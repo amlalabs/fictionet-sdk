@@ -86,7 +86,7 @@
 //! assert_eq!(Message::parse(&bytes), Ok(reply));
 //! ```
 
-use fictionet::stdlib::codec::{be16, be32, Wire};
+use fictionet::stdlib::codec::{Wire, be16, be32};
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -114,7 +114,8 @@ pub const MAX_AUTH_DATA: usize = 255;
 /// authentication data.
 pub const TRAILER_HEADER_LEN: usize = 4;
 /// The longest RIP message: the most entries, then the longest trailer.
-pub const MAX_MESSAGE: usize = HEADER_LEN + MAX_ENTRIES * ENTRY_LEN + TRAILER_HEADER_LEN + MAX_AUTH_DATA;
+pub const MAX_MESSAGE: usize =
+    HEADER_LEN + MAX_ENTRIES * ENTRY_LEN + TRAILER_HEADER_LEN + MAX_AUTH_DATA;
 /// The longest RIP datagram to send: RFC 1058 3.1 limits a datagram to
 /// 512 bytes. RFC 4822 does not say whether its trailer counts.
 /// FRRouting counts it, and drops longer datagrams, so with a 16-byte
@@ -376,18 +377,31 @@ impl std::fmt::Display for Error {
             Error::Truncated => write!(f, "message cut short"),
             Error::Command(c) => write!(f, "command {c}, not 1 or 2"),
             Error::Version(v) => write!(f, "unknown version {v}"),
-            Error::MustBeZero { offset } => write!(f, "must-be-zero field at offset {offset} is not zero"),
-            Error::Family { entry, family } => write!(f, "entry {entry} has address family {family}"),
-            Error::AuthPlace { entry } => write!(f, "authentication entry {entry} is not the first"),
-            Error::WholeTable { entry } => write!(f, "entry {entry} is a malformed whole-table request"),
+            Error::MustBeZero { offset } => {
+                write!(f, "must-be-zero field at offset {offset} is not zero")
+            }
+            Error::Family { entry, family } => {
+                write!(f, "entry {entry} has address family {family}")
+            }
+            Error::AuthPlace { entry } => {
+                write!(f, "authentication entry {entry} is not the first")
+            }
+            Error::WholeTable { entry } => {
+                write!(f, "entry {entry} is a malformed whole-table request")
+            }
             Error::Metric { entry, metric } => write!(f, "entry {entry} has metric {metric}"),
             Error::Mask { entry } => write!(f, "entry {entry} has a mask that is not contiguous"),
-            Error::PrefixLength { entry, len } => write!(f, "entry {entry} has prefix length {len}"),
+            Error::PrefixLength { entry, len } => {
+                write!(f, "entry {entry} has prefix length {len}")
+            }
             Error::PacketLength(n) => write!(f, "authentication packet length {n} is not valid"),
             Error::Trailer => write!(f, "authentication trailer header is not 0xffff 0x0001"),
             Error::AuthDataTooLong => write!(f, "authentication trailer is too long"),
             Error::AuthDataLen { declared, actual } => {
-                write!(f, "authentication data is {actual} bytes, entry says {declared}")
+                write!(
+                    f,
+                    "authentication data is {actual} bytes, entry says {declared}"
+                )
             }
             Error::NoEntries => write!(f, "message has no entries"),
             Error::TooManyEntries => write!(f, "message has too many entries"),
@@ -412,12 +426,20 @@ impl Message {
             Some(Auth::Crypto(c)) => TRAILER_HEADER_LEN.saturating_add(c.data.len()),
             _ => 0,
         };
-        HEADER_LEN.saturating_add(entries.saturating_mul(ENTRY_LEN)).saturating_add(trailer) <= MAX_DATAGRAM
+        HEADER_LEN
+            .saturating_add(entries.saturating_mul(ENTRY_LEN))
+            .saturating_add(trailer)
+            <= MAX_DATAGRAM
     }
 
     /// A request for the whole table, with no authentication.
     pub fn whole_table_request(version: Version) -> Message {
-        Message { command: Command::Request, version, auth: None, entries: Entries::WholeTable }
+        Message {
+            command: Command::Request,
+            version,
+            auth: None,
+            entries: Entries::WholeTable,
+        }
     }
 
     /// Reads a message as a receiving router does. An entry with an
@@ -430,8 +452,12 @@ impl Message {
     /// passes it. Whether a destination is one a router should accept
     /// (not 127/8 or multicast, say) is left to world code.
     pub fn receive(b: &[u8]) -> Result<Received<Message>, Error> {
-        let scan = Routes { receive: true, ..Routes::default() };
-        scan.read(b).map(|(message, skipped)| Received { message, skipped })
+        let scan = Routes {
+            receive: true,
+            ..Routes::default()
+        };
+        scan.read(b)
+            .map(|(message, skipped)| Received { message, skipped })
     }
 }
 
@@ -469,22 +495,31 @@ impl Routes {
             3.. if self.receive => Version::V2,
             _ => return Err(Error::Version(v)),
         };
-        if version == Version::V1 && b.get(2..b.len().min(4)).is_some_and(|s| s.iter().any(|&x| x != 0)) {
+        if version == Version::V1
+            && b.get(2..b.len().min(4))
+                .is_some_and(|s| s.iter().any(|&x| x != 0))
+        {
             return Err(Error::MustBeZero { offset: 2 });
         }
-        if b.len() < HEADER_LEN { return Err(Error::Truncated); }
+        if b.len() < HEADER_LEN {
+            return Err(Error::Truncated);
+        }
         loop {
             let at = HEADER_LEN + self.entry * ENTRY_LEN;
             if self.entries_end.is_some_and(|end| at >= end) {
                 break;
             }
-            let Some(e) = b.get(at..at + ENTRY_LEN) else { break };
+            let Some(e) = b.get(at..at + ENTRY_LEN) else {
+                break;
+            };
             if self.entry >= MAX_ENTRIES {
                 return Err(Error::TooManyEntries);
             }
             if let Err(err) = self.entry_at(command, version, at, e) {
-                let skippable =
-                    matches!(err, Error::Family { .. } | Error::Mask { .. } | Error::Metric { .. });
+                let skippable = matches!(
+                    err,
+                    Error::Family { .. } | Error::Mask { .. } | Error::Metric { .. }
+                );
                 if !(self.receive && skippable) {
                     return Err(err);
                 }
@@ -511,7 +546,10 @@ impl Routes {
             if let Some(Auth::Crypto(c)) = &mut auth {
                 let declared = usize::from(c.data_len);
                 if declared != data.len() && declared != data.len() + TRAILER_HEADER_LEN {
-                    return Err(Error::AuthDataLen { declared: c.data_len, actual: data.len() });
+                    return Err(Error::AuthDataLen {
+                        declared: c.data_len,
+                        actual: data.len(),
+                    });
                 }
                 c.data = data.to_vec();
             }
@@ -521,12 +559,30 @@ impl Routes {
         if self.entry == 0 {
             return Err(Error::NoEntries);
         }
-        let entries = if self.whole { Entries::WholeTable } else { Entries::Routes(self.routes) };
-        Ok((Message { command, version, auth, entries }, self.skipped))
+        let entries = if self.whole {
+            Entries::WholeTable
+        } else {
+            Entries::Routes(self.routes)
+        };
+        Ok((
+            Message {
+                command,
+                version,
+                auth,
+                entries,
+            },
+            self.skipped,
+        ))
     }
 
     /// Reads entry number `self.entry`, the 20 bytes `e` at offset `at`.
-    fn entry_at(&mut self, command: Command, version: Version, at: usize, e: &[u8]) -> Result<(), Error> {
+    fn entry_at(
+        &mut self,
+        command: Command,
+        version: Version,
+        at: usize,
+        e: &[u8],
+    ) -> Result<(), Error> {
         let entry = self.entry;
         let fam = be16(e, 0).ok_or(Error::Truncated)?;
         if version == Version::V1 && (fam == family::WHOLE_TABLE || fam == family::INET) {
@@ -556,7 +612,12 @@ impl Routes {
                             return Err(Error::PacketLength(packet_len));
                         }
                         self.entries_end = Some(n);
-                        Auth::Crypto(Crypto { key_id: e[6], data_len: e[7], sequence: be32(e, 8).ok_or(Error::Truncated)?, data: Vec::new() })
+                        Auth::Crypto(Crypto {
+                            key_id: e[6],
+                            data_len: e[7],
+                            sequence: be32(e, 8).ok_or(Error::Truncated)?,
+                            data: Vec::new(),
+                        })
                     }
                     _ => Auth::Other { kind, data },
                 });
@@ -566,7 +627,11 @@ impl Routes {
                 // other fields are ignored. It must be the first entry
                 // after any authentication entry.
                 let first = entry == usize::from(self.auth.is_some());
-                if command != Command::Request || self.whole || !first || be32(e, 16).ok_or(Error::Truncated)? != u32::from(INFINITY) {
+                if command != Command::Request
+                    || self.whole
+                    || !first
+                    || be32(e, 16).ok_or(Error::Truncated)? != u32::from(INFINITY)
+                {
                     return Err(Error::WholeTable { entry });
                 }
                 self.whole = true;
@@ -663,12 +728,20 @@ pub struct NgMessage {
     pub entries: NgEntries,
 }
 
-const WHOLE_TABLE_NG: NgRoute = NgRoute { prefix: Ipv6Addr::UNSPECIFIED, tag: 0, prefix_len: 0, metric: INFINITY };
+const WHOLE_TABLE_NG: NgRoute = NgRoute {
+    prefix: Ipv6Addr::UNSPECIFIED,
+    tag: 0,
+    prefix_len: 0,
+    metric: INFINITY,
+};
 
 impl NgMessage {
     /// A request for the whole table.
     pub fn whole_table_request() -> NgMessage {
-        NgMessage { command: Command::Request, entries: NgEntries::WholeTable }
+        NgMessage {
+            command: Command::Request,
+            entries: NgEntries::WholeTable,
+        }
     }
 
     /// Reads a message as a receiving router does: a route with a prefix
@@ -713,16 +786,31 @@ fn ng_entry(command: Command, entry: usize, e: &[u8]) -> Result<NgEntry, Error> 
         // RFC 2080 2.1.1: a next hop that is not link-local means the
         // sender, as :: does.
         let link_local = prefix.segments()[0] & 0xffc0 == 0xfe80;
-        return Ok(NgEntry::NextHop(if link_local { prefix } else { Ipv6Addr::UNSPECIFIED }));
+        return Ok(NgEntry::NextHop(if link_local {
+            prefix
+        } else {
+            Ipv6Addr::UNSPECIFIED
+        }));
     }
     let prefix_len = e[18];
     if prefix_len > MAX_PREFIX_LEN {
-        return Err(Error::PrefixLength { entry, len: prefix_len });
+        return Err(Error::PrefixLength {
+            entry,
+            len: prefix_len,
+        });
     }
     if !command.allows_metric(u32::from(metric)) {
-        return Err(Error::Metric { entry, metric: u32::from(metric) });
+        return Err(Error::Metric {
+            entry,
+            metric: u32::from(metric),
+        });
     }
-    Ok(NgEntry::Route(NgRoute { prefix, tag: be16(e, 16).ok_or(Error::Truncated)?, prefix_len, metric }))
+    Ok(NgEntry::Route(NgRoute {
+        prefix,
+        tag: be16(e, 16).ok_or(Error::Truncated)?,
+        prefix_len,
+        metric,
+    }))
 }
 
 /// Whether a route asks for the whole table when it is a request's only
@@ -759,9 +847,14 @@ fn scan_ng(b: &[u8], mut skip: Option<&mut Vec<Error>>) -> Result<NgMessage, Err
     if count == 0 {
         return Err(Error::NoEntries);
     }
-    let whole =
-        command == Command::Request && count == 1 && matches!(entries[..], [NgEntry::Route(r)] if is_whole_table_ng(r));
-    let entries = if whole { NgEntries::WholeTable } else { NgEntries::Entries(entries) };
+    let whole = command == Command::Request
+        && count == 1
+        && matches!(entries[..], [NgEntry::Route(r)] if is_whole_table_ng(r));
+    let entries = if whole {
+        NgEntries::WholeTable
+    } else {
+        NgEntries::Entries(entries)
+    };
     Ok(NgMessage { command, entries })
 }
 
@@ -900,12 +993,10 @@ impl Wire for NgMessage {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Collect, CollectError, Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn collect(b: &[u8]) -> Result<Message, Error> {
@@ -915,10 +1006,19 @@ mod tests {
         let parsed = Message::parse(b);
         let (items, failure) = decode_all(make, b);
         if b.len() <= MAX_MESSAGE {
-            assert_eq!(failure, parsed.clone().err().map(|e| Fail::Protocol(CollectError::Parse(e))));
+            assert_eq!(
+                failure,
+                parsed
+                    .clone()
+                    .err()
+                    .map(|e| Fail::Protocol(CollectError::Parse(e)))
+            );
             assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
         } else {
-            assert_eq!(failure, Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE })));
+            assert_eq!(
+                failure,
+                Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE }))
+            );
         }
         parsed
     }
@@ -928,7 +1028,13 @@ mod tests {
     }
 
     /// A version 2 route entry's bytes.
-    fn v2_entry(tag: u16, address: [u8; 4], mask: [u8; 4], next_hop: [u8; 4], metric: u32) -> Vec<u8> {
+    fn v2_entry(
+        tag: u16,
+        address: [u8; 4],
+        mask: [u8; 4],
+        next_hop: [u8; 4],
+        metric: u32,
+    ) -> Vec<u8> {
         let mut e = vec![0, 2];
         e.extend_from_slice(&tag.to_be_bytes());
         e.extend_from_slice(&address);
@@ -1001,7 +1107,13 @@ mod tests {
         assert_eq!(collect(b), p);
         if let Ok(m) = &p {
             // Reading as a router does agrees on every message parse takes.
-            assert_eq!(Message::receive(b), Ok(Received { message: m.clone(), skipped: vec![] }));
+            assert_eq!(
+                Message::receive(b),
+                Ok(Received {
+                    message: m.clone(),
+                    skipped: vec![]
+                })
+            );
             let out = m.to_bytes().unwrap();
             assert_eq!(out.len(), b.len());
             assert_eq!(Message::parse(&out).as_ref(), Ok(m));
@@ -1010,7 +1122,10 @@ mod tests {
             assert!(r.skipped.len() <= MAX_ENTRIES);
             if let Entries::Routes(routes) = &r.message.entries {
                 for x in routes {
-                    assert!(r.message.command.allows_metric(u32::from(x.metric)) && contiguous(u32::from(x.mask)));
+                    assert!(
+                        r.message.command.allows_metric(u32::from(x.metric))
+                            && contiguous(u32::from(x.mask))
+                    );
                 }
             }
         }
@@ -1021,24 +1136,34 @@ mod tests {
         let p = NgMessage::parse(b);
         assert_eq!(ng_collect(b), p);
         if let Ok(m) = &p {
-            assert_eq!(NgMessage::receive(b), Ok(Received { message: m.clone(), skipped: vec![] }));
+            assert_eq!(
+                NgMessage::receive(b),
+                Ok(Received {
+                    message: m.clone(),
+                    skipped: vec![]
+                })
+            );
             let out = m.to_bytes().unwrap();
             assert_eq!(out.len(), b.len());
             assert_eq!(NgMessage::parse(&out).as_ref(), Ok(m));
         }
         if let Ok(r) = NgMessage::receive(b)
-            && let NgEntries::Entries(es) = &r.message.entries {
-                for e in es {
-                    match e {
-                        NgEntry::NextHop(a) => assert!(a.is_unspecified() || a.segments()[0] & 0xffc0 == 0xfe80),
-                        NgEntry::Route(x) => {
-                            assert!(
-                                x.prefix_len <= MAX_PREFIX_LEN && r.message.command.allows_metric(u32::from(x.metric))
-                            )
-                        }
+            && let NgEntries::Entries(es) = &r.message.entries
+        {
+            for e in es {
+                match e {
+                    NgEntry::NextHop(a) => {
+                        assert!(a.is_unspecified() || a.segments()[0] & 0xffc0 == 0xfe80)
+                    }
+                    NgEntry::Route(x) => {
+                        assert!(
+                            x.prefix_len <= MAX_PREFIX_LEN
+                                && r.message.command.allows_metric(u32::from(x.metric))
+                        )
                     }
                 }
             }
+        }
         p
     }
 
@@ -1049,7 +1174,14 @@ mod tests {
             msg(2, 1, &[v2_entry(0, [192, 168, 1, 0], [0; 4], [0; 4], 2)]),
             msg(1, 1, &[whole_table_entry()]),
             msg(1, 2, &[whole_table_entry()]),
-            msg(2, 2, &[pw.clone(), v2_entry(7, [10, 0, 0, 0], [255, 0, 0, 0], [10, 0, 0, 1], 16)]),
+            msg(
+                2,
+                2,
+                &[
+                    pw.clone(),
+                    v2_entry(7, [10, 0, 0, 0], [255, 0, 0, 0], [10, 0, 0, 1], 16),
+                ],
+            ),
             msg(
                 2,
                 2,
@@ -1069,7 +1201,14 @@ mod tests {
         let hop: Ipv6Addr = "fe80::1".parse().unwrap();
         vec![
             msg(1, 1, &[ng_entry_bytes(Ipv6Addr::UNSPECIFIED, 0, 0, 16)]),
-            msg(2, 1, &[ng_entry_bytes(hop, 0, 0, 0xff), ng_entry_bytes(doc, 9, 32, 1)]),
+            msg(
+                2,
+                1,
+                &[
+                    ng_entry_bytes(hop, 0, 0, 0xff),
+                    ng_entry_bytes(doc, 9, 32, 1),
+                ],
+            ),
             msg(1, 1, &[ng_entry_bytes(doc, 0, 32, 0)]),
         ]
     }
@@ -1078,7 +1217,10 @@ mod tests {
     fn module_example() {
         let mut request = vec![1, 2, 0, 0];
         request.extend_from_slice(&whole_table_entry());
-        assert_eq!(check(&request), Ok(Message::whole_table_request(Version::V2)));
+        assert_eq!(
+            check(&request),
+            Ok(Message::whole_table_request(Version::V2))
+        );
         let reply = Message {
             command: Command::Response,
             version: Version::V2,
@@ -1092,7 +1234,12 @@ mod tests {
             }]),
         };
         let bytes = reply.to_bytes().unwrap();
-        assert_eq!(bytes, [2, 2, 0, 0, 0, 2, 0, 0, 10, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(
+            bytes,
+            [
+                2, 2, 0, 0, 0, 2, 0, 0, 10, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+            ]
+        );
         assert_eq!(check(&bytes), Ok(reply));
     }
 
@@ -1118,14 +1265,22 @@ mod tests {
     fn whole_table_requests() {
         let v1 = msg(1, 1, &[whole_table_entry()]);
         assert_eq!(check(&v1), Ok(Message::whole_table_request(Version::V1)));
-        assert_eq!(Message::whole_table_request(Version::V1).to_bytes().unwrap(), v1);
+        assert_eq!(
+            Message::whole_table_request(Version::V1)
+                .to_bytes()
+                .unwrap(),
+            v1
+        );
         let ng = msg(1, 1, &[ng_entry_bytes(Ipv6Addr::UNSPECIFIED, 0, 0, 16)]);
         assert_eq!(ng_check(&ng), Ok(NgMessage::whole_table_request()));
         assert_eq!(NgMessage::whole_table_request().to_bytes().unwrap(), ng);
         // In a response the same entry is a route to ::/0 that cannot be
         // reached.
         let ng_resp = msg(2, 1, &[ng_entry_bytes(Ipv6Addr::UNSPECIFIED, 0, 0, 16)]);
-        assert!(matches!(ng_check(&ng_resp).unwrap().entries, NgEntries::Entries(_)));
+        assert!(matches!(
+            ng_check(&ng_resp).unwrap().entries,
+            NgEntries::Entries(_)
+        ));
     }
 
     #[test]
@@ -1151,7 +1306,15 @@ mod tests {
     fn crypto_authentication() {
         let b = crypto_message(16, &[0xab; 16]);
         let m = check(&b).unwrap();
-        assert_eq!(m.auth, Some(Auth::Crypto(Crypto { key_id: 1, data_len: 16, sequence: 7, data: vec![0xab; 16] })));
+        assert_eq!(
+            m.auth,
+            Some(Auth::Crypto(Crypto {
+                key_id: 1,
+                data_len: 16,
+                sequence: 7,
+                data: vec![0xab; 16]
+            }))
+        );
         assert_eq!(m.to_bytes().unwrap(), b);
         // The length that counts the trailer header is read too.
         let b20 = crypto_message(20, &[0xcd; 16]);
@@ -1177,7 +1340,12 @@ mod tests {
             m.entries,
             NgEntries::Entries(vec![
                 NgEntry::NextHop("fe80::1".parse().unwrap()),
-                NgEntry::Route(NgRoute { prefix: "2001:db8::".parse().unwrap(), tag: 9, prefix_len: 32, metric: 1 }),
+                NgEntry::Route(NgRoute {
+                    prefix: "2001:db8::".parse().unwrap(),
+                    tag: 9,
+                    prefix_len: 32,
+                    metric: 1
+                }),
             ])
         );
         assert_eq!(&m.to_bytes().unwrap(), b);
@@ -1202,35 +1370,107 @@ mod tests {
             (msg(0, 2, std::slice::from_ref(&route)), Error::Command(0)),
             (msg(2, 0, std::slice::from_ref(&route)), Error::Version(0)),
             (msg(2, 3, std::slice::from_ref(&route)), Error::Version(3)),
-            ([vec![2, 1, 0, 1], v1_route.clone()].concat(), Error::MustBeZero { offset: 2 }),
-            (vec![2, 1, 1], Error::MustBeZero { offset: 2 }),
-            (msg(2, 1, &[v2_entry(1, [10, 0, 0, 0], [0; 4], [0; 4], 1)]), Error::MustBeZero { offset: 6 }),
-            (msg(2, 1, std::slice::from_ref(&route)), Error::MustBeZero { offset: 12 }),
-            (msg(2, 1, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [1; 4], 1)]), Error::MustBeZero { offset: 16 }),
-            (msg(2, 1, &[pw.clone()]), Error::Family { entry: 0, family: 0xffff }),
             (
-                msg(2, 2, &[route.clone(), [vec![0, 7], route[2..].to_vec()].concat()]),
-                Error::Family { entry: 1, family: 7 },
+                [vec![2, 1, 0, 1], v1_route.clone()].concat(),
+                Error::MustBeZero { offset: 2 },
             ),
-            (msg(2, 2, &[route.clone(), pw.clone()]), Error::AuthPlace { entry: 1 }),
-            (msg(2, 2, &[whole_table_entry()]), Error::WholeTable { entry: 0 }),
-            (msg(1, 2, &[route.clone(), whole_table_entry()]), Error::WholeTable { entry: 1 }),
-            (msg(1, 2, &[whole_table_entry(), route.clone()]), Error::WholeTable { entry: 1 }),
-            (msg(1, 2, &[whole_table_entry(), whole_table_entry()]), Error::WholeTable { entry: 1 }),
-            (msg(1, 2, &[[&[0u8; 16][..], &[0, 0, 0, 15]].concat()]), Error::WholeTable { entry: 0 }),
+            (vec![2, 1, 1], Error::MustBeZero { offset: 2 }),
             (
-                msg(1, 1, &[[&[0u8, 0, 0, 1][..], &[0; 12], &[0, 0, 0, 16]].concat()]),
+                msg(2, 1, &[v2_entry(1, [10, 0, 0, 0], [0; 4], [0; 4], 1)]),
                 Error::MustBeZero { offset: 6 },
             ),
-            (msg(2, 2, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [0; 4], 0)]), Error::Metric { entry: 0, metric: 0 }),
-            (msg(2, 2, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [0; 4], 17)]), Error::Metric { entry: 0, metric: 17 }),
+            (
+                msg(2, 1, std::slice::from_ref(&route)),
+                Error::MustBeZero { offset: 12 },
+            ),
+            (
+                msg(2, 1, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [1; 4], 1)]),
+                Error::MustBeZero { offset: 16 },
+            ),
+            (
+                msg(2, 1, &[pw.clone()]),
+                Error::Family {
+                    entry: 0,
+                    family: 0xffff,
+                },
+            ),
+            (
+                msg(
+                    2,
+                    2,
+                    &[route.clone(), [vec![0, 7], route[2..].to_vec()].concat()],
+                ),
+                Error::Family {
+                    entry: 1,
+                    family: 7,
+                },
+            ),
+            (
+                msg(2, 2, &[route.clone(), pw.clone()]),
+                Error::AuthPlace { entry: 1 },
+            ),
+            (
+                msg(2, 2, &[whole_table_entry()]),
+                Error::WholeTable { entry: 0 },
+            ),
+            (
+                msg(1, 2, &[route.clone(), whole_table_entry()]),
+                Error::WholeTable { entry: 1 },
+            ),
+            (
+                msg(1, 2, &[whole_table_entry(), route.clone()]),
+                Error::WholeTable { entry: 1 },
+            ),
+            (
+                msg(1, 2, &[whole_table_entry(), whole_table_entry()]),
+                Error::WholeTable { entry: 1 },
+            ),
+            (
+                msg(1, 2, &[[&[0u8; 16][..], &[0, 0, 0, 15]].concat()]),
+                Error::WholeTable { entry: 0 },
+            ),
+            (
+                msg(
+                    1,
+                    1,
+                    &[[&[0u8, 0, 0, 1][..], &[0; 12], &[0, 0, 0, 16]].concat()],
+                ),
+                Error::MustBeZero { offset: 6 },
+            ),
+            (
+                msg(2, 2, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [0; 4], 0)]),
+                Error::Metric {
+                    entry: 0,
+                    metric: 0,
+                },
+            ),
+            (
+                msg(2, 2, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [0; 4], 17)]),
+                Error::Metric {
+                    entry: 0,
+                    metric: 17,
+                },
+            ),
             (
                 msg(1, 2, &[v2_entry(0, [10, 0, 0, 0], [0; 4], [0; 4], 0x100)]),
-                Error::Metric { entry: 0, metric: 0x100 },
+                Error::Metric {
+                    entry: 0,
+                    metric: 0x100,
+                },
             ),
-            (msg(2, 2, &[v2_entry(0, [10, 0, 0, 0], [255, 0, 255, 0], [0; 4], 1)]), Error::Mask { entry: 0 }),
+            (
+                msg(
+                    2,
+                    2,
+                    &[v2_entry(0, [10, 0, 0, 0], [255, 0, 255, 0], [0; 4], 1)],
+                ),
+                Error::Mask { entry: 0 },
+            ),
             (vec![2, 2, 0, 0], Error::NoEntries),
-            (msg(2, 2, &vec![route.clone(); MAX_ENTRIES + 1]), Error::TooManyEntries),
+            (
+                msg(2, 2, &vec![route.clone(); MAX_ENTRIES + 1]),
+                Error::TooManyEntries,
+            ),
         ];
         for (b, e) in &cases {
             assert_eq!(check(b), Err(*e), "{b:?}");
@@ -1259,8 +1499,17 @@ mod tests {
         bad[47] = 2;
         assert_eq!(check(&bad), Err(Error::Trailer));
         assert_eq!(check(&good[..46]), Err(Error::Truncated));
-        assert_eq!(check(&crypto_message(16, &[1; 15])), Err(Error::AuthDataLen { declared: 16, actual: 15 }));
-        assert_eq!(check(&crypto_message(255, &[1; 256])), Err(Error::AuthDataTooLong));
+        assert_eq!(
+            check(&crypto_message(16, &[1; 15])),
+            Err(Error::AuthDataLen {
+                declared: 16,
+                actual: 15
+            })
+        );
+        assert_eq!(
+            check(&crypto_message(255, &[1; 256])),
+            Err(Error::AuthDataTooLong)
+        );
         assert!(check(&crypto_message(255, &[1; 255])).is_ok());
         // Packet length 24 is the authentication entry alone.
         let mut alone = vec![2, 2, 0, 0, 0xff, 0xff, 0, 3, 0, 24, 1, 0, 0, 0, 0, 1];
@@ -1284,9 +1533,27 @@ mod tests {
                 msg(2, 1, &[route.clone(), ng_entry_bytes(doc, 0, 129, 1)]),
                 Error::PrefixLength { entry: 1, len: 129 },
             ),
-            (msg(2, 1, &[ng_entry_bytes(doc, 0, 32, 0)]), Error::Metric { entry: 0, metric: 0 }),
-            (msg(2, 1, &[ng_entry_bytes(doc, 0, 32, 17)]), Error::Metric { entry: 0, metric: 17 }),
-            (msg(1, 1, &[ng_entry_bytes(doc, 0, 32, 0xfe)]), Error::Metric { entry: 0, metric: 0xfe }),
+            (
+                msg(2, 1, &[ng_entry_bytes(doc, 0, 32, 0)]),
+                Error::Metric {
+                    entry: 0,
+                    metric: 0,
+                },
+            ),
+            (
+                msg(2, 1, &[ng_entry_bytes(doc, 0, 32, 17)]),
+                Error::Metric {
+                    entry: 0,
+                    metric: 17,
+                },
+            ),
+            (
+                msg(1, 1, &[ng_entry_bytes(doc, 0, 32, 0xfe)]),
+                Error::Metric {
+                    entry: 0,
+                    metric: 0xfe,
+                },
+            ),
             (vec![2, 1, 0, 0], Error::NoEntries),
         ];
         for (b, e) in &cases {
@@ -1303,7 +1570,10 @@ mod tests {
         // The header's unused field is ignored.
         let mut b = msg(2, 1, std::slice::from_ref(&route));
         b[3] = 1;
-        assert_eq!(ng_check(&b).unwrap().to_bytes().unwrap(), msg(2, 1, &[route]));
+        assert_eq!(
+            ng_check(&b).unwrap().to_bytes().unwrap(),
+            msg(2, 1, &[route])
+        );
     }
 
     #[test]
@@ -1329,14 +1599,33 @@ mod tests {
         m.auth = Some(Auth::Password([0; 16]));
         assert_eq!(m.to_bytes(), Err(Error::TooManyEntries));
         let mut m = base.clone();
-        m.auth = Some(Auth::Crypto(Crypto { key_id: 1, data_len: 0, sequence: 0, data: vec![0; 256] }));
+        m.auth = Some(Auth::Crypto(Crypto {
+            key_id: 1,
+            data_len: 0,
+            sequence: 0,
+            data: vec![0; 256],
+        }));
         assert_eq!(m.to_bytes(), Err(Error::AuthDataTooLong));
         let mut m = base.clone();
-        m.auth = Some(Auth::Crypto(Crypto { key_id: 1, data_len: 3, sequence: 0, data: vec![0; 16] }));
-        assert_eq!(m.to_bytes(), Err(Error::AuthDataLen { declared: 3, actual: 16 }));
+        m.auth = Some(Auth::Crypto(Crypto {
+            key_id: 1,
+            data_len: 3,
+            sequence: 0,
+            data: vec![0; 16],
+        }));
+        assert_eq!(
+            m.to_bytes(),
+            Err(Error::AuthDataLen {
+                declared: 3,
+                actual: 16
+            })
+        );
         for kind in [auth_type::PASSWORD, auth_type::CRYPTO] {
             let mut m = base.clone();
-            m.auth = Some(Auth::Other { kind, data: [0; 16] });
+            m.auth = Some(Auth::Other {
+                kind,
+                data: [0; 16],
+            });
             assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         }
         let mut m = base.clone();
@@ -1344,34 +1633,73 @@ mod tests {
         assert_eq!(m.to_bytes(), Err(Error::MustBeZero { offset: 12 }));
         let mut m = Message::whole_table_request(Version::V1);
         m.auth = Some(Auth::Password([0; 16]));
-        assert_eq!(m.to_bytes(), Err(Error::Family { entry: 0, family: 0xffff }));
+        assert_eq!(
+            m.to_bytes(),
+            Err(Error::Family {
+                entry: 0,
+                family: 0xffff
+            })
+        );
         let mut m = Message::whole_table_request(Version::V2);
         m.command = Command::Response;
         assert_eq!(m.to_bytes(), Err(Error::WholeTable { entry: 0 }));
         let mut m = base.clone();
-        m.entries = Entries::Routes(vec![RouteEntry { metric: 17, ..route }]);
-        assert_eq!(m.to_bytes(), Err(Error::Metric { entry: 0, metric: 17 }));
+        m.entries = Entries::Routes(vec![RouteEntry {
+            metric: 17,
+            ..route
+        }]);
+        assert_eq!(
+            m.to_bytes(),
+            Err(Error::Metric {
+                entry: 0,
+                metric: 17
+            })
+        );
         let mut m = base.clone();
         m.entries = Entries::Routes(vec![]);
         assert_eq!(m.to_bytes(), Err(Error::NoEntries));
 
-        let whole = NgRoute { prefix: Ipv6Addr::UNSPECIFIED, tag: 0, prefix_len: 0, metric: 16 };
-        let m = NgMessage { command: Command::Request, entries: NgEntries::Entries(vec![NgEntry::Route(whole)]) };
+        let whole = NgRoute {
+            prefix: Ipv6Addr::UNSPECIFIED,
+            tag: 0,
+            prefix_len: 0,
+            metric: 16,
+        };
+        let m = NgMessage {
+            command: Command::Request,
+            entries: NgEntries::Entries(vec![NgEntry::Route(whole)]),
+        };
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
-        let m = NgMessage { command: Command::Response, entries: NgEntries::WholeTable };
+        let m = NgMessage {
+            command: Command::Response,
+            entries: NgEntries::WholeTable,
+        };
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
-        let m = NgMessage { command: Command::Response, entries: NgEntries::Entries(vec![]) };
+        let m = NgMessage {
+            command: Command::Response,
+            entries: NgEntries::Entries(vec![]),
+        };
         assert_eq!(m.to_bytes(), Err(Error::NoEntries));
         let m = NgMessage {
             command: Command::Response,
-            entries: NgEntries::Entries(vec![NgEntry::NextHop(Ipv6Addr::UNSPECIFIED); MAX_NG_ENTRIES + 1]),
+            entries: NgEntries::Entries(vec![
+                NgEntry::NextHop(Ipv6Addr::UNSPECIFIED);
+                MAX_NG_ENTRIES + 1
+            ]),
         };
         assert_eq!(m.to_bytes(), Err(Error::TooManyEntries));
         let m = NgMessage {
             command: Command::Response,
-            entries: NgEntries::Entries(vec![NgEntry::Route(NgRoute { prefix_len: 200, metric: 1, ..whole })]),
+            entries: NgEntries::Entries(vec![NgEntry::Route(NgRoute {
+                prefix_len: 200,
+                metric: 1,
+                ..whole
+            })]),
         };
-        assert_eq!(m.to_bytes(), Err(Error::PrefixLength { entry: 0, len: 200 }));
+        assert_eq!(
+            m.to_bytes(),
+            Err(Error::PrefixLength { entry: 0, len: 200 })
+        );
     }
 
     #[test]
@@ -1385,9 +1713,15 @@ mod tests {
                 match r {
                     // A crypto message cut 4 bytes into its data reads as
                     // one whose length counts the trailer header.
-                    Ok(_) => assert!(if crypto { k + 4 == b.len() } else { boundary }, "{k} {b:?}"),
+                    Ok(_) => assert!(
+                        if crypto { k + 4 == b.len() } else { boundary },
+                        "{k} {b:?}"
+                    ),
                     Err(e) => assert!(
-                        matches!(e, Error::Truncated | Error::NoEntries | Error::AuthDataLen { .. }),
+                        matches!(
+                            e,
+                            Error::Truncated | Error::NoEntries | Error::AuthDataLen { .. }
+                        ),
                         "{k} {e:?}"
                     ),
                 }
@@ -1400,7 +1734,10 @@ mod tests {
                 let boundary = k >= HEADER_LEN && (k - HEADER_LEN).is_multiple_of(ENTRY_LEN);
                 match r {
                     Ok(_) => assert!(boundary),
-                    Err(e) => assert!(matches!(e, Error::Truncated | Error::NoEntries), "{k} {e:?}"),
+                    Err(e) => assert!(
+                        matches!(e, Error::Truncated | Error::NoEntries),
+                        "{k} {e:?}"
+                    ),
                 }
             }
         }
@@ -1411,7 +1748,11 @@ mod tests {
         assert_eq!(collect(&[7]), Err(Error::Command(7)));
         assert_eq!(ng_collect(&[1, 2]), Err(Error::Version(2)));
         let b = [2, 2, 0, 0, 0, 2].repeat(rounds(10_000));
-        contract::check_decode_with_alloc_limit(|| Collect::<Message>::new(MAX_MESSAGE), &b, 2 * (MAX_MESSAGE + 1));
+        contract::check_decode_with_alloc_limit(
+            || Collect::<Message>::new(MAX_MESSAGE),
+            &b,
+            2 * (MAX_MESSAGE + 1),
+        );
     }
 
     #[test]
@@ -1422,21 +1763,36 @@ mod tests {
         e[2] = 1;
         e[4] = 10;
         e[8] = 255;
-        assert_eq!(check(&msg(1, 2, &[e])), Ok(Message::whole_table_request(Version::V2)));
+        assert_eq!(
+            check(&msg(1, 2, &[e])),
+            Ok(Message::whole_table_request(Version::V2))
+        );
         // In version 1 the address is not a must-be-zero field.
         let mut e = whole_table_entry();
         e[4] = 10;
-        assert_eq!(check(&msg(1, 1, &[e])), Ok(Message::whole_table_request(Version::V1)));
+        assert_eq!(
+            check(&msg(1, 1, &[e])),
+            Ok(Message::whole_table_request(Version::V1))
+        );
         // Its must-be-zero fields still are.
         let mut e = whole_table_entry();
         e[8] = 255;
-        assert_eq!(check(&msg(1, 1, &[e])), Err(Error::MustBeZero { offset: 12 }));
+        assert_eq!(
+            check(&msg(1, 1, &[e])),
+            Err(Error::MustBeZero { offset: 12 })
+        );
         // RFC 2080: the prefix, prefix length and metric decide; the tag
         // does not.
         let ng = msg(1, 1, &[ng_entry_bytes(Ipv6Addr::UNSPECIFIED, 7, 0, 16)]);
         assert_eq!(ng_check(&ng), Ok(NgMessage::whole_table_request()));
-        let tagged = NgRoute { tag: 7, ..WHOLE_TABLE_NG };
-        let m = NgMessage { command: Command::Request, entries: NgEntries::Entries(vec![NgEntry::Route(tagged)]) };
+        let tagged = NgRoute {
+            tag: 7,
+            ..WHOLE_TABLE_NG
+        };
+        let m = NgMessage {
+            command: Command::Request,
+            entries: NgEntries::Entries(vec![NgEntry::Route(tagged)]),
+        };
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
     }
 
@@ -1451,7 +1807,12 @@ mod tests {
         let m = Message {
             command: Command::Request,
             version: Version::V2,
-            auth: Some(Auth::Crypto(Crypto { key_id: 2, data_len: 4, sequence: 9, data: vec![5; 4] })),
+            auth: Some(Auth::Crypto(Crypto {
+                key_id: 2,
+                data_len: 4,
+                sequence: 9,
+                data: vec![5; 4],
+            })),
             entries: Entries::WholeTable,
         };
         let b = m.to_bytes().unwrap();
@@ -1471,7 +1832,12 @@ mod tests {
         assert_eq!(Version::V2.code(), 2);
         assert!(Command::Request.allows_metric(0));
         assert!(!Command::Response.allows_metric(0));
-        assert!(contiguous(0) && contiguous(u32::MAX) && contiguous(0xffff_ff00) && !contiguous(0x00ff_ffff));
+        assert!(
+            contiguous(0)
+                && contiguous(u32::MAX)
+                && contiguous(0xffff_ff00)
+                && !contiguous(0x00ff_ffff)
+        );
         assert_eq!(MAX_MESSAGE, 763);
         assert_eq!(MAX_NG_ENTRIES, 3276);
     }
@@ -1488,14 +1854,30 @@ mod tests {
         let bad_family = [vec![0, 7], a[2..].to_vec()].concat();
         let bad_mask = v2_entry(0, [10, 0, 0, 0], [255, 0, 255, 0], [0; 4], 1);
         let b2 = v2_entry(0, [10, 2, 0, 0], [255, 255, 0, 0], [0; 4], 2);
-        let b = msg(2, 2, &[a.clone(), bad_metric, bad_family, bad_mask, b2.clone()]);
-        assert_eq!(check(&b), Err(Error::Metric { entry: 1, metric: 17 }));
+        let b = msg(
+            2,
+            2,
+            &[a.clone(), bad_metric, bad_family, bad_mask, b2.clone()],
+        );
+        assert_eq!(
+            check(&b),
+            Err(Error::Metric {
+                entry: 1,
+                metric: 17
+            })
+        );
         let r = Message::receive(&b).unwrap();
         assert_eq!(
             r.skipped,
             vec![
-                Error::Metric { entry: 1, metric: 17 },
-                Error::Family { entry: 2, family: 7 },
+                Error::Metric {
+                    entry: 1,
+                    metric: 17
+                },
+                Error::Family {
+                    entry: 2,
+                    family: 7
+                },
                 Error::Mask { entry: 3 },
             ]
         );
@@ -1507,27 +1889,63 @@ mod tests {
         let mut pw = vec![0xff, 0xff, 0, 2];
         pw.extend_from_slice(&[0; 16]);
         let r = Message::receive(&msg(2, 1, &[pw, v1.clone()])).unwrap();
-        assert_eq!(r.skipped, vec![Error::Family { entry: 0, family: 0xffff }]);
+        assert_eq!(
+            r.skipped,
+            vec![Error::Family {
+                entry: 0,
+                family: 0xffff
+            }]
+        );
         assert_eq!(r.message, Message::parse(&msg(2, 1, &[v1])).unwrap());
         // Every entry skipped leaves no routes.
         let r = Message::receive(&msg(2, 2, &[route_bytes(0)])).unwrap();
         assert_eq!(r.message.entries, Entries::Routes(vec![]));
         assert_eq!(r.message.to_bytes(), Err(Error::NoEntries));
         // Rules about the message as a whole still fail it.
-        assert_eq!(Message::receive(&msg(2, 2, &[a.clone(), a[..10].to_vec()])), Err(Error::Truncated));
-        assert_eq!(Message::receive(&msg(2, 2, &[whole_table_entry()])), Err(Error::WholeTable { entry: 0 }));
-        assert_eq!(Message::receive(&msg(2, 1, &[route_bytes(1)])), Err(Error::MustBeZero { offset: 12 }));
+        assert_eq!(
+            Message::receive(&msg(2, 2, &[a.clone(), a[..10].to_vec()])),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            Message::receive(&msg(2, 2, &[whole_table_entry()])),
+            Err(Error::WholeTable { entry: 0 })
+        );
+        assert_eq!(
+            Message::receive(&msg(2, 1, &[route_bytes(1)])),
+            Err(Error::MustBeZero { offset: 12 })
+        );
         // RFC 2080 2.4.2: the same for RIPng.
         let doc: Ipv6Addr = "2001:db8::".parse().unwrap();
         let ok = ng_entry_bytes(doc, 0, 32, 1);
-        let b = msg(2, 1, &[ok.clone(), ng_entry_bytes(doc, 0, 129, 1), ng_entry_bytes(doc, 0, 32, 17), ok.clone()]);
-        assert_eq!(ng_check(&b), Err(Error::PrefixLength { entry: 1, len: 129 }));
+        let b = msg(
+            2,
+            1,
+            &[
+                ok.clone(),
+                ng_entry_bytes(doc, 0, 129, 1),
+                ng_entry_bytes(doc, 0, 32, 17),
+                ok.clone(),
+            ],
+        );
+        assert_eq!(
+            ng_check(&b),
+            Err(Error::PrefixLength { entry: 1, len: 129 })
+        );
         let r = NgMessage::receive(&b).unwrap();
         assert_eq!(
             r.skipped,
-            vec![Error::PrefixLength { entry: 1, len: 129 }, Error::Metric { entry: 2, metric: 17 }]
+            vec![
+                Error::PrefixLength { entry: 1, len: 129 },
+                Error::Metric {
+                    entry: 2,
+                    metric: 17
+                }
+            ]
         );
-        assert_eq!(r.message, NgMessage::parse(&msg(2, 1, &[ok.clone(), ok])).unwrap());
+        assert_eq!(
+            r.message,
+            NgMessage::parse(&msg(2, 1, &[ok.clone(), ok])).unwrap()
+        );
         // A request whose only good entry is ::/0 with metric 16, after one
         // that was skipped, is not a whole-table request.
         let wt = ng_entry_bytes(Ipv6Addr::UNSPECIFIED, 0, 0, 16);
@@ -1554,10 +1972,28 @@ mod tests {
         // RFC 2080 2.1.1: a next hop that is not link-local is read as ::.
         let doc: Ipv6Addr = "2001:db8::".parse().unwrap();
         let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        let route = NgRoute { prefix: doc, tag: 0, prefix_len: 32, metric: 1 };
-        let b = msg(2, 1, &[ng_entry_bytes(global, 0, 0, 0xff), ng_entry_bytes(doc, 0, 32, 1)]);
+        let route = NgRoute {
+            prefix: doc,
+            tag: 0,
+            prefix_len: 32,
+            metric: 1,
+        };
+        let b = msg(
+            2,
+            1,
+            &[
+                ng_entry_bytes(global, 0, 0, 0xff),
+                ng_entry_bytes(doc, 0, 32, 1),
+            ],
+        );
         let m = ng_check(&b).unwrap();
-        assert_eq!(m.entries, NgEntries::Entries(vec![NgEntry::NextHop(Ipv6Addr::UNSPECIFIED), NgEntry::Route(route)]));
+        assert_eq!(
+            m.entries,
+            NgEntries::Entries(vec![
+                NgEntry::NextHop(Ipv6Addr::UNSPECIFIED),
+                NgEntry::Route(route)
+            ])
+        );
         // A writer does not send one.
         let w = NgMessage {
             command: Command::Response,
@@ -1565,11 +2001,25 @@ mod tests {
         };
         assert_eq!(w.to_bytes(), Err(Error::Unwritable));
         // The edges of fe80::/10.
-        for (a, kept) in [("fe80::1", true), ("febf:ffff::1", true), ("fec0::1", false), ("ff02::9", false)] {
+        for (a, kept) in [
+            ("fe80::1", true),
+            ("febf:ffff::1", true),
+            ("fec0::1", false),
+            ("ff02::9", false),
+        ] {
             let a: Ipv6Addr = a.parse().unwrap();
-            let m = ng_check(&msg(2, 1, &[ng_entry_bytes(a, 0, 0, 0xff), ng_entry_bytes(doc, 0, 32, 1)])).unwrap();
+            let m = ng_check(&msg(
+                2,
+                1,
+                &[ng_entry_bytes(a, 0, 0, 0xff), ng_entry_bytes(doc, 0, 32, 1)],
+            ))
+            .unwrap();
             let want = if kept { a } else { Ipv6Addr::UNSPECIFIED };
-            assert_eq!(m.entries, NgEntries::Entries(vec![NgEntry::NextHop(want), NgEntry::Route(route)]), "{a}");
+            assert_eq!(
+                m.entries,
+                NgEntries::Entries(vec![NgEntry::NextHop(want), NgEntry::Route(route)]),
+                "{a}"
+            );
         }
     }
 
@@ -1587,7 +2037,12 @@ mod tests {
         let crypto = |n: usize| Message {
             command: Command::Response,
             version: Version::V2,
-            auth: Some(Auth::Crypto(Crypto { key_id: 1, data_len: 16, sequence: 1, data: vec![9; 16] })),
+            auth: Some(Auth::Crypto(Crypto {
+                key_id: 1,
+                data_len: 16,
+                sequence: 1,
+                data: vec![9; 16],
+            })),
             entries: Entries::Routes(vec![route; n]),
         };
         assert!(crypto(23).fits_datagram());
@@ -1609,14 +2064,22 @@ mod tests {
         assert_eq!(wire.len(), 524);
         assert_eq!(check(&wire), Ok(crypto(24)));
         // Without a trailer, 25 entries are 504 bytes.
-        let plain = Message { auth: Some(Auth::Password([0; 16])), ..crypto(24) };
+        let plain = Message {
+            auth: Some(Auth::Password([0; 16])),
+            ..crypto(24)
+        };
         assert_eq!(plain.to_bytes().unwrap().len(), 504);
         assert!(plain.fits_datagram());
         // Include the exact boundary and the first byte above it.
         for size in [MAX_DATAGRAM, MAX_DATAGRAM + 1] {
             let digest = size - 488; // Header, authentication, 23 routes, trailer header.
             let m = Message {
-                auth: Some(Auth::Crypto(Crypto { key_id: 1, data_len: digest as u8, sequence: 1, data: vec![9; digest] })),
+                auth: Some(Auth::Crypto(Crypto {
+                    key_id: 1,
+                    data_len: digest as u8,
+                    sequence: 1,
+                    data: vec![9; digest],
+                })),
                 ..crypto(23)
             };
             assert_eq!(m.to_bytes().unwrap().len(), size);
@@ -1632,10 +2095,13 @@ mod tests {
         let mut stream = Stream::new(Collect::<Message>::new(MAX_MESSAGE));
         assert_eq!(stream.push(&b), b.len());
         stream.end();
-        let m = stream.with_next(|message, raw, _| {
-            assert_eq!(raw, b);
-            message
-        }).unwrap().unwrap();
+        let m = stream
+            .with_next(|message, raw, _| {
+                assert_eq!(raw, b);
+                message
+            })
+            .unwrap()
+            .unwrap();
         assert_ne!(m.to_bytes().unwrap(), b);
     }
 
@@ -1643,7 +2109,9 @@ mod tests {
     fn collection_reads_all_routes() {
         let b = msg(2, 2, &vec![route_bytes(1); MAX_ENTRIES]);
         let m = collect(&b).unwrap();
-        let Entries::Routes(routes) = m.entries else { panic!() };
+        let Entries::Routes(routes) = m.entries else {
+            panic!()
+        };
         assert_eq!(routes.len(), MAX_ENTRIES);
     }
 
@@ -1655,7 +2123,11 @@ mod tests {
             for _ in 0..rng.index(30) * 4 {
                 // Mostly small bytes, so families and metrics are often
                 // valid.
-                b.push(if !rng.coin() { 0 } else { rng.next() as u8 % 20 });
+                b.push(if !rng.coin() {
+                    0
+                } else {
+                    rng.next() as u8 % 20
+                });
             }
             b
         } else {
@@ -1704,14 +2176,32 @@ mod tests {
     fn lcg_fuzz_writers() {
         let mut rng = Lcg::new(42);
         for _ in 0..4000 {
-            let command = if !rng.coin() { Command::Request } else { Command::Response };
-            let version = if !rng.coin() { Version::V1 } else { Version::V2 };
-            let small = |rng: &mut Lcg| if rng.index(3) == 0 { rng.next() as u8 } else { 0 };
+            let command = if !rng.coin() {
+                Command::Request
+            } else {
+                Command::Response
+            };
+            let version = if !rng.coin() {
+                Version::V1
+            } else {
+                Version::V2
+            };
+            let small = |rng: &mut Lcg| {
+                if rng.index(3) == 0 {
+                    rng.next() as u8
+                } else {
+                    0
+                }
+            };
             let auth = match rng.index(5) {
                 0 => Some(Auth::Password([rng.next() as u8; 16])),
                 1 => {
                     let n = rng.index(40);
-                    let data_len = if rng.index(4) == 0 { rng.next() as u8 } else { n as u8 };
+                    let data_len = if rng.index(4) == 0 {
+                        rng.next() as u8
+                    } else {
+                        n as u8
+                    };
                     Some(Auth::Crypto(Crypto {
                         key_id: rng.next() as u8,
                         data_len,
@@ -1719,7 +2209,10 @@ mod tests {
                         data: vec![rng.next() as u8; n],
                     }))
                 }
-                2 => Some(Auth::Other { kind: rng.index(5) as u16, data: [rng.next() as u8; 16] }),
+                2 => Some(Auth::Other {
+                    kind: rng.index(5) as u16,
+                    data: [rng.next() as u8; 16],
+                }),
                 _ => None,
             };
             let entries = if rng.index(6) == 0 {
@@ -1728,15 +2221,26 @@ mod tests {
                 let routes = (0..rng.index(28))
                     .map(|_| RouteEntry {
                         tag: u16::from(small(&mut rng)),
-                        address: Ipv4Addr::from(u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8))),
-                        mask: Ipv4Addr::from(if !rng.coin() { 0 } else { u32::MAX << rng.index(32) }),
+                        address: Ipv4Addr::from(u32::from_be_bytes(std::array::from_fn(|_| {
+                            rng.next() as u8
+                        }))),
+                        mask: Ipv4Addr::from(if !rng.coin() {
+                            0
+                        } else {
+                            u32::MAX << rng.index(32)
+                        }),
                         next_hop: Ipv4Addr::from(u32::from(small(&mut rng))),
                         metric: rng.index(19) as u8,
                     })
                     .collect();
                 Entries::Routes(routes)
             };
-            let m = Message { command, version, auth, entries };
+            let m = Message {
+                command,
+                version,
+                auth,
+                entries,
+            };
             if let Ok(b) = m.to_bytes() {
                 assert!(b.len() <= MAX_MESSAGE);
                 assert_eq!(check(&b), Ok(m));
@@ -1748,10 +2252,16 @@ mod tests {
                     (0..rng.index(8))
                         .map(|_| {
                             if rng.index(4) == 0 {
-                                NgEntry::NextHop(Ipv6Addr::from(u128::from(u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)))))
+                                NgEntry::NextHop(Ipv6Addr::from(u128::from(u32::from_be_bytes(
+                                    std::array::from_fn(|_| rng.next() as u8),
+                                ))))
                             } else {
                                 NgEntry::Route(NgRoute {
-                                    prefix: Ipv6Addr::from(u128::from(u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8))) << 96),
+                                    prefix: Ipv6Addr::from(
+                                        u128::from(u32::from_be_bytes(std::array::from_fn(|_| {
+                                            rng.next() as u8
+                                        }))) << 96,
+                                    ),
                                     tag: u16::from(small(&mut rng)),
                                     prefix_len: rng.index(140) as u8,
                                     metric: rng.index(19) as u8,
@@ -1761,7 +2271,10 @@ mod tests {
                         .collect(),
                 )
             };
-            let n = NgMessage { command, entries: ng_entries };
+            let n = NgMessage {
+                command,
+                entries: ng_entries,
+            };
             if let Ok(b) = n.to_bytes() {
                 assert_eq!(ng_check(&b), Ok(n));
             }

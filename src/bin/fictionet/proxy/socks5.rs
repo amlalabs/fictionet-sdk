@@ -37,14 +37,19 @@ async fn send_reply<W: AsyncWrite + Unpin>(w: &mut W, code: ReplyCode) {
 
 /// Serves one client connection.
 pub(crate) async fn serve(mut client: TcpStream, stack: Stack, token: Token) {
-    let Connect { host, port, early } = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut client, &token)).await {
-        Err(_) => return log("socks5: no whole handshake within 10 s"),
-        Ok(Ok(connect)) => connect,
-        Ok(Err(Refusal::Malformed(why))) => return log(&format!("socks5: {why}")),
-        Ok(Err(Refusal::NoMethod)) => return log("socks5: the client did not offer username/password"),
-        Ok(Err(Refusal::BadToken)) => return log("socks5: wrong token"),
-        Ok(Err(Refusal::Reply(code, why))) => return log(&format!("socks5: reply {}, {why}", code.code())),
-    };
+    let Connect { host, port, early } =
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut client, &token)).await {
+            Err(_) => return log("socks5: no whole handshake within 10 s"),
+            Ok(Ok(connect)) => connect,
+            Ok(Err(Refusal::Malformed(why))) => return log(&format!("socks5: {why}")),
+            Ok(Err(Refusal::NoMethod)) => {
+                return log("socks5: the client did not offer username/password");
+            }
+            Ok(Err(Refusal::BadToken)) => return log("socks5: wrong token"),
+            Ok(Err(Refusal::Reply(code, why))) => {
+                return log(&format!("socks5: reply {}, {why}", code.code()));
+            }
+        };
     let what = format!("socks5 CONNECT {host}:{port}");
     let started = Instant::now();
     let (conn, addr) = match stack.connect(&host, port).await {
@@ -61,14 +66,26 @@ pub(crate) async fn serve(mut client: TcpStream, stack: Stack, token: Token) {
         std::net::SocketAddr::V6(_) => None,
     };
     let mut world = conn.into_tokio(stack.fcx());
-    if client.write_all(&reply(ReplyCode::Succeeded, bound)).await.is_err() {
-        return log(&format!("{what} ({}) reply 0, but the client closed the connection first", IpAddr::V4(addr)));
+    if client
+        .write_all(&reply(ReplyCode::Succeeded, bound))
+        .await
+        .is_err()
+    {
+        return log(&format!(
+            "{what} ({}) reply 0, but the client closed the connection first",
+            IpAddr::V4(addr)
+        ));
     }
     if !early.is_empty() && world.write_all(&early).await.is_err() {
-        return log(&format!("{what} ({}) reply 0, but the site closed the connection first", IpAddr::V4(addr)));
+        return log(&format!(
+            "{what} ({}) reply 0, but the site closed the connection first",
+            IpAddr::V4(addr)
+        ));
     }
     let (moved, error) = pump::tunnel(&mut client, &mut world).await;
-    let end = error.map(|e| format!(", ended early by {e}")).unwrap_or_default();
+    let end = error
+        .map(|e| format!(", ended early by {e}"))
+        .unwrap_or_default();
     log(&format!(
         "{what} ({}) reply 0, {} bytes up, {} down, {:.3} s{end}",
         IpAddr::V4(addr),
@@ -87,7 +104,10 @@ mod tests {
         assert_eq!(reply_for(&Fail::NoSuchName), ReplyCode::HostUnreachable);
         assert_eq!(reply_for(&Fail::Refused), ReplyCode::ConnectionRefused);
         assert_eq!(reply_for(&Fail::Unreachable(1)), ReplyCode::HostUnreachable);
-        assert_eq!(reply_for(&Fail::Unreachable(0)), ReplyCode::NetworkUnreachable);
+        assert_eq!(
+            reply_for(&Fail::Unreachable(0)),
+            ReplyCode::NetworkUnreachable
+        );
         assert_eq!(reply_for(&Fail::TimedOut), ReplyCode::TtlExpired);
         assert_eq!(reply_for(&Fail::WorldGone), ReplyCode::GeneralFailure);
     }

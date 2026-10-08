@@ -3,8 +3,8 @@
 #![no_main]
 
 use fictionet::stdlib::amqp::{
-    BasicProperties, ContentHeader, Frame, FrameKind, Frames, MAX_PAYLOAD, Method, Table, content_frames, frame_limit,
-    plain_credentials,
+    BasicProperties, ContentHeader, Frame, FrameKind, Frames, MAX_PAYLOAD, Method, Table,
+    content_frames, frame_limit, plain_credentials,
 };
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
@@ -14,7 +14,9 @@ use libfuzzer_sys::fuzz_target;
 /// Writes a message with `content_frames` and reads it back through a
 /// decoder of the same frame-max.
 fn message(method: &Method, properties: &BasicProperties, body: &[u8], frame_max: u32) {
-    let Ok(frames) = content_frames(1, method, properties, body, frame_max) else { return };
+    let Ok(frames) = content_frames(1, method, properties, body, frame_max) else {
+        return;
+    };
     let room = (frame_limit(frame_max) - 8) as usize;
     let mut stream = Vec::new();
     for f in &frames {
@@ -29,9 +31,16 @@ fn message(method: &Method, properties: &BasicProperties, body: &[u8], frame_max
     let header = ContentHeader::parse(&back[1].payload).unwrap();
     assert_eq!(header.body_size, body.len() as u64);
     assert_eq!(&header.properties, properties);
-    let joined: Vec<u8> = back[2..].iter().flat_map(|f| f.payload.iter().copied()).collect();
+    let joined: Vec<u8> = back[2..]
+        .iter()
+        .flat_map(|f| f.payload.iter().copied())
+        .collect();
     assert_eq!(joined, body);
-    assert!(back[2..].iter().all(|f| f.kind == FrameKind::Body && f.payload.len() <= room));
+    assert!(
+        back[2..]
+            .iter()
+            .all(|f| f.kind == FrameKind::Body && f.payload.len() <= room)
+    );
 }
 
 /// A payload read as each kind of thing it might be. Whatever reads can be
@@ -51,7 +60,10 @@ fn payload(p: &[u8], frame_max: u32) {
     }
     if let Ok(h) = ContentHeader::parse(p) {
         let bytes = h.to_bytes().unwrap();
-        assert_eq!(ContentHeader::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
+        assert_eq!(
+            ContentHeader::parse(&bytes).unwrap().to_bytes().unwrap(),
+            bytes
+        );
         let publish = Method::BasicPublish {
             exchange: String::new(),
             routing_key: "q".into(),
@@ -81,7 +93,12 @@ fuzz_target!(|data: &[u8]| {
     // A frame built from any bytes: whatever its writer writes, its reader
     // reads back as the same frame.
     if let [kind, c0, c1, rest @ ..] = data {
-        let kinds = [FrameKind::Method, FrameKind::Header, FrameKind::Body, FrameKind::Heartbeat];
+        let kinds = [
+            FrameKind::Method,
+            FrameKind::Header,
+            FrameKind::Body,
+            FrameKind::Heartbeat,
+        ];
         let f = Frame {
             kind: kinds[usize::from(kind % 4)],
             channel: u16::from_be_bytes([*c0, *c1]),

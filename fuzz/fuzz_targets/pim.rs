@@ -5,15 +5,25 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::pim::{
-    ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, CandidateRp, Endpoints, Message, Error, checksum,
+    ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, CandidateRp, Endpoints, Error, Message, checksum,
 };
-use fictionet::stdlib::{codec::{Wire, Collect, Decode}, test_support::contract, pim};
+use fictionet::stdlib::{
+    codec::{Collect, Decode, Wire},
+    pim,
+    test_support::contract,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let ends = [
-        Endpoints::V4 { source: Ipv4Addr::new(10, 0, 0, 2), destination: ALL_PIM_ROUTERS_V4 },
-        Endpoints::V6 { source: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2), destination: ALL_PIM_ROUTERS_V6 },
+        Endpoints::V4 {
+            source: Ipv4Addr::new(10, 0, 0, 2),
+            destination: ALL_PIM_ROUTERS_V4,
+        },
+        Endpoints::V6 {
+            source: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
+            destination: ALL_PIM_ROUTERS_V6,
+        },
     ];
     for e in &ends {
         check(data, e);
@@ -28,10 +38,16 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn check(data: &[u8], e: &Endpoints) {
-    contract::check_decode_with_alloc_limit(|| Collect::<pim::Datagram>::new(pim::MAX_MESSAGE), data, 2 * (pim::MAX_MESSAGE + 1));
     contract::check_decode_with_alloc_limit(
-        || Collect::<pim::Datagram>::new(pim::MAX_MESSAGE)
-            .map(|datagram| Message::parse(&datagram.0, e)),
+        || Collect::<pim::Datagram>::new(pim::MAX_MESSAGE),
+        data,
+        2 * (pim::MAX_MESSAGE + 1),
+    );
+    contract::check_decode_with_alloc_limit(
+        || {
+            Collect::<pim::Datagram>::new(pim::MAX_MESSAGE)
+                .map(|datagram| Message::parse(&datagram.0, e))
+        },
         data,
         2 * (pim::MAX_MESSAGE + 1),
     );
@@ -54,14 +70,20 @@ fn check(data: &[u8], e: &Endpoints) {
         if let Message::CandidateRp(CandidateRp { groups, .. }) = m
             && groups.is_empty()
         {
-            assert_eq!(m.frame(e).and_then(|frame| frame.to_bytes()), Err(Error::Count));
+            assert_eq!(
+                m.frame(e).and_then(|frame| frame.to_bytes()),
+                Err(Error::Count)
+            );
             return;
         }
         // Any other message read can be written, and reads back the same.
         let bytes = m.frame(e).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(bytes.len(), data.len());
         assert_eq!(m.encoded_len(), Ok(bytes.len()));
-        assert_eq!(checksum(&bytes, e), Some(u16::from_be_bytes([bytes[2], bytes[3]])));
+        assert_eq!(
+            checksum(&bytes, e),
+            Some(u16::from_be_bytes([bytes[2], bytes[3]]))
+        );
         assert_eq!(Message::parse(&bytes, e).as_ref(), Ok(m));
     }
 }

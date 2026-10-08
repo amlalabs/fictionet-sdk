@@ -15,7 +15,9 @@ use fictionet::prelude::*;
 use fictionet::stdlib::tls::{self, ServerConfig};
 use fictionet::stdlib::{ConnError, Connection};
 use fictionet::{Cx, block_on, run};
-use rcgen::{BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{AlertDescription, ClientConfig, ClientConnection, RootCertStore};
 
@@ -44,11 +46,22 @@ struct MemConn {
 fn mem_pair() -> (MemConn, MemConn) {
     let a = Arc::new(Mutex::new(Pipe::default()));
     let b = Arc::new(Mutex::new(Pipe::default()));
-    (MemConn { rx: a.clone(), tx: b.clone() }, MemConn { rx: b, tx: a })
+    (
+        MemConn {
+            rx: a.clone(),
+            tx: b.clone(),
+        },
+        MemConn { rx: b, tx: a },
+    )
 }
 
 impl Connection for MemConn {
-    fn poll_read(&mut self, fcx: &Cx, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_read(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, ConnError>> {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
@@ -70,7 +83,12 @@ impl Connection for MemConn {
         Poll::Ready(Ok(n))
     }
 
-    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_write(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<Result<usize, ConnError>> {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
@@ -144,7 +162,12 @@ impl From<ConnError> for ClientError {
 }
 
 impl Client {
-    async fn connect(fcx: &Cx, conn: MemConn, config: Arc<ClientConfig>, name: &str) -> Result<Client, ClientError> {
+    async fn connect(
+        fcx: &Cx,
+        conn: MemConn,
+        config: Arc<ClientConfig>,
+        name: &str,
+    ) -> Result<Client, ClientError> {
         let name = ServerName::try_from(name.to_owned()).unwrap();
         let tls = ClientConnection::new(config, name).unwrap();
         let mut c = Client { conn, tls };
@@ -194,7 +217,9 @@ impl Client {
             match self.tls.reader().read(buf) {
                 Ok(n) => return Ok(n),
                 Err(e) if e.kind() == ErrorKind::WouldBlock => self.read_more(fcx).await?,
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(ClientError::Truncated),
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                    return Err(ClientError::Truncated);
+                }
                 Err(e) => panic!("{e}"),
             }
         }
@@ -202,7 +227,11 @@ impl Client {
 
     async fn write_all(&mut self, fcx: &Cx, mut data: &[u8]) -> Result<(), ClientError> {
         while !data.is_empty() {
-            let n = self.tls.writer().write(&data[..data.len().min(16 * 1024)]).unwrap();
+            let n = self
+                .tls
+                .writer()
+                .write(&data[..data.len().min(16 * 1024)])
+                .unwrap();
             data = &data[n..];
             self.flush(fcx).await?;
         }
@@ -255,7 +284,9 @@ impl Ca {
         to: i32,
         usage: ExtendedKeyUsagePurpose,
     ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-        let mut params = CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap();
+        let mut params =
+            CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+                .unwrap();
         params.not_before = rcgen::date_time_ymd(from, 1, 1);
         params.not_after = rcgen::date_time_ymd(to, 1, 1);
         params.extended_key_usages = vec![usage];
@@ -289,7 +320,9 @@ struct FixedTime(SystemTime);
 
 impl rustls::time_provider::TimeProvider for FixedTime {
     fn current_time(&self) -> Option<UnixTime> {
-        Some(UnixTime::since_unix_epoch(self.0.duration_since(UNIX_EPOCH).unwrap()))
+        Some(UnixTime::since_unix_epoch(
+            self.0.duration_since(UNIX_EPOCH).unwrap(),
+        ))
     }
 }
 
@@ -332,7 +365,9 @@ fn handshake_with_sni_and_alpn() {
                 Ok(())
             });
 
-            let mut client = Client::connect(&fcx, client_side, client_config, "example.test").await.unwrap();
+            let mut client = Client::connect(&fcx, client_side, client_config, "example.test")
+                .await
+                .unwrap();
             assert_eq!(client.tls.alpn_protocol(), Some(&b"h2"[..]));
             client.write_all(&fcx, b"ping").await.unwrap();
             let mut buf = [0; 4];
@@ -361,7 +396,11 @@ fn the_world_picks_a_config_per_handshake() {
                 let (a, b) = (a.clone(), b.clone());
                 let server = fcx.spawn(move |fcx| async move {
                     let hello = tls::server(&fcx, server_side).await?;
-                    let config = if hello.server_name() == Some("a.test") { a } else { b };
+                    let config = if hello.server_name() == Some("a.test") {
+                        a
+                    } else {
+                        b
+                    };
                     let mut conn = hello.finish(&fcx, config).await?;
                     conn.write_all(&fcx, b"hi").await?;
                     conn.shutdown(&fcx).await?;
@@ -369,7 +408,9 @@ fn the_world_picks_a_config_per_handshake() {
                 });
                 // The client checks the certificate matches the name, so the
                 // handshake succeeds only if the server picked the right one.
-                let mut client = Client::connect(&fcx, client_side, client_config.clone(), name).await.unwrap();
+                let mut client = Client::connect(&fcx, client_side, client_config.clone(), name)
+                    .await
+                    .unwrap();
                 let mut buf = [0; 2];
                 let mut got = 0;
                 while got < 2 {
@@ -388,8 +429,14 @@ fn the_world_picks_a_config_per_handshake() {
                 assert_eq!(hello.finish(&fcx, a2).await.err(), Some(ConnError::Broken));
                 Ok(())
             });
-            let err = Client::connect(&fcx, client_side, client_config, "b.test").await.err().unwrap();
-            assert!(matches!(err, ClientError::Tls(rustls::Error::InvalidCertificate(_))), "{err:?}");
+            let err = Client::connect(&fcx, client_side, client_config, "b.test")
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(err, ClientError::Tls(rustls::Error::InvalidCertificate(_))),
+                "{err:?}"
+            );
             Ok(server.join(&fcx).await?)
         }))
     })
@@ -409,9 +456,17 @@ fn reject_sends_unrecognized_name() {
                 hello.reject(&fcx).await?;
                 Ok(())
             });
-            let err = Client::connect(&fcx, client_side, client_config, "unknown.test").await.err().unwrap();
+            let err = Client::connect(&fcx, client_side, client_config, "unknown.test")
+                .await
+                .err()
+                .unwrap();
             assert!(
-                matches!(err, ClientError::Tls(rustls::Error::AlertReceived(AlertDescription::UnrecognisedName))),
+                matches!(
+                    err,
+                    ClientError::Tls(rustls::Error::AlertReceived(
+                        AlertDescription::UnrecognisedName
+                    ))
+                ),
                 "{err:?}"
             );
             Ok(server.join(&fcx).await?)
@@ -431,7 +486,10 @@ fn a_dropped_hello_closes_with_no_alert() {
                 drop(tls::server(&fcx, server_side).await?);
                 Ok(())
             });
-            let err = Client::connect(&fcx, client_side, client_config, "x.test").await.err().unwrap();
+            let err = Client::connect(&fcx, client_side, client_config, "x.test")
+                .await
+                .err()
+                .unwrap();
             // The client reads the end of the stream, not an alert.
             assert!(matches!(err, ClientError::Truncated), "{err:?}");
             Ok(server.join(&fcx).await?)
@@ -446,10 +504,15 @@ fn a_first_message_that_is_not_a_hello_is_broken() {
         block_on(run(|fcx| async move {
             let (server_side, mut client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
-                assert_eq!(tls::server(&fcx, server_side).await.err(), Some(ConnError::Broken));
+                assert_eq!(
+                    tls::server(&fcx, server_side).await.err(),
+                    Some(ConnError::Broken)
+                );
                 Ok(())
             });
-            client_side.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await?;
+            client_side
+                .write_all(&fcx, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await?;
             server.join(&fcx).await?;
             // Nothing was sent back.
             let mut buf = [0; 16];
@@ -458,7 +521,10 @@ fn a_first_message_that_is_not_a_hello_is_broken() {
             // A client that closes before its hello is complete.
             let (server_side, mut client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
-                assert_eq!(tls::server(&fcx, server_side).await.err(), Some(ConnError::Broken));
+                assert_eq!(
+                    tls::server(&fcx, server_side).await.err(),
+                    Some(ConnError::Broken)
+                );
                 Ok(())
             });
             client_side.write_all(&fcx, &[22, 3, 1, 0, 200, 1]).await?;
@@ -480,8 +546,18 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
         block_on(run(move |fcx| async move {
             let ca = Ca::new();
             // Valid only in 2019.
-            let (client_chain, client_key) = ca.issue(&["client.test"], 2019, 2020, ExtendedKeyUsagePurpose::ClientAuth);
-            let (chain, key) = ca.issue(&["example.test"], 2000, 2100, ExtendedKeyUsagePurpose::ServerAuth);
+            let (client_chain, client_key) = ca.issue(
+                &["client.test"],
+                2019,
+                2020,
+                ExtendedKeyUsagePurpose::ClientAuth,
+            );
+            let (chain, key) = ca.issue(
+                &["example.test"],
+                2000,
+                2100,
+                ExtendedKeyUsagePurpose::ServerAuth,
+            );
             let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
                 Arc::new(ca.roots()),
                 Arc::new(provider()),
@@ -498,12 +574,15 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
             );
             // The client's clock says mid-2019, so it accepts the server.
             let client_config = Arc::new(
-                ClientConfig::builder_with_details(Arc::new(provider()), Arc::new(FixedTime(date(2019, 6, 1))))
-                    .with_safe_default_protocol_versions()
-                    .unwrap()
-                    .with_root_certificates(ca.roots())
-                    .with_client_auth_cert(client_chain, client_key)
-                    .unwrap(),
+                ClientConfig::builder_with_details(
+                    Arc::new(provider()),
+                    Arc::new(FixedTime(date(2019, 6, 1))),
+                )
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(ca.roots())
+                .with_client_auth_cert(client_chain, client_key)
+                .unwrap(),
             );
 
             let (server_side, client_side) = mem_pair();
@@ -526,14 +605,24 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
                 let mut buf = [0; 2];
                 let mut got = 0;
                 while got < 2 {
-                    got += c.read(&fcx, &mut buf[got..]).await.map_err(|e| format!("{e:?}"))?;
+                    got += c
+                        .read(&fcx, &mut buf[got..])
+                        .await
+                        .map_err(|e| format!("{e:?}"))?;
                 }
                 Ok::<_, String>(())
             };
             let client_result = client.await;
             server.join(&fcx).await?;
             let server_ok = result.lock().unwrap().unwrap();
-            *o.lock().unwrap() = Some((if server_ok { Ok(()) } else { Err(ConnError::Broken) }, client_result));
+            *o.lock().unwrap() = Some((
+                if server_ok {
+                    Ok(())
+                } else {
+                    Err(ConnError::Broken)
+                },
+                client_result,
+            ));
             Ok(())
         }))
         .unwrap();
@@ -563,7 +652,10 @@ fn close_notify_both_ways() {
             let (server_side, client_side) = mem_pair();
 
             let server = fcx.spawn(move |fcx| async move {
-                let mut conn = tls::server(&fcx, server_side).await?.finish(&fcx, config).await?;
+                let mut conn = tls::server(&fcx, server_side)
+                    .await?
+                    .finish(&fcx, config)
+                    .await?;
                 conn.write_all(&fcx, b"bye").await?;
                 conn.shutdown(&fcx).await?;
                 // Writing after shutdown fails.
@@ -582,7 +674,9 @@ fn close_notify_both_ways() {
                 Ok(())
             });
 
-            let mut client = Client::connect(&fcx, client_side, client_config, "example.test").await.unwrap();
+            let mut client = Client::connect(&fcx, client_side, client_config, "example.test")
+                .await
+                .unwrap();
             let mut got = Vec::new();
             let mut buf = [0; 64];
             loop {
@@ -620,7 +714,10 @@ fn five_megabytes_each_way() {
 
             let d = data.clone();
             let server = fcx.spawn(move |fcx| async move {
-                let mut conn = tls::server(&fcx, server_side).await?.finish(&fcx, config).await?;
+                let mut conn = tls::server(&fcx, server_side)
+                    .await?
+                    .finish(&fcx, config)
+                    .await?;
                 // Odd-sized writes, so records do not line up with them.
                 for chunk in d.chunks(70_001) {
                     conn.write_all(&fcx, chunk).await?;
@@ -642,7 +739,9 @@ fn five_megabytes_each_way() {
                 Ok(())
             });
 
-            let mut client = Client::connect(&fcx, client_side, client_config, "example.test").await.unwrap();
+            let mut client = Client::connect(&fcx, client_side, client_config, "example.test")
+                .await
+                .unwrap();
             let mut received = Vec::with_capacity(SIZE);
             let mut buf = vec![0; 40_000];
             while received.len() < SIZE {
@@ -668,7 +767,10 @@ fn tls12_clients_work_too() {
             let ca = Ca::new();
             let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
             // The config draws random values through Fictionet, not ring.
-            assert_eq!(format!("{:?}", config.crypto_provider().secure_random), "CxRandom");
+            assert_eq!(
+                format!("{:?}", config.crypto_provider().secure_random),
+                "CxRandom"
+            );
             let mut client_config = ClientConfig::builder_with_provider(Arc::new(provider()))
                 .with_protocol_versions(&[&rustls::version::TLS12])
                 .unwrap()
@@ -677,14 +779,23 @@ fn tls12_clients_work_too() {
             client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
             let (server_side, client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
-                let mut conn = tls::server(&fcx, server_side).await?.finish(&fcx, config).await?;
+                let mut conn = tls::server(&fcx, server_side)
+                    .await?
+                    .finish(&fcx, config)
+                    .await?;
                 assert_eq!(conn.alpn(), Some(&b"http/1.1"[..]));
                 conn.write_all(&fcx, b"twelve").await?;
                 conn.shutdown(&fcx).await?;
                 Ok(())
             });
-            let mut client = Client::connect(&fcx, client_side, Arc::new(client_config), "example.test").await.unwrap();
-            assert_eq!(client.tls.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_2));
+            let mut client =
+                Client::connect(&fcx, client_side, Arc::new(client_config), "example.test")
+                    .await
+                    .unwrap();
+            assert_eq!(
+                client.tls.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_2)
+            );
             let mut got = Vec::new();
             let mut buf = [0; 64];
             loop {
@@ -716,7 +827,10 @@ fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
             let server = fcx.spawn(move |fcx| async move {
                 let _ = fcx
                     .region(|region_fcx| async move {
-                        let mut conn = tls::server(&region_fcx, server_side).await?.finish(&region_fcx, config).await?;
+                        let mut conn = tls::server(&region_fcx, server_side)
+                            .await?
+                            .finish(&region_fcx, config)
+                            .await?;
                         // One byte now: rustls holds the rest, decrypted.
                         let mut one = [0; 1];
                         assert_eq!(conn.read(&region_fcx, &mut one).await?, 1);
@@ -727,7 +841,9 @@ fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
                     .await;
                 Ok(())
             });
-            let mut client = Client::connect(&fcx, client_side, client_config, "example.test").await.unwrap();
+            let mut client = Client::connect(&fcx, client_side, client_config, "example.test")
+                .await
+                .unwrap();
             client.write_all(&fcx, b"hello").await.unwrap();
             server.join(&fcx).await?;
             assert_eq!(rx.recv().unwrap(), Err(ConnError::Cancelled));
@@ -748,7 +864,11 @@ fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
                 });
                 // The client never says hello.
                 let res = tls::server_detailed(&region_fcx, server_side).await;
-                assert!(matches!(res, Err(tls::HandshakeError::Cancelled)), "{:?}", res.err());
+                assert!(
+                    matches!(res, Err(tls::HandshakeError::Cancelled)),
+                    "{:?}",
+                    res.err()
+                );
                 Ok(())
             })
             .await

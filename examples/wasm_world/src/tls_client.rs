@@ -18,9 +18,18 @@ pub(crate) struct TlsClient<C> {
 }
 
 impl<C: Connection> TlsClient<C> {
-    pub(crate) fn new(conn: C, config: Arc<rustls::ClientConfig>, name: &str) -> fictionet::Result<Self> {
+    pub(crate) fn new(
+        conn: C,
+        config: Arc<rustls::ClientConfig>,
+        name: &str,
+    ) -> fictionet::Result<Self> {
         let tls = ClientConnection::new(config, name.to_owned().try_into()?)?;
-        Ok(TlsClient { conn, tls, out: Vec::new(), inbuf: vec![0; 16 * 1024].into_boxed_slice() })
+        Ok(TlsClient {
+            conn,
+            tls,
+            out: Vec::new(),
+            inbuf: vec![0; 16 * 1024].into_boxed_slice(),
+        })
     }
 
     /// Finishes the handshake.
@@ -52,7 +61,9 @@ impl<C: Connection> TlsClient<C> {
                 if !self.tls.wants_write() {
                     return Poll::Ready(Ok(()));
                 }
-                self.tls.write_tls(&mut self.out).map_err(|_| ConnError::Broken)?;
+                self.tls
+                    .write_tls(&mut self.out)
+                    .map_err(|_| ConnError::Broken)?;
             }
             match self.conn.poll_write(fcx, cx, &self.out) {
                 Poll::Ready(Ok(n)) => {
@@ -76,8 +87,12 @@ impl<C: Connection> TlsClient<C> {
         loop {
             // The world's records are small, and the reader takes the
             // plaintext as it comes, so rustls always has room here.
-            self.tls.read_tls(&mut data).map_err(|_| ConnError::Broken)?;
-            self.tls.process_new_packets().map_err(|_| ConnError::Broken)?;
+            self.tls
+                .read_tls(&mut data)
+                .map_err(|_| ConnError::Broken)?;
+            self.tls
+                .process_new_packets()
+                .map_err(|_| ConnError::Broken)?;
             if data.is_empty() {
                 return Poll::Ready(Ok(n > 0));
             }
@@ -86,7 +101,12 @@ impl<C: Connection> TlsClient<C> {
 }
 
 impl<C: Connection> Connection for TlsClient<C> {
-    fn poll_read(&mut self, fcx: &Cx, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_read(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, ConnError>> {
         // A cancel comes first, before plaintext already decrypted.
         if fcx.is_cancelled() {
             return Poll::Ready(Err(ConnError::Cancelled));
@@ -110,11 +130,20 @@ impl<C: Connection> Connection for TlsClient<C> {
         }
     }
 
-    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_write(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<Result<usize, ConnError>> {
         if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
             return Poll::Ready(Err(e));
         }
-        let n = self.tls.writer().write(data).map_err(|_| ConnError::Broken)?;
+        let n = self
+            .tls
+            .writer()
+            .write(data)
+            .map_err(|_| ConnError::Broken)?;
         let _ = self.poll_flush(fcx, cx);
         Poll::Ready(Ok(n))
     }

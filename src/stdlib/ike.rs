@@ -81,7 +81,7 @@
 //! assert_eq!(back.notify(notify::INVALID_KE_PAYLOAD).unwrap().data, [0, 19]);
 //! ```
 
-use fictionet::stdlib::codec::{be16, Reader, Truncated};
+use fictionet::stdlib::codec::{Reader, Truncated, be16};
 
 use fictionet::stdlib::codec::Wire;
 
@@ -354,7 +354,10 @@ impl std::fmt::Display for Error {
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Short => f.write_str("message cut short"),
             Error::Version(v) => write!(f, "version byte {v:#04x}, not IKEv2"),
-            Error::MessageLength(n) => write!(f, "message length {n}, outside {HEADER_LEN}..={MAX_MESSAGE}"),
+            Error::MessageLength(n) => write!(
+                f,
+                "message length {n}, outside {HEADER_LEN}..={MAX_MESSAGE}"
+            ),
             Error::Trailing => f.write_str("bytes left after the last payload"),
             Error::PayloadLength(k) => write!(f, "payload type {k} has a bad length"),
             Error::Body { kind, reason } => write!(f, "payload type {kind}: {reason}"),
@@ -440,7 +443,11 @@ impl Message {
     /// peer sends it, so it has the initiator flag only when the request
     /// does not.
     pub fn response(&self, payloads: Vec<Payload>) -> Message {
-        let initiator = if self.is_initiator() { 0 } else { flags::INITIATOR };
+        let initiator = if self.is_initiator() {
+            0
+        } else {
+            flags::INITIATOR
+        };
         Message {
             initiator_spi: self.initiator_spi,
             responder_spi: self.responder_spi,
@@ -504,7 +511,10 @@ pub struct Payload {
 impl Payload {
     /// A payload that is not marked critical.
     pub fn new(body: Body) -> Payload {
-        Payload { critical: false, body }
+        Payload {
+            critical: false,
+            body,
+        }
     }
 
     /// The payload type.
@@ -737,7 +747,9 @@ impl EncryptedFragment {
     /// total are not 0, the number is at most the total, and only the
     /// first fragment names a first payload.
     pub fn is_valid(&self) -> bool {
-        self.number != 0 && self.number <= self.total && (self.number == 1 || self.first_payload == payload::NONE)
+        self.number != 0
+            && self.number <= self.total
+            && (self.number == 1 || self.first_payload == payload::NONE)
     }
 }
 
@@ -838,12 +850,22 @@ fn parse_body(kind: u8, next: u8, b: &[u8]) -> Result<Body, Error> {
         payload::SA => Body::SecurityAssociation(parse_sa(b)?),
         payload::KE => {
             let rest = b.get(4..).ok_or_else(short)?;
-            Body::KeyExchange(KeyExchange { group: be16(b, 0).ok_or(short())?, data: rest.to_vec() })
+            Body::KeyExchange(KeyExchange {
+                group: be16(b, 0).ok_or(short())?,
+                data: rest.to_vec(),
+            })
         }
         payload::IDI | payload::IDR => {
             let rest = b.get(4..).ok_or_else(short)?;
-            let ident = Identification { kind: b[0], data: rest.to_vec() };
-            if kind == payload::IDI { Body::IdInitiator(ident) } else { Body::IdResponder(ident) }
+            let ident = Identification {
+                kind: b[0],
+                data: rest.to_vec(),
+            };
+            if kind == payload::IDI {
+                Body::IdInitiator(ident)
+            } else {
+                Body::IdResponder(ident)
+            }
         }
         payload::NONCE => Body::Nonce(b.to_vec()),
         payload::NOTIFY => {
@@ -851,7 +873,9 @@ fn parse_body(kind: u8, next: u8, b: &[u8]) -> Result<Body, Error> {
                 return Err(short());
             }
             let spi_size = usize::from(b[1]);
-            let spi = b.get(4..4 + spi_size).ok_or(bad(kind, "SPI longer than the payload"))?;
+            let spi = b
+                .get(4..4 + spi_size)
+                .ok_or(bad(kind, "SPI longer than the payload"))?;
             Body::Notify(Notify {
                 protocol: b[0],
                 spi: spi.to_vec(),
@@ -877,22 +901,39 @@ fn parse_body(kind: u8, next: u8, b: &[u8]) -> Result<Body, Error> {
             } else {
                 rest.chunks_exact(spi_size).map(<[u8]>::to_vec).collect()
             };
-            Body::Delete(Delete { protocol: b[0], spi_size: b[1], spis })
+            Body::Delete(Delete {
+                protocol: b[0],
+                spi_size: b[1],
+                spis,
+            })
         }
         payload::VENDOR_ID => Body::VendorId(b.to_vec()),
         payload::TSI => Body::TsInitiator(parse_selectors(kind, b)?),
         payload::TSR => Body::TsResponder(parse_selectors(kind, b)?),
-        payload::SK => Body::Encrypted(Encrypted { first_payload: next, data: b.to_vec() }),
+        payload::SK => Body::Encrypted(Encrypted {
+            first_payload: next,
+            data: b.to_vec(),
+        }),
         payload::SKF => {
             let rest = b.get(4..).ok_or_else(short)?;
-            let f =
-                EncryptedFragment { first_payload: next, number: be16(b, 0).ok_or(short())?, total: be16(b, 2).ok_or(short())?, data: rest.to_vec() };
+            let f = EncryptedFragment {
+                first_payload: next,
+                number: be16(b, 0).ok_or(short())?,
+                total: be16(b, 2).ok_or(short())?,
+                data: rest.to_vec(),
+            };
             if !f.is_valid() {
-                return Err(bad(kind, "fragment number, total or next payload breaks RFC 7383"));
+                return Err(bad(
+                    kind,
+                    "fragment number, total or next payload breaks RFC 7383",
+                ));
             }
             Body::EncryptedFragment(f)
         }
-        _ => Body::Other { kind, data: b.to_vec() },
+        _ => Body::Other {
+            kind,
+            data: b.to_vec(),
+        },
     })
 }
 
@@ -920,13 +961,20 @@ fn parse_sa(b: &[u8]) -> Result<Vec<Proposal>, Error> {
         }
         let p = &rest[..len];
         let spi_size = usize::from(p[6]);
-        let spi = p.get(8..8 + spi_size).ok_or(bad(k, "SPI longer than its proposal"))?;
+        let spi = p
+            .get(8..8 + spi_size)
+            .ok_or(bad(k, "SPI longer than its proposal"))?;
         let transforms = parse_transforms(&p[8 + spi_size..], usize::from(p[7]))?;
         pos += len;
         if !last_flag(rest[0], pos == b.len(), 2) {
             return Err(bad(k, "proposal's last-substructure byte is wrong"));
         }
-        out.push(Proposal { number: p[4], protocol: p[5], spi: spi.to_vec(), transforms });
+        out.push(Proposal {
+            number: p[4],
+            protocol: p[5],
+            spi: spi.to_vec(),
+            transforms,
+        });
     }
     Ok(out)
 }
@@ -955,7 +1003,11 @@ fn parse_transforms(b: &[u8], count: usize) -> Result<Vec<Transform>, Error> {
         if !last_flag(rest[0], pos == b.len(), 3) {
             return Err(bad(k, "transform's last-substructure byte is wrong"));
         }
-        out.push(Transform { kind: rest[4], id: be16(rest, 6).ok_or(bad(k, "transform header cut short"))?, attributes });
+        out.push(Transform {
+            kind: rest[4],
+            id: be16(rest, 6).ok_or(bad(k, "transform header cut short"))?,
+            attributes,
+        });
     }
     if out.len() != count {
         return Err(bad(k, "fewer transforms than the proposal counts"));
@@ -978,12 +1030,20 @@ fn parse_attributes(b: &[u8]) -> Result<Vec<Attribute>, Error> {
         let t = be16(rest, 0).ok_or(bad(k, "attribute cut short"))?;
         let kind = t & 0x7fff;
         if t & 0x8000 != 0 {
-            out.push(Attribute { kind, value: AttributeValue::Short(be16(rest, 2).ok_or(bad(k, "attribute cut short"))?) });
+            out.push(Attribute {
+                kind,
+                value: AttributeValue::Short(be16(rest, 2).ok_or(bad(k, "attribute cut short"))?),
+            });
             pos += 4;
         } else {
             let len = usize::from(be16(rest, 2).ok_or(bad(k, "attribute cut short"))?);
-            let v = rest.get(4..4 + len).ok_or(bad(k, "attribute value cut short"))?;
-            out.push(Attribute { kind, value: AttributeValue::Long(v.to_vec()) });
+            let v = rest
+                .get(4..4 + len)
+                .ok_or(bad(k, "attribute value cut short"))?;
+            out.push(Attribute {
+                kind,
+                value: AttributeValue::Long(v.to_vec()),
+            });
             pos += 4 + len;
         }
     }
@@ -1008,7 +1068,11 @@ fn parse_selectors(k: u8, b: &[u8]) -> Result<Vec<TrafficSelector>, Error> {
         if rest.len() < 4 {
             return Err(bad(k, "selector header cut short"));
         }
-        let (kind, protocol, len) = (rest[0], rest[1], usize::from(be16(rest, 2).ok_or(bad(k, "selector header cut short"))?));
+        let (kind, protocol, len) = (
+            rest[0],
+            rest[1],
+            usize::from(be16(rest, 2).ok_or(bad(k, "selector header cut short"))?),
+        );
         if len < 4 || len > rest.len() {
             return Err(bad(k, "selector length out of range"));
         }
@@ -1019,20 +1083,39 @@ fn parse_selectors(k: u8, b: &[u8]) -> Result<Vec<TrafficSelector>, Error> {
                 if len != 8 + 2 * n {
                     return Err(bad(k, "address range selector has the wrong length"));
                 }
-                let (start_port, end_port) = (be16(s, 4).ok_or(bad(k, "selector header cut short"))?, be16(s, 6).ok_or(bad(k, "selector header cut short"))?);
+                let (start_port, end_port) = (
+                    be16(s, 4).ok_or(bad(k, "selector header cut short"))?,
+                    be16(s, 6).ok_or(bad(k, "selector header cut short"))?,
+                );
                 if n == 4 {
                     let a = |i: usize| Ipv4Addr::new(s[i], s[i + 1], s[i + 2], s[i + 3]);
-                    TrafficSelector::Ipv4 { protocol, start_port, end_port, start: a(8), end: a(12) }
+                    TrafficSelector::Ipv4 {
+                        protocol,
+                        start_port,
+                        end_port,
+                        start: a(8),
+                        end: a(12),
+                    }
                 } else {
                     let a = |i: usize| {
                         let mut o = [0u8; 16];
                         o.copy_from_slice(&s[i..i + 16]);
                         Ipv6Addr::from(o)
                     };
-                    TrafficSelector::Ipv6 { protocol, start_port, end_port, start: a(8), end: a(24) }
+                    TrafficSelector::Ipv6 {
+                        protocol,
+                        start_port,
+                        end_port,
+                        start: a(8),
+                        end: a(24),
+                    }
                 }
             }
-            _ => TrafficSelector::Other { kind, protocol, data: s[4..].to_vec() },
+            _ => TrafficSelector::Other {
+                kind,
+                protocol,
+                data: s[4..].to_vec(),
+            },
         };
         out.push(ts);
         pos += len;
@@ -1245,21 +1328,37 @@ fn write_selectors(sel: &[TrafficSelector], room: usize, out: &mut Vec<u8>) -> O
         }
         let mut bytes = Vec::new();
         match s {
-            TrafficSelector::Ipv4 { protocol, start_port, end_port, start, end } => {
+            TrafficSelector::Ipv4 {
+                protocol,
+                start_port,
+                end_port,
+                start,
+                end,
+            } => {
                 bytes.extend_from_slice(&[ts::IPV4_ADDR_RANGE, *protocol, 0, 16]);
                 bytes.extend_from_slice(&start_port.to_be_bytes());
                 bytes.extend_from_slice(&end_port.to_be_bytes());
                 bytes.extend_from_slice(&start.octets());
                 bytes.extend_from_slice(&end.octets());
             }
-            TrafficSelector::Ipv6 { protocol, start_port, end_port, start, end } => {
+            TrafficSelector::Ipv6 {
+                protocol,
+                start_port,
+                end_port,
+                start,
+                end,
+            } => {
                 bytes.extend_from_slice(&[ts::IPV6_ADDR_RANGE, *protocol, 0, 40]);
                 bytes.extend_from_slice(&start_port.to_be_bytes());
                 bytes.extend_from_slice(&end_port.to_be_bytes());
                 bytes.extend_from_slice(&start.octets());
                 bytes.extend_from_slice(&end.octets());
             }
-            TrafficSelector::Other { kind, protocol, data } => {
+            TrafficSelector::Other {
+                kind,
+                protocol,
+                data,
+            } => {
                 if *kind == ts::IPV4_ADDR_RANGE || *kind == ts::IPV6_ADDR_RANGE {
                     return None;
                 }
@@ -1288,7 +1387,11 @@ impl Wire for Header {
     /// The version and flag bytes are kept without validation.
     fn parse(b: &[u8]) -> Result<Header, Error> {
         if b.len() != HEADER_LEN {
-            return Err(if b.len() < HEADER_LEN { Error::Short } else { Error::Trailing });
+            return Err(if b.len() < HEADER_LEN {
+                Error::Short
+            } else {
+                Error::Trailing
+            });
         }
 
         let mut r = Reader::new(b);
@@ -1409,7 +1512,10 @@ impl Wire for NatT {
         let mut out = Vec::new();
         match self {
             NatT::Keepalive => out.push(NAT_KEEPALIVE),
-            NatT::Ike(message) => { out.extend_from_slice(&NON_ESP_MARKER); message.write(&mut out)?; }
+            NatT::Ike(message) => {
+                out.extend_from_slice(&NON_ESP_MARKER);
+                message.write(&mut out)?;
+            }
             NatT::Esp(data) => {
                 if data.len() < 4 || data.len() > MAX_MESSAGE + 4 || data[..4] == NON_ESP_MARKER {
                     return Err(Error::Unwritable);
@@ -1424,16 +1530,18 @@ impl Wire for NatT {
 
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Short }
+    fn from(_: Truncated) -> Self {
+        Error::Short
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::mutate;
+    use fictionet::stdlib::test_support::rounds;
 
     /// An IKE_SA_INIT request laid out by hand from the figures in RFC
     /// 7296 sections 3.1 to 3.10: header, SA, KE, Ni, and two notifies.
@@ -1484,21 +1592,38 @@ mod tests {
         assert_eq!(m.exchange, exchange::IKE_SA_INIT);
         assert!(m.is_initiator() && !m.is_response());
         assert_eq!(m.payloads.len(), 5);
-        let Body::SecurityAssociation(props) = &m.payloads[0].body else { panic!() };
+        let Body::SecurityAssociation(props) = &m.payloads[0].body else {
+            panic!()
+        };
         assert_eq!(props.len(), 1);
         assert_eq!(props[0].protocol, protocol::IKE);
         let t = &props[0].transforms;
         assert_eq!(t.len(), 4);
-        assert_eq!((t[0].kind, t[0].id), (transform::ENCR, transform::ENCR_AES_CBC));
-        assert_eq!(t[0].attributes, [Attribute { kind: transform::KEY_LENGTH, value: AttributeValue::Short(256) }]);
+        assert_eq!(
+            (t[0].kind, t[0].id),
+            (transform::ENCR, transform::ENCR_AES_CBC)
+        );
+        assert_eq!(
+            t[0].attributes,
+            [Attribute {
+                kind: transform::KEY_LENGTH,
+                value: AttributeValue::Short(256)
+            }]
+        );
         assert_eq!((t[3].kind, t[3].id), (transform::DH, transform::DH_ECP_256));
         assert_eq!(
             m.payloads[1].body,
-            Body::KeyExchange(KeyExchange { group: 19, data: vec![1, 2, 3, 4, 5, 6, 7, 8] })
+            Body::KeyExchange(KeyExchange {
+                group: 19,
+                data: vec![1, 2, 3, 4, 5, 6, 7, 8]
+            })
         );
         assert_eq!(m.payloads[2].body, Body::Nonce((0xa0..=0xaf).collect()));
         assert_eq!(m.notify(notify::COOKIE).unwrap().data, [0xc0, 0x0c]);
-        assert_eq!(m.notify(notify::NAT_DETECTION_SOURCE_IP).unwrap().data, [0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            m.notify(notify::NAT_DETECTION_SOURCE_IP).unwrap().data,
+            [0xde, 0xad, 0xbe, 0xef]
+        );
         assert!(m.notify(notify::INITIAL_CONTACT).is_none());
         // Written back, the bytes are the same.
         assert_eq!(m.to_bytes().unwrap(), bytes);
@@ -1574,20 +1699,47 @@ mod tests {
     #[test]
     fn payload_chain_errors() {
         // The header names a payload, and there is none.
-        assert_eq!(Message::parse(&raw(payload::NONCE, &[])), Err(Error::PayloadLength(payload::NONCE)));
+        assert_eq!(
+            Message::parse(&raw(payload::NONCE, &[])),
+            Err(Error::PayloadLength(payload::NONCE))
+        );
         // A payload length below 4, and past the end.
-        assert_eq!(Message::parse(&raw(payload::NONCE, &[0, 0, 0, 3])), Err(Error::PayloadLength(payload::NONCE)));
-        assert_eq!(Message::parse(&raw(payload::NONCE, &[0, 0, 0, 9, 1])), Err(Error::PayloadLength(payload::NONCE)));
+        assert_eq!(
+            Message::parse(&raw(payload::NONCE, &[0, 0, 0, 3])),
+            Err(Error::PayloadLength(payload::NONCE))
+        );
+        assert_eq!(
+            Message::parse(&raw(payload::NONCE, &[0, 0, 0, 9, 1])),
+            Err(Error::PayloadLength(payload::NONCE))
+        );
         // Bytes after the last payload.
-        assert_eq!(Message::parse(&raw(payload::NONCE, &[0, 0, 0, 5, 1, 9])), Err(Error::Trailing));
+        assert_eq!(
+            Message::parse(&raw(payload::NONCE, &[0, 0, 0, 5, 1, 9])),
+            Err(Error::Trailing)
+        );
         // Bytes after an SK payload, whose next field names what is inside.
-        assert_eq!(Message::parse(&raw(payload::SK, &[payload::IDI, 0, 0, 5, 1, 9])), Err(Error::Trailing));
+        assert_eq!(
+            Message::parse(&raw(payload::SK, &[payload::IDI, 0, 0, 5, 1, 9])),
+            Err(Error::Trailing)
+        );
         // Too many payloads.
-        let chain: Vec<u8> = (0..=MAX_PAYLOADS).flat_map(|_| [payload::VENDOR_ID, 0, 0, 4]).collect();
-        assert_eq!(Message::parse(&raw(payload::VENDOR_ID, &chain)), Err(Error::Limit("payloads")));
-        let chain: Vec<u8> =
-            (0..MAX_PAYLOADS).flat_map(|i| [if i + 1 == MAX_PAYLOADS { 0 } else { 43 }, 0, 0, 4]).collect();
-        assert_eq!(Message::parse(&raw(payload::VENDOR_ID, &chain)).unwrap().payloads.len(), MAX_PAYLOADS);
+        let chain: Vec<u8> = (0..=MAX_PAYLOADS)
+            .flat_map(|_| [payload::VENDOR_ID, 0, 0, 4])
+            .collect();
+        assert_eq!(
+            Message::parse(&raw(payload::VENDOR_ID, &chain)),
+            Err(Error::Limit("payloads"))
+        );
+        let chain: Vec<u8> = (0..MAX_PAYLOADS)
+            .flat_map(|i| [if i + 1 == MAX_PAYLOADS { 0 } else { 43 }, 0, 0, 4])
+            .collect();
+        assert_eq!(
+            Message::parse(&raw(payload::VENDOR_ID, &chain))
+                .unwrap()
+                .payloads
+                .len(),
+            MAX_PAYLOADS
+        );
     }
 
     fn body_err(kind: u8, body: &[u8]) -> Error {
@@ -1601,7 +1753,11 @@ mod tests {
         let mut chain = vec![0, 0];
         chain.extend_from_slice(&((4 + body.len()) as u16).to_be_bytes());
         chain.extend_from_slice(body);
-        Message::parse(&raw(kind, &chain)).unwrap().payloads.remove(0).body
+        Message::parse(&raw(kind, &chain))
+            .unwrap()
+            .payloads
+            .remove(0)
+            .body
     }
 
     fn is_body(e: Error, k: u8) -> bool {
@@ -1624,20 +1780,40 @@ mod tests {
             assert!(is_body(body_err(k, &[0, 0, 0]), k), "type {k}");
         }
         // A notify SPI longer than the payload.
-        assert!(is_body(body_err(payload::NOTIFY, &[3, 4, 0, 1, 0, 0, 0]), payload::NOTIFY));
+        assert!(is_body(
+            body_err(payload::NOTIFY, &[3, 4, 0, 1, 0, 0, 0]),
+            payload::NOTIFY
+        ));
         // Delete: count times size must fill the body.
-        assert!(is_body(body_err(payload::DELETE, &[3, 4, 0, 2, 1, 2, 3, 4]), payload::DELETE));
-        assert_eq!(body_err(payload::DELETE, &[3, 0, 0x10, 0x01]), Error::Limit("SPIs to delete"));
+        assert!(is_body(
+            body_err(payload::DELETE, &[3, 4, 0, 2, 1, 2, 3, 4]),
+            payload::DELETE
+        ));
+        assert_eq!(
+            body_err(payload::DELETE, &[3, 0, 0x10, 0x01]),
+            Error::Limit("SPIs to delete")
+        );
         // Proposals.
         let sa = payload::SA;
         assert!(is_body(body_err(sa, &[0, 0, 0, 8, 1, 1, 0]), sa));
         assert!(is_body(body_err(sa, &[0, 0, 0, 7, 1, 1, 0, 0]), sa));
         assert!(is_body(body_err(sa, &[0, 0, 0, 9, 1, 1, 0, 0]), sa));
         assert!(is_body(body_err(sa, &[0, 0, 0, 8, 1, 1, 1, 0]), sa));
-        assert!(is_body(body_err(sa, &[2, 0, 0, 8, 1, 1, 0, 0]), sa), "last proposal marked as not last");
-        assert!(is_body(body_err(sa, &[0, 0, 0, 8, 1, 1, 0, 0, 0, 0, 0, 8, 2, 1, 0, 0]), sa));
-        assert_eq!(body_err(sa, &[0, 0, 0, 8, 1, 1, 0, 65]), Error::Limit("transforms"));
-        let many: Vec<u8> = (0..=MAX_PROPOSALS).flat_map(|_| [2, 0, 0, 8, 1, 1, 0, 0]).collect();
+        assert!(
+            is_body(body_err(sa, &[2, 0, 0, 8, 1, 1, 0, 0]), sa),
+            "last proposal marked as not last"
+        );
+        assert!(is_body(
+            body_err(sa, &[0, 0, 0, 8, 1, 1, 0, 0, 0, 0, 0, 8, 2, 1, 0, 0]),
+            sa
+        ));
+        assert_eq!(
+            body_err(sa, &[0, 0, 0, 8, 1, 1, 0, 65]),
+            Error::Limit("transforms")
+        );
+        let many: Vec<u8> = (0..=MAX_PROPOSALS)
+            .flat_map(|_| [2, 0, 0, 8, 1, 1, 0, 0])
+            .collect();
         assert_eq!(body_err(sa, &many), Error::Limit("proposals"));
         // Transforms.
         let prop = |count: u8, t: &[u8]| {
@@ -1647,30 +1823,63 @@ mod tests {
         };
         assert!(body_ok(sa, &prop(1, &[0, 0, 0, 8, 1, 0, 0, 12])) != Body::Nonce(vec![]));
         assert!(is_body(body_err(sa, &prop(1, &[0, 0, 0, 8, 1, 0, 0])), sa));
-        assert!(is_body(body_err(sa, &prop(1, &[0, 0, 0, 7, 1, 0, 0, 12])), sa));
-        assert!(is_body(body_err(sa, &prop(1, &[0, 0, 0, 9, 1, 0, 0, 12])), sa));
-        assert!(is_body(body_err(sa, &prop(1, &[3, 0, 0, 8, 1, 0, 0, 12])), sa));
-        assert!(is_body(body_err(sa, &prop(2, &[0, 0, 0, 8, 1, 0, 0, 12])), sa));
-        assert!(is_body(body_err(sa, &prop(0, &[0, 0, 0, 8, 1, 0, 0, 12])), sa));
+        assert!(is_body(
+            body_err(sa, &prop(1, &[0, 0, 0, 7, 1, 0, 0, 12])),
+            sa
+        ));
+        assert!(is_body(
+            body_err(sa, &prop(1, &[0, 0, 0, 9, 1, 0, 0, 12])),
+            sa
+        ));
+        assert!(is_body(
+            body_err(sa, &prop(1, &[3, 0, 0, 8, 1, 0, 0, 12])),
+            sa
+        ));
+        assert!(is_body(
+            body_err(sa, &prop(2, &[0, 0, 0, 8, 1, 0, 0, 12])),
+            sa
+        ));
+        assert!(is_body(
+            body_err(sa, &prop(0, &[0, 0, 0, 8, 1, 0, 0, 12])),
+            sa
+        ));
         // Attributes.
-        assert!(is_body(body_err(sa, &prop(1, &[0, 0, 0, 11, 1, 0, 0, 12, 0x80, 14, 1])), sa));
-        assert!(is_body(body_err(sa, &prop(1, &[0, 0, 0, 13, 1, 0, 0, 12, 0, 1, 0, 2, 9])), sa));
-        let attrs: Vec<u8> = (0..=MAX_ATTRIBUTES).flat_map(|_| [0x80, 14, 0, 128]).collect();
+        assert!(is_body(
+            body_err(sa, &prop(1, &[0, 0, 0, 11, 1, 0, 0, 12, 0x80, 14, 1])),
+            sa
+        ));
+        assert!(is_body(
+            body_err(sa, &prop(1, &[0, 0, 0, 13, 1, 0, 0, 12, 0, 1, 0, 2, 9])),
+            sa
+        ));
+        let attrs: Vec<u8> = (0..=MAX_ATTRIBUTES)
+            .flat_map(|_| [0x80, 14, 0, 128])
+            .collect();
         let mut t = vec![0, 0, 0, 8 + attrs.len() as u8, 1, 0, 0, 12];
         t.extend_from_slice(&attrs);
         assert_eq!(body_err(sa, &prop(1, &t)), Error::Limit("attributes"));
         // Traffic selectors.
         let tsi = payload::TSI;
-        assert_eq!(body_err(tsi, &[65, 0, 0, 0]), Error::Limit("traffic selectors"));
+        assert_eq!(
+            body_err(tsi, &[65, 0, 0, 0]),
+            Error::Limit("traffic selectors")
+        );
         assert!(is_body(body_err(tsi, &[1, 0, 0, 0]), tsi));
         assert!(is_body(body_err(tsi, &[0, 0, 0, 0, 9, 0, 0, 4]), tsi));
         assert!(is_body(body_err(tsi, &[1, 0, 0, 0, 9, 0, 0]), tsi));
         assert!(is_body(body_err(tsi, &[1, 0, 0, 0, 9, 0, 0, 3]), tsi));
         assert!(is_body(body_err(tsi, &[1, 0, 0, 0, 9, 0, 0, 5]), tsi));
-        assert!(is_body(body_err(tsi, &[1, 0, 0, 0, 7, 0, 0, 8, 0, 0, 0, 0]), tsi));
+        assert!(is_body(
+            body_err(tsi, &[1, 0, 0, 0, 7, 0, 0, 8, 0, 0, 0, 0]),
+            tsi
+        ));
         assert_eq!(
             body_ok(tsi, &[1, 0, 0, 0, 9, 6, 0, 5, 1]),
-            Body::TsInitiator(vec![TrafficSelector::Other { kind: 9, protocol: 6, data: vec![1] }])
+            Body::TsInitiator(vec![TrafficSelector::Other {
+                kind: 9,
+                protocol: 6,
+                data: vec![1]
+            }])
         );
     }
 
@@ -1682,7 +1891,10 @@ mod tests {
             Error::MessageLength(3),
             Error::Trailing,
             Error::PayloadLength(40),
-            Error::Body { kind: 33, reason: "x" },
+            Error::Body {
+                kind: 33,
+                reason: "x",
+            },
             Error::Limit("payloads"),
         ] {
             assert!(!e.to_string().is_empty());
@@ -1705,18 +1917,42 @@ mod tests {
                             kind: transform::ENCR,
                             id: transform::ENCR_AES_GCM_16,
                             attributes: vec![
-                                Attribute { kind: transform::KEY_LENGTH, value: AttributeValue::Short(128) },
-                                Attribute { kind: 99, value: AttributeValue::Long(vec![5, 6, 7]) },
+                                Attribute {
+                                    kind: transform::KEY_LENGTH,
+                                    value: AttributeValue::Short(128),
+                                },
+                                Attribute {
+                                    kind: 99,
+                                    value: AttributeValue::Long(vec![5, 6, 7]),
+                                },
                             ],
                         },
-                        Transform { kind: transform::ESN, id: transform::ESN_NO, attributes: vec![] },
+                        Transform {
+                            kind: transform::ESN,
+                            id: transform::ESN_NO,
+                            attributes: vec![],
+                        },
                     ],
                 },
-                Proposal { number: 2, protocol: protocol::AH, spi: vec![9; 4], transforms: vec![] },
+                Proposal {
+                    number: 2,
+                    protocol: protocol::AH,
+                    spi: vec![9; 4],
+                    transforms: vec![],
+                },
             ])),
-            Payload::new(Body::KeyExchange(KeyExchange { group: 31, data: vec![3; 32] })),
-            Payload::new(Body::IdInitiator(Identification { kind: id::FQDN, data: b"vpn.example".to_vec() })),
-            Payload::new(Body::IdResponder(Identification { kind: id::IPV4_ADDR, data: vec![192, 0, 2, 1] })),
+            Payload::new(Body::KeyExchange(KeyExchange {
+                group: 31,
+                data: vec![3; 32],
+            })),
+            Payload::new(Body::IdInitiator(Identification {
+                kind: id::FQDN,
+                data: b"vpn.example".to_vec(),
+            })),
+            Payload::new(Body::IdResponder(Identification {
+                kind: id::IPV4_ADDR,
+                data: vec![192, 0, 2, 1],
+            })),
             Payload::new(Body::Nonce(vec![4; 16])),
             Payload::new(Body::Notify(Notify {
                 protocol: protocol::ESP,
@@ -1729,7 +1965,11 @@ mod tests {
                 spi_size: 4,
                 spis: vec![vec![1; 4], vec![2; 4]],
             })),
-            Payload::new(Body::Delete(Delete { protocol: protocol::IKE, spi_size: 0, spis: vec![] })),
+            Payload::new(Body::Delete(Delete {
+                protocol: protocol::IKE,
+                spi_size: 0,
+                spis: vec![],
+            })),
             Payload::new(Body::VendorId(b"fictionet".to_vec())),
             Payload::new(Body::TsInitiator(vec![TrafficSelector::Ipv4 {
                 protocol: 0,
@@ -1746,11 +1986,27 @@ mod tests {
                     start: Ipv6Addr::LOCALHOST,
                     end: Ipv6Addr::LOCALHOST,
                 },
-                TrafficSelector::Other { kind: 9, protocol: 0, data: vec![1, 2] },
+                TrafficSelector::Other {
+                    kind: 9,
+                    protocol: 0,
+                    data: vec![1, 2],
+                },
             ])),
-            Payload { critical: true, body: Body::Other { kind: 200, data: vec![7] } },
-            Payload::new(Body::Other { kind: payload::AUTH, data: vec![2, 0, 0, 0, 0xaa] }),
-            Payload::new(Body::Encrypted(Encrypted { first_payload: payload::IDI, data: vec![0x55; 40] })),
+            Payload {
+                critical: true,
+                body: Body::Other {
+                    kind: 200,
+                    data: vec![7],
+                },
+            },
+            Payload::new(Body::Other {
+                kind: payload::AUTH,
+                data: vec![2, 0, 0, 0, 0xaa],
+            }),
+            Payload::new(Body::Encrypted(Encrypted {
+                first_payload: payload::IDI,
+                data: vec![0x55; 40],
+            })),
         ]
     }
 
@@ -1784,15 +2040,23 @@ mod tests {
     fn payload_chains_round_trip_and_refuse_a_different_first_type() {
         fn chain_bytes(first: u8, payloads: Vec<Payload>) -> Result<Vec<u8>, Error> {
             let bytes = message(payloads).to_bytes()?;
-            if bytes[16] != first { return Err(Error::Unwritable); }
+            if bytes[16] != first {
+                return Err(Error::Unwritable);
+            }
             Ok(bytes[HEADER_LEN..].to_vec())
         }
         let payloads = every_body();
         let chain = message(payloads.clone());
         let bytes = chain_bytes(payload::SA, payloads.clone()).unwrap();
-        assert_eq!(parse_payloads(payload::SA, &bytes), Ok(chain.payloads.clone()));
+        assert_eq!(
+            parse_payloads(payload::SA, &bytes),
+            Ok(chain.payloads.clone())
+        );
         contract::check_wire_value(&chain);
-        assert_eq!(chain_bytes(payload::NONCE, payloads.clone()), Err(Error::Unwritable));
+        assert_eq!(
+            chain_bytes(payload::NONCE, payloads.clone()),
+            Err(Error::Unwritable)
+        );
         contract::check_wire_value(&message(payloads));
         contract::check_wire_value(&message(vec![]));
     }
@@ -1807,7 +2071,10 @@ mod tests {
         }));
         let m = message(vec![f.clone()]);
         let bytes = m.to_bytes().unwrap();
-        assert_eq!(bytes[HEADER_LEN..], [payload::IDI, 0, 0, 11, 0, 1, 0, 3, 1, 2, 3]);
+        assert_eq!(
+            bytes[HEADER_LEN..],
+            [payload::IDI, 0, 0, 11, 0, 1, 0, 3, 1, 2, 3]
+        );
         assert_eq!(Message::parse(&bytes), Ok(m));
     }
 
@@ -1831,10 +2098,20 @@ mod tests {
         }
         // The writer refuses invalid fragment fields.
         let frag = |first_payload, number, total| {
-            Payload::new(Body::EncryptedFragment(EncryptedFragment { first_payload, number, total, data: vec![1] }))
+            Payload::new(Body::EncryptedFragment(EncryptedFragment {
+                first_payload,
+                number,
+                total,
+                data: vec![1],
+            }))
         };
         let nonce = Payload::new(Body::Nonce(vec![1; 16]));
-        for bad in [frag(0, 0, 1), frag(0, 2, 1), frag(0, 1, 0), frag(payload::IDI, 2, 3)] {
+        for bad in [
+            frag(0, 0, 1),
+            frag(0, 2, 1),
+            frag(0, 1, 0),
+            frag(payload::IDI, 2, 3),
+        ] {
             let m = message(vec![bad, nonce.clone()]);
             assert_eq!(m.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&m);
@@ -1844,18 +2121,35 @@ mod tests {
     #[test]
     fn writers_refuse_invalid_values() {
         let m = message(vec![
-            Payload::new(Body::Other { kind: payload::SA, data: vec![1] }),
-            Payload::new(Body::Other { kind: 0, data: vec![1] }),
+            Payload::new(Body::Other {
+                kind: payload::SA,
+                data: vec![1],
+            }),
+            Payload::new(Body::Other {
+                kind: 0,
+                data: vec![1],
+            }),
             Payload::new(Body::Nonce(vec![1; 16])),
-            Payload::new(Body::Encrypted(Encrypted { first_payload: 0, data: vec![] })),
+            Payload::new(Body::Encrypted(Encrypted {
+                first_payload: 0,
+                data: vec![],
+            })),
             Payload::new(Body::Nonce(vec![2; 16])),
         ]);
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&m);
         // Delete SPIs of the wrong size, and selectors typed as Other.
         let m = message(vec![
-            Payload::new(Body::Delete(Delete { protocol: 3, spi_size: 4, spis: vec![vec![1; 4], vec![1; 3]] })),
-            Payload::new(Body::TsInitiator(vec![TrafficSelector::Other { kind: 7, protocol: 0, data: vec![0; 12] }])),
+            Payload::new(Body::Delete(Delete {
+                protocol: 3,
+                spi_size: 4,
+                spis: vec![vec![1; 4], vec![1; 3]],
+            })),
+            Payload::new(Body::TsInitiator(vec![TrafficSelector::Other {
+                kind: 7,
+                protocol: 0,
+                data: vec![0; 12],
+            }])),
         ]);
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         for payload in &m.payloads {
@@ -1874,26 +2168,81 @@ mod tests {
     #[test]
     fn writers_refuse_oversized_values() {
         let huge = vec![0xab; rounds(100_000)];
-        let m = message(vec![Payload::new(Body::Nonce(huge.clone())), Payload::new(Body::VendorId(huge.clone()))]);
+        let m = message(vec![
+            Payload::new(Body::Nonce(huge.clone())),
+            Payload::new(Body::VendorId(huge.clone())),
+        ]);
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&m);
         // A long chain of every kind of oversized body.
         // Each attribute value is too long on its own, and the counts are
         // past the limits.
         let big = vec![0xcd; 70_000];
-        let mut attributes = vec![Attribute { kind: 0xffff, value: AttributeValue::Long(big) }];
-        attributes.extend(vec![Attribute { kind: 1, value: AttributeValue::Long(vec![1; 3000]) }; 30]);
-        let t = Transform { kind: 1, id: 12, attributes };
-        let p = Proposal { number: 1, protocol: 3, spi: vec![1; 300], transforms: vec![t; 100] };
+        let mut attributes = vec![Attribute {
+            kind: 0xffff,
+            value: AttributeValue::Long(big),
+        }];
+        attributes.extend(vec![
+            Attribute {
+                kind: 1,
+                value: AttributeValue::Long(vec![1; 3000])
+            };
+            30
+        ]);
+        let t = Transform {
+            kind: 1,
+            id: 12,
+            attributes,
+        };
+        let p = Proposal {
+            number: 1,
+            protocol: 3,
+            spi: vec![1; 300],
+            transforms: vec![t; 100],
+        };
         let bodies = vec![
             Body::SecurityAssociation(vec![p; 3]),
-            Body::SecurityAssociation(vec![Proposal { number: 1, protocol: 1, spi: vec![], transforms: vec![] }; 100]),
-            Body::KeyExchange(KeyExchange { group: 1, data: huge.clone() }),
-            Body::IdInitiator(Identification { kind: 2, data: huge.clone() }),
-            Body::Notify(Notify { protocol: 3, spi: vec![1; 300], kind: 1, data: huge.clone() }),
-            Body::Delete(Delete { protocol: 3, spi_size: 4, spis: vec![vec![1; 4]; 20_000] }),
-            Body::Delete(Delete { protocol: 1, spi_size: 0, spis: vec![vec![]; 20_000] }),
-            Body::TsInitiator(vec![TrafficSelector::Other { kind: 9, protocol: 0, data: huge.clone() }; 100]),
+            Body::SecurityAssociation(vec![
+                Proposal {
+                    number: 1,
+                    protocol: 1,
+                    spi: vec![],
+                    transforms: vec![]
+                };
+                100
+            ]),
+            Body::KeyExchange(KeyExchange {
+                group: 1,
+                data: huge.clone(),
+            }),
+            Body::IdInitiator(Identification {
+                kind: 2,
+                data: huge.clone(),
+            }),
+            Body::Notify(Notify {
+                protocol: 3,
+                spi: vec![1; 300],
+                kind: 1,
+                data: huge.clone(),
+            }),
+            Body::Delete(Delete {
+                protocol: 3,
+                spi_size: 4,
+                spis: vec![vec![1; 4]; 20_000],
+            }),
+            Body::Delete(Delete {
+                protocol: 1,
+                spi_size: 0,
+                spis: vec![vec![]; 20_000],
+            }),
+            Body::TsInitiator(vec![
+                TrafficSelector::Other {
+                    kind: 9,
+                    protocol: 0,
+                    data: huge.clone()
+                };
+                100
+            ]),
             Body::TsResponder(vec![
                 TrafficSelector::Ipv4 {
                     protocol: 0,
@@ -1904,15 +2253,26 @@ mod tests {
                 };
                 100
             ]),
-            Body::EncryptedFragment(EncryptedFragment { first_payload: 0, number: 1, total: 1, data: huge.clone() }),
-            Body::Encrypted(Encrypted { first_payload: 0, data: huge.clone() }),
+            Body::EncryptedFragment(EncryptedFragment {
+                first_payload: 0,
+                number: 1,
+                total: 1,
+                data: huge.clone(),
+            }),
+            Body::Encrypted(Encrypted {
+                first_payload: 0,
+                data: huge.clone(),
+            }),
         ];
         for b in &bodies {
             let m = message(vec![Payload::new(b.clone())]);
             assert_eq!(m.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&m);
             // Behind a full nonce, there is little room left.
-            let m = message(vec![Payload::new(Body::Nonce(vec![0; MAX_BODY - 10])), Payload::new(b.clone())]);
+            let m = message(vec![
+                Payload::new(Body::Nonce(vec![0; MAX_BODY - 10])),
+                Payload::new(b.clone()),
+            ]);
             assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         }
         // More payloads than allowed.
@@ -1939,14 +2299,23 @@ mod tests {
         assert_eq!(parse_payloads(first, chain), Ok(back.payloads));
         // One byte more than a message can hold.
         let long = vec![0; MAX_CHAIN + 1];
-        assert_eq!(parse_payloads(payload::VENDOR_ID, &long), Err(Error::Limit("chain bytes")));
+        assert_eq!(
+            parse_payloads(payload::VENDOR_ID, &long),
+            Err(Error::Limit("chain bytes"))
+        );
     }
 
     #[test]
     fn find_payload() {
         let m = message(every_body());
-        assert_eq!(m.payload(payload::NONCE).map(|p| &p.body), Some(&Body::Nonce(vec![4; 16])));
-        assert_eq!(m.payload(payload::AUTH).map(Payload::kind), Some(payload::AUTH));
+        assert_eq!(
+            m.payload(payload::NONCE).map(|p| &p.body),
+            Some(&Body::Nonce(vec![4; 16]))
+        );
+        assert_eq!(
+            m.payload(payload::AUTH).map(Payload::kind),
+            Some(payload::AUTH)
+        );
         assert_eq!(m.payload(payload::EAP), None);
     }
 
@@ -1978,18 +2347,36 @@ mod tests {
         let req = Message::parse(&sa_init_bytes()).unwrap();
         let resp = req.response(vec![]);
         assert_eq!(resp.flags, flags::RESPONSE);
-        assert_eq!((resp.initiator_spi, resp.message_id, resp.exchange), (req.initiator_spi, 0, req.exchange));
+        assert_eq!(
+            (resp.initiator_spi, resp.message_id, resp.exchange),
+            (req.initiator_spi, 0, req.exchange)
+        );
         assert!(resp.is_response() && !resp.is_initiator());
         // A request from the original responder is answered by the
         // original initiator, which sets the initiator flag (RFC 7296
         // section 3.1).
         let mut req = message(vec![]);
         req.flags = 0;
-        assert_eq!(req.response(vec![]).flags, flags::RESPONSE | flags::INITIATOR);
+        assert_eq!(
+            req.response(vec![]).flags,
+            flags::RESPONSE | flags::INITIATOR
+        );
         // A known type marked critical is not unsupported.
-        let m = message(vec![Payload { critical: true, body: Body::Other { kind: payload::CP, data: vec![] } }]);
+        let m = message(vec![Payload {
+            critical: true,
+            body: Body::Other {
+                kind: payload::CP,
+                data: vec![],
+            },
+        }]);
         assert_eq!(m.unsupported_critical(), None);
-        let m = message(vec![Payload { critical: false, body: Body::Other { kind: 100, data: vec![] } }]);
+        let m = message(vec![Payload {
+            critical: false,
+            body: Body::Other {
+                kind: 100,
+                data: vec![],
+            },
+        }]);
         assert_eq!(m.unsupported_critical(), None);
     }
 
@@ -2022,12 +2409,15 @@ mod tests {
                 assert_eq!(Message::parse(&bytes[..n]), Err(Error::Short));
             }
             let bytes = m.to_bytes().unwrap();
-        let first = bytes[16];
-        let chain = &bytes[HEADER_LEN..];
+            let first = bytes[16];
+            let chain = &bytes[HEADER_LEN..];
             assert_eq!(parse_payloads(first, chain).as_ref(), Ok(&m.payloads));
         }
         if let Ok(NatT::Ike(m)) = NatT::parse(data) {
-            assert_eq!(NatT::parse(&NatT::Ike(m.clone()).to_bytes().unwrap()), Ok(NatT::Ike(m)));
+            assert_eq!(
+                NatT::parse(&NatT::Ike(m.clone()).to_bytes().unwrap()),
+                Ok(NatT::Ike(m))
+            );
         }
         let _ = Header::parse(data);
         if let Some((&first, rest)) = data.split_first()
@@ -2049,15 +2439,16 @@ mod tests {
                 // Flip a few bytes past the header's length.
                 0 => {
                     let mut chain = data.split_off(HEADER_LEN);
-                    for _ in 0..1 + s.index(4) { mutate(&mut s, &mut chain); }
+                    for _ in 0..1 + s.index(4) {
+                        mutate(&mut s, &mut chain);
+                    }
                     data.extend(chain);
                     let len = (data.len() as u32).to_be_bytes();
                     data[24..28].copy_from_slice(&len);
                 }
                 // Cut it and fix the length.
                 1 => {
-                    let n =
-                        HEADER_LEN + s.index(data.len() - HEADER_LEN);
+                    let n = HEADER_LEN + s.index(data.len() - HEADER_LEN);
                     data.truncate(n);
                     let len = (n as u32).to_be_bytes();
                     data[24..28].copy_from_slice(&len);

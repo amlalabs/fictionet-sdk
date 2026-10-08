@@ -1,10 +1,8 @@
 //! Messaging streams, datagrams, and strict writers.
 
-use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
-use fictionet::stdlib::codec::{
-    Decode, Fail, Step, Stream, Wire,
-};
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Decode, Fail, Step, Stream, Wire};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::{amqp, coap, dhcpv6, mqtt, syslog};
 
@@ -79,7 +77,9 @@ fn amqp_broker_round_trip_and_payload_errors() {
         payload: vec![0],
     };
     let mut bytes = contract::check_written(&bad_method);
-    bytes.extend(contract::check_written(&amqp::Frame::method(1, &publish).unwrap()));
+    bytes.extend(contract::check_written(
+        &amqp::Frame::method(1, &publish).unwrap(),
+    ));
     let make = || amqp::Frames::new().map(|frame| amqp::Method::parse(&frame.payload));
     let (items, error) = check(make, &bytes);
     assert_eq!(error, None);
@@ -142,7 +142,10 @@ fn coap_udp_and_tcp_round_trip() {
     };
     let frames = vec![coap::Frame::csm(4096, true), request.clone()];
     let bytes: Vec<u8> = frames.iter().flat_map(contract::check_written).collect();
-    assert_eq!(check(Frames::<coap::Frame>::new, &bytes), (frames.clone(), None));
+    assert_eq!(
+        check(Frames::<coap::Frame>::new, &bytes),
+        (frames.clone(), None)
+    );
     let mut reply = request.reply(coap::Code::CONTENT);
     reply.payload = b"21.5".to_vec();
     assert_eq!(
@@ -258,9 +261,7 @@ fn partial_units_and_header_faults() {
         check(amqp::Frames::server, b"NOT AMQP"),
         (
             vec![],
-            Some(Fail::Protocol(amqp::Error::ProtocolHeader(
-                *b"NOT AMQP"
-            )))
+            Some(Fail::Protocol(amqp::Error::ProtocolHeader(*b"NOT AMQP")))
         )
     );
     let oversized = [3, 0, 1, 0, 0, 0x10, 0];
@@ -341,10 +342,7 @@ fn partial_units_and_header_faults() {
     }
     assert_eq!(
         check(syslog::Frames::new, b"12x"),
-        (
-            vec![],
-            Some(Fail::Protocol(syslog::Error::Length(b'x')))
-        )
+        (vec![], Some(Fail::Protocol(syslog::Error::Length(b'x'))))
     );
     check(syslog::Frames::new, b"999999999999999999999999999999 ");
 }
@@ -533,9 +531,7 @@ fn syslog_overlong_frames_skip_tails_and_detect_incomplete_counts() {
     assert!(items[0].truncated);
     assert_eq!(
         error,
-        Some(Fail::Protocol(syslog::Error::Incomplete {
-            remaining: 7
-        }))
+        Some(Fail::Protocol(syslog::Error::Incomplete { remaining: 7 }))
     );
 
     // A CR just past the maximum can still belong to the CRLF trailer.
@@ -584,11 +580,23 @@ fn decoders_have_bounded_capacity_and_no_held_input() {
         assert_eq!(decoder.held(), 0);
     }
     assert_eq!(Frames::<coap::Frame>::new().capacity(), coap::MAX_BUFFERED);
-    assert_eq!(Frames::<dhcpv6::Message>::new().capacity(), dhcpv6::MAX_BUFFERED);
+    assert_eq!(
+        Frames::<dhcpv6::Message>::new().capacity(),
+        dhcpv6::MAX_BUFFERED
+    );
     assert_eq!(syslog::Frames::new().capacity(), syslog::MAX_BUFFERED);
     assert_eq!(amqp::Frames::new().decode(&[], true), Ok(Step::Need));
-    assert_eq!(Frames::<mqtt::Packet>::new().decode(&[], true), Ok(Step::Need));
-    assert_eq!(Frames::<coap::Frame>::new().decode(&[], true), Ok(Step::Need));
-    assert_eq!(Frames::<dhcpv6::Message>::new().decode(&[], true), Ok(Step::Need));
+    assert_eq!(
+        Frames::<mqtt::Packet>::new().decode(&[], true),
+        Ok(Step::Need)
+    );
+    assert_eq!(
+        Frames::<coap::Frame>::new().decode(&[], true),
+        Ok(Step::Need)
+    );
+    assert_eq!(
+        Frames::<dhcpv6::Message>::new().decode(&[], true),
+        Ok(Step::Need)
+    );
     assert_eq!(syslog::Frames::new().decode(&[], true), Ok(Step::Need));
 }

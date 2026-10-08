@@ -39,10 +39,18 @@ pub(crate) fn request(words: &[String]) -> Result<String, String> {
     Ok(match w.as_slice() {
         [] | ["graph"] => r#"{"op":"graph"}"#.into(),
         [json] if json.starts_with('{') => (*json).to_owned(),
-        [op @ ("world" | "watch" | "counters" | "keylog" | "events")] => format!(r#"{{"op":"{op}"}}"#),
-        [op @ ("watch" | "events"), after] => format!(r#"{{"op":"{op}","after":{}}}"#, number(after)?),
+        [op @ ("world" | "watch" | "counters" | "keylog" | "events")] => {
+            format!(r#"{{"op":"{op}"}}"#)
+        }
+        [op @ ("watch" | "events"), after] => {
+            format!(r#"{{"op":"{op}","after":{}}}"#, number(after)?)
+        }
         [op @ ("link" | "packets" | "pcap"), l] => format!(r#"{{"op":"{op}","link":{}}}"#, link(l)),
-        ["packet", l, seq] => format!(r#"{{"op":"packet","link":{},"seq":{}}}"#, link(l), number(seq)?),
+        ["packet", l, seq] => format!(
+            r#"{{"op":"packet","link":{},"seq":{}}}"#,
+            link(l),
+            number(seq)?
+        ),
         _ => return Err(format!("unknown request: {}", words.join(" "))),
     })
 }
@@ -55,10 +63,13 @@ fn number(s: &str) -> Result<u64, String> {
 /// [`WorldSocket`](fictionet::WorldSocket).
 pub(crate) fn world_path(world: &str) -> Result<String, String> {
     match world.parse::<fictionet::WorldSocket>() {
-        Ok(fictionet::WorldSocket::UnixSocket(path)) => {
-            path.into_os_string().into_string().map_err(|p| format!("--world: {} is not UTF-8", p.display()))
-        }
-        Ok(other) => Err(format!("--world {other} is not supported here; use unix:<path>")),
+        Ok(fictionet::WorldSocket::UnixSocket(path)) => path
+            .into_os_string()
+            .into_string()
+            .map_err(|p| format!("--world: {} is not UTF-8", p.display())),
+        Ok(other) => Err(format!(
+            "--world {other} is not supported here; use unix:<path>"
+        )),
         Err(e) => Err(format!("--world: {e}")),
     }
 }
@@ -129,7 +140,8 @@ pub(crate) fn main(args: &[String]) -> i32 {
         let written = if value.binary {
             out.write_all(&value.bytes)
         } else {
-            out.write_all(&value.bytes).and_then(|()| out.write_all(b"\n"))
+            out.write_all(&value.bytes)
+                .and_then(|()| out.write_all(b"\n"))
         };
         if let Err(e) = written.and_then(|()| out.flush()) {
             // stdout closed, such as a pipe into head: stop quietly. Any
@@ -141,7 +153,11 @@ pub(crate) fn main(args: &[String]) -> i32 {
             return 1;
         }
         if value.end {
-            return if !value.binary && value.bytes.starts_with(br#"{"error":"#) { 1 } else { 0 };
+            return if !value.binary && value.bytes.starts_with(br#"{"error":"#) {
+                1
+            } else {
+                0
+            };
         }
     }
 }
@@ -158,10 +174,22 @@ mod tests {
     fn requests_from_words() {
         assert_eq!(request(&[]).unwrap(), r#"{"op":"graph"}"#);
         assert_eq!(request(&words("watch")).unwrap(), r#"{"op":"watch"}"#);
-        assert_eq!(request(&words("packets e12")).unwrap(), r#"{"op":"packets","link":"e12"}"#);
-        assert_eq!(request(&words("packet e12 40")).unwrap(), r#"{"op":"packet","link":"e12","seq":40}"#);
-        assert_eq!(request(&words("events 7")).unwrap(), r#"{"op":"events","after":7}"#);
-        assert_eq!(request(&words("watch 0")).unwrap(), r#"{"op":"watch","after":0}"#);
+        assert_eq!(
+            request(&words("packets e12")).unwrap(),
+            r#"{"op":"packets","link":"e12"}"#
+        );
+        assert_eq!(
+            request(&words("packet e12 40")).unwrap(),
+            r#"{"op":"packet","link":"e12","seq":40}"#
+        );
+        assert_eq!(
+            request(&words("events 7")).unwrap(),
+            r#"{"op":"events","after":7}"#
+        );
+        assert_eq!(
+            request(&words("watch 0")).unwrap(),
+            r#"{"op":"watch","after":0}"#
+        );
         assert!(request(&words("packet e12 x")).is_err());
         assert!(request(&words("fly")).is_err());
     }
@@ -169,8 +197,14 @@ mod tests {
     #[test]
     fn world_flag() {
         let (w, rest) = take_world(&words("--world unix:/run/w.sock watch")).unwrap();
-        assert_eq!((world_path(&w).unwrap(), rest), ("/run/w.sock".to_owned(), words("watch")));
-        assert_eq!(world_path("tls:x:1").unwrap_err(), r#"--world: expected unix:<path>, not "tls:x:1""#);
+        assert_eq!(
+            (world_path(&w).unwrap(), rest),
+            ("/run/w.sock".to_owned(), words("watch"))
+        );
+        assert_eq!(
+            world_path("tls:x:1").unwrap_err(),
+            r#"--world: expected unix:<path>, not "tls:x:1""#
+        );
         assert!(world_path("unix:").is_err());
         assert!(take_world(&words("graph")).is_err());
     }

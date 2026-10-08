@@ -33,7 +33,9 @@ use libfuzzer_sys::fuzz_target;
 /// Retains sections from two streams across a partial encoder instruction.
 fn blocked_sections(bytes: &[u8]) {
     // This caller does not order sections, so no per-stream ordering is checked.
-    let Some((&split, rest)) = bytes.split_first() else { return };
+    let Some((&split, rest)) = bytes.split_first() else {
+        return;
+    };
     let (instructions, sections) = rest.split_at(usize::from(split) * rest.len() / 255);
     let (early, late) = instructions.split_at(instructions.len() / 2);
     let mut table = Table::new(4096);
@@ -41,7 +43,10 @@ fn blocked_sections(bytes: &[u8]) {
     let mut held = qpack::BlockedSections::new(2);
     let mut sent = [Vec::new(), Vec::new()];
     if try_pump(&mut input, early, |instruction| table.apply(instruction?)).is_ok() {
-        for (i, piece) in sections.chunks(sections.len().div_ceil(4).max(1)).enumerate() {
+        for (i, piece) in sections
+            .chunks(sections.len().div_ceil(4).max(1))
+            .enumerate()
+        {
             let k = i % 2;
             match qpack::decode_section(&table, k as u64 * 4, piece) {
                 Ok(SectionResult::Blocked(section)) => {
@@ -98,16 +103,34 @@ fuzz_target!(|input: &[u8]| {
     contract::check_wire::<DecoderInstruction>(bytes);
     contract::check_wire::<Representation>(bytes);
     contract::check_wire::<FieldSection>(bytes);
-    contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, bytes, 2 * qpack::MAX_INSTRUCTION);
-    contract::check_decode_with_alloc_limit(Frames::<DecoderInstruction>::new, bytes, 2 * qpack::MAX_INTEGER_BYTES);
+    contract::check_decode_with_alloc_limit(
+        Frames::<EncoderInstruction>::new,
+        bytes,
+        2 * qpack::MAX_INSTRUCTION,
+    );
+    contract::check_decode_with_alloc_limit(
+        Frames::<DecoderInstruction>::new,
+        bytes,
+        2 * qpack::MAX_INTEGER_BYTES,
+    );
 
-    let integer = input.iter().take(8).fold(0u64, |n, b| (n << 8) | u64::from(*b));
+    let integer = input
+        .iter()
+        .take(8)
+        .fold(0u64, |n, b| (n << 8) | u64::from(*b));
     let value = input[..input.len().min(qpack::MAX_STRING + 1)].to_vec();
     for instruction in [
         EncoderInstruction::SetCapacity(integer),
         EncoderInstruction::Duplicate(integer),
-        EncoderInstruction::InsertWithNameRef { static_table: true, index: integer, value: value.clone() },
-        EncoderInstruction::InsertWithLiteralName { name: b"x-fuzz".to_vec(), value: value.clone() },
+        EncoderInstruction::InsertWithNameRef {
+            static_table: true,
+            index: integer,
+            value: value.clone(),
+        },
+        EncoderInstruction::InsertWithLiteralName {
+            name: b"x-fuzz".to_vec(),
+            value: value.clone(),
+        },
     ] {
         contract::check_wire_value(&instruction);
     }
@@ -129,7 +152,10 @@ fuzz_target!(|input: &[u8]| {
     let mut table = Table::new(4096);
     let (instructions, _) = decode_all(Frames::<EncoderInstruction>::new, bytes);
     for instruction in instructions {
-        if instruction.and_then(|instruction| table.apply(instruction)).is_err() {
+        if instruction
+            .and_then(|instruction| table.apply(instruction))
+            .is_err()
+        {
             break;
         }
     }
@@ -155,7 +181,9 @@ fuzz_target!(|input: &[u8]| {
                 table.set_capacity(4096).unwrap();
                 for n in 0..64u8 {
                     table.insert(vec![b'x', n], vec![n]).unwrap();
-                    if let Some((_, Ok(SectionResult::Fields { ack: Some(ack), .. }))) = held.next_ready(&table) {
+                    if let Some((_, Ok(SectionResult::Fields { ack: Some(ack), .. }))) =
+                        held.next_ready(&table)
+                    {
                         contract::check_wire_value(&ack);
                     }
                 }
@@ -171,18 +199,31 @@ fuzz_target!(|input: &[u8]| {
 
     let mut encoder = qpack::Encoder::new(4096, qpack::MAX_FIELD_SECTION_SIZE);
     let mut receiving = Table::new(4096);
-    receiving.apply(encoder.set_capacity(4096).unwrap()).unwrap();
+    receiving
+        .apply(encoder.set_capacity(4096).unwrap())
+        .unwrap();
     let value = &bytes[..bytes.len().min(256)];
     let (_, instruction) = encoder.insert(b"x-fuzz", value).unwrap();
     contract::check_wire_value(&instruction);
     receiving.apply(instruction).unwrap();
-    encoder.apply_instruction(receiving.take_increment().unwrap()).unwrap();
+    encoder
+        .apply_instruction(receiving.take_increment().unwrap())
+        .unwrap();
     let (_, instruction) = encoder.insert(b"x-other", b"2").unwrap();
     receiving.apply(instruction).unwrap();
-    encoder.apply_instruction(receiving.take_increment().unwrap()).unwrap();
+    encoder
+        .apply_instruction(receiving.take_increment().unwrap())
+        .unwrap();
     for stream in [0, 4, 4] {
-        let section =
-            encoder.section(stream, &[qpack::Field::new("x-fuzz", value), qpack::Field::new("x-other", "2")]).unwrap();
+        let section = encoder
+            .section(
+                stream,
+                &[
+                    qpack::Field::new("x-fuzz", value),
+                    qpack::Field::new("x-other", "2"),
+                ],
+            )
+            .unwrap();
         contract::check_wire_value(&section);
     }
     let (acks, _) = decode_all(Frames::<DecoderInstruction>::new, bytes);

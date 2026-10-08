@@ -48,8 +48,8 @@
 
 extern crate alloc;
 
-use fictionet::stdlib::codec::ascii::{self, hex_upper};
 use alloc::{string::String, vec::Vec};
+use fictionet::stdlib::codec::ascii::{self, hex_upper};
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The most bytes [`Form::parse`] and [`Fields`] read, and the most
@@ -216,12 +216,21 @@ impl EncodeSet {
             EncodeSet::Fragment => matches!(b, b' ' | b'"' | b'<' | b'>' | b'`'),
             EncodeSet::Query => matches!(b, b' ' | b'"' | b'#' | b'<' | b'>'),
             EncodeSet::SpecialQuery => b == b'\'' || EncodeSet::Query.contains(b),
-            EncodeSet::Path => matches!(b, b'?' | b'^' | b'`' | b'{' | b'}') || EncodeSet::Query.contains(b),
-            EncodeSet::Userinfo => {
-                matches!(b, b'/' | b':' | b';' | b'=' | b'@' | b'[' | b'\\' | b']' | b'|') || EncodeSet::Path.contains(b)
+            EncodeSet::Path => {
+                matches!(b, b'?' | b'^' | b'`' | b'{' | b'}') || EncodeSet::Query.contains(b)
             }
-            EncodeSet::Component => matches!(b, b'$' | b'%' | b'&' | b'+' | b',') || EncodeSet::Userinfo.contains(b),
-            EncodeSet::Form => matches!(b, b'!' | b'\'' | b'(' | b')' | b'~') || EncodeSet::Component.contains(b),
+            EncodeSet::Userinfo => {
+                matches!(
+                    b,
+                    b'/' | b':' | b';' | b'=' | b'@' | b'[' | b'\\' | b']' | b'|'
+                ) || EncodeSet::Path.contains(b)
+            }
+            EncodeSet::Component => {
+                matches!(b, b'$' | b'%' | b'&' | b'+' | b',') || EncodeSet::Userinfo.contains(b)
+            }
+            EncodeSet::Form => {
+                matches!(b, b'!' | b'\'' | b'(' | b')' | b'~') || EncodeSet::Component.contains(b)
+            }
         }
     }
 }
@@ -243,7 +252,11 @@ fn percent_encode(bytes: &[u8], set: EncodeSet, space_as_plus: bool) -> Result<S
 /// byte adds at most 3 and slices are far shorter than `usize::MAX / 3`.
 fn encoded_len(bytes: &[u8], set: EncodeSet, space_as_plus: bool) -> usize {
     bytes.iter().fold(0usize, |n, &b| {
-        n.saturating_add(if (space_as_plus && b == b' ') || !set.contains(b) { 1 } else { 3 })
+        n.saturating_add(if (space_as_plus && b == b' ') || !set.contains(b) {
+            1
+        } else {
+            3
+        })
     })
 }
 
@@ -270,7 +283,9 @@ fn canonical_len<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Result<usize
     let mut len = 0usize;
     for (i, (n, v)) in pairs.iter().enumerate() {
         let (n, v) = (n.as_ref().as_bytes(), v.as_ref().as_bytes());
-        let piece = encoded_len(n, EncodeSet::Form, true).saturating_add(encoded_len(v, EncodeSet::Form, true)).saturating_add(1);
+        let piece = encoded_len(n, EncodeSet::Form, true)
+            .saturating_add(encoded_len(v, EncodeSet::Form, true))
+            .saturating_add(1);
         len = len.saturating_add(piece).saturating_add(usize::from(i > 0));
         if len > MAX_INPUT {
             return Err(Error::TooLong);
@@ -364,7 +379,9 @@ impl PercentEncoded {
     /// set. Pass text as UTF-8 bytes. The result is ASCII. Refuses input or
     /// encoded output beyond [`MAX_INPUT`].
     pub fn new(bytes: &[u8], set: EncodeSet, space_as_plus: bool) -> Result<Self, Error> {
-        Ok(Self { text: percent_encode(bytes, set, space_as_plus)? })
+        Ok(Self {
+            text: percent_encode(bytes, set, space_as_plus)?,
+        })
     }
 }
 
@@ -402,13 +419,22 @@ impl Wire for PercentEncoded {
 
 /// The value of the first pair named `name`, if there is one.
 pub fn first<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    pairs.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+    pairs
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.as_str())
 }
 
 /// The values of every pair named `name`, in order. Forms repeat a name
 /// for checkboxes and multiple selects.
-pub fn values<'a>(pairs: &'a [(String, String)], name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-    pairs.iter().filter(move |(n, _)| n == name).map(|(_, v)| v.as_str())
+pub fn values<'a>(
+    pairs: &'a [(String, String)],
+    name: &'a str,
+) -> impl Iterator<Item = &'a str> + 'a {
+    pairs
+        .iter()
+        .filter(move |(n, _)| n == name)
+        .map(|(_, v)| v.as_str())
 }
 
 /// The query of a request target or URL: the bytes after the first `?`,
@@ -554,9 +580,9 @@ impl Decode for Fields {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::decode_all;
 
     fn check(input: &[u8]) {
@@ -583,7 +609,9 @@ mod tests {
     }
 
     fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
-        list.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect()
+        list.iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
     }
 
     fn assert_pairs(input: &[u8], expected: Vec<(String, String)>) {
@@ -635,16 +663,27 @@ mod tests {
         // One U+FFFD per maximal subpart, as the WHATWG UTF-8 decoder does.
         assert_eq!(decode_component(b"%E2%80").unwrap(), "\u{fffd}");
         assert_eq!(decode_component(b"%E2%80a").unwrap(), "\u{fffd}a");
-        assert_eq!(decode_component(b"%F0%80%80").unwrap(), "\u{fffd}\u{fffd}\u{fffd}");
-        assert_eq!(decode_component(b"%ED%A0%80").unwrap(), "\u{fffd}\u{fffd}\u{fffd}");
+        assert_eq!(
+            decode_component(b"%F0%80%80").unwrap(),
+            "\u{fffd}\u{fffd}\u{fffd}"
+        );
+        assert_eq!(
+            decode_component(b"%ED%A0%80").unwrap(),
+            "\u{fffd}\u{fffd}\u{fffd}"
+        );
         assert_eq!(decode_component(b"%C0%AF").unwrap(), "\u{fffd}\u{fffd}");
-        assert_eq!(decode_component(b"%F4%90%80%80").unwrap(), "\u{fffd}\u{fffd}\u{fffd}\u{fffd}");
+        assert_eq!(
+            decode_component(b"%F4%90%80%80").unwrap(),
+            "\u{fffd}\u{fffd}\u{fffd}\u{fffd}"
+        );
         assert_eq!(decode_component(b"%F0%9F%98").unwrap(), "\u{fffd}");
     }
 
     #[test]
     fn set_nesting() {
-        let holds = |big: EncodeSet, small: EncodeSet| (0..=255u8).all(|b| !small.contains(b) || big.contains(b));
+        let holds = |big: EncodeSet, small: EncodeSet| {
+            (0..=255u8).all(|b| !small.contains(b) || big.contains(b))
+        };
         assert!(holds(EncodeSet::Fragment, EncodeSet::C0Control));
         assert!(holds(EncodeSet::Query, EncodeSet::C0Control));
         assert!(holds(EncodeSet::SpecialQuery, EncodeSet::Query));
@@ -654,13 +693,21 @@ mod tests {
         assert!(holds(EncodeSet::Component, EncodeSet::Userinfo));
         assert!(holds(EncodeSet::Form, EncodeSet::Component));
         // Path is the query set and exactly ?, ^, `, { and }.
-        let extra: Vec<u8> = (0..=255u8).filter(|&b| EncodeSet::Path.contains(b) && !EncodeSet::Query.contains(b)).collect();
+        let extra: Vec<u8> = (0..=255u8)
+            .filter(|&b| EncodeSet::Path.contains(b) && !EncodeSet::Query.contains(b))
+            .collect();
         assert_eq!(extra, b"?^`{}");
-        let extra: Vec<u8> = (0..=255u8).filter(|&b| EncodeSet::Userinfo.contains(b) && !EncodeSet::Path.contains(b)).collect();
+        let extra: Vec<u8> = (0..=255u8)
+            .filter(|&b| EncodeSet::Userinfo.contains(b) && !EncodeSet::Path.contains(b))
+            .collect();
         assert_eq!(extra, b"/:;=@[\\]|");
-        let extra: Vec<u8> = (0..=255u8).filter(|&b| EncodeSet::Component.contains(b) && !EncodeSet::Userinfo.contains(b)).collect();
+        let extra: Vec<u8> = (0..=255u8)
+            .filter(|&b| EncodeSet::Component.contains(b) && !EncodeSet::Userinfo.contains(b))
+            .collect();
         assert_eq!(extra, b"$%&+,");
-        let extra: Vec<u8> = (0..=255u8).filter(|&b| EncodeSet::Form.contains(b) && !EncodeSet::Component.contains(b)).collect();
+        let extra: Vec<u8> = (0..=255u8)
+            .filter(|&b| EncodeSet::Form.contains(b) && !EncodeSet::Component.contains(b))
+            .collect();
         assert_eq!(extra, b"!'()~");
     }
 
@@ -668,7 +715,10 @@ mod tests {
     fn percent_decode_examples() {
         // From the standard's percent-decode examples.
         assert_eq!(percent_decode(b"%25%s%1G").unwrap(), b"%%s%1G");
-        assert_eq!(percent_decode("\u{203d}%25%2E".as_bytes()).unwrap(), [0xe2, 0x80, 0xbd, 0x25, 0x2e]);
+        assert_eq!(
+            percent_decode("\u{203d}%25%2E".as_bytes()).unwrap(),
+            [0xe2, 0x80, 0xbd, 0x25, 0x2e]
+        );
         assert_eq!(percent_decode(b"a+b").unwrap(), b"a+b");
         assert_eq!(decode_component(b"a+b%20c").unwrap(), "a b c");
     }
@@ -676,15 +726,39 @@ mod tests {
     #[test]
     fn percent_encode_examples() {
         // From the standard's percent-encode examples.
-        assert_eq!(encoded("\u{2261}".as_bytes(), EncodeSet::Userinfo, false).unwrap(), "%E2%89%A1");
-        assert_eq!(encoded("\u{203d}".as_bytes(), EncodeSet::Userinfo, false).unwrap(), "%E2%80%BD");
-        assert_eq!(encoded("Say what\u{203d}".as_bytes(), EncodeSet::Userinfo, false).unwrap(), "Say%20what%E2%80%BD");
-        assert_eq!(encoded("Say what\u{203d}".as_bytes(), EncodeSet::Form, true).unwrap(), "Say+what%E2%80%BD");
+        assert_eq!(
+            encoded("\u{2261}".as_bytes(), EncodeSet::Userinfo, false).unwrap(),
+            "%E2%89%A1"
+        );
+        assert_eq!(
+            encoded("\u{203d}".as_bytes(), EncodeSet::Userinfo, false).unwrap(),
+            "%E2%80%BD"
+        );
+        assert_eq!(
+            encoded("Say what\u{203d}".as_bytes(), EncodeSet::Userinfo, false).unwrap(),
+            "Say%20what%E2%80%BD"
+        );
+        assert_eq!(
+            encoded("Say what\u{203d}".as_bytes(), EncodeSet::Form, true).unwrap(),
+            "Say+what%E2%80%BD"
+        );
         // What each set leaves alone.
         let printable: Vec<u8> = (0x20..=0x7e).collect();
-        let kept = |set: EncodeSet| -> String { printable.iter().filter(|&&b| !set.contains(b)).map(|&b| char::from(b)).collect() };
-        assert_eq!(kept(EncodeSet::Form), "*-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz");
-        assert_eq!(kept(EncodeSet::Component), "!'()*-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~");
+        let kept = |set: EncodeSet| -> String {
+            printable
+                .iter()
+                .filter(|&&b| !set.contains(b))
+                .map(|&b| char::from(b))
+                .collect()
+        };
+        assert_eq!(
+            kept(EncodeSet::Form),
+            "*-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+        );
+        assert_eq!(
+            kept(EncodeSet::Component),
+            "!'()*-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~"
+        );
         assert_eq!(kept(EncodeSet::C0Control).len(), printable.len());
         for b in *b" \"#<>" {
             assert!(EncodeSet::Query.contains(b));
@@ -720,7 +794,12 @@ mod tests {
 
     #[test]
     fn serializer_examples() {
-        let p = pairs(&[("a b", "c&d=e"), ("", ""), ("x", "1+1"), ("~", "\u{e9}*-._")]);
+        let p = pairs(&[
+            ("a b", "c&d=e"),
+            ("", ""),
+            ("x", "1+1"),
+            ("~", "\u{e9}*-._"),
+        ]);
         let s = serialized(&p).unwrap();
         assert_eq!(s, "a+b=c%26d%3De&=&x=1%2B1&%7E=%C3%A9*-._");
         assert_eq!(decoded(s.as_bytes()).unwrap(), p);
@@ -741,8 +820,14 @@ mod tests {
         assert_eq!(query_of(b"/a#b?c"), b"");
         assert_eq!(query_of(b"/a?b?c"), b"b?c");
         assert_eq!(query_of(b"?"), b"");
-        assert_eq!(Error::TooLong.to_string(), format!("form is longer than {MAX_INPUT} bytes"));
-        assert_eq!(Error::TooManyPairs.to_string(), format!("form has more than {MAX_PAIRS} pairs"));
+        assert_eq!(
+            Error::TooLong.to_string(),
+            format!("form is longer than {MAX_INPUT} bytes")
+        );
+        assert_eq!(
+            Error::TooManyPairs.to_string(),
+            format!("form has more than {MAX_PAIRS} pairs")
+        );
     }
 
     #[test]
@@ -769,7 +854,10 @@ mod tests {
             Form::parse(s.as_bytes()).map(|form| form.pairs),
             decoded(s.as_bytes())
         );
-        assert_eq!(serialized(&[("x", "a".repeat(MAX_INPUT - 1).as_str())]), Err(Error::TooLong));
+        assert_eq!(
+            serialized(&[("x", "a".repeat(MAX_INPUT - 1).as_str())]),
+            Err(Error::TooLong)
+        );
         // Writing can grow a form. Bytes that are not UTF-8 each become
         // U+FFFD, nine bytes once encoded, so a form the parser reads may
         // be too long to write back. The writer refuses it as too long.
@@ -780,7 +868,10 @@ mod tests {
         assert_eq!(Form::parse(&bad), Err(Error::TooLong));
         let mut stream = Stream::new(Fields::new());
         let error = Fail::Protocol(Error::TooLong);
-        assert_eq!(pump(&mut stream, &big, |_| panic!("no field")), Err(error.clone()));
+        assert_eq!(
+            pump(&mut stream, &big, |_| panic!("no field")),
+            Err(error.clone())
+        );
         assert_eq!(stream.push(b"a=b&"), 4);
         stream.end();
         assert_eq!(stream.next(), None);
@@ -792,23 +883,42 @@ mod tests {
         // A byte that is not UTF-8 grows to three, so the output may be
         // longer than the input, but the input is capped.
         assert_eq!(decode_component(&[0xff]).unwrap(), "\u{fffd}");
-        assert_eq!(decode_component(&vec![0xff; MAX_INPUT + 1]), Err(Error::TooLong));
-        assert_eq!(decode_component(&vec![b'a'; MAX_INPUT]).unwrap().len(), MAX_INPUT);
+        assert_eq!(
+            decode_component(&vec![0xff; MAX_INPUT + 1]),
+            Err(Error::TooLong)
+        );
+        assert_eq!(
+            decode_component(&vec![b'a'; MAX_INPUT]).unwrap().len(),
+            MAX_INPUT
+        );
     }
 
     #[test]
     fn percent_encode_never_writes_what_percent_decode_refuses() {
         // Each % grows to three bytes with the component set.
         let over = vec![b'%'; MAX_INPUT / 3 + 1];
-        assert_eq!(encoded(&over, EncodeSet::Component, false), Err(Error::TooLong));
+        assert_eq!(
+            encoded(&over, EncodeSet::Component, false),
+            Err(Error::TooLong)
+        );
         assert_eq!(encoded(&over, EncodeSet::Form, true), Err(Error::TooLong));
         let at = vec![b'%'; MAX_INPUT / 3];
         let s = encoded(&at, EncodeSet::Component, false).unwrap();
         assert!(s.len() <= MAX_INPUT);
         assert_eq!(percent_decode(s.as_bytes()).unwrap(), at);
-        assert_eq!(decoded(encoded(&at, EncodeSet::Form, true).unwrap().as_bytes()).unwrap().len(), 1);
+        assert_eq!(
+            decoded(encoded(&at, EncodeSet::Form, true).unwrap().as_bytes())
+                .unwrap()
+                .len(),
+            1
+        );
         // A space written as + stays one byte.
-        assert_eq!(encoded(&vec![b' '; MAX_INPUT], EncodeSet::Form, true).unwrap().len(), MAX_INPUT);
+        assert_eq!(
+            encoded(&vec![b' '; MAX_INPUT], EncodeSet::Form, true)
+                .unwrap()
+                .len(),
+            MAX_INPUT
+        );
     }
 
     /// A name that reads as empty the first time and long after that.
@@ -819,13 +929,20 @@ mod tests {
 
     impl AsRef<str> for Shifty {
         fn as_ref(&self) -> &str {
-            if self.seen.replace(true) { &self.long } else { "" }
+            if self.seen.replace(true) {
+                &self.long
+            } else {
+                ""
+            }
         }
     }
 
     #[test]
     fn serialize_reads_each_string_once() {
-        let v = Shifty { seen: std::cell::Cell::new(false), long: "a".repeat(MAX_INPUT + 1) };
+        let v = Shifty {
+            seen: std::cell::Cell::new(false),
+            long: "a".repeat(MAX_INPUT + 1),
+        };
         let pairs = [("k", v)];
         match serialized(&pairs) {
             Ok(s) => {
@@ -842,8 +959,13 @@ mod tests {
         input.extend(std::iter::repeat_n(b'a', MAX_INPUT - 3));
         check(&input);
         assert_eq!(Form::parse(&input), Err(Error::TooLong));
-        assert_eq!(decode_all(Fields::new, &input),
-            (vec![Field(("k".into(), "v".into()))], Some(Fail::Protocol(Error::TooLong))));
+        assert_eq!(
+            decode_all(Fields::new, &input),
+            (
+                vec![Field(("k".into(), "v".into()))],
+                Some(Fail::Protocol(Error::TooLong))
+            )
+        );
         let over = b"a&".repeat(MAX_PAIRS + 1);
         check(&over);
         let (fields, error) = decode_all(Fields::new, &over);
@@ -891,7 +1013,8 @@ mod tests {
 
     #[test]
     fn every_truncated_prefix() {
-        let full = b"name=J%C3%BCrgen+M%C3%BCller&&email=j%40example.com&note=%E2%80%BD&flag&=&x=%2";
+        let full =
+            b"name=J%C3%BCrgen+M%C3%BCller&&email=j%40example.com&note=%E2%80%BD&flag&=&x=%2";
         let whole = decoded(full).unwrap();
         assert_eq!(whole.len(), 6);
         for n in 0..=full.len() {
@@ -912,11 +1035,17 @@ mod tests {
         assert_eq!(Form::parse(&bytes), Err(Error::TooLong));
         contract::check_wire::<Form>(&bytes);
         contract::check_wire_value(&PercentEncoded { text: "é".into() });
-        assert_eq!(PercentEncoded { text: "é".into() }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            PercentEncoded { text: "é".into() }.to_bytes(),
+            Err(Error::Unwritable)
+        );
         for input in ["é".as_bytes(), &[0xff]] {
             assert_eq!(PercentEncoded::parse(input), Err(Error::NonAscii));
         }
-        assert_eq!(PercentEncoded::parse(b"%+%zz").unwrap().to_bytes().unwrap(), b"%+%zz");
+        assert_eq!(
+            PercentEncoded::parse(b"%+%zz").unwrap().to_bytes().unwrap(),
+            b"%+%zz"
+        );
         contract::check_wire::<PercentEncoded>(b"%+%zz");
     }
 
@@ -927,7 +1056,13 @@ mod tests {
         for round in 0..5000 {
             let len = rng.index(48);
             let buf: Vec<u8> = (0..len)
-                .map(|_| if rng.index(4) == 0 { rng.index(256) as u8 } else { ALPHABET[rng.index(ALPHABET.len())] })
+                .map(|_| {
+                    if rng.index(4) == 0 {
+                        rng.index(256) as u8
+                    } else {
+                        ALPHABET[rng.index(ALPHABET.len())]
+                    }
+                })
                 .collect();
             let got = decoded(&buf).unwrap();
             check(&buf);
@@ -950,7 +1085,10 @@ mod tests {
                 if set.contains(b'%') {
                     assert_eq!(percent_decode(plain.as_bytes()).unwrap(), buf, "{set:?}");
                     if set.contains(b'+') {
-                        assert_eq!(decode_component(plus.as_bytes()).unwrap(), String::from_utf8_lossy(&buf));
+                        assert_eq!(
+                            decode_component(plus.as_bytes()).unwrap(),
+                            String::from_utf8_lossy(&buf)
+                        );
                     }
                 }
             }

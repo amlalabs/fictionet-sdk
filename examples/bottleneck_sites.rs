@@ -23,22 +23,36 @@ type Counts = Arc<[AtomicU64; 2]>;
 /// A filter that counts packets by direction and passes them all.
 fn count(fcx: &fictionet::Cx, inner: impl fictionet::Interface, counts: Counts) -> fictionet::End {
     stdlib::filter(fcx, inner, move |_, direction, _| {
-        let i = if direction == Direction::ToInner { 0 } else { 1 };
+        let i = if direction == Direction::ToInner {
+            0
+        } else {
+            1
+        };
         counts[i].fetch_add(1, Ordering::Relaxed);
         true
     })
 }
 
 fn main() -> fictionet::Result {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/run/fictionet/world.sock".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/run/fictionet/world.sock".into());
     let (attacher, attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
+    let _listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(path.clone().into()),
+        attacher,
+    )?;
     println!("listening on {path}");
 
     fictionet::block_on(fictionet::run(|fcx| async move {
         let app = axum::Router::new()
             .route("/4mb", get(|| async { vec![b'x'; 4 << 20] }))
-            .route("/upload", post(|body: axum::body::Bytes| async move { format!("got {} bytes\n", body.len()) }))
+            .route(
+                "/upload",
+                post(
+                    |body: axum::body::Bytes| async move { format!("got {} bytes\n", body.len()) },
+                ),
+            )
             // The agent sends this body, so keep a limit on it.
             .layer(DefaultBodyLimit::max(8 << 20));
 

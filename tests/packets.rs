@@ -32,7 +32,9 @@ where
 
 /// Waits up to 5 s for a packet on `end`.
 async fn recv_soon(fcx: &Cx, end: &mut End) -> Packet {
-    recv_within(fcx, end, ms(5000)).await.expect("no packet arrived")
+    recv_within(fcx, end, ms(5000))
+        .await
+        .expect("no packet arrived")
 }
 
 /// Waits up to `limit` for a packet. `None` if none came.
@@ -78,7 +80,13 @@ impl Drop for Removed {
 /// Wraps a cable and returns a flag set when its owner removes it.
 fn removed(end: End) -> (Removed, Arc<AtomicBool>) {
     let removed = Arc::new(AtomicBool::new(false));
-    (Removed { end, removed: removed.clone() }, removed)
+    (
+        Removed {
+            end,
+            removed: removed.clone(),
+        },
+        removed,
+    )
 }
 
 /// A tagged packet: a byte to tell it apart, then `len - 1` filler bytes.
@@ -176,7 +184,11 @@ fn bottleneck_sends_at_the_rate() {
         assert!(times[19] < ms(5000), "last after {:?}", times[19]);
         // Each packet leaves at least 10 ms after the one before, so they
         // are spread out, not sent in a lump.
-        assert!(times[9] >= ms(100) && times[9] < ms(5000), "tenth after {:?}", times[9]);
+        assert!(
+            times[9] >= ms(100) && times[9] < ms(5000),
+            "tenth after {:?}",
+            times[9]
+        );
 
         // The other direction has its own rate and queue.
         let t0 = fcx.now();
@@ -198,14 +210,21 @@ fn bottleneck_queue_of_ten_drops_the_eleventh_of_a_burst() {
         for direction in 0..2 {
             let (mut sandbox, world_side) = pair();
             let mut link = bottleneck(&fcx, 1_000_000, 10, world_side);
-            let (from, to) = if direction == 0 { (&mut sandbox, &mut link) } else { (&mut link, &mut sandbox) };
+            let (from, to) = if direction == 0 {
+                (&mut sandbox, &mut link)
+            } else {
+                (&mut link, &mut sandbox)
+            };
             for i in 0..11 {
                 from.send(tagged(i, 1250));
             }
             for i in 0..10 {
                 assert_eq!(recv_soon(&fcx, to).await.0[0], i);
             }
-            assert!(recv_within(&fcx, to, ms(100)).await.is_none(), "the 11th was not dropped");
+            assert!(
+                recv_within(&fcx, to, ms(100)).await.is_none(),
+                "the 11th was not dropped"
+            );
 
             // Once the queue has drained, packets pass again.
             from.send(tagged(42, 1250));
@@ -248,7 +267,9 @@ fn v6_tcp(src: [u8; 16], dst: [u8; 16], payload: &[u8]) -> Vec<u8> {
 const A4: [u8; 4] = [10, 0, 0, 2];
 const B4: [u8; 4] = [1, 1, 1, 1];
 const A6: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
-const B6: [u8; 16] = [0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11];
+const B6: [u8; 16] = [
+    0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11,
+];
 
 #[test]
 fn split_versions_sorts_by_version_and_merges_back() {
@@ -315,9 +336,15 @@ fn split_protocols_sorts_by_protocol_and_icmp_errors_by_the_quoted_packet() {
         let tcp6 = v6_tcp(A6, B6, b"hello");
         let udp6 = v6_udp(A6, B6, b"query");
         let mut ping4 = Vec::new();
-        PacketBuilder::ipv4(A4, B4, 64).icmpv4_echo_request(1, 1).write(&mut ping4, b"ping").unwrap();
+        PacketBuilder::ipv4(A4, B4, 64)
+            .icmpv4_echo_request(1, 1)
+            .write(&mut ping4, b"ping")
+            .unwrap();
         let mut ping6 = Vec::new();
-        PacketBuilder::ipv6(A6, B6, 64).icmpv6_echo_request(1, 1).write(&mut ping6, b"ping").unwrap();
+        PacketBuilder::ipv6(A6, B6, 64)
+            .icmpv6_echo_request(1, 1)
+            .write(&mut ping6, b"ping")
+            .unwrap();
         // GRE (47) is neither.
         let mut gre = udp4.clone();
         gre[9] = 47;
@@ -336,7 +363,21 @@ fn split_protocols_sorts_by_protocol_and_icmp_errors_by_the_quoted_packet() {
         // An error about a ping stays with ICMP.
         let about_ping = icmp4_error(11, 0, &ping4);
 
-        for p in [&tcp4, &udp4, &tcp6, &udp6, &ping4, &ping6, &gre, &hbh, &port_unreachable, &frag_needed, &too_big, &unreachable6, &about_ping] {
+        for p in [
+            &tcp4,
+            &udp4,
+            &tcp6,
+            &udp6,
+            &ping4,
+            &ping6,
+            &gre,
+            &hbh,
+            &port_unreachable,
+            &frag_needed,
+            &too_big,
+            &unreachable6,
+            &about_ping,
+        ] {
             sandbox.send(Packet(p.clone()));
         }
         assert_eq!(recv_soon(&fcx, &mut tcp).await.0, tcp4);
@@ -354,7 +395,10 @@ fn split_protocols_sorts_by_protocol_and_icmp_errors_by_the_quoted_packet() {
         assert_eq!(recv_soon(&fcx, &mut icmp_end).await.0, about_ping);
         assert_eq!(recv_soon(&fcx, &mut other).await.0, gre);
         for end in [&mut tcp, &mut udp, &mut icmp_end, &mut other] {
-            assert!(recv_within(&fcx, end, ms(30)).await.is_none(), "an extra packet");
+            assert!(
+                recv_within(&fcx, end, ms(30)).await.is_none(),
+                "an extra packet"
+            );
         }
 
         // Everything sent into the ends goes out on the split cable.
@@ -375,7 +419,11 @@ fn internet_checksum(pseudo: &[u8], data: &[u8]) -> u16 {
     let mut add = |bytes: &[u8]| {
         for i in (0..bytes.len()).step_by(2) {
             let hi = bytes[i] as u32;
-            let lo = if i + 1 < bytes.len() { bytes[i + 1] as u32 } else { 0 };
+            let lo = if i + 1 < bytes.len() {
+                bytes[i + 1] as u32
+            } else {
+                0
+            };
             sum += (hi << 8) | lo;
         }
     };
@@ -473,7 +521,13 @@ fn split_protocols_reassembles_fragments_that_arrive_out_of_order() {
         let mut other_id = v4_udp(A4, B4, &payload[..1200]);
         other_id[5] ^= 0x55; // a different identification
         let (whole_b, frags_b) = fragment_v4(&other_id, &[400, 400]);
-        for f in [&frags_b[2], &frags_a[1], &frags_b[0], &frags_a[0], &frags_b[1]] {
+        for f in [
+            &frags_b[2],
+            &frags_a[1],
+            &frags_b[0],
+            &frags_a[0],
+            &frags_b[1],
+        ] {
             sandbox.send(Packet(f.clone()));
         }
         assert_eq!(recv_soon(&fcx, &mut udp).await.0, whole_a);
@@ -487,7 +541,10 @@ fn split_protocols_reassembles_fragments_that_arrive_out_of_order() {
         sandbox.send(Packet(frags_c[0].clone()));
         sandbox.send(Packet(overlap[1].clone())); // bytes 400..1200 overlap 0..800
         sandbox.send(Packet(frags_c[1].clone()));
-        assert!(recv_within(&fcx, &mut udp, ms(50)).await.is_none(), "overlapping fragments were joined");
+        assert!(
+            recv_within(&fcx, &mut udp, ms(50)).await.is_none(),
+            "overlapping fragments were joined"
+        );
         assert!(recv_within(&fcx, &mut other, ms(10)).await.is_none());
 
         // A packet in one fragment (an atomic fragment) passes at once.
@@ -508,16 +565,37 @@ fn to4(dst: [u8; 4], tag: u8) -> Packet {
 #[test]
 fn prefixes_parse() {
     let p: Prefix = "10.0.0.0/8".parse().unwrap();
-    assert_eq!(p, Prefix { addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), len: 8 });
+    assert_eq!(
+        p,
+        Prefix {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
+            len: 8
+        }
+    );
     let p: Prefix = "::/0".parse().unwrap();
-    assert_eq!(p, Prefix { addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED), len: 0 });
+    assert_eq!(
+        p,
+        Prefix {
+            addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            len: 0
+        }
+    );
     let p: Prefix = "10.1.2.3/8".parse().unwrap();
     assert_eq!(p.addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)));
     let p: Prefix = "1.1.1.1".parse().unwrap();
     assert_eq!(p.len, 32);
     let p: Prefix = "fd00::1/64".parse().unwrap();
     assert_eq!(p.addr, "fd00::".parse::<IpAddr>().unwrap());
-    for bad in ["", "10.0.0.0/33", "::/129", "10.0.0.0/", "10.0.0.0/x", "10.0.0/8", "10.0.0.0/-1", "10.0.0.0/+8"] {
+    for bad in [
+        "",
+        "10.0.0.0/33",
+        "::/129",
+        "10.0.0.0/",
+        "10.0.0.0/x",
+        "10.0.0/8",
+        "10.0.0.0/-1",
+        "10.0.0.0/+8",
+    ] {
         assert!(bad.parse::<Prefix>().is_err(), "{bad:?} parsed");
     }
 }
@@ -541,13 +619,22 @@ fn router_longest_prefix_add_replace_and_removal_on_close() {
         // Longest prefix wins, from any cable. The router lowers the TTL.
         let hop = |src, dst, payload: &[u8]| {
             let mut v = Vec::new();
-            PacketBuilder::ipv4(src, dst, 63).udp(1000, 53).write(&mut v, payload).unwrap();
+            PacketBuilder::ipv4(src, dst, 63)
+                .udp(1000, 53)
+                .write(&mut v, payload)
+                .unwrap();
             v
         };
         c.send(to4([10, 1, 2, 3], 1));
-        assert_eq!(recv_soon(&fcx, &mut b).await.0, hop(A4, [10, 1, 2, 3], &[1]));
+        assert_eq!(
+            recv_soon(&fcx, &mut b).await.0,
+            hop(A4, [10, 1, 2, 3], &[1])
+        );
         c.send(to4([10, 2, 0, 1], 2));
-        assert_eq!(recv_soon(&fcx, &mut a).await.0, hop(A4, [10, 2, 0, 1], &[2]));
+        assert_eq!(
+            recv_soon(&fcx, &mut a).await.0,
+            hop(A4, [10, 2, 0, 1], &[2])
+        );
         a.send(to4([8, 8, 8, 8], 3));
         assert_eq!(recv_soon(&fcx, &mut c).await.0[28], 3);
         // Back out the cable it came in on, when that is the best route.
@@ -578,12 +665,18 @@ fn router_longest_prefix_add_replace_and_removal_on_close() {
 
         // A closed cable loses its route: the next best one takes over.
         drop(e);
-        wait::until(&fcx, Duration::from_secs(10), || e_removed.load(Ordering::SeqCst)).await;
+        wait::until(&fcx, Duration::from_secs(10), || {
+            e_removed.load(Ordering::SeqCst)
+        })
+        .await;
         c.send(to4([10, 1, 2, 3], 9));
         assert_eq!(recv_soon(&fcx, &mut f).await.0[28], 9);
         // And with no route left for an address, packets are dropped.
         drop(c);
-        wait::until(&fcx, Duration::from_secs(10), || c_removed.load(Ordering::SeqCst)).await;
+        wait::until(&fcx, Duration::from_secs(10), || {
+            c_removed.load(Ordering::SeqCst)
+        })
+        .await;
         a.send(to4([8, 8, 8, 8], 10));
         for end in [&mut a, &mut d, &mut f] {
             assert!(recv_within(&fcx, end, ms(30)).await.is_none());
@@ -602,9 +695,18 @@ fn router_keeps_running_while_the_handle_can_add_routes() {
     world(|fcx| async move {
         let (a_router, a) = pair();
         let (a_router, a_removed) = removed(a_router);
-        let r = router(&fcx, vec![("10.0.0.0/8".parse()?, Box::new(a_router) as Box<dyn Interface>)]);
+        let r = router(
+            &fcx,
+            vec![(
+                "10.0.0.0/8".parse()?,
+                Box::new(a_router) as Box<dyn Interface>,
+            )],
+        );
         drop(a);
-        wait::until(&fcx, Duration::from_secs(10), || a_removed.load(Ordering::SeqCst)).await;
+        wait::until(&fcx, Duration::from_secs(10), || {
+            a_removed.load(Ordering::SeqCst)
+        })
+        .await;
         // Every cable is closed, but the handle is alive: a new route works.
         let (b_router, mut b) = pair();
         let (c_router, mut c) = pair();
@@ -656,7 +758,10 @@ fn lan_forwards_unicast_and_floods_ip_group_traffic() {
         assert_eq!(recv_soon(&fcx, &mut new_b).await.0[28], 5);
 
         let (outside_lan, _outside) = pair();
-        assert!(lan.add("192.168.57.1".parse()?, Box::new(outside_lan), None).is_err());
+        assert!(
+            lan.add("192.168.57.1".parse()?, Box::new(outside_lan), None)
+                .is_err()
+        );
 
         drop(lan);
         drop((a, b, c, new_b));
@@ -694,7 +799,11 @@ fn lan_sends_off_subnet_unicast_to_the_gateway_or_drops_it() {
         assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 5);
 
         // Members' broadcasts and multicasts stay among the members.
-        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 255], &[6])));
+        a.send(Packet(v4_udp(
+            [192, 168, 56, 10],
+            [192, 168, 56, 255],
+            &[6],
+        )));
         a.send(Packet(v4_udp([192, 168, 56, 10], [224, 0, 0, 252], &[7])));
         assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 6);
         assert_eq!(recv_soon(&fcx, &mut b).await.0[28], 7);
@@ -715,7 +824,10 @@ fn lan_sends_off_subnet_unicast_to_the_gateway_or_drops_it() {
 
         // When the gateway closes, the LAN is sealed again.
         drop(gw2);
-        wait::until(&fcx, Duration::from_secs(10), || gw2_removed.load(Ordering::SeqCst)).await;
+        wait::until(&fcx, Duration::from_secs(10), || {
+            gw2_removed.load(Ordering::SeqCst)
+        })
+        .await;
         a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[10])));
         for end in [&mut a, &mut b] {
             assert!(recv_within(&fcx, end, ms(20)).await.is_none());
@@ -766,7 +878,10 @@ fn lan_carries_one_address_family() {
         lan6.add("fd00::22".parse()?, Box::new(e_lan), None)?;
         lan6.gateway(Box::new(gw6_lan))?;
         let (x_lan, _x) = pair();
-        assert!(lan6.add("192.168.56.10".parse()?, Box::new(x_lan), None).is_err());
+        assert!(
+            lan6.add("192.168.56.10".parse()?, Box::new(x_lan), None)
+                .is_err()
+        );
         c.send(Packet(v6_udp(fd(0x10), fd(0x11), &[5])));
         assert_eq!(recv_soon(&fcx, &mut d).await.0[48], 5);
         assert!(recv_within(&fcx, &mut e, ms(20)).await.is_none());
@@ -775,7 +890,11 @@ fn lan_carries_one_address_family() {
         assert_eq!(recv_soon(&fcx, &mut e).await.0[48], 6);
         c.send(Packet(v6_udp(fd(0x10), B6, &[7])));
         assert_eq!(recv_soon(&fcx, &mut gw6).await.0[48], 7);
-        c.send(Packet(v6_udp(LL_A, [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11], &[8])));
+        c.send(Packet(v6_udp(
+            LL_A,
+            [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11],
+            &[8],
+        )));
         c.send(Packet(v4_udp(A4, B4, &[9])));
         for end in [&mut c, &mut d, &mut e, &mut gw6] {
             assert!(recv_within(&fcx, end, ms(20)).await.is_none());
@@ -799,12 +918,19 @@ fn lan_forgets_a_member_whose_interface_closed() {
         lan.add("192.168.56.11".parse()?, Box::new(b_lan), None)?;
         lan.add("192.168.56.22".parse()?, Box::new(c_lan), None)?;
         drop(b);
-        wait::until(&fcx, Duration::from_secs(10), || b_removed.load(Ordering::SeqCst)).await;
+        wait::until(&fcx, Duration::from_secs(10), || {
+            b_removed.load(Ordering::SeqCst)
+        })
+        .await;
 
         // Unicast for it goes nowhere. Broadcast still reaches the rest.
         a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[1])));
         assert!(recv_within(&fcx, &mut c, ms(20)).await.is_none());
-        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 255], &[2])));
+        a.send(Packet(v4_udp(
+            [192, 168, 56, 10],
+            [192, 168, 56, 255],
+            &[2],
+        )));
         assert_eq!(recv_soon(&fcx, &mut c).await.0[28], 2);
 
         // The address is free for a new member.
@@ -853,11 +979,22 @@ fn lan_fan_out_counts_toward_the_budget() {
         for i in 0..7u8 {
             let (lan_side, far) = pair();
             let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10 + i));
-            lan.add(addr, Box::new(LoggedSend { inner: lan_side, log: l.clone() }), None)?;
+            lan.add(
+                addr,
+                Box::new(LoggedSend {
+                    inner: lan_side,
+                    log: l.clone(),
+                }),
+                None,
+            )?;
             members.push(far);
         }
         for i in 0..200u32 {
-            sender.send(Packet(v4_udp([10, 0, 0, 1], [10, 0, 0, 255], &i.to_be_bytes())));
+            sender.send(Packet(v4_udp(
+                [10, 0, 0, 1],
+                [10, 0, 0, 255],
+                &i.to_be_bytes(),
+            )));
         }
         ticker(&fcx, l.clone(), done.clone());
         for far in &mut members {
@@ -924,7 +1061,13 @@ fn longest_run(log: &[char]) -> usize {
 
 #[test]
 fn each_task_yields_after_64_packets_in_a_row() {
-    for which in ["split_versions", "split_protocols", "router", "delay", "bottleneck"] {
+    for which in [
+        "split_versions",
+        "split_protocols",
+        "router",
+        "delay",
+        "bottleneck",
+    ] {
         let log = Arc::new(Mutex::new(Vec::new()));
         let l = log.clone();
         world(move |fcx| async move {
@@ -934,7 +1077,10 @@ fn each_task_yields_after_64_packets_in_a_row() {
                 sandbox.send(Packet(v4_udp(A4, B4, &i.to_be_bytes())));
             }
             ticker(&fcx, l.clone(), done.clone());
-            let inner = Logged { inner: world_side, log: l.clone() };
+            let inner = Logged {
+                inner: world_side,
+                log: l.clone(),
+            };
             let mut out: End = match which {
                 "split_versions" => ip::split_versions(&fcx, inner).0,
                 "split_protocols" => ip::split_protocols(&fcx, inner).1,
@@ -942,10 +1088,13 @@ fn each_task_yields_after_64_packets_in_a_row() {
                 "bottleneck" => bottleneck(&fcx, u64::MAX, 2000, inner),
                 _ => {
                     let (out_router, out) = pair();
-                    let r = router(&fcx, vec![
-                        ("0.0.0.0/0".parse()?, Box::new(inner) as Box<dyn Interface>),
-                        ("1.1.1.1/32".parse()?, Box::new(out_router)),
-                    ]);
+                    let r = router(
+                        &fcx,
+                        vec![
+                            ("0.0.0.0/0".parse()?, Box::new(inner) as Box<dyn Interface>),
+                            ("1.1.1.1/32".parse()?, Box::new(out_router)),
+                        ],
+                    );
                     drop(r);
                     out
                 }
@@ -960,7 +1109,10 @@ fn each_task_yields_after_64_packets_in_a_row() {
         assert_eq!(log.iter().filter(|c| **c == 'p').count(), 1000, "{which}");
         let longest = longest_run(&log);
         assert!(longest <= 64, "{which} took {longest} packets in a row");
-        assert!(longest >= 16, "{which}: the test did not load the task ({longest})");
+        assert!(
+            longest >= 16,
+            "{which}: the test did not load the task ({longest})"
+        );
     }
 }
 
@@ -970,16 +1122,28 @@ fn each_task_yields_after_64_packets_in_a_row() {
 fn echo_reply_v4_has_correct_checksums() {
     let addr = Ipv4Addr::new(1, 1, 1, 1);
     let mut req = Vec::new();
-    PacketBuilder::ipv4(A4, addr.octets(), 64).icmpv4_echo_request(0x1234, 7).write(&mut req, b"abcdefghij").unwrap();
-    let reply = icmp::echo_reply(&Packet(req.clone()), IpAddr::V4(addr)).expect("a reply").0;
+    PacketBuilder::ipv4(A4, addr.octets(), 64)
+        .icmpv4_echo_request(0x1234, 7)
+        .write(&mut req, b"abcdefghij")
+        .unwrap();
+    let reply = icmp::echo_reply(&Packet(req.clone()), IpAddr::V4(addr))
+        .expect("a reply")
+        .0;
 
     // IPv4 header: from the address, to the sender, checksum good.
     assert_eq!(reply[0], 0x45);
-    assert_eq!(u16::from_be_bytes([reply[2], reply[3]]) as usize, reply.len());
+    assert_eq!(
+        u16::from_be_bytes([reply[2], reply[3]]) as usize,
+        reply.len()
+    );
     assert_eq!(reply[9], 1);
     assert_eq!(&reply[12..16], &addr.octets());
     assert_eq!(&reply[16..20], &A4);
-    assert_eq!(internet_checksum(&[], &reply[..20]), 0, "IPv4 header checksum");
+    assert_eq!(
+        internet_checksum(&[], &reply[..20]),
+        0,
+        "IPv4 header checksum"
+    );
     // ICMP: echo reply, same id, sequence and data, checksum good.
     let icmp = &reply[20..];
     assert_eq!(icmp[0], 0);
@@ -1001,7 +1165,9 @@ fn echo_reply_v4_has_correct_checksums() {
     }
 
     // No reply to another address, to a reply, or to a bad checksum.
-    assert!(icmp::echo_reply(&Packet(req.clone()), IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2))).is_none());
+    assert!(
+        icmp::echo_reply(&Packet(req.clone()), IpAddr::V4(Ipv4Addr::new(1, 1, 1, 2))).is_none()
+    );
     assert!(icmp::echo_reply(&Packet(req.clone()), IpAddr::V6(Ipv6Addr::LOCALHOST)).is_none());
     assert!(icmp::echo_reply(&Packet(reply.clone()), IpAddr::V4(Ipv4Addr::from(A4))).is_none());
     let mut bad = req.clone();
@@ -1015,11 +1181,19 @@ fn echo_reply_v4_has_correct_checksums() {
 fn echo_reply_v6_has_correct_checksums() {
     let addr = Ipv6Addr::from(B6);
     let mut req = Vec::new();
-    PacketBuilder::ipv6(A6, B6, 64).icmpv6_echo_request(0x4321, 9).write(&mut req, b"0123456789abc").unwrap();
-    let reply = icmp::echo_reply(&Packet(req.clone()), IpAddr::V6(addr)).expect("a reply").0;
+    PacketBuilder::ipv6(A6, B6, 64)
+        .icmpv6_echo_request(0x4321, 9)
+        .write(&mut req, b"0123456789abc")
+        .unwrap();
+    let reply = icmp::echo_reply(&Packet(req.clone()), IpAddr::V6(addr))
+        .expect("a reply")
+        .0;
 
     assert_eq!(reply[0] >> 4, 6);
-    assert_eq!(u16::from_be_bytes([reply[4], reply[5]]) as usize, reply.len() - 40);
+    assert_eq!(
+        u16::from_be_bytes([reply[4], reply[5]]) as usize,
+        reply.len() - 40
+    );
     assert_eq!(reply[6], 58);
     assert_eq!(&reply[8..24], &B6);
     assert_eq!(&reply[24..40], &A6);
@@ -1038,7 +1212,10 @@ fn echo_reply_v6_has_correct_checksums() {
     let parsed = etherparse::SlicedPacket::from_ip(&reply).unwrap();
     match parsed.transport {
         Some(etherparse::TransportSlice::Icmpv6(s)) => {
-            assert!(s.is_checksum_valid(B6, A6), "etherparse says the checksum is wrong");
+            assert!(
+                s.is_checksum_valid(B6, A6),
+                "etherparse says the checksum is wrong"
+            );
             match s.icmp_type() {
                 etherparse::Icmpv6Type::EchoReply(h) => assert_eq!((h.id, h.seq), (0x4321, 9)),
                 t => panic!("not an echo reply: {t:?}"),
@@ -1069,7 +1246,10 @@ fn a_ping_loop_answers_through_split_protocols() {
             Ok(())
         });
         let mut req = Vec::new();
-        PacketBuilder::ipv4(A4, B4, 64).icmpv4_echo_request(1, 1).write(&mut req, &[7u8; 3000]).unwrap();
+        PacketBuilder::ipv4(A4, B4, 64)
+            .icmpv4_echo_request(1, 1)
+            .write(&mut req, &[7u8; 3000])
+            .unwrap();
         // A ping too big for one packet, fragmented: the reply comes back
         // whole.
         let (whole, frags) = fragment_v4(&req, &[1480, 1480]);
@@ -1108,7 +1288,10 @@ fn every_task_stops_when_its_region_is_cancelled() {
             keep.extend([w, x, y, z]);
             let (a, b) = pair();
             keep.push(a);
-            let r = router(&fcx, vec![("0.0.0.0/0".parse()?, Box::new(b) as Box<dyn Interface>)]);
+            let r = router(
+                &fcx,
+                vec![("0.0.0.0/0".parse()?, Box::new(b) as Box<dyn Interface>)],
+            );
             let (a, b) = pair();
             keep.push(a);
             let l = lan::<Box<dyn Interface>, _>(&fcx, "10.0.0.0/24".parse()?, |event| event);
@@ -1124,17 +1307,29 @@ fn every_task_stops_when_its_region_is_cancelled() {
 #[test]
 fn lan_drop_identity_comes_from_ingress_registration() {
     world(|fcx| async move {
-        let lan = lan(&fcx, "10.0.0.0/24".parse()?, |event| event.field("lan", "test"));
+        let lan = lan(&fcx, "10.0.0.0/24".parse()?, |event| {
+            event.field("lan", "test")
+        });
         let identity = fictionet::events::Sandbox {
-            id: 17, name: Arc::from("member"), addr: Some(Ipv4Addr::new(10, 0, 0, 2)), addr_v6: None,
+            id: 17,
+            name: Arc::from("member"),
+            addr: Some(Ipv4Addr::new(10, 0, 0, 2)),
+            addr_v6: None,
         };
         let (member, mut peer) = pair();
         lan.add("10.0.0.2".parse()?, member, Some(identity.clone()))?;
         // The packet claims another member's source address.
-        peer.send(ip::packet("10.0.0.3".parse()?, "10.0.0.99".parse()?, 253, &[]));
+        peer.send(ip::packet(
+            "10.0.0.3".parse()?,
+            "10.0.0.99".parse()?,
+            253,
+            &[],
+        ));
         peer.send(Packet(vec![1, 2, 3]));
         let events = fcx.events();
-        let drops = events.wait(&fcx, 2, Duration::from_secs(10), |e| e.is("lan", "drop")).await?;
+        let drops = events
+            .wait(&fcx, 2, Duration::from_secs(10), |e| e.is("lan", "drop"))
+            .await?;
         assert_eq!(drops.len(), 2);
         assert!(events.of("net", "blocked").is_empty());
         for event in &drops {
@@ -1148,7 +1343,10 @@ fn lan_drop_identity_comes_from_ingress_registration() {
         let (member, mut peer) = pair();
         lan.add("10.0.0.2".parse()?, member, None)?;
         peer.send(Packet(vec![1, 2, 3]));
-        let drops = fcx.events().wait(&fcx, 3, Duration::from_secs(10), |e| e.is("lan", "drop")).await?;
+        let drops = fcx
+            .events()
+            .wait(&fcx, 3, Duration::from_secs(10), |e| e.is("lan", "drop"))
+            .await?;
         assert_eq!(drops.len(), 3);
         assert!(drops[2].conn.sandbox.is_none());
         Ok(())

@@ -191,8 +191,8 @@ pub mod xr {
     pub const VOIP_METRICS: u8 = 7;
 }
 
-use fictionet::stdlib::codec::{Prefixed, Frames};
-use fictionet::stdlib::codec::{be16, be32, Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, be16, be32};
+use fictionet::stdlib::codec::{Frames, Prefixed};
 
 /// One RTCP packet: what it carries, and how many bytes of padding follow.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -458,7 +458,12 @@ impl Tmmb {
     /// limit. For a TMMBN, it is the limit's owner.
     pub fn with_bitrate(ssrc: u32, bps: u64, overhead: u16) -> Tmmb {
         let (exponent, mantissa) = split_bitrate(bps, 17);
-        Tmmb { ssrc, exponent, mantissa, overhead }
+        Tmmb {
+            ssrc,
+            exponent,
+            mantissa,
+            overhead,
+        }
     }
 }
 
@@ -559,7 +564,11 @@ impl Remb {
     /// mantissa hold.
     pub fn with_bitrate(bps: u64, ssrcs: Vec<u32>) -> Remb {
         let (exponent, mantissa) = split_bitrate(bps, 18);
-        Remb { exponent, mantissa, ssrcs }
+        Remb {
+            exponent,
+            mantissa,
+            ssrcs,
+        }
     }
 }
 
@@ -629,8 +638,7 @@ impl XrBlock {
             return Err(Error::Unwritable);
         }
         let mut data = Vec::new();
-        data.try_reserve_exact(len)
-            .map_err(|_| Error::Unwritable)?;
+        data.try_reserve_exact(len).map_err(|_| Error::Unwritable)?;
         for i in items {
             data.extend_from_slice(&i.ssrc.to_be_bytes());
             data.extend_from_slice(&i.last_rr.to_be_bytes());
@@ -653,7 +661,13 @@ impl XrBlock {
             .as_chunks::<12>()
             .0
             .iter()
-            .map(|c| Some(DlrrItem { ssrc: be32(c, 0)?, last_rr: be32(c, 4)?, delay_since_last_rr: be32(c, 8)? }))
+            .map(|c| {
+                Some(DlrrItem {
+                    ssrc: be32(c, 0)?,
+                    last_rr: be32(c, 4)?,
+                    delay_since_last_rr: be32(c, 8)?,
+                })
+            })
             .collect()
     }
 }
@@ -715,17 +729,22 @@ impl std::fmt::Display for Error {
             Error::Malformed(t) => write!(f, "contents that do not fit RTCP packet type {t}"),
             Error::NoPackets => f.write_str("not a valid compound packet: no packets"),
             Error::FirstNotReport(t) => {
-                write!(f, "not a valid compound packet: the first packet is type {t}, not SR or RR")
+                write!(
+                    f,
+                    "not a valid compound packet: the first packet is type {t}, not SR or RR"
+                )
             }
             Error::NoCname => f.write_str("not a valid compound packet: no SDES CNAME item"),
             Error::EarlyPadding => {
                 f.write_str("not a valid compound packet: padding on a packet other than the last")
             }
-            Error::FeedbackOrder => {
-                f.write_str("not a valid compound packet: a feedback packet before a report or SDES packet")
-            }
+            Error::FeedbackOrder => f.write_str(
+                "not a valid compound packet: a feedback packet before a report or SDES packet",
+            ),
             Error::Trailing => f.write_str("bytes follow the RTCP packet or RFC 4571 envelope"),
-            Error::OverLimit { length, limit } => write!(f, "RFC 4571 payload of {length} bytes, over {limit}"),
+            Error::OverLimit { length, limit } => {
+                write!(f, "RFC 4571 payload of {length} bytes, over {limit}")
+            }
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
@@ -751,7 +770,13 @@ impl Body {
 
     /// Whether this is a REMB, which never carries padding.
     fn is_remb(&self) -> bool {
-        matches!(self, Body::PayloadFeedback(PayloadFeedback { message: PayloadMessage::Remb(_), .. }))
+        matches!(
+            self,
+            Body::PayloadFeedback(PayloadFeedback {
+                message: PayloadMessage::Remb(_),
+                ..
+            })
+        )
     }
 
     /// Reads contents `c`, padding left out, of a packet of type `pt` with
@@ -770,7 +795,8 @@ impl Body {
                 }
                 Body::SenderReport(SenderReport {
                     ssrc: be32(c, 0).ok_or(bad)?,
-                    ntp_timestamp: u64::from(be32(c, 4).ok_or(bad)?) << 32 | u64::from(be32(c, 8).ok_or(bad)?),
+                    ntp_timestamp: u64::from(be32(c, 4).ok_or(bad)?) << 32
+                        | u64::from(be32(c, 8).ok_or(bad)?),
                     rtp_timestamp: be32(c, 12).ok_or(bad)?,
                     packet_count: be32(c, 16).ok_or(bad)?,
                     octet_count: be32(c, 20).ok_or(bad)?,
@@ -793,7 +819,9 @@ impl Body {
                 if c.len() < 4 * n {
                     return Err(bad);
                 }
-                let sources = (0..n).map(|i| be32(c, 4 * i).ok_or(bad)).collect::<Result<_, _>>()?;
+                let sources = (0..n)
+                    .map(|i| be32(c, 4 * i).ok_or(bad))
+                    .collect::<Result<_, _>>()?;
                 let rest = &c[4 * n..];
                 let reason = match rest.split_first() {
                     None => None,
@@ -834,11 +862,21 @@ impl Body {
                             return Err(bad);
                         }
                         TransportMessage::Nack(
-                            fci.as_chunks::<4>().0.iter().map(|e| Ok(Nack { pid: be16(e, 0).ok_or(bad)?, blp: be16(e, 2).ok_or(bad)? })).collect::<Result<_, Error>>()?,
+                            fci.as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|e| {
+                                    Ok(Nack {
+                                        pid: be16(e, 0).ok_or(bad)?,
+                                        blp: be16(e, 2).ok_or(bad)?,
+                                    })
+                                })
+                                .collect::<Result<_, Error>>()?,
                         )
                     }
                     rtpfb::TMMBR | rtpfb::TMMBN => {
-                        if !fci.len().is_multiple_of(8) || (count == rtpfb::TMMBR && fci.is_empty()) {
+                        if !fci.len().is_multiple_of(8) || (count == rtpfb::TMMBR && fci.is_empty())
+                        {
                             return Err(bad);
                         }
                         let items = fci
@@ -863,9 +901,16 @@ impl Body {
                             TransportMessage::Tmmbn(items)
                         }
                     }
-                    fmt => TransportMessage::Other { fmt, fci: fci.to_vec() },
+                    fmt => TransportMessage::Other {
+                        fmt,
+                        fci: fci.to_vec(),
+                    },
                 };
-                Body::TransportFeedback(TransportFeedback { sender_ssrc: be32(c, 0).ok_or(bad)?, media_ssrc, message })
+                Body::TransportFeedback(TransportFeedback {
+                    sender_ssrc: be32(c, 0).ok_or(bad)?,
+                    media_ssrc,
+                    message,
+                })
             }
             packet_type::PSFB => {
                 if c.len() < 8 {
@@ -885,7 +930,9 @@ impl Body {
                             return Err(bad);
                         }
                         PayloadMessage::Sli(
-                            fci.as_chunks::<4>().0.iter()
+                            fci.as_chunks::<4>()
+                                .0
+                                .iter()
                                 .map(|e| {
                                     let v = be32(e, 0).ok_or(bad)?;
                                     Ok(Sli {
@@ -898,12 +945,18 @@ impl Body {
                         )
                     }
                     psfb::RPSI => {
-                        let [pb, pt, data @ ..] = fci else { return Err(bad) };
+                        let [pb, pt, data @ ..] = fci else {
+                            return Err(bad);
+                        };
                         if !rpsi_padding_ok(*pb, data) {
                             return Err(bad);
                         }
                         // The bit above the payload type is ignored on reading.
-                        PayloadMessage::Rpsi(Rpsi { payload_type: pt & 0x7f, padding_bits: *pb, data: data.to_vec() })
+                        PayloadMessage::Rpsi(Rpsi {
+                            payload_type: pt & 0x7f,
+                            padding_bits: *pb,
+                            data: data.to_vec(),
+                        })
                     }
                     psfb::FIR => {
                         if fci.is_empty() || !fci.len().is_multiple_of(8) {
@@ -912,7 +965,16 @@ impl Body {
                         // The media SSRC is unused, and ignored on reading.
                         media_ssrc = 0;
                         PayloadMessage::Fir(
-                            fci.as_chunks::<8>().0.iter().map(|e| Ok(Fir { ssrc: be32(e, 0).ok_or(bad)?, sequence: e[4] })).collect::<Result<_, Error>>()?,
+                            fci.as_chunks::<8>()
+                                .0
+                                .iter()
+                                .map(|e| {
+                                    Ok(Fir {
+                                        ssrc: be32(e, 0).ok_or(bad)?,
+                                        sequence: e[4],
+                                    })
+                                })
+                                .collect::<Result<_, Error>>()?,
                         )
                     }
                     psfb::AFB if fci.starts_with(REMB_ID) => {
@@ -921,9 +983,16 @@ impl Body {
                         PayloadMessage::Remb(parse_remb(fci).ok_or(bad)?)
                     }
                     psfb::AFB => PayloadMessage::Afb(fci.to_vec()),
-                    fmt => PayloadMessage::Other { fmt, fci: fci.to_vec() },
+                    fmt => PayloadMessage::Other {
+                        fmt,
+                        fci: fci.to_vec(),
+                    },
                 };
-                Body::PayloadFeedback(PayloadFeedback { sender_ssrc: be32(c, 0).ok_or(bad)?, media_ssrc, message })
+                Body::PayloadFeedback(PayloadFeedback {
+                    sender_ssrc: be32(c, 0).ok_or(bad)?,
+                    media_ssrc,
+                    message,
+                })
             }
             packet_type::XR => {
                 if c.len() < 4 {
@@ -941,13 +1010,28 @@ impl Body {
                         return Err(bad);
                     }
                     // A reserved byte after the type is ignored on reading.
-                    let type_specific = if xr_reserved(block_type) { 0 } else { header[1] };
-                    blocks.push(XrBlock { block_type, type_specific, data: data.to_vec() });
+                    let type_specific = if xr_reserved(block_type) {
+                        0
+                    } else {
+                        header[1]
+                    };
+                    blocks.push(XrBlock {
+                        block_type,
+                        type_specific,
+                        data: data.to_vec(),
+                    });
                     pos += len;
                 }
-                Body::ExtendedReport(ExtendedReport { ssrc: be32(c, 0).ok_or(bad)?, blocks })
+                Body::ExtendedReport(ExtendedReport {
+                    ssrc: be32(c, 0).ok_or(bad)?,
+                    blocks,
+                })
             }
-            _ => Body::Other { packet_type: pt, count, data: c.to_vec() },
+            _ => Body::Other {
+                packet_type: pt,
+                count,
+                data: c.to_vec(),
+            },
         })
     }
 
@@ -1046,7 +1130,9 @@ impl Body {
                                 return Err(Error::Unwritable);
                             }
                             out.extend_from_slice(&i.ssrc.to_be_bytes());
-                            let v = u32::from(i.exponent) << 26 | i.mantissa << 9 | u32::from(i.overhead);
+                            let v = u32::from(i.exponent) << 26
+                                | i.mantissa << 9
+                                | u32::from(i.overhead);
                             out.extend_from_slice(&v.to_be_bytes());
                         }
                         if request { rtpfb::TMMBR } else { rtpfb::TMMBN }
@@ -1077,7 +1163,9 @@ impl Body {
                             if e.first >= 1 << 13 || e.number >= 1 << 13 || e.picture_id >= 1 << 6 {
                                 return Err(Error::Unwritable);
                             }
-                            let v = u32::from(e.first) << 19 | u32::from(e.number) << 6 | u32::from(e.picture_id);
+                            let v = u32::from(e.first) << 19
+                                | u32::from(e.number) << 6
+                                | u32::from(e.picture_id);
                             out.extend_from_slice(&v.to_be_bytes());
                         }
                         psfb::SLI
@@ -1115,7 +1203,9 @@ impl Body {
                             return Err(Error::Unwritable);
                         }
                         out.extend_from_slice(REMB_ID);
-                        let v = (remb.ssrcs.len() as u32) << 24 | u32::from(remb.exponent) << 18 | remb.mantissa;
+                        let v = (remb.ssrcs.len() as u32) << 24
+                            | u32::from(remb.exponent) << 18
+                            | remb.mantissa;
                         out.extend_from_slice(&v.to_be_bytes());
                         for s in &remb.ssrcs {
                             out.extend_from_slice(&s.to_be_bytes());
@@ -1135,7 +1225,10 @@ impl Body {
                         if usize::from(*fmt) > MAX_COUNT {
                             return Err(Error::Unwritable);
                         }
-                        if matches!(*fmt, psfb::PLI | psfb::SLI | psfb::RPSI | psfb::FIR | psfb::AFB) {
+                        if matches!(
+                            *fmt,
+                            psfb::PLI | psfb::SLI | psfb::RPSI | psfb::FIR | psfb::AFB
+                        ) {
                             return Err(Error::Unwritable);
                         }
                         words(fci)?;
@@ -1149,7 +1242,8 @@ impl Body {
                 out.extend_from_slice(&report.ssrc.to_be_bytes());
                 for b in &report.blocks {
                     words(&b.data)?;
-                    if !xr_layout_ok(b.block_type, b.data.len()) || (xr_reserved(b.block_type) && b.type_specific != 0)
+                    if !xr_layout_ok(b.block_type, b.data.len())
+                        || (xr_reserved(b.block_type) && b.type_specific != 0)
                     {
                         return Err(Error::Unwritable);
                     }
@@ -1161,7 +1255,11 @@ impl Body {
                 }
                 0
             }
-            Body::Other { packet_type, count, data } => {
+            Body::Other {
+                packet_type,
+                count,
+                data,
+            } => {
                 if (packet_type::SR..=packet_type::XR).contains(packet_type) {
                     return Err(Error::Unwritable);
                 }
@@ -1304,16 +1402,26 @@ pub fn check_compound(packets: &[Packet]) -> Result<(), Error> {
     if !matches!(first.body, Body::SenderReport(_) | Body::ReceiverReport(_)) {
         return Err(Error::FirstNotReport(first.body.packet_type()));
     }
-    if packets.iter().any(|p| p.padding != 0 && !std::ptr::eq(p, last)) {
+    if packets
+        .iter()
+        .any(|p| p.padding != 0 && !std::ptr::eq(p, last))
+    {
         return Err(Error::EarlyPadding);
     }
-    let feedback = packets.iter().position(|p| matches!(p.body, Body::TransportFeedback(_) | Body::PayloadFeedback(_)));
+    let feedback = packets.iter().position(|p| {
+        matches!(
+            p.body,
+            Body::TransportFeedback(_) | Body::PayloadFeedback(_)
+        )
+    });
     if let Some(at) = feedback {
         let after = &packets[at..];
-        if after
-            .iter()
-            .any(|p| matches!(p.body, Body::SenderReport(_) | Body::ReceiverReport(_) | Body::SourceDescription(_)))
-        {
+        if after.iter().any(|p| {
+            matches!(
+                p.body,
+                Body::SenderReport(_) | Body::ReceiverReport(_) | Body::SourceDescription(_)
+            )
+        }) {
             return Err(Error::FeedbackOrder);
         }
     }
@@ -1324,7 +1432,11 @@ pub fn check_compound(packets: &[Packet]) -> Result<(), Error> {
             Body::SourceDescription(chunks) => Some(chunks),
             _ => None,
         })
-        .any(|chunks| chunks.iter().any(|c| c.items.iter().any(|i| i.kind == sdes::CNAME)));
+        .any(|chunks| {
+            chunks
+                .iter()
+                .any(|c| c.items.iter().any(|i| i.kind == sdes::CNAME))
+        });
     if !cname {
         return Err(Error::NoCname);
     }
@@ -1468,10 +1580,7 @@ impl Wire for Frame {
     /// Reads exactly one RFC 4571 frame. Refuses truncated frames and
     /// trailing bytes. An empty payload is a valid null frame.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        match Frames::<Frame>::new()
-            .decode(bytes, true)
-?
-        {
+        match Frames::<Frame>::new().decode(bytes, true)? {
             Step::Item(frame, used) if used == bytes.len() => Ok(frame),
             Step::Item(_, _) => Err(Error::Trailing),
             _ => Err(Error::Truncated),
@@ -1504,10 +1613,14 @@ impl Prefixed for Frame {
     const NAME: &'static str = "RTP/RTCP RFC 4571";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_FRAME }
+    fn default_limit() -> Self::Limit {
+        MAX_FRAME
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_FRAME) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_FRAME)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -1516,32 +1629,39 @@ impl Prefixed for Frame {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         let Some(&[hi, lo]) = input.get(..2) else {
             return Ok(None);
         };
         let length = usize::from(u16::from_be_bytes([hi, lo]));
         if length > limit {
-            return Err(Error::OverLimit {
-                length,
-                limit,
-            });
+            return Err(Error::OverLimit { length, limit });
         }
         let used = 2usize.saturating_add(length);
-        Ok(input.get(2..used).map(|bytes| (Frame(bytes.to_vec()), used)))
+        Ok(input
+            .get(2..used)
+            .map(|bytes| (Frame(bytes.to_vec()), used)))
     }
 }
 
-
 /// Reads `n` report blocks from the start of `b`, which holds them all.
 fn report_blocks(b: &[u8], n: usize) -> Result<Vec<ReportBlock>, Error> {
-    b.as_chunks::<REPORT_BLOCK_LEN>().0.iter()
+    b.as_chunks::<REPORT_BLOCK_LEN>()
+        .0
+        .iter()
         .take(n)
         .map(|r| {
             let raw = be32(r, 4).ok_or(Error::Truncated)? & 0xff_ffff;
             // Sign-extend the 24-bit loss.
-            let lost = if raw & 0x80_0000 != 0 { raw as i32 - (1 << 24) } else { raw as i32 };
+            let lost = if raw & 0x80_0000 != 0 {
+                raw as i32 - (1 << 24)
+            } else {
+                raw as i32
+            };
             Ok(ReportBlock {
                 ssrc: be32(r, 0).ok_or(Error::Truncated)?,
                 fraction_lost: r[4],
@@ -1556,7 +1676,11 @@ fn report_blocks(b: &[u8], n: usize) -> Result<Vec<ReportBlock>, Error> {
 }
 
 /// Writes report blocks and an extension, and returns the count field.
-fn write_reports(out: &mut Vec<u8>, reports: &[ReportBlock], extension: &[u8]) -> Result<u8, Error> {
+fn write_reports(
+    out: &mut Vec<u8>,
+    reports: &[ReportBlock],
+    extension: &[u8],
+) -> Result<u8, Error> {
     if reports.len() > MAX_COUNT {
         return Err(Error::Unwritable);
     }
@@ -1603,7 +1727,10 @@ fn parse_sdes(c: &[u8], n: usize) -> Option<Vec<SdesChunk>> {
             }
             let len = usize::from(*c.get(pos + 1)?);
             let text = c.get(pos + 2..pos + 2 + len)?;
-            let item = SdesItem { kind, text: text.to_vec() };
+            let item = SdesItem {
+                kind,
+                text: text.to_vec(),
+            };
             if !item.layout_ok() {
                 return None;
             }
@@ -1637,7 +1764,12 @@ fn parse_remb(fci: &[u8]) -> Option<Remb> {
     Some(Remb {
         exponent: (v >> 18 & 0x3f) as u8,
         mantissa: v & 0x3_ffff,
-        ssrcs: rest.as_chunks::<4>().0.iter().map(|s| be32(s, 0)).collect::<Option<_>>()?,
+        ssrcs: rest
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|s| be32(s, 0))
+            .collect::<Option<_>>()?,
     })
 }
 
@@ -1707,7 +1839,10 @@ fn xr_layout_ok(block_type: u8, len: usize) -> bool {
 /// Whether the byte after an XR block's type is reserved: written as 0
 /// and ignored on reading (RFC 3611 sections 4.4, 4.5 and 4.7).
 fn xr_reserved(block_type: u8) -> bool {
-    matches!(block_type, xr::RECEIVER_REFERENCE_TIME | xr::DLRR | xr::VOIP_METRICS)
+    matches!(
+        block_type,
+        xr::RECEIVER_REFERENCE_TIME | xr::DLRR | xr::VOIP_METRICS
+    )
 }
 
 /// Pads `out` with zeros to a whole number of 32-bit words.
@@ -1747,22 +1882,28 @@ fn check_size(n: usize) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn rr(ssrc: u32) -> Packet {
-        Body::ReceiverReport(ReceiverReport { ssrc, reports: vec![], extension: vec![] }).into()
+        Body::ReceiverReport(ReceiverReport {
+            ssrc,
+            reports: vec![],
+            extension: vec![],
+        })
+        .into()
     }
 
     fn cname(ssrc: u32, name: &[u8]) -> Packet {
         Body::SourceDescription(vec![SdesChunk {
             ssrc,
-            items: vec![SdesItem { kind: sdes::CNAME, text: name.to_vec() }],
+            items: vec![SdesItem {
+                kind: sdes::CNAME,
+                text: name.to_vec(),
+            }],
         }])
         .into()
     }
@@ -1831,42 +1972,81 @@ mod tests {
             SdesChunk {
                 ssrc: 1,
                 items: vec![
-                    SdesItem { kind: sdes::CNAME, text: b"ab".to_vec() },
-                    SdesItem { kind: sdes::TOOL, text: vec![] },
+                    SdesItem {
+                        kind: sdes::CNAME,
+                        text: b"ab".to_vec(),
+                    },
+                    SdesItem {
+                        kind: sdes::TOOL,
+                        text: vec![],
+                    },
                 ],
             },
-            SdesChunk { ssrc: 2, items: vec![] },
+            SdesChunk {
+                ssrc: 2,
+                items: vec![],
+            },
         ]));
         let b = round_trip(&p);
-        assert_eq!(b, [0x82, 202, 0, 5, 0, 0, 0, 1, 1, 2, b'a', b'b', 6, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0]);
-        let item = SdesItem { kind: sdes::PRIV, text: b"\x03abcxyz".to_vec() };
+        assert_eq!(
+            b,
+            [
+                0x82, 202, 0, 5, 0, 0, 0, 1, 1, 2, b'a', b'b', 6, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0
+            ]
+        );
+        let item = SdesItem {
+            kind: sdes::PRIV,
+            text: b"\x03abcxyz".to_vec(),
+        };
         assert_eq!(item.priv_parts(), Some((&b"abc"[..], &b"xyz"[..])));
-        assert_eq!(SdesItem { kind: sdes::PRIV, text: vec![9, 1] }.priv_parts(), None);
-        assert_eq!(SdesItem { kind: sdes::NOTE, text: vec![0] }.priv_parts(), None);
+        assert_eq!(
+            SdesItem {
+                kind: sdes::PRIV,
+                text: vec![9, 1]
+            }
+            .priv_parts(),
+            None
+        );
+        assert_eq!(
+            SdesItem {
+                kind: sdes::NOTE,
+                text: vec![0]
+            }
+            .priv_parts(),
+            None
+        );
         // A non-zero byte in the padding, and a chunk left over.
         let mut bad = b.clone();
         bad[15] = 1;
-        assert_eq!(
-            Packet::parse(&bad),
-            Err(Error::Malformed(202))
-        );
+        assert_eq!(Packet::parse(&bad), Err(Error::Malformed(202)));
         let mut bad = b.clone();
         bad[0] = 0x81;
-        assert_eq!(
-            Packet::parse(&bad),
-            Err(Error::Malformed(202))
-        );
+        assert_eq!(Packet::parse(&bad), Err(Error::Malformed(202)));
     }
 
     // RFC 3550 section 6.6.
     #[test]
     fn bye_with_and_without_reason() {
-        let p = Packet::from(Body::Bye(Bye { sources: vec![7], reason: Some(b"done".to_vec()) }));
+        let p = Packet::from(Body::Bye(Bye {
+            sources: vec![7],
+            reason: Some(b"done".to_vec()),
+        }));
         let b = round_trip(&p);
-        assert_eq!(b, [0x81, 203, 0, 3, 0, 0, 0, 7, 4, b'd', b'o', b'n', b'e', 0, 0, 0]);
-        let none = round_trip(&Packet::from(Body::Bye(Bye { sources: vec![1, 2], reason: None })));
+        assert_eq!(
+            b,
+            [
+                0x81, 203, 0, 3, 0, 0, 0, 7, 4, b'd', b'o', b'n', b'e', 0, 0, 0
+            ]
+        );
+        let none = round_trip(&Packet::from(Body::Bye(Bye {
+            sources: vec![1, 2],
+            reason: None,
+        })));
         assert_eq!(none.len(), 12);
-        let empty = round_trip(&Packet::from(Body::Bye(Bye { sources: vec![], reason: Some(vec![]) })));
+        let empty = round_trip(&Packet::from(Body::Bye(Bye {
+            sources: vec![],
+            reason: Some(vec![]),
+        })));
         assert_eq!(empty, [0x80, 203, 0, 1, 0, 0, 0, 0]);
         // A reason longer than the packet, and junk after it.
         assert_eq!(
@@ -1890,20 +2070,44 @@ mod tests {
 
     #[test]
     fn app() {
-        let p = Packet::from(Body::App(App { subtype: 3, ssrc: 1, name: *b"TEST", data: vec![9; 8] }));
+        let p = Packet::from(Body::App(App {
+            subtype: 3,
+            ssrc: 1,
+            name: *b"TEST",
+            data: vec![9; 8],
+        }));
         let b = round_trip(&p);
-        assert_eq!(&b[..12], &[0x83, 204, 0, 4, 0, 0, 0, 1, b'T', b'E', b'S', b'T']);
-        assert_eq!(Packet::parse(&[0x80, 204, 0, 1, 0, 0, 0, 1]), Err(Error::Malformed(204)));
+        assert_eq!(
+            &b[..12],
+            &[0x83, 204, 0, 4, 0, 0, 0, 1, b'T', b'E', b'S', b'T']
+        );
+        assert_eq!(
+            Packet::parse(&[0x80, 204, 0, 1, 0, 0, 0, 1]),
+            Err(Error::Malformed(204))
+        );
     }
 
     // RFC 4585 section 6.2.1.
     #[test]
     fn generic_nack() {
-        assert_eq!(Nack { pid: 65535, blp: 0x8001 }.lost(), vec![65535, 0, 15]);
+        assert_eq!(
+            Nack {
+                pid: 65535,
+                blp: 0x8001
+            }
+            .lost(),
+            vec![65535, 0, 15]
+        );
         let p = Packet::from(Body::TransportFeedback(TransportFeedback {
             sender_ssrc: 1,
             media_ssrc: 2,
-            message: TransportMessage::Nack(vec![Nack { pid: 1, blp: 0 }, Nack { pid: 40, blp: 0xffff }]),
+            message: TransportMessage::Nack(vec![
+                Nack { pid: 1, blp: 0 },
+                Nack {
+                    pid: 40,
+                    blp: 0xffff,
+                },
+            ]),
         }));
         let b = round_trip(&p);
         assert_eq!(&b[..4], &[0x81, 205, 0, 4]);
@@ -1945,24 +2149,52 @@ mod tests {
             Packet::parse(&[0x84, 205, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
             Err(Error::Malformed(205))
         );
-        assert_eq!(Tmmb { ssrc: 0, exponent: 63, mantissa: 0x1_ffff, overhead: 0 }.bitrate(), u64::MAX);
+        assert_eq!(
+            Tmmb {
+                ssrc: 0,
+                exponent: 63,
+                mantissa: 0x1_ffff,
+                overhead: 0
+            }
+            .bitrate(),
+            u64::MAX
+        );
     }
 
     // RFC 4585 sections 6.3.1 to 6.3.3, RFC 5104 section 4.3.1.
     #[test]
     fn pli_sli_rpsi_fir() {
-        let fb =
-            |message| Packet::from(Body::PayloadFeedback(PayloadFeedback { sender_ssrc: 1, media_ssrc: 2, message }));
-        assert_eq!(round_trip(&fb(PayloadMessage::Pli)), [0x81, 206, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]);
-        let b = round_trip(&fb(PayloadMessage::Sli(vec![Sli { first: 8191, number: 1, picture_id: 63 }])));
+        let fb = |message| {
+            Packet::from(Body::PayloadFeedback(PayloadFeedback {
+                sender_ssrc: 1,
+                media_ssrc: 2,
+                message,
+            }))
+        };
+        assert_eq!(
+            round_trip(&fb(PayloadMessage::Pli)),
+            [0x81, 206, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]
+        );
+        let b = round_trip(&fb(PayloadMessage::Sli(vec![Sli {
+            first: 8191,
+            number: 1,
+            picture_id: 63,
+        }])));
         assert_eq!(&b[12..], &[0xff, 0xf8, 0x00, 0x7f]);
-        let b = round_trip(&fb(PayloadMessage::Rpsi(Rpsi { payload_type: 96, padding_bits: 4, data: vec![0xa0, 0] })));
+        let b = round_trip(&fb(PayloadMessage::Rpsi(Rpsi {
+            payload_type: 96,
+            padding_bits: 4,
+            data: vec![0xa0, 0],
+        })));
         assert_eq!(&b[..4], &[0x83, 206, 0, 3]);
         assert_eq!(&b[12..], &[4, 96, 0xa0, 0]);
         let fir = Packet::from(Body::PayloadFeedback(PayloadFeedback {
             sender_ssrc: 1,
             media_ssrc: 0,
-            message: PayloadMessage::Fir(vec![Fir { ssrc: 5, sequence: 9 }]),
+            message: PayloadMessage::Fir(vec![Fir {
+                ssrc: 5,
+                sequence: 9,
+            }]),
         }));
         let b = round_trip(&fir);
         assert_eq!(&b[..4], &[0x84, 206, 0, 4]);
@@ -1974,7 +2206,8 @@ mod tests {
         // PLI with FCI, empty SLI and FIR, RPSI with too many padding bits
         // or no room for its two leading bytes.
         let head = [0, 0, 0, 1, 0, 0, 0, 2];
-        let with = |first: u8, len: u8, fci: &[u8]| [&[first, 206, 0, len][..], &head, fci].concat();
+        let with =
+            |first: u8, len: u8, fci: &[u8]| [&[first, 206, 0, len][..], &head, fci].concat();
         for bad in [
             with(0x81, 3, &[0, 0, 0, 0]),
             with(0x82, 2, &[]),
@@ -1983,11 +2216,7 @@ mod tests {
             with(0x83, 3, &[17, 96, 0, 0]),
             with(0x83, 2, &[]),
         ] {
-            assert_eq!(
-                Packet::parse(&bad),
-                Err(Error::Malformed(206)),
-                "{bad:?}"
-            );
+            assert_eq!(Packet::parse(&bad), Err(Error::Malformed(206)), "{bad:?}");
         }
     }
 
@@ -1995,14 +2224,22 @@ mod tests {
     #[test]
     fn remb() {
         let bytes = [
-            0x8f, 0xce, 0x00, 0x05, 0, 0, 0, 1, 0, 0, 0, 0, b'R', b'E', b'M', b'B', 0x01, 0x0a, 0x00, 0x10, 0, 0, 0, 9,
+            0x8f, 0xce, 0x00, 0x05, 0, 0, 0, 1, 0, 0, 0, 0, b'R', b'E', b'M', b'B', 0x01, 0x0a,
+            0x00, 0x10, 0, 0, 0, 9,
         ];
         let p = Packet::parse(&bytes).unwrap();
-        let Body::PayloadFeedback(PayloadFeedback { message: PayloadMessage::Remb(r), .. }) = &p.body else {
+        let Body::PayloadFeedback(PayloadFeedback {
+            message: PayloadMessage::Remb(r),
+            ..
+        }) = &p.body
+        else {
             panic!("{p:?}")
         };
         // Exponent 2, mantissa 0x20010.
-        assert_eq!((r.exponent, r.mantissa, r.ssrcs.clone()), (2, 0x2_0010, vec![9]));
+        assert_eq!(
+            (r.exponent, r.mantissa, r.ssrcs.clone()),
+            (2, 0x2_0010, vec![9])
+        );
         assert_eq!(r.bitrate(), 0x2_0010 * 4);
         assert_eq!(p.to_bytes().unwrap(), bytes);
         let w = Remb::with_bitrate(2_500_000, vec![]);
@@ -2010,22 +2247,27 @@ mod tests {
         // A count that does not match is a bad REMB.
         let mut afb = bytes;
         afb[16] = 2;
-        assert_eq!(
-            Packet::parse(&afb),
-            Err(Error::Malformed(206))
-        );
+        assert_eq!(Packet::parse(&afb), Err(Error::Malformed(206)));
     }
 
     // RFC 3611 sections 4.4 and 4.5.
     #[test]
     fn extended_reports() {
-        let items = [DlrrItem { ssrc: 1, last_rr: 2, delay_since_last_rr: 3 }];
+        let items = [DlrrItem {
+            ssrc: 1,
+            last_rr: 2,
+            delay_since_last_rr: 3,
+        }];
         let p = Packet::from(Body::ExtendedReport(ExtendedReport {
             ssrc: 7,
             blocks: vec![
                 XrBlock::receiver_reference_time(0x0102_0304_0506_0708),
                 XrBlock::dlrr(&items).unwrap(),
-                XrBlock { block_type: 99, type_specific: 5, data: vec![] },
+                XrBlock {
+                    block_type: 99,
+                    type_specific: 5,
+                    data: vec![],
+                },
             ],
         }));
         let b = round_trip(&p);
@@ -2033,7 +2275,9 @@ mod tests {
         assert_eq!(&b[8..12], &[4, 0, 0, 2]);
         assert_eq!(&b[20..24], &[5, 0, 0, 3]);
         assert_eq!(&b[36..40], &[99, 5, 0, 0]);
-        let Body::ExtendedReport(x) = &p.body else { panic!() };
+        let Body::ExtendedReport(x) = &p.body else {
+            panic!()
+        };
         assert_eq!(x.blocks[0].ntp_timestamp(), Some(0x0102_0304_0506_0708));
         assert_eq!(x.blocks[1].dlrr_items(), Some(items.to_vec()));
         assert_eq!(x.blocks[1].ntp_timestamp(), None);
@@ -2051,7 +2295,11 @@ mod tests {
 
     #[test]
     fn dlrr_packet_size_boundary() {
-        let item = DlrrItem { ssrc: 1, last_rr: 2, delay_since_last_rr: 3 };
+        let item = DlrrItem {
+            ssrc: 1,
+            last_rr: 2,
+            delay_since_last_rr: 3,
+        };
         let mut items = vec![item; (MAX_PACKET - 12) / 12];
         let block = XrBlock::dlrr(&items).unwrap();
         assert_eq!(block.dlrr_items(), Some(items.clone()));
@@ -2066,10 +2314,23 @@ mod tests {
 
     #[test]
     fn other_types_and_aliases() {
-        let p = Packet { body: Body::Other { packet_type: 210, count: 4, data: vec![1, 2, 3, 4] }, padding: 4 };
+        let p = Packet {
+            body: Body::Other {
+                packet_type: 210,
+                count: 4,
+                data: vec![1, 2, 3, 4],
+            },
+            padding: 4,
+        };
         let b = round_trip(&p);
         assert_eq!(b, [0xa4, 210, 0, 2, 1, 2, 3, 4, 0, 0, 0, 4]);
-        let other = |packet_type| Packet::from(Body::Other { packet_type, count: 0, data: vec![] });
+        let other = |packet_type| {
+            Packet::from(Body::Other {
+                packet_type,
+                count: 0,
+                data: vec![],
+            })
+        };
         for t in 200..=207 {
             assert_eq!(other(t).to_bytes(), Err(Error::Unwritable));
         }
@@ -2087,7 +2348,10 @@ mod tests {
             Packet::from(Body::PayloadFeedback(PayloadFeedback {
                 sender_ssrc: 0,
                 media_ssrc: 0,
-                message: PayloadMessage::Other { fmt, fci: vec![0; 4] },
+                message: PayloadMessage::Other {
+                    fmt,
+                    fci: vec![0; 4],
+                },
             }))
         };
         assert_eq!(ps(15).to_bytes(), Err(Error::Unwritable));
@@ -2103,7 +2367,10 @@ mod tests {
     // RFC 3550 section 6.4.1: padding, with the count in the last byte.
     #[test]
     fn padding() {
-        let p = Packet { padding: 4, ..rr(1) };
+        let p = Packet {
+            padding: 4,
+            ..rr(1)
+        };
         let b = round_trip(&p);
         assert_eq!(b, [0xa0, 201, 0, 2, 0, 0, 0, 1, 0, 0, 0, 4]);
         assert_eq!(
@@ -2123,10 +2390,7 @@ mod tests {
             Packet::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 5]),
             Err(Error::Padding)
         );
-        assert_eq!(
-            Packet::parse(&[0xa0, 210, 0, 0]),
-            Err(Error::Padding)
-        );
+        assert_eq!(Packet::parse(&[0xa0, 210, 0, 0]), Err(Error::Padding));
         // A count that is not a multiple of four.
         assert_eq!(
             Packet::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 3]),
@@ -2178,7 +2442,10 @@ mod tests {
             Err(Error::Malformed(206))
         );
         // A typed packet whose contents are not whole words.
-        assert_eq!(Datagram::parse(&[0x80, 204, 0, 1, 0, 0, 0, 1]).map(|p| p.0), Err(Error::Malformed(204)));
+        assert_eq!(
+            Datagram::parse(&[0x80, 204, 0, 1, 0, 0, 0, 1]).map(|p| p.0),
+            Err(Error::Malformed(204))
+        );
         for e in [Error::Empty, Error::NoCname, Error::Version(0)] {
             assert!(!e.to_string().is_empty());
         }
@@ -2191,24 +2458,45 @@ mod tests {
         let bytes = Compound(good.to_vec()).to_bytes().unwrap();
         assert_eq!(Compound::parse(&bytes).map(|p| p.0), Ok(good.clone()));
         assert_eq!(check_compound(&[]), Err(Error::NoPackets));
-        assert_eq!(check_compound(&[cname(1, b"x"), rr(1)]), Err(Error::FirstNotReport(202)));
+        assert_eq!(
+            check_compound(&[cname(1, b"x"), rr(1)]),
+            Err(Error::FirstNotReport(202))
+        );
         assert_eq!(check_compound(&[rr(1)]), Err(Error::NoCname));
         let no_cname = Packet::from(Body::SourceDescription(vec![SdesChunk {
             ssrc: 1,
-            items: vec![SdesItem { kind: sdes::NAME, text: vec![] }],
+            items: vec![SdesItem {
+                kind: sdes::NAME,
+                text: vec![],
+            }],
         }]));
         assert_eq!(check_compound(&[rr(1), no_cname]), Err(Error::NoCname));
-        let padded = vec![Packet { padding: 4, ..rr(1) }, cname(1, b"x")];
+        let padded = vec![
+            Packet {
+                padding: 4,
+                ..rr(1)
+            },
+            cname(1, b"x"),
+        ];
         assert_eq!(check_compound(&padded), Err(Error::EarlyPadding));
-        assert_eq!(
-            Compound(padded.to_vec()).to_bytes(),
-            Err(Error::Unwritable)
-        );
+        assert_eq!(Compound(padded.to_vec()).to_bytes(), Err(Error::Unwritable));
         let bytes = Datagram(padded.to_vec()).to_bytes().unwrap();
         assert_eq!(Datagram::parse(&bytes).map(|p| p.0), Ok(padded));
-        assert_eq!(Compound::parse(&bytes).map(|p| p.0), Err(Error::EarlyPadding));
-        let last = vec![rr(1), Packet { padding: 8, ..cname(1, b"x") }];
-        assert_eq!(Compound::parse(&Compound(last.to_vec()).to_bytes().unwrap()).map(|p| p.0), Ok(last));
+        assert_eq!(
+            Compound::parse(&bytes).map(|p| p.0),
+            Err(Error::EarlyPadding)
+        );
+        let last = vec![
+            rr(1),
+            Packet {
+                padding: 8,
+                ..cname(1, b"x")
+            },
+        ];
+        assert_eq!(
+            Compound::parse(&Compound(last.to_vec()).to_bytes().unwrap()).map(|p| p.0),
+            Ok(last)
+        );
         assert_eq!(Compound([].to_vec()).to_bytes(), Err(Error::Unwritable));
         assert_eq!(Datagram([].to_vec()).to_bytes(), Err(Error::Unwritable));
     }
@@ -2217,9 +2505,30 @@ mod tests {
     // 0 on sending and ignored on reading.
     #[test]
     fn rpsi_reserved_bit_is_ignored() {
-        let bytes = [0x83, 206, 0, 3, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0x80 | 96, 0xa0, 0];
+        let bytes = [
+            0x83,
+            206,
+            0,
+            3,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            2,
+            0,
+            0x80 | 96,
+            0xa0,
+            0,
+        ];
         let p = Packet::parse(&bytes).unwrap();
-        let want = Rpsi { payload_type: 96, padding_bits: 0, data: vec![0xa0, 0] };
+        let want = Rpsi {
+            payload_type: 96,
+            padding_bits: 0,
+            data: vec![0xa0, 0],
+        };
         assert_eq!(
             p.body,
             Body::PayloadFeedback(PayloadFeedback {
@@ -2244,11 +2553,25 @@ mod tests {
             media_ssrc: 2,
             message: TransportMessage::Nack(vec![Nack { pid: 1, blp: 0 }]),
         }));
-        assert_eq!(check_compound(&[rr(1), cname(1, b"x"), pli.clone(), nack.clone()]), Ok(()));
-        assert_eq!(check_compound(&[rr(1), pli.clone(), cname(1, b"x")]), Err(Error::FeedbackOrder));
-        assert_eq!(check_compound(&[rr(1), nack.clone(), rr(2), cname(1, b"x")]), Err(Error::FeedbackOrder));
-        let bytes = Datagram([rr(1), pli.clone(), cname(1, b"x")].to_vec()).to_bytes().unwrap();
-        assert_eq!(Compound::parse(&bytes).map(|p| p.0), Err(Error::FeedbackOrder));
+        assert_eq!(
+            check_compound(&[rr(1), cname(1, b"x"), pli.clone(), nack.clone()]),
+            Ok(())
+        );
+        assert_eq!(
+            check_compound(&[rr(1), pli.clone(), cname(1, b"x")]),
+            Err(Error::FeedbackOrder)
+        );
+        assert_eq!(
+            check_compound(&[rr(1), nack.clone(), rr(2), cname(1, b"x")]),
+            Err(Error::FeedbackOrder)
+        );
+        let bytes = Datagram([rr(1), pli.clone(), cname(1, b"x")].to_vec())
+            .to_bytes()
+            .unwrap();
+        assert_eq!(
+            Compound::parse(&bytes).map(|p| p.0),
+            Err(Error::FeedbackOrder)
+        );
         assert_eq!(
             Compound([rr(1), nack, cname(1, b"x")].to_vec()).to_bytes(),
             Err(Error::Unwritable)
@@ -2262,19 +2585,11 @@ mod tests {
     fn packet_longer_than_max_packet() {
         let mut b = vec![0u8; 4 * 65536];
         b[..4].copy_from_slice(&[0x80, 210, 0xff, 0xff]);
-        assert_eq!(
-            Packet::parse(&b),
-            Err(Error::TooLong(4 * 65536))
-        );
+        assert_eq!(Packet::parse(&b), Err(Error::TooLong(4 * 65536)));
         let mut b = vec![0u8; MAX_PACKET + 4];
         let words = (MAX_PACKET / 4) as u16;
         b[..4].copy_from_slice(&[0x80, 210, (words >> 8) as u8, words as u8]);
-        assert_eq!(
-            Packet::parse(&b),
-            Err(Error::TooLong(
-                MAX_PACKET + 4
-            ))
-        );
+        assert_eq!(Packet::parse(&b), Err(Error::TooLong(MAX_PACKET + 4)));
         // The longest packet reads and writes back.
         let words = (MAX_PACKET / 4 - 1) as u16;
         b[..4].copy_from_slice(&[0x80, 210, (words >> 8) as u8, words as u8]);
@@ -2290,9 +2605,15 @@ mod tests {
         assert_eq!(
             nacks,
             vec![
-                Nack { pid: 100, blp: 0b10 | 1 << 15 },
+                Nack {
+                    pid: 100,
+                    blp: 0b10 | 1 << 15
+                },
                 Nack { pid: 117, blp: 0 },
-                Nack { pid: 65535, blp: 1 | 1 << 15 },
+                Nack {
+                    pid: 65535,
+                    blp: 1 | 1 << 15
+                },
                 Nack { pid: 16, blp: 0 },
             ]
         );
@@ -2301,7 +2622,14 @@ mod tests {
         // Repeats and numbers that go back start a new entry, and every
         // number listed is still asked for.
         let nacks = Nack::from_lost(&[5, 5, 3]);
-        assert_eq!(nacks, vec![Nack { pid: 5, blp: 0 }, Nack { pid: 5, blp: 0 }, Nack { pid: 3, blp: 0 }]);
+        assert_eq!(
+            nacks,
+            vec![
+                Nack { pid: 5, blp: 0 },
+                Nack { pid: 5, blp: 0 },
+                Nack { pid: 3, blp: 0 }
+            ]
+        );
         let mut r = Lcg::new(0x6e61_636b);
         for _ in 0..2000 {
             let lost: Vec<u16> = (0..r.index(40)).map(|_| r.next() as u16 % 64).collect();
@@ -2322,7 +2650,11 @@ mod tests {
         let mut too_lost = block(1);
         too_lost.cumulative_lost = MAX_CUMULATIVE_LOST + 1;
         let rrb = |reports: Vec<ReportBlock>, extension: Vec<u8>| {
-            Packet::from(Body::ReceiverReport(ReceiverReport { ssrc: 1, reports, extension }))
+            Packet::from(Body::ReceiverReport(ReceiverReport {
+                ssrc: 1,
+                reports,
+                extension,
+            }))
         };
         assert_eq!(
             rrb(vec![block(1); 32], vec![]).to_bytes(),
@@ -2332,65 +2664,163 @@ mod tests {
             rrb(vec![too_lost], vec![]).to_bytes(),
             Err(Error::Unwritable)
         );
-        assert_eq!(
-            rrb(vec![], vec![0; 3]).to_bytes(),
-            Err(Error::Unwritable)
-        );
+        assert_eq!(rrb(vec![], vec![0; 3]).to_bytes(), Err(Error::Unwritable));
         assert_eq!(
             rrb(vec![], vec![0; MAX_PACKET]).to_bytes(),
             Err(Error::Unwritable)
         );
         let sd = |chunks| Packet::from(Body::SourceDescription(chunks));
-        assert_eq!(sd(vec![SdesChunk { ssrc: 0, items: vec![] }; 32]).to_bytes(), Err(Error::Unwritable));
-        let item = |kind, n| vec![SdesChunk { ssrc: 0, items: vec![SdesItem { kind, text: vec![b'a'; n] }] }];
+        assert_eq!(
+            sd(vec![
+                SdesChunk {
+                    ssrc: 0,
+                    items: vec![]
+                };
+                32
+            ])
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let item = |kind, n| {
+            vec![SdesChunk {
+                ssrc: 0,
+                items: vec![SdesItem {
+                    kind,
+                    text: vec![b'a'; n],
+                }],
+            }]
+        };
         assert_eq!(sd(item(0, 1)).to_bytes(), Err(Error::Unwritable));
         assert_eq!(sd(item(1, 256)).to_bytes(), Err(Error::Unwritable));
         round_trip(&sd(item(1, 255)));
         let bye = |sources: Vec<u32>, reason| Packet::from(Body::Bye(Bye { sources, reason }));
         assert_eq!(bye(vec![0; 32], None).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(bye(vec![], Some(vec![0; 256])).to_bytes(), Err(Error::Unwritable));
-        let app = |subtype, n| Packet::from(Body::App(App { subtype, ssrc: 0, name: *b"abcd", data: vec![0; n] }));
+        assert_eq!(
+            bye(vec![], Some(vec![0; 256])).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let app = |subtype, n| {
+            Packet::from(Body::App(App {
+                subtype,
+                ssrc: 0,
+                name: *b"abcd",
+                data: vec![0; n],
+            }))
+        };
         assert_eq!(app(32, 0).to_bytes(), Err(Error::Unwritable));
         assert_eq!(app(0, 2).to_bytes(), Err(Error::Unwritable));
         let tf = |message| {
-            Packet::from(Body::TransportFeedback(TransportFeedback { sender_ssrc: 0, media_ssrc: 0, message }))
+            Packet::from(Body::TransportFeedback(TransportFeedback {
+                sender_ssrc: 0,
+                media_ssrc: 0,
+                message,
+            }))
         };
-        assert_eq!(tf(TransportMessage::Nack(vec![])).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(tf(TransportMessage::Tmmbr(vec![])).to_bytes(), Err(Error::Unwritable));
-        let t = Tmmb { ssrc: 0, exponent: 64, mantissa: 0, overhead: 0 };
-        assert_eq!(tf(TransportMessage::Tmmbn(vec![t])).to_bytes(), Err(Error::Unwritable));
-        let t = Tmmb { exponent: 0, mantissa: 1 << 17, ..t };
-        assert_eq!(tf(TransportMessage::Tmmbn(vec![t])).to_bytes(), Err(Error::Unwritable));
-        let t = Tmmb { mantissa: 0, overhead: 512, ..t };
-        assert_eq!(tf(TransportMessage::Tmmbn(vec![t])).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(tf(TransportMessage::Other { fmt: 2, fci: vec![0] }).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            tf(TransportMessage::Nack(vec![])).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            tf(TransportMessage::Tmmbr(vec![])).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let t = Tmmb {
+            ssrc: 0,
+            exponent: 64,
+            mantissa: 0,
+            overhead: 0,
+        };
+        assert_eq!(
+            tf(TransportMessage::Tmmbn(vec![t])).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let t = Tmmb {
+            exponent: 0,
+            mantissa: 1 << 17,
+            ..t
+        };
+        assert_eq!(
+            tf(TransportMessage::Tmmbn(vec![t])).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let t = Tmmb {
+            mantissa: 0,
+            overhead: 512,
+            ..t
+        };
+        assert_eq!(
+            tf(TransportMessage::Tmmbn(vec![t])).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            tf(TransportMessage::Other {
+                fmt: 2,
+                fci: vec![0]
+            })
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
         let nacks = vec![Nack { pid: 0, blp: 0 }; MAX_PACKET / 4];
-        assert_eq!(tf(TransportMessage::Nack(nacks)).to_bytes(), Err(Error::Unwritable));
-        let pf =
-            |message| Packet::from(Body::PayloadFeedback(PayloadFeedback { sender_ssrc: 0, media_ssrc: 0, message }));
-        assert_eq!(pf(PayloadMessage::Sli(vec![])).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(pf(PayloadMessage::Fir(vec![])).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            tf(TransportMessage::Nack(nacks)).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let pf = |message| {
+            Packet::from(Body::PayloadFeedback(PayloadFeedback {
+                sender_ssrc: 0,
+                media_ssrc: 0,
+                message,
+            }))
+        };
+        assert_eq!(
+            pf(PayloadMessage::Sli(vec![])).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            pf(PayloadMessage::Fir(vec![])).to_bytes(),
+            Err(Error::Unwritable)
+        );
         for s in [
-            Sli { first: 8192, number: 0, picture_id: 0 },
-            Sli { first: 0, number: 8192, picture_id: 0 },
-            Sli { first: 0, number: 0, picture_id: 64 },
+            Sli {
+                first: 8192,
+                number: 0,
+                picture_id: 0,
+            },
+            Sli {
+                first: 0,
+                number: 8192,
+                picture_id: 0,
+            },
+            Sli {
+                first: 0,
+                number: 0,
+                picture_id: 64,
+            },
         ] {
             assert_eq!(
                 pf(PayloadMessage::Sli(vec![s])).to_bytes(),
                 Err(Error::Unwritable)
             );
         }
-        let rp =
-            |payload_type, padding_bits, n| PayloadMessage::Rpsi(Rpsi { payload_type, padding_bits, data: vec![0; n] });
+        let rp = |payload_type, padding_bits, n| {
+            PayloadMessage::Rpsi(Rpsi {
+                payload_type,
+                padding_bits,
+                data: vec![0; n],
+            })
+        };
         assert_eq!(pf(rp(128, 0, 2)).to_bytes(), Err(Error::Unwritable));
         assert_eq!(pf(rp(0, 17, 2)).to_bytes(), Err(Error::Unwritable));
         assert_eq!(pf(rp(0, 0, 3)).to_bytes(), Err(Error::Unwritable));
-        let remb = |exponent, mantissa, n| PayloadMessage::Remb(Remb { exponent, mantissa, ssrcs: vec![0; n] });
+        let remb = |exponent, mantissa, n| {
+            PayloadMessage::Remb(Remb {
+                exponent,
+                mantissa,
+                ssrcs: vec![0; n],
+            })
+        };
         assert_eq!(pf(remb(64, 0, 1)).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(
-            pf(remb(0, 1 << 18, 1)).to_bytes(),
-            Err(Error::Unwritable)
-        );
+        assert_eq!(pf(remb(0, 1 << 18, 1)).to_bytes(), Err(Error::Unwritable));
         assert_eq!(pf(remb(0, 0, 256)).to_bytes(), Err(Error::Unwritable));
         assert_eq!(
             pf(PayloadMessage::Afb(vec![0; 5])).to_bytes(),
@@ -2407,13 +2837,23 @@ mod tests {
         let x = |data| {
             Packet::from(Body::ExtendedReport(ExtendedReport {
                 ssrc: 0,
-                blocks: vec![XrBlock { block_type: 1, type_specific: 0, data }],
+                blocks: vec![XrBlock {
+                    block_type: 1,
+                    type_specific: 0,
+                    data,
+                }],
             }))
         };
         assert_eq!(x(vec![0; 2]).to_bytes(), Err(Error::Unwritable));
         assert_eq!(x(vec![0; 4 * 65536]).to_bytes(), Err(Error::Unwritable));
         assert_eq!(x(vec![0; MAX_PACKET]).to_bytes(), Err(Error::Unwritable));
-        let o = |count| Packet::from(Body::Other { packet_type: 0, count, data: vec![] });
+        let o = |count| {
+            Packet::from(Body::Other {
+                packet_type: 0,
+                count,
+                data: vec![],
+            })
+        };
         assert_eq!(o(32).to_bytes(), Err(Error::Unwritable));
         // A datagram past the limit.
         let big = rrb(vec![], vec![0; 32000]);
@@ -2489,7 +2929,13 @@ mod tests {
                 ssrc: 1,
                 blocks: vec![XrBlock::receiver_reference_time(9)],
             })),
-            Packet { padding: 4, ..Packet::from(Body::Bye(Bye { sources: vec![1], reason: Some(b"bye".to_vec()) })) },
+            Packet {
+                padding: 4,
+                ..Packet::from(Body::Bye(Bye {
+                    sources: vec![1],
+                    reason: Some(b"bye".to_vec()),
+                }))
+            },
         ];
         let bytes = Compound(packets.clone()).to_bytes().unwrap();
         assert_eq!(Compound::parse(&bytes).map(|p| p.0), Ok(packets.clone()));
@@ -2514,7 +2960,11 @@ mod tests {
     }
 
     fn psfb(media_ssrc: u32, message: PayloadMessage) -> Packet {
-        Packet::from(Body::PayloadFeedback(PayloadFeedback { sender_ssrc: 1, media_ssrc, message }))
+        Packet::from(Body::PayloadFeedback(PayloadFeedback {
+            sender_ssrc: 1,
+            media_ssrc,
+            message,
+        }))
     }
 
     // Writers check the size of caller data before they copy it.
@@ -2522,16 +2972,27 @@ mod tests {
     fn writers_check_size_before_copying() {
         let big = vec![0u8; MAX_PACKET];
         let bodies = [
-            Body::App(App { subtype: 0, ssrc: 0, name: *b"TEST", data: big.clone() }),
+            Body::App(App {
+                subtype: 0,
+                ssrc: 0,
+                name: *b"TEST",
+                data: big.clone(),
+            }),
             Body::TransportFeedback(TransportFeedback {
                 sender_ssrc: 0,
                 media_ssrc: 0,
-                message: TransportMessage::Other { fmt: 9, fci: big.clone() },
+                message: TransportMessage::Other {
+                    fmt: 9,
+                    fci: big.clone(),
+                },
             }),
             Body::PayloadFeedback(PayloadFeedback {
                 sender_ssrc: 0,
                 media_ssrc: 0,
-                message: PayloadMessage::Other { fmt: 9, fci: big.clone() },
+                message: PayloadMessage::Other {
+                    fmt: 9,
+                    fci: big.clone(),
+                },
             }),
             Body::PayloadFeedback(PayloadFeedback {
                 sender_ssrc: 0,
@@ -2547,15 +3008,14 @@ mod tests {
                     data: vec![0; MAX_PACKET + 2],
                 }),
             }),
-            Body::Other { packet_type: 210, count: 0, data: big },
+            Body::Other {
+                packet_type: 210,
+                count: 0,
+                data: big,
+            },
         ];
         for b in bodies {
-            assert_eq!(
-                b.encode(),
-                Err(Error::Unwritable),
-                "{}",
-                b.packet_type()
-            );
+            assert_eq!(b.encode(), Err(Error::Unwritable), "{}", b.packet_type());
         }
     }
 
@@ -2563,12 +3023,32 @@ mod tests {
     // draft-alvestrand-rmcat-remb section 2.2: the media SSRC is 0.
     #[test]
     fn media_ssrc_zero_where_unused() {
-        let tmmb = Tmmb { ssrc: 9, exponent: 1, mantissa: 2, overhead: 3 };
-        let tf = |media_ssrc, message| {
-            Packet::from(Body::TransportFeedback(TransportFeedback { sender_ssrc: 1, media_ssrc, message }))
+        let tmmb = Tmmb {
+            ssrc: 9,
+            exponent: 1,
+            mantissa: 2,
+            overhead: 3,
         };
-        let remb = || PayloadMessage::Remb(Remb { exponent: 1, mantissa: 2, ssrcs: vec![9] });
-        let fir = || PayloadMessage::Fir(vec![Fir { ssrc: 9, sequence: 1 }]);
+        let tf = |media_ssrc, message| {
+            Packet::from(Body::TransportFeedback(TransportFeedback {
+                sender_ssrc: 1,
+                media_ssrc,
+                message,
+            }))
+        };
+        let remb = || {
+            PayloadMessage::Remb(Remb {
+                exponent: 1,
+                mantissa: 2,
+                ssrcs: vec![9],
+            })
+        };
+        let fir = || {
+            PayloadMessage::Fir(vec![Fir {
+                ssrc: 9,
+                sequence: 1,
+            }])
+        };
         for p in [
             tf(2, TransportMessage::Tmmbr(vec![tmmb])),
             tf(2, TransportMessage::Tmmbn(vec![tmmb])),
@@ -2578,7 +3058,11 @@ mod tests {
             assert_eq!(p.to_bytes(), Err(Error::Unwritable), "{p:?}");
         }
         // Read, a nonzero media SSRC is ignored.
-        for p in [tf(0, TransportMessage::Tmmbr(vec![tmmb])), psfb(0, remb()), psfb(0, fir())] {
+        for p in [
+            tf(0, TransportMessage::Tmmbr(vec![tmmb])),
+            psfb(0, remb()),
+            psfb(0, fir()),
+        ] {
             let mut b = round_trip(&p);
             b[11] = 2;
             assert_eq!(Packet::parse(&b), Ok(p));
@@ -2594,7 +3078,11 @@ mod tests {
         let xr = |block_type, type_specific, n| {
             Packet::from(Body::ExtendedReport(ExtendedReport {
                 ssrc: 1,
-                blocks: vec![XrBlock { block_type, type_specific, data: vec![0; n] }],
+                blocks: vec![XrBlock {
+                    block_type,
+                    type_specific,
+                    data: vec![0; n],
+                }],
             }))
         };
         for (t, good, bad) in [
@@ -2613,7 +3101,11 @@ mod tests {
                 let p = xr(t, 0, n);
                 assert_eq!(p.to_bytes(), Err(Error::Unwritable), "{t} {n}");
                 let words = (2 + n / 4) as u8;
-                let b = [&[0x80, 207, 0, words, 0, 0, 0, 1, t, 0, 0, (n / 4) as u8][..], &vec![0; n]].concat();
+                let b = [
+                    &[0x80, 207, 0, words, 0, 0, 0, 1, t, 0, 0, (n / 4) as u8][..],
+                    &vec![0; n],
+                ]
+                .concat();
                 assert_eq!(Packet::parse(&b), Err(Error::Malformed(207)), "{t} {n}");
             }
         }
@@ -2637,27 +3129,25 @@ mod tests {
     // 32-bit boundary.
     #[test]
     fn rpsi_padding() {
-        let rp =
-            |padding_bits, data: Vec<u8>| psfb(2, PayloadMessage::Rpsi(Rpsi { payload_type: 96, padding_bits, data }));
+        let rp = |padding_bits, data: Vec<u8>| {
+            psfb(
+                2,
+                PayloadMessage::Rpsi(Rpsi {
+                    payload_type: 96,
+                    padding_bits,
+                    data,
+                }),
+            )
+        };
         round_trip(&rp(4, vec![0xf0, 0]));
         round_trip(&rp(31, vec![0x80, 0, 0, 0, 0, 0]));
-        assert_eq!(
-            rp(4, vec![0, 0xff]).to_bytes(),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            rp(9, vec![0xff, 0x01]).to_bytes(),
-            Err(Error::Unwritable)
-        );
+        assert_eq!(rp(4, vec![0, 0xff]).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(rp(9, vec![0xff, 0x01]).to_bytes(), Err(Error::Unwritable));
         assert_eq!(rp(32, vec![0; 6]).to_bytes(), Err(Error::Unwritable));
         let head = [0x83, 206, 0, 3, 0, 0, 0, 1, 0, 0, 0, 2];
         for bad in [[4, 96, 0, 0x0f], [32, 96, 0, 0]] {
             let b = [&head[..], &bad].concat();
-            assert_eq!(
-                Packet::parse(&b),
-                Err(Error::Malformed(206)),
-                "{bad:?}"
-            );
+            assert_eq!(Packet::parse(&b), Err(Error::Malformed(206)), "{bad:?}");
         }
     }
 
@@ -2665,25 +3155,44 @@ mod tests {
     // 0, and there is at least one SSRC.
     #[test]
     fn remb_rules() {
-        let remb = |ssrcs| PayloadMessage::Remb(Remb { exponent: 1, mantissa: 2, ssrcs });
-        assert_eq!(Packet { padding: 4, ..psfb(0, remb(vec![9])) }.to_bytes(), Err(Error::Unwritable));
-        let b = [0xaf, 206, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0, b'R', b'E', b'M', b'B', 1, 0, 0, 0, 0, 0, 0, 4];
+        let remb = |ssrcs| {
+            PayloadMessage::Remb(Remb {
+                exponent: 1,
+                mantissa: 2,
+                ssrcs,
+            })
+        };
+        assert_eq!(
+            Packet {
+                padding: 4,
+                ..psfb(0, remb(vec![9]))
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let b = [
+            0xaf, 206, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0, b'R', b'E', b'M', b'B', 1, 0, 0, 0, 0, 0, 0, 4,
+        ];
         assert_eq!(Packet::parse(&b), Err(Error::Malformed(206)));
         assert_eq!(psfb(0, remb(vec![])).to_bytes(), Err(Error::Unwritable));
         // `REMB` with a count that does not match, or no SSRCs, is a bad
         // REMB, not other application layer feedback.
         let head = [0x8f, 206, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0];
-        for fci in [[b'R', b'E', b'M', b'B', 1, 0, 0, 0], [b'R', b'E', b'M', b'B', 0, 0, 0, 0]] {
+        for fci in [
+            [b'R', b'E', b'M', b'B', 1, 0, 0, 0],
+            [b'R', b'E', b'M', b'B', 0, 0, 0, 0],
+        ] {
             let b = [&head[..], &fci].concat();
-            assert_eq!(
-                Packet::parse(&b),
-                Err(Error::Malformed(206)),
-                "{fci:?}"
-            );
+            assert_eq!(Packet::parse(&b), Err(Error::Malformed(206)), "{fci:?}");
         }
-        let b = [0x8f, 206, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, b'R', b'E', b'M', b'B'];
+        let b = [
+            0x8f, 206, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, b'R', b'E', b'M', b'B',
+        ];
         assert_eq!(Packet::parse(&b), Err(Error::Malformed(206)));
-        assert_eq!(psfb(0, PayloadMessage::Afb(b"REMB".to_vec())).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            psfb(0, PayloadMessage::Afb(b"REMB".to_vec())).to_bytes(),
+            Err(Error::Unwritable)
+        );
         assert_eq!(
             psfb(0, PayloadMessage::Afb(b"REMB\x02\0\0\0\0\0\0\x01".to_vec())).to_bytes(),
             Err(Error::Unwritable)
@@ -2698,7 +3207,10 @@ mod tests {
         let sd = |text: &[u8]| {
             Packet::from(Body::SourceDescription(vec![SdesChunk {
                 ssrc: 1,
-                items: vec![SdesItem { kind: sdes::PRIV, text: text.to_vec() }],
+                items: vec![SdesItem {
+                    kind: sdes::PRIV,
+                    text: text.to_vec(),
+                }],
             }]))
         };
         round_trip(&sd(b"\x01ab"));
@@ -2707,11 +3219,7 @@ mod tests {
         assert_eq!(sd(b"").to_bytes(), Err(Error::Unwritable));
         for item in [[8, 2, 3, b'a'], [8, 0, 0, 0]] {
             let b = [&[0x81, 202, 0, 3, 0, 0, 0, 1][..], &item, &[0, 0, 0, 0]].concat();
-            assert_eq!(
-                Packet::parse(&b),
-                Err(Error::Malformed(202)),
-                "{item:?}"
-            );
+            assert_eq!(Packet::parse(&b), Err(Error::Malformed(202)), "{item:?}");
         }
     }
 
@@ -2719,13 +3227,40 @@ mod tests {
     // for every packet type.
     #[test]
     fn padding_is_whole_words() {
-        assert_eq!(Packet::parse(&[0xa4, 210, 0, 1, 1, 2, 3, 1]), Err(Error::Padding));
-        assert_eq!(Packet::parse(&[0xa4, 210, 0, 1, 1, 2, 3, 3]), Err(Error::Padding));
-        let p = Packet { body: Body::Other { packet_type: 210, count: 4, data: vec![1, 2, 3] }, padding: 1 };
+        assert_eq!(
+            Packet::parse(&[0xa4, 210, 0, 1, 1, 2, 3, 1]),
+            Err(Error::Padding)
+        );
+        assert_eq!(
+            Packet::parse(&[0xa4, 210, 0, 1, 1, 2, 3, 3]),
+            Err(Error::Padding)
+        );
+        let p = Packet {
+            body: Body::Other {
+                packet_type: 210,
+                count: 4,
+                data: vec![1, 2, 3],
+            },
+            padding: 1,
+        };
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-        let p = Packet { body: Body::Other { packet_type: 210, count: 4, data: vec![1, 2, 3] }, padding: 0 };
+        let p = Packet {
+            body: Body::Other {
+                packet_type: 210,
+                count: 4,
+                data: vec![1, 2, 3],
+            },
+            padding: 0,
+        };
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-        round_trip(&Packet { body: Body::Other { packet_type: 210, count: 4, data: vec![1, 2, 3, 4] }, padding: 4 });
+        round_trip(&Packet {
+            body: Body::Other {
+                packet_type: 210,
+                count: 4,
+                data: vec![1, 2, 3, 4],
+            },
+            padding: 4,
+        });
     }
 
     /// Reads `data` every way there is, and checks what reads writes back
@@ -2805,7 +3340,12 @@ mod tests {
                 let entries = n(r, 4);
                 let message = match r.index(4) {
                     0 => TransportMessage::Nack(
-                        (0..entries).map(|_| Nack { pid: r.next() as u16, blp: r.next() as u16 }).collect(),
+                        (0..entries)
+                            .map(|_| Nack {
+                                pid: r.next() as u16,
+                                blp: r.next() as u16,
+                            })
+                            .collect(),
                     ),
                     k => {
                         let items = (0..entries)
@@ -2917,15 +3457,19 @@ mod tests {
     #[test]
     fn lcg_fuzz_parsers() {
         let mut r = Lcg::new(0x5254_4350);
-        let seed = Compound([
-            rr(1),
-            cname(1, b"a"),
-            Packet::from(Body::TransportFeedback(TransportFeedback {
-                sender_ssrc: 1,
-                media_ssrc: 2,
-                message: TransportMessage::Nack(vec![Nack { pid: 3, blp: 4 }]),
-            })),
-        ].to_vec()).to_bytes()
+        let seed = Compound(
+            [
+                rr(1),
+                cname(1, b"a"),
+                Packet::from(Body::TransportFeedback(TransportFeedback {
+                    sender_ssrc: 1,
+                    media_ssrc: 2,
+                    message: TransportMessage::Nack(vec![Nack { pid: 3, blp: 4 }]),
+                })),
+            ]
+            .to_vec(),
+        )
+        .to_bytes()
         .unwrap();
         for i in 0..rounds(20_000) {
             let data = if i % 2 == 0 {
@@ -2952,7 +3496,11 @@ mod tests {
             check(&data);
             let mut bytes = Frame(data.clone()).to_bytes().unwrap();
             bytes.extend_from_slice(&data);
-            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * (2 + MAX_FRAME));
+            contract::check_decode_with_alloc_limit(
+                Frames::<Frame>::new,
+                &bytes,
+                2 * (2 + MAX_FRAME),
+            );
             assert_eq!(
                 decode_all(Frames::<Frame>::new, &bytes).0.first(),
                 Some(&Frame(data))

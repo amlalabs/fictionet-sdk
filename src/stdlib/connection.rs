@@ -35,7 +35,10 @@ pub trait Accepted: Connection {
 pub trait Datagram: Send + 'static {
     /// Waits for bytes and their sender. Drains queued datagrams before
     /// returning [`fictionet::RecvError::Closed`]. Cancellation ends the wait.
-    fn recv(&mut self, fcx: &Cx) -> impl Future<Output = Result<(Vec<u8>, std::net::SocketAddr), fictionet::RecvError>> + Send;
+    fn recv(
+        &mut self,
+        fcx: &Cx,
+    ) -> impl Future<Output = Result<(Vec<u8>, std::net::SocketAddr), fictionet::RecvError>> + Send;
     /// Sends a datagram without waiting. Undeliverable datagrams are lost.
     fn send_to(&mut self, data: &[u8], to: std::net::SocketAddr);
 }
@@ -96,7 +99,12 @@ pub trait Connection: Send + 'static {
     /// Bytes that were taken are on their way. There is no separate flush,
     /// so a middleware such as TLS must hand its output on before it reports
     /// bytes as taken.
-    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>>;
+    fn poll_write(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<Result<usize, ConnError>>;
 
     /// Polls to say this side will send nothing more. For TCP this sends a
     /// FIN. For TLS it first sends `close_notify`. Reading still works.
@@ -123,7 +131,12 @@ impl Connection for Box<dyn Connection> {
         (**self).poll_read(fcx, cx, buf)
     }
 
-    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_write(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<Result<usize, ConnError>> {
         (**self).poll_write(fcx, cx, data)
     }
 
@@ -183,7 +196,10 @@ pub trait ConnectionExt: Connection {
     }
 
     /// Says this side will send nothing more. Reading still works.
-    fn shutdown<'a>(&'a mut self, fcx: &'a Cx) -> impl Future<Output = Result<(), ConnError>> + Send + 'a {
+    fn shutdown<'a>(
+        &'a mut self,
+        fcx: &'a Cx,
+    ) -> impl Future<Output = Result<(), ConnError>> + Send + 'a {
         std::future::poll_fn(move |cx| self.poll_shutdown(fcx, cx))
     }
 }

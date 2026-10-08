@@ -474,7 +474,11 @@ fn parse_xml(input: &str) -> Result<Vec<XmlNode>, Error> {
                         }
                         let id = nodes.len();
                         if let Some(parent) = stack.last() {
-                            nodes.get_mut(*parent).ok_or(Error::Xml(at))?.children.push(id);
+                            nodes
+                                .get_mut(*parent)
+                                .ok_or(Error::Xml(at))?
+                                .children
+                                .push(id);
                         }
                         nodes.push(XmlNode {
                             tag: start.name.local,
@@ -489,7 +493,11 @@ fn parse_xml(input: &str) -> Result<Vec<XmlNode>, Error> {
                     }
                     xml::Event::Text(text) => {
                         let id = stack.last().ok_or(Error::Xml(at))?;
-                        nodes.get_mut(*id).ok_or(Error::Xml(at))?.text.push_str(&text);
+                        nodes
+                            .get_mut(*id)
+                            .ok_or(Error::Xml(at))?
+                            .text
+                            .push_str(&text);
                     }
                     xml::Event::Declaration { version, .. } => {
                         if version != "1.0" {
@@ -1753,8 +1761,11 @@ struct Budget {
 }
 impl Default for Budget {
     fn default() -> Self {
-        Self { nodes: Work::new("MAX_VALUES", MAX_VALUES), bytes: 0,
-            work: Work::new("MAX_VALUES", MAX_VALUES) }
+        Self {
+            nodes: Work::new("MAX_VALUES", MAX_VALUES),
+            bytes: 0,
+            work: Work::new("MAX_VALUES", MAX_VALUES),
+        }
     }
 }
 impl Budget {
@@ -2291,7 +2302,13 @@ impl Schema {
         Ok(())
     }
 
-    fn read_message(&self, input: &[u8], header: Header, block: usize, budget: &mut Budget) -> Result<Message, Error> {
+    fn read_message(
+        &self,
+        input: &[u8],
+        header: Header,
+        block: usize,
+        budget: &mut Budget,
+    ) -> Result<Message, Error> {
         let mut reader = Reader {
             schema: self,
             input,
@@ -2590,7 +2607,9 @@ impl Decode for Messages<'_> {
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, Error> {
         let before = self.work.used();
         let scanned = self.scan(input);
-        self.examined = self.examined.saturating_add((self.work.used() - before) as u64);
+        self.examined = self
+            .examined
+            .saturating_add((self.work.used() - before) as u64);
         let Some(used) = scanned? else {
             // Every position the scan needs is checked against the limit,
             // so this is only a guard for rule 5 (progress at capacity).
@@ -2602,8 +2621,14 @@ impl Decode for Messages<'_> {
         let bytes = input.get(..used).ok_or(Error::Truncated)?;
         let mut budget = Budget::default();
         let message = self.schema.read_message(
-            bytes, self.header.ok_or(Error::Header)?, self.root, &mut budget);
-        self.examined = self.examined.saturating_add(budget.work.used() as u64)
+            bytes,
+            self.header.ok_or(Error::Header)?,
+            self.root,
+            &mut budget,
+        );
+        self.examined = self
+            .examined
+            .saturating_add(budget.work.used() as u64)
             .saturating_add(budget.nodes.used() as u64);
         let message = message?;
         let examined = self.examined;
@@ -2699,8 +2724,8 @@ mod tests {
     use super::harness::{CAR, CAR_BYTES, Car};
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support;
+    use fictionet::stdlib::test_support::contract;
     use std::sync::OnceLock;
 
     fn named(name: &str, value: Value) -> NamedValue {
@@ -2917,11 +2942,20 @@ mod tests {
             let bytes = empty_groups(10_000, block_length);
             let mut frames = Messages::new(&s);
             assert_eq!(frames.scan(&bytes), Ok(Some(bytes.len())));
-            assert!(frames.work.used() <= 2 * bytes.len(), "{}", frames.work.used());
+            assert!(
+                frames.work.used() <= 2 * bytes.len(),
+                "{}",
+                frames.work.used()
+            );
             // Group counts reserve work before their entries arrive.
             for count in [0, 1, 100, 10_000, 20_000] {
-                test_support::check_work(|| Messages::new(&s), &empty_groups(count, block_length),
-                    Messages::examined, MAX_VALUES as u64, 8);
+                test_support::check_work(
+                    || Messages::new(&s),
+                    &empty_groups(count, block_length),
+                    Messages::examined,
+                    MAX_VALUES as u64,
+                    8,
+                );
             }
             let m = s.decode(&bytes).unwrap();
             let mut out = vec![0xaa];
@@ -3162,7 +3196,10 @@ mod tests {
         contract::check_decode(|| Messages::with_limit(&s, small.len()), &small);
         // Truncated below the limit: Need at EOF, so the driver reports it.
         let cut = &small[..small.len() - 1];
-        assert_eq!(Messages::with_limit(&s, 64).decode(cut, true), Ok(Step::Need));
+        assert_eq!(
+            Messages::with_limit(&s, 64).decode(cut, true),
+            Ok(Step::Need)
+        );
         // A length past the limit is refused as soon as it is read.
         let long = packet(0, &[100, 0, 0, 0]);
         assert_eq!(
@@ -3771,7 +3808,11 @@ mod tests {
             s.decode(&bytes),
             Err(Error::Limit("MAX_ARRAY_LENGTH"))
         ));
-        contract::check_decode_with_alloc_limit(|| Messages::new(&s), &bytes, 2 * MAX_MESSAGE_BYTES);
+        contract::check_decode_with_alloc_limit(
+            || Messages::new(&s),
+            &bytes,
+            2 * MAX_MESSAGE_BYTES,
+        );
         let bytes = packet(0, &[0, 0, 0, 0, 1, 0]);
         assert!(matches!(s.decode(&bytes), Err(Error::Limit("MAX_VALUES"))));
     }
@@ -3780,8 +3821,13 @@ mod tests {
     fn one_byte_stream_and_map() {
         let schema = Car::schema().unwrap();
         for count in [1, 2, 8] {
-            test_support::check_work(|| Messages::new(schema), &CAR_BYTES.repeat(count),
-                Messages::examined, MAX_VALUES as u64, 16);
+            test_support::check_work(
+                || Messages::new(schema),
+                &CAR_BYTES.repeat(count),
+                Messages::examined,
+                MAX_VALUES as u64,
+                16,
+            );
         }
         let mut stream = Stream::new(Messages::new(schema).map(|m| m.header.template_id));
         for chunk in test_support::chunks(CAR_BYTES, &[1]) {
@@ -3809,7 +3855,11 @@ mod tests {
         let mut out = Vec::new();
         s.write(&message, &mut out).unwrap();
         assert_eq!(out, bytes);
-        contract::check_decode_with_alloc_limit(|| Messages::new(&s), &bytes, 2 * MAX_MESSAGE_BYTES);
+        contract::check_decode_with_alloc_limit(
+            || Messages::new(&s),
+            &bytes,
+            2 * MAX_MESSAGE_BYTES,
+        );
     }
 
     #[test]

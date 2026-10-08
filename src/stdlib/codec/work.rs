@@ -22,7 +22,11 @@ impl Work {
     /// Starts an unused allowance.
     #[inline]
     pub fn new(name: &'static str, limit: usize) -> Self {
-        Self { name, limit, used: 0 }
+        Self {
+            name,
+            limit,
+            used: 0,
+        }
     }
     /// Charges units, refusing overflow or exhaustion.
     #[inline]
@@ -36,7 +40,9 @@ impl Work {
     /// Charges `count * each + fixed`, refusing arithmetic overflow.
     #[inline]
     pub fn charge_product(&mut self, count: usize, each: usize, fixed: usize) -> Result<(), Error> {
-        let units = count.checked_mul(each).and_then(|n| n.checked_add(fixed))
+        let units = count
+            .checked_mul(each)
+            .and_then(|n| n.checked_add(fixed))
             .ok_or_else(|| self.refusal(usize::MAX))?;
         self.charge(units)
     }
@@ -51,7 +57,12 @@ impl Work {
         self.limit - self.used
     }
     fn refusal(&self, charge: usize) -> Error {
-        Error::Work { name: self.name, limit: self.limit, used: self.used, charge }
+        Error::Work {
+            name: self.name,
+            limit: self.limit,
+            used: self.used,
+            charge,
+        }
     }
 }
 
@@ -64,15 +75,27 @@ mod tests {
         let mut work = Work::new("test", 7);
         work.charge_product(2, 3, 1).unwrap();
         work.charge(0).unwrap();
-        assert_eq!(work.charge(1), Err(Error::Work {
-            name: "test", limit: 7, used: 7, charge: 1,
-        }));
+        assert_eq!(
+            work.charge(1),
+            Err(Error::Work {
+                name: "test",
+                limit: 7,
+                used: 7,
+                charge: 1,
+            })
+        );
         assert_eq!((work.used(), work.remaining()), (7, 0));
         let mut work = Work::new("overflow", usize::MAX);
         for (count, each, fixed) in [(usize::MAX, 2, 0), (usize::MAX, 1, 1)] {
-            assert_eq!(work.charge_product(count, each, fixed), Err(Error::Work {
-                name: "overflow", limit: usize::MAX, used: 0, charge: usize::MAX,
-            }));
+            assert_eq!(
+                work.charge_product(count, each, fixed),
+                Err(Error::Work {
+                    name: "overflow",
+                    limit: usize::MAX,
+                    used: 0,
+                    charge: usize::MAX,
+                })
+            );
             assert_eq!(work.used(), 0);
         }
         work.charge(usize::MAX).unwrap();

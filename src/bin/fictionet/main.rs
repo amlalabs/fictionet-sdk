@@ -119,7 +119,8 @@ fn exit_on_signals(ready_file: Option<&std::path::Path>) {
             // lstat.
             unsafe {
                 let mut st: libc::stat = std::mem::zeroed();
-                if libc::lstat(path.as_ptr(), &mut st) == 0 && st.st_dev == dev && st.st_ino == ino {
+                if libc::lstat(path.as_ptr(), &mut st) == 0 && st.st_dev == dev && st.st_ino == ino
+                {
                     libc::unlink(path.as_ptr());
                 }
             }
@@ -129,7 +130,11 @@ fn exit_on_signals(ready_file: Option<&std::path::Path>) {
             // message was built before it was set. The kernel handles a
             // route netlink request inside sendto, so no answer is awaited.
             unsafe {
-                let fd = libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE);
+                let fd = libc::socket(
+                    libc::AF_NETLINK,
+                    libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                    libc::NETLINK_ROUTE,
+                );
                 if fd >= 0 {
                     let mut kernel: libc::sockaddr_nl = std::mem::zeroed();
                     kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
@@ -188,7 +193,9 @@ fn main() {
             };
             if let Err(failure) = result {
                 match &failure {
-                    world::Failure::Refused(reason) => eprintln!("fictionet attach: the world refused: {reason}"),
+                    world::Failure::Refused(reason) => {
+                        eprintln!("fictionet attach: the world refused: {reason}")
+                    }
                     world::Failure::Error(msg) => eprintln!("fictionet attach: {msg}"),
                 }
                 std::process::exit(failure.status());

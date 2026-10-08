@@ -4,12 +4,12 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire};
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::openvpn::Frame;
 use fictionet::stdlib::openvpn::{
-    Ack, Authenticated, Encrypted, Control, ControlBody, ControlKind, Error, MAX_HMAC_LEN,
+    Ack, Authenticated, Control, ControlBody, ControlKind, Encrypted, Error, MAX_HMAC_LEN,
     MAX_PACKET, MAX_TCP_FRAME, Packet, TlsAuth, TlsCrypt, Wrapping, split_first_byte,
 };
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 const WRAPPINGS: [Wrapping; 6] = [
@@ -17,7 +17,9 @@ const WRAPPINGS: [Wrapping; 6] = [
     Wrapping::TlsAuth { hmac_len: 0 },
     Wrapping::TlsAuth { hmac_len: 20 },
     Wrapping::TlsAuth { hmac_len: 32 },
-    Wrapping::TlsAuth { hmac_len: MAX_HMAC_LEN },
+    Wrapping::TlsAuth {
+        hmac_len: MAX_HMAC_LEN,
+    },
     Wrapping::TlsCrypt,
 ];
 
@@ -26,7 +28,9 @@ struct Fields<'a>(&'a [u8]);
 
 impl Fields<'_> {
     fn u8(&mut self) -> u8 {
-        let Some((&b, rest)) = self.0.split_first() else { return 0 };
+        let Some((&b, rest)) = self.0.split_first() else {
+            return 0;
+        };
         self.0 = rest;
         b
     }
@@ -56,25 +60,49 @@ fn build(data: &[u8]) -> Packet {
     let key_id = f.u8() % 10;
     let session_id = [f.u8(); 8];
     match what % 4 {
-        0 => Packet::DataV1 { key_id, payload: f.sized(1) },
+        0 => Packet::DataV1 {
+            key_id,
+            payload: f.sized(1),
+        },
         1 => {
             let peer_id = f.u32() >> (f.u8() % 9);
-            Packet::DataV2 { key_id, peer_id, payload: f.sized(1) }
+            Packet::DataV2 {
+                key_id,
+                peer_id,
+                payload: f.sized(1),
+            }
         }
         2 => {
             let kind = ControlKind::ALL[usize::from(f.u8()) % ControlKind::ALL.len()];
             let tls_auth = f.u8().is_multiple_of(2).then(|| {
                 let hmac_len = usize::from(f.u8() % 70);
-                TlsAuth { hmac: f.bytes(hmac_len), packet_id: f.u32(), net_time: f.u32() }
+                TlsAuth {
+                    hmac: f.bytes(hmac_len),
+                    packet_id: f.u32(),
+                    net_time: f.u32(),
+                }
             });
             let ack = f.u8().is_multiple_of(2).then(|| {
                 let count = f.u8() % 11;
-                Ack { ids: (0..count).map(|_| f.u32()).collect(), remote_session_id: [f.u8(); 8] }
+                Ack {
+                    ids: (0..count).map(|_| f.u32()).collect(),
+                    remote_session_id: [f.u8(); 8],
+                }
             });
             let message_id = if f.u8().is_multiple_of(2) { 0 } else { f.u32() };
             let payload = f.sized(1);
-            let c = Control { session_id, tls_auth, ack, message_id, payload };
-            Packet::Control { kind, key_id, body: ControlBody::Plain(c) }
+            let c = Control {
+                session_id,
+                tls_auth,
+                ack,
+                message_id,
+                payload,
+            };
+            Packet::Control {
+                kind,
+                key_id,
+                body: ControlBody::Plain(c),
+            }
         }
         _ => {
             let kind = ControlKind::ALL[usize::from(f.u8()) % ControlKind::ALL.len()];
@@ -82,8 +110,18 @@ fn build(data: &[u8]) -> Packet {
             let mut tag = [0; 32];
             tag.fill(f.u8());
             let ciphertext = f.sized(5);
-            let c = TlsCrypt { session_id, packet_id, net_time, tag, ciphertext };
-            Packet::Control { kind, key_id, body: ControlBody::TlsCrypt(c) }
+            let c = TlsCrypt {
+                session_id,
+                packet_id,
+                net_time,
+                tag,
+                ciphertext,
+            };
+            Packet::Control {
+                kind,
+                key_id,
+                body: ControlBody::TlsCrypt(c),
+            }
         }
     }
 }
@@ -124,7 +162,9 @@ fuzz_target!(|data: &[u8]| {
             2 * MAX_TCP_FRAME,
         );
     }
-    let too_long = Wrapping::TlsAuth { hmac_len: MAX_HMAC_LEN + 1 };
+    let too_long = Wrapping::TlsAuth {
+        hmac_len: MAX_HMAC_LEN + 1,
+    };
     if let Ok(packet) = Packet::parse_with(data, too_long) {
         assert_eq!(packet.wrapping(), Wrapping::None);
         assert_eq!(packet.to_bytes().unwrap(), data);
@@ -157,10 +197,9 @@ fuzz_target!(|data: &[u8]| {
             };
         }
         authenticated!(
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-            32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
-            48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
+            46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
         );
     }
     contract::check_wire_value(&Encrypted(packet));

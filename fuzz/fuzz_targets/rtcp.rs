@@ -2,17 +2,18 @@
 //! reads them, and packets a world builds, as it writes them.
 #![no_main]
 
-use fictionet::stdlib::codec::Frames;
 use arbitrary::{Result, Unstructured};
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire};
-use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::rtcp::Frame;
 use fictionet::stdlib::rtcp::{
-    App, Body, Bye, Datagram, Compound, DlrrItem, ExtendedReport, Fir, MAX_DATAGRAM, MAX_PACKET, Nack, Packet,
-    PayloadFeedback, PayloadMessage, ReceiverReport, Remb, ReportBlock, Rpsi, SdesChunk, SdesItem, SenderReport, Sli,
-    Tmmb, TransportFeedback, TransportMessage, XrBlock, check_compound, classify,
+    App, Body, Bye, Compound, Datagram, DlrrItem, ExtendedReport, Fir, MAX_DATAGRAM, MAX_PACKET,
+    Nack, Packet, PayloadFeedback, PayloadMessage, ReceiverReport, Remb, ReportBlock, Rpsi,
+    SdesChunk, SdesItem, SenderReport, Sli, Tmmb, TransportFeedback, TransportMessage, XrBlock,
+    check_compound, classify,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 fn datagram(data: &[u8]) {
     let _ = classify(data);
@@ -52,7 +53,11 @@ fn media_ssrc(u: &mut Unstructured) -> Result<u32> {
 }
 
 /// Up to `max` values built by `f`.
-fn list<T>(u: &mut Unstructured, max: usize, mut f: impl FnMut(&mut Unstructured) -> Result<T>) -> Result<Vec<T>> {
+fn list<T>(
+    u: &mut Unstructured,
+    max: usize,
+    mut f: impl FnMut(&mut Unstructured) -> Result<T>,
+) -> Result<Vec<T>> {
     let n = u.int_in_range(0..=max)?;
     (0..n).map(|_| f(u)).collect()
 }
@@ -98,20 +103,42 @@ fn packet(u: &mut Unstructured) -> Result<Packet> {
         2 => Body::SourceDescription(list(u, 33, |u| {
             Ok(SdesChunk {
                 ssrc: u.arbitrary()?,
-                items: list(u, 5, |u| Ok(SdesItem { kind: u.arbitrary()?, text: bytes(u, 260)? }))?,
+                items: list(u, 5, |u| {
+                    Ok(SdesItem {
+                        kind: u.arbitrary()?,
+                        text: bytes(u, 260)?,
+                    })
+                })?,
             })
         })?),
         3 => Body::Bye(Bye {
             sources: list(u, 33, |u| u.arbitrary())?,
-            reason: if u.arbitrary()? { Some(bytes(u, 260)?) } else { None },
+            reason: if u.arbitrary()? {
+                Some(bytes(u, 260)?)
+            } else {
+                None
+            },
         }),
-        4 => Body::App(App { subtype: u.arbitrary()?, ssrc: u.arbitrary()?, name: u.arbitrary()?, data: data(u)? }),
+        4 => Body::App(App {
+            subtype: u.arbitrary()?,
+            ssrc: u.arbitrary()?,
+            name: u.arbitrary()?,
+            data: data(u)?,
+        }),
         5 => {
             let message = match u.int_in_range(0..=3u8)? {
-                0 => TransportMessage::Nack(list(u, 20, |u| Ok(Nack { pid: u.arbitrary()?, blp: u.arbitrary()? }))?),
+                0 => TransportMessage::Nack(list(u, 20, |u| {
+                    Ok(Nack {
+                        pid: u.arbitrary()?,
+                        blp: u.arbitrary()?,
+                    })
+                })?),
                 1 => TransportMessage::Tmmbr(list(u, 5, tmmb)?),
                 2 => TransportMessage::Tmmbn(list(u, 5, tmmb)?),
-                _ => TransportMessage::Other { fmt: u.arbitrary()?, fci: data(u)? },
+                _ => TransportMessage::Other {
+                    fmt: u.arbitrary()?,
+                    fci: data(u)?,
+                },
             };
             Body::TransportFeedback(TransportFeedback {
                 sender_ssrc: u.arbitrary()?,
@@ -134,29 +161,56 @@ fn packet(u: &mut Unstructured) -> Result<Packet> {
                     padding_bits: u.arbitrary()?,
                     data: data(u)?,
                 }),
-                3 => PayloadMessage::Fir(list(u, 5, |u| Ok(Fir { ssrc: u.arbitrary()?, sequence: u.arbitrary()? }))?),
+                3 => PayloadMessage::Fir(list(u, 5, |u| {
+                    Ok(Fir {
+                        ssrc: u.arbitrary()?,
+                        sequence: u.arbitrary()?,
+                    })
+                })?),
                 4 => PayloadMessage::Remb(Remb {
                     exponent: u.int_in_range(0..=64)?,
                     mantissa: u.int_in_range(0..=1 << 18)?,
                     ssrcs: list(u, 260, |u| u.arbitrary())?,
                 }),
                 5 => PayloadMessage::Afb(data(u)?),
-                _ => PayloadMessage::Other { fmt: u.arbitrary()?, fci: data(u)? },
+                _ => PayloadMessage::Other {
+                    fmt: u.arbitrary()?,
+                    fci: data(u)?,
+                },
             };
-            Body::PayloadFeedback(PayloadFeedback { sender_ssrc: u.arbitrary()?, media_ssrc: media_ssrc(u)?, message })
+            Body::PayloadFeedback(PayloadFeedback {
+                sender_ssrc: u.arbitrary()?,
+                media_ssrc: media_ssrc(u)?,
+                message,
+            })
         }
         7 => Body::ExtendedReport(ExtendedReport {
             ssrc: u.arbitrary()?,
             blocks: list(u, 5, |u| {
                 // Mostly the types RFC 3611 defines, whose lengths are set.
-                let block_type = if u.ratio(3, 4)? { u.int_in_range(1..=7)? } else { u.arbitrary()? };
+                let block_type = if u.ratio(3, 4)? {
+                    u.int_in_range(1..=7)?
+                } else {
+                    u.arbitrary()?
+                };
                 let type_specific = if u.arbitrary()? { 0 } else { u.arbitrary()? };
-                Ok(XrBlock { block_type, type_specific, data: bytes(u, 40)? })
+                Ok(XrBlock {
+                    block_type,
+                    type_specific,
+                    data: bytes(u, 40)?,
+                })
             })?,
         }),
-        _ => Body::Other { packet_type: u.arbitrary()?, count: u.arbitrary()?, data: data(u)? },
+        _ => Body::Other {
+            packet_type: u.arbitrary()?,
+            count: u.arbitrary()?,
+            data: data(u)?,
+        },
     };
-    Ok(Packet { body, padding: u.arbitrary()? })
+    Ok(Packet {
+        body,
+        padding: u.arbitrary()?,
+    })
 }
 
 /// Packets a world builds: whatever a writer accepts reads back the same.
@@ -186,13 +240,20 @@ fn built(data: &[u8]) -> Result<()> {
     // A DLRR block built from items gives them back, and is written only
     // when it fits a packet.
     let items = list(&mut u, 40, |u| {
-        Ok(DlrrItem { ssrc: u.arbitrary()?, last_rr: u.arbitrary()?, delay_since_last_rr: u.arbitrary()? })
+        Ok(DlrrItem {
+            ssrc: u.arbitrary()?,
+            last_rr: u.arbitrary()?,
+            delay_since_last_rr: u.arbitrary()?,
+        })
     })?;
     let block = XrBlock::dlrr(&items).unwrap();
     assert_eq!(block.dlrr_items(), Some(items));
     let ntp = XrBlock::receiver_reference_time(u.arbitrary()?);
     assert!(ntp.ntp_timestamp().is_some());
-    let report = Packet::from(Body::ExtendedReport(ExtendedReport { ssrc: u.arbitrary()?, blocks: vec![ntp, block] }));
+    let report = Packet::from(Body::ExtendedReport(ExtendedReport {
+        ssrc: u.arbitrary()?,
+        blocks: vec![ntp, block],
+    }));
     let bytes = report.to_bytes().unwrap();
     assert_eq!(Packet::parse(&bytes), Ok(report));
     Ok(())

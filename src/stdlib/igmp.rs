@@ -106,7 +106,7 @@
 //! assert_eq!(reports[0].to_bytes().unwrap(), [0x22, 0, 0xea, 0xf9, 0, 0, 0, 1, 2, 0, 0, 0, 239, 1, 2, 3]);
 //! ```
 
-use fictionet::stdlib::codec::{be16, Wire};
+use fictionet::stdlib::codec::{Wire, be16};
 use fictionet::stdlib::ip::checksum;
 
 use std::net::Ipv4Addr;
@@ -375,7 +375,9 @@ impl Wire for Code {
         match bytes {
             [code] => Ok(Self(decode_code(*code))),
             [] => Err(Error::Truncated),
-            _ => Err(Error::Trailing { remaining: bytes.len() - 1 }),
+            _ => Err(Error::Trailing {
+                remaining: bytes.len() - 1,
+            }),
         }
     }
 
@@ -385,7 +387,9 @@ impl Wire for Code {
         let code = if self.0 < 128 {
             self.0 as u8
         } else {
-            (128..=255u8).find(|&code| decode_code(code) == self.0).ok_or(Error::Unwritable)?
+            (128..=255u8)
+                .find(|&code| decode_code(code) == self.0)
+                .ok_or(Error::Unwritable)?
         };
         out.push(code);
         Ok(())
@@ -393,7 +397,14 @@ impl Wire for Code {
 }
 
 fn known_type(t: u8) -> bool {
-    matches!(t, kind::MEMBERSHIP_QUERY | kind::V1_REPORT | kind::V2_REPORT | kind::LEAVE_GROUP | kind::V3_REPORT)
+    matches!(
+        t,
+        kind::MEMBERSHIP_QUERY
+            | kind::V1_REPORT
+            | kind::V2_REPORT
+            | kind::LEAVE_GROUP
+            | kind::V3_REPORT
+    )
 }
 
 fn addr(b: &[u8], i: usize) -> Option<Ipv4Addr> {
@@ -403,9 +414,17 @@ fn addr(b: &[u8], i: usize) -> Option<Ipv4Addr> {
 
 /// `n` source addresses starting at `at`, and where they end.
 fn addrs(b: &[u8], at: usize, n: usize) -> Result<(Vec<Ipv4Addr>, usize), Error> {
-    let end = n.checked_mul(4).and_then(|l| l.checked_add(at)).ok_or(Error::Truncated)?;
+    let end = n
+        .checked_mul(4)
+        .and_then(|l| l.checked_add(at))
+        .ok_or(Error::Truncated)?;
     let s = b.get(at..end).ok_or(Error::Truncated)?;
-    let out: Vec<Ipv4Addr> = s.as_chunks::<4>().0.iter().map(|c| Ipv4Addr::new(c[0], c[1], c[2], c[3])).collect();
+    let out: Vec<Ipv4Addr> = s
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| Ipv4Addr::new(c[0], c[1], c[2], c[3]))
+        .collect();
     check_sources(&out)?;
     Ok((out, end))
 }
@@ -456,7 +475,10 @@ impl Message {
     /// The IGMP version the message belongs to: 1, 2 or 3.
     pub fn version(&self) -> u8 {
         match self {
-            Message::Query { max_resp_time: 0, .. } | Message::ReportV1 { .. } => 1,
+            Message::Query {
+                max_resp_time: 0, ..
+            }
+            | Message::ReportV1 { .. } => 1,
             Message::Query { .. } | Message::ReportV2 { .. } | Message::Leave { .. } => 2,
             Message::QueryV3(_) | Message::ReportV3 { .. } => 3,
         }
@@ -485,7 +507,10 @@ impl Message {
     /// the message.
     pub fn encoded_len(&self) -> Result<usize, Error> {
         let n = match self {
-            Message::Query { max_resp_time: 0, group } => {
+            Message::Query {
+                max_resp_time: 0,
+                group,
+            } => {
                 // A version 1 query is sent with a zero group.
                 if !group.is_unspecified() {
                     return Err(Error::Address(*group));
@@ -496,7 +521,9 @@ impl Message {
                 check_group(*group, true)?;
                 Some(HEADER_LEN)
             }
-            Message::ReportV1 { group } | Message::ReportV2 { group } | Message::Leave { group } => {
+            Message::ReportV1 { group }
+            | Message::ReportV2 { group }
+            | Message::Leave { group } => {
                 check_group(*group, false)?;
                 Some(HEADER_LEN)
             }
@@ -506,7 +533,10 @@ impl Message {
                 }
                 check_query_v3(q.group, q.sources.len())?;
                 check_sources(&q.sources)?;
-                q.sources.len().checked_mul(4).and_then(|l| l.checked_add(V3_QUERY_LEN))
+                q.sources
+                    .len()
+                    .checked_mul(4)
+                    .and_then(|l| l.checked_add(V3_QUERY_LEN))
             }
             Message::ReportV3 { records } => {
                 let mut n = Some(HEADER_LEN);
@@ -558,10 +588,16 @@ impl Message {
         let message = match t {
             kind::MEMBERSHIP_QUERY => match b.len() {
                 // A version 1 query's group field is ignored when read.
-                HEADER_LEN if b[1] == 0 => Ok(Message::Query { max_resp_time: 0, group: Ipv4Addr::UNSPECIFIED }),
+                HEADER_LEN if b[1] == 0 => Ok(Message::Query {
+                    max_resp_time: 0,
+                    group: Ipv4Addr::UNSPECIFIED,
+                }),
                 HEADER_LEN => {
                     check_group(group, true)?;
-                    Ok(Message::Query { max_resp_time: b[1], group })
+                    Ok(Message::Query {
+                        max_resp_time: b[1],
+                        group,
+                    })
                 }
                 n if n < V3_QUERY_LEN => Err(Error::QueryLength(n)),
                 _ => {
@@ -586,7 +622,8 @@ impl Message {
                 let m = usize::from(be16(b, 6).ok_or(Error::Truncated)?);
                 // Each record takes at least 8 bytes, so the bytes bound
                 // what is allocated, whatever the count says.
-                let mut records = Vec::with_capacity(m.min((b.len() - HEADER_LEN) / RECORD_HEADER_LEN));
+                let mut records =
+                    Vec::with_capacity(m.min((b.len() - HEADER_LEN) / RECORD_HEADER_LEN));
                 let mut at = HEADER_LEN;
                 for _ in 0..m {
                     let head = b.get(at..at + RECORD_HEADER_LEN).ok_or(Error::Truncated)?;
@@ -596,8 +633,15 @@ impl Message {
                     check_group(group, false)?;
                     let (sources, end) = addrs(b, at + RECORD_HEADER_LEN, n)?;
                     // The auxiliary data must be there, but is skipped.
-                    let aux_end = end.checked_add(aux_len).filter(|&e| e <= b.len()).ok_or(Error::Truncated)?;
-                    records.push(GroupRecord { kind: RecordType::from_code(head[0]), group, sources });
+                    let aux_end = end
+                        .checked_add(aux_len)
+                        .filter(|&e| e <= b.len())
+                        .ok_or(Error::Truncated)?;
+                    records.push(GroupRecord {
+                        kind: RecordType::from_code(head[0]),
+                        group,
+                        sources,
+                    });
                     at = aux_end;
                 }
                 used = at;
@@ -605,7 +649,9 @@ impl Message {
             }
         }?;
         if exact && used != b.len() {
-            return Err(Error::Trailing { remaining: b.len() - used });
+            return Err(Error::Trailing {
+                remaining: b.len() - used,
+            });
         }
         Ok(message)
     }
@@ -635,9 +681,14 @@ impl Wire for Message {
         out.reserve(len);
         out.push(self.kind());
         let (code, group) = match self {
-            Message::Query { max_resp_time, group } => (*max_resp_time, *group),
+            Message::Query {
+                max_resp_time,
+                group,
+            } => (*max_resp_time, *group),
             Message::QueryV3(q) => (q.max_resp_code, q.group),
-            Message::ReportV1 { group } | Message::ReportV2 { group } | Message::Leave { group } => (0, *group),
+            Message::ReportV1 { group }
+            | Message::ReportV2 { group }
+            | Message::Leave { group } => (0, *group),
             Message::ReportV3 { .. } => (0, Ipv4Addr::UNSPECIFIED),
         };
         out.push(code);
@@ -686,15 +737,23 @@ pub mod harness {
         let zero = |a: &Ipv4Addr| a.octets() == [0; 4];
         let unicast = |a: &Ipv4Addr| !multicast(a) && !zero(a) && a.octets() != [255; 4];
         let len = match m {
-            Message::Query { max_resp_time: 0, group } if !zero(group) => return false,
+            Message::Query {
+                max_resp_time: 0,
+                group,
+            } if !zero(group) => return false,
             Message::Query { group, .. } if !zero(group) && !multicast(group) => return false,
-            Message::ReportV1 { group } | Message::ReportV2 { group } | Message::Leave { group }
+            Message::ReportV1 { group }
+            | Message::ReportV2 { group }
+            | Message::Leave { group }
                 if !multicast(group) =>
             {
                 return false;
             }
             Message::QueryV3(q) => {
-                if q.qrv > 7 || !(zero(&q.group) || multicast(&q.group)) || !q.sources.iter().all(unicast) {
+                if q.qrv > 7
+                    || !(zero(&q.group) || multicast(&q.group))
+                    || !q.sources.iter().all(unicast)
+                {
                     return false;
                 }
                 if zero(&q.group) && !q.sources.is_empty() {
@@ -727,9 +786,7 @@ pub mod harness {
 mod tests {
     use super::harness::conforms;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Collect, CollectError, Fail, Lcg,
-    };
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
@@ -740,10 +797,19 @@ mod tests {
         let parsed = Message::parse(b);
         let (items, failure) = decode_all(make, b);
         if b.len() <= MAX_MESSAGE {
-            assert_eq!(failure, parsed.clone().err().map(|e| Fail::Protocol(CollectError::Parse(e))));
+            assert_eq!(
+                failure,
+                parsed
+                    .clone()
+                    .err()
+                    .map(|e| Fail::Protocol(CollectError::Parse(e)))
+            );
             assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
         } else {
-            assert_eq!(failure, Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE })));
+            assert_eq!(
+                failure,
+                Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE }))
+            );
         }
         parsed
     }
@@ -777,7 +843,13 @@ mod tests {
     fn v2_general_query_example() {
         let b = [0x11, 0x64, 0xee, 0x9b, 0, 0, 0, 0];
         let m = Message::parse(&b).unwrap();
-        assert_eq!(m, Message::Query { max_resp_time: 100, group: Ipv4Addr::UNSPECIFIED });
+        assert_eq!(
+            m,
+            Message::Query {
+                max_resp_time: 100,
+                group: Ipv4Addr::UNSPECIFIED
+            }
+        );
         assert_eq!(m.version(), 2);
         assert_eq!(m.destination(), ALL_SYSTEMS);
         assert_eq!(m.to_bytes().unwrap(), b);
@@ -785,7 +857,10 @@ mod tests {
 
     #[test]
     fn v1_query_has_a_zero_code() {
-        let m = Message::Query { max_resp_time: 0, group: Ipv4Addr::UNSPECIFIED };
+        let m = Message::Query {
+            max_resp_time: 0,
+            group: Ipv4Addr::UNSPECIFIED,
+        };
         let b = round_trip(&m);
         assert_eq!(b, [0x11, 0, 0xee, 0xff, 0, 0, 0, 0]);
         assert_eq!(m.version(), 1);
@@ -793,7 +868,10 @@ mod tests {
 
     #[test]
     fn group_specific_query_goes_to_the_group() {
-        let m = Message::Query { max_resp_time: 10, group: ip(239, 1, 2, 3) };
+        let m = Message::Query {
+            max_resp_time: 10,
+            group: ip(239, 1, 2, 3),
+        };
         round_trip(&m);
         assert_eq!(m.destination(), ip(239, 1, 2, 3));
     }
@@ -819,10 +897,18 @@ mod tests {
         // A version 2 report with a nonzero max response time field, which
         // receivers ignore.
         let b = fix(vec![0x16, 0x55, 0, 0, 239, 1, 2, 3]);
-        assert_eq!(Message::parse(&b), Ok(Message::ReportV2 { group: ip(239, 1, 2, 3) }));
+        assert_eq!(
+            Message::parse(&b),
+            Ok(Message::ReportV2 {
+                group: ip(239, 1, 2, 3)
+            })
+        );
         // A version 3 report with its reserved fields set.
         let b = fix(vec![0x22, 0xaa, 0, 0, 0xbb, 0xcc, 0, 0]);
-        assert_eq!(Message::parse(&b), Ok(Message::ReportV3 { records: vec![] }));
+        assert_eq!(
+            Message::parse(&b),
+            Ok(Message::ReportV3 { records: vec![] })
+        );
     }
 
     #[test]
@@ -867,7 +953,9 @@ mod tests {
     #[test]
     fn v3_query_reserved_bits_are_ignored() {
         let b = fix(vec![0x11, 1, 0, 0, 0, 0, 0, 0, 0xf3, 9, 0, 0]);
-        let Message::QueryV3(q) = Message::parse(&b).unwrap() else { panic!() };
+        let Message::QueryV3(q) = Message::parse(&b).unwrap() else {
+            panic!()
+        };
         assert!(!q.suppress);
         assert_eq!(q.qrv, 3);
     }
@@ -896,7 +984,9 @@ mod tests {
 
     #[test]
     fn v3_report_with_every_record_type() {
-        let m = Message::ReportV3 { records: every_record_type() };
+        let m = Message::ReportV3 {
+            records: every_record_type(),
+        };
         let b = round_trip(&m);
         assert_eq!(&b[..2], [0x22, 0]);
         assert_eq!(&b[4..8], [0, 0, 0, 8]);
@@ -930,27 +1020,45 @@ mod tests {
         assert_eq!(Code(992).to_bytes(), Ok(vec![0xaf]));
         assert_eq!(Code::parse(&[0xaf]), Ok(Code(992)));
         assert_eq!(Code::parse(&[]), Err(Error::Truncated));
-        assert_eq!(Code::parse(&[0xaf, 0]), Err(Error::Trailing { remaining: 1 }));
+        assert_eq!(
+            Code::parse(&[0xaf, 0]),
+            Err(Error::Trailing { remaining: 1 })
+        );
         assert_eq!(decode_code(0xaf), 31 << 5);
     }
 
     #[test]
     fn trailing_bytes_are_ignored() {
         let messages = [
-            Message::ReportV2 { group: ip(239, 9, 9, 9) },
-            Message::Leave { group: ip(239, 1, 1, 1) },
+            Message::ReportV2 {
+                group: ip(239, 9, 9, 9),
+            },
+            Message::Leave {
+                group: ip(239, 1, 1, 1),
+            },
             Message::QueryV3(QueryV3 {
-                max_resp_code: 1, group: Ipv4Addr::UNSPECIFIED, suppress: false,
-                qrv: 1, qqic: 1, sources: vec![],
+                max_resp_code: 1,
+                group: Ipv4Addr::UNSPECIFIED,
+                suppress: false,
+                qrv: 1,
+                qqic: 1,
+                sources: vec![],
             }),
             Message::QueryV3(QueryV3 {
-                max_resp_code: 1, group: ip(239, 1, 1, 1), suppress: false,
-                qrv: 1, qqic: 1, sources: vec![ip(192, 0, 2, 1)],
-            }),
-            Message::ReportV3 { records: vec![GroupRecord {
-                kind: RecordType::ModeIsInclude, group: ip(239, 1, 1, 1),
+                max_resp_code: 1,
+                group: ip(239, 1, 1, 1),
+                suppress: false,
+                qrv: 1,
+                qqic: 1,
                 sources: vec![ip(192, 0, 2, 1)],
-            }] },
+            }),
+            Message::ReportV3 {
+                records: vec![GroupRecord {
+                    kind: RecordType::ModeIsInclude,
+                    group: ip(239, 1, 1, 1),
+                    sources: vec![ip(192, 0, 2, 1)],
+                }],
+            },
         ];
         for m in messages {
             let mut b = m.to_bytes().unwrap();
@@ -962,7 +1070,10 @@ mod tests {
                 b = fix(b);
                 assert_eq!(Message::parse(&b).as_ref(), Ok(&m));
                 assert_eq!(Message::receive(&b).as_ref(), Ok(&m));
-                assert_eq!(Message::receive(&fix(b[..b.len() - 1].to_vec())), Err(Error::Truncated));
+                assert_eq!(
+                    Message::receive(&fix(b[..b.len() - 1].to_vec())),
+                    Err(Error::Truncated)
+                );
             }
             b.extend_from_slice(&[1, 2, 3, 4, 5]);
             // Trailing bytes still participate in the checksum.
@@ -979,11 +1090,23 @@ mod tests {
     fn error_paths() {
         assert_eq!(Message::parse(&[]), Err(Error::Truncated));
         assert_eq!(Message::parse(&[0x11]), Err(Error::Truncated));
-        assert_eq!(Message::parse(&[0x11, 0, 0, 0, 0, 0, 0]), Err(Error::Truncated));
-        assert_eq!(Message::parse(&[0x13, 0, 0, 0, 0, 0, 0, 0]), Err(Error::UnknownType(0x13)));
+        assert_eq!(
+            Message::parse(&[0x11, 0, 0, 0, 0, 0, 0]),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            Message::parse(&[0x13, 0, 0, 0, 0, 0, 0, 0]),
+            Err(Error::UnknownType(0x13))
+        );
         assert_eq!(Message::parse(&[0x00]), Err(Error::UnknownType(0)));
-        assert_eq!(Message::parse(&vec![0x22; MAX_MESSAGE + 1]), Err(Error::TooLong));
-        assert_eq!(Message::parse(&[0x16, 0, 0, 0, 239, 1, 2, 3]), Err(Error::Checksum));
+        assert_eq!(
+            Message::parse(&vec![0x22; MAX_MESSAGE + 1]),
+            Err(Error::TooLong)
+        );
+        assert_eq!(
+            Message::parse(&[0x16, 0, 0, 0, 239, 1, 2, 3]),
+            Err(Error::Checksum)
+        );
         for n in 9..12 {
             let b = fix(vec![0x11; n]);
             assert_eq!(Message::parse(&b), Err(Error::QueryLength(n)));
@@ -998,7 +1121,9 @@ mod tests {
         let b = fix(vec![0x22, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 239, 0, 0, 1]);
         assert_eq!(Message::parse(&b), Err(Error::Truncated));
         // A record that says 1 word of aux data and holds 2 bytes.
-        let b = fix(vec![0x22, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 239, 0, 0, 1, 0, 0]);
+        let b = fix(vec![
+            0x22, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 239, 0, 0, 1, 0, 0,
+        ]);
         assert_eq!(Message::parse(&b), Err(Error::Truncated));
         // A record count of 65535 with no records.
         let b = fix(vec![0x22, 0, 0, 0, 0, 0, 0xff, 0xff]);
@@ -1007,17 +1132,42 @@ mod tests {
 
     #[test]
     fn writer_errors() {
-        let q = QueryV3 { max_resp_code: 0, group: ip(232, 1, 1, 1), suppress: false, qrv: 8, qqic: 0, sources: vec![] };
+        let q = QueryV3 {
+            max_resp_code: 0,
+            group: ip(232, 1, 1, 1),
+            suppress: false,
+            qrv: 8,
+            qqic: 0,
+            sources: vec![],
+        };
         assert_eq!(Message::QueryV3(q.clone()).to_bytes(), Err(Error::Qrv(8)));
-        let big = QueryV3 { qrv: 0, sources: vec![ip(1, 1, 1, 1); 20_000], ..q };
-        assert_eq!(Message::QueryV3(big.clone()).to_bytes(), Err(Error::TooLong));
-        let fits = QueryV3 { sources: vec![ip(1, 1, 1, 1); (MAX_MESSAGE - V3_QUERY_LEN) / 4], ..big };
+        let big = QueryV3 {
+            qrv: 0,
+            sources: vec![ip(1, 1, 1, 1); 20_000],
+            ..q
+        };
+        assert_eq!(
+            Message::QueryV3(big.clone()).to_bytes(),
+            Err(Error::TooLong)
+        );
+        let fits = QueryV3 {
+            sources: vec![ip(1, 1, 1, 1); (MAX_MESSAGE - V3_QUERY_LEN) / 4],
+            ..big
+        };
         let b = round_trip(&Message::QueryV3(fits));
         assert!(b.len() <= MAX_MESSAGE);
-        let r = GroupRecord { kind: RecordType::ModeIsInclude, group: ip(239, 0, 0, 1), sources: vec![] };
-        let many = Message::ReportV3 { records: vec![r.clone(); 10_000] };
+        let r = GroupRecord {
+            kind: RecordType::ModeIsInclude,
+            group: ip(239, 0, 0, 1),
+            sources: vec![],
+        };
+        let many = Message::ReportV3 {
+            records: vec![r.clone(); 10_000],
+        };
         assert_eq!(many.to_bytes(), Err(Error::TooLong));
-        let most = Message::ReportV3 { records: vec![r; (MAX_MESSAGE - HEADER_LEN) / RECORD_HEADER_LEN] };
+        let most = Message::ReportV3 {
+            records: vec![r; (MAX_MESSAGE - HEADER_LEN) / RECORD_HEADER_LEN],
+        };
         round_trip(&most);
     }
 
@@ -1026,7 +1176,11 @@ mod tests {
         // Other(3) would be written as code 3 and read back as
         // ChangeToInclude, a different message.
         for c in 1..=6u8 {
-            let r = GroupRecord { kind: RecordType::Other(c), group: ip(239, 0, 0, 1), sources: vec![] };
+            let r = GroupRecord {
+                kind: RecordType::Other(c),
+                group: ip(239, 0, 0, 1),
+                sources: vec![],
+            };
             let m = Message::ReportV3 { records: vec![r] };
             assert_eq!(m.to_bytes(), Err(Error::Unwritable));
             assert_eq!(m.encoded_len(), Err(Error::Unwritable));
@@ -1042,11 +1196,15 @@ mod tests {
         for _ in 0..n {
             b.extend_from_slice(&[1, 0, 0, 0, 239, 0, 0, 1]);
         }
-        let Message::ReportV3 { records } = Message::parse(&fix(b)).unwrap() else { panic!() };
+        let Message::ReportV3 { records } = Message::parse(&fix(b)).unwrap() else {
+            panic!()
+        };
         assert_eq!(records.len(), n);
         // A count and a source count that claim far more than the bytes
         // hold fail without a large allocation.
-        let mut b = vec![0x22, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 0xff, 0xff, 0xff, 239, 0, 0, 1];
+        let mut b = vec![
+            0x22, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 0xff, 0xff, 0xff, 239, 0, 0, 1,
+        ];
         b.resize(MAX_MESSAGE, 0);
         assert_eq!(Message::parse(&fix(b)), Err(Error::Truncated));
         // A large chunk of unknown type fails on its type, as parse does.
@@ -1060,7 +1218,8 @@ mod tests {
     fn messages_can_be_hashed() {
         let set: std::collections::HashSet<Message> = samples().into_iter().collect();
         assert_eq!(set.len(), samples().len());
-        let kinds: std::collections::HashSet<RecordType> = (0..=255u8).map(RecordType::from_code).collect();
+        let kinds: std::collections::HashSet<RecordType> =
+            (0..=255u8).map(RecordType::from_code).collect();
         assert_eq!(kinds.len(), 256);
     }
 
@@ -1086,20 +1245,54 @@ mod tests {
     fn groups_must_be_multicast() {
         // RFC 2236, section 2.4, and RFC 3376, section 4.2.8.
         let u = ip(192, 0, 2, 1);
-        for m in [Message::ReportV1 { group: u }, Message::ReportV2 { group: u }, Message::Leave { group: u }] {
+        for m in [
+            Message::ReportV1 { group: u },
+            Message::ReportV2 { group: u },
+            Message::Leave { group: u },
+        ] {
             assert_eq!(m.to_bytes(), Err(Error::Address(u)));
             assert_eq!(m.encoded_len(), Err(Error::Address(u)));
         }
         for t in [0x12, 0x16, 0x17] {
-            assert_eq!(Message::parse(&fix(vec![t, 0, 0, 0, 192, 0, 2, 1])), Err(Error::Address(u)));
+            assert_eq!(
+                Message::parse(&fix(vec![t, 0, 0, 0, 192, 0, 2, 1])),
+                Err(Error::Address(u))
+            );
         }
-        assert_eq!(Message::Query { max_resp_time: 10, group: u }.to_bytes(), Err(Error::Address(u)));
-        assert_eq!(Message::parse(&fix(vec![0x11, 10, 0, 0, 192, 0, 2, 1])), Err(Error::Address(u)));
-        let q = QueryV3 { max_resp_code: 1, group: u, suppress: false, qrv: 2, qqic: 1, sources: vec![] };
+        assert_eq!(
+            Message::Query {
+                max_resp_time: 10,
+                group: u
+            }
+            .to_bytes(),
+            Err(Error::Address(u))
+        );
+        assert_eq!(
+            Message::parse(&fix(vec![0x11, 10, 0, 0, 192, 0, 2, 1])),
+            Err(Error::Address(u))
+        );
+        let q = QueryV3 {
+            max_resp_code: 1,
+            group: u,
+            suppress: false,
+            qrv: 2,
+            qqic: 1,
+            sources: vec![],
+        };
         assert_eq!(Message::QueryV3(q).to_bytes(), Err(Error::Address(u)));
-        assert_eq!(Message::parse(&fix(vec![0x11, 1, 0, 0, 192, 0, 2, 1, 2, 1, 0, 0])), Err(Error::Address(u)));
-        let r = GroupRecord { kind: RecordType::ModeIsInclude, group: u, sources: vec![] };
-        assert_eq!(Message::ReportV3 { records: vec![r] }.to_bytes(), Err(Error::Address(u)));
+        assert_eq!(
+            Message::parse(&fix(vec![0x11, 1, 0, 0, 192, 0, 2, 1, 2, 1, 0, 0])),
+            Err(Error::Address(u))
+        );
+        let r = GroupRecord {
+            kind: RecordType::ModeIsInclude,
+            group: u,
+            sources: vec![],
+        };
+        assert_eq!(
+            Message::ReportV3 { records: vec![r] }.to_bytes(),
+            Err(Error::Address(u))
+        );
         let b = fix(vec![0x22, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 192, 0, 2, 1]);
         assert_eq!(Message::parse(&b), Err(Error::Address(u)));
     }
@@ -1108,14 +1301,32 @@ mod tests {
     fn sources_must_be_unicast() {
         // RFC 3376, sections 4.1.9 and 4.2.9.
         for bad in [ip(239, 1, 1, 1), Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST] {
-            let q = QueryV3 { max_resp_code: 1, group: ip(232, 1, 1, 1), suppress: false, qrv: 2, qqic: 1, sources: vec![ip(10, 0, 0, 1), bad] };
+            let q = QueryV3 {
+                max_resp_code: 1,
+                group: ip(232, 1, 1, 1),
+                suppress: false,
+                qrv: 2,
+                qqic: 1,
+                sources: vec![ip(10, 0, 0, 1), bad],
+            };
             assert_eq!(Message::QueryV3(q).to_bytes(), Err(Error::Address(bad)));
             let o = bad.octets();
-            let b = fix(vec![0x11, 1, 0, 0, 232, 1, 1, 1, 2, 1, 0, 1, o[0], o[1], o[2], o[3]]);
+            let b = fix(vec![
+                0x11, 1, 0, 0, 232, 1, 1, 1, 2, 1, 0, 1, o[0], o[1], o[2], o[3],
+            ]);
             assert_eq!(Message::parse(&b), Err(Error::Address(bad)));
-            let r = GroupRecord { kind: RecordType::AllowNewSources, group: ip(239, 1, 1, 1), sources: vec![bad] };
-            assert_eq!(Message::ReportV3 { records: vec![r] }.to_bytes(), Err(Error::Address(bad)));
-            let b = fix(vec![0x22, 0, 0, 0, 0, 0, 0, 1, 5, 0, 0, 1, 239, 1, 1, 1, o[0], o[1], o[2], o[3]]);
+            let r = GroupRecord {
+                kind: RecordType::AllowNewSources,
+                group: ip(239, 1, 1, 1),
+                sources: vec![bad],
+            };
+            assert_eq!(
+                Message::ReportV3 { records: vec![r] }.to_bytes(),
+                Err(Error::Address(bad))
+            );
+            let b = fix(vec![
+                0x22, 0, 0, 0, 0, 0, 0, 1, 5, 0, 0, 1, 239, 1, 1, 1, o[0], o[1], o[2], o[3],
+            ]);
             assert_eq!(Message::parse(&b), Err(Error::Address(bad)));
         }
     }
@@ -1124,22 +1335,43 @@ mod tests {
     fn v3_general_query_lists_no_sources() {
         // RFC 3376, section 4.1.9: group 0.0.0.0 and one source, with a
         // right checksum. Linux drops it too.
-        let b = [0x11, 0x64, 0x2a, 0x1c, 0, 0, 0, 0, 0x02, 0x7d, 0, 1, 192, 0, 2, 1];
+        let b = [
+            0x11, 0x64, 0x2a, 0x1c, 0, 0, 0, 0, 0x02, 0x7d, 0, 1, 192, 0, 2, 1,
+        ];
         assert_eq!(checksum(&b), 0);
         assert_eq!(Message::parse(&b), Err(Error::GeneralQuerySources(1)));
-        let q = QueryV3 { max_resp_code: 100, group: Ipv4Addr::UNSPECIFIED, suppress: false, qrv: 2, qqic: 125, sources: vec![ip(192, 0, 2, 1)] };
-        assert_eq!(Message::QueryV3(q).to_bytes(), Err(Error::GeneralQuerySources(1)));
+        let q = QueryV3 {
+            max_resp_code: 100,
+            group: Ipv4Addr::UNSPECIFIED,
+            suppress: false,
+            qrv: 2,
+            qqic: 125,
+            sources: vec![ip(192, 0, 2, 1)],
+        };
+        assert_eq!(
+            Message::QueryV3(q).to_bytes(),
+            Err(Error::GeneralQuerySources(1))
+        );
     }
 
     #[test]
     fn v1_query_group_is_ignored_and_never_sent() {
         // RFC 1112, appendix I: zero when sent, ignored when received.
-        let m = Message::Query { max_resp_time: 0, group: ip(239, 1, 2, 3) };
+        let m = Message::Query {
+            max_resp_time: 0,
+            group: ip(239, 1, 2, 3),
+        };
         assert_eq!(m.to_bytes(), Err(Error::Address(ip(239, 1, 2, 3))));
         for g in [[239, 1, 2, 3], [192, 0, 2, 1]] {
             let b = fix(vec![0x11, 0, 0, 0, g[0], g[1], g[2], g[3]]);
             let m = Message::parse(&b).unwrap();
-            assert_eq!(m, Message::Query { max_resp_time: 0, group: Ipv4Addr::UNSPECIFIED });
+            assert_eq!(
+                m,
+                Message::Query {
+                    max_resp_time: 0,
+                    group: Ipv4Addr::UNSPECIFIED
+                }
+            );
             assert_eq!(m.destination(), ALL_SYSTEMS);
             assert_eq!(m.version(), 1);
         }
@@ -1149,9 +1381,15 @@ mod tests {
     fn aux_data_is_skipped_and_never_written() {
         // RFC 3376, section 4.2.10: a record with one word of aux data
         // reads as the record alone, and is written without it.
-        let b = fix(vec![0x22, 0, 0, 0, 0, 0, 0, 1, 2, 1, 0, 0, 239, 1, 2, 3, 1, 2, 3, 4]);
+        let b = fix(vec![
+            0x22, 0, 0, 0, 0, 0, 0, 1, 2, 1, 0, 0, 239, 1, 2, 3, 1, 2, 3, 4,
+        ]);
         let m = Message::parse(&b).unwrap();
-        let r = GroupRecord { kind: RecordType::ModeIsExclude, group: ip(239, 1, 2, 3), sources: vec![] };
+        let r = GroupRecord {
+            kind: RecordType::ModeIsExclude,
+            group: ip(239, 1, 2, 3),
+            sources: vec![],
+        };
         assert_eq!(m, Message::ReportV3 { records: vec![r] });
         let out = m.to_bytes().unwrap();
         assert_eq!(out.len(), 16);
@@ -1161,8 +1399,13 @@ mod tests {
         let mut b = vec![0x22, 0, 0, 0, 0, 0, 0, 2, 1, 255, 0, 0, 239, 0, 0, 1];
         b.extend_from_slice(&[0xaa; 255 * 4]);
         b.extend_from_slice(&[2, 0, 0, 0, 239, 0, 0, 2]);
-        let Message::ReportV3 { records } = Message::parse(&fix(b)).unwrap() else { panic!() };
-        assert_eq!(records.iter().map(|r| r.group).collect::<Vec<_>>(), [ip(239, 0, 0, 1), ip(239, 0, 0, 2)]);
+        let Message::ReportV3 { records } = Message::parse(&fix(b)).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            records.iter().map(|r| r.group).collect::<Vec<_>>(),
+            [ip(239, 0, 0, 1), ip(239, 0, 0, 2)]
+        );
     }
 
     #[test]
@@ -1170,8 +1413,18 @@ mod tests {
         // RFC 3376, section 4: every message carries Router Alert, so the
         // IPv4 header is at least 24 bytes and a message at most 65511.
         assert_eq!(MAX_MESSAGE + 24, 65_535);
-        let q = |n| QueryV3 { max_resp_code: 1, group: ip(232, 1, 1, 1), suppress: false, qrv: 2, qqic: 1, sources: vec![ip(10, 0, 0, 1); n] };
-        assert_eq!(Message::QueryV3(q(16_375)).encoded_len(), Err(Error::TooLong));
+        let q = |n| QueryV3 {
+            max_resp_code: 1,
+            group: ip(232, 1, 1, 1),
+            suppress: false,
+            qrv: 2,
+            qqic: 1,
+            sources: vec![ip(10, 0, 0, 1); n],
+        };
+        assert_eq!(
+            Message::QueryV3(q(16_375)).encoded_len(),
+            Err(Error::TooLong)
+        );
         assert_eq!(round_trip(&Message::QueryV3(q(16_374))).len(), 65_508);
         // A received message that only fits a 20-byte header is too long.
         let mut b = vec![0x16, 0, 0, 0, 239, 1, 2, 3];
@@ -1190,12 +1443,27 @@ mod tests {
 
     fn samples() -> Vec<Message> {
         vec![
-            Message::Query { max_resp_time: 100, group: Ipv4Addr::UNSPECIFIED },
-            Message::Query { max_resp_time: 0, group: Ipv4Addr::UNSPECIFIED },
-            Message::Query { max_resp_time: 10, group: ip(239, 1, 1, 1) },
-            Message::ReportV1 { group: ip(239, 1, 1, 1) },
-            Message::ReportV2 { group: ip(239, 1, 1, 2) },
-            Message::Leave { group: ip(239, 1, 1, 3) },
+            Message::Query {
+                max_resp_time: 100,
+                group: Ipv4Addr::UNSPECIFIED,
+            },
+            Message::Query {
+                max_resp_time: 0,
+                group: Ipv4Addr::UNSPECIFIED,
+            },
+            Message::Query {
+                max_resp_time: 10,
+                group: ip(239, 1, 1, 1),
+            },
+            Message::ReportV1 {
+                group: ip(239, 1, 1, 1),
+            },
+            Message::ReportV2 {
+                group: ip(239, 1, 1, 2),
+            },
+            Message::Leave {
+                group: ip(239, 1, 1, 3),
+            },
             Message::QueryV3(QueryV3 {
                 max_resp_code: 0xc3,
                 group: ip(232, 0, 0, 9),
@@ -1204,7 +1472,9 @@ mod tests {
                 qqic: 0x90,
                 sources: vec![ip(10, 1, 1, 1), ip(10, 2, 2, 2), ip(10, 3, 3, 3)],
             }),
-            Message::ReportV3 { records: every_record_type() },
+            Message::ReportV3 {
+                records: every_record_type(),
+            },
         ]
     }
 
@@ -1221,7 +1491,10 @@ mod tests {
                 // 8 bytes reads as a v2 query).
                 let fixed = fix(p.to_vec());
                 if let Ok(short) = Message::parse(&fixed) {
-                    assert!(matches!(short, Message::Query { .. }) && n == HEADER_LEN, "{m:?} prefix {n}");
+                    assert!(
+                        matches!(short, Message::Query { .. }) && n == HEADER_LEN,
+                        "{m:?} prefix {n}"
+                    );
                 }
             }
         }
@@ -1259,7 +1532,11 @@ mod tests {
         }
         /// A group for a query: multicast, or now and then 0.0.0.0.
         fn query_group(&mut self) -> Ipv4Addr {
-            if self.index(3) == 0 { Ipv4Addr::UNSPECIFIED } else { self.group() }
+            if self.index(3) == 0 {
+                Ipv4Addr::UNSPECIFIED
+            } else {
+                self.group()
+            }
         }
         /// A unicast address: first octet 1 to 223.
         fn source(&mut self) -> Ipv4Addr {
@@ -1279,15 +1556,25 @@ mod tests {
     fn random_message(rng: &mut Lcg) -> Message {
         match rng.index(6) {
             0 => match rng.next() as u8 {
-                0 => Message::Query { max_resp_time: 0, group: Ipv4Addr::UNSPECIFIED },
-                t => Message::Query { max_resp_time: t, group: rng.query_group() },
+                0 => Message::Query {
+                    max_resp_time: 0,
+                    group: Ipv4Addr::UNSPECIFIED,
+                },
+                t => Message::Query {
+                    max_resp_time: t,
+                    group: rng.query_group(),
+                },
             },
             1 => Message::ReportV1 { group: rng.group() },
             2 => Message::ReportV2 { group: rng.group() },
             3 => Message::Leave { group: rng.group() },
             4 => {
                 let group = rng.query_group();
-                let sources = if group.is_unspecified() { vec![] } else { rng.sources(8) };
+                let sources = if group.is_unspecified() {
+                    vec![]
+                } else {
+                    rng.sources(8)
+                };
                 Message::QueryV3(QueryV3 {
                     max_resp_code: rng.next() as u8,
                     group,
@@ -1318,13 +1605,20 @@ mod tests {
     /// codes.
     fn random_any_message(rng: &mut Lcg) -> Message {
         match rng.index(6) {
-            0 => Message::Query { max_resp_time: rng.next() as u8 % 3, group: rng.addr() },
+            0 => Message::Query {
+                max_resp_time: rng.next() as u8 % 3,
+                group: rng.addr(),
+            },
             1 => Message::ReportV1 { group: rng.addr() },
             2 => Message::ReportV2 { group: rng.addr() },
             3 => Message::Leave { group: rng.addr() },
             4 => Message::QueryV3(QueryV3 {
                 max_resp_code: rng.next() as u8,
-                group: if !rng.coin() { Ipv4Addr::UNSPECIFIED } else { rng.addr() },
+                group: if !rng.coin() {
+                    Ipv4Addr::UNSPECIFIED
+                } else {
+                    rng.addr()
+                },
                 suppress: !rng.coin(),
                 qrv: rng.index(10) as u8,
                 qqic: rng.next() as u8,

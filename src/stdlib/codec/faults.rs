@@ -566,7 +566,7 @@ impl Faults {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::{test_support, modbus};
+    use fictionet::stdlib::{modbus, test_support};
 
     fn rule<T>(fault: ItemFault<T>) -> [Rule<ItemFault<T>>; 1] {
         [Rule {

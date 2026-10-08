@@ -24,16 +24,20 @@ use fictionet::stdlib::{ConnError, ip, tcp, udp};
 use fictionet::{Cx, End, Interface, Packet, RecvError};
 use tokio::sync::oneshot;
 
+use super::link::Link;
 use fictionet::relay::proxy::Host;
 use fictionet::relay::proxy::dns::{self, Lookup};
-use super::link::Link;
 
 /// How long a connection may take to open before the client is told it
 /// timed out. The stack itself would wait two minutes for a SYN that is
 /// never answered.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A DNS query is sent again after each of these waits, then given up.
-const DNS_WAITS: [Duration; 3] = [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)];
+const DNS_WAITS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
 /// At most this many names are cached.
 const CACHE_SIZE: usize = 4096;
 /// A name the world says does not exist is remembered this long, so a
@@ -116,10 +120,14 @@ struct Waiting<'a> {
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
         let mut pending = self.pending.lock().unwrap();
-        let Some(lookup) = self.lookup.take() else { return };
+        let Some(lookup) = self.lookup.take() else {
+            return;
+        };
         // Clones are made and dropped only under this lock, so the count is
         // exact: the map's and this one mean no one else waits.
-        let mine = pending.get(self.name).is_some_and(|l| Arc::ptr_eq(l, &lookup));
+        let mine = pending
+            .get(self.name)
+            .is_some_and(|l| Arc::ptr_eq(l, &lookup));
         if mine && (lookup.initialized() || Arc::strong_count(&lookup) == 2) {
             pending.remove(self.name);
         }
@@ -132,7 +140,10 @@ impl Stack {
     pub(crate) fn new(fcx: &Cx, link: Link, addr: Ipv4Addr, dns: Ipv4Addr) -> Stack {
         let (tcp_end, udp_end, _icmp, _other) = ip::split_protocols(fcx, link);
         let unreachable = Arc::new(Unreachable::default());
-        let watched = Watch { inner: tcp_end, unreachable: unreachable.clone() };
+        let watched = Watch {
+            inner: tcp_end,
+            unreachable: unreachable.clone(),
+        };
         Stack {
             fcx: fcx.clone(),
             tcp: tcp::endpoint(fcx, watched, IpAddr::V4(addr)),
@@ -152,19 +163,38 @@ impl Stack {
     pub(crate) async fn resolve(&self, host: &Host) -> Result<Ipv4Addr, Fail> {
         let name = match host {
             Host::V4(a) => return Ok(*a),
-            Host::V6(_) => return Err(Fail::BadAddress("IPv6 is not supported: attach's stack is IPv4 only")),
+            Host::V6(_) => {
+                return Err(Fail::BadAddress(
+                    "IPv6 is not supported: attach's stack is IPv4 only",
+                ));
+            }
             Host::Name(n) => n,
         };
         let cached = || {
-            self.cache.lock().unwrap().get(name).filter(|(_, until)| Instant::now() < *until).map(|(a, _)| a.clone())
+            self.cache
+                .lock()
+                .unwrap()
+                .get(name)
+                .filter(|(_, until)| Instant::now() < *until)
+                .map(|(a, _)| a.clone())
         };
         if let Some(answer) = cached() {
             return answer;
         }
         // One lookup per name at a time. If the client that started it goes
         // away, the next one waiting runs the lookup instead.
-        let lookup = self.pending.lock().unwrap().entry(name.clone()).or_default().clone();
-        let waiting = Waiting { pending: &self.pending, name, lookup: Some(lookup) };
+        let lookup = self
+            .pending
+            .lock()
+            .unwrap()
+            .entry(name.clone())
+            .or_default()
+            .clone();
+        let waiting = Waiting {
+            pending: &self.pending,
+            name,
+            lookup: Some(lookup),
+        };
         // A lookup that finished between the check above and joining this
         // one has put its answer in the cache already.
         if let Some(answer) = cached() {
@@ -203,7 +233,9 @@ impl Stack {
             loop {
                 match tokio::time::timeout_at(deadline, socket.recv(&self.fcx)).await {
                     Err(_) => break,
-                    Ok(Err(RecvError::Closed | RecvError::Cancelled)) => return Err(Fail::WorldGone),
+                    Ok(Err(RecvError::Closed | RecvError::Cancelled)) => {
+                        return Err(Fail::WorldGone);
+                    }
                     Ok(Ok((bytes, from))) => match dns::answer(&bytes, from, self.dns, name, id) {
                         None => continue,
                         Some(Ok(found)) => return Ok(found),
@@ -213,7 +245,10 @@ impl Stack {
                 }
             }
         }
-        Err(Fail::Dns(format!("no answer from {} in 7 s", self.dns.ip())))
+        Err(Fail::Dns(format!(
+            "no answer from {} in 7 s",
+            self.dns.ip()
+        )))
     }
 
     /// A UDP socket on a free port from 49152 up, picked at random.
@@ -231,7 +266,11 @@ impl Stack {
 
     /// Looks `host` up and opens a TCP connection to it from the sandbox's
     /// address. Returns the connection and the address it went to.
-    pub(crate) async fn connect(&self, host: &Host, port: u16) -> Result<(TcpConnection, Ipv4Addr), Fail> {
+    pub(crate) async fn connect(
+        &self,
+        host: &Host,
+        port: u16,
+    ) -> Result<(TcpConnection, Ipv4Addr), Fail> {
         if port == 0 {
             return Err(Fail::BadAddress("port 0"));
         }
@@ -348,7 +387,12 @@ pub(crate) fn unreachable_about(p: &[u8]) -> Option<(SocketAddr, u8)> {
     if inner[0] >> 4 != 4 || inner_ihl < 20 || *inner.get(9)? != 6 {
         return None;
     }
-    let dst = Ipv4Addr::new(*inner.get(16)?, *inner.get(17)?, *inner.get(18)?, *inner.get(19)?);
+    let dst = Ipv4Addr::new(
+        *inner.get(16)?,
+        *inner.get(17)?,
+        *inner.get(18)?,
+        *inner.get(19)?,
+    );
     let tcp = inner.get(inner_ihl..inner_ihl + 4)?;
     let port = u16::from_be_bytes([tcp[2], tcp[3]]);
     Some((SocketAddr::new(IpAddr::V4(dst), port), code))
@@ -382,11 +426,15 @@ mod tests {
     /// An ICMP "host unreachable" from 10.0.0.1 about a SYN from
     /// 10.0.0.2:50000 to 192.0.2.7:443.
     fn host_unreachable() -> Vec<u8> {
-        let mut syn = vec![0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 10, 0, 0, 2, 192, 0, 2, 7];
+        let mut syn = vec![
+            0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 10, 0, 0, 2, 192, 0, 2, 7,
+        ];
         syn.extend_from_slice(&50000u16.to_be_bytes());
         syn.extend_from_slice(&443u16.to_be_bytes());
         syn.extend_from_slice(&[0; 16]);
-        let mut p = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2];
+        let mut p = vec![
+            0x45, 0, 0, 0, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
+        ];
         p.extend_from_slice(&[3, 1, 0, 0, 0, 0, 0, 0]);
         p.extend_from_slice(&syn);
         p
@@ -395,7 +443,10 @@ mod tests {
     #[test]
     fn icmp_unreachable_names_the_destination() {
         let p = host_unreachable();
-        assert_eq!(unreachable_about(&p), Some(("192.0.2.7:443".parse().unwrap(), 1)));
+        assert_eq!(
+            unreachable_about(&p),
+            Some(("192.0.2.7:443".parse().unwrap(), 1))
+        );
         // Not ICMP, not type 3, not about TCP, cut short.
         let mut udp = p.clone();
         udp[9] = 17;
@@ -424,8 +475,16 @@ mod tests {
                 live.push(rx);
             }
             let w = u.waiting.lock().unwrap();
-            assert!(w.senders <= 2 * (live.len() + 1) + 64 + 1, "{} senders for {} live", w.senders, live.len());
-            assert_eq!(w.senders, w.by_destination.values().map(Vec::len).sum::<usize>());
+            assert!(
+                w.senders <= 2 * (live.len() + 1) + 64 + 1,
+                "{} senders for {} live",
+                w.senders,
+                live.len()
+            );
+            assert_eq!(
+                w.senders,
+                w.by_destination.values().map(Vec::len).sum::<usize>()
+            );
         }
     }
 

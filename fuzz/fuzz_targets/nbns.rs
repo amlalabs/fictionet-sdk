@@ -3,11 +3,11 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::nbns::{
-    MAX_DATAGRAM, MAX_PACKET, Name, NbEntry, NodeName, NodeType, Packet, Error, RrName,
+    Error, MAX_DATAGRAM, MAX_PACKET, Name, NbEntry, NodeName, NodeType, Packet, RrName,
     decode_first_level, rcode,
 };
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 use std::net::Ipv4Addr;
 
@@ -47,7 +47,12 @@ fuzz_target!(|data: &[u8]| {
                 .map(|c| NbEntry {
                     group: c[0] & 1 != 0,
                     node_type: NodeType::from_bits(u16::from(c[0] >> 1)),
-                    address: Ipv4Addr::new(c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0), 1),
+                    address: Ipv4Addr::new(
+                        c[0],
+                        *c.get(1).unwrap_or(&0),
+                        *c.get(2).unwrap_or(&0),
+                        1,
+                    ),
                 })
                 .collect();
             let names: Vec<NodeName> = data

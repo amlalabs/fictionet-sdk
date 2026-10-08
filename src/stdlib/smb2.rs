@@ -75,8 +75,8 @@
 //! assert_eq!(out[..8], [0, 0, 0, 129, 0xfe, b'S', b'M', b'B']);
 //! ```
 
-use fictionet::stdlib::codec::{Prefixed, Frames};
-use fictionet::stdlib::codec::{le16, le32, le64, Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, le16, le32, le64};
+use fictionet::stdlib::codec::{Frames, Prefixed};
 
 /// The TCP port SMB servers listen on for direct TCP.
 pub const PORT: u16 = 445;
@@ -416,25 +416,37 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::FrameType(kind) => write!(f, "SMB direct TCP frame type {kind}, not zero"),
-            Error::Length { length, limit } => write!(f, "frame length {length}, more than {limit}"),
+            Error::Length { length, limit } => {
+                write!(f, "frame length {length}, more than {limit}")
+            }
             Error::Incomplete => f.write_str("incomplete SMB direct TCP frame"),
-            Error::Trailing { remaining } => write!(f, "{remaining} bytes after SMB direct TCP frame"),
+            Error::Trailing { remaining } => {
+                write!(f, "{remaining} bytes after SMB direct TCP frame")
+            }
             Error::Unwritable => f.write_str("SMB value cannot be written without changing it"),
             Error::Truncated => f.write_str("the bytes end inside a fixed part"),
             Error::Protocol(p) => write!(f, "protocol ID {p:02x?} is not SMB2"),
             Error::TooLong => write!(f, "a payload longer than {MAX_MESSAGE} bytes"),
             Error::HeaderSize(n) => write!(f, "header StructureSize {n}, not 64"),
-            Error::StructureSize(n) => write!(f, "body StructureSize {n} does not match the command"),
+            Error::StructureSize(n) => {
+                write!(f, "body StructureSize {n} does not match the command")
+            }
             Error::NextCommand(n) => write!(f, "NextCommand {n} is not a valid offset"),
             Error::TooMany => write!(f, "a compound chain of more than {MAX_CHAIN} messages"),
-            Error::Buffer => f.write_str("an offset and length outside the message or inside a fixed part"),
+            Error::Buffer => {
+                f.write_str("an offset and length outside the message or inside a fixed part")
+            }
             Error::Overlap => f.write_str("two buffers of one body overlap or are out of order"),
             Error::Align(n) => write!(f, "offset {n} is not 8-byte aligned"),
             Error::OddString => f.write_str("a UTF-16 string of an odd number of bytes"),
             Error::NoLocks => f.write_str("a LOCK request with no locks"),
             Error::NoDialects => f.write_str("a NEGOTIATE request with no dialects"),
-            Error::CompressionFlags(x) => write!(f, "compression flags {x:#06x} are not allowed here"),
-            Error::CompressionAlgorithm => f.write_str("an unchained compression header with algorithm NONE"),
+            Error::CompressionFlags(x) => {
+                write!(f, "compression flags {x:#06x} are not allowed here")
+            }
+            Error::CompressionAlgorithm => {
+                f.write_str("an unchained compression header with algorithm NONE")
+            }
             Error::TransformFlags(x) => write!(f, "transform header flags {x:#06x}, not 0x0001"),
             Error::NegotiateContexts => {
                 f.write_str("an SMB 3.1.1 NEGOTIATE response with missing or repeated contexts")
@@ -463,7 +475,9 @@ impl Frame {
     /// A direct TCP frame containing the complete serialized packet.
     /// Refuses packets that cannot be written without changing them.
     pub fn from_packet(packet: &Packet) -> Result<Self, Error> {
-        Ok(Self { payload: packet.to_bytes()? })
+        Ok(Self {
+            payload: packet.to_bytes()?,
+        })
     }
 }
 
@@ -476,7 +490,9 @@ impl Wire for Frame {
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         match Frames::<Frame>::new().decode(bytes, false)? {
             Step::Item(frame, used) if used == bytes.len() => Ok(frame),
-            Step::Item(_, used) => Err(Error::Trailing { remaining: bytes.len() - used }),
+            Step::Item(_, used) => Err(Error::Trailing {
+                remaining: bytes.len() - used,
+            }),
             _ => Err(Error::Incomplete),
         }
     }
@@ -519,10 +535,14 @@ impl Prefixed for Frame {
     const NAME: &'static str = "SMB direct TCP";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_MESSAGE }
+    fn default_limit() -> Self::Limit {
+        MAX_MESSAGE
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_MESSAGE) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_MESSAGE)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -531,22 +551,35 @@ impl Prefixed for Frame {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
-        let Some(&first) = input.first() else { return Ok(None) };
+        let Some(&first) = input.first() else {
+            return Ok(None);
+        };
         if first != 0 {
             return Err(Error::FrameType(first));
         }
-        let Some(&[_, a, b, c]) = input.get(..FRAME_HEADER_LEN) else { return Ok(None) };
+        let Some(&[_, a, b, c]) = input.get(..FRAME_HEADER_LEN) else {
+            return Ok(None);
+        };
         let length = (usize::from(a) << 16) | (usize::from(b) << 8) | usize::from(c);
         if length > limit {
             return Err(Error::Length { length, limit });
         }
         let end = FRAME_HEADER_LEN + length;
-        Ok(input.get(FRAME_HEADER_LEN..end).map(|payload| (Frame { payload: payload.to_vec() }, end)))
+        Ok(input.get(FRAME_HEADER_LEN..end).map(|payload| {
+            (
+                Frame {
+                    payload: payload.to_vec(),
+                },
+                end,
+            )
+        }))
     }
 }
-
 
 // ---------------------------------------------------------------------
 // Payloads
@@ -621,13 +654,26 @@ impl Packet {
         let last = messages.len() - 1;
         let mut total = 0usize;
         for (i, message) in messages.iter().enumerate() {
-            let size = HEADER_LEN.checked_add(message.body.len()).ok_or(Error::Unwritable)?;
-            let size = if i == last { size } else { size.checked_next_multiple_of(8).ok_or(Error::Unwritable)? };
-            total = total.checked_add(size).filter(|n| *n <= MAX_MESSAGE).ok_or(Error::Unwritable)?;
+            let size = HEADER_LEN
+                .checked_add(message.body.len())
+                .ok_or(Error::Unwritable)?;
+            let size = if i == last {
+                size
+            } else {
+                size.checked_next_multiple_of(8).ok_or(Error::Unwritable)?
+            };
+            total = total
+                .checked_add(size)
+                .filter(|n| *n <= MAX_MESSAGE)
+                .ok_or(Error::Unwritable)?;
             message.header.encode(0)?;
         }
         for message in &mut messages[..last] {
-            let size = message.body.len().checked_next_multiple_of(8).ok_or(Error::Unwritable)?;
+            let size = message
+                .body
+                .len()
+                .checked_next_multiple_of(8)
+                .ok_or(Error::Unwritable)?;
             message.body.resize(size, 0);
         }
         Ok(Self::Smb2(messages))
@@ -757,7 +803,11 @@ impl ChainedPayload {
     /// OriginalPayloadSize for the algorithms that have it (MS-SMB2
     /// section 2.2.42.2.1), and none for the rest.
     fn min_len(&self) -> usize {
-        if matches!(self.algorithm, 1 | 2 | 3 | 5) { 4 } else { 0 }
+        if matches!(self.algorithm, 1 | 2 | 3 | 5) {
+            4
+        } else {
+            0
+        }
     }
 }
 
@@ -789,7 +839,12 @@ impl Wire for Compressed {
             if offset as usize > data.len() {
                 return Err(Error::Buffer);
             }
-            return Ok(Compressed::Unchained { original_size, algorithm, offset, data });
+            return Ok(Compressed::Unchained {
+                original_size,
+                algorithm,
+                offset,
+                data,
+            });
         }
         if flags != COMPRESSION_FLAG_CHAINED {
             return Err(Error::CompressionFlags(flags));
@@ -806,14 +861,21 @@ impl Wire for Compressed {
             let start = at + 8;
             let end = start.checked_add(len).ok_or(Error::Buffer)?;
             let data = b.get(start..end).ok_or(Error::Buffer)?.to_vec();
-            let payload = ChainedPayload { algorithm, flags, data };
+            let payload = ChainedPayload {
+                algorithm,
+                flags,
+                data,
+            };
             if payload.data.len() < payload.min_len() {
                 return Err(Error::Buffer);
             }
             payloads.push(payload);
             at = end;
         }
-        Ok(Compressed::Chained { original_size, payloads })
+        Ok(Compressed::Chained {
+            original_size,
+            payloads,
+        })
     }
 
     /// Appends the compression header and data. Refuses invalid flags or
@@ -823,7 +885,12 @@ impl Wire for Compressed {
         let mut out = Vec::new();
         out.extend_from_slice(&protocol::COMPRESSION);
         match self {
-            Compressed::Unchained { original_size, algorithm, offset, data } => {
+            Compressed::Unchained {
+                original_size,
+                algorithm,
+                offset,
+                data,
+            } => {
                 if *algorithm == 0 {
                     return Err(Error::Unwritable);
                 }
@@ -837,8 +904,13 @@ impl Wire for Compressed {
                 out.extend_from_slice(&offset.to_le_bytes());
                 out.extend_from_slice(data);
             }
-            Compressed::Chained { original_size, payloads } => {
-                let Some(first) = payloads.first() else { return Err(Error::Unwritable) };
+            Compressed::Chained {
+                original_size,
+                payloads,
+            } => {
+                let Some(first) = payloads.first() else {
+                    return Err(Error::Unwritable);
+                };
                 if first.flags != COMPRESSION_FLAG_CHAINED
                     || payloads[1..].iter().any(|p| p.flags != 0)
                     || payloads.iter().any(|p| p.data.len() < p.min_len())
@@ -884,7 +956,10 @@ pub enum Target {
 
 impl Default for Target {
     fn default() -> Target {
-        Target::Sync { process_id: 0, tree_id: 0 }
+        Target::Sync {
+            process_id: 0,
+            tree_id: 0,
+        }
     }
 }
 
@@ -917,7 +992,12 @@ impl Header {
     /// A sync request header for `command` with `message_id`, asking for
     /// one credit, with everything else 0.
     pub fn new(command: u16, message_id: u64) -> Header {
-        Header { command, message_id, credits: 1, ..Header::default() }
+        Header {
+            command,
+            message_id,
+            credits: 1,
+            ..Header::default()
+        }
     }
 
     /// The header of a response to this request: the same command,
@@ -930,7 +1010,8 @@ impl Header {
             status,
             command: self.command,
             credits: self.credits.max(1),
-            flags: flags::SERVER_TO_REDIR | (self.flags & (flags::ASYNC_COMMAND | flags::RELATED_OPERATIONS)),
+            flags: flags::SERVER_TO_REDIR
+                | (self.flags & (flags::ASYNC_COMMAND | flags::RELATED_OPERATIONS)),
             message_id: self.message_id,
             target: self.target,
             session_id: self.session_id,
@@ -958,9 +1039,14 @@ impl Header {
         }
         let flags = le32(b, 16).ok_or(Error::Truncated)?;
         let target = if flags & flags::ASYNC_COMMAND != 0 {
-            Target::Async { async_id: le64(b, 32).ok_or(Error::Truncated)? }
+            Target::Async {
+                async_id: le64(b, 32).ok_or(Error::Truncated)?,
+            }
         } else {
-            Target::Sync { process_id: le32(b, 32).ok_or(Error::Truncated)?, tree_id: le32(b, 36).ok_or(Error::Truncated)? }
+            Target::Sync {
+                process_id: le32(b, 32).ok_or(Error::Truncated)?,
+                tree_id: le32(b, 36).ok_or(Error::Truncated)?,
+            }
         };
         let header = Header {
             credit_charge: le16(b, 6).ok_or(Error::Truncated)?,
@@ -981,8 +1067,16 @@ impl Header {
         let is_async = self.flags & flags::ASYNC_COMMAND != 0;
         let mut out = [0u8; HEADER_LEN];
         match (self.target, is_async) {
-            (Target::Async { async_id }, true) => out[32..40].copy_from_slice(&async_id.to_le_bytes()),
-            (Target::Sync { process_id, tree_id }, false) => {
+            (Target::Async { async_id }, true) => {
+                out[32..40].copy_from_slice(&async_id.to_le_bytes())
+            }
+            (
+                Target::Sync {
+                    process_id,
+                    tree_id,
+                },
+                false,
+            ) => {
                 out[32..36].copy_from_slice(&process_id.to_le_bytes());
                 out[36..40].copy_from_slice(&tree_id.to_le_bytes());
             }
@@ -1029,7 +1123,10 @@ impl Wire for Message {
         if next != 0 {
             return Err(Error::NextCommand(next));
         }
-        Ok(Self { header, body: bytes[HEADER_LEN..].to_vec() })
+        Ok(Self {
+            header,
+            body: bytes[HEADER_LEN..].to_vec(),
+        })
     }
 
     /// Appends one message with NextCommand zero. Refuses inconsistent async
@@ -1100,14 +1197,20 @@ fn read_chain(b: &[u8]) -> Result<Vec<Message>, Error> {
         }
         let (header, next) = Header::read(rest)?;
         if next == 0 {
-            out.push(Message { header, body: rest[HEADER_LEN..].to_vec() });
+            out.push(Message {
+                header,
+                body: rest[HEADER_LEN..].to_vec(),
+            });
             return Ok(out);
         }
         let n = next as usize;
         if n < HEADER_LEN || !n.is_multiple_of(8) || n > rest.len() {
             return Err(Error::NextCommand(next));
         }
-        out.push(Message { header, body: rest[HEADER_LEN..n].to_vec() });
+        out.push(Message {
+            header,
+            body: rest[HEADER_LEN..n].to_vec(),
+        });
         rest = &rest[n..];
     }
 }
@@ -1123,7 +1226,9 @@ fn write_messages(messages: &[Message]) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     for (i, m) in messages.iter().enumerate() {
         let last = i + 1 == messages.len();
-        let len = HEADER_LEN.checked_add(m.body.len()).ok_or(Error::Unwritable)?;
+        let len = HEADER_LEN
+            .checked_add(m.body.len())
+            .ok_or(Error::Unwritable)?;
         if !last && !len.is_multiple_of(8) {
             return Err(Error::Unwritable);
         }
@@ -1150,10 +1255,16 @@ pub struct FileId {
 impl FileId {
     /// The FileId that, in a compound request, means "the file the request
     /// before this one opened".
-    pub const RELATED: FileId = FileId { persistent: u64::MAX, volatile: u64::MAX };
+    pub const RELATED: FileId = FileId {
+        persistent: u64::MAX,
+        volatile: u64::MAX,
+    };
 
     fn read(b: &[u8], at: usize) -> Result<FileId, Error> {
-        Ok(FileId { persistent: le64(b, at).ok_or(Error::Truncated)?, volatile: le64(b, at + 8).ok_or(Error::Truncated)? })
+        Ok(FileId {
+            persistent: le64(b, at).ok_or(Error::Truncated)?,
+            volatile: le64(b, at + 8).ok_or(Error::Truncated)?,
+        })
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -1234,7 +1345,10 @@ impl NegotiateContext {
         }
         data.extend_from_slice(salt);
         fit16(data.len())?;
-        Ok(NegotiateContext { kind: negotiate_context::PREAUTH_INTEGRITY_CAPABILITIES, data })
+        Ok(NegotiateContext {
+            kind: negotiate_context::PREAUTH_INTEGRITY_CAPABILITIES,
+            data,
+        })
     }
 
     /// The hash algorithm IDs and salt of a preauthentication integrity
@@ -1247,7 +1361,9 @@ impl NegotiateContext {
         let d = &self.data;
         let hashes = usize::from(le16(d, 0).ok_or(Error::Truncated).ok()?);
         let salt = usize::from(le16(d, 2).ok_or(Error::Truncated).ok()?);
-        let list = (0..hashes).map(|i| le16(d, 4 + 2 * i).ok_or(Error::Truncated).ok()).collect::<Option<Vec<u16>>>()?;
+        let list = (0..hashes)
+            .map(|i| le16(d, 4 + 2 * i).ok_or(Error::Truncated).ok())
+            .collect::<Option<Vec<u16>>>()?;
         let start = 4 + 2 * hashes;
         Some((list, d.get(start..start + salt)?.to_vec()))
     }
@@ -1269,7 +1385,9 @@ impl NegotiateContext {
     /// `None` if its count does not fit its data.
     pub fn algorithm_list(&self) -> Option<Vec<u16>> {
         let n = usize::from(le16(&self.data, 0).ok_or(Error::Truncated).ok()?);
-        (0..n).map(|i| le16(&self.data, 2 + 2 * i).ok_or(Error::Truncated).ok()).collect()
+        (0..n)
+            .map(|i| le16(&self.data, 2 + 2 * i).ok_or(Error::Truncated).ok())
+            .collect()
     }
 }
 
@@ -1644,11 +1762,21 @@ impl Request {
                 if count == 0 {
                     return Err(Error::NoDialects);
                 }
-                let dialects = (0..count).map(|i| le16(b, 36 + 2 * i).ok_or(Error::Truncated)).collect::<Result<Vec<u16>, Error>>()?;
+                let dialects = (0..count)
+                    .map(|i| le16(b, 36 + 2 * i).ok_or(Error::Truncated))
+                    .collect::<Result<Vec<u16>, Error>>()?;
                 let (client_start_time, contexts) = if dialects.contains(&dialect::SMB_3_1_1) {
                     // The dialect list, as a buffer, from byte 36 of the body.
                     let list = (HEADER_LEN as u32 + 36, 2 * count as u32);
-                    (0, negotiate_contexts(b, le32(b, 28).ok_or(Error::Truncated)?, le16(b, 32).ok_or(Error::Truncated)?, list)?)
+                    (
+                        0,
+                        negotiate_contexts(
+                            b,
+                            le32(b, 28).ok_or(Error::Truncated)?,
+                            le16(b, 32).ok_or(Error::Truncated)?,
+                            list,
+                        )?,
+                    )
                 } else {
                     (le64(b, 28).ok_or(Error::Truncated)?, Vec::new())
                 };
@@ -1669,7 +1797,12 @@ impl Request {
                     capabilities: le32(b, 4).ok_or(Error::Truncated)?,
                     channel: le32(b, 8).ok_or(Error::Truncated)?,
                     previous_session_id: le64(b, 16).ok_or(Error::Truncated)?,
-                    security_buffer: buffer(b, le16(b, 12).ok_or(Error::Truncated)?.into(), le16(b, 14).ok_or(Error::Truncated)?.into())?.to_vec(),
+                    security_buffer: buffer(
+                        b,
+                        le16(b, 12).ok_or(Error::Truncated)?.into(),
+                        le16(b, 14).ok_or(Error::Truncated)?.into(),
+                    )?
+                    .to_vec(),
                 })
             }
             command::LOGOFF => {
@@ -1679,16 +1812,23 @@ impl Request {
             command::TREE_CONNECT => {
                 fixed(b, 9)?;
                 let flags = le16(b, 2).ok_or(Error::Truncated)?;
-                let path = (u32::from(le16(b, 4).ok_or(Error::Truncated)?), u32::from(le16(b, 6).ok_or(Error::Truncated)?));
+                let path = (
+                    u32::from(le16(b, 4).ok_or(Error::Truncated)?),
+                    u32::from(le16(b, 6).ok_or(Error::Truncated)?),
+                );
                 if flags & TREE_CONNECT_EXTENSION_PRESENT != 0 {
                     // The extension's 16-byte header comes first, at 72.
                     if b.len() < 8 + TREE_CONNECT_EXTENSION_LEN
-                        || (path.1 != 0 && path.0 < (HEADER_LEN + 8 + TREE_CONNECT_EXTENSION_LEN) as u32)
+                        || (path.1 != 0
+                            && path.0 < (HEADER_LEN + 8 + TREE_CONNECT_EXTENSION_LEN) as u32)
                     {
                         return Err(Error::Buffer);
                     }
                 }
-                Request::TreeConnect(TreeConnectRequest { flags, path: string(buffer(b, path.0, path.1)?)? })
+                Request::TreeConnect(TreeConnectRequest {
+                    flags,
+                    path: string(buffer(b, path.0, path.1)?)?,
+                })
             }
             command::TREE_DISCONNECT => {
                 fixed(b, 4)?;
@@ -1700,11 +1840,17 @@ impl Request {
                 if b.len() < 57 {
                     return Err(Error::Truncated);
                 }
-                let name = (u32::from(le16(b, 44).ok_or(Error::Truncated)?), u32::from(le16(b, 46).ok_or(Error::Truncated)?));
+                let name = (
+                    u32::from(le16(b, 44).ok_or(Error::Truncated)?),
+                    u32::from(le16(b, 46).ok_or(Error::Truncated)?),
+                );
                 if name.1 != 0 && !name.0.is_multiple_of(8) {
                     return Err(Error::Align(name.0));
                 }
-                let region = (le32(b, 48).ok_or(Error::Truncated)?, le32(b, 52).ok_or(Error::Truncated)?);
+                let region = (
+                    le32(b, 48).ok_or(Error::Truncated)?,
+                    le32(b, 52).ok_or(Error::Truncated)?,
+                );
                 let name_bytes = buffer(b, name.0, name.1)?;
                 let region_bytes = buffer(b, region.0, region.1)?;
                 if region.1 != 0 {
@@ -1724,11 +1870,16 @@ impl Request {
             }
             command::CLOSE => {
                 fixed(b, 24)?;
-                Request::Close { flags: le16(b, 2).ok_or(Error::Truncated)?, file_id: FileId::read(b, 8)? }
+                Request::Close {
+                    flags: le16(b, 2).ok_or(Error::Truncated)?,
+                    file_id: FileId::read(b, 8)?,
+                }
             }
             command::FLUSH => {
                 fixed(b, 24)?;
-                Request::Flush { file_id: FileId::read(b, 8)? }
+                Request::Flush {
+                    file_id: FileId::read(b, 8)?,
+                }
             }
             command::READ => {
                 fixed(b, 49)?;
@@ -1737,7 +1888,12 @@ impl Request {
                 let channel_info = if channel == 0 {
                     Vec::new()
                 } else {
-                    buffer(b, le16(b, 44).ok_or(Error::Truncated)?.into(), le16(b, 46).ok_or(Error::Truncated)?.into())?.to_vec()
+                    buffer(
+                        b,
+                        le16(b, 44).ok_or(Error::Truncated)?.into(),
+                        le16(b, 46).ok_or(Error::Truncated)?.into(),
+                    )?
+                    .to_vec()
                 };
                 Request::Read(ReadRequest {
                     padding: b[2],
@@ -1753,11 +1909,22 @@ impl Request {
             }
             command::WRITE => {
                 fixed(b, 49)?;
-                let data = (u32::from(le16(b, 2).ok_or(Error::Truncated)?), le32(b, 4).ok_or(Error::Truncated)?);
+                let data = (
+                    u32::from(le16(b, 2).ok_or(Error::Truncated)?),
+                    le32(b, 4).ok_or(Error::Truncated)?,
+                );
                 let channel = le32(b, 32).ok_or(Error::Truncated)?;
                 // With channel NONE the server ignores the channel info.
-                let info = if channel == 0 { (0, 0) } else { (u32::from(le16(b, 40).ok_or(Error::Truncated)?), u32::from(le16(b, 42).ok_or(Error::Truncated)?)) };
-                let (data_bytes, info_bytes) = (buffer(b, data.0, data.1)?, buffer(b, info.0, info.1)?);
+                let info = if channel == 0 {
+                    (0, 0)
+                } else {
+                    (
+                        u32::from(le16(b, 40).ok_or(Error::Truncated)?),
+                        u32::from(le16(b, 42).ok_or(Error::Truncated)?),
+                    )
+                };
+                let (data_bytes, info_bytes) =
+                    (buffer(b, data.0, data.1)?, buffer(b, info.0, info.1)?);
                 apart(data, info)?;
                 Request::Write(WriteRequest {
                     offset: le64(b, 8).ok_or(Error::Truncated)?,
@@ -1782,10 +1949,18 @@ impl Request {
                 let locks = (0..count)
                     .map(|i| {
                         let at = 24 + 24 * i;
-                        Ok(Lock { offset: le64(b, at).ok_or(Error::Truncated)?, length: le64(b, at + 8).ok_or(Error::Truncated)?, flags: le32(b, at + 16).ok_or(Error::Truncated)? })
+                        Ok(Lock {
+                            offset: le64(b, at).ok_or(Error::Truncated)?,
+                            length: le64(b, at + 8).ok_or(Error::Truncated)?,
+                            flags: le32(b, at + 16).ok_or(Error::Truncated)?,
+                        })
                     })
                     .collect::<Result<Vec<Lock>, Error>>()?;
-                Request::Lock(LockRequest { lock_sequence: le32(b, 4).ok_or(Error::Truncated)?, file_id: FileId::read(b, 8)?, locks })
+                Request::Lock(LockRequest {
+                    lock_sequence: le32(b, 4).ok_or(Error::Truncated)?,
+                    file_id: FileId::read(b, 8)?,
+                    locks,
+                })
             }
             command::IOCTL => {
                 fixed(b, 57)?;
@@ -1793,7 +1968,11 @@ impl Request {
                 if le32(b, 40).ok_or(Error::Truncated)? != 0 {
                     return Err(Error::Buffer);
                 }
-                let input = buffer(b, le32(b, 24).ok_or(Error::Truncated)?, le32(b, 28).ok_or(Error::Truncated)?)?;
+                let input = buffer(
+                    b,
+                    le32(b, 24).ok_or(Error::Truncated)?,
+                    le32(b, 28).ok_or(Error::Truncated)?,
+                )?;
                 Request::Ioctl(IoctlRequest {
                     ctl_code: le32(b, 4).ok_or(Error::Truncated)?,
                     file_id: FileId::read(b, 8)?,
@@ -1819,7 +1998,11 @@ impl Request {
                     flags: b[3],
                     file_index: le32(b, 4).ok_or(Error::Truncated)?,
                     file_id: FileId::read(b, 8)?,
-                    pattern: string(buffer(b, le16(b, 24).ok_or(Error::Truncated)?.into(), le16(b, 26).ok_or(Error::Truncated)?.into())?)?,
+                    pattern: string(buffer(
+                        b,
+                        le16(b, 24).ok_or(Error::Truncated)?.into(),
+                        le16(b, 26).ok_or(Error::Truncated)?.into(),
+                    )?)?,
                     output_buffer_length: le32(b, 28).ok_or(Error::Truncated)?,
                 })
             }
@@ -1838,7 +2021,12 @@ impl Request {
                     info_type: b[2],
                     file_info_class: b[3],
                     output_buffer_length: le32(b, 4).ok_or(Error::Truncated)?,
-                    input: buffer(b, le16(b, 8).ok_or(Error::Truncated)?.into(), le32(b, 12).ok_or(Error::Truncated)?)?.to_vec(),
+                    input: buffer(
+                        b,
+                        le16(b, 8).ok_or(Error::Truncated)?.into(),
+                        le32(b, 12).ok_or(Error::Truncated)?,
+                    )?
+                    .to_vec(),
                     additional_information: le32(b, 16).ok_or(Error::Truncated)?,
                     flags: le32(b, 20).ok_or(Error::Truncated)?,
                     file_id: FileId::read(b, 24)?,
@@ -1849,12 +2037,20 @@ impl Request {
                 Request::SetInfo(SetInfoRequest {
                     info_type: b[2],
                     file_info_class: b[3],
-                    data: buffer(b, le16(b, 8).ok_or(Error::Truncated)?.into(), le32(b, 4).ok_or(Error::Truncated)?)?.to_vec(),
+                    data: buffer(
+                        b,
+                        le16(b, 8).ok_or(Error::Truncated)?.into(),
+                        le32(b, 4).ok_or(Error::Truncated)?,
+                    )?
+                    .to_vec(),
                     additional_information: le32(b, 12).ok_or(Error::Truncated)?,
                     file_id: FileId::read(b, 16)?,
                 })
             }
-            command => Request::Other { command, body: b.to_vec() },
+            command => Request::Other {
+                command,
+                body: b.to_vec(),
+            },
         })
     }
 
@@ -1900,13 +2096,22 @@ impl Request {
                 put64(&mut w, r.previous_session_id);
                 w.extend_from_slice(&r.security_buffer);
             }
-            Request::Logoff | Request::TreeDisconnect | Request::Cancel | Request::Echo => put32(&mut w, 4),
+            Request::Logoff | Request::TreeDisconnect | Request::Cancel | Request::Echo => {
+                put32(&mut w, 4)
+            }
             Request::TreeConnect(r) => {
                 let path = string16(&r.path)?;
                 let extended = r.flags & TREE_CONNECT_EXTENSION_PRESENT != 0;
                 put16(&mut w, 9);
                 put16(&mut w, r.flags);
-                put16(&mut w, if extended { (HEADER_LEN + 8 + TREE_CONNECT_EXTENSION_LEN) as u16 } else { 72 });
+                put16(
+                    &mut w,
+                    if extended {
+                        (HEADER_LEN + 8 + TREE_CONNECT_EXTENSION_LEN) as u16
+                    } else {
+                        72
+                    },
+                );
                 put16(&mut w, fit16(path.len())?);
                 if extended {
                     // An extension with no tree connect contexts: offset
@@ -1923,7 +2128,13 @@ impl Request {
                 put32(&mut w, r.impersonation_level);
                 put64(&mut w, 0);
                 put64(&mut w, 0);
-                for v in [r.desired_access, r.file_attributes, r.share_access, r.create_disposition, r.create_options] {
+                for v in [
+                    r.desired_access,
+                    r.file_attributes,
+                    r.share_access,
+                    r.create_disposition,
+                    r.create_options,
+                ] {
                     put32(&mut w, v);
                 }
                 put16(&mut w, 120);
@@ -1971,7 +2182,11 @@ impl Request {
                 let info_len = fit16(r.channel_info.len())?;
                 let data_first = r.channel_info.is_empty() || fit16(112 + r.data.len()).is_ok();
                 let (data_at, info_at) = if data_first {
-                    let info_at = if r.channel_info.is_empty() { 0 } else { fit16(112 + r.data.len())? };
+                    let info_at = if r.channel_info.is_empty() {
+                        0
+                    } else {
+                        fit16(112 + r.data.len())?
+                    };
                     (112, info_at)
                 } else {
                     (fit16(112 + r.channel_info.len())?, 112)
@@ -2295,20 +2510,33 @@ impl Response {
         if error_body(command, status, le16(b, 0).ok_or(Error::Truncated).ok()) {
             fixed(b, 9)?;
             let n = le32(b, 4).ok_or(Error::Truncated)? as usize;
-            let data = b.get(8..8usize.checked_add(n).ok_or(Error::Buffer)?).ok_or(Error::Buffer)?;
+            let data = b
+                .get(8..8usize.checked_add(n).ok_or(Error::Buffer)?)
+                .ok_or(Error::Buffer)?;
             if !error_contexts_fit(b[2], data) {
                 return Err(Error::Buffer);
             }
-            return Ok(Response::Error(ErrorResponse { context_count: b[2], data: data.to_vec() }));
+            return Ok(Response::Error(ErrorResponse {
+                context_count: b[2],
+                data: data.to_vec(),
+            }));
         }
         Ok(match command {
             command::NEGOTIATE => {
                 fixed(b, 65)?;
                 let dialect = le16(b, 4).ok_or(Error::Truncated)?;
-                let security = (u32::from(le16(b, 56).ok_or(Error::Truncated)?), u32::from(le16(b, 58).ok_or(Error::Truncated)?));
+                let security = (
+                    u32::from(le16(b, 56).ok_or(Error::Truncated)?),
+                    u32::from(le16(b, 58).ok_or(Error::Truncated)?),
+                );
                 let security_buffer = buffer(b, security.0, security.1)?.to_vec();
                 let contexts = if dialect == dialect::SMB_3_1_1 {
-                    let contexts = negotiate_contexts(b, le32(b, 60).ok_or(Error::Truncated)?, le16(b, 6).ok_or(Error::Truncated)?, security)?;
+                    let contexts = negotiate_contexts(
+                        b,
+                        le32(b, 60).ok_or(Error::Truncated)?,
+                        le16(b, 6).ok_or(Error::Truncated)?,
+                        security,
+                    )?;
                     if !response_contexts_ok(&contexts) {
                         return Err(Error::NegotiateContexts);
                     }
@@ -2334,7 +2562,12 @@ impl Response {
                 fixed(b, 9)?;
                 Response::SessionSetup {
                     session_flags: le16(b, 2).ok_or(Error::Truncated)?,
-                    security_buffer: buffer(b, le16(b, 4).ok_or(Error::Truncated)?.into(), le16(b, 6).ok_or(Error::Truncated)?.into())?.to_vec(),
+                    security_buffer: buffer(
+                        b,
+                        le16(b, 4).ok_or(Error::Truncated)?.into(),
+                        le16(b, 6).ok_or(Error::Truncated)?.into(),
+                    )?
+                    .to_vec(),
                 }
             }
             command::LOGOFF => fixed(b, 4).map(|_| Response::Logoff)?,
@@ -2359,7 +2592,10 @@ impl Response {
                     info: FileInfo::read(b, 8)?,
                     file_id: FileId::read(b, 64)?,
                     contexts: {
-                        let region = (le32(b, 80).ok_or(Error::Truncated)?, le32(b, 84).ok_or(Error::Truncated)?);
+                        let region = (
+                            le32(b, 80).ok_or(Error::Truncated)?,
+                            le32(b, 84).ok_or(Error::Truncated)?,
+                        );
                         let bytes = buffer(b, region.0, region.1)?;
                         if region.1 != 0 {
                             contexts_after(region.0, (0, 0))?;
@@ -2370,7 +2606,10 @@ impl Response {
             }
             command::CLOSE => {
                 fixed(b, 60)?;
-                Response::Close { flags: le16(b, 2).ok_or(Error::Truncated)?, info: FileInfo::read(b, 8)? }
+                Response::Close {
+                    flags: le16(b, 2).ok_or(Error::Truncated)?,
+                    info: FileInfo::read(b, 8)?,
+                }
             }
             command::FLUSH => fixed(b, 4).map(|_| Response::Flush)?,
             command::READ => {
@@ -2383,21 +2622,32 @@ impl Response {
             }
             command::WRITE => {
                 fixed(b, 17)?;
-                Response::Write { count: le32(b, 4).ok_or(Error::Truncated)?, remaining: le32(b, 8).ok_or(Error::Truncated)? }
+                Response::Write {
+                    count: le32(b, 4).ok_or(Error::Truncated)?,
+                    remaining: le32(b, 8).ok_or(Error::Truncated)?,
+                }
             }
             command::LOCK => fixed(b, 4).map(|_| Response::Lock)?,
             command::IOCTL => {
                 fixed(b, 49)?;
-                let input = (le32(b, 24).ok_or(Error::Truncated)?, le32(b, 28).ok_or(Error::Truncated)?);
-                let output = (le32(b, 32).ok_or(Error::Truncated)?, le32(b, 36).ok_or(Error::Truncated)?);
-                let (input_bytes, output_bytes) = (buffer(b, input.0, input.1)?, buffer(b, output.0, output.1)?);
+                let input = (
+                    le32(b, 24).ok_or(Error::Truncated)?,
+                    le32(b, 28).ok_or(Error::Truncated)?,
+                );
+                let output = (
+                    le32(b, 32).ok_or(Error::Truncated)?,
+                    le32(b, 36).ok_or(Error::Truncated)?,
+                );
+                let (input_bytes, output_bytes) =
+                    (buffer(b, input.0, input.1)?, buffer(b, output.0, output.1)?);
                 // 2.2.32: output starts at the end of the input rounded up
                 // to a multiple of 8. Padding past that is allowed.
                 if output.1 != 0 {
                     if !output.0.is_multiple_of(8) {
                         return Err(Error::Align(output.0));
                     }
-                    if input.1 != 0 && u64::from(output.0) < u64::from(input.0) + u64::from(input.1) {
+                    if input.1 != 0 && u64::from(output.0) < u64::from(input.0) + u64::from(input.1)
+                    {
                         return Err(Error::Overlap);
                     }
                 }
@@ -2465,7 +2715,9 @@ impl Response {
         match self {
             Response::Negotiate(r) => {
                 let is_311 = r.dialect == dialect::SMB_3_1_1;
-                if (!is_311 && !r.contexts.is_empty()) || (is_311 && !response_contexts_ok(&r.contexts)) {
+                if (!is_311 && !r.contexts.is_empty())
+                    || (is_311 && !response_contexts_ok(&r.contexts))
+                {
                     return Err(Error::Unwritable);
                 }
                 put16(&mut w, 65);
@@ -2473,7 +2725,12 @@ impl Response {
                 put16(&mut w, r.dialect);
                 put16(&mut w, 0);
                 w.extend_from_slice(&r.server_guid);
-                for v in [r.capabilities, r.max_transact_size, r.max_read_size, r.max_write_size] {
+                for v in [
+                    r.capabilities,
+                    r.max_transact_size,
+                    r.max_read_size,
+                    r.max_write_size,
+                ] {
                     put32(&mut w, v);
                 }
                 put64(&mut w, r.system_time);
@@ -2491,16 +2748,21 @@ impl Response {
                     w[60..64].copy_from_slice(&at.to_le_bytes());
                 }
             }
-            Response::SessionSetup { session_flags, security_buffer } => {
+            Response::SessionSetup {
+                session_flags,
+                security_buffer,
+            } => {
                 put16(&mut w, 9);
                 put16(&mut w, *session_flags);
                 put16(&mut w, 72);
                 put16(&mut w, fit16(security_buffer.len())?);
                 w.extend_from_slice(security_buffer);
             }
-            Response::Logoff | Response::TreeDisconnect | Response::Flush | Response::Lock | Response::Echo => {
-                put32(&mut w, 4)
-            }
+            Response::Logoff
+            | Response::TreeDisconnect
+            | Response::Flush
+            | Response::Lock
+            | Response::Echo => put32(&mut w, 4),
             Response::TreeConnect(r) => {
                 put16(&mut w, 16);
                 w.push(r.share_type);
@@ -2526,7 +2788,11 @@ impl Response {
                 put32(&mut w, 0);
                 info.write(&mut w);
             }
-            Response::Read { data, data_remaining, flags } => {
+            Response::Read {
+                data,
+                data_remaining,
+                flags,
+            } => {
                 put16(&mut w, 17);
                 w.push(80);
                 w.push(0);
@@ -2550,7 +2816,11 @@ impl Response {
                 // The output starts 8-byte aligned after the input, and
                 // its offset is 0 when there is none.
                 let input_end = fit32(112 + r.input.len())?;
-                let out_at = if r.output.is_empty() { 0 } else { input_end.next_multiple_of(8) };
+                let out_at = if r.output.is_empty() {
+                    0
+                } else {
+                    input_end.next_multiple_of(8)
+                };
                 put32(&mut w, 112);
                 put32(&mut w, fit32(r.input.len())?);
                 put32(&mut w, out_at);
@@ -2559,12 +2829,18 @@ impl Response {
                 put32(&mut w, 0);
                 w.extend_from_slice(&r.input);
                 if !r.output.is_empty() {
-                    too_long(HEADER_LEN.saturating_add(out_at as usize).saturating_add(r.output.len()))?;
+                    too_long(
+                        HEADER_LEN
+                            .saturating_add(out_at as usize)
+                            .saturating_add(r.output.len()),
+                    )?;
                     w.resize(out_at as usize - HEADER_LEN, 0);
                     w.extend_from_slice(&r.output);
                 }
             }
-            Response::QueryDirectory { data } | Response::ChangeNotify { data } | Response::QueryInfo { data } => {
+            Response::QueryDirectory { data }
+            | Response::ChangeNotify { data }
+            | Response::QueryInfo { data } => {
                 put16(&mut w, 9);
                 put16(&mut w, 72);
                 put32(&mut w, fit32(data.len())?);
@@ -2597,13 +2873,17 @@ fn error_body(command: u16, status: u32, size: Option<u16>) -> bool {
     if status == status::SUCCESS {
         return false;
     }
-    let Some(own) = own_size(command) else { return size == Some(9) };
+    let Some(own) = own_size(command) else {
+        return size == Some(9);
+    };
     match (command, status) {
         (command::SESSION_SETUP, status::MORE_PROCESSING_REQUIRED)
         | (command::QUERY_INFO, status::BUFFER_OVERFLOW)
         | (command::CHANGE_NOTIFY, status::NOTIFY_ENUM_DIR) => false,
         (command::READ, status::BUFFER_OVERFLOW)
-        | (command::IOCTL, status::BUFFER_OVERFLOW | status::INVALID_PARAMETER) => size != Some(own),
+        | (command::IOCTL, status::BUFFER_OVERFLOW | status::INVALID_PARAMETER) => {
+            size != Some(own)
+        }
         _ => true,
     }
 }
@@ -2618,11 +2898,15 @@ fn error_contexts_fit(count: u8, data: &[u8]) -> bool {
         if i > 0 {
             at = at.next_multiple_of(8);
         }
-        let Ok(len) = le32(data, at).ok_or(Error::Truncated) else { return false };
+        let Ok(len) = le32(data, at).ok_or(Error::Truncated) else {
+            return false;
+        };
         if le32(data, at + 4).ok_or(Error::Truncated).is_err() {
             return false;
         }
-        let Some(end) = (at + 8).checked_add(len as usize) else { return false };
+        let Some(end) = (at + 8).checked_add(len as usize) else {
+            return false;
+        };
         if end > data.len() {
             return false;
         }
@@ -2655,8 +2939,15 @@ fn response_contexts_ok(contexts: &[NegotiateContext]) -> bool {
 fn own_size(command: u16) -> Option<u16> {
     Some(match command {
         command::NEGOTIATE => 65,
-        command::SESSION_SETUP | command::QUERY_DIRECTORY | command::CHANGE_NOTIFY | command::QUERY_INFO => 9,
-        command::LOGOFF | command::TREE_DISCONNECT | command::FLUSH | command::LOCK | command::ECHO => 4,
+        command::SESSION_SETUP
+        | command::QUERY_DIRECTORY
+        | command::CHANGE_NOTIFY
+        | command::QUERY_INFO => 9,
+        command::LOGOFF
+        | command::TREE_DISCONNECT
+        | command::FLUSH
+        | command::LOCK
+        | command::ECHO => 4,
         command::TREE_CONNECT => 16,
         command::CREATE => 89,
         command::CLOSE => 60,
@@ -2691,7 +2982,12 @@ fn fixed(b: &[u8], size: u16) -> Result<(), Error> {
 /// A QUERY_DIRECTORY, CHANGE_NOTIFY or QUERY_INFO response's output.
 fn output(b: &[u8]) -> Result<Vec<u8>, Error> {
     fixed(b, 9)?;
-    Ok(buffer(b, le16(b, 2).ok_or(Error::Truncated)?.into(), le32(b, 4).ok_or(Error::Truncated)?)?.to_vec())
+    Ok(buffer(
+        b,
+        le16(b, 2).ok_or(Error::Truncated)?.into(),
+        le32(b, 4).ok_or(Error::Truncated)?,
+    )?
+    .to_vec())
 }
 
 /// The bytes at `offset`, counted from the header's start, and `len` long.
@@ -2704,7 +3000,9 @@ fn buffer(b: &[u8], offset: u32, len: u32) -> Result<&[u8], Error> {
         return Ok(&[]);
     }
     let fixed = usize::from(le16(b, 0).ok_or(Error::Truncated)? & !1);
-    let start = (offset as usize).checked_sub(HEADER_LEN).ok_or(Error::Buffer)?;
+    let start = (offset as usize)
+        .checked_sub(HEADER_LEN)
+        .ok_or(Error::Buffer)?;
     if start < fixed {
         return Err(Error::Buffer);
     }
@@ -2741,7 +3039,11 @@ fn string(b: &[u8]) -> Result<Vec<u16>, Error> {
     if !b.len().is_multiple_of(2) {
         return Err(Error::OddString);
     }
-    Ok(b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+    Ok(b.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect())
 }
 
 /// Code units as UTF-16LE bytes for a 16-bit length field, checked
@@ -2759,13 +3061,20 @@ fn unstring(units: &[u16]) -> Vec<u8> {
 /// Negotiate contexts: `count` of them from `offset`, each 8-byte aligned
 /// from the header's start. The first starts after the body's fixed part
 /// and after the buffer `before` (see [`contexts_after`]).
-fn negotiate_contexts(b: &[u8], offset: u32, count: u16, before: (u32, u32)) -> Result<Vec<NegotiateContext>, Error> {
+fn negotiate_contexts(
+    b: &[u8],
+    offset: u32,
+    count: u16,
+    before: (u32, u32),
+) -> Result<Vec<NegotiateContext>, Error> {
     let mut out = Vec::new();
     if count == 0 {
         return Ok(out);
     }
     let fixed = usize::from(le16(b, 0).ok_or(Error::Truncated)? & !1);
-    let mut at = (offset as usize).checked_sub(HEADER_LEN).ok_or(Error::Buffer)?;
+    let mut at = (offset as usize)
+        .checked_sub(HEADER_LEN)
+        .ok_or(Error::Buffer)?;
     if at < fixed {
         return Err(Error::Buffer);
     }
@@ -2774,12 +3083,21 @@ fn negotiate_contexts(b: &[u8], offset: u32, count: u16, before: (u32, u32)) -> 
         if i > 0 {
             at = at.checked_next_multiple_of(8).ok_or(Error::Buffer)?;
         }
-        let kind = le16(b, at).ok_or(Error::Truncated).map_err(|_| Error::Buffer)?;
-        let len = usize::from(le16(b, at.checked_add(2).ok_or(Error::Buffer)?).ok_or(Error::Truncated).map_err(|_| Error::Buffer)?);
+        let kind = le16(b, at)
+            .ok_or(Error::Truncated)
+            .map_err(|_| Error::Buffer)?;
+        let len = usize::from(
+            le16(b, at.checked_add(2).ok_or(Error::Buffer)?)
+                .ok_or(Error::Truncated)
+                .map_err(|_| Error::Buffer)?,
+        );
         let start = at.checked_add(8).ok_or(Error::Buffer)?;
         let end = start.checked_add(len).ok_or(Error::Buffer)?;
         let data = b.get(start..end).ok_or(Error::Buffer)?;
-        out.push(NegotiateContext { kind, data: data.to_vec() });
+        out.push(NegotiateContext {
+            kind,
+            data: data.to_vec(),
+        });
         at = end;
     }
     Ok(out)
@@ -2831,10 +3149,19 @@ fn create_contexts(region: &[u8]) -> Result<Vec<CreateContext>, Error> {
             if len == 0 {
                 return Ok(Vec::new());
             }
-            Ok(this.get(off..off.checked_add(len).ok_or(Error::Buffer)?).ok_or(Error::Buffer)?.to_vec())
+            Ok(this
+                .get(off..off.checked_add(len).ok_or(Error::Buffer)?)
+                .ok_or(Error::Buffer)?
+                .to_vec())
         };
-        let (name_at, name_len) = (le16(rest, 4).ok_or(Error::Truncated)?, le16(rest, 6).ok_or(Error::Truncated)?);
-        let (data_at, data_len) = (le16(rest, 10).ok_or(Error::Truncated)?, le32(rest, 12).ok_or(Error::Truncated)?);
+        let (name_at, name_len) = (
+            le16(rest, 4).ok_or(Error::Truncated)?,
+            le16(rest, 6).ok_or(Error::Truncated)?,
+        );
+        let (data_at, data_len) = (
+            le16(rest, 10).ok_or(Error::Truncated)?,
+            le32(rest, 12).ok_or(Error::Truncated)?,
+        );
         if name_len != 0 {
             if name_at < 16 {
                 return Err(Error::Buffer);
@@ -2851,7 +3178,10 @@ fn create_contexts(region: &[u8]) -> Result<Vec<CreateContext>, Error> {
             if data_at % 8 != 0 {
                 return Err(Error::Align(data_at.into()));
             }
-            apart((name_at.into(), name_len.into()), (data_at.into(), data_len))?;
+            apart(
+                (name_at.into(), name_len.into()),
+                (data_at.into(), data_len),
+            )?;
         }
         let name = field(usize::from(name_at), usize::from(name_len))?;
         let data = field(usize::from(data_at), data_len as usize)?;
@@ -2865,7 +3195,11 @@ fn create_contexts(region: &[u8]) -> Result<Vec<CreateContext>, Error> {
 
 /// Writes create contexts after the bytes already in `w`, 8-byte aligned,
 /// and puts their offset and length at `field` in the fixed part.
-fn write_create_contexts(w: &mut Vec<u8>, contexts: &[CreateContext], field: usize) -> Result<(), Error> {
+fn write_create_contexts(
+    w: &mut Vec<u8>,
+    contexts: &[CreateContext],
+    field: usize,
+) -> Result<(), Error> {
     if contexts.is_empty() {
         return Ok(());
     }
@@ -2874,11 +3208,23 @@ fn write_create_contexts(w: &mut Vec<u8>, contexts: &[CreateContext], field: usi
     for (i, c) in contexts.iter().enumerate() {
         let here = w.len();
         let name_end = 16usize.checked_add(c.name.len()).ok_or(Error::Unwritable)?;
-        let data_at = if c.data.is_empty() { 0 } else { name_end.next_multiple_of(8) };
-        let size = if c.data.is_empty() { name_end } else { data_at.saturating_add(c.data.len()) };
+        let data_at = if c.data.is_empty() {
+            0
+        } else {
+            name_end.next_multiple_of(8)
+        };
+        let size = if c.data.is_empty() {
+            name_end
+        } else {
+            data_at.saturating_add(c.data.len())
+        };
         too_long(here.saturating_add(size))?;
         let last = i + 1 == contexts.len();
-        let next = if last { 0 } else { fit32(size.next_multiple_of(8))? };
+        let next = if last {
+            0
+        } else {
+            fit32(size.next_multiple_of(8))?
+        };
         put32(w, next);
         put16(w, 16);
         put16(w, fit16(c.name.len())?);
@@ -2924,7 +3270,11 @@ fn pad8(w: &mut Vec<u8>) {
 }
 
 fn too_long(n: usize) -> Result<(), Error> {
-    if n > MAX_MESSAGE { Err(Error::Unwritable) } else { Ok(()) }
+    if n > MAX_MESSAGE {
+        Err(Error::Unwritable)
+    } else {
+        Ok(())
+    }
 }
 
 fn fit16(n: usize) -> Result<u16, Error> {
@@ -2950,7 +3300,9 @@ fn put64(w: &mut Vec<u8>, v: u64) {
 
 fn arr<const N: usize>(b: &[u8], at: usize) -> Result<[u8; N], Error> {
     let end = at.checked_add(N).ok_or(Error::Truncated)?;
-    b.get(at..end).and_then(|s| s.try_into().ok()).ok_or(Error::Truncated)
+    b.get(at..end)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(Error::Truncated)
 }
 
 /// Checks shared by this module's tests and its fuzz target.
@@ -2963,19 +3315,19 @@ pub mod harness {
     pub fn no_longer(command: u16, new: &[u8], old: &[u8]) -> bool {
         let slack = if command == command::CREATE { 7 } else { 0 };
         new.len() <= old.len() + slack
-            || new.get(..2).is_some_and(|s| new.len() <= usize::from(u16::from_le_bytes([s[0], s[1]])))
+            || new
+                .get(..2)
+                .is_some_and(|s| new.len() <= usize::from(u16::from_le_bytes([s[0], s[1]])))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::no_longer;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     // The byte layouts below are built field by field from MS-SMB2,
@@ -3026,15 +3378,28 @@ mod tests {
             ..NegotiateRequest::default()
         });
         let hello = Message::from_request(Header::new(command::NEGOTIATE, 0), &negotiate).unwrap();
-        let bytes = Packet::Smb2(vec![hello]).to_bytes().and_then(|payload| Frame { payload }.to_bytes()).unwrap();
+        let bytes = Packet::Smb2(vec![hello])
+            .to_bytes()
+            .and_then(|payload| Frame { payload }.to_bytes())
+            .unwrap();
         let mut decoder = Stream::new(Frames::<Frame>::new());
         assert_eq!(decoder.push(&bytes[..10]), 10);
         assert_eq!(decoder.next(), None);
         assert_eq!(decoder.push(&bytes[10..]), bytes.len() - 10);
         let payload = decoder.next().unwrap().unwrap();
-        let Packet::Smb2(messages) = Packet::parse(&payload.payload).unwrap() else { panic!() };
-        let Ok(Request::Negotiate(offer)) = messages[0].request() else { panic!() };
-        let chosen = offer.dialects.iter().copied().filter(|&d| d <= dialect::SMB_3_0_2).max().unwrap();
+        let Packet::Smb2(messages) = Packet::parse(&payload.payload).unwrap() else {
+            panic!()
+        };
+        let Ok(Request::Negotiate(offer)) = messages[0].request() else {
+            panic!()
+        };
+        let chosen = offer
+            .dialects
+            .iter()
+            .copied()
+            .filter(|&d| d <= dialect::SMB_3_0_2)
+            .max()
+            .unwrap();
         assert_eq!(chosen, dialect::SMB_3_0_2);
         let answer = Response::Negotiate(NegotiateResponse {
             dialect: chosen,
@@ -3042,40 +3407,94 @@ mod tests {
             ..NegotiateResponse::default()
         });
         let reply = Message::reply_to(&messages[0].header, status::SUCCESS, &answer).unwrap();
-        let out = Packet::Smb2(vec![reply]).to_bytes().and_then(|payload| Frame { payload }.to_bytes()).unwrap();
+        let out = Packet::Smb2(vec![reply])
+            .to_bytes()
+            .and_then(|payload| Frame { payload }.to_bytes())
+            .unwrap();
         assert_eq!(out[..8], [0, 0, 0, 129, 0xfe, b'S', b'M', b'B']);
         // The reply's header: the response flag, the same message ID.
-        let Packet::Smb2(back) = Packet::parse(&out[4..]).unwrap() else { panic!() };
+        let Packet::Smb2(back) = Packet::parse(&out[4..]).unwrap() else {
+            panic!()
+        };
         assert!(back[0].header.is_response());
         assert_eq!(back[0].response(), Ok(answer));
     }
 
     #[test]
     fn sync_and_async_headers() {
-        let b = header_bytes(command::READ, 0, flags::SIGNED, 0, 7, 0x0001_0001, 0x4000_0000_0001);
+        let b = header_bytes(
+            command::READ,
+            0,
+            flags::SIGNED,
+            0,
+            7,
+            0x0001_0001,
+            0x4000_0000_0001,
+        );
         let h = Message::parse(&b).unwrap().header;
         assert_eq!(h.command, command::READ);
         assert_eq!(h.credit_charge, 1);
         assert_eq!(h.credits, 31);
         assert_eq!(h.message_id, 7);
-        assert_eq!(h.target, Target::Sync { process_id: 0xfeff, tree_id: 0x0001_0001 });
+        assert_eq!(
+            h.target,
+            Target::Sync {
+                process_id: 0xfeff,
+                tree_id: 0x0001_0001
+            }
+        );
         assert_eq!(h.session_id, 0x4000_0000_0001);
-        assert_eq!(Message { header: h, body: vec![] }.to_bytes().unwrap()[..], b[..]);
+        assert_eq!(
+            Message {
+                header: h,
+                body: vec![]
+            }
+            .to_bytes()
+            .unwrap()[..],
+            b[..]
+        );
         // The async form: bytes 32..40 are the async ID.
         let mut a = b.clone();
         a[16..20].copy_from_slice(&(flags::ASYNC_COMMAND | flags::SERVER_TO_REDIR).to_le_bytes());
         a[8..12].copy_from_slice(&status::PENDING.to_le_bytes());
         let h = Message::parse(&a).unwrap().header;
-        assert_eq!(h.target, Target::Async { async_id: 0x0001_0001_0000_feff });
+        assert_eq!(
+            h.target,
+            Target::Async {
+                async_id: 0x0001_0001_0000_feff
+            }
+        );
         assert!(h.is_response());
-        assert_eq!(Message { header: h, body: vec![] }.to_bytes().unwrap()[..], a[..]);
+        assert_eq!(
+            Message {
+                header: h,
+                body: vec![]
+            }
+            .to_bytes()
+            .unwrap()[..],
+            a[..]
+        );
         // The flag and the target must agree.
         let mut wrong = h;
         wrong.target = Target::default();
-        assert_eq!(Message { header: wrong, body: vec![] }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Message {
+                header: wrong,
+                body: vec![]
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
         let mut wrong = Header::new(command::ECHO, 1);
         wrong.target = Target::Async { async_id: 1 };
-        assert_eq!(Message { header: wrong, body: vec![] }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Message {
+                header: wrong,
+                body: vec![]
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
@@ -3083,12 +3502,18 @@ mod tests {
         let mut req = Header::new(command::CREATE, 9);
         req.credits = 0;
         req.flags = flags::RELATED_OPERATIONS | flags::SIGNED | flags::DFS_OPERATIONS;
-        req.target = Target::Sync { process_id: 0, tree_id: 5 };
+        req.target = Target::Sync {
+            process_id: 0,
+            tree_id: 5,
+        };
         req.session_id = 77;
         let r = req.reply(status::ACCESS_DENIED);
         assert_eq!(r.flags, flags::SERVER_TO_REDIR | flags::RELATED_OPERATIONS);
         assert_eq!(r.credits, 1);
-        assert_eq!((r.message_id, r.session_id, r.target, r.status), (9, 77, req.target, status::ACCESS_DENIED));
+        assert_eq!(
+            (r.message_id, r.session_id, r.target, r.status),
+            (9, 77, req.target, status::ACCESS_DENIED)
+        );
     }
 
     #[test]
@@ -3110,23 +3535,50 @@ mod tests {
         body.extend_from_slice(&[0; 6]); // pad to 8
         body.extend_from_slice(&le(&[2, 4, 0, 1, 2], &[2, 2, 4, 2, 2]));
         let req = Request::parse(command::NEGOTIATE, &body).unwrap();
-        let Request::Negotiate(n) = &req else { panic!() };
+        let Request::Negotiate(n) = &req else {
+            panic!()
+        };
         assert_eq!(n.dialects, [0x202, 0x210, 0x300, 0x302, 0x311]);
         assert_eq!(n.security_mode, security_mode::SIGNING_ENABLED);
         assert_eq!(n.capabilities, 0x7f);
         assert_eq!(n.client_guid, [0xaa; 16]);
         assert_eq!(n.contexts.len(), 2);
-        assert_eq!(n.contexts[0].preauth_integrity_parts(), Some((vec![negotiate_context::SHA_512], vec![1, 2, 3, 4])));
-        assert_eq!(n.contexts[1].kind, negotiate_context::ENCRYPTION_CAPABILITIES);
+        assert_eq!(
+            n.contexts[0].preauth_integrity_parts(),
+            Some((vec![negotiate_context::SHA_512], vec![1, 2, 3, 4]))
+        );
+        assert_eq!(
+            n.contexts[1].kind,
+            negotiate_context::ENCRYPTION_CAPABILITIES
+        );
         assert_eq!(n.contexts[1].algorithm_list(), Some(vec![2]));
         // The writer lays it out the same way.
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
-        assert_eq!(NegotiateContext::preauth_integrity(&[1], &[1, 2, 3, 4]).unwrap(), n.contexts[0]);
-        assert_eq!(NegotiateContext::algorithms(2, &[2]).unwrap(), n.contexts[1]);
+        assert_eq!(
+            NegotiateContext::preauth_integrity(&[1], &[1, 2, 3, 4]).unwrap(),
+            n.contexts[0]
+        );
+        assert_eq!(
+            NegotiateContext::algorithms(2, &[2]).unwrap(),
+            n.contexts[1]
+        );
         assert_eq!(n.contexts[1].preauth_integrity_parts(), None);
-        assert_eq!(NegotiateContext::algorithms(2, &[0; 40000]), Err(Error::Unwritable));
-        assert_eq!(NegotiateContext::preauth_integrity(&[], &[0; 70000]), Err(Error::Unwritable));
-        assert_eq!(NegotiateContext { kind: 2, data: vec![5, 0] }.algorithm_list(), None);
+        assert_eq!(
+            NegotiateContext::algorithms(2, &[0; 40000]),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            NegotiateContext::preauth_integrity(&[], &[0; 70000]),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            NegotiateContext {
+                kind: 2,
+                data: vec![5, 0]
+            }
+            .algorithm_list(),
+            None
+        );
     }
 
     #[test]
@@ -3136,38 +3588,72 @@ mod tests {
         body.extend_from_slice(&0x1234u64.to_le_bytes());
         body.extend_from_slice(&0x202u16.to_le_bytes());
         let req = Request::parse(command::NEGOTIATE, &body).unwrap();
-        let Request::Negotiate(n) = &req else { panic!() };
+        let Request::Negotiate(n) = &req else {
+            panic!()
+        };
         assert_eq!(n.client_start_time, 0x1234);
         assert!(n.contexts.is_empty());
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         // Contexts need 3.1.1, and 3.1.1 leaves no room for a start time.
-        let bad = NegotiateRequest { dialects: vec![0x202], contexts: vec![NegotiateContext::default()], ..n.clone() };
-        assert_eq!(Request::Negotiate(bad).message(0).map(|m| m.body), Err(Error::Unwritable));
-        let bad = NegotiateRequest { dialects: vec![0x311], ..n.clone() };
-        assert_eq!(Request::Negotiate(bad).message(0).map(|m| m.body), Err(Error::Unwritable));
-        let bad =
-            NegotiateResponse { dialect: 0x302, contexts: vec![NegotiateContext::default()], ..Default::default() };
-        assert_eq!(Response::Negotiate(bad).message(&Header::new(0, 0), 0).map(|m| m.body), Err(Error::Unwritable));
+        let bad = NegotiateRequest {
+            dialects: vec![0x202],
+            contexts: vec![NegotiateContext::default()],
+            ..n.clone()
+        };
+        assert_eq!(
+            Request::Negotiate(bad).message(0).map(|m| m.body),
+            Err(Error::Unwritable)
+        );
+        let bad = NegotiateRequest {
+            dialects: vec![0x311],
+            ..n.clone()
+        };
+        assert_eq!(
+            Request::Negotiate(bad).message(0).map(|m| m.body),
+            Err(Error::Unwritable)
+        );
+        let bad = NegotiateResponse {
+            dialect: 0x302,
+            contexts: vec![NegotiateContext::default()],
+            ..Default::default()
+        };
+        assert_eq!(
+            Response::Negotiate(bad)
+                .message(&Header::new(0, 0), 0)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
     fn negotiate_response_example() {
         let mut body = le(&[65, 1, 0x311, 1], &[2, 2, 2, 2]);
         body.extend_from_slice(&[0x11; 16]);
-        body.extend_from_slice(&le(&[0x2f, 0x80_0000, 0x80_0000, 0x80_0000, 132, 0], &[4, 4, 4, 4, 8, 8]));
+        body.extend_from_slice(&le(
+            &[0x2f, 0x80_0000, 0x80_0000, 0x80_0000, 132, 0],
+            &[4, 4, 4, 4, 8, 8],
+        ));
         body.extend_from_slice(&le(&[128, 3, 136], &[2, 2, 4]));
         body.extend_from_slice(&[0x60, 0x48, 0x06]); // the start of a SPNEGO blob
         body.resize(72, 0); // 64 + 72 = 136
         body.extend_from_slice(&le(&[1, 38, 0, 1, 32, 1], &[2, 2, 4, 2, 2, 2]));
         body.extend_from_slice(&[9; 32]);
         let resp = Response::parse(command::NEGOTIATE, 0, &body).unwrap();
-        let Response::Negotiate(n) = &resp else { panic!() };
+        let Response::Negotiate(n) = &resp else {
+            panic!()
+        };
         assert_eq!(n.dialect, dialect::SMB_3_1_1);
         assert_eq!(n.max_read_size, 0x80_0000);
         assert_eq!(n.system_time, 132);
         assert_eq!(n.security_buffer, [0x60, 0x48, 0x06]);
-        assert_eq!(n.contexts[0].preauth_integrity_parts(), Some((vec![1], vec![9; 32])));
-        assert_eq!(resp.message(&Header::new(0, 0), 0).map(|m| m.body).unwrap(), body);
+        assert_eq!(
+            n.contexts[0].preauth_integrity_parts(),
+            Some((vec![1], vec![9; 32]))
+        );
+        assert_eq!(
+            resp.message(&Header::new(0, 0), 0).map(|m| m.body).unwrap(),
+            body
+        );
     }
 
     #[test]
@@ -3187,16 +3673,39 @@ mod tests {
         // SESSION_SETUP body, not an error body.
         let mut body = le(&[9, 0, 72, 2], &[2, 2, 2, 2]);
         body.extend_from_slice(&[0xa1, 0x00]);
-        let resp = Response::parse(command::SESSION_SETUP, status::MORE_PROCESSING_REQUIRED, &body).unwrap();
-        assert_eq!(resp, Response::SessionSetup { session_flags: 0, security_buffer: vec![0xa1, 0] });
-        assert_eq!(resp.message(&Header::new(command::SESSION_SETUP, 0), status::MORE_PROCESSING_REQUIRED).map(|m| m.body).unwrap(), body);
+        let resp = Response::parse(
+            command::SESSION_SETUP,
+            status::MORE_PROCESSING_REQUIRED,
+            &body,
+        )
+        .unwrap();
+        assert_eq!(
+            resp,
+            Response::SessionSetup {
+                session_flags: 0,
+                security_buffer: vec![0xa1, 0]
+            }
+        );
+        assert_eq!(
+            resp.message(
+                &Header::new(command::SESSION_SETUP, 0),
+                status::MORE_PROCESSING_REQUIRED
+            )
+            .map(|m| m.body)
+            .unwrap(),
+            body
+        );
         // The same bytes with LOGON_FAILURE are an error body.
         assert!(matches!(
             Response::parse(command::SESSION_SETUP, status::LOGON_FAILURE, &body),
             Ok(Response::Error(_)) | Err(_)
         ));
         assert_eq!(
-            resp.message(&Header::new(command::SESSION_SETUP, 0), status::LOGON_FAILURE).map(|m| m.body),
+            resp.message(
+                &Header::new(command::SESSION_SETUP, 0),
+                status::LOGON_FAILURE
+            )
+            .map(|m| m.body),
             Err(Error::Unwritable)
         );
     }
@@ -3207,7 +3716,9 @@ mod tests {
         let mut body = le(&[9, 0, 72, path.len() as u64], &[2, 2, 2, 2]);
         body.extend_from_slice(&path);
         let req = Request::parse(command::TREE_CONNECT, &body).unwrap();
-        let Request::TreeConnect(t) = &req else { panic!() };
+        let Request::TreeConnect(t) = &req else {
+            panic!()
+        };
         assert_eq!(utf16_lossy(&t.path), "\\\\fs1\\IPC$");
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         let body = le(&[16, 2, 0, 0x30, 0, 0x1f01ff], &[2, 1, 1, 4, 4, 4]);
@@ -3221,12 +3732,26 @@ mod tests {
                 maximal_access: 0x1f01ff
             })
         );
-        assert_eq!(resp.message(&Header::new(command::TREE_CONNECT, 0), 0).map(|m| m.body).unwrap(), body);
+        assert_eq!(
+            resp.message(&Header::new(command::TREE_CONNECT, 0), 0)
+                .map(|m| m.body)
+                .unwrap(),
+            body
+        );
         // A bad share is an error body with one zero byte of data.
         let err = Response::Error(ErrorResponse::default());
-        let bytes = err.message(&Header::new(command::TREE_CONNECT, 0), status::BAD_NETWORK_NAME).map(|m| m.body).unwrap();
+        let bytes = err
+            .message(
+                &Header::new(command::TREE_CONNECT, 0),
+                status::BAD_NETWORK_NAME,
+            )
+            .map(|m| m.body)
+            .unwrap();
         assert_eq!(bytes, [9, 0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(Response::parse(command::TREE_CONNECT, status::BAD_NETWORK_NAME, &bytes), Ok(err));
+        assert_eq!(
+            Response::parse(command::TREE_CONNECT, status::BAD_NETWORK_NAME, &bytes),
+            Ok(err)
+        );
     }
 
     fn create_request() -> CreateRequest {
@@ -3240,8 +3765,14 @@ mod tests {
             create_options: 0x20,
             name: utf16("docs\\plan.txt"),
             contexts: vec![
-                CreateContext { name: create_context::QUERY_MAXIMAL_ACCESS.to_vec(), data: vec![] },
-                CreateContext { name: create_context::REQUEST_LEASE.to_vec(), data: vec![7; 32] },
+                CreateContext {
+                    name: create_context::QUERY_MAXIMAL_ACCESS.to_vec(),
+                    data: vec![],
+                },
+                CreateContext {
+                    name: create_context::REQUEST_LEASE.to_vec(),
+                    data: vec![7; 32],
+                },
             ],
         }
     }
@@ -3250,7 +3781,23 @@ mod tests {
     fn create_examples() {
         let name = u16s("docs\\plan.txt"); // 26 bytes
         let mut body = le(
-            &[57, 0, 0xff, 2, 0, 0, 0x0012_0089, 0, 7, 1, 0x20, 120, 26, 152, 0],
+            &[
+                57,
+                0,
+                0xff,
+                2,
+                0,
+                0,
+                0x0012_0089,
+                0,
+                7,
+                1,
+                0x20,
+                120,
+                26,
+                152,
+                0,
+            ],
             &[2, 1, 1, 4, 8, 8, 4, 4, 4, 4, 4, 2, 2, 4, 4],
         );
         body.extend_from_slice(&name);
@@ -3283,10 +3830,19 @@ mod tests {
                 end_of_file: 10,
                 file_attributes: 0x20,
             },
-            file_id: FileId { persistent: 5, volatile: 6 },
-            contexts: vec![CreateContext { name: b"MxAc".to_vec(), data: vec![0, 0, 0, 0, 0xff, 1, 0x1f, 0] }],
+            file_id: FileId {
+                persistent: 5,
+                volatile: 6,
+            },
+            contexts: vec![CreateContext {
+                name: b"MxAc".to_vec(),
+                data: vec![0, 0, 0, 0, 0xff, 1, 0x1f, 0],
+            }],
         });
-        let bytes = resp.message(&Header::new(command::CREATE, 0), 0).map(|m| m.body).unwrap();
+        let bytes = resp
+            .message(&Header::new(command::CREATE, 0), 0)
+            .map(|m| m.body)
+            .unwrap();
         assert_eq!(le16(&bytes, 0).ok_or(Error::Truncated), Ok(89));
         assert_eq!(le32(&bytes, 56).ok_or(Error::Truncated), Ok(0x20)); // FileAttributes
         assert_eq!(le64(&bytes, 64).ok_or(Error::Truncated), Ok(5)); // FileId
@@ -3294,29 +3850,82 @@ mod tests {
         assert_eq!(Response::parse(command::CREATE, 0, &bytes), Ok(resp));
         // Without contexts: the fixed part and one zero byte.
         let plain = Response::Create(CreateResponse::default());
-        assert_eq!(plain.message(&Header::new(command::CREATE, 0), 0).map(|m| m.body).unwrap().len(), 89);
+        assert_eq!(
+            plain
+                .message(&Header::new(command::CREATE, 0), 0)
+                .map(|m| m.body)
+                .unwrap()
+                .len(),
+            89
+        );
     }
 
     #[test]
     fn close_flush_echo_and_friends() {
-        let fid = FileId { persistent: 1, volatile: 2 };
+        let fid = FileId {
+            persistent: 1,
+            volatile: 2,
+        };
         let mut body = le(&[24, 1, 0, 1, 2], &[2, 2, 4, 8, 8]);
-        assert_eq!(Request::parse(command::CLOSE, &body), Ok(Request::Close { flags: 1, file_id: fid }));
-        assert_eq!(Request::Close { flags: 1, file_id: fid }.message(0).map(|m| m.body).unwrap(), body);
+        assert_eq!(
+            Request::parse(command::CLOSE, &body),
+            Ok(Request::Close {
+                flags: 1,
+                file_id: fid
+            })
+        );
+        assert_eq!(
+            Request::Close {
+                flags: 1,
+                file_id: fid
+            }
+            .message(0)
+            .map(|m| m.body)
+            .unwrap(),
+            body
+        );
         body[2] = 0;
-        assert_eq!(Request::parse(command::FLUSH, &body), Ok(Request::Flush { file_id: fid }));
-        assert_eq!(Request::Flush { file_id: fid }.message(0).map(|m| m.body).unwrap(), body);
-        let info = FileInfo { end_of_file: 9, file_attributes: 0x80, ..Default::default() };
-        let mut close = le(&[60, 1, 0, 0, 0, 0, 0, 0, 9, 0x80], &[2, 2, 4, 8, 8, 8, 8, 8, 8, 4]);
+        assert_eq!(
+            Request::parse(command::FLUSH, &body),
+            Ok(Request::Flush { file_id: fid })
+        );
+        assert_eq!(
+            Request::Flush { file_id: fid }
+                .message(0)
+                .map(|m| m.body)
+                .unwrap(),
+            body
+        );
+        let info = FileInfo {
+            end_of_file: 9,
+            file_attributes: 0x80,
+            ..Default::default()
+        };
+        let mut close = le(
+            &[60, 1, 0, 0, 0, 0, 0, 0, 9, 0x80],
+            &[2, 2, 4, 8, 8, 8, 8, 8, 8, 4],
+        );
         let resp = Response::parse(command::CLOSE, 0, &close).unwrap();
         assert_eq!(resp, Response::Close { flags: 1, info });
-        assert_eq!(resp.message(&Header::new(command::CLOSE, 0), 0).map(|m| m.body).unwrap(), close);
+        assert_eq!(
+            resp.message(&Header::new(command::CLOSE, 0), 0)
+                .map(|m| m.body)
+                .unwrap(),
+            close
+        );
         close.pop();
-        assert_eq!(Response::parse(command::CLOSE, 0, &close), Err(Error::Truncated));
+        assert_eq!(
+            Response::parse(command::CLOSE, 0, &close),
+            Err(Error::Truncated)
+        );
         let four = [4, 0, 0, 0];
         for (c, req, resp) in [
             (command::LOGOFF, Request::Logoff, Some(Response::Logoff)),
-            (command::TREE_DISCONNECT, Request::TreeDisconnect, Some(Response::TreeDisconnect)),
+            (
+                command::TREE_DISCONNECT,
+                Request::TreeDisconnect,
+                Some(Response::TreeDisconnect),
+            ),
             (command::ECHO, Request::Echo, Some(Response::Echo)),
             (command::CANCEL, Request::Cancel, None),
         ] {
@@ -3324,27 +3933,53 @@ mod tests {
             assert_eq!(req.message(0).map(|m| m.body).unwrap(), four);
             if let Some(r) = resp {
                 assert_eq!(Response::parse(c, 0, &four), Ok(r.clone()));
-                assert_eq!(r.message(&Header::new(c, 0), 0).map(|m| m.body).unwrap(), four);
+                assert_eq!(
+                    r.message(&Header::new(c, 0), 0).map(|m| m.body).unwrap(),
+                    four
+                );
             }
         }
-        assert_eq!(Response::parse(command::FLUSH, 0, &four), Ok(Response::Flush));
+        assert_eq!(
+            Response::parse(command::FLUSH, 0, &four),
+            Ok(Response::Flush)
+        );
         assert_eq!(Response::parse(command::LOCK, 0, &four), Ok(Response::Lock));
-        assert_eq!(Response::parse(command::SET_INFO, 0, &[2, 0]), Ok(Response::SetInfo));
-        assert_eq!(Response::SetInfo.message(&Header::new(command::SET_INFO, 0), 0).map(|m| m.body).unwrap(), [2, 0]);
+        assert_eq!(
+            Response::parse(command::SET_INFO, 0, &[2, 0]),
+            Ok(Response::SetInfo)
+        );
+        assert_eq!(
+            Response::SetInfo
+                .message(&Header::new(command::SET_INFO, 0), 0)
+                .map(|m| m.body)
+                .unwrap(),
+            [2, 0]
+        );
         // CANCEL has no response body of its own.
-        assert_eq!(Response::parse(command::CANCEL, 0, &four), Ok(Response::Other { body: four.to_vec() }));
+        assert_eq!(
+            Response::parse(command::CANCEL, 0, &four),
+            Ok(Response::Other {
+                body: four.to_vec()
+            })
+        );
     }
 
     #[test]
     fn read_and_write_examples() {
-        let mut body = le(&[49, 0x50, 0, 0x10000, 4096, 1, 2, 1, 0, 0, 0, 0], &[2, 1, 1, 4, 8, 8, 8, 4, 4, 4, 2, 2]);
+        let mut body = le(
+            &[49, 0x50, 0, 0x10000, 4096, 1, 2, 1, 0, 0, 0, 0],
+            &[2, 1, 1, 4, 8, 8, 8, 4, 4, 4, 2, 2],
+        );
         body.push(0);
         let req = Request::parse(command::READ, &body).unwrap();
         let want = ReadRequest {
             padding: 0x50,
             length: 0x10000,
             offset: 4096,
-            file_id: FileId { persistent: 1, volatile: 2 },
+            file_id: FileId {
+                persistent: 1,
+                volatile: 2,
+            },
             minimum_count: 1,
             ..Default::default()
         };
@@ -3353,31 +3988,73 @@ mod tests {
         let mut body = le(&[17, 80, 0, 5, 0, 0], &[2, 1, 1, 4, 4, 4]);
         body.extend_from_slice(b"hello");
         let resp = Response::parse(command::READ, 0, &body).unwrap();
-        assert_eq!(resp, Response::Read { data: b"hello".to_vec(), data_remaining: 0, flags: 0 });
-        assert_eq!(resp.message(&Header::new(command::READ, 0), 0).map(|m| m.body).unwrap(), body);
+        assert_eq!(
+            resp,
+            Response::Read {
+                data: b"hello".to_vec(),
+                data_remaining: 0,
+                flags: 0
+            }
+        );
+        assert_eq!(
+            resp.message(&Header::new(command::READ, 0), 0)
+                .map(|m| m.body)
+                .unwrap(),
+            body
+        );
         // BUFFER_OVERFLOW on a pipe read still carries a READ body.
-        assert_eq!(Response::parse(command::READ, status::BUFFER_OVERFLOW, &body), Ok(resp));
+        assert_eq!(
+            Response::parse(command::READ, status::BUFFER_OVERFLOW, &body),
+            Ok(resp)
+        );
 
-        let mut body = le(&[49, 112, 3, 10, 1, 2, 0, 0, 0, 0, 1], &[2, 2, 4, 8, 8, 8, 4, 4, 2, 2, 4]);
+        let mut body = le(
+            &[49, 112, 3, 10, 1, 2, 0, 0, 0, 0, 1],
+            &[2, 2, 4, 8, 8, 8, 4, 4, 2, 2, 4],
+        );
         body.extend_from_slice(b"abc");
         let req = Request::parse(command::WRITE, &body).unwrap();
         let want = WriteRequest {
             offset: 10,
-            file_id: FileId { persistent: 1, volatile: 2 },
+            file_id: FileId {
+                persistent: 1,
+                volatile: 2,
+            },
             flags: 1,
             data: b"abc".to_vec(),
             ..Default::default()
         };
         assert_eq!(req, Request::Write(want.clone()));
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
-        let with_info = Request::Write(WriteRequest { channel: 1, channel_info: vec![1, 2, 3, 4], ..want });
-        assert_eq!(Request::parse(command::WRITE, &with_info.message(0).map(|m| m.body).unwrap()), Ok(with_info));
+        let with_info = Request::Write(WriteRequest {
+            channel: 1,
+            channel_info: vec![1, 2, 3, 4],
+            ..want
+        });
+        assert_eq!(
+            Request::parse(
+                command::WRITE,
+                &with_info.message(0).map(|m| m.body).unwrap()
+            ),
+            Ok(with_info)
+        );
         let body = le(&[17, 0, 3, 0, 0, 0], &[2, 2, 4, 4, 2, 2]);
         let resp = Response::parse(command::WRITE, 0, &body).unwrap();
-        assert_eq!(resp, Response::Write { count: 3, remaining: 0 });
+        assert_eq!(
+            resp,
+            Response::Write {
+                count: 3,
+                remaining: 0
+            }
+        );
         let mut padded = body.clone();
         padded.push(0);
-        assert_eq!(resp.message(&Header::new(command::WRITE, 0), 0).map(|m| m.body).unwrap(), padded);
+        assert_eq!(
+            resp.message(&Header::new(command::WRITE, 0), 0)
+                .map(|m| m.body)
+                .unwrap(),
+            padded
+        );
         // A write past the end of the message is refused.
         let mut short = le(&[49, 112, 30], &[2, 2, 4]);
         short.resize(49, 0);
@@ -3391,23 +4068,59 @@ mod tests {
         body.extend_from_slice(&le(&[100, 1, 0x11, 0], &[8, 8, 4, 4]));
         let req = Request::parse(command::LOCK, &body).unwrap();
         let Request::Lock(l) = &req else { panic!() };
-        assert_eq!(l.locks, [Lock { offset: 0, length: 10, flags: 2 }, Lock { offset: 100, length: 1, flags: 0x11 }]);
+        assert_eq!(
+            l.locks,
+            [
+                Lock {
+                    offset: 0,
+                    length: 10,
+                    flags: 2
+                },
+                Lock {
+                    offset: 100,
+                    length: 1,
+                    flags: 0x11
+                }
+            ]
+        );
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         // A lock without its 4 reserved bytes is cut short.
-        assert_eq!(Request::parse(command::LOCK, &body[..body.len() - 1]), Err(Error::Truncated));
+        assert_eq!(
+            Request::parse(command::LOCK, &body[..body.len() - 1]),
+            Err(Error::Truncated)
+        );
         // A count past the locks there are.
         body[2] = 3;
         assert_eq!(Request::parse(command::LOCK, &body), Err(Error::Truncated));
         body[2] = 0;
         assert_eq!(Request::parse(command::LOCK, &body), Err(Error::NoLocks));
-        assert_eq!(Request::Lock(LockRequest::default()).message(0).map(|m| m.body), Err(Error::Unwritable));
+        assert_eq!(
+            Request::Lock(LockRequest::default())
+                .message(0)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
     fn ioctl_examples() {
         // FSCTL_VALIDATE_NEGOTIATE_INFO with 4 input bytes.
         let mut body = le(
-            &[57, 0, 0x0014_0204, u64::MAX, u64::MAX, 120, 4, 0, 0, 0, 24, 1, 0],
+            &[
+                57,
+                0,
+                0x0014_0204,
+                u64::MAX,
+                u64::MAX,
+                120,
+                4,
+                0,
+                0,
+                0,
+                24,
+                1,
+                0,
+            ],
             &[2, 2, 4, 8, 8, 4, 4, 4, 4, 4, 4, 4, 4],
         );
         body.extend_from_slice(&[1, 2, 3, 4]);
@@ -3417,54 +4130,110 @@ mod tests {
         assert_eq!(i.input, [1, 2, 3, 4]);
         assert_eq!(i.max_output_response, 24);
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
-        let resp = Response::Ioctl(IoctlResponse { ctl_code: 0x0014_0204, output: vec![5; 24], ..Default::default() });
-        let bytes = resp.message(&Header::new(command::IOCTL, 0), 0).map(|m| m.body).unwrap();
+        let resp = Response::Ioctl(IoctlResponse {
+            ctl_code: 0x0014_0204,
+            output: vec![5; 24],
+            ..Default::default()
+        });
+        let bytes = resp
+            .message(&Header::new(command::IOCTL, 0), 0)
+            .map(|m| m.body)
+            .unwrap();
         assert_eq!(le32(&bytes, 32).ok_or(Error::Truncated), Ok(112));
         assert_eq!(Response::parse(command::IOCTL, 0, &bytes), Ok(resp.clone()));
         // An IOCTL body may come with a failing status, as copychunk does.
-        let b = resp.message(&Header::new(command::IOCTL, 0), status::INVALID_PARAMETER).map(|m| m.body).unwrap();
-        assert_eq!(Response::parse(command::IOCTL, status::INVALID_PARAMETER, &b), Ok(resp));
+        let b = resp
+            .message(&Header::new(command::IOCTL, 0), status::INVALID_PARAMETER)
+            .map(|m| m.body)
+            .unwrap();
+        assert_eq!(
+            Response::parse(command::IOCTL, status::INVALID_PARAMETER, &b),
+            Ok(resp)
+        );
     }
 
     #[test]
     fn directory_notify_and_info_examples() {
         let star = u16s("*");
-        let mut body = le(&[33, 0x25, 1, 0, 1, 2, 96, 2, 65536], &[2, 1, 1, 4, 8, 8, 2, 2, 4]);
+        let mut body = le(
+            &[33, 0x25, 1, 0, 1, 2, 96, 2, 65536],
+            &[2, 1, 1, 4, 8, 8, 2, 2, 4],
+        );
         body.extend_from_slice(&star);
         let req = Request::parse(command::QUERY_DIRECTORY, &body).unwrap();
-        let Request::QueryDirectory(q) = &req else { panic!() };
-        assert_eq!((q.file_information_class, q.flags, q.pattern.clone()), (0x25, 1, utf16("*")));
+        let Request::QueryDirectory(q) = &req else {
+            panic!()
+        };
+        assert_eq!(
+            (q.file_information_class, q.flags, q.pattern.clone()),
+            (0x25, 1, utf16("*"))
+        );
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         let body = le(&[32, 1, 4096, 1, 2, 0x17, 0], &[2, 2, 4, 8, 8, 4, 4]);
         let req = Request::parse(command::CHANGE_NOTIFY, &body).unwrap();
-        let Request::ChangeNotify(c) = &req else { panic!() };
-        assert_eq!((c.flags, c.output_buffer_length, c.completion_filter), (1, 4096, 0x17));
+        let Request::ChangeNotify(c) = &req else {
+            panic!()
+        };
+        assert_eq!(
+            (c.flags, c.output_buffer_length, c.completion_filter),
+            (1, 4096, 0x17)
+        );
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
-        let mut body = le(&[41, 1, 5, 1024, 104, 0, 0, 0, 0, 1, 2], &[2, 1, 1, 4, 2, 2, 4, 4, 4, 8, 8]);
+        let mut body = le(
+            &[41, 1, 5, 1024, 104, 0, 0, 0, 0, 1, 2],
+            &[2, 1, 1, 4, 2, 2, 4, 4, 4, 8, 8],
+        );
         body.push(0);
         let req = Request::parse(command::QUERY_INFO, &body).unwrap();
-        let Request::QueryInfo(q) = &req else { panic!() };
-        assert_eq!((q.info_type, q.file_info_class, q.output_buffer_length), (1, 5, 1024));
+        let Request::QueryInfo(q) = &req else {
+            panic!()
+        };
+        assert_eq!(
+            (q.info_type, q.file_info_class, q.output_buffer_length),
+            (1, 5, 1024)
+        );
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
-        let mut body = le(&[33, 1, 20, 8, 96, 0, 0, 1, 2], &[2, 1, 1, 4, 2, 2, 4, 8, 8]);
+        let mut body = le(
+            &[33, 1, 20, 8, 96, 0, 0, 1, 2],
+            &[2, 1, 1, 4, 2, 2, 4, 8, 8],
+        );
         body.extend_from_slice(&1234u64.to_le_bytes());
         let req = Request::parse(command::SET_INFO, &body).unwrap();
         let Request::SetInfo(s) = &req else { panic!() };
-        assert_eq!((s.info_type, s.file_info_class, s.data.clone()), (1, 20, 1234u64.to_le_bytes().to_vec()));
+        assert_eq!(
+            (s.info_type, s.file_info_class, s.data.clone()),
+            (1, 20, 1234u64.to_le_bytes().to_vec())
+        );
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
-        for c in [command::QUERY_DIRECTORY, command::CHANGE_NOTIFY, command::QUERY_INFO] {
+        for c in [
+            command::QUERY_DIRECTORY,
+            command::CHANGE_NOTIFY,
+            command::QUERY_INFO,
+        ] {
             let mut body = le(&[9, 72, 3], &[2, 2, 4]);
             body.extend_from_slice(&[1, 2, 3]);
             let resp = Response::parse(c, 0, &body).unwrap();
-            assert_eq!(resp.message(&Header::new(c, 0), 0).map(|m| m.body).unwrap(), body);
+            assert_eq!(
+                resp.message(&Header::new(c, 0), 0).map(|m| m.body).unwrap(),
+                body
+            );
             assert_eq!(resp.command(), Some(c));
         }
         // NO_MORE_FILES ends a listing with an error body.
-        let end = Response::parse(command::QUERY_DIRECTORY, status::NO_MORE_FILES, &[9, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let end = Response::parse(
+            command::QUERY_DIRECTORY,
+            status::NO_MORE_FILES,
+            &[9, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
         assert_eq!(end, Ok(Response::Error(ErrorResponse::default())));
         // QUERY_INFO with BUFFER_OVERFLOW carries what fit.
-        let body =
-            Response::QueryInfo { data: vec![1; 8] }.message(&Header::new(command::QUERY_INFO, 0), status::BUFFER_OVERFLOW).map(|m| m.body).unwrap();
+        let body = Response::QueryInfo { data: vec![1; 8] }
+            .message(
+                &Header::new(command::QUERY_INFO, 0),
+                status::BUFFER_OVERFLOW,
+            )
+            .map(|m| m.body)
+            .unwrap();
         assert_eq!(
             Response::parse(command::QUERY_INFO, status::BUFFER_OVERFLOW, &body),
             Ok(Response::QueryInfo { data: vec![1; 8] })
@@ -3476,26 +4245,57 @@ mod tests {
         let mut body = le(&[9, 0, 0, 4], &[2, 1, 1, 4]);
         body.extend_from_slice(&[0x10, 0, 0, 0]);
         let resp = Response::parse(command::READ, status::END_OF_FILE, &body).unwrap();
-        assert_eq!(resp, Response::Error(ErrorResponse { context_count: 0, data: vec![0x10, 0, 0, 0] }));
-        assert_eq!(resp.message(&Header::new(command::READ, 0), status::END_OF_FILE).map(|m| m.body).unwrap(), body);
+        assert_eq!(
+            resp,
+            Response::Error(ErrorResponse {
+                context_count: 0,
+                data: vec![0x10, 0, 0, 0]
+            })
+        );
+        assert_eq!(
+            resp.message(&Header::new(command::READ, 0), status::END_OF_FILE)
+                .map(|m| m.body)
+                .unwrap(),
+            body
+        );
         assert_eq!(resp.command(), None);
         // An interim response.
         let pending = Response::Error(ErrorResponse::default());
-        let b = pending.message(&Header::new(command::CHANGE_NOTIFY, 0), status::PENDING).map(|m| m.body).unwrap();
-        assert_eq!(Response::parse(command::CHANGE_NOTIFY, status::PENDING, &b), Ok(pending.clone()));
+        let b = pending
+            .message(&Header::new(command::CHANGE_NOTIFY, 0), status::PENDING)
+            .map(|m| m.body)
+            .unwrap();
+        assert_eq!(
+            Response::parse(command::CHANGE_NOTIFY, status::PENDING, &b),
+            Ok(pending.clone())
+        );
         // An error body never goes with success.
-        assert_eq!(pending.message(&Header::new(command::READ, 0), 0).map(|m| m.body), Err(Error::Unwritable));
+        assert_eq!(
+            pending
+                .message(&Header::new(command::READ, 0), 0)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
         // A ByteCount past the end.
         body[4] = 9;
-        assert_eq!(Response::parse(command::READ, status::END_OF_FILE, &body), Err(Error::Buffer));
+        assert_eq!(
+            Response::parse(command::READ, status::END_OF_FILE, &body),
+            Err(Error::Buffer)
+        );
         // For commands this module does not read, StructureSize 9 decides.
         assert_eq!(
-            Response::parse(command::OPLOCK_BREAK, status::ACCESS_DENIED, &[9, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Response::parse(
+                command::OPLOCK_BREAK,
+                status::ACCESS_DENIED,
+                &[9, 0, 0, 0, 0, 0, 0, 0, 0]
+            ),
             Ok(Response::Error(ErrorResponse::default()))
         );
         assert_eq!(
             Response::parse(command::OPLOCK_BREAK, status::ACCESS_DENIED, &[24, 0, 1]),
-            Ok(Response::Other { body: vec![24, 0, 1] })
+            Ok(Response::Other {
+                body: vec![24, 0, 1]
+            })
         );
     }
 
@@ -3503,65 +4303,137 @@ mod tests {
     fn others_and_commands() {
         let body = vec![24, 0, 1, 0, 0, 0, 0, 0];
         let req = Request::parse(command::OPLOCK_BREAK, &body).unwrap();
-        assert_eq!(req, Request::Other { command: command::OPLOCK_BREAK, body: body.clone() });
+        assert_eq!(
+            req,
+            Request::Other {
+                command: command::OPLOCK_BREAK,
+                body: body.clone()
+            }
+        );
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
-        assert_eq!(Request::Other { command: command::READ, body: vec![] }.message(0).map(|m| m.body), Err(Error::Unwritable));
-        assert_eq!(Response::Other { body: vec![4, 0] }.message(&Header::new(command::ECHO, 0), 0).map(|m| m.body), Err(Error::Unwritable));
-        assert_eq!(Response::Echo.message(&Header::new(command::LOGOFF, 0), 0).map(|m| m.body), Err(Error::Unwritable));
+        assert_eq!(
+            Request::Other {
+                command: command::READ,
+                body: vec![]
+            }
+            .message(0)
+            .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Response::Other { body: vec![4, 0] }
+                .message(&Header::new(command::ECHO, 0), 0)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Response::Echo
+                .message(&Header::new(command::LOGOFF, 0), 0)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
         assert_eq!(
             Message::from_request(Header::new(command::ECHO, 1), &Request::Logoff),
             Err(Error::Unwritable)
         );
         // An Other body with status 0 and an odd StructureSize is kept as is.
         let odd = Response::Other { body: vec![9, 0] };
-        assert_eq!(odd.message(&Header::new(0x99, 0), 0).map(|m| m.body), Ok(vec![9, 0]));
-        assert_eq!(odd.message(&Header::new(0x99, 0), 1).map(|m| m.body), Err(Error::Unwritable));
+        assert_eq!(
+            odd.message(&Header::new(0x99, 0), 0).map(|m| m.body),
+            Ok(vec![9, 0])
+        );
+        assert_eq!(
+            odd.message(&Header::new(0x99, 0), 1).map(|m| m.body),
+            Err(Error::Unwritable)
+        );
     }
 
     /// CREATE, READ and CLOSE in one compound chain, related.
     fn chain() -> Vec<Message> {
         let mut h = Header::new(command::CREATE, 4);
         h.session_id = 9;
-        h.target = Target::Sync { process_id: 0, tree_id: 1 };
+        h.target = Target::Sync {
+            process_id: 0,
+            tree_id: 1,
+        };
         let create = Message::from_request(h, &Request::Create(create_request())).unwrap();
-        let mut h = Header { command: command::READ, message_id: 5, flags: flags::RELATED_OPERATIONS, ..h };
-        let read = Request::Read(ReadRequest { length: 100, file_id: FileId::RELATED, ..Default::default() });
+        let mut h = Header {
+            command: command::READ,
+            message_id: 5,
+            flags: flags::RELATED_OPERATIONS,
+            ..h
+        };
+        let read = Request::Read(ReadRequest {
+            length: 100,
+            file_id: FileId::RELATED,
+            ..Default::default()
+        });
         let read = Message::from_request(h, &read).unwrap();
         h.command = command::CLOSE;
         h.message_id = 6;
-        let close = Message::from_request(h, &Request::Close { flags: 0, file_id: FileId::RELATED }).unwrap();
+        let close = Message::from_request(
+            h,
+            &Request::Close {
+                flags: 0,
+                file_id: FileId::RELATED,
+            },
+        )
+        .unwrap();
         vec![create, read, close]
     }
 
     #[test]
     fn compound_chains() {
         let messages = chain();
-        let bytes = Packet::compound(messages.clone()).and_then(|packet| packet.to_bytes()).unwrap();
-        let Packet::Smb2(back) = Packet::parse(&bytes).unwrap() else { panic!() };
+        let bytes = Packet::compound(messages.clone())
+            .and_then(|packet| packet.to_bytes())
+            .unwrap();
+        let Packet::Smb2(back) = Packet::parse(&bytes).unwrap() else {
+            panic!()
+        };
         assert_eq!(back.len(), 3);
         // The READ body (49 bytes) was padded to 56 to keep the CLOSE aligned.
         let first = le32(&bytes, 20).ok_or(Error::Truncated).unwrap() as usize;
         assert_eq!(first % 8, 0);
         let second = le32(&bytes, first + 20).ok_or(Error::Truncated).unwrap() as usize;
         assert_eq!(second, 64 + 56);
-        assert_eq!(le32(&bytes, first + second + 20).ok_or(Error::Truncated), Ok(0));
+        assert_eq!(
+            le32(&bytes, first + second + 20).ok_or(Error::Truncated),
+            Ok(0)
+        );
         assert_eq!(back[1].body.len(), 56);
         assert_eq!(back[1].request(), messages[1].request());
         assert_eq!(back[2], messages[2]);
         // Read back, the chain writes the same bytes.
-        assert_eq!(Packet::compound(back.clone()).and_then(|packet| packet.to_bytes()).unwrap(), bytes);
+        assert_eq!(
+            Packet::compound(back.clone())
+                .and_then(|packet| packet.to_bytes())
+                .unwrap(),
+            bytes
+        );
         // Bad NextCommand values.
         for next in [8u32, 63, 65, 100, bytes.len() as u32 + 8] {
             let mut b = bytes.clone();
             b[20..24].copy_from_slice(&next.to_le_bytes());
             assert_eq!(Packet::parse(&b), Err(Error::NextCommand(next)), "{next}");
         }
-        assert_eq!(Packet::compound(vec![]).and_then(|packet| packet.to_bytes()), Err(Error::Unwritable));
+        assert_eq!(
+            Packet::compound(vec![]).and_then(|packet| packet.to_bytes()),
+            Err(Error::Unwritable)
+        );
         // The longest chain reads; one more is refused.
         let echo = Message::from_request(Header::new(command::ECHO, 0), &Request::Echo).unwrap();
         let many = vec![echo; MAX_CHAIN];
-        let b = Packet::compound(many.clone()).and_then(|packet| packet.to_bytes()).unwrap();
-        assert_eq!(match Packet::parse(&b).unwrap() { Packet::Smb2(m) => m.len(), _ => panic!() }, MAX_CHAIN);
+        let b = Packet::compound(many.clone())
+            .and_then(|packet| packet.to_bytes())
+            .unwrap();
+        assert_eq!(
+            match Packet::parse(&b).unwrap() {
+                Packet::Smb2(m) => m.len(),
+                _ => panic!(),
+            },
+            MAX_CHAIN
+        );
         let mut more = b.clone();
         let last = more.len() - 68;
         more[last + 20..last + 24].copy_from_slice(&72u32.to_le_bytes());
@@ -3570,7 +4442,10 @@ mod tests {
         assert_eq!(Packet::parse(&more), Err(Error::TooMany));
         let mut too_many = many;
         too_many.push(too_many[0].clone());
-        assert_eq!(Packet::compound(too_many.clone()).and_then(|packet| packet.to_bytes()), Err(Error::Unwritable));
+        assert_eq!(
+            Packet::compound(too_many.clone()).and_then(|packet| packet.to_bytes()),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
@@ -3593,24 +4468,58 @@ mod tests {
         // 3.3.5.2.1.1: a header with no message after it.
         assert_eq!(Packet::parse(&b[..52]), Err(Error::Truncated));
 
-        let c = Compressed::Unchained { original_size: 400, algorithm: 1, offset: 2, data: vec![9; 10] };
+        let c = Compressed::Unchained {
+            original_size: 400,
+            algorithm: 1,
+            offset: 2,
+            data: vec![9; 10],
+        };
         let b = c.to_bytes().unwrap();
-        assert_eq!(b[..16], [0xfc, b'S', b'M', b'B', 0x90, 1, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(
+            b[..16],
+            [
+                0xfc, b'S', b'M', b'B', 0x90, 1, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0
+            ]
+        );
         assert_eq!(Packet::parse(&b), Ok(Packet::Compressed(c)));
-        let bad = Compressed::Unchained { original_size: 0, algorithm: 0, offset: 0, data: vec![] };
+        let bad = Compressed::Unchained {
+            original_size: 0,
+            algorithm: 0,
+            offset: 0,
+            data: vec![],
+        };
         assert_eq!(bad.to_bytes(), Err(Error::Unwritable));
-        let bad = Compressed::Unchained { original_size: 0, algorithm: 1, offset: 1, data: vec![] };
+        let bad = Compressed::Unchained {
+            original_size: 0,
+            algorithm: 1,
+            offset: 1,
+            data: vec![],
+        };
         assert_eq!(bad.to_bytes(), Err(Error::Unwritable));
-        let mut b =
-            Compressed::Unchained { original_size: 0, algorithm: 1, offset: 0, data: vec![] }.to_bytes().unwrap();
+        let mut b = Compressed::Unchained {
+            original_size: 0,
+            algorithm: 1,
+            offset: 0,
+            data: vec![],
+        }
+        .to_bytes()
+        .unwrap();
         b[12] = 1;
         assert_eq!(Compressed::parse(&b), Err(Error::Buffer));
 
         let c = Compressed::Chained {
             original_size: 300,
             payloads: vec![
-                ChainedPayload { algorithm: 0, flags: 1, data: vec![1; 64] },
-                ChainedPayload { algorithm: 4, flags: 0, data: vec![2; 8] },
+                ChainedPayload {
+                    algorithm: 0,
+                    flags: 1,
+                    data: vec![1; 64],
+                },
+                ChainedPayload {
+                    algorithm: 4,
+                    flags: 0,
+                    data: vec![2; 8],
+                },
             ],
         };
         let b = c.to_bytes().unwrap();
@@ -3618,9 +4527,15 @@ mod tests {
         assert_eq!(Packet::parse(&b), Ok(Packet::Compressed(c)));
         assert_eq!(Compressed::parse(&b[..b.len() - 1]), Err(Error::Buffer));
         assert_eq!(Compressed::parse(&b[..b.len() - 13]), Err(Error::Truncated));
-        let empty = Compressed::Chained { original_size: 0, payloads: vec![] };
+        let empty = Compressed::Chained {
+            original_size: 0,
+            payloads: vec![],
+        };
         assert_eq!(empty.to_bytes(), Err(Error::Unwritable));
-        let unflagged = Compressed::Chained { original_size: 0, payloads: vec![ChainedPayload::default()] };
+        let unflagged = Compressed::Chained {
+            original_size: 0,
+            payloads: vec![ChainedPayload::default()],
+        };
         assert_eq!(unflagged.to_bytes(), Err(Error::Unwritable));
     }
 
@@ -3629,74 +4544,130 @@ mod tests {
         let smb1 = [0xff, b'S', b'M', b'B', 0x72];
         assert_eq!(Packet::parse(&smb1), Ok(Packet::Smb1(smb1.to_vec())));
         assert_eq!(Packet::Smb1(smb1.to_vec()).to_bytes().unwrap(), smb1);
-        assert_eq!(Packet::Smb1(vec![1, 2, 3]).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Packet::Smb1(vec![1, 2, 3]).to_bytes(),
+            Err(Error::Unwritable)
+        );
         assert_eq!(Packet::parse(b"GET /"), Err(Error::Protocol(*b"GET ")));
         assert_eq!(Packet::parse(&[0xfe, b'S']), Err(Error::Truncated));
-        assert_eq!(Packet::parse(&vec![0xff; MAX_MESSAGE + 1]), Err(Error::TooLong));
+        assert_eq!(
+            Packet::parse(&vec![0xff; MAX_MESSAGE + 1]),
+            Err(Error::TooLong)
+        );
         let mut h = header_bytes(0, 0, 0, 0, 0, 0, 0);
         h[4] = 65;
         assert_eq!(Packet::parse(&h), Err(Error::HeaderSize(65)));
         assert_eq!(Packet::parse(&h[..63]), Err(Error::Truncated));
         let big = Packet::Smb1([&smb1[..4], &vec![0; MAX_MESSAGE][..]].concat());
         assert_eq!(big.to_bytes(), Err(Error::Unwritable));
-        let big = Message { header: Header::new(0x99, 0), body: vec![0; MAX_MESSAGE] };
+        let big = Message {
+            header: Header::new(0x99, 0),
+            body: vec![0; MAX_MESSAGE],
+        };
         assert_eq!(big.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
     fn body_errors() {
         // Wrong StructureSize, and a fixed part cut short.
-        assert_eq!(Request::parse(command::ECHO, &[5, 0, 0, 0]), Err(Error::StructureSize(5)));
-        assert_eq!(Request::parse(command::ECHO, &[4, 0, 0]), Err(Error::Truncated));
+        assert_eq!(
+            Request::parse(command::ECHO, &[5, 0, 0, 0]),
+            Err(Error::StructureSize(5))
+        );
+        assert_eq!(
+            Request::parse(command::ECHO, &[4, 0, 0]),
+            Err(Error::Truncated)
+        );
         assert_eq!(Request::parse(command::ECHO, &[4]), Err(Error::Truncated));
         // A buffer whose offset points into the header, or past the end.
         let mut b = le(&[9, 0, 8, 2], &[2, 2, 2, 2]);
         b.extend_from_slice(&[0, 0]);
-        assert_eq!(Request::parse(command::TREE_CONNECT, &b), Err(Error::Buffer));
+        assert_eq!(
+            Request::parse(command::TREE_CONNECT, &b),
+            Err(Error::Buffer)
+        );
         b[4] = 72;
         b[6] = 4;
-        assert_eq!(Request::parse(command::TREE_CONNECT, &b), Err(Error::Buffer));
+        assert_eq!(
+            Request::parse(command::TREE_CONNECT, &b),
+            Err(Error::Buffer)
+        );
         // An odd UTF-16 length.
         b[6] = 1;
-        assert_eq!(Request::parse(command::TREE_CONNECT, &b), Err(Error::OddString));
+        assert_eq!(
+            Request::parse(command::TREE_CONNECT, &b),
+            Err(Error::OddString)
+        );
         // Create contexts that run off their region, or link backwards.
-        let mut body = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
+        let mut body = Request::Create(create_request())
+            .message(0)
+            .map(|m| m.body)
+            .unwrap();
         let offset = le32(&body, 48).ok_or(Error::Truncated).unwrap() as usize - 64;
         body[offset] = 8; // Next below 16
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
         body[offset] = 0xf0;
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
-        let mut body = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
+        let mut body = Request::Create(create_request())
+            .message(0)
+            .map(|m| m.body)
+            .unwrap();
         body[offset + 6] = 30; // name past its context
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
         let n = body.len();
         body[52..56].copy_from_slice(&((n - offset) as u32 - 4).to_le_bytes());
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
         // A context region of a few bytes.
-        let mut body = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
+        let mut body = Request::Create(create_request())
+            .message(0)
+            .map(|m| m.body)
+            .unwrap();
         body[52..56].copy_from_slice(&8u32.to_le_bytes());
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
         // Negotiate contexts past the end.
         let req = Request::Negotiate(NegotiateRequest {
             dialects: vec![0x311],
-            contexts: vec![NegotiateContext { kind: 1, data: vec![1; 6] }],
+            contexts: vec![NegotiateContext {
+                kind: 1,
+                data: vec![1; 6],
+            }],
             ..Default::default()
         });
         let mut body = req.message(0).map(|m| m.body).unwrap();
         body[32] = 2;
-        assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::Buffer));
+        assert_eq!(
+            Request::parse(command::NEGOTIATE, &body),
+            Err(Error::Buffer)
+        );
         body[32] = 1;
         body[28] = 8;
-        assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::Buffer));
+        assert_eq!(
+            Request::parse(command::NEGOTIATE, &body),
+            Err(Error::Buffer)
+        );
         // Dialects past the end.
-        let mut body =
-            Request::Negotiate(NegotiateRequest { dialects: vec![0x202], ..Default::default() }).message(0).map(|m| m.body).unwrap();
+        let mut body = Request::Negotiate(NegotiateRequest {
+            dialects: vec![0x202],
+            ..Default::default()
+        })
+        .message(0)
+        .map(|m| m.body)
+        .unwrap();
         body[2] = 2;
-        assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::Truncated));
+        assert_eq!(
+            Request::parse(command::NEGOTIATE, &body),
+            Err(Error::Truncated)
+        );
         // Writers refuse what will not fit a field.
-        let long = Request::SessionSetup(SessionSetupRequest { security_buffer: vec![0; 70000], ..Default::default() });
+        let long = Request::SessionSetup(SessionSetupRequest {
+            security_buffer: vec![0; 70000],
+            ..Default::default()
+        });
         assert_eq!(long.message(0).map(|m| m.body), Err(Error::Unwritable));
-        let long = Request::TreeConnect(TreeConnectRequest { flags: 0, path: vec![0x41; 40000] });
+        let long = Request::TreeConnect(TreeConnectRequest {
+            flags: 0,
+            path: vec![0x41; 40000],
+        });
         assert_eq!(long.message(0).map(|m| m.body), Err(Error::Unwritable));
         let long = Request::Write(WriteRequest {
             data: vec![0; 70000],
@@ -3705,21 +4676,49 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(long.message(0).map(|m| m.body), Err(Error::Unwritable));
-        let long = Response::Read { data: vec![0; MAX_MESSAGE + 1], data_remaining: 0, flags: 0 };
-        assert_eq!(long.message(&Header::new(command::READ, 0), 0).map(|m| m.body), Err(Error::Unwritable));
+        let long = Response::Read {
+            data: vec![0; MAX_MESSAGE + 1],
+            data_remaining: 0,
+            flags: 0,
+        };
+        assert_eq!(
+            long.message(&Header::new(command::READ, 0), 0)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
     fn frames_and_errors() {
-        let frame = Frame { payload: vec![0xfe, b'S', b'M', b'B'] };
+        let frame = Frame {
+            payload: vec![0xfe, b'S', b'M', b'B'],
+        };
         let bytes = frame.to_bytes().unwrap();
         assert_eq!(bytes, [0, 0, 0, 4, 0xfe, b'S', b'M', b'B']);
-        for n in 0..bytes.len() { assert_eq!(Frame::parse(&bytes[..n]), Err(Error::Incomplete)); }
+        for n in 0..bytes.len() {
+            assert_eq!(Frame::parse(&bytes[..n]), Err(Error::Incomplete));
+        }
         assert_eq!(Frame::parse(&bytes), Ok(frame));
         assert_eq!(Frame::parse(&[0x85]), Err(Error::FrameType(0x85)));
-        assert_eq!(Frame::parse(&[0, 0xff, 0xff, 0xff]), Err(Error::Length { length: 0xff_ffff, limit: MAX_MESSAGE }));
-        assert_eq!(Frame { payload: vec![0; MAX_MESSAGE + 1] }.to_bytes(), Err(Error::Unwritable));
-        let longest = Frame { payload: vec![7; MAX_MESSAGE] }.to_bytes().unwrap();
+        assert_eq!(
+            Frame::parse(&[0, 0xff, 0xff, 0xff]),
+            Err(Error::Length {
+                length: 0xff_ffff,
+                limit: MAX_MESSAGE
+            })
+        );
+        assert_eq!(
+            Frame {
+                payload: vec![0; MAX_MESSAGE + 1]
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let longest = Frame {
+            payload: vec![7; MAX_MESSAGE],
+        }
+        .to_bytes()
+        .unwrap();
         assert_eq!(longest.len(), MAX_FRAME);
         assert_eq!(Frame::parse(&longest).unwrap().payload.len(), MAX_MESSAGE);
         assert_eq!(Frame::parse(&[0, 0, 0, 0]), Ok(Frame { payload: vec![] }));
@@ -3729,19 +4728,35 @@ mod tests {
     fn stream_splits_frames() {
         let first = Packet::compound(chain()).unwrap();
         let second = Packet::Smb2(vec![Request::Echo.message(7).unwrap()]);
-        let bytes = [Frame::from_packet(&first).unwrap().to_bytes().unwrap(),
-            Frame::from_packet(&second).unwrap().to_bytes().unwrap()].concat();
+        let bytes = [
+            Frame::from_packet(&first).unwrap().to_bytes().unwrap(),
+            Frame::from_packet(&second).unwrap().to_bytes().unwrap(),
+        ]
+        .concat();
         contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
         let (frames, error) = decode_all(Frames::<Frame>::new, &bytes);
         assert_eq!(error, None);
-        assert_eq!(frames.iter().map(|f| Packet::parse(&f.payload).unwrap()).collect::<Vec<_>>(), [first, second]);
-        assert_eq!(decode_all(Frames::<Frame>::new, &[0x81, 0, 0, 0]).1, Some(Fail::Protocol(Error::FrameType(0x81))));
+        assert_eq!(
+            frames
+                .iter()
+                .map(|f| Packet::parse(&f.payload).unwrap())
+                .collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert_eq!(
+            decode_all(Frames::<Frame>::new, &[0x81, 0, 0, 0]).1,
+            Some(Fail::Protocol(Error::FrameType(0x81)))
+        );
     }
 
     #[test]
     fn stream_holds_at_most_max_buffered() {
         let mut d = Stream::new(Frames::<Frame>::new());
-        let big = Frame { payload: vec![1; MAX_MESSAGE] }.to_bytes().unwrap();
+        let big = Frame {
+            payload: vec![1; MAX_MESSAGE],
+        }
+        .to_bytes()
+        .unwrap();
         let stream: Vec<u8> = big.iter().chain(&big).copied().collect();
         assert_eq!(d.push(&stream), MAX_FRAME);
         assert_eq!(d.push(&stream[MAX_FRAME..]), 0);
@@ -3753,12 +4768,21 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_frames_in_linear_time() {
-        assert_linear("stream_takes_many_small_frames_in_linear_time", rounds(50_000), |size| {
-            let bytes = Frame { payload: b"\xffSMB".to_vec() }.to_bytes().unwrap().repeat(size);
-            let (frames, error) = decode_all(Frames::<Frame>::new, &bytes);
-            assert_eq!(frames.len(), size);
-            assert_eq!(error, None);
-        });
+        assert_linear(
+            "stream_takes_many_small_frames_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let bytes = Frame {
+                    payload: b"\xffSMB".to_vec(),
+                }
+                .to_bytes()
+                .unwrap()
+                .repeat(size);
+                let (frames, error) = decode_all(Frames::<Frame>::new, &bytes);
+                assert_eq!(frames.len(), size);
+                assert_eq!(error, None);
+            },
+        );
     }
 
     #[test]
@@ -3798,16 +4822,33 @@ mod tests {
             Ok(Response::ChangeNotify { data: vec![] })
         );
         let resp = Response::ChangeNotify { data: vec![1; 4] };
-        let body = resp.message(&Header::new(command::CHANGE_NOTIFY, 0), status::NOTIFY_ENUM_DIR).map(|m| m.body).unwrap();
-        assert_eq!(Response::parse(command::CHANGE_NOTIFY, status::NOTIFY_ENUM_DIR, &body), Ok(resp));
+        let body = resp
+            .message(
+                &Header::new(command::CHANGE_NOTIFY, 0),
+                status::NOTIFY_ENUM_DIR,
+            )
+            .map(|m| m.body)
+            .unwrap();
+        assert_eq!(
+            Response::parse(command::CHANGE_NOTIFY, status::NOTIFY_ENUM_DIR, &body),
+            Ok(resp)
+        );
         let error = Response::Error(ErrorResponse::default());
         assert_eq!(
-            error.message(&Header::new(command::CHANGE_NOTIFY, 0), status::NOTIFY_ENUM_DIR).map(|m| m.body),
+            error
+                .message(
+                    &Header::new(command::CHANGE_NOTIFY, 0),
+                    status::NOTIFY_ENUM_DIR
+                )
+                .map(|m| m.body),
             Err(Error::Unwritable)
         );
         // Under any other failure it is read as an error body, and these
         // bytes, read that way, claim 72 error contexts in no data.
-        assert_eq!(Response::parse(command::CHANGE_NOTIFY, status::ACCESS_DENIED, &b), Err(Error::Buffer));
+        assert_eq!(
+            Response::parse(command::CHANGE_NOTIFY, status::ACCESS_DENIED, &b),
+            Err(Error::Buffer)
+        );
     }
 
     #[test]
@@ -3815,8 +4856,16 @@ mod tests {
         // 2.2.3: DialectCount MUST be greater than 0.
         let mut body = le(&[36, 0, 0, 0, 0], &[2, 2, 2, 2, 4]);
         body.extend_from_slice(&[0; 24]);
-        assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::NoDialects));
-        assert_eq!(Request::Negotiate(NegotiateRequest::default()).message(0).map(|m| m.body), Err(Error::Unwritable));
+        assert_eq!(
+            Request::parse(command::NEGOTIATE, &body),
+            Err(Error::NoDialects)
+        );
+        assert_eq!(
+            Request::Negotiate(NegotiateRequest::default())
+                .message(0)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
@@ -3839,26 +4888,55 @@ mod tests {
         assert_eq!(Compressed::parse(&b), Err(Error::CompressionFlags(1)));
         b[19] = 0;
         assert!(Compressed::parse(&b).is_ok());
-        let first = ChainedPayload { algorithm: 0, flags: COMPRESSION_FLAG_CHAINED, data: vec![7] };
-        let later = ChainedPayload { algorithm: 0, flags: COMPRESSION_FLAG_CHAINED, data: vec![8] };
-        let bad = Compressed::Chained { original_size: 9, payloads: vec![first.clone(), later] };
+        let first = ChainedPayload {
+            algorithm: 0,
+            flags: COMPRESSION_FLAG_CHAINED,
+            data: vec![7],
+        };
+        let later = ChainedPayload {
+            algorithm: 0,
+            flags: COMPRESSION_FLAG_CHAINED,
+            data: vec![8],
+        };
+        let bad = Compressed::Chained {
+            original_size: 9,
+            payloads: vec![first.clone(), later],
+        };
         assert_eq!(bad.to_bytes(), Err(Error::Unwritable));
         let odd = ChainedPayload { flags: 3, ..first };
-        assert_eq!(Compressed::Chained { original_size: 9, payloads: vec![odd] }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Compressed::Chained {
+                original_size: 9,
+                payloads: vec![odd]
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
     fn write_puts_channel_info_first_when_data_is_long() {
         // Channel info at 112, then 70000 bytes of data at 116: both
         // offsets fit their 16-bit fields, so the writer must find a layout.
-        let mut body = le(&[49, 116, 70000, 0, 0, 0, 1, 0, 112, 4, 0], &[2, 2, 4, 8, 8, 8, 4, 4, 2, 2, 4]);
+        let mut body = le(
+            &[49, 116, 70000, 0, 0, 0, 1, 0, 112, 4, 0],
+            &[2, 2, 4, 8, 8, 8, 4, 4, 2, 2, 4],
+        );
         body.extend_from_slice(&[1, 2, 3, 4]);
         body.extend_from_slice(&vec![9; 70000]);
         let req = Request::parse(command::WRITE, &body).unwrap();
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         // Both too long for any layout: refused.
-        let w = WriteRequest { data: vec![0; 70000], channel: 1, channel_info: vec![1; 65500], ..Default::default() };
-        assert_eq!(Request::Write(w).message(0).map(|m| m.body), Err(Error::Unwritable));
+        let w = WriteRequest {
+            data: vec![0; 70000],
+            channel: 1,
+            channel_info: vec![1; 65500],
+            ..Default::default()
+        };
+        assert_eq!(
+            Request::Write(w).message(0).map(|m| m.body),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
@@ -3866,21 +4944,36 @@ mod tests {
         // QUERY_INFO output at offset 64: inside the fixed part.
         let mut b = le(&[9, 64, 9], &[2, 2, 4]);
         b.push(0);
-        assert_eq!(Response::parse(command::QUERY_INFO, 0, &b), Err(Error::Buffer));
+        assert_eq!(
+            Response::parse(command::QUERY_INFO, 0, &b),
+            Err(Error::Buffer)
+        );
         b[2] = 72;
         b[4] = 1;
-        assert_eq!(Response::parse(command::QUERY_INFO, 0, &b), Ok(Response::QueryInfo { data: vec![0] }));
+        assert_eq!(
+            Response::parse(command::QUERY_INFO, 0, &b),
+            Ok(Response::QueryInfo { data: vec![0] })
+        );
         // A READ response whose DataOffset points into its fixed part.
         let mut r = le(&[17, 64, 0, 4, 0, 0], &[2, 1, 1, 4, 4, 4]);
         r.push(0);
         assert_eq!(Response::parse(command::READ, 0, &r), Err(Error::Buffer));
         // IOCTL input and output over the same bytes would write back twice
         // as long; they are refused. (A request has no output at all.)
-        let resp = Response::Ioctl(IoctlResponse { output: vec![1; 8], ..Default::default() });
-        let mut body = resp.message(&Header::new(command::IOCTL, 0), 0).map(|m| m.body).unwrap();
+        let resp = Response::Ioctl(IoctlResponse {
+            output: vec![1; 8],
+            ..Default::default()
+        });
+        let mut body = resp
+            .message(&Header::new(command::IOCTL, 0), 0)
+            .map(|m| m.body)
+            .unwrap();
         body[24..28].copy_from_slice(&112u32.to_le_bytes());
         body[28..32].copy_from_slice(&8u32.to_le_bytes());
-        assert_eq!(Response::parse(command::IOCTL, 0, &body), Err(Error::Overlap));
+        assert_eq!(
+            Response::parse(command::IOCTL, 0, &body),
+            Err(Error::Overlap)
+        );
         // WRITE data and channel info over the same bytes.
         let req = Request::Write(WriteRequest {
             data: vec![1; 8],
@@ -3892,7 +4985,10 @@ mod tests {
         body[40..42].copy_from_slice(&116u16.to_le_bytes());
         assert_eq!(Request::parse(command::WRITE, &body), Err(Error::Overlap));
         // CREATE contexts that start inside the name.
-        let mut body = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
+        let mut body = Request::Create(create_request())
+            .message(0)
+            .map(|m| m.body)
+            .unwrap();
         body[48..52].copy_from_slice(&128u32.to_le_bytes());
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Overlap));
         // A NEGOTIATE response whose contexts start inside the security buffer.
@@ -3902,18 +4998,30 @@ mod tests {
             contexts: vec![NegotiateContext::preauth_integrity(&[1], &[2; 8]).unwrap()],
             ..Default::default()
         });
-        let mut body = resp.message(&Header::new(command::NEGOTIATE, 0), 0).map(|m| m.body).unwrap();
+        let mut body = resp
+            .message(&Header::new(command::NEGOTIATE, 0), 0)
+            .map(|m| m.body)
+            .unwrap();
         body[60..64].copy_from_slice(&136u32.to_le_bytes());
-        assert_eq!(Response::parse(command::NEGOTIATE, 0, &body), Err(Error::Overlap));
+        assert_eq!(
+            Response::parse(command::NEGOTIATE, 0, &body),
+            Err(Error::Overlap)
+        );
         // NEGOTIATE request contexts over the dialect list.
         let req = Request::Negotiate(NegotiateRequest {
             dialects: vec![0x311; 8],
-            contexts: vec![NegotiateContext { kind: 1, data: vec![] }],
+            contexts: vec![NegotiateContext {
+                kind: 1,
+                data: vec![],
+            }],
             ..Default::default()
         });
         let mut body = req.message(0).map(|m| m.body).unwrap();
         body[28..32].copy_from_slice(&104u32.to_le_bytes());
-        assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::Overlap));
+        assert_eq!(
+            Request::parse(command::NEGOTIATE, &body),
+            Err(Error::Overlap)
+        );
     }
 
     #[test]
@@ -3921,27 +5029,45 @@ mod tests {
         // 2.2.3: the first negotiate context is 8-byte aligned.
         let req = Request::Negotiate(NegotiateRequest {
             dialects: vec![0x311],
-            contexts: vec![NegotiateContext { kind: 1, data: vec![1; 6] }],
+            contexts: vec![NegotiateContext {
+                kind: 1,
+                data: vec![1; 6],
+            }],
             ..Default::default()
         });
         let mut body = req.message(0).map(|m| m.body).unwrap();
         body.insert(40, 0);
         body[28..32].copy_from_slice(&105u32.to_le_bytes());
-        assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::Align(105)));
+        assert_eq!(
+            Request::parse(command::NEGOTIATE, &body),
+            Err(Error::Align(105))
+        );
         // 2.2.13.2: create contexts, their Next and their DataOffset too.
-        let good = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
+        let good = Request::Create(create_request())
+            .message(0)
+            .map(|m| m.body)
+            .unwrap();
         let offset = le32(&good, 48).ok_or(Error::Truncated).unwrap() as usize - 64;
         let mut body = good.clone();
         body.insert(offset, 0);
         body[48..52].copy_from_slice(&(offset as u32 + 65).to_le_bytes());
-        assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Align(offset as u32 + 65)));
+        assert_eq!(
+            Request::parse(command::CREATE, &body),
+            Err(Error::Align(offset as u32 + 65))
+        );
         let mut body = good.clone();
         body[offset] = 20;
-        assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Align(20)));
+        assert_eq!(
+            Request::parse(command::CREATE, &body),
+            Err(Error::Align(20))
+        );
         let second = offset + 24;
         let mut body = good.clone();
         body[second + 10] = 20;
-        assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Align(20)));
+        assert_eq!(
+            Request::parse(command::CREATE, &body),
+            Err(Error::Align(20))
+        );
         // A name inside the context's own header, or data over the name.
         let mut body = good.clone();
         body[second + 4] = 8;
@@ -3958,10 +5084,15 @@ mod tests {
         let n = MAX_MESSAGE - HEADER_LEN;
         let mut q = le(&[9, 72, (n - 8) as u64], &[2, 2, 4]);
         q.resize(n, 5);
-        let m = Message { header: Header::new(command::QUERY_INFO, 0).reply(0), body: q };
+        let m = Message {
+            header: Header::new(command::QUERY_INFO, 0).reply(0),
+            body: q,
+        };
         let bytes = m.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
-        let Packet::Smb2(back) = Packet::parse(&bytes).unwrap() else { panic!() };
+        let Packet::Smb2(back) = Packet::parse(&bytes).unwrap() else {
+            panic!()
+        };
         let resp = back[0].response().unwrap();
         let again = Message::reply_to(&Header::new(command::QUERY_INFO, 0), 0, &resp).unwrap();
         assert_eq!(again.to_bytes().unwrap(), bytes);
@@ -3984,26 +5115,46 @@ mod tests {
         let mut body = vec![4, 0, 0, 0];
         body.resize(MAX_MESSAGE + 1, 0);
         assert_eq!(Request::parse(command::ECHO, &body), Err(Error::TooLong));
-        assert_eq!(Response::parse(command::ECHO, 0, &body), Err(Error::TooLong));
+        assert_eq!(
+            Response::parse(command::ECHO, 0, &body),
+            Err(Error::TooLong)
+        );
         // Writers refuse before they copy or convert.
-        let long = Request::Create(CreateRequest { name: vec![0x41; 40000], ..Default::default() });
+        let long = Request::Create(CreateRequest {
+            name: vec![0x41; 40000],
+            ..Default::default()
+        });
         assert_eq!(long.message(0).map(|m| m.body), Err(Error::Unwritable));
-        let long = Request::QueryDirectory(QueryDirectoryRequest { pattern: vec![0x41; 40000], ..Default::default() });
+        let long = Request::QueryDirectory(QueryDirectoryRequest {
+            pattern: vec![0x41; 40000],
+            ..Default::default()
+        });
         assert_eq!(long.message(0).map(|m| m.body), Err(Error::Unwritable));
-        let long = Response::Other { body: vec![0; MAX_MESSAGE + 1] };
-        assert_eq!(long.message(&Header::new(0x99, 0), 0).map(|m| m.body), Err(Error::Unwritable));
+        let long = Response::Other {
+            body: vec![0; MAX_MESSAGE + 1],
+        };
+        assert_eq!(
+            long.message(&Header::new(0x99, 0), 0).map(|m| m.body),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
     fn tree_connect_extension_is_written_at_the_buffer() {
         // 2.2.9.1: with EXTENSION_PRESENT the Buffer starts with the
         // extension's 16-byte header, then the path.
-        let req = Request::TreeConnect(TreeConnectRequest { flags: 4, path: utf16("\\\\server\\share") });
+        let req = Request::TreeConnect(TreeConnectRequest {
+            flags: 4,
+            path: utf16("\\\\server\\share"),
+        });
         let body = req.message(0).map(|m| m.body).unwrap();
         let path = u16s("\\\\server\\share");
         assert_eq!(le16(&body, 2).ok_or(Error::Truncated), Ok(4));
         assert_eq!(le16(&body, 4).ok_or(Error::Truncated), Ok(88));
-        assert_eq!(le16(&body, 6).ok_or(Error::Truncated), Ok(path.len() as u16));
+        assert_eq!(
+            le16(&body, 6).ok_or(Error::Truncated),
+            Ok(path.len() as u16)
+        );
         assert_eq!(body[8..24], [0; 16]);
         assert_eq!(body[24..], path[..]);
         assert_eq!(Request::parse(command::TREE_CONNECT, &body), Ok(req));
@@ -4021,61 +5172,166 @@ mod tests {
         // The path over the extension's header is refused.
         let mut bad = le(&[9, 4, 72, path.len() as u64], &[2, 2, 2, 2]);
         bad.extend_from_slice(&path);
-        assert_eq!(Request::parse(command::TREE_CONNECT, &bad), Err(Error::Buffer));
+        assert_eq!(
+            Request::parse(command::TREE_CONNECT, &bad),
+            Err(Error::Buffer)
+        );
     }
 
     #[test]
     fn ioctl_response_output_is_eight_byte_aligned() {
         // 2.2.32: OutputOffset is InputOffset + InputCount rounded up to 8.
-        let resp = Response::Ioctl(IoctlResponse { input: vec![1], output: vec![2], ..Default::default() });
-        let body = resp.message(&Header::new(command::IOCTL, 0), 0).map(|m| m.body).unwrap();
-        assert_eq!((le32(&body, 24).ok_or(Error::Truncated), le32(&body, 28).ok_or(Error::Truncated)), (Ok(112), Ok(1)));
-        assert_eq!((le32(&body, 32).ok_or(Error::Truncated), le32(&body, 36).ok_or(Error::Truncated)), (Ok(120), Ok(1)));
+        let resp = Response::Ioctl(IoctlResponse {
+            input: vec![1],
+            output: vec![2],
+            ..Default::default()
+        });
+        let body = resp
+            .message(&Header::new(command::IOCTL, 0), 0)
+            .map(|m| m.body)
+            .unwrap();
+        assert_eq!(
+            (
+                le32(&body, 24).ok_or(Error::Truncated),
+                le32(&body, 28).ok_or(Error::Truncated)
+            ),
+            (Ok(112), Ok(1))
+        );
+        assert_eq!(
+            (
+                le32(&body, 32).ok_or(Error::Truncated),
+                le32(&body, 36).ok_or(Error::Truncated)
+            ),
+            (Ok(120), Ok(1))
+        );
         assert_eq!(body[56], 2);
         assert_eq!(Response::parse(command::IOCTL, 0, &body), Ok(resp));
         // Output right after the input, unaligned, is refused.
-        let mut bad = le(&[49, 0, 0, 0, 0, 112, 1, 113, 1, 0, 0], &[2, 2, 4, 8, 8, 4, 4, 4, 4, 4, 4]);
+        let mut bad = le(
+            &[49, 0, 0, 0, 0, 112, 1, 113, 1, 0, 0],
+            &[2, 2, 4, 8, 8, 4, 4, 4, 4, 4, 4],
+        );
         bad.extend_from_slice(&[1, 2]);
-        assert_eq!(Response::parse(command::IOCTL, 0, &bad), Err(Error::Align(113)));
+        assert_eq!(
+            Response::parse(command::IOCTL, 0, &bad),
+            Err(Error::Align(113))
+        );
         // Aligned output before the end of the input is refused.
-        let mut bad = le(&[49, 0, 0, 0, 0, 112, 9, 112, 1, 0, 0], &[2, 2, 4, 8, 8, 4, 4, 4, 4, 4, 4]);
+        let mut bad = le(
+            &[49, 0, 0, 0, 0, 112, 9, 112, 1, 0, 0],
+            &[2, 2, 4, 8, 8, 4, 4, 4, 4, 4, 4],
+        );
         bad.resize(48 + 9, 0);
-        assert_eq!(Response::parse(command::IOCTL, 0, &bad), Err(Error::Overlap));
+        assert_eq!(
+            Response::parse(command::IOCTL, 0, &bad),
+            Err(Error::Overlap)
+        );
         // No output: OutputOffset 0.
-        let none = Response::Ioctl(IoctlResponse { input: vec![1], ..Default::default() });
-        assert_eq!(le32(&none.message(&Header::new(command::IOCTL, 0), 0).map(|m| m.body).unwrap(), 32).ok_or(Error::Truncated), Ok(0));
+        let none = Response::Ioctl(IoctlResponse {
+            input: vec![1],
+            ..Default::default()
+        });
+        assert_eq!(
+            le32(
+                &none
+                    .message(&Header::new(command::IOCTL, 0), 0)
+                    .map(|m| m.body)
+                    .unwrap(),
+                32
+            )
+            .ok_or(Error::Truncated),
+            Ok(0)
+        );
     }
 
     #[test]
     fn failures_get_error_bodies_but_for_the_listed_exceptions() {
         // 3.3.4.4: ACCESS_DENIED is a failure for ECHO, which has no
         // exception, so its body is an error body.
-        assert_eq!(Response::Echo.message(&Header::new(command::ECHO, 0), status::ACCESS_DENIED).map(|m| m.body), Err(Error::Unwritable));
-        assert_eq!(Response::parse(command::ECHO, status::ACCESS_DENIED, &[4, 0, 0, 0]), Err(Error::StructureSize(4)));
-        let read = Response::Read { data: vec![1], data_remaining: 0, flags: 0 };
-        assert_eq!(read.message(&Header::new(command::READ, 0), status::END_OF_FILE).map(|m| m.body), Err(Error::Unwritable));
+        assert_eq!(
+            Response::Echo
+                .message(&Header::new(command::ECHO, 0), status::ACCESS_DENIED)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Response::parse(command::ECHO, status::ACCESS_DENIED, &[4, 0, 0, 0]),
+            Err(Error::StructureSize(4))
+        );
+        let read = Response::Read {
+            data: vec![1],
+            data_remaining: 0,
+            flags: 0,
+        };
+        assert_eq!(
+            read.message(&Header::new(command::READ, 0), status::END_OF_FILE)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
         let create = Response::Create(CreateResponse::default());
-        assert_eq!(create.message(&Header::new(command::CREATE, 0), status::BUFFER_OVERFLOW).map(|m| m.body), Err(Error::Unwritable));
+        assert_eq!(
+            create
+                .message(&Header::new(command::CREATE, 0), status::BUFFER_OVERFLOW)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
         // The exceptions keep their own bodies.
-        assert!(read.message(&Header::new(command::READ, 0), status::BUFFER_OVERFLOW).map(|m| m.body).is_ok());
+        assert!(
+            read.message(&Header::new(command::READ, 0), status::BUFFER_OVERFLOW)
+                .map(|m| m.body)
+                .is_ok()
+        );
         let ioctl = Response::Ioctl(IoctlResponse::default());
-        assert!(ioctl.message(&Header::new(command::IOCTL, 0), status::BUFFER_OVERFLOW).map(|m| m.body).is_ok());
-        assert!(ioctl.message(&Header::new(command::IOCTL, 0), status::INVALID_PARAMETER).map(|m| m.body).is_ok());
-        assert_eq!(ioctl.message(&Header::new(command::IOCTL, 0), status::ACCESS_DENIED).map(|m| m.body), Err(Error::Unwritable));
+        assert!(
+            ioctl
+                .message(&Header::new(command::IOCTL, 0), status::BUFFER_OVERFLOW)
+                .map(|m| m.body)
+                .is_ok()
+        );
+        assert!(
+            ioctl
+                .message(&Header::new(command::IOCTL, 0), status::INVALID_PARAMETER)
+                .map(|m| m.body)
+                .is_ok()
+        );
+        assert_eq!(
+            ioctl
+                .message(&Header::new(command::IOCTL, 0), status::ACCESS_DENIED)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
     fn smb_311_negotiate_responses_carry_one_preauth_context() {
         let preauth = NegotiateContext::preauth_integrity(&[1], &[7; 32]).unwrap();
-        let signing = NegotiateContext::algorithms(negotiate_context::SIGNING_CAPABILITIES, &[1]).unwrap();
+        let signing =
+            NegotiateContext::algorithms(negotiate_context::SIGNING_CAPABILITIES, &[1]).unwrap();
         let response = |contexts: Vec<NegotiateContext>| {
-            Response::Negotiate(NegotiateResponse { dialect: dialect::SMB_3_1_1, contexts, ..Default::default() })
+            Response::Negotiate(NegotiateResponse {
+                dialect: dialect::SMB_3_1_1,
+                contexts,
+                ..Default::default()
+            })
         };
         // 3.2.5.2: a client refuses none, two, or two of one other kind.
-        assert_eq!(response(vec![]).message(&Header::new(0, 0), 0).map(|m| m.body), Err(Error::Unwritable));
-        assert_eq!(response(vec![preauth.clone(), preauth.clone()]).message(&Header::new(0, 0), 0).map(|m| m.body), Err(Error::Unwritable));
+        assert_eq!(
+            response(vec![])
+                .message(&Header::new(0, 0), 0)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            response(vec![preauth.clone(), preauth.clone()])
+                .message(&Header::new(0, 0), 0)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
         let two_signing = response(vec![preauth.clone(), signing.clone(), signing.clone()]);
-        assert_eq!(two_signing.message(&Header::new(0, 0), 0).map(|m| m.body), Err(Error::Unwritable));
+        assert_eq!(
+            two_signing.message(&Header::new(0, 0), 0).map(|m| m.body),
+            Err(Error::Unwritable)
+        );
         let good = response(vec![preauth, signing]);
         let mut body = good.message(&Header::new(0, 0), 0).map(|m| m.body).unwrap();
         assert_eq!(Response::parse(0, 0, &body), Ok(good));
@@ -4092,22 +5348,38 @@ mod tests {
     fn channel_none_ignores_channel_info() {
         // 2.2.19: with SMB2_CHANNEL_NONE the server ignores
         // ReadChannelInfoOffset and ReadChannelInfoLength.
-        let mut read = le(&[49, 0, 0, 10, 0, 1, 2, 0, 0, 0, 0xffff, 1], &[2, 1, 1, 4, 8, 8, 8, 4, 4, 4, 2, 2]);
+        let mut read = le(
+            &[49, 0, 0, 10, 0, 1, 2, 0, 0, 0, 0xffff, 1],
+            &[2, 1, 1, 4, 8, 8, 8, 4, 4, 4, 2, 2],
+        );
         read.push(0);
-        let Ok(Request::Read(r)) = Request::parse(command::READ, &read) else { panic!() };
+        let Ok(Request::Read(r)) = Request::parse(command::READ, &read) else {
+            panic!()
+        };
         assert!(r.channel_info.is_empty());
         // With RDMA_V1 the same fields are read, and point nowhere.
         read[36] = 1;
         assert_eq!(Request::parse(command::READ, &read), Err(Error::Buffer));
         // 2.2.21: the same for WRITE.
-        let mut write = le(&[49, 112, 3, 0, 1, 2, 0, 0, 0xffff, 1, 0], &[2, 2, 4, 8, 8, 8, 4, 4, 2, 2, 4]);
+        let mut write = le(
+            &[49, 112, 3, 0, 1, 2, 0, 0, 0xffff, 1, 0],
+            &[2, 2, 4, 8, 8, 8, 4, 4, 2, 2, 4],
+        );
         write.extend_from_slice(b"abc");
-        let Ok(Request::Write(w)) = Request::parse(command::WRITE, &write) else { panic!() };
+        let Ok(Request::Write(w)) = Request::parse(command::WRITE, &write) else {
+            panic!()
+        };
         assert_eq!((w.data, w.channel_info), (b"abc".to_vec(), vec![]));
         // Writers refuse channel info with channel NONE.
-        let r = Request::Read(ReadRequest { channel_info: vec![1], ..Default::default() });
+        let r = Request::Read(ReadRequest {
+            channel_info: vec![1],
+            ..Default::default()
+        });
         assert_eq!(r.message(0).map(|m| m.body), Err(Error::Unwritable));
-        let w = Request::Write(WriteRequest { channel_info: vec![1], ..Default::default() });
+        let w = Request::Write(WriteRequest {
+            channel_info: vec![1],
+            ..Default::default()
+        });
         assert_eq!(w.message(0).map(|m| m.body), Err(Error::Unwritable));
     }
 
@@ -4137,35 +5409,58 @@ mod tests {
         offset.extend_from_slice(&4096u64.to_le_bytes());
         offset.extend_from_slice(b"AlSi");
         let body = create_with(120, &[], &offset);
-        let Ok(Request::Create(c)) = Request::parse(command::CREATE, &body) else { panic!() };
-        let want = CreateContext { name: b"AlSi".to_vec(), data: 4096u64.to_le_bytes().to_vec() };
+        let Ok(Request::Create(c)) = Request::parse(command::CREATE, &body) else {
+            panic!()
+        };
+        let want = CreateContext {
+            name: b"AlSi".to_vec(),
+            data: 4096u64.to_le_bytes().to_vec(),
+        };
         assert_eq!(c.contexts, [want]);
         // Written back with the name first: at most 7 bytes longer.
-        let back = Request::Create(c.clone()).message(0).map(|m| m.body).unwrap();
+        let back = Request::Create(c.clone())
+            .message(0)
+            .map(|m| m.body)
+            .unwrap();
         assert!(back.len() <= body.len() + 7);
-        assert_eq!(Request::parse(command::CREATE, &back), Ok(Request::Create(c)));
+        assert_eq!(
+            Request::parse(command::CREATE, &back),
+            Ok(Request::Create(c))
+        );
         // Name and data over the same bytes are still refused.
         let mut offset = le(&[0, 16, 4, 0, 16, 8], &[4, 2, 2, 2, 2, 4]);
         offset.extend_from_slice(&[0; 8]);
-        assert_eq!(Request::parse(command::CREATE, &create_with(120, &[], &offset)), Err(Error::Overlap));
+        assert_eq!(
+            Request::parse(command::CREATE, &create_with(120, &[], &offset)),
+            Err(Error::Overlap)
+        );
     }
 
     #[test]
     fn create_names_are_aligned_and_next_points_at_a_context() {
         // 2.2.13: the file name is 8-byte aligned.
         let body = create_with(122, &u16s("a"), &[]);
-        assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Align(122)));
+        assert_eq!(
+            Request::parse(command::CREATE, &body),
+            Err(Error::Align(122))
+        );
         assert!(Request::parse(command::CREATE, &create_with(128, &u16s("a"), &[])).is_ok());
         // 2.2.13.2: a create context's name is 8-byte aligned.
         let mut offset = le(&[0, 17, 4, 0, 0, 0], &[4, 2, 2, 2, 2, 4]);
         offset.extend_from_slice(b"\0MxAc");
-        assert_eq!(Request::parse(command::CREATE, &create_with(120, &[], &offset)), Err(Error::Align(17)));
+        assert_eq!(
+            Request::parse(command::CREATE, &create_with(120, &[], &offset)),
+            Err(Error::Align(17))
+        );
         // A Next of 24 that reaches the end of the region, with no context
         // there.
         let mut offset = le(&[24, 16, 4, 0, 0, 0], &[4, 2, 2, 2, 2, 4]);
         offset.extend_from_slice(b"MxAc");
         offset.resize(24, 0);
-        assert_eq!(Request::parse(command::CREATE, &create_with(120, &[], &offset)), Err(Error::Buffer));
+        assert_eq!(
+            Request::parse(command::CREATE, &create_with(120, &[], &offset)),
+            Err(Error::Buffer)
+        );
         offset[0] = 0;
         assert!(Request::parse(command::CREATE, &create_with(120, &[], &offset)).is_ok());
     }
@@ -4176,16 +5471,38 @@ mod tests {
         let body = create_with(120, &[], &[]);
         assert_eq!(body.len(), 57);
         assert!(Request::parse(command::CREATE, &body).is_ok());
-        assert_eq!(Request::parse(command::CREATE, &body[..56]), Err(Error::Truncated));
+        assert_eq!(
+            Request::parse(command::CREATE, &body[..56]),
+            Err(Error::Truncated)
+        );
     }
 
     #[test]
     fn transform_headers_need_flags_one_and_a_message() {
         // 2.2.41 and 3.3.5.2.1.1.
         assert_eq!(Transform::default().to_bytes(), Err(Error::Unwritable));
-        assert_eq!(Transform { flags: 1, ..Default::default() }.to_bytes(), Err(Error::Unwritable));
-        assert_eq!(Transform { flags: 2, data: vec![1], ..Default::default() }.to_bytes(), Err(Error::Unwritable));
-        let good = Transform { flags: 1, data: vec![1], ..Default::default() };
+        assert_eq!(
+            Transform {
+                flags: 1,
+                ..Default::default()
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Transform {
+                flags: 2,
+                data: vec![1],
+                ..Default::default()
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let good = Transform {
+            flags: 1,
+            data: vec![1],
+            ..Default::default()
+        };
         let mut b = good.to_bytes().unwrap();
         assert_eq!(Packet::parse(&b), Ok(Packet::Transform(good)));
         b[42] = 0;
@@ -4199,11 +5516,25 @@ mod tests {
         // 2.2.42.2.1: LZNT1, LZ77, LZ77+Huffman and LZ4 carry a 4-byte
         // OriginalPayloadSize inside Length.
         for algorithm in [1, 2, 3, 5] {
-            let short = ChainedPayload { algorithm, flags: 1, data: vec![0; 3] };
-            let c = Compressed::Chained { original_size: 9, payloads: vec![short] };
+            let short = ChainedPayload {
+                algorithm,
+                flags: 1,
+                data: vec![0; 3],
+            };
+            let c = Compressed::Chained {
+                original_size: 9,
+                payloads: vec![short],
+            };
             assert_eq!(c.to_bytes(), Err(Error::Unwritable), "{algorithm}");
-            let ok = ChainedPayload { algorithm, flags: 1, data: vec![9, 0, 0, 0] };
-            let c = Compressed::Chained { original_size: 9, payloads: vec![ok] };
+            let ok = ChainedPayload {
+                algorithm,
+                flags: 1,
+                data: vec![9, 0, 0, 0],
+            };
+            let c = Compressed::Chained {
+                original_size: 9,
+                payloads: vec![ok],
+            };
             let mut b = c.to_bytes().unwrap();
             assert_eq!(Compressed::parse(&b), Ok(c));
             b[12] = 3;
@@ -4213,7 +5544,11 @@ mod tests {
         // NONE and Pattern_V1 have no such field.
         let none = Compressed::Chained {
             original_size: 0,
-            payloads: vec![ChainedPayload { algorithm: 0, flags: 1, data: vec![] }],
+            payloads: vec![ChainedPayload {
+                algorithm: 0,
+                flags: 1,
+                data: vec![],
+            }],
         };
         assert_eq!(Compressed::parse(&none.to_bytes().unwrap()), Ok(none));
     }
@@ -4221,32 +5556,82 @@ mod tests {
     #[test]
     fn error_contexts_fit_their_count() {
         // 2.2.2: ErrorContextCount contexts, each 8-byte aligned.
-        let missing = Response::Error(ErrorResponse { context_count: 1, data: vec![] });
-        assert_eq!(missing.message(&Header::new(command::CREATE, 0), status::ACCESS_DENIED).map(|m| m.body), Err(Error::Unwritable));
+        let missing = Response::Error(ErrorResponse {
+            context_count: 1,
+            data: vec![],
+        });
         assert_eq!(
-            Response::parse(command::CREATE, status::ACCESS_DENIED, &[9, 0, 1, 0, 0, 0, 0, 0, 0]),
+            missing
+                .message(&Header::new(command::CREATE, 0), status::ACCESS_DENIED)
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Response::parse(
+                command::CREATE,
+                status::ACCESS_DENIED,
+                &[9, 0, 1, 0, 0, 0, 0, 0, 0]
+            ),
             Err(Error::Buffer)
         );
         // Two contexts: 3 bytes of data, padding to 16, then an empty one.
         let mut data = le(&[3, 0], &[4, 4]);
         data.extend_from_slice(&[1, 2, 3, 0, 0, 0, 0, 0]);
         data.extend_from_slice(&le(&[0, 0x7264_5253], &[4, 4]));
-        let two = Response::Error(ErrorResponse { context_count: 2, data: data.clone() });
-        let body = two.message(&Header::new(command::TREE_CONNECT, 0), status::BAD_NETWORK_NAME).map(|m| m.body).unwrap();
-        assert_eq!(Response::parse(command::TREE_CONNECT, status::BAD_NETWORK_NAME, &body), Ok(two));
+        let two = Response::Error(ErrorResponse {
+            context_count: 2,
+            data: data.clone(),
+        });
+        let body = two
+            .message(
+                &Header::new(command::TREE_CONNECT, 0),
+                status::BAD_NETWORK_NAME,
+            )
+            .map(|m| m.body)
+            .unwrap();
+        assert_eq!(
+            Response::parse(command::TREE_CONNECT, status::BAD_NETWORK_NAME, &body),
+            Ok(two)
+        );
         // Without the padding the second context does not fit.
         data.drain(11..16);
-        let unpadded = Response::Error(ErrorResponse { context_count: 2, data });
-        assert_eq!(unpadded.message(&Header::new(command::TREE_CONNECT, 0), status::BAD_NETWORK_NAME).map(|m| m.body), Err(Error::Unwritable));
+        let unpadded = Response::Error(ErrorResponse {
+            context_count: 2,
+            data,
+        });
+        assert_eq!(
+            unpadded
+                .message(
+                    &Header::new(command::TREE_CONNECT, 0),
+                    status::BAD_NETWORK_NAME
+                )
+                .map(|m| m.body),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
     fn ioctl_requests_carry_no_output() {
         // 2.2.31: "OutputCount: The client MUST set this to 0."
-        let req = Request::Ioctl(IoctlRequest { output: vec![1], ..Default::default() });
+        let req = Request::Ioctl(IoctlRequest {
+            output: vec![1],
+            ..Default::default()
+        });
         assert_eq!(req.message(0).map(|m| m.body), Err(Error::Unwritable));
-        let mut body = Request::Ioctl(IoctlRequest { input: vec![1; 8], ..Default::default() }).message(0).map(|m| m.body).unwrap();
-        assert_eq!((le32(&body, 36).ok_or(Error::Truncated), le32(&body, 40).ok_or(Error::Truncated)), (Ok(0), Ok(0)));
+        let mut body = Request::Ioctl(IoctlRequest {
+            input: vec![1; 8],
+            ..Default::default()
+        })
+        .message(0)
+        .map(|m| m.body)
+        .unwrap();
+        assert_eq!(
+            (
+                le32(&body, 36).ok_or(Error::Truncated),
+                le32(&body, 40).ok_or(Error::Truncated)
+            ),
+            (Ok(0), Ok(0))
+        );
         body[36..40].copy_from_slice(&128u32.to_le_bytes());
         assert!(Request::parse(command::IOCTL, &body).is_ok());
         body[40..44].copy_from_slice(&1u32.to_le_bytes());
@@ -4255,7 +5640,10 @@ mod tests {
 
     /// One request of each kind, with buffers filled.
     fn requests() -> Vec<Request> {
-        let fid = FileId { persistent: 3, volatile: 4 };
+        let fid = FileId {
+            persistent: 3,
+            volatile: 4,
+        };
         vec![
             Request::Negotiate(NegotiateRequest {
                 security_mode: 1,
@@ -4266,10 +5654,17 @@ mod tests {
                 contexts: vec![
                     NegotiateContext::preauth_integrity(&[1], &[7; 32]).unwrap(),
                     NegotiateContext::algorithms(2, &[2, 1]).unwrap(),
-                    NegotiateContext { kind: 5, data: u16s("fs1") },
+                    NegotiateContext {
+                        kind: 5,
+                        data: u16s("fs1"),
+                    },
                 ],
             }),
-            Request::Negotiate(NegotiateRequest { dialects: vec![0x202], client_start_time: 5, ..Default::default() }),
+            Request::Negotiate(NegotiateRequest {
+                dialects: vec![0x202],
+                client_start_time: 5,
+                ..Default::default()
+            }),
             Request::SessionSetup(SessionSetupRequest {
                 flags: 1,
                 security_mode: 2,
@@ -4278,11 +5673,17 @@ mod tests {
                 ..Default::default()
             }),
             Request::Logoff,
-            Request::TreeConnect(TreeConnectRequest { flags: 0, path: utf16("\\\\fs1\\share") }),
+            Request::TreeConnect(TreeConnectRequest {
+                flags: 0,
+                path: utf16("\\\\fs1\\share"),
+            }),
             Request::TreeDisconnect,
             Request::Create(create_request()),
             Request::Create(CreateRequest::default()),
-            Request::Close { flags: 1, file_id: fid },
+            Request::Close {
+                flags: 1,
+                file_id: fid,
+            },
             Request::Flush { file_id: fid },
             Request::Read(ReadRequest {
                 length: 10,
@@ -4302,7 +5703,14 @@ mod tests {
             Request::Lock(LockRequest {
                 lock_sequence: 1,
                 file_id: fid,
-                locks: vec![Lock { offset: 1, length: 2, flags: 2 }; 3],
+                locks: vec![
+                    Lock {
+                        offset: 1,
+                        length: 2,
+                        flags: 2
+                    };
+                    3
+                ],
             }),
             Request::Ioctl(IoctlRequest {
                 ctl_code: 0x0011_c017,
@@ -4340,7 +5748,10 @@ mod tests {
                 data: vec![1; 40],
                 ..Default::default()
             }),
-            Request::Other { command: command::OPLOCK_BREAK, body: vec![24, 0, 1, 0] },
+            Request::Other {
+                command: command::OPLOCK_BREAK,
+                body: vec![24, 0, 1, 0],
+            },
         ]
     }
 
@@ -4363,9 +5774,19 @@ mod tests {
             (
                 1,
                 status::MORE_PROCESSING_REQUIRED,
-                Response::SessionSetup { session_flags: 0, security_buffer: vec![0xa1; 9] },
+                Response::SessionSetup {
+                    session_flags: 0,
+                    security_buffer: vec![0xa1; 9],
+                },
             ),
-            (1, 0, Response::SessionSetup { session_flags: 1, security_buffer: vec![] }),
+            (
+                1,
+                0,
+                Response::SessionSetup {
+                    session_flags: 1,
+                    security_buffer: vec![],
+                },
+            ),
             (2, 0, Response::Logoff),
             (
                 3,
@@ -4383,14 +5804,42 @@ mod tests {
                 0,
                 Response::Create(CreateResponse {
                     create_action: 2,
-                    contexts: vec![CreateContext { name: b"QFid".to_vec(), data: vec![1; 32] }],
+                    contexts: vec![CreateContext {
+                        name: b"QFid".to_vec(),
+                        data: vec![1; 32],
+                    }],
                     ..Default::default()
                 }),
             ),
-            (6, 0, Response::Close { flags: 1, info: FileInfo { end_of_file: 5, ..Default::default() } }),
+            (
+                6,
+                0,
+                Response::Close {
+                    flags: 1,
+                    info: FileInfo {
+                        end_of_file: 5,
+                        ..Default::default()
+                    },
+                },
+            ),
             (7, 0, Response::Flush),
-            (8, status::BUFFER_OVERFLOW, Response::Read { data: vec![1; 7], data_remaining: 0, flags: 0 }),
-            (9, 0, Response::Write { count: 4, remaining: 0 }),
+            (
+                8,
+                status::BUFFER_OVERFLOW,
+                Response::Read {
+                    data: vec![1; 7],
+                    data_remaining: 0,
+                    flags: 0,
+                },
+            ),
+            (
+                9,
+                0,
+                Response::Write {
+                    count: 4,
+                    remaining: 0,
+                },
+            ),
             (10, 0, Response::Lock),
             (
                 11,
@@ -4405,15 +5854,32 @@ mod tests {
             (13, 0, Response::Echo),
             (14, 0, Response::QueryDirectory { data: vec![0; 104] }),
             (15, 0, Response::ChangeNotify { data: vec![] }),
-            (16, status::BUFFER_OVERFLOW, Response::QueryInfo { data: vec![1; 3] }),
+            (
+                16,
+                status::BUFFER_OVERFLOW,
+                Response::QueryInfo { data: vec![1; 3] },
+            ),
             (17, 0, Response::SetInfo),
-            (5, status::OBJECT_NAME_NOT_FOUND, Response::Error(ErrorResponse::default())),
+            (
+                5,
+                status::OBJECT_NAME_NOT_FOUND,
+                Response::Error(ErrorResponse::default()),
+            ),
             (
                 15,
                 status::PENDING,
-                Response::Error(ErrorResponse { context_count: 1, data: le(&[4, 0, 0x0101_0101], &[4, 4, 4]) }),
+                Response::Error(ErrorResponse {
+                    context_count: 1,
+                    data: le(&[4, 0, 0x0101_0101], &[4, 4, 4]),
+                }),
             ),
-            (0x12, 0, Response::Other { body: vec![24, 0, 1, 0] }),
+            (
+                0x12,
+                0,
+                Response::Other {
+                    body: vec![24, 0, 1, 0],
+                },
+            ),
         ]
     }
 
@@ -4421,7 +5887,11 @@ mod tests {
     fn what_writers_accept_reads_back_the_same() {
         for req in requests() {
             let body = req.message(0).map(|m| m.body).unwrap();
-            assert_eq!(Request::parse(req.command(), &body), Ok(req.clone()), "{req:?}");
+            assert_eq!(
+                Request::parse(req.command(), &body),
+                Ok(req.clone()),
+                "{req:?}"
+            );
         }
         for (c, s, resp) in responses() {
             let body = resp.message(&Header::new(c, 0), s).map(|m| m.body).unwrap();
@@ -4441,14 +5911,33 @@ mod tests {
             out.push(m.to_bytes().unwrap());
         }
         out.push(Packet::compound(chain()).unwrap().to_bytes().unwrap());
-        out.push(Transform { flags: 1, data: vec![1; 20], ..Default::default() }.to_bytes().unwrap());
         out.push(
-            Compressed::Unchained { original_size: 9, algorithm: 2, offset: 1, data: vec![3; 9] }.to_bytes().unwrap(),
+            Transform {
+                flags: 1,
+                data: vec![1; 20],
+                ..Default::default()
+            }
+            .to_bytes()
+            .unwrap(),
+        );
+        out.push(
+            Compressed::Unchained {
+                original_size: 9,
+                algorithm: 2,
+                offset: 1,
+                data: vec![3; 9],
+            }
+            .to_bytes()
+            .unwrap(),
         );
         out.push(
             Compressed::Chained {
                 original_size: 9,
-                payloads: vec![ChainedPayload { algorithm: 0, flags: 1, data: vec![1; 9] }],
+                payloads: vec![ChainedPayload {
+                    algorithm: 0,
+                    flags: 1,
+                    data: vec![1; 9],
+                }],
             }
             .to_bytes()
             .unwrap(),
@@ -4459,10 +5948,14 @@ mod tests {
     /// Reads a payload every way there is, checks that what reads writes
     /// back and reads the same, and never panics.
     fn read_everything(payload: &[u8], status: u32) {
-        let Ok(packet) = Packet::parse(payload) else { return };
+        let Ok(packet) = Packet::parse(payload) else {
+            return;
+        };
         let bytes = packet.to_bytes().unwrap();
         assert_eq!(Packet::parse(&bytes), Ok(packet.clone()));
-        let Packet::Smb2(messages) = packet else { return };
+        let Packet::Smb2(messages) = packet else {
+            return;
+        };
         // A chain read writes back byte for byte.
         assert_eq!(bytes, payload);
         for m in &messages {
@@ -4473,7 +5966,10 @@ mod tests {
             }
             for s in [m.header.status, status] {
                 if let Ok(resp) = Response::parse(m.header.command, s, &m.body) {
-                    let body = resp.message(&Header::new(m.header.command, 0), s).map(|m| m.body).unwrap();
+                    let body = resp
+                        .message(&Header::new(m.header.command, 0), s)
+                        .map(|m| m.body)
+                        .unwrap();
                     assert!(no_longer(m.header.command, &body, &m.body), "{resp:?}");
                     assert_eq!(Response::parse(m.header.command, s, &body), Ok(resp));
                 }
@@ -4492,7 +5988,11 @@ mod tests {
                 }
                 read_everything(&whole[..n], status::BUFFER_OVERFLOW);
             }
-            let f = Frame { payload: whole.clone() }.to_bytes().unwrap();
+            let f = Frame {
+                payload: whole.clone(),
+            }
+            .to_bytes()
+            .unwrap();
             for n in 0..f.len() {
                 assert_eq!(Frame::parse(&f[..n]), Err(Error::Incomplete));
             }
@@ -4505,7 +6005,10 @@ mod tests {
                 continue;
             }
             for n in 0..size {
-                assert!(Request::parse(req.command(), &body[..n]).is_err(), "{req:?} at {n}");
+                assert!(
+                    Request::parse(req.command(), &body[..n]).is_err(),
+                    "{req:?} at {n}"
+                );
             }
         }
         for (c, s, resp) in responses() {
@@ -4515,7 +6018,10 @@ mod tests {
             }
             let size = usize::from(le16(&body, 0).ok_or(Error::Truncated).unwrap() & !1);
             for n in 0..size {
-                assert!(Response::parse(c, s, &body[..n]).is_err(), "{resp:?} at {n}");
+                assert!(
+                    Response::parse(c, s, &body[..n]).is_err(),
+                    "{resp:?} at {n}"
+                );
             }
         }
     }
@@ -4559,13 +6065,20 @@ mod tests {
                 assert_eq!(Request::parse(command, &back), Ok(req));
             }
             if let Ok(resp) = Response::parse(command, status, body) {
-                let back = resp.message(&Header::new(command, 0), status).map(|m| m.body).unwrap();
+                let back = resp
+                    .message(&Header::new(command, 0), status)
+                    .map(|m| m.body)
+                    .unwrap();
                 assert!(no_longer(command, &back, body), "{resp:?}");
                 assert_eq!(Response::parse(command, status, &back), Ok(resp));
             }
             let mut stream = Frame { payload }.to_bytes().unwrap();
             if rng.coin() {
-                Frame { payload: corpus[rng.index(corpus.len())].clone() }.write(&mut stream).unwrap();
+                Frame {
+                    payload: corpus[rng.index(corpus.len())].clone(),
+                }
+                .write(&mut stream)
+                .unwrap();
             }
             mutate(&mut rng, &mut stream);
             contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &stream, 2 * MAX_FRAME);

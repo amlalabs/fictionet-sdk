@@ -1,10 +1,7 @@
 //! Public wire units preserve protocol boundaries and constructor choices.
 
 use fictionet::stdlib::{
-    bacnet,
-    codec::{Wire},
-    test_support::contract,
-    dtls, l2tp, nbns, ntlmssp, pcp,
+    bacnet, codec::Wire, dtls, l2tp, nbns, ntlmssp, pcp, test_support::contract,
 };
 use std::net::Ipv4Addr;
 
@@ -46,7 +43,10 @@ fn complete_units_refuse_a_second_unit() {
     });
     let datagram = dtls::Datagram::new(&[record.clone(), record.clone()], 8).unwrap();
     let bytes = datagram.to_bytes().unwrap();
-    assert_eq!(dtls::Datagram::read(&bytes, 8), Ok(vec![record.clone(), record]));
+    assert_eq!(
+        dtls::Datagram::read(&bytes, 8),
+        Ok(vec![record.clone(), record])
+    );
     contract::check_wire_value(&datagram);
     assert_eq!(
         dtls::Record::read(&bytes, 8),
@@ -64,7 +64,10 @@ fn control_ignores_trailing_bytes_and_nat_pmp_refuses_them() {
 
     let mut bytes = pcp::NatPmpRequest::ExternalAddress.to_bytes().unwrap();
     bytes.push(0);
-    assert_eq!(pcp::NatPmpRequest::parse(&bytes), Err(pcp::Error::NatPmpTrailing));
+    assert_eq!(
+        pcp::NatPmpRequest::parse(&bytes),
+        Err(pcp::Error::NatPmpTrailing)
+    );
     contract::check_wire::<pcp::NatPmpRequest>(&bytes);
 }
 

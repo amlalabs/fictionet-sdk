@@ -88,13 +88,18 @@ pub(crate) fn frame(dst: Mac, src: Mac, ethertype: u16, payload: &[u8]) -> Vec<u
 /// A known subnet's directed broadcast also uses the broadcast MAC.
 /// Prefixes /31 and /32 have no directed broadcast. With Family::FromWorld,
 /// attach does not know the subnet and treats directed broadcasts as unicast.
-pub(crate) fn destination(packet: &[u8], vm: Option<Mac>, subnet: Option<(Ipv4Addr, u8)>) -> Option<(Mac, u16)> {
+pub(crate) fn destination(
+    packet: &[u8],
+    vm: Option<Mac>,
+    subnet: Option<(Ipv4Addr, u8)>,
+) -> Option<(Mac, u16)> {
     match packet.first()? >> 4 {
         4 if packet.len() >= 20 => {
             let d: [u8; 4] = packet[16..20].try_into().unwrap();
-            let mac = if d == [255; 4] || subnet.is_some_and(|(addr, prefix)| {
-                prefix < 31 && u32::from_be_bytes(d) == u32::from(addr) | (u32::MAX >> prefix)
-            }) {
+            let mac = if d == [255; 4]
+                || subnet.is_some_and(|(addr, prefix)| {
+                    prefix < 31 && u32::from_be_bytes(d) == u32::from(addr) | (u32::MAX >> prefix)
+                }) {
                 BROADCAST
             } else if Ipv4Addr::from(d).is_multicast() {
                 [0x01, 0x00, 0x5e, d[1] & 0x7f, d[2], d[3]]
@@ -105,7 +110,11 @@ pub(crate) fn destination(packet: &[u8], vm: Option<Mac>, subnet: Option<(Ipv4Ad
         }
         6 if packet.len() >= 40 => {
             let d = &packet[24..40];
-            let mac = if d[0] == 0xff { [0x33, 0x33, d[12], d[13], d[14], d[15]] } else { vm? };
+            let mac = if d[0] == 0xff {
+                [0x33, 0x33, d[12], d[13], d[14], d[15]]
+            } else {
+                vm?
+            };
             Some((mac, IPV6))
         }
         _ => None,
@@ -149,12 +158,27 @@ pub(crate) fn ip_packet(ethertype: u16, payload: &[u8]) -> Option<&[u8]> {
 /// An IPv4 packet around `payload`, with TTL 64, identification 0, no
 /// flags and a correct header checksum.
 pub(crate) fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Vec<u8> {
-    ip::packet_with(src.into(), dst.into(), proto, Fields { dont_fragment: false, ..Fields::default() }, payload).0
+    ip::packet_with(
+        src.into(),
+        dst.into(),
+        proto,
+        Fields {
+            dont_fragment: false,
+            ..Fields::default()
+        },
+        payload,
+    )
+    .0
 }
 
 /// A UDP datagram in an IPv4 packet, with a correct checksum.
 pub(crate) fn udp4(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8]) -> Vec<u8> {
-    ipv4(src, dst, UDP, &udp(src.into(), sport, dst.into(), dport, data))
+    ipv4(
+        src,
+        dst,
+        UDP,
+        &udp(src.into(), sport, dst.into(), dport, data),
+    )
 }
 
 /// A UDP datagram from `src` to `dst`, with a correct checksum.
@@ -174,13 +198,35 @@ fn udp(src: IpAddr, sport: u16, dst: IpAddr, dport: u16, data: &[u8]) -> Vec<u8>
 }
 
 /// An IPv6 packet around `payload`.
-pub(crate) fn ipv6(src: Ipv6Addr, dst: Ipv6Addr, next: u8, hop_limit: u8, payload: &[u8]) -> Vec<u8> {
-    ip::packet_with(src.into(), dst.into(), next, Fields { ttl: hop_limit, ..Fields::default() }, payload).0
+pub(crate) fn ipv6(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    next: u8,
+    hop_limit: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    ip::packet_with(
+        src.into(),
+        dst.into(),
+        next,
+        Fields {
+            ttl: hop_limit,
+            ..Fields::default()
+        },
+        payload,
+    )
+    .0
 }
 
 /// A UDP datagram in an IPv6 packet, with a correct checksum.
 pub(crate) fn udp6(src: Ipv6Addr, sport: u16, dst: Ipv6Addr, dport: u16, data: &[u8]) -> Vec<u8> {
-    ipv6(src, dst, UDP, 64, &udp(src.into(), sport, dst.into(), dport, data))
+    ipv6(
+        src,
+        dst,
+        UDP,
+        64,
+        &udp(src.into(), sport, dst.into(), dport, data),
+    )
 }
 
 /// An ICMPv6 message in an IPv6 packet with hop limit 255, as neighbor
@@ -261,7 +307,11 @@ pub(crate) enum Upper<'a> {
     UdpFragment { port: u16 },
     /// An ICMPv6 message: its type, and the message from its first byte.
     /// With `fragment`, this is the first fragment of a longer message.
-    Icmp6 { kind: u8, msg: &'a [u8], fragment: bool },
+    Icmp6 {
+        kind: u8,
+        msg: &'a [u8],
+        fragment: bool,
+    },
     /// Any other transport, or a fragment other than the first, which
     /// holds no transport header.
     Other,
@@ -297,13 +347,20 @@ pub(crate) fn upper(packet: &[u8]) -> Result<Upper<'_>, Unreadable> {
             if len < 8 || len > bytes.len() {
                 return Err(Unreadable);
             }
-            Ok(Upper::Udp { port, payload: &bytes[8..len] })
+            Ok(Upper::Udp {
+                port,
+                payload: &bytes[8..len],
+            })
         }
         ICMPV6 if packet[0] >> 4 == 6 => {
             if bytes.len() < 4 {
                 return Err(Unreadable);
             }
-            Ok(Upper::Icmp6 { kind: bytes[0], msg: bytes, fragment })
+            Ok(Upper::Icmp6 {
+                kind: bytes[0],
+                msg: bytes,
+                fragment,
+            })
         }
         _ => Ok(Upper::Other),
     }
@@ -322,7 +379,14 @@ pub(crate) fn is_neighbor_discovery(kind: u8) -> bool {
 /// multicast, or a solicitation that is not valid (hop limit other than
 /// 255, code other than 0).
 pub(crate) fn neighbor_advert(packet: &[u8], vm: Mac, own: Option<Ipv6Addr>) -> Option<Vec<u8>> {
-    let Ok(Upper::Icmp6 { kind: NEIGHBOR_SOLICITATION, msg, fragment: false }) = upper(packet) else { return None };
+    let Ok(Upper::Icmp6 {
+        kind: NEIGHBOR_SOLICITATION,
+        msg,
+        fragment: false,
+    }) = upper(packet)
+    else {
+        return None;
+    };
     if msg[1] != 0 || packet[7] != 255 || msg.len() < 24 {
         return None;
     }
@@ -383,7 +447,11 @@ pub(crate) struct TooLong(pub(crate) usize);
 
 impl Decoder {
     pub(crate) fn new() -> Decoder {
-        Decoder { buf: vec![0; 4 * (4 + MAX_STREAM_FRAME)], start: 0, end: 0 }
+        Decoder {
+            buf: vec![0; 4 * (4 + MAX_STREAM_FRAME)],
+            start: 0,
+            end: 0,
+        }
     }
 
     /// Where the next read should go. Never empty.
@@ -435,7 +503,11 @@ pub(crate) struct Outbox {
 
 impl Outbox {
     pub(crate) fn new(cap: usize) -> Outbox {
-        Outbox { buf: Vec::new(), start: 0, cap }
+        Outbox {
+            buf: Vec::new(),
+            start: 0,
+            cap,
+        }
     }
 
     /// Queues one frame made of `parts`. `false` if it was dropped.
@@ -513,11 +585,21 @@ pub(crate) mod tests {
 
     #[test]
     fn padding_is_trimmed_and_lying_lengths_are_refused() {
-        let p = udp4(Ipv4Addr::new(10, 0, 0, 2), 1, Ipv4Addr::new(10, 0, 0, 1), 2, b"hi");
+        let p = udp4(
+            Ipv4Addr::new(10, 0, 0, 2),
+            1,
+            Ipv4Addr::new(10, 0, 0, 1),
+            2,
+            b"hi",
+        );
         let mut padded = p.clone();
         padded.resize(46, 0);
         assert_eq!(ip_packet(IPV4, &padded), Some(&p[..]));
-        assert_eq!(ip_packet(IPV4, &p[..p.len() - 1]), None, "total length past the end");
+        assert_eq!(
+            ip_packet(IPV4, &p[..p.len() - 1]),
+            None,
+            "total length past the end"
+        );
         let mut bad = p.clone();
         bad[0] = 0x44;
         assert_eq!(ip_packet(IPV4, &bad), None, "header length under 20");
@@ -532,10 +614,23 @@ pub(crate) mod tests {
 
     #[test]
     fn built_packets_have_correct_checksums() {
-        let p = udp4(Ipv4Addr::new(10, 0, 0, 1), 67, Ipv4Addr::BROADCAST, 68, b"odd");
+        let p = udp4(
+            Ipv4Addr::new(10, 0, 0, 1),
+            67,
+            Ipv4Addr::BROADCAST,
+            68,
+            b"odd",
+        );
         assert_eq!(ip::checksum(&p[..20]), 0, "IPv4 header");
-        let (src, dst) = (Ipv4Addr::new(10, 0, 0, 1).into(), Ipv4Addr::BROADCAST.into());
-        assert_eq!(ip::transport_checksum(src, dst, UDP, &p[20..]), 0, "UDP over IPv4");
+        let (src, dst) = (
+            Ipv4Addr::new(10, 0, 0, 1).into(),
+            Ipv4Addr::BROADCAST.into(),
+        );
+        assert_eq!(
+            ip::transport_checksum(src, dst, UDP, &p[20..]),
+            0,
+            "UDP over IPv4"
+        );
         let p = udp6(link_local(GATEWAY_MAC), 547, link_local(VM), 546, b"odd");
         assert!(v6_checksum_ok(&p));
         assert_eq!(udp_to(&p), Some((546, &b"odd"[..])));
@@ -543,15 +638,48 @@ pub(crate) mod tests {
 
     #[test]
     fn destinations() {
-        let to = |dst: Ipv4Addr| destination(&ipv4(Ipv4Addr::new(10, 0, 0, 1), dst, UDP, &[]), Some(VM), None);
+        let to = |dst: Ipv4Addr| {
+            destination(
+                &ipv4(Ipv4Addr::new(10, 0, 0, 1), dst, UDP, &[]),
+                Some(VM),
+                None,
+            )
+        };
         assert_eq!(to(Ipv4Addr::new(10, 0, 0, 2)), Some((VM, IPV4)));
         assert_eq!(to(Ipv4Addr::BROADCAST), Some((BROADCAST, IPV4)));
-        assert_eq!(to(Ipv4Addr::new(239, 129, 2, 3)), Some(([1, 0, 0x5e, 1, 2, 3], IPV4)));
-        let p = ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2), UDP, &[]);
-        assert_eq!(destination(&p, None, None), None, "the VM's MAC is not known yet");
-        let p = ipv6(link_local(GATEWAY_MAC), "ff02::1:ff12:3456".parse().unwrap(), UDP, 1, &[]);
-        assert_eq!(destination(&p, Some(VM), None), Some(([0x33, 0x33, 0xff, 0x12, 0x34, 0x56], IPV6)));
-        let p = ipv6(link_local(GATEWAY_MAC), "fd00::2".parse().unwrap(), UDP, 1, &[]);
+        assert_eq!(
+            to(Ipv4Addr::new(239, 129, 2, 3)),
+            Some(([1, 0, 0x5e, 1, 2, 3], IPV4))
+        );
+        let p = ipv4(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            UDP,
+            &[],
+        );
+        assert_eq!(
+            destination(&p, None, None),
+            None,
+            "the VM's MAC is not known yet"
+        );
+        let p = ipv6(
+            link_local(GATEWAY_MAC),
+            "ff02::1:ff12:3456".parse().unwrap(),
+            UDP,
+            1,
+            &[],
+        );
+        assert_eq!(
+            destination(&p, Some(VM), None),
+            Some(([0x33, 0x33, 0xff, 0x12, 0x34, 0x56], IPV6))
+        );
+        let p = ipv6(
+            link_local(GATEWAY_MAC),
+            "fd00::2".parse().unwrap(),
+            UDP,
+            1,
+            &[],
+        );
         assert_eq!(destination(&p, Some(VM), None), Some((VM, IPV6)));
         assert_eq!(destination(&p, None, None), None);
         assert_eq!(destination(&[0x50; 40], Some(VM), None), None);
@@ -615,10 +743,26 @@ pub(crate) mod tests {
         assert_eq!(&p[64..72], &[2, 1, 0x02, 0x66, 0x6e, 0, 0, 1]);
 
         let dad = solicitation(Ipv6Addr::UNSPECIFIED, "fd00::2".parse().unwrap(), 255);
-        assert!(neighbor_advert(&dad, VM, None).is_none(), "duplicate address detection");
-        assert!(neighbor_advert(&solicitation(vm_ll, target, 64), VM, None).is_none(), "hop limit not 255");
-        assert!(neighbor_advert(&solicitation(vm_ll, "ff02::1".parse().unwrap(), 255), VM, None).is_none());
-        assert!(neighbor_advert(&solicitation(vm_ll, target, 255), VM, Some(target)).is_none(), "its own address");
+        assert!(
+            neighbor_advert(&dad, VM, None).is_none(),
+            "duplicate address detection"
+        );
+        assert!(
+            neighbor_advert(&solicitation(vm_ll, target, 64), VM, None).is_none(),
+            "hop limit not 255"
+        );
+        assert!(
+            neighbor_advert(
+                &solicitation(vm_ll, "ff02::1".parse().unwrap(), 255),
+                VM,
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            neighbor_advert(&solicitation(vm_ll, target, 255), VM, Some(target)).is_none(),
+            "its own address"
+        );
         let short = solicitation(vm_ll, target, 255);
         assert!(neighbor_advert(&short[..60], VM, None).is_none());
     }
@@ -632,7 +776,13 @@ pub(crate) mod tests {
             ext.extend_from_slice(&[if i + 1 == n { proto } else { 60 }, 0, 1, 4, 0, 0, 0, 0]);
         }
         ext.extend_from_slice(inner);
-        ipv6(link_local(VM), "ff02::1".parse().unwrap(), if n == 0 { proto } else { 60 }, 255, &ext)
+        ipv6(
+            link_local(VM),
+            "ff02::1".parse().unwrap(),
+            if n == 0 { proto } else { 60 },
+            255,
+            &ext,
+        )
     }
 
     fn icmp6_kind(p: &[u8]) -> Option<u8> {
@@ -645,7 +795,11 @@ pub(crate) mod tests {
     #[test]
     fn extension_headers_are_skipped() {
         let src = link_local(VM);
-        let ra = icmp6(src, "ff02::1".parse().unwrap(), vec![ROUTER_ADVERTISEMENT, 0, 0, 0, 64, 0, 0, 0]);
+        let ra = icmp6(
+            src,
+            "ff02::1".parse().unwrap(),
+            vec![ROUTER_ADVERTISEMENT, 0, 0, 0, 64, 0, 0, 0],
+        );
         // The same message behind a hop-by-hop header.
         let mut ext = vec![ICMPV6, 0, 1, 4, 0, 0, 0, 0];
         ext.extend_from_slice(&ra[40..]);
@@ -653,21 +807,40 @@ pub(crate) mod tests {
         assert_eq!(icmp6_kind(&p), Some(ROUTER_ADVERTISEMENT));
         // Behind eight destination options headers, and behind sixteen: no
         // chain is too long to read.
-        assert_eq!(icmp6_kind(&behind_options(8, ICMPV6, &ra[40..])), Some(ROUTER_ADVERTISEMENT));
-        assert_eq!(icmp6_kind(&behind_options(16, ICMPV6, &ra[40..])), Some(ROUTER_ADVERTISEMENT));
+        assert_eq!(
+            icmp6_kind(&behind_options(8, ICMPV6, &ra[40..])),
+            Some(ROUTER_ADVERTISEMENT)
+        );
+        assert_eq!(
+            icmp6_kind(&behind_options(16, ICMPV6, &ra[40..])),
+            Some(ROUTER_ADVERTISEMENT)
+        );
         // Behind an authentication header.
         let mut ah = vec![ICMPV6, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         ah.extend_from_slice(&ra[40..]);
-        assert_eq!(icmp6_kind(&ipv6(src, "ff02::1".parse().unwrap(), 51, 255, &ah)), Some(ROUTER_ADVERTISEMENT));
+        assert_eq!(
+            icmp6_kind(&ipv6(src, "ff02::1".parse().unwrap(), 51, 255, &ah)),
+            Some(ROUTER_ADVERTISEMENT)
+        );
         // A first fragment holds the type, and says it is a fragment; a later
         // one does not hold it.
         let mut frag = vec![ICMPV6, 0, 0, 1, 0, 0, 0, 7];
         frag.extend_from_slice(&ra[40..]);
         let p = ipv6(src, "ff02::1".parse().unwrap(), 44, 255, &frag);
-        assert!(matches!(upper(&p), Ok(Upper::Icmp6 { kind: ROUTER_ADVERTISEMENT, fragment: true, .. })));
+        assert!(matches!(
+            upper(&p),
+            Ok(Upper::Icmp6 {
+                kind: ROUTER_ADVERTISEMENT,
+                fragment: true,
+                ..
+            })
+        ));
         let mut later = frag.clone();
         later[2..4].copy_from_slice(&8u16.to_be_bytes());
-        assert_eq!(upper(&ipv6(src, "ff02::1".parse().unwrap(), 44, 255, &later)), Ok(Upper::Other));
+        assert_eq!(
+            upper(&ipv6(src, "ff02::1".parse().unwrap(), 44, 255, &later)),
+            Ok(Upper::Other)
+        );
         // A header that runs past the end cannot be read, unlike a packet
         // that is simply not ICMPv6 or UDP.
         assert_eq!(upper(&ipv6(src, src, 0, 1, &[UDP, 9])), Err(Unreadable));
@@ -680,8 +853,20 @@ pub(crate) mod tests {
 
     #[test]
     fn udp_lengths_and_fragments() {
-        let p = udp4(Ipv4Addr::UNSPECIFIED, 68, Ipv4Addr::BROADCAST, 67, b"discover");
-        assert_eq!(upper(&p), Ok(Upper::Udp { port: 67, payload: b"discover" }));
+        let p = udp4(
+            Ipv4Addr::UNSPECIFIED,
+            68,
+            Ipv4Addr::BROADCAST,
+            67,
+            b"discover",
+        );
+        assert_eq!(
+            upper(&p),
+            Ok(Upper::Udp {
+                port: 67,
+                payload: b"discover"
+            })
+        );
         // A UDP length past the packet's end, or under the header's.
         let mut long = p.clone();
         long[24..26].copy_from_slice(&100u16.to_be_bytes());
@@ -697,12 +882,23 @@ pub(crate) mod tests {
         later[7] = 1;
         assert_eq!(upper(&later), Ok(Upper::Other));
         // A first fragment that stops inside the UDP header.
-        let cut = ipv4(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::BROADCAST, UDP, &p[20..24]);
+        let cut = ipv4(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::BROADCAST,
+            UDP,
+            &p[20..24],
+        );
         let mut cut_first = cut.clone();
         cut_first[6] = 0x20;
         assert_eq!(upper(&cut_first), Err(Unreadable));
         // IPv6: a first fragment of a DHCPv6 request.
-        let u = udp6(link_local(VM), 546, "ff02::1:2".parse().unwrap(), 547, &[1; 40]);
+        let u = udp6(
+            link_local(VM),
+            546,
+            "ff02::1:2".parse().unwrap(),
+            547,
+            &[1; 40],
+        );
         let mut frag = vec![UDP, 0, 0, 1, 0, 0, 0, 9];
         frag.extend_from_slice(&u[40..88]);
         let p6 = ipv6(link_local(VM), "ff02::1:2".parse().unwrap(), 44, 64, &frag);
@@ -711,8 +907,14 @@ pub(crate) mod tests {
 
     #[test]
     fn link_local_from_mac() {
-        assert_eq!(link_local(VM), "fe80::5054:ff:fe12:3456".parse::<Ipv6Addr>().unwrap());
-        assert_eq!(link_local(GATEWAY_MAC), "fe80::66:6eff:fe00:1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(
+            link_local(VM),
+            "fe80::5054:ff:fe12:3456".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(
+            link_local(GATEWAY_MAC),
+            "fe80::66:6eff:fe00:1".parse::<Ipv6Addr>().unwrap()
+        );
     }
 
     fn stream(frames: &[&[u8]]) -> Vec<u8> {
@@ -743,7 +945,10 @@ pub(crate) mod tests {
                 got.push(f.to_vec());
             }
         }
-        assert_eq!(got, vec![b"first".to_vec(), big.clone(), vec![], b"last".to_vec()]);
+        assert_eq!(
+            got,
+            vec![b"first".to_vec(), big.clone(), vec![], b"last".to_vec()]
+        );
         got.clear();
         for piece in s.chunks(1000) {
             feed(&mut d, piece);

@@ -9,9 +9,26 @@ use libfuzzer_sys::fuzz_target;
 #[derive(Arbitrary, Debug)]
 enum Piece {
     /// An IPv4 fragment.
-    V4 { id: u8, src: u8, proto: u8, offset: u16, len: u16, more: bool, df: bool, options: u8 },
+    V4 {
+        id: u8,
+        src: u8,
+        proto: u8,
+        offset: u16,
+        len: u16,
+        more: bool,
+        df: bool,
+        options: u8,
+    },
     /// An IPv6 fragment, with extension headers before the fragment header.
-    V6 { id: u8, src: u8, offset: u16, len: u16, more: bool, before: Vec<u8>, next: u8 },
+    V6 {
+        id: u8,
+        src: u8,
+        offset: u16,
+        len: u16,
+        more: bool,
+        before: Vec<u8>,
+        next: u8,
+    },
     /// Any bytes.
     Raw(Vec<u8>),
 }
@@ -24,7 +41,16 @@ struct Step {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn v4(id: u8, src: u8, proto: u8, offset: u16, len: u16, more: bool, df: bool, options: u8) -> Vec<u8> {
+fn v4(
+    id: u8,
+    src: u8,
+    proto: u8,
+    offset: u16,
+    len: u16,
+    more: bool,
+    df: bool,
+    options: u8,
+) -> Vec<u8> {
     let opts = (options % 11) as usize * 4;
     let ihl = 20 + opts;
     let len = len as usize % 1500;
@@ -50,7 +76,11 @@ fn v6(id: u8, src: u8, offset: u16, len: u16, more: bool, before: &[u8], next: u
     // Extension headers before the fragment header: each byte picks one.
     let mut ext = Vec::new();
     let mut first = 44u8;
-    let mut kinds: Vec<u8> = before.iter().take(4).map(|b| [0u8, 43, 60, 51][*b as usize % 4]).collect();
+    let mut kinds: Vec<u8> = before
+        .iter()
+        .take(4)
+        .map(|b| [0u8, 43, 60, 51][*b as usize % 4])
+        .collect();
     if let Some(&k) = kinds.first() {
         first = k;
     }
@@ -90,8 +120,25 @@ fuzz_target!(|steps: Vec<Step>| {
     let packets = steps.into_iter().map(|s| {
         ms += s.wait as u64;
         let bytes = match s.piece {
-            Piece::V4 { id, src, proto, offset, len, more, df, options } => v4(id, src, proto, offset, len, more, df, options),
-            Piece::V6 { id, src, offset, len, more, before, next } => v6(id, src, offset, len, more, &before, next),
+            Piece::V4 {
+                id,
+                src,
+                proto,
+                offset,
+                len,
+                more,
+                df,
+                options,
+            } => v4(id, src, proto, offset, len, more, df, options),
+            Piece::V6 {
+                id,
+                src,
+                offset,
+                len,
+                more,
+                before,
+                next,
+            } => v6(id, src, offset, len, more, &before, next),
             Piece::Raw(b) => b,
         };
         (ms, bytes)

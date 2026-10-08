@@ -4,11 +4,11 @@
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::resp::harness::wire_same;
 use fictionet::stdlib::resp::{
     Command, Commands, Error, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, Resp2, Value, Values,
 };
-use fictionet::stdlib::resp::harness::wire_same;
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 // The harness needs reflexive equality. NaN has one RESP wire spelling.
@@ -37,17 +37,30 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Command>(data);
     contract::check_wire::<Resp2>(data);
     contract::check_wire_value(&WireValue(Value::simple(
-        data.iter().take(MAX_LINE_LEN + 1).copied().collect::<Vec<_>>(),
+        data.iter()
+            .take(MAX_LINE_LEN + 1)
+            .copied()
+            .collect::<Vec<_>>(),
     )));
     contract::check_wire_value(&Command::new([data.get(..MAX_LINE_LEN).unwrap_or(data)]));
     let mut rng = Lcg::new(data.iter().fold(0x9e37_79b9_7f4a_7c15, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
     }));
-    let small = Limits { bulk: 6, elements: 3, depth: 2, line: 6, frame: 40 };
+    let small = Limits {
+        bulk: 6,
+        elements: 3,
+        depth: 2,
+        line: 6,
+        frame: 40,
+    };
     let drawn = Limits {
         bulk: rng.index(64),
         elements: rng.index(16),
-        depth: if rng.index(4) == 0 { usize::MAX } else { rng.index(8) },
+        depth: if rng.index(4) == 0 {
+            usize::MAX
+        } else {
+            rng.index(8)
+        },
         line: rng.index(64),
         frame: rng.index(data.len().saturating_add(2)),
     };
@@ -56,15 +69,25 @@ fuzz_target!(|data: &[u8]| {
         // exercise whole input without repeating those expensive schedules.
         if index < 2 {
             let allocation = 2 * limits.frame.clamp(1, MAX_FRAME_LEN);
-            contract::check_decode_with_alloc_limit(|| Values::with_limits(limits).map(WireValue), data, allocation);
-            contract::check_decode_with_alloc_limit(|| Commands::with_limits(limits), data, allocation);
+            contract::check_decode_with_alloc_limit(
+                || Values::with_limits(limits).map(WireValue),
+                data,
+                allocation,
+            );
+            contract::check_decode_with_alloc_limit(
+                || Commands::with_limits(limits),
+                data,
+                allocation,
+            );
         }
         let values = decode_all(|| Values::with_limits(limits), data);
         let commands = decode_all(|| Commands::with_limits(limits), data);
         if index == 0 {
             // Exact parsing bypasses the stream's scan gate. These parsers use default limits.
             partial_oracle(data, Value::parse(data), &values, |_| false);
-            partial_oracle(data, Command::parse(data), &commands, |command| command.args.is_empty());
+            partial_oracle(data, Command::parse(data), &commands, |command| {
+                command.args.is_empty()
+            });
         }
         for command in commands.0 {
             contract::check_wire_value(&command);
@@ -86,14 +109,28 @@ fn partial_oracle<T: Wire<ParseError = Error, WriteError = Error>>(
     empty: impl Fn(&T) -> bool,
 ) {
     let expected = match parsed {
-        Ok(value) => (if empty(&value) { vec![] } else { vec![value.to_bytes().unwrap()] }, None),
+        Ok(value) => (
+            if empty(&value) {
+                vec![]
+            } else {
+                vec![value.to_bytes().unwrap()]
+            },
+            None,
+        ),
         // An empty stream has no incomplete frame.
-        Err(Error::Incomplete) => (vec![], (!data.is_empty()).then_some(Fail::Truncated { unread: data.len() })),
+        Err(Error::Incomplete) => (
+            vec![],
+            (!data.is_empty()).then_some(Fail::Truncated { unread: data.len() }),
+        ),
         // Trailing frames need prefix parsing. Size expansion can be refused by
         // Wire::parse after a stream has successfully read the value.
         Err(Error::Trailing | Error::Unwritable | Error::FrameTooLarge) => return,
         Err(error) => (vec![], Some(Fail::Protocol(error))),
     };
-    let actual: Vec<_> = decoded.0.iter().map(|value| value.to_bytes().unwrap()).collect();
+    let actual: Vec<_> = decoded
+        .0
+        .iter()
+        .map(|value| value.to_bytes().unwrap())
+        .collect();
     assert_eq!((actual, decoded.1.clone()), expected);
 }

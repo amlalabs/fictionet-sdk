@@ -1,10 +1,10 @@
 //! `fictionet observe` and `fictionet dashboard`, run as the binary against
 //! a world in this process.
 
-#[path = "common/poll.rs"]
-mod poll;
 #[path = "common/logged.rs"]
 mod logged;
+#[path = "common/poll.rs"]
+mod poll;
 
 use logged::logged;
 
@@ -18,7 +18,10 @@ use fictionet::InterfaceExt;
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
 
 fn temp_socket() -> String {
-    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let dir = std::env::temp_dir().join(format!("fn-obsbin-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("world.sock").to_str().unwrap().to_owned()
@@ -27,7 +30,8 @@ fn temp_socket() -> String {
 /// A world that takes attachments, and emits an event every 50 ms.
 fn start_world(path: &str) -> fictionet::Listening {
     let (attacher, mut attachments) = fictionet::attachments();
-    let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
+    let listening =
+        fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
             fcx.spawn(move |fcx| async move {
@@ -49,7 +53,11 @@ fn start_world(path: &str) -> fictionet::Listening {
 
 fn get(port: u16, path: &str) -> (String, String) {
     let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    write!(conn, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").unwrap();
+    write!(
+        conn,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+    )
+    .unwrap();
     let mut all = String::new();
     conn.read_to_string(&mut all).unwrap();
     let (head, body) = all.split_once("\r\n\r\n").unwrap();
@@ -61,34 +69,68 @@ fn observe_prints_json_lines() {
     let path = temp_socket();
     let _listening = start_world(&path);
     let world = format!("unix:{path}");
-    let out = Command::new(BIN).args(["observe", "--world", &world, "world"]).output().unwrap();
+    let out = Command::new(BIN)
+        .args(["observe", "--world", &world, "world"])
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{out:?}");
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.starts_with(r#"{"observe":1,"#) && text.ends_with("}\n"), "{text}");
+    assert!(
+        text.starts_with(r#"{"observe":1,"#) && text.ends_with("}\n"),
+        "{text}"
+    );
 
     // A stream: the snapshot, then the world's own events, one per line.
-    let mut child = Command::new(BIN).args(["observe", "--world", &world, "watch"]).stdout(Stdio::piped()).spawn().unwrap();
+    let mut child = Command::new(BIN)
+        .args(["observe", "--world", &world, "watch"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    assert!(lines.next().unwrap().unwrap().starts_with(r#"{"event":"snapshot""#));
-    let tick = lines.map(Result::unwrap).find(|l| l.contains(r#""source":"test","kind":"tick""#));
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .unwrap()
+            .starts_with(r#"{"event":"snapshot""#)
+    );
+    let tick = lines
+        .map(Result::unwrap)
+        .find(|l| l.contains(r#""source":"test","kind":"tick""#));
     assert!(tick.is_some());
     child.kill().unwrap();
     child.wait().unwrap();
 
     // A request the world cannot answer exits 1; one that makes no sense, 2.
-    let out = Command::new(BIN).args(["observe", "--world", &world, "packet", "e999", "1"]).output().unwrap();
+    let out = Command::new(BIN)
+        .args(["observe", "--world", &world, "packet", "e999", "1"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stdout).contains(r#""error""#));
-    let out = Command::new(BIN).args(["observe", "--world", &world, "fly"]).output().unwrap();
+    let out = Command::new(BIN)
+        .args(["observe", "--world", &world, "fly"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    let out = Command::new(BIN).args(["observe", "--world", "unix:/nonexistent/world.sock"]).output().unwrap();
+    let out = Command::new(BIN)
+        .args(["observe", "--world", "unix:/nonexistent/world.sock"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(1));
 
     // A full disk is a failure, not a quiet stop as a closed pipe is.
     if let Ok(full) = std::fs::File::create("/dev/full") {
-        let out = Command::new(BIN).args(["observe", "--world", &world, "world"]).stdout(full).output().unwrap();
+        let out = Command::new(BIN)
+            .args(["observe", "--world", &world, "world"])
+            .stdout(full)
+            .output()
+            .unwrap();
         assert_eq!(out.status.code(), Some(1), "{out:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("writing to stdout"), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("writing to stdout"),
+            "{out:?}"
+        );
     }
 }
 
@@ -105,7 +147,14 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
     let mut out = BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
     out.read_line(&mut line).unwrap();
-    let port: u16 = line.trim_end().rsplit(':').next().unwrap().trim_end_matches('/').parse().unwrap();
+    let port: u16 = line
+        .trim_end()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .trim_end_matches('/')
+        .parse()
+        .unwrap();
 
     let (status, body) = get(port, "/");
     assert_eq!(status, "HTTP/1.1 200 OK");
@@ -122,7 +171,8 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
 
     // A stream comes back as server-sent events.
     let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     write!(conn, "GET /api/watch HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
     let mut events = BufReader::new(conn);
     let mut seen = Vec::new();
@@ -140,7 +190,11 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
 
     // A page on another site cannot read it through a name of its own.
     let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    write!(conn, "GET /api/graph HTTP/1.1\r\nHost: attacker.example:{port}\r\n\r\n").unwrap();
+    write!(
+        conn,
+        "GET /api/graph HTTP/1.1\r\nHost: attacker.example:{port}\r\n\r\n"
+    )
+    .unwrap();
     let mut all = String::new();
     conn.read_to_string(&mut all).unwrap();
     assert!(all.starts_with("HTTP/1.1 403"));
@@ -154,7 +208,8 @@ fn start_two_links(path: &str) -> fictionet::Listening {
     use fictionet::Interface;
     use fictionet::prelude::*;
     let (attacher, mut attachments) = fictionet::attachments();
-    let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
+    let listening =
+        fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
     std::thread::spawn(move || {
         let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
             // Observers find a world once it takes attachments.
@@ -176,7 +231,9 @@ fn start_two_links(path: &str) -> fictionet::Listening {
                 fcx.spawn(move |fcx| async move {
                     loop {
                         // An IPv4 header with nothing after it.
-                        let p = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2];
+                        let p = vec![
+                            0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
+                        ];
                         a.send(fictionet::Packet(p));
                         a.recv(&fcx).await?;
                         fcx.sleep(fictionet::time::ms(20)).await?;
@@ -205,12 +262,23 @@ fn the_dashboard_merges_the_packets_of_several_links() {
         }
     }
     let mut child = Stop(
-        Command::new(BIN).args(["dashboard", "--world", &world, "--listen", "127.0.0.1:0"]).stdout(Stdio::piped()).spawn().unwrap(),
+        Command::new(BIN)
+            .args(["dashboard", "--world", &world, "--listen", "127.0.0.1:0"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
     );
     let mut out = BufReader::new(child.0.stdout.take().unwrap());
     let mut line = String::new();
     out.read_line(&mut line).unwrap();
-    let port: u16 = line.trim_end().rsplit(':').next().unwrap().trim_end_matches('/').parse().unwrap();
+    let port: u16 = line
+        .trim_end()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .trim_end_matches('/')
+        .parse()
+        .unwrap();
     assert_eq!(get(port, "/groups.js").0, "HTTP/1.1 200 OK");
 
     // The two links, and the group their echo tasks are in.
@@ -220,14 +288,22 @@ fn the_dashboard_merges_the_packets_of_several_links() {
         graph.contains(r#""name":"lan","parent":null"#) && graph.matches(r#"{"id":"e"#).count() == 2
     });
     assert!(graph.contains(r#""name":"lan","parent":null"#), "{graph}");
-    let links: Vec<String> =
-        graph.split(r#"{"id":"e"#).skip(1).map(|r| format!("e{}", r.split('"').next().unwrap())).collect();
+    let links: Vec<String> = graph
+        .split(r#"{"id":"e"#)
+        .skip(1)
+        .map(|r| format!("e{}", r.split('"').next().unwrap()))
+        .collect();
     assert_eq!(links.len(), 2, "{graph}");
     let both = links.join(",");
 
     let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(conn, "GET /api/packets?link={both} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        conn,
+        "GET /api/packets?link={both} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    )
+    .unwrap();
     let mut events = BufReader::new(conn);
     let mut from = std::collections::HashSet::new();
     let mut packets = 0;
@@ -240,7 +316,14 @@ fn the_dashboard_merges_the_packets_of_several_links() {
             && data.contains(r#""seq":"#)
         {
             packets += 1;
-            let link = data.split(r#""link":""#).nth(1).unwrap().split('"').next().unwrap().to_owned();
+            let link = data
+                .split(r#""link":""#)
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .to_owned();
             assert!(links.contains(&link), "{data}");
             from.insert(link);
         }
@@ -250,13 +333,24 @@ fn the_dashboard_merges_the_packets_of_several_links() {
     // While the stream above still watches both links, the capture of both
     // holds two pcapng sections.
     let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    write!(conn, "GET /api/pcap?link={both} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    write!(
+        conn,
+        "GET /api/pcap?link={both} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    )
+    .unwrap();
     let mut all = Vec::new();
     conn.read_to_end(&mut all).unwrap();
     let head_end = all.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-    assert!(all.starts_with(b"HTTP/1.1 200 OK"), "{}", String::from_utf8_lossy(&all[..head_end]));
+    assert!(
+        all.starts_with(b"HTTP/1.1 200 OK"),
+        "{}",
+        String::from_utf8_lossy(&all[..head_end])
+    );
     let body = &all[head_end..];
-    let sections = body.windows(4).filter(|w| *w == [0x0a, 0x0d, 0x0d, 0x0a]).count();
+    let sections = body
+        .windows(4)
+        .filter(|w| *w == [0x0a, 0x0d, 0x0d, 0x0a])
+        .count();
     assert!(body.starts_with(&[0x0a, 0x0d, 0x0d, 0x0a]));
     assert!(sections >= 2, "{sections} section headers");
     drop(child);
@@ -269,8 +363,16 @@ fn a_watch_exits_0_when_the_world_ends() {
     let path = temp_socket();
     let world = format!("unix:{path}");
     let (attacher, mut attachments) = fictionet::attachments();
-    let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
-    let mut child = Command::new(BIN).args(["observe", "--world", &world, "watch"]).stdout(Stdio::piped()).spawn().unwrap();
+    let listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(path.clone().into()),
+        attacher,
+    )
+    .unwrap();
+    let mut child = Command::new(BIN)
+        .args(["observe", "--world", &world, "watch"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
     // The world returns once the observer has its snapshot.
     let (stop, mut stopped) = fictionet::pair();
     let world_thread = std::thread::spawn(move || {
@@ -307,5 +409,9 @@ fn a_watch_exits_0_when_the_world_ends() {
     let status = status.expect("the watch should exit when the world ends");
     assert_eq!(status.code(), Some(0), "{out}");
     assert!(out.contains(r#"{"event":"ended","#), "{out}");
-    assert!(out.trim_end().ends_with(r#"{"event":"end","data":{"reason":"the world ended"}}"#), "{out}");
+    assert!(
+        out.trim_end()
+            .ends_with(r#"{"event":"end","data":{"reason":"the world ended"}}"#),
+        "{out}"
+    );
 }

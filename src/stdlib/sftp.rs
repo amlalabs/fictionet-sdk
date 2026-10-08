@@ -70,10 +70,10 @@
 //! );
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Wire, Reader, Truncated, Trailing};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire};
 
 /// The SSH subsystem name a client asks for to start SFTP.
 pub const SUBSYSTEM: &str = "sftp";
@@ -212,7 +212,9 @@ pub struct Packet {
 impl Packet {
     fn parse_prefix(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Error> {
         let limit = limit.min(MAX_PACKET);
-        let Some(head) = b.get(..LENGTH_LEN) else { return Ok(None) };
+        let Some(head) = b.get(..LENGTH_LEN) else {
+            return Ok(None);
+        };
         let length = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
         let n = usize::try_from(length).unwrap_or(usize::MAX);
         if n == 0 {
@@ -221,8 +223,13 @@ impl Packet {
         if n > limit {
             return Err(Error::PacketTooLong(length));
         }
-        let Some(rest) = b.get(LENGTH_LEN..LENGTH_LEN + n) else { return Ok(None) };
-        let packet = Packet { kind: rest[0], body: rest[1..].to_vec() };
+        let Some(rest) = b.get(LENGTH_LEN..LENGTH_LEN + n) else {
+            return Ok(None);
+        };
+        let packet = Packet {
+            kind: rest[0],
+            body: rest[1..].to_vec(),
+        };
         Ok(Some((packet, LENGTH_LEN + n)))
     }
 
@@ -280,10 +287,14 @@ impl Prefixed for Packet {
     const NAME: &'static str = "SFTP";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_PACKET }
+    fn default_limit() -> Self::Limit {
+        MAX_PACKET
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_PACKET) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_PACKET)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -292,12 +303,14 @@ impl Prefixed for Packet {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         Packet::parse_prefix(input, limit)
     }
 }
-
 
 /// Why bytes are not an SFTP packet, why a packet's body is not the
 /// request or response its type says, or why a value cannot be written.
@@ -526,7 +539,9 @@ impl Attrs {
     }
 
     fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        if self.extended.len() > MAX_ATTR_EXTENSIONS { return Err(Error::Unwritable); }
+        if self.extended.len() > MAX_ATTR_EXTENSIONS {
+            return Err(Error::Unwritable);
+        }
         put_u32(out, self.flags());
         if let Some(s) = self.size {
             out.extend_from_slice(&s.to_be_bytes());
@@ -604,17 +619,35 @@ pub enum Request {
     /// INIT: the client's highest `version`, and the `extensions` it
     /// offers. The first packet of a session. A reader skips extensions
     /// over their limits, as it would any it does not know.
-    Init { version: u32, extensions: Vec<Extension> },
+    Init {
+        version: u32,
+        extensions: Vec<Extension>,
+    },
     /// OPEN: open the file at `path` with [`open_flags`] `flags`, and set
     /// `attrs` if it is created. Answered with HANDLE or STATUS.
-    Open { id: u32, path: Vec<u8>, flags: u32, attrs: Attrs },
+    Open {
+        id: u32,
+        path: Vec<u8>,
+        flags: u32,
+        attrs: Attrs,
+    },
     /// CLOSE: close `handle`. Answered with STATUS.
     Close { id: u32, handle: Vec<u8> },
     /// READ: read up to `len` bytes at `offset`. Answered with DATA, or
     /// STATUS (EOF at the end of the file).
-    Read { id: u32, handle: Vec<u8>, offset: u64, len: u32 },
+    Read {
+        id: u32,
+        handle: Vec<u8>,
+        offset: u64,
+        len: u32,
+    },
     /// WRITE: write `data` at `offset`. Answered with STATUS.
-    Write { id: u32, handle: Vec<u8>, offset: u64, data: Vec<u8> },
+    Write {
+        id: u32,
+        handle: Vec<u8>,
+        offset: u64,
+        data: Vec<u8>,
+    },
     /// LSTAT: the attributes of `path`, not following a final symbolic
     /// link. Answered with ATTRS or STATUS.
     Lstat { id: u32, path: Vec<u8> },
@@ -622,10 +655,18 @@ pub enum Request {
     /// ATTRS or STATUS.
     Fstat { id: u32, handle: Vec<u8> },
     /// SETSTAT: set `attrs` on `path`. Answered with STATUS.
-    Setstat { id: u32, path: Vec<u8>, attrs: Attrs },
+    Setstat {
+        id: u32,
+        path: Vec<u8>,
+        attrs: Attrs,
+    },
     /// FSETSTAT: set `attrs` on the open file `handle`. Answered with
     /// STATUS.
-    Fsetstat { id: u32, handle: Vec<u8>, attrs: Attrs },
+    Fsetstat {
+        id: u32,
+        handle: Vec<u8>,
+        attrs: Attrs,
+    },
     /// OPENDIR: open the directory at `path` for listing. Answered with
     /// HANDLE or STATUS.
     Opendir { id: u32, path: Vec<u8> },
@@ -636,7 +677,11 @@ pub enum Request {
     Remove { id: u32, path: Vec<u8> },
     /// MKDIR: make a directory at `path` with `attrs`. Answered with
     /// STATUS.
-    Mkdir { id: u32, path: Vec<u8>, attrs: Attrs },
+    Mkdir {
+        id: u32,
+        path: Vec<u8>,
+        attrs: Attrs,
+    },
     /// RMDIR: remove the directory at `path`. Answered with STATUS.
     Rmdir { id: u32, path: Vec<u8> },
     /// REALPATH: the absolute, canonical form of `path`. Answered with a
@@ -653,11 +698,19 @@ pub enum Request {
     /// SYMLINK: make a symbolic link at `linkpath` pointing to
     /// `targetpath`, in the order the specification gives. OpenSSH sends
     /// the two the other way round, target first. Answered with STATUS.
-    Symlink { id: u32, linkpath: Vec<u8>, targetpath: Vec<u8> },
+    Symlink {
+        id: u32,
+        linkpath: Vec<u8>,
+        targetpath: Vec<u8>,
+    },
     /// EXTENDED: the request `name` (such as `statvfs@openssh.com`), with
     /// `data` laid out as that request defines. Answered with
     /// EXTENDED_REPLY or STATUS.
-    Extended { id: u32, name: Vec<u8>, data: Vec<u8> },
+    Extended {
+        id: u32,
+        name: Vec<u8>,
+        data: Vec<u8>,
+    },
 }
 
 impl Request {
@@ -670,38 +723,110 @@ impl Request {
         if packet.kind == t::INIT {
             let version = r.u32_be()?;
             let extensions = r.extensions()?;
-            return Ok(Request::Init { version, extensions });
+            return Ok(Request::Init {
+                version,
+                extensions,
+            });
         }
         if !matches!(packet.kind, t::OPEN..=t::SYMLINK | t::EXTENDED) {
             return Err(Error::UnknownType(packet.kind));
         }
         let id = r.u32_be()?;
         let req = match packet.kind {
-            t::OPEN => Request::Open { id, path: r.path()?, flags: r.u32_be()?, attrs: Attrs::read(&mut r)? },
-            t::CLOSE => Request::Close { id, handle: r.handle()? },
-            t::READ => Request::Read { id, handle: r.handle()?, offset: r.u64_be()?, len: r.u32_be()? },
-            t::WRITE => Request::Write { id, handle: r.handle()?, offset: r.u64_be()?, data: r.string(MAX_DATA)? },
-            t::LSTAT => Request::Lstat { id, path: r.path()? },
-            t::FSTAT => Request::Fstat { id, handle: r.handle()? },
-            t::SETSTAT => Request::Setstat { id, path: r.path()?, attrs: Attrs::read(&mut r)? },
-            t::FSETSTAT => Request::Fsetstat { id, handle: r.handle()?, attrs: Attrs::read(&mut r)? },
-            t::OPENDIR => Request::Opendir { id, path: r.path()? },
-            t::READDIR => Request::Readdir { id, handle: r.handle()? },
-            t::REMOVE => Request::Remove { id, path: r.path()? },
-            t::MKDIR => Request::Mkdir { id, path: r.path()?, attrs: Attrs::read(&mut r)? },
-            t::RMDIR => Request::Rmdir { id, path: r.path()? },
-            t::REALPATH => Request::Realpath { id, path: r.path()? },
-            t::STAT => Request::Stat { id, path: r.path()? },
-            t::RENAME => Request::Rename { id, from: r.path()?, to: r.path()? },
-            t::READLINK => Request::Readlink { id, path: r.path()? },
-            t::SYMLINK => Request::Symlink { id, linkpath: r.path()?, targetpath: r.path()? },
+            t::OPEN => Request::Open {
+                id,
+                path: r.path()?,
+                flags: r.u32_be()?,
+                attrs: Attrs::read(&mut r)?,
+            },
+            t::CLOSE => Request::Close {
+                id,
+                handle: r.handle()?,
+            },
+            t::READ => Request::Read {
+                id,
+                handle: r.handle()?,
+                offset: r.u64_be()?,
+                len: r.u32_be()?,
+            },
+            t::WRITE => Request::Write {
+                id,
+                handle: r.handle()?,
+                offset: r.u64_be()?,
+                data: r.string(MAX_DATA)?,
+            },
+            t::LSTAT => Request::Lstat {
+                id,
+                path: r.path()?,
+            },
+            t::FSTAT => Request::Fstat {
+                id,
+                handle: r.handle()?,
+            },
+            t::SETSTAT => Request::Setstat {
+                id,
+                path: r.path()?,
+                attrs: Attrs::read(&mut r)?,
+            },
+            t::FSETSTAT => Request::Fsetstat {
+                id,
+                handle: r.handle()?,
+                attrs: Attrs::read(&mut r)?,
+            },
+            t::OPENDIR => Request::Opendir {
+                id,
+                path: r.path()?,
+            },
+            t::READDIR => Request::Readdir {
+                id,
+                handle: r.handle()?,
+            },
+            t::REMOVE => Request::Remove {
+                id,
+                path: r.path()?,
+            },
+            t::MKDIR => Request::Mkdir {
+                id,
+                path: r.path()?,
+                attrs: Attrs::read(&mut r)?,
+            },
+            t::RMDIR => Request::Rmdir {
+                id,
+                path: r.path()?,
+            },
+            t::REALPATH => Request::Realpath {
+                id,
+                path: r.path()?,
+            },
+            t::STAT => Request::Stat {
+                id,
+                path: r.path()?,
+            },
+            t::RENAME => Request::Rename {
+                id,
+                from: r.path()?,
+                to: r.path()?,
+            },
+            t::READLINK => Request::Readlink {
+                id,
+                path: r.path()?,
+            },
+            t::SYMLINK => Request::Symlink {
+                id,
+                linkpath: r.path()?,
+                targetpath: r.path()?,
+            },
             _ => {
                 let name = r.string(MAX_EXTENSION_NAME)?;
                 let data = r.rest();
                 if data.len() > MAX_DATA {
                     return Err(Error::TooLong);
                 }
-                Request::Extended { id, name, data: data.to_vec() }
+                Request::Extended {
+                    id,
+                    name,
+                    data: data.to_vec(),
+                }
             }
         };
         r.finish()?;
@@ -768,24 +893,41 @@ impl Request {
             put_u32(&mut b, id);
         }
         match self {
-            Request::Init { version, extensions } => {
+            Request::Init {
+                version,
+                extensions,
+            } => {
                 put_u32(&mut b, *version);
                 put_extensions(&mut b, extensions)?;
             }
-            Request::Open { path, flags, attrs, .. } => {
+            Request::Open {
+                path, flags, attrs, ..
+            } => {
                 put_str(&mut b, path, MAX_PATH)?;
                 put_u32(&mut b, *flags);
                 attrs.encode(&mut b)?;
             }
-            Request::Close { handle, .. } | Request::Fstat { handle, .. } | Request::Readdir { handle, .. } => {
+            Request::Close { handle, .. }
+            | Request::Fstat { handle, .. }
+            | Request::Readdir { handle, .. } => {
                 put_str(&mut b, handle, MAX_HANDLE)?;
             }
-            Request::Read { handle, offset, len, .. } => {
+            Request::Read {
+                handle,
+                offset,
+                len,
+                ..
+            } => {
                 put_str(&mut b, handle, MAX_HANDLE)?;
                 b.extend_from_slice(&offset.to_be_bytes());
                 put_u32(&mut b, *len);
             }
-            Request::Write { handle, offset, data, .. } => {
+            Request::Write {
+                handle,
+                offset,
+                data,
+                ..
+            } => {
                 put_str(&mut b, handle, MAX_HANDLE)?;
                 b.extend_from_slice(&offset.to_be_bytes());
                 put_str(&mut b, data, MAX_DATA)?;
@@ -805,7 +947,12 @@ impl Request {
                 put_str(&mut b, handle, MAX_HANDLE)?;
                 attrs.encode(&mut b)?;
             }
-            Request::Rename { from: a, to: z, .. } | Request::Symlink { linkpath: a, targetpath: z, .. } => {
+            Request::Rename { from: a, to: z, .. }
+            | Request::Symlink {
+                linkpath: a,
+                targetpath: z,
+                ..
+            } => {
                 put_str(&mut b, a, MAX_PATH)?;
                 put_str(&mut b, z, MAX_PATH)?;
             }
@@ -814,10 +961,14 @@ impl Request {
                 put_raw(&mut b, data, MAX_DATA)?;
             }
         }
-        if b.len() >= MAX_PACKET { return Err(Error::Unwritable); }
-        Ok(Packet { kind: self.kind(), body: b })
+        if b.len() >= MAX_PACKET {
+            return Err(Error::Unwritable);
+        }
+        Ok(Packet {
+            kind: self.kind(),
+            body: b,
+        })
     }
-
 }
 
 /// A response: what a server answers. Every response but VERSION carries
@@ -829,10 +980,18 @@ pub enum Response {
     /// the server offers. The specification asks for the lower of the
     /// client's version and the server's. This module writes only version
     /// 3 packets, so a server built on it answers 3, as OpenSSH does.
-    Version { version: u32, extensions: Vec<Extension> },
+    Version {
+        version: u32,
+        extensions: Vec<Extension>,
+    },
     /// STATUS: how a request ended, with a `message` for people to read
     /// and the `language` tag it is written in. Both may be empty.
-    Status { id: u32, status: Status, message: Vec<u8>, language: Vec<u8> },
+    Status {
+        id: u32,
+        status: Status,
+        message: Vec<u8>,
+        language: Vec<u8>,
+    },
     /// HANDLE: the `handle` of a file or directory just opened.
     Handle { id: u32, handle: Vec<u8> },
     /// DATA: bytes read from a file.
@@ -852,7 +1011,12 @@ impl Response {
     /// Writing refuses a message over [`MAX_TEXT`] bytes.
     pub fn status(id: u32, status: Status, message: &str) -> Response {
         let message = message.as_bytes().to_vec();
-        Response::Status { id, status, message, language: b"en".to_vec() }
+        Response::Status {
+            id,
+            status,
+            message,
+            language: b"en".to_vec(),
+        }
     }
 
     /// Reads the response in `packet`. A STATUS that stops after its code,
@@ -865,17 +1029,36 @@ impl Response {
             t::VERSION => {
                 let version = r.u32_be()?;
                 let extensions = r.extensions()?;
-                return Ok(Response::Version { version, extensions });
+                return Ok(Response::Version {
+                    version,
+                    extensions,
+                });
             }
             t::STATUS => {
                 let (id, status) = (r.u32_be()?, Status::from_code(r.u32_be()?));
                 if r.is_empty() {
-                    return Ok(Response::Status { id, status, message: Vec::new(), language: Vec::new() });
+                    return Ok(Response::Status {
+                        id,
+                        status,
+                        message: Vec::new(),
+                        language: Vec::new(),
+                    });
                 }
-                Response::Status { id, status, message: r.string(MAX_TEXT)?, language: r.string(MAX_TEXT)? }
+                Response::Status {
+                    id,
+                    status,
+                    message: r.string(MAX_TEXT)?,
+                    language: r.string(MAX_TEXT)?,
+                }
             }
-            t::HANDLE => Response::Handle { id: r.u32_be()?, handle: r.handle()? },
-            t::DATA => Response::Data { id: r.u32_be()?, data: r.string(MAX_DATA)? },
+            t::HANDLE => Response::Handle {
+                id: r.u32_be()?,
+                handle: r.handle()?,
+            },
+            t::DATA => Response::Data {
+                id: r.u32_be()?,
+                data: r.string(MAX_DATA)?,
+            },
             t::NAME => {
                 let (id, count) = (r.u32_be()?, r.u32_be()?);
                 if usize::try_from(count).map_or(true, |c| c > MAX_NAMES) {
@@ -884,18 +1067,28 @@ impl Response {
                 let mut names = Vec::new();
                 for _ in 0..count {
                     let (filename, longname) = (r.path()?, r.path()?);
-                    names.push(NameEntry { filename, longname, attrs: Attrs::read(&mut r)? });
+                    names.push(NameEntry {
+                        filename,
+                        longname,
+                        attrs: Attrs::read(&mut r)?,
+                    });
                 }
                 Response::Name { id, names }
             }
-            t::ATTRS => Response::Attrs { id: r.u32_be()?, attrs: Attrs::read(&mut r)? },
+            t::ATTRS => Response::Attrs {
+                id: r.u32_be()?,
+                attrs: Attrs::read(&mut r)?,
+            },
             t::EXTENDED_REPLY => {
                 let id = r.u32_be()?;
                 let data = r.rest();
                 if data.len() > MAX_DATA {
                     return Err(Error::TooLong);
                 }
-                Response::ExtendedReply { id, data: data.to_vec() }
+                Response::ExtendedReply {
+                    id,
+                    data: data.to_vec(),
+                }
             }
             k => return Err(Error::UnknownType(k)),
         };
@@ -937,12 +1130,22 @@ impl Response {
             put_u32(&mut b, id);
         }
         match self {
-            Response::Version { version, extensions } => {
+            Response::Version {
+                version,
+                extensions,
+            } => {
                 put_u32(&mut b, *version);
                 put_extensions(&mut b, extensions)?;
             }
-            Response::Status { status, message, language, .. } => {
-                if matches!(status, Status::Other(0..=8)) { return Err(Error::Unwritable); }
+            Response::Status {
+                status,
+                message,
+                language,
+                ..
+            } => {
+                if matches!(status, Status::Other(0..=8)) {
+                    return Err(Error::Unwritable);
+                }
                 put_u32(&mut b, status.code());
                 put_str(&mut b, message, MAX_TEXT)?;
                 put_str(&mut b, language, MAX_TEXT)?;
@@ -950,7 +1153,9 @@ impl Response {
             Response::Handle { handle, .. } => put_str(&mut b, handle, MAX_HANDLE)?,
             Response::Data { data, .. } => put_str(&mut b, data, MAX_DATA)?,
             Response::Name { names, .. } => {
-                if names.len() > MAX_NAMES { return Err(Error::Unwritable); }
+                if names.len() > MAX_NAMES {
+                    return Err(Error::Unwritable);
+                }
                 put_u32(&mut b, names.len() as u32);
                 for n in names {
                     n.encode(&mut b)?;
@@ -959,10 +1164,14 @@ impl Response {
             Response::Attrs { attrs, .. } => attrs.encode(&mut b)?,
             Response::ExtendedReply { data, .. } => put_raw(&mut b, data, MAX_DATA)?,
         }
-        if b.len() >= MAX_PACKET { return Err(Error::Unwritable); }
-        Ok(Packet { kind: self.kind(), body: b })
+        if b.len() >= MAX_PACKET {
+            return Err(Error::Unwritable);
+        }
+        Ok(Packet {
+            kind: self.kind(),
+            body: b,
+        })
     }
-
 }
 
 trait ReadFields<'a> {
@@ -993,7 +1202,10 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     }
 
     fn extension(&mut self) -> Result<Extension, Error> {
-        Ok(Extension { name: self.string(MAX_EXTENSION_NAME)?, data: self.string(MAX_TEXT)? })
+        Ok(Extension {
+            name: self.string(MAX_EXTENSION_NAME)?,
+            data: self.string(MAX_TEXT)?,
+        })
     }
 
     /// A string of any length that fits in the body, not copied.
@@ -1010,8 +1222,14 @@ impl<'a> ReadFields<'a> for Reader<'a> {
         let mut out = Vec::new();
         while !self.is_empty() {
             let (name, data) = (self.raw_string()?, self.raw_string()?);
-            if out.len() < MAX_EXTENSIONS && name.len() <= MAX_EXTENSION_NAME && data.len() <= MAX_TEXT {
-                out.push(Extension { name: name.to_vec(), data: data.to_vec() });
+            if out.len() < MAX_EXTENSIONS
+                && name.len() <= MAX_EXTENSION_NAME
+                && data.len() <= MAX_TEXT
+            {
+                out.push(Extension {
+                    name: name.to_vec(),
+                    data: data.to_vec(),
+                });
             }
         }
         Ok(out)
@@ -1031,7 +1249,9 @@ fn put_raw(out: &mut Vec<u8>, bytes: &[u8], max: usize) -> Result<(), Error> {
 }
 
 fn put_str(out: &mut Vec<u8>, bytes: &[u8], max: usize) -> Result<(), Error> {
-    if bytes.len() > max || bytes.len().saturating_add(4) > (MAX_PACKET - 1).saturating_sub(out.len()) {
+    if bytes.len() > max
+        || bytes.len().saturating_add(4) > (MAX_PACKET - 1).saturating_sub(out.len())
+    {
         return Err(Error::Unwritable);
     }
     put_u32(out, bytes.len() as u32);
@@ -1045,8 +1265,12 @@ fn put_extension(out: &mut Vec<u8>, extension: &Extension) -> Result<(), Error> 
 }
 
 fn put_extensions(out: &mut Vec<u8>, extensions: &[Extension]) -> Result<(), Error> {
-    if extensions.len() > MAX_EXTENSIONS { return Err(Error::Unwritable); }
-    for extension in extensions { put_extension(out, extension)?; }
+    if extensions.len() > MAX_EXTENSIONS {
+        return Err(Error::Unwritable);
+    }
+    for extension in extensions {
+        put_extension(out, extension)?;
+    }
     Ok(())
 }
 
@@ -1097,16 +1321,22 @@ impl Wire for Attrs {
 
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Truncated }
+    fn from(_: Truncated) -> Self {
+        Error::Truncated
+    }
 }
 
 impl From<Trailing> for Error {
     #[inline]
-    fn from(_: Trailing) -> Self { Error::Trailing }
+    fn from(_: Trailing) -> Self {
+        Error::Trailing
+    }
 }
 
 fn packet_reader(packet: &Packet) -> Result<Reader<'_>, Error> {
-    if packet.body.len() >= MAX_PACKET { return Err(Error::TooLong); }
+    if packet.body.len() >= MAX_PACKET {
+        return Err(Error::TooLong);
+    }
     Ok(Reader::new(&packet.body))
 }
 
@@ -1133,14 +1363,12 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
-    use super::harness::{check_packet};
-    use fictionet::stdlib::codec::{Step, Decode};
+    use super::harness::check_packet;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Decode, Step};
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn s(v: &[u8]) -> Vec<u8> {
@@ -1153,7 +1381,10 @@ mod tests {
             uid_gid: Some((1000, 100)),
             permissions: Some(0o100644),
             times: Some((1_700_000_000, 1_700_000_001)),
-            extended: vec![Extension { name: s(b"x@example.com"), data: s(b"v") }],
+            extended: vec![Extension {
+                name: s(b"x@example.com"),
+                data: s(b"v"),
+            }],
         }
     }
 
@@ -1161,58 +1392,194 @@ mod tests {
         let a = full_attrs();
         let h = s(b"h1");
         vec![
-            Request::Init { version: 3, extensions: vec![] },
-            Request::Init { version: 6, extensions: vec![Extension { name: s(b"a@b"), data: s(b"1") }] },
-            Request::Open { id: 1, path: s(b"/f"), flags: open_flags::READ | open_flags::WRITE, attrs: a.clone() },
-            Request::Open { id: 1, path: s(b"/f"), flags: open_flags::READ, attrs: Attrs::default() },
-            Request::Close { id: 2, handle: h.clone() },
-            Request::Read { id: 3, handle: h.clone(), offset: 1 << 40, len: 32768 },
-            Request::Write { id: 4, handle: h.clone(), offset: 7, data: s(b"hello") },
-            Request::Lstat { id: 5, path: s(b"/l") },
-            Request::Fstat { id: 6, handle: h.clone() },
-            Request::Setstat { id: 7, path: s(b"/s"), attrs: a.clone() },
-            Request::Fsetstat { id: 8, handle: h.clone(), attrs: a.clone() },
-            Request::Opendir { id: 9, path: s(b"/") },
-            Request::Readdir { id: 10, handle: h.clone() },
-            Request::Remove { id: 11, path: s(b"/r") },
-            Request::Mkdir { id: 12, path: s(b"/d"), attrs: Attrs { permissions: Some(0o755), ..Attrs::default() } },
-            Request::Rmdir { id: 13, path: s(b"/d") },
-            Request::Realpath { id: 14, path: s(b".") },
-            Request::Stat { id: 15, path: s(b"/s") },
-            Request::Rename { id: 16, from: s(b"/a"), to: s(b"/b") },
-            Request::Readlink { id: 17, path: s(b"/ln") },
-            Request::Symlink { id: 18, linkpath: s(b"/ln"), targetpath: s(b"/t") },
-            Request::Extended { id: 19, name: s(b"statvfs@openssh.com"), data: s(b"\0\0\0\x01/") },
-            Request::Extended { id: 20, name: s(b"x"), data: vec![] },
+            Request::Init {
+                version: 3,
+                extensions: vec![],
+            },
+            Request::Init {
+                version: 6,
+                extensions: vec![Extension {
+                    name: s(b"a@b"),
+                    data: s(b"1"),
+                }],
+            },
+            Request::Open {
+                id: 1,
+                path: s(b"/f"),
+                flags: open_flags::READ | open_flags::WRITE,
+                attrs: a.clone(),
+            },
+            Request::Open {
+                id: 1,
+                path: s(b"/f"),
+                flags: open_flags::READ,
+                attrs: Attrs::default(),
+            },
+            Request::Close {
+                id: 2,
+                handle: h.clone(),
+            },
+            Request::Read {
+                id: 3,
+                handle: h.clone(),
+                offset: 1 << 40,
+                len: 32768,
+            },
+            Request::Write {
+                id: 4,
+                handle: h.clone(),
+                offset: 7,
+                data: s(b"hello"),
+            },
+            Request::Lstat {
+                id: 5,
+                path: s(b"/l"),
+            },
+            Request::Fstat {
+                id: 6,
+                handle: h.clone(),
+            },
+            Request::Setstat {
+                id: 7,
+                path: s(b"/s"),
+                attrs: a.clone(),
+            },
+            Request::Fsetstat {
+                id: 8,
+                handle: h.clone(),
+                attrs: a.clone(),
+            },
+            Request::Opendir {
+                id: 9,
+                path: s(b"/"),
+            },
+            Request::Readdir {
+                id: 10,
+                handle: h.clone(),
+            },
+            Request::Remove {
+                id: 11,
+                path: s(b"/r"),
+            },
+            Request::Mkdir {
+                id: 12,
+                path: s(b"/d"),
+                attrs: Attrs {
+                    permissions: Some(0o755),
+                    ..Attrs::default()
+                },
+            },
+            Request::Rmdir {
+                id: 13,
+                path: s(b"/d"),
+            },
+            Request::Realpath {
+                id: 14,
+                path: s(b"."),
+            },
+            Request::Stat {
+                id: 15,
+                path: s(b"/s"),
+            },
+            Request::Rename {
+                id: 16,
+                from: s(b"/a"),
+                to: s(b"/b"),
+            },
+            Request::Readlink {
+                id: 17,
+                path: s(b"/ln"),
+            },
+            Request::Symlink {
+                id: 18,
+                linkpath: s(b"/ln"),
+                targetpath: s(b"/t"),
+            },
+            Request::Extended {
+                id: 19,
+                name: s(b"statvfs@openssh.com"),
+                data: s(b"\0\0\0\x01/"),
+            },
+            Request::Extended {
+                id: 20,
+                name: s(b"x"),
+                data: vec![],
+            },
         ]
     }
 
     fn responses() -> Vec<Response> {
         vec![
-            Response::Version { version: 3, extensions: vec![] },
+            Response::Version {
+                version: 3,
+                extensions: vec![],
+            },
             Response::Version {
                 version: 3,
                 extensions: vec![
-                    Extension { name: s(b"posix-rename@openssh.com"), data: s(b"1") },
-                    Extension { name: s(b"statvfs@openssh.com"), data: s(b"2") },
+                    Extension {
+                        name: s(b"posix-rename@openssh.com"),
+                        data: s(b"1"),
+                    },
+                    Extension {
+                        name: s(b"statvfs@openssh.com"),
+                        data: s(b"2"),
+                    },
                 ],
             },
             Response::status(1, Status::Ok, "Success"),
-            Response::Status { id: 2, status: Status::Other(99), message: vec![], language: vec![] },
-            Response::Handle { id: 3, handle: s(b"\0\0\0\x01") },
-            Response::Data { id: 4, data: s(b"file contents") },
-            Response::Data { id: 4, data: vec![] },
-            Response::Name { id: 5, names: vec![] },
+            Response::Status {
+                id: 2,
+                status: Status::Other(99),
+                message: vec![],
+                language: vec![],
+            },
+            Response::Handle {
+                id: 3,
+                handle: s(b"\0\0\0\x01"),
+            },
+            Response::Data {
+                id: 4,
+                data: s(b"file contents"),
+            },
+            Response::Data {
+                id: 4,
+                data: vec![],
+            },
+            Response::Name {
+                id: 5,
+                names: vec![],
+            },
             Response::Name {
                 id: 6,
                 names: vec![
-                    NameEntry { filename: s(b"a"), longname: s(b"-rw-r--r-- 1 u g 0 Jan 1 a"), attrs: full_attrs() },
-                    NameEntry { filename: s(b"b"), longname: vec![], attrs: Attrs::default() },
+                    NameEntry {
+                        filename: s(b"a"),
+                        longname: s(b"-rw-r--r-- 1 u g 0 Jan 1 a"),
+                        attrs: full_attrs(),
+                    },
+                    NameEntry {
+                        filename: s(b"b"),
+                        longname: vec![],
+                        attrs: Attrs::default(),
+                    },
                 ],
             },
-            Response::Attrs { id: 7, attrs: full_attrs() },
-            Response::Attrs { id: 7, attrs: Attrs { size: Some(1), ..Attrs::default() } },
-            Response::ExtendedReply { id: 8, data: s(b"anything") },
+            Response::Attrs {
+                id: 7,
+                attrs: full_attrs(),
+            },
+            Response::Attrs {
+                id: 7,
+                attrs: Attrs {
+                    size: Some(1),
+                    ..Attrs::default()
+                },
+            },
+            Response::ExtendedReply {
+                id: 8,
+                data: s(b"anything"),
+            },
         ]
     }
 
@@ -1220,12 +1587,33 @@ mod tests {
 
     #[test]
     fn init_and_version_bytes() {
-        let init = Request::Init { version: 3, extensions: vec![] };
+        let init = Request::Init {
+            version: 3,
+            extensions: vec![],
+        };
         assert_eq!(init.to_bytes().unwrap(), [0, 0, 0, 5, 1, 0, 0, 0, 3]);
-        let v = Response::Version { version: 3, extensions: vec![Extension { name: s(b"a"), data: s(b"bc") }] };
-        assert_eq!(v.to_bytes().unwrap(), [0, 0, 0, 16, 2, 0, 0, 0, 3, 0, 0, 0, 1, b'a', 0, 0, 0, 2, b'b', b'c']);
+        let v = Response::Version {
+            version: 3,
+            extensions: vec![Extension {
+                name: s(b"a"),
+                data: s(b"bc"),
+            }],
+        };
+        assert_eq!(
+            v.to_bytes().unwrap(),
+            [
+                0, 0, 0, 16, 2, 0, 0, 0, 3, 0, 0, 0, 1, b'a', 0, 0, 0, 2, b'b', b'c'
+            ]
+        );
         assert_eq!(v.id(), None);
-        assert_eq!(Packet { kind: 1, body: vec![0, 0, 0, 3] }.id(), None);
+        assert_eq!(
+            Packet {
+                kind: 1,
+                body: vec![0, 0, 0, 3]
+            }
+            .id(),
+            None
+        );
     }
 
     #[test]
@@ -1234,10 +1622,14 @@ mod tests {
             id: 0x0a0b0c0d,
             path: s(b"/x"),
             flags: open_flags::WRITE | open_flags::CREAT | open_flags::TRUNC,
-            attrs: Attrs { permissions: Some(0o644), ..Attrs::default() },
+            attrs: Attrs {
+                permissions: Some(0o644),
+                ..Attrs::default()
+            },
         };
         let bytes = [
-            0, 0, 0, 23, 3, 0x0a, 0x0b, 0x0c, 0x0d, 0, 0, 0, 2, b'/', b'x', 0, 0, 0, 0x1a, 0, 0, 0, 4, 0, 0, 0x01, 0xa4,
+            0, 0, 0, 23, 3, 0x0a, 0x0b, 0x0c, 0x0d, 0, 0, 0, 2, b'/', b'x', 0, 0, 0, 0x1a, 0, 0, 0,
+            4, 0, 0, 0x01, 0xa4,
         ];
         assert_eq!(req.to_bytes().unwrap(), bytes);
         let p = Packet::parse(&bytes).unwrap();
@@ -1247,15 +1639,36 @@ mod tests {
 
     #[test]
     fn read_status_and_attrs_bytes() {
-        let req = Request::Read { id: 1, handle: s(b"h"), offset: 0x100, len: 0x8000 };
-        assert_eq!(req.to_packet().unwrap().body, [0, 0, 0, 1, 0, 0, 0, 1, b'h', 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0x80, 0]);
+        let req = Request::Read {
+            id: 1,
+            handle: s(b"h"),
+            offset: 0x100,
+            len: 0x8000,
+        };
+        assert_eq!(
+            req.to_packet().unwrap().body,
+            [
+                0, 0, 0, 1, 0, 0, 0, 1, b'h', 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0x80, 0
+            ]
+        );
         let eof = Response::status(1, Status::Eof, "");
-        assert_eq!(eof.to_packet().unwrap().body, [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, b'e', b'n']);
+        assert_eq!(
+            eof.to_packet().unwrap().body,
+            [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, b'e', b'n']
+        );
         // A STATUS with no message and no language tag, as old servers send.
-        let short = Packet { kind: packet_type::STATUS, body: vec![0, 0, 0, 1, 0, 0, 0, 2] };
+        let short = Packet {
+            kind: packet_type::STATUS,
+            body: vec![0, 0, 0, 1, 0, 0, 0, 2],
+        };
         assert_eq!(
             Response::from_packet(&short),
-            Ok(Response::Status { id: 1, status: Status::NoSuchFile, message: vec![], language: vec![] })
+            Ok(Response::Status {
+                id: 1,
+                status: Status::NoSuchFile,
+                message: vec![],
+                language: vec![]
+            })
         );
         let attrs = full_attrs();
         let mut body = Vec::new();
@@ -1297,7 +1710,12 @@ mod tests {
         assert_eq!(Status::from_code(u32::MAX).code(), u32::MAX);
         assert_eq!(Status::from_code(8), Status::OpUnsupported);
         for code in 0..=8 {
-            let response = Response::Status { id: 1, status: Status::Other(code), message: vec![], language: vec![] };
+            let response = Response::Status {
+                id: 1,
+                status: Status::Other(code),
+                message: vec![],
+                language: vec![],
+            };
             assert_eq!(response.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&response);
         }
@@ -1314,51 +1732,114 @@ mod tests {
                 uid_gid: (mask & 2 != 0).then_some((1, 2)),
                 permissions: (mask & 4 != 0).then_some(0o40755),
                 times: (mask & 8 != 0).then_some((3, 4)),
-                extended: if mask & 16 != 0 { vec![Extension::default()] } else { vec![] },
+                extended: if mask & 16 != 0 {
+                    vec![Extension::default()]
+                } else {
+                    vec![]
+                },
             };
-            let resp = Response::Attrs { id: mask, attrs: attrs.clone() };
+            let resp = Response::Attrs {
+                id: mask,
+                attrs: attrs.clone(),
+            };
             let p = resp.to_packet().unwrap();
             assert_eq!(Response::from_packet(&p), Ok(resp));
             let flags = u32::from_be_bytes([p.body[4], p.body[5], p.body[6], p.body[7]]);
             assert_eq!(flags, attrs.flags());
         }
         // The EXTENDED flag with a count of 0 reads as no extended attributes.
-        let p = Packet { kind: packet_type::ATTRS, body: vec![0, 0, 0, 1, 0x80, 0, 0, 0, 0, 0, 0, 0] };
-        assert_eq!(Response::from_packet(&p), Ok(Response::Attrs { id: 1, attrs: Attrs::default() }));
+        let p = Packet {
+            kind: packet_type::ATTRS,
+            body: vec![0, 0, 0, 1, 0x80, 0, 0, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(
+            Response::from_packet(&p),
+            Ok(Response::Attrs {
+                id: 1,
+                attrs: Attrs::default()
+            })
+        );
     }
 
     #[test]
     fn packet_errors() {
-        for (bytes, error) in [(&[0, 0, 0, 0][..], Error::Empty),
+        for (bytes, error) in [
+            (&[0, 0, 0, 0][..], Error::Empty),
             (&[0, 4, 0, 1][..], Error::PacketTooLong(0x40001)),
-            (&[0xff; 4][..], Error::PacketTooLong(u32::MAX))] {
+            (&[0xff; 4][..], Error::PacketTooLong(u32::MAX)),
+        ] {
             assert_eq!(Packet::parse(bytes), Err(error));
         }
-        assert_eq!(Frames::<Packet>::new().decode(&[0, 4, 0, 0], false), Ok(Step::Need));
-        assert_eq!(Frames::<Packet>::with_limit(8).decode(&[0, 0, 0, 9], false), Err(Error::PacketTooLong(9)));
-        assert_eq!(Frames::<Packet>::with_limit(8).decode(&[0, 0, 0, 8], false), Ok(Step::Need));
-        assert_eq!(Frames::<Packet>::with_limit(usize::MAX).decode(&[0, 4, 0, 1], false), Err(Error::PacketTooLong(0x40001)));
-        assert_eq!(Packet::parse(&[0, 0, 0, 1, 7, 9]), Err(Error::PacketTrailing));
-        assert_eq!(Packet::parse(&[0, 0, 0, 1, 7]), Ok(Packet { kind: 7, body: vec![] }));
+        assert_eq!(
+            Frames::<Packet>::new().decode(&[0, 4, 0, 0], false),
+            Ok(Step::Need)
+        );
+        assert_eq!(
+            Frames::<Packet>::with_limit(8).decode(&[0, 0, 0, 9], false),
+            Err(Error::PacketTooLong(9))
+        );
+        assert_eq!(
+            Frames::<Packet>::with_limit(8).decode(&[0, 0, 0, 8], false),
+            Ok(Step::Need)
+        );
+        assert_eq!(
+            Frames::<Packet>::with_limit(usize::MAX).decode(&[0, 4, 0, 1], false),
+            Err(Error::PacketTooLong(0x40001))
+        );
+        assert_eq!(
+            Packet::parse(&[0, 0, 0, 1, 7, 9]),
+            Err(Error::PacketTrailing)
+        );
+        assert_eq!(
+            Packet::parse(&[0, 0, 0, 1, 7]),
+            Ok(Packet {
+                kind: 7,
+                body: vec![]
+            })
+        );
         assert!(Error::Empty.to_string().contains('0'));
     }
 
     #[test]
     fn parse_errors() {
-        let p = |kind: u8, body: &[u8]| Packet { kind, body: body.to_vec() };
+        let p = |kind: u8, body: &[u8]| Packet {
+            kind,
+            body: body.to_vec(),
+        };
         let t = packet_type::STAT;
         // Unknown types.
         assert_eq!(Request::from_packet(&p(0, &[])), Err(Error::UnknownType(0)));
-        assert_eq!(Request::from_packet(&p(21, &[0, 0, 0, 1])), Err(Error::UnknownType(21)));
-        assert_eq!(Request::from_packet(&p(packet_type::EXTENDED_REPLY, &[])), Err(Error::UnknownType(201)));
-        assert_eq!(Response::from_packet(&p(100, &[])), Err(Error::UnknownType(100)));
+        assert_eq!(
+            Request::from_packet(&p(21, &[0, 0, 0, 1])),
+            Err(Error::UnknownType(21))
+        );
+        assert_eq!(
+            Request::from_packet(&p(packet_type::EXTENDED_REPLY, &[])),
+            Err(Error::UnknownType(201))
+        );
+        assert_eq!(
+            Response::from_packet(&p(100, &[])),
+            Err(Error::UnknownType(100))
+        );
         // Truncated: no id, a short path, a path length past the end.
         assert_eq!(Request::from_packet(&p(t, &[0, 0])), Err(Error::Truncated));
-        assert_eq!(Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0])), Err(Error::Truncated));
-        assert_eq!(Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0, 0, 2, b'/'])), Err(Error::Truncated));
+        assert_eq!(
+            Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0])),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0, 0, 2, b'/'])),
+            Err(Error::Truncated)
+        );
         // Trailing bytes.
-        assert_eq!(Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0, 0, 1, b'/', 0])), Err(Error::Trailing));
-        assert_eq!(Response::from_packet(&p(packet_type::HANDLE, &[0, 0, 0, 1, 0, 0, 0, 0, 1])), Err(Error::Trailing));
+        assert_eq!(
+            Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0, 0, 1, b'/', 0])),
+            Err(Error::Trailing)
+        );
+        assert_eq!(
+            Response::from_packet(&p(packet_type::HANDLE, &[0, 0, 0, 1, 0, 0, 0, 0, 1])),
+            Err(Error::Trailing)
+        );
         // Strings over their limits.
         let len = |n: usize| (n as u32).to_be_bytes();
         let mut body = vec![0, 0, 0, 1];
@@ -1367,36 +1848,67 @@ mod tests {
         assert_eq!(Request::from_packet(&p(t, &body)), Err(Error::TooLong));
         body.truncate(4);
         body.extend_from_slice(&len(MAX_HANDLE + 1));
-        assert_eq!(Request::from_packet(&p(packet_type::CLOSE, &body)), Err(Error::TooLong));
+        assert_eq!(
+            Request::from_packet(&p(packet_type::CLOSE, &body)),
+            Err(Error::TooLong)
+        );
         body.truncate(4);
         body.extend_from_slice(&len(MAX_EXTENSION_NAME + 1));
-        assert_eq!(Request::from_packet(&p(packet_type::EXTENDED, &body)), Err(Error::TooLong));
+        assert_eq!(
+            Request::from_packet(&p(packet_type::EXTENDED, &body)),
+            Err(Error::TooLong)
+        );
         let mut ext = vec![0, 0, 0, 1, 0, 0, 0, 1, b'x'];
         ext.resize(ext.len() + MAX_DATA + 1, 0);
-        assert_eq!(Request::from_packet(&p(packet_type::EXTENDED, &ext)), Err(Error::TooLong));
+        assert_eq!(
+            Request::from_packet(&p(packet_type::EXTENDED, &ext)),
+            Err(Error::TooLong)
+        );
         let mut reply = vec![0, 0, 0, 1];
         reply.resize(4 + MAX_DATA + 1, 0);
-        assert_eq!(Response::from_packet(&p(packet_type::EXTENDED_REPLY, &reply)), Err(Error::TooLong));
+        assert_eq!(
+            Response::from_packet(&p(packet_type::EXTENDED_REPLY, &reply)),
+            Err(Error::TooLong)
+        );
         let mut data = vec![0, 0, 0, 1];
         data.extend_from_slice(&len(MAX_DATA + 1));
-        assert_eq!(Response::from_packet(&p(packet_type::DATA, &data)), Err(Error::TooLong));
+        assert_eq!(
+            Response::from_packet(&p(packet_type::DATA, &data)),
+            Err(Error::TooLong)
+        );
         let mut status = vec![0, 0, 0, 1, 0, 0, 0, 0];
         status.extend_from_slice(&len(MAX_TEXT + 1));
-        assert_eq!(Response::from_packet(&p(packet_type::STATUS, &status)), Err(Error::TooLong));
-        assert_eq!(Response::from_packet(&p(packet_type::STATUS, &[0, 0, 0, 1, 0, 0, 0, 0, 0])), Err(Error::Truncated));
+        assert_eq!(
+            Response::from_packet(&p(packet_type::STATUS, &status)),
+            Err(Error::TooLong)
+        );
+        assert_eq!(
+            Response::from_packet(&p(packet_type::STATUS, &[0, 0, 0, 1, 0, 0, 0, 0, 0])),
+            Err(Error::Truncated)
+        );
         // Counts over their limits.
         let mut names = vec![0, 0, 0, 1];
         names.extend_from_slice(&len(MAX_NAMES + 1));
-        assert_eq!(Response::from_packet(&p(packet_type::NAME, &names)), Err(Error::TooMany));
+        assert_eq!(
+            Response::from_packet(&p(packet_type::NAME, &names)),
+            Err(Error::TooMany)
+        );
         let mut attrs = vec![0, 0, 0, 1, 0x80, 0, 0, 0];
         attrs.extend_from_slice(&len(MAX_ATTR_EXTENSIONS + 1));
-        assert_eq!(Response::from_packet(&p(packet_type::ATTRS, &attrs)), Err(Error::TooMany));
+        assert_eq!(
+            Response::from_packet(&p(packet_type::ATTRS, &attrs)),
+            Err(Error::TooMany)
+        );
         let mut init = vec![0, 0, 0, 3];
         for _ in 0..=MAX_EXTENSIONS {
             init.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
         }
         // Extensions past the limit are skipped, not refused.
-        let Ok(Request::Init { extensions, .. }) = Request::from_packet(&p(packet_type::INIT, &init)) else { panic!() };
+        let Ok(Request::Init { extensions, .. }) =
+            Request::from_packet(&p(packet_type::INIT, &init))
+        else {
+            panic!()
+        };
         assert_eq!(extensions.len(), MAX_EXTENSIONS);
         // Attribute flags version 3 does not define.
         assert_eq!(
@@ -1407,9 +1919,18 @@ mod tests {
         // A body longer than a packet can hold.
         let huge = p(packet_type::EXTENDED_REPLY, &vec![0; MAX_PACKET]);
         assert_eq!(Response::from_packet(&huge), Err(Error::TooLong));
-        assert_eq!(Request::from_packet(&Packet { kind: packet_type::EXTENDED, ..huge }), Err(Error::TooLong));
+        assert_eq!(
+            Request::from_packet(&Packet {
+                kind: packet_type::EXTENDED,
+                ..huge
+            }),
+            Err(Error::TooLong)
+        );
         // TooLong also covers raw data and whole bodies, not only strings.
-        assert_eq!(Error::TooLong.to_string(), "a field or the body over its limit");
+        assert_eq!(
+            Error::TooLong.to_string(),
+            "a field or the body over its limit"
+        );
     }
 
     #[test]
@@ -1422,8 +1943,15 @@ mod tests {
         for (p, is_request) in &packets {
             let bytes = p.to_bytes().unwrap();
             for n in 0..bytes.len() {
-                assert_eq!(Packet::parse(&bytes[..n]), Err(Error::PacketTruncated), "{p:?} at {n}");
-                assert_eq!(Frames::<Packet>::new().decode(&bytes[..n], false), Ok(Step::Need));
+                assert_eq!(
+                    Packet::parse(&bytes[..n]),
+                    Err(Error::PacketTruncated),
+                    "{p:?} at {n}"
+                );
+                assert_eq!(
+                    Frames::<Packet>::new().decode(&bytes[..n], false),
+                    Ok(Step::Need)
+                );
             }
             let parse = |q: &Packet| {
                 if *is_request {
@@ -1434,7 +1962,10 @@ mod tests {
             };
             assert_eq!(parse(p).as_ref(), Ok(p));
             for n in 0..p.body.len() {
-                let short = Packet { kind: p.kind, body: p.body[..n].to_vec() };
+                let short = Packet {
+                    kind: p.kind,
+                    body: p.body[..n].to_vec(),
+                };
                 // Bodies that end in a list or in raw data can stop early
                 // and still be well formed, but never read as the whole
                 // one. A STATUS may stop after its code, and then reads
@@ -1446,7 +1977,10 @@ mod tests {
                 }
                 let open_ended = matches!(
                     p.kind,
-                    packet_type::INIT | packet_type::VERSION | packet_type::EXTENDED | packet_type::EXTENDED_REPLY
+                    packet_type::INIT
+                        | packet_type::VERSION
+                        | packet_type::EXTENDED
+                        | packet_type::EXTENDED_REPLY
                 );
                 if !open_ended && !short_status {
                     assert!(got.is_err(), "{p:?} at {n}");
@@ -1457,8 +1991,16 @@ mod tests {
 
     #[test]
     fn stream_splits_packets_and_reports_terminal_errors_once() {
-        let a = Request::Init { version: 3, extensions: vec![] }.to_bytes().unwrap();
-        let stat = Request::Stat { id: 1, path: s(b"/etc/passwd") };
+        let a = Request::Init {
+            version: 3,
+            extensions: vec![],
+        }
+        .to_bytes()
+        .unwrap();
+        let stat = Request::Stat {
+            id: 1,
+            path: s(b"/etc/passwd"),
+        };
         let b = stat.to_bytes().unwrap();
         let bytes = [&a[..], &b].concat();
         contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_FRAME);
@@ -1471,18 +2013,33 @@ mod tests {
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Empty))));
         assert_eq!(stream.next(), None);
         assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::Empty)));
-        assert!(matches!(decode_all(|| Frames::<Packet>::with_limit(8), &b).1, Some(Fail::Protocol(Error::PacketTooLong(_)))));
-        assert_eq!(decode_all(Frames::<Packet>::new, &b[..6]).1, Some(Fail::Truncated { unread: 6 }));
+        assert!(matches!(
+            decode_all(|| Frames::<Packet>::with_limit(8), &b).1,
+            Some(Fail::Protocol(Error::PacketTooLong(_)))
+        ));
+        assert_eq!(
+            decode_all(Frames::<Packet>::new, &b[..6]).1,
+            Some(Fail::Truncated { unread: 6 })
+        );
     }
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
-        assert_linear("stream_takes_many_small_packets_in_linear_time", rounds(50_000), |size| {
-            let one = Request::Readdir { id: 1, handle: s(b"d") }.to_bytes().unwrap();
-            let (packets, failure) = decode_all(Frames::<Packet>::new, &one.repeat(size));
-            assert_eq!(failure, None);
-            assert_eq!(packets.len(), size);
-        });
+        assert_linear(
+            "stream_takes_many_small_packets_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let one = Request::Readdir {
+                    id: 1,
+                    handle: s(b"d"),
+                }
+                .to_bytes()
+                .unwrap();
+                let (packets, failure) = decode_all(Frames::<Packet>::new, &one.repeat(size));
+                assert_eq!(failure, None);
+                assert_eq!(packets.len(), size);
+            },
+        );
     }
 
     #[test]
@@ -1492,34 +2049,131 @@ mod tests {
             contract::check_wire_value(&value);
         }
         let big = vec![b'a'; 2 * MAX_PACKET];
-        let many_ext = vec![Extension { name: vec![0; 1000], data: vec![0; 5000] }; 200];
-        let attrs = Attrs { extended: many_ext.clone(), ..full_attrs() };
-        refused(Request::Write { id: 1, handle: big.clone(), offset: 0, data: big.clone() });
-        refused(Request::Extended { id: 1, name: big.clone(), data: big.clone() });
-        refused(Request::Open { id: 1, path: big.clone(), flags: 0, attrs: attrs.clone() });
-        refused(Request::Rename { id: 1, from: big.clone(), to: big.clone() });
-        refused(Request::Init { version: 3, extensions: many_ext.clone() });
-        refused(Response::Version { version: 3, extensions: many_ext });
-        refused(Response::Status { id: 1, status: Status::Failure, message: big.clone(), language: big.clone() });
-        refused(Response::Handle { id: 1, handle: big.clone() });
-        refused(Response::Data { id: 1, data: big.clone() });
-        refused(Response::ExtendedReply { id: 1, data: big.clone() });
-        refused(Response::Attrs { id: 1, attrs: attrs.clone() });
-        refused(Response::Name { id: 1, names: vec![NameEntry { filename: big.clone(), longname: big.clone(), attrs }; 50] });
-        refused(Response::Name { id: 1, names: vec![NameEntry::default(); MAX_NAMES + 1] });
-        let entry = NameEntry { filename: vec![0; MAX_PATH], longname: vec![0; MAX_PATH], attrs: Attrs::default() };
-        refused(Response::Name { id: 1, names: vec![entry; 50] });
+        let many_ext = vec![
+            Extension {
+                name: vec![0; 1000],
+                data: vec![0; 5000]
+            };
+            200
+        ];
+        let attrs = Attrs {
+            extended: many_ext.clone(),
+            ..full_attrs()
+        };
+        refused(Request::Write {
+            id: 1,
+            handle: big.clone(),
+            offset: 0,
+            data: big.clone(),
+        });
+        refused(Request::Extended {
+            id: 1,
+            name: big.clone(),
+            data: big.clone(),
+        });
+        refused(Request::Open {
+            id: 1,
+            path: big.clone(),
+            flags: 0,
+            attrs: attrs.clone(),
+        });
+        refused(Request::Rename {
+            id: 1,
+            from: big.clone(),
+            to: big.clone(),
+        });
+        refused(Request::Init {
+            version: 3,
+            extensions: many_ext.clone(),
+        });
+        refused(Response::Version {
+            version: 3,
+            extensions: many_ext,
+        });
+        refused(Response::Status {
+            id: 1,
+            status: Status::Failure,
+            message: big.clone(),
+            language: big.clone(),
+        });
+        refused(Response::Handle {
+            id: 1,
+            handle: big.clone(),
+        });
+        refused(Response::Data {
+            id: 1,
+            data: big.clone(),
+        });
+        refused(Response::ExtendedReply {
+            id: 1,
+            data: big.clone(),
+        });
+        refused(Response::Attrs {
+            id: 1,
+            attrs: attrs.clone(),
+        });
+        refused(Response::Name {
+            id: 1,
+            names: vec![
+                NameEntry {
+                    filename: big.clone(),
+                    longname: big.clone(),
+                    attrs
+                };
+                50
+            ],
+        });
+        refused(Response::Name {
+            id: 1,
+            names: vec![NameEntry::default(); MAX_NAMES + 1],
+        });
+        let entry = NameEntry {
+            filename: vec![0; MAX_PATH],
+            longname: vec![0; MAX_PATH],
+            attrs: Attrs::default(),
+        };
+        refused(Response::Name {
+            id: 1,
+            names: vec![entry; 50],
+        });
         let packet = Packet { kind: 9, body: big };
         assert!(packet.to_bytes().is_err());
         contract::check_wire_value(&packet);
-        for value in [Response::Name { id: 1, names: vec![] },
-            Response::Name { id: 1, names: vec![NameEntry::default(); MAX_NAMES] },
-            Response::Data { id: 1, data: vec![0; MAX_DATA] },
-            Response::Handle { id: 1, handle: vec![0; MAX_HANDLE] }] {
+        for value in [
+            Response::Name {
+                id: 1,
+                names: vec![],
+            },
+            Response::Name {
+                id: 1,
+                names: vec![NameEntry::default(); MAX_NAMES],
+            },
+            Response::Data {
+                id: 1,
+                data: vec![0; MAX_DATA],
+            },
+            Response::Handle {
+                id: 1,
+                handle: vec![0; MAX_HANDLE],
+            },
+        ] {
             assert_eq!(Response::parse(&value.to_bytes().unwrap()), Ok(value));
         }
-        for (name_len, data_len, count) in [(MAX_EXTENSION_NAME + 1, 0, 1), (0, MAX_TEXT + 1, 1), (0, 0, MAX_ATTR_EXTENSIONS + 1)] {
-            refused(Attrs { extended: vec![Extension { name: vec![0; name_len], data: vec![0; data_len] }; count], ..Attrs::default() });
+        for (name_len, data_len, count) in [
+            (MAX_EXTENSION_NAME + 1, 0, 1),
+            (0, MAX_TEXT + 1, 1),
+            (0, 0, MAX_ATTR_EXTENSIONS + 1),
+        ] {
+            refused(Attrs {
+                extended: vec![
+                    Extension {
+                        name: vec![0; name_len],
+                        data: vec![0; data_len]
+                    };
+                    count
+                ],
+                ..Attrs::default()
+            });
         }
     }
 
@@ -1527,10 +2181,16 @@ mod tests {
     fn name_prefix_fits_without_changing_entries() {
         let fits = |names: &[NameEntry]| {
             let fit = names_that_fit(names);
-            let response = Response::Name { id: 1, names: names[..fit].to_vec() };
+            let response = Response::Name {
+                id: 1,
+                names: names[..fit].to_vec(),
+            };
             assert_eq!(Response::parse(&response.to_bytes().unwrap()), Ok(response));
             if fit < names.len() {
-                let next = Response::Name { id: 1, names: names[..fit + 1].to_vec() };
+                let next = Response::Name {
+                    id: 1,
+                    names: names[..fit + 1].to_vec(),
+                };
                 let mut out = vec![7];
                 assert_eq!(next.write(&mut out), Err(Error::Unwritable));
                 assert_eq!(out, [7]);
@@ -1538,7 +2198,9 @@ mod tests {
             fit
         };
         let big = NameEntry {
-            filename: vec![b'f'; MAX_PATH], longname: vec![b'l'; MAX_PATH], attrs: full_attrs(),
+            filename: vec![b'f'; MAX_PATH],
+            longname: vec![b'l'; MAX_PATH],
+            attrs: full_attrs(),
         };
         let names = vec![big; 50];
         let fit = fits(&names);
@@ -1546,14 +2208,41 @@ mod tests {
         assert_eq!(fits(&vec![NameEntry::default(); MAX_NAMES + 1]), MAX_NAMES);
         assert_eq!(fits(&[]), 0);
         for bad in [
-            NameEntry { filename: vec![0; MAX_PATH + 1], ..NameEntry::default() },
-            NameEntry { longname: vec![0; MAX_PATH + 1], ..NameEntry::default() },
-            NameEntry { attrs: Attrs { extended: vec![Extension::default(); MAX_ATTR_EXTENSIONS + 1],
-                ..Attrs::default() }, ..NameEntry::default() },
-            NameEntry { attrs: Attrs { extended: vec![Extension { name: vec![0; MAX_EXTENSION_NAME + 1],
-                data: vec![] }], ..Attrs::default() }, ..NameEntry::default() },
-            NameEntry { attrs: Attrs { extended: vec![Extension { name: vec![], data: vec![0; MAX_TEXT + 1] }],
-                ..Attrs::default() }, ..NameEntry::default() },
+            NameEntry {
+                filename: vec![0; MAX_PATH + 1],
+                ..NameEntry::default()
+            },
+            NameEntry {
+                longname: vec![0; MAX_PATH + 1],
+                ..NameEntry::default()
+            },
+            NameEntry {
+                attrs: Attrs {
+                    extended: vec![Extension::default(); MAX_ATTR_EXTENSIONS + 1],
+                    ..Attrs::default()
+                },
+                ..NameEntry::default()
+            },
+            NameEntry {
+                attrs: Attrs {
+                    extended: vec![Extension {
+                        name: vec![0; MAX_EXTENSION_NAME + 1],
+                        data: vec![],
+                    }],
+                    ..Attrs::default()
+                },
+                ..NameEntry::default()
+            },
+            NameEntry {
+                attrs: Attrs {
+                    extended: vec![Extension {
+                        name: vec![],
+                        data: vec![0; MAX_TEXT + 1],
+                    }],
+                    ..Attrs::default()
+                },
+                ..NameEntry::default()
+            },
         ] {
             assert_eq!(fits(std::slice::from_ref(&bad)), 0);
             assert_eq!(fits(&[NameEntry::default(), bad, NameEntry::default()]), 1);
@@ -1562,10 +2251,24 @@ mod tests {
 
     #[test]
     fn stream_holds_at_most_one_packet() {
-        let one = Request::Readdir { id: 1, handle: s(b"d") }.to_bytes().unwrap();
+        let one = Request::Readdir {
+            id: 1,
+            handle: s(b"d"),
+        }
+        .to_bytes()
+        .unwrap();
         let bytes = one.repeat(100);
-        contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), &bytes, 2 * (LENGTH_LEN + 64));
-        assert_eq!(decode_all(|| Frames::<Packet>::with_limit(64), &bytes).0.len(), 100);
+        contract::check_decode_with_alloc_limit(
+            || Frames::<Packet>::with_limit(64),
+            &bytes,
+            2 * (LENGTH_LEN + 64),
+        );
+        assert_eq!(
+            decode_all(|| Frames::<Packet>::with_limit(64), &bytes)
+                .0
+                .len(),
+            100
+        );
         let mut stream = Stream::new(Frames::<Packet>::with_limit(64));
         assert_eq!(stream.push(&bytes), LENGTH_LEN + 64);
         assert_eq!(stream.push(&one), 0);
@@ -1575,17 +2278,29 @@ mod tests {
     fn status_text_is_preserved_or_refused() {
         for text in ["a".repeat(MAX_TEXT - 1) + "é", "😀".repeat(300)] {
             let response = Response::status(1, Status::Failure, &text);
-            let Response::Status { message, .. } = &response else { panic!() };
+            let Response::Status { message, .. } = &response else {
+                panic!()
+            };
             assert_eq!(message, text.as_bytes());
             assert_eq!(response.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&response);
-            let language = Response::Status { id: 1, status: Status::Failure, message: vec![], language: text.into_bytes() };
+            let language = Response::Status {
+                id: 1,
+                status: Status::Failure,
+                message: vec![],
+                language: text.into_bytes(),
+            };
             assert_eq!(language.to_bytes(), Err(Error::Unwritable));
         }
         let response = Response::status(1, Status::Ok, "été");
         assert_eq!(Response::parse(&response.to_bytes().unwrap()), Ok(response));
         for n in [MAX_TEXT, MAX_TEXT + 1] {
-            let response = Response::Status { id: 1, status: Status::Ok, message: vec![0x80; n], language: vec![] };
+            let response = Response::Status {
+                id: 1,
+                status: Status::Ok,
+                message: vec![0x80; n],
+                language: vec![],
+            };
             assert_eq!(response.to_bytes().is_ok(), n == MAX_TEXT);
             contract::check_wire_value(&response);
         }
@@ -1604,12 +2319,30 @@ mod tests {
         ext(&mut body, &[b'n'; MAX_EXTENSION_NAME + 1], 1);
         ext(&mut body, b"posix-rename@openssh.com", 1);
         for kind in [packet_type::INIT, packet_type::VERSION] {
-            let p = Packet { kind, body: body.clone() };
-            let kept = vec![Extension { name: s(b"posix-rename@openssh.com"), data: s(b"z") }];
+            let p = Packet {
+                kind,
+                body: body.clone(),
+            };
+            let kept = vec![Extension {
+                name: s(b"posix-rename@openssh.com"),
+                data: s(b"z"),
+            }];
             if kind == packet_type::INIT {
-                assert_eq!(Request::from_packet(&p), Ok(Request::Init { version: 3, extensions: kept }));
+                assert_eq!(
+                    Request::from_packet(&p),
+                    Ok(Request::Init {
+                        version: 3,
+                        extensions: kept
+                    })
+                );
             } else {
-                assert_eq!(Response::from_packet(&p), Ok(Response::Version { version: 3, extensions: kept }));
+                assert_eq!(
+                    Response::from_packet(&p),
+                    Ok(Response::Version {
+                        version: 3,
+                        extensions: kept
+                    })
+                );
             }
         }
         // Past MAX_EXTENSIONS, the rest are skipped too.
@@ -1617,8 +2350,10 @@ mod tests {
         for _ in 0..MAX_EXTENSIONS + 5 {
             ext(&mut many, b"a", 0);
         }
-        let Ok(Request::Init { extensions, .. }) = Request::from_packet(&Packet { kind: packet_type::INIT, body: many })
-        else {
+        let Ok(Request::Init { extensions, .. }) = Request::from_packet(&Packet {
+            kind: packet_type::INIT,
+            body: many,
+        }) else {
             panic!()
         };
         assert_eq!(extensions.len(), MAX_EXTENSIONS);
@@ -1626,16 +2361,29 @@ mod tests {
         let mut cut = vec![0, 0, 0, 3];
         ext(&mut cut, b"a", 10);
         cut.truncate(cut.len() - 1);
-        assert_eq!(Request::from_packet(&Packet { kind: packet_type::INIT, body: cut }), Err(Error::Truncated));
+        assert_eq!(
+            Request::from_packet(&Packet {
+                kind: packet_type::INIT,
+                body: cut
+            }),
+            Err(Error::Truncated)
+        );
     }
 
     #[test]
     fn generated_inputs_obey_contracts() {
         let mut rng = Lcg::new(0x5f7f);
-        let seeds: Vec<Vec<u8>> = requests().iter().map(|r| r.to_bytes().unwrap())
-            .chain(responses().iter().map(|r| r.to_bytes().unwrap())).collect();
+        let seeds: Vec<Vec<u8>> = requests()
+            .iter()
+            .map(|r| r.to_bytes().unwrap())
+            .chain(responses().iter().map(|r| r.to_bytes().unwrap()))
+            .collect();
         for _ in 0..6000 {
-            let mut bytes = if rng.coin() { seeds[rng.index(seeds.len())].clone() } else { rng.bytes(64) };
+            let mut bytes = if rng.coin() {
+                seeds[rng.index(seeds.len())].clone()
+            } else {
+                rng.bytes(64)
+            };
             mutate(&mut rng, &mut bytes);
             contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_FRAME);
             contract::check_wire::<Packet>(&bytes);
@@ -1643,7 +2391,10 @@ mod tests {
             contract::check_wire::<Response>(&bytes);
             contract::check_wire::<Attrs>(&bytes);
             for kind in 0..=255 {
-                let packet = Packet { kind, body: bytes.clone() };
+                let packet = Packet {
+                    kind,
+                    body: bytes.clone(),
+                };
                 check_packet(&packet);
             }
         }

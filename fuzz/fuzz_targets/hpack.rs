@@ -1,10 +1,10 @@
 //! HPACK wire contracts, complete blocks, table recovery, and round trips.
 #![no_main]
 use fictionet::stdlib::{
-    codec::{Collect},
-    test_support::contract,
+    codec::Collect,
     hpack::{self, Encoder, Field, StringLiteral, Table},
     prefix_int::Integer,
+    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 

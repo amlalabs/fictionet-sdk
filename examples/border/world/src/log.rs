@@ -57,7 +57,10 @@ pub struct Log {
 }
 
 fn now() -> f64 {
-    let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     ms as f64 / 1000.0
 }
 
@@ -112,7 +115,19 @@ fn fold_key(line: &Map<String, Value>) -> Option<String> {
         None => Value::Null,
     };
     let field = |name: &str| line.get(name).cloned().unwrap_or(Value::Null);
-    Some(json!([kind, sandbox, field("why"), field("protocol"), field("src"), field("dst"), field("hop"), field("from")]).to_string())
+    Some(
+        json!([
+            kind,
+            sandbox,
+            field("why"),
+            field("protocol"),
+            field("src"),
+            field("dst"),
+            field("hop"),
+            field("from")
+        ])
+        .to_string(),
+    )
 }
 
 /// The repeats of one line, counted in the current window.
@@ -200,14 +215,26 @@ impl Writer<'_> {
             self.close_folds();
         }
         self.window.get_or_insert_with(Instant::now);
-        self.folds.insert(key, Fold { line: fields.clone(), count: 0, ports: None });
+        self.folds.insert(
+            key,
+            Fold {
+                line: fields.clone(),
+                count: 0,
+                ports: None,
+            },
+        );
         self.write(ts, fields);
     }
 
     /// Writes the count of every fold that had repeats, and starts a new
     /// window.
     fn close_folds(&mut self) {
-        let mut folds: Vec<Fold> = self.folds.drain().map(|(_, f)| f).filter(|f| f.count > 0).collect();
+        let mut folds: Vec<Fold> = self
+            .folds
+            .drain()
+            .map(|(_, f)| f)
+            .filter(|f| f.count > 0)
+            .collect();
         folds.sort_by(|a, b| {
             let t = |f: &Fold| f.line.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
             t(a).total_cmp(&t(b))
@@ -222,13 +249,30 @@ impl Writer<'_> {
         let n = self.lost.load(Ordering::Relaxed);
         if n != self.reported {
             self.reported = n;
-            self.write(now(), json!({"type": "lost", "count": n}).as_object().cloned().unwrap_or_default());
+            self.write(
+                now(),
+                json!({"type": "lost", "count": n})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
     }
 }
 
-fn write_all(rx: Receiver<(f64, Record)>, out: Box<dyn Write + Send>, scenario: &Scenario, lost: &AtomicU64) {
-    let mut w = Writer { out, folds: HashMap::new(), window: None, lost, reported: 0 };
+fn write_all(
+    rx: Receiver<(f64, Record)>,
+    out: Box<dyn Write + Send>,
+    scenario: &Scenario,
+    lost: &AtomicU64,
+) {
+    let mut w = Writer {
+        out,
+        folds: HashMap::new(),
+        window: None,
+        lost,
+        reported: 0,
+    };
     let handle = |w: &mut Writer, (ts, record): (f64, Record)| {
         let value = match record {
             Record::Entry(entry) => events::line(scenario, &entry),
@@ -275,9 +319,16 @@ mod tests {
 
     #[test]
     fn the_password_never_reaches_a_line() {
-        let text = format!("{{\"path\":\"/login/{}\",\"ua\":\"{}\"}}", ACCOUNT.password, ACCOUNT.password.to_uppercase());
+        let text = format!(
+            "{{\"path\":\"/login/{}\",\"ua\":\"{}\"}}",
+            ACCOUNT.password,
+            ACCOUNT.password.to_uppercase()
+        );
         let clean = scrub(text);
-        assert_eq!(clean, "{\"path\":\"/login/[password]\",\"ua\":\"[password]\"}");
+        assert_eq!(
+            clean,
+            "{\"path\":\"/login/[password]\",\"ua\":\"[password]\"}"
+        );
         assert_eq!(scrub("nothing here".into()), "nothing here");
     }
 
@@ -314,18 +365,33 @@ mod tests {
             }
         }
         let lost = AtomicU64::new(0);
-        let mut w = Writer { out: Box::new(Out(buf.clone())), folds: HashMap::new(), window: None, lost: &lost, reported: 0 };
+        let mut w = Writer {
+            out: Box::new(Out(buf.clone())),
+            folds: HashMap::new(),
+            window: None,
+            lost: &lost,
+            reported: 0,
+        };
         for (i, line) in lines.into_iter().enumerate() {
             w.line(i as f64, line);
         }
         w.close_folds();
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        let got: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let got: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
         assert_eq!(got.len(), 4, "{text}");
         assert_eq!(got[0]["type"], "dns");
-        assert_eq!((got[1]["dst_port"].as_u64(), got[1].get("count")), (Some(1), None));
+        assert_eq!(
+            (got[1]["dst_port"].as_u64(), got[1].get("count")),
+            (Some(1), None)
+        );
         assert_eq!(got[2]["dst"], "84.21.60.20");
-        assert_eq!((got[3]["count"].as_u64(), got[3]["ports"].clone()), (Some(999), json!([2, 1000])));
+        assert_eq!(
+            (got[3]["count"].as_u64(), got[3]["ports"].clone()),
+            (Some(999), json!([2, 1000]))
+        );
         assert_eq!(got[3]["dst"], "84.21.44.10");
     }
 }

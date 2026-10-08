@@ -12,13 +12,13 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::task::Poll;
 use std::time::Duration;
 
-use fictionet::stdlib::bgp;
-use fictionet::stdlib::codec::{Frames, Stream, Wire};
 use border_world::certs::Ca;
 use border_world::log::Log;
-use border_world::scenario::{parse_prefix, Scenario, Task, Variant};
+use border_world::scenario::{Scenario, Task, Variant, parse_prefix};
 use bytes::Bytes;
 use fictionet::prelude::*;
+use fictionet::stdlib::bgp;
+use fictionet::stdlib::codec::{Frames, Stream, Wire};
 use fictionet::stdlib::dns::op::{Message, Query, ResponseCode};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::{ConnError, ip, tcp, udp};
@@ -52,16 +52,27 @@ impl Write for Buf {
 impl Buf {
     pub fn lines(&self) -> Vec<Value> {
         let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
-        text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+        text.lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
     }
 
     /// The lines of `kind` so far.
     pub fn of(&self, kind: &str) -> Vec<Value> {
-        self.lines().into_iter().filter(|l| l["type"] == kind).collect()
+        self.lines()
+            .into_iter()
+            .filter(|l| l["type"] == kind)
+            .collect()
     }
 
     /// Waits up to 5 s for `n` lines of `kind` that `keep` keeps.
-    pub async fn wait(&self, fcx: &Cx, kind: &str, n: usize, keep: impl Fn(&Value) -> bool) -> Vec<Value> {
+    pub async fn wait(
+        &self,
+        fcx: &Cx,
+        kind: &str,
+        n: usize,
+        keep: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
         for _ in 0..500 {
             let got: Vec<Value> = self.of(kind).into_iter().filter(|l| keep(l)).collect();
             if got.len() >= n {
@@ -99,9 +110,17 @@ where
 {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
         let result = rt.block_on(fictionet::run(move |fcx| async move {
-            let scenario = Arc::new(Scenario::new(variant, task, parse_prefix("10.0.0.0/24").unwrap()));
+            let scenario = Arc::new(Scenario::new(
+                variant,
+                task,
+                parse_prefix("10.0.0.0/24").unwrap(),
+            ));
             let (ids, root) = {
                 let ca = Ca::root("Test Root CA")?;
                 (border_world::identities(&scenario, &ca)?, ca.der().clone())
@@ -113,12 +132,24 @@ where
             let (attacher, attachments) = fictionet::attachments();
             let lookups = border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
             border_world::look_up_all(&fcx, &lookups, &scenario).await?;
-            f(fcx, attacher, Env { roots: Arc::new(roots), log: buf, scenario }).await?;
+            f(
+                fcx,
+                attacher,
+                Env {
+                    roots: Arc::new(roots),
+                    log: buf,
+                    scenario,
+                },
+            )
+            .await?;
             Err(fictionet::Error::from(Done))
         }));
         let _ = tx.send(result);
     });
-    match rx.recv_timeout(Duration::from_secs(90)).expect("the test timed out") {
+    match rx
+        .recv_timeout(Duration::from_secs(90))
+        .expect("the test timed out")
+    {
         Err(e) if e.downcast_ref::<Done>().is_some() => {}
         Err(e) => panic!("the world failed: {e}"),
         Ok(()) => panic!("the world should end with Done"),
@@ -151,18 +182,28 @@ pub struct Machine {
 pub fn machine(fcx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Machine {
     let end = attacher.attach(name).unwrap();
     let (tcp, udp, icmp, _other) = ip::split_protocols(fcx, end);
-    Machine { tcp: tcp::endpoint(fcx, tcp, addr.into()), udp: udp::endpoint(fcx, udp, addr.into()), icmp }
+    Machine {
+        tcp: tcp::endpoint(fcx, tcp, addr.into()),
+        udp: udp::endpoint(fcx, udp, addr.into()),
+        icmp,
+    }
 }
 
 /// Looks `name` up at the gateway. Returns the response code and the
 /// addresses.
 pub async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> (ResponseCode, Vec<Ipv4Addr>) {
-    let mut socket = m.udp.bind(40000 + (fcx.random_u64() % 20000) as u16).unwrap();
+    let mut socket = m
+        .udp
+        .bind(40000 + (fcx.random_u64() % 20000) as u16)
+        .unwrap();
     let mut q = Message::query();
     q.metadata.id = fcx.random_u64() as u16;
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
     socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(GATEWAY.into(), 53));
-    let (bytes, _) = timeout(fcx, Duration::from_secs(5), socket.recv(fcx)).await.expect("a DNS answer").unwrap();
+    let (bytes, _) = timeout(fcx, Duration::from_secs(5), socket.recv(fcx))
+        .await
+        .expect("a DNS answer")
+        .unwrap();
     let r = Message::from_vec(&bytes).unwrap();
     let addrs = r
         .answers
@@ -210,18 +251,26 @@ impl ServerCertVerifier for AcceptAll {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
 /// The client's TLS: verify against `roots`, or not at all.
 pub fn client_config(roots: Option<&Arc<RootCertStore>>) -> Arc<ClientConfig> {
-    let builder = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap();
+    let builder =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap();
     let mut config = match roots {
-        Some(roots) => builder.with_root_certificates(roots.clone()).with_no_client_auth(),
-        None => builder.dangerous().with_custom_certificate_verifier(Arc::new(AcceptAll)).with_no_client_auth(),
+        Some(roots) => builder
+            .with_root_certificates(roots.clone())
+            .with_no_client_auth(),
+        None => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAll))
+            .with_no_client_auth(),
     };
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Arc::new(config)
@@ -230,10 +279,25 @@ pub fn client_config(roots: Option<&Arc<RootCertStore>>) -> Arc<ClientConfig> {
 pub type TlsStream = tokio_rustls::client::TlsStream<fictionet::tokio::Compat<tcp::TcpConnection>>;
 
 /// Connects to `addr:443` and shakes hands for `sni`.
-pub async fn tls(fcx: &Cx, m: &Machine, addr: Ipv4Addr, sni: &str, config: Arc<ClientConfig>) -> std::io::Result<TlsStream> {
-    let conn = m.tcp.connect(fcx, SocketAddr::new(addr.into(), 443)).await.map_err(std::io::Error::other)?;
+pub async fn tls(
+    fcx: &Cx,
+    m: &Machine,
+    addr: Ipv4Addr,
+    sni: &str,
+    config: Arc<ClientConfig>,
+) -> std::io::Result<TlsStream> {
+    let conn = m
+        .tcp
+        .connect(fcx, SocketAddr::new(addr.into(), 443))
+        .await
+        .map_err(std::io::Error::other)?;
     let connector = tokio_rustls::TlsConnector::from(config);
-    connector.connect(ServerName::try_from(sni.to_owned()).unwrap(), conn.into_tokio(fcx)).await
+    connector
+        .connect(
+            ServerName::try_from(sni.to_owned()).unwrap(),
+            conn.into_tokio(fcx),
+        )
+        .await
 }
 
 /// The answer to one HTTP/1.1 request.
@@ -244,37 +308,71 @@ pub struct Got {
 }
 
 /// Sends one HTTP/1.1 request over `io`.
-pub async fn request<IO>(io: IO, method: &str, host: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Got
+pub async fn request<IO>(
+    io: IO,
+    method: &str,
+    host: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Got
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await.unwrap();
+    let (mut send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
+        .await
+        .unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
     });
-    let mut r = Request::builder().method(method).uri(path).header("host", host);
+    let mut r = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", host);
     for (k, v) in headers {
         r = r.header(*k, *v);
     }
-    let response = send.send_request(r.body(Full::new(Bytes::from(body.to_owned()))).unwrap()).await.unwrap();
+    let response = send
+        .send_request(r.body(Full::new(Bytes::from(body.to_owned()))).unwrap())
+        .await
+        .unwrap();
     let status = response.status();
     let headers = response.headers().clone();
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    Got { status, headers, body: String::from_utf8_lossy(&body).into_owned() }
+    Got {
+        status,
+        headers,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    }
 }
 
 /// Opens plain TCP to `addr:80`, for [`request`].
-pub async fn plain(fcx: &Cx, m: &Machine, addr: Ipv4Addr) -> fictionet::tokio::Compat<tcp::TcpConnection> {
-    m.tcp.connect(fcx, SocketAddr::new(addr.into(), 80)).await.unwrap().into_tokio(fcx)
+pub async fn plain(
+    fcx: &Cx,
+    m: &Machine,
+    addr: Ipv4Addr,
+) -> fictionet::tokio::Compat<tcp::TcpConnection> {
+    m.tcp
+        .connect(fcx, SocketAddr::new(addr.into(), 80))
+        .await
+        .unwrap()
+        .into_tokio(fcx)
 }
 
 /// Writes a message with two-octet AS numbers.
 pub fn bgp_bytes(message: bgp::Message) -> Vec<u8> {
-    message.to_frame(&bgp::Context::default()).and_then(|frame| frame.to_bytes()).unwrap()
+    message
+        .to_frame(&bgp::Context::default())
+        .and_then(|frame| frame.to_bytes())
+        .unwrap()
 }
 
 /// Reads one whole BGP message: its kind and body.
-pub async fn bgp_read(fcx: &Cx, conn: &mut tcp::TcpConnection, stream: &mut Stream<Frames<bgp::Frame>>) -> Result<(u8, Vec<u8>), ConnError> {
+pub async fn bgp_read(
+    fcx: &Cx,
+    conn: &mut tcp::TcpConnection,
+    stream: &mut Stream<Frames<bgp::Frame>>,
+) -> Result<(u8, Vec<u8>), ConnError> {
     loop {
         if let Some(frame) = stream.next() {
             let frame = frame.expect("a good frame");
@@ -297,7 +395,20 @@ pub use fictionet::stdlib::ip::checksum;
 /// An IPv4 packet with `ttl`.
 pub fn ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, ttl: u8, payload: &[u8]) -> Packet {
     let total = 20 + payload.len();
-    let mut p = vec![0x45, 0, (total >> 8) as u8, total as u8, 0, 1, 0, 0, ttl, proto, 0, 0];
+    let mut p = vec![
+        0x45,
+        0,
+        (total >> 8) as u8,
+        total as u8,
+        0,
+        1,
+        0,
+        0,
+        ttl,
+        proto,
+        0,
+        0,
+    ];
     p.extend_from_slice(&src.octets());
     p.extend_from_slice(&dst.octets());
     let sum = checksum(&p);
@@ -342,5 +453,10 @@ pub fn parse(p: &Packet) -> (Ipv4Addr, u8, u8, Vec<u8>) {
     let b = &p.0;
     let ihl = usize::from(b[0] & 0x0f) * 4;
     assert_eq!(checksum(&b[..ihl]), 0, "a bad header checksum");
-    (Ipv4Addr::new(b[12], b[13], b[14], b[15]), b[8], b[9], b[ihl..].to_vec())
+    (
+        Ipv4Addr::new(b[12], b[13], b[14], b[15]),
+        b[8],
+        b[9],
+        b[ihl..].to_vec(),
+    )
 }

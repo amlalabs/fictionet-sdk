@@ -76,10 +76,10 @@
 //! assert!(reader.is_done());
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::{Decode, Reader, Step, Truncated, Wire};
 
 /// The TCP port MySQL servers listen on.
 pub const PORT: u16 = 3306;
@@ -416,17 +416,25 @@ pub struct Packet {
 
 impl Packet {
     fn parse_prefix(b: &[u8], limit: usize) -> Result<Option<(Self, usize)>, Error> {
-        let Some(&[a, b0, c, seq]) = b.get(..HEADER_LEN) else { return Ok(None) };
+        let Some(&[a, b0, c, seq]) = b.get(..HEADER_LEN) else {
+            return Ok(None);
+        };
         let length = u32::from_le_bytes([a, b0, c, 0]);
         let len = usize::try_from(length).map_err(|_| Error::TooLong(usize::MAX))?;
         if len > limit.min(MAX_PACKET_PAYLOAD) {
             return Err(Error::TooLong(len));
         }
         let end = HEADER_LEN.checked_add(len).ok_or(Error::TooLong(len))?;
-        Ok(b.get(HEADER_LEN..end).map(|payload| (Self { seq, payload: payload.to_vec() }, end)))
+        Ok(b.get(HEADER_LEN..end).map(|payload| {
+            (
+                Self {
+                    seq,
+                    payload: payload.to_vec(),
+                },
+                end,
+            )
+        }))
     }
-
-
 }
 
 impl Wire for Packet {
@@ -449,7 +457,9 @@ impl Wire for Packet {
         if len > MAX_PACKET_PAYLOAD {
             return Err(Error::Unwritable);
         }
-        let [a, b, c, _] = u32::try_from(len).map_err(|_| Error::Unwritable)?.to_le_bytes();
+        let [a, b, c, _] = u32::try_from(len)
+            .map_err(|_| Error::Unwritable)?
+            .to_le_bytes();
         out.extend_from_slice(&[a, b, c, self.seq]);
         out.extend_from_slice(&self.payload);
         Ok(())
@@ -470,10 +480,14 @@ impl Prefixed for Packet {
     const NAME: &'static str = "MySQL";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_PACKET_PAYLOAD }
+    fn default_limit() -> Self::Limit {
+        MAX_PACKET_PAYLOAD
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_PACKET_PAYLOAD) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_PACKET_PAYLOAD)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -482,12 +496,14 @@ impl Prefixed for Packet {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         Packet::parse_prefix(input, limit)
     }
 }
-
 
 /// Why bytes are not the packet or message a reader expected, why a
 /// stream of packets cannot be read any further, or why a value cannot be
@@ -552,9 +568,13 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Truncated => f.write_str("input ended before a complete packet, or inside a field"),
+            Error::Truncated => {
+                f.write_str("input ended before a complete packet, or inside a field")
+            }
             Error::Incomplete => f.write_str("incomplete split MySQL message"),
-            Error::Sequence { expected, got } => write!(f, "sequence ID {got}, expected {expected}"),
+            Error::Sequence { expected, got } => {
+                write!(f, "sequence ID {got}, expected {expected}")
+            }
             Error::TooLong(n) => write!(f, "message of at least {n} bytes is over the limit"),
             Error::Header(b) => write!(f, "unexpected first byte {b:#04x}"),
             Error::LengthPrefix(b) => write!(f, "{b:#04x} does not start a length here"),
@@ -670,19 +690,28 @@ pub struct Messages {
 
 impl Messages {
     /// Accepts messages up to [`MAX_MESSAGE`] payload bytes.
-    pub fn new() -> Self { Self::with_limit(MAX_MESSAGE) }
+    pub fn new() -> Self {
+        Self::with_limit(MAX_MESSAGE)
+    }
 
     /// Sets the payload limit, clamped to [`MAX_MESSAGE`].
     pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.min(MAX_MESSAGE), partial: None }
+        Self {
+            limit: limit.min(MAX_MESSAGE),
+            partial: None,
+        }
     }
 
     /// The maximum assembled payload size.
-    pub fn limit(&self) -> usize { self.limit }
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
 }
 
 impl Default for Messages {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Decode for Messages {
@@ -690,33 +719,57 @@ impl Decode for Messages {
     type Error = Error;
     const NAME: &'static str = "MySQL messages";
 
-    fn capacity(&self) -> usize { HEADER_LEN + self.limit.min(MAX_PACKET_PAYLOAD) }
-    fn held(&self) -> usize { self.partial.as_ref().map_or(0, |p| p.2.len()) }
+    fn capacity(&self) -> usize {
+        HEADER_LEN + self.limit.min(MAX_PACKET_PAYLOAD)
+    }
+    fn held(&self) -> usize {
+        self.partial.as_ref().map_or(0, |p| p.2.len())
+    }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, Error> {
         let Some(&[a, b, c, seq]) = input.get(..HEADER_LEN) else {
-            if eof && input.is_empty() && self.partial.is_some() { return Err(Error::Incomplete); }
+            if eof && input.is_empty() && self.partial.is_some() {
+                return Err(Error::Incomplete);
+            }
             return Ok(Step::Need);
         };
         let length = usize::from(a) | usize::from(b) << 8 | usize::from(c) << 16;
         if let Some((_, last, _)) = &self.partial {
             let expected = last.wrapping_add(1);
-            if seq != expected { return Err(Error::Sequence { expected, got: seq }); }
+            if seq != expected {
+                return Err(Error::Sequence { expected, got: seq });
+            }
         }
         let total = self.held().saturating_add(length);
-        if total > self.limit { return Err(Error::TooLong(total)); }
+        if total > self.limit {
+            return Err(Error::TooLong(total));
+        }
         let used = HEADER_LEN + length;
-        let Some(payload) = input.get(HEADER_LEN..used) else { return Ok(Step::Need) };
+        let Some(payload) = input.get(HEADER_LEN..used) else {
+            return Ok(Step::Need);
+        };
         let (first, mut bytes) = match self.partial.take() {
             Some((first, _, bytes)) => (first, bytes),
             None => (seq, Vec::new()),
         };
         if total > bytes.capacity() {
-            let target = total.max(bytes.capacity().saturating_mul(2)).min(self.limit);
-            bytes.try_reserve_exact(target.saturating_sub(bytes.len())).map_err(|_| Error::TooLong(total))?;
+            let target = total
+                .max(bytes.capacity().saturating_mul(2))
+                .min(self.limit);
+            bytes
+                .try_reserve_exact(target.saturating_sub(bytes.len()))
+                .map_err(|_| Error::TooLong(total))?;
         }
         bytes.extend_from_slice(payload);
-        if length < MAX_PACKET_PAYLOAD { return Ok(Step::Item(Message { seq: first, payload: bytes }, used)); }
+        if length < MAX_PACKET_PAYLOAD {
+            return Ok(Step::Item(
+                Message {
+                    seq: first,
+                    payload: bytes,
+                },
+                used,
+            ));
+        }
         self.partial = Some((first, seq, bytes));
         Ok(Step::Skip(used))
     }
@@ -781,7 +834,12 @@ impl Handshake {
         let mut auth_data = r.take(8)?.to_vec();
         r.u8()?; // filler
         let mut capabilities = u32::from(r.u16_le()?);
-        let mut h = Handshake { server_version, connection_id, capabilities, ..Handshake::default() };
+        let mut h = Handshake {
+            server_version,
+            connection_id,
+            capabilities,
+            ..Handshake::default()
+        };
         if r.is_empty() {
             h.auth_data = auth_data;
             return Ok(h);
@@ -793,7 +851,11 @@ impl Handshake {
         r.take(10)?; // reserved
         // Part 2 comes whatever the flags; its length byte counts only with
         // PLUGIN_AUTH.
-        let n = if capabilities & capability::PLUGIN_AUTH != 0 { data_len.saturating_sub(8).max(13) } else { 13 };
+        let n = if capabilities & capability::PLUGIN_AUTH != 0 {
+            data_len.saturating_sub(8).max(13)
+        } else {
+            13
+        };
         auth_data.extend_from_slice(r.take(n)?);
         if capabilities & capability::PLUGIN_AUTH != 0 {
             // Some servers leave out the closing NUL.
@@ -801,7 +863,9 @@ impl Handshake {
         }
         h.capabilities = capabilities;
         h.auth_data = auth_data;
-        if !r.is_empty() { return Err(Error::Trailing); }
+        if !r.is_empty() {
+            return Err(Error::Trailing);
+        }
         Ok(h)
     }
 
@@ -817,8 +881,23 @@ impl Handshake {
         if !short && (n < 8 + 13 || n > if plugin_auth { 255 } else { 8 + 13 }) {
             return Err(Error::Length(n));
         }
-        let overhead = if short { 9 } else { 25 + usize::from(plugin_auth) };
-        payload_size(overhead, [self.server_version.len(), self.auth_data.len(), if plugin_auth { self.auth_plugin.len() } else { 0 }])?;
+        let overhead = if short {
+            9
+        } else {
+            25 + usize::from(plugin_auth)
+        };
+        payload_size(
+            overhead,
+            [
+                self.server_version.len(),
+                self.auth_data.len(),
+                if plugin_auth {
+                    self.auth_plugin.len()
+                } else {
+                    0
+                },
+            ],
+        )?;
         let mut out = vec![PROTOCOL_VERSION];
         put_nul(&mut out, &self.server_version)?;
         out.extend_from_slice(&self.connection_id.to_le_bytes());
@@ -894,8 +973,14 @@ impl HandshakeResponse {
             r.nul()?
         }
         .to_vec();
-        let mut h =
-            HandshakeResponse { capabilities, max_packet, charset, username, auth_response, ..Default::default() };
+        let mut h = HandshakeResponse {
+            capabilities,
+            max_packet,
+            charset,
+            username,
+            auth_response,
+            ..Default::default()
+        };
         if capabilities & capability::CONNECT_WITH_DB != 0 {
             h.database = r.nul()?.to_vec();
         }
@@ -924,30 +1009,64 @@ impl HandshakeResponse {
                 return Err(Error::Value(u64::from(h.zstd_level)));
             }
         }
-        if !r.is_empty() { return Err(Error::Trailing); }
+        if !r.is_empty() {
+            return Err(Error::Trailing);
+        }
         Ok(h)
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
         let caps = self.capabilities;
         let attrs = if caps & capability::CONNECT_ATTRS != 0 {
-            if self.attributes.len() > MAX_ATTRIBUTES { return Err(Error::Unwritable); }
+            if self.attributes.len() > MAX_ATTRIBUTES {
+                return Err(Error::Unwritable);
+            }
             let mut size = 0usize;
             for (key, value) in &self.attributes {
-                size = size.checked_add(lenenc_size(key.len() as u64)).and_then(|n| n.checked_add(key.len()))
+                size = size
+                    .checked_add(lenenc_size(key.len() as u64))
+                    .and_then(|n| n.checked_add(key.len()))
                     .and_then(|n| n.checked_add(lenenc_size(value.len() as u64)))
-                    .and_then(|n| n.checked_add(value.len())).ok_or(Error::Unwritable)?;
-                if size > MAX_ATTRIBUTE_BYTES { return Err(Error::Unwritable); }
+                    .and_then(|n| n.checked_add(value.len()))
+                    .ok_or(Error::Unwritable)?;
+                if size > MAX_ATTRIBUTE_BYTES {
+                    return Err(Error::Unwritable);
+                }
             }
             size + lenenc_size(size as u64)
-        } else { 0 };
+        } else {
+            0
+        };
         let auth_prefix = if caps & capability::PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
             lenenc_size(self.auth_response.len() as u64)
-        } else { 1 };
-        payload_size(33 + auth_prefix, [self.username.len(), self.auth_response.len(), attrs,
-            if caps & capability::CONNECT_WITH_DB != 0 { self.database.len().checked_add(1).ok_or(Error::Unwritable)? } else { 0 },
-            if caps & capability::PLUGIN_AUTH != 0 { self.auth_plugin.len().checked_add(1).ok_or(Error::Unwritable)? } else { 0 },
-            usize::from(caps & capability::ZSTD_COMPRESSION_ALGORITHM != 0)])?;
+        } else {
+            1
+        };
+        payload_size(
+            33 + auth_prefix,
+            [
+                self.username.len(),
+                self.auth_response.len(),
+                attrs,
+                if caps & capability::CONNECT_WITH_DB != 0 {
+                    self.database
+                        .len()
+                        .checked_add(1)
+                        .ok_or(Error::Unwritable)?
+                } else {
+                    0
+                },
+                if caps & capability::PLUGIN_AUTH != 0 {
+                    self.auth_plugin
+                        .len()
+                        .checked_add(1)
+                        .ok_or(Error::Unwritable)?
+                } else {
+                    0
+                },
+                usize::from(caps & capability::ZSTD_COMPRESSION_ALGORITHM != 0),
+            ],
+        )?;
         let mut out = Vec::new();
         out.extend_from_slice(&caps.to_le_bytes());
         out.extend_from_slice(&self.max_packet.to_le_bytes());
@@ -1027,7 +1146,11 @@ impl SslRequest {
         if capabilities & need != need {
             return Err(Error::Unsupported);
         }
-        Ok(SslRequest { capabilities, max_packet, charset })
+        Ok(SslRequest {
+            capabilities,
+            max_packet,
+            charset,
+        })
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -1076,7 +1199,11 @@ impl OkPacket {
         if header != 0x00 && header != 0xfe {
             return Err(Error::Header(header));
         }
-        let mut ok = OkPacket { affected_rows: r.lenenc()?, last_insert_id: r.lenenc()?, ..OkPacket::default() };
+        let mut ok = OkPacket {
+            affected_rows: r.lenenc()?,
+            last_insert_id: r.lenenc()?,
+            ..OkPacket::default()
+        };
         if capabilities & capability::PROTOCOL_41 != 0 {
             ok.status = r.u16_le()?;
             ok.warnings = r.u16_le()?;
@@ -1112,14 +1239,36 @@ impl OkPacket {
     }
 
     fn encode_header(&self, header: u8, caps: u32) -> Result<Vec<u8>, Error> {
-        let status_len = if caps & capability::PROTOCOL_41 != 0 { 4 }
-            else if caps & capability::TRANSACTIONS != 0 { 2 } else { 0 };
+        let status_len = if caps & capability::PROTOCOL_41 != 0 {
+            4
+        } else if caps & capability::TRANSACTIONS != 0 {
+            2
+        } else {
+            0
+        };
         let tracked = caps & capability::SESSION_TRACK != 0;
         let state = tracked && status_len != 0 && self.status & status::SESSION_STATE_CHANGED != 0;
-        let overhead = 1 + lenenc_size(self.affected_rows) + lenenc_size(self.last_insert_id) + status_len
-            + if tracked { lenenc_size(self.info.len() as u64) } else { 0 }
-            + if state { lenenc_size(self.session_state.len() as u64) } else { 0 };
-        payload_size(overhead, [self.info.len(), if state { self.session_state.len() } else { 0 }])?;
+        let overhead = 1
+            + lenenc_size(self.affected_rows)
+            + lenenc_size(self.last_insert_id)
+            + status_len
+            + if tracked {
+                lenenc_size(self.info.len() as u64)
+            } else {
+                0
+            }
+            + if state {
+                lenenc_size(self.session_state.len() as u64)
+            } else {
+                0
+            };
+        payload_size(
+            overhead,
+            [
+                self.info.len(),
+                if state { self.session_state.len() } else { 0 },
+            ],
+        )?;
         let mut out = vec![header];
         put_lenenc_int(&mut out, self.affected_rows);
         put_lenenc_int(&mut out, self.last_insert_id);
@@ -1158,7 +1307,11 @@ pub struct ErrPacket {
 impl ErrPacket {
     /// An ERR packet with a SQLSTATE.
     pub fn new(code: u16, sql_state: &[u8; 5], message: &[u8]) -> ErrPacket {
-        ErrPacket { code, sql_state: Some(*sql_state), message: message.to_vec() }
+        ErrPacket {
+            code,
+            sql_state: Some(*sql_state),
+            message: message.to_vec(),
+        }
     }
 
     /// Reads an ERR packet, with first byte 0xFF, under the connection's
@@ -1175,19 +1328,37 @@ impl ErrPacket {
         }
         let code = r.u16_le()?;
         let mut sql_state = None;
-        if capabilities & capability::PROTOCOL_41 != 0 && r.remaining() >= 6 && r.clone().rest()[0] == b'#' {
+        if capabilities & capability::PROTOCOL_41 != 0
+            && r.remaining() >= 6
+            && r.clone().rest()[0] == b'#'
+        {
             let mut s = [0u8; 5];
             s.copy_from_slice(&r.clone().rest()[1..6]);
             sql_state = Some(s);
             r.skip(6)?;
         }
-        Ok(ErrPacket { code, sql_state, message: r.rest().to_vec() })
+        Ok(ErrPacket {
+            code,
+            sql_state,
+            message: r.rest().to_vec(),
+        })
     }
 
     fn encode(&self, capabilities: u32) -> Result<Vec<u8>, Error> {
         let protocol_41 = capabilities & capability::PROTOCOL_41 != 0;
-        payload_size(if protocol_41 && self.sql_state.is_some() { 9 } else { 3 }, [self.message.len()])?;
-        if protocol_41 && self.sql_state.is_none() && self.message.len() >= 6 && self.message[0] == b'#' {
+        payload_size(
+            if protocol_41 && self.sql_state.is_some() {
+                9
+            } else {
+                3
+            },
+            [self.message.len()],
+        )?;
+        if protocol_41
+            && self.sql_state.is_none()
+            && self.message.len() >= 6
+            && self.message[0] == b'#'
+        {
             return Err(Error::Unwritable);
         }
         let mut out = vec![0xff];
@@ -1225,7 +1396,10 @@ impl Eof {
         }
         let mut eof = Eof::default();
         if capabilities & capability::PROTOCOL_41 != 0 {
-            eof = Eof { warnings: r.u16_le()?, status: r.u16_le()? };
+            eof = Eof {
+                warnings: r.u16_le()?,
+                status: r.u16_le()?,
+            };
         }
         if !r.is_empty() {
             return Err(Error::Trailing);
@@ -1326,7 +1500,10 @@ impl Command {
             }
             command::FIELD_LIST => {
                 let table = r.nul()?.to_vec();
-                Command::FieldList { table, wildcard: r.rest().to_vec() }
+                Command::FieldList {
+                    table,
+                    wildcard: r.rest().to_vec(),
+                }
             }
             command::CREATE_DB => Command::CreateDb(r.rest().to_vec()),
             command::DROP_DB => Command::DropDb(r.rest().to_vec()),
@@ -1341,7 +1518,10 @@ impl Command {
             command::STMT_RESET => Command::StmtReset(r.u32_le()?),
             command::SET_OPTION => Command::SetOption(r.u16_le()?),
             command::RESET_CONNECTION => Command::ResetConnection,
-            _ => Command::Other { command: code, data: r.rest().to_vec() },
+            _ => Command::Other {
+                command: code,
+                data: r.rest().to_vec(),
+            },
         })
     }
 
@@ -1371,10 +1551,26 @@ impl Command {
 
     fn encode(&self, capabilities: u32) -> Result<Vec<u8>, Error> {
         let (overhead, length) = match self {
-            Self::Query(data) => (if capabilities & capability::QUERY_ATTRIBUTES != 0 { 3 } else { 1 }, data.len()),
-            Self::InitDb(data) | Self::CreateDb(data) | Self::DropDb(data) | Self::StmtPrepare(data)
-                | Self::Other { data, .. } => (1, data.len()),
-            Self::FieldList { table, wildcard } => (2, table.len().checked_add(wildcard.len()).ok_or(Error::Unwritable)?),
+            Self::Query(data) => (
+                if capabilities & capability::QUERY_ATTRIBUTES != 0 {
+                    3
+                } else {
+                    1
+                },
+                data.len(),
+            ),
+            Self::InitDb(data)
+            | Self::CreateDb(data)
+            | Self::DropDb(data)
+            | Self::StmtPrepare(data)
+            | Self::Other { data, .. } => (1, data.len()),
+            Self::FieldList { table, wildcard } => (
+                2,
+                table
+                    .len()
+                    .checked_add(wildcard.len())
+                    .ok_or(Error::Unwritable)?,
+            ),
             _ => (1, 4),
         };
         payload_size(overhead, [length])?;
@@ -1399,9 +1595,10 @@ impl Command {
                 }
                 out.extend_from_slice(sql);
             }
-            Command::InitDb(s) | Command::CreateDb(s) | Command::DropDb(s) | Command::StmtPrepare(s) => {
-                out.extend_from_slice(s)
-            }
+            Command::InitDb(s)
+            | Command::CreateDb(s)
+            | Command::DropDb(s)
+            | Command::StmtPrepare(s) => out.extend_from_slice(s),
             Command::FieldList { table, wildcard } => {
                 put_nul(&mut out, table)?;
                 out.extend_from_slice(wildcard);
@@ -1480,15 +1677,35 @@ impl Column {
         c.flags = r.u16_le()?;
         c.decimals = r.u8()?;
         r.take(2)?; // filler
-        if !r.is_empty() { return Err(Error::Trailing); }
+        if !r.is_empty() {
+            return Err(Error::Trailing);
+        }
         Ok(c)
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        payload_size(13, [&self.catalog, &self.schema, &self.table, &self.org_table, &self.name, &self.org_name]
-            .into_iter().map(|v| v.len().saturating_add(lenenc_size(v.len() as u64))))?;
+        payload_size(
+            13,
+            [
+                &self.catalog,
+                &self.schema,
+                &self.table,
+                &self.org_table,
+                &self.name,
+                &self.org_name,
+            ]
+            .into_iter()
+            .map(|v| v.len().saturating_add(lenenc_size(v.len() as u64))),
+        )?;
         let mut out = Vec::new();
-        for s in [&self.catalog, &self.schema, &self.table, &self.org_table, &self.name, &self.org_name] {
+        for s in [
+            &self.catalog,
+            &self.schema,
+            &self.table,
+            &self.org_table,
+            &self.name,
+            &self.org_name,
+        ] {
             put_lenenc_str(&mut out, s);
         }
         out.push(0x0c);
@@ -1539,19 +1756,36 @@ impl Row {
         let mut reader = Reader::new(payload);
         let mut values = Vec::new();
         while !reader.is_empty() {
-            if values.len() == MAX_COLUMNS { return Err(Error::TooMany); }
-            if reader.clone().rest()[0] == 0xfb { reader.skip(1)?; values.push(None); }
-            else { values.push(Some(reader.lenenc_str()?.to_vec())); }
+            if values.len() == MAX_COLUMNS {
+                return Err(Error::TooMany);
+            }
+            if reader.clone().rest()[0] == 0xfb {
+                reader.skip(1)?;
+                values.push(None);
+            } else {
+                values.push(Some(reader.lenenc_str()?.to_vec()));
+            }
         }
         Ok(Self(values))
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        if self.0.len() > MAX_COLUMNS { return Err(Error::Unwritable); }
-        payload_size(0, self.0.iter().map(|v| v.as_ref().map_or(1, |v| v.len().saturating_add(lenenc_size(v.len() as u64)))))?;
+        if self.0.len() > MAX_COLUMNS {
+            return Err(Error::Unwritable);
+        }
+        payload_size(
+            0,
+            self.0.iter().map(|v| {
+                v.as_ref()
+                    .map_or(1, |v| v.len().saturating_add(lenenc_size(v.len() as u64)))
+            }),
+        )?;
         let mut out = Vec::new();
         for value in &self.0 {
-            match value { Some(value) => put_lenenc_str(&mut out, value), None => out.push(0xfb) }
+            match value {
+                Some(value) => put_lenenc_str(&mut out, value),
+                None => out.push(0xfb),
+            }
         }
         Ok(out)
     }
@@ -1567,7 +1801,9 @@ impl LocalInfile {
     fn read(payload: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader::new(payload);
         let first = reader.u8()?;
-        if first != 0xfb { return Err(Error::Header(first)); }
+        if first != 0xfb {
+            return Err(Error::Header(first));
+        }
         Ok(Self(reader.rest().to_vec()))
     }
     fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -1588,7 +1824,9 @@ impl LenencInt {
     fn read(payload: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader::new(payload);
         let value = reader.lenenc()?;
-        if !reader.is_empty() { return Err(Error::Trailing); }
+        if !reader.is_empty() {
+            return Err(Error::Trailing);
+        }
         Ok(Self(value))
     }
     fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -1621,15 +1859,28 @@ impl ResultSet {
         if columns.len() > MAX_COLUMNS || self.rows.iter().any(|r| r.0.len() != columns.len()) {
             return Err(Error::Unwritable);
         }
-        let end = OkPacket { status: self.status, warnings: self.warnings, ..OkPacket::default() };
+        let end = OkPacket {
+            status: self.status,
+            warnings: self.warnings,
+            ..OkPacket::default()
+        };
         if columns.is_empty() {
-            if !self.rows.is_empty() { return Err(Error::Unwritable); }
+            if !self.rows.is_empty() {
+                return Err(Error::Unwritable);
+            }
             return Ok(vec![end.message(seq, capabilities)?]);
         }
-        if capabilities & capability::PROTOCOL_41 == 0 { return Err(Error::Unwritable); }
+        if capabilities & capability::PROTOCOL_41 == 0 {
+            return Err(Error::Unwritable);
+        }
         let mut count = LenencInt(columns.len() as u64).to_bytes()?;
-        if capabilities & capability::OPTIONAL_RESULTSET_METADATA != 0 { count.push(METADATA_FULL); }
-        let first = Message { seq, payload: count };
+        if capabilities & capability::OPTIONAL_RESULTSET_METADATA != 0 {
+            count.push(METADATA_FULL);
+        }
+        let first = Message {
+            seq,
+            payload: count,
+        };
         seq = first.next_seq();
         let mut out = vec![first];
         for column in columns {
@@ -1637,7 +1888,10 @@ impl ResultSet {
             seq = message.next_seq();
             out.push(message);
         }
-        let eof = Eof { warnings: self.warnings, status: self.status };
+        let eof = Eof {
+            warnings: self.warnings,
+            status: self.status,
+        };
         if capabilities & capability::DEPRECATE_EOF == 0 {
             let message = eof.message(seq, capabilities)?;
             seq = message.next_seq();
@@ -1650,7 +1904,9 @@ impl ResultSet {
         }
         out.push(if capabilities & capability::DEPRECATE_EOF != 0 {
             end.end_message(seq, capabilities)?
-        } else { eof.message(seq, capabilities)? });
+        } else {
+            eof.message(seq, capabilities)?
+        });
         Ok(out)
     }
 }
@@ -1709,7 +1965,11 @@ pub struct ResultReader {
 impl ResultReader {
     /// A reader for a connection with these capability flags.
     pub fn new(capabilities: u32) -> ResultReader {
-        ResultReader { capabilities, state: ReadState::Start, columns: 0 }
+        ResultReader {
+            capabilities,
+            state: ReadState::Start,
+            columns: 0,
+        }
     }
 
     /// Whether the last result has ended.
@@ -1758,7 +2018,9 @@ impl ResultReader {
                     let mut r = Reader::new(payload);
                     let n = r.lenenc()?;
                     // The flag byte comes after the count, as libmysql reads it.
-                    if caps & capability::OPTIONAL_RESULTSET_METADATA != 0 && r.u8()? != METADATA_FULL {
+                    if caps & capability::OPTIONAL_RESULTSET_METADATA != 0
+                        && r.u8()? != METADATA_FULL
+                    {
                         return Err(Error::Unsupported);
                     }
                     if !r.is_empty() {
@@ -1768,7 +2030,10 @@ impl ResultReader {
                         // A count of 0 in a longer encoding than 0x00.
                         return Err(Error::Header(first));
                     }
-                    let n = usize::try_from(n).ok().filter(|&n| n <= MAX_COLUMNS).ok_or(Error::TooMany)?;
+                    let n = usize::try_from(n)
+                        .ok()
+                        .filter(|&n| n <= MAX_COLUMNS)
+                        .ok_or(Error::TooMany)?;
                     self.columns = n;
                     self.state = ReadState::Columns { left: n };
                     Ok(ResultEvent::ColumnCount(n))
@@ -1813,7 +2078,11 @@ impl ResultReader {
                         OkPacket::parse(payload, caps)?
                     } else {
                         let eof = Eof::parse(payload, caps)?;
-                        OkPacket { status: eof.status, warnings: eof.warnings, ..OkPacket::default() }
+                        OkPacket {
+                            status: eof.status,
+                            warnings: eof.warnings,
+                            ..OkPacket::default()
+                        }
                     };
                     self.after(end.status);
                     return Ok(ResultEvent::End(end));
@@ -1829,7 +2098,11 @@ impl ResultReader {
     }
 
     fn after(&mut self, status: u16) {
-        self.state = if status & status::MORE_RESULTS_EXISTS != 0 { ReadState::Start } else { ReadState::Done };
+        self.state = if status & status::MORE_RESULTS_EXISTS != 0 {
+            ReadState::Start
+        } else {
+            ReadState::Done
+        };
     }
 }
 
@@ -1903,21 +2176,29 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     }
 }
 
-
 fn read_size(payload: &[u8]) -> Result<(), Error> {
-    if payload.len() > MAX_MESSAGE { return Err(Error::Length(payload.len())); }
+    if payload.len() > MAX_MESSAGE {
+        return Err(Error::Length(payload.len()));
+    }
     Ok(())
 }
 
 fn lenenc_size(value: u64) -> usize {
-    match value { 0..=250 => 1, 251..=0xffff => 3, 0x1_0000..=0xff_ffff => 4, _ => 9 }
+    match value {
+        0..=250 => 1,
+        251..=0xffff => 3,
+        0x1_0000..=0xff_ffff => 4,
+        _ => 9,
+    }
 }
 
 fn payload_size(base: usize, lengths: impl IntoIterator<Item = usize>) -> Result<(), Error> {
     let mut size = base;
     for length in lengths {
         size = size.checked_add(length).ok_or(Error::Unwritable)?;
-        if size > MAX_MESSAGE { return Err(Error::Unwritable); }
+        if size > MAX_MESSAGE {
+            return Err(Error::Unwritable);
+        }
     }
     Ok(())
 }
@@ -1949,27 +2230,41 @@ macro_rules! payload_wire {
         }
     };
 }
-payload_wire!(Handshake,
+payload_wire!(
+    Handshake,
     "Reads a handshake payload. A server that refuses a client may send\nan ERR packet instead, which gives [`Error::Version`] with 0xFF;\nread it with [`ErrPacket::parse`].\n\nOld servers stop after the lower capability flags. Then the\ncharacter set, status and upper flags are 0 and `auth_data` holds\n8 bytes.",
-    "Appends a HandshakeV10 payload. Refuses embedded NULs, omitted plugin names, and auth data lengths the flags cannot carry: 21 bytes normally, 21 to 255 with PLUGIN_AUTH, or 8 in the short form with no character set, status, upper flags, or plugin name.");
-payload_wire!(HandshakeResponse,
+    "Appends a HandshakeV10 payload. Refuses embedded NULs, omitted plugin names, and auth data lengths the flags cannot carry: 21 bytes normally, 21 to 255 with PLUGIN_AUTH, or 8 in the short form with no character set, status, upper flags, or plugin name."
+);
+payload_wire!(
+    HandshakeResponse,
     "Reads a handshake response payload. A 32-byte payload is an\n[`SslRequest`] instead, and gives [`Error::Truncated`] here.\nWithout [`capability::PROTOCOL_41`] it gives\n[`Error::Unsupported`]. Every field the flags call for must be\nthere, as a MySQL server reads them, except the plugin name: when\nit is left out it reads as empty, and its closing NUL may be left\nout at the very end. A block of connection attributes over\n[`MAX_ATTRIBUTE_BYTES`] gives [`Error::Length`], and a zstd level\noutside [`ZSTD_LEVELS`] gives [`Error::Value`].",
-    "Appends a HandshakeResponse41 payload. Refuses missing PROTOCOL_41, fields omitted by the capabilities, embedded NULs in terminated fields, auth data above 255 bytes without length encoding, more than MAX_ATTRIBUTES, an attribute block above MAX_ATTRIBUTE_BYTES, and a zstd level outside ZSTD_LEVELS.");
-payload_wire!(SslRequest,
+    "Appends a HandshakeResponse41 payload. Refuses missing PROTOCOL_41, fields omitted by the capabilities, embedded NULs in terminated fields, auth data above 255 bytes without length encoding, more than MAX_ATTRIBUTES, an attribute block above MAX_ATTRIBUTE_BYTES, and a zstd level outside ZSTD_LEVELS."
+);
+payload_wire!(
+    SslRequest,
     "Reads an SSL request: exactly [`SSL_REQUEST_LEN`] bytes, with\n[`capability::SSL`] and [`capability::PROTOCOL_41`] set. Other\npayloads give [`Error::Truncated`], [`Error::Trailing`] or\n[`Error::Unsupported`].",
-    "Appends the 32-byte TLS request. Refuses missing SSL or PROTOCOL_41 capability flags.");
-payload_wire!(Column,
+    "Appends the 32-byte TLS request. Refuses missing SSL or PROTOCOL_41 capability flags."
+);
+payload_wire!(
+    Column,
     "Reads one column definition. Refuses a fixed-field length other than 12, incomplete fields, and trailing bytes, including COM_FIELD_LIST defaults.",
-    "Appends the six length-encoded names and 12 fixed-field bytes. Refuses a payload above MAX_MESSAGE.");
-payload_wire!(Row,
+    "Appends the six length-encoded names and 12 fixed-field bytes. Refuses a payload above MAX_MESSAGE."
+);
+payload_wire!(
+    Row,
     "Reads length-encoded values and NULL markers until the payload ends. Refuses invalid prefixes, truncated values, and more than MAX_COLUMNS.",
-    "Appends each value with its length, or 0xFB for NULL. Refuses more than MAX_COLUMNS or a payload above MAX_MESSAGE.");
-payload_wire!(LocalInfile,
+    "Appends each value with its length, or 0xFB for NULL. Refuses more than MAX_COLUMNS or a payload above MAX_MESSAGE."
+);
+payload_wire!(
+    LocalInfile,
     "Reads 0xFB followed by a file name. Refuses an empty payload or another first byte. Negotiated LOCAL_FILES is checked by ResultReader.",
-    "Appends 0xFB and the full file name. Refuses a payload above MAX_MESSAGE.");
-payload_wire!(LenencInt,
+    "Appends 0xFB and the full file name. Refuses a payload above MAX_MESSAGE."
+);
+payload_wire!(
+    LenencInt,
     "Reads exactly one non-NULL length-encoded integer. Values below 251 use one byte. Prefixes 0xFC, 0xFD, and 0xFE introduce 2, 3, and 8 bytes. Refuses 0xFB (NULL), 0xFF, incomplete input, and trailing bytes.",
-    "Appends a non-NULL integer in its shortest length-encoded form. Every integer value is representable.");
+    "Appends a non-NULL integer in its shortest length-encoded form. Every integer value is representable."
+);
 macro_rules! contextual_message {
     ($($ty:ty),+ $(,)?) => {$ (
         impl $ty {
@@ -1992,23 +2287,31 @@ impl OkPacket {
     /// by the flags and a payload at least [`MAX_PACKET_PAYLOAD`] bytes.
     /// Uses header 0xFE under [`capability::DEPRECATE_EOF`].
     pub fn end_message(&self, seq: u8, capabilities: u32) -> Result<Message, Error> {
-        let payload = self.encode_end(capabilities).map_err(|_| Error::Unwritable)?;
-        if Self::parse(&payload, capabilities).as_ref() != Ok(self) { return Err(Error::Unwritable); }
+        let payload = self
+            .encode_end(capabilities)
+            .map_err(|_| Error::Unwritable)?;
+        if Self::parse(&payload, capabilities).as_ref() != Ok(self) {
+            return Err(Error::Unwritable);
+        }
         Ok(Message { seq, payload })
     }
 }
 
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Truncated }
+    fn from(_: Truncated) -> Self {
+        Error::Truncated
+    }
 }
 
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
 pub mod harness {
-    use super::{Column, Command, Eof, ErrPacket, Handshake, HandshakeResponse, LenencInt,
-        LocalInfile, OkPacket, ResultReader, Row, SslRequest, parse_row};
+    use super::{
+        Column, Command, Eof, ErrPacket, Handshake, HandshakeResponse, LenencInt, LocalInfile,
+        OkPacket, ResultReader, Row, SslRequest, parse_row,
+    };
     use fictionet::stdlib::codec::Wire;
     use fictionet::stdlib::test_support::contract;
 
@@ -2035,13 +2338,22 @@ pub mod harness {
                 }
             }
             if let Ok(value) = ErrPacket::parse(bytes, caps) {
-                assert_eq!(ErrPacket::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value));
+                assert_eq!(
+                    ErrPacket::parse(&value.message(0, caps).unwrap().payload, caps),
+                    Ok(value)
+                );
             }
             if let Ok(value) = Eof::parse(bytes, caps) {
-                assert_eq!(Eof::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value));
+                assert_eq!(
+                    Eof::parse(&value.message(0, caps).unwrap().payload, caps),
+                    Ok(value)
+                );
             }
             if let Ok(value) = Command::parse(bytes, caps) {
-                assert_eq!(Command::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value));
+                assert_eq!(
+                    Command::parse(&value.message(0, caps).unwrap().payload, caps),
+                    Ok(value)
+                );
             }
             let _ = ResultReader::new(caps).push(bytes);
         }
@@ -2056,16 +2368,15 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
-    use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, pump,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::hex;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
-    const CAPS41: u32 = capability::PROTOCOL_41 | capability::SECURE_CONNECTION | capability::TRANSACTIONS;
+    const CAPS41: u32 =
+        capability::PROTOCOL_41 | capability::SECURE_CONNECTION | capability::TRANSACTIONS;
     const CAPS_MODERN: u32 = CAPS41
         | capability::PLUGIN_AUTH
         | capability::PLUGIN_AUTH_LENENC_CLIENT_DATA
@@ -2075,12 +2386,19 @@ mod tests {
         | capability::DEPRECATE_EOF
         | capability::MULTI_RESULTS;
     /// Flag sets the readers are tried under.
-    const CAPS_SETS: [u32; 5] =
-        [0, capability::TRANSACTIONS, CAPS41, CAPS_MODERN, CAPS_MODERN | capability::QUERY_ATTRIBUTES];
-
+    const CAPS_SETS: [u32; 5] = [
+        0,
+        capability::TRANSACTIONS,
+        CAPS41,
+        CAPS_MODERN,
+        CAPS_MODERN | capability::QUERY_ATTRIBUTES,
+    ];
 
     /// Every strict prefix of `full` is refused or reads as something else.
-    fn prefixes<T: PartialEq + std::fmt::Debug>(full: &[u8], parse: impl Fn(&[u8]) -> Result<T, Error>) {
+    fn prefixes<T: PartialEq + std::fmt::Debug>(
+        full: &[u8],
+        parse: impl Fn(&[u8]) -> Result<T, Error>,
+    ) {
         prefixes_but_nul(full, false, parse)
     }
 
@@ -2142,7 +2460,10 @@ mod tests {
         assert_eq!(Handshake::parse(&p), Ok(h.clone()));
         prefixes_but_nul(&p, true, Handshake::parse);
         // A server that leaves out the plugin name's NUL.
-        assert_eq!(Handshake::parse(&p[..p.len() - 1]).unwrap().auth_plugin, b"caching_sha2_password");
+        assert_eq!(
+            Handshake::parse(&p[..p.len() - 1]).unwrap().auth_plugin,
+            b"caching_sha2_password"
+        );
         // A length below 21 still means 13 bytes in part 2.
         let mut q = p.clone();
         q[1 + 7 + 4 + 8 + 1 + 2 + 1 + 2 + 2] = 0;
@@ -2157,7 +2478,10 @@ mod tests {
         assert_eq!((h.charset, h.status, h.auth_data.len()), (0, 0, 8));
         assert_eq!(h.to_bytes().unwrap(), short);
         assert_eq!(Handshake::parse(&[9, b'x', 0]), Err(Error::Version(9)));
-        assert_eq!(Handshake::parse(&[0xff, 0x15, 0x04]), Err(Error::Version(0xff)));
+        assert_eq!(
+            Handshake::parse(&[0xff, 0x15, 0x04]),
+            Err(Error::Version(0xff))
+        );
         // No NUL after the version.
         assert_eq!(Handshake::parse(&[10, b'5', b'.']), Err(Error::Truncated));
         // Writers refuse what would not read back the same: a NUL in a
@@ -2170,15 +2494,44 @@ mod tests {
             ..Handshake::default()
         };
         assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
-        let plugin = Handshake { capabilities: CAPS_MODERN, auth_plugin: b"a\0b".to_vec(), ..odd.clone() };
+        let plugin = Handshake {
+            capabilities: CAPS_MODERN,
+            auth_plugin: b"a\0b".to_vec(),
+            ..odd.clone()
+        };
         assert_eq!(plugin.to_bytes(), Err(Error::Unwritable));
-        let fine = Handshake { server_version: b"8".to_vec(), ..odd.clone() };
-        assert_eq!(Handshake::parse(&fine.to_bytes().unwrap()), Ok(fine.clone()));
-        for (n, caps) in [(3, 0), (20, 0), (22, 0), (20, CAPS_MODERN), (256, CAPS_MODERN)] {
-            let h = Handshake { auth_data: vec![1; n], capabilities: caps, ..fine.clone() };
-            assert_eq!(h.to_bytes(), Err(Error::Unwritable), "{n} bytes, flags {caps:#x}");
+        let fine = Handshake {
+            server_version: b"8".to_vec(),
+            ..odd.clone()
+        };
+        assert_eq!(
+            Handshake::parse(&fine.to_bytes().unwrap()),
+            Ok(fine.clone())
+        );
+        for (n, caps) in [
+            (3, 0),
+            (20, 0),
+            (22, 0),
+            (20, CAPS_MODERN),
+            (256, CAPS_MODERN),
+        ] {
+            let h = Handshake {
+                auth_data: vec![1; n],
+                capabilities: caps,
+                ..fine.clone()
+            };
+            assert_eq!(
+                h.to_bytes(),
+                Err(Error::Unwritable),
+                "{n} bytes, flags {caps:#x}"
+            );
         }
-        let long = Handshake { auth_data: vec![1; 255], capabilities: CAPS_MODERN, charset: 8, ..Handshake::default() };
+        let long = Handshake {
+            auth_data: vec![1; 255],
+            capabilities: CAPS_MODERN,
+            charset: 8,
+            ..Handshake::default()
+        };
         assert_eq!(Handshake::parse(&long.to_bytes().unwrap()), Ok(long));
     }
 
@@ -2211,11 +2564,24 @@ mod tests {
         // length.
         let mut reader = ResultReader::new(CAPS41);
         reader.push(&[1]).unwrap();
-        reader.push(&Column::new(b"a", column_type::VAR_STRING).to_bytes().unwrap()).unwrap();
-        reader.push(&Eof::default().message(0, CAPS41).unwrap().payload).unwrap();
+        reader
+            .push(
+                &Column::new(b"a", column_type::VAR_STRING)
+                    .to_bytes()
+                    .unwrap(),
+            )
+            .unwrap();
+        reader
+            .push(&Eof::default().message(0, CAPS41).unwrap().payload)
+            .unwrap();
         let row = [0xfe, 1, 0, 0, 0, 0, 0, 0, 0, b'x'];
-        assert_eq!(reader.push(&row), Ok(ResultEvent::Row(Row(vec![Some(b"x".to_vec())]))));
-        let end = reader.push(&Eof::default().message(0, CAPS41).unwrap().payload).unwrap();
+        assert_eq!(
+            reader.push(&row),
+            Ok(ResultEvent::Row(Row(vec![Some(b"x".to_vec())])))
+        );
+        let end = reader
+            .push(&Eof::default().message(0, CAPS41).unwrap().payload)
+            .unwrap();
         assert_eq!(end, ResultEvent::End(OkPacket::default()));
     }
 
@@ -2249,7 +2615,10 @@ mod tests {
             auth_response: vec![0; 300],
             database: b"shop".to_vec(),
             auth_plugin: b"caching_sha2_password".to_vec(),
-            attributes: vec![(b"_client_name".to_vec(), b"libmysql".to_vec()), (b"_pid".to_vec(), b"42".to_vec())],
+            attributes: vec![
+                (b"_client_name".to_vec(), b"libmysql".to_vec()),
+                (b"_pid".to_vec(), b"42".to_vec()),
+            ],
             zstd_level: 3,
         };
         let p = r.to_bytes().unwrap();
@@ -2257,10 +2626,25 @@ mod tests {
         prefixes(&p, HandshakeResponse::parse);
         // Without the length-encoded flag, an auth response over 255
         // bytes cannot be written.
-        let short = HandshakeResponse { capabilities: CAPS41, ..r.clone() };
+        let short = HandshakeResponse {
+            capabilities: CAPS41,
+            ..r.clone()
+        };
         assert_eq!(short.to_bytes(), Err(Error::Unwritable));
-        let short = HandshakeResponse { auth_response: vec![1; 255], database: vec![], auth_plugin: vec![], attributes: vec![], zstd_level: 0, ..short };
-        assert_eq!(HandshakeResponse::parse(&short.to_bytes().unwrap()).unwrap().auth_response, short.auth_response);
+        let short = HandshakeResponse {
+            auth_response: vec![1; 255],
+            database: vec![],
+            auth_plugin: vec![],
+            attributes: vec![],
+            zstd_level: 0,
+            ..short
+        };
+        assert_eq!(
+            HandshakeResponse::parse(&short.to_bytes().unwrap())
+                .unwrap()
+                .auth_response,
+            short.auth_response
+        );
         // Without SECURE_CONNECTION it ends at a NUL, so it may hold none.
         let old = HandshakeResponse {
             capabilities: capability::PROTOCOL_41,
@@ -2268,7 +2652,10 @@ mod tests {
             ..HandshakeResponse::default()
         };
         assert_eq!(old.to_bytes(), Err(Error::Unwritable));
-        let user = HandshakeResponse { username: b"alice\0admin".to_vec(), ..r.clone() };
+        let user = HandshakeResponse {
+            username: b"alice\0admin".to_vec(),
+            ..r.clone()
+        };
         assert_eq!(user.to_bytes(), Err(Error::Unwritable));
         // Errors.
         let pre41 = [0u8; 40];
@@ -2279,7 +2666,10 @@ mod tests {
             ..HandshakeResponse::default()
         };
         let mut p = many.to_bytes().unwrap();
-        assert_eq!(HandshakeResponse::parse(&p).unwrap().attributes.len(), MAX_ATTRIBUTES);
+        assert_eq!(
+            HandshakeResponse::parse(&p).unwrap().attributes.len(),
+            MAX_ATTRIBUTES
+        );
         // Two more bytes in the block: one more attribute.
         let block = MAX_ATTRIBUTES * 2;
         let at = p.len() - block - 3;
@@ -2287,20 +2677,37 @@ mod tests {
         p[at + 1..at + 3].copy_from_slice(&((block + 2) as u16).to_le_bytes());
         p.extend_from_slice(&[0, 0]);
         assert_eq!(HandshakeResponse::parse(&p), Err(Error::TooMany));
-        let more = HandshakeResponse { attributes: vec![(vec![], vec![]); MAX_ATTRIBUTES + 1], ..many };
+        let more = HandshakeResponse {
+            attributes: vec![(vec![], vec![]); MAX_ATTRIBUTES + 1],
+            ..many
+        };
         assert_eq!(more.to_bytes(), Err(Error::Unwritable));
         // A bad length prefix in the auth response.
-        let mut bad =
-            HandshakeResponse { capabilities: CAPS_MODERN, ..HandshakeResponse::default() }.to_bytes().unwrap();
+        let mut bad = HandshakeResponse {
+            capabilities: CAPS_MODERN,
+            ..HandshakeResponse::default()
+        }
+        .to_bytes()
+        .unwrap();
         bad[33] = 0xff;
-        assert_eq!(HandshakeResponse::parse(&bad), Err(Error::LengthPrefix(0xff)));
+        assert_eq!(
+            HandshakeResponse::parse(&bad),
+            Err(Error::LengthPrefix(0xff))
+        );
     }
 
     #[test]
     fn ssl_request() {
-        let s = SslRequest { capabilities: CAPS41, max_packet: 1 << 24, charset: 45 };
+        let s = SslRequest {
+            capabilities: CAPS41,
+            max_packet: 1 << 24,
+            charset: 45,
+        };
         assert_eq!(s.to_bytes(), Err(Error::Unwritable));
-        let s = SslRequest { capabilities: CAPS41 | capability::SSL, ..s };
+        let s = SslRequest {
+            capabilities: CAPS41 | capability::SSL,
+            ..s
+        };
         let p = s.to_bytes().unwrap();
         assert_eq!(p.len(), SSL_REQUEST_LEN);
         let back = SslRequest::parse(&p).unwrap();
@@ -2319,11 +2726,22 @@ mod tests {
     fn ok_example() {
         let bytes = hex("00 00 00 02 00 00 00");
         let ok = OkPacket::parse(&bytes, CAPS41).unwrap();
-        assert_eq!(ok, OkPacket { status: status::AUTOCOMMIT, ..OkPacket::default() });
+        assert_eq!(
+            ok,
+            OkPacket {
+                status: status::AUTOCOMMIT,
+                ..OkPacket::default()
+            }
+        );
         assert_eq!(ok.message(0, CAPS41).unwrap().payload, bytes);
         prefixes(&bytes, |b| OkPacket::parse(b, CAPS41));
         // With info text.
-        let ok = OkPacket { affected_rows: 300, last_insert_id: 70000, info: b"Rows matched: 1".to_vec(), ..ok };
+        let ok = OkPacket {
+            affected_rows: 300,
+            last_insert_id: 70000,
+            info: b"Rows matched: 1".to_vec(),
+            ..ok
+        };
         let p = ok.message(0, CAPS41).unwrap().payload;
         assert_eq!(&p[..7], &[0, 0xfc, 0x2c, 0x01, 0xfd, 0x70, 0x11]);
         assert_eq!(OkPacket::parse(&p, CAPS41), Ok(ok.clone()));
@@ -2342,16 +2760,36 @@ mod tests {
         assert_eq!(OkPacket::parse(&end, CAPS_MODERN), Ok(tracked));
         // Before 4.1: the status goes only with TRANSACTIONS.
         let p = ok.message(0, capability::TRANSACTIONS).unwrap().payload;
-        assert_eq!(OkPacket::parse(&p, capability::TRANSACTIONS).unwrap().status, ok.status);
+        assert_eq!(
+            OkPacket::parse(&p, capability::TRANSACTIONS)
+                .unwrap()
+                .status,
+            ok.status
+        );
         assert_eq!(ok.message(0, 0), Err(Error::Unwritable));
         let without_status = OkPacket { status: 0, ..ok };
-        assert_eq!(OkPacket::parse(&without_status.message(0, 0).unwrap().payload, 0), Ok(without_status));
+        assert_eq!(
+            OkPacket::parse(&without_status.message(0, 0).unwrap().payload, 0),
+            Ok(without_status)
+        );
         // Errors.
-        assert_eq!(OkPacket::parse(&[0x01, 0, 0], CAPS41), Err(Error::Header(1)));
-        assert_eq!(OkPacket::parse(&[0x00, 0xfb, 0], CAPS41), Err(Error::LengthPrefix(0xfb)));
+        assert_eq!(
+            OkPacket::parse(&[0x01, 0, 0], CAPS41),
+            Err(Error::Header(1))
+        );
+        assert_eq!(
+            OkPacket::parse(&[0x00, 0xfb, 0], CAPS41),
+            Err(Error::LengthPrefix(0xfb))
+        );
         // Long info is written whole.
-        let big = OkPacket { info: vec![b'x'; 0x1_0010], ..OkPacket::default() };
-        assert_eq!(OkPacket::parse(&big.message(0, CAPS_MODERN).unwrap().payload, CAPS_MODERN), Ok(big));
+        let big = OkPacket {
+            info: vec![b'x'; 0x1_0010],
+            ..OkPacket::default()
+        };
+        assert_eq!(
+            OkPacket::parse(&big.message(0, CAPS_MODERN).unwrap().payload, CAPS_MODERN),
+            Ok(big)
+        );
     }
 
     #[test]
@@ -2363,25 +2801,53 @@ mod tests {
         prefixes(&bytes, |b| ErrPacket::parse(b, CAPS41));
         // Before the handshake, or before 4.1: no SQLSTATE.
         let early = ErrPacket::parse(&hex("ff 15 04 48 6f 73 74"), CAPS41).unwrap();
-        assert_eq!((early.code, early.sql_state, &early.message[..]), (1045, None, &b"Host"[..]));
+        assert_eq!(
+            (early.code, early.sql_state, &early.message[..]),
+            (1045, None, &b"Host"[..])
+        );
         let old = ErrPacket::parse(&bytes, 0).unwrap();
         assert_eq!(old.sql_state, None);
         assert_eq!(&old.message[..6], b"#HY000");
-        assert_eq!(ErrPacket::new(1, b"HY000", b"x").message(0, 0), Err(Error::Unwritable));
-        assert_eq!(ErrPacket { code: 1, sql_state: None, message: b"x".to_vec() }.message(0, 0).unwrap().payload, [0xff, 1, 0, b'x']);
-        assert_eq!(ErrPacket::parse(&[0x00, 1, 0], CAPS41), Err(Error::Header(0)));
+        assert_eq!(
+            ErrPacket::new(1, b"HY000", b"x").message(0, 0),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            ErrPacket {
+                code: 1,
+                sql_state: None,
+                message: b"x".to_vec()
+            }
+            .message(0, 0)
+            .unwrap()
+            .payload,
+            [0xff, 1, 0, b'x']
+        );
+        assert_eq!(
+            ErrPacket::parse(&[0x00, 1, 0], CAPS41),
+            Err(Error::Header(0))
+        );
     }
 
     #[test]
     fn eof_example() {
         let bytes = hex("fe 00 00 02 00");
         let eof = Eof::parse(&bytes, CAPS41).unwrap();
-        assert_eq!(eof, Eof { warnings: 0, status: status::AUTOCOMMIT });
+        assert_eq!(
+            eof,
+            Eof {
+                warnings: 0,
+                status: status::AUTOCOMMIT
+            }
+        );
         assert_eq!(eof.message(0, CAPS41).unwrap().payload, bytes);
         prefixes(&bytes, |b| Eof::parse(b, CAPS41));
         assert_eq!(Eof::parse(&[0xfe], 0), Ok(Eof::default()));
         assert_eq!(Eof::parse(&[0xfe; 9], CAPS41), Err(Error::Trailing));
-        assert_eq!(Eof::parse(&[0x00, 0, 0, 0, 0], CAPS41), Err(Error::Header(0)));
+        assert_eq!(
+            Eof::parse(&[0x00, 0, 0, 0, 0], CAPS41),
+            Err(Error::Header(0))
+        );
     }
 
     #[test]
@@ -2392,14 +2858,28 @@ mod tests {
         let m = Message::parse(&bytes).unwrap();
         assert_eq!(m.seq, 0);
         let c = Command::parse(&m.payload, CAPS41).unwrap();
-        assert_eq!(c, Command::Query(b"select @@version_comment limit 1".to_vec()));
-        assert_eq!(Message { seq: 0, payload: c.message(0, CAPS41).unwrap().payload }.to_bytes().unwrap(), bytes);
+        assert_eq!(
+            c,
+            Command::Query(b"select @@version_comment limit 1".to_vec())
+        );
+        assert_eq!(
+            Message {
+                seq: 0,
+                payload: c.message(0, CAPS41).unwrap().payload
+            }
+            .to_bytes()
+            .unwrap(),
+            bytes
+        );
         // With query attributes and none sent.
         let attrs = CAPS41 | capability::QUERY_ATTRIBUTES;
         let p = c.message(0, attrs).unwrap().payload;
         assert_eq!(&p[..3], &[3, 0, 1]);
         assert_eq!(Command::parse(&p, attrs), Ok(c));
-        assert_eq!(Command::parse(&[3, 1, 1, 0, 0], attrs), Err(Error::Unsupported));
+        assert_eq!(
+            Command::parse(&[3, 1, 1, 0, 0], attrs),
+            Err(Error::Unsupported)
+        );
         assert_eq!(Command::parse(&[3, 0], attrs), Err(Error::Truncated));
     }
 
@@ -2409,7 +2889,10 @@ mod tests {
             Command::Quit,
             Command::InitDb(b"shop".to_vec()),
             Command::Query(b"SELECT * FROM t".to_vec()),
-            Command::FieldList { table: b"t".to_vec(), wildcard: b"a%".to_vec() },
+            Command::FieldList {
+                table: b"t".to_vec(),
+                wildcard: b"a%".to_vec(),
+            },
             Command::CreateDb(b"x".to_vec()),
             Command::DropDb(b"x".to_vec()),
             Command::Refresh(1),
@@ -2423,7 +2906,10 @@ mod tests {
             Command::StmtReset(6),
             Command::SetOption(1),
             Command::ResetConnection,
-            Command::Other { command: command::STMT_EXECUTE, data: vec![1, 0, 0, 0, 0, 1, 0, 0, 0] },
+            Command::Other {
+                command: command::STMT_EXECUTE,
+                data: vec![1, 0, 0, 0, 0, 1, 0, 0, 0],
+            },
         ];
         for c in all {
             let p = c.message(0, CAPS41).unwrap().payload;
@@ -2432,10 +2918,19 @@ mod tests {
             prefixes(&p, |b| Command::parse(b, CAPS41));
         }
         assert_eq!(Command::parse(&[], CAPS41), Err(Error::Truncated));
-        assert_eq!(Command::parse(&[command::STMT_CLOSE, 1, 2], CAPS41), Err(Error::Truncated));
-        assert_eq!(Command::parse(&[command::FIELD_LIST, b't'], CAPS41), Err(Error::Truncated));
+        assert_eq!(
+            Command::parse(&[command::STMT_CLOSE, 1, 2], CAPS41),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            Command::parse(&[command::FIELD_LIST, b't'], CAPS41),
+            Err(Error::Truncated)
+        );
         // Bytes after fixed fields are ignored.
-        assert_eq!(Command::parse(&[command::PING, 9, 9], CAPS41), Ok(Command::Ping));
+        assert_eq!(
+            Command::parse(&[command::PING, 9, 9], CAPS41),
+            Ok(Command::Ping)
+        );
     }
 
     #[test]
@@ -2448,7 +2943,10 @@ mod tests {
             (0x1_0000, vec![0xfd, 0x00, 0x00, 0x01]),
             (0xff_ffff, vec![0xfd, 0xff, 0xff, 0xff]),
             (0x100_0000, vec![0xfe, 0, 0, 0, 1, 0, 0, 0, 0]),
-            (u64::MAX, vec![0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            (
+                u64::MAX,
+                vec![0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ),
         ] {
             let mut out = Vec::new();
             LenencInt(v).write(&mut out).unwrap();
@@ -2468,7 +2966,10 @@ mod tests {
         assert_eq!(Row::parse(&s), Ok(Row(vec![Some(b"hello".to_vec())])));
         assert_eq!(Row::parse(&s[..5]), Err(Error::Truncated));
         // A length past anything that could follow.
-        assert_eq!(Row::parse(&[0xfe, 0, 0, 0, 0, 0, 0, 0, 0x80]), Err(Error::Truncated));
+        assert_eq!(
+            Row::parse(&[0xfe, 0, 0, 0, 0, 0, 0, 0, 0x80]),
+            Err(Error::Truncated)
+        );
     }
 
     #[test]
@@ -2492,7 +2993,9 @@ mod tests {
         let messages = set.messages(1, caps).unwrap();
         let next = messages.last().unwrap().next_seq();
         let mut bytes = Vec::new();
-        for message in messages { message.write(&mut bytes).unwrap(); }
+        for message in messages {
+            message.write(&mut bytes).unwrap();
+        }
         let expected = hex("01 00 00 01 01 \
              27 00 00 02 03 64 65 66 00 00 00 11 40 40 76 65 72 73 69 6f 6e 5f 63 6f 6d 6d 65 6e 74 00 0c 08 00 1c 00 \
              00 00 fd 00 00 1f 00 00 \
@@ -2516,9 +3019,15 @@ mod tests {
             [
                 ResultEvent::ColumnCount(1),
                 ResultEvent::Column(column),
-                ResultEvent::ColumnsEnd(Eof { warnings: 0, status: 2 }),
+                ResultEvent::ColumnsEnd(Eof {
+                    warnings: 0,
+                    status: 2
+                }),
                 ResultEvent::Row(set.rows[0].clone()),
-                ResultEvent::End(OkPacket { status: 2, ..OkPacket::default() }),
+                ResultEvent::End(OkPacket {
+                    status: 2,
+                    ..OkPacket::default()
+                }),
             ]
         );
         assert!(r.is_done());
@@ -2530,27 +3039,60 @@ mod tests {
         let caps = CAPS_MODERN;
         // Two result sets, the first saying more follow, then the rows end.
         let first = ResultSet {
-            columns: vec![Column::new(b"a", column_type::LONG), Column::new(b"b", column_type::VAR_STRING)],
-            rows: vec![Row(vec![Some(b"1".to_vec()), None]), Row(vec![None, Some(vec![])])],
+            columns: vec![
+                Column::new(b"a", column_type::LONG),
+                Column::new(b"b", column_type::VAR_STRING),
+            ],
+            rows: vec![
+                Row(vec![Some(b"1".to_vec()), None]),
+                Row(vec![None, Some(vec![])]),
+            ],
             status: status::MORE_RESULTS_EXISTS,
             warnings: 1,
         };
-        let mut payloads = first.messages(0, caps).map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()).unwrap();
-        payloads.push(OkPacket { affected_rows: 3, ..OkPacket::default() }.message(0, caps).unwrap().payload);
+        let mut payloads = first
+            .messages(0, caps)
+            .map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>())
+            .unwrap();
+        payloads.push(
+            OkPacket {
+                affected_rows: 3,
+                ..OkPacket::default()
+            }
+            .message(0, caps)
+            .unwrap()
+            .payload,
+        );
         let mut r = ResultReader::new(caps);
         let events: Vec<_> = payloads.iter().map(|p| r.push(p).unwrap()).collect();
         assert_eq!(events.len(), 1 + 2 + 2 + 1 + 1);
-        assert_eq!(events[3], ResultEvent::Row(Row(vec![Some(b"1".to_vec()), None])));
+        assert_eq!(
+            events[3],
+            ResultEvent::Row(Row(vec![Some(b"1".to_vec()), None]))
+        );
         assert_eq!(events[4], ResultEvent::Row(Row(vec![None, Some(vec![])])));
         assert_eq!(
             events[5],
-            ResultEvent::End(OkPacket { status: status::MORE_RESULTS_EXISTS, warnings: 1, ..OkPacket::default() })
+            ResultEvent::End(OkPacket {
+                status: status::MORE_RESULTS_EXISTS,
+                warnings: 1,
+                ..OkPacket::default()
+            })
         );
-        assert!(matches!(events[6], ResultEvent::Ok(OkPacket { affected_rows: 3, .. })));
+        assert!(matches!(
+            events[6],
+            ResultEvent::Ok(OkPacket {
+                affected_rows: 3,
+                ..
+            })
+        ));
         assert!(r.is_done());
 
         // ERR, mid rows and at the start.
-        let err = ErrPacket::new(1146, b"42S02", b"Table 'x' doesn't exist").message(0, caps).unwrap().payload;
+        let err = ErrPacket::new(1146, b"42S02", b"Table 'x' doesn't exist")
+            .message(0, caps)
+            .unwrap()
+            .payload;
         let mut r = ResultReader::new(caps);
         assert!(matches!(r.push(&err), Ok(ResultEvent::Err(_))));
         assert!(r.is_done());
@@ -2568,26 +3110,50 @@ mod tests {
             Ok(ResultEvent::LocalInfile(b"/etc/passwd".to_vec()))
         );
         assert!(!r.is_done());
-        assert!(matches!(r.push(&[0, 0, 0, 0, 0, 0, 0]), Ok(ResultEvent::Ok(_))));
+        assert!(matches!(
+            r.push(&[0, 0, 0, 0, 0, 0, 0]),
+            Ok(ResultEvent::Ok(_))
+        ));
 
         // No columns: written as an OK packet.
-        let empty = ResultSet::default().messages(0, caps).map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()).unwrap();
+        let empty = ResultSet::default()
+            .messages(0, caps)
+            .map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>())
+            .unwrap();
         assert_eq!(empty.len(), 1);
-        assert!(matches!(ResultReader::new(caps).push(&empty[0]), Ok(ResultEvent::Ok(_))));
+        assert!(matches!(
+            ResultReader::new(caps).push(&empty[0]),
+            Ok(ResultEvent::Ok(_))
+        ));
 
         // Errors leave the reader where it was.
         let mut r = ResultReader::new(caps);
         assert_eq!(r.push(&[]), Err(Error::Truncated));
-        assert_eq!(r.push(&[0xfe, 0, 0, 0, 0, 0, 0, 0, 0]), Err(Error::Header(0xfe)));
+        assert_eq!(
+            r.push(&[0xfe, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(Error::Header(0xfe))
+        );
         assert_eq!(r.push(&[0xfe, 0, 0, 0, 0, 0, 0, 0, 1]), Err(Error::TooMany));
         assert_eq!(r.push(&[0xfc, 0x01, 0x10]), Err(Error::TooMany));
         assert_eq!(r.push(&[2, 0]), Err(Error::Trailing));
         assert_eq!(ResultReader::new(0).push(&[1]), Err(Error::Unsupported));
         let optional = caps | capability::OPTIONAL_RESULTSET_METADATA;
-        assert_eq!(ResultReader::new(optional).push(&[1]), Err(Error::Truncated));
-        assert_eq!(ResultReader::new(optional).push(&[1, 0]), Err(Error::Unsupported));
-        assert_eq!(ResultReader::new(optional).push(&[1, METADATA_FULL]), Ok(ResultEvent::ColumnCount(1)));
-        assert_eq!(ResultReader::new(optional).push(&[1, METADATA_FULL, 0]), Err(Error::Trailing));
+        assert_eq!(
+            ResultReader::new(optional).push(&[1]),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            ResultReader::new(optional).push(&[1, 0]),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(
+            ResultReader::new(optional).push(&[1, METADATA_FULL]),
+            Ok(ResultEvent::ColumnCount(1))
+        );
+        assert_eq!(
+            ResultReader::new(optional).push(&[1, METADATA_FULL, 0]),
+            Err(Error::Trailing)
+        );
         r.push(&[1]).unwrap();
         let mut bad = Column::new(b"a", 3).to_bytes().unwrap();
         let at = bad.len() - 13;
@@ -2604,8 +3170,14 @@ mod tests {
     fn result_sets_read_back_under_each_flag_set() {
         // Whatever the 4.1 flags, a result set written reads back whole.
         let set = ResultSet {
-            columns: vec![Column::new(b"a", column_type::LONG), Column::new(b"b", column_type::VAR_STRING)],
-            rows: vec![Row(vec![Some(b"1".to_vec()), None]), Row(vec![None, Some(vec![0xfe; 300])])],
+            columns: vec![
+                Column::new(b"a", column_type::LONG),
+                Column::new(b"b", column_type::VAR_STRING),
+            ],
+            rows: vec![
+                Row(vec![Some(b"1".to_vec()), None]),
+                Row(vec![None, Some(vec![0xfe; 300])]),
+            ],
             status: status::AUTOCOMMIT,
             warnings: 2,
         };
@@ -2614,14 +3186,20 @@ mod tests {
             capability::DEPRECATE_EOF,
             capability::SESSION_TRACK,
             capability::OPTIONAL_RESULTSET_METADATA,
-            capability::OPTIONAL_RESULTSET_METADATA | capability::DEPRECATE_EOF | capability::SESSION_TRACK,
+            capability::OPTIONAL_RESULTSET_METADATA
+                | capability::DEPRECATE_EOF
+                | capability::SESSION_TRACK,
         ];
         for extra in extras {
             let caps = capability::PROTOCOL_41 | extra;
             let mut r = ResultReader::new(caps);
             let mut rows = Vec::new();
             let mut columns = Vec::new();
-            for p in set.messages(0, caps).map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()).unwrap() {
+            for p in set
+                .messages(0, caps)
+                .map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>())
+                .unwrap()
+            {
                 match r.push(&p) {
                     Ok(ResultEvent::Row(row)) => rows.push(row),
                     Ok(ResultEvent::Column(c)) => columns.push(c),
@@ -2631,7 +3209,11 @@ mod tests {
                 }
             }
             assert!(r.is_done(), "flags {caps:#x}");
-            assert_eq!((columns, &rows), (set.columns.clone(), &set.rows), "flags {caps:#x}");
+            assert_eq!(
+                (columns, &rows),
+                (set.columns.clone(), &set.rows),
+                "flags {caps:#x}"
+            );
         }
     }
 
@@ -2642,12 +3224,20 @@ mod tests {
         let (messages, failure) = decode_all(Messages::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(messages.len(), n);
-        for (index, message) in messages.iter().enumerate() { assert_eq!(message.seq, index as u8); }
+        for (index, message) in messages.iter().enumerate() {
+            assert_eq!(message.seq, index as u8);
+        }
         let mut stream = Stream::new(Messages::new());
         assert_eq!(stream.push(&[1, 0, 0, 0]), 4);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(b"x"), 1);
-        assert_eq!(stream.next(), Some(Ok(Message { seq: 0, payload: b"x".to_vec() })));
+        assert_eq!(
+            stream.next(),
+            Some(Ok(Message {
+                seq: 0,
+                payload: b"x".to_vec()
+            }))
+        );
     }
 
     #[test]
@@ -2666,39 +3256,79 @@ mod tests {
 
     #[test]
     fn split_packets() {
-        let message = Message { seq: 254, payload: (0..MAX_PACKET_PAYLOAD + 1).map(|i| i as u8).collect() };
+        let message = Message {
+            seq: 254,
+            payload: (0..MAX_PACKET_PAYLOAD + 1).map(|i| i as u8).collect(),
+        };
         assert_eq!(message.packets(), 2);
         assert_eq!(message.next_seq(), 0);
         let bytes = message.to_bytes().unwrap();
         assert_eq!(bytes.len(), message.payload.len() + 8);
         assert_eq!(&bytes[..4], &[0xff, 0xff, 0xff, 254]);
-        assert_eq!(&bytes[HEADER_LEN + MAX_PACKET_PAYLOAD..][..4], &[1, 0, 0, 255]);
+        assert_eq!(
+            &bytes[HEADER_LEN + MAX_PACKET_PAYLOAD..][..4],
+            &[1, 0, 0, 255]
+        );
         assert_eq!(Message::parse(&bytes), Ok(message.clone()));
         assert_eq!(decode_all(Messages::new, &bytes), (vec![message], None));
-        let full = Message { seq: 3, payload: vec![9; MAX_PACKET_PAYLOAD] };
+        let full = Message {
+            seq: 3,
+            payload: vec![9; MAX_PACKET_PAYLOAD],
+        };
         let bytes = full.to_bytes().unwrap();
         assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 4]);
         assert_eq!(full.next_seq(), 5);
         let mut stream = Stream::new(Messages::new());
-        assert_eq!(pump(&mut stream, &bytes[..bytes.len() - 1], |_| panic!("premature message")), Ok(bytes.len() - 1));
+        assert_eq!(
+            pump(&mut stream, &bytes[..bytes.len() - 1], |_| panic!(
+                "premature message"
+            )),
+            Ok(bytes.len() - 1)
+        );
         assert_eq!(stream.held(), MAX_PACKET_PAYLOAD);
         assert_eq!(stream.buffered(), 3);
         assert_eq!(stream.push(&bytes[bytes.len() - 1..]), 1);
         assert_eq!(stream.next(), Some(Ok(full)));
         let mut bad = bytes.clone();
         *bad.last_mut().unwrap() = 9;
-        assert_eq!(decode_all(Messages::new, &bad).1, Some(Fail::Protocol(Error::Sequence { expected: 4, got: 9 })));
-        assert_eq!(decode_all(Messages::new, &bytes[..bytes.len() - 4]).1, Some(Fail::Protocol(Error::Incomplete)));
+        assert_eq!(
+            decode_all(Messages::new, &bad).1,
+            Some(Fail::Protocol(Error::Sequence {
+                expected: 4,
+                got: 9
+            }))
+        );
+        assert_eq!(
+            decode_all(Messages::new, &bytes[..bytes.len() - 4]).1,
+            Some(Fail::Protocol(Error::Incomplete))
+        );
     }
 
     #[test]
     fn message_limits_and_stream() {
-        assert_eq!(decode_all(|| Messages::with_limit(10), &[11, 0, 0, 0]).1, Some(Fail::Protocol(Error::TooLong(11))));
-        assert_eq!(Messages::with_limit(10).decode(&[10, 0, 0, 0], false), Ok(Step::Need));
+        assert_eq!(
+            decode_all(|| Messages::with_limit(10), &[11, 0, 0, 0]).1,
+            Some(Fail::Protocol(Error::TooLong(11)))
+        );
+        assert_eq!(
+            Messages::with_limit(10).decode(&[10, 0, 0, 0], false),
+            Ok(Step::Need)
+        );
         assert_eq!(Messages::with_limit(usize::MAX).limit(), MAX_MESSAGE);
-        let messages = vec![Message { seq: 0, payload: vec![] }, Message { seq: 1, payload: b"abc".to_vec() }];
+        let messages = vec![
+            Message {
+                seq: 0,
+                payload: vec![],
+            },
+            Message {
+                seq: 1,
+                payload: b"abc".to_vec(),
+            },
+        ];
         let mut bytes = Vec::new();
-        for message in &messages { message.write(&mut bytes).unwrap(); }
+        for message in &messages {
+            message.write(&mut bytes).unwrap();
+        }
         assert_eq!(bytes, [0, 0, 0, 0, 3, 0, 0, 1, b'a', b'b', b'c']);
         assert_eq!(messages[1].next_seq(), 2);
         contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_FRAME);
@@ -2725,7 +3355,14 @@ mod tests {
             assert!(!e.to_string().is_empty());
         }
         assert!(!Error::TooLong(5).to_string().is_empty());
-        assert!(!Error::Sequence { expected: 1, got: 2 }.to_string().is_empty());
+        assert!(
+            !Error::Sequence {
+                expected: 1,
+                got: 2
+            }
+            .to_string()
+            .is_empty()
+        );
     }
 
     // Regressions for an outside review of this module.
@@ -2739,16 +3376,35 @@ mod tests {
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong(17)))));
         assert_eq!(stream.next(), None);
         let bytes = [1, 0, 0, 0, b'x'].repeat(1000);
-        contract::check_decode_with_alloc_limit(|| Messages::with_limit(16), &bytes, 2 * (16 + HEADER_LEN));
-        let message = Message { seq: 0, payload: vec![7; MAX_PACKET_PAYLOAD + 10] };
-        assert_eq!(decode_all(|| Messages::with_limit(MAX_PACKET_PAYLOAD + 10), &message.to_bytes().unwrap()), (vec![message], None));
+        contract::check_decode_with_alloc_limit(
+            || Messages::with_limit(16),
+            &bytes,
+            2 * (16 + HEADER_LEN),
+        );
+        let message = Message {
+            seq: 0,
+            payload: vec![7; MAX_PACKET_PAYLOAD + 10],
+        };
+        assert_eq!(
+            decode_all(
+                || Messages::with_limit(MAX_PACKET_PAYLOAD + 10),
+                &message.to_bytes().unwrap()
+            ),
+            (vec![message], None)
+        );
     }
 
     #[test]
     fn writers_refuse_messages_over_the_limit() {
-        let message = Message { seq: 0, payload: vec![0; MAX_MESSAGE + 1] };
+        let message = Message {
+            seq: 0,
+            payload: vec![0; MAX_MESSAGE + 1],
+        };
         assert_eq!(message.to_bytes(), Err(Error::Unwritable));
-        assert_eq!(message.packets(), (MAX_MESSAGE + 1) / MAX_PACKET_PAYLOAD + 1);
+        assert_eq!(
+            message.packets(),
+            (MAX_MESSAGE + 1) / MAX_PACKET_PAYLOAD + 1
+        );
         let mut bytes = vec![7];
         assert_eq!(message.write(&mut bytes), Err(Error::Unwritable));
         assert_eq!(bytes, [7]);
@@ -2759,9 +3415,19 @@ mod tests {
         let caps = capability::PROTOCOL_41 | capability::DEPRECATE_EOF | capability::SESSION_TRACK;
         // 16384 schema-change-like blocks: 65536 bytes, past the old cut.
         let state: Vec<u8> = [3, 2, 1, b'1'].repeat(16384);
-        let ok = OkPacket { status: status::SESSION_STATE_CHANGED, session_state: state, ..OkPacket::default() };
-        assert_eq!(OkPacket::parse(&ok.message(0, caps).unwrap().payload, caps), Ok(ok.clone()));
-        assert_eq!(OkPacket::parse(&ok.end_message(0, caps).unwrap().payload, caps), Ok(ok.clone()));
+        let ok = OkPacket {
+            status: status::SESSION_STATE_CHANGED,
+            session_state: state,
+            ..OkPacket::default()
+        };
+        assert_eq!(
+            OkPacket::parse(&ok.message(0, caps).unwrap().payload, caps),
+            Ok(ok.clone())
+        );
+        assert_eq!(
+            OkPacket::parse(&ok.end_message(0, caps).unwrap().payload, caps),
+            Ok(ok.clone())
+        );
         // A result set ended by an OK packet that changed the schema.
         let end = OkPacket {
             status: status::SESSION_STATE_CHANGED,
@@ -2771,23 +3437,44 @@ mod tests {
         let mut r = ResultReader::new(caps);
         r.push(&[1]).unwrap();
         r.push(&Column::new(b"a", 3).to_bytes().unwrap()).unwrap();
-        assert_eq!(r.push(&end.end_message(0, caps).unwrap().payload), Ok(ResultEvent::End(end)));
+        assert_eq!(
+            r.push(&end.end_message(0, caps).unwrap().payload),
+            Ok(ResultEvent::End(end))
+        );
         // An end packet as long as a packet holds would read as a row.
-        let long = OkPacket { info: vec![b'i'; MAX_PACKET_PAYLOAD], ..OkPacket::default() };
-        assert!(matches!(long.end_message(0, caps).map(|m| m.payload), Err(Error::Unwritable)));
+        let long = OkPacket {
+            info: vec![b'i'; MAX_PACKET_PAYLOAD],
+            ..OkPacket::default()
+        };
+        assert!(matches!(
+            long.end_message(0, caps).map(|m| m.payload),
+            Err(Error::Unwritable)
+        ));
     }
 
     #[test]
     fn ok_needs_its_session_state_and_nothing_after() {
         let caps = capability::PROTOCOL_41 | capability::SESSION_TRACK;
         // The flag is set and the info is there, but no session state.
-        assert_eq!(OkPacket::parse(&hex("00 00 00 00 40 00 00 00"), caps), Err(Error::Truncated));
+        assert_eq!(
+            OkPacket::parse(&hex("00 00 00 00 40 00 00 00"), caps),
+            Err(Error::Truncated)
+        );
         // Ending after the warnings is allowed, as libmysql allows it.
         let ok = OkPacket::parse(&hex("00 00 00 00 40 00 00"), caps).unwrap();
         assert_eq!(ok.status, status::SESSION_STATE_CHANGED);
-        assert_eq!(OkPacket::parse(&ok.message(0, caps).unwrap().payload, caps), Ok(ok));
-        assert_eq!(OkPacket::parse(&hex("00 00 00 00 40 00 00 00 00 aa"), caps), Err(Error::Trailing));
-        assert_eq!(OkPacket::parse(&hex("00 00 00 02 00 00 00 00 aa"), caps), Err(Error::Trailing));
+        assert_eq!(
+            OkPacket::parse(&ok.message(0, caps).unwrap().payload, caps),
+            Ok(ok)
+        );
+        assert_eq!(
+            OkPacket::parse(&hex("00 00 00 00 40 00 00 00 00 aa"), caps),
+            Err(Error::Trailing)
+        );
+        assert_eq!(
+            OkPacket::parse(&hex("00 00 00 02 00 00 00 00 aa"), caps),
+            Err(Error::Trailing)
+        );
     }
 
     #[test]
@@ -2801,19 +3488,38 @@ mod tests {
         let p = r.to_bytes().unwrap();
         assert_eq!(HandshakeResponse::parse(&p), Ok(r.clone()));
         // The database's NUL left out, or the whole database.
-        assert_eq!(HandshakeResponse::parse(&p[..p.len() - 1]), Err(Error::Truncated));
-        assert_eq!(HandshakeResponse::parse(&p[..p.len() - 3]), Err(Error::Truncated));
+        assert_eq!(
+            HandshakeResponse::parse(&p[..p.len() - 1]),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            HandshakeResponse::parse(&p[..p.len() - 3]),
+            Err(Error::Truncated)
+        );
         // The attribute block's length left out.
-        let r = HandshakeResponse { capabilities: r.capabilities | capability::CONNECT_ATTRS, ..r };
+        let r = HandshakeResponse {
+            capabilities: r.capabilities | capability::CONNECT_ATTRS,
+            ..r
+        };
         let p = r.to_bytes().unwrap();
         assert_eq!(HandshakeResponse::parse(&p), Ok(r.clone()));
-        assert_eq!(HandshakeResponse::parse(&p[..p.len() - 1]), Err(Error::Truncated));
+        assert_eq!(
+            HandshakeResponse::parse(&p[..p.len() - 1]),
+            Err(Error::Truncated)
+        );
         // The zstd level left out.
         let caps = r.capabilities | capability::ZSTD_COMPRESSION_ALGORITHM;
-        let r = HandshakeResponse { capabilities: caps, zstd_level: 3, ..r };
+        let r = HandshakeResponse {
+            capabilities: caps,
+            zstd_level: 3,
+            ..r
+        };
         let p = r.to_bytes().unwrap();
         assert_eq!(HandshakeResponse::parse(&p), Ok(r.clone()));
-        assert_eq!(HandshakeResponse::parse(&p[..p.len() - 1]), Err(Error::Truncated));
+        assert_eq!(
+            HandshakeResponse::parse(&p[..p.len() - 1]),
+            Err(Error::Truncated)
+        );
     }
 
     #[test]
@@ -2825,10 +3531,16 @@ mod tests {
         };
         assert!(matches!(r.to_bytes(), Err(Error::Unwritable)));
         // The most that fits: a 1-byte key and a value with a 3-byte length.
-        let fits = HandshakeResponse { attributes: vec![(b"k".to_vec(), vec![b'v'; 65535 - 2 - 3])], ..r.clone() };
+        let fits = HandshakeResponse {
+            attributes: vec![(b"k".to_vec(), vec![b'v'; 65535 - 2 - 3])],
+            ..r.clone()
+        };
         let p = fits.to_bytes().unwrap();
         assert_eq!(HandshakeResponse::parse(&p), Ok(fits.clone()));
-        let over = HandshakeResponse { attributes: vec![(b"k".to_vec(), vec![b'v'; 65535 - 2 - 2])], ..r };
+        let over = HandshakeResponse {
+            attributes: vec![(b"k".to_vec(), vec![b'v'; 65535 - 2 - 2])],
+            ..r
+        };
         assert_eq!(over.to_bytes(), Err(Error::Unwritable));
         // The same block, read: its length is checked before anything else.
         let mut q = p[..p.len() - 65535 - 3].to_vec();
@@ -2842,14 +3554,25 @@ mod tests {
     fn zstd_level_must_be_valid() {
         let caps = CAPS41 | capability::ZSTD_COMPRESSION_ALGORITHM;
         for level in [0u8, 23, 255] {
-            let r = HandshakeResponse { capabilities: caps, zstd_level: level, ..HandshakeResponse::default() };
+            let r = HandshakeResponse {
+                capabilities: caps,
+                zstd_level: level,
+                ..HandshakeResponse::default()
+            };
             assert_eq!(r.to_bytes(), Err(Error::Unwritable));
             let mut p = HandshakeResponse { zstd_level: 3, ..r }.to_bytes().unwrap();
             *p.last_mut().unwrap() = level;
-            assert_eq!(HandshakeResponse::parse(&p), Err(Error::Value(u64::from(level))));
+            assert_eq!(
+                HandshakeResponse::parse(&p),
+                Err(Error::Value(u64::from(level)))
+            );
         }
         for level in ZSTD_LEVELS {
-            let r = HandshakeResponse { capabilities: caps, zstd_level: level, ..HandshakeResponse::default() };
+            let r = HandshakeResponse {
+                capabilities: caps,
+                zstd_level: level,
+                ..HandshakeResponse::default()
+            };
             assert_eq!(HandshakeResponse::parse(&r.to_bytes().unwrap()), Ok(r));
         }
     }
@@ -2857,54 +3580,135 @@ mod tests {
     #[test]
     fn query_parameter_set_count_must_be_one() {
         let caps = CAPS41 | capability::QUERY_ATTRIBUTES;
-        assert_eq!(Command::parse(&hex("03 00 00 53 45 4c 45 43 54 20 31"), caps), Err(Error::Value(0)));
-        assert_eq!(Command::parse(&hex("03 00 02 53"), caps), Err(Error::Value(2)));
-        assert_eq!(Command::parse(&hex("03 00 01 53"), caps), Ok(Command::Query(b"S".to_vec())));
+        assert_eq!(
+            Command::parse(&hex("03 00 00 53 45 4c 45 43 54 20 31"), caps),
+            Err(Error::Value(0))
+        );
+        assert_eq!(
+            Command::parse(&hex("03 00 02 53"), caps),
+            Err(Error::Value(2))
+        );
+        assert_eq!(
+            Command::parse(&hex("03 00 01 53"), caps),
+            Ok(Command::Query(b"S".to_vec()))
+        );
     }
 
     #[test]
     fn local_infile_needs_the_flag_and_then_an_answer() {
         let request = LocalInfile(b"/etc/passwd".to_vec()).to_bytes().unwrap();
-        assert_eq!(ResultReader::new(CAPS41).push(&request), Err(Error::Header(0xfb)));
+        assert_eq!(
+            ResultReader::new(CAPS41).push(&request),
+            Err(Error::Header(0xfb))
+        );
         let caps = CAPS41 | capability::LOCAL_FILES;
         let mut r = ResultReader::new(caps);
-        assert_eq!(r.push(&request), Ok(ResultEvent::LocalInfile(b"/etc/passwd".to_vec())));
+        assert_eq!(
+            r.push(&request),
+            Ok(ResultEvent::LocalInfile(b"/etc/passwd".to_vec()))
+        );
         // Only an OK or ERR packet may follow.
         assert_eq!(r.push(&request), Err(Error::Header(0xfb)));
         assert_eq!(r.push(&[1]), Err(Error::Header(1)));
-        let err = ErrPacket::new(1290, b"HY000", b"no").message(0, caps).unwrap().payload;
+        let err = ErrPacket::new(1290, b"HY000", b"no")
+            .message(0, caps)
+            .unwrap()
+            .payload;
         assert!(matches!(r.clone().push(&err), Ok(ResultEvent::Err(_))));
-        assert!(matches!(r.push(&OkPacket::default().message(0, caps).unwrap().payload), Ok(ResultEvent::Ok(_))));
+        assert!(matches!(
+            r.push(&OkPacket::default().message(0, caps).unwrap().payload),
+            Ok(ResultEvent::Ok(_))
+        ));
         assert!(r.is_done());
     }
 
     #[test]
     fn err_without_sqlstate_cannot_fake_one() {
-        let e = ErrPacket { code: 1045, sql_state: None, message: b"#HY000oops".to_vec() };
-        assert_eq!(e.message(0, CAPS41).map(|m| m.payload), Err(Error::Unwritable));
+        let e = ErrPacket {
+            code: 1045,
+            sql_state: None,
+            message: b"#HY000oops".to_vec(),
+        };
+        assert_eq!(
+            e.message(0, CAPS41).map(|m| m.payload),
+            Err(Error::Unwritable)
+        );
         // Before 4.1 no SQLSTATE is read, so it reads back the same.
-        assert_eq!(ErrPacket::parse(&e.message(0, 0).unwrap().payload, 0), Ok(e));
+        assert_eq!(
+            ErrPacket::parse(&e.message(0, 0).unwrap().payload, 0),
+            Ok(e)
+        );
         // A short message after `#` is no SQLSTATE.
-        let e = ErrPacket { code: 1045, sql_state: None, message: b"#oops".to_vec() };
-        assert_eq!(ErrPacket::parse(&e.message(0, CAPS41).unwrap().payload, CAPS41), Ok(e));
+        let e = ErrPacket {
+            code: 1045,
+            sql_state: None,
+            message: b"#oops".to_vec(),
+        };
+        assert_eq!(
+            ErrPacket::parse(&e.message(0, CAPS41).unwrap().payload, CAPS41),
+            Ok(e)
+        );
     }
 
     #[test]
     fn writers_refuse_what_readers_refuse() {
-        assert_eq!(Row(vec![None; MAX_COLUMNS + 1]).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(Row(vec![None; MAX_COLUMNS]).to_bytes().map(|p| p.len()), Ok(MAX_COLUMNS));
-        for code in [command::QUIT, command::QUERY, command::STMT_CLOSE, command::FIELD_LIST, command::SET_OPTION] {
-            let c = Command::Other { command: code, data: vec![] };
-            assert_eq!(c.message(0, CAPS41).map(|m| m.payload), Err(Error::Unwritable));
-        }
-        let c = Command::Other { command: command::STMT_EXECUTE, data: vec![] };
-        assert_eq!(Command::parse(&c.message(0, CAPS41).unwrap().payload, CAPS41), Ok(c));
-        let c = Command::FieldList { table: b"t\0x".to_vec(), wildcard: vec![] };
-        assert_eq!(c.message(0, CAPS41).map(|m| m.payload), Err(Error::Unwritable));
-        let set = ResultSet { columns: vec![Column::new(b"a", 3)], rows: vec![], ..ResultSet::default() };
-        assert_eq!(set.messages(0, 0).map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()), Err(Error::Unwritable));
         assert_eq!(
-            ResultSet { columns: vec![Column::new(b"a", 3); MAX_COLUMNS + 1], ..set.clone() }.messages(0, CAPS41).map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()),
+            Row(vec![None; MAX_COLUMNS + 1]).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Row(vec![None; MAX_COLUMNS]).to_bytes().map(|p| p.len()),
+            Ok(MAX_COLUMNS)
+        );
+        for code in [
+            command::QUIT,
+            command::QUERY,
+            command::STMT_CLOSE,
+            command::FIELD_LIST,
+            command::SET_OPTION,
+        ] {
+            let c = Command::Other {
+                command: code,
+                data: vec![],
+            };
+            assert_eq!(
+                c.message(0, CAPS41).map(|m| m.payload),
+                Err(Error::Unwritable)
+            );
+        }
+        let c = Command::Other {
+            command: command::STMT_EXECUTE,
+            data: vec![],
+        };
+        assert_eq!(
+            Command::parse(&c.message(0, CAPS41).unwrap().payload, CAPS41),
+            Ok(c)
+        );
+        let c = Command::FieldList {
+            table: b"t\0x".to_vec(),
+            wildcard: vec![],
+        };
+        assert_eq!(
+            c.message(0, CAPS41).map(|m| m.payload),
+            Err(Error::Unwritable)
+        );
+        let set = ResultSet {
+            columns: vec![Column::new(b"a", 3)],
+            rows: vec![],
+            ..ResultSet::default()
+        };
+        assert_eq!(
+            set.messages(0, 0)
+                .map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            ResultSet {
+                columns: vec![Column::new(b"a", 3); MAX_COLUMNS + 1],
+                ..set.clone()
+            }
+            .messages(0, CAPS41)
+            .map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()),
             Err(Error::Unwritable)
         );
     }
@@ -2912,24 +3716,55 @@ mod tests {
     #[test]
     fn result_set_rows_must_match_the_columns() {
         let two = vec![Column::new(b"a", 3), Column::new(b"b", 3)];
-        let short = ResultSet { columns: two.clone(), rows: vec![Row(vec![Some(b"1".to_vec())])], ..ResultSet::default() };
-        assert_eq!(short.messages(0, CAPS41).map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()), Err(Error::Unwritable));
-        let long = ResultSet { columns: two, rows: vec![Row(vec![None; 3])], ..ResultSet::default() };
-        assert_eq!(long.messages(0, CAPS41).map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()), Err(Error::Unwritable));
-        let none = ResultSet { rows: vec![Row(vec![])], ..ResultSet::default() };
-        assert_eq!(none.messages(0, CAPS41).map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()), Err(Error::Unwritable));
+        let short = ResultSet {
+            columns: two.clone(),
+            rows: vec![Row(vec![Some(b"1".to_vec())])],
+            ..ResultSet::default()
+        };
+        assert_eq!(
+            short
+                .messages(0, CAPS41)
+                .map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()),
+            Err(Error::Unwritable)
+        );
+        let long = ResultSet {
+            columns: two,
+            rows: vec![Row(vec![None; 3])],
+            ..ResultSet::default()
+        };
+        assert_eq!(
+            long.messages(0, CAPS41)
+                .map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()),
+            Err(Error::Unwritable)
+        );
+        let none = ResultSet {
+            rows: vec![Row(vec![])],
+            ..ResultSet::default()
+        };
+        assert_eq!(
+            none.messages(0, CAPS41)
+                .map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()),
+            Err(Error::Unwritable)
+        );
         // 4096 columns and empty rows are refused, not padded with NULLs.
         let wide = ResultSet {
             columns: vec![Column::new(b"c", 3); MAX_COLUMNS],
             rows: vec![Row(vec![]); 1000],
             ..ResultSet::default()
         };
-        assert_eq!(wide.messages(0, CAPS41).map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()), Err(Error::Unwritable));
+        assert_eq!(
+            wide.messages(0, CAPS41)
+                .map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
     fn eof_takes_no_bytes_after_its_fields() {
-        assert_eq!(Eof::parse(&hex("fe 00 00 02 00 aa"), CAPS41), Err(Error::Trailing));
+        assert_eq!(
+            Eof::parse(&hex("fe 00 00 02 00 aa"), CAPS41),
+            Err(Error::Trailing)
+        );
         assert_eq!(Eof::parse(&hex("fe aa"), 0), Err(Error::Trailing));
         assert_eq!(Eof::parse(&hex("fe"), 0), Ok(Eof::default()));
     }
@@ -2938,7 +3773,10 @@ mod tests {
         super::harness::check_payload(bytes, &CAPS_SETS);
         for caps in CAPS_SETS {
             if let Ok(value) = OkPacket::parse(bytes, caps) {
-                assert_eq!(OkPacket::parse(&value.end_message(0, caps).unwrap().payload, caps), Ok(value));
+                assert_eq!(
+                    OkPacket::parse(&value.end_message(0, caps).unwrap().payload, caps),
+                    Ok(value)
+                );
             }
         }
     }
@@ -2969,27 +3807,50 @@ mod tests {
             }
             .to_bytes()
             .unwrap(),
-            SslRequest { capabilities: CAPS41 | capability::SSL, ..SslRequest::default() }.to_bytes().unwrap(),
+            SslRequest {
+                capabilities: CAPS41 | capability::SSL,
+                ..SslRequest::default()
+            }
+            .to_bytes()
+            .unwrap(),
             OkPacket {
                 status: status::SESSION_STATE_CHANGED,
                 info: b"i".to_vec(),
                 session_state: vec![1, 2],
                 ..OkPacket::default()
             }
-            .message(0, CAPS_MODERN).unwrap().payload,
-            ErrPacket::new(1, b"HY000", b"m").message(0, CAPS41).unwrap().payload,
+            .message(0, CAPS_MODERN)
+            .unwrap()
+            .payload,
+            ErrPacket::new(1, b"HY000", b"m")
+                .message(0, CAPS41)
+                .unwrap()
+                .payload,
             Eof::default().message(0, CAPS41).unwrap().payload,
             Column::new(b"c", 3).to_bytes().unwrap(),
             Row(vec![Some(b"a".to_vec()), None]).to_bytes().unwrap(),
-            Command::Query(b"q".to_vec()).message(0, CAPS41 | capability::QUERY_ATTRIBUTES).unwrap().payload,
-            Command::FieldList { table: b"t".to_vec(), wildcard: vec![] }.message(0, 0).unwrap().payload,
+            Command::Query(b"q".to_vec())
+                .message(0, CAPS41 | capability::QUERY_ATTRIBUTES)
+                .unwrap()
+                .payload,
+            Command::FieldList {
+                table: b"t".to_vec(),
+                wildcard: vec![],
+            }
+            .message(0, 0)
+            .unwrap()
+            .payload,
         ];
         let set = ResultSet {
             columns: vec![Column::new(b"a", 3)],
             rows: vec![Row(vec![Some(b"1".to_vec())])],
             ..ResultSet::default()
         };
-        s.extend(set.messages(0, CAPS41).map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()).unwrap());
+        s.extend(
+            set.messages(0, CAPS41)
+                .map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>())
+                .unwrap(),
+        );
         s
     }
 
@@ -2998,7 +3859,11 @@ mod tests {
         let samples = samples();
         let mut rng = Lcg::new(0x5e_ed0f_3306);
         for _ in 0..6000 {
-            let mut bytes = if rng.coin() { rng.bytes(80) } else { samples[rng.index(samples.len())].clone() };
+            let mut bytes = if rng.coin() {
+                rng.bytes(80)
+            } else {
+                samples[rng.index(samples.len())].clone()
+            };
             mutate(&mut rng, &mut bytes);
             check_payload(&bytes);
             for at in (0..bytes.len()).step_by(7) {
@@ -3009,26 +3874,46 @@ mod tests {
                 }
             }
             let limit = 8 + rng.index(64);
-            contract::check_decode_with_alloc_limit(|| Messages::with_limit(limit), &bytes, 2 * (limit + HEADER_LEN));
-            contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(limit), &bytes, 2 * (limit + HEADER_LEN));
+            contract::check_decode_with_alloc_limit(
+                || Messages::with_limit(limit),
+                &bytes,
+                2 * (limit + HEADER_LEN),
+            );
+            contract::check_decode_with_alloc_limit(
+                || Frames::<Packet>::with_limit(limit),
+                &bytes,
+                2 * (limit + HEADER_LEN),
+            );
             contract::check_wire::<Message>(&bytes);
             for message in decode_all(|| Messages::with_limit(limit), &bytes).0 {
                 check_payload(&message.payload);
                 assert!(message.to_bytes().is_ok(), "{message:?}");
                 contract::check_wire_value(&message);
-                for caps in CAPS_SETS { let _ = ResultReader::new(caps).push(&message.payload); }
+                for caps in CAPS_SETS {
+                    let _ = ResultReader::new(caps).push(&message.payload);
+                }
             }
             // A random result set, written and read back. One row in five
             // has the wrong number of values, which the writer refuses.
             let ncols = rng.index(4);
             let set = ResultSet {
-                columns: (0..ncols).map(|i| Column::new(&[b'a' + i as u8], rng.next() as u8)).collect(),
+                columns: (0..ncols)
+                    .map(|i| Column::new(&[b'a' + i as u8], rng.next() as u8))
+                    .collect(),
                 rows: (0..rng.index(4))
                     .map(|_| {
-                        Row((0..if rng.index(5) == 0 { rng.index(ncols + 2) } else { ncols })
+                        Row((0..if rng.index(5) == 0 {
+                            rng.index(ncols + 2)
+                        } else {
+                            ncols
+                        })
                             .map(|_| match rng.index(3) {
                                 0 => None,
-                                _ => Some((0..rng.index(300)).map(|_| 0xfa + rng.index(6) as u8).collect()),
+                                _ => Some(
+                                    (0..rng.index(300))
+                                        .map(|_| 0xfa + rng.index(6) as u8)
+                                        .collect(),
+                                ),
                             })
                             .collect())
                     })
@@ -3037,7 +3922,10 @@ mod tests {
                 warnings: rng.next() as u16,
             };
             let caps = capability::PROTOCOL_41 | (rng.next() as u32 & !capability::PROTOCOL_41);
-            let payloads = match set.messages(0, caps).map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>()) {
+            let payloads = match set
+                .messages(0, caps)
+                .map(|ms| ms.into_iter().map(|m| m.payload).collect::<Vec<_>>())
+            {
                 Ok(p) => p,
                 Err(e) => {
                     // With no columns any row is refused, and the first
@@ -3058,5 +3946,4 @@ mod tests {
             assert_eq!(rows, set.rows);
         }
     }
-
 }

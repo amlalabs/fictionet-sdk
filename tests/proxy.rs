@@ -5,11 +5,11 @@
 //! The Docker test in `tests/docker/proxy` runs the same engine with more
 //! clients (wget, git, Python, Go, Node) and measures it.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -17,7 +17,9 @@ use std::time::{Duration, Instant, SystemTime};
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use fictionet::stdlib::{tls, web};
-use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{
+    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
@@ -29,7 +31,10 @@ const SECURE: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
 
 fn temp_dir() -> PathBuf {
     // Unix socket paths must be short, so not under a long target dir.
-    let n = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+    let n = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let dir = std::env::temp_dir().join(format!("fn-proxy-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -62,17 +67,29 @@ impl World {
         let thread = std::thread::spawn(move || {
             let (chain, key) = certs(&ca_path);
             let (attacher, attachments) = fictionet::attachments();
-            let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(sock2.clone().into()), attacher).unwrap();
+            let listening = fictionet::listen(
+                fictionet::WorldSocket::UnixSocket(sock2.clone().into()),
+                attacher,
+            )
+            .unwrap();
             ready_tx.send(()).unwrap();
             // A tokio runtime polls the world: axum runs WebSockets in tokio
             // tasks.
-            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
             let _ = rt.block_on(fictionet::run(move |fcx| async move {
                 let config = Arc::new(
-                    tls::config_builder(&fcx, SystemTime::now(), rustls::crypto::ring::default_provider())
-                        .with_safe_default_protocol_versions()?
-                        .with_no_client_auth()
-                        .with_single_cert(chain, key)?,
+                    tls::config_builder(
+                        &fcx,
+                        SystemTime::now(),
+                        rustls::crypto::ring::default_provider(),
+                    )
+                    .with_safe_default_protocol_versions()?
+                    .with_no_client_auth()
+                    .with_single_cert(chain, key)?,
                 );
                 let app = axum::Router::new()
                     .route("/", get(|| async { "plain site\n" }))
@@ -91,9 +108,13 @@ impl World {
                     "/echo",
                     get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
                         ws.on_upgrade(|mut socket| async move {
-                            while let Some(Ok(axum::extract::ws::Message::Text(t))) = socket.recv().await {
+                            while let Some(Ok(axum::extract::ws::Message::Text(t))) =
+                                socket.recv().await
+                            {
                                 let reply = format!("echo: {}", t.as_str());
-                                let _ = socket.send(axum::extract::ws::Message::Text(reply.into())).await;
+                                let _ = socket
+                                    .send(axum::extract::ws::Message::Text(reply.into()))
+                                    .await;
                             }
                         })
                     }),
@@ -117,7 +138,14 @@ impl World {
             drop(listening);
         });
         ready_rx.recv().unwrap();
-        World { dir, sock, stop, thread: Some(thread), seen: Arc::default(), queries }
+        World {
+            dir,
+            sock,
+            stop,
+            thread: Some(thread),
+            seen: Arc::default(),
+            queries,
+        }
     }
 
     /// A world that takes every packet from every sandbox and answers
@@ -133,7 +161,11 @@ impl World {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             let (attacher, mut attachments) = fictionet::attachments();
-            let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(sock2.clone().into()), attacher).unwrap();
+            let listening = fictionet::listen(
+                fictionet::WorldSocket::UnixSocket(sock2.clone().into()),
+                attacher,
+            )
+            .unwrap();
             ready_tx.send(()).unwrap();
             let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
                 fcx.spawn(move |fcx| async move {
@@ -159,7 +191,14 @@ impl World {
             drop(listening);
         });
         ready_rx.recv().unwrap();
-        World { dir, sock, stop, thread: Some(thread), seen, queries: Arc::default() }
+        World {
+            dir,
+            sock,
+            stop,
+            thread: Some(thread),
+            seen,
+            queries: Arc::default(),
+        }
     }
 
     fn ca(&self) -> PathBuf {
@@ -194,11 +233,17 @@ async fn upload(body: axum::body::Body) -> String {
 }
 
 /// A CA, written to `ca_path`, and a certificate for `secure.test`.
-fn certs(ca_path: &Path) -> (Vec<rustls::pki_types::CertificateDer<'static>>, PrivateKeyDer<'static>) {
+fn certs(
+    ca_path: &Path,
+) -> (
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    PrivateKeyDer<'static>,
+) {
     let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    ca.distinguished_name.push(rcgen::DnType::CommonName, "proxy test CA");
+    ca.distinguished_name
+        .push(rcgen::DnType::CommonName, "proxy test CA");
     let ca_key = KeyPair::generate().unwrap();
     let ca = ca.self_signed(&ca_key).unwrap();
     let mut leaf = CertificateParams::new(vec!["secure.test".to_owned()]).unwrap();
@@ -207,7 +252,10 @@ fn certs(ca_path: &Path) -> (Vec<rustls::pki_types::CertificateDer<'static>>, Pr
     let leaf_key = KeyPair::generate().unwrap();
     let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
     std::fs::write(ca_path, ca.pem()).unwrap();
-    (vec![leaf.der().clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())))
+    (
+        vec![leaf.der().clone()],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+    )
 }
 
 /// A running attach.
@@ -224,8 +272,21 @@ impl Attach {
         let token = world.dir.join("token");
         std::fs::write(&token, format!("{TOKEN}\n")).unwrap();
         let mut child = Command::new(BIN)
-            .args(["attach", "--world", &format!("unix:{}", world.sock), "--name", name, "--type", kind])
-            .args(["--listen", "127.0.0.1:0", "--token-file", token.to_str().unwrap()])
+            .args([
+                "attach",
+                "--world",
+                &format!("unix:{}", world.sock),
+                "--name",
+                name,
+                "--type",
+                kind,
+            ])
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--token-file",
+                token.to_str().unwrap(),
+            ])
             .args(["--ip-addr", ip, "--dns", "10.0.0.1"])
             .stderr(Stdio::piped())
             .spawn()
@@ -233,7 +294,11 @@ impl Attach {
         let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
         let first = lines.next().unwrap().unwrap();
         // "... attached; HTTP proxy on 127.0.0.1:41234, as ..."
-        let addr = first.split(" on ").nth(1).and_then(|r| r.split(',').next()).unwrap_or_else(|| panic!("{first}"));
+        let addr = first
+            .split(" on ")
+            .nth(1)
+            .and_then(|r| r.split(',').next())
+            .unwrap_or_else(|| panic!("{first}"));
         let addr: SocketAddr = addr.parse().unwrap();
         let log = Arc::new(Mutex::new(format!("{first}\n")));
         let log2 = log.clone();
@@ -311,8 +376,14 @@ fn read_head(s: &mut TcpStream) -> String {
 /// Sends `CONNECT target` with `auth`, and returns the answer's head.
 fn connect(a: &Attach, target: &str, auth: Option<&str>) -> (TcpStream, String) {
     let mut s = a.connect();
-    let auth = auth.map(|v| format!("Proxy-Authorization: {v}\r\n")).unwrap_or_default();
-    write!(s, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{auth}\r\n").unwrap();
+    let auth = auth
+        .map(|v| format!("Proxy-Authorization: {v}\r\n"))
+        .unwrap_or_default();
+    write!(
+        s,
+        "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{auth}\r\n"
+    )
+    .unwrap();
     let head = read_head(&mut s);
     (s, head)
 }
@@ -320,7 +391,11 @@ fn connect(a: &Attach, target: &str, auth: Option<&str>) -> (TcpStream, String) 
 /// An HTTP/1.1 request with `Connection: close` on `s`, and the whole
 /// answer.
 fn http_get(s: &mut TcpStream, host: &str, path: &str) -> String {
-    write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").unwrap();
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
     String::from_utf8_lossy(&read_all(s)).into_owned()
 }
 
@@ -347,7 +422,10 @@ fn socks_login(s: &mut TcpStream, user: &[u8], password: &[u8]) -> ([u8; 2], [u8
 /// stream and the reply.
 fn socks_connect(a: &Attach, name: &str, port: u16) -> (TcpStream, [u8; 10]) {
     let mut s = a.connect();
-    assert_eq!(socks_login(&mut s, b"relay", TOKEN.as_bytes()), ([5, 2], [1, 0]));
+    assert_eq!(
+        socks_login(&mut s, b"relay", TOKEN.as_bytes()),
+        ([5, 2], [1, 0])
+    );
     let mut req = vec![5, 1, 0, 3, name.len() as u8];
     req.extend_from_slice(name.as_bytes());
     req.extend_from_slice(&port.to_be_bytes());
@@ -358,7 +436,11 @@ fn socks_connect(a: &Attach, name: &str, port: u16) -> (TcpStream, [u8; 10]) {
 }
 
 fn curl() -> bool {
-    Command::new("curl").arg("--version").stdout(Stdio::null()).status().is_ok_and(|s| s.success())
+    Command::new("curl")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 #[test]
@@ -390,8 +472,16 @@ fn http_door_connects_and_forwards() {
     let (_, head) = connect(&a, "198.18.0.1:80", Some(&format!("Bearer {TOKEN}")));
     assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
 
-    assert!(a.logged("CONNECT plain.test:80 (198.18.0.1) 200"), "{}", a.log());
-    assert!(a.logged("GET http://plain.test:80/ (198.18.0.1) 200"), "{}", a.log());
+    assert!(
+        a.logged("CONNECT plain.test:80 (198.18.0.1) 200"),
+        "{}",
+        a.log()
+    );
+    assert!(
+        a.logged("GET http://plain.test:80/ (198.18.0.1) 200"),
+        "{}",
+        a.log()
+    );
 }
 
 #[test]
@@ -415,17 +505,38 @@ fn https_through_both_doors_with_curl() {
     };
     let http = format!("http://relay:{TOKEN}@{}", h.addr);
     let socks = format!("socks5h://relay:{TOKEN}@{}", s.addr);
-    assert_eq!(run(http.clone(), "https://secure.test/", Some(&ca)), "secure site\n");
-    assert_eq!(run(http.clone(), "http://plain.test/", None), "plain site\n");
-    assert_eq!(run(socks.clone(), "https://secure.test/", Some(&ca)), "secure site\n");
-    assert_eq!(run(socks.clone(), "http://plain.test/", None), "plain site\n");
+    assert_eq!(
+        run(http.clone(), "https://secure.test/", Some(&ca)),
+        "secure site\n"
+    );
+    assert_eq!(
+        run(http.clone(), "http://plain.test/", None),
+        "plain site\n"
+    );
+    assert_eq!(
+        run(socks.clone(), "https://secure.test/", Some(&ca)),
+        "secure site\n"
+    );
+    assert_eq!(
+        run(socks.clone(), "http://plain.test/", None),
+        "plain site\n"
+    );
     // TLS is end to end: without the world's CA, curl refuses the site.
     assert!(run(http.clone(), "https://secure.test/", None).contains("(60)"));
     // Failures, as curl reports them.
     assert!(run(http.clone(), "https://nope.test/", None).contains("response 502"));
     assert!(run(socks.clone(), "https://nope.test/", None).contains("(4)"));
-    assert!(run(format!("http://{}", h.addr), "https://secure.test/", None).contains("response 407"));
-    assert!(run(format!("socks5h://relay:wrong@{}", s.addr), "https://secure.test/", None).contains("rejected"));
+    assert!(
+        run(format!("http://{}", h.addr), "https://secure.test/", None).contains("response 407")
+    );
+    assert!(
+        run(
+            format!("socks5h://relay:wrong@{}", s.addr),
+            "https://secure.test/",
+            None
+        )
+        .contains("rejected")
+    );
 }
 
 /// An axum WebSocket handler in the world, through the HTTP door with a
@@ -447,8 +558,13 @@ fn websockets_pass_through_the_http_door() {
     let head = read_head(&mut s).to_lowercase();
     assert!(head.starts_with("http/1.1 101 "), "{head}");
     assert!(head.contains("\r\nupgrade: websocket\r\n"), "{head}");
-    assert!(head.contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="), "{head}");
-    let frame = Message::Text("hello".into()).to_frame(Some([9, 8, 7, 6])).unwrap();
+    assert!(
+        head.contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="),
+        "{head}"
+    );
+    let frame = Message::Text("hello".into())
+        .to_frame(Some([9, 8, 7, 6]))
+        .unwrap();
     s.write_all(&frame.to_bytes().unwrap()).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut stream = Stream::new(Messages::new(Role::Client));
@@ -468,16 +584,31 @@ fn websockets_pass_through_the_http_door() {
 fn tokens_are_checked() {
     let world = World::start();
     let a = Attach::start(&world, "http_proxy", "t1", "10.0.0.2");
-    for auth in [None, Some("Basic cmVsYXk6d3Jvbmc="), Some("Bearer wrong"), Some("Basic !!")] {
+    for auth in [
+        None,
+        Some("Basic cmVsYXk6d3Jvbmc="),
+        Some("Bearer wrong"),
+        Some("Basic !!"),
+    ] {
         let (mut s, head) = connect(&a, "plain.test:80", auth);
-        assert!(head.starts_with("HTTP/1.1 407 Proxy Authentication Required\r\n"), "{auth:?}: {head}");
-        assert!(head.contains("Proxy-Authenticate: Basic realm=\"proxy\""), "{head}");
+        assert!(
+            head.starts_with("HTTP/1.1 407 Proxy Authentication Required\r\n"),
+            "{auth:?}: {head}"
+        );
+        assert!(
+            head.contains("Proxy-Authenticate: Basic realm=\"proxy\""),
+            "{head}"
+        );
         // And the connection is closed.
         let _ = read_all(&mut s);
     }
     // Plain-HTTP requests need it too.
     let mut s = a.connect();
-    write!(s, "GET http://plain.test/ HTTP/1.1\r\nHost: plain.test\r\n\r\n").unwrap();
+    write!(
+        s,
+        "GET http://plain.test/ HTTP/1.1\r\nHost: plain.test\r\n\r\n"
+    )
+    .unwrap();
     assert!(String::from_utf8_lossy(&read_all(&mut s)).starts_with("HTTP/1.1 407 "));
 
     let b = Attach::start(&world, "socks5", "t2", "10.0.0.3");
@@ -488,8 +619,16 @@ fn tokens_are_checked() {
     let mut s = b.connect();
     s.write_all(&[5, 1, 0]).unwrap();
     assert_eq!(read_all(&mut s), [5, 0xff]);
-    assert!(a.logged("CONNECT plain.test:80 407 no token"), "{}", a.log());
-    assert!(a.logged("CONNECT plain.test:80 407 wrong token"), "{}", a.log());
+    assert!(
+        a.logged("CONNECT plain.test:80 407 no token"),
+        "{}",
+        a.log()
+    );
+    assert!(
+        a.logged("CONNECT plain.test:80 407 wrong token"),
+        "{}",
+        a.log()
+    );
     assert!(b.logged("socks5: wrong token"), "{}", b.log());
 }
 
@@ -498,7 +637,11 @@ fn failures_get_proxy_answers() {
     let world = World::start();
     let a = Attach::start(&world, "http_proxy", "f1", "10.0.0.2");
     let cases = [
-        ("nope.test:443", "502 Bad Gateway", "no such name in the world"),
+        (
+            "nope.test:443",
+            "502 Bad Gateway",
+            "no such name in the world",
+        ),
         ("plain.test:443", "502 Bad Gateway", "connection refused"),
         // An address with no machine: the world answers "host
         // unreachable", and the answer comes at once.
@@ -506,12 +649,22 @@ fn failures_get_proxy_answers() {
         // Nothing outside the world: a real address is just another
         // address in the world, and has no machine either.
         ("1.1.1.1:443", "502 Bad Gateway", "host unreachable"),
-        ("[2606:4700::1111]:443", "502 Bad Gateway", "IPv6 is not supported: attach's stack is IPv4 only"),
+        (
+            "[2606:4700::1111]:443",
+            "502 Bad Gateway",
+            "IPv6 is not supported: attach's stack is IPv4 only",
+        ),
     ];
     for (target, status, why) in cases {
         let (_, head) = connect(&a, target, Some(BASIC));
-        assert!(head.starts_with(&format!("HTTP/1.1 {status}\r\n")), "{target}: {head}");
-        assert!(head.contains(&format!("X-Proxy-Error: {why}\r\n")), "{target}: {head}");
+        assert!(
+            head.starts_with(&format!("HTTP/1.1 {status}\r\n")),
+            "{target}: {head}"
+        );
+        assert!(
+            head.contains(&format!("X-Proxy-Error: {why}\r\n")),
+            "{target}: {head}"
+        );
     }
     // A request that is not a proxy request.
     let mut s = a.connect();
@@ -520,7 +673,12 @@ fn failures_get_proxy_answers() {
     assert!(answer.starts_with("HTTP/1.1 400 "), "{answer}");
 
     let b = Attach::start(&world, "socks5", "f2", "10.0.0.3");
-    for (name, port, code) in [("nope.test", 443, 4), ("plain.test", 443, 5), ("192.0.2.1", 80, 4), ("1.1.1.1", 443, 4)] {
+    for (name, port, code) in [
+        ("nope.test", 443, 4),
+        ("plain.test", 443, 5),
+        ("192.0.2.1", 80, 4),
+        ("1.1.1.1", 443, 4),
+    ] {
         let (_, reply) = socks_connect(&b, name, port);
         assert_eq!(reply[..2], [5, code], "{name}:{port}");
     }
@@ -552,8 +710,16 @@ fn socks5_carries_bytes_both_ways() {
 
 /// Writes a POST of `n` bytes to /upload and returns the answer's body.
 fn post_upload(s: &mut TcpStream, n: usize, absolute: bool) -> String {
-    let target = if absolute { "http://plain.test/upload" } else { "/upload" };
-    let auth = if absolute { format!("Proxy-Authorization: {BASIC}\r\n") } else { String::new() };
+    let target = if absolute {
+        "http://plain.test/upload"
+    } else {
+        "/upload"
+    };
+    let auth = if absolute {
+        format!("Proxy-Authorization: {BASIC}\r\n")
+    } else {
+        String::new()
+    };
     write!(s, "POST {target} HTTP/1.1\r\nHost: plain.test\r\n{auth}Content-Length: {n}\r\nConnection: close\r\n\r\n").unwrap();
     let chunk = vec![b'u'; 64 * 1024];
     let mut left = n;
@@ -572,9 +738,17 @@ fn big_uploads_and_many_downloads_at_once() {
     let n = 8 << 20;
     let (mut s, head) = connect(&a, "plain.test:80", Some(BASIC));
     assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
-    assert_eq!(post_upload(&mut s, n, false), format!("{n}\n"), "through CONNECT");
+    assert_eq!(
+        post_upload(&mut s, n, false),
+        format!("{n}\n"),
+        "through CONNECT"
+    );
     let mut s = a.connect();
-    assert_eq!(post_upload(&mut s, n, true), format!("{n}\n"), "as a plain-HTTP request");
+    assert_eq!(
+        post_upload(&mut s, n, true),
+        format!("{n}\n"),
+        "as a plain-HTTP request"
+    );
 
     // Ten downloads at once, each 1 MiB, all of it.
     let addr = a.addr;
@@ -582,10 +756,18 @@ fn big_uploads_and_many_downloads_at_once() {
         .map(|_| {
             std::thread::spawn(move || {
                 let mut s = TcpStream::connect(addr).unwrap();
-                write!(s, "CONNECT plain.test:80 HTTP/1.1\r\nProxy-Authorization: {BASIC}\r\n\r\n").unwrap();
+                write!(
+                    s,
+                    "CONNECT plain.test:80 HTTP/1.1\r\nProxy-Authorization: {BASIC}\r\n\r\n"
+                )
+                .unwrap();
                 let head = read_head(&mut s);
                 assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
-                write!(s, "GET /mb HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n").unwrap();
+                write!(
+                    s,
+                    "GET /mb HTTP/1.1\r\nHost: plain.test\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
                 let answer = read_all(&mut s);
                 let at = answer.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
                 answer.len() - at
@@ -606,7 +788,11 @@ fn the_world_closing_ends_attach_and_closes_the_port() {
     world.stop();
     let status = a.wait();
     assert_eq!(status.code(), Some(0), "{}", a.log());
-    assert!(a.logged("the world closed the connection; the proxy is closed"), "{}", a.log());
+    assert!(
+        a.logged("the world closed the connection; the proxy is closed"),
+        "{}",
+        a.log()
+    );
     // Fails closed: nothing listens any more.
     assert!(TcpStream::connect(a.addr).is_err());
 }
@@ -617,27 +803,72 @@ fn a_second_attach_under_the_same_name_is_refused() {
     let _a = Attach::start(&world, "socks5", "dup", "10.0.0.2");
     let token = world.dir.join("token");
     let out = Command::new(BIN)
-        .args(["attach", "--world", &format!("unix:{}", world.sock), "--name", "dup", "--type", "http_proxy"])
-        .args(["--listen", "127.0.0.1:0", "--token-file", token.to_str().unwrap(), "--ip-addr", "10.0.0.3", "--dns", "10.0.0.1"])
+        .args([
+            "attach",
+            "--world",
+            &format!("unix:{}", world.sock),
+            "--name",
+            "dup",
+            "--type",
+            "http_proxy",
+        ])
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--token-file",
+            token.to_str().unwrap(),
+            "--ip-addr",
+            "10.0.0.3",
+            "--dns",
+            "10.0.0.1",
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("the world refused: dup is already attached"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("the world refused: dup is already attached")
+    );
 }
 
 #[test]
 fn proxy_types_refuse_tun_flags_and_need_a_token() {
-    let base = ["attach", "--world", "unix:/nowhere", "--name", "a", "--type", "http_proxy", "--listen", "127.0.0.1:0"];
+    let base = [
+        "attach",
+        "--world",
+        "unix:/nowhere",
+        "--name",
+        "a",
+        "--type",
+        "http_proxy",
+        "--listen",
+        "127.0.0.1:0",
+    ];
     let out = Command::new(BIN)
         .args(base)
-        .args(["--token-file", "/t", "--ip-addr", "10.0.0.2", "--dns", "10.0.0.1", "--gateway", "10.0.0.1"])
+        .args([
+            "--token-file",
+            "/t",
+            "--ip-addr",
+            "10.0.0.2",
+            "--dns",
+            "10.0.0.1",
+            "--gateway",
+            "10.0.0.1",
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--type http_proxy takes no --gateway: attach makes the packets itself"), "{err}");
+    assert!(
+        err.contains("--type http_proxy takes no --gateway: attach makes the packets itself"),
+        "{err}"
+    );
 
-    let out = Command::new(BIN).args(base).args(["--ip-addr", "10.0.0.2", "--dns", "10.0.0.1"]).output().unwrap();
+    let out = Command::new(BIN)
+        .args(base)
+        .args(["--ip-addr", "10.0.0.2", "--dns", "10.0.0.1"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("needs --token-file"));
 
@@ -646,10 +877,20 @@ fn proxy_types_refuse_tun_flags_and_need_a_token() {
     let dir = temp_dir();
     let empty = dir.join("empty");
     std::fs::write(&empty, "\n").unwrap();
-    for (file, why) in [(dir.join("missing"), "reading the token file"), (empty, "it is empty")] {
+    for (file, why) in [
+        (dir.join("missing"), "reading the token file"),
+        (empty, "it is empty"),
+    ] {
         let out = Command::new(BIN)
             .args(base)
-            .args(["--token-file", file.to_str().unwrap(), "--ip-addr", "10.0.0.2", "--dns", "10.0.0.1"])
+            .args([
+                "--token-file",
+                file.to_str().unwrap(),
+                "--ip-addr",
+                "10.0.0.2",
+                "--dns",
+                "10.0.0.1",
+            ])
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1));
@@ -672,27 +913,42 @@ fn clients_waiting_for_a_connection_hear_that_the_world_is_gone() {
     let mut socks = Vec::new();
     for i in 1..=n {
         let mut c = h.connect();
-        write!(c, "CONNECT 192.0.2.{i}:443 HTTP/1.1\r\nProxy-Authorization: {BASIC}\r\n\r\n").unwrap();
+        write!(
+            c,
+            "CONNECT 192.0.2.{i}:443 HTTP/1.1\r\nProxy-Authorization: {BASIC}\r\n\r\n"
+        )
+        .unwrap();
         https.push(c);
         let mut c = s.connect();
-        assert_eq!(socks_login(&mut c, b"relay", TOKEN.as_bytes()), ([5, 2], [1, 0]));
+        assert_eq!(
+            socks_login(&mut c, b"relay", TOKEN.as_bytes()),
+            ([5, 2], [1, 0])
+        );
         c.write_all(&[5, 1, 0, 1, 192, 0, 2, i, 1, 187]).unwrap();
         socks.push(c);
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     while world.seen.lock().unwrap().len() < 2 * n as usize {
-        assert!(Instant::now() < deadline, "the world saw {} connections", world.seen.lock().unwrap().len());
+        assert!(
+            Instant::now() < deadline,
+            "the world saw {} connections",
+            world.seen.lock().unwrap().len()
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     world.stop();
     for mut c in https {
         let head = read_head(&mut c);
         assert!(head.starts_with("HTTP/1.1 503 "), "{head:?}\n{}", h.log());
-        assert!(head.contains("X-Proxy-Error: the world is gone\r\n"), "{head}");
+        assert!(
+            head.contains("X-Proxy-Error: the world is gone\r\n"),
+            "{head}"
+        );
     }
     for mut c in socks {
         let mut reply = [0u8; 10];
-        c.read_exact(&mut reply).unwrap_or_else(|e| panic!("{e}\n{}", s.log()));
+        c.read_exact(&mut reply)
+            .unwrap_or_else(|e| panic!("{e}\n{}", s.log()));
         assert_eq!(reply[..2], [5, 1], "general failure");
     }
     assert_eq!(h.wait().code(), Some(0), "{}", h.log());
@@ -716,7 +972,13 @@ fn answer_hello(sock: &Path, answer: Vec<u8>) -> std::thread::JoinHandle<()> {
     };
     std::thread::spawn(move || {
         // SAFETY: accept on the listener this thread owns.
-        let conn = unsafe { OwnedFd::from_raw_fd(libc::accept(listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut())) };
+        let conn = unsafe {
+            OwnedFd::from_raw_fd(libc::accept(
+                listener.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ))
+        };
         fictionet::relay::unix::raise_buffers(conn.as_raw_fd());
         let mut buf = vec![0u8; fictionet::relay::MAX_MESSAGE];
         fictionet::relay::unix::recv(conn.as_raw_fd(), &mut buf, false).unwrap();
@@ -734,8 +996,25 @@ fn an_oversized_answer_to_hello_is_an_error_not_a_refusal() {
     std::fs::write(&token, format!("{TOKEN}\n")).unwrap();
     let attach = |sock: &Path| {
         Command::new(BIN)
-            .args(["attach", "--world", &format!("unix:{}", sock.display()), "--name", "big", "--type", "http_proxy"])
-            .args(["--listen", "127.0.0.1:0", "--token-file", token.to_str().unwrap(), "--ip-addr", "10.0.0.2", "--dns", "10.0.0.1"])
+            .args([
+                "attach",
+                "--world",
+                &format!("unix:{}", sock.display()),
+                "--name",
+                "big",
+                "--type",
+                "http_proxy",
+            ])
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--token-file",
+                token.to_str().unwrap(),
+                "--ip-addr",
+                "10.0.0.2",
+                "--dns",
+                "10.0.0.1",
+            ])
             .output()
             .unwrap()
     };
@@ -755,7 +1034,12 @@ fn an_oversized_answer_to_hello_is_an_error_not_a_refusal() {
     let world = answer_hello(&sock, refuse);
     let out = attach(&sock);
     world.join().unwrap();
-    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

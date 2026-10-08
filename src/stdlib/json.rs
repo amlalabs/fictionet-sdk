@@ -86,7 +86,11 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Limits {
-        Limits { depth: MAX_DEPTH, size: MAX_SIZE, elements: MAX_ELEMENTS }
+        Limits {
+            depth: MAX_DEPTH,
+            size: MAX_SIZE,
+            elements: MAX_ELEMENTS,
+        }
     }
 }
 
@@ -188,7 +192,11 @@ impl Number {
     /// The number as an `i64`, if its text is an integer (no fraction and
     /// no exponent) that fits.
     pub fn as_i64(&self) -> Option<i64> {
-        if self.is_integer_text() { self.text.parse().ok() } else { None }
+        if self.is_integer_text() {
+            self.text.parse().ok()
+        } else {
+            None
+        }
     }
 
     /// The number as a `u64`, if its text is a non-negative integer (no
@@ -198,7 +206,11 @@ impl Number {
             return None;
         }
         // `-0` is zero. Only the sign keeps `u64` parsing from reading it.
-        if self.text == "-0" { Some(0) } else { self.text.parse().ok() }
+        if self.text == "-0" {
+            Some(0)
+        } else {
+            self.text.parse().ok()
+        }
     }
 
     fn is_integer_text(&self) -> bool {
@@ -376,7 +388,10 @@ impl Value {
     /// The value of the first member named `key`, if this is an object
     /// that has one. Use [`Value::as_object`] to see every duplicate.
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.as_object()?.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        self.as_object()?
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
     }
 
     /// Checks whether compact JSON for this value fits `limits`.
@@ -485,7 +500,13 @@ pub fn parse_with(input: &[u8], limits: &Limits) -> Result<Value, Error> {
     if input.len() > size {
         return Err(Error::at(ErrorKind::TooLarge, size));
     }
-    let mut p = Parser { b: input, i: 0, depth: limits.depth(), elements: limits.elements(), count: 0 };
+    let mut p = Parser {
+        b: input,
+        i: 0,
+        depth: limits.depth(),
+        elements: limits.elements(),
+        count: 0,
+    };
     p.ws();
     let v = p.value(0)?;
     p.ws();
@@ -818,7 +839,9 @@ impl Writer {
             Value::Bool(false) => self.push("false"),
             Value::Number(n) => self.push(&n.text),
             Value::String(s) => self.string(s),
-            Value::Array(_) | Value::Object(_) if depth >= self.depth => self.err(ErrorKind::TooDeep),
+            Value::Array(_) | Value::Object(_) if depth >= self.depth => {
+                self.err(ErrorKind::TooDeep)
+            }
             Value::Array(items) => {
                 self.push("[")?;
                 for (k, item) in items.iter().enumerate() {
@@ -1104,7 +1127,11 @@ enum Scan {
     #[default]
     Idle,
     /// Inside an array or object.
-    Container { depth: usize, in_string: bool, escape: bool },
+    Container {
+        depth: usize,
+        in_string: bool,
+        escape: bool,
+    },
     /// Inside a top-level string.
     Str { escape: bool },
     /// Inside a top-level number or literal.
@@ -1117,13 +1144,11 @@ fn is_scalar_byte(c: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::codec::{
-        Lcg,
-    };
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn check(input: &[u8]) {
@@ -1168,15 +1193,42 @@ mod tests {
             }"#;
         let v = Value::parse(text).unwrap();
         let image = v.get("Image").unwrap();
-        assert_eq!(image.get("Width").and_then(Value::as_number).and_then(Number::as_u64), Some(800));
-        assert_eq!(image.get("Title").and_then(Value::as_str), Some("View from 15th Floor"));
+        assert_eq!(
+            image
+                .get("Width")
+                .and_then(Value::as_number)
+                .and_then(Number::as_u64),
+            Some(800)
+        );
+        assert_eq!(
+            image.get("Title").and_then(Value::as_str),
+            Some("View from 15th Floor")
+        );
         assert_eq!(image.get("Animated").and_then(Value::as_bool), Some(false));
         let thumb = image.get("Thumbnail").unwrap();
-        assert_eq!(thumb.get("Url").and_then(Value::as_str), Some("http://www.example.com/image/481989943"));
-        let ids: Vec<i64> = image.get("IDs").unwrap().as_array().unwrap().iter().map(|v| v.as_number().unwrap().as_i64().unwrap()).collect();
+        assert_eq!(
+            thumb.get("Url").and_then(Value::as_str),
+            Some("http://www.example.com/image/481989943")
+        );
+        let ids: Vec<i64> = image
+            .get("IDs")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_number().unwrap().as_i64().unwrap())
+            .collect();
         assert_eq!(ids, [116, 943, 234, 38793]);
-        let keys: Vec<&str> = image.as_object().unwrap().iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, ["Width", "Height", "Title", "Thumbnail", "Animated", "IDs"]);
+        let keys: Vec<&str> = image
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            keys,
+            ["Width", "Height", "Title", "Thumbnail", "Animated", "IDs"]
+        );
         String::from_utf8(contract::check_written(&v)).unwrap();
     }
 
@@ -1208,7 +1260,10 @@ mod tests {
         let v = Value::parse(text).unwrap();
         let items = v.as_array().unwrap();
         assert_eq!(items.len(), 2);
-        let lon = items[1].get("Longitude").and_then(Value::as_number).unwrap();
+        let lon = items[1]
+            .get("Longitude")
+            .and_then(Value::as_number)
+            .unwrap();
         // The exact text stays, trailing zero included.
         assert_eq!(lon.text(), "-122.026020");
         assert_eq!(lon.as_f64(), -122.02602);
@@ -1218,7 +1273,10 @@ mod tests {
 
     #[test]
     fn rfc_scalar_texts() {
-        assert_eq!(Value::parse(b"\"Hello world!\"").unwrap(), s("Hello world!"));
+        assert_eq!(
+            Value::parse(b"\"Hello world!\"").unwrap(),
+            s("Hello world!")
+        );
         assert_eq!(Value::parse(b"42").unwrap(), n("42"));
         assert_eq!(Value::parse(b"true").unwrap(), Value::Bool(true));
         assert_eq!(Value::parse(b"false").unwrap(), Value::Bool(false));
@@ -1227,36 +1285,99 @@ mod tests {
 
     #[test]
     fn numbers() {
-        for good in ["0", "-0", "1", "-1", "10", "1.5", "0.25", "-0.0", "1e5", "1E5", "1e+5", "1e-5", "2.5E-03", "123456789012345678901234567890"] {
+        for good in [
+            "0",
+            "-0",
+            "1",
+            "-1",
+            "10",
+            "1.5",
+            "0.25",
+            "-0.0",
+            "1e5",
+            "1E5",
+            "1e+5",
+            "1e-5",
+            "2.5E-03",
+            "123456789012345678901234567890",
+        ] {
             let v = Value::parse(good.as_bytes()).unwrap();
             assert_eq!(v.as_number().unwrap().text(), good);
             assert_eq!(written_text(&v), good);
             assert!(Number::from_text(good).is_some());
         }
-        for bad in ["-", "01", "-01", "00", "1.", ".5", "+1", "1e", "1e+", "1.e5", "0x10", "Infinity", "NaN", "-Infinity", " 1", "1 ", "1.5.5", ""] {
-            assert!(Value::parse(bad.as_bytes()).is_err() || bad.trim() != bad, "{bad}");
+        for bad in [
+            "-",
+            "01",
+            "-01",
+            "00",
+            "1.",
+            ".5",
+            "+1",
+            "1e",
+            "1e+",
+            "1.e5",
+            "0x10",
+            "Infinity",
+            "NaN",
+            "-Infinity",
+            " 1",
+            "1 ",
+            "1.5.5",
+            "",
+        ] {
+            assert!(
+                Value::parse(bad.as_bytes()).is_err() || bad.trim() != bad,
+                "{bad}"
+            );
             assert!(Number::from_text(bad).is_none(), "{bad}");
         }
         let big = Number::from_text("1e400").unwrap();
         assert!(big.as_f64().is_infinite());
         assert_eq!(big.as_i64(), None);
-        assert_eq!(Number::from_text("9223372036854775807").unwrap().as_i64(), Some(i64::MAX));
-        assert_eq!(Number::from_text("9223372036854775808").unwrap().as_i64(), None);
-        assert_eq!(Number::from_text("9223372036854775808").unwrap().as_u64(), Some(1 << 63));
+        assert_eq!(
+            Number::from_text("9223372036854775807").unwrap().as_i64(),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            Number::from_text("9223372036854775808").unwrap().as_i64(),
+            None
+        );
+        assert_eq!(
+            Number::from_text("9223372036854775808").unwrap().as_u64(),
+            Some(1 << 63)
+        );
         assert_eq!(Number::from_text("-1").unwrap().as_u64(), None);
         assert_eq!(Number::from_text("1.0").unwrap().as_i64(), None);
         assert_eq!(Number::from_text("1e2").unwrap().as_f64(), 100.0);
         assert_ne!(Number::from_text("1.0"), Number::from_text("1"));
         assert_eq!(Number::from_i64(i64::MIN).text(), "-9223372036854775808");
         assert_eq!(Number::from_u64(u64::MAX).text(), "18446744073709551615");
-        for f in [0.0, -0.0, 1.5, -2.25, 1e300, 5e-324, f64::MAX, f64::MIN_POSITIVE, 0.1, 123456.789] {
+        for f in [
+            0.0,
+            -0.0,
+            1.5,
+            -2.25,
+            1e300,
+            5e-324,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            0.1,
+            123456.789,
+        ] {
             let num = Number::from_f64(f).unwrap();
             assert_eq!(num.as_f64(), f, "{}", num.text());
             assert!(num.text().len() <= 32, "{}", num.text());
         }
         assert_eq!(Number::from_f64(f64::NAN), None);
         assert_eq!(Number::from_f64(f64::INFINITY), None);
-        assert_eq!(Number::from_text(&"1".repeat(MAX_NUMBER_LEN)).unwrap().text().len(), MAX_NUMBER_LEN);
+        assert_eq!(
+            Number::from_text(&"1".repeat(MAX_NUMBER_LEN))
+                .unwrap()
+                .text()
+                .len(),
+            MAX_NUMBER_LEN
+        );
         assert!(Number::from_text(&"1".repeat(MAX_NUMBER_LEN + 1)).is_none());
     }
 
@@ -1268,15 +1389,24 @@ mod tests {
         assert_eq!(Value::parse(br#""\ud83d\ude00""#).unwrap(), s("😀"));
         assert_eq!(Value::parse(br#""\uD834\uDD1E""#).unwrap(), s("𝄞"));
         // Raw UTF-8 passes through.
-        assert_eq!(Value::parse("\"日本 😀\"".as_bytes()).unwrap(), s("日本 😀"));
+        assert_eq!(
+            Value::parse("\"日本 😀\"".as_bytes()).unwrap(),
+            s("日本 😀")
+        );
         // U+0000 is allowed as an escape.
         assert_eq!(Value::parse(br#""\u0000""#).unwrap(), s("\0"));
         // The writer escapes only what it must.
         let w = written_text(&s("q\"b\\/\n\u{1}\u{7f}é😀"));
         assert_eq!(w, "\"q\\\"b\\\\/\\n\\u0001\u{7f}é😀\"");
-        String::from_utf8(contract::check_written(&s("q\"b\\/\n\u{1}\u{1f}\u{7f}é😀\u{2028}"))).unwrap();
+        String::from_utf8(contract::check_written(&s(
+            "q\"b\\/\n\u{1}\u{1f}\u{7f}é😀\u{2028}",
+        )))
+        .unwrap();
         for c in 0..0x20u32 {
-            String::from_utf8(contract::check_written(&Value::String(char::from_u32(c).unwrap().to_string()))).unwrap();
+            String::from_utf8(contract::check_written(&Value::String(
+                char::from_u32(c).unwrap().to_string(),
+            )))
+            .unwrap();
         }
     }
 
@@ -1316,7 +1446,10 @@ mod tests {
         assert_eq!(err(b"1.x"), (ErrorKind::BadNumber, 2));
         assert_eq!(err(b"-a"), (ErrorKind::BadNumber, 1));
         assert_eq!(err(b"1e"), (ErrorKind::UnexpectedEnd, 2));
-        assert_eq!(err("1".repeat(MAX_NUMBER_LEN + 1).as_bytes()), (ErrorKind::NumberTooLong, 0));
+        assert_eq!(
+            err("1".repeat(MAX_NUMBER_LEN + 1).as_bytes()),
+            (ErrorKind::NumberTooLong, 0)
+        );
         assert_eq!(err(br#""\x""#), (ErrorKind::BadEscape, 2));
         assert_eq!(err(br#""\u12g4""#), (ErrorKind::BadEscape, 5));
         assert_eq!(err(br#""\ud800""#), (ErrorKind::LoneSurrogate, 1));
@@ -1331,9 +1464,15 @@ mod tests {
         let big = vec![b' '; MAX_SIZE + 1];
         assert_eq!(err(&big), (ErrorKind::TooLarge, MAX_SIZE));
         let many = format!("[{}0]", "0,".repeat(MAX_ELEMENTS));
-        assert_eq!(Value::parse(many.as_bytes()).unwrap_err().kind, ErrorKind::TooManyElements);
+        assert_eq!(
+            Value::parse(many.as_bytes()).unwrap_err().kind,
+            ErrorKind::TooManyElements
+        );
         // Every kind prints.
-        assert_eq!(Error::at(ErrorKind::BadEscape, 4).to_string(), "an unknown escape at byte 4");
+        assert_eq!(
+            Error::at(ErrorKind::BadEscape, 4).to_string(),
+            "an unknown escape at byte 4"
+        );
     }
 
     #[test]
@@ -1341,20 +1480,49 @@ mod tests {
         let at = format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
         let v = Value::parse(at.as_bytes()).unwrap();
         String::from_utf8(contract::check_written(&v)).unwrap();
-        let tight = Limits { depth: 2, size: 20, elements: 4 };
+        let tight = Limits {
+            depth: 2,
+            size: 20,
+            elements: 4,
+        };
         assert!(parse_with(b"[[1]]", &tight).is_ok());
-        assert_eq!(parse_with(b"[[[]]]", &tight).unwrap_err(), Error::at(ErrorKind::TooDeep, 2));
-        assert_eq!(parse_with(b"{\"a\":{\"b\":{}}}", &tight).unwrap_err().kind, ErrorKind::TooDeep);
-        assert_eq!(parse_with(b"[1,2,3,4]", &tight).unwrap_err(), Error::at(ErrorKind::TooManyElements, 7));
+        assert_eq!(
+            parse_with(b"[[[]]]", &tight).unwrap_err(),
+            Error::at(ErrorKind::TooDeep, 2)
+        );
+        assert_eq!(
+            parse_with(b"{\"a\":{\"b\":{}}}", &tight).unwrap_err().kind,
+            ErrorKind::TooDeep
+        );
+        assert_eq!(
+            parse_with(b"[1,2,3,4]", &tight).unwrap_err(),
+            Error::at(ErrorKind::TooManyElements, 7)
+        );
         assert!(parse_with(b"[1,2,3]", &tight).is_ok());
-        assert_eq!(parse_with(&[b' '; 21], &tight).unwrap_err().kind, ErrorKind::TooLarge);
-        let scalars_only = Limits { depth: 0, ..Limits::default() };
+        assert_eq!(
+            parse_with(&[b' '; 21], &tight).unwrap_err().kind,
+            ErrorKind::TooLarge
+        );
+        let scalars_only = Limits {
+            depth: 0,
+            ..Limits::default()
+        };
         assert!(parse_with(b"1", &scalars_only).is_ok());
-        assert_eq!(parse_with(b"[]", &scalars_only).unwrap_err().kind, ErrorKind::TooDeep);
+        assert_eq!(
+            parse_with(b"[]", &scalars_only).unwrap_err().kind,
+            ErrorKind::TooDeep
+        );
         // Limits cannot go past the constants.
-        let loose = Limits { depth: usize::MAX, size: usize::MAX, elements: usize::MAX };
+        let loose = Limits {
+            depth: usize::MAX,
+            size: usize::MAX,
+            elements: usize::MAX,
+        };
         let deep = format!("{}{}", "[".repeat(MAX_DEPTH + 1), "]".repeat(MAX_DEPTH + 1));
-        assert_eq!(parse_with(deep.as_bytes(), &loose).unwrap_err().kind, ErrorKind::TooDeep);
+        assert_eq!(
+            parse_with(deep.as_bytes(), &loose).unwrap_err().kind,
+            ErrorKind::TooDeep
+        );
     }
 
     #[test]
@@ -1397,10 +1565,28 @@ mod tests {
         );
         let ok = Value::Array(vec![Value::Null; MAX_ELEMENTS - 1]);
         String::from_utf8(contract::check_written(&ok)).unwrap();
-        let tight = Limits { depth: 1, size: 10, elements: 3 };
-        assert_eq!(Value::Array(vec![Value::Array(vec![])]).validate(&tight).unwrap_err(), Error::at(ErrorKind::TooDeep, 1));
-        assert_eq!(s("0123456789").validate(&tight).unwrap_err().kind, ErrorKind::TooLarge);
-        assert_eq!(Value::Array(vec![true.into(), false.into(), Value::Null]).validate(&Limits { size: 100, ..tight }).unwrap_err().kind, ErrorKind::TooManyElements);
+        let tight = Limits {
+            depth: 1,
+            size: 10,
+            elements: 3,
+        };
+        assert_eq!(
+            Value::Array(vec![Value::Array(vec![])])
+                .validate(&tight)
+                .unwrap_err(),
+            Error::at(ErrorKind::TooDeep, 1)
+        );
+        assert_eq!(
+            s("0123456789").validate(&tight).unwrap_err().kind,
+            ErrorKind::TooLarge
+        );
+        assert_eq!(
+            Value::Array(vec![true.into(), false.into(), Value::Null])
+                .validate(&Limits { size: 100, ..tight })
+                .unwrap_err()
+                .kind,
+            ErrorKind::TooManyElements
+        );
     }
 
     #[test]
@@ -1411,7 +1597,14 @@ mod tests {
             ("u".into(), Value::from(u64::MAX)),
             ("f".into(), Value::from(Number::from_f64(-1.25e-9).unwrap())),
             ("s".into(), s("tab\there \"quoted\" \\ é 😀")),
-            ("a".into(), Value::Array(vec![Value::Array(vec![]), Value::Object(vec![]), true.into()])),
+            (
+                "a".into(),
+                Value::Array(vec![
+                    Value::Array(vec![]),
+                    Value::Object(vec![]),
+                    true.into(),
+                ]),
+            ),
             ("n".into(), Value::from("again")),
         ]);
         String::from_utf8(contract::check_written(&v)).unwrap();
@@ -1443,7 +1636,9 @@ mod tests {
                 let (items, error) = decode_all(Values::new, &doc[..cut]);
                 assert!(items.is_empty());
                 let whitespace = doc[..cut].iter().take_while(|c| is_ws(**c)).count();
-                let expected = (cut > whitespace).then_some(Fail::Truncated { unread: cut - whitespace });
+                let expected = (cut > whitespace).then_some(Fail::Truncated {
+                    unread: cut - whitespace,
+                });
                 assert_eq!(error, expected);
             }
         }
@@ -1457,7 +1652,10 @@ mod tests {
             assert_eq!(stream.next(), Some(Ok(Value::Object(vec![]))));
             assert_eq!(stream.buffered(), 0);
         }
-        pump(&mut stream, &vec![b' '; 3 * MAX_SIZE], |_| panic!("no value")).unwrap();
+        pump(&mut stream, &vec![b' '; 3 * MAX_SIZE], |_| {
+            panic!("no value")
+        })
+        .unwrap();
         assert_eq!(stream.buffered(), 0);
         assert!(stream.into_parts().0.allocated() <= 2 * (MAX_SIZE + 1));
     }
@@ -1469,12 +1667,17 @@ mod tests {
             assert_eq!(stream.push(text.as_bytes()), text.len());
             assert_eq!(stream.next(), None);
             stream.end();
-            assert_eq!(stream.next(), Some(Ok(Value::parse(text.as_bytes()).unwrap())));
+            assert_eq!(
+                stream.next(),
+                Some(Ok(Value::parse(text.as_bytes()).unwrap()))
+            );
             assert_eq!(stream.next(), None);
             check(text.as_bytes());
         }
-        assert_eq!(decode_all(Values::new, b"{\"a\":1}\n42"),
-            (vec![Value::parse(b"{\"a\":1}").unwrap(), n("42")], None));
+        assert_eq!(
+            decode_all(Values::new, b"{\"a\":1}\n42"),
+            (vec![Value::parse(b"{\"a\":1}").unwrap(), n("42")], None)
+        );
         assert_eq!(
             decode_all(Values::new, b"[x"),
             (
@@ -1494,9 +1697,18 @@ mod tests {
                 (vec![], Some(Fail::Protocol(error)))
             );
         }
-        for (input, unread) in [(b"{\"a\":".as_slice(), 5), (b"[1] [2,", 3), (b" \"abc", 4), (b"tru", 3), (b"1e", 2)] {
+        for (input, unread) in [
+            (b"{\"a\":".as_slice(), 5),
+            (b"[1] [2,", 3),
+            (b" \"abc", 4),
+            (b"tru", 3),
+            (b"1e", 2),
+        ] {
             check(input);
-            assert_eq!(decode_all(Values::new, input).1, Some(Fail::Truncated { unread }));
+            assert_eq!(
+                decode_all(Values::new, input).1,
+                Some(Fail::Truncated { unread })
+            );
         }
         let mut stream = Stream::new(Values::new());
         assert_eq!(stream.push(b" "), 1);
@@ -1510,19 +1722,38 @@ mod tests {
     fn stream_does_not_frame_lines() {
         let bytes = b"{}{}\n{\n\"a\":1\n}\n";
         check(bytes);
-        assert_eq!(decode_all(Values::new, bytes),
-            (vec![Value::Object(vec![]), Value::Object(vec![]), Value::parse(b"{\"a\":1}").unwrap()], None));
+        assert_eq!(
+            decode_all(Values::new, bytes),
+            (
+                vec![
+                    Value::Object(vec![]),
+                    Value::Object(vec![]),
+                    Value::parse(b"{\"a\":1}").unwrap()
+                ],
+                None
+            )
+        );
     }
 
     #[test]
     fn stream_splits_values_and_tracks_error_offsets() {
         let bytes = b" {\"id\":1} [2]\n\"three\" 4 true null {\"id\":5}\n";
         check(bytes);
-        assert_eq!(decode_all(Values::new, bytes), (vec![
-            Value::parse(b"{\"id\":1}").unwrap(), Value::parse(b"[2]").unwrap(),
-            s("three"), n("4"), Value::Bool(true), Value::Null,
-            Value::parse(b"{\"id\":5}").unwrap(),
-        ], None));
+        assert_eq!(
+            decode_all(Values::new, bytes),
+            (
+                vec![
+                    Value::parse(b"{\"id\":1}").unwrap(),
+                    Value::parse(b"[2]").unwrap(),
+                    s("three"),
+                    n("4"),
+                    Value::Bool(true),
+                    Value::Null,
+                    Value::parse(b"{\"id\":5}").unwrap(),
+                ],
+                None
+            )
+        );
         let mut stream = Stream::new(Values::new());
         assert_eq!(stream.push(b"12"), 2);
         assert_eq!(stream.next(), None);
@@ -1537,27 +1768,60 @@ mod tests {
         assert_eq!(stream.push(b"[1]"), 3);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.failed(), Some(&error));
-        assert_eq!(decode_all(Values::new, b"]").1,
-            Some(Fail::Protocol(Error::at(ErrorKind::UnexpectedByte(b']'), 0))));
+        assert_eq!(
+            decode_all(Values::new, b"]").1,
+            Some(Fail::Protocol(Error::at(
+                ErrorKind::UnexpectedByte(b']'),
+                0
+            )))
+        );
     }
 
     #[test]
     fn stream_limits_and_earlier_errors() {
-        let tight = Limits { depth: 2, size: 8, elements: 100 };
+        let tight = Limits {
+            depth: 2,
+            size: 8,
+            elements: 100,
+        };
         for (bytes, limits, expected) in [
-            (b"[[]] [[[".as_slice(), tight, Error::at(ErrorKind::TooDeep, 7)),
+            (
+                b"[[]] [[[".as_slice(),
+                tight,
+                Error::at(ErrorKind::TooDeep, 7),
+            ),
             (b"  \"abcdefgh", tight, Error::at(ErrorKind::TooLarge, 10)),
-            (b"1 {", Limits { depth: 0, ..Limits::default() }, Error::at(ErrorKind::TooDeep, 2)),
-            (b"[1,2,[[", Limits { depth: 2, size: 100, elements: 2 }, Error::at(ErrorKind::TooManyElements, 3)),
+            (
+                b"1 {",
+                Limits {
+                    depth: 0,
+                    ..Limits::default()
+                },
+                Error::at(ErrorKind::TooDeep, 2),
+            ),
+            (
+                b"[1,2,[[",
+                Limits {
+                    depth: 2,
+                    size: 100,
+                    elements: 2,
+                },
+                Error::at(ErrorKind::TooManyElements, 3),
+            ),
         ] {
             let make = || Values::with_limits(limits);
             contract::check_decode_with_alloc_limit(make, bytes, 2 * make().capacity());
             assert_eq!(decode_all(make, bytes).1, Some(Fail::Protocol(expected)));
         }
-        for input in [format!("[x{}", "[".repeat(MAX_DEPTH + 10)), format!(" {}", "[".repeat(MAX_DEPTH + 1))] {
+        for input in [
+            format!("[x{}", "[".repeat(MAX_DEPTH + 10)),
+            format!(" {}", "[".repeat(MAX_DEPTH + 1)),
+        ] {
             check(input.as_bytes());
-            assert_eq!(decode_all(Values::new, input.as_bytes()).1,
-                Some(Fail::Protocol(Value::parse(input.as_bytes()).unwrap_err())));
+            assert_eq!(
+                decode_all(Values::new, input.as_bytes()).1,
+                Some(Fail::Protocol(Value::parse(input.as_bytes()).unwrap_err()))
+            );
         }
     }
 
@@ -1605,8 +1869,10 @@ mod tests {
             (b"  nul\"", ErrorKind::UnexpectedByte(b'"'), 5),
         ] {
             check(input);
-            assert_eq!(decode_all(Values::new, input),
-                (vec![], Some(Fail::Protocol(Error::at(kind, offset)))));
+            assert_eq!(
+                decode_all(Values::new, input),
+                (vec![], Some(Fail::Protocol(Error::at(kind, offset))))
+            );
         }
     }
 
@@ -1620,7 +1886,8 @@ mod tests {
             pump(&mut stream, bytes.as_bytes(), |value| {
                 assert_eq!(value, n("0"));
                 count += 1;
-            }).unwrap();
+            })
+            .unwrap();
             finish(&mut stream, |_| panic!("no pending value")).unwrap();
             assert_eq!(count, size);
             assert_eq!(stream.buffered(), 0);
@@ -1633,7 +1900,38 @@ mod tests {
     }
 
     const PIECES: [&str; 32] = [
-        "{", "}", "[", "]", ",", ":", " ", "\n", "\"", "\"a\"", "\"k\":", "\\", "\\u", "d83d", "\\ude00", "\\n", "0", "1", "-", ".", "e", "+", "12.5", "true", "false", "null", "tru", "é", "\u{1}", "x", "\"\\ud800\"", "9e999",
+        "{",
+        "}",
+        "[",
+        "]",
+        ",",
+        ":",
+        " ",
+        "\n",
+        "\"",
+        "\"a\"",
+        "\"k\":",
+        "\\",
+        "\\u",
+        "d83d",
+        "\\ude00",
+        "\\n",
+        "0",
+        "1",
+        "-",
+        ".",
+        "e",
+        "+",
+        "12.5",
+        "true",
+        "false",
+        "null",
+        "tru",
+        "é",
+        "\u{1}",
+        "x",
+        "\"\\ud800\"",
+        "9e999",
     ];
 
     fn random_input(r: &mut Lcg) -> Vec<u8> {
@@ -1659,15 +1957,31 @@ mod tests {
                     ))
                     .unwrap_or(Number::from_i64(0)),
                 ),
-                _ => Value::from(Number::from_text(&format!("{}.{}e-{}", r.next(), r.next(), r.index(400))).unwrap()),
+                _ => Value::from(
+                    Number::from_text(&format!("{}.{}e-{}", r.next(), r.next(), r.index(400)))
+                        .unwrap(),
+                ),
             },
             3 => Value::String(
                 (0..r.index(8))
                     .filter_map(|_| char::from_u32(r.next() as u32 % 0x11000))
                     .collect(),
             ),
-            4 => Value::Array((0..r.index(5)).map(|_| random_value(r, depth + 1)).collect()),
-            _ => Value::Object((0..r.index(5)).map(|_| (PIECES[r.index(PIECES.len())].to_string(), random_value(r, depth + 1))).collect()),
+            4 => Value::Array(
+                (0..r.index(5))
+                    .map(|_| random_value(r, depth + 1))
+                    .collect(),
+            ),
+            _ => Value::Object(
+                (0..r.index(5))
+                    .map(|_| {
+                        (
+                            PIECES[r.index(PIECES.len())].to_string(),
+                            random_value(r, depth + 1),
+                        )
+                    })
+                    .collect(),
+            ),
         }
     }
 

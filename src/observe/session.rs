@@ -13,9 +13,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use super::json::{self, Object, Scalar};
 use super::packets::{LinkWatch, Subscription, keylog};
 use super::view::{self, View};
+use crate::Attacher;
 use crate::relay::{self, Message, unix};
 use crate::watch::Graph;
-use crate::Attacher;
 
 /// How often a graph subscription sends what changed.
 const GRAPH_TICK: Duration = Duration::from_millis(250);
@@ -28,10 +28,16 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SUBSCRIPTIONS: usize = 64;
 
 pub(crate) fn start(attacher: Attacher, fd: OwnedFd) {
-    let _ = std::thread::Builder::new().name("fictionet-observe".into()).spawn(move || {
-        let mut session = Session { attacher, fd, subs: Vec::new() };
-        let _ = session.run();
-    });
+    let _ = std::thread::Builder::new()
+        .name("fictionet-observe".into())
+        .spawn(move || {
+            let mut session = Session {
+                attacher,
+                fd,
+                subs: Vec::new(),
+            };
+            let _ = session.run();
+        });
 }
 
 /// Counts a connected observer, so links copy packets and TLS keeps keys.
@@ -54,9 +60,21 @@ enum Sub {
     /// `watch`: the graph, then what changed.
     /// `after` is where the events start, if the request said: the first
     /// run's events after that number, and every event of a later run.
-    Graph { id: u32, shown: Option<(u64, View, Viewer)>, after: Option<u64>, said_waiting: bool, next: Instant },
+    Graph {
+        id: u32,
+        shown: Option<(u64, View, Viewer)>,
+        after: Option<u64>,
+        said_waiting: bool,
+        next: Instant,
+    },
     /// `packets`: one link's packets as they are copied.
-    Packets { id: u32, watch: Arc<LinkWatch>, cursor: u64, _held: (Subscription, Viewer), next: Instant },
+    Packets {
+        id: u32,
+        watch: Arc<LinkWatch>,
+        cursor: u64,
+        _held: (Subscription, Viewer),
+        next: Instant,
+    },
 }
 
 impl Sub {
@@ -109,8 +127,14 @@ impl Session {
             let wait = self.subs.iter().map(|s| match s {
                 Sub::Graph { next, .. } | Sub::Packets { next, .. } => *next,
             });
-            let timeout = wait.min().map_or(1000, |t| t.saturating_duration_since(Instant::now()).as_millis() as i32);
-            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let timeout = wait.min().map_or(1000, |t| {
+                t.saturating_duration_since(Instant::now()).as_millis() as i32
+            });
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
             // SAFETY: one valid pollfd.
             let ready = unsafe { libc::poll(&mut pfd, 1, timeout.max(0)) };
             if ready > 0 {
@@ -152,7 +176,16 @@ impl Session {
             } else if end {
                 flags |= relay::END;
             }
-            unix::send(self.fd.as_raw_fd(), &Message::Reply { id, flags, body: chunk }.encode(), false)?;
+            unix::send(
+                self.fd.as_raw_fd(),
+                &Message::Reply {
+                    id,
+                    flags,
+                    body: chunk,
+                }
+                .encode(),
+                false,
+            )?;
         }
         Ok(())
     }
@@ -162,7 +195,9 @@ impl Session {
     }
 
     fn handle(&mut self, id: u32, req: Option<Request>) -> std::io::Result<()> {
-        let Some(req) = req else { return self.reply(id, &error("the request is not a flat JSON object")) };
+        let Some(req) = req else {
+            return self.reply(id, &error("the request is not a flat JSON object"));
+        };
         let Some(op) = req.get("op").and_then(Scalar::as_str) else {
             return self.reply(id, &error("the request has no op"));
         };
@@ -180,7 +215,12 @@ impl Session {
             "events" => match graph {
                 Some(g) => {
                     let after = req.get("after").and_then(Scalar::as_u64).unwrap_or(0);
-                    let max = req.get("max").and_then(Scalar::as_u64).map_or(view::EVENTS_PER_REPLY, |m| (m as usize).min(view::EVENTS_PER_REPLY));
+                    let max = req
+                        .get("max")
+                        .and_then(Scalar::as_u64)
+                        .map_or(view::EVENTS_PER_REPLY, |m| {
+                            (m as usize).min(view::EVENTS_PER_REPLY)
+                        });
                     self.reply(id, &view::events(&g, after, max))
                 }
                 None => self.reply(id, &error("no world is running yet")),
@@ -194,14 +234,24 @@ impl Session {
             }
             "watch" => {
                 let after = req.get("after").and_then(Scalar::as_u64);
-                self.subs.push(Sub::Graph { id, shown: None, after, said_waiting: false, next: Instant::now() });
+                self.subs.push(Sub::Graph {
+                    id,
+                    shown: None,
+                    after,
+                    said_waiting: false,
+                    next: Instant::now(),
+                });
                 Ok(())
             }
             "link" | "packets" | "packet" | "pcap" => {
-                let Some(link) = link_id(&req) else { return self.reply(id, &error("the request needs a link, such as \"e5\"")) };
+                let Some(link) = link_id(&req) else {
+                    return self.reply(id, &error("the request needs a link, such as \"e5\""));
+                };
                 let watch = match (op, &graph) {
                     ("packets", Some(g)) => super::watch(g, link).map(|(w, s)| (w, Some(s))),
-                    ("packet" | "pcap", Some(g)) => super::existing_watch(g, link).map(|w| (w, None)),
+                    ("packet" | "pcap", Some(g)) => {
+                        super::existing_watch(g, link).map(|w| (w, None))
+                    }
                     _ => None,
                 };
                 match op {
@@ -214,23 +264,43 @@ impl Session {
                             return self.reply(id, &error("no such link"));
                         };
                         let after = req.get("after").and_then(Scalar::as_u64).unwrap_or(0);
-                        self.send(id, event("link", &watch.describe()).as_bytes(), false, false)?;
-                        let Some(g) = watch.graph() else { return self.reply(id, &error("no such link")) };
+                        self.send(
+                            id,
+                            event("link", &watch.describe()).as_bytes(),
+                            false,
+                            false,
+                        )?;
+                        let Some(g) = watch.graph() else {
+                            return self.reply(id, &error("no such link"));
+                        };
                         let held = (subscription, Viewer::new(g));
-                        self.subs.push(Sub::Packets { id, watch, cursor: after, _held: held, next: Instant::now() });
+                        self.subs.push(Sub::Packets {
+                            id,
+                            watch,
+                            cursor: after,
+                            _held: held,
+                            next: Instant::now(),
+                        });
                         Ok(())
                     }
                     "packet" => {
-                        let Some((watch, _)) = watch else { return self.reply(id, &error("nothing is watching that link")) };
+                        let Some((watch, _)) = watch else {
+                            return self.reply(id, &error("nothing is watching that link"));
+                        };
                         watch.pump();
-                        let detail = req.get("seq").and_then(Scalar::as_u64).and_then(|seq| watch.detail(seq));
+                        let detail = req
+                            .get("seq")
+                            .and_then(Scalar::as_u64)
+                            .and_then(|seq| watch.detail(seq));
                         match detail {
                             Some(d) => self.reply(id, &d),
                             None => self.reply(id, &error("that packet is not kept")),
                         }
                     }
                     _ => {
-                        let Some((watch, _)) = watch else { return self.reply(id, &error("nothing is watching that link")) };
+                        let Some((watch, _)) = watch else {
+                            return self.reply(id, &error("nothing is watching that link"));
+                        };
                         watch.pump();
                         self.send(id, &watch.pcapng(), true, true)
                     }
@@ -238,7 +308,10 @@ impl Session {
             }
             "cancel" => {
                 // An id past what a request id can be names no subscription.
-                let target = req.get("id").and_then(Scalar::as_u64).and_then(|n| u32::try_from(n).ok());
+                let target = req
+                    .get("id")
+                    .and_then(Scalar::as_u64)
+                    .and_then(|n| u32::try_from(n).ok());
                 match self.subs.iter().position(|s| Some(s.id()) == target) {
                     Some(i) => {
                         let sub = self.subs.remove(i);
@@ -259,7 +332,13 @@ impl Session {
         let mut out: Vec<(u32, String, bool)> = Vec::new();
         for sub in &mut self.subs {
             match sub {
-                Sub::Graph { id, shown, after, said_waiting, next } => {
+                Sub::Graph {
+                    id,
+                    shown,
+                    after,
+                    said_waiting,
+                    next,
+                } => {
                     if *next > now {
                         continue;
                     }
@@ -278,7 +357,11 @@ impl Session {
                                 out.push((*id, event(name, &data), false));
                             }
                             if view.ended() {
-                                out.push((*id, event("end", r#"{"reason":"the world ended"}"#), true));
+                                out.push((
+                                    *id,
+                                    event("end", r#"{"reason":"the world ended"}"#),
+                                    true,
+                                ));
                                 ended.push(*id);
                             }
                         }
@@ -288,14 +371,24 @@ impl Session {
                             *after = after.map(|_| 0);
                             out.push((*id, event(name, &data), false));
                             if view.ended() {
-                                out.push((*id, event("end", r#"{"reason":"the world ended"}"#), true));
+                                out.push((
+                                    *id,
+                                    event("end", r#"{"reason":"the world ended"}"#),
+                                    true,
+                                ));
                                 ended.push(*id);
                             }
                             *shown = Some((generation, view, Viewer::new(graph)));
                         }
                     }
                 }
-                Sub::Packets { id, watch, cursor, next, .. } => {
+                Sub::Packets {
+                    id,
+                    watch,
+                    cursor,
+                    next,
+                    ..
+                } => {
                     if *next > now {
                         continue;
                     }
@@ -314,7 +407,9 @@ impl Session {
         }
         // Ended subscriptions let go of the world only once their end is
         // sent: a world that is exiting waits for that (see `Listening`).
-        let (finished, kept) = std::mem::take(&mut self.subs).into_iter().partition(|s| ended.contains(&s.id()));
+        let (finished, kept) = std::mem::take(&mut self.subs)
+            .into_iter()
+            .partition(|s| ended.contains(&s.id()));
         let finished: Vec<Sub> = finished;
         self.subs = kept;
         for (id, value, end) in out {
@@ -335,13 +430,27 @@ fn current(attacher: &Attacher) -> (Option<Arc<Graph>>, u64) {
 
 /// The `world` reply: what this world is, and whether it runs.
 fn world(graph: Option<&Graph>) -> String {
-    let o = Object::new().num("observe", relay::OBSERVE_VERSION).str("fictionet", env!("CARGO_PKG_VERSION"));
+    let o = Object::new()
+        .num("observe", relay::OBSERVE_VERSION)
+        .str("fictionet", env!("CARGO_PKG_VERSION"));
     match graph {
-        None => o.bool("running", false).bool("ended", false).raw("started", "null").raw("t", "null").done(),
+        None => o
+            .bool("running", false)
+            .bool("ended", false)
+            .raw("started", "null")
+            .raw("t", "null")
+            .done(),
         Some(g) => {
             let ended = g.state().ended;
-            let started = g.start_wall.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
-            o.bool("running", !ended).bool("ended", ended).num("started", started).secs("t", g.start.elapsed()).done()
+            let started = g
+                .start_wall
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            o.bool("running", !ended)
+                .bool("ended", ended)
+                .num("started", started)
+                .secs("t", g.start.elapsed())
+                .done()
         }
     }
 }
@@ -357,18 +466,34 @@ mod tests {
     fn an_out_of_range_cancel_cancels_nothing() {
         let mut fds = [0; 2];
         // SAFETY: socketpair fills two fds, owned from here.
-        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) }, 0);
-        let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let (ours, theirs) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         let (attacher, _attachments) = crate::attachments();
-        let mut session = Session { attacher, fd: ours, subs: Vec::new() };
-        session.handle(1, json::parse_flat(r#"{"op":"watch"}"#)).unwrap();
-        session.handle(2, json::parse_flat(r#"{"op":"cancel","id":4294967297}"#)).unwrap();
+        let mut session = Session {
+            attacher,
+            fd: ours,
+            subs: Vec::new(),
+        };
+        session
+            .handle(1, json::parse_flat(r#"{"op":"watch"}"#))
+            .unwrap();
+        session
+            .handle(2, json::parse_flat(r#"{"op":"cancel","id":4294967297}"#))
+            .unwrap();
         assert_eq!(session.subs.len(), 1);
         let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
         let n = unix::recv(theirs.as_raw_fd(), &mut buf, false).unwrap();
-        let Ok(Message::Reply { id, body, .. }) = relay::decode(&buf[..n]) else { panic!("not a reply") };
+        let Ok(Message::Reply { id, body, .. }) = relay::decode(&buf[..n]) else {
+            panic!("not a reply")
+        };
         assert_eq!((id, body), (2, &br#"{"error":"no such subscription"}"#[..]));
-        session.handle(3, json::parse_flat(r#"{"op":"cancel","id":1}"#)).unwrap();
+        session
+            .handle(3, json::parse_flat(r#"{"op":"cancel","id":1}"#))
+            .unwrap();
         assert!(session.subs.is_empty());
     }
 
@@ -378,12 +503,20 @@ mod tests {
     fn long_values_are_chunked() {
         let mut fds = [0; 2];
         // SAFETY: socketpair fills two fds, owned from here.
-        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) }, 0);
-        let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let (ours, theirs) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         unix::raise_buffers(ours.as_raw_fd());
         unix::raise_buffers(theirs.as_raw_fd());
         let (attacher, _attachments) = crate::attachments();
-        let session = Session { attacher, fd: ours, subs: Vec::new() };
+        let session = Session {
+            attacher,
+            fd: ours,
+            subs: Vec::new(),
+        };
         let value: Vec<u8> = (0..150_000u32).map(|i| i as u8).collect();
         session.send(9, &value, true, true).unwrap();
         let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
@@ -392,7 +525,9 @@ mod tests {
         loop {
             let n = unix::recv(theirs.as_raw_fd(), &mut buf, false).unwrap();
             assert!(n <= relay::MAX_MESSAGE);
-            let Ok(Message::Reply { id, flags, body }) = relay::decode(&buf[..n]) else { panic!("not a reply") };
+            let Ok(Message::Reply { id, flags, body }) = relay::decode(&buf[..n]) else {
+                panic!("not a reply")
+            };
             assert_eq!(id, 9);
             got.extend_from_slice(body);
             flags_seen.push(flags);
@@ -402,6 +537,9 @@ mod tests {
         }
         assert_eq!(got, value);
         let b = relay::BINARY;
-        assert_eq!(flags_seen, [b | relay::MORE, b | relay::MORE, b | relay::END]);
+        assert_eq!(
+            flags_seen,
+            [b | relay::MORE, b | relay::MORE, b | relay::END]
+        );
     }
 }

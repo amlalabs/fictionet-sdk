@@ -63,12 +63,12 @@
 //! assert_eq!(dn.to_text().unwrap(), "uid=jdoe,dc=example,dc=com");
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::asn1::{self, Class, Element, Length, Reader, Rules, Tag};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::ascii::{hex_lower, hex_value as hex_digit};
-use fictionet::stdlib::asn1::{self, Class, Element, Length, Reader, Rules, Tag};
-use fictionet::stdlib::codec::{Wire};
 use std::fmt;
 
 /// The port LDAP servers listen on, over TCP, and CLDAP over UDP.
@@ -2478,10 +2478,14 @@ impl Prefixed for Message {
     const NAME: &'static str = "LDAP";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_MESSAGE }
+    fn default_limit() -> Self::Limit {
+        MAX_MESSAGE
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_MESSAGE) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_MESSAGE)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -2490,7 +2494,10 @@ impl Prefixed for Message {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         let header = match asn1::Header::parse(input, Rules::Ber) {
             Ok(header) => header,
@@ -2515,7 +2522,6 @@ impl Prefixed for Message {
     }
 }
 
-
 /// The whole length a header at the start of `b` declares: the header and
 /// the contents. It is for a header [`asn1::Header::parse`] found too long,
 /// so its length octets are all in `b`.
@@ -2537,12 +2543,10 @@ fn declared_total(b: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
     fn msg(id: u32, op: Op) -> Message {
@@ -2554,7 +2558,7 @@ mod tests {
     }
 
     /// Pushes bytes that fit.
-    fn put(d: &mut Stream<Frames::<Message>>, b: &[u8]) {
+    fn put(d: &mut Stream<Frames<Message>>, b: &[u8]) {
         assert_eq!(d.push(b), b.len());
     }
 
@@ -3661,27 +3665,26 @@ mod tests {
 
     #[test]
     fn decoder_takes_many_small_messages_in_linear_time() {
-        assert_linear("decoder_takes_many_small_messages_in_linear_time", rounds(50_000), |size| {
-            let one = msg(1, Op::UnbindRequest).to_bytes().unwrap();
-            let stream: Vec<u8> = one
-                .iter()
-                .copied()
-                .cycle()
-                .take(one.len() * size)
-                .collect();
-            let mut d = Stream::new(Frames::<Message>::new());
-            let mut rest = &stream[..];
-            let mut n = 0;
-            while !rest.is_empty() {
-                rest = &rest[d.push(rest)..];
-                while let Some(m) = d.next() {
-                    m.unwrap();
-                    n += 1;
+        assert_linear(
+            "decoder_takes_many_small_messages_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let one = msg(1, Op::UnbindRequest).to_bytes().unwrap();
+                let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
+                let mut d = Stream::new(Frames::<Message>::new());
+                let mut rest = &stream[..];
+                let mut n = 0;
+                while !rest.is_empty() {
+                    rest = &rest[d.push(rest)..];
+                    while let Some(m) = d.next() {
+                        m.unwrap();
+                        n += 1;
+                    }
                 }
-            }
-            assert_eq!(n, size);
-            assert_eq!(d.buffered(), 0);
-        });
+                assert_eq!(n, size);
+                assert_eq!(d.buffered(), 0);
+            },
+        );
     }
 
     #[test]
@@ -3951,7 +3954,12 @@ mod tests {
 
     fn attribute_name(g: &mut Lcg) -> String {
         const NAMES: &[&str] = &[
-            "cn", "objectClass", "o", "1.2.840.113549.1.9.1", "cn;lang-en", "x-y",
+            "cn",
+            "objectClass",
+            "o",
+            "1.2.840.113549.1.9.1",
+            "cn;lang-en",
+            "x-y",
         ];
         NAMES[g.index(NAMES.len())].to_string()
     }
@@ -4209,8 +4217,7 @@ mod tests {
             .map(|_| {
                 Rdn((0..1 + g.below(2))
                     .map(|_| {
-                        let attribute =
-                            ["cn", "O", "2.5.4.3", "x-1"][g.index(4)].to_string();
+                        let attribute = ["cn", "O", "2.5.4.3", "x-1"][g.index(4)].to_string();
                         let value = if g.below(4) == 0 {
                             AttributeValue::Ber(nonempty_bytes(g, 4))
                         } else {
@@ -4289,9 +4296,7 @@ mod tests {
             // Text made of the characters filters and DNs use.
             const T: &[u8] = b"()&|!=*~<>:\\0123456789abcdefABCDEFdnDN.;-, +#\"cnou";
             let n = g.index(30);
-            let text: String = (0..n)
-                .map(|_| char::from(T[g.index(T.len())]))
-                .collect();
+            let text: String = (0..n).map(|_| char::from(T[g.index(T.len())])).collect();
             check_text(&text);
             let mut tf = f.to_text().unwrap().into_bytes();
             if !tf.is_empty() {
@@ -4322,9 +4327,16 @@ mod tests {
         .unwrap();
         for limit in 0..=16 {
             assert_eq!(Frames::<Message>::with_limit(limit).capacity(), 16);
-            contract::check_decode_with_alloc_limit(|| Frames::<Message>::with_limit(limit), &bytes, 2 * Frames::<Message>::with_limit(limit).capacity());
+            contract::check_decode_with_alloc_limit(
+                || Frames::<Message>::with_limit(limit),
+                &bytes,
+                2 * Frames::<Message>::with_limit(limit).capacity(),
+            );
         }
-        assert_eq!(Frames::<Message>::with_limit(usize::MAX).limit(), MAX_MESSAGE);
+        assert_eq!(
+            Frames::<Message>::with_limit(usize::MAX).limit(),
+            MAX_MESSAGE
+        );
         let mut stream = Stream::new(Frames::<Message>::new());
         assert_eq!(stream.push(&[0x30, 0x80]), 2);
         assert_eq!(
@@ -4337,7 +4349,7 @@ mod tests {
 
     #[test]
     fn codec_message_writer_rolls_back() {
-        use fictionet::stdlib::codec::{Wire};
+        use fictionet::stdlib::codec::Wire;
         use fictionet::stdlib::test_support::contract;
         let mut message = Message {
             id: 1,

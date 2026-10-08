@@ -1,12 +1,12 @@
 //! Document entries, schema/instance pairs, formats, dependencies, and examples.
 #![no_main]
 
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::json::{self, Value};
 use fictionet::stdlib::json_schema::{
     CompileErrorKind, Dialect, ErrorMode, FormatPolicy, GenerationLimits, Limits, Options,
     PatternPolicy, Schema,
 };
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: &[u8]| {

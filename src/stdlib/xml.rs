@@ -164,7 +164,10 @@ impl Start {
     /// The value of the attribute `local` in `namespace`, if the tag has
     /// one.
     pub fn attribute(&self, namespace: Option<&str>, local: &str) -> Option<&str> {
-        self.attributes.iter().find(|a| a.name.is(namespace, local)).map(|a| a.value.as_str())
+        self.attributes
+            .iter()
+            .find(|a| a.name.is(namespace, local))
+            .map(|a| a.value.as_str())
     }
 }
 
@@ -607,16 +610,22 @@ fn token_kind(rest: &[u8]) -> Option<Result<Kind, ErrorKind>> {
         b'?' => Some(Ok(Kind::Pi)),
         b'!' => {
             let mut waiting = false;
-            for (pat, kind) in
-                [(&b"<!--"[..], Kind::Comment), (b"<![CDATA[", Kind::CData), (b"<!DOCTYPE", Kind::Doctype)]
-            {
+            for (pat, kind) in [
+                (&b"<!--"[..], Kind::Comment),
+                (b"<![CDATA[", Kind::CData),
+                (b"<!DOCTYPE", Kind::Doctype),
+            ] {
                 match prefix_state(rest, pat) {
                     Some(true) => return Some(Ok(kind)),
                     None => waiting = true,
                     Some(false) => {}
                 }
             }
-            if waiting { None } else { Some(Err(ErrorKind::BadSyntax)) }
+            if waiting {
+                None
+            } else {
+                Some(Err(ErrorKind::BadSyntax))
+            }
         }
         _ => Some(Ok(Kind::StartTag)),
     }
@@ -625,9 +634,17 @@ fn token_kind(rest: &[u8]) -> Option<Result<Kind, ErrorKind>> {
 /// The length of the token of `kind` at the start of `rest`, or `None` if
 /// its end has not come. Text ends at the next `<`, or at the end of the
 /// input once it has finished.
-fn find_end(rest: &[u8], kind: Kind, s: &mut Scan, finished: bool) -> Result<Option<usize>, ErrorKind> {
+fn find_end(
+    rest: &[u8],
+    kind: Kind,
+    s: &mut Scan,
+    finished: bool,
+) -> Result<Option<usize>, ErrorKind> {
     match kind {
-        Kind::Text => match rest.get(s.pos..).and_then(|r| r.iter().position(|&b| b == b'<')) {
+        Kind::Text => match rest
+            .get(s.pos..)
+            .and_then(|r| r.iter().position(|&b| b == b'<'))
+        {
             Some(i) => Ok(Some(s.pos + i)),
             None => {
                 s.pos = rest.len();
@@ -664,7 +681,9 @@ fn find_end(rest: &[u8], kind: Kind, s: &mut Scan, finished: bool) -> Result<Opt
 /// Finds `pat` at or after `from`, starting where the last search stopped.
 fn find_pattern(rest: &[u8], pat: &[u8], from: usize, s: &mut Scan) -> Option<usize> {
     let begin = from.max(s.pos.saturating_sub(pat.len() - 1));
-    let found = rest.get(begin..).and_then(|r| r.windows(pat.len()).position(|w| w == pat));
+    let found = rest
+        .get(begin..)
+        .and_then(|r| r.windows(pat.len()).position(|w| w == pat));
     match found {
         Some(i) => Some(begin + i + pat.len()),
         None => {
@@ -781,7 +800,9 @@ fn read_token(doc: &mut Doc, kind: Kind, tok: &str) -> Result<Option<Event>, Err
             let (name, attlists) = read_doctype(&tok[9..tok.len() - 1])?;
             doc.doctype()?;
             doc.attlists = attlists;
-            Ok(Some(Event::Doctype { name: name.to_string() }))
+            Ok(Some(Event::Doctype {
+                name: name.to_string(),
+            }))
         }
         Kind::EndTag => {
             let mut c = Cur::new(&tok[2..tok.len() - 1]);
@@ -856,11 +877,19 @@ struct AttList {
 }
 
 fn need_ws(c: &mut Cur<'_>) -> Result<(), ErrorKind> {
-    if c.ws() { Ok(()) } else { Err(ErrorKind::BadSyntax) }
+    if c.ws() {
+        Ok(())
+    } else {
+        Err(ErrorKind::BadSyntax)
+    }
 }
 
 fn need(c: &mut Cur<'_>, p: &str) -> Result<(), ErrorKind> {
-    if c.eat(p) { Ok(()) } else { Err(ErrorKind::BadSyntax) }
+    if c.eat(p) {
+        Ok(())
+    } else {
+        Err(ErrorKind::BadSyntax)
+    }
 }
 
 /// Reads a name that must be a QName: element and attribute names.
@@ -873,7 +902,11 @@ fn qname_at<'a>(c: &mut Cur<'a>) -> Result<&'a str, ErrorKind> {
 /// Reads a name that may hold no colon: entity and notation names.
 fn ncname_at<'a>(c: &mut Cur<'a>) -> Result<&'a str, ErrorKind> {
     let n = c.name()?;
-    if is_ncname(n) { Ok(n) } else { Err(ErrorKind::BadName) }
+    if is_ncname(n) {
+        Ok(n)
+    } else {
+        Err(ErrorKind::BadName)
+    }
 }
 
 /// Reads an external identifier: `SYSTEM` and a literal, or `PUBLIC` and a
@@ -914,7 +947,11 @@ fn read_subset(c: &mut Cur<'_>) -> Result<BTreeMap<String, AttList>, ErrorKind> 
         c.ws();
         if c.eat("]") {
             c.ws();
-            return if c.at_end() { Ok(lists) } else { Err(ErrorKind::BadSyntax) };
+            return if c.at_end() {
+                Ok(lists)
+            } else {
+                Err(ErrorKind::BadSyntax)
+            };
         }
         if c.eat("<!--") {
             let r = c.rest();
@@ -1076,7 +1113,11 @@ fn attlist_decl(c: &mut Cur<'_>, lists: &mut BTreeMap<String, AttList>) -> Resul
                 need_ws(c)?;
             }
             let value = decode(c.quoted()?, true)?;
-            Some(if tokenized { collapse_spaces(&value) } else { value })
+            Some(if tokenized {
+                collapse_spaces(&value)
+            } else {
+                value
+            })
         };
         if list.types.contains_key(name) {
             continue;
@@ -1199,7 +1240,10 @@ fn read_pi(doc: &mut Doc, inner: &str) -> Result<Event, ErrorKind> {
         return Err(ErrorKind::BadSyntax);
     };
     doc.misc();
-    Ok(Event::Pi { target: target.to_string(), data: normalize(data) })
+    Ok(Event::Pi {
+        target: target.to_string(),
+        data: normalize(data),
+    })
 }
 
 fn check_pi_target(target: &str) -> Result<(), ErrorKind> {
@@ -1244,7 +1288,11 @@ fn read_declaration(doc: &mut Doc, mut c: Cur<'_>) -> Result<Event, ErrorKind> {
         return Err(ErrorKind::BadDeclaration);
     }
     doc.decl()?;
-    Ok(Event::Declaration { version: version.to_string(), encoding, standalone })
+    Ok(Event::Declaration {
+        version: version.to_string(),
+        encoding,
+        standalone,
+    })
 }
 
 fn check_version(v: &str) -> Result<(), ErrorKind> {
@@ -1324,7 +1372,9 @@ fn resolve(r: &str) -> Result<char, ErrorKind> {
             }
         };
     };
-    char::from_u32(code).filter(|&c| is_xml_char(c)).ok_or(ErrorKind::BadReference)
+    char::from_u32(code)
+        .filter(|&c| is_xml_char(c))
+        .ok_or(ErrorKind::BadReference)
 }
 
 fn number(digits: &str, radix: u32) -> Result<u32, ErrorKind> {
@@ -1334,7 +1384,10 @@ fn number(digits: &str, radix: u32) -> Result<u32, ErrorKind> {
     let mut n: u32 = 0;
     for ch in digits.chars() {
         let d = ch.to_digit(radix).ok_or(ErrorKind::BadReference)?;
-        n = n.checked_mul(radix).and_then(|n| n.checked_add(d)).ok_or(ErrorKind::BadReference)?;
+        n = n
+            .checked_mul(radix)
+            .and_then(|n| n.checked_add(d))
+            .ok_or(ErrorKind::BadReference)?;
     }
     Ok(n)
 }
@@ -1365,7 +1418,8 @@ fn is_name_start(c: char) -> bool {
 }
 
 fn is_name_char(c: char) -> bool {
-    is_name_start(c) || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
+    is_name_start(c)
+        || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
 }
 
 /// Whether `s` is a name with no colon (an NCName).
@@ -1431,7 +1485,11 @@ impl<'a> Cur<'a> {
         let r = self.rest();
         let mut end = 0;
         for (k, c) in r.char_indices() {
-            let ok = if k == 0 { is_name_start(c) } else { is_name_char(c) };
+            let ok = if k == 0 {
+                is_name_start(c)
+            } else {
+                is_name_char(c)
+            };
             if !ok {
                 break;
             }
@@ -1605,8 +1663,11 @@ impl Doc {
             *n = n.saturating_add(1);
             return shared.clone();
         }
-        let shared =
-            hints.iter().find(|h| h.len() == uri.len() && ***h == *uri).cloned().unwrap_or_else(|| Arc::from(uri));
+        let shared = hints
+            .iter()
+            .find(|h| h.len() == uri.len() && ***h == *uri)
+            .cloned()
+            .unwrap_or_else(|| Arc::from(uri));
         self.interned.insert(shared.clone(), (shared.clone(), 1));
         self.state_held = self.state_held.saturating_add(uri.len());
         shared
@@ -1655,7 +1716,12 @@ impl Doc {
     /// Opens an element. Attribute defaults the DTD declares for it are
     /// added after the attributes written, and values of a tokenized type
     /// are normalized. `hints` are URIs a writer was given, to share.
-    fn start(&mut self, qname: &str, mut attrs: Vec<(String, String)>, hints: &[Arc<str>]) -> Result<Start, ErrorKind> {
+    fn start(
+        &mut self,
+        qname: &str,
+        mut attrs: Vec<(String, String)>,
+        hints: &[Arc<str>],
+    ) -> Result<Start, ErrorKind> {
         if self.stack.is_empty() && self.root_seen {
             return Err(ErrorKind::OutsideRoot);
         }
@@ -1784,7 +1850,11 @@ impl Doc {
     ) -> Result<Start, ErrorKind> {
         let element_ns = match prefix {
             Some("xml") => Some(self.xml_ns.clone()),
-            Some(p) => Some(self.lookup(Some(p)).ok_or(ErrorKind::UndeclaredPrefix)?.clone()),
+            Some(p) => Some(
+                self.lookup(Some(p))
+                    .ok_or(ErrorKind::UndeclaredPrefix)?
+                    .clone(),
+            ),
             None => self.lookup(None).filter(|u| !u.is_empty()).cloned(),
         };
         let mut attributes = Vec::with_capacity(attrs.len());
@@ -1793,7 +1863,11 @@ impl Doc {
             let namespace = match (p, l) {
                 (Some("xmlns"), _) | (None, "xmlns") => Some(self.xmlns_ns.clone()),
                 (Some("xml"), _) => Some(self.xml_ns.clone()),
-                (Some(p), _) => Some(self.lookup(Some(p)).ok_or(ErrorKind::UndeclaredPrefix)?.clone()),
+                (Some(p), _) => Some(
+                    self.lookup(Some(p))
+                        .ok_or(ErrorKind::UndeclaredPrefix)?
+                        .clone(),
+                ),
                 (None, _) => None,
             };
             // Interned URIs are equal exactly when they are the same copy,
@@ -1804,10 +1878,21 @@ impl Doc {
             {
                 return Err(ErrorKind::DuplicateAttribute);
             }
-            let name = Name { prefix: p.map(String::from), local: l.to_string(), namespace };
-            attributes.push(Attribute { name, value: v.clone() });
+            let name = Name {
+                prefix: p.map(String::from),
+                local: l.to_string(),
+                namespace,
+            };
+            attributes.push(Attribute {
+                name,
+                value: v.clone(),
+            });
         }
-        let name = Name { prefix: prefix.map(String::from), local: local.to_string(), namespace: element_ns };
+        let name = Name {
+            prefix: prefix.map(String::from),
+            local: local.to_string(),
+            namespace: element_ns,
+        };
         Ok(Start { name, attributes })
     }
 
@@ -1823,7 +1908,11 @@ impl Doc {
     }
 
     fn finish(&self) -> Result<(), ErrorKind> {
-        if !self.stack.is_empty() || !self.root_seen { Err(ErrorKind::UnexpectedEnd) } else { Ok(()) }
+        if !self.stack.is_empty() || !self.root_seen {
+            Err(ErrorKind::UnexpectedEnd)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1862,7 +1951,9 @@ impl Builder {
     /// Returns the document. Refuses a missing root or any unclosed element.
     pub fn build(self) -> Result<Document, ErrorKind> {
         self.doc.finish()?;
-        Ok(Document { data: self.out.into_bytes() })
+        Ok(Document {
+            data: self.out.into_bytes(),
+        })
     }
 
     /// How many more bytes may be written, keeping room for the end tags.
@@ -1871,7 +1962,11 @@ impl Builder {
     }
 
     fn room(&self, len: usize) -> Result<(), ErrorKind> {
-        if len <= self.left() { Ok(()) } else { Err(ErrorKind::TooLarge) }
+        if len <= self.left() {
+            Ok(())
+        } else {
+            Err(ErrorKind::TooLarge)
+        }
     }
 
     /// Writes `<?xml version="1.0" encoding="UTF-8"?>`. It must come first.
@@ -1885,7 +1980,12 @@ impl Builder {
         encoding: Option<&str>,
         standalone: Option<bool>,
     ) -> Result<(), ErrorKind> {
-        self.room(version.len().saturating_add(encoding.map_or(0, str::len)).saturating_add(64))?;
+        self.room(
+            version
+                .len()
+                .saturating_add(encoding.map_or(0, str::len))
+                .saturating_add(64),
+        )?;
         check_version(version)?;
         let mut piece = format!("<?xml version=\"{version}\"");
         if let Some(e) = encoding {
@@ -1893,7 +1993,11 @@ impl Builder {
             piece.push_str(&format!(" encoding=\"{e}\""));
         }
         if let Some(s) = standalone {
-            piece.push_str(if s { " standalone=\"yes\"" } else { " standalone=\"no\"" });
+            piece.push_str(if s {
+                " standalone=\"yes\""
+            } else {
+                " standalone=\"no\""
+            });
         }
         piece.push_str("?>");
         self.room(piece.len())?;
@@ -1963,7 +2067,10 @@ impl Builder {
         if piece.len() > limit {
             return Err(ErrorKind::TooLarge);
         }
-        let attrs = attributes.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+        let attrs = attributes
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
         let (started, root_seen) = (self.doc.started, self.doc.root_seen);
         let mut hints: Vec<Arc<str>> = Vec::new();
         if let Some(e) = expect {
@@ -1992,7 +2099,13 @@ impl Builder {
     /// Closes the element opened last. Its end tag always fits, since the
     /// room for it was kept when the element was opened.
     pub fn end(&mut self) -> Result<(), ErrorKind> {
-        let qname = self.doc.stack.last().ok_or(ErrorKind::OutsideRoot)?.qname.clone();
+        let qname = self
+            .doc
+            .stack
+            .last()
+            .ok_or(ErrorKind::OutsideRoot)?
+            .qname
+            .clone();
         let piece = format!("</{qname}>");
         self.doc.end(&qname)?;
         self.closing = self.closing.saturating_sub(piece.len());
@@ -2083,21 +2196,32 @@ impl Builder {
     /// in another namespace.
     pub fn event(&mut self, event: &Event) -> Result<(), ErrorKind> {
         match event {
-            Event::Declaration { version, encoding, standalone } => {
-                self.write_declaration(version, encoding.as_deref(), *standalone)
-            }
+            Event::Declaration {
+                version,
+                encoding,
+                standalone,
+            } => self.write_declaration(version, encoding.as_deref(), *standalone),
             Event::Doctype { name } => self.doctype(name),
             Event::Start(s) => {
                 if s.attributes.len() > MAX_ATTRIBUTES {
                     return Err(ErrorKind::TooManyAttributes);
                 }
-                let qlen = |n: &Name| n.prefix.as_ref().map_or(0, |p| p.len() + 1).saturating_add(n.local.len());
-                if qlen(&s.name) > MAX_NAME || s.attributes.iter().any(|a| qlen(&a.name) > MAX_NAME) {
+                let qlen = |n: &Name| {
+                    n.prefix
+                        .as_ref()
+                        .map_or(0, |p| p.len() + 1)
+                        .saturating_add(n.local.len())
+                };
+                if qlen(&s.name) > MAX_NAME || s.attributes.iter().any(|a| qlen(&a.name) > MAX_NAME)
+                {
                     return Err(ErrorKind::NameTooLong);
                 }
                 let names: Vec<String> = s.attributes.iter().map(|a| a.name.qname()).collect();
-                let attrs: Vec<(&str, &str)> =
-                    names.iter().zip(&s.attributes).map(|(n, a)| (n.as_str(), a.value.as_str())).collect();
+                let attrs: Vec<(&str, &str)> = names
+                    .iter()
+                    .zip(&s.attributes)
+                    .map(|(n, a)| (n.as_str(), a.value.as_str()))
+                    .collect();
                 self.write_start(&s.name.qname(), &attrs, false, Some(s))
             }
             Event::End(name) => {
@@ -2139,7 +2263,11 @@ fn same_names(got: &Start, want: &Start) -> bool {
 }
 
 fn check_chars(s: &str) -> Result<(), ErrorKind> {
-    if s.chars().all(is_xml_char) { Ok(()) } else { Err(ErrorKind::InvalidChar) }
+    if s.chars().all(is_xml_char) {
+        Ok(())
+    } else {
+        Err(ErrorKind::InvalidChar)
+    }
 }
 
 /// Appends `s` escaped for text, or for a double-quoted attribute value.
@@ -2162,18 +2290,20 @@ fn escape(out: &mut String, s: &str, attr: bool, limit: usize) -> Result<(), Err
             _ => return Err(ErrorKind::InvalidChar),
         }
     }
-    if out.len() > limit { Err(ErrorKind::TooLarge) } else { Ok(()) }
+    if out.len() > limit {
+        Err(ErrorKind::TooLarge)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::codec::{
-        Lcg,
-    };
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn built_text(builder: Builder) -> Result<String, ErrorKind> {
@@ -2305,11 +2435,18 @@ mod tests {
     }
 
     fn name(local: &str) -> Name {
-        Name { prefix: None, local: local.into(), namespace: None }
+        Name {
+            prefix: None,
+            local: local.into(),
+            namespace: None,
+        }
     }
 
     fn start(local: &str) -> Event {
-        Event::Start(Start { name: name(local), attributes: vec![] })
+        Event::Start(Start {
+            name: name(local),
+            attributes: vec![],
+        })
     }
 
     // Examples from XML 1.0, Fifth Edition.
@@ -2322,8 +2459,14 @@ mod tests {
         assert_eq!(
             events,
             [
-                Event::Declaration { version: "1.0".into(), encoding: None, standalone: None },
-                Event::Doctype { name: "greeting".into() },
+                Event::Declaration {
+                    version: "1.0".into(),
+                    encoding: None,
+                    standalone: None
+                },
+                Event::Doctype {
+                    name: "greeting".into()
+                },
                 start("greeting"),
                 Event::Text("Hello, world!".into()),
                 Event::End(name("greeting")),
@@ -2332,7 +2475,12 @@ mod tests {
         // The same with an internal subset, which is skipped.
         let doc = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<!DOCTYPE greeting [\n  <!ELEMENT greeting (#PCDATA)>\n  <!-- a ] in a comment -->\n  <?pi ]> ?>\n  <!ATTLIST greeting a CDATA \"]>\">\n]>\n<greeting>Hello, world!</greeting>";
         let events = read_events(doc.as_bytes()).unwrap();
-        assert_eq!(events[1], Event::Doctype { name: "greeting".into() });
+        assert_eq!(
+            events[1],
+            Event::Doctype {
+                name: "greeting".into()
+            }
+        );
         assert_eq!(events[3], Event::Text("Hello, world!".into()));
         check(doc.as_bytes());
     }
@@ -2342,20 +2490,45 @@ mod tests {
         // Sections 2.5, 2.6 and 2.7.
         let doc = "<a><!-- declarations for <head> & <body> --><![CDATA[<greeting>Hello, world!</greeting>]]><?xml-stylesheet href=\"s.css\"?><?t?></a>";
         let events = read_events(doc.as_bytes()).unwrap();
-        assert_eq!(events[1], Event::Comment(" declarations for <head> & <body> ".into()));
-        assert_eq!(events[2], Event::CData("<greeting>Hello, world!</greeting>".into()));
-        assert_eq!(events[3], Event::Pi { target: "xml-stylesheet".into(), data: "href=\"s.css\"".into() });
-        assert_eq!(events[4], Event::Pi { target: "t".into(), data: String::new() });
-        assert_eq!(kind("<a><!-- B+, B, or B--->--></a>"), ErrorKind::BadComment);
+        assert_eq!(
+            events[1],
+            Event::Comment(" declarations for <head> & <body> ".into())
+        );
+        assert_eq!(
+            events[2],
+            Event::CData("<greeting>Hello, world!</greeting>".into())
+        );
+        assert_eq!(
+            events[3],
+            Event::Pi {
+                target: "xml-stylesheet".into(),
+                data: "href=\"s.css\"".into()
+            }
+        );
+        assert_eq!(
+            events[4],
+            Event::Pi {
+                target: "t".into(),
+                data: String::new()
+            }
+        );
+        assert_eq!(
+            kind("<a><!-- B+, B, or B--->--></a>"),
+            ErrorKind::BadComment
+        );
     }
 
     #[test]
     fn references_and_line_ends() {
-        let events = read_events(b"<a>&lt;&gt;&amp;&apos;&quot;&#38;&#x41;&#x1F600;\r\nx\ry</a>").unwrap();
+        let events =
+            read_events(b"<a>&lt;&gt;&amp;&apos;&quot;&#38;&#x41;&#x1F600;\r\nx\ry</a>").unwrap();
         assert_eq!(events[1], Event::Text("<>&'\"&A\u{1F600}\nx\ny".into()));
         // Section 3.3.3: attribute value normalization.
-        let events = read_events(b"<a b=\"&#xd;&#xd;A&#xa;&#xa;B&#xd;&#xa;\" c=\"\r\n\nxyz\tq\"/>").unwrap();
-        let Event::Start(s) = &events[0] else { panic!() };
+        let events =
+            read_events(b"<a b=\"&#xd;&#xd;A&#xa;&#xa;B&#xd;&#xa;\" c=\"\r\n\nxyz\tq\"/>").unwrap();
+        let Event::Start(s) = &events[0] else {
+            panic!()
+        };
         assert_eq!(s.attribute(None, "b"), Some("\r\rA\n\nB\r\n"));
         assert_eq!(s.attribute(None, "c"), Some("  xyz q"));
         assert_eq!(events[1], Event::End(name("a")));
@@ -2370,8 +2543,13 @@ mod tests {
     fn namespaces() {
         let doc = "<x xmlns:edi='http://ecommerce.example.org/schema'><lineItem edi:taxClass=\"exempt\">Baby food</lineItem></x>";
         let events = read_events(doc.as_bytes()).unwrap();
-        let Event::Start(s) = &events[1] else { panic!() };
-        assert_eq!(s.attribute(Some("http://ecommerce.example.org/schema"), "taxClass"), Some("exempt"));
+        let Event::Start(s) = &events[1] else {
+            panic!()
+        };
+        assert_eq!(
+            s.attribute(Some("http://ecommerce.example.org/schema"), "taxClass"),
+            Some("exempt")
+        );
         assert_eq!(s.name.namespace, None);
         // A default namespace, and undeclaring it.
         let doc = "<html xmlns='http://www.w3.org/1999/xhtml'><p/><q xmlns=''><r/></q></html>";
@@ -2391,10 +2569,15 @@ mod tests {
         assert!(read_events(ok.as_bytes()).is_ok());
         let bad = "<x xmlns:n1=\"http://www.w3.org\" xmlns:n2=\"http://www.w3.org\"><bad n1:a=\"1\" n2:a=\"2\"/></x>";
         assert_eq!(kind(bad), ErrorKind::DuplicateAttribute);
-        assert_eq!(kind("<x><bad a=\"1\" a=\"2\"/></x>"), ErrorKind::DuplicateAttribute);
+        assert_eq!(
+            kind("<x><bad a=\"1\" a=\"2\"/></x>"),
+            ErrorKind::DuplicateAttribute
+        );
         // The xml prefix is always bound.
         let events = read_events(b"<a xml:lang='en'/>").unwrap();
-        let Event::Start(s) = &events[0] else { panic!() };
+        let Event::Start(s) = &events[0] else {
+            panic!()
+        };
         assert_eq!(s.attribute(Some(XML_NAMESPACE), "lang"), Some("en"));
         assert!(read_events(b"<a xmlns:xml='http://www.w3.org/XML/1998/namespace'/>").is_ok());
     }
@@ -2409,7 +2592,10 @@ mod tests {
         assert_eq!(kind("<a>& b</a>"), ErrorKind::BadReference);
         assert_eq!(kind("<a>&nbsp;</a>"), ErrorKind::UnknownEntity);
         assert_eq!(kind("<a>&amp &amp;</a>"), ErrorKind::BadReference);
-        assert_eq!(kind(&format!("<a>&{};</a>", "e".repeat(MAX_NAME + 1))), ErrorKind::NameTooLong);
+        assert_eq!(
+            kind(&format!("<a>&{};</a>", "e".repeat(MAX_NAME + 1))),
+            ErrorKind::NameTooLong
+        );
         // Production [66] puts no bound on a character reference's digits.
         let zeros = format!("<a b='&#{0}65;'>&#x{0}41;</a>", "0".repeat(1000));
         let events = read_events(zeros.as_bytes()).unwrap();
@@ -2423,19 +2609,34 @@ mod tests {
         assert_eq!(kind("<a <b/>"), ErrorKind::BadSyntax);
         assert_eq!(kind("<!ELEMENT a><a/>"), ErrorKind::BadSyntax);
         assert_eq!(kind("<a></a >x"), ErrorKind::OutsideRoot);
-        assert_eq!(kind(" <?xml version='1.0'?><a/>"), ErrorKind::BadDeclaration);
+        assert_eq!(
+            kind(" <?xml version='1.0'?><a/>"),
+            ErrorKind::BadDeclaration
+        );
         assert_eq!(kind("<?xml version='2.0'?><a/>"), ErrorKind::BadDeclaration);
         assert_eq!(kind("<?xml?><a/>"), ErrorKind::BadDeclaration);
-        assert_eq!(kind("<?xml version='1.0' standalone='maybe'?><a/>"), ErrorKind::BadDeclaration);
-        assert_eq!(kind("<?xml version='1.0'encoding='UTF-8'?><a/>"), ErrorKind::BadDeclaration);
-        assert_eq!(kind("<?xml version='1.0' encoding='ISO-8859-1'?><a/>"), ErrorKind::UnsupportedEncoding);
+        assert_eq!(
+            kind("<?xml version='1.0' standalone='maybe'?><a/>"),
+            ErrorKind::BadDeclaration
+        );
+        assert_eq!(
+            kind("<?xml version='1.0'encoding='UTF-8'?><a/>"),
+            ErrorKind::BadDeclaration
+        );
+        assert_eq!(
+            kind("<?xml version='1.0' encoding='ISO-8859-1'?><a/>"),
+            ErrorKind::UnsupportedEncoding
+        );
         assert_eq!(kind("<a/><?xml version='1.0'?>"), ErrorKind::BadDeclaration);
         assert_eq!(kind("<a/><?Xml?>"), ErrorKind::ReservedPi);
         assert_eq!(kind("<?XML x?><a/>"), ErrorKind::ReservedPi);
         assert_eq!(kind("<?a:b?><a/>"), ErrorKind::BadName);
         assert_eq!(kind("<?ab#?><a/>"), ErrorKind::BadSyntax);
         assert_eq!(kind("<a/><!DOCTYPE a>"), ErrorKind::MisplacedDoctype);
-        assert_eq!(kind("<!DOCTYPE a><!DOCTYPE a><a/>"), ErrorKind::MisplacedDoctype);
+        assert_eq!(
+            kind("<!DOCTYPE a><!DOCTYPE a><a/>"),
+            ErrorKind::MisplacedDoctype
+        );
         assert_eq!(kind("<!DOCTYPE a [ ] x><a/>"), ErrorKind::BadSyntax);
         assert_eq!(kind("<a></b>"), ErrorKind::MismatchedEnd);
         assert_eq!(kind("</a>"), ErrorKind::OutsideRoot);
@@ -2447,16 +2648,29 @@ mod tests {
         assert_eq!(kind("<a xmlns:p=''/>"), ErrorKind::BadNamespace);
         assert_eq!(kind("<a xmlns:xmlns='u'/>"), ErrorKind::BadNamespace);
         assert_eq!(kind("<a xmlns:xml='u'/>"), ErrorKind::BadNamespace);
-        assert_eq!(kind("<a xmlns:p='http://www.w3.org/XML/1998/namespace'/>"), ErrorKind::BadNamespace);
-        assert_eq!(kind("<a xmlns='http://www.w3.org/2000/xmlns/'/>"), ErrorKind::BadNamespace);
+        assert_eq!(
+            kind("<a xmlns:p='http://www.w3.org/XML/1998/namespace'/>"),
+            ErrorKind::BadNamespace
+        );
+        assert_eq!(
+            kind("<a xmlns='http://www.w3.org/2000/xmlns/'/>"),
+            ErrorKind::BadNamespace
+        );
         assert_eq!(kind("<xmlns:a/>"), ErrorKind::BadNamespace);
         assert_eq!(kind(""), ErrorKind::UnexpectedEnd);
         assert_eq!(kind("<!-- only -->"), ErrorKind::UnexpectedEnd);
         assert_eq!(kind("<a>"), ErrorKind::UnexpectedEnd);
         assert_eq!(kind("<a><!-- x"), ErrorKind::UnexpectedEnd);
-        assert_eq!(kind(&format!("<{}/>", "a".repeat(MAX_NAME + 1))), ErrorKind::NameTooLong);
+        assert_eq!(
+            kind(&format!("<{}/>", "a".repeat(MAX_NAME + 1))),
+            ErrorKind::NameTooLong
+        );
         assert!(read_events(format!("<{}/>", "a".repeat(MAX_NAME)).as_bytes()).is_ok());
-        let deep = format!("{}{}", "<a>".repeat(MAX_DEPTH + 1), "</a>".repeat(MAX_DEPTH + 1));
+        let deep = format!(
+            "{}{}",
+            "<a>".repeat(MAX_DEPTH + 1),
+            "</a>".repeat(MAX_DEPTH + 1)
+        );
         assert_eq!(kind(&deep), ErrorKind::TooDeep);
         let deep = format!("{}{}", "<a>".repeat(MAX_DEPTH), "</a>".repeat(MAX_DEPTH));
         assert!(read_events(deep.as_bytes()).is_ok());
@@ -2466,9 +2680,18 @@ mod tests {
         let many = format!("{}{}", format!("<a{decls}>").repeat(6), "</a>".repeat(6));
         assert_eq!(kind(&many), ErrorKind::TooManyNamespaces);
         // Bytes that are not UTF-8.
-        assert_eq!(read_events(b"<a>\xff</a>").unwrap_err().kind, ErrorKind::InvalidUtf8);
+        assert_eq!(
+            read_events(b"<a>\xff</a>").unwrap_err().kind,
+            ErrorKind::InvalidUtf8
+        );
         // Offsets point at the token that broke.
-        assert_eq!(decode_all(Events::new, b"<a><b></c></a>").1, Some(Fail::Protocol(Error { kind: ErrorKind::MismatchedEnd, offset: 6 })));
+        assert_eq!(
+            decode_all(Events::new, b"<a><b></c></a>").1,
+            Some(Fail::Protocol(Error {
+                kind: ErrorKind::MismatchedEnd,
+                offset: 6
+            }))
+        );
     }
 
     #[test]
@@ -2477,7 +2700,9 @@ mod tests {
         let events = read_events(b"<!DOCTYPE a[<!ELEMENT a ANY>]><a/>").unwrap();
         assert_eq!(events[0], Event::Doctype { name: "a".into() });
         assert!(read_events(b"<!DOCTYPE a SYSTEM 'a.dtd'[]><a/>").is_ok());
-        assert!(read_events(b"<!DOCTYPE a PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" 'x.dtd' ><a/>").is_ok());
+        assert!(
+            read_events(b"<!DOCTYPE a PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" 'x.dtd' ><a/>").is_ok()
+        );
         assert!(read_events(b"<!DOCTYPE a\n>\n<a/>").is_ok());
         // An external identifier is SYSTEM or PUBLIC with its literals.
         assert_eq!(kind("<!DOCTYPE a junk><a/>"), ErrorKind::BadSyntax);
@@ -2486,8 +2711,14 @@ mod tests {
         assert_eq!(kind("<!DOCTYPE a SYSTEM'x'><a/>"), ErrorKind::BadSyntax);
         assert_eq!(kind("<!DOCTYPE a PUBLIC 'p'><a/>"), ErrorKind::BadSyntax);
         assert_eq!(kind("<!DOCTYPE a PUBLIC 'p''s'><a/>"), ErrorKind::BadSyntax);
-        assert_eq!(kind("<!DOCTYPE a PUBLIC 'p{' 's'><a/>"), ErrorKind::BadSyntax);
-        assert_eq!(kind("<!DOCTYPE a SYSTEM 's' x [ ]><a/>"), ErrorKind::BadSyntax);
+        assert_eq!(
+            kind("<!DOCTYPE a PUBLIC 'p{' 's'><a/>"),
+            ErrorKind::BadSyntax
+        );
+        assert_eq!(
+            kind("<!DOCTYPE a SYSTEM 's' x [ ]><a/>"),
+            ErrorKind::BadSyntax
+        );
         // Namespaces in XML, section 5: the doctype's name is a QName.
         assert_eq!(kind("<!DOCTYPE a:b:c><a/>"), ErrorKind::BadName);
         assert_eq!(Builder::new().doctype("a:b:c"), Err(ErrorKind::BadName));
@@ -2520,15 +2751,25 @@ mod tests {
         // A tag that fails leaves no binding behind.
         let mut w = Builder::new();
         w.start("a", &[("xmlns:p", "u1")]).unwrap();
-        assert_eq!(w.start("b", &[("xmlns:p", "u2"), ("q:x", "1")]), Err(ErrorKind::UndeclaredPrefix));
-        assert_eq!(w.start("c", &[("xmlns", "u3"), ("x", "1"), ("x", "2")]), Err(ErrorKind::DuplicateAttribute));
+        assert_eq!(
+            w.start("b", &[("xmlns:p", "u2"), ("q:x", "1")]),
+            Err(ErrorKind::UndeclaredPrefix)
+        );
+        assert_eq!(
+            w.start("c", &[("xmlns", "u3"), ("x", "1"), ("x", "2")]),
+            Err(ErrorKind::DuplicateAttribute)
+        );
         w.empty("p:d", &[]).unwrap();
         w.empty("e", &[]).unwrap();
         w.end().unwrap();
         let events = read_events(built_text(w).unwrap().as_bytes()).unwrap();
-        let Event::Start(d) = &events[1] else { panic!() };
+        let Event::Start(d) = &events[1] else {
+            panic!()
+        };
         assert_eq!(d.name.namespace.as_deref(), Some("u1"));
-        let Event::Start(e) = &events[3] else { panic!() };
+        let Event::Start(e) = &events[3] else {
+            panic!()
+        };
         assert_eq!(e.name.namespace, None);
         // Failed tags do not use up the binding limit either.
         let mut w = Builder::new();
@@ -2541,7 +2782,10 @@ mod tests {
         for _ in 0..MAX_NAMESPACES / MAX_ATTRIBUTES {
             w.start("p0:x", &attrs).unwrap();
         }
-        assert_eq!(w.start("x", &[("xmlns:z", "u")]), Err(ErrorKind::TooManyNamespaces));
+        assert_eq!(
+            w.start("x", &[("xmlns:z", "u")]),
+            Err(ErrorKind::TooManyNamespaces)
+        );
     }
 
     #[test]
@@ -2566,7 +2810,11 @@ mod tests {
             assert_eq!(*p, *default);
             for e in &events[1..events.len() - 1] {
                 let Event::Start(s) = e else { continue };
-                let want = if s.name.prefix.is_some() { &p } else { &default };
+                let want = if s.name.prefix.is_some() {
+                    &p
+                } else {
+                    &default
+                };
                 assert!(Arc::ptr_eq(want, s.name.namespace.as_ref().unwrap()));
                 for a in &s.attributes {
                     assert!(Arc::ptr_eq(&p, a.name.namespace.as_ref().unwrap()));
@@ -2581,7 +2829,13 @@ mod tests {
         let mut doc = b"<a>".to_vec();
         doc.resize(MAX_DOCUMENT + 10, b'x');
         let r = decode_all(Events::new, &doc);
-        assert_eq!(match r.1.unwrap() { Fail::Protocol(e) => e.kind, other => panic!("{other:?}") }, ErrorKind::TooLarge);
+        assert_eq!(
+            match r.1.unwrap() {
+                Fail::Protocol(e) => e.kind,
+                other => panic!("{other:?}"),
+            },
+            ErrorKind::TooLarge
+        );
         check(&doc);
         // A document just under the limit is fine.
         let mut doc = b"<a>".to_vec();
@@ -2608,7 +2862,10 @@ mod tests {
         assert_eq!(err, None);
         for n in 0..full.len() {
             let (got, err) = decode_all(Events::new, &full[..n]);
-            assert!(err.is_some() || n == 0, "prefix of {n} bytes read as a document");
+            assert!(
+                err.is_some() || n == 0,
+                "prefix of {n} bytes read as a document"
+            );
             assert!(got.len() <= events.len(), "{n}");
             // Without finishing, a prefix gives no error, and a prefix of the
             // events.
@@ -2641,9 +2898,13 @@ mod tests {
         assert_eq!(w.text("x"), Err(ErrorKind::OutsideRoot));
         assert_eq!(w.cdata("x"), Err(ErrorKind::OutsideRoot));
         assert_eq!(w.end(), Err(ErrorKind::OutsideRoot));
-        w.start("r", &[("xmlns:p", "urn:p"), ("a", "<\"&'\t\n\r>")]).unwrap();
+        w.start("r", &[("xmlns:p", "urn:p"), ("a", "<\"&'\t\n\r>")])
+            .unwrap();
         assert_eq!(w.start("q:x", &[]), Err(ErrorKind::UndeclaredPrefix));
-        assert_eq!(w.start("x", &[("a", "1"), ("a", "2")]), Err(ErrorKind::DuplicateAttribute));
+        assert_eq!(
+            w.start("x", &[("a", "1"), ("a", "2")]),
+            Err(ErrorKind::DuplicateAttribute)
+        );
         assert_eq!(w.start("1x", &[]), Err(ErrorKind::BadName));
         assert_eq!(w.text("\u{0}"), Err(ErrorKind::InvalidChar));
         assert_eq!(w.cdata("a]]>b"), Err(ErrorKind::CdataEndInText));
@@ -2653,7 +2914,10 @@ mod tests {
         assert_eq!(w.pi("a", "?>"), Err(ErrorKind::BadPi));
         assert_eq!(w.pi("a:b", ""), Err(ErrorKind::BadName));
         assert_eq!(w.doctype("r"), Err(ErrorKind::MisplacedDoctype));
-        assert_eq!(w.event(&Event::End(name("x"))), Err(ErrorKind::MismatchedEnd));
+        assert_eq!(
+            w.event(&Event::End(name("x"))),
+            Err(ErrorKind::MismatchedEnd)
+        );
         w.empty("p:e", &[]).unwrap();
         w.text("]]> & <\r").unwrap();
         w.cdata("<raw>").unwrap();
@@ -2670,7 +2934,9 @@ mod tests {
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE r><!-- hi --><r xmlns:p=\"urn:p\" a=\"&lt;&quot;&amp;'&#9;&#10;&#13;&gt;\"><p:e/>]]&gt; &amp; &lt;&#13;<![CDATA[<raw>]]><?go now?></r>\n"
         );
         let events = read_events(out.as_bytes()).unwrap();
-        let Event::Start(s) = &events[3] else { panic!() };
+        let Event::Start(s) = &events[3] else {
+            panic!()
+        };
         assert_eq!(s.attribute(None, "a"), Some("<\"&'\t\n\r>"));
         assert_eq!(events[6], Event::Text("]]> & <\r".into()));
         // A writer stops at the size limit.
@@ -2824,14 +3090,23 @@ mod tests {
         // Escaping stops once the piece passes the room left, rather than
         // building all of it first.
         let mut out = String::new();
-        assert_eq!(escape(&mut out, &"&".repeat(1 << 20), false, 100), Err(ErrorKind::TooLarge));
+        assert_eq!(
+            escape(&mut out, &"&".repeat(1 << 20), false, 100),
+            Err(ErrorKind::TooLarge)
+        );
         assert!(out.len() <= 100 + 6, "{}", out.len());
         let mut w = Builder::new();
         w.start("r", &[]).unwrap();
         assert_eq!(w.text(&"&".repeat(MAX_DOCUMENT)), Err(ErrorKind::TooLarge));
-        assert_eq!(w.comment(&"x".repeat(MAX_DOCUMENT)), Err(ErrorKind::TooLarge));
+        assert_eq!(
+            w.comment(&"x".repeat(MAX_DOCUMENT)),
+            Err(ErrorKind::TooLarge)
+        );
         assert_eq!(w.cdata(&"x".repeat(MAX_DOCUMENT)), Err(ErrorKind::TooLarge));
-        assert_eq!(w.pi("t", &"x".repeat(MAX_DOCUMENT)), Err(ErrorKind::TooLarge));
+        assert_eq!(
+            w.pi("t", &"x".repeat(MAX_DOCUMENT)),
+            Err(ErrorKind::TooLarge)
+        );
         let many: Vec<String> = (0..=MAX_ATTRIBUTES).map(|i| format!("a{i}")).collect();
         let attrs: Vec<(&str, &str)> = many.iter().map(|n| (n.as_str(), "")).collect();
         assert_eq!(w.start("x", &attrs), Err(ErrorKind::TooManyAttributes));
@@ -2865,17 +3140,41 @@ mod tests {
         let bad = [
             ("<!DOCTYPE r [garbage]><r/>", ErrorKind::BadSyntax),
             ("<!DOCTYPE r [<!--a--b-->]><r/>", ErrorKind::BadComment),
-            ("<!DOCTYPE r [<?xml version='1.0'?>]><r/>", ErrorKind::ReservedPi),
+            (
+                "<!DOCTYPE r [<?xml version='1.0'?>]><r/>",
+                ErrorKind::ReservedPi,
+            ),
             ("<!DOCTYPE r [<?a:b?>]><r/>", ErrorKind::BadName),
             ("<!DOCTYPE r [<!ELEMENT r>]><r/>", ErrorKind::BadSyntax),
-            ("<!DOCTYPE r [<!ELEMENT r (a|b,c)>]><r/>", ErrorKind::BadSyntax),
-            ("<!DOCTYPE r [<!ELEMENT r (#PCDATA|a)>]><r/>", ErrorKind::BadSyntax),
+            (
+                "<!DOCTYPE r [<!ELEMENT r (a|b,c)>]><r/>",
+                ErrorKind::BadSyntax,
+            ),
+            (
+                "<!DOCTYPE r [<!ELEMENT r (#PCDATA|a)>]><r/>",
+                ErrorKind::BadSyntax,
+            ),
             ("<!DOCTYPE r [<!ELEMENT r EMPTY]><r/>", ErrorKind::BadSyntax),
-            ("<!DOCTYPE r [<!ATTLIST r a CDATA>]><r/>", ErrorKind::BadSyntax),
-            ("<!DOCTYPE r [<!ATTLIST r a CDATA '<'>]><r/>", ErrorKind::BadSyntax),
-            ("<!DOCTYPE r [<!ATTLIST r a BOGUS #IMPLIED>]><r/>", ErrorKind::BadSyntax),
-            ("<!DOCTYPE r [<!ENTITY e '%pe;'>]><r/>", ErrorKind::BadSyntax),
-            ("<!DOCTYPE r [<!ENTITY e '& x'>]><r/>", ErrorKind::BadReference),
+            (
+                "<!DOCTYPE r [<!ATTLIST r a CDATA>]><r/>",
+                ErrorKind::BadSyntax,
+            ),
+            (
+                "<!DOCTYPE r [<!ATTLIST r a CDATA '<'>]><r/>",
+                ErrorKind::BadSyntax,
+            ),
+            (
+                "<!DOCTYPE r [<!ATTLIST r a BOGUS #IMPLIED>]><r/>",
+                ErrorKind::BadSyntax,
+            ),
+            (
+                "<!DOCTYPE r [<!ENTITY e '%pe;'>]><r/>",
+                ErrorKind::BadSyntax,
+            ),
+            (
+                "<!DOCTYPE r [<!ENTITY e '& x'>]><r/>",
+                ErrorKind::BadReference,
+            ),
             ("<!DOCTYPE r [<!ENTITY a:b 'x'>]><r/>", ErrorKind::BadName),
             ("<!DOCTYPE r [<!NOTATION n>]><r/>", ErrorKind::BadSyntax),
             ("<!DOCTYPE r [<!FOO r>]><r/>", ErrorKind::BadSyntax),
@@ -2885,11 +3184,19 @@ mod tests {
             assert_eq!(kind(doc), want, "{doc}");
         }
         // Content models nest, up to a limit.
-        let nested = format!("<!DOCTYPE r [<!ELEMENT r {}a{}>]><r/>", "(".repeat(MAX_DEPTH), ")".repeat(MAX_DEPTH));
+        let nested = format!(
+            "<!DOCTYPE r [<!ELEMENT r {}a{}>]><r/>",
+            "(".repeat(MAX_DEPTH),
+            ")".repeat(MAX_DEPTH)
+        );
         assert!(read_events(nested.as_bytes()).is_ok());
         for offset in (0..rounds(100_000)).step_by(100_000) {
             let count = (rounds(100_000) - offset).min(100_000);
-            let nested = format!("<!DOCTYPE r [<!ELEMENT r {}a{}>]><r/>", "(".repeat(count), ")".repeat(count));
+            let nested = format!(
+                "<!DOCTYPE r [<!ELEMENT r {}a{}>]><r/>",
+                "(".repeat(count),
+                ")".repeat(count)
+            );
             assert_eq!(kind(&nested), ErrorKind::TooDeep);
         }
     }
@@ -2898,31 +3205,49 @@ mod tests {
     fn attribute_declarations() {
         // Section 3.3.2: a declared default is supplied, and it can declare
         // a namespace.
-        let events = read_events(b"<!DOCTYPE r [<!ATTLIST r xmlns CDATA 'urn:r' a CDATA 'x'>]><r a='y'/>").unwrap();
-        let Event::Start(s) = &events[1] else { panic!() };
+        let events =
+            read_events(b"<!DOCTYPE r [<!ATTLIST r xmlns CDATA 'urn:r' a CDATA 'x'>]><r a='y'/>")
+                .unwrap();
+        let Event::Start(s) = &events[1] else {
+            panic!()
+        };
         assert_eq!(s.name.namespace.as_deref(), Some("urn:r"));
         assert_eq!(s.attribute(None, "a"), Some("y"));
         assert_eq!(s.attribute(Some(XMLNS_NAMESPACE), "xmlns"), Some("urn:r"));
-        let events = read_events(b"<!DOCTYPE p:r [<!ATTLIST p:r xmlns:p CDATA 'urn:r'>]><p:r/>").unwrap();
-        let Event::Start(s) = &events[1] else { panic!() };
+        let events =
+            read_events(b"<!DOCTYPE p:r [<!ATTLIST p:r xmlns:p CDATA 'urn:r'>]><p:r/>").unwrap();
+        let Event::Start(s) = &events[1] else {
+            panic!()
+        };
         assert_eq!(s.name.namespace.as_deref(), Some("urn:r"));
         // Section 3.3.3: values of a tokenized type lose leading, trailing
         // and repeated spaces, defaults and written values alike. The first
         // declaration of an attribute is the one that counts.
         let doc = "<!DOCTYPE r [<!ATTLIST r t NMTOKENS ' a  b ' c CDATA ' a  b '><!ATTLIST r t CDATA 'z' u CDATA 'v'>]><r><r t=' x&#32; y\t'/></r>";
         let events = read_events(doc.as_bytes()).unwrap();
-        let Event::Start(s) = &events[1] else { panic!() };
+        let Event::Start(s) = &events[1] else {
+            panic!()
+        };
         assert_eq!(s.attribute(None, "t"), Some("a b"));
         assert_eq!(s.attribute(None, "c"), Some(" a  b "));
         assert_eq!(s.attribute(None, "u"), Some("v"));
-        let Event::Start(s) = &events[2] else { panic!() };
+        let Event::Start(s) = &events[2] else {
+            panic!()
+        };
         assert_eq!(s.attribute(None, "t"), Some("x y"));
         // #IMPLIED and #REQUIRED supply nothing.
-        let events = read_events(b"<!DOCTYPE r [<!ATTLIST r a CDATA #IMPLIED b CDATA #REQUIRED>]><r/>").unwrap();
-        let Event::Start(s) = &events[1] else { panic!() };
+        let events =
+            read_events(b"<!DOCTYPE r [<!ATTLIST r a CDATA #IMPLIED b CDATA #REQUIRED>]><r/>")
+                .unwrap();
+        let Event::Start(s) = &events[1] else {
+            panic!()
+        };
         assert!(s.attributes.is_empty());
         // A default naming an undeclared prefix is an error where it is used.
-        assert_eq!(kind("<!DOCTYPE r [<!ATTLIST r p:a CDATA 'x'>]><r/>"), ErrorKind::UndeclaredPrefix);
+        assert_eq!(
+            kind("<!DOCTYPE r [<!ATTLIST r p:a CDATA 'x'>]><r/>"),
+            ErrorKind::UndeclaredPrefix
+        );
         // What a parser read with defaults, a writer writes and a parser
         // reads back the same.
         let doc = "<!DOCTYPE r [<!ATTLIST r xmlns CDATA 'urn:r' t NMTOKENS ' a  b '>]><r/>";
@@ -2949,8 +3274,13 @@ mod tests {
         doc.push_str("</r>");
         assert_eq!(kind(&doc), ErrorKind::TooLarge);
         // Declarations for one element are capped like its attributes.
-        let defs: String = (0..=MAX_ATTRIBUTES).map(|i| format!(" a{i} CDATA #IMPLIED")).collect();
-        assert_eq!(kind(&format!("<!DOCTYPE r [<!ATTLIST r{defs}>]><r/>")), ErrorKind::TooManyAttributes);
+        let defs: String = (0..=MAX_ATTRIBUTES)
+            .map(|i| format!(" a{i} CDATA #IMPLIED"))
+            .collect();
+        assert_eq!(
+            kind(&format!("<!DOCTYPE r [<!ATTLIST r{defs}>]><r/>")),
+            ErrorKind::TooManyAttributes
+        );
         // The same declaration repeated counts once.
         let defs = " a CDATA #IMPLIED".repeat(MAX_ATTRIBUTES * 4);
         assert!(read_events(format!("<!DOCTYPE r [<!ATTLIST r{defs}>]><r/>").as_bytes()).is_ok());
@@ -2965,10 +3295,16 @@ mod tests {
                 check(&doc);
                 let (_, error) = decode_all(Events::new, &doc);
                 let expected = if extra > 1 {
-                    Error { kind: ErrorKind::TooLarge, offset: 3 }
+                    Error {
+                        kind: ErrorKind::TooLarge,
+                        offset: 3,
+                    }
                 } else {
                     let offset = if tail.is_empty() { doc.len() } else { 3 };
-                    Error { kind: ErrorKind::UnexpectedEnd, offset }
+                    Error {
+                        kind: ErrorKind::UnexpectedEnd,
+                        offset,
+                    }
                 };
                 assert_eq!(error, Some(Fail::Protocol(expected)));
             }
@@ -2980,22 +3316,49 @@ mod tests {
         // An event's names carry namespaces; a writer that cannot give a name
         // the same namespace refuses it rather than change it.
         let ns = |u: &str| Some(Arc::<str>::from(u));
-        let r = Name { prefix: None, local: "r".into(), namespace: ns("urn:r") };
+        let r = Name {
+            prefix: None,
+            local: "r".into(),
+            namespace: ns("urn:r"),
+        };
         let mut w = Builder::new();
-        let start = Event::Start(Start { name: r.clone(), attributes: vec![] });
+        let start = Event::Start(Start {
+            name: r.clone(),
+            attributes: vec![],
+        });
         assert_eq!(w.event(&start), Err(ErrorKind::BadNamespace));
         assert_eq!(w.depth(), 0);
         let decl = Attribute {
-            name: Name { prefix: None, local: "xmlns".into(), namespace: ns(XMLNS_NAMESPACE) },
+            name: Name {
+                prefix: None,
+                local: "xmlns".into(),
+                namespace: ns(XMLNS_NAMESPACE),
+            },
             value: "urn:r".into(),
         };
-        w.event(&Event::Start(Start { name: r.clone(), attributes: vec![decl] })).unwrap();
-        let attr =
-            Attribute { name: Name { prefix: None, local: "a".into(), namespace: ns("urn:r") }, value: "".into() };
-        let bad = Event::Start(Start { name: r.clone(), attributes: vec![attr] });
+        w.event(&Event::Start(Start {
+            name: r.clone(),
+            attributes: vec![decl],
+        }))
+        .unwrap();
+        let attr = Attribute {
+            name: Name {
+                prefix: None,
+                local: "a".into(),
+                namespace: ns("urn:r"),
+            },
+            value: "".into(),
+        };
+        let bad = Event::Start(Start {
+            name: r.clone(),
+            attributes: vec![attr],
+        });
         assert_eq!(w.event(&bad), Err(ErrorKind::BadNamespace));
         assert_eq!(w.depth(), 1);
-        assert_eq!(w.event(&Event::End(name("r"))), Err(ErrorKind::BadNamespace));
+        assert_eq!(
+            w.event(&Event::End(name("r"))),
+            Err(ErrorKind::BadNamespace)
+        );
         w.event(&Event::End(r)).unwrap();
         let out = built_text(w).unwrap();
         assert_eq!(out, "<r xmlns=\"urn:r\"></r>");
@@ -3015,7 +3378,10 @@ mod tests {
         let mut w = Builder::new();
         w.start("r", &[]).unwrap();
         w.start("s", &[]).unwrap();
-        assert_eq!(w.text(&"x".repeat(MAX_DOCUMENT - 3 - 3)), Err(ErrorKind::TooLarge));
+        assert_eq!(
+            w.text(&"x".repeat(MAX_DOCUMENT - 3 - 3)),
+            Err(ErrorKind::TooLarge)
+        );
         w.text(&"x".repeat(MAX_DOCUMENT - 6 - 8)).unwrap();
         assert_eq!(w.start("t", &[]), Err(ErrorKind::TooLarge));
         assert_eq!(w.empty("t", &[]), Err(ErrorKind::TooLarge));

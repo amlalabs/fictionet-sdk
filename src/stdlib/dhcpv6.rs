@@ -74,8 +74,8 @@
 //! assert_eq!(lease.valid, 7200);
 //! ```
 
-use fictionet::stdlib::codec::{Prefixed, Frames, be32};
 use core::convert::Infallible;
+use fictionet::stdlib::codec::{Frames, Prefixed, be32};
 use std::net::Ipv6Addr;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -563,21 +563,39 @@ association_status!(IaNa, IaTa, IaAddr, IaPd, IaPrefix);
 impl IaNa {
     /// The addresses inside.
     pub fn addresses(&self) -> impl Iterator<Item = &IaAddr> {
-        self.options.iter().filter_map(|o| if let DhcpOption::IaAddr(a) = o { Some(a) } else { None })
+        self.options.iter().filter_map(|o| {
+            if let DhcpOption::IaAddr(a) = o {
+                Some(a)
+            } else {
+                None
+            }
+        })
     }
 }
 
 impl IaTa {
     /// The addresses inside.
     pub fn addresses(&self) -> impl Iterator<Item = &IaAddr> {
-        self.options.iter().filter_map(|o| if let DhcpOption::IaAddr(a) = o { Some(a) } else { None })
+        self.options.iter().filter_map(|o| {
+            if let DhcpOption::IaAddr(a) = o {
+                Some(a)
+            } else {
+                None
+            }
+        })
     }
 }
 
 impl IaPd {
     /// The prefixes inside.
     pub fn prefixes(&self) -> impl Iterator<Item = &IaPrefix> {
-        self.options.iter().filter_map(|o| if let DhcpOption::IaPrefix(p) = o { Some(p) } else { None })
+        self.options.iter().filter_map(|o| {
+            if let DhcpOption::IaPrefix(p) = o {
+                Some(p)
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -607,7 +625,9 @@ impl std::fmt::Display for Error {
         match self {
             Error::Short => f.write_str("shorter than a DHCPv6 header"),
             Error::TooLong(n) => write!(f, "{n} bytes, longer than a DHCPv6 message may be"),
-            Error::Truncated => f.write_str("an option or TCP message runs past the end of its bytes"),
+            Error::Truncated => {
+                f.write_str("an option or TCP message runs past the end of its bytes")
+            }
             Error::BadOption(c) => write!(f, "option {c} is malformed"),
             Error::Trailing => f.write_str("bytes after the DHCPv6 TCP message"),
             Error::Unwritable => f.write_str("DHCPv6 value cannot be written without changing it"),
@@ -741,12 +761,24 @@ impl Message {
 
     /// The client's DUID, from the Client Identifier option.
     pub fn client_id(&self) -> Option<&Duid> {
-        self.options.iter().find_map(|o| if let DhcpOption::ClientId(d) = o { Some(d) } else { None })
+        self.options.iter().find_map(|o| {
+            if let DhcpOption::ClientId(d) = o {
+                Some(d)
+            } else {
+                None
+            }
+        })
     }
 
     /// The server's DUID, from the Server Identifier option.
     pub fn server_id(&self) -> Option<&Duid> {
-        self.options.iter().find_map(|o| if let DhcpOption::ServerId(d) = o { Some(d) } else { None })
+        self.options.iter().find_map(|o| {
+            if let DhcpOption::ServerId(d) = o {
+                Some(d)
+            } else {
+                None
+            }
+        })
     }
 
     /// The message's own status code, if it has one. Status codes inside
@@ -757,17 +789,35 @@ impl Message {
 
     /// The identity associations for non-temporary addresses.
     pub fn ia_na(&self) -> impl Iterator<Item = &IaNa> {
-        self.options.iter().filter_map(|o| if let DhcpOption::IaNa(ia) = o { Some(ia) } else { None })
+        self.options.iter().filter_map(|o| {
+            if let DhcpOption::IaNa(ia) = o {
+                Some(ia)
+            } else {
+                None
+            }
+        })
     }
 
     /// The identity associations for temporary addresses.
     pub fn ia_ta(&self) -> impl Iterator<Item = &IaTa> {
-        self.options.iter().filter_map(|o| if let DhcpOption::IaTa(ia) = o { Some(ia) } else { None })
+        self.options.iter().filter_map(|o| {
+            if let DhcpOption::IaTa(ia) = o {
+                Some(ia)
+            } else {
+                None
+            }
+        })
     }
 
     /// The identity associations for prefix delegation.
     pub fn ia_pd(&self) -> impl Iterator<Item = &IaPd> {
-        self.options.iter().filter_map(|o| if let DhcpOption::IaPd(ia) = o { Some(ia) } else { None })
+        self.options.iter().filter_map(|o| {
+            if let DhcpOption::IaPd(ia) = o {
+                Some(ia)
+            } else {
+                None
+            }
+        })
     }
 
     /// The option codes the client asks for, from the Option Request
@@ -775,14 +825,26 @@ impl Message {
     pub fn requested_options(&self) -> &[u16] {
         self.options
             .iter()
-            .find_map(|o| if let DhcpOption::Oro(c) = o { Some(c.as_slice()) } else { None })
+            .find_map(|o| {
+                if let DhcpOption::Oro(c) = o {
+                    Some(c.as_slice())
+                } else {
+                    None
+                }
+            })
             .unwrap_or(&[])
     }
 
     /// The relay agent's name for the interface the message came in on,
     /// from the Interface-Id option.
     pub fn interface_id(&self) -> Option<&[u8]> {
-        self.options.iter().find_map(|o| if let DhcpOption::InterfaceId(b) = o { Some(b.as_slice()) } else { None })
+        self.options.iter().find_map(|o| {
+            if let DhcpOption::InterfaceId(b) = o {
+                Some(b.as_slice())
+            } else {
+                None
+            }
+        })
     }
 
     /// The message a relay message carries, read from its Relay Message
@@ -796,9 +858,13 @@ impl Message {
         if !self.is_relay() {
             return None;
         }
-        self.options
-            .iter()
-            .find_map(|o| if let DhcpOption::RelayMessage(b) = o { Some(Message::parse(b)) } else { None })
+        self.options.iter().find_map(|o| {
+            if let DhcpOption::RelayMessage(b) = o {
+                Some(Message::parse(b))
+            } else {
+                None
+            }
+        })
     }
 
     /// The start of a server's answer to this client message: a message of
@@ -931,18 +997,30 @@ impl Prefixed for Message {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
-        let Some(&[a, b]) = input.get(..2) else { return Ok(None) };
+    fn parse_prefix(
+        input: &[u8],
+        _limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let Some(&[a, b]) = input.get(..2) else {
+            return Ok(None);
+        };
         // The two-byte length is at most MAX_TCP_MESSAGE.
         let used = 2usize.saturating_add(usize::from(u16::from_be_bytes([a, b])));
-        let Some(body) = input.get(2..used) else { return Ok(None) };
+        let Some(body) = input.get(2..used) else {
+            return Ok(None);
+        };
         Ok(Some((Message::parse_within(body, MAX_TCP_MESSAGE), used)))
     }
 }
 
-
 fn find_status(options: &[DhcpOption]) -> Option<&StatusCode> {
-    options.iter().find_map(|o| if let DhcpOption::StatusCode(s) = o { Some(s) } else { None })
+    options.iter().find_map(|o| {
+        if let DhcpOption::StatusCode(s) = o {
+            Some(s)
+        } else {
+            None
+        }
+    })
 }
 
 /// Reads an option list at `depth`.
@@ -974,26 +1052,48 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
                 return Err(bad);
             }
             let d = Duid(b.to_vec());
-            if code == opt::CLIENTID { DhcpOption::ClientId(d) } else { DhcpOption::ServerId(d) }
+            if code == opt::CLIENTID {
+                DhcpOption::ClientId(d)
+            } else {
+                DhcpOption::ServerId(d)
+            }
         }
         opt::IA_NA if nest => {
             at_least(12)?;
             let options = parse_options(&b[12..], depth + 1)?;
-            DhcpOption::IaNa(IaNa { iaid: be32(b, 0).ok_or(bad)?, t1: be32(b, 4).ok_or(bad)?, t2: be32(b, 8).ok_or(bad)?, options })
+            DhcpOption::IaNa(IaNa {
+                iaid: be32(b, 0).ok_or(bad)?,
+                t1: be32(b, 4).ok_or(bad)?,
+                t2: be32(b, 8).ok_or(bad)?,
+                options,
+            })
         }
         opt::IA_TA if nest => {
             at_least(4)?;
-            DhcpOption::IaTa(IaTa { iaid: be32(b, 0).ok_or(bad)?, options: parse_options(&b[4..], depth + 1)? })
+            DhcpOption::IaTa(IaTa {
+                iaid: be32(b, 0).ok_or(bad)?,
+                options: parse_options(&b[4..], depth + 1)?,
+            })
         }
         opt::IAADDR if nest => {
             at_least(24)?;
             let options = parse_options(&b[24..], depth + 1)?;
-            DhcpOption::IaAddr(IaAddr { address: addr(b, 0), preferred: be32(b, 16).ok_or(bad)?, valid: be32(b, 20).ok_or(bad)?, options })
+            DhcpOption::IaAddr(IaAddr {
+                address: addr(b, 0),
+                preferred: be32(b, 16).ok_or(bad)?,
+                valid: be32(b, 20).ok_or(bad)?,
+                options,
+            })
         }
         opt::IA_PD if nest => {
             at_least(12)?;
             let options = parse_options(&b[12..], depth + 1)?;
-            DhcpOption::IaPd(IaPd { iaid: be32(b, 0).ok_or(bad)?, t1: be32(b, 4).ok_or(bad)?, t2: be32(b, 8).ok_or(bad)?, options })
+            DhcpOption::IaPd(IaPd {
+                iaid: be32(b, 0).ok_or(bad)?,
+                t1: be32(b, 4).ok_or(bad)?,
+                t2: be32(b, 8).ok_or(bad)?,
+                options,
+            })
         }
         opt::IAPREFIX if nest => {
             at_least(25)?;
@@ -1013,7 +1113,13 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
             if !b.len().is_multiple_of(2) {
                 return Err(bad);
             }
-            DhcpOption::Oro(b.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect())
+            DhcpOption::Oro(
+                b.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect(),
+            )
         }
         opt::PREFERENCE => {
             fixed(1)?;
@@ -1047,7 +1153,10 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
                 return Err(bad);
             }
             let message = std::str::from_utf8(&b[2..]).map_err(|_| bad)?.to_string();
-            DhcpOption::StatusCode(StatusCode { code: u16::from_be_bytes([b[0], b[1]]), message })
+            DhcpOption::StatusCode(StatusCode {
+                code: u16::from_be_bytes([b[0], b[1]]),
+                message,
+            })
         }
         opt::RAPID_COMMIT => {
             fixed(0)?;
@@ -1061,7 +1170,10 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
         opt::VENDOR_CLASS => {
             // RFC 8415, section 21.16: one or more vendor classes.
             at_least(6)?;
-            DhcpOption::VendorClass { enterprise: be32(b, 0).ok_or(bad)?, classes: parse_counted(&b[4..]).ok_or(bad)? }
+            DhcpOption::VendorClass {
+                enterprise: be32(b, 0).ok_or(bad)?,
+                classes: parse_counted(&b[4..]).ok_or(bad)?,
+            }
         }
         opt::VENDOR_OPTS => {
             at_least(4)?;
@@ -1069,7 +1181,10 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
             if !options_in_form(&b[4..]) {
                 return Err(bad);
             }
-            DhcpOption::VendorOpts { enterprise: be32(b, 0).ok_or(bad)?, data: b[4..].to_vec() }
+            DhcpOption::VendorOpts {
+                enterprise: be32(b, 0).ok_or(bad)?,
+                data: b[4..].to_vec(),
+            }
         }
         opt::INTERFACE_ID => DhcpOption::InterfaceId(b.to_vec()),
         opt::RECONF_MSG => {
@@ -1089,7 +1204,10 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
         }
         opt::DOMAIN_LIST => match parse_names(b).ok_or(bad)? {
             Names::Hosts(names) => DhcpOption::DomainList(names),
-            Names::Other => DhcpOption::Other { code, data: b.to_vec() },
+            Names::Other => DhcpOption::Other {
+                code,
+                data: b.to_vec(),
+            },
         },
         opt::INFORMATION_REFRESH_TIME | opt::SOL_MAX_RT | opt::INF_MAX_RT => {
             fixed(4)?;
@@ -1100,7 +1218,10 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
                 _ => DhcpOption::InfMaxRt(v),
             }
         }
-        _ => DhcpOption::Other { code, data: b.to_vec() },
+        _ => DhcpOption::Other {
+            code,
+            data: b.to_vec(),
+        },
     })
 }
 
@@ -1123,7 +1244,9 @@ fn parse_counted(b: &[u8]) -> Option<Vec<Vec<u8>>> {
 fn options_in_form(b: &[u8]) -> bool {
     let mut i = 0;
     while i < b.len() {
-        let Some(head) = b.get(i..i + 4) else { return false };
+        let Some(head) = b.get(i..i + 4) else {
+            return false;
+        };
         i += 4 + usize::from(u16::from_be_bytes([head[2], head[3]]));
     }
     i == b.len()
@@ -1182,7 +1305,11 @@ fn parse_names(b: &[u8]) -> Option<Names> {
             names.push(name);
         }
     }
-    Some(if hosts { Names::Hosts(names) } else { Names::Other })
+    Some(if hosts {
+        Names::Hosts(names)
+    } else {
+        Names::Other
+    })
 }
 
 /// A domain name in DNS wire form, or `None` if it cannot be one.
@@ -1203,7 +1330,11 @@ fn encode_name(name: &str) -> Option<Vec<u8>> {
         }
     }
     out.push(0);
-    if out.len() > MAX_NAME { None } else { Some(out) }
+    if out.len() > MAX_NAME {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// An option list at `depth`, in at most `budget` bytes. Options that are
@@ -1240,7 +1371,11 @@ fn encode_option(o: &DhcpOption, depth: usize, budget: usize) -> Option<Vec<u8>>
 /// An option's body, or `None` if it is invalid or cannot fit in `max` bytes.
 fn encode_body(o: &DhcpOption, depth: usize, max: usize) -> Option<Vec<u8>> {
     let nested = |options: &[DhcpOption], fixed: usize| {
-        if depth < MAX_DEPTH { encode_options(options, depth + 1, max.checked_sub(fixed)?) } else { None }
+        if depth < MAX_DEPTH {
+            encode_options(options, depth + 1, max.checked_sub(fixed)?)
+        } else {
+            None
+        }
     };
     let mut out = Vec::new();
     match o {
@@ -1302,7 +1437,10 @@ fn encode_body(o: &DhcpOption, depth: usize, max: usize) -> Option<Vec<u8>> {
         }
         DhcpOption::RapidCommit | DhcpOption::ReconfigureAccept => {}
         DhcpOption::UserClass(items) => push_counted(&mut out, items, max)?,
-        DhcpOption::VendorClass { enterprise, classes } => {
+        DhcpOption::VendorClass {
+            enterprise,
+            classes,
+        } => {
             out.extend_from_slice(&enterprise.to_be_bytes());
             push_counted(&mut out, classes, max)?;
         }
@@ -1324,9 +1462,9 @@ fn encode_body(o: &DhcpOption, depth: usize, max: usize) -> Option<Vec<u8>> {
                 push_fitting(&mut out, &encode_name(name)?, max)?;
             }
         }
-        DhcpOption::InformationRefreshTime(v) | DhcpOption::SolMaxRt(v) | DhcpOption::InfMaxRt(v) => {
-            out.extend_from_slice(&v.to_be_bytes())
-        }
+        DhcpOption::InformationRefreshTime(v)
+        | DhcpOption::SolMaxRt(v)
+        | DhcpOption::InfMaxRt(v) => out.extend_from_slice(&v.to_be_bytes()),
         DhcpOption::Other { data, .. } => push_fitting(&mut out, data, max)?,
     }
     Some(out)
@@ -1360,12 +1498,10 @@ fn addr(b: &[u8], i: usize) -> Ipv6Addr {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Lcg, Stream, pump,
-    };
+    use fictionet::stdlib::codec::{Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn a(s: &str) -> Ipv6Addr {
@@ -1378,7 +1514,8 @@ mod tests {
     /// list.
     const SOLICIT: [u8; 48] = [
         1, 0x12, 0x34, 0x56, // Solicit, transaction 0x123456
-        0, 1, 0, 10, 0, 3, 0, 1, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // Client ID: DUID-LL, Ethernet
+        0, 1, 0, 10, 0, 3, 0, 1, 0x00, 0x11, 0x22, 0x33, 0x44,
+        0x55, // Client ID: DUID-LL, Ethernet
         0, 8, 0, 2, 0, 0, // Elapsed Time 0
         0, 3, 0, 12, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, // IA_NA 1, T1 0, T2 0
         0, 6, 0, 4, 0, 23, 0, 24, // ORO: DNS servers, domain list
@@ -1393,7 +1530,11 @@ mod tests {
         for len in [0, MIN_DUID - 1, MIN_DUID, MAX_DUID, MAX_DUID + 1] {
             let bytes = vec![0; len];
             let valid = (MIN_DUID..=MAX_DUID).contains(&len);
-            let expected = if valid { Ok(Duid(bytes.clone())) } else { Err(Error::BadOption(opt::CLIENTID)) };
+            let expected = if valid {
+                Ok(Duid(bytes.clone()))
+            } else {
+                Err(Error::BadOption(opt::CLIENTID))
+            };
             assert_eq!(Duid::parse(&bytes), expected);
             assert_eq!(Duid(bytes.clone()).to_bytes().is_ok(), valid);
             contract::check_wire::<Duid>(&bytes);
@@ -1414,7 +1555,12 @@ mod tests {
             [
                 DhcpOption::ClientId(client_duid()),
                 DhcpOption::ElapsedTime(0),
-                DhcpOption::IaNa(IaNa { iaid: 1, t1: 0, t2: 0, options: vec![] }),
+                DhcpOption::IaNa(IaNa {
+                    iaid: 1,
+                    t1: 0,
+                    t2: 0,
+                    options: vec![]
+                }),
                 DhcpOption::Oro(vec![opt::DNS_SERVERS, opt::DOMAIN_LIST]),
             ]
         );
@@ -1430,18 +1576,31 @@ mod tests {
         let request = Message::parse(&SOLICIT).unwrap();
         let server = Duid::llt(hardware::ETHERNET, 0x2a2b_2c2d, &[2, 0, 0, 0, 0, 9]);
         let mut reply = request.answer(msg::REPLY, &server);
-        let address = IaAddr { address: a("2001:db8::1"), preferred: 3600, valid: 7200, options: vec![] };
+        let address = IaAddr {
+            address: a("2001:db8::1"),
+            preferred: 3600,
+            valid: 7200,
+            options: vec![],
+        };
         reply.options.push(DhcpOption::IaNa(IaNa {
             iaid: 1,
             t1: 1800,
             t2: 2880,
             options: vec![
                 DhcpOption::IaAddr(address),
-                DhcpOption::StatusCode(StatusCode { code: status::SUCCESS, message: "ok".into() }),
+                DhcpOption::StatusCode(StatusCode {
+                    code: status::SUCCESS,
+                    message: "ok".into(),
+                }),
             ],
         }));
-        let prefix =
-            IaPrefix { preferred: 3600, valid: INFINITY, prefix_len: 48, prefix: a("2001:db8:1::"), options: vec![] };
+        let prefix = IaPrefix {
+            preferred: 3600,
+            valid: INFINITY,
+            prefix_len: 48,
+            prefix: a("2001:db8:1::"),
+            options: vec![],
+        };
         reply.options.push(DhcpOption::IaPd(IaPd {
             iaid: 2,
             t1: 0,
@@ -1458,8 +1617,8 @@ mod tests {
         assert_eq!(&bytes[4..8], [0, 2, 0, 14]);
         // The IAPREFIX option, laid out by hand.
         let iaprefix = [
-            0, 26, 0, 25, 0, 0, 0x0e, 0x10, 0xff, 0xff, 0xff, 0xff, 48, 0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0,
+            0, 26, 0, 25, 0, 0, 0x0e, 0x10, 0xff, 0xff, 0xff, 0xff, 48, 0x20, 0x01, 0x0d, 0xb8, 0,
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         assert!(bytes.windows(iaprefix.len()).any(|w| w == iaprefix));
         let back = Message::parse(&bytes).unwrap();
@@ -1470,9 +1629,15 @@ mod tests {
         assert_eq!(ia.status().unwrap().message, "ok");
         let pd = back.ia_pd().next().unwrap();
         let p = pd.prefixes().next().unwrap();
-        assert_eq!((p.prefix, p.prefix_len, p.valid), (a("2001:db8:1::"), 48, INFINITY));
+        assert_eq!(
+            (p.prefix, p.prefix_len, p.valid),
+            (a("2001:db8:1::"), 48, INFINITY)
+        );
         assert_eq!(back.server_id(), Some(&server));
-        assert_eq!(back.option(opt::RAPID_COMMIT), Some(&DhcpOption::RapidCommit));
+        assert_eq!(
+            back.option(opt::RAPID_COMMIT),
+            Some(&DhcpOption::RapidCommit)
+        );
         assert_eq!(back.status(), None);
         assert_eq!(back.ia_ta().count(), 0);
     }
@@ -1480,9 +1645,15 @@ mod tests {
     #[test]
     fn relay_example() {
         let solicit = Message::parse(&SOLICIT).unwrap();
-        let mut forw =
-            Message::relay_forward(&solicit, 0, a("2001:db8:0:1::1"), a("fe80::211:22ff:fe33:4455")).unwrap();
-        forw.options.insert(0, DhcpOption::InterfaceId(b"eth0".to_vec()));
+        let mut forw = Message::relay_forward(
+            &solicit,
+            0,
+            a("2001:db8:0:1::1"),
+            a("fe80::211:22ff:fe33:4455"),
+        )
+        .unwrap();
+        forw.options
+            .insert(0, DhcpOption::InterfaceId(b"eth0".to_vec()));
         let bytes = forw.to_bytes().unwrap();
         // RFC 8415, section 9: type, hop count, link address, peer address.
         assert_eq!(bytes[0], msg::RELAY_FORW);
@@ -1500,17 +1671,33 @@ mod tests {
         assert_eq!(read.relayed(), Some(Ok(solicit.clone())));
 
         // A second relay agent wraps it again.
-        let outer = Message::relay_forward(&read, 1, Ipv6Addr::UNSPECIFIED, a("2001:db8:0:1::1")).unwrap();
+        let outer =
+            Message::relay_forward(&read, 1, Ipv6Addr::UNSPECIFIED, a("2001:db8:0:1::1")).unwrap();
         let outer = Message::parse(&outer.to_bytes().unwrap()).unwrap();
         assert_eq!(outer.hop_count, 1);
-        assert_eq!(outer.relayed().unwrap().unwrap().relayed().unwrap().unwrap(), solicit);
+        assert_eq!(
+            outer
+                .relayed()
+                .unwrap()
+                .unwrap()
+                .relayed()
+                .unwrap()
+                .unwrap(),
+            solicit
+        );
 
         // The server answers through the first relay agent.
         let advertise = solicit.answer(msg::ADVERTISE, &Duid::en(9, b"srv"));
         let repl = read.relay_reply(&advertise).unwrap();
         assert_eq!(repl.msg_type, msg::RELAY_REPL);
-        assert_eq!((repl.hop_count, repl.link_address, repl.peer_address), (0, read.link_address, read.peer_address));
-        assert_eq!(repl.option(opt::INTERFACE_ID), Some(&DhcpOption::InterfaceId(b"eth0".to_vec())));
+        assert_eq!(
+            (repl.hop_count, repl.link_address, repl.peer_address),
+            (0, read.link_address, read.peer_address)
+        );
+        assert_eq!(
+            repl.option(opt::INTERFACE_ID),
+            Some(&DhcpOption::InterfaceId(b"eth0".to_vec()))
+        );
         let back = Message::parse(&repl.to_bytes().unwrap()).unwrap();
         assert_eq!(back.relayed(), Some(Ok(advertise)));
         assert_eq!(solicit.relayed(), None);
@@ -1527,24 +1714,49 @@ mod tests {
                     address: a("fd00::5"),
                     preferred: 1,
                     valid: 2,
-                    options: vec![DhcpOption::StatusCode(StatusCode { code: 0, message: String::new() })],
+                    options: vec![DhcpOption::StatusCode(StatusCode {
+                        code: 0,
+                        message: String::new(),
+                    })],
                 })],
             }),
             DhcpOption::Preference(255),
-            DhcpOption::Auth(Auth { protocol: 3, algorithm: 1, rdm: 0, replay_detection: 42, info: vec![1; 17] }),
+            DhcpOption::Auth(Auth {
+                protocol: 3,
+                algorithm: 1,
+                rdm: 0,
+                replay_detection: 42,
+                info: vec![1; 17],
+            }),
             DhcpOption::Unicast(a("2001:db8::547")),
-            DhcpOption::StatusCode(StatusCode { code: status::NO_ADDRS_AVAIL, message: "épuisé".into() }),
+            DhcpOption::StatusCode(StatusCode {
+                code: status::NO_ADDRS_AVAIL,
+                message: "épuisé".into(),
+            }),
             DhcpOption::UserClass(vec![b"lab".to_vec(), vec![]]),
-            DhcpOption::VendorClass { enterprise: 4491, classes: vec![b"docsis3.0".to_vec()] },
-            DhcpOption::VendorOpts { enterprise: 4491, data: vec![0, 1, 0, 0] },
+            DhcpOption::VendorClass {
+                enterprise: 4491,
+                classes: vec![b"docsis3.0".to_vec()],
+            },
+            DhcpOption::VendorOpts {
+                enterprise: 4491,
+                data: vec![0, 1, 0, 0],
+            },
             DhcpOption::ReconfigureMessage(msg::RENEW),
             DhcpOption::ReconfigureAccept,
             DhcpOption::DnsServers(vec![a("2001:4860:4860::8888"), a("2001:4860:4860::8844")]),
-            DhcpOption::DomainList(vec!["example.com".into(), "lab.example.org".into(), String::new()]),
+            DhcpOption::DomainList(vec![
+                "example.com".into(),
+                "lab.example.org".into(),
+                String::new(),
+            ]),
             DhcpOption::InformationRefreshTime(86400),
             DhcpOption::SolMaxRt(3600),
             DhcpOption::InfMaxRt(3600),
-            DhcpOption::Other { code: 39, data: vec![0, 4, b'h', b'o', b's', b't'] },
+            DhcpOption::Other {
+                code: 39,
+                data: vec![0, 4, b'h', b'o', b's', b't'],
+            },
         ];
         let mut m = Message::new(msg::REPLY, 0xffffff);
         m.options = options;
@@ -1562,7 +1774,12 @@ mod tests {
         list.extend_from_slice(&[0, 0]);
         assert!(bytes.windows(list.len()).any(|w| w == list));
         // Every DUID constructor makes a DUID a message may carry.
-        for d in [Duid::llt(1, 0, &[1; 6]), Duid::en(1, b"x"), Duid::ll(1, &[1; 6]), Duid::uuid([0; 16])] {
+        for d in [
+            Duid::llt(1, 0, &[1; 6]),
+            Duid::en(1, b"x"),
+            Duid::ll(1, &[1; 6]),
+            Duid::uuid([0; 16]),
+        ] {
             assert!(d.is_valid());
         }
         assert_eq!(Duid(vec![0]).kind(), None);
@@ -1585,7 +1802,10 @@ mod tests {
         // An Other option fills the rest exactly.
         long.truncate(MAX_MESSAGE);
         long[4..8].copy_from_slice(&[0, 99, 0xff, 0xef]);
-        assert_eq!(usize::from(u16::from_be_bytes([0xff, 0xef])), MAX_MESSAGE - 8);
+        assert_eq!(
+            usize::from(u16::from_be_bytes([0xff, 0xef])),
+            MAX_MESSAGE - 8
+        );
         let m = Message::parse(&long).unwrap();
         assert_eq!(m.to_bytes().unwrap(), long);
     }
@@ -1594,10 +1814,18 @@ mod tests {
     fn truncated_options() {
         // A header cut short, and a body that runs past the end.
         assert_eq!(Message::parse(&[1, 0, 0, 0, 0]), Err(Error::Truncated));
-        assert_eq!(Message::parse(&[1, 0, 0, 0, 0, 8, 0]), Err(Error::Truncated));
-        assert_eq!(Message::parse(&[1, 0, 0, 0, 0, 8, 0, 2, 0]), Err(Error::Truncated));
+        assert_eq!(
+            Message::parse(&[1, 0, 0, 0, 0, 8, 0]),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            Message::parse(&[1, 0, 0, 0, 0, 8, 0, 2, 0]),
+            Err(Error::Truncated)
+        );
         // Inside an IA_NA, too.
-        let ia = [1, 0, 0, 0, 0, 3, 0, 14, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5];
+        let ia = [
+            1, 0, 0, 0, 0, 3, 0, 14, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
+        ];
         assert_eq!(Message::parse(&ia), Err(Error::Truncated));
     }
 
@@ -1613,7 +1841,11 @@ mod tests {
     #[test]
     fn malformed_options() {
         let bad = |code: u16, body: &[u8]| {
-            assert_eq!(Message::parse(&with_option(code, body)), Err(Error::BadOption(code)), "{code} {body:?}");
+            assert_eq!(
+                Message::parse(&with_option(code, body)),
+                Err(Error::BadOption(code)),
+                "{code} {body:?}"
+            );
         };
         bad(opt::CLIENTID, &[0, 3]);
         bad(opt::SERVERID, &[0; 131]);
@@ -1664,10 +1896,22 @@ mod tests {
         // A bad option inside an IA_NA names the inner option.
         let mut ia = vec![0u8; 12];
         ia.extend_from_slice(&[0, 13, 0, 1, 0]);
-        assert_eq!(Message::parse(&with_option(opt::IA_NA, &ia)), Err(Error::BadOption(opt::STATUS_CODE)));
+        assert_eq!(
+            Message::parse(&with_option(opt::IA_NA, &ia)),
+            Err(Error::BadOption(opt::STATUS_CODE))
+        );
         // Bodies just long enough read.
-        for (code, n) in [(opt::IA_NA, 12), (opt::IA_TA, 4), (opt::IAADDR, 24), (opt::IA_PD, 12), (opt::IAPREFIX, 25)] {
-            assert!(Message::parse(&with_option(code, &vec![0; n])).is_ok(), "{code}");
+        for (code, n) in [
+            (opt::IA_NA, 12),
+            (opt::IA_TA, 4),
+            (opt::IAADDR, 24),
+            (opt::IA_PD, 12),
+            (opt::IAPREFIX, 25),
+        ] {
+            assert!(
+                Message::parse(&with_option(code, &vec![0; n])).is_ok(),
+                "{code}"
+            );
         }
         assert!(Message::parse(&with_option(opt::CLIENTID, &[0, 3, 0])).is_ok());
         assert!(Message::parse(&with_option(opt::CLIENTID, &[0; 130])).is_ok());
@@ -1682,31 +1926,49 @@ mod tests {
         max_name.push(0);
         assert_eq!(max_name.len(), MAX_NAME);
         let m = Message::parse(&with_option(opt::DOMAIN_LIST, &max_name)).unwrap();
-        assert_eq!(m.to_bytes().unwrap(), with_option(opt::DOMAIN_LIST, &max_name));
+        assert_eq!(
+            m.to_bytes().unwrap(),
+            with_option(opt::DOMAIN_LIST, &max_name)
+        );
     }
 
     #[test]
     fn spec_review_cases() {
         // RFC 8415, section 21.15: a User Class option holds one or more
         // instances, so readers and writers refuse a list with no items.
-        assert_eq!(Message::parse(&with_option(opt::USER_CLASS, &[])), Err(Error::BadOption(opt::USER_CLASS)));
+        assert_eq!(
+            Message::parse(&with_option(opt::USER_CLASS, &[])),
+            Err(Error::BadOption(opt::USER_CLASS))
+        );
         assert!(Message::parse(&with_option(opt::USER_CLASS, &[0, 0])).is_ok());
         let mut m = Message::new(msg::SOLICIT, 1);
         m.options.push(DhcpOption::UserClass(vec![]));
         m.options.push(DhcpOption::UserClass(vec![vec![0; 70000]]));
         for option in m.options {
-            let value = Message { options: vec![option], ..Message::new(msg::SOLICIT, 1) };
+            let value = Message {
+                options: vec![option],
+                ..Message::new(msg::SOLICIT, 1)
+            };
             assert!(value.to_bytes().is_err());
             contract::check_wire_value(&value);
         }
         // Section 21.13: a status message is not null-terminated.
         let nul = with_option(opt::STATUS_CODE, &[0, 0, b'o', b'k', 0]);
-        assert_eq!(Message::parse(&nul), Err(Error::BadOption(opt::STATUS_CODE)));
+        assert_eq!(
+            Message::parse(&nul),
+            Err(Error::BadOption(opt::STATUS_CODE))
+        );
         assert!(Message::parse(&with_option(opt::STATUS_CODE, &[0, 0, 0, b'k'])).is_ok());
         let mut m = Message::new(msg::REPLY, 1);
-        m.options.push(DhcpOption::StatusCode(StatusCode { code: 0, message: "ok\0".into() }));
+        m.options.push(DhcpOption::StatusCode(StatusCode {
+            code: 0,
+            message: "ok\0".into(),
+        }));
         for option in m.options {
-            let value = Message { options: vec![option], ..Message::new(msg::REPLY, 1) };
+            let value = Message {
+                options: vec![option],
+                ..Message::new(msg::REPLY, 1)
+            };
             assert!(value.to_bytes().is_err());
             contract::check_wire_value(&value);
         }
@@ -1716,12 +1978,20 @@ mod tests {
     fn relay_reply_with_a_long_interface_id() {
         // A Relay-forward whose Interface-Id leaves no room for the answer:
         // writing the Relay-reply must fail without dropping its message.
-        let mut forw = Message::relay_forward(&Message::new(msg::SOLICIT, 1), 0, a("::1"), a("::2")).unwrap();
-        forw.options = vec![DhcpOption::InterfaceId(vec![7; MAX_MESSAGE - RELAY_HEADER_LEN - 4])];
+        let mut forw =
+            Message::relay_forward(&Message::new(msg::SOLICIT, 1), 0, a("::1"), a("::2")).unwrap();
+        forw.options = vec![DhcpOption::InterfaceId(vec![
+            7;
+            MAX_MESSAGE
+                - RELAY_HEADER_LEN
+                - 4
+        ])];
         let bytes = forw.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
         let read = Message::parse(&bytes).unwrap();
-        let answer = Message::parse(&SOLICIT).unwrap().answer(msg::REPLY, &Duid::en(1, b"s"));
+        let answer = Message::parse(&SOLICIT)
+            .unwrap()
+            .answer(msg::REPLY, &Duid::en(1, b"s"));
         let repl = read.relay_reply(&answer).unwrap();
         assert!(repl.to_bytes().is_err());
         contract::check_wire_value(&repl);
@@ -1731,18 +2001,34 @@ mod tests {
     fn accessors_and_defaults() {
         // A server answers the options a client asks for in its ORO.
         let solicit = Message::parse(&SOLICIT).unwrap();
-        assert_eq!(solicit.requested_options(), [opt::DNS_SERVERS, opt::DOMAIN_LIST]);
-        assert_eq!(Message::new(msg::SOLICIT, 1).requested_options(), [] as [u16; 0]);
+        assert_eq!(
+            solicit.requested_options(),
+            [opt::DNS_SERVERS, opt::DOMAIN_LIST]
+        );
+        assert_eq!(
+            Message::new(msg::SOLICIT, 1).requested_options(),
+            [] as [u16; 0]
+        );
         // A relay's Interface-Id, as bytes.
         let mut forw = Message::relay_forward(&solicit, 0, a("::1"), a("::2")).unwrap();
         assert_eq!(forw.interface_id(), None);
         forw.options.push(DhcpOption::InterfaceId(b"eth1".to_vec()));
         assert_eq!(forw.interface_id(), Some(&b"eth1"[..]));
         // The IA, status and auth types build from defaults.
-        let ia = IaNa { iaid: 3, ..Default::default() };
+        let ia = IaNa {
+            iaid: 3,
+            ..Default::default()
+        };
         assert_eq!((ia.t1, ia.t2, ia.options.len()), (0, 0, 0));
         assert_eq!(IaTa::default().iaid, 0);
-        assert_eq!(IaPd { iaid: 4, ..Default::default() }.iaid, 4);
+        assert_eq!(
+            IaPd {
+                iaid: 4,
+                ..Default::default()
+            }
+            .iaid,
+            4
+        );
         assert_eq!(StatusCode::default().code, status::SUCCESS);
         assert_eq!(Auth::default().info, Vec::<u8>::new());
     }
@@ -1765,7 +2051,12 @@ mod tests {
 
     #[test]
     fn errors_display() {
-        for e in [Error::Short, Error::TooLong(70000), Error::Truncated, Error::BadOption(3)] {
+        for e in [
+            Error::Short,
+            Error::TooLong(70000),
+            Error::Truncated,
+            Error::BadOption(3),
+        ] {
             assert!(!e.to_string().is_empty());
         }
         assert_eq!(Error::BadOption(3).to_string(), "option 3 is malformed");
@@ -1773,10 +2064,19 @@ mod tests {
 
     #[test]
     fn every_truncated_prefix() {
-        let relay =
-            Message::relay_forward(&Message::parse(&SOLICIT).unwrap(), 0, a("2001:db8::1"), a("fe80::1")).unwrap();
+        let relay = Message::relay_forward(
+            &Message::parse(&SOLICIT).unwrap(),
+            0,
+            a("2001:db8::1"),
+            a("fe80::1"),
+        )
+        .unwrap();
         for full in [SOLICIT.to_vec(), relay.to_bytes().unwrap()] {
-            let header = if full[0] == msg::RELAY_FORW { RELAY_HEADER_LEN } else { CLIENT_HEADER_LEN };
+            let header = if full[0] == msg::RELAY_FORW {
+                RELAY_HEADER_LEN
+            } else {
+                CLIENT_HEADER_LEN
+            };
             // Where each top-level option ends.
             let mut ends = vec![header];
             let mut i = header;
@@ -1796,10 +2096,19 @@ mod tests {
                 }
             }
             // Over TCP, every prefix waits for more.
-            let framed = Frame(Message::parse(&full).unwrap().clone()).to_bytes().unwrap();
-            contract::check_decode_with_alloc_limit(Frames::<Message>::new, &framed, 2 * MAX_BUFFERED);
+            let framed = Frame(Message::parse(&full).unwrap().clone())
+                .to_bytes()
+                .unwrap();
+            contract::check_decode_with_alloc_limit(
+                Frames::<Message>::new,
+                &framed,
+                2 * MAX_BUFFERED,
+            );
             for n in 0..framed.len() {
-                assert_eq!(Frames::<Message>::new().decode(&framed[..n], false), Ok(Step::Need));
+                assert_eq!(
+                    Frames::<Message>::new().decode(&framed[..n], false),
+                    Ok(Step::Need)
+                );
             }
         }
     }
@@ -1812,7 +2121,10 @@ mod tests {
         bytes.extend_from_slice(&[0, 3, 1, 0, 0]);
         bytes.extend_from_slice(&Frame(second.clone()).to_bytes().unwrap());
         contract::check_decode_with_alloc_limit(Frames::<Message>::new, &bytes, 2 * MAX_BUFFERED);
-        assert_eq!(decode_all(Frames::<Message>::new, &bytes), (vec![Ok(first), Err(Error::Short), Ok(second)], None));
+        assert_eq!(
+            decode_all(Frames::<Message>::new, &bytes),
+            (vec![Ok(first), Err(Error::Short), Ok(second)], None)
+        );
         let (messages, error) = decode_all(Frames::<Message>::new, &[0, 0, 0, 4, 2, 0, 0, 1]);
         assert_eq!(messages, [Err(Error::Short), Ok(Message::new(2, 1))]);
         assert_eq!(error, None);
@@ -1839,12 +2151,23 @@ mod tests {
             options = &ia.options;
         }
         assert_eq!(depth, MAX_DEPTH);
-        assert!(matches!(options.first(), Some(DhcpOption::Other { code: opt::IA_NA, .. })));
+        assert!(matches!(
+            options.first(),
+            Some(DhcpOption::Other {
+                code: opt::IA_NA,
+                ..
+            })
+        ));
 
         // A constructed value past the depth limit is refused.
         let mut o = DhcpOption::RapidCommit;
         for _ in 0..MAX_DEPTH * 3 {
-            o = DhcpOption::IaNa(IaNa { iaid: 0, t1: 0, t2: 0, options: vec![o] });
+            o = DhcpOption::IaNa(IaNa {
+                iaid: 0,
+                t1: 0,
+                t2: 0,
+                options: vec![o],
+            });
         }
         let mut m = Message::new(msg::REPLY, 1);
         m.options.push(o);
@@ -1868,27 +2191,59 @@ mod tests {
                 prefix: Ipv6Addr::UNSPECIFIED,
                 options: vec![],
             }),
-            DhcpOption::Other { code: opt::PREFERENCE, data: vec![1, 2, 3] },
-            DhcpOption::Other { code: opt::ELAPSED_TIME, data: vec![0, 5] },
-            DhcpOption::DomainList(vec!["ok.example".into(), "bad..name".into(), "sp ace".into(), "a.".into()]),
+            DhcpOption::Other {
+                code: opt::PREFERENCE,
+                data: vec![1, 2, 3],
+            },
+            DhcpOption::Other {
+                code: opt::ELAPSED_TIME,
+                data: vec![0, 5],
+            },
+            DhcpOption::DomainList(vec![
+                "ok.example".into(),
+                "bad..name".into(),
+                "sp ace".into(),
+                "a.".into(),
+            ]),
             DhcpOption::UserClass(vec![vec![0; 70000], b"kept".to_vec()]),
-            DhcpOption::Other { code: 1000, data: vec![0; 70000] },
+            DhcpOption::Other {
+                code: 1000,
+                data: vec![0; 70000],
+            },
             DhcpOption::RelayMessage(vec![0; MAX_MESSAGE]),
         ];
         assert!(m.to_bytes().is_err());
         for option in std::mem::take(&mut m.options) {
-            let value = Message { options: vec![option], ..Message::new(msg::REPLY, 1) };
+            let value = Message {
+                options: vec![option],
+                ..Message::new(msg::REPLY, 1)
+            };
             assert!(value.to_bytes().is_err(), "{:?}", value.options);
             contract::check_wire_value(&value);
         }
         for (option, fits) in [
-            (DhcpOption::DnsServers(vec![Ipv6Addr::LOCALHOST; 4094]), true),
-            (DhcpOption::DnsServers(vec![Ipv6Addr::LOCALHOST; 4095]), false),
+            (
+                DhcpOption::DnsServers(vec![Ipv6Addr::LOCALHOST; 4094]),
+                true,
+            ),
+            (
+                DhcpOption::DnsServers(vec![Ipv6Addr::LOCALHOST; 4095]),
+                false,
+            ),
             (DhcpOption::Oro(vec![23; 32759]), true),
             (DhcpOption::Oro(vec![23; 32760]), false),
-            (DhcpOption::StatusCode(StatusCode { code: 0, message: "x".repeat(70000) }), false),
+            (
+                DhcpOption::StatusCode(StatusCode {
+                    code: 0,
+                    message: "x".repeat(70000),
+                }),
+                false,
+            ),
         ] {
-            let value = Message { options: vec![option], ..Message::new(msg::REPLY, 1) };
+            let value = Message {
+                options: vec![option],
+                ..Message::new(msg::REPLY, 1)
+            };
             let mut out = vec![0x5a];
             if fits {
                 value.write(&mut out).unwrap();
@@ -1902,9 +2257,13 @@ mod tests {
 
         // A relay whose inner message does not fit is refused.
         let mut huge = Message::new(msg::SOLICIT, 0);
-        huge.options.push(DhcpOption::Other { code: 1000, data: vec![0; MAX_MESSAGE - 8] });
+        huge.options.push(DhcpOption::Other {
+            code: 1000,
+            data: vec![0; MAX_MESSAGE - 8],
+        });
         assert_eq!(huge.to_bytes().unwrap().len(), MAX_MESSAGE);
-        let forw = Message::relay_forward(&huge, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED).unwrap();
+        let forw =
+            Message::relay_forward(&huge, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED).unwrap();
         assert!(forw.to_bytes().is_err());
         assert!(Frame(forw).to_bytes().is_err());
     }
@@ -1912,9 +2271,17 @@ mod tests {
     /// A random option, sometimes malformed, nested up to `depth` more.
     fn random_option(r: &mut Lcg, depth: usize) -> DhcpOption {
         let nested = |r: &mut Lcg| {
-            if depth == 0 { Vec::new() } else { (0..r.index(3)).map(|_| random_option(r, depth - 1)).collect() }
+            if depth == 0 {
+                Vec::new()
+            } else {
+                (0..r.index(3))
+                    .map(|_| random_option(r, depth - 1))
+                    .collect()
+            }
         };
-        let addr = |r: &mut Lcg| Ipv6Addr::from(u128::from(r.next() as u32) << 96 | u128::from(r.next() as u32));
+        let addr = |r: &mut Lcg| {
+            Ipv6Addr::from(u128::from(r.next() as u32) << 96 | u128::from(r.next() as u32))
+        };
         match r.index(30) {
             0 => DhcpOption::ClientId(Duid(r.bytes(140))),
             1 => DhcpOption::ServerId(Duid::en(r.next() as u32, &[1, 2])),
@@ -1924,9 +2291,22 @@ mod tests {
                 t2: r.next() as u32,
                 options: nested(r),
             }),
-            3 => DhcpOption::IaTa(IaTa { iaid: r.next() as u32, options: nested(r) }),
-            4 => DhcpOption::IaAddr(IaAddr { address: addr(r), preferred: 1, valid: 2, options: nested(r) }),
-            5 => DhcpOption::IaPd(IaPd { iaid: r.next() as u32, t1: 0, t2: 0, options: nested(r) }),
+            3 => DhcpOption::IaTa(IaTa {
+                iaid: r.next() as u32,
+                options: nested(r),
+            }),
+            4 => DhcpOption::IaAddr(IaAddr {
+                address: addr(r),
+                preferred: 1,
+                valid: 2,
+                options: nested(r),
+            }),
+            5 => DhcpOption::IaPd(IaPd {
+                iaid: r.next() as u32,
+                t1: 0,
+                t2: 0,
+                options: nested(r),
+            }),
             6 => DhcpOption::IaPrefix(IaPrefix {
                 preferred: 1,
                 valid: 2,
@@ -1946,26 +2326,40 @@ mod tests {
                 info: r.bytes(20),
             }),
             12 => DhcpOption::Unicast(addr(r)),
-            13 => {
-                DhcpOption::StatusCode(StatusCode { code: r.next() as u16, message: "nö".repeat(r.index(4)) })
-            }
+            13 => DhcpOption::StatusCode(StatusCode {
+                code: r.next() as u16,
+                message: "nö".repeat(r.index(4)),
+            }),
             14 => DhcpOption::RapidCommit,
             15 => DhcpOption::UserClass((0..r.index(4)).map(|_| r.bytes(6)).collect()),
-            16 => DhcpOption::VendorClass { enterprise: r.next() as u32, classes: vec![r.bytes(5)] },
-            17 => DhcpOption::VendorOpts { enterprise: r.next() as u32, data: r.bytes(9) },
+            16 => DhcpOption::VendorClass {
+                enterprise: r.next() as u32,
+                classes: vec![r.bytes(5)],
+            },
+            17 => DhcpOption::VendorOpts {
+                enterprise: r.next() as u32,
+                data: r.bytes(9),
+            },
             18 => DhcpOption::InterfaceId(r.bytes(9)),
             19 => DhcpOption::ReconfigureMessage(r.next() as u8),
             20 => DhcpOption::ReconfigureAccept,
             21 => DhcpOption::DnsServers((0..r.index(4)).map(|_| addr(r)).collect()),
             22 => {
                 let names = ["a.b", "", "x..y", "-", "ä.com", "host_1.lab"];
-                DhcpOption::DomainList((0..r.index(4)).map(|_| names[r.index(names.len())].to_string()).collect())
+                DhcpOption::DomainList(
+                    (0..r.index(4))
+                        .map(|_| names[r.index(names.len())].to_string())
+                        .collect(),
+                )
             }
             23 => DhcpOption::InformationRefreshTime(r.next() as u32),
             24 => DhcpOption::SolMaxRt(r.next() as u32),
             25 => DhcpOption::InfMaxRt(r.next() as u32),
             // Other options, some with known codes and any body.
-            _ => DhcpOption::Other { code: r.index(30) as u16, data: r.bytes(30) },
+            _ => DhcpOption::Other {
+                code: r.index(30) as u16,
+                data: r.bytes(30),
+            },
         }
     }
 
@@ -1974,7 +2368,9 @@ mod tests {
         m.transaction = r.next() as u32;
         m.hop_count = r.next() as u8;
         m.link_address = Ipv6Addr::from(u128::from(r.next() as u32));
-        m.options = (0..r.index(6)).map(|_| random_option(r, MAX_DEPTH + 2)).collect();
+        m.options = (0..r.index(6))
+            .map(|_| random_option(r, MAX_DEPTH + 2))
+            .collect();
         m
     }
 
@@ -2029,10 +2425,18 @@ mod tests {
             }
         }
         assert_eq!(seeds.len(), 21);
-        assert!(seeds.iter().any(|bytes| Message::parse(bytes).unwrap().is_relay()));
+        assert!(
+            seeds
+                .iter()
+                .any(|bytes| Message::parse(bytes).unwrap().is_relay())
+        );
         let mut accepted = 0;
         for round in 0..6000 {
-            let mut data = if round % 4 == 0 { r.bytes(80) } else { seeds[r.index(seeds.len())].clone() };
+            let mut data = if round % 4 == 0 {
+                r.bytes(80)
+            } else {
+                seeds[r.index(seeds.len())].clone()
+            };
             for _ in 0..1 + r.index(4) {
                 mutate(&mut r, &mut data);
             }
@@ -2045,7 +2449,11 @@ mod tests {
                     contract::check_wire_value(&inner);
                 }
             }
-            contract::check_decode_with_alloc_limit(Frames::<Message>::new, &data, 2 * MAX_BUFFERED);
+            contract::check_decode_with_alloc_limit(
+                Frames::<Message>::new,
+                &data,
+                2 * MAX_BUFFERED,
+            );
         }
         assert!(accepted > 500, "{accepted}");
     }
@@ -2070,14 +2478,24 @@ mod tests {
         // still reads, with the list kept as its bytes.
         let bytes = with_option(opt::DOMAIN_LIST, &[1, b'.', 0]);
         let m = Message::parse(&bytes).unwrap();
-        assert_eq!(m.options, [DhcpOption::Other { code: opt::DOMAIN_LIST, data: vec![1, b'.', 0] }]);
+        assert_eq!(
+            m.options,
+            [DhcpOption::Other {
+                code: opt::DOMAIN_LIST,
+                data: vec![1, b'.', 0]
+            }]
+        );
         assert_eq!(m.to_bytes().unwrap(), bytes);
     }
 
     #[test]
     fn review_vendor_and_dns_bodies() {
         let bad = |code: u16, body: &[u8]| {
-            assert_eq!(Message::parse(&with_option(code, body)), Err(Error::BadOption(code)), "{code} {body:?}");
+            assert_eq!(
+                Message::parse(&with_option(code, body)),
+                Err(Error::BadOption(code)),
+                "{code} {body:?}"
+            );
         };
         // RFC 8415, section 21.16: one or more vendor classes.
         bad(opt::VENDOR_CLASS, &[0, 0, 0, 1]);
@@ -2089,12 +2507,21 @@ mod tests {
         bad(opt::DNS_SERVERS, &[]);
         let mut m = Message::new(msg::REPLY, 1);
         m.options = vec![
-            DhcpOption::VendorClass { enterprise: 1, classes: vec![] },
-            DhcpOption::VendorOpts { enterprise: 1, data: vec![0] },
+            DhcpOption::VendorClass {
+                enterprise: 1,
+                classes: vec![],
+            },
+            DhcpOption::VendorOpts {
+                enterprise: 1,
+                data: vec![0],
+            },
             DhcpOption::DnsServers(vec![]),
         ];
         for option in m.options {
-            let value = Message { options: vec![option], ..Message::new(msg::REPLY, 1) };
+            let value = Message {
+                options: vec![option],
+                ..Message::new(msg::REPLY, 1)
+            };
             assert!(value.to_bytes().is_err());
             contract::check_wire_value(&value);
         }
@@ -2116,7 +2543,11 @@ mod tests {
         assert_eq!(stream.buffered(), MAX_BUFFERED);
         assert_eq!(stream.next(), Some(Ok(Err(Error::Short))));
         assert_eq!(stream.push(&[0; 4096]), 2);
-        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &[0; 4096], 2 * MAX_BUFFERED);
+        contract::check_decode_with_alloc_limit(
+            Frames::<Message>::new,
+            &[0; 4096],
+            2 * MAX_BUFFERED,
+        );
     }
 
     #[test]
@@ -2134,13 +2565,21 @@ mod tests {
     #[test]
     fn writer_refuses_relays_that_do_not_fit() {
         let mut huge = Message::new(msg::SOLICIT, 0);
-        huge.options.push(DhcpOption::Other { code: 1000, data: vec![0; MAX_MESSAGE - 8] });
+        huge.options.push(DhcpOption::Other {
+            code: 1000,
+            data: vec![0; MAX_MESSAGE - 8],
+        });
         assert!(huge.to_bytes().is_ok());
-        let forw = Message::relay_forward(&huge, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED).unwrap();
+        let forw =
+            Message::relay_forward(&huge, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED).unwrap();
         assert!(forw.to_bytes().is_err());
-        let small =
-            Message::relay_forward(&Message::new(msg::SOLICIT, 1), 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED)
-                .unwrap();
+        let small = Message::relay_forward(
+            &Message::new(msg::SOLICIT, 1),
+            0,
+            Ipv6Addr::UNSPECIFIED,
+            Ipv6Addr::UNSPECIFIED,
+        )
+        .unwrap();
         assert!(small.to_bytes().is_ok());
     }
 }

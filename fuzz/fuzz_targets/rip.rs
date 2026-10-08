@@ -4,13 +4,25 @@
 use fictionet::stdlib::rip::{
     Entries, MAX_PREFIX_LEN, Message, NgEntries, NgEntry, NgMessage, Received,
 };
-use fictionet::stdlib::{codec::{Wire, Collect, Stream}, test_support::contract, rip};
+use fictionet::stdlib::{
+    codec::{Collect, Stream, Wire},
+    rip,
+    test_support::contract,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(|| Collect::<rip::Message>::new(rip::MAX_MESSAGE), data, 2 * (rip::MAX_MESSAGE + 1));
+    contract::check_decode_with_alloc_limit(
+        || Collect::<rip::Message>::new(rip::MAX_MESSAGE),
+        data,
+        2 * (rip::MAX_MESSAGE + 1),
+    );
     contract::check_wire::<rip::Message>(data);
-    contract::check_decode_with_alloc_limit(|| Collect::<rip::NgMessage>::new(rip::MAX_NG_MESSAGE), data, 2 * (rip::MAX_NG_MESSAGE + 1));
+    contract::check_decode_with_alloc_limit(
+        || Collect::<rip::NgMessage>::new(rip::MAX_NG_MESSAGE),
+        data,
+        2 * (rip::MAX_NG_MESSAGE + 1),
+    );
     contract::check_wire::<rip::NgMessage>(data);
 
     let message = Message {
@@ -29,16 +41,25 @@ fuzz_target!(|data: &[u8]| {
         let mut stream = Stream::new(Collect::<Message>::new(rip::MAX_MESSAGE));
         assert_eq!(stream.push(data), data.len());
         stream.end();
-        assert_eq!(stream.with_next(|message, raw, span| {
-            assert_eq!(raw, data);
-            assert_eq!(span, 0..data.len() as u64);
-            message
-        }), Some(Ok(m.clone())));
+        assert_eq!(
+            stream.with_next(|message, raw, span| {
+                assert_eq!(raw, data);
+                assert_eq!(span, 0..data.len() as u64);
+                message
+            }),
+            Some(Ok(m.clone()))
+        );
         let bytes = m.to_bytes().unwrap();
         assert_eq!(bytes.len(), data.len());
         assert_eq!(Message::parse(&bytes).as_ref(), Ok(m));
         // Reading as a router does agrees on every message parse takes.
-        assert_eq!(Message::receive(data), Ok(Received { message: m.clone(), skipped: vec![] }));
+        assert_eq!(
+            Message::receive(data),
+            Ok(Received {
+                message: m.clone(),
+                skipped: vec![]
+            })
+        );
     }
     // A router keeps only routes that pass the checks.
     if let Ok(r) = Message::receive(data)
@@ -57,7 +78,13 @@ fuzz_target!(|data: &[u8]| {
         let bytes = m.to_bytes().unwrap();
         assert_eq!(bytes.len(), data.len());
         assert_eq!(NgMessage::parse(&bytes).as_ref(), Ok(m));
-        assert_eq!(NgMessage::receive(data), Ok(Received { message: m.clone(), skipped: vec![] }));
+        assert_eq!(
+            NgMessage::receive(data),
+            Ok(Received {
+                message: m.clone(),
+                skipped: vec![]
+            })
+        );
     }
     // RFC 2080: next hops are link-local or ::, and kept routes are valid.
     if let Ok(r) = NgMessage::receive(data)
@@ -65,7 +92,9 @@ fuzz_target!(|data: &[u8]| {
     {
         for e in entries {
             match e {
-                NgEntry::NextHop(a) => assert!(a.is_unspecified() || a.segments()[0] & 0xffc0 == 0xfe80),
+                NgEntry::NextHop(a) => {
+                    assert!(a.is_unspecified() || a.segments()[0] & 0xffc0 == 0xfe80)
+                }
                 NgEntry::Route(x) => {
                     assert!(x.prefix_len <= MAX_PREFIX_LEN);
                     assert!(r.message.command.allows_metric(u32::from(x.metric)));

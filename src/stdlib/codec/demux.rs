@@ -1,13 +1,11 @@
 extern crate alloc;
 
 use alloc::collections::{BTreeMap, BTreeSet};
-use fictionet::stdlib::codec::{
-    Decode, Fail, Stream,
-};
 use core::{
     cell::Cell,
     ops::Bound::{Excluded, Unbounded},
 };
+use fictionet::stdlib::codec::{Decode, Fail, Stream};
 
 struct Entry<D: Decode> {
     stream: Option<Stream<D>>,

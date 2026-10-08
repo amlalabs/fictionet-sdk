@@ -116,7 +116,8 @@ pub const MAX_SEQUENCE: u64 = (1 << 48) - 1;
 pub const MAX_RECORDS_PER_DATAGRAM: usize = 256;
 /// The largest encoded datagram under the record count and size limits.
 /// A world must also enforce the size of its UDP transport.
-pub const MAX_DATAGRAM_LEN: usize = MAX_RECORDS_PER_DATAGRAM * (RECORD_HEADER_LEN + MAX_CID_LEN + MAX_PLAIN_FRAGMENT);
+pub const MAX_DATAGRAM_LEN: usize =
+    MAX_RECORDS_PER_DATAGRAM * (RECORD_HEADER_LEN + MAX_CID_LEN + MAX_PLAIN_FRAGMENT);
 /// The most handshake fragments [`Fragments::parse`] reads from one
 /// record.
 pub const MAX_FRAGMENTS_PER_RECORD: usize = 2048;
@@ -149,8 +150,8 @@ pub const MAX_EXTENSIONS_LEN: usize = 65535;
 /// The random value of a DTLS 1.3 ServerHello that is a HelloRetryRequest:
 /// the SHA-256 hash of "HelloRetryRequest" (RFC 8446, section 4.1.3).
 pub const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
-    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91, 0xc2, 0xa2, 0x11,
-    0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
 ];
 
 /// Protocol versions as they appear on the wire. DTLS counts down from
@@ -288,7 +289,11 @@ impl ContentType {
 
     /// The content type with number `n`, if it lies in 20 to 31.
     pub fn new(n: u8) -> Option<ContentType> {
-        if (Self::MIN..=Self::MAX).contains(&n) { Some(ContentType(n)) } else { None }
+        if (Self::MIN..=Self::MAX).contains(&n) {
+            Some(ContentType(n))
+        } else {
+            None
+        }
     }
 
     /// The content type's number.
@@ -449,11 +454,17 @@ impl std::fmt::Display for Error {
             Error::ContentType(t) => write!(f, "first byte {t} starts no DTLS record"),
             Error::RecordTruncated => write!(f, "the bytes end inside a record"),
             Error::Length(n) => write!(f, "record length {n} is over the limit"),
-            Error::TooManyRecords => write!(f, "more than {MAX_RECORDS_PER_DATAGRAM} records in a datagram"),
+            Error::TooManyRecords => write!(
+                f,
+                "more than {MAX_RECORDS_PER_DATAGRAM} records in a datagram"
+            ),
             Error::FieldTruncated => write!(f, "the bytes end inside a field"),
             Error::TooLong(n) => write!(f, "message length {n} is over {MAX_MESSAGE_LEN}"),
             Error::FragmentRange => write!(f, "the fragment runs past the end of its message"),
-            Error::TooManyFragments => write!(f, "more than {MAX_FRAGMENTS_PER_RECORD} fragments in a record"),
+            Error::TooManyFragments => write!(
+                f,
+                "more than {MAX_FRAGMENTS_PER_RECORD} fragments in a record"
+            ),
             Error::BodyTrailing => write!(f, "bytes left after the body"),
             Error::SessionId(n) => write!(f, "session ID of {n} bytes, over {MAX_SESSION_ID}"),
             Error::CipherSuites => write!(f, "cipher suite list empty or of an odd length"),
@@ -461,9 +472,13 @@ impl std::fmt::Display for Error {
             Error::Extensions => write!(f, "an extension runs past the extension block"),
             Error::DuplicateExtension(t) => write!(f, "two extensions of type {t}"),
             Error::FragmentInvalid => write!(f, "the fragment's fields disagree"),
-            Error::FragmentConflict => write!(f, "the fragment disagrees with earlier ones of its message"),
+            Error::FragmentConflict => {
+                write!(f, "the fragment disagrees with earlier ones of its message")
+            }
             Error::OutsideWindow(s) => write!(f, "message sequence {s} is too far ahead"),
-            Error::TooManyRanges => write!(f, "more than {MAX_FRAGMENT_RANGES} pieces of one message"),
+            Error::TooManyRanges => {
+                write!(f, "more than {MAX_FRAGMENT_RANGES} pieces of one message")
+            }
             Error::ReassemblyMemory => write!(f, "more than {MAX_REASSEMBLY_BYTES} bytes held"),
         }
     }
@@ -477,15 +492,23 @@ impl Record {
     /// chose, 0 if it uses none. A unified header without a length takes
     /// every byte left.
     fn parse_prefix(b: &[u8], cid_len: u8) -> Result<(Self, usize), Error> {
-        let Some(&first) = b.first() else { return Err(Error::Empty) };
+        let Some(&first) = b.first() else {
+            return Err(Error::Empty);
+        };
         let short = |_: Truncated| Error::RecordTruncated;
         let mut r = Reader::new(b);
         if first & unified_bits::FIXED_MASK == unified_bits::FIXED {
             r.u8().map_err(short)?;
-            let connection_id =
-                if first & unified_bits::CID != 0 { Some(r.take(usize::from(cid_len)).map_err(short)?.to_vec()) } else { None };
-            let sequence =
-                if first & unified_bits::SEQ16 != 0 { Sequence::Long(r.u16_be().map_err(short)?) } else { Sequence::Short(r.u8().map_err(short)?) };
+            let connection_id = if first & unified_bits::CID != 0 {
+                Some(r.take(usize::from(cid_len)).map_err(short)?.to_vec())
+            } else {
+                None
+            };
+            let sequence = if first & unified_bits::SEQ16 != 0 {
+                Sequence::Long(r.u16_be().map_err(short)?)
+            } else {
+                Sequence::Short(r.u8().map_err(short)?)
+            };
             let has_length = first & unified_bits::LENGTH != 0;
             let payload = if has_length {
                 let len = usize::from(r.u16_be().map_err(short)?);
@@ -509,19 +532,31 @@ impl Record {
             };
             return Ok((Record::Unified(record), r.position()));
         }
-        let Some(content_type) = ContentType::new(first) else { return Err(Error::ContentType(first)) };
+        let Some(content_type) = ContentType::new(first) else {
+            return Err(Error::ContentType(first));
+        };
         r.u8().map_err(short)?;
         let version = r.u16_be().map_err(short)?;
         let epoch = r.u16_be().map_err(short)?;
         let sequence = r.u48().map_err(short)?;
-        let connection_id =
-            if content_type == ContentType::TLS12_CID { r.take(usize::from(cid_len)).map_err(short)?.to_vec() } else { Vec::new() };
+        let connection_id = if content_type == ContentType::TLS12_CID {
+            r.take(usize::from(cid_len)).map_err(short)?.to_vec()
+        } else {
+            Vec::new()
+        };
         let len = usize::from(r.u16_be().map_err(short)?);
         if len > plain_limit(epoch) {
             return Err(Error::Length(len));
         }
         let fragment = r.take(len).map_err(short)?.to_vec();
-        let record = PlainRecord { content_type, version, epoch, sequence, connection_id, fragment };
+        let record = PlainRecord {
+            content_type,
+            version,
+            epoch,
+            sequence,
+            connection_id,
+            fragment,
+        };
         Ok((Record::Plain(record), r.position()))
     }
 }
@@ -598,7 +633,11 @@ impl Wire for Datagram {
 
 /// The most bytes a record with the 13-byte header carries in `epoch`.
 fn plain_limit(epoch: u16) -> usize {
-    if epoch == 0 { MAX_PLAINTEXT } else { MAX_PLAIN_FRAGMENT }
+    if epoch == 0 {
+        MAX_PLAINTEXT
+    } else {
+        MAX_PLAIN_FRAGMENT
+    }
 }
 
 /// One fragment of a handshake message: the 12-byte header and the bytes
@@ -636,7 +675,16 @@ impl Fragment {
             return Err(Error::FragmentRange);
         }
         let body = r.take(fragment_length as usize)?.to_vec();
-        Ok((Fragment { msg_type, length, message_seq, offset, body }, r.position()))
+        Ok((
+            Fragment {
+                msg_type,
+                length,
+                message_seq,
+                offset,
+                body,
+            },
+            r.position(),
+        ))
     }
 
     /// Whether this fragment covers its whole message.
@@ -684,7 +732,8 @@ impl Handshake {
             return Ok(vec![self.to_fragment()?]);
         }
         let step = max_body.clamp(1, MAX_MESSAGE_LEN);
-        Ok(body.chunks(step)
+        Ok(body
+            .chunks(step)
             .enumerate()
             .map(|(i, chunk)| Fragment {
                 msg_type: self.msg_type,
@@ -701,7 +750,9 @@ impl Handshake {
         match self.msg_type {
             handshake_type::CLIENT_HELLO => ClientHello::parse(&self.body).map(Body::ClientHello),
             handshake_type::SERVER_HELLO => ServerHello::parse(&self.body).map(Body::ServerHello),
-            handshake_type::HELLO_VERIFY_REQUEST => HelloVerifyRequest::parse(&self.body).map(Body::HelloVerifyRequest),
+            handshake_type::HELLO_VERIFY_REQUEST => {
+                HelloVerifyRequest::parse(&self.body).map(Body::HelloVerifyRequest)
+            }
             other => Ok(Body::Other(other)),
         }
     }
@@ -777,7 +828,13 @@ impl ClientHello {
         if n < 2 || usize::from(n) != list.len() || !n.is_multiple_of(2) {
             return None;
         }
-        Some(list.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect())
+        Some(
+            list.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect(),
+        )
     }
 }
 
@@ -882,7 +939,10 @@ impl Reassembler {
     /// A reassembler that expects message `seq` first. A DTLS 1.2 server
     /// that answered with a HelloVerifyRequest expects message 1 next.
     pub fn starting_at(seq: u16) -> Reassembler {
-        Reassembler { next_seq: seq, ..Reassembler::default() }
+        Reassembler {
+            next_seq: seq,
+            ..Reassembler::default()
+        }
     }
 
     /// The message sequence number of the next message to be given out.
@@ -919,7 +979,10 @@ impl Reassembler {
         if ahead >= MAX_PENDING_MESSAGES {
             return Err(Error::OutsideWindow(f.message_seq));
         }
-        let found = self.pending.iter().position(|p| p.message_seq == f.message_seq);
+        let found = self
+            .pending
+            .iter()
+            .position(|p| p.message_seq == f.message_seq);
         let ranges = match found {
             Some(i) => {
                 let p = &self.pending[i];
@@ -940,7 +1003,11 @@ impl Reassembler {
                     }
                     self.make_room(length);
                 }
-                if start == end { Vec::new() } else { vec![(start, end)] }
+                if start == end {
+                    Vec::new()
+                } else {
+                    vec![(start, end)]
+                }
             }
         };
         if ranges.len() > MAX_FRAGMENT_RANGES {
@@ -986,7 +1053,8 @@ impl Reassembler {
     fn make_room(&mut self, length: usize) {
         while self.held.saturating_add(length) > MAX_REASSEMBLY_BYTES {
             let next = self.next_seq;
-            let Some(i) = (0..self.pending.len()).max_by_key(|&i| self.pending[i].message_seq.wrapping_sub(next))
+            let Some(i) = (0..self.pending.len())
+                .max_by_key(|&i| self.pending[i].message_seq.wrapping_sub(next))
             else {
                 return;
             };
@@ -997,11 +1065,18 @@ impl Reassembler {
 
     /// The next message in sequence, if all of it has come.
     pub fn next_message(&mut self) -> Option<Handshake> {
-        let i = self.pending.iter().position(|p| p.message_seq == self.next_seq && p.is_whole())?;
+        let i = self
+            .pending
+            .iter()
+            .position(|p| p.message_seq == self.next_seq && p.is_whole())?;
         let p = self.pending.swap_remove(i);
         self.held -= p.data.len();
         self.next_seq = self.next_seq.wrapping_add(1);
-        Some(Handshake { msg_type: p.msg_type, message_seq: p.message_seq, body: p.data })
+        Some(Handshake {
+            msg_type: p.msg_type,
+            message_seq: p.message_seq,
+            body: p.data,
+        })
     }
 }
 
@@ -1062,7 +1137,10 @@ fn extensions(r: &mut Reader<'_>) -> Result<Option<Vec<Extension>>, Error> {
         if !seen.insert(typ) {
             return Err(Error::DuplicateExtension(typ));
         }
-        out.push(Extension { typ, data: data.to_vec() });
+        out.push(Extension {
+            typ,
+            data: data.to_vec(),
+        });
     }
     Ok(Some(out))
 }
@@ -1085,11 +1163,16 @@ impl TypeSet {
 }
 
 fn put_extensions(out: &mut Vec<u8>, extensions: Option<&[Extension]>) -> Result<(), Error> {
-    let Some(extensions) = extensions else { return Ok(()) };
+    let Some(extensions) = extensions else {
+        return Ok(());
+    };
     let mut block = Vec::new();
     let mut seen = TypeSet::new();
     for e in extensions {
-        if e.data.len() > MAX_EXTENSIONS_LEN || block.len() + 4 + e.data.len() > MAX_EXTENSIONS_LEN || !seen.insert(e.typ) {
+        if e.data.len() > MAX_EXTENSIONS_LEN
+            || block.len() + 4 + e.data.len() > MAX_EXTENSIONS_LEN
+            || !seen.insert(e.typ)
+        {
             return Err(Error::Unwritable);
         }
         block.extend_from_slice(&e.typ.to_be_bytes());
@@ -1102,7 +1185,10 @@ fn put_extensions(out: &mut Vec<u8>, extensions: Option<&[Extension]>) -> Result
 }
 
 fn find_extension(extensions: Option<&[Extension]>, typ: u16) -> Option<&[u8]> {
-    extensions?.iter().find(|e| e.typ == typ).map(|e| e.data.as_slice())
+    extensions?
+        .iter()
+        .find(|e| e.typ == typ)
+        .map(|e| e.data.as_slice())
 }
 
 /// Writes `b`, at most 255 bytes, behind a one-byte length.
@@ -1130,7 +1216,9 @@ trait ReadFields<'a> {
 impl<'a> ReadFields<'a> for Reader<'a> {
     fn u48(&mut self) -> Result<u64, Truncated> {
         let s = self.take(6)?;
-        Ok(u64::from_be_bytes([0, 0, s[0], s[1], s[2], s[3], s[4], s[5]]))
+        Ok(u64::from_be_bytes([
+            0, 0, s[0], s[1], s[2], s[3], s[4], s[5],
+        ]))
     }
 
     fn vec8(&mut self) -> Result<&'a [u8], Truncated> {
@@ -1172,8 +1260,13 @@ impl Record {
         let mut out = Vec::new();
         match self {
             Record::Plain(p) => {
-                if p.sequence > MAX_SEQUENCE || p.fragment.len() > plain_limit(p.epoch)
-                    || if p.content_type == ContentType::TLS12_CID { p.connection_id.len() != usize::from(cid_len) } else { !p.connection_id.is_empty() }
+                if p.sequence > MAX_SEQUENCE
+                    || p.fragment.len() > plain_limit(p.epoch)
+                    || if p.content_type == ContentType::TLS12_CID {
+                        p.connection_id.len() != usize::from(cid_len)
+                    } else {
+                        !p.connection_id.is_empty()
+                    }
                 {
                     return Err(Error::Unwritable);
                 }
@@ -1189,8 +1282,11 @@ impl Record {
                 out.extend_from_slice(fragment);
             }
             Record::Unified(u) => {
-                if u.epoch_bits > unified_bits::EPOCH_MASK || u.payload.len() > MAX_UNIFIED_PAYLOAD
-                    || u.connection_id.as_ref().is_some_and(|id| id.len() != usize::from(cid_len))
+                if u.epoch_bits > unified_bits::EPOCH_MASK
+                    || u.payload.len() > MAX_UNIFIED_PAYLOAD
+                    || u.connection_id
+                        .as_ref()
+                        .is_some_and(|id| id.len() != usize::from(cid_len))
                 {
                     return Err(Error::Unwritable);
                 }
@@ -1241,7 +1337,10 @@ impl Wire for Fragment {
     /// Appends the complete fragment. Refuses messages above [`MAX_MESSAGE_LEN`] and
     /// fragment ranges outside their declared message. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        if self.length as usize > MAX_MESSAGE_LEN || self.offset > self.length || self.body.len() > (self.length - self.offset) as usize {
+        if self.length as usize > MAX_MESSAGE_LEN
+            || self.offset > self.length
+            || self.body.len() > (self.length - self.offset) as usize
+        {
             return Err(Error::Unwritable);
         }
         let length = self.length;
@@ -1269,7 +1368,11 @@ impl Wire for Handshake {
         if !fragment.is_whole() {
             return Err(Error::FragmentRange);
         }
-        Ok(Self { msg_type: fragment.msg_type, message_seq: fragment.message_seq, body: fragment.body })
+        Ok(Self {
+            msg_type: fragment.msg_type,
+            message_seq: fragment.message_seq,
+            body: fragment.body,
+        })
     }
 
     /// Appends one whole handshake fragment. Refuses bodies above [`MAX_MESSAGE_LEN`].
@@ -1295,13 +1398,26 @@ impl Wire for ClientHello {
         if suites.is_empty() || !suites.len().is_multiple_of(2) {
             return Err(Error::CipherSuites);
         }
-        let cipher_suites = suites.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let cipher_suites = suites
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
         let compression_methods = r.vec8()?.to_vec();
         if compression_methods.is_empty() {
             return Err(Error::CompressionMethods);
         }
         let extensions = extensions(&mut r)?;
-        Ok(ClientHello { version, random, session_id, cookie, cipher_suites, compression_methods, extensions })
+        Ok(ClientHello {
+            version,
+            random,
+            session_id,
+            cookie,
+            cipher_suites,
+            compression_methods,
+            extensions,
+        })
     }
 
     /// Appends the hello body. Refuses oversized session IDs or cookies, empty or oversized
@@ -1316,8 +1432,11 @@ impl Wire for ClientHello {
         out.extend_from_slice(&self.random);
         put_vec8(&mut out, &self.session_id)?;
         put_vec8(&mut out, &self.cookie)?;
-        if self.cipher_suites.is_empty() || self.cipher_suites.len() > MAX_CIPHER_SUITES
-            || self.compression_methods.is_empty() || self.compression_methods.len() > MAX_COMPRESSION_METHODS {
+        if self.cipher_suites.is_empty()
+            || self.cipher_suites.len() > MAX_CIPHER_SUITES
+            || self.compression_methods.is_empty()
+            || self.compression_methods.len() > MAX_COMPRESSION_METHODS
+        {
             return Err(Error::Unwritable);
         }
         let suites = &self.cipher_suites;
@@ -1347,7 +1466,14 @@ impl Wire for ServerHello {
         let cipher_suite = r.u16_be()?;
         let compression_method = r.u8()?;
         let extensions = extensions(&mut r)?;
-        Ok(ServerHello { version, random, session_id, cipher_suite, compression_method, extensions })
+        Ok(ServerHello {
+            version,
+            random,
+            session_id,
+            cipher_suite,
+            compression_method,
+            extensions,
+        })
     }
 
     /// Appends the hello body. Refuses oversized session IDs, duplicate extensions and
@@ -1427,7 +1553,9 @@ impl Wire for Fragments {
             return Err(Error::Unwritable);
         }
         let mut out = Vec::new();
-        for fragment in &self.0 { fragment.write(&mut out)?; }
+        for fragment in &self.0 {
+            fragment.write(&mut out)?;
+        }
         dst.extend_from_slice(&out);
         Ok(())
     }
@@ -1442,7 +1570,9 @@ mod tests {
 
     /// A DTLS 1.2 handshake record, laid out field by field as in RFC 6347,
     /// section 4.1: type 22, version 0xfefd, epoch 1, sequence 5, length 3.
-    const PLAIN: [u8; 16] = [22, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 5, 0, 3, 0xaa, 0xbb, 0xcc];
+    const PLAIN: [u8; 16] = [
+        22, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 5, 0, 3, 0xaa, 0xbb, 0xcc,
+    ];
 
     /// A ClientHello body: version 0xfefd, a random of 7s, an empty session
     /// ID, a 2-byte cookie, two cipher suites, compression null, and one
@@ -1484,7 +1614,9 @@ mod tests {
         // The full 48-bit sequence number.
         let mut b = PLAIN;
         b[5..11].copy_from_slice(&[0xff; 6]);
-        let Record::Plain(p) = Record::read(&b, 0).unwrap() else { panic!() };
+        let Record::Plain(p) = Record::read(&b, 0).unwrap() else {
+            panic!()
+        };
         assert_eq!(p.sequence, MAX_SEQUENCE);
     }
 
@@ -1492,7 +1624,9 @@ mod tests {
     fn tls12_cid_record() {
         // RFC 9146: the connection ID sits between the sequence number and
         // the length.
-        let b = [25, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 9, 0x11, 0x22, 0, 1, 0x55];
+        let b = [
+            25, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 9, 0x11, 0x22, 0, 1, 0x55,
+        ];
         let r = Record::read(&b, 2).unwrap();
         assert_eq!(r.datagram(2).unwrap().to_bytes().unwrap().len(), b.len());
         let Record::Plain(p) = &r else { panic!() };
@@ -1501,7 +1635,16 @@ mod tests {
         assert_eq!(p.fragment, [0x55]);
         assert_eq!(r.datagram(2).unwrap().to_bytes().unwrap(), b);
         // Other types carry no connection ID, whatever its length.
-        assert_eq!(Record::read(&PLAIN, 2).unwrap().datagram(2).unwrap().to_bytes().unwrap().len(), 16);
+        assert_eq!(
+            Record::read(&PLAIN, 2)
+                .unwrap()
+                .datagram(2)
+                .unwrap()
+                .to_bytes()
+                .unwrap()
+                .len(),
+            16
+        );
     }
 
     #[test]
@@ -1536,27 +1679,50 @@ mod tests {
         assert_eq!(u.payload, [1, 2, 3, 4]);
         assert_eq!(r.datagram(3).unwrap().to_bytes().unwrap(), b);
         // The top three bits decide: 0x3f is unified, 0x40 is neither.
-        assert!(matches!(Record::read(&[0x3f, 0, 0, 0, 0], 0), Ok(Record::Unified(_))));
-        assert_eq!(Record::read(&[0x40, 0, 0], 0), Err(Error::ContentType(0x40)));
+        assert!(matches!(
+            Record::read(&[0x3f, 0, 0, 0, 0], 0),
+            Ok(Record::Unified(_))
+        ));
+        assert_eq!(
+            Record::read(&[0x40, 0, 0], 0),
+            Err(Error::ContentType(0x40))
+        );
     }
 
     #[test]
     fn record_errors() {
         assert_eq!(Record::read(&[], 0), Err(Error::Empty));
-        assert_eq!(Record::read(&[19, 0xfe, 0xfd], 0), Err(Error::ContentType(19)));
+        assert_eq!(
+            Record::read(&[19, 0xfe, 0xfd], 0),
+            Err(Error::ContentType(19))
+        );
         assert_eq!(Record::read(&[0xff], 0), Err(Error::ContentType(0xff)));
         // Every prefix of a plain record ends inside it.
         for n in 1..PLAIN.len() {
-            assert_eq!(Record::read(&PLAIN[..n], 0), Err(Error::RecordTruncated), "{n} bytes");
+            assert_eq!(
+                Record::read(&PLAIN[..n], 0),
+                Err(Error::RecordTruncated),
+                "{n} bytes"
+            );
         }
-        let cid = [25, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 9, 0x11, 0x22, 0, 1, 0x55];
+        let cid = [
+            25, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 9, 0x11, 0x22, 0, 1, 0x55,
+        ];
         for n in 1..cid.len() {
-            assert_eq!(Record::read(&cid[..n], 2), Err(Error::RecordTruncated), "{n} bytes");
+            assert_eq!(
+                Record::read(&cid[..n], 2),
+                Err(Error::RecordTruncated),
+                "{n} bytes"
+            );
         }
         // Every prefix of a unified record with a length.
         let u = [0x3c, 0xaa, 0x01, 0x02, 0x00, 0x02, 0xde, 0xad];
         for n in 1..u.len() {
-            assert_eq!(Record::read(&u[..n], 1), Err(Error::RecordTruncated), "{n} bytes");
+            assert_eq!(
+                Record::read(&u[..n], 1),
+                Err(Error::RecordTruncated),
+                "{n} bytes"
+            );
         }
         // Without a length, a prefix past the sequence number still reads.
         let u = [0x30, 0xaa, 0x01, 0xde, 0xad];
@@ -1566,12 +1732,18 @@ mod tests {
         // Lengths over the limits.
         let mut b = PLAIN;
         b[11..13].copy_from_slice(&((MAX_PLAIN_FRAGMENT + 1) as u16).to_be_bytes());
-        assert_eq!(Record::read(&b, 0), Err(Error::Length(MAX_PLAIN_FRAGMENT + 1)));
+        assert_eq!(
+            Record::read(&b, 0),
+            Err(Error::Length(MAX_PLAIN_FRAGMENT + 1))
+        );
         let b = [0x2c, 0, 0, 0xff, 0xff];
         assert_eq!(Record::read(&b, 0), Err(Error::Length(0xffff)));
         let mut b = vec![0x20, 0];
         b.extend(std::iter::repeat_n(0, MAX_UNIFIED_PAYLOAD + 1));
-        assert_eq!(Record::read(&b, 0), Err(Error::Length(MAX_UNIFIED_PAYLOAD + 1)));
+        assert_eq!(
+            Record::read(&b, 0),
+            Err(Error::Length(MAX_UNIFIED_PAYLOAD + 1))
+        );
         b.pop();
         assert!(Record::read(&b, 0).is_ok());
     }
@@ -1586,7 +1758,9 @@ mod tests {
             has_length: false,
             payload: vec![9; 5],
         });
-        let Record::Unified(mut framed) = tail.clone() else { panic!() };
+        let Record::Unified(mut framed) = tail.clone() else {
+            panic!()
+        };
         framed.has_length = true;
         let framed = Record::Unified(framed);
         let records = vec![plain.clone(), framed.clone(), plain.clone(), tail.clone()];
@@ -1604,9 +1778,17 @@ mod tests {
         assert_eq!(Datagram::read(&bad, 0), Err(Error::RecordTruncated));
         // Too many records.
         let empty = [0x2c, 0, 0, 0, 0];
-        let many: Vec<u8> = empty.iter().copied().cycle().take(5 * (MAX_RECORDS_PER_DATAGRAM + 1)).collect();
+        let many: Vec<u8> = empty
+            .iter()
+            .copied()
+            .cycle()
+            .take(5 * (MAX_RECORDS_PER_DATAGRAM + 1))
+            .collect();
         assert_eq!(Datagram::read(&many, 0), Err(Error::TooManyRecords));
-        assert_eq!(Datagram::read(&many[5..], 0).unwrap().len(), MAX_RECORDS_PER_DATAGRAM);
+        assert_eq!(
+            Datagram::read(&many[5..], 0).unwrap().len(),
+            MAX_RECORDS_PER_DATAGRAM
+        );
         let many = Datagram::new(&vec![plain; MAX_RECORDS_PER_DATAGRAM + 5], 0);
         assert_eq!(many, Err(Error::Unwritable));
     }
@@ -1629,13 +1811,29 @@ mod tests {
         let b = [1, 0, 0, 6, 0, 3, 0, 0, 2, 0, 0, 3, 7, 8, 9];
         let f = Fragment::parse(&b).unwrap();
         assert_eq!(f.to_bytes().unwrap().len(), b.len());
-        assert_eq!(f, Fragment { msg_type: 1, length: 6, message_seq: 3, offset: 2, body: vec![7, 8, 9] });
+        assert_eq!(
+            f,
+            Fragment {
+                msg_type: 1,
+                length: 6,
+                message_seq: 3,
+                offset: 2,
+                body: vec![7, 8, 9]
+            }
+        );
         assert!(!f.is_whole());
         assert_eq!(f.to_bytes().unwrap(), b);
         for n in 0..b.len() {
-            assert_eq!(Fragment::parse(&b[..n]), Err(Error::FieldTruncated), "{n} bytes");
+            assert_eq!(
+                Fragment::parse(&b[..n]),
+                Err(Error::FieldTruncated),
+                "{n} bytes"
+            );
             if n > 0 {
-                assert_eq!(Fragments::parse(&b[..n]).map(|fragments| fragments.0), Err(Error::FieldTruncated));
+                assert_eq!(
+                    Fragments::parse(&b[..n]).map(|fragments| fragments.0),
+                    Err(Error::FieldTruncated)
+                );
             }
         }
         // Past the message's end.
@@ -1648,29 +1846,54 @@ mod tests {
         b.extend_from_slice(&[0; 8]);
         assert_eq!(Fragment::parse(&b), Err(Error::TooLong(n)));
         // Several fragments in one record, and too many.
-        let empty = Handshake { msg_type: 14, message_seq: 1, body: vec![] }.to_bytes().unwrap();
+        let empty = Handshake {
+            msg_type: 14,
+            message_seq: 1,
+            body: vec![],
+        }
+        .to_bytes()
+        .unwrap();
         assert_eq!(empty, [14, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
-        let many: Vec<u8> = empty.iter().copied().cycle().take(12 * MAX_FRAGMENTS_PER_RECORD).collect();
+        let many: Vec<u8> = empty
+            .iter()
+            .copied()
+            .cycle()
+            .take(12 * MAX_FRAGMENTS_PER_RECORD)
+            .collect();
         assert_eq!(
             Fragments::parse(&many).unwrap().0.len(),
             MAX_FRAGMENTS_PER_RECORD
         );
         let mut more = many.clone();
         more.extend_from_slice(&empty);
-        assert_eq!(Fragments::parse(&more).map(|fragments| fragments.0), Err(Error::TooManyFragments));
+        assert_eq!(
+            Fragments::parse(&more).map(|fragments| fragments.0),
+            Err(Error::TooManyFragments)
+        );
     }
 
     #[test]
     fn splitting_messages() {
-        let m = Handshake { msg_type: 11, message_seq: 2, body: (0..100).collect() };
+        let m = Handshake {
+            msg_type: 11,
+            message_seq: 2,
+            body: (0..100).collect(),
+        };
         let parts = m.fragments(30).unwrap();
         assert_eq!(parts.len(), 4);
-        assert_eq!(parts.iter().map(|f| f.offset).collect::<Vec<_>>(), [0, 30, 60, 90]);
+        assert_eq!(
+            parts.iter().map(|f| f.offset).collect::<Vec<_>>(),
+            [0, 30, 60, 90]
+        );
         assert!(parts.iter().all(|f| f.length == 100));
         assert!(m.to_fragment().unwrap().is_whole());
         assert_eq!(m.fragments(0).unwrap().len(), 100);
         assert_eq!(m.fragments(1000).unwrap(), [m.to_fragment().unwrap()]);
-        let empty = Handshake { msg_type: 14, message_seq: 0, body: vec![] };
+        let empty = Handshake {
+            msg_type: 14,
+            message_seq: 0,
+            body: vec![],
+        };
         assert_eq!(empty.fragments(10).unwrap(), [empty.to_fragment().unwrap()]);
     }
 
@@ -1684,7 +1907,10 @@ mod tests {
         assert_eq!(ch.cookie, [0xc0, 0x0c]);
         assert_eq!(ch.cipher_suites, [0xc02b, 0x1301]);
         assert_eq!(ch.compression_methods, [0]);
-        assert_eq!(ch.supported_versions(), Some(vec![version::DTLS_1_3, version::DTLS_1_2]));
+        assert_eq!(
+            ch.supported_versions(),
+            Some(vec![version::DTLS_1_3, version::DTLS_1_2])
+        );
         assert_eq!(ch.extension(extension_type::COOKIE), None);
         assert_eq!(ch.to_bytes().unwrap(), b);
         // Without the extension block, the hello ends after compression.
@@ -1703,7 +1929,11 @@ mod tests {
             }
         }
         for n in 0..short.len() {
-            assert_eq!(ClientHello::parse(&b[..n]), Err(Error::FieldTruncated), "{n} bytes");
+            assert_eq!(
+                ClientHello::parse(&b[..n]),
+                Err(Error::FieldTruncated),
+                "{n} bytes"
+            );
         }
         // An empty extension block reads as an empty list, not as `None`.
         let mut empty = short.to_vec();
@@ -1741,13 +1971,22 @@ mod tests {
         assert_eq!(ClientHello::parse(&bad), Err(Error::Extensions));
         // A malformed supported_versions list.
         let mut ch = ClientHello::parse(&b).unwrap();
-        ch.extensions = Some(vec![Extension { typ: extension_type::SUPPORTED_VERSIONS, data: vec![3, 0xfe, 0xfc, 0] }]);
+        ch.extensions = Some(vec![Extension {
+            typ: extension_type::SUPPORTED_VERSIONS,
+            data: vec![3, 0xfe, 0xfc, 0],
+        }]);
         assert_eq!(ch.supported_versions(), None);
         // RFC 8446, section 4.2.1: versions<2..254>, so an empty list is
         // malformed.
-        ch.extensions = Some(vec![Extension { typ: extension_type::SUPPORTED_VERSIONS, data: vec![0] }]);
+        ch.extensions = Some(vec![Extension {
+            typ: extension_type::SUPPORTED_VERSIONS,
+            data: vec![0],
+        }]);
         assert_eq!(ch.supported_versions(), None);
-        ch.extensions = Some(vec![Extension { typ: extension_type::SUPPORTED_VERSIONS, data: vec![2, 0xfe, 0xfc] }]);
+        ch.extensions = Some(vec![Extension {
+            typ: extension_type::SUPPORTED_VERSIONS,
+            data: vec![2, 0xfe, 0xfc],
+        }]);
         assert_eq!(ch.supported_versions(), Some(vec![version::DTLS_1_3]));
     }
 
@@ -1755,7 +1994,13 @@ mod tests {
     fn overlapping_bytes_keep_the_first_copy() {
         // A repeat that covers held bytes changes nothing, whether it covers
         // them all or only some.
-        let f = |offset: u32, body: Vec<u8>| Fragment { msg_type: 1, length: 6, message_seq: 0, offset, body };
+        let f = |offset: u32, body: Vec<u8>| Fragment {
+            msg_type: 1,
+            length: 6,
+            message_seq: 0,
+            offset,
+            body,
+        };
         let mut r = Reassembler::new();
         assert_eq!(r.add(&f(0, vec![1, 2, 3, 4])), Ok(Added::New));
         assert_eq!(r.add(&f(1, vec![9, 9])), Ok(Added::Repeat));
@@ -1773,14 +2018,28 @@ mod tests {
         // An empty fragment of a message not yet seen brings no bytes, so the
         // reassembler sets nothing aside for it and does not pin its type.
         let mut r = Reassembler::new();
-        let empty = Fragment { msg_type: 1, length: 1000, message_seq: 0, offset: 0, body: vec![] };
+        let empty = Fragment {
+            msg_type: 1,
+            length: 1000,
+            message_seq: 0,
+            offset: 0,
+            body: vec![],
+        };
         assert_eq!(r.add(&empty), Ok(Added::Repeat));
         assert_eq!(r.buffered(), 0);
-        let real = Handshake { msg_type: 2, message_seq: 0, body: vec![7; 3] };
+        let real = Handshake {
+            msg_type: 2,
+            message_seq: 0,
+            body: vec![7; 3],
+        };
         assert_eq!(r.add(&real.to_fragment().unwrap()), Ok(Added::New));
         assert_eq!(r.next_message(), Some(real));
         // An empty message is still given out.
-        let none = Handshake { msg_type: 14, message_seq: 1, body: vec![] };
+        let none = Handshake {
+            msg_type: 14,
+            message_seq: 1,
+            body: vec![],
+        };
         assert_eq!(r.add(&none.to_fragment().unwrap()), Ok(Added::New));
         assert_eq!(r.next_message(), Some(none));
     }
@@ -1790,7 +2049,11 @@ mod tests {
         // A reassembler can be cloned, so a world can try a fragment on a
         // copy first.
         let mut r = Reassembler::new();
-        let m = Handshake { msg_type: 1, message_seq: 0, body: vec![1, 2, 3, 4] };
+        let m = Handshake {
+            msg_type: 1,
+            message_seq: 0,
+            body: vec![1, 2, 3, 4],
+        };
         let parts = m.fragments(2).unwrap();
         r.add(&parts[0]).unwrap();
         let mut copy = r.clone();
@@ -1835,17 +2098,45 @@ mod tests {
         // RFC 6347, section 4.2.1: server_version, then the cookie.
         let b = [0xfe, 0xff, 3, 1, 2, 3];
         let h = HelloVerifyRequest::parse(&b).unwrap();
-        assert_eq!(h, HelloVerifyRequest { version: version::DTLS_1_0, cookie: vec![1, 2, 3] });
+        assert_eq!(
+            h,
+            HelloVerifyRequest {
+                version: version::DTLS_1_0,
+                cookie: vec![1, 2, 3]
+            }
+        );
         assert_eq!(h.to_bytes().unwrap(), b);
         for n in 0..b.len() {
-            assert_eq!(HelloVerifyRequest::parse(&b[..n]), Err(Error::FieldTruncated), "{n} bytes");
+            assert_eq!(
+                HelloVerifyRequest::parse(&b[..n]),
+                Err(Error::FieldTruncated),
+                "{n} bytes"
+            );
         }
-        assert_eq!(HelloVerifyRequest::parse(&[0xfe, 0xff, 0, 0]), Err(Error::BodyTrailing));
-        let m = Handshake { msg_type: handshake_type::HELLO_VERIFY_REQUEST, message_seq: 0, body: b.to_vec() };
+        assert_eq!(
+            HelloVerifyRequest::parse(&[0xfe, 0xff, 0, 0]),
+            Err(Error::BodyTrailing)
+        );
+        let m = Handshake {
+            msg_type: handshake_type::HELLO_VERIFY_REQUEST,
+            message_seq: 0,
+            body: b.to_vec(),
+        };
         assert_eq!(m.parse_body(), Ok(Body::HelloVerifyRequest(h)));
-        let other = Handshake { msg_type: handshake_type::FINISHED, message_seq: 4, body: vec![1, 2] };
-        assert_eq!(other.parse_body(), Ok(Body::Other(handshake_type::FINISHED)));
-        let bad = Handshake { msg_type: handshake_type::SERVER_HELLO, message_seq: 1, body: vec![1] };
+        let other = Handshake {
+            msg_type: handshake_type::FINISHED,
+            message_seq: 4,
+            body: vec![1, 2],
+        };
+        assert_eq!(
+            other.parse_body(),
+            Ok(Body::Other(handshake_type::FINISHED))
+        );
+        let bad = Handshake {
+            msg_type: handshake_type::SERVER_HELLO,
+            message_seq: 1,
+            body: vec![1],
+        };
         assert_eq!(bad.parse_body(), Err(Error::FieldTruncated));
     }
 
@@ -1854,11 +2145,20 @@ mod tests {
         let base = ClientHello::parse(&client_hello_bytes()).unwrap();
         assert_eq!(base.to_bytes().unwrap(), client_hello_bytes());
         let mut ext_block = base.clone();
-        ext_block.extensions = Some(vec![Extension { typ: 1, data: vec![0; MAX_EXTENSIONS_LEN - 3] }]);
+        ext_block.extensions = Some(vec![Extension {
+            typ: 1,
+            data: vec![0; MAX_EXTENSIONS_LEN - 3],
+        }]);
         let mut ext_sum = base.clone();
         ext_sum.extensions = Some(vec![
-            Extension { typ: 1, data: vec![0; 40000] },
-            Extension { typ: 2, data: vec![0; 30000] },
+            Extension {
+                typ: 1,
+                data: vec![0; 40000],
+            },
+            Extension {
+                typ: 2,
+                data: vec![0; 30000],
+            },
         ]);
         let with = |change: fn(&mut ClientHello)| {
             let mut c = base.clone();
@@ -1868,12 +2168,24 @@ mod tests {
         let values = [
             ("one extension", ext_block),
             ("two extensions", ext_sum),
-            ("session_id", with(|c| c.session_id = vec![1; MAX_SESSION_ID + 1])),
+            (
+                "session_id",
+                with(|c| c.session_id = vec![1; MAX_SESSION_ID + 1]),
+            ),
             ("cookie", with(|c| c.cookie = vec![2; MAX_COOKIE + 1])),
-            ("cipher_suites", with(|c| c.cipher_suites = vec![0x1301; MAX_CIPHER_SUITES + 1])),
+            (
+                "cipher_suites",
+                with(|c| c.cipher_suites = vec![0x1301; MAX_CIPHER_SUITES + 1]),
+            ),
             ("no cipher_suites", with(|c| c.cipher_suites.clear())),
-            ("compression_methods", with(|c| c.compression_methods = vec![0; MAX_COMPRESSION_METHODS + 1])),
-            ("no compression_methods", with(|c| c.compression_methods.clear())),
+            (
+                "compression_methods",
+                with(|c| c.compression_methods = vec![0; MAX_COMPRESSION_METHODS + 1]),
+            ),
+            (
+                "no compression_methods",
+                with(|c| c.compression_methods.clear()),
+            ),
         ];
         for (name, c) in values {
             assert_eq!(c.to_bytes(), Err(Error::Unwritable), "{name}");
@@ -1898,7 +2210,10 @@ mod tests {
             has_length: true,
             payload: vec![0; MAX_UNIFIED_PAYLOAD],
         };
-        for r in [Record::Plain(plain.clone()), Record::Unified(unified.clone())] {
+        for r in [
+            Record::Plain(plain.clone()),
+            Record::Unified(unified.clone()),
+        ] {
             let d = r.datagram(4).unwrap();
             assert_eq!(Datagram::read(&d.0, 4), Ok(vec![r]));
         }
@@ -1935,14 +2250,50 @@ mod tests {
 
     #[test]
     fn fragment_writer_refuses_each_range_on_its_own() {
-        let ok = Fragment { msg_type: 1, length: MAX_MESSAGE_LEN as u32, message_seq: 0, offset: 2, body: vec![1; 3] };
+        let ok = Fragment {
+            msg_type: 1,
+            length: MAX_MESSAGE_LEN as u32,
+            message_seq: 0,
+            offset: 2,
+            body: vec![1; 3],
+        };
         assert_eq!(Fragment::parse(&ok.to_bytes().unwrap()), Ok(ok.clone()));
-        let at_end = Fragment { msg_type: 1, length: 4, message_seq: 0, offset: 4, body: vec![] };
+        let at_end = Fragment {
+            msg_type: 1,
+            length: 4,
+            message_seq: 0,
+            offset: 4,
+            body: vec![],
+        };
         assert_eq!(Fragment::parse(&at_end.to_bytes().unwrap()), Ok(at_end));
         for (name, f) in [
-            ("length", Fragment { length: MAX_MESSAGE_LEN as u32 + 1, offset: 0, body: vec![], ..ok.clone() }),
-            ("offset", Fragment { length: 4, offset: 5, body: vec![], ..ok.clone() }),
-            ("body", Fragment { length: 4, offset: 2, body: vec![1; 3], ..ok.clone() }),
+            (
+                "length",
+                Fragment {
+                    length: MAX_MESSAGE_LEN as u32 + 1,
+                    offset: 0,
+                    body: vec![],
+                    ..ok.clone()
+                },
+            ),
+            (
+                "offset",
+                Fragment {
+                    length: 4,
+                    offset: 5,
+                    body: vec![],
+                    ..ok.clone()
+                },
+            ),
+            (
+                "body",
+                Fragment {
+                    length: 4,
+                    offset: 2,
+                    body: vec![1; 3],
+                    ..ok.clone()
+                },
+            ),
         ] {
             assert_eq!(f.to_bytes(), Err(Error::Unwritable), "{name}");
             contract::check_wire_value(&f);
@@ -1959,18 +2310,34 @@ mod tests {
             cipher_suites: vec![0x1301; 40000],
             compression_methods: vec![0; 300],
             extensions: Some(vec![
-                Extension { typ: 1, data: vec![0; 40000] },
-                Extension { typ: 2, data: vec![0; 30000] },
-                Extension { typ: 3, data: vec![0; 20000] },
+                Extension {
+                    typ: 1,
+                    data: vec![0; 40000],
+                },
+                Extension {
+                    typ: 2,
+                    data: vec![0; 30000],
+                },
+                Extension {
+                    typ: 3,
+                    data: vec![0; 20000],
+                },
             ]),
         };
         contract::check_wire_value(&ch);
         assert_eq!(ch.to_bytes(), Err(Error::Unwritable));
         let mut ch = ClientHello::parse(&client_hello_bytes()).unwrap();
-        ch.extensions = Some(vec![Extension { typ: 1, data: vec![0; 20000] }]);
+        ch.extensions = Some(vec![Extension {
+            typ: 1,
+            data: vec![0; 20000],
+        }]);
         // The body is too big for one record, but splits into fragments
         // that reassemble.
-        let m = Handshake { msg_type: 1, message_seq: 0, body: ch.to_bytes().unwrap() };
+        let m = Handshake {
+            msg_type: 1,
+            message_seq: 0,
+            body: ch.to_bytes().unwrap(),
+        };
         let mut r = Reassembler::new();
         for f in m.fragments(MAX_PLAINTEXT - HANDSHAKE_HEADER_LEN).unwrap() {
             let rec = Record::Plain(PlainRecord {
@@ -1981,7 +2348,11 @@ mod tests {
                 connection_id: vec![],
                 fragment: f.to_bytes().unwrap(),
             });
-            let Record::Plain(p) = Record::read(&rec.datagram(0).unwrap().to_bytes().unwrap(), 0).unwrap() else { panic!() };
+            let Record::Plain(p) =
+                Record::read(&rec.datagram(0).unwrap().to_bytes().unwrap(), 0).unwrap()
+            else {
+                panic!()
+            };
             for f in Fragments::parse(&p.fragment).unwrap().0 {
                 assert_eq!(r.add(&f), Ok(Added::New));
             }
@@ -1998,7 +2369,10 @@ mod tests {
         };
         contract::check_wire_value(&sh);
         assert_eq!(sh.to_bytes(), Err(Error::Unwritable));
-        let h = HelloVerifyRequest { version: 0, cookie: vec![0; 1000] };
+        let h = HelloVerifyRequest {
+            version: 0,
+            cookie: vec![0; 1000],
+        };
         contract::check_wire_value(&h);
         assert_eq!(h.to_bytes(), Err(Error::Unwritable));
 
@@ -2020,13 +2394,29 @@ mod tests {
         });
         assert_eq!(u.datagram(0), Err(Error::Unwritable));
 
-        let f = Fragment { msg_type: 1, length: u32::MAX, message_seq: 0, offset: u32::MAX, body: vec![1; 10] };
+        let f = Fragment {
+            msg_type: 1,
+            length: u32::MAX,
+            message_seq: 0,
+            offset: u32::MAX,
+            body: vec![1; 10],
+        };
         contract::check_wire_value(&f);
         assert_eq!(f.to_bytes(), Err(Error::Unwritable));
-        let f = Fragment { msg_type: 1, length: 4, message_seq: 0, offset: 2, body: vec![1; 10] };
+        let f = Fragment {
+            msg_type: 1,
+            length: 4,
+            message_seq: 0,
+            offset: 2,
+            body: vec![1; 10],
+        };
         contract::check_wire_value(&f);
         assert_eq!(f.to_bytes(), Err(Error::Unwritable));
-        let big = Handshake { msg_type: 1, message_seq: 0, body: vec![0; MAX_MESSAGE_LEN + 10] };
+        let big = Handshake {
+            msg_type: 1,
+            message_seq: 0,
+            body: vec![0; MAX_MESSAGE_LEN + 10],
+        };
         assert_eq!(big.to_fragment(), Err(Error::Unwritable));
         assert_eq!(big.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&big);
@@ -2034,7 +2424,11 @@ mod tests {
 
     #[test]
     fn reassembly_in_any_order() {
-        let m = Handshake { msg_type: 11, message_seq: 0, body: (0..=255).collect() };
+        let m = Handshake {
+            msg_type: 11,
+            message_seq: 0,
+            body: (0..=255).collect(),
+        };
         let mut parts = m.fragments(40).unwrap();
         parts.reverse();
         let mut r = Reassembler::new();
@@ -2050,7 +2444,11 @@ mod tests {
         assert_eq!(r.add(&parts[0]), Ok(Added::Repeat));
 
         // Overlapping pieces, and bytes already held.
-        let m = Handshake { msg_type: 2, message_seq: 1, body: (0..50).collect() };
+        let m = Handshake {
+            msg_type: 2,
+            message_seq: 1,
+            body: (0..50).collect(),
+        };
         let piece = |a: usize, b: usize| Fragment {
             msg_type: 2,
             length: 50,
@@ -2067,8 +2465,16 @@ mod tests {
         assert_eq!(r.next_message(), Some(m));
 
         // A later message waits for an earlier one.
-        let a = Handshake { msg_type: 14, message_seq: 2, body: vec![] };
-        let b = Handshake { msg_type: 16, message_seq: 3, body: vec![5; 3] };
+        let a = Handshake {
+            msg_type: 14,
+            message_seq: 2,
+            body: vec![],
+        };
+        let b = Handshake {
+            msg_type: 16,
+            message_seq: 3,
+            body: vec![5; 3],
+        };
         assert_eq!(r.add(&b.to_fragment().unwrap()), Ok(Added::New));
         assert_eq!(r.next_message(), None);
         assert_eq!(r.add(&a.to_fragment().unwrap()), Ok(Added::New));
@@ -2079,7 +2485,11 @@ mod tests {
 
     #[test]
     fn reassembly_one_byte_at_a_time() {
-        let m = Handshake { msg_type: 1, message_seq: 0, body: client_hello_bytes() };
+        let m = Handshake {
+            msg_type: 1,
+            message_seq: 0,
+            body: client_hello_bytes(),
+        };
         let mut r = Reassembler::new();
         for f in m.fragments(1).unwrap() {
             let bytes = f.to_bytes().unwrap();
@@ -2102,16 +2512,28 @@ mod tests {
             offset,
             body,
         };
-        assert_eq!(r.add(&f(65534, 4, 3, vec![1, 2])), Err(Error::FragmentInvalid));
-        assert_eq!(r.add(&f(65534, (MAX_MESSAGE_LEN + 1) as u32, 0, vec![])), Err(Error::FragmentInvalid));
-        assert_eq!(r.add(&f(65534, 4, u32::MAX, vec![1])), Err(Error::FragmentInvalid));
+        assert_eq!(
+            r.add(&f(65534, 4, 3, vec![1, 2])),
+            Err(Error::FragmentInvalid)
+        );
+        assert_eq!(
+            r.add(&f(65534, (MAX_MESSAGE_LEN + 1) as u32, 0, vec![])),
+            Err(Error::FragmentInvalid)
+        );
+        assert_eq!(
+            r.add(&f(65534, 4, u32::MAX, vec![1])),
+            Err(Error::FragmentInvalid)
+        );
         // The window wraps past 65535.
         assert_eq!(r.add(&f(5, 1, 0, vec![1])), Ok(Added::New));
         assert_eq!(r.add(&f(6, 1, 0, vec![1])), Err(Error::OutsideWindow(6)));
         assert_eq!(r.add(&f(65533, 1, 0, vec![1])), Ok(Added::Repeat));
         // A type or length that disagrees.
         assert_eq!(r.add(&f(65534, 4, 0, vec![1])), Ok(Added::New));
-        assert_eq!(r.add(&f(65534, 5, 0, vec![1])), Err(Error::FragmentConflict));
+        assert_eq!(
+            r.add(&f(65534, 5, 0, vec![1])),
+            Err(Error::FragmentConflict)
+        );
         let mut other = f(65534, 4, 1, vec![1]);
         other.msg_type = 2;
         assert_eq!(r.add(&other), Err(Error::FragmentConflict));
@@ -2123,10 +2545,16 @@ mod tests {
         let mut r = Reassembler::new();
         let n = 2 * MAX_FRAGMENT_RANGES + 2;
         for i in 0..MAX_FRAGMENT_RANGES {
-            assert_eq!(r.add(&f(0, n as u32, (2 * i) as u32, vec![0])), Ok(Added::New));
+            assert_eq!(
+                r.add(&f(0, n as u32, (2 * i) as u32, vec![0])),
+                Ok(Added::New)
+            );
         }
         let gap = (2 * MAX_FRAGMENT_RANGES) as u32;
-        assert_eq!(r.add(&f(0, n as u32, gap, vec![0])), Err(Error::TooManyRanges));
+        assert_eq!(
+            r.add(&f(0, n as u32, gap, vec![0])),
+            Err(Error::TooManyRanges)
+        );
         // Filling a gap still works, and so does the rest.
         assert_eq!(r.add(&f(0, n as u32, 1, vec![0])), Ok(Added::New));
         assert_eq!(r.add(&f(0, n as u32, gap, vec![0])), Ok(Added::New));
@@ -2140,7 +2568,10 @@ mod tests {
             assert_eq!(r.add(&f(seq, big, 0, vec![0])), Ok(Added::New));
             seq += 1;
         }
-        assert_eq!(r.add(&f(seq, big, 0, vec![0])), Err(Error::ReassemblyMemory));
+        assert_eq!(
+            r.add(&f(seq, big, 0, vec![0])),
+            Err(Error::ReassemblyMemory)
+        );
         assert_eq!(r.buffered(), MAX_REASSEMBLY_BYTES);
         const { assert!(MAX_MESSAGE_LEN <= MAX_REASSEMBLY_BYTES) };
     }
@@ -2220,7 +2651,10 @@ mod tests {
         ];
         let selected = [records[0].clone(), records[3].clone(), records[4].clone()];
         let datagram = Datagram::new(&selected, 1).unwrap();
-        assert_eq!(Datagram::read(&datagram.to_bytes().unwrap(), 1).unwrap(), selected);
+        assert_eq!(
+            Datagram::read(&datagram.to_bytes().unwrap(), 1).unwrap(),
+            selected
+        );
         contract::check_wire_value(&datagram);
         assert_eq!(Datagram::new(&records, 1), Err(Error::Unwritable));
     }
@@ -2238,9 +2672,14 @@ mod tests {
             b
         };
         assert!(Record::read(&record(0, MAX_PLAINTEXT), 0).is_ok());
-        assert_eq!(Record::read(&record(0, MAX_PLAINTEXT + 1), 0), Err(Error::Length(MAX_PLAINTEXT + 1)));
+        assert_eq!(
+            Record::read(&record(0, MAX_PLAINTEXT + 1), 0),
+            Err(Error::Length(MAX_PLAINTEXT + 1))
+        );
         assert!(Record::read(&record(1, MAX_PLAIN_FRAGMENT), 0).is_ok());
-        let Ok(Record::Plain(mut p)) = Record::read(&record(1, MAX_PLAIN_FRAGMENT), 0) else { panic!() };
+        let Ok(Record::Plain(mut p)) = Record::read(&record(1, MAX_PLAIN_FRAGMENT), 0) else {
+            panic!()
+        };
         p.epoch = 0;
         let value = Record::Plain(p);
         assert_eq!(value.datagram(0), Err(Error::Unwritable));
@@ -2253,25 +2692,49 @@ mod tests {
         let mut r = Reassembler::new();
         let quarter = (MAX_REASSEMBLY_BYTES / 4) as u32;
         for seq in 1..=4 {
-            let f = Fragment { msg_type: 1, length: quarter, message_seq: seq, offset: 0, body: vec![1] };
+            let f = Fragment {
+                msg_type: 1,
+                length: quarter,
+                message_seq: seq,
+                offset: 0,
+                body: vec![1],
+            };
             assert_eq!(r.add(&f), Ok(Added::New));
         }
-        let first = Handshake { msg_type: 1, message_seq: 0, body: vec![7] };
+        let first = Handshake {
+            msg_type: 1,
+            message_seq: 0,
+            body: vec![7],
+        };
         assert_eq!(r.add(&first.to_fragment().unwrap()), Ok(Added::New));
         assert!(r.buffered() <= MAX_REASSEMBLY_BYTES);
         assert_eq!(r.next_message(), Some(first));
         // The furthest message made way; the nearer ones stay.
         assert_eq!(r.buffered(), 3 * quarter as usize);
-        let second = Handshake { msg_type: 1, message_seq: 1, body: vec![1; quarter as usize] };
+        let second = Handshake {
+            msg_type: 1,
+            message_seq: 1,
+            body: vec![1; quarter as usize],
+        };
         assert_eq!(r.add(&second.to_fragment().unwrap()), Ok(Added::New));
         assert_eq!(r.next_message(), Some(second));
         // A message for the next place always fits, whatever is held.
         let mut r = Reassembler::new();
         for seq in 1..=4 {
-            let f = Fragment { msg_type: 1, length: quarter, message_seq: seq, offset: 0, body: vec![1] };
+            let f = Fragment {
+                msg_type: 1,
+                length: quarter,
+                message_seq: seq,
+                offset: 0,
+                body: vec![1],
+            };
             r.add(&f).unwrap();
         }
-        let big = Handshake { msg_type: 1, message_seq: 0, body: vec![5; MAX_MESSAGE_LEN] };
+        let big = Handshake {
+            msg_type: 1,
+            message_seq: 0,
+            body: vec![5; MAX_MESSAGE_LEN],
+        };
         assert_eq!(r.add(&big.to_fragment().unwrap()), Ok(Added::New));
         assert!(r.buffered() <= MAX_REASSEMBLY_BYTES);
         assert_eq!(r.next_message(), Some(big));
@@ -2289,7 +2752,10 @@ mod tests {
         assert_eq!(ClientHello::parse(&empty_suites), Err(Error::CipherSuites));
         let mut empty_compression = b.clone();
         empty_compression.extend_from_slice(&[0, 2, 0xc0, 0x2b, 0]);
-        assert_eq!(ClientHello::parse(&empty_compression), Err(Error::CompressionMethods));
+        assert_eq!(
+            ClientHello::parse(&empty_compression),
+            Err(Error::CompressionMethods)
+        );
         // Writers refuse missing mandatory vectors.
         let mut ch = ClientHello::parse(&client_hello_bytes()).unwrap();
         ch.cipher_suites.clear();
@@ -2305,17 +2771,32 @@ mod tests {
         let mut b = client_hello_bytes();
         let at = b.len() - 11;
         b.truncate(at);
-        b.extend_from_slice(&[0, 14, 0, 43, 0, 3, 2, 0xfe, 0xfd, 0, 43, 0, 3, 2, 0xfe, 0xfc]);
+        b.extend_from_slice(&[
+            0, 14, 0, 43, 0, 3, 2, 0xfe, 0xfd, 0, 43, 0, 3, 2, 0xfe, 0xfc,
+        ]);
         assert_eq!(ClientHello::parse(&b), Err(Error::DuplicateExtension(43)));
         let mut sh = ServerHello::parse(&server_hello_bytes()).unwrap();
         let mut bytes = sh.to_bytes().unwrap();
         let n = bytes.len();
         bytes[n - 7] = 12;
         bytes.extend_from_slice(&[0, 43, 0, 2, 0xfe, 0xfc]);
-        assert_eq!(ServerHello::parse(&bytes), Err(Error::DuplicateExtension(43)));
+        assert_eq!(
+            ServerHello::parse(&bytes),
+            Err(Error::DuplicateExtension(43))
+        );
         // Writers refuse duplicate types.
-        let svs = |v: u8| Extension { typ: extension_type::SUPPORTED_VERSIONS, data: vec![0xfe, v] };
-        sh.extensions = Some(vec![svs(0xfc), Extension { typ: 1, data: vec![] }, svs(0xfd)]);
+        let svs = |v: u8| Extension {
+            typ: extension_type::SUPPORTED_VERSIONS,
+            data: vec![0xfe, v],
+        };
+        sh.extensions = Some(vec![
+            svs(0xfc),
+            Extension {
+                typ: 1,
+                data: vec![],
+            },
+            svs(0xfd),
+        ]);
         contract::check_wire_value(&sh);
         assert_eq!(sh.to_bytes(), Err(Error::Unwritable));
     }
@@ -2351,7 +2832,11 @@ mod tests {
                 }
             }
             // The next message expected still goes in.
-            let next = Handshake { msg_type: 1, message_seq: r.next_seq(), body: b.to_vec() };
+            let next = Handshake {
+                msg_type: 1,
+                message_seq: r.next_seq(),
+                body: b.to_vec(),
+            };
             match r.add(&next.to_fragment().unwrap()) {
                 Ok(_) => assert!(r.next_message().is_some()),
                 Err(e) => assert_eq!(e, Error::FragmentConflict),
@@ -2374,7 +2859,12 @@ mod tests {
     #[test]
     fn fuzz_loop() {
         let mut rng = Lcg::new(0x4454_4c53);
-        let samples = [PLAIN.to_vec(), client_hello_bytes(), server_hello_bytes(), vec![0xfe, 0xff, 3, 1, 2, 3]];
+        let samples = [
+            PLAIN.to_vec(),
+            client_hello_bytes(),
+            server_hello_bytes(),
+            vec![0xfe, 0xff, 3, 1, 2, 3],
+        ];
         let mut parsed = 0;
         for i in 0..6000 {
             let len = rng.index(160);
@@ -2386,7 +2876,9 @@ mod tests {
                 // A sample with a few bytes changed, or cut short.
                 1 => {
                     b = samples[rng.index(samples.len())].clone();
-                    for _ in 0..1 + rng.index(3) { mutate(&mut rng, &mut b); }
+                    for _ in 0..1 + rng.index(3) {
+                        mutate(&mut rng, &mut b);
+                    }
                 }
                 // A record header that fits, over random bytes.
                 2 => {
@@ -2402,7 +2894,8 @@ mod tests {
                         let n = (b.len() - 12) as u32;
                         let extra = rng.index(4) as u32;
                         b[1..4].copy_from_slice(&(n + extra).to_be_bytes()[1..]);
-                        b[6..9].copy_from_slice(&(extra.min(rng.index(2) as u32)).to_be_bytes()[1..]);
+                        b[6..9]
+                            .copy_from_slice(&(extra.min(rng.index(2) as u32)).to_be_bytes()[1..]);
                         b[9..12].copy_from_slice(&n.to_be_bytes()[1..]);
                     }
                 }
@@ -2417,7 +2910,11 @@ mod tests {
 
             // Random messages, split into random fragments, passed in a random
             // order with repeats, and one byte at a time, come back whole.
-            let m = Handshake { msg_type: rng.next() as u8, message_seq: 0, body: b.clone() };
+            let m = Handshake {
+                msg_type: rng.next() as u8,
+                message_seq: 0,
+                body: b.clone(),
+            };
             // Few enough pieces that the gaps stay under the range limit.
             let step = (1 + rng.index(16)).max(b.len().div_ceil(MAX_FRAGMENT_RANGES));
             let mut parts = m.fragments(step).unwrap();

@@ -2,14 +2,12 @@
 //! entry state machine driven by whatever inbound messages parse.
 #![no_main]
 
-use fictionet::stdlib::session::Action;
-use fictionet::stdlib::codec::{
-    Wire,
-};
-use fictionet::stdlib::test_support::contract::{check_wire, check_wire_value};
+use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::ouch::{
     EnterOrder, Event, Exchange, ExchangeConfig, Inbound, Outbound, Price,
 };
+use fictionet::stdlib::session::Action;
+use fictionet::stdlib::test_support::contract::{check_wire, check_wire_value};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;

@@ -52,7 +52,7 @@
 //! assert_eq!(back.header.key(), Some(7));
 //! ```
 
-use fictionet::stdlib::codec::{be16, be32, Wire};
+use fictionet::stdlib::codec::{Wire, be16, be32};
 use fictionet::stdlib::ip::checksum;
 
 /// The IP protocol number that marks a GRE packet.
@@ -104,7 +104,8 @@ const GRE_MUST_BE_ZERO: u16 = ROUTING_BIT | STRICT_ROUTE_BIT | 0x0400;
 // RFC 2637: C, R, s, the recursion control and the flags (bits 9 to 12)
 // are always zero.
 const PPTP_FLAGS_BITS: u16 = 0x0078;
-const PPTP_MUST_BE_ZERO: u16 = CHECKSUM_BIT | ROUTING_BIT | STRICT_ROUTE_BIT | RECURSION_BITS | PPTP_FLAGS_BITS;
+const PPTP_MUST_BE_ZERO: u16 =
+    CHECKSUM_BIT | ROUTING_BIT | STRICT_ROUTE_BIT | RECURSION_BITS | PPTP_FLAGS_BITS;
 
 /// A plain GRE header, version 0. The flag bits are worked out from which
 /// fields are present, so none of them is kept.
@@ -198,7 +199,9 @@ impl std::fmt::Display for Error {
             Error::Reserved(bits) => write!(f, "GRE flag bits {bits:#06x} must be zero"),
             Error::MissingKey => f.write_str("PPTP GRE header without the K bit"),
             Error::PptpProtocol(p) => write!(f, "PPTP GRE protocol type {p:#06x}, not 0x880b"),
-            Error::PptpSequence => f.write_str("PPTP GRE sequence number without a payload, or payload without one"),
+            Error::PptpSequence => {
+                f.write_str("PPTP GRE sequence number without a payload, or payload without one")
+            }
             Error::Checksum => f.write_str("GRE checksum does not match"),
             Error::TooLong => write!(f, "GRE packet longer than {MAX_PACKET} bytes"),
         }
@@ -248,8 +251,12 @@ impl Header {
     pub fn len(&self) -> usize {
         let fields = |flags: [bool; 3]| flags.iter().filter(|&&f| f).count() * FIELD_LEN;
         match self {
-            Header::Gre(h) => BASE_HEADER_LEN + fields([h.checksum, h.key.is_some(), h.sequence.is_some()]),
-            Header::Pptp(h) => PPTP_BASE_HEADER_LEN + fields([h.sequence.is_some(), h.ack.is_some(), false]),
+            Header::Gre(h) => {
+                BASE_HEADER_LEN + fields([h.checksum, h.key.is_some(), h.sequence.is_some()])
+            }
+            Header::Pptp(h) => {
+                PPTP_BASE_HEADER_LEN + fields([h.sequence.is_some(), h.ack.is_some(), false])
+            }
         }
     }
 
@@ -364,11 +371,16 @@ impl Header {
                 Ok((header, &b[used..]))
             }
             Header::Pptp(_) => {
-                let end = used.checked_add(usize::from(be16(b, BASE_HEADER_LEN).ok_or(Error::Truncated)?))
+                let end = used
+                    .checked_add(usize::from(
+                        be16(b, BASE_HEADER_LEN).ok_or(Error::Truncated)?,
+                    ))
                     .ok_or(Error::TooLong)?;
                 let payload = b.get(used..end).ok_or(Error::Truncated)?;
                 if end != b.len() {
-                    return Err(Error::Trailing { remaining: b.len() - end });
+                    return Err(Error::Trailing {
+                        remaining: b.len() - end,
+                    });
                 }
                 Ok((header, payload))
             }
@@ -445,7 +457,10 @@ impl Wire for Packet {
     /// Refuses invalid flags, lengths, checksums, and trailing PPTP bytes.
     fn parse(b: &[u8]) -> Result<Self, Error> {
         let (header, payload) = Header::split(b)?;
-        Ok(Packet { header, payload: payload.to_vec() })
+        Ok(Packet {
+            header,
+            payload: payload.to_vec(),
+        })
     }
 
     /// Appends a packet with its checksum and PPTP payload length. Refuses
@@ -453,7 +468,12 @@ impl Wire for Packet {
     /// does not match the payload. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let start = out.len();
-        out.reserve(self.header.len().saturating_add(self.payload.len()).min(MAX_PACKET));
+        out.reserve(
+            self.header
+                .len()
+                .saturating_add(self.payload.len())
+                .min(MAX_PACKET),
+        );
         self.header.write(self.payload.len(), out)?;
         out.extend_from_slice(&self.payload);
         if let Header::Gre(PlainHeader { checksum: true, .. }) = self.header {
@@ -468,9 +488,7 @@ impl Wire for Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{
-        Collect, CollectError, Fail, Lcg,
-    };
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
@@ -481,20 +499,38 @@ mod tests {
         let parsed = Packet::parse(b);
         let (items, failure) = decode_all(make, b);
         if b.len() <= MAX_PACKET {
-            assert_eq!(failure, parsed.clone().err().map(|e| Fail::Protocol(CollectError::Parse(e))));
+            assert_eq!(
+                failure,
+                parsed
+                    .clone()
+                    .err()
+                    .map(|e| Fail::Protocol(CollectError::Parse(e)))
+            );
             assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
         } else {
-            assert_eq!(failure, Some(Fail::Protocol(CollectError::TooLong { limit: MAX_PACKET })));
+            assert_eq!(
+                failure,
+                Some(Fail::Protocol(CollectError::TooLong { limit: MAX_PACKET }))
+            );
         }
         parsed
     }
 
     fn gre(protocol: u16, checksum: bool, key: Option<u32>, sequence: Option<u32>) -> Header {
-        Header::Gre(PlainHeader { protocol, checksum, key, sequence })
+        Header::Gre(PlainHeader {
+            protocol,
+            checksum,
+            key,
+            sequence,
+        })
     }
 
     fn pptp(call_id: u16, sequence: Option<u32>, ack: Option<u32>) -> Header {
-        Header::Pptp(PptpHeader { call_id, sequence, ack })
+        Header::Pptp(PptpHeader {
+            call_id,
+            sequence,
+            ack,
+        })
     }
 
     /// Parses `b` directly and through Collect and checks they agree. A packet read
@@ -541,7 +577,10 @@ mod tests {
         assert_eq!(p.header, gre(protocol::IPV4, true, None, None));
         assert_eq!(p.payload, [0x45, 0x00]);
         assert_eq!(p.to_bytes().unwrap(), b);
-        assert_eq!(checksum(&[0x80, 0x00, 0x08, 0x00, 0, 0, 0, 0, 0x45, 0x00]), 0x32ff);
+        assert_eq!(
+            checksum(&[0x80, 0x00, 0x08, 0x00, 0, 0, 0, 0, 0x45, 0x00]),
+            0x32ff
+        );
     }
 
     #[test]
@@ -578,11 +617,21 @@ mod tests {
     #[test]
     fn key_and_sequence() {
         // RFC 2890: C, K and S, then checksum, key and sequence number.
-        let mut b = vec![0xb0, 0x00, 0x65, 0x58, 0, 0, 0, 0, 0x01, 0x02, 0x03, 0x04, 0, 0, 0, 9, 0xaa];
+        let mut b = vec![
+            0xb0, 0x00, 0x65, 0x58, 0, 0, 0, 0, 0x01, 0x02, 0x03, 0x04, 0, 0, 0, 9, 0xaa,
+        ];
         let sum = checksum(&b);
         b[4..6].copy_from_slice(&sum.to_be_bytes());
         let p = check(&b).unwrap();
-        assert_eq!(p.header, gre(protocol::TRANSPARENT_ETHERNET_BRIDGING, true, Some(0x01020304), Some(9)));
+        assert_eq!(
+            p.header,
+            gre(
+                protocol::TRANSPARENT_ETHERNET_BRIDGING,
+                true,
+                Some(0x01020304),
+                Some(9)
+            )
+        );
         assert_eq!(p.header.key(), Some(0x01020304));
         assert_eq!(p.header.sequence(), Some(9));
         assert_eq!(p.payload, [0xaa]);
@@ -591,16 +640,30 @@ mod tests {
 
         // Key only, and sequence only.
         let b = [0x20, 0x00, 0x08, 0x00, 0, 0, 0, 5];
-        assert_eq!(check(&b).unwrap().header, gre(protocol::IPV4, false, Some(5), None));
+        assert_eq!(
+            check(&b).unwrap().header,
+            gre(protocol::IPV4, false, Some(5), None)
+        );
         let b = [0x10, 0x00, 0x08, 0x00, 0xff, 0xff, 0xff, 0xff];
-        assert_eq!(check(&b).unwrap().header, gre(protocol::IPV4, false, None, Some(u32::MAX)));
+        assert_eq!(
+            check(&b).unwrap().header,
+            gre(protocol::IPV4, false, None, Some(u32::MAX))
+        );
     }
 
     #[test]
     fn doc_example() {
-        let packet = Packet { header: gre(protocol::IPV4, true, Some(7), None), payload: vec![0x45, 0x00] };
+        let packet = Packet {
+            header: gre(protocol::IPV4, true, Some(7), None),
+            payload: vec![0x45, 0x00],
+        };
         let bytes = packet.to_bytes().unwrap();
-        assert_eq!(bytes, [0xa0, 0x00, 0x08, 0x00, 0x12, 0xf8, 0, 0, 0, 0, 0, 7, 0x45, 0x00]);
+        assert_eq!(
+            bytes,
+            [
+                0xa0, 0x00, 0x08, 0x00, 0x12, 0xf8, 0, 0, 0, 0, 0, 7, 0x45, 0x00
+            ]
+        );
         let back = Packet::parse(&bytes).unwrap();
         assert_eq!(back, packet);
         assert_eq!(back.header.key(), Some(7));
@@ -621,8 +684,15 @@ mod tests {
         // RFC 2637 section 4.1: the Flags field, bits 9 to 12, must be zero.
         for bit in [0x40u8, 0x20, 0x10, 0x08] {
             let b = [0x30, 0x01 | bit, 0x88, 0x0b, 0, 1, 0, 1, 0, 0, 0, 1, 0x42];
-            assert_eq!(check(&b), Err(Error::Reserved(u16::from(bit))), "{bit:#04x}");
-            assert_eq!(Header::parse_prefix(&b[..2]), Err(Error::Reserved(u16::from(bit))));
+            assert_eq!(
+                check(&b),
+                Err(Error::Reserved(u16::from(bit))),
+                "{bit:#04x}"
+            );
+            assert_eq!(
+                Header::parse_prefix(&b[..2]),
+                Err(Error::Reserved(u16::from(bit)))
+            );
         }
     }
 
@@ -635,13 +705,22 @@ mod tests {
         // A sequence number without data:
         let b = [0x30, 0x01, 0x88, 0x0b, 0, 0, 0, 1, 0, 0, 0, 1];
         assert_eq!(check(&b), Err(Error::PptpSequence));
-        assert_eq!(Header::parse_prefix(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0]), Ok(None));
-        assert_eq!(Header::parse_prefix(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0, 1]), Err(Error::PptpSequence));
+        assert_eq!(
+            Header::parse_prefix(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0]),
+            Ok(None)
+        );
+        assert_eq!(
+            Header::parse_prefix(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0, 1]),
+            Err(Error::PptpSequence)
+        );
         assert!(!Error::PptpSequence.to_string().is_empty());
 
         // Writers refuse both, and leave `out` as it was.
         for (sequence, payload) in [(None, vec![0x42]), (Some(1), vec![])] {
-            let p = Packet { header: pptp(1, sequence, Some(2)), payload };
+            let p = Packet {
+                header: pptp(1, sequence, Some(2)),
+                payload,
+            };
             let mut out = vec![9];
             assert_eq!(p.write(&mut out), Err(Error::PptpSequence));
             assert_eq!(out, [9]);
@@ -653,7 +732,10 @@ mod tests {
     fn pptp_data_packet() {
         // K, S and A, version 1, PPP, payload length 3, call ID 0x1234,
         // sequence 5, acknowledgment 4, then the PPP frame.
-        let b = [0x30, 0x81, 0x88, 0x0b, 0x00, 0x03, 0x12, 0x34, 0, 0, 0, 5, 0, 0, 0, 4, 0xff, 0x03, 0x21];
+        let b = [
+            0x30, 0x81, 0x88, 0x0b, 0x00, 0x03, 0x12, 0x34, 0, 0, 0, 5, 0, 0, 0, 4, 0xff, 0x03,
+            0x21,
+        ];
         let p = check(&b).unwrap();
         assert_eq!(p.header, pptp(0x1234, Some(5), Some(4)));
         assert_eq!(p.header.protocol(), protocol::PPP);
@@ -676,7 +758,9 @@ mod tests {
 
     #[test]
     fn pptp_refuses_trailing_bytes() {
-        let b = [0x30, 0x01, 0x88, 0x0b, 0x00, 0x01, 0, 7, 0, 0, 0, 1, 0x42, 0xee, 0xee];
+        let b = [
+            0x30, 0x01, 0x88, 0x0b, 0x00, 0x01, 0, 7, 0, 0, 0, 1, 0x42, 0xee, 0xee,
+        ];
         assert_eq!(check(&b), Err(Error::Trailing { remaining: 2 }));
         assert_eq!(Header::split(&b), Err(Error::Trailing { remaining: 2 }));
         let p = check(&b[..13]).unwrap();
@@ -692,7 +776,10 @@ mod tests {
             (&[0x00], Error::Truncated),
             (&[0x00, 0x00, 0x08], Error::Truncated),
             // C and K set, but the bytes stop inside the key.
-            (&[0xa0, 0x00, 0x08, 0x00, 0, 0, 0, 0, 0, 0], Error::Truncated),
+            (
+                &[0xa0, 0x00, 0x08, 0x00, 0, 0, 0, 0, 0, 0],
+                Error::Truncated,
+            ),
             // Versions 2 to 7.
             (&[0x00, 0x02], Error::Version(2)),
             (&[0x00, 0x07, 0x08, 0x00], Error::Version(7)),
@@ -703,22 +790,43 @@ mod tests {
             (&[0x04, 0x00], Error::Reserved(0x0400)),
             (&[0x4c, 0x00], Error::Reserved(0x4c00)),
             // PPTP with a checksum bit, with recursion, without a key.
-            (&[0xa0, 0x01, 0x88, 0x0b, 0, 0, 0, 0], Error::Reserved(0x8000)),
+            (
+                &[0xa0, 0x01, 0x88, 0x0b, 0, 0, 0, 0],
+                Error::Reserved(0x8000),
+            ),
             (&[0x21, 0x01], Error::Reserved(0x0100)),
             (&[0x00, 0x01, 0x88, 0x0b], Error::MissingKey),
             // PPTP carrying something other than PPP.
-            (&[0x20, 0x01, 0x08, 0x00, 0, 0, 0, 0], Error::PptpProtocol(0x0800)),
+            (
+                &[0x20, 0x01, 0x08, 0x00, 0, 0, 0, 0],
+                Error::PptpProtocol(0x0800),
+            ),
             // PPTP whose payload length runs past the bytes.
-            (&[0x30, 0x01, 0x88, 0x0b, 0, 2, 0, 0, 0, 0, 0, 1, 0xff], Error::Truncated),
+            (
+                &[0x30, 0x01, 0x88, 0x0b, 0, 2, 0, 0, 0, 0, 0, 1, 0xff],
+                Error::Truncated,
+            ),
             // PPTP data without a sequence number, and a sequence number
             // without data.
-            (&[0x20, 0x01, 0x88, 0x0b, 0, 2, 0, 0, 0xff], Error::PptpSequence),
-            (&[0x30, 0x01, 0x88, 0x0b, 0, 0, 0, 0, 0, 0, 0, 1], Error::PptpSequence),
+            (
+                &[0x20, 0x01, 0x88, 0x0b, 0, 2, 0, 0, 0xff],
+                Error::PptpSequence,
+            ),
+            (
+                &[0x30, 0x01, 0x88, 0x0b, 0, 0, 0, 0, 0, 0, 0, 1],
+                Error::PptpSequence,
+            ),
             // PPTP with a flags bit set.
             (&[0x20, 0x09, 0x88, 0x0b], Error::Reserved(0x0008)),
             // A checksum off by one.
-            (&[0x80, 0x00, 0x08, 0x00, 0x32, 0xfe, 0x00, 0x00, 0x45, 0x00], Error::Checksum),
-            (&[0x80, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00], Error::Checksum),
+            (
+                &[0x80, 0x00, 0x08, 0x00, 0x32, 0xfe, 0x00, 0x00, 0x45, 0x00],
+                Error::Checksum,
+            ),
+            (
+                &[0x80, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00],
+                Error::Checksum,
+            ),
         ];
         for (b, e) in cases {
             assert_eq!(check(b), Err(*e), "{b:02x?}");
@@ -731,10 +839,19 @@ mod tests {
         assert_eq!(Header::parse_prefix(&[0]), Ok(None));
         assert_eq!(Header::parse_prefix(&[0, 3]), Err(Error::Version(3)));
         assert_eq!(Header::parse_prefix(&[0x20, 1, 0x86]), Ok(None));
-        assert_eq!(Header::parse_prefix(&[0x20, 1, 0x86, 0xdd]), Err(Error::PptpProtocol(0x86dd)));
+        assert_eq!(
+            Header::parse_prefix(&[0x20, 1, 0x86, 0xdd]),
+            Err(Error::PptpProtocol(0x86dd))
+        );
         assert_eq!(Header::parse_prefix(&[0x20, 0, 8, 0, 0, 0, 0]), Ok(None));
-        assert_eq!(Header::parse_prefix(&[0x20, 0, 8, 0, 0, 0, 0, 3]), Ok(Some((gre(protocol::IPV4, false, Some(3), None), 8))));
-        assert_eq!(collect(&[0x80, 0, 8, 0, 0x32, 0xfe, 0, 0, 0x45, 0]), Err(Error::Checksum));
+        assert_eq!(
+            Header::parse_prefix(&[0x20, 0, 8, 0, 0, 0, 0, 3]),
+            Ok(Some((gre(protocol::IPV4, false, Some(3), None), 8)))
+        );
+        assert_eq!(
+            collect(&[0x80, 0, 8, 0, 0x32, 0xfe, 0, 0, 0x45, 0]),
+            Err(Error::Checksum)
+        );
     }
 
     #[test]
@@ -751,7 +868,10 @@ mod tests {
         assert_eq!(check(&b), Err(Error::Version(5)));
 
         // Writers refuse the same.
-        let fits = Packet { header: gre(1, true, Some(1), None), payload: vec![0xab; MAX_PACKET - 12] };
+        let fits = Packet {
+            header: gre(1, true, Some(1), None),
+            payload: vec![0xab; MAX_PACKET - 12],
+        };
         let bytes = fits.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_PACKET);
         assert_eq!(Packet::parse(&bytes), Ok(fits.clone()));
@@ -761,7 +881,10 @@ mod tests {
         assert_eq!(over.write(&mut out), Err(Error::TooLong));
         assert_eq!(out, [9]);
 
-        let fits = Packet { header: pptp(1, Some(1), Some(2)), payload: vec![0xab; MAX_PACKET - 16] };
+        let fits = Packet {
+            header: pptp(1, Some(1), Some(2)),
+            payload: vec![0xab; MAX_PACKET - 16],
+        };
         let bytes = fits.to_bytes().unwrap();
         assert_eq!(Packet::parse(&bytes), Ok(fits.clone()));
         let mut over = fits;
@@ -772,7 +895,10 @@ mod tests {
 
     #[test]
     fn write_appends() {
-        let p = Packet { header: gre(protocol::IPV6, true, None, Some(3)), payload: b"inner".to_vec() };
+        let p = Packet {
+            header: gre(protocol::IPV6, true, None, Some(3)),
+            payload: b"inner".to_vec(),
+        };
         let mut out = b"before".to_vec();
         p.write(&mut out).unwrap();
         assert_eq!(&out[..6], b"before");
@@ -789,13 +915,20 @@ mod tests {
                 (flags & 2 != 0).then_some(0xdeadbeef),
                 (flags & 4 != 0).then_some(42),
             );
-            out.push(Packet { header, payload: b"abcdefg".to_vec() });
+            out.push(Packet {
+                header,
+                payload: b"abcdefg".to_vec(),
+            });
         }
         for flags in 0..4u8 {
             // A payload goes with a sequence number, and none without.
             let data = flags & 1 != 0;
             let header = pptp(0x0102, data.then_some(7), (flags & 2 != 0).then_some(6));
-            let payload = if data { b"\xff\x03payload".to_vec() } else { Vec::new() };
+            let payload = if data {
+                b"\xff\x03payload".to_vec()
+            } else {
+                Vec::new()
+            };
             out.push(Packet { header, payload });
         }
         out
@@ -830,7 +963,10 @@ mod tests {
 
     #[test]
     fn every_flipped_bit_in_a_checksummed_packet() {
-        let p = Packet { header: gre(protocol::IPV4, true, Some(1), Some(2)), payload: b"payload!".to_vec() };
+        let p = Packet {
+            header: gre(protocol::IPV4, true, Some(1), Some(2)),
+            payload: b"payload!".to_vec(),
+        };
         let b = p.to_bytes().unwrap();
         // Bit 0 is the C bit itself: clearing it leaves a packet with no
         // checksum to check.
@@ -863,7 +999,12 @@ mod tests {
             let header = pptp(rng.next() as u16, sequence, rng.maybe());
             return Packet { header, payload };
         }
-        let protocols = [protocol::IPV4, protocol::IPV6, protocol::TRANSPARENT_ETHERNET_BRIDGING, rng.next() as u16];
+        let protocols = [
+            protocol::IPV4,
+            protocol::IPV6,
+            protocol::TRANSPARENT_ETHERNET_BRIDGING,
+            rng.next() as u16,
+        ];
         let proto = protocols[rng.index(protocols.len())];
         let header = gre(proto, !rng.coin(), rng.maybe(), rng.maybe());
         let n = rng.index(48);

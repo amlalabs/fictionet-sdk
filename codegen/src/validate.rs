@@ -889,7 +889,9 @@ fn normalize(
                     Type::Scalar(p) => fits(null, *p),
                     Type::Range { item: p, min, max } => {
                         // Check representability before comparing as floats.
-                        fits(null, *p) && fits(min, *p) && fits(max, *p)
+                        fits(null, *p)
+                            && fits(min, *p)
+                            && fits(max, *p)
                             && !(number_le(min, null, *p) && number_le(null, max, *p))
                     }
                     Type::Ref(name) => match (kinds.get(name), &*null) {

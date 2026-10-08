@@ -3,8 +3,8 @@
 //! the units drive.
 #![no_main]
 
-use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::cboe_pitch::AddOrderExpanded;
+use fictionet::stdlib::codec::Frames;
 
 use fictionet::stdlib::cboe_pitch::Book;
 
@@ -19,9 +19,7 @@ use fictionet::stdlib::cboe_pitch::HEADER_LENGTH;
 use fictionet::stdlib::cboe_pitch::Message;
 
 use fictionet::stdlib::cboe_pitch::Unit;
-use fictionet::stdlib::codec::{
-    Wire,
-};
+use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;

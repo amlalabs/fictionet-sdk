@@ -2,15 +2,19 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::ike::*;
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 fn check_chain(first: u8, data: &[u8]) {
     if let Ok(payloads) = parse_payloads(first, data) {
         let message = Message {
-            initiator_spi: 0, responder_spi: 0, minor_version: 0,
-            exchange: exchange::INFORMATIONAL, flags: 0, message_id: 0,
+            initiator_spi: 0,
+            responder_spi: 0,
+            minor_version: 0,
+            exchange: exchange::INFORMATIONAL,
+            flags: 0,
+            message_id: 0,
             payloads: payloads.clone(),
         };
         contract::check_wire_value(&message);

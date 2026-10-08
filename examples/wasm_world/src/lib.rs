@@ -70,10 +70,14 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
         // The world's date: certificates are checked against it.
         let date = std::time::Duration::from_secs(1_767_225_600); // 2026-01-01
         let server = Arc::new(
-            tls::config_builder(&fcx, std::time::UNIX_EPOCH + date, rustls::crypto::ring::default_provider())
-                .with_safe_default_protocol_versions()?
-                .with_no_client_auth()
-                .with_single_cert(certs.chain, certs.key)?,
+            tls::config_builder(
+                &fcx,
+                std::time::UNIX_EPOCH + date,
+                rustls::crypto::ring::default_provider(),
+            )
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(certs.chain, certs.key)?,
         );
         let (attacher, attachments) = fictionet::attachments();
         let sites = web::Sites::new(move |host| match host {
@@ -100,24 +104,39 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
 
         let address = lookup(&fcx, &udp, NAME).await?;
         let response = if https {
-            let conn = tcp.connect(&fcx, SocketAddr::new(address.into(), 443)).await?;
-            let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()?
-                .with_root_certificates(certs.roots)
-                .with_no_client_auth();
-            client.alpn_protocols = vec![if version == Version::HTTP_2 { b"h2".to_vec() } else { b"http/1.1".to_vec() }];
+            let conn = tcp
+                .connect(&fcx, SocketAddr::new(address.into(), 443))
+                .await?;
+            let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(certs.roots)
+            .with_no_client_auth();
+            client.alpn_protocols = vec![if version == Version::HTTP_2 {
+                b"h2".to_vec()
+            } else {
+                b"http/1.1".to_vec()
+            }];
             let mut conn = TlsClient::new(conn, Arc::new(client), NAME)?;
             conn.handshake(&fcx).await?;
             get(&fcx, conn, "https", version, "/from-the-browser").await?
         } else {
-            let conn = tcp.connect(&fcx, SocketAddr::new(address.into(), 80)).await?;
+            let conn = tcp
+                .connect(&fcx, SocketAddr::new(address.into(), 80))
+                .await?;
             get(&fcx, conn, "http", version, "/from-the-browser").await?
         };
         let status = response.status().as_u16();
         let version = response.version();
         let body = response.into_body().collect().await?.to_bytes();
         let body = String::from_utf8(body.to_vec())?;
-        *out.lock().unwrap() = Some(Fetched { address, status, version, body });
+        *out.lock().unwrap() = Some(Fetched {
+            address,
+            status,
+            version,
+            body,
+        });
         // Ending with an error cancels the sites, which would serve forever.
         Err(fictionet::Error::from(Done))
     })
@@ -137,9 +156,16 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(js_name = fetchText)]
 pub async fn fetch_text(https: bool, http2: bool) -> std::result::Result<String, String> {
-    let version = if http2 { Version::HTTP_2 } else { Version::HTTP_11 };
+    let version = if http2 {
+        Version::HTTP_2
+    } else {
+        Version::HTTP_11
+    };
     let fetched = fetch(https, version).await.map_err(|e| e.to_string())?;
-    Ok(format!("{} {:?} from {}\n{}", fetched.status, fetched.version, fetched.address, fetched.body))
+    Ok(format!(
+        "{} {:?} from {}\n{}",
+        fetched.status, fetched.version, fetched.address, fetched.body
+    ))
 }
 
 /// The site's handler: answers every request with its method and path.
@@ -156,7 +182,11 @@ impl tower_service::Service<Request<web::Body>> for Hello {
     }
 
     fn call(&mut self, request: Request<web::Body>) -> Self::Future {
-        let body = format!("hello from {NAME}: {} {}\n", request.method(), request.uri().path());
+        let body = format!(
+            "hello from {NAME}: {} {}\n",
+            request.method(),
+            request.uri().path()
+        );
         std::future::ready(Ok(Response::new(Full::new(Bytes::from(body)))))
     }
 }
@@ -185,7 +215,10 @@ async fn lookup(fcx: &Cx, udp: &udp::Endpoint, name: &str) -> Result<Ipv4Addr> {
     let (bytes, _from) = socket.recv(fcx).await?;
     let answer = Message::from_vec(&bytes)?;
     if answer.metadata.response_code != ResponseCode::NoError {
-        return Err(fictionet::Error::msg(format!("DNS answered {} for {name}", answer.metadata.response_code)));
+        return Err(fictionet::Error::msg(format!(
+            "DNS answered {} for {name}",
+            answer.metadata.response_code
+        )));
     }
     answer
         .answers
@@ -216,7 +249,11 @@ fn certs() -> Result<Certs> {
     let mut roots = RootCertStore::empty();
     roots.add(ca.der().clone())?;
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
-    Ok(Certs { roots, chain: vec![leaf.der().clone()], key })
+    Ok(Certs {
+        roots,
+        chain: vec![leaf.der().clone()],
+        key,
+    })
 }
 
 /// Sends one GET for `path` to [`NAME`] over `conn` with hyper's client.
@@ -227,7 +264,10 @@ async fn get<C: Connection + Unpin>(
     version: Version,
     path: &str,
 ) -> Result<Response<Incoming>> {
-    let io = Io { fcx: fcx.clone(), conn };
+    let io = Io {
+        fcx: fcx.clone(),
+        conn,
+    };
     let empty = Empty::<Bytes>::new;
     if version == Version::HTTP_2 {
         let (mut send, conn) = hyper::client::conn::http2::handshake(Exec(fcx.clone()), io).await?;
@@ -235,7 +275,9 @@ async fn get<C: Connection + Unpin>(
             let _ = conn.await;
             Ok(())
         });
-        let request = Request::builder().uri(format!("{scheme}://{NAME}{path}")).body(empty())?;
+        let request = Request::builder()
+            .uri(format!("{scheme}://{NAME}{path}"))
+            .body(empty())?;
         Ok(send.send_request(request).await?)
     } else {
         let (mut send, conn) = hyper::client::conn::http1::handshake(io).await?;
@@ -243,7 +285,10 @@ async fn get<C: Connection + Unpin>(
             let _ = conn.await;
             Ok(())
         });
-        let request = Request::builder().uri(path).header("host", NAME).body(empty())?;
+        let request = Request::builder()
+            .uri(path)
+            .header("host", NAME)
+            .body(empty())?;
         Ok(send.send_request(request).await?)
     }
 }
@@ -274,9 +319,15 @@ impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
 }
 
 impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        this.conn.poll_write(&this.fcx, cx, data).map_err(std::io::Error::other)
+        this.conn
+            .poll_write(&this.fcx, cx, data)
+            .map_err(std::io::Error::other)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -285,7 +336,9 @@ impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        this.conn.poll_shutdown(&this.fcx, cx).map_err(std::io::Error::other)
+        this.conn
+            .poll_shutdown(&this.fcx, cx)
+            .map_err(std::io::Error::other)
     }
 }
 

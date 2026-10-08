@@ -35,7 +35,8 @@ fn copied_modbus_uses_the_public_driver_and_map() {
     let mut bytes = Vec::new();
     frame.write(&mut bytes).unwrap();
     assert_eq!(<modbus::Frame as Wire>::parse(&bytes).unwrap(), frame);
-    let mut stream = Stream::new(Frames::<modbus::Frame>::new().map(|frame| modbus::Request::parse(&frame.pdu)));
+    let mut stream =
+        Stream::new(Frames::<modbus::Frame>::new().map(|frame| modbus::Request::parse(&frame.pdu)));
     let mut requests = Vec::new();
     for chunk in bytes.chunks(3) {
         assert_eq!(
@@ -51,7 +52,9 @@ fn copied_modbus_uses_the_public_driver_and_map() {
 #[test]
 fn copied_presenters_plug_into_observe_and_construct_display_items() {
     use fictionet::events::Transport;
-    use fictionet::observe::{Decoded, Layer, Match, Observed, Place, Present, Registry, Selection};
+    use fictionet::observe::{
+        Decoded, Layer, Match, Observed, Place, Present, Registry, Selection,
+    };
     let mut registry = Registry::new();
     registry.register(
         "modbus",
@@ -257,9 +260,7 @@ fn copied_fast_uses_templates_and_the_public_driver() {
     )));
     assert_eq!(blocks.push(&[0, 0x82, 0xc0, 0x81]), 4);
     assert_eq!(blocks.next().unwrap().unwrap(), value);
-    let mut split = Stream::new(fast::BlockMessages::new(fast::Messages::new(
-        templates,
-    )));
+    let mut split = Stream::new(fast::BlockMessages::new(fast::Messages::new(templates)));
     assert_eq!(split.push(&[0x81, 0xc0, 0x81, 0x81]), 4);
     assert!(matches!(
         split.next(),
@@ -300,9 +301,9 @@ fn copied_soupbintcp_frames_through_the_public_driver() {
     finish(&mut stream, |_| unreachable!()).unwrap();
     assert_eq!(
         events.last(),
-        Some(&fictionet::stdlib::session::Action::Event(soupbintcp::Event::Sequenced {
-            sequence: 7
-        }))
+        Some(&fictionet::stdlib::session::Action::Event(
+            soupbintcp::Event::Sequenced { sequence: 7 }
+        ))
     );
     assert_eq!(client.next_sequence(), 8);
 }
@@ -403,7 +404,9 @@ fn copied_ouch_exchange_accepts_through_wire() {
     };
     assert_eq!(
         exchange.receive(&inbound, 0).unwrap(),
-        [fictionet::stdlib::session::Action::Event(ouch::Event::EnterRequested(token))]
+        [fictionet::stdlib::session::Action::Event(
+            ouch::Event::EnterRequested(token)
+        )]
     );
     let accepted = exchange.accept(token, 1).unwrap().to_bytes().unwrap();
     assert!(matches!(
@@ -457,8 +460,8 @@ fn copied_cboe_pitch_frames_units_and_builds_a_book() {
 
 #[test]
 fn copied_cboe_boe_logs_in_and_acknowledges() {
-    use fictionet::stdlib::session::Action;
     use cboe_boe::{Event, OrderEvent, Text};
+    use fictionet::stdlib::session::Action;
     let config = cboe_boe::ClientConfig {
         session_sub_id: Text::new("0001").unwrap(),
         username: Text::new("TEST").unwrap(),

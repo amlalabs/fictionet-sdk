@@ -10,24 +10,34 @@
 
 use fictionet::observe::{Decoded, Layer, Placement, Present};
 use fictionet::stdlib::codec::{Decode, Demux, Fail, Spans, Step, Wire};
-use fictionet::stdlib::{grpc, hpack};
 use fictionet::stdlib::http2::{
-    Error, ErrorCode, Frame, FrameHeader, FrameItem, Frames, HEADER_LEN, HeaderBlocks, MAX_WINDOW, PREFACE,
-    Setting,
+    Error, ErrorCode, Frame, FrameHeader, FrameItem, Frames, HEADER_LEN, HeaderBlocks, MAX_WINDOW,
+    PREFACE, Setting,
 };
+use fictionet::stdlib::{grpc, hpack};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 fn protocol(reason: &'static str) -> Error {
-    Error { code: ErrorCode::ProtocolError, reason }
+    Error {
+        code: ErrorCode::ProtocolError,
+        reason,
+    }
 }
 fn size(reason: &'static str) -> Error {
-    Error { code: ErrorCode::FrameSizeError, reason }
+    Error {
+        code: ErrorCode::FrameSizeError,
+        reason,
+    }
 }
 fn u32_at(bytes: &[u8], at: usize) -> Result<u32, Error> {
-    let b = bytes.get(at..at.saturating_add(4)).ok_or_else(|| size("truncated integer"))?;
-    Ok(u32::from_be_bytes(b.try_into().map_err(|_| size("truncated integer"))?))
+    let b = bytes
+        .get(at..at.saturating_add(4))
+        .ok_or_else(|| size("truncated integer"))?;
+    Ok(u32::from_be_bytes(
+        b.try_into().map_err(|_| size("truncated integer"))?,
+    ))
 }
 /// A DATA payload without its padding. `None`: the padding is longer
 /// than the frame.
@@ -40,16 +50,23 @@ fn unpad(payload: &[u8], flags: u8) -> Option<&[u8]> {
 }
 /// A gRPC message's summary: the encoded body, not decompressed.
 fn grpc_summary(item: &grpc::Message) -> String {
-    format!("{} bytes{}", item.data.len(), if item.compressed { ", compressed" } else { "" })
+    format!(
+        "{} bytes{}",
+        item.data.len(),
+        if item.compressed { ", compressed" } else { "" }
+    )
 }
 /// A gRPC message's fields: the compressed flag, the length prefix and
 /// the encoded body.
 fn grpc_fields(item: &grpc::Message, bytes: &[u8], layer: &mut Layer) {
     layer.field("Compressed", item.compressed.to_string(), (0, 1));
     layer.field("Length", item.data.len().to_string(), (1, grpc::HEADER_LEN));
-    layer.field("Message", format!("{} bytes", item.data.len()), (grpc::HEADER_LEN, bytes.len()));
+    layer.field(
+        "Message",
+        format!("{} bytes", item.data.len()),
+        (grpc::HEADER_LEN, bytes.len()),
+    );
 }
-
 
 /// Aggregate gRPC DATA budget used by the built-in capture presenter.
 pub const CAPTURE_DATA_BUDGET: usize = 8 << 20;
@@ -110,7 +127,7 @@ impl Default for CaptureBudget {
 }
 const CAPTURE_CALL_LIMIT: usize = 256;
 struct CaptureCalls {
-    messages: Demux<(bool, u32), fictionet::stdlib::codec::Frames::<grpc::Message>>,
+    messages: Demux<(bool, u32), fictionet::stdlib::codec::Frames<grpc::Message>>,
     state: BTreeMap<(bool, u32), Call>,
     budget: CaptureBudget,
     charged: usize,
@@ -1163,7 +1180,9 @@ mod tests {
 
     #[test]
     fn data_demux_has_one_budget_across_streams() {
-        let mut calls = Demux::new(4, 8, |_| fictionet::stdlib::codec::Frames::<grpc::Message>::with_limit(32));
+        let mut calls = Demux::new(4, 8, |_| {
+            fictionet::stdlib::codec::Frames::<grpc::Message>::with_limit(32)
+        });
         assert_eq!(calls.push(&1, &[0, 0, 0, 0]), 4);
         assert_eq!(calls.push(&3, &[0, 0, 0, 0]), 4);
         assert!(calls.next().is_none());

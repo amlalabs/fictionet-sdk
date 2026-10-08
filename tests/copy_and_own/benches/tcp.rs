@@ -56,7 +56,12 @@ async fn read_exact<C: Connection>(fcx: &Cx, conn: &mut C, buf: &mut [u8]) -> fi
     Ok(())
 }
 
-async fn transfer<C: Connection>(fcx: &Cx, mut client: C, mut server: C, bytes: usize) -> fictionet::Result {
+async fn transfer<C: Connection>(
+    fcx: &Cx,
+    mut client: C,
+    mut server: C,
+    bytes: usize,
+) -> fictionet::Result {
     let writer = fcx.spawn(move |fcx| async move {
         let buf = vec![0x5a; 65536];
         let mut left = bytes;
@@ -77,7 +82,10 @@ async fn transfer<C: Connection>(fcx: &Cx, mut client: C, mut server: C, bytes: 
         let n = left.min(buf.len());
         read_exact(fcx, &mut client, &mut buf[..n]).await?;
         // Spot checks keep the reader's own work small next to TCP's.
-        assert!(buf[0] == 0x5a && buf[n / 2] == 0x5a && buf[n - 1] == 0x5a, "TCP delivered wrong bytes");
+        assert!(
+            buf[0] == 0x5a && buf[n / 2] == 0x5a && buf[n - 1] == 0x5a,
+            "TCP delivered wrong bytes"
+        );
         left -= n;
     }
     client.write_all(fcx, &[1]).await?;
@@ -104,7 +112,10 @@ macro_rules! case {
                 transfer(&fcx, c, s, bytes).await?;
                 let seconds = start.elapsed().as_secs_f64();
                 let allocations = ALLOCS.load(Ordering::Relaxed) - allocations;
-                *result.lock().unwrap() = Some(Sample { seconds, allocations });
+                *result.lock().unwrap() = Some(Sample {
+                    seconds,
+                    allocations,
+                });
                 fcx.cancel();
                 Ok(())
             }));
@@ -129,8 +140,10 @@ fn row(name: &str, samples: &[Sample]) -> (f64, f64) {
     allocations.sort_by(f64::total_cmp);
     let middle = samples.len() / 2;
     let best = rates[samples.len() - 1];
-    println!("{name:<10} {:>10.1} {:>10.1} [{:>7.1}, {:>7.1}] {:>12.1}",
-        best, rates[middle], rates[0], best, allocations[middle]);
+    println!(
+        "{name:<10} {:>10.1} {:>10.1} [{:>7.1}, {:>7.1}] {:>12.1}",
+        best, rates[middle], rates[0], best, allocations[middle]
+    );
     // Other work on the machine only slows a round, so the fastest round
     // is the steadiest measure of what the code can do.
     (best, allocations[middle])
@@ -157,6 +170,12 @@ fn main() {
     println!("             best MB/s median MB/s       range MB/s     allocs/MB");
     let (built_rate, built_allocs) = row("built-in", &built);
     let (copy_rate, copy_allocs) = row("copy", &copy);
-    assert!(copy_rate >= built_rate * (1.0 - MAX_SLOWDOWN), "the copy's best throughput fell more than 15% below the built-in's");
-    assert!(copy_allocs <= built_allocs * (1.0 + MAX_EXTRA_ALLOCS), "copy allocations rose more than 5%");
+    assert!(
+        copy_rate >= built_rate * (1.0 - MAX_SLOWDOWN),
+        "the copy's best throughput fell more than 15% below the built-in's"
+    );
+    assert!(
+        copy_allocs <= built_allocs * (1.0 + MAX_EXTRA_ALLOCS),
+        "copy allocations rose more than 5%"
+    );
 }

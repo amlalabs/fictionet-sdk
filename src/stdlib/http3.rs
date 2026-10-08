@@ -40,8 +40,8 @@
 //! # Ok::<(), fictionet::stdlib::http3::Error>(())
 //! ```
 
-use fictionet::stdlib::codec::{Prefixed, Frames};
-use fictionet::stdlib::codec::ascii::{self, trim_ows, is_tchar as token};
+use fictionet::stdlib::codec::ascii::{self, is_tchar as token, trim_ows};
+use fictionet::stdlib::codec::{Frames, Prefixed};
 use fictionet::stdlib::{
     codec::{self, Decode, Step, Wire},
     qpack, quic,
@@ -210,13 +210,17 @@ impl Error {
             Self::Limit => c::EXCESSIVE_LOAD,
             Self::Frame => c::FRAME_ERROR,
             Self::UnexpectedFrame(_) => c::FRAME_UNEXPECTED,
-            Self::DuplicateSetting(_) | Self::Http2Setting(_) | Self::SettingValue(_) => c::SETTINGS_ERROR,
+            Self::DuplicateSetting(_) | Self::Http2Setting(_) | Self::SettingValue(_) => {
+                c::SETTINGS_ERROR
+            }
             Self::MissingSettings => c::MISSING_SETTINGS,
             Self::Id => c::ID_ERROR,
             Self::ClosedCriticalStream => c::CLOSED_CRITICAL_STREAM,
             Self::Message(_) => c::MESSAGE_ERROR,
             Self::Incomplete => c::REQUEST_INCOMPLETE,
-            Self::Unwritable | Self::State | Self::Priority | Self::Truncated | Self::Trailing => return None,
+            Self::Unwritable | Self::State | Self::Priority | Self::Truncated | Self::Trailing => {
+                return None;
+            }
             Self::Qpack(_) => c::QPACK_DECOMPRESSION_FAILED,
             Self::QpackEncoderStream(_) => c::QPACK_ENCODER_STREAM_ERROR,
             Self::QpackDecoderStream(_) => c::QPACK_DECODER_STREAM_ERROR,
@@ -257,7 +261,9 @@ fn varint(bytes: &[u8]) -> Option<(u64, usize)> {
     quic::read_varint(bytes).ok()
 }
 fn put_varint(value: u64, out: &mut Vec<u8>) -> Result<(), Error> {
-    quic::VarInt(value).write(out).map_err(|_| Error::Unwritable)
+    quic::VarInt(value)
+        .write(out)
+        .map_err(|_| Error::Unwritable)
 }
 fn integer_at(bytes: &[u8], offset: &mut usize) -> Result<u64, Error> {
     let (v, n) = varint(bytes.get(*offset..).ok_or(Error::Frame)?).ok_or(Error::Frame)?;
@@ -295,7 +301,11 @@ pub struct Settings {
 impl Settings {
     /// The explicitly supplied value, or None if the identifier was absent.
     pub fn get(&self, id: u64) -> Option<u64> {
-        self.entries.iter().take(MAX_SETTINGS).find(|s| s.id == id).map(|s| s.value)
+        self.entries
+            .iter()
+            .take(MAX_SETTINGS)
+            .find(|s| s.id == id)
+            .map(|s| s.value)
     }
 }
 
@@ -359,12 +369,18 @@ fn frame_payload_limit(kind: u64) -> usize {
         frame_type::HEADERS => MAX_SECTION_BYTES,
         frame_type::SETTINGS => MAX_SETTINGS_BYTES,
         frame_type::PUSH_PROMISE => MAX_SECTION_BYTES + 8,
-        frame_type::PRIORITY_UPDATE_REQUEST | frame_type::PRIORITY_UPDATE_PUSH => MAX_PRIORITY_BYTES + 8,
+        frame_type::PRIORITY_UPDATE_REQUEST | frame_type::PRIORITY_UPDATE_PUSH => {
+            MAX_PRIORITY_BYTES + 8
+        }
         _ => MAX_FRAME_PAYLOAD,
     }
 }
 fn field_bytes(b: &[u8]) -> Result<(), Error> {
-    if b.len() > MAX_SECTION_BYTES { Err(Error::Limit) } else { Ok(()) }
+    if b.len() > MAX_SECTION_BYTES {
+        Err(Error::Limit)
+    } else {
+        Ok(())
+    }
 }
 fn priority_bytes(b: &[u8]) -> Result<(), Error> {
     if b.len() > MAX_PRIORITY_BYTES {
@@ -377,11 +393,15 @@ fn priority_bytes(b: &[u8]) -> Result<(), Error> {
 }
 // Header failures are terminal; payload failures retain the next frame boundary.
 fn frame_header(bytes: &[u8]) -> Result<Option<(u64, usize, usize)>, Error> {
-    let Some((t, a)) = varint(bytes) else { return Ok(None) };
+    let Some((t, a)) = varint(bytes) else {
+        return Ok(None);
+    };
     if forbidden_frame(t) {
         return Err(Error::UnexpectedFrame(t));
     }
-    let Some((len, b)) = varint(bytes.get(a..).ok_or(Error::Frame)?) else { return Ok(None) };
+    let Some((len, b)) = varint(bytes.get(a..).ok_or(Error::Frame)?) else {
+        return Ok(None);
+    };
     let len = usize::try_from(len).map_err(|_| Error::Limit)?;
     let limit = frame_payload_limit(t);
     if len > limit {
@@ -399,7 +419,10 @@ impl Frame {
     /// Builds a HEADERS frame around an encoded field section.
     /// Refuses sections that cannot be written within the QPACK limits.
     pub fn headers(section: &qpack::FieldSection) -> Result<Self, Error> {
-        section.to_bytes().map(Self::Headers).map_err(|_| Error::Unwritable)
+        section
+            .to_bytes()
+            .map(Self::Headers)
+            .map_err(|_| Error::Unwritable)
     }
 
     /// The wire type of this frame.
@@ -412,7 +435,10 @@ impl Frame {
             Self::PushPromise { .. } => 5,
             Self::Goaway(_) => 7,
             Self::MaxPushId(_) => 0x0d,
-            Self::PriorityUpdate { element: PriorityElement::Request(_), .. } => 0x0f0700,
+            Self::PriorityUpdate {
+                element: PriorityElement::Request(_),
+                ..
+            } => 0x0f0700,
             Self::PriorityUpdate { .. } => 0x0f0701,
             Self::Unknown { frame_type, .. } => *frame_type,
         }
@@ -421,8 +447,12 @@ impl Frame {
     /// needed. Oversized lengths and forbidden types fail before allocation.
     /// Nonminimal QUIC integers are accepted; writers use the shortest form.
     fn parse_prefix(bytes: &[u8]) -> Result<Option<(Self, usize)>, Error> {
-        let Some((t, start, end)) = frame_header(bytes)? else { return Ok(None) };
-        let Some(payload) = bytes.get(start..end) else { return Ok(None) };
+        let Some((t, start, end)) = frame_header(bytes)? else {
+            return Ok(None);
+        };
+        let Some(payload) = bytes.get(start..end) else {
+            return Ok(None);
+        };
         Ok(Some((Self::parse_payload(t, payload)?, end)))
     }
 
@@ -446,7 +476,10 @@ impl Frame {
                 let (push_id, used) = varint(payload).ok_or(Error::Frame)?;
                 let section = payload.get(used..).ok_or(Error::Frame)?;
                 field_bytes(section)?;
-                Self::PushPromise { push_id, field_section: section.to_vec() }
+                Self::PushPromise {
+                    push_id,
+                    field_section: section.to_vec(),
+                }
             }
             0x0f0700 | 0x0f0701 => {
                 let (id, used) = varint(payload).ok_or(Error::Frame)?;
@@ -455,10 +488,20 @@ impl Frame {
                 }
                 let value = payload.get(used..).ok_or(Error::Frame)?;
                 priority_bytes(value)?;
-                let element = if t == 0x0f0700 { PriorityElement::Request(id) } else { PriorityElement::Push(id) };
-                Self::PriorityUpdate { element, value: value.to_vec() }
+                let element = if t == 0x0f0700 {
+                    PriorityElement::Request(id)
+                } else {
+                    PriorityElement::Push(id)
+                };
+                Self::PriorityUpdate {
+                    element,
+                    value: value.to_vec(),
+                }
             }
-            _ => Self::Unknown { frame_type: t, payload: payload.to_vec() },
+            _ => Self::Unknown {
+                frame_type: t,
+                payload: payload.to_vec(),
+            },
         };
         Ok(frame)
     }
@@ -482,11 +525,15 @@ pub enum StreamHeader {
 impl StreamHeader {
     /// Reads just the stream prefix and returns its consumed length.
     fn parse_prefix(bytes: &[u8]) -> Result<Option<(Self, usize)>, Error> {
-        let Some((t, used)) = varint(bytes) else { return Ok(None) };
+        let Some((t, used)) = varint(bytes) else {
+            return Ok(None);
+        };
         let header = match t {
             0 => Self::Control,
             1 => {
-                let Some((id, n)) = varint(bytes.get(used..).ok_or(Error::Frame)?) else { return Ok(None) };
+                let Some((id, n)) = varint(bytes.get(used..).ok_or(Error::Frame)?) else {
+                    return Ok(None);
+                };
                 return Ok(Some((Self::Push(id), used + n)));
             }
             2 => Self::QpackEncoder,
@@ -527,13 +574,22 @@ impl Wire for Priority {
         if bytes.len() > MAX_PRIORITY_BYTES {
             return Err(Error::Limit);
         }
-        let mut p = Dictionary { bytes, pos: 0, members: 0, items: 0 };
+        let mut p = Dictionary {
+            bytes,
+            pos: 0,
+            members: 0,
+            items: 0,
+        };
         let mut result = Self::default();
         p.spaces();
         while p.peek().is_some() {
             p.member()?;
             let key = p.key()?;
-            let value = if p.eat(b'=') { p.value()? } else { Scalar::Boolean(true) };
+            let value = if p.eat(b'=') {
+                p.value()?
+            } else {
+                Scalar::Boolean(true)
+            };
             p.parameters()?;
             match key {
                 b"u" => {
@@ -629,7 +685,10 @@ impl<'a> Dictionary<'a> {
             return Err(Error::Priority);
         }
         self.pos += 1;
-        while matches!(self.peek(), Some(b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'*')) {
+        while matches!(
+            self.peek(),
+            Some(b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'*')
+        ) {
             self.pos += 1;
         }
         self.bytes.get(start..self.pos).ok_or(Error::Priority)
@@ -735,7 +794,10 @@ impl<'a> Dictionary<'a> {
             b':' => {
                 self.pos += 1;
                 let start = self.pos;
-                while self.peek().is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/')) {
+                while self
+                    .peek()
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/'))
+                {
                     self.pos += 1;
                 }
                 let digits = self.pos - start;
@@ -761,7 +823,10 @@ impl<'a> Dictionary<'a> {
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'*' => {
                 self.pos += 1;
-                while self.peek().is_some_and(|b| token(b) || matches!(b, b':' | b'/')) {
+                while self
+                    .peek()
+                    .is_some_and(|b| token(b) || matches!(b, b':' | b'/'))
+                {
                     self.pos += 1;
                 }
                 Ok(Scalar::Other)
@@ -818,8 +883,15 @@ struct Receive {
 /// holding the decimal value, at the place of the first.
 fn normalize_length(fields: &mut Vec<qpack::Field>, length: Option<u64>) {
     let Some(n) = length else { return };
-    let count = fields.iter().filter(|f| f.name == b"content-length").count();
-    if count <= 1 && !fields.iter().any(|f| f.name == b"content-length" && f.value.contains(&b',')) {
+    let count = fields
+        .iter()
+        .filter(|f| f.name == b"content-length")
+        .count();
+    if count <= 1
+        && !fields
+            .iter()
+            .any(|f| f.name == b"content-length" && f.value.contains(&b','))
+    {
         return;
     }
     let mut first = true;
@@ -845,29 +917,51 @@ fn reg_name_char(b: u8) -> bool {
     b.is_ascii_alphanumeric()
         || matches!(
             b,
-            b'-' | b'.' | b'_' | b'~' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
         )
 }
 fn authority(value: &[u8], port_required: bool) -> bool {
     if value.is_empty()
-        || value.iter().any(|b| !matches!(b, 0x21..=0x7e) || matches!(b, b'@' | b'/' | b'?' | b'#' | b'\\'))
+        || value
+            .iter()
+            .any(|b| !matches!(b, 0x21..=0x7e) || matches!(b, b'@' | b'/' | b'?' | b'#' | b'\\'))
     {
         return false;
     }
     let rest = if value.first() == Some(&b'[') {
-        let Some(end) = value.iter().position(|b| *b == b']') else { return false };
+        let Some(end) = value.iter().position(|b| *b == b']') else {
+            return false;
+        };
         if end <= 1 {
             return false;
         }
-        let Ok(ip) = std::str::from_utf8(value.get(1..end).unwrap_or_default()) else { return false };
-        let future = ip.strip_prefix('v').or_else(|| ip.strip_prefix('V')).is_some_and(|v| {
-            v.split_once('.').is_some_and(|(version, address)| {
-                !version.is_empty()
-                    && version.bytes().all(|b| b.is_ascii_hexdigit())
-                    && !address.is_empty()
-                    && address.bytes().all(|b| reg_name_char(b) || b == b':')
-            })
-        });
+        let Ok(ip) = std::str::from_utf8(value.get(1..end).unwrap_or_default()) else {
+            return false;
+        };
+        let future = ip
+            .strip_prefix('v')
+            .or_else(|| ip.strip_prefix('V'))
+            .is_some_and(|v| {
+                v.split_once('.').is_some_and(|(version, address)| {
+                    !version.is_empty()
+                        && version.bytes().all(|b| b.is_ascii_hexdigit())
+                        && !address.is_empty()
+                        && address.bytes().all(|b| reg_name_char(b) || b == b':')
+                })
+            });
         if ip.parse::<std::net::Ipv6Addr>().is_err() && !future {
             return false;
         }
@@ -875,7 +969,10 @@ fn authority(value: &[u8], port_required: bool) -> bool {
     } else {
         let end = value.iter().position(|b| *b == b':').unwrap_or(value.len());
         let host = value.get(..end).unwrap_or_default();
-        if host.is_empty() || !host.iter().all(|b| reg_name_char(*b) || *b == b'%') || !uri_path(host) {
+        if host.is_empty()
+            || !host.iter().all(|b| reg_name_char(*b) || *b == b'%')
+            || !uri_path(host)
+        {
             return false;
         }
         value.get(end..).unwrap_or_default()
@@ -886,7 +983,8 @@ fn authority(value: &[u8], port_required: bool) -> bool {
     if rest == b":" {
         return !port_required;
     }
-    rest.first() == Some(&b':') && decimal(rest.get(1..).unwrap_or_default()).is_some_and(|p| p <= 65535)
+    rest.first() == Some(&b':')
+        && decimal(rest.get(1..).unwrap_or_default()).is_some_and(|p| p <= 65535)
 }
 fn uri_path(path: &[u8]) -> bool {
     let mut pos = 0;
@@ -942,7 +1040,13 @@ impl HeaderList {
         connect_response: bool,
     ) -> Result<(Self, HeaderInfo), Error> {
         let mut headers = Self { fields };
-        let info = headers.info(kind, Receive { length_list: true, connect_response })?;
+        let info = headers.info(
+            kind,
+            Receive {
+                length_list: true,
+                connect_response,
+            },
+        )?;
         normalize_length(&mut headers.fields, info.content_length);
         Ok((headers, info))
     }
@@ -972,7 +1076,9 @@ impl HeaderList {
             if name.len() > MAX_FIELD_BYTES || value.len() > MAX_FIELD_BYTES {
                 return Err(Error::Limit);
             }
-            size = size.checked_add(name.len() as u64 + value.len() as u64 + 32).ok_or(Error::Limit)?;
+            size = size
+                .checked_add(name.len() as u64 + value.len() as u64 + 32)
+                .ok_or(Error::Limit)?;
             if size > MAX_FIELD_SECTION_SIZE {
                 return Err(Error::Limit);
             }
@@ -1005,14 +1111,20 @@ impl HeaderList {
                 }
                 if matches!(
                     name,
-                    b"connection" | b"proxy-connection" | b"keep-alive" | b"transfer-encoding" | b"upgrade"
+                    b"connection"
+                        | b"proxy-connection"
+                        | b"keep-alive"
+                        | b"transfer-encoding"
+                        | b"upgrade"
                 ) {
                     return Err(bad("connection-specific field"));
                 }
                 if name == b"te" && (!request || !value.eq_ignore_ascii_case(b"trailers")) {
                     return Err(bad("TE is only trailers in request headers"));
                 }
-                if kind == HeaderKind::Trailers && matches!(name, b"content-length" | b"host" | b"trailer") {
+                if kind == HeaderKind::Trailers
+                    && matches!(name, b"content-length" | b"host" | b"trailer")
+                {
                     return Err(bad("framing field in trailers"));
                 }
                 if name == b"host" && host.replace(value).is_some() {
@@ -1035,7 +1147,12 @@ impl HeaderList {
         }
         match kind {
             HeaderKind::Request { .. } | HeaderKind::Promise => {
-                let extended_connect = matches!(kind, HeaderKind::Request { extended_connect: true });
+                let extended_connect = matches!(
+                    kind,
+                    HeaderKind::Request {
+                        extended_connect: true
+                    }
+                );
                 let method = method.ok_or(bad("missing :method"))?;
                 if !nonempty_token(method) {
                     return Err(bad("invalid :method"));
@@ -1052,9 +1169,10 @@ impl HeaderList {
                     return Err(bad("empty authority"));
                 }
                 if let (Some(a), Some(h)) = (auth, host)
-                    && a != h {
-                        return Err(bad("Host differs from :authority"));
-                    }
+                    && a != h
+                {
+                    return Err(bad("Host differs from :authority"));
+                }
                 if let Some(p) = protocol {
                     if !info.connect || !extended_connect || !nonempty_token(p) {
                         return Err(bad("invalid or unnegotiated :protocol"));
@@ -1064,20 +1182,28 @@ impl HeaderList {
                     }
                 }
                 if info.connect && protocol.is_none() {
-                    if scheme.is_some() || path.is_some() || !auth.is_some_and(|a| authority(a, true)) {
+                    if scheme.is_some()
+                        || path.is_some()
+                        || !auth.is_some_and(|a| authority(a, true))
+                    {
                         return Err(bad("CONNECT needs only :method and host:port :authority"));
                     }
                 } else {
                     let scheme = scheme.ok_or(bad("missing :scheme"))?;
                     if !scheme.first().is_some_and(u8::is_ascii_alphabetic)
-                        || !scheme.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+                        || !scheme
+                            .iter()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
                     {
                         return Err(bad("invalid :scheme"));
                     }
                     let path = path.ok_or(bad("missing :path"))?;
-                    let http = scheme.eq_ignore_ascii_case(b"http") || scheme.eq_ignore_ascii_case(b"https");
+                    let http = scheme.eq_ignore_ascii_case(b"http")
+                        || scheme.eq_ignore_ascii_case(b"https");
                     if !uri_path(path)
-                        || (http && !(path.first() == Some(&b'/') || (path == b"*" && method == b"OPTIONS")))
+                        || (http
+                            && !(path.first() == Some(&b'/')
+                                || (path == b"*" && method == b"OPTIONS")))
                     {
                         return Err(bad("invalid :path"));
                     }
@@ -1168,7 +1294,12 @@ struct ControlState {
 }
 impl ControlState {
     fn new(sender: Endpoint) -> Self {
-        Self { sender, settings: false, goaway: None, max_push: None }
+        Self {
+            sender,
+            settings: false,
+            goaway: None,
+            max_push: None,
+        }
     }
     fn accept(&mut self, frame: &Frame) -> Result<(), Error> {
         if !self.settings {
@@ -1180,7 +1311,9 @@ impl ControlState {
         }
         let unexpected = Error::UnexpectedFrame(frame.frame_type());
         match frame {
-            Frame::Settings(_) | Frame::Data(_) | Frame::Headers(_) | Frame::PushPromise { .. } => Err(unexpected),
+            Frame::Settings(_) | Frame::Data(_) | Frame::Headers(_) | Frame::PushPromise { .. } => {
+                Err(unexpected)
+            }
             Frame::MaxPushId(id) => {
                 if self.sender != Endpoint::Client {
                     return Err(unexpected);
@@ -1406,14 +1539,21 @@ impl RequestStream {
             return HeaderKind::Trailers;
         }
         if self.side == MessageSide::Request {
-            HeaderKind::Request { extended_connect: self.extended_connect }
+            HeaderKind::Request {
+                extended_connect: self.extended_connect,
+            }
         } else {
             HeaderKind::Response
         }
     }
-    fn accept_fields(&mut self, pending: PendingSection, fields: Vec<qpack::Field>) -> Result<Event, Error> {
+    fn accept_fields(
+        &mut self,
+        pending: PendingSection,
+        fields: Vec<qpack::Field>,
+    ) -> Result<Event, Error> {
         let kind = self.kind(pending);
-        let (headers, info) = HeaderList::received(fields, kind, self.side == MessageSide::ConnectResponse)?;
+        let (headers, info) =
+            HeaderList::received(fields, kind, self.side == MessageSide::ConnectResponse)?;
         if let PendingSection::Promise(push_id) = pending {
             return Ok(Event::PushPromise { push_id, headers });
         }
@@ -1428,7 +1568,8 @@ impl RequestStream {
         // Any 2xx response to CONNECT opens a tunnel; its Content-Length is
         // ignored and its status puts no limit on tunnel bytes.
         self.tunnel = (self.side == MessageSide::Request && info.connect)
-            || (self.side == MessageSide::ConnectResponse && info.status.is_some_and(|s| (200..300).contains(&s)));
+            || (self.side == MessageSide::ConnectResponse
+                && info.status.is_some_and(|s| (200..300).contains(&s)));
         // RFC 9110: HEAD responses, 204, 205 and 304 carry no content, nor
         // do TRACE requests; 204 and 304 carry no trailers either.
         self.no_content = !self.tunnel
@@ -1437,10 +1578,17 @@ impl RequestStream {
                 || matches!(info.status, Some(204 | 205 | 304)));
         self.no_trailers = !self.tunnel && matches!(info.status, Some(204 | 304));
         let hypothetical = self.side == MessageSide::HeadResponse || info.status == Some(304);
-        self.content_length = if self.tunnel || hypothetical { None } else { info.content_length };
+        self.content_length = if self.tunnel || hypothetical {
+            None
+        } else {
+            info.content_length
+        };
         Ok(Event::Headers(headers))
     }
-    fn pending_section<'a>(&self, frame: &'a Frame) -> Result<Option<(PendingSection, &'a [u8])>, Error> {
+    fn pending_section<'a>(
+        &self,
+        frame: &'a Frame,
+    ) -> Result<Option<(PendingSection, &'a [u8])>, Error> {
         let t = frame.frame_type();
         // RFC 9114 section 4.4: an open tunnel carries only DATA and extension
         // frames. This is checked before QPACK sees a section.
@@ -1458,7 +1606,10 @@ impl RequestStream {
             Frame::Headers(bytes) if self.state != MessageState::Trailers => {
                 Some((PendingSection::Headers, bytes.as_slice()))
             }
-            Frame::PushPromise { push_id, field_section } if self.side != MessageSide::Request && !self.push => {
+            Frame::PushPromise {
+                push_id,
+                field_section,
+            } if self.side != MessageSide::Request && !self.push => {
                 Some((PendingSection::Promise(*push_id), field_section.as_slice()))
             }
             _ => None,
@@ -1519,11 +1670,15 @@ impl RequestStream {
         }
         let result = self.pending_section(frame).and_then(|pending| {
             if let Some((pending, bytes)) = pending {
-                let section = qpack::decode_section_with_limit(table, self.stream, bytes, self.field_limit)
-                    .map_err(Error::Qpack)?;
+                let section =
+                    qpack::decode_section_with_limit(table, self.stream, bytes, self.field_limit)
+                        .map_err(Error::Qpack)?;
                 self.accept_section(pending, section)
             } else {
-                self.accept_frame(frame).map(|event| RequestResult::Event { event: Ok(event), ack: None })
+                self.accept_frame(frame).map(|event| RequestResult::Event {
+                    event: Ok(event),
+                    ack: None,
+                })
             }
         });
         if result.is_err() {
@@ -1546,7 +1701,9 @@ impl RequestStream {
             return Err(Error::State);
         }
         let pending = self.pending.ok_or(Error::State)?;
-        let result = section.map_err(Error::Qpack).and_then(|section| self.accept_section(pending, section));
+        let result = section
+            .map_err(Error::Qpack)
+            .and_then(|section| self.accept_section(pending, section));
         if result.is_err() {
             self.fail();
         }
@@ -1619,7 +1776,10 @@ impl Wire for Frame {
                 put_varint(*id, &mut out)?;
                 out
             }
-            Self::PushPromise { push_id, field_section } => {
+            Self::PushPromise {
+                push_id,
+                field_section,
+            } => {
                 field_bytes(field_section).map_err(|_| Error::Unwritable)?;
                 let mut out = Vec::with_capacity(MAX_SECTION_BYTES + 8);
                 put_varint(*push_id, &mut out)?;
@@ -1638,7 +1798,12 @@ impl Wire for Frame {
                 out
             }
         };
-        let mut out = Vec::with_capacity(payload.len().checked_add(MAX_FRAME_HEADER).ok_or(Error::Unwritable)?);
+        let mut out = Vec::with_capacity(
+            payload
+                .len()
+                .checked_add(MAX_FRAME_HEADER)
+                .ok_or(Error::Unwritable)?,
+        );
         put_varint(t, &mut out)?;
         put_varint(payload.len() as u64, &mut out)?;
         out.extend_from_slice(&payload);
@@ -1745,13 +1910,19 @@ impl Prefixed for Frame {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
-        let Some((kind, start, end)) = frame_header(input)? else { return Ok(None) };
-        let Some(payload) = input.get(start..end) else { return Ok(None) };
+    fn parse_prefix(
+        input: &[u8],
+        _limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let Some((kind, start, end)) = frame_header(input)? else {
+            return Ok(None);
+        };
+        let Some(payload) = input.get(start..end) else {
+            return Ok(None);
+        };
         Ok(Some((Frame::parse_payload(kind, payload), end)))
     }
 }
-
 
 /// Reads one unidirectional stream header, then returns [`Step::End`].
 ///
@@ -1823,7 +1994,9 @@ pub struct ControlFrames {
 impl ControlFrames {
     /// Creates a control decoder for the endpoint sending this stream.
     pub fn new(sender: Endpoint) -> Self {
-        Self { state: ControlState::new(sender) }
+        Self {
+            state: ControlState::new(sender),
+        }
     }
 }
 
@@ -1899,11 +2072,15 @@ pub struct StreamItems {
 impl StreamItems {
     /// Reads request or response frames without a unidirectional prefix.
     pub fn request() -> Self {
-        Self { kind: StreamKind::Frames }
+        Self {
+            kind: StreamKind::Frames,
+        }
     }
     /// Reads one unidirectional header and ends for a driver handoff.
     pub fn unidirectional() -> Self {
-        Self { kind: StreamKind::Header(StreamHeaders::new()) }
+        Self {
+            kind: StreamKind::Header(StreamHeaders::new()),
+        }
     }
     /// Selects the decoder for bytes after a complete stream header.
     /// Use [`codec::Stream::swap`] so unread bytes and EOF are preserved.
@@ -1956,32 +2133,46 @@ impl Decode for StreamItems {
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
         Ok(match &mut self.kind {
-            StreamKind::Header(decoder) => {
-                stream_step(decoder.decode(input, eof)?, |header| Ok(StreamItem::Header(header)))
+            StreamKind::Header(decoder) => stream_step(decoder.decode(input, eof)?, |header| {
+                Ok(StreamItem::Header(header))
+            }),
+            StreamKind::Frames => {
+                stream_step(Frames::<Frame>::new().decode(input, eof)?, |frame| {
+                    Ok(StreamItem::Frame(frame?))
+                })
             }
-            StreamKind::Frames => stream_step(Frames::<Frame>::new().decode(input, eof)?, |frame| Ok(StreamItem::Frame(frame?))),
-            StreamKind::Control(decoder) => {
-                stream_step(decoder.decode(input, eof)?, |frame| Ok(StreamItem::Frame(frame?)))
-            }
+            StreamKind::Control(decoder) => stream_step(decoder.decode(input, eof)?, |frame| {
+                Ok(StreamItem::Frame(frame?))
+            }),
             StreamKind::Encoder => {
                 if eof && input.is_empty() {
                     return Err(Error::ClosedCriticalStream);
                 }
-                let step = Frames::<qpack::EncoderInstruction>::new().decode(input, eof).map_err(Error::QpackEncoderStream)?;
+                let step = Frames::<qpack::EncoderInstruction>::new()
+                    .decode(input, eof)
+                    .map_err(Error::QpackEncoderStream)?;
                 if eof && matches!(step, Step::Need) {
                     return Err(Error::ClosedCriticalStream);
                 }
-                stream_step(step, |item| item.map(StreamItem::EncoderInstruction).map_err(Error::QpackEncoderStream))
+                stream_step(step, |item| {
+                    item.map(StreamItem::EncoderInstruction)
+                        .map_err(Error::QpackEncoderStream)
+                })
             }
             StreamKind::Decoder => {
                 if eof && input.is_empty() {
                     return Err(Error::ClosedCriticalStream);
                 }
-                let step = Frames::<qpack::DecoderInstruction>::new().decode(input, eof).map_err(Error::QpackDecoderStream)?;
+                let step = Frames::<qpack::DecoderInstruction>::new()
+                    .decode(input, eof)
+                    .map_err(Error::QpackDecoderStream)?;
                 if eof && matches!(step, Step::Need) {
                     return Err(Error::ClosedCriticalStream);
                 }
-                stream_step(step, |item| item.map(StreamItem::DecoderInstruction).map_err(Error::QpackDecoderStream))
+                stream_step(step, |item| {
+                    item.map(StreamItem::DecoderInstruction)
+                        .map_err(Error::QpackDecoderStream)
+                })
             }
             StreamKind::Ignore if input.is_empty() => Step::Need,
             StreamKind::Ignore => Step::Skip(input.len()),
@@ -2083,7 +2274,9 @@ impl Session {
             && !stream.is_done()
         {
             let held = stream.buffered().saturating_add(stream.held());
-            let idle = codec::Stream::new(StreamItems { kind: StreamKind::Paused(held) });
+            let idle = codec::Stream::new(StreamItems {
+                kind: StreamKind::Paused(held),
+            });
             self.paused.insert(id, core::mem::replace(stream, idle));
         }
     }
@@ -2129,7 +2322,8 @@ impl Session {
     }
     fn swap_stream(stream: &mut codec::Stream<StreamItems>, next: StreamItems) {
         // swap takes ownership; the temporary stream allocates no input buffer.
-        let previous = core::mem::replace(stream, codec::Stream::new(StreamItems::unidirectional()));
+        let previous =
+            core::mem::replace(stream, codec::Stream::new(StreamItems::unidirectional()));
         *stream = previous.swap(next);
     }
     /// The aggregate unread and decoder-held bytes across every stream.
@@ -2176,22 +2370,29 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
-    use super::harness::{check_session_budget};
+    use super::harness::check_session_budget;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
-    fn event(state: &mut RequestStream, frame: Frame, table: &qpack::Table) -> Result<Event, Error> {
+    fn event(
+        state: &mut RequestStream,
+        frame: Frame,
+        table: &qpack::Table,
+    ) -> Result<Event, Error> {
         match state.step(&frame, table)? {
             RequestResult::Event { event, .. } => event,
             RequestResult::Blocked(_) => Err(Error::State),
         }
     }
 
-    fn received(table: &qpack::Table, stream: u64, bytes: &[u8], kind: HeaderKind) -> Result<HeaderList, Error> {
+    fn received(
+        table: &qpack::Table,
+        stream: u64,
+        bytes: &[u8],
+        kind: HeaderKind,
+    ) -> Result<HeaderList, Error> {
         let qpack::SectionResult::Fields { fields, .. } =
             qpack::decode_section(table, stream, bytes).map_err(Error::Qpack)?
         else {
@@ -2203,10 +2404,17 @@ mod tests {
     const MAX_TEST_BYTES: usize = 2048;
     const FUZZ_CASES: usize = 3000;
     fn fields(pairs: &[(&str, &str)]) -> HeaderList {
-        HeaderList { fields: pairs.iter().map(|(n, v)| qpack::Field::new(n, v)).collect() }
+        HeaderList {
+            fields: pairs.iter().map(|(n, v)| qpack::Field::new(n, v)).collect(),
+        }
     }
     fn request() -> HeaderList {
-        fields(&[(":method", "GET"), (":scheme", "https"), (":authority", "example.net"), (":path", "/")])
+        fields(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "example.net"),
+            (":path", "/"),
+        ])
     }
     fn response(status: &str) -> HeaderList {
         fields(&[(":status", status)])
@@ -2215,7 +2423,11 @@ mod tests {
         qpack::Table::new(0)
     }
     fn encoded(list: &HeaderList) -> Vec<u8> {
-        qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE).section(0, &list.fields).unwrap().to_bytes().unwrap()
+        qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE)
+            .section(0, &list.fields)
+            .unwrap()
+            .to_bytes()
+            .unwrap()
     }
     fn headers(list: &HeaderList) -> Frame {
         Frame::Headers(encoded(list))
@@ -2268,8 +2480,20 @@ mod tests {
             (Frame::Goaway(4), vec![7, 1, 4]),
             (Frame::MaxPushId(63), vec![0x0d, 1, 63]),
             (Frame::Headers(vec![0, 0, 0xd9]), vec![1, 3, 0, 0, 0xd9]),
-            (Frame::PushPromise { push_id: 0, field_section: vec![0, 0, 0xd1] }, vec![5, 4, 0, 0, 0, 0xd1]),
-            (Frame::Unknown { frame_type: 0x21, payload: vec![0xaa] }, vec![0x21, 1, 0xaa]),
+            (
+                Frame::PushPromise {
+                    push_id: 0,
+                    field_section: vec![0, 0, 0xd1],
+                },
+                vec![5, 4, 0, 0, 0, 0xd1],
+            ),
+            (
+                Frame::Unknown {
+                    frame_type: 0x21,
+                    payload: vec![0xaa],
+                },
+                vec![0x21, 1, 0xaa],
+            ),
         ];
         for (frame, bytes) in examples {
             assert_eq!(frame.to_bytes().unwrap(), bytes);
@@ -2283,15 +2507,25 @@ mod tests {
         section.extend_from_slice(b"/index.html");
         let mut expected = vec![1, 15];
         expected.extend_from_slice(&section);
-        assert_eq!(Frame::Headers(section.clone()).to_bytes().unwrap(), expected);
+        assert_eq!(
+            Frame::Headers(section.clone()).to_bytes().unwrap(),
+            expected
+        );
         assert_eq!(
             qpack::decode_section(&plain_qpack(), 0, &section),
-            Ok(qpack::SectionResult::Fields { fields: vec![qpack::Field::new(":path", "/index.html")], ack: None })
+            Ok(qpack::SectionResult::Fields {
+                fields: vec![qpack::Field::new(":path", "/index.html")],
+                ack: None
+            })
         );
         // Complete HTTP/3 response using static entry 25 (:status: 200).
         assert_eq!(
             response("200")
-                .section(&mut qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE), 0, HeaderKind::Response)
+                .section(
+                    &mut qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE),
+                    0,
+                    HeaderKind::Response
+                )
                 .unwrap()
                 .to_bytes()
                 .unwrap(),
@@ -2306,11 +2540,17 @@ mod tests {
                 Setting { id: 6, value: 1024 },
                 Setting { id: 7, value: 16 },
                 Setting { id: 8, value: 1 },
-                Setting { id: 0x21, value: 42 },
+                Setting {
+                    id: 0x21,
+                    value: 42,
+                },
                 Setting { id: 0x99, value: 0 },
             ],
         };
-        assert_eq!(s.to_bytes().unwrap(), [1, 0x50, 0, 6, 0x44, 0, 7, 16, 8, 1, 0x21, 42, 0x40, 0x99, 0]);
+        assert_eq!(
+            s.to_bytes().unwrap(),
+            [1, 0x50, 0, 6, 0x44, 0, 7, 16, 8, 1, 0x21, 42, 0x40, 0x99, 0]
+        );
         assert_eq!(s.get(1), Some(4096));
         assert_eq!(s.get(9), None);
         roundtrip(&Frame::Settings(s));
@@ -2319,17 +2559,44 @@ mod tests {
     #[test]
     fn rfc9218_priority_examples_exact_bytes() {
         for (bytes, expected) in [
-            (b"u=0".as_slice(), Priority { urgency: Some(0), incremental: None }),
-            (b"u=5, i".as_slice(), Priority { urgency: Some(5), incremental: Some(true) }),
-            (b"u=1".as_slice(), Priority { urgency: Some(1), incremental: None }),
+            (
+                b"u=0".as_slice(),
+                Priority {
+                    urgency: Some(0),
+                    incremental: None,
+                },
+            ),
+            (
+                b"u=5, i".as_slice(),
+                Priority {
+                    urgency: Some(5),
+                    incremental: Some(true),
+                },
+            ),
+            (
+                b"u=1".as_slice(),
+                Priority {
+                    urgency: Some(1),
+                    incremental: None,
+                },
+            ),
         ] {
             assert_eq!(Priority::parse(bytes), Ok(expected));
             assert_eq!(expected.to_bytes().unwrap(), bytes);
         }
-        let frame = Frame::PriorityUpdate { element: PriorityElement::Request(0), value: b"u=0, i".to_vec() };
-        assert_eq!(frame.to_bytes().unwrap(), [0x80, 0x0f, 7, 0, 7, 0, b'u', b'=', b'0', b',', b' ', b'i']);
+        let frame = Frame::PriorityUpdate {
+            element: PriorityElement::Request(0),
+            value: b"u=0, i".to_vec(),
+        };
+        assert_eq!(
+            frame.to_bytes().unwrap(),
+            [0x80, 0x0f, 7, 0, 7, 0, b'u', b'=', b'0', b',', b' ', b'i']
+        );
         roundtrip(&frame);
-        roundtrip(&Frame::PriorityUpdate { element: PriorityElement::Push(MAX_VARINT), value: vec![] });
+        roundtrip(&Frame::PriorityUpdate {
+            element: PriorityElement::Push(MAX_VARINT),
+            value: vec![],
+        });
     }
     #[test]
     fn all_varint_widths_and_nonminimal_forms() {
@@ -2354,14 +2621,34 @@ mod tests {
             assert!(!is_reserved(n));
         }
         for t in [2, 6, 8, 9] {
-            assert_eq!(Frame::parse(&[t]), Err(Error::UnexpectedFrame(u64::from(t))));
-            assert!(Frame::Unknown { frame_type: u64::from(t), payload: vec![] }.to_bytes().is_err());
+            assert_eq!(
+                Frame::parse(&[t]),
+                Err(Error::UnexpectedFrame(u64::from(t)))
+            );
+            assert!(
+                Frame::Unknown {
+                    frame_type: u64::from(t),
+                    payload: vec![]
+                }
+                .to_bytes()
+                .is_err()
+            );
         }
         for t in [0, 1, 3, 4, 5, 7, 0x0d, 0x0f0700, 0x0f0701] {
-            assert!(Frame::Unknown { frame_type: t, payload: vec![] }.to_bytes().is_err());
+            assert!(
+                Frame::Unknown {
+                    frame_type: t,
+                    payload: vec![]
+                }
+                .to_bytes()
+                .is_err()
+            );
         }
         for t in [0x21, 0x40, 0xff, MAX_VARINT] {
-            roundtrip(&Frame::Unknown { frame_type: t, payload: vec![] });
+            roundtrip(&Frame::Unknown {
+                frame_type: t,
+                payload: vec![],
+            });
         }
     }
     #[test]
@@ -2384,13 +2671,21 @@ mod tests {
             b.extend_from_slice(&payload);
             assert_eq!(Frame::parse(&b), Err(Error::Id));
             assert_eq!(
-                Frame::PriorityUpdate { element: PriorityElement::Request(id), value: vec![] }.to_bytes(),
+                Frame::PriorityUpdate {
+                    element: PriorityElement::Request(id),
+                    value: vec![]
+                }
+                .to_bytes(),
                 Err(Error::Unwritable)
             );
         }
         for value in [vec![0], vec![b'\r'], vec![b'\n'], vec![0x80]] {
             assert_eq!(
-                Frame::PriorityUpdate { element: PriorityElement::Push(0), value }.to_bytes(),
+                Frame::PriorityUpdate {
+                    element: PriorityElement::Push(0),
+                    value
+                }
+                .to_bytes(),
                 Err(Error::Unwritable)
             );
         }
@@ -2398,7 +2693,9 @@ mod tests {
     #[test]
     fn settings_duplicate_http2_and_value_refusals() {
         for id in [1, 6, 7, 8, 0x21, 0x99] {
-            let s = Settings { entries: vec![Setting { id, value: 0 }, Setting { id, value: 0 }] };
+            let s = Settings {
+                entries: vec![Setting { id, value: 0 }, Setting { id, value: 0 }],
+            };
             assert_eq!(s.to_bytes(), Err(Error::Unwritable));
             let mut b = Vec::new();
             for _ in 0..2 {
@@ -2408,14 +2705,29 @@ mod tests {
             assert_eq!(Settings::parse(&b), Err(Error::DuplicateSetting(id)));
         }
         for id in 2..=5 {
-            assert_eq!(Settings::parse(&[id, 0]), Err(Error::Http2Setting(u64::from(id))));
             assert_eq!(
-                Settings { entries: vec![Setting { id: u64::from(id), value: 0 }] }.to_bytes(),
+                Settings::parse(&[id, 0]),
+                Err(Error::Http2Setting(u64::from(id)))
+            );
+            assert_eq!(
+                Settings {
+                    entries: vec![Setting {
+                        id: u64::from(id),
+                        value: 0
+                    }]
+                }
+                .to_bytes(),
                 Err(Error::Unwritable)
             );
         }
         assert_eq!(Settings::parse(&[8, 2]), Err(Error::SettingValue(8)));
-        assert_eq!(Settings { entries: vec![Setting { id: 8, value: 2 }] }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Settings {
+                entries: vec![Setting { id: 8, value: 2 }]
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
         for bytes in [vec![1], vec![1, 0x40], vec![0x40]] {
             assert_eq!(Settings::parse(&bytes), Err(Error::Frame));
         }
@@ -2424,15 +2736,28 @@ mod tests {
     }
     #[test]
     fn writer_and_parser_resource_limits() {
-        assert_eq!(Frame::Data(vec![0; MAX_FRAME_PAYLOAD + 1]).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(Frame::Headers(vec![0; MAX_SECTION_BYTES + 1]).to_bytes(), Err(Error::Unwritable));
         assert_eq!(
-            Frame::PushPromise { push_id: 0, field_section: vec![0; MAX_SECTION_BYTES + 1] }.to_bytes(),
+            Frame::Data(vec![0; MAX_FRAME_PAYLOAD + 1]).to_bytes(),
             Err(Error::Unwritable)
         );
         assert_eq!(
-            Frame::PriorityUpdate { element: PriorityElement::Push(0), value: vec![b'a'; MAX_PRIORITY_BYTES + 1] }
-                .to_bytes(),
+            Frame::Headers(vec![0; MAX_SECTION_BYTES + 1]).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Frame::PushPromise {
+                push_id: 0,
+                field_section: vec![0; MAX_SECTION_BYTES + 1]
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Frame::PriorityUpdate {
+                element: PriorityElement::Push(0),
+                value: vec![b'a'; MAX_PRIORITY_BYTES + 1]
+            }
+            .to_bytes(),
             Err(Error::Unwritable)
         );
         for t in [0, 1, 4, 5, 0x0f0700] {
@@ -2441,7 +2766,14 @@ mod tests {
             put_varint(MAX_FRAME_PAYLOAD as u64 + 1, &mut bytes).unwrap();
             assert_eq!(Frame::parse(&bytes), Err(Error::Limit));
         }
-        let s = Settings { entries: (0..=MAX_SETTINGS).map(|n| Setting { id: 100 + n as u64, value: 0 }).collect() };
+        let s = Settings {
+            entries: (0..=MAX_SETTINGS)
+                .map(|n| Setting {
+                    id: 100 + n as u64,
+                    value: 0,
+                })
+                .collect(),
+        };
         assert_eq!(s.to_bytes(), Err(Error::Unwritable));
         let mut b = Vec::new();
         for entry in &s.entries {
@@ -2453,7 +2785,10 @@ mod tests {
             Frame::Goaway(u64::MAX),
             Frame::CancelPush(MAX_VARINT + 1),
             Frame::MaxPushId(MAX_VARINT + 1),
-            Frame::Unknown { frame_type: u64::MAX, payload: vec![] },
+            Frame::Unknown {
+                frame_type: u64::MAX,
+                payload: vec![],
+            },
         ] {
             assert_eq!(f.to_bytes(), Err(Error::Unwritable));
         }
@@ -2467,12 +2802,18 @@ mod tests {
             Frame::Data(vec![42; 257]),
             headers(&request()),
             Frame::CancelPush(MAX_VARINT),
-            Frame::Unknown { frame_type: MAX_VARINT, payload: vec![1, 2] },
+            Frame::Unknown {
+                frame_type: MAX_VARINT,
+                payload: vec![1, 2],
+            },
         ] {
             let bytes = frame.to_bytes().unwrap();
             contract::check_wire_value(&frame);
             contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
-            assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (vec![Ok(frame)], None));
+            assert_eq!(
+                decode_all(Frames::<Frame>::new, &bytes),
+                (vec![Ok(frame)], None)
+            );
         }
     }
     #[test]
@@ -2488,7 +2829,11 @@ mod tests {
             let mut bytes = header.to_bytes().unwrap();
             contract::check_wire_value(&header);
             bytes.extend_from_slice(b"body");
-            contract::check_decode_with_alloc_limit(StreamHeaders::new, &bytes, 2 * MAX_STREAM_HEADER);
+            contract::check_decode_with_alloc_limit(
+                StreamHeaders::new,
+                &bytes,
+                2 * MAX_STREAM_HEADER,
+            );
             let mut stream = Stream::new(StreamHeaders::new());
             assert_eq!(stream.push(&bytes), bytes.len());
             assert_eq!(stream.next(), Some(Ok(header)));
@@ -2512,13 +2857,19 @@ mod tests {
         let frames = [Frame::Data(vec![]), big.clone(), big];
         let bytes = join(&frames);
         contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
-        assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (frames.into_iter().map(Ok).collect(), None));
+        assert_eq!(
+            decode_all(Frames::<Frame>::new, &bytes),
+            (frames.into_iter().map(Ok).collect(), None)
+        );
     }
     #[test]
     fn framing_errors_are_terminal_and_fin_checks_truncation() {
         let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&[2, 0]), 2);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::UnexpectedFrame(2)))));
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(Error::UnexpectedFrame(2))))
+        );
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(&[0, 0]), 2);
         for bytes in [vec![0x40], vec![0], vec![0, 1]] {
@@ -2528,20 +2879,44 @@ mod tests {
     }
     #[test]
     fn control_requires_first_and_unique_settings() {
-        for frame in [Frame::Data(vec![]), Frame::Goaway(0), Frame::Unknown { frame_type: 0x21, payload: vec![] }] {
-            assert_eq!(control(Endpoint::Client, &[frame]), Err(Error::MissingSettings));
+        for frame in [
+            Frame::Data(vec![]),
+            Frame::Goaway(0),
+            Frame::Unknown {
+                frame_type: 0x21,
+                payload: vec![],
+            },
+        ] {
+            assert_eq!(
+                control(Endpoint::Client, &[frame]),
+                Err(Error::MissingSettings)
+            );
         }
-        assert_eq!(control(Endpoint::Client, &[settings(), settings()]), Err(Error::UnexpectedFrame(4)));
-        for frame in
-            [Frame::Data(vec![]), Frame::Headers(vec![]), Frame::PushPromise { push_id: 0, field_section: vec![] }]
-        {
+        assert_eq!(
+            control(Endpoint::Client, &[settings(), settings()]),
+            Err(Error::UnexpectedFrame(4))
+        );
+        for frame in [
+            Frame::Data(vec![]),
+            Frame::Headers(vec![]),
+            Frame::PushPromise {
+                push_id: 0,
+                field_section: vec![],
+            },
+        ] {
             let t = frame.frame_type();
-            assert_eq!(control(Endpoint::Client, &[settings(), frame]), Err(Error::UnexpectedFrame(t)));
+            assert_eq!(
+                control(Endpoint::Client, &[settings(), frame]),
+                Err(Error::UnexpectedFrame(t))
+            );
         }
         for sender in [Endpoint::Client, Endpoint::Server] {
             let mut stream = Stream::new(ControlFrames::new(sender));
             stream.end();
-            assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::ClosedCriticalStream))));
+            assert_eq!(
+                stream.next(),
+                Some(Err(Fail::Protocol(Error::ClosedCriticalStream)))
+            );
             assert_eq!(stream.push(&[4, 0]), 2);
             assert_eq!(stream.next(), None);
         }
@@ -2550,8 +2925,14 @@ mod tests {
     fn control_sender_and_id_rules() {
         for frame in [
             Frame::MaxPushId(0),
-            Frame::PriorityUpdate { element: PriorityElement::Request(0), value: vec![] },
-            Frame::PriorityUpdate { element: PriorityElement::Push(0), value: vec![] },
+            Frame::PriorityUpdate {
+                element: PriorityElement::Request(0),
+                value: vec![],
+            },
+            Frame::PriorityUpdate {
+                element: PriorityElement::Push(0),
+                value: vec![],
+            },
         ] {
             assert_eq!(
                 control(Endpoint::Server, &[settings(), frame.clone()]),
@@ -2559,18 +2940,52 @@ mod tests {
             );
             assert_eq!(control(Endpoint::Client, &[settings(), frame]), Ok(()));
         }
-        assert_eq!(control(Endpoint::Client, &[settings(), Frame::MaxPushId(2), Frame::MaxPushId(1)]), Err(Error::Id));
         assert_eq!(
-            control(Endpoint::Client, &[settings(), Frame::MaxPushId(2), Frame::MaxPushId(2), Frame::MaxPushId(3)]),
+            control(
+                Endpoint::Client,
+                &[settings(), Frame::MaxPushId(2), Frame::MaxPushId(1)]
+            ),
+            Err(Error::Id)
+        );
+        assert_eq!(
+            control(
+                Endpoint::Client,
+                &[
+                    settings(),
+                    Frame::MaxPushId(2),
+                    Frame::MaxPushId(2),
+                    Frame::MaxPushId(3)
+                ]
+            ),
             Ok(())
         );
         for sender in [Endpoint::Client, Endpoint::Server] {
-            assert_eq!(control(sender, &[settings(), Frame::Goaway(8), Frame::Goaway(4), Frame::Goaway(4)]), Ok(()));
-            assert_eq!(control(sender, &[settings(), Frame::Goaway(4), Frame::Goaway(8)]), Err(Error::Id));
+            assert_eq!(
+                control(
+                    sender,
+                    &[
+                        settings(),
+                        Frame::Goaway(8),
+                        Frame::Goaway(4),
+                        Frame::Goaway(4)
+                    ]
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                control(sender, &[settings(), Frame::Goaway(4), Frame::Goaway(8)]),
+                Err(Error::Id)
+            );
             assert_eq!(control(sender, &[settings(), Frame::CancelPush(0)]), Ok(()));
         }
-        assert_eq!(control(Endpoint::Server, &[settings(), Frame::Goaway(1)]), Err(Error::Id));
-        assert_eq!(control(Endpoint::Client, &[settings(), Frame::Goaway(1)]), Ok(()));
+        assert_eq!(
+            control(Endpoint::Server, &[settings(), Frame::Goaway(1)]),
+            Err(Error::Id)
+        );
+        assert_eq!(
+            control(Endpoint::Client, &[settings(), Frame::Goaway(1)]),
+            Ok(())
+        );
     }
     #[test]
     fn control_stream_contract() {
@@ -2578,10 +2993,17 @@ mod tests {
             settings(),
             Frame::MaxPushId(400),
             Frame::Goaway(23),
-            Frame::Unknown { frame_type: 0x21, payload: vec![0; 20] },
+            Frame::Unknown {
+                frame_type: 0x21,
+                payload: vec![0; 20],
+            },
         ];
         let bytes = join(&frames);
-        contract::check_decode_with_alloc_limit(|| ControlFrames::new(Endpoint::Client), &bytes, 2 * MAX_FRAME);
+        contract::check_decode_with_alloc_limit(
+            || ControlFrames::new(Endpoint::Client),
+            &bytes,
+            2 * MAX_FRAME,
+        );
         let (items, error) = decode_all(|| ControlFrames::new(Endpoint::Client), &bytes);
         assert_eq!(items, frames.into_iter().map(Ok).collect::<Vec<_>>());
         assert_eq!(error, Some(Fail::Protocol(Error::ClosedCriticalStream)));
@@ -2589,29 +3011,58 @@ mod tests {
     #[test]
     fn requests_responses_and_trailers_roundtrip_qpack() {
         for (list, kind) in [
-            (request(), HeaderKind::Request { extended_connect: false }),
+            (
+                request(),
+                HeaderKind::Request {
+                    extended_connect: false,
+                },
+            ),
             (response("200"), HeaderKind::Response),
             (fields(&[("digest", "sha-256=abc")]), HeaderKind::Trailers),
         ] {
-            let bytes =
-                list.section(&mut qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE), 0, kind).unwrap().to_bytes().unwrap();
+            let bytes = list
+                .section(&mut qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE), 0, kind)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
             assert_eq!(received(&plain_qpack(), 0, &bytes, kind), Ok(list));
         }
         let trailer = fields(&[("x-check", "ok")]);
-        let (events, result) =
-            messages(MessageSide::Request, &[headers(&request()), Frame::Data(vec![1, 2]), headers(&trailer)]);
+        let (events, result) = messages(
+            MessageSide::Request,
+            &[
+                headers(&request()),
+                Frame::Data(vec![1, 2]),
+                headers(&trailer),
+            ],
+        );
         assert_eq!(result, Ok(()));
-        assert_eq!(events, [Event::Headers(request()), Event::Data(vec![1, 2]), Event::Trailers(trailer)]);
+        assert_eq!(
+            events,
+            [
+                Event::Headers(request()),
+                Event::Data(vec![1, 2]),
+                Event::Trailers(trailer)
+            ]
+        );
     }
     #[test]
     fn request_frame_contract_and_message_sequence() {
-        let frames = [headers(&request()), Frame::Data(vec![1; 80]), headers(&fields(&[("x-check", "ok")]))];
+        let frames = [
+            headers(&request()),
+            Frame::Data(vec![1; 80]),
+            headers(&fields(&[("x-check", "ok")])),
+        ];
         let bytes = join(&frames);
         contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
         let (events, result) = messages(MessageSide::Request, &frames);
         assert_eq!(
             events,
-            [Event::Headers(request()), Event::Data(vec![1; 80]), Event::Trailers(fields(&[("x-check", "ok")]))]
+            [
+                Event::Headers(request()),
+                Event::Data(vec![1; 80]),
+                Event::Trailers(fields(&[("x-check", "ok")]))
+            ]
         );
         assert_eq!(result, Ok(()));
     }
@@ -2623,14 +3074,30 @@ mod tests {
                 Frame::CancelPush(0),
                 Frame::Goaway(0),
                 Frame::MaxPushId(0),
-                Frame::PriorityUpdate { element: PriorityElement::Request(0), value: vec![] },
+                Frame::PriorityUpdate {
+                    element: PriorityElement::Request(0),
+                    value: vec![],
+                },
             ] {
-                assert_eq!(messages(side, std::slice::from_ref(&frame)).1, Err(Error::UnexpectedFrame(frame.frame_type())));
+                assert_eq!(
+                    messages(side, std::slice::from_ref(&frame)).1,
+                    Err(Error::UnexpectedFrame(frame.frame_type()))
+                );
             }
-            assert_eq!(messages(side, &[Frame::Data(vec![])]).1, Err(Error::UnexpectedFrame(0)));
+            assert_eq!(
+                messages(side, &[Frame::Data(vec![])]).1,
+                Err(Error::UnexpectedFrame(0))
+            );
         }
         assert_eq!(
-            messages(MessageSide::Request, &[Frame::PushPromise { push_id: 0, field_section: encoded(&request()) }]).1,
+            messages(
+                MessageSide::Request,
+                &[Frame::PushPromise {
+                    push_id: 0,
+                    field_section: encoded(&request())
+                }]
+            )
+            .1,
             Err(Error::UnexpectedFrame(5))
         );
         for id in [1, 2, 3, u64::MAX] {
@@ -2655,29 +3122,54 @@ mod tests {
         assert!(matches!(events.first(), Some(Event::Informational(_))));
         assert_eq!(events.len(), 5);
         assert_eq!(
-            messages(MessageSide::Response, &[headers(&response("103")), Frame::Data(vec![])]).1,
+            messages(
+                MessageSide::Response,
+                &[headers(&response("103")), Frame::Data(vec![])]
+            )
+            .1,
             Err(Error::UnexpectedFrame(0))
         );
-        assert_eq!(messages(MessageSide::Response, &[headers(&response("103"))]).1, Err(Error::Incomplete));
+        assert_eq!(
+            messages(MessageSide::Response, &[headers(&response("103"))]).1,
+            Err(Error::Incomplete)
+        );
         assert!(matches!(
-            messages(MessageSide::Response, &[headers(&response("200")), headers(&response("201"))]).1,
+            messages(
+                MessageSide::Response,
+                &[headers(&response("200")), headers(&response("201"))]
+            )
+            .1,
             Err(Error::Message(_))
         ));
         for last in [headers(&trailer), Frame::Data(vec![])] {
             assert_eq!(
-                messages(MessageSide::Request, &[headers(&request()), headers(&trailer), last.clone()]).1,
+                messages(
+                    MessageSide::Request,
+                    &[headers(&request()), headers(&trailer), last.clone()]
+                )
+                .1,
                 Err(Error::UnexpectedFrame(last.frame_type()))
             );
         }
         assert!(matches!(
-            messages(MessageSide::Request, &[headers(&request()), headers(&request())]).1,
+            messages(
+                MessageSide::Request,
+                &[headers(&request()), headers(&request())]
+            )
+            .1,
             Err(Error::Message(_))
         ));
     }
     #[test]
     fn unknowns_and_promises_do_not_change_message_state() {
-        let unknown = Frame::Unknown { frame_type: 0x21, payload: vec![42] };
-        let promise = Frame::PushPromise { push_id: 7, field_section: encoded(&request()) };
+        let unknown = Frame::Unknown {
+            frame_type: 0x21,
+            payload: vec![42],
+        };
+        let promise = Frame::PushPromise {
+            push_id: 7,
+            field_section: encoded(&request()),
+        };
         let trailer = headers(&fields(&[]));
         let frames = [
             unknown.clone(),
@@ -2694,15 +3186,26 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert_eq!(events.len(), frames.len());
         let mut state = RequestStream::push(3).unwrap();
-        assert_eq!(event(&mut state, promise, &plain_qpack()), Err(Error::UnexpectedFrame(5)));
+        assert_eq!(
+            event(&mut state, promise, &plain_qpack()),
+            Err(Error::UnexpectedFrame(5))
+        );
         let mut state = RequestStream::push(3).unwrap();
-        assert!(matches!(event(&mut state, headers(&response("103")), &plain_qpack()), Ok(Event::Informational(_))));
-        assert!(matches!(event(&mut state, headers(&response("200")), &plain_qpack()), Ok(Event::Headers(_))));
+        assert!(matches!(
+            event(&mut state, headers(&response("103")), &plain_qpack()),
+            Ok(Event::Informational(_))
+        ));
+        assert!(matches!(
+            event(&mut state, headers(&response("200")), &plain_qpack()),
+            Ok(Event::Headers(_))
+        ));
         assert_eq!(state.finish(), Ok(()));
     }
     #[test]
     fn pseudo_header_presence_placement_and_uniqueness() {
-        let kind = HeaderKind::Request { extended_connect: false };
+        let kind = HeaderKind::Request {
+            extended_connect: false,
+        };
         for index in [0, 1, 2, 3] {
             let mut h = request();
             h.fields.remove(index);
@@ -2710,7 +3213,12 @@ mod tests {
         }
         for name in [":method", ":scheme", ":authority", ":path"] {
             let mut h = request();
-            let f = h.fields.iter().find(|f| f.name == name.as_bytes()).unwrap().clone();
+            let f = h
+                .fields
+                .iter()
+                .find(|f| f.name == name.as_bytes())
+                .unwrap()
+                .clone();
             h.fields.push(f);
             assert!(h.validate(kind).is_err());
         }
@@ -2726,7 +3234,11 @@ mod tests {
         h.fields.push(qpack::Field::new(":status", "200"));
         assert!(h.validate(HeaderKind::Response).is_err());
         for name in [":method", ":scheme", ":authority", ":path", ":protocol"] {
-            assert!(fields(&[(name, "x"), (":status", "200")]).validate(HeaderKind::Response).is_err());
+            assert!(
+                fields(&[(name, "x"), (":status", "200")])
+                    .validate(HeaderKind::Response)
+                    .is_err()
+            );
         }
         assert!(fields(&[]).validate(HeaderKind::Response).is_err());
         assert!(request().validate(HeaderKind::Trailers).is_err());
@@ -2734,35 +3246,83 @@ mod tests {
     #[test]
     fn invalid_field_names_values_and_hop_fields() {
         for name in ["", "Upper", "x y", "x:y", "x\r", "x\0", "é"] {
-            assert!(fields(&[(name, "v")]).validate(HeaderKind::Trailers).is_err());
+            assert!(
+                fields(&[(name, "v")])
+                    .validate(HeaderKind::Trailers)
+                    .is_err()
+            );
         }
-        for value in ["a\0b", "a\rb", "a\nb", "a\u{7f}b", " leading", "trailing ", "\t", "a\u{01}b"] {
-            assert!(fields(&[("x", value)]).validate(HeaderKind::Trailers).is_err());
+        for value in [
+            "a\0b",
+            "a\rb",
+            "a\nb",
+            "a\u{7f}b",
+            " leading",
+            "trailing ",
+            "\t",
+            "a\u{01}b",
+        ] {
+            assert!(
+                fields(&[("x", value)])
+                    .validate(HeaderKind::Trailers)
+                    .is_err()
+            );
         }
-        assert!(fields(&[("x", "a\tb"), ("x", ""), ("x", "é")]).validate(HeaderKind::Trailers).is_ok());
-        for name in ["connection", "proxy-connection", "keep-alive", "transfer-encoding", "upgrade"] {
+        assert!(
+            fields(&[("x", "a\tb"), ("x", ""), ("x", "é")])
+                .validate(HeaderKind::Trailers)
+                .is_ok()
+        );
+        for name in [
+            "connection",
+            "proxy-connection",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+        ] {
             let mut h = request();
             h.fields.push(qpack::Field::new(name, "x"));
-            assert!(h.validate(HeaderKind::Request { extended_connect: false }).is_err());
+            assert!(
+                h.validate(HeaderKind::Request {
+                    extended_connect: false
+                })
+                .is_err()
+            );
         }
         let mut h = request();
         h.fields.push(qpack::Field::new("te", "Trailers"));
-        assert!(h.validate(HeaderKind::Request { extended_connect: false }).is_ok());
+        assert!(
+            h.validate(HeaderKind::Request {
+                extended_connect: false
+            })
+            .is_ok()
+        );
         for value in ["gzip", "trailers, gzip", ""] {
             let mut h = request();
             h.fields.push(qpack::Field::new("te", value));
-            assert!(h.validate(HeaderKind::Request { extended_connect: false }).is_err());
+            assert!(
+                h.validate(HeaderKind::Request {
+                    extended_connect: false
+                })
+                .is_err()
+            );
         }
         let mut h = response("200");
         h.fields.push(qpack::Field::new("te", "trailers"));
         assert!(h.validate(HeaderKind::Response).is_err());
         for name in ["te", "host", "content-length", "trailer"] {
-            assert!(fields(&[(name, "trailers")]).validate(HeaderKind::Trailers).is_err());
+            assert!(
+                fields(&[(name, "trailers")])
+                    .validate(HeaderKind::Trailers)
+                    .is_err()
+            );
         }
     }
     #[test]
     fn method_scheme_authority_path_and_status_values() {
-        let kind = HeaderKind::Request { extended_connect: false };
+        let kind = HeaderKind::Request {
+            extended_connect: false,
+        };
         for (name, value) in [
             (":method", ""),
             (":method", "GE T"),
@@ -2779,7 +3339,11 @@ mod tests {
             (":path", "/a%zz"),
         ] {
             let mut h = request();
-            h.fields.iter_mut().find(|f| f.name == name.as_bytes()).unwrap().value = value.as_bytes().to_vec();
+            h.fields
+                .iter_mut()
+                .find(|f| f.name == name.as_bytes())
+                .unwrap()
+                .value = value.as_bytes().to_vec();
             assert!(h.validate(kind).is_err(), "{name}={value}");
         }
         let mut h = request();
@@ -2795,11 +3359,20 @@ mod tests {
         h.fields.push(qpack::Field::new("host", "different.net"));
         assert!(h.validate(kind).is_err());
         assert!(
-            fields(&[(":method", "OPTIONS"), (":scheme", "https"), (":authority", "example.net"), (":path", "*")])
+            fields(&[
+                (":method", "OPTIONS"),
+                (":scheme", "https"),
+                (":authority", "example.net"),
+                (":path", "*")
+            ])
+            .validate(kind)
+            .is_ok()
+        );
+        assert!(
+            fields(&[(":method", "GET"), (":scheme", "custom"), (":path", "")])
                 .validate(kind)
                 .is_ok()
         );
-        assert!(fields(&[(":method", "GET"), (":scheme", "custom"), (":path", "")]).validate(kind).is_ok());
         for status in ["", "99", "099", "101", "600", "999", "2000", "2a0", "+20"] {
             assert!(response(status).validate(HeaderKind::Response).is_err());
         }
@@ -2811,7 +3384,13 @@ mod tests {
     fn classic_and_extended_connect_rules() {
         let classic = fields(&[(":method", "CONNECT"), (":authority", "example.net:443")]);
         for enabled in [false, true] {
-            assert!(classic.validate(HeaderKind::Request { extended_connect: enabled }).is_ok());
+            assert!(
+                classic
+                    .validate(HeaderKind::Request {
+                        extended_connect: enabled
+                    })
+                    .is_ok()
+            );
         }
         for auth in [
             "example.net",
@@ -2825,19 +3404,28 @@ mod tests {
         ] {
             assert!(
                 fields(&[(":method", "CONNECT"), (":authority", auth)])
-                    .validate(HeaderKind::Request { extended_connect: false })
+                    .validate(HeaderKind::Request {
+                        extended_connect: false
+                    })
                     .is_err()
             );
         }
         assert!(
             fields(&[(":method", "CONNECT"), (":authority", "[::1]:443")])
-                .validate(HeaderKind::Request { extended_connect: false })
+                .validate(HeaderKind::Request {
+                    extended_connect: false
+                })
                 .is_ok()
         );
         for name in [":scheme", ":path"] {
             let mut h = classic.clone();
             h.fields.push(qpack::Field::new(name, "x"));
-            assert!(h.validate(HeaderKind::Request { extended_connect: true }).is_err());
+            assert!(
+                h.validate(HeaderKind::Request {
+                    extended_connect: true
+                })
+                .is_err()
+            );
         }
         let extended = fields(&[
             (":method", "CONNECT"),
@@ -2846,36 +3434,92 @@ mod tests {
             (":path", "/chat"),
             (":protocol", "websocket"),
         ]);
-        assert!(extended.validate(HeaderKind::Request { extended_connect: true }).is_ok());
-        assert!(extended.validate(HeaderKind::Request { extended_connect: false }).is_err());
+        assert!(
+            extended
+                .validate(HeaderKind::Request {
+                    extended_connect: true
+                })
+                .is_ok()
+        );
+        assert!(
+            extended
+                .validate(HeaderKind::Request {
+                    extended_connect: false
+                })
+                .is_err()
+        );
         for name in [":scheme", ":authority", ":path"] {
             let mut h = extended.clone();
             h.fields.retain(|f| f.name != name.as_bytes());
-            assert!(h.validate(HeaderKind::Request { extended_connect: true }).is_err());
+            assert!(
+                h.validate(HeaderKind::Request {
+                    extended_connect: true
+                })
+                .is_err()
+            );
         }
         for method in ["GET", "connect"] {
             let mut h = extended.clone();
             h.fields.get_mut(0).unwrap().value = method.as_bytes().to_vec();
-            assert!(h.validate(HeaderKind::Request { extended_connect: true }).is_err());
+            assert!(
+                h.validate(HeaderKind::Request {
+                    extended_connect: true
+                })
+                .is_err()
+            );
         }
         for protocol in ["", "web socket"] {
             let mut h = extended.clone();
             h.fields.last_mut().unwrap().value = protocol.as_bytes().to_vec();
-            assert!(h.validate(HeaderKind::Request { extended_connect: true }).is_err());
+            assert!(
+                h.validate(HeaderKind::Request {
+                    extended_connect: true
+                })
+                .is_err()
+            );
         }
         let mut d = RequestStream::new(0, MessageSide::Request, true).unwrap();
-        assert_eq!(event(&mut d, headers(&extended), &plain_qpack()), Ok(Event::Headers(extended)));
+        assert_eq!(
+            event(&mut d, headers(&extended), &plain_qpack()),
+            Ok(Event::Headers(extended))
+        );
         assert_eq!(d.finish(), Ok(()));
     }
     #[test]
     fn authority_uri_literals_ports_and_escapes() {
-        let kind = HeaderKind::Request { extended_connect: false };
-        for auth in ["example.net:", "example%2enet", "[::1]", "[v1.a-b]", "[Vf.test:1]:443"] {
-            let h = fields(&[(":method", "GET"), (":scheme", "https"), (":authority", auth), (":path", "/")]);
+        let kind = HeaderKind::Request {
+            extended_connect: false,
+        };
+        for auth in [
+            "example.net:",
+            "example%2enet",
+            "[::1]",
+            "[v1.a-b]",
+            "[Vf.test:1]:443",
+        ] {
+            let h = fields(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", auth),
+                (":path", "/"),
+            ]);
             assert!(h.validate(kind).is_ok(), "{auth}");
         }
-        for auth in ["example%", "example%zz", "[v.a]", "[v1.]", "[v1.%41]", "[::1]junk", "host:80:90"] {
-            let h = fields(&[(":method", "GET"), (":scheme", "https"), (":authority", auth), (":path", "/")]);
+        for auth in [
+            "example%",
+            "example%zz",
+            "[v.a]",
+            "[v1.]",
+            "[v1.%41]",
+            "[::1]junk",
+            "host:80:90",
+        ] {
+            let h = fields(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", auth),
+                (":path", "/"),
+            ]);
             assert!(h.validate(kind).is_err(), "{auth}");
         }
     }
@@ -2883,56 +3527,111 @@ mod tests {
     fn content_length_and_bodyless_contexts() {
         let mut h = request();
         h.fields.push(qpack::Field::new("content-length", "2"));
-        assert_eq!(messages(MessageSide::Request, &[headers(&h), Frame::Data(vec![1, 2])]).1, Ok(()));
+        assert_eq!(
+            messages(
+                MessageSide::Request,
+                &[headers(&h), Frame::Data(vec![1, 2])]
+            )
+            .1,
+            Ok(())
+        );
         assert!(matches!(
             messages(MessageSide::Request, &[headers(&h), Frame::Data(vec![1])]).1,
             Err(Error::Message(_))
         ));
         assert!(matches!(
-            messages(MessageSide::Request, &[headers(&h), Frame::Data(vec![1, 2, 3])]).1,
+            messages(
+                MessageSide::Request,
+                &[headers(&h), Frame::Data(vec![1, 2, 3])]
+            )
+            .1,
             Err(Error::Message(_))
         ));
         h.fields.push(qpack::Field::new("content-length", "2, 2"));
         // Writers refuse the list form; readers accept it and rewrite it.
-        assert!(h.validate(HeaderKind::Request { extended_connect: false }).is_err());
-        assert_eq!(messages(MessageSide::Request, &[headers(&h), Frame::Data(vec![1, 2])]).1, Ok(()));
+        assert!(
+            h.validate(HeaderKind::Request {
+                extended_connect: false
+            })
+            .is_err()
+        );
+        assert_eq!(
+            messages(
+                MessageSide::Request,
+                &[headers(&h), Frame::Data(vec![1, 2])]
+            )
+            .1,
+            Ok(())
+        );
         h.fields.push(qpack::Field::new("content-length", "3"));
-        assert!(matches!(messages(MessageSide::Request, &[headers(&h)]).1, Err(Error::Message(_))));
+        assert!(matches!(
+            messages(MessageSide::Request, &[headers(&h)]).1,
+            Err(Error::Message(_))
+        ));
         for value in ["-1", "+1", "", "1,", "1,2", "18446744073709551616"] {
             let mut h = request();
             h.fields.push(qpack::Field::new("content-length", value));
-            assert!(h.validate(HeaderKind::Request { extended_connect: false }).is_err());
+            assert!(
+                h.validate(HeaderKind::Request {
+                    extended_connect: false
+                })
+                .is_err()
+            );
         }
         for status in ["103", "204"] {
             let mut h = response(status);
             h.fields.push(qpack::Field::new("content-length", "0"));
             assert!(h.validate(HeaderKind::Response).is_err());
         }
-        for (side, status) in [(MessageSide::HeadResponse, "200"), (MessageSide::Response, "304")] {
+        for (side, status) in [
+            (MessageSide::HeadResponse, "200"),
+            (MessageSide::Response, "304"),
+        ] {
             let mut h = response(status);
             h.fields.push(qpack::Field::new("content-length", "99"));
             assert_eq!(messages(side, &[headers(&h)]).1, Ok(()));
-            assert!(matches!(messages(side, &[headers(&h), Frame::Data(vec![1])]).1, Err(Error::Message(_))));
+            assert!(matches!(
+                messages(side, &[headers(&h), Frame::Data(vec![1])]).1,
+                Err(Error::Message(_))
+            ));
         }
         assert_eq!(
-            messages(MessageSide::ConnectResponse, &[headers(&response("200")), Frame::Data(vec![0; 50])]).1,
+            messages(
+                MessageSide::ConnectResponse,
+                &[headers(&response("200")), Frame::Data(vec![0; 50])]
+            )
+            .1,
             Ok(())
         );
         // RFC 9110 section 9.3.6: the client ignores this Content-Length.
         let mut h = response("200");
         h.fields.push(qpack::Field::new("content-length", "0"));
-        assert_eq!(messages(MessageSide::ConnectResponse, &[headers(&h), Frame::Data(vec![1])]).1, Ok(()));
+        assert_eq!(
+            messages(
+                MessageSide::ConnectResponse,
+                &[headers(&h), Frame::Data(vec![1])]
+            )
+            .1,
+            Ok(())
+        );
     }
     #[test]
     fn header_limits_and_never_index_roundtrip() {
         let mut h = request();
         h.fields.push(qpack::Field::new("x", "secret"));
         h.fields.last_mut().unwrap().never_index = true;
-        let kind = HeaderKind::Request { extended_connect: false };
-        let bytes =
-            h.section(&mut qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE), 0, kind).unwrap().to_bytes().unwrap();
+        let kind = HeaderKind::Request {
+            extended_connect: false,
+        };
+        let bytes = h
+            .section(&mut qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE), 0, kind)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
         assert_eq!(received(&plain_qpack(), 0, &bytes, kind), Ok(h));
-        let too_many = HeaderList { fields: vec![qpack::Field::new("x", ""); MAX_FIELDS + 1] };
+        let too_many = HeaderList {
+            fields: vec![qpack::Field::new("x", ""); MAX_FIELDS + 1],
+        };
         assert_eq!(too_many.validate(HeaderKind::Trailers), Err(Error::Limit));
         let large = HeaderList {
             fields: vec![qpack::Field {
@@ -2942,45 +3641,75 @@ mod tests {
             }],
         };
         assert_eq!(large.validate(HeaderKind::Trailers), Err(Error::Limit));
-        let large = HeaderList { fields: vec![qpack::Field::new("x", vec![b'a'; MAX_FIELD_BYTES]); 4] };
+        let large = HeaderList {
+            fields: vec![qpack::Field::new("x", vec![b'a'; MAX_FIELD_BYTES]); 4],
+        };
         assert_eq!(large.validate(HeaderKind::Trailers), Err(Error::Limit));
         assert_eq!(
-            request().section(&mut qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE), u64::MAX, kind),
+            request().section(
+                &mut qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE),
+                u64::MAX,
+                kind
+            ),
             Err(Error::Id)
         );
-        assert_eq!(received(&plain_qpack(), u64::MAX, &[], kind), Err(Error::Qpack(qpack::Error::IntegerOverflow)));
+        assert_eq!(
+            received(&plain_qpack(), u64::MAX, &[], kind),
+            Err(Error::Qpack(qpack::Error::IntegerOverflow))
+        );
     }
     #[test]
     fn qpack_dynamic_blocking_resume_and_stream_routing() {
         let mut encoder = qpack::Encoder::new(4096, MAX_FIELD_SECTION_SIZE);
         let capacity = encoder.set_capacity(4096).unwrap();
         let insert = encoder.insert(b"x-test", b"value").unwrap().1;
-        encoder.apply_instruction(qpack::DecoderInstruction::InsertCountIncrement(1)).unwrap();
+        encoder
+            .apply_instruction(qpack::DecoderInstruction::InsertCountIncrement(1))
+            .unwrap();
         let mut headers = request();
         headers.fields.push(qpack::Field::new("x-test", "value"));
-        let section = headers.section(&mut encoder, 0, HeaderKind::Request { extended_connect: false }).unwrap();
+        let section = headers
+            .section(
+                &mut encoder,
+                0,
+                HeaderKind::Request {
+                    extended_connect: false,
+                },
+            )
+            .unwrap();
         let wire = join(&[Frame::headers(&section).unwrap(), Frame::Data(vec![42])]);
         let mut table = qpack::Table::new(4096);
         let mut state = RequestStream::new(0, MessageSide::Request, false).unwrap();
         let mut session = Session::new(Endpoint::Client, 4, MAX_FRAME);
         assert_eq!(session.push(0, &wire), wire.len());
-        let (_, Ok(Ok(StreamItem::Frame(frame)))) = session.next().unwrap() else { panic!() };
-        let RequestResult::Blocked(blocked) = state.step(&frame, &table).unwrap() else { panic!() };
+        let (_, Ok(Ok(StreamItem::Frame(frame)))) = session.next().unwrap() else {
+            panic!()
+        };
+        let RequestResult::Blocked(blocked) = state.step(&frame, &table).unwrap() else {
+            panic!()
+        };
         session.pause(0);
         assert_eq!(session.push(0, &[0]), 0);
         assert_eq!(session.next(), None);
         assert_eq!(state.finish(), Err(Error::State));
-        assert_eq!(state.resume(4, blocked.clone().retry(&table)), Err(Error::State));
+        assert_eq!(
+            state.resume(4, blocked.clone().retry(&table)),
+            Err(Error::State)
+        );
         assert!(state.is_blocked());
         table.apply(capacity).unwrap();
         table.apply(insert).unwrap();
-        let RequestResult::Event { event: result, ack } = state.resume(0, blocked.retry(&table)).unwrap() else {
+        let RequestResult::Event { event: result, ack } =
+            state.resume(0, blocked.retry(&table)).unwrap()
+        else {
             panic!()
         };
         assert_eq!(result, Ok(Event::Headers(headers)));
         encoder.apply_instruction(ack.unwrap()).unwrap();
         session.unpause(0);
-        let (_, Ok(Ok(StreamItem::Frame(frame)))) = session.next().unwrap() else { panic!() };
+        let (_, Ok(Ok(StreamItem::Frame(frame)))) = session.next().unwrap() else {
+            panic!()
+        };
         assert_eq!(event(&mut state, frame, &table), Ok(Event::Data(vec![42])));
         assert_eq!(state.finish(), Ok(()));
     }
@@ -2990,7 +3719,9 @@ mod tests {
             let mut encoder = qpack::Encoder::new(4096, MAX_FIELD_SECTION_SIZE);
             let capacity = encoder.set_capacity(4096).unwrap();
             let insert = encoder.insert(b"x", b"y").unwrap().1;
-            encoder.apply_instruction(qpack::DecoderInstruction::InsertCountIncrement(1)).unwrap();
+            encoder
+                .apply_instruction(qpack::DecoderInstruction::InsertCountIncrement(1))
+                .unwrap();
             let mut table = qpack::Table::new(4096);
             let mut state = RequestStream::new(0, MessageSide::Response, false).unwrap();
             let mut list = match pending {
@@ -3002,22 +3733,38 @@ mod tests {
             if pending == 1 {
                 event(&mut state, headers(&response("200")), &table).unwrap();
             }
-            let block = encoder.section(0, &list.fields).unwrap().to_bytes().unwrap();
+            let block = encoder
+                .section(0, &list.fields)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
             let frame = if pending == 2 {
-                Frame::PushPromise { push_id: 1, field_section: block }
+                Frame::PushPromise {
+                    push_id: 1,
+                    field_section: block,
+                }
             } else {
                 Frame::Headers(block)
             };
-            let RequestResult::Blocked(blocked) = state.step(&frame, &table).unwrap() else { panic!() };
+            let RequestResult::Blocked(blocked) = state.step(&frame, &table).unwrap() else {
+                panic!()
+            };
             table.apply(capacity).unwrap();
             table.apply(insert).unwrap();
-            let RequestResult::Event { event, ack } = state.resume(0, blocked.retry(&table)).unwrap() else { panic!() };
+            let RequestResult::Event { event, ack } =
+                state.resume(0, blocked.retry(&table)).unwrap()
+            else {
+                panic!()
+            };
             assert_eq!(
                 event,
                 Ok(match pending {
                     0 => Event::Informational(list),
                     1 => Event::Trailers(list),
-                    _ => Event::PushPromise { push_id: 1, headers: list },
+                    _ => Event::PushPromise {
+                        push_id: 1,
+                        headers: list
+                    },
                 })
             );
             encoder.apply_instruction(ack.unwrap()).unwrap();
@@ -3030,15 +3777,34 @@ mod tests {
             event(&mut state, Frame::Headers(vec![]), &plain_qpack()),
             Err(Error::Qpack(qpack::Error::Truncated))
         );
-        assert_eq!(state.step(&Frame::Data(vec![]), &plain_qpack()), Err(Error::State));
+        assert_eq!(
+            state.step(&Frame::Data(vec![]), &plain_qpack()),
+            Err(Error::State)
+        );
         let mut state = RequestStream::new(0, MessageSide::Request, false).unwrap();
         state.pending = Some(PendingSection::Headers);
-        let result =
-            state.resume(0, Ok(qpack::SectionResult::Fields { fields: response("200").fields, ack: None })).unwrap();
-        assert!(matches!(result, RequestResult::Event { event: Err(Error::Message(_)), .. }));
+        let result = state
+            .resume(
+                0,
+                Ok(qpack::SectionResult::Fields {
+                    fields: response("200").fields,
+                    ack: None,
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            result,
+            RequestResult::Event {
+                event: Err(Error::Message(_)),
+                ..
+            }
+        ));
         let mut state = RequestStream::new(0, MessageSide::Request, false).unwrap();
         state.pending = Some(PendingSection::Headers);
-        assert_eq!(state.resume(0, Err(qpack::Error::Huffman)), Err(Error::Qpack(qpack::Error::Huffman)));
+        assert_eq!(
+            state.resume(0, Err(qpack::Error::Huffman)),
+            Err(Error::Qpack(qpack::Error::Huffman))
+        );
     }
 
     #[test]
@@ -3049,15 +3815,22 @@ mod tests {
             Frame::Data(vec![42; 100]),
             headers(&fields(&[("x", "end")])),
         ];
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &join(&frames), 2 * MAX_FRAME);
+        contract::check_decode_with_alloc_limit(
+            Frames::<Frame>::new,
+            &join(&frames),
+            2 * MAX_FRAME,
+        );
         for push in [false, true] {
             let mut state = if push {
                 RequestStream::push(3).unwrap()
             } else {
                 RequestStream::new(0, MessageSide::Response, false).unwrap()
             };
-            let events: Vec<_> =
-                frames.iter().cloned().map(|frame| event(&mut state, frame, &plain_qpack()).unwrap()).collect();
+            let events: Vec<_> = frames
+                .iter()
+                .cloned()
+                .map(|frame| event(&mut state, frame, &plain_qpack()).unwrap())
+                .collect();
             assert_eq!(
                 events,
                 [
@@ -3073,11 +3846,17 @@ mod tests {
     #[test]
     fn push_stream_refuses_push_promise() {
         let table = plain_qpack();
-        let promise = Frame::PushPromise { push_id: 7, field_section: encoded(&request()) };
+        let promise = Frame::PushPromise {
+            push_id: 7,
+            field_section: encoded(&request()),
+        };
         for started in [false, true] {
             let mut state = RequestStream::push(3).unwrap();
             if started {
-                assert_eq!(event(&mut state, headers(&response("200")), &table), Ok(Event::Headers(response("200"))));
+                assert_eq!(
+                    event(&mut state, headers(&response("200")), &table),
+                    Ok(Event::Headers(response("200")))
+                );
             }
             assert_eq!(
                 event(&mut state, promise.clone(), &table),
@@ -3106,19 +3885,49 @@ mod tests {
     }
     #[test]
     fn priority_unknown_types_parameters_and_duplicates() {
-        for value in [b"".as_slice(), b"u=9, i=7", b"u=-1, i=token", b"u=3.0, i=\"yes\"", b"u=(1 2), i=:YQ==:"] {
+        for value in [
+            b"".as_slice(),
+            b"u=9, i=7",
+            b"u=-1, i=token",
+            b"u=3.0, i=\"yes\"",
+            b"u=(1 2), i=:YQ==:",
+        ] {
             assert_eq!(Priority::parse(value), Ok(Priority::default()));
         }
-        assert_eq!(Priority::parse(b"u=1, u=5, i=?0, i"), Ok(Priority { urgency: Some(5), incremental: Some(true) }));
-        assert_eq!(Priority::parse(b"u=1, u=unknown, i, i=42"), Ok(Priority::default()));
+        assert_eq!(
+            Priority::parse(b"u=1, u=5, i=?0, i"),
+            Ok(Priority {
+                urgency: Some(5),
+                incremental: Some(true)
+            })
+        );
+        assert_eq!(
+            Priority::parse(b"u=1, u=unknown, i, i=42"),
+            Ok(Priority::default())
+        );
         let value = b"u=2;a=token;b=\"escaped\\\"\", other=(1;p=?0 \"x,y\" :YWI=:);v=1.2, i;z=?1";
-        assert_eq!(Priority::parse(value), Ok(Priority { urgency: Some(2), incremental: Some(true) }));
+        assert_eq!(
+            Priority::parse(value),
+            Ok(Priority {
+                urgency: Some(2),
+                incremental: Some(true)
+            })
+        );
         assert_eq!(Priority::default().effective_urgency(), 3);
         assert!(!Priority::default().effective_incremental());
-        assert_eq!(Priority::parse(b"u=-0, i=?0"), Ok(Priority { urgency: Some(0), incremental: Some(false) }));
+        assert_eq!(
+            Priority::parse(b"u=-0, i=?0"),
+            Ok(Priority {
+                urgency: Some(0),
+                incremental: Some(false)
+            })
+        );
         for u in 0..=7 {
             for i in [None, Some(false), Some(true)] {
-                let p = Priority { urgency: Some(u), incremental: i };
+                let p = Priority {
+                    urgency: Some(u),
+                    incremental: i,
+                };
                 assert_eq!(Priority::parse(&p.to_bytes().unwrap()), Ok(p));
             }
         }
@@ -3151,12 +3960,30 @@ mod tests {
             "x=@1",
             "x;=1",
         ] {
-            assert_eq!(Priority::parse(value.as_bytes()), Err(Error::Priority), "{value:?}");
+            assert_eq!(
+                Priority::parse(value.as_bytes()),
+                Err(Error::Priority),
+                "{value:?}"
+            );
         }
-        assert_eq!(Priority { urgency: Some(8), incremental: None }.to_bytes(), Err(Error::Unwritable));
-        assert_eq!(Priority::parse(&vec![b' '; MAX_PRIORITY_BYTES + 1]), Err(Error::Limit));
         assert_eq!(
-            Priority::parse("x,".repeat(MAX_PRIORITY_MEMBERS + 1).trim_end_matches(',').as_bytes()),
+            Priority {
+                urgency: Some(8),
+                incremental: None
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Priority::parse(&vec![b' '; MAX_PRIORITY_BYTES + 1]),
+            Err(Error::Limit)
+        );
+        assert_eq!(
+            Priority::parse(
+                "x,".repeat(MAX_PRIORITY_MEMBERS + 1)
+                    .trim_end_matches(',')
+                    .as_bytes()
+            ),
             Err(Error::Limit)
         );
         let value = format!("x=({})", "1 ".repeat(MAX_PRIORITY_ITEMS + 1));
@@ -3167,7 +3994,13 @@ mod tests {
     #[test]
     fn priority_field_lines_are_combined_in_order() {
         let h = fields(&[("priority", "u=5"), ("x", "y"), ("priority", "i, u=1")]);
-        assert_eq!(h.priority(), Ok(Priority { urgency: Some(1), incremental: Some(true) }));
+        assert_eq!(
+            h.priority(),
+            Ok(Priority {
+                urgency: Some(1),
+                incremental: Some(true)
+            })
+        );
         assert_eq!(request().priority(), Ok(Priority::default()));
         let h = fields(&[("priority", "u=5,"), ("priority", "i")]);
         assert_eq!(h.priority(), Err(Error::Priority));
@@ -3177,13 +4010,28 @@ mod tests {
         for value in ["\tu=1", " \tu=1", "\t"] {
             assert_eq!(Priority::parse(value.as_bytes()), Err(Error::Priority));
         }
-        assert_eq!(Priority::parse(b"  u=1\t,\ti\t"), Ok(Priority { urgency: Some(1), incremental: Some(true) }));
+        assert_eq!(
+            Priority::parse(b"  u=1\t,\ti\t"),
+            Ok(Priority {
+                urgency: Some(1),
+                incremental: Some(true)
+            })
+        );
         for binary in ["", "YQ", "YQ=", "YQ==", "YWI", "YWI=", "YWJj", "YR=="] {
             let value = format!("x=:{binary}:, u=2");
-            assert_eq!(Priority::parse(value.as_bytes()), Ok(Priority { urgency: Some(2), incremental: None }));
+            assert_eq!(
+                Priority::parse(value.as_bytes()),
+                Ok(Priority {
+                    urgency: Some(2),
+                    incremental: None
+                })
+            );
         }
         for binary in ["Y", "Y=", "=", "YWI==", "YWJj=", "Y Q==", "YQ\n=="] {
-            assert_eq!(Priority::parse(format!("x=:{binary}:").as_bytes()), Err(Error::Priority));
+            assert_eq!(
+                Priority::parse(format!("x=:{binary}:").as_bytes()),
+                Err(Error::Priority)
+            );
         }
     }
     #[test]
@@ -3210,9 +4058,18 @@ mod tests {
         for (i, code) in codes.iter().enumerate() {
             assert_eq!(*code, 0x100 + i as u64);
         }
-        assert_eq!(error_code::QPACK_DECOMPRESSION_FAILED, qpack::error_code::DECOMPRESSION_FAILED);
-        assert_eq!(error_code::QPACK_ENCODER_STREAM_ERROR, qpack::error_code::ENCODER_STREAM_ERROR);
-        assert_eq!(error_code::QPACK_DECODER_STREAM_ERROR, qpack::error_code::DECODER_STREAM_ERROR);
+        assert_eq!(
+            error_code::QPACK_DECOMPRESSION_FAILED,
+            qpack::error_code::DECOMPRESSION_FAILED
+        );
+        assert_eq!(
+            error_code::QPACK_ENCODER_STREAM_ERROR,
+            qpack::error_code::ENCODER_STREAM_ERROR
+        );
+        assert_eq!(
+            error_code::QPACK_DECODER_STREAM_ERROR,
+            qpack::error_code::DECODER_STREAM_ERROR
+        );
         for (error, code) in [
             (Error::Limit, 0x107),
             (Error::Frame, 0x106),
@@ -3242,7 +4099,11 @@ mod tests {
             let mut bytes = rng.bytes(MAX_TEST_BYTES);
             mutate(&mut rng, &mut bytes);
             contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
-            contract::check_decode_with_alloc_limit(StreamHeaders::new, &bytes, 2 * MAX_STREAM_HEADER);
+            contract::check_decode_with_alloc_limit(
+                StreamHeaders::new,
+                &bytes,
+                2 * MAX_STREAM_HEADER,
+            );
             contract::check_wire::<Frame>(&bytes);
             contract::check_wire::<Settings>(&bytes);
             contract::check_wire::<Priority>(&bytes);
@@ -3262,7 +4123,11 @@ mod tests {
                     RequestStream::push(3).unwrap(),
                 ] {
                     for item in &items {
-                        if item.clone().and_then(|frame| event(&mut state, frame, &plain_qpack())).is_err() {
+                        if item
+                            .clone()
+                            .and_then(|frame| event(&mut state, frame, &plain_qpack()))
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -3272,16 +4137,33 @@ mod tests {
             let frame = match rng.index(5) {
                 0 => Frame::Data(bytes.clone()),
                 1 => Frame::Headers(bytes.clone()),
-                2 => Frame::Unknown { frame_type: 0x21, payload: bytes.clone() },
-                3 => Frame::PushPromise { push_id: rng.next(), field_section: bytes.clone() },
+                2 => Frame::Unknown {
+                    frame_type: 0x21,
+                    payload: bytes.clone(),
+                },
+                3 => Frame::PushPromise {
+                    push_id: rng.next(),
+                    field_section: bytes.clone(),
+                },
                 _ => Frame::Goaway(rng.next()),
             };
             roundtrip(&frame);
             let mut list = request();
-            list.fields.push(qpack::Field { name: b"x-fuzz".to_vec(), value: bytes, never_index: rng.coin() });
-            let kind = HeaderKind::Request { extended_connect: false };
-            if let Ok(section) = list.section(&mut qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE), 0, kind) {
-                assert_eq!(received(&plain_qpack(), 0, &section.to_bytes().unwrap(), kind), Ok(list));
+            list.fields.push(qpack::Field {
+                name: b"x-fuzz".to_vec(),
+                value: bytes,
+                never_index: rng.coin(),
+            });
+            let kind = HeaderKind::Request {
+                extended_connect: false,
+            };
+            if let Ok(section) =
+                list.section(&mut qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE), 0, kind)
+            {
+                assert_eq!(
+                    received(&plain_qpack(), 0, &section.to_bytes().unwrap(), kind),
+                    Ok(list)
+                );
             }
         }
     }
@@ -3302,27 +4184,55 @@ mod tests {
     #[test]
     fn connect_tunnel_allows_only_data_and_extensions() {
         // RFC 9114 section 4.4: other known frames after the tunnel opens.
-        let promise = Frame::PushPromise { push_id: 0, field_section: encoded(&request()) };
+        let promise = Frame::PushPromise {
+            push_id: 0,
+            field_section: encoded(&request()),
+        };
         for status in ["200", "204", "299"] {
-            for late in [headers(&fields(&[])), headers(&fields(&[("x", "y")])), promise.clone()] {
+            for late in [
+                headers(&fields(&[])),
+                headers(&fields(&[("x", "y")])),
+                promise.clone(),
+            ] {
                 let (events, result) = messages(
                     MessageSide::ConnectResponse,
-                    &[headers(&response(status)), Frame::Data(b"x".to_vec()), late.clone()],
+                    &[
+                        headers(&response(status)),
+                        Frame::Data(b"x".to_vec()),
+                        late.clone(),
+                    ],
                 );
                 assert_eq!(events.len(), 2, "{status}");
                 assert_eq!(result, Err(Error::UnexpectedFrame(late.frame_type())));
             }
         }
         let connect = fields(&[(":method", "CONNECT"), (":authority", "example.net:443")]);
-        let (_, result) =
-            messages(MessageSide::Request, &[headers(&connect), Frame::Data(b"x".to_vec()), headers(&fields(&[]))]);
+        let (_, result) = messages(
+            MessageSide::Request,
+            &[
+                headers(&connect),
+                Frame::Data(b"x".to_vec()),
+                headers(&fields(&[])),
+            ],
+        );
         assert_eq!(result, Err(Error::UnexpectedFrame(frame_type::HEADERS)));
-        let unknown = Frame::Unknown { frame_type: 0x21, payload: vec![1] };
-        let (events, result) = messages(MessageSide::ConnectResponse, &[headers(&response("200")), unknown.clone()]);
-        assert_eq!((events.last(), result), (Some(&Event::Unknown(unknown)), Ok(())));
+        let unknown = Frame::Unknown {
+            frame_type: 0x21,
+            payload: vec![1],
+        };
+        let (events, result) = messages(
+            MessageSide::ConnectResponse,
+            &[headers(&response("200")), unknown.clone()],
+        );
+        assert_eq!(
+            (events.last(), result),
+            (Some(&Event::Unknown(unknown)), Ok(()))
+        );
         // A failed CONNECT is an ordinary response and may carry trailers.
-        let (_, result) =
-            messages(MessageSide::ConnectResponse, &[headers(&response("404")), headers(&fields(&[("x", "y")]))]);
+        let (_, result) = messages(
+            MessageSide::ConnectResponse,
+            &[headers(&response("404")), headers(&fields(&[("x", "y")]))],
+        );
         assert_eq!(result, Ok(()));
         // The check happens before QPACK, so a section that would block is refused too.
         let table = qpack::Table::new(4096);
@@ -3338,13 +4248,17 @@ mod tests {
     fn connect_success_ignores_content_length_and_204() {
         // RFC 9110 section 9.3.6: any 2xx opens the tunnel; Content-Length is ignored.
         for status in ["200", "204", "206"] {
-            let (_, result) =
-                messages(MessageSide::ConnectResponse, &[headers(&response(status)), Frame::Data(b"tunnel".to_vec())]);
+            let (_, result) = messages(
+                MessageSide::ConnectResponse,
+                &[headers(&response(status)), Frame::Data(b"tunnel".to_vec())],
+            );
             assert_eq!(result, Ok(()), "{status}");
             let mut h = response(status);
             h.fields.push(qpack::Field::new("content-length", "0"));
-            let (events, result) =
-                messages(MessageSide::ConnectResponse, &[headers(&h), Frame::Data(b"tunnel".to_vec())]);
+            let (events, result) = messages(
+                MessageSide::ConnectResponse,
+                &[headers(&h), Frame::Data(b"tunnel".to_vec())],
+            );
             assert_eq!(result, Ok(()), "{status}");
             assert_eq!(events.first(), Some(&Event::Headers(h)));
         }
@@ -3370,64 +4284,132 @@ mod tests {
         };
         assert_eq!(run(Some(MessageSide::HeadResponse), &[headers(&h)]), Ok(()));
         assert!(matches!(
-            run(Some(MessageSide::HeadResponse), &[headers(&h), Frame::Data(vec![1])]),
+            run(
+                Some(MessageSide::HeadResponse),
+                &[headers(&h), Frame::Data(vec![1])]
+            ),
             Err(Error::Message(_))
         ));
         assert!(matches!(run(None, &[headers(&h)]), Err(Error::Message(_))));
         let mut d = RequestStream::push(3).unwrap();
         assert_eq!(d.set_push_side(MessageSide::Request), Err(Error::State));
-        assert_eq!(d.set_push_side(MessageSide::ConnectResponse), Err(Error::State));
+        assert_eq!(
+            d.set_push_side(MessageSide::ConnectResponse),
+            Err(Error::State)
+        );
         event(&mut d, headers(&response("200")), &plain_qpack()).unwrap();
-        assert_eq!(d.set_push_side(MessageSide::HeadResponse), Err(Error::State));
+        assert_eq!(
+            d.set_push_side(MessageSide::HeadResponse),
+            Err(Error::State)
+        );
         let mut d = RequestStream::new(0, MessageSide::Response, false).unwrap();
-        assert_eq!(d.set_push_side(MessageSide::HeadResponse), Err(Error::State));
+        assert_eq!(
+            d.set_push_side(MessageSide::HeadResponse),
+            Err(Error::State)
+        );
     }
     #[test]
     fn promised_requests_need_authority() {
         // RFC 9114 section 4.6: the server MUST include :authority.
-        let host_only = fields(&[(":method", "GET"), (":scheme", "https"), (":path", "/"), ("host", "example.net")]);
-        assert_eq!(host_only.validate(HeaderKind::Request { extended_connect: false }), Ok(()));
-        assert!(matches!(host_only.validate(HeaderKind::Promise), Err(Error::Message(_))));
+        let host_only = fields(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            ("host", "example.net"),
+        ]);
+        assert_eq!(
+            host_only.validate(HeaderKind::Request {
+                extended_connect: false
+            }),
+            Ok(())
+        );
+        assert!(matches!(
+            host_only.validate(HeaderKind::Promise),
+            Err(Error::Message(_))
+        ));
         assert_eq!(request().validate(HeaderKind::Promise), Ok(()));
-        let promise = Frame::PushPromise { push_id: 0, field_section: encoded(&host_only) };
+        let promise = Frame::PushPromise {
+            push_id: 0,
+            field_section: encoded(&host_only),
+        };
         let (_, result) = messages(MessageSide::Response, &[promise]);
         assert!(matches!(result, Err(Error::Message(_))));
         let mut encoder = qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE);
-        assert!(host_only.section(&mut encoder, 0, HeaderKind::Promise).is_err());
-        let connect = fields(&[(":method", "CONNECT"), (":authority", "example.net:443"), (":protocol", "websocket")]);
+        assert!(
+            host_only
+                .section(&mut encoder, 0, HeaderKind::Promise)
+                .is_err()
+        );
+        let connect = fields(&[
+            (":method", "CONNECT"),
+            (":authority", "example.net:443"),
+            (":protocol", "websocket"),
+        ]);
         assert!(connect.validate(HeaderKind::Promise).is_err());
     }
     #[test]
     fn no_trailers_after_204_or_304() {
         // RFC 9110 sections 15.3.5 and 15.4.5: no content or trailers.
         for status in ["204", "304"] {
-            let (_, result) =
-                messages(MessageSide::Response, &[headers(&response(status)), headers(&fields(&[("x-check", "ok")]))]);
+            let (_, result) = messages(
+                MessageSide::Response,
+                &[
+                    headers(&response(status)),
+                    headers(&fields(&[("x-check", "ok")])),
+                ],
+            );
             assert!(matches!(result, Err(Error::Message(_))), "{status}");
         }
-        let (_, result) =
-            messages(MessageSide::Response, &[headers(&response("200")), headers(&fields(&[("x-check", "ok")]))]);
+        let (_, result) = messages(
+            MessageSide::Response,
+            &[
+                headers(&response("200")),
+                headers(&fields(&[("x-check", "ok")])),
+            ],
+        );
         assert_eq!(result, Ok(()));
     }
     #[test]
     fn no_content_for_205_or_trace() {
         // RFC 9110 sections 15.3.6 and 9.3.8.
-        let (_, result) = messages(MessageSide::Response, &[headers(&response("205")), Frame::Data(b"x".to_vec())]);
+        let (_, result) = messages(
+            MessageSide::Response,
+            &[headers(&response("205")), Frame::Data(b"x".to_vec())],
+        );
         assert!(matches!(result, Err(Error::Message(_))));
-        assert_eq!(messages(MessageSide::Response, &[headers(&response("205")), Frame::Data(vec![])]).1, Ok(()));
-        let trace =
-            fields(&[(":method", "TRACE"), (":scheme", "https"), (":authority", "example.net"), (":path", "/")]);
-        let (_, result) = messages(MessageSide::Request, &[headers(&trace), Frame::Data(b"x".to_vec())]);
+        assert_eq!(
+            messages(
+                MessageSide::Response,
+                &[headers(&response("205")), Frame::Data(vec![])]
+            )
+            .1,
+            Ok(())
+        );
+        let trace = fields(&[
+            (":method", "TRACE"),
+            (":scheme", "https"),
+            (":authority", "example.net"),
+            (":path", "/"),
+        ]);
+        let (_, result) = messages(
+            MessageSide::Request,
+            &[headers(&trace), Frame::Data(b"x".to_vec())],
+        );
         assert!(matches!(result, Err(Error::Message(_))));
         assert_eq!(messages(MessageSide::Request, &[headers(&trace)]).1, Ok(()));
         let mut long = trace.clone();
         long.fields.push(qpack::Field::new("content-length", "5"));
-        assert!(matches!(messages(MessageSide::Request, &[headers(&long)]).1, Err(Error::Message(_))));
+        assert!(matches!(
+            messages(MessageSide::Request, &[headers(&long)]).1,
+            Err(Error::Message(_))
+        ));
     }
     #[test]
     fn repeated_content_length_is_normalized() {
         // RFC 9110 section 8.6: replace "2, 2" with one value or reject it.
-        let kind = HeaderKind::Request { extended_connect: false };
+        let kind = HeaderKind::Request {
+            extended_connect: false,
+        };
         let mut h = request();
         h.fields.push(qpack::Field::new("content-length", "2, 2"));
         h.fields.push(qpack::Field::new("x", "y"));
@@ -3436,10 +4418,22 @@ mod tests {
         want.fields.push(qpack::Field::new("content-length", "2"));
         want.fields.push(qpack::Field::new("x", "y"));
         assert!(h.validate(kind).is_err());
-        assert!(h.section(&mut qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE), 0, kind).is_err());
-        assert_eq!(received(&plain_qpack(), 0, &encoded(&h), kind), Ok(want.clone()));
-        let (events, result) = messages(MessageSide::Request, &[headers(&h), Frame::Data(vec![1, 2])]);
-        assert_eq!((events.first(), result), (Some(&Event::Headers(want.clone())), Ok(())));
+        assert!(
+            h.section(&mut qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE), 0, kind)
+                .is_err()
+        );
+        assert_eq!(
+            received(&plain_qpack(), 0, &encoded(&h), kind),
+            Ok(want.clone())
+        );
+        let (events, result) = messages(
+            MessageSide::Request,
+            &[headers(&h), Frame::Data(vec![1, 2])],
+        );
+        assert_eq!(
+            (events.first(), result),
+            (Some(&Event::Headers(want.clone())), Ok(()))
+        );
         assert_eq!(want.validate(kind), Ok(()));
     }
 }

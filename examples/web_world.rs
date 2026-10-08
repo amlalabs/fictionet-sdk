@@ -38,11 +38,13 @@ use std::time::SystemTime;
 
 use axum::Extension;
 use axum::routing::get;
+use fictionet::Result;
 use fictionet::stdlib::tls;
 use fictionet::stdlib::web;
-use fictionet::Result;
 use http::Version;
-use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{
+    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 /// The addresses `example.test`, `www.example.test` and `shared.test`
@@ -56,11 +58,22 @@ fn main() -> Result {
 
 /// Starts a world on the socket and writes its CA certificate.
 pub fn run(
-    world: fn(&fictionet::Cx, Vec<rustls::pki_types::CertificateDer<'static>>, PrivateKeyDer<'static>, fictionet::Attachments) -> Result,
+    world: fn(
+        &fictionet::Cx,
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        PrivateKeyDer<'static>,
+        fictionet::Attachments,
+    ) -> Result,
 ) -> Result {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).cloned().unwrap_or_else(|| "/run/fictionet/world.sock".into());
-    let ca_path = args.get(2).cloned().unwrap_or_else(|| "/run/fictionet/ca.pem".into());
+    let path = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "/run/fictionet/world.sock".into());
+    let ca_path = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "/run/fictionet/ca.pem".into());
 
     // The world's CA and one certificate for its HTTPS names.
     let mut ca = CertificateParams::new(Vec::<String>::new())?;
@@ -68,10 +81,16 @@ pub fn run(
     // Python 3.13 and later check certificates strictly: a CA must say
     // what its key is for, and a leaf must name the key that signed it.
     ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    ca.distinguished_name.push(rcgen::DnType::CommonName, "web_world CA");
+    ca.distinguished_name
+        .push(rcgen::DnType::CommonName, "web_world CA");
     let ca_key = KeyPair::generate()?;
     let ca = ca.self_signed(&ca_key)?;
-    let names = ["example.test", "www.example.test", "v4only.test", "v6only.test"];
+    let names = [
+        "example.test",
+        "www.example.test",
+        "v4only.test",
+        "v6only.test",
+    ];
     let mut leaf = CertificateParams::new(names.map(str::to_owned).to_vec())?;
     leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     // Python 3.13 and later refuse a leaf without an authority key identifier.
@@ -83,11 +102,18 @@ pub fn run(
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
 
     let (attacher, attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
+    let _listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(path.clone().into()),
+        attacher,
+    )?;
     println!("listening on {path}, CA in {ca_path}");
 
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    runtime.block_on(fictionet::run(move |fcx| async move { world(&fcx, chain, key, attachments) }))
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(fictionet::run(move |fcx| async move {
+        world(&fcx, chain, key, attachments)
+    }))
 }
 
 /// Builds the world's sites on `attachments`, with `chain` and `key` for
@@ -107,9 +133,14 @@ pub fn app() -> axum::Router {
     axum::Router::new()
         .route(
             "/",
-            get(|Extension(t): Extension<web::Target>, version: Version| async move {
-                format!("hello from {} {} {} over {:?}\n", t.scheme, t.host, t.port, version)
-            }),
+            get(
+                |Extension(t): Extension<web::Target>, version: Version| async move {
+                    format!(
+                        "hello from {} {} {} over {:?}\n",
+                        t.scheme, t.host, t.port, version
+                    )
+                },
+            ),
         )
         .route(
             "/count",
@@ -136,18 +167,24 @@ pub fn sites(
     plain: axum::Router,
 ) -> Result<impl Fn(&str) -> Option<web::Site> + Send + Sync + 'static> {
     let config = Arc::new(
-        tls::config_builder(fcx, SystemTime::now(), rustls::crypto::ring::default_provider())
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_single_cert(chain, key)?,
+        tls::config_builder(
+            fcx,
+            SystemTime::now(),
+            rustls::crypto::ring::default_provider(),
+        )
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(chain, key)?,
     );
     Ok(move |host: &str| {
         println!("lookup {host}");
         match host {
-            "example.test" | "www.example.test" => Some(web::Site::new(app.clone()).at(SHARED).at(SHARED6).tls({
-                let c = config.clone();
-                move |_| c.clone()
-            })),
+            "example.test" | "www.example.test" => {
+                Some(web::Site::new(app.clone()).at(SHARED).at(SHARED6).tls({
+                    let c = config.clone();
+                    move |_| c.clone()
+                }))
+            }
             "v4only.test" => Some(web::Site::new(app.clone()).ipv4_only().tls({
                 let c = config.clone();
                 move |_| c.clone()

@@ -4,14 +4,14 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::{
-    Wire,
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract::{
+    check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value,
 };
-use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::whois::{
-    Field, MAX_QUERY, MAX_RESPONSE, RESPONSE_WINDOW, Queries, Query, Referral,
-    ReferralKind, Response, CollectedResponses, find_referral, parse_fields,
+    CollectedResponses, Field, MAX_QUERY, MAX_RESPONSE, Queries, Query, RESPONSE_WINDOW, Referral,
+    ReferralKind, Response, find_referral, parse_fields,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -26,8 +26,11 @@ fn built(data: &[u8]) -> Result<()> {
     let terms: &str = u.arbitrary()?;
     if let Ok(q) = Query::build(&flags, terms) {
         // The flags and terms read back as given.
-        let words: Vec<&str> =
-            q.flags().iter().flat_map(|f| std::iter::once(f.name).chain(f.argument)).collect();
+        let words: Vec<&str> = q
+            .flags()
+            .iter()
+            .flat_map(|f| std::iter::once(f.name).chain(f.argument))
+            .collect();
         assert_eq!(words, flags);
         assert_eq!(q.terms(), terms.trim_matches([' ', '\t']));
         assert_eq!(decode_all(Queries::new, &q.to_bytes().unwrap()).0, [Ok(q)]);
@@ -39,7 +42,11 @@ fn built(data: &[u8]) -> Result<()> {
         if i > 0 && u.arbitrary()? {
             block += 1;
         }
-        fields.push(Field { block, key: u.arbitrary()?, value: u.arbitrary()? });
+        fields.push(Field {
+            block,
+            key: u.arbitrary()?,
+            value: u.arbitrary()?,
+        });
     }
     if let Ok(response) = Response::from_fields(&fields) {
         check_wire_value(&response);
@@ -51,13 +58,21 @@ fn built(data: &[u8]) -> Result<()> {
         ReferralKind::RegistrarWhoisServer,
         ReferralKind::ReferralServer,
     ])?;
-    let referral = Referral { kind, host: u.arbitrary()?, port: u.arbitrary()? };
+    let referral = Referral {
+        kind,
+        host: u.arbitrary()?,
+        port: u.arbitrary()?,
+    };
     if let Ok(f) = referral.to_field(0) {
         assert_eq!(Referral::from_field(&f), Some(referral));
     }
     // An IPv6 address, written in brackets, reads back the same.
     let ip: std::net::Ipv6Addr = u.arbitrary()?;
-    let referral = Referral { kind, host: ip.to_string(), port: u.arbitrary()? };
+    let referral = Referral {
+        kind,
+        host: ip.to_string(),
+        port: u.arbitrary()?,
+    };
     if let Ok(f) = referral.to_field(0) {
         assert_eq!(Referral::from_field(&f), Some(referral));
     } else {
@@ -70,7 +85,11 @@ fuzz_target!(|data: &[u8]| {
     check_decode_with_alloc_limit(Queries::new, data, 2 * (MAX_QUERY + 2));
     check_decode_with_alloc_limit(CollectedResponses::new, data, 2 * RESPONSE_WINDOW);
     check_decode_with_held_limit(CollectedResponses::new, data, MAX_RESPONSE);
-    check_decode_with_alloc_limit(|| CollectedResponses::with_limit(17), data, 2 * RESPONSE_WINDOW);
+    check_decode_with_alloc_limit(
+        || CollectedResponses::with_limit(17),
+        data,
+        2 * RESPONSE_WINDOW,
+    );
     check_decode_with_held_limit(|| CollectedResponses::with_limit(17), data, 17);
     check_wire::<Query>(data);
     check_wire::<Response>(data);
@@ -96,7 +115,10 @@ fuzz_target!(|data: &[u8]| {
         }
         for field in &fields {
             if let Some(referral) = Referral::from_field(field) {
-                assert_eq!(Referral::from_field(&referral.to_field(field.block).unwrap()), Some(referral));
+                assert_eq!(
+                    Referral::from_field(&referral.to_field(field.block).unwrap()),
+                    Some(referral)
+                );
             }
         }
         assert_eq!(response.referral(), find_referral(&fields));

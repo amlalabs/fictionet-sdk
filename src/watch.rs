@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
-use crate::lock;
 use crate::Packet;
+use crate::lock;
 use crate::sys::{Instant, SystemTime};
 
 thread_local! {
@@ -177,7 +177,10 @@ impl Meter {
         let tap = slot.get_or_insert_with(|| Arc::new(Tap::new())).clone();
         tap.viewers.fetch_add(1, Ordering::Relaxed);
         self.tapped.store(true, Ordering::Relaxed);
-        TapGuard { meter: Arc::downgrade(self), tap }
+        TapGuard {
+            meter: Arc::downgrade(self),
+            tap,
+        }
     }
 }
 
@@ -196,7 +199,9 @@ pub(crate) struct TapGuard {
 
 impl Drop for TapGuard {
     fn drop(&mut self) {
-        let Some(meter) = self.meter.upgrade() else { return };
+        let Some(meter) = self.meter.upgrade() else {
+            return;
+        };
         let mut slot = lock(&meter.tap);
         if self.tap.viewers.fetch_sub(1, Ordering::Relaxed) == 1 {
             meter.tapped.store(false, Ordering::Relaxed);
@@ -281,9 +286,17 @@ impl Tap {
         s.next_seq += 1;
         let skipped = std::mem::take(&mut s.skipped);
         s.bytes += data.len();
-        s.copies.push_back(Copy { seq, at: now, side, data: data.into(), skipped });
+        s.copies.push_back(Copy {
+            seq,
+            at: now,
+            side,
+            data: data.into(),
+            skipped,
+        });
         while s.copies.len() > TAP_PACKETS || s.bytes > TAP_BYTES {
-            let Some(old) = s.copies.pop_front() else { break };
+            let Some(old) = s.copies.pop_front() else {
+                break;
+            };
             s.bytes -= old.data.len();
         }
     }
@@ -414,7 +427,10 @@ impl Graph {
             start_wall: SystemTime::now(),
             viewers: AtomicUsize::new(0),
             next_group: AtomicU64::new(1),
-            state: Mutex::new(GraphState { sweep_at: 64, ..GraphState::default() }),
+            state: Mutex::new(GraphState {
+                sweep_at: 64,
+                ..GraphState::default()
+            }),
             events: crate::events::Store::new(),
             watches: Mutex::default(),
             protocols: Mutex::default(),
@@ -514,7 +530,13 @@ impl Graph {
         }
         let s = self.state();
         let t = s.tasks.get(&task)?;
-        Some(crate::events::Origin { task, name: t.name.clone(), file: t.file, line: t.line, parent: t.parent })
+        Some(crate::events::Origin {
+            task,
+            name: t.name.clone(),
+            file: t.file,
+            line: t.line,
+            parent: t.parent,
+        })
     }
 
     pub(crate) fn key(&self, line: KeyLine) {
@@ -548,7 +570,10 @@ pub(crate) fn short_name(full: &str) -> String {
             _ => {}
         }
     }
-    let parts: Vec<&str> = plain.split("::").filter(|p| !p.is_empty() && !p.starts_with('{')).collect();
+    let parts: Vec<&str> = plain
+        .split("::")
+        .filter(|p| !p.is_empty() && !p.starts_with('{'))
+        .collect();
     let n = parts.len();
     parts[n.saturating_sub(2)..].join("::")
 }
@@ -572,8 +597,8 @@ mod tests {
     /// uses which end of a pair, and how much went each way.
     #[test]
     fn a_watched_run_records_tasks_owners_and_counts() {
-        use crate::prelude::*;
         use crate::Interface;
+        use crate::prelude::*;
         let graph = Graph::new();
         let g = graph.clone();
         let (spawn_line, seen) = (Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(None)));
@@ -597,8 +622,15 @@ mod tests {
         }));
         out.unwrap();
         let (tasks, links) = seen.lock().unwrap().take().unwrap();
-        let world = &tasks.iter().find(|(_, t)| t.name == "world").expect("the world task").0;
-        let (echo, info) = tasks.iter().find(|(_, t)| t.name != "world").expect("the echo task");
+        let world = &tasks
+            .iter()
+            .find(|(_, t)| t.name == "world")
+            .expect("the world task")
+            .0;
+        let (echo, info) = tasks
+            .iter()
+            .find(|(_, t)| t.name != "world")
+            .expect("the echo task");
         assert_eq!(info.line as u64, spawn_line.load(Ordering::SeqCst));
         assert!(info.file.ends_with("watch.rs"));
         assert_eq!(info.parent, *world);
@@ -616,15 +648,19 @@ mod tests {
     fn snapshot(g: &Graph) -> Snapshot {
         let s = g.state();
         let tasks = s.tasks.iter().map(|(id, t)| (*id, t.clone())).collect();
-        let links = s.links.values().map(|l| (l.owners, l.meter.upgrade().unwrap().totals())).collect();
+        let links = s
+            .links
+            .values()
+            .map(|l| (l.owners, l.meter.upgrade().unwrap().totals()))
+            .collect();
         (tasks, links)
     }
 
     /// Pairs count their packets in every run.
     #[test]
     fn pairs_count_their_packets() {
-        use crate::prelude::*;
         use crate::Interface;
+        use crate::prelude::*;
         crate::block_on(crate::run(|fcx| async move {
             let (mut a, mut b) = crate::pair();
             a.send(Packet(vec![0; 40]));
@@ -652,7 +688,10 @@ mod tests {
         meter.sent(0, &Packet(vec![3; 10]));
         let copies = guard.tap.since(0, 100);
         assert_eq!(copies.len(), 2);
-        assert_eq!((copies[0].seq, copies[0].side, copies[0].data[0]), (1, 1, 2));
+        assert_eq!(
+            (copies[0].seq, copies[0].side, copies[0].data[0]),
+            (1, 1, 2)
+        );
         assert_eq!(guard.tap.since(1, 100).len(), 1);
         assert_eq!(meter.totals(), [2, 20, 1, 10]);
         drop(guard);
@@ -668,6 +707,9 @@ mod tests {
         let copies = guard.tap.since(0, 10_000);
         assert!(copies.len() < 200, "{} copies", copies.len());
         let skipped: u64 = copies.iter().map(|c| c.skipped).sum();
-        assert!(skipped + copies.len() as u64 <= 1000 && skipped > 300, "{skipped} skipped");
+        assert!(
+            skipped + copies.len() as u64 <= 1000 && skipped > 300,
+            "{skipped} skipped"
+        );
     }
 }

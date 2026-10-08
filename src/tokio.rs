@@ -32,8 +32,8 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::stdlib::Connection;
 use crate::Cx;
+use crate::stdlib::Connection;
 
 /// Adds [`into_tokio`](ConnectionTokioExt::into_tokio) to every
 /// [`Connection`]. Imported by [`prelude`](crate::prelude).
@@ -51,7 +51,10 @@ pub trait ConnectionTokioExt: Connection + Sized {
     /// the matching I/O error kind, such as `ConnectionReset`, by
     /// `ConnError`'s `From` impl for `std::io::Error`.
     fn into_tokio(self, fcx: &Cx) -> Compat<Self> {
-        Compat { inner: self, fcx: fcx.clone() }
+        Compat {
+            inner: self,
+            fcx: fcx.clone(),
+        }
     }
 }
 
@@ -78,7 +81,10 @@ impl<C: Connection + Unpin> ::tokio::io::AsyncRead for Compat<C> {
         buf: &mut ::tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        match this.inner.poll_read(&this.fcx, cx, buf.initialize_unfilled()) {
+        match this
+            .inner
+            .poll_read(&this.fcx, cx, buf.initialize_unfilled())
+        {
             Poll::Ready(Ok(n)) => {
                 buf.advance(n);
                 Poll::Ready(Ok(()))
@@ -90,9 +96,15 @@ impl<C: Connection + Unpin> ::tokio::io::AsyncRead for Compat<C> {
 }
 
 impl<C: Connection + Unpin> ::tokio::io::AsyncWrite for Compat<C> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        this.inner.poll_write(&this.fcx, cx, data).map_err(std::io::Error::from)
+        this.inner
+            .poll_write(&this.fcx, cx, data)
+            .map_err(std::io::Error::from)
     }
 
     /// A connection hands bytes on as soon as `poll_write` takes them, so
@@ -103,6 +115,8 @@ impl<C: Connection + Unpin> ::tokio::io::AsyncWrite for Compat<C> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        this.inner.poll_shutdown(&this.fcx, cx).map_err(std::io::Error::from)
+        this.inner
+            .poll_shutdown(&this.fcx, cx)
+            .map_err(std::io::Error::from)
     }
 }

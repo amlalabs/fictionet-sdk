@@ -2,8 +2,8 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
 
 use fictionet::stdlib::iec104::{Asdu, Frame, Object};

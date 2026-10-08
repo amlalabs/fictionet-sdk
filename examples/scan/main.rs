@@ -30,7 +30,7 @@ use std::sync::Arc;
 use fictionet::stdlib::codec::{Decode, Step};
 use fictionet::stdlib::net::{Host, Net};
 use fictionet::stdlib::route::Prefix;
-use fictionet::stdlib::serve::{Flow, Driver, Service};
+use fictionet::stdlib::serve::{Driver, Flow, Service};
 use fictionet::time::{Duration, ms};
 use fictionet::{Attachments, Cx, Result};
 
@@ -42,7 +42,11 @@ enum Kind {
     /// Answers every HTTP request with a small page. `status` is the start
     /// of the response, such as `HTTP/1.1 200 OK`, and `server` the server
     /// it names.
-    Http { status: &'static str, server: &'static str, title: &'static str },
+    Http {
+        status: &'static str,
+        server: &'static str,
+        title: &'static str,
+    },
 }
 
 /// A simulated machine: its name, last address byte, and open ports.
@@ -60,16 +64,31 @@ const MACHINES: &[Machine] = &[
         host: 10,
         ports: &[
             (22, OPENSSH),
-            (80, Kind::Http { status: "HTTP/1.1 200 OK", server: "Apache/2.4.62 (Debian)", title: "Intranet" }),
+            (
+                80,
+                Kind::Http {
+                    status: "HTTP/1.1 200 OK",
+                    server: "Apache/2.4.62 (Debian)",
+                    title: "Intranet",
+                },
+            ),
         ],
     },
     Machine {
         name: "mail",
         host: 11,
         ports: &[
-            (25, Kind::Banner("220 mail.corp.test ESMTP Postfix (Debian/GNU)\r\n")),
+            (
+                25,
+                Kind::Banner("220 mail.corp.test ESMTP Postfix (Debian/GNU)\r\n"),
+            ),
             (110, Kind::Banner("+OK Dovecot ready.\r\n")),
-            (143, Kind::Banner("* OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ STARTTLS AUTH=PLAIN] Dovecot ready.\r\n")),
+            (
+                143,
+                Kind::Banner(
+                    "* OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ STARTTLS AUTH=PLAIN] Dovecot ready.\r\n",
+                ),
+            ),
         ],
     },
     Machine {
@@ -81,8 +100,22 @@ const MACHINES: &[Machine] = &[
         name: "printer",
         host: 13,
         ports: &[
-            (80, Kind::Http { status: "HTTP/1.0 200 OK", server: "lighttpd/1.4.69 (Linux)", title: "LaserJet M507" }),
-            (631, Kind::Http { status: "HTTP/1.0 200 OK", server: "CUPS/2.4 IPP/2.1", title: "Home - CUPS 2.4.2" }),
+            (
+                80,
+                Kind::Http {
+                    status: "HTTP/1.0 200 OK",
+                    server: "lighttpd/1.4.69 (Linux)",
+                    title: "LaserJet M507",
+                },
+            ),
+            (
+                631,
+                Kind::Http {
+                    status: "HTTP/1.0 200 OK",
+                    server: "CUPS/2.4 IPP/2.1",
+                    title: "Home - CUPS 2.4.2",
+                },
+            ),
         ],
     },
 ];
@@ -95,15 +128,23 @@ const CONTAINER: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 50);
 const SCANNER_NET: &str = "10.0.9.0/24";
 
 fn main() -> Result {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/run/fictionet/world.sock".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/run/fictionet/world.sock".into());
     let (attacher, attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
+    let _listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(path.clone().into()),
+        attacher,
+    )?;
     println!("listening on {path}");
     fictionet::block_on(fictionet::run(move |fcx| world(fcx, attachments)))
 }
 
 async fn world(fcx: Cx, attachments: Attachments) -> Result {
-    let mut net = Net::new().group("simulated hosts").subnet(SCANNER_NET.parse()?).ipv4_only();
+    let mut net = Net::new()
+        .group("simulated hosts")
+        .subnet(SCANNER_NET.parse()?)
+        .ipv4_only();
     for m in MACHINES {
         let mut host = Host::new(m.name).at(Ipv4Addr::new(SUBNET[0], SUBNET[1], SUBNET[2], m.host));
         for &(port, kind) in m.ports {
@@ -122,7 +163,14 @@ async fn world(fcx: Cx, attachments: Attachments) -> Result {
         println!("attached {}", sandbox.name());
         fictionet::stdlib::delay(&fcx.group(group), by, sandbox)
     });
-    net.route("container", Prefix { addr: CONTAINER.into(), len: 32 }).serve(&fcx, delayed)?;
+    net.route(
+        "container",
+        Prefix {
+            addr: CONTAINER.into(),
+            len: 32,
+        },
+    )
+    .serve(&fcx, delayed)?;
     Ok(())
 }
 
@@ -175,20 +223,40 @@ impl Service for Port {
     type Error = Infallible;
 
     fn decoder(&self) -> Head {
-        Head { ignore: matches!(self.kind, Kind::Banner(_)) }
+        Head {
+            ignore: matches!(self.kind, Kind::Banner(_)),
+        }
     }
 
-    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> std::result::Result<Flow, Infallible> {
+    fn on_open(
+        &mut self,
+        _: &(),
+        driver: &mut Driver<'_>,
+    ) -> std::result::Result<Flow, Infallible> {
         if let Kind::Banner(line) = self.kind {
             driver.reply().extend_from_slice(line.as_bytes());
         }
         Ok(Flow::Continue)
     }
 
-    fn on_item(&mut self, _: (), _: &(), driver: &mut Driver<'_>) -> std::result::Result<Flow, Infallible> {
-        let Kind::Http { status, server, title } = self.kind else { return Ok(Flow::Continue) };
+    fn on_item(
+        &mut self,
+        _: (),
+        _: &(),
+        driver: &mut Driver<'_>,
+    ) -> std::result::Result<Flow, Infallible> {
+        let Kind::Http {
+            status,
+            server,
+            title,
+        } = self.kind
+        else {
+            return Ok(Flow::Continue);
+        };
         self.request += 1;
-        let body = format!("<!doctype html><html><head><title>{title}</title></head><body><h1>{title}</h1></body></html>\n");
+        let body = format!(
+            "<!doctype html><html><head><title>{title}</title></head><body><h1>{title}</h1></body></html>\n"
+        );
         let head = format!(
             "{status}\r\nServer: {server}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
@@ -234,7 +302,11 @@ mod tests {
         Packet(p)
     }
 
-    async fn within<T>(fcx: &Cx, d: Duration, fut: impl std::future::Future<Output = T>) -> Option<T> {
+    async fn within<T>(
+        fcx: &Cx,
+        d: Duration,
+        fut: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
         let mut fut = std::pin::pin!(fut);
         let mut sleep = std::pin::pin!(fcx.sleep(d));
         std::future::poll_fn(|cx| {
@@ -283,7 +355,10 @@ mod tests {
         let end = attacher.attach("scanner").unwrap();
         let (t, _u, mut icmp, _o) = ip::split_protocols(fcx, end);
         let tcp = tcp::endpoint(fcx, t, SCANNER.into());
-        let hosts: Vec<Ipv4Addr> = [10u8, 11, 12, 13, 14, 20, 50, 99].iter().map(|h| Ipv4Addr::new(10, 0, 0, *h)).collect();
+        let hosts: Vec<Ipv4Addr> = [10u8, 11, 12, 13, 14, 20, 50, 99]
+            .iter()
+            .map(|h| Ipv4Addr::new(10, 0, 0, *h))
+            .collect();
         let mut lines = Vec::new();
         // Pings, all at once.
         for (i, h) in hosts.iter().enumerate() {
@@ -297,7 +372,10 @@ mod tests {
             }
         }
         for h in &hosts {
-            lines.push(format!("ping {h} {}", if up.contains(h) { "up" } else { "down" }));
+            lines.push(format!(
+                "ping {h} {}",
+                if up.contains(h) { "up" } else { "down" }
+            ));
         }
         for h in &hosts {
             for port in [21u16, 22, 25, 80, 110, 143, 443, 631, 3306] {
@@ -305,11 +383,14 @@ mod tests {
                 let state = match within(fcx, ms(800), tcp.connect(fcx, to)).await {
                     Some(Ok(mut conn)) => {
                         if matches!(port, 80 | 631) {
-                            conn.write_all(fcx, b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+                            conn.write_all(fcx, b"GET / HTTP/1.0\r\n\r\n")
+                                .await
+                                .unwrap();
                         }
                         let mut got = Vec::new();
                         let mut buf = [0u8; 4096];
-                        while let Some(Ok(n)) = within(fcx, ms(500), conn.read(fcx, &mut buf)).await {
+                        while let Some(Ok(n)) = within(fcx, ms(500), conn.read(fcx, &mut buf)).await
+                        {
                             if n == 0 {
                                 break;
                             }
@@ -341,7 +422,9 @@ mod tests {
             }));
             let _ = result;
         });
-        let got = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("the scan finished");
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .expect("the scan finished");
         let file = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/scan/golden.txt");
         let got = got.join("\n") + "\n";
         if std::env::var_os("SCAN_GOLDEN_WRITE").is_some() {

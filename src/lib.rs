@@ -307,25 +307,25 @@ pub mod events;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing;
-pub mod observe;
 pub mod getting_started;
 #[cfg(not(target_arch = "wasm32"))]
 mod listen;
 pub mod lowering;
+pub mod observe;
+pub mod proto;
+pub mod recipes;
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub mod relay;
+pub mod roadmap;
 mod run;
 pub mod running;
-mod sys;
-mod timer;
-mod watch;
-pub mod proto;
-pub mod recipes;
-pub mod roadmap;
 pub mod stdlib;
+mod sys;
 pub mod time;
+mod timer;
 pub mod tokio;
+mod watch;
 
 /// The extension traits. Import this to call methods such as
 /// [`recv`](InterfaceExt::recv) and [`read`](stdlib::ConnectionExt::read).
@@ -339,11 +339,11 @@ pub mod prelude {
     pub use crate::tokio::ConnectionTokioExt;
 }
 
-pub use attach::{AttachError, Attachment, Attacher, Attachments, attachments};
+pub use attach::{AttachError, Attacher, Attachment, Attachments, attachments};
+pub use block_on::block_on;
 pub use cable::{End, PACKET_COST, pair, pair_with_limit};
 pub use cx::{CancelWait, Cancelled, Cx, JoinError, RaceError, Task, Timer};
 pub use error::{Error, ErrorChain};
-pub use block_on::block_on;
 #[cfg(not(target_arch = "wasm32"))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};
 pub use run::run;
@@ -357,7 +357,6 @@ use std::task::{Context, Poll};
 /// fail. Any error type that implements [`std::error::Error`], `Send` and
 /// `Sync` converts into [`Error`] with `?`.
 pub type Result<T = (), E = Error> = std::result::Result<T, E>;
-
 
 /// One IPv4 or IPv6 packet, exactly the bytes on the wire.
 ///
@@ -476,7 +475,10 @@ pub trait InterfaceExt: Interface {
     /// So a loop that waits on `recv` stops on its own when its region is
     /// cancelled, with no extra code.
     fn recv<'a>(&'a mut self, fcx: &'a Cx) -> Recv<'a, Self> {
-        Recv { interface: self, fcx }
+        Recv {
+            interface: self,
+            fcx,
+        }
     }
 }
 

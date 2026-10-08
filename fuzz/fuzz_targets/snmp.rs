@@ -6,11 +6,10 @@ use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::snmp::{
-    BasicPdu, Error, MAX_MESSAGE, Message, Oid, Pdu, Value, VarBind,
-    Version,
-};
 use fictionet::stdlib::snmp::harness::{check_message, check_scalars};
+use fictionet::stdlib::snmp::{
+    BasicPdu, Error, MAX_MESSAGE, Message, Oid, Pdu, Value, VarBind, Version,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -30,7 +29,11 @@ fuzz_target!(|data: &[u8]| {
     let name: Oid = "1.3.6.1.2.1.1.5.0".parse().unwrap();
     let copies = usize::from(data.first().copied().unwrap_or(0) % 4);
     let built = Message {
-        version: if data.len() % 2 == 0 { Version::V1 } else { Version::V2c },
+        version: if data.len() % 2 == 0 {
+            Version::V1
+        } else {
+            Version::V2c
+        },
         community: data.to_vec(),
         pdu: Pdu::Set(BasicPdu::new(
             1,

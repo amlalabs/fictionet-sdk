@@ -4,11 +4,12 @@
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::sip::harness::{cseq_round_trip, round_trip, text_value};
 use fictionet::stdlib::sip::{
-    CSeq, Contacts, Messages, MAX_BODY, MAX_HEAD, MAX_MESSAGE, Message, NameAddr, Param, Scheme, Uri, Via,
+    CSeq, Contacts, MAX_BODY, MAX_HEAD, MAX_MESSAGE, Message, Messages, NameAddr, Param, Scheme,
+    Uri, Via,
 };
-use fictionet::stdlib::sip::harness::{round_trip, cseq_round_trip, text_value};
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -66,28 +67,52 @@ fuzz_target!(|data: &[u8]| {
 // Exercise constructed values, including ones the parser cannot produce.
 fn writers(data: &[u8]) {
     let bounded = data.get(..MAX_HEAD + 1).unwrap_or(data);
-    let parts: Vec<String> =
-        bounded.split(|&b| b == 0xff).take(12).map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+    let parts: Vec<String> = bounded
+        .split(|&b| b == 0xff)
+        .take(12)
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
     let part = |i: usize| parts.get(i).cloned().unwrap_or_default();
     let opt = |i: usize| parts.get(i).cloned();
     let params = |from: usize| -> Vec<Param> {
         (from..parts.len().min(from + 6))
             .step_by(2)
-            .map(|i| Param { name: part(i), value: opt(i + 1) })
+            .map(|i| Param {
+                name: part(i),
+                value: opt(i + 1),
+            })
             .collect()
     };
-    let scheme = if data.first().is_some_and(|b| b & 1 == 1) { Scheme::Sips } else { Scheme::Sip };
+    let scheme = if data.first().is_some_and(|b| b & 1 == 1) {
+        Scheme::Sips
+    } else {
+        Scheme::Sip
+    };
     let mut uri = Uri::new(scheme, &part(0));
     uri.user = opt(1);
     uri.password = opt(2);
     uri.params = params(3);
     contract::check_wire_value(&uri);
-    let address = NameAddr { display: opt(0), uri: part(1), params: params(2) };
+    let address = NameAddr {
+        display: opt(0),
+        uri: part(1),
+        params: params(2),
+    };
     contract::check_wire_value(&address);
     contract::check_wire_value(&Contacts::List(vec![address]));
-    contract::check_wire_value(&Via { transport: part(0), host: part(1), port: None, params: params(2) });
-    let seq = bounded.iter().fold(0u32, |n, &b| n.rotate_left(8) ^ u32::from(b));
-    contract::check_wire_value(&CSeq { seq, method: part(0) });
+    contract::check_wire_value(&Via {
+        transport: part(0),
+        host: part(1),
+        port: None,
+        params: params(2),
+    });
+    let seq = bounded
+        .iter()
+        .fold(0u32, |n, &b| n.rotate_left(8) ^ u32::from(b));
+    contract::check_wire_value(&CSeq {
+        seq,
+        method: part(0),
+    });
     let mut message = if data.first().is_some_and(|b| b & 2 == 2) {
         Message::request(&part(0), &part(1))
     } else {
@@ -96,7 +121,10 @@ fn writers(data: &[u8]) {
     for i in (2..parts.len()).step_by(2) {
         message.push_header(&part(i), &part(i + 1));
     }
-    message.body = parts.last().map(|p| p.as_bytes().to_vec()).unwrap_or_default();
+    message.body = parts
+        .last()
+        .map(|p| p.as_bytes().to_vec())
+        .unwrap_or_default();
     contract::check_wire_value(&message);
     message.set_header("Content-Length", &message.body.len().to_string());
     contract::check_wire_value(&message);

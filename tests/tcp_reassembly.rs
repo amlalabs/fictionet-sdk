@@ -1,5 +1,5 @@
 use fictionet::stdlib::codec::{Decode, Step, Stream, finish, pump};
-use fictionet::stdlib::tcp_reassembly::{FlowKey, Limits, Reassembler, Segment, Chunk};
+use fictionet::stdlib::tcp_reassembly::{Chunk, FlowKey, Limits, Reassembler, Segment};
 use std::convert::Infallible;
 
 struct UserDecoder;

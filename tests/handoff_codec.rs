@@ -3,8 +3,9 @@
 use core::{convert::Infallible, fmt::Debug};
 use fictionet::stdlib::{
     codec::{self, Decode, Fail, Step, Stream, Wire},
-    test_support::contract, test_support::chunks,
     proxy_protocol as proxy, rfb, socks,
+    test_support::chunks,
+    test_support::contract,
 };
 use std::net::Ipv4Addr;
 
@@ -36,7 +37,12 @@ where
     let (items, failure) = contract::check_decode(&make, &wire);
     assert_eq!(items, expected);
     assert_eq!(failure, None);
-    for pattern in [&[][..], &[1], &[3, 1, 7, 2, 64], &[units.len().saturating_sub(1), 64]] {
+    for pattern in [
+        &[][..],
+        &[1],
+        &[3, 1, 7, 2, 64],
+        &[units.len().saturating_sub(1), 64],
+    ] {
         let mut stream = Stream::with_buffer(make(), wire.len());
         let mut accepted = 0;
         let mut items = Vec::new();
@@ -74,7 +80,10 @@ where
         while let Some(byte) = next.next() {
             payload.push(byte.unwrap());
         }
-        assert_eq!(codec::pump(&mut next, &wire[accepted..], |b| payload.push(b)), Ok(wire.len() - accepted));
+        assert_eq!(
+            codec::pump(&mut next, &wire[accepted..], |b| payload.push(b)),
+            Ok(wire.len() - accepted)
+        );
         codec::finish(&mut next, |b| payload.push(b)).unwrap();
         assert_eq!(payload, PAYLOAD);
         assert_eq!(next.offset(), wire.len() as u64);
@@ -130,7 +139,12 @@ where
 {
     assert_eq!(
         contract::check_decode_with_alloc_limit(&make, bytes, make().capacity().saturating_mul(2)),
-        (vec![], Some(Fail::Truncated { unread: bytes.len() }))
+        (
+            vec![],
+            Some(Fail::Truncated {
+                unread: bytes.len()
+            })
+        )
     );
     let mut stream = Stream::new(make());
     assert_eq!(stream.push(bytes), bytes.len());
@@ -161,11 +175,15 @@ fn proxy_v1_v2_round_trip_and_handoff() {
             tlvs: vec![],
         }),
     ];
-    headers.push(proxy::Header::V2(proxy::V2 {
-        command: proxy::Command::Proxy,
-        addresses: proxy::Addresses::Unspec,
-        tlvs: vec![],
-    }.with_checksum().unwrap()));
+    headers.push(proxy::Header::V2(
+        proxy::V2 {
+            command: proxy::Command::Proxy,
+            addresses: proxy::Addresses::Unspec,
+            tlvs: vec![],
+        }
+        .with_checksum()
+        .unwrap(),
+    ));
     for header in headers {
         let bytes = Wire::to_bytes(&header).unwrap();
         contract::check_wire::<proxy::Header>(&bytes);
@@ -178,10 +196,18 @@ fn proxy_v1_v2_round_trip_and_handoff() {
 fn proxy_header_limits_truncation_and_terminal_errors() {
     let mut over = proxy::V2_SIGNATURE.to_vec();
     over.extend_from_slice(&[0x21, 0, 0, 17]);
-    terminal(|| proxy::Headers::with_limit(32), &over, Fail::Protocol(proxy::FrameError::TooLong));
+    terminal(
+        || proxy::Headers::with_limit(32),
+        &over,
+        Fail::Protocol(proxy::FrameError::TooLong),
+    );
     let mut invalid = proxy::V2_SIGNATURE.to_vec();
     invalid.push(0x31);
-    terminal(proxy::Headers::new, &invalid, Fail::Protocol(proxy::FrameError::Protocol(proxy::Error::Version(3))));
+    terminal(
+        proxy::Headers::new,
+        &invalid,
+        Fail::Protocol(proxy::FrameError::Protocol(proxy::Error::Version(3))),
+    );
     truncated(proxy::Headers::new, b"PROXY TCP4 192.");
     truncated(proxy::Headers::new, &over);
     let overline = [b"PROXY ".as_slice(), &[b'x'; proxy::V1_MAX_LEN - 6]].concat();
@@ -195,13 +221,19 @@ fn proxy_header_limits_truncation_and_terminal_errors() {
 #[test]
 fn proxy_not_proxy_retains_all_bytes_and_can_swap() {
     let bytes = b"GET / HTTP/1.1\r\n\x00\xff";
-    terminal(proxy::Headers::new, bytes, Fail::Protocol(proxy::FrameError::Protocol(proxy::Error::NotProxy)));
+    terminal(
+        proxy::Headers::new,
+        bytes,
+        Fail::Protocol(proxy::FrameError::Protocol(proxy::Error::NotProxy)),
+    );
     for prefix in 1..=bytes.len() {
         let mut stream = Stream::new(proxy::Headers::new());
         assert_eq!(stream.push(&bytes[..prefix]), prefix);
         assert!(matches!(
             stream.next(),
-            Some(Err(Fail::Protocol(proxy::FrameError::Protocol(proxy::Error::NotProxy))))
+            Some(Err(Fail::Protocol(proxy::FrameError::Protocol(
+                proxy::Error::NotProxy
+            ))))
         ));
         let mut stream = stream.swap(Bytes);
         let mut got = Vec::new();
@@ -217,8 +249,16 @@ fn proxy_not_proxy_retains_all_bytes_and_can_swap() {
 fn proxy_bad_complete_body_is_an_item_before_end() {
     let mut bytes = proxy::V2_SIGNATURE.to_vec();
     bytes.extend_from_slice(&[0x21, 0, 0, 3, proxy::tlv_type::CRC32C, 0, 0]);
-    handoff(proxy::Headers::new, &bytes, &[Err(proxy::Error::TlvLength(proxy::tlv_type::CRC32C))]);
-    handoff(proxy::Headers::new, b"PROXY invalid\r\n", &[Err(proxy::Error::V1Syntax)]);
+    handoff(
+        proxy::Headers::new,
+        &bytes,
+        &[Err(proxy::Error::TlvLength(proxy::tlv_type::CRC32C))],
+    );
+    handoff(
+        proxy::Headers::new,
+        b"PROXY invalid\r\n",
+        &[Err(proxy::Error::V1Syntax)],
+    );
 }
 
 struct SocksHandshake(socks::ClientMessages);
@@ -260,9 +300,16 @@ fn socks5_request() -> socks::Request {
 fn socks5_greeting_auth_request_round_trip_and_handoff() {
     for auth in [false, true] {
         let greeting = socks::Greeting {
-            methods: vec![if auth { socks::Method::UsernamePassword } else { socks::Method::NoAuth }],
+            methods: vec![if auth {
+                socks::Method::UsernamePassword
+            } else {
+                socks::Method::NoAuth
+            }],
         };
-        let login = socks::AuthRequest { username: b"user".to_vec(), password: b"password".to_vec() };
+        let login = socks::AuthRequest {
+            username: b"user".to_vec(),
+            password: b"password".to_vec(),
+        };
         let request = socks5_request();
         let mut bytes = Wire::to_bytes(&greeting).unwrap();
         let mut expected = vec![Ok(socks::ClientMessage::Greeting(greeting))];
@@ -272,7 +319,11 @@ fn socks5_greeting_auth_request_round_trip_and_handoff() {
         }
         Wire::write(&request, &mut bytes).unwrap();
         expected.push(Ok(socks::ClientMessage::Request(request)));
-        handoff(|| SocksHandshake(socks::ClientMessages::new()), &bytes, &expected);
+        handoff(
+            || SocksHandshake(socks::ClientMessages::new()),
+            &bytes,
+            &expected,
+        );
     }
 }
 
@@ -290,13 +341,19 @@ fn socks4_and_4a_round_trip_and_handoff() {
         };
         let bytes = Wire::to_bytes(&request).unwrap();
         contract::check_wire::<socks::Socks4Request>(&bytes);
-        handoff(socks::ClientMessages::new, &bytes, &[Ok(socks::ClientMessage::Socks4(request))]);
+        handoff(
+            socks::ClientMessages::new,
+            &bytes,
+            &[Ok(socks::ClientMessage::Socks4(request))],
+        );
     }
 }
 
 #[test]
 fn socks_reply_bind_and_refusal_handoffs() {
-    let selection = socks::Selection { method: socks::Method::NoAuth };
+    let selection = socks::Selection {
+        method: socks::Method::NoAuth,
+    };
     let reply = socks::Reply {
         code: socks::ReplyCode::Succeeded,
         address: socks::Address::Ipv4(Ipv4Addr::LOCALHOST),
@@ -314,26 +371,43 @@ fn socks_reply_bind_and_refusal_handoffs() {
             Ok(socks::ServerMessage::Reply(reply)),
         ],
     );
-    let selection = socks::Selection { method: socks::Method::NoAcceptable };
+    let selection = socks::Selection {
+        method: socks::Method::NoAcceptable,
+    };
     handoff(
         || socks::ServerMessages::socks5(socks::Command::Connect),
         &Wire::to_bytes(&selection).unwrap(),
         &[Ok(socks::ServerMessage::Selection(selection))],
     );
-    let reply = socks::Socks4Reply { code: socks::Socks4Code::Granted, ip: Ipv4Addr::LOCALHOST, port: 80 };
+    let reply = socks::Socks4Reply {
+        code: socks::Socks4Code::Granted,
+        ip: Ipv4Addr::LOCALHOST,
+        port: 80,
+    };
     let mut bytes = Wire::to_bytes(&reply).unwrap();
     Wire::write(&reply, &mut bytes).unwrap();
     handoff(
         || socks::ServerMessages::socks4(socks::Socks4Command::Bind),
         &bytes,
-        &[Ok(socks::ServerMessage::Socks4(reply)), Ok(socks::ServerMessage::Socks4(reply))],
+        &[
+            Ok(socks::ServerMessage::Socks4(reply)),
+            Ok(socks::ServerMessage::Socks4(reply)),
+        ],
     );
 }
 
 #[test]
 fn socks_limits_truncation_and_framing_errors() {
-    terminal(|| socks::ClientMessages::with_limit(8), &[5, 20], Fail::Protocol(socks::FrameError::TooLong));
-    terminal(socks::ClientMessages::new, &[3], Fail::Protocol(socks::FrameError::Version(3)));
+    terminal(
+        || socks::ClientMessages::with_limit(8),
+        &[5, 20],
+        Fail::Protocol(socks::FrameError::TooLong),
+    );
+    terminal(
+        socks::ClientMessages::new,
+        &[3],
+        Fail::Protocol(socks::FrameError::Version(3)),
+    );
     truncated(socks::ClientMessages::new, &[5, 2, 0]);
     truncated(socks::ClientMessages::new, &[4, 1, 0, 80, 1, 2, 3, 4, b'u']);
     let make = || {
@@ -342,15 +416,27 @@ fn socks_limits_truncation_and_framing_errors() {
         assert!(d.select(socks::Method::NoAuth));
         d
     };
-    terminal(make, &[5, 1, 0, 3, 30], Fail::Protocol(socks::FrameError::TooLong));
-    terminal(make, &[5, 1, 0, 99], Fail::Protocol(socks::FrameError::AddressType(99)));
+    terminal(
+        make,
+        &[5, 1, 0, 3, 30],
+        Fail::Protocol(socks::FrameError::TooLong),
+    );
+    terminal(
+        make,
+        &[5, 1, 0, 99],
+        Fail::Protocol(socks::FrameError::AddressType(99)),
+    );
     let make_auth = || {
         let mut d = socks::ClientMessages::with_limit(8);
         d.decode(&[5, 1, 2], false).unwrap();
         assert!(d.select(socks::Method::UsernamePassword));
         d
     };
-    terminal(make_auth, &[1, 20], Fail::Protocol(socks::FrameError::TooLong));
+    terminal(
+        make_auth,
+        &[1, 20],
+        Fail::Protocol(socks::FrameError::TooLong),
+    );
     truncated(make_auth, &[1, 1, b'u', 2, b'p']);
 }
 
@@ -363,7 +449,10 @@ fn socks_modes_and_complete_request_errors() {
     bytes.extend_from_slice(&request);
     bytes.extend_from_slice(PAYLOAD);
     assert_eq!(stream.push(&bytes), bytes.len());
-    assert!(matches!(stream.next(), Some(Ok(Ok(socks::ClientMessage::Greeting(_))))));
+    assert!(matches!(
+        stream.next(),
+        Some(Ok(Ok(socks::ClientMessage::Greeting(_))))
+    ));
     assert_eq!(stream.unread(), [&request[..], PAYLOAD].concat());
     assert!(!stream.decoder().select(socks::Method::UsernamePassword));
     assert!(stream.decoder().select(socks::Method::NoAuth));
@@ -372,7 +461,11 @@ fn socks_modes_and_complete_request_errors() {
     assert_eq!(stream.next(), None);
     assert!(stream.is_done());
     assert_eq!(stream.into_parts().0.unread(), PAYLOAD);
-    contract::check_decode_with_alloc_limit(socks::ClientMessages::new, &bytes, 2 * socks::MAX_MESSAGE); // Pending decisions preserve bytes below capacity.
+    contract::check_decode_with_alloc_limit(
+        socks::ClientMessages::new,
+        &bytes,
+        2 * socks::MAX_MESSAGE,
+    ); // Pending decisions preserve bytes below capacity.
 }
 
 #[test]
@@ -492,7 +585,9 @@ fn socks_decisions_fail_only_at_capacity_without_consuming() {
         assert_eq!(stream.push(&[0]), 1);
         assert_eq!(
             stream.next(),
-            Some(Err(Fail::Protocol(socks::FrameError::DecisionRequired(phase))))
+            Some(Err(Fail::Protocol(socks::FrameError::DecisionRequired(
+                phase
+            ))))
         );
         assert_eq!(stream.decoder().phase(), socks::ServerPhase::Failed);
         assert_eq!(stream.next(), None);
@@ -601,7 +696,12 @@ fn format() -> rfb::PixelFormat {
     rfb::PixelFormat::TRUE_COLOR_32
 }
 fn init() -> rfb::ServerInit {
-    rfb::ServerInit { width: 8, height: 8, format: format(), name: b"desktop".to_vec() }
+    rfb::ServerInit {
+        width: 8,
+        height: 8,
+        format: format(),
+        name: b"desktop".to_vec(),
+    }
 }
 fn server_decoder(phase: rfb::Phase, limit: usize) -> rfb::ServerMessages {
     let mut d = rfb::ServerMessages::with_limit(limit);
@@ -630,7 +730,9 @@ impl Decode for RfbServerHandshake {
                 rfb::ServerMessage::SecurityTypes(_) => rfb::Phase::VncChallenge,
                 rfb::ServerMessage::VncChallenge(_) => rfb::Phase::SecurityResult,
                 rfb::ServerMessage::SecurityOk => rfb::Phase::ServerInit,
-                rfb::ServerMessage::ServerInit(_) | rfb::ServerMessage::FramebufferUpdate(_) => rfb::Phase::Normal,
+                rfb::ServerMessage::ServerInit(_) | rfb::ServerMessage::FramebufferUpdate(_) => {
+                    rfb::Phase::Normal
+                }
                 _ => rfb::Phase::Closed,
             };
             self.0
@@ -668,16 +770,37 @@ impl Decode for RfbClientHandshake {
 #[test]
 fn rfb_whole_handshake_into_messages_and_handoff() {
     let update = rfb::ServerMessage::FramebufferUpdate(vec![
-        rfb::Rectangle { x: 0, y: 0, width: 2, height: 2, contents: rfb::Contents::Raw(vec![7; 16]) },
-        rfb::Rectangle { x: 2, y: 2, width: 1, height: 1, contents: rfb::Contents::CopyRect { src_x: 0, src_y: 0 } },
+        rfb::Rectangle {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            contents: rfb::Contents::Raw(vec![7; 16]),
+        },
+        rfb::Rectangle {
+            x: 2,
+            y: 2,
+            width: 1,
+            height: 1,
+            contents: rfb::Contents::CopyRect { src_x: 0, src_y: 0 },
+        },
         rfb::Rectangle {
             x: 0,
             y: 0,
             width: 1,
             height: 1,
-            contents: rfb::Contents::Cursor { pixels: vec![2; 4], mask: vec![128] },
+            contents: rfb::Contents::Cursor {
+                pixels: vec![2; 4],
+                mask: vec![128],
+            },
         },
-        rfb::Rectangle { x: 0, y: 0, width: 16, height: 16, contents: rfb::Contents::DesktopSize },
+        rfb::Rectangle {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+            contents: rfb::Contents::DesktopSize,
+        },
     ]);
     let messages = vec![
         rfb::ServerMessage::Version(rfb::Version::V3_8),
@@ -707,15 +830,22 @@ fn rfb_whole_handshake_into_messages_and_handoff() {
         rfb::ClientMessage::SecurityType(2),
         rfb::ClientMessage::VncResponse([9; 16]),
         rfb::ClientMessage::ClientInit { shared: true },
-        rfb::ClientMessage::KeyEvent { down: true, key: 65 },
+        rfb::ClientMessage::KeyEvent {
+            down: true,
+            key: 65,
+        },
     ];
     let mut bytes = Vec::new();
     for m in &messages {
         match m {
             rfb::ClientMessage::Version(v) => v.write(&mut bytes).unwrap(),
-            rfb::ClientMessage::SecurityType(t) => rfb::SecurityChoice(*t).write(&mut bytes).unwrap(),
+            rfb::ClientMessage::SecurityType(t) => {
+                rfb::SecurityChoice(*t).write(&mut bytes).unwrap()
+            }
             rfb::ClientMessage::VncResponse(r) => rfb::VncResponse(*r).write(&mut bytes).unwrap(),
-            rfb::ClientMessage::ClientInit { shared } => rfb::ClientInit { shared: *shared }.write(&mut bytes).unwrap(),
+            rfb::ClientMessage::ClientInit { shared } => rfb::ClientInit { shared: *shared }
+                .write(&mut bytes)
+                .unwrap(),
             _ => m.write(&mut bytes).unwrap(),
         }
     }
@@ -735,19 +865,38 @@ fn rfb_limits_truncation_and_framing_errors() {
     terminal(make, &over, Fail::Protocol(rfb::FrameError::TooLong));
     truncated(make, &bytes[..25]);
     truncated(rfb::ClientMessages::new, b"RFB 003.");
-    truncated(|| server_decoder(rfb::Phase::SecurityResult, LIMIT), &[0, 0, 0]);
-    terminal(rfb::ServerMessages::new, b"BAD", Fail::Protocol(rfb::FrameError::Version));
-    terminal(|| server_decoder(rfb::Phase::Normal, LIMIT), &[99], Fail::Protocol(rfb::FrameError::MessageType(99)));
+    truncated(
+        || server_decoder(rfb::Phase::SecurityResult, LIMIT),
+        &[0, 0, 0],
+    );
+    terminal(
+        rfb::ServerMessages::new,
+        b"BAD",
+        Fail::Protocol(rfb::FrameError::Version),
+    );
+    terminal(
+        || server_decoder(rfb::Phase::Normal, LIMIT),
+        &[99],
+        Fail::Protocol(rfb::FrameError::MessageType(99)),
+    );
     terminal(
         || client_decoder(rfb::Phase::Normal, 32),
         &[6, 0, 0, 0, 0, 0, 0, 100],
         Fail::Protocol(rfb::FrameError::TooLong),
     );
     let rectangle = [0, 0, 0, 1, 0, 0, 0, 0, 0, 8, 0, 8, 0, 0, 0, 0];
-    terminal(|| server_decoder(rfb::Phase::Normal, 32), &rectangle, Fail::Protocol(rfb::FrameError::TooLong));
+    terminal(
+        || server_decoder(rfb::Phase::Normal, 32),
+        &rectangle,
+        Fail::Protocol(rfb::FrameError::TooLong),
+    );
     let mut unknown = rectangle;
     unknown[12..].copy_from_slice(&42i32.to_be_bytes());
-    terminal(|| server_decoder(rfb::Phase::Normal, LIMIT), &unknown, Fail::Protocol(rfb::FrameError::Encoding(42)));
+    terminal(
+        || server_decoder(rfb::Phase::Normal, LIMIT),
+        &unknown,
+        Fail::Protocol(rfb::FrameError::Encoding(42)),
+    );
     truncated(|| server_decoder(rfb::Phase::Normal, LIMIT), &rectangle);
 }
 
@@ -755,7 +904,10 @@ fn rfb_limits_truncation_and_framing_errors() {
 fn rfb_body_errors_are_items_and_mode_changes_require_boundaries() {
     let mut stream = Stream::new(client_decoder(rfb::Phase::Normal, LIMIT));
     let bad_format = [0; 20];
-    let good = rfb::ClientMessage::KeyEvent { down: false, key: 65 };
+    let good = rfb::ClientMessage::KeyEvent {
+        down: false,
+        key: 65,
+    };
     let mut bytes = bad_format.to_vec();
     Wire::write(&good, &mut bytes).unwrap();
     assert_eq!(stream.push(&bytes[..2]), 2);
@@ -765,15 +917,16 @@ fn rfb_body_errors_are_items_and_mode_changes_require_boundaries() {
         Err(rfb::Error::PartialUnit)
     );
     assert_eq!(stream.push(&bytes[2..]), bytes.len() - 2);
-    assert_eq!(
-        stream.next(),
-        Some(Ok(Err(rfb::Error::PixelFormat)))
-    );
+    assert_eq!(stream.next(), Some(Ok(Err(rfb::Error::PixelFormat))));
     assert_eq!(stream.next(), Some(Ok(Ok(good))));
     assert!(stream.decoder().set_phase(rfb::Phase::Closed).is_ok());
     assert_eq!(stream.next(), None);
     assert!(stream.is_done());
-    contract::check_decode_with_alloc_limit(|| client_decoder(rfb::Phase::Normal, LIMIT), &bytes, 2 * LIMIT);
+    contract::check_decode_with_alloc_limit(
+        || client_decoder(rfb::Phase::Normal, LIMIT),
+        &bytes,
+        2 * LIMIT,
+    );
 }
 
 #[test]
@@ -784,31 +937,52 @@ fn strict_wire_writers_refuse_changes_transactionally() {
         addresses: proxy::Addresses::Unspec,
         tlvs: vec![proxy::Tlv::Crc32c(0)],
     }));
-    contract::check_wire_value(&socks::Greeting { methods: vec![socks::Method::Other(0)] });
-    contract::check_wire_value(&socks::AuthRequest { username: vec![0; 256], password: vec![] });
+    contract::check_wire_value(&socks::Greeting {
+        methods: vec![socks::Method::Other(0)],
+    });
+    contract::check_wire_value(&socks::AuthRequest {
+        username: vec![0; 256],
+        password: vec![],
+    });
     contract::check_wire_value(&socks::Socks4Request {
         command: socks::Socks4Command::Connect,
         destination: socks::Socks4Destination::Ip(Ipv4Addr::new(0, 0, 0, 1)),
         port: 80,
         user_id: b"a\0b".to_vec(),
     });
-    contract::check_wire_value(&rfb::Version { major: 1000, minor: 8 });
+    contract::check_wire_value(&rfb::Version {
+        major: 1000,
+        minor: 8,
+    });
     contract::check_wire_value(&rfb::ClientMessage::SecurityType(1));
     contract::check_wire_value(&format());
     contract::check_wire_value(&init());
     contract::check_wire::<rfb::Version>(&Wire::to_bytes(&rfb::Version::V3_8).unwrap());
     contract::check_wire::<rfb::ServerInit>(&Wire::to_bytes(&init()).unwrap());
-    for bytes in [Wire::to_bytes(&rfb::Version::V3_8).unwrap(), Wire::to_bytes(&init()).unwrap()] {
+    for bytes in [
+        Wire::to_bytes(&rfb::Version::V3_8).unwrap(),
+        Wire::to_bytes(&init()).unwrap(),
+    ] {
         let mut trailing = bytes;
         trailing.push(0);
         if trailing.len() == rfb::VERSION_LEN + 1 {
-            assert_eq!(<rfb::Version as Wire>::parse(&trailing), Err(rfb::Error::Trailing));
+            assert_eq!(
+                <rfb::Version as Wire>::parse(&trailing),
+                Err(rfb::Error::Trailing)
+            );
         } else {
-            assert_eq!(<rfb::ServerInit as Wire>::parse(&trailing), Err(rfb::Error::Trailing));
+            assert_eq!(
+                <rfb::ServerInit as Wire>::parse(&trailing),
+                Err(rfb::Error::Trailing)
+            );
         }
     }
     let mut out = vec![1, 2, 3];
-    assert!(rfb::ServerMessage::SecurityTypes(vec![]).write(rfb::Dialect::V3_8, &format(), &mut out).is_err());
+    assert!(
+        rfb::ServerMessage::SecurityTypes(vec![])
+            .write(rfb::Dialect::V3_8, &format(), &mut out)
+            .is_err()
+    );
     assert_eq!(out, [1, 2, 3]);
 }
 
@@ -826,11 +1000,15 @@ fn rfb_stream_sessions_negotiate_all_existing_dialects() {
                     }
                     if server.phase().server_turn() {
                         let message = match server.phase() {
-                            rfb::Phase::ServerVersion => rfb::ServerMessage::Version(rfb::Version::V3_8),
+                            rfb::Phase::ServerVersion => {
+                                rfb::ServerMessage::Version(rfb::Version::V3_8)
+                            }
                             rfb::Phase::SecurityOffer if server.dialect() == rfb::Dialect::V3_3 => {
                                 rfb::ServerMessage::SecurityType(if vnc { 2 } else { 1 })
                             }
-                            rfb::Phase::SecurityOffer => rfb::ServerMessage::SecurityTypes(vec![1, 2]),
+                            rfb::Phase::SecurityOffer => {
+                                rfb::ServerMessage::SecurityTypes(vec![1, 2])
+                            }
                             rfb::Phase::VncChallenge => rfb::ServerMessage::VncChallenge([7; 16]),
                             rfb::Phase::SecurityResult => rfb::ServerMessage::SecurityOk,
                             rfb::Phase::ServerInit => rfb::ServerMessage::ServerInit(init()),
@@ -848,9 +1026,13 @@ fn rfb_stream_sessions_negotiate_all_existing_dialects() {
                     } else {
                         let message = match client.phase() {
                             rfb::Phase::ClientVersion => rfb::ClientMessage::Version(version),
-                            rfb::Phase::SecurityChoice => rfb::ClientMessage::SecurityType(if vnc { 2 } else { 1 }),
+                            rfb::Phase::SecurityChoice => {
+                                rfb::ClientMessage::SecurityType(if vnc { 2 } else { 1 })
+                            }
                             rfb::Phase::VncResponse => rfb::ClientMessage::VncResponse([9; 16]),
-                            rfb::Phase::ClientInit => rfb::ClientMessage::ClientInit { shared: true },
+                            rfb::Phase::ClientInit => {
+                                rfb::ClientMessage::ClientInit { shared: true }
+                            }
                             phase => panic!("unexpected client phase {phase:?}"),
                         };
                         let bytes = client.send(&message).unwrap();
@@ -877,10 +1059,7 @@ fn rfb_stream_sessions_negotiate_all_existing_dialects() {
                 let mut bytes = vec![0; 20];
                 Wire::write(&good, &mut bytes).unwrap();
                 assert_eq!(server.push(&bytes), bytes.len());
-                assert_eq!(
-                    server.next(),
-                    Some(Ok(Err(rfb::Error::PixelFormat)))
-                );
+                assert_eq!(server.next(), Some(Ok(Err(rfb::Error::PixelFormat))));
                 assert_eq!(server.phase(), rfb::Phase::Normal);
                 assert_eq!(server.next(), Some(Ok(Ok(good))));
                 let bad = rfb::ServerMessage::FramebufferUpdate(vec![rfb::Rectangle {
@@ -895,15 +1074,9 @@ fn rfb_stream_sessions_negotiate_all_existing_dialects() {
                     .write(server.dialect(), &format(), &mut bytes)
                     .unwrap();
                 assert_eq!(client.push(&bytes), bytes.len());
-                assert_eq!(
-                    client.next(),
-                    Some(Ok(Err(rfb::Error::Rectangle)))
-                );
+                assert_eq!(client.next(), Some(Ok(Err(rfb::Error::Rectangle))));
                 assert_eq!(client.phase(), rfb::Phase::Normal);
-                assert_eq!(
-                    client.next(),
-                    Some(Ok(Ok(rfb::ServerMessage::Bell)))
-                );
+                assert_eq!(client.next(), Some(Ok(Ok(rfb::ServerMessage::Bell))));
                 let req = rfb::ClientMessage::FramebufferUpdateRequest {
                     incremental: false,
                     x: 0,
@@ -914,7 +1087,10 @@ fn rfb_stream_sessions_negotiate_all_existing_dialects() {
                 let bytes = client.send(&req).unwrap();
                 assert_eq!(server.push(&bytes), bytes.len());
                 assert_eq!(server.next(), Some(Ok(Ok(req))));
-                assert_eq!(client.send(&rfb::ClientMessage::SetPixelFormat(format())), Err(rfb::Error::Outstanding));
+                assert_eq!(
+                    client.send(&rfb::ClientMessage::SetPixelFormat(format())),
+                    Err(rfb::Error::Outstanding)
+                );
                 let update = rfb::ServerMessage::FramebufferUpdate(vec![rfb::Rectangle {
                     x: 0,
                     y: 0,
@@ -926,10 +1102,20 @@ fn rfb_stream_sessions_negotiate_all_existing_dialects() {
                 assert_eq!(client.push(&bytes[..4]), 4);
                 assert_eq!(client.next(), None);
                 // A normal send must not reset a partially scanned update.
-                client.send(&rfb::ClientMessage::PointerEvent { buttons: 0, x: 0, y: 0 }).unwrap();
+                client
+                    .send(&rfb::ClientMessage::PointerEvent {
+                        buttons: 0,
+                        x: 0,
+                        y: 0,
+                    })
+                    .unwrap();
                 assert_eq!(client.push(&bytes[4..]), bytes.len() - 4);
                 assert_eq!(client.next(), Some(Ok(Ok(update))));
-                assert!(client.send(&rfb::ClientMessage::SetPixelFormat(format())).is_ok());
+                assert!(
+                    client
+                        .send(&rfb::ClientMessage::SetPixelFormat(format()))
+                        .is_ok()
+                );
                 client.end();
                 assert_eq!(client.next(), None);
                 assert!(client.is_done());
@@ -941,14 +1127,24 @@ fn rfb_stream_sessions_negotiate_all_existing_dialects() {
 #[test]
 fn rfb_sessions_handoff_unsupported_security_and_refusal() {
     let mut server = rfb::Server::new();
-    server.send(&rfb::ServerMessage::Version(rfb::Version::V3_8)).unwrap();
+    server
+        .send(&rfb::ServerMessage::Version(rfb::Version::V3_8))
+        .unwrap();
     let bytes = Wire::to_bytes(&rfb::Version::V3_8).unwrap();
     assert_eq!(server.push(&bytes), bytes.len());
-    assert!(matches!(server.next(), Some(Ok(Ok(rfb::ClientMessage::Version(_))))));
-    server.send(&rfb::ServerMessage::SecurityTypes(vec![42])).unwrap();
+    assert!(matches!(
+        server.next(),
+        Some(Ok(Ok(rfb::ClientMessage::Version(_))))
+    ));
+    server
+        .send(&rfb::ServerMessage::SecurityTypes(vec![42]))
+        .unwrap();
     let bytes = [&[42][..], PAYLOAD].concat();
     assert_eq!(server.push(&bytes), bytes.len());
-    assert_eq!(server.next(), Some(Ok(Ok(rfb::ClientMessage::SecurityType(42)))));
+    assert_eq!(
+        server.next(),
+        Some(Ok(Ok(rfb::ClientMessage::SecurityType(42))))
+    );
     assert_eq!(server.phase(), rfb::Phase::Unsupported(42));
     assert_eq!(server.next(), None);
     assert!(server.is_done());
@@ -957,8 +1153,13 @@ fn rfb_sessions_handoff_unsupported_security_and_refusal() {
     let mut client = rfb::Client::new();
     let bytes = Wire::to_bytes(&rfb::Version::V3_8).unwrap();
     assert_eq!(client.push(&bytes), bytes.len());
-    assert!(matches!(client.next(), Some(Ok(Ok(rfb::ServerMessage::Version(_))))));
-    client.send(&rfb::ClientMessage::Version(rfb::Version::V3_8)).unwrap();
+    assert!(matches!(
+        client.next(),
+        Some(Ok(Ok(rfb::ServerMessage::Version(_))))
+    ));
+    client
+        .send(&rfb::ClientMessage::Version(rfb::Version::V3_8))
+        .unwrap();
     let refusal = rfb::ServerMessage::SecurityFailure(b"no access".to_vec());
     let mut bytes = server_bytes(&refusal, rfb::Dialect::V3_8, &format()).unwrap();
     bytes.extend_from_slice(PAYLOAD);
@@ -982,10 +1183,7 @@ fn rfb_unoffered_security_closes_without_reading_another_choice() {
             .send(&rfb::ServerMessage::SecurityTypes(vec![1]))
             .unwrap();
         assert_eq!(server.push(&[choice, 1]), 2);
-        assert_eq!(
-            server.next(),
-            Some(Ok(Err(rfb::Error::NotOffered(choice))))
-        );
+        assert_eq!(server.next(), Some(Ok(Err(rfb::Error::NotOffered(choice)))));
         assert_eq!(server.phase(), rfb::Phase::Closed);
         assert_eq!(server.next(), None);
         assert!(server.is_done());
@@ -1144,10 +1342,26 @@ fn contract_checks_small_arbitrary_inputs_and_wire_values() {
     for len in 0..80 {
         let bytes = random.bytes(len);
         contract::check_decode_with_alloc_limit(|| proxy::Headers::with_limit(32), &bytes, 2 * 32);
-        contract::check_decode_with_alloc_limit(|| SocksHandshake(socks::ClientMessages::with_limit(16)), &bytes, 2 * 16);
-        contract::check_decode_with_alloc_limit(|| socks::ServerMessages::socks5(socks::Command::Bind), &bytes, 2 * socks::MAX_MESSAGE);
-        contract::check_decode_with_alloc_limit(|| server_decoder(rfb::Phase::Normal, LIMIT), &bytes, 2 * LIMIT);
-        contract::check_decode_with_alloc_limit(|| client_decoder(rfb::Phase::Normal, LIMIT), &bytes, 2 * LIMIT);
+        contract::check_decode_with_alloc_limit(
+            || SocksHandshake(socks::ClientMessages::with_limit(16)),
+            &bytes,
+            2 * 16,
+        );
+        contract::check_decode_with_alloc_limit(
+            || socks::ServerMessages::socks5(socks::Command::Bind),
+            &bytes,
+            2 * socks::MAX_MESSAGE,
+        );
+        contract::check_decode_with_alloc_limit(
+            || server_decoder(rfb::Phase::Normal, LIMIT),
+            &bytes,
+            2 * LIMIT,
+        );
+        contract::check_decode_with_alloc_limit(
+            || client_decoder(rfb::Phase::Normal, LIMIT),
+            &bytes,
+            2 * LIMIT,
+        );
         contract::check_wire::<proxy::Header>(&bytes);
         contract::check_wire::<socks::Greeting>(&bytes);
         contract::check_wire::<socks::AuthRequest>(&bytes);
@@ -1240,10 +1454,7 @@ fn rfb_client_refused_server_init_closes_before_retry() {
     bytes[4] = 24;
     bytes.extend_from_slice(&good);
     assert_eq!(client.push(&bytes), bytes.len());
-    assert_eq!(
-        client.next(),
-        Some(Ok(Err(rfb::Error::PixelFormat)))
-    );
+    assert_eq!(client.next(), Some(Ok(Err(rfb::Error::PixelFormat))));
     assert_eq!(client.phase(), rfb::Phase::Closed);
     assert_eq!(client.next(), None);
     assert!(client.is_done());
@@ -1355,7 +1566,11 @@ fn rfb_client_limits_pending_input_after_turn_change() {
     assert_eq!(client.push(b"discard"), 7);
 }
 
-fn server_bytes(message: &rfb::ServerMessage, dialect: rfb::Dialect, format: &rfb::PixelFormat) -> Result<Vec<u8>, rfb::Error> {
+fn server_bytes(
+    message: &rfb::ServerMessage,
+    dialect: rfb::Dialect,
+    format: &rfb::PixelFormat,
+) -> Result<Vec<u8>, rfb::Error> {
     let mut out = Vec::new();
     message.write(dialect, format, &mut out)?;
     Ok(out)

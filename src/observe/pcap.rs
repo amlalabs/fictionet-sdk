@@ -66,12 +66,20 @@ mod tests {
     /// multiple of four, and the blocks come in the expected order.
     #[test]
     fn blocks_are_well_formed() {
-        let packet = [0x45u8, 0, 0, 21, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1, 7];
-        let file = pcapng(&[(1_700_000_000_000_000, &packet[..])], b"CLIENT_RANDOM aa bb\n");
+        let packet = [
+            0x45u8, 0, 0, 21, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1, 7,
+        ];
+        let file = pcapng(
+            &[(1_700_000_000_000_000, &packet[..])],
+            b"CLIENT_RANDOM aa bb\n",
+        );
         let mut kinds = Vec::new();
         let mut i = 0;
         while i < file.len() {
-            let (kind, len) = (le32(&file, i).unwrap(), le32(&file, i + 4).unwrap() as usize);
+            let (kind, len) = (
+                le32(&file, i).unwrap(),
+                le32(&file, i + 4).unwrap() as usize,
+            );
             assert_eq!(len % 4, 0);
             assert_eq!(le32(&file, i + len - 4).unwrap() as usize, len);
             kinds.push(kind);

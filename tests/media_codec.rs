@@ -1,8 +1,6 @@
 //! RTSP and SIP lines, SDP bodies, recovery, and strict wire values.
 
-use fictionet::stdlib::codec::{
-    Decode, Fail, Lcg, Step, Stream, Wire, finish, pump,
-};
+use fictionet::stdlib::codec::{Decode, Fail, Lcg, Step, Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::{decode_all, mutate};
@@ -12,7 +10,8 @@ const SDP: &[u8] = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=media\r\nt=0 0\r\n";
 const SDP_CALL: &[u8] = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=call\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 49170 RTP/AVP 96\r\na=rtpmap:96 opus/48000/2\r\na=sendonly\r\n";
 
 fn rtsp_body() -> rtsp::Message {
-    let mut message = rtsp::Message::request(rtsp::Version::Rtsp20, "ANNOUNCE", "rtsp://camera/media");
+    let mut message =
+        rtsp::Message::request(rtsp::Version::Rtsp20, "ANNOUNCE", "rtsp://camera/media");
     message.push_header("CSeq", "1");
     message.push_header("Content-Type", "application/sdp");
     message.body = Wire::to_bytes(&<sdp::SessionDescription as Wire>::parse(SDP).unwrap()).unwrap();
@@ -22,7 +21,15 @@ fn rtsp_body() -> rtsp::Message {
 
 fn sip_body() -> sip::Message {
     let mut message = sip::Message::request("INVITE", "sip:alice@example.com");
-    message.push_value("CSeq", &sip::CSeq { seq: 1, method: "INVITE".into() }).unwrap();
+    message
+        .push_value(
+            "CSeq",
+            &sip::CSeq {
+                seq: 1,
+                method: "INVITE".into(),
+            },
+        )
+        .unwrap();
     message.push_header("c", "application/sdp");
     message.body = Wire::to_bytes(&<sdp::SessionDescription as Wire>::parse(SDP).unwrap()).unwrap();
     message.push_header("l", &message.body.len().to_string());
@@ -35,7 +42,10 @@ fn rtsp_stream_round_trip_with_interleaved_media_and_recovery() {
     let mut response = rtsp::Message::response(rtsp::Version::Rtsp10, 204, "No Content");
     // This version and status ignore even an invalid Content-Length.
     response.push_header("Content-Length", "ignored");
-    let binary = rtsp::Interleaved { channel: 7, data: b"$\r\n\r\n\0\xff".to_vec() };
+    let binary = rtsp::Interleaved {
+        channel: 7,
+        data: b"$\r\n\r\n\0\xff".to_vec(),
+    };
     let mut bytes = b"\r\n\n".to_vec();
     Wire::write(&body, &mut bytes).unwrap();
     Wire::write(&binary, &mut bytes).unwrap();
@@ -51,16 +61,27 @@ fn rtsp_stream_round_trip_with_interleaved_media_and_recovery() {
     ];
     contract::check_decode(rtsp::Frames::new, &bytes);
     contract::check_decode_with_held_limit(rtsp::Frames::new, &bytes, 0);
-    assert_eq!(decode_all(rtsp::Frames::new, &bytes), (expected.clone(), None));
+    assert_eq!(
+        decode_all(rtsp::Frames::new, &bytes),
+        (expected.clone(), None)
+    );
     for item in expected.iter().flatten() {
         let encoded = Wire::to_bytes(item).unwrap();
         contract::check_wire::<rtsp::Frame>(&encoded);
         assert_eq!(<rtsp::Frame as Wire>::parse(&encoded), Ok(item.clone()));
-        assert_eq!(decode_all(rtsp::Frames::new, &encoded), (vec![Ok(item.clone())], None));
+        assert_eq!(
+            decode_all(rtsp::Frames::new, &encoded),
+            (vec![Ok(item.clone())], None)
+        );
         if let rtsp::Frame::Message(m) = item {
             contract::check_wire::<rtsp::Message>(&encoded);
             if !m.body.is_empty() {
-                assert_eq!(<sdp::SessionDescription as Wire>::parse(&m.body).unwrap().name, "media");
+                assert_eq!(
+                    <sdp::SessionDescription as Wire>::parse(&m.body)
+                        .unwrap()
+                        .name,
+                    "media"
+                );
             }
         }
     }
@@ -76,15 +97,26 @@ fn sip_stream_round_trip_with_recovery_and_bodiless_response() {
     bytes.extend_from_slice(b"SIP/2.0 200 OK\r\nBad Header\r\nl: 4\r\n\r\nbody");
     Wire::write(&response, &mut bytes).unwrap();
     Wire::write(&body, &mut bytes).unwrap();
-    let expected = vec![Ok(body.clone()), Err(sip::Error::HeaderLine), Ok(response), Ok(body)];
+    let expected = vec![
+        Ok(body.clone()),
+        Err(sip::Error::HeaderLine),
+        Ok(response),
+        Ok(body),
+    ];
     contract::check_decode(sip::Messages::new, &bytes);
     contract::check_decode_with_held_limit(sip::Messages::new, &bytes, 0);
-    assert_eq!(decode_all(sip::Messages::new, &bytes), (expected.clone(), None));
+    assert_eq!(
+        decode_all(sip::Messages::new, &bytes),
+        (expected.clone(), None)
+    );
     for message in expected.iter().flatten() {
         let encoded = Wire::to_bytes(message).unwrap();
         contract::check_wire::<sip::Message>(&encoded);
         assert_eq!(<sip::Message as Wire>::parse(&encoded), Ok(message.clone()));
-        assert_eq!(decode_all(sip::Messages::new, &encoded), (vec![Ok(message.clone())], None));
+        assert_eq!(
+            decode_all(sip::Messages::new, &encoded),
+            (vec![Ok(message.clone())], None)
+        );
         if !message.body.is_empty() {
             contract::check_decode_with_alloc_limit(
                 sdp::SessionDescriptions::new,
@@ -93,7 +125,10 @@ fn sip_stream_round_trip_with_recovery_and_bodiless_response() {
             );
             let (descriptions, failure) = decode_all(sdp::SessionDescriptions::new, &message.body);
             assert_eq!(failure, None);
-            assert_eq!(descriptions, [<sdp::SessionDescription as Wire>::parse(SDP).unwrap()]);
+            assert_eq!(
+                descriptions,
+                [<sdp::SessionDescription as Wire>::parse(SDP).unwrap()]
+            );
         }
     }
 }
@@ -148,7 +183,10 @@ fn complete_raw_spans_and_one_item_per_call() {
 #[test]
 fn sip_bare_lf_ends_the_stream_before_another_message() {
     let bytes = b"INVITE sip:a@b SIP/2.0\r\nl: 0\r\nX: a\n\nINVITE sip:b@c SIP/2.0\r\nl: 0\r\n\r\n";
-    assert_eq!(decode_all(sip::Messages::new, bytes), (vec![], Some(Fail::Protocol(sip::Error::LineEnding))));
+    assert_eq!(
+        decode_all(sip::Messages::new, bytes),
+        (vec![], Some(Fail::Protocol(sip::Error::LineEnding)))
+    );
     contract::check_decode_with_alloc_limit(sip::Messages::new, bytes, 2 * sip::MAX_MESSAGE);
 }
 
@@ -166,7 +204,11 @@ fn rtsp20_bare_lf_ends_the_stream_at_the_head() {
                 decode_all(rtsp::Frames::new, input),
                 (vec![], Some(Fail::Protocol(rtsp::Error::LineEnding)))
             );
-            contract::check_decode_with_alloc_limit(rtsp::Frames::new, input, 2 * rtsp::MAX_MESSAGE);
+            contract::check_decode_with_alloc_limit(
+                rtsp::Frames::new,
+                input,
+                2 * rtsp::MAX_MESSAGE,
+            );
         }
     }
 }
@@ -182,22 +224,40 @@ fn line_endings_and_status_body_rules() {
         (vec![], Some(Fail::Protocol(rtsp::Error::LineEnding)))
     );
     let sip_lf = b"SIP/2.0 200 OK\nl: 1\n\nx";
-    assert_eq!(decode_all(sip::Messages::new, sip_lf), (vec![], Some(Fail::Protocol(sip::Error::LineEnding))));
+    assert_eq!(
+        decode_all(sip::Messages::new, sip_lf),
+        (vec![], Some(Fail::Protocol(sip::Error::LineEnding)))
+    );
     contract::check_decode_with_alloc_limit(rtsp::Frames::new, new_lf, 2 * rtsp::MAX_MESSAGE);
     contract::check_decode_with_alloc_limit(sip::Messages::new, sip_lf, 2 * sip::MAX_MESSAGE);
     for code in [100, 199, 204, 304] {
         for version in [rtsp::Version::Rtsp10, rtsp::Version::Rtsp20] {
-            let text = format!("{} {code} Status\r\nContent-Length: 1\r\n\r\n", version.as_str());
+            let text = format!(
+                "{} {code} Status\r\nContent-Length: 1\r\n\r\n",
+                version.as_str()
+            );
             let mut bytes = text.as_bytes().to_vec();
             if version == rtsp::Version::Rtsp20 {
                 bytes.push(b'x');
             }
             let parsed = <rtsp::Message as Wire>::parse(&bytes).unwrap();
-            assert_eq!(parsed.body, if version == rtsp::Version::Rtsp20 { b"x".to_vec() } else { vec![] });
+            assert_eq!(
+                parsed.body,
+                if version == rtsp::Version::Rtsp20 {
+                    b"x".to_vec()
+                } else {
+                    vec![]
+                }
+            );
             contract::check_wire::<rtsp::Message>(&bytes);
         }
         let bytes = format!("SIP/2.0 {code} Status\r\nl: 1\r\n\r\nx");
-        assert_eq!(<sip::Message as Wire>::parse(bytes.as_bytes()).unwrap().body, b"x");
+        assert_eq!(
+            <sip::Message as Wire>::parse(bytes.as_bytes())
+                .unwrap()
+                .body,
+            b"x"
+        );
     }
     // No length on RTSP means no body; SIP must carry a length even at 100.
     assert!(<rtsp::Message as Wire>::parse(b"RTSP/2.0 200 OK\r\n\r\n").is_ok());
@@ -218,14 +278,25 @@ fn untrusted_lengths_end_the_stream_once() {
         "Content-Length: 999999999999999999999999999999999",
     ] {
         let bytes = format!("RTSP/2.0 200 OK\r\n{headers}\r\n\r\nbody");
-        contract::check_decode_with_alloc_limit(rtsp::Frames::new, bytes.as_bytes(), 2 * rtsp::MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(
+            rtsp::Frames::new,
+            bytes.as_bytes(),
+            2 * rtsp::MAX_MESSAGE,
+        );
         assert!(decode_all(rtsp::Frames::new, bytes.as_bytes()).1.is_some());
         let bytes = format!("SIP/2.0 200 OK\r\n{headers}\r\n\r\nbody");
-        contract::check_decode_with_alloc_limit(sip::Messages::new, bytes.as_bytes(), 2 * sip::MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(
+            sip::Messages::new,
+            bytes.as_bytes(),
+            2 * sip::MAX_MESSAGE,
+        );
         assert!(decode_all(sip::Messages::new, bytes.as_bytes()).1.is_some());
     }
     let repeated = b"SIP/2.0 200 OK\r\nContent-Length: 0\r\nl: 0\r\n\r\n";
-    assert_eq!(decode_all(sip::Messages::new, repeated).1, Some(Fail::Protocol(sip::Error::ContentLength)));
+    assert_eq!(
+        decode_all(sip::Messages::new, repeated).1,
+        Some(Fail::Protocol(sip::Error::ContentLength))
+    );
     let equal = b"RTSP/2.0 200 OK\r\nContent-Length: 01\r\nContent-Length: 1\r\n\r\nx";
     contract::check_wire::<rtsp::Message>(equal);
     assert!(<rtsp::Message as Wire>::parse(equal).is_ok());
@@ -277,7 +348,10 @@ fn sip_datagram_framing_and_limits() {
     contract::check_wire_value(&message);
     assert!(message.to_bytes().is_ok());
     bytes.push(b'x');
-    assert_eq!(sip::Message::read_datagram(&bytes), Err(sip::Error::TooLong));
+    assert_eq!(
+        sip::Message::read_datagram(&bytes),
+        Err(sip::Error::TooLong)
+    );
 
     // Discarded bytes do not count against the body or message limit.
     let mut bytes = b"SIP/2.0 200 OK\r\nl: 01\r\n\r\na".to_vec();
@@ -286,9 +360,15 @@ fn sip_datagram_framing_and_limits() {
     assert_eq!(message.body, b"a");
     assert_eq!(message.header("l"), Some("01"));
     contract::check_wire_value(&message);
-    assert_eq!(sip::Message::read_datagram(&message.to_bytes().unwrap()), Ok(message));
+    assert_eq!(
+        sip::Message::read_datagram(&message.to_bytes().unwrap()),
+        Ok(message)
+    );
     let declared = format!("SIP/2.0 200 OK\r\nl: {}\r\n\r\n", sip::MAX_BODY + 1);
-    assert_eq!(sip::Message::read_datagram(declared.as_bytes()), Err(sip::Error::TooLong));
+    assert_eq!(
+        sip::Message::read_datagram(declared.as_bytes()),
+        Err(sip::Error::TooLong)
+    );
 
     let mut head = b"SIP/2.0 200 OK\r\nX: ".to_vec();
     head.resize(sip::MAX_HEAD - 4, b'a');
@@ -300,9 +380,18 @@ fn sip_datagram_framing_and_limits() {
     assert_eq!(message.to_bytes(), Err(sip::Error::TooLong));
     head.insert(head.len() - 4, b'a');
     assert_eq!(sip::Message::read_datagram(&head), Err(sip::Error::TooLong));
-    assert_eq!(sip::Message::read_datagram(&vec![b'a'; sip::MAX_HEAD]), Err(sip::Error::TooLong));
-    let headers = format!("SIP/2.0 200 OK\r\n{}\r\n", "X: a\r\n".repeat(sip::MAX_HEADERS + 1));
-    assert_eq!(sip::Message::read_datagram(headers.as_bytes()), Err(sip::Error::TooMany));
+    assert_eq!(
+        sip::Message::read_datagram(&vec![b'a'; sip::MAX_HEAD]),
+        Err(sip::Error::TooLong)
+    );
+    let headers = format!(
+        "SIP/2.0 200 OK\r\n{}\r\n",
+        "X: a\r\n".repeat(sip::MAX_HEADERS + 1)
+    );
+    assert_eq!(
+        sip::Message::read_datagram(headers.as_bytes()),
+        Err(sip::Error::TooMany)
+    );
 }
 
 #[test]
@@ -311,15 +400,30 @@ fn exact_parsers_and_transactional_writers_preserve_fields() {
     let sip = b"SIP/2.0 200 OK\r\nl: 01\r\nX: a\r\n b\r\n\r\nx";
     let mut r = <rtsp::Message as Wire>::parse(rtsp).unwrap();
     let mut s = <sip::Message as Wire>::parse(sip).unwrap();
-    assert_eq!(Wire::to_bytes(&r).unwrap(), b"RTSP/1.0 200 OK\r\ncontent-length: 01\r\nX: a b\r\n\r\nx");
-    assert_eq!(Wire::to_bytes(&s).unwrap(), b"SIP/2.0 200 OK\r\nl: 01\r\nX: a b\r\n\r\nx");
+    assert_eq!(
+        Wire::to_bytes(&r).unwrap(),
+        b"RTSP/1.0 200 OK\r\ncontent-length: 01\r\nX: a b\r\n\r\nx"
+    );
+    assert_eq!(
+        Wire::to_bytes(&s).unwrap(),
+        b"SIP/2.0 200 OK\r\nl: 01\r\nX: a b\r\n\r\nx"
+    );
     assert_eq!(
         <rtsp::Message as Wire>::parse(&[rtsp.as_slice(), b"junk"].concat()),
         Err(rtsp::Error::Trailing)
     );
-    assert_eq!(<sip::Message as Wire>::parse(&[sip.as_slice(), b"junk"].concat()), Err(sip::Error::Trailing));
-    assert_eq!(<rtsp::Interleaved as Wire>::parse(b"$\0\0\0junk"), Err(rtsp::Error::Trailing));
-    assert_eq!(sip::Message::parse(b"SIP/2.0 200 OK\r\n\r\nbody"), Err(sip::Error::MissingContentLength));
+    assert_eq!(
+        <sip::Message as Wire>::parse(&[sip.as_slice(), b"junk"].concat()),
+        Err(sip::Error::Trailing)
+    );
+    assert_eq!(
+        <rtsp::Interleaved as Wire>::parse(b"$\0\0\0junk"),
+        Err(rtsp::Error::Trailing)
+    );
+    assert_eq!(
+        sip::Message::parse(b"SIP/2.0 200 OK\r\n\r\nbody"),
+        Err(sip::Error::MissingContentLength)
+    );
     for bad in [" leading", "trailing ", "a\r\nInjected: x", "\0"] {
         r.headers[1].value = bad.into();
         s.headers[1].value = bad.into();
@@ -342,7 +446,8 @@ fn exact_parsers_and_transactional_writers_preserve_fields() {
 #[test]
 fn wire_body_length_mismatches_are_unwritable() {
     for (length, body) in [("5", &b"ab"[..]), ("5", b"abcdefg"), ("0", b"x")] {
-        let mut r = rtsp::Message::request(rtsp::Version::Rtsp20, "ANNOUNCE", "rtsp://camera/media");
+        let mut r =
+            rtsp::Message::request(rtsp::Version::Rtsp20, "ANNOUNCE", "rtsp://camera/media");
         r.push_header("Content-Length", length);
         r.body = body.to_vec();
         let mut out = b"prefix".to_vec();
@@ -361,8 +466,16 @@ fn wire_body_length_mismatches_are_unwritable() {
 #[test]
 fn wire_writers_preserve_syntax_and_limit_errors() {
     for (length, rtsp_error, sip_error) in [
-        ("invalid".to_owned(), rtsp::Error::ContentLength, sip::Error::ContentLength),
-        ((rtsp::MAX_BODY + 1).to_string(), rtsp::Error::TooLong, sip::Error::TooLong),
+        (
+            "invalid".to_owned(),
+            rtsp::Error::ContentLength,
+            sip::Error::ContentLength,
+        ),
+        (
+            (rtsp::MAX_BODY + 1).to_string(),
+            rtsp::Error::TooLong,
+            sip::Error::TooLong,
+        ),
     ] {
         let mut r = rtsp::Message::response(rtsp::Version::Rtsp20, 200, "OK");
         r.push_header("Content-Length", &length);
@@ -378,20 +491,37 @@ fn wire_writers_preserve_syntax_and_limit_errors() {
 
 #[test]
 fn partial_units_are_driver_truncation() {
-    for bytes in
-        [&b"RTSP/2.0"[..], b"RTSP/2.0 200 OK\r\n", b"RTSP/2.0 200 OK\r\nContent-Length: 2\r\n\r\nx", b"$\0\0\x02x"]
-    {
+    for bytes in [
+        &b"RTSP/2.0"[..],
+        b"RTSP/2.0 200 OK\r\n",
+        b"RTSP/2.0 200 OK\r\nContent-Length: 2\r\n\r\nx",
+        b"$\0\0\x02x",
+    ] {
         contract::check_decode_with_alloc_limit(rtsp::Frames::new, bytes, 2 * rtsp::MAX_MESSAGE);
         assert_eq!(
             decode_all(rtsp::Frames::new, bytes),
-            (vec![], Some(Fail::Truncated { unread: bytes.len() }))
+            (
+                vec![],
+                Some(Fail::Truncated {
+                    unread: bytes.len()
+                })
+            )
         );
     }
-    for bytes in [&b"SIP/2.0"[..], b"SIP/2.0 200 OK\r\n", b"SIP/2.0 200 OK\r\nl: 2\r\n\r\nx"] {
+    for bytes in [
+        &b"SIP/2.0"[..],
+        b"SIP/2.0 200 OK\r\n",
+        b"SIP/2.0 200 OK\r\nl: 2\r\n\r\nx",
+    ] {
         contract::check_decode_with_alloc_limit(sip::Messages::new, bytes, 2 * sip::MAX_MESSAGE);
         assert_eq!(
             decode_all(sip::Messages::new, bytes),
-            (vec![], Some(Fail::Truncated { unread: bytes.len() }))
+            (
+                vec![],
+                Some(Fail::Truncated {
+                    unread: bytes.len()
+                })
+            )
         );
     }
 }
@@ -401,17 +531,40 @@ fn named_limits_bound_lines_heads_bodies_and_counts() {
     let long = vec![b'x'; rtsp::MAX_LINE + 2];
     contract::check_decode_with_alloc_limit(rtsp::Frames::new, &long, 2 * rtsp::MAX_MESSAGE);
     contract::check_decode_with_alloc_limit(sip::Messages::new, &long, 2 * sip::MAX_MESSAGE);
-    assert_eq!(decode_all(rtsp::Frames::new, &long).1, Some(Fail::Protocol(rtsp::Error::TooLong)));
-    assert_eq!(decode_all(sip::Messages::new, &long).1, Some(Fail::Protocol(sip::Error::TooLong)));
-    for (start, max) in [("RTSP/2.0 200 OK", rtsp::MAX_HEAD), ("SIP/2.0 200 OK", sip::MAX_HEAD)] {
+    assert_eq!(
+        decode_all(rtsp::Frames::new, &long).1,
+        Some(Fail::Protocol(rtsp::Error::TooLong))
+    );
+    assert_eq!(
+        decode_all(sip::Messages::new, &long).1,
+        Some(Fail::Protocol(sip::Error::TooLong))
+    );
+    for (start, max) in [
+        ("RTSP/2.0 200 OK", rtsp::MAX_HEAD),
+        ("SIP/2.0 200 OK", sip::MAX_HEAD),
+    ] {
         let mut bytes = format!("{start}\r\nX: ").into_bytes();
         bytes.resize(max, b'a');
         if start.starts_with("RTSP") {
-            contract::check_decode_with_alloc_limit(rtsp::Frames::new, &bytes, 2 * rtsp::MAX_MESSAGE);
-            assert_eq!(decode_all(rtsp::Frames::new, &bytes).1, Some(Fail::Protocol(rtsp::Error::TooLong)));
+            contract::check_decode_with_alloc_limit(
+                rtsp::Frames::new,
+                &bytes,
+                2 * rtsp::MAX_MESSAGE,
+            );
+            assert_eq!(
+                decode_all(rtsp::Frames::new, &bytes).1,
+                Some(Fail::Protocol(rtsp::Error::TooLong))
+            );
         } else {
-            contract::check_decode_with_alloc_limit(sip::Messages::new, &bytes, 2 * sip::MAX_MESSAGE);
-            assert_eq!(decode_all(sip::Messages::new, &bytes).1, Some(Fail::Protocol(sip::Error::TooLong)));
+            contract::check_decode_with_alloc_limit(
+                sip::Messages::new,
+                &bytes,
+                2 * sip::MAX_MESSAGE,
+            );
+            assert_eq!(
+                decode_all(sip::Messages::new, &bytes).1,
+                Some(Fail::Protocol(sip::Error::TooLong))
+            );
         }
     }
     let mut r = rtsp_body();
@@ -422,7 +575,10 @@ fn named_limits_bound_lines_heads_bodies_and_counts() {
     s.set_header("l", &s.body.len().to_string());
     let rb = Wire::to_bytes(&r).unwrap();
     let sb = Wire::to_bytes(&s).unwrap();
-    assert_eq!(decode_all(rtsp::Frames::new, &rb).0, [Ok(rtsp::Frame::Message(r.clone()))]);
+    assert_eq!(
+        decode_all(rtsp::Frames::new, &rb).0,
+        [Ok(rtsp::Frame::Message(r.clone()))]
+    );
     assert_eq!(decode_all(sip::Messages::new, &sb).0, [Ok(s.clone())]);
     r.body.push(0);
     s.body.push(0);
@@ -444,37 +600,66 @@ fn named_limits_bound_lines_heads_bodies_and_counts() {
     assert_eq!(failure, None);
     assert_eq!(items[0], Err(sip::Error::TooMany));
     assert!(items[1].is_ok());
-    let frame = rtsp::Interleaved { channel: 255, data: vec![0xff; rtsp::MAX_INTERLEAVED] };
+    let frame = rtsp::Interleaved {
+        channel: 255,
+        data: vec![0xff; rtsp::MAX_INTERLEAVED],
+    };
     let bytes = Wire::to_bytes(&frame).unwrap();
     contract::check_wire::<rtsp::Interleaved>(&bytes);
-    assert_eq!(decode_all(rtsp::Frames::new, &bytes).0, [Ok(rtsp::Frame::Interleaved(frame))]);
+    assert_eq!(
+        decode_all(rtsp::Frames::new, &bytes).0,
+        [Ok(rtsp::Frame::Interleaved(frame))]
+    );
 }
 
 #[test]
 fn need_never_holds_input_and_large_direct_slices_stay_bounded() {
     let mut r = rtsp::Frames::new();
     let mut s = sip::Messages::new();
-    assert_eq!(r.decode(b"RTSP/2.0 200 OK\r\nContent-Length: 4\r\n\r\nx", false), Ok(Step::Need));
-    assert_eq!(s.decode(b"SIP/2.0 200 OK\r\nl: 4\r\n\r\nx", false), Ok(Step::Need));
+    assert_eq!(
+        r.decode(b"RTSP/2.0 200 OK\r\nContent-Length: 4\r\n\r\nx", false),
+        Ok(Step::Need)
+    );
+    assert_eq!(
+        s.decode(b"SIP/2.0 200 OK\r\nl: 4\r\n\r\nx", false),
+        Ok(Step::Need)
+    );
     assert_eq!(r.held(), 0);
     assert_eq!(s.held(), 0);
     let bytes = vec![b'x'; rtsp::MAX_MESSAGE + 10];
-    assert_eq!(rtsp::Frames::new().decode(&bytes, false), Err(rtsp::Error::TooLong));
-    assert_eq!(sip::Messages::new().decode(&bytes, false), Err(sip::Error::TooLong));
+    assert_eq!(
+        rtsp::Frames::new().decode(&bytes, false),
+        Err(rtsp::Error::TooLong)
+    );
+    assert_eq!(
+        sip::Messages::new().decode(&bytes, false),
+        Err(sip::Error::TooLong)
+    );
 }
 
 #[test]
 fn codec_contracts_on_mutated_messages() {
     let mut rng = Lcg::new(0x0516_0554);
-    let seeds = [Wire::to_bytes(&rtsp_body()).unwrap(), Wire::to_bytes(&sip_body()).unwrap()];
+    let seeds = [
+        Wire::to_bytes(&rtsp_body()).unwrap(),
+        Wire::to_bytes(&sip_body()).unwrap(),
+    ];
     for seed in &seeds {
         for _ in 0..100 {
             let mut bytes = seed.clone();
             for _ in 0..3 {
                 mutate(&mut rng, &mut bytes);
             }
-            contract::check_decode_with_alloc_limit(rtsp::Frames::new, &bytes, 2 * rtsp::MAX_MESSAGE);
-            contract::check_decode_with_alloc_limit(sip::Messages::new, &bytes, 2 * sip::MAX_MESSAGE);
+            contract::check_decode_with_alloc_limit(
+                rtsp::Frames::new,
+                &bytes,
+                2 * rtsp::MAX_MESSAGE,
+            );
+            contract::check_decode_with_alloc_limit(
+                sip::Messages::new,
+                &bytes,
+                2 * sip::MAX_MESSAGE,
+            );
             contract::check_wire::<rtsp::Message>(&bytes);
             contract::check_wire::<rtsp::Frame>(&bytes);
             contract::check_wire::<sip::Message>(&bytes);
@@ -511,12 +696,24 @@ fn head_limit_accepts_exact_fit_and_wire_refuses_canonical_expansion() {
     sb[sat] = b'a';
     assert!(decode_all(rtsp::Frames::new, &rb).0[0].is_ok());
     assert!(decode_all(sip::Messages::new, &sb).0[0].is_ok());
-    assert_eq!(<rtsp::Message as Wire>::parse(&rb), Err(rtsp::Error::TooLong));
+    assert_eq!(
+        <rtsp::Message as Wire>::parse(&rb),
+        Err(rtsp::Error::TooLong)
+    );
     assert_eq!(<sip::Message as Wire>::parse(&sb), Err(sip::Error::TooLong));
-    let rb = format!("RTSP/2.0 200 OK\r\nContent-Length: {}\r\n\r\n", rtsp::MAX_BODY + 1);
+    let rb = format!(
+        "RTSP/2.0 200 OK\r\nContent-Length: {}\r\n\r\n",
+        rtsp::MAX_BODY + 1
+    );
     let sb = format!("SIP/2.0 200 OK\r\nl: {}\r\n\r\n", sip::MAX_BODY + 1);
-    assert_eq!(decode_all(rtsp::Frames::new, rb.as_bytes()).1, Some(Fail::Protocol(rtsp::Error::TooLong)));
-    assert_eq!(decode_all(sip::Messages::new, sb.as_bytes()).1, Some(Fail::Protocol(sip::Error::TooLong)));
+    assert_eq!(
+        decode_all(rtsp::Frames::new, rb.as_bytes()).1,
+        Some(Fail::Protocol(rtsp::Error::TooLong))
+    );
+    assert_eq!(
+        decode_all(sip::Messages::new, sb.as_bytes()).1,
+        Some(Fail::Protocol(sip::Error::TooLong))
+    );
 }
 
 #[test]
@@ -534,7 +731,10 @@ fn header_writers_refuse_empty_display_names() {
     // Received empty display names still normalize to an absent name.
     let bytes = b"\"\" <sip:a@b>";
     contract::check_wire::<sip::NameAddr>(bytes);
-    assert_eq!(sip::NameAddr::parse(bytes).unwrap(), sip::NameAddr::new("sip:a@b"));
+    assert_eq!(
+        sip::NameAddr::parse(bytes).unwrap(),
+        sip::NameAddr::new("sip:a@b")
+    );
 }
 
 #[test]
@@ -556,7 +756,9 @@ fn rtsp_header_values_and_transport_lists_have_byte_limits() {
     let mut out = b"prefix".to_vec();
     assert_eq!(too_long.write(&mut out), Err(rtsp::Error::TooLong));
     assert_eq!(out, b"prefix");
-    let list = rtsp::Transports { values: vec![transport.clone(), transport] };
+    let list = rtsp::Transports {
+        values: vec![transport.clone(), transport],
+    };
     contract::check_wire_value(&list);
     assert_eq!(list.write(&mut out), Err(rtsp::Error::TooLong));
     assert_eq!(out, b"prefix");
@@ -574,8 +776,14 @@ fn sip_header_readers_refuse_canonical_expansion_over_the_limit() {
     // The name-addr writer must add angle brackets around the same URI.
     contract::check_wire::<sip::NameAddr>(uri.as_bytes());
     contract::check_wire::<sip::Contacts>(uri.as_bytes());
-    assert_eq!(sip::NameAddr::parse(uri.as_bytes()), Err(sip::Error::TooLong));
-    assert_eq!(sip::Contacts::parse(uri.as_bytes()), Err(sip::Error::TooLong));
+    assert_eq!(
+        sip::NameAddr::parse(uri.as_bytes()),
+        Err(sip::Error::TooLong)
+    );
+    assert_eq!(
+        sip::Contacts::parse(uri.as_bytes()),
+        Err(sip::Error::TooLong)
+    );
 }
 
 #[test]
@@ -670,7 +878,11 @@ fn sdp_rejects_oversize_lines_and_bodies() {
     }
     let mut lines = b"v=0\no=- 1 1 IN IP4 192.0.2.1\ns=x\nt=0 0\n".to_vec();
     lines.extend_from_slice(&b"a=x\n".repeat(sdp::MAX_LINES - 4));
-    assert!(decode_all(sdp::SessionDescriptions::new, &lines).1.is_none());
+    assert!(
+        decode_all(sdp::SessionDescriptions::new, &lines)
+            .1
+            .is_none()
+    );
     lines.extend_from_slice(b"a=x\n");
     assert_eq!(
         decode_all(sdp::SessionDescriptions::new, &lines),

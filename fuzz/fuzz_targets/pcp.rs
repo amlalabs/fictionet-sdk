@@ -2,8 +2,8 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::pcp::*;
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 use std::net::Ipv4Addr;
 
@@ -31,9 +31,15 @@ fuzz_target!(|data: &[u8]| {
         let reply = error_reply(b, ResultCode::MalformedRequest, 30, 1);
         contract::check_wire_value(&reply);
         let bytes = reply.to_bytes().unwrap();
-        let body = b.get(HEADER_LEN..b.len().min(MAX_MESSAGE)).unwrap_or_default();
+        let body = b
+            .get(HEADER_LEN..b.len().min(MAX_MESSAGE))
+            .unwrap_or_default();
         assert_eq!(&bytes[HEADER_LEN..HEADER_LEN + body.len()], body);
-        assert!(bytes[HEADER_LEN + body.len()..].iter().all(|&byte| byte == 0));
+        assert!(
+            bytes[HEADER_LEN + body.len()..]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
         for speaks in [Speaks::Pcp, Speaks::NatPmp, Speaks::Both] {
             if let Incoming::Reply(reply) = receive(b, speaks, source, 11) {
                 contract::check_wire_value(&reply);
@@ -42,7 +48,10 @@ fuzz_target!(|data: &[u8]| {
                 // RFC 6886 section 3.5 writes the unsupported-version reply
                 // with opcode 0, so a NAT-PMP server reads it back as an
                 // external address request. Every other reply is ignored.
-                if !matches!(reply, Reply::NatPmp(NatPmpResponse::UnsupportedVersion { .. })) {
+                if !matches!(
+                    reply,
+                    Reply::NatPmp(NatPmpResponse::UnsupportedVersion { .. })
+                ) {
                     assert_eq!(receive(&bytes, speaks, source, 11), Incoming::Ignore);
                 }
             }

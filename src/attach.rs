@@ -57,7 +57,10 @@ enum Link {
     Socket(SocketLink),
     /// What [`Attachments::map`] made from another attachment, and a check
     /// for whether that attachment's sandbox has detached.
-    Mapped { interface: Box<dyn Interface>, gone: Arc<dyn Fn() -> bool + Send + Sync> },
+    Mapped {
+        interface: Box<dyn Interface>,
+        gone: Arc<dyn Fn() -> bool + Send + Sync>,
+    },
 }
 
 impl Attachment {
@@ -101,21 +104,32 @@ impl Attachment {
     pub(crate) fn from_socket(name: String, mtu: u16, link: SocketLink) -> Attachment {
         let meter = Meter::new();
         meter.set_sandbox(&name);
-        Attachment { name, mtu, link: Link::Socket(link), meter, seen: 0, wraps: Vec::new() }
+        Attachment {
+            name,
+            mtu,
+            link: Link::Socket(link),
+            meter,
+            seen: 0,
+            wraps: Vec::new(),
+        }
     }
 
     /// Runs the wraps still waiting, in the order they were added. Called
     /// when the world takes the attachment.
     fn unwrap_pending(mut self) -> Attachment {
         let wraps = std::mem::take(&mut self.wraps);
-        wraps.into_iter().fold(self, |attachment, wrap| wrap(attachment))
+        wraps
+            .into_iter()
+            .fold(self, |attachment, wrap| wrap(attachment))
     }
-
 }
 
 impl std::fmt::Debug for Attachment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Attachment").field("name", &self.name).field("mtu", &self.mtu).finish()
+        f.debug_struct("Attachment")
+            .field("name", &self.name)
+            .field("mtu", &self.mtu)
+            .finish()
     }
 }
 
@@ -276,7 +290,10 @@ impl Attacher {
         if !state.names.insert(name.to_owned()) {
             return Err(AttachError::Taken);
         }
-        Ok(NameGuard { hub: self.hub.clone(), name: name.to_owned() })
+        Ok(NameGuard {
+            hub: self.hub.clone(),
+            name: name.to_owned(),
+        })
     }
 
     /// Ready once the [`Attachments`] is dropped. Until then, `cx`'s waker is
@@ -478,13 +495,23 @@ impl Attachments {
                 // sandbox's own attachment keeps them.
                 let (wrap, fcx) = (wrap.clone(), fcx.clone());
                 sandbox.wraps.push(Box::new(move |sandbox: Attachment| {
-                    let (name, mtu, gone) = (sandbox.name.clone(), sandbox.mtu, sandbox.detached_check());
-                    let interface = Box::new((wrap.lock().unwrap_or_else(|e| e.into_inner()))(&fcx, sandbox));
+                    let (name, mtu, gone) =
+                        (sandbox.name.clone(), sandbox.mtu, sandbox.detached_check());
+                    let interface = Box::new((wrap.lock().unwrap_or_else(|e| e.into_inner()))(
+                        &fcx, sandbox,
+                    ));
                     // The wrapped interface counts its own packets, so this
                     // meter stays unused: `observe_link` hands out the
                     // interface's.
                     let link = Link::Mapped { interface, gone };
-                    Attachment { name, mtu, link, meter: Meter::new(), seen: 0, wraps: Vec::new() }
+                    Attachment {
+                        name,
+                        mtu,
+                        link,
+                        meter: Meter::new(),
+                        seen: 0,
+                        wraps: Vec::new(),
+                    }
                 }));
                 out.deliver(sandbox);
             }
@@ -510,11 +537,18 @@ impl Attachments {
                 state.graph = Arc::downgrade(fcx.graph());
             }
             if state.pending.iter().any(Attachment::detached) {
-                let (dead, live) = std::mem::take(&mut state.pending).into_iter().partition(Attachment::detached);
+                let (dead, live) = std::mem::take(&mut state.pending)
+                    .into_iter()
+                    .partition(Attachment::detached);
                 state.pending = live;
                 gone = dead;
             }
-            if let Some(found) = state.pending.iter().position(&wanted).and_then(|i| state.pending.remove(i)) {
+            if let Some(found) = state
+                .pending
+                .iter()
+                .position(&wanted)
+                .and_then(|i| state.pending.remove(i))
+            {
                 drop(state);
                 drop(gone);
                 return Poll::Ready(Ok(found));

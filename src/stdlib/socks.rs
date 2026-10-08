@@ -93,86 +93,123 @@ macro_rules! socks_wire {
     };
 }
 
-socks_wire!(Greeting, "Reads one SOCKS5 greeting. Empty method lists are accepted.",
-    "Refuses more than `MAX_METHODS` methods and `Other` variants with named codes.", |value, out| {
-    if value.methods.len() > MAX_METHODS || value.methods.iter().any(|m| Method::from_code(m.code()) != *m) {
-        return Err(Error::Unwritable);
-    }
-    out.extend_from_slice(&[VERSION_5, value.methods.len() as u8]);
-    out.extend(value.methods.iter().map(|m| m.code()));
-});
-socks_wire!(Selection, "Reads one SOCKS5 method selection.",
-    "Refuses `Other` variants with named method codes.", |value, out| {
-    if Method::from_code(value.method.code()) != value.method {
-        return Err(Error::Unwritable);
-    }
-    out.extend_from_slice(&[VERSION_5, value.method.code()]);
-});
-socks_wire!(AuthRequest, "Reads one RFC 1929 login. Empty fields are accepted.",
-    "Refuses usernames or passwords longer than 255 bytes.", |value, out| {
-    if value.username.len() > MAX_USERNAME || value.password.len() > MAX_PASSWORD {
-        return Err(Error::Unwritable);
-    }
-    out.extend_from_slice(&[AUTH_VERSION, value.username.len() as u8]);
-    out.extend_from_slice(&value.username);
-    out.push(value.password.len() as u8);
-    out.extend_from_slice(&value.password);
-});
-socks_wire!(AuthReply, "Reads one RFC 1929 status. Any nonzero status means failure.",
-    "Accepts every status byte; no values are refused.", |value, out| {
-    out.extend_from_slice(&[AUTH_VERSION, value.status]);
-});
-socks_wire!(Request, "Reads one SOCKS5 request. Refuses unknown commands and nonzero reserved bytes.",
-    "Refuses domain names longer than `MAX_DOMAIN` bytes.", |value, out| {
-    out.extend_from_slice(&[VERSION_5, value.command.code(), 0]);
-    Endpoint::from_address(&value.address, value.port)?.write(out)?;
-});
-socks_wire!(Reply, "Reads one SOCKS5 reply. Refuses nonzero reserved bytes.",
-    "Refuses oversized domains and `Other` variants with named reply codes.", |value, out| {
-    if ReplyCode::from_code(value.code.code()) != value.code {
-        return Err(Error::Unwritable);
-    }
-    out.extend_from_slice(&[VERSION_5, value.code.code(), 0]);
-    Endpoint::from_address(&value.address, value.port)?.write(out)?;
-});
-socks_wire!(Socks4Request, "Reads one SOCKS4 request. A 0.0.0.x address with nonzero x selects SOCKS4a. Refuses unknown commands and unterminated fields past their limits.",
-    "Refuses SOCKS4a marker IPs, zero bytes in fields and fields longer than 255 bytes.", |value, out| {
-    if value.user_id.len() > MAX_USER_ID || value.user_id.contains(&0) {
-        return Err(Error::Unwritable);
-    }
-    let ip = match &value.destination {
-        Socks4Destination::Ip(ip) => {
-            if matches!(ip.octets(), [0, 0, 0, x] if x != 0) {
-                return Err(Error::Unwritable);
-            }
-            ip.octets()
+socks_wire!(
+    Greeting,
+    "Reads one SOCKS5 greeting. Empty method lists are accepted.",
+    "Refuses more than `MAX_METHODS` methods and `Other` variants with named codes.",
+    |value, out| {
+        if value.methods.len() > MAX_METHODS
+            || value
+                .methods
+                .iter()
+                .any(|m| Method::from_code(m.code()) != *m)
+        {
+            return Err(Error::Unwritable);
         }
-        Socks4Destination::Domain(d) => {
-            if d.len() > MAX_SOCKS4_DOMAIN || d.contains(&0) {
-                return Err(Error::Unwritable);
-            }
-            [0, 0, 0, 1]
+        out.extend_from_slice(&[VERSION_5, value.methods.len() as u8]);
+        out.extend(value.methods.iter().map(|m| m.code()));
+    }
+);
+socks_wire!(
+    Selection,
+    "Reads one SOCKS5 method selection.",
+    "Refuses `Other` variants with named method codes.",
+    |value, out| {
+        if Method::from_code(value.method.code()) != value.method {
+            return Err(Error::Unwritable);
         }
-    };
-    out.extend_from_slice(&[VERSION_4, value.command.code()]);
-    out.extend_from_slice(&value.port.to_be_bytes());
-    out.extend_from_slice(&ip);
-    out.extend_from_slice(&value.user_id);
-    out.push(0);
-    if let Socks4Destination::Domain(d) = &value.destination {
-        out.extend_from_slice(d);
+        out.extend_from_slice(&[VERSION_5, value.method.code()]);
+    }
+);
+socks_wire!(
+    AuthRequest,
+    "Reads one RFC 1929 login. Empty fields are accepted.",
+    "Refuses usernames or passwords longer than 255 bytes.",
+    |value, out| {
+        if value.username.len() > MAX_USERNAME || value.password.len() > MAX_PASSWORD {
+            return Err(Error::Unwritable);
+        }
+        out.extend_from_slice(&[AUTH_VERSION, value.username.len() as u8]);
+        out.extend_from_slice(&value.username);
+        out.push(value.password.len() as u8);
+        out.extend_from_slice(&value.password);
+    }
+);
+socks_wire!(
+    AuthReply,
+    "Reads one RFC 1929 status. Any nonzero status means failure.",
+    "Accepts every status byte; no values are refused.",
+    |value, out| {
+        out.extend_from_slice(&[AUTH_VERSION, value.status]);
+    }
+);
+socks_wire!(
+    Request,
+    "Reads one SOCKS5 request. Refuses unknown commands and nonzero reserved bytes.",
+    "Refuses domain names longer than `MAX_DOMAIN` bytes.",
+    |value, out| {
+        out.extend_from_slice(&[VERSION_5, value.command.code(), 0]);
+        Endpoint::from_address(&value.address, value.port)?.write(out)?;
+    }
+);
+socks_wire!(
+    Reply,
+    "Reads one SOCKS5 reply. Refuses nonzero reserved bytes.",
+    "Refuses oversized domains and `Other` variants with named reply codes.",
+    |value, out| {
+        if ReplyCode::from_code(value.code.code()) != value.code {
+            return Err(Error::Unwritable);
+        }
+        out.extend_from_slice(&[VERSION_5, value.code.code(), 0]);
+        Endpoint::from_address(&value.address, value.port)?.write(out)?;
+    }
+);
+socks_wire!(
+    Socks4Request,
+    "Reads one SOCKS4 request. A 0.0.0.x address with nonzero x selects SOCKS4a. Refuses unknown commands and unterminated fields past their limits.",
+    "Refuses SOCKS4a marker IPs, zero bytes in fields and fields longer than 255 bytes.",
+    |value, out| {
+        if value.user_id.len() > MAX_USER_ID || value.user_id.contains(&0) {
+            return Err(Error::Unwritable);
+        }
+        let ip = match &value.destination {
+            Socks4Destination::Ip(ip) => {
+                if matches!(ip.octets(), [0, 0, 0, x] if x != 0) {
+                    return Err(Error::Unwritable);
+                }
+                ip.octets()
+            }
+            Socks4Destination::Domain(d) => {
+                if d.len() > MAX_SOCKS4_DOMAIN || d.contains(&0) {
+                    return Err(Error::Unwritable);
+                }
+                [0, 0, 0, 1]
+            }
+        };
+        out.extend_from_slice(&[VERSION_4, value.command.code()]);
+        out.extend_from_slice(&value.port.to_be_bytes());
+        out.extend_from_slice(&ip);
+        out.extend_from_slice(&value.user_id);
         out.push(0);
+        if let Socks4Destination::Domain(d) = &value.destination {
+            out.extend_from_slice(d);
+            out.push(0);
+        }
     }
-});
-socks_wire!(Socks4Reply, "Reads one eight-byte SOCKS4 reply. Refuses a nonzero version byte.",
-    "Refuses `Other` variants with named reply codes.", |value, out| {
-    if Socks4Code::from_code(value.code.code()) != value.code {
-        return Err(Error::Unwritable);
+);
+socks_wire!(
+    Socks4Reply,
+    "Reads one eight-byte SOCKS4 reply. Refuses a nonzero version byte.",
+    "Refuses `Other` variants with named reply codes.",
+    |value, out| {
+        if Socks4Code::from_code(value.code.code()) != value.code {
+            return Err(Error::Unwritable);
+        }
+        out.extend_from_slice(&[VERSION_4_REPLY, value.code.code()]);
+        out.extend_from_slice(&value.port.to_be_bytes());
+        out.extend_from_slice(&value.ip.octets());
     }
-    out.extend_from_slice(&[VERSION_4_REPLY, value.code.code()]);
-    out.extend_from_slice(&value.port.to_be_bytes());
-    out.extend_from_slice(&value.ip.octets());
-});
+);
 
 /// An address type, address and port, shared by SOCKS5 requests and replies.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,26 +226,39 @@ impl Endpoint {
         if matches!(address, Address::Domain(d) if d.len() > MAX_DOMAIN) {
             return Err(Error::Unwritable);
         }
-        Ok(Self { address: address.clone(), port })
+        Ok(Self {
+            address: address.clone(),
+            port,
+        })
     }
 
     fn parse_prefix(b: &[u8]) -> Result<Option<(Self, usize)>, Error> {
         Ok(parse_endpoint(b, 0)?.map(|(address, port, used)| (Self { address, port }, used)))
     }
 }
-socks_wire!(Endpoint, "Reads one SOCKS5 endpoint. Refuses unknown address types.",
-    "Refuses domain names longer than `MAX_DOMAIN` bytes.", |value, out| {
-    match &value.address {
-        Address::Ipv4(a) => { out.push(atyp::IPV4); out.extend_from_slice(&a.octets()); }
-        Address::Ipv6(a) => { out.push(atyp::IPV6); out.extend_from_slice(&a.octets()); }
-        Address::Domain(d) => {
-            let len = u8::try_from(d.len()).map_err(|_| Error::Unwritable)?;
-            out.extend_from_slice(&[atyp::DOMAIN, len]);
-            out.extend_from_slice(d);
+socks_wire!(
+    Endpoint,
+    "Reads one SOCKS5 endpoint. Refuses unknown address types.",
+    "Refuses domain names longer than `MAX_DOMAIN` bytes.",
+    |value, out| {
+        match &value.address {
+            Address::Ipv4(a) => {
+                out.push(atyp::IPV4);
+                out.extend_from_slice(&a.octets());
+            }
+            Address::Ipv6(a) => {
+                out.push(atyp::IPV6);
+                out.extend_from_slice(&a.octets());
+            }
+            Address::Domain(d) => {
+                let len = u8::try_from(d.len()).map_err(|_| Error::Unwritable)?;
+                out.extend_from_slice(&[atyp::DOMAIN, len]);
+                out.extend_from_slice(d);
+            }
         }
+        out.extend_from_slice(&value.port.to_be_bytes());
     }
-    out.extend_from_slice(&value.port.to_be_bytes());
-});
+);
 
 fn sized_end(at: usize, len: usize) -> Result<usize, FrameError> {
     at.checked_add(len).ok_or(FrameError::TooLong)
@@ -217,7 +267,9 @@ fn sized_end(at: usize, len: usize) -> Result<usize, FrameError> {
 // Finds framing without interpreting command and reserved fields. Those
 // are per-unit failures once the endpoint establishes an exact boundary.
 fn endpoint_end(b: &[u8], at: usize) -> Result<Option<usize>, FrameError> {
-    let Some(&kind) = b.get(at) else { return Ok(None) };
+    let Some(&kind) = b.get(at) else {
+        return Ok(None);
+    };
     Ok(Some(match kind {
         atyp::IPV4 => sized_end(at, 7)?,
         atyp::IPV6 => sized_end(at, 19)?,
@@ -238,12 +290,18 @@ struct Scan4 {
 }
 impl Scan4 {
     fn length(&mut self, b: &[u8]) -> Result<Option<usize>, FrameError> {
-        let Some(&[a, c, d, e]) = b.get(4..8) else { return Ok(None) };
+        let Some(&[a, c, d, e]) = b.get(4..8) else {
+            return Ok(None);
+        };
         let domain = [a, c, d] == [0, 0, 0] && e != 0;
         self.pos = self.pos.max(8);
         loop {
             let start = self.user_end.map_or(Ok(8), |n| sized_end(n, 1))?;
-            let max = if self.user_end.is_some() { MAX_SOCKS4_DOMAIN } else { MAX_USER_ID };
+            let max = if self.user_end.is_some() {
+                MAX_SOCKS4_DOMAIN
+            } else {
+                MAX_USER_ID
+            };
             let field_end = sized_end(sized_end(start, max)?, 1)?;
             let end = b.len().min(field_end);
             let bytes = b.get(self.pos..end).unwrap_or_default();
@@ -335,7 +393,11 @@ impl ClientMessages {
     /// outside the verification phase. Refusal preserves unread bytes.
     pub fn verified(&mut self, good: bool) {
         if self.phase == ServerPhase::Verifying {
-            self.phase = if good { ServerPhase::Request } else { ServerPhase::Closed };
+            self.phase = if good {
+                ServerPhase::Request
+            } else {
+                ServerPhase::Closed
+            };
         }
     }
 }
@@ -369,7 +431,9 @@ impl ClientMessages {
             }
             _ => {}
         }
-        let Some(&first) = b.first() else { return Ok(Step::Need) };
+        let Some(&first) = b.first() else {
+            return Ok(Step::Need);
+        };
         let v4 = self.phase == ServerPhase::Greeting && first == VERSION_4;
         let version = if v4 {
             VERSION_4
@@ -408,21 +472,31 @@ impl ClientMessages {
             }
         };
         let Some(used) = end else {
-            return if b.len() >= self.limit { Err(FrameError::TooLong) } else { Ok(Step::Need) };
+            return if b.len() >= self.limit {
+                Err(FrameError::TooLong)
+            } else {
+                Ok(Step::Need)
+            };
         };
         if used > self.limit {
             return Err(FrameError::TooLong);
         }
-        let Some(bytes) = b.get(..used) else { return Ok(Step::Need) };
-        let item = if v4 {
-            Socks4Request::parse_prefix(bytes).map(|v| v.map(|(m, _)| ClientMessage::Socks4(m)))
-        } else {
-            match self.phase {
-                ServerPhase::Greeting => Greeting::parse_prefix(bytes).map(|v| v.map(|(m, _)| ClientMessage::Greeting(m))),
-                ServerPhase::Auth => AuthRequest::parse_prefix(bytes).map(|v| v.map(|(m, _)| ClientMessage::Auth(m))),
-                _ => Request::parse_prefix(bytes).map(|v| v.map(|(m, _)| ClientMessage::Request(m))),
-            }
+        let Some(bytes) = b.get(..used) else {
+            return Ok(Step::Need);
         };
+        let item =
+            if v4 {
+                Socks4Request::parse_prefix(bytes).map(|v| v.map(|(m, _)| ClientMessage::Socks4(m)))
+            } else {
+                match self.phase {
+                    ServerPhase::Greeting => Greeting::parse_prefix(bytes)
+                        .map(|v| v.map(|(m, _)| ClientMessage::Greeting(m))),
+                    ServerPhase::Auth => AuthRequest::parse_prefix(bytes)
+                        .map(|v| v.map(|(m, _)| ClientMessage::Auth(m))),
+                    _ => Request::parse_prefix(bytes)
+                        .map(|v| v.map(|(m, _)| ClientMessage::Request(m))),
+                }
+            };
         let item = match item {
             Ok(Some(value)) => Ok(value),
             Ok(None) => return Ok(Step::Need),
@@ -476,7 +550,10 @@ impl ServerMessages {
 
     /// Also checks the selection against the first [`MAX_METHODS`] offers.
     pub fn socks5_offering(command: Command, methods: &[Method]) -> Self {
-        Self { offered: Some(MethodSet::of(methods)), ..Self::socks5(command) }
+        Self {
+            offered: Some(MethodSet::of(methods)),
+            ..Self::socks5(command)
+        }
     }
 
     /// Reads SOCKS4 or SOCKS4a replies, including BIND's second reply.
@@ -521,7 +598,10 @@ impl codec::Decode for ServerMessages {
 }
 impl ServerMessages {
     fn decode_unit(&mut self, b: &[u8]) -> Result<Step<Result<ServerMessage, Error>>, FrameError> {
-        if matches!(self.phase, ClientPhase::Done | ClientPhase::Closed | ClientPhase::Failed) {
+        if matches!(
+            self.phase,
+            ClientPhase::Done | ClientPhase::Closed | ClientPhase::Failed
+        ) {
             return Ok(Step::End);
         }
         let version = if self.socks4 {
@@ -547,13 +627,20 @@ impl ServerMessages {
         if used > self.limit {
             return Err(FrameError::TooLong);
         }
-        let Some(bytes) = b.get(..used) else { return Ok(Step::Need) };
-        let item = match self.phase {
-            ClientPhase::Selection => Selection::parse_prefix(bytes).map(|v| v.map(|(m, _)| ServerMessage::Selection(m))),
-            ClientPhase::Auth => AuthReply::parse_prefix(bytes).map(|v| v.map(|(m, _)| ServerMessage::Auth(m))),
-            _ if self.socks4 => Socks4Reply::parse_prefix(bytes).map(|v| v.map(|(m, _)| ServerMessage::Socks4(m))),
-            _ => Reply::parse_prefix(bytes).map(|v| v.map(|(m, _)| ServerMessage::Reply(m))),
+        let Some(bytes) = b.get(..used) else {
+            return Ok(Step::Need);
         };
+        let item =
+            match self.phase {
+                ClientPhase::Selection => Selection::parse_prefix(bytes)
+                    .map(|v| v.map(|(m, _)| ServerMessage::Selection(m))),
+                ClientPhase::Auth => {
+                    AuthReply::parse_prefix(bytes).map(|v| v.map(|(m, _)| ServerMessage::Auth(m)))
+                }
+                _ if self.socks4 => Socks4Reply::parse_prefix(bytes)
+                    .map(|v| v.map(|(m, _)| ServerMessage::Socks4(m))),
+                _ => Reply::parse_prefix(bytes).map(|v| v.map(|(m, _)| ServerMessage::Reply(m))),
+            };
         let item = match item {
             Ok(Some(value)) => Ok(value),
             Ok(None) => return Ok(Step::Need),
@@ -567,8 +654,11 @@ impl ServerMessages {
             }
             Ok(m)
         });
-        let reply_phase =
-            if self.bind && self.phase == ClientPhase::Reply { ClientPhase::SecondReply } else { ClientPhase::Done };
+        let reply_phase = if self.bind && self.phase == ClientPhase::Reply {
+            ClientPhase::SecondReply
+        } else {
+            ClientPhase::Done
+        };
         self.phase = match &item {
             Ok(ServerMessage::Selection(s)) => match Method::from_code(s.method.code()) {
                 Method::NoAuth => ClientPhase::Reply,
@@ -577,8 +667,12 @@ impl ServerMessages {
                 _ => ClientPhase::Done,
             },
             Ok(ServerMessage::Auth(a)) if a.success() => ClientPhase::Reply,
-            Ok(ServerMessage::Reply(r)) if r.code.code() == ReplyCode::Succeeded.code() => reply_phase,
-            Ok(ServerMessage::Socks4(r)) if r.code.code() == Socks4Code::Granted.code() => reply_phase,
+            Ok(ServerMessage::Reply(r)) if r.code.code() == ReplyCode::Succeeded.code() => {
+                reply_phase
+            }
+            Ok(ServerMessage::Socks4(r)) if r.code.code() == Socks4Code::Granted.code() => {
+                reply_phase
+            }
             Ok(_) => ClientPhase::Closed,
             Err(_) => ClientPhase::Failed,
         };
@@ -842,17 +936,23 @@ impl From<IpAddr> for Address {
 /// `Ok(None)` if `b` ends first, and otherwise the address, the port and
 /// where they end.
 fn parse_endpoint(b: &[u8], at: usize) -> Result<Option<(Address, u16, usize)>, Error> {
-    let Some(&kind) = b.get(at) else { return Ok(None) };
+    let Some(&kind) = b.get(at) else {
+        return Ok(None);
+    };
     let (start, len) = match kind {
         atyp::IPV4 => (at + 1, 4),
         atyp::IPV6 => (at + 1, 16),
         atyp::DOMAIN => {
-            let Some(&n) = b.get(at + 1) else { return Ok(None) };
+            let Some(&n) = b.get(at + 1) else {
+                return Ok(None);
+            };
             (at + 2, usize::from(n))
         }
         t => return Err(Error::AddressType(t)),
     };
-    let Some(end) = start.checked_add(len).and_then(|e| e.checked_add(2)) else { return Ok(None) };
+    let Some(end) = start.checked_add(len).and_then(|e| e.checked_add(2)) else {
+        return Ok(None);
+    };
     if b.len() < end {
         return Ok(None);
     }
@@ -866,7 +966,11 @@ fn parse_endpoint(b: &[u8], at: usize) -> Result<Option<(Address, u16, usize)>, 
         }
         _ => Address::Domain(raw.to_vec()),
     };
-    Ok(Some((address, be16(b, start + len).ok_or(Error::Truncated)?, end)))
+    Ok(Some((
+        address,
+        be16(b, start + len).ok_or(Error::Truncated)?,
+        end,
+    )))
 }
 
 /// Checks the first byte of `b` is `version`, if it has come.
@@ -914,7 +1018,12 @@ impl Selection {
     fn parse_prefix(b: &[u8]) -> Result<Option<(Selection, usize)>, Error> {
         check_version(b, VERSION_5)?;
         match b.get(1) {
-            Some(&m) => Ok(Some((Selection { method: Method::from_code(m) }, 2))),
+            Some(&m) => Ok(Some((
+                Selection {
+                    method: Method::from_code(m),
+                },
+                2,
+            ))),
             None => Ok(None),
         }
     }
@@ -937,9 +1046,13 @@ impl AuthRequest {
     /// read too.
     fn parse_prefix(b: &[u8]) -> Result<Option<(AuthRequest, usize)>, Error> {
         check_version(b, AUTH_VERSION)?;
-        let Some(&ulen) = b.get(1) else { return Ok(None) };
+        let Some(&ulen) = b.get(1) else {
+            return Ok(None);
+        };
         let ulen = usize::from(ulen);
-        let Some(&plen) = b.get(2 + ulen) else { return Ok(None) };
+        let Some(&plen) = b.get(2 + ulen) else {
+            return Ok(None);
+        };
         let end = 3 + ulen + usize::from(plen);
         if b.len() < end {
             return Ok(None);
@@ -994,13 +1107,26 @@ impl Request {
     /// as it comes.
     fn parse_prefix(b: &[u8]) -> Result<Option<(Request, usize)>, Error> {
         check_version(b, VERSION_5)?;
-        let Some(&cmd) = b.get(1) else { return Ok(None) };
+        let Some(&cmd) = b.get(1) else {
+            return Ok(None);
+        };
         let command = Command::from_code(cmd)?;
-        let Some(&rsv) = b.get(2) else { return Ok(None) };
+        let Some(&rsv) = b.get(2) else {
+            return Ok(None);
+        };
         if rsv != 0 {
             return Err(Error::Reserved(u16::from(rsv)));
         }
-        Ok(parse_endpoint(b, 3)?.map(|(address, port, end)| (Request { command, address, port }, end)))
+        Ok(parse_endpoint(b, 3)?.map(|(address, port, end)| {
+            (
+                Request {
+                    command,
+                    address,
+                    port,
+                },
+                end,
+            )
+        }))
     }
 }
 
@@ -1082,19 +1208,36 @@ impl Reply {
     /// Reads the reply at the start of `b`. Returns `Ok(None)` for a partial unit.
     fn parse_prefix(b: &[u8]) -> Result<Option<(Reply, usize)>, Error> {
         check_version(b, VERSION_5)?;
-        let Some(&rep) = b.get(1) else { return Ok(None) };
-        let Some(&rsv) = b.get(2) else { return Ok(None) };
+        let Some(&rep) = b.get(1) else {
+            return Ok(None);
+        };
+        let Some(&rsv) = b.get(2) else {
+            return Ok(None);
+        };
         if rsv != 0 {
             return Err(Error::Reserved(u16::from(rsv)));
         }
         let code = ReplyCode::from_code(rep);
-        Ok(parse_endpoint(b, 3)?.map(|(address, port, end)| (Reply { code, address, port }, end)))
+        Ok(parse_endpoint(b, 3)?.map(|(address, port, end)| {
+            (
+                Reply {
+                    code,
+                    address,
+                    port,
+                },
+                end,
+            )
+        }))
     }
 
     /// A failure reply with code `code` and a zero IPv4 address and port,
     /// as a proxy sends before it closes the connection.
     pub fn failure(code: ReplyCode) -> Reply {
-        Reply { code, address: Address::Ipv4(Ipv4Addr::UNSPECIFIED), port: 0 }
+        Reply {
+            code,
+            address: Address::Ipv4(Ipv4Addr::UNSPECIFIED),
+            port: 0,
+        }
     }
 }
 
@@ -1113,24 +1256,42 @@ pub struct UdpHeader {
 
 impl UdpHeader {
     fn parse_prefix(bytes: &[u8]) -> Result<Option<(Self, usize)>, Error> {
-        let Some(&[hi, lo, fragment]) = bytes.get(..3) else { return Ok(None) };
+        let Some(&[hi, lo, fragment]) = bytes.get(..3) else {
+            return Ok(None);
+        };
         let reserved = u16::from_be_bytes([hi, lo]);
         if reserved != 0 {
             return Err(Error::Reserved(reserved));
         }
-        Ok(parse_endpoint(bytes, 3)?.map(|(address, port, used)| (Self { fragment, address, port }, used)))
+        Ok(parse_endpoint(bytes, 3)?.map(|(address, port, used)| {
+            (
+                Self {
+                    fragment,
+                    address,
+                    port,
+                },
+                used,
+            )
+        }))
     }
 
     /// Wraps this header and a payload as one wire datagram.
     pub fn datagram(self, payload: Vec<u8>) -> UdpDatagram {
-        UdpDatagram { header: self, payload }
+        UdpDatagram {
+            header: self,
+            payload,
+        }
     }
 }
-socks_wire!(UdpHeader, "Reads one SOCKS5 UDP header. Refuses nonzero reserved bytes and unknown address types.",
-    "Refuses domain names longer than `MAX_DOMAIN` bytes.", |value, out| {
-    out.extend_from_slice(&[0, 0, value.fragment]);
-    Endpoint::from_address(&value.address, value.port)?.write(out)?;
-});
+socks_wire!(
+    UdpHeader,
+    "Reads one SOCKS5 UDP header. Refuses nonzero reserved bytes and unknown address types.",
+    "Refuses domain names longer than `MAX_DOMAIN` bytes.",
+    |value, out| {
+        out.extend_from_slice(&[0, 0, value.fragment]);
+        Endpoint::from_address(&value.address, value.port)?.write(out)?;
+    }
+);
 
 /// One relayed UDP datagram, including its SOCKS5 header.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1151,7 +1312,10 @@ impl Wire for UdpDatagram {
             return Err(Error::TooLong);
         }
         let (header, used) = UdpHeader::parse_prefix(bytes)?.ok_or(Error::Truncated)?;
-        Ok(Self { header, payload: bytes[used..].to_vec() })
+        Ok(Self {
+            header,
+            payload: bytes[used..].to_vec(),
+        })
     }
 
     /// Refuses oversized domains and datagrams longer than [`MAX_DATAGRAM`].
@@ -1159,7 +1323,11 @@ impl Wire for UdpDatagram {
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let mut bytes = Vec::new();
         self.header.write(&mut bytes)?;
-        if bytes.len().checked_add(self.payload.len()).is_none_or(|n| n > MAX_DATAGRAM) {
+        if bytes
+            .len()
+            .checked_add(self.payload.len())
+            .is_none_or(|n| n > MAX_DATAGRAM)
+        {
             return Err(Error::Unwritable);
         }
         bytes.extend_from_slice(&self.payload);
@@ -1239,24 +1407,38 @@ impl Socks4Request {
     /// follows the user ID.
     fn parse_prefix(b: &[u8]) -> Result<Option<(Socks4Request, usize)>, Error> {
         check_version(b, VERSION_4)?;
-        let Some(&cmd) = b.get(1) else { return Ok(None) };
+        let Some(&cmd) = b.get(1) else {
+            return Ok(None);
+        };
         let command = Socks4Command::from_code(cmd)?;
         if b.len() < 8 {
             return Ok(None);
         }
         let port = be16(b, 2).ok_or(Error::Truncated)?;
         let ip = Ipv4Addr::new(b[4], b[5], b[6], b[7]);
-        let Some(nul) = find_nul(b, 8, MAX_USER_ID)? else { return Ok(None) };
+        let Some(nul) = find_nul(b, 8, MAX_USER_ID)? else {
+            return Ok(None);
+        };
         // Nothing is copied until the whole request has come.
         let (destination, used) = match ip.octets() {
             [0, 0, 0, x] if x != 0 => {
-                let Some(end) = find_nul(b, nul + 1, MAX_SOCKS4_DOMAIN)? else { return Ok(None) };
+                let Some(end) = find_nul(b, nul + 1, MAX_SOCKS4_DOMAIN)? else {
+                    return Ok(None);
+                };
                 (Socks4Destination::Domain(b[nul + 1..end].to_vec()), end + 1)
             }
             _ => (Socks4Destination::Ip(ip), nul + 1),
         };
         let user_id = b[8..nul].to_vec();
-        Ok(Some((Socks4Request { command, port, destination, user_id }, used)))
+        Ok(Some((
+            Socks4Request {
+                command,
+                port,
+                destination,
+                user_id,
+            },
+            used,
+        )))
     }
 }
 
@@ -1414,53 +1596,93 @@ pub enum ClientPhase {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::assert_linear;
     use super::*;
-    use codec::{
-        Decode, Fail, Lcg, Stream,
-    };
+    use codec::{Decode, Fail, Lcg, Stream};
+    use fictionet::stdlib::test_support::assert_linear;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
     fn request() -> Request {
-        Request { command: Command::Connect, address: Address::Ipv4(Ipv4Addr::new(192, 168, 1, 2)), port: 8080 }
+        Request {
+            command: Command::Connect,
+            address: Address::Ipv4(Ipv4Addr::new(192, 168, 1, 2)),
+            port: 8080,
+        }
     }
-
 
     #[test]
     fn rfc1928_greeting_and_selection() {
-        let greeting = Greeting { methods: vec![Method::NoAuth, Method::UsernamePassword] };
+        let greeting = Greeting {
+            methods: vec![Method::NoAuth, Method::UsernamePassword],
+        };
         assert_eq!(Greeting::parse(&[5, 2, 0, 2]), Ok(greeting.clone()));
         assert_eq!(greeting.to_bytes().unwrap(), [5, 2, 0, 2]);
-        assert_eq!(Selection::parse(&[5, 2]), Ok(Selection { method: Method::UsernamePassword }));
+        assert_eq!(
+            Selection::parse(&[5, 2]),
+            Ok(Selection {
+                method: Method::UsernamePassword
+            })
+        );
         assert_eq!(Selection::parse(&[5, 2, 9]), Err(Error::Trailing));
-        assert_eq!(Selection { method: Method::NoAcceptable }.to_bytes().unwrap(), [5, 0xff]);
+        assert_eq!(
+            Selection {
+                method: Method::NoAcceptable
+            }
+            .to_bytes()
+            .unwrap(),
+            [5, 0xff]
+        );
         assert_eq!(Greeting::parse(&[5, 0]), Ok(Greeting { methods: vec![] }));
         for c in 0..=255u8 {
             assert_eq!(Method::from_code(c).code(), c);
             assert_eq!(ReplyCode::from_code(c).code(), c);
             assert_eq!(Socks4Code::from_code(c).code(), c);
-            contract::check_wire_value(&Selection { method: Method::from_code(c) });
-            contract::check_wire_value(&Selection { method: Method::Other(c) });
+            contract::check_wire_value(&Selection {
+                method: Method::from_code(c),
+            });
+            contract::check_wire_value(&Selection {
+                method: Method::Other(c),
+            });
             contract::check_wire_value(&Reply::failure(ReplyCode::Other(c)));
-            contract::check_wire_value(&Socks4Reply { code: Socks4Code::Other(c), port: 0, ip: Ipv4Addr::LOCALHOST });
+            contract::check_wire_value(&Socks4Reply {
+                code: Socks4Code::Other(c),
+                port: 0,
+                ip: Ipv4Addr::LOCALHOST,
+            });
             match Socks4Command::from_code(c) {
                 Ok(cmd) => assert_eq!(cmd.code(), c),
                 Err(e) => assert_eq!(e, Error::Command(c)),
             }
-            if let Ok(cmd) = Command::from_code(c) { assert_eq!(cmd.code(), c); }
+            if let Ok(cmd) = Command::from_code(c) {
+                assert_eq!(cmd.code(), c);
+            }
         }
-        assert_eq!(Address::from(IpAddr::V4(Ipv4Addr::LOCALHOST)), Address::Ipv4(Ipv4Addr::LOCALHOST));
-        assert_eq!(Address::from(IpAddr::V6(Ipv6Addr::LOCALHOST)), Address::Ipv6(Ipv6Addr::LOCALHOST));
+        assert_eq!(
+            Address::from(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            Address::Ipv4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            Address::from(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            Address::Ipv6(Ipv6Addr::LOCALHOST)
+        );
     }
 
     #[test]
     fn rfc1929_login() {
         let bytes = [1, 5, b'a', b'l', b'i', b'c', b'e', 3, b'p', b'w', b'd'];
-        let auth = AuthRequest { username: b"alice".to_vec(), password: b"pwd".to_vec() };
+        let auth = AuthRequest {
+            username: b"alice".to_vec(),
+            password: b"pwd".to_vec(),
+        };
         assert_eq!(AuthRequest::parse(&bytes), Ok(auth.clone()));
         assert_eq!(auth.to_bytes().unwrap(), bytes);
-        assert_eq!(AuthRequest::parse(&[1, 0, 0]), Ok(AuthRequest { username: vec![], password: vec![] }));
+        assert_eq!(
+            AuthRequest::parse(&[1, 0, 0]),
+            Ok(AuthRequest {
+                username: vec![],
+                password: vec![]
+            })
+        );
         assert_eq!(AuthReply::parse(&[1, 0]), Ok(AuthReply { status: 0 }));
         assert!(!AuthReply { status: 1 }.success());
         assert_eq!(AuthReply::parse(&[5, 0]), Err(Error::Version(5)));
@@ -1471,23 +1693,58 @@ mod tests {
         let bytes = [5, 1, 0, 1, 192, 168, 1, 2, 0x1f, 0x90];
         assert_eq!(Request::parse(&bytes), Ok(request()));
         assert_eq!(request().to_bytes().unwrap(), bytes);
-        for address in [Address::Ipv4(Ipv4Addr::LOCALHOST), Address::Ipv6(Ipv6Addr::LOCALHOST), Address::Domain(b"h".to_vec()), Address::Domain(vec![])] {
+        for address in [
+            Address::Ipv4(Ipv4Addr::LOCALHOST),
+            Address::Ipv6(Ipv6Addr::LOCALHOST),
+            Address::Domain(b"h".to_vec()),
+            Address::Domain(vec![]),
+        ] {
             for command in [Command::Connect, Command::Bind, Command::UdpAssociate] {
-                let req = Request { command, address: address.clone(), port: 53 };
+                let req = Request {
+                    command,
+                    address: address.clone(),
+                    port: 53,
+                };
                 let bytes = req.to_bytes().unwrap();
                 assert_eq!(Request::parse(&bytes), Ok(req));
-                for n in 0..bytes.len() { assert_eq!(Request::parse(&bytes[..n]), Err(Error::Truncated)); }
+                for n in 0..bytes.len() {
+                    assert_eq!(Request::parse(&bytes[..n]), Err(Error::Truncated));
+                }
                 contract::check_wire::<Request>(&bytes);
             }
-            let reply = Reply { code: ReplyCode::Succeeded, address, port: 9 };
+            let reply = Reply {
+                code: ReplyCode::Succeeded,
+                address,
+                port: 9,
+            };
             let bytes = reply.to_bytes().unwrap();
             assert_eq!(Reply::parse(&bytes), Ok(reply.clone()));
-            for n in 0..bytes.len() { assert_eq!(Reply::parse(&bytes[..n]), Err(Error::Truncated)); }
+            for n in 0..bytes.len() {
+                assert_eq!(Reply::parse(&bytes[..n]), Err(Error::Truncated));
+            }
             contract::check_wire_value(&reply);
         }
-        assert_eq!(Reply::failure(ReplyCode::HostUnreachable).to_bytes().unwrap(), [5, 4, 0, 1, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(Reply::parse(&[5, 0, 0, 3, 1, b'h', 0, 7]), Ok(Reply { code: ReplyCode::Succeeded, address: Address::Domain(b"h".to_vec()), port: 7 }));
-        for bytes in [vec![5, 2, 0, 2], vec![5, 2], vec![1, 1, b'u', 1, b'p'], vec![1, 0], vec![0, 90, 0, 0, 0, 0, 0, 0]] {
+        assert_eq!(
+            Reply::failure(ReplyCode::HostUnreachable)
+                .to_bytes()
+                .unwrap(),
+            [5, 4, 0, 1, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            Reply::parse(&[5, 0, 0, 3, 1, b'h', 0, 7]),
+            Ok(Reply {
+                code: ReplyCode::Succeeded,
+                address: Address::Domain(b"h".to_vec()),
+                port: 7
+            })
+        );
+        for bytes in [
+            vec![5, 2, 0, 2],
+            vec![5, 2],
+            vec![1, 1, b'u', 1, b'p'],
+            vec![1, 0],
+            vec![0, 90, 0, 0, 0, 0, 0, 0],
+        ] {
             macro_rules! prefixes {
                 ($($ty:ty),+) => {$(if <$ty>::parse(&bytes).is_ok() {
                     for n in 0..bytes.len() { assert_eq!(<$ty>::parse(&bytes[..n]), Err(Error::Truncated)); }
@@ -1499,102 +1756,245 @@ mod tests {
 
     #[test]
     fn udp_datagrams() {
-        let header = UdpHeader { fragment: 0, address: Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8)), port: 53 };
+        let header = UdpHeader {
+            fragment: 0,
+            address: Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8)),
+            port: 53,
+        };
         let datagram = header.clone().datagram(b"query".to_vec());
         let bytes = datagram.to_bytes().unwrap();
-        assert_eq!(bytes, [0, 0, 0, 1, 8, 8, 8, 8, 0, 53, b'q', b'u', b'e', b'r', b'y']);
+        assert_eq!(
+            bytes,
+            [0, 0, 0, 1, 8, 8, 8, 8, 0, 53, b'q', b'u', b'e', b'r', b'y']
+        );
         assert_eq!(UdpDatagram::parse(&bytes), Ok(datagram));
-        for n in 0..10 { assert_eq!(UdpDatagram::parse(&bytes[..n]), Err(Error::Truncated)); }
+        for n in 0..10 {
+            assert_eq!(UdpDatagram::parse(&bytes[..n]), Err(Error::Truncated));
+        }
         assert_eq!(UdpHeader::parse(&bytes[..10]), Ok(header.clone()));
         assert_eq!(UdpHeader::parse(&bytes), Err(Error::Trailing));
-        assert_eq!(UdpDatagram::parse(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 0]), Err(Error::Reserved(1)));
-        assert_eq!(UdpDatagram::parse(&[0, 0, 0, 2]), Err(Error::AddressType(2)));
+        assert_eq!(
+            UdpDatagram::parse(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 0]),
+            Err(Error::Reserved(1))
+        );
+        assert_eq!(
+            UdpDatagram::parse(&[0, 0, 0, 2]),
+            Err(Error::AddressType(2))
+        );
         let full = header.clone().datagram(vec![7; MAX_DATAGRAM - 10]);
         let bytes = full.to_bytes().unwrap();
         assert_eq!(bytes.len(), 65_527);
         assert_eq!(UdpDatagram::parse(&bytes), Ok(full.clone()));
         contract::check_wire_value(&full);
-        assert_eq!(contract::check_refused(&header.datagram(vec![7; MAX_DATAGRAM - 9])), Error::Unwritable);
-        assert_eq!(UdpDatagram::parse(&vec![0; MAX_DATAGRAM + 1]), Err(Error::TooLong));
-        assert_eq!(Error::TooLong.to_string(), "SOCKS datagram exceeds MAX_DATAGRAM");
+        assert_eq!(
+            contract::check_refused(&header.datagram(vec![7; MAX_DATAGRAM - 9])),
+            Error::Unwritable
+        );
+        assert_eq!(
+            UdpDatagram::parse(&vec![0; MAX_DATAGRAM + 1]),
+            Err(Error::TooLong)
+        );
+        assert_eq!(
+            Error::TooLong.to_string(),
+            "SOCKS datagram exceeds MAX_DATAGRAM"
+        );
     }
 
     #[test]
     fn socks4_examples_and_limits() {
-        let req = Socks4Request { command: Socks4Command::Connect, port: 80,
-            destination: Socks4Destination::Ip(Ipv4Addr::new(66, 102, 7, 99)), user_id: b"fred".to_vec() };
+        let req = Socks4Request {
+            command: Socks4Command::Connect,
+            port: 80,
+            destination: Socks4Destination::Ip(Ipv4Addr::new(66, 102, 7, 99)),
+            user_id: b"fred".to_vec(),
+        };
         let bytes = [4, 1, 0, 80, 66, 102, 7, 99, b'f', b'r', b'e', b'd', 0];
         assert_eq!(Socks4Request::parse(&bytes), Ok(req.clone()));
         assert_eq!(req.to_bytes().unwrap(), bytes);
-        for n in 0..bytes.len() { assert_eq!(Socks4Request::parse(&bytes[..n]), Err(Error::Truncated)); }
-        let req = Socks4Request { command: Socks4Command::Bind, port: 21,
-            destination: Socks4Destination::Domain(b"ftp.example.org".to_vec()), user_id: vec![] };
+        for n in 0..bytes.len() {
+            assert_eq!(Socks4Request::parse(&bytes[..n]), Err(Error::Truncated));
+        }
+        let req = Socks4Request {
+            command: Socks4Command::Bind,
+            port: 21,
+            destination: Socks4Destination::Domain(b"ftp.example.org".to_vec()),
+            user_id: vec![],
+        };
         let bytes = b"\x04\x02\x00\x15\x00\x00\x00\x01\x00ftp.example.org\0";
-        for n in 0..bytes.len() { assert_eq!(Socks4Request::parse(&bytes[..n]), Err(Error::Truncated)); }
+        for n in 0..bytes.len() {
+            assert_eq!(Socks4Request::parse(&bytes[..n]), Err(Error::Truncated));
+        }
         assert_eq!(Socks4Request::parse(bytes), Ok(req.clone()));
         assert_eq!(req.to_bytes().unwrap(), bytes);
-        assert_eq!(Socks4Request::parse(&[4, 1, 0, 1, 0, 0, 0, 9, 0, b'a', 0]).unwrap().destination, Socks4Destination::Domain(b"a".to_vec()));
-        assert_eq!(Socks4Request::parse(&[4, 1, 0, 1, 0, 0, 0, 0, 0]).unwrap().destination, Socks4Destination::Ip(Ipv4Addr::UNSPECIFIED));
-        let reply = Socks4Reply { code: Socks4Code::Granted, port: 0x1234, ip: Ipv4Addr::new(1, 2, 3, 4) };
+        assert_eq!(
+            Socks4Request::parse(&[4, 1, 0, 1, 0, 0, 0, 9, 0, b'a', 0])
+                .unwrap()
+                .destination,
+            Socks4Destination::Domain(b"a".to_vec())
+        );
+        assert_eq!(
+            Socks4Request::parse(&[4, 1, 0, 1, 0, 0, 0, 0, 0])
+                .unwrap()
+                .destination,
+            Socks4Destination::Ip(Ipv4Addr::UNSPECIFIED)
+        );
+        let reply = Socks4Reply {
+            code: Socks4Code::Granted,
+            port: 0x1234,
+            ip: Ipv4Addr::new(1, 2, 3, 4),
+        };
         assert_eq!(reply.to_bytes().unwrap(), [0, 90, 0x12, 0x34, 1, 2, 3, 4]);
         contract::check_wire_value(&reply);
-        let longest = Socks4Request { command: Socks4Command::Connect, port: 80,
-            destination: Socks4Destination::Domain(vec![b'd'; MAX_SOCKS4_DOMAIN]), user_id: vec![b'u'; MAX_USER_ID] };
+        let longest = Socks4Request {
+            command: Socks4Command::Connect,
+            port: 80,
+            destination: Socks4Destination::Domain(vec![b'd'; MAX_SOCKS4_DOMAIN]),
+            user_id: vec![b'u'; MAX_USER_ID],
+        };
         let bytes = longest.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
-        assert_eq!(Socks4Request::parse(&bytes[..MAX_MESSAGE - 1]), Err(Error::Truncated));
+        assert_eq!(
+            Socks4Request::parse(&bytes[..MAX_MESSAGE - 1]),
+            Err(Error::Truncated)
+        );
         contract::check_decode_with_alloc_limit(ClientMessages::new, &bytes, 2 * MAX_MESSAGE);
-        assert_eq!(decode_all(ClientMessages::new, &bytes), (vec![Ok(ClientMessage::Socks4(longest))], None));
-        for (prefix, max) in [(vec![4, 1, 0, 80, 1, 2, 3, 4], MAX_USER_ID), (vec![4, 1, 0, 80, 0, 0, 0, 1, 0], MAX_SOCKS4_DOMAIN)] {
+        assert_eq!(
+            decode_all(ClientMessages::new, &bytes),
+            (vec![Ok(ClientMessage::Socks4(longest))], None)
+        );
+        for (prefix, max) in [
+            (vec![4, 1, 0, 80, 1, 2, 3, 4], MAX_USER_ID),
+            (vec![4, 1, 0, 80, 0, 0, 0, 1, 0], MAX_SOCKS4_DOMAIN),
+        ] {
             let mut bytes = prefix;
             bytes.extend(vec![b'x'; max]);
             assert_eq!(Socks4Request::parse(&bytes), Err(Error::Truncated));
             bytes.push(b'x');
             assert_eq!(Socks4Request::parse(&bytes), Err(Error::FieldTooLong));
         }
-        for destination in [Socks4Destination::Ip(Ipv4Addr::new(0, 0, 0, 7)), Socks4Destination::Domain(vec![b'x'; 256]), Socks4Destination::Domain(b"a\0b".to_vec())] {
-            assert_eq!(contract::check_refused(&Socks4Request { destination, ..req.clone() }), Error::Unwritable);
+        for destination in [
+            Socks4Destination::Ip(Ipv4Addr::new(0, 0, 0, 7)),
+            Socks4Destination::Domain(vec![b'x'; 256]),
+            Socks4Destination::Domain(b"a\0b".to_vec()),
+        ] {
+            assert_eq!(
+                contract::check_refused(&Socks4Request {
+                    destination,
+                    ..req.clone()
+                }),
+                Error::Unwritable
+            );
         }
-        for user_id in [b"ab\0cd".to_vec(), vec![b'u'; 256]] { assert_eq!(contract::check_refused(&Socks4Request { user_id, ..req.clone() }), Error::Unwritable); }
+        for user_id in [b"ab\0cd".to_vec(), vec![b'u'; 256]] {
+            assert_eq!(
+                contract::check_refused(&Socks4Request {
+                    user_id,
+                    ..req.clone()
+                }),
+                Error::Unwritable
+            );
+        }
     }
 
     #[test]
     fn requests_byte_at_a_time_are_bounded() {
         let check = |size| {
-            let request = Socks4Request { command: Socks4Command::Connect, port: 80,
-                destination: Socks4Destination::Domain(vec![b'd'; size]), user_id: vec![b'u'; size] };
+            let request = Socks4Request {
+                command: Socks4Command::Connect,
+                port: 80,
+                destination: Socks4Destination::Domain(vec![b'd'; size]),
+                user_id: vec![b'u'; size],
+            };
             let bytes = request.to_bytes().unwrap();
             for _ in 0..2000 {
                 let mut stream = Stream::new(ClientMessages::new());
                 for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
                     assert_eq!(stream.push(chunk), 1);
-                    if i + 1 < bytes.len() { assert_eq!(stream.next(), None); }
+                    if i + 1 < bytes.len() {
+                        assert_eq!(stream.next(), None);
+                    }
                     assert!(stream.buffered() <= MAX_MESSAGE);
                 }
-                assert_eq!(stream.next(), Some(Ok(Ok(ClientMessage::Socks4(request.clone())))));
+                assert_eq!(
+                    stream.next(),
+                    Some(Ok(Ok(ClientMessage::Socks4(request.clone()))))
+                );
                 assert_eq!(stream.buffered(), 0);
             }
         };
         check(MAX_USER_ID);
-        assert_linear("requests_byte_at_a_time_are_bounded", MAX_USER_ID / 4, check);
+        assert_linear(
+            "requests_byte_at_a_time_are_bounded",
+            MAX_USER_ID / 4,
+            check,
+        );
     }
 
     #[test]
     fn writers_refuse_changes() {
-        assert_eq!(contract::check_refused(&Greeting { methods: vec![Method::NoAuth; MAX_METHODS + 1] }), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Greeting { methods: vec![Method::Other(0)] }), Error::Unwritable);
-        assert_eq!(contract::check_refused(&AuthRequest { username: vec![0; 256], password: vec![] }), Error::Unwritable);
-        assert_eq!(contract::check_refused(&AuthRequest { username: vec![], password: vec![0; 256] }), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Request { address: Address::Domain(vec![0; 256]), ..request() }), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Reply { address: Address::Domain(vec![0; 256]), ..Reply::failure(ReplyCode::GeneralFailure) }), Error::Unwritable);
-        assert_eq!(contract::check_refused(&UdpHeader { fragment: 0, address: Address::Domain(vec![0; 256]), port: 0 }), Error::Unwritable);
-        let greeting = Greeting { methods: vec![Method::NoAuth; MAX_METHODS] };
+        assert_eq!(
+            contract::check_refused(&Greeting {
+                methods: vec![Method::NoAuth; MAX_METHODS + 1]
+            }),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&Greeting {
+                methods: vec![Method::Other(0)]
+            }),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&AuthRequest {
+                username: vec![0; 256],
+                password: vec![]
+            }),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&AuthRequest {
+                username: vec![],
+                password: vec![0; 256]
+            }),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&Request {
+                address: Address::Domain(vec![0; 256]),
+                ..request()
+            }),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&Reply {
+                address: Address::Domain(vec![0; 256]),
+                ..Reply::failure(ReplyCode::GeneralFailure)
+            }),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&UdpHeader {
+                fragment: 0,
+                address: Address::Domain(vec![0; 256]),
+                port: 0
+            }),
+            Error::Unwritable
+        );
+        let greeting = Greeting {
+            methods: vec![Method::NoAuth; MAX_METHODS],
+        };
         assert!(greeting.to_bytes().is_ok());
         contract::check_wire_value(&greeting);
-        let auth = AuthRequest { username: vec![0; MAX_USERNAME], password: vec![0; MAX_PASSWORD] };
+        let auth = AuthRequest {
+            username: vec![0; MAX_USERNAME],
+            password: vec![0; MAX_PASSWORD],
+        };
         assert!(auth.to_bytes().is_ok());
         contract::check_wire_value(&auth);
-        let request = Request { address: Address::Domain(vec![0; MAX_DOMAIN]), ..request() };
+        let request = Request {
+            address: Address::Domain(vec![0; MAX_DOMAIN]),
+            ..request()
+        };
         assert!(request.to_bytes().is_ok());
         contract::check_wire_value(&request);
     }
@@ -1602,7 +2002,9 @@ mod tests {
     #[test]
     fn malformed_fields() {
         macro_rules! bad {
-            ($ty:ty, $bytes:expr, $error:expr) => { assert_eq!(<$ty>::parse($bytes), Err($error)); };
+            ($ty:ty, $bytes:expr, $error:expr) => {
+                assert_eq!(<$ty>::parse($bytes), Err($error));
+            };
         }
         bad!(Greeting, &[4, 1, 0], Error::Version(4));
         bad!(Selection, &[0], Error::Version(0));
@@ -1616,10 +2018,23 @@ mod tests {
         bad!(Socks4Request, &[5], Error::Version(5));
         bad!(Socks4Request, &[4, 3], Error::Command(3));
         bad!(Socks4Reply, &[4, 90], Error::Version(4));
-        assert_eq!(Error::Command(9).reply_code(), ReplyCode::CommandNotSupported);
-        assert_eq!(Error::AddressType(9).reply_code(), ReplyCode::AddressTypeNotSupported);
+        assert_eq!(
+            Error::Command(9).reply_code(),
+            ReplyCode::CommandNotSupported
+        );
+        assert_eq!(
+            Error::AddressType(9).reply_code(),
+            ReplyCode::AddressTypeNotSupported
+        );
         assert_eq!(Error::Reserved(1).reply_code(), ReplyCode::GeneralFailure);
-        for e in [Error::Version(1), Error::Command(1), Error::AddressType(1), Error::Reserved(1), Error::FieldTooLong, Error::Method(1)] {
+        for e in [
+            Error::Version(1),
+            Error::Command(1),
+            Error::AddressType(1),
+            Error::Reserved(1),
+            Error::FieldTooLong,
+            Error::Method(1),
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1628,13 +2043,19 @@ mod tests {
     fn client_handshake_login_and_handoff() {
         let mut stream = Stream::new(ClientMessages::new());
         assert_eq!(stream.decoder().phase(), ServerPhase::Greeting);
-        let auth = AuthRequest { username: b"u".to_vec(), password: b"p".to_vec() };
+        let auth = AuthRequest {
+            username: b"u".to_vec(),
+            password: b"p".to_vec(),
+        };
         let mut bytes = vec![5, 1, 2];
         auth.write(&mut bytes).unwrap();
         request().write(&mut bytes).unwrap();
         bytes.extend_from_slice(b"tail");
         assert_eq!(stream.push(&bytes), bytes.len());
-        assert!(matches!(stream.next(), Some(Ok(Ok(ClientMessage::Greeting(_))))));
+        assert!(matches!(
+            stream.next(),
+            Some(Ok(Ok(ClientMessage::Greeting(_))))
+        ));
         assert_eq!(stream.next(), None);
         stream.decoder().verified(true);
         assert!(!stream.decoder().select(Method::NoAuth));
@@ -1643,7 +2064,10 @@ mod tests {
         assert_eq!(stream.decoder().phase(), ServerPhase::Verifying);
         assert_eq!(stream.next(), None);
         stream.decoder().verified(true);
-        assert_eq!(stream.next(), Some(Ok(Ok(ClientMessage::Request(request())))));
+        assert_eq!(
+            stream.next(),
+            Some(Ok(Ok(ClientMessage::Request(request()))))
+        );
         assert_eq!(stream.decoder().phase(), ServerPhase::Done);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.into_parts().0.unread(), b"tail");
@@ -1651,9 +2075,18 @@ mod tests {
 
     #[test]
     fn selection_refusal_and_unknown_methods() {
-        for (code, phase) in [(0, ServerPhase::Request), (2, ServerPhase::Auth), (1, ServerPhase::Done), (0x80, ServerPhase::Done), (0xff, ServerPhase::Closed)] {
+        for (code, phase) in [
+            (0, ServerPhase::Request),
+            (2, ServerPhase::Auth),
+            (1, ServerPhase::Done),
+            (0x80, ServerPhase::Done),
+            (0xff, ServerPhase::Closed),
+        ] {
             let mut d = ClientMessages::new();
-            assert!(matches!(d.decode(&[5, 1, code], false), Ok(Step::Item(Ok(_), 3))));
+            assert!(matches!(
+                d.decode(&[5, 1, code], false),
+                Ok(Step::Item(Ok(_), 3))
+            ));
             assert!(d.select(Method::Other(code)));
             assert_eq!(d.phase(), phase);
             assert!(!d.select(Method::NoAuth));
@@ -1670,8 +2103,13 @@ mod tests {
         d.verified(false);
         assert_eq!(d.phase(), ServerPhase::Closed);
         assert_eq!(d.decode(b"tail", false), Ok(Step::End));
-        for (code, allowed, phase) in [(0, false, ClientPhase::Failed), (2, true, ClientPhase::Auth), (0xff, true, ClientPhase::Closed)] {
-            let mut d = ServerMessages::socks5_offering(Command::Connect, &[Method::UsernamePassword]);
+        for (code, allowed, phase) in [
+            (0, false, ClientPhase::Failed),
+            (2, true, ClientPhase::Auth),
+            (0xff, true, ClientPhase::Closed),
+        ] {
+            let mut d =
+                ServerMessages::socks5_offering(Command::Connect, &[Method::UsernamePassword]);
             let result = d.decode(&[5, code], false).unwrap();
             assert_eq!(matches!(result, Step::Item(Ok(_), 2)), allowed);
             if !allowed {
@@ -1682,35 +2120,72 @@ mod tests {
         // Offers past the wire limit cannot be written and do not authorize a selection.
         let mut offered = vec![Method::NoAuth; MAX_METHODS];
         offered.push(Method::Other(4));
-        assert_eq!(contract::check_refused(&Greeting { methods: offered.clone() }), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Greeting {
+                methods: offered.clone()
+            }),
+            Error::Unwritable
+        );
         let mut d = ServerMessages::socks5_offering(Command::Connect, &offered);
-        assert_eq!(d.decode(&[5, 4], false), Ok(Step::Item(Err(Error::Method(4)), 2)));
+        assert_eq!(
+            d.decode(&[5, 4], false),
+            Ok(Step::Item(Err(Error::Method(4)), 2))
+        );
     }
 
     #[test]
     fn replies_bind_and_refusals() {
-        let first = Reply { code: ReplyCode::Succeeded, address: Address::Ipv4(Ipv4Addr::LOCALHOST), port: 5000 };
-        let second = Reply { port: 6000, ..first.clone() };
+        let first = Reply {
+            code: ReplyCode::Succeeded,
+            address: Address::Ipv4(Ipv4Addr::LOCALHOST),
+            port: 5000,
+        };
+        let second = Reply {
+            port: 6000,
+            ..first.clone()
+        };
         let mut bytes = vec![5, 2, 1, 0];
-        first.write(&mut bytes).unwrap(); second.write(&mut bytes).unwrap(); bytes.push(b'x');
+        first.write(&mut bytes).unwrap();
+        second.write(&mut bytes).unwrap();
+        bytes.push(b'x');
         let mut stream = Stream::new(ServerMessages::socks5(Command::Bind));
         assert_eq!(stream.push(&bytes), bytes.len());
-        assert!(matches!(stream.next(), Some(Ok(Ok(ServerMessage::Selection(_))))));
+        assert!(matches!(
+            stream.next(),
+            Some(Ok(Ok(ServerMessage::Selection(_))))
+        ));
         assert_eq!(stream.decoder().phase(), ClientPhase::Auth);
-        assert_eq!(stream.next(), Some(Ok(Ok(ServerMessage::Auth(AuthReply { status: 0 })))));
+        assert_eq!(
+            stream.next(),
+            Some(Ok(Ok(ServerMessage::Auth(AuthReply { status: 0 }))))
+        );
         assert_eq!(stream.next(), Some(Ok(Ok(ServerMessage::Reply(first)))));
         assert_eq!(stream.decoder().phase(), ClientPhase::SecondReply);
         assert_eq!(stream.next(), Some(Ok(Ok(ServerMessage::Reply(second)))));
         assert_eq!(stream.decoder().phase(), ClientPhase::Done);
         assert_eq!(stream.into_parts().0.unread(), b"x");
-        for bytes in [vec![5, 2, 1, 1], vec![5, 0xff], vec![5, 0, 5, 5, 0, 1, 0, 0, 0, 0, 0, 0]] {
+        for bytes in [
+            vec![5, 2, 1, 1],
+            vec![5, 0xff],
+            vec![5, 0, 5, 5, 0, 1, 0, 0, 0, 0, 0, 0],
+        ] {
             let mut s = Stream::new(ServerMessages::socks5(Command::Connect));
-            codec::pump(&mut s, &bytes, |m| { m.unwrap(); }).unwrap();
+            codec::pump(&mut s, &bytes, |m| {
+                m.unwrap();
+            })
+            .unwrap();
             assert_eq!(s.decoder().phase(), ClientPhase::Closed);
         }
-        let reply = Socks4Reply { code: Socks4Code::Granted, port: 1, ip: Ipv4Addr::LOCALHOST };
+        let reply = Socks4Reply {
+            code: Socks4Code::Granted,
+            port: 1,
+            ip: Ipv4Addr::LOCALHOST,
+        };
         let bytes = [reply.to_bytes().unwrap(), reply.to_bytes().unwrap()].concat();
-        assert_eq!(decode_all(|| ServerMessages::socks4(Socks4Command::Bind), &bytes), (vec![Ok(ServerMessage::Socks4(reply)); 2], None));
+        assert_eq!(
+            decode_all(|| ServerMessages::socks4(Socks4Command::Bind), &bytes),
+            (vec![Ok(ServerMessage::Socks4(reply)); 2], None)
+        );
         let mut d = ServerMessages::socks4(Socks4Command::Connect);
         d.decode(&[0, 91, 0, 0, 0, 0, 0, 0], false).unwrap();
         assert_eq!(d.phase(), ClientPhase::Closed);
@@ -1720,40 +2195,80 @@ mod tests {
     fn errors_end_once_and_decisions_are_bounded() {
         let mut stream = Stream::new(ClientMessages::new());
         assert_eq!(stream.push(&[7]), 1);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Version(7)))));
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(FrameError::Version(7))))
+        );
         assert_eq!(stream.next(), None);
         assert_eq!(stream.decoder().phase(), ServerPhase::Failed);
         let mut stream = Stream::new(ServerMessages::socks5(Command::Connect));
         assert_eq!(stream.push(&[4, 0]), 2);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Version(4)))));
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(FrameError::Version(4))))
+        );
         assert_eq!(stream.next(), None);
         assert_eq!(stream.decoder().phase(), ClientPhase::Failed);
         let mut d = ClientMessages::new();
-        d.decode(&[5, 1, 0], false).unwrap(); d.select(Method::NoAuth);
+        d.decode(&[5, 1, 0], false).unwrap();
+        d.select(Method::NoAuth);
         let mut copy = d.clone();
         let bytes = request().to_bytes().unwrap();
         assert_eq!(d.decode(&bytes[..2], false), Ok(Step::Need));
         assert_eq!(d.decode(&bytes, false), copy.decode(&bytes, false));
         assert_eq!(d.phase(), ServerPhase::Done);
-        let make = || { let mut d = ClientMessages::new(); d.decode(&[5, 1, 0], false).unwrap(); d };
+        let make = || {
+            let mut d = ClientMessages::new();
+            d.decode(&[5, 1, 0], false).unwrap();
+            d
+        };
         let bytes = vec![0; MAX_MESSAGE + 10];
         contract::check_decode_with_alloc_limit(make, &bytes, 2 * MAX_MESSAGE);
-        assert_eq!(decode_all(make, &bytes).1, Some(Fail::Protocol(FrameError::DecisionRequired(ServerPhase::Selecting))));
+        assert_eq!(
+            decode_all(make, &bytes).1,
+            Some(Fail::Protocol(FrameError::DecisionRequired(
+                ServerPhase::Selecting
+            )))
+        );
     }
 
     #[test]
     fn generated_contracts() {
         let mut rng = Lcg::new(0x50c4_5f00);
-        let seeds = [request().to_bytes().unwrap(), vec![5, 1, 2, 1, 0, 0], vec![4, 1, 0, 80, 1, 2, 3, 4, 0]];
+        let seeds = [
+            request().to_bytes().unwrap(),
+            vec![5, 1, 2, 1, 0, 0],
+            vec![4, 1, 0, 80, 1, 2, 3, 4, 0],
+        ];
         for _ in 0..512 {
-            let mut bytes = if rng.coin() { seeds[rng.index(seeds.len())].clone() } else { rng.bytes(80) };
+            let mut bytes = if rng.coin() {
+                seeds[rng.index(seeds.len())].clone()
+            } else {
+                rng.bytes(80)
+            };
             mutate(&mut rng, &mut bytes);
             contract::check_decode_with_alloc_limit(ClientMessages::new, &bytes, 2 * MAX_MESSAGE);
-            for make in [|| ServerMessages::socks5(Command::Connect), || ServerMessages::socks5(Command::Bind), || ServerMessages::socks4(Socks4Command::Bind)] {
+            for make in [
+                || ServerMessages::socks5(Command::Connect),
+                || ServerMessages::socks5(Command::Bind),
+                || ServerMessages::socks4(Socks4Command::Bind),
+            ] {
                 contract::check_decode_with_alloc_limit(make, &bytes, 2 * MAX_MESSAGE);
             }
             macro_rules! wires { ($($ty:ty),+) => {$(contract::check_wire::<$ty>(&bytes);)+}; }
-            wires!(Greeting, Selection, AuthRequest, AuthReply, Request, Reply, Socks4Request, Socks4Reply, Endpoint, UdpHeader, UdpDatagram);
+            wires!(
+                Greeting,
+                Selection,
+                AuthRequest,
+                AuthReply,
+                Request,
+                Reply,
+                Socks4Request,
+                Socks4Reply,
+                Endpoint,
+                UdpHeader,
+                UdpDatagram
+            );
         }
     }
 }

@@ -1,9 +1,9 @@
 use fictionet::events::Transport;
-use fictionet::stdlib::codec::{be16, be24};
 use fictionet::observe::{
     Conversation, Decoded, KeyLine, Layer, Observed, Place, Placement, Present, Protocol, Registry,
     protocols,
 };
+use fictionet::stdlib::codec::{be16, be24};
 
 /// One TLS connection: what its hellos said, and its keys.
 struct Tls {
@@ -84,7 +84,9 @@ const MAX_HANDSHAKE: usize = 64 << 10;
 fn whole_messages(b: &[u8]) -> usize {
     let mut at = 0;
     while at + 4 <= b.len() {
-        let Some(len) = be24(b, at + 1) else { break; };
+        let Some(len) = be24(b, at + 1) else {
+            break;
+        };
         let len = len as usize;
         if at + 4 + len > b.len() {
             break;
@@ -551,7 +553,9 @@ impl Tls {
         let mut at = 0;
         while at + 4 <= b.len() {
             let t = b[at];
-            let Some(len) = be24(b, at + 1) else { return names; };
+            let Some(len) = be24(b, at + 1) else {
+                return names;
+            };
             let len = len as usize;
             let end = (at + 4 + len).min(b.len());
             let m = &b[at + 4..end];
@@ -583,7 +587,9 @@ impl Tls {
                 2 if m.len() >= 38 && !decrypted => {
                     let sid = usize::from(m[34]);
                     if m.len() >= 35 + sid + 2 {
-                        let Some(c) = be16(m, 35 + sid) else { return names; };
+                        let Some(c) = be16(m, 35 + sid) else {
+                            return names;
+                        };
                         self.cipher = Some(c);
                         l.note("Cipher suite", cipher_name(c));
                     }
@@ -639,7 +645,9 @@ fn extensions(m: &[u8], client: bool) -> Vec<(u16, &[u8])> {
         if i + 2 > m.len() {
             return Vec::new();
         }
-        let Some(length) = be16(m, i) else { return Vec::new(); };
+        let Some(length) = be16(m, i) else {
+            return Vec::new();
+        };
         i += 2 + usize::from(length);
         let Some(&comp) = m.get(i) else {
             return Vec::new();
@@ -657,11 +665,15 @@ fn extensions_at(m: &[u8], mut i: usize) -> Vec<(u16, &[u8])> {
     if i + 2 > m.len() {
         return out;
     }
-    let Some(length) = be16(m, i) else { return out; };
+    let Some(length) = be16(m, i) else {
+        return out;
+    };
     let end = (i + 2 + usize::from(length)).min(m.len());
     i += 2;
     while i + 4 <= end {
-        let (Some(t), Some(n)) = (be16(m, i), be16(m, i + 2)) else { return out; };
+        let (Some(t), Some(n)) = (be16(m, i), be16(m, i + 2)) else {
+            return out;
+        };
         let n = usize::from(n);
         if i + 4 + n > end {
             break;

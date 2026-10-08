@@ -101,9 +101,17 @@ impl LinkWatch {
             let meter = link.meter.upgrade()?;
             let end = |side: usize| match (side, &link.sandbox) {
                 (1, Some(_)) => format!("s{id}"),
-                _ => task_id(if link.owners[side] != 0 { link.owners[side] } else { link.creator }),
+                _ => task_id(if link.owners[side] != 0 {
+                    link.owners[side]
+                } else {
+                    link.creator
+                }),
             };
-            (meter, [end(0), end(1)], link.label.as_deref().map(str::to_owned))
+            (
+                meter,
+                [end(0), end(1)],
+                link.label.as_deref().map(str::to_owned),
+            )
         };
         Some(LinkWatch {
             graph: Arc::downgrade(graph),
@@ -170,7 +178,9 @@ impl LinkWatch {
 
     /// Decodes copies made since the last call, up to a batch.
     pub(crate) fn pump(&self) {
-        let Some(graph) = self.graph.upgrade() else { return };
+        let Some(graph) = self.graph.upgrade() else {
+            return;
+        };
         let mut inner = lock(&self.inner);
         let mut done = 0;
         while done < PUMP_BATCH {
@@ -200,7 +210,9 @@ impl LinkWatch {
                 let seq = inner.next_row;
                 inner.next_row += 1;
                 let at = copy.at.saturating_duration_since(graph.start);
-                let micros = (graph.start_wall + at).duration_since(UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
+                let micros = (graph.start_wall + at)
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_micros() as u64);
                 let mut decoded = inner.dissector.decode(&copy.data, keys);
                 decoded.tags.sort_unstable();
                 decoded.tags.dedup();
@@ -214,7 +226,10 @@ impl LinkWatch {
                     .str("dst", &decoded.dst)
                     .str("proto", &decoded.proto)
                     .str("info", &decoded.info)
-                    .raw("tags", &json::array(decoded.tags.iter().map(|t| json::quote(t))))
+                    .raw(
+                        "tags",
+                        &json::array(decoded.tags.iter().map(|t| json::quote(t))),
+                    )
                     .done();
                 let mut detail = Object::new()
                     .num("seq", seq)
@@ -230,11 +245,19 @@ impl LinkWatch {
                 detail.push_str(",\"buffers\":");
                 decoded.write_buffers(&mut detail, &copy.data);
                 detail.push('}');
-                let row = Row { seq, micros, data: copy.data.clone(), summary, detail };
+                let row = Row {
+                    seq,
+                    micros,
+                    data: copy.data.clone(),
+                    summary,
+                    detail,
+                };
                 inner.row_bytes += row.bytes();
                 inner.rows.push_back(row);
                 while inner.rows.len() > ROWS || inner.row_bytes > ROW_BYTES {
-                    let Some(old) = inner.rows.pop_front() else { break };
+                    let Some(old) = inner.rows.pop_front() else {
+                        break;
+                    };
                     inner.row_bytes -= old.bytes();
                 }
             }
@@ -244,14 +267,28 @@ impl LinkWatch {
     /// Packet list lines after row `after`, at most `max`.
     pub(crate) fn rows_after(&self, after: u64, max: usize) -> Vec<(u64, String)> {
         let inner = lock(&self.inner);
-        let skip = inner.rows.iter().position(|r| r.seq > after).unwrap_or(inner.rows.len());
-        inner.rows.iter().skip(skip).take(max).map(|r| (r.seq, r.summary.clone())).collect()
+        let skip = inner
+            .rows
+            .iter()
+            .position(|r| r.seq > after)
+            .unwrap_or(inner.rows.len());
+        inner
+            .rows
+            .iter()
+            .skip(skip)
+            .take(max)
+            .map(|r| (r.seq, r.summary.clone()))
+            .collect()
     }
 
     /// The detail of row `seq`, if it is still kept.
     pub(crate) fn detail(&self, seq: u64) -> Option<String> {
         let inner = lock(&self.inner);
-        inner.rows.iter().find(|r| r.seq == seq).map(|r| r.detail.clone())
+        inner
+            .rows
+            .iter()
+            .find(|r| r.seq == seq)
+            .map(|r| r.detail.clone())
     }
 
     /// Every kept packet as a pcapng file, with the world's TLS keys in it,
@@ -259,7 +296,8 @@ impl LinkWatch {
     pub(crate) fn pcapng(&self) -> Vec<u8> {
         let keys = self.graph.upgrade().map(|g| keylog(&g)).unwrap_or_default();
         let inner = lock(&self.inner);
-        let packets: Vec<(u64, &[u8])> = inner.rows.iter().map(|r| (r.micros, &r.data[..])).collect();
+        let packets: Vec<(u64, &[u8])> =
+            inner.rows.iter().map(|r| (r.micros, &r.data[..])).collect();
         super::pcap::pcapng(&packets, keys.as_bytes())
     }
 }

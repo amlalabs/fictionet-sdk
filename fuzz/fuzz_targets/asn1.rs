@@ -2,11 +2,9 @@
 //! certificate the agent sends, and writes them back.
 #![no_main]
 
-use fictionet::stdlib::asn1::{
-    Frame, MAX_INPUT, Reader, Rules, StringKind, Tag, Writer,
-};
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::asn1::harness::check;
+use fictionet::stdlib::asn1::{Frame, MAX_INPUT, Reader, Rules, StringKind, Tag, Writer};
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 /// Runs writer calls named by the bytes of `ops`, from the front, until
@@ -28,7 +26,9 @@ fn script(ops: &mut &[u8], w: &mut Writer, level: usize) {
                 *ops = &ops[n..];
             }
             2 => w.explicit(u32::from(arg % 4), |w| script(ops, w, level + 1)),
-            3 => w.implicit(Tag::context(u32::from(arg % 4)), |w| script(ops, w, level + 1)),
+            3 => w.implicit(Tag::context(u32::from(arg % 4)), |w| {
+                script(ops, w, level + 1)
+            }),
             4 => w.sequence(|w| script(ops, w, level + 1)),
             5 => w.set(|w| script(ops, w, level + 1)),
             6 => w.set_of(|w| script(ops, w, level + 1)),
@@ -43,7 +43,9 @@ fn script(ops: &mut &[u8], w: &mut Writer, level: usize) {
                 w.text(StringKind::Bmp, &s);
             }
             10 => w.bit_string(&ops[..ops.len().min(3)], arg % 9),
-            11 => w.constructed(Tag::application(u32::from(arg % 4)), |w| script(ops, w, level + 1)),
+            11 => w.constructed(Tag::application(u32::from(arg % 4)), |w| {
+                script(ops, w, level + 1)
+            }),
             _ => return,
         }
     }

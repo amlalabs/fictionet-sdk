@@ -72,7 +72,10 @@ impl Link {
             dropped: AtomicU64::new(0),
         });
         tokio::spawn(write_queued(shared.clone()));
-        Ok(Link { shared, buf: vec![0u8; relay::MAX_MESSAGE + 1] })
+        Ok(Link {
+            shared,
+            buf: vec![0u8; relay::MAX_MESSAGE + 1],
+        })
     }
 
     pub(crate) fn shared(&self) -> Arc<Shared> {
@@ -134,7 +137,11 @@ impl Shared {
 fn send_one(fd: std::os::fd::RawFd, packet: &Packet) -> io::Result<bool> {
     match unix::send_parts(fd, &[&[relay::PACKET], &packet.0], true) {
         Ok(()) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::ENOBUFS) => Ok(false),
+        Err(e)
+            if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::ENOBUFS) =>
+        {
+            Ok(false)
+        }
         Err(e) => Err(e),
     }
 }
@@ -208,7 +215,9 @@ impl Interface for Link {
                     return Poll::Ready(Err(RecvError::Closed));
                 }
                 Ok(n) if n > relay::MAX_MESSAGE => {
-                    shared.close(Some("the world sent a message longer than 65,536 bytes".into()));
+                    shared.close(Some(
+                        "the world sent a message longer than 65,536 bytes".into(),
+                    ));
                     return Poll::Ready(Err(RecvError::Closed));
                 }
                 Ok(n) => match relay::decode(&self.buf[..n]) {

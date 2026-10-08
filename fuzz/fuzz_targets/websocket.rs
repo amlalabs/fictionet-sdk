@@ -5,11 +5,11 @@ use fictionet::stdlib::codec::{Decode, Step, Wire};
 use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::websocket::{
-    Close, Error, Frame, Frames, Header, MAX_HEADERS, MAX_MESSAGE, Message, Messages, Opcode, Role, check_request,
-    check_response, request_headers,
-};
 use fictionet::stdlib::websocket::harness::bounded;
+use fictionet::stdlib::websocket::{
+    Close, Error, Frame, Frames, Header, MAX_HEADERS, MAX_MESSAGE, Message, Messages, Opcode, Role,
+    check_request, check_response, request_headers,
+};
 use libfuzzer_sys::fuzz_target;
 
 fn check_clone(mut decoder: Messages, data: &[u8]) {
@@ -40,9 +40,13 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(close) = Close::parse(data) {
         assert_eq!(close.to_bytes().unwrap(), data);
     }
-    let limit = data
-        .first()
-        .map_or(MAX_MESSAGE, |&b| if b & 1 == 0 { MAX_MESSAGE } else { usize::from(b) });
+    let limit = data.first().map_or(MAX_MESSAGE, |&b| {
+        if b & 1 == 0 {
+            MAX_MESSAGE
+        } else {
+            usize::from(b)
+        }
+    });
     for role in [Role::Server, Role::Client] {
         let frames = || Frames::new(role).with_limit(limit);
         let messages = || Messages::new(role).with_limit(limit);
@@ -50,7 +54,11 @@ fuzz_target!(|data: &[u8]| {
         bounded(messages, data);
         contract::check_decode_with_held_limit(messages, data, limit);
         check_clone(messages(), data);
-        let mask = if role == Role::Server { Some([1, 2, 3, 4]) } else { None };
+        let mask = if role == Role::Server {
+            Some([1, 2, 3, 4])
+        } else {
+            None
+        };
         for message in decode_all(messages, data).0 {
             let frame = message.to_frame(mask).unwrap();
             contract::check_wire_value(&frame);
@@ -84,15 +92,28 @@ fuzz_target!(|data: &[u8]| {
         assert!(data.starts_with(&written));
     }
     let payload: Vec<_> = data.iter().take(4096).copied().collect();
-    for opcode in [Opcode::Text, Opcode::Binary, Opcode::Continuation, Opcode::Close, Opcode::Ping, Opcode::Pong] {
+    for opcode in [
+        Opcode::Text,
+        Opcode::Binary,
+        Opcode::Continuation,
+        Opcode::Close,
+        Opcode::Ping,
+        Opcode::Pong,
+    ] {
         contract::check_wire_value(&Frame {
             fin: data.first().is_some_and(|b| b & 1 != 0),
             opcode,
-            mask: data.first().is_some_and(|b| b & 2 != 0).then_some([1, 2, 3, 4]),
+            mask: data
+                .first()
+                .is_some_and(|b| b & 2 != 0)
+                .then_some([1, 2, 3, 4]),
             payload: payload.clone(),
         });
     }
-    let code = u16::from_be_bytes([data.first().copied().unwrap_or(0), data.get(1).copied().unwrap_or(0)]);
+    let code = u16::from_be_bytes([
+        data.first().copied().unwrap_or(0),
+        data.get(1).copied().unwrap_or(0),
+    ]);
     let reason = String::from_utf8_lossy(&payload).into_owned();
     let close = Close {
         code,

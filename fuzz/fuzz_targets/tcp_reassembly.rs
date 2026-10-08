@@ -1,7 +1,7 @@
 #![no_main]
 
 use arbitrary::Arbitrary;
-use fictionet::stdlib::tcp_reassembly::{FlowKey, Limits, Reassembler, Segment, Chunk};
+use fictionet::stdlib::tcp_reassembly::{Chunk, FlowKey, Limits, Reassembler, Segment};
 use libfuzzer_sys::fuzz_target;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;

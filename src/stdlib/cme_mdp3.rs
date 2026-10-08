@@ -17952,9 +17952,7 @@ impl fictionet::stdlib::codec::Wire for Packet {
         let header = PacketHeader {
             sequence: u32::from_le_bytes(sequence.try_into().map_err(|_| Error::Truncated)?),
             sending_time: u64::from_le_bytes(
-                sending_time
-                    .try_into()
-                    .map_err(|_| Error::Truncated)?,
+                sending_time.try_into().map_err(|_| Error::Truncated)?,
             ),
         };
         let mut rest = bytes.get(PACKET_HEADER..).unwrap_or_default();
@@ -17963,7 +17961,9 @@ impl fictionet::stdlib::codec::Wire for Packet {
             if messages.len() >= MAX_PACKET_MESSAGES {
                 return Err(Error::Limit);
             }
-            let step = Messages.decode(rest, true).map_err(|FrameError::Size| Error::Layout)?;
+            let step = Messages
+                .decode(rest, true)
+                .map_err(|FrameError::Size| Error::Layout)?;
             let Step::Item(message, used) = step else {
                 return Err(Error::Truncated);
             };
@@ -17989,8 +17989,7 @@ impl fictionet::stdlib::codec::Wire for Packet {
                 return Err(Error::Limit);
             }
         }
-        out.try_reserve(packet.len())
-            .map_err(|_| Error::Limit)?;
+        out.try_reserve(packet.len()).map_err(|_| Error::Limit)?;
         out.extend_from_slice(&packet);
         Ok(())
     }
@@ -18081,10 +18080,7 @@ mod framing_tests {
             ]
         );
         assert_eq!(Packet::parse(&bytes).unwrap(), packet);
-        for (at, error) in [
-            (12, Error::Layout),
-            (16, Error::Header),
-        ] {
+        for (at, error) in [(12, Error::Layout), (16, Error::Header)] {
             let mut bad = bytes.clone();
             bad[at] = if at == 12 { 1 } else { 13 };
             assert_eq!(Packet::parse(&bad), Err(error));
@@ -18109,7 +18105,10 @@ mod framing_tests {
         let bytes = [&good[..], &unknown, &good, &longer, &good].concat();
         let mut stream = Stream::new(Messages);
         let mut items = Vec::new();
-        assert_eq!(pump(&mut stream, &bytes, |m| items.push(m)), Ok(bytes.len()));
+        assert_eq!(
+            pump(&mut stream, &bytes, |m| items.push(m)),
+            Ok(bytes.len())
+        );
         finish(&mut stream, |m| items.push(m)).unwrap();
         assert_eq!(
             items,

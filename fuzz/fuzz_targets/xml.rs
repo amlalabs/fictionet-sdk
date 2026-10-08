@@ -8,11 +8,17 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::xml::{Attribute, Builder, Document, ErrorKind, Event, Events, Name, Start, XMLNS_NAMESPACE};
+use fictionet::stdlib::xml::{
+    Attribute, Builder, Document, ErrorKind, Event, Events, Name, Start, XMLNS_NAMESPACE,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Events::new, data, 2 * (fictionet::stdlib::xml::MAX_DOCUMENT + 1));
+    contract::check_decode_with_alloc_limit(
+        Events::new,
+        data,
+        2 * (fictionet::stdlib::xml::MAX_DOCUMENT + 1),
+    );
     contract::check_wire::<fictionet::stdlib::xml::Document>(data);
     contract::check_wire_value(&fictionet::stdlib::xml::Document {
         data: data.to_vec(),
@@ -20,7 +26,9 @@ fuzz_target!(|data: &[u8]| {
     let whole = decode_all(Events::new, data);
 
     // A document read can be written, and reads back the same.
-    if let (events, None) = &whole && !events.is_empty() {
+    if let (events, None) = &whole
+        && !events.is_empty()
+    {
         let mut w = Builder::new();
         let mut written = true;
         for e in events {
@@ -67,7 +75,11 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn events(data: &[u8]) {
-    let uris = [None, Some(Arc::<str>::from("urn:a")), Some(Arc::<str>::from("urn:b"))];
+    let uris = [
+        None,
+        Some(Arc::<str>::from("urn:a")),
+        Some(Arc::<str>::from("urn:b")),
+    ];
     let prefixes = [None, Some("p"), Some("q")];
     let name = |b: u8| Name {
         prefix: prefixes[usize::from(b % 3)].map(String::from),
@@ -89,14 +101,24 @@ fn events(data: &[u8]) {
                     let prefix = (local != "xmlns").then(|| "xmlns".to_string());
                     let value = ["", "urn:a", "urn:b"][usize::from(a / 6 % 3)].to_string();
                     attributes.push(Attribute {
-                        name: Name { prefix, local: local.into(), namespace: xmlns.clone() },
+                        name: Name {
+                            prefix,
+                            local: local.into(),
+                            namespace: xmlns.clone(),
+                        },
                         value,
                     });
                 }
                 if a & 64 != 0 {
-                    attributes.push(Attribute { name: name(b / 2), value: "v".into() });
+                    attributes.push(Attribute {
+                        name: name(b / 2),
+                        value: "v".into(),
+                    });
                 }
-                Event::Start(Start { name: name(b), attributes })
+                Event::Start(Start {
+                    name: name(b),
+                    attributes,
+                })
             }
             2 => match open.last() {
                 Some(n) if a % 4 != 0 => Event::End(n.clone()),
@@ -126,7 +148,10 @@ fn events(data: &[u8]) {
         let bytes = out.to_bytes().unwrap();
         let (read, error) = decode_all(Events::new, &bytes);
         assert_eq!(error, None);
-        let read: Vec<Event> = read.into_iter().filter(|e| matches!(e, Event::Start(_) | Event::End(_))).collect();
+        let read: Vec<Event> = read
+            .into_iter()
+            .filter(|e| matches!(e, Event::Start(_) | Event::End(_)))
+            .collect();
         assert_eq!(read, tags, "{out:?}");
     }
 }

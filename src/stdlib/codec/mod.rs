@@ -146,22 +146,22 @@ use alloc::vec::Vec;
 
 pub mod ascii;
 pub mod base64;
-pub mod civil;
-pub mod crc32c;
-pub mod field;
-pub mod leb128;
-pub mod head_body;
 mod buffer;
+pub mod civil;
 mod combinators;
+pub mod crc32c;
 mod demux;
 mod faults;
+pub mod field;
 mod frames;
+pub mod head_body;
 mod interceptor;
+mod layout;
 mod lcg;
-mod work;
+pub mod leb128;
 mod pipe;
 mod reader;
-mod layout;
+mod work;
 pub use fictionet::layout;
 mod recorder;
 mod stream;
@@ -172,17 +172,17 @@ pub use combinators::{
     Map,
 };
 pub use demux::Demux;
-pub use frames::{Frames, Prefixed};
 pub use faults::{ByteFault, FaultDelay, FaultError, Faults, ItemFault, Rule, Trigger};
+pub use frames::{Frames, Prefixed};
 pub use interceptor::{
     InterceptError, Interceptor, Rewrite, RewriteError, SkipPolicy, append_bounded, write_bounded,
 };
 pub use lcg::Lcg;
-pub use work::Work;
 pub use pipe::{Carry, DEFAULT_SPANS, Layered, Pipe, PipeError, Span, Spans};
 pub use reader::{Reader, Trailing, Truncated, be16, be24, be32, be64, le16, le24, le32, le64};
 pub use recorder::{Direction, Record, RecordKind, Recorder};
 pub use stream::{Fail, PumpError, Stream, StreamEvent, finish, pump, try_pump};
+pub use work::Work;
 
 /// A refused codec operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,8 +202,15 @@ pub enum Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Work { name, limit, used, charge } =>
-                write!(f, "{name}: work charge {charge} exceeds allowance {limit} with {used} used"),
+            Self::Work {
+                name,
+                limit,
+                used,
+                charge,
+            } => write!(
+                f,
+                "{name}: work charge {charge} exceeds allowance {limit} with {used} used"
+            ),
         }
     }
 }

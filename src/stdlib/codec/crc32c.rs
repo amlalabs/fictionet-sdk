@@ -22,7 +22,11 @@ const CRC32C_TABLE: [u32; 256] = {
         let mut c = i as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { (c >> 1) ^ 0x82f6_3b78 } else { c >> 1 };
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0x82f6_3b78
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         table[i] = c;
@@ -39,6 +43,11 @@ mod tests {
         assert_eq!(checksum(b""), 0);
         assert_eq!(checksum(b"123456789"), 0xe306_9283);
         assert_eq!(checksum(&[0; 32]), 0x8a91_36aa);
-        for i in 0..=9 { assert_eq!(!update(update(!0, &b"123456789"[..i]), &b"123456789"[i..]), 0xe306_9283); }
+        for i in 0..=9 {
+            assert_eq!(
+                !update(update(!0, &b"123456789"[..i]), &b"123456789"[i..]),
+                0xe306_9283
+            );
+        }
     }
 }

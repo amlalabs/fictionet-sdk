@@ -3,14 +3,15 @@
 
 use fictionet::stdlib::{
     codec::Wire,
-    test_support::contract, test_support::chunks,
     rfb::{ClientMessages, ServerMessages},
+    test_support::chunks,
+    test_support::contract,
 };
 
-use fictionet::stdlib::rfb::{
-    ClientMessage, Dialect, PixelFormat, Phase, ServerInit, ServerMessage, Version, Text,
-};
 use fictionet::stdlib::rfb::harness;
+use fictionet::stdlib::rfb::{
+    ClientMessage, Dialect, Phase, PixelFormat, ServerInit, ServerMessage, Text, Version,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -22,8 +23,16 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire_value(&ClientMessage::ClientCutText(
         data.iter().take(4097).copied().collect(),
     ));
-    contract::check_decode_with_alloc_limit(ClientMessages::new, data, 2 * fictionet::stdlib::rfb::MAX_CLIENT_MESSAGE);
-    contract::check_decode_with_alloc_limit(ServerMessages::new, data, 2 * fictionet::stdlib::rfb::MAX_MESSAGE);
+    contract::check_decode_with_alloc_limit(
+        ClientMessages::new,
+        data,
+        2 * fictionet::stdlib::rfb::MAX_CLIENT_MESSAGE,
+    );
+    contract::check_decode_with_alloc_limit(
+        ServerMessages::new,
+        data,
+        2 * fictionet::stdlib::rfb::MAX_MESSAGE,
+    );
     let selectors = [
         data.first().copied().unwrap_or(0),
         data.get(1).copied().unwrap_or(0),
@@ -82,9 +91,19 @@ fuzz_target!(|data: &[u8]| {
         input,
         8192,
     );
-    let Some((&choice, data)) = data.split_first() else { return };
+    let Some((&choice, data)) = data.split_first() else {
+        return;
+    };
     let vnc = choice & 1 == 1;
-    let version = [Version::V3_3, Version::V3_7, Version::V3_8, Version { major: 3, minor: 889 }][usize::from(choice >> 1) % 4];
+    let version = [
+        Version::V3_3,
+        Version::V3_7,
+        Version::V3_8,
+        Version {
+            major: 3,
+            minor: 889,
+        },
+    ][usize::from(choice >> 1) % 4];
 
     // Compare the sessions across pushes, including sends inside partial units.
     let data = &data[..data.len().min(4096)];

@@ -146,13 +146,17 @@ fn takes_next_word(w: &str, next: &str) -> bool {
     if w == "-C" {
         return DENIC_CHARSETS.iter().any(|c| c.eq_ignore_ascii_case(next));
     }
-    let Some(group) = w.strip_prefix('-') else { return false };
+    let Some(group) = w.strip_prefix('-') else {
+        return false;
+    };
     if group.starts_with('-') {
         return false;
     }
     let mut chars = group.chars();
     while let Some(c) = chars.next() {
-        let wants = FLAGS_WITH_ARGUMENT.iter().any(|f| f.strip_prefix('-').is_some_and(|r| r.chars().eq([c])));
+        let wants = FLAGS_WITH_ARGUMENT
+            .iter()
+            .any(|f| f.strip_prefix('-').is_some_and(|r| r.chars().eq([c])));
         if wants {
             return chars.as_str().is_empty();
         }
@@ -199,7 +203,9 @@ impl std::fmt::Display for Error {
         match self {
             Error::QueryTooLong => write!(f, "a query line longer than {MAX_QUERY} bytes"),
             Error::NotUtf8 => f.write_str("a query line that is not UTF-8"),
-            Error::Control(c) => write!(f, "control character {:#x} in a query line", u32::from(*c)),
+            Error::Control(c) => {
+                write!(f, "control character {:#x} in a query line", u32::from(*c))
+            }
             Error::Flags => f.write_str("query flags and terms that would not read back as given"),
             Error::Incomplete => f.write_str("incomplete WHOIS query"),
             Error::Trailing => f.write_str("bytes after WHOIS query"),
@@ -236,7 +242,9 @@ impl Query {
     /// [`MAX_QUERY`] bytes or holds a control character other than a tab.
     pub fn new(text: &str) -> Result<Query, Error> {
         check_query(text)?;
-        Ok(Query { text: text.to_string() })
+        Ok(Query {
+            text: text.to_string(),
+        })
     }
 
     /// A query of `flags` and then `terms`, each word with one space
@@ -263,7 +271,9 @@ impl Query {
         text.push_str(terms);
         let query = Query::new(&text)?;
         let (read, read_terms) = query.split();
-        let words = read.iter().flat_map(|f| std::iter::once(f.name).chain(f.argument));
+        let words = read
+            .iter()
+            .flat_map(|f| std::iter::once(f.name).chain(f.argument));
         if !words.eq(flags.iter().copied()) || read_terms != trim(terms) {
             return Err(Error::Flags);
         }
@@ -371,7 +381,9 @@ impl Response {
         if bytes.len() > MAX_RESPONSE {
             return Err(Error::ResponseTooLong);
         }
-        Ok(Response { bytes: bytes.to_vec() })
+        Ok(Response {
+            bytes: bytes.to_vec(),
+        })
     }
 
     /// Builds a response of `Key: value` lines ended by CRLF, with a blank
@@ -419,7 +431,11 @@ impl Response {
                     return Err(Error::Unwritable);
                 }
                 if i > 0 {
-                    let extra = if line.is_empty() { 3 } else { CONTINUATION_INDENT.len() + line.len() + 2 };
+                    let extra = if line.is_empty() {
+                        3
+                    } else {
+                        CONTINUATION_INDENT.len() + line.len() + 2
+                    };
                     need = need.checked_add(extra).ok_or(Error::ResponseTooLong)?;
                 }
             }
@@ -447,7 +463,9 @@ impl Response {
                 out.push_str("\r\n");
             }
         }
-        Ok(Response { bytes: out.into_bytes() })
+        Ok(Response {
+            bytes: out.into_bytes(),
+        })
     }
 
     /// The bytes a server sends before it closes the connection.
@@ -491,7 +509,11 @@ pub struct Field {
 impl Field {
     /// A field with this block, key and value.
     pub fn new(block: usize, key: &str, value: &str) -> Field {
-        Field { block, key: key.to_string(), value: value.to_string() }
+        Field {
+            block,
+            key: key.to_string(),
+            value: value.to_string(),
+        }
     }
 
     /// Whether the key is `key`, ignoring ASCII case.
@@ -530,7 +552,12 @@ pub struct FieldReader<'a> {
 impl<'a> FieldReader<'a> {
     /// A reader of the fields of `text`.
     pub fn new(text: &'a str) -> FieldReader<'a> {
-        FieldReader { lines: text.split('\n'), block: 0, block_has_field: false, pending: None }
+        FieldReader {
+            lines: text.split('\n'),
+            block: 0,
+            block_has_field: false,
+            pending: None,
+        }
     }
 }
 
@@ -575,7 +602,11 @@ impl Iterator for FieldReader<'_> {
             if !is_comment(body)
                 && let Some((key, value)) = key_line(body)
             {
-                let field = Field { block: self.block, key: key.to_string(), value: value.to_string() };
+                let field = Field {
+                    block: self.block,
+                    key: key.to_string(),
+                    value: value.to_string(),
+                };
                 self.pending = Some((field, indent));
                 self.block_has_field = true;
             }
@@ -603,7 +634,9 @@ fn key_line(body: &str) -> Option<(&str, &str)> {
     // A colon followed by a space, a tab or the end ends any key. Any
     // other colon ends only an RPSL name, and not before `//`, so a URL
     // at the start of a line stays free text.
-    let delimited = rest.is_empty() || rest.starts_with([' ', '\t']) || (is_rpsl_name(key) && !rest.starts_with("//"));
+    let delimited = rest.is_empty()
+        || rest.starts_with([' ', '\t'])
+        || (is_rpsl_name(key) && !rest.starts_with("//"));
     if !ok || !delimited {
         return None;
     }
@@ -617,7 +650,8 @@ fn is_rpsl_name(s: &str) -> bool {
     let b = s.as_bytes();
     matches!(b.first(), Some(c) if c.is_ascii_alphabetic())
         && matches!(b.last(), Some(c) if c.is_ascii_alphanumeric())
-        && b.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        && b.iter()
+            .all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
 /// Takes spaces and tabs off both ends.
@@ -673,9 +707,13 @@ impl ReferralKind {
 
     /// The kind of referral a field's key gives, ignoring ASCII case.
     pub fn from_key(key: &str) -> Option<ReferralKind> {
-        [ReferralKind::Refer, ReferralKind::RegistrarWhoisServer, ReferralKind::ReferralServer]
-            .into_iter()
-            .find(|k| key.eq_ignore_ascii_case(k.key()))
+        [
+            ReferralKind::Refer,
+            ReferralKind::RegistrarWhoisServer,
+            ReferralKind::ReferralServer,
+        ]
+        .into_iter()
+        .find(|k| key.eq_ignore_ascii_case(k.key()))
     }
 }
 
@@ -767,7 +805,11 @@ impl Referral {
             value.push(':');
             value.push_str(&self.port.to_string());
         }
-        Ok(Field { block, key: self.kind.key().to_string(), value })
+        Ok(Field {
+            block,
+            key: self.kind.key().to_string(),
+            value,
+        })
     }
 }
 
@@ -799,7 +841,9 @@ fn check_host(host: &str) -> Result<(), Error> {
     let name = host.strip_suffix('.').unwrap_or(host);
     let ok = !host.starts_with('-')
         && name.split('.').all(|l| !l.is_empty() && l.len() <= 63)
-        && host.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_'));
+        && host.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_')
+        });
     if ok { Ok(()) } else { Err(Error::Unwritable) }
 }
 
@@ -812,10 +856,7 @@ impl Wire for Query {
     /// bytes, incomplete input, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Self::ParseError> {
         let mut decoder = Queries::new();
-        match decoder
-            .decode(bytes, true)
-            .map_err(|_| Error::Incomplete)?
-        {
+        match decoder.decode(bytes, true).map_err(|_| Error::Incomplete)? {
             Step::Item(query, used) if used == bytes.len() => query,
             Step::Item(Err(e), _) => Err(e),
             Step::Item(_, _) => Err(Error::Trailing),
@@ -1001,12 +1042,10 @@ impl Decode for CollectedResponses {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
-    use codec::{
-        Lcg, Stream,
-    };
+    use codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// An answer in the layout Verisign uses for .com, cut short.
@@ -1101,27 +1140,60 @@ mod tests {
         let q = Query::new("-B -T inetnum 193.0.0.1").unwrap();
         assert_eq!(
             q.flags(),
-            [Flag { name: "-B", argument: None }, Flag { name: "-T", argument: Some("inetnum") }]
+            [
+                Flag {
+                    name: "-B",
+                    argument: None
+                },
+                Flag {
+                    name: "-T",
+                    argument: Some("inetnum")
+                }
+            ]
         );
         assert_eq!(q.terms(), "193.0.0.1");
         let q = Query::new("-T dn,ace example.de").unwrap();
-        assert_eq!(q.flags(), [Flag { name: "-T", argument: Some("dn,ace") }]);
+        assert_eq!(
+            q.flags(),
+            [Flag {
+                name: "-T",
+                argument: Some("dn,ace")
+            }]
+        );
         assert_eq!(q.terms(), "example.de");
         let q = Query::new("  --sources\tRIPE  -r   AS3333  ").unwrap();
         assert_eq!(
             q.flags(),
-            [Flag { name: "--sources", argument: Some("RIPE") }, Flag { name: "-r", argument: None }]
+            [
+                Flag {
+                    name: "--sources",
+                    argument: Some("RIPE")
+                },
+                Flag {
+                    name: "-r",
+                    argument: None
+                }
+            ]
         );
         assert_eq!(q.terms(), "AS3333");
         // ARIN and Verisign keywords stay in the terms.
         let q = Query::new("n + 8.8.8.8").unwrap();
         assert!(q.flags().is_empty());
         assert_eq!(q.terms(), "n + 8.8.8.8");
-        assert_eq!(Query::new("domain example.com").unwrap().terms(), "domain example.com");
+        assert_eq!(
+            Query::new("domain example.com").unwrap().terms(),
+            "domain example.com"
+        );
         assert_eq!(Query::new("=example.com").unwrap().terms(), "=example.com");
         // A flag that wants an argument at the end has none.
         let q = Query::new("-i").unwrap();
-        assert_eq!(q.flags(), [Flag { name: "-i", argument: None }]);
+        assert_eq!(
+            q.flags(),
+            [Flag {
+                name: "-i",
+                argument: None
+            }]
+        );
         assert_eq!(q.terms(), "");
         // A dash alone is a term.
         assert_eq!(Query::new("- x").unwrap().terms(), "- x");
@@ -1136,7 +1208,16 @@ mod tests {
         let q = Query::new("-T dn,ace -C UTF-8 example.de").unwrap();
         assert_eq!(
             q.flags(),
-            [Flag { name: "-T", argument: Some("dn,ace") }, Flag { name: "-C", argument: Some("UTF-8") }]
+            [
+                Flag {
+                    name: "-T",
+                    argument: Some("dn,ace")
+                },
+                Flag {
+                    name: "-C",
+                    argument: Some("UTF-8")
+                }
+            ]
         );
         assert_eq!(q.terms(), "example.de");
     }
@@ -1167,12 +1248,26 @@ mod tests {
         assert_eq!(Query::new("a\u{85}"), Err(Error::Control('\u{85}')));
         assert!(Query::new("a\tb").is_ok());
         assert_eq!(Query::parse(b"\xffabc\r\n"), Err(Error::NotUtf8));
-        assert_eq!(Query::parse(&[vec![b'a'; MAX_QUERY + 1], b"\r\n".to_vec()].concat()), Err(Error::QueryTooLong));
+        assert_eq!(
+            Query::parse(&[vec![b'a'; MAX_QUERY + 1], b"\r\n".to_vec()].concat()),
+            Err(Error::QueryTooLong)
+        );
         assert!(Query::parse(&[vec![b'a'; MAX_QUERY], b"\r\n".to_vec()].concat()).is_ok());
-        assert_eq!(Query::new(&"a".repeat(MAX_QUERY + 1)), Err(Error::QueryTooLong));
+        assert_eq!(
+            Query::new(&"a".repeat(MAX_QUERY + 1)),
+            Err(Error::QueryTooLong)
+        );
         assert_eq!(Query::build(&["x"; 2000], ""), Err(Error::QueryTooLong));
-        assert_eq!(Query::build(&[&"a".repeat(MAX_QUERY)], "b"), Err(Error::QueryTooLong));
-        for e in [Error::QueryTooLong, Error::NotUtf8, Error::Control('\0'), Error::Flags] {
+        assert_eq!(
+            Query::build(&[&"a".repeat(MAX_QUERY)], "b"),
+            Err(Error::QueryTooLong)
+        );
+        for e in [
+            Error::QueryTooLong,
+            Error::NotUtf8,
+            Error::Control('\0'),
+            Error::Flags,
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1183,7 +1278,10 @@ mod tests {
         bytes.extend_from_slice(b"\r\nok\r\n");
         let got = decode_all(Queries::new, &bytes).0;
         contract::check_decode_with_alloc_limit(Queries::new, &bytes, 2 * (MAX_QUERY + 2));
-        assert_eq!(got, [Err(Error::QueryTooLong), Ok(Query::new("ok").unwrap())]);
+        assert_eq!(
+            got,
+            [Err(Error::QueryTooLong), Ok(Query::new("ok").unwrap())]
+        );
         // A line one byte too long, ended by a bare LF, is an error too.
         let mut d = Stream::new(Queries::new());
         let mut line = vec![b'a'; MAX_QUERY + 1];
@@ -1194,24 +1292,43 @@ mod tests {
         let mut line = vec![b'a'; MAX_QUERY];
         line.extend_from_slice(b"\r\n");
         assert_eq!(d.push(&line), line.len());
-        assert_eq!(d.next().unwrap().unwrap().unwrap().as_str().len(), MAX_QUERY);
+        assert_eq!(
+            d.next().unwrap().unwrap().unwrap().as_str().len(),
+            MAX_QUERY
+        );
     }
 
     #[test]
     fn verisign_layout() {
         let fields = parse_fields(VERISIGN).unwrap();
         assert_eq!(fields[0], Field::new(0, "Domain Name", "EXAMPLE.COM"));
-        assert_eq!(fields[2], Field::new(0, "Registrar WHOIS Server", "whois.iana.org"));
+        assert_eq!(
+            fields[2],
+            Field::new(0, "Registrar WHOIS Server", "whois.iana.org")
+        );
         assert_eq!(fields[3].value, "http://res-dom.iana.org");
-        assert_eq!(fields[7].key, "URL of the ICANN Whois Inaccuracy Complaint Form");
+        assert_eq!(
+            fields[7].key,
+            "URL of the ICANN Whois Inaccuracy Complaint Form"
+        );
         assert_eq!(fields[7].value, "https://www.icann.org/wicf/");
         // NOTICE starts a field in block 1, and the next line, at the
         // same indent, is free text.
         assert_eq!(fields.len(), 9);
         assert_eq!(fields[8].key, "NOTICE");
         assert_eq!(fields[8].block, 1);
-        let r = Response::new(VERISIGN.as_bytes()).unwrap().referral().unwrap();
-        assert_eq!(r, Referral { kind: ReferralKind::RegistrarWhoisServer, host: "whois.iana.org".into(), port: 43 });
+        let r = Response::new(VERISIGN.as_bytes())
+            .unwrap()
+            .referral()
+            .unwrap();
+        assert_eq!(
+            r,
+            Referral {
+                kind: ReferralKind::RegistrarWhoisServer,
+                host: "whois.iana.org".into(),
+                port: 43
+            }
+        );
     }
 
     #[test]
@@ -1222,7 +1339,11 @@ mod tests {
             [
                 Field::new(0, "inetnum", "193.0.0.0 - 193.0.7.255"),
                 Field::new(0, "netname", "RIPE-NCC"),
-                Field::new(0, "descr", "RIPE Network Coordination Centre\nAmsterdam, Netherlands\n\nmain office"),
+                Field::new(
+                    0,
+                    "descr",
+                    "RIPE Network Coordination Centre\nAmsterdam, Netherlands\n\nmain office"
+                ),
                 Field::new(0, "country", "NL"),
                 Field::new(1, "route", "193.0.0.0/21"),
                 Field::new(1, "origin", "AS3333"),
@@ -1240,10 +1361,21 @@ mod tests {
         assert_eq!(fields.len(), 6);
         assert_eq!(
             find_referral(&fields),
-            Some(Referral { kind: ReferralKind::Refer, host: "whois.verisign-grs.com".into(), port: 43 })
+            Some(Referral {
+                kind: ReferralKind::Refer,
+                host: "whois.verisign-grs.com".into(),
+                port: 43
+            })
         );
         let r = Response::new(ARIN.as_bytes()).unwrap().referral().unwrap();
-        assert_eq!(r, Referral { kind: ReferralKind::ReferralServer, host: "whois.ripe.net".into(), port: 43 });
+        assert_eq!(
+            r,
+            Referral {
+                kind: ReferralKind::ReferralServer,
+                host: "whois.ripe.net".into(),
+                port: 43
+            }
+        );
     }
 
     #[test]
@@ -1252,10 +1384,22 @@ mod tests {
         let r = read("ReferralServer", "WHOIS://Whois.Example.NET:4343/").unwrap();
         assert_eq!((r.host.as_str(), r.port), ("whois.example.net", 4343));
         assert_eq!(read("refer", "whois.nic.example:43").unwrap().port, 43);
-        assert_eq!(read("REFER", "whois.nic.example").unwrap().kind, ReferralKind::Refer);
-        assert_eq!(read("registrar whois server", "whois.x").unwrap().kind, ReferralKind::RegistrarWhoisServer);
-        assert_eq!(read("ReferralServer", "rwhois://rwhois.example.net:4321"), None);
-        assert_eq!(read("Registrar WHOIS Server", "https://whois.example"), None);
+        assert_eq!(
+            read("REFER", "whois.nic.example").unwrap().kind,
+            ReferralKind::Refer
+        );
+        assert_eq!(
+            read("registrar whois server", "whois.x").unwrap().kind,
+            ReferralKind::RegistrarWhoisServer
+        );
+        assert_eq!(
+            read("ReferralServer", "rwhois://rwhois.example.net:4321"),
+            None
+        );
+        assert_eq!(
+            read("Registrar WHOIS Server", "https://whois.example"),
+            None
+        );
         assert_eq!(read("Registrar WHOIS Server", ""), None);
         assert_eq!(read("refer", "host:0"), None);
         assert_eq!(read("refer", "host:"), None);
@@ -1271,19 +1415,42 @@ mod tests {
 
     #[test]
     fn referral_round_trips() {
-        for kind in [ReferralKind::Refer, ReferralKind::RegistrarWhoisServer, ReferralKind::ReferralServer] {
+        for kind in [
+            ReferralKind::Refer,
+            ReferralKind::RegistrarWhoisServer,
+            ReferralKind::ReferralServer,
+        ] {
             for port in [43, 1, 4343, 65535] {
-                let r = Referral { kind, host: "whois.example-1.net".into(), port };
+                let r = Referral {
+                    kind,
+                    host: "whois.example-1.net".into(),
+                    port,
+                };
                 let f = r.to_field(2).unwrap();
                 assert_eq!(f.block, 2);
                 assert_eq!(Referral::from_field(&f), Some(r.clone()));
-                let resp = Response::from_fields(&[Field::new(0, "a", "b"), Field::new(1, &f.key, &f.value)]).unwrap();
+                let resp = Response::from_fields(&[
+                    Field::new(0, "a", "b"),
+                    Field::new(1, &f.key, &f.value),
+                ])
+                .unwrap();
                 assert_eq!(resp.referral(), Some(r));
             }
         }
-        let r = Referral { kind: ReferralKind::ReferralServer, host: "h".into(), port: 4343 };
+        let r = Referral {
+            kind: ReferralKind::ReferralServer,
+            host: "h".into(),
+            port: 4343,
+        };
         assert_eq!(r.to_field(0).unwrap().value, "whois://h:4343");
-        let bad = |host: &str, port| Referral { kind: ReferralKind::Refer, host: host.into(), port }.to_field(0);
+        let bad = |host: &str, port| {
+            Referral {
+                kind: ReferralKind::Refer,
+                host: host.into(),
+                port,
+            }
+            .to_field(0)
+        };
         assert_eq!(bad("Upper.example", 43), Err(Error::Unwritable));
         assert_eq!(bad("", 43), Err(Error::Unwritable));
         assert_eq!(bad(".x", 43), Err(Error::Unwritable));
@@ -1295,27 +1462,45 @@ mod tests {
     fn field_layout_rules() {
         // Comments end a field, and so does free text.
         let text = "a: 1\n% c\n  more\nb: 2\nfree text\n  more\n";
-        assert_eq!(parse_fields(text).unwrap(), [Field::new(0, "a", "1"), Field::new(0, "b", "2")]);
+        assert_eq!(
+            parse_fields(text).unwrap(),
+            [Field::new(0, "a", "1"), Field::new(0, "b", "2")]
+        );
         // A colon must be followed by a space, a tab or the end, unless
         // the key is an RPSL name.
         let text = "http://x\nk:v\ntime 12:30\nk:\nj:\tv \r\n";
         assert_eq!(
             parse_fields(text).unwrap(),
-            [Field::new(0, "k", "v"), Field::new(0, "k", ""), Field::new(0, "j", "v")]
+            [
+                Field::new(0, "k", "v"),
+                Field::new(0, "k", ""),
+                Field::new(0, "j", "v")
+            ]
         );
         // A value on the lines after an empty one.
         let text = "    Registrant:\n        Example Ltd\n        London\n    Status: ok\n";
         assert_eq!(
             parse_fields(text).unwrap(),
-            [Field::new(0, "Registrant", "Example Ltd\nLondon"), Field::new(0, "Status", "ok")]
+            [
+                Field::new(0, "Registrant", "Example Ltd\nLondon"),
+                Field::new(0, "Status", "ok")
+            ]
         );
         // Keys that are too long, empty, or start with + are not keys.
         let long = format!("{}: v\n", "k".repeat(MAX_KEY + 1));
         assert_eq!(parse_fields(&long).unwrap(), []);
-        assert_eq!(parse_fields(&format!("{}: v", "k".repeat(MAX_KEY))).unwrap().len(), 1);
+        assert_eq!(
+            parse_fields(&format!("{}: v", "k".repeat(MAX_KEY)))
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(parse_fields(": v\n+k: v\n").unwrap(), []);
         // Blank lines with no field before them do not start a block.
-        assert_eq!(parse_fields("\n\n \t\na: 1\n\n\nb: 2").unwrap(), [Field::new(0, "a", "1"), Field::new(1, "b", "2")]);
+        assert_eq!(
+            parse_fields("\n\n \t\na: 1\n\n\nb: 2").unwrap(),
+            [Field::new(0, "a", "1"), Field::new(1, "b", "2")]
+        );
         assert_eq!(parse_fields("").unwrap(), []);
         assert!(Field::new(0, "Refer", "x").key_is("REFER"));
     }
@@ -1326,7 +1511,10 @@ mod tests {
         assert_eq!(parse_fields(&text).unwrap().len(), MAX_FIELDS);
         let text = "k: v\n".repeat(MAX_FIELDS + 1);
         assert_eq!(parse_fields(&text), Err(Error::TooManyFields));
-        assert_eq!(Response::new(text.as_bytes()).unwrap().fields(), Err(Error::TooManyFields));
+        assert_eq!(
+            Response::new(text.as_bytes()).unwrap().fields(),
+            Err(Error::TooManyFields)
+        );
         assert!(!Error::TooManyFields.to_string().is_empty());
         let fields = vec![Field::new(0, "k", "v"); MAX_FIELDS + 1];
         assert_eq!(Response::from_fields(&fields), Err(Error::ResponseTooLong));
@@ -1336,7 +1524,9 @@ mod tests {
     #[test]
     fn writer_errors() {
         let one = |k: &str, v: &str| Response::from_fields(&[Field::new(0, k, v)]);
-        for key in ["", " k", "k ", "a:b", "%k", "#k", ">k", "+k", "k\tx", "k\u{7f}"] {
+        for key in [
+            "", " k", "k ", "a:b", "%k", "#k", ">k", "+k", "k\tx", "k\u{7f}",
+        ] {
             assert_eq!(one(key, "v"), Err(Error::Unwritable), "{key:?}");
         }
         assert_eq!(one(&"k".repeat(MAX_KEY + 1), "v"), Err(Error::Unwritable));
@@ -1361,11 +1551,20 @@ mod tests {
         );
         let big = "v".repeat(MAX_RESPONSE);
         assert_eq!(one("k", &big), Err(Error::ResponseTooLong));
-        assert_eq!(Response::from_fields(&[Field::new(0, "k", &big)]), Err(Error::ResponseTooLong));
+        assert_eq!(
+            Response::from_fields(&[Field::new(0, "k", &big)]),
+            Err(Error::ResponseTooLong)
+        );
         // A value with more lines than one response holds is refused
         // before it is split.
-        assert_eq!(one("k", &"a\n".repeat(MAX_RESPONSE)), Err(Error::ResponseTooLong));
-        assert_eq!(Response::new(&vec![0; MAX_RESPONSE + 1]), Err(Error::ResponseTooLong));
+        assert_eq!(
+            one("k", &"a\n".repeat(MAX_RESPONSE)),
+            Err(Error::ResponseTooLong)
+        );
+        assert_eq!(
+            Response::new(&vec![0; MAX_RESPONSE + 1]),
+            Err(Error::ResponseTooLong)
+        );
         assert!(Response::new(&vec![0; MAX_RESPONSE]).is_ok());
         for e in [Error::Unwritable, Error::ResponseTooLong] {
             assert!(!e.to_string().is_empty());
@@ -1402,14 +1601,21 @@ mod tests {
         let r = &items[0].response;
         assert_eq!(r.as_bytes().len(), MAX_RESPONSE);
         assert_eq!(r.as_bytes().last(), Some(&b'y'));
-        contract::check_decode_with_alloc_limit(CollectedResponses::new, &bytes, 2 * RESPONSE_WINDOW);
+        contract::check_decode_with_alloc_limit(
+            CollectedResponses::new,
+            &bytes,
+            2 * RESPONSE_WINDOW,
+        );
         let r = Response::new(b"owner: M\xfcller\n").unwrap();
         assert_eq!(r.fields().unwrap()[0].value, "M\u{fffd}ller");
     }
 
     #[test]
     fn every_truncated_prefix() {
-        let q = Query::new("-B -T inetnum 193.0.0.1").unwrap().to_bytes().unwrap();
+        let q = Query::new("-B -T inetnum 193.0.0.1")
+            .unwrap()
+            .to_bytes()
+            .unwrap();
         for n in 0..q.len() {
             let mut d = Stream::new(Queries::new());
             assert_eq!(d.push(&q[..n]), n);
@@ -1437,14 +1643,22 @@ mod tests {
         let mut rng = Lcg::new(0x5eed_3912);
         let seeds = [VERISIGN, RIPE, IANA, ARIN, "-B -T inetnum 193.0.0.1\r\n"];
         for _ in 0..4000 {
-            let mut data = if rng.coin() { seeds[rng.index(seeds.len())].as_bytes().to_vec() } else { rng.bytes(300) };
+            let mut data = if rng.coin() {
+                seeds[rng.index(seeds.len())].as_bytes().to_vec()
+            } else {
+                rng.bytes(300)
+            };
             if rng.index(16) == 0 {
                 data = vec![b'x'; MAX_QUERY + 1 + rng.index(MAX_QUERY)];
                 data.extend_from_slice(b"\r\nexample.com\r\n");
             }
             mutate(&mut rng, &mut data);
             contract::check_decode_with_alloc_limit(Queries::new, &data, 2 * (MAX_QUERY + 2));
-            contract::check_decode_with_alloc_limit(CollectedResponses::new, &data, 2 * RESPONSE_WINDOW);
+            contract::check_decode_with_alloc_limit(
+                CollectedResponses::new,
+                &data,
+                2 * RESPONSE_WINDOW,
+            );
             contract::check_wire::<Query>(&data);
             contract::check_wire::<Response>(&data);
             for q in decode_all(Queries::new, &data).0.iter().flatten() {
@@ -1457,7 +1671,11 @@ mod tests {
             let mut parts: Vec<_> = text.split(' ').collect();
             let terms = parts.pop().unwrap_or("");
             if let Ok(query) = Query::build(&parts, terms) {
-                let words: Vec<_> = query.flags().iter().flat_map(|f| std::iter::once(f.name).chain(f.argument)).collect();
+                let words: Vec<_> = query
+                    .flags()
+                    .iter()
+                    .flat_map(|f| std::iter::once(f.name).chain(f.argument))
+                    .collect();
                 assert_eq!(words, parts);
                 assert_eq!(query.terms(), trim(terms));
                 contract::check_wire_value(&query);
@@ -1470,7 +1688,10 @@ mod tests {
             }
             for field in &fields {
                 if let Some(referral) = Referral::from_field(field) {
-                    assert_eq!(Referral::from_field(&referral.to_field(field.block).unwrap()), Some(referral));
+                    assert_eq!(
+                        Referral::from_field(&referral.to_field(field.block).unwrap()),
+                        Some(referral)
+                    );
                 }
             }
             assert_eq!(response.referral(), find_referral(&fields));
@@ -1511,8 +1732,15 @@ mod tests {
         for length in [0, 1, MAX_QUERY - 1, MAX_QUERY, MAX_QUERY + 1, 3 * MAX_QUERY] {
             for ending in [b"\r\n".as_slice(), b"\n"] {
                 let data = [vec![b'a'; length], ending.to_vec(), b"next\r\n".to_vec()].concat();
-                let expected = if length > MAX_QUERY { Err(Error::QueryTooLong) } else { Query::new(&"a".repeat(length)) };
-                assert_eq!(decode_all(Queries::new, &data), (vec![expected, Query::new("next")], None));
+                let expected = if length > MAX_QUERY {
+                    Err(Error::QueryTooLong)
+                } else {
+                    Query::new(&"a".repeat(length))
+                };
+                assert_eq!(
+                    decode_all(Queries::new, &data),
+                    (vec![expected, Query::new("next")], None)
+                );
                 contract::check_decode_with_alloc_limit(Queries::new, &data, 2 * (MAX_QUERY + 2));
             }
         }
@@ -1523,40 +1751,91 @@ mod tests {
         // RIPE's `-C` (`--no-irt`) takes no argument, so the address is the
         // term. DENIC's `-C` takes a character set name.
         let q = Query::new("-C 193.0.0.1").unwrap();
-        assert_eq!(q.flags(), [Flag { name: "-C", argument: None }]);
+        assert_eq!(
+            q.flags(),
+            [Flag {
+                name: "-C",
+                argument: None
+            }]
+        );
         assert_eq!(q.terms(), "193.0.0.1");
         assert_eq!(Query::new("-C AS3333 x").unwrap().terms(), "AS3333 x");
-        assert_eq!(Query::new("-C utf-8 example.de").unwrap().flags()[0].argument, Some("utf-8"));
-        assert_eq!(Query::build(&["-C"], "193.0.0.1").unwrap().terms(), "193.0.0.1");
+        assert_eq!(
+            Query::new("-C utf-8 example.de").unwrap().flags()[0].argument,
+            Some("utf-8")
+        );
+        assert_eq!(
+            Query::build(&["-C"], "193.0.0.1").unwrap().terms(),
+            "193.0.0.1"
+        );
         // `-Z` (`--charset`) and `-S` (`--resources`) take an argument.
         let q = Query::new("-Z UTF-8 AS3333").unwrap();
-        assert_eq!(q.flags(), [Flag { name: "-Z", argument: Some("UTF-8") }]);
+        assert_eq!(
+            q.flags(),
+            [Flag {
+                name: "-Z",
+                argument: Some("UTF-8")
+            }]
+        );
         assert_eq!(q.terms(), "AS3333");
-        assert_eq!(Query::new("-S ARIN-GRS 193.201.1.1").unwrap().terms(), "193.201.1.1");
-        assert_eq!(Query::new("--charset UTF-8 AS3333").unwrap().terms(), "AS3333");
+        assert_eq!(
+            Query::new("-S ARIN-GRS 193.201.1.1").unwrap().terms(),
+            "193.201.1.1"
+        );
+        assert_eq!(
+            Query::new("--charset UTF-8 AS3333").unwrap().terms(),
+            "AS3333"
+        );
         // Short flags grouped in one word: the last one may take the
         // next word, and one inside the group takes the rest of the word.
         let q = Query::new("-Bi tech-c DW-RIPE").unwrap();
-        assert_eq!(q.flags(), [Flag { name: "-Bi", argument: Some("tech-c") }]);
+        assert_eq!(
+            q.flags(),
+            [Flag {
+                name: "-Bi",
+                argument: Some("tech-c")
+            }]
+        );
         assert_eq!(q.terms(), "DW-RIPE");
         let q = Query::new("-Tas-set AS-FOO").unwrap();
-        assert_eq!(q.flags(), [Flag { name: "-Tas-set", argument: None }]);
+        assert_eq!(
+            q.flags(),
+            [Flag {
+                name: "-Tas-set",
+                argument: None
+            }]
+        );
         assert_eq!(q.terms(), "AS-FOO");
         assert_eq!(Query::new("-rB AS3333").unwrap().terms(), "AS3333");
-        assert_eq!(Query::build(&["-Bi", "origin"], "AS3333").unwrap().terms(), "AS3333");
+        assert_eq!(
+            Query::build(&["-Bi", "origin"], "AS3333").unwrap().terms(),
+            "AS3333"
+        );
         assert_eq!(Query::build(&["-Bi"], "origin AS3333"), Err(Error::Flags));
     }
 
     #[test]
     fn rpsl_values_right_after_the_colon() {
         // RFC 2622, section 2: the name, a colon, then the value.
-        assert_eq!(parse_fields("origin:AS3333\n").unwrap(), [Field::new(0, "origin", "AS3333")]);
-        assert_eq!(parse_fields("remarks:a: b\n").unwrap(), [Field::new(0, "remarks", "a: b")]);
-        assert_eq!(parse_fields("descr: a: b\n").unwrap(), [Field::new(0, "descr", "a: b")]);
+        assert_eq!(
+            parse_fields("origin:AS3333\n").unwrap(),
+            [Field::new(0, "origin", "AS3333")]
+        );
+        assert_eq!(
+            parse_fields("remarks:a: b\n").unwrap(),
+            [Field::new(0, "remarks", "a: b")]
+        );
+        assert_eq!(
+            parse_fields("descr: a: b\n").unwrap(),
+            [Field::new(0, "descr", "a: b")]
+        );
         // A key is never read with a colon in it.
         assert_eq!(parse_fields("time 12:30: x\n").unwrap(), []);
         // Free text that is not an RPSL name, or a URL, is not a field.
-        assert_eq!(parse_fields("see https://icann.org/epp\nhttp://x\nab-:c\n1a:b\n").unwrap(), []);
+        assert_eq!(
+            parse_fields("see https://icann.org/epp\nhttp://x\nab-:c\n1a:b\n").unwrap(),
+            []
+        );
     }
 
     #[test]
@@ -1572,16 +1851,32 @@ mod tests {
         assert_eq!(read("[2001:db8::1"), None);
         assert_eq!(read("[example.net]"), None);
         assert_eq!(read("[fe80::1%eth0]"), None);
-        for kind in [ReferralKind::Refer, ReferralKind::RegistrarWhoisServer, ReferralKind::ReferralServer] {
+        for kind in [
+            ReferralKind::Refer,
+            ReferralKind::RegistrarWhoisServer,
+            ReferralKind::ReferralServer,
+        ] {
             for port in [43, 4343] {
-                let r = Referral { kind, host: "2001:db8::1".into(), port };
+                let r = Referral {
+                    kind,
+                    host: "2001:db8::1".into(),
+                    port,
+                };
                 let f = r.to_field(0).unwrap();
                 assert_eq!(Referral::from_field(&f), Some(r));
             }
         }
-        let r = Referral { kind: ReferralKind::Refer, host: "2001:db8::1".into(), port: 4343 };
+        let r = Referral {
+            kind: ReferralKind::Refer,
+            host: "2001:db8::1".into(),
+            port: 4343,
+        };
         assert_eq!(r.to_field(0).unwrap().value, "[2001:db8::1]:4343");
-        let bad = Referral { kind: ReferralKind::Refer, host: "2001:DB8::1".into(), port: 43 };
+        let bad = Referral {
+            kind: ReferralKind::Refer,
+            host: "2001:DB8::1".into(),
+            port: 43,
+        };
         assert_eq!(bad.to_field(0), Err(Error::Unwritable));
     }
 
@@ -1594,11 +1889,21 @@ mod tests {
         assert_eq!(read("a..example"), None);
         assert!(read("whois.example.").is_some());
         assert_eq!(read("whois.example.."), None);
-        let longest = ["a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61)].join(".");
+        let longest = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61),
+        ]
+        .join(".");
         assert_eq!(longest.len(), MAX_HOST);
         assert!(read(&longest).is_some());
         assert_eq!(read(&format!("{longest}e")), None);
-        let bad = Referral { kind: ReferralKind::Refer, host: "a..b".into(), port: 43 };
+        let bad = Referral {
+            kind: ReferralKind::Refer,
+            host: "a..b".into(),
+            port: 43,
+        };
         assert_eq!(bad.to_field(0), Err(Error::Unwritable));
     }
 
@@ -1625,12 +1930,18 @@ mod tests {
             );
         }
         // A blank line between blocks counts too.
-        let fields = [Field::new(0, "k", ""), Field::new(1, "k", &"a".repeat(MAX_RESPONSE - 11))];
+        let fields = [
+            Field::new(0, "k", ""),
+            Field::new(1, "k", &"a".repeat(MAX_RESPONSE - 11)),
+        ];
         assert_eq!(
             Response::from_fields(&fields).unwrap().as_bytes().len(),
             MAX_RESPONSE
         );
-        let fields = [Field::new(0, "k", ""), Field::new(1, "k", &"a".repeat(MAX_RESPONSE - 10))];
+        let fields = [
+            Field::new(0, "k", ""),
+            Field::new(1, "k", &"a".repeat(MAX_RESPONSE - 10)),
+        ];
         assert_eq!(Response::from_fields(&fields), Err(Error::ResponseTooLong));
     }
 
@@ -1641,10 +1952,16 @@ mod tests {
         assert_eq!(stream.next(), None);
         assert_eq!(stream.buffered(), 4);
         assert_eq!(stream.push(b"ple.com\r\n"), 9);
-        assert_eq!(stream.next().unwrap().unwrap().unwrap().as_str(), "example.com");
+        assert_eq!(
+            stream.next().unwrap().unwrap().unwrap().as_str(),
+            "example.com"
+        );
         assert_eq!(stream.buffered(), 0);
         let (_, failure) = decode_all(Queries::new, b"exam");
-        assert_eq!(failure, Some(codec::Fail::Protocol(codec::LineError::Unterminated)));
+        assert_eq!(
+            failure,
+            Some(codec::Fail::Protocol(codec::LineError::Unterminated))
+        );
     }
 
     #[test]
@@ -1662,11 +1979,15 @@ mod tests {
                 if i > 0 && rng.index(4) == 0 {
                     block += 1;
                 }
-                let key: String = (0..1 + rng.index(10)).map(|_| KEY[rng.index(KEY.len())] as char).collect();
+                let key: String = (0..1 + rng.index(10))
+                    .map(|_| KEY[rng.index(KEY.len())] as char)
+                    .collect();
                 let key = format!("k{}k", key);
                 let lines: Vec<String> = (0..1 + rng.index(3))
                     .map(|_| {
-                        let s: String = (0..rng.index(12)).map(|_| VALUE[rng.index(VALUE.len())] as char).collect();
+                        let s: String = (0..rng.index(12))
+                            .map(|_| VALUE[rng.index(VALUE.len())] as char)
+                            .collect();
                         trim(&s).to_string()
                     })
                     .collect();
@@ -1678,8 +1999,18 @@ mod tests {
             }
             let resp = Response::from_fields(&fields).unwrap();
             assert_eq!(resp.fields().unwrap(), fields);
-            contract::check_decode_with_alloc_limit(CollectedResponses::new, resp.as_bytes(), 2 * RESPONSE_WINDOW);
-            assert_eq!(decode_all(CollectedResponses::new, resp.as_bytes()).0[0].response.fields().unwrap(), fields);
+            contract::check_decode_with_alloc_limit(
+                CollectedResponses::new,
+                resp.as_bytes(),
+                2 * RESPONSE_WINDOW,
+            );
+            assert_eq!(
+                decode_all(CollectedResponses::new, resp.as_bytes()).0[0]
+                    .response
+                    .fields()
+                    .unwrap(),
+                fields
+            );
         }
     }
 }

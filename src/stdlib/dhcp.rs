@@ -120,7 +120,10 @@ impl Message {
 
     /// The value of option `code`.
     pub fn option(&self, code: u8) -> Option<&[u8]> {
-        self.options.iter().find(|(c, _)| *c == code).map(|(_, v)| v.as_slice())
+        self.options
+            .iter()
+            .find(|(c, _)| *c == code)
+            .map(|(_, v)| v.as_slice())
     }
 
     /// The message type (option 53).
@@ -307,7 +310,10 @@ mod tests {
         assert_eq!(bytes.len(), PADDED_LEN);
         assert_eq!(&bytes[236..247], &[99, 130, 83, 99, 53, 1, 1, 50, 4, 10, 0]);
         assert_eq!(Message::parse(&bytes), Ok(m.clone()));
-        assert_eq!((m.message_type(), m.option_addr(opt::REQUESTED_IP)), (Some(DISCOVER), Some(Ipv4Addr::new(10, 0, 0, 2))));
+        assert_eq!(
+            (m.message_type(), m.option_addr(opt::REQUESTED_IP)),
+            (Some(DISCOVER), Some(Ipv4Addr::new(10, 0, 0, 2)))
+        );
         check_wire::<Message>(&bytes);
         check_wire_value(&m);
     }
@@ -334,7 +340,10 @@ mod tests {
         split.truncate(MIN_MESSAGE);
         split.extend_from_slice(&[6, 4, 1, 1, 1, 1, 53, 1, 3, 6, 4, 8, 8, 8, 8, opt::END]);
         let m = Message::parse(&split).unwrap();
-        assert_eq!(m.options, [(6, vec![1, 1, 1, 1, 8, 8, 8, 8]), (53, vec![3])]);
+        assert_eq!(
+            m.options,
+            [(6, vec![1, 1, 1, 1, 8, 8, 8, 8]), (53, vec![3])]
+        );
         check_wire::<Message>(&split);
     }
 
@@ -346,8 +355,14 @@ mod tests {
         magic[236] = 0;
         assert_eq!(Message::parse(&magic), Err(Error::Magic));
         // An option cut short, in its length or its value.
-        assert_eq!(Message::parse(&[&bytes[..MIN_MESSAGE], &[53]].concat()), Err(Error::Truncated));
-        assert_eq!(Message::parse(&[&bytes[..MIN_MESSAGE], &[53, 2, 1]].concat()), Err(Error::Truncated));
+        assert_eq!(
+            Message::parse(&[&bytes[..MIN_MESSAGE], &[53]].concat()),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            Message::parse(&[&bytes[..MIN_MESSAGE], &[53, 2, 1]].concat()),
+            Err(Error::Truncated)
+        );
         // No end option is allowed; anything but padding after it is not.
         assert!(Message::parse(&[&bytes[..MIN_MESSAGE], &[53, 1, 1]].concat()).is_ok());
         let mut trailing = bytes.clone();
@@ -360,7 +375,11 @@ mod tests {
     #[test]
     fn messages_that_would_read_back_otherwise_are_not_written() {
         let mut out = vec![1, 2, 3];
-        for (code, err) in [(opt::PAD, Error::Reserved(0)), (opt::END, Error::Reserved(255)), (53, Error::Duplicate(53))] {
+        for (code, err) in [
+            (opt::PAD, Error::Reserved(0)),
+            (opt::END, Error::Reserved(255)),
+            (53, Error::Duplicate(53)),
+        ] {
             let mut m = discover();
             m.push(code, [1]);
             assert_eq!(m.write(&mut out), Err(err));

@@ -1,14 +1,13 @@
 #![no_main]
 
-use fictionet::stdlib::codec::Frames;
 use core::time::Duration;
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::{
     codec::{
         ByteFault, Carry, Decode, Direction, Ending, Faults, Interceptor, ItemFault, Lines, Pipe,
-        PumpError, Recorder, Rewrite, Rule, Stream, StreamEvent, Trigger, Wire,
-        write_bounded,
-    }, test_support,
-    json, modbus,
+        PumpError, Recorder, Rewrite, Rule, Stream, StreamEvent, Trigger, Wire, write_bounded,
+    },
+    json, modbus, test_support,
 };
 use libfuzzer_sys::fuzz_target;
 

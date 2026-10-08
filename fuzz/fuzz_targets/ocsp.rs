@@ -4,12 +4,12 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::ocsp::{
     AlgorithmIdentifier, BasicResponse, CertId, CertStatus, CrlReason, Extension, Frames,
     MAX_NONCE, Request, ResponderId, Response, ResponseBytes, ResponseData, ResponseStatus,
     SingleRequest, SingleResponse, decode_get_path, encode_get_path, find_nonce,
 };
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 /// Takes the next `n` bytes, or what is left.

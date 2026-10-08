@@ -38,7 +38,10 @@ pub(crate) struct Object {
 
 impl Object {
     pub(crate) fn new() -> Object {
-        Object { out: String::from("{"), first: true }
+        Object {
+            out: String::from("{"),
+            first: true,
+        }
     }
 
     fn key(&mut self, k: &str) {
@@ -110,12 +113,20 @@ mod tests {
 
     #[test]
     fn strings_are_escaped() {
-        assert_eq!(quote("a\"b\\c\n</script>\u{1}"), r#""a\"b\\c\n\u003c/script>\u0001""#);
+        assert_eq!(
+            quote("a\"b\\c\n</script>\u{1}"),
+            r#""a\"b\\c\n\u003c/script>\u0001""#
+        );
     }
 
     #[test]
     fn objects_and_arrays() {
-        let o = Object::new().str("id", "t1").num("line", 5).bool("ok", true).opt_str("p", None).done();
+        let o = Object::new()
+            .str("id", "t1")
+            .num("line", 5)
+            .bool("ok", true)
+            .opt_str("p", None)
+            .done();
         assert_eq!(o, r#"{"id":"t1","line":5,"ok":true,"p":null}"#);
         assert_eq!(array(["1", "2"]), "[1,2]");
     }
@@ -150,7 +161,10 @@ impl Scalar {
 /// Parses a JSON object whose values are strings, numbers, booleans or
 /// null. `None` for anything else.
 pub(crate) fn parse_flat(text: &str) -> Option<std::collections::HashMap<String, Scalar>> {
-    let mut p = Parser { b: text.as_bytes(), i: 0 };
+    let mut p = Parser {
+        b: text.as_bytes(),
+        i: 0,
+    };
     let mut out = std::collections::HashMap::new();
     p.ws();
     p.eat(b'{')?;
@@ -212,10 +226,16 @@ impl Parser<'_> {
     }
     fn number(&mut self) -> Option<f64> {
         let start = self.i;
-        while matches!(self.peek(), Some(b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')) {
+        while matches!(
+            self.peek(),
+            Some(b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+        ) {
             self.i += 1;
         }
-        std::str::from_utf8(&self.b[start..self.i]).ok()?.parse().ok()
+        std::str::from_utf8(&self.b[start..self.i])
+            .ok()?
+            .parse()
+            .ok()
     }
     fn string(&mut self) -> Option<String> {
         self.eat(b'"')?;
@@ -240,7 +260,8 @@ impl Parser<'_> {
                         b'u' => {
                             let hex = std::str::from_utf8(self.b.get(self.i..self.i + 4)?).ok()?;
                             self.i += 4;
-                            let ch = char::from_u32(u32::from_str_radix(hex, 16).ok()?).unwrap_or('\u{fffd}');
+                            let ch = char::from_u32(u32::from_str_radix(hex, 16).ok()?)
+                                .unwrap_or('\u{fffd}');
                             let mut buf = [0; 4];
                             out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                         }
@@ -259,7 +280,10 @@ mod parse_tests {
 
     #[test]
     fn flat_objects_parse() {
-        let o = parse_flat(r#" {"op":"packets", "link":"e5","after":12, "x":true,"y":null,"s":"a\"A"} "#).unwrap();
+        let o = parse_flat(
+            r#" {"op":"packets", "link":"e5","after":12, "x":true,"y":null,"s":"a\"A"} "#,
+        )
+        .unwrap();
         assert_eq!(o["op"].as_str(), Some("packets"));
         assert_eq!(o["after"].as_u64(), Some(12));
         assert_eq!(o["x"], Scalar::Bool(true));

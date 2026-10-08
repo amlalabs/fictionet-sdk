@@ -7,13 +7,19 @@ use std::collections::BTreeMap;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::protobuf::{Frame, Varint, MAX_MESSAGE, MAX_VARINT_LEN, MAX_FIELDS, Message};
 use fictionet::stdlib::protobuf::harness::total_fields;
+use fictionet::stdlib::protobuf::{
+    Frame, MAX_FIELDS, MAX_MESSAGE, MAX_VARINT_LEN, Message, Varint,
+};
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * (MAX_MESSAGE + MAX_VARINT_LEN));
+    contract::check_decode_with_alloc_limit(
+        Frames::<Frame>::new,
+        data,
+        2 * (MAX_MESSAGE + MAX_VARINT_LEN),
+    );
     contract::check_wire::<Frame>(data);
     contract::check_wire::<Varint>(data);
     contract::check_wire::<Message>(data);
@@ -25,7 +31,11 @@ fuzz_target!(|data: &[u8]| {
         // number's fields alone, so the work stays linear in the fields.
         let mut by_number: BTreeMap<u32, Message> = BTreeMap::new();
         for f in &m.fields {
-            by_number.entry(f.number).or_default().fields.push(f.clone());
+            by_number
+                .entry(f.number)
+                .or_default()
+                .fields
+                .push(f.clone());
         }
         for (n, part) in &by_number {
             let n = *n;
@@ -33,7 +43,10 @@ fuzz_target!(|data: &[u8]| {
             // A merged message or group can be written and read back.
             if let Ok(Some(inner)) = part.message(n) {
                 let bytes = inner.to_bytes().unwrap();
-                assert_eq!(Message::parse(&bytes).map(|p| p.fields.len()), Ok(inner.fields.len()));
+                assert_eq!(
+                    Message::parse(&bytes).map(|p| p.fields.len()),
+                    Ok(inner.fields.len())
+                );
             }
             if let Some(g) = part.group(n) {
                 assert!(g.to_bytes().is_ok());

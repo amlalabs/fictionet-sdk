@@ -4,11 +4,11 @@
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::telnet::harness::merged;
 use fictionet::stdlib::telnet::{
     self, BinaryEvent, Event, Events, Negotiation, Side, Subnegotiation, option,
 };
-use fictionet::stdlib::telnet::harness::merged;
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 struct Session {
@@ -71,7 +71,10 @@ fuzz_target!(|data: &[u8]| {
             contract::check_decode_with_alloc_limit(make, data, 2 * telnet::MAX_EVENT_WIRE);
             contract::check_decode_with_held_limit(make, data, 0);
             let (events, _) = decode_all(make, data);
-            let kept: Vec<_> = events.into_iter().filter(|event| !matches!(event, Event::Error(_))).collect();
+            let kept: Vec<_> = events
+                .into_iter()
+                .filter(|event| !matches!(event, Event::Error(_)))
+                .collect();
             let mut written = Vec::new();
             for event in &kept {
                 if binary {
@@ -103,7 +106,11 @@ fuzz_target!(|data: &[u8]| {
     let event = Event::Data(data.iter().take(telnet::MAX_DATA + 1).copied().collect());
     contract::check_wire_value(&event);
     contract::check_wire_value(&BinaryEvent(event));
-    let payload: Vec<_> = data.iter().take(telnet::MAX_SUBNEGOTIATION + 1).copied().collect();
+    let payload: Vec<_> = data
+        .iter()
+        .take(telnet::MAX_SUBNEGOTIATION + 1)
+        .copied()
+        .collect();
     contract::check_wire_value(&Event::Subnegotiation {
         option: mode,
         data: payload.clone(),

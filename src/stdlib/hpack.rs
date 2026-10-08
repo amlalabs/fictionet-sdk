@@ -20,7 +20,7 @@
 //! # Ok::<(), fictionet::stdlib::hpack::Error>(())
 //! ```
 
-use fictionet::stdlib::codec::{Reader, Truncated, Trailing};
+use fictionet::stdlib::codec::{Reader, Trailing, Truncated};
 
 use fictionet::stdlib::{codec::Wire, huffman, prefix_int};
 use std::collections::VecDeque;
@@ -177,7 +177,9 @@ impl<'a> ReadFields<'a> for Reader<'a> {
         if len > limit {
             return Err(Error::StringTooLong);
         }
-        self.position().checked_add(len).ok_or(Error::StringTooLong)?;
+        self.position()
+            .checked_add(len)
+            .ok_or(Error::StringTooLong)?;
         let bytes = self.take(len)?;
         if coded {
             huffman::decode_limited(bytes, limit).map_err(|e| match e {
@@ -701,20 +703,23 @@ impl Encoder {
 
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Truncated }
+    fn from(_: Truncated) -> Self {
+        Error::Truncated
+    }
 }
 
 impl From<Trailing> for Error {
     #[inline]
-    fn from(_: Trailing) -> Self { Error::Trailing }
+    fn from(_: Trailing) -> Self {
+        Error::Trailing
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::prefix_int::Integer;
-
+    use fictionet::stdlib::test_support::hex;
 
     fn pairs(h: &[Header]) -> Vec<(&str, &str)> {
         h.iter()

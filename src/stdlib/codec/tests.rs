@@ -1,7 +1,7 @@
 use super::*;
-use fictionet::stdlib::test_support::{self, contract};
 use alloc::{rc::Rc, vec, vec::Vec};
 use core::{cell::Cell, convert::Infallible, fmt};
+use fictionet::stdlib::test_support::{self, contract};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TestError;
@@ -1512,7 +1512,10 @@ fn regression_pipe_end_with_unpushed_payload() {
 
 #[test]
 fn regression_demux_visits_only_ready_streams() {
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     struct Counted {
         calls: Arc<AtomicUsize>,
         held_calls: Arc<AtomicUsize>,
@@ -1552,7 +1555,11 @@ fn regression_demux_visits_only_ready_streams() {
         assert!(d.next().is_none());
         assert_eq!(d.total(), 0);
     }
-    assert!(calls.load(Ordering::Relaxed) <= 8192 * 2, "{} decode calls", calls.load(Ordering::Relaxed));
+    assert!(
+        calls.load(Ordering::Relaxed) <= 8192 * 2,
+        "{} decode calls",
+        calls.load(Ordering::Relaxed)
+    );
     assert!(
         held_calls.load(Ordering::Relaxed) <= 8192 * 12,
         "{} held calls",
@@ -2181,7 +2188,14 @@ fn regression_pipe_spans_cover_assembled_message() {
 
 #[test]
 fn pad_to_four_edges() {
-    for (n, want) in [(0, 0), (1, 4), (3, 4), (4, 4), (5, 8), (usize::MAX - 3, usize::MAX - 3)] {
+    for (n, want) in [
+        (0, 0),
+        (1, 4),
+        (3, 4),
+        (4, 4),
+        (5, 8),
+        (usize::MAX - 3, usize::MAX - 3),
+    ] {
         assert_eq!(super::pad_to_4(n), want);
     }
 }

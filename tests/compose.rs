@@ -5,8 +5,8 @@ mod common;
 
 use common::within;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc};
 use std::time::Duration;
 
 use fictionet::prelude::*;
@@ -77,7 +77,9 @@ fn a_sandbox_that_detached_before_it_was_taken_is_skipped() {
     within(Duration::from_secs(5), || {
         let (attacher, attachments) = attachments();
         block_on(run(move |fcx| async move {
-            let mut mapped = attachments.map(&fcx, |fcx, sandbox| stdlib::filter(fcx, sandbox, |_, _, _| true));
+            let mut mapped = attachments.map(&fcx, |fcx, sandbox| {
+                stdlib::filter(fcx, sandbox, |_, _, _| true)
+            });
             // Taking the barrier puts the first sandbox in the mapped queue.
             let first = attacher.attach("agent").unwrap();
             let barrier = attacher.attach("barrier").unwrap();
@@ -149,7 +151,9 @@ fn maps_chain_with_the_first_closest_to_the_sandbox() {
             let seen = Arc::new(AtomicUsize::new(0));
             let s = seen.clone();
             let mut mapped = attachments
-                .map(&fcx, |fcx, sandbox| stdlib::filter(fcx, sandbox, |_, _, p| p.0[0] != 0))
+                .map(&fcx, |fcx, sandbox| {
+                    stdlib::filter(fcx, sandbox, |_, _, p| p.0[0] != 0)
+                })
                 .map(&fcx, move |fcx, sandbox| {
                     let s = s.clone();
                     stdlib::filter(fcx, sandbox, move |_, _, _| {
@@ -211,7 +215,9 @@ fn mapped_attachments_box_as_interfaces() {
         let (attacher, attachments) = attachments();
         let mut agent = attacher.attach("agent").unwrap();
         block_on(run(move |fcx| async move {
-            let mut mapped = attachments.map(&fcx, |_fcx, sandbox| Box::new(sandbox) as Box<dyn Interface>);
+            let mut mapped = attachments.map(&fcx, |_fcx, sandbox| {
+                Box::new(sandbox) as Box<dyn Interface>
+            });
             let mut world: Box<dyn Interface> = Box::new(mapped.get(&fcx, "agent").await?);
             agent.send(Packet(vec![3]));
             assert_eq!(world.recv(&fcx).await?, Packet(vec![3]));

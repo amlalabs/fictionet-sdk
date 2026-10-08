@@ -30,10 +30,10 @@
 //! assert_eq!(Frame::parse_prefix(&bytes).unwrap(), Some((frame, bytes.len())));
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{le16, le24, Wire};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::{Wire, le16, le24};
 
 /// The TCP port IEC 104 servers normally listen on.
 pub const PORT: u16 = 2404;
@@ -290,11 +290,13 @@ impl Prefixed for Frame {
     /// [`Error::Start`], [`Error::ApduLength`], [`Error::Control`]
     /// or [`Error::AsduLength`].
     #[inline]
-    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        _limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         Frame::parse_prefix(input)
     }
 }
-
 
 /// An ASDU header followed by opaque information object bytes. Unknown
 /// type IDs and causes are preserved. Object layout is checked separately

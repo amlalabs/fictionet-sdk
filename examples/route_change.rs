@@ -19,21 +19,40 @@ const TIME_LIMIT: Duration = Duration::from_secs(10);
 
 /// Starts a machine at `addr` on `side` that answers every HTTP request
 /// on port 80 with `body`.
-fn web_machine(fcx: &Cx, side: impl Interface, addr: IpAddr, body: &'static str) -> fictionet::Result {
+fn web_machine(
+    fcx: &Cx,
+    side: impl Interface,
+    addr: IpAddr,
+    body: &'static str,
+) -> fictionet::Result {
     let (tcp, _udp, _icmp, _other) = ip::split_protocols(fcx, side);
     let listener = tcp::endpoint(fcx, tcp, addr).listen(80)?;
-    let site = httpd::Router::new().fallback(move |_, _| http::Response::new(bytes::Bytes::from(body)));
-    let opts = serve::ServeOptions::default().max_conns(MAX_CONNECTIONS).idle(Some(TIME_LIMIT));
-    serve::listen(fcx, listener, Arc::new(()), move || httpd::Http1::new(site.clone()), opts);
+    let site =
+        httpd::Router::new().fallback(move |_, _| http::Response::new(bytes::Bytes::from(body)));
+    let opts = serve::ServeOptions::default()
+        .max_conns(MAX_CONNECTIONS)
+        .idle(Some(TIME_LIMIT));
+    serve::listen(
+        fcx,
+        listener,
+        Arc::new(()),
+        move || httpd::Http1::new(site.clone()),
+        opts,
+    );
     Ok(())
 }
 
 fn main() -> fictionet::Result {
     let mut args = std::env::args().skip(1);
-    let path = args.next().unwrap_or_else(|| "/run/fictionet/world.sock".into());
+    let path = args
+        .next()
+        .unwrap_or_else(|| "/run/fictionet/world.sock".into());
     let after: u64 = args.next().map(|s| s.parse()).transpose()?.unwrap_or(20);
     let (attacher, mut attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
+    let _listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(path.clone().into()),
+        attacher,
+    )?;
     println!("listening on {path}");
 
     fictionet::block_on(fictionet::run(move |fcx| async move {
@@ -46,7 +65,10 @@ fn main() -> fictionet::Result {
         let router = route::router(
             &fcx,
             vec![
-                ("10.0.0.0/24".parse()?, Box::new(agent) as Box<dyn Interface>),
+                (
+                    "10.0.0.0/24".parse()?,
+                    Box::new(agent) as Box<dyn Interface>,
+                ),
                 ("203.0.113.0/24".parse()?, Box::new(to_bank)),
             ],
         );
@@ -58,7 +80,12 @@ fn main() -> fictionet::Result {
         // address now leads to the impostor. The rest of 203.0.113.0/24
         // still leads to the bank.
         let (to_impostor, impostor_side) = pair();
-        web_machine(&fcx, impostor_side, "203.0.113.10".parse()?, "an impostor\n")?;
+        web_machine(
+            &fcx,
+            impostor_side,
+            "203.0.113.10".parse()?,
+            "an impostor\n",
+        )?;
         router.add("203.0.113.10/32".parse()?, Box::new(to_impostor));
         println!("{after} s later: 203.0.113.10/32 leads to the impostor");
         Ok(())

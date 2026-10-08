@@ -32,8 +32,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType, SerialNumber,
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType, SerialNumber,
 };
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -95,11 +95,20 @@ fn name(fields: &[(DnType, &str)]) -> DistinguishedName {
     dn
 }
 
-fn ca_params(dn: DistinguishedName, path_len: u8, from: OffsetDateTime, to: OffsetDateTime) -> CertificateParams {
+fn ca_params(
+    dn: DistinguishedName,
+    path_len: u8,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+) -> CertificateParams {
     let mut params = CertificateParams::default();
     params.distinguished_name = dn;
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(path_len));
-    params.key_usages = vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
     params.not_before = from;
     params.not_after = to;
     params.serial_number = Some(serial());
@@ -111,10 +120,19 @@ impl Ca {
     /// ago and valid for fifteen years.
     pub fn root(common_name: &str) -> Result<Ca> {
         let from = days_ago(365, 4 * 365);
-        let params = ca_params(name(&[(DnType::CommonName, common_name)]), 0, from, from + Duration::days(15 * 365));
+        let params = ca_params(
+            name(&[(DnType::CommonName, common_name)]),
+            0,
+            from,
+            from + Duration::days(15 * 365),
+        );
         let key = KeyPair::generate()?;
         let cert = params.self_signed(&key)?;
-        Ok(Ca { der: cert.der().clone(), issuer: cert, key })
+        Ok(Ca {
+            der: cert.der().clone(),
+            issuer: cert,
+            key,
+        })
     }
 
     /// The CA in `dir`: `ca.pem` and `ca.key`.
@@ -137,7 +155,10 @@ impl Ca {
     pub fn leaf(&self, names: &[&str], addr: Ipv4Addr) -> Result<Leaf> {
         let from = days_ago(5, 60);
         let mut params = CertificateParams::default();
-        params.distinguished_name = name(&[(DnType::CommonName, &names[0].chars().take(64).collect::<String>())]);
+        params.distinguished_name = name(&[(
+            DnType::CommonName,
+            &names[0].chars().take(64).collect::<String>(),
+        )]);
         let mut sans = Vec::new();
         for n in names {
             sans.push(SanType::DnsName((*n).try_into()?));
@@ -166,7 +187,12 @@ pub fn rogue_ca() -> Result<Ca> {
 
 fn write_private(path: &Path, text: &str) -> Result<()> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
     f.write_all(text.as_bytes())?;
     Ok(())
 }
@@ -175,7 +201,12 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
 pub fn make_ca(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let from = days_ago(365, 4 * 365);
-    let params = ca_params(name(&[(DnType::CommonName, LAB_CA_NAME)]), 0, from, from + Duration::days(15 * 365));
+    let params = ca_params(
+        name(&[(DnType::CommonName, LAB_CA_NAME)]),
+        0,
+        from,
+        from + Duration::days(15 * 365),
+    );
     let key = KeyPair::generate()?;
     let cert = params.self_signed(&key)?;
     write_private(&dir.join("ca.key"), &key.serialize_pem())?;
@@ -208,7 +239,10 @@ pub fn make_pki(dir: &Path) -> Result<()> {
         name(&[
             (DnType::CountryName, "US"),
             (DnType::OrganizationName, "DigiCert Inc"),
-            (DnType::CommonName, "DigiCert Global G3 TLS ECC SHA384 2020 CA1"),
+            (
+                DnType::CommonName,
+                "DigiCert Global G3 TLS ECC SHA384 2020 CA1",
+            ),
         ]),
         0,
         datetime!(2021-04-14 00:00 UTC),

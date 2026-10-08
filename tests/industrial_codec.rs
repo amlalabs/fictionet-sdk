@@ -1,10 +1,8 @@
 //! Industrial transport frames through the shared codec driver.
 
-use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
-use fictionet::stdlib::codec::{
-    Decode, Fail, Step, Stream, Wire, finish, pump,
-};
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Decode, Fail, Step, Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::{dnp3, enip, iec104, opcua, rdp, tpkt};
@@ -26,7 +24,8 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    let (items, failure) = contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
+    let (items, failure) =
+        contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
     assert_eq!(items, expected);
     assert_eq!(failure, None);
     contract::check_decode_with_held_limit(&make, bytes, 0);
@@ -69,7 +68,10 @@ fn dnp3_application_request_and_response() {
         })
         .collect();
     let bytes = check_frames(Frames::<dnp3::Frame>::new, &frames);
-    let make = || Frames::<dnp3::Frame>::new().map(|frame| frame.segment().map(|s| dnp3::Fragment::parse(&s.data)));
+    let make = || {
+        Frames::<dnp3::Frame>::new()
+            .map(|frame| frame.segment().map(|s| dnp3::Fragment::parse(&s.data)))
+    };
     contract::check_decode(make, &bytes);
     decode_chunks(make, &bytes, &[Ok(Ok(request)), Ok(Ok(response))]);
     contract::check_truncated(Frames::<dnp3::Frame>::new, &frames[0].to_bytes().unwrap());
@@ -79,7 +81,10 @@ fn dnp3_application_request_and_response() {
         data: vec![0x42; dnp3::MAX_DATA],
         ..frames[0].clone()
     };
-    check_frames(Frames::<dnp3::Frame>::new, &[large.clone(), large.clone(), large]);
+    check_frames(
+        Frames::<dnp3::Frame>::new,
+        &[large.clone(), large.clone(), large],
+    );
     contract::check_refused(&dnp3::Frame {
         data: vec![0; dnp3::MAX_DATA + 1],
         ..frames[0].clone()
@@ -183,7 +188,11 @@ fn enip_cip_request_and_response() {
     };
     let packet = enip_packet(send.to_bytes().unwrap());
     let bytes = contract::check_exact(&packet);
-    decode_chunks(Frames::<enip::Packet>::new, &bytes, core::slice::from_ref(&packet));
+    decode_chunks(
+        Frames::<enip::Packet>::new,
+        &bytes,
+        core::slice::from_ref(&packet),
+    );
     let make = || {
         Frames::<enip::Packet>::new().map(|p| {
             let send = enip::SendData::parse(&p.data)?;
@@ -251,7 +260,11 @@ fn enip_preserves_permissive_framing_and_partial_packets() {
         Err(enip::Error::Options)
     );
     contract::check_refused(&raw);
-    decode_chunks(Frames::<enip::Packet>::new, &bytes, core::slice::from_ref(&raw));
+    decode_chunks(
+        Frames::<enip::Packet>::new,
+        &bytes,
+        core::slice::from_ref(&raw),
+    );
     bytes[20..24].copy_from_slice(&0u32.to_le_bytes());
     assert_eq!(
         <enip::Packet as Wire>::parse(&bytes),
@@ -340,7 +353,10 @@ fn opcua_handshake_and_multichunk_message() {
     finish(&mut stream, |message| parsed.push(message)).unwrap();
     assert_eq!(parsed, messages);
     assert_eq!(stream.held(), 0);
-    contract::check_truncated(Frames::<opcua::Chunk>::new, &Wire::to_bytes(&frames[0]).unwrap());
+    contract::check_truncated(
+        Frames::<opcua::Chunk>::new,
+        &Wire::to_bytes(&frames[0]).unwrap(),
+    );
     for message_type in [
         opcua::MessageType::Hello,
         opcua::MessageType::Open,
@@ -410,7 +426,11 @@ fn opcua_limits_headers_and_handshake_normalization() {
         body: vec![0; opcua::MAX_HANDSHAKE_SIZE as usize - opcua::HEADER_LEN],
     };
     let handshake_bytes = contract::check_exact(&handshake);
-    decode_chunks(Frames::<opcua::Chunk>::new, &handshake_bytes, core::slice::from_ref(&handshake));
+    decode_chunks(
+        Frames::<opcua::Chunk>::new,
+        &handshake_bytes,
+        core::slice::from_ref(&handshake),
+    );
     let mut bytes = Wire::to_bytes(&handshake).unwrap();
     bytes[3] = 0;
     assert_eq!(<opcua::Chunk as Wire>::parse(&bytes), Ok(handshake));
@@ -526,13 +546,20 @@ fn framing_errors_are_terminal_once_and_keep_unread_bytes() {
         D::Item: PartialEq + Debug,
         D::Error: Clone + PartialEq + Debug,
     {
-        assert_eq!(contract::check_decode(&make, bytes), (vec![], Some(Fail::Protocol(error))));
+        assert_eq!(
+            contract::check_decode(&make, bytes),
+            (vec![], Some(Fail::Protocol(error)))
+        );
         let mut stream = Stream::new(make());
         assert_eq!(stream.push(bytes), bytes.len());
         stream.next().unwrap().unwrap_err();
         assert_eq!(stream.unread(), bytes);
     }
-    check(Frames::<dnp3::Frame>::new, &[5, 0x64, 4], dnp3::Error::FrameLength);
+    check(
+        Frames::<dnp3::Frame>::new,
+        &[5, 0x64, 4],
+        dnp3::Error::FrameLength,
+    );
     check(
         Frames::<dnp3::Frame>::new,
         &[5, 0x64, 5, 0, 0, 0, 0, 0, 0, 0],

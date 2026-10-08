@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Waker};
@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use crate::attach::NameGuard;
 use crate::cx::CancelWait;
-use crate::relay::{self, Message, unix};
 use crate::relay::unix::cvt;
+use crate::relay::{self, Message, unix};
 use crate::{Attacher, Attachment, Cx, Packet, RecvError};
 
 /// Where a world listens for attach and observers.
@@ -46,7 +46,9 @@ impl std::str::FromStr for WorldSocket {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.strip_prefix("unix:") {
             Some(path) if !path.is_empty() => Ok(WorldSocket::UnixSocket(path.into())),
-            _ => Err(ParseWorldSocketError { input: s.to_owned() }),
+            _ => Err(ParseWorldSocketError {
+                input: s.to_owned(),
+            }),
         }
     }
 }
@@ -142,10 +144,26 @@ pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listen
     let listener = bind(&path)?;
     // SAFETY: plain syscalls; each fd is owned from here.
     let epoll = unsafe { OwnedFd::from_raw_fd(cvt(libc::epoll_create1(libc::EPOLL_CLOEXEC))?) };
-    let wake_fd =
-        unsafe { OwnedFd::from_raw_fd(cvt(libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC))?) };
-    epoll_ctl(epoll.as_raw_fd(), libc::EPOLL_CTL_ADD, listener.as_raw_fd(), libc::EPOLLIN as u32, LISTEN_TOKEN)?;
-    epoll_ctl(epoll.as_raw_fd(), libc::EPOLL_CTL_ADD, wake_fd.as_raw_fd(), libc::EPOLLIN as u32, WAKE_TOKEN)?;
+    let wake_fd = unsafe {
+        OwnedFd::from_raw_fd(cvt(libc::eventfd(
+            0,
+            libc::EFD_NONBLOCK | libc::EFD_CLOEXEC,
+        ))?)
+    };
+    epoll_ctl(
+        epoll.as_raw_fd(),
+        libc::EPOLL_CTL_ADD,
+        listener.as_raw_fd(),
+        libc::EPOLLIN as u32,
+        LISTEN_TOKEN,
+    )?;
+    epoll_ctl(
+        epoll.as_raw_fd(),
+        libc::EPOLL_CTL_ADD,
+        wake_fd.as_raw_fd(),
+        libc::EPOLLIN as u32,
+        WAKE_TOKEN,
+    )?;
     let shared = Arc::new(ListenShared {
         epoll,
         wake_fd,
@@ -158,7 +176,12 @@ pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listen
     std::thread::Builder::new()
         .name("fictionet-listen".into())
         .spawn(move || helper(helper_shared, listener, helper_attacher, closed_tx))?;
-    Ok(Listening { shared, path, closed: closed_rx, attacher })
+    Ok(Listening {
+        shared,
+        path,
+        closed: closed_rx,
+        attacher,
+    })
 }
 
 fn epoll_ctl(epoll: RawFd, op: libc::c_int, fd: RawFd, events: u32, token: u64) -> io::Result<()> {
@@ -174,13 +197,16 @@ fn bind(path: &Path) -> io::Result<OwnedFd> {
     let (addr, len) = unix::address(path)?;
     let fd = unix::socket(true)?;
     // SAFETY: `addr` is a valid sockaddr_un of length `len`.
-    let bound = |fd: &OwnedFd| cvt(unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), len) });
+    let bound =
+        |fd: &OwnedFd| cvt(unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), len) });
     if let Err(e) = bound(&fd) {
         if e.raw_os_error() != Some(libc::EADDRINUSE) {
             return Err(e);
         }
         use std::os::unix::fs::FileTypeExt;
-        let is_socket = std::fs::symlink_metadata(path).map(|m| m.file_type().is_socket()).unwrap_or(false);
+        let is_socket = std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false);
         let stale = is_socket
             && matches!(unix::connect(path), Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED));
         if !stale {
@@ -271,7 +297,13 @@ impl ConnSlot {
         if on {
             events |= libc::EPOLLOUT as u32;
         }
-        let _ = epoll_ctl(epoll, libc::EPOLL_CTL_MOD, self.fd.as_raw_fd(), events, self.token);
+        let _ = epoll_ctl(
+            epoll,
+            libc::EPOLL_CTL_MOD,
+            self.fd.as_raw_fd(),
+            events,
+            self.token,
+        );
     }
 }
 
@@ -298,7 +330,12 @@ struct Handshake {
 
 /// The helper thread: accepts connections, runs their handshakes, and wakes
 /// idle attachments when their connection becomes readable.
-fn helper(shared: Arc<ListenShared>, listener: OwnedFd, attacher: Attacher, closed: mpsc::Sender<()>) {
+fn helper(
+    shared: Arc<ListenShared>,
+    listener: OwnedFd,
+    attacher: Attacher,
+    closed: mpsc::Sender<()>,
+) {
     let epoll = shared.epoll.as_raw_fd();
     let mut listener = Some(listener);
     let mut handshakes: HashMap<u64, Handshake> = HashMap::new();
@@ -326,7 +363,13 @@ fn helper(shared: Arc<ListenShared>, listener: OwnedFd, attacher: Attacher, clos
             && until <= now
         {
             accept_paused = None;
-            let _ = epoll_ctl(epoll, libc::EPOLL_CTL_ADD, fd.as_raw_fd(), libc::EPOLLIN as u32, LISTEN_TOKEN);
+            let _ = epoll_ctl(
+                epoll,
+                libc::EPOLL_CTL_ADD,
+                fd.as_raw_fd(),
+                libc::EPOLLIN as u32,
+                LISTEN_TOKEN,
+            );
         }
         let timeout = handshakes
             .values()
@@ -337,14 +380,16 @@ fn helper(shared: Arc<ListenShared>, listener: OwnedFd, attacher: Attacher, clos
             .map(|d| d.as_millis().min(i32::MAX as u128) as i32 + 1)
             .unwrap_or(-1);
         // SAFETY: `events` is valid for 64 entries.
-        let n = unsafe { libc::epoll_wait(epoll, events.as_mut_ptr(), events.len() as i32, timeout) };
+        let n =
+            unsafe { libc::epoll_wait(epoll, events.as_mut_ptr(), events.len() as i32, timeout) };
         let n = if n < 0 { 0 } else { n as usize };
         for event in &events[..n] {
             let (token, flags) = (event.u64, event.events);
             match token {
                 LISTEN_TOKEN => {
                     let Some(fd) = &listener else { continue };
-                    if accept_all(fd.as_raw_fd(), epoll, &mut handshakes, &mut next_token).is_err() {
+                    if accept_all(fd.as_raw_fd(), epoll, &mut handshakes, &mut next_token).is_err()
+                    {
                         let _ = epoll_ctl(epoll, libc::EPOLL_CTL_DEL, fd.as_raw_fd(), 0, 0);
                         accept_paused = Some(Instant::now() + ACCEPT_RETRY);
                     }
@@ -356,7 +401,9 @@ fn helper(shared: Arc<ListenShared>, listener: OwnedFd, attacher: Attacher, clos
                 }
                 token if handshakes.contains_key(&token) => {
                     let handshake = handshakes.remove(&token).unwrap();
-                    if let Some(handshake) = handshake_step(&shared, &attacher, token, handshake, &mut buf) {
+                    if let Some(handshake) =
+                        handshake_step(&shared, &attacher, token, handshake, &mut buf)
+                    {
                         handshakes.insert(token, handshake);
                     }
                 }
@@ -402,13 +449,20 @@ fn accept_all(
     loop {
         // SAFETY: plain syscall; the fd is owned from here.
         let fd = unsafe {
-            libc::accept4(listener, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
+            libc::accept4(
+                listener,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            )
         };
         if fd < 0 {
             let err = io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::EINTR) | Some(libc::ECONNABORTED) => continue,
-                Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => return Err(err),
+                Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+                    return Err(err);
+                }
                 _ => return Ok(()),
             }
         }
@@ -416,8 +470,22 @@ fn accept_all(
         unix::raise_buffers(fd.as_raw_fd());
         let token = *next_token;
         *next_token += 1;
-        if epoll_ctl(epoll, libc::EPOLL_CTL_ADD, fd.as_raw_fd(), libc::EPOLLIN as u32, token).is_ok() {
-            handshakes.insert(token, Handshake { fd, deadline: Instant::now() + relay::HANDSHAKE_TIMEOUT });
+        if epoll_ctl(
+            epoll,
+            libc::EPOLL_CTL_ADD,
+            fd.as_raw_fd(),
+            libc::EPOLLIN as u32,
+            token,
+        )
+        .is_ok()
+        {
+            handshakes.insert(
+                token,
+                Handshake {
+                    fd,
+                    deadline: Instant::now() + relay::HANDSHAKE_TIMEOUT,
+                },
+            );
         }
     }
 }
@@ -489,7 +557,13 @@ fn handshake_step(
     });
     shared.conns.lock().unwrap().insert(token, slot.clone());
     let events = (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLET) as u32;
-    let _ = epoll_ctl(shared.epoll.as_raw_fd(), libc::EPOLL_CTL_MOD, fd, events, token);
+    let _ = epoll_ctl(
+        shared.epoll.as_raw_fd(),
+        libc::EPOLL_CTL_MOD,
+        fd,
+        events,
+        token,
+    );
     let link = SocketLink {
         listen: shared.clone(),
         token,
@@ -538,7 +612,10 @@ impl SocketLink {
     /// dropped, it says gone.
     pub(crate) fn peer_gone_check(&self) -> impl Fn() -> bool + Send + Sync + 'static {
         let slot = Arc::downgrade(&self.slot);
-        move || slot.upgrade().is_none_or(|s| s.name.lock().unwrap().is_none())
+        move || {
+            slot.upgrade()
+                .is_none_or(|s| s.name.lock().unwrap().is_none())
+        }
     }
 
     fn close(&mut self) {
@@ -553,7 +630,11 @@ impl SocketLink {
         self.slot.release_name();
     }
 
-    pub(crate) fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
+    pub(crate) fn poll_recv(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Packet, RecvError>> {
         // A cancel comes first, as it does for every wait.
         if fcx.is_cancelled() {
             return Poll::Ready(Err(RecvError::Cancelled));
@@ -625,7 +706,11 @@ impl SocketLink {
             self.slot.flush(&mut out, epoll);
         }
         if out.queue.is_empty() {
-            match unix::send_parts(self.slot.fd.as_raw_fd(), &[&[relay::PACKET], &packet.0], true) {
+            match unix::send_parts(
+                self.slot.fd.as_raw_fd(),
+                &[&[relay::PACKET], &packet.0],
+                true,
+            ) {
                 Ok(()) => return,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 // Attach is gone; the next `recv` says so.
@@ -648,7 +733,13 @@ impl SocketLink {
 
 impl Drop for SocketLink {
     fn drop(&mut self) {
-        let _ = epoll_ctl(self.listen.epoll.as_raw_fd(), libc::EPOLL_CTL_DEL, self.slot.fd.as_raw_fd(), 0, 0);
+        let _ = epoll_ctl(
+            self.listen.epoll.as_raw_fd(),
+            libc::EPOLL_CTL_DEL,
+            self.slot.fd.as_raw_fd(),
+            0,
+            0,
+        );
         let last = {
             let mut conns = self.listen.conns.lock().unwrap();
             conns.remove(&self.token);
@@ -700,6 +791,8 @@ impl Drop for Listening {
 
 impl std::fmt::Debug for Listening {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Listening").field("path", &self.path).finish()
+        f.debug_struct("Listening")
+            .field("path", &self.path)
+            .finish()
     }
 }

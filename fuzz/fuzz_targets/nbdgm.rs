@@ -3,8 +3,8 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::nbdgm::{ErrorCode, MAX_PENDING, Name, Packet, Reassembler};
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 use std::net::Ipv4Addr;
 
@@ -46,7 +46,10 @@ fuzz_target!(|data: &[u8]| {
         }
         // The fragments of a datagram put back together give its data.
         if let Some(d) = p.as_datagram() {
-            let got = whole.as_ref().and_then(Packet::as_datagram).map(|w| &w.data);
+            let got = whole
+                .as_ref()
+                .and_then(Packet::as_datagram)
+                .map(|w| &w.data);
             assert_eq!(got, Some(&d.data));
         }
     }

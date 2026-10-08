@@ -20,7 +20,10 @@ use std::collections::BTreeSet;
 const PAGES: &[(&str, &str)] = &[
     ("README.md", include_str!("../README.md")),
     ("src/lib.rs", include_str!("../src/lib.rs")),
-    ("src/getting_started.rs", include_str!("../src/getting_started.rs")),
+    (
+        "src/getting_started.rs",
+        include_str!("../src/getting_started.rs"),
+    ),
     ("src/running.rs", include_str!("../src/running.rs")),
     ("src/attaching.rs", include_str!("../src/attaching.rs")),
     ("src/lowering.rs", include_str!("../src/lowering.rs")),
@@ -29,7 +32,10 @@ const PAGES: &[(&str, &str)] = &[
     ("src/proto.rs", include_str!("../src/proto.rs")),
     ("src/stdlib/mod.rs", include_str!("../src/stdlib/mod.rs")),
     ("src/stdlib/web.rs", include_str!("../src/stdlib/web.rs")),
-    ("examples/attach/netns.sh", include_str!("../examples/attach/netns.sh")),
+    (
+        "examples/attach/netns.sh",
+        include_str!("../examples/attach/netns.sh"),
+    ),
 ];
 
 const ARGS: &str = include_str!("../src/bin/fictionet/args.rs");
@@ -50,11 +56,16 @@ fn flags(text: &str) -> BTreeSet<String> {
     while let Some(at) = text[i..].find("--") {
         let start = i + at;
         let mut end = start + 2;
-        while end < bytes.len() && (bytes[end].is_ascii_lowercase() || bytes[end].is_ascii_digit() || bytes[end] == b'-') {
+        while end < bytes.len()
+            && (bytes[end].is_ascii_lowercase()
+                || bytes[end].is_ascii_digit()
+                || bytes[end] == b'-')
+        {
             end += 1;
         }
         // `--` alone, or a long rule of dashes, is not a flag.
-        let before_ok = start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'-');
+        let before_ok =
+            start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'-');
         if end > start + 2 && bytes[start + 2].is_ascii_lowercase() && before_ok {
             out.insert(text[start..end].trim_end_matches('-').to_owned());
         }
@@ -70,7 +81,11 @@ fn doc_text(path: &str, text: &str) -> String {
         return text.to_owned();
     }
     text.lines()
-        .filter_map(|l| l.trim_start().strip_prefix("//!").or_else(|| l.trim_start().strip_prefix("///")))
+        .filter_map(|l| {
+            l.trim_start()
+                .strip_prefix("//!")
+                .or_else(|| l.trim_start().strip_prefix("///"))
+        })
         .map(|l| l.strip_prefix(' ').unwrap_or(l))
         .collect::<Vec<_>>()
         .join("\n")
@@ -87,7 +102,11 @@ fn attach_commands(text: &str) -> Vec<String> {
             let mut command = lines[i].to_owned();
             while command.trim_end().ends_with('\\') && i + 1 < lines.len() {
                 i += 1;
-                command = format!("{} {}", command.trim_end().trim_end_matches('\\'), lines[i].trim());
+                command = format!(
+                    "{} {}",
+                    command.trim_end().trim_end_matches('\\'),
+                    lines[i].trim()
+                );
             }
             let from = command.find("fictionet attach").unwrap();
             out.push(command[from..].to_owned());
@@ -117,8 +136,20 @@ fn prose(text: &str) -> String {
 #[test]
 fn the_usage_text_is_found() {
     let known = flags(usage());
-    for flag in ["--world", "--name", "--type", "--down-link", "--world-wait", "--ready-file", "--vm", "--token-file"] {
-        assert!(known.contains(flag), "ATTACH_USAGE should mention {flag}; found {known:?}");
+    for flag in [
+        "--world",
+        "--name",
+        "--type",
+        "--down-link",
+        "--world-wait",
+        "--ready-file",
+        "--vm",
+        "--token-file",
+    ] {
+        assert!(
+            known.contains(flag),
+            "ATTACH_USAGE should mention {flag}; found {known:?}"
+        );
     }
 }
 
@@ -136,13 +167,19 @@ fn every_attach_command_in_the_docs_uses_real_flags() {
             }
         }
     }
-    assert!(bad.is_empty(), "flags that fictionet attach does not take:\n{}", bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "flags that fictionet attach does not take:\n{}",
+        bad.join("\n")
+    );
 }
 
 #[test]
 fn attaching_lists_every_flag() {
     let attaching = doc_text("src/attaching.rs", include_str!("../src/attaching.rs"));
-    let start = attaching.find("\n# Every flag\n").expect("attaching has an 'Every flag' section");
+    let start = attaching
+        .find("\n# Every flag\n")
+        .expect("attaching has an 'Every flag' section");
     let rest = &attaching[start + 1..];
     let end = rest[1..].find("\n# ").map_or(rest.len(), |e| e + 1);
     let table = flags(&rest[..end]);
@@ -150,7 +187,12 @@ fn attaching_lists_every_flag() {
         .into_iter()
         .filter(|f| f != "--help")
         // `--no-dns` and the like are covered by the row for their flag.
-        .filter(|f| !table.contains(f) && !f.strip_prefix("--no-").is_some_and(|base| table.contains(&format!("--{base}"))))
+        .filter(|f| {
+            !table.contains(f)
+                && !f
+                    .strip_prefix("--no-")
+                    .is_some_and(|base| table.contains(&format!("--{base}")))
+        })
         // The `-v6` forms, and their `--no-` forms, are covered by the row
         // for the IPv4 flag.
         .filter(|f| {
@@ -158,7 +200,10 @@ fn attaching_lists_every_flag() {
             !base.is_some_and(|b| table.contains(&b))
         })
         .collect();
-    assert!(missing.is_empty(), "attaching's 'Every flag' table should list {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "attaching's 'Every flag' table should list {missing:?}"
+    );
 }
 
 #[test]
@@ -173,11 +218,19 @@ fn a_page_that_names_an_attach_flag_links_to_attaching() {
             continue;
         }
         let text = doc_text(path, text);
-        let named: Vec<_> =
-            flags(&prose(&text)).into_iter().filter(|f| known.contains(f) && !shared.contains(&f.as_str())).collect();
-        let links = text.contains("crate::attaching") || text.contains("fictionet::attaching") || text.contains("(attaching") || text.contains("[`attaching`]") || text.contains("src/attaching.rs");
+        let named: Vec<_> = flags(&prose(&text))
+            .into_iter()
+            .filter(|f| known.contains(f) && !shared.contains(&f.as_str()))
+            .collect();
+        let links = text.contains("crate::attaching")
+            || text.contains("fictionet::attaching")
+            || text.contains("(attaching")
+            || text.contains("[`attaching`]")
+            || text.contains("src/attaching.rs");
         if !named.is_empty() && !links {
-            bad.push(format!("{path} names {named:?} but never links to attaching"));
+            bad.push(format!(
+                "{path} names {named:?} but never links to attaching"
+            ));
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));

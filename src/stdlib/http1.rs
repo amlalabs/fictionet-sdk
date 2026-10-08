@@ -1306,9 +1306,7 @@ fn chunk_framing(
 }
 
 fn token(b: &[u8]) -> bool {
-    !b.is_empty()
-        && b.iter()
-            .all(|&b| ascii::is_tchar(b))
+    !b.is_empty() && b.iter().all(|&b| ascii::is_tchar(b))
 }
 fn field_byte(b: u8) -> bool {
     b == b'\t' || (b >= b' ' && b != 127)
@@ -1472,13 +1470,18 @@ fn header_line(line: &[u8], lenient: bool) -> Result<Header, Error> {
         return Err(Error::Header);
     }
     Ok(Header {
-        name: core::str::from_utf8(name).map(str::to_owned).map_err(|_| Error::Header)?,
+        name: core::str::from_utf8(name)
+            .map(str::to_owned)
+            .map_err(|_| Error::Header)?,
         value: value.to_vec(),
     })
 }
 fn split_head(b: &[u8], lenient: bool) -> Result<(&[u8], Vec<Header>), Error> {
     let mut lines = b.split(|b| *b == b'\n');
-    let first = lines.next().and_then(|l| line_end(l, lenient)).ok_or(Error::LineEnding)?;
+    let first = lines
+        .next()
+        .and_then(|l| line_end(l, lenient))
+        .ok_or(Error::LineEnding)?;
     let mut headers = Vec::new();
     for line in lines {
         let line = line_end(line, lenient).ok_or(Error::LineEnding)?;
@@ -1507,7 +1510,10 @@ fn lenient_bounds(b: &[u8], request: bool) -> Result<Option<(usize, usize)>, Err
                 true
             } else if request {
                 line.first() != Some(&b' ')
-                    && line.iter().take_while(|b| **b != b' ').all(|b| token(std::slice::from_ref(b)))
+                    && line
+                        .iter()
+                        .take_while(|b| **b != b' ')
+                        .all(|b| token(std::slice::from_ref(b)))
             } else {
                 let n = line.len().min(7);
                 line[..n] == b"HTTP/1."[..n]
@@ -1612,12 +1618,18 @@ fn request_line(line: &[u8], lenient: bool) -> Result<(String, String, Version),
     if parts.next().is_some() {
         return Err(Error::StartLine);
     }
-    if lenient && (!token(method) || target.is_empty() || !target.iter().all(|b| *b > b' ' && *b != 127)) {
+    if lenient
+        && (!token(method) || target.is_empty() || !target.iter().all(|b| *b > b' ' && *b != 127))
+    {
         return Err(Error::StartLine);
     }
     Ok((
-        core::str::from_utf8(method).map(str::to_owned).map_err(|_| Error::StartLine)?,
-        core::str::from_utf8(target).map(str::to_owned).map_err(|_| Error::StartLine)?,
+        core::str::from_utf8(method)
+            .map(str::to_owned)
+            .map_err(|_| Error::StartLine)?,
+        core::str::from_utf8(target)
+            .map(str::to_owned)
+            .map_err(|_| Error::StartLine)?,
         version,
     ))
 }
@@ -1990,13 +2002,14 @@ impl Wire for Chunk {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::{
-        Assemble, Assembled, Carry, Collect, CollectError, Demux, Fragment, Layered, Lcg, Pipe, pump,
+        Assemble, Assembled, Carry, Collect, CollectError, Demux, Fragment, Layered, Lcg, Pipe,
+        pump,
     };
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
 
     const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
     const POST: &[u8] =
@@ -2012,12 +2025,24 @@ mod tests {
         assert!(RequestHead::parse(&bytes[2..bytes.len() - 4]).is_err());
         let (head, n) = RequestHead::parse_lenient(bytes).unwrap().unwrap();
         assert_eq!(n, bytes.len() - 4);
-        assert_eq!((head.method.as_str(), head.target.as_str()), ("POST", "http://u@a/x#f"));
+        assert_eq!(
+            (head.method.as_str(), head.target.as_str()),
+            ("POST", "http://u@a/x#f")
+        );
         assert_eq!(head.headers.len(), 3);
         assert_eq!(head.headers[2].value, b"chunked");
-        assert_eq!(RequestHead::parse_lenient(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap(), None);
-        let (head, n) = ResponseHead::parse_lenient(b"HTTP/1.0 200 Fine\nTransfer-Encoding: gzip\n\nrest").unwrap().unwrap();
-        assert_eq!((head.status, head.reason.as_slice(), n), (200, &b"Fine"[..], 43));
+        assert_eq!(
+            RequestHead::parse_lenient(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap(),
+            None
+        );
+        let (head, n) =
+            ResponseHead::parse_lenient(b"HTTP/1.0 200 Fine\nTransfer-Encoding: gzip\n\nrest")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            (head.status, head.reason.as_slice(), n),
+            (200, &b"Fine"[..], 43)
+        );
         // The syntax still holds.
         for bad in [
             &b"GET / HTTP/2.0\r\n\r\n"[..],
@@ -2027,19 +2052,41 @@ mod tests {
             b"GET / HTTP/1.1\r\nBad Name: x\r\n\r\n",
             b"GET / HTTP/1.1\r\nX: a\x01b\r\n\r\n",
         ] {
-            assert!(RequestHead::parse_lenient(bad).is_err(), "{:?}", String::from_utf8_lossy(bad));
+            assert!(
+                RequestHead::parse_lenient(bad).is_err(),
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
         }
-        for bad in [&b"HTTP/1.1 20 OK\r\n\r\n"[..], b"HTTP/1.1 600 OK\r\n\r\n", b"HTTP/1.1 200 \x7f\r\n\r\n"] {
-            assert!(ResponseHead::parse_lenient(bad).is_err(), "{:?}", String::from_utf8_lossy(bad));
+        for bad in [
+            &b"HTTP/1.1 20 OK\r\n\r\n"[..],
+            b"HTTP/1.1 600 OK\r\n\r\n",
+            b"HTTP/1.1 200 \x7f\r\n\r\n",
+        ] {
+            assert!(
+                ResponseHead::parse_lenient(bad).is_err(),
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
         }
         // Bytes that are not HTTP fail before the head would end.
         assert!(RequestHead::parse_lenient(b"\x05\x01\x00").is_err());
         assert!(RequestHead::parse_lenient(b"GET / HTTP/1.1\r\nno colon\r\n").is_err());
         assert!(ResponseHead::parse_lenient(b"SSH-2.0-OpenSSH\r\n").is_err());
         assert!(ResponseHead::parse_lenient(b"SSH").is_err());
-        for partial in [&b""[..], b"\r", b"\r\n", b"HTT", b"HTTP/1.1 200 OK\r\nX: y", b"GET / HT"] {
+        for partial in [
+            &b""[..],
+            b"\r",
+            b"\r\n",
+            b"HTT",
+            b"HTTP/1.1 200 OK\r\nX: y",
+            b"GET / HT",
+        ] {
             assert_eq!(ResponseHead::parse_lenient(partial).ok().flatten(), None);
-            assert!(partial.starts_with(b"HTTP") || RequestHead::parse_lenient(partial).is_ok_and(|h| h.is_none()));
+            assert!(
+                partial.starts_with(b"HTTP")
+                    || RequestHead::parse_lenient(partial).is_ok_and(|h| h.is_none())
+            );
         }
     }
 
@@ -2076,8 +2123,13 @@ mod tests {
             let request = Request::parse(bytes).unwrap();
             contract::check_wire::<Request>(bytes);
             contract::check_wire_value(&request.head);
-            contract::check_decode_with_held_limit(|| RequestEvents::with_limits(small()), bytes, 0);
-            let (events, failure) = test_support::decode_all(|| RequestEvents::with_limits(small()), bytes);
+            contract::check_decode_with_held_limit(
+                || RequestEvents::with_limits(small()),
+                bytes,
+                0,
+            );
+            let (events, failure) =
+                test_support::decode_all(|| RequestEvents::with_limits(small()), bytes);
             assert_eq!(failure, None);
             assert_eq!(events.first(), Some(&Event::Head(request.head)));
             assert_eq!(events.last(), Some(&Event::Done));
@@ -2521,7 +2573,8 @@ mod tests {
             assert_eq!(head_boundary.len(), Limits::default().head);
             for bytes in [line_boundary, head_boundary] {
                 if request {
-                    let (events, failure) = test_support::decode_all(RequestEvents::default, &bytes);
+                    let (events, failure) =
+                        test_support::decode_all(RequestEvents::default, &bytes);
                     assert_eq!(failure, None);
                     let Event::Head(mut head) = events[0].clone() else {
                         panic!("head")
@@ -2535,7 +2588,8 @@ mod tests {
                     assert_eq!(failure, None);
                     assert_eq!(values.len(), 1);
                 } else {
-                    let (events, failure) = test_support::decode_all(ResponseEvents::default, &bytes);
+                    let (events, failure) =
+                        test_support::decode_all(ResponseEvents::default, &bytes);
                     assert_eq!(failure, None);
                     let Event::Head(mut head) = events[0].clone() else {
                         panic!("head")
@@ -2671,22 +2725,38 @@ mod tests {
     #[test]
     fn whole_messages_refuse_declared_lengths_from_the_head() {
         let head = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1000000\r\n\r\n";
-        let mut stream = Stream::new(Requests::with_limits(Limits { body: 10, message: 4096, ..Limits::default() }));
+        let mut stream = Stream::new(Requests::with_limits(Limits {
+            body: 10,
+            message: 4096,
+            ..Limits::default()
+        }));
         assert_eq!(stream.push(head), head.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::BodyTooLong))));
-        let mut stream = Stream::new(Requests::with_limits(Limits { body: MAX_BODY, message: 4096, ..Limits::default() }));
+        let mut stream = Stream::new(Requests::with_limits(Limits {
+            body: MAX_BODY,
+            message: 4096,
+            ..Limits::default()
+        }));
         assert_eq!(stream.push(head), head.len());
         assert_eq!(
             stream.next(),
             Some(Err(Fail::Protocol(Error::MessageTooLong)))
         );
-        let mut stream = Stream::new(Responses::with_limits(Limits { body: 10, message: 4096, ..Limits::default() }));
+        let mut stream = Stream::new(Responses::with_limits(Limits {
+            body: 10,
+            message: 4096,
+            ..Limits::default()
+        }));
         let head = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n";
         assert_eq!(stream.push(head), head.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::BodyTooLong))));
         // A chunk larger than the remaining body bound is refused from its size line.
         let chunked = request_with("Transfer-Encoding: chunked\r\n", b"4\r\nabcd\r\n10\r\n");
-        let mut stream = Stream::new(Requests::with_limits(Limits { body: 10, message: 4096, ..small() }));
+        let mut stream = Stream::new(Requests::with_limits(Limits {
+            body: 10,
+            message: 4096,
+            ..small()
+        }));
         assert_eq!(stream.push(&chunked), chunked.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::BodyTooLong))));
     }
@@ -2694,7 +2764,11 @@ mod tests {
     #[test]
     fn whole_messages_hold_no_input_while_they_need_more() {
         for limits in [Limits::default(), small()] {
-            let mut decoder = Requests::with_limits(Limits { body: MAX_BODY, message: MAX_MESSAGE, ..limits });
+            let mut decoder = Requests::with_limits(Limits {
+                body: MAX_BODY,
+                message: MAX_MESSAGE,
+                ..limits
+            });
             let partial = request_with("Content-Length: 10\r\n", b"hello");
             assert!(matches!(decoder.decode(&partial, false), Ok(Step::Need)));
             assert_eq!(decoder.held(), 0);
@@ -2707,7 +2781,11 @@ mod tests {
             assert_eq!(decoder.held(), 0);
         }
         let chunked = request_with("Transfer-Encoding: chunked\r\n", b"2\r\nhe\r\n3\r\nllo\r\n");
-        let mut decoder = Requests::with_limits(Limits { body: MAX_BODY, message: MAX_MESSAGE, ..small() });
+        let mut decoder = Requests::with_limits(Limits {
+            body: MAX_BODY,
+            message: MAX_MESSAGE,
+            ..small()
+        });
         assert!(matches!(decoder.decode(&chunked, false), Ok(Step::Need)));
         assert_eq!(decoder.held(), 0);
         let mut done = chunked.clone();
@@ -2724,7 +2802,13 @@ mod tests {
     #[test]
     fn whole_messages_obey_contracts_and_limits() {
         let pipeline = [CHUNKED, GET, POST].concat();
-        let make = || Requests::with_limits(Limits { body: 5, message: CHUNKED.len(), ..small() });
+        let make = || {
+            Requests::with_limits(Limits {
+                body: 5,
+                message: CHUNKED.len(),
+                ..small()
+            })
+        };
         contract::check_decode_with_held_limit(make, &pipeline, CHUNKED.len() + 5);
         contract::check_decode_with_alloc_limit(make, &pipeline, (CHUNKED.len() + 1) * 2);
         let (messages, error) = test_support::decode_all(make, &pipeline);
@@ -2738,13 +2822,25 @@ mod tests {
             ]
         );
         for bytes in [CHUNKED, POST] {
-            let make = || Requests::with_limits(Limits { body: 4, message: 512, ..small() });
+            let make = || {
+                Requests::with_limits(Limits {
+                    body: 4,
+                    message: 512,
+                    ..small()
+                })
+            };
             assert_eq!(
                 test_support::decode_all(make, bytes).1,
                 Some(Fail::Protocol(Error::BodyTooLong))
             );
             contract::check_decode(make, bytes);
-            let make = || Requests::with_limits(Limits { body: 5, message: bytes.len() - 1, ..small() });
+            let make = || {
+                Requests::with_limits(Limits {
+                    body: 5,
+                    message: bytes.len() - 1,
+                    ..small()
+                })
+            };
             assert_eq!(
                 test_support::decode_all(make, bytes).1,
                 Some(Fail::Protocol(Error::MessageTooLong))
@@ -2753,11 +2849,24 @@ mod tests {
         }
         for bytes in [GET, b"", b"\r", b"\r\n", b"GET"] {
             for limit in [0, 1, 2, GET.len() - 1, GET.len()] {
-                contract::check_decode(|| Requests::with_limits(Limits { body: 0, message: limit, ..small() }), bytes);
+                contract::check_decode(
+                    || {
+                        Requests::with_limits(Limits {
+                            body: 0,
+                            message: limit,
+                            ..small()
+                        })
+                    },
+                    bytes,
+                );
             }
         }
         let make = || {
-            let mut decoder = Responses::with_limits(Limits { body: 5, message: 128, ..small() });
+            let mut decoder = Responses::with_limits(Limits {
+                body: 5,
+                message: 128,
+                ..small()
+            });
             decoder.expect_method("HEAD").unwrap();
             decoder.expect_method("GET").unwrap();
             decoder
@@ -2770,13 +2879,25 @@ mod tests {
         assert!(responses[1].body.is_empty());
         assert_eq!(responses[2].body, b"hello");
         for bytes in [OK, b"HTTP/1.1 200 OK\r\n\r\nhello"] {
-            let make = || Responses::with_limits(Limits { body: 5, message: bytes.len(), ..small() });
+            let make = || {
+                Responses::with_limits(Limits {
+                    body: 5,
+                    message: bytes.len(),
+                    ..small()
+                })
+            };
             contract::check_decode(make, bytes);
             assert_eq!(
                 test_support::decode_all(make, bytes),
                 (vec![Response::parse(bytes).unwrap()], None)
             );
-            let make = || Responses::with_limits(Limits { body: 4, message: 128, ..small() });
+            let make = || {
+                Responses::with_limits(Limits {
+                    body: 4,
+                    message: 128,
+                    ..small()
+                })
+            };
             contract::check_decode(make, bytes);
             assert_eq!(
                 test_support::decode_all(make, bytes).1,
@@ -2890,7 +3011,10 @@ mod tests {
                 }
             );
         }
-        assert_eq!(contract::check_refused(&Response::status(99)), Error::StartLine);
+        assert_eq!(
+            contract::check_refused(&Response::status(99)),
+            Error::StartLine
+        );
         let response = Response::json(b" {\"ok\": true} \n").unwrap();
         assert_eq!(response.body, b" {\"ok\": true} \n");
         assert_eq!(
@@ -2949,7 +3073,10 @@ mod tests {
         Chunk(b"data: {}\n\n".to_vec()).write(&mut out).unwrap();
         Chunk(Vec::new()).write(&mut out).unwrap();
         assert_eq!(Response::parse(&out).unwrap().body, b"data: {}\n\n");
-        assert_eq!(contract::check_refused(&Response::event_stream("bad\r\nfield")), Error::Header);
+        assert_eq!(
+            contract::check_refused(&Response::event_stream("bad\r\nfield")),
+            Error::Header
+        );
     }
 
     #[test]
@@ -2970,7 +3097,8 @@ mod tests {
     fn bodyless_responses_and_expectation_queue() {
         for status in [100, 103, 199, 204, 304] {
             let bytes = format!("HTTP/1.1 {status} Fine\r\n\r\n");
-            let (events, error) = test_support::decode_all(ResponseEvents::default, bytes.as_bytes());
+            let (events, error) =
+                test_support::decode_all(ResponseEvents::default, bytes.as_bytes());
             assert_eq!(error, None);
             assert_eq!(events.len(), 2);
             assert_eq!(events[1], Event::Done);
@@ -3050,7 +3178,9 @@ mod tests {
         }
         let bytes = b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET / HTTP/1.0\r\n\r\n";
         assert_eq!(
-            test_support::decode_all(RequestEvents::default, bytes).0.len(),
+            test_support::decode_all(RequestEvents::default, bytes)
+                .0
+                .len(),
             4
         );
         let bytes = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhitail";
@@ -3166,7 +3296,10 @@ mod tests {
         let mut stream = stream.swap(RequestEvents::with_limits(limits));
         events.clear();
         finish(&mut stream, |e| events.push(e)).unwrap();
-        assert_eq!(events, test_support::decode_all(RequestEvents::default, GET).0);
+        assert_eq!(
+            events,
+            test_support::decode_all(RequestEvents::default, GET).0
+        );
         assert!(stream.unread().is_empty());
         assert_eq!(stream.failed(), None);
     }
@@ -3312,11 +3445,17 @@ mod tests {
             name: "Transfer-Encoding".into(),
             value: b"chunked".to_vec(),
         });
-        assert_eq!(contract::check_refused(&value), Error::TransferEncodingAndContentLength);
+        assert_eq!(
+            contract::check_refused(&value),
+            Error::TransferEncodingAndContentLength
+        );
         value = base.clone();
         value.body = vec![0; MAX_BODY.saturating_add(1)];
         assert_eq!(contract::check_refused(&value), Error::BodyTooLong);
-        assert_eq!(contract::check_refused(&Chunk(vec![0; MAX_BODY.saturating_add(1)])), Error::BodyTooLong);
+        assert_eq!(
+            contract::check_refused(&Chunk(vec![0; MAX_BODY.saturating_add(1)])),
+            Error::BodyTooLong
+        );
         value = base.clone();
         value.head.target = format!("/{}", "a".repeat(8192));
         assert_eq!(contract::check_refused(&value), Error::StartLineTooLong);

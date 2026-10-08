@@ -2,11 +2,11 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::sbe::{
-    Messages, MAX_MESSAGE_BYTES, MessageWire, Scalar, Schema, SchemaSource, Value,
-};
 use fictionet::stdlib::sbe::harness::{CAR_BYTES, Car};
+use fictionet::stdlib::sbe::{
+    MAX_MESSAGE_BYTES, MessageWire, Messages, Scalar, Schema, SchemaSource, Value,
+};
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_BYTES: usize = 8192;
@@ -50,7 +50,11 @@ fuzz_target!(|input: &[u8]| {
         }
     }
     contract::check_wire::<MessageWire<Car>>(&bytes);
-    contract::check_decode_with_alloc_limit(|| Messages::new(schema), &bytes, 2 * MAX_MESSAGE_BYTES);
+    contract::check_decode_with_alloc_limit(
+        || Messages::new(schema),
+        &bytes,
+        2 * MAX_MESSAGE_BYTES,
+    );
     let mut value = MessageWire::<Car>::parse(CAR_BYTES).unwrap();
     if let Some(first) = data.first() {
         value.message.header.version = u64::from(*first);

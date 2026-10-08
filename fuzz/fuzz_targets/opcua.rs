@@ -3,16 +3,15 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::opcua::{
-    Chunk, ChunkType, DataValue, DiagnosticInfo, ExpandedNodeId,
-    ExtensionObject, Limits, LocalizedText, Message, MessageType, NodeId, QualifiedName,
-    ResponseHeader, Service, Variant,
-};
 use fictionet::stdlib::opcua::Messages;
 use fictionet::stdlib::opcua::harness::check_reader;
+use fictionet::stdlib::opcua::{
+    Chunk, ChunkType, DataValue, DiagnosticInfo, ExpandedNodeId, ExtensionObject, Limits,
+    LocalizedText, Message, MessageType, NodeId, QualifiedName, ResponseHeader, Service, Variant,
+};
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

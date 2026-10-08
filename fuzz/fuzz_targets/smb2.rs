@@ -5,14 +5,14 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::smb2::harness::no_longer;
+use fictionet::stdlib::smb2::{
+    ChainedPayload, Compressed, Error, ErrorResponse, Frame, HEADER_LEN, Header, IoctlResponse,
+    MAX_FRAME, MAX_MESSAGE, Message, NegotiateContext, NegotiateResponse, Packet, ReadRequest,
+    Request, Response, Transform, TreeConnectRequest, WriteRequest, command, status,
+};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::smb2::{
-    ChainedPayload, Compressed, Error, ErrorResponse, Frame, Header, HEADER_LEN, IoctlResponse, Message,
-    MAX_FRAME, MAX_MESSAGE, NegotiateContext, NegotiateResponse, Packet, ReadRequest, Request, Response,
-    Transform, TreeConnectRequest, WriteRequest, command, status,
-};
-use fictionet::stdlib::smb2::harness::no_longer;
 use libfuzzer_sys::fuzz_target;
 
 /// A body read alone can fit while its message header or CREATE padding
@@ -36,11 +36,15 @@ fn written_body(message: Result<Message, Error>, command: u16, old: &[u8]) -> Op
 /// A payload read every way there is. Whatever reads is written back, and
 /// reads back the same. A compound chain writes back byte for byte.
 fn payload(data: &[u8], status: u32) {
-    let Ok(packet) = Packet::parse(data) else { return };
+    let Ok(packet) = Packet::parse(data) else {
+        return;
+    };
     let bytes = packet.to_bytes().unwrap();
     assert!(bytes.len() <= MAX_MESSAGE);
     assert_eq!(Packet::parse(&bytes), Ok(packet.clone()));
-    let Packet::Smb2(messages) = packet else { return };
+    let Packet::Smb2(messages) = packet else {
+        return;
+    };
     assert_eq!(bytes, data);
     for m in &messages {
         if let Ok(req) = m.request()
@@ -50,7 +54,8 @@ fn payload(data: &[u8], status: u32) {
         }
         for s in [m.header.status, status] {
             if let Ok(resp) = Response::parse(m.header.command, s, &m.body)
-                && let Some(body) = written_body(resp.message(&m.header, s), m.header.command, &m.body)
+                && let Some(body) =
+                    written_body(resp.message(&m.header, s), m.header.command, &m.body)
             {
                 assert_eq!(Response::parse(m.header.command, s, &body), Ok(resp));
             }
@@ -84,14 +89,26 @@ fn entry_points(data: &[u8]) {
 fn body(data: &[u8]) {
     let [c, s, rest @ ..] = data else { return };
     let command = u16::from(*c % 0x16);
-    let status = [0, 0x8000_0005, 0xc000_0016, 0xc000_0022, 0x103, 0x10c, 0xc000_000d][usize::from(*s % 7)];
+    let status = [
+        0,
+        0x8000_0005,
+        0xc000_0016,
+        0xc000_0022,
+        0x103,
+        0x10c,
+        0xc000_000d,
+    ][usize::from(*s % 7)];
     if let Ok(req) = Request::parse(command, rest)
         && let Some(back) = written_body(req.message(0), command, rest)
     {
         assert_eq!(Request::parse(command, &back), Ok(req));
     }
     if let Ok(resp) = Response::parse(command, status, rest)
-        && let Some(back) = written_body(resp.message(&Header::new(command, 0), status), command, rest)
+        && let Some(back) = written_body(
+            resp.message(&Header::new(command, 0), status),
+            command,
+            rest,
+        )
     {
         assert_eq!(Response::parse(command, status, &back), Ok(resp));
     }
@@ -135,7 +152,10 @@ fn constructed(data: &[u8]) {
         ..Default::default()
     });
     let s = [0, status::BUFFER_OVERFLOW, status::INVALID_PARAMETER][usize::from(b.byte() % 3)];
-    if let Ok(body) = ioctl.message(&Header::new(command::IOCTL, 0), s).map(|m| m.body) {
+    if let Ok(body) = ioctl
+        .message(&Header::new(command::IOCTL, 0), s)
+        .map(|m| m.body)
+    {
         let at = |i: usize| u32::from_le_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
         if at(36) != 0 {
             assert_eq!(at(32), (at(24) + at(28)).next_multiple_of(8));
@@ -144,37 +164,65 @@ fn constructed(data: &[u8]) {
     }
 
     // 2.2.2: error data holds the error contexts its count claims.
-    let error = Response::Error(ErrorResponse { context_count: b.byte() % 4, data: b.take(name_len * 2) });
-    if let Ok(body) = error.message(&Header::new(command::CREATE, 0), status::ACCESS_DENIED).map(|m| m.body) {
-        assert_eq!(Response::parse(command::CREATE, status::ACCESS_DENIED, &body), Ok(error));
+    let error = Response::Error(ErrorResponse {
+        context_count: b.byte() % 4,
+        data: b.take(name_len * 2),
+    });
+    if let Ok(body) = error
+        .message(&Header::new(command::CREATE, 0), status::ACCESS_DENIED)
+        .map(|m| m.body)
+    {
+        assert_eq!(
+            Response::parse(command::CREATE, status::ACCESS_DENIED, &body),
+            Ok(error)
+        );
     }
 
     // 2.2.42.2.1: payloads that need OriginalPayloadSize have its 4 bytes.
     let chained = Compressed::Chained {
         original_size: 1,
-        payloads: vec![ChainedPayload { algorithm: u16::from(b.byte() % 7), flags: 1, data: b.take(info_len % 8) }],
+        payloads: vec![ChainedPayload {
+            algorithm: u16::from(b.byte() % 7),
+            flags: 1,
+            data: b.take(info_len % 8),
+        }],
     };
     if let Ok(bytes) = chained.to_bytes() {
         assert_eq!(Compressed::parse(&bytes), Ok(chained));
     }
 
     // 2.2.41: a transform header has flags 1 and a message after it.
-    let transform = Transform { flags: b.u16() % 3, data: b.take(info_len % 3), ..Default::default() };
+    let transform = Transform {
+        flags: b.u16() % 3,
+        data: b.take(info_len % 3),
+        ..Default::default()
+    };
     match transform.to_bytes() {
         Ok(bytes) => assert_eq!(Packet::parse(&bytes), Ok(Packet::Transform(transform))),
         Err(_) => assert!(transform.flags != 1 || transform.data.is_empty()),
     }
 
     // 2.2.9.1: an extended TREE_CONNECT puts the path after the extension.
-    let path = b.take(name_len * 2).chunks(2).map(|c| u16::from(c[0])).collect();
-    let tree = Request::TreeConnect(TreeConnectRequest { flags: b.u16() % 8, path });
+    let path = b
+        .take(name_len * 2)
+        .chunks(2)
+        .map(|c| u16::from(c[0]))
+        .collect();
+    let tree = Request::TreeConnect(TreeConnectRequest {
+        flags: b.u16() % 8,
+        path,
+    });
     let body = tree.message(0).map(|m| m.body).unwrap();
     assert_eq!(Request::parse(command::TREE_CONNECT, &body), Ok(tree));
 
     // 2.2.19 and 2.2.21: channel information only with a channel.
     let channel = u32::from(b.byte() % 3);
     let info = b.take(info_len);
-    let read = Request::Read(ReadRequest { channel, channel_info: info.clone(), ..Default::default() });
+    let read = Request::Read(ReadRequest {
+        channel,
+        channel_info: info.clone(),
+        ..Default::default()
+    });
     let write = Request::Write(WriteRequest {
         channel,
         channel_info: info.clone(),
@@ -190,9 +238,22 @@ fn constructed(data: &[u8]) {
 
     // 3.2.5.2: an SMB 3.1.1 response carries one preauth context.
     let kinds: Vec<u16> = b.take(3).iter().map(|k| u16::from(k % 4)).collect();
-    let contexts = kinds.iter().map(|&kind| NegotiateContext { kind, data: vec![1, 0] }).collect();
-    let negotiate = Response::Negotiate(NegotiateResponse { dialect: 0x311, contexts, ..Default::default() });
-    if let Ok(body) = negotiate.message(&Header::new(command::NEGOTIATE, 0), 0).map(|m| m.body) {
+    let contexts = kinds
+        .iter()
+        .map(|&kind| NegotiateContext {
+            kind,
+            data: vec![1, 0],
+        })
+        .collect();
+    let negotiate = Response::Negotiate(NegotiateResponse {
+        dialect: 0x311,
+        contexts,
+        ..Default::default()
+    });
+    if let Ok(body) = negotiate
+        .message(&Header::new(command::NEGOTIATE, 0), 0)
+        .map(|m| m.body)
+    {
         assert_eq!(kinds.iter().filter(|&&k| k == 1).count(), 1);
         assert_eq!(Response::parse(command::NEGOTIATE, 0, &body), Ok(negotiate));
     }
@@ -201,7 +262,11 @@ fn constructed(data: &[u8]) {
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * MAX_FRAME);
     contract::check_wire::<Frame>(data);
-    contract::check_decode_with_alloc_limit(|| Frames::<Frame>::new().map(|f| Packet::parse(&f.payload)), data, 2 * MAX_FRAME);
+    contract::check_decode_with_alloc_limit(
+        || Frames::<Frame>::new().map(|f| Packet::parse(&f.payload)),
+        data,
+        2 * MAX_FRAME,
+    );
     contract::check_wire_value(&Frame {
         payload: data.to_vec(),
     });

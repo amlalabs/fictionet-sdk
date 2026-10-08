@@ -17,7 +17,11 @@ fn socket_path(tag: &str) -> String {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir();
-    format!("{}/fictionet-test-{}-{tag}-{n}.sock", dir.display(), std::process::id())
+    format!(
+        "{}/fictionet-test-{}-{tag}-{n}.sock",
+        dir.display(),
+        std::process::id()
+    )
 }
 
 /// A test client: the attach side of the protocol.
@@ -52,14 +56,23 @@ impl Client {
     }
 
     fn hello(&self, name: &str, mtu: u16) {
-        self.send(&Message::Hello(Hello { version: relay::VERSION, mtu, kind: "tun".into(), name: name.into() }));
+        self.send(&Message::Hello(Hello {
+            version: relay::VERSION,
+            mtu,
+            kind: "tun".into(),
+            name: name.into(),
+        }));
     }
 
     /// The next message, or `None` when the world closed the connection.
     fn recv(&self) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
         let n = unix::recv(self.fd.as_raw_fd(), &mut buf, false).expect("recv");
-        if n == 0 { None } else { Some(buf[..n].to_vec()) }
+        if n == 0 {
+            None
+        } else {
+            Some(buf[..n].to_vec())
+        }
     }
 
     fn attach(path: &str, name: &str) -> Client {
@@ -139,7 +152,9 @@ fn attach_echo_and_detach() {
     for i in 0..20_000u32 {
         client.send(&Message::Packet(&payload(i, 1400)));
     }
-    poll::until(Duration::from_secs(15), || echoed.load(Ordering::SeqCst) == 20_501);
+    poll::until(Duration::from_secs(15), || {
+        echoed.load(Ordering::SeqCst) == 20_501
+    });
     client.set_timeout(Duration::from_millis(500));
     let mut got = 0;
     while let Some(m) = client.try_recv() {
@@ -155,7 +170,9 @@ fn attach_echo_and_detach() {
     for i in 0..1_000u32 {
         client.send(&Message::Packet(&payload(i, 60_000)));
     }
-    poll::until(Duration::from_secs(15), || echoed.load(Ordering::SeqCst) == 21_501);
+    poll::until(Duration::from_secs(15), || {
+        echoed.load(Ordering::SeqCst) == 21_501
+    });
     let mut last = None;
     let mut got = 0;
     while let Some(m) = client.try_recv() {
@@ -181,7 +198,9 @@ fn attach_echo_and_detach() {
 
     // Closing is the detach: the world reads Closed and returns.
     drop(client);
-    let out = done_rx.recv_timeout(Duration::from_secs(5)).expect("world did not end");
+    let out = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("world did not end");
     assert_eq!(out, Ok(()));
     drop(listening);
     assert!(!std::path::Path::new(&path).exists());
@@ -191,22 +210,35 @@ fn attach_echo_and_detach() {
 fn refuses_taken_and_bad_names_and_frees_names_on_close() {
     let path = socket_path("names");
     let (attacher, _attachments) = attachments();
-    let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher.clone()).unwrap();
+    let _listening = listen(
+        WorldSocket::UnixSocket(path.clone().into()),
+        attacher.clone(),
+    )
+    .unwrap();
 
     let first = Client::attach(&path, "abc");
 
     let second = Client::connect(&path);
     second.hello("abc", 1500);
     let refuse = second.recv().unwrap();
-    assert_eq!(relay::decode(&refuse), Ok(Message::Refuse("abc is already attached".into())));
+    assert_eq!(
+        relay::decode(&refuse),
+        Ok(Message::Refuse("abc is already attached".into()))
+    );
     assert_eq!(second.recv(), None, "the world closes after refuse");
 
     // The name set is shared with the attacher.
-    assert_eq!(attacher.attach("abc").unwrap_err(), fictionet::AttachError::Taken);
+    assert_eq!(
+        attacher.attach("abc").unwrap_err(),
+        fictionet::AttachError::Taken
+    );
     let _test_end = attacher.attach("by-test").unwrap();
     let third = Client::connect(&path);
     third.hello("by-test", 1500);
-    assert!(matches!(relay::decode(&third.recv().unwrap()), Ok(Message::Refuse(_))));
+    assert!(matches!(
+        relay::decode(&third.recv().unwrap()),
+        Ok(Message::Refuse(_))
+    ));
 
     let empty = Client::connect(&path);
     empty.hello("", 1500);
@@ -216,8 +248,16 @@ fn refuses_taken_and_bad_names_and_frees_names_on_close() {
     );
 
     let old = Client::connect(&path);
-    old.send(&Message::Hello(Hello { version: 2, mtu: 1500, kind: "tun".into(), name: "v2".into() }));
-    assert!(matches!(relay::decode(&old.recv().unwrap()), Ok(Message::Refuse(_))));
+    old.send(&Message::Hello(Hello {
+        version: 2,
+        mtu: 1500,
+        kind: "tun".into(),
+        name: "v2".into(),
+    }));
+    assert!(matches!(
+        relay::decode(&old.recv().unwrap()),
+        Ok(Message::Refuse(_))
+    ));
 
     // Something other than hello first closes the connection.
     let rude = Client::connect(&path);
@@ -287,7 +327,10 @@ fn handshake_times_out() {
     silent.set_timeout(Duration::from_secs(25));
     assert_eq!(silent.recv(), None);
     let took = start.elapsed();
-    assert!(took >= Duration::from_millis(9_900) && took < Duration::from_secs(20), "{took:?}");
+    assert!(
+        took >= Duration::from_millis(9_900) && took < Duration::from_secs(20),
+        "{took:?}"
+    );
 }
 
 #[test]
@@ -321,9 +364,19 @@ fn dropping_listening_closes_the_socket_but_keeps_attachments() {
 fn a_stale_socket_file_is_replaced_and_a_live_one_is_not() {
     let path = socket_path("stale");
     let (attacher, _attachments) = attachments();
-    let listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher.clone()).unwrap();
+    let listening = listen(
+        WorldSocket::UnixSocket(path.clone().into()),
+        attacher.clone(),
+    )
+    .unwrap();
     // A live world owns the path.
-    assert!(listen(WorldSocket::UnixSocket(path.clone().into()), attacher.clone()).is_err());
+    assert!(
+        listen(
+            WorldSocket::UnixSocket(path.clone().into()),
+            attacher.clone()
+        )
+        .is_err()
+    );
     // A socket file whose world is gone: leave one behind by hand.
     std::mem::forget(listening);
     let stale_path = socket_path("stale2");
@@ -346,7 +399,9 @@ fn many_idle_attachments_wake() {
     let path = socket_path("many");
     let (attacher, mut attachments) = attachments();
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
-    let clients: Vec<Client> = (0..20).map(|i| Client::attach(&path, &format!("s{i}"))).collect();
+    let clients: Vec<Client> = (0..20)
+        .map(|i| Client::attach(&path, &format!("s{i}")))
+        .collect();
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
     let world = std::thread::spawn(move || {
         block_on(run(move |fcx| async move {
@@ -419,7 +474,10 @@ fn an_oversized_message_closes_the_connection() {
             assert_eq!(first, Packet(vec![1]));
             match a.recv(&fcx).await {
                 Err(RecvError::Closed) => Ok(()),
-                Ok(p) => Err(fictionet::Error::msg(format!("got a packet of {} bytes", p.0.len()))),
+                Ok(p) => Err(fictionet::Error::msg(format!(
+                    "got a packet of {} bytes",
+                    p.0.len()
+                ))),
                 Err(e) => Err(e.into()),
             }
         }))
@@ -486,12 +544,21 @@ fn a_world_that_only_sends_gets_its_queue_written_out() {
     client.set_timeout(Duration::from_secs(15));
     let mut got = 0u32;
     while got < 10_000 {
-        let m = client.recv().expect("the world closed before the burst arrived");
+        let m = client
+            .recv()
+            .expect("the world closed before the burst arrived");
         assert_eq!(m[0], relay::PACKET);
-        assert_eq!(u32::from_be_bytes(m[1..5].try_into().unwrap()), got, "in order");
+        assert_eq!(
+            u32::from_be_bytes(m[1..5].try_into().unwrap()),
+            got,
+            "in order"
+        );
         got += 1;
     }
-    assert_eq!(got, 10_000, "only {got} of 10,000 packets arrived before the world closed");
+    assert_eq!(
+        got, 10_000,
+        "only {got} of 10,000 packets arrived before the world closed"
+    );
     drop(stop);
     world.join().unwrap().unwrap();
     assert_eq!(client.recv(), None);
@@ -532,7 +599,9 @@ fn mapped_socket_attachments_keep_their_mtu_and_skip_detached_ones() {
     // The map task passes the first sandbox on while it is attached. Only
     // then does it detach.
     let barrier = Client::attach(&path, "barrier");
-    queued_rx.recv_timeout(Duration::from_secs(10)).expect("the map did not pass the barrier");
+    queued_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the map did not pass the barrier");
     drop(barrier);
     drop(first);
     let deadline = Instant::now() + Duration::from_secs(5);

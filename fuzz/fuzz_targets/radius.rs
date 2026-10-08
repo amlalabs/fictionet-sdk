@@ -7,12 +7,12 @@ use fictionet::stdlib::codec::Frames;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::radius::{
-    Attribute, Code, Error, Evs, Extended, MAX_PACKET, MAX_VALUE, Packet,
-    RESERVED_EXTENDED_TYPES, Value, Vsa,
-};
 use fictionet::stdlib::radius::harness::check_datagram;
+use fictionet::stdlib::radius::{
+    Attribute, Code, Error, Evs, Extended, MAX_PACKET, MAX_VALUE, Packet, RESERVED_EXTENDED_TYPES,
+    Value, Vsa,
+};
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 /// Takes bytes off the front of the fuzzer's input.
@@ -25,10 +25,18 @@ impl<'a> Input<'a> {
         Some(*b)
     }
     fn u16(&mut self) -> Option<usize> {
-        Some(usize::from(u16::from_be_bytes([self.byte()?, self.byte()?])))
+        Some(usize::from(u16::from_be_bytes([
+            self.byte()?,
+            self.byte()?,
+        ])))
     }
     fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_be_bytes([self.byte()?, self.byte()?, self.byte()?, self.byte()?]))
+        Some(u32::from_be_bytes([
+            self.byte()?,
+            self.byte()?,
+            self.byte()?,
+            self.byte()?,
+        ]))
     }
     fn bytes(&mut self, n: usize) -> Vec<u8> {
         let n = n.min(self.0.len());
@@ -56,19 +64,42 @@ impl<'a> Input<'a> {
             5 => Value::Time(self.u32()?),
             6 => Value::Integer64(u64::from_be_bytes(self.array()?)),
             7 => Value::Ipv6Address(Ipv6Addr::from(self.array::<16>()?)),
-            8 => Value::Ipv6Prefix { length: self.byte()?, prefix: Ipv6Addr::from(self.array::<16>()?) },
-            9 => Value::Ipv4Prefix { length: self.byte()?, prefix: Ipv4Addr::from(self.u32()?) },
+            8 => Value::Ipv6Prefix {
+                length: self.byte()?,
+                prefix: Ipv6Addr::from(self.array::<16>()?),
+            },
+            9 => Value::Ipv4Prefix {
+                length: self.byte()?,
+                prefix: Ipv4Addr::from(self.u32()?),
+            },
             10 => Value::InterfaceId(self.array()?),
-            11 => Value::Vsa(Vsa { vendor: self.u32()?, data: self.bytes(len) }),
-            12 => Value::Evs(Evs { vendor: self.u32()?, evs_type: self.byte()?, data: self.bytes(len) }),
-            13 => Value::Extended { ext_type: self.byte()?, data: self.bytes(len) },
-            14 => Value::LongExtended { ext_type: self.byte()?, more: self.byte()? & 1 == 1, data: self.bytes(len) },
+            11 => Value::Vsa(Vsa {
+                vendor: self.u32()?,
+                data: self.bytes(len),
+            }),
+            12 => Value::Evs(Evs {
+                vendor: self.u32()?,
+                evs_type: self.byte()?,
+                data: self.bytes(len),
+            }),
+            13 => Value::Extended {
+                ext_type: self.byte()?,
+                data: self.bytes(len),
+            },
+            14 => Value::LongExtended {
+                ext_type: self.byte()?,
+                more: self.byte()? & 1 == 1,
+                data: self.bytes(len),
+            },
             _ if depth < 2 => {
                 let mut tlvs = Vec::new();
                 for _ in 0..self.byte()? % 4 {
                     let kind = self.byte()?;
                     let n = self.byte()?;
-                    tlvs.push(Attribute { kind, value: self.bytes(usize::from(n) + 20) });
+                    tlvs.push(Attribute {
+                        kind,
+                        value: self.bytes(usize::from(n) + 20),
+                    });
                 }
                 Value::Tlv(tlvs)
             }
@@ -104,12 +135,19 @@ fn construct(data: &[u8]) -> Option<()> {
             // Raw bytes, straight into the public field: any length.
             1 => {
                 let n = input.u16()? % 400;
-                p.attributes.push(Attribute { kind, value: input.bytes(n) });
+                p.attributes.push(Attribute {
+                    kind,
+                    value: input.bytes(n),
+                });
             }
             // An extended value.
             2 => {
                 let n = input.u16()? % 4200;
-                let e = Extended { kind, ext_type: input.byte()?, data: input.bytes(n) };
+                let e = Extended {
+                    kind,
+                    ext_type: input.byte()?,
+                    data: input.bytes(n),
+                };
                 let before = p.clone();
                 match p.push_extended(&e) {
                     Ok(()) => assert!(e.ext_type < RESERVED_EXTENDED_TYPES),
@@ -122,8 +160,12 @@ fn construct(data: &[u8]) -> Option<()> {
             // Raw bytes through push.
             _ => {
                 let n = input.u16()? % 300;
-                let a = Attribute { kind, value: input.bytes(n) };
-                let fits = a.value.len() <= MAX_VALUE && p.encoded_len() + 2 + a.value.len() <= MAX_PACKET;
+                let a = Attribute {
+                    kind,
+                    value: input.bytes(n),
+                };
+                let fits =
+                    a.value.len() <= MAX_VALUE && p.encoded_len() + 2 + a.value.len() <= MAX_PACKET;
                 assert_eq!(p.push(a).is_ok(), fits);
             }
         }
@@ -137,16 +179,31 @@ fn construct(data: &[u8]) -> Option<()> {
         }
         Err(error) => {
             assert_eq!(error, Error::Unwritable);
-            assert!(p.encoded_len() > MAX_PACKET || p.attributes.iter().any(|a| a.value.len() > MAX_VALUE))
+            assert!(
+                p.encoded_len() > MAX_PACKET
+                    || p.attributes.iter().any(|a| a.value.len() > MAX_VALUE)
+            )
         }
     }
     Some(())
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * Frames::<Packet>::new().capacity());
-    contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(0), data, 2 * Frames::<Packet>::with_limit(0).capacity());
-    contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), data, 2 * Frames::<Packet>::with_limit(64).capacity());
+    contract::check_decode_with_alloc_limit(
+        Frames::<Packet>::new,
+        data,
+        2 * Frames::<Packet>::new().capacity(),
+    );
+    contract::check_decode_with_alloc_limit(
+        || Frames::<Packet>::with_limit(0),
+        data,
+        2 * Frames::<Packet>::with_limit(0).capacity(),
+    );
+    contract::check_decode_with_alloc_limit(
+        || Frames::<Packet>::with_limit(64),
+        data,
+        2 * Frames::<Packet>::with_limit(64).capacity(),
+    );
     contract::check_wire::<Packet>(data);
 
     check_datagram(data);

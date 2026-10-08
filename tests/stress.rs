@@ -38,15 +38,27 @@ fn ticks(stats: &[(String, std::fs::File)]) -> Vec<(String, u64)> {
             let stat = std::str::from_utf8(&buf[..n]).unwrap();
             let rest = &stat[stat.rfind(')').unwrap() + 2..];
             let fields: Vec<&str> = rest.split(' ').collect();
-            (name.clone(), fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap())
+            (
+                name.clone(),
+                fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap(),
+            )
         })
         .collect()
 }
 
 fn connect(path: &str, name: &str) -> OwnedFd {
     let fd = unix::connect(path).unwrap();
-    let _ = unix::set_timeout(fd.as_raw_fd(), libc::SO_RCVTIMEO, Some(Duration::from_secs(15)));
-    let hello = Message::Hello(Hello { version: relay::VERSION, mtu: 1500, kind: "tun".into(), name: name.into() });
+    let _ = unix::set_timeout(
+        fd.as_raw_fd(),
+        libc::SO_RCVTIMEO,
+        Some(Duration::from_secs(15)),
+    );
+    let hello = Message::Hello(Hello {
+        version: relay::VERSION,
+        mtu: 1500,
+        kind: "tun".into(),
+        name: name.into(),
+    });
     unix::send(fd.as_raw_fd(), &hello.encode(), false).unwrap();
     let mut buf = [0u8; 64];
     let n = unix::recv(fd.as_raw_fd(), &mut buf, false).unwrap();
@@ -73,9 +85,17 @@ const WINDOW: u32 = 48;
 
 #[test]
 fn many_attachments_lose_nothing_and_idle_costs_nothing() {
-    let path = format!("{}/fictionet-test-{}-stress.sock", std::env::temp_dir().display(), std::process::id());
+    let path = format!(
+        "{}/fictionet-test-{}-stress.sock",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
     let (attacher, mut attachments) = attachments();
-    let listening = listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
+    let listening = listen(
+        fictionet::WorldSocket::UnixSocket(path.clone().into()),
+        attacher,
+    )
+    .unwrap();
     let (stop, mut stopped) = pair();
     let (ready_tx, ready_rx) = mpsc::channel();
     let world = std::thread::Builder::new()
@@ -109,7 +129,9 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
         })
         .unwrap();
 
-    let fds: Vec<OwnedFd> = (0..CLIENTS).map(|i| connect(&path, &format!("s{i}"))).collect();
+    let fds: Vec<OwnedFd> = (0..CLIENTS)
+        .map(|i| connect(&path, &format!("s{i}")))
+        .collect();
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     // A new thread sets its own name, so it may not have one yet.
     let mut stats = thread_stats(&["world", "fictionet-"]);
@@ -117,7 +139,11 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
         stats = thread_stats(&["world", "fictionet-"]);
         stats.len() >= 3
     });
-    assert!(stats.len() >= 3, "{:?}", stats.iter().map(|s| &s.0).collect::<Vec<_>>());
+    assert!(
+        stats.len() >= 3,
+        "{:?}",
+        stats.iter().map(|s| &s.0).collect::<Vec<_>>()
+    );
 
     let started = Instant::now();
     let before = ticks(&stats);
@@ -132,7 +158,8 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
                 let mut sent = 0;
                 for got in 0..PACKETS {
                     while sent < PACKETS && sent < got + WINDOW {
-                        unix::send_parts(raw, &[&[relay::PACKET], &packet(id, sent)], false).unwrap();
+                        unix::send_parts(raw, &[&[relay::PACKET], &packet(id, sent)], false)
+                            .unwrap();
                         sent += 1;
                     }
                     let n = unix::recv(raw, &mut buf, false)
@@ -150,7 +177,10 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
         "{} packets each way in {:?}; CPU ticks: {:?}",
         CLIENTS * PACKETS,
         started.elapsed(),
-        busy.iter().zip(&before).map(|((n, b), (_, a))| (n, b - a)).collect::<Vec<_>>()
+        busy.iter()
+            .zip(&before)
+            .map(|((n, b), (_, a))| (n, b - a))
+            .collect::<Vec<_>>()
     );
 
     // Everyone attached and idle, with a timer pending: no thread of
@@ -166,12 +196,21 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
     std::thread::sleep(Duration::from_millis(1500));
     let idle_end = ticks(&stats);
     for ((name, a), (_, b)) in idle_start.iter().zip(&idle_end) {
-        assert!(b - a <= 2, "{name} used {} ticks in 1.5 s while idle", b - a);
+        assert!(
+            b - a <= 2,
+            "{name} used {} ticks in 1.5 s while idle",
+            b - a
+        );
     }
 
     // The attachments still work after the idle time.
     for (id, fd) in fds.iter().enumerate() {
-        unix::send_parts(fd.as_raw_fd(), &[&[relay::PACKET], &packet(id as u32, 9)], false).unwrap();
+        unix::send_parts(
+            fd.as_raw_fd(),
+            &[&[relay::PACKET], &packet(id as u32, 9)],
+            false,
+        )
+        .unwrap();
         let mut buf = vec![0u8; 2048];
         let n = unix::recv(fd.as_raw_fd(), &mut buf, false).unwrap();
         assert_eq!(&buf[1..n], &packet(id as u32, 9)[..]);

@@ -4,15 +4,20 @@
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::json::{self, Limits, Value, Values};
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: &[u8]| {
     let (limits, data) = match input {
         [a, b, rest @ ..] if a & 0x80 != 0 => (
-            Limits { depth: usize::from(a & 0x0f), size: usize::from(*b) * 4,
-                elements: usize::from(a >> 4 & 0x07) * 4 + 1 }, rest),
+            Limits {
+                depth: usize::from(a & 0x0f),
+                size: usize::from(*b) * 4,
+                elements: usize::from(a >> 4 & 0x07) * 4 + 1,
+            },
+            rest,
+        ),
         [_, _, rest @ ..] => (Limits::default(), rest),
         _ => (Limits::default(), input),
     };

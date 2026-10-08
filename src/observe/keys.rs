@@ -31,14 +31,27 @@ impl std::fmt::Debug for Recorder {
 impl rustls::KeyLog for Recorder {
     fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
         let graph = self.fcx.graph();
-        let first = !graph.state().keys.iter().any(|k| k.client_random == client_random);
-        graph.key(KeyLine { label: label.to_owned(), client_random: client_random.to_vec(), secret: secret.to_vec() });
+        let first = !graph
+            .state()
+            .keys
+            .iter()
+            .any(|k| k.client_random == client_random);
+        graph.key(KeyLine {
+            label: label.to_owned(),
+            client_random: client_random.to_vec(),
+            secret: secret.to_vec(),
+        });
         if first {
             let name = self.sni.as_deref().unwrap_or("a connection with no name");
             let random = super::packets::hex(&client_random[..4]);
             let summary = format!("session keys for {name}, client random {random}…");
             let _task = crate::watch::Polling::enter(self.task);
-            self.fcx.record(Event::new("tls", "keys").summary(summary).field("sni", crate::events::opt(self.sni.as_deref())).field("client_random", random));
+            self.fcx.record(
+                Event::new("tls", "keys")
+                    .summary(summary)
+                    .field("sni", crate::events::opt(self.sni.as_deref()))
+                    .field("client_random", random),
+            );
         }
     }
 }
@@ -49,12 +62,19 @@ impl rustls::KeyLog for Recorder {
 /// clones it and replaces its key logger with one that records session
 /// secrets for packet decryption and `tls.keys` events. `sni` is the
 /// client's requested server name, included in those events.
-pub fn observed_config(fcx: &Cx, config: Arc<ServerConfig>, sni: Option<&str>) -> Arc<ServerConfig> {
+pub fn observed_config(
+    fcx: &Cx,
+    config: Arc<ServerConfig>,
+    sni: Option<&str>,
+) -> Arc<ServerConfig> {
     if !fcx.observed() {
         return config;
     }
     let mut logged = (*config).clone();
-    logged.key_log =
-        Arc::new(Recorder { fcx: fcx.clone(), sni: sni.map(str::to_owned), task: crate::watch::current_task() });
+    logged.key_log = Arc::new(Recorder {
+        fcx: fcx.clone(),
+        sni: sni.map(str::to_owned),
+        task: crate::watch::current_task(),
+    });
     Arc::new(logged)
 }

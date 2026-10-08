@@ -1,16 +1,16 @@
 //! FTP control commands, replies, and address tokens.
 #![no_main]
 
-use fictionet::stdlib::codec::{
-    Wire,
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract::{
+    check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value,
 };
-use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value};
 
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::ftp::{
-    Command, Commands, EprtAddress, Feature, MAX_LINE, MAX_REPLY_BYTES, PortAddress,
-    Replies, Reply, ReplyCode, Request,
+    Command, Commands, EprtAddress, Feature, MAX_LINE, MAX_REPLY_BYTES, PortAddress, Replies,
+    Reply, ReplyCode, Request,
 };
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -28,7 +28,10 @@ fuzz_target!(|data: &[u8]| {
         check_wire_value(command);
         let bytes = command.to_bytes().unwrap();
         assert!(bytes.len() <= MAX_LINE);
-        assert_eq!(decode_all(Commands::new, &bytes), (vec![Ok(command.clone())], None));
+        assert_eq!(
+            decode_all(Commands::new, &bytes),
+            (vec![Ok(command.clone())], None)
+        );
         if let Ok(request) = Request::from_command(command) {
             check_wire_value(&request);
             assert_eq!(Request::parse(&request.to_bytes().unwrap()), Ok(request));
@@ -39,26 +42,45 @@ fuzz_target!(|data: &[u8]| {
     let (verb, arg) = text.split_once(' ').unwrap_or((&text, ""));
     check_wire_value(&Command::new(verb, Some(arg)));
     for request in [
-        Request::Dele(arg.into()), Request::Allo(arg.into()),
-        Request::Rest(arg.into()), Request::Opts(arg.into()),
+        Request::Dele(arg.into()),
+        Request::Allo(arg.into()),
+        Request::Rest(arg.into()),
+        Request::Opts(arg.into()),
     ] {
         check_wire_value(&request);
     }
     let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
     let code = ReplyCode::new(100 + u16::from(data.first().copied().unwrap_or(0)) % 500);
     if let Some(code) = code {
-        check_wire_value(&Reply { code, lines: lines.clone() });
+        check_wire_value(&Reply {
+            code,
+            lines: lines.clone(),
+        });
         if let Ok(reply) = Reply::from_lines(code, lines.clone()) {
             check_wire_value(&reply);
-            assert_eq!(Reply::parse(&reply.to_bytes().unwrap()).as_ref(), Ok(&reply));
+            assert_eq!(
+                Reply::parse(&reply.to_bytes().unwrap()).as_ref(),
+                Ok(&reply)
+            );
         }
-        let features: Vec<Feature> = lines.iter().map(|line| {
-            let (name, params) = line.split_once(' ').map_or((line.as_str(), None), |(n, p)| (n, Some(p.into())));
-            Feature { name: name.into(), params }
-        }).collect();
+        let features: Vec<Feature> = lines
+            .iter()
+            .map(|line| {
+                let (name, params) = line
+                    .split_once(' ')
+                    .map_or((line.as_str(), None), |(n, p)| (n, Some(p.into())));
+                Feature {
+                    name: name.into(),
+                    params,
+                }
+            })
+            .collect();
         if let Ok(reply) = Reply::feature_list(&features) {
             check_wire_value(&reply);
-            assert_eq!(Reply::parse(&reply.to_bytes().unwrap()).unwrap().features(), Ok(features));
+            assert_eq!(
+                Reply::parse(&reply.to_bytes().unwrap()).unwrap().features(),
+                Ok(features)
+            );
         }
     }
 
@@ -78,7 +100,10 @@ fuzz_target!(|data: &[u8]| {
         }
         if let Ok(port) = reply.extended_passive_port() {
             let bytes = Reply::extended_passive(port).to_bytes().unwrap();
-            assert_eq!(Reply::parse(&bytes).unwrap().extended_passive_port(), Ok(port));
+            assert_eq!(
+                Reply::parse(&bytes).unwrap().extended_passive_port(),
+                Ok(port)
+            );
         }
     }
 });

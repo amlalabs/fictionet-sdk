@@ -6,100 +6,52 @@
 // A macro keeps rustfmt from following the #[path] modules.
 macro_rules! protocols {
     () => {
-        #[path = "../../src/observe/protocols.rs"]
-        pub mod observe_protocols;
-        #[path = "../../src/observe/http2.rs"]
-        pub mod observe_http2;
-        #[path = "../../src/observe/tls.rs"]
-        pub mod observe_tls;
-        #[path = "../../src/observe/conversation.rs"]
-        pub mod observe_conversation;
-        #[path = "../../src/stdlib/codec/buffer.rs"]
-        pub mod buffer;
-        #[path = "../../src/stdlib/codec/combinators.rs"]
-        pub mod combinators;
-        #[path = "../../src/stdlib/codec/demux.rs"]
-        pub mod demux;
-        #[path = "../../src/stdlib/codec/frames.rs"]
-        pub mod frames;
-        #[path = "../../src/stdlib/codec/head_body.rs"]
-        pub mod head_body;
-        #[path = "../../src/stdlib/codec/pipe.rs"]
-        pub mod pipe;
-        #[path = "../../src/stdlib/codec/reader.rs"]
-        pub mod reader;
-        #[path = "../../src/stdlib/codec/stream.rs"]
-        pub mod stream;
-        #[path = "../../src/stdlib/test_support/mod.rs"]
-        pub mod test_support;
-        #[path = "../../src/stdlib/link.rs"]
-        pub mod link;
-        #[path = "../../src/stdlib/tcp.rs"]
-        pub mod tcp;
-        #[path = "../../src/stdlib/udp.rs"]
-        pub mod udp;
-        #[path = "../../src/stdlib/ports.rs"]
-        pub mod ports;
-        #[path = "../../src/stdlib/route.rs"]
-        pub mod route;
-        #[path = "../../src/stdlib/tls.rs"]
-        pub mod tls;
-        #[path = "../../src/stdlib/codec/ascii.rs"]
-        pub mod ascii;
-        #[path = "../../src/stdlib/codec/base64.rs"]
-        pub mod base64;
-        #[path = "../../src/stdlib/codec/civil.rs"]
-        pub mod civil;
-        #[path = "../../src/stdlib/codec/crc32c.rs"]
-        pub mod crc32c;
-        #[path = "../../src/stdlib/codec/field.rs"]
-        pub mod field;
-        #[path = "../../src/stdlib/codec/layout.rs"]
-        pub mod layout;
-        #[path = "../../src/stdlib/codec/leb128.rs"]
-        pub mod leb128;
-        #[path = "../../src/stdlib/codec/work.rs"]
-        pub mod work;
-        #[path = "../../src/stdlib/codec/interceptor.rs"]
-        pub mod interceptor;
-        #[path = "../../src/stdlib/codec/recorder.rs"]
-        pub mod recorder;
-        #[path = "../../src/stdlib/codec/faults.rs"]
-        pub mod faults;
-        #[path = "../../src/stdlib/codec/lcg.rs"]
-        pub mod lcg;
         #[path = "../../src/stdlib/amqp.rs"]
         pub mod amqp;
+        #[path = "../../src/stdlib/codec/ascii.rs"]
+        pub mod ascii;
         #[path = "../../src/stdlib/asn1.rs"]
         pub mod asn1;
         #[path = "../../src/stdlib/bacnet.rs"]
         pub mod bacnet;
+        #[path = "../../src/stdlib/codec/base64.rs"]
+        pub mod base64;
         #[path = "../../src/stdlib/bgp.rs"]
         pub mod bgp;
+        #[path = "../../src/stdlib/codec/buffer.rs"]
+        pub mod buffer;
         #[path = "../../src/stdlib/cboe_boe.rs"]
         pub mod cboe_boe;
         #[path = "../../src/stdlib/cboe_pitch.rs"]
         pub mod cboe_pitch;
+        #[path = "../../src/stdlib/codec/civil.rs"]
+        pub mod civil;
         #[path = "../../src/stdlib/cme_mdp3.rs"]
         pub mod cme_mdp3;
         #[path = "../../src/stdlib/coap.rs"]
         pub mod coap;
-        #[path = "../../src/stdlib/cotp.rs"]
-        pub mod cotp;
-        #[path = "../../src/stdlib/dcerpc.rs"]
-        pub mod dcerpc;
+        #[path = "../../src/stdlib/codec/combinators.rs"]
+        pub mod combinators;
         #[path = "../../src/stdlib/connection.rs"]
         pub mod connection;
+        #[path = "../../src/stdlib/cotp.rs"]
+        pub mod cotp;
+        #[path = "../../src/stdlib/codec/crc32c.rs"]
+        pub mod crc32c;
+        #[path = "../../src/stdlib/dcerpc.rs"]
+        pub mod dcerpc;
+        #[path = "../../src/stdlib/codec/demux.rs"]
+        pub mod demux;
         #[path = "../../src/stdlib/dhcp.rs"]
         pub mod dhcp;
         #[path = "../../src/stdlib/dhcpv6.rs"]
         pub mod dhcpv6;
         #[path = "../../src/stdlib/diameter.rs"]
         pub mod diameter;
-        #[path = "../../src/stdlib/dns.rs"]
-        pub mod dns;
         #[path = "../../src/stdlib/dnp3.rs"]
         pub mod dnp3;
+        #[path = "../../src/stdlib/dns.rs"]
+        pub mod dns;
         #[path = "../../src/stdlib/dtls.rs"]
         pub mod dtls;
         #[path = "../../src/stdlib/enip.rs"]
@@ -108,8 +60,14 @@ macro_rules! protocols {
         pub mod fast;
         #[path = "../../src/stdlib/fastcgi.rs"]
         pub mod fastcgi;
+        #[path = "../../src/stdlib/codec/faults.rs"]
+        pub mod faults;
+        #[path = "../../src/stdlib/codec/field.rs"]
+        pub mod field;
         #[path = "../../src/stdlib/fix.rs"]
         pub mod fix;
+        #[path = "../../src/stdlib/codec/frames.rs"]
+        pub mod frames;
         #[path = "../../src/stdlib/ftp.rs"]
         pub mod ftp;
         #[path = "../../codegen/tests/golden/recursive.rs"]
@@ -122,30 +80,34 @@ macro_rules! protocols {
         pub mod gre;
         #[path = "../../src/stdlib/grpc.rs"]
         pub mod grpc;
+        #[path = "../../src/stdlib/codec/head_body.rs"]
+        pub mod head_body;
         #[path = "../../src/stdlib/hpack.rs"]
         pub mod hpack;
-        #[path = "../../src/stdlib/httpd.rs"]
-        pub mod httpd;
-        #[path = "../../src/stdlib/huffman.rs"]
-        pub mod huffman;
         #[path = "../../src/stdlib/http1.rs"]
         pub mod http1;
         #[path = "../../src/stdlib/http2.rs"]
         pub mod http2;
         #[path = "../../src/stdlib/http3.rs"]
         pub mod http3;
+        #[path = "../../src/stdlib/httpd.rs"]
+        pub mod httpd;
+        #[path = "../../src/stdlib/huffman.rs"]
+        pub mod huffman;
+        #[path = "../../src/stdlib/icmp.rs"]
+        pub mod icmp;
         #[path = "../../src/stdlib/iec104.rs"]
         pub mod iec104;
         #[path = "../../src/stdlib/igmp.rs"]
         pub mod igmp;
-        #[path = "../../src/stdlib/icmp.rs"]
-        pub mod icmp;
         #[path = "../../src/stdlib/ike.rs"]
         pub mod ike;
         #[path = "../../src/stdlib/imap.rs"]
         pub mod imap;
         #[path = "../../src/stdlib/imf.rs"]
         pub mod imf;
+        #[path = "../../src/stdlib/codec/interceptor.rs"]
+        pub mod interceptor;
         #[path = "../../src/stdlib/ip.rs"]
         pub mod ip;
         #[path = "../../src/stdlib/ipp.rs"]
@@ -166,8 +128,16 @@ macro_rules! protocols {
         pub mod kerberos;
         #[path = "../../src/stdlib/l2tp.rs"]
         pub mod l2tp;
+        #[path = "../../src/stdlib/codec/layout.rs"]
+        pub mod layout;
+        #[path = "../../src/stdlib/codec/lcg.rs"]
+        pub mod lcg;
         #[path = "../../src/stdlib/ldap.rs"]
         pub mod ldap;
+        #[path = "../../src/stdlib/codec/leb128.rs"]
+        pub mod leb128;
+        #[path = "../../src/stdlib/link.rs"]
+        pub mod link;
         #[path = "../../src/stdlib/memcache.rs"]
         pub mod memcache;
         #[path = "../../src/stdlib/mime_multipart.rs"]
@@ -182,6 +152,36 @@ macro_rules! protocols {
         pub mod mqtt;
         #[path = "../../src/stdlib/mysql.rs"]
         pub mod mysql;
+        #[path = "../../src/observe/conversation.rs"]
+        pub mod observe_conversation;
+        #[path = "../../src/observe/http2.rs"]
+        pub mod observe_http2;
+        #[path = "../../src/observe/protocols.rs"]
+        pub mod observe_protocols;
+        #[path = "../../src/observe/tls.rs"]
+        pub mod observe_tls;
+        #[path = "../../src/stdlib/codec/pipe.rs"]
+        pub mod pipe;
+        #[path = "../../src/stdlib/ports.rs"]
+        pub mod ports;
+        #[path = "../../src/stdlib/codec/reader.rs"]
+        pub mod reader;
+        #[path = "../../src/stdlib/codec/recorder.rs"]
+        pub mod recorder;
+        #[path = "../../src/stdlib/route.rs"]
+        pub mod route;
+        #[path = "../../src/stdlib/codec/stream.rs"]
+        pub mod stream;
+        #[path = "../../src/stdlib/tcp.rs"]
+        pub mod tcp;
+        #[path = "../../src/stdlib/test_support/mod.rs"]
+        pub mod test_support;
+        #[path = "../../src/stdlib/tls.rs"]
+        pub mod tls;
+        #[path = "../../src/stdlib/udp.rs"]
+        pub mod udp;
+        #[path = "../../src/stdlib/codec/work.rs"]
+        pub mod work;
         // NBDGM and NBSS use the public NBNS name encoding helpers.
         #[path = "../../src/stdlib/nbdgm.rs"]
         pub mod nbdgm;
@@ -270,10 +270,10 @@ macro_rules! protocols {
         pub mod soupbintcp;
         #[path = "../../src/stdlib/spnego.rs"]
         pub mod spnego;
-        #[path = "../../src/stdlib/ssh.rs"]
-        pub mod ssh;
         #[path = "../../src/stdlib/sse.rs"]
         pub mod sse;
+        #[path = "../../src/stdlib/ssh.rs"]
+        pub mod ssh;
         #[path = "../../src/stdlib/stun.rs"]
         pub mod stun;
         #[path = "../../src/stdlib/syslog.rs"]
@@ -320,7 +320,11 @@ protocols!();
 // These are the copied types, so their Prefixed impls must use public APIs.
 fn copied_frames() {
     use fictionet::stdlib::codec::{Decode, Frames, Prefixed};
-    fn check<T: Prefixed>(_decoder: Frames<T>) where Frames<T>: Decode {}
+    fn check<T: Prefixed>(_decoder: Frames<T>)
+    where
+        Frames<T>: Decode,
+    {
+    }
     check(Frames::<modbus::Frame>::new());
     check(Frames::<diameter::Message>::with_limit(1024));
     check(Frames::<opcua::Chunk>::with_limit(opcua::Limits::default()));
@@ -341,7 +345,7 @@ fn copied_transports<S, M>(
     M: Fn() -> S + Send + Sync + 'static,
     <S::Decoder as fictionet::stdlib::codec::Decode>::Error: Clone + Send,
 {
-    use fictionet::stdlib::serve::{listen, serve_datagram, ServeOptions};
+    use fictionet::stdlib::serve::{ServeOptions, listen, serve_datagram};
     let opts = ServeOptions::default();
     listen(fcx, listener, state.clone(), make, opts.clone());
     fn send_future(_: impl std::future::Future + Send) {}
@@ -359,8 +363,15 @@ fn copied_connection<S>(
     S: fictionet::stdlib::serve::Service,
     <S::Decoder as fictionet::stdlib::codec::Decode>::Error: Clone + Send,
 {
-    use fictionet::stdlib::serve::{serve, ServeOptions};
-    drop(serve(fcx, conn, info, service, state, &ServeOptions::default()));
+    use fictionet::stdlib::serve::{ServeOptions, serve};
+    drop(serve(
+        fcx,
+        conn,
+        info,
+        service,
+        state,
+        &ServeOptions::default(),
+    ));
 }
 
 fn copied_tls(fcx: &fictionet::Cx, conn: tcp::TcpConnection) {

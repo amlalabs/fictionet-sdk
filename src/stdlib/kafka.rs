@@ -72,14 +72,14 @@
 //! assert_eq!(Response::parse(&bytes[4..], api_key::API_VERSIONS, 0).unwrap(), response);
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Prefixed;
 extern crate alloc;
 
-use fictionet::stdlib::codec::leb128;
-use fictionet::stdlib::codec::{Wire, Reader, Truncated, Trailing};
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use fictionet::stdlib::codec::leb128;
+use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire};
 
 /// The TCP port Kafka brokers listen on.
 pub const PORT: u16 = 9092;
@@ -219,7 +219,11 @@ pub fn request_header_version(api_key: i16, api_version: i16) -> u8 {
 /// uses 0, so a client that does not yet know what a broker speaks can
 /// read its answer.
 pub fn response_header_version(api_key: i16, api_version: i16) -> u8 {
-    if api_key != api_key::API_VERSIONS && is_flexible(api_key, api_version) { 1 } else { 0 }
+    if api_key != api_key::API_VERSIONS && is_flexible(api_key, api_version) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Why bytes could not be read or written.
@@ -276,7 +280,10 @@ impl core::fmt::Display for Error {
             Error::Null => f.write_str("null where this version does not allow one"),
             Error::TagOrder(t) => write!(f, "tagged field {t} is out of order"),
             Error::HeaderVersion(v) => write!(f, "header version {v} is not one this module reads"),
-            Error::UnsupportedVersion { api_key, api_version } => {
+            Error::UnsupportedVersion {
+                api_key,
+                api_version,
+            } => {
                 write!(f, "no full body for API {api_key} version {api_version}")
             }
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
@@ -346,7 +353,13 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     /// bit set on every byte but the last. It takes at most 5 bytes, and
     /// the fifth may hold only the top 4 bits of a u32.
     fn uvarint(&mut self) -> Result<u32, Error> {
-        leb128::decode_with(|| self.u8().map_err(Error::from), 5, u64::from(u32::MAX), Error::Varint).map(|v| v as u32)
+        leb128::decode_with(
+            || self.u8().map_err(Error::from),
+            5,
+            u64::from(u32::MAX),
+            Error::Varint,
+        )
+        .map(|v| v as u32)
     }
 
     /// A VARINT: a zigzag-encoded i32 in an unsigned varint, so small
@@ -361,13 +374,20 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     /// holding only the top bit.
     #[cfg(test)]
     fn varlong(&mut self) -> Result<i64, Error> {
-        let value = leb128::decode_with(|| self.u8().map_err(Error::from), 10, u64::MAX, Error::Varint)?;
+        let value = leb128::decode_with(
+            || self.u8().map_err(Error::from),
+            10,
+            u64::MAX,
+            Error::Varint,
+        )?;
         Ok((value >> 1) as i64 ^ -((value & 1) as i64))
     }
 
     fn utf8(&mut self, n: usize) -> Result<String, Error> {
         let b = self.take(n)?;
-        core::str::from_utf8(b).map(str::to_owned).map_err(|_| Error::Utf8)
+        core::str::from_utf8(b)
+            .map(str::to_owned)
+            .map_err(|_| Error::Utf8)
     }
 
     /// A STRING: an INT16 length, then that many bytes of UTF-8.
@@ -446,7 +466,11 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     /// Checks an array's element count against [`MAX_ARRAY`] and the bytes
     /// left. Every element takes at least one byte.
     fn count(&self, n: usize) -> Result<usize, Error> {
-        if n > MAX_ARRAY || n > self.remaining() { Err(Error::Length(n as i64)) } else { Ok(n) }
+        if n > MAX_ARRAY || n > self.remaining() {
+            Err(Error::Length(n as i64))
+        } else {
+            Ok(n)
+        }
     }
 
     /// An ARRAY's element count: an INT32, or -1 for a null array. The
@@ -496,19 +520,35 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     }
 
     fn str_f(&mut self, flex: bool) -> Result<String, Error> {
-        if flex { self.compact_string() } else { self.string() }
+        if flex {
+            self.compact_string()
+        } else {
+            self.string()
+        }
     }
 
     fn nstr_f(&mut self, flex: bool) -> Result<Option<String>, Error> {
-        if flex { self.compact_nullable_string() } else { self.nullable_string() }
+        if flex {
+            self.compact_nullable_string()
+        } else {
+            self.nullable_string()
+        }
     }
 
     fn arr_f(&mut self, flex: bool) -> Result<Option<usize>, Error> {
-        if flex { self.compact_array_len() } else { self.array_len() }
+        if flex {
+            self.compact_array_len()
+        } else {
+            self.array_len()
+        }
     }
 
     fn tags_f(&mut self, flex: bool) -> Result<Vec<TaggedField>, Error> {
-        if flex { self.tagged_fields() } else { Ok(Vec::new()) }
+        if flex {
+            self.tagged_fields()
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn i32s(&mut self, flex: bool) -> Result<Vec<i32>, Error> {
@@ -532,11 +572,19 @@ struct Writer {
 impl Writer {
     /// A writer with nothing written.
     fn new() -> Writer {
-        Writer { out: Vec::new(), failed: false, limit: MAX_FRAME }
+        Writer {
+            out: Vec::new(),
+            failed: false,
+            limit: MAX_FRAME,
+        }
     }
 
     fn finish(self) -> Result<Vec<u8>, Error> {
-        if self.failed { Err(Error::Unwritable) } else { Ok(self.out) }
+        if self.failed {
+            Err(Error::Unwritable)
+        } else {
+            Ok(self.out)
+        }
     }
 
     fn raw(&mut self, bytes: &[u8]) {
@@ -620,7 +668,10 @@ impl Writer {
 
     /// A STRING.
     fn string(&mut self, s: &str) {
-        if s.len() > MAX_STRING { self.failed = true; return; }
+        if s.len() > MAX_STRING {
+            self.failed = true;
+            return;
+        }
         self.i16(s.len() as i16);
         self.raw(s.as_bytes());
     }
@@ -635,7 +686,10 @@ impl Writer {
 
     /// A COMPACT_STRING.
     fn compact_string(&mut self, s: &str) {
-        if s.len() > MAX_STRING { self.failed = true; return; }
+        if s.len() > MAX_STRING {
+            self.failed = true;
+            return;
+        }
         self.uvarint(s.len() as u32 + 1);
         self.raw(s.as_bytes());
     }
@@ -651,7 +705,10 @@ impl Writer {
     /// BYTES.
     #[cfg(test)]
     fn bytes(&mut self, b: &[u8]) {
-        if b.len() > MAX_FRAME { self.failed = true; return; }
+        if b.len() > MAX_FRAME {
+            self.failed = true;
+            return;
+        }
         self.i32(b.len() as i32);
         self.raw(b);
     }
@@ -668,7 +725,10 @@ impl Writer {
     /// COMPACT_BYTES.
     #[cfg(test)]
     fn compact_bytes(&mut self, b: &[u8]) {
-        if b.len() > MAX_FRAME { self.failed = true; return; }
+        if b.len() > MAX_FRAME {
+            self.failed = true;
+            return;
+        }
         self.uvarint(b.len() as u32 + 1);
         self.raw(b);
     }
@@ -703,8 +763,13 @@ impl Writer {
     fn tagged_fields(&mut self, fields: &[TaggedField]) {
         if fields.len() > MAX_TAGGED_FIELDS
             || fields.windows(2).any(|pair| pair[0].tag >= pair[1].tag)
-            || fields.iter().any(|field| field.tag > MAX_TAG || field.data.len() > MAX_FRAME)
-        { self.failed = true; return; }
+            || fields
+                .iter()
+                .any(|field| field.tag > MAX_TAG || field.data.len() > MAX_FRAME)
+        {
+            self.failed = true;
+            return;
+        }
         self.uvarint(fields.len() as u32);
         for field in fields {
             self.uvarint(field.tag);
@@ -716,15 +781,27 @@ impl Writer {
     // The same writes in the classic or the flexible form.
 
     fn str_f(&mut self, flex: bool, s: &str) {
-        if flex { self.compact_string(s) } else { self.string(s) }
+        if flex {
+            self.compact_string(s)
+        } else {
+            self.string(s)
+        }
     }
 
     fn nstr_f(&mut self, flex: bool, s: Option<&str>) {
-        if flex { self.compact_nullable_string(s) } else { self.nullable_string(s) }
+        if flex {
+            self.compact_nullable_string(s)
+        } else {
+            self.nullable_string(s)
+        }
     }
 
     fn arr_f(&mut self, flex: bool, n: Option<usize>) {
-        if flex { self.compact_array_len(n) } else { self.array_len(n) }
+        if flex {
+            self.compact_array_len(n)
+        } else {
+            self.array_len(n)
+        }
     }
 
     fn tags_f(&mut self, flex: bool, fields: &[TaggedField]) {
@@ -736,7 +813,10 @@ impl Writer {
     }
 
     fn i32s(&mut self, flex: bool, v: &[i32]) {
-        if v.len() > MAX_ARRAY { self.failed = true; return; }
+        if v.len() > MAX_ARRAY {
+            self.failed = true;
+            return;
+        }
         self.arr_f(flex, Some(v.len()));
         for &x in v {
             self.i32(x);
@@ -746,7 +826,11 @@ impl Writer {
 
 /// Checks a container count before walking or copying its elements.
 fn bounded<T>(values: &[T]) -> Result<&[T], Error> {
-    if values.len() > MAX_ARRAY { Err(Error::Unwritable) } else { Ok(values) }
+    if values.len() > MAX_ARRAY {
+        Err(Error::Unwritable)
+    } else {
+        Ok(values)
+    }
 }
 
 /// Reads the frame at the start of `b`: a 4-byte size, then the payload.
@@ -754,7 +838,9 @@ fn bounded<T>(values: &[T]) -> Result<&[T], Error> {
 /// payload and how many bytes of `b` the frame took. A size that is
 /// negative or over `limit` is an error, known from the first 4 bytes.
 fn parse_frame(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>, Error> {
-    let Some(head) = b.get(..SIZE_LEN) else { return Ok(None) };
+    let Some(head) = b.get(..SIZE_LEN) else {
+        return Ok(None);
+    };
     let size = i32::from_be_bytes([head[0], head[1], head[2], head[3]]);
     if size < 0 || size as usize > limit.min(MAX_FRAME) {
         return Err(Error::FrameSize(size));
@@ -800,7 +886,9 @@ impl Wire for Frame {
     /// Appends a length prefix and payload. Refuses payloads over
     /// [`MAX_FRAME`] without changing `out`.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        if self.0.len() > MAX_FRAME { return Err(Error::Unwritable); }
+        if self.0.len() > MAX_FRAME {
+            return Err(Error::Unwritable);
+        }
         out.extend_from_slice(&(self.0.len() as i32).to_be_bytes());
         out.extend_from_slice(&self.0);
         Ok(())
@@ -836,10 +924,14 @@ impl Prefixed for Frame {
     const NAME: &'static str = "Kafka";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_FRAME }
+    fn default_limit() -> Self::Limit {
+        MAX_FRAME
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_FRAME) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_FRAME)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -848,12 +940,14 @@ impl Prefixed for Frame {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         Ok(parse_frame(input, limit)?.map(|(payload, used)| (Frame(payload.to_vec()), used)))
     }
 }
-
 
 /// A request header. Version 0 has the first three fields, version 1 adds
 /// the client ID, and version 2 adds tagged fields. The version follows
@@ -896,14 +990,30 @@ impl RequestHeader {
         let api_key = r.i16_be()?;
         let api_version = r.i16_be()?;
         let correlation_id = r.i32_be()?;
-        let client_id = if version >= 1 { r.nullable_string()? } else { None };
-        let tagged_fields = if version >= 2 { r.tagged_fields()? } else { Vec::new() };
-        Ok(RequestHeader { api_key, api_version, correlation_id, client_id, tagged_fields })
+        let client_id = if version >= 1 {
+            r.nullable_string()?
+        } else {
+            None
+        };
+        let tagged_fields = if version >= 2 {
+            r.tagged_fields()?
+        } else {
+            Vec::new()
+        };
+        Ok(RequestHeader {
+            api_key,
+            api_version,
+            correlation_id,
+            client_id,
+            tagged_fields,
+        })
     }
 
     fn encode(&self, w: &mut Writer) {
         let version = self.version();
-        if (version == 0 && self.client_id.is_some()) || (version < 2 && !self.tagged_fields.is_empty()) {
+        if (version == 0 && self.client_id.is_some())
+            || (version < 2 && !self.tagged_fields.is_empty())
+        {
             w.failed = true;
             return;
         }
@@ -937,12 +1047,22 @@ impl ResponseHeader {
             return Err(Error::HeaderVersion(version));
         }
         let correlation_id = r.i32_be()?;
-        let tagged_fields = if version >= 1 { r.tagged_fields()? } else { Vec::new() };
-        Ok(ResponseHeader { correlation_id, tagged_fields })
+        let tagged_fields = if version >= 1 {
+            r.tagged_fields()?
+        } else {
+            Vec::new()
+        };
+        Ok(ResponseHeader {
+            correlation_id,
+            tagged_fields,
+        })
     }
 
     fn encode(&self, w: &mut Writer, version: u8) {
-        if version > 1 || (version == 0 && !self.tagged_fields.is_empty()) { w.failed = true; return; }
+        if version > 1 || (version == 0 && !self.tagged_fields.is_empty()) {
+            w.failed = true;
+            return;
+        }
         w.i32(self.correlation_id);
         if version >= 1 {
             w.tagged_fields(&self.tagged_fields);
@@ -957,7 +1077,9 @@ impl Wire for RequestHeader {
     /// Reads exactly one request header. Refuses malformed fields,
     /// excess lengths, input over [`MAX_FRAME`], incomplete input, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() > MAX_FRAME { return Err(Error::TooLarge(bytes.len())); }
+        if bytes.len() > MAX_FRAME {
+            return Err(Error::TooLarge(bytes.len()));
+        }
         let mut reader = Reader::new(bytes);
         let header = Self::read(&mut reader)?;
         reader.finish()?;
@@ -986,7 +1108,14 @@ pub fn has_body(api_key: i16, api_version: i16) -> bool {
 }
 
 fn check_version(api_key: i16, api_version: i16) -> Result<(), Error> {
-    if has_body(api_key, api_version) { Ok(()) } else { Err(Error::UnsupportedVersion { api_key, api_version }) }
+    if has_body(api_key, api_version) {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedVersion {
+            api_key,
+            api_version,
+        })
+    }
 }
 
 /// Finishes a body only if its versioned reader preserves the value.
@@ -1044,14 +1173,17 @@ impl ApiVersionsRequest {
             let b = s.as_bytes();
             let inner = |c: &u8| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'.';
             match (b.first(), b.last()) {
-                (Some(f), Some(l)) => f.is_ascii_alphanumeric() && l.is_ascii_alphanumeric() && b.iter().all(inner),
+                (Some(f), Some(l)) => {
+                    f.is_ascii_alphanumeric() && l.is_ascii_alphanumeric() && b.iter().all(inner)
+                }
                 _ => false,
             }
         }
         if version >= 5 && self.cluster_id.is_some() != (self.node_id != -1) {
             return false;
         }
-        version < 3 || (software(&self.client_software_name) && software(&self.client_software_version))
+        version < 3
+            || (software(&self.client_software_name) && software(&self.client_software_version))
     }
 
     /// Reads the body of an ApiVersions request of version `version`.
@@ -1157,7 +1289,12 @@ impl ApiVersionsResponse {
         let tagged_fields = r.tags_f(flex)?;
         r.finish()?;
         check_feature_tags(&tagged_fields)?;
-        Ok(ApiVersionsResponse { error_code, api_keys, throttle_time_ms, tagged_fields })
+        Ok(ApiVersionsResponse {
+            error_code,
+            api_keys,
+            throttle_time_ms,
+            tagged_fields,
+        })
     }
 
     fn encode(&self, version: i16) -> Result<Vec<u8>, Error> {
@@ -1280,9 +1417,17 @@ impl MetadataRequest {
                 let mut topics = Vec::new();
                 for _ in 0..n {
                     let topic_id = if version >= 10 { r.uuid()? } else { [0; 16] };
-                    let name = if version >= 10 { r.nstr_f(flex)? } else { Some(r.str_f(flex)?) };
+                    let name = if version >= 10 {
+                        r.nstr_f(flex)?
+                    } else {
+                        Some(r.str_f(flex)?)
+                    };
                     let tagged_fields = r.tags_f(flex)?;
-                    topics.push(MetadataRequestTopic { topic_id, name, tagged_fields });
+                    topics.push(MetadataRequestTopic {
+                        topic_id,
+                        name,
+                        tagged_fields,
+                    });
                 }
                 Some(topics)
             }
@@ -1290,7 +1435,10 @@ impl MetadataRequest {
         if let Some(topics) = &topics {
             check_request_topics(topics, version)?;
         }
-        let mut out = MetadataRequest { topics, ..MetadataRequest::default() };
+        let mut out = MetadataRequest {
+            topics,
+            ..MetadataRequest::default()
+        };
         if version >= 4 {
             out.allow_auto_topic_creation = r.bool()?;
         }
@@ -1533,7 +1681,13 @@ impl MetadataResponse {
             let port = r.i32_be()?;
             let rack = if version >= 1 { r.nstr_f(flex)? } else { None };
             let tagged_fields = r.tags_f(flex)?;
-            out.brokers.push(MetadataBroker { node_id, host, port, rack, tagged_fields });
+            out.brokers.push(MetadataBroker {
+                node_id,
+                host,
+                port,
+                rack,
+                tagged_fields,
+            });
         }
         if version >= 2 {
             out.cluster_id = r.nstr_f(flex)?;
@@ -1543,8 +1697,15 @@ impl MetadataResponse {
         }
         let n = r.arr_f(flex)?.ok_or(Error::Null)?;
         for _ in 0..n {
-            let mut t = MetadataTopic { error_code: r.i16_be()?, ..MetadataTopic::default() };
-            t.name = if version >= 12 { r.nstr_f(flex)? } else { Some(r.str_f(flex)?) };
+            let mut t = MetadataTopic {
+                error_code: r.i16_be()?,
+                ..MetadataTopic::default()
+            };
+            t.name = if version >= 12 {
+                r.nstr_f(flex)?
+            } else {
+                Some(r.str_f(flex)?)
+            };
             if version >= 10 {
                 t.topic_id = r.uuid()?;
             }
@@ -1766,7 +1927,8 @@ impl Response {
             return Err(Error::TooLarge(payload.len()));
         }
         let mut r = Reader::new(payload);
-        let header = ResponseHeader::read_version(&mut r, response_header_version(api_key, api_version))?;
+        let header =
+            ResponseHeader::read_version(&mut r, response_header_version(api_key, api_version))?;
         let rest = r.rest();
         let body = if !has_body(api_key, api_version) {
             ResponseBody::Other(rest.to_vec())
@@ -1784,13 +1946,18 @@ impl Response {
     /// ApiVersions errors for unsupported versions should use version 0.
     pub fn to_frame(&self, api_key: i16, api_version: i16) -> Result<Frame, Error> {
         let body = match &self.body {
-            ResponseBody::ApiVersions(b) if api_key == api_key::API_VERSIONS => b.encode(api_version)?,
+            ResponseBody::ApiVersions(b) if api_key == api_key::API_VERSIONS => {
+                b.encode(api_version)?
+            }
             ResponseBody::Metadata(b) if api_key == api_key::METADATA => b.encode(api_version)?,
-            ResponseBody::Other(b) if !has_body(api_key, api_version) && b.len() <= MAX_FRAME => b.clone(),
+            ResponseBody::Other(b) if !has_body(api_key, api_version) && b.len() <= MAX_FRAME => {
+                b.clone()
+            }
             _ => return Err(Error::Unwritable),
         };
         let mut writer = Writer::new();
-        self.header.encode(&mut writer, response_header_version(api_key, api_version));
+        self.header
+            .encode(&mut writer, response_header_version(api_key, api_version));
         writer.raw(&body);
         Ok(Frame(writer.finish()?))
     }
@@ -1798,23 +1965,25 @@ impl Response {
 
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Truncated }
+    fn from(_: Truncated) -> Self {
+        Error::Truncated
+    }
 }
 
 impl From<Trailing> for Error {
     #[inline]
-    fn from(error: Trailing) -> Self { Error::Trailing(error.0) }
+    fn from(error: Trailing) -> Self {
+        Error::Trailing(error.0)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
-    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, finish, pump,
-    };
+    use fictionet::stdlib::codec::{Decode, Step};
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     enum BodyCase {
@@ -1831,7 +2000,11 @@ mod tests {
             impl BodyFixture for $ty {
                 fn case(&self, version: i16) -> BodyCase {
                     BodyCase::Request(Request {
-                        header: RequestHeader { api_key: $key, api_version: version, ..Default::default() },
+                        header: RequestHeader {
+                            api_key: $key,
+                            api_version: version,
+                            ..Default::default()
+                        },
                         body: RequestBody::$variant(self.clone()),
                     })
                 }
@@ -1840,31 +2013,54 @@ mod tests {
         (response, $ty:ident, $key:expr, $variant:ident) => {
             impl BodyFixture for $ty {
                 fn case(&self, _version: i16) -> BodyCase {
-                    BodyCase::Response(Response {
-                        header: ResponseHeader::default(), body: ResponseBody::$variant(self.clone()),
-                    }, $key)
+                    BodyCase::Response(
+                        Response {
+                            header: ResponseHeader::default(),
+                            body: ResponseBody::$variant(self.clone()),
+                        },
+                        $key,
+                    )
                 }
             }
         };
     }
-    body_fixture!(request, ApiVersionsRequest, api_key::API_VERSIONS, ApiVersions);
+    body_fixture!(
+        request,
+        ApiVersionsRequest,
+        api_key::API_VERSIONS,
+        ApiVersions
+    );
     body_fixture!(request, MetadataRequest, api_key::METADATA, Metadata);
-    body_fixture!(response, ApiVersionsResponse, api_key::API_VERSIONS, ApiVersions);
+    body_fixture!(
+        response,
+        ApiVersionsResponse,
+        api_key::API_VERSIONS,
+        ApiVersions
+    );
     body_fixture!(response, MetadataResponse, api_key::METADATA, Metadata);
 
     fn body_bytes(value: &impl BodyFixture, version: i16) -> Result<Vec<u8>, Error> {
         let (bytes, response_version) = match value.case(version) {
             BodyCase::Request(request) => (request.to_bytes()?, None),
-            BodyCase::Response(response, key) => (response.to_frame(key, version)?.0, Some(response_header_version(key, version))),
+            BodyCase::Response(response, key) => (
+                response.to_frame(key, version)?.0,
+                Some(response_header_version(key, version)),
+            ),
         };
         let mut reader = Reader::new(&bytes);
-        if let Some(version) = response_version { ResponseHeader::read_version(&mut reader, version)?; }
-        else { RequestHeader::read(&mut reader)?; }
+        if let Some(version) = response_version {
+            ResponseHeader::read_version(&mut reader, version)?;
+        } else {
+            RequestHeader::read(&mut reader)?;
+        }
         Ok(reader.rest().to_vec())
     }
 
     fn tag(tag: u32, data: &[u8]) -> TaggedField {
-        TaggedField { tag, data: data.to_vec() }
+        TaggedField {
+            tag,
+            data: data.to_vec(),
+        }
     }
 
     fn encoded(write: impl FnOnce(&mut Writer)) -> Vec<u8> {
@@ -1883,9 +2079,19 @@ mod tests {
         assert_eq!(encoded(|w| w.uvarint(127)), [0x7f]);
         assert_eq!(encoded(|w| w.uvarint(128)), [0x80, 0x01]);
         assert_eq!(encoded(|w| w.uvarint(300)), [0xac, 0x02]);
-        assert_eq!(encoded(|w| w.uvarint(u32::MAX)), [0xff, 0xff, 0xff, 0xff, 0x0f]);
+        assert_eq!(
+            encoded(|w| w.uvarint(u32::MAX)),
+            [0xff, 0xff, 0xff, 0xff, 0x0f]
+        );
         // Zigzag: 0, -1, 1, -2 are 0, 1, 2, 3.
-        for (v, z) in [(0, 0u8), (-1, 1), (1, 2), (-2, 3), (2147483647, 0xfe), (-2147483648, 0xff)] {
+        for (v, z) in [
+            (0, 0u8),
+            (-1, 1),
+            (1, 2),
+            (-2, 3),
+            (2147483647, 0xfe),
+            (-2147483648, 0xff),
+        ] {
             let mut w = Vec::new();
             w.extend(encoded(|w| w.varint(v)));
             let b = w;
@@ -1912,8 +2118,14 @@ mod tests {
     #[test]
     fn varint_errors() {
         // A sixth byte, and a fifth that overflows a u32.
-        assert_eq!(Reader::new(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00]).uvarint(), Err(Error::Varint));
-        assert_eq!(Reader::new(&[0xff, 0xff, 0xff, 0xff, 0x10]).uvarint(), Err(Error::Varint));
+        assert_eq!(
+            Reader::new(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00]).uvarint(),
+            Err(Error::Varint)
+        );
+        assert_eq!(
+            Reader::new(&[0xff, 0xff, 0xff, 0xff, 0x10]).uvarint(),
+            Err(Error::Varint)
+        );
         assert_eq!(Reader::new(&[0x80, 0x80]).uvarint(), Err(Error::Truncated));
         let mut long = vec![0x80; 9];
         long.push(0x02);
@@ -1987,13 +2199,21 @@ mod tests {
         w.extend(encoded(|w| w.nullable_string(None)));
         w.extend(encoded(|w| w.compact_array_len(Some(2))));
         w.extend(encoded(|w| w.tagged_fields(&[tag(0, &[9])])));
-        assert_eq!(w, [0, 2, b'a', b'b', 3, b'a', b'b', 0, 0xff, 0xff, 3, 1, 0, 1, 9]);
+        assert_eq!(
+            w,
+            [
+                0, 2, b'a', b'b', 3, b'a', b'b', 0, 0xff, 0xff, 3, 1, 0, 1, 9
+            ]
+        );
     }
 
     #[test]
     fn primitive_errors() {
         assert_eq!(Reader::new(&[0xff, 0xff]).string(), Err(Error::Null));
-        assert_eq!(Reader::new(&[0xff, 0xfe]).nullable_string(), Err(Error::Length(-2)));
+        assert_eq!(
+            Reader::new(&[0xff, 0xfe]).nullable_string(),
+            Err(Error::Length(-2))
+        );
         assert_eq!(Reader::new(&[0, 3, b'a']).string(), Err(Error::Truncated));
         assert_eq!(Reader::new(&[0, 1, 0xff]).string(), Err(Error::Utf8));
         assert_eq!(Reader::new(&[0]).compact_string(), Err(Error::Null));
@@ -2001,32 +2221,71 @@ mod tests {
         // A compact string over the limit.
         let mut w = Vec::new();
         w.extend(encoded(|w| w.uvarint(MAX_STRING as u32 + 2)));
-        assert_eq!(Reader::new(&w).compact_string(), Err(Error::Length(MAX_STRING as i64 + 1)));
-        assert_eq!(Reader::new(&[0xff, 0xff, 0xff, 0xff]).bytes(), Err(Error::Null));
-        assert_eq!(Reader::new(&[0xff, 0xff, 0xff, 0xfe]).nullable_bytes(), Err(Error::Length(-2)));
+        assert_eq!(
+            Reader::new(&w).compact_string(),
+            Err(Error::Length(MAX_STRING as i64 + 1))
+        );
+        assert_eq!(
+            Reader::new(&[0xff, 0xff, 0xff, 0xff]).bytes(),
+            Err(Error::Null)
+        );
+        assert_eq!(
+            Reader::new(&[0xff, 0xff, 0xff, 0xfe]).nullable_bytes(),
+            Err(Error::Length(-2))
+        );
         assert_eq!(Reader::new(&[0, 0, 0, 5, 1]).bytes(), Err(Error::Truncated));
         assert_eq!(Reader::new(&[0]).compact_bytes(), Err(Error::Null));
         assert_eq!(Reader::new(&[3, 1]).compact_bytes(), Err(Error::Truncated));
         // Array counts below -1, over the bytes left, or over the limit.
-        assert_eq!(Reader::new(&[0xff, 0xff, 0xff, 0xfe]).array_len(), Err(Error::Length(-2)));
-        assert_eq!(Reader::new(&[0, 0, 0, 2, 1]).array_len(), Err(Error::Length(2)));
+        assert_eq!(
+            Reader::new(&[0xff, 0xff, 0xff, 0xfe]).array_len(),
+            Err(Error::Length(-2))
+        );
+        assert_eq!(
+            Reader::new(&[0, 0, 0, 2, 1]).array_len(),
+            Err(Error::Length(2))
+        );
         assert_eq!(Reader::new(&[0, 0, 0, 1, 1]).array_len(), Ok(Some(1)));
-        assert_eq!(Reader::new(&[3, 1]).compact_array_len(), Err(Error::Length(2)));
+        assert_eq!(
+            Reader::new(&[3, 1]).compact_array_len(),
+            Err(Error::Length(2))
+        );
         let mut big = vec![0x00, 0x10, 0x00, 0x01];
         big.resize(MAX_ARRAY + 10, 0);
-        assert_eq!(Reader::new(&big).array_len(), Err(Error::Length(MAX_ARRAY as i64 + 1)));
+        assert_eq!(
+            Reader::new(&big).array_len(),
+            Err(Error::Length(MAX_ARRAY as i64 + 1))
+        );
         // Tagged fields out of order, repeated, too many, or cut short.
-        assert_eq!(Reader::new(&[2, 3, 0, 1, 0]).tagged_fields(), Err(Error::TagOrder(1)));
-        assert_eq!(Reader::new(&[2, 3, 0, 3, 0]).tagged_fields(), Err(Error::TagOrder(3)));
-        assert_eq!(Reader::new(&[3, 3, 0]).tagged_fields(), Err(Error::Length(3)));
-        assert_eq!(Reader::new(&[1, 3, 4, 1]).tagged_fields(), Err(Error::Truncated));
+        assert_eq!(
+            Reader::new(&[2, 3, 0, 1, 0]).tagged_fields(),
+            Err(Error::TagOrder(1))
+        );
+        assert_eq!(
+            Reader::new(&[2, 3, 0, 3, 0]).tagged_fields(),
+            Err(Error::TagOrder(3))
+        );
+        assert_eq!(
+            Reader::new(&[3, 3, 0]).tagged_fields(),
+            Err(Error::Length(3))
+        );
+        assert_eq!(
+            Reader::new(&[1, 3, 4, 1]).tagged_fields(),
+            Err(Error::Truncated)
+        );
         let mut many = encoded(|w| w.uvarint(MAX_TAGGED_FIELDS as u32 + 1));
         many.resize(5000, 0);
-        assert_eq!(Reader::new(&many).tagged_fields(), Err(Error::Length(MAX_TAGGED_FIELDS as i64 + 1)));
+        assert_eq!(
+            Reader::new(&many).tagged_fields(),
+            Err(Error::Length(MAX_TAGGED_FIELDS as i64 + 1))
+        );
         // Trailing bytes.
         let r = Reader::new(&[1, 2]);
         assert_eq!(r.finish().map_err(Error::from), Err(Error::Trailing(2)));
-        assert_eq!(Reader::new(&[]).i64_be().map_err(Error::from), Err(Error::Truncated));
+        assert_eq!(
+            Reader::new(&[]).i64_be().map_err(Error::from),
+            Err(Error::Truncated)
+        );
     }
 
     #[test]
@@ -2044,12 +2303,21 @@ mod tests {
         refuses(|w| w.compact_string(&long));
         refuses(|w| w.array_len(Some(usize::MAX)));
         refuses(|w| w.compact_array_len(Some(usize::MAX)));
-        refuses(|w| w.tagged_fields(&(0..2000).map(|tag| TaggedField { tag, data: vec![] }).collect::<Vec<_>>()));
+        refuses(|w| {
+            w.tagged_fields(
+                &(0..2000)
+                    .map(|tag| TaggedField { tag, data: vec![] })
+                    .collect::<Vec<_>>(),
+            )
+        });
         refuses(|w| w.tagged_fields(&[tag(5, b"x"), tag(1, b"yz"), tag(5, b"dup")]));
         refuses(|w| w.tagged_fields(&[tag(1, b"x"), tag(1, b"dup")]));
         for value in [None, Some(MAX_ARRAY)] {
             let bytes = encoded(|w| w.array_len(value));
-            assert_eq!(Reader::new(&bytes).i32_be().unwrap(), value.map_or(-1, |n| n as i32));
+            assert_eq!(
+                Reader::new(&bytes).i32_be().unwrap(),
+                value.map_or(-1, |n| n as i32)
+            );
         }
         let bytes = encoded(|w| w.compact_array_len(Some(MAX_ARRAY)));
         assert_eq!(Reader::new(&bytes).uvarint(), Ok(MAX_ARRAY as u32 + 1));
@@ -2057,7 +2325,10 @@ mod tests {
         let bytes = encoded(|w| w.string(&string));
         assert_eq!(Reader::new(&bytes).string(), Ok(string));
         let bytes = encoded(|w| w.f64(f64::NAN));
-        assert_eq!(Reader::new(&bytes).f64_be().unwrap().to_bits(), f64::NAN.to_bits());
+        assert_eq!(
+            Reader::new(&bytes).f64_be().unwrap().to_bits(),
+            f64::NAN.to_bits()
+        );
     }
 
     #[test]
@@ -2093,7 +2364,15 @@ mod tests {
         // Version 0: ControlledShutdown 0, no client ID.
         let b0 = [0, 7, 0, 0, 0, 0, 0, 9];
         let h0 = RequestHeader::read(&mut Reader::new(&b0)).unwrap();
-        assert_eq!(h0, RequestHeader { api_key: 7, api_version: 0, correlation_id: 9, ..Default::default() });
+        assert_eq!(
+            h0,
+            RequestHeader {
+                api_key: 7,
+                api_version: 0,
+                correlation_id: 9,
+                ..Default::default()
+            }
+        );
         let mut w = Vec::new();
         h0.write(&mut w).unwrap();
         assert_eq!(w, b0);
@@ -2105,11 +2384,20 @@ mod tests {
         let mut w = Vec::new();
         h2.write(&mut w).unwrap();
         assert_eq!(w, b2);
-        assert_eq!(RequestHeader::read_version(&mut Reader::new(&b2), 3), Err(Error::HeaderVersion(3)));
-        assert_eq!(ResponseHeader::read_version(&mut Reader::new(&b2), 2), Err(Error::HeaderVersion(2)));
+        assert_eq!(
+            RequestHeader::read_version(&mut Reader::new(&b2), 3),
+            Err(Error::HeaderVersion(3))
+        );
+        assert_eq!(
+            ResponseHeader::read_version(&mut Reader::new(&b2), 2),
+            Err(Error::HeaderVersion(2))
+        );
         // Every prefix is cut short.
         for n in 0..b2.len() {
-            assert!(RequestHeader::read(&mut Reader::new(&b2[..n])).is_err(), "{n}");
+            assert!(
+                RequestHeader::read(&mut Reader::new(&b2[..n])).is_err(),
+                "{n}"
+            );
         }
     }
 
@@ -2134,7 +2422,9 @@ mod tests {
         let req = Request::parse(&p).unwrap();
         assert_eq!(req.header.correlation_id, 5);
         assert_eq!(req.header.client_id.as_deref(), Some("adminclient-1"));
-        let RequestBody::ApiVersions(body) = &req.body else { panic!() };
+        let RequestBody::ApiVersions(body) = &req.body else {
+            panic!()
+        };
         assert_eq!(body.client_software_name, "apache-kafka-java");
         assert_eq!(body.client_software_version, "3.7.0");
         assert_eq!(body.node_id, -1);
@@ -2155,19 +2445,34 @@ mod tests {
     fn api_versions_response_v3() {
         // Header version 0, even though the body is flexible.
         let resp = Response {
-            header: ResponseHeader { correlation_id: 5, tagged_fields: vec![] },
+            header: ResponseHeader {
+                correlation_id: 5,
+                tagged_fields: vec![],
+            },
             body: ResponseBody::ApiVersions(ApiVersionsResponse {
                 error_code: 0,
                 api_keys: vec![
-                    ApiVersion { api_key: 3, min_version: 0, max_version: 12, tagged_fields: vec![] },
-                    ApiVersion { api_key: 18, min_version: 0, max_version: 3, tagged_fields: vec![] },
+                    ApiVersion {
+                        api_key: 3,
+                        min_version: 0,
+                        max_version: 12,
+                        tagged_fields: vec![],
+                    },
+                    ApiVersion {
+                        api_key: 18,
+                        min_version: 0,
+                        max_version: 3,
+                        tagged_fields: vec![],
+                    },
                 ],
                 throttle_time_ms: 0,
                 tagged_fields: vec![tag(1, &[0, 0, 0, 0, 0, 0, 0, 7])],
             }),
         };
         let p = resp.to_frame(18, 3).map(|frame| frame.0).unwrap();
-        let mut want = vec![0, 0, 0, 5, 0, 0, 3, 0, 3, 0, 0, 0, 12, 0, 0, 18, 0, 0, 0, 3, 0, 0, 0, 0, 0];
+        let mut want = vec![
+            0, 0, 0, 5, 0, 0, 3, 0, 3, 0, 0, 0, 12, 0, 0, 18, 0, 0, 0, 3, 0, 0, 0, 0, 0,
+        ];
         want.extend_from_slice(&[1, 1, 8, 0, 0, 0, 0, 0, 0, 0, 7]);
         assert_eq!(p, want);
         assert_eq!(Response::parse(&p, 18, 3), Ok(resp));
@@ -2199,12 +2504,27 @@ mod tests {
             tagged_fields: vec![tag(3, &[1])],
         };
         for v in 0..=API_VERSIONS_MAX_VERSION {
-            let req = if v < 3 { ApiVersionsRequest::default() }
-                else if v < 5 { ApiVersionsRequest { cluster_id: None, node_id: -1, ..req.clone() } }
-                else { req.clone() };
+            let req = if v < 3 {
+                ApiVersionsRequest::default()
+            } else if v < 5 {
+                ApiVersionsRequest {
+                    cluster_id: None,
+                    node_id: -1,
+                    ..req.clone()
+                }
+            } else {
+                req.clone()
+            };
             let mut resp = resp.clone();
-            if v == 0 { resp.throttle_time_ms = 0; }
-            if v < 3 { resp.tagged_fields.clear(); for key in &mut resp.api_keys { key.tagged_fields.clear(); } }
+            if v == 0 {
+                resp.throttle_time_ms = 0;
+            }
+            if v < 3 {
+                resp.tagged_fields.clear();
+                for key in &mut resp.api_keys {
+                    key.tagged_fields.clear();
+                }
+            }
 
             let b = body_bytes(&req, v).unwrap();
             let back = ApiVersionsRequest::parse(&b, v).unwrap();
@@ -2234,10 +2554,16 @@ mod tests {
         assert_eq!(body_bytes(&req, 6), Err(Error::Unwritable));
         assert_eq!(
             ApiVersionsResponse::parse(&[], -1),
-            Err(Error::UnsupportedVersion { api_key: 18, api_version: -1 })
+            Err(Error::UnsupportedVersion {
+                api_key: 18,
+                api_version: -1
+            })
         );
         // A null array of keys.
-        assert_eq!(ApiVersionsResponse::parse(&[0, 0, 0xff, 0xff, 0xff, 0xff], 0), Err(Error::Null));
+        assert_eq!(
+            ApiVersionsResponse::parse(&[0, 0, 0xff, 0xff, 0xff, 0xff], 0),
+            Err(Error::Null)
+        );
         // A version 0 request with a body.
         assert_eq!(ApiVersionsRequest::parse(&[1], 0), Err(Error::Trailing(1)));
     }
@@ -2245,22 +2571,44 @@ mod tests {
     #[test]
     fn metadata_request_examples() {
         // Version 0, topics "test": header version 1, client ID "c".
-        let p = [0, 3, 0, 0, 0, 0, 0, 7, 0, 1, b'c', 0, 0, 0, 1, 0, 4, b't', b'e', b's', b't'];
+        let p = [
+            0, 3, 0, 0, 0, 0, 0, 7, 0, 1, b'c', 0, 0, 0, 1, 0, 4, b't', b'e', b's', b't',
+        ];
         let req = Request::parse(&p).unwrap();
-        let RequestBody::Metadata(m) = &req.body else { panic!() };
+        let RequestBody::Metadata(m) = &req.body else {
+            panic!()
+        };
         let topics = m.topics.as_ref().unwrap();
         assert_eq!(topics.len(), 1);
         assert_eq!(topics[0].name.as_deref(), Some("test"));
         assert_eq!(req.to_bytes().unwrap(), p);
         // Version 0 requires an explicit empty array for every topic.
-        assert_eq!(MetadataRequest::parse(&[0xff, 0xff, 0xff, 0xff], 0), Err(Error::Null));
-        assert_eq!(body_bytes(&MetadataRequest::default(), 0), Err(Error::Unwritable));
-        let all = MetadataRequest { topics: Some(vec![]), ..Default::default() };
+        assert_eq!(
+            MetadataRequest::parse(&[0xff, 0xff, 0xff, 0xff], 0),
+            Err(Error::Null)
+        );
+        assert_eq!(
+            body_bytes(&MetadataRequest::default(), 0),
+            Err(Error::Unwritable)
+        );
+        let all = MetadataRequest {
+            topics: Some(vec![]),
+            ..Default::default()
+        };
         assert_eq!(body_bytes(&all, 0).unwrap(), [0, 0, 0, 0]);
         // Version 1, every topic: a null array.
-        assert_eq!(MetadataRequest::parse(&[0xff, 0xff, 0xff, 0xff], 1).unwrap().topics, None);
+        assert_eq!(
+            MetadataRequest::parse(&[0xff, 0xff, 0xff, 0xff], 1)
+                .unwrap()
+                .topics,
+            None
+        );
         // Version 4 adds allow_auto_topic_creation.
-        assert!(!MetadataRequest::parse(&[0, 0, 0, 0, 0], 4).unwrap().allow_auto_topic_creation);
+        assert!(
+            !MetadataRequest::parse(&[0, 0, 0, 0, 0], 4)
+                .unwrap()
+                .allow_auto_topic_creation
+        );
         // Version 9: compact, topic "a", no auto creation, both flags, tags.
         let b9 = [2, 2, b'a', 0, 0, 1, 0, 0];
         let m9 = MetadataRequest::parse(&b9, 9).unwrap();
@@ -2278,10 +2626,20 @@ mod tests {
         assert_eq!((t.topic_id, t.name.clone()), ([0x11; 16], None));
         assert_eq!(body_bytes(&m12, 12).unwrap(), b12);
         // A null name before version 10 is refused.
-        assert_eq!(MetadataRequest::parse(&[2, 0, 0, 1, 0, 0, 0], 9), Err(Error::Null));
+        assert_eq!(
+            MetadataRequest::parse(&[2, 0, 0, 1, 0, 0, 0], 9),
+            Err(Error::Null)
+        );
         // Version 11 drops include_cluster_authorized_operations.
-        assert!(MetadataRequest::parse(&[0, 1, 1, 0], 11).unwrap().include_topic_authorized_operations);
-        assert_eq!(MetadataRequest::parse(&[0, 1, 1, 0], 10), Err(Error::Truncated));
+        assert!(
+            MetadataRequest::parse(&[0, 1, 1, 0], 11)
+                .unwrap()
+                .include_topic_authorized_operations
+        );
+        assert_eq!(
+            MetadataRequest::parse(&[0, 1, 1, 0], 10),
+            Err(Error::Truncated)
+        );
         for n in 0..p.len() {
             assert!(Request::parse(&p[..n]).is_err(), "{n}");
         }
@@ -2374,7 +2732,10 @@ mod tests {
             let b = body_bytes(&m, v).unwrap();
             let back = MetadataResponse::parse(&b, v).unwrap();
             assert_eq!(body_bytes(&back, v).unwrap(), b, "{v}");
-            assert_eq!(MetadataResponse::parse(&body_bytes(&back, v).unwrap(), v).unwrap(), back);
+            assert_eq!(
+                MetadataResponse::parse(&body_bytes(&back, v).unwrap(), v).unwrap(),
+                back
+            );
             if v == 10 {
                 assert_eq!(back, m, "{v}");
             }
@@ -2408,9 +2769,14 @@ mod tests {
                     correlation_id: 1,
                     tagged_fields: if v >= 9 { vec![tag(0, b"h")] } else { vec![] },
                 },
-                body: ResponseBody::Metadata(MetadataResponse::parse(&body_bytes(&m, v).unwrap(), v).unwrap()),
+                body: ResponseBody::Metadata(
+                    MetadataResponse::parse(&body_bytes(&m, v).unwrap(), v).unwrap(),
+                ),
             };
-            assert_eq!(Response::parse(&resp.to_frame(3, v).map(|frame| frame.0).unwrap(), 3, v).unwrap(), resp);
+            assert_eq!(
+                Response::parse(&resp.to_frame(3, v).map(|frame| frame.0).unwrap(), 3, v).unwrap(),
+                resp
+            );
         }
         // Version 12 and later carry a null topic name, for a topic with
         // an error; earlier versions have none.
@@ -2418,35 +2784,78 @@ mod tests {
         nameless.topics[0].name = None;
         nameless.topics[0].error_code = error_code::UNKNOWN_TOPIC_ID;
         let b = body_bytes(&fit_response(nameless.clone(), 12), 12).unwrap();
-        assert_eq!(MetadataResponse::parse(&b, 12).unwrap().topics[0].name, None);
+        assert_eq!(
+            MetadataResponse::parse(&b, 12).unwrap().topics[0].name,
+            None
+        );
         assert!(matches!(body_bytes(&nameless, 11), Err(Error::Unwritable)));
         assert_eq!(body_bytes(&m, 14), Err(Error::Unwritable));
         // Version 13's top-level error code is last, after the topics.
-        let mut failed = MetadataResponse { error_code: 29, ..MetadataResponse::default() };
+        let mut failed = MetadataResponse {
+            error_code: 29,
+            ..MetadataResponse::default()
+        };
         failed.tagged_fields.clear();
-        assert_eq!(body_bytes(&failed, 13).unwrap(), [0, 0, 0, 0, 1, 0, 0xff, 0xff, 0xff, 0xff, 1, 0, 29, 0]);
+        assert_eq!(
+            body_bytes(&failed, 13).unwrap(),
+            [0, 0, 0, 0, 1, 0, 0xff, 0xff, 0xff, 0xff, 1, 0, 29, 0]
+        );
     }
 
     #[test]
     fn mismatched_bodies() {
-        let header = RequestHeader { api_key: 3, api_version: 1, ..Default::default() };
-        let req = Request { header: header.clone(), body: RequestBody::ApiVersions(ApiVersionsRequest::default()) };
+        let header = RequestHeader {
+            api_key: 3,
+            api_version: 1,
+            ..Default::default()
+        };
+        let req = Request {
+            header: header.clone(),
+            body: RequestBody::ApiVersions(ApiVersionsRequest::default()),
+        };
         assert_eq!(req.to_bytes(), Err(Error::Unwritable));
-        let req = Request { header: header.clone(), body: RequestBody::Other(vec![]) };
+        let req = Request {
+            header: header.clone(),
+            body: RequestBody::Other(vec![]),
+        };
         assert_eq!(req.to_bytes(), Err(Error::Unwritable));
         // A version with no full body is an Other.
-        let header = RequestHeader { api_key: 3, api_version: 99, ..Default::default() };
-        let req = Request { header: header.clone(), body: RequestBody::Metadata(MetadataRequest::default()) };
+        let header = RequestHeader {
+            api_key: 3,
+            api_version: 99,
+            ..Default::default()
+        };
+        let req = Request {
+            header: header.clone(),
+            body: RequestBody::Metadata(MetadataRequest::default()),
+        };
         assert_eq!(req.to_bytes(), Err(Error::Unwritable));
-        let req = Request { header, body: RequestBody::Other(vec![1, 2, 3]) };
+        let req = Request {
+            header,
+            body: RequestBody::Other(vec![1, 2, 3]),
+        };
         let back = Request::parse(&req.to_bytes().unwrap()).unwrap();
         assert_eq!(back, req);
-        let resp = Response { header: ResponseHeader::default(), body: ResponseBody::Other(vec![]) };
-        assert_eq!(resp.to_frame(18, 0).map(|frame| frame.0), Err(Error::Unwritable));
-        assert_eq!(Response::parse(&resp.to_frame(0, 9).map(|frame| frame.0).unwrap(), 0, 9).unwrap(), resp);
-        let resp =
-            Response { header: ResponseHeader::default(), body: ResponseBody::Metadata(MetadataResponse::default()) };
-        assert_eq!(resp.to_frame(18, 0).map(|frame| frame.0), Err(Error::Unwritable));
+        let resp = Response {
+            header: ResponseHeader::default(),
+            body: ResponseBody::Other(vec![]),
+        };
+        assert_eq!(
+            resp.to_frame(18, 0).map(|frame| frame.0),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Response::parse(&resp.to_frame(0, 9).map(|frame| frame.0).unwrap(), 0, 9).unwrap(),
+            resp
+        );
+        let resp = Response {
+            header: ResponseHeader::default(),
+            body: ResponseBody::Metadata(MetadataResponse::default()),
+        };
+        assert_eq!(
+            resp.to_frame(18, 0).map(|frame| frame.0),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
@@ -2456,14 +2865,27 @@ mod tests {
         assert_eq!(bytes, [0, 0, 0, 3, 1, 2, 3]);
         assert_eq!(Frame::parse(&bytes), Ok(value));
         for n in 0..bytes.len() {
-            assert_eq!(Frames::<Frame>::new().decode(&bytes[..n], false), Ok(Step::Need), "{n}");
+            assert_eq!(
+                Frames::<Frame>::new().decode(&bytes[..n], false),
+                Ok(Step::Need),
+                "{n}"
+            );
             assert_eq!(Frame::parse(&bytes[..n]), Err(Error::Truncated));
         }
         assert_eq!(Frame::parse(&[0; 4]), Ok(Frame(vec![])));
         assert_eq!(Frame::parse(&[0xff; 4]), Err(Error::FrameSize(-1)));
-        assert_eq!(Frames::<Frame>::with_limit(3).decode(&[0, 0, 0, 4], false), Err(Error::FrameSize(4)));
-        assert_eq!(Frame::parse(&[0x7f, 0xff, 0xff, 0xff]), Err(Error::FrameSize(i32::MAX)));
-        assert_eq!(Frame(vec![0; MAX_FRAME + 1]).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Frames::<Frame>::with_limit(3).decode(&[0, 0, 0, 4], false),
+            Err(Error::FrameSize(4))
+        );
+        assert_eq!(
+            Frame::parse(&[0x7f, 0xff, 0xff, 0xff]),
+            Err(Error::FrameSize(i32::MAX))
+        );
+        assert_eq!(
+            Frame(vec![0; MAX_FRAME + 1]).to_bytes(),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
@@ -2472,12 +2894,20 @@ mod tests {
         let b = Frame(vec![0, 18, 0, 0, 0, 0, 0, 2, 0xff, 0xff]);
         let mut bytes = a.to_bytes().unwrap();
         b.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * Frames::<Frame>::new().capacity());
+        contract::check_decode_with_alloc_limit(
+            Frames::<Frame>::new,
+            &bytes,
+            2 * Frames::<Frame>::new().capacity(),
+        );
         assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (vec![a, b], None));
         for (limit, header, error) in [
             (MAX_FRAME, [0x80, 0, 0, 0], Error::FrameSize(i32::MIN)),
             (4, [0, 0, 0, 5], Error::FrameSize(5)),
-            (usize::MAX, [0x7f, 0xff, 0xff, 0xff], Error::FrameSize(i32::MAX)),
+            (
+                usize::MAX,
+                [0x7f, 0xff, 0xff, 0xff],
+                Error::FrameSize(i32::MAX),
+            ),
         ] {
             let mut stream = Stream::new(Frames::<Frame>::with_limit(limit));
             assert_eq!(stream.push(&header), 4);
@@ -2494,15 +2924,21 @@ mod tests {
 
     #[test]
     fn stream_reads_many_small_frames_in_linear_time() {
-        assert_linear("stream_reads_many_small_frames_in_linear_time", rounds(50_000), |size| {
-            let one = Frame(vec![0, 18, 0, 0, 0, 0, 0, 1, 0xff, 0xff]).to_bytes().unwrap();
-            let mut stream = Stream::new(Frames::<Frame>::new());
-            let mut count = 0;
-            pump(&mut stream, &one.repeat(size), |_| count += 1).unwrap();
-            finish(&mut stream, |_| count += 1).unwrap();
-            assert_eq!(count, size);
-            assert_eq!(stream.buffered(), 0);
-        });
+        assert_linear(
+            "stream_reads_many_small_frames_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let one = Frame(vec![0, 18, 0, 0, 0, 0, 0, 1, 0xff, 0xff])
+                    .to_bytes()
+                    .unwrap();
+                let mut stream = Stream::new(Frames::<Frame>::new());
+                let mut count = 0;
+                pump(&mut stream, &one.repeat(size), |_| count += 1).unwrap();
+                finish(&mut stream, |_| count += 1).unwrap();
+                assert_eq!(count, size);
+                assert_eq!(stream.buffered(), 0);
+            },
+        );
     }
 
     #[test]
@@ -2517,7 +2953,10 @@ mod tests {
             Error::Null,
             Error::TagOrder(1),
             Error::HeaderVersion(3),
-            Error::UnsupportedVersion { api_key: 1, api_version: 2 },
+            Error::UnsupportedVersion {
+                api_key: 1,
+                api_version: 2,
+            },
             Error::Unwritable,
             Error::Trailing(1),
             Error::Invalid("x"),
@@ -2534,7 +2973,11 @@ mod tests {
 
     /// Exercises framing, exact requests, and contextual responses.
     fn check(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * Frames::<Frame>::new().capacity());
+        contract::check_decode_with_alloc_limit(
+            Frames::<Frame>::new,
+            data,
+            2 * Frames::<Frame>::new().capacity(),
+        );
         contract::check_wire::<Frame>(data);
         contract::check_wire::<Request>(data);
         contract::check_wire::<RequestHeader>(data);
@@ -2572,7 +3015,10 @@ mod tests {
         let m = sample_metadata();
         let mut seeds: Vec<Vec<u8>> = vec![Frame(api_versions_v3_request()).to_bytes().unwrap()];
         for v in 0..=METADATA_MAX_VERSION {
-            let resp = Response { header: ResponseHeader::default(), body: ResponseBody::Metadata(fit_response(m.clone(), v)) };
+            let resp = Response {
+                header: ResponseHeader::default(),
+                body: ResponseBody::Metadata(fit_response(m.clone(), v)),
+            };
             seeds.push(resp.to_frame(3, v).unwrap().to_bytes().unwrap());
             let req = Request {
                 header: RequestHeader {
@@ -2583,7 +3029,10 @@ mod tests {
                     tagged_fields: vec![],
                 },
                 body: RequestBody::Metadata(MetadataRequest {
-                    topics: Some(vec![MetadataRequestTopic { name: Some("t".into()), ..Default::default() }]),
+                    topics: Some(vec![MetadataRequestTopic {
+                        name: Some("t".into()),
+                        ..Default::default()
+                    }]),
                     ..Default::default()
                 }),
             };
@@ -2624,7 +3073,11 @@ mod tests {
     }
 
     fn any_option(rng: &mut Lcg) -> Option<String> {
-        if rng.index(3) == 0 { None } else { Some(any_string(rng)) }
+        if rng.index(3) == 0 {
+            None
+        } else {
+            Some(any_string(rng))
+        }
     }
 
     fn any_tags(rng: &mut Lcg) -> Vec<TaggedField> {
@@ -2805,8 +3258,12 @@ mod tests {
         let mut rng = Lcg::new(0x77_7269_7465);
         for _ in 0..300 {
             let mut header = RequestHeader {
-                api_key: [api_key::API_VERSIONS, api_key::METADATA, api_key::CONTROLLED_SHUTDOWN, 500]
-                    [rng.index(4)],
+                api_key: [
+                    api_key::API_VERSIONS,
+                    api_key::METADATA,
+                    api_key::CONTROLLED_SHUTDOWN,
+                    500,
+                ][rng.index(4)],
                 api_version: rng.index(16) as i16 - 1,
                 correlation_id: rng.next() as i32,
                 client_id: any_option(&mut rng),
@@ -2848,7 +3305,10 @@ mod tests {
             let bytes = req.to_bytes().unwrap();
             assert_eq!(Request::parse(&bytes), Ok(req.clone()));
             let frame = req.to_frame().unwrap();
-            assert_eq!(decode_all(Frames::<Frame>::new, &frame.to_bytes().unwrap()), (vec![Frame(bytes)], None));
+            assert_eq!(
+                decode_all(Frames::<Frame>::new, &frame.to_bytes().unwrap()),
+                (vec![Frame(bytes)], None)
+            );
 
             let mut rbody = if !has_body(key, version) {
                 ResponseBody::Other(rng.bytes(4))
@@ -2880,7 +3340,10 @@ mod tests {
                     }
                 }
             }
-            let mut header = ResponseHeader { correlation_id: 1, tagged_fields: any_tags(&mut rng) };
+            let mut header = ResponseHeader {
+                correlation_id: 1,
+                tagged_fields: any_tags(&mut rng),
+            };
             if response_header_version(key, version) == 0 {
                 header.tagged_fields.clear();
             }
@@ -2891,7 +3354,6 @@ mod tests {
             let frame = resp.to_frame(key, version).unwrap();
             contract::check_wire_value(&frame);
             assert_eq!(Response::parse(&frame.0, key, version), Ok(resp));
-
         }
     }
 
@@ -2903,20 +3365,29 @@ mod tests {
         let mut junk = vec![0, 0, 0, 17];
         junk.resize(100_000, 0xaa);
         assert_eq!(stream.push(&junk), 20);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::FrameSize(17)))));
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(Error::FrameSize(17))))
+        );
         assert_eq!(stream.buffered(), 20);
         assert!(stream.next().is_none());
         let mut stream = Stream::new(Frames::<Frame>::with_limit(16));
         assert_eq!(stream.push(&[0, 0, 0, 1, 7, 0xff]), 6);
         assert_eq!(stream.next(), Some(Ok(Frame(vec![7]))));
         assert_eq!(stream.push(&[0xff, 0xff, 0xff, 1, 2, 3]), 6);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::FrameSize(-1)))));
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(Error::FrameSize(-1))))
+        );
         let mut stream = Stream::new(Frames::<Frame>::with_limit(16));
         assert_eq!(stream.push(&[0, 0]), 2);
         assert!(stream.next().is_none());
         assert_eq!(stream.buffered(), 2);
         assert_eq!(stream.push(&[1, 0, 9, 9]), 4);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::FrameSize(256)))));
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(Error::FrameSize(256))))
+        );
     }
 
     #[test]
@@ -2925,23 +3396,44 @@ mod tests {
         let mut p = vec![0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0xff];
         p.resize(MAX_FRAME + 1, 0);
         assert_eq!(Request::parse(&p), Err(Error::TooLarge(MAX_FRAME + 1)));
-        assert_eq!(RequestHeader::parse(&p), Err(Error::TooLarge(MAX_FRAME + 1)));
-        assert_eq!(Response::parse(&p, api_key::METADATA, 9), Err(Error::TooLarge(MAX_FRAME + 1)));
-        assert_eq!(Response::parse(&p, api_key::PRODUCE, 0), Err(Error::TooLarge(MAX_FRAME + 1)));
+        assert_eq!(
+            RequestHeader::parse(&p),
+            Err(Error::TooLarge(MAX_FRAME + 1))
+        );
+        assert_eq!(
+            Response::parse(&p, api_key::METADATA, 9),
+            Err(Error::TooLarge(MAX_FRAME + 1))
+        );
+        assert_eq!(
+            Response::parse(&p, api_key::PRODUCE, 0),
+            Err(Error::TooLarge(MAX_FRAME + 1))
+        );
         p.truncate(MAX_FRAME);
         let req = Request::parse(&p).unwrap();
-        assert_eq!(req.to_frame().unwrap().to_bytes().unwrap().len(), MAX_FRAME + SIZE_LEN);
+        assert_eq!(
+            req.to_frame().unwrap().to_bytes().unwrap().len(),
+            MAX_FRAME + SIZE_LEN
+        );
         // Byte strings and tagged-field values longer than a writer makes.
         let mut big = ((MAX_FRAME + 1) as i32).to_be_bytes().to_vec();
         big.resize(MAX_FRAME + 5, 0);
-        assert_eq!(Reader::new(&big).bytes(), Err(Error::Length(MAX_FRAME as i64 + 1)));
+        assert_eq!(
+            Reader::new(&big).bytes(),
+            Err(Error::Length(MAX_FRAME as i64 + 1))
+        );
         let mut big = encoded(|w| w.uvarint(MAX_FRAME as u32 + 2));
         big.resize(MAX_FRAME + 5, 0);
-        assert_eq!(Reader::new(&big).compact_bytes(), Err(Error::Length(MAX_FRAME as i64 + 1)));
+        assert_eq!(
+            Reader::new(&big).compact_bytes(),
+            Err(Error::Length(MAX_FRAME as i64 + 1))
+        );
         let mut big = vec![1, 0];
         big.extend(encoded(|w| w.uvarint(MAX_FRAME as u32 + 1)));
         big.resize(MAX_FRAME + 10, 0);
-        assert_eq!(Reader::new(&big).tagged_fields(), Err(Error::Length(MAX_FRAME as i64 + 1)));
+        assert_eq!(
+            Reader::new(&big).tagged_fields(),
+            Err(Error::Length(MAX_FRAME as i64 + 1))
+        );
     }
 
     #[test]
@@ -2949,7 +3441,10 @@ mod tests {
         // A broker that does not speak ApiVersions version 3 answers in
         // version 0: correlation ID 1, UNSUPPORTED_VERSION, no APIs.
         let p = [0, 0, 0, 1, 0, 0x23, 0, 0, 0, 0];
-        let want = ApiVersionsResponse { error_code: error_code::UNSUPPORTED_VERSION, ..Default::default() };
+        let want = ApiVersionsResponse {
+            error_code: error_code::UNSUPPORTED_VERSION,
+            ..Default::default()
+        };
         for v in 1..=API_VERSIONS_MAX_VERSION {
             let resp = Response::parse(&p, api_key::API_VERSIONS, v).unwrap();
             assert_eq!(resp.body, ResponseBody::ApiVersions(want.clone()), "{v}");
@@ -2957,28 +3452,56 @@ mod tests {
         // With the APIs the broker speaks, as Kafka 2.4 and later send.
         let p = [0, 0x23, 0, 0, 0, 1, 0, 18, 0, 0, 0, 2];
         let got = ApiVersionsResponse::parse(&p, 3).unwrap();
-        assert_eq!(got.api_keys, [ApiVersion { api_key: 18, min_version: 0, max_version: 2, tagged_fields: vec![] }]);
+        assert_eq!(
+            got.api_keys,
+            [ApiVersion {
+                api_key: 18,
+                min_version: 0,
+                max_version: 2,
+                tagged_fields: vec![]
+            }]
+        );
         // Only for UNSUPPORTED_VERSION.
         assert!(ApiVersionsResponse::parse(&[0, 0, 0, 0, 0, 0], 3).is_err());
     }
 
     #[test]
     fn metadata_request_refuses_fields_its_version_lacks() {
-        let named = |name: &str| MetadataRequestTopic { name: Some(name.into()), ..Default::default() };
+        let named = |name: &str| MetadataRequestTopic {
+            name: Some(name.into()),
+            ..Default::default()
+        };
         let no_auto = MetadataRequest {
             topics: Some(vec![named("missing-topic")]),
             allow_auto_topic_creation: false,
             ..Default::default()
         };
         for v in 0..4 {
-            assert!(matches!(body_bytes(&no_auto, v), Err(Error::Unwritable)), "{v}");
+            assert!(
+                matches!(body_bytes(&no_auto, v), Err(Error::Unwritable)),
+                "{v}"
+            );
         }
-        assert!(!MetadataRequest::parse(&body_bytes(&no_auto, 4).unwrap(), 4).unwrap().allow_auto_topic_creation);
-        let cluster_ops = MetadataRequest { include_cluster_authorized_operations: true, ..Default::default() };
+        assert!(
+            !MetadataRequest::parse(&body_bytes(&no_auto, 4).unwrap(), 4)
+                .unwrap()
+                .allow_auto_topic_creation
+        );
+        let cluster_ops = MetadataRequest {
+            include_cluster_authorized_operations: true,
+            ..Default::default()
+        };
         for v in 0..=METADATA_MAX_VERSION {
-            assert_eq!(body_bytes(&cluster_ops, v).is_ok(), (8..=10).contains(&v), "{v}");
+            assert_eq!(
+                body_bytes(&cluster_ops, v).is_ok(),
+                (8..=10).contains(&v),
+                "{v}"
+            );
         }
-        let topic_ops = MetadataRequest { include_topic_authorized_operations: true, ..Default::default() };
+        let topic_ops = MetadataRequest {
+            include_topic_authorized_operations: true,
+            ..Default::default()
+        };
         for v in 0..=METADATA_MAX_VERSION {
             assert_eq!(body_bytes(&topic_ops, v).is_ok(), v >= 8, "{v}");
         }
@@ -2987,25 +3510,41 @@ mod tests {
     #[test]
     fn metadata_request_asks_by_id_from_version_12() {
         let by_id = MetadataRequest {
-            topics: Some(vec![MetadataRequestTopic { topic_id: [0x11; 16], name: None, tagged_fields: vec![] }]),
+            topics: Some(vec![MetadataRequestTopic {
+                topic_id: [0x11; 16],
+                name: None,
+                tagged_fields: vec![],
+            }]),
             ..Default::default()
         };
         for v in 0..12 {
-            assert!(matches!(body_bytes(&by_id, v), Err(Error::Unwritable)), "{v}");
+            assert!(
+                matches!(body_bytes(&by_id, v), Err(Error::Unwritable)),
+                "{v}"
+            );
         }
         let b = body_bytes(&by_id, 12).unwrap();
         assert_eq!(MetadataRequest::parse(&b, 12).unwrap(), by_id);
         // Versions 10 and 11 have the fields, but Kafka refuses them there.
-        assert!(matches!(MetadataRequest::parse(&b, 11), Err(Error::Invalid(_))));
+        assert!(matches!(
+            MetadataRequest::parse(&b, 11),
+            Err(Error::Invalid(_))
+        ));
         let mut named_id = by_id.clone();
         named_id.topics.as_mut().unwrap()[0].name = Some("t".into());
         assert!(matches!(body_bytes(&named_id, 11), Err(Error::Unwritable)));
         let mut b10 = vec![2];
         b10.extend_from_slice(&[0x11; 16]);
         b10.extend_from_slice(&[2, b't', 0, 1, 0, 0, 0]);
-        assert!(matches!(MetadataRequest::parse(&b10, 10), Err(Error::Invalid(_))));
+        assert!(matches!(
+            MetadataRequest::parse(&b10, 10),
+            Err(Error::Invalid(_))
+        ));
         // A null name with no ID is refused before version 12 too.
-        let nameless = MetadataRequest { topics: Some(vec![MetadataRequestTopic::default()]), ..Default::default() };
+        let nameless = MetadataRequest {
+            topics: Some(vec![MetadataRequestTopic::default()]),
+            ..Default::default()
+        };
         assert!(matches!(body_bytes(&nameless, 3), Err(Error::Unwritable)));
     }
 
@@ -3038,7 +3577,10 @@ mod tests {
 
     #[test]
     fn api_versions_known_tags_are_checked() {
-        let with = |t: TaggedField| ApiVersionsResponse { tagged_fields: vec![t], ..Default::default() };
+        let with = |t: TaggedField| ApiVersionsResponse {
+            tagged_fields: vec![t],
+            ..Default::default()
+        };
         // FinalizedFeaturesEpoch is an INT64, and ZkMigrationReady a BOOLEAN.
         for t in [tag(1, b""), tag(1, &[0; 7]), tag(3, b""), tag(3, &[1, 1])] {
             let r = with(t.clone());
@@ -3053,21 +3595,44 @@ mod tests {
         let mut features = vec![2, 4];
         features.extend_from_slice(b"abc");
         features.extend_from_slice(&[0, 1, 0, 2, 0]);
-        for good in [tag(0, &features), tag(2, &features), tag(0, &[1]), tag(1, &[0; 8]), tag(3, &[1]), tag(9, b"")] {
+        for good in [
+            tag(0, &features),
+            tag(2, &features),
+            tag(0, &[1]),
+            tag(1, &[0; 8]),
+            tag(3, &[1]),
+            tag(9, b""),
+        ] {
             let r = with(good.clone());
-            assert_eq!(ApiVersionsResponse::parse(&body_bytes(&r, 3).unwrap(), 3), Ok(r), "{good:?}");
+            assert_eq!(
+                ApiVersionsResponse::parse(&body_bytes(&r, 3).unwrap(), 3),
+                Ok(r),
+                "{good:?}"
+            );
         }
         for bad in [&features[..features.len() - 1], &[0], &[2, 1, 0], &[]] {
-            assert!(matches!(body_bytes(&with(tag(0, bad)), 4), Err(Error::Unwritable)), "{bad:?}");
-            assert!(matches!(body_bytes(&with(tag(2, bad)), 4), Err(Error::Unwritable)), "{bad:?}");
+            assert!(
+                matches!(body_bytes(&with(tag(0, bad)), 4), Err(Error::Unwritable)),
+                "{bad:?}"
+            );
+            assert!(
+                matches!(body_bytes(&with(tag(2, bad)), 4), Err(Error::Unwritable)),
+                "{bad:?}"
+            );
         }
         // Tagged fields with tags of the same numbers inside the API entries
         // are not these fields, and stay opaque.
         let r = ApiVersionsResponse {
-            api_keys: vec![ApiVersion { tagged_fields: vec![tag(1, b"")], ..Default::default() }],
+            api_keys: vec![ApiVersion {
+                tagged_fields: vec![tag(1, b"")],
+                ..Default::default()
+            }],
             ..Default::default()
         };
-        assert_eq!(ApiVersionsResponse::parse(&body_bytes(&r, 3).unwrap(), 3), Ok(r));
+        assert_eq!(
+            ApiVersionsResponse::parse(&body_bytes(&r, 3).unwrap(), 3),
+            Ok(r)
+        );
     }
 
     #[test]
@@ -3081,7 +3646,10 @@ mod tests {
             let mut b = vec![1];
             b.extend(encoded(|w| w.uvarint(t)));
             b.push(0);
-            assert!(matches!(Reader::new(&b).tagged_fields(), Err(Error::Invalid(_))), "{t}");
+            assert!(
+                matches!(Reader::new(&b).tagged_fields(), Err(Error::Invalid(_))),
+                "{t}"
+            );
             let fields = vec![tag(t, b"x"), tag(3, b"y")];
             let mut writer = Writer::new();
             writer.tagged_fields(&fields);
@@ -3092,17 +3660,28 @@ mod tests {
     #[test]
     fn metadata_response_topics_name_or_fail() {
         let topic = |error_code: i16, name: Option<&str>, topic_id: [u8; 16]| MetadataResponse {
-            topics: vec![MetadataTopic { error_code, name: name.map(Into::into), topic_id, ..Default::default() }],
+            topics: vec![MetadataTopic {
+                error_code,
+                name: name.map(Into::into),
+                topic_id,
+                ..Default::default()
+            }],
             ..Default::default()
         };
         // A topic asked for by an unknown ID: no name, an error.
         let unknown = topic(error_code::UNKNOWN_TOPIC_ID, None, [5; 16]);
-        assert_eq!(MetadataResponse::parse(&body_bytes(&unknown, 12).unwrap(), 12), Ok(unknown.clone()));
+        assert_eq!(
+            MetadataResponse::parse(&body_bytes(&unknown, 12).unwrap(), 12),
+            Ok(unknown.clone())
+        );
         // Before version 12 a name is never null.
         assert!(matches!(body_bytes(&unknown, 11), Err(Error::Unwritable)));
         // A topic with no error always has a name, and one of name and ID
         // is always there.
-        for (bad, v) in [(topic(0, None, [5; 16]), 12), (topic(error_code::UNKNOWN_TOPIC_ID, None, [0; 16]), 13)] {
+        for (bad, v) in [
+            (topic(0, None, [5; 16]), 12),
+            (topic(error_code::UNKNOWN_TOPIC_ID, None, [0; 16]), 13),
+        ] {
             assert!(matches!(body_bytes(&bad, v), Err(Error::Unwritable)));
             let mut ok = bad.clone();
             ok.topics[0].name = Some("t".into());
@@ -3111,8 +3690,10 @@ mod tests {
             let at = b.windows(2).position(|x| x == [2, b't']).unwrap();
             let mut nulled = b.clone();
             nulled.splice(at..at + 2, [0]);
-            assert!(matches!(MetadataResponse::parse(&nulled, v), Err(Error::Invalid(_))), "{v}");
+            assert!(
+                matches!(MetadataResponse::parse(&nulled, v), Err(Error::Invalid(_))),
+                "{v}"
+            );
         }
     }
-
 }

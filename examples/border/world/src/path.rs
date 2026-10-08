@@ -106,7 +106,12 @@ struct OnTheWay {
 impl OnTheWay {
     fn hold(&mut self, at: Instant, to: To, packet: Packet) {
         self.seq += 1;
-        self.heap.push(Reverse(Held { at, seq: self.seq, to, packet }));
+        self.heap.push(Reverse(Held {
+            at,
+            seq: self.seq,
+            to,
+            packet,
+        }));
     }
 
     fn next_time(&self) -> Option<Instant> {
@@ -131,11 +136,19 @@ struct Bucket {
 
 impl Bucket {
     fn new(now: Instant, rate: f64) -> Bucket {
-        Bucket { tokens: rate, rate, last: now }
+        Bucket {
+            tokens: rate,
+            rate,
+            last: now,
+        }
     }
 
     fn take(&mut self, now: Instant) -> bool {
-        let gained = now.since_start().saturating_sub(self.last.since_start()).as_secs_f64() * self.rate;
+        let gained = now
+            .since_start()
+            .saturating_sub(self.last.since_start())
+            .as_secs_f64()
+            * self.rate;
         self.tokens = (self.tokens + gained).min(self.rate);
         self.last = now;
         if self.tokens >= 1.0 {
@@ -148,7 +161,13 @@ impl Bucket {
 }
 
 /// Runs the path for one sandbox until it detaches.
-pub async fn run(fcx: Cx, mut sandbox: impl Interface, mut inner: End, shared: Arc<Shared>, name: Arc<str>) -> fictionet::Result {
+pub async fn run(
+    fcx: Cx,
+    mut sandbox: impl Interface,
+    mut inner: End,
+    shared: Arc<Shared>,
+    name: Arc<str>,
+) -> fictionet::Result {
     let scenario = shared.scenario.clone();
     let (mut home, home_side) = pair();
     router(&fcx, home_side, HOME.router, Some((&shared, name.clone())));
@@ -195,7 +214,9 @@ pub async fn run(fcx: Cx, mut sandbox: impl Interface, mut inner: End, shared: A
                 let now = fcx.now();
                 let mut sent = 0;
                 while sent < 64 {
-                    let Some((to, packet)) = on_the_way.due(now) else { break };
+                    let Some((to, packet)) = on_the_way.due(now) else {
+                        break;
+                    };
                     match to {
                         To::Sandbox => sandbox.send(packet),
                         To::Sites => inner.send(packet),
@@ -299,7 +320,11 @@ pub async fn run(fcx: Cx, mut sandbox: impl Interface, mut inner: End, shared: A
                     let ttl = p[8].saturating_sub(back).max(1);
                     set_ttl(&mut p, ttl);
                 }
-                let by = if is_special(src) { Duration::ZERO } else { scenario.one_way(src) };
+                let by = if is_special(src) {
+                    Duration::ZERO
+                } else {
+                    scenario.one_way(src)
+                };
                 on_the_way.hold(now + by, To::Sandbox, Packet(p));
             }
         }
@@ -380,7 +405,14 @@ pub fn time_exceeded(p: &[u8], from: Ipv4Addr, ttl: u8, id: u16) -> Option<Packe
 /// An ICMP error of `kind` and `code` about `p`, from router `from`, sent
 /// with `ttl`, quoting `p` as the router got it. `None` where RFC 1122
 /// forbids one (see [`time_exceeded`]).
-pub fn icmp_error(p: &[u8], from: Ipv4Addr, ttl: u8, id: u16, kind: u8, code: u8) -> Option<Packet> {
+pub fn icmp_error(
+    p: &[u8],
+    from: Ipv4Addr,
+    ttl: u8,
+    id: u16,
+    kind: u8,
+    code: u8,
+) -> Option<Packet> {
     let ihl = header_len(p)?;
     let src = Ipv4Addr::new(p[12], p[13], p[14], p[15]);
     if is_special(src) || src.is_loopback() {
@@ -422,7 +454,20 @@ mod tests {
 
     fn packet(proto: u8, ttl: u8, frag: u16, payload: &[u8]) -> Vec<u8> {
         let total = 20 + payload.len();
-        let mut p = vec![0x45, 0, (total >> 8) as u8, total as u8, 0, 7, (frag >> 8) as u8, frag as u8, ttl, proto, 0, 0];
+        let mut p = vec![
+            0x45,
+            0,
+            (total >> 8) as u8,
+            total as u8,
+            0,
+            7,
+            (frag >> 8) as u8,
+            frag as u8,
+            ttl,
+            proto,
+            0,
+            0,
+        ];
         p.extend_from_slice(&[10, 0, 0, 2, 84, 21, 44, 10]);
         let sum = checksum(&p);
         p[10..12].copy_from_slice(&sum.to_be_bytes());
@@ -432,7 +477,14 @@ mod tests {
 
     #[test]
     fn time_exceeded_quotes_the_packet_from_the_router() {
-        let probe = packet(17, 2, 0, &[0x9c, 0x40, 0x82, 0x9a, 0, 13, 0, 0, b'x', b'y', b'z', b'w', b'v']);
+        let probe = packet(
+            17,
+            2,
+            0,
+            &[
+                0x9c, 0x40, 0x82, 0x9a, 0, 13, 0, 0, b'x', b'y', b'z', b'w', b'v',
+            ],
+        );
         let reply = time_exceeded(&probe, HOME.router, 63, 5).unwrap().0;
         assert_eq!(checksum(&reply[..20]), 0);
         assert_eq!((reply[8], reply[9]), (63, 1));
@@ -451,11 +503,35 @@ mod tests {
 
     #[test]
     fn no_time_exceeded_for_icmp_errors_or_later_fragments() {
-        assert!(time_exceeded(&packet(1, 1, 0, &[3, 1, 0, 0, 0, 0, 0, 0]), HOME.router, 64, 0).is_none());
-        assert!(time_exceeded(&packet(1, 1, 0, &[11, 0, 0, 0, 0, 0, 0, 0]), HOME.router, 64, 0).is_none());
+        assert!(
+            time_exceeded(
+                &packet(1, 1, 0, &[3, 1, 0, 0, 0, 0, 0, 0]),
+                HOME.router,
+                64,
+                0
+            )
+            .is_none()
+        );
+        assert!(
+            time_exceeded(
+                &packet(1, 1, 0, &[11, 0, 0, 0, 0, 0, 0, 0]),
+                HOME.router,
+                64,
+                0
+            )
+            .is_none()
+        );
         assert!(time_exceeded(&packet(17, 1, 0x2001, &[0; 8]), HOME.router, 64, 0).is_none());
         // A ping is answered, and so is a first fragment.
-        assert!(time_exceeded(&packet(1, 1, 0, &[8, 0, 0, 0, 0, 0, 0, 0]), HOME.router, 64, 0).is_some());
+        assert!(
+            time_exceeded(
+                &packet(1, 1, 0, &[8, 0, 0, 0, 0, 0, 0, 0]),
+                HOME.router,
+                64,
+                0
+            )
+            .is_some()
+        );
         assert!(time_exceeded(&packet(17, 1, 0x2000, &[0; 8]), HOME.router, 64, 0).is_some());
         // Not IPv4 at all.
         assert!(time_exceeded(&[0x60; 40], HOME.router, 64, 0).is_none());

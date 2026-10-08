@@ -1,9 +1,7 @@
 use fictionet::stdlib::codec::{Stream, Wire};
-use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::http1::{Header, Limits, Request, Requests, Response, Responses};
 use fictionet::stdlib::test_support;
-use fictionet::stdlib::http1::{
-    Header, Limits, Request, Requests, Response, Responses,
-};
+use fictionet::stdlib::test_support::contract;
 
 const FIRST: &[u8] = b"POST /tools HTTP/1.1\r\nHost: api.test\r\nTransfer-Encoding: chunked\r\nX-Raw:\t keep \t\r\n\r\n01\r\n{\r\n1\r\n}\r\n000\r\n\r\n";
 const SECOND: &[u8] = b"GET /next HTTP/1.1\r\nHost:api.test\r\n\r\n";
@@ -231,15 +229,16 @@ fn copied_message_decoders_preserve_bytes_and_share_wire_traits() {
         Response::parse(&response.to_bytes().unwrap()).unwrap().body,
         b"{}"
     );
-    contract::check_decode(
-        copied::Responses::new,
-        b"HTTP/1.1 204 \r\n\r\n",
-    );
+    contract::check_decode(copied::Responses::new, b"HTTP/1.1 204 \r\n\r\n");
 }
 
 #[test]
 fn message_buffer_bounds_do_not_change_between_messages() {
-    let mut stream = Stream::new(Requests::with_limits(Limits { body: 2, message: FIRST.len(), ..Limits::default() }));
+    let mut stream = Stream::new(Requests::with_limits(Limits {
+        body: 2,
+        message: FIRST.len(),
+        ..Limits::default()
+    }));
     let capacity = FIRST.len().checked_add(1).unwrap();
     let input = [FIRST, SECOND, FIRST, SECOND].concat();
     let mut rest = input.as_slice();

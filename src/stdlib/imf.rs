@@ -65,8 +65,8 @@
 //! assert_eq!(bytes, "To: John Doe <jdoe@machine.example>\r\nSubject: Re: Café hours\r\n\r\n".as_bytes());
 //! ```
 
+use fictionet::stdlib::codec::base64::{self, Padding, encode as base64_encode};
 use fictionet::stdlib::codec::civil::days_in_month;
-use fictionet::stdlib::codec::base64::{self, encode as base64_encode, Padding};
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The longest header section, counting the blank line that ends it.
@@ -193,17 +193,26 @@ impl Header {
 
     /// The value of the first field named `name`, in any case.
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.fields.iter().find(|f| f.is(name)).map(|f| f.value.as_str())
+        self.fields
+            .iter()
+            .find(|f| f.is(name))
+            .map(|f| f.value.as_str())
     }
 
     /// The values of every field named `name`, in any case, in order.
     pub fn get_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-        self.fields.iter().filter(move |f| f.is(name)).map(|f| f.value.as_str())
+        self.fields
+            .iter()
+            .filter(move |f| f.is(name))
+            .map(|f| f.value.as_str())
     }
 
     /// Adds a field at the end.
     pub fn push(&mut self, name: &str, value: &str) {
-        self.fields.push(Field { name: name.to_string(), value: value.to_string() });
+        self.fields.push(Field {
+            name: name.to_string(),
+            value: value.to_string(),
+        });
     }
 }
 
@@ -430,7 +439,10 @@ fn parse_fields(b: &[u8]) -> Result<Header, Error> {
         if let Some((name, value)) = current.take() {
             fields.push(finish(name, value)?);
         }
-        let colon = line.iter().position(|&c| c == b':').ok_or(Error::FieldName)?;
+        let colon = line
+            .iter()
+            .position(|&c| c == b':')
+            .ok_or(Error::FieldName)?;
         // The obsolete syntax allows white space before the colon.
         let mut name = &line[..colon];
         while let [rest @ .., b' ' | b'\t'] = name {
@@ -455,9 +467,16 @@ fn finish(name: &[u8], value: Vec<u8>) -> Result<Field, Error> {
     if value.iter().any(|&c| c == 0 || c == b'\r') {
         return Err(Error::FieldValue);
     }
-    let start = value.iter().position(|&c| c != b' ' && c != b'\t').unwrap_or(value.len());
-    let value = core::str::from_utf8(&value[start..]).map(str::to_owned).map_err(|_| Error::Utf8)?;
-    let name = core::str::from_utf8(name).map(str::to_owned).map_err(|_| Error::FieldName)?;
+    let start = value
+        .iter()
+        .position(|&c| c != b' ' && c != b'\t')
+        .unwrap_or(value.len());
+    let value = core::str::from_utf8(&value[start..])
+        .map(str::to_owned)
+        .map_err(|_| Error::Utf8)?;
+    let name = core::str::from_utf8(name)
+        .map(str::to_owned)
+        .map_err(|_| Error::FieldName)?;
     Ok(Field { name, value })
 }
 
@@ -470,7 +489,11 @@ fn valid_name(name: &[u8]) -> bool {
 fn fold(out: &mut Vec<u8>, name: &str, v: &[u8]) {
     // RFC 2047 section 2: a line holding an encoded word is at most 76
     // characters long.
-    let limit = if v.windows(2).any(|w| w == b"=?") { ENCODED_LINE_LEN } else { FOLD_AT };
+    let limit = if v.windows(2).any(|w| w == b"=?") {
+        ENCODED_LINE_LEN
+    } else {
+        FOLD_AT
+    };
     let is_ws = |c: u8| c == b' ' || c == b'\t';
     out.extend_from_slice(name.as_bytes());
     out.push(b':');
@@ -787,7 +810,9 @@ pub struct DateTime {
 }
 
 const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 const ZONES: [(&str, i16); 10] = [
     ("UT", 0),
     ("GMT", 0),
@@ -822,7 +847,11 @@ impl DateTime {
             out.push_str(DAYS[usize::from(w)]);
             out.push_str(", ");
         }
-        let sign = if zone < 0 || self.zone.is_none() { '-' } else { '+' };
+        let sign = if zone < 0 || self.zone.is_none() {
+            '-'
+        } else {
+            '+'
+        };
         out.push_str(&format!(
             "{} {} {:04} {:02}:{:02}:{:02} {sign}{:02}{:02}",
             self.day,
@@ -857,7 +886,8 @@ fn read_date(t: &[Lexed]) -> Option<DateTime> {
         Some(Tok::Atom(a)) => Some(a.as_str()),
         _ => None,
     };
-    let special = |k: usize, c: char| matches!(t.get(k).map(|l| &l.tok), Some(Tok::Special(x)) if *x == c);
+    let special =
+        |k: usize, c: char| matches!(t.get(k).map(|l| &l.tok), Some(Tok::Special(x)) if *x == c);
     let mut i = 0;
     let weekday = if special(1, ',') {
         i = 2;
@@ -899,7 +929,16 @@ fn read_date(t: &[Lexed]) -> Option<DateTime> {
     if i + 1 != t.len() {
         return None;
     }
-    let date = DateTime { weekday, year, month, day, hour, minute, second, zone };
+    let date = DateTime {
+        weekday,
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        zone,
+    };
     date.valid().then_some(date)
 }
 
@@ -945,7 +984,8 @@ fn weekday(year: u16, month: u8, day: u8) -> u8 {
     // Sakamoto's method, which counts from Sunday.
     const T: [u32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
     let y = u32::from(year) - u32::from(month < 3);
-    let from_sunday = (y + y / 4 - y / 100 + y / 400 + T[usize::from(month - 1)] + u32::from(day)) % 7;
+    let from_sunday =
+        (y + y / 4 - y / 100 + y / 400 + T[usize::from(month - 1)] + u32::from(day)) % 7;
     ((from_sunday + 6) % 7) as u8
 }
 
@@ -963,7 +1003,11 @@ pub fn decode_word(word: &str) -> Option<String> {
     let inner = word.strip_prefix("=?")?.strip_suffix("?=")?;
     let (charset, rest) = inner.split_once('?')?;
     let (encoding, text) = rest.split_once('?')?;
-    if text.is_empty() || text.bytes().any(|c| !(0x21..=0x7e).contains(&c) || c == b'?') {
+    if text.is_empty()
+        || text
+            .bytes()
+            .any(|c| !(0x21..=0x7e).contains(&c) || c == b'?')
+    {
         return None;
     }
     let bytes = match encoding {
@@ -1354,7 +1398,10 @@ struct Parser {
 
 impl Parser {
     fn new(s: &str) -> Option<Parser> {
-        Some(Parser { toks: lex(s)?, i: 0 })
+        Some(Parser {
+            toks: lex(s)?,
+            i: 0,
+        })
     }
 
     fn done(&self) -> bool {
@@ -1382,7 +1429,10 @@ impl Parser {
     /// Takes atoms, quoted strings and dots, and returns where they are.
     fn words(&mut self) -> std::ops::Range<usize> {
         let start = self.i;
-        while matches!(self.peek(), Some(Tok::Atom(_) | Tok::Quoted(_) | Tok::Special('.'))) {
+        while matches!(
+            self.peek(),
+            Some(Tok::Atom(_) | Tok::Quoted(_) | Tok::Special('.'))
+        ) {
             self.i += 1;
         }
         start..self.i
@@ -1435,7 +1485,9 @@ impl Parser {
             Tok::Atom(a) => {
                 let mut d = a;
                 while self.eat('.') {
-                    let Tok::Atom(a) = self.next()? else { return None };
+                    let Tok::Atom(a) = self.next()? else {
+                        return None;
+                    };
                     d.push('.');
                     d.push_str(&a);
                 }
@@ -1450,7 +1502,11 @@ impl Parser {
     fn mailbox(&mut self) -> Option<Mailbox> {
         let words = self.words();
         if self.eat('<') {
-            let name = if words.is_empty() { None } else { Some(self.phrase(words)?) };
+            let name = if words.is_empty() {
+                None
+            } else {
+                Some(self.phrase(words)?)
+            };
             if matches!(self.peek(), Some(Tok::Special(',' | '@'))) {
                 // An obsolete source route, `@a.test,@b.test:`, is read
                 // and dropped. RFC 5322 section 4.4: commas, then `@` and
@@ -1478,11 +1534,19 @@ impl Parser {
             if !self.eat('>') {
                 return None;
             }
-            Some(Mailbox { name, local, domain })
+            Some(Mailbox {
+                name,
+                local,
+                domain,
+            })
         } else if self.eat('@') {
             let local = self.local_part(words)?;
             let domain = self.domain()?;
-            Some(Mailbox { name: None, local, domain })
+            Some(Mailbox {
+                name: None,
+                local,
+                domain,
+            })
         } else {
             None
         }
@@ -1492,7 +1556,11 @@ impl Parser {
     fn address(&mut self, count: &mut usize) -> Result<Address, Error> {
         let mut bump = || {
             *count += 1;
-            if *count > MAX_ADDRESSES { Err(Error::TooManyItems) } else { Ok(()) }
+            if *count > MAX_ADDRESSES {
+                Err(Error::TooManyItems)
+            } else {
+                Ok(())
+            }
         };
         let start = self.i;
         let words = self.words();
@@ -1542,12 +1610,18 @@ impl Parser {
 
 /// `out`, if it fits in [`MAX_VALUE_BYTES`].
 fn fits(out: String) -> Result<String, Error> {
-    if out.len() > MAX_VALUE_BYTES { Err(Error::TooLarge) } else { Ok(out) }
+    if out.len() > MAX_VALUE_BYTES {
+        Err(Error::TooLarge)
+    } else {
+        Ok(out)
+    }
 }
 
 /// Whether `s` is words of atom characters split by single dots.
 fn is_dot_atom(s: &str) -> bool {
-    !s.is_empty() && s.split('.').all(|w| !w.is_empty() && w.chars().all(is_atext))
+    !s.is_empty()
+        && s.split('.')
+            .all(|w| !w.is_empty() && w.chars().all(is_atext))
 }
 
 /// Writes a display name: as atoms when it is atom words split by single
@@ -1565,7 +1639,10 @@ fn write_phrase(out: &mut String, s: &str) -> Result<(), Error> {
         out.push_str(&encoded_text(s));
         return Ok(());
     }
-    let atoms = !s.is_empty() && !s.contains("=?") && s.split(' ').all(|w| !w.is_empty() && w.chars().all(is_atext));
+    let atoms = !s.is_empty()
+        && !s.contains("=?")
+        && s.split(' ')
+            .all(|w| !w.is_empty() && w.chars().all(is_atext));
     if atoms {
         out.push_str(s);
         Ok(())
@@ -1625,16 +1702,18 @@ fn write_domain(out: &mut String, s: &str, err: Error, spaces: bool) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn mailbox(name: Option<&str>, local: &str, domain: &str) -> Mailbox {
-        Mailbox { name: name.map(str::to_string), local: local.to_string(), domain: domain.to_string() }
+        Mailbox {
+            name: name.map(str::to_string),
+            local: local.to_string(),
+            domain: domain.to_string(),
+        }
     }
 
     fn one(s: &str) -> Mailbox {
@@ -1657,14 +1736,34 @@ mod tests {
     #[test]
     fn simple_message() {
         let (h, body) = split_message(SIMPLE.as_bytes()).unwrap();
-        assert_eq!(body, b"This is a message just to say hello.\r\nSo, \"Hello\".\r\n");
+        assert_eq!(
+            body,
+            b"This is a message just to say hello.\r\nSo, \"Hello\".\r\n"
+        );
         assert_eq!(h.fields.len(), 5);
         assert_eq!(h.get("subject"), Some("Saying Hello"));
-        assert_eq!(one(h.get("From").unwrap()), mailbox(Some("John Doe"), "jdoe", "machine.example"));
-        assert_eq!(one(h.get("To").unwrap()), mailbox(Some("Mary Smith"), "mary", "example.net"));
+        assert_eq!(
+            one(h.get("From").unwrap()),
+            mailbox(Some("John Doe"), "jdoe", "machine.example")
+        );
+        assert_eq!(
+            one(h.get("To").unwrap()),
+            mailbox(Some("Mary Smith"), "mary", "example.net")
+        );
         let id = MessageId::parse((h.get("message-id").unwrap()).as_bytes()).unwrap();
-        assert_eq!(id, MessageId { left: "1234".into(), right: "local.machine.example".into() });
-        assert_eq!(id.to_bytes().map(|b| String::from_utf8(b).unwrap()).unwrap(), "<1234@local.machine.example>");
+        assert_eq!(
+            id,
+            MessageId {
+                left: "1234".into(),
+                right: "local.machine.example".into()
+            }
+        );
+        assert_eq!(
+            id.to_bytes()
+                .map(|b| String::from_utf8(b).unwrap())
+                .unwrap(),
+            "<1234@local.machine.example>"
+        );
         let d = DateTime::parse((h.get("Date").unwrap()).as_bytes()).unwrap();
         let want = DateTime {
             weekday: Some(4),
@@ -1707,7 +1806,9 @@ mod tests {
             one("\"Joe Q. Public\" <john.q.public@example.com>"),
             mailbox(Some("Joe Q. Public"), "john.q.public", "example.com")
         );
-        let list = parse_address_list("Mary Smith <mary@x.test>, jdoe@example.org, Who? <one@y.test>").unwrap();
+        let list =
+            parse_address_list("Mary Smith <mary@x.test>, jdoe@example.org, Who? <one@y.test>")
+                .unwrap();
         assert_eq!(
             list,
             [
@@ -1716,16 +1817,25 @@ mod tests {
                 Address::Mailbox(mailbox(Some("Who?"), "one", "y.test")),
             ]
         );
-        let list = parse_address_list("<boss@nil.test>, \"Giant; \\\"Big\\\" Box\" <sysservices@example.net>").unwrap();
+        let list = parse_address_list(
+            "<boss@nil.test>, \"Giant; \\\"Big\\\" Box\" <sysservices@example.net>",
+        )
+        .unwrap();
         assert_eq!(
             list,
             [
                 Address::Mailbox(mailbox(None, "boss", "nil.test")),
-                Address::Mailbox(mailbox(Some("Giant; \"Big\" Box"), "sysservices", "example.net")),
+                Address::Mailbox(mailbox(
+                    Some("Giant; \"Big\" Box"),
+                    "sysservices",
+                    "example.net"
+                )),
             ]
         );
         // A.1.3: groups.
-        let list = parse_address_list("A Group:Ed Jones <c@a.test>,joe@where.test,John <jdoe@one.test>;").unwrap();
+        let list =
+            parse_address_list("A Group:Ed Jones <c@a.test>,joe@where.test,John <jdoe@one.test>;")
+                .unwrap();
         assert_eq!(
             list,
             [Address::Group {
@@ -1739,7 +1849,10 @@ mod tests {
         );
         assert_eq!(
             parse_address_list("Undisclosed recipients:;").unwrap(),
-            [Address::Group { name: "Undisclosed recipients".into(), members: vec![] }]
+            [Address::Group {
+                name: "Undisclosed recipients".into(),
+                members: vec![]
+            }]
         );
         // A.5: white space and comments.
         assert_eq!(
@@ -1751,27 +1864,43 @@ mod tests {
              joe@example.org,\r\n  John <jdoe@one.test> (my dear friend); (the end of the group)",
         )
         .unwrap();
-        let [Address::Group { name, members }] = &list[..] else { panic!("{list:?}") };
+        let [Address::Group { name, members }] = &list[..] else {
+            panic!("{list:?}")
+        };
         assert_eq!(name, "A Group");
-        assert_eq!(members[0], mailbox(Some("Chris Jones"), "c", "public.example"));
+        assert_eq!(
+            members[0],
+            mailbox(Some("Chris Jones"), "c", "public.example")
+        );
         assert_eq!(members.len(), 3);
         // A.6.1: an obsolete phrase with a dot, and a source route.
         assert_eq!(
             one("Joe Q. Public <john.q.public@example.com>"),
             mailbox(Some("Joe Q. Public"), "john.q.public", "example.com")
         );
-        assert_eq!(one("<@machine.tld:mary@example.net>"), mailbox(None, "mary", "example.net"));
+        assert_eq!(
+            one("<@machine.tld:mary@example.net>"),
+            mailbox(None, "mary", "example.net")
+        );
         // Empty entries, quoted local parts and domain literals.
         assert_eq!(parse_address_list(" , a@b , ,").unwrap().len(), 1);
         assert_eq!(parse_address_list("").unwrap(), []);
-        assert_eq!(one("\"a b\"@[192.0.2.1]"), mailbox(None, "a b", "[192.0.2.1]"));
+        assert_eq!(
+            one("\"a b\"@[192.0.2.1]"),
+            mailbox(None, "a b", "[192.0.2.1]")
+        );
     }
 
     #[test]
     fn utf8_headers() {
         // RFC 6532 lets UTF-8 stand in names, addresses and text.
-        let (h, _) = split_message("From: Jöhn Dœ <jöhn@exämple.de>\r\nSubject: Grüße\r\n\r\n".as_bytes()).unwrap();
-        assert_eq!(one(h.get("from").unwrap()), mailbox(Some("Jöhn Dœ"), "jöhn", "exämple.de"));
+        let (h, _) =
+            split_message("From: Jöhn Dœ <jöhn@exämple.de>\r\nSubject: Grüße\r\n\r\n".as_bytes())
+                .unwrap();
+        assert_eq!(
+            one(h.get("from").unwrap()),
+            mailbox(Some("Jöhn Dœ"), "jöhn", "exämple.de")
+        );
         assert_eq!(h.get("subject"), Some("Grüße"));
         assert_eq!(split_message(b"Subject: \xff\r\n\r\n"), Err(Error::Utf8));
     }
@@ -1779,12 +1908,24 @@ mod tests {
     #[test]
     fn encoded_words_from_the_rfc() {
         // RFC 2047, section 8.
-        assert_eq!(one("=?US-ASCII?Q?Keith_Moore?= <moore@cs.utk.edu>").name.as_deref(), Some("Keith Moore"));
         assert_eq!(
-            one("=?ISO-8859-1?Q?Keld_J=F8rn_Simonsen?= <keld@dkuug.dk>").name.as_deref(),
+            one("=?US-ASCII?Q?Keith_Moore?= <moore@cs.utk.edu>")
+                .name
+                .as_deref(),
+            Some("Keith Moore")
+        );
+        assert_eq!(
+            one("=?ISO-8859-1?Q?Keld_J=F8rn_Simonsen?= <keld@dkuug.dk>")
+                .name
+                .as_deref(),
             Some("Keld Jørn Simonsen")
         );
-        assert_eq!(one("=?ISO-8859-1?Q?Andr=E9?= Pirard <PIRARD@vm1.ulg.ac.be>").name.as_deref(), Some("André Pirard"));
+        assert_eq!(
+            one("=?ISO-8859-1?Q?Andr=E9?= Pirard <PIRARD@vm1.ulg.ac.be>")
+                .name
+                .as_deref(),
+            Some("André Pirard")
+        );
         assert_eq!(
             decode_text(
                 "=?ISO-8859-1?B?SWYgeW91IGNhbiByZWFkIHRoaXMgeW8=?= =?ISO-8859-1?B?dSB1bmRlcnN0YW5kIHRoZSBleGFtcGxlLg==?="
@@ -1801,9 +1942,15 @@ mod tests {
         assert_eq!(decode_text("=?ISO-8859-1?Q?a?="), "a");
         assert_eq!(decode_text("=?ISO-8859-1?Q?a?= b"), "a b");
         assert_eq!(decode_text("=?ISO-8859-1?Q?a?= =?ISO-8859-1?Q?b?="), "ab");
-        assert_eq!(decode_text("=?ISO-8859-1?Q?a?=  \t =?ISO-8859-1?Q?b?="), "ab");
+        assert_eq!(
+            decode_text("=?ISO-8859-1?Q?a?=  \t =?ISO-8859-1?Q?b?="),
+            "ab"
+        );
         assert_eq!(decode_text("=?ISO-8859-1?Q?a_b?="), "a b");
-        assert_eq!(decode_text("=?ISO-8859-1?Q?a?= =?ISO-8859-2?Q?_b?="), "a =?ISO-8859-2?Q?_b?=");
+        assert_eq!(
+            decode_text("=?ISO-8859-1?Q?a?= =?ISO-8859-2?Q?_b?="),
+            "a =?ISO-8859-2?Q?_b?="
+        );
         // A language suffix (RFC 2231) is ignored.
         assert_eq!(decode_word("=?utf-8*en?q?hi?="), Some("hi".into()));
         // Words that do not decode stay.
@@ -1827,9 +1974,15 @@ mod tests {
             assert_eq!(decode_text(w), w);
         }
         // Text around and between keeps its spacing.
-        assert_eq!(decode_text("  Re:  =?utf-8?q?Caf=C3=A9?=  ok "), "  Re:  Café  ok ");
+        assert_eq!(
+            decode_text("  Re:  =?utf-8?q?Caf=C3=A9?=  ok "),
+            "  Re:  Café  ok "
+        );
         // Inside quotes, nothing is decoded.
-        assert_eq!(one("\"=?utf-8?q?x?=\" <a@b>").name.as_deref(), Some("=?utf-8?q?x?="));
+        assert_eq!(
+            one("\"=?utf-8?q?x?=\" <a@b>").name.as_deref(),
+            Some("=?utf-8?q?x?=")
+        );
     }
 
     #[test]
@@ -1854,9 +2007,15 @@ mod tests {
         }
         for n in 0..10 {
             let s = "xyz".repeat(n);
-            assert_eq!(base64::decode(base64_encode(s.as_bytes()).as_bytes(), Padding::Optional).unwrap(), s.as_bytes());
+            assert_eq!(
+                base64::decode(base64_encode(s.as_bytes()).as_bytes(), Padding::Optional).unwrap(),
+                s.as_bytes()
+            );
         }
-        assert_eq!(base64::decode(b"QUI", Padding::Optional), Some(b"AB".to_vec()));
+        assert_eq!(
+            base64::decode(b"QUI", Padding::Optional),
+            Some(b"AB".to_vec())
+        );
     }
 
     #[test]
@@ -1953,12 +2112,27 @@ mod tests {
             );
         }
         // The writer refuses what the reader refuses.
-        let good =
-            DateTime { weekday: None, year: 2000, month: 2, day: 29, hour: 0, minute: 0, second: 0, zone: Some(0) };
-        assert!(good.to_bytes().map(|b| String::from_utf8(b).unwrap()).is_ok());
+        let good = DateTime {
+            weekday: None,
+            year: 2000,
+            month: 2,
+            day: 29,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            zone: Some(0),
+        };
+        assert!(
+            good.to_bytes()
+                .map(|b| String::from_utf8(b).unwrap())
+                .is_ok()
+        );
         for bad in [
             DateTime { year: 1899, ..good },
-            DateTime { year: 10000, ..good },
+            DateTime {
+                year: 10000,
+                ..good
+            },
             DateTime { month: 0, ..good },
             DateTime { month: 13, ..good },
             DateTime { day: 0, ..good },
@@ -1966,9 +2140,18 @@ mod tests {
             DateTime { hour: 24, ..good },
             DateTime { minute: 60, ..good },
             DateTime { second: 61, ..good },
-            DateTime { weekday: Some(7), ..good },
-            DateTime { zone: Some(6000), ..good },
-            DateTime { zone: Some(i16::MIN), ..good },
+            DateTime {
+                weekday: Some(7),
+                ..good
+            },
+            DateTime {
+                zone: Some(6000),
+                ..good
+            },
+            DateTime {
+                zone: Some(i16::MIN),
+                ..good
+            },
         ] {
             assert_eq!(
                 bad.to_bytes().map(|b| String::from_utf8(b).unwrap()),
@@ -1980,7 +2163,9 @@ mod tests {
 
     #[test]
     fn message_ids() {
-        let ids = parse_message_ids("<1234@local.machine.example> (a comment)\r\n <3456@example.net>").unwrap();
+        let ids =
+            parse_message_ids("<1234@local.machine.example> (a comment)\r\n <3456@example.net>")
+                .unwrap();
         assert_eq!(ids.len(), 2);
         assert_eq!(
             MessageIds(ids.clone())
@@ -2003,23 +2188,67 @@ mod tests {
             }
         );
         // The writer does not write the obsolete quoted left part back.
-        assert_eq!(id.to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable));
-        for s in
-            ["", "1234@x", "<1234>", "<@x>", "<a@>", "<a@x", "<a@x> <b@y>", "<a@x.>", "<a..b@x>", "<a@x>>", "<a@x)"]
-        {
+        assert_eq!(
+            id.to_bytes().map(|b| String::from_utf8(b).unwrap()),
+            Err(Error::Unwritable)
+        );
+        for s in [
+            "",
+            "1234@x",
+            "<1234>",
+            "<@x>",
+            "<a@>",
+            "<a@x",
+            "<a@x> <b@y>",
+            "<a@x.>",
+            "<a..b@x>",
+            "<a@x>>",
+            "<a@x)",
+        ] {
             assert_eq!(MessageId::parse(s.as_bytes()), Err(Error::MessageId), "{s}");
         }
         let many = "<a@b>".repeat(MAX_MESSAGE_IDS + 1);
         assert_eq!(parse_message_ids(&many), Err(Error::TooManyItems));
-        assert_eq!(parse_message_ids(&" ".repeat(MAX_VALUE_BYTES + 1)), Err(Error::TooLarge));
-        let bad = MessageId { left: "a\r".into(), right: "x".into() };
-        assert_eq!(bad.to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable));
-        let bad = MessageId { left: "a".into(), right: "x y".into() };
-        assert_eq!(bad.to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable));
-        let id = MessageId { left: "a".into(), right: "x".into() };
-        assert_eq!(MessageIds(vec![id; MAX_MESSAGE_IDS + 1]).to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable));
-        let id = MessageId { left: "a".repeat(MAX_VALUE_BYTES), right: "x".into() };
-        assert_eq!(MessageIds(vec![id]).to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable));
+        assert_eq!(
+            parse_message_ids(&" ".repeat(MAX_VALUE_BYTES + 1)),
+            Err(Error::TooLarge)
+        );
+        let bad = MessageId {
+            left: "a\r".into(),
+            right: "x".into(),
+        };
+        assert_eq!(
+            bad.to_bytes().map(|b| String::from_utf8(b).unwrap()),
+            Err(Error::Unwritable)
+        );
+        let bad = MessageId {
+            left: "a".into(),
+            right: "x y".into(),
+        };
+        assert_eq!(
+            bad.to_bytes().map(|b| String::from_utf8(b).unwrap()),
+            Err(Error::Unwritable)
+        );
+        let id = MessageId {
+            left: "a".into(),
+            right: "x".into(),
+        };
+        assert_eq!(
+            MessageIds(vec![id; MAX_MESSAGE_IDS + 1])
+                .to_bytes()
+                .map(|b| String::from_utf8(b).unwrap()),
+            Err(Error::Unwritable)
+        );
+        let id = MessageId {
+            left: "a".repeat(MAX_VALUE_BYTES),
+            right: "x".into(),
+        };
+        assert_eq!(
+            MessageIds(vec![id])
+                .to_bytes()
+                .map(|b| String::from_utf8(b).unwrap()),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
@@ -2057,15 +2286,26 @@ mod tests {
         ] {
             assert_eq!(parse_address_list(s), Err(Error::Address), "{s:?}");
         }
-        let deep = format!("{}{}a@b", "(".repeat(MAX_COMMENT_DEPTH + 1), ")".repeat(MAX_COMMENT_DEPTH + 1));
+        let deep = format!(
+            "{}{}a@b",
+            "(".repeat(MAX_COMMENT_DEPTH + 1),
+            ")".repeat(MAX_COMMENT_DEPTH + 1)
+        );
         assert_eq!(parse_address_list(&deep), Err(Error::Address));
-        let ok = format!("{}{}a@b", "(".repeat(MAX_COMMENT_DEPTH), ")".repeat(MAX_COMMENT_DEPTH));
+        let ok = format!(
+            "{}{}a@b",
+            "(".repeat(MAX_COMMENT_DEPTH),
+            ")".repeat(MAX_COMMENT_DEPTH)
+        );
         assert!(parse_address_list(&ok).is_ok());
         let many = "a@b,".repeat(MAX_ADDRESSES + 1);
         assert_eq!(parse_address_list(&many), Err(Error::TooManyItems));
         let group = format!("G:{};", "a@b,".repeat(MAX_ADDRESSES));
         assert_eq!(parse_address_list(&group), Err(Error::TooManyItems));
-        assert_eq!(parse_address_list(&" ".repeat(MAX_VALUE_BYTES + 1)), Err(Error::TooLarge));
+        assert_eq!(
+            parse_address_list(&" ".repeat(MAX_VALUE_BYTES + 1)),
+            Err(Error::TooLarge)
+        );
         // Every prefix of a list either reads or fails, but never panics.
         let s = "A Group(x):\"Ed \\\" J\" <c@[1.2.3.4]>,joe@where.test (y);, =?utf-8?q?Z?= <z@q>";
         for (n, _) in s.char_indices() {
@@ -2087,20 +2327,41 @@ mod tests {
             );
         }
         let list = vec![Address::Mailbox(mailbox(None, "a", "b")); MAX_ADDRESSES + 1];
-        assert_eq!(AddressList(list.to_vec()).to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable));
-        let list = [Address::Mailbox(mailbox(None, &"a".repeat(MAX_VALUE_BYTES), "b"))];
-        assert_eq!(AddressList(list.to_vec()).to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable));
+        assert_eq!(
+            AddressList(list.to_vec())
+                .to_bytes()
+                .map(|b| String::from_utf8(b).unwrap()),
+            Err(Error::Unwritable)
+        );
+        let list = [Address::Mailbox(mailbox(
+            None,
+            &"a".repeat(MAX_VALUE_BYTES),
+            "b",
+        ))];
+        assert_eq!(
+            AddressList(list.to_vec())
+                .to_bytes()
+                .map(|b| String::from_utf8(b).unwrap()),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
     fn address_writer() {
         let list = [
             Address::Mailbox(mailbox(Some("John Doe"), "jdoe", "machine.example")),
-            Address::Mailbox(mailbox(Some("Joe Q. Public"), "john.q.public", "example.com")),
+            Address::Mailbox(mailbox(
+                Some("Joe Q. Public"),
+                "john.q.public",
+                "example.com",
+            )),
             Address::Mailbox(mailbox(Some(""), "a b", "[192.0.2.1]")),
             Address::Mailbox(mailbox(None, ".x", "y")),
             Address::Mailbox(mailbox(Some("say \"hi\" \\ =?x?q?y?="), "s", "t")),
-            Address::Group { name: "".into(), members: vec![] },
+            Address::Group {
+                name: "".into(),
+                members: vec![],
+            },
             Address::Group {
                 name: "Team".into(),
                 members: vec![mailbox(None, "a", "x"), mailbox(Some("B"), "b", "x")],
@@ -2122,7 +2383,8 @@ mod tests {
     fn folding_and_unfolding() {
         // RFC 5322 section 2.2.3: unfolding takes out each CRLF before
         // white space.
-        let (h, _) = split_message(b"Subject: This\r\n is a test\r\n\tof folding\nX:\r\n\r\n").unwrap();
+        let (h, _) =
+            split_message(b"Subject: This\r\n is a test\r\n\tof folding\nX:\r\n\r\n").unwrap();
         assert_eq!(h.get("subject"), Some("This is a test\tof folding"));
         assert_eq!(h.get("x"), Some(""));
         let words = "word ".repeat(60);
@@ -2134,7 +2396,10 @@ mod tests {
         let bytes = h.to_bytes().unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
         let subject = &text[..text.find("X-Long").unwrap()];
-        assert!(subject.split("\r\n").all(|line| line.len() <= FOLD_AT), "{subject:?}");
+        assert!(
+            subject.split("\r\n").all(|line| line.len() <= FOLD_AT),
+            "{subject:?}"
+        );
         assert!(subject.split("\r\n").count() > 3);
         assert!(text.contains(&format!("X-Long: {}\r\n", "y".repeat(200))));
         assert!(text.contains(&format!("To: {}\r\n z\r\n", "q".repeat(100))));
@@ -2200,19 +2465,11 @@ mod tests {
             (b"A: \xc3\r\n\r\n", Error::Utf8),
         ];
         for (b, e) in cases {
-            assert_eq!(
-                Header::parse(b),
-                Err(e),
-                "{:?}",
-                String::from_utf8_lossy(b)
-            );
+            assert_eq!(Header::parse(b), Err(e), "{:?}", String::from_utf8_lossy(b));
             assert_eq!(split_message(b).map(|_| ()), Err(e));
         }
         let many = "A: b\r\n".repeat(MAX_FIELDS + 1) + "\r\n";
-        assert_eq!(
-            Header::parse(many.as_bytes()),
-            Err(Error::TooManyFields)
-        );
+        assert_eq!(Header::parse(many.as_bytes()), Err(Error::TooManyFields));
         let enough = "A: b\r\n".repeat(MAX_FIELDS) + "\r\n";
         assert_eq!(
             Header::parse(enough.as_bytes()).unwrap().fields.len(),
@@ -2221,7 +2478,10 @@ mod tests {
         // No blank line within the limit.
         let big = format!("A: {}", "b".repeat(MAX_HEADER_BYTES));
         assert_eq!(Header::parse(big.as_bytes()), Err(Error::TooLarge));
-        assert_eq!(split_message(big.as_bytes()).map(|_| ()), Err(Error::TooLarge));
+        assert_eq!(
+            split_message(big.as_bytes()).map(|_| ()),
+            Err(Error::TooLarge)
+        );
         // A blank line that ends exactly at the limit.
         let fits = format!("A: {}\r\n\r\n", "b".repeat(MAX_HEADER_BYTES - 7));
         assert_eq!(fits.len(), MAX_HEADER_BYTES);
@@ -2231,20 +2491,22 @@ mod tests {
                 .len(),
             MAX_HEADER_BYTES - 7
         );
-        assert_eq!(
-            Header::parse(fits.as_bytes()),
-            Err(Error::UnsupportedForm)
-        );
+        assert_eq!(Header::parse(fits.as_bytes()), Err(Error::UnsupportedForm));
         let over = format!("A: {}\r\n\r\n", "b".repeat(MAX_HEADER_BYTES - 6));
-        assert_eq!(
-            Header::parse(over.as_bytes()),
-            Err(Error::TooLarge)
-        );
+        assert_eq!(Header::parse(over.as_bytes()), Err(Error::TooLarge));
         // An empty header section, and a message with no header at all.
-        assert_eq!(split_message(b"\r\nbody").unwrap(), (Header::default(), &b"body"[..]));
+        assert_eq!(
+            split_message(b"\r\nbody").unwrap(),
+            (Header::default(), &b"body"[..])
+        );
         assert_eq!(split_message(b"").unwrap(), (Header::default(), &b""[..]));
         // Writers refuse what readers refuse.
-        let field = |name: &str, value: &str| Header { fields: vec![Field { name: name.into(), value: value.into() }] };
+        let field = |name: &str, value: &str| Header {
+            fields: vec![Field {
+                name: name.into(),
+                value: value.into(),
+            }],
+        };
         assert_eq!(field("", "x").to_bytes(), Err(Error::Unwritable));
         assert_eq!(field("A B", "x").to_bytes(), Err(Error::Unwritable));
         assert_eq!(field("A:", "x").to_bytes(), Err(Error::Unwritable));
@@ -2257,15 +2519,36 @@ mod tests {
         // Full lines of 1,000 bytes with their CRLF, then a last field and
         // the blank line that end exactly at the limit.
         let full = |last: usize| {
-            let mut h = Header { fields: vec![Field { name: "A".into(), value: "b".repeat(995) }; 65] };
+            let mut h = Header {
+                fields: vec![
+                    Field {
+                        name: "A".into(),
+                        value: "b".repeat(995)
+                    };
+                    65
+                ],
+            };
             h.push("A", &"b".repeat(last));
             h.to_bytes()
         };
         assert_eq!(full(529).map(|b| b.len()), Ok(MAX_HEADER_BYTES));
         assert_eq!(full(530), Err(Error::Unwritable));
-        let many = Header { fields: vec![Field { name: "A".into(), value: "b".into() }; MAX_FIELDS + 1] };
+        let many = Header {
+            fields: vec![
+                Field {
+                    name: "A".into(),
+                    value: "b".into()
+                };
+                MAX_FIELDS + 1
+            ],
+        };
         assert_eq!(many.to_bytes(), Err(Error::Unwritable));
-        for e in [Error::TooLarge, Error::FieldName, Error::Date, Error::TooManyItems] {
+        for e in [
+            Error::TooLarge,
+            Error::FieldName,
+            Error::Date,
+            Error::TooManyItems,
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -2302,9 +2585,18 @@ mod tests {
         // RFC 5322 section 4.5: obsolete fields allow white space between
         // the name and the colon.
         let (h, _) = split_message(b"Subject : hi\r\nTo\t: a@b\r\n\r\n").unwrap();
-        assert_eq!(h.fields[0], Field { name: "Subject".into(), value: "hi".into() });
+        assert_eq!(
+            h.fields[0],
+            Field {
+                name: "Subject".into(),
+                value: "hi".into()
+            }
+        );
         assert_eq!(h.get("to"), Some("a@b"));
-        assert_eq!(split_message(b" : x\r\n\r\n").map(|_| ()), Err(Error::FieldName));
+        assert_eq!(
+            split_message(b" : x\r\n\r\n").map(|_| ()),
+            Err(Error::FieldName)
+        );
     }
 
     #[test]
@@ -2324,7 +2616,12 @@ mod tests {
     #[test]
     fn review_line_limit() {
         // RFC 5322 section 2.1.1: lines are at most 998 characters.
-        let field = |v: String| Header { fields: vec![Field { name: "A".into(), value: v }] };
+        let field = |v: String| Header {
+            fields: vec![Field {
+                name: "A".into(),
+                value: v,
+            }],
+        };
         assert!(field("b".repeat(MAX_LINE_BYTES - 3)).to_bytes().is_ok());
         assert_eq!(
             field("b".repeat(MAX_LINE_BYTES - 2)).to_bytes(),
@@ -2337,10 +2634,19 @@ mod tests {
     #[test]
     fn review_folding_inside_quotes_and_comments() {
         // FWS may fold a quoted string: the CRLF goes, the space stays.
-        assert_eq!(one("\"Joe\r\n Doe\" <j@x>").name.as_deref(), Some("Joe Doe"));
+        assert_eq!(
+            one("\"Joe\r\n Doe\" <j@x>").name.as_deref(),
+            Some("Joe Doe")
+        );
         assert_eq!(one("(a\r\n b) j@x"), mailbox(None, "j", "x"));
         // A line break not followed by white space is not folding.
-        for s in ["a@b\r\n", "a@b\n,c@d", "\"a\r\nb\"@c", "a@b\r c@d", "(x\ny) a@b"] {
+        for s in [
+            "a@b\r\n",
+            "a@b\n,c@d",
+            "\"a\r\nb\"@c",
+            "a@b\r c@d",
+            "(x\ny) a@b",
+        ] {
             assert_eq!(parse_address_list(s), Err(Error::Address), "{s:?}");
         }
     }
@@ -2384,8 +2690,15 @@ mod tests {
             Err(Error::UnsupportedForm)
         );
         for (l, r) in [("a b", "x"), ("a", "[x y]"), ("", "x"), ("a", "[x\u{1}]")] {
-            let id = MessageId { left: l.into(), right: r.into() };
-            assert_eq!(id.to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable), "{id:?}");
+            let id = MessageId {
+                left: l.into(),
+                right: r.into(),
+            };
+            assert_eq!(
+                id.to_bytes().map(|b| String::from_utf8(b).unwrap()),
+                Err(Error::Unwritable),
+                "{id:?}"
+            );
         }
         assert_eq!(
             MessageId {
@@ -2417,14 +2730,51 @@ mod tests {
     #[test]
     fn review_weekday_matches_date() {
         // RFC 5322 section 3.3: the weekday must be the date's own.
-        assert_eq!(DateTime::parse("Mon, 21 Nov 1997 09:55:06 -0600".as_bytes()), Err(Error::Date));
-        assert_eq!(DateTime::parse("Sat, 1 Jan 2000 00:00 +0000".as_bytes()).unwrap().weekday, Some(5));
-        assert_eq!(DateTime::parse("Fri, 31 Dec 9999 23:59 +0000".as_bytes()).unwrap().weekday, Some(4));
-        assert_eq!(DateTime::parse("Mon, 1 Jan 1900 00:00 +0000".as_bytes()).unwrap().weekday, Some(0));
-        let d =
-            DateTime { weekday: Some(0), year: 1997, month: 11, day: 21, hour: 0, minute: 0, second: 0, zone: Some(0) };
-        assert_eq!(d.to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable));
-        assert!(DateTime { weekday: Some(4), ..d }.to_bytes().map(|b| String::from_utf8(b).unwrap()).is_ok());
+        assert_eq!(
+            DateTime::parse("Mon, 21 Nov 1997 09:55:06 -0600".as_bytes()),
+            Err(Error::Date)
+        );
+        assert_eq!(
+            DateTime::parse("Sat, 1 Jan 2000 00:00 +0000".as_bytes())
+                .unwrap()
+                .weekday,
+            Some(5)
+        );
+        assert_eq!(
+            DateTime::parse("Fri, 31 Dec 9999 23:59 +0000".as_bytes())
+                .unwrap()
+                .weekday,
+            Some(4)
+        );
+        assert_eq!(
+            DateTime::parse("Mon, 1 Jan 1900 00:00 +0000".as_bytes())
+                .unwrap()
+                .weekday,
+            Some(0)
+        );
+        let d = DateTime {
+            weekday: Some(0),
+            year: 1997,
+            month: 11,
+            day: 21,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            zone: Some(0),
+        };
+        assert_eq!(
+            d.to_bytes().map(|b| String::from_utf8(b).unwrap()),
+            Err(Error::Unwritable)
+        );
+        assert!(
+            DateTime {
+                weekday: Some(4),
+                ..d
+            }
+            .to_bytes()
+            .map(|b| String::from_utf8(b).unwrap())
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2439,10 +2789,21 @@ mod tests {
     fn review_encoded_name_with_control_round_trips() {
         // An encoded word may decode to a control character. The reader
         // takes it, so the writer writes it back as an encoded word.
-        for s in ["=?utf-8?q?a=01b?= <x@y>", "G=?utf-8?b?AQ==?=: a@b;", "=?utf-8?q?=7F?= <x@y>"] {
+        for s in [
+            "=?utf-8?q?a=01b?= <x@y>",
+            "G=?utf-8?b?AQ==?=: a@b;",
+            "=?utf-8?q?=7F?= <x@y>",
+        ] {
             let list = parse_address_list(s).unwrap();
-            let text = AddressList(list.to_vec()).to_bytes().map(|b| String::from_utf8(b).unwrap()).unwrap();
-            assert_eq!(parse_address_list(&text).unwrap(), list, "{s:?} -> {text:?}");
+            let text = AddressList(list.to_vec())
+                .to_bytes()
+                .map(|b| String::from_utf8(b).unwrap())
+                .unwrap();
+            assert_eq!(
+                parse_address_list(&text).unwrap(),
+                list,
+                "{s:?} -> {text:?}"
+            );
             check_value(s);
         }
         let m = mailbox(Some("a\u{1}b \"c\""), "x", "y");
@@ -2502,20 +2863,52 @@ mod tests {
     #[test]
     fn astra_standalone_writers_stay_in_bounds() {
         // A group of MAX_ADDRESSES members counts as one more entry.
-        let group = Address::Group { name: "G".into(), members: vec![mailbox(None, "a", "b"); MAX_ADDRESSES] };
-        assert_eq!(group.to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable));
-        let group = Address::Group { name: "G".into(), members: vec![mailbox(None, "a", "b"); MAX_ADDRESSES - 1] };
-        assert_eq!(parse_address_list(&group.to_bytes().map(|b| String::from_utf8(b).unwrap()).unwrap()).unwrap(), [group]);
+        let group = Address::Group {
+            name: "G".into(),
+            members: vec![mailbox(None, "a", "b"); MAX_ADDRESSES],
+        };
+        assert_eq!(
+            group.to_bytes().map(|b| String::from_utf8(b).unwrap()),
+            Err(Error::Unwritable)
+        );
+        let group = Address::Group {
+            name: "G".into(),
+            members: vec![mailbox(None, "a", "b"); MAX_ADDRESSES - 1],
+        };
+        assert_eq!(
+            parse_address_list(
+                &group
+                    .to_bytes()
+                    .map(|b| String::from_utf8(b).unwrap())
+                    .unwrap()
+            )
+            .unwrap(),
+            [group]
+        );
         let m = mailbox(None, &"a".repeat(MAX_VALUE_BYTES), "b");
         assert_eq!(
             m.to_bytes().map(|b| String::from_utf8(b).unwrap()),
             Err(Error::Unwritable)
         );
         let m = mailbox(None, &"a".repeat(MAX_VALUE_BYTES - 2), "b");
-        assert_eq!(one(&m.to_bytes().map(|b| String::from_utf8(b).unwrap()).unwrap()), m);
-        let id = MessageId { left: "a".repeat(MAX_VALUE_BYTES), right: "b".into() };
-        assert_eq!(id.to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable));
-        let h = Header { fields: vec![Field { name: "N".repeat(MAX_HEADER_BYTES + 1), value: "x".into() }] };
+        assert_eq!(
+            one(&m.to_bytes().map(|b| String::from_utf8(b).unwrap()).unwrap()),
+            m
+        );
+        let id = MessageId {
+            left: "a".repeat(MAX_VALUE_BYTES),
+            right: "b".into(),
+        };
+        assert_eq!(
+            id.to_bytes().map(|b| String::from_utf8(b).unwrap()),
+            Err(Error::Unwritable)
+        );
+        let h = Header {
+            fields: vec![Field {
+                name: "N".repeat(MAX_HEADER_BYTES + 1),
+                value: "x".into(),
+            }],
+        };
         assert_eq!(h.to_bytes(), Err(Error::Unwritable));
     }
 
@@ -2548,7 +2941,10 @@ mod tests {
         // The fold after the colon is only taken when it helps.
         let mut h = Header::default();
         h.push("To", &format!("{} z", "q".repeat(100)));
-        assert_eq!(h.to_bytes().unwrap(), format!("To: {}\r\n z\r\n\r\n", "q".repeat(100)).as_bytes());
+        assert_eq!(
+            h.to_bytes().unwrap(),
+            format!("To: {}\r\n z\r\n\r\n", "q".repeat(100)).as_bytes()
+        );
     }
 
     #[test]
@@ -2563,12 +2959,19 @@ mod tests {
         assert!(!text.contains("\\\r\n"), "{text:?}");
         // The raw folded value, before unfolding, still reads.
         let raw = &text["To: ".len()..text.len() - 4];
-        assert_eq!(parse_address_list(raw).unwrap(), parse_address_list(&v).unwrap());
+        assert_eq!(
+            parse_address_list(raw).unwrap(),
+            parse_address_list(&v).unwrap()
+        );
         // An escaped backslash before white space leaves a fold point.
         let v = format!("\"{}\\\\ b\"@example.com", "a".repeat(70));
         let mut h = Header::default();
         h.push("To", &v);
-        assert!(std::str::from_utf8(&h.to_bytes().unwrap()).unwrap().contains("\\\\\r\n b"));
+        assert!(
+            std::str::from_utf8(&h.to_bytes().unwrap())
+                .unwrap()
+                .contains("\\\\\r\n b")
+        );
     }
 
     #[test]
@@ -2576,13 +2979,29 @@ mod tests {
         // RFC 5322 sections 3.2.5 and 4: controls other than a tab are
         // obsolete text, which a writer may not write.
         for v in ["hello\u{7f}", "a\u{1}b", "\u{1b}[0m"] {
-            let h = Header { fields: vec![Field { name: "Subject".into(), value: v.into() }] };
+            let h = Header {
+                fields: vec![Field {
+                    name: "Subject".into(),
+                    value: v.into(),
+                }],
+            };
             assert_eq!(h.to_bytes(), Err(Error::Unwritable), "{v:?}");
         }
-        let h = Header { fields: vec![Field { name: "Subject".into(), value: "a\tb".into() }] };
+        let h = Header {
+            fields: vec![Field {
+                name: "Subject".into(),
+                value: "a\tb".into(),
+            }],
+        };
         assert!(h.to_bytes().is_ok());
         // The reader still takes them.
-        assert_eq!(split_message(b"Subject: a\x7f\r\n\r\n").unwrap().0.get("subject"), Some("a\u{7f}"));
+        assert_eq!(
+            split_message(b"Subject: a\x7f\r\n\r\n")
+                .unwrap()
+                .0
+                .get("subject"),
+            Some("a\u{7f}")
+        );
     }
 
     #[test]
@@ -2618,7 +3037,15 @@ mod tests {
         ] {
             assert_eq!(parse_address_list(s).unwrap().len(), 1, "{s:?}");
         }
-        for s in ["<@:a@b>", "<@a b:x@y>", "<,:a@b>", "<,a@b>", "<@a.test,b.test:x@y>", "<@[x]@y:a@b>", "<@a.test>"] {
+        for s in [
+            "<@:a@b>",
+            "<@a b:x@y>",
+            "<,:a@b>",
+            "<,a@b>",
+            "<@a.test,b.test:x@y>",
+            "<@[x]@y:a@b>",
+            "<@a.test>",
+        ] {
             assert_eq!(parse_address_list(s), Err(Error::Address), "{s:?}");
         }
     }
@@ -2717,7 +3144,11 @@ mod tests {
     fn astra_unknown_zone() {
         // RFC 5322 sections 3.3 and 4.3: -0000 means the local zone is
         // unknown, and military letters are read as -0000.
-        for s in ["1 Jan 2024 00:00 -0000", "1 Jan 2024 00:00 Z", "1 Jan 2024 00:00 a"] {
+        for s in [
+            "1 Jan 2024 00:00 -0000",
+            "1 Jan 2024 00:00 Z",
+            "1 Jan 2024 00:00 a",
+        ] {
             let d = DateTime::parse(s.as_bytes()).unwrap();
             assert_eq!(d.zone, None, "{s}");
             assert_eq!(
@@ -2788,21 +3219,37 @@ mod tests {
     }
 
     fn random_mailbox(rng: &mut Lcg) -> Mailbox {
-        let name = if rng.coin() { None } else { Some(random_text(rng)) };
-        let local = if rng.coin() { "a.b".to_string() } else { random_text(rng) };
-        Mailbox { name, local, domain: random_domain(rng) }
+        let name = if rng.coin() {
+            None
+        } else {
+            Some(random_text(rng))
+        };
+        let local = if rng.coin() {
+            "a.b".to_string()
+        } else {
+            random_text(rng)
+        };
+        Mailbox {
+            name,
+            local,
+            domain: random_domain(rng),
+        }
     }
 
     /// A header holding `value` as its one field must read back, folded
     /// or not, as the value was written.
     fn folds_back(value: &str) -> String {
         let mut h = Header::default();
-        h.push("Long-Field-Name-For-Folding", &format!("{} {value}", "w".repeat(rng_pad(value))));
+        h.push(
+            "Long-Field-Name-For-Folding",
+            &format!("{} {value}", "w".repeat(rng_pad(value))),
+        );
         let bytes = h.to_bytes().unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(Header::parse(text.as_bytes()).unwrap(), h);
         // The raw value, still folded, with the padding taken off.
-        let raw = text["Long-Field-Name-For-Folding:".len()..text.len() - 4].trim_start_matches([' ', '\r', '\n']);
+        let raw = text["Long-Field-Name-For-Folding:".len()..text.len() - 4]
+            .trim_start_matches([' ', '\r', '\n']);
         raw.split_once(' ').map_or(raw, |(_, r)| r).to_string()
     }
 
@@ -2875,7 +3322,12 @@ mod tests {
                 assert_eq!(DateTime::parse(text.as_bytes()), Ok(d), "{text:?}");
             }
             let v = random_text(&mut rng);
-            let h = Header { fields: vec![Field { name: "X".into(), value: v.clone() }] };
+            let h = Header {
+                fields: vec![Field {
+                    name: "X".into(),
+                    value: v.clone(),
+                }],
+            };
             match h.to_bytes() {
                 Ok(bytes) => assert_eq!(Header::parse(&bytes).unwrap().fields[0].value, v),
                 Err(e) => assert_eq!(e, Error::Unwritable),

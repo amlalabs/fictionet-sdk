@@ -10,7 +10,10 @@ use std::time::Duration;
 
 use fictionet::prelude::*;
 use fictionet::time::ms;
-use fictionet::{AttachError, Cancelled, Interface, JoinError, Packet, RecvError, attachments, block_on, pair, run};
+use fictionet::{
+    AttachError, Cancelled, Interface, JoinError, Packet, RecvError, attachments, block_on, pair,
+    run,
+};
 
 #[derive(Debug)]
 struct Boom(&'static str);
@@ -173,14 +176,20 @@ fn cancellation_ends_every_wait() {
             let (port, _other) = pair();
             let r8 = r.clone();
             fcx.spawn(move |fcx| async move {
-                let mut ports = fictionet::stdlib::ports::Ports::new(vec![Box::new(port) as Box<dyn Interface>]);
+                let mut ports =
+                    fictionet::stdlib::ports::Ports::new(
+                        vec![Box::new(port) as Box<dyn Interface>],
+                    );
                 let res = ports.next(&fcx, None, |_| std::task::Poll::Pending).await;
                 r8.lock().unwrap().push(format!("ports {:?}", res.err()));
                 Ok(())
             });
             let r9 = r.clone();
             fcx.spawn(move |fcx| async move {
-                let res = fcx.events().wait(&fcx, 1, Duration::from_secs(60), |_| false).await;
+                let res = fcx
+                    .events()
+                    .wait(&fcx, 1, Duration::from_secs(60), |_| false)
+                    .await;
                 r9.lock().unwrap().push(format!("events {:?}", res.err()));
                 Ok(())
             });
@@ -279,12 +288,17 @@ fn join_returns_what_the_work_returned() {
     // The joiner holds the task's own error, the one `run` returns: the
     // same value, not a copy of its message.
     let out = out.unwrap_err();
-    let Some(Err(JoinError::Failed(e))) = joined else { panic!("{joined:?}") };
+    let Some(Err(JoinError::Failed(e))) = joined else {
+        panic!("{joined:?}")
+    };
     assert_eq!(e.downcast_ref::<Boom>().map(|b| b.0), Some("bad"));
     assert!(std::ptr::addr_eq(&*e, &*out));
     let joined = JoinError::Failed(e);
     assert_eq!(joined.to_string(), "the task failed");
-    assert_eq!(fictionet::ErrorChain(&joined).to_string(), "the task failed: bad");
+    assert_eq!(
+        fictionet::ErrorChain(&joined).to_string(),
+        "the task failed: bad"
+    );
     assert!(std::error::Error::source(&joined).is_some_and(|s| s.is::<Boom>()));
 }
 
@@ -397,7 +411,10 @@ fn boxed_interfaces_work() {
 fn attacher_name_rules() {
     let (attacher, mut attachments) = attachments();
     assert_eq!(attacher.attach("").unwrap_err(), AttachError::BadName);
-    assert_eq!(attacher.attach(&"x".repeat(256)).unwrap_err(), AttachError::BadName);
+    assert_eq!(
+        attacher.attach(&"x".repeat(256)).unwrap_err(),
+        AttachError::BadName
+    );
     let long = attacher.attach(&"x".repeat(255)).unwrap();
     let abc = attacher.attach("abc").unwrap();
     let clone = attacher.clone();
@@ -517,7 +534,12 @@ fn cancellation_reaches_waits_outside_the_run() {
             let outside = fcx.clone();
             let (mut a, _b) = pair();
             std::thread::spawn(move || {
-                let res = block_on(async { (outside.sleep(Duration::from_secs(60)).await, a.recv(&outside).await) });
+                let res = block_on(async {
+                    (
+                        outside.sleep(Duration::from_secs(60)).await,
+                        a.recv(&outside).await,
+                    )
+                });
                 tx.send(res).unwrap();
             });
             fcx.sleep(ms(20)).await?;
@@ -534,7 +556,11 @@ fn cancellation_reaches_waits_outside_the_run() {
 /// tokio tasks next to it.
 #[test]
 fn runs_on_tokio() {
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_time().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_time()
+        .build()
+        .unwrap();
     rt.block_on(async {
         let (mut inside, mut outside) = pair();
         let echo = tokio::spawn(run(move |fcx| async move {
@@ -592,7 +618,11 @@ fn many_waits_outside_the_run_stay_idle() {
     // waits end by the cancel, not by a closed cable.
     let keep = Arc::new(Mutex::new(Vec::new()));
     let k = keep.clone();
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_time().build().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_time()
+        .build()
+        .unwrap();
     let out = rt.block_on(async move {
         tokio::spawn(run(move |fcx| async move {
             for _ in 0..WAITERS {
@@ -614,7 +644,11 @@ fn many_waits_outside_the_run_stay_idle() {
             let settled = p.load(Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(300)).await;
             let later = p.load(Ordering::SeqCst);
-            assert!(later - settled < 10, "{} polls of idle waits in 300 ms", later - settled);
+            assert!(
+                later - settled < 10,
+                "{} polls of idle waits in 300 ms",
+                later - settled
+            );
             Err(Boom("stop").into())
         }))
         .await
@@ -646,11 +680,15 @@ fn dropping_the_run_ends_waits_outside_it() {
                 let mut ready_tx = Some(ready_tx);
                 let joined = std::future::poll_fn(|cx| {
                     let result = join.as_mut().poll(cx);
-                    if result.is_pending() && let Some(tx) = ready_tx.take() {
+                    if result.is_pending()
+                        && let Some(tx) = ready_tx.take()
+                    {
                         tx.send(()).unwrap();
                     }
                     result
-                }).await.map_err(|e| e.to_string());
+                })
+                .await
+                .map_err(|e| e.to_string());
                 outside.cancelled().await;
                 joined
             });
@@ -663,9 +701,13 @@ fn dropping_the_run_ends_waits_outside_it() {
     for _ in 0..3 {
         assert!(future.as_mut().poll(&mut cx).is_pending());
     }
-    ready_rx.recv_timeout(Duration::from_secs(5)).expect("the outside join was not polled");
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the outside join was not polled");
     drop(future);
-    let res = rx.recv_timeout(Duration::from_secs(5)).expect("a wait outside the run did not end");
+    let res = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a wait outside the run did not end");
     assert_eq!(res, Err("the join stopped".to_owned()));
 }
 
@@ -752,7 +794,10 @@ fn cancel_from_another_thread_stops_the_run() {
 
 #[test]
 fn an_outside_wait_raced_against_cancelled_ends() {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let out = runtime.block_on(async {
         let world = run(|fcx| async move {
             fcx.spawn(|fcx| async move {
@@ -792,7 +837,9 @@ fn a_joiner_that_cancels_after_a_failure_keeps_the_error() {
             let watcher = fcx.clone();
             std::thread::spawn(move || {
                 let mut join = std::pin::pin!(task.join(&watcher));
-                let _ = join.as_mut().poll(&mut std::task::Context::from_waker(&waker));
+                let _ = join
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(&waker));
                 drop(ready);
                 block_on(watcher.cancelled());
             });
@@ -830,10 +877,19 @@ fn a_cancel_woken_by_dropping_a_failed_task_keeps_the_error() {
             });
             Ok(())
         }));
-        assert!(world.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            world
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         let fcx = rx.recv().unwrap();
         let wake = Waker::from(Arc::new(CancelOnWake(fcx.clone())));
-        assert!(outside.poll_recv(&fcx, &mut Context::from_waker(&wake)).is_pending());
+        assert!(
+            outside
+                .poll_recv(&fcx, &mut Context::from_waker(&wake))
+                .is_pending()
+        );
         block_on(world)
     });
     assert_eq!(out.unwrap_err().to_string(), "failed while holding a link");
@@ -855,7 +911,9 @@ fn a_joiner_outside_the_run_gets_the_message_of_a_failed_task() {
     }
     impl RePoll {
         fn poll(&self, wake: &Waker) {
-            let Some(mut job) = self.job.lock().unwrap().take() else { return };
+            let Some(mut job) = self.job.lock().unwrap().take() else {
+                return;
+            };
             match job.as_mut().poll(&mut Context::from_waker(wake)) {
                 Poll::Ready(value) => {
                     *self.result.lock().unwrap() = Some(match value {
@@ -881,7 +939,12 @@ fn a_joiner_outside_the_run_gets_the_message_of_a_failed_task() {
             fcx.cancelled().await;
             Ok(())
         }));
-        assert!(world.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            world
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         let (task, fcx) = rx.recv().unwrap();
         let watcher = Arc::new(RePoll {
             job: Mutex::new(Some(Box::pin(async move { task.join(&fcx).await }))),

@@ -2280,14 +2280,12 @@ impl MountResponse {
                 }),
                 Some(e) => Err(e),
             }),
-            mount_procedure::DUMP => {
-                MountResponse::Dump(r.list(MAX_MOUNTS, usize::MAX, |r| {
-                    Ok(MountEntry {
-                        hostname: read_mount_name(r)?,
-                        directory: read_path(r)?,
-                    })
-                })?)
-            }
+            mount_procedure::DUMP => MountResponse::Dump(r.list(MAX_MOUNTS, usize::MAX, |r| {
+                Ok(MountEntry {
+                    hostname: read_mount_name(r)?,
+                    directory: read_path(r)?,
+                })
+            })?),
             mount_procedure::UMNT => MountResponse::Umnt,
             mount_procedure::UMNTALL => MountResponse::UmntAll,
             mount_procedure::EXPORT => {
@@ -2490,14 +2488,14 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::harness::check;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Assembled, Wire};
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support;
     use fictionet::stdlib::onc_rpc::{Body, MAX_RECORD, Record, records};
+    use fictionet::stdlib::test_support;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
 
     fn fh(b: &[u8]) -> FileHandle {
         FileHandle(b.to_vec())
@@ -2850,10 +2848,7 @@ mod tests {
                 case_insensitive: false,
                 case_preserving: true,
             })),
-            Response::PathConf(Err((
-                Status::Other(NonZeroU32::new(12345).unwrap()),
-                None,
-            ))),
+            Response::PathConf(Err((Status::Other(NonZeroU32::new(12345).unwrap()), None))),
             Response::Commit(Ok(CommitOk {
                 wcc: wcc(),
                 verf: [3; 8],
@@ -3089,8 +3084,8 @@ mod tests {
     fn requests_compose_with_codec_records() {
         use fictionet::stdlib::{
             codec::{Decode, Wire},
-            test_support::contract,
             onc_rpc,
+            test_support::contract,
         };
 
         const RECORD_LIMIT: usize = 4096;

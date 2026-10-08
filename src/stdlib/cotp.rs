@@ -263,11 +263,7 @@ impl Variable {
             Variable::Parameters(params) => {
                 let mut left = room;
                 for p in params {
-                    let need = p
-                        .value
-                        .len()
-                        .checked_add(2)
-                        .ok_or(Error::Unwritable)?;
+                    let need = p.value.len().checked_add(2).ok_or(Error::Unwritable)?;
                     if p.value.len() > MAX_PARAMETER || need > left {
                         return Err(Error::Unwritable);
                     }
@@ -795,7 +791,7 @@ pub mod over_tpkt {
 /// TPKT already bounds each payload to [`MAX_TPDU`], so only the standalone
 /// [`Wire`] parser needs [`Error::TpduTooLong`]. Framing errors are
 /// [`tpkt::Error`].
-pub type Tpdus = Map<Frames::<tpkt::Packet>, fn(tpkt::Packet) -> Result<Tpdu, Error>>;
+pub type Tpdus = Map<Frames<tpkt::Packet>, fn(tpkt::Packet) -> Result<Tpdu, Error>>;
 
 /// Creates a TPDU decoder with a TPKT packet limit, including its header.
 /// Clamps `packet_limit` to [`tpkt::MIN_PACKET`] through [`tpkt::MAX_PACKET`].
@@ -815,8 +811,7 @@ pub fn tpdus(packet_limit: usize) -> Tpdus {
 /// EOF before EOT reports [`fictionet::stdlib::codec::AssembleError::Incomplete`], even
 /// for an empty fragment. A torn TPKT reports [`fictionet::stdlib::codec::Fail::Truncated`].
 /// Framing errors and message overflow end the stream.
-pub type Messages =
-    Assemble<Tpdus, fn(Result<Tpdu, Error>) -> Fragment<Result<Tpdu, Error>>>;
+pub type Messages = Assemble<Tpdus, fn(Result<Tpdu, Error>) -> Fragment<Result<Tpdu, Error>>>;
 
 /// Creates a TPKT, TPDU, and message decoder with separate size limits.
 ///
@@ -1011,12 +1006,10 @@ pub fn segment(message: &[u8], tpdu_size: usize) -> Vec<Data> {
 
 #[cfg(test)]
 mod codec_tests {
-    use fictionet::stdlib::codec::{
-        AssembleError, Assembled, Fail, Stream, finish, pump,
-    };
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support;
     use super::*;
+    use fictionet::stdlib::codec::{AssembleError, Assembled, Fail, Stream, finish, pump};
+    use fictionet::stdlib::test_support;
+    use fictionet::stdlib::test_support::contract;
 
     fn strict_packet(tpdu: &Tpdu) -> tpkt::Packet {
         tpkt::Packet {
@@ -1404,12 +1397,12 @@ mod codec_tests {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use tpkt::{MAX_PACKET, MAX_PAYLOAD, Packet};
 
     // An RDP connection request (MS-RDPBCGR 4.1.1) starts with a TPKT
@@ -1461,10 +1454,7 @@ mod tests {
             over_tpkt::from_tpdu(&data(65529, 0)),
             Err(Error::Unwritable)
         );
-        assert_eq!(
-            over_tpkt::from_tpdu(&data(0, 0x80)),
-            Err(Error::Unwritable)
-        );
+        assert_eq!(over_tpkt::from_tpdu(&data(0, 0x80)), Err(Error::Unwritable));
         let connect = |f: &dyn Fn(&mut Connect)| {
             let mut c = Connect::request(7);
             f(&mut c);
@@ -1472,18 +1462,9 @@ mod tests {
         };
         assert!(connect(&|_| ()).is_ok());
         assert!(connect(&|c| c.credit = 15).is_ok());
-        assert_eq!(
-            connect(&|c| c.credit = 16),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            connect(&|c| c.class = 16),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            connect(&|c| c.options = 16),
-            Err(Error::Unwritable)
-        );
+        assert_eq!(connect(&|c| c.credit = 16), Err(Error::Unwritable));
+        assert_eq!(connect(&|c| c.class = 16), Err(Error::Unwritable));
+        assert_eq!(connect(&|c| c.options = 16), Err(Error::Unwritable));
         // A parameter longer than its length byte, or more than a header holds.
         assert_eq!(
             connect(&|c| c.variable.set(0xc1, vec![0; 256])),
@@ -1526,7 +1507,11 @@ mod tests {
             rng.fill(&mut message);
             for tpdu_size in [0usize, 128, 1024, 8192, MAX_PAYLOAD, usize::MAX] {
                 let bytes = over_tpkt::write_message(&message, tpdu_size).unwrap();
-                contract::check_decode_with_alloc_limit(Frames::<tpkt::Packet>::new, &bytes, 2 * MAX_PACKET);
+                contract::check_decode_with_alloc_limit(
+                    Frames::<tpkt::Packet>::new,
+                    &bytes,
+                    2 * MAX_PACKET,
+                );
                 let (packets, err) = test_support::decode_all(Frames::<tpkt::Packet>::new, &bytes);
                 assert_eq!(err, None);
                 let mut r = Reassembler::new();
@@ -1607,7 +1592,11 @@ mod tests {
         );
         // Every prefix is incomplete, not an error.
         for n in 0..packet.len() {
-            assert_eq!(tpkt::Packet::parse_prefix(&packet[..n]), Ok(None), "{n} bytes");
+            assert_eq!(
+                tpkt::Packet::parse_prefix(&packet[..n]),
+                Ok(None),
+                "{n} bytes"
+            );
         }
         // Extra bytes after the packet are left alone.
         let mut longer = packet.to_vec();
@@ -1987,10 +1976,7 @@ mod tests {
     #[test]
     fn tpdu_errors() {
         assert_eq!(Tpdu::parse(&[]), Err(Error::Empty));
-        assert_eq!(
-            Tpdu::parse(&[255, 0xf0]),
-            Err(Error::LengthIndicator(255))
-        );
+        assert_eq!(Tpdu::parse(&[255, 0xf0]), Err(Error::LengthIndicator(255)));
         assert_eq!(Tpdu::parse(&[0]), Err(Error::Unsupported(0)));
         assert_eq!(
             Tpdu::parse(&[6, 0xe0, 0]),
@@ -2057,7 +2043,11 @@ mod tests {
         ];
         for p in &packets {
             for n in 0..p.len() {
-                assert_eq!(tpkt::Packet::parse_prefix(&p[..n]), Ok(None), "{n} of {p:?}");
+                assert_eq!(
+                    tpkt::Packet::parse_prefix(&p[..n]),
+                    Ok(None),
+                    "{n} of {p:?}"
+                );
                 let mut d = Stream::new(Frames::<tpkt::Packet>::new());
                 assert_eq!(d.push(&p[..n]), n);
                 assert_eq!(d.next(), None);
@@ -2166,7 +2156,10 @@ mod tests {
         // Past the limit: one error, the rest of the message dropped.
         let mut r = Reassembler::with_limit(4);
         assert_eq!(r.push(&seg(false, b"abc")), Ok(None));
-        assert_eq!(r.push(&seg(false, b"de")), Err(Error::OverLimit { limit: 4 }));
+        assert_eq!(
+            r.push(&seg(false, b"de")),
+            Err(Error::OverLimit { limit: 4 })
+        );
         assert_eq!(r.pending(), 0);
         assert_eq!(r.push(&seg(false, b"x")), Ok(None));
         assert_eq!(r.push(&seg(true, b"y")), Ok(None));
@@ -2380,7 +2373,11 @@ mod tests {
         let one = packet.to_bytes().unwrap();
         let mut bytes = one.repeat(1000);
         bytes.extend_from_slice(&one[..10]);
-        contract::check_decode_with_alloc_limit(Frames::<tpkt::Packet>::new, &bytes, 2 * tpkt::MAX_PACKET);
+        contract::check_decode_with_alloc_limit(
+            Frames::<tpkt::Packet>::new,
+            &bytes,
+            2 * tpkt::MAX_PACKET,
+        );
         let mut stream = Stream::new(Frames::<tpkt::Packet>::new());
         let mut count = 0;
         pump(&mut stream, &bytes, |_| count += 1).unwrap();
@@ -2394,29 +2391,28 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
-        assert_linear("stream_takes_many_small_packets_in_linear_time", rounds(50_000), |size| {
-            let one = Tpdu::Data(Data {
-                eot: true,
-                number: 0,
-                data: vec![1],
-            })
-            .to_bytes()
-            .map(tpkt::Packet::new)
-            .unwrap()
-            .to_bytes()
-            .unwrap();
-            let stream: Vec<u8> = one
-                .iter()
-                .copied()
-                .cycle()
-                .take(one.len() * size)
-                .collect();
-            let mut d = Stream::new(Frames::<tpkt::Packet>::new());
-            let mut n = 0;
-            pump(&mut d, &stream, |_| n += 1).unwrap();
-            assert_eq!(n, size);
-            assert_eq!(d.buffered(), 0);
-        });
+        assert_linear(
+            "stream_takes_many_small_packets_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let one = Tpdu::Data(Data {
+                    eot: true,
+                    number: 0,
+                    data: vec![1],
+                })
+                .to_bytes()
+                .map(tpkt::Packet::new)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+                let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
+                let mut d = Stream::new(Frames::<tpkt::Packet>::new());
+                let mut n = 0;
+                pump(&mut d, &stream, |_| n += 1).unwrap();
+                assert_eq!(n, size);
+                assert_eq!(d.buffered(), 0);
+            },
+        );
     }
 
     /// The checks the fuzz target makes, on one buffer.

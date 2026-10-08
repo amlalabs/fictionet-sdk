@@ -13,8 +13,12 @@ use libfuzzer_sys::fuzz_target;
 fn router() -> Router {
     Router::new()
         .get("/", |_, _| http::Response::new(Bytes::from("home\n")))
-        .post("/echo", |_, r: http::Request<Bytes>| http::Response::new(r.into_body()))
-        .get("/files/*", |_, r| http::Response::new(Bytes::from(r.uri().path().to_owned())))
+        .post("/echo", |_, r: http::Request<Bytes>| {
+            http::Response::new(r.into_body())
+        })
+        .get("/files/*", |_, r| {
+            http::Response::new(Bytes::from(r.uri().path().to_owned()))
+        })
 }
 
 fn run(chunks: &[&[u8]]) -> (Vec<u8>, usize, bool) {
@@ -29,7 +33,9 @@ fn run(chunks: &[&[u8]]) -> (Vec<u8>, usize, bool) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Some((&cut, bytes)) = data.split_first() else { return };
+    let Some((&cut, bytes)) = data.split_first() else {
+        return;
+    };
     let at = usize::from(cut).min(bytes.len());
     let whole = run(&[bytes]);
     let split = run(&[&bytes[..at], &bytes[at..]]);

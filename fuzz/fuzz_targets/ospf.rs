@@ -6,27 +6,44 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::ospf::{
-    ALL_SPF_ROUTERS_V4, ALL_SPF_ROUTERS_V6, AsExternalLsa, AsExternalLsaV3, Auth, Body, DatabaseDescription,
-    Endpoints, ExternalRoute, Header, HelloV2, HelloV3, InterAreaPrefixLsa, InterAreaRouterLsa, IntraAreaPrefixLsa,
-    LSA_HEADER_LEN, LinkLsa, Lsa, LsaBody, LsaHeader, LsaKey, MAX_LSA, MAX_MESSAGE, MAX_PACKET, NetworkLsa,
-    NetworkLsaV3, OPTION_L_V2, OPTION_L_V3, Error, Packet, Prefix, RouterInterface, RouterLink, RouterLsa,
-    RouterLsaV3, SummaryLsa, TosMetric, Version, checksum, lsa_checksum, lsa_type_v2, lsa_type_v3,
+    ALL_SPF_ROUTERS_V4, ALL_SPF_ROUTERS_V6, AsExternalLsa, AsExternalLsaV3, Auth, Body,
+    DatabaseDescription, Endpoints, Error, ExternalRoute, Header, HelloV2, HelloV3,
+    InterAreaPrefixLsa, InterAreaRouterLsa, IntraAreaPrefixLsa, LSA_HEADER_LEN, LinkLsa, Lsa,
+    LsaBody, LsaHeader, LsaKey, MAX_LSA, MAX_MESSAGE, MAX_PACKET, NetworkLsa, NetworkLsaV3,
+    OPTION_L_V2, OPTION_L_V3, Packet, Prefix, RouterInterface, RouterLink, RouterLsa, RouterLsaV3,
+    SummaryLsa, TosMetric, Version, checksum, lsa_checksum, lsa_type_v2, lsa_type_v3,
 };
-use fictionet::stdlib::{codec::{Wire, Collect, Decode}, test_support::contract, ospf};
+use fictionet::stdlib::{
+    codec::{Collect, Decode, Wire},
+    ospf,
+    test_support::contract,
+};
 use libfuzzer_sys::fuzz_target;
 
 fn ends() -> [Endpoints; 2] {
     [
-        Endpoints::V4 { source: Ipv4Addr::new(10, 0, 0, 1), destination: ALL_SPF_ROUTERS_V4 },
-        Endpoints::V6 { source: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), destination: ALL_SPF_ROUTERS_V6 },
+        Endpoints::V4 {
+            source: Ipv4Addr::new(10, 0, 0, 1),
+            destination: ALL_SPF_ROUTERS_V4,
+        },
+        Endpoints::V6 {
+            source: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            destination: ALL_SPF_ROUTERS_V6,
+        },
     ]
 }
 
 fn check(data: &[u8], e: &Endpoints) {
-    contract::check_decode_with_alloc_limit(|| Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE), data, 2 * (ospf::MAX_MESSAGE + 1));
     contract::check_decode_with_alloc_limit(
-        || Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE)
-            .map(|datagram| Packet::parse(&datagram.0, e)),
+        || Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE),
+        data,
+        2 * (ospf::MAX_MESSAGE + 1),
+    );
+    contract::check_decode_with_alloc_limit(
+        || {
+            Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE)
+                .map(|datagram| Packet::parse(&datagram.0, e))
+        },
         data,
         2 * (ospf::MAX_MESSAGE + 1),
     );
@@ -57,7 +74,10 @@ fn check_lsa(data: &[u8], v: Version) {
         let bytes = lsa.frame(v).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(bytes, data[..n]);
         let h = lsa.header(v).unwrap();
-        assert_eq!((h.checksum, usize::from(h.length)), (u16::from_be_bytes([data[16], data[17]]), n));
+        assert_eq!(
+            (h.checksum, usize::from(h.length)),
+            (u16::from_be_bytes([data[16], data[17]]), n)
+        );
     }
     // The bytes after a header as a body, read directly: it is capped at
     // what an LSA holds, and a body read writes back to the same bytes.
@@ -68,7 +88,10 @@ fn check_lsa(data: &[u8], v: Version) {
             Version::V3 => u16::from_be_bytes([data[2], data[3]]),
         };
         match LsaBody::parse(body, v, t) {
-            Ok(b) => assert_eq!(b.frame(v, t).and_then(|frame| frame.to_bytes()).as_deref(), Ok(body)),
+            Ok(b) => assert_eq!(
+                b.frame(v, t).and_then(|frame| frame.to_bytes()).as_deref(),
+                Ok(body)
+            ),
             Err(e) => assert!(body.len() <= MAX_LSA - LSA_HEADER_LEN || e == Error::TooLong),
         }
     }
@@ -83,7 +106,11 @@ fn ip6(u: &mut Unstructured) -> Result<Ipv6Addr> {
 }
 
 /// A list of up to `max` items made by `f`.
-fn list<T>(u: &mut Unstructured, max: usize, mut f: impl FnMut(&mut Unstructured) -> Result<T>) -> Result<Vec<T>> {
+fn list<T>(
+    u: &mut Unstructured,
+    max: usize,
+    mut f: impl FnMut(&mut Unstructured) -> Result<T>,
+) -> Result<Vec<T>> {
     let n = u.int_in_range(0..=max)?;
     (0..n).map(|_| f(u)).collect()
 }
@@ -94,7 +121,11 @@ fn prefix(u: &mut Unstructured) -> Result<Prefix> {
     if u.arbitrary()? {
         Ok(Prefix::new(u.arbitrary()?, u.arbitrary()?, ip6(u)?))
     } else {
-        Ok(Prefix { length: u.arbitrary()?, options: u.arbitrary()?, address: ip6(u)? })
+        Ok(Prefix {
+            length: u.arbitrary()?,
+            options: u.arbitrary()?,
+            address: ip6(u)?,
+        })
     }
 }
 
@@ -113,14 +144,22 @@ fn lsa_body(u: &mut Unstructured, v: Version) -> Result<(u16, LsaBody)> {
                         data: ip4(u)?,
                         kind: u.arbitrary()?,
                         metric: u.arbitrary()?,
-                        tos: list(u, 300, |u| Ok(TosMetric { tos: u.arbitrary()?, metric: u.arbitrary()? }))?,
+                        tos: list(u, 300, |u| {
+                            Ok(TosMetric {
+                                tos: u.arbitrary()?,
+                                metric: u.arbitrary()?,
+                            })
+                        })?,
                     })
                 })?,
             }),
         ),
         (Version::V2, 1) => (
             lsa_type_v2::NETWORK,
-            LsaBody::Network(NetworkLsa { network_mask: ip4(u)?, attached_routers: list(u, 20, ip4)? }),
+            LsaBody::Network(NetworkLsa {
+                network_mask: ip4(u)?,
+                attached_routers: list(u, 20, ip4)?,
+            }),
         ),
         (Version::V2, 2) => (
             lsa_type_v2::SUMMARY_NETWORK,
@@ -163,11 +202,17 @@ fn lsa_body(u: &mut Unstructured, v: Version) -> Result<(u16, LsaBody)> {
         ),
         (Version::V3, 1) => (
             lsa_type_v3::NETWORK,
-            LsaBody::NetworkV3(NetworkLsaV3 { options: u.arbitrary()?, attached_routers: list(u, 20, ip4)? }),
+            LsaBody::NetworkV3(NetworkLsaV3 {
+                options: u.arbitrary()?,
+                attached_routers: list(u, 20, ip4)?,
+            }),
         ),
         (Version::V3, 2) => (
             lsa_type_v3::INTER_AREA_PREFIX,
-            LsaBody::InterAreaPrefix(InterAreaPrefixLsa { metric: u.arbitrary()?, prefix: prefix(u)? }),
+            LsaBody::InterAreaPrefix(InterAreaPrefixLsa {
+                metric: u.arbitrary()?,
+                prefix: prefix(u)?,
+            }),
         ),
         (Version::V3, 3) => (
             lsa_type_v3::INTER_AREA_ROUTER,
@@ -185,7 +230,11 @@ fn lsa_body(u: &mut Unstructured, v: Version) -> Result<(u16, LsaBody)> {
                 prefix: prefix(u)?,
                 forwarding_address: if u.arbitrary()? { Some(ip6(u)?) } else { None },
                 route_tag: u.arbitrary()?,
-                referenced: if u.arbitrary()? { Some((u.arbitrary()?, ip4(u)?)) } else { None },
+                referenced: if u.arbitrary()? {
+                    Some((u.arbitrary()?, ip4(u)?))
+                } else {
+                    None
+                },
             }),
         ),
         (Version::V3, 5) => {
@@ -223,7 +272,11 @@ fn lsa(u: &mut Unstructured, v: Version) -> Result<Lsa> {
     let (ls_type, body) = lsa_body(u, v)?;
     Ok(Lsa {
         age: u.arbitrary()?,
-        options: if v == Version::V2 || u.ratio(1, 8)? { u.arbitrary()? } else { 0 },
+        options: if v == Version::V2 || u.ratio(1, 8)? {
+            u.arbitrary()?
+        } else {
+            0
+        },
         ls_type,
         link_state_id: ip4(u)?,
         advertising_router: ip4(u)?,
@@ -276,7 +329,11 @@ fn packet(u: &mut Unstructured, v: Version) -> Result<Packet> {
             headers: list(u, 8, lsa_header)?,
         }),
         3 => Body::LinkStateRequest(list(u, 8, |u| {
-            Ok(LsaKey { ls_type: u.arbitrary()?, link_state_id: ip4(u)?, advertising_router: ip4(u)? })
+            Ok(LsaKey {
+                ls_type: u.arbitrary()?,
+                link_state_id: ip4(u)?,
+                advertising_router: ip4(u)?,
+            })
         })?),
         4 => Body::LinkStateUpdate(list(u, 4, |u| lsa(u, v))?),
         _ => Body::LinkStateAck(list(u, 8, lsa_header)?),
@@ -294,10 +351,15 @@ fn packet(u: &mut Unstructured, v: Version) -> Result<Packet> {
                         digest: u.bytes(n)?.to_vec(),
                     }
                 }
-                _ => Auth::Other { kind: u.arbitrary()?, data: u.arbitrary()? },
+                _ => Auth::Other {
+                    kind: u.arbitrary()?,
+                    data: u.arbitrary()?,
+                },
             },
         },
-        Version::V3 => Header::V3 { instance_id: u.arbitrary()? },
+        Version::V3 => Header::V3 {
+            instance_id: u.arbitrary()?,
+        },
     };
     // Sometimes a signaling block, usually with the L bit set to go with
     // it.
@@ -307,7 +369,11 @@ fn packet(u: &mut Unstructured, v: Version) -> Result<Packet> {
                 Body::HelloV2(h) => h.options |= OPTION_L_V2,
                 Body::HelloV3(h) => h.options |= OPTION_L_V3,
                 Body::DatabaseDescription(d) => {
-                    d.options |= if v == Version::V2 { u32::from(OPTION_L_V2) } else { OPTION_L_V3 }
+                    d.options |= if v == Version::V2 {
+                        u32::from(OPTION_L_V2)
+                    } else {
+                        OPTION_L_V3
+                    }
                 }
                 _ => {}
             }
@@ -317,14 +383,24 @@ fn packet(u: &mut Unstructured, v: Version) -> Result<Packet> {
     } else {
         None
     };
-    Ok(Packet { router_id: ip4(u)?, area_id: ip4(u)?, header, lls, body })
+    Ok(Packet {
+        router_id: ip4(u)?,
+        area_id: ip4(u)?,
+        header,
+        lls,
+        body,
+    })
 }
 
 /// Values a world builds: whatever a writer accepts reads back the same.
 fn built(data: &[u8]) -> Result<()> {
     let mut u = Unstructured::new(data);
     for e in &ends() {
-        let v = if u.ratio(1, 8)? { Version::V2 } else { e.version() };
+        let v = if u.ratio(1, 8)? {
+            Version::V2
+        } else {
+            e.version()
+        };
         let p = packet(&mut u, v)?;
         if let Ok(bytes) = p.frame(e).and_then(|frame| frame.to_bytes()) {
             assert!(bytes.len() <= MAX_MESSAGE);

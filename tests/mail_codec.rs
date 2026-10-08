@@ -1,10 +1,9 @@
 //! Mail line codecs, mode boundaries, literals, and strict wire values.
 
 use fictionet::stdlib::{
-    codec::{
-        self, Decode, Fail, Step, Stream, Wire,
-    }, test_support::contract,
+    codec::{self, Decode, Fail, Step, Stream, Wire},
     imap, pop3, smtp,
+    test_support::contract,
 };
 
 #[test]
@@ -450,7 +449,9 @@ fn imap_literal_refusal_zero_length_and_limits() {
         );
         assert!(matches!(
             read(imap::Inputs::new, bytes.as_bytes()).first(),
-            Some(Err(Fail::Protocol(imap::FrameError::LiteralTooLarge { .. })))
+            Some(Err(Fail::Protocol(
+                imap::FrameError::LiteralTooLarge { .. }
+            )))
         ));
     }
     for bytes in [
@@ -773,7 +774,9 @@ fn imap_line_text_and_literal_limits() {
     );
     assert!(matches!(
         read(imap::Inputs::new, bytes).as_slice(),
-        [Err(Fail::Protocol(imap::FrameError::LiteralTooLarge { .. }))]
+        [Err(Fail::Protocol(
+            imap::FrameError::LiteralTooLarge { .. }
+        ))]
     ));
     let broken = b"a X {2+}\r\n\0x\r\nb NOOP\r\n";
     contract::check_decode_with_alloc_limit(
@@ -880,10 +883,7 @@ fn assemblies_stop_at_named_body_limits() {
         let result = codec::pump(&mut smtp, &line, |_| panic!("no terminator sent"));
         assert!(smtp.held() <= smtp::MAX_DATA);
         if let Err(error) = result {
-            assert_eq!(
-                error,
-                Fail::Protocol(smtp::FrameError::TooMuchData)
-            );
+            assert_eq!(error, Fail::Protocol(smtp::FrameError::TooMuchData));
             break;
         }
     }
@@ -931,7 +931,9 @@ fn imap_aggregate_literals_stop_at_the_message_limit() {
     contract::check_decode_with_held_limit(imap::Responses::new, &wire, imap::MAX_HELD);
     assert!(matches!(
         read(imap::Responses::new, &wire).as_slice(),
-        [Err(Fail::Protocol(imap::FrameError::LiteralTooLarge { .. }))]
+        [Err(Fail::Protocol(
+            imap::FrameError::LiteralTooLarge { .. }
+        ))]
     ));
 }
 
@@ -951,10 +953,7 @@ fn smtp_long_command_recovers() {
 fn pop3_long_command_recovers() {
     let bytes = [vec![b'X'; 300], b"\r\nNOOP\r\n".to_vec()].concat();
     let items = read(pop3::Inputs::new, &bytes);
-    assert_eq!(
-        items.first(),
-        Some(&Ok(Err(pop3::Error::LineTooLong)))
-    );
+    assert_eq!(items.first(), Some(&Ok(Err(pop3::Error::LineTooLong))));
     assert!(matches!(items.get(1), Some(Ok(Ok(_)))));
     assert_eq!(items.len(), 2);
 }
@@ -1134,10 +1133,7 @@ fn raw_line_modes_require_boundaries() {
 
     let mut commands = Stream::new(pop3::Inputs::new());
     assert_eq!(commands.push(&[b'X'; 300]), 300);
-    assert_eq!(
-        commands.next(),
-        Some(Ok(Err(pop3::Error::LineTooLong)))
-    );
+    assert_eq!(commands.next(), Some(Ok(Err(pop3::Error::LineTooLong))));
     assert_eq!(
         commands.decoder().expect_line(),
         Err(pop3::FrameError::State)
@@ -1484,8 +1480,7 @@ fn smtp_data_line_overflow_has_one_fatal_shape() {
     }
 }
 
-type Pop3ReplyItems =
-    Vec<Result<Result<pop3::Output, pop3::Error>, Fail<pop3::FrameError>>>;
+type Pop3ReplyItems = Vec<Result<Result<pop3::Output, pop3::Error>, Fail<pop3::FrameError>>>;
 
 /// Reads `bytes` as a client that reads the greeting, then sends `AUTH`
 /// with one raw line selected and `LIST` behind it. Gives the items and the

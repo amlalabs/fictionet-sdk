@@ -273,19 +273,37 @@ const OPERATION_NAMES: &[(u16, &str)] = &[
     (operation::PURGE_JOBS, "Purge-Jobs"),
     (operation::SET_PRINTER_ATTRIBUTES, "Set-Printer-Attributes"),
     (operation::SET_JOB_ATTRIBUTES, "Set-Job-Attributes"),
-    (operation::GET_PRINTER_SUPPORTED_VALUES, "Get-Printer-Supported-Values"),
-    (operation::CREATE_PRINTER_SUBSCRIPTIONS, "Create-Printer-Subscriptions"),
-    (operation::CREATE_JOB_SUBSCRIPTIONS, "Create-Job-Subscriptions"),
-    (operation::GET_SUBSCRIPTION_ATTRIBUTES, "Get-Subscription-Attributes"),
+    (
+        operation::GET_PRINTER_SUPPORTED_VALUES,
+        "Get-Printer-Supported-Values",
+    ),
+    (
+        operation::CREATE_PRINTER_SUBSCRIPTIONS,
+        "Create-Printer-Subscriptions",
+    ),
+    (
+        operation::CREATE_JOB_SUBSCRIPTIONS,
+        "Create-Job-Subscriptions",
+    ),
+    (
+        operation::GET_SUBSCRIPTION_ATTRIBUTES,
+        "Get-Subscription-Attributes",
+    ),
     (operation::GET_SUBSCRIPTIONS, "Get-Subscriptions"),
     (operation::RENEW_SUBSCRIPTION, "Renew-Subscription"),
     (operation::CANCEL_SUBSCRIPTION, "Cancel-Subscription"),
     (operation::GET_NOTIFICATIONS, "Get-Notifications"),
-    (operation::GET_RESOURCE_ATTRIBUTES, "Get-Resource-Attributes"),
+    (
+        operation::GET_RESOURCE_ATTRIBUTES,
+        "Get-Resource-Attributes",
+    ),
     (operation::GET_RESOURCES, "Get-Resources"),
     (operation::ENABLE_PRINTER, "Enable-Printer"),
     (operation::DISABLE_PRINTER, "Disable-Printer"),
-    (operation::PAUSE_PRINTER_AFTER_CURRENT_JOB, "Pause-Printer-After-Current-Job"),
+    (
+        operation::PAUSE_PRINTER_AFTER_CURRENT_JOB,
+        "Pause-Printer-After-Current-Job",
+    ),
     (operation::HOLD_NEW_JOBS, "Hold-New-Jobs"),
     (operation::RELEASE_HELD_NEW_JOBS, "Release-Held-New-Jobs"),
     (operation::DEACTIVATE_PRINTER, "Deactivate-Printer"),
@@ -300,10 +318,16 @@ const OPERATION_NAMES: &[(u16, &str)] = &[
     (operation::PROMOTE_JOB, "Promote-Job"),
     (operation::SCHEDULE_JOB_AFTER, "Schedule-Job-After"),
     (operation::CANCEL_DOCUMENT, "Cancel-Document"),
-    (operation::GET_DOCUMENT_ATTRIBUTES, "Get-Document-Attributes"),
+    (
+        operation::GET_DOCUMENT_ATTRIBUTES,
+        "Get-Document-Attributes",
+    ),
     (operation::GET_DOCUMENTS, "Get-Documents"),
     (operation::DELETE_DOCUMENT, "Delete-Document"),
-    (operation::SET_DOCUMENT_ATTRIBUTES, "Set-Document-Attributes"),
+    (
+        operation::SET_DOCUMENT_ATTRIBUTES,
+        "Set-Document-Attributes",
+    ),
     (operation::CANCEL_JOBS, "Cancel-Jobs"),
     (operation::CANCEL_MY_JOBS, "Cancel-My-Jobs"),
     (operation::RESUBMIT_JOB, "Resubmit-Job"),
@@ -314,77 +338,218 @@ const OPERATION_NAMES: &[(u16, &str)] = &[
 
 const STATUS_NAMES: &[(u16, &str)] = &[
     (status::SUCCESSFUL_OK, "successful-ok"),
-    (status::SUCCESSFUL_OK_IGNORED_OR_SUBSTITUTED_ATTRIBUTES, "successful-ok-ignored-or-substituted-attributes"),
-    (status::SUCCESSFUL_OK_CONFLICTING_ATTRIBUTES, "successful-ok-conflicting-attributes"),
-    (status::SUCCESSFUL_OK_IGNORED_SUBSCRIPTIONS, "successful-ok-ignored-subscriptions"),
-    (status::SUCCESSFUL_OK_TOO_MANY_EVENTS, "successful-ok-too-many-events"),
-    (status::SUCCESSFUL_OK_EVENTS_COMPLETE, "successful-ok-events-complete"),
+    (
+        status::SUCCESSFUL_OK_IGNORED_OR_SUBSTITUTED_ATTRIBUTES,
+        "successful-ok-ignored-or-substituted-attributes",
+    ),
+    (
+        status::SUCCESSFUL_OK_CONFLICTING_ATTRIBUTES,
+        "successful-ok-conflicting-attributes",
+    ),
+    (
+        status::SUCCESSFUL_OK_IGNORED_SUBSCRIPTIONS,
+        "successful-ok-ignored-subscriptions",
+    ),
+    (
+        status::SUCCESSFUL_OK_TOO_MANY_EVENTS,
+        "successful-ok-too-many-events",
+    ),
+    (
+        status::SUCCESSFUL_OK_EVENTS_COMPLETE,
+        "successful-ok-events-complete",
+    ),
     (status::CLIENT_ERROR_BAD_REQUEST, "client-error-bad-request"),
     (status::CLIENT_ERROR_FORBIDDEN, "client-error-forbidden"),
-    (status::CLIENT_ERROR_NOT_AUTHENTICATED, "client-error-not-authenticated"),
-    (status::CLIENT_ERROR_NOT_AUTHORIZED, "client-error-not-authorized"),
-    (status::CLIENT_ERROR_NOT_POSSIBLE, "client-error-not-possible"),
+    (
+        status::CLIENT_ERROR_NOT_AUTHENTICATED,
+        "client-error-not-authenticated",
+    ),
+    (
+        status::CLIENT_ERROR_NOT_AUTHORIZED,
+        "client-error-not-authorized",
+    ),
+    (
+        status::CLIENT_ERROR_NOT_POSSIBLE,
+        "client-error-not-possible",
+    ),
     (status::CLIENT_ERROR_TIMEOUT, "client-error-timeout"),
     (status::CLIENT_ERROR_NOT_FOUND, "client-error-not-found"),
     (status::CLIENT_ERROR_GONE, "client-error-gone"),
-    (status::CLIENT_ERROR_REQUEST_ENTITY_TOO_LARGE, "client-error-request-entity-too-large"),
-    (status::CLIENT_ERROR_REQUEST_VALUE_TOO_LONG, "client-error-request-value-too-long"),
-    (status::CLIENT_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED, "client-error-document-format-not-supported"),
-    (status::CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED, "client-error-attributes-or-values-not-supported"),
-    (status::CLIENT_ERROR_URI_SCHEME_NOT_SUPPORTED, "client-error-uri-scheme-not-supported"),
-    (status::CLIENT_ERROR_CHARSET_NOT_SUPPORTED, "client-error-charset-not-supported"),
-    (status::CLIENT_ERROR_CONFLICTING_ATTRIBUTES, "client-error-conflicting-attributes"),
-    (status::CLIENT_ERROR_COMPRESSION_NOT_SUPPORTED, "client-error-compression-not-supported"),
-    (status::CLIENT_ERROR_COMPRESSION_ERROR, "client-error-compression-error"),
-    (status::CLIENT_ERROR_DOCUMENT_FORMAT_ERROR, "client-error-document-format-error"),
-    (status::CLIENT_ERROR_DOCUMENT_ACCESS_ERROR, "client-error-document-access-error"),
-    (status::CLIENT_ERROR_ATTRIBUTES_NOT_SETTABLE, "client-error-attributes-not-settable"),
-    (status::CLIENT_ERROR_IGNORED_ALL_SUBSCRIPTIONS, "client-error-ignored-all-subscriptions"),
-    (status::CLIENT_ERROR_TOO_MANY_SUBSCRIPTIONS, "client-error-too-many-subscriptions"),
-    (status::CLIENT_ERROR_DOCUMENT_PASSWORD_ERROR, "client-error-document-password-error"),
-    (status::CLIENT_ERROR_DOCUMENT_PERMISSION_ERROR, "client-error-document-permission-error"),
-    (status::CLIENT_ERROR_DOCUMENT_SECURITY_ERROR, "client-error-document-security-error"),
-    (status::CLIENT_ERROR_DOCUMENT_UNPRINTABLE_ERROR, "client-error-document-unprintable-error"),
-    (status::CLIENT_ERROR_ACCOUNT_INFO_NEEDED, "client-error-account-info-needed"),
-    (status::CLIENT_ERROR_ACCOUNT_CLOSED, "client-error-account-closed"),
-    (status::CLIENT_ERROR_ACCOUNT_LIMIT_REACHED, "client-error-account-limit-reached"),
-    (status::CLIENT_ERROR_ACCOUNT_AUTHORIZATION_FAILED, "client-error-account-authorization-failed"),
-    (status::CLIENT_ERROR_NOT_FETCHABLE, "client-error-not-fetchable"),
-    (status::SERVER_ERROR_INTERNAL_ERROR, "server-error-internal-error"),
-    (status::SERVER_ERROR_OPERATION_NOT_SUPPORTED, "server-error-operation-not-supported"),
-    (status::SERVER_ERROR_SERVICE_UNAVAILABLE, "server-error-service-unavailable"),
-    (status::SERVER_ERROR_VERSION_NOT_SUPPORTED, "server-error-version-not-supported"),
-    (status::SERVER_ERROR_DEVICE_ERROR, "server-error-device-error"),
-    (status::SERVER_ERROR_TEMPORARY_ERROR, "server-error-temporary-error"),
-    (status::SERVER_ERROR_NOT_ACCEPTING_JOBS, "server-error-not-accepting-jobs"),
+    (
+        status::CLIENT_ERROR_REQUEST_ENTITY_TOO_LARGE,
+        "client-error-request-entity-too-large",
+    ),
+    (
+        status::CLIENT_ERROR_REQUEST_VALUE_TOO_LONG,
+        "client-error-request-value-too-long",
+    ),
+    (
+        status::CLIENT_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED,
+        "client-error-document-format-not-supported",
+    ),
+    (
+        status::CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+        "client-error-attributes-or-values-not-supported",
+    ),
+    (
+        status::CLIENT_ERROR_URI_SCHEME_NOT_SUPPORTED,
+        "client-error-uri-scheme-not-supported",
+    ),
+    (
+        status::CLIENT_ERROR_CHARSET_NOT_SUPPORTED,
+        "client-error-charset-not-supported",
+    ),
+    (
+        status::CLIENT_ERROR_CONFLICTING_ATTRIBUTES,
+        "client-error-conflicting-attributes",
+    ),
+    (
+        status::CLIENT_ERROR_COMPRESSION_NOT_SUPPORTED,
+        "client-error-compression-not-supported",
+    ),
+    (
+        status::CLIENT_ERROR_COMPRESSION_ERROR,
+        "client-error-compression-error",
+    ),
+    (
+        status::CLIENT_ERROR_DOCUMENT_FORMAT_ERROR,
+        "client-error-document-format-error",
+    ),
+    (
+        status::CLIENT_ERROR_DOCUMENT_ACCESS_ERROR,
+        "client-error-document-access-error",
+    ),
+    (
+        status::CLIENT_ERROR_ATTRIBUTES_NOT_SETTABLE,
+        "client-error-attributes-not-settable",
+    ),
+    (
+        status::CLIENT_ERROR_IGNORED_ALL_SUBSCRIPTIONS,
+        "client-error-ignored-all-subscriptions",
+    ),
+    (
+        status::CLIENT_ERROR_TOO_MANY_SUBSCRIPTIONS,
+        "client-error-too-many-subscriptions",
+    ),
+    (
+        status::CLIENT_ERROR_DOCUMENT_PASSWORD_ERROR,
+        "client-error-document-password-error",
+    ),
+    (
+        status::CLIENT_ERROR_DOCUMENT_PERMISSION_ERROR,
+        "client-error-document-permission-error",
+    ),
+    (
+        status::CLIENT_ERROR_DOCUMENT_SECURITY_ERROR,
+        "client-error-document-security-error",
+    ),
+    (
+        status::CLIENT_ERROR_DOCUMENT_UNPRINTABLE_ERROR,
+        "client-error-document-unprintable-error",
+    ),
+    (
+        status::CLIENT_ERROR_ACCOUNT_INFO_NEEDED,
+        "client-error-account-info-needed",
+    ),
+    (
+        status::CLIENT_ERROR_ACCOUNT_CLOSED,
+        "client-error-account-closed",
+    ),
+    (
+        status::CLIENT_ERROR_ACCOUNT_LIMIT_REACHED,
+        "client-error-account-limit-reached",
+    ),
+    (
+        status::CLIENT_ERROR_ACCOUNT_AUTHORIZATION_FAILED,
+        "client-error-account-authorization-failed",
+    ),
+    (
+        status::CLIENT_ERROR_NOT_FETCHABLE,
+        "client-error-not-fetchable",
+    ),
+    (
+        status::SERVER_ERROR_INTERNAL_ERROR,
+        "server-error-internal-error",
+    ),
+    (
+        status::SERVER_ERROR_OPERATION_NOT_SUPPORTED,
+        "server-error-operation-not-supported",
+    ),
+    (
+        status::SERVER_ERROR_SERVICE_UNAVAILABLE,
+        "server-error-service-unavailable",
+    ),
+    (
+        status::SERVER_ERROR_VERSION_NOT_SUPPORTED,
+        "server-error-version-not-supported",
+    ),
+    (
+        status::SERVER_ERROR_DEVICE_ERROR,
+        "server-error-device-error",
+    ),
+    (
+        status::SERVER_ERROR_TEMPORARY_ERROR,
+        "server-error-temporary-error",
+    ),
+    (
+        status::SERVER_ERROR_NOT_ACCEPTING_JOBS,
+        "server-error-not-accepting-jobs",
+    ),
     (status::SERVER_ERROR_BUSY, "server-error-busy"),
-    (status::SERVER_ERROR_JOB_CANCELED, "server-error-job-canceled"),
-    (status::SERVER_ERROR_MULTIPLE_DOCUMENT_JOBS_NOT_SUPPORTED, "server-error-multiple-document-jobs-not-supported"),
-    (status::SERVER_ERROR_PRINTER_IS_DEACTIVATED, "server-error-printer-is-deactivated"),
-    (status::SERVER_ERROR_TOO_MANY_JOBS, "server-error-too-many-jobs"),
-    (status::SERVER_ERROR_TOO_MANY_DOCUMENTS, "server-error-too-many-documents"),
+    (
+        status::SERVER_ERROR_JOB_CANCELED,
+        "server-error-job-canceled",
+    ),
+    (
+        status::SERVER_ERROR_MULTIPLE_DOCUMENT_JOBS_NOT_SUPPORTED,
+        "server-error-multiple-document-jobs-not-supported",
+    ),
+    (
+        status::SERVER_ERROR_PRINTER_IS_DEACTIVATED,
+        "server-error-printer-is-deactivated",
+    ),
+    (
+        status::SERVER_ERROR_TOO_MANY_JOBS,
+        "server-error-too-many-jobs",
+    ),
+    (
+        status::SERVER_ERROR_TOO_MANY_DOCUMENTS,
+        "server-error-too-many-documents",
+    ),
 ];
 
 /// The registered name of an operation ID, such as `"Print-Job"` for 2.
 pub fn operation_name(id: u16) -> Option<&'static str> {
-    OPERATION_NAMES.iter().find(|(c, _)| *c == id).map(|(_, n)| *n)
+    OPERATION_NAMES
+        .iter()
+        .find(|(c, _)| *c == id)
+        .map(|(_, n)| *n)
 }
 
 /// The operation ID with a registered name, such as 2 for `"Print-Job"`.
 /// Case matters, as in the registry.
 pub fn operation_by_name(name: &str) -> Option<u16> {
-    OPERATION_NAMES.iter().find(|(_, n)| *n == name).map(|(c, _)| *c)
+    OPERATION_NAMES
+        .iter()
+        .find(|(_, n)| *n == name)
+        .map(|(c, _)| *c)
 }
 
 /// The registered name of a status code, such as `"successful-ok"` for 0.
 pub fn status_name(code: u16) -> Option<&'static str> {
-    STATUS_NAMES.iter().find(|(c, _)| *c == code).map(|(_, n)| *n)
+    STATUS_NAMES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, n)| *n)
 }
 
 /// The status code with a registered name, such as 0x0406 for
 /// `"client-error-not-found"`.
 pub fn status_by_name(name: &str) -> Option<u16> {
-    STATUS_NAMES.iter().find(|(_, n)| *n == name).map(|(c, _)| *c)
+    STATUS_NAMES
+        .iter()
+        .find(|(_, n)| *n == name)
+        .map(|(c, _)| *c)
 }
 
 /// The name of a delimiter or value tag, such as `"keyword"` for 0x44.
@@ -495,7 +660,10 @@ pub struct Attribute {
 impl Attribute {
     /// An attribute with one value.
     pub fn new(name: impl Into<String>, value: Value) -> Attribute {
-        Attribute { name: name.into(), values: vec![value] }
+        Attribute {
+            name: name.into(),
+            values: vec![value],
+        }
     }
 }
 
@@ -737,7 +905,9 @@ impl std::fmt::Display for Error {
             Error::Truncated => f.write_str("IPP head ended early"),
             Error::Trailing => f.write_str("bytes follow the IPP head"),
             Error::DocumentTooLong => write!(f, "document exceeds {MAX_DOCUMENT} bytes"),
-            Error::BadRequest { request_id, .. } => write!(f, "IPP request {request_id} is malformed"),
+            Error::BadRequest { request_id, .. } => {
+                write!(f, "IPP request {request_id} is malformed")
+            }
         }
     }
 }
@@ -817,13 +987,22 @@ impl Message {
         if group == tag::OPERATION_ATTRIBUTES {
             match self.group_mut(group) {
                 Some(g) => g.attributes.push(attribute),
-                None => self.groups.insert(0, Group { tag: group, attributes: vec![attribute] }),
+                None => self.groups.insert(
+                    0,
+                    Group {
+                        tag: group,
+                        attributes: vec![attribute],
+                    },
+                ),
             }
             return;
         }
         match self.groups.last_mut() {
             Some(g) if g.tag == group => g.attributes.push(attribute),
-            _ => self.groups.push(Group { tag: group, attributes: vec![attribute] }),
+            _ => self.groups.push(Group {
+                tag: group,
+                attributes: vec![attribute],
+            }),
         }
     }
 
@@ -839,7 +1018,11 @@ impl Message {
 
     /// The first attribute called `name` in a group with tag `group`.
     pub fn attribute(&self, group: u8, name: &str) -> Option<&Attribute> {
-        self.groups.iter().filter(|g| g.tag == group).flat_map(|g| &g.attributes).find(|a| a.name == name)
+        self.groups
+            .iter()
+            .filter(|g| g.tag == group)
+            .flat_map(|g| &g.attributes)
+            .find(|a| a.name == name)
     }
 }
 
@@ -848,7 +1031,10 @@ fn standard_operation_group() -> Group {
         tag: tag::OPERATION_ATTRIBUTES,
         attributes: vec![
             Attribute::new("attributes-charset", Value::Charset("utf-8".into())),
-            Attribute::new("attributes-natural-language", Value::NaturalLanguage("en".into())),
+            Attribute::new(
+                "attributes-natural-language",
+                Value::NaturalLanguage("en".into()),
+            ),
         ],
     }
 }
@@ -1231,7 +1417,10 @@ impl Decode for Head {
         };
         let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
         self.done = true;
-        let item = head(fixed, body).map_err(|error| Error::BadRequest { request_id, error: Box::new(error) });
+        let item = head(fixed, body).map_err(|error| Error::BadRequest {
+            request_id,
+            error: Box::new(error),
+        });
         Ok(Step::Item(item, end))
     }
 }
@@ -1294,7 +1483,11 @@ fn len_at(b: &[u8], i: usize) -> Result<Option<usize>, FrameError> {
     match b.get(i..i.saturating_add(2)) {
         Some(&[hi, lo]) => {
             let n = u16::from_be_bytes([hi, lo]);
-            if usize::from(n) > MAX_FIELD { Err(FrameError::Length(n)) } else { Ok(Some(usize::from(n))) }
+            if usize::from(n) > MAX_FIELD {
+                Err(FrameError::Length(n))
+            } else {
+                Ok(Some(usize::from(n)))
+            }
         }
         _ => Ok(None),
     }
@@ -1303,7 +1496,11 @@ fn len_at(b: &[u8], i: usize) -> Result<Option<usize>, FrameError> {
 /// One record of the attribute section.
 enum Record<'a> {
     Delimiter(u8),
-    Value { tag: u8, name: &'a [u8], value: &'a [u8] },
+    Value {
+        tag: u8,
+        name: &'a [u8],
+        value: &'a [u8],
+    },
 }
 
 /// The records of an attribute section whose lengths [`scan_head`] has checked.
@@ -1329,7 +1526,11 @@ impl<'a> Iterator for Records<'a> {
         let v = usize::from(u16::from_be_bytes([*b.get(at)?, *b.get(at + 1)?]));
         let value = b.get(at + 2..at + 2 + v)?;
         self.pos = at + 2 + v;
-        Some(Record::Value { tag: t, name, value })
+        Some(Record::Value {
+            tag: t,
+            name,
+            value,
+        })
     }
 }
 
@@ -1346,21 +1547,29 @@ fn head(fixed: &[u8; HEADER_LEN], body: &[u8]) -> Result<Header, Error> {
             Record::Delimiter(tag::END_OF_ATTRIBUTES) => break,
             Record::Delimiter(0) => return Err(Error::ReservedGroup),
             Record::Delimiter(t) => {
-                groups.push(Group { tag: t, attributes: Vec::new() });
+                groups.push(Group {
+                    tag: t,
+                    attributes: Vec::new(),
+                });
                 names.clear();
             }
             Record::Value { tag, name, value } => {
                 let group = groups.last_mut().ok_or(Error::NoGroup)?;
                 if name.is_empty() {
                     let attribute = group.attributes.last_mut().ok_or(Error::NoAttribute)?;
-                    attribute.values.push(read_value(tag, value, &mut records, 0)?);
+                    attribute
+                        .values
+                        .push(read_value(tag, value, &mut records, 0)?);
                 } else {
                     if !names.insert(name) {
                         return Err(Error::Duplicate);
                     }
                     let name = utf8_name(name)?;
                     let v = read_value(tag, value, &mut records, 0)?;
-                    group.attributes.push(Attribute { name, values: vec![v] });
+                    group.attributes.push(Attribute {
+                        name,
+                        values: vec![v],
+                    });
                 }
             }
         }
@@ -1391,7 +1600,11 @@ fn utf8_name(b: &[u8]) -> Result<String, Error> {
 fn in_range(v: &Value) -> bool {
     match v {
         Value::Enum(n) => *n >= 1,
-        Value::Resolution { cross_feed, feed, units } => *cross_feed > 0 && *feed > 0 && matches!(units, 3 | 4),
+        Value::Resolution {
+            cross_feed,
+            feed,
+            units,
+        } => *cross_feed > 0 && *feed > 0 && matches!(units, 3 | 4),
         Value::DateTime(d) => {
             (1..=12).contains(&d.month)
                 && (1..=31).contains(&d.day)
@@ -1412,7 +1625,11 @@ fn in_range(v: &Value) -> bool {
 /// [`MAX_DEPTH`].
 fn read_value(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Result<Value, Error> {
     let value = read_one(t, v, records, depth)?;
-    if in_range(&value) { Ok(value) } else { Err(Error::BadValue(t)) }
+    if in_range(&value) {
+        Ok(value)
+    } else {
+        Err(Error::BadValue(t))
+    }
 }
 
 fn read_one(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Result<Value, Error> {
@@ -1432,7 +1649,11 @@ fn read_one(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Result<
             if v.len() != 4 {
                 return Err(bad());
             }
-            if t == tag::INTEGER { Value::Integer(i32_at(0)) } else { Value::Enum(i32_at(0)) }
+            if t == tag::INTEGER {
+                Value::Integer(i32_at(0))
+            } else {
+                Value::Enum(i32_at(0))
+            }
         }
         tag::BOOLEAN => match v {
             [0] => Value::Boolean(false),
@@ -1441,7 +1662,19 @@ fn read_one(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Result<
         },
         tag::OCTET_STRING => Value::OctetString(v.to_vec()),
         tag::DATE_TIME => {
-            let &[y0, y1, month, day, hour, minutes, seconds, deci_seconds, direction, utc_hours, utc_minutes] = v
+            let &[
+                y0,
+                y1,
+                month,
+                day,
+                hour,
+                minutes,
+                seconds,
+                deci_seconds,
+                direction,
+                utc_hours,
+                utc_minutes,
+            ] = v
             else {
                 return Err(bad());
             };
@@ -1462,13 +1695,20 @@ fn read_one(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Result<
             if v.len() != 9 {
                 return Err(bad());
             }
-            Value::Resolution { cross_feed: i32_at(0), feed: i32_at(4), units: v[8] as i8 }
+            Value::Resolution {
+                cross_feed: i32_at(0),
+                feed: i32_at(4),
+                units: v[8] as i8,
+            }
         }
         tag::RANGE_OF_INTEGER => {
             if v.len() != 8 {
                 return Err(bad());
             }
-            Value::Range { lower: i32_at(0), upper: i32_at(4) }
+            Value::Range {
+                lower: i32_at(0),
+                upper: i32_at(4),
+            }
         }
         tag::TEXT_WITH_LANGUAGE | tag::NAME_WITH_LANGUAGE => {
             let (language, rest) = counted(v).ok_or_else(bad)?;
@@ -1480,7 +1720,10 @@ fn read_one(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Result<
             if t == tag::TEXT_WITH_LANGUAGE {
                 Value::TextWithLanguage { language, text }
             } else {
-                Value::NameWithLanguage { language, name: text }
+                Value::NameWithLanguage {
+                    language,
+                    name: text,
+                }
             }
         }
         tag::TEXT_WITHOUT_LANGUAGE => Value::Text(s(v)?),
@@ -1493,9 +1736,15 @@ fn read_one(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Result<
         tag::MIME_MEDIA_TYPE => Value::MimeMediaType(s(v)?),
         tag::EXTENSION => {
             let (&[a, b, c, d], data) = (v.first_chunk::<4>().ok_or_else(bad)?, &v[4..]);
-            Value::Extension { tag: u32::from_be_bytes([a, b, c, d]), data: data.to_vec() }
+            Value::Extension {
+                tag: u32::from_be_bytes([a, b, c, d]),
+                data: data.to_vec(),
+            }
         }
-        _ => Value::Unknown { tag: t, data: v.to_vec() },
+        _ => Value::Unknown {
+            tag: t,
+            data: v.to_vec(),
+        },
     })
 }
 
@@ -1503,7 +1752,11 @@ fn read_one(t: u8, v: &[u8], records: &mut Records<'_>, depth: usize) -> Result<
 fn counted(b: &[u8]) -> Option<(&[u8], &[u8])> {
     let (&[hi, lo], rest) = (b.first_chunk::<2>()?, &b[2..]);
     let n = usize::from(u16::from_be_bytes([hi, lo]));
-    if rest.len() < n { None } else { Some(rest.split_at(n)) }
+    if rest.len() < n {
+        None
+    } else {
+        Some(rest.split_at(n))
+    }
 }
 
 /// Reads a collection's members, after its begCollection, up to and
@@ -1515,7 +1768,12 @@ fn read_members(records: &mut Records<'_>, depth: usize) -> Result<Vec<Attribute
     // Whether an empty memberAttrName has said another value comes next.
     let mut more = false;
     loop {
-        let Some(Record::Value { tag: t, name, value }) = records.next() else {
+        let Some(Record::Value {
+            tag: t,
+            name,
+            value,
+        }) = records.next()
+        else {
             return Err(Error::Collection);
         };
         if !name.is_empty() {
@@ -1534,7 +1792,10 @@ fn read_members(records: &mut Records<'_>, depth: usize) -> Result<Vec<Attribute
                 }
                 more = true;
             }
-            tag::MEMBER_ATTR_NAME => members.push(Attribute { name: utf8_name(value)?, values: Vec::new() }),
+            tag::MEMBER_ATTR_NAME => members.push(Attribute {
+                name: utf8_name(value)?,
+                values: Vec::new(),
+            }),
             _ => {
                 let member = members.last_mut().ok_or(Error::Collection)?;
                 member.values.push(read_value(t, value, records, depth)?);
@@ -1546,12 +1807,10 @@ fn read_members(records: &mut Records<'_>, depth: usize) -> Result<Vec<Attribute
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// One record's bytes.
@@ -1570,7 +1829,11 @@ mod tests {
             vec![0x01, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x01],
             rec(0x47, "attributes-charset", b"utf-8"),
             rec(0x48, "attributes-natural-language", b"en-us"),
-            rec(0x45, "printer-uri", b"ipp://printer.example.com/ipp/print/pinetree"),
+            rec(
+                0x45,
+                "printer-uri",
+                b"ipp://printer.example.com/ipp/print/pinetree",
+            ),
             rec(0x42, "job-name", b"foobar"),
             rec(0x22, "ipp-attribute-fidelity", &[0x01]),
             vec![0x02],
@@ -1592,15 +1855,29 @@ mod tests {
         assert_eq!(m.request_id, 1);
         assert_eq!(m.groups.len(), 2);
         assert_eq!(m.groups[0].tag, tag::OPERATION_ATTRIBUTES);
-        assert_eq!(m.attribute(tag::JOB_ATTRIBUTES, "copies").unwrap().values, [Value::Integer(20)]);
+        assert_eq!(
+            m.attribute(tag::JOB_ATTRIBUTES, "copies").unwrap().values,
+            [Value::Integer(20)]
+        );
         assert_eq!(
             m.attribute(tag::JOB_ATTRIBUTES, "sides").unwrap().values,
             [Value::Keyword("two-sided-long-edge".into())]
         );
-        let op = |n| m.attribute(tag::OPERATION_ATTRIBUTES, n).unwrap().values.clone();
+        let op = |n| {
+            m.attribute(tag::OPERATION_ATTRIBUTES, n)
+                .unwrap()
+                .values
+                .clone()
+        };
         assert_eq!(op("attributes-charset"), [Value::Charset("utf-8".into())]);
-        assert_eq!(op("attributes-natural-language"), [Value::NaturalLanguage("en-us".into())]);
-        assert_eq!(op("printer-uri")[0].as_str(), Some("ipp://printer.example.com/ipp/print/pinetree"));
+        assert_eq!(
+            op("attributes-natural-language"),
+            [Value::NaturalLanguage("en-us".into())]
+        );
+        assert_eq!(
+            op("printer-uri")[0].as_str(),
+            Some("ipp://printer.example.com/ipp/print/pinetree")
+        );
         assert_eq!(op("job-name"), [Value::Name("foobar".into())]);
         assert_eq!(op("ipp-attribute-fidelity"), [Value::Boolean(true)]);
         assert_eq!(m.data, b"%!PDF...");
@@ -1617,7 +1894,11 @@ mod tests {
             rec(0x41, "status-message", b"successful-ok"),
             vec![0x02],
             rec(0x21, "job-id", &147i32.to_be_bytes()),
-            rec(0x45, "job-uri", b"ipp://printer.example.com/ipp/print/pinetree/147"),
+            rec(
+                0x45,
+                "job-uri",
+                b"ipp://printer.example.com/ipp/print/pinetree/147",
+            ),
             rec(0x23, "job-state", &3i32.to_be_bytes()),
             vec![0x03],
         ]
@@ -1625,8 +1906,16 @@ mod tests {
         let m = Message::parse(&bytes).unwrap();
         assert_eq!(status_name(m.code), Some("successful-ok"));
         assert!(status::is_successful(m.code));
-        assert_eq!(m.attribute(tag::JOB_ATTRIBUTES, "job-id").unwrap().values[0].as_i32(), Some(147));
-        assert_eq!(m.attribute(tag::JOB_ATTRIBUTES, "job-state").unwrap().values, [Value::Enum(3)]);
+        assert_eq!(
+            m.attribute(tag::JOB_ATTRIBUTES, "job-id").unwrap().values[0].as_i32(),
+            Some(147)
+        );
+        assert_eq!(
+            m.attribute(tag::JOB_ATTRIBUTES, "job-state")
+                .unwrap()
+                .values,
+            [Value::Enum(3)]
+        );
         assert!(m.data.is_empty());
         assert_eq!(m.to_bytes().unwrap(), bytes);
     }
@@ -1638,7 +1927,11 @@ mod tests {
             vec![0x01, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x01],
             rec(0x47, "attributes-charset", b"utf-8"),
             rec(0x48, "attributes-natural-language", b"en-us"),
-            rec(0x45, "printer-uri", b"ipp://printer.example.com/ipp/print/pinetree"),
+            rec(
+                0x45,
+                "printer-uri",
+                b"ipp://printer.example.com/ipp/print/pinetree",
+            ),
             rec(0x34, "media-col", b""),
             rec(0x4a, "", b"media-size"),
             rec(0x34, "", b""),
@@ -1660,7 +1953,10 @@ mod tests {
         let bytes = media_col();
         let m = Message::parse(&bytes).unwrap();
         assert_eq!(operation_name(m.code), Some("Create-Job"));
-        let col = &m.attribute(tag::OPERATION_ATTRIBUTES, "media-col").unwrap().values;
+        let col = &m
+            .attribute(tag::OPERATION_ATTRIBUTES, "media-col")
+            .unwrap()
+            .values;
         let expected = Value::Collection(vec![
             Attribute::new(
                 "media-size",
@@ -1675,9 +1971,14 @@ mod tests {
         assert_eq!(m.to_bytes().unwrap(), bytes);
         // A member with two values: the second follows with no member name.
         let mut m = Message::request(operation::CREATE_JOB, 2);
-        let member =
-            Attribute { name: "k".into(), values: vec![Value::Keyword("a".into()), Value::Keyword("b".into())] };
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("c", Value::Collection(vec![member])));
+        let member = Attribute {
+            name: "k".into(),
+            values: vec![Value::Keyword("a".into()), Value::Keyword("b".into())],
+        };
+        m.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute::new("c", Value::Collection(vec![member])),
+        );
         let bytes = m.to_bytes().unwrap();
         let tail = [
             rec(0x34, "c", b""),
@@ -1702,7 +2003,10 @@ mod tests {
         ]
         .concat();
         let m = Message::parse(&bytes).unwrap();
-        assert_eq!(m.groups.iter().map(|g| g.tag).collect::<Vec<_>>(), [1, 4, 5]);
+        assert_eq!(
+            m.groups.iter().map(|g| g.tag).collect::<Vec<_>>(),
+            [1, 4, 5]
+        );
         assert!(m.groups[0].attributes.is_empty());
         assert_eq!(m.groups[1].attributes[0].values.len(), 3);
         assert_eq!(m.to_bytes().unwrap(), bytes);
@@ -1734,10 +2038,23 @@ mod tests {
                 utc_hours: 4,
                 utc_minutes: 0,
             }),
-            Value::Resolution { cross_feed: 600, feed: 300, units: 3 },
-            Value::Range { lower: 1, upper: 100 },
-            Value::TextWithLanguage { language: "fr".into(), text: "bonjour é".into() },
-            Value::NameWithLanguage { language: "de".into(), name: "Drucker".into() },
+            Value::Resolution {
+                cross_feed: 600,
+                feed: 300,
+                units: 3,
+            },
+            Value::Range {
+                lower: 1,
+                upper: 100,
+            },
+            Value::TextWithLanguage {
+                language: "fr".into(),
+                text: "bonjour é".into(),
+            },
+            Value::NameWithLanguage {
+                language: "de".into(),
+                name: "Drucker".into(),
+            },
             Value::Text("hello".into()),
             Value::Name("".into()),
             Value::Keyword("one-sided".into()),
@@ -1748,10 +2065,22 @@ mod tests {
             Value::MimeMediaType("application/pdf".into()),
             Value::Collection(vec![]),
             Value::Collection(vec![Attribute::new("a", Value::Integer(1))]),
-            Value::Extension { tag: 0x4000_0001, data: vec![9, 9] },
-            Value::Unknown { tag: 0x20, data: vec![] },
-            Value::Unknown { tag: 0x43, data: b"x".to_vec() },
-            Value::Unknown { tag: 0x99, data: vec![1, 2, 3] },
+            Value::Extension {
+                tag: 0x4000_0001,
+                data: vec![9, 9],
+            },
+            Value::Unknown {
+                tag: 0x20,
+                data: vec![],
+            },
+            Value::Unknown {
+                tag: 0x43,
+                data: b"x".to_vec(),
+            },
+            Value::Unknown {
+                tag: 0x99,
+                data: vec![1, 2, 3],
+            },
         ]
     }
 
@@ -1801,14 +2130,30 @@ mod tests {
             m.add(tag::JOB_ATTRIBUTES, Attribute::new("x", v.clone()));
             let back = Message::parse(&m.to_bytes().unwrap()).unwrap();
             assert_eq!(back, m, "{v:?}");
-            assert!(tag_name(v.tag()).is_some() || is_unknown_tag(v.tag()) || (0x10..=0x1f).contains(&v.tag()));
+            assert!(
+                tag_name(v.tag()).is_some()
+                    || is_unknown_tag(v.tag())
+                    || (0x10..=0x1f).contains(&v.tag())
+            );
         }
         // All of them as one attribute, and inside a collection.
         let mut m = Message::request(operation::PRINT_JOB, 3);
-        m.add(tag::JOB_ATTRIBUTES, Attribute { name: "all".into(), values: every_value() });
         m.add(
             tag::JOB_ATTRIBUTES,
-            Attribute::new("c", Value::Collection(vec![Attribute { name: "m".into(), values: every_value() }])),
+            Attribute {
+                name: "all".into(),
+                values: every_value(),
+            },
+        );
+        m.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute::new(
+                "c",
+                Value::Collection(vec![Attribute {
+                    name: "m".into(),
+                    values: every_value(),
+                }]),
+            ),
         );
         m.data = vec![1, 2, 3];
         assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
@@ -1870,19 +2215,21 @@ mod tests {
         .concat();
         let m = Message::parse(&bytes).unwrap();
         assert_eq!(m.groups[0].attributes[0].values, [Value::OutOfBand(0x10)]);
-        assert_eq!(m.groups[0].attributes[1].values, [Value::Collection(vec![])]);
+        assert_eq!(
+            m.groups[0].attributes[1].values,
+            [Value::Collection(vec![])]
+        );
     }
 
     #[test]
     fn errors() {
         let hdr = vec![1, 1, 0, 2, 0, 0, 0, 1];
-        let with = |parts: Vec<Vec<u8>>| Message::parse(&[vec![hdr.clone()], parts, vec![vec![3]]].concat().concat());
+        let with = |parts: Vec<Vec<u8>>| {
+            Message::parse(&[vec![hdr.clone()], parts, vec![vec![3]]].concat().concat())
+        };
         assert_eq!(Message::parse(&hdr), Err(Error::Truncated));
         assert_eq!(Message::parse(&[1, 1]), Err(Error::Truncated));
-        assert_eq!(
-            with(vec![rec(0x44, "a", b"b")]),
-            Err(Error::NoGroup)
-        );
+        assert_eq!(with(vec![rec(0x44, "a", b"b")]), Err(Error::NoGroup));
         assert_eq!(
             with(vec![vec![1], rec(0x44, "", b"b")]),
             Err(Error::NoAttribute)
@@ -2029,7 +2376,13 @@ mod tests {
         ] {
             assert!(!e.to_string().is_empty());
         }
-        for e in [Error::BadValue(0x21), Error::BadName, Error::Collection, Error::TooDeep, Error::ReservedGroup] {
+        for e in [
+            Error::BadValue(0x21),
+            Error::BadName,
+            Error::Collection,
+            Error::TooDeep,
+            Error::ReservedGroup,
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -2039,7 +2392,9 @@ mod tests {
     #[test]
     fn empty_member_name_adds_a_value() {
         let hdr = vec![1, 1, 0, 5, 0, 0, 0, 1, 2];
-        let with = |parts: Vec<Vec<u8>>| Message::parse(&[vec![hdr.clone()], parts, vec![vec![3]]].concat().concat());
+        let with = |parts: Vec<Vec<u8>>| {
+            Message::parse(&[vec![hdr.clone()], parts, vec![vec![3]]].concat().concat())
+        };
         let m = with(vec![
             rec(0x34, "c", b""),
             rec(0x4a, "", b"k"),
@@ -2049,22 +2404,43 @@ mod tests {
             rec(0x37, "", b""),
         ])
         .unwrap();
-        let member =
-            Attribute { name: "k".into(), values: vec![Value::Keyword("a".into()), Value::Keyword("b".into())] };
-        assert_eq!(m.groups[0].attributes, [Attribute::new("c", Value::Collection(vec![member]))]);
+        let member = Attribute {
+            name: "k".into(),
+            values: vec![Value::Keyword("a".into()), Value::Keyword("b".into())],
+        };
+        assert_eq!(
+            m.groups[0].attributes,
+            [Attribute::new("c", Value::Collection(vec![member]))]
+        );
         assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
         // It needs a member with a value before it, and a value after it.
         assert_eq!(
-            with(vec![rec(0x34, "c", b""), rec(0x4a, "", b""), rec(0x44, "", b"a"), rec(0x37, "", b"")]),
+            with(vec![
+                rec(0x34, "c", b""),
+                rec(0x4a, "", b""),
+                rec(0x44, "", b"a"),
+                rec(0x37, "", b"")
+            ]),
             Err(Error::Collection)
         );
         assert_eq!(
-            with(vec![rec(0x34, "c", b""), rec(0x4a, "", b"k"), rec(0x4a, "", b""), rec(0x44, "", b"a")]),
+            with(vec![
+                rec(0x34, "c", b""),
+                rec(0x4a, "", b"k"),
+                rec(0x4a, "", b""),
+                rec(0x44, "", b"a")
+            ]),
             Err(Error::Collection)
         );
         for after in [rec(0x37, "", b""), rec(0x4a, "", b"n"), rec(0x4a, "", b"")] {
             assert_eq!(
-                with(vec![rec(0x34, "c", b""), rec(0x4a, "", b"k"), rec(0x44, "", b"a"), rec(0x4a, "", b""), after]),
+                with(vec![
+                    rec(0x34, "c", b""),
+                    rec(0x4a, "", b"k"),
+                    rec(0x44, "", b"a"),
+                    rec(0x4a, "", b""),
+                    after
+                ]),
                 Err(Error::Collection)
             );
         }
@@ -2081,21 +2457,27 @@ mod tests {
             vec![3],
         ]
         .concat();
-        assert_eq!(
-            Message::parse(&bytes),
-            Err(Error::Duplicate)
-        );
+        assert_eq!(Message::parse(&bytes), Err(Error::Duplicate));
         assert_eq!(
             decode_all(Head::new, &bytes),
             (
-                vec![Err(Error::BadRequest { request_id: 1, error: Box::new(Error::Duplicate) })],
+                vec![Err(Error::BadRequest {
+                    request_id: 1,
+                    error: Box::new(Error::Duplicate)
+                })],
                 None
             )
         );
         assert!(!Error::Duplicate.to_string().is_empty());
         // The same name in two groups is fine.
-        let bytes =
-            [vec![1, 1, 0, 2, 0, 0, 0, 1, 2], rec(0x44, "a", b"x"), vec![2], rec(0x44, "a", b"y"), vec![3]].concat();
+        let bytes = [
+            vec![1, 1, 0, 2, 0, 0, 0, 1, 2],
+            rec(0x44, "a", b"x"),
+            vec![2],
+            rec(0x44, "a", b"y"),
+            vec![3],
+        ]
+        .concat();
         assert_eq!(Message::parse(&bytes).unwrap().groups.len(), 2);
         let mut message = Message::request(operation::PRINT_JOB, 1);
         message.add(tag::JOB_ATTRIBUTES, Attribute::new("a", Value::Integer(1)));
@@ -2113,11 +2495,15 @@ mod tests {
         assert!(g.attribute("nope").is_none());
         let g = m.group_mut(tag::JOB_ATTRIBUTES).unwrap();
         g.attribute_mut("copies").unwrap().values = vec![Value::Integer(2)];
-        assert_eq!(m.attribute(tag::JOB_ATTRIBUTES, "copies").unwrap().values, [Value::Integer(2)]);
+        assert_eq!(
+            m.attribute(tag::JOB_ATTRIBUTES, "copies").unwrap().values,
+            [Value::Integer(2)]
+        );
         // Messages, values and errors can be kept in sets and maps.
         let set: std::collections::HashSet<Message> = [m.clone(), m.clone()].into_iter().collect();
         assert_eq!(set.len(), 1);
-        let errors: std::collections::HashSet<Error> = [Error::Duplicate, Error::Duplicate].into_iter().collect();
+        let errors: std::collections::HashSet<Error> =
+            [Error::Duplicate, Error::Duplicate].into_iter().collect();
         assert_eq!(errors.len(), 1);
         // A scan cursor can be copied without copying input.
         let bytes = print_job();
@@ -2143,7 +2529,10 @@ mod tests {
     #[test]
     fn depth_limit() {
         let mut m = Message::request(operation::PRINT_JOB, 1);
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("deep", nested(MAX_DEPTH)));
+        m.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute::new("deep", nested(MAX_DEPTH)),
+        );
         assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
         // One deeper is refused by both reader and writer.
         let mut bytes = vec![1, 1, 0, 2, 0, 0, 0, 1, 2];
@@ -2158,15 +2547,18 @@ mod tests {
             bytes.extend(rec(0x37, "", b""));
         }
         bytes.push(3);
-        assert_eq!(
-            Message::parse(&bytes),
-            Err(Error::TooDeep)
-        );
+        assert_eq!(Message::parse(&bytes), Err(Error::TooDeep));
         let mut m = Message::request(operation::PRINT_JOB, 1);
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("deep", nested(MAX_DEPTH + 1)));
         m.add(
             tag::JOB_ATTRIBUTES,
-            Attribute { name: "x".into(), values: vec![nested(MAX_DEPTH + 5), Value::Integer(2)] },
+            Attribute::new("deep", nested(MAX_DEPTH + 1)),
+        );
+        m.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute {
+                name: "x".into(),
+                values: vec![nested(MAX_DEPTH + 5), Value::Integer(2)],
+            },
         );
         assert_unwritable(&m);
         // Very deep input is cut off without deep recursion.
@@ -2179,10 +2571,7 @@ mod tests {
                 bytes.extend(rec(0x34, "", b""));
             }
             bytes.push(3);
-            assert_eq!(
-                Message::parse(&bytes),
-                Err(Error::TooDeep)
-            );
+            assert_eq!(Message::parse(&bytes), Err(Error::TooDeep));
         }
     }
 
@@ -2236,7 +2625,10 @@ mod tests {
         assert_eq!(stream.push(&[0, 1, b'a', 0, 0, 3]), 6);
         assert_eq!(
             stream.next(),
-            Some(Ok(Err(Error::BadRequest { request_id: 1, error: Box::new(Error::NoGroup) })))
+            Some(Ok(Err(Error::BadRequest {
+                request_id: 1,
+                error: Box::new(Error::NoGroup)
+            })))
         );
         assert_eq!(stream.next(), None);
     }
@@ -2349,10 +2741,7 @@ mod tests {
         bytes.extend_from_slice(&message.data);
         assert_eq!(Message::parse(&bytes), Err(Error::DocumentTooLong));
         bytes[8] = 0;
-        assert_eq!(
-            Message::parse(&bytes),
-            Err(Error::ReservedGroup)
-        );
+        assert_eq!(Message::parse(&bytes), Err(Error::ReservedGroup));
     }
 
     #[test]
@@ -2374,7 +2763,10 @@ mod tests {
         assert_eq!(tag_name(0x43), None);
         for t in 0x10..=0xffu8 {
             // Every value tag is named, out-of-band, or unknown.
-            assert!(tag_name(t).is_some() || is_unknown_tag(t) || (0x10..=0x1f).contains(&t), "{t:#x}");
+            assert!(
+                tag_name(t).is_some() || is_unknown_tag(t) || (0x10..=0x1f).contains(&t),
+                "{t:#x}"
+            );
             assert!(!(tag_name(t).is_some() && is_unknown_tag(t)), "{t:#x}");
         }
     }
@@ -2386,8 +2778,14 @@ mod tests {
             match request.code {
                 operation::GET_PRINTER_ATTRIBUTES => {
                     let mut reply = request.response(status::SUCCESSFUL_OK);
-                    reply.add(tag::PRINTER_ATTRIBUTES, Attribute::new("printer-name", Value::Name("lobby".into())));
-                    reply.add(tag::PRINTER_ATTRIBUTES, Attribute::new("printer-state", Value::Enum(3)));
+                    reply.add(
+                        tag::PRINTER_ATTRIBUTES,
+                        Attribute::new("printer-name", Value::Name("lobby".into())),
+                    );
+                    reply.add(
+                        tag::PRINTER_ATTRIBUTES,
+                        Attribute::new("printer-state", Value::Enum(3)),
+                    );
                     reply
                 }
                 _ => request.response(status::SERVER_ERROR_OPERATION_NOT_SUPPORTED),
@@ -2415,12 +2813,16 @@ mod tests {
             .unwrap()
             .with_document(Vec::new());
         assert_eq!(request.code, operation::GET_PRINTER_ATTRIBUTES);
-        let charset = request.attribute(tag::OPERATION_ATTRIBUTES, "attributes-charset").unwrap();
+        let charset = request
+            .attribute(tag::OPERATION_ATTRIBUTES, "attributes-charset")
+            .unwrap();
         assert_eq!(charset.values, [Value::Charset("utf-8".into())]);
         let reply = answer(&request).to_bytes().unwrap();
         assert_eq!(&reply[..8], [1, 1, 0, 0, 0, 0, 0, 7]);
         let back = Message::parse(&reply).unwrap();
-        let state = back.attribute(tag::PRINTER_ATTRIBUTES, "printer-state").unwrap();
+        let state = back
+            .attribute(tag::PRINTER_ATTRIBUTES, "printer-state")
+            .unwrap();
         assert_eq!(state.values, [Value::Enum(3)]);
         // The request the example builds by hand is the one `request` makes.
         assert_eq!(
@@ -2441,7 +2843,10 @@ mod tests {
         let mut stream = Stream::new(Head::new());
         assert_eq!(stream.push(&long), MAX_HEAD);
         assert_eq!(stream.push(&long), 0);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::TooLong))));
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(FrameError::TooLong)))
+        );
         assert_eq!(stream.next(), None);
         contract::check_decode_with_alloc_limit(Head::new, &long, 2 * MAX_HEAD);
         let mut partial = vec![1, 1, 0, 2, 0, 0, 0, 1, 1];
@@ -2474,7 +2879,10 @@ mod tests {
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(
             stream.next(),
-            Some(Ok(Err(Error::BadRequest { request_id: 42, error: Box::new(Error::BadValue(0x22)) })))
+            Some(Ok(Err(Error::BadRequest {
+                request_id: 42,
+                error: Box::new(Error::BadValue(0x22))
+            })))
         );
         assert_eq!(stream.next(), None);
     }
@@ -2484,7 +2892,9 @@ mod tests {
     #[test]
     fn names_are_printable_ascii() {
         let hdr = vec![1, 1, 0, 2, 0, 0, 0, 1, 1];
-        let with = |parts: Vec<Vec<u8>>| Message::parse(&[vec![hdr.clone()], parts, vec![vec![3]]].concat().concat());
+        let with = |parts: Vec<Vec<u8>>| {
+            Message::parse(&[vec![hdr.clone()], parts, vec![vec![3]]].concat().concat())
+        };
         for bad in ["x\0y", "a b", "é", &"a".repeat(MAX_NAME + 1)] {
             assert_eq!(
                 with(vec![rec(0x44, bad, b"k")]),
@@ -2506,12 +2916,18 @@ mod tests {
             m.add(tag::JOB_ATTRIBUTES, Attribute::new(bad, Value::Integer(1)));
             m.add(
                 tag::JOB_ATTRIBUTES,
-                Attribute::new("c", Value::Collection(vec![Attribute::new(bad, Value::Integer(1))])),
+                Attribute::new(
+                    "c",
+                    Value::Collection(vec![Attribute::new(bad, Value::Integer(1))]),
+                ),
             );
             assert_unwritable(&m);
         }
         let ok = "a".repeat(MAX_NAME);
-        assert_eq!(with(vec![rec(0x44, &ok, b"k")]).unwrap().groups[0].attributes[0].name, ok);
+        assert_eq!(
+            with(vec![rec(0x44, &ok, b"k")]).unwrap().groups[0].attributes[0].name,
+            ok
+        );
     }
 
     /// RFC 8011 sections 5.1.5 and 5.1.16, and RFC 2579's DateAndTime.
@@ -2532,21 +2948,55 @@ mod tests {
         let bad = [
             Value::Enum(0),
             Value::Enum(-1),
-            Value::Resolution { cross_feed: 0, feed: 300, units: 3 },
-            Value::Resolution { cross_feed: 300, feed: -1, units: 3 },
-            Value::Resolution { cross_feed: 300, feed: 300, units: 0 },
-            Value::Resolution { cross_feed: 300, feed: 300, units: 5 },
+            Value::Resolution {
+                cross_feed: 0,
+                feed: 300,
+                units: 3,
+            },
+            Value::Resolution {
+                cross_feed: 300,
+                feed: -1,
+                units: 3,
+            },
+            Value::Resolution {
+                cross_feed: 300,
+                feed: 300,
+                units: 0,
+            },
+            Value::Resolution {
+                cross_feed: 300,
+                feed: 300,
+                units: 5,
+            },
             Value::DateTime(DateTime { month: 0, ..date }),
             Value::DateTime(DateTime { month: 13, ..date }),
             Value::DateTime(DateTime { day: 0, ..date }),
             Value::DateTime(DateTime { day: 32, ..date }),
             Value::DateTime(DateTime { hour: 24, ..date }),
-            Value::DateTime(DateTime { minutes: 60, ..date }),
-            Value::DateTime(DateTime { seconds: 61, ..date }),
-            Value::DateTime(DateTime { deci_seconds: 10, ..date }),
-            Value::DateTime(DateTime { direction: 0, ..date }),
-            Value::DateTime(DateTime { utc_hours: 15, ..date }),
-            Value::DateTime(DateTime { utc_minutes: 60, ..date }),
+            Value::DateTime(DateTime {
+                minutes: 60,
+                ..date
+            }),
+            Value::DateTime(DateTime {
+                seconds: 61,
+                ..date
+            }),
+            Value::DateTime(DateTime {
+                deci_seconds: 10,
+                ..date
+            }),
+            Value::DateTime(DateTime {
+                direction: 0,
+                ..date
+            }),
+            Value::DateTime(DateTime {
+                utc_hours: 15,
+                ..date
+            }),
+            Value::DateTime(DateTime {
+                utc_minutes: 60,
+                ..date
+            }),
         ];
         for v in bad {
             // Written by hand, the reader refuses it.
@@ -2554,7 +3004,11 @@ mod tests {
             let mut value = Vec::new();
             match &v {
                 Value::Enum(n) => value.extend(n.to_be_bytes()),
-                Value::Resolution { cross_feed, feed, units } => {
+                Value::Resolution {
+                    cross_feed,
+                    feed,
+                    units,
+                } => {
                     value.extend(cross_feed.to_be_bytes());
                     value.extend(feed.to_be_bytes());
                     value.push(*units as u8);
@@ -2583,7 +3037,13 @@ mod tests {
             );
             // The writer refuses it.
             let mut m = Message::request(operation::PRINT_JOB, 1);
-            m.add(tag::JOB_ATTRIBUTES, Attribute { name: "x".into(), values: vec![v.clone(), Value::Integer(1)] });
+            m.add(
+                tag::JOB_ATTRIBUTES,
+                Attribute {
+                    name: "x".into(),
+                    values: vec![v.clone(), Value::Integer(1)],
+                },
+            );
             assert_unwritable(&m);
         }
         // The edges are kept.
@@ -2591,7 +3051,11 @@ mod tests {
         let values = vec![
             Value::Enum(1),
             Value::Enum(i32::MAX),
-            Value::Resolution { cross_feed: 1, feed: 1, units: 4 },
+            Value::Resolution {
+                cross_feed: 1,
+                feed: 1,
+                units: 4,
+            },
             Value::DateTime(date),
             Value::DateTime(DateTime {
                 month: 1,
@@ -2606,7 +3070,13 @@ mod tests {
                 ..date
             }),
         ];
-        m.add(tag::JOB_ATTRIBUTES, Attribute { name: "x".into(), values });
+        m.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute {
+                name: "x".into(),
+                values,
+            },
+        );
         assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
     }
 
@@ -2620,22 +3090,30 @@ mod tests {
             vec![3],
         ]
         .concat();
-        assert_eq!(
-            Message::parse(&bytes),
-            Err(Error::ReservedGroup)
-        );
+        assert_eq!(Message::parse(&bytes), Err(Error::ReservedGroup));
         assert_eq!(
             decode_all(Head::new, &bytes),
             (
-                vec![Err(Error::BadRequest { request_id: 1, error: Box::new(Error::ReservedGroup) })],
+                vec![Err(Error::BadRequest {
+                    request_id: 1,
+                    error: Box::new(Error::ReservedGroup)
+                })],
                 None
             )
         );
         let mut m = Message::request(operation::PRINT_JOB, 1);
-        m.groups.push(Group { tag: 0, attributes: vec![Attribute::new("a", Value::Integer(1))] });
+        m.groups.push(Group {
+            tag: 0,
+            attributes: vec![Attribute::new("a", Value::Integer(1))],
+        });
         assert_unwritable(&m);
         // Unassigned delimiter tags are kept, for groups defined later.
-        let bytes = [vec![1, 1, 0, 2, 0, 0, 0, 1, 0x0b], rec(0x21, "a", &[0; 4]), vec![3]].concat();
+        let bytes = [
+            vec![1, 1, 0, 2, 0, 0, 0, 1, 0x0b],
+            rec(0x21, "a", &[0; 4]),
+            vec![3],
+        ]
+        .concat();
         assert_eq!(Message::parse(&bytes).unwrap().groups[0].tag, 0x0b);
     }
 
@@ -2643,19 +3121,46 @@ mod tests {
     #[test]
     fn operation_attributes_stay_in_the_first_group() {
         let mut m = Message::request(operation::PRINT_JOB, 1);
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("copies", Value::Integer(2)));
-        m.add(tag::OPERATION_ATTRIBUTES, Attribute::new("job-name", Value::Name("a".into())));
+        m.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute::new("copies", Value::Integer(2)),
+        );
+        m.add(
+            tag::OPERATION_ATTRIBUTES,
+            Attribute::new("job-name", Value::Name("a".into())),
+        );
         assert_eq!(m.groups.iter().map(|g| g.tag).collect::<Vec<_>>(), [1, 2]);
         assert_eq!(m.groups[0].attributes[2].name, "job-name");
-        let mut m = Message { version: (1, 1), code: 2, request_id: 1, groups: vec![], data: vec![] };
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("copies", Value::Integer(2)));
-        m.add(tag::OPERATION_ATTRIBUTES, Attribute::new("job-name", Value::Name("a".into())));
+        let mut m = Message {
+            version: (1, 1),
+            code: 2,
+            request_id: 1,
+            groups: vec![],
+            data: vec![],
+        };
+        m.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute::new("copies", Value::Integer(2)),
+        );
+        m.add(
+            tag::OPERATION_ATTRIBUTES,
+            Attribute::new("job-name", Value::Name("a".into())),
+        );
         assert_eq!(m.groups.iter().map(|g| g.tag).collect::<Vec<_>>(), [1, 2]);
         // Other groups still follow the order they are added in.
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("sides", Value::Keyword("one-sided".into())));
-        m.add(tag::PRINTER_ATTRIBUTES, Attribute::new("p", Value::Integer(1)));
+        m.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute::new("sides", Value::Keyword("one-sided".into())),
+        );
+        m.add(
+            tag::PRINTER_ATTRIBUTES,
+            Attribute::new("p", Value::Integer(1)),
+        );
         m.add(tag::JOB_ATTRIBUTES, Attribute::new("q", Value::Integer(1)));
-        assert_eq!(m.groups.iter().map(|g| g.tag).collect::<Vec<_>>(), [1, 2, 4, 2]);
+        assert_eq!(
+            m.groups.iter().map(|g| g.tag).collect::<Vec<_>>(),
+            [1, 2, 4, 2]
+        );
     }
 
     fn assert_unwritable<M: Wire<WriteError = Error> + PartialEq + std::fmt::Debug>(value: &M) {
@@ -2721,7 +3226,13 @@ mod tests {
                 let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
                 assert_eq!(
                     (items, failure),
-                    (vec![Err(Error::BadRequest { request_id, error: Box::new(error) })], None)
+                    (
+                        vec![Err(Error::BadRequest {
+                            request_id,
+                            error: Box::new(error)
+                        })],
+                        None
+                    )
                 );
             }
         }
@@ -2752,7 +3263,13 @@ mod tests {
             Message::request(2, 9).to_bytes().unwrap(),
         ];
         let mut full = Message::request(operation::PRINT_JOB, 3);
-        full.add(tag::JOB_ATTRIBUTES, Attribute { name: "all".into(), values: every_value() });
+        full.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute {
+                name: "all".into(),
+                values: every_value(),
+            },
+        );
         let seeds = [seeds.to_vec(), vec![full.to_bytes().unwrap()]].concat();
         let mut parsed = 0;
         for i in 0..6000 {
@@ -2787,8 +3304,13 @@ mod tests {
                 let mut attributes = Vec::new();
                 for j in 0..rng.index(4) {
                     let all = every_value();
-                    let values = (0..1 + rng.index(3)).map(|_| all[rng.index(all.len())].clone()).collect();
-                    attributes.push(Attribute { name: format!("a{j}"), values });
+                    let values = (0..1 + rng.index(3))
+                        .map(|_| all[rng.index(all.len())].clone())
+                        .collect();
+                    attributes.push(Attribute {
+                        name: format!("a{j}"),
+                        values,
+                    });
                 }
                 m.groups.push(Group {
                     tag: [1, 2, 4, 5, 0x0b, 0x0f][rng.index(6)],

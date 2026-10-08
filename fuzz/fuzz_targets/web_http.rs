@@ -34,7 +34,9 @@ struct Input {
 
 impl Input {
     fn read(data: &[u8]) -> Option<Input> {
-        let [flags, chunk, rest @ ..] = data else { return None };
+        let [flags, chunk, rest @ ..] = data else {
+            return None;
+        };
         let mut bytes = Vec::new();
         if flags & 0x40 != 0 {
             bytes.extend_from_slice(PREFACE);
@@ -53,7 +55,11 @@ impl Input {
 
 /// Reads from `conn`, giving the world turns while nothing comes. `None`
 /// once it has stayed quiet.
-async fn read_quiet(fcx: &Cx, conn: &mut TcpConnection, buf: &mut [u8]) -> Option<Result<usize, ConnError>> {
+async fn read_quiet(
+    fcx: &Cx,
+    conn: &mut TcpConnection,
+    buf: &mut [u8],
+) -> Option<Result<usize, ConnError>> {
     for _ in 0..64 {
         if let Some(r) = poll_once(conn.read(fcx, buf)).await {
             return Some(r);
@@ -126,18 +132,32 @@ impl Tls {
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Some(input) = Input::read(data) else { return };
+    let Some(input) = Input::read(data) else {
+        return;
+    };
     world(move |fcx| async move {
         let attacher = serve(&fcx);
         let client = Client::new(&fcx, &attacher, "agent", Ipv4Addr::new(10, 0, 0, 2));
         let (addr, port) = if input.dns {
             (Ipv4Addr::new(10, 0, 0, 1), 53)
         } else {
-            let Some(addr) = client.lookup(&fcx, input.name).await else { return };
+            let Some(addr) = client.lookup(&fcx, input.name).await else {
+                return;
+            };
             (addr, if input.mode == 0 { 80 } else { 443 })
         };
-        let Ok(mut conn) = client.tcp.connect(&fcx, SocketAddr::new(addr.into(), port)).await else { return };
-        let chunk = if input.chunk == 0 { usize::MAX } else { input.chunk };
+        let Ok(mut conn) = client
+            .tcp
+            .connect(&fcx, SocketAddr::new(addr.into(), port))
+            .await
+        else {
+            return;
+        };
+        let chunk = if input.chunk == 0 {
+            usize::MAX
+        } else {
+            input.chunk
+        };
         if input.mode == 0 || input.dns {
             for piece in input.bytes.chunks(chunk.min(input.bytes.len().max(1))) {
                 if !write_quiet(&fcx, &mut conn, piece).await {

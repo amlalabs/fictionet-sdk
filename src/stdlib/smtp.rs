@@ -657,9 +657,7 @@ impl Wire for Reply {
                     }
                     return Ok(reply);
                 }
-                codec::Step::Skip(used) => {
-                    bytes = bytes.get(used..).ok_or(Error::Incomplete)?
-                }
+                codec::Step::Skip(used) => bytes = bytes.get(used..).ok_or(Error::Incomplete)?,
                 _ => return Err(Error::Incomplete),
             }
         }
@@ -677,9 +675,7 @@ impl Wire for Reply {
             if line.len() > MAX_LINE - 6 || text(line.as_bytes()).is_err() {
                 return Err(Error::Unwritable);
             }
-            size = size
-                .checked_add(line.len() + 6)
-                .ok_or(Error::Unwritable)?;
+            size = size.checked_add(line.len() + 6).ok_or(Error::Unwritable)?;
         }
         out.try_reserve(size).map_err(|_| Error::Unwritable)?;
         let code = self.code.to_string();
@@ -742,9 +738,7 @@ impl Wire for Data {
                     }
                     return Ok(Self { bytes: message });
                 }
-                codec::Step::Skip(used) => {
-                    bytes = bytes.get(used..).ok_or(Error::Incomplete)?
-                }
+                codec::Step::Skip(used) => bytes = bytes.get(used..).ok_or(Error::Incomplete)?,
                 _ => return Err(Error::Incomplete),
             }
         }
@@ -759,11 +753,7 @@ impl Wire for Data {
         {
             return Err(Error::Unwritable);
         }
-        let mut size = self
-            .bytes
-            .len()
-            .checked_add(3)
-            .ok_or(Error::Unwritable)?;
+        let mut size = self.bytes.len().checked_add(3).ok_or(Error::Unwritable)?;
         for line in self.bytes.split_inclusive(|b| *b == b'\n') {
             let content = line.strip_suffix(b"\r\n").ok_or(Error::Unwritable)?;
             check_data_line(content).map_err(|_| Error::Unwritable)?;
@@ -1105,9 +1095,7 @@ impl Decode for Replies {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::{
-        Fail, Lcg, Stream,
-    };
+    use codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
@@ -1116,7 +1104,6 @@ mod tests {
         server.start_data().unwrap();
         server
     }
-
 
     #[test]
     fn command_and_request_round_trips() {
@@ -1189,15 +1176,9 @@ mod tests {
             let c = Command::parse(format!("{line}\r\n").as_bytes()).unwrap();
             assert_eq!(Request::from_command(&c), Err(Error::Argument), "{line}");
         }
-        assert_eq!(
-            Command::parse(b"NOOP\r\nQUIT\r\n"),
-            Err(Error::Trailing)
-        );
+        assert_eq!(Command::parse(b"NOOP\r\nQUIT\r\n"), Err(Error::Trailing));
         for line in [&b"NOOP\0"[..], b"\xff", b"NOOP\x7f"] {
-            assert_eq!(
-                Command::parse(&[line, b"\r\n"].concat()),
-                Err(Error::Text)
-            );
+            assert_eq!(Command::parse(&[line, b"\r\n"].concat()), Err(Error::Text));
         }
         assert!(Command::new("NOOP QUIT", None).to_bytes().is_err());
         assert!(Command::new("NOOP", Some("x\r\nQUIT")).to_bytes().is_err());
@@ -1241,7 +1222,10 @@ mod tests {
         ];
         assert_eq!(decode_all(Inputs::new, &wire), (expected, None));
         contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_DATA_LINE + 1));
-        assert_eq!(contract::check_refused(&Command::new("NOOP", Some(&"a".repeat(MAX_LINE - 6)))), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Command::new("NOOP", Some(&"a".repeat(MAX_LINE - 6)))),
+            Error::Unwritable
+        );
     }
 
     #[test]
@@ -1258,7 +1242,11 @@ mod tests {
         );
         contract::check_decode_with_alloc_limit(Replies::new, bytes, 2 * MAX_LINE);
         for (bad, error, fatal) in [
-            (&b"250-hi\r\n550 done\r\n"[..], Error::ReplyMismatch, Some(FrameError::ReplyMismatch)),
+            (
+                &b"250-hi\r\n550 done\r\n"[..],
+                Error::ReplyMismatch,
+                Some(FrameError::ReplyMismatch),
+            ),
             (
                 b"250-hi\r\n PIPELINING\r\n250 done\r\n",
                 Error::ReplyCode,
@@ -1405,9 +1393,12 @@ mod tests {
             );
         }
         for bad in [&b"bare\n"[..], b"bare\r", b"nul\0\r\n", b"cr\rinside\r\n"] {
-            assert_eq!(contract::check_refused(&Data {
-                bytes: bad.to_vec(),
-            }), Error::Unwritable);
+            assert_eq!(
+                contract::check_refused(&Data {
+                    bytes: bad.to_vec(),
+                }),
+                Error::Unwritable
+            );
         }
     }
 
@@ -1451,9 +1442,12 @@ mod tests {
             Some(Err(Fail::Protocol(FrameError::TooMuchData)))
         );
         assert_eq!(stream.next(), None);
-        assert_eq!(contract::check_refused(&Data {
-            bytes: vec![0; MAX_DATA + 1],
-        }), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Data {
+                bytes: vec![0; MAX_DATA + 1],
+            }),
+            Error::Unwritable
+        );
     }
 
     #[test]

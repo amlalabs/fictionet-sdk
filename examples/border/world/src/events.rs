@@ -34,10 +34,16 @@ fn js(v: Option<&J>) -> Value {
     match v {
         None | Some(J::Null) => Value::Null,
         Some(J::Bool(b)) => json!(b),
-        Some(J::Number(n)) => n.as_u64().map(|u| json!(u)).or_else(|| n.as_i64().map(|i| json!(i))).unwrap_or_else(|| json!(n.as_f64())),
+        Some(J::Number(n)) => n
+            .as_u64()
+            .map(|u| json!(u))
+            .or_else(|| n.as_i64().map(|i| json!(i)))
+            .unwrap_or_else(|| json!(n.as_f64())),
         Some(J::String(s)) => json!(s),
         Some(J::Array(a)) => Value::Array(a.iter().map(|v| js(Some(v))).collect()),
-        Some(J::Object(o)) => Value::Object(o.iter().map(|(k, v)| (k.clone(), js(Some(v)))).collect()),
+        Some(J::Object(o)) => {
+            Value::Object(o.iter().map(|(k, v)| (k.clone(), js(Some(v)))).collect())
+        }
     }
 }
 
@@ -59,7 +65,9 @@ pub fn line(scenario: &Scenario, e: &Entry) -> Option<Value> {
     let local = e.conn.local.map(|a| a.to_string()).unwrap_or_default();
     match (e.source, e.kind) {
         ("net", "attached") => Some(json!({"type": "attached", "sandbox": sandbox(e)})),
-        ("net", "bound") => Some(json!({"type": "bound", "sandbox": sandbox(e), "by_dhcp": f("by_dhcp")})),
+        ("net", "bound") => {
+            Some(json!({"type": "bound", "sandbox": sandbox(e), "by_dhcp": f("by_dhcp")}))
+        }
         ("net", "detached") => Some(json!({"type": "detached", "sandbox": sandbox(e)})),
         ("dns", "query") => Some(dns(e)),
         ("tls", "handshake") => Some(tls(scenario, e)),
@@ -74,16 +82,21 @@ pub fn line(scenario: &Scenario, e: &Entry) -> Option<Value> {
         })),
         // The network counts repeats: past the first of a run, one event
         // counts the rest, with the lowest and highest port.
-        ("net", "blocked") if e.u64("count").is_some_and(|n| n > 1) || matches!(e.get("dst_port"), Some(J::Array(_))) => Some(json!({
-            "type": "blocked",
-            "sandbox": sandbox(e),
-            "why": f("why"),
-            "protocol": f("protocol"),
-            "src": f("src"),
-            "dst": f("dst"),
-            "count": f("count"),
-            "ports": f("dst_port"),
-        })),
+        ("net", "blocked")
+            if e.u64("count").is_some_and(|n| n > 1)
+                || matches!(e.get("dst_port"), Some(J::Array(_))) =>
+        {
+            Some(json!({
+                "type": "blocked",
+                "sandbox": sandbox(e),
+                "why": f("why"),
+                "protocol": f("protocol"),
+                "src": f("src"),
+                "dst": f("dst"),
+                "count": f("count"),
+                "ports": f("dst_port"),
+            }))
+        }
         ("net", "blocked") => Some(json!({
             "type": "blocked",
             "sandbox": sandbox(e),
@@ -117,9 +130,14 @@ fn dns(e: &Entry) -> Value {
 
 fn tls(scenario: &Scenario, e: &Entry) -> Value {
     // The scenario is IPv4 only (`Sites::ipv4_only`).
-    let addr = e.str("addr").and_then(|a| a.parse::<std::net::Ipv4Addr>().ok());
+    let addr = e
+        .str("addr")
+        .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok());
     let sni = e.str("sni");
-    let identity = sni.zip(addr).and_then(|(n, a)| scenario.identity(n, a)).map(|i| i.as_str());
+    let identity = sni
+        .zip(addr)
+        .and_then(|(n, a)| scenario.identity(n, a))
+        .map(|i| i.as_str());
     let mut line = json!({
         "type": "tls",
         "sandbox": sandbox(e),
@@ -139,12 +157,22 @@ fn tls(scenario: &Scenario, e: &Entry) -> Value {
             fields.insert("alert_code".into(), js(e.get("alert_code")));
         }
         "failed" => {
-            fields.insert("detail".into(), json!(e.str("detail").unwrap_or_default().chars().take(200).collect::<String>()));
+            fields.insert(
+                "detail".into(),
+                json!(
+                    e.str("detail")
+                        .unwrap_or_default()
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                ),
+            );
         }
         _ => {}
     }
     let outcome = match outcome {
-        "accepted" | "rejected" | "alert" | "failed" | "closed" | "timed_out" | "detached" | "cancelled" => outcome,
+        "accepted" | "rejected" | "alert" | "failed" | "closed" | "timed_out" | "detached"
+        | "cancelled" => outcome,
         _ => "other",
     };
     fields.insert("outcome".into(), json!(outcome));
@@ -155,8 +183,15 @@ fn http(e: &Entry) -> Value {
     let mut names: Vec<String> = Vec::new();
     let mut ua = None;
     for pair in e.get("headers").and_then(J::as_array).unwrap_or_default() {
-        let Some(pair) = pair.as_array() else { continue };
-        let (Some(name), Some(value)) = (pair.first().and_then(J::as_str), pair.get(1).and_then(J::as_str)) else { continue };
+        let Some(pair) = pair.as_array() else {
+            continue;
+        };
+        let (Some(name), Some(value)) = (
+            pair.first().and_then(J::as_str),
+            pair.get(1).and_then(J::as_str),
+        ) else {
+            continue;
+        };
         if !names.iter().any(|n| n == name) {
             names.push(name.to_owned());
         }
@@ -203,9 +238,14 @@ pub fn redact_path(path: &str) -> String {
     let secret = ACCOUNT.password.as_bytes();
     let holds = |seg: &str| {
         let decoded = unquote_to_bytes(seg.as_bytes());
-        decoded.windows(secret.len()).any(|w| w.eq_ignore_ascii_case(secret))
+        decoded
+            .windows(secret.len())
+            .any(|w| w.eq_ignore_ascii_case(secret))
     };
-    path.split('/').map(|seg| if holds(seg) { "[password]" } else { seg }).collect::<Vec<_>>().join("/")
+    path.split('/')
+        .map(|seg| if holds(seg) { "[password]" } else { seg })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]

@@ -28,7 +28,10 @@ impl Token {
             return Err("it is empty".into());
         }
         if token.len() > MAX_TOKEN {
-            return Err(format!("the token is {} bytes; the most is {MAX_TOKEN}", token.len()));
+            return Err(format!(
+                "the token is {} bytes; the most is {MAX_TOKEN}",
+                token.len()
+            ));
         }
         if !token.iter().all(|b| b.is_ascii_graphic()) {
             return Err("the token must be printable ASCII with no spaces".into());
@@ -43,7 +46,11 @@ impl Token {
         if given.len() != self.0.len() {
             return false;
         }
-        given.iter().zip(&self.0).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+        given
+            .iter()
+            .zip(&self.0)
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
     }
 
     /// Checks a `Proxy-Authorization` value: `Basic` with the token as the
@@ -51,11 +58,17 @@ impl Token {
     /// that put only one value in the URL), or `Bearer <token>`.
     pub fn check_header(&self, value: &[u8]) -> bool {
         let value = value.trim_ascii();
-        let Some(space) = value.iter().position(|&b| b == b' ') else { return false };
+        let Some(space) = value.iter().position(|&b| b == b' ') else {
+            return false;
+        };
         let (scheme, rest) = (&value[..space], value[space..].trim_ascii());
         if scheme.eq_ignore_ascii_case(b"basic") {
-            let Some(decoded) = base64_decode(rest) else { return false };
-            let Some(colon) = decoded.iter().position(|&b| b == b':') else { return false };
+            let Some(decoded) = base64_decode(rest) else {
+                return false;
+            };
+            let Some(colon) = decoded.iter().position(|&b| b == b':') else {
+                return false;
+            };
             let (user, password) = (&decoded[..colon], &decoded[colon + 1..]);
             // Both are checked whatever the first gives, so the time taken
             // does not say which one matched.
@@ -127,7 +140,12 @@ mod tests {
         assert_eq!(base64_decode(b"Zm9vYg==").unwrap(), b"foob");
         assert_eq!(base64_decode(b"+/+/").unwrap(), [0xfb, 0xff, 0xbf]);
         for bad in [&b"Z"[..], b"Zm9v=", b"Zg===", b"Z=g=", b"Zm9v!", b"Zm 9v"] {
-            assert_eq!(base64_decode(bad), None, "{:?}", String::from_utf8_lossy(bad));
+            assert_eq!(
+                base64_decode(bad),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
         }
     }
 

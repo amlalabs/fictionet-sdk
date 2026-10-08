@@ -2,8 +2,8 @@
 //! reads them.
 #![no_main]
 
-use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::coap::Reassembler;
+use fictionet::stdlib::codec::Frames;
 
 use fictionet::stdlib::coap::Block;
 
@@ -26,10 +26,10 @@ use fictionet::stdlib::coap::Type;
 use fictionet::stdlib::coap::option;
 
 use fictionet::stdlib::coap::peek_header;
-use libfuzzer_sys::fuzz_target;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * MAX_BUFFERED);
@@ -72,8 +72,21 @@ fuzz_target!(|data: &[u8]| {
         };
         assert_eq!(m.bad_block(), bad_block);
         let o = &m.options;
-        let _ = (m.bad_option(), o.uri_path(), o.uri_query(), o.content_format(), o.accept(), o.max_age());
-        let _ = (o.observe(), o.size1(), o.size2(), o.uri_host(), o.uri_port());
+        let _ = (
+            m.bad_option(),
+            o.uri_path(),
+            o.uri_query(),
+            o.content_format(),
+            o.accept(),
+            o.max_age(),
+        );
+        let _ = (
+            o.observe(),
+            o.size1(),
+            o.size2(),
+            o.uri_host(),
+            o.uri_port(),
+        );
         // A Uri-Path of `.` or `..` is a bad critical option, and no path
         // reads from it.
         if o.get_all(option::URI_PATH).any(|s| s == b"." || s == b"..") {
@@ -81,7 +94,9 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(o.uri_path(), None);
         }
         // A critical string option that is not UTF-8 is a bad option.
-        if o.get(option::URI_HOST).is_some_and(|v| std::str::from_utf8(v).is_err()) {
+        if o.get(option::URI_HOST)
+            .is_some_and(|v| std::str::from_utf8(v).is_err())
+        {
             assert!(m.bad_option().is_some());
         }
         // A path read writes back as the same segments, except one empty
@@ -135,8 +150,14 @@ fuzz_target!(|data: &[u8]| {
         while let Some((block, chunk)) = Block::take(rest, num, szx) {
             let before = a.body().len();
             if num > 0 {
-                let skipped = Block { num: num + 1, ..block };
-                assert!(matches!(a.push(skipped, chunk), Err(Error::OutOfOrder { .. })));
+                let skipped = Block {
+                    num: num + 1,
+                    ..block
+                };
+                assert!(matches!(
+                    a.push(skipped, chunk),
+                    Err(Error::OutOfOrder { .. })
+                ));
                 assert_eq!(a.body().len(), before);
             }
             if a.push(block, chunk).unwrap() {

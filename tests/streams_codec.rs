@@ -1,10 +1,8 @@
 //! Stream framers and strict protocol wire values.
 
-use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
-use fictionet::stdlib::codec::{
-    Decode, Fail, Lcg, Stream, Wire,
-};
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Decode, Fail, Lcg, Stream, Wire};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::{openvpn, rtcp, rtp, snmp, ssh};
 
@@ -91,7 +89,10 @@ fn openvpn_chunked_tcp_round_trip() {
             },
             &bytes,
         ),
-        (packets.into_iter().map(Ok).collect::<Vec<_>>().to_vec(), None)
+        (
+            packets.into_iter().map(Ok).collect::<Vec<_>>().to_vec(),
+            None
+        )
     );
 }
 
@@ -149,7 +150,10 @@ fn openvpn_wrapping_stays_explicit() {
         check(
             || {
                 Frames::<openvpn::Frame>::new().map(|frame| {
-                    openvpn::Packet::parse_with(&frame.0, openvpn::Wrapping::TlsAuth { hmac_len: 20 })
+                    openvpn::Packet::parse_with(
+                        &frame.0,
+                        openvpn::Wrapping::TlsAuth { hmac_len: 20 },
+                    )
                 })
             },
             &bytes,
@@ -235,9 +239,14 @@ fn rtp_chunked_rfc4571_round_trip() {
 fn rtp_body_error_keeps_stream_and_limit_error_ends_it() {
     let packet = media_packet();
     let mut bytes = contract::check_written(&rtcp::Frame(vec![0, 0]));
-    rtcp::Frame(contract::check_written(&packet)).write(&mut bytes).unwrap();
+    rtcp::Frame(contract::check_written(&packet))
+        .write(&mut bytes)
+        .unwrap();
     assert_eq!(
-        check(|| Frames::<rtcp::Frame>::new().map(|frame| rtp::Packet::parse(&frame.0)), &bytes),
+        check(
+            || Frames::<rtcp::Frame>::new().map(|frame| rtp::Packet::parse(&frame.0)),
+            &bytes
+        ),
         (vec![Err(rtp::Error::Version(0)), Ok(packet)], None)
     );
     refused_header(
@@ -364,7 +373,10 @@ fn rtcp_chunked_compound_round_trip() {
             },
             &bytes,
         ),
-        (vec![Ok(Some(packets.clone())), Ok(None), Ok(Some(packets))], None)
+        (
+            vec![Ok(Some(packets.clone())), Ok(None), Ok(Some(packets))],
+            None
+        )
     );
 }
 
@@ -372,10 +384,13 @@ fn rtcp_chunked_compound_round_trip() {
 fn rtcp_body_error_keeps_stream_and_limit_error_ends_it() {
     let packet = reports().remove(0);
     let mut bytes = contract::check_written(&rtcp::Frame(vec![0x80, rtcp::packet_type::RR, 0, 0]));
-    rtcp::Frame(contract::check_written(&packet)).write(&mut bytes).unwrap();
+    rtcp::Frame(contract::check_written(&packet))
+        .write(&mut bytes)
+        .unwrap();
     assert_eq!(
         check(
-            || Frames::<rtcp::Frame>::new().map(|frame| rtcp::Datagram::parse(&frame.0).map(|value| value.0)),
+            || Frames::<rtcp::Frame>::new()
+                .map(|frame| rtcp::Datagram::parse(&frame.0).map(|value| value.0)),
             &bytes,
         ),
         (
@@ -459,7 +474,10 @@ fn ssh_chunked_cleartext_round_trip() {
         contract::check_truncated(Frames::<ssh::Packet>::new, &encoded);
         packet.write(&mut bytes).unwrap();
     }
-    assert_eq!(check(Frames::<ssh::Packet>::new, &bytes), (packets.to_vec(), None));
+    assert_eq!(
+        check(Frames::<ssh::Packet>::new, &bytes),
+        (packets.to_vec(), None)
+    );
 }
 
 #[test]
@@ -592,7 +610,10 @@ fn snmp_chunked_ber_round_trip() {
         contract::check_truncated(Frames::<snmp::Message>::new, &encoded);
         message.write(&mut bytes).unwrap();
     }
-    assert_eq!(check(Frames::<snmp::Message>::new, &bytes), (vec![Ok(request), Ok(response)], None));
+    assert_eq!(
+        check(Frames::<snmp::Message>::new, &bytes),
+        (vec![Ok(request), Ok(response)], None)
+    );
 }
 
 #[test]
@@ -600,7 +621,10 @@ fn snmp_body_error_keeps_stream_and_framing_error_ends_it() {
     let message = snmp_message();
     let mut bytes = vec![0x30, 0]; // A complete TLV with no message fields.
     message.write(&mut bytes).unwrap();
-    assert_eq!(check(Frames::<snmp::Message>::new, &bytes), (vec![Err(snmp::Error::Truncated), Ok(message)], None));
+    assert_eq!(
+        check(Frames::<snmp::Message>::new, &bytes),
+        (vec![Err(snmp::Error::Truncated), Ok(message)], None)
+    );
     refused_header(
         Frames::<snmp::Message>::new,
         &[0x30, 0x82, 0xff, 0xff],
@@ -611,8 +635,16 @@ fn snmp_body_error_keeps_stream_and_framing_error_ends_it() {
         &[0x30, 17],
         snmp::Error::TooLong(19),
     );
-    refused_header(Frames::<snmp::Message>::new, &[0x30, 0x80], snmp::Error::Length);
-    refused_header(Frames::<snmp::Message>::new, &[0x04], snmp::Error::UnexpectedTag(0x04));
+    refused_header(
+        Frames::<snmp::Message>::new,
+        &[0x30, 0x80],
+        snmp::Error::Length,
+    );
+    refused_header(
+        Frames::<snmp::Message>::new,
+        &[0x04],
+        snmp::Error::UnexpectedTag(0x04),
+    );
 }
 
 #[test]
@@ -625,13 +657,20 @@ fn snmp_accepts_redundant_long_form_ber_lengths() {
     bytes.push(canonical[1]);
     bytes.extend_from_slice(&canonical[2..]);
     contract::check_wire::<snmp::Message>(&bytes);
-    assert_eq!(check(Frames::<snmp::Message>::new, &bytes), (vec![Ok(message)], None));
+    assert_eq!(
+        check(Frames::<snmp::Message>::new, &bytes),
+        (vec![Ok(message)], None)
+    );
     refused_header(
         || Frames::<snmp::Message>::with_limit(16),
         &bytes[..128],
         snmp::Error::TooLong(bytes.len()),
     );
-    contract::check_decode_with_alloc_limit(|| Frames::<snmp::Message>::with_limit(0), &[0x30, 0xfe], 256);
+    contract::check_decode_with_alloc_limit(
+        || Frames::<snmp::Message>::with_limit(0),
+        &[0x30, 0xfe],
+        256,
+    );
 }
 
 #[test]
@@ -665,8 +704,14 @@ fn configured_limits_and_maximum_envelopes() {
         rtcp::MAX_FRAME
     );
     assert_eq!(Frames::<rtcp::Frame>::with_limit(0).capacity(), 2);
-    assert_eq!(Frames::<ssh::Packet>::with_limit(usize::MAX).limit(), ssh::MAX_PACKET);
-    assert_eq!(Frames::<ssh::Packet>::with_limit(0).limit(), ssh::MIN_PACKET);
+    assert_eq!(
+        Frames::<ssh::Packet>::with_limit(usize::MAX).limit(),
+        ssh::MAX_PACKET
+    );
+    assert_eq!(
+        Frames::<ssh::Packet>::with_limit(0).limit(),
+        ssh::MIN_PACKET
+    );
     assert_eq!(
         Frames::<snmp::Message>::with_limit(usize::MAX).limit(),
         snmp::MAX_MESSAGE
@@ -686,12 +731,27 @@ fn configured_limits_and_maximum_envelopes() {
     );
     for length in [1, openvpn::MAX_PACKET] {
         let frame = openvpn::Frame(vec![7; length]);
-        assert_eq!(check(Frames::<openvpn::Frame>::new, &contract::check_written(&frame)), (vec![frame], None));
+        assert_eq!(
+            check(
+                Frames::<openvpn::Frame>::new,
+                &contract::check_written(&frame)
+            ),
+            (vec![frame], None)
+        );
     }
     let frame = rtcp::Frame(vec![7; rtcp::MAX_FRAME]);
-    assert_eq!(check(Frames::<rtcp::Frame>::new, &contract::check_written(&frame)), (vec![frame], None));
+    assert_eq!(
+        check(Frames::<rtcp::Frame>::new, &contract::check_written(&frame)),
+        (vec![frame], None)
+    );
     let packet = ssh_packet(vec![7; ssh::MAX_PAYLOAD]);
-    assert_eq!(check(Frames::<ssh::Packet>::new, &contract::check_written(&packet)), (vec![packet], None));
+    assert_eq!(
+        check(
+            Frames::<ssh::Packet>::new,
+            &contract::check_written(&packet)
+        ),
+        (vec![packet], None)
+    );
 }
 
 #[test]

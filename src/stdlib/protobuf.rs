@@ -53,14 +53,14 @@
 //! assert_eq!(bytes[0], 7);
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Prefixed;
 extern crate alloc;
 
-use fictionet::stdlib::codec::leb128;
 use alloc::vec::Vec;
-use fictionet::stdlib::codec::{Wire};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::leb128;
 
 /// The largest message, in bytes, that this module reads or writes. It is
 /// the default limit on a received message in gRPC (4 MiB).
@@ -155,7 +155,10 @@ impl core::error::Error for Error {}
 pub fn decode_varint(b: &[u8]) -> Result<(u64, usize), Error> {
     let mut bytes = b.iter().copied();
     let value = leb128::decode_with(
-        || bytes.next().ok_or(Error::Truncated), MAX_VARINT_LEN, u64::MAX, Error::VarintOverflow,
+        || bytes.next().ok_or(Error::Truncated),
+        MAX_VARINT_LEN,
+        u64::MAX,
+        Error::VarintOverflow,
     )?;
     Ok((value, b.len() - bytes.len()))
 }
@@ -181,7 +184,9 @@ impl Wire for Varint {
     fn parse(input: &[u8]) -> Result<Self, Error> {
         let (value, used) = decode_varint(input)?;
         if used != input.len() {
-            return Err(Error::Trailing { remaining: input.len().saturating_sub(used) });
+            return Err(Error::Trailing {
+                remaining: input.len().saturating_sub(used),
+            });
         }
         Ok(Self(value))
     }
@@ -283,19 +288,34 @@ impl Message {
 
     /// Every value with field number `number`, in order.
     pub fn all(&self, number: u32) -> impl Iterator<Item = &Value> {
-        self.fields.iter().filter(move |f| f.number == number).map(|f| &f.value)
+        self.fields
+            .iter()
+            .filter(move |f| f.number == number)
+            .map(|f| &f.value)
     }
 
     /// The last value with field number `number`. For a scalar field the
     /// last one wins.
     pub fn last(&self, number: u32) -> Option<&Value> {
-        self.fields.iter().rev().find(|f| f.number == number).map(|f| &f.value)
+        self.fields
+            .iter()
+            .rev()
+            .find(|f| f.number == number)
+            .map(|f| &f.value)
     }
 
     /// The last varint with field number `number`, as a `uint64`. Values
     /// of other wire types are skipped.
     pub fn uint64(&self, number: u32) -> Option<u64> {
-        self.all(number).filter_map(|v| if let Value::Varint(x) = v { Some(*x) } else { None }).last()
+        self.all(number)
+            .filter_map(|v| {
+                if let Value::Varint(x) = v {
+                    Some(*x)
+                } else {
+                    None
+                }
+            })
+            .last()
     }
 
     /// The field as an `int64`.
@@ -330,7 +350,15 @@ impl Message {
 
     /// The last four-byte value with field number `number`, as a `fixed32`.
     pub fn fixed32(&self, number: u32) -> Option<u32> {
-        self.all(number).filter_map(|v| if let Value::Fixed32(x) = v { Some(*x) } else { None }).last()
+        self.all(number)
+            .filter_map(|v| {
+                if let Value::Fixed32(x) = v {
+                    Some(*x)
+                } else {
+                    None
+                }
+            })
+            .last()
     }
 
     /// The field as a `sfixed32`.
@@ -346,7 +374,15 @@ impl Message {
     /// The last eight-byte value with field number `number`, as a
     /// `fixed64`.
     pub fn fixed64(&self, number: u32) -> Option<u64> {
-        self.all(number).filter_map(|v| if let Value::Fixed64(x) = v { Some(*x) } else { None }).last()
+        self.all(number)
+            .filter_map(|v| {
+                if let Value::Fixed64(x) = v {
+                    Some(*x)
+                } else {
+                    None
+                }
+            })
+            .last()
     }
 
     /// The field as a `sfixed64`.
@@ -362,7 +398,15 @@ impl Message {
     /// The last length-delimited value with field number `number`, as
     /// `bytes`.
     pub fn bytes(&self, number: u32) -> Option<&[u8]> {
-        self.all(number).filter_map(|v| if let Value::Bytes(b) = v { Some(&b[..]) } else { None }).last()
+        self.all(number)
+            .filter_map(|v| {
+                if let Value::Bytes(b) = v {
+                    Some(&b[..])
+                } else {
+                    None
+                }
+            })
+            .last()
     }
 
     /// The field as a `string`: the last occurrence wins. It fails if the
@@ -396,8 +440,10 @@ impl Message {
     /// above [`MAX_DEPTH`].
     pub fn message_at(&self, number: u32, depth: usize) -> Result<Option<Message>, Error> {
         // The merged message must fit in one, as its bytes joined would.
-        let len =
-            self.all(number).map(|v| if let Value::Bytes(b) = v { b.len() } else { 0 }).fold(0, usize::saturating_add);
+        let len = self
+            .all(number)
+            .map(|v| if let Value::Bytes(b) = v { b.len() } else { 0 })
+            .fold(0, usize::saturating_add);
         if len > MAX_MESSAGE {
             return Err(Error::TooLong);
         }
@@ -406,7 +452,10 @@ impl Message {
         for v in self.all(number) {
             if let Value::Bytes(b) = v {
                 let m = parse_entry(b, depth, &mut count)?;
-                merged.get_or_insert_with(Message::new).fields.extend(m.fields);
+                merged
+                    .get_or_insert_with(Message::new)
+                    .fields
+                    .extend(m.fields);
             }
         }
         Ok(merged)
@@ -453,7 +502,10 @@ impl Message {
         let mut merged: Option<Message> = None;
         for v in self.all(number) {
             if let Value::Group(g) = v {
-                merged.get_or_insert_with(Message::new).fields.extend(g.fields.iter().cloned());
+                merged
+                    .get_or_insert_with(Message::new)
+                    .fields
+                    .extend(g.fields.iter().cloned());
             }
         }
         merged
@@ -490,7 +542,12 @@ impl Message {
                     if b.len() % 4 != 0 {
                         return Err(Error::Truncated);
                     }
-                    out.extend(b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+                    out.extend(
+                        b.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                    );
                 }
                 _ => {}
             }
@@ -629,14 +686,20 @@ impl Message {
     /// Adds a packed repeated four-byte field.
     pub fn push_packed_fixed32(&mut self, number: u32, vs: &[u32]) {
         if !vs.is_empty() {
-            self.push(number, Value::Bytes(vs.iter().flat_map(|v| v.to_le_bytes()).collect()));
+            self.push(
+                number,
+                Value::Bytes(vs.iter().flat_map(|v| v.to_le_bytes()).collect()),
+            );
         }
     }
 
     /// Adds a packed repeated eight-byte field.
     pub fn push_packed_fixed64(&mut self, number: u32, vs: &[u64]) {
         if !vs.is_empty() {
-            self.push(number, Value::Bytes(vs.iter().flat_map(|v| v.to_le_bytes()).collect()));
+            self.push(
+                number,
+                Value::Bytes(vs.iter().flat_map(|v| v.to_le_bytes()).collect()),
+            );
         }
     }
 }
@@ -644,7 +707,10 @@ impl Message {
 /// Reads one occurrence of an embedded message field of a message at
 /// `depth`, adding its fields, group members included, to `count`.
 fn parse_entry(b: &[u8], depth: usize, count: &mut usize) -> Result<Message, Error> {
-    let depth = depth.checked_add(1).filter(|&d| d <= MAX_DEPTH).ok_or(Error::TooDeep)?;
+    let depth = depth
+        .checked_add(1)
+        .filter(|&d| d <= MAX_DEPTH)
+        .ok_or(Error::TooDeep)?;
     if b.len() > MAX_MESSAGE {
         return Err(Error::TooLong);
     }
@@ -685,14 +751,20 @@ fn parse_fields(
                 Value::Varint(v)
             }
             wire_type::I64 => {
-                let a: [u8; 8] = rest.get(..8).ok_or(Error::Truncated)?.try_into().map_err(|_| Error::Truncated)?;
+                let a: [u8; 8] = rest
+                    .get(..8)
+                    .ok_or(Error::Truncated)?
+                    .try_into()
+                    .map_err(|_| Error::Truncated)?;
                 *pos += 8;
                 Value::Fixed64(u64::from_le_bytes(a))
             }
             wire_type::LEN => {
                 let (len, n) = decode_varint(rest)?;
-                let body =
-                    usize::try_from(len).ok().and_then(|len| rest.get(n..)?.get(..len)).ok_or(Error::Truncated)?;
+                let body = usize::try_from(len)
+                    .ok()
+                    .and_then(|len| rest.get(n..)?.get(..len))
+                    .ok_or(Error::Truncated)?;
                 *pos += n + body.len();
                 Value::Bytes(body.to_vec())
             }
@@ -706,7 +778,10 @@ fn parse_fields(
                     return Err(Error::TooManyFields);
                 }
                 let inner = parse_fields(b, pos, depth + 1, Some(number), count)?;
-                m.fields.push(Field { number, value: Value::Group(inner) });
+                m.fields.push(Field {
+                    number,
+                    value: Value::Group(inner),
+                });
                 continue;
             }
             wire_type::EGROUP => {
@@ -716,7 +791,11 @@ fn parse_fields(
                 return Err(Error::EndGroup(number));
             }
             wire_type::I32 => {
-                let a: [u8; 4] = rest.get(..4).ok_or(Error::Truncated)?.try_into().map_err(|_| Error::Truncated)?;
+                let a: [u8; 4] = rest
+                    .get(..4)
+                    .ok_or(Error::Truncated)?
+                    .try_into()
+                    .map_err(|_| Error::Truncated)?;
                 *pos += 4;
                 Value::Fixed32(u32::from_le_bytes(a))
             }
@@ -732,7 +811,12 @@ fn parse_fields(
 
 /// Appends the fields of `m` to `out`, checking every limit the parser
 /// checks. The depth check before each group bounds the recursion.
-fn write_fields(m: &Message, depth: usize, out: &mut Vec<u8>, count: &mut usize) -> Result<(), Error> {
+fn write_fields(
+    m: &Message,
+    depth: usize,
+    out: &mut Vec<u8>,
+    count: &mut usize,
+) -> Result<(), Error> {
     for f in &m.fields {
         if f.number == 0 || f.number > MAX_FIELD_NUMBER {
             return Err(Error::FieldNumber(u64::from(f.number)));
@@ -782,7 +866,9 @@ impl Frame {
     /// Wraps a message for a delimited stream. Refuses messages that cannot
     /// be written under the field, size, or nesting limits.
     pub fn from_message(message: &Message) -> Result<Self, Error> {
-        Ok(Self { data: message.to_bytes()? })
+        Ok(Self {
+            data: message.to_bytes()?,
+        })
     }
 }
 
@@ -792,9 +878,19 @@ fn parse_frame(input: &[u8]) -> Result<Option<(Frame, usize)>, Error> {
         Err(Error::Truncated) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let length = usize::try_from(length).ok().filter(|n| *n <= MAX_MESSAGE).ok_or(Error::TooLong)?;
+    let length = usize::try_from(length)
+        .ok()
+        .filter(|n| *n <= MAX_MESSAGE)
+        .ok_or(Error::TooLong)?;
     let end = start.checked_add(length).ok_or(Error::TooLong)?;
-    Ok(input.get(start..end).map(|data| (Frame { data: data.to_vec() }, end)))
+    Ok(input.get(start..end).map(|data| {
+        (
+            Frame {
+                data: data.to_vec(),
+            },
+            end,
+        )
+    }))
 }
 
 impl Wire for Frame {
@@ -806,7 +902,9 @@ impl Wire for Frame {
     fn parse(input: &[u8]) -> Result<Self, Error> {
         match parse_frame(input)? {
             Some((frame, used)) if used == input.len() => Ok(frame),
-            Some((_, used)) => Err(Error::Trailing { remaining: input.len().saturating_sub(used) }),
+            Some((_, used)) => Err(Error::Trailing {
+                remaining: input.len().saturating_sub(used),
+            }),
             None => Err(Error::Truncated),
         }
     }
@@ -879,11 +977,13 @@ impl Prefixed for Frame {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        _limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         parse_frame(input)
     }
 }
-
 
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]
@@ -893,7 +993,16 @@ pub mod harness {
 
     /// Counts fields including group members.
     pub fn total_fields(m: &Message) -> usize {
-        m.fields.iter().map(|f| 1 + if let Value::Group(g) = &f.value { total_fields(g) } else { 0 }).sum()
+        m.fields
+            .iter()
+            .map(|f| {
+                1 + if let Value::Group(g) = &f.value {
+                    total_fields(g)
+                } else {
+                    0
+                }
+            })
+            .sum()
     }
 }
 
@@ -901,15 +1010,17 @@ pub mod harness {
 mod tests {
     use super::harness::total_fields;
     use super::*;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::codec::{
-        Lcg,
-    };
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn check(input: &[u8]) {
-        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, input, 2 * Frames::<Frame>::new().capacity());
+        contract::check_decode_with_alloc_limit(
+            Frames::<Frame>::new,
+            input,
+            2 * Frames::<Frame>::new().capacity(),
+        );
     }
 
     fn varint(v: u64) -> Vec<u8> {
@@ -927,21 +1038,41 @@ mod tests {
         let mut m = Message::new();
         m.push_int32(1, -1);
         let b = m.to_bytes().unwrap();
-        assert_eq!(b, [0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]);
+        assert_eq!(
+            b,
+            [
+                0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01
+            ]
+        );
         assert_eq!(Message::parse(&b).unwrap().int32(1), Some(-1));
         assert_eq!(varint(u64::MAX).len(), MAX_VARINT_LEN);
         assert_eq!(decode_varint(&varint(u64::MAX)), Ok((u64::MAX, 10)));
         // Overlong forms read the same.
         assert_eq!(decode_varint(&[0x81, 0x80, 0x80, 0x00]), Ok((1, 4)));
-        for v in [0, 1, 127, 128, 16383, 16384, u64::from(u32::MAX), u64::MAX - 1] {
+        for v in [
+            0,
+            1,
+            127,
+            128,
+            16383,
+            16384,
+            u64::from(u32::MAX),
+            u64::MAX - 1,
+        ] {
             assert_eq!(decode_varint(&varint(v)), Ok((v, varint(v).len())));
         }
     }
 
     #[test]
     fn zigzag_examples() {
-        for (s, u) in [(0i64, 0u64), (-1, 1), (1, 2), (-2, 3), (0x7fff_ffff, 0xffff_fffe), (-0x8000_0000, 0xffff_ffff)]
-        {
+        for (s, u) in [
+            (0i64, 0u64),
+            (-1, 1),
+            (1, 2),
+            (-2, 3),
+            (0x7fff_ffff, 0xffff_fffe),
+            (-0x8000_0000, 0xffff_ffff),
+        ] {
             assert_eq!(zigzag_encode64(s), u);
             assert_eq!(zigzag_decode64(u), s);
             assert_eq!(zigzag_encode32(s as i32), u as u32);
@@ -961,7 +1092,13 @@ mod tests {
     fn spec_messages() {
         // Test1 { a: 150 }
         let t1 = Message::parse(&[0x08, 0x96, 0x01]).unwrap();
-        assert_eq!(t1.fields, [Field { number: 1, value: Value::Varint(150) }]);
+        assert_eq!(
+            t1.fields,
+            [Field {
+                number: 1,
+                value: Value::Varint(150)
+            }]
+        );
         // Test2 { b: "testing" }
         let t2 = Message::parse(&[0x12, 0x07, 0x74, 0x65, 0x73, 0x74, 0x69, 0x6e, 0x67]).unwrap();
         assert_eq!(t2.string(2), Ok(Some("testing")));
@@ -997,8 +1134,10 @@ mod tests {
         assert_eq!(m.uint64(1), Some(3));
         assert_eq!(m.all(1).count(), 3);
         // Embedded messages merge: { a: 1 } then { b: "x" }, and a later a.
-        let m =
-            Message::parse(&[0x1a, 0x02, 0x08, 0x01, 0x1a, 0x03, 0x12, 0x01, b'x', 0x1a, 0x02, 0x08, 0x07]).unwrap();
+        let m = Message::parse(&[
+            0x1a, 0x02, 0x08, 0x01, 0x1a, 0x03, 0x12, 0x01, b'x', 0x1a, 0x02, 0x08, 0x07,
+        ])
+        .unwrap();
         let c = m.message(3).unwrap().unwrap();
         assert_eq!(c.uint64(1), Some(7));
         assert_eq!(c.string(2), Ok(Some("x")));
@@ -1126,7 +1265,9 @@ mod tests {
         assert_eq!(Message::parse(&[0x09, 1, 2, 3]), Err(Error::Truncated));
         assert_eq!(Message::parse(&[0x0d, 1, 2, 3]), Err(Error::Truncated));
         assert_eq!(Message::parse(&[0x0a, 0x05, 1]), Err(Error::Truncated));
-        let huge_len = [0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        let huge_len = [
+            0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+        ];
         assert_eq!(Message::parse(&huge_len), Err(Error::Truncated));
         // Varints past 64 bits.
         assert_eq!(decode_varint(&[0xff; 11]), Err(Error::VarintOverflow));
@@ -1135,12 +1276,17 @@ mod tests {
             Err(Error::VarintOverflow)
         );
         assert_eq!(
-            Message::parse(&[0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]),
+            Message::parse(&[
+                0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f
+            ]),
             Err(Error::VarintOverflow)
         );
         // Field numbers.
         assert_eq!(Message::parse(&[0x00, 0x01]), Err(Error::FieldNumber(0)));
-        assert_eq!(Message::parse(&[0x80, 0x80, 0x80, 0x80, 0x10, 0]), Err(Error::FieldNumber(1 << 29)));
+        assert_eq!(
+            Message::parse(&[0x80, 0x80, 0x80, 0x80, 0x10, 0]),
+            Err(Error::FieldNumber(1 << 29))
+        );
         assert!(Message::parse(&[0xf8, 0xff, 0xff, 0xff, 0x0f, 0]).is_ok());
         let mut w = Message::new();
         w.push_uint64(0, 1);
@@ -1154,9 +1300,15 @@ mod tests {
         // Groups that do not match.
         assert_eq!(Message::parse(&[0x0c]), Err(Error::EndGroup(1)));
         assert_eq!(Message::parse(&[0x0b, 0x14]), Err(Error::EndGroup(2)));
-        assert_eq!(Message::parse(&[0x0b, 0x08, 0x01]), Err(Error::UnclosedGroup(1)));
+        assert_eq!(
+            Message::parse(&[0x0b, 0x08, 0x01]),
+            Err(Error::UnclosedGroup(1))
+        );
         // Too long.
-        assert_eq!(Message::parse(&vec![0; MAX_MESSAGE + 1]), Err(Error::TooLong));
+        assert_eq!(
+            Message::parse(&vec![0; MAX_MESSAGE + 1]),
+            Err(Error::TooLong)
+        );
         let mut w = Message::new();
         w.push_bytes(1, &vec![0; MAX_MESSAGE]);
         assert_eq!(w.to_bytes(), Err(Error::TooLong));
@@ -1174,8 +1326,22 @@ mod tests {
         // Too many fields, both ways.
         let many: Vec<u8> = [0x08, 0x00].repeat(MAX_FIELDS + 1);
         assert_eq!(Message::parse(&many), Err(Error::TooManyFields));
-        assert_eq!(Message::parse(&many[..2 * MAX_FIELDS]).unwrap().fields.len(), MAX_FIELDS);
-        let mut w = Message { fields: vec![Field { number: 1, value: Value::Varint(0) }; MAX_FIELDS] };
+        assert_eq!(
+            Message::parse(&many[..2 * MAX_FIELDS])
+                .unwrap()
+                .fields
+                .len(),
+            MAX_FIELDS
+        );
+        let mut w = Message {
+            fields: vec![
+                Field {
+                    number: 1,
+                    value: Value::Varint(0)
+                };
+                MAX_FIELDS
+            ],
+        };
         assert!(w.to_bytes().is_ok());
         w.push_bool(1, false);
         assert_eq!(w.to_bytes(), Err(Error::TooManyFields));
@@ -1197,7 +1363,11 @@ mod tests {
         assert_eq!(outer.to_bytes(), Err(Error::TooDeep));
         assert_eq!(outer.clone().push_message(2, &outer), Err(Error::TooDeep));
         // Every error prints.
-        for e in [Error::Truncated, Error::Trailing { remaining: 1 }, Error::TooDeep] {
+        for e in [
+            Error::Truncated,
+            Error::Trailing { remaining: 1 },
+            Error::TooDeep,
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1225,7 +1395,10 @@ mod tests {
             match Message::parse(&b[..n]) {
                 // A prefix that ends between fields holds the first fields.
                 Ok(p) => assert_eq!(p.fields[..], m.fields[..p.fields.len()], "{n} bytes"),
-                Err(e) => assert!(matches!(e, Error::Truncated | Error::UnclosedGroup(4)), "{n} bytes: {e:?}"),
+                Err(e) => assert!(
+                    matches!(e, Error::Truncated | Error::UnclosedGroup(4)),
+                    "{n} bytes: {e:?}"
+                ),
             }
         }
         let frame = Frame { data: b };
@@ -1239,15 +1412,21 @@ mod tests {
 
     #[test]
     fn frames() {
-        let frame = Frame { data: vec![0x08, 0x01] };
+        let frame = Frame {
+            data: vec![0x08, 0x01],
+        };
         assert_eq!(frame.to_bytes().unwrap(), [2, 0x08, 0x01]);
         assert_eq!(Frame::parse(&[2, 0x08, 0x01]), Ok(frame));
         assert_eq!(Frame::parse(&[0x81, 0x80, 0x80, 0x02]), Err(Error::TooLong));
         assert_eq!(Frame::parse(&[0xff; 10]), Err(Error::VarintOverflow));
-        let big = Frame { data: vec![0; MAX_MESSAGE + 1] };
+        let big = Frame {
+            data: vec![0; MAX_MESSAGE + 1],
+        };
         assert_eq!(big.to_bytes(), Err(Error::TooLong));
         contract::check_wire_value(&big);
-        let max = Frame { data: vec![0; MAX_MESSAGE] };
+        let max = Frame {
+            data: vec![0; MAX_MESSAGE],
+        };
         let bytes = max.to_bytes().unwrap();
         assert_eq!(Frame::parse(&bytes), Ok(max));
         assert_eq!(Frame::parse(&[0, 0]), Err(Error::Trailing { remaining: 1 }));
@@ -1256,21 +1435,33 @@ mod tests {
     #[test]
     fn grpc_composition() {
         use fictionet::stdlib::grpc;
-        let frame = grpc::Message { compressed: true, data: vec![0x08, 0x01] };
+        let frame = grpc::Message {
+            compressed: true,
+            data: vec![0x08, 0x01],
+        };
         let bytes = Wire::to_bytes(&frame).unwrap();
         assert_eq!(bytes, [1, 0, 0, 0, 2, 0x08, 0x01]);
         contract::check_wire_value(&frame);
-        contract::check_decode_with_alloc_limit(Frames::<grpc::Message>::new, &bytes,
-            2 * (grpc::HEADER_LEN + grpc::DEFAULT_MAX_MESSAGE));
+        contract::check_decode_with_alloc_limit(
+            Frames::<grpc::Message>::new,
+            &bytes,
+            2 * (grpc::HEADER_LEN + grpc::DEFAULT_MAX_MESSAGE),
+        );
         let (frames, error) = decode_all(Frames::<grpc::Message>::new, &bytes);
         assert_eq!(frames, [frame]);
         assert_eq!(error, None);
-        assert!(matches!(decode_all(Frames::<grpc::Message>::new, &[2]).1,
-            Some(Fail::Protocol(grpc::Error::Flag(2)))));
-        assert!(matches!(decode_all(Frames::<grpc::Message>::new, &[0, 0x00, 0x40, 0x00, 0x01]).1,
-            Some(Fail::Protocol(grpc::Error::TooLarge { .. }))));
-        assert!(matches!(decode_all(Frames::<grpc::Message>::new, &[0, 0x00, 0x40, 0x00, 0x00]).1,
-            Some(Fail::Truncated { .. })));
+        assert!(matches!(
+            decode_all(Frames::<grpc::Message>::new, &[2]).1,
+            Some(Fail::Protocol(grpc::Error::Flag(2)))
+        ));
+        assert!(matches!(
+            decode_all(Frames::<grpc::Message>::new, &[0, 0x00, 0x40, 0x00, 0x01]).1,
+            Some(Fail::Protocol(grpc::Error::TooLarge { .. }))
+        ));
+        assert!(matches!(
+            decode_all(Frames::<grpc::Message>::new, &[0, 0x00, 0x40, 0x00, 0x00]).1,
+            Some(Fail::Truncated { .. })
+        ));
     }
 
     #[test]
@@ -1280,8 +1471,10 @@ mod tests {
         Frame { data: vec![] }.write(&mut bytes).unwrap();
         frame.write(&mut bytes).unwrap();
         check(&bytes);
-        assert_eq!(decode_all(Frames::<Frame>::new, &bytes),
-            (vec![frame.clone(), Frame { data: vec![] }, frame], None));
+        assert_eq!(
+            decode_all(Frames::<Frame>::new, &bytes),
+            (vec![frame.clone(), Frame { data: vec![] }, frame], None)
+        );
         let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&[0xff; 12]), 12);
         let error = Fail::Protocol(Error::VarintOverflow);
@@ -1309,7 +1502,8 @@ mod tests {
             pump(&mut stream, &vec![0; size], |frame| {
                 assert!(frame.data.is_empty());
                 count += 1;
-            }).unwrap();
+            })
+            .unwrap();
             finish(&mut stream, |_| panic!("no pending frame")).unwrap();
             assert_eq!(count, size);
             assert_eq!(stream.buffered(), 0);
@@ -1360,7 +1554,8 @@ mod tests {
     #[test]
     fn singular_groups_merge() {
         // Group 1 twice: { 2: 1 }, then { 3: 2, 2: 5 }.
-        let m = Message::parse(&[0x0b, 0x10, 0x01, 0x0c, 0x0b, 0x18, 0x02, 0x10, 0x05, 0x0c]).unwrap();
+        let m =
+            Message::parse(&[0x0b, 0x10, 0x01, 0x0c, 0x0b, 0x18, 0x02, 0x10, 0x05, 0x0c]).unwrap();
         let g = m.group(1).unwrap();
         assert_eq!(g.uint64(3), Some(2));
         assert_eq!(g.uint64(2), Some(5));

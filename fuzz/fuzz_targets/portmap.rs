@@ -5,14 +5,14 @@
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::onc_rpc::{Body, Call, Message, PMAP_PROGRAM};
 use fictionet::stdlib::portmap::{
-    AddrStat, CallArgs, CallResult, MAX_UADDR, Mapping, Netbuf, Error, PmapRequest, PmapResult, Request,
-    RmtCallResult, RmtCallStat, Rpcb, RpcbEntry, RpcbRequest, RpcbResult, RpcbStat, format_uaddr,
-    parse_uaddr,
+    AddrStat, CallArgs, CallResult, Error, MAX_UADDR, Mapping, Netbuf, PmapRequest, PmapResult,
+    Request, RmtCallResult, RmtCallStat, Rpcb, RpcbEntry, RpcbRequest, RpcbResult, RpcbStat,
+    format_uaddr, parse_uaddr,
 };
 use fictionet::stdlib::{
     codec::{Decode, Wire},
-    test_support::contract,
     onc_rpc,
+    test_support::contract,
 };
 use libfuzzer_sys::fuzz_target;
 use std::net::{IpAddr, SocketAddr};
@@ -34,7 +34,10 @@ fn read(data: &[u8]) {
         }
         for version in 1..=5 {
             let call = Call::new(PMAP_PROGRAM, version, procedure, data.to_vec());
-            assert_eq!(Request::read(version, procedure, data), Request::from_call(&call));
+            assert_eq!(
+                Request::read(version, procedure, data),
+                Request::from_call(&call)
+            );
             if let Ok(req) = Request::from_call(&call) {
                 assert_eq!(req.to_call().unwrap(), call);
             }
@@ -50,7 +53,9 @@ fn read(data: &[u8]) {
 /// A string of up to 300 bytes, so some are over the limit.
 fn text(u: &mut Unstructured) -> Result<String> {
     let n = u.int_in_range(0..=300usize)?;
-    Ok((0..n).map(|_| u.int_in_range(b'a'..=b'z').map(char::from)).collect::<Result<_>>()?)
+    Ok((0..n)
+        .map(|_| u.int_in_range(b'a'..=b'z').map(char::from))
+        .collect::<Result<_>>()?)
 }
 
 fn bytes(u: &mut Unstructured, max: usize) -> Result<Vec<u8>> {
@@ -90,13 +95,20 @@ fn call_args(u: &mut Unstructured) -> Result<CallArgs> {
 /// sometimes not.
 fn netbuf(u: &mut Unstructured) -> Result<Netbuf> {
     let buf = bytes(u, 300)?;
-    let maxlen =
-        if u.arbitrary()? { u.arbitrary()? } else { buf.len() as u32 + u32::from(u.arbitrary::<u8>()?) };
+    let maxlen = if u.arbitrary()? {
+        u.arbitrary()?
+    } else {
+        buf.len() as u32 + u32::from(u.arbitrary::<u8>()?)
+    };
     Ok(Netbuf { maxlen, buf })
 }
 
 fn stat(u: &mut Unstructured) -> Result<RpcbStat> {
-    let mut s = RpcbStat { setinfo: u.arbitrary()?, unsetinfo: u.arbitrary()?, ..RpcbStat::default() };
+    let mut s = RpcbStat {
+        setinfo: u.arbitrary()?,
+        unsetinfo: u.arbitrary()?,
+        ..RpcbStat::default()
+    };
     s.info = u.arbitrary()?;
     for _ in 0..u.int_in_range(0..=1100)? {
         s.addrinfo.push(AddrStat {
@@ -148,7 +160,10 @@ fn request(u: &mut Unstructured) -> Result<Request> {
         11 => RpcbRequest::GetAddrList(rpcb(u)?),
         _ => RpcbRequest::GetStat,
     };
-    Ok(Request::Rpcb { version: u.int_in_range(1..=6)?, request })
+    Ok(Request::Rpcb {
+        version: u.int_in_range(1..=6)?,
+        request,
+    })
 }
 
 fn pmap_result(u: &mut Unstructured) -> Result<PmapResult> {
@@ -160,7 +175,10 @@ fn pmap_result(u: &mut Unstructured) -> Result<PmapResult> {
             let n = u.int_in_range(0..=1100usize)?;
             PmapResult::Dump((0..n).map(|_| mapping(u)).collect::<Result<_>>()?)
         }
-        _ => PmapResult::CallIt(CallResult { port: u.arbitrary()?, results: bytes(u, 70_000)? }),
+        _ => PmapResult::CallIt(CallResult {
+            port: u.arbitrary()?,
+            results: bytes(u, 70_000)?,
+        }),
     })
 }
 
@@ -173,7 +191,10 @@ fn rpcb_result(u: &mut Unstructured) -> Result<RpcbResult> {
             let n = u.int_in_range(0..=1100usize)?;
             RpcbResult::Dump((0..n).map(|_| rpcb(u)).collect::<Result<_>>()?)
         }
-        4 => RpcbResult::CallIt(RmtCallResult { addr: text(u)?, results: bytes(u, 70_000)? }),
+        4 => RpcbResult::CallIt(RmtCallResult {
+            addr: text(u)?,
+            results: bytes(u, 70_000)?,
+        }),
         5 => RpcbResult::Time(u.arbitrary()?),
         6 => RpcbResult::Netbuf(netbuf(u)?),
         7 => {
@@ -199,7 +220,9 @@ fn built(data: &[u8]) -> Result<()> {
     let req = request(&mut u)?;
     if let Ok(msg) = req.call(u.arbitrary()?) {
         let back = <Message as Wire>::parse(&msg.to_bytes().unwrap()).unwrap();
-        let Body::Call(call) = &back.body else { panic!("not a call") };
+        let Body::Call(call) = &back.body else {
+            panic!("not a call")
+        };
         assert_eq!(Request::from_call(call), Ok(req));
     }
     let res = pmap_result(&mut u)?;

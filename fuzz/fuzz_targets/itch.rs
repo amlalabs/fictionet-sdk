@@ -3,14 +3,12 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{
-    Wire,
-};
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::itch::{
     AddOrder, Book, BookConfig, MAX_MESSAGE_LENGTH, Message, Noii, OrderReplace, StockDirectory,
 };
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;

@@ -2,15 +2,13 @@
 //! server and exchange driven by whatever inbound messages parse.
 #![no_main]
 
-use fictionet::stdlib::session::Action;
-use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::cboe_boe::{
-    ClientHeartbeat, Event, Exchange, ExchangeConfig, Inbound, LoginRequest,
-    NewOrder, OrderEvent, Outbound, Price, Server, Timers, UnitSequence,
+    ClientHeartbeat, Event, Exchange, ExchangeConfig, Inbound, LoginRequest, NewOrder, OrderEvent,
+    Outbound, Price, Server, Timers, UnitSequence,
 };
-use fictionet::stdlib::codec::{
-    Wire,
-};
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::session::Action;
 use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use libfuzzer_sys::fuzz_target;
 

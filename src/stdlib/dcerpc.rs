@@ -96,11 +96,11 @@
 //! assert_eq!(reply.len(), 16 + 8 + 2 + 4 + 2 + 4 + 24);
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::ascii::hex_value as hex;
-use fictionet::stdlib::codec::{be16, be32, le16, le32, Wire, Reader, Truncated};
+use fictionet::stdlib::codec::{Reader, Truncated, Wire, be16, be32, le16, le32};
 
 /// The TCP port of the endpoint mapper.
 pub const PORT: u16 = 135;
@@ -318,7 +318,10 @@ impl Uuid {
         let a = a.to_be_bytes();
         let b = b.to_be_bytes();
         let c = c.to_be_bytes();
-        Uuid([a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
+        Uuid([
+            a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], d[0], d[1], d[2], d[3], d[4], d[5],
+            d[6], d[7],
+        ])
     }
 
     /// Reads the usual string form, such as
@@ -379,26 +382,45 @@ pub struct SyntaxId {
 
 impl SyntaxId {
     /// The empty syntax a refused context is answered with.
-    pub const NIL: SyntaxId = SyntaxId { uuid: Uuid::NIL, major: 0, minor: 0 };
+    pub const NIL: SyntaxId = SyntaxId {
+        uuid: Uuid::NIL,
+        major: 0,
+        minor: 0,
+    };
 }
 
 /// The NDR transfer syntax, version 2.0.
 pub const NDR: SyntaxId = SyntaxId {
-    uuid: Uuid::from_fields(0x8a88_5d04, 0x1ceb, 0x11c9, [0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10, 0x48, 0x60]),
+    uuid: Uuid::from_fields(
+        0x8a88_5d04,
+        0x1ceb,
+        0x11c9,
+        [0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10, 0x48, 0x60],
+    ),
     major: 2,
     minor: 0,
 };
 
 /// The NDR64 transfer syntax, version 1.0 (MS-RPCE).
 pub const NDR64: SyntaxId = SyntaxId {
-    uuid: Uuid::from_fields(0x7171_0533, 0xbeba, 0x4937, [0x83, 0x19, 0xb5, 0xdb, 0xef, 0x9c, 0xcc, 0x36]),
+    uuid: Uuid::from_fields(
+        0x7171_0533,
+        0xbeba,
+        0x4937,
+        [0x83, 0x19, 0xb5, 0xdb, 0xef, 0x9c, 0xcc, 0x36],
+    ),
     major: 1,
     minor: 0,
 };
 
 /// The endpoint mapper's interface, version 3.0.
 pub const EPMAPPER: SyntaxId = SyntaxId {
-    uuid: Uuid::from_fields(0xe1af_8308, 0x5d1f, 0x11c9, [0x91, 0xa4, 0x08, 0x00, 0x2b, 0x14, 0xa0, 0xfa]),
+    uuid: Uuid::from_fields(
+        0xe1af_8308,
+        0x5d1f,
+        0x11c9,
+        [0x91, 0xa4, 0x08, 0x00, 0x2b, 0x14, 0xa0, 0xfa],
+    ),
     major: 3,
     minor: 0,
 };
@@ -501,12 +523,20 @@ pub struct ContextResult {
 impl ContextResult {
     /// A context accepted with `syntax`.
     pub fn accept(syntax: SyntaxId) -> ContextResult {
-        ContextResult { result: result::ACCEPTANCE, reason: reason::NOT_SPECIFIED, transfer_syntax: syntax }
+        ContextResult {
+            result: result::ACCEPTANCE,
+            reason: reason::NOT_SPECIFIED,
+            transfer_syntax: syntax,
+        }
     }
 
     /// A context the runtime refused, for `reason`.
     pub fn reject(reason: u16) -> ContextResult {
-        ContextResult { result: result::PROVIDER_REJECTION, reason, transfer_syntax: SyntaxId::NIL }
+        ContextResult {
+            result: result::PROVIDER_REJECTION,
+            reason,
+            transfer_syntax: SyntaxId::NIL,
+        }
     }
 }
 
@@ -628,7 +658,9 @@ impl Body {
     /// The stub data of a request, response or fault.
     pub fn stub(&self) -> Option<&[u8]> {
         match self {
-            Body::Request { stub, .. } | Body::Response { stub, .. } | Body::Fault { stub, .. } => Some(stub),
+            Body::Request { stub, .. } | Body::Response { stub, .. } | Body::Fault { stub, .. } => {
+                Some(stub)
+            }
             _ => None,
         }
     }
@@ -636,20 +668,38 @@ impl Body {
     /// A copy with any stub data left out.
     fn clone_without_stub(&self) -> Body {
         match self {
-            Body::Request { alloc_hint, context_id, opnum, object, .. } => Body::Request {
+            Body::Request {
+                alloc_hint,
+                context_id,
+                opnum,
+                object,
+                ..
+            } => Body::Request {
                 alloc_hint: *alloc_hint,
                 context_id: *context_id,
                 opnum: *opnum,
                 object: *object,
                 stub: Vec::new(),
             },
-            Body::Response { alloc_hint, context_id, cancel_count, .. } => Body::Response {
+            Body::Response {
+                alloc_hint,
+                context_id,
+                cancel_count,
+                ..
+            } => Body::Response {
                 alloc_hint: *alloc_hint,
                 context_id: *context_id,
                 cancel_count: *cancel_count,
                 stub: Vec::new(),
             },
-            Body::Fault { alloc_hint, context_id, cancel_count, fault_flags, status, .. } => Body::Fault {
+            Body::Fault {
+                alloc_hint,
+                context_id,
+                cancel_count,
+                fault_flags,
+                status,
+                ..
+            } => Body::Fault {
                 alloc_hint: *alloc_hint,
                 context_id: *context_id,
                 cancel_count: *cancel_count,
@@ -663,7 +713,9 @@ impl Body {
 
     fn stub_mut(&mut self) -> Option<&mut Vec<u8>> {
         match self {
-            Body::Request { stub, .. } | Body::Response { stub, .. } | Body::Fault { stub, .. } => Some(stub),
+            Body::Request { stub, .. } | Body::Response { stub, .. } | Body::Fault { stub, .. } => {
+                Some(stub)
+            }
             _ => None,
         }
     }
@@ -762,21 +814,37 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::TooLong { length, limit } => write!(f, "DCE/RPC fragment of {length} bytes exceeds {limit}"),
+            Error::TooLong { length, limit } => {
+                write!(f, "DCE/RPC fragment of {length} bytes exceeds {limit}")
+            }
             Error::Incomplete => f.write_str("incomplete DCE/RPC fragment"),
             Error::Trailing { remaining } => write!(f, "{remaining} bytes after DCE/RPC fragment"),
             Error::Unwritable => f.write_str("DCE/RPC value cannot be written without changing it"),
-            Error::Version { major, minor } => write!(f, "DCE/RPC version {major}.{minor}, not 5.0 or 5.1"),
+            Error::Version { major, minor } => {
+                write!(f, "DCE/RPC version {major}.{minor}, not 5.0 or 5.1")
+            }
             Error::IntegerRep(r) => write!(f, "integer representation {r}, not 0 or 1"),
             Error::FragLength(n) => write!(f, "fragment length {n}, shorter than the header"),
             Error::Type(t) => write!(f, "packet type {t} is not a connection-oriented PDU"),
-            Error::AuthLength(n) => write!(f, "auth length {n} does not fit in the fragment or the packet type"),
-            Error::AuthPad(n) => write!(f, "auth padding of {n} bytes runs into the header or misaligns the trailer"),
+            Error::AuthLength(n) => write!(
+                f,
+                "auth length {n} does not fit in the fragment or the packet type"
+            ),
+            Error::AuthPad(n) => write!(
+                f,
+                "auth padding of {n} bytes runs into the header or misaligns the trailer"
+            ),
             Error::Truncated => f.write_str("the PDU body is shorter than its fields"),
             Error::Address => f.write_str("the secondary address does not end with a zero byte"),
-            Error::Interleaved { call_id } => write!(f, "call {call_id} started inside another call"),
-            Error::UnexpectedFragment { call_id } => write!(f, "a fragment of call {call_id} came out of order"),
-            Error::StubTooLong { call_id } => write!(f, "call {call_id} has more stub data than allowed"),
+            Error::Interleaved { call_id } => {
+                write!(f, "call {call_id} started inside another call")
+            }
+            Error::UnexpectedFragment { call_id } => {
+                write!(f, "a fragment of call {call_id} came out of order")
+            }
+            Error::StubTooLong { call_id } => {
+                write!(f, "call {call_id} has more stub data than allowed")
+            }
         }
     }
 }
@@ -789,16 +857,30 @@ impl Pdu {
     /// gets the [`flags::OBJECT_UUID`] flag.
     pub fn new(call_id: u32, body: Body) -> Pdu {
         let mut flags = flags::FIRST_FRAG | flags::LAST_FRAG;
-        if let Body::Request { object: Some(_), .. } = body {
+        if let Body::Request {
+            object: Some(_), ..
+        } = body
+        {
             flags |= self::flags::OBJECT_UUID;
         }
-        Pdu { version_minor: 0, flags, drep: DataRep::LITTLE_ENDIAN, call_id, body, auth: None }
+        Pdu {
+            version_minor: 0,
+            flags,
+            drep: DataRep::LITTLE_ENDIAN,
+            call_id,
+            body,
+            auth: None,
+        }
     }
 
     /// A whole PDU that answers this one with `body`, with the same call
     /// ID, version and data representation.
     pub fn reply(&self, body: Body) -> Pdu {
-        Pdu { version_minor: self.version_minor, drep: self.drep, ..Pdu::new(self.call_id, body) }
+        Pdu {
+            version_minor: self.version_minor,
+            drep: self.drep,
+            ..Pdu::new(self.call_id, body)
+        }
     }
 
     /// How long the PDU at the start of `b` is, from its header. It
@@ -807,16 +889,23 @@ impl Pdu {
     /// byte on.
     pub fn frame_length(b: &[u8]) -> Result<Option<usize>, Error> {
         if b.len() >= 2 && (b[0] != VERSION || b[1] > 1) {
-            return Err(Error::Version { major: b[0], minor: b[1] });
+            return Err(Error::Version {
+                major: b[0],
+                minor: b[1],
+            });
         }
         if b.len() < 5 {
             return Ok(None);
         }
-        let le = DataRep([b[4], 0, 0, 0]).little_endian().ok_or(Error::IntegerRep(b[4] >> 4))?;
+        let le = DataRep([b[4], 0, 0, 0])
+            .little_endian()
+            .ok_or(Error::IntegerRep(b[4] >> 4))?;
         if b.len() < 10 {
             return Ok(None);
         }
-        let Some(n) = (if le { le16(b, 8) } else { be16(b, 8) }) else { return Ok(None); };
+        let Some(n) = (if le { le16(b, 8) } else { be16(b, 8) }) else {
+            return Ok(None);
+        };
         if usize::from(n) < HEADER_LEN {
             return Err(Error::FragLength(n));
         }
@@ -839,7 +928,9 @@ impl Pdu {
             return Err(Error::Unwritable);
         }
         let header = match &self.body {
-            Body::Request { object: Some(_), .. } => HEADER_LEN + 24,
+            Body::Request {
+                object: Some(_), ..
+            } => HEADER_LEN + 24,
             Body::Request { .. } | Body::Response { .. } => HEADER_LEN + 8,
             _ => {
                 // The writer stops at MAX_FRAG bytes, so this copies at
@@ -854,15 +945,27 @@ impl Pdu {
         // stub is copied once in all rather than once per fragment.
         let template = self.body.clone_without_stub();
         // The header the fragments share, written once to check it.
-        Pdu { auth: None, body: template.clone(), ..*self }.to_bytes()?;
-        let room = usize::from(max_frag).checked_sub(header).filter(|&r| r > 0).ok_or(Error::Unwritable)?;
+        Pdu {
+            auth: None,
+            body: template.clone(),
+            ..*self
+        }
+        .to_bytes()?;
+        let room = usize::from(max_frag)
+            .checked_sub(header)
+            .filter(|&r| r > 0)
+            .ok_or(Error::Unwritable)?;
         let stub = self.body.stub().unwrap_or(&[]);
         let n = stub.len().div_ceil(room).max(1);
         if n > MAX_FRAGMENTS {
             return Err(Error::Unwritable);
         }
         let base = self.flags & !(flags::FIRST_FRAG | flags::LAST_FRAG);
-        let pieces: Vec<&[u8]> = if stub.is_empty() { vec![&[]] } else { stub.chunks(room).collect() };
+        let pieces: Vec<&[u8]> = if stub.is_empty() {
+            vec![&[]]
+        } else {
+            stub.chunks(room).collect()
+        };
         let last = n - 1;
         let mut out = Vec::with_capacity(n);
         for (i, piece) in pieces.into_iter().enumerate() {
@@ -908,7 +1011,9 @@ impl Wire for Pdu {
         let used = Self::frame_length(bytes)?.ok_or(Error::Incomplete)?;
         let fragment = bytes.get(..used).ok_or(Error::Incomplete)?;
         if used != bytes.len() {
-            return Err(Error::Trailing { remaining: bytes.len() - used });
+            return Err(Error::Trailing {
+                remaining: bytes.len() - used,
+            });
         }
         let pdu = parse_fragment(fragment)?;
         pdu.write(&mut Vec::new())?;
@@ -931,18 +1036,30 @@ impl Wire for Pdu {
             return Err(Error::Unwritable);
         }
         match (&self.body, &self.auth) {
-            (Body::Auth3, None) | (Body::BindNak(_) | Body::Shutdown, Some(_)) => return Err(Error::Unwritable),
+            (Body::Auth3, None) | (Body::BindNak(_) | Body::Shutdown, Some(_)) => {
+                return Err(Error::Unwritable);
+            }
             _ => {}
         }
-        let mut w = W { out: Vec::with_capacity(64), le };
-        w.out.extend_from_slice(&[VERSION, self.version_minor, self.body.ptype(), self.flags]);
+        let mut w = W {
+            out: Vec::with_capacity(64),
+            le,
+        };
+        w.out
+            .extend_from_slice(&[VERSION, self.version_minor, self.body.ptype(), self.flags]);
         w.out.extend_from_slice(&self.drep.0);
         // The fragment and auth lengths, filled in at the end.
         w.out.extend_from_slice(&[0; 4]);
         w.u32(self.call_id);
         let mut stub_start = None;
         match &self.body {
-            Body::Request { alloc_hint, context_id, opnum, object, stub } => {
+            Body::Request {
+                alloc_hint,
+                context_id,
+                opnum,
+                object,
+                stub,
+            } => {
                 w.u32(*alloc_hint);
                 w.u16(*context_id);
                 w.u16(*opnum);
@@ -952,14 +1069,26 @@ impl Wire for Pdu {
                 stub_start = Some(w.out.len());
                 w.bytes(stub)?;
             }
-            Body::Response { alloc_hint, context_id, cancel_count, stub } => {
+            Body::Response {
+                alloc_hint,
+                context_id,
+                cancel_count,
+                stub,
+            } => {
                 w.u32(*alloc_hint);
                 w.u16(*context_id);
                 w.out.extend_from_slice(&[*cancel_count, 0]);
                 stub_start = Some(w.out.len());
                 w.bytes(stub)?;
             }
-            Body::Fault { alloc_hint, context_id, cancel_count, fault_flags, status, stub } => {
+            Body::Fault {
+                alloc_hint,
+                context_id,
+                cancel_count,
+                fault_flags,
+                status,
+                stub,
+            } => {
                 w.u32(*alloc_hint);
                 w.u16(*context_id);
                 w.out.extend_from_slice(&[*cancel_count, *fault_flags]);
@@ -972,10 +1101,12 @@ impl Wire for Pdu {
                 w.u16(b.max_xmit_frag);
                 w.u16(b.max_recv_frag);
                 w.u32(b.assoc_group);
-                w.out.extend_from_slice(&[count(b.contexts.len())?, 0, 0, 0]);
+                w.out
+                    .extend_from_slice(&[count(b.contexts.len())?, 0, 0, 0]);
                 for c in &b.contexts {
                     w.u16(c.id);
-                    w.out.extend_from_slice(&[count(c.transfer_syntaxes.len())?, 0]);
+                    w.out
+                        .extend_from_slice(&[count(c.transfer_syntaxes.len())?, 0]);
                     w.syntax(c.abstract_syntax);
                     for s in &c.transfer_syntaxes {
                         w.syntax(*s);
@@ -1023,7 +1154,10 @@ impl Wire for Pdu {
             match stub_start {
                 Some(s) => {
                     let n = before - s;
-                    w.out.resize(before + (AUTH_PAD_ALIGN - n % AUTH_PAD_ALIGN) % AUTH_PAD_ALIGN, 0);
+                    w.out.resize(
+                        before + (AUTH_PAD_ALIGN - n % AUTH_PAD_ALIGN) % AUTH_PAD_ALIGN,
+                        0,
+                    );
                 }
                 None => w.align(4),
             }
@@ -1074,26 +1208,41 @@ impl Prefixed for Pdu {
     const NAME: &'static str = "DCE/RPC";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_FRAG }
+    fn default_limit() -> Self::Limit {
+        MAX_FRAG
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(HEADER_LEN, MAX_FRAG) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.clamp(HEADER_LEN, MAX_FRAG)
+    }
 
     #[inline]
-    fn capacity(limit: &Self::Limit) -> usize { *limit }
+    fn capacity(limit: &Self::Limit) -> usize {
+        *limit
+    }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
-        let Some(used) = Pdu::frame_length(input)? else { return Ok(None) };
+        let Some(used) = Pdu::frame_length(input)? else {
+            return Ok(None);
+        };
         if used > limit {
-            return Err(Error::TooLong { length: used, limit });
+            return Err(Error::TooLong {
+                length: used,
+                limit,
+            });
         }
-        let Some(bytes) = input.get(..used) else { return Ok(None) };
+        let Some(bytes) = input.get(..used) else {
+            return Ok(None);
+        };
         Ok(Some((parse_fragment(bytes), used)))
     }
 }
-
 
 /// How many items a list holds, as its 8-bit count.
 fn count(n: usize) -> Result<u8, Error> {
@@ -1113,7 +1262,9 @@ fn parse_fragment(f: &[u8]) -> Result<Pdu, Error> {
     }
     match kind {
         ptype::AUTH3 if auth_len == 0 => return Err(Error::AuthLength(0)),
-        ptype::BIND_NAK | ptype::SHUTDOWN if auth_len > 0 => return Err(Error::AuthLength(auth_len)),
+        ptype::BIND_NAK | ptype::SHUTDOWN if auth_len > 0 => {
+            return Err(Error::AuthLength(auth_len));
+        }
         _ => {}
     }
     let mut end = f.len();
@@ -1125,41 +1276,87 @@ fn parse_fragment(f: &[u8]) -> Result<Pdu, Error> {
             .filter(|&t| t >= HEADER_LEN)
             .ok_or(Error::AuthLength(auth_len))?;
         let pad = f[t + 2];
-        end = t.checked_sub(usize::from(pad)).filter(|&e| e >= HEADER_LEN && t % 4 == 0).ok_or(Error::AuthPad(pad))?;
+        end = t
+            .checked_sub(usize::from(pad))
+            .filter(|&e| e >= HEADER_LEN && t % 4 == 0)
+            .ok_or(Error::AuthPad(pad))?;
         auth = Some(Auth {
             kind: f[t],
             level: f[t + 1],
-            context_id: (if le { le32(f, t + 4) } else { be32(f, t + 4) }).ok_or(Error::Truncated)?,
+            context_id: (if le { le32(f, t + 4) } else { be32(f, t + 4) })
+                .ok_or(Error::Truncated)?,
             value: f[t + SEC_TRAILER_LEN..].to_vec(),
         });
     }
-    let mut r = Fields { cursor: { let mut r = Reader::new(&f[..end]); r.skip(HEADER_LEN)?; r }, le };
+    let mut r = Fields {
+        cursor: {
+            let mut r = Reader::new(&f[..end]);
+            r.skip(HEADER_LEN)?;
+            r
+        },
+        le,
+    };
     let body = match kind {
         ptype::REQUEST => {
             let (alloc_hint, context_id, opnum) = (r.u32()?, r.u16()?, r.u16()?);
-            let object = if pdu_flags & flags::OBJECT_UUID != 0 { Some(r.uuid()?) } else { None };
-            Body::Request { alloc_hint, context_id, opnum, object, stub: r.rest() }
+            let object = if pdu_flags & flags::OBJECT_UUID != 0 {
+                Some(r.uuid()?)
+            } else {
+                None
+            };
+            Body::Request {
+                alloc_hint,
+                context_id,
+                opnum,
+                object,
+                stub: r.rest(),
+            }
         }
         ptype::RESPONSE => {
             let (alloc_hint, context_id, cancel_count) = (r.u32()?, r.u16()?, r.u8()?);
             r.take(1)?;
-            Body::Response { alloc_hint, context_id, cancel_count, stub: r.rest() }
+            Body::Response {
+                alloc_hint,
+                context_id,
+                cancel_count,
+                stub: r.rest(),
+            }
         }
         ptype::FAULT => {
-            let (alloc_hint, context_id, cancel_count, fault_flags) = (r.u32()?, r.u16()?, r.u8()?, r.u8()?);
+            let (alloc_hint, context_id, cancel_count, fault_flags) =
+                (r.u32()?, r.u16()?, r.u8()?, r.u8()?);
             let status = r.u32()?;
             // The reserved word after the status; some senders leave it
             // out of a fault with no stub data.
-            let stub = if r.take(4).is_ok() { r.rest() } else { Vec::new() };
-            Body::Fault { alloc_hint, context_id, cancel_count, fault_flags, status, stub }
+            let stub = if r.take(4).is_ok() {
+                r.rest()
+            } else {
+                Vec::new()
+            };
+            Body::Fault {
+                alloc_hint,
+                context_id,
+                cancel_count,
+                fault_flags,
+                status,
+                stub,
+            }
         }
         ptype::BIND | ptype::ALTER_CONTEXT => {
             let b = read_bind(&mut r)?;
-            if kind == ptype::BIND { Body::Bind(b) } else { Body::AlterContext(b) }
+            if kind == ptype::BIND {
+                Body::Bind(b)
+            } else {
+                Body::AlterContext(b)
+            }
         }
         ptype::BIND_ACK | ptype::ALTER_CONTEXT_RESP => {
             let a = read_bind_ack(&mut r)?;
-            if kind == ptype::BIND_ACK { Body::BindAck(a) } else { Body::AlterContextResp(a) }
+            if kind == ptype::BIND_ACK {
+                Body::BindAck(a)
+            } else {
+                Body::AlterContextResp(a)
+            }
         }
         ptype::BIND_NAK => {
             let reason = r.u16()?;
@@ -1181,7 +1378,14 @@ fn parse_fragment(f: &[u8]) -> Result<Pdu, Error> {
         ptype::CO_CANCEL => Body::Cancel,
         _ => Body::Orphaned,
     };
-    Ok(Pdu { version_minor, flags: pdu_flags, drep, call_id, body, auth })
+    Ok(Pdu {
+        version_minor,
+        flags: pdu_flags,
+        drep,
+        call_id,
+        body,
+        auth,
+    })
 }
 
 fn read_bind(r: &mut Fields) -> Result<Bind, Error> {
@@ -1198,9 +1402,18 @@ fn read_bind(r: &mut Fields) -> Result<Bind, Error> {
         for _ in 0..k {
             transfer_syntaxes.push(r.syntax()?);
         }
-        contexts.push(Context { id, abstract_syntax, transfer_syntaxes });
+        contexts.push(Context {
+            id,
+            abstract_syntax,
+            transfer_syntaxes,
+        });
     }
-    Ok(Bind { max_xmit_frag, max_recv_frag, assoc_group, contexts })
+    Ok(Bind {
+        max_xmit_frag,
+        max_recv_frag,
+        assoc_group,
+        contexts,
+    })
 }
 
 fn read_bind_ack(r: &mut Fields) -> Result<BindAck, Error> {
@@ -1216,9 +1429,19 @@ fn read_bind_ack(r: &mut Fields) -> Result<BindAck, Error> {
     let mut results = Vec::new();
     for _ in 0..k {
         let (result, reason) = (r.u16()?, r.u16()?);
-        results.push(ContextResult { result, reason, transfer_syntax: r.syntax()? });
+        results.push(ContextResult {
+            result,
+            reason,
+            transfer_syntax: r.syntax()?,
+        });
     }
-    Ok(BindAck { max_xmit_frag, max_recv_frag, assoc_group, secondary_address, results })
+    Ok(BindAck {
+        max_xmit_frag,
+        max_recv_frag,
+        assoc_group,
+        secondary_address,
+        results,
+    })
 }
 
 /// Reads fields from a fragment, counting `pos` from the PDU's start so
@@ -1241,12 +1464,22 @@ impl<'a> Fields<'a> {
 
     #[inline]
     fn u16(&mut self) -> Result<u16, Error> {
-        if self.le { self.cursor.u16_le() } else { self.cursor.u16_be() }.map_err(Error::from)
+        if self.le {
+            self.cursor.u16_le()
+        } else {
+            self.cursor.u16_be()
+        }
+        .map_err(Error::from)
     }
 
     #[inline]
     fn u32(&mut self) -> Result<u32, Error> {
-        if self.le { self.cursor.u32_le() } else { self.cursor.u32_be() }.map_err(Error::from)
+        if self.le {
+            self.cursor.u32_le()
+        } else {
+            self.cursor.u32_be()
+        }
+        .map_err(Error::from)
     }
 
     fn uuid(&mut self) -> Result<Uuid, Error> {
@@ -1260,7 +1493,11 @@ impl<'a> Fields<'a> {
     fn syntax(&mut self) -> Result<SyntaxId, Error> {
         let uuid = self.uuid()?;
         let v = self.u32()?;
-        Ok(SyntaxId { uuid, major: v as u16, minor: (v >> 16) as u16 })
+        Ok(SyntaxId {
+            uuid,
+            major: v as u16,
+            minor: (v >> 16) as u16,
+        })
     }
 
     #[inline]
@@ -1277,11 +1514,19 @@ struct W {
 
 impl W {
     fn u16(&mut self, v: u16) {
-        self.out.extend_from_slice(&if self.le { v.to_le_bytes() } else { v.to_be_bytes() });
+        self.out.extend_from_slice(&if self.le {
+            v.to_le_bytes()
+        } else {
+            v.to_be_bytes()
+        });
     }
 
     fn u32(&mut self, v: u32) {
-        self.out.extend_from_slice(&if self.le { v.to_le_bytes() } else { v.to_be_bytes() });
+        self.out.extend_from_slice(&if self.le {
+            v.to_le_bytes()
+        } else {
+            v.to_be_bytes()
+        });
     }
 
     fn uuid(&mut self, u: Uuid) {
@@ -1308,7 +1553,11 @@ impl W {
     }
 
     fn check(&self) -> Result<(), Error> {
-        if self.out.len() > MAX_FRAG { Err(Error::Unwritable) } else { Ok(()) }
+        if self.out.len() > MAX_FRAG {
+            Err(Error::Unwritable)
+        } else {
+            Ok(())
+        }
     }
 
     /// Pads with zeros to a multiple of `n` from the PDU's start.
@@ -1354,12 +1603,19 @@ impl Reassembler {
     /// A reassembler that joins calls of up to `limit` bytes of stub data,
     /// or [`MAX_STUB`] if that is less.
     pub fn new(limit: usize) -> Reassembler {
-        Reassembler { limit: limit.min(MAX_STUB), partial: None, security: None }
+        Reassembler {
+            limit: limit.min(MAX_STUB),
+            partial: None,
+            security: None,
+        }
     }
 
     /// How many bytes of stub data are held for the call being joined.
     pub fn pending(&self) -> usize {
-        self.partial.as_ref().and_then(|p| p.body.stub()).map_or(0, <[u8]>::len)
+        self.partial
+            .as_ref()
+            .and_then(|p| p.body.stub())
+            .map_or(0, <[u8]>::len)
     }
 
     /// Takes one PDU. It returns a whole call or another PDU when one is
@@ -1394,28 +1650,50 @@ impl Reassembler {
             self.partial = Some(Pdu { auth: None, ..pdu });
             return Ok(None);
         }
-        let Some(mut p) = self.partial.take() else { return Err(Error::UnexpectedFragment { call_id }) };
+        let Some(mut p) = self.partial.take() else {
+            return Err(Error::UnexpectedFragment { call_id });
+        };
         let same = p.call_id == call_id
             && self.security == security(&pdu)
             && match (&p.body, &pdu.body) {
                 (
-                    Body::Request { context_id: a, opnum: b, object: c, .. },
-                    Body::Request { context_id: x, opnum: y, object: z, .. },
+                    Body::Request {
+                        context_id: a,
+                        opnum: b,
+                        object: c,
+                        ..
+                    },
+                    Body::Request {
+                        context_id: x,
+                        opnum: y,
+                        object: z,
+                        ..
+                    },
                 ) => a == x && b == y && c == z,
-                (Body::Response { context_id: a, .. }, Body::Response { context_id: x, .. }) => a == x,
+                (Body::Response { context_id: a, .. }, Body::Response { context_id: x, .. }) => {
+                    a == x
+                }
                 _ => false,
             };
         if !same {
             return Err(Error::UnexpectedFragment { call_id });
         }
-        let Some(stub) = p.body.stub_mut() else { return Err(Error::UnexpectedFragment { call_id }) };
+        let Some(stub) = p.body.stub_mut() else {
+            return Err(Error::UnexpectedFragment { call_id });
+        };
         if stub.len().saturating_add(len) > self.limit {
             return Err(Error::StubTooLong { call_id });
         }
         stub.extend_from_slice(pdu.body.stub().unwrap_or(&[]));
         p.flags |= pdu.flags & flags::PENDING_CANCEL;
-        if let (Body::Response { cancel_count: a, .. }, Body::Response { cancel_count: b, .. }) =
-            (&mut p.body, &pdu.body)
+        if let (
+            Body::Response {
+                cancel_count: a, ..
+            },
+            Body::Response {
+                cancel_count: b, ..
+            },
+        ) = (&mut p.body, &pdu.body)
         {
             *a = (*a).max(*b);
         }
@@ -1431,7 +1709,9 @@ impl Reassembler {
 
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Truncated }
+    fn from(_: Truncated) -> Self {
+        Error::Truncated
+    }
 }
 
 /// Checks shared by this module's tests and its fuzz target.
@@ -1477,22 +1757,24 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::rewrite;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// An endpoint mapper bind as Windows sends it: one context, the
     /// endpoint mapper over NDR.
     const BIND: [u8; 72] = [
-        0x05, 0x00, 0x0b, 0x03, 0x10, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, //
-        0xd0, 0x16, 0xd0, 0x16, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, //
-        0x08, 0x83, 0xaf, 0xe1, 0x1f, 0x5d, 0xc9, 0x11, 0x91, 0xa4, 0x08, 0x00, 0x2b, 0x14, 0xa0, 0xfa, //
-        0x03, 0x00, 0x00, 0x00, 0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11, 0x9f, 0xe8, 0x08, 0x00, //
+        0x05, 0x00, 0x0b, 0x03, 0x10, 0x00, 0x00, 0x00, 0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, //
+        0xd0, 0x16, 0xd0, 0x16, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, //
+        0x08, 0x83, 0xaf, 0xe1, 0x1f, 0x5d, 0xc9, 0x11, 0x91, 0xa4, 0x08, 0x00, 0x2b, 0x14, 0xa0,
+        0xfa, //
+        0x03, 0x00, 0x00, 0x00, 0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11, 0x9f, 0xe8, 0x08,
+        0x00, //
         0x2b, 0x10, 0x48, 0x60, 0x02, 0x00, 0x00, 0x00,
     ];
 
@@ -1503,13 +1785,26 @@ mod tests {
                 max_xmit_frag: 5840,
                 max_recv_frag: 5840,
                 assoc_group: 0,
-                contexts: vec![Context { id: 0, abstract_syntax: EPMAPPER, transfer_syntaxes: vec![NDR] }],
+                contexts: vec![Context {
+                    id: 0,
+                    abstract_syntax: EPMAPPER,
+                    transfer_syntaxes: vec![NDR],
+                }],
             }),
         )
     }
 
     fn request(stub: Vec<u8>) -> Pdu {
-        Pdu::new(7, Body::Request { alloc_hint: stub.len() as u32, context_id: 0, opnum: 3, object: None, stub })
+        Pdu::new(
+            7,
+            Body::Request {
+                alloc_hint: stub.len() as u32,
+                context_id: 0,
+                opnum: 3,
+                object: None,
+                stub,
+            },
+        )
     }
 
     fn all_bodies() -> Vec<Pdu> {
@@ -1518,7 +1813,10 @@ mod tests {
             max_recv_frag: 4280,
             assoc_group: 0x53f0,
             secondary_address: b"\\PIPE\\samr\0".to_vec(),
-            results: vec![ContextResult::accept(NDR), ContextResult::reject(reason::ABSTRACT_SYNTAX_NOT_SUPPORTED)],
+            results: vec![
+                ContextResult::accept(NDR),
+                ContextResult::reject(reason::ABSTRACT_SYNTAX_NOT_SUPPORTED),
+            ],
         };
         let b = match bind().body {
             Body::Bind(b) => b,
@@ -1529,9 +1827,23 @@ mod tests {
             request(vec![1, 2, 3]),
             Pdu::new(
                 8,
-                Body::Request { alloc_hint: 0, context_id: 2, opnum: 9, object: Some(object), stub: vec![9; 5] },
+                Body::Request {
+                    alloc_hint: 0,
+                    context_id: 2,
+                    opnum: 9,
+                    object: Some(object),
+                    stub: vec![9; 5],
+                },
             ),
-            Pdu::new(9, Body::Response { alloc_hint: 4, context_id: 1, cancel_count: 0, stub: vec![0, 0, 0, 0] }),
+            Pdu::new(
+                9,
+                Body::Response {
+                    alloc_hint: 4,
+                    context_id: 1,
+                    cancel_count: 0,
+                    stub: vec![0, 0, 0, 0],
+                },
+            ),
             Pdu::new(
                 10,
                 Body::Fault {
@@ -1546,12 +1858,27 @@ mod tests {
             bind(),
             Pdu::new(1, Body::BindAck(ack.clone())),
             Pdu::new(1, Body::AlterContext(b)),
-            Pdu::new(1, Body::AlterContextResp(BindAck { secondary_address: vec![], ..ack })),
             Pdu::new(
                 1,
-                Body::BindNak(BindNak { reason: reject::PROTOCOL_VERSION_NOT_SUPPORTED, versions: vec![(5, 0)] }),
+                Body::AlterContextResp(BindAck {
+                    secondary_address: vec![],
+                    ..ack
+                }),
             ),
-            Pdu::new(1, Body::BindNak(BindNak { reason: 0, versions: vec![] })),
+            Pdu::new(
+                1,
+                Body::BindNak(BindNak {
+                    reason: reject::PROTOCOL_VERSION_NOT_SUPPORTED,
+                    versions: vec![(5, 0)],
+                }),
+            ),
+            Pdu::new(
+                1,
+                Body::BindNak(BindNak {
+                    reason: 0,
+                    versions: vec![],
+                }),
+            ),
             Pdu {
                 auth: Some(Auth {
                     kind: auth_type::WINNT,
@@ -1579,15 +1906,29 @@ mod tests {
         // Bytes past the fragment are left.
         let mut more = BIND.to_vec();
         more.extend_from_slice(&[5, 0]);
-        assert_eq!(Pdu::parse(&more), Err(Error::Trailing { remaining: more.len() - 72 }));
+        assert_eq!(
+            Pdu::parse(&more),
+            Err(Error::Trailing {
+                remaining: more.len() - 72
+            })
+        );
     }
 
     #[test]
     fn uuids() {
         assert_eq!(NDR.uuid.to_string(), "8a885d04-1ceb-11c9-9fe8-08002b104860");
-        assert_eq!(Uuid::parse("8A885D04-1CEB-11C9-9FE8-08002B104860"), Some(NDR.uuid));
-        assert_eq!(EPMAPPER.uuid.to_string(), "e1af8308-5d1f-11c9-91a4-08002b14a0fa");
-        assert_eq!(NDR64.uuid.to_string(), "71710533-beba-4937-8319-b5dbef9ccc36");
+        assert_eq!(
+            Uuid::parse("8A885D04-1CEB-11C9-9FE8-08002B104860"),
+            Some(NDR.uuid)
+        );
+        assert_eq!(
+            EPMAPPER.uuid.to_string(),
+            "e1af8308-5d1f-11c9-91a4-08002b14a0fa"
+        );
+        assert_eq!(
+            NDR64.uuid.to_string(),
+            "71710533-beba-4937-8319-b5dbef9ccc36"
+        );
         assert_eq!(Uuid::parse("8a885d04-1ceb-11c9-9fe8-08002b10486"), None);
         assert_eq!(Uuid::parse("8a885d04x1ceb-11c9-9fe8-08002b104860"), None);
         assert_eq!(Uuid::parse("8a885d04-1ceb-11c9-9fe8-08002b10486g"), None);
@@ -1655,11 +1996,24 @@ mod tests {
     fn syntax_version_is_one_u32_in_the_data_representation() {
         // C706 12.6.3.1: if_version is a u32, the major version in the low
         // 16 bits. Little-endian, that is major then minor as two u16s.
-        let v = SyntaxId { uuid: Uuid::NIL, major: 3, minor: 1 };
-        let context = |s| Context { id: 0, abstract_syntax: s, transfer_syntaxes: vec![] };
+        let v = SyntaxId {
+            uuid: Uuid::NIL,
+            major: 3,
+            minor: 1,
+        };
+        let context = |s| Context {
+            id: 0,
+            abstract_syntax: s,
+            transfer_syntaxes: vec![],
+        };
         let mut p = Pdu::new(
             1,
-            Body::Bind(Bind { max_xmit_frag: 0, max_recv_frag: 0, assoc_group: 0, contexts: vec![context(v)] }),
+            Body::Bind(Bind {
+                max_xmit_frag: 0,
+                max_recv_frag: 0,
+                assoc_group: 0,
+                contexts: vec![context(v)],
+            }),
         );
         let b = contract::check_written(&p);
         assert_eq!(b[48..52], [3, 0, 1, 0]);
@@ -1669,8 +2023,16 @@ mod tests {
         assert_eq!(b[48..52], [0, 1, 0, 3]);
         let mut be = b.clone();
         be[48..52].copy_from_slice(&[0, 0, 0, 2]);
-        let Body::Bind(got) = Pdu::parse(&be).unwrap().body else { panic!() };
-        assert_eq!((got.contexts[0].abstract_syntax.major, got.contexts[0].abstract_syntax.minor), (2, 0));
+        let Body::Bind(got) = Pdu::parse(&be).unwrap().body else {
+            panic!()
+        };
+        assert_eq!(
+            (
+                got.contexts[0].abstract_syntax.major,
+                got.contexts[0].abstract_syntax.minor
+            ),
+            (2, 0)
+        );
     }
 
     #[test]
@@ -1703,15 +2065,33 @@ mod tests {
     #[test]
     fn request_and_response_layout() {
         let b = contract::check_written(&request(vec![0xde, 0xad]));
-        assert_eq!(b, [5, 0, 0, 3, 0x10, 0, 0, 0, 26, 0, 0, 0, 7, 0, 0, 0, 2, 0, 0, 0, 0, 0, 3, 0, 0xde, 0xad]);
+        assert_eq!(
+            b,
+            [
+                5, 0, 0, 3, 0x10, 0, 0, 0, 26, 0, 0, 0, 7, 0, 0, 0, 2, 0, 0, 0, 0, 0, 3, 0, 0xde,
+                0xad
+            ]
+        );
         // The object UUID follows the opnum, in the data representation's
         // byte order.
-        let object = Uuid::from_fields(0x0102_0304, 0x0506, 0x0708, [9, 10, 11, 12, 13, 14, 15, 16]);
-        let p =
-            Pdu::new(1, Body::Request { alloc_hint: 0, context_id: 0, opnum: 0, object: Some(object), stub: vec![] });
+        let object =
+            Uuid::from_fields(0x0102_0304, 0x0506, 0x0708, [9, 10, 11, 12, 13, 14, 15, 16]);
+        let p = Pdu::new(
+            1,
+            Body::Request {
+                alloc_hint: 0,
+                context_id: 0,
+                opnum: 0,
+                object: Some(object),
+                stub: vec![],
+            },
+        );
         assert_eq!(p.flags & flags::OBJECT_UUID, flags::OBJECT_UUID);
         let b = contract::check_written(&p);
-        assert_eq!(b[24..40], [4, 3, 2, 1, 6, 5, 8, 7, 9, 10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(
+            b[24..40],
+            [4, 3, 2, 1, 6, 5, 8, 7, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
         let fault = Pdu::new(
             7,
             Body::Fault {
@@ -1748,26 +2128,52 @@ mod tests {
         assert_eq!(b[40..44], [9, 5, 13, 0]);
         // A bind's trailer is aligned to 4 from the PDU's start.
         let mut p = bind();
-        p.auth = Some(Auth { kind: auth_type::WINNT, level: auth_level::CONNECT, context_id: 0, value: vec![1; 40] });
+        p.auth = Some(Auth {
+            kind: auth_type::WINNT,
+            level: auth_level::CONNECT,
+            context_id: 0,
+            value: vec![1; 40],
+        });
         let b = contract::check_written(&p);
         assert_eq!(b.len(), 72 + 8 + 40);
         assert_eq!(b[74], 0);
         // Auth3 carries 4 bytes of padding before the trailer.
         let mut p = Pdu::new(3, Body::Auth3);
-        p.auth = Some(Auth { kind: 0x0a, level: 2, context_id: 0, value: vec![1, 2] });
+        p.auth = Some(Auth {
+            kind: 0x0a,
+            level: 2,
+            context_id: 0,
+            value: vec![1, 2],
+        });
         let b = contract::check_written(&p);
         assert_eq!(b.len(), 20 + 8 + 2);
     }
 
     #[test]
     fn header_errors_break_the_stream() {
-        assert_eq!(Pdu::parse(&[4, 0]), Err(Error::Version { major: 4, minor: 0 }));
-        assert_eq!(Pdu::parse(&[5, 2]), Err(Error::Version { major: 5, minor: 2 }));
+        assert_eq!(
+            Pdu::parse(&[4, 0]),
+            Err(Error::Version { major: 4, minor: 0 })
+        );
+        assert_eq!(
+            Pdu::parse(&[5, 2]),
+            Err(Error::Version { major: 5, minor: 2 })
+        );
         assert_eq!(Pdu::parse(&[5]), Err(Error::Incomplete));
         assert_eq!(Pdu::parse(&[5, 0, 0, 3, 0x20]), Err(Error::IntegerRep(2)));
-        assert_eq!(Pdu::parse(&[5, 0, 0, 3, 0x10, 0, 0, 0, 15, 0]), Err(Error::FragLength(15)));
-        assert_eq!(Pdu::parse(&[5, 0, 0, 3, 0x00, 0, 0, 0, 0, 15]), Err(Error::FragLength(15)));
-        for e in [Error::Version { major: 4, minor: 0 }, Error::IntegerRep(2), Error::FragLength(0)] {
+        assert_eq!(
+            Pdu::parse(&[5, 0, 0, 3, 0x10, 0, 0, 0, 15, 0]),
+            Err(Error::FragLength(15))
+        );
+        assert_eq!(
+            Pdu::parse(&[5, 0, 0, 3, 0x00, 0, 0, 0, 0, 15]),
+            Err(Error::FragLength(15))
+        );
+        for e in [
+            Error::Version { major: 4, minor: 0 },
+            Error::IntegerRep(2),
+            Error::FragLength(0),
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1785,7 +2191,10 @@ mod tests {
         }
         // An auth length the fragment cannot hold.
         assert_eq!(Pdu::parse(&header(18, 24, 1)), Err(Error::AuthLength(1)));
-        assert_eq!(Pdu::parse(&header(18, 25, 1)).unwrap().auth.unwrap().value, [0]);
+        assert_eq!(
+            Pdu::parse(&header(18, 25, 1)).unwrap().auth.unwrap().value,
+            [0]
+        );
         // Padding that runs into the header.
         let mut b = header(18, 25, 1);
         b[18] = 1;
@@ -1820,9 +2229,18 @@ mod tests {
         // A bind_nak that stops after its reason.
         assert_eq!(
             Pdu::parse(&header(13, 18, 0)).unwrap().body,
-            Body::BindNak(BindNak { reason: 0, versions: vec![] })
+            Body::BindNak(BindNak {
+                reason: 0,
+                versions: vec![]
+            })
         );
-        for e in [Error::Type(1), Error::AuthLength(1), Error::AuthPad(1), Error::Truncated, Error::Address] {
+        for e in [
+            Error::Type(1),
+            Error::AuthLength(1),
+            Error::AuthPad(1),
+            Error::Truncated,
+            Error::Address,
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1839,27 +2257,72 @@ mod tests {
         p.flags |= flags::OBJECT_UUID;
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let mut p = request(vec![]);
-        p.auth = Some(Auth { kind: 9, level: 6, context_id: 0, value: vec![] });
+        p.auth = Some(Auth {
+            kind: 9,
+            level: 6,
+            context_id: 0,
+            value: vec![],
+        });
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let mut p = request(vec![]);
-        p.auth = Some(Auth { kind: 9, level: 6, context_id: 0, value: vec![0; 65536] });
+        p.auth = Some(Auth {
+            kind: 9,
+            level: 6,
+            context_id: 0,
+            value: vec![0; 65536],
+        });
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-        assert_eq!(request(vec![0; MAX_FRAG]).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            request(vec![0; MAX_FRAG]).to_bytes(),
+            Err(Error::Unwritable)
+        );
         // The longest request fits exactly.
         contract::check_written(&request(vec![0; MAX_FRAG - 24]));
-        assert_eq!(request(vec![0; MAX_FRAG - 23]).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            request(vec![0; MAX_FRAG - 23]).to_bytes(),
+            Err(Error::Unwritable)
+        );
         let mut b = match bind().body {
             Body::Bind(b) => b,
             _ => unreachable!(),
         };
         b.contexts[0].transfer_syntaxes = vec![NDR; 256];
-        assert_eq!(Pdu::new(1, Body::Bind(b.clone())).to_bytes(), Err(Error::Unwritable));
-        b.contexts = vec![Context { id: 0, abstract_syntax: NDR, transfer_syntaxes: vec![] }; 256];
-        assert_eq!(Pdu::new(1, Body::Bind(b.clone())).to_bytes(), Err(Error::Unwritable));
-        b.contexts = vec![Context { id: 0, abstract_syntax: NDR, transfer_syntaxes: vec![NDR; 255] }; 255];
-        assert_eq!(Pdu::new(1, Body::Bind(b)).to_bytes(), Err(Error::Unwritable));
-        let nak = BindNak { reason: 0, versions: vec![(5, 0); 256] };
-        assert_eq!(Pdu::new(1, Body::BindNak(nak)).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Pdu::new(1, Body::Bind(b.clone())).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        b.contexts = vec![
+            Context {
+                id: 0,
+                abstract_syntax: NDR,
+                transfer_syntaxes: vec![]
+            };
+            256
+        ];
+        assert_eq!(
+            Pdu::new(1, Body::Bind(b.clone())).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        b.contexts = vec![
+            Context {
+                id: 0,
+                abstract_syntax: NDR,
+                transfer_syntaxes: vec![NDR; 255]
+            };
+            255
+        ];
+        assert_eq!(
+            Pdu::new(1, Body::Bind(b)).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let nak = BindNak {
+            reason: 0,
+            versions: vec![(5, 0); 256],
+        };
+        assert_eq!(
+            Pdu::new(1, Body::BindNak(nak)).to_bytes(),
+            Err(Error::Unwritable)
+        );
         let ack = BindAck {
             max_xmit_frag: 0,
             max_recv_frag: 0,
@@ -1867,9 +2330,19 @@ mod tests {
             secondary_address: vec![0; 70000],
             results: vec![],
         };
-        assert_eq!(Pdu::new(1, Body::BindAck(ack.clone())).to_bytes(), Err(Error::Unwritable));
-        let ack = BindAck { secondary_address: vec![], results: vec![ContextResult::accept(NDR); 256], ..ack };
-        assert_eq!(Pdu::new(1, Body::BindAck(ack)).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Pdu::new(1, Body::BindAck(ack.clone())).to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let ack = BindAck {
+            secondary_address: vec![],
+            results: vec![ContextResult::accept(NDR); 256],
+            ..ack
+        };
+        assert_eq!(
+            Pdu::new(1, Body::BindAck(ack)).to_bytes(),
+            Err(Error::Unwritable)
+        );
         assert!(!Error::Unwritable.to_string().is_empty());
     }
 
@@ -1900,10 +2373,23 @@ mod tests {
         // Too small for the header, and a PDU with a verifier.
         assert_eq!(request(vec![1]).fragments(24), Err(Error::Unwritable));
         let mut p = request(vec![1]);
-        p.auth = Some(Auth { kind: 9, level: 6, context_id: 0, value: vec![1] });
+        p.auth = Some(Auth {
+            kind: 9,
+            level: 6,
+            context_id: 0,
+            value: vec![1],
+        });
         assert_eq!(p.fragments(1000), Err(Error::Unwritable));
         // Responses with an object-less header split too.
-        let resp = Pdu::new(4, Body::Response { alloc_hint: 9, context_id: 1, cancel_count: 0, stub: vec![5; 9] });
+        let resp = Pdu::new(
+            4,
+            Body::Response {
+                alloc_hint: 9,
+                context_id: 1,
+                cancel_count: 0,
+                stub: vec![5; 9],
+            },
+        );
         let parts = resp.fragments(28).unwrap();
         assert_eq!(parts.len(), 3);
         let mut r = Reassembler::new(100);
@@ -1919,10 +2405,16 @@ mod tests {
         // A peer that binds with a tiny max_recv_frag must not make a
         // world build millions of fragments, or copy the stub once per
         // fragment.
-        assert_eq!(request(vec![0; MAX_STUB]).fragments(25), Err(Error::Unwritable));
+        assert_eq!(
+            request(vec![0; MAX_STUB]).fragments(25),
+            Err(Error::Unwritable)
+        );
         let n = MAX_FRAGMENTS;
         assert_eq!(request(vec![0; n]).fragments(25).map(|v| v.len()), Ok(n));
-        assert_eq!(request(vec![0; n + 1]).fragments(25), Err(Error::Unwritable));
+        assert_eq!(
+            request(vec![0; n + 1]).fragments(25),
+            Err(Error::Unwritable)
+        );
         assert_linear("fragments_are_bounded_and_linear", 15_000, |size| {
             let parts = request(vec![1; size]).fragments(25).unwrap();
             assert_eq!(parts.len(), size);
@@ -1936,10 +2428,16 @@ mod tests {
         assert_eq!(parts.len(), 3);
         // A middle fragment with nothing started.
         let mut r = Reassembler::default();
-        assert_eq!(r.push(parts[1].clone()), Err(Error::UnexpectedFragment { call_id: 7 }));
+        assert_eq!(
+            r.push(parts[1].clone()),
+            Err(Error::UnexpectedFragment { call_id: 7 })
+        );
         // Two first fragments.
         assert_eq!(r.push(parts[0].clone()), Ok(None));
-        assert_eq!(r.push(parts[0].clone()), Err(Error::Interleaved { call_id: 7 }));
+        assert_eq!(
+            r.push(parts[0].clone()),
+            Err(Error::Interleaved { call_id: 7 })
+        );
         assert_eq!(r.pending(), 0);
         // A fragment of another call.
         assert_eq!(r.push(parts[0].clone()), Ok(None));
@@ -1957,23 +2455,46 @@ mod tests {
         assert_eq!(r.push(parts[0].clone()), Ok(None));
         let resp = Pdu {
             flags: 0,
-            ..Pdu::new(7, Body::Response { alloc_hint: 0, context_id: 0, cancel_count: 0, stub: vec![] })
+            ..Pdu::new(
+                7,
+                Body::Response {
+                    alloc_hint: 0,
+                    context_id: 0,
+                    cancel_count: 0,
+                    stub: vec![],
+                },
+            )
         };
         assert_eq!(r.push(resp), Err(Error::UnexpectedFragment { call_id: 7 }));
         // Over the limit, at the first fragment and later.
         let mut r = Reassembler::new(15);
         assert_eq!(r.push(parts[0].clone()), Ok(None));
-        assert_eq!(r.push(parts[1].clone()), Err(Error::StubTooLong { call_id: 7 }));
+        assert_eq!(
+            r.push(parts[1].clone()),
+            Err(Error::StubTooLong { call_id: 7 })
+        );
         let mut r = Reassembler::new(5);
-        assert_eq!(r.push(parts[0].clone()), Err(Error::StubTooLong { call_id: 7 }));
+        assert_eq!(
+            r.push(parts[0].clone()),
+            Err(Error::StubTooLong { call_id: 7 })
+        );
         // A fault or orphaned PDU ends the call; other PDUs pass by.
         let mut r = Reassembler::default();
         assert_eq!(r.push(parts[0].clone()), Ok(None));
-        assert_eq!(r.push(Pdu::new(7, Body::Cancel)), Ok(Some(Pdu::new(7, Body::Cancel))));
+        assert_eq!(
+            r.push(Pdu::new(7, Body::Cancel)),
+            Ok(Some(Pdu::new(7, Body::Cancel)))
+        );
         assert_eq!(r.pending(), 10);
-        assert_eq!(r.push(Pdu::new(9, Body::Orphaned)), Ok(Some(Pdu::new(9, Body::Orphaned))));
+        assert_eq!(
+            r.push(Pdu::new(9, Body::Orphaned)),
+            Ok(Some(Pdu::new(9, Body::Orphaned)))
+        );
         assert_eq!(r.pending(), 10);
-        assert_eq!(r.push(Pdu::new(7, Body::Orphaned)), Ok(Some(Pdu::new(7, Body::Orphaned))));
+        assert_eq!(
+            r.push(Pdu::new(7, Body::Orphaned)),
+            Ok(Some(Pdu::new(7, Body::Orphaned)))
+        );
         assert_eq!(r.pending(), 0);
         for e in [
             Error::Interleaved { call_id: 1 },
@@ -1985,7 +2506,12 @@ mod tests {
     }
 
     fn auth(context_id: u32) -> Auth {
-        Auth { kind: auth_type::WINNT, level: auth_level::PKT_INTEGRITY, context_id, value: vec![7; 16] }
+        Auth {
+            kind: auth_type::WINNT,
+            level: auth_level::PKT_INTEGRITY,
+            context_id,
+            value: vec![7; 16],
+        }
     }
 
     #[test]
@@ -1998,7 +2524,10 @@ mod tests {
             secondary_address: vec![0; 1 << 20],
             results: vec![],
         };
-        assert_eq!(Pdu::new(1, Body::BindAck(ack)).fragments(4096), Err(Error::Unwritable));
+        assert_eq!(
+            Pdu::new(1, Body::BindAck(ack)).fragments(4096),
+            Err(Error::Unwritable)
+        );
         let fault = Body::Fault {
             alloc_hint: 0,
             context_id: 0,
@@ -2047,20 +2576,47 @@ mod tests {
         // MS-RPCE 2.2.2.11: every fragment of a call has the same auth
         // type, level and context ID.
         let parts = request(vec![1; 30]).fragments(34).unwrap();
-        let with = |i: usize, a: Option<Auth>| Pdu { auth: a, ..parts[i].clone() };
+        let with = |i: usize, a: Option<Auth>| Pdu {
+            auth: a,
+            ..parts[i].clone()
+        };
         let mut r = Reassembler::default();
         assert_eq!(r.push(with(0, Some(auth(1)))), Ok(None));
-        assert_eq!(r.push(with(1, Some(auth(2)))), Err(Error::UnexpectedFragment { call_id: 7 }));
+        assert_eq!(
+            r.push(with(1, Some(auth(2)))),
+            Err(Error::UnexpectedFragment { call_id: 7 })
+        );
         assert_eq!(r.push(with(0, Some(auth(1)))), Ok(None));
-        let other = Auth { level: auth_level::PKT_PRIVACY, ..auth(1) };
-        assert_eq!(r.push(with(1, Some(other))), Err(Error::UnexpectedFragment { call_id: 7 }));
+        let other = Auth {
+            level: auth_level::PKT_PRIVACY,
+            ..auth(1)
+        };
+        assert_eq!(
+            r.push(with(1, Some(other))),
+            Err(Error::UnexpectedFragment { call_id: 7 })
+        );
         assert_eq!(r.push(with(0, Some(auth(1)))), Ok(None));
-        assert_eq!(r.push(with(1, None)), Err(Error::UnexpectedFragment { call_id: 7 }));
+        assert_eq!(
+            r.push(with(1, None)),
+            Err(Error::UnexpectedFragment { call_id: 7 })
+        );
         assert_eq!(r.push(with(0, None)), Ok(None));
-        assert_eq!(r.push(with(1, Some(auth(1)))), Err(Error::UnexpectedFragment { call_id: 7 }));
+        assert_eq!(
+            r.push(with(1, Some(auth(1)))),
+            Err(Error::UnexpectedFragment { call_id: 7 })
+        );
         // The same context throughout joins, with a different token each.
         assert_eq!(r.push(with(0, Some(auth(1)))), Ok(None));
-        assert_eq!(r.push(with(1, Some(Auth { value: vec![9; 16], ..auth(1) }))), Ok(None));
+        assert_eq!(
+            r.push(with(
+                1,
+                Some(Auth {
+                    value: vec![9; 16],
+                    ..auth(1)
+                })
+            )),
+            Ok(None)
+        );
         let got = r.push(with(2, Some(auth(1)))).unwrap().unwrap();
         assert_eq!(got.body.stub(), Some(&[1; 30][..]));
         assert_eq!(got.auth, None);
@@ -2068,7 +2624,15 @@ mod tests {
 
     #[test]
     fn reassembly_keeps_a_later_cancel() {
-        let resp = Pdu::new(4, Body::Response { alloc_hint: 0, context_id: 1, cancel_count: 0, stub: vec![5; 9] });
+        let resp = Pdu::new(
+            4,
+            Body::Response {
+                alloc_hint: 0,
+                context_id: 1,
+                cancel_count: 0,
+                stub: vec![5; 9],
+            },
+        );
         let mut parts = resp.fragments(28).unwrap();
         assert_eq!(parts.len(), 3);
         parts[2].flags |= flags::PENDING_CANCEL;
@@ -2082,7 +2646,13 @@ mod tests {
         }
         let got = got.unwrap();
         assert_eq!(got.flags & flags::PENDING_CANCEL, flags::PENDING_CANCEL);
-        assert!(matches!(got.body, Body::Response { cancel_count: 1, .. }));
+        assert!(matches!(
+            got.body,
+            Body::Response {
+                cancel_count: 1,
+                ..
+            }
+        ));
         // A cancel pending on a middle fragment of a request stays too.
         let mut parts = request(vec![1; 30]).fragments(34).unwrap();
         parts[1].flags |= flags::PENDING_CANCEL;
@@ -2091,7 +2661,10 @@ mod tests {
         for p in parts {
             got = r.push(p).unwrap();
         }
-        assert_eq!(got.unwrap().flags & flags::PENDING_CANCEL, flags::PENDING_CANCEL);
+        assert_eq!(
+            got.unwrap().flags & flags::PENDING_CANCEL,
+            flags::PENDING_CANCEL
+        );
     }
 
     #[test]
@@ -2107,7 +2680,13 @@ mod tests {
         b[10] = 1;
         assert_eq!(Pdu::parse(&b), Err(Error::Truncated));
         // C706 12.6.4.5 and 12.6.4.11: a bind_nak or shutdown has none.
-        for body in [Body::Shutdown, Body::BindNak(BindNak { reason: 0, versions: vec![] })] {
+        for body in [
+            Body::Shutdown,
+            Body::BindNak(BindNak {
+                reason: 0,
+                versions: vec![],
+            }),
+        ] {
             let mut p = Pdu::new(1, body);
             let plain = p.to_bytes().unwrap();
             p.auth = Some(auth(0));
@@ -2210,7 +2789,10 @@ mod tests {
         // A body that cannot be read still gives its bytes.
         let bad = [5, 0, 9, 3, 0x10, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(d.push(&bad), 16);
-        assert_eq!(d.with_next(|p, raw, _| (p, raw.to_vec())), Some(Ok((Err(Error::Type(9)), bad.to_vec()))));
+        assert_eq!(
+            d.with_next(|p, raw, _| (p, raw.to_vec())),
+            Some(Ok((Err(Error::Type(9)), bad.to_vec())))
+        );
     }
 
     #[test]
@@ -2228,8 +2810,10 @@ mod tests {
         assert_eq!(whole.len(), all_bodies().len() + 2);
         assert_eq!(whole[whole.len() - 2], Err(Error::Type(9)));
         assert_eq!(whole[whole.len() - 1], Ok(bind()));
-        assert_eq!(decode_all(Frames::<Pdu>::new, &[6, 0, 0, 0]).1,
-            Some(Fail::Protocol(Error::Version { major: 6, minor: 0 })));
+        assert_eq!(
+            decode_all(Frames::<Pdu>::new, &[6, 0, 0, 0]).1,
+            Some(Fail::Protocol(Error::Version { major: 6, minor: 0 }))
+        );
     }
 
     #[test]
@@ -2250,13 +2834,17 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_pdus_in_linear_time() {
-        assert_linear("stream_takes_many_small_pdus_in_linear_time", rounds(50_000), |size| {
-            let bytes = Pdu::new(1, Body::Shutdown).to_bytes().unwrap().repeat(size);
-            let (pdus, error) = decode_all(Frames::<Pdu>::new, &bytes);
-            assert_eq!(pdus.len(), size);
-            assert!(pdus.iter().all(Result::is_ok));
-            assert_eq!(error, None);
-        });
+        assert_linear(
+            "stream_takes_many_small_pdus_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let bytes = Pdu::new(1, Body::Shutdown).to_bytes().unwrap().repeat(size);
+                let (pdus, error) = decode_all(Frames::<Pdu>::new, &bytes);
+                assert_eq!(pdus.len(), size);
+                assert!(pdus.iter().all(Result::is_ok));
+                assert_eq!(error, None);
+            },
+        );
     }
 
     #[test]
@@ -2267,7 +2855,12 @@ mod tests {
             if matches!(p.body, Body::BindNak(_) | Body::Shutdown) {
                 continue;
             }
-            p.auth = Some(Auth { kind: 9, level: 6, context_id: 1, value: vec![1, 2, 3] });
+            p.auth = Some(Auth {
+                kind: 9,
+                level: 6,
+                context_id: 1,
+                value: vec![1, 2, 3],
+            });
             samples.push(p.to_bytes().unwrap());
             p.drep = DataRep::BIG_ENDIAN;
             samples.push(p.to_bytes().unwrap());

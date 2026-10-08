@@ -100,11 +100,11 @@
 //! A connection that ends in an error is one `http.error` event, with
 //! `local`, `cause` (`protocol`, `timeout` or `transport`) and `detail`.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::future::{Future, poll_fn};
-use std::any::Any;
 use std::fmt::Write as _;
+use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
@@ -116,11 +116,13 @@ use http::uri::{Authority, Scheme};
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
 use http_body::{Body as _, Frame, SizeHint};
 
-use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
 use fictionet::events::{ConnInfo, Event, Fields, Level, float, opt};
+use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
 use fictionet::stdlib::json::Value;
 use fictionet::stdlib::net::{Accept, Arrival, ConfigFor, Host, Sni};
-use fictionet::stdlib::serve::{self, Budget, Ended, Flow, Pending, PendingDriver, Prefixed, Driver, ServeOptions, Timer};
+use fictionet::stdlib::serve::{
+    self, Budget, Driver, Ended, Flow, Pending, PendingDriver, Prefixed, ServeOptions, Timer,
+};
 use fictionet::stdlib::tls::ServerConfig;
 use fictionet::stdlib::{ConnError, Connection, ConnectionExt};
 use fictionet::time::Instant;
@@ -220,7 +222,10 @@ impl http_body::Body for Body {
     type Data = Bytes;
     type Error = Error;
 
-    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
         match &mut self.get_mut().0 {
             Inner::Full(b) => Poll::Ready(b.take().map(|b| Ok(Frame::data(b)))),
             Inner::Stream(s) => s.as_mut().poll_frame(cx),
@@ -254,11 +259,16 @@ where
     type Data = Bytes;
     type Error = Error;
 
-    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
-        self.0
-            .as_mut()
-            .poll_frame(cx)
-            .map(|f| f.map(|r| r.map(|f| f.map_data(|mut d| d.copy_to_bytes(d.remaining()))).map_err(Into::into)))
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        self.0.as_mut().poll_frame(cx).map(|f| {
+            f.map(|r| {
+                r.map(|f| f.map_data(|mut d| d.copy_to_bytes(d.remaining())))
+                    .map_err(Into::into)
+            })
+        })
     }
 
     fn is_end_stream(&self) -> bool {
@@ -305,7 +315,11 @@ pub struct Exchange<'a> {
 impl<'a> Exchange<'a> {
     /// An exchange for a handler called outside a service, such as in a
     /// test.
-    pub fn new<R: FnMut() -> u64>(now: Instant, rng: &'a mut R, conn: &'a ConnInfo) -> Exchange<'a> {
+    pub fn new<R: FnMut() -> u64>(
+        now: Instant,
+        rng: &'a mut R,
+        conn: &'a ConnInfo,
+    ) -> Exchange<'a> {
         Exchange { now, rng, conn }
     }
 
@@ -327,7 +341,9 @@ impl<'a> Exchange<'a> {
 
 /// An answer that needs async work: given the connection's [`Cx`], a future
 /// of the response. An error answers `500`, or `502` for [`BadGateway`].
-pub type Later = Box<dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>> + Send>;
+pub type Later = Box<
+    dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>> + Send,
+>;
 
 /// What a handler gives back for a request.
 pub enum Reply {
@@ -365,7 +381,11 @@ impl std::fmt::Display for BadGateway {
 impl std::error::Error for BadGateway {}
 
 type SyncRoute = Arc<dyn Fn(&mut Exchange<'_>, Request<Bytes>) -> Response<Bytes> + Send + Sync>;
-type AsyncRoute = Arc<dyn Fn(Cx, Request<Bytes>) -> Pin<Box<dyn Future<Output = Response<Bytes>> + Send>> + Send + Sync>;
+type AsyncRoute = Arc<
+    dyn Fn(Cx, Request<Bytes>) -> Pin<Box<dyn Future<Output = Response<Bytes>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 enum Route {
@@ -397,7 +417,8 @@ impl Router {
     where
         F: Fn(&mut Exchange<'_>, Request<Bytes>) -> Response<Bytes> + Send + Sync + 'static,
     {
-        self.routes.push((method, path.to_owned(), Route::Sync(Arc::new(f))));
+        self.routes
+            .push((method, path.to_owned(), Route::Sync(Arc::new(f))));
         self
     }
 
@@ -468,13 +489,19 @@ impl Handler for Router {
         let route = match self.find(request.method(), request.uri().path()) {
             Ok(route) => route.clone(),
             Err(known) => {
-                let status = if known { StatusCode::METHOD_NOT_ALLOWED } else { StatusCode::NOT_FOUND };
+                let status = if known {
+                    StatusCode::METHOD_NOT_ALLOWED
+                } else {
+                    StatusCode::NOT_FOUND
+                };
                 return Reply::Now(status_only(status));
             }
         };
         match route {
             Route::Sync(f) => Reply::Now(f(ex, request).map(Body::from)),
-            Route::Async(f) => Reply::Later(Box::new(move |fcx| Box::pin(async move { Ok(f(fcx, request).await.map(Body::from)) }))),
+            Route::Async(f) => Reply::Later(Box::new(move |fcx| {
+                Box::pin(async move { Ok(f(fcx, request).await.map(Body::from)) })
+            })),
         }
     }
 }
@@ -489,7 +516,10 @@ fn status_only(status: StatusCode) -> Response<Body> {
 pub fn text(status: StatusCode, body: &str) -> Response<Body> {
     let mut response = Response::new(Body::from(body.to_owned()));
     *response.status_mut() = status;
-    response.headers_mut().insert(http::header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
     response
 }
 
@@ -511,7 +541,9 @@ where
     B::Data: Send,
     B::Error: Into<Error>,
 {
-    Tower { service: Mutex::new(service) }
+    Tower {
+        service: Mutex::new(service),
+    }
 }
 
 impl<S, B> Handler for Tower<S>
@@ -524,10 +556,16 @@ where
     B::Error: Into<Error>,
 {
     fn call(&self, request: Request<Body>, _ex: &mut Exchange<'_>) -> Reply {
-        let mut service = self.service.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut service = self
+            .service
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         Reply::Later(Box::new(move |_fcx| {
             Box::pin(async move {
-                poll_fn(|cx| service.poll_ready(cx)).await.map_err(Into::into)?;
+                poll_fn(|cx| service.poll_ready(cx))
+                    .await
+                    .map_err(Into::into)?;
                 let response = service.call(request).await.map_err(Into::into)?;
                 Ok(response.map(Body::new))
             })
@@ -553,7 +591,11 @@ pub struct VHost {
 impl VHost {
     /// A site with `handler`, plain HTTP only.
     pub fn new(handler: impl Handler) -> VHost {
-        VHost { handler: Arc::new(handler), https: false, plain_http: false }
+        VHost {
+            handler: Arc::new(handler),
+            https: false,
+            plain_http: false,
+        }
     }
 }
 
@@ -590,18 +632,31 @@ impl VirtualHosts {
     /// Adds `site` under `name` (lowercase, without a trailing dot),
     /// replacing one there.
     pub fn insert(&self, name: &str, site: VHost) {
-        self.inner.hosts.write().unwrap_or_else(|e| e.into_inner()).insert(normalize(name), site);
+        self.inner
+            .hosts
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(normalize(name), site);
     }
 
     /// Makes `site` the default, for hosts no site has. The first default
     /// set keeps the role.
     pub fn set_default(&self, site: VHost) {
-        self.inner.default.write().unwrap_or_else(|e| e.into_inner()).get_or_insert(site);
+        self.inner
+            .default
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(site);
     }
 
     /// The site named `name`.
     pub fn get(&self, name: &str) -> Option<VHost> {
-        self.inner.hosts.read().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
+        self.inner
+            .hosts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
     }
 
     /// Whether a site named `name` is served over HTTPS here.
@@ -610,31 +665,57 @@ impl VirtualHosts {
     }
 
     fn site_or_default(&self, host: &str) -> Option<VHost> {
-        self.get(host).or_else(|| self.inner.default.read().unwrap_or_else(|e| e.into_inner()).clone())
+        self.get(host).or_else(|| {
+            self.inner
+                .default
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
     }
 }
 
 fn answered(mut response: Response<Body>, answer: &'static str) -> Response<Body> {
-    response.extensions_mut().insert(Fields::new().with("answer", answer));
+    response
+        .extensions_mut()
+        .insert(Fields::new().with("answer", answer));
     response
 }
 
 impl Handler for VirtualHosts {
     fn call(&self, mut request: Request<Body>, ex: &mut Exchange<'_>) -> Reply {
         let Some(host) = request_host(&request) else {
-            return Reply::Now(answered(text(StatusCode::BAD_REQUEST, "The request names no host.\n"), "no_host"));
+            return Reply::Now(answered(
+                text(StatusCode::BAD_REQUEST, "The request names no host.\n"),
+                "no_host",
+            ));
         };
         let misdirected = || {
-            Reply::Now(answered(text(StatusCode::MISDIRECTED_REQUEST, "This server does not serve that host.\n"), "misdirected"))
+            Reply::Now(answered(
+                text(
+                    StatusCode::MISDIRECTED_REQUEST,
+                    "This server does not serve that host.\n",
+                ),
+                "misdirected",
+            ))
         };
-        let Some(site) = self.site_or_default(&host) else { return misdirected() };
+        let Some(site) = self.site_or_default(&host) else {
+            return misdirected();
+        };
         let tls = ex.conn().tls;
         match (tls, site.https) {
             (true, false) => misdirected(),
             (false, true) if !site.plain_http => {
-                let path = request.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+                let path = request
+                    .uri()
+                    .path_and_query()
+                    .map(|p| p.as_str())
+                    .unwrap_or("/");
                 let location = format!("https://{host}{path}");
-                let mut response = text(StatusCode::MOVED_PERMANENTLY, &format!("Moved to {location}\n"));
+                let mut response = text(
+                    StatusCode::MOVED_PERMANENTLY,
+                    &format!("Moved to {location}\n"),
+                );
                 if let Ok(value) = location.parse() {
                     response.headers_mut().insert(LOCATION, value);
                 }
@@ -699,12 +780,28 @@ impl Tracker {
         let headers: Vec<Value> = request
             .headers()
             .iter()
-            .map(|(n, v)| Value::Array(vec![n.as_str().into(), String::from_utf8_lossy(v.as_bytes()).into_owned().into()]))
+            .map(|(n, v)| {
+                Value::Array(vec![
+                    n.as_str().into(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned().into(),
+                ])
+            })
             .collect();
         let uri = request.uri();
         // Room for every field, and for the status the summary gets later.
-        let mut summary = String::with_capacity(request.method().as_str().len() + host.as_ref().map_or(1, String::len) + uri.path().len() + 5);
-        let _ = write!(summary, "{} {}{}", request.method(), host.as_deref().unwrap_or("-"), uri.path());
+        let mut summary = String::with_capacity(
+            request.method().as_str().len()
+                + host.as_ref().map_or(1, String::len)
+                + uri.path().len()
+                + 5,
+        );
+        let _ = write!(
+            summary,
+            "{} {}{}",
+            request.method(),
+            host.as_deref().unwrap_or("-"),
+            uri.path()
+        );
         let event = Event::new("http", "request")
             .fields(Fields::with_capacity(16))
             .field("scheme", if conn.tls { "https" } else { "http" })
@@ -722,7 +819,13 @@ impl Tracker {
     }
 
     /// The finished event: `extra` from the handler first, then the facts.
-    fn finish(&mut self, extra: Option<Fields>, status: Option<StatusCode>, sent: u64, complete: bool) -> Option<Event> {
+    fn finish(
+        &mut self,
+        extra: Option<Fields>,
+        status: Option<StatusCode>,
+        sent: u64,
+        complete: bool,
+    ) -> Option<Event> {
         let mut event = self.event.take()?;
         let mut fields = extra.unwrap_or_default();
         let answer = fields.remove("answer").unwrap_or_else(|| {
@@ -754,9 +857,14 @@ fn error_response(e: &Error) -> Response<Body> {
     let mut response = if e.is::<BadGateway>() {
         text(StatusCode::BAD_GATEWAY, &format!("{e}\n"))
     } else {
-        text(StatusCode::INTERNAL_SERVER_ERROR, "The site failed to answer.\n")
+        text(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The site failed to answer.\n",
+        )
     };
-    response.extensions_mut().insert(Fields::new().with("answer", "error"));
+    response
+        .extensions_mut()
+        .insert(Fields::new().with("answer", "error"));
     response
 }
 
@@ -842,7 +950,16 @@ impl Http1 {
 
     /// Answers with `handler` and `opts`.
     pub fn with(handler: Arc<dyn Handler>, opts: Limits) -> Http1 {
-        Http1 { handler, opts, date: None, handoff: None, head: None, body: Vec::new(), too_big: false, started: Instant::ZERO }
+        Http1 {
+            handler,
+            opts,
+            date: None,
+            handoff: None,
+            head: None,
+            body: Vec::new(),
+            too_big: false,
+            started: Instant::ZERO,
+        }
     }
 
     /// The head of the request that asked for a protocol upgrade, such as
@@ -865,7 +982,14 @@ impl Http1 {
 
     fn respond(&mut self, driver: &mut Driver<'_>) -> Flow {
         let body = Body::from(std::mem::take(&mut self.body));
-        let body = if self.too_big { partial(body.bytes().unwrap_or_default(), "the request body is too large") } else { body };
+        let body = if self.too_big {
+            partial(
+                body.bytes().unwrap_or_default(),
+                "the request body is too large",
+            )
+        } else {
+            body
+        };
         let close = self.too_big;
         self.dispatch(driver, body, close)
     }
@@ -873,7 +997,9 @@ impl Http1 {
     /// Calls the handler for the request whose head is pending, with
     /// `body`. `close` closes the connection after the answer.
     fn dispatch(&mut self, driver: &mut Driver<'_>, body: Body, close: bool) -> Flow {
-        let Some(head) = self.head.take() else { return Flow::Close };
+        let Some(head) = self.head.take() else {
+            return Flow::Close;
+        };
         let version = match head.version {
             http1::Version::Http10 => Version::HTTP_10,
             http1::Version::Http11 => Version::HTTP_11,
@@ -895,7 +1021,8 @@ impl Http1 {
         let conn = driver.conn().clone();
         let reply = {
             let mut rng = || driver.random_u64();
-            self.handler.call(request, &mut Exchange::new(now, &mut rng, &conn))
+            self.handler
+                .call(request, &mut Exchange::new(now, &mut rng, &conn))
         };
         let close = !keep_alive;
         // Every answer goes out as deferred work, so its event is made
@@ -904,7 +1031,10 @@ impl Http1 {
             Reply::Now(response) => (None, Some(response)),
             Reply::Later(work) => (Some(work), None),
         };
-        driver.defer(Streaming::new(work, response, version, head_only, close, tracker).dated(self.date, now));
+        driver.defer(
+            Streaming::new(work, response, version, head_only, close, tracker)
+                .dated(self.date, now),
+        );
         self.after(driver, close)
     }
 
@@ -921,11 +1051,21 @@ impl Http1 {
 /// Whether an HTTP/1.1 request asks to switch protocols (RFC 9110 section
 /// 7.8): it has an `Upgrade` field and names `upgrade` in `Connection`.
 fn asks_upgrade(head: &RequestHead) -> bool {
-    let has = |name: &str| head.headers.iter().any(|h| h.name.eq_ignore_ascii_case(name));
+    let has = |name: &str| {
+        head.headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case(name))
+    };
     let connection_upgrade = head.headers.iter().any(|h| {
-        h.name.eq_ignore_ascii_case("connection") && h.value.split(|b| *b == b',').any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
+        h.name.eq_ignore_ascii_case("connection")
+            && h.value
+                .split(|b| *b == b',')
+                .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
     });
-    head.version == http1::Version::Http11 && head.method != "CONNECT" && has("upgrade") && connection_upgrade
+    head.version == http1::Version::Http11
+        && head.method != "CONNECT"
+        && has("upgrade")
+        && connection_upgrade
 }
 
 /// The head at the start of `unread`, read with an empty Host field added
@@ -942,7 +1082,11 @@ fn without_host(unread: &[u8]) -> Option<RequestHead> {
     patched.extend_from_slice(&unread[line_end + 2..head_end]);
     let mut head = <RequestHead as fictionet::stdlib::codec::Wire>::parse(&patched).ok()?;
     // The handler sees the request as it came, without the field added.
-    if head.headers.first().is_some_and(|h| h.name == "Host" && h.value.is_empty()) {
+    if head
+        .headers
+        .first()
+        .is_some_and(|h| h.name == "Host" && h.value.is_empty())
+    {
         head.headers.remove(0);
     }
     Some(head)
@@ -955,7 +1099,10 @@ fn partial(bytes: Bytes, why: &'static str) -> Body {
     impl http_body::Body for Partial {
         type Data = Bytes;
         type Error = Error;
-        fn poll_frame(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
             let this = self.get_mut();
             if let Some(b) = this.0.take().filter(|b| !b.is_empty()) {
                 return Poll::Ready(Some(Ok(Frame::data(b))));
@@ -967,7 +1114,10 @@ fn partial(bytes: Bytes, why: &'static str) -> Body {
 }
 
 fn to_request(head: &RequestHead, version: Version, body: Body) -> Option<Request<Body>> {
-    let mut builder = Request::builder().method(head.method.as_bytes()).uri(head.target.as_str()).version(version);
+    let mut builder = Request::builder()
+        .method(head.method.as_bytes())
+        .uri(head.target.as_str())
+        .version(version);
     let headers = builder.headers_mut()?;
     for h in &head.headers {
         let name = HeaderName::from_bytes(h.name.as_bytes()).ok()?;
@@ -978,7 +1128,9 @@ fn to_request(head: &RequestHead, version: Version, body: Body) -> Option<Reques
 }
 
 fn no_body(status: StatusCode) -> bool {
-    status.is_informational() || status == StatusCode::NO_CONTENT || status == StatusCode::NOT_MODIFIED
+    status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
 }
 
 /// Writes a response head. `len` is the body's length if known. Returns
@@ -1002,9 +1154,15 @@ fn encode(
     out.push(b' ');
     out.extend_from_slice(status.canonical_reason().unwrap_or("").as_bytes());
     out.extend_from_slice(b"\r\n");
-    let given_len = response.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+    let given_len = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
     for (name, value) in response.headers() {
-        if matches!(name.as_str(), "content-length" | "transfer-encoding" | "connection" | "keep-alive") {
+        if matches!(
+            name.as_str(),
+            "content-length" | "transfer-encoding" | "connection" | "keep-alive"
+        ) {
             continue;
         }
         out.extend_from_slice(name.as_str().as_bytes());
@@ -1036,14 +1194,31 @@ fn encode(
     close
 }
 
-fn write_simple(out: &mut Vec<u8>, version: Version, status: StatusCode, date: Option<HeaderValue>) {
-    encode(out, version, &status_only(status), Some(0), false, true, date);
+fn write_simple(
+    out: &mut Vec<u8>,
+    version: Version,
+    status: StatusCode,
+    date: Option<HeaderValue>,
+) {
+    encode(
+        out,
+        version,
+        &status_only(status),
+        Some(0),
+        false,
+        true,
+        date,
+    );
 }
 
 /// The `Date` header at `now` on the run's clock, in a world whose date at
 /// the start of the run was `start`. `None` without a world date.
 pub fn date_header(start: Option<SystemTime>, now: Instant) -> Option<HeaderValue> {
-    let secs = start?.checked_add(now.since_start())?.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+    let secs = start?
+        .checked_add(now.since_start())?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
     HeaderValue::from_str(&http_date(secs)).ok()
 }
 
@@ -1059,7 +1234,9 @@ pub fn date_header(start: Option<SystemTime>, now: Instant) -> Option<HeaderValu
 /// ```
 pub fn http_date(secs: u64) -> String {
     const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     let days = (secs / 86_400) as i64;
     let rest = secs % 86_400;
     // Days to a civil date (Howard Hinnant's algorithm).
@@ -1096,7 +1273,12 @@ impl serve::Service for Http1 {
         Ok(Flow::Continue)
     }
 
-    fn on_item(&mut self, item: H1<RequestHead>, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+    fn on_item(
+        &mut self,
+        item: H1<RequestHead>,
+        _: &(),
+        driver: &mut Driver<'_>,
+    ) -> Result<Flow, Infallible> {
         match item {
             H1::Head(head) => {
                 driver.cancel_timer(HEAD);
@@ -1109,7 +1291,9 @@ impl serve::Service for Http1 {
                 }
                 driver.set_timer(BODY, self.opts.body_timeout);
                 if head.expects_continue() {
-                    driver.reply().extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+                    driver
+                        .reply()
+                        .extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
                 }
                 self.started = driver.now();
                 self.head = Some(head);
@@ -1136,7 +1320,12 @@ impl serve::Service for Http1 {
         self.body.len()
     }
 
-    fn on_fail(&mut self, error: &serve_fail::Fail, _: &(), driver: &mut Driver<'_>) -> Result<(), Infallible> {
+    fn on_fail(
+        &mut self,
+        error: &serve_fail::Fail,
+        _: &(),
+        driver: &mut Driver<'_>,
+    ) -> Result<(), Infallible> {
         if self.head.is_some() {
             // The body was cut off: the handler still sees what came, as a
             // body that ends in an error.
@@ -1147,8 +1336,10 @@ impl serve::Service for Http1 {
             self.dispatch(driver, body, true);
             return Ok(());
         }
-        if matches!(error, fictionet::stdlib::codec::Fail::Protocol(http1::Error::Host))
-            && let Some(head) = without_host(driver.unread())
+        if matches!(
+            error,
+            fictionet::stdlib::codec::Fail::Protocol(http1::Error::Host)
+        ) && let Some(head) = without_host(driver.unread())
         {
             // An HTTP/1.1 request with no Host field: the handler answers
             // it, as a request that names no host (`400`, `no_host`).
@@ -1157,15 +1348,28 @@ impl serve::Service for Http1 {
             self.dispatch(driver, Body::empty(), true);
             return Ok(());
         }
-        driver.record(error_event(driver.conn(), "protocol", fictionet::ErrorChain(error).to_string()));
+        driver.record(error_event(
+            driver.conn(),
+            "protocol",
+            fictionet::ErrorChain(error).to_string(),
+        ));
         let date = date_header(self.date, driver.now());
-        write_simple(driver.reply(), Version::HTTP_11, StatusCode::BAD_REQUEST, date);
+        write_simple(
+            driver.reply(),
+            Version::HTTP_11,
+            StatusCode::BAD_REQUEST,
+            date,
+        );
         Ok(())
     }
 
     fn on_end(&mut self, end: Ended, _: &(), driver: &mut Driver<'_>) -> Result<(), Infallible> {
         if end == Ended::Conn(ConnError::Broken) {
-            let e = error_event(driver.conn(), "transport", "a TLS record did not decrypt".into());
+            let e = error_event(
+                driver.conn(),
+                "transport",
+                "a TLS record did not decrypt".into(),
+            );
             driver.record(e);
         }
         Ok(())
@@ -1215,7 +1419,14 @@ struct Streaming {
 }
 
 impl Streaming {
-    fn new(work: Option<Later>, response: Option<Response<Body>>, version: Version, head_only: bool, close: bool, tracker: Tracker) -> Streaming {
+    fn new(
+        work: Option<Later>,
+        response: Option<Response<Body>>,
+        version: Version,
+        head_only: bool,
+        close: bool,
+        tracker: Tracker,
+    ) -> Streaming {
         Streaming {
             work,
             making: None,
@@ -1241,7 +1452,11 @@ impl Streaming {
     /// Dates the response from `date`, the world's date at the start of
     /// the run, when it is made; `asked` is the time without a [`Cx`].
     fn dated(self, date: Option<SystemTime>, asked: Instant) -> Streaming {
-        Streaming { date, asked, ..self }
+        Streaming {
+            date,
+            asked,
+            ..self
+        }
     }
 
     /// Counts the last piece's body bytes once the driver wrote it all.
@@ -1263,7 +1478,10 @@ impl Streaming {
             return;
         }
         self.finished = true;
-        if let Some(e) = self.tracker.finish(self.extra.take(), self.status, self.body_sent, complete) {
+        if let Some(e) =
+            self.tracker
+                .finish(self.extra.take(), self.status, self.body_sent, complete)
+        {
             driver.record(e);
         }
     }
@@ -1281,14 +1499,20 @@ impl Streaming {
 }
 
 impl Pending for Streaming {
-    fn poll_next(&mut self, driver: &mut PendingDriver<'_>, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, Error>>> {
+    fn poll_next(
+        &mut self,
+        driver: &mut PendingDriver<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Vec<u8>, Error>>> {
         // The driver polls again only once the last piece is written.
         self.confirm(driver);
         loop {
             if let Some(work) = self.work.take() {
                 self.making = Some(match driver.fcx() {
                     Some(fcx) => work(fcx.clone()),
-                    None => Box::pin(std::future::ready(Err(fictionet::Error::msg("this answer needs a Cx: give the harness one with Harness::with_fcx")))),
+                    None => Box::pin(std::future::ready(Err(fictionet::Error::msg(
+                        "this answer needs a Cx: give the harness one with Harness::with_fcx",
+                    )))),
                 });
             }
             if let Some(making) = &mut self.making {
@@ -1306,7 +1530,15 @@ impl Pending for Streaming {
                 let len = body.size_hint().exact();
                 let mut head = Vec::new();
                 let now = driver.fcx().map_or(self.asked, Cx::now);
-                self.close = encode(&mut head, self.version, &response, len, self.head_only, self.close, date_header(self.date, now));
+                self.close = encode(
+                    &mut head,
+                    self.version,
+                    &response,
+                    len,
+                    self.head_only,
+                    self.close,
+                    date_header(self.date, now),
+                );
                 if self.close {
                     // An HTTP/1.0 body of unknown length ends with the
                     // connection, whatever the request asked for.
@@ -1415,7 +1647,13 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// connection's failure is the connection's, and the run's events say what
 /// it was. Returns [`Cancelled`] if `fcx`'s
 /// [region](fictionet::Cx#regions) is cancelled first.
-pub async fn serve_connection<C: Connection + Unpin>(fcx: &Cx, conn: C, info: ConnInfo, handler: Arc<dyn Handler>, opts: &HttpOptions) -> Result<(), Cancelled> {
+pub async fn serve_connection<C: Connection + Unpin>(
+    fcx: &Cx,
+    conn: C,
+    info: ConnInfo,
+    handler: Arc<dyn Handler>,
+    opts: &HttpOptions,
+) -> Result<(), Cancelled> {
     let mut conn = conn;
     let mut first = Vec::new();
     let h2 = if info.tls {
@@ -1425,21 +1663,34 @@ pub async fn serve_connection<C: Connection + Unpin>(fcx: &Cx, conn: C, info: Co
         let preface = async {
             let mut buf = [0u8; 24];
             while first.len() < PREFACE.len() && PREFACE.starts_with(&first) {
-                match conn.read(fcx, &mut buf[..PREFACE.len() - first.len()]).await {
+                match conn
+                    .read(fcx, &mut buf[..PREFACE.len() - first.len()])
+                    .await
+                {
                     Ok(0) | Err(_) => return false,
                     Ok(n) => first.extend_from_slice(&buf[..n]),
                 }
             }
             true
         };
-        match fcx.race(opts.first_bytes.map(|d| fcx.now() + d), preface).await {
+        match fcx
+            .race(opts.first_bytes.map(|d| fcx.now() + d), preface)
+            .await
+        {
             Ok(true) => {}
             Ok(false) if fcx.is_cancelled() => return Err(Cancelled),
             Ok(false) => return Ok(()),
             Err(RaceError::Cancelled) => return Err(Cancelled),
             Err(RaceError::Deadline) => {
                 let secs = opts.first_bytes.map_or(0, |d| d.as_secs());
-                fcx.record(error_event(&info, "timeout", format!("no bytes within {secs} seconds of connecting")).conn(&info));
+                fcx.record(
+                    error_event(
+                        &info,
+                        "timeout",
+                        format!("no bytes within {secs} seconds of connecting"),
+                    )
+                    .conn(&info),
+                );
                 return Ok(());
             }
         }
@@ -1460,12 +1711,16 @@ pub async fn serve_connection<C: Connection + Unpin>(fcx: &Cx, conn: C, info: Co
     let mut service = Http1::with(handler.clone(), opts.limits);
     service.date = opts.date;
     match serve::serve(fcx, conn, info.clone(), &mut service, &(), &serve_opts).await {
-        Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) => match service.take_handoff() {
-            // A request that asks for an upgrade: hyper's HTTP/1 reads it
-            // again and carries the upgrade out.
-            Some(head) => h2::serve_upgrade(fcx, Prefixed::new(head, rest), handler, info, opts).await,
-            None => Ok(()),
-        },
+        Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) => {
+            match service.take_handoff() {
+                // A request that asks for an upgrade: hyper's HTTP/1 reads it
+                // again and carries the upgrade out.
+                Some(head) => {
+                    h2::serve_upgrade(fcx, Prefixed::new(head, rest), handler, info, opts).await
+                }
+                None => Ok(()),
+            }
+        }
         Err(serve::ServeError::Cancelled) => Err(Cancelled),
         // The driver recorded the failure as a `conn.error` event.
         Ok(_) | Err(_) => Ok(()),
@@ -1507,7 +1762,11 @@ impl Server {
     /// The same, from a shared handler.
     pub fn shared(handler: Arc<dyn Handler>) -> Server {
         Server {
-            vhost: VHost { handler, https: false, plain_http: false },
+            vhost: VHost {
+                handler,
+                https: false,
+                plain_http: false,
+            },
             default_host: false,
             limits: Limits::default(),
             date: None,
@@ -1574,7 +1833,9 @@ impl Accept for Server {
 
     fn share(&self, names: &[String], other: &Arc<dyn Accept>) -> bool {
         let other: &dyn Any = &**other;
-        let Some(site) = other.downcast_ref::<Server>() else { return false };
+        let Some(site) = other.downcast_ref::<Server>() else {
+            return false;
+        };
         for name in names {
             self.vhosts.insert(name, site.vhost.clone());
         }
@@ -1606,29 +1867,50 @@ impl Website {
 
     /// The same, from a shared handler.
     pub fn shared(handler: Arc<dyn Handler>) -> Website {
-        Website { handler, tls: None, plain_http: false, default_host: false, date: None }
+        Website {
+            handler,
+            tls: None,
+            plain_http: false,
+            default_host: false,
+            date: None,
+        }
     }
 
     /// Serves it over HTTPS on port 443, with the config `config_for`
     /// returns for each handshake. Port 80 then redirects to https.
-    pub fn tls(self, config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static) -> Website {
-        Website { tls: Some(Arc::new(config_for)), ..self }
+    pub fn tls(
+        self,
+        config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
+    ) -> Website {
+        Website {
+            tls: Some(Arc::new(config_for)),
+            ..self
+        }
     }
 
     /// With TLS, answers plain HTTP on port 80 too, with no redirect.
     pub fn plain_http(self) -> Website {
-        Website { plain_http: true, ..self }
+        Website {
+            plain_http: true,
+            ..self
+        }
     }
 
     /// Answers requests at its address whose host names no site there.
     pub fn default_host(self) -> Website {
-        Website { default_host: true, ..self }
+        Website {
+            default_host: true,
+            ..self
+        }
     }
 
     /// Sends `Date` headers: `start` is the world's date and time at the
     /// start of the run. See [Dates](self#dates).
     pub fn date(self, start: SystemTime) -> Website {
-        Website { date: Some(start), ..self }
+        Website {
+            date: Some(start),
+            ..self
+        }
     }
 
     /// `host`, serving this website.
@@ -1659,7 +1941,13 @@ mod h2 {
     use hyper::body::Incoming;
 
     /// Runs hyper's HTTP/2 server on `conn`.
-    pub(super) async fn serve<C: Connection + Unpin>(fcx: &Cx, conn: C, handler: Arc<dyn Handler>, info: ConnInfo, opts: &HttpOptions) -> Result<(), Cancelled> {
+    pub(super) async fn serve<C: Connection + Unpin>(
+        fcx: &Cx,
+        conn: C,
+        handler: Arc<dyn Handler>,
+        info: ConnInfo,
+        opts: &HttpOptions,
+    ) -> Result<(), Cancelled> {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let io = Io::new(fcx, conn, broke.clone(), opts.limits.write_timeout);
         let route = Route::new(fcx, handler, &info, opts);
@@ -1703,8 +1991,15 @@ mod h2 {
     /// How a connection hyper served ends: [`Cancelled`] if `fcx`'s region
     /// was cancelled, whether hyper saw it first or its I/O did; otherwise
     /// it ended, and an error is recorded.
-    fn finish(fcx: &Cx, info: &ConnInfo, broke: &std::sync::atomic::AtomicBool, raced: Result<Result<(), hyper::Error>, RaceError>) -> Result<(), Cancelled> {
-        let Ok(result) = raced else { return Err(Cancelled) };
+    fn finish(
+        fcx: &Cx,
+        info: &ConnInfo,
+        broke: &std::sync::atomic::AtomicBool,
+        raced: Result<Result<(), hyper::Error>, RaceError>,
+    ) -> Result<(), Cancelled> {
+        let Ok(result) = raced else {
+            return Err(Cancelled);
+        };
         if fcx.is_cancelled() {
             return Err(Cancelled);
         }
@@ -1713,7 +2008,12 @@ mod h2 {
     }
 
     /// Records how a connection hyper served ended, if in an error.
-    fn report(fcx: &Cx, info: &ConnInfo, broke: &std::sync::atomic::AtomicBool, result: Result<(), hyper::Error>) {
+    fn report(
+        fcx: &Cx,
+        info: &ConnInfo,
+        broke: &std::sync::atomic::AtomicBool,
+        result: Result<(), hyper::Error>,
+    ) {
         let broke = broke.load(std::sync::atomic::Ordering::Relaxed);
         let cause = match &result {
             Err(e) => match error_cause(e) {
@@ -1741,7 +2041,8 @@ mod h2 {
                 if let Some(io) = e.get_io() {
                     return transport(io);
                 }
-                let protocol = e.is_library() && e.reason().is_some_and(|r| r != ::h2::Reason::NO_ERROR);
+                let protocol =
+                    e.is_library() && e.reason().is_some_and(|r| r != ::h2::Reason::NO_ERROR);
                 return protocol.then_some("protocol");
             }
             if let Some(io) = s.downcast_ref::<std::io::Error>() {
@@ -1753,7 +2054,8 @@ mod h2 {
     }
 
     fn transport(io: &std::io::Error) -> Option<&'static str> {
-        let broken = io.get_ref().and_then(|e| e.downcast_ref::<ConnError>()) == Some(&ConnError::Broken);
+        let broken =
+            io.get_ref().and_then(|e| e.downcast_ref::<ConnError>()) == Some(&ConnError::Broken);
         broken.then_some("transport")
     }
 
@@ -1787,18 +2089,33 @@ mod h2 {
 
         /// Reads a request's body, charging it as it comes. `Err` is the
         /// answer instead.
-        async fn body(&self, body: Incoming, charge: &mut Option<Charge>) -> Result<Bytes, Box<Response<Body>>> {
+        async fn body(
+            &self,
+            body: Incoming,
+            charge: &mut Option<Charge>,
+        ) -> Result<Bytes, Box<Response<Body>>> {
             let read = async {
                 let mut body = pin!(body);
                 let mut got = Vec::new();
                 while let Some(frame) = poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
                     let Ok(frame) = frame else {
-                        return Err(Box::new(answered(text(StatusCode::BAD_REQUEST, "The request body was cut off.\n"), "cut_off")));
+                        return Err(Box::new(answered(
+                            text(StatusCode::BAD_REQUEST, "The request body was cut off.\n"),
+                            "cut_off",
+                        )));
                     };
-                    let Ok(data) = frame.into_data() else { continue };
+                    let Ok(data) = frame.into_data() else {
+                        continue;
+                    };
                     let len = got.len() + data.len();
                     if len > self.limits.body {
-                        return Err(Box::new(answered(text(StatusCode::PAYLOAD_TOO_LARGE, "The request body is too large.\n"), "too_large")));
+                        return Err(Box::new(answered(
+                            text(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "The request body is too large.\n",
+                            ),
+                            "too_large",
+                        )));
                     }
                     if !charge.as_mut().is_none_or(|c| c.set(len)) {
                         return Err(Box::new(over_budget()));
@@ -1807,16 +2124,32 @@ mod h2 {
                 }
                 Ok(Bytes::from(got))
             };
-            match self.fcx.race(Some(self.fcx.now() + self.limits.body_timeout), read).await {
+            match self
+                .fcx
+                .race(Some(self.fcx.now() + self.limits.body_timeout), read)
+                .await
+            {
                 Ok(got) => got,
-                Err(_) => Err(Box::new(answered(text(StatusCode::REQUEST_TIMEOUT, "The request body took too long.\n"), "timeout"))),
+                Err(_) => Err(Box::new(answered(
+                    text(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "The request body took too long.\n",
+                    ),
+                    "timeout",
+                ))),
             }
         }
     }
 
     /// The answer when the sandbox's budget cannot hold a body.
     fn over_budget() -> Response<Body> {
-        answered(text(StatusCode::SERVICE_UNAVAILABLE, "The server cannot hold this request now.\n"), "budget")
+        answered(
+            text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The server cannot hold this request now.\n",
+            ),
+            "budget",
+        )
     }
 
     type Answer = Pin<Box<dyn Future<Output = Result<Response<Counted>, Error>> + Send>>;
@@ -1854,7 +2187,9 @@ mod h2 {
                         let now = route.fcx.now();
                         let rng = route.rng.clone();
                         let mut rng = move || rng.lock().unwrap_or_else(|e| e.into_inner()).next();
-                        let reply = route.handler.call(request, &mut Exchange::new(now, &mut rng, &route.info));
+                        let reply = route
+                            .handler
+                            .call(request, &mut Exchange::new(now, &mut rng, &route.info));
                         match reply {
                             Reply::Now(r) => r,
                             Reply::Later(work) => match work(route.fcx.clone()).await {
@@ -1866,7 +2201,11 @@ mod h2 {
                 };
                 let (parts, body) = response.into_parts();
                 let fits = charge.as_mut().is_none_or(|c| c.set(body.full_len()));
-                let (mut parts, body) = if fits { (parts, body) } else { over_budget().into_parts() };
+                let (mut parts, body) = if fits {
+                    (parts, body)
+                } else {
+                    over_budget().into_parts()
+                };
                 if !parts.headers.contains_key(DATE)
                     && let Some(date) = date_header(route.date, route.fcx.now())
                 {
@@ -1893,7 +2232,16 @@ mod h2 {
                     c.set(body.full_len());
                 }
                 parts.extensions = http::Extensions::new();
-                Ok(Response::from_parts(parts, Counted { body, rest: Bytes::new(), track, bodiless, charge }))
+                Ok(Response::from_parts(
+                    parts,
+                    Counted {
+                        body,
+                        rest: Bytes::new(),
+                        track,
+                        bodiless,
+                        charge,
+                    },
+                ))
             })
         }
     }
@@ -1913,7 +2261,10 @@ mod h2 {
 
     impl Drop for Track {
         fn drop(&mut self) {
-            if let Some(e) = self.tracker.finish(self.extra.take(), self.status, self.sent, self.complete) {
+            if let Some(e) =
+                self.tracker
+                    .finish(self.extra.take(), self.status, self.sent, self.complete)
+            {
                 self.fcx.record(e.conn(&self.info));
             }
         }
@@ -1934,7 +2285,10 @@ mod h2 {
         type Data = Bytes;
         type Error = Error;
 
-        fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
             let this = self.get_mut();
             if !this.rest.is_empty() {
                 let piece = this.rest.split_to(this.rest.len().min(PIECE));
@@ -2014,8 +2368,20 @@ mod h2 {
     }
 
     impl<C: Connection + Unpin> Io<C> {
-        fn new(fcx: &Cx, conn: C, broke: Arc<std::sync::atomic::AtomicBool>, stall: Duration) -> Io<C> {
-            Io { fcx: fcx.clone(), conn, broke, buf: vec![0; 16 * 1024].into_boxed_slice(), stall, stalled: None }
+        fn new(
+            fcx: &Cx,
+            conn: C,
+            broke: Arc<std::sync::atomic::AtomicBool>,
+            stall: Duration,
+        ) -> Io<C> {
+            Io {
+                fcx: fcx.clone(),
+                conn,
+                broke,
+                buf: vec![0; 16 * 1024].into_boxed_slice(),
+                stall,
+                stalled: None,
+            }
         }
 
         /// One write, with the stall timer: armed when it waits, cleared
@@ -2025,7 +2391,9 @@ mod h2 {
                 Poll::Pending => {
                     let fcx = self.fcx.clone();
                     let stall = self.stall;
-                    let timer = self.stalled.get_or_insert_with(|| Box::pin(async move { fcx.sleep(stall).await }));
+                    let timer = self
+                        .stalled
+                        .get_or_insert_with(|| Box::pin(async move { fcx.sleep(stall).await }));
                     match timer.as_mut().poll(cx) {
                         Poll::Ready(Ok(())) => Poll::Ready(Err(ConnError::TimedOut)),
                         Poll::Ready(Err(_)) => Poll::Ready(Err(ConnError::Cancelled)),
@@ -2041,7 +2409,11 @@ mod h2 {
     }
 
     impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
-        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            mut buf: hyper::rt::ReadBufCursor<'_>,
+        ) -> Poll<std::io::Result<()>> {
             let this = self.get_mut();
             let want = buf.remaining().min(this.buf.len());
             match this.conn.poll_read(&this.fcx, cx, &mut this.buf[..want]) {
@@ -2061,7 +2433,11 @@ mod h2 {
     }
 
     impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
-        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
             self.get_mut().write(cx, data).map_err(std::io::Error::from)
         }
 
@@ -2069,7 +2445,11 @@ mod h2 {
             true
         }
 
-        fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[std::io::IoSlice<'_>]) -> Poll<std::io::Result<usize>> {
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
             let this = self.get_mut();
             let mut done = 0;
             for buf in bufs.iter().filter(|b| !b.is_empty()) {
@@ -2096,7 +2476,9 @@ mod h2 {
 
         fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             let this = self.get_mut();
-            this.conn.poll_shutdown(&this.fcx, cx).map_err(std::io::Error::from)
+            this.conn
+                .poll_shutdown(&this.fcx, cx)
+                .map_err(std::io::Error::from)
         }
     }
 
@@ -2178,7 +2560,12 @@ mod h2 {
         }
 
         impl Connection for StalledBody {
-            fn poll_read(&mut self, _: &Cx, _: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+            fn poll_read(
+                &mut self,
+                _: &Cx,
+                _: &mut Context<'_>,
+                buf: &mut [u8],
+            ) -> Poll<Result<usize, ConnError>> {
                 if self.input.is_empty() {
                     return Poll::Pending;
                 }
@@ -2187,11 +2574,20 @@ mod h2 {
                 Poll::Ready(Ok(n))
             }
 
-            fn poll_write(&mut self, _: &Cx, _: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+            fn poll_write(
+                &mut self,
+                _: &Cx,
+                _: &mut Context<'_>,
+                data: &[u8],
+            ) -> Poll<Result<usize, ConnError>> {
                 Poll::Ready(Ok(data.len()))
             }
 
-            fn poll_shutdown(&mut self, _: &Cx, _: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+            fn poll_shutdown(
+                &mut self,
+                _: &Cx,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), ConnError>> {
                 Poll::Ready(Ok(()))
             }
         }
@@ -2205,14 +2601,27 @@ mod h2 {
                 let block = b"\x83\x86\x84\x01\x01a";
                 input.extend_from_slice(&[0, 0, block.len() as u8, 1, 4, 0, 0, 0, 1]);
                 input.extend_from_slice(block);
-                let conn = StalledBody { input: Bytes::from(input) };
+                let conn = StalledBody {
+                    input: Bytes::from(input),
+                };
                 let duration = Duration::from_millis(40);
                 let opts = HttpOptions {
-                    limits: Limits { body_timeout: duration, ..Limits::default() },
+                    limits: Limits {
+                        body_timeout: duration,
+                        ..Limits::default()
+                    },
                     ..HttpOptions::default()
                 };
-                let handler = Router::new().post("/", |_, _| panic!("a stalled body cannot reach the handler"));
-                let mut served = pin!(serve(&fcx, conn, Arc::new(handler), ConnInfo::default(), &opts));
+                let handler = Router::new().post("/", |_, _| {
+                    panic!("a stalled body cannot reach the handler")
+                });
+                let mut served = pin!(serve(
+                    &fcx,
+                    conn,
+                    Arc::new(handler),
+                    ConnInfo::default(),
+                    &opts
+                ));
                 let log = fcx.events();
                 let wait = async {
                     loop {
@@ -2223,10 +2632,16 @@ mod h2 {
                     }
                 };
                 let mut wait = pin!(wait);
-                let event = fcx.race(Some(fcx.now() + Duration::from_secs(2)), poll_fn(|cx| {
-                    assert!(served.as_mut().poll(cx).is_pending());
-                    wait.as_mut().poll(cx)
-                })).await.unwrap();
+                let event = fcx
+                    .race(
+                        Some(fcx.now() + Duration::from_secs(2)),
+                        poll_fn(|cx| {
+                            assert!(served.as_mut().poll(cx).is_pending());
+                            wait.as_mut().poll(cx)
+                        }),
+                    )
+                    .await
+                    .unwrap();
                 let started = event.get("started").unwrap().as_f64().unwrap();
                 let elapsed = event.at.since_start().as_secs_f64() - started;
                 assert!(elapsed >= duration.as_secs_f64(), "{elapsed}");
@@ -2238,7 +2653,8 @@ mod h2 {
                 assert_eq!(log.of("http", "request").len(), 1);
                 assert!(log.of("http", "error").is_empty());
                 Ok(())
-            })).unwrap();
+            }))
+            .unwrap();
         }
 
         /// A hyper sleep on a cancelled `Cx` stays pending instead of
@@ -2259,7 +2675,10 @@ mod h2 {
                 assert!(inner.is_cancelled());
                 let mut sleep = CxTimer { fcx: inner }.sleep(Duration::from_secs(5));
                 let pending = |sleep: &mut Pin<Box<dyn hyper::rt::Sleep>>| {
-                    sleep.as_mut().poll(&mut Context::from_waker(std::task::Waker::noop())).is_pending()
+                    sleep
+                        .as_mut()
+                        .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                        .is_pending()
                 };
                 assert!(pending(&mut sleep));
                 fcx.sleep(Duration::from_millis(5)).await?;

@@ -1,13 +1,13 @@
 //! FAST 1.1 wire units, blocks, XML templates, messages, and strict writers.
 #![no_main]
 
-use fictionet::stdlib::codec::{
-    Wire,
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract::{
+    check_decode_with_alloc_limit, check_wire, check_wire_value,
 };
-use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_wire, check_wire_value};
 
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::fast::*;
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 // Original test templates. These are not templates for an exchange feed.

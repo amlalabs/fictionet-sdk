@@ -30,7 +30,13 @@ pub fn write_decimal(out: &mut impl fmt::Write, raw: u64, places: u32) -> fmt::R
     if places == 0 {
         return write!(out, "{raw}");
     }
-    write!(out, "{}.{:0width$}", raw / scale, raw % scale, width = places as usize)
+    write!(
+        out,
+        "{}.{:0width$}",
+        raw / scale,
+        raw % scale,
+        width = places as usize
+    )
 }
 
 /// Reads unsigned ASCII decimal text with at most `places` fractional digits.
@@ -47,8 +53,11 @@ pub fn parse_decimal(text: &str, places: u32) -> Result<u64, Error> {
     let scale = 10u64.checked_pow(places).ok_or(Error::Decimal)?;
     let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
     let digits = |t: &str| !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit());
-    if !digits(whole) || (!fraction.is_empty() && !digits(fraction))
-        || text.ends_with('.') || fraction.len() > places as usize {
+    if !digits(whole)
+        || (!fraction.is_empty() && !digits(fraction))
+        || text.ends_with('.')
+        || fraction.len() > places as usize
+    {
         return Err(Error::Decimal);
     }
     let whole: u64 = whole.parse().map_err(|_| Error::Decimal)?;
@@ -60,7 +69,8 @@ pub fn parse_decimal(text: &str, places: u32) -> Result<u64, Error> {
     for _ in fraction.len()..places as usize {
         frac = frac.checked_mul(10).ok_or(Error::Decimal)?;
     }
-    whole.checked_mul(scale)
+    whole
+        .checked_mul(scale)
         .and_then(|w| w.checked_add(frac))
         .ok_or(Error::Decimal)
 }
@@ -87,8 +97,11 @@ mod tests {
             assert_eq!(out, text);
             out.clear();
             write_decimal(&mut out, 0, places).unwrap();
-            let zero = if places == 0 { "0".to_owned() }
-                else { format!("0.{}", "0".repeat(places as usize)) };
+            let zero = if places == 0 {
+                "0".to_owned()
+            } else {
+                format!("0.{}", "0".repeat(places as usize))
+            };
             assert_eq!(out, zero);
             assert_eq!(parse_decimal(&out, places), Ok(0));
         }
@@ -99,16 +112,34 @@ mod tests {
     #[test]
     fn invalid_decimals() {
         for places in [0, 2, 4, 8, 19] {
-            for text in ["", ".", "1.", ".1", "+1", "-1", "1.+1", "1.-1",
-                " 1", "1 ", "1.2.3", "１", "1e2", "18446744073709551616"] {
+            for text in [
+                "",
+                ".",
+                "1.",
+                ".1",
+                "+1",
+                "-1",
+                "1.+1",
+                "1.-1",
+                " 1",
+                "1 ",
+                "1.2.3",
+                "１",
+                "1e2",
+                "18446744073709551616",
+            ] {
                 assert_eq!(parse_decimal(text, places), Err(Error::Decimal), "{text}");
             }
             let text = format!("0.{}", "0".repeat(places as usize + 1));
             assert_eq!(parse_decimal(&text, places), Err(Error::Decimal));
         }
-        for (places, text) in [(2, "184467440737095516.16"),
-            (4, "1844674407370955.1616"), (8, "184467440737.09551616"),
-            (19, "1.8446744073709551616"), (19, "2")] {
+        for (places, text) in [
+            (2, "184467440737095516.16"),
+            (4, "1844674407370955.1616"),
+            (8, "184467440737.09551616"),
+            (19, "1.8446744073709551616"),
+            (19, "2"),
+        ] {
             assert_eq!(parse_decimal(text, places), Err(Error::Decimal));
         }
         for places in [20, u32::MAX] {

@@ -167,7 +167,10 @@ impl core::error::Error for Error {}
 /// set (letters, digits, space and `'()+_,-./:=?`), not ending in a space.
 pub fn valid_boundary(b: &str) -> bool {
     let x = b.as_bytes();
-    !x.is_empty() && x.len() <= MAX_BOUNDARY && x.iter().all(|&c| is_bchar(c)) && x[x.len() - 1] != b' '
+    !x.is_empty()
+        && x.len() <= MAX_BOUNDARY
+        && x.iter().all(|&c| is_bchar(c))
+        && x[x.len() - 1] != b' '
 }
 
 /// The boundary named in a `Content-Type` value such as
@@ -188,7 +191,10 @@ pub fn boundary(content_type: &str) -> Option<String> {
     let cleaned = strip_comments(content_type)?;
     let v = ParamValue::parse_text(&cleaned)?;
     let (top, sub) = v.value.split_once('/')?;
-    let (top, sub) = (top.trim_end_matches(is_wsp_char), sub.trim_start_matches(is_wsp_char));
+    let (top, sub) = (
+        top.trim_end_matches(is_wsp_char),
+        sub.trim_start_matches(is_wsp_char),
+    );
     if !top.eq_ignore_ascii_case("multipart") || sub.is_empty() || !sub.bytes().all(is_token) {
         return None;
     }
@@ -277,11 +283,17 @@ fn strip_comments(s: &str) -> Option<String> {
 /// subtype is empty, is not a token, or exceeds [`MAX_HEADER_BYTES`] minus
 /// 128 bytes, or the boundary is not valid.
 pub fn content_type(subtype: &str, boundary: &str) -> Option<ParamValue> {
-    if subtype.is_empty() || subtype.len() > MAX_HEADER_BYTES.saturating_sub(128)
-        || !subtype.bytes().all(is_token) || !valid_boundary(boundary) {
+    if subtype.is_empty()
+        || subtype.len() > MAX_HEADER_BYTES.saturating_sub(128)
+        || !subtype.bytes().all(is_token)
+        || !valid_boundary(boundary)
+    {
         return None;
     }
-    Some(ParamValue { value: format!("multipart/{subtype}"), params: vec![("boundary".into(), boundary.into())] })
+    Some(ParamValue {
+        value: format!("multipart/{subtype}"),
+        params: vec![("boundary".into(), boundary.into())],
+    })
 }
 
 /// A header value with parameters, as in `Content-Type` and
@@ -325,7 +337,10 @@ impl ParamValue {
                 return None;
             }
             let name = &rest[..n];
-            rest = rest[n..].trim_start_matches(is_wsp_char).strip_prefix('=')?.trim_start_matches(is_wsp_char);
+            rest = rest[n..]
+                .trim_start_matches(is_wsp_char)
+                .strip_prefix('=')?
+                .trim_start_matches(is_wsp_char);
             let value;
             if let Some(q) = rest.strip_prefix('"') {
                 let mut out = String::new();
@@ -354,18 +369,26 @@ impl ParamValue {
                 value = rest[..n].to_string();
                 rest = &rest[n..];
             }
-            if params.len() == MAX_PARAMETERS || params.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            if params.len() == MAX_PARAMETERS
+                || params.iter().any(|(n, _)| n.eq_ignore_ascii_case(name))
+            {
                 return None;
             }
             params.push((name.to_string(), value));
         }
-        Some(ParamValue { value: main.to_string(), params })
+        Some(ParamValue {
+            value: main.to_string(),
+            params,
+        })
     }
 
     /// The value of the parameter called `name`, in any case. If a value
     /// built by hand has it twice, this is the first.
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.params.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        self.params
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
 
     fn header_text(&self) -> Result<String, Error> {
@@ -381,9 +404,16 @@ impl ParamValue {
         }
         let len = self.params.iter().fold(v.len(), |n, (name, value)| {
             let quoted = value.is_empty() || !value.bytes().all(is_token);
-            let escapes = if quoted { value.bytes().filter(|b| matches!(b, b'"' | b'\\')).count() } else { 0 };
-            n.saturating_add(name.len()).saturating_add(value.len()).saturating_add(escapes)
-                .saturating_add(3).saturating_add(if quoted { 2 } else { 0 })
+            let escapes = if quoted {
+                value.bytes().filter(|b| matches!(b, b'"' | b'\\')).count()
+            } else {
+                0
+            };
+            n.saturating_add(name.len())
+                .saturating_add(value.len())
+                .saturating_add(escapes)
+                .saturating_add(3)
+                .saturating_add(if quoted { 2 } else { 0 })
         });
         if len > MAX_HEADER_BYTES {
             return Err(Error::HeaderTooLong);
@@ -396,7 +426,10 @@ impl ParamValue {
             if value.contains(['\r', '\n']) {
                 return Err(Error::HeaderValue);
             }
-            if self.params[..i].iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            if self.params[..i]
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(name))
+            {
                 return Err(Error::Unwritable);
             }
             out.push_str("; ");
@@ -463,18 +496,27 @@ pub struct Headers {
 impl Headers {
     /// The value of the first field called `name`, in any case.
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.fields.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        self.fields
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
 
     /// The values of every field called `name`, in any case, in order.
     pub fn get_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-        self.fields.iter().filter(move |(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+        self.fields
+            .iter()
+            .filter(move |(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
     }
 
     /// The value of the field called `name`, in any case, if there is
     /// exactly one.
     pub fn get_one(&self, name: &str) -> Option<&str> {
-        let mut all = self.fields.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name));
+        let mut all = self
+            .fields
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name));
         let (_, v) = all.next()?;
         all.next().is_none().then_some(v.as_str())
     }
@@ -511,9 +553,14 @@ impl Part {
         if name.len() > MAX_HEADER_BYTES {
             return None;
         }
-        let d = ParamValue { value: "form-data".into(), params: vec![("name".into(), name.into())] };
+        let d = ParamValue {
+            value: "form-data".into(),
+            params: vec![("name".into(), name.into())],
+        };
         Some(Part {
-            headers: Headers { fields: vec![("Content-Disposition".into(), d.header_text().ok()?)] },
+            headers: Headers {
+                fields: vec![("Content-Disposition".into(), d.header_text().ok()?)],
+            },
             body: value.into(),
         })
     }
@@ -523,14 +570,25 @@ impl Part {
     /// the disposition exceeds [`MAX_HEADER_BYTES`], or the content type
     /// is not a valid header value or exceeds [`MAX_HEADER_BYTES`]. The
     /// writer checks the part cap.
-    pub fn file(name: &str, filename: &str, content_type: &str, body: impl Into<Vec<u8>>) -> Option<Part> {
-        if name.len() > MAX_HEADER_BYTES || filename.len() > MAX_HEADER_BYTES
-            || content_type.len() > MAX_HEADER_BYTES || !valid_value(content_type) {
+    pub fn file(
+        name: &str,
+        filename: &str,
+        content_type: &str,
+        body: impl Into<Vec<u8>>,
+    ) -> Option<Part> {
+        if name.len() > MAX_HEADER_BYTES
+            || filename.len() > MAX_HEADER_BYTES
+            || content_type.len() > MAX_HEADER_BYTES
+            || !valid_value(content_type)
+        {
             return None;
         }
         let d = ParamValue {
             value: "form-data".into(),
-            params: vec![("name".into(), name.into()), ("filename".into(), filename.into())],
+            params: vec![
+                ("name".into(), name.into()),
+                ("filename".into(), filename.into()),
+            ],
         };
         Some(Part {
             headers: Headers {
@@ -552,7 +610,12 @@ impl Part {
     /// The uploaded file's name: the `filename` parameter of
     /// `Content-Disposition`, as sent. It may hold a path.
     pub fn filename(&self) -> Option<String> {
-        Some(self.headers.content_disposition()?.get("filename")?.to_string())
+        Some(
+            self.headers
+                .content_disposition()?
+                .get("filename")?
+                .to_string(),
+        )
     }
 }
 
@@ -736,10 +799,12 @@ impl Decode for Parts {
     }
 
     fn held(&self) -> usize {
-        self.headers.fields.iter().fold(
-            self.delim.len(),
-            |n, (name, value)| n.saturating_add(name.len()).saturating_add(value.len()),
-        )
+        self.headers
+            .fields
+            .iter()
+            .fold(self.delim.len(), |n, (name, value)| {
+                n.saturating_add(name.len()).saturating_add(value.len())
+            })
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Part>, Error> {
@@ -881,7 +946,10 @@ impl Multipart {
     /// Pairs this body with an explicit boundary for a complete MIME entity.
     /// [`Wire::write`] checks the boundary and all body limits.
     pub fn with_boundary(self, boundary: impl Into<String>) -> Entity {
-        Entity { boundary: boundary.into(), multipart: self }
+        Entity {
+            boundary: boundary.into(),
+            multipart: self,
+        }
     }
 
     /// Chooses a free boundary and returns a complete MIME entity.
@@ -901,14 +969,17 @@ impl Multipart {
         if self.slices().iter().any(|s| find(s, &dash).is_some()) {
             return Err(Error::BoundaryInData);
         }
-        let mut size = self.preamble.len()
+        let mut size = self
+            .preamble
+            .len()
             .checked_add(if self.preamble.is_empty() { 0 } else { 2 })
             .and_then(|n| n.checked_add(dash.len()))
             .and_then(|n| n.checked_add(4))
             .and_then(|n| n.checked_add(self.epilogue.len()))
             .ok_or(Error::EntityTooLong)?;
         for part in &self.parts {
-            size = size.checked_add(header_block_size(part, header_separator(part).len()))
+            size = size
+                .checked_add(header_block_size(part, header_separator(part).len()))
                 .and_then(|n| n.checked_add(part.body.len()))
                 .and_then(|n| n.checked_add(dash.len() + 4))
                 .ok_or(Error::EntityTooLong)?;
@@ -970,12 +1041,13 @@ impl Multipart {
             while let Some(i) = s.get(at..).and_then(|r| find(r, &needle)) {
                 let start = at + i + needle.len();
                 if let Some(hex) = s.get(start..start + 8)
-                    && hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-                        let text = core::str::from_utf8(hex).unwrap_or("");
-                        if let Ok(n) = u32::from_str_radix(text, 16) {
-                            used.insert(n);
-                        }
+                    && hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                {
+                    let text = core::str::from_utf8(hex).unwrap_or("");
+                    if let Ok(n) = u32::from_str_radix(text, 16) {
+                        used.insert(n);
                     }
+                }
                 at = at + i + 1;
             }
         }
@@ -1130,14 +1202,22 @@ impl Wire for Entity {
         let cleaned = strip_comments(value).ok_or(Error::Header)?;
         let content_type = ParamValue::parse(cleaned.as_bytes())?;
         let (top, sub) = content_type.value.split_once('/').ok_or(Error::Header)?;
-        if !top.trim_end_matches(is_wsp_char).eq_ignore_ascii_case("multipart")
-            || !sub.trim_start_matches(is_wsp_char).eq_ignore_ascii_case("mixed")
-            || content_type.params.len() != 1 {
+        if !top
+            .trim_end_matches(is_wsp_char)
+            .eq_ignore_ascii_case("multipart")
+            || !sub
+                .trim_start_matches(is_wsp_char)
+                .eq_ignore_ascii_case("mixed")
+            || content_type.params.len() != 1
+        {
             return Err(Error::Header);
         }
         let boundary = boundary(value).ok_or(Error::Boundary)?;
         let multipart = Multipart::parse(input.get(end..).unwrap_or_default(), &boundary)?;
-        let entity = Self { boundary, multipart };
+        let entity = Self {
+            boundary,
+            multipart,
+        };
         // Canonical header spacing must also fit the entity cap.
         entity.to_bytes().map_err(parse_error)?;
         Ok(entity)
@@ -1167,16 +1247,25 @@ impl Wire for Entity {
 /// How many bytes a part's header block takes, with each line's name and
 /// value joined by `sep_len` bytes plus CR LF, and the empty line at the end.
 fn header_block_size(part: &Part, sep_len: usize) -> usize {
-    part.headers.fields.iter().fold(2usize, |size, (name, value)| {
-        size.saturating_add(name.len()).saturating_add(value.len()).saturating_add(sep_len + 2)
-    })
+    part.headers
+        .fields
+        .iter()
+        .fold(2usize, |size, (name, value)| {
+            size.saturating_add(name.len())
+                .saturating_add(value.len())
+                .saturating_add(sep_len + 2)
+        })
 }
 
 /// What goes between a header's name and value: `": "`, or `":"` if the
 /// part would pass [`MAX_HEADER_BYTES`] or [`MAX_PART`] with the spaces.
 fn header_separator(part: &Part) -> &'static [u8] {
     let size = header_block_size(part, 2);
-    if size <= MAX_HEADER_BYTES && size.saturating_add(part.body.len()) <= MAX_PART { b": " } else { b":" }
+    if size <= MAX_HEADER_BYTES && size.saturating_add(part.body.len()) <= MAX_PART {
+        b": "
+    } else {
+        b":"
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1238,7 +1327,10 @@ fn scan(buf: &[u8], delim: &[u8], finished: bool) -> (usize, Found) {
                     Look::Line(n) => return (i, Found::Close(after + 2 + n)),
                     Look::TooMuch => return (i, Found::Padding),
                     // Padding up to the end of the body also closes it.
-                    Look::More if finished && buf[after + 2..].iter().all(|&b| b == b' ' || b == b'\t') => {
+                    Look::More
+                        if finished
+                            && buf[after + 2..].iter().all(|&b| b == b' ' || b == b'\t') =>
+                    {
                         return (i, Found::Close(buf.len()));
                     }
                     Look::More if finished => {}
@@ -1353,11 +1445,11 @@ fn valid_value(v: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::assert_linear;
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
+    use fictionet::stdlib::test_support::assert_linear;
+    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::decode_all;
 
     // Tests of raw HTTP bodies omit the entity's Content-Type header.
@@ -1429,7 +1521,9 @@ explanatory note to non-MIME conformant readers.
         assert!(m.parts[0].headers.fields.is_empty());
         assert_eq!(
             m.parts[0].body,
-            crlf("This is implicitly typed plain US-ASCII text.\nIt does NOT end with a linebreak.")
+            crlf(
+                "This is implicitly typed plain US-ASCII text.\nIt does NOT end with a linebreak."
+            )
         );
         let ct = m.parts[1].headers.content_type().unwrap();
         assert_eq!(ct.value, "text/plain");
@@ -1438,9 +1532,16 @@ explanatory note to non-MIME conformant readers.
             m.parts[1].body,
             crlf("This is explicitly typed plain US-ASCII text.\nIt DOES end with a linebreak.\n")
         );
-        assert_eq!(m.epilogue, crlf("\nThis is the epilogue.  It is also to be ignored.\n"));
+        assert_eq!(
+            m.epilogue,
+            crlf("\nThis is the epilogue.  It is also to be ignored.\n")
+        );
         // Writing it again with the same boundary gives the same bytes back.
-        let again = m.clone().with_boundary("simple boundary").to_bytes().unwrap();
+        let again = m
+            .clone()
+            .with_boundary("simple boundary")
+            .to_bytes()
+            .unwrap();
         assert_eq!(Multipart::parse(raw(&again), "simple boundary").unwrap(), m);
         assert_eq!(raw(&again), body);
     }
@@ -1466,15 +1567,25 @@ Content-Type: text/plain
 ... contents of file1.txt ...
 --AaB03x--",
         );
-        let m = Multipart::parse(raw(&body), &boundary("multipart/form-data; boundary=AaB03x").unwrap()).unwrap();
+        let m = Multipart::parse(
+            raw(&body),
+            &boundary("multipart/form-data; boundary=AaB03x").unwrap(),
+        )
+        .unwrap();
         assert_eq!(m.parts.len(), 3);
         assert_eq!(m.parts[0].name().as_deref(), Some("_charset_"));
         assert_eq!(m.parts[0].body, b"iso-8859-1");
         assert_eq!(m.parts[1].name().as_deref(), Some("field1"));
         assert_eq!(m.parts[1].filename(), None);
         let ct = m.parts[1].headers.content_type().unwrap();
-        assert_eq!((ct.value.as_str(), ct.get("charset")), ("text/plain", Some("windows-1250")));
-        assert_eq!(m.parts[1].headers.get("Content-Transfer-Encoding"), Some("quoted-printable"));
+        assert_eq!(
+            (ct.value.as_str(), ct.get("charset")),
+            ("text/plain", Some("windows-1250"))
+        );
+        assert_eq!(
+            m.parts[1].headers.get("Content-Transfer-Encoding"),
+            Some("quoted-printable")
+        );
         assert_eq!(m.parts[1].body, b"Joe owes =E2=82=AC100.");
         assert_eq!(m.parts[2].name().as_deref(), Some("files"));
         assert_eq!(m.parts[2].filename().as_deref(), Some("file1.txt"));
@@ -1490,7 +1601,9 @@ Content-Type: text/plain
             b"--b\r\nX:v\r\n\r\nx--b and --b-00000000\r\n--b--",
         ] {
             let multipart = Multipart::parse(input, "b").unwrap();
-            let entity = multipart.with_free_boundary("b").expect("a parsed body picks a boundary");
+            let entity = multipart
+                .with_free_boundary("b")
+                .expect("a parsed body picks a boundary");
             let bytes = entity.to_bytes().expect("a parsed body writes again");
             assert_eq!(Entity::parse(&bytes).as_ref(), Ok(&entity));
             contract::check_wire_value(&Body {
@@ -1503,14 +1616,62 @@ Content-Type: text/plain
     #[test]
     fn parameter_write_errors_are_specific() {
         for (value, expected) in [
-            (ParamValue { value: "x".into(), params: vec![("bad name".into(), "v".into())] }, Error::HeaderName),
-            (ParamValue { value: "x\r\ny".into(), params: vec![] }, Error::HeaderValue),
-            (ParamValue { value: "x".into(), params: vec![("n".into(), "v\n".into())] }, Error::HeaderValue),
-            (ParamValue { value: "x".repeat(MAX_HEADER_BYTES + 1), params: vec![] }, Error::HeaderTooLong),
-            (ParamValue { value: "x".into(), params: vec![("n".into(), "\"".repeat(MAX_HEADER_BYTES / 2))] }, Error::HeaderTooLong),
-            (ParamValue { value: " x".into(), params: vec![] }, Error::HeaderValue),
-            (ParamValue { value: "x;y".into(), params: vec![] }, Error::Unwritable),
-            (ParamValue { value: "x".into(), params: vec![("n".into(), "v".into()), ("N".into(), "v".into())] }, Error::Unwritable),
+            (
+                ParamValue {
+                    value: "x".into(),
+                    params: vec![("bad name".into(), "v".into())],
+                },
+                Error::HeaderName,
+            ),
+            (
+                ParamValue {
+                    value: "x\r\ny".into(),
+                    params: vec![],
+                },
+                Error::HeaderValue,
+            ),
+            (
+                ParamValue {
+                    value: "x".into(),
+                    params: vec![("n".into(), "v\n".into())],
+                },
+                Error::HeaderValue,
+            ),
+            (
+                ParamValue {
+                    value: "x".repeat(MAX_HEADER_BYTES + 1),
+                    params: vec![],
+                },
+                Error::HeaderTooLong,
+            ),
+            (
+                ParamValue {
+                    value: "x".into(),
+                    params: vec![("n".into(), "\"".repeat(MAX_HEADER_BYTES / 2))],
+                },
+                Error::HeaderTooLong,
+            ),
+            (
+                ParamValue {
+                    value: " x".into(),
+                    params: vec![],
+                },
+                Error::HeaderValue,
+            ),
+            (
+                ParamValue {
+                    value: "x;y".into(),
+                    params: vec![],
+                },
+                Error::Unwritable,
+            ),
+            (
+                ParamValue {
+                    value: "x".into(),
+                    params: vec![("n".into(), "v".into()), ("N".into(), "v".into())],
+                },
+                Error::Unwritable,
+            ),
         ] {
             let mut out = b"keep".to_vec();
             assert_eq!(value.write(&mut out), Err(expected));
@@ -1522,26 +1683,45 @@ Content-Type: text/plain
     #[test]
     fn entity_limits_and_parameter_refusals() {
         let part = Part {
-            headers: Headers { fields: vec![("X".into(), "v".into())] },
+            headers: Headers {
+                fields: vec![("X".into(), "v".into())],
+            },
             body: vec![b'x'; MAX_PART - 7],
         };
-        let entity = Multipart { parts: vec![part], ..Multipart::default() }.with_boundary("b");
+        let entity = Multipart {
+            parts: vec![part],
+            ..Multipart::default()
+        }
+        .with_boundary("b");
         // A compact header keeps a part exactly at its limit writable.
         contract::check_wire_value(&entity);
         let bytes = entity.to_bytes().unwrap();
         assert_eq!(Entity::parse(&bytes), Ok(entity));
         let oversized = Multipart {
-            epilogue: vec![b'e'; MAX_ENTITY], ..Multipart::default()
-        }.with_boundary("b");
+            epilogue: vec![b'e'; MAX_ENTITY],
+            ..Multipart::default()
+        }
+        .with_boundary("b");
         assert_eq!(oversized.to_bytes(), Err(Error::EntityTooLong));
         contract::check_wire_value(&oversized);
-        assert_eq!(Multipart::parse(&vec![b'x'; MAX_ENTITY + 1], "b"), Err(Error::EntityTooLong));
-        let long = ParamValue { value: "x".repeat(MAX_HEADER_BYTES + 1), params: vec![] };
+        assert_eq!(
+            Multipart::parse(&vec![b'x'; MAX_ENTITY + 1], "b"),
+            Err(Error::EntityTooLong)
+        );
+        let long = ParamValue {
+            value: "x".repeat(MAX_HEADER_BYTES + 1),
+            params: vec![],
+        };
         assert_eq!(long.to_bytes(), Err(Error::HeaderTooLong));
         contract::check_wire_value(&long);
         assert_eq!(ParamValue::parse(b"x\r\ny"), Err(Error::Header));
         contract::check_wire::<ParamValue>(b"x;n=\"a b\"");
-        assert_eq!(Entity::parse(b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nx--b\r\n--b--\r\n"), Err(Error::Boundary));
+        assert_eq!(
+            Entity::parse(
+                b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nx--b\r\n--b--\r\n"
+            ),
+            Err(Error::Boundary)
+        );
         for input in [
             b"Content-Type: text/plain\r\n\r\n--b--".as_slice(),
             b"Content-Type: multipart/mixed; boundary=b\r\nX: y\r\n\r\n--b--",
@@ -1554,33 +1734,76 @@ Content-Type: text/plain
 
     #[test]
     fn parameters() {
-        let v = ParamValue::parse(("form-data; name=\"a \\\"q\\\" \\\\ b\";filename=x.txt ; ;").as_bytes()).ok().unwrap();
+        let v = ParamValue::parse(
+            ("form-data; name=\"a \\\"q\\\" \\\\ b\";filename=x.txt ; ;").as_bytes(),
+        )
+        .ok()
+        .unwrap();
         assert_eq!(v.value, "form-data");
         assert_eq!(v.get("NAME"), Some("a \"q\" \\ b"));
         assert_eq!(v.get("filename"), Some("x.txt"));
         assert_eq!(v.get("other"), None);
         assert_eq!(ParamValue::parse(&v.to_bytes().unwrap()).ok(), Some(v));
-        let u = ParamValue::parse(("form-data; filename=\"résumé.pdf\"").as_bytes()).ok().unwrap();
+        let u = ParamValue::parse(("form-data; filename=\"résumé.pdf\"").as_bytes())
+            .ok()
+            .unwrap();
         assert_eq!(u.get("filename"), Some("résumé.pdf"));
-        assert_eq!(ParamValue::parse(("x; name = \"\"").as_bytes()).ok().unwrap().get("name"), Some(""));
-        for bad in ["", " ; a=b", "x; =b", "x; a", "x; a=", "x; a=\"open", "x; a=b c", "x; a b=c", "x; a=@"] {
+        assert_eq!(
+            ParamValue::parse(("x; name = \"\"").as_bytes())
+                .ok()
+                .unwrap()
+                .get("name"),
+            Some("")
+        );
+        for bad in [
+            "",
+            " ; a=b",
+            "x; =b",
+            "x; a",
+            "x; a=",
+            "x; a=\"open",
+            "x; a=b c",
+            "x; a b=c",
+            "x; a=@",
+        ] {
             assert_eq!(ParamValue::parse((bad).as_bytes()).ok(), None, "{bad:?}");
         }
         // A name given twice, in any case, is refused: readers that take
         // the first and readers that take the last would disagree.
-        assert_eq!(ParamValue::parse(("form-data; name=a; NAME=b").as_bytes()).ok(), None);
         assert_eq!(
-            ParamValue { value: "a".into(), params: vec![("n".into(), "1".into()), ("N".into(), "2".into())] }
-                .to_bytes().ok().map(|bytes| String::from_utf8(bytes).unwrap()),
+            ParamValue::parse(("form-data; name=a; NAME=b").as_bytes()).ok(),
+            None
+        );
+        assert_eq!(
+            ParamValue {
+                value: "a".into(),
+                params: vec![("n".into(), "1".into()), ("N".into(), "2".into())]
+            }
+            .to_bytes()
+            .ok()
+            .map(|bytes| String::from_utf8(bytes).unwrap()),
             None
         );
         let many: String = (0..=MAX_PARAMETERS).map(|i| format!("; p{i}=v")).collect();
         assert_eq!(ParamValue::parse(format!("x{many}").as_bytes()).ok(), None);
         let ok: String = (0..MAX_PARAMETERS).map(|i| format!("; p{i}=v")).collect();
-        assert_eq!(ParamValue::parse(format!("x{ok}").as_bytes()).ok().unwrap().params.len(), MAX_PARAMETERS);
+        assert_eq!(
+            ParamValue::parse(format!("x{ok}").as_bytes())
+                .ok()
+                .unwrap()
+                .params
+                .len(),
+            MAX_PARAMETERS
+        );
         // Writers refuse what would not read back the same.
         let w = |value: &str, name: &str, pv: &str| {
-            ParamValue { value: value.into(), params: vec![(name.into(), pv.into())] }.to_bytes().ok().map(|bytes| String::from_utf8(bytes).unwrap())
+            ParamValue {
+                value: value.into(),
+                params: vec![(name.into(), pv.into())],
+            }
+            .to_bytes()
+            .ok()
+            .map(|bytes| String::from_utf8(bytes).unwrap())
         };
         assert_eq!(w("a", "n", "v").as_deref(), Some("a; n=v"));
         assert_eq!(w("a", "n", "v w").as_deref(), Some("a; n=\"v w\""));
@@ -1604,12 +1827,24 @@ Content-Type: text/plain
         assert!(!valid_boundary("trailing "));
         assert!(!valid_boundary("semi;colon"));
         assert!(!valid_boundary("é"));
-        assert_eq!(boundary("Multipart/Mixed; Boundary=abc").as_deref(), Some("abc"));
-        assert_eq!(boundary("multipart/form-data; boundary=\"a:b=c\"").as_deref(), Some("a:b=c"));
+        assert_eq!(
+            boundary("Multipart/Mixed; Boundary=abc").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            boundary("multipart/form-data; boundary=\"a:b=c\"").as_deref(),
+            Some("a:b=c")
+        );
         assert_eq!(boundary("text/plain; boundary=abc"), None);
         assert_eq!(boundary("multipart/mixed"), None);
         assert_eq!(boundary("multipart/mixed; boundary=\"bad \""), None);
-        let ct = String::from_utf8(content_type("form-data", "a:b").unwrap().to_bytes().unwrap()).unwrap();
+        let ct = String::from_utf8(
+            content_type("form-data", "a:b")
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(ct, "multipart/form-data; boundary=\"a:b\"");
         assert_eq!(boundary(&ct).as_deref(), Some("a:b"));
         assert_eq!(content_type("form-data", "bad;"), None);
@@ -1622,7 +1857,10 @@ Content-Type: text/plain
         // Two boundaries would let readers disagree on where parts end.
         assert_eq!(boundary("multipart/mixed; boundary=a; BOUNDARY=b"), None);
         assert_eq!(Parts::new("").err(), Some(Error::Boundary));
-        assert_eq!(Multipart::parse(raw(b"--a--"), "a b ").err(), Some(Error::Boundary));
+        assert_eq!(
+            Multipart::parse(raw(b"--a--"), "a b ").err(),
+            Some(Error::Boundary)
+        );
     }
 
     #[test]
@@ -1640,16 +1878,42 @@ Content-Type: text/plain
         assert_eq!(m, Multipart::default());
         // The closing line ends with padding and a line break, or with
         // padding and the end of the body.
-        assert_eq!(Multipart::parse(raw(b"--b--  \r\nE"), "b").unwrap().epilogue, b"E");
-        assert_eq!(Multipart::parse(raw(b"--b--  "), "b").unwrap().epilogue, b"");
-        assert_eq!(Multipart::parse(raw(b"--b--  E"), "b"), Err(Error::Truncated));
-        assert_eq!(Multipart::parse(raw(b"--b-- \r"), "b"), Err(Error::Truncated));
+        assert_eq!(
+            Multipart::parse(raw(b"--b--  \r\nE"), "b")
+                .unwrap()
+                .epilogue,
+            b"E"
+        );
+        assert_eq!(
+            Multipart::parse(raw(b"--b--  "), "b").unwrap().epilogue,
+            b""
+        );
+        assert_eq!(
+            Multipart::parse(raw(b"--b--  E"), "b"),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            Multipart::parse(raw(b"--b-- \r"), "b"),
+            Err(Error::Truncated)
+        );
         // Folded header lines are joined.
-        let m = Multipart::parse(raw(b"--b\r\nA:  one\r\n  two \r\n\tthree\r\n\r\nz\r\n--b--"), "b").unwrap();
+        let m = Multipart::parse(
+            raw(b"--b\r\nA:  one\r\n  two \r\n\tthree\r\n\r\nz\r\n--b--"),
+            "b",
+        )
+        .unwrap();
         assert_eq!(m.parts[0].headers.get("a"), Some("one  two \tthree"));
         // A preamble that starts with CR LF.
-        assert_eq!(Multipart::parse(raw(b"\r\n--b--"), "b").unwrap().preamble, b"");
-        assert_eq!(Multipart::parse(raw(b"\r\n\r\n--b--"), "b").unwrap().preamble, b"\r\n");
+        assert_eq!(
+            Multipart::parse(raw(b"\r\n--b--"), "b").unwrap().preamble,
+            b""
+        );
+        assert_eq!(
+            Multipart::parse(raw(b"\r\n\r\n--b--"), "b")
+                .unwrap()
+                .preamble,
+            b"\r\n"
+        );
     }
 
     #[test]
@@ -1668,9 +1932,17 @@ Content-Type: text/plain
         assert_eq!(part(b"A: bare\rcr"), Err(Error::Header));
         assert_eq!(part(b" folded first"), Err(Error::Header));
         assert_eq!(part(b"A: \xff\xfe"), Err(Error::Header));
-        let many: Vec<u8> = (0..=MAX_HEADERS).map(|i| format!("H{i}: v")).collect::<Vec<_>>().join("\r\n").into_bytes();
+        let many: Vec<u8> = (0..=MAX_HEADERS)
+            .map(|i| format!("H{i}: v"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            .into_bytes();
         assert_eq!(part(&many), Err(Error::TooManyHeaders));
-        let ok: Vec<u8> = (0..MAX_HEADERS).map(|i| format!("H{i}: v")).collect::<Vec<_>>().join("\r\n").into_bytes();
+        let ok: Vec<u8> = (0..MAX_HEADERS)
+            .map(|i| format!("H{i}: v"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            .into_bytes();
         assert!(part(&ok).is_ok());
         // The block, with its CR LF CR LF, may be exactly the limit.
         let fits = format!("A: {}", "v".repeat(MAX_HEADER_BYTES - 7));
@@ -1683,7 +1955,10 @@ Content-Type: text/plain
         check(&input, "b");
         let mut stream = Stream::new(Parts::new("b").unwrap());
         let error = Fail::Protocol(Error::HeaderTooLong);
-        assert_eq!(pump(&mut stream, &input, |_| panic!("invalid header")), Err(error.clone()));
+        assert_eq!(
+            pump(&mut stream, &input, |_| panic!("invalid header")),
+            Err(error.clone())
+        );
         assert_eq!(stream.push(b"\r\n\r\n--b--"), 9);
         stream.end();
         assert_eq!(stream.next(), None);
@@ -1692,7 +1967,10 @@ Content-Type: text/plain
 
     #[test]
     fn part_count_limit() {
-        let mut ok = Multipart { parts: vec![Part::field("f", "v").unwrap(); MAX_PARTS], ..Multipart::default() };
+        let mut ok = Multipart {
+            parts: vec![Part::field("f", "v").unwrap(); MAX_PARTS],
+            ..Multipart::default()
+        };
         let bytes = ok.clone().with_boundary("b").to_bytes().unwrap();
         assert_eq!(Multipart::parse(raw(&bytes), "b").unwrap(), ok);
         let mut over = String::new();
@@ -1700,9 +1978,15 @@ Content-Type: text/plain
             over.push_str("--b\r\n\r\n\r\n");
         }
         over.push_str("--b--");
-        assert_eq!(Multipart::parse(raw(over.as_bytes()), "b"), Err(Error::TooManyParts));
+        assert_eq!(
+            Multipart::parse(raw(over.as_bytes()), "b"),
+            Err(Error::TooManyParts)
+        );
         ok.parts.push(Part::default());
-        assert_eq!(ok.clone().with_boundary("b").to_bytes(), Err(Error::TooManyParts));
+        assert_eq!(
+            ok.clone().with_boundary("b").to_bytes(),
+            Err(Error::TooManyParts)
+        );
     }
 
     fn sample() -> Multipart {
@@ -1712,7 +1996,10 @@ Content-Type: text/plain
                 Part::field("user", "alice").unwrap(),
                 Part::file("doc", "C:\\a \"b\".txt", "text/plain", "line\r\n").unwrap(),
                 Part::default(),
-                Part { headers: Headers::default(), body: b"\r\n".to_vec() },
+                Part {
+                    headers: Headers::default(),
+                    body: b"\r\n".to_vec(),
+                },
             ],
             epilogue: b"\r\npost".to_vec(),
         }
@@ -1751,17 +2038,28 @@ Content-Type: text/plain
         // Byte at a time, the same.
         check(&bytes, &b);
         // Empty preamble and epilogue.
-        let bare = Multipart { parts: vec![Part::field("a", "").unwrap()], ..Multipart::default() };
+        let bare = Multipart {
+            parts: vec![Part::field("a", "").unwrap()],
+            ..Multipart::default()
+        };
         let bytes = bare.clone().with_boundary("z").to_bytes().unwrap();
-        assert_eq!(raw(&bytes), b"--z\r\nContent-Disposition: form-data; name=a\r\n\r\n\r\n--z--\r\n");
+        assert_eq!(
+            raw(&bytes),
+            b"--z\r\nContent-Disposition: form-data; name=a\r\n\r\n\r\n--z--\r\n"
+        );
         assert_eq!(Multipart::parse(raw(&bytes), "z").unwrap(), bare);
     }
 
     #[test]
     fn picking_a_boundary() {
-        let mut m =
-            Multipart { parts: vec![Part::field("x", "--XyZ and --XyZ-00000000").unwrap()], ..Multipart::default() };
-        assert_eq!(m.clone().with_boundary("XyZ").to_bytes(), Err(Error::BoundaryInData));
+        let mut m = Multipart {
+            parts: vec![Part::field("x", "--XyZ and --XyZ-00000000").unwrap()],
+            ..Multipart::default()
+        };
+        assert_eq!(
+            m.clone().with_boundary("XyZ").to_bytes(),
+            Err(Error::BoundaryInData)
+        );
         assert_eq!(m.pick_boundary("XyZ").unwrap(), "XyZ-00000001");
         m.preamble = b"--XyZ-00000001".to_vec();
         assert_eq!(m.pick_boundary("XyZ").unwrap(), "XyZ-00000002");
@@ -1778,33 +2076,83 @@ Content-Type: text/plain
         assert_eq!(m.pick_boundary("bad;"), Err(Error::Boundary));
         // The boundary in a header counts too.
         let h = Multipart {
-            parts: vec![Part { headers: Headers { fields: vec![("X".into(), "--k".into())] }, body: vec![] }],
+            parts: vec![Part {
+                headers: Headers {
+                    fields: vec![("X".into(), "--k".into())],
+                },
+                body: vec![],
+            }],
             ..Multipart::default()
         };
-        assert_eq!(h.clone().with_boundary("k").to_bytes(), Err(Error::BoundaryInData));
+        assert_eq!(
+            h.clone().with_boundary("k").to_bytes(),
+            Err(Error::BoundaryInData)
+        );
         assert_eq!(h.pick_boundary("k").unwrap(), "k-00000000");
     }
 
     #[test]
     fn write_errors() {
         let with = |name: &str, value: &str| Multipart {
-            parts: vec![Part { headers: Headers { fields: vec![(name.into(), value.into())] }, body: vec![] }],
+            parts: vec![Part {
+                headers: Headers {
+                    fields: vec![(name.into(), value.into())],
+                },
+                body: vec![],
+            }],
             ..Multipart::default()
         };
-        assert_eq!(with("A", "v").clone().with_boundary("").to_bytes(), Err(Error::Boundary));
+        assert_eq!(
+            with("A", "v").clone().with_boundary("").to_bytes(),
+            Err(Error::Boundary)
+        );
         assert!(with("A", "").clone().with_boundary("b").to_bytes().is_ok());
-        assert_eq!(with("", "v").clone().with_boundary("b").to_bytes(), Err(Error::HeaderName));
-        assert_eq!(with("A B", "v").clone().with_boundary("b").to_bytes(), Err(Error::HeaderName));
-        assert_eq!(with("A:", "v").clone().with_boundary("b").to_bytes(), Err(Error::HeaderName));
-        assert_eq!(with("A", "v\r\nX: y").clone().with_boundary("b").to_bytes(), Err(Error::HeaderValue));
-        assert_eq!(with("A", " v").clone().with_boundary("b").to_bytes(), Err(Error::HeaderValue));
-        assert_eq!(with("A", "v\t").clone().with_boundary("b").to_bytes(), Err(Error::HeaderValue));
-        assert_eq!(with("A", &"v".repeat(MAX_HEADER_BYTES)).clone().with_boundary("b").to_bytes(), Err(Error::HeaderTooLong));
+        assert_eq!(
+            with("", "v").clone().with_boundary("b").to_bytes(),
+            Err(Error::HeaderName)
+        );
+        assert_eq!(
+            with("A B", "v").clone().with_boundary("b").to_bytes(),
+            Err(Error::HeaderName)
+        );
+        assert_eq!(
+            with("A:", "v").clone().with_boundary("b").to_bytes(),
+            Err(Error::HeaderName)
+        );
+        assert_eq!(
+            with("A", "v\r\nX: y").clone().with_boundary("b").to_bytes(),
+            Err(Error::HeaderValue)
+        );
+        assert_eq!(
+            with("A", " v").clone().with_boundary("b").to_bytes(),
+            Err(Error::HeaderValue)
+        );
+        assert_eq!(
+            with("A", "v\t").clone().with_boundary("b").to_bytes(),
+            Err(Error::HeaderValue)
+        );
+        assert_eq!(
+            with("A", &"v".repeat(MAX_HEADER_BYTES))
+                .clone()
+                .with_boundary("b")
+                .to_bytes(),
+            Err(Error::HeaderTooLong)
+        );
         let fits = with("A", &"v".repeat(MAX_HEADER_BYTES - 7));
-        assert_eq!(Multipart::parse(raw(&fits.clone().with_boundary("b").to_bytes().unwrap()), "b").unwrap(), fits);
+        assert_eq!(
+            Multipart::parse(
+                raw(&fits.clone().with_boundary("b").to_bytes().unwrap()),
+                "b"
+            )
+            .unwrap(),
+            fits
+        );
         let mut many = with("A", "v");
         many.parts[0].headers.fields = vec![("A".into(), "v".into()); MAX_HEADERS + 1];
-        assert_eq!(many.clone().with_boundary("b").to_bytes(), Err(Error::TooManyHeaders));
+        assert_eq!(
+            many.clone().with_boundary("b").to_bytes(),
+            Err(Error::TooManyHeaders)
+        );
         assert_eq!(Part::field("a\r\n", "v"), None);
         assert_eq!(Part::file("a", "f", "text/plain\r\n", "v"), None);
         assert_eq!(Part::file("a", "f\n", "text/plain", "v"), None);
@@ -1814,11 +2162,22 @@ Content-Type: text/plain
     fn parts_in_order_and_truncated_body() {
         let bytes = b"P\r\n--b\r\nA: 1\r\n\r\nxy\r\n--b--\r\nE";
         check(bytes, "b");
-        assert_eq!(decode_all(|| Parts::new("b").unwrap(), bytes), (vec![Part {
-            headers: Headers { fields: vec![("A".into(), "1".into())] }, body: b"xy".to_vec(),
-        }], None));
-        assert_eq!(decode_all(|| Parts::new("b").unwrap(), b"--b\r\n\r\nbody").1,
-            Some(Fail::Protocol(Error::Truncated)));
+        assert_eq!(
+            decode_all(|| Parts::new("b").unwrap(), bytes),
+            (
+                vec![Part {
+                    headers: Headers {
+                        fields: vec![("A".into(), "1".into())]
+                    },
+                    body: b"xy".to_vec(),
+                }],
+                None
+            )
+        );
+        assert_eq!(
+            decode_all(|| Parts::new("b").unwrap(), b"--b\r\n\r\nbody").1,
+            Some(Fail::Protocol(Error::Truncated))
+        );
     }
 
     #[test]
@@ -1845,7 +2204,11 @@ Content-Type: text/plain
             assert_eq!(m.parts.len(), 64);
         };
         check(MAX_HEADER_BYTES - 9);
-        assert_linear("slow_headers_take_linear_time", (MAX_HEADER_BYTES - 9) / 4, check);
+        assert_linear(
+            "slow_headers_take_linear_time",
+            (MAX_HEADER_BYTES - 9) / 4,
+            check,
+        );
     }
 
     #[test]
@@ -1898,7 +2261,12 @@ Content-Type: text/plain
     #[test]
     fn large_body_and_epilogue_use_bounded_storage() {
         for body in [
-            [b"--b\r\n\r\n".as_slice(), &vec![b'x'; 1 << 20], b"\r\n--b--\r\n"].concat(),
+            [
+                b"--b\r\n\r\n".as_slice(),
+                &vec![b'x'; 1 << 20],
+                b"\r\n--b--\r\n",
+            ]
+            .concat(),
             [b"--b--\r\n".as_slice(), &vec![b'e'; 1 << 20]].concat(),
         ] {
             check(&body, "b");
@@ -1909,27 +2277,47 @@ Content-Type: text/plain
     #[test]
     fn boundary_across_a_header_line() {
         let m = Multipart {
-            parts: vec![Part { headers: Headers { fields: vec![("--x".into(), "y".into())] }, body: vec![] }],
+            parts: vec![Part {
+                headers: Headers {
+                    fields: vec![("--x".into(), "y".into())],
+                },
+                body: vec![],
+            }],
             ..Multipart::default()
         };
-        assert_eq!(m.clone().with_boundary("x: y").to_bytes(), Err(Error::BoundaryInData));
+        assert_eq!(
+            m.clone().with_boundary("x: y").to_bytes(),
+            Err(Error::BoundaryInData)
+        );
         let b = m.pick_boundary("x: y").unwrap();
         assert_ne!(b, "x: y");
         let bytes = m.clone().with_boundary(&b).to_bytes().unwrap();
         assert_eq!(Multipart::parse(raw(&bytes), &b).unwrap(), m);
         // The same in the compact form.
         let mut c = m.clone();
-        c.parts[0].headers.fields.push(("P".into(), "p".repeat(MAX_HEADER_BYTES - 14)));
+        c.parts[0]
+            .headers
+            .fields
+            .push(("P".into(), "p".repeat(MAX_HEADER_BYTES - 14)));
         assert_eq!(header_separator(&c.parts[0]), b":");
-        assert_eq!(c.clone().with_boundary("x:y").to_bytes(), Err(Error::BoundaryInData));
+        assert_eq!(
+            c.clone().with_boundary("x:y").to_bytes(),
+            Err(Error::BoundaryInData)
+        );
         let b = c.pick_boundary("x:y").unwrap();
-        assert_eq!(Multipart::parse(raw(&c.clone().with_boundary(&b).to_bytes().unwrap()), &b).unwrap(), c);
+        assert_eq!(
+            Multipart::parse(raw(&c.clone().with_boundary(&b).to_bytes().unwrap()), &b).unwrap(),
+            c
+        );
     }
 
     // Finding: `--b--junk` closed the body.
     #[test]
     fn closing_line_must_end() {
-        assert_eq!(Multipart::parse(raw(b"--b\r\n\r\nx\r\n--b--junk"), "b"), Err(Error::Truncated));
+        assert_eq!(
+            Multipart::parse(raw(b"--b\r\n\r\nx\r\n--b--junk"), "b"),
+            Err(Error::Truncated)
+        );
         let m = Multipart::parse(raw(b"--b\r\n\r\nx\r\n--b--junk\r\n--b--\r\nE"), "b").unwrap();
         assert_eq!(m.parts.len(), 1);
         assert_eq!(m.parts[0].body, b"x\r\n--b--junk");
@@ -1942,21 +2330,42 @@ Content-Type: text/plain
     fn too_much_padding_is_an_error() {
         let pad = " ".repeat(MAX_PADDING + 1);
         let body = format!("--b\r\n\r\nx\r\n--b{pad}\r\n\r\ny\r\n--b--");
-        assert_eq!(Multipart::parse(raw(body.as_bytes()), "b"), Err(Error::Padding));
+        assert_eq!(
+            Multipart::parse(raw(body.as_bytes()), "b"),
+            Err(Error::Padding)
+        );
         check(body.as_bytes(), "b");
         let body = format!("--b\r\n\r\nx\r\n--b--{pad}");
-        assert_eq!(Multipart::parse(raw(body.as_bytes()), "b"), Err(Error::Padding));
+        assert_eq!(
+            Multipart::parse(raw(body.as_bytes()), "b"),
+            Err(Error::Padding)
+        );
         let fits = " ".repeat(MAX_PADDING);
         let body = format!("--b{fits}\r\n\r\nx\r\n--b{fits}\r\n\r\ny\r\n--b--{fits}");
-        assert_eq!(Multipart::parse(raw(body.as_bytes()), "b").unwrap().parts.len(), 2);
+        assert_eq!(
+            Multipart::parse(raw(body.as_bytes()), "b")
+                .unwrap()
+                .parts
+                .len(),
+            2
+        );
     }
 
     // Finding: comments and spaces in Content-Type hid the boundary.
     #[test]
     fn content_type_comments() {
-        assert_eq!(boundary("multipart/mixed; boundary=b (comment)").as_deref(), Some("b"));
-        assert_eq!(boundary("multipart / mixed; boundary=b").as_deref(), Some("b"));
-        assert_eq!(boundary("(a (nested) \\) one) multipart/mixed (x); boundary=\"(q)\"").as_deref(), Some("(q)"));
+        assert_eq!(
+            boundary("multipart/mixed; boundary=b (comment)").as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            boundary("multipart / mixed; boundary=b").as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            boundary("(a (nested) \\) one) multipart/mixed (x); boundary=\"(q)\"").as_deref(),
+            Some("(q)")
+        );
         assert_eq!(boundary("multipart/mixed; boundary=b (open"), None);
         assert_eq!(boundary("multi(x)part/mixed; boundary=b"), None);
     }
@@ -1988,14 +2397,29 @@ Content-Type: text/plain
     // Finding: RFC 2231 continuations of the boundary were not joined.
     #[test]
     fn boundary_continuations() {
-        assert_eq!(boundary("multipart/mixed; boundary*0=\"ab\"; boundary*1=\"cd\"").as_deref(), Some("abcd"));
-        assert_eq!(boundary("multipart/mixed; Boundary*1=cd; BOUNDARY*0=ab").as_deref(), Some("abcd"));
-        assert_eq!(boundary("multipart/mixed; boundary*0=ab; boundary*2=cd"), None);
+        assert_eq!(
+            boundary("multipart/mixed; boundary*0=\"ab\"; boundary*1=\"cd\"").as_deref(),
+            Some("abcd")
+        );
+        assert_eq!(
+            boundary("multipart/mixed; Boundary*1=cd; BOUNDARY*0=ab").as_deref(),
+            Some("abcd")
+        );
+        assert_eq!(
+            boundary("multipart/mixed; boundary*0=ab; boundary*2=cd"),
+            None
+        );
         assert_eq!(boundary("multipart/mixed; boundary*1=ab"), None);
         assert_eq!(boundary("multipart/mixed; boundary=x; boundary*0=ab"), None);
         assert_eq!(boundary("multipart/mixed; boundary*0*=us-ascii''ab"), None);
-        assert_eq!(boundary("multipart/mixed; boundary*0=ab; boundary*01=cd"), None);
-        let long = format!("multipart/mixed; boundary*0={}; boundary*1=b", "a".repeat(MAX_BOUNDARY));
+        assert_eq!(
+            boundary("multipart/mixed; boundary*0=ab; boundary*01=cd"),
+            None
+        );
+        let long = format!(
+            "multipart/mixed; boundary*0={}; boundary*1=b",
+            "a".repeat(MAX_BOUNDARY)
+        );
         assert_eq!(boundary(&long), None);
     }
 
@@ -2072,16 +2496,24 @@ Content-Type: text/plain
                 let b = entity.boundary.clone();
                 let bytes = entity.to_bytes().unwrap();
                 assert_eq!(Entity::parse(&bytes).as_ref(), Ok(&entity));
-                assert_eq!(Multipart::parse(raw(&bytes), &b).as_ref(), Ok(&m), "round {round}");
+                assert_eq!(
+                    Multipart::parse(raw(&bytes), &b).as_ref(),
+                    Ok(&m),
+                    "round {round}"
+                );
                 for p in &m.parts {
                     let _ = (p.name(), p.filename(), p.headers.content_type());
                 }
             }
             if let Ok(s) = std::str::from_utf8(&data) {
                 if let Ok(v) = ParamValue::parse(s.as_bytes())
-                    && let Some(h) = v.to_bytes().ok().map(|bytes| String::from_utf8(bytes).unwrap()) {
-                        assert_eq!(ParamValue::parse(h.as_bytes()).ok(), Some(v));
-                    }
+                    && let Some(h) = v
+                        .to_bytes()
+                        .ok()
+                        .map(|bytes| String::from_utf8(bytes).unwrap())
+                {
+                    assert_eq!(ParamValue::parse(h.as_bytes()).ok(), Some(v));
+                }
                 let _ = boundary(s);
             }
         }
@@ -2096,7 +2528,11 @@ Content-Type: text/plain
                 }
                 v
             };
-            let mut m = Multipart { preamble: bytes(&mut r), parts: Vec::new(), epilogue: bytes(&mut r) };
+            let mut m = Multipart {
+                preamble: bytes(&mut r),
+                parts: Vec::new(),
+                epilogue: bytes(&mut r),
+            };
             for _ in 0..r.index(5) {
                 let name = String::from_utf8_lossy(&bytes(&mut r)).into_owned();
                 let part = if r.index(2) == 0 {
@@ -2119,7 +2555,11 @@ Content-Type: text/plain
             let b = entity.boundary.clone();
             let out = entity.to_bytes().unwrap();
             assert_eq!(Entity::parse(&out).as_ref(), Ok(&entity));
-            assert_eq!(Multipart::parse(raw(&out), &b).as_ref(), Ok(&m), "round {round}");
+            assert_eq!(
+                Multipart::parse(raw(&out), &b).as_ref(),
+                Ok(&m),
+                "round {round}"
+            );
             check(&out, &b);
             for p in &m.parts {
                 if let Some(n) = p.name() {

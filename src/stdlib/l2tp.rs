@@ -87,7 +87,7 @@
 //! assert_eq!(back.message(), Ok(reply));
 //! ```
 
-use fictionet::stdlib::codec::{be16, be32, Wire};
+use fictionet::stdlib::codec::{Wire, be16, be32};
 
 /// The UDP port L2TP peers listen on.
 pub const PORT: u16 = 1701;
@@ -259,7 +259,10 @@ impl std::fmt::Display for Error {
             Error::Trailing => f.write_str("bytes after the unit"),
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Truncated => f.write_str("the bytes end before the header, field or AVP does"),
-            Error::TooLong(n) => write!(f, "{n} bytes, longer than an L2TP datagram or message can be"),
+            Error::TooLong(n) => write!(
+                f,
+                "{n} bytes, longer than an L2TP datagram or message can be"
+            ),
             Error::Version(v) => write!(f, "L2TP version {v}, not the one expected"),
             Error::ControlBits => f.write_str("a control message without L and S, or with O or P"),
             Error::NotControl => f.write_str("a data message where a control message was expected"),
@@ -404,7 +407,13 @@ pub struct Avp {
 impl Avp {
     /// A mandatory IETF AVP that is not hidden.
     pub fn new(attribute: u16, value: Vec<u8>) -> Avp {
-        Avp { mandatory: true, hidden: false, vendor: 0, attribute, value }
+        Avp {
+            mandatory: true,
+            hidden: false,
+            vendor: 0,
+            attribute,
+            value,
+        }
     }
 
     /// A mandatory IETF AVP holding a 16-bit number.
@@ -493,7 +502,12 @@ impl ControlMessage {
     /// A message of IETF type `message_type` with the M bit set, then
     /// `avps`.
     pub fn new(message_type: MessageType, avps: Vec<Avp>) -> ControlMessage {
-        ControlMessage { message_type: Some(message_type), mandatory: true, vendor: 0, avps }
+        ControlMessage {
+            message_type: Some(message_type),
+            mandatory: true,
+            vendor: 0,
+            avps,
+        }
     }
 
     /// A ZLB acknowledgment: a control header with no body.
@@ -513,7 +527,9 @@ impl ControlMessage {
 
     /// The first AVP from `vendor` of type `attribute`, if there is one.
     pub fn find_vendor(&self, vendor: u16, attribute: u16) -> Option<&Avp> {
-        self.avps.iter().find(|a| a.vendor == vendor && a.attribute == attribute)
+        self.avps
+            .iter()
+            .find(|a| a.vendor == vendor && a.attribute == attribute)
     }
 
     /// The four reserved bits of each AVP in the control message body
@@ -569,7 +585,13 @@ pub struct V2Packet {
 impl V2Packet {
     /// A control message to `tunnel` and `session`, with sequence numbers
     /// `ns` and `nr`.
-    pub fn control(tunnel: u16, session: u16, ns: u16, nr: u16, message: &ControlMessage) -> Result<V2Packet, Error> {
+    pub fn control(
+        tunnel: u16,
+        session: u16,
+        ns: u16,
+        nr: u16,
+        message: &ControlMessage,
+    ) -> Result<V2Packet, Error> {
         Ok(V2Packet {
             control: true,
             has_length: true,
@@ -622,8 +644,18 @@ pub struct V3Control {
 impl V3Control {
     /// A control message to `connection`, with sequence numbers `ns` and
     /// `nr`.
-    pub fn new(connection: u32, ns: u16, nr: u16, message: &ControlMessage) -> Result<V3Control, Error> {
-        Ok(V3Control { connection, ns, nr, payload: message.to_bytes()? })
+    pub fn new(
+        connection: u32,
+        ns: u16,
+        nr: u16,
+        message: &ControlMessage,
+    ) -> Result<V3Control, Error> {
+        Ok(V3Control {
+            connection,
+            ns,
+            nr,
+            payload: message.to_bytes()?,
+        })
     }
 
     /// Reads the body as a [`ControlMessage`].
@@ -784,8 +816,12 @@ impl Wire for ControlMessage {
             return Err(Error::Unwritable);
         }
         let mut out = Vec::new();
-        Avp { mandatory: self.mandatory, vendor: self.vendor,
-            ..Avp::from_u16(attribute::MESSAGE_TYPE, t.code()) }.write(&mut out)?;
+        Avp {
+            mandatory: self.mandatory,
+            vendor: self.vendor,
+            ..Avp::from_u16(attribute::MESSAGE_TYPE, t.code())
+        }
+        .write(&mut out)?;
         for avp in &self.avps {
             avp.write(&mut out)?;
             if out.len() > MAX_MESSAGE {
@@ -821,11 +857,17 @@ impl Wire for V2Packet {
             return Err(Error::Version(version));
         }
         let control = word & bits::T != 0;
-        let (l, s, o, p) = (word & bits::L != 0, word & bits::S != 0, word & bits::O != 0, word & bits::P != 0);
+        let (l, s, o, p) = (
+            word & bits::L != 0,
+            word & bits::S != 0,
+            word & bits::O != 0,
+            word & bits::P != 0,
+        );
         if control && (!l || !s || o || p) {
             return Err(Error::ControlBits);
         }
-        let header = V2_MIN_HEADER_LEN + 2 * usize::from(l) + 4 * usize::from(s) + 2 * usize::from(o);
+        let header =
+            V2_MIN_HEADER_LEN + 2 * usize::from(l) + 4 * usize::from(s) + 2 * usize::from(o);
         if b.len() < header {
             return Err(Error::Truncated);
         }
@@ -847,14 +889,20 @@ impl Wire for V2Packet {
         at += 4;
         let sequence = if s {
             at += 4;
-            Some((be16(b, at - 4).ok_or(Error::Truncated)?, be16(b, at - 2).ok_or(Error::Truncated)?))
+            Some((
+                be16(b, at - 4).ok_or(Error::Truncated)?,
+                be16(b, at - 2).ok_or(Error::Truncated)?,
+            ))
         } else {
             None
         };
         let offset_pad = if o {
             let size = be16(b, at).ok_or(Error::Truncated)?;
             at += 2;
-            let Some(pad) = b.get(at..end).and_then(|rest| rest.get(..usize::from(size))) else {
+            let Some(pad) = b
+                .get(at..end)
+                .and_then(|rest| rest.get(..usize::from(size)))
+            else {
                 return Err(Error::Offset(size));
             };
             at += pad.len();
@@ -863,14 +911,28 @@ impl Wire for V2Packet {
             None
         };
         let payload = b.get(at..end).ok_or(Error::Truncated)?.to_vec();
-        Ok(V2Packet { control, has_length: l, sequence, offset_pad, priority: p, tunnel, session, payload })
+        Ok(V2Packet {
+            control,
+            has_length: l,
+            sequence,
+            offset_pad,
+            priority: p,
+            tunnel,
+            session,
+            payload,
+        })
     }
 
     /// Appends the complete packet. Refuses invalid control flags, missing control sequence
     /// numbers, and oversized payloads or offset padding. Control bodies remain raw bytes.
     /// Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        if self.control && (!self.has_length || self.sequence.is_none() || self.offset_pad.is_some() || self.priority) {
+        if self.control
+            && (!self.has_length
+                || self.sequence.is_none()
+                || self.offset_pad.is_some()
+                || self.priority)
+        {
             return Err(Error::Unwritable);
         }
         let l = self.has_length;
@@ -881,8 +943,11 @@ impl Wire for V2Packet {
             + 2 * usize::from(l)
             + 4 * usize::from(sequence.is_some())
             + 2 * usize::from(pad.is_some());
-        let total = header.checked_add(pad.map_or(0, <[u8]>::len))
-            .and_then(|n| n.checked_add(self.payload.len())).filter(|n| *n <= MAX_DATAGRAM).ok_or(Error::Unwritable)?;
+        let total = header
+            .checked_add(pad.map_or(0, <[u8]>::len))
+            .and_then(|n| n.checked_add(self.payload.len()))
+            .filter(|n| *n <= MAX_DATAGRAM)
+            .ok_or(Error::Unwritable)?;
         let payload = &self.payload;
 
         let mut word = u16::from(VERSION_2);
@@ -944,8 +1009,15 @@ impl Wire for V3Control {
         if usize::from(length) < CONTROL_HEADER_LEN {
             return Err(Error::Length(length));
         }
-        let payload = b.get(CONTROL_HEADER_LEN..usize::from(length)).ok_or(Error::Truncated)?;
-        Ok(V3Control { connection: be32(b, 4).ok_or(Error::Truncated)?, ns: be16(b, 8).ok_or(Error::Truncated)?, nr: be16(b, 10).ok_or(Error::Truncated)?, payload: payload.to_vec() })
+        let payload = b
+            .get(CONTROL_HEADER_LEN..usize::from(length))
+            .ok_or(Error::Truncated)?;
+        Ok(V3Control {
+            connection: be32(b, 4).ok_or(Error::Truncated)?,
+            ns: be16(b, 8).ok_or(Error::Truncated)?,
+            nr: be16(b, 10).ok_or(Error::Truncated)?,
+            payload: payload.to_vec(),
+        })
     }
 
     /// Appends the complete control packet. Refuses oversized control bodies.
@@ -1054,11 +1126,11 @@ impl Wire for Packet {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::mutate;
+    use fictionet::stdlib::test_support::rounds;
 
     /// The SCCRQ from the module doc.
     fn sccrq() -> Vec<u8> {
@@ -1085,8 +1157,15 @@ mod tests {
         let m = p.message().unwrap();
         assert_eq!(m.message_type, Some(MessageType::Sccrq));
         assert_eq!(m.avps.len(), 4);
-        assert_eq!(m.find(attribute::PROTOCOL_VERSION).and_then(Avp::as_u16), Some(0x0100));
-        assert_eq!(m.find(attribute::FRAMING_CAPABILITIES).and_then(Avp::as_u32), Some(3));
+        assert_eq!(
+            m.find(attribute::PROTOCOL_VERSION).and_then(Avp::as_u16),
+            Some(0x0100)
+        );
+        assert_eq!(
+            m.find(attribute::FRAMING_CAPABILITIES)
+                .and_then(Avp::as_u32),
+            Some(3)
+        );
         assert_eq!(m.find(attribute::CHALLENGE), None);
         assert_eq!(m.to_bytes().unwrap(), bytes[12..]);
         // Trailing bytes past the length field are not part of it.
@@ -1104,9 +1183,18 @@ mod tests {
         assert_eq!(p.sequence, Some((3, 5)));
         let m = p.message().unwrap();
         assert!(m.is_zlb());
-        assert_eq!(V2Packet::control(7,0,3,5,&ControlMessage::zlb()).unwrap().to_bytes().unwrap(), bytes);
+        assert_eq!(
+            V2Packet::control(7, 0, 3, 5, &ControlMessage::zlb())
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
         // A ZLB cannot carry AVPs.
-        let odd = ControlMessage { avps: vec![Avp::from_u16(9, 1)], ..ControlMessage::zlb() };
+        let odd = ControlMessage {
+            avps: vec![Avp::from_u16(9, 1)],
+            ..ControlMessage::zlb()
+        };
         assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&odd);
     }
@@ -1116,7 +1204,9 @@ mod tests {
         // T clear; L, S, O and P set; length 20; tunnel 1, session 2;
         // Ns 3, Nr 4; offset size 2 with pad 0xee 0xee; then a PPP frame
         // start (0xff 0x03 0xc0 0x21).
-        let bytes = [0x4b, 0x02, 0, 20, 0, 1, 0, 2, 0, 3, 0, 4, 0, 2, 0xee, 0xee, 0xff, 0x03, 0xc0, 0x21];
+        let bytes = [
+            0x4b, 0x02, 0, 20, 0, 1, 0, 2, 0, 3, 0, 4, 0, 2, 0xee, 0xee, 0xff, 0x03, 0xc0, 0x21,
+        ];
         let p = V2Packet::parse(&bytes).unwrap();
         assert_eq!(
             p,
@@ -1135,7 +1225,10 @@ mod tests {
         assert_eq!(p.message(), Err(Error::NotControl));
         // The plainest data header: six bytes, then the frame.
         let plain = V2Packet::data(1, 2, vec![0xff, 0x03]);
-        assert_eq!(plain.to_bytes().unwrap(), [0x00, 0x02, 0, 1, 0, 2, 0xff, 0x03]);
+        assert_eq!(
+            plain.to_bytes().unwrap(),
+            [0x00, 0x02, 0, 1, 0, 2, 0xff, 0x03]
+        );
         assert_eq!(V2Packet::parse(&plain.to_bytes().unwrap()), Ok(plain));
     }
 
@@ -1160,7 +1253,13 @@ mod tests {
         let a = Avp::parse(&bytes).unwrap();
         assert_eq!(
             a,
-            Avp { mandatory: true, hidden: true, vendor: 9, attribute: 0x1234, value: vec![1, 2, 3, 4] }
+            Avp {
+                mandatory: true,
+                hidden: true,
+                vendor: 9,
+                attribute: 0x1234,
+                value: vec![1, 2, 3, 4]
+            }
         );
         assert_eq!(a.as_u32(), None, "hidden values are not read");
         // Reserved bits are sent as zero.
@@ -1194,13 +1293,25 @@ mod tests {
     #[test]
     fn message_errors() {
         // The first AVP is not a message type.
-        assert_eq!(ControlMessage::parse(&[0x80, 8, 0, 0, 0, 9, 0, 1]), Err(Error::MessageType));
+        assert_eq!(
+            ControlMessage::parse(&[0x80, 8, 0, 0, 0, 9, 0, 1]),
+            Err(Error::MessageType)
+        );
         // A hidden message type.
-        assert_eq!(ControlMessage::parse(&[0xc0, 8, 0, 0, 0, 0, 0, 1]), Err(Error::MessageType));
+        assert_eq!(
+            ControlMessage::parse(&[0xc0, 8, 0, 0, 0, 0, 0, 1]),
+            Err(Error::MessageType)
+        );
         // A message type with a 3-byte value.
-        assert_eq!(ControlMessage::parse(&[0x80, 9, 0, 0, 0, 0, 0, 1, 0]), Err(Error::MessageType));
+        assert_eq!(
+            ControlMessage::parse(&[0x80, 9, 0, 0, 0, 0, 0, 1, 0]),
+            Err(Error::MessageType)
+        );
         // An AVP that runs past the body, and a bad AVP length.
-        assert_eq!(ControlMessage::parse(&[0x80, 8, 0, 0, 0, 0, 0, 6, 0x80, 9]), Err(Error::Truncated));
+        assert_eq!(
+            ControlMessage::parse(&[0x80, 8, 0, 0, 0, 0, 0, 6, 0x80, 9]),
+            Err(Error::Truncated)
+        );
         let bad = [0x80, 8, 0, 0, 0, 0, 0, 6, 0x80, 2, 0, 0, 0, 0];
         assert_eq!(ControlMessage::parse(&bad), Err(Error::AvpLength(2)));
         // Too many AVPs, and too many bytes.
@@ -1209,10 +1320,16 @@ mod tests {
             many.extend_from_slice(&[0, 6, 0, 0, 0, 50]);
         }
         assert_eq!(ControlMessage::parse(&many), Err(Error::TooManyAvps));
-        assert_eq!(ControlMessage::parse(&vec![0; MAX_MESSAGE + 1]), Err(Error::TooLong(MAX_MESSAGE + 1)));
+        assert_eq!(
+            ControlMessage::parse(&vec![0; MAX_MESSAGE + 1]),
+            Err(Error::TooLong(MAX_MESSAGE + 1))
+        );
         // MAX_AVPS in all reads.
         many.truncate(8 + 6 * (MAX_AVPS - 1));
-        assert_eq!(ControlMessage::parse(&many).unwrap().avps.len(), MAX_AVPS - 1);
+        assert_eq!(
+            ControlMessage::parse(&many).unwrap().avps.len(),
+            MAX_AVPS - 1
+        );
     }
 
     #[test]
@@ -1245,14 +1362,25 @@ mod tests {
     #[test]
     fn reserved_bits_of_every_avp_are_read() {
         // A HELLO, then an AVP with reserved bits 0b1001, then one with none.
-        let body = [0x80, 8, 0, 0, 0, 0, 0, 6, 0xa4, 8, 0, 0, 0, 9, 0, 7, 0x80, 8, 0, 0, 0, 10, 0, 1];
+        let body = [
+            0x80, 8, 0, 0, 0, 0, 0, 6, 0xa4, 8, 0, 0, 0, 9, 0, 7, 0x80, 8, 0, 0, 0, 10, 0, 1,
+        ];
         let m = ControlMessage::parse(&body).unwrap();
         assert_eq!(m.avps.len(), 2);
         assert_eq!(ControlMessage::reserved_bits(&body), Ok(vec![0, 9, 0]));
-        assert_eq!(ControlMessage::reserved_bits(&m.to_bytes().unwrap()), Ok(vec![0, 0, 0]));
+        assert_eq!(
+            ControlMessage::reserved_bits(&m.to_bytes().unwrap()),
+            Ok(vec![0, 0, 0])
+        );
         assert_eq!(ControlMessage::reserved_bits(&[]), Ok(vec![]));
-        assert_eq!(ControlMessage::reserved_bits(&body[..20]), Err(Error::Truncated));
-        assert_eq!(ControlMessage::reserved_bits(&body[8..]), Err(Error::MessageType));
+        assert_eq!(
+            ControlMessage::reserved_bits(&body[..20]),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            ControlMessage::reserved_bits(&body[8..]),
+            Err(Error::MessageType)
+        );
     }
 
     #[test]
@@ -1262,7 +1390,11 @@ mod tests {
         let body = [0x00, 8, 0, 9, 0, 0, 0, 1, 0x80, 8, 0, 0, 0, 9, 0, 1];
         let m = ControlMessage::parse(&body).unwrap();
         assert_eq!(m.vendor, 9);
-        assert_eq!(m.message_type, Some(MessageType::Other(1)), "not the IETF SCCRQ");
+        assert_eq!(
+            m.message_type,
+            Some(MessageType::Other(1)),
+            "not the IETF SCCRQ"
+        );
         assert_eq!(m.avps.len(), 1);
         assert_eq!(m.to_bytes().unwrap(), body);
     }
@@ -1274,7 +1406,10 @@ mod tests {
         assert_eq!(Packet::parse(&[0xc8, 0x01, 0, 12]), Err(Error::Version(1)));
         assert_eq!(V2Packet::parse(&[0xc8, 0x03]), Err(Error::Version(3)));
         assert_eq!(V3Control::parse(&[0xc8, 0x02]), Err(Error::Version(2)));
-        assert_eq!(Packet::parse(&vec![0; MAX_DATAGRAM + 1]), Err(Error::TooLong(MAX_DATAGRAM + 1)));
+        assert_eq!(
+            Packet::parse(&vec![0; MAX_DATAGRAM + 1]),
+            Err(Error::TooLong(MAX_DATAGRAM + 1))
+        );
         // Control messages need L and S, and must not have O or P.
         assert_eq!(V2Packet::parse(&[0x88, 0x02]), Err(Error::ControlBits));
         assert_eq!(V2Packet::parse(&[0xc0, 0x02]), Err(Error::ControlBits));
@@ -1282,18 +1417,44 @@ mod tests {
         assert_eq!(V2Packet::parse(&[0xc9, 0x02]), Err(Error::ControlBits));
         assert_eq!(V3Control::parse(&[0x80, 0x03]), Err(Error::ControlBits));
         // A length field shorter than the header.
-        assert_eq!(V2Packet::parse(&[0xc8, 0x02, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0]), Err(Error::Length(11)));
-        assert_eq!(V3Control::parse(&[0xc8, 0x03, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0]), Err(Error::Length(4)));
+        assert_eq!(
+            V2Packet::parse(&[0xc8, 0x02, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(Error::Length(11))
+        );
+        assert_eq!(
+            V3Control::parse(&[0xc8, 0x03, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(Error::Length(4))
+        );
         // A length field longer than the datagram.
-        assert_eq!(V2Packet::parse(&[0xc8, 0x02, 0, 13, 0, 0, 0, 0, 0, 0, 0, 0]), Err(Error::Truncated));
+        assert_eq!(
+            V2Packet::parse(&[0xc8, 0x02, 0, 13, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(Error::Truncated)
+        );
         // An offset past the end.
-        assert_eq!(V2Packet::parse(&[0x02, 0x02, 0, 1, 0, 2, 0, 3, 0xee, 0xee]), Err(Error::Offset(3)));
+        assert_eq!(
+            V2Packet::parse(&[0x02, 0x02, 0, 1, 0, 2, 0, 3, 0xee, 0xee]),
+            Err(Error::Offset(3))
+        );
         // The wrong kind for the reader asked.
-        assert_eq!(V3Control::parse(&[0x00, 0x03, 0, 0, 0, 0, 0, 1]), Err(Error::NotControl));
+        assert_eq!(
+            V3Control::parse(&[0x00, 0x03, 0, 0, 0, 0, 0, 1]),
+            Err(Error::NotControl)
+        );
         assert_eq!(V3Data::<0>::parse(&sccrq_v3()), Err(Error::NotData));
-        assert_eq!(V3Data::<5>::parse(&[0, 3, 0, 0, 0, 0, 0, 1]), Err(Error::Cookie(5)));
-        assert_eq!(V3Data::<4>::parse(&[0, 3, 0, 0, 0, 0, 0, 1, 1, 2]), Err(Error::Truncated));
-        for e in [Error::Truncated, Error::Cookie(1), Error::Offset(3), Error::TooManyAvps] {
+        assert_eq!(
+            V3Data::<5>::parse(&[0, 3, 0, 0, 0, 0, 0, 1]),
+            Err(Error::Cookie(5))
+        );
+        assert_eq!(
+            V3Data::<4>::parse(&[0, 3, 0, 0, 0, 0, 0, 1, 1, 2]),
+            Err(Error::Truncated)
+        );
+        for e in [
+            Error::Truncated,
+            Error::Cookie(1),
+            Error::Offset(3),
+            Error::TooManyAvps,
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1311,24 +1472,52 @@ mod tests {
     #[test]
     fn rfc3931_control_and_data() {
         let bytes = sccrq_v3();
-        let Ok(Packet::V3Control(c)) = Packet::parse(&bytes) else { panic!() };
+        let Ok(Packet::V3Control(c)) = Packet::parse(&bytes) else {
+            panic!()
+        };
         assert_eq!((c.connection, c.ns, c.nr), (0, 0, 0));
         let m = c.message().unwrap();
         assert_eq!(m.message_type, Some(MessageType::Sccrq));
-        assert_eq!(m.find(attribute::ASSIGNED_CONTROL_CONNECTION_ID).and_then(Avp::as_u32), Some(0x0102_0304));
+        assert_eq!(
+            m.find(attribute::ASSIGNED_CONTROL_CONNECTION_ID)
+                .and_then(Avp::as_u32),
+            Some(0x0102_0304)
+        );
         assert_eq!(c.to_bytes().unwrap(), bytes);
-        assert_eq!(V3Control::new(0,0,0,&m).unwrap(), c);
+        assert_eq!(V3Control::new(0, 0, 0, &m).unwrap(), c);
         // An ACK to connection 0x01020304.
-        let ack = V3Control::new(0x0102_0304,1,1,&ControlMessage::new(MessageType::Ack, vec![])).unwrap();
-        assert_eq!(ack.to_bytes().unwrap(), [0xc8, 0x03, 0, 20, 1, 2, 3, 4, 0, 1, 0, 1, 0x80, 8, 0, 0, 0, 0, 0, 20]);
+        let ack = V3Control::new(
+            0x0102_0304,
+            1,
+            1,
+            &ControlMessage::new(MessageType::Ack, vec![]),
+        )
+        .unwrap();
+        assert_eq!(
+            ack.to_bytes().unwrap(),
+            [
+                0xc8, 0x03, 0, 20, 1, 2, 3, 4, 0, 1, 0, 1, 0x80, 8, 0, 0, 0, 0, 0, 20
+            ]
+        );
 
         // A data message: session 0x11223344, a 4-byte cookie, a frame.
-        let d = [0x00, 0x03, 0, 0, 0x11, 0x22, 0x33, 0x44, 0xc0, 0x0c, 0x1e, 0x00, 0xde, 0xad];
-        let Ok(Packet::V3Data(plain)) = Packet::parse(&d) else { panic!() };
+        let d = [
+            0x00, 0x03, 0, 0, 0x11, 0x22, 0x33, 0x44, 0xc0, 0x0c, 0x1e, 0x00, 0xde, 0xad,
+        ];
+        let Ok(Packet::V3Data(plain)) = Packet::parse(&d) else {
+            panic!()
+        };
         assert_eq!(plain.cookie, []);
         assert_eq!(plain.payload.len(), 6);
         let v = V3Data::<4>::parse(&d).unwrap();
-        assert_eq!(v, V3Data { session: 0x1122_3344, cookie: vec![0xc0, 0x0c, 0x1e, 0x00], payload: vec![0xde, 0xad] });
+        assert_eq!(
+            v,
+            V3Data {
+                session: 0x1122_3344,
+                cookie: vec![0xc0, 0x0c, 0x1e, 0x00],
+                payload: vec![0xde, 0xad]
+            }
+        );
         assert_eq!(v.to_bytes(), Ok(d.to_vec()));
         assert_eq!(v.to_bytes(), Ok(d.to_vec()));
         assert_eq!(V3Data::<8>::parse(&d), Err(Error::Truncated));
@@ -1341,7 +1530,11 @@ mod tests {
         assert_eq!(V3Data::<4>::parse(&r).unwrap().to_bytes(), Ok(d.to_vec()));
         // A cookie of a length other than 0, 4 or 8 is refused, not cut.
         for n in [1, 3, 5, 6, 7, 9, 12] {
-            let odd = V3Data::<0> { session: 1, cookie: vec![1; n], payload: vec![] };
+            let odd = V3Data::<0> {
+                session: 1,
+                cookie: vec![1; n],
+                payload: vec![],
+            };
             assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
             assert_eq!(Packet::V3Data(odd).to_bytes(), Err(Error::Unwritable));
         }
@@ -1352,7 +1545,9 @@ mod tests {
         let examples = [
             sccrq(),
             sccrq_v3(),
-            vec![0x4b, 0x02, 0, 20, 0, 1, 0, 2, 0, 3, 0, 4, 0, 2, 0xee, 0xee, 0xff, 0x03, 0xc0, 0x21],
+            vec![
+                0x4b, 0x02, 0, 20, 0, 1, 0, 2, 0, 3, 0, 4, 0, 2, 0xee, 0xee, 0xff, 0x03, 0xc0, 0x21,
+            ],
         ];
         for bytes in &examples {
             for n in 0..bytes.len() {
@@ -1386,18 +1581,36 @@ mod tests {
         p.offset_pad = Some(huge.clone());
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&p);
-        let c = V3Control { connection: 1, ns: 0, nr: 0, payload: huge.clone() };
+        let c = V3Control {
+            connection: 1,
+            ns: 0,
+            nr: 0,
+            payload: huge.clone(),
+        };
         assert_eq!(c.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&c);
-        let d = V3Data::<8> { session: 1, cookie: vec![0; 8], payload: huge };
+        let d = V3Data::<8> {
+            session: 1,
+            cookie: vec![0; 8],
+            payload: huge,
+        };
         assert_eq!(d.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&d);
-        let many = ControlMessage::new(MessageType::Hello, vec![Avp::from_u16(50, 1); MAX_AVPS + 10]);
-        let fat = ControlMessage::new(MessageType::Hello, vec![Avp::new(50, vec![0; MAX_AVP_VALUE]); 100]);
+        let many = ControlMessage::new(
+            MessageType::Hello,
+            vec![Avp::from_u16(50, 1); MAX_AVPS + 10],
+        );
+        let fat = ControlMessage::new(
+            MessageType::Hello,
+            vec![Avp::new(50, vec![0; MAX_AVP_VALUE]); 100],
+        );
         for message in [many, fat] {
             assert_eq!(message.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&message);
-            assert_eq!(V2Packet::control(1, 0, 0, 0, &message), Err(Error::Unwritable));
+            assert_eq!(
+                V2Packet::control(1, 0, 0, 0, &message),
+                Err(Error::Unwritable)
+            );
         }
     }
 
@@ -1406,22 +1619,44 @@ mod tests {
         // A message type AVP, 64 AVPs of 1023 bytes and one of 42: 65522
         // bytes, 7 more than a body can be. Cutting at MAX_MESSAGE would
         // end inside the last AVP. The writer refuses the whole body.
-        let mut body = ControlMessage::new(MessageType::Hello, vec![]).to_bytes().unwrap();
+        let mut body = ControlMessage::new(MessageType::Hello, vec![])
+            .to_bytes()
+            .unwrap();
         for _ in 0..64 {
-            Avp::new(50, vec![0; MAX_AVP_VALUE]).write(&mut body).unwrap();
+            Avp::new(50, vec![0; MAX_AVP_VALUE])
+                .write(&mut body)
+                .unwrap();
         }
         Avp::new(51, vec![0; 36]).write(&mut body).unwrap();
         assert_eq!(body.len(), 65_522);
         assert_eq!(ControlMessage::parse(&body), Err(Error::TooLong(65_522)));
         let kept = ControlMessage::parse(&body[..65_522 - 42]).unwrap();
         assert_eq!(kept.avps.len(), 64);
-        let c = V3Control { connection: 1, ns: 0, nr: 0, payload: body.clone() };
+        let c = V3Control {
+            connection: 1,
+            ns: 0,
+            nr: 0,
+            payload: body.clone(),
+        };
         assert_eq!(c.to_bytes(), Err(Error::Unwritable));
-        let v2 = V2Packet { payload: body.clone(), ..V2Packet::control(1, 0, 0, 0, &ControlMessage::zlb()).unwrap() };
+        let v2 = V2Packet {
+            payload: body.clone(),
+            ..V2Packet::control(1, 0, 0, 0, &ControlMessage::zlb()).unwrap()
+        };
         assert_eq!(v2.to_bytes(), Err(Error::Unwritable));
         let bounded = V3Control::new(1, 0, 0, &kept).unwrap();
-        assert_eq!(V3Control::parse(&bounded.to_bytes().unwrap()).unwrap().message(), Ok(kept));
-        let junk = V3Control { connection: 1, ns: 0, nr: 0, payload: vec![0; 70_000] };
+        assert_eq!(
+            V3Control::parse(&bounded.to_bytes().unwrap())
+                .unwrap()
+                .message(),
+            Ok(kept)
+        );
+        let junk = V3Control {
+            connection: 1,
+            ns: 0,
+            nr: 0,
+            payload: vec![0; 70_000],
+        };
         assert_eq!(junk.to_bytes(), Err(Error::Unwritable));
         let data = V2Packet::data(1, 2, body);
         assert_eq!(data.to_bytes(), Err(Error::Unwritable));
@@ -1448,9 +1683,18 @@ mod tests {
     fn find_vendor_avps() {
         let m = ControlMessage::new(
             MessageType::Hello,
-            vec![Avp { vendor: 9, ..Avp::from_u16(attribute::HOST_NAME, 1) }, Avp::from_u16(attribute::HOST_NAME, 2)],
+            vec![
+                Avp {
+                    vendor: 9,
+                    ..Avp::from_u16(attribute::HOST_NAME, 1)
+                },
+                Avp::from_u16(attribute::HOST_NAME, 2),
+            ],
         );
-        assert_eq!(m.find_vendor(9, attribute::HOST_NAME).and_then(Avp::as_u16), Some(1));
+        assert_eq!(
+            m.find_vendor(9, attribute::HOST_NAME).and_then(Avp::as_u16),
+            Some(1)
+        );
         assert_eq!(m.find(attribute::HOST_NAME).and_then(Avp::as_u16), Some(2));
         assert_eq!(m.find_vendor(8, attribute::HOST_NAME), None);
     }
@@ -1492,7 +1736,9 @@ mod tests {
                 avp.value.resize(MAX_AVP_VALUE + 1, 0);
             }
             contract::check_wire_value(&message);
-            let Ok(body) = message.to_bytes() else { continue };
+            let Ok(body) = message.to_bytes() else {
+                continue;
+            };
             written += 1;
             let read = ControlMessage::parse(&body).unwrap();
             assert_eq!(read, message.clone());
@@ -1500,15 +1746,29 @@ mod tests {
             let v2 = V2Packet {
                 control: rng.coin(),
                 has_length: rng.coin(),
-                sequence: if rng.coin() { None } else { Some((u16r(&mut rng), u16r(&mut rng))) },
-                offset_pad: if rng.coin() { None } else { Some(rng.bytes(40)) },
+                sequence: if rng.coin() {
+                    None
+                } else {
+                    Some((u16r(&mut rng), u16r(&mut rng)))
+                },
+                offset_pad: if rng.coin() {
+                    None
+                } else {
+                    Some(rng.bytes(40))
+                },
                 priority: rng.coin(),
                 tunnel: u16r(&mut rng),
                 session: u16r(&mut rng),
                 payload: body.clone(),
             };
             contract::check_wire_value(&v2);
-            let c = V3Control::new(u32::from(u16r(&mut rng)) << 16,u16r(&mut rng),u16r(&mut rng),&message).unwrap();
+            let c = V3Control::new(
+                u32::from(u16r(&mut rng)) << 16,
+                u16r(&mut rng),
+                u16r(&mut rng),
+                &message,
+            )
+            .unwrap();
             assert_eq!(V3Control::parse(&c.to_bytes().unwrap()), Ok(c.clone()));
             assert_eq!(c.message().unwrap().to_bytes().unwrap(), body);
             let cookie = match rng.index(4) {
@@ -1548,7 +1808,12 @@ mod tests {
             let body = m.to_bytes().unwrap();
             if !body.is_empty() {
                 let long = body.repeat(MAX_MESSAGE / body.len() + 1);
-                let c = V3Control { connection: 1, ns: 0, nr: 0, payload: long };
+                let c = V3Control {
+                    connection: 1,
+                    ns: 0,
+                    nr: 0,
+                    payload: long,
+                };
                 assert_eq!(c.to_bytes(), Err(Error::Unwritable));
             }
         }

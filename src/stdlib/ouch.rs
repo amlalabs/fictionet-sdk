@@ -76,10 +76,10 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use fictionet::stdlib::session::Action;
-use fictionet::stdlib::codec::field;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::field;
+use fictionet::stdlib::session::Action;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::str::FromStr;
@@ -207,7 +207,9 @@ impl FromStr for Price {
     type Err = Error;
     /// Reads "10.25" or "10" as dollars; refuses more than four places.
     fn from_str(s: &str) -> Result<Self, Error> {
-        field::parse_decimal(s, 4).map(Self).map_err(|_| Error::Price)
+        field::parse_decimal(s, 4)
+            .map(Self)
+            .map_err(|_| Error::Price)
     }
 }
 impl Field for Price {
@@ -1447,7 +1449,11 @@ impl Exchange {
 
     /// Handles one inbound message. Refuses a time before the last one
     /// used.
-    pub fn receive(&mut self, message: &Inbound, now: u64) -> Result<Vec<Action<Outbound, Event>>, Error> {
+    pub fn receive(
+        &mut self,
+        message: &Inbound,
+        now: u64,
+    ) -> Result<Vec<Action<Outbound, Event>>, Error> {
         self.check_time(now)?;
         self.now = now;
         Ok(match message {
@@ -1576,12 +1582,7 @@ impl Exchange {
 
     /// Rejects a pending enter or replace with an Appendix C `reason`. A
     /// rejected replace leaves the original order as it was (2.2).
-    pub fn reject(
-        &mut self,
-        token: Token,
-        reason: u16,
-        now: u64,
-    ) -> Result<Outbound, Error> {
+    pub fn reject(&mut self, token: Token, reason: u16, now: u64) -> Result<Outbound, Error> {
         self.check_time(now)?;
         let cl_ord_id = if let Some(p) = self.replaces.remove(&token) {
             self.replacing.remove(&p.original);
@@ -1617,9 +1618,7 @@ impl Exchange {
             return Err(Error::Shares);
         }
         let match_number = self.next_match;
-        let next = match_number
-            .checked_add(1)
-            .ok_or(Error::Exhausted)?;
+        let next = match_number.checked_add(1).ok_or(Error::Exhausted)?;
         let cl_ord_id = order.cl_ord_id;
         self.next_match = next;
         self.now = now;
@@ -1864,7 +1863,12 @@ impl Exchange {
         })]
     }
 
-    fn cancel_request(&mut self, token: Token, quantity: u32, now: u64) -> Vec<Action<Outbound, Event>> {
+    fn cancel_request(
+        &mut self,
+        token: Token,
+        quantity: u32,
+        now: u64,
+    ) -> Vec<Action<Outbound, Event>> {
         let Ok(order) = self.open(token) else {
             return vec![Action::Event(Event::Ignored(Ignored::UnknownOrder(token)))];
         };
@@ -2068,11 +2072,9 @@ fn canceled(token: Token, quantity: u32, reason: u8, now: u64) -> Outbound {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::check_atomic;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Lcg, Wire,
-    };
+    use fictionet::stdlib::codec::{Lcg, Wire};
+    use fictionet::stdlib::test_support::check_atomic;
     use fictionet::stdlib::test_support::contract::{check_wire, check_wire_value};
     use fictionet::stdlib::test_support::mutate;
 
@@ -2734,10 +2736,7 @@ mod tests {
             (a.order_ref, a.quantity, a.order_state, a.user_ref),
             (1000, 500, b'L', 1)
         );
-        assert_eq!(
-            x.accept(token(1), 2),
-            Err(Error::UnknownToken(token(1)))
-        );
+        assert_eq!(x.accept(token(1), 2), Err(Error::UnknownToken(token(1))));
         // 1.2: a repeat of the same UserRefNum is a retransmission.
         assert_eq!(
             x.receive(&e.into(), 3).unwrap(),
@@ -2804,10 +2803,7 @@ mod tests {
             panic!()
         };
         assert_eq!((b.user_ref, b.cl_ord_id), (1, alpha("ORDER1")));
-        assert_eq!(
-            x.break_trade(1, b'E', 8),
-            Err(Error::UnknownMatch(1))
-        );
+        assert_eq!(x.break_trade(1, b'E', 8), Err(Error::UnknownMatch(1)));
         // Account query: next UserRefNum on channel 0.
         let out = sends(
             x.receive(&AccountQuery { options: None }.into(), 9)
@@ -2860,10 +2856,7 @@ mod tests {
         };
         assert_eq!(r.user_ref, 2);
         assert_eq!(x.order(token(2)), None);
-        assert_eq!(
-            x.reject(token(2), 1, 4),
-            Err(Error::UnknownToken(token(2)))
-        );
+        assert_eq!(x.reject(token(2), 1, 4), Err(Error::UnknownToken(token(2))));
         assert_eq!(
             Exchange::new(ExchangeConfig {
                 max_orders: 0,
@@ -3269,10 +3262,7 @@ mod tests {
         );
         assert_eq!(x.order(token(1)).unwrap().quantity, 100);
         assert_eq!(x.next_user_ref(0), Some(3));
-        assert_eq!(
-            x.accept(token(2), 3),
-            Err(Error::UnknownToken(token(2)))
-        );
+        assert_eq!(x.accept(token(2), 3), Err(Error::UnknownToken(token(2))));
     }
 
     #[test]
@@ -3294,10 +3284,7 @@ mod tests {
             ))))]
         );
         x.execute(token(1), 100, Price(1), b'A', 3).unwrap();
-        assert_eq!(
-            x.accept(token(2), 4),
-            Err(Error::UnknownToken(token(2)))
-        );
+        assert_eq!(x.accept(token(2), 4), Err(Error::UnknownToken(token(2))));
         // Both slots are free again.
         for n in [4, 5] {
             assert_eq!(
@@ -3324,19 +3311,13 @@ mod tests {
         }
         // Matches 7, 8 and 9 were made; 7 is forgotten, 10 not yet made.
         for m in [0, 6, 7, 10, u64::MAX] {
-            assert_eq!(
-                x.break_trade(m, b'E', 3),
-                Err(Error::UnknownMatch(m))
-            );
+            assert_eq!(x.break_trade(m, b'E', 3), Err(Error::UnknownMatch(m)));
         }
         let Outbound::BrokenTrade(b) = x.break_trade(8, b'E', 3).unwrap() else {
             panic!()
         };
         assert_eq!((b.match_number, b.user_ref), (8, 1));
-        assert_eq!(
-            x.break_trade(8, b'E', 3),
-            Err(Error::UnknownMatch(8))
-        );
+        assert_eq!(x.break_trade(8, b'E', 3), Err(Error::UnknownMatch(8)));
         x.break_trade(9, b'E', 3).unwrap();
         // A new execution pushes out the broken 8.
         x.execute(token(1), 1, Price(1), b'A', 4).unwrap();
@@ -3349,16 +3330,28 @@ mod tests {
         x.receive(&enter(1, 100, Options::default()).into(), 5)
             .unwrap();
         let capture = |x: &Exchange| format!("{x:?}");
-        assert_eq!(check_atomic(&mut x,
-            |x| x.receive(&enter(2, 100, Options::default()).into(), 4), capture), Err(Error::Time));
-        assert_eq!(check_atomic(&mut x, |x| x.accept(token(1), 4), capture), Err(Error::Time));
-        assert_eq!(check_atomic(&mut x, |x| x.reject(token(1), 1, 4), capture), Err(Error::Time));
-        assert_eq!(check_atomic(&mut x, |x| x.system_event(b'S', 4), capture), Err(Error::Time));
-        x.accept(token(1), 6).unwrap();
         assert_eq!(
-            x.execute(token(1), 1, Price(1), b'A', 5),
+            check_atomic(
+                &mut x,
+                |x| x.receive(&enter(2, 100, Options::default()).into(), 4),
+                capture
+            ),
             Err(Error::Time)
         );
+        assert_eq!(
+            check_atomic(&mut x, |x| x.accept(token(1), 4), capture),
+            Err(Error::Time)
+        );
+        assert_eq!(
+            check_atomic(&mut x, |x| x.reject(token(1), 1, 4), capture),
+            Err(Error::Time)
+        );
+        assert_eq!(
+            check_atomic(&mut x, |x| x.system_event(b'S', 4), capture),
+            Err(Error::Time)
+        );
+        x.accept(token(1), 6).unwrap();
+        assert_eq!(x.execute(token(1), 1, Price(1), b'A', 5), Err(Error::Time));
         assert_eq!(x.cancel(token(1), 1, b'U', 5), Err(Error::Time));
         x.execute(token(1), 1, Price(1), b'A', 6).unwrap();
         assert_eq!(x.break_trade(1, b'E', 5), Err(Error::Time));

@@ -47,7 +47,8 @@ pub(crate) fn log(line: &str) {
 /// Reads the sandbox's token from `path`: the file's text, without the
 /// spaces and line ends around it.
 fn read_token(path: &std::path::Path) -> Result<Token, Failure> {
-    let text = std::fs::read(path).map_err(|e| Failure::Error(format!("reading the token file {}: {e}", path.display())))?;
+    let text = std::fs::read(path)
+        .map_err(|e| Failure::Error(format!("reading the token file {}: {e}", path.display())))?;
     Token::new(&text).map_err(|e| Failure::Error(format!("the token file {}: {e}", path.display())))
 }
 
@@ -69,9 +70,14 @@ pub(crate) fn run(args: ProxyArgs) -> Result<(), Failure> {
     // Listen first, so a port that is taken stops attach before it says
     // hello. Clients that connect before the world accepts wait in the
     // listen queue.
-    let std_listener = std::net::TcpListener::bind(args.listen).map_err(err(&format!("listening on {}", args.listen)))?;
-    std_listener.set_nonblocking(true).map_err(err("making the listener nonblocking"))?;
-    let listen = std_listener.local_addr().map_err(err("reading the listening address"))?;
+    let std_listener = std::net::TcpListener::bind(args.listen)
+        .map_err(err(&format!("listening on {}", args.listen)))?;
+    std_listener
+        .set_nonblocking(true)
+        .map_err(err("making the listener nonblocking"))?;
+    let listen = std_listener
+        .local_addr()
+        .map_err(err("reading the listening address"))?;
     let sock = world::handshake(&Greeting {
         world: &args.world,
         world_wait: args.world_wait,
@@ -83,7 +89,10 @@ pub(crate) fn run(args: ProxyArgs) -> Result<(), Failure> {
         ProxyKind::Http => "HTTP proxy",
         ProxyKind::Socks5 => "SOCKS5 proxy",
     };
-    log(&format!("{} attached; {door} on {listen}, as {} with DNS at {}", args.name, args.ip_addr, args.dns));
+    log(&format!(
+        "{} attached; {door} on {listen}, as {} with DNS at {}",
+        args.name, args.ip_addr, args.dns
+    ));
     world::write_ready_file(args.ready_file.as_deref(), &args.name)?;
 
     let result = runtime.block_on(async move {
@@ -96,7 +105,8 @@ pub(crate) fn run(args: ProxyArgs) -> Result<(), Failure> {
         let (limit2, accepting2) = (limit.clone(), accepting.clone());
         let ran = fictionet::run(move |fcx| async move {
             let stack = Stack::new(&fcx, link, ip, dns);
-            *accepting2.lock().unwrap() = Some(tokio::spawn(accept(listener, stack, token, kind, limit2)));
+            *accepting2.lock().unwrap() =
+                Some(tokio::spawn(accept(listener, stack, token, kind, limit2)));
             Ok(())
         })
         .await;
@@ -115,7 +125,10 @@ pub(crate) fn run(args: ProxyArgs) -> Result<(), Failure> {
     world::clear_ready_file(args.ready_file.as_deref());
     let shared = result?;
     if shared.dropped() > 0 {
-        log(&format!("{} packets dropped on a full queue to the world", shared.dropped()));
+        log(&format!(
+            "{} packets dropped on a full queue to the world",
+            shared.dropped()
+        ));
     }
     match shared.error() {
         Some(why) => Err(Failure::Error(why)),
@@ -128,7 +141,13 @@ pub(crate) fn run(args: ProxyArgs) -> Result<(), Failure> {
 
 /// Takes client connections until it is aborted. Each client holds a
 /// permit from `limit` while it is served.
-async fn accept(listener: TcpListener, stack: Stack, token: Token, kind: ProxyKind, limit: Arc<Semaphore>) {
+async fn accept(
+    listener: TcpListener,
+    stack: Stack,
+    token: Token,
+    kind: ProxyKind,
+    limit: Arc<Semaphore>,
+) {
     loop {
         let client = match listener.accept().await {
             Ok((client, _)) => client,
@@ -159,9 +178,16 @@ async fn accept(listener: TcpListener, stack: Stack, token: Token, kind: ProxyKi
 /// Answers a client past [`MAX_CLIENTS`], then closes.
 async fn busy(mut client: TcpStream, kind: ProxyKind) {
     use tokio::io::AsyncWriteExt;
-    log(&format!("more than {MAX_CLIENTS} clients at once; one turned away"));
+    log(&format!(
+        "more than {MAX_CLIENTS} clients at once; one turned away"
+    ));
     if kind == ProxyKind::Http {
-        let _ = client.write_all(&fictionet::relay::proxy::http::error_response(503, "too many connections through this proxy")).await;
+        let _ = client
+            .write_all(&fictionet::relay::proxy::http::error_response(
+                503,
+                "too many connections through this proxy",
+            ))
+            .await;
     }
     let _ = client.shutdown().await;
 }

@@ -39,7 +39,11 @@ where
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }
     }));
-    assert_eq!(result.unwrap_err().to_string(), "done", "the world failed on its own");
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "done",
+        "the world failed on its own"
+    );
 }
 
 /// Lets the world's other tasks run `n` turns.
@@ -52,10 +56,12 @@ pub async fn settle(fcx: &Cx, n: usize) {
 /// Polls `fut` once. `None` if it is not done yet.
 pub async fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
     let mut fut = pin!(fut);
-    poll_fn(|cx| Poll::Ready(match fut.as_mut().poll(cx) {
-        Poll::Ready(v) => Some(v),
-        Poll::Pending => None,
-    }))
+    poll_fn(|cx| {
+        Poll::Ready(match fut.as_mut().poll(cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        })
+    })
     .await
 }
 
@@ -129,12 +135,24 @@ pub struct MemConn {
 
 impl MemConn {
     pub fn new(input: Vec<u8>, pieces: Vec<usize>) -> MemConn {
-        MemConn { input, at: 0, pieces, piece: 0, output: Vec::new(), shut: false }
+        MemConn {
+            input,
+            at: 0,
+            pieces,
+            piece: 0,
+            output: Vec::new(),
+            shut: false,
+        }
     }
 }
 
 impl Connection for MemConn {
-    fn poll_read(&mut self, _fcx: &Cx, _cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_read(
+        &mut self,
+        _fcx: &Cx,
+        _cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, ConnError>> {
         let want = match self.pieces.get(self.piece) {
             Some(&n) => n.max(1),
             None => usize::MAX,
@@ -146,7 +164,12 @@ impl Connection for MemConn {
         Poll::Ready(Ok(n))
     }
 
-    fn poll_write(&mut self, _fcx: &Cx, _cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_write(
+        &mut self,
+        _fcx: &Cx,
+        _cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<Result<usize, ConnError>> {
         if self.shut {
             return Poll::Ready(Err(ConnError::Closed));
         }
@@ -164,23 +187,25 @@ impl Connection for MemConn {
 /// IPv4 header's, and the TCP, UDP or ICMP one after the fixed header. So
 /// a fuzzer's packet reaches the code past the checksum checks.
 pub fn fix_checksums(p: &mut [u8]) {
-    let (src, dst, proto, at, end): (IpAddr, IpAddr, u8, usize, usize) = match p.first().map(|b| b >> 4) {
-        Some(4) if p.len() >= 20 => {
-            let ihl = ((p[0] & 15) as usize * 4).max(20).min(p.len());
-            ip::set_header_checksum(&mut p[..ihl]);
-            let total = (u16::from_be_bytes([p[2], p[3]]) as usize).clamp(ihl, p.len());
-            let src = std::net::Ipv4Addr::new(p[12], p[13], p[14], p[15]).into();
-            let dst = std::net::Ipv4Addr::new(p[16], p[17], p[18], p[19]).into();
-            (src, dst, p[9], ihl, total)
-        }
-        Some(6) if p.len() >= 40 => {
-            let end = (40 + u16::from_be_bytes([p[4], p[5]]) as usize).min(p.len());
-            let src = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&p[8..24]).unwrap()).into();
-            let dst = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).unwrap()).into();
-            (src, dst, p[6], 40, end)
-        }
-        _ => return,
-    };
+    let (src, dst, proto, at, end): (IpAddr, IpAddr, u8, usize, usize) =
+        match p.first().map(|b| b >> 4) {
+            Some(4) if p.len() >= 20 => {
+                let ihl = ((p[0] & 15) as usize * 4).max(20).min(p.len());
+                ip::set_header_checksum(&mut p[..ihl]);
+                let total = (u16::from_be_bytes([p[2], p[3]]) as usize).clamp(ihl, p.len());
+                let src = std::net::Ipv4Addr::new(p[12], p[13], p[14], p[15]).into();
+                let dst = std::net::Ipv4Addr::new(p[16], p[17], p[18], p[19]).into();
+                (src, dst, p[9], ihl, total)
+            }
+            Some(6) if p.len() >= 40 => {
+                let end = (40 + u16::from_be_bytes([p[4], p[5]]) as usize).min(p.len());
+                let src = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&p[8..24]).unwrap()).into();
+                let dst =
+                    std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).unwrap()).into();
+                (src, dst, p[6], 40, end)
+            }
+            _ => return,
+        };
     let at_sum = match proto {
         6 => 16,
         17 => 6,
@@ -193,6 +218,10 @@ pub fn fix_checksums(p: &mut [u8]) {
     let t = &mut p[at..end];
     t[at_sum] = 0;
     t[at_sum + 1] = 0;
-    let sum = if proto == 1 { ip::checksum(t) } else { transport_checksum(src, dst, proto, t) };
+    let sum = if proto == 1 {
+        ip::checksum(t)
+    } else {
+        transport_checksum(src, dst, proto, t)
+    };
     t[at_sum..at_sum + 2].copy_from_slice(&sum.to_be_bytes());
 }

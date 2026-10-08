@@ -60,7 +60,7 @@
 //! assert_eq!(answer.answers[0].data, RData::Nb(vec![owner]));
 //! ```
 
-use fictionet::stdlib::codec::{be16, Wire};
+use fictionet::stdlib::codec::{Wire, be16};
 
 use std::net::Ipv4Addr;
 
@@ -175,7 +175,13 @@ pub fn decode_first_level(label: &[u8]) -> Option<[u8; NAME_LEN]> {
     if label.len() != ENCODED_LEN {
         return None;
     }
-    let half = |c: u8| if (b'A'..=b'P').contains(&c) { Some(c - b'A') } else { None };
+    let half = |c: u8| {
+        if (b'A'..=b'P').contains(&c) {
+            Some(c - b'A')
+        } else {
+            None
+        }
+    };
     let mut out = [0u8; NAME_LEN];
     for (i, pair) in label.as_chunks::<2>().0.iter().enumerate() {
         out[i] = half(pair[0])? << 4 | half(pair[1])?;
@@ -204,7 +210,10 @@ impl Name {
             *slot = b.to_ascii_uppercase();
         }
         bytes[NAME_LEN - 1] = suffix;
-        Name { bytes, scope: Vec::new() }
+        Name {
+            bytes,
+            scope: Vec::new(),
+        }
     }
 
     /// The name `*` followed by zero bytes, which node status requests
@@ -212,7 +221,10 @@ impl Name {
     pub fn wildcard() -> Name {
         let mut bytes = [0u8; NAME_LEN];
         bytes[0] = b'*';
-        Name { bytes, scope: Vec::new() }
+        Name {
+            bytes,
+            scope: Vec::new(),
+        }
     }
 
     /// This name with the scope `scope`, given with dots between labels.
@@ -240,14 +252,18 @@ impl Name {
 /// The labels of `text`, given with dots between them. Empty labels are
 /// skipped; the others are kept as given.
 fn dotted_labels(text: &str) -> Vec<Vec<u8>> {
-    text.split('.').filter(|l| !l.is_empty()).map(|l| l.as_bytes().to_vec()).collect()
+    text.split('.')
+        .filter(|l| !l.is_empty())
+        .map(|l| l.as_bytes().to_vec())
+        .collect()
 }
 
 /// Appends valid labels and the final zero to a name. Refuses empty or
 /// oversized labels and names above [`MAX_NAME_LEN`].
 fn put_labels<'a>(out: &mut Vec<u8>, labels: impl Iterator<Item = &'a [u8]>) -> Result<(), Error> {
     for label in labels {
-        if label.is_empty() || label.len() > MAX_LABEL || out.len() + label.len() + 2 > MAX_NAME_LEN {
+        if label.is_empty() || label.len() > MAX_LABEL || out.len() + label.len() + 2 > MAX_NAME_LEN
+        {
             return Err(Error::Unwritable);
         }
         out.push(label.len() as u8);
@@ -517,12 +533,18 @@ pub struct NodeName {
 impl NodeName {
     /// An active unique name owned by a B node.
     pub fn unique(name: &Name) -> NodeName {
-        NodeName { bytes: name.bytes, flags: name_flags::ACTIVE }
+        NodeName {
+            bytes: name.bytes,
+            flags: name_flags::ACTIVE,
+        }
     }
 
     /// An active group name owned by a B node.
     pub fn group(name: &Name) -> NodeName {
-        NodeName { bytes: name.bytes, flags: name_flags::ACTIVE | name_flags::GROUP }
+        NodeName {
+            bytes: name.bytes,
+            flags: name_flags::ACTIVE | name_flags::GROUP,
+        }
     }
 }
 
@@ -542,7 +564,10 @@ pub struct NodeStatus {
 
 impl Default for NodeStatus {
     fn default() -> NodeStatus {
-        NodeStatus { names: Vec::new(), statistics: vec![0; STATISTICS_LEN] }
+        NodeStatus {
+            names: Vec::new(),
+            statistics: vec![0; STATISTICS_LEN],
+        }
     }
 }
 
@@ -591,7 +616,13 @@ impl RData {
 
     fn parse(rr: u16, data: &[u8]) -> Result<RData, Error> {
         if rr == rr_type::NB && data.len().is_multiple_of(NB_ENTRY_LEN) {
-            return Ok(RData::Nb(data.as_chunks::<NB_ENTRY_LEN>().0.iter().map(|e| NbEntry::parse(e)).collect::<Result<_, _>>()?));
+            return Ok(RData::Nb(
+                data.as_chunks::<NB_ENTRY_LEN>()
+                    .0
+                    .iter()
+                    .map(|e| NbEntry::parse(e))
+                    .collect::<Result<_, _>>()?,
+            ));
         }
         if rr == rr_type::NBSTAT
             && let Some((&n, rest)) = data.split_first()
@@ -604,13 +635,19 @@ impl RData {
                 .map(|c| {
                     let mut bytes = [0u8; NAME_LEN];
                     bytes.copy_from_slice(&c[..NAME_LEN]);
-                    Ok(NodeName { bytes, flags: be16(c, NAME_LEN).ok_or(Error::Truncated)? })
+                    Ok(NodeName {
+                        bytes,
+                        flags: be16(c, NAME_LEN).ok_or(Error::Truncated)?,
+                    })
                 })
                 .collect::<Result<_, Error>>()?;
             let statistics = rest[usize::from(n) * NODE_NAME_LEN..].to_vec();
             return Ok(RData::NodeStatus(NodeStatus { names, statistics }));
         }
-        Ok(RData::Other { rr_type: rr, data: data.to_vec() })
+        Ok(RData::Other {
+            rr_type: rr,
+            data: data.to_vec(),
+        })
     }
 
     /// Appends complete record data. Refuses oversized or ambiguous values.
@@ -620,7 +657,9 @@ impl RData {
                 if entries.len() > MAX_NB_ENTRIES {
                     return Err(Error::Unwritable);
                 }
-                for entry in entries { entry.write(out); }
+                for entry in entries {
+                    entry.write(out);
+                }
             }
             RData::NodeStatus(status) => {
                 if status.names.len() > MAX_NODE_NAMES || status.statistics.len() > MAX_RDATA {
@@ -675,7 +714,11 @@ pub struct Record {
 
 impl Record {
     /// Appends a complete record, using earlier names when possible.
-    fn write_record(&self, out: &mut Vec<u8>, written: &std::collections::HashMap<Vec<u8>, u16>) -> Result<Option<Vec<u8>>, Error> {
+    fn write_record(
+        &self,
+        out: &mut Vec<u8>,
+        written: &std::collections::HashMap<Vec<u8>, u16>,
+    ) -> Result<Option<Vec<u8>>, Error> {
         let full = put_name(out, self.name.to_bytes()?, written);
         let mut data = Vec::new();
         self.data.write_data(&mut data)?;
@@ -692,7 +735,11 @@ impl Record {
 /// the beginning of `out`. A name written in full earlier, as listed in
 /// `written`, becomes a two-byte pointer to it. It returns the name's
 /// bytes if it wrote the name in full.
-fn put_name(out: &mut Vec<u8>, wire: Vec<u8>, written: &std::collections::HashMap<Vec<u8>, u16>) -> Option<Vec<u8>> {
+fn put_name(
+    out: &mut Vec<u8>,
+    wire: Vec<u8>,
+    written: &std::collections::HashMap<Vec<u8>, u16>,
+) -> Option<Vec<u8>> {
     if let Some(at) = written.get(&wire) {
         out.extend_from_slice(&(0xc000 | at).to_be_bytes());
         return None;
@@ -703,7 +750,11 @@ fn put_name(out: &mut Vec<u8>, wire: Vec<u8>, written: &std::collections::HashMa
 
 /// Notes that the name `full` was written in full at offset `at`, if a
 /// pointer can reach it: pointers hold 14 bits.
-fn remember(written: &mut std::collections::HashMap<Vec<u8>, u16>, full: Option<Vec<u8>>, at: usize) {
+fn remember(
+    written: &mut std::collections::HashMap<Vec<u8>, u16>,
+    full: Option<Vec<u8>>,
+    at: usize,
+) {
     if let (Some(wire), Ok(at)) = (full, u16::try_from(at))
         && at <= 0x3fff
     {
@@ -887,7 +938,9 @@ impl Packet {
         if self.response {
             return Err(Error::NotRequest);
         }
-        let [q] = &self.questions[..] else { return Err(Error::BadRequest) };
+        let [q] = &self.questions[..] else {
+            return Err(Error::BadRequest);
+        };
         if q.class != CLASS_IN {
             return Err(Error::BadRequest);
         }
@@ -895,13 +948,15 @@ impl Packet {
         // RFC 1002 sections 4.2.2 to 4.2.4 and 4.2.9: one additional
         // record, for the question's name, of class IN, with one owner.
         let nb = || match &self.additional[..] {
-            [r] if q.qtype == rr_type::NB && r.name == q.name && r.class == CLASS_IN => match &r.data {
-                RData::Nb(e) => match &e[..] {
-                    [e] => Ok((r.ttl, *e)),
+            [r] if q.qtype == rr_type::NB && r.name == q.name && r.class == CLASS_IN => {
+                match &r.data {
+                    RData::Nb(e) => match &e[..] {
+                        [e] => Ok((r.ttl, *e)),
+                        _ => Err(Error::BadRequest),
+                    },
                     _ => Err(Error::BadRequest),
-                },
-                _ => Err(Error::BadRequest),
-            },
+                }
+            }
             _ => Err(Error::BadRequest),
         };
         match self.opcode {
@@ -913,8 +968,12 @@ impl Packet {
             Opcode::Registration if !self.flags.recursion_desired => {
                 nb().map(|(ttl, entry)| Request::Overwrite { name, ttl, entry })
             }
-            Opcode::Registration => nb().map(|(ttl, entry)| Request::Registration { name, ttl, entry }),
-            Opcode::Refresh | Opcode::Other(9) => nb().map(|(ttl, entry)| Request::Refresh { name, ttl, entry }),
+            Opcode::Registration => {
+                nb().map(|(ttl, entry)| Request::Registration { name, ttl, entry })
+            }
+            Opcode::Refresh | Opcode::Other(9) => {
+                nb().map(|(ttl, entry)| Request::Refresh { name, ttl, entry })
+            }
             Opcode::Release => nb().map(|(_, entry)| Request::Release { name, entry }),
             other => Err(Error::Unsupported(other)),
         }
@@ -928,7 +987,11 @@ impl Packet {
             opcode,
             flags,
             rcode: rcode::OK,
-            questions: vec![Question { name, qtype, class: CLASS_IN }],
+            questions: vec![Question {
+                name,
+                qtype,
+                class: CLASS_IN,
+            }],
             answers: Vec::new(),
             authority: Vec::new(),
             additional: Vec::new(),
@@ -939,7 +1002,11 @@ impl Packet {
     /// It asks a name server to do the work (RD), and is marked broadcast
     /// if `broadcast` is set.
     pub fn name_query(id: u16, name: Name, broadcast: bool) -> Packet {
-        let flags = Flags { recursion_desired: true, broadcast, ..Flags::default() };
+        let flags = Flags {
+            recursion_desired: true,
+            broadcast,
+            ..Flags::default()
+        };
         Packet::asking(id, Opcode::Query, flags, name, rr_type::NB)
     }
 
@@ -951,17 +1018,34 @@ impl Packet {
     /// A request to register `name` for `entry`, for `ttl` seconds: the
     /// question, and an NB record in the additional section.
     pub fn registration(id: u16, name: Name, ttl: u32, entry: NbEntry, broadcast: bool) -> Packet {
-        let flags = Flags { recursion_desired: true, broadcast, ..Flags::default() };
+        let flags = Flags {
+            recursion_desired: true,
+            broadcast,
+            ..Flags::default()
+        };
         let mut p = Packet::asking(id, Opcode::Registration, flags, name.clone(), rr_type::NB);
-        p.additional.push(Record { name: name.into(), class: CLASS_IN, ttl, data: RData::Nb(vec![entry]) });
+        p.additional.push(Record {
+            name: name.into(),
+            class: CLASS_IN,
+            ttl,
+            data: RData::Nb(vec![entry]),
+        });
         p
     }
 
     /// A request to release `name`, held by `entry`.
     pub fn release(id: u16, name: Name, entry: NbEntry, broadcast: bool) -> Packet {
-        let flags = Flags { broadcast, ..Flags::default() };
+        let flags = Flags {
+            broadcast,
+            ..Flags::default()
+        };
         let mut p = Packet::asking(id, Opcode::Release, flags, name.clone(), rr_type::NB);
-        p.additional.push(Record { name: name.into(), class: CLASS_IN, ttl: 0, data: RData::Nb(vec![entry]) });
+        p.additional.push(Record {
+            name: name.into(),
+            class: CLASS_IN,
+            ttl: 0,
+            data: RData::Nb(vec![entry]),
+        });
         p
     }
 
@@ -973,7 +1057,11 @@ impl Packet {
             id: self.id,
             response: true,
             opcode,
-            flags: Flags { authoritative: true, recursion_desired: true, ..Flags::default() },
+            flags: Flags {
+                authoritative: true,
+                recursion_desired: true,
+                ..Flags::default()
+            },
             rcode: code,
             questions: Vec::new(),
             answers: vec![record],
@@ -990,7 +1078,12 @@ impl Packet {
         let limit = reply_list_limit(&name, 0, NB_ENTRY_LEN);
         let truncated = owners.len() > limit;
         owners.truncate(limit);
-        let record = Record { name: name.into(), class: CLASS_IN, ttl, data: RData::Nb(owners) };
+        let record = Record {
+            name: name.into(),
+            class: CLASS_IN,
+            ttl,
+            data: RData::Nb(owners),
+        };
         let mut p = self.reply(Opcode::Query, rcode::OK, record);
         p.flags.truncated = truncated;
         p
@@ -1001,8 +1094,16 @@ impl Packet {
     /// 4.2.14). An end node sends none for a broadcast query. It stays
     /// silent.
     pub fn negative_query_response(&self, name: Name, code: u8) -> Packet {
-        let data = RData::Other { rr_type: rr_type::NULL, data: Vec::new() };
-        let record = Record { name: name.into(), class: CLASS_IN, ttl: 0, data };
+        let data = RData::Other {
+            rr_type: rr_type::NULL,
+            data: Vec::new(),
+        };
+        let record = Record {
+            name: name.into(),
+            class: CLASS_IN,
+            ttl: 0,
+            data,
+        };
         self.reply(Opcode::Query, code, record)
     }
 
@@ -1023,7 +1124,12 @@ impl Packet {
         let mut statistics = vec![0u8; STATISTICS_LEN];
         statistics[..6].copy_from_slice(&unit_id);
         let data = RData::NodeStatus(NodeStatus { names, statistics });
-        let record = Record { name: name.into(), class: CLASS_IN, ttl: 0, data };
+        let record = Record {
+            name: name.into(),
+            class: CLASS_IN,
+            ttl: 0,
+            data,
+        };
         let mut p = self.reply(Opcode::Query, rcode::OK, record);
         p.flags.recursion_desired = false;
         p.flags.truncated = truncated;
@@ -1036,7 +1142,12 @@ impl Packet {
     /// with a registration response too (section 5.1.4.1), so the opcode
     /// is always 5, with AA, RD and RA set (sections 4.2.5 and 4.2.6).
     pub fn registration_response(&self, name: Name, ttl: u32, entry: NbEntry, code: u8) -> Packet {
-        let record = Record { name: name.into(), class: CLASS_IN, ttl, data: RData::Nb(vec![entry]) };
+        let record = Record {
+            name: name.into(),
+            class: CLASS_IN,
+            ttl,
+            data: RData::Nb(vec![entry]),
+        };
         let mut p = self.reply(Opcode::Registration, code, record);
         p.flags.recursion_available = true;
         p
@@ -1045,7 +1156,12 @@ impl Packet {
     /// The answer to a release, with result code `code` and only AA set
     /// (RFC 1002 sections 4.2.10 and 4.2.11).
     pub fn release_response(&self, name: Name, entry: NbEntry, code: u8) -> Packet {
-        let record = Record { name: name.into(), class: CLASS_IN, ttl: 0, data: RData::Nb(vec![entry]) };
+        let record = Record {
+            name: name.into(),
+            class: CLASS_IN,
+            ttl: 0,
+            data: RData::Nb(vec![entry]),
+        };
         let mut p = self.reply(Opcode::Release, code, record);
         p.flags.recursion_desired = false;
         p
@@ -1057,8 +1173,15 @@ impl Packet {
     /// [`RrName::null`] if it has none.
     pub fn wack(&self, name: impl Into<RrName>, ttl: u32) -> Packet {
         let data = (self.header_word() & 0xfff0).to_be_bytes().to_vec();
-        let record =
-            Record { name: name.into(), class: CLASS_IN, ttl, data: RData::Other { rr_type: rr_type::NB, data } };
+        let record = Record {
+            name: name.into(),
+            class: CLASS_IN,
+            ttl,
+            data: RData::Other {
+                rr_type: rr_type::NB,
+                data,
+            },
+        };
         let mut p = self.reply(Opcode::Wack, rcode::OK, record);
         p.flags.recursion_desired = false;
         p
@@ -1069,9 +1192,18 @@ impl Packet {
 /// pointers. It returns the name and where the bytes after it begin.
 fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), Error> {
     let (mut labels, after) = read_labels(msg, start)?;
-    let bytes = labels.first().and_then(|l| decode_first_level(l)).ok_or(Error::BadFirstLevel)?;
+    let bytes = labels
+        .first()
+        .and_then(|l| decode_first_level(l))
+        .ok_or(Error::BadFirstLevel)?;
     labels.remove(0);
-    Ok((Name { bytes, scope: labels }, after))
+    Ok((
+        Name {
+            bytes,
+            scope: labels,
+        },
+        after,
+    ))
 }
 
 /// Reads the name of a resource record at `start` in the packet `msg`:
@@ -1081,7 +1213,13 @@ fn read_rr_name(msg: &[u8], start: usize) -> Result<(RrName, usize), Error> {
     match labels.first().and_then(|l| decode_first_level(l)) {
         Some(bytes) => {
             labels.remove(0);
-            Ok((RrName::NetBios(Name { bytes, scope: labels }), after))
+            Ok((
+                RrName::NetBios(Name {
+                    bytes,
+                    scope: labels,
+                }),
+                after,
+            ))
         }
         None => Ok((RrName::Domain(labels), after)),
     }
@@ -1207,7 +1345,11 @@ impl Wire for Packet {
         for _ in 0..counts[0] {
             let (name, next) = read_name(b, pos)?;
             let fixed = b.get(next..next + 4).ok_or(Error::Truncated)?;
-            questions.push(Question { name, qtype: be16(fixed, 0).ok_or(Error::Truncated)?, class: be16(fixed, 2).ok_or(Error::Truncated)? });
+            questions.push(Question {
+                name,
+                qtype: be16(fixed, 0).ok_or(Error::Truncated)?,
+                class: be16(fixed, 2).ok_or(Error::Truncated)?,
+            });
             pos = next + 4;
         }
         let mut sections: [Vec<Record>; 3] = Default::default();
@@ -1271,13 +1413,22 @@ impl Wire for Packet {
 impl Packet {
     /// Stages the complete packet within its byte and record limits.
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        if self.questions.len() > MAX_RECORDS || [&self.answers, &self.authority, &self.additional].iter().any(|s| s.len() > MAX_RECORDS) {
+        if self.questions.len() > MAX_RECORDS
+            || [&self.answers, &self.authority, &self.additional]
+                .iter()
+                .any(|s| s.len() > MAX_RECORDS)
+        {
             return Err(Error::Unwritable);
         }
         let mut out = Vec::new();
         out.extend_from_slice(&self.id.to_be_bytes());
         out.extend_from_slice(&self.header_word().to_be_bytes());
-        for count in [self.questions.len(), self.answers.len(), self.authority.len(), self.additional.len()] {
+        for count in [
+            self.questions.len(),
+            self.answers.len(),
+            self.authority.len(),
+            self.additional.len(),
+        ] {
             out.extend_from_slice(&(count as u16).to_be_bytes());
         }
         let mut written = std::collections::HashMap::new();
@@ -1291,7 +1442,12 @@ impl Packet {
                 return Err(Error::Unwritable);
             }
         }
-        for record in self.answers.iter().chain(&self.authority).chain(&self.additional) {
+        for record in self
+            .answers
+            .iter()
+            .chain(&self.authority)
+            .chain(&self.additional)
+        {
             let at = out.len();
             let full = record.write_record(&mut out, &written)?;
             remember(&mut written, full, at);
@@ -1312,17 +1468,21 @@ fn reply_list_limit(name: &Name, fixed_data: usize, entry_len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
-    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::mutate;
+    use fictionet::stdlib::test_support::rounds;
 
     const FRED: &[u8; 32] = b"EGFCEFEECACACACACACACACACACACACA";
 
     fn owner(last: u8) -> NbEntry {
-        NbEntry { group: false, node_type: NodeType::B, address: Ipv4Addr::new(10, 0, 0, last) }
+        NbEntry {
+            group: false,
+            node_type: NodeType::B,
+            address: Ipv4Addr::new(10, 0, 0, last),
+        }
     }
 
     /// A name query for FRED<20>, written by hand.
@@ -1340,7 +1500,9 @@ mod tests {
         let mut b = vec![0x00, 0x07, 0x29, 0x10, 0, 1, 0, 0, 0, 0, 0, 1, 0x20];
         b.extend_from_slice(FRED);
         b.extend_from_slice(&[0, 0, 0x20, 0, 1]);
-        b.extend_from_slice(&[0xc0, 0x0c, 0, 0x20, 0, 1, 0, 0x04, 0x93, 0xe0, 0, 6, 0x00, 0x00, 10, 0, 0, 9]);
+        b.extend_from_slice(&[
+            0xc0, 0x0c, 0, 0x20, 0, 1, 0, 0x04, 0x93, 0xe0, 0, 6, 0x00, 0x00, 10, 0, 0, 9,
+        ]);
         b
     }
 
@@ -1350,8 +1512,12 @@ mod tests {
         vec![
             query_bytes(),
             registration_bytes(),
-            req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1), owner(2)]).to_bytes().unwrap(),
-            req.negative_query_response(Name::new("FRED", 0x20), rcode::NAM_ERR).to_bytes().unwrap(),
+            req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1), owner(2)])
+                .to_bytes()
+                .unwrap(),
+            req.negative_query_response(Name::new("FRED", 0x20), rcode::NAM_ERR)
+                .to_bytes()
+                .unwrap(),
             status.to_bytes().unwrap(),
             status
                 .node_status_response(
@@ -1359,8 +1525,11 @@ mod tests {
                     vec![NodeName::unique(&Name::new("FRED", 0))],
                     [1, 2, 3, 4, 5, 6],
                 )
-                .to_bytes().unwrap(),
-            Packet::name_query(9, Name::new("FRED", 0x20).with_scope("NETBIOS.COM"), false).to_bytes().unwrap(),
+                .to_bytes()
+                .unwrap(),
+            Packet::name_query(9, Name::new("FRED", 0x20).with_scope("NETBIOS.COM"), false)
+                .to_bytes()
+                .unwrap(),
             req.wack(Name::new("FRED", 0x20), 5).to_bytes().unwrap(),
             req.wack(RrName::null(), 5).to_bytes().unwrap(),
             redirect_bytes(),
@@ -1373,15 +1542,27 @@ mod tests {
         let fred = Name::new("Fred", 0x20);
         assert_eq!(&fred.to_bytes().unwrap()[1..1 + ENCODED_LEN], FRED);
         assert_eq!(decode_first_level(FRED), Some(fred.bytes));
-        assert_eq!(&Name::wildcard().to_bytes().unwrap()[1..1 + ENCODED_LEN], b"CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(
+            &Name::wildcard().to_bytes().unwrap()[1..1 + ENCODED_LEN],
+            b"CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
         for b in 0..=255u8 {
-            let name = Name { bytes: [b; NAME_LEN], scope: Vec::new() };
+            let name = Name {
+                bytes: [b; NAME_LEN],
+                scope: Vec::new(),
+            };
             assert_eq!(Name::parse(&name.to_bytes().unwrap()), Ok(name));
         }
         // Wrong lengths and letters outside A to P.
         assert_eq!(decode_first_level(&FRED[..31]), None);
-        assert_eq!(decode_first_level(b"QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), None);
-        assert_eq!(decode_first_level(b"aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), None);
+        assert_eq!(
+            decode_first_level(b"QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            None
+        );
+        assert_eq!(
+            decode_first_level(b"aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            None
+        );
     }
 
     #[test]
@@ -1418,14 +1599,25 @@ mod tests {
         assert!(!back.response);
         assert_eq!(back.opcode, Opcode::Query);
         assert!(back.flags.broadcast && back.flags.recursion_desired);
-        assert_eq!(back.request(), Ok(Request::NameQuery { name: Name::new("FRED", 0x20) }));
+        assert_eq!(
+            back.request(),
+            Ok(Request::NameQuery {
+                name: Name::new("FRED", 0x20)
+            })
+        );
     }
 
     #[test]
     fn positive_query_response() {
         let req = Packet::parse(&query_bytes()).unwrap();
-        let owners =
-            vec![owner(1), NbEntry { group: true, node_type: NodeType::H, address: Ipv4Addr::new(192, 0, 2, 7) }];
+        let owners = vec![
+            owner(1),
+            NbEntry {
+                group: true,
+                node_type: NodeType::H,
+                address: Ipv4Addr::new(192, 0, 2, 7),
+            },
+        ];
         let resp = req.query_response(Name::new("FRED", 0x20), 300_000, owners.clone());
         let bytes = resp.to_bytes().unwrap();
         // R, opcode 0, AA and RD, result 0.
@@ -1433,7 +1625,10 @@ mod tests {
         assert_eq!(bytes[4..12], [0, 0, 0, 1, 0, 0, 0, 0]);
         let tail = &bytes[12 + 34..];
         assert_eq!(tail[..10], [0, 0x20, 0, 1, 0, 0x04, 0x93, 0xe0, 0, 12]);
-        assert_eq!(tail[10..], [0x00, 0x00, 10, 0, 0, 1, 0xe0, 0x00, 192, 0, 2, 7]);
+        assert_eq!(
+            tail[10..],
+            [0x00, 0x00, 10, 0, 0, 1, 0xe0, 0x00, 192, 0, 2, 7]
+        );
         let back = Packet::parse(&bytes).unwrap();
         assert_eq!(back, resp);
         assert_eq!(back.answers[0].data, RData::Nb(owners));
@@ -1449,7 +1644,13 @@ mod tests {
         assert_eq!(bytes[12 + 34..], [0, 0x0a, 0, 1, 0, 0, 0, 0, 0, 0]);
         let back = Packet::parse(&bytes).unwrap();
         assert_eq!(back.rcode, rcode::NAM_ERR);
-        assert_eq!(back.answers[0].data, RData::Other { rr_type: rr_type::NULL, data: vec![] });
+        assert_eq!(
+            back.answers[0].data,
+            RData::Other {
+                rr_type: rr_type::NULL,
+                data: vec![]
+            }
+        );
     }
 
     #[test]
@@ -1460,10 +1661,15 @@ mod tests {
         assert_eq!(&bytes[12..15], b"\x20CK");
         assert_eq!(bytes[bytes.len() - 4..], [0, 0x21, 0, 1]);
         let asked = Packet::parse(&bytes).unwrap();
-        let Ok(Request::NodeStatus { name }) = asked.request() else { panic!() };
+        let Ok(Request::NodeStatus { name }) = asked.request() else {
+            panic!()
+        };
         assert_eq!(name, Name::wildcard());
 
-        let names = vec![NodeName::unique(&Name::new("FRED", 0x00)), NodeName::group(&Name::new("WORKGROUP", 0x00))];
+        let names = vec![
+            NodeName::unique(&Name::new("FRED", 0x00)),
+            NodeName::group(&Name::new("WORKGROUP", 0x00)),
+        ];
         let resp = asked.node_status_response(name, names.clone(), [0, 0x50, 0x56, 1, 2, 3]);
         let bytes = resp.to_bytes().unwrap();
         assert_eq!(bytes[2..4], [0x84, 0x00]);
@@ -1474,7 +1680,9 @@ mod tests {
         assert_eq!(rdata[17..19], [0x04, 0x00]);
         assert_eq!(rdata[35..37], [0x84, 0x00]);
         let back = Packet::parse(&bytes).unwrap();
-        let RData::NodeStatus(s) = &back.answers[0].data else { panic!() };
+        let RData::NodeStatus(s) = &back.answers[0].data else {
+            panic!()
+        };
         assert_eq!(s.names, names);
         assert_eq!(s.unit_id(), Some([0, 0x50, 0x56, 1, 2, 3]));
         assert_eq!(back.answers[0].ttl, 0);
@@ -1482,10 +1690,19 @@ mod tests {
         let mut short = bytes.clone();
         let at = 12 + 34 + 10;
         short[at] = 200;
-        let RData::Other { rr_type, data } = &Packet::parse(&short).unwrap().answers[0].data else { panic!() };
+        let RData::Other { rr_type, data } = &Packet::parse(&short).unwrap().answers[0].data else {
+            panic!()
+        };
         assert_eq!((*rr_type, data.len()), (rr_type::NBSTAT, rdata.len()));
         assert_eq!(NodeStatus::default().unit_id(), Some([0; 6]));
-        assert_eq!(NodeStatus { names: vec![], statistics: vec![1, 2] }.unit_id(), None);
+        assert_eq!(
+            NodeStatus {
+                names: vec![],
+                statistics: vec![1, 2]
+            }
+            .unit_id(),
+            None
+        );
     }
 
     #[test]
@@ -1494,7 +1711,11 @@ mod tests {
         let p = Packet::parse(&bytes).unwrap();
         assert_eq!(p.opcode, Opcode::Registration);
         assert_eq!(p.additional[0].name, Name::new("FRED", 0x20));
-        let want = Request::Registration { name: Name::new("FRED", 0x20), ttl: 300_000, entry: owner(9) };
+        let want = Request::Registration {
+            name: Name::new("FRED", 0x20),
+            ttl: 300_000,
+            entry: owner(9),
+        };
         assert_eq!(p.request(), Ok(want));
         // The writer spells the name out, and reads back the same.
         let built = Packet::registration(7, Name::new("FRED", 0x20), 300_000, owner(9), true);
@@ -1515,14 +1736,30 @@ mod tests {
     fn refresh_and_release() {
         let mut p = Packet::registration(1, Name::new("FRED", 0x20), 60, owner(3), false);
         p.opcode = Opcode::Refresh;
-        assert_eq!(p.request(), Ok(Request::Refresh { name: Name::new("FRED", 0x20), ttl: 60, entry: owner(3) }));
+        assert_eq!(
+            p.request(),
+            Ok(Request::Refresh {
+                name: Name::new("FRED", 0x20),
+                ttl: 60,
+                entry: owner(3)
+            })
+        );
         let r = p.registration_response(Name::new("FRED", 0x20), 60, owner(3), rcode::OK);
-        assert_eq!(Packet::parse(&r.to_bytes().unwrap()).unwrap().opcode, Opcode::Registration);
+        assert_eq!(
+            Packet::parse(&r.to_bytes().unwrap()).unwrap().opcode,
+            Opcode::Registration
+        );
 
         let rel = Packet::release(2, Name::new("FRED", 0x20), owner(3), true);
         let back = Packet::parse(&rel.to_bytes().unwrap()).unwrap();
         assert_eq!(back.to_bytes().unwrap()[2..4], [0x30, 0x10]);
-        assert_eq!(back.request(), Ok(Request::Release { name: Name::new("FRED", 0x20), entry: owner(3) }));
+        assert_eq!(
+            back.request(),
+            Ok(Request::Release {
+                name: Name::new("FRED", 0x20),
+                entry: owner(3)
+            })
+        );
         let resp = back.release_response(Name::new("FRED", 0x20), owner(3), rcode::OK);
         let b = resp.to_bytes().unwrap();
         assert_eq!(b[2..4], [0xb4, 0x00]);
@@ -1538,7 +1775,13 @@ mod tests {
         // The data: the request's opcode and flags, result code 0.
         assert_eq!(b[b.len() - 4..], [0, 2, 0x29, 0x10]);
         let back = Packet::parse(&b).unwrap();
-        assert_eq!(back.answers[0].data, RData::Other { rr_type: rr_type::NB, data: vec![0x29, 0x10] });
+        assert_eq!(
+            back.answers[0].data,
+            RData::Other {
+                rr_type: rr_type::NB,
+                data: vec![0x29, 0x10]
+            }
+        );
         assert_eq!(back, w);
     }
 
@@ -1548,9 +1791,19 @@ mod tests {
         // name keeps its case, so it is built from its bytes. The RFC
         // prints FEGHGFCAEOGFHEECEJEPFDCAHEGBGNGF, which has two letters
         // wrong: it decodes to "Tge NetBIOS tame".
-        let name = Name { bytes: *b"The NetBIOS name", scope: Vec::new() }.with_scope("SCOPE.ID.COM");
-        assert_eq!(&name.to_bytes().unwrap()[1..1 + ENCODED_LEN], b"FEGIGFCAEOGFHEECEJEPFDCAGOGBGNGF");
-        assert_eq!(decode_first_level(b"FEGHGFCAEOGFHEECEJEPFDCAHEGBGNGF"), Some(*b"Tge NetBIOS tame"));
+        let name = Name {
+            bytes: *b"The NetBIOS name",
+            scope: Vec::new(),
+        }
+        .with_scope("SCOPE.ID.COM");
+        assert_eq!(
+            &name.to_bytes().unwrap()[1..1 + ENCODED_LEN],
+            b"FEGIGFCAEOGFHEECEJEPFDCAGOGBGNGF"
+        );
+        assert_eq!(
+            decode_first_level(b"FEGHGFCAEOGFHEECEJEPFDCAHEGBGNGF"),
+            Some(*b"Tge NetBIOS tame")
+        );
         let wire = name.to_bytes().unwrap();
         assert_eq!(&wire[33..], b"\x05SCOPE\x02ID\x03COM\x00");
         assert_eq!(read_name(&wire, 0), Ok((name, wire.len())));
@@ -1562,7 +1815,9 @@ mod tests {
         // to the question's name.
         let built = Packet::registration(7, Name::new("FRED", 0x20), 300_000, owner(9), true);
         assert_eq!(built.to_bytes().unwrap(), registration_bytes());
-        let rel = Packet::release(2, Name::new("FRED", 0x20), owner(3), false).to_bytes().unwrap();
+        let rel = Packet::release(2, Name::new("FRED", 0x20), owner(3), false)
+            .to_bytes()
+            .unwrap();
         assert_eq!(rel[50..52], [0xc0, 0x0c]);
         // A different name is written in full.
         let mut p = built.clone();
@@ -1581,7 +1836,14 @@ mod tests {
         p.flags.recursion_desired = false;
         let back = Packet::parse(&p.to_bytes().unwrap()).unwrap();
         assert_eq!(back.opcode, Opcode::Other(9));
-        assert_eq!(back.request(), Ok(Request::Refresh { name: Name::new("FRED", 0x20), ttl: 60, entry: owner(3) }));
+        assert_eq!(
+            back.request(),
+            Ok(Request::Refresh {
+                name: Name::new("FRED", 0x20),
+                ttl: 60,
+                entry: owner(3)
+            })
+        );
     }
 
     #[test]
@@ -1592,13 +1854,19 @@ mod tests {
         let mut refresh = Packet::registration(1, Name::new("FRED", 0x20), 60, owner(3), false);
         refresh.opcode = Opcode::Refresh;
         refresh.flags.recursion_desired = false;
-        let r = refresh.registration_response(Name::new("FRED", 0x20), 60, owner(3), rcode::OK).to_bytes().unwrap();
+        let r = refresh
+            .registration_response(Name::new("FRED", 0x20), 60, owner(3), rcode::OK)
+            .to_bytes()
+            .unwrap();
         assert_eq!(r[2..4], [0xad, 0x80]);
         // A release response has only AA (section 4.2.10), even when the
         // request set RD.
         let mut rel = Packet::release(2, Name::new("FRED", 0x20), owner(3), false);
         rel.flags.recursion_desired = true;
-        let r = rel.release_response(Name::new("FRED", 0x20), owner(3), rcode::OK).to_bytes().unwrap();
+        let r = rel
+            .release_response(Name::new("FRED", 0x20), owner(3), rcode::OK)
+            .to_bytes()
+            .unwrap();
         assert_eq!(r[2..4], [0xb4, 0x00]);
     }
 
@@ -1608,13 +1876,27 @@ mod tests {
         // with RD set, even to a query that had it clear.
         let mut q = Packet::name_query(5, Name::new("FRED", 0x20), false);
         q.flags.recursion_desired = false;
-        let yes = q.query_response(Name::new("FRED", 0x20), 60, vec![owner(1)]).to_bytes().unwrap();
+        let yes = q
+            .query_response(Name::new("FRED", 0x20), 60, vec![owner(1)])
+            .to_bytes()
+            .unwrap();
         assert_eq!(yes[2..4], [0x85, 0x00]);
-        let no = q.negative_query_response(Name::new("FRED", 0x20), rcode::NAM_ERR).to_bytes().unwrap();
+        let no = q
+            .negative_query_response(Name::new("FRED", 0x20), rcode::NAM_ERR)
+            .to_bytes()
+            .unwrap();
         assert_eq!(no[2..4], [0x85, 0x03]);
         // Node status (4.2.18) and WACK (4.2.16) keep RD clear.
-        assert_eq!(q.node_status_response(Name::wildcard(), vec![], [0; 6]).to_bytes().unwrap()[2..4], [0x84, 0x00]);
-        assert_eq!(q.wack(Name::new("FRED", 0x20), 1).to_bytes().unwrap()[2..4], [0xbc, 0x00]);
+        assert_eq!(
+            q.node_status_response(Name::wildcard(), vec![], [0; 6])
+                .to_bytes()
+                .unwrap()[2..4],
+            [0x84, 0x00]
+        );
+        assert_eq!(
+            q.wack(Name::new("FRED", 0x20), 1).to_bytes().unwrap()[2..4],
+            [0xbc, 0x00]
+        );
     }
 
     #[test]
@@ -1623,14 +1905,32 @@ mod tests {
         let reqs = [
             Request::NameQuery { name: fred.clone() },
             Request::NodeStatus { name: fred.clone() },
-            Request::Registration { name: fred.clone(), ttl: 1, entry: owner(1) },
-            Request::Refresh { name: fred.clone(), ttl: 1, entry: owner(1) },
-            Request::Release { name: fred.clone(), entry: owner(1) },
+            Request::Registration {
+                name: fred.clone(),
+                ttl: 1,
+                entry: owner(1),
+            },
+            Request::Refresh {
+                name: fred.clone(),
+                ttl: 1,
+                entry: owner(1),
+            },
+            Request::Release {
+                name: fred.clone(),
+                entry: owner(1),
+            },
         ];
         for r in &reqs {
             assert_eq!(r.name(), &fred);
         }
-        assert_eq!(Packet::parse(&registration_bytes()).unwrap().request().unwrap().name(), &fred);
+        assert_eq!(
+            Packet::parse(&registration_bytes())
+                .unwrap()
+                .request()
+                .unwrap()
+                .name(),
+            &fred
+        );
     }
 
     #[test]
@@ -1641,7 +1941,10 @@ mod tests {
             name: Name::new("FRED", 0x20).into(),
             class: CLASS_IN,
             ttl: 0,
-            data: RData::Other { rr_type: rr_type::NB, data: vec![0, 0, 10, 0, 0, 1] },
+            data: RData::Other {
+                rr_type: rr_type::NB,
+                data: vec![0, 0, 10, 0, 0, 1],
+            },
         });
         p.opcode = Opcode::Other(5);
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
@@ -1678,7 +1981,10 @@ mod tests {
         assert_eq!(Packet::parse(&[]), Err(Error::Truncated));
         assert_eq!(Packet::parse(&[0; 11]), Err(Error::Truncated));
         assert!(Packet::parse(&[0; 12]).is_ok());
-        assert_eq!(Packet::parse(&vec![0; MAX_PACKET + 1]), Err(Error::TooLong(MAX_PACKET + 1)));
+        assert_eq!(
+            Packet::parse(&vec![0; MAX_PACKET + 1]),
+            Err(Error::TooLong(MAX_PACKET + 1))
+        );
         let mut many = vec![0; 12];
         many[10..12].copy_from_slice(&65u16.to_be_bytes());
         assert_eq!(Packet::parse(&many), Err(Error::TooManyRecords(65)));
@@ -1725,7 +2031,10 @@ mod tests {
             last = here;
         }
         let end = b.len();
-        assert_eq!(read_name(&b, end - 4), Ok((Name::new("FRED", 0x20), end - 2)));
+        assert_eq!(
+            read_name(&b, end - 4),
+            Ok((Name::new("FRED", 0x20), end - 2))
+        );
         assert_eq!(read_name(&b, end - 2), Err(Error::BadPointer(12)));
     }
 
@@ -1755,7 +2064,12 @@ mod tests {
         for s in samples() {
             assert!(Packet::parse(&s).is_ok());
             for n in 0..s.len() {
-                assert_eq!(Packet::parse(&s[..n]), Err(Error::Truncated), "{n} of {} bytes", s.len());
+                assert_eq!(
+                    Packet::parse(&s[..n]),
+                    Err(Error::Truncated),
+                    "{n} of {} bytes",
+                    s.len()
+                );
             }
         }
     }
@@ -1795,13 +2109,27 @@ mod tests {
         }
         let name = Name::new("X", 0);
         for data in [
-            RData::NodeStatus(NodeStatus { names: vec![NodeName::unique(&name); 300], statistics: vec![] }),
-            RData::NodeStatus(NodeStatus { names: vec![], statistics: vec![7; 70_000] }),
+            RData::NodeStatus(NodeStatus {
+                names: vec![NodeName::unique(&name); 300],
+                statistics: vec![],
+            }),
+            RData::NodeStatus(NodeStatus {
+                names: vec![],
+                statistics: vec![7; 70_000],
+            }),
             RData::Nb(vec![owner(1); 20_000]),
-            RData::Other { rr_type: 0x99, data: vec![1; 70_000] },
+            RData::Other {
+                rr_type: 0x99,
+                data: vec![1; 70_000],
+            },
         ] {
             let mut packet = Packet::name_query(1, name.clone(), false);
-            packet.answers.push(Record { name: name.clone().into(), class: CLASS_IN, ttl: 0, data });
+            packet.answers.push(Record {
+                name: name.clone().into(),
+                class: CLASS_IN,
+                ttl: 0,
+                data,
+            });
             contract::check_wire_value(&packet);
             assert_eq!(packet.to_bytes(), Err(Error::Unwritable));
         }
@@ -1929,7 +2257,6 @@ mod tests {
         assert_eq!(NodeStatus::default().statistics, vec![0; STATISTICS_LEN]);
     }
 
-
     /// A redirect name query response (RFC 1002 section 4.2.15): the
     /// name server NS.NETBIOS.COM, at 10.0.0.1, has authority over
     /// NETBIOS.COM. The additional record's name points into the NS data.
@@ -1966,12 +2293,21 @@ mod tests {
     fn redirect_with_domain_names() {
         let b = redirect_bytes();
         let p = Packet::parse(&b).unwrap();
-        assert_eq!(p.authority[0].name, RrName::domain("netbios.com".to_uppercase().as_str()));
+        assert_eq!(
+            p.authority[0].name,
+            RrName::domain("netbios.com".to_uppercase().as_str())
+        );
         assert_eq!(p.authority[0].name.to_string(), "NETBIOS.COM");
         let ns = vec![b"NS".to_vec(), b"NETBIOS".to_vec(), b"COM".to_vec()];
         assert_eq!(p.authority[0].data, RData::Ns(ns.clone()));
         assert_eq!(p.additional[0].name, RrName::Domain(ns));
-        assert_eq!(p.additional[0].data, RData::Other { rr_type: rr_type::A, data: vec![10, 0, 0, 1] });
+        assert_eq!(
+            p.additional[0].data,
+            RData::Other {
+                rr_type: rr_type::A,
+                data: vec![10, 0, 0, 1]
+            }
+        );
         assert!(p.authority[0].name.netbios().is_none());
         let back = Packet::parse(&p.to_bytes().unwrap()).unwrap();
         assert_eq!(back, p);
@@ -2005,11 +2341,17 @@ mod tests {
         assert_eq!(back, p);
         // Opaque NS data with a pointer is refused.
         let mut built = p.clone();
-        built.authority[0].data = RData::Other { rr_type: rr_type::NS, data: vec![0xc0, 0x5f] };
+        built.authority[0].data = RData::Other {
+            rr_type: rr_type::NS,
+            data: vec![0xc0, 0x5f],
+        };
         assert_eq!(built.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&built);
         // Opaque NS data that would read as Ns is also refused.
-        built.authority[0].data = RData::Other { rr_type: rr_type::NS, data: b"\x03COM\x00".to_vec() };
+        built.authority[0].data = RData::Other {
+            rr_type: rr_type::NS,
+            data: b"\x03COM\x00".to_vec(),
+        };
         assert_eq!(built.to_bytes(), Err(Error::Unwritable));
         built.authority[0].data = RData::Ns(vec![b"COM".to_vec()]);
         contract::check_wire_value(&built);
@@ -2024,7 +2366,11 @@ mod tests {
         assert!(matches!(reg, Request::Registration { .. }));
         p.flags.recursion_desired = false;
         let back = Packet::parse(&p.to_bytes().unwrap()).unwrap();
-        let want = Request::Overwrite { name: Name::new("FRED", 0x20), ttl: 60, entry: owner(9) };
+        let want = Request::Overwrite {
+            name: Name::new("FRED", 0x20),
+            ttl: 60,
+            entry: owner(9),
+        };
         assert_eq!(back.request(), Ok(want.clone()));
         assert_eq!(want.name(), reg.name());
     }
@@ -2039,7 +2385,12 @@ mod tests {
             assert!(bytes.len() <= MAX_PACKET);
             let back = Packet::parse(&bytes).unwrap();
             assert_eq!(back, p);
-            for r in back.answers.iter().chain(&back.authority).chain(&back.additional) {
+            for r in back
+                .answers
+                .iter()
+                .chain(&back.authority)
+                .chain(&back.additional)
+            {
                 assert!(!r.name.to_string().is_empty());
             }
             if p.request().is_ok() {

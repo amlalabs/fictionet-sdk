@@ -1,10 +1,8 @@
 extern crate alloc;
 
 use alloc::{collections::VecDeque, vec::Vec};
-use fictionet::stdlib::codec::{
-    Buffer, Decode, Fail, Step, Stream,
-};
 use core::{error::Error, fmt, ops::Range};
+use fictionet::stdlib::codec::{Buffer, Decode, Fail, Step, Stream};
 
 /// Default number of provenance spans retained by a [`Pipe`].
 pub const DEFAULT_SPANS: usize = 256;
@@ -138,10 +136,12 @@ impl Spans {
                 .outer
                 .start
                 .checked_add(at.checked_sub(span.inner.start)?)?;
-            let end = span
-                .outer
-                .start
-                .checked_add(range.end.min(span.inner.end).checked_sub(span.inner.start)?)?;
+            let end = span.outer.start.checked_add(
+                range
+                    .end
+                    .min(span.inner.end)
+                    .checked_sub(span.inner.start)?,
+            )?;
             if end > span.outer.end {
                 return None;
             }
@@ -349,7 +349,10 @@ where
             }
             let after = self.inner.buffered().saturating_add(self.inner.held());
             if n == 0 && self.inner.offset() == offset && after >= before {
-                return Err(PipeError::Inner(Fail::Refused { unread: self.inner.buffered(), limit: self.inner.limit() }));
+                return Err(PipeError::Inner(Fail::Refused {
+                    unread: self.inner.buffered(),
+                    limit: self.inner.limit(),
+                }));
             }
         }
         if self.outer_ended {

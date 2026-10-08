@@ -154,7 +154,13 @@ pub struct GpePacket {
 
 impl Default for GpePacket {
     fn default() -> GpePacket {
-        GpePacket { vni: 0, next_protocol: Some(next_protocol::ETHERNET), bum: false, oam: false, payload: Vec::new() }
+        GpePacket {
+            vni: 0,
+            next_protocol: Some(next_protocol::ETHERNET),
+            bum: false,
+            oam: false,
+            payload: Vec::new(),
+        }
     }
 }
 
@@ -187,12 +193,17 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Truncated(n) => write!(f, "{n} bytes, shorter than the {HEADER_LEN}-byte VXLAN header"),
+            Error::Truncated(n) => write!(
+                f,
+                "{n} bytes, shorter than the {HEADER_LEN}-byte VXLAN header"
+            ),
             Error::TooLong(n) => write!(f, "{n} bytes, longer than a UDP datagram can carry"),
             Error::NoVni => write!(f, "I flag clear, so no valid VNI"),
             Error::Version(v) => write!(f, "VXLAN-GPE version {v}, not 0"),
             Error::NextProtocolWithoutP(p) => write!(f, "next protocol {p} with the P flag clear"),
-            Error::ReservedNextProtocol => write!(f, "next protocol 0, which is reserved, with the P flag set"),
+            Error::ReservedNextProtocol => {
+                write!(f, "next protocol 0, which is reserved, with the P flag set")
+            }
         }
     }
 }
@@ -246,7 +257,10 @@ impl Wire for Packet {
         if first & flags::I == 0 {
             return Err(Error::NoVni);
         }
-        Ok(Packet { vni, frame: frame.to_vec() })
+        Ok(Packet {
+            vni,
+            frame: frame.to_vec(),
+        })
     }
 
     /// Appends the VXLAN header and Ethernet frame. Refuses VNIs wider than 24 bits
@@ -313,7 +327,12 @@ impl Wire for GpePacket {
         if self.oam {
             first |= flags::O;
         }
-        let out = write(first, self.next_protocol.unwrap_or(0), self.vni, &self.payload)?;
+        let out = write(
+            first,
+            self.next_protocol.unwrap_or(0),
+            self.vni,
+            &self.payload,
+        )?;
 
         dst.extend_from_slice(&out);
         Ok(())
@@ -324,10 +343,10 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
 
     /// The ARP request from the module doc: VNI 5001 and a 14-byte frame.
     fn example() -> Vec<u8> {
@@ -347,14 +366,26 @@ mod tests {
         assert_eq!(p.to_bytes(), Ok(d));
         // The largest VNI.
         let p = Packet::parse(&[0x08, 0, 0, 0, 0xff, 0xff, 0xff, 0]).unwrap();
-        assert_eq!(p, Packet { vni: MAX_VNI, frame: vec![] });
+        assert_eq!(
+            p,
+            Packet {
+                vni: MAX_VNI,
+                frame: vec![]
+            }
+        );
     }
 
     #[test]
     fn reserved_bits_are_ignored_and_written_as_zero() {
         let d = [0xf7 | flags::I, 0xaa, 0xbb, 0xcc, 0, 0, 7, 0xdd, 1, 2];
         let p = Packet::parse(&d).unwrap();
-        assert_eq!(p, Packet { vni: 7, frame: vec![1, 2] });
+        assert_eq!(
+            p,
+            Packet {
+                vni: 7,
+                frame: vec![1, 2]
+            }
+        );
         assert_eq!(p.to_bytes().unwrap(), [0x08, 0, 0, 0, 0, 0, 7, 0, 1, 2]);
         // In VXLAN-GPE: the two high bits, the 16 reserved bits and the
         // last byte.
@@ -401,17 +432,32 @@ mod tests {
         assert_eq!(Packet::parse(&[]), Err(Error::Truncated(0)));
         assert_eq!(GpePacket::parse(&[0x08; 7]), Err(Error::Truncated(7)));
         assert_eq!(Packet::parse(&[0, 0, 0, 0, 0, 0, 1, 0]), Err(Error::NoVni));
-        assert_eq!(GpePacket::parse(&[0x04, 0, 0, 1, 0, 0, 1, 0]), Err(Error::NoVni));
-        assert_eq!(GpePacket::parse(&[0x18, 0, 0, 0, 0, 0, 1, 0]), Err(Error::Version(1)));
-        assert_eq!(GpePacket::parse(&[0x38, 0, 0, 0, 0, 0, 1, 0]), Err(Error::Version(3)));
-        assert_eq!(GpePacket::parse(&[0x08, 0, 0, 3, 0, 0, 1, 0]), Err(Error::NextProtocolWithoutP(3)));
+        assert_eq!(
+            GpePacket::parse(&[0x04, 0, 0, 1, 0, 0, 1, 0]),
+            Err(Error::NoVni)
+        );
+        assert_eq!(
+            GpePacket::parse(&[0x18, 0, 0, 0, 0, 0, 1, 0]),
+            Err(Error::Version(1))
+        );
+        assert_eq!(
+            GpePacket::parse(&[0x38, 0, 0, 0, 0, 0, 1, 0]),
+            Err(Error::Version(3))
+        );
+        assert_eq!(
+            GpePacket::parse(&[0x08, 0, 0, 3, 0, 0, 1, 0]),
+            Err(Error::NextProtocolWithoutP(3))
+        );
         let mut big = vec![0x08, 0, 0, 0, 0, 0, 1, 0];
         big.resize(MAX_DATAGRAM, 0);
         assert!(Packet::parse(&big).is_ok());
         assert!(GpePacket::parse(&big).is_ok());
         big.push(0);
         assert_eq!(Packet::parse(&big), Err(Error::TooLong(MAX_DATAGRAM + 1)));
-        assert_eq!(GpePacket::parse(&big), Err(Error::TooLong(MAX_DATAGRAM + 1)));
+        assert_eq!(
+            GpePacket::parse(&big),
+            Err(Error::TooLong(MAX_DATAGRAM + 1))
+        );
         for e in [
             Error::Truncated(3),
             Error::TooLong(70_000),
@@ -447,29 +493,52 @@ mod tests {
     fn writers_reject_a_vni_wider_than_24_bits() {
         // RFC 7348 section 5: the VNI is 24 bits. Masking would send the
         // frame to another network, so the writer refuses.
-        let p = Packet { vni: 0x0100_0001, frame: vec![0; 60] };
+        let p = Packet {
+            vni: 0x0100_0001,
+            frame: vec![0; 60],
+        };
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-        let g = GpePacket { vni: 0xab00_0001, ..GpePacket::default() };
+        let g = GpePacket {
+            vni: 0xab00_0001,
+            ..GpePacket::default()
+        };
         assert_eq!(g.to_bytes(), Err(Error::Unwritable));
-        let p = Packet { vni: MAX_VNI, frame: vec![] };
+        let p = Packet {
+            vni: MAX_VNI,
+            frame: vec![],
+        };
         assert_eq!(p.to_bytes(), Ok(vec![0x08, 0, 0, 0, 0xff, 0xff, 0xff, 0]));
     }
 
     #[test]
     fn writers_reject_a_payload_too_long_for_a_datagram() {
         // The longest payload fits, at exactly the longest datagram.
-        let p = Packet { vni: 1, frame: vec![1; MAX_PAYLOAD] };
+        let p = Packet {
+            vni: 1,
+            frame: vec![1; MAX_PAYLOAD],
+        };
         let bytes = p.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_DATAGRAM);
         assert_eq!(Packet::parse(&bytes), Ok(p));
-        let g = GpePacket { vni: 2, payload: vec![2; MAX_PAYLOAD], ..GpePacket::default() };
+        let g = GpePacket {
+            vni: 2,
+            payload: vec![2; MAX_PAYLOAD],
+            ..GpePacket::default()
+        };
         let bytes = g.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_DATAGRAM);
         assert_eq!(GpePacket::parse(&bytes), Ok(g));
         // One byte more is an error, not a cut frame.
-        let p = Packet { vni: 1, frame: vec![1; MAX_PAYLOAD + 1] };
+        let p = Packet {
+            vni: 1,
+            frame: vec![1; MAX_PAYLOAD + 1],
+        };
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-        let g = GpePacket { vni: 2, payload: vec![2; 70_000], ..GpePacket::default() };
+        let g = GpePacket {
+            vni: 2,
+            payload: vec![2; 70_000],
+            ..GpePacket::default()
+        };
         assert_eq!(g.to_bytes(), Err(Error::Unwritable));
     }
 
@@ -477,12 +546,26 @@ mod tests {
     fn reserved_next_protocol_zero_is_rejected() {
         // Draft-12 section 11.2 reserves 0x00. With P set it names no
         // protocol: the reader rejects it and the writer will not write it.
-        assert_eq!(GpePacket::parse(&[0x0c, 0, 0, 0, 0, 0, 1, 0]), Err(Error::ReservedNextProtocol));
-        assert_eq!(GpePacket::parse(&[0x0f, 0, 0, 0, 0, 0, 1, 0, 9]), Err(Error::ReservedNextProtocol));
-        let g = GpePacket { vni: 1, next_protocol: Some(0), ..GpePacket::default() };
+        assert_eq!(
+            GpePacket::parse(&[0x0c, 0, 0, 0, 0, 0, 1, 0]),
+            Err(Error::ReservedNextProtocol)
+        );
+        assert_eq!(
+            GpePacket::parse(&[0x0f, 0, 0, 0, 0, 0, 1, 0, 9]),
+            Err(Error::ReservedNextProtocol)
+        );
+        let g = GpePacket {
+            vni: 1,
+            next_protocol: Some(0),
+            ..GpePacket::default()
+        };
         assert_eq!(g.to_bytes(), Err(Error::Unwritable));
         // P clear with a zero field is still implicit Ethernet.
-        let g = GpePacket { vni: 1, next_protocol: None, ..GpePacket::default() };
+        let g = GpePacket {
+            vni: 1,
+            next_protocol: None,
+            ..GpePacket::default()
+        };
         assert_eq!(g.to_bytes(), Ok(vec![0x08, 0, 0, 0, 0, 0, 1, 0]));
         assert_eq!(g.protocol(), next_protocol::ETHERNET);
     }
@@ -499,7 +582,11 @@ mod tests {
         assert_eq!(g.protocol(), next_protocol::ETHERNET);
         assert_eq!(g.to_bytes(), Ok(vec![0x0c, 0, 0, 0x03, 0, 0, 0, 0]));
         assert_eq!(GpePacket::parse(&g.to_bytes().unwrap()), Ok(g));
-        let g = GpePacket { vni: 1, payload: vec![0xff; 14], ..GpePacket::default() };
+        let g = GpePacket {
+            vni: 1,
+            payload: vec![0xff; 14],
+            ..GpePacket::default()
+        };
         assert_eq!(g.to_bytes().unwrap()[..8], [0x0c, 0, 0, 0x03, 0, 0, 1, 0]);
     }
 
@@ -539,10 +626,16 @@ mod tests {
             // The datagram growing a byte at a time: every prefix. Below
             // the header length each one is Truncated. Once the header is
             // in, each one gets the same answer as the whole datagram.
-            let whole = (Packet::parse(&data).map(|_| ()), GpePacket::parse(&data).map(|_| ()));
+            let whole = (
+                Packet::parse(&data).map(|_| ()),
+                GpePacket::parse(&data).map(|_| ()),
+            );
             for n in 0..data.len() {
                 check(&data[..n]);
-                let part = (Packet::parse(&data[..n]).map(|_| ()), GpePacket::parse(&data[..n]).map(|_| ()));
+                let part = (
+                    Packet::parse(&data[..n]).map(|_| ()),
+                    GpePacket::parse(&data[..n]).map(|_| ()),
+                );
                 if n < HEADER_LEN {
                     assert_eq!(part, (Err(Error::Truncated(n)), Err(Error::Truncated(n))));
                 } else {
@@ -554,9 +647,17 @@ mod tests {
         // Random packets, any VNI and any next protocol, written and
         // read back. A write either keeps the whole value or fails.
         for _ in 0..5_000 {
-            let vni = u32::from_be_bytes([rng.index(4) as u8, (rng.next() as u8), (rng.next() as u8), (rng.next() as u8)]);
+            let vni = u32::from_be_bytes([
+                rng.index(4) as u8,
+                (rng.next() as u8),
+                (rng.next() as u8),
+                (rng.next() as u8),
+            ]);
             let payload: Vec<u8> = rng.bytes(31);
-            let p = Packet { vni, frame: payload.clone() };
+            let p = Packet {
+                vni,
+                frame: payload.clone(),
+            };
             match p.to_bytes() {
                 Ok(bytes) => assert_eq!(Packet::parse(&bytes), Ok(p)),
                 Err(e) => assert!(vni > MAX_VNI && e == Error::Unwritable),
@@ -564,7 +665,11 @@ mod tests {
             let flags = rng.next() as u8;
             let g = GpePacket {
                 vni,
-                next_protocol: if flags & 1 == 0 { None } else { Some(rng.index(8) as u8) },
+                next_protocol: if flags & 1 == 0 {
+                    None
+                } else {
+                    Some(rng.index(8) as u8)
+                },
                 bum: flags & 2 != 0,
                 oam: flags & 4 != 0,
                 payload,

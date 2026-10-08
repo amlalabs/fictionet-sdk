@@ -62,14 +62,14 @@
 //! assert_eq!(back.pdu.bindings()[0].value, Value::OctetString(b"pump controller".to_vec()));
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::asn1;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::asn1;
+use fictionet::stdlib::codec::Prefixed;
 use std::fmt;
 use std::str::FromStr;
 
-use fictionet::stdlib::codec::{Wire};
+use fictionet::stdlib::codec::Wire;
 
 /// The UDP port agents listen on for requests.
 pub const PORT: u16 = 161;
@@ -232,11 +232,15 @@ impl Header {
     /// lengths and lengths over [`MAX_MESSAGE`] are errors. A long-form
     /// length may use more bytes than it needs (RFC 3417, section 8).
     pub fn parse(b: &[u8]) -> Result<Option<Header>, Error> {
-        let Some(&tag) = b.first() else { return Ok(None) };
+        let Some(&tag) = b.first() else {
+            return Ok(None);
+        };
         if tag & tag::HIGH_NUMBER == tag::HIGH_NUMBER {
             return Err(Error::UnexpectedTag(tag));
         }
-        let Some(&first) = b.get(1) else { return Ok(None) };
+        let Some(&first) = b.get(1) else {
+            return Ok(None);
+        };
         let (content_len, header_len) = if first < 0x80 {
             (usize::from(first), 2)
         } else {
@@ -245,14 +249,22 @@ impl Header {
             if n == 0 || n == 0x7f {
                 return Err(Error::Length);
             }
-            let Some(bytes) = b.get(2..2 + n) else { return Ok(None) };
-            let len = bytes.iter().fold(0usize, |acc, &x| acc.saturating_mul(256).saturating_add(usize::from(x)));
+            let Some(bytes) = b.get(2..2 + n) else {
+                return Ok(None);
+            };
+            let len = bytes.iter().fold(0usize, |acc, &x| {
+                acc.saturating_mul(256).saturating_add(usize::from(x))
+            });
             (len, 2 + n)
         };
         if content_len > MAX_MESSAGE {
             return Err(Error::TooLong(content_len));
         }
-        Ok(Some(Header { tag, header_len, content_len }))
+        Ok(Some(Header {
+            tag,
+            header_len,
+            content_len,
+        }))
     }
 
     /// The length of the whole element: header and content. A header
@@ -276,7 +288,10 @@ impl<'a> Reader<'a> {
     /// The next element's tag and content.
     fn next(&mut self) -> Result<(u8, &'a [u8]), Error> {
         let h = Header::parse(self.b)?.ok_or(Error::Truncated)?;
-        let content = self.b.get(h.header_len..h.total_len()).ok_or(Error::Truncated)?;
+        let content = self
+            .b
+            .get(h.header_len..h.total_len())
+            .ok_or(Error::Truncated)?;
         self.b = &self.b[h.total_len()..];
         Ok((h.tag, content))
     }
@@ -295,14 +310,22 @@ impl<'a> Reader<'a> {
     }
 
     fn end(&self) -> Result<(), Error> {
-        if self.b.is_empty() { Ok(()) } else { Err(Error::TrailingBytes) }
+        if self.b.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::TrailingBytes)
+        }
     }
 }
 
 /// How many bytes an element takes whose content is `len` bytes long,
 /// or `usize::MAX` if that does not fit in a `usize`.
 fn tlv_len(len: usize) -> usize {
-    let len_len = if len < 0x80 { 1 } else { 1 + (usize::BITS - len.leading_zeros()).div_ceil(8) as usize };
+    let len_len = if len < 0x80 {
+        1
+    } else {
+        1 + (usize::BITS - len.leading_zeros()).div_ceil(8) as usize
+    };
     len.saturating_add(1 + len_len)
 }
 
@@ -322,7 +345,10 @@ fn read_int(c: &[u8]) -> Result<i128, Error> {
     if bytes.len() > 9 {
         return Err(Error::Integer);
     }
-    asn1::Integer::from_bytes(bytes).ok().and_then(|n| n.to_i128()).ok_or(Error::Integer)
+    asn1::Integer::from_bytes(bytes)
+        .ok()
+        .and_then(|n| n.to_i128())
+        .ok_or(Error::Integer)
 }
 
 /// The minimal two's complement content of an integer.
@@ -345,7 +371,9 @@ pub fn message_len(b: &[u8]) -> Result<Option<usize>, Error> {
     {
         return Err(Error::UnexpectedTag(t));
     }
-    let Some(h) = Header::parse(b)? else { return Ok(None) };
+    let Some(h) = Header::parse(b)? else {
+        return Ok(None);
+    };
     if h.total_len() > MAX_MESSAGE {
         return Err(Error::TooLong(h.total_len()));
     }
@@ -387,7 +415,13 @@ impl Element {
         let h = Header::parse(b)?.ok_or(Error::Truncated)?;
         let content = b.get(h.header_len..h.total_len()).ok_or(Error::Truncated)?;
         if h.tag & tag::CONSTRUCTED == 0 {
-            return Ok((Element::Primitive { tag: h.tag, content: content.to_vec() }, h.total_len()));
+            return Ok((
+                Element::Primitive {
+                    tag: h.tag,
+                    content: content.to_vec(),
+                },
+                h.total_len(),
+            ));
         }
         if depth > MAX_DEPTH {
             return Err(Error::TooDeep);
@@ -399,7 +433,13 @@ impl Element {
             children.push(child);
             rest = &rest[used..];
         }
-        Ok((Element::Constructed { tag: h.tag, children }, h.total_len()))
+        Ok((
+            Element::Constructed {
+                tag: h.tag,
+                children,
+            },
+            h.total_len(),
+        ))
     }
 
     fn write_at(&self, out: &mut Vec<u8>, depth: usize) -> Result<(), Error> {
@@ -546,7 +586,11 @@ impl Wire for Oid {
             if fresh && b == 0x80 {
                 return Err(Error::Oid);
             }
-            let limit = if arcs.is_empty() { u64::from(u32::MAX) + 80 } else { u64::from(u32::MAX) };
+            let limit = if arcs.is_empty() {
+                u64::from(u32::MAX) + 80
+            } else {
+                u64::from(u32::MAX)
+            };
             v = (v << 7) | u64::from(b & 0x7f);
             if v > limit {
                 return Err(Error::Oid);
@@ -720,7 +764,13 @@ impl Value {
     /// no Counter64 and no exception values.
     pub fn allowed_in(&self, version: Version) -> bool {
         version == Version::V2c
-            || !matches!(self, Value::Counter64(_) | Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView)
+            || !matches!(
+                self,
+                Value::Counter64(_)
+                    | Value::NoSuchObject
+                    | Value::NoSuchInstance
+                    | Value::EndOfMibView
+            )
     }
 
     /// Reads a value from an element's tag and content. Content longer
@@ -731,11 +781,23 @@ impl Value {
         }
         let unsigned = |max: i128| -> Result<i128, Error> {
             let v = read_int(c)?;
-            if (0..=max).contains(&v) { Ok(v) } else { Err(Error::Integer) }
+            if (0..=max).contains(&v) {
+                Ok(v)
+            } else {
+                Err(Error::Integer)
+            }
         };
-        let empty = |v: Value| if c.is_empty() { Ok(v) } else { Err(Error::Value(t)) };
+        let empty = |v: Value| {
+            if c.is_empty() {
+                Ok(v)
+            } else {
+                Err(Error::Value(t))
+            }
+        };
         Ok(match t {
-            tag::INTEGER => Value::Integer(i32::try_from(read_int(c)?).map_err(|_| Error::Integer)?),
+            tag::INTEGER => {
+                Value::Integer(i32::try_from(read_int(c)?).map_err(|_| Error::Integer)?)
+            }
             tag::OCTET_STRING => Value::OctetString(c.to_vec()),
             tag::NULL => empty(Value::Null)?,
             tag::OBJECT_IDENTIFIER => Value::ObjectIdentifier(Oid::parse(c)?),
@@ -760,7 +822,9 @@ impl Value {
             Value::Null | Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView => 0,
             Value::ObjectIdentifier(o) => o.content_len(),
             Value::IpAddress(_) => 4,
-            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => asn1::minimal_twos(&i128::from(*v).to_be_bytes()).len(),
+            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => {
+                asn1::minimal_twos(&i128::from(*v).to_be_bytes()).len()
+            }
             Value::Counter64(v) => asn1::minimal_twos(&i128::from(*v).to_be_bytes()).len(),
         }
     }
@@ -771,14 +835,18 @@ impl Value {
         match self {
             Value::Integer(v) => write_int(out, t, (*v).into()),
             Value::OctetString(b) | Value::Opaque(b) => write_tlv(out, t, b),
-            Value::Null | Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView => write_tlv(out, t, &[]),
+            Value::Null | Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView => {
+                write_tlv(out, t, &[])
+            }
             Value::ObjectIdentifier(o) => {
                 out.push(t);
                 asn1::encode_length(o.content_len(), out);
                 o.write(out)?;
             }
             Value::IpAddress(a) => write_tlv(out, t, a),
-            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => write_int(out, t, (*v).into()),
+            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => {
+                write_int(out, t, (*v).into())
+            }
             Value::Counter64(v) => write_int(out, t, (*v).into()),
         }
         Ok(())
@@ -803,7 +871,10 @@ impl VarBind {
     /// A binding of `name` to [`Value::Null`], as a Get, GetNext or
     /// GetBulk request carries.
     pub fn null(name: Oid) -> VarBind {
-        VarBind { name, value: Value::Null }
+        VarBind {
+            name,
+            value: Value::Null,
+        }
     }
 
     /// How many bytes the binding's content takes: its name's element
@@ -940,7 +1011,10 @@ impl ErrorStatus {
 
     /// The status for a number.
     pub fn from_code(c: i32) -> ErrorStatus {
-        usize::try_from(c).ok().and_then(|i| STATUSES.get(i).copied()).unwrap_or(ErrorStatus::Other(c))
+        usize::try_from(c)
+            .ok()
+            .and_then(|i| STATUSES.get(i).copied())
+            .unwrap_or(ErrorStatus::Other(c))
     }
 
     /// The status a version 1 response carries in place of this one, as
@@ -952,7 +1026,9 @@ impl ErrorStatus {
         match named {
             NoError | TooBig | NoSuchName | BadValue | ReadOnly | GenErr => named,
             WrongValue | WrongEncoding | WrongType | WrongLength | InconsistentValue => BadValue,
-            NoAccess | NotWritable | NoCreation | InconsistentName | AuthorizationError => NoSuchName,
+            NoAccess | NotWritable | NoCreation | InconsistentName | AuthorizationError => {
+                NoSuchName
+            }
             ResourceUnavailable | CommitFailed | UndoFailed | Other(_) => GenErr,
         }
     }
@@ -1040,7 +1116,12 @@ pub struct BasicPdu {
 impl BasicPdu {
     /// A body with no error and these bindings.
     pub fn new(request_id: i32, bindings: Vec<VarBind>) -> BasicPdu {
-        BasicPdu { request_id, error_status: ErrorStatus::NoError, error_index: 0, bindings }
+        BasicPdu {
+            request_id,
+            error_status: ErrorStatus::NoError,
+            error_index: 0,
+            bindings,
+        }
     }
 }
 
@@ -1066,7 +1147,9 @@ impl BulkPdu {
     /// to that many rounds of one binding per repeater; how many rounds
     /// fit in a message is the agent's call.
     pub fn split(&self) -> (&[VarBind], &[VarBind], usize) {
-        let n = usize::try_from(self.non_repeaters.max(0)).unwrap_or(0).min(self.bindings.len());
+        let n = usize::try_from(self.non_repeaters.max(0))
+            .unwrap_or(0)
+            .min(self.bindings.len());
         let m = usize::try_from(self.max_repetitions.max(0)).unwrap_or(0);
         let (non, rep) = self.bindings.split_at(n);
         (non, rep, m)
@@ -1181,24 +1264,34 @@ impl Pdu {
         match self {
             Pdu::Get(_) | Pdu::GetNext(_) | Pdu::Response(_) | Pdu::Set(_) => true,
             Pdu::TrapV1(_) => version == Version::V1,
-            Pdu::GetBulk(_) | Pdu::Inform(_) | Pdu::TrapV2(_) | Pdu::Report(_) => version == Version::V2c,
+            Pdu::GetBulk(_) | Pdu::Inform(_) | Pdu::TrapV2(_) | Pdu::Report(_) => {
+                version == Version::V2c
+            }
         }
     }
 
     /// Whether this PDU asks for a Response: Get, GetNext, Set, GetBulk
     /// and Inform.
     pub fn is_confirmed(&self) -> bool {
-        matches!(self, Pdu::Get(_) | Pdu::GetNext(_) | Pdu::Set(_) | Pdu::GetBulk(_) | Pdu::Inform(_))
+        matches!(
+            self,
+            Pdu::Get(_) | Pdu::GetNext(_) | Pdu::Set(_) | Pdu::GetBulk(_) | Pdu::Inform(_)
+        )
     }
 
     fn parse(t: u8, c: &[u8]) -> Result<Pdu, Error> {
         let mut r = Reader::new(c);
         if t == tag::TRAP_V1 {
             let enterprise = Oid::parse(r.expect(tag::OBJECT_IDENTIFIER)?)?;
-            let agent_addr = r.expect(tag::IP_ADDRESS)?.try_into().map_err(|_| Error::Value(tag::IP_ADDRESS))?;
+            let agent_addr = r
+                .expect(tag::IP_ADDRESS)?
+                .try_into()
+                .map_err(|_| Error::Value(tag::IP_ADDRESS))?;
             let generic_trap = GenericTrap::from_code(r.int()?);
             let specific_trap = r.int()?;
-            let Value::TimeTicks(time_stamp) = Value::from_ber(tag::TIME_TICKS, r.expect(tag::TIME_TICKS)?)? else {
+            let Value::TimeTicks(time_stamp) =
+                Value::from_ber(tag::TIME_TICKS, r.expect(tag::TIME_TICKS)?)?
+            else {
                 return Err(Error::Value(tag::TIME_TICKS));
             };
             let bindings = parse_bindings(r.expect(tag::SEQUENCE)?)?;
@@ -1219,9 +1312,19 @@ impl Pdu {
         let bindings = parse_bindings(r.expect(tag::SEQUENCE)?)?;
         r.end()?;
         if t == tag::GET_BULK_REQUEST {
-            return Ok(Pdu::GetBulk(BulkPdu { request_id, non_repeaters: a, max_repetitions: b, bindings }));
+            return Ok(Pdu::GetBulk(BulkPdu {
+                request_id,
+                non_repeaters: a,
+                max_repetitions: b,
+                bindings,
+            }));
         }
-        let p = BasicPdu { request_id, error_status: ErrorStatus::from_code(a), error_index: b, bindings };
+        let p = BasicPdu {
+            request_id,
+            error_status: ErrorStatus::from_code(a),
+            error_index: b,
+            bindings,
+        };
         Ok(match t {
             tag::GET_REQUEST => Pdu::Get(p),
             tag::GET_NEXT_REQUEST => Pdu::GetNext(p),
@@ -1328,10 +1431,14 @@ impl Message {
     /// it to drop rounds of bindings until the response fits the size it
     /// sends.
     pub fn encoded_len(&self) -> usize {
-        let list = self.pdu.bindings().iter().fold(0usize, |acc, b| acc.saturating_add(tlv_len(b.content_len())));
+        let list = self.pdu.bindings().iter().fold(0usize, |acc, b| {
+            acc.saturating_add(tlv_len(b.content_len()))
+        });
         let pdu = self.pdu.head_len().saturating_add(tlv_len(list));
         // The version field is always 3 bytes: tag, length and 0 or 1.
-        let content = tlv_len(self.community.len()).saturating_add(tlv_len(pdu)).saturating_add(3);
+        let content = tlv_len(self.community.len())
+            .saturating_add(tlv_len(pdu))
+            .saturating_add(3);
         tlv_len(content)
     }
 
@@ -1339,7 +1446,12 @@ impl Message {
     /// message's version (see [`Pdu::allowed_in`] and
     /// [`Value::allowed_in`]).
     pub fn follows_version(&self) -> bool {
-        self.pdu.allowed_in(self.version) && self.pdu.bindings().iter().all(|b| b.value.allowed_in(self.version))
+        self.pdu.allowed_in(self.version)
+            && self
+                .pdu
+                .bindings()
+                .iter()
+                .all(|b| b.value.allowed_in(self.version))
     }
 
     /// The Response that answers this request with `bindings`, with the
@@ -1365,7 +1477,9 @@ impl Message {
             return None;
         }
         if self.version == Version::V1
-            && let Some(i) = bindings.iter().position(|b| !b.value.allowed_in(Version::V1))
+            && let Some(i) = bindings
+                .iter()
+                .position(|b| !b.value.allowed_in(Version::V1))
         {
             let index = i32::try_from(i + 1).unwrap_or(i32::MAX);
             return self.error_response(ErrorStatus::NoSuchName, index);
@@ -1390,15 +1504,28 @@ impl Message {
         if !self.pdu.is_confirmed() || !self.follows_version() {
             return None;
         }
-        let status = if self.version == Version::V1 { status.to_v1() } else { ErrorStatus::from_code(status.code()) };
+        let status = if self.version == Version::V1 {
+            status.to_v1()
+        } else {
+            ErrorStatus::from_code(status.code())
+        };
         let too_big = status == ErrorStatus::TooBig;
         let index = if too_big { 0 } else { index };
-        let bindings = if too_big && self.version == Version::V2c { Vec::new() } else { self.pdu.bindings().to_vec() };
+        let bindings = if too_big && self.version == Version::V2c {
+            Vec::new()
+        } else {
+            self.pdu.bindings().to_vec()
+        };
         let request_id = self.pdu.request_id()?;
         Some(Message {
             version: self.version,
             community: self.community.clone(),
-            pdu: Pdu::Response(BasicPdu { request_id, error_status: status, error_index: index, bindings }),
+            pdu: Pdu::Response(BasicPdu {
+                request_id,
+                error_status: status,
+                error_index: index,
+                bindings,
+            }),
         })
     }
 
@@ -1414,14 +1541,24 @@ impl Message {
         inform: bool,
     ) -> Message {
         let mut all = Vec::with_capacity(bindings.len() + 2);
-        all.push(VarBind::new(Oid(SYS_UP_TIME_0.to_vec()), Value::TimeTicks(uptime)));
-        all.push(VarBind::new(Oid(SNMP_TRAP_OID_0.to_vec()), Value::ObjectIdentifier(trap)));
+        all.push(VarBind::new(
+            Oid(SYS_UP_TIME_0.to_vec()),
+            Value::TimeTicks(uptime),
+        ));
+        all.push(VarBind::new(
+            Oid(SNMP_TRAP_OID_0.to_vec()),
+            Value::ObjectIdentifier(trap),
+        ));
         all.extend(bindings);
         let body = BasicPdu::new(request_id, all);
         Message {
             version: Version::V2c,
             community: community.to_vec(),
-            pdu: if inform { Pdu::Inform(body) } else { Pdu::TrapV2(body) },
+            pdu: if inform {
+                Pdu::Inform(body)
+            } else {
+                Pdu::TrapV2(body)
+            },
         }
     }
 
@@ -1522,10 +1659,14 @@ impl Prefixed for Message {
     const NAME: &'static str = "SNMP/TCP";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_MESSAGE }
+    fn default_limit() -> Self::Limit {
+        MAX_MESSAGE
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_MESSAGE) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_MESSAGE)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -1534,7 +1675,10 @@ impl Prefixed for Message {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         let Some(length) = message_len(input)? else {
             return Ok(None);
@@ -1542,10 +1686,11 @@ impl Prefixed for Message {
         if length > limit {
             return Err(Error::TooLong(length));
         }
-        Ok(input.get(..length).map(|bytes| (Message::parse(bytes), length)))
+        Ok(input
+            .get(..length)
+            .map(|bytes| (Message::parse(bytes), length)))
     }
 }
-
 
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]
@@ -1563,8 +1708,12 @@ pub mod harness {
             assert_eq!(Message::parse(&b), Ok(m.clone()));
             // Answers to it follow its version and are no longer than it,
             // so they are written whole and read back the same.
-            for r in
-                [m.response(m.pdu.bindings().to_vec()), m.error_response(ErrorStatus::GenErr, 1)].into_iter().flatten()
+            for r in [
+                m.response(m.pdu.bindings().to_vec()),
+                m.error_response(ErrorStatus::GenErr, 1),
+            ]
+            .into_iter()
+            .flatten()
             {
                 assert!(m.follows_version() && r.follows_version());
                 let b = r.to_bytes().unwrap();
@@ -1595,13 +1744,11 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::{check_message, check_scalars};
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, pump,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn oid(s: &str) -> Oid {
@@ -1610,17 +1757,17 @@ mod tests {
 
     /// The version 2c GetRequest for sysDescr.0 from the module example.
     const GET_SYS_DESCR: [u8; 43] = [
-        0x30, 0x29, 0x02, 0x01, 0x01, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa0, 0x1c, 0x02, 0x04, 0x12,
-        0x34, 0x56, 0x78, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x0e, 0x30, 0x0c, 0x06, 0x08, 0x2b, 0x06, 0x01,
-        0x02, 0x01, 0x01, 0x01, 0x00, 0x05, 0x00,
+        0x30, 0x29, 0x02, 0x01, 0x01, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa0, 0x1c,
+        0x02, 0x04, 0x12, 0x34, 0x56, 0x78, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x0e, 0x30,
+        0x0c, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00, 0x05, 0x00,
     ];
 
     /// A version 1 coldStart trap from 10.0.0.1, enterprise
     /// 1.3.6.1.4.1.9, at tick 4242, community "public".
     const TRAP_COLD_START: [u8; 41] = [
-        0x30, 0x27, 0x02, 0x01, 0x00, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa4, 0x1a, 0x06, 0x06, 0x2b,
-        0x06, 0x01, 0x04, 0x01, 0x09, 0x40, 0x04, 10, 0, 0, 1, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x43, 0x02, 0x10,
-        0x92, 0x30, 0x00,
+        0x30, 0x27, 0x02, 0x01, 0x00, 0x04, 0x06, b'p', b'u', b'b', b'l', b'i', b'c', 0xa4, 0x1a,
+        0x06, 0x06, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x09, 0x40, 0x04, 10, 0, 0, 1, 0x02, 0x01, 0x00,
+        0x02, 0x01, 0x00, 0x43, 0x02, 0x10, 0x92, 0x30, 0x00,
     ];
 
     fn every_value() -> Vec<Value> {
@@ -1651,14 +1798,34 @@ mod tests {
             .enumerate()
             .map(|(i, v)| VarBind::new(oid("1.3.6.1.2.1.1").child(i as u32).unwrap(), v))
             .collect();
-        let basic =
-            BasicPdu { request_id: -5, error_status: ErrorStatus::WrongType, error_index: 3, bindings: binds.clone() };
-        let v1binds: Vec<VarBind> = binds.iter().filter(|b| b.value.allowed_in(Version::V1)).cloned().collect();
+        let basic = BasicPdu {
+            request_id: -5,
+            error_status: ErrorStatus::WrongType,
+            error_index: 3,
+            bindings: binds.clone(),
+        };
+        let v1binds: Vec<VarBind> = binds
+            .iter()
+            .filter(|b| b.value.allowed_in(Version::V1))
+            .cloned()
+            .collect();
         vec![
             Message::parse(&GET_SYS_DESCR).unwrap(),
-            Message { version: Version::V1, community: b"private".to_vec(), pdu: Pdu::Get(BasicPdu::new(1, vec![])) },
-            Message { version: Version::V2c, community: vec![], pdu: Pdu::GetNext(basic.clone()) },
-            Message { version: Version::V2c, community: b"c".to_vec(), pdu: Pdu::Response(basic.clone()) },
+            Message {
+                version: Version::V1,
+                community: b"private".to_vec(),
+                pdu: Pdu::Get(BasicPdu::new(1, vec![])),
+            },
+            Message {
+                version: Version::V2c,
+                community: vec![],
+                pdu: Pdu::GetNext(basic.clone()),
+            },
+            Message {
+                version: Version::V2c,
+                community: b"c".to_vec(),
+                pdu: Pdu::Response(basic.clone()),
+            },
             Message {
                 version: Version::V1,
                 community: b"c".to_vec(),
@@ -1686,9 +1853,24 @@ mod tests {
                     bindings: binds.clone(),
                 }),
             },
-            Message { version: Version::V2c, community: b"x".to_vec(), pdu: Pdu::Inform(basic.clone()) },
-            Message::trap_v2(b"public", 77, 100, oid("1.3.6.1.6.3.1.1.5.1"), vec![], false),
-            Message { version: Version::V2c, community: b"x".to_vec(), pdu: Pdu::Report(basic) },
+            Message {
+                version: Version::V2c,
+                community: b"x".to_vec(),
+                pdu: Pdu::Inform(basic.clone()),
+            },
+            Message::trap_v2(
+                b"public",
+                77,
+                100,
+                oid("1.3.6.1.6.3.1.1.5.1"),
+                vec![],
+                false,
+            ),
+            Message {
+                version: Version::V2c,
+                community: b"x".to_vec(),
+                pdu: Pdu::Report(basic),
+            },
         ]
     }
 
@@ -1704,7 +1886,10 @@ mod tests {
             (-128, &[0x80]),
             (-129, &[0xff, 0x7f]),
             (u32::MAX as i128, &[0x00, 0xff, 0xff, 0xff, 0xff]),
-            (u64::MAX as i128, &[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            (
+                u64::MAX as i128,
+                &[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ),
         ];
         for (v, bytes) in cases {
             assert_eq!(int_content(v), bytes, "{v}");
@@ -1781,12 +1966,19 @@ mod tests {
     #[test]
     fn module_example_reply() {
         let request = Message::parse(&GET_SYS_DESCR).unwrap();
-        let answers = vec![VarBind::new(oid("1.3.6.1.2.1.1.1.0"), Value::OctetString(b"pump controller".to_vec()))];
+        let answers = vec![VarBind::new(
+            oid("1.3.6.1.2.1.1.1.0"),
+            Value::OctetString(b"pump controller".to_vec()),
+        )];
         let reply = request.response(answers).unwrap().to_bytes().unwrap();
         let mut want = vec![0x30, 0x38, 0x02, 0x01, 0x01, 0x04, 0x06];
         want.extend_from_slice(b"public");
-        want.extend_from_slice(&[0xa2, 0x2b, 0x02, 0x04, 0x12, 0x34, 0x56, 0x78, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00]);
-        want.extend_from_slice(&[0x30, 0x1d, 0x30, 0x1b, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00]);
+        want.extend_from_slice(&[
+            0xa2, 0x2b, 0x02, 0x04, 0x12, 0x34, 0x56, 0x78, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00,
+        ]);
+        want.extend_from_slice(&[
+            0x30, 0x1d, 0x30, 0x1b, 0x06, 0x08, 0x2b, 0x06, 0x01, 0x02, 0x01, 0x01, 0x01, 0x00,
+        ]);
         want.extend_from_slice(&[0x04, 0x0f]);
         want.extend_from_slice(b"pump controller");
         assert_eq!(reply, want);
@@ -1799,8 +1991,14 @@ mod tests {
             v.write_fields(&mut out).unwrap();
             out
         };
-        assert_eq!(enc(&Value::Counter32(u32::MAX)), [0x41, 0x05, 0x00, 0xff, 0xff, 0xff, 0xff]);
-        assert_eq!(enc(&Value::IpAddress([10, 1, 2, 3])), [0x40, 0x04, 10, 1, 2, 3]);
+        assert_eq!(
+            enc(&Value::Counter32(u32::MAX)),
+            [0x41, 0x05, 0x00, 0xff, 0xff, 0xff, 0xff]
+        );
+        assert_eq!(
+            enc(&Value::IpAddress([10, 1, 2, 3])),
+            [0x40, 0x04, 10, 1, 2, 3]
+        );
         assert_eq!(enc(&Value::NoSuchObject), [0x80, 0x00]);
         assert_eq!(enc(&Value::NoSuchInstance), [0x81, 0x00]);
         assert_eq!(enc(&Value::EndOfMibView), [0x82, 0x00]);
@@ -1812,13 +2010,34 @@ mod tests {
             assert_eq!(Value::from_ber(h.tag, &b[h.header_len..]), Ok(v));
         }
         // Wrong sizes and ranges.
-        assert_eq!(Value::from_ber(tag::NULL, &[0]), Err(Error::Value(tag::NULL)));
-        assert_eq!(Value::from_ber(tag::END_OF_MIB_VIEW, &[0]), Err(Error::Value(tag::END_OF_MIB_VIEW)));
-        assert_eq!(Value::from_ber(tag::IP_ADDRESS, &[1, 2, 3]), Err(Error::Value(tag::IP_ADDRESS)));
-        assert_eq!(Value::from_ber(tag::COUNTER32, &[0xff]), Err(Error::Integer));
-        assert_eq!(Value::from_ber(tag::GAUGE32, &[1, 0, 0, 0, 0]), Err(Error::Integer));
-        assert_eq!(Value::from_ber(tag::INTEGER, &[0, 0x80, 0, 0, 0]), Err(Error::Integer));
-        assert_eq!(Value::from_ber(tag::COUNTER64, &[1, 0, 0, 0, 0, 0, 0, 0, 0]), Err(Error::Integer));
+        assert_eq!(
+            Value::from_ber(tag::NULL, &[0]),
+            Err(Error::Value(tag::NULL))
+        );
+        assert_eq!(
+            Value::from_ber(tag::END_OF_MIB_VIEW, &[0]),
+            Err(Error::Value(tag::END_OF_MIB_VIEW))
+        );
+        assert_eq!(
+            Value::from_ber(tag::IP_ADDRESS, &[1, 2, 3]),
+            Err(Error::Value(tag::IP_ADDRESS))
+        );
+        assert_eq!(
+            Value::from_ber(tag::COUNTER32, &[0xff]),
+            Err(Error::Integer)
+        );
+        assert_eq!(
+            Value::from_ber(tag::GAUGE32, &[1, 0, 0, 0, 0]),
+            Err(Error::Integer)
+        );
+        assert_eq!(
+            Value::from_ber(tag::INTEGER, &[0, 0x80, 0, 0, 0]),
+            Err(Error::Integer)
+        );
+        assert_eq!(
+            Value::from_ber(tag::COUNTER64, &[1, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(Error::Integer)
+        );
         assert_eq!(Value::from_ber(0x45, &[]), Err(Error::UnexpectedTag(0x45)));
         assert_eq!(Value::from_ber(0x24, &[]), Err(Error::UnexpectedTag(0x24)));
     }
@@ -1856,18 +2075,32 @@ mod tests {
         };
         let (non, rep, m) = req.split();
         assert_eq!((non.len(), rep.len(), m), (1, 2, 2));
-        let msg = Message { version: Version::V2c, community: b"public".to_vec(), pdu: Pdu::GetBulk(req.clone()) };
+        let msg = Message {
+            version: Version::V2c,
+            community: b"public".to_vec(),
+            pdu: Pdu::GetBulk(req.clone()),
+        };
         assert_eq!(Message::parse(&msg.to_bytes().unwrap()), Ok(msg.clone()));
         assert!(msg.follows_version());
         assert_eq!(msg.to_bytes().unwrap()[13], tag::GET_BULK_REQUEST);
         // Out-of-range fields count as 0 or all.
-        let odd = BulkPdu { non_repeaters: 9, max_repetitions: -4, ..req.clone() };
+        let odd = BulkPdu {
+            non_repeaters: 9,
+            max_repetitions: -4,
+            ..req.clone()
+        };
         assert_eq!(odd.split().0.len(), 3);
         assert_eq!(odd.split().2, 0);
-        let neg = BulkPdu { non_repeaters: -1, ..req };
+        let neg = BulkPdu {
+            non_repeaters: -1,
+            ..req
+        };
         assert_eq!(neg.split().0.len(), 0);
         // GetBulk in version 1 is read but breaks the version, and gets no response.
-        let v1 = Message { version: Version::V1, ..msg };
+        let v1 = Message {
+            version: Version::V1,
+            ..msg
+        };
         assert!(!v1.follows_version());
         assert_eq!(Message::parse(&v1.to_bytes().unwrap()), Ok(v1.clone()));
         assert_eq!(v1.response(vec![]), None);
@@ -1880,11 +2113,20 @@ mod tests {
             5,
             900,
             oid("1.3.6.1.6.3.1.1.5.3"),
-            vec![VarBind::new(oid("1.3.6.1.2.1.2.2.1.1.2"), Value::Integer(2))],
+            vec![VarBind::new(
+                oid("1.3.6.1.2.1.2.2.1.1.2"),
+                Value::Integer(2),
+            )],
             false,
         );
         let b = m.pdu.bindings();
-        assert_eq!(b[0], VarBind::new(Oid::from_arcs(SYS_UP_TIME_0).unwrap(), Value::TimeTicks(900)));
+        assert_eq!(
+            b[0],
+            VarBind::new(
+                Oid::from_arcs(SYS_UP_TIME_0).unwrap(),
+                Value::TimeTicks(900)
+            )
+        );
         assert_eq!(b[1].name.arcs(), SNMP_TRAP_OID_0);
         assert_eq!(b.len(), 3);
         assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m.clone()));
@@ -1901,17 +2143,30 @@ mod tests {
         let get = Message::parse(&GET_SYS_DESCR).unwrap();
         let err = get.error_response(ErrorStatus::NoAccess, 1).unwrap();
         let Pdu::Response(p) = &err.pdu else { panic!() };
-        assert_eq!((p.error_status, p.error_index, p.request_id), (ErrorStatus::NoAccess, 1, 0x12345678));
+        assert_eq!(
+            (p.error_status, p.error_index, p.request_id),
+            (ErrorStatus::NoAccess, 1, 0x12345678)
+        );
         assert_eq!(p.bindings, get.pdu.bindings());
         let big = get.error_response(ErrorStatus::TooBig, 0).unwrap();
         assert!(big.pdu.bindings().is_empty());
         // Version 1 maps version 2 statuses and refuses version 2 values.
-        let v1 = Message { version: Version::V1, ..get.clone() };
-        let Pdu::Response(p) = v1.error_response(ErrorStatus::NotWritable, 1).unwrap().pdu else { panic!() };
+        let v1 = Message {
+            version: Version::V1,
+            ..get.clone()
+        };
+        let Pdu::Response(p) = v1.error_response(ErrorStatus::NotWritable, 1).unwrap().pdu else {
+            panic!()
+        };
         assert_eq!(p.error_status, ErrorStatus::NoSuchName);
         let answers = vec![VarBind::new(oid("1.3.6.1.2.1.1.1.0"), Value::NoSuchObject)];
-        let Pdu::Response(p) = v1.response(answers.clone()).unwrap().pdu else { panic!() };
-        assert_eq!((p.error_status, p.error_index), (ErrorStatus::NoSuchName, 1));
+        let Pdu::Response(p) = v1.response(answers.clone()).unwrap().pdu else {
+            panic!()
+        };
+        assert_eq!(
+            (p.error_status, p.error_index),
+            (ErrorStatus::NoSuchName, 1)
+        );
         assert_eq!(p.bindings, get.pdu.bindings());
         let ok = get.response(answers.clone()).unwrap();
         assert!(ok.follows_version());
@@ -1930,7 +2185,10 @@ mod tests {
         assert_eq!(ErrorStatus::from_code(18), ErrorStatus::InconsistentName);
         assert_eq!(ErrorStatus::WrongLength.to_v1(), ErrorStatus::BadValue);
         assert_eq!(ErrorStatus::CommitFailed.to_v1(), ErrorStatus::GenErr);
-        assert_eq!(ErrorStatus::AuthorizationError.to_v1(), ErrorStatus::NoSuchName);
+        assert_eq!(
+            ErrorStatus::AuthorizationError.to_v1(),
+            ErrorStatus::NoSuchName
+        );
         assert_eq!(ErrorStatus::ReadOnly.to_v1(), ErrorStatus::ReadOnly);
         assert_eq!(ErrorStatus::Other(99).to_v1(), ErrorStatus::GenErr);
         for c in 0..19 {
@@ -1953,7 +2211,12 @@ mod tests {
         for m in samples() {
             let b = m.to_bytes().unwrap();
             for n in 0..b.len() {
-                assert_eq!(Message::parse(&b[..n]), Err(Error::Truncated), "{n} of {}", b.len());
+                assert_eq!(
+                    Message::parse(&b[..n]),
+                    Err(Error::Truncated),
+                    "{n} of {}",
+                    b.len()
+                );
                 assert_eq!(Element::parse(&b[..n]), Err(Error::Truncated));
                 let len = message_len(&b[..n]).unwrap();
                 assert!(len.is_none() || len == Some(b.len()));
@@ -1977,7 +2240,10 @@ mod tests {
         assert_eq!(p(&inner), Err(Error::TrailingBytes));
         // Not a sequence, and wrong tags inside.
         assert_eq!(p(&[0x04, 0x00]), Err(Error::UnexpectedTag(0x04)));
-        assert_eq!(p(&[0x30, 0x03, 0x04, 0x01, 0x00]), Err(Error::UnexpectedTag(0x04)));
+        assert_eq!(
+            p(&[0x30, 0x03, 0x04, 0x01, 0x00]),
+            Err(Error::UnexpectedTag(0x04))
+        );
         let mut pdu = GET_SYS_DESCR;
         pdu[13] = 0xa9;
         assert_eq!(p(&pdu), Err(Error::UnexpectedTag(0xa9)));
@@ -1987,12 +2253,25 @@ mod tests {
         assert_eq!(p(&[0x30, 0x80, 0x00, 0x00]), Err(Error::Length));
         assert_eq!(p(&[0x30, 0xff, 0, 0]), Err(Error::Length));
         assert_eq!(p(&[0x30, 0x85, 0, 0, 0, 0, 1]), Err(Error::Truncated));
-        assert_eq!(p(&[0x30, 0x89, 1, 0, 0, 0, 0, 0, 0, 0, 0]), Err(Error::TooLong(usize::MAX)));
-        assert_eq!(p(&[0x30, 0x83, 0x01, 0x00, 0x00]), Err(Error::TooLong(0x10000)));
-        assert_eq!(p(&[0x30, 0x82, 0xff, 0xff]), Err(Error::TooLong(MAX_MESSAGE + 4)));
+        assert_eq!(
+            p(&[0x30, 0x89, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Err(Error::TooLong(usize::MAX))
+        );
+        assert_eq!(
+            p(&[0x30, 0x83, 0x01, 0x00, 0x00]),
+            Err(Error::TooLong(0x10000))
+        );
+        assert_eq!(
+            p(&[0x30, 0x82, 0xff, 0xff]),
+            Err(Error::TooLong(MAX_MESSAGE + 4))
+        );
         assert_eq!(
             Header::parse(&[0x04, 0x84, 0, 0, 0xff, 0xff]),
-            Ok(Some(Header { tag: 4, header_len: 6, content_len: 0xffff }))
+            Ok(Some(Header {
+                tag: 4,
+                header_len: 6,
+                content_len: 0xffff
+            }))
         );
         // Long-form lengths that are not minimal are still read.
         let mut long = vec![0x30, 0x81, 0x29];
@@ -2002,7 +2281,10 @@ mod tests {
         let mut v3 = GET_SYS_DESCR;
         v3[4] = 3;
         assert_eq!(p(&v3), Err(Error::Unsupported(3)));
-        assert_eq!(p(&[0x30, 0x07, 0x02, 0x05, 0x01, 0, 0, 0, 0]), Err(Error::Integer));
+        assert_eq!(
+            p(&[0x30, 0x07, 0x02, 0x05, 0x01, 0, 0, 0, 0]),
+            Err(Error::Integer)
+        );
         assert_eq!(Version::from_code(2), Err(Error::Unsupported(2)));
         // Bad values inside a binding.
         let mut null = GET_SYS_DESCR;
@@ -2044,7 +2326,12 @@ mod tests {
         for e in all {
             assert!(!e.to_string().is_empty());
         }
-        for e in [Error::TooFewArcs, Error::TooManyArcs, Error::FirstArcs, Error::OidText] {
+        for e in [
+            Error::TooFewArcs,
+            Error::TooManyArcs,
+            Error::FirstArcs,
+            Error::OidText,
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -2058,25 +2345,66 @@ mod tests {
         assert_eq!(Element::parse(&deep), Err(Error::TooDeep));
         assert!(Element::parse(&deep[2..]).is_ok());
         // Writers refuse what the reader would.
-        let mut e = Element::Primitive { tag: 0x04, content: vec![] };
+        let mut e = Element::Primitive {
+            tag: 0x04,
+            content: vec![],
+        };
         for _ in 0..=MAX_DEPTH {
-            e = Element::Constructed { tag: 0x30, children: vec![e] };
+            e = Element::Constructed {
+                tag: 0x30,
+                children: vec![e],
+            };
         }
         assert_eq!(e.to_bytes(), Err(Error::Unwritable));
-        let Element::Constructed { children, .. } = e else { panic!() };
+        let Element::Constructed { children, .. } = e else {
+            panic!()
+        };
         let ok = children[0].to_bytes().unwrap();
         assert_eq!(Element::parse(&ok), Ok(children[0].clone()));
-        assert_eq!(Element::Primitive { tag: 0x30, content: vec![] }.to_bytes(), Err(Error::Unwritable));
-        assert_eq!(Element::Constructed { tag: 0x04, children: vec![] }.to_bytes(), Err(Error::Unwritable));
-        assert_eq!(Element::Primitive { tag: 0x1f, content: vec![] }.to_bytes(), Err(Error::Unwritable));
-        let huge = Element::Primitive { tag: 0x04, content: vec![0; MAX_MESSAGE + 1] };
+        assert_eq!(
+            Element::Primitive {
+                tag: 0x30,
+                content: vec![]
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Element::Constructed {
+                tag: 0x04,
+                children: vec![]
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Element::Primitive {
+                tag: 0x1f,
+                content: vec![]
+            }
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let huge = Element::Primitive {
+            tag: 0x04,
+            content: vec![0; MAX_MESSAGE + 1],
+        };
         assert_eq!(huge.to_bytes(), Err(Error::Unwritable));
         let wide = Element::Constructed {
             tag: 0x30,
-            children: vec![Element::Primitive { tag: 0x04, content: vec![0; 40_000] }; 2],
+            children: vec![
+                Element::Primitive {
+                    tag: 0x04,
+                    content: vec![0; 40_000]
+                };
+                2
+            ],
         };
         assert!(matches!(wide.to_bytes(), Err(Error::Unwritable)));
-        let fits = Element::Primitive { tag: 0x04, content: vec![7; MAX_MESSAGE] };
+        let fits = Element::Primitive {
+            tag: 0x04,
+            content: vec![7; MAX_MESSAGE],
+        };
         let b = fits.to_bytes().unwrap();
         assert_eq!(Element::parse(&b), Ok(fits));
     }
@@ -2085,13 +2413,20 @@ mod tests {
     fn too_big_responses() {
         // RFC 3416, section 4.2.1: error-index zero and no bindings.
         let get = Message::parse(&GET_SYS_DESCR).unwrap();
-        let Pdu::Response(p) = get.error_response(ErrorStatus::TooBig, 3).unwrap().pdu else { panic!() };
+        let Pdu::Response(p) = get.error_response(ErrorStatus::TooBig, 3).unwrap().pdu else {
+            panic!()
+        };
         assert_eq!((p.error_status, p.error_index), (ErrorStatus::TooBig, 0));
         assert!(p.bindings.is_empty());
         // RFC 1157, section 4.1.2: a GetResponse "of identical form" to the
         // request, error-index zero, so it carries the request's bindings.
-        let v1 = Message { version: Version::V1, ..get.clone() };
-        let Pdu::Response(p) = v1.error_response(ErrorStatus::TooBig, 3).unwrap().pdu else { panic!() };
+        let v1 = Message {
+            version: Version::V1,
+            ..get.clone()
+        };
+        let Pdu::Response(p) = v1.error_response(ErrorStatus::TooBig, 3).unwrap().pdu else {
+            panic!()
+        };
         assert_eq!((p.error_status, p.error_index), (ErrorStatus::TooBig, 0));
         assert_eq!(p.bindings, get.pdu.bindings());
     }
@@ -2126,17 +2461,27 @@ mod tests {
         // Hash agrees with Eq.
         use std::hash::BuildHasher;
         let rs = std::hash::RandomState::new();
-        assert_eq!(rs.hash_one(ErrorStatus::Other(5)), rs.hash_one(ErrorStatus::GenErr));
-        assert_eq!(rs.hash_one(GenericTrap::Other(6)), rs.hash_one(GenericTrap::EnterpriseSpecific));
+        assert_eq!(
+            rs.hash_one(ErrorStatus::Other(5)),
+            rs.hash_one(ErrorStatus::GenErr)
+        );
+        assert_eq!(
+            rs.hash_one(GenericTrap::Other(6)),
+            rs.hash_one(GenericTrap::EnterpriseSpecific)
+        );
         let get = Message::parse(&GET_SYS_DESCR).unwrap();
         let mut m = get.error_response(ErrorStatus::Other(5), 1).unwrap();
         assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m.clone()));
-        let Pdu::Response(p) = &mut m.pdu else { panic!() };
+        let Pdu::Response(p) = &mut m.pdu else {
+            panic!()
+        };
         p.error_status = ErrorStatus::Other(12);
         assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m.clone()));
         let trap = Message::parse(&TRAP_COLD_START).unwrap();
         let mut t = trap.clone();
-        let Pdu::TrapV1(body) = &mut t.pdu else { panic!() };
+        let Pdu::TrapV1(body) = &mut t.pdu else {
+            panic!()
+        };
         body.generic_trap = GenericTrap::Other(0);
         assert_eq!(t, trap);
         assert_eq!(Message::parse(&t.to_bytes().unwrap()), Ok(t.clone()));
@@ -2151,7 +2496,11 @@ mod tests {
 
     #[test]
     fn header_total_len_does_not_overflow() {
-        let h = Header { tag: 4, header_len: 6, content_len: usize::MAX };
+        let h = Header {
+            tag: 4,
+            header_len: 6,
+            content_len: usize::MAX,
+        };
         assert_eq!(h.total_len(), usize::MAX);
     }
 
@@ -2164,7 +2513,9 @@ mod tests {
         let trap = Message::parse(&TRAP_COLD_START).unwrap();
         assert_eq!(trap.pdu.basic(), None);
         let mut m = get.clone();
-        m.pdu.bindings_mut().push(VarBind::null(oid("1.3.6.1.2.1.1.5.0")));
+        m.pdu
+            .bindings_mut()
+            .push(VarBind::null(oid("1.3.6.1.2.1.1.5.0")));
         assert_eq!(m.pdu.bindings().len(), 2);
         let e = Element::parse(&GET_SYS_DESCR).unwrap();
         assert_eq!(e.tag(), tag::SEQUENCE);
@@ -2177,26 +2528,30 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_messages_in_linear_time() {
-        assert_linear("stream_takes_many_small_messages_in_linear_time", rounds(500000), |size| {
-            let count = size;
-            let bytes = [0x30, 0].repeat(count);
-            let mut stream = Stream::new(Frames::<Message>::new());
-            let mut got = 0;
-            pump(&mut stream, &bytes, |item| {
-                assert_eq!(item, Err(Error::Truncated));
-                got += 1;
-            })
-            .unwrap();
-            assert_eq!(got, count);
-            assert_eq!(stream.buffered(), 0);
-            let message = Message::parse(&GET_SYS_DESCR).unwrap();
-            assert_eq!(stream.push(&GET_SYS_DESCR), 43);
-            assert_eq!(stream.push(&GET_SYS_DESCR[..5]), 5);
-            assert_eq!(stream.next(), Some(Ok(Ok(message.clone()))));
-            assert_eq!(stream.push(&GET_SYS_DESCR[5..]), 38);
-            assert_eq!(stream.next(), Some(Ok(Ok(message))));
-            assert_eq!(stream.next(), None);
-        });
+        assert_linear(
+            "stream_takes_many_small_messages_in_linear_time",
+            rounds(500000),
+            |size| {
+                let count = size;
+                let bytes = [0x30, 0].repeat(count);
+                let mut stream = Stream::new(Frames::<Message>::new());
+                let mut got = 0;
+                pump(&mut stream, &bytes, |item| {
+                    assert_eq!(item, Err(Error::Truncated));
+                    got += 1;
+                })
+                .unwrap();
+                assert_eq!(got, count);
+                assert_eq!(stream.buffered(), 0);
+                let message = Message::parse(&GET_SYS_DESCR).unwrap();
+                assert_eq!(stream.push(&GET_SYS_DESCR), 43);
+                assert_eq!(stream.push(&GET_SYS_DESCR[..5]), 5);
+                assert_eq!(stream.next(), Some(Ok(Ok(message.clone()))));
+                assert_eq!(stream.push(&GET_SYS_DESCR[5..]), 38);
+                assert_eq!(stream.next(), Some(Ok(Ok(message))));
+                assert_eq!(stream.next(), None);
+            },
+        );
     }
 
     #[test]
@@ -2204,10 +2559,18 @@ mod tests {
         // A Set of two 40,000-byte values does not fit, and is refused
         // whole rather than sent as a Set of the first alone.
         let binds: Vec<VarBind> = (0..2)
-            .map(|i| VarBind::new(oid("1.3.6.1.2.1.1.5").child(i).unwrap(), Value::OctetString(vec![b'x'; 40_000])))
+            .map(|i| {
+                VarBind::new(
+                    oid("1.3.6.1.2.1.1.5").child(i).unwrap(),
+                    Value::OctetString(vec![b'x'; 40_000]),
+                )
+            })
             .collect();
-        let set =
-            Message { version: Version::V2c, community: b"private".to_vec(), pdu: Pdu::Set(BasicPdu::new(1, binds)) };
+        let set = Message {
+            version: Version::V2c,
+            community: b"private".to_vec(),
+            pdu: Pdu::Set(BasicPdu::new(1, binds)),
+        };
         let len = set.encoded_len();
         assert!(len > MAX_MESSAGE);
         assert_eq!(set.to_bytes(), Err(Error::Unwritable));
@@ -2218,13 +2581,23 @@ mod tests {
         let big = get.error_response(ErrorStatus::TooBig, 0).unwrap();
         assert_eq!(Message::parse(&big.to_bytes().unwrap()), Ok(big));
         // A value far too large for any message is measured, not copied.
-        let huge = get.response(vec![VarBind::new(oid("1.3.6"), Value::Opaque(vec![0; rounds(1 << 26)]))]).unwrap();
+        let huge = get
+            .response(vec![VarBind::new(
+                oid("1.3.6"),
+                Value::Opaque(vec![0; rounds(1 << 26)]),
+            )])
+            .unwrap();
         assert_eq!(huge.to_bytes(), Err(Error::Unwritable));
         // Right at the limit: with this request, a binding of 1.3.6 to n
         // bytes makes a message of n + 47 bytes.
         for extra in 0..40 {
             let n = MAX_MESSAGE - 40 - extra;
-            let m = get.response(vec![VarBind::new(oid("1.3.6"), Value::OctetString(vec![1; n]))]).unwrap();
+            let m = get
+                .response(vec![VarBind::new(
+                    oid("1.3.6"),
+                    Value::OctetString(vec![1; n]),
+                )])
+                .unwrap();
             match m.to_bytes() {
                 Ok(b) => {
                     assert!(extra >= 7);
@@ -2245,16 +2618,23 @@ mod tests {
     #[test]
     fn long_communities_are_kept() {
         // RFC 3584, snmpCommunityName: only the message size bounds a community.
-        let mut c = vec![0x30, 0x82, 0x01, 0x40, 0x02, 0x01, 0x01, 0x04, 0x82, 0x01, 0x2c];
+        let mut c = vec![
+            0x30, 0x82, 0x01, 0x40, 0x02, 0x01, 0x01, 0x04, 0x82, 0x01, 0x2c,
+        ];
         c.extend_from_slice(&[b'a'; 300]);
-        c.extend_from_slice(&[0xa0, 0x0b, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]);
+        c.extend_from_slice(&[
+            0xa0, 0x0b, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00,
+        ]);
         assert_eq!(c.len(), 4 + 0x140);
         let m = Message::parse(&c).unwrap();
         assert_eq!(m.community, [b'a'; 300]);
         assert_eq!(m.to_bytes().unwrap(), c);
         // Written whole, never cut, and refused only when the message is too long.
-        let m =
-            Message { version: Version::V2c, community: vec![b'b'; 60_000], pdu: Pdu::Get(BasicPdu::new(1, vec![])) };
+        let m = Message {
+            version: Version::V2c,
+            community: vec![b'b'; 60_000],
+            pdu: Pdu::Get(BasicPdu::new(1, vec![])),
+        };
         assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m));
         let m = Message {
             version: Version::V2c,
@@ -2281,18 +2661,36 @@ mod tests {
         assert_eq!(m.error_response(ErrorStatus::GenErr, 1), None);
         assert_eq!(m.response(m.pdu.bindings().to_vec()), None);
         // The same request in version 2c is answered.
-        let v2 = Message { version: Version::V2c, ..m };
-        assert!(v2.error_response(ErrorStatus::GenErr, 1).unwrap().follows_version());
+        let v2 = Message {
+            version: Version::V2c,
+            ..m
+        };
+        assert!(
+            v2.error_response(ErrorStatus::GenErr, 1)
+                .unwrap()
+                .follows_version()
+        );
     }
 
     #[test]
     fn value_content_is_bounded() {
         let over = vec![0; MAX_MESSAGE + 1];
-        for t in [tag::OCTET_STRING, tag::OPAQUE, tag::INTEGER, tag::OBJECT_IDENTIFIER] {
-            assert_eq!(Value::from_ber(t, &over), Err(Error::TooLong(MAX_MESSAGE + 1)));
+        for t in [
+            tag::OCTET_STRING,
+            tag::OPAQUE,
+            tag::INTEGER,
+            tag::OBJECT_IDENTIFIER,
+        ] {
+            assert_eq!(
+                Value::from_ber(t, &over),
+                Err(Error::TooLong(MAX_MESSAGE + 1))
+            );
         }
         let most = vec![0; MAX_MESSAGE];
-        assert_eq!(Value::from_ber(tag::OCTET_STRING, &most), Ok(Value::OctetString(most.clone())));
+        assert_eq!(
+            Value::from_ber(tag::OCTET_STRING, &most),
+            Ok(Value::OctetString(most.clone()))
+        );
         assert_eq!(Value::from_ber(tag::OPAQUE, &most), Ok(Value::Opaque(most)));
     }
 
@@ -2306,8 +2704,18 @@ mod tests {
         assert_eq!("2.4294967295".parse::<Oid>(), Ok(o));
         // One more is past the last arc.
         assert_eq!(Oid::parse(&[0x90, 0x80, 0x80, 0x80, 0x50]), Err(Error::Oid));
-        assert_eq!(Oid::parse(&[0x80 | 0x7f, 0xff, 0xff, 0xff, 0xff, 0x7f]), Err(Error::Oid));
-        let m = Message::trap_v2(b"p", 1, 0, Oid::from_arcs(&[2, u32::MAX, u32::MAX]).unwrap(), vec![], false);
+        assert_eq!(
+            Oid::parse(&[0x80 | 0x7f, 0xff, 0xff, 0xff, 0xff, 0x7f]),
+            Err(Error::Oid)
+        );
+        let m = Message::trap_v2(
+            b"p",
+            1,
+            0,
+            Oid::from_arcs(&[2, u32::MAX, u32::MAX]).unwrap(),
+            vec![],
+            false,
+        );
         assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m));
     }
 

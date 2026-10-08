@@ -118,7 +118,12 @@ fn tls(e: &Entry) -> Option<Value> {
             let name = e.str("alert").unwrap_or("unknown");
             format!("the client sent alert {code} ({name})")
         }
-        "failed" => e.str("detail").unwrap_or_default().chars().take(200).collect(),
+        "failed" => e
+            .str("detail")
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect(),
         "closed" => "the client closed the connection before the handshake finished".to_owned(),
         "timed_out" => "the handshake did not finish within 10 seconds".to_owned(),
         _ => "the handshake failed".to_owned(),

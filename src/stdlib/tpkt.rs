@@ -44,12 +44,12 @@
 //! assert_eq!(Packet::parse_prefix(&[3, 0, 0, 7, 1, 2, 3]), Ok(Some((packet, 7))));
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Decode;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Wire};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::Wire;
 
 /// The TCP port ISO transport servers listen on.
 pub const PORT: u16 = 102;
@@ -121,7 +121,9 @@ impl core::fmt::Display for Error {
             }
             Error::Incomplete => f.write_str("incomplete TPKT packet"),
             Error::Trailing { remaining } => write!(f, "{remaining} bytes after TPKT packet"),
-            Error::PayloadTooShort(n) => write!(f, "TPKT payload of {n} bytes, below {MIN_PAYLOAD}"),
+            Error::PayloadTooShort(n) => {
+                write!(f, "TPKT payload of {n} bytes, below {MIN_PAYLOAD}")
+            }
             Error::PayloadTooLong(n) => write!(f, "{n} bytes, more than TPKT may carry"),
         }
     }
@@ -183,8 +185,7 @@ impl Wire for Header {
     /// A version other than 3 or a length below [`MIN_PACKET`] returns
     /// [`Error::Version`] or [`Error::Length`].
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let header = Header::parse(bytes, MAX_PACKET)?
-            .ok_or(Error::Incomplete)?;
+        let header = Header::parse(bytes, MAX_PACKET)?.ok_or(Error::Incomplete)?;
         if bytes.len() != HEADER_LEN {
             return Err(Error::Trailing {
                 remaining: bytes.len().saturating_sub(HEADER_LEN),
@@ -275,8 +276,7 @@ impl Wire for Packet {
     /// other than 3 or a length below [`MIN_PACKET`] returns
     /// [`Error::Version`] or [`Error::Length`].
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let (packet, used) = Packet::parse_prefix(bytes)?
-            .ok_or(Error::Incomplete)?;
+        let (packet, used) = Packet::parse_prefix(bytes)?.ok_or(Error::Incomplete)?;
         if used != bytes.len() {
             return Err(Error::Trailing {
                 remaining: bytes.len().saturating_sub(used),
@@ -307,31 +307,39 @@ impl Prefixed for Packet {
     const NAME: &'static str = "TPKT";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_PACKET }
+    fn default_limit() -> Self::Limit {
+        MAX_PACKET
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { clamp_limit(limit) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        clamp_limit(limit)
+    }
 
     #[inline]
-    fn capacity(limit: &Self::Limit) -> usize { *limit }
+    fn capacity(limit: &Self::Limit) -> usize {
+        *limit
+    }
 
     /// Reads one packet. Returns [`Error::Version`] for a version other
     /// than 3, [`Error::Length`] below [`MIN_PACKET`], or
     /// [`Error::OverLimit`] above the configured limit. Partial input
     /// returns [`fictionet::stdlib::codec::Step::Need`], including at EOF.
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         Packet::parse_limited(input, limit)
     }
 }
 
-
 #[cfg(test)]
 mod codec_tests {
+    use super::*;
     use fictionet::stdlib::codec::{Fail, Stream};
     use fictionet::stdlib::test_support::contract;
-    use super::*;
 
     #[test]
     fn exact_wire_and_transactional_writes() {
@@ -354,11 +362,11 @@ mod codec_tests {
             <Packet as Wire>::parse(&trailing),
             Err(Error::Trailing { remaining: 1 })
         );
-        assert_eq!(Packet::parse_prefix(&trailing), Ok(Some((packet, bytes.len()))));
         assert_eq!(
-            <Packet as Wire>::parse(&[9]),
-            Err(Error::Version(9))
+            Packet::parse_prefix(&trailing),
+            Ok(Some((packet, bytes.len())))
         );
+        assert_eq!(<Packet as Wire>::parse(&[9]), Err(Error::Version(9)));
 
         for size in [
             0,
@@ -440,8 +448,8 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support;
+    use fictionet::stdlib::test_support::contract;
 
     // RFC 1006 section 6: version 3, reserved, then the length of the
     // whole packet, header included. The smallest TPDU, a class 0 data
@@ -498,7 +506,9 @@ mod tests {
             0
         );
         // The reserved byte is kept, not checked.
-        let (p, _) = Packet::parse_prefix(&[3, 0xff, 0, 7, 1, 2, 3]).unwrap().unwrap();
+        let (p, _) = Packet::parse_prefix(&[3, 0xff, 0, 7, 1, 2, 3])
+            .unwrap()
+            .unwrap();
         assert_eq!(p.reserved, 0xff);
         assert_eq!(p.to_bytes().unwrap(), [3, 0xff, 0, 7, 1, 2, 3]);
     }
@@ -667,7 +677,10 @@ mod tests {
             for p in &whole.0 {
                 assert!(p.payload.len() + HEADER_LEN <= limit);
                 let bytes = p.to_bytes().unwrap();
-                assert_eq!(Packet::parse_prefix(&bytes), Ok(Some((p.clone(), bytes.len()))));
+                assert_eq!(
+                    Packet::parse_prefix(&bytes),
+                    Ok(Some((p.clone(), bytes.len())))
+                );
             }
             // Any header a writer takes reads back the same.
             let h = Header {

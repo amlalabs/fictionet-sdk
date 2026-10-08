@@ -578,15 +578,21 @@ impl Events {
         // Inherited IDs and canonical field spelling can add bytes. Check
         // them before publishing an event so default-decoded events write.
         if let Err(error) = event.encoded_len(self.limits) {
-            return Err(if error == (Error::Unwritable { reason: "line limit" }) {
-                Error::LineTooLong {
-                    limit: self.limits.line,
-                }
-            } else {
-                Error::EventTooLong {
-                    limit: self.limits.event,
-                }
-            });
+            return Err(
+                if error
+                    == (Error::Unwritable {
+                        reason: "line limit",
+                    })
+                {
+                    Error::LineTooLong {
+                        limit: self.limits.line,
+                    }
+                } else {
+                    Error::EventTooLong {
+                        limit: self.limits.event,
+                    }
+                },
+            );
         }
         Ok(Some(event))
     }
@@ -707,10 +713,10 @@ fn reserve(out: &mut Vec<u8>, size: usize) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::contract;
     use super::*;
-    use fictionet::stdlib::test_support::decode_all;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::decode_all;
 
     fn events(bytes: &[u8]) -> Vec<Event> {
         let (events, error) = decode_all(Events::default, bytes);
@@ -972,7 +978,10 @@ mod tests {
             decode_all(|| RawLines::with_limit(0), b"\xef\xbb\xbf\r\n").0,
             [Line::Empty]
         );
-        assert_eq!(RawLines::with_limit(usize::MAX).capacity(), Buffer::MAX_LIMIT);
+        assert_eq!(
+            RawLines::with_limit(usize::MAX).capacity(),
+            Buffer::MAX_LIMIT
+        );
         assert_eq!(
             Events::with_limits(Limits {
                 line: usize::MAX,

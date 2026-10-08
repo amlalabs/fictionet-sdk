@@ -11,9 +11,9 @@ use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::json;
-use fictionet::stdlib::codec::{be16, be32};
-use fictionet::stdlib::tcp_reassembly::{FlowKey, Reassembler, Segment, Chunk, conversation_key};
 use crate::watch::KeyLine;
+use fictionet::stdlib::codec::{be16, be32};
+use fictionet::stdlib::tcp_reassembly::{Chunk, FlowKey, Reassembler, Segment, conversation_key};
 
 /// A field of a layer, and where its bytes are.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,23 +44,45 @@ pub struct Layer {
 impl Layer {
     /// Creates an empty layer with the given buffer and byte range.
     pub fn new(name: &str, buf: usize, range: (usize, usize)) -> Layer {
-        Layer { name: name.to_owned(), summary: String::new(), buf, range, fields: Vec::new() }
+        Layer {
+            name: name.to_owned(),
+            summary: String::new(),
+            buf,
+            range,
+            fields: Vec::new(),
+        }
     }
 
     /// Adds a field with a byte range in this layer's buffer.
     pub fn field(&mut self, name: &str, value: impl Into<String>, range: (usize, usize)) {
-        self.fields.push(Field { name: name.to_owned(), value: value.into(), range: Some(range) });
+        self.fields.push(Field {
+            name: name.to_owned(),
+            value: value.into(),
+            range: Some(range),
+        });
     }
 
     /// Adds a note without a byte range.
     pub fn note(&mut self, name: &str, value: impl Into<String>) {
-        self.fields.push(Field { name: name.to_owned(), value: value.into(), range: None });
+        self.fields.push(Field {
+            name: name.to_owned(),
+            value: value.into(),
+            range: None,
+        });
     }
 
     /// Roughly how many bytes the layer adds to the packet's detail.
     fn size(&self) -> usize {
-        let fields = self.fields.iter().fold(0usize, |sum, f| sum.saturating_add(f.name.len()).saturating_add(f.value.len()).saturating_add(32));
-        self.name.len().saturating_add(self.summary.len()).saturating_add(fields).saturating_add(64)
+        let fields = self.fields.iter().fold(0usize, |sum, f| {
+            sum.saturating_add(f.name.len())
+                .saturating_add(f.value.len())
+                .saturating_add(32)
+        });
+        self.name
+            .len()
+            .saturating_add(self.summary.len())
+            .saturating_add(fields)
+            .saturating_add(64)
     }
 }
 
@@ -133,7 +155,11 @@ impl Decoded {
             json::string(out, &l.name);
             out.push_str(",\"summary\":");
             json::string(out, &l.summary);
-            let _ = write!(out, ",\"buf\":{},\"range\":[{},{}],\"fields\":[", l.buf, l.range.0, l.range.1);
+            let _ = write!(
+                out,
+                ",\"buf\":{},\"range\":[{},{}],\"fields\":[",
+                l.buf, l.range.0, l.range.1
+            );
             for (j, f) in l.fields.iter().enumerate() {
                 if j > 0 {
                     out.push(',');
@@ -155,9 +181,18 @@ impl Decoded {
     /// Appends the buffers as a JSON array: the packet, then each extra
     /// buffer, as objects with `name` and `hex`.
     pub fn write_buffers(&self, out: &mut String, packet: &[u8]) {
-        out.reserve(2 * packet.len() + self.extra.iter().map(|(n, b)| n.len() + 2 * b.len() + 24).sum::<usize>() + 32);
+        out.reserve(
+            2 * packet.len()
+                + self
+                    .extra
+                    .iter()
+                    .map(|(n, b)| n.len() + 2 * b.len() + 24)
+                    .sum::<usize>()
+                + 32,
+        );
         out.push('[');
-        let all = std::iter::once(("Packet", packet)).chain(self.extra.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
+        let all = std::iter::once(("Packet", packet))
+            .chain(self.extra.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
         for (i, (name, bytes)) in all.enumerate() {
             if i > 0 {
                 out.push(',');
@@ -203,7 +238,11 @@ impl Decoded {
 
     /// Bytes the detail still has room for.
     pub fn room(&self) -> usize {
-        if self.cut > 0 { 0 } else { MAX_DETAIL - self.used }
+        if self.cut > 0 {
+            0
+        } else {
+            MAX_DETAIL - self.used
+        }
     }
 
     /// Adds a tag, once.
@@ -256,7 +295,10 @@ fn ip_proto_name(p: u8) -> &'static str {
 impl Dissector {
     /// Creates a dissector with built-in or user protocol registrations.
     pub fn with_registry(registry: super::Registry) -> Self {
-        Self { registry, ..Self::default() }
+        Self {
+            registry,
+            ..Self::default()
+        }
     }
 
     /// Decodes one raw IPv4 or IPv6 packet. Pass TLS key log entries when
@@ -274,7 +316,10 @@ impl Dissector {
         }
         if d.cut > 0 {
             let mut l = Layer::new("Not shown", 0, (0, 0));
-            l.summary = format!("{} more layers and buffers: one packet's detail holds at most 1 MiB", d.cut);
+            l.summary = format!(
+                "{} more layers and buffers: one packet's detail holds at most 1 MiB",
+                d.cut
+            );
             d.layers.push(l);
         }
         d.cap_info();
@@ -286,7 +331,9 @@ impl Dissector {
             return truncated(d, "IPv4", p.len());
         }
         let ihl = usize::from(p[0] & 0x0f) * 4;
-        let Some(total_length) = be16(p, 2) else { return truncated(d, "IPv4", p.len()); };
+        let Some(total_length) = be16(p, 2) else {
+            return truncated(d, "IPv4", p.len());
+        };
         let total = usize::from(total_length);
         if ihl < 20 || p.len() < ihl {
             return truncated(d, "IPv4", p.len());
@@ -296,7 +343,9 @@ impl Dissector {
         let dst = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
         let proto = p[9];
         let flags = p[6] >> 5;
-        let Some(fragment) = be16(p, 6) else { return truncated(d, "IPv4", p.len()); };
+        let Some(fragment) = be16(p, 6) else {
+            return truncated(d, "IPv4", p.len());
+        };
         let offset = (usize::from(fragment) & 0x1fff) * 8;
         let mut l = Layer::new("Internet Protocol Version 4", 0, (0, ihl));
         l.summary = format!("Src: {src}, Dst: {dst}");
@@ -304,8 +353,14 @@ impl Dissector {
         l.field("Header length", format!("{ihl} bytes"), (0, 1));
         l.field("Differentiated services", format!("0x{:02x}", p[1]), (1, 2));
         l.field("Total length", total.to_string(), (2, 4));
-        let Some(identification) = be16(p, 4) else { return truncated(d, "IPv4", p.len()); };
-        l.field("Identification", format!("0x{:04x} ({})", identification, identification), (4, 6));
+        let Some(identification) = be16(p, 4) else {
+            return truncated(d, "IPv4", p.len());
+        };
+        l.field(
+            "Identification",
+            format!("0x{:04x} ({})", identification, identification),
+            (4, 6),
+        );
         let mut fl = Vec::new();
         if flags & 2 != 0 {
             fl.push("Don't fragment");
@@ -313,11 +368,25 @@ impl Dissector {
         if flags & 1 != 0 {
             fl.push("More fragments");
         }
-        l.field("Flags", if fl.is_empty() { "none".to_owned() } else { fl.join(", ") }, (6, 7));
+        l.field(
+            "Flags",
+            if fl.is_empty() {
+                "none".to_owned()
+            } else {
+                fl.join(", ")
+            },
+            (6, 7),
+        );
         l.field("Fragment offset", offset.to_string(), (6, 8));
         l.field("Time to live", p[8].to_string(), (8, 9));
-        l.field("Protocol", format!("{} ({proto})", ip_proto_name(proto)), (9, 10));
-        let Some(checksum) = be16(p, 10) else { return truncated(d, "IPv4", p.len()); };
+        l.field(
+            "Protocol",
+            format!("{} ({proto})", ip_proto_name(proto)),
+            (9, 10),
+        );
+        let Some(checksum) = be16(p, 10) else {
+            return truncated(d, "IPv4", p.len());
+        };
         l.field("Header checksum", format!("0x{:04x}", checksum), (10, 12));
         l.field("Source address", src.to_string(), (12, 16));
         l.field("Destination address", dst.to_string(), (16, 20));
@@ -326,7 +395,11 @@ impl Dissector {
         d.dst = dst.to_string();
         if offset != 0 || flags & 1 != 0 {
             d.proto = "IPv4".into();
-            d.info = format!("Fragment of a {} packet (offset {offset}, {} bytes)", ip_proto_name(proto), end - ihl);
+            d.info = format!(
+                "Fragment of a {} packet (offset {offset}, {} bytes)",
+                ip_proto_name(proto),
+                end - ihl
+            );
             d.tag("fragment");
             if offset != 0 {
                 return;
@@ -341,18 +414,36 @@ impl Dissector {
         }
         let src = Ipv6Addr::from(<[u8; 16]>::try_from(&p[8..24]).unwrap());
         let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).unwrap());
-        let Some(payload_length) = be16(p, 4) else { return truncated(d, "IPv6", p.len()); };
+        let Some(payload_length) = be16(p, 4) else {
+            return truncated(d, "IPv6", p.len());
+        };
         let payload = usize::from(payload_length);
         let end = (40 + payload).min(p.len());
         let mut l = Layer::new("Internet Protocol Version 6", 0, (0, 40));
         l.summary = format!("Src: {src}, Dst: {dst}");
         l.field("Version", "6", (0, 1));
-        let Some(version_class) = be16(p, 0) else { return truncated(d, "IPv6", p.len()); };
-        l.field("Traffic class", format!("0x{:02x}", (version_class >> 4) as u8), (0, 2));
-        let Some(version_flow) = be32(p, 0) else { return truncated(d, "IPv6", p.len()); };
-        l.field("Flow label", format!("0x{:05x}", version_flow & 0xfffff), (1, 4));
+        let Some(version_class) = be16(p, 0) else {
+            return truncated(d, "IPv6", p.len());
+        };
+        l.field(
+            "Traffic class",
+            format!("0x{:02x}", (version_class >> 4) as u8),
+            (0, 2),
+        );
+        let Some(version_flow) = be32(p, 0) else {
+            return truncated(d, "IPv6", p.len());
+        };
+        l.field(
+            "Flow label",
+            format!("0x{:05x}", version_flow & 0xfffff),
+            (1, 4),
+        );
         l.field("Payload length", payload.to_string(), (4, 6));
-        l.field("Next header", format!("{} ({})", ip_proto_name(p[6]), p[6]), (6, 7));
+        l.field(
+            "Next header",
+            format!("{} ({})", ip_proto_name(p[6]), p[6]),
+            (6, 7),
+        );
         l.field("Hop limit", p[7].to_string(), (7, 8));
         l.field("Source address", src.to_string(), (8, 24));
         l.field("Destination address", dst.to_string(), (24, 40));
@@ -363,9 +454,15 @@ impl Dissector {
         let (mut next, mut at) = (p[6], 40);
         while matches!(next, 0 | 43 | 44 | 60) && at + 8 <= end {
             if next == 44 {
-                let Some(fragment) = be16(p, at + 2) else { return truncated(d, "IPv6", p.len()); };
+                let Some(fragment) = be16(p, at + 2) else {
+                    return truncated(d, "IPv6", p.len());
+                };
                 let offset = usize::from(fragment & 0xfff8);
-                l.field("Fragment header", format!("offset {offset}, more: {}", p[at + 3] & 1 == 1), (at, at + 8));
+                l.field(
+                    "Fragment header",
+                    format!("offset {offset}, more: {}", p[at + 3] & 1 == 1),
+                    (at, at + 8),
+                );
                 if offset != 0 || p[at + 3] & 1 == 1 {
                     d.proto = "IPv6".into();
                     d.info = format!("Fragment (offset {offset})");
@@ -378,7 +475,11 @@ impl Dissector {
                 at += 8;
             } else {
                 let len = (usize::from(p[at + 1]) + 1) * 8;
-                l.field("Extension header", format!("type {next}, {len} bytes"), (at, (at + len).min(end)));
+                l.field(
+                    "Extension header",
+                    format!("type {next}, {len} bytes"),
+                    (at, (at + len).min(end)),
+                );
                 next = p[at];
                 at += len;
             }
@@ -392,7 +493,17 @@ impl Dissector {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn transport(&mut self, p: &[u8], at: usize, end: usize, proto: u8, src: IpAddr, dst: IpAddr, d: &mut Decoded, keys: &[KeyLine]) {
+    fn transport(
+        &mut self,
+        p: &[u8],
+        at: usize,
+        end: usize,
+        proto: u8,
+        src: IpAddr,
+        dst: IpAddr,
+        d: &mut Decoded,
+        keys: &[KeyLine],
+    ) {
         let body = &p[at..end];
         match proto {
             6 => self.tcp(p, at, end, src, dst, d, keys),
@@ -407,7 +518,16 @@ impl Dissector {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn tcp(&mut self, p: &[u8], at: usize, end: usize, src: IpAddr, dst: IpAddr, d: &mut Decoded, keys: &[KeyLine]) {
+    fn tcp(
+        &mut self,
+        p: &[u8],
+        at: usize,
+        end: usize,
+        src: IpAddr,
+        dst: IpAddr,
+        d: &mut Decoded,
+        keys: &[KeyLine],
+    ) {
         let t = &p[at..end];
         if t.len() < 20 {
             return truncated(d, "TCP", t.len());
@@ -416,12 +536,22 @@ impl Dissector {
         if off < 20 || off > t.len() {
             return truncated(d, "TCP", t.len());
         }
-        let Some(source_port) = be16(t, 0) else { return truncated(d, "TCP", t.len()); };
-        let Some(destination_port) = be16(t, 2) else { return truncated(d, "TCP", t.len()); };
+        let Some(source_port) = be16(t, 0) else {
+            return truncated(d, "TCP", t.len());
+        };
+        let Some(destination_port) = be16(t, 2) else {
+            return truncated(d, "TCP", t.len());
+        };
         let (sport, dport) = (source_port, destination_port);
-        let Some(sequence) = be32(t, 4) else { return truncated(d, "TCP", t.len()); };
-        let Some(acknowledgment) = be32(t, 8) else { return truncated(d, "TCP", t.len()); };
-        let Some(window) = be16(t, 14) else { return truncated(d, "TCP", t.len()); };
+        let Some(sequence) = be32(t, 4) else {
+            return truncated(d, "TCP", t.len());
+        };
+        let Some(acknowledgment) = be32(t, 8) else {
+            return truncated(d, "TCP", t.len());
+        };
+        let Some(window) = be16(t, 14) else {
+            return truncated(d, "TCP", t.len());
+        };
         let (seq, ack, flags, win) = (sequence, acknowledgment, t[13], window);
         let payload = (at + off, end);
         let key = (src, sport, dst, dport);
@@ -450,14 +580,30 @@ impl Dissector {
         );
         l.field("Source port", sport.to_string(), r(0, 2));
         l.field("Destination port", dport.to_string(), r(2, 4));
-        l.field("Sequence number", format!("{} (raw {seq})", flow.rel_seq), r(4, 8));
-        l.field("Acknowledgment number", format!("{} (raw {ack})", flow.rel_ack), r(8, 12));
+        l.field(
+            "Sequence number",
+            format!("{} (raw {seq})", flow.rel_seq),
+            r(4, 8),
+        );
+        l.field(
+            "Acknowledgment number",
+            format!("{} (raw {ack})", flow.rel_ack),
+            r(8, 12),
+        );
         l.field("Header length", format!("{off} bytes"), r(12, 13));
-        l.field("Flags", format!("0x{flags:03x} ({})", names.join(", ")), r(12, 14));
+        l.field(
+            "Flags",
+            format!("0x{flags:03x} ({})", names.join(", ")),
+            r(12, 14),
+        );
         l.field("Window", win.to_string(), r(14, 16));
-        let Some(checksum) = be16(t, 16) else { return truncated(d, "TCP", t.len()); };
+        let Some(checksum) = be16(t, 16) else {
+            return truncated(d, "TCP", t.len());
+        };
         l.field("Checksum", format!("0x{:04x}", checksum), r(16, 18));
-        let Some(urgent) = be16(t, 18) else { return truncated(d, "TCP", t.len()); };
+        let Some(urgent) = be16(t, 18) else {
+            return truncated(d, "TCP", t.len());
+        };
         l.field("Urgent pointer", urgent.to_string(), r(18, 20));
         let opts = tcp_options(&t[20..off]);
         if !opts.is_empty() {
@@ -468,7 +614,11 @@ impl Dissector {
         d.src = sock(&d.src, sport);
         d.dst = sock(&d.dst, dport);
         d.proto = "TCP".into();
-        let mut info = format!("{sport} → {dport} [{}] Seq={} ", names.join(", "), flow.rel_seq);
+        let mut info = format!(
+            "{sport} → {dport} [{}] Seq={} ",
+            names.join(", "),
+            flow.rel_seq
+        );
         if flags & 0x10 != 0 {
             let _ = write!(info, "Ack={} ", flow.rel_ack);
         }
@@ -489,14 +639,28 @@ impl Dissector {
         let mut delivered = false;
         for event in flow.events {
             match event {
-                Chunk::Bytes { offset, bytes, input_offset, .. } => {
-                    let conversation = self.conversations.entry(ckey).or_insert_with(|| super::Conversation::with_registry(ckey.1, ckey.3, self.registry.clone()));
-                    let place = super::Place { stream_start: offset, buf: 0, offset: input_offset.and_then(|at| payload.0.checked_add(at)), len: bytes.len() };
+                Chunk::Bytes {
+                    offset,
+                    bytes,
+                    input_offset,
+                    ..
+                } => {
+                    let conversation = self.conversations.entry(ckey).or_insert_with(|| {
+                        super::Conversation::with_registry(ckey.1, ckey.3, self.registry.clone())
+                    });
+                    let place = super::Place {
+                        stream_start: offset,
+                        buf: 0,
+                        offset: input_offset.and_then(|at| payload.0.checked_add(at)),
+                        len: bytes.len(),
+                    };
                     conversation.data(reversed, &bytes, place, d, keys);
                     delivered = true;
                 }
                 Chunk::Gap { resumed: true, .. } => {
-                    let conversation = self.conversations.entry(ckey).or_insert_with(|| super::Conversation::with_registry(ckey.1, ckey.3, self.registry.clone()));
+                    let conversation = self.conversations.entry(ckey).or_insert_with(|| {
+                        super::Conversation::with_registry(ckey.1, ckey.3, self.registry.clone())
+                    });
                     conversation.lost(reversed);
                 }
                 Chunk::Gap { resumed: false, .. } => gap = true,
@@ -509,14 +673,24 @@ impl Dissector {
         if gap {
             d.tag("gap");
         }
-        if delivered && d.layers.len().checked_add(d.cut) == layers && self.conversations.get(&ckey).is_some_and(|c| c.waiting(reversed)) {
+        if delivered
+            && d.layers.len().checked_add(d.cut) == layers
+            && self
+                .conversations
+                .get(&ckey)
+                .is_some_and(|c| c.waiting(reversed))
+        {
             d.info.push_str(" [part of a longer message]");
         }
     }
 }
 
 fn sock(ip: &str, port: u16) -> String {
-    if ip.contains(':') { format!("[{ip}]:{port}") } else { format!("{ip}:{port}") }
+    if ip.contains(':') {
+        format!("[{ip}]:{port}")
+    } else {
+        format!("{ip}:{port}")
+    }
 }
 
 fn truncated(d: &mut Decoded, what: &str, len: usize) {
@@ -526,8 +700,21 @@ fn truncated(d: &mut Decoded, what: &str, len: usize) {
 }
 
 pub(crate) fn flag_names(flags: u8) -> Vec<&'static str> {
-    let names = [(0x02, "SYN"), (0x10, "ACK"), (0x08, "PSH"), (0x01, "FIN"), (0x04, "RST"), (0x20, "URG"), (0x40, "ECE"), (0x80, "CWR")];
-    names.iter().filter(|(bit, _)| flags & bit != 0).map(|(_, n)| *n).collect()
+    let names = [
+        (0x02, "SYN"),
+        (0x10, "ACK"),
+        (0x08, "PSH"),
+        (0x01, "FIN"),
+        (0x04, "RST"),
+        (0x20, "URG"),
+        (0x40, "ECE"),
+        (0x80, "CWR"),
+    ];
+    names
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, n)| *n)
+        .collect()
 }
 
 fn tcp_options(o: &[u8]) -> Vec<String> {
@@ -546,16 +733,20 @@ fn tcp_options(o: &[u8]) -> Vec<String> {
                 let v = &o[i + 2..i + len];
                 out.push(match (kind, v.len()) {
                     (2, 2) => {
-                        let Some(mss) = be16(v, 0) else { break; };
+                        let Some(mss) = be16(v, 0) else {
+                            break;
+                        };
                         format!("MSS={mss}")
-                    },
+                    }
                     (3, 1) => format!("WS={}", 1u32 << v[0].min(14)),
                     (4, 0) => "SACK_PERM".to_owned(),
                     (5, _) => format!("SACK({} blocks)", v.len() / 8),
                     (8, 8) => {
-                        let (Some(value), Some(echo)) = (be32(v, 0), be32(v, 4)) else { break; };
+                        let (Some(value), Some(echo)) = (be32(v, 0), be32(v, 4)) else {
+                            break;
+                        };
                         format!("TSval={value} TSecr={echo}")
-                    },
+                    }
                     _ => format!("option {kind}"),
                 });
                 i += len;
@@ -570,9 +761,15 @@ fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, registry: &super::Regis
     if u.len() < 8 {
         return truncated(d, "UDP", u.len());
     }
-    let Some(source_port) = be16(u, 0) else { return truncated(d, "UDP", u.len()); };
-    let Some(destination_port) = be16(u, 2) else { return truncated(d, "UDP", u.len()); };
-    let Some(length) = be16(u, 4) else { return truncated(d, "UDP", u.len()); };
+    let Some(source_port) = be16(u, 0) else {
+        return truncated(d, "UDP", u.len());
+    };
+    let Some(destination_port) = be16(u, 2) else {
+        return truncated(d, "UDP", u.len());
+    };
+    let Some(length) = be16(u, 4) else {
+        return truncated(d, "UDP", u.len());
+    };
     let (sport, dport, len) = (source_port, destination_port, length);
     // The datagram is as long as its header says, if the packet holds that
     // much: bytes after it are not part of it.
@@ -585,7 +782,9 @@ fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, registry: &super::Regis
     l.field("Source port", sport.to_string(), (at, at + 2));
     l.field("Destination port", dport.to_string(), (at + 2, at + 4));
     l.field("Length", len.to_string(), (at + 4, at + 6));
-    let Some(checksum) = be16(u, 6) else { return truncated(d, "UDP", u.len()); };
+    let Some(checksum) = be16(u, 6) else {
+        return truncated(d, "UDP", u.len());
+    };
     l.field("Checksum", format!("0x{:04x}", checksum), (at + 6, at + 8));
     d.push(l);
     d.src = sock(&d.src, sport);
@@ -602,13 +801,22 @@ fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, registry: &super::Regis
         return;
     }
     let bytes = &p[body.0..body.1];
-    let selection = super::Selection { transport: crate::events::Transport::Udp, ports: (sport, dport), alpn: None, first: bytes.get(..bytes.len().min(64)).unwrap_or_default() };
+    let selection = super::Selection {
+        transport: crate::events::Transport::Udp,
+        ports: (sport, dport),
+        alpn: None,
+        first: bytes.get(..bytes.len().min(64)).unwrap_or_default(),
+    };
     if let Ok(mut protocol) = registry.open(selection) {
-        let place = super::Place { stream_start: 0, buf: 0, offset: Some(body.0), len: bytes.len() };
+        let place = super::Place {
+            stream_start: 0,
+            buf: 0,
+            offset: Some(body.0),
+            len: bytes.len(),
+        };
         protocol.data(false, bytes, place, d, &[]);
         protocol.end(false, d);
     }
-
 }
 
 fn icmp(p: &[u8], at: usize, end: usize, d: &mut Decoded, v6: bool) {
@@ -619,24 +827,46 @@ fn icmp(p: &[u8], at: usize, end: usize, d: &mut Decoded, v6: bool) {
     }
     let (kind, code) = (c[0], c[1]);
     let what = icmp_name(kind, code, v6);
-    let mut l = Layer::new(if v6 { "Internet Control Message Protocol v6" } else { "Internet Control Message Protocol" }, 0, (at, end));
+    let mut l = Layer::new(
+        if v6 {
+            "Internet Control Message Protocol v6"
+        } else {
+            "Internet Control Message Protocol"
+        },
+        0,
+        (at, end),
+    );
     l.summary = what.clone();
     l.field("Type", format!("{kind} ({what})"), (at, at + 1));
     l.field("Code", code.to_string(), (at + 1, at + 2));
-    let Some(checksum) = be16(c, 2) else { return truncated(d, name, c.len()); };
+    let Some(checksum) = be16(c, 2) else {
+        return truncated(d, name, c.len());
+    };
     l.field("Checksum", format!("0x{:04x}", checksum), (at + 2, at + 4));
     let mut info = what;
-    let echo = if v6 { matches!(kind, 128 | 129) } else { matches!(kind, 0 | 8) };
+    let echo = if v6 {
+        matches!(kind, 128 | 129)
+    } else {
+        matches!(kind, 0 | 8)
+    };
     if echo && c.len() >= 8 {
-        let Some(identifier) = be16(c, 4) else { return truncated(d, name, c.len()); };
-        let Some(sequence) = be16(c, 6) else { return truncated(d, name, c.len()); };
+        let Some(identifier) = be16(c, 4) else {
+            return truncated(d, name, c.len());
+        };
+        let Some(sequence) = be16(c, 6) else {
+            return truncated(d, name, c.len());
+        };
         let (id, seq) = (identifier, sequence);
         l.field("Identifier", format!("0x{id:04x}"), (at + 4, at + 6));
         l.field("Sequence number", seq.to_string(), (at + 6, at + 8));
         l.note("Data", format!("{} bytes", c.len() - 8));
         let _ = write!(info, " id=0x{id:04x}, seq={seq}");
     }
-    let quotes = if v6 { matches!(kind, 1..=4) } else { matches!(kind, 3 | 4 | 5 | 11 | 12) };
+    let quotes = if v6 {
+        matches!(kind, 1..=4)
+    } else {
+        matches!(kind, 3 | 4 | 5 | 11 | 12)
+    };
     if quotes && c.len() >= 8 + 20 {
         let inner = &c[8..];
         let summary = quoted_summary(inner);
@@ -654,7 +884,12 @@ fn quoted_summary(q: &[u8]) -> String {
     let (src, dst, proto, at) = match q[0] >> 4 {
         4 if q.len() >= 20 => {
             let ihl = usize::from(q[0] & 0xf) * 4;
-            (IpAddr::from([q[12], q[13], q[14], q[15]]), IpAddr::from([q[16], q[17], q[18], q[19]]), q[9], ihl)
+            (
+                IpAddr::from([q[12], q[13], q[14], q[15]]),
+                IpAddr::from([q[16], q[17], q[18], q[19]]),
+                q[9],
+                ihl,
+            )
         }
         6 if q.len() >= 40 => (
             IpAddr::from(<[u8; 16]>::try_from(&q[8..24]).unwrap()),
@@ -665,9 +900,18 @@ fn quoted_summary(q: &[u8]) -> String {
         _ => return "a packet".into(),
     };
     if matches!(proto, 6 | 17) && q.len() >= at + 4 {
-        let Some(source_port) = be16(q, at) else { return format!("{src} → {dst} {}", ip_proto_name(proto)); };
-        let Some(destination_port) = be16(q, at + 2) else { return format!("{src} → {dst} {}", ip_proto_name(proto)); };
-        format!("{} → {} {}", sock(&src.to_string(), source_port), sock(&dst.to_string(), destination_port), ip_proto_name(proto))
+        let Some(source_port) = be16(q, at) else {
+            return format!("{src} → {dst} {}", ip_proto_name(proto));
+        };
+        let Some(destination_port) = be16(q, at + 2) else {
+            return format!("{src} → {dst} {}", ip_proto_name(proto));
+        };
+        format!(
+            "{} → {} {}",
+            sock(&src.to_string(), source_port),
+            sock(&dst.to_string(), destination_port),
+            ip_proto_name(proto)
+        )
     } else {
         format!("{src} → {dst} {}", ip_proto_name(proto))
     }
@@ -731,7 +975,10 @@ mod tests {
         let mut echo = vec![8, 0, 0, 0, 0x12, 0x34, 0, 7];
         echo.extend_from_slice(&[0; 16]);
         let d = Dissector::default().decode(&ipv4(1, [10, 0, 0, 2], [10, 0, 0, 1], &echo), &[]);
-        assert_eq!((d.src.as_str(), d.dst.as_str(), d.proto.as_str()), ("10.0.0.2", "10.0.0.1", "ICMP"));
+        assert_eq!(
+            (d.src.as_str(), d.dst.as_str(), d.proto.as_str()),
+            ("10.0.0.2", "10.0.0.1", "ICMP")
+        );
         assert_eq!(d.info, "Echo (ping) request id=0x1234, seq=7");
         assert_eq!(d.layers.len(), 2);
         assert_eq!(d.layers[1].fields[3].range, Some((24, 26)));
@@ -739,7 +986,9 @@ mod tests {
 
     #[test]
     fn a_syn_shows_its_flags_and_options() {
-        let mut syn = vec![0xc3, 0x50, 0, 80, 0, 0, 0, 100, 0, 0, 0, 0, 0x60, 0x02, 0xfa, 0xf0, 0, 0, 0, 0];
+        let mut syn = vec![
+            0xc3, 0x50, 0, 80, 0, 0, 0, 100, 0, 0, 0, 0, 0x60, 0x02, 0xfa, 0xf0, 0, 0, 0, 0,
+        ];
         syn.extend_from_slice(&[2, 4, 0x05, 0xb4]);
         let d = Dissector::default().decode(&ipv4(6, [10, 0, 0, 2], [203, 0, 113, 10], &syn), &[]);
         assert_eq!(d.src, "10.0.0.2:50000");
@@ -783,11 +1032,21 @@ mod tests {
         let second = dis.decode(&tcp(40000, 80, 111, 0x18, &request[10..]), &[]);
         assert_eq!(second.proto, "TCP");
         let first = dis.decode(&tcp(40000, 80, 101, 0x18, &request[..10]), &[]);
-        assert_eq!((first.proto.as_str(), first.info.as_str()), ("HTTP", "GET /count HTTP/1.1"));
+        assert_eq!(
+            (first.proto.as_str(), first.info.as_str()),
+            ("HTTP", "GET /count HTTP/1.1")
+        );
         let http = first.layers.last().unwrap();
-        assert_eq!(http.buf, 1, "the request spans packets, so it has a buffer of its own");
+        assert_eq!(
+            http.buf, 1,
+            "the request spans packets, so it has a buffer of its own"
+        );
         assert_eq!(first.extra[0].1, request);
-        assert!(http.fields.iter().any(|f| f.name == "Host" && f.value == "example.test"));
+        assert!(
+            http.fields
+                .iter()
+                .any(|f| f.name == "Host" && f.value == "example.test")
+        );
         // The same bytes again are a retransmission, and decode to nothing new.
         let again = dis.decode(&tcp(40000, 80, 101, 0x18, &request[..10]), &[]);
         assert!(again.tags.contains(&"retransmission"));
@@ -826,10 +1085,29 @@ mod tests {
         let mut dis = Dissector::default();
         dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
         dis.decode(&tcp_back(500, 0x12, b""), &[]);
-        dis.decode(&tcp(40000, 80, 101, 0x18, b"HEAD / HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\n"), &[]);
-        let first = dis.decode(&tcp_back(501, 0x18, b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n"), &[]);
+        dis.decode(
+            &tcp(
+                40000,
+                80,
+                101,
+                0x18,
+                b"HEAD / HTTP/1.1\r\n\r\nGET / HTTP/1.1\r\n\r\n",
+            ),
+            &[],
+        );
+        let first = dis.decode(
+            &tcp_back(501, 0x18, b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n"),
+            &[],
+        );
         assert_eq!(first.info, "HTTP/1.1 200 OK");
-        let second = dis.decode(&tcp_back(541, 0x18, b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"), &[]);
+        let second = dis.decode(
+            &tcp_back(
+                541,
+                0x18,
+                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n",
+            ),
+            &[],
+        );
         assert_eq!(second.info, "HTTP/1.1 404 Not Found");
     }
 
@@ -876,9 +1154,21 @@ mod tests {
     fn a_new_connection_on_the_same_ports_starts_over() {
         let mut dis = Dissector::default();
         dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
-        dis.decode(&tcp(40000, 80, 101, 0x18, b"POST / HTTP/1.1\r\ncontent-length: 100\r\n\r\n"), &[]);
+        dis.decode(
+            &tcp(
+                40000,
+                80,
+                101,
+                0x18,
+                b"POST / HTTP/1.1\r\ncontent-length: 100\r\n\r\n",
+            ),
+            &[],
+        );
         dis.decode(&tcp(40000, 80, 5000, 0x02, b""), &[]);
-        let d = dis.decode(&tcp(40000, 80, 5001, 0x18, b"GET /new HTTP/1.1\r\n\r\n"), &[]);
+        let d = dis.decode(
+            &tcp(40000, 80, 5001, 0x18, b"GET /new HTTP/1.1\r\n\r\n"),
+            &[],
+        );
         assert_eq!(d.info, "GET /new HTTP/1.1");
         // A SYN-ACK that answers the SYN keeps what the SYN carried, whether
         // it acknowledges the SYN's data (TCP Fast Open) or only the SYN.
@@ -889,7 +1179,11 @@ mod tests {
             syn_ack[28..32].copy_from_slice(&ack.to_be_bytes());
             dis.decode(&syn_ack, &[]);
             let rest = tcp(40000, 80, 9010, 0x18, b" HTTP/1.1\r\n\r\n");
-            assert_eq!(dis.decode(&rest, &[]).info, "GET /fast HTTP/1.1", "ack {ack}");
+            assert_eq!(
+                dis.decode(&rest, &[]).info,
+                "GET /fast HTTP/1.1",
+                "ack {ack}"
+            );
         }
     }
 
@@ -917,36 +1211,76 @@ mod tests {
             dis.decode(&tcp(40000, 80, base + k * 100, 0x18, &segment), &[]);
         }
         let d = dis.decode(&tcp(40000, 80, base, 0x18, &segment), &[]);
-        let kept: usize = d.layers.iter().flat_map(|l| &l.fields).map(|f| f.value.len()).sum();
+        let kept: usize = d
+            .layers
+            .iter()
+            .flat_map(|l| &l.fields)
+            .map(|f| f.value.len())
+            .sum();
         assert!(kept <= MAX_DETAIL, "{kept} bytes of fields");
         assert!(d.layers_json().len() < 2 * MAX_DETAIL);
         assert!(d.info.len() < 2048);
         assert_eq!(d.layers.last().unwrap().name, "Not shown");
         // The table is still known.
-        let d = dis.decode(&tcp(40000, 80, base + 256 * 100, 0x18, &h2_frame(1, 0x4, 11, &[0xbe])), &[]);
-        let x = d.layers.last().unwrap().fields.iter().find(|f| f.name == "x").unwrap();
+        let d = dis.decode(
+            &tcp(
+                40000,
+                80,
+                base + 256 * 100,
+                0x18,
+                &h2_frame(1, 0x4, 11, &[0xbe]),
+            ),
+            &[],
+        );
+        let x = d
+            .layers
+            .last()
+            .unwrap()
+            .fields
+            .iter()
+            .find(|f| f.name == "x")
+            .unwrap();
         assert_eq!(x.value.len(), 4000);
     }
 
     #[test]
     fn reassembly_gap_resets_the_http2_header_table() {
         use fictionet::stdlib::tcp_reassembly::Limits;
-        let mut dis = Dissector { tcp: Reassembler::new(Limits { segments: 1, ..Limits::default() }), ..Dissector::default() };
+        let mut dis = Dissector {
+            tcp: Reassembler::new(Limits {
+                segments: 1,
+                ..Limits::default()
+            }),
+            ..Dissector::default()
+        };
         dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
         let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         first.extend(h2_frame(1, 0x4, 1, b"\x40\x01x\x01y"));
         let initial = dis.decode(&tcp(40000, 80, 101, 0x18, &first), &[]);
-        assert!(initial.layers.iter().any(|l| l.fields.iter().any(|f| f.name == "x" && f.value == "y")));
+        assert!(
+            initial
+                .layers
+                .iter()
+                .any(|l| l.fields.iter().any(|f| f.name == "x" && f.value == "y"))
+        );
         let next = 101 + first.len() as u32;
         let indexed = h2_frame(1, 0x4, 3, &[0xbe]);
         dis.decode(&tcp(40000, 80, next + 10, 0x18, &indexed), &[]);
         let resumed = dis.decode(&tcp(40000, 80, next + 100, 0x18, b"dropped"), &[]);
-        assert!(!resumed.layers.iter().any(|l| l.fields.iter().any(|f| f.name == "x" && f.value == "y")));
+        assert!(
+            !resumed
+                .layers
+                .iter()
+                .any(|l| l.fields.iter().any(|f| f.name == "x" && f.value == "y"))
+        );
         assert_eq!(resumed.proto, "TCP");
         assert_eq!(resumed.layers.len(), 2);
         assert!(resumed.extra.is_empty());
         assert!(!resumed.tags.contains(&"gap"));
-        let following = dis.decode(&tcp(40000, 80, next + 10 + indexed.len() as u32, 0x18, &indexed), &[]);
+        let following = dis.decode(
+            &tcp(40000, 80, next + 10 + indexed.len() as u32, 0x18, &indexed),
+            &[],
+        );
         assert_eq!(following.proto, "TCP");
         assert_eq!(following.layers.len(), 2);
     }
@@ -954,7 +1288,13 @@ mod tests {
     #[test]
     fn reassembly_gap_before_the_first_bytes_also_stops_http2() {
         use fictionet::stdlib::tcp_reassembly::Limits;
-        let mut dis = Dissector { tcp: Reassembler::new(Limits { segments: 1, ..Limits::default() }), ..Dissector::default() };
+        let mut dis = Dissector {
+            tcp: Reassembler::new(Limits {
+                segments: 1,
+                ..Limits::default()
+            }),
+            ..Dissector::default()
+        };
         dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
         let mut first = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         first.extend(h2_frame(1, 0x4, 1, &[0x82]));
@@ -968,7 +1308,13 @@ mod tests {
     #[test]
     fn reassembly_gap_without_held_data_keeps_the_packet_tag() {
         use fictionet::stdlib::tcp_reassembly::Limits;
-        let mut dis = Dissector { tcp: Reassembler::new(Limits { buffered: 0, ..Limits::default() }), ..Dissector::default() };
+        let mut dis = Dissector {
+            tcp: Reassembler::new(Limits {
+                buffered: 0,
+                ..Limits::default()
+            }),
+            ..Dissector::default()
+        };
         dis.decode(&tcp(40000, 80, 100, 0x02, b""), &[]);
         let gap = dis.decode(&tcp(40000, 80, 110, 0x18, b"dropped"), &[]);
         assert!(gap.tags.contains(&"gap"));
@@ -1010,9 +1356,14 @@ mod tests {
             state
         };
         let starts: [&[u8]; 6] = [
-            &[0x16, 0x03, 0x01, 0x00, 0x40, 0x01, 0x00, 0x00, 0x3c, 0x03, 0x03],
+            &[
+                0x16, 0x03, 0x01, 0x00, 0x40, 0x01, 0x00, 0x00, 0x3c, 0x03, 0x03,
+            ],
             b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
-            &[0x00, 0x00, 0x05, 0x01, 0x2d, 0x00, 0x00, 0x00, 0x01, 0x08, 0x00, 0x00, 0x00, 0x05, 0xff, 0xff],
+            &[
+                0x00, 0x00, 0x05, 0x01, 0x2d, 0x00, 0x00, 0x00, 0x01, 0x08, 0x00, 0x00, 0x00, 0x05,
+                0xff, 0xff,
+            ],
             b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nffffffff\r\n",
             b"HTTP/1.1 200 OK\r\ncontent-length: 99999999999\r\n\r\n",
             &[0x17, 0x03, 0x03, 0x40, 0x00],
@@ -1026,7 +1377,11 @@ mod tests {
                 payload.push(rand() as u8);
             }
             let flags = [0x02, 0x10, 0x18, 0x11, 0x04][(rand() % 5) as usize];
-            let seq = if round % 3 == 0 { rand() as u32 } else { 1000 + (rand() % 3000) as u32 };
+            let seq = if round % 3 == 0 {
+                rand() as u32
+            } else {
+                1000 + (rand() % 3000) as u32
+            };
             let packet = tcp(port, dport, seq, flags, &payload);
             let mut packet = packet;
             if round % 7 == 0 {
@@ -1059,8 +1414,14 @@ mod tests {
                 .done()
         }));
         let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-        let first = Object::new().str("name", "Packet").str("hex", &hex(packet)).done();
-        let rest = d.extra.iter().map(|(name, b)| Object::new().str("name", name).str("hex", &hex(b)).done());
+        let first = Object::new()
+            .str("name", "Packet")
+            .str("hex", &hex(packet))
+            .done();
+        let rest = d
+            .extra
+            .iter()
+            .map(|(name, b)| Object::new().str("name", name).str("hex", &hex(b)).done());
         (layers, json::array(std::iter::once(first).chain(rest)))
     }
 
@@ -1070,7 +1431,13 @@ mod tests {
     fn detail_writers_match_the_plain_json() {
         let mut packets = vec![
             tcp(40000, 80, 100, 0x02, b""),
-            tcp(40000, 80, 101, 0x18, b"GET /a\"b\\c\x01</script> HTTP/1.1\r\nhost: x\r\n\r\n"),
+            tcp(
+                40000,
+                80,
+                101,
+                0x18,
+                b"GET /a\"b\\c\x01</script> HTTP/1.1\r\nhost: x\r\n\r\n",
+            ),
             tcp_back(700, 0x18, b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"),
             tcp(40001, 9000, 5, 0x18, &[0xff; 1460]),
         ];
@@ -1084,8 +1451,16 @@ mod tests {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            let payload: Vec<u8> = (0..(state % 300)).map(|i| (state >> (i % 56)) as u8).collect();
-            packets.push(tcp(1000 + (state % 50) as u16, [443, 80, 53][(state % 3) as usize], state as u32, 0x18, &payload));
+            let payload: Vec<u8> = (0..(state % 300))
+                .map(|i| (state >> (i % 56)) as u8)
+                .collect();
+            packets.push(tcp(
+                1000 + (state % 50) as u16,
+                [443, 80, 53][(state % 3) as usize],
+                state as u32,
+                0x18,
+                &payload,
+            ));
         }
         let mut dis = Dissector::default();
         for p in &packets {

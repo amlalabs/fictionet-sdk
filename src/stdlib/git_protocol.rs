@@ -64,9 +64,9 @@
 //! assert!(reply.ends_with(b" HEAD symref-target:refs/heads/main\n0000"));
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::ascii::hex_value as hex_digit;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
@@ -191,11 +191,13 @@ impl Prefixed for Packet {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        _limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         Ok(Pkt::parse(input)?.map(|(packet, used)| (packet.to_packet(), used)))
     }
 }
-
 
 /// A packet borrowed from the bytes it was read from, so that a message
 /// can be checked without copying its data.
@@ -316,7 +318,8 @@ impl ObjectId {
     /// accept either, so upper-case digits are read and stored in lower
     /// case.
     pub fn parse(s: &str) -> Option<ObjectId> {
-        let ok = (s.len() == SHA1_HEX_LEN || s.len() == SHA256_HEX_LEN) && s.bytes().all(|c| c.is_ascii_hexdigit());
+        let ok = (s.len() == SHA1_HEX_LEN || s.len() == SHA256_HEX_LEN)
+            && s.bytes().all(|c| c.is_ascii_hexdigit());
         ok.then(|| ObjectId(s.to_ascii_lowercase()))
     }
 
@@ -355,7 +358,10 @@ pub struct Unknown<T> {
 
 impl<T> Unknown<T> {
     fn new(line: &str) -> Unknown<T> {
-        Unknown { line: line.to_string(), kind: std::marker::PhantomData }
+        Unknown {
+            line: line.to_string(),
+            kind: std::marker::PhantomData,
+        }
     }
 
     /// The line, without its line feed.
@@ -403,12 +409,18 @@ pub struct Capability {
 impl Capability {
     /// A capability with no value.
     pub fn new(name: &str) -> Capability {
-        Capability { name: name.to_string(), value: None }
+        Capability {
+            name: name.to_string(),
+            value: None,
+        }
     }
 
     /// A capability with a value.
     pub fn with_value(name: &str, value: &str) -> Capability {
-        Capability { name: name.to_string(), value: Some(value.to_string()) }
+        Capability {
+            name: name.to_string(),
+            value: Some(value.to_string()),
+        }
     }
 
     fn parse(s: &str) -> Result<Capability, Error> {
@@ -419,13 +431,19 @@ impl Capability {
         if !is_key(name) {
             return Err(Error::Syntax("a capability name"));
         }
-        Ok(Capability { name: field(name)?, value: value.map(field).transpose()? })
+        Ok(Capability {
+            name: field(name)?,
+            value: value.map(field).transpose()?,
+        })
     }
 
     fn token(&self, v0: bool) -> Result<String, Error> {
         let name = checked_key(&self.name)?;
         Ok(match &self.value {
-            Some(value) => format!("{name}={}", checked_text(value, if v0 { &[' '] } else { &[] }, MAX_TEXT)?),
+            Some(value) => format!(
+                "{name}={}",
+                checked_text(value, if v0 { &[' '] } else { &[] }, MAX_TEXT)?
+            ),
             None => name.to_string(),
         })
     }
@@ -493,12 +511,22 @@ impl ProtoRequest {
 
     /// Reads a request from a packet's data.
     pub fn from_data(d: &[u8]) -> Result<ProtoRequest, Error> {
-        if d.len() > MAX_DATA { return Err(Error::TooLong); }
-        let sp = d.iter().position(|&c| c == b' ').ok_or(Error::Syntax("a request line"))?;
+        if d.len() > MAX_DATA {
+            return Err(Error::TooLong);
+        }
+        let sp = d
+            .iter()
+            .position(|&c| c == b' ')
+            .ok_or(Error::Syntax("a request line"))?;
         let service = Service::from_name(text(&d[..sp])?).ok_or(Error::Syntax("a service name"))?;
         let rest = &d[sp + 1..];
         let (path, mut rest) = until_nul(rest)?;
-        let mut req = ProtoRequest { service, path: field(utf8(path)?)?, host: None, extra: Vec::new() };
+        let mut req = ProtoRequest {
+            service,
+            path: field(utf8(path)?)?,
+            host: None,
+            extra: Vec::new(),
+        };
         if let Some(h) = rest.strip_prefix(b"host=") {
             let (host, after) = until_nul(h)?;
             req.host = Some(field(utf8(host)?)?);
@@ -543,23 +571,31 @@ impl ProtoRequest {
     /// Builds the complete request packet. Refuses NULs, empty extra
     /// parameters, and fields or lists beyond their limits.
     pub fn to_packet(&self) -> Result<Packet, Error> {
-        if self.extra.len() > MAX_CAPABILITIES { return Err(Error::Unwritable); }
+        if self.extra.len() > MAX_CAPABILITIES {
+            return Err(Error::Unwritable);
+        }
         let mut text = format!("{} {}\0", self.service.name(), checked_nul(&self.path)?);
         if let Some(host) = &self.host {
             text.push_str("host=");
             text.push_str(checked_nul(host)?);
             text.push('\0');
         }
-        if !self.extra.is_empty() { text.push('\0'); }
+        if !self.extra.is_empty() {
+            text.push('\0');
+        }
         for parameter in &self.extra {
             let parameter = checked_nul(parameter)?;
-            if parameter.is_empty() || text.len().saturating_add(parameter.len()).saturating_add(1) > MAX_DATA {
+            if parameter.is_empty()
+                || text.len().saturating_add(parameter.len()).saturating_add(1) > MAX_DATA
+            {
                 return Err(Error::Unwritable);
             }
             text.push_str(parameter);
             text.push('\0');
         }
-        if text.len() > MAX_DATA { return Err(Error::Unwritable); }
+        if text.len() > MAX_DATA {
+            return Err(Error::Unwritable);
+        }
         Ok(Packet::Data(text.into_bytes()))
     }
 
@@ -577,10 +613,16 @@ pub struct ServiceHeader(
 
 impl ServiceHeader {
     fn parse_prefix(bytes: &[u8]) -> Result<Option<(Self, usize)>, Error> {
-        let Some((packets, used)) = until_flush(bytes, true)? else { return Ok(None) };
-        let [packet] = packets.as_slice() else { return Err(Error::Syntax("one service line")) };
+        let Some((packets, used)) = until_flush(bytes, true)? else {
+            return Ok(None);
+        };
+        let [packet] = packets.as_slice() else {
+            return Err(Error::Syntax("one service line"));
+        };
         let text = line(data_of(packet)?)?;
-        let name = text.strip_prefix("# service=").ok_or(Error::Syntax("# service="))?;
+        let name = text
+            .strip_prefix("# service=")
+            .ok_or(Error::Syntax("# service="))?;
         let service = Service::from_name(name).ok_or(Error::Syntax("a service name"))?;
         Ok(Some((Self(service), used)))
     }
@@ -618,7 +660,9 @@ pub struct Advertisement {
 
 impl Advertisement {
     fn parse_prefix(b: &[u8]) -> Result<Option<(Advertisement, usize)>, Error> {
-        let Some((packets, used)) = until_flush(b, true)? else { return Ok(None) };
+        let Some((packets, used)) = until_flush(b, true)? else {
+            return Ok(None);
+        };
         Ok(Some((Advertisement::read(&packets)?, used)))
     }
 
@@ -627,7 +671,9 @@ impl Advertisement {
     /// says: 40 hex digits without one or with `sha1`, and 64 with
     /// `sha256`.
     pub fn from_packets(packets: &[Packet]) -> Result<Advertisement, Error> {
-        if packets.len() > MAX_MESSAGE_PACKETS { return Err(Error::TooMany); }
+        if packets.len() > MAX_MESSAGE_PACKETS {
+            return Err(Error::TooMany);
+        }
         Advertisement::read(&packets.iter().map(Pkt::of).collect::<Vec<_>>())
     }
 
@@ -683,7 +729,12 @@ impl Advertisement {
             }
         }
         if let Some(n) = id_len(&ad.capabilities)
-            && ad.refs.iter().map(|r| &r.id).chain(&ad.shallow).any(|id| id.as_str().len() != n)
+            && ad
+                .refs
+                .iter()
+                .map(|r| &r.id)
+                .chain(&ad.shallow)
+                .any(|id| id.as_str().len() != n)
         {
             return Err(Error::ObjectId);
         }
@@ -696,24 +747,47 @@ impl Advertisement {
     }
 
     fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        if self.refs.len() > MAX_ITEMS || self.shallow.len() > MAX_ITEMS { return Err(Error::Unwritable); }
-        let length = id_len(&self.capabilities);
-        let fits = |id: &ObjectId| length.is_none_or(|n| id.as_str().len() == n);
-        if self.refs.iter().any(|r| !fits(&r.id)) || self.shallow.iter().any(|id| !fits(id))
-            || self.refs.first().is_some_and(|r| r.id.is_zero() && r.name == "capabilities^{}") {
+        if self.refs.len() > MAX_ITEMS || self.shallow.len() > MAX_ITEMS {
             return Err(Error::Unwritable);
         }
-        if self.version_1 { Packet::text("version 1").write(out)?; }
+        let length = id_len(&self.capabilities);
+        let fits = |id: &ObjectId| length.is_none_or(|n| id.as_str().len() == n);
+        if self.refs.iter().any(|r| !fits(&r.id))
+            || self.shallow.iter().any(|id| !fits(id))
+            || self
+                .refs
+                .first()
+                .is_some_and(|r| r.id.is_zero() && r.name == "capabilities^{}")
+        {
+            return Err(Error::Unwritable);
+        }
+        if self.version_1 {
+            Packet::text("version 1").write(out)?;
+        }
         let mut first = match self.refs.first() {
-            Some(reference) => format!("{} {}\0", reference.id, checked_text(&reference.name, &[], MAX_TEXT)?),
-            None => format!("{} capabilities^{{}}\0", ObjectId::zero(length == Some(SHA256_HEX_LEN))),
+            Some(reference) => format!(
+                "{} {}\0",
+                reference.id,
+                checked_text(&reference.name, &[], MAX_TEXT)?
+            ),
+            None => format!(
+                "{} capabilities^{{}}\0",
+                ObjectId::zero(length == Some(SHA256_HEX_LEN))
+            ),
         };
         push_caps(&mut first, &self.capabilities, "")?;
         Packet::text(&first).write(out)?;
         for reference in self.refs.iter().skip(1) {
-            Packet::text(&format!("{} {}", reference.id, checked_text(&reference.name, &[], MAX_TEXT)?)).write(out)?;
+            Packet::text(&format!(
+                "{} {}",
+                reference.id,
+                checked_text(&reference.name, &[], MAX_TEXT)?
+            ))
+            .write(out)?;
         }
-        for id in &self.shallow { Packet::text(&format!("shallow {id}")).write(out)?; }
+        for id in &self.shallow {
+            Packet::text(&format!("shallow {id}")).write(out)?;
+        }
         Packet::Flush.write(out)?;
         Ok(())
     }
@@ -729,19 +803,25 @@ pub struct CapabilityAdvertisement {
 
 impl CapabilityAdvertisement {
     fn parse_prefix(b: &[u8]) -> Result<Option<(CapabilityAdvertisement, usize)>, Error> {
-        let Some((packets, used)) = until_flush(b, true)? else { return Ok(None) };
+        let Some((packets, used)) = until_flush(b, true)? else {
+            return Ok(None);
+        };
         Ok(Some((CapabilityAdvertisement::read(&packets)?, used)))
     }
 
     /// Reads an advertisement from its packets, not counting the flush.
     pub fn from_packets(packets: &[Packet]) -> Result<CapabilityAdvertisement, Error> {
-        if packets.len() > MAX_MESSAGE_PACKETS { return Err(Error::TooMany); }
+        if packets.len() > MAX_MESSAGE_PACKETS {
+            return Err(Error::TooMany);
+        }
         CapabilityAdvertisement::read(&packets.iter().map(Pkt::of).collect::<Vec<_>>())
     }
 
     fn read(packets: &[Pkt<'_>]) -> Result<CapabilityAdvertisement, Error> {
         any_remote(packets)?;
-        let Some((first, rest)) = packets.split_first() else { return Err(Error::Syntax("version 2")) };
+        let Some((first, rest)) = packets.split_first() else {
+            return Err(Error::Syntax("version 2"));
+        };
         let s = line(data_of(first)?)?;
         if s != "version 2" {
             return Err(Error::Syntax("version 2"));
@@ -749,7 +829,10 @@ impl CapabilityAdvertisement {
         if rest.len() > MAX_CAPABILITIES {
             return Err(Error::TooMany);
         }
-        let capabilities = rest.iter().map(|p| Capability::parse(line(data_of(p)?)?)).collect::<Result<_, _>>()?;
+        let capabilities = rest
+            .iter()
+            .map(|p| Capability::parse(line(data_of(p)?)?))
+            .collect::<Result<_, _>>()?;
         Ok(CapabilityAdvertisement { capabilities })
     }
 
@@ -785,7 +868,10 @@ impl Command {
         if self.args.len() > MAX_ITEMS {
             return Err(Error::TooMany);
         }
-        self.args.iter().map(|a| LsRefsArg::parse_line(checked_line(a)?)).collect()
+        self.args
+            .iter()
+            .map(|a| LsRefsArg::parse_line(checked_line(a)?))
+            .collect()
     }
 
     /// The arguments read as `fetch` arguments. More than [`MAX_ITEMS`]
@@ -796,9 +882,17 @@ impl Command {
         if self.args.len() > MAX_ITEMS {
             return Err(Error::TooMany);
         }
-        let args = self.args.iter().map(|a| ClientLine::parse_line(checked_line(a)?)).collect::<Result<Vec<_>, _>>()?;
+        let args = self
+            .args
+            .iter()
+            .map(|a| ClientLine::parse_line(checked_line(a)?))
+            .collect::<Result<Vec<_>, _>>()?;
         let deepen = args.iter().any(|a| matches!(a, ClientLine::Deepen(_)));
-        if deepen && args.iter().any(|a| matches!(a, ClientLine::DeepenSince(_) | ClientLine::DeepenNot(_))) {
+        if deepen
+            && args
+                .iter()
+                .any(|a| matches!(a, ClientLine::DeepenSince(_) | ClientLine::DeepenNot(_)))
+        {
             return Err(Error::Syntax("deepen without deepen-since or deepen-not"));
         }
         Ok(args)
@@ -816,7 +910,9 @@ pub enum V2Request {
 
 impl V2Request {
     fn parse_prefix(b: &[u8]) -> Result<Option<(V2Request, usize)>, Error> {
-        let Some((packets, used)) = until_flush(b, false)? else { return Ok(None) };
+        let Some((packets, used)) = until_flush(b, false)? else {
+            return Ok(None);
+        };
         Ok(Some((V2Request::read(&packets)?, used)))
     }
 
@@ -824,18 +920,28 @@ impl V2Request {
     /// delimiter packet before the arguments may be left out when there
     /// are none.
     pub fn from_packets(packets: &[Packet]) -> Result<V2Request, Error> {
-        if packets.len() > MAX_MESSAGE_PACKETS { return Err(Error::TooMany); }
+        if packets.len() > MAX_MESSAGE_PACKETS {
+            return Err(Error::TooMany);
+        }
         V2Request::read(&packets.iter().map(Pkt::of).collect::<Vec<_>>())
     }
 
     fn read(packets: &[Pkt<'_>]) -> Result<V2Request, Error> {
-        let Some((first, rest)) = packets.split_first() else { return Ok(V2Request::Empty) };
+        let Some((first, rest)) = packets.split_first() else {
+            return Ok(V2Request::Empty);
+        };
         let s = line(data_of(first)?)?;
-        let name = s.strip_prefix("command=").ok_or(Error::Syntax("command="))?;
+        let name = s
+            .strip_prefix("command=")
+            .ok_or(Error::Syntax("command="))?;
         if !is_key(name) {
             return Err(Error::Syntax("a command name"));
         }
-        let mut cmd = Command { name: field(name)?, capabilities: Vec::new(), args: Vec::new() };
+        let mut cmd = Command {
+            name: field(name)?,
+            capabilities: Vec::new(),
+            args: Vec::new(),
+        };
         let mut in_args = false;
         for p in rest {
             match p {
@@ -862,7 +968,9 @@ impl V2Request {
 
     fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if let Self::Command(command) = self {
-            if command.args.len() > MAX_ITEMS { return Err(Error::Unwritable); }
+            if command.args.len() > MAX_ITEMS {
+                return Err(Error::Unwritable);
+            }
             let name = checked_key(&command.name)?;
             Packet::text(&format!("command={name}")).write(out)?;
             write_caps_v2(out, &command.capabilities)?;
@@ -940,8 +1048,17 @@ impl LsRef {
         let mut parts = s.split(' ');
         let first = parts.next().unwrap_or("");
         let name = parts.next().ok_or(Error::Syntax("a ref line"))?;
-        let id = if first == "unborn" { None } else { Some(oid(first)?) };
-        let mut r = LsRef { id, name: field(name)?, symref_target: None, peeled: None };
+        let id = if first == "unborn" {
+            None
+        } else {
+            Some(oid(first)?)
+        };
+        let mut r = LsRef {
+            id,
+            name: field(name)?,
+            symref_target: None,
+            peeled: None,
+        };
         for a in parts {
             if let Some(t) = a.strip_prefix("symref-target:") {
                 r.symref_target = Some(field(t)?);
@@ -968,7 +1085,6 @@ impl LsRef {
         }
         Ok(s)
     }
-
 }
 
 /// One line a client sends while fetching: a version 0 upload request or
@@ -1037,7 +1153,10 @@ impl ClientLine {
             _ => {
                 if let Some(rest) = s.strip_prefix("want ") {
                     let (id, caps) = rest.split_once(' ').unwrap_or((rest, ""));
-                    ClientLine::Want { id: oid(id)?, capabilities: parse_caps(caps)? }
+                    ClientLine::Want {
+                        id: oid(id)?,
+                        capabilities: parse_caps(caps)?,
+                    }
                 } else if let Some(r) = s.strip_prefix("want-ref ") {
                     ClientLine::WantRef(field(r)?)
                 } else if let Some(id) = s.strip_prefix("have ") {
@@ -1083,11 +1202,12 @@ impl ClientLine {
             ClientLine::OfsDelta => "ofs-delta".to_string(),
             ClientLine::SidebandAll => "sideband-all".to_string(),
             ClientLine::WaitForDone => "wait-for-done".to_string(),
-            ClientLine::PackfileUris(p) => format!("packfile-uris {}", checked_text(p, &[], MAX_TEXT)?),
+            ClientLine::PackfileUris(p) => {
+                format!("packfile-uris {}", checked_text(p, &[], MAX_TEXT)?)
+            }
             ClientLine::Other(u) => u.line.clone(),
         })
     }
-
 }
 
 /// What an `ACK` adds after the object id in version 0 multi-ack modes.
@@ -1139,9 +1259,15 @@ impl Section {
     }
 
     fn from_name(s: &str) -> Option<Section> {
-        [Section::Acknowledgments, Section::ShallowInfo, Section::WantedRefs, Section::PackfileUris, Section::Packfile]
-            .into_iter()
-            .find(|x| x.name() == s)
+        [
+            Section::Acknowledgments,
+            Section::ShallowInfo,
+            Section::WantedRefs,
+            Section::PackfileUris,
+            Section::Packfile,
+        ]
+        .into_iter()
+        .find(|x| x.name() == s)
     }
 }
 
@@ -1189,7 +1315,10 @@ impl ServerLine {
                         Some((id, "ready")) => (id, Some(AckStatus::Ready)),
                         Some(_) => return Err(Error::Syntax("an ACK status")),
                     };
-                    ServerLine::Ack { id: oid(id)?, status }
+                    ServerLine::Ack {
+                        id: oid(id)?,
+                        status,
+                    }
                 } else if let Some(id) = s.strip_prefix("shallow ") {
                     ServerLine::Shallow(oid(id)?)
                 } else if let Some(id) = s.strip_prefix("unshallow ") {
@@ -1207,7 +1336,10 @@ impl ServerLine {
         Ok(match self {
             ServerLine::Nak => "NAK".to_string(),
             ServerLine::Ack { id, status: None } => format!("ACK {id}"),
-            ServerLine::Ack { id, status: Some(s) } => format!("ACK {id} {}", s.name()),
+            ServerLine::Ack {
+                id,
+                status: Some(s),
+            } => format!("ACK {id} {}", s.name()),
             ServerLine::Ready => "ready".to_string(),
             ServerLine::Shallow(id) => format!("shallow {id}"),
             ServerLine::Unshallow(id) => format!("unshallow {id}"),
@@ -1216,7 +1348,6 @@ impl ServerLine {
             ServerLine::Other(u) => u.line.clone(),
         })
     }
-
 }
 
 /// A side-band stream: the first byte of each data packet says which.
@@ -1254,7 +1385,10 @@ impl Sideband {
 /// Splits a side-band data packet into its band and payload.
 pub fn split_band(data: &[u8]) -> Result<(Sideband, &[u8]), Error> {
     let (&c, rest) = data.split_first().ok_or(Error::Syntax("a band byte"))?;
-    Ok((Sideband::from_code(c).ok_or(Error::Syntax("band 1, 2 or 3"))?, rest))
+    Ok((
+        Sideband::from_code(c).ok_or(Error::Syntax("band 1, 2 or 3"))?,
+        rest,
+    ))
 }
 
 /// `payload` as side-band packets on `band`, each at most `packet_max`
@@ -1262,7 +1396,11 @@ pub fn split_band(data: &[u8]) -> Result<(Sideband, &[u8]), Error> {
 /// [`SIDE_BAND_64K_PACKET`] for `side-band-64k`. A value out of that
 /// range is brought into it, so the packets add at most one byte in 199
 /// to the payload. An empty payload gives no packets.
-pub fn band_packets(band: Sideband, payload: &[u8], packet_max: usize) -> impl Iterator<Item = Packet> + '_ {
+pub fn band_packets(
+    band: Sideband,
+    payload: &[u8],
+    packet_max: usize,
+) -> impl Iterator<Item = Packet> + '_ {
     let chunk = packet_max.clamp(SIDE_BAND_PACKET, SIDE_BAND_64K_PACKET) - HEADER_LEN - 1;
     payload.chunks(chunk).map(move |piece| {
         let mut data = Vec::with_capacity(piece.len() + 1);
@@ -1295,10 +1433,14 @@ impl Decode for Bands {
     type Error = Error;
     const NAME: &'static str = "Git side-band";
 
-    fn capacity(&self) -> usize { MAX_PACKET }
+    fn capacity(&self) -> usize {
+        MAX_PACKET
+    }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Band>, Error> {
-        let Some((packet, used)) = Pkt::parse(input)? else { return Ok(Step::Need) };
+        let Some((packet, used)) = Pkt::parse(input)? else {
+            return Ok(Step::Need);
+        };
         let item = match packet {
             Pkt::Flush => Band::Flush,
             Pkt::Delim => Band::Delim,
@@ -1347,7 +1489,13 @@ fn data_of<'a>(p: &Pkt<'a>) -> Result<&'a [u8], Error> {
 
 /// The first `ERR` line among `packets`, as an error.
 fn any_remote(packets: &[Pkt<'_>]) -> Result<(), Error> {
-    packets.iter().try_for_each(|p| if let Pkt::Data(d) = p { remote(d) } else { Ok(()) })
+    packets.iter().try_for_each(|p| {
+        if let Pkt::Data(d) = p {
+            remote(d)
+        } else {
+            Ok(())
+        }
+    })
 }
 
 /// How long an advertisement's ids are, by its `object-format`
@@ -1414,21 +1562,33 @@ fn number<T: std::str::FromStr>(s: &str) -> Result<T, Error> {
 /// need not be UTF-8 text: the other side has given up either way.
 fn remote(d: &[u8]) -> Result<(), Error> {
     match strip_lf(d).strip_prefix(b"ERR ") {
-        Some(m) => Err(Error::Remote(clipped_text(&String::from_utf8_lossy(&m[..m.len().min(MAX_TEXT + 3)]), MAX_TEXT).to_string())),
+        Some(m) => Err(Error::Remote(
+            clipped_text(
+                &String::from_utf8_lossy(&m[..m.len().min(MAX_TEXT + 3)]),
+                MAX_TEXT,
+            )
+            .to_string(),
+        )),
         None => Ok(()),
     }
 }
 
 /// The bytes before the next NUL, and those after it.
 fn until_nul(b: &[u8]) -> Result<(&[u8], &[u8]), Error> {
-    let n = b.iter().position(|&c| c == 0).ok_or(Error::Syntax("a NUL"))?;
+    let n = b
+        .iter()
+        .position(|&c| c == 0)
+        .ok_or(Error::Syntax("a NUL"))?;
     Ok((&b[..n], &b[n + 1..]))
 }
 
 /// `<id> <name>`, as in a version 0 advertisement.
 fn ref_line(s: &str) -> Result<AdvertisedRef, Error> {
     let (id, name) = s.split_once(' ').ok_or(Error::Syntax("a ref line"))?;
-    Ok(AdvertisedRef { id: oid(id)?, name: field(name)? })
+    Ok(AdvertisedRef {
+        id: oid(id)?,
+        name: field(name)?,
+    })
 }
 
 /// A version 0 capability list: names split at spaces.
@@ -1444,11 +1604,18 @@ fn parse_caps(s: &str) -> Result<Vec<Capability>, Error> {
 }
 
 fn push_caps(out: &mut String, caps: &[Capability], first_sep: &str) -> Result<(), Error> {
-    if caps.len() > MAX_CAPABILITIES { return Err(Error::Unwritable); }
+    if caps.len() > MAX_CAPABILITIES {
+        return Err(Error::Unwritable);
+    }
     for (index, capability) in caps.iter().enumerate() {
         let token = capability.token(true)?;
         let separator = if index == 0 { first_sep } else { " " };
-        if out.len().saturating_add(separator.len()).saturating_add(token.len()) > MAX_LINE {
+        if out
+            .len()
+            .saturating_add(separator.len())
+            .saturating_add(token.len())
+            > MAX_LINE
+        {
             return Err(Error::Unwritable);
         }
         out.push_str(separator);
@@ -1458,8 +1625,12 @@ fn push_caps(out: &mut String, caps: &[Capability], first_sep: &str) -> Result<(
 }
 
 fn write_caps_v2(out: &mut Vec<u8>, caps: &[Capability]) -> Result<(), Error> {
-    if caps.len() > MAX_CAPABILITIES { return Err(Error::Unwritable); }
-    for capability in caps { Packet::text(&capability.token(false)?).write(out)?; }
+    if caps.len() > MAX_CAPABILITIES {
+        return Err(Error::Unwritable);
+    }
+    for capability in caps {
+        Packet::text(&capability.token(false)?).write(out)?;
+    }
     Ok(())
 }
 
@@ -1474,17 +1645,25 @@ fn is_key_byte(c: u8) -> bool {
 }
 
 fn checked_key(text: &str) -> Result<&str, Error> {
-    if text.len() > MAX_TEXT || !is_key(text) { return Err(Error::Unwritable); }
+    if text.len() > MAX_TEXT || !is_key(text) {
+        return Err(Error::Unwritable);
+    }
     Ok(text)
 }
 
 fn checked_nul(text: &str) -> Result<&str, Error> {
-    if text.len() > MAX_TEXT || text.contains('\0') { return Err(Error::Unwritable); }
+    if text.len() > MAX_TEXT || text.contains('\0') {
+        return Err(Error::Unwritable);
+    }
     Ok(text)
 }
 
 fn checked_text<'a>(text: &'a str, excluded: &[char], max: usize) -> Result<&'a str, Error> {
-    if text.len() > max || text.chars().any(|c| c == '\0' || c == '\n' || excluded.contains(&c)) {
+    if text.len() > max
+        || text
+            .chars()
+            .any(|c| c == '\0' || c == '\n' || excluded.contains(&c))
+    {
         return Err(Error::Unwritable);
     }
     Ok(text)
@@ -1531,21 +1710,31 @@ macro_rules! message_wire {
         }
     };
 }
-message_wire!(ProtoRequest,
+message_wire!(
+    ProtoRequest,
     "Reads the initial git:// service request. Refuses non-data packets, unknown services, missing NUL separators, malformed host or extra parameters, and fields above MAX_TEXT. Line endings inside NUL-delimited fields are preserved.",
-    "Appends the complete request packet. Refuses NULs, empty extra parameters, excessive fields or lists, and a request above MAX_DATA.");
-message_wire!(ServiceHeader,
+    "Appends the complete request packet. Refuses NULs, empty extra parameters, excessive fields or lists, and a request above MAX_DATA."
+);
+message_wire!(
+    ServiceHeader,
     "Reads one smart HTTP service line followed by a flush. Refuses unknown services and any other packet layout.",
-    "Appends the service announcement and flush. Every service value is representable.");
-message_wire!(Advertisement,
+    "Appends the service announcement and flush. Every service value is representable."
+);
+message_wire!(
+    Advertisement,
     "Reads a version 0 or 1 ref advertisement through its flush. Refuses malformed refs or capabilities, object IDs inconsistent with object-format, and refs after shallow lines. An ERR line returns Error::Remote immediately, even before a flush; its text is limited to MAX_TEXT. Each parse starts at the beginning. For incremental input, collect packets with [`Stream<Frames::<Packet>>`](fictionet::stdlib::codec::Stream) and use [`Advertisement::from_packets`].",
-    "Appends refs, capabilities, shallow lines, and a flush. Refuses invalid fields, conflicting object formats, a first ref that would become the empty-ref marker, and values beyond the reader limits. SHA-1 is the default object format.");
-message_wire!(CapabilityAdvertisement,
+    "Appends refs, capabilities, shallow lines, and a flush. Refuses invalid fields, conflicting object formats, a first ref that would become the empty-ref marker, and values beyond the reader limits. SHA-1 is the default object format."
+);
+message_wire!(
+    CapabilityAdvertisement,
     "Reads version 2 and its capabilities through a flush. Refuses missing version 2 or malformed capabilities. An ERR line returns Error::Remote immediately, even before a flush; its text is limited to MAX_TEXT.",
-    "Appends version 2, each capability, and a flush. Refuses malformed capability names or values and lists beyond MAX_CAPABILITIES.");
-message_wire!(V2Request,
+    "Appends version 2, each capability, and a flush. Refuses malformed capability names or values and lists beyond MAX_CAPABILITIES."
+);
+message_wire!(
+    V2Request,
     "Reads one version 2 request through its flush. A lone flush means Empty. Refuses missing command=, malformed capabilities, repeated delimiters, or control packets in arguments. The delimiter may be omitted when there are no arguments.",
-    "Appends the command, capabilities, delimiter, arguments, and flush, or a lone flush for Empty. Refuses invalid command names, capabilities, line endings, and excessive fields or lists.");
+    "Appends the command, capabilities, delimiter, arguments, and flush, or a lone flush for Empty. Refuses invalid command names, capabilities, line endings, and excessive fields or lists."
+);
 
 macro_rules! line_wire {
     ($($ty:ty),+ $(,)?) => {$ (
@@ -1583,8 +1772,11 @@ line_wire!(LsRefsArg, LsRef, ClientLine, ServerLine);
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
 pub mod harness {
-    use super::{Advertisement, Band, Bands, CapabilityAdvertisement, ClientLine, LsRef, LsRefsArg,
-        MAX_PACKET, Packet, ProtoRequest, ServerLine, ServiceHeader, Sideband, V2Request, band_packets};
+    use super::{
+        Advertisement, Band, Bands, CapabilityAdvertisement, ClientLine, LsRef, LsRefsArg,
+        MAX_PACKET, Packet, ProtoRequest, ServerLine, ServiceHeader, Sideband, V2Request,
+        band_packets,
+    };
     use fictionet::stdlib::codec::{Frames, Stream, Wire};
     use fictionet::stdlib::test_support::{contract, decode_all};
 
@@ -1642,7 +1834,9 @@ pub mod harness {
         assert_eq!(failure, None);
         let mut back = Vec::new();
         for item in items {
-            let Band::Data(Sideband::Pack, payload) = item else { panic!("unexpected band") };
+            let Band::Data(Sideband::Pack, payload) = item else {
+                panic!("unexpected band")
+            };
             back.extend(payload);
         }
         assert_eq!(back, data);
@@ -1651,13 +1845,11 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::check;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     const A: &str = "7217a7c7e582c46cec22a130adf4b9d7d950fba0";
@@ -1684,56 +1876,114 @@ mod tests {
     // Examples from gitprotocol-common, "pkt-line Format".
     #[test]
     fn review_writer_validation() {
-        let request = V2Request::Command(Command { name: "fetch".into(), capabilities: vec![], args: vec!["ERR stopped".into()] });
+        let request = V2Request::Command(Command {
+            name: "fetch".into(),
+            capabilities: vec![],
+            args: vec!["ERR stopped".into()],
+        });
         let mut encoded = Vec::new();
         request.encode(&mut encoded).unwrap();
         assert_eq!(V2Request::parse(&encoded), Ok(request.clone()));
         assert_eq!(request.to_bytes(), Ok(encoded));
         for value in ["bad\0field".to_string(), "x".repeat(MAX_TEXT + 1)] {
-            let request = ProtoRequest { service: Service::UploadPack, path: value.clone(), host: None, extra: vec![] };
+            let request = ProtoRequest {
+                service: Service::UploadPack,
+                path: value.clone(),
+                host: None,
+                extra: vec![],
+            };
             assert_eq!(request.to_bytes(), Err(Error::Unwritable));
-            let caps = CapabilityAdvertisement { capabilities: vec![Capability::with_value("agent", &value)] };
+            let caps = CapabilityAdvertisement {
+                capabilities: vec![Capability::with_value("agent", &value)],
+            };
             assert_eq!(caps.to_bytes(), Err(Error::Unwritable));
-            assert_eq!(LsRefsArg::RefPrefix(value.clone()).to_bytes(), Err(Error::Unwritable));
-            assert_eq!(ClientLine::WantRef(value.clone()).to_bytes(), Err(Error::Unwritable));
-            assert_eq!(ServerLine::Error(value.clone()).to_bytes(), Err(Error::Unwritable));
-            assert_eq!(LsRef { id: None, name: value, symref_target: None, peeled: None }.to_bytes(), Err(Error::Unwritable));
+            assert_eq!(
+                LsRefsArg::RefPrefix(value.clone()).to_bytes(),
+                Err(Error::Unwritable)
+            );
+            assert_eq!(
+                ClientLine::WantRef(value.clone()).to_bytes(),
+                Err(Error::Unwritable)
+            );
+            assert_eq!(
+                ServerLine::Error(value.clone()).to_bytes(),
+                Err(Error::Unwritable)
+            );
+            assert_eq!(
+                LsRef {
+                    id: None,
+                    name: value,
+                    symref_target: None,
+                    peeled: None
+                }
+                .to_bytes(),
+                Err(Error::Unwritable)
+            );
         }
-        for service in [Service::UploadPack, Service::ReceivePack, Service::UploadArchive] {
+        for service in [
+            Service::UploadPack,
+            Service::ReceivePack,
+            Service::UploadArchive,
+        ] {
             let header = ServiceHeader(service);
-            assert_eq!(ServiceHeader::parse(&header.to_bytes().unwrap()), Ok(header));
+            assert_eq!(
+                ServiceHeader::parse(&header.to_bytes().unwrap()),
+                Ok(header)
+            );
         }
     }
 
     #[test]
     fn packet_examples() {
-        for (bytes, data) in [(&b"0006a\n"[..], &b"a\n"[..]), (b"0005a", b"a"), (b"000bfoobar\n", b"foobar\n"), (b"0004", b"")] {
+        for (bytes, data) in [
+            (&b"0006a\n"[..], &b"a\n"[..]),
+            (b"0005a", b"a"),
+            (b"000bfoobar\n", b"foobar\n"),
+            (b"0004", b""),
+        ] {
             let packet = Packet::parse(bytes).unwrap();
             assert_eq!(packet, Packet::Data(data.to_vec()));
             assert_eq!(packet.to_bytes().unwrap(), bytes);
         }
         assert_eq!(Packet::parse(b"0000rest"), Err(Error::Trailing));
-        assert_eq!(Frames::<Packet>::new().decode(b"0000rest", false), Ok(Step::Item(Packet::Flush, 4)));
+        assert_eq!(
+            Frames::<Packet>::new().decode(b"0000rest", false),
+            Ok(Step::Item(Packet::Flush, 4))
+        );
         assert_eq!(Packet::parse(b"0001"), Ok(Packet::Delim));
         assert_eq!(Packet::parse(b"0002"), Ok(Packet::ResponseEnd));
-        assert_eq!(Packet::parse(b"000Bfoobar\n"), Ok(Packet::Data(b"foobar\n".to_vec())));
+        assert_eq!(
+            Packet::parse(b"000Bfoobar\n"),
+            Ok(Packet::Data(b"foobar\n".to_vec()))
+        );
         assert_eq!(Packet::text("a"), Packet::Data(b"a\n".to_vec()));
         assert_eq!(Packet::Flush.data(), None);
     }
 
     #[test]
     fn packet_errors() {
-        for (bytes, error) in [(&b"0003"[..], Error::Reserved), (b"fff1", Error::PacketTooLong(0xfff1)),
-            (b"ffff", Error::PacketTooLong(0xffff)), (b"00g0", Error::Header),
-            (b"x", Error::Header), (b"0 ", Error::Header)] {
+        for (bytes, error) in [
+            (&b"0003"[..], Error::Reserved),
+            (b"fff1", Error::PacketTooLong(0xfff1)),
+            (b"ffff", Error::PacketTooLong(0xffff)),
+            (b"00g0", Error::Header),
+            (b"x", Error::Header),
+            (b"0 ", Error::Header),
+        ] {
             assert_eq!(Packet::parse(bytes), Err(error.clone()));
             assert!(!error.to_string().is_empty());
         }
-        assert_eq!(Frames::<Packet>::new().decode(b"fff0", false), Ok(Step::Need));
+        assert_eq!(
+            Frames::<Packet>::new().decode(b"fff0", false),
+            Ok(Step::Need)
+        );
         let bytes = b"000bfoobar\n";
         for n in 0..bytes.len() {
             assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Truncated));
-            assert_eq!(Frames::<Packet>::new().decode(&bytes[..n], false), Ok(Step::Need));
+            assert_eq!(
+                Frames::<Packet>::new().decode(&bytes[..n], false),
+                Ok(Step::Need)
+            );
         }
     }
 
@@ -1758,8 +2008,18 @@ mod tests {
     fn stream_splits_packets() {
         let bytes = pkt(&["want x\n", "0001", "0000", "done\n"]);
         contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_PACKET);
-        assert_eq!(decode_all(Frames::<Packet>::new, &bytes),
-            (vec![Packet::text("want x"), Packet::Delim, Packet::Flush, Packet::text("done")], None));
+        assert_eq!(
+            decode_all(Frames::<Packet>::new, &bytes),
+            (
+                vec![
+                    Packet::text("want x"),
+                    Packet::Delim,
+                    Packet::Flush,
+                    Packet::text("done")
+                ],
+                None
+            )
+        );
         let mut stream = Stream::new(Frames::<Packet>::new());
         assert_eq!(stream.push(b"00"), 2);
         assert_eq!(stream.next(), None);
@@ -1772,12 +2032,21 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
-        assert_linear("stream_takes_many_small_packets_in_linear_time", rounds(50_000), |size| {
-            let stream: Vec<u8> = b"0009done\n".iter().copied().cycle().take(9 * size).collect();
-            let (packets, failed) = decode_all(Frames::<Packet>::new, &stream);
-            assert_eq!(failed, None);
-            assert_eq!(packets.len(), size);
-        });
+        assert_linear(
+            "stream_takes_many_small_packets_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let stream: Vec<u8> = b"0009done\n"
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(9 * size)
+                    .collect();
+                let (packets, failed) = decode_all(Frames::<Packet>::new, &stream);
+                assert_eq!(failed, None);
+                assert_eq!(packets.len(), size);
+            },
+        );
     }
 
     // gitprotocol-pack, "Git Transport".
@@ -1801,13 +2070,20 @@ mod tests {
         let req = ProtoRequest::from_data(b"git-upload-archive /a\0\0a\0b\0").unwrap();
         assert_eq!(req.host, None);
         assert_eq!(req.extra, ["a", "b"]);
-        assert_eq!(ProtoRequest::from_data(req.to_packet().unwrap().data().unwrap()), Ok(req));
+        assert_eq!(
+            ProtoRequest::from_data(req.to_packet().unwrap().data().unwrap()),
+            Ok(req)
+        );
         // gitprotocol-pack, "Extra Parameters".
         let v1 = b"003egit-upload-pack /project.git\0host=myserver.com\0\0version=1\0";
         let req = ProtoRequest::parse(v1).unwrap();
         assert_eq!(req.version(), Some(1));
         assert_eq!(req.to_bytes().unwrap(), v1);
-        for s in [Service::UploadPack, Service::ReceivePack, Service::UploadArchive] {
+        for s in [
+            Service::UploadPack,
+            Service::ReceivePack,
+            Service::UploadArchive,
+        ] {
             assert_eq!(Service::from_name(s.name()), Some(s));
         }
     }
@@ -1823,17 +2099,48 @@ mod tests {
         assert!(syntax(b"git-upload-pack /x\0\0version=2"));
         // Each extra parameter has at least one byte, and the NUL before
         // them is followed by at least one.
-        assert_eq!(ProtoRequest::from_data(b"git-upload-pack /x\0\0a\0\0"), Err(Error::Syntax("an extra parameter")));
-        assert_eq!(ProtoRequest::from_data(b"git-upload-pack /x\0\0\0"), Err(Error::Syntax("an extra parameter")));
-        assert_eq!(ProtoRequest::from_data(b"git-upload-pack /x\0host=h\0\0"), Err(Error::Syntax("an extra parameter")));
-        assert_eq!(ProtoRequest::from_data(b"git-upload-pack /\xff\0"), Err(Error::Text));
+        assert_eq!(
+            ProtoRequest::from_data(b"git-upload-pack /x\0\0a\0\0"),
+            Err(Error::Syntax("an extra parameter"))
+        );
+        assert_eq!(
+            ProtoRequest::from_data(b"git-upload-pack /x\0\0\0"),
+            Err(Error::Syntax("an extra parameter"))
+        );
+        assert_eq!(
+            ProtoRequest::from_data(b"git-upload-pack /x\0host=h\0\0"),
+            Err(Error::Syntax("an extra parameter"))
+        );
+        assert_eq!(
+            ProtoRequest::from_data(b"git-upload-pack /\xff\0"),
+            Err(Error::Text)
+        );
         let long = format!("git-upload-pack /{}\0", "x".repeat(MAX_TEXT));
-        assert_eq!(ProtoRequest::from_data(long.as_bytes()), Err(Error::TooLong));
-        let many = format!("git-upload-pack /x\0\0{}", "p\0".repeat(MAX_CAPABILITIES + 1));
-        assert_eq!(ProtoRequest::from_data(many.as_bytes()), Err(Error::TooMany));
-        assert_eq!(ProtoRequest::parse(b"0000"), Err(Error::Syntax("a request line")));
+        assert_eq!(
+            ProtoRequest::from_data(long.as_bytes()),
+            Err(Error::TooLong)
+        );
+        let many = format!(
+            "git-upload-pack /x\0\0{}",
+            "p\0".repeat(MAX_CAPABILITIES + 1)
+        );
+        assert_eq!(
+            ProtoRequest::from_data(many.as_bytes()),
+            Err(Error::TooMany)
+        );
+        assert_eq!(
+            ProtoRequest::parse(b"0000"),
+            Err(Error::Syntax("a request line"))
+        );
         assert_eq!(ProtoRequest::parse(b"0003"), Err(Error::Reserved));
-        let bytes = ProtoRequest { service: Service::UploadPack, path: "/p".into(), host: None, extra: vec![] }.to_bytes().unwrap();
+        let bytes = ProtoRequest {
+            service: Service::UploadPack,
+            path: "/p".into(),
+            host: None,
+            extra: vec![],
+        }
+        .to_bytes()
+        .unwrap();
         for n in 0..bytes.len() {
             assert_eq!(ProtoRequest::parse(&bytes[..n]), Err(Error::Truncated));
         }
@@ -1841,40 +2148,85 @@ mod tests {
 
     #[test]
     fn proto_request_writer_refuses_invalid_fields() {
-        let base = ProtoRequest { service: Service::UploadPack, path: "/p".into(), host: None, extra: vec![] };
+        let base = ProtoRequest {
+            service: Service::UploadPack,
+            path: "/p".into(),
+            host: None,
+            extra: vec![],
+        };
         for request in [
-            ProtoRequest { path: "/a\0b\n".repeat(MAX_TEXT), ..base.clone() },
-            ProtoRequest { host: Some("h\0".into()), ..base.clone() },
-            ProtoRequest { extra: vec!["x".repeat(MAX_TEXT); MAX_CAPABILITIES + 1], ..base.clone() },
-            ProtoRequest { extra: vec!["x".repeat(MAX_TEXT); MAX_CAPABILITIES], ..base.clone() },
-            ProtoRequest { extra: vec![String::new(), "\0".into(), "version=2".into()], ..base.clone() },
+            ProtoRequest {
+                path: "/a\0b\n".repeat(MAX_TEXT),
+                ..base.clone()
+            },
+            ProtoRequest {
+                host: Some("h\0".into()),
+                ..base.clone()
+            },
+            ProtoRequest {
+                extra: vec!["x".repeat(MAX_TEXT); MAX_CAPABILITIES + 1],
+                ..base.clone()
+            },
+            ProtoRequest {
+                extra: vec!["x".repeat(MAX_TEXT); MAX_CAPABILITIES],
+                ..base.clone()
+            },
+            ProtoRequest {
+                extra: vec![String::new(), "\0".into(), "version=2".into()],
+                ..base.clone()
+            },
         ] {
             assert_eq!(request.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&request);
         }
-        let request = ProtoRequest { path: "/a\nb".into(), ..base };
-        assert_eq!(ProtoRequest::parse(&request.to_bytes().unwrap()), Ok(request));
+        let request = ProtoRequest {
+            path: "/a\nb".into(),
+            ..base
+        };
+        assert_eq!(
+            ProtoRequest::parse(&request.to_bytes().unwrap()),
+            Ok(request)
+        );
     }
 
     #[test]
     fn service_header_round_trip() {
         let bytes = ServiceHeader(Service::UploadPack).to_bytes().unwrap();
         assert_eq!(bytes, b"001e# service=git-upload-pack\n0000");
-        assert_eq!(ServiceHeader::parse(&bytes), Ok(ServiceHeader(Service::UploadPack)));
+        assert_eq!(
+            ServiceHeader::parse(&bytes),
+            Ok(ServiceHeader(Service::UploadPack))
+        );
         for n in 0..bytes.len() {
             assert_eq!(ServiceHeader::parse(&bytes[..n]), Err(Error::Truncated));
         }
-        assert_eq!(ServiceHeader::parse(b"0000"), Err(Error::Syntax("one service line")));
-        assert_eq!(ServiceHeader::parse(&pkt(&["# x\n", "0000"])), Err(Error::Syntax("# service=")));
-        assert_eq!(ServiceHeader::parse(&pkt(&["# service=git-x\n", "0000"])), Err(Error::Syntax("a service name")));
-        assert_eq!(ServiceHeader::parse(&pkt(&["0001", "0000"])), Err(Error::Syntax("a data packet")));
-        assert_eq!(ServiceHeader::parse(&pkt(&["ERR no\n", "0000"])), Err(Error::Remote("no".into())));
+        assert_eq!(
+            ServiceHeader::parse(b"0000"),
+            Err(Error::Syntax("one service line"))
+        );
+        assert_eq!(
+            ServiceHeader::parse(&pkt(&["# x\n", "0000"])),
+            Err(Error::Syntax("# service="))
+        );
+        assert_eq!(
+            ServiceHeader::parse(&pkt(&["# service=git-x\n", "0000"])),
+            Err(Error::Syntax("a service name"))
+        );
+        assert_eq!(
+            ServiceHeader::parse(&pkt(&["0001", "0000"])),
+            Err(Error::Syntax("a data packet"))
+        );
+        assert_eq!(
+            ServiceHeader::parse(&pkt(&["ERR no\n", "0000"])),
+            Err(Error::Remote("no".into()))
+        );
     }
 
     // gitprotocol-pack, "Reference Discovery".
     #[test]
     fn advertisement_example() {
-        let caps = "multi_ack thin-pack side-band side-band-64k ofs-delta shallow no-progress include-tag";
+        let caps =
+            "multi_ack thin-pack side-band side-band-64k ofs-delta shallow no-progress include-tag";
         let first = format!("{A} HEAD\0{caps}\n");
         let lines = [
             first.as_str(),
@@ -1891,14 +2243,24 @@ mod tests {
         let ad = Advertisement::parse(&bytes).unwrap();
         assert!(!ad.version_1);
         assert_eq!(ad.refs.len(), 6);
-        assert_eq!(ad.refs[0], AdvertisedRef { id: id(A), name: "HEAD".into() });
+        assert_eq!(
+            ad.refs[0],
+            AdvertisedRef {
+                id: id(A),
+                name: "HEAD".into()
+            }
+        );
         assert_eq!(ad.refs[5].name, "refs/tags/v1.0^{}");
         assert_eq!(ad.capabilities.len(), 8);
         assert!(ad.capability("ofs-delta").is_some());
         assert!(ad.capability("agent").is_none());
         assert_eq!(ad.to_bytes().unwrap(), bytes);
         for n in 0..bytes.len() {
-            assert_eq!(Advertisement::parse(&bytes[..n]), Err(Error::Truncated), "{n} bytes");
+            assert_eq!(
+                Advertisement::parse(&bytes[..n]),
+                Err(Error::Truncated),
+                "{n} bytes"
+            );
         }
     }
 
@@ -1907,7 +2269,10 @@ mod tests {
         let ad = Advertisement {
             version_1: true,
             refs: vec![],
-            capabilities: vec![Capability::with_value("object-format", "sha256"), Capability::with_value("agent", "git/2")],
+            capabilities: vec![
+                Capability::with_value("object-format", "sha256"),
+                Capability::with_value("agent", "git/2"),
+            ],
             shallow: vec![id(C)],
         };
         let bytes = ad.to_bytes().unwrap();
@@ -1929,8 +2294,14 @@ mod tests {
         // A leading ref named capabilities^{} with a zero id is refused.
         let odd = Advertisement {
             refs: vec![
-                AdvertisedRef { id: ObjectId::zero(false), name: "capabilities^{}".into() },
-                AdvertisedRef { id: id(B), name: "x".into() },
+                AdvertisedRef {
+                    id: ObjectId::zero(false),
+                    name: "capabilities^{}".into(),
+                },
+                AdvertisedRef {
+                    id: id(B),
+                    name: "x".into(),
+                },
             ],
             ..Advertisement::default()
         };
@@ -1942,10 +2313,20 @@ mod tests {
     // (process_dummy_ref in connect.c). Otherwise it is a ref.
     #[test]
     fn capabilities_line_needs_a_zero_id() {
-        let bytes = pkt(&[&format!("{A} capabilities^{{}}\0ofs-delta\n"), &format!("{B} refs/heads/x\n"), "0000"]);
+        let bytes = pkt(&[
+            &format!("{A} capabilities^{{}}\0ofs-delta\n"),
+            &format!("{B} refs/heads/x\n"),
+            "0000",
+        ]);
         let ad = Advertisement::parse(&bytes).unwrap();
         assert_eq!(ad.refs.len(), 2);
-        assert_eq!(ad.refs[0], AdvertisedRef { id: id(A), name: "capabilities^{}".into() });
+        assert_eq!(
+            ad.refs[0],
+            AdvertisedRef {
+                id: id(A),
+                name: "capabilities^{}".into()
+            }
+        );
         assert_eq!(ad.to_bytes().unwrap(), bytes);
         // With a zero id, of either length, it is the no-refs line.
         for zero in [ObjectId::zero(false), ObjectId::zero(true)] {
@@ -1959,11 +2340,23 @@ mod tests {
     fn object_ids_are_case_insensitive() {
         let upper = A.to_uppercase();
         assert_eq!(ObjectId::parse(&upper), Some(id(A)));
-        assert_eq!(ClientLine::parse(format!("have {upper}\n").as_bytes()), Ok(ClientLine::Have(id(A))));
-        assert_eq!(ServerLine::parse(format!("ACK {upper} common").as_bytes()).unwrap().to_bytes().unwrap(), format!("ACK {A} common\n").as_bytes());
+        assert_eq!(
+            ClientLine::parse(format!("have {upper}\n").as_bytes()),
+            Ok(ClientLine::Have(id(A)))
+        );
+        assert_eq!(
+            ServerLine::parse(format!("ACK {upper} common").as_bytes())
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            format!("ACK {A} common\n").as_bytes()
+        );
         let ad = Advertisement::parse(&pkt(&[&format!("{upper} HEAD\0\n"), "0000"])).unwrap();
         assert_eq!(ad.refs[0].id.as_str(), A);
-        let zero = Advertisement::parse(&pkt(&[&format!("{} capabilities^{{}}\0\n", "0".repeat(40)), "0000"]));
+        let zero = Advertisement::parse(&pkt(&[
+            &format!("{} capabilities^{{}}\0\n", "0".repeat(40)),
+            "0000",
+        ]));
         assert!(zero.unwrap().refs.is_empty());
     }
 
@@ -1972,7 +2365,9 @@ mod tests {
     // "2", written just so.
     #[test]
     fn version_is_the_greatest_one_asked_for() {
-        let req = |extra: &[u8]| ProtoRequest::from_data(&[&b"git-upload-pack /x\0\0"[..], extra].concat()).unwrap();
+        let req = |extra: &[u8]| {
+            ProtoRequest::from_data(&[&b"git-upload-pack /x\0\0"[..], extra].concat()).unwrap()
+        };
         assert_eq!(req(b"version=2\0version=1\0").version(), Some(2));
         assert_eq!(req(b"version=1\0version=2\0").version(), Some(2));
         assert_eq!(req(b"version=+2\0").version(), None);
@@ -1989,17 +2384,44 @@ mod tests {
     // back the line it read.
     #[test]
     fn unknown_lines_keep_their_reader() {
-        let ServerLine::Other(s) = ServerLine::parse(b"want zz\n").unwrap() else { panic!() };
+        let ServerLine::Other(s) = ServerLine::parse(b"want zz\n").unwrap() else {
+            panic!()
+        };
         assert_eq!(s.as_str(), "want zz");
-        assert_eq!(ServerLine::parse(ServerLine::Other(s.clone()).to_packet().unwrap().data().unwrap()), Ok(ServerLine::Other(s)));
+        assert_eq!(
+            ServerLine::parse(
+                ServerLine::Other(s.clone())
+                    .to_packet()
+                    .unwrap()
+                    .data()
+                    .unwrap()
+            ),
+            Ok(ServerLine::Other(s))
+        );
         let long = format!("ref-prefix {}", "p".repeat(MAX_TEXT + 1));
-        let ClientLine::Other(c) = ClientLine::parse(long.as_bytes()).unwrap() else { panic!() };
+        let ClientLine::Other(c) = ClientLine::parse(long.as_bytes()).unwrap() else {
+            panic!()
+        };
         assert_eq!(format!("{c:?}"), format!("Unknown({long:?})"));
-        assert_eq!(ClientLine::parse(&ClientLine::Other(c.clone()).to_bytes().unwrap()), Ok(ClientLine::Other(c)));
-        let ls = Command { name: "ls-refs".into(), capabilities: vec![], args: vec!["ACK x".into()] };
-        let Ok([LsRefsArg::Other(a)]) = <[LsRefsArg; 1]>::try_from(ls.ls_refs_args().unwrap()) else { panic!() };
-        assert_eq!(LsRefsArg::parse(&LsRefsArg::Other(a.clone()).to_bytes().unwrap()), Ok(LsRefsArg::Other(a)));
-        let set: std::collections::HashSet<_> = [Unknown::<ServerLine>::new("a"), Unknown::new("a")].into();
+        assert_eq!(
+            ClientLine::parse(&ClientLine::Other(c.clone()).to_bytes().unwrap()),
+            Ok(ClientLine::Other(c))
+        );
+        let ls = Command {
+            name: "ls-refs".into(),
+            capabilities: vec![],
+            args: vec!["ACK x".into()],
+        };
+        let Ok([LsRefsArg::Other(a)]) = <[LsRefsArg; 1]>::try_from(ls.ls_refs_args().unwrap())
+        else {
+            panic!()
+        };
+        assert_eq!(
+            LsRefsArg::parse(&LsRefsArg::Other(a.clone()).to_bytes().unwrap()),
+            Ok(LsRefsArg::Other(a))
+        );
+        let set: std::collections::HashSet<_> =
+            [Unknown::<ServerLine>::new("a"), Unknown::new("a")].into();
         assert_eq!(set.len(), 1);
     }
 
@@ -2007,22 +2429,52 @@ mod tests {
     #[test]
     fn keys_are_checked() {
         let name = Err(Error::Syntax("a capability name"));
-        assert_eq!(Advertisement::parse(&pkt(&[&format!("{A} HEAD\0ofs delta=x a.b\n"), "0000"])).map(|_| ()), name);
-        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["version 2\n", "ls refs\n", "0000"])).map(|_| ()), name);
-        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["version 2\n", "fetch/x=y\n", "0000"])).map(|_| ()), name);
-        assert_eq!(ClientLine::parse(format!("want {A} th!n-pack").as_bytes()).map(|_| ()), name);
-        let ok = CapabilityAdvertisement::parse(&pkt(&["version 2\n", "Ab-9_=v w\n", "0000"])).unwrap();
+        assert_eq!(
+            Advertisement::parse(&pkt(&[&format!("{A} HEAD\0ofs delta=x a.b\n"), "0000"]))
+                .map(|_| ()),
+            name
+        );
+        assert_eq!(
+            CapabilityAdvertisement::parse(&pkt(&["version 2\n", "ls refs\n", "0000"])).map(|_| ()),
+            name
+        );
+        assert_eq!(
+            CapabilityAdvertisement::parse(&pkt(&["version 2\n", "fetch/x=y\n", "0000"]))
+                .map(|_| ()),
+            name
+        );
+        assert_eq!(
+            ClientLine::parse(format!("want {A} th!n-pack").as_bytes()).map(|_| ()),
+            name
+        );
+        let ok =
+            CapabilityAdvertisement::parse(&pkt(&["version 2\n", "Ab-9_=v w\n", "0000"])).unwrap();
         assert_eq!(ok.capabilities, [Capability::with_value("Ab-9_", "v w")]);
         let command = Err(Error::Syntax("a command name"));
-        assert_eq!(V2Request::parse(&pkt(&["command=\n", "0000"])).map(|_| ()), command);
-        assert_eq!(V2Request::parse(&pkt(&["command=ls refs\n", "0000"])).map(|_| ()), command);
-        assert_eq!(V2Request::parse(&pkt(&["command=a=b\n", "0000"])).map(|_| ()), command);
+        assert_eq!(
+            V2Request::parse(&pkt(&["command=\n", "0000"])).map(|_| ()),
+            command
+        );
+        assert_eq!(
+            V2Request::parse(&pkt(&["command=ls refs\n", "0000"])).map(|_| ()),
+            command
+        );
+        assert_eq!(
+            V2Request::parse(&pkt(&["command=a=b\n", "0000"])).map(|_| ()),
+            command
+        );
         // A command whose name has nothing a key may hold is refused.
-        let empty = V2Request::Command(Command { name: "?!".into(), capabilities: vec![], args: vec!["x".into()] });
+        let empty = V2Request::Command(Command {
+            name: "?!".into(),
+            capabilities: vec![],
+            args: vec!["x".into()],
+        });
         assert_eq!(empty.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&empty);
         let cap = Capability::with_value("é x", "v");
-        let ad = CapabilityAdvertisement { capabilities: vec![cap.clone(), Capability::new("~")] };
+        let ad = CapabilityAdvertisement {
+            capabilities: vec![cap.clone(), Capability::new("~")],
+        };
         assert_eq!(ad.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&ad);
     }
@@ -2032,19 +2484,57 @@ mod tests {
         let first = format!("{A} HEAD\0ofs-delta\n");
         let parse = |lines: &[&str]| Advertisement::parse(&pkt(lines)).map(|_| ());
         let zero = format!("{} capabilities^{{}}\0\n", "0".repeat(40));
-        assert_eq!(parse(&[&zero, &format!("{A} x\n"), "0000"]), Err(Error::Syntax("a shallow line")));
-        assert_eq!(parse(&[&first, &format!("shallow {A}\n"), &format!("{A} x\n"), "0000"]), Err(Error::Syntax("a shallow line")));
+        assert_eq!(
+            parse(&[&zero, &format!("{A} x\n"), "0000"]),
+            Err(Error::Syntax("a shallow line"))
+        );
+        assert_eq!(
+            parse(&[
+                &first,
+                &format!("shallow {A}\n"),
+                &format!("{A} x\n"),
+                "0000"
+            ]),
+            Err(Error::Syntax("a shallow line"))
+        );
         assert_eq!(parse(&["nothex HEAD\0\n", "0000"]), Err(Error::ObjectId));
-        assert_eq!(parse(&[&first, "shallow zz\n", "0000"]), Err(Error::ObjectId));
-        assert_eq!(parse(&["ERR access denied\n", "0000"]), Err(Error::Remote("access denied".into())));
-        assert_eq!(parse(&[&first, "ERR later\n", "0000"]), Err(Error::Remote("later".into())));
-        assert_eq!(parse(&[&first, "0001", "0000"]), Err(Error::Syntax("a data packet")));
-        assert_eq!(parse(&["0002", "0000"]), Err(Error::Syntax("a data packet")));
+        assert_eq!(
+            parse(&[&first, "shallow zz\n", "0000"]),
+            Err(Error::ObjectId)
+        );
+        assert_eq!(
+            parse(&["ERR access denied\n", "0000"]),
+            Err(Error::Remote("access denied".into()))
+        );
+        assert_eq!(
+            parse(&[&first, "ERR later\n", "0000"]),
+            Err(Error::Remote("later".into()))
+        );
+        assert_eq!(
+            parse(&[&first, "0001", "0000"]),
+            Err(Error::Syntax("a data packet"))
+        );
+        assert_eq!(
+            parse(&["0002", "0000"]),
+            Err(Error::Syntax("a data packet"))
+        );
         assert_eq!(parse(&[A, "0000"]), Err(Error::Syntax("a ref line")));
-        assert_eq!(parse(&[&format!("{A} HEAD\0=x\n"), "0000"]), Err(Error::Syntax("a capability name")));
-        assert_eq!(parse(&[&format!("{A} HEAD\0a\0b\n"), "0000"]), Err(Error::Text));
-        assert_eq!(parse(&[&first, &format!("{A} a\0b\n"), "0000"]), Err(Error::Text));
-        assert_eq!(parse(&[&format!("{A} HEAD\0\u{0}\n"), "0000"]), Err(Error::Text));
+        assert_eq!(
+            parse(&[&format!("{A} HEAD\0=x\n"), "0000"]),
+            Err(Error::Syntax("a capability name"))
+        );
+        assert_eq!(
+            parse(&[&format!("{A} HEAD\0a\0b\n"), "0000"]),
+            Err(Error::Text)
+        );
+        assert_eq!(
+            parse(&[&first, &format!("{A} a\0b\n"), "0000"]),
+            Err(Error::Text)
+        );
+        assert_eq!(
+            parse(&[&format!("{A} HEAD\0\u{0}\n"), "0000"]),
+            Err(Error::Text)
+        );
         let many = format!("{A} HEAD\0{}\n", "c ".repeat(MAX_CAPABILITIES + 1));
         assert_eq!(parse(&[&many, "0000"]), Err(Error::TooMany));
         let long = format!("{A} {}\n", "r".repeat(MAX_TEXT + 1));
@@ -2063,12 +2553,21 @@ mod tests {
         let ad = Advertisement {
             version_1: false,
             refs: vec![
-                AdvertisedRef { id: id(A), name: "HE\0AD\n".into() },
-                AdvertisedRef { id: id(B), name: "n".repeat(MAX_TEXT * 2) },
+                AdvertisedRef {
+                    id: id(A),
+                    name: "HE\0AD\n".into(),
+                },
+                AdvertisedRef {
+                    id: id(B),
+                    name: "n".repeat(MAX_TEXT * 2),
+                },
             ],
             capabilities: vec![Capability::with_value("a b=c", "x y"); MAX_CAPABILITIES + 5]
                 .into_iter()
-                .chain([Capability::new(""), Capability::with_value("big", &"v".repeat(MAX_TEXT))])
+                .chain([
+                    Capability::new(""),
+                    Capability::with_value("big", &"v".repeat(MAX_TEXT)),
+                ])
                 .collect(),
             shallow: vec![],
         };
@@ -2097,26 +2596,52 @@ mod tests {
         ]);
         let ad = CapabilityAdvertisement::parse(&bytes).unwrap();
         assert_eq!(ad.capabilities.len(), 5);
-        assert_eq!(ad.capability("fetch"), Some(&Capability::with_value("fetch", "shallow wait-for-done")));
-        assert_eq!(ad.capability("server-option"), Some(&Capability::new("server-option")));
+        assert_eq!(
+            ad.capability("fetch"),
+            Some(&Capability::with_value("fetch", "shallow wait-for-done"))
+        );
+        assert_eq!(
+            ad.capability("server-option"),
+            Some(&Capability::new("server-option"))
+        );
         assert_eq!(ad.to_bytes().unwrap(), bytes);
         for n in 0..bytes.len() {
-            assert_eq!(CapabilityAdvertisement::parse(&bytes[..n]), Err(Error::Truncated));
+            assert_eq!(
+                CapabilityAdvertisement::parse(&bytes[..n]),
+                Err(Error::Truncated)
+            );
         }
-        assert_eq!(CapabilityAdvertisement::parse(b"0000"), Err(Error::Syntax("version 2")));
-        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["version 1\n", "0000"])), Err(Error::Syntax("version 2")));
-        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["ERR x\n", "0000"])), Err(Error::Remote("x".into())));
+        assert_eq!(
+            CapabilityAdvertisement::parse(b"0000"),
+            Err(Error::Syntax("version 2"))
+        );
+        assert_eq!(
+            CapabilityAdvertisement::parse(&pkt(&["version 1\n", "0000"])),
+            Err(Error::Syntax("version 2"))
+        );
+        assert_eq!(
+            CapabilityAdvertisement::parse(&pkt(&["ERR x\n", "0000"])),
+            Err(Error::Remote("x".into()))
+        );
         assert_eq!(
             CapabilityAdvertisement::parse(&pkt(&["version 2\n", "=v\n", "0000"])),
             Err(Error::Syntax("a capability name"))
         );
-        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["version 2\n", "0001", "0000"])), Err(Error::Syntax("a data packet")));
+        assert_eq!(
+            CapabilityAdvertisement::parse(&pkt(&["version 2\n", "0001", "0000"])),
+            Err(Error::Syntax("a data packet"))
+        );
         let mut many = vec!["version 2\n"];
         many.extend(std::iter::repeat_n("c\n", MAX_CAPABILITIES + 1));
         many.push("0000");
-        assert_eq!(CapabilityAdvertisement::parse(&pkt(&many)), Err(Error::TooMany));
+        assert_eq!(
+            CapabilityAdvertisement::parse(&pkt(&many)),
+            Err(Error::TooMany)
+        );
         // A capability named like an error reads back as a capability.
-        let odd = CapabilityAdvertisement { capabilities: vec![Capability::new("ERR x"), Capability::new("=")] };
+        let odd = CapabilityAdvertisement {
+            capabilities: vec![Capability::new("ERR x"), Capability::new("=")],
+        };
         assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&odd);
     }
@@ -2124,18 +2649,36 @@ mod tests {
     // gitprotocol-v2, "ls-refs" and "fetch".
     #[test]
     fn v2_requests() {
-        let bytes = pkt(&["command=fetch\n", "agent=git/2.45\n", "object-format=sha1\n", "0001",
-            "thin-pack\n", "ofs-delta\n", &format!("want {A}\n"), &format!("have {B}\n"), "done\n", "0000"]);
+        let bytes = pkt(&[
+            "command=fetch\n",
+            "agent=git/2.45\n",
+            "object-format=sha1\n",
+            "0001",
+            "thin-pack\n",
+            "ofs-delta\n",
+            &format!("want {A}\n"),
+            &format!("have {B}\n"),
+            "done\n",
+            "0000",
+        ]);
         let req = V2Request::parse(&bytes).unwrap();
-        let V2Request::Command(cmd) = &req else { panic!() };
+        let V2Request::Command(cmd) = &req else {
+            panic!()
+        };
         assert_eq!(cmd.name, "fetch");
-        assert_eq!(cmd.capabilities[0], Capability::with_value("agent", "git/2.45"));
+        assert_eq!(
+            cmd.capabilities[0],
+            Capability::with_value("agent", "git/2.45")
+        );
         assert_eq!(
             cmd.fetch_args().unwrap(),
             [
                 ClientLine::ThinPack,
                 ClientLine::OfsDelta,
-                ClientLine::Want { id: id(A), capabilities: vec![] },
+                ClientLine::Want {
+                    id: id(A),
+                    capabilities: vec![]
+                },
                 ClientLine::Have(id(B)),
                 ClientLine::Done
             ]
@@ -2148,16 +2691,37 @@ mod tests {
         assert_eq!(V2Request::Empty.to_bytes().unwrap(), b"0000");
         // No delimiter and no arguments.
         let req = V2Request::parse(&pkt(&["command=ls-refs\n", "0000"])).unwrap();
-        assert_eq!(req, V2Request::Command(Command { name: "ls-refs".into(), capabilities: vec![], args: vec![] }));
+        assert_eq!(
+            req,
+            V2Request::Command(Command {
+                name: "ls-refs".into(),
+                capabilities: vec![],
+                args: vec![]
+            })
+        );
         let ls = Command {
             name: "ls-refs".into(),
             capabilities: vec![],
-            args: vec!["peel".into(), "unborn".into(), "ref-prefix refs/tags/".into(), "x-y".into()],
+            args: vec![
+                "peel".into(),
+                "unborn".into(),
+                "ref-prefix refs/tags/".into(),
+                "x-y".into(),
+            ],
         };
         let args = ls.ls_refs_args().unwrap();
-        assert_eq!(args[..3], [LsRefsArg::Peel, LsRefsArg::Unborn, LsRefsArg::RefPrefix("refs/tags/".into())]);
+        assert_eq!(
+            args[..3],
+            [
+                LsRefsArg::Peel,
+                LsRefsArg::Unborn,
+                LsRefsArg::RefPrefix("refs/tags/".into())
+            ]
+        );
         assert_eq!(args[3].to_bytes().unwrap(), b"x-y\n");
-        let LsRefsArg::Other(u) = &args[3] else { panic!() };
+        let LsRefsArg::Other(u) = &args[3] else {
+            panic!()
+        };
         assert_eq!(u.as_str(), "x-y");
         for a in &args {
             assert_eq!(LsRefsArg::parse(&a.to_bytes().unwrap()).as_ref(), Ok(a));
@@ -2167,12 +2731,30 @@ mod tests {
     #[test]
     fn v2_request_errors() {
         let parse = |lines: &[&str]| V2Request::parse(&pkt(lines)).map(|_| ());
-        assert_eq!(parse(&["ls-refs\n", "0000"]), Err(Error::Syntax("command=")));
-        assert_eq!(parse(&["0001", "0000"]), Err(Error::Syntax("a data packet")));
-        assert_eq!(parse(&["command=x\n", "0001", "0001", "0000"]), Err(Error::Syntax("a data packet")));
-        assert_eq!(parse(&["command=x\n", "0002", "0000"]), Err(Error::Syntax("a data packet")));
-        assert_eq!(parse(&["command=x\n", "=y\n", "0000"]), Err(Error::Syntax("a capability name")));
-        assert_eq!(parse(&["command=x\n", "0001", "a\nb\n", "0000"]), Err(Error::Text));
+        assert_eq!(
+            parse(&["ls-refs\n", "0000"]),
+            Err(Error::Syntax("command="))
+        );
+        assert_eq!(
+            parse(&["0001", "0000"]),
+            Err(Error::Syntax("a data packet"))
+        );
+        assert_eq!(
+            parse(&["command=x\n", "0001", "0001", "0000"]),
+            Err(Error::Syntax("a data packet"))
+        );
+        assert_eq!(
+            parse(&["command=x\n", "0002", "0000"]),
+            Err(Error::Syntax("a data packet"))
+        );
+        assert_eq!(
+            parse(&["command=x\n", "=y\n", "0000"]),
+            Err(Error::Syntax("a capability name"))
+        );
+        assert_eq!(
+            parse(&["command=x\n", "0001", "a\nb\n", "0000"]),
+            Err(Error::Text)
+        );
         assert_eq!(parse(&["command=\u{0}\n", "0000"]), Err(Error::Text));
         let mut many = vec!["command=x\n"];
         many.extend(std::iter::repeat_n("c\n", MAX_CAPABILITIES + 1));
@@ -2182,11 +2764,23 @@ mod tests {
         args.extend(std::iter::repeat_n("a\n", MAX_ITEMS + 1));
         args.push("0000");
         assert_eq!(parse(&args), Err(Error::TooMany));
-        let bad = Command { name: "fetch".into(), capabilities: vec![], args: vec!["want zz".into()] };
+        let bad = Command {
+            name: "fetch".into(),
+            capabilities: vec![],
+            args: vec!["want zz".into()],
+        };
         assert_eq!(bad.fetch_args(), Err(Error::ObjectId));
-        let bad = Command { name: "ls-refs".into(), capabilities: vec![], args: vec!["a\nb".into()] };
+        let bad = Command {
+            name: "ls-refs".into(),
+            capabilities: vec![],
+            args: vec!["a\nb".into()],
+        };
         assert_eq!(bad.ls_refs_args(), Err(Error::Text));
-        let long = Command { name: "ls-refs".into(), capabilities: vec![], args: vec![format!("ref-prefix {}", "p".repeat(MAX_TEXT + 1))] };
+        let long = Command {
+            name: "ls-refs".into(),
+            capabilities: vec![],
+            args: vec![format!("ref-prefix {}", "p".repeat(MAX_TEXT + 1))],
+        };
         assert_eq!(long.ls_refs_args(), Err(Error::TooLong));
         // Writers refuse fields that would need changes.
         let req = V2Request::Command(Command {
@@ -2201,15 +2795,32 @@ mod tests {
     // gitprotocol-pack, "Packfile Negotiation".
     #[test]
     fn client_lines() {
-        let want = format!("want {A} multi_ack_detailed side-band-64k thin-pack ofs-delta agent=git/2.45\n");
+        let want = format!(
+            "want {A} multi_ack_detailed side-band-64k thin-pack ofs-delta agent=git/2.45\n"
+        );
         let line = ClientLine::parse(want.as_bytes()).unwrap();
-        let ClientLine::Want { id: w, capabilities } = &line else { panic!() };
+        let ClientLine::Want {
+            id: w,
+            capabilities,
+        } = &line
+        else {
+            panic!()
+        };
         assert_eq!(w, &id(A));
         assert_eq!(capabilities.len(), 5);
-        assert_eq!(find_capability(capabilities, "agent").unwrap().value.as_deref(), Some("git/2.45"));
+        assert_eq!(
+            find_capability(capabilities, "agent")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("git/2.45")
+        );
         assert_eq!(line.to_packet().unwrap(), Packet::Data(want.into_bytes()));
         let all = [
-            ClientLine::Want { id: id(B), capabilities: vec![] },
+            ClientLine::Want {
+                id: id(B),
+                capabilities: vec![],
+            },
             ClientLine::WantRef("refs/heads/main".into()),
             ClientLine::Have(id(A)),
             ClientLine::Done,
@@ -2228,32 +2839,68 @@ mod tests {
             ClientLine::PackfileUris("https".into()),
         ];
         for l in &all {
-            assert_eq!(ClientLine::parse(l.to_packet().unwrap().data().unwrap()).as_ref(), Ok(l));
+            assert_eq!(
+                ClientLine::parse(l.to_packet().unwrap().data().unwrap()).as_ref(),
+                Ok(l)
+            );
         }
         assert_eq!(ClientLine::parse(b"deepen 007"), Ok(ClientLine::Deepen(7)));
         let other = ClientLine::parse(b"want\n").unwrap();
         assert_eq!(other.to_bytes().unwrap(), b"want\n");
         // Errors.
         assert_eq!(ClientLine::parse(b"want 123\n"), Err(Error::ObjectId));
-        assert_eq!(ClientLine::parse(format!("have {}\n", &A[1..]).as_bytes()), Err(Error::ObjectId));
-        assert_eq!(ClientLine::parse(format!("want {A} =x").as_bytes()), Err(Error::Syntax("a capability name")));
-        assert_eq!(ClientLine::parse(b"deepen -1"), Err(Error::Syntax("a number")));
-        assert_eq!(ClientLine::parse(b"deepen "), Err(Error::Syntax("a number")));
-        assert_eq!(ClientLine::parse(b"deepen 99999999999"), Err(Error::Syntax("a number")));
-        assert_eq!(ClientLine::parse(b"deepen-since x"), Err(Error::Syntax("a number")));
+        assert_eq!(
+            ClientLine::parse(format!("have {}\n", &A[1..]).as_bytes()),
+            Err(Error::ObjectId)
+        );
+        assert_eq!(
+            ClientLine::parse(format!("want {A} =x").as_bytes()),
+            Err(Error::Syntax("a capability name"))
+        );
+        assert_eq!(
+            ClientLine::parse(b"deepen -1"),
+            Err(Error::Syntax("a number"))
+        );
+        assert_eq!(
+            ClientLine::parse(b"deepen "),
+            Err(Error::Syntax("a number"))
+        );
+        assert_eq!(
+            ClientLine::parse(b"deepen 99999999999"),
+            Err(Error::Syntax("a number"))
+        );
+        assert_eq!(
+            ClientLine::parse(b"deepen-since x"),
+            Err(Error::Syntax("a number"))
+        );
         assert_eq!(ClientLine::parse(b"done\n\n"), Err(Error::Text));
         assert_eq!(ClientLine::parse(b"\xc3"), Err(Error::Text));
-        assert_eq!(ClientLine::parse(format!("filter {}", "f".repeat(MAX_TEXT + 1)).as_bytes()), Err(Error::TooLong));
+        assert_eq!(
+            ClientLine::parse(format!("filter {}", "f".repeat(MAX_TEXT + 1)).as_bytes()),
+            Err(Error::TooLong)
+        );
     }
 
     #[test]
     fn server_lines() {
         let all = [
             ServerLine::Nak,
-            ServerLine::Ack { id: id(A), status: None },
-            ServerLine::Ack { id: id(A), status: Some(AckStatus::Continue) },
-            ServerLine::Ack { id: id(A), status: Some(AckStatus::Common) },
-            ServerLine::Ack { id: id(A), status: Some(AckStatus::Ready) },
+            ServerLine::Ack {
+                id: id(A),
+                status: None,
+            },
+            ServerLine::Ack {
+                id: id(A),
+                status: Some(AckStatus::Continue),
+            },
+            ServerLine::Ack {
+                id: id(A),
+                status: Some(AckStatus::Common),
+            },
+            ServerLine::Ack {
+                id: id(A),
+                status: Some(AckStatus::Ready),
+            },
             ServerLine::Ready,
             ServerLine::Shallow(id(B)),
             ServerLine::Unshallow(id(B)),
@@ -2265,38 +2912,85 @@ mod tests {
             ServerLine::Error("upload-pack: not our ref".into()),
         ];
         for l in &all {
-            assert_eq!(ServerLine::parse(l.to_packet().unwrap().data().unwrap()).as_ref(), Ok(l));
+            assert_eq!(
+                ServerLine::parse(l.to_packet().unwrap().data().unwrap()).as_ref(),
+                Ok(l)
+            );
         }
-        assert_eq!(ServerLine::parse(b"0008NAK\n"), Ok(ServerLine::Other(Unknown::new("0008NAK"))));
+        assert_eq!(
+            ServerLine::parse(b"0008NAK\n"),
+            Ok(ServerLine::Other(Unknown::new("0008NAK")))
+        );
         assert_eq!(ServerLine::parse(b"NAK\n"), Ok(ServerLine::Nak));
-        assert_eq!(ServerLine::parse(format!("ACK {A} maybe").as_bytes()), Err(Error::Syntax("an ACK status")));
+        assert_eq!(
+            ServerLine::parse(format!("ACK {A} maybe").as_bytes()),
+            Err(Error::Syntax("an ACK status"))
+        );
         assert_eq!(ServerLine::parse(b"ACK x"), Err(Error::ObjectId));
         assert_eq!(ServerLine::parse(b"unshallow x"), Err(Error::ObjectId));
-        assert_eq!(ServerLine::parse(format!("ERR {}", "e".repeat(MAX_TEXT + 1)).as_bytes()), Err(Error::TooLong));
-        assert_eq!(ServerLine::Error("a\nb".into()).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            ServerLine::parse(format!("ERR {}", "e".repeat(MAX_TEXT + 1)).as_bytes()),
+            Err(Error::TooLong)
+        );
+        assert_eq!(
+            ServerLine::Error("a\nb".into()).to_bytes(),
+            Err(Error::Unwritable)
+        );
         // A wanted-refs entry reads as an LsRef.
         let other = ServerLine::parse(format!("{A} refs/heads/main\n").as_bytes()).unwrap();
-        let ServerLine::Other(u) = other else { panic!() };
-        assert_eq!(LsRef::parse(u.as_str().as_bytes()).unwrap().name, "refs/heads/main");
+        let ServerLine::Other(u) = other else {
+            panic!()
+        };
+        assert_eq!(
+            LsRef::parse(u.as_str().as_bytes()).unwrap().name,
+            "refs/heads/main"
+        );
     }
 
     #[test]
     fn ls_refs_lines() {
         let s = format!("{A} refs/tags/v1 peeled:{B}\n");
         let r = LsRef::parse(s.as_bytes()).unwrap();
-        assert_eq!(r, LsRef { id: Some(id(A)), name: "refs/tags/v1".into(), symref_target: None, peeled: Some(id(B)) });
+        assert_eq!(
+            r,
+            LsRef {
+                id: Some(id(A)),
+                name: "refs/tags/v1".into(),
+                symref_target: None,
+                peeled: Some(id(B))
+            }
+        );
         assert_eq!(r.to_packet().unwrap(), Packet::Data(s.into_bytes()));
         let u = LsRef::parse(b"unborn HEAD symref-target:refs/heads/main x:y").unwrap();
         assert_eq!(u.id, None);
-        assert_eq!(u.to_bytes().unwrap(), b"unborn HEAD symref-target:refs/heads/main\n");
+        assert_eq!(
+            u.to_bytes().unwrap(),
+            b"unborn HEAD symref-target:refs/heads/main\n"
+        );
         assert_eq!(LsRef::parse(A.as_bytes()), Err(Error::Syntax("a ref line")));
         assert_eq!(LsRef::parse(b"zz HEAD"), Err(Error::ObjectId));
-        assert_eq!(LsRef::parse(format!("{A} H peeled:q").as_bytes()), Err(Error::ObjectId));
-        assert_eq!(LsRef::parse(format!("{A} {}", "n".repeat(MAX_TEXT + 1)).as_bytes()), Err(Error::TooLong));
-        let odd = LsRef { id: None, name: "a b\0".into(), symref_target: Some("c d".into()), peeled: None };
+        assert_eq!(
+            LsRef::parse(format!("{A} H peeled:q").as_bytes()),
+            Err(Error::ObjectId)
+        );
+        assert_eq!(
+            LsRef::parse(format!("{A} {}", "n".repeat(MAX_TEXT + 1)).as_bytes()),
+            Err(Error::TooLong)
+        );
+        let odd = LsRef {
+            id: None,
+            name: "a b\0".into(),
+            symref_target: Some("c d".into()),
+            peeled: None,
+        };
         assert_eq!(odd.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&odd);
-        let empty = LsRef { id: Some(id(A)), name: String::new(), symref_target: None, peeled: None };
+        let empty = LsRef {
+            id: Some(id(A)),
+            name: String::new(),
+            symref_target: None,
+            peeled: None,
+        };
         assert_eq!(LsRef::parse(&empty.to_bytes().unwrap()), Ok(empty));
     }
 
@@ -2318,8 +3012,15 @@ mod tests {
         let pack = vec![7; 2500];
         let mut bytes = Vec::new();
         for packet in band_packets(Sideband::Pack, &pack, SIDE_BAND_PACKET)
-            .chain(band_packets(Sideband::Progress, b"Counting objects: 3\r", SIDE_BAND_64K_PACKET))
-            .chain([Packet::Flush]) { packet.write(&mut bytes).unwrap(); }
+            .chain(band_packets(
+                Sideband::Progress,
+                b"Counting objects: 3\r",
+                SIDE_BAND_64K_PACKET,
+            ))
+            .chain([Packet::Flush])
+        {
+            packet.write(&mut bytes).unwrap();
+        }
         contract::check_decode_with_alloc_limit(|| Bands, &bytes, 2 * MAX_PACKET);
         let (items, failure) = decode_all(|| Bands, &bytes);
         assert_eq!(failure, None);
@@ -2327,8 +3028,13 @@ mod tests {
         let mut sizes = Vec::new();
         for item in items {
             match item {
-                Band::Data(Sideband::Pack, payload) => { sizes.push(payload.len()); got.extend(payload); }
-                Band::Data(Sideband::Progress, payload) => assert_eq!(payload, b"Counting objects: 3\r"),
+                Band::Data(Sideband::Pack, payload) => {
+                    sizes.push(payload.len());
+                    got.extend(payload);
+                }
+                Band::Data(Sideband::Progress, payload) => {
+                    assert_eq!(payload, b"Counting objects: 3\r")
+                }
                 Band::Flush => (),
                 other => panic!("{other:?}"),
             }
@@ -2336,22 +3042,54 @@ mod tests {
         assert_eq!(got, pack);
         assert_eq!(sizes, [995, 995, 510]);
         assert_eq!(band_packets(Sideband::Error, b"", 1000).count(), 0);
-        assert_eq!(band_packets(Sideband::Error, b"ab", 0).next().unwrap().to_bytes().unwrap(), b"0007\x03ab");
-        let small: usize = band_packets(Sideband::Pack, &[1; 99_500], 6).map(|p| p.to_bytes().unwrap().len()).sum();
+        assert_eq!(
+            band_packets(Sideband::Error, b"ab", 0)
+                .next()
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            b"0007\x03ab"
+        );
+        let small: usize = band_packets(Sideband::Pack, &[1; 99_500], 6)
+            .map(|p| p.to_bytes().unwrap().len())
+            .sum();
         assert_eq!(small, 99_500 + 100 * 5);
-        assert_eq!(&band_packets(Sideband::Pack, &vec![0; MAX_PACKET * 2], usize::MAX).next().unwrap().to_bytes().unwrap()[..4], b"fff0");
-        for band in [Sideband::Pack, Sideband::Progress, Sideband::Error] { assert_eq!(Sideband::from_code(band.code()), Some(band)); }
+        assert_eq!(
+            &band_packets(Sideband::Pack, &vec![0; MAX_PACKET * 2], usize::MAX)
+                .next()
+                .unwrap()
+                .to_bytes()
+                .unwrap()[..4],
+            b"fff0"
+        );
+        for band in [Sideband::Pack, Sideband::Progress, Sideband::Error] {
+            assert_eq!(Sideband::from_code(band.code()), Some(band));
+        }
         assert_eq!(split_band(b"\x02hi"), Ok((Sideband::Progress, &b"hi"[..])));
         assert_eq!(split_band(b""), Err(Error::Syntax("a band byte")));
         assert_eq!(split_band(b"\x04"), Err(Error::Syntax("band 1, 2 or 3")));
-        assert_eq!(decode_all(|| Bands, b"00010002000509"), (vec![Band::Delim, Band::ResponseEnd],
-            Some(Fail::Protocol(Error::Syntax("band 1, 2 or 3")))));
-        assert_eq!(decode_all(|| Bands, b"zz").1, Some(Fail::Protocol(Error::Header)));
+        assert_eq!(
+            decode_all(|| Bands, b"00010002000509"),
+            (
+                vec![Band::Delim, Band::ResponseEnd],
+                Some(Fail::Protocol(Error::Syntax("band 1, 2 or 3")))
+            )
+        );
+        assert_eq!(
+            decode_all(|| Bands, b"zz").1,
+            Some(Fail::Protocol(Error::Header))
+        );
         let mut stream = Stream::new(Frames::<Packet>::new());
         assert_eq!(stream.push(b"000dpackfile\n0006\x01P"), 19);
-        assert_eq!(ServerLine::parse(stream.next().unwrap().unwrap().data().unwrap()), Ok(ServerLine::Section(Section::Packfile)));
+        assert_eq!(
+            ServerLine::parse(stream.next().unwrap().unwrap().data().unwrap()),
+            Ok(ServerLine::Section(Section::Packfile))
+        );
         let mut stream = stream.swap(Bands);
-        assert_eq!(stream.next(), Some(Ok(Band::Data(Sideband::Pack, b"P".to_vec()))));
+        assert_eq!(
+            stream.next(),
+            Some(Ok(Band::Data(Sideband::Pack, b"P".to_vec())))
+        );
         assert_eq!(stream.next(), None);
     }
 
@@ -2380,7 +3118,11 @@ mod tests {
         assert_eq!(stream.push(b"0000"), 0);
         assert_eq!(stream.next(), Some(Ok(Packet::Flush)));
         assert_eq!(stream.push(b"0000"), 4);
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes[..1024], 2 * MAX_PACKET);
+        contract::check_decode_with_alloc_limit(
+            Frames::<Packet>::new,
+            &bytes[..1024],
+            2 * MAX_PACKET,
+        );
         let mut bands = Stream::new(Bands);
         assert_eq!(bands.push(&bytes), MAX_PACKET);
         assert_eq!(bands.buffered(), MAX_PACKET);
@@ -2393,14 +3135,27 @@ mod tests {
         let bytes = b"0008NAK\nPACK\x00\x00\x00\x02";
         let mut stream = Stream::new(Frames::<Packet>::new());
         assert_eq!(stream.push(bytes), bytes.len());
-        assert_eq!(ServerLine::parse(stream.next().unwrap().unwrap().data().unwrap()), Ok(ServerLine::Nak));
+        assert_eq!(
+            ServerLine::parse(stream.next().unwrap().unwrap().data().unwrap()),
+            Ok(ServerLine::Nak)
+        );
         assert_eq!(stream.into_parts().0.unread(), b"PACK\x00\x00\x00\x02");
-        assert!(Stream::new(Frames::<Packet>::new()).into_parts().0.unread().is_empty());
+        assert!(
+            Stream::new(Frames::<Packet>::new())
+                .into_parts()
+                .0
+                .unread()
+                .is_empty()
+        );
     }
 
     #[test]
     fn command_args_are_bounded() {
-        let many = Command { name: "fetch".into(), capabilities: vec![], args: vec!["done".into(); MAX_ITEMS + 1] };
+        let many = Command {
+            name: "fetch".into(),
+            capabilities: vec![],
+            args: vec!["done".into(); MAX_ITEMS + 1],
+        };
         assert_eq!(many.fetch_args(), Err(Error::TooMany));
         assert_eq!(many.ls_refs_args(), Err(Error::TooMany));
     }
@@ -2416,7 +3171,10 @@ mod tests {
         };
         let full = format!("{} HEAD\0{}", "a".repeat(40), names(4015));
         assert_eq!(full.len(), MAX_DATA);
-        assert_eq!(Advertisement::parse(&pkt(&[&full, "0000"])), Err(Error::TooLong));
+        assert_eq!(
+            Advertisement::parse(&pkt(&[&full, "0000"])),
+            Err(Error::TooLong)
+        );
         let fits = format!("{} HEAD\0{}\n", "a".repeat(40), names(4014));
         assert_eq!(fits.len(), MAX_DATA);
         let ad = Advertisement::parse(&pkt(&[&fits, "0000"])).unwrap();
@@ -2431,7 +3189,10 @@ mod tests {
         let req = ProtoRequest::from_data(b"git-upload-pack /a\nb\0host=h\0\0x\ny\0").unwrap();
         assert_eq!(req.path, "/a\nb");
         assert_eq!(req.extra, ["x\ny"]);
-        assert_eq!(req.to_packet().unwrap(), Packet::Data(b"git-upload-pack /a\nb\0host=h\0\0x\ny\0".to_vec()));
+        assert_eq!(
+            req.to_packet().unwrap(),
+            Packet::Data(b"git-upload-pack /a\nb\0host=h\0\0x\ny\0".to_vec())
+        );
     }
 
     // gitprotocol-pack, "pkt-line Format": an ERR packet ends the transfer,
@@ -2439,22 +3200,49 @@ mod tests {
     #[test]
     fn err_lines_end_a_message() {
         let remote = |m: &str| Err::<(), _>(Error::Remote(m.into()));
-        assert_eq!(Advertisement::parse(b"000bERR no\n").map(|_| ()), remote("no"));
+        assert_eq!(
+            Advertisement::parse(b"000bERR no\n").map(|_| ()),
+            remote("no")
+        );
         let first = format!("{A} HEAD\0ofs-delta\n");
-        assert_eq!(Advertisement::parse(&pkt(&[&first, "ERR later\n"])).map(|_| ()), remote("later"));
-        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["version 2\n", "ERR x\n"])).map(|_| ()), remote("x"));
-        assert_eq!(CapabilityAdvertisement::parse(&pkt(&["version 2\n", "ERR x\n", "0000"])).map(|_| ()), remote("x"));
+        assert_eq!(
+            Advertisement::parse(&pkt(&[&first, "ERR later\n"])).map(|_| ()),
+            remote("later")
+        );
+        assert_eq!(
+            CapabilityAdvertisement::parse(&pkt(&["version 2\n", "ERR x\n"])).map(|_| ()),
+            remote("x")
+        );
+        assert_eq!(
+            CapabilityAdvertisement::parse(&pkt(&["version 2\n", "ERR x\n", "0000"])).map(|_| ()),
+            remote("x")
+        );
         let packets = [Packet::text("version 2"), Packet::text("ERR y")];
-        assert_eq!(CapabilityAdvertisement::from_packets(&packets).map(|_| ()), remote("y"));
-        assert_eq!(ServiceHeader::parse(&pkt(&["ERR z\n"])).map(|_| ()), remote("z"));
-        assert_eq!(Advertisement::parse(&pkt(&["ERR \u{0}\n"])).map(|_| ()), remote("\u{0}"));
-        assert_eq!(Advertisement::parse(b"0009ERR \xff").map(|_| ()), remote("\u{fffd}"));
+        assert_eq!(
+            CapabilityAdvertisement::from_packets(&packets).map(|_| ()),
+            remote("y")
+        );
+        assert_eq!(
+            ServiceHeader::parse(&pkt(&["ERR z\n"])).map(|_| ()),
+            remote("z")
+        );
+        assert_eq!(
+            Advertisement::parse(&pkt(&["ERR \u{0}\n"])).map(|_| ()),
+            remote("\u{0}")
+        );
+        assert_eq!(
+            Advertisement::parse(b"0009ERR \xff").map(|_| ()),
+            remote("\u{fffd}")
+        );
         // Keep enough source bytes to finish a character at the boundary.
         for room in 0..4 {
             let prefix = "a".repeat(MAX_TEXT - room);
             let text = format!("{prefix}😀tail");
             let packet = Packet::Data(format!("ERR {text}").into_bytes());
-            assert_eq!(Advertisement::from_packets(&[packet]).map(|_| ()), remote(&prefix));
+            assert_eq!(
+                Advertisement::from_packets(&[packet]).map(|_| ()),
+                remote(&prefix)
+            );
         }
     }
 
@@ -2464,18 +3252,39 @@ mod tests {
     fn ids_follow_the_object_format() {
         let sha256 = format!("{C} HEAD\0object-format=sha256\n");
         assert!(Advertisement::parse(&pkt(&[&sha256, "0000"])).is_ok());
-        assert_eq!(Advertisement::parse(&pkt(&[&sha256, &format!("shallow {B}\n"), "0000"])), Err(Error::ObjectId));
-        assert_eq!(Advertisement::parse(&pkt(&[&sha256, &format!("{A} refs/x\n"), "0000"])), Err(Error::ObjectId));
-        assert_eq!(Advertisement::parse(&pkt(&[&format!("{C} HEAD\0ofs-delta\n"), "0000"])), Err(Error::ObjectId));
+        assert_eq!(
+            Advertisement::parse(&pkt(&[&sha256, &format!("shallow {B}\n"), "0000"])),
+            Err(Error::ObjectId)
+        );
+        assert_eq!(
+            Advertisement::parse(&pkt(&[&sha256, &format!("{A} refs/x\n"), "0000"])),
+            Err(Error::ObjectId)
+        );
+        assert_eq!(
+            Advertisement::parse(&pkt(&[&format!("{C} HEAD\0ofs-delta\n"), "0000"])),
+            Err(Error::ObjectId)
+        );
         let sha1 = format!("{C} HEAD\0object-format=sha1\n");
-        assert_eq!(Advertisement::parse(&pkt(&[&sha1, "0000"])), Err(Error::ObjectId));
+        assert_eq!(
+            Advertisement::parse(&pkt(&[&sha1, "0000"])),
+            Err(Error::ObjectId)
+        );
         // A format this module does not know is not checked.
         let odd = format!("{C} HEAD\0object-format=x\n");
         assert!(Advertisement::parse(&pkt(&[&odd, &format!("{A} refs/x\n"), "0000"])).is_ok());
         // Writers leave out ids of the wrong length.
         let ad = Advertisement {
             version_1: false,
-            refs: vec![AdvertisedRef { id: id(A), name: "HEAD".into() }, AdvertisedRef { id: id(C), name: "refs/c".into() }],
+            refs: vec![
+                AdvertisedRef {
+                    id: id(A),
+                    name: "HEAD".into(),
+                },
+                AdvertisedRef {
+                    id: id(C),
+                    name: "refs/c".into(),
+                },
+            ],
             capabilities: vec![Capability::with_value("object-format", "sha256")],
             shallow: vec![id(B), id(C)],
         };
@@ -2483,7 +3292,10 @@ mod tests {
         contract::check_wire_value(&ad);
         let mut caps = vec![Capability::with_value("k", &"v".repeat(MAX_TEXT - 10)); 40];
         caps.push(Capability::with_value("object-format", "sha256"));
-        let full = Advertisement { capabilities: caps, ..ad };
+        let full = Advertisement {
+            capabilities: caps,
+            ..ad
+        };
         assert_eq!(full.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&full);
     }
@@ -2493,9 +3305,13 @@ mod tests {
     #[test]
     fn fetch_deepen_combinations() {
         let fetch = |args: &[&str]| {
-            Command { name: "fetch".into(), capabilities: vec![], args: args.iter().map(|a| a.to_string()).collect() }
-                .fetch_args()
-                .map(|_| ())
+            Command {
+                name: "fetch".into(),
+                capabilities: vec![],
+                args: args.iter().map(|a| a.to_string()).collect(),
+            }
+            .fetch_args()
+            .map(|_| ())
         };
         let both = Err(Error::Syntax("deepen without deepen-since or deepen-not"));
         assert_eq!(fetch(&["deepen 1", "deepen-since 1"]), both);
@@ -2514,21 +3330,35 @@ mod tests {
             b"0004".to_vec(),
             Packet::text("version 1").to_bytes().unwrap(),
             Packet::text("version 2").to_bytes().unwrap(),
-            Packet::text(&format!("{A} HEAD\0ofs-delta agent=git/2 =x")).to_bytes().unwrap(),
-            Packet::text(&format!("{} capabilities^{{}}\0side-band", "0".repeat(40))).to_bytes().unwrap(),
-            Packet::text(&format!("{A} capabilities^{{}}\0thin-pack")).to_bytes().unwrap(),
-            Packet::text(&format!("{} refs/heads/up", B.to_uppercase())).to_bytes().unwrap(),
-            Packet::Data(b"git-upload-pack /x\0\0\0".to_vec()).to_bytes().unwrap(),
+            Packet::text(&format!("{A} HEAD\0ofs-delta agent=git/2 =x"))
+                .to_bytes()
+                .unwrap(),
+            Packet::text(&format!("{} capabilities^{{}}\0side-band", "0".repeat(40)))
+                .to_bytes()
+                .unwrap(),
+            Packet::text(&format!("{A} capabilities^{{}}\0thin-pack"))
+                .to_bytes()
+                .unwrap(),
+            Packet::text(&format!("{} refs/heads/up", B.to_uppercase()))
+                .to_bytes()
+                .unwrap(),
+            Packet::Data(b"git-upload-pack /x\0\0\0".to_vec())
+                .to_bytes()
+                .unwrap(),
             Packet::text("command=").to_bytes().unwrap(),
             Packet::text("x.y=z").to_bytes().unwrap(),
-            Packet::text(&format!("{B} refs/heads/a b")).to_bytes().unwrap(),
+            Packet::text(&format!("{B} refs/heads/a b"))
+                .to_bytes()
+                .unwrap(),
             Packet::text(&format!("shallow {B}")).to_bytes().unwrap(),
             Packet::text("command=ls-refs").to_bytes().unwrap(),
             Packet::text("command=fetch").to_bytes().unwrap(),
             Packet::text("agent=x y").to_bytes().unwrap(),
             Packet::text("symrefs").to_bytes().unwrap(),
             Packet::text("ref-prefix refs/").to_bytes().unwrap(),
-            Packet::text(&format!("want {A} thin-pack")).to_bytes().unwrap(),
+            Packet::text(&format!("want {A} thin-pack"))
+                .to_bytes()
+                .unwrap(),
             Packet::text(&format!("have {B}")).to_bytes().unwrap(),
             Packet::text("done").to_bytes().unwrap(),
             Packet::text("deepen 12").to_bytes().unwrap(),
@@ -2538,11 +3368,27 @@ mod tests {
             Packet::text(&format!("ACK {A} common")).to_bytes().unwrap(),
             Packet::text("ERR nope").to_bytes().unwrap(),
             Packet::text("packfile").to_bytes().unwrap(),
-            Packet::text(&format!("unborn HEAD symref-target:refs/heads/main peeled:{B}")).to_bytes().unwrap(),
-            Packet::text("# service=git-upload-pack").to_bytes().unwrap(),
-            Packet::Data(b"git-upload-pack /x\0host=h\0\0version=2\0".to_vec()).to_bytes().unwrap(),
-            band_packets(Sideband::Pack, b"PACK", 1000).next().unwrap().to_bytes().unwrap(),
-            band_packets(Sideband::Progress, b"50%\r", 1000).next().unwrap().to_bytes().unwrap(),
+            Packet::text(&format!(
+                "unborn HEAD symref-target:refs/heads/main peeled:{B}"
+            ))
+            .to_bytes()
+            .unwrap(),
+            Packet::text("# service=git-upload-pack")
+                .to_bytes()
+                .unwrap(),
+            Packet::Data(b"git-upload-pack /x\0host=h\0\0version=2\0".to_vec())
+                .to_bytes()
+                .unwrap(),
+            band_packets(Sideband::Pack, b"PACK", 1000)
+                .next()
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            band_packets(Sideband::Progress, b"50%\r", 1000)
+                .next()
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
             b"0006\x07x".to_vec(),
             b"0005\xff".to_vec(),
         ];
@@ -2550,10 +3396,15 @@ mod tests {
         for _ in 0..4000 {
             let mut bytes = Vec::new();
             for _ in 0..rng.index(8) {
-                if rng.coin() { bytes.extend(rng.bytes(12)); }
-                else if rng.coin() {
+                if rng.coin() {
+                    bytes.extend(rng.bytes(12));
+                } else if rng.coin() {
                     let alphabet = b" \0\n=^{}abc0123";
-                    let data = rng.text(20).bytes().map(|b| alphabet[usize::from(b) % alphabet.len()]).collect();
+                    let data = rng
+                        .text(20)
+                        .bytes()
+                        .map(|b| alphabet[usize::from(b) % alphabet.len()])
+                        .collect();
                     Packet::Data(data).write(&mut bytes).unwrap();
                 } else {
                     let mut piece = pieces[rng.index(pieces.len())].clone();

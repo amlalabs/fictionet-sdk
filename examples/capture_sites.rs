@@ -18,10 +18,17 @@ const LINKTYPE_RAW: u32 = 101;
 
 fn main() -> fictionet::Result {
     let mut args = std::env::args().skip(1);
-    let path = args.next().unwrap_or_else(|| "/run/fictionet/world.sock".into());
-    let pcap = args.next().unwrap_or_else(|| "/run/fictionet/agent.pcap".into());
+    let path = args
+        .next()
+        .unwrap_or_else(|| "/run/fictionet/world.sock".into());
+    let pcap = args
+        .next()
+        .unwrap_or_else(|| "/run/fictionet/agent.pcap".into());
     let (attacher, attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
+    let _listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(path.clone().into()),
+        attacher,
+    )?;
     println!("listening on {path}, writing packets to {pcap}");
 
     // The file is written on a thread of its own. A world's tasks share
@@ -66,13 +73,16 @@ fn main() -> fictionet::Result {
     let pcap_path = pcap.clone();
     std::thread::spawn(move || {
         if let Err(e) = writer() {
-            eprintln!("capture: writing {pcap_path} failed, so later packets are not captured: {e}");
+            eprintln!(
+                "capture: writing {pcap_path} failed, so later packets are not captured: {e}"
+            );
         }
     });
 
     let start = SystemTime::now().duration_since(UNIX_EPOCH)?;
     fictionet::block_on(fictionet::run(move |fcx| async move {
-        let app = axum::Router::new().route("/", axum::routing::get(|| async { "hello, captured\n" }));
+        let app =
+            axum::Router::new().route("/", axum::routing::get(|| async { "hello, captured\n" }));
 
         let watched = attachments.map(&fcx, move |fcx, sandbox| {
             let (tx, lost) = (tx.clone(), lost.clone());

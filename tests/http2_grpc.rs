@@ -3,7 +3,7 @@ use fictionet::stdlib::{
     codec::{Demux, Wire},
     grpc, hpack, http2, tcp_reassembly,
 };
-use tcp_reassembly::{FlowKey, Segment, Chunk};
+use tcp_reassembly::{Chunk, FlowKey, Segment};
 
 fn key(direction: usize) -> FlowKey {
     let a = "192.0.2.1".parse().unwrap();
@@ -59,7 +59,7 @@ fn data(stream: u32, payload: &[u8], end: bool) -> Vec<u8> {
 struct Stack {
     tcp: tcp_reassembly::Reassembler,
     h2: [http2::Session; 2],
-    calls: Demux<(usize, u32), Frames::<grpc::Message>>,
+    calls: Demux<(usize, u32), Frames<grpc::Message>>,
     messages: Vec<(usize, u32, Vec<u8>)>,
     statuses: Vec<grpc::Status>,
     requests: Vec<grpc::Request>,

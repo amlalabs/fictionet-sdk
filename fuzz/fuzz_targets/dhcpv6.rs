@@ -4,11 +4,11 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::dhcpv6::{
     DhcpOption, Duid, Frame, HOP_COUNT_LIMIT, MAX_BUFFERED, MAX_MESSAGE, Message, msg,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -49,11 +49,20 @@ fuzz_target!(|data: &[u8]| {
                 assert_eq!(Message::parse(&bytes).unwrap().relayed(), Some(Ok(answer)));
             }
         }
-        let forward =
-            Message::relay_forward(&m, m.hop_count.saturating_add(1), m.link_address, m.peer_address).unwrap();
+        let forward = Message::relay_forward(
+            &m,
+            m.hop_count.saturating_add(1),
+            m.link_address,
+            m.peer_address,
+        )
+        .unwrap();
         contract::check_wire_value(&forward);
     }
-    for message in decode_all(Frames::<Message>::new, data).0.into_iter().flatten() {
+    for message in decode_all(Frames::<Message>::new, data)
+        .0
+        .into_iter()
+        .flatten()
+    {
         contract::check_wire_value(&Frame(message));
     }
 });

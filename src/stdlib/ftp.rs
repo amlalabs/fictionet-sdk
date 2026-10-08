@@ -210,7 +210,10 @@ impl std::error::Error for Error {}
 impl Command {
     /// A command with `verb` and `arg`.
     pub fn new(verb: &str, arg: Option<&str>) -> Command {
-        Command { verb: verb.to_string(), arg: arg.map(str::to_string) }
+        Command {
+            verb: verb.to_string(),
+            arg: arg.map(str::to_string),
+        }
     }
 
     /// Reads one command line, without its line ending. Telnet commands in
@@ -229,10 +232,16 @@ impl Command {
             Some((verb, arg)) => (verb, Some(arg)),
             None => (line, None),
         };
-        if verb.is_empty() || verb.len() > MAX_VERB || !verb.bytes().all(|b| b.is_ascii_alphabetic()) {
+        if verb.is_empty()
+            || verb.len() > MAX_VERB
+            || !verb.bytes().all(|b| b.is_ascii_alphabetic())
+        {
             return Err(Error::Verb);
         }
-        Ok(Command { verb: verb.to_ascii_uppercase(), arg: arg.map(str::to_string) })
+        Ok(Command {
+            verb: verb.to_ascii_uppercase(),
+            arg: arg.map(str::to_string),
+        })
     }
 }
 
@@ -396,7 +405,13 @@ impl Request {
         use Error as E;
         let arg = command.arg.as_deref();
         let need = || arg.map(str::to_string).ok_or(E::MissingArgument);
-        let none = |r: Request| if arg.is_some() { Err(E::UnexpectedArgument) } else { Ok(r) };
+        let none = |r: Request| {
+            if arg.is_some() {
+                Err(E::UnexpectedArgument)
+            } else {
+                Ok(r)
+            }
+        };
         let maybe = || arg.map(str::to_string);
         let upper = || arg.map(str::to_ascii_uppercase).ok_or(E::MissingArgument);
         Ok(match command.verb.as_str() {
@@ -427,8 +442,20 @@ impl Request {
             "STOR" => Request::Stor(need()?),
             "STOU" => none(Request::Stou)?,
             "APPE" => Request::Appe(need()?),
-            "ALLO" => Request::Allo(need().and_then(|a| if allo_ok(&a) { Ok(a) } else { Err(E::InvalidArgument) })?),
-            "REST" => Request::Rest(need().and_then(|a| if rest_ok(&a) { Ok(a) } else { Err(E::InvalidArgument) })?),
+            "ALLO" => Request::Allo(need().and_then(|a| {
+                if allo_ok(&a) {
+                    Ok(a)
+                } else {
+                    Err(E::InvalidArgument)
+                }
+            })?),
+            "REST" => Request::Rest(need().and_then(|a| {
+                if rest_ok(&a) {
+                    Ok(a)
+                } else {
+                    Err(E::InvalidArgument)
+                }
+            })?),
             "RNFR" => Request::Rnfr(need()?),
             "RNTO" => Request::Rnto(need()?),
             "ABOR" => none(Request::Abor)?,
@@ -447,12 +474,20 @@ impl Request {
             "EPSV" => Request::Epsv(match arg {
                 None => None,
                 Some(a) if a.eq_ignore_ascii_case("ALL") => Some(EpsvArg::All),
-                Some(a) => {
-                    Some(EpsvArg::Protocol(decimal(a, 5).and_then(|n| u16::try_from(n).ok()).ok_or(E::InvalidArgument)?))
-                }
+                Some(a) => Some(EpsvArg::Protocol(
+                    decimal(a, 5)
+                        .and_then(|n| u16::try_from(n).ok())
+                        .ok_or(E::InvalidArgument)?,
+                )),
             }),
             "FEAT" => none(Request::Feat)?,
-            "OPTS" => Request::Opts(need().and_then(|a| if opts_ok(&a) { Ok(a) } else { Err(E::InvalidArgument) })?),
+            "OPTS" => Request::Opts(need().and_then(|a| {
+                if opts_ok(&a) {
+                    Ok(a)
+                } else {
+                    Err(E::InvalidArgument)
+                }
+            })?),
             "MDTM" => Request::Mdtm(need()?),
             "SIZE" => Request::Size(need()?),
             "MLST" => Request::Mlst(maybe()),
@@ -688,9 +723,13 @@ fn parse_eprt(arg: &str) -> Result<SocketAddr, Error> {
         return Err(Error::Address);
     }
     let mut fields = arg[1..].split(d);
-    let (Some(family), Some(host), Some(port), Some(""), None) =
-        (fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
-    else {
+    let (Some(family), Some(host), Some(port), Some(""), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
         return Err(Error::Address);
     };
     if family.is_empty() || !family.bytes().all(|c| c.is_ascii_digit()) {
@@ -702,7 +741,9 @@ fn parse_eprt(arg: &str) -> Result<SocketAddr, Error> {
         "2" => IpAddr::V6(host.parse::<Ipv6Addr>().map_err(|_| Error::Address)?),
         _ => return Err(Error::Family),
     };
-    let port = decimal(port, 5).and_then(|n| u16::try_from(n).ok()).ok_or(Error::Address)?;
+    let port = decimal(port, 5)
+        .and_then(|n| u16::try_from(n).ok())
+        .ok_or(Error::Address)?;
     Ok(SocketAddr::new(ip, port))
 }
 
@@ -728,11 +769,19 @@ fn scan_host_port(s: &str) -> Option<(SocketAddrV4, usize)> {
             }
             at += 1;
         }
-        let digits = b.get(at..)?.iter().take(4).take_while(|c| c.is_ascii_digit()).count();
+        let digits = b
+            .get(at..)?
+            .iter()
+            .take(4)
+            .take_while(|c| c.is_ascii_digit())
+            .count();
         *slot = u8::try_from(decimal(s.get(at..at + digits)?, 3)?).ok()?;
         at += digits;
     }
-    let addr = SocketAddrV4::new(Ipv4Addr::new(n[0], n[1], n[2], n[3]), u16::from_be_bytes([n[4], n[5]]));
+    let addr = SocketAddrV4::new(
+        Ipv4Addr::new(n[0], n[1], n[2], n[3]),
+        u16::from_be_bytes([n[4], n[5]]),
+    );
     Some((addr, at))
 }
 
@@ -754,7 +803,11 @@ pub mod code {
     impl ReplyCode {
         /// The code `n`, if it is from 100 to 599.
         pub const fn new(n: u16) -> Option<ReplyCode> {
-            if n >= 100 && n <= 599 { Some(ReplyCode(n)) } else { None }
+            if n >= 100 && n <= 599 {
+                Some(ReplyCode(n))
+            } else {
+                None
+            }
         }
 
         /// The code's number.
@@ -924,7 +977,10 @@ impl Reply {
     /// A reply of one line. Writing refuses text longer than `MAX_REPLY_TEXT`
     /// bytes, so the line with its code, separator and CRLF fits in [`MAX_LINE`].
     pub fn new(code: ReplyCode, text: &str) -> Reply {
-        Reply { code, lines: vec![text.to_string()] }
+        Reply {
+            code,
+            lines: vec![text.to_string()],
+        }
     }
 
     /// Builds a reply, adding a space before each middle line that starts
@@ -978,7 +1034,10 @@ impl Reply {
     /// The reply to `PASV`: code 227 and the address in the form RFC 959
     /// gives, `Entering Passive Mode (h1,h2,h3,h4,p1,p2).`
     pub fn passive(addr: SocketAddrV4) -> Reply {
-        Reply::new(code::PASSIVE, &format!("Entering Passive Mode ({}).", port_text(addr)))
+        Reply::new(
+            code::PASSIVE,
+            &format!("Entering Passive Mode ({}).", port_text(addr)),
+        )
     }
 
     /// The address in a reply to `PASV`. Servers word the reply in
@@ -1001,7 +1060,10 @@ impl Reply {
     /// The reply to `EPSV`: code 229 and the port in the form RFC 2428
     /// gives, `Entering Extended Passive Mode (|||port|)`.
     pub fn extended_passive(port: u16) -> Reply {
-        Reply::new(code::EXTENDED_PASSIVE, &format!("Entering Extended Passive Mode (|||{port}|)"))
+        Reply::new(
+            code::EXTENDED_PASSIVE,
+            &format!("Entering Extended Passive Mode (|||{port}|)"),
+        )
     }
 
     /// The port in a reply to `EPSV`: the number in `(|||port|)`, where `|`
@@ -1011,7 +1073,10 @@ impl Reply {
         if self.code != code::EXTENDED_PASSIVE {
             return Err(Error::Code(self.code));
         }
-        self.lines.iter().find_map(|line| epsv_port(line)).ok_or(Error::Address)
+        self.lines
+            .iter()
+            .find_map(|line| epsv_port(line))
+            .ok_or(Error::Address)
     }
 
     /// Builds a `FEAT` reply (RFC 2389, section 3.2). With no features,
@@ -1027,15 +1092,26 @@ impl Reply {
         }
         let mut lines = vec!["Extensions supported:".to_string()];
         for feature in features {
-            let size = feature.name.len().checked_add(1)
-                .and_then(|n| feature.params.as_ref().map_or(Some(n), |p| n.checked_add(1)?.checked_add(p.len())))
+            let size = feature
+                .name
+                .len()
+                .checked_add(1)
+                .and_then(|n| {
+                    feature
+                        .params
+                        .as_ref()
+                        .map_or(Some(n), |p| n.checked_add(1)?.checked_add(p.len()))
+                })
                 .ok_or(Error::LineTooLong)?;
             if size > MAX_CONTENT {
                 return Err(Error::LineTooLong);
             }
             if feature.name.is_empty()
                 || !feature.name.bytes().all(|b| b.is_ascii_graphic())
-                || feature.params.as_ref().is_some_and(|p| p.is_empty() || !p.chars().all(feature_char))
+                || feature
+                    .params
+                    .as_ref()
+                    .is_some_and(|p| p.is_empty() || !p.chars().all(feature_char))
             {
                 return Err(Error::Unwritable);
             }
@@ -1047,7 +1123,10 @@ impl Reply {
             lines.push(line);
         }
         lines.push("End".to_string());
-        Ok(Reply { code: code::SYSTEM_STATUS, lines })
+        Ok(Reply {
+            code: code::SYSTEM_STATUS,
+            lines,
+        })
     }
 
     /// The features a reply to `FEAT` lists. A reply of one line lists
@@ -1056,7 +1135,11 @@ impl Reply {
         if self.code != code::SYSTEM_STATUS {
             return Err(Error::Code(self.code));
         }
-        let middle = if self.lines.len() > 2 { &self.lines[1..self.lines.len() - 1] } else { &[] };
+        let middle = if self.lines.len() > 2 {
+            &self.lines[1..self.lines.len() - 1]
+        } else {
+            &[]
+        };
         middle
             .iter()
             .map(|line| {
@@ -1073,7 +1156,10 @@ impl Reply {
                 if params.is_some_and(|p| !p.chars().all(feature_char)) {
                     return Err(Error::Feature);
                 }
-                Ok(Feature { name: name.to_string(), params: params.map(str::to_string) })
+                Ok(Feature {
+                    name: name.to_string(),
+                    params: params.map(str::to_string),
+                })
             })
             .collect()
     }
@@ -1092,7 +1178,8 @@ fn epsv_port(line: &str) -> Option<u16> {
     let d = inside.chars().next().filter(|c| c.is_ascii_graphic())?;
     // Split off only the three fields, so `)` may be the delimiter.
     let mut fields = inside[1..].splitn(4, d);
-    let (Some(""), Some(""), Some(port), Some(rest)) = (fields.next(), fields.next(), fields.next(), fields.next())
+    let (Some(""), Some(""), Some(port), Some(rest)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
     else {
         return None;
     };
@@ -1139,7 +1226,9 @@ impl Builder {
         }
         let b = line.as_bytes();
         let code = match b.get(..3) {
-            Some(&[a, x, y]) if (b'1'..=b'5').contains(&a) && x.is_ascii_digit() && y.is_ascii_digit() => {
+            Some(&[a, x, y])
+                if (b'1'..=b'5').contains(&a) && x.is_ascii_digit() && y.is_ascii_digit() =>
+            {
                 let n = u16::from(a - b'0') * 100 + u16::from(x - b'0') * 10 + u16::from(y - b'0');
                 ReplyCode::new(n).ok_or(Error::Syntax)?
             }
@@ -1147,7 +1236,10 @@ impl Builder {
         };
         let rest = line.get(4..).unwrap_or("").to_string();
         match b.get(3) {
-            None | Some(b' ') => Ok(Some(Reply { code, lines: vec![rest] })),
+            None | Some(b' ') => Ok(Some(Reply {
+                code,
+                lines: vec![rest],
+            })),
             Some(b'-') => {
                 self.open = Some((code, vec![rest], false));
                 Ok(None)
@@ -1161,7 +1253,9 @@ impl Builder {
 /// code, then a space or the end of the line.
 fn ends(line: &str, code: ReplyCode) -> bool {
     let b = line.as_bytes();
-    b.len() >= 3 && b[..3] == *code.get().to_string().as_bytes() && matches!(b.get(3), None | Some(b' '))
+    b.len() >= 3
+        && b[..3] == *code.get().to_string().as_bytes()
+        && matches!(b.get(3), None | Some(b' '))
 }
 
 /// The two bytes taken to come before the bytes a reader holds: the end
@@ -1614,7 +1708,10 @@ impl Wire for Request {
         if arg.as_ref().is_some_and(|a| a.len() > MAX_LINE) {
             return Err(Error::LineTooLong);
         }
-        let command = Command { verb: verb.to_string(), arg: arg.map(Cow::into_owned) };
+        let command = Command {
+            verb: verb.to_string(),
+            arg: arg.map(Cow::into_owned),
+        };
         let bytes = command.to_bytes()?;
         if Self::parse(&bytes).as_ref() != Ok(self) {
             return Err(Error::Unwritable);
@@ -1667,13 +1764,11 @@ impl Wire for Reply {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use std::net::SocketAddrV6;
 
-    use codec::{
-        Fail, Lcg, Stream,
-    };
+    use codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
 
     use fictionet::stdlib::test_support::{decode_all, mutate};
@@ -1698,30 +1793,60 @@ mod tests {
 
     #[test]
     fn rfc959_commands() {
-        assert_eq!(request("USER anonymous"), Ok(Request::User("anonymous".into())));
-        assert_eq!(request("user anonymous"), Ok(Request::User("anonymous".into())));
+        assert_eq!(
+            request("USER anonymous"),
+            Ok(Request::User("anonymous".into()))
+        );
+        assert_eq!(
+            request("user anonymous"),
+            Ok(Request::User("anonymous".into()))
+        );
         assert_eq!(request("PASS guest@"), Ok(Request::Pass("guest@".into())));
         // RFC 959, section 4.1.2: a PORT argument, port 24 * 256 + 131.
         let to = SocketAddrV4::new(Ipv4Addr::new(132, 235, 1, 2), 6275);
         assert_eq!(request("PORT 132,235,1,2,24,131"), Ok(Request::Port(to)));
-        assert_eq!(Request::Port(to).to_bytes().unwrap(), b"PORT 132,235,1,2,24,131\r\n");
-        assert_eq!(request("TYPE A N"), Ok(Request::Type(DataType::Ascii(Some(Format::NonPrint)))));
+        assert_eq!(
+            Request::Port(to).to_bytes().unwrap(),
+            b"PORT 132,235,1,2,24,131\r\n"
+        );
+        assert_eq!(
+            request("TYPE A N"),
+            Ok(Request::Type(DataType::Ascii(Some(Format::NonPrint))))
+        );
         assert_eq!(request("TYPE i"), Ok(Request::Type(DataType::Image)));
-        assert_eq!(request("TYPE L 8"), Ok(Request::Type(DataType::Local(NonZeroU8::new(8).unwrap()))));
+        assert_eq!(
+            request("TYPE L 8"),
+            Ok(Request::Type(DataType::Local(NonZeroU8::new(8).unwrap())))
+        );
         assert_eq!(request("STRU R"), Ok(Request::Stru(Structure::Record)));
         assert_eq!(request("MODE B"), Ok(Request::Mode(TransferMode::Block)));
-        assert_eq!(request("RETR dir/file name.txt"), Ok(Request::Retr("dir/file name.txt".into())));
+        assert_eq!(
+            request("RETR dir/file name.txt"),
+            Ok(Request::Retr("dir/file name.txt".into()))
+        );
         assert_eq!(request("LIST"), Ok(Request::List(None)));
         assert_eq!(request("LIST -la"), Ok(Request::List(Some("-la".into()))));
         assert_eq!(request("XPWD"), Ok(Request::Pwd));
         assert_eq!(request("XMKD new"), Ok(Request::Mkd("new".into())));
-        assert_eq!(request("SITE CHMOD 755 x"), Ok(Request::Site("CHMOD 755 x".into())));
-        assert_eq!(request("AUTH TLS"), Ok(Request::Other(Command { verb: "AUTH".into(), arg: Some("TLS".into()) })));
+        assert_eq!(
+            request("SITE CHMOD 755 x"),
+            Ok(Request::Site("CHMOD 755 x".into()))
+        );
+        assert_eq!(
+            request("AUTH TLS"),
+            Ok(Request::Other(Command {
+                verb: "AUTH".into(),
+                arg: Some("TLS".into())
+            }))
+        );
     }
 
     #[test]
     fn rfc3659_and_rfc2389_commands() {
-        assert_eq!(request("SIZE /pub/file"), Ok(Request::Size("/pub/file".into())));
+        assert_eq!(
+            request("SIZE /pub/file"),
+            Ok(Request::Size("/pub/file".into()))
+        );
         assert_eq!(request("MDTM file"), Ok(Request::Mdtm("file".into())));
         assert_eq!(request("REST 1024"), Ok(Request::Rest("1024".into())));
         assert_eq!(request("MLSD"), Ok(Request::Mlsd(None)));
@@ -1733,21 +1858,43 @@ mod tests {
     #[test]
     fn rfc2428_addresses() {
         let v4: SocketAddr = "132.235.1.2:6275".parse().unwrap();
-        assert_eq!(EprtAddress::parse("|1|132.235.1.2|6275|".as_bytes()).map(|token| token.address), Ok(v4));
+        assert_eq!(
+            EprtAddress::parse("|1|132.235.1.2|6275|".as_bytes()).map(|token| token.address),
+            Ok(v4)
+        );
         let v6: SocketAddr = "[1080::8:800:200c:417a]:5282".parse().unwrap();
-        assert_eq!(EprtAddress::parse("|2|1080::8:800:200C:417A|5282|".as_bytes()).map(|token| token.address), Ok(v6));
+        assert_eq!(
+            EprtAddress::parse("|2|1080::8:800:200C:417A|5282|".as_bytes())
+                .map(|token| token.address),
+            Ok(v6)
+        );
         // Any printable delimiter.
-        assert_eq!(EprtAddress::parse("!1!132.235.1.2!6275!".as_bytes()).map(|token| token.address), Ok(v4));
-        assert_eq!(EprtAddress { address: v4 }.to_bytes().unwrap(), b"|1|132.235.1.2|6275|");
-        assert_eq!(request("EPRT |2|1080::8:800:200C:417A|5282|"), Ok(Request::Eprt(v6)));
+        assert_eq!(
+            EprtAddress::parse("!1!132.235.1.2!6275!".as_bytes()).map(|token| token.address),
+            Ok(v4)
+        );
+        assert_eq!(
+            EprtAddress { address: v4 }.to_bytes().unwrap(),
+            b"|1|132.235.1.2|6275|"
+        );
+        assert_eq!(
+            request("EPRT |2|1080::8:800:200C:417A|5282|"),
+            Ok(Request::Eprt(v6))
+        );
         assert_eq!(request("EPSV"), Ok(Request::Epsv(None)));
-        assert_eq!(request("EPSV 2"), Ok(Request::Epsv(Some(EpsvArg::Protocol(2)))));
+        assert_eq!(
+            request("EPSV 2"),
+            Ok(Request::Epsv(Some(EpsvArg::Protocol(2))))
+        );
         assert_eq!(request("EPSV all"), Ok(Request::Epsv(Some(EpsvArg::All))));
         // RFC 2428, section 3: the reply to EPSV.
         let r = reply_of(b"229 Entering Extended Passive Mode (|||6446|)\r\n");
         assert_eq!(r.extended_passive_port(), Ok(6446));
         assert_eq!(Reply::extended_passive(6446), r);
-        assert_eq!(reply_of(b"229 ok (!!!21!)\r\n").extended_passive_port(), Ok(21));
+        assert_eq!(
+            reply_of(b"229 ok (!!!21!)\r\n").extended_passive_port(),
+            Ok(21)
+        );
     }
 
     #[test]
@@ -1757,11 +1904,26 @@ mod tests {
         assert_eq!(r.passive_address(), Ok(addr));
         assert_eq!(Reply::passive(addr), r);
         // Other wordings, as RFC 1123 warns.
-        assert_eq!(reply_of(b"227 =192,168,1,2,19,137\n").passive_address(), Ok(addr));
-        assert_eq!(reply_of(b"227 Passive 192,168,1,2,19,137 ok\r\n").passive_address(), Ok(addr));
-        assert_eq!(reply_of(b"227 Passive\r\n").passive_address(), Err(Error::Address));
-        assert_eq!(reply_of(b"227 (1,2,3)\r\n").passive_address(), Err(Error::Address));
-        assert_eq!(reply_of(b"200 (1,2,3,4,5,6)\r\n").passive_address(), Err(Error::Code(code::OK)));
+        assert_eq!(
+            reply_of(b"227 =192,168,1,2,19,137\n").passive_address(),
+            Ok(addr)
+        );
+        assert_eq!(
+            reply_of(b"227 Passive 192,168,1,2,19,137 ok\r\n").passive_address(),
+            Ok(addr)
+        );
+        assert_eq!(
+            reply_of(b"227 Passive\r\n").passive_address(),
+            Err(Error::Address)
+        );
+        assert_eq!(
+            reply_of(b"227 (1,2,3)\r\n").passive_address(),
+            Err(Error::Address)
+        );
+        assert_eq!(
+            reply_of(b"200 (1,2,3,4,5,6)\r\n").passive_address(),
+            Err(Error::Code(code::OK))
+        );
     }
 
     #[test]
@@ -1770,9 +1932,20 @@ mod tests {
         let bytes = b"123-First line\r\nSecond line\r\n  234 A line beginning with numbers\r\n123 The last line\r\n";
         let r = reply_of(bytes);
         assert_eq!(r.code.get(), 123);
-        assert_eq!(r.lines, ["First line", "Second line", "  234 A line beginning with numbers", "The last line"]);
+        assert_eq!(
+            r.lines,
+            [
+                "First line",
+                "Second line",
+                "  234 A line beginning with numbers",
+                "The last line"
+            ]
+        );
         assert_eq!(r.to_bytes().unwrap(), bytes);
-        assert_eq!(reply_of(b"220 Service ready\r\n"), Reply::new(code::READY, "Service ready"));
+        assert_eq!(
+            reply_of(b"220 Service ready\r\n"),
+            Reply::new(code::READY, "Service ready")
+        );
         // A code with no text, and a bare LF.
         assert_eq!(reply_of(b"200\n"), Reply::new(code::OK, ""));
         // A line in the middle with another code is text.
@@ -1787,21 +1960,47 @@ mod tests {
         let f = r.features().unwrap();
         let names: Vec<_> = f.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["MLST", "SIZE", "COMPRESSION", "MDTM"]);
-        assert_eq!(f[0].params.as_deref(), Some("size*;create;modify*;perm;media-type"));
+        assert_eq!(
+            f[0].params.as_deref(),
+            Some("size*;create;modify*;perm;media-type")
+        );
         assert_eq!(f[1].params, None);
         assert_eq!(Reply::feature_list(&f).unwrap().features(), Ok(f));
         // No features.
         assert_eq!(reply_of(b"211 no-features\r\n").features(), Ok(vec![]));
-        assert_eq!(Reply::feature_list(&[]).unwrap().to_bytes().unwrap(), b"211 No features.\r\n");
+        assert_eq!(
+            Reply::feature_list(&[]).unwrap().to_bytes().unwrap(),
+            b"211 No features.\r\n"
+        );
         // Errors.
-        assert_eq!(reply_of(b"500 no\r\n").features(), Err(Error::Code(code::SYNTAX_ERROR)));
-        assert_eq!(reply_of(b"211-x\r\nSIZE\r\n211 e\r\n").features(), Err(Error::Feature));
-        assert_eq!(reply_of(b"211-x\r\n  SIZE\r\n211 e\r\n").features(), Err(Error::Feature));
-        assert_eq!(reply_of(b"211-x\r\n \x01\r\n211 e\r\n").features(), Err(Error::Feature));
+        assert_eq!(
+            reply_of(b"500 no\r\n").features(),
+            Err(Error::Code(code::SYNTAX_ERROR))
+        );
+        assert_eq!(
+            reply_of(b"211-x\r\nSIZE\r\n211 e\r\n").features(),
+            Err(Error::Feature)
+        );
+        assert_eq!(
+            reply_of(b"211-x\r\n  SIZE\r\n211 e\r\n").features(),
+            Err(Error::Feature)
+        );
+        assert_eq!(
+            reply_of(b"211-x\r\n \x01\r\n211 e\r\n").features(),
+            Err(Error::Feature)
+        );
         // Names keep their case, and a space with nothing after it is no
         // parameters.
-        let f = reply_of(b"211-x\r\n mdtm \r\n211 e\r\n").features().unwrap();
-        assert_eq!(f, [Feature { name: "mdtm".into(), params: None }]);
+        let f = reply_of(b"211-x\r\n mdtm \r\n211 e\r\n")
+            .features()
+            .unwrap();
+        assert_eq!(
+            f,
+            [Feature {
+                name: "mdtm".into(),
+                params: None
+            }]
+        );
     }
 
     #[test]
@@ -1869,7 +2068,10 @@ mod tests {
             Request::Rnto("end\r".into()),
         ];
         let stream: Vec<u8> = all.iter().flat_map(|r| r.to_bytes().unwrap()).collect();
-        let back: Vec<_> = commands(&stream).into_iter().map(|c| Request::from_command(&c.unwrap()).unwrap()).collect();
+        let back: Vec<_> = commands(&stream)
+            .into_iter()
+            .map(|c| Request::from_command(&c.unwrap()).unwrap())
+            .collect();
         assert_eq!(back, all);
     }
 
@@ -1894,7 +2096,10 @@ mod tests {
         }
         assert_eq!(Command::parse(b"RETR a\nb\r\n"), Err(Error::Trailing));
         assert_eq!(Command::parse(&[b'A'; MAX_LINE]), Err(Error::LineTooLong));
-        assert_eq!(Command::parse(b"retr \r\n"), Ok(Command::new("RETR", Some(""))));
+        assert_eq!(
+            Command::parse(b"retr \r\n"),
+            Ok(Command::new("RETR", Some("")))
+        );
     }
 
     #[test]
@@ -1921,9 +2126,17 @@ mod tests {
         assert_eq!(request("EPSV 65536"), Err(E::InvalidArgument));
         assert_eq!(request("PORT 1,2,3,4,5"), Err(Error::Address));
         // RFC 959, section 5.3.2, and RFC 2389, section 4.
-        for bad in
-            ["ALLO xyz", "ALLO ", "ALLO 1 R", "ALLO 1 X 2", "ALLO 1  R 2", "REST a b", "REST ", "OPTS ", "OPTS  x"]
-        {
+        for bad in [
+            "ALLO xyz",
+            "ALLO ",
+            "ALLO 1 R",
+            "ALLO 1 X 2",
+            "ALLO 1  R 2",
+            "REST a b",
+            "REST ",
+            "OPTS ",
+            "OPTS  x",
+        ] {
             assert_eq!(request(bad), Err(E::InvalidArgument), "{bad:?}");
         }
         assert_eq!(request("ALLO 10 r 2"), Ok(Request::Allo("10 r 2".into())));
@@ -1935,11 +2148,25 @@ mod tests {
     #[test]
     fn address_errors() {
         use Error::*;
-        for bad in ["", "1,2,3,4,5", "1,2,3,4,5,6,", "256,0,0,0,0,0", "1,2,3,4,5,0006", "1, 2,3,4,5,6", "+1,2,3,4,5,6"]
-        {
-            assert_eq!(PortAddress::parse(bad.as_bytes()).map(|token| token.address), Err(Address), "{bad:?}");
+        for bad in [
+            "",
+            "1,2,3,4,5",
+            "1,2,3,4,5,6,",
+            "256,0,0,0,0,0",
+            "1,2,3,4,5,0006",
+            "1, 2,3,4,5,6",
+            "+1,2,3,4,5,6",
+        ] {
+            assert_eq!(
+                PortAddress::parse(bad.as_bytes()).map(|token| token.address),
+                Err(Address),
+                "{bad:?}"
+            );
         }
-        assert_eq!(PortAddress::parse("001,2,3,4,5,6".as_bytes()).map(|token| token.address), Ok(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 0x0506)));
+        assert_eq!(
+            PortAddress::parse("001,2,3,4,5,6".as_bytes()).map(|token| token.address),
+            Ok(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 0x0506))
+        );
         for bad in [
             "",
             " 1 1.2.3.4 5 ",
@@ -1953,23 +2180,56 @@ mod tests {
             "|x|1.2.3.4|5|",
             "|1|01.2.3.4|5|",
         ] {
-            assert_eq!(EprtAddress::parse(bad.as_bytes()).map(|token| token.address), Err(Address), "{bad:?}");
+            assert_eq!(
+                EprtAddress::parse(bad.as_bytes()).map(|token| token.address),
+                Err(Address),
+                "{bad:?}"
+            );
         }
-        assert_eq!(EprtAddress::parse("|0|1.2.3.4|5|".as_bytes()).map(|token| token.address), Err(Family));
-        assert_eq!(EprtAddress::parse("|99999|1.2.3.4|5|".as_bytes()).map(|token| token.address), Err(Family));
+        assert_eq!(
+            EprtAddress::parse("|0|1.2.3.4|5|".as_bytes()).map(|token| token.address),
+            Err(Family)
+        );
+        assert_eq!(
+            EprtAddress::parse("|99999|1.2.3.4|5|".as_bytes()).map(|token| token.address),
+            Err(Family)
+        );
         // RFC 2428, section 2: an unknown family gets 522, whatever its
         // address and port look like.
-        assert_eq!(EprtAddress::parse("|123456|1.2.3.4|5|".as_bytes()).map(|token| token.address), Err(Family));
-        assert_eq!(EprtAddress::parse("|3|zone:4|x|".as_bytes()).map(|token| token.address), Err(Family));
-        for bad in ["229 none", "229 ()", "229 (|||x|)", "229 (||1|5|)", "229 (|||5|", "229 (|||5)", "229 ( || 5|)"] {
+        assert_eq!(
+            EprtAddress::parse("|123456|1.2.3.4|5|".as_bytes()).map(|token| token.address),
+            Err(Family)
+        );
+        assert_eq!(
+            EprtAddress::parse("|3|zone:4|x|".as_bytes()).map(|token| token.address),
+            Err(Family)
+        );
+        for bad in [
+            "229 none",
+            "229 ()",
+            "229 (|||x|)",
+            "229 (||1|5|)",
+            "229 (|||5|",
+            "229 (|||5)",
+            "229 ( || 5|)",
+        ] {
             let r = reply_of(format!("{bad}\r\n").as_bytes());
             assert_eq!(r.extended_passive_port(), Err(Address), "{bad:?}");
         }
-        assert_eq!(Reply::new(code::OK, "(|||5|)").extended_passive_port(), Err(Code(code::OK)));
+        assert_eq!(
+            Reply::new(code::OK, "(|||5|)").extended_passive_port(),
+            Err(Code(code::OK))
+        );
         // A reply built by hand with no lines.
-        let empty = Reply { code: code::PASSIVE, lines: vec![] };
+        let empty = Reply {
+            code: code::PASSIVE,
+            lines: vec![],
+        };
         assert_eq!(empty.passive_address(), Err(Address));
-        let empty = Reply { code: code::EXTENDED_PASSIVE, lines: vec![] };
+        let empty = Reply {
+            code: code::EXTENDED_PASSIVE,
+            lines: vec![],
+        };
         assert_eq!(empty.extended_passive_port(), Err(Address));
         // `)` as the delimiter (RFC 2428, section 3).
         let r = reply_of(b"229 Entering Extended Passive Mode ()))6446))\r\n");
@@ -2010,7 +2270,12 @@ mod tests {
         assert_eq!(Reply::parse(b"200 \xff\r\n"), Err(Error::Text));
         assert_eq!(Reply::parse(b"200 a\rb\r\n"), Err(Error::Text));
         assert_eq!(Reply::parse(b"200-a\r\nb\0\r\n"), Err(Error::Text));
-        let long = [vec![b'2', b'0', b'0', b' '], vec![b'x'; MAX_LINE], b"\r\n".to_vec()].concat();
+        let long = [
+            vec![b'2', b'0', b'0', b' '],
+            vec![b'x'; MAX_LINE],
+            b"\r\n".to_vec(),
+        ]
+        .concat();
         assert_eq!(Reply::parse(&long), Err(Error::LineTooLong));
         // Too many lines.
         let mut many = b"200-first\r\n".to_vec();
@@ -2027,28 +2292,50 @@ mod tests {
         most.extend_from_slice(b"200 last\r\n");
         assert_eq!(reply_of(&most).lines.len(), MAX_REPLY_LINES);
         // A malformed first line is recoverable; invalid text in an open reply is terminal.
-        assert_eq!(replies(b"200 ok\r\nhello\r\n200 ok\r\n"), [
-            Ok(Reply::new(code::OK, "ok")), Err(Error::Syntax), Ok(Reply::new(code::OK, "ok"))
-        ]);
+        assert_eq!(
+            replies(b"200 ok\r\nhello\r\n200 ok\r\n"),
+            [
+                Ok(Reply::new(code::OK, "ok")),
+                Err(Error::Syntax),
+                Ok(Reply::new(code::OK, "ok"))
+            ]
+        );
         let mut stream = Stream::new(Replies::new());
         assert_eq!(stream.push(b"200-a\r\nb\0\r\n"), 11);
-        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Reply(Error::Text)))));
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(FrameError::Reply(Error::Text))))
+        );
         assert!(stream.next().is_none());
-        assert_eq!(stream.failed(), Some(&Fail::Protocol(FrameError::Reply(Error::Text))));
+        assert_eq!(
+            stream.failed(),
+            Some(&Fail::Protocol(FrameError::Reply(Error::Text)))
+        );
     }
 
     #[test]
     fn line_lengths() {
         // The longest line allowed, with CRLF and with LF alone.
         let verb = b"RETR ";
-        let fits = [verb.to_vec(), vec![b'x'; MAX_LINE - 2 - verb.len()], b"\r\n".to_vec()].concat();
+        let fits = [
+            verb.to_vec(),
+            vec![b'x'; MAX_LINE - 2 - verb.len()],
+            b"\r\n".to_vec(),
+        ]
+        .concat();
         assert_eq!(fits.len(), MAX_LINE);
         let fits_lf = [&fits[..fits.len() - 2], b"\n"].concat();
         let over_lf = [&fits[..fits.len() - 2], b"x\n"].concat();
         let over = [&fits[..fits.len() - 2], b"x\r\n"].concat();
         let far_over = [vec![b'x'; 3 * MAX_LINE], b"\r\n".to_vec()].concat();
         let next = b"NOOP\r\n";
-        for (line, ok) in [(&fits, true), (&fits_lf, true), (&over_lf, false), (&over, false), (&far_over, false)] {
+        for (line, ok) in [
+            (&fits, true),
+            (&fits_lf, true),
+            (&over_lf, false),
+            (&over, false),
+            (&far_over, false),
+        ] {
             let stream = [line.as_slice(), next].concat();
             let got = commands(&stream);
             assert_eq!(got.len(), 2);
@@ -2059,7 +2346,11 @@ mod tests {
             assert_eq!(got[1], Ok(Command::new("NOOP", None)));
             contract::check_decode_with_alloc_limit(Commands::new, &stream, 2 * MAX_LINE);
         }
-        contract::check_decode_with_alloc_limit(Commands::new, &vec![b'x'; 3 * MAX_LINE], 2 * MAX_LINE);
+        contract::check_decode_with_alloc_limit(
+            Commands::new,
+            &vec![b'x'; 3 * MAX_LINE],
+            2 * MAX_LINE,
+        );
     }
 
     #[test]
@@ -2075,7 +2366,11 @@ mod tests {
         let reply: &[u8] = b"211-Extensions supported:\r\n SIZE\r\n MDTM\r\n211 End\r\n";
         reply_of(reply);
         for n in 0..reply.len() {
-            assert_eq!(Reply::parse(&reply[..n]), Err(Error::Incomplete), "{n} bytes");
+            assert_eq!(
+                Reply::parse(&reply[..n]),
+                Err(Error::Incomplete),
+                "{n} bytes"
+            );
             assert_eq!(replies(&reply[..n]), vec![], "{n} bytes");
         }
     }
@@ -2141,60 +2436,118 @@ mod tests {
     #[test]
     fn writers_preserve_values_or_refuse() {
         let c = Request::Retr("a\r\nDELE b".into());
-        assert_eq!(commands(&c.to_bytes().unwrap()), [Ok(Command::new("RETR", Some("a\r\nDELE b")))]);
+        assert_eq!(
+            commands(&c.to_bytes().unwrap()),
+            [Ok(Command::new("RETR", Some("a\r\nDELE b")))]
+        );
         for (request, error) in [
             (Request::Dele("a\nb".into()), Error::Unwritable),
             (Request::Dele("a\0b".into()), Error::Unwritable),
             (Request::Allo("xyz".into()), Error::Unwritable),
-            (Request::Other(Command::new("RETR", None)), Error::Unwritable),
-            (Request::Other(Command::new("NOOP", None)), Error::Unwritable),
-            (Request::Other(Command::new("noop", None)), Error::Unwritable),
-            (Request::Other(Command::new("abcd", None)), Error::Unwritable),
+            (
+                Request::Other(Command::new("RETR", None)),
+                Error::Unwritable,
+            ),
+            (
+                Request::Other(Command::new("NOOP", None)),
+                Error::Unwritable,
+            ),
+            (
+                Request::Other(Command::new("noop", None)),
+                Error::Unwritable,
+            ),
+            (
+                Request::Other(Command::new("abcd", None)),
+                Error::Unwritable,
+            ),
             (Request::Stor("é".repeat(MAX_LINE)), Error::LineTooLong),
-            (Request::Stor("x".repeat(rounds(64 << 20))), Error::LineTooLong),
+            (
+                Request::Stor("x".repeat(rounds(64 << 20))),
+                Error::LineTooLong,
+            ),
         ] {
             let mut out = b"prefix".to_vec();
             assert_eq!(request.write(&mut out), Err(error));
             assert_eq!(out, b"prefix");
         }
         for verb in ["x-y z", "12", "", "abcdef"] {
-            assert_eq!(
-                Command::new(verb, None).to_bytes(),
-                Err(Error::Unwritable)
-            );
+            assert_eq!(Command::new(verb, None).to_bytes(), Err(Error::Unwritable));
         }
-        assert_eq!(Command::new("retr", Some("x")).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Command::new("retr", Some("x")).to_bytes(),
+            Err(Error::Unwritable)
+        );
         let fits = "x".repeat(MAX_LINE - 7);
         let request = Request::Stor(fits.clone());
         assert_eq!(request.to_bytes().unwrap().len(), MAX_LINE);
         contract::check_wire_value(&request);
-        assert_eq!(Request::Stor(format!("{}\r", &fits[1..])).to_bytes(), Err(Error::LineTooLong));
+        assert_eq!(
+            Request::Stor(format!("{}\r", &fits[1..])).to_bytes(),
+            Err(Error::LineTooLong)
+        );
         for lines in [
-            vec!["a\r\n214 x".into(), "214 end".into(), "214".into(), "é".repeat(MAX_LINE), "z".into()],
+            vec![
+                "a\r\n214 x".into(),
+                "214 end".into(),
+                "214".into(),
+                "é".repeat(MAX_LINE),
+                "z".into(),
+            ],
             vec!["a".into(), "214 end".into(), "z".into()],
             vec!["a".into(), "214".into(), "z".into()],
             vec!["a".into(), "2\r30 x".into(), "end".into()],
             (0..MAX_REPLY_LINES + 5).map(|i| i.to_string()).collect(),
             vec![],
         ] {
-            let reply = Reply { code: code::HELP, lines };
+            let reply = Reply {
+                code: code::HELP,
+                lines,
+            };
             let mut out = b"prefix".to_vec();
             assert_eq!(reply.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, b"prefix");
         }
-        let reply = Reply { code: code::READY, lines: vec!["a".into(), "230 Logged in".into(), "999-x".into(), "end".into()] };
-        assert_eq!(reply.to_bytes().unwrap(), b"220-a\r\n230 Logged in\r\n999-x\r\n220 end\r\n");
+        let reply = Reply {
+            code: code::READY,
+            lines: vec![
+                "a".into(),
+                "230 Logged in".into(),
+                "999-x".into(),
+                "end".into(),
+            ],
+        };
+        assert_eq!(
+            reply.to_bytes().unwrap(),
+            b"220-a\r\n230 Logged in\r\n999-x\r\n220 end\r\n"
+        );
         let one = Reply::new(code::OK, &"x".repeat(2 * MAX_LINE));
         assert_eq!(one.to_bytes(), Err(Error::LineTooLong));
         for feature in [
-            Feature { name: "a b".into(), params: Some("p\r\nq\x01\té".into()) },
-            Feature { name: " ".into(), params: None },
-            Feature { name: "X".into(), params: Some(String::new()) },
-            Feature { name: "Y".into(), params: Some("\x01".into()) },
+            Feature {
+                name: "a b".into(),
+                params: Some("p\r\nq\x01\té".into()),
+            },
+            Feature {
+                name: " ".into(),
+                params: None,
+            },
+            Feature {
+                name: "X".into(),
+                params: Some(String::new()),
+            },
+            Feature {
+                name: "Y".into(),
+                params: Some("\x01".into()),
+            },
         ] {
             assert_eq!(Reply::feature_list(&[feature]), Err(Error::Unwritable));
         }
-        let many: Vec<_> = (0..MAX_REPLY_LINES).map(|i| Feature { name: format!("F{i}"), params: None }).collect();
+        let many: Vec<_> = (0..MAX_REPLY_LINES)
+            .map(|i| Feature {
+                name: format!("F{i}"),
+                params: None,
+            })
+            .collect();
         assert_eq!(Reply::feature_list(&many), Err(Error::Unwritable));
         let reply = Reply::feature_list(&many[..MAX_FEATURES]).unwrap();
         assert_eq!(reply.features().unwrap().len(), MAX_FEATURES);
@@ -2205,7 +2558,10 @@ mod tests {
     fn reply_and_feature_line_limits() {
         for at in 0..3 {
             let limit = if at == 1 { MAX_CONTENT } else { MAX_REPLY_TEXT };
-            let mut reply = Reply { code: code::HELP, lines: vec!["start".into(), "middle".into(), "end".into()] };
+            let mut reply = Reply {
+                code: code::HELP,
+                lines: vec!["start".into(), "middle".into(), "end".into()],
+            };
             reply.lines[at] = "x".repeat(limit);
             let bytes = reply.to_bytes().unwrap();
             assert_eq!(Reply::parse(&bytes), Ok(reply.clone()));
@@ -2215,8 +2571,14 @@ mod tests {
             assert_eq!(out, b"prefix");
         }
         for mut feature in [
-            Feature { name: "x".repeat(MAX_CONTENT - 1), params: None },
-            Feature { name: "X".into(), params: Some("p".repeat(MAX_CONTENT - 3)) },
+            Feature {
+                name: "x".repeat(MAX_CONTENT - 1),
+                params: None,
+            },
+            Feature {
+                name: "X".into(),
+                params: Some("p".repeat(MAX_CONTENT - 3)),
+            },
         ] {
             let reply = Reply::feature_list(std::slice::from_ref(&feature)).unwrap();
             assert_eq!(Reply::parse(&reply.to_bytes().unwrap()), Ok(reply));
@@ -2268,23 +2630,32 @@ mod tests {
 
     #[test]
     fn decoders_take_many_short_lines_in_linear_time() {
-        assert_linear("decoders_take_many_short_lines_in_linear_time", rounds(125_000), |size| {
-            let stream = b"NOOP\r\n".repeat(size);
-            let got = commands(&stream);
-            assert_eq!(got.len(), size);
-            assert!(got.iter().all(|c| *c == Ok(Command::new("NOOP", None))));
-            let stream = b"200 ok\r\n".repeat(size);
-            let got = replies(&stream);
-            assert_eq!(got.len(), size);
-            assert!(got.iter().all(|r| *r == Ok(Reply::new(code::OK, "ok"))));
-        });
+        assert_linear(
+            "decoders_take_many_short_lines_in_linear_time",
+            rounds(125_000),
+            |size| {
+                let stream = b"NOOP\r\n".repeat(size);
+                let got = commands(&stream);
+                assert_eq!(got.len(), size);
+                assert!(got.iter().all(|c| *c == Ok(Command::new("NOOP", None))));
+                let stream = b"200 ok\r\n".repeat(size);
+                let got = replies(&stream);
+                assert_eq!(got.len(), size);
+                assert!(got.iter().all(|r| *r == Ok(Reply::new(code::OK, "ok"))));
+            },
+        );
     }
 
     #[test]
     fn decoders_skip_long_lines_after_short_ones() {
         // Lines taken out leave room for a long line to be noticed and
         // skipped, pushed whole or in pieces.
-        let long = [b"NOOP\r\n".repeat(10), vec![b'x'; 2 * MAX_LINE], b"\r\nQUIT\r\n".to_vec()].concat();
+        let long = [
+            b"NOOP\r\n".repeat(10),
+            vec![b'x'; 2 * MAX_LINE],
+            b"\r\nQUIT\r\n".to_vec(),
+        ]
+        .concat();
         let mut want = vec![Ok(Command::new("NOOP", None)); 10];
         want.push(Err(Error::LineTooLong));
         want.push(Ok(Command::new("QUIT", None)));
@@ -2297,7 +2668,10 @@ mod tests {
     #[test]
     fn streams_bound_input_allocation() {
         let big = [vec![b'x'; 1 << 20], b"yy\r\nNOOP\r\n".to_vec()].concat();
-        assert_eq!(commands(&big), [Err(Error::LineTooLong), Ok(Command::new("NOOP", None))]);
+        assert_eq!(
+            commands(&big),
+            [Err(Error::LineTooLong), Ok(Command::new("NOOP", None))]
+        );
         contract::check_decode_with_alloc_limit(Commands::new, &big, 2 * MAX_LINE);
         let mut stream = Stream::new(Commands::new());
         let many = b"NOOP\r\n".repeat(MAX_LINE);
@@ -2307,16 +2681,29 @@ mod tests {
         let big = [b"200 a\r\n".as_slice(), &vec![b'x'; 1 << 20], b"\r\n"].concat();
         let (items, failure) = decode_all(Replies::new, &big);
         assert_eq!(items, [Ok(Reply::new(code::OK, "a"))]);
-        assert_eq!(failure, Some(Fail::Protocol(FrameError::Reply(Error::LineTooLong))));
+        assert_eq!(
+            failure,
+            Some(Fail::Protocol(FrameError::Reply(Error::LineTooLong)))
+        );
         contract::check_decode_with_alloc_limit(Replies::new, &big, 2 * MAX_LINE);
     }
 
     #[test]
     fn crnul_pathnames_round_trip() {
         // RFC 2640, section 3.1, its own example.
-        assert_eq!(commands(b"STOR foo\r\0\nboo.bar\r\n"), [Ok(Command::new("STOR", Some("foo\r\nboo.bar")))]);
-        contract::check_decode_with_alloc_limit(Commands::new, b"STOR foo\r\0\nboo.bar\r\n", 2 * MAX_LINE);
-        assert_eq!(Request::Stor("foo\r\nboo.bar".into()).to_bytes().unwrap(), b"STOR foo\r\0\nboo.bar\r\n");
+        assert_eq!(
+            commands(b"STOR foo\r\0\nboo.bar\r\n"),
+            [Ok(Command::new("STOR", Some("foo\r\nboo.bar")))]
+        );
+        contract::check_decode_with_alloc_limit(
+            Commands::new,
+            b"STOR foo\r\0\nboo.bar\r\n",
+            2 * MAX_LINE,
+        );
+        assert_eq!(
+            Request::Stor("foo\r\nboo.bar".into()).to_bytes().unwrap(),
+            b"STOR foo\r\0\nboo.bar\r\n"
+        );
         let got = commands(&Request::Dele("a\rb".into()).to_bytes().unwrap());
         assert_eq!(got, [Ok(Command::new("DELE", Some("a\rb")))]);
         // A bare LF still ends a line.
@@ -2326,15 +2713,25 @@ mod tests {
     #[test]
     fn telnet_commands_are_dropped() {
         // RFC 959, section 4.1.3: IP and Synch before ABOR.
-        assert_eq!(commands(b"\xff\xf4\xff\xf2ABOR\r\n"), [Ok(Command::new("ABOR", None))]);
-        assert_eq!(commands(b"NO\xff\xfb\x01OP\r\n"), [Ok(Command::new("NOOP", None))]);
+        assert_eq!(
+            commands(b"\xff\xf4\xff\xf2ABOR\r\n"),
+            [Ok(Command::new("ABOR", None))]
+        );
+        assert_eq!(
+            commands(b"NO\xff\xfb\x01OP\r\n"),
+            [Ok(Command::new("NOOP", None))]
+        );
     }
 
     #[test]
     fn passive_helpers_read_multiline_replies() {
         let r = reply_of(b"227-Preparing\r\n227 Entering Passive Mode (127,0,0,1,19,137)\r\n");
-        assert_eq!(r.passive_address(), Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 19 * 256 + 137)));
-        let r = reply_of(b"229-Preparing (soon)\r\n229 Entering Extended Passive Mode (|||6446|)\r\n");
+        assert_eq!(
+            r.passive_address(),
+            Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 19 * 256 + 137))
+        );
+        let r =
+            reply_of(b"229-Preparing (soon)\r\n229 Entering Extended Passive Mode (|||6446|)\r\n");
         assert_eq!(r.extended_passive_port(), Ok(6446));
     }
 
@@ -2346,7 +2743,10 @@ mod tests {
             s.extend_from_slice(b"x\r\n");
         }
         s.extend_from_slice(b"200 last\r\n220 next\r\n");
-        let want = vec![Err(Error::TooManyLines), Ok(Reply::new(code::READY, "next"))];
+        let want = vec![
+            Err(Error::TooManyLines),
+            Ok(Reply::new(code::READY, "next")),
+        ];
         assert_eq!(replies(&s), want);
         contract::check_decode_with_alloc_limit(Replies::new, &s, 2 * MAX_LINE);
     }
@@ -2355,25 +2755,44 @@ mod tests {
     fn feature_names_keep_their_case() {
         let r = reply_of(b"211-x\r\n x-Custom a\tb\r\n211 End\r\n");
         let f = r.features().unwrap();
-        assert_eq!(f, [Feature { name: "x-Custom".into(), params: Some("a\tb".into()) }]);
+        assert_eq!(
+            f,
+            [Feature {
+                name: "x-Custom".into(),
+                params: Some("a\tb".into())
+            }]
+        );
         assert_eq!(Reply::feature_list(&f).unwrap().features(), Ok(f));
         // RFC 2389, section 2.1: parameters are TCHAR.
-        assert_eq!(reply_of(b"211-x\r\n X \x01\r\n211 End\r\n").features(), Err(Error::Feature));
-        assert_eq!(reply_of("211-x\r\n X é\r\n211 End\r\n".as_bytes()).features(), Err(Error::Feature));
+        assert_eq!(
+            reply_of(b"211-x\r\n X \x01\r\n211 End\r\n").features(),
+            Err(Error::Feature)
+        );
+        assert_eq!(
+            reply_of("211-x\r\n X é\r\n211 End\r\n".as_bytes()).features(),
+            Err(Error::Feature)
+        );
     }
 
     #[test]
     fn fuzz_loop() {
         let mut rng = Lcg::new(0x5eed);
         let seeds: &[&[u8]] = &[
-            b"USER a\r\nRETR a\r\0\nb\r\nNOOP\r\n", b"\xff\xf4\xff\xf2ABOR\r\n",
-            b"211-a\r\n123 b\r\n211 c\r\n", b"227 (1,2,3,4,5,6)\r\n",
-            b"229 (|||123|)\r\n", b"211-a\r\n x-Custom a\tb\r\n211 End\r\n",
+            b"USER a\r\nRETR a\r\0\nb\r\nNOOP\r\n",
+            b"\xff\xf4\xff\xf2ABOR\r\n",
+            b"211-a\r\n123 b\r\n211 c\r\n",
+            b"227 (1,2,3,4,5,6)\r\n",
+            b"229 (|||123|)\r\n",
+            b"211-a\r\n x-Custom a\tb\r\n211 End\r\n",
             b"PORT 1,2,3,4,5,6\r\nEPRT |2|::1|21|\r\nTYPE A N\r\n",
             b"ALLO 1 R 2\r\nREST 10\r\nEPSV ALL\r\n",
         ];
         for _ in 0..4000 {
-            let mut data = if rng.coin() { seeds[rng.index(seeds.len())].to_vec() } else { rng.bytes(256) };
+            let mut data = if rng.coin() {
+                seeds[rng.index(seeds.len())].to_vec()
+            } else {
+                rng.bytes(256)
+            };
             if rng.index(16) == 0 {
                 data.extend(std::iter::repeat_n(b'x', rng.index(3 * MAX_LINE / 2 + 1)));
                 data.extend_from_slice(b"\r\nNOOP\r\n");
@@ -2388,7 +2807,9 @@ mod tests {
             contract::check_wire::<EprtAddress>(&data);
             let address = SocketAddrV4::new(Ipv4Addr::from(rng.next() as u32), rng.next() as u16);
             contract::check_wire_value(&PortAddress { address });
-            contract::check_wire_value(&EprtAddress { address: address.into() });
+            contract::check_wire_value(&EprtAddress {
+                address: address.into(),
+            });
             for command in commands(&data).iter().flatten() {
                 contract::check_wire_value(command);
                 command.to_bytes().unwrap();
@@ -2400,13 +2821,19 @@ mod tests {
             for reply in replies(&data).iter().flatten() {
                 contract::check_wire_value(reply);
                 if let Ok(features) = reply.features() {
-                    assert_eq!(Reply::feature_list(&features).unwrap().features(), Ok(features));
+                    assert_eq!(
+                        Reply::feature_list(&features).unwrap().features(),
+                        Ok(features)
+                    );
                 }
                 if let Ok(address) = reply.passive_address() {
                     assert_eq!(Reply::passive(address).passive_address(), Ok(address));
                 }
                 if let Ok(port) = reply.extended_passive_port() {
-                    assert_eq!(Reply::extended_passive(port).extended_passive_port(), Ok(port));
+                    assert_eq!(
+                        Reply::extended_passive(port).extended_passive_port(),
+                        Ok(port)
+                    );
                 }
             }
             let bytes = rng.bytes(128);
@@ -2414,7 +2841,11 @@ mod tests {
             let (verb, arg) = text.split_once(' ').unwrap_or((&text, ""));
             contract::check_wire_value(&Command::new(verb, Some(arg)));
             contract::check_wire_value(&Command::new("RETR", Some(&text)));
-            for request in [Request::Allo(text.clone()), Request::Rest(text.clone()), Request::Opts(text.clone())] {
+            for request in [
+                Request::Allo(text.clone()),
+                Request::Rest(text.clone()),
+                Request::Opts(text.clone()),
+            ] {
                 contract::check_wire_value(&request);
             }
             let lines: Vec<String> = text
@@ -2429,10 +2860,16 @@ mod tests {
                 && let Ok(reply) = Reply::from_lines(code, lines.clone())
             {
                 contract::check_wire_value(&reply);
-                assert_eq!(Reply::parse(&reply.to_bytes().unwrap()).as_ref(), Ok(&reply));
+                assert_eq!(
+                    Reply::parse(&reply.to_bytes().unwrap()).as_ref(),
+                    Ok(&reply)
+                );
                 for (i, (line, padded)) in lines.iter().zip(&reply.lines).enumerate() {
                     let middle = i != 0 && i + 1 != lines.len();
-                    let numeric = line.as_bytes().get(..3).is_some_and(|start| start.iter().all(u8::is_ascii_digit));
+                    let numeric = line
+                        .as_bytes()
+                        .get(..3)
+                        .is_some_and(|start| start.iter().all(u8::is_ascii_digit));
                     if middle && numeric {
                         assert_eq!(padded.strip_prefix(' '), Some(line.as_str()));
                     } else {

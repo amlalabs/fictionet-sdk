@@ -41,7 +41,7 @@
 //! assert_eq!(answer.origin, request.transmit);
 //! ```
 
-use fictionet::stdlib::codec::{be32, Wire};
+use fictionet::stdlib::codec::{Wire, be32};
 
 /// The UDP port NTP servers listen on.
 pub const PORT: u16 = 123;
@@ -174,7 +174,10 @@ pub struct Timestamp {
 
 impl Timestamp {
     /// The all-zero timestamp, which NTP uses for "no time".
-    pub const ZERO: Timestamp = Timestamp { seconds: 0, fraction: 0 };
+    pub const ZERO: Timestamp = Timestamp {
+        seconds: 0,
+        fraction: 0,
+    };
 
     /// The timestamp for `secs` seconds and `nanos` nanoseconds after the
     /// Unix epoch. Negative `secs` are before 1970. Nanoseconds of a second
@@ -188,7 +191,10 @@ impl Timestamp {
         // At most (10⁹ − 1) · 2³² + 5 · 10⁸, so this fits in a u64, and the
         // quotient stays below 2³².
         let fraction = ((nanos << 32) + 500_000_000) / 1_000_000_000;
-        Timestamp { seconds: ntp.rem_euclid(1 << 32) as u32, fraction: fraction as u32 }
+        Timestamp {
+            seconds: ntp.rem_euclid(1 << 32) as u32,
+            fraction: fraction as u32,
+        }
     }
 
     /// The time as whole seconds and nanoseconds after the Unix epoch,
@@ -211,9 +217,16 @@ impl Timestamp {
         let ntp = base + (i128::from(self.seconds) - base).rem_euclid(era);
         let nanos = (u64::from(self.fraction) * 1_000_000_000 + (1 << 31)) >> 32;
         // Rounding the largest fractions up reaches a whole second.
-        let (ntp, nanos) = if nanos >= 1_000_000_000 { (ntp + 1, 0) } else { (ntp, nanos as u32) };
+        let (ntp, nanos) = if nanos >= 1_000_000_000 {
+            (ntp + 1, 0)
+        } else {
+            (ntp, nanos as u32)
+        };
         let unix = ntp - i128::from(UNIX_OFFSET);
-        (unix.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64, nanos)
+        (
+            unix.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+            nanos,
+        )
     }
 
     /// Whether this is the all-zero "no time" timestamp.
@@ -228,11 +241,17 @@ impl Timestamp {
 
     /// The timestamp from one 64-bit number, seconds in the high half.
     pub fn from_bits(bits: u64) -> Timestamp {
-        Timestamp { seconds: (bits >> 32) as u32, fraction: bits as u32 }
+        Timestamp {
+            seconds: (bits >> 32) as u32,
+            fraction: bits as u32,
+        }
     }
 
     fn read(b: &[u8], i: usize) -> Result<Timestamp, Error> {
-        Ok(Timestamp { seconds: be32(b, i).ok_or(Error::Short(b.len()))?, fraction: be32(b, i + 4).ok_or(Error::Short(b.len()))? })
+        Ok(Timestamp {
+            seconds: be32(b, i).ok_or(Error::Short(b.len()))?,
+            fraction: be32(b, i + 4).ok_or(Error::Short(b.len()))?,
+        })
     }
 }
 
@@ -302,14 +321,20 @@ impl KissCode {
     /// The kiss code written as these four bytes. A named code always
     /// comes back as its variant, never as [`KissCode::Other`].
     pub fn from_bytes(b: [u8; 4]) -> KissCode {
-        KissCode::NAMED.iter().find(|(_, bytes)| *bytes == b).map_or(KissCode::Other(b), |(code, _)| *code)
+        KissCode::NAMED
+            .iter()
+            .find(|(_, bytes)| *bytes == b)
+            .map_or(KissCode::Other(b), |(code, _)| *code)
     }
 
     /// The four bytes this kiss code is written as.
     fn octets(self) -> [u8; 4] {
         match self {
             KissCode::Other(b) => b,
-            named => KissCode::NAMED.iter().find(|(code, _)| *code == named).map_or([0; 4], |(_, bytes)| *bytes),
+            named => KissCode::NAMED
+                .iter()
+                .find(|(code, _)| *code == named)
+                .map_or([0; 4], |(_, bytes)| *bytes),
         }
     }
 }
@@ -420,12 +445,22 @@ impl std::fmt::Display for Error {
         match self {
             Error::FieldLength { want, got } => write!(f, "{got} bytes, expected {want}"),
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Short(n) => write!(f, "{n} bytes, shorter than the {HEADER_LEN}-byte NTP header"),
-            Error::Long(n) => write!(f, "{n} bytes, longer than the {MAX_PACKET} an NTP packet may have here"),
+            Error::Short(n) => write!(
+                f,
+                "{n} bytes, shorter than the {HEADER_LEN}-byte NTP header"
+            ),
+            Error::Long(n) => write!(
+                f,
+                "{n} bytes, longer than the {MAX_PACKET} an NTP packet may have here"
+            ),
             Error::Version(v) => write!(f, "NTP version {v}, not 1 to 7"),
             Error::Mode(m) => write!(f, "NTP mode {m}, not 1 to 5"),
             Error::Trailer(n) => write!(f, "{n} bytes after the NTP header, not a multiple of 4"),
-            Error::NotClient(m) => write!(f, "NTP mode {} packet, not a request (mode 3 or 1)", m.bits()),
+            Error::NotClient(m) => write!(
+                f,
+                "NTP mode {} packet, not a request (mode 3 or 1)",
+                m.bits()
+            ),
             Error::ReplyVersion(v) => write!(f, "NTP version {v} request, not 1 to 4"),
         }
     }
@@ -552,7 +587,11 @@ pub fn server_reply(
         leap: server.leap,
         version: request.version,
         mode,
-        stratum: if server.stratum >= 16 { 0 } else { server.stratum },
+        stratum: if server.stratum >= 16 {
+            0
+        } else {
+            server.stratum
+        },
         poll: request.poll,
         precision: server.precision,
         root_delay: server.root_delay,
@@ -635,7 +674,10 @@ impl Wire for Packet {
     /// Appends the packet. Refuses versions outside 1 to 7, trailers above [`MAX_TRAILER`],
     /// and trailer lengths that are not multiples of four. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        if !(1..=7).contains(&self.version) || self.trailer.len() > MAX_TRAILER || !self.trailer.len().is_multiple_of(4) {
+        if !(1..=7).contains(&self.version)
+            || self.trailer.len() > MAX_TRAILER
+            || !self.trailer.len().is_multiple_of(4)
+        {
             return Err(Error::Unwritable);
         }
         let trailer = &self.trailer;
@@ -664,7 +706,10 @@ impl Wire for KissCode {
 
     /// Reads exactly four bytes. Refuses short or trailing input.
     fn parse(b: &[u8]) -> Result<Self, Error> {
-        let bytes = b.try_into().map_err(|_| Error::FieldLength { want: 4, got: b.len() })?;
+        let bytes = b.try_into().map_err(|_| Error::FieldLength {
+            want: 4,
+            got: b.len(),
+        })?;
         Ok(Self::from_bytes(bytes))
     }
 
@@ -686,7 +731,10 @@ impl Wire for Timestamp {
     /// Reads exactly eight bytes. Refuses short or trailing input.
     fn parse(b: &[u8]) -> Result<Self, Error> {
         if b.len() != 8 {
-            return Err(Error::FieldLength { want: 8, got: b.len() });
+            return Err(Error::FieldLength {
+                want: 8,
+                got: b.len(),
+            });
         }
         Self::read(b, 0)
     }
@@ -714,7 +762,12 @@ mod tests {
             0x00, 0x00, 0x00, 0x40, // root dispersion 0x0040
             192, 0, 2, 1, // reference ID
         ];
-        for t in [0xe8f0_0000_8000_0000u64, 0xe8f0_0010_0000_0001, 0xe8f0_0011_4000_0000, 0xe8f0_0011_4000_0100] {
+        for t in [
+            0xe8f0_0000_8000_0000u64,
+            0xe8f0_0010_0000_0001,
+            0xe8f0_0011_4000_0000,
+            0xe8f0_0011_4000_0100,
+        ] {
             b.extend_from_slice(&t.to_be_bytes());
         }
         b.extend_from_slice(&[0x11; 20]);
@@ -733,7 +786,13 @@ mod tests {
         assert_eq!(p.root_delay, 0x180);
         assert_eq!(p.root_dispersion, 0x40);
         assert_eq!(p.reference_id, [192, 0, 2, 1]);
-        assert_eq!(p.reference, Timestamp { seconds: 0xe8f0_0000, fraction: 0x8000_0000 });
+        assert_eq!(
+            p.reference,
+            Timestamp {
+                seconds: 0xe8f0_0000,
+                fraction: 0x8000_0000
+            }
+        );
         assert_eq!(p.origin.to_bits(), 0xe8f0_0010_0000_0001);
         assert_eq!(p.receive.to_bits(), 0xe8f0_0011_4000_0000);
         assert_eq!(p.transmit.to_bits(), 0xe8f0_0011_4000_0100);
@@ -752,7 +811,10 @@ mod tests {
         // LI 3 (unsynchronized), version 4, server.
         b[0] = 0xe4;
         let p = Packet::parse(&b).unwrap();
-        assert_eq!((p.leap, p.version, p.mode), (Leap::Unsynchronized, 4, Mode::Server));
+        assert_eq!(
+            (p.leap, p.version, p.mode),
+            (Leap::Unsynchronized, 4, Mode::Server)
+        );
         for bits in 0..4 {
             assert_eq!(Leap::from_bits(bits).bits(), bits);
         }
@@ -768,14 +830,30 @@ mod tests {
     #[test]
     fn timestamps_and_the_unix_epoch() {
         // RFC 5905, figure 4: 1970-01-01 is NTP second 2,208,988,800.
-        assert_eq!(Timestamp::from_unix(0, 0), Timestamp { seconds: 2_208_988_800, fraction: 0 });
-        assert_eq!(Timestamp { seconds: 2_208_988_800, fraction: 0 }.to_unix(), (0, 0));
+        assert_eq!(
+            Timestamp::from_unix(0, 0),
+            Timestamp {
+                seconds: 2_208_988_800,
+                fraction: 0
+            }
+        );
+        assert_eq!(
+            Timestamp {
+                seconds: 2_208_988_800,
+                fraction: 0
+            }
+            .to_unix(),
+            (0, 0)
+        );
         // Half a second is 2³¹ units.
         assert_eq!(Timestamp::from_unix(0, 500_000_000).fraction, 0x8000_0000);
         // Era 0 starts in 1900: Unix time -2,208,988,800. It falls outside
         // the default window, but a pivot near it reads it.
         assert_eq!(Timestamp::from_unix(-UNIX_OFFSET, 0), Timestamp::ZERO);
-        assert_eq!(Timestamp::ZERO.to_unix_near(-UNIX_OFFSET), (-UNIX_OFFSET, 0));
+        assert_eq!(
+            Timestamp::ZERO.to_unix_near(-UNIX_OFFSET),
+            (-UNIX_OFFSET, 0)
+        );
         // With the default window, NTP second 0 is the start of era 1,
         // 2036-02-07 06:28:16 UTC.
         assert_eq!(Timestamp::ZERO.to_unix(), (ERA_PIVOT, 0));
@@ -783,15 +861,46 @@ mod tests {
         // The last second of era 0 and the first of era 1.
         assert_eq!(Timestamp::from_unix(ERA_PIVOT - 1, 0).seconds, u32::MAX);
         assert_eq!(Timestamp::from_unix(ERA_PIVOT, 0).seconds, 0);
-        assert_eq!(Timestamp { seconds: u32::MAX, fraction: 0 }.to_unix(), (ERA_PIVOT - 1, 0));
+        assert_eq!(
+            Timestamp {
+                seconds: u32::MAX,
+                fraction: 0
+            }
+            .to_unix(),
+            (ERA_PIVOT - 1, 0)
+        );
         // The ends of the default window: 1968-01-20 03:14:08 and
         // 2104-02-26 09:42:23 UTC.
-        assert_eq!(Timestamp { seconds: 0x8000_0000, fraction: 0 }.to_unix(), (-61_505_152, 0));
-        assert_eq!(Timestamp { seconds: 0x7fff_ffff, fraction: 0 }.to_unix(), (4_233_462_143, 0));
+        assert_eq!(
+            Timestamp {
+                seconds: 0x8000_0000,
+                fraction: 0
+            }
+            .to_unix(),
+            (-61_505_152, 0)
+        );
+        assert_eq!(
+            Timestamp {
+                seconds: 0x7fff_ffff,
+                fraction: 0
+            }
+            .to_unix(),
+            (4_233_462_143, 0)
+        );
         // Nanoseconds past a second carry.
-        assert_eq!(Timestamp::from_unix(10, 2_500_000_000), Timestamp::from_unix(12, 500_000_000));
+        assert_eq!(
+            Timestamp::from_unix(10, 2_500_000_000),
+            Timestamp::from_unix(12, 500_000_000)
+        );
         // The largest fraction rounds up to the next second.
-        assert_eq!(Timestamp { seconds: 2_208_988_800, fraction: u32::MAX }.to_unix(), (1, 0));
+        assert_eq!(
+            Timestamp {
+                seconds: 2_208_988_800,
+                fraction: u32::MAX
+            }
+            .to_unix(),
+            (1, 0)
+        );
     }
 
     #[test]
@@ -803,18 +912,32 @@ mod tests {
             (4_233_462_143, 1),
             (ERA_PIVOT, 999_999_999),
         ] {
-            assert_eq!(Timestamp::from_unix(secs, nanos).to_unix(), (secs, nanos), "{secs}.{nanos:09}");
+            assert_eq!(
+                Timestamp::from_unix(secs, nanos).to_unix(),
+                (secs, nanos),
+                "{secs}.{nanos:09}"
+            );
         }
         // Any era, read near a pivot in that era.
         let far = 9_000_000_000_000i64;
-        assert_eq!(Timestamp::from_unix(far, 5).to_unix_near(far + 1_000_000), (far, 5));
+        assert_eq!(
+            Timestamp::from_unix(far, 5).to_unix_near(far + 1_000_000),
+            (far, 5)
+        );
         assert_eq!(Timestamp::from_unix(-far, 5).to_unix_near(-far), (-far, 5));
         // Extreme pivots saturate instead of overflowing.
-        let (s, _) = Timestamp { seconds: u32::MAX, fraction: u32::MAX }.to_unix_near(i64::MAX);
+        let (s, _) = Timestamp {
+            seconds: u32::MAX,
+            fraction: u32::MAX,
+        }
+        .to_unix_near(i64::MAX);
         assert!(s > i64::MAX - (1 << 32));
         let (s, _) = Timestamp::ZERO.to_unix_near(i64::MIN);
         assert!(s < i64::MIN + (1 << 32));
-        let t = Timestamp { seconds: 0xdead_beef, fraction: 0x1234_5678 };
+        let t = Timestamp {
+            seconds: 0xdead_beef,
+            fraction: 0x1234_5678,
+        };
         assert_eq!(Timestamp::from_bits(t.to_bits()), t);
     }
 
@@ -850,7 +973,13 @@ mod tests {
 
         // A version 3 request gets a version 3 reply.
         asked.version = 3;
-        assert_eq!(server_reply(&asked, &server, t2, t3).unwrap().to_bytes().unwrap()[0], 0x1c);
+        assert_eq!(
+            server_reply(&asked, &server, t2, t3)
+                .unwrap()
+                .to_bytes()
+                .unwrap()[0],
+            0x1c
+        );
     }
 
     #[test]
@@ -878,7 +1007,9 @@ mod tests {
     fn a_symmetric_active_peer_gets_a_symmetric_passive_reply() {
         // RFC 4330, section 5: mode 1 is answered with mode 2, so Windows
         // Time with its symmetric-active flag (0x4) gets the time too.
-        let mut b = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0)).to_bytes().unwrap();
+        let mut b = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0))
+            .to_bytes()
+            .unwrap();
         b[0] = 0x21; // LI 0, version 4, symmetric active.
         let req = Packet::parse(&b).unwrap();
         let t = Timestamp::from_unix(1_700_000_001, 0);
@@ -888,7 +1019,10 @@ mod tests {
         assert_eq!(reply.to_bytes().unwrap()[0], 0x22);
         let kod = kiss_reply(&req, KissCode::Rate).unwrap();
         assert_eq!(kod.mode, Mode::SymmetricPassive);
-        assert_eq!(Packet::parse(&kod.to_bytes().unwrap()).unwrap().kiss_code(), Some(KissCode::Rate));
+        assert_eq!(
+            Packet::parse(&kod.to_bytes().unwrap()).unwrap().kiss_code(),
+            Some(KissCode::Rate)
+        );
     }
 
     #[test]
@@ -915,7 +1049,10 @@ mod tests {
         // A request built in code with version 0 is refused too.
         let mut req = Packet::client_request(t);
         req.version = 0;
-        assert_eq!(server_reply(&req, &ServerInfo::default(), t, t), Err(Error::ReplyVersion(0)));
+        assert_eq!(
+            server_reply(&req, &ServerInfo::default(), t, t),
+            Err(Error::ReplyVersion(0))
+        );
     }
 
     #[test]
@@ -933,7 +1070,8 @@ mod tests {
         let mut p = Packet::client_request(Timestamp::ZERO);
         for mode in [Mode::SymmetricPassive, Mode::Server, Mode::Broadcast] {
             p.mode = mode;
-            let e = server_reply(&p, &ServerInfo::default(), Timestamp::ZERO, Timestamp::ZERO).unwrap_err();
+            let e = server_reply(&p, &ServerInfo::default(), Timestamp::ZERO, Timestamp::ZERO)
+                .unwrap_err();
             assert_eq!(e, Error::NotClient(mode));
             assert_eq!(kiss_reply(&p, KissCode::Deny), Err(Error::NotClient(mode)));
             assert!(!e.to_string().is_empty());
@@ -1015,7 +1153,10 @@ mod tests {
     fn the_last_fraction_of_an_era_rounds_into_the_next() {
         // The last fraction of era 0 reads as the first second of era 1,
         // and writes back as NTP second 0. That is one unit away, not 2⁶⁴.
-        let last = Timestamp { seconds: u32::MAX, fraction: u32::MAX };
+        let last = Timestamp {
+            seconds: u32::MAX,
+            fraction: u32::MAX,
+        };
         assert_eq!(last.to_unix(), (ERA_PIVOT, 0));
         let back = Timestamp::from_unix(ERA_PIVOT, 0);
         assert_eq!(back, Timestamp::ZERO);
@@ -1025,7 +1166,10 @@ mod tests {
         assert_eq!(back.to_bits().abs_diff(last.to_bits()), u64::MAX);
         // The last fraction of the default window rounds to its end,
         // pivot + 2³¹, which to_unix_near's bounds include.
-        let top = Timestamp { seconds: 0x7fff_ffff, fraction: u32::MAX };
+        let top = Timestamp {
+            seconds: 0x7fff_ffff,
+            fraction: u32::MAX,
+        };
         assert_eq!(top.to_unix(), (ERA_PIVOT + (1 << 31), 0));
         assert_eq!(gap(Timestamp::from_unix(ERA_PIVOT + (1 << 31), 0), top), 1);
     }
@@ -1051,8 +1195,15 @@ mod tests {
         let req = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0));
         let t = Timestamp::from_unix(1_700_000_001, 0);
         for (stratum, sent) in [(1, 1), (15, 15), (16, 0), (17, 0), (255, 0)] {
-            let server = ServerInfo { stratum, ..ServerInfo::default() };
-            assert_eq!(server_reply(&req, &server, t, t).unwrap().stratum, sent, "{stratum}");
+            let server = ServerInfo {
+                stratum,
+                ..ServerInfo::default()
+            };
+            assert_eq!(
+                server_reply(&req, &server, t, t).unwrap().stratum,
+                sent,
+                "{stratum}"
+            );
         }
     }
 
@@ -1060,7 +1211,9 @@ mod tests {
     fn long_extension_fields_are_read() {
         // NTS (RFC 8915) requests carry a cookie and placeholders for more,
         // and can run past a kilobyte. RFC 7822 sets no limit.
-        let mut b = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0)).to_bytes().unwrap();
+        let mut b = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0))
+            .to_bytes()
+            .unwrap();
         b.extend(std::iter::repeat_n(0xab, 1200));
         let p = Packet::parse(&b).unwrap();
         assert_eq!(p.trailer.len(), 1200);

@@ -95,7 +95,8 @@ pub const ENCRYPTED_TIMESTAMP_LEN: usize = TIMESTAMP_LEN + TAG_LEN;
 /// The length of the encrypted cookie: the cookie and a tag.
 pub const ENCRYPTED_COOKIE_LEN: usize = COOKIE_LEN + TAG_LEN;
 /// The length of a handshake initiation.
-pub const INITIATION_LEN: usize = 4 + 4 + KEY_LEN + ENCRYPTED_STATIC_LEN + ENCRYPTED_TIMESTAMP_LEN + 2 * MAC_LEN;
+pub const INITIATION_LEN: usize =
+    4 + 4 + KEY_LEN + ENCRYPTED_STATIC_LEN + ENCRYPTED_TIMESTAMP_LEN + 2 * MAC_LEN;
 /// The length of a handshake response.
 pub const RESPONSE_LEN: usize = 4 + 4 + 4 + KEY_LEN + TAG_LEN + 2 * MAC_LEN;
 /// The length of a cookie reply.
@@ -235,9 +236,13 @@ impl std::fmt::Display for Error {
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Short(n) => write!(f, "{n} bytes, too short for a message type"),
             Error::Type(t) => write!(f, "message type {t}, not 1 to 4"),
-            Error::Unexpected { want, found } => write!(f, "message type {found}, not the type {want} wanted here"),
+            Error::Unexpected { want, found } => {
+                write!(f, "message type {found}, not the type {want} wanted here")
+            }
             Error::Reserved(r) => write!(f, "reserved bytes {r:?}, not all 0"),
-            Error::Length { kind, len } => write!(f, "{len} bytes, the wrong length for message type {kind}"),
+            Error::Length { kind, len } => {
+                write!(f, "{len} bytes, the wrong length for message type {kind}")
+            }
         }
     }
 }
@@ -294,7 +299,11 @@ impl Data {
 /// MTU is known. A plaintext longer than the MTU is padded as if only its
 /// last MTU-sized piece counted, as the Linux module does.
 pub fn padding(len: usize, mtu: usize) -> usize {
-    let last = if mtu != 0 && len > mtu { len % mtu } else { len };
+    let last = if mtu != 0 && len > mtu {
+        len % mtu
+    } else {
+        len
+    };
     let rem = last % PADDING_MULTIPLE;
     let up = if rem == 0 { 0 } else { PADDING_MULTIPLE - rem };
     if mtu == 0 {
@@ -317,7 +326,10 @@ impl Plaintext {
     /// Copies a plaintext and adds the zeros chosen by [padding].
     /// Refuses a padded length above [`MAX_PLAINTEXT`].
     pub fn padded(plaintext: &[u8], mtu: usize) -> Result<Self, Error> {
-        let padded = plaintext.len().checked_add(padding(plaintext.len(), mtu)).ok_or(Error::Unwritable)?;
+        let padded = plaintext
+            .len()
+            .checked_add(padding(plaintext.len(), mtu))
+            .ok_or(Error::Unwritable)?;
         if padded > MAX_PLAINTEXT {
             return Err(Error::Unwritable);
         }
@@ -335,7 +347,10 @@ impl Wire for Plaintext {
     /// Keeps every byte, including zeros. Refuses input above [`MAX_PLAINTEXT`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         if b.len() > MAX_PLAINTEXT {
-            return Err(Error::Length { kind: message_type::DATA, len: b.len() });
+            return Err(Error::Length {
+                kind: message_type::DATA,
+                len: b.len(),
+            });
         }
         Ok(Self(b.to_vec()))
     }
@@ -373,7 +388,10 @@ impl Default for ReplayWindow {
 impl ReplayWindow {
     /// A window that has seen no counters.
     pub fn new() -> ReplayWindow {
-        ReplayWindow { bits: [0; (WINDOW_BITS / 64) as usize], highest: None }
+        ReplayWindow {
+            bits: [0; (WINDOW_BITS / 64) as usize],
+            highest: None,
+        }
     }
 
     /// Takes `counter` and returns true if it is new and in range. It
@@ -439,7 +457,9 @@ impl ReplayWindow {
 
 /// Checks the 4-byte type field and returns the type byte.
 fn check_type(b: &[u8]) -> Result<u8, Error> {
-    let [kind, r0, r1, r2, ..] = *b else { return Err(Error::Short(b.len())) };
+    let [kind, r0, r1, r2, ..] = *b else {
+        return Err(Error::Short(b.len()));
+    };
     if !(message_type::INITIATION..=message_type::DATA).contains(&kind) {
         return Err(Error::Type(kind));
     }
@@ -460,10 +480,15 @@ fn header(kind: u8, len: usize) -> Vec<u8> {
 #[inline]
 fn exact(b: &[u8], kind: u8, len: usize) -> Result<Reader<'_>, Error> {
     let found = check_type(b)?;
-    if found != kind { return Err(Error::Unexpected { want: kind, found }); }
-    if b.len() != len { return Err(Error::Length { kind, len: b.len() }); }
+    if found != kind {
+        return Err(Error::Unexpected { want: kind, found });
+    }
+    if b.len() != len {
+        return Err(Error::Length { kind, len: b.len() });
+    }
     let mut r = Reader::new(b);
-    r.skip(4).map_err(|_| Error::Length { kind, len: b.len() })?;
+    r.skip(4)
+        .map_err(|_| Error::Length { kind, len: b.len() })?;
     Ok(r)
 }
 
@@ -506,7 +531,10 @@ impl Wire for Initiation {
     /// Refuses invalid headers and lengths. Reads the whole input.
     fn parse(b: &[u8]) -> Result<Initiation, Error> {
         let mut r = exact(b, message_type::INITIATION, INITIATION_LEN)?;
-        let short = |_: Truncated| Error::Length { kind: message_type::INITIATION, len: b.len() };
+        let short = |_: Truncated| Error::Length {
+            kind: message_type::INITIATION,
+            len: b.len(),
+        };
         Ok(Initiation {
             sender: r.u32_le().map_err(short)?,
             ephemeral: r.array().map_err(short)?,
@@ -540,7 +568,10 @@ impl Wire for Response {
     /// Refuses invalid headers and lengths. Reads the whole input.
     fn parse(b: &[u8]) -> Result<Response, Error> {
         let mut r = exact(b, message_type::RESPONSE, RESPONSE_LEN)?;
-        let short = |_: Truncated| Error::Length { kind: message_type::RESPONSE, len: b.len() };
+        let short = |_: Truncated| Error::Length {
+            kind: message_type::RESPONSE,
+            len: b.len(),
+        };
         Ok(Response {
             sender: r.u32_le().map_err(short)?,
             receiver: r.u32_le().map_err(short)?,
@@ -574,8 +605,15 @@ impl Wire for CookieReply {
     /// Refuses invalid headers and lengths. Reads the whole input.
     fn parse(b: &[u8]) -> Result<CookieReply, Error> {
         let mut r = exact(b, message_type::COOKIE_REPLY, COOKIE_REPLY_LEN)?;
-        let short = |_: Truncated| Error::Length { kind: message_type::COOKIE_REPLY, len: b.len() };
-        Ok(CookieReply { receiver: r.u32_le().map_err(short)?, nonce: r.array().map_err(short)?, encrypted_cookie: r.array().map_err(short)? })
+        let short = |_: Truncated| Error::Length {
+            kind: message_type::COOKIE_REPLY,
+            len: b.len(),
+        };
+        Ok(CookieReply {
+            receiver: r.u32_le().map_err(short)?,
+            nonce: r.array().map_err(short)?,
+            encrypted_cookie: r.array().map_err(short)?,
+        })
     }
 
     /// Appends the complete 64-byte cookie reply. Refuses no values.
@@ -600,7 +638,10 @@ impl Wire for Data {
     fn parse(b: &[u8]) -> Result<Data, Error> {
         let kind = check_type(b)?;
         if kind != message_type::DATA {
-            return Err(Error::Unexpected { want: message_type::DATA, found: kind });
+            return Err(Error::Unexpected {
+                want: message_type::DATA,
+                found: kind,
+            });
         }
         if b.len() < MIN_DATA_LEN || b.len() > MAX_MESSAGE {
             return Err(Error::Length { kind, len: b.len() });
@@ -611,7 +652,11 @@ impl Wire for Data {
         let receiver = r.u32_le().map_err(short)?;
         let counter = r.u64_le().map_err(short)?;
         let encrypted = b.get(DATA_HEADER_LEN..).unwrap_or_default().to_vec();
-        Ok(Data { receiver, counter, encrypted })
+        Ok(Data {
+            receiver,
+            counter,
+            encrypted,
+        })
     }
 
     /// Appends the complete transport message. Refuses ciphertext shorter than [`TAG_LEN`]
@@ -632,10 +677,10 @@ impl Wire for Data {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
 
     fn init() -> Initiation {
         Initiation {
@@ -660,11 +705,19 @@ mod tests {
     }
 
     fn cookie() -> CookieReply {
-        CookieReply { receiver: 5, nonce: [0x99; 24], encrypted_cookie: [0xaa; 32] }
+        CookieReply {
+            receiver: 5,
+            nonce: [0x99; 24],
+            encrypted_cookie: [0xaa; 32],
+        }
     }
 
     fn data() -> Data {
-        Data { receiver: 0xdead_beef, counter: 0x0102_0304_0506_0708, encrypted: vec![0xbb; 48] }
+        Data {
+            receiver: 0xdead_beef,
+            counter: 0x0102_0304_0506_0708,
+            encrypted: vec![0xbb; 48],
+        }
     }
 
     fn all() -> Vec<Message> {
@@ -734,7 +787,11 @@ mod tests {
         assert_eq!(b[8..16], [8, 7, 6, 5, 4, 3, 2, 1]);
         assert_eq!(b[16..], [0xbb; 48]);
         assert!(!data().is_keepalive());
-        let k = Data { receiver: 1, counter: 0, encrypted: vec![0; 16] };
+        let k = Data {
+            receiver: 1,
+            counter: 0,
+            encrypted: vec![0; 16],
+        };
         assert!(k.is_keepalive());
         assert_eq!(k.to_bytes().unwrap().len(), 32);
     }
@@ -748,7 +805,10 @@ mod tests {
         }
         assert_eq!(Initiation::parse(&init().to_bytes().unwrap()), Ok(init()));
         assert_eq!(Response::parse(&resp().to_bytes().unwrap()), Ok(resp()));
-        assert_eq!(CookieReply::parse(&cookie().to_bytes().unwrap()), Ok(cookie()));
+        assert_eq!(
+            CookieReply::parse(&cookie().to_bytes().unwrap()),
+            Ok(cookie())
+        );
         assert_eq!(Data::parse(&data().to_bytes().unwrap()), Ok(data()));
     }
 
@@ -757,7 +817,10 @@ mod tests {
         let kinds: Vec<u8> = all().iter().map(Message::kind).collect();
         assert_eq!(kinds, [1, 2, 3, 4]);
         let receivers: Vec<Option<u32>> = all().iter().map(Message::receiver).collect();
-        assert_eq!(receivers, [None, Some(0x0403_0201), Some(5), Some(0xdead_beef)]);
+        assert_eq!(
+            receivers,
+            [None, Some(0x0403_0201), Some(5), Some(0xdead_beef)]
+        );
     }
 
     #[test]
@@ -772,7 +835,15 @@ mod tests {
                     // A shorter data message is still a data message.
                     assert!(e.is_ok());
                 } else {
-                    assert_eq!(e, Err(Error::Length { kind: m.kind(), len: n }), "{n} bytes of type {}", m.kind());
+                    assert_eq!(
+                        e,
+                        Err(Error::Length {
+                            kind: m.kind(),
+                            len: n
+                        }),
+                        "{n} bytes of type {}",
+                        m.kind()
+                    );
                 }
             }
         }
@@ -798,17 +869,39 @@ mod tests {
         // A data message too long for UDP.
         let mut b = vec![4, 0, 0, 0];
         b.resize(MAX_MESSAGE + 1, 0);
-        assert_eq!(Message::parse(&b), Err(Error::Length { kind: 4, len: MAX_MESSAGE + 1 }));
+        assert_eq!(
+            Message::parse(&b),
+            Err(Error::Length {
+                kind: 4,
+                len: MAX_MESSAGE + 1
+            })
+        );
         b.pop();
         assert!(Message::parse(&b).is_ok());
         // The per-type readers check the type. A known type that is not the
         // one a reader wants is its own error, not an unknown type.
-        assert_eq!(Initiation::parse(&resp().to_bytes().unwrap()), Err(Error::Unexpected { want: 1, found: 2 }));
-        assert_eq!(Response::parse(&init().to_bytes().unwrap()), Err(Error::Unexpected { want: 2, found: 1 }));
-        assert_eq!(CookieReply::parse(&data().to_bytes().unwrap()), Err(Error::Unexpected { want: 3, found: 4 }));
-        assert_eq!(Data::parse(&cookie().to_bytes().unwrap()), Err(Error::Unexpected { want: 4, found: 3 }));
+        assert_eq!(
+            Initiation::parse(&resp().to_bytes().unwrap()),
+            Err(Error::Unexpected { want: 1, found: 2 })
+        );
+        assert_eq!(
+            Response::parse(&init().to_bytes().unwrap()),
+            Err(Error::Unexpected { want: 2, found: 1 })
+        );
+        assert_eq!(
+            CookieReply::parse(&data().to_bytes().unwrap()),
+            Err(Error::Unexpected { want: 3, found: 4 })
+        );
+        assert_eq!(
+            Data::parse(&cookie().to_bytes().unwrap()),
+            Err(Error::Unexpected { want: 4, found: 3 })
+        );
         assert_eq!(Data::parse(&[9, 0, 0, 0]), Err(Error::Type(9)));
-        assert!(!Error::Unexpected { want: 1, found: 2 }.to_string().contains("not 1 to 4"));
+        assert!(
+            !Error::Unexpected { want: 1, found: 2 }
+                .to_string()
+                .contains("not 1 to 4")
+        );
         // Every error has a message.
         for e in [
             Error::Short(1),
@@ -845,17 +938,29 @@ mod tests {
     fn per_type_readers_on_every_prefix() {
         let b = init().to_bytes().unwrap();
         for n in 0..b.len() {
-            let want = if n < 4 { Error::Short(n) } else { Error::Length { kind: 1, len: n } };
+            let want = if n < 4 {
+                Error::Short(n)
+            } else {
+                Error::Length { kind: 1, len: n }
+            };
             assert_eq!(Initiation::parse(&b[..n]), Err(want));
         }
         let b = resp().to_bytes().unwrap();
         for n in 0..b.len() {
-            let want = if n < 4 { Error::Short(n) } else { Error::Length { kind: 2, len: n } };
+            let want = if n < 4 {
+                Error::Short(n)
+            } else {
+                Error::Length { kind: 2, len: n }
+            };
             assert_eq!(Response::parse(&b[..n]), Err(want));
         }
         let b = cookie().to_bytes().unwrap();
         for n in 0..b.len() {
-            let want = if n < 4 { Error::Short(n) } else { Error::Length { kind: 3, len: n } };
+            let want = if n < 4 {
+                Error::Short(n)
+            } else {
+                Error::Length { kind: 3, len: n }
+            };
             assert_eq!(CookieReply::parse(&b[..n]), Err(want));
         }
         let b = data().to_bytes().unwrap();
@@ -876,12 +981,30 @@ mod tests {
         // The writer takes exactly the encrypted lengths the reader takes,
         // writes them unchanged, and refuses the rest with Unwritable.
         let mut s = Lcg::new(0xda7a);
-        let edges = [0, 1, 15, 16, 17, MAX_ENCRYPTED - 1, MAX_ENCRYPTED, MAX_ENCRYPTED + 1, MAX_MESSAGE];
+        let edges = [
+            0,
+            1,
+            15,
+            16,
+            17,
+            MAX_ENCRYPTED - 1,
+            MAX_ENCRYPTED,
+            MAX_ENCRYPTED + 1,
+            MAX_MESSAGE,
+        ];
         for i in 0..400 {
-            let n = if i < edges.len() { edges[i] } else { s.index(2000) };
+            let n = if i < edges.len() {
+                edges[i]
+            } else {
+                s.index(2000)
+            };
             let mut encrypted = vec![0; n];
             s.fill(&mut encrypted);
-            let d = Data { receiver: s.next() as u32, counter: s.next() << 20, encrypted };
+            let d = Data {
+                receiver: s.next() as u32,
+                counter: s.next() << 20,
+                encrypted,
+            };
             match d.to_bytes() {
                 Ok(b) => {
                     assert!((TAG_LEN..=MAX_ENCRYPTED).contains(&n), "{n}");
@@ -902,17 +1025,29 @@ mod tests {
     fn data_writer_never_changes_the_ciphertext() {
         // A short or long encrypted part is refused, not padded or cut.
         for n in [0, 1, 3, 15, MAX_ENCRYPTED + 1, MAX_MESSAGE * 2] {
-            let d = Data { receiver: 1, counter: 2, encrypted: vec![7; n] };
+            let d = Data {
+                receiver: 1,
+                counter: 2,
+                encrypted: vec![7; n],
+            };
             assert_eq!(d.to_bytes(), Err(Error::Unwritable), "{n}");
         }
         // An empty encrypted part is not a keepalive, and does not become one.
-        let empty = Data { receiver: 0, counter: 0, encrypted: Vec::new() };
+        let empty = Data {
+            receiver: 0,
+            counter: 0,
+            encrypted: Vec::new(),
+        };
         assert!(!empty.is_keepalive());
         assert!(empty.to_bytes().is_err());
         // The longest one is written whole, its last byte (the tag's) kept.
         let mut long = vec![7; MAX_ENCRYPTED];
         long[MAX_ENCRYPTED - 1] = 0xee;
-        let d = Data { receiver: 1, counter: 2, encrypted: long };
+        let d = Data {
+            receiver: 1,
+            counter: 2,
+            encrypted: long,
+        };
         let b = d.to_bytes().unwrap();
         assert_eq!(b.len(), MAX_MESSAGE);
         assert_eq!(Data::parse(&b), Ok(d));
@@ -934,10 +1069,16 @@ mod tests {
         assert_eq!(padding(usize::MAX, 0), 1);
         assert_eq!(padding(usize::MAX, usize::MAX), 0);
         assert_eq!(padding(usize::MAX - 3, usize::MAX), 3);
-        assert_eq!(Plaintext::padded(&[1, 2, 3], 0).map(|v| v.0), Ok(vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(
+            Plaintext::padded(&[1, 2, 3], 0).map(|v| v.0),
+            Ok(vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        );
         assert_eq!(Plaintext::padded(&[], 1420).map(|v| v.0), Ok(Vec::new()));
         // Too long for one message: refused, not cut.
-        assert_eq!(Plaintext::padded(&vec![1; MAX_MESSAGE], 0).map(|v| v.0), Err(Error::Unwritable));
+        assert_eq!(
+            Plaintext::padded(&vec![1; MAX_MESSAGE], 0).map(|v| v.0),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
@@ -951,17 +1092,38 @@ mod tests {
         assert_eq!(out[..p.len()], p[..]);
         assert!(out[p.len()..].iter().all(|&x| x == 0));
         // The limits with no MTU: 65,488 is the longest padded length.
-        assert_eq!(Plaintext::padded(&vec![1; 65_488], 0).map(|v| v.0).map(|v| v.len()), Ok(65_488));
-        assert_eq!(Plaintext::padded(&vec![1; 65_489], 0).map(|v| v.0), Err(Error::Unwritable));
+        assert_eq!(
+            Plaintext::padded(&vec![1; 65_488], 0)
+                .map(|v| v.0)
+                .map(|v| v.len()),
+            Ok(65_488)
+        );
+        assert_eq!(
+            Plaintext::padded(&vec![1; 65_489], 0).map(|v| v.0),
+            Err(Error::Unwritable)
+        );
         // With an MTU the padding can stop short of 16, so a longer one fits.
-        assert_eq!(Plaintext::padded(&vec![1; MAX_PLAINTEXT], MAX_PLAINTEXT).map(|v| v.0).map(|v| v.len()), Ok(MAX_PLAINTEXT));
-        assert!(Plaintext::padded(&vec![1; MAX_PLAINTEXT + 1], MAX_PLAINTEXT + 1).map(|v| v.0).is_err());
+        assert_eq!(
+            Plaintext::padded(&vec![1; MAX_PLAINTEXT], MAX_PLAINTEXT)
+                .map(|v| v.0)
+                .map(|v| v.len()),
+            Ok(MAX_PLAINTEXT)
+        );
+        assert!(
+            Plaintext::padded(&vec![1; MAX_PLAINTEXT + 1], MAX_PLAINTEXT + 1)
+                .map(|v| v.0)
+                .is_err()
+        );
         // Any length and MTU: either every byte and zeros after, or refused
         // because the padded length passes the limit. Whatever it gives can
         // be sent once encrypted.
         let mut s = Lcg::new(0x9ad);
         for i in 0..3_000 {
-            let len = if i % 2 == 0 { 65_400 + s.index(200) } else { s.index(3000) };
+            let len = if i % 2 == 0 {
+                65_400 + s.index(200)
+            } else {
+                s.index(3000)
+            };
             let mtu = match s.index(3) {
                 0 => 0,
                 1 => 1 + s.index(70_000),
@@ -974,7 +1136,11 @@ mod tests {
                     assert_eq!(out.len(), len + n);
                     assert_eq!(out[..len], p[..]);
                     assert!(out[len..].iter().all(|&x| x == 0));
-                    let d = Data { receiver: 1, counter: 0, encrypted: vec![0; out.len() + TAG_LEN] };
+                    let d = Data {
+                        receiver: 1,
+                        counter: 0,
+                        encrypted: vec![0; out.len() + TAG_LEN],
+                    };
                     assert!(d.to_bytes().is_ok(), "{len} {mtu}");
                 }
                 Err(e) => {
@@ -1050,10 +1216,15 @@ mod tests {
     #[test]
     fn fuzz_loop() {
         let mut s = Lcg::new(0x5eed);
-        let sizes = [0, 3, 4, 31, 32, 63, 64, 65, 91, 92, 93, 147, 148, 149, 200, 1500];
+        let sizes = [
+            0, 3, 4, 31, 32, 63, 64, 65, 91, 92, 93, 147, 148, 149, 200, 1500,
+        ];
         for i in 0..rounds(20_000) {
-            let len =
-                if i % 2 == 0 { sizes[s.index(sizes.len())] } else { s.index(300) };
+            let len = if i % 2 == 0 {
+                sizes[s.index(sizes.len())]
+            } else {
+                s.index(300)
+            };
             let mut b = vec![0; len];
             s.fill(&mut b);
             if !b.is_empty() && s.index(4) != 0 {
@@ -1074,7 +1245,11 @@ mod tests {
         }
         // Random messages written, then read back.
         for _ in 0..5_000 {
-            let mut bytes = |n: usize| -> Vec<u8> { let mut out = vec![0; n]; s.fill(&mut out); out };
+            let mut bytes = |n: usize| -> Vec<u8> {
+                let mut out = vec![0; n];
+                s.fill(&mut out);
+                out
+            };
             let m = match bytes(1)[0] % 4 {
                 0 => Message::Initiation(Initiation {
                     sender: u32::from_le_bytes(bytes(4).try_into().unwrap()),

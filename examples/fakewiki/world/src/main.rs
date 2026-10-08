@@ -15,7 +15,9 @@ use std::time::SystemTime;
 
 use fakewiki_world::content::Content;
 use fakewiki_world::log::Log;
-use fakewiki_world::{GATEWAY, args, issue_leaves, look_up_all, secs, serve, start_backend, watch_backend};
+use fakewiki_world::{
+    GATEWAY, args, issue_leaves, look_up_all, secs, serve, start_backend, watch_backend,
+};
 use serde_json::json;
 
 fn main() {
@@ -36,8 +38,14 @@ fn real_main() -> fictionet::Result {
     watch_backend(child);
     let variant = backend["variant"].as_str().unwrap_or_default().to_owned();
     let mut hosts = HashMap::new();
-    for (name, ip) in backend["hosts"].as_object().ok_or_else(|| fictionet::Error::msg("backend sent no hosts"))? {
-        let ip: Ipv4Addr = ip.as_str().ok_or_else(|| fictionet::Error::msg("bad host address"))?.parse()?;
+    for (name, ip) in backend["hosts"]
+        .as_object()
+        .ok_or_else(|| fictionet::Error::msg("backend sent no hosts"))?
+    {
+        let ip: Ipv4Addr = ip
+            .as_str()
+            .ok_or_else(|| fictionet::Error::msg("bad host address"))?
+            .parse()?;
         hosts.insert(name.clone(), ip);
     }
 
@@ -69,7 +77,10 @@ fn real_main() -> fictionet::Result {
     let host_list: Vec<String> = hosts.keys().cloned().collect();
 
     // The network itself needs no tokio; the content client does.
-    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
     runtime.block_on(fictionet::run(move |fcx| async move {
         serve(&fcx, &hosts, leaves, content, log, attachments)?;
 
@@ -77,7 +88,8 @@ fn real_main() -> fictionet::Result {
         // the start, as in the Python world, even for an agent that
         // connects by address without DNS.
         look_up_all(&fcx, &attacher, &host_list).await?;
-        let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
+        let _listening =
+            fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
 
         std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
         if let Some(dir) = ready.parent() {

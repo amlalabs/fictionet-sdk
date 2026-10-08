@@ -1,9 +1,7 @@
 //! Complete JSON-RPC bodies, batch errors, bounded collection, and writes.
 #![no_main]
 
-use fictionet::stdlib::codec::{
-    Collect, CollectError, Decode, Fail, Wire,
-};
+use fictionet::stdlib::codec::{Collect, CollectError, Decode, Fail, Wire};
 use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::decode_all;

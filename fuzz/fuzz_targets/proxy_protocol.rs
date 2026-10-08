@@ -2,11 +2,13 @@
 //! reads them at the start of a connection.
 #![no_main]
 
-use fictionet::stdlib::{codec::Wire, test_support::contract, proxy_protocol::Headers};
+use fictionet::stdlib::{codec::Wire, proxy_protocol::Headers, test_support::contract};
 
-use fictionet::stdlib::proxy_protocol::{Addresses, Command, Header, Ssl, SslTlv, Tlv, Transport, MAX_HEADER_LEN, MAX_TLV_VALUE, V1, V2};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use fictionet::stdlib::proxy_protocol::{
+    Addresses, Command, Header, MAX_HEADER_LEN, MAX_TLV_VALUE, Ssl, SslTlv, Tlv, Transport, V1, V2,
+};
 use libfuzzer_sys::fuzz_target;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Headers::new, data, 2 * MAX_HEADER_LEN);
@@ -33,11 +35,22 @@ fuzz_target!(|data: &[u8]| {
                 SocketAddr::from((Ipv4Addr::new(b[0], b[1], b[2], b[3]), port))
             }
         };
-        let (src, dst) = (addr(&a[..18], a[36] & 1 != 0), addr(&a[18..36], a[36] & 2 != 0));
-        let transport = if a[37] & 1 == 0 { Transport::Stream } else { Transport::Dgram };
+        let (src, dst) = (
+            addr(&a[..18], a[36] & 1 != 0),
+            addr(&a[18..36], a[36] & 2 != 0),
+        );
+        let transport = if a[37] & 1 == 0 {
+            Transport::Stream
+        } else {
+            Transport::Dgram
+        };
         let headers = [
             Header::V1(V1::from_addrs(src, dst)),
-            Header::V2(V2 { command: Command::Proxy, addresses: Addresses::from_addrs(transport, src, dst), tlvs: vec![] }),
+            Header::V2(V2 {
+                command: Command::Proxy,
+                addresses: Addresses::from_addrs(transport, src, dst),
+                tlvs: vec![],
+            }),
         ];
         for h in headers {
             contract::check_wire_value(&h);
@@ -56,7 +69,11 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(ssl) = Ssl::parse(data) {
         assert_eq!(ssl.to_bytes().unwrap(), data);
-        let h = Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs: vec![Tlv::Ssl(ssl)] });
+        let h = Header::V2(V2 {
+            command: Command::Proxy,
+            addresses: Addresses::Unspec,
+            tlvs: vec![Tlv::Ssl(ssl)],
+        });
         let bytes = h.to_bytes().unwrap();
         assert_eq!(Header::parse(&bytes), Ok(h));
     }
@@ -67,29 +84,52 @@ fuzz_target!(|data: &[u8]| {
     let mut rest = data;
     while let [pick, len_hi, len_lo, tail @ ..] = rest {
         // A length byte of 0xff stands for a value far too long to fit.
-        let n = if *len_hi == 0xff { usize::from(*len_lo) * 1024 } else { usize::from(u16::from_be_bytes([*len_hi & 0x0f, *len_lo])) };
+        let n = if *len_hi == 0xff {
+            usize::from(*len_lo) * 1024
+        } else {
+            usize::from(u16::from_be_bytes([*len_hi & 0x0f, *len_lo]))
+        };
         let (v, next) = tail.split_at(n.min(tail.len()));
         let mut v = v.to_vec();
         v.resize(n, *pick);
         rest = next;
-        let sub = |v: &[u8]| v.chunks(7).map(|c| SslTlv::from_raw(0x21 + c[0] % 6, &c[1..]).unwrap()).collect();
+        let sub = |v: &[u8]| {
+            v.chunks(7)
+                .map(|c| SslTlv::from_raw(0x21 + c[0] % 6, &c[1..]).unwrap())
+                .collect()
+        };
         tlvs.push(match pick % 9 {
             0 => Tlv::Alpn(v),
             1 => Tlv::Authority(v),
             2 => Tlv::Crc32c(u32::from(*len_lo)),
             3 => Tlv::Noop(v),
             4 => Tlv::UniqueId(v),
-            5 => Tlv::Ssl(Ssl { client: *len_lo, verify: u32::from(*len_hi), tlvs: sub(&v) }),
+            5 => Tlv::Ssl(Ssl {
+                client: *len_lo,
+                verify: u32::from(*len_hi),
+                tlvs: sub(&v),
+            }),
             6 => Tlv::NetNs(v),
-            _ => Tlv::Other { kind: *len_hi, value: v },
+            _ => Tlv::Other {
+                kind: *len_hi,
+                value: v,
+            },
         });
         if tlvs.len() == 64 {
             break;
         }
     }
     if !tlvs.is_empty() {
-        let command = if data[0] & 0x80 == 0 { Command::Local } else { Command::Proxy };
-        let h = Header::V2(V2 { command, addresses: Addresses::Unspec, tlvs });
+        let command = if data[0] & 0x80 == 0 {
+            Command::Local
+        } else {
+            Command::Proxy
+        };
+        let h = Header::V2(V2 {
+            command,
+            addresses: Addresses::Unspec,
+            tlvs,
+        });
         contract::check_wire_value(&h);
     }
 });

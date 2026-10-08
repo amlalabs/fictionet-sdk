@@ -65,12 +65,14 @@
 //! assert_eq!(trailers[1], ("grpc-message".to_string(), "no user 'x'".to_string()));
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::leb128;
-use fictionet::stdlib::codec::ascii::{self, hex_upper, trim_ows as trim, is_tchar as is_token, hex_value as hex};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::ascii::{
+    self, hex_upper, hex_value as hex, is_tchar as is_token, trim_ows as trim,
+};
 use fictionet::stdlib::codec::base64::{self, Padding};
+use fictionet::stdlib::codec::leb128;
 use std::fmt;
 use std::time::Duration;
 
@@ -333,10 +335,14 @@ impl Prefixed for Message {
     const NAME: &'static str = "gRPC";
 
     #[inline]
-    fn default_limit() -> Self::Limit { DEFAULT_MAX_MESSAGE }
+    fn default_limit() -> Self::Limit {
+        DEFAULT_MAX_MESSAGE
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_MESSAGE) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_MESSAGE)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -349,12 +355,14 @@ impl Prefixed for Message {
     /// limit returns [`Error::TooLarge`]. Partial input returns
     /// [`fictionet::stdlib::codec::Step::Need`], including at EOF.
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         parse_message(input, limit)
     }
 }
-
 
 // Shared prefix parsing. Only a complete, bounded body is copied.
 fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, Error> {
@@ -1330,7 +1338,9 @@ impl Request {
                 return Err(Error::Name(name.clone()));
             }
             let ok = if name.ends_with("-bin") {
-                value.split(|&c| c == b',').all(|v| base64::is_valid(v, Padding::Optional))
+                value
+                    .split(|&c| c == b',')
+                    .all(|v| base64::is_valid(v, Padding::Optional))
             } else {
                 value.iter().all(|c| (0x20..=0x7e).contains(c))
                     && value.first() != Some(&b' ')
@@ -1481,12 +1491,12 @@ pub mod harness {
 #[cfg(test)]
 mod tests {
     use super::harness::strings;
-    use fictionet::stdlib::codec::Step;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::codec::Step;
     use fictionet::stdlib::codec::{Decode, Fail, Stream, finish, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support;
+    use fictionet::stdlib::test_support::contract;
 
     #[test]
     fn status_details_refuse_varint_overflow() {
@@ -1708,7 +1718,11 @@ mod tests {
             }
             // Exercise accepted messages, small-limit refusals, and every EOF prefix.
             for limit in [0, 7, 8, MAX_MESSAGE] {
-                contract::check_decode_with_held_limit(|| Frames::<Message>::with_limit(limit), &bytes, 0);
+                contract::check_decode_with_held_limit(
+                    || Frames::<Message>::with_limit(limit),
+                    &bytes,
+                    0,
+                );
                 contract::check_decode_with_alloc_limit(
                     || Frames::<Message>::with_limit(limit),
                     &bytes,
@@ -1852,7 +1866,10 @@ mod tests {
         );
         // Exactly the limit is allowed, and waits for its bytes.
         let at = (MAX_MESSAGE as u32).to_be_bytes();
-        assert_eq!(Message::parse_prefix(&[0, at[0], at[1], at[2], at[3]]), Ok(None));
+        assert_eq!(
+            Message::parse_prefix(&[0, at[0], at[1], at[2], at[3]]),
+            Ok(None)
+        );
         assert_eq!(Error::Flag(2).code(), Code::Internal);
         assert_eq!(
             Error::TooLarge {
@@ -1870,7 +1887,10 @@ mod tests {
                 limit: 1,
             },
         ] {
-            assert_eq!(fail_status(&Fail::Protocol(error.clone())), error.to_status());
+            assert_eq!(
+                fail_status(&Fail::Protocol(error.clone())),
+                error.to_status()
+            );
         }
         assert_eq!(
             fail_status(&Fail::Stuck {
@@ -1914,7 +1934,10 @@ mod tests {
         assert_eq!(stream.next(), None);
         assert_eq!(stream.failed(), Some(&error));
         assert_eq!(stream.push(&over), over.len());
-        assert_eq!(Frames::<Message>::with_limit(usize::MAX).limit(), MAX_MESSAGE);
+        assert_eq!(
+            Frames::<Message>::with_limit(usize::MAX).limit(),
+            MAX_MESSAGE
+        );
         assert_eq!(Frames::<Message>::default().limit(), DEFAULT_MAX_MESSAGE);
     }
 
@@ -1929,10 +1952,7 @@ mod tests {
                 data: vec![9]
             }))
         );
-        assert_eq!(
-            stream.next(),
-            Some(Err(Fail::Protocol(Error::Flag(7))))
-        );
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Flag(7)))));
         assert_eq!(stream.next(), None);
     }
 
@@ -2464,26 +2484,16 @@ mod tests {
                 // Unpadded base64 is what gRPC sends.
                 assert!(got.is_ok());
             } else {
-                assert_eq!(
-                    got,
-                    Err(Error::Value(name.to_string())),
-                    "{name} {value:?}"
-                );
+                assert_eq!(got, Err(Error::Value(name.to_string())), "{name} {value:?}");
             }
         }
         assert!(bad_value("x-bin", b"YQ==,YWI=").is_ok());
         assert!(bad_value("x-empty", b"").is_ok());
         let mut a = r.clone();
         a.authority = Some("a\nb".to_string());
-        assert_eq!(
-            a.to_headers(),
-            Err(Error::Value(":authority".to_string()))
-        );
+        assert_eq!(a.to_headers(), Err(Error::Value(":authority".to_string())));
         a.authority = Some(String::new());
-        assert_eq!(
-            a.to_headers(),
-            Err(Error::Value(":authority".to_string()))
-        );
+        assert_eq!(a.to_headers(), Err(Error::Value(":authority".to_string())));
         let mut e = r.clone();
         e.encoding = Some(String::new());
         assert_eq!(

@@ -4,13 +4,13 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Fail, Wire};
+use fictionet::stdlib::grpc::harness::strings;
+use fictionet::stdlib::grpc::{
+    Code, ContentType, Error, HEADER_LEN, MAX_MESSAGE, Message, MethodPath, Rejection, Request,
+    Status, Timeout, decode_message, encode_message,
+};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::grpc::{
-    Code, ContentType, Error, HEADER_LEN, MAX_MESSAGE, Message, MethodPath, Rejection, Request, Status,
-    Timeout, decode_message, encode_message,
-};
-use fictionet::stdlib::grpc::harness::strings;
 use libfuzzer_sys::fuzz_target;
 
 /// The request headers with the fields that make a call: POST, a path

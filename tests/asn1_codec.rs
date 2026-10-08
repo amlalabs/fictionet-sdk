@@ -1,10 +1,8 @@
 //! ASN.1 framing and its LDAP, OCSP, SPNEGO, PEM, and Kerberos consumers.
 
-use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
-use fictionet::stdlib::codec::{
-    Decode, Fail, Stream, Wire, finish, pump,
-};
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::{asn1, kerberos, ldap, ocsp, spnego, x509};
 
@@ -50,7 +48,10 @@ fn asn1_elements_round_trip() -> Result<(), Box<dyn core::error::Error>> {
     );
     contract::check_truncated(|| asn1::Elements::new(asn1::Rules::Ber), &ber);
     assert_eq!(
-        contract::check_decode(|| asn1::Elements::new(asn1::Rules::Der), &[0x04, 0x83, 0x10, 0, 0]),
+        contract::check_decode(
+            || asn1::Elements::new(asn1::Rules::Der),
+            &[0x04, 0x83, 0x10, 0, 0]
+        ),
         (vec![], Some(Fail::Protocol(asn1::Error::TooLong)))
     );
     Ok(())
@@ -238,7 +239,8 @@ fn x509_pem_trailing_text_at_eof() -> Result<(), Box<dyn core::error::Error>> {
         let expected = x509::pem_decode(input.as_bytes())?;
         round_trip(x509::PemBlocks::new, input.as_bytes(), &expected);
     }
-    let (items, failure) = contract::check_decode(x509::PemBlocks::new, b"-----BEGIN TEST-----\nAQID");
+    let (items, failure) =
+        contract::check_decode(x509::PemBlocks::new, b"-----BEGIN TEST-----\nAQID");
     assert!(items.is_empty());
     assert!(matches!(failure, Some(Fail::Truncated { .. })));
     Ok(())
@@ -295,7 +297,10 @@ fn frame_limits_refuse_lengths_before_bodies() {
         );
         assert_eq!(
             contract::check_decode(|| kerberos::Frames::with_limit(limit), &[0, 0, 0, 128]),
-            (vec![], Some(Fail::Protocol(kerberos::Error::LengthTooLong(128))))
+            (
+                vec![],
+                Some(Fail::Protocol(kerberos::Error::LengthTooLong(128)))
+            )
         );
         assert_eq!(ocsp::Frames::with_limit(limit).capacity(), limit.max(16));
         assert_eq!(spnego::Frames::with_limit(limit).capacity(), limit.max(16));
@@ -361,7 +366,10 @@ fn kerberos_tcp_messages_round_trip() -> Result<(), Box<dyn core::error::Error>>
     let length = kerberos::MAX_MESSAGE as u32 + 1;
     assert_eq!(
         contract::check_decode(kerberos::Frames::new, &length.to_be_bytes()),
-        (vec![], Some(Fail::Protocol(kerberos::Error::LengthTooLong(length))))
+        (
+            vec![],
+            Some(Fail::Protocol(kerberos::Error::LengthTooLong(length)))
+        )
     );
     Ok(())
 }

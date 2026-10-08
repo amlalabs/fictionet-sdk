@@ -316,13 +316,13 @@
 //! | [`xml`] | XML 1.0: a nonvalidating UTF-8 pull parser and writer, with DTD attribute defaults but no declared entity expansion. | yes | yes |  |  |  | yes | yes |
 //! | [`zabbix`] | The Zabbix protocol: packets and the JSON messages of agents, senders and servers. | yes | yes |  |  |  | yes | yes |
 
-mod connection;
 pub mod amqp;
 pub mod asn1;
 pub mod bacnet;
 pub mod bgp;
 pub mod cboe_boe;
 pub mod cboe_pitch;
+mod connection;
 // These docs live here, not in cme_mdp3.rs, because regenerating that file
 // (BLESS_CODEGEN=1) rewrites its header.
 /// CME Group MDP 3.0 market data: every message of CME's public SBE
@@ -425,8 +425,8 @@ pub mod ouch;
 pub mod pcp;
 pub mod pim;
 pub mod pop3;
-pub mod ports;
 pub mod portmap;
+pub mod ports;
 pub mod postgres;
 pub mod prefix_int;
 pub mod protobuf;
@@ -454,8 +454,8 @@ pub mod snmp;
 pub mod socks;
 pub mod soupbintcp;
 pub mod spnego;
-pub mod ssh;
 pub mod sse;
+pub mod ssh;
 pub mod stun;
 pub mod syslog;
 pub mod tcp;
@@ -480,7 +480,7 @@ pub mod x509;
 pub mod xml;
 pub mod zabbix;
 
-pub use connection::{Accept, Accepted, Datagram, ConnError, Connection, ConnectionExt};
+pub use connection::{Accept, Accepted, ConnError, Connection, ConnectionExt, Datagram};
 
 mod link;
-pub use link::{delay, bottleneck, filter, Direction};
+pub use link::{Direction, bottleneck, delay, filter};

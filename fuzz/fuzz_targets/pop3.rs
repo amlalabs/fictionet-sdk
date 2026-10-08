@@ -4,11 +4,11 @@
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::pop3::{
-    Command, Error, Input, Inputs, MAX_AUTH_LINE, MAX_REPLY_HELD, Output, Outputs, Reply,
-    Request, ScanListing, UniqueIdListing,
+    Command, Error, Input, Inputs, MAX_AUTH_LINE, MAX_REPLY_HELD, Output, Outputs, Reply, Request,
+    ScanListing, UniqueIdListing,
 };
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fn check_reply(reply: &Reply) {

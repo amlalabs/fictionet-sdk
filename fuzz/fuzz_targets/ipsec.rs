@@ -2,16 +2,34 @@
 //! world playing a VPN gateway reads them.
 #![no_main]
 
-use fictionet::stdlib::ipsec::{AhPacket, EspPacket, Datagram, Error, Plaintext, MAX_DATAGRAM, MAX_PADDING};
-use fictionet::stdlib::{codec::{Wire, Collect}, test_support::contract, ipsec};
+use fictionet::stdlib::ipsec::{
+    AhPacket, Datagram, Error, EspPacket, MAX_DATAGRAM, MAX_PADDING, Plaintext,
+};
+use fictionet::stdlib::{
+    codec::{Collect, Wire},
+    ipsec,
+    test_support::contract,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(|| Collect::<ipsec::EspPacket>::new(ipsec::MAX_PACKET), data, 2 * (ipsec::MAX_PACKET + 1));
+    contract::check_decode_with_alloc_limit(
+        || Collect::<ipsec::EspPacket>::new(ipsec::MAX_PACKET),
+        data,
+        2 * (ipsec::MAX_PACKET + 1),
+    );
     contract::check_wire::<ipsec::EspPacket>(data);
-    contract::check_decode_with_alloc_limit(|| Collect::<ipsec::AhPacket>::new(ipsec::MAX_PACKET), data, 2 * (ipsec::MAX_PACKET + 1));
+    contract::check_decode_with_alloc_limit(
+        || Collect::<ipsec::AhPacket>::new(ipsec::MAX_PACKET),
+        data,
+        2 * (ipsec::MAX_PACKET + 1),
+    );
     contract::check_wire::<ipsec::AhPacket>(data);
-    contract::check_decode_with_alloc_limit(|| Collect::<ipsec::Datagram>::new(ipsec::MAX_DATAGRAM), data, 2 * (ipsec::MAX_DATAGRAM + 1));
+    contract::check_decode_with_alloc_limit(
+        || Collect::<ipsec::Datagram>::new(ipsec::MAX_DATAGRAM),
+        data,
+        2 * (ipsec::MAX_DATAGRAM + 1),
+    );
     contract::check_wire::<ipsec::Datagram>(data);
 
     let packet = ipsec::EspPacket {

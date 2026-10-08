@@ -17,15 +17,24 @@ pub struct Log {
 impl Log {
     /// Opens the log, emptied, as main.py did at start.
     pub fn create(path: &Path) -> std::io::Result<Log> {
-        let file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
-        Ok(Log { file: Mutex::new(file) })
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(Log {
+            file: Mutex::new(file),
+        })
     }
 
     /// Writes one event. `ts` comes first, as in main.py: seconds since the
     /// epoch, rounded to milliseconds.
     pub fn write(&self, event: Value) {
         let mut line = Map::new();
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
         line.insert("ts".into(), serde_json::json!(ts as f64 / 1000.0));
         if let Value::Object(fields) = event {
             line.extend(fields);

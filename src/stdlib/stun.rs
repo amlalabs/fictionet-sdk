@@ -58,14 +58,14 @@
 
 extern crate alloc;
 
-use fictionet::stdlib::codec::pad_to_4 as padded;
-use fictionet::stdlib::codec::{be16, be32};
 use alloc::{
     string::{String, ToString},
     vec,
     vec::Vec,
 };
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use fictionet::stdlib::codec::pad_to_4 as padded;
+use fictionet::stdlib::codec::{be16, be32};
 
 use fictionet::stdlib::codec::{self, Decode, Step};
 
@@ -328,7 +328,12 @@ impl Attribute {
                     return Err(bad());
                 }
                 Ok(Attribute::UnknownAttributes(
-                    value.as_chunks::<2>().0.iter().filter_map(|c| be16(c, 0)).collect(),
+                    value
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .filter_map(|c| be16(c, 0))
+                        .collect(),
                 ))
             }
             attr::FINGERPRINT => Err(Error::FingerprintNotLast),
@@ -590,9 +595,7 @@ impl Message {
             };
             let typ = u16::from_be_bytes([*hi, *lo]);
             let len = usize::from(u16::from_be_bytes([*len_hi, *len_lo]));
-            let value = rest
-                .get(..len)
-                .ok_or(Error::AttributeTruncated { typ })?;
+            let value = rest.get(..len).ok_or(Error::AttributeTruncated { typ })?;
             count += 1;
             if count > MAX_ATTRIBUTES {
                 return Err(Error::TooManyAttributes);
@@ -838,10 +841,7 @@ impl codec::Wire for Message {
             body.extend_from_slice(&value);
             body.resize(end, 0);
         }
-        let body_len = body
-            .len()
-            .checked_add(reserve)
-            .ok_or(Error::BodyTooLong)?;
+        let body_len = body.len().checked_add(reserve).ok_or(Error::BodyTooLong)?;
         let total = HEADER_LEN
             .checked_add(body_len)
             .filter(|&n| n <= MAX_MESSAGE)
@@ -1144,12 +1144,12 @@ enum Integrity {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, Wire, finish, pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
 
     const TID: [u8; 12] = [
         0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
@@ -1388,10 +1388,7 @@ mod tests {
         assert_eq!(Message::parse(&b), Err(Error::Length(2)));
         let mut b = good.clone();
         b[4] = 0;
-        assert_eq!(
-            Message::parse(&b),
-            Err(Error::MagicCookie(0x0012_a442))
-        );
+        assert_eq!(Message::parse(&b), Err(Error::MagicCookie(0x0012_a442)));
         let mut b = good.clone();
         b.push(0);
         assert_eq!(Message::parse(&b), Err(Error::TrailingBytes(1)));
@@ -1493,10 +1490,7 @@ mod tests {
         // A changed byte before the fingerprint is caught too.
         let mut b = SAMPLE_IPV4_RESPONSE;
         b[24] = b'T';
-        assert!(matches!(
-            Message::parse(&b),
-            Err(Error::Fingerprint { .. })
-        ));
+        assert!(matches!(Message::parse(&b), Err(Error::Fingerprint { .. })));
         // Too many attributes.
         let many: Vec<u8> = std::iter::repeat_n([0x80u8, 0x99, 0, 0], MAX_ATTRIBUTES + 1)
             .flatten()
@@ -1518,11 +1512,7 @@ mod tests {
     fn every_prefix_is_truncated() {
         for s in samples() {
             for n in 0..s.len() {
-                assert_eq!(
-                    Message::parse(&s[..n]),
-                    Err(Error::Truncated),
-                    "{n} bytes"
-                );
+                assert_eq!(Message::parse(&s[..n]), Err(Error::Truncated), "{n} bytes");
                 let mut d = Stream::new(Frames);
                 put(&mut d, &s[..n]);
                 assert_eq!(
@@ -1569,9 +1559,7 @@ mod tests {
         put(&mut d, &[0x00, 0x01, 0x00, 0x00, 1, 2, 3, 4]);
         assert_eq!(
             d.next().map(|r| r.map(|frame| Message::parse(&frame))),
-            Some(Err(codec::Fail::Protocol(Error::MagicCookie(
-                0x0102_0304
-            ))))
+            Some(Err(codec::Fail::Protocol(Error::MagicCookie(0x0102_0304))))
         );
         put(&mut d, &SAMPLE_REQUEST);
         assert_eq!(
@@ -1800,10 +1788,7 @@ mod tests {
         );
         let mut b = vec![0, 0x1c, 0, 18];
         b.resize(4 + 20, 0);
-        assert_eq!(
-            p(&b),
-            Err(Error::AttributeValue { typ: 0x1c, len: 18 })
-        );
+        assert_eq!(p(&b), Err(Error::AttributeValue { typ: 0x1c, len: 18 }));
         let mut b = vec![0, 0x1c, 0, 16];
         b.resize(4 + 16, 0);
         assert!(p(&b).is_ok());

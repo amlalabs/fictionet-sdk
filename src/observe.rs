@@ -459,22 +459,22 @@
 //! ignores them, as clients should ignore what they do not know, draws
 //! every task on its own.
 
-/// Copyable capture decoders and presenters for the built-in protocols.
-pub mod protocols;
+mod conversation;
 /// Copyable HTTP/2 and gRPC presentation.
 pub mod http2;
+/// Copyable capture decoders and presenters for the built-in protocols.
+pub mod protocols;
 /// Copyable TLS record presentation, handshake state, and decryption.
 pub mod tls;
-mod conversation;
 
 pub use conversation::Conversation;
 mod present;
 mod registry;
 
+pub use crate::watch::KeyLine;
+pub use decode::{Decoded, Dissector, Field, Layer};
 pub use present::{Observed, Place, Placement, Present};
 pub use registry::{Match, Protocol, Registry, Selection};
-pub use decode::{Decoded, Dissector, Field, Layer};
-pub use crate::watch::KeyLine;
 
 mod app;
 mod decode;
@@ -489,18 +489,26 @@ mod view;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::Cx;
 use crate::lock;
 use crate::watch::Graph;
-use crate::Cx;
 pub use keys::observed_config;
 pub(crate) use packets::LinkWatch;
 
 /// How long a link's decoded packets are kept after the last observer
 /// stopped asking for them.
-const WATCH_LINGER: Duration = if cfg!(test) { Duration::from_millis(200) } else { Duration::from_secs(60) };
+const WATCH_LINGER: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(60)
+};
 /// How often the reaper looks for watches to forget.
 #[cfg(not(target_arch = "wasm32"))]
-const REAP_EVERY: Duration = if cfg!(test) { Duration::from_millis(50) } else { Duration::from_secs(5) };
+const REAP_EVERY: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(5)
+};
 
 /// Serves one observer session on `fd`, which has been accepted on the
 /// world socket of `attacher`.
@@ -527,7 +535,11 @@ static REAPER: Mutex<(Vec<std::sync::Weak<Graph>>, bool)> = Mutex::new((Vec::new
 /// watch leaves.
 pub(crate) fn reap_later(graph: &Arc<Graph>) {
     let mut reaper = lock(&REAPER);
-    if !reaper.0.iter().any(|g| std::ptr::eq(g.as_ptr(), Arc::as_ptr(graph))) {
+    if !reaper
+        .0
+        .iter()
+        .any(|g| std::ptr::eq(g.as_ptr(), Arc::as_ptr(graph)))
+    {
         reaper.0.push(Arc::downgrade(graph));
     }
     if reaper.1 {
@@ -572,7 +584,10 @@ fn start_reaper() -> bool {
 /// The watch of link `id` in `graph`, made if needed, and a subscription
 /// to it. Both are taken under the lock the reaper takes, so the reaper
 /// cannot forget the watch between them.
-pub(crate) fn watch(graph: &Arc<Graph>, id: u64) -> Option<(Arc<LinkWatch>, packets::Subscription)> {
+pub(crate) fn watch(
+    graph: &Arc<Graph>,
+    id: u64,
+) -> Option<(Arc<LinkWatch>, packets::Subscription)> {
     reap(graph);
     let mut watches = lock(&graph.watches);
     let w = match watches.get(&id) {
@@ -635,13 +650,20 @@ mod tests {
         drop(sub);
         meter.sent(0, &crate::Packet(vec![0x45; 20]));
         w.pump();
-        assert_eq!(w.rows_after(0, 10).len(), 1, "nothing is copied with no subscriber");
+        assert_eq!(
+            w.rows_after(0, 10).len(),
+            1,
+            "nothing is copied with no subscriber"
+        );
         // The decoded rows stay for a while, for `packet` and `pcap`.
         assert!(existing_watch(&graph, meter.id).is_some());
         drop(w);
         let weak = Arc::downgrade(&graph);
         drop(graph);
-        assert!(weak.upgrade().is_none(), "the kept watch held its world alive");
+        assert!(
+            weak.upgrade().is_none(),
+            "the kept watch held its world alive"
+        );
     }
 
     #[test]
@@ -703,7 +725,10 @@ mod tests {
         assert!(existing_watch(&graph, meter.id).is_some());
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while existing_watch(&graph, meter.id).is_some() {
-            assert!(std::time::Instant::now() < deadline, "the idle watch was kept");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the idle watch was kept"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         // A watch taken again is subscribed to as it is found, so the
@@ -721,7 +746,12 @@ mod tests {
             let line = line!() + 1;
             let _f = crate::stdlib::filter(&fcx, a, |_, _, _| true);
             let tasks: Vec<_> = fcx.graph().state().tasks.values().cloned().collect();
-            assert!(tasks.iter().any(|t| t.name == "filter" && t.file == file!() && t.line == line), "{tasks:?}");
+            assert!(
+                tasks
+                    .iter()
+                    .any(|t| t.name == "filter" && t.file == file!() && t.line == line),
+                "{tasks:?}"
+            );
             Ok(())
         }))
         .unwrap();
@@ -733,7 +763,8 @@ mod tests {
         crate::block_on(crate::run(|fcx| async move {
             let (a, b) = crate::pair();
             let (c, d) = crate::pair();
-            let router = crate::stdlib::route::router(&fcx, vec![("10.0.0.0/24".parse().unwrap(), a)]);
+            let router =
+                crate::stdlib::route::router(&fcx, vec![("10.0.0.0/24".parse().unwrap(), a)]);
             router.add("10.0.1.0/24".parse().unwrap(), c);
             assert!(!fcx.observed());
             drop(b);

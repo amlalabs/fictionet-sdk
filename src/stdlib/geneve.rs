@@ -202,7 +202,10 @@ impl std::fmt::Display for Error {
             Error::Vni(v) => write!(f, "VNI {v} does not fit in 24 bits"),
             Error::OptionType(t) => write!(f, "option type {t} does not fit in 7 bits"),
             Error::OptionData(n) => {
-                write!(f, "option data of {n} bytes, not a multiple of 4 up to {MAX_OPTION_DATA}")
+                write!(
+                    f,
+                    "option data of {n} bytes, not a multiple of 4 up to {MAX_OPTION_DATA}"
+                )
             }
             Error::OptionsLength(n) => {
                 write!(f, "options of {n} bytes, more than {MAX_OPTIONS_LEN}")
@@ -308,12 +311,16 @@ impl Header {
 
     /// The first option with this class and type, if there is one.
     pub fn option(&self, class: u16, kind: u8) -> Option<&GeneveOption> {
-        self.options.iter().find(|o| o.class == class && o.kind == kind)
+        self.options
+            .iter()
+            .find(|o| o.class == class && o.kind == kind)
     }
 
     /// The bytes all the options take.
     pub fn options_len(&self) -> usize {
-        self.options.iter().fold(0usize, |n, o| n.saturating_add(o.len()))
+        self.options
+            .iter()
+            .fold(0usize, |n, o| n.saturating_add(o.len()))
     }
 
     /// The bytes the whole header takes.
@@ -363,8 +370,12 @@ impl Packet {
     /// header, `Packet { header: self.header.clone(), payload }`, which
     /// writes whenever this packet does.
     pub fn reply(&self, payload: Vec<u8>) -> Packet {
-        let header =
-            Header { control: self.header.control, protocol: self.header.protocol, vni: self.header.vni, options: Vec::new() };
+        let header = Header {
+            control: self.header.control,
+            protocol: self.header.protocol,
+            vni: self.header.vni,
+            options: Vec::new(),
+        };
         Packet { header, payload }
     }
 }
@@ -377,7 +388,10 @@ impl Wire for Packet {
     /// Refuses an invalid header or a datagram above [`MAX_DATAGRAM`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         let (header, payload) = Header::split(b)?;
-        Ok(Packet { header, payload: payload.to_vec() })
+        Ok(Packet {
+            header,
+            payload: payload.to_vec(),
+        })
     }
 
     /// Appends a datagram after [`Header::check`]. Refuses a datagram above
@@ -404,7 +418,9 @@ impl Wire for Header {
     fn parse(b: &[u8]) -> Result<Self, Error> {
         let (header, used) = Self::parse_prefix(b)?.ok_or(Error::Truncated)?;
         if used != b.len() {
-            return Err(Error::Trailing { remaining: b.len() - used });
+            return Err(Error::Trailing {
+                remaining: b.len() - used,
+            });
         }
         Ok(header)
     }
@@ -435,12 +451,10 @@ impl Wire for Header {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Collect, CollectError, Fail, Lcg,
-    };
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn collect(b: &[u8]) -> Result<Packet, Error> {
@@ -450,20 +464,41 @@ mod tests {
         let parsed = Packet::parse(b);
         let (items, failure) = decode_all(make, b);
         if b.len() <= MAX_DATAGRAM {
-            assert_eq!(failure, parsed.clone().err().map(|e| Fail::Protocol(CollectError::Parse(e))));
+            assert_eq!(
+                failure,
+                parsed
+                    .clone()
+                    .err()
+                    .map(|e| Fail::Protocol(CollectError::Parse(e)))
+            );
             assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
         } else {
-            assert_eq!(failure, Some(Fail::Protocol(CollectError::TooLong { limit: MAX_DATAGRAM })));
+            assert_eq!(
+                failure,
+                Some(Fail::Protocol(CollectError::TooLong {
+                    limit: MAX_DATAGRAM
+                }))
+            );
         }
         parsed
     }
 
     fn opt(class: u16, kind: u8, critical: bool, data: &[u8]) -> GeneveOption {
-        GeneveOption { class, kind, critical, data: data.to_vec() }
+        GeneveOption {
+            class,
+            kind,
+            critical,
+            data: data.to_vec(),
+        }
     }
 
     fn header(options: Vec<GeneveOption>) -> Header {
-        Header { control: false, protocol: protocol::TRANSPARENT_ETHERNET_BRIDGING, vni: 0x123456, options }
+        Header {
+            control: false,
+            protocol: protocol::TRANSPARENT_ETHERNET_BRIDGING,
+            vni: 0x123456,
+            options,
+        }
     }
 
     // The layouts of RFC 8926, sections 3.4 and 3.5.
@@ -494,7 +529,13 @@ mod tests {
         assert!(p.header.control);
         assert_eq!(p.header.protocol, protocol::IPV4);
         assert_eq!(p.header.vni, 42);
-        assert_eq!(p.header.options, vec![opt(0x0102, 3, false, &[1, 2, 3, 4]), opt(0xffff, 0x7f, true, &[])]);
+        assert_eq!(
+            p.header.options,
+            vec![
+                opt(0x0102, 3, false, &[1, 2, 3, 4]),
+                opt(0xffff, 0x7f, true, &[])
+            ]
+        );
         assert!(p.header.critical());
         assert_eq!(p.header.option(0xffff, 0x7f), Some(&p.header.options[1]));
         assert_eq!(p.header.option(0xffff, 0x7e), None);
@@ -507,20 +548,31 @@ mod tests {
     fn reserved_bits_are_ignored_and_written_as_zero() {
         // Reserved bits in the flags byte, the last header byte and the
         // option's R bits.
-        let b = [0x01, 0x3f, 0x86, 0xdd, 0, 0, 1, 0xff, 0x00, 0x01, 0x05, 0xe0];
+        let b = [
+            0x01, 0x3f, 0x86, 0xdd, 0, 0, 1, 0xff, 0x00, 0x01, 0x05, 0xe0,
+        ];
         let p = Packet::parse(&b).unwrap();
         assert_eq!(p.header.options, vec![opt(1, 5, false, &[])]);
         assert_eq!(p.header.vni, 1);
-        assert_eq!(p.to_bytes().unwrap(), [0x01, 0x00, 0x86, 0xdd, 0, 0, 1, 0, 0x00, 0x01, 0x05, 0x00]);
+        assert_eq!(
+            p.to_bytes().unwrap(),
+            [0x01, 0x00, 0x86, 0xdd, 0, 0, 1, 0, 0x00, 0x01, 0x05, 0x00]
+        );
     }
 
     #[test]
     fn largest_header() {
         // Options of 4 + 124 and 4 + 120 bytes fill the 252 exactly, and
         // the payload fills the rest of the datagram.
-        let h = header(vec![opt(1, 1, false, &[7; 124]), opt(2, 2, true, &[8; 120])]);
+        let h = header(vec![
+            opt(1, 1, false, &[7; 124]),
+            opt(2, 2, true, &[8; 120]),
+        ]);
         assert_eq!(h.options_len(), MAX_OPTIONS_LEN);
-        let p = Packet { header: h, payload: vec![9; MAX_DATAGRAM - MAX_HEADER_LEN] };
+        let p = Packet {
+            header: h,
+            payload: vec![9; MAX_DATAGRAM - MAX_HEADER_LEN],
+        };
         let b = p.to_bytes().unwrap();
         assert_eq!(b.len(), MAX_DATAGRAM);
         assert_eq!(b[0], 63);
@@ -541,7 +593,10 @@ mod tests {
 
     #[test]
     fn reply_keeps_network_and_protocol() {
-        let mut p = Packet { header: header(vec![opt(1, 1, true, &[])]), payload: vec![1] };
+        let mut p = Packet {
+            header: header(vec![opt(1, 1, true, &[])]),
+            payload: vec![1],
+        };
         p.header.control = true;
         let r = p.reply(vec![2, 3]);
         assert_eq!(r.header.vni, p.header.vni);
@@ -595,7 +650,10 @@ mod tests {
         // Opt Len 2 words and the C bit clear. The first option header is
         // critical, so the error shows before the second option comes.
         let b = [0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 1, 0x81, 0, 0, 1, 0x01, 0];
-        assert_eq!(Header::parse_prefix(&b[..12]), Err(Error::CriticalBit(false)));
+        assert_eq!(
+            Header::parse_prefix(&b[..12]),
+            Err(Error::CriticalBit(false))
+        );
         assert_eq!(Packet::parse(&b), Err(Error::CriticalBit(false)));
         // Even when a later option overruns, the earlier error stands.
         let b = [0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 1, 0x81, 0, 0, 1, 0x01, 1];
@@ -643,7 +701,10 @@ mod tests {
     #[test]
     fn every_truncated_prefix() {
         let p = Packet {
-            header: header(vec![opt(0x0102, 3, false, &[1, 2, 3, 4]), opt(0x0103, 4, true, &[5; 8])]),
+            header: header(vec![
+                opt(0x0102, 3, false, &[1, 2, 3, 4]),
+                opt(0x0103, 4, true, &[5; 8]),
+            ]),
             payload: vec![0xaa; 3],
         };
         let b = p.to_bytes().unwrap();
@@ -665,10 +726,16 @@ mod tests {
 
     #[test]
     fn header_prefix_and_stream_boundary() {
-        let p = Packet { header: header(vec![opt(9, 9, false, &[1; 4])]), payload: vec![3; 100] };
+        let p = Packet {
+            header: header(vec![opt(9, 9, false, &[1; 4])]),
+            payload: vec![3; 100],
+        };
         let b = p.to_bytes().unwrap();
         assert_eq!(Header::parse_prefix(&b[..p.header.len() - 1]), Ok(None));
-        assert_eq!(Header::parse_prefix(&b[..p.header.len()]), Ok(Some((p.header.clone(), p.header.len()))));
+        assert_eq!(
+            Header::parse_prefix(&b[..p.header.len()]),
+            Ok(Some((p.header.clone(), p.header.len())))
+        );
         assert_eq!(collect(&b), Ok(p));
         assert_eq!(collect(&[]), Err(Error::Truncated));
     }
@@ -692,11 +759,24 @@ mod tests {
         assert_eq!(h.to_bytes(), Err(Error::OptionData(128)));
 
         // Two full options are 256 bytes, over the 252 a header holds.
-        let h = header(vec![opt(1, 1, false, &[0; 124]), opt(1, 2, false, &[0; 124])]);
+        let h = header(vec![
+            opt(1, 1, false, &[0; 124]),
+            opt(1, 2, false, &[0; 124]),
+        ]);
         assert_eq!(h.to_bytes(), Err(Error::OptionsLength(256)));
-        assert_eq!(Packet { header: h, payload: vec![] }.to_bytes(), Err(Error::OptionsLength(256)));
+        assert_eq!(
+            Packet {
+                header: h,
+                payload: vec![]
+            }
+            .to_bytes(),
+            Err(Error::OptionsLength(256))
+        );
 
-        let p = Packet { header: header(vec![opt(1, 1, false, &[0; 4])]), payload: vec![0; MAX_PAYLOAD - 7] };
+        let p = Packet {
+            header: header(vec![opt(1, 1, false, &[0; 4])]),
+            payload: vec![0; MAX_PAYLOAD - 7],
+        };
         assert_eq!(p.to_bytes(), Err(Error::TooLong));
 
         // On an error, write leaves the buffer alone.
@@ -712,7 +792,10 @@ mod tests {
         let mut h = header((0..63).map(|i| opt(i, 1, i % 2 == 0, &[])).collect());
         let b = h.to_bytes().unwrap();
         assert_eq!(b.len(), MAX_HEADER_LEN);
-        assert_eq!(Header::parse_prefix(&b), Ok(Some((h.clone(), MAX_HEADER_LEN))));
+        assert_eq!(
+            Header::parse_prefix(&b),
+            Ok(Some((h.clone(), MAX_HEADER_LEN)))
+        );
         h.options.push(opt(63, 1, false, &[]));
         let mut out = vec![1, 2];
         assert_eq!(h.write(&mut out), Err(Error::OptionsLength(256)));
@@ -723,9 +806,21 @@ mod tests {
     fn reply_can_keep_the_options() {
         // An AWS Gateway Load Balancer packet with its flow cookie (class
         // 0x0108, type 3), answered with every option kept.
-        let p = Packet { header: header(vec![opt(0x0108, 3, false, &[1, 2, 3, 4])]), payload: vec![1] };
-        let r = Packet { header: p.header.clone(), payload: vec![2] };
-        assert_eq!(Packet::parse(&r.to_bytes().unwrap()).unwrap().header.option(0x0108, 3), p.header.option(0x0108, 3));
+        let p = Packet {
+            header: header(vec![opt(0x0108, 3, false, &[1, 2, 3, 4])]),
+            payload: vec![1],
+        };
+        let r = Packet {
+            header: p.header.clone(),
+            payload: vec![2],
+        };
+        assert_eq!(
+            Packet::parse(&r.to_bytes().unwrap())
+                .unwrap()
+                .header
+                .option(0x0108, 3),
+            p.header.option(0x0108, 3)
+        );
     }
 
     #[test]
@@ -737,7 +832,11 @@ mod tests {
         for _ in 0..5_000 {
             let mut options = Vec::new();
             for _ in 0..rng.index(70) {
-                let n = if rng.index(4) == 0 { rng.index(140) } else { rng.index(8) * 4 };
+                let n = if rng.index(4) == 0 {
+                    rng.index(140)
+                } else {
+                    rng.index(8) * 4
+                };
                 let data = rng.bytes(n);
                 options.push(GeneveOption {
                     class: rng.next() as u16,
@@ -746,10 +845,19 @@ mod tests {
                     data,
                 });
             }
-            let vni = if rng.index(4) == 0 { rng.next() as u32 } else { (rng.next() as u32) & MAX_VNI };
+            let vni = if rng.index(4) == 0 {
+                rng.next() as u32
+            } else {
+                (rng.next() as u32) & MAX_VNI
+            };
             let n = rng.index(64);
             let p = Packet {
-                header: Header { control: !rng.coin(), protocol: rng.next() as u16, vni, options },
+                header: Header {
+                    control: !rng.coin(),
+                    protocol: rng.next() as u16,
+                    vni,
+                    options,
+                },
                 payload: rng.bytes(n),
             };
             let mut out = vec![0xee];
@@ -765,18 +873,27 @@ mod tests {
 
     #[test]
     fn packet_write_appends() {
-        let p = Packet { header: header(vec![opt(3, 4, true, &[1; 8])]), payload: vec![5; 3] };
+        let p = Packet {
+            header: header(vec![opt(3, 4, true, &[1; 8])]),
+            payload: vec![5; 3],
+        };
         let mut out = vec![0xee];
         p.write(&mut out).unwrap();
         assert_eq!(out[0], 0xee);
         assert_eq!(&out[1..], &p.to_bytes().unwrap()[..]);
         assert_eq!(Packet::parse(&out[1..]), Ok(p));
         // On an error, the buffer is left alone.
-        let big = Packet { header: header(vec![]), payload: vec![0; MAX_PAYLOAD + 1] };
+        let big = Packet {
+            header: header(vec![]),
+            payload: vec![0; MAX_PAYLOAD + 1],
+        };
         let mut out = vec![1, 2];
         assert_eq!(big.write(&mut out), Err(Error::TooLong));
         assert_eq!(out, [1, 2]);
-        let bad = Packet { header: header(vec![opt(1, 1, false, &[1])]), payload: vec![] };
+        let bad = Packet {
+            header: header(vec![opt(1, 1, false, &[1])]),
+            payload: vec![],
+        };
         assert_eq!(bad.write(&mut out), Err(Error::OptionData(1)));
         assert_eq!(out, [1, 2]);
     }
@@ -828,7 +945,12 @@ mod tests {
             let class = rng.next() as u16;
             let kind = rng.index(128) as u8;
             let critical = rng.index(4) == 0;
-            options.push(GeneveOption { class, kind, critical, data });
+            options.push(GeneveOption {
+                class,
+                kind,
+                critical,
+                data,
+            });
             if room < OPTION_HEADER_LEN {
                 break;
             }
@@ -889,9 +1011,10 @@ mod tests {
             // Keep the version 0 most of the time, so mutations reach the
             // options.
             if i % 8 != 0
-                && let Some(b) = data.first_mut() {
-                    *b &= 0x3f;
-                }
+                && let Some(b) = data.first_mut()
+            {
+                *b &= 0x3f;
+            }
             check_bytes(&data);
         }
     }

@@ -34,10 +34,10 @@
 //! assert_eq!(decoder.next().unwrap().unwrap(), frame);
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{le16, Wire};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::{Wire, le16};
 
 /// The usual TCP and UDP port.
 pub const PORT: u16 = 20000;
@@ -92,8 +92,12 @@ impl std::fmt::Display for Error {
             Self::SegmentLength => f.write_str("DNP3 transport segment length is outside 2..=250"),
             Self::Sequence => f.write_str("DNP3 transport sequence is invalid"),
             Self::MissingFirst => f.write_str("DNP3 transport continuation has no first segment"),
-            Self::FragmentTooLong => f.write_str("DNP3 application fragment exceeds the local limit"),
-            Self::FragmentLength => f.write_str("DNP3 application fragment length is outside its range"),
+            Self::FragmentTooLong => {
+                f.write_str("DNP3 application fragment exceeds the local limit")
+            }
+            Self::FragmentLength => {
+                f.write_str("DNP3 application fragment length is outside its range")
+            }
             Self::Indications => f.write_str("DNP3 internal indications do not match the function"),
         }
     }
@@ -257,11 +261,13 @@ impl Prefixed for Frame {
     /// Returns [`Error::Start`], [`Error::FrameLength`] or
     /// [`Error::Crc`] for invalid start bytes, lengths or CRCs.
     #[inline]
-    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        _limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         Frame::parse_prefix(input)
     }
 }
-
 
 fn check_crc(b: &[u8], at: usize, size: usize) -> Result<(), Error> {
     if crc(&b[at..at + size]) == le16(b, at + size).ok_or(Error::Truncated)? {
@@ -418,7 +424,11 @@ impl Wire for Fragment {
         Ok(Self {
             control: b[0],
             function: b[1],
-            indications: if response { Some(le16(b, 2).ok_or(Error::FragmentLength)?) } else { None },
+            indications: if response {
+                Some(le16(b, 2).ok_or(Error::FragmentLength)?)
+            } else {
+                None
+            },
             objects: b[header..].to_vec(),
         })
     }

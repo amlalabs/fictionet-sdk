@@ -5,9 +5,13 @@
 use std::net::Ipv4Addr;
 
 use fictionet::stdlib::igmp::Message;
-use fictionet::stdlib::ip::checksum;
-use fictionet::stdlib::{codec::{Wire, Collect}, test_support::contract, igmp};
 use fictionet::stdlib::igmp::harness::conforms;
+use fictionet::stdlib::ip::checksum;
+use fictionet::stdlib::{
+    codec::{Collect, Wire},
+    igmp,
+    test_support::contract,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -25,7 +29,11 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn check(data: &[u8]) {
-    contract::check_decode_with_alloc_limit(|| Collect::<igmp::Message>::new(igmp::MAX_MESSAGE), data, 2 * (igmp::MAX_MESSAGE + 1));
+    contract::check_decode_with_alloc_limit(
+        || Collect::<igmp::Message>::new(igmp::MAX_MESSAGE),
+        data,
+        2 * (igmp::MAX_MESSAGE + 1),
+    );
     contract::check_wire::<igmp::Message>(data);
     contract::check_wire::<igmp::Code>(data);
     if let Some((value, _)) = data.split_first_chunk::<4>() {

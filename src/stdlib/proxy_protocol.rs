@@ -63,8 +63,8 @@
 //! assert_eq!(Header::parse(&bytes), Ok(header));
 //! ```
 
-use fictionet::stdlib::codec::crc32c::{checksum as crc32c, update as crc32c_update};
 use fictionet::stdlib::codec::be16;
+use fictionet::stdlib::codec::crc32c::{checksum as crc32c, update as crc32c_update};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use fictionet::stdlib::codec::{self, Decode, Wire};
@@ -104,8 +104,7 @@ impl Wire for Header {
     /// LOCAL ignores an unreadable address block, but still checks any
     /// checksum TLV it can find, even before a later malformed TLV.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let (header, used) = Self::parse_prefix(bytes)
-            ?.ok_or(Error::Truncated)?;
+        let (header, used) = Self::parse_prefix(bytes)?.ok_or(Error::Truncated)?;
         if used != bytes.len() {
             return Err(Error::Trailing);
         }
@@ -158,7 +157,11 @@ impl Headers {
     /// Sets the whole-header limit, clamped to [`V2_HEADER_LEN`] through
     /// [`MAX_HEADER_LEN`]. A v2 length is checked before its body arrives.
     pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.clamp(V2_HEADER_LEN, MAX_HEADER_LEN), scanned: 0, done: false }
+        Self {
+            limit: limit.clamp(V2_HEADER_LEN, MAX_HEADER_LEN),
+            scanned: 0,
+            done: false,
+        }
     }
 
     /// The largest accepted header, including its fixed part.
@@ -214,7 +217,9 @@ impl Decode for Headers {
             Detection::V2 => {
                 // Validate just the fixed prefix even when a whole body is
                 // available, so header faults always have the same priority.
-                let fixed = input.get(..input.len().min(V2_HEADER_LEN)).unwrap_or_default();
+                let fixed = input
+                    .get(..input.len().min(V2_HEADER_LEN))
+                    .unwrap_or_default();
                 Header::parse_prefix(fixed).map_err(FrameError::Protocol)?;
                 let Some(&[hi, lo]) = input.get(14..16) else {
                     return Ok(codec::Step::Need);
@@ -228,8 +233,11 @@ impl Decode for Headers {
                 used
             }
         };
-        let Some(bytes) = input.get(..used) else { return Ok(codec::Step::Need) };
-        let item = Header::parse_prefix(bytes).and_then(|m| m.map(|(h, _)| h).ok_or(Error::V1Syntax));
+        let Some(bytes) = input.get(..used) else {
+            return Ok(codec::Step::Need);
+        };
+        let item =
+            Header::parse_prefix(bytes).and_then(|m| m.map(|(h, _)| h).ok_or(Error::V1Syntax));
         self.done = true;
         Ok(codec::Step::Item(item, used))
     }
@@ -243,7 +251,9 @@ pub const V1_MAX_LEN: usize = 107;
 /// `UNKNOWN` and still fit in [`V1_MAX_LEN`].
 pub const V1_MAX_UNKNOWN_REST: usize = V1_MAX_LEN - b"PROXY UNKNOWN\r\n".len();
 /// The 12 bytes every version 2 header starts with.
-pub const V2_SIGNATURE: [u8; 12] = [0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a];
+pub const V2_SIGNATURE: [u8; 12] = [
+    0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
+];
 /// The length of the fixed part of a version 2 header: the signature, the
 /// version and command, the family and transport, and the length.
 pub const V2_HEADER_LEN: usize = 16;
@@ -318,9 +328,19 @@ pub enum Header {
 pub enum V1 {
     /// `PROXY TCP4`: a TCP connection over IPv4, from `src:src_port` to
     /// `dst:dst_port`.
-    Tcp4 { src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16 },
+    Tcp4 {
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    },
     /// `PROXY TCP6`: a TCP connection over IPv6.
-    Tcp6 { src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16 },
+    Tcp6 {
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        src_port: u16,
+        dst_port: u16,
+    },
     /// `PROXY UNKNOWN`: the proxy does not say where the connection came
     /// from. The bytes are whatever followed the word `UNKNOWN` on the line,
     /// before the CR and LF. They are empty or start with a space. A
@@ -367,13 +387,29 @@ pub enum Addresses {
     /// No addresses: the family and transport are both unspecified.
     Unspec,
     /// IPv4 source and destination, with ports.
-    Inet { transport: Transport, src: Ipv4Addr, dst: Ipv4Addr, src_port: u16, dst_port: u16 },
+    Inet {
+        transport: Transport,
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    },
     /// IPv6 source and destination, with ports.
-    Inet6 { transport: Transport, src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16 },
+    Inet6 {
+        transport: Transport,
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        src_port: u16,
+        dst_port: u16,
+    },
     /// Unix socket paths, each padded with zero bytes to
     /// [`UNIX_ADDR_LEN`]. [`unix_path`] cuts the padding off. Writers take
     /// all [`UNIX_ADDR_LEN`] bytes as given, padding included.
-    Unix { transport: Transport, src: [u8; UNIX_ADDR_LEN], dst: [u8; UNIX_ADDR_LEN] },
+    Unix {
+        transport: Transport,
+        src: [u8; UNIX_ADDR_LEN],
+        dst: [u8; UNIX_ADDR_LEN],
+    },
 }
 
 /// One TLV of a version 2 header.
@@ -498,10 +534,15 @@ impl std::fmt::Display for Error {
             Error::V1Port => f.write_str("bad port in PROXY v1 line"),
             Error::Version(v) => write!(f, "PROXY header version {v}, not 2"),
             Error::Command(c) => write!(f, "PROXY v2 command {c}, not LOCAL or PROXY"),
-            Error::Family(b) => write!(f, "PROXY v2 family and transport byte {b:#04x} not allowed"),
+            Error::Family(b) => {
+                write!(f, "PROXY v2 family and transport byte {b:#04x} not allowed")
+            }
             Error::Length(n) => write!(f, "PROXY v2 length {n} too short for the address block"),
             Error::TlvTruncated => f.write_str("PROXY v2 TLV runs past its end"),
-            Error::TlvLength(k) => write!(f, "PROXY v2 TLV type {k:#04x} has a value of the wrong length"),
+            Error::TlvLength(k) => write!(
+                f,
+                "PROXY v2 TLV type {k:#04x} has a value of the wrong length"
+            ),
             Error::Checksum => f.write_str("PROXY v2 CRC32C checksum does not match"),
             Error::Truncated => f.write_str("incomplete PROXY header"),
             Error::Trailing => f.write_str("bytes after the PROXY header"),
@@ -568,21 +609,47 @@ impl Header {
     /// a receiver uses the connection's real endpoints.
     pub fn addresses(&self) -> Option<(SocketAddr, SocketAddr)> {
         match self {
-            Header::V1(V1::Tcp4 { src, dst, src_port, dst_port }) => {
-                Some((SocketAddr::from((*src, *src_port)), SocketAddr::from((*dst, *dst_port))))
-            }
-            Header::V1(V1::Tcp6 { src, dst, src_port, dst_port }) => {
-                Some((SocketAddr::from((*src, *src_port)), SocketAddr::from((*dst, *dst_port))))
-            }
+            Header::V1(V1::Tcp4 {
+                src,
+                dst,
+                src_port,
+                dst_port,
+            }) => Some((
+                SocketAddr::from((*src, *src_port)),
+                SocketAddr::from((*dst, *dst_port)),
+            )),
+            Header::V1(V1::Tcp6 {
+                src,
+                dst,
+                src_port,
+                dst_port,
+            }) => Some((
+                SocketAddr::from((*src, *src_port)),
+                SocketAddr::from((*dst, *dst_port)),
+            )),
             Header::V1(V1::Unknown(_)) => None,
             Header::V2(h) if h.command == Command::Local => None,
             Header::V2(h) => match &h.addresses {
-                Addresses::Inet { src, dst, src_port, dst_port, .. } => {
-                    Some((SocketAddr::from((*src, *src_port)), SocketAddr::from((*dst, *dst_port))))
-                }
-                Addresses::Inet6 { src, dst, src_port, dst_port, .. } => {
-                    Some((SocketAddr::from((*src, *src_port)), SocketAddr::from((*dst, *dst_port))))
-                }
+                Addresses::Inet {
+                    src,
+                    dst,
+                    src_port,
+                    dst_port,
+                    ..
+                } => Some((
+                    SocketAddr::from((*src, *src_port)),
+                    SocketAddr::from((*dst, *dst_port)),
+                )),
+                Addresses::Inet6 {
+                    src,
+                    dst,
+                    src_port,
+                    dst_port,
+                    ..
+                } => Some((
+                    SocketAddr::from((*src, *src_port)),
+                    SocketAddr::from((*dst, *dst_port)),
+                )),
                 Addresses::Unspec | Addresses::Unix { .. } => None,
             },
         }
@@ -592,7 +659,11 @@ impl Header {
 fn parse_v1(b: &[u8]) -> Result<Option<(V1, usize)>, Error> {
     let window = &b[..b.len().min(V1_MAX_LEN)];
     let Some(lf) = window.iter().position(|&c| c == b'\n') else {
-        return if b.len() >= V1_MAX_LEN { Err(Error::V1TooLong) } else { Ok(None) };
+        return if b.len() >= V1_MAX_LEN {
+            Err(Error::V1TooLong)
+        } else {
+            Ok(None)
+        };
     };
     // The prefix holds no LF, so `lf` is at least 6.
     let cr = lf.checked_sub(1).ok_or(Error::V1Syntax)?;
@@ -609,19 +680,34 @@ fn parse_v1(b: &[u8]) -> Result<Option<(V1, usize)>, Error> {
         return Ok(Some((V1::Unknown(rest.to_vec()), used)));
     }
     let mut fields = line.split(|&c| c == b' ');
-    let (Some(proto), Some(src), Some(dst), Some(sport), Some(dport), None) =
-        (fields.next(), fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
-    else {
+    let (Some(proto), Some(src), Some(dst), Some(sport), Some(dport), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
         return Err(Error::V1Syntax);
     };
     let header = match proto {
         b"TCP4" => {
             let (src, dst) = (v1_addr::<Ipv4Addr>(src)?, v1_addr::<Ipv4Addr>(dst)?);
-            V1::Tcp4 { src, dst, src_port: v1_port(sport)?, dst_port: v1_port(dport)? }
+            V1::Tcp4 {
+                src,
+                dst,
+                src_port: v1_port(sport)?,
+                dst_port: v1_port(dport)?,
+            }
         }
         b"TCP6" => {
             let (src, dst) = (v1_addr::<Ipv6Addr>(src)?, v1_addr::<Ipv6Addr>(dst)?);
-            V1::Tcp6 { src, dst, src_port: v1_port(sport)?, dst_port: v1_port(dport)? }
+            V1::Tcp6 {
+                src,
+                dst,
+                src_port: v1_port(sport)?,
+                dst_port: v1_port(dport)?,
+            }
         }
         _ => return Err(Error::V1Syntax),
     };
@@ -629,7 +715,10 @@ fn parse_v1(b: &[u8]) -> Result<Option<(V1, usize)>, Error> {
 }
 
 fn v1_addr<A: std::str::FromStr>(field: &[u8]) -> Result<A, Error> {
-    std::str::from_utf8(field).ok().and_then(|s| s.parse().ok()).ok_or(Error::V1Address)
+    std::str::from_utf8(field)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or(Error::V1Address)
 }
 
 fn v1_port(field: &[u8]) -> Result<u16, Error> {
@@ -685,15 +774,27 @@ impl Wire for V1 {
     fn write(&self, dest: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = V1_PREFIX.to_vec();
         match self {
-            V1::Tcp4 { src, dst, src_port, dst_port } => {
+            V1::Tcp4 {
+                src,
+                dst,
+                src_port,
+                dst_port,
+            } => {
                 out.extend_from_slice(format!("TCP4 {src} {dst} {src_port} {dst_port}").as_bytes());
             }
-            V1::Tcp6 { src, dst, src_port, dst_port } => {
+            V1::Tcp6 {
+                src,
+                dst,
+                src_port,
+                dst_port,
+            } => {
                 out.extend_from_slice(format!("TCP6 {src} {dst} {src_port} {dst_port}").as_bytes());
             }
             V1::Unknown(rest) => {
-                if rest.len() > V1_MAX_UNKNOWN_REST || rest.contains(&b'\n')
-                    || (!rest.is_empty() && rest.first() != Some(&b' ')) {
+                if rest.len() > V1_MAX_UNKNOWN_REST
+                    || rest.contains(&b'\n')
+                    || (!rest.is_empty() && rest.first() != Some(&b' '))
+                {
                     return Err(Error::Unwritable);
                 }
                 out.extend_from_slice(b"UNKNOWN");
@@ -713,8 +814,18 @@ impl V1 {
     pub fn from_addrs(src: SocketAddr, dst: SocketAddr) -> V1 {
         let (src_port, dst_port) = (src.port(), dst.port());
         match same_family(src, dst) {
-            SamePair::V4(src, dst) => V1::Tcp4 { src, dst, src_port, dst_port },
-            SamePair::V6(src, dst) => V1::Tcp6 { src, dst, src_port, dst_port },
+            SamePair::V4(src, dst) => V1::Tcp4 {
+                src,
+                dst,
+                src_port,
+                dst_port,
+            },
+            SamePair::V6(src, dst) => V1::Tcp6 {
+                src,
+                dst,
+                src_port,
+                dst_port,
+            },
         }
     }
 }
@@ -727,8 +838,20 @@ impl Addresses {
     pub fn from_addrs(transport: Transport, src: SocketAddr, dst: SocketAddr) -> Addresses {
         let (src_port, dst_port) = (src.port(), dst.port());
         match same_family(src, dst) {
-            SamePair::V4(src, dst) => Addresses::Inet { transport, src, dst, src_port, dst_port },
-            SamePair::V6(src, dst) => Addresses::Inet6 { transport, src, dst, src_port, dst_port },
+            SamePair::V4(src, dst) => Addresses::Inet {
+                transport,
+                src,
+                dst,
+                src_port,
+                dst_port,
+            },
+            SamePair::V6(src, dst) => Addresses::Inet6 {
+                transport,
+                src,
+                dst,
+                src_port,
+                dst_port,
+            },
         }
     }
 }
@@ -749,7 +872,9 @@ fn family(fam: u8) -> Option<(usize, Transport)> {
 }
 
 fn parse_v2(b: &[u8]) -> Result<Option<(V2, usize)>, Error> {
-    let Some(&ver_cmd) = b.get(12) else { return Ok(None) };
+    let Some(&ver_cmd) = b.get(12) else {
+        return Ok(None);
+    };
     if ver_cmd >> 4 != 2 {
         return Err(Error::Version(ver_cmd >> 4));
     }
@@ -758,7 +883,9 @@ fn parse_v2(b: &[u8]) -> Result<Option<(V2, usize)>, Error> {
         1 => Command::Proxy,
         c => return Err(Error::Command(c)),
     };
-    let Some(&fam) = b.get(13) else { return Ok(None) };
+    let Some(&fam) = b.get(13) else {
+        return Ok(None);
+    };
     // A LOCAL header's block is discarded, so only PROXY fails early.
     let proxy = command == Command::Proxy;
     if proxy && family(fam).is_none() {
@@ -769,21 +896,36 @@ fn parse_v2(b: &[u8]) -> Result<Option<(V2, usize)>, Error> {
     }
     let len = be16(b, 14).ok_or(Error::Truncated)?;
     if let (true, Some((block, _))) = (proxy, family(fam))
-        && usize::from(len) < block {
-            return Err(Error::Length(len));
-        }
+        && usize::from(len) < block
+    {
+        return Err(Error::Length(len));
+    }
     let total = V2_HEADER_LEN + usize::from(len);
     if b.len() < total {
         return Ok(None);
     }
     match parse_v2_body(b, fam, total) {
-        Ok((addresses, tlvs)) => Ok(Some((V2 { command, addresses, tlvs }, total))),
+        Ok((addresses, tlvs)) => Ok(Some((
+            V2 {
+                command,
+                addresses,
+                tlvs,
+            },
+            total,
+        ))),
         // The specification says a receiver accepts a LOCAL header and
         // discards its address block, family included. A wrong checksum,
         // or a CRC32C TLV that cannot be checked, still makes the header
         // invalid.
         Err(e) if !proxy && e != Error::Checksum && e != Error::TlvLength(tlv_type::CRC32C) => {
-            Ok(Some((V2 { command, addresses: Addresses::Unspec, tlvs: Vec::new() }, total)))
+            Ok(Some((
+                V2 {
+                    command,
+                    addresses: Addresses::Unspec,
+                    tlvs: Vec::new(),
+                },
+                total,
+            )))
         }
         Err(e) => Err(e),
     }
@@ -824,7 +966,11 @@ fn parse_v2_body(b: &[u8], fam: u8, total: usize) -> Result<(Addresses, Vec<Tlv>
             let mut dst = [0u8; UNIX_ADDR_LEN];
             src.copy_from_slice(&a[..UNIX_ADDR_LEN]);
             dst.copy_from_slice(&a[UNIX_ADDR_LEN..]);
-            Addresses::Unix { transport, src, dst }
+            Addresses::Unix {
+                transport,
+                src,
+                dst,
+            }
         }
         _ => Addresses::Unspec,
     };
@@ -902,7 +1048,11 @@ fn check_raw(kind: u8, value: &[u8]) -> Result<(), Error> {
         }
         _ => true,
     };
-    if ok { Ok(()) } else { Err(Error::TlvLength(kind)) }
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::TlvLength(kind))
+    }
 }
 
 /// Checks an `SSL` TLV's value, as [`Ssl::parse`] does, without copying it.
@@ -933,7 +1083,10 @@ impl Tlv {
             tlv_type::UNIQUE_ID => Tlv::UniqueId(value.to_vec()),
             tlv_type::SSL => Tlv::Ssl(Ssl::parse(value)?),
             tlv_type::NETNS => Tlv::NetNs(value.to_vec()),
-            _ => Tlv::Other { kind, value: value.to_vec() },
+            _ => Tlv::Other {
+                kind,
+                value: value.to_vec(),
+            },
         })
     }
 
@@ -969,7 +1122,11 @@ impl Wire for Ssl {
             tlvs.push(SslTlv::from_raw(kind, v)?);
             i = next;
         }
-        Ok(Ssl { client, verify, tlvs })
+        Ok(Ssl {
+            client,
+            verify,
+            tlvs,
+        })
     }
 
     /// Refuses oversized sub-TLVs, named codes stored as `Other` and values
@@ -979,7 +1136,9 @@ impl Wire for Ssl {
         let mut bytes = Vec::with_capacity(len);
         bytes.push(self.client);
         bytes.extend_from_slice(&self.verify.to_be_bytes());
-        for tlv in &self.tlvs { tlv.write(&mut bytes)?; }
+        for tlv in &self.tlvs {
+            tlv.write(&mut bytes)?;
+        }
         out.extend_from_slice(&bytes);
         Ok(())
     }
@@ -987,7 +1146,9 @@ impl Wire for Ssl {
 impl Ssl {
     fn wire_len(&self) -> Result<usize, Error> {
         self.tlvs.iter().try_fold(SSL_FIXED_LEN, |len, tlv| {
-            len.checked_add(tlv.wire_len()?).filter(|&n| n <= MAX_TLV_VALUE).ok_or(Error::Unwritable)
+            len.checked_add(tlv.wire_len()?)
+                .filter(|&n| n <= MAX_TLV_VALUE)
+                .ok_or(Error::Unwritable)
         })
     }
 }
@@ -1002,15 +1163,27 @@ impl Tlv {
             Self::Other { kind, value } if !matches!(*kind, 1..=5 | 0x20 | 0x30) => value.len(),
             _ => return Err(Error::Unwritable),
         };
-        n.checked_add(3).filter(|&n| n <= V2_MAX_BODY).ok_or(Error::Unwritable)
+        n.checked_add(3)
+            .filter(|&n| n <= V2_MAX_BODY)
+            .ok_or(Error::Unwritable)
     }
 }
 impl SslTlv {
     fn wire_len(&self) -> Result<usize, Error> {
-        if matches!(self, Self::Other { kind: 0x21..=0x25, .. }) {
+        if matches!(
+            self,
+            Self::Other {
+                kind: 0x21..=0x25,
+                ..
+            }
+        ) {
             return Err(Error::Unwritable);
         }
-        self.value().len().checked_add(3).filter(|&n| n <= MAX_TLV_VALUE - SSL_FIXED_LEN).ok_or(Error::Unwritable)
+        self.value()
+            .len()
+            .checked_add(3)
+            .filter(|&n| n <= MAX_TLV_VALUE - SSL_FIXED_LEN)
+            .ok_or(Error::Unwritable)
     }
 }
 
@@ -1052,8 +1225,12 @@ tlv_wire!(Tlv, Tlv::from_raw, |value, bytes| {
     match value {
         Tlv::Crc32c(crc) => bytes.extend_from_slice(&crc.to_be_bytes()),
         Tlv::Ssl(ssl) => ssl.write(bytes)?,
-        Tlv::Alpn(v) | Tlv::Authority(v) | Tlv::Noop(v) | Tlv::NetNs(v)
-        | Tlv::UniqueId(v) | Tlv::Other { value: v, .. } => bytes.extend_from_slice(v),
+        Tlv::Alpn(v)
+        | Tlv::Authority(v)
+        | Tlv::Noop(v)
+        | Tlv::NetNs(v)
+        | Tlv::UniqueId(v)
+        | Tlv::Other { value: v, .. } => bytes.extend_from_slice(v),
     }
 });
 tlv_wire!(SslTlv, SslTlv::from_raw, |value, bytes| {
@@ -1139,13 +1316,25 @@ impl Wire for V2 {
         out.extend_from_slice(&[0, 0]);
         match &self.addresses {
             Addresses::Unspec => {}
-            Addresses::Inet { src, dst, src_port, dst_port, .. } => {
+            Addresses::Inet {
+                src,
+                dst,
+                src_port,
+                dst_port,
+                ..
+            } => {
                 out.extend_from_slice(&src.octets());
                 out.extend_from_slice(&dst.octets());
                 out.extend_from_slice(&src_port.to_be_bytes());
                 out.extend_from_slice(&dst_port.to_be_bytes());
             }
-            Addresses::Inet6 { src, dst, src_port, dst_port, .. } => {
+            Addresses::Inet6 {
+                src,
+                dst,
+                src_port,
+                dst_port,
+                ..
+            } => {
                 out.extend_from_slice(&src.octets());
                 out.extend_from_slice(&dst.octets());
                 out.extend_from_slice(&src_port.to_be_bytes());
@@ -1163,7 +1352,8 @@ impl Wire for V2 {
             }
             tlv.write(&mut out)?;
         }
-        let len = u16::try_from(out.len().saturating_sub(V2_HEADER_LEN)).map_err(|_| Error::Unwritable)?;
+        let len = u16::try_from(out.len().saturating_sub(V2_HEADER_LEN))
+            .map_err(|_| Error::Unwritable)?;
         out[14..16].copy_from_slice(&len.to_be_bytes());
         if parse_v2(&out).ok().flatten().as_ref().map(|(h, _)| h) != Some(self) {
             return Err(Error::Unwritable);
@@ -1209,11 +1399,18 @@ impl V2 {
     /// The value of the first TLV of type `kind`, if there is one whose
     /// value is plain bytes (not CRC32C or SSL).
     pub fn tlv(&self, kind: u8) -> Option<&[u8]> {
-        self.tlvs.iter().find(|t| t.kind() == kind).and_then(|t| match t {
-            Tlv::Alpn(v) | Tlv::Authority(v) | Tlv::Noop(v) | Tlv::UniqueId(v) | Tlv::NetNs(v) => Some(&v[..]),
-            Tlv::Other { value, .. } => Some(&value[..]),
-            Tlv::Crc32c(_) | Tlv::Ssl(_) => None,
-        })
+        self.tlvs
+            .iter()
+            .find(|t| t.kind() == kind)
+            .and_then(|t| match t {
+                Tlv::Alpn(v)
+                | Tlv::Authority(v)
+                | Tlv::Noop(v)
+                | Tlv::UniqueId(v)
+                | Tlv::NetNs(v) => Some(&v[..]),
+                Tlv::Other { value, .. } => Some(&value[..]),
+                Tlv::Crc32c(_) | Tlv::Ssl(_) => None,
+            })
     }
 
     /// The first `SSL` TLV, if there is one.
@@ -1234,11 +1431,9 @@ pub fn unix_path(addr: &[u8; UNIX_ADDR_LEN]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::assert_linear;
     use super::*;
-    use codec::{
-        Lcg, Stream,
-    };
+    use codec::{Lcg, Stream};
+    use fictionet::stdlib::test_support::assert_linear;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
@@ -1268,7 +1463,15 @@ mod tests {
         let line = b"PROXY TCP4 255.255.255.255 255.255.255.255 65535 65535\r\n";
         let h = Header::parse(line).unwrap();
         let b = Ipv4Addr::BROADCAST;
-        assert_eq!(h, Header::V1(V1::Tcp4 { src: b, dst: b, src_port: 65535, dst_port: 65535 }));
+        assert_eq!(
+            h,
+            Header::V1(V1::Tcp4 {
+                src: b,
+                dst: b,
+                src_port: 65535,
+                dst_port: 65535
+            })
+        );
         assert_eq!(h.to_bytes().unwrap(), line);
 
         let f = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
@@ -1281,7 +1484,10 @@ mod tests {
         let line = format!("PROXY UNKNOWN {f} {f} 65535 65535\r\n");
         assert_eq!(line.len(), V1_MAX_LEN);
         let h = Header::parse(line.as_bytes()).unwrap();
-        assert_eq!(h, Header::V1(V1::Unknown(format!(" {f} {f} 65535 65535").into_bytes())));
+        assert_eq!(
+            h,
+            Header::V1(V1::Unknown(format!(" {f} {f} 65535 65535").into_bytes()))
+        );
         assert_eq!(h.to_bytes().unwrap(), line.as_bytes());
         assert_eq!(h.addresses(), None);
 
@@ -1310,13 +1516,23 @@ mod tests {
         assert_eq!(e(b"PROXY TCP4 1.2.3.400 5.6.7.8 1 2\r\n"), Error::V1Address);
         assert_eq!(e(b"PROXY TCP4 ::1 5.6.7.8 1 2\r\n"), Error::V1Address);
         assert_eq!(e(b"PROXY TCP6 1.2.3.4 ::1 1 2\r\n"), Error::V1Address);
-        assert_eq!(e(b"PROXY TCP4 1.2.3.4 5.6.7.\xff 1 2\r\n"), Error::V1Address);
+        assert_eq!(
+            e(b"PROXY TCP4 1.2.3.4 5.6.7.\xff 1 2\r\n"),
+            Error::V1Address
+        );
         assert_eq!(e(b"PROXY TCP4 1.2.3.4 5.6.7.8 65536 2\r\n"), Error::V1Port);
         assert_eq!(e(b"PROXY TCP4 1.2.3.4 5.6.7.8 01 2\r\n"), Error::V1Port);
         assert_eq!(e(b"PROXY TCP4 1.2.3.4 5.6.7.8 1 \r\n"), Error::V1Port);
         assert_eq!(e(b"PROXY TCP4 1.2.3.4 5.6.7.8 1 +2\r\n"), Error::V1Port);
         assert_eq!(e(b"PROXY TCP4 1.2.3.4 5.6.7.8 1 123456\r\n"), Error::V1Port);
-        assert_eq!(e(&b"PROXY ".iter().copied().chain([b'x'; 101]).collect::<Vec<_>>()), Error::V1TooLong);
+        assert_eq!(
+            e(&b"PROXY "
+                .iter()
+                .copied()
+                .chain([b'x'; 101])
+                .collect::<Vec<_>>()),
+            Error::V1TooLong
+        );
         // A port of 0 is allowed.
         assert!(Header::parse(b"PROXY TCP4 1.2.3.4 5.6.7.8 0 0\r\n").is_ok());
     }
@@ -1325,14 +1541,23 @@ mod tests {
     fn v2_spec_layout() {
         let bytes = tcp4().to_bytes().unwrap();
         let mut want = V2_SIGNATURE.to_vec();
-        want.extend_from_slice(&[0x21, 0x11, 0x00, 0x0c, 192, 0, 2, 1, 198, 51, 100, 2, 0xdc, 0x04, 0x01, 0xbb]);
+        want.extend_from_slice(&[
+            0x21, 0x11, 0x00, 0x0c, 192, 0, 2, 1, 198, 51, 100, 2, 0xdc, 0x04, 0x01, 0xbb,
+        ]);
         assert_eq!(bytes, want);
         assert_eq!(Header::parse(&bytes), Ok(tcp4()));
         // Version 2 headers carry no addresses for LOCAL.
         let mut local = V2_SIGNATURE.to_vec();
         local.extend_from_slice(&[0x20, 0x00, 0x00, 0x00]);
         let h = Header::parse(&local).unwrap();
-        assert_eq!(h, Header::V2(V2 { command: Command::Local, addresses: Addresses::Unspec, tlvs: vec![] }));
+        assert_eq!(
+            h,
+            Header::V2(V2 {
+                command: Command::Local,
+                addresses: Addresses::Unspec,
+                tlvs: vec![]
+            })
+        );
         assert_eq!(h.addresses(), None);
         assert_eq!(h.to_bytes().unwrap(), local);
     }
@@ -1342,17 +1567,48 @@ mod tests {
         let tr = [Transport::Stream, Transport::Dgram];
         for (i, transport) in tr.into_iter().enumerate() {
             let fams = [
-                Addresses::Inet { transport, src: Ipv4Addr::LOCALHOST, dst: Ipv4Addr::UNSPECIFIED, src_port: 1, dst_port: 2 },
-                Addresses::Inet6 { transport, src: Ipv6Addr::LOCALHOST, dst: "2001:db8::2".parse().unwrap(), src_port: 3, dst_port: 4 },
-                Addresses::Unix { transport, src: { let mut a = [0; UNIX_ADDR_LEN]; a[..11].copy_from_slice(b"/run/a.sock"); a }, dst: [b'x'; UNIX_ADDR_LEN] },
+                Addresses::Inet {
+                    transport,
+                    src: Ipv4Addr::LOCALHOST,
+                    dst: Ipv4Addr::UNSPECIFIED,
+                    src_port: 1,
+                    dst_port: 2,
+                },
+                Addresses::Inet6 {
+                    transport,
+                    src: Ipv6Addr::LOCALHOST,
+                    dst: "2001:db8::2".parse().unwrap(),
+                    src_port: 3,
+                    dst_port: 4,
+                },
+                Addresses::Unix {
+                    transport,
+                    src: {
+                        let mut a = [0; UNIX_ADDR_LEN];
+                        a[..11].copy_from_slice(b"/run/a.sock");
+                        a
+                    },
+                    dst: [b'x'; UNIX_ADDR_LEN],
+                },
             ];
             for (f, addresses) in fams.into_iter().enumerate() {
-                let h = Header::V2(V2 { command: Command::Proxy, addresses, tlvs: vec![] });
+                let h = Header::V2(V2 {
+                    command: Command::Proxy,
+                    addresses,
+                    tlvs: vec![],
+                });
                 let bytes = h.to_bytes().unwrap();
                 assert_eq!(bytes[13], ((f as u8 + 1) << 4) | (i as u8 + 1));
-                assert_eq!(bytes.len(), V2_HEADER_LEN + [INET_BLOCK_LEN, INET6_BLOCK_LEN, UNIX_BLOCK_LEN][f]);
+                assert_eq!(
+                    bytes.len(),
+                    V2_HEADER_LEN + [INET_BLOCK_LEN, INET6_BLOCK_LEN, UNIX_BLOCK_LEN][f]
+                );
                 assert_eq!(reparses(&h), h);
-                if let Header::V2(V2 { addresses: Addresses::Unix { src, dst, .. }, .. }) = &h {
+                if let Header::V2(V2 {
+                    addresses: Addresses::Unix { src, dst, .. },
+                    ..
+                }) = &h
+                {
                     assert_eq!(unix_path(src), b"/run/a.sock");
                     assert_eq!(unix_path(dst).len(), UNIX_ADDR_LEN);
                     assert_eq!(h.addresses(), None);
@@ -1374,10 +1630,15 @@ mod tests {
                 SslTlv::Cipher(b"TLS_AES_128_GCM_SHA256".to_vec()),
                 SslTlv::SigAlg(b"SHA256".to_vec()),
                 SslTlv::KeyAlg(b"RSA2048".to_vec()),
-                SslTlv::Other { kind: 0x26, value: b"x".to_vec() },
+                SslTlv::Other {
+                    kind: 0x26,
+                    value: b"x".to_vec(),
+                },
             ],
         };
-        let Header::V2(mut v2) = tcp4() else { unreachable!() };
+        let Header::V2(mut v2) = tcp4() else {
+            unreachable!()
+        };
         v2.tlvs = vec![
             Tlv::Alpn(b"h2".to_vec()),
             Tlv::Authority(b"example.com".to_vec()),
@@ -1386,7 +1647,10 @@ mod tests {
             Tlv::UniqueId(vec![7; 16]),
             Tlv::Ssl(ssl.clone()),
             Tlv::NetNs(b"blue".to_vec()),
-            Tlv::Other { kind: 0xea, value: vec![1, 2] },
+            Tlv::Other {
+                kind: 0xea,
+                value: vec![1, 2],
+            },
         ];
         let v2 = v2.with_checksum().unwrap();
         assert!(matches!(v2.tlvs[2], Tlv::Crc32c(c) if c != 0));
@@ -1427,7 +1691,10 @@ mod tests {
         assert_eq!(with(15, 11), Err(Error::Length(11)));
         // Errors in the fixed part show before the rest arrives.
         assert_eq!(Header::parse(&with_prefix(&[0x31])), Err(Error::Version(3)));
-        assert_eq!(Header::parse(&with_prefix(&[0x21, 0x40])), Err(Error::Family(0x40)));
+        assert_eq!(
+            Header::parse(&with_prefix(&[0x21, 0x40])),
+            Err(Error::Family(0x40))
+        );
 
         let body = |tlvs: &[u8]| {
             let mut b = V2_SIGNATURE.to_vec();
@@ -1438,9 +1705,18 @@ mod tests {
         };
         assert_eq!(body(&[0x01, 0x00]), Err(Error::TlvTruncated));
         assert_eq!(body(&[0x01, 0x00, 0x02, b'h']), Err(Error::TlvTruncated));
-        assert_eq!(body(&[0x03, 0x00, 0x02, 0, 0]), Err(Error::TlvLength(tlv_type::CRC32C)));
-        assert_eq!(body(&[0x20, 0x00, 0x04, 1, 0, 0, 0]), Err(Error::TlvLength(tlv_type::SSL)));
-        assert_eq!(body(&[0x20, 0x00, 0x07, 1, 0, 0, 0, 0, 0x21, 0]), Err(Error::TlvTruncated));
+        assert_eq!(
+            body(&[0x03, 0x00, 0x02, 0, 0]),
+            Err(Error::TlvLength(tlv_type::CRC32C))
+        );
+        assert_eq!(
+            body(&[0x20, 0x00, 0x04, 1, 0, 0, 0]),
+            Err(Error::TlvLength(tlv_type::SSL))
+        );
+        assert_eq!(
+            body(&[0x20, 0x00, 0x07, 1, 0, 0, 0, 0, 0x21, 0]),
+            Err(Error::TlvTruncated)
+        );
         let mut uid = vec![0x05, 0x00, 129];
         uid.extend_from_slice(&[0; 129]);
         assert_eq!(body(&uid), Err(Error::TlvLength(tlv_type::UNIQUE_ID)));
@@ -1474,13 +1750,20 @@ mod tests {
             b.extend_from_slice(body);
             Header::parse(&b)
         };
-        let empty = Header::V2(V2 { command: Command::Local, addresses: Addresses::Unspec, tlvs: vec![] });
+        let empty = Header::V2(V2 {
+            command: Command::Local,
+            addresses: Addresses::Unspec,
+            tlvs: vec![],
+        });
         assert_eq!(local(0x45, &[1, 2, 3]), Ok(empty.clone()));
         assert_eq!(local(0x11, &[]), Ok(empty.clone()));
         assert_eq!(local(0x00, &[0x01, 0x00]), Ok(empty.clone()));
         assert_eq!(local(0x13, &[]).map(|h| reparses(&h)), Ok(empty));
         // A partial LOCAL header with a bad family still needs more.
-        assert_eq!(Header::parse(&with_prefix(&[0x20, 0x45, 0x00, 0x03, 1])), Err(Error::Truncated));
+        assert_eq!(
+            Header::parse(&with_prefix(&[0x20, 0x45, 0x00, 0x03, 1])),
+            Err(Error::Truncated)
+        );
         // A wrong checksum is still refused.
         let mut one = checksum_header(Command::Local);
         one[19] ^= 1;
@@ -1496,17 +1779,26 @@ mod tests {
         // The same header with the right checksum is accepted, as LOCAL.
         let mut right = local.clone();
         right[19..23].copy_from_slice(&0x5c5f_83afu32.to_be_bytes());
-        let empty = Header::V2(V2 { command: Command::Local, addresses: Addresses::Unspec, tlvs: vec![] });
+        let empty = Header::V2(V2 {
+            command: Command::Local,
+            addresses: Addresses::Unspec,
+            tlvs: vec![],
+        });
         assert_eq!(Header::parse(&right), Ok(empty));
         // A checksum after a TLV whose value is bad is still checked.
-        let local = with_prefix(&[0x20, 0x00, 0x00, 0x0a, 0x20, 0x00, 0x00, 0x03, 0x00, 0x04, 0, 0, 0, 0]);
+        let local = with_prefix(&[
+            0x20, 0x00, 0x00, 0x0a, 0x20, 0x00, 0x00, 0x03, 0x00, 0x04, 0, 0, 0, 0,
+        ]);
         assert_eq!(Header::parse(&local), Err(Error::Checksum));
         let mut proxy = local.clone();
         proxy[12] = 0x21;
         assert_eq!(Header::parse(&proxy), Err(Error::Checksum));
         // A CRC32C TLV that cannot be checked is refused under LOCAL too.
         let local = with_prefix(&[0x20, 0x00, 0x00, 0x05, 0x03, 0x00, 0x02, 0, 0]);
-        assert_eq!(Header::parse(&local), Err(Error::TlvLength(tlv_type::CRC32C)));
+        assert_eq!(
+            Header::parse(&local),
+            Err(Error::TlvLength(tlv_type::CRC32C))
+        );
     }
 
     #[test]
@@ -1518,10 +1810,22 @@ mod tests {
         }
         assert_eq!(ssl.len(), 65_537);
         assert_eq!(Ssl::parse(&ssl), Err(Error::TlvLength(tlv_type::SSL)));
-        assert_eq!(Tlv::from_raw(tlv_type::SSL, &ssl), Err(Error::TlvLength(tlv_type::SSL)));
-        assert_eq!(Tlv::from_raw(tlv_type::NOOP, &[0; MAX_TLV_VALUE + 1]), Err(Error::TlvLength(tlv_type::NOOP)));
-        assert_eq!(Tlv::from_raw(0xe0, &[0; MAX_TLV_VALUE + 1]), Err(Error::TlvLength(0xe0)));
-        assert_eq!(SslTlv::from_raw(0xe0, &[0; MAX_TLV_VALUE - SSL_FIXED_LEN - 2]), Err(Error::TlvLength(0xe0)));
+        assert_eq!(
+            Tlv::from_raw(tlv_type::SSL, &ssl),
+            Err(Error::TlvLength(tlv_type::SSL))
+        );
+        assert_eq!(
+            Tlv::from_raw(tlv_type::NOOP, &[0; MAX_TLV_VALUE + 1]),
+            Err(Error::TlvLength(tlv_type::NOOP))
+        );
+        assert_eq!(
+            Tlv::from_raw(0xe0, &[0; MAX_TLV_VALUE + 1]),
+            Err(Error::TlvLength(0xe0))
+        );
+        assert_eq!(
+            SslTlv::from_raw(0xe0, &[0; MAX_TLV_VALUE - SSL_FIXED_LEN - 2]),
+            Err(Error::TlvLength(0xe0))
+        );
         let sub = SslTlv::from_raw(0xe0, &[0; MAX_TLV_VALUE - SSL_FIXED_LEN - 3]).unwrap();
         assert!(sub.to_bytes().is_ok());
         contract::check_wire_value(&sub);
@@ -1529,14 +1833,21 @@ mod tests {
         ssl.truncate(MAX_TLV_VALUE - (MAX_TLV_VALUE - SSL_FIXED_LEN) % 3);
         let s = Ssl::parse(&ssl).unwrap();
         assert_eq!(s.to_bytes().unwrap(), ssl);
-        let h = Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs: vec![Tlv::Ssl(s)] });
+        let h = Header::V2(V2 {
+            command: Command::Proxy,
+            addresses: Addresses::Unspec,
+            tlvs: vec![Tlv::Ssl(s)],
+        });
         assert_eq!(reparses(&h), h);
     }
 
     #[test]
     fn v1_unknown_is_a_word() {
         assert_eq!(Header::parse(b"PROXY UNKNOWNfoo\r\n"), Err(Error::V1Syntax));
-        assert_eq!(Header::parse(b"PROXY UNKNOWN4 1.2.3.4 5.6.7.8 1 2\r\n"), Err(Error::V1Syntax));
+        assert_eq!(
+            Header::parse(b"PROXY UNKNOWN4 1.2.3.4 5.6.7.8 1 2\r\n"),
+            Err(Error::V1Syntax)
+        );
         assert!(Header::parse(b"PROXY UNKNOWN junk\r\n").is_ok());
         // The writer refuses text that would join the word.
         let h = Header::V1(V1::Unknown(b"foo".to_vec()));
@@ -1547,13 +1858,22 @@ mod tests {
     fn v2_short_length_fails_early() {
         // A PROXY header whose length cannot hold its address block fails
         // as soon as the length is read.
-        assert_eq!(Header::parse(&with_prefix(&[0x21, 0x21, 0x00, 0x0c])), Err(Error::Length(12)));
+        assert_eq!(
+            Header::parse(&with_prefix(&[0x21, 0x21, 0x00, 0x0c])),
+            Err(Error::Length(12))
+        );
     }
 
     #[test]
     fn every_truncated_prefix_needs_more() {
-        let Header::V2(mut v2) = tcp4() else { unreachable!() };
-        v2.tlvs = vec![Tlv::Ssl(Ssl { client: 1, verify: 0, tlvs: vec![SslTlv::Version(b"TLSv1.2".to_vec())] })];
+        let Header::V2(mut v2) = tcp4() else {
+            unreachable!()
+        };
+        v2.tlvs = vec![Tlv::Ssl(Ssl {
+            client: 1,
+            verify: 0,
+            tlvs: vec![SslTlv::Version(b"TLSv1.2".to_vec())],
+        })];
         let headers = [
             b"PROXY TCP4 1.2.3.4 5.6.7.8 1 2\r\n".to_vec(),
             b"PROXY UNKNOWN\r\n".to_vec(),
@@ -1564,7 +1884,11 @@ mod tests {
         ];
         for h in &headers {
             for n in 0..h.len() {
-                assert_eq!(Header::parse(&h[..n]), Err(Error::Truncated), "{n} bytes of {h:?}");
+                assert_eq!(
+                    Header::parse(&h[..n]),
+                    Err(Error::Truncated),
+                    "{n} bytes of {h:?}"
+                );
             }
             assert!(Header::parse(h).is_ok());
         }
@@ -1584,7 +1908,10 @@ mod tests {
         let mapped = v4("[::ffff:192.0.2.1]:56324");
 
         let h = Header::V1(V1::from_addrs(a, b));
-        assert_eq!(h.to_bytes().unwrap(), b"PROXY TCP4 192.0.2.1 198.51.100.2 56324 443\r\n");
+        assert_eq!(
+            h.to_bytes().unwrap(),
+            b"PROXY TCP4 192.0.2.1 198.51.100.2 56324 443\r\n"
+        );
         assert_eq!(h.addresses(), Some((a, b)));
         let h = Header::V1(V1::from_addrs(c, d));
         assert_eq!(reparses(&h).addresses(), Some((c, d)));
@@ -1594,44 +1921,121 @@ mod tests {
 
         for transport in [Transport::Stream, Transport::Dgram] {
             for (s, t, want) in [(a, b, (a, b)), (c, d, (c, d)), (a, d, (mapped, d))] {
-                let h = Header::V2(V2 { command: Command::Proxy, addresses: Addresses::from_addrs(transport, s, t), tlvs: vec![] });
+                let h = Header::V2(V2 {
+                    command: Command::Proxy,
+                    addresses: Addresses::from_addrs(transport, s, t),
+                    tlvs: vec![],
+                });
                 assert_eq!(reparses(&h).addresses(), Some(want));
             }
         }
         // A scope ID or flow label is not part of the header.
-        let scoped = SocketAddr::V6(std::net::SocketAddrV6::new("fe80::1".parse().unwrap(), 9, 7, 3));
-        let Header::V1(back) = reparses(&Header::V1(V1::from_addrs(scoped, d))) else { panic!() };
-        assert_eq!(back, V1::Tcp6 { src: "fe80::1".parse().unwrap(), dst: "2001:db8::2".parse().unwrap(), src_port: 9, dst_port: 2 });
+        let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            9,
+            7,
+            3,
+        ));
+        let Header::V1(back) = reparses(&Header::V1(V1::from_addrs(scoped, d))) else {
+            panic!()
+        };
+        assert_eq!(
+            back,
+            V1::Tcp6 {
+                src: "fe80::1".parse().unwrap(),
+                dst: "2001:db8::2".parse().unwrap(),
+                src_port: 9,
+                dst_port: 2
+            }
+        );
     }
 
     fn checksum_header(command: Command) -> Vec<u8> {
-        V2 { command, addresses: Addresses::Unspec, tlvs: vec![] }
-            .with_checksum().unwrap().to_bytes().unwrap()
+        V2 {
+            command,
+            addresses: Addresses::Unspec,
+            tlvs: vec![],
+        }
+        .with_checksum()
+        .unwrap()
+        .to_bytes()
+        .unwrap()
     }
-
 
     #[test]
     fn strict_writers_preserve_every_field() {
-        for rest in [b" a\nb".to_vec(), vec![b' '; V1_MAX_UNKNOWN_REST + 1], b"foo".to_vec()] {
-            assert_eq!(contract::check_refused(&Header::V1(V1::Unknown(rest))), Error::Unwritable);
+        for rest in [
+            b" a\nb".to_vec(),
+            vec![b' '; V1_MAX_UNKNOWN_REST + 1],
+            b"foo".to_vec(),
+        ] {
+            assert_eq!(
+                contract::check_refused(&Header::V1(V1::Unknown(rest))),
+                Error::Unwritable
+            );
         }
         for rest in [b" \r".to_vec(), vec![b' '; V1_MAX_UNKNOWN_REST]] {
             let header = Header::V1(V1::Unknown(rest));
             assert!(header.to_bytes().is_ok());
             contract::check_wire_value(&header);
         }
-        for tlv in [Tlv::UniqueId(vec![5; MAX_UNIQUE_ID + 1]), Tlv::Noop(vec![0; MAX_TLV_VALUE + 1]),
-            Tlv::Other { kind: tlv_type::CRC32C, value: vec![1, 2, 3] },
-            Tlv::Other { kind: tlv_type::ALPN, value: b"h2".to_vec() },
-            Tlv::Other { kind: tlv_type::SSL, value: vec![] },
-            Tlv::Ssl(Ssl { client: 0, verify: 1, tlvs: vec![SslTlv::Cipher(vec![3; 70_000])] }),
-            Tlv::Ssl(Ssl { client: 0, verify: 1, tlvs: vec![SslTlv::Other { kind: tlv_type::SSL_CN, value: vec![] }] })] {
-            assert_eq!(contract::check_refused(&Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs: vec![tlv] })), Error::Unwritable);
+        for tlv in [
+            Tlv::UniqueId(vec![5; MAX_UNIQUE_ID + 1]),
+            Tlv::Noop(vec![0; MAX_TLV_VALUE + 1]),
+            Tlv::Other {
+                kind: tlv_type::CRC32C,
+                value: vec![1, 2, 3],
+            },
+            Tlv::Other {
+                kind: tlv_type::ALPN,
+                value: b"h2".to_vec(),
+            },
+            Tlv::Other {
+                kind: tlv_type::SSL,
+                value: vec![],
+            },
+            Tlv::Ssl(Ssl {
+                client: 0,
+                verify: 1,
+                tlvs: vec![SslTlv::Cipher(vec![3; 70_000])],
+            }),
+            Tlv::Ssl(Ssl {
+                client: 0,
+                verify: 1,
+                tlvs: vec![SslTlv::Other {
+                    kind: tlv_type::SSL_CN,
+                    value: vec![],
+                }],
+            }),
+        ] {
+            assert_eq!(
+                contract::check_refused(&Header::V2(V2 {
+                    command: Command::Proxy,
+                    addresses: Addresses::Unspec,
+                    tlvs: vec![tlv]
+                })),
+                Error::Unwritable
+            );
         }
-        for tlvs in [vec![Tlv::Noop(vec![0; 40_000]); 2], vec![Tlv::Crc32c(0); 2], vec![Tlv::Crc32c(0)]] {
-            assert_eq!(contract::check_refused(&Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs })), Error::Unwritable);
+        for tlvs in [
+            vec![Tlv::Noop(vec![0; 40_000]); 2],
+            vec![Tlv::Crc32c(0); 2],
+            vec![Tlv::Crc32c(0)],
+        ] {
+            assert_eq!(
+                contract::check_refused(&Header::V2(V2 {
+                    command: Command::Proxy,
+                    addresses: Addresses::Unspec,
+                    tlvs
+                })),
+                Error::Unwritable
+            );
         }
-        let h = Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs: vec![Tlv::Noop(vec![0; MAX_TLV_VALUE])] });
+        let h = Header::V2(V2 {
+            command: Command::Proxy,
+            addresses: Addresses::Unspec,
+            tlvs: vec![Tlv::Noop(vec![0; MAX_TLV_VALUE])],
+        });
         let bytes = h.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_HEADER_LEN);
         assert_eq!(Header::parse(&bytes), Ok(h.clone()));
@@ -1657,7 +2061,12 @@ mod tests {
         assert_eq!(s.push(b"PRO"), 3);
         assert_eq!(s.next(), None);
         assert_eq!(s.push(b"BE x"), 4);
-        assert_eq!(s.next(), Some(Err(codec::Fail::Protocol(FrameError::Protocol(Error::NotProxy)))));
+        assert_eq!(
+            s.next(),
+            Some(Err(codec::Fail::Protocol(FrameError::Protocol(
+                Error::NotProxy
+            ))))
+        );
         assert_eq!(s.next(), None);
         assert_eq!(s.into_parts().0.unread(), b"PROBE x");
         // A payload beyond capacity remains with the caller, without copying or loss.
@@ -1668,13 +2077,20 @@ mod tests {
         assert_eq!(accepted, MAX_HEADER_LEN);
         s.next().unwrap().unwrap().unwrap();
         let (buffer, _) = s.into_parts();
-        assert_eq!([buffer.unread(), &bytes[accepted..]].concat(), vec![7; MAX_HEADER_LEN + 10]);
+        assert_eq!(
+            [buffer.unread(), &bytes[accepted..]].concat(),
+            vec![7; MAX_HEADER_LEN + 10]
+        );
     }
 
     #[test]
     fn checksums_are_constructed_without_changing_other_fields() {
         for command in [Command::Local, Command::Proxy] {
-            let header = V2 { command, addresses: Addresses::Unspec, tlvs: vec![Tlv::Alpn(b"h2".to_vec())] };
+            let header = V2 {
+                command,
+                addresses: Addresses::Unspec,
+                tlvs: vec![Tlv::Alpn(b"h2".to_vec())],
+            };
             let checked = header.clone().with_checksum().unwrap();
             assert_eq!(checked.tlvs[..1], header.tlvs);
             assert_eq!(checked.tlvs.len(), 2);
@@ -1691,81 +2107,159 @@ mod tests {
             vec![Tlv::Crc32c(0); 2],
             vec![Tlv::Noop(vec![0; MAX_TLV_VALUE])],
             vec![Tlv::UniqueId(vec![0; MAX_UNIQUE_ID + 1])],
-            vec![Tlv::Other { kind: tlv_type::ALPN, value: vec![] }],
-            vec![Tlv::Ssl(Ssl { client: 0, verify: 0, tlvs: vec![SslTlv::Other { kind: tlv_type::SSL_CN, value: vec![] }] })],
+            vec![Tlv::Other {
+                kind: tlv_type::ALPN,
+                value: vec![],
+            }],
+            vec![Tlv::Ssl(Ssl {
+                client: 0,
+                verify: 0,
+                tlvs: vec![SslTlv::Other {
+                    kind: tlv_type::SSL_CN,
+                    value: vec![],
+                }],
+            })],
         ] {
-            let header = V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs };
+            let header = V2 {
+                command: Command::Proxy,
+                addresses: Addresses::Unspec,
+                tlvs,
+            };
             assert_eq!(header.with_checksum(), Err(Error::Unwritable));
         }
-        let longest = V2 { command: Command::Proxy, addresses: Addresses::Unspec,
-            tlvs: vec![Tlv::Noop(vec![0; MAX_TLV_VALUE - 7])] }.with_checksum().unwrap();
+        let longest = V2 {
+            command: Command::Proxy,
+            addresses: Addresses::Unspec,
+            tlvs: vec![Tlv::Noop(vec![0; MAX_TLV_VALUE - 7])],
+        }
+        .with_checksum()
+        .unwrap();
         assert_eq!(longest.to_bytes().unwrap().len(), V2_MAX_LEN);
         contract::check_wire_value(&longest);
     }
 
     #[test]
     fn exact_version_readers_report_the_other_version() {
-        assert_eq!(V1::parse(&tcp4().to_bytes().unwrap()), Err(Error::WrongVersion));
+        assert_eq!(
+            V1::parse(&tcp4().to_bytes().unwrap()),
+            Err(Error::WrongVersion)
+        );
         assert_eq!(V2::parse(b"PROXY UNKNOWN\r\n"), Err(Error::WrongVersion));
-        assert_eq!(Error::WrongVersion.to_string(), "PROXY header has the wrong version");
+        assert_eq!(
+            Error::WrongVersion.to_string(),
+            "PROXY header has the wrong version"
+        );
     }
 
     #[test]
     fn longest_header_byte_at_a_time_is_bounded() {
-        assert_linear("longest_header_byte_at_a_time_is_bounded", MAX_TLV_VALUE / 4, |size| {
-            let header = V2 { command: Command::Proxy, addresses: Addresses::Unspec,
-                tlvs: vec![Tlv::Noop(vec![0; size])] };
-            let bytes = header.to_bytes().unwrap();
-            let mut stream = Stream::new(Headers::new());
-            for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
-                assert_eq!(stream.push(chunk), 1);
-                if i + 1 < bytes.len() { assert_eq!(stream.next(), None); }
-                assert!(stream.buffered() <= MAX_HEADER_LEN);
-            }
-            assert_eq!(stream.next(), Some(Ok(Ok(Header::V2(header)))));
-            assert_eq!(stream.buffered(), 0);
-        });
+        assert_linear(
+            "longest_header_byte_at_a_time_is_bounded",
+            MAX_TLV_VALUE / 4,
+            |size| {
+                let header = V2 {
+                    command: Command::Proxy,
+                    addresses: Addresses::Unspec,
+                    tlvs: vec![Tlv::Noop(vec![0; size])],
+                };
+                let bytes = header.to_bytes().unwrap();
+                let mut stream = Stream::new(Headers::new());
+                for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
+                    assert_eq!(stream.push(chunk), 1);
+                    if i + 1 < bytes.len() {
+                        assert_eq!(stream.next(), None);
+                    }
+                    assert!(stream.buffered() <= MAX_HEADER_LEN);
+                }
+                assert_eq!(stream.next(), Some(Ok(Ok(Header::V2(header)))));
+                assert_eq!(stream.buffered(), 0);
+            },
+        );
     }
 
     fn random_v2(rng: &mut Lcg) -> V2 {
-        let transport = if rng.coin() { Transport::Stream } else { Transport::Dgram };
+        let transport = if rng.coin() {
+            Transport::Stream
+        } else {
+            Transport::Dgram
+        };
         let addresses = match rng.index(4) {
             0 => Addresses::Unspec,
-            1 => Addresses::Inet { transport, src: Ipv4Addr::from(rng.next() as u32),
-                dst: Ipv4Addr::from(rng.next() as u32), src_port: rng.next() as u16, dst_port: rng.next() as u16 },
-            2 => Addresses::Inet6 { transport, src: Ipv6Addr::from(u128::from(rng.next())),
-                dst: Ipv6Addr::from(u128::from(rng.next()) << 96), src_port: rng.next() as u16, dst_port: rng.next() as u16 },
+            1 => Addresses::Inet {
+                transport,
+                src: Ipv4Addr::from(rng.next() as u32),
+                dst: Ipv4Addr::from(rng.next() as u32),
+                src_port: rng.next() as u16,
+                dst_port: rng.next() as u16,
+            },
+            2 => Addresses::Inet6 {
+                transport,
+                src: Ipv6Addr::from(u128::from(rng.next())),
+                dst: Ipv6Addr::from(u128::from(rng.next()) << 96),
+                src_port: rng.next() as u16,
+                dst_port: rng.next() as u16,
+            },
             _ => {
                 let mut src = [0; UNIX_ADDR_LEN];
                 let mut dst = [0; UNIX_ADDR_LEN];
                 rng.fill(&mut src);
                 rng.fill(&mut dst);
-                Addresses::Unix { transport, src, dst }
+                Addresses::Unix {
+                    transport,
+                    src,
+                    dst,
+                }
             }
         };
-        let tlvs = (0..rng.index(6)).map(|_| {
-            let value = rng.bytes(40);
-            match rng.index(9) {
-                0 => Tlv::Alpn(value),
-                1 => Tlv::Authority(value),
-                2 => Tlv::Crc32c(rng.next() as u32),
-                3 => Tlv::Noop(value),
-                4 => Tlv::UniqueId(value),
-                5 => Tlv::Ssl(Ssl { client: rng.next() as u8, verify: rng.next() as u32,
-                    tlvs: (0..rng.index(8)).map(|_| SslTlv::from_raw(0x20 + rng.index(8) as u8, &value).unwrap()).collect() }),
-                6 => Tlv::NetNs(value),
-                _ => Tlv::Other { kind: rng.next() as u8, value },
-            }
-        }).collect();
-        V2 { command: if rng.coin() { Command::Local } else { Command::Proxy }, addresses, tlvs }
+        let tlvs = (0..rng.index(6))
+            .map(|_| {
+                let value = rng.bytes(40);
+                match rng.index(9) {
+                    0 => Tlv::Alpn(value),
+                    1 => Tlv::Authority(value),
+                    2 => Tlv::Crc32c(rng.next() as u32),
+                    3 => Tlv::Noop(value),
+                    4 => Tlv::UniqueId(value),
+                    5 => Tlv::Ssl(Ssl {
+                        client: rng.next() as u8,
+                        verify: rng.next() as u32,
+                        tlvs: (0..rng.index(8))
+                            .map(|_| SslTlv::from_raw(0x20 + rng.index(8) as u8, &value).unwrap())
+                            .collect(),
+                    }),
+                    6 => Tlv::NetNs(value),
+                    _ => Tlv::Other {
+                        kind: rng.next() as u8,
+                        value,
+                    },
+                }
+            })
+            .collect();
+        V2 {
+            command: if rng.coin() {
+                Command::Local
+            } else {
+                Command::Proxy
+            },
+            addresses,
+            tlvs,
+        }
     }
 
     #[test]
     fn generated_contracts() {
         let mut rng = Lcg::new(0x5eed);
-        let seeds = [tcp4().to_bytes().unwrap(), b"PROXY UNKNOWN text\r\n".to_vec(), checksum_header(Command::Proxy)];
+        let seeds = [
+            tcp4().to_bytes().unwrap(),
+            b"PROXY UNKNOWN text\r\n".to_vec(),
+            checksum_header(Command::Proxy),
+        ];
         for _ in 0..512 {
-            let mut bytes = if rng.coin() { seeds[rng.index(seeds.len())].clone() } else { rng.bytes(80) };
+            let mut bytes = if rng.coin() {
+                seeds[rng.index(seeds.len())].clone()
+            } else {
+                rng.bytes(80)
+            };
             mutate(&mut rng, &mut bytes);
             contract::check_decode_with_alloc_limit(Headers::new, &bytes, 2 * MAX_HEADER_LEN);
             contract::check_wire::<Header>(&bytes);
@@ -1775,7 +2269,10 @@ mod tests {
             contract::check_wire::<Ssl>(&bytes);
             contract::check_wire::<SslTlv>(&bytes);
             contract::check_wire_value(&Header::V1(V1::Unknown(rng.text(120).into_bytes())));
-            contract::check_wire_value(&Tlv::Other { kind: rng.next() as u8, value: rng.bytes(40) });
+            contract::check_wire_value(&Tlv::Other {
+                kind: rng.next() as u8,
+                value: rng.bytes(40),
+            });
             let header = random_v2(&mut rng);
             contract::check_wire_value(&header);
             if let Ok(header) = header.with_checksum() {

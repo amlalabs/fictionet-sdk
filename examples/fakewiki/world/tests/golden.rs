@@ -69,23 +69,29 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAll {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
 fn client_config(alpn: &[u8]) -> Arc<ClientConfig> {
-    let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAll))
-        .with_no_client_auth();
+    let mut config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAll))
+            .with_no_client_auth();
     config.alpn_protocols = vec![alpn.to_vec()];
     Arc::new(config)
 }
 
 async fn lookup(fcx: &Cx, m: &Machine, name: &str, kind: RecordType) {
-    let mut socket = m.udp.bind(40000 + (fcx.random_u64() % 20000) as u16).unwrap();
+    let mut socket = m
+        .udp
+        .bind(40000 + (fcx.random_u64() % 20000) as u16)
+        .unwrap();
     let mut q = Message::query();
     q.metadata.id = fcx.random_u64() as u16;
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
@@ -98,7 +104,9 @@ async fn get<IO>(io: IO, method: &str, host: &str, path: &str) -> u16
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io)).await.unwrap();
+    let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
+        .await
+        .unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -115,10 +123,24 @@ where
     status
 }
 
-async fn tls(fcx: &Cx, m: &Machine, addr: Ipv4Addr, sni: &str) -> std::io::Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> {
-    let conn = m.tcp.connect(fcx, SocketAddr::new(addr.into(), 443)).await.map_err(std::io::Error::other)?;
+async fn tls(
+    fcx: &Cx,
+    m: &Machine,
+    addr: Ipv4Addr,
+    sni: &str,
+) -> std::io::Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> {
+    let conn = m
+        .tcp
+        .connect(fcx, SocketAddr::new(addr.into(), 443))
+        .await
+        .map_err(std::io::Error::other)?;
     let connector = tokio_rustls::TlsConnector::from(client_config(b"http/1.1"));
-    connector.connect(ServerName::try_from(sni.to_owned()).unwrap(), conn.into_tokio(fcx)).await
+    connector
+        .connect(
+            ServerName::try_from(sni.to_owned()).unwrap(),
+            conn.into_tokio(fcx),
+        )
+        .await
 }
 
 /// A CA in a fresh directory, as `ca.py` leaves it: `ca.pem` and `ca.key`.
@@ -127,7 +149,9 @@ fn ca_dir() -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    params.distinguished_name.push(rcgen::DnType::CommonName, "FakeWiki Test CA");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "FakeWiki Test CA");
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = params.self_signed(&key).unwrap();
     std::fs::write(dir.join("ca.pem"), cert.pem()).unwrap();
@@ -138,9 +162,14 @@ fn ca_dir() -> PathBuf {
 #[test]
 fn the_log_is_the_recorded_one() {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let state_dir = std::env::temp_dir().join(format!("fakewiki-golden-state-{}", std::process::id()));
+    let state_dir =
+        std::env::temp_dir().join(format!("fakewiki-golden-state-{}", std::process::id()));
     std::fs::create_dir_all(&state_dir).unwrap();
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
     // SAFETY: set before any thread of this test process reads the environment.
     unsafe {
         std::env::set_var("FAKEWIKI_CORPUS", here.join("../fixtures/corpus.json"));
@@ -157,17 +186,28 @@ fn the_log_is_the_recorded_one() {
     let (backend, mut child) = start_backend(&args).unwrap();
     let mut hosts = HashMap::new();
     for (name, ip) in backend["hosts"].as_object().unwrap() {
-        hosts.insert(name.clone(), ip.as_str().unwrap().parse::<Ipv4Addr>().unwrap());
+        hosts.insert(
+            name.clone(),
+            ip.as_str().unwrap().parse::<Ipv4Addr>().unwrap(),
+        );
     }
-    let documents: Vec<String> =
-        backend["documents"].as_array().unwrap().iter().map(|d| d["url"].as_str().unwrap().to_owned()).collect();
+    let documents: Vec<String> = backend["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["url"].as_str().unwrap().to_owned())
+        .collect();
     let log_path = state_dir.join("log.jsonl");
     let log = Arc::new(Log::create(&log_path).unwrap());
     let leaves = issue_leaves(&args.ca_dir, hosts.keys()).unwrap();
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
         let result = rt.block_on(fictionet::run(move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             let host_list: Vec<String> = hosts.keys().cloned().collect();
@@ -176,7 +216,11 @@ fn the_log_is_the_recorded_one() {
 
             let end = attacher.attach("agent").unwrap();
             let (t, u, i, _other) = ip::split_protocols(&fcx, end);
-            let m = Machine { tcp: tcp::endpoint(&fcx, t, ME.into()), udp: udp::endpoint(&fcx, u, ME.into()), _icmp: i };
+            let m = Machine {
+                tcp: tcp::endpoint(&fcx, t, ME.into()),
+                udp: udp::endpoint(&fcx, u, ME.into()),
+                _icmp: i,
+            };
             let wiki = hosts["en.wikipedia.org"];
             lookup(&fcx, &m, "en.wikipedia.org", RecordType::A).await;
             lookup(&fcx, &m, "en.wikipedia.org", RecordType::AAAA).await;
@@ -197,8 +241,15 @@ fn the_log_is_the_recorded_one() {
             let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
             assert_eq!(get(stream, "GET", "www.gov.uk", "/").await, 421);
             // Plain HTTP: a redirect.
-            let conn = m.tcp.connect(&fcx, SocketAddr::new(IpAddr::V4(wiki), 80)).await.unwrap();
-            assert_eq!(get(conn.into_tokio(&fcx), "GET", "en.wikipedia.org", "/wiki/X").await, 301);
+            let conn = m
+                .tcp
+                .connect(&fcx, SocketAddr::new(IpAddr::V4(wiki), 80))
+                .await
+                .unwrap();
+            assert_eq!(
+                get(conn.into_tokio(&fcx), "GET", "en.wikipedia.org", "/wiki/X").await,
+                301
+            );
             // A name the world does not serve.
             assert!(tls(&fcx, &m, wiki, "example.com").await.is_err());
             let _ = fcx.sleep(Duration::from_millis(500)).await;
@@ -231,10 +282,18 @@ fn the_log_is_the_recorded_one() {
     let want: Vec<&str> = want.lines().collect();
     let got: Vec<&str> = got.iter().map(String::as_str).collect();
     for line in &want {
-        assert!(got.contains(line), "missing from the log now: {line}\n\nthe log now:\n{}", got.join("\n"));
+        assert!(
+            got.contains(line),
+            "missing from the log now: {line}\n\nthe log now:\n{}",
+            got.join("\n")
+        );
     }
     for line in &got {
-        assert!(want.contains(line), "new in the log: {line}\n\nrecorded:\n{}", want.join("\n"));
+        assert!(
+            want.contains(line),
+            "new in the log: {line}\n\nrecorded:\n{}",
+            want.join("\n")
+        );
     }
     assert_eq!(got, want);
 }

@@ -7,8 +7,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use arbitrary::Arbitrary;
-use fictionet::stdlib::dhcp;
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::dhcp;
 use fictionet::stdlib::dns::op::{Message, Query};
 use fictionet::stdlib::dns::rr::{Name, RecordType};
 use fictionet::{Interface, Packet};
@@ -26,17 +26,43 @@ enum Step {
     /// A UDP datagram to the gateway's DNS server, any bytes.
     DnsBytes(Vec<u8>),
     /// A well-formed query for one of the world's names.
-    DnsQuery { name: u8, qtype: u16, id: u16, edns: bool },
+    DnsQuery {
+        name: u8,
+        qtype: u16,
+        id: u16,
+        edns: bool,
+    },
     /// A DHCP message from 0.0.0.0, any bytes after a valid start.
-    Dhcp { kind: u8, xid: u32, requested: Option<u8>, ciaddr: Option<u8>, server: Option<u8>, extra: Vec<u8> },
+    Dhcp {
+        kind: u8,
+        xid: u32,
+        requested: Option<u8>,
+        ciaddr: Option<u8>,
+        server: Option<u8>,
+        extra: Vec<u8>,
+    },
     /// A TCP segment to the gateway or a site.
-    Tcp { to: u8, sport: u8, dport: u8, seq: u32, ack: u32, flags: u8, data: Vec<u8> },
+    Tcp {
+        to: u8,
+        sport: u8,
+        dport: u8,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        data: Vec<u8>,
+    },
     /// Let the world run.
     Pump(u8),
 }
 
 fn dst(to: u8) -> Ipv4Addr {
-    [GATEWAY, SITE_ADDR, DEFAULT_ADDR, Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(10, 0, 0, 3)][to as usize % 5]
+    [
+        GATEWAY,
+        SITE_ADDR,
+        DEFAULT_ADDR,
+        Ipv4Addr::new(198, 18, 0, 1),
+        Ipv4Addr::new(10, 0, 0, 3),
+    ][to as usize % 5]
 }
 
 fuzz_target!(|steps: Vec<Step>| {
@@ -53,17 +79,30 @@ fuzz_target!(|steps: Vec<Step>| {
                     bytes
                 }
                 Step::DnsBytes(b) => udp_packet(me, 5353, GATEWAY.into(), 53, &b),
-                Step::DnsQuery { name, qtype, id, edns } => {
+                Step::DnsQuery {
+                    name,
+                    qtype,
+                    id,
+                    edns,
+                } => {
                     let mut m = Message::query();
                     m.metadata.id = id;
-                    let n = Name::from_ascii(format!("{}.", NAMES[name as usize % NAMES.len()])).unwrap();
+                    let n = Name::from_ascii(format!("{}.", NAMES[name as usize % NAMES.len()]))
+                        .unwrap();
                     m.add_query(Query::query(n, RecordType::from(qtype)));
                     if edns {
                         m.edns = Some(Default::default());
                     }
                     udp_packet(me, 5353, GATEWAY.into(), 53, &m.to_vec().unwrap())
                 }
-                Step::Dhcp { kind, xid, requested, ciaddr, server, extra } => {
+                Step::Dhcp {
+                    kind,
+                    xid,
+                    requested,
+                    ciaddr,
+                    server,
+                    extra,
+                } => {
                     let mut m = dhcp::Message::new(dhcp::BOOTREQUEST, xid);
                     m.push(dhcp::opt::MESSAGE_TYPE, [kind % 9]);
                     if let Some(r) = requested {
@@ -82,10 +121,22 @@ fuzz_target!(|steps: Vec<Step>| {
                     b.truncate(end);
                     b.extend_from_slice(&extra);
                     b.push(dhcp::opt::END);
-                    let src = if ciaddr.is_some() { m.ciaddr } else { Ipv4Addr::UNSPECIFIED };
+                    let src = if ciaddr.is_some() {
+                        m.ciaddr
+                    } else {
+                        Ipv4Addr::UNSPECIFIED
+                    };
                     udp_packet(src.into(), 68, Ipv4Addr::BROADCAST.into(), 67, &b)
                 }
-                Step::Tcp { to, sport, dport, seq, ack, flags, data } => {
+                Step::Tcp {
+                    to,
+                    sport,
+                    dport,
+                    seq,
+                    ack,
+                    flags,
+                    data,
+                } => {
                     let dport = [53, 80, 443, 22][dport as usize % 4];
                     let seg = Segment {
                         sport: 40000 + (sport % 8) as u16,
@@ -102,7 +153,10 @@ fuzz_target!(|steps: Vec<Step>| {
                 }
                 Step::Pump(n) => {
                     settle(&fcx, 1 + n as usize % 16).await;
-                    while let Some(Ok(_)) = poll_once(fictionet::InterfaceExt::recv(&mut end, &fcx)).await {}
+                    while let Some(Ok(_)) =
+                        poll_once(fictionet::InterfaceExt::recv(&mut end, &fcx)).await
+                    {
+                    }
                     continue;
                 }
             };

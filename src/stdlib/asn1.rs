@@ -234,8 +234,12 @@ impl fmt::Display for Error {
             }
             Error::Empty => f.write_str("no more elements"),
             Error::Trailing => f.write_str("bytes after the last element"),
-            Error::Primitive => f.write_str("primitive element where a constructed one was expected"),
-            Error::Constructed => f.write_str("constructed element where a primitive one was expected"),
+            Error::Primitive => {
+                f.write_str("primitive element where a constructed one was expected")
+            }
+            Error::Constructed => {
+                f.write_str("constructed element where a primitive one was expected")
+            }
             Error::Boolean => f.write_str("malformed boolean"),
             Error::Integer => f.write_str("malformed or out-of-range integer"),
             Error::Null => f.write_str("null with contents"),
@@ -343,27 +347,47 @@ impl Tag {
 impl Tag {
     /// A primitive universal tag.
     pub const fn universal(number: u32) -> Tag {
-        Tag { class: Class::Universal, constructed: false, number }
+        Tag {
+            class: Class::Universal,
+            constructed: false,
+            number,
+        }
     }
 
     /// A primitive application tag, `[APPLICATION number]`.
     pub const fn application(number: u32) -> Tag {
-        Tag { class: Class::Application, constructed: false, number }
+        Tag {
+            class: Class::Application,
+            constructed: false,
+            number,
+        }
     }
 
     /// A primitive context-specific tag, `[number]`.
     pub const fn context(number: u32) -> Tag {
-        Tag { class: Class::ContextSpecific, constructed: false, number }
+        Tag {
+            class: Class::ContextSpecific,
+            constructed: false,
+            number,
+        }
     }
 
     /// A primitive private tag, `[PRIVATE number]`.
     pub const fn private(number: u32) -> Tag {
-        Tag { class: Class::Private, constructed: false, number }
+        Tag {
+            class: Class::Private,
+            constructed: false,
+            number,
+        }
     }
 
     /// The same tag in constructed form.
     pub const fn as_constructed(self) -> Tag {
-        Tag { class: self.class, constructed: true, number: self.number }
+        Tag {
+            class: self.class,
+            constructed: true,
+            number: self.number,
+        }
     }
 
     /// Whether two tags have the same class and number, in either form.
@@ -492,7 +516,14 @@ fn read_tag(b: &[u8], start: usize) -> Result<(Tag, usize), Error> {
             return Err(Error::Tag);
         }
     }
-    Ok((Tag { class, constructed, number }, i))
+    Ok((
+        Tag {
+            class,
+            constructed,
+            number,
+        },
+        i,
+    ))
 }
 
 /// The header at `b[start..]`, with `len` counted from `start`.
@@ -532,7 +563,11 @@ fn read_header(b: &[u8], start: usize, rules: Rules) -> Result<Header, Error> {
             Length::Definite(v as usize)
         }
     };
-    Ok(Header { tag, length, len: i - start })
+    Ok(Header {
+        tag,
+        length,
+        len: i - start,
+    })
 }
 
 fn is_eoc_tag(tag: Tag) -> bool {
@@ -554,7 +589,15 @@ fn extent(b: &[u8], rules: Rules, depth: usize) -> Result<(Header, usize, usize)
             if depth >= MAX_DEPTH {
                 return Err(Error::TooDeep);
             }
-            return match scan(b, rules, depth, Scan { pos: h.len, open: 1 })? {
+            return match scan(
+                b,
+                rules,
+                depth,
+                Scan {
+                    pos: h.len,
+                    open: 1,
+                },
+            )? {
                 Ok((eoc, end)) => Ok((h, eoc, end)),
                 Err(_) => Err(Error::Truncated),
             };
@@ -575,7 +618,12 @@ struct Scan {
 /// Follows an indefinite length in `b`, from `at`, to its end-of-contents
 /// marker. It returns where the marker starts and where the element ends,
 /// or, if `b` ends first, where to go on from once more bytes come.
-fn scan(b: &[u8], rules: Rules, depth: usize, at: Scan) -> Result<Result<(usize, usize), Scan>, Error> {
+fn scan(
+    b: &[u8],
+    rules: Rules,
+    depth: usize,
+    at: Scan,
+) -> Result<Result<(usize, usize), Scan>, Error> {
     let Scan { mut pos, mut open } = at;
     loop {
         let here = Scan { pos, open };
@@ -710,7 +758,10 @@ pub struct Elements {
 impl Elements {
     /// Creates an element decoder using `rules` and [`MAX_INPUT`].
     pub fn new(rules: Rules) -> Self {
-        Self { rules, resume: None }
+        Self {
+            rules,
+            resume: None,
+        }
     }
 
     /// The encoding rules used to frame elements.
@@ -732,7 +783,10 @@ impl Decode for Elements {
         let at = match self.resume {
             Some(at) => Some(at),
             None => match read_header(input, 0, self.rules) {
-                Ok(h) if h.length == Length::Indefinite && !is_eoc_tag(h.tag) => Some(Scan { pos: h.len, open: 1 }),
+                Ok(h) if h.length == Length::Indefinite && !is_eoc_tag(h.tag) => Some(Scan {
+                    pos: h.len,
+                    open: 1,
+                }),
                 _ => None,
             },
         };
@@ -808,7 +862,11 @@ impl<'a> Element<'a> {
         if self.depth >= MAX_DEPTH {
             return Err(Error::TooDeep);
         }
-        Ok(Reader { rest: self.contents, rules: self.rules, depth: self.depth + 1 })
+        Ok(Reader {
+            rest: self.contents,
+            rules: self.rules,
+            depth: self.depth + 1,
+        })
     }
 
     /// A reader over a SET's children. Under DER it checks first that
@@ -850,7 +908,11 @@ impl<'a> Element<'a> {
     }
 
     fn primitive(&self) -> Result<&'a [u8], Error> {
-        if self.tag.constructed { Err(Error::Constructed) } else { Ok(self.contents) }
+        if self.tag.constructed {
+            Err(Error::Constructed)
+        } else {
+            Ok(self.contents)
+        }
     }
 
     /// The contents as a BOOLEAN. BER takes any nonzero byte as TRUE; DER
@@ -871,7 +933,11 @@ impl<'a> Element<'a> {
 
     /// Checks the contents are a NULL: none at all.
     pub fn null(&self) -> Result<(), Error> {
-        if self.primitive()?.is_empty() { Ok(()) } else { Err(Error::Null) }
+        if self.primitive()?.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Null)
+        }
     }
 
     /// The contents as an OBJECT IDENTIFIER.
@@ -900,7 +966,10 @@ impl<'a> Element<'a> {
         for child in self.reader()? {
             let child = child?;
             if !child.tag.same_type(Tag::OCTET_STRING) {
-                return Err(Error::Unexpected { expected: Tag::OCTET_STRING, found: child.tag });
+                return Err(Error::Unexpected {
+                    expected: Tag::OCTET_STRING,
+                    found: child.tag,
+                });
             }
             if child.tag.constructed {
                 child.append_segments(out)?;
@@ -917,7 +986,10 @@ impl<'a> Element<'a> {
     pub fn bit_string(&self) -> Result<BitString<'a>, Error> {
         if !self.tag.constructed {
             let (unused, bytes) = bit_segment(self.contents, self.rules)?;
-            return Ok(BitString { unused, bytes: Cow::Borrowed(bytes) });
+            return Ok(BitString {
+                unused,
+                bytes: Cow::Borrowed(bytes),
+            });
         }
         if self.rules == Rules::Der {
             return Err(Error::Constructed);
@@ -925,14 +997,20 @@ impl<'a> Element<'a> {
         let mut out = Vec::new();
         let mut unused = 0;
         self.append_bit_segments(&mut out, &mut unused)?;
-        Ok(BitString { unused, bytes: Cow::Owned(out) })
+        Ok(BitString {
+            unused,
+            bytes: Cow::Owned(out),
+        })
     }
 
     fn append_bit_segments(&self, out: &mut Vec<u8>, unused: &mut u8) -> Result<(), Error> {
         for child in self.reader()? {
             let child = child?;
             if !child.tag.same_type(Tag::BIT_STRING) {
-                return Err(Error::Unexpected { expected: Tag::BIT_STRING, found: child.tag });
+                return Err(Error::Unexpected {
+                    expected: Tag::BIT_STRING,
+                    found: child.tag,
+                });
             }
             // Only the last segment may leave bits unused (8.6.4). Any
             // segment after one that did is refused, even an empty
@@ -1000,7 +1078,10 @@ fn bit_segment(contents: &[u8], rules: Rules) -> Result<(u8, &[u8]), Error> {
 /// the shorter padded with zeros.
 fn padded_cmp(a: &[u8], b: &[u8]) -> Ordering {
     for i in 0..a.len().max(b.len()) {
-        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
         if x != y {
             return x.cmp(&y);
         }
@@ -1022,7 +1103,11 @@ impl<'a> Reader<'a> {
     /// A reader over `input`, holding it to `rules`. Its elements are at
     /// depth 0.
     pub fn new(input: &'a [u8], rules: Rules) -> Reader<'a> {
-        Reader { rest: input, rules, depth: 0 }
+        Reader {
+            rest: input,
+            rules,
+            depth: 0,
+        }
     }
 
     /// The rules the reader holds input to.
@@ -1047,7 +1132,11 @@ impl<'a> Reader<'a> {
 
     /// Checks every element has been read, as the end of a sequence must.
     pub fn finish(&self) -> Result<(), Error> {
-        if self.rest.is_empty() { Ok(()) } else { Err(Error::Trailing) }
+        if self.rest.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Trailing)
+        }
     }
 
     /// The next element, without reading past it.
@@ -1079,7 +1168,10 @@ impl<'a> Reader<'a> {
     pub fn read_expected(&mut self, tag: Tag) -> Result<Element<'a>, Error> {
         let e = self.peek()?;
         if !e.tag.same_type(tag) {
-            return Err(Error::Unexpected { expected: tag, found: e.tag });
+            return Err(Error::Unexpected {
+                expected: tag,
+                found: e.tag,
+            });
         }
         self.rest = &self.rest[e.raw.len()..];
         Ok(e)
@@ -1104,7 +1196,9 @@ impl<'a> Reader<'a> {
     /// A matching outer element is consumed before its form is checked.
     #[inline]
     pub fn read_optional_explicit(&mut self, number: u32) -> Result<Option<Reader<'a>>, Error> {
-        self.read_optional(Tag::context(number))?.map(|e| e.reader()).transpose()
+        self.read_optional(Tag::context(number))?
+            .map(|e| e.reader())
+            .transpose()
     }
 
     /// Reads an optional explicit context field with `f` and checks its end.
@@ -1147,12 +1241,16 @@ impl<'a> Reader<'a> {
 
     /// Reads an INTEGER that fits an `i64`.
     pub fn read_i64(&mut self) -> Result<i64, Error> {
-        self.read_with(Tag::INTEGER, |e| e.integer()?.to_i64().ok_or(Error::Integer))
+        self.read_with(Tag::INTEGER, |e| {
+            e.integer()?.to_i64().ok_or(Error::Integer)
+        })
     }
 
     /// Reads an INTEGER that fits a `u64`.
     pub fn read_u64(&mut self) -> Result<u64, Error> {
-        self.read_with(Tag::INTEGER, |e| e.integer()?.to_u64().ok_or(Error::Integer))
+        self.read_with(Tag::INTEGER, |e| {
+            e.integer()?.to_u64().ok_or(Error::Integer)
+        })
     }
 
     /// Reads an ENUMERATED.
@@ -1184,7 +1282,10 @@ impl<'a> Reader<'a> {
     /// the type it had.
     pub fn read_text(&mut self) -> Result<(StringKind, String), Error> {
         let e = self.peek()?;
-        let kind = StringKind::from_tag(e.tag).ok_or(Error::Unexpected { expected: Tag::UTF8_STRING, found: e.tag })?;
+        let kind = StringKind::from_tag(e.tag).ok_or(Error::Unexpected {
+            expected: Tag::UTF8_STRING,
+            found: e.tag,
+        })?;
         let text = e.text(kind)?;
         self.rest = &self.rest[e.raw.len()..];
         Ok((kind, text))
@@ -1232,10 +1333,17 @@ impl<'a> Reader<'a> {
 
     /// Reads the next element if it has `tag`'s class and number and `f`
     /// accepts it. On an error nothing is read.
-    fn read_with<T>(&mut self, tag: Tag, f: impl FnOnce(&Element<'a>) -> Result<T, Error>) -> Result<T, Error> {
+    fn read_with<T>(
+        &mut self,
+        tag: Tag,
+        f: impl FnOnce(&Element<'a>) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         let e = self.peek()?;
         if !e.tag.same_type(tag) {
-            return Err(Error::Unexpected { expected: tag, found: e.tag });
+            return Err(Error::Unexpected {
+                expected: tag,
+                found: e.tag,
+            });
         }
         let v = f(&e)?;
         self.rest = &self.rest[e.raw.len()..];
@@ -1358,7 +1466,10 @@ impl<'a> BitString<'a> {
 
     /// The same bit string, owning its bytes, to keep past the input.
     pub fn into_owned(self) -> BitString<'static> {
-        BitString { unused: self.unused, bytes: Cow::Owned(self.bytes.into_owned()) }
+        BitString {
+            unused: self.unused,
+            bytes: Cow::Owned(self.bytes.into_owned()),
+        }
     }
 
     /// How many bits at the end of the last byte are unused.
@@ -1493,7 +1604,10 @@ impl std::str::FromStr for Oid {
     fn from_str(s: &str) -> Result<Oid, Error> {
         let mut arcs = Vec::new();
         for part in s.split('.') {
-            if part.is_empty() || !part.bytes().all(|c| c.is_ascii_digit()) || arcs.len() > MAX_OID_LEN {
+            if part.is_empty()
+                || !part.bytes().all(|c| c.is_ascii_digit())
+                || arcs.len() > MAX_OID_LEN
+            {
                 return Err(Error::Oid);
             }
             arcs.push(part.parse::<u128>().map_err(|_| Error::Oid)?);
@@ -1592,7 +1706,10 @@ impl StringKind {
 
     /// Whether this module decodes the type's characters to text.
     pub fn is_decoded(self) -> bool {
-        !matches!(self, StringKind::Teletex | StringKind::Videotex | StringKind::Graphic | StringKind::General)
+        !matches!(
+            self,
+            StringKind::Teletex | StringKind::Videotex | StringKind::Graphic | StringKind::General
+        )
     }
 
     /// Checks `b` holds only characters the type allows.
@@ -1600,20 +1717,40 @@ impl StringKind {
         let ok = match self {
             StringKind::Utf8 => std::str::from_utf8(b).is_ok(),
             StringKind::Numeric => b.iter().all(|&c| c.is_ascii_digit() || c == b' '),
-            StringKind::Printable => b.iter().all(|&c| c.is_ascii_alphanumeric() || b" '()+,-./:=?".contains(&c)),
+            StringKind::Printable => b
+                .iter()
+                .all(|&c| c.is_ascii_alphanumeric() || b" '()+,-./:=?".contains(&c)),
             StringKind::Ia5 => b.is_ascii(),
             StringKind::Visible => b.iter().all(|&c| (0x20..=0x7e).contains(&c)),
             StringKind::Universal => {
                 b.len().is_multiple_of(4)
-                    && b.as_chunks::<4>().0.iter().all(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])).is_some())
-                    && no_shifts(b.as_chunks::<4>().0.iter().map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])))
+                    && b.as_chunks::<4>().0.iter().all(|c| {
+                        char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])).is_some()
+                    })
+                    && no_shifts(
+                        b.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])),
+                    )
             }
             StringKind::Bmp => {
                 b.len().is_multiple_of(2)
-                    && b.as_chunks::<2>().0.iter().all(|c| !(0xd800..=0xdfff).contains(&u16::from_be_bytes([c[0], c[1]])))
-                    && no_shifts(b.as_chunks::<2>().0.iter().map(|c| u32::from(u16::from_be_bytes([c[0], c[1]]))))
+                    && b.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .all(|c| !(0xd800..=0xdfff).contains(&u16::from_be_bytes([c[0], c[1]])))
+                    && no_shifts(
+                        b.as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|c| u32::from(u16::from_be_bytes([c[0], c[1]]))),
+                    )
             }
-            StringKind::Teletex | StringKind::Videotex | StringKind::Graphic | StringKind::General => true,
+            StringKind::Teletex
+            | StringKind::Videotex
+            | StringKind::Graphic
+            | StringKind::General => true,
         };
         if ok { Ok(()) } else { Err(Error::Charset) }
     }
@@ -1629,12 +1766,18 @@ impl StringKind {
         }
         self.check(b)?;
         Ok(match self {
-            StringKind::Universal => {
-                b.as_chunks::<4>().0.iter().filter_map(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]]))).collect()
-            }
-            StringKind::Bmp => {
-                b.as_chunks::<2>().0.iter().filter_map(|c| char::from_u32(u32::from(u16::from_be_bytes([c[0], c[1]])))).collect()
-            }
+            StringKind::Universal => b
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter_map(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])))
+                .collect(),
+            StringKind::Bmp => b
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .filter_map(|c| char::from_u32(u32::from(u16::from_be_bytes([c[0], c[1]]))))
+                .collect(),
             _ => String::from_utf8_lossy(b).into_owned(),
         })
     }
@@ -1741,14 +1884,27 @@ impl Text<'_> {
             None if !utc && rules == Rules::Ber => {}
             _ => return Err(Error::Time),
         }
-        if self.i == self.b.len() { Ok(()) } else { Err(Error::Time) }
+        if self.i == self.b.len() {
+            Ok(())
+        } else {
+            Err(Error::Time)
+        }
     }
 }
 
 /// Checks a calendar date and a time of day. Second 60, a positive leap
 /// second, is allowed when `leap` is set.
-fn check_date(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32, leap: bool) -> Result<(), Error> {
-    let leap_year = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+fn check_date(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    leap: bool,
+) -> Result<(), Error> {
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
     let days = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -1856,7 +2012,12 @@ pub struct Writer {
 
 impl Default for Writer {
     fn default() -> Writer {
-        Writer { out: Vec::new(), depth: 0, error: None, room: MAX_INPUT }
+        Writer {
+            out: Vec::new(),
+            depth: 0,
+            error: None,
+            room: MAX_INPUT,
+        }
     }
 }
 
@@ -1923,13 +2084,22 @@ impl Writer {
     /// made for another depth, what that writer holds is read again at
     /// `depth`, so nothing nests deeper than a reader opens.
     fn run(&self, depth: usize, f: impl FnOnce(&mut Writer)) -> Result<Vec<u8>, Error> {
-        let mut child = Writer { out: Vec::new(), depth, error: None, room: self.left() };
+        let mut child = Writer {
+            out: Vec::new(),
+            depth,
+            error: None,
+            room: self.left(),
+        };
         f(&mut child);
         if let Some(e) = child.error {
             return Err(e);
         }
         if child.depth != depth {
-            for e in (Reader { rest: &child.out, rules: Rules::Der, depth }) {
+            for e in (Reader {
+                rest: &child.out,
+                rules: Rules::Der,
+                depth,
+            }) {
                 check_der(&e?)?;
             }
         }
@@ -2112,7 +2282,13 @@ impl Writer {
         if tag.class == Class::Universal {
             return self.fail(Error::Tag);
         }
-        self.put(Tag { constructed: false, ..tag }, contents);
+        self.put(
+            Tag {
+                constructed: false,
+                ..tag
+            },
+            contents,
+        );
     }
 
     /// Writes a constructed element with a non-universal tag, whose
@@ -2166,7 +2342,11 @@ impl Writer {
         if self.error.is_some() {
             return;
         }
-        let mut r = Reader { rest: der, rules: Rules::Der, depth: self.depth };
+        let mut r = Reader {
+            rest: der,
+            rules: Rules::Der,
+            depth: self.depth,
+        };
         let checked = r.read().and_then(|e| {
             r.finish()?;
             check_der(&e)
@@ -2194,7 +2374,13 @@ impl Writer {
         };
         let mut r = Reader::new(&written, Rules::Der);
         match (r.read(), r.is_empty()) {
-            (Ok(e), true) => self.put(Tag { constructed: e.tag.constructed, ..tag }, e.contents),
+            (Ok(e), true) => self.put(
+                Tag {
+                    constructed: e.tag.constructed,
+                    ..tag
+                },
+                e.contents,
+            ),
             _ => self.fail(Error::Implicit),
         }
     }
@@ -2265,8 +2451,10 @@ fn sorted(contents: &[u8], order: Order) -> Result<Vec<u8>, Error> {
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
 pub mod harness {
-    use super::{Class, Element, Elements, Error, Frame, MAX_INPUT, Oid, Reader, Rules, StringKind, Tag, Writer,
-        check_generalized_time, check_utc_time, element_len};
+    use super::{
+        Class, Element, Elements, Error, Frame, MAX_INPUT, Oid, Reader, Rules, StringKind, Tag,
+        Writer, check_generalized_time, check_utc_time, element_len,
+    };
     use fictionet::stdlib::test_support::contract;
 
     /// ASN.1 string kinds.
@@ -2322,7 +2510,10 @@ pub mod harness {
             }
             17 => {
                 let kids = children(e)?;
-                let mut tags: Vec<_> = kids.iter().map(|k| (k.tag().class, k.tag().number)).collect();
+                let mut tags: Vec<_> = kids
+                    .iter()
+                    .map(|k| (k.tag().class, k.tag().number))
+                    .collect();
                 tags.sort();
                 let distinct = tags.windows(2).all(|p| p[0] != p[1]);
                 if distinct && e.set_reader().is_ok() {
@@ -2355,7 +2546,13 @@ pub mod harness {
     pub fn walk(e: Element<'_>) {
         let _ = e.boolean();
         if let Ok(i) = e.integer() {
-            let _ = (i.to_i64(), i.to_u64(), i.to_i128(), i.to_u128(), i.unsigned_bytes());
+            let _ = (
+                i.to_i64(),
+                i.to_u64(),
+                i.to_i128(),
+                i.to_u128(),
+                i.unsigned_bytes(),
+            );
         }
         let _ = e.null();
         if let Ok(o) = e.oid() {
@@ -2373,7 +2570,10 @@ pub mod harness {
         for kind in ALL_KINDS {
             let _ = e.string_bytes(kind);
             if let Ok(s) = e.text(kind) {
-                assert_eq!(kind.encode(&s).ok().as_deref(), e.string_bytes(kind).ok().as_deref());
+                assert_eq!(
+                    kind.encode(&s).ok().as_deref(),
+                    e.string_bytes(kind).ok().as_deref()
+                );
                 let mut writer = Writer::new();
                 writer.text(kind, &s);
                 let bytes = writer.finish().expect("decoded text re-encodes");
@@ -2384,7 +2584,12 @@ pub mod harness {
                 );
             }
         }
-        let _ = (e.utc_time(), e.generalized_time(), e.set_reader().is_ok(), e.set_of_reader().is_ok());
+        let _ = (
+            e.utc_time(),
+            e.generalized_time(),
+            e.set_reader().is_ok(),
+            e.set_of_reader().is_ok(),
+        );
         if let Ok(r) = e.reader() {
             for child in r {
                 match child {
@@ -2450,12 +2655,10 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::harness::{check, copy};
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{chunks, mutate};
 
     fn der(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
@@ -2482,8 +2685,13 @@ mod tests {
     #[test]
     fn review_write_checked_rejects_lossy_encoding() {
         let mut out = vec![42];
-        let result = write_checked(&256u16, |v| Ok(vec![*v as u8]),
-            |b| Ok(u16::from(b[0])), Error::Integer, &mut out);
+        let result = write_checked(
+            &256u16,
+            |v| Ok(vec![*v as u8]),
+            |b| Ok(u16::from(b[0])),
+            Error::Integer,
+            &mut out,
+        );
         assert_eq!(result, Err(Error::Integer));
         assert_eq!(out, [42]);
     }
@@ -2493,8 +2701,14 @@ mod tests {
         // 8.2.2: TRUE may be any nonzero byte in BER; DER uses 0xFF.
         assert_eq!(der(|w| w.boolean(true)), [0x01, 0x01, 0xff]);
         assert_eq!(der(|w| w.boolean(false)), [0x01, 0x01, 0x00]);
-        assert_eq!(Reader::new(&[0x01, 0x01, 0x05], Rules::Ber).read_boolean(), Ok(true));
-        assert_eq!(Reader::new(&[0x01, 0x01, 0x05], Rules::Der).read_boolean(), Err(Error::Boolean));
+        assert_eq!(
+            Reader::new(&[0x01, 0x01, 0x05], Rules::Ber).read_boolean(),
+            Ok(true)
+        );
+        assert_eq!(
+            Reader::new(&[0x01, 0x01, 0x05], Rules::Der).read_boolean(),
+            Err(Error::Boolean)
+        );
     }
 
     #[test]
@@ -2508,11 +2722,26 @@ mod tests {
         assert_eq!(out, [0x81, 0xc9]);
         // BER may spend more octets on a length; DER may not.
         let long = [0x04, 0x81, 0x01, 0xaa];
-        assert_eq!(Reader::new(&long, Rules::Ber).read_octet_string().unwrap().as_ref(), [0xaa]);
-        assert_eq!(Reader::new(&long, Rules::Der).read_octet_string(), Err(Error::NonMinimalLength));
+        assert_eq!(
+            Reader::new(&long, Rules::Ber)
+                .read_octet_string()
+                .unwrap()
+                .as_ref(),
+            [0xaa]
+        );
+        assert_eq!(
+            Reader::new(&long, Rules::Der).read_octet_string(),
+            Err(Error::NonMinimalLength)
+        );
         let padded = [0x04, 0x82, 0x00, 0x81, 0xaa];
-        assert_eq!(Header::parse(&padded, Rules::Ber).unwrap().length, Length::Definite(0x81));
-        assert_eq!(Header::parse(&padded, Rules::Der), Err(Error::NonMinimalLength));
+        assert_eq!(
+            Header::parse(&padded, Rules::Ber).unwrap().length,
+            Length::Definite(0x81)
+        );
+        assert_eq!(
+            Header::parse(&padded, Rules::Der),
+            Err(Error::NonMinimalLength)
+        );
         // A 200-byte octet string takes a two-byte length.
         let w = der(|w| w.octet_string(&[7; 200]));
         assert_eq!(&w[..3], [0x04, 0x81, 200]);
@@ -2522,7 +2751,9 @@ mod tests {
     #[test]
     fn sequence_example() {
         // 8.9.3: SEQUENCE {name IA5String, ok BOOLEAN} {name "Smith", ok TRUE}.
-        let bytes = [0x30, 0x0a, 0x16, 0x05, b'S', b'm', b'i', b't', b'h', 0x01, 0x01, 0xff];
+        let bytes = [
+            0x30, 0x0a, 0x16, 0x05, b'S', b'm', b'i', b't', b'h', 0x01, 0x01, 0xff,
+        ];
         let built = der(|w| {
             w.sequence(|w| {
                 w.text(StringKind::Ia5, "Smith");
@@ -2532,7 +2763,10 @@ mod tests {
         assert_eq!(built, bytes);
         let mut r = Reader::new(&bytes, Rules::Der);
         let mut s = r.read_sequence().unwrap();
-        assert_eq!(s.read_text().unwrap(), (StringKind::Ia5, "Smith".to_string()));
+        assert_eq!(
+            s.read_text().unwrap(),
+            (StringKind::Ia5, "Smith".to_string())
+        );
         assert!(s.read_boolean().unwrap());
         s.finish().unwrap();
         r.finish().unwrap();
@@ -2542,39 +2776,77 @@ mod tests {
     fn bit_string_example() {
         // 8.6.4.2: '0A3B5F291CD'H, primitive and then constructed.
         let primitive = [0x03, 0x07, 0x04, 0x0a, 0x3b, 0x5f, 0x29, 0x1c, 0xd0];
-        let b = Reader::new(&primitive, Rules::Der).read_bit_string().unwrap();
-        assert_eq!((b.unused(), b.bytes()), (4, &[0x0a, 0x3b, 0x5f, 0x29, 0x1c, 0xd0][..]));
+        let b = Reader::new(&primitive, Rules::Der)
+            .read_bit_string()
+            .unwrap();
+        assert_eq!(
+            (b.unused(), b.bytes()),
+            (4, &[0x0a, 0x3b, 0x5f, 0x29, 0x1c, 0xd0][..])
+        );
         assert_eq!(b.len(), 44);
         assert_eq!(b.bit(4), Some(true));
         assert_eq!(b.bit(0), Some(false));
         assert_eq!(b.bit(44), None);
         assert_eq!(der(|w| w.bit_string(b.bytes(), 4)), primitive);
-        let constructed =
-            [0x23, 0x80, 0x03, 0x03, 0x00, 0x0a, 0x3b, 0x03, 0x05, 0x04, 0x5f, 0x29, 0x1c, 0xd0, 0x00, 0x00];
-        let c = Reader::new(&constructed, Rules::Ber).read_bit_string().unwrap();
+        let constructed = [
+            0x23, 0x80, 0x03, 0x03, 0x00, 0x0a, 0x3b, 0x03, 0x05, 0x04, 0x5f, 0x29, 0x1c, 0xd0,
+            0x00, 0x00,
+        ];
+        let c = Reader::new(&constructed, Rules::Ber)
+            .read_bit_string()
+            .unwrap();
         assert_eq!(c, b);
-        assert_eq!(Reader::new(&constructed, Rules::Der).read_bit_string(), Err(Error::Indefinite));
+        assert_eq!(
+            Reader::new(&constructed, Rules::Der).read_bit_string(),
+            Err(Error::Indefinite)
+        );
         // The same, definite-length: DER still refuses the constructed form.
-        let definite = [0x23, 0x0c, 0x03, 0x03, 0x00, 0x0a, 0x3b, 0x03, 0x05, 0x04, 0x5f, 0x29, 0x1c, 0xd0];
-        assert_eq!(Reader::new(&definite, Rules::Ber).read_bit_string().unwrap(), b);
-        assert_eq!(Reader::new(&definite, Rules::Der).read_bit_string(), Err(Error::Constructed));
+        let definite = [
+            0x23, 0x0c, 0x03, 0x03, 0x00, 0x0a, 0x3b, 0x03, 0x05, 0x04, 0x5f, 0x29, 0x1c, 0xd0,
+        ];
+        assert_eq!(
+            Reader::new(&definite, Rules::Ber)
+                .read_bit_string()
+                .unwrap(),
+            b
+        );
+        assert_eq!(
+            Reader::new(&definite, Rules::Der).read_bit_string(),
+            Err(Error::Constructed)
+        );
     }
 
     #[test]
     fn octet_string_segments() {
         // 8.7.3.2: a constructed octet string, nested, with an indefinite
         // length inside a definite one.
-        let b = [0x24, 0x0b, 0x04, 0x01, b'a', 0x24, 0x80, 0x04, 0x02, b'b', b'c', 0x00, 0x00];
-        assert_eq!(Reader::new(&b, Rules::Ber).read_octet_string().unwrap().as_ref(), b"abc");
+        let b = [
+            0x24, 0x0b, 0x04, 0x01, b'a', 0x24, 0x80, 0x04, 0x02, b'b', b'c', 0x00, 0x00,
+        ];
+        assert_eq!(
+            Reader::new(&b, Rules::Ber)
+                .read_octet_string()
+                .unwrap()
+                .as_ref(),
+            b"abc"
+        );
         // Segments must be octet strings.
         let bad = [0x24, 0x03, 0x02, 0x01, 0x00];
         assert_eq!(
             Reader::new(&bad, Rules::Ber).read_octet_string(),
-            Err(Error::Unexpected { expected: Tag::OCTET_STRING, found: Tag::INTEGER })
+            Err(Error::Unexpected {
+                expected: Tag::OCTET_STRING,
+                found: Tag::INTEGER
+            })
         );
         // A constructed UTF8String is made of octet string segments too.
-        let s = [0x2c, 0x80, 0x04, 0x02, 0xc3, 0xa9, 0x04, 0x01, b'!', 0x00, 0x00];
-        assert_eq!(Reader::new(&s, Rules::Ber).read_text().unwrap(), (StringKind::Utf8, "é!".to_string()));
+        let s = [
+            0x2c, 0x80, 0x04, 0x02, 0xc3, 0xa9, 0x04, 0x01, b'!', 0x00, 0x00,
+        ];
+        assert_eq!(
+            Reader::new(&s, Rules::Ber).read_text().unwrap(),
+            (StringKind::Utf8, "é!".to_string())
+        );
     }
 
     #[test]
@@ -2589,7 +2861,10 @@ mod tests {
         assert_eq!(cn.as_bytes(), [0x55, 0x04, 0x03]);
         // A UUID arc under 2.25 needs all 128 bits.
         let big = Oid::from_arcs(&[2, 25, u128::MAX]).unwrap();
-        assert_eq!(Oid::from_contents(big.as_bytes()).unwrap().arcs(), [2, 25, u128::MAX]);
+        assert_eq!(
+            Oid::from_contents(big.as_bytes()).unwrap().arcs(),
+            [2, 25, u128::MAX]
+        );
         assert_eq!(big.to_string().parse::<Oid>(), Ok(big));
         // One bit more does not fit.
         let mut over = vec![0x69, 0x84];
@@ -2611,7 +2886,10 @@ mod tests {
             (-1, &[0xff]),
             (-128, &[0x80]),
             (-129, &[0xff, 0x7f]),
-            (i128::MIN, &[0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (
+                i128::MIN,
+                &[0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
         ];
         for &(v, contents) in cases {
             let b = der(|w| w.integer_i128(v));
@@ -2622,7 +2900,12 @@ mod tests {
         }
         // u64::MAX needs a leading zero byte.
         let b = der(|w| w.integer_u64(u64::MAX));
-        assert_eq!(b, [0x02, 0x09, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(
+            b,
+            [
+                0x02, 0x09, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+            ]
+        );
         assert_eq!(Reader::new(&b, Rules::Der).read_u64(), Ok(u64::MAX));
         assert_eq!(Reader::new(&b, Rules::Der).read_i64(), Err(Error::Integer));
         // An integer larger than any Rust type, such as an RSA modulus.
@@ -2634,10 +2917,19 @@ mod tests {
         assert_eq!(der(|w| w.integer_unsigned(&[0, 0, 5])), [0x02, 0x01, 0x05]);
         assert_eq!(der(|w| w.integer_unsigned(&[])), [0x02, 0x01, 0x00]);
         assert_eq!(der(|w| w.integer_bytes(&[])), [0x02, 0x01, 0x00]);
-        assert_eq!(der(|w| w.integer_bytes(&[0xff, 0xff, 0x80])), [0x02, 0x01, 0x80]);
+        assert_eq!(
+            der(|w| w.integer_bytes(&[0xff, 0xff, 0x80])),
+            [0x02, 0x01, 0x80]
+        );
         assert_eq!(der(|w| w.enumerated(2)), [0x0a, 0x01, 0x02]);
         let e = der(|w| w.enumerated(-300));
-        assert_eq!(Reader::new(&e, Rules::Der).read_enumerated().unwrap().to_i64(), Some(-300));
+        assert_eq!(
+            Reader::new(&e, Rules::Der)
+                .read_enumerated()
+                .unwrap()
+                .to_i64(),
+            Some(-300)
+        );
     }
 
     #[test]
@@ -2656,10 +2948,22 @@ mod tests {
             assert_eq!(Reader::new(&b, Rules::Der).read_u64(), Ok(u));
             let wide = (i128::from(v) << 64) | i128::from(u);
             let b = der(|w| w.integer_i128(wide));
-            assert_eq!(Reader::new(&b, Rules::Der).read_integer().unwrap().to_i128(), Some(wide));
+            assert_eq!(
+                Reader::new(&b, Rules::Der)
+                    .read_integer()
+                    .unwrap()
+                    .to_i128(),
+                Some(wide)
+            );
             let uw = (u128::from(u) << 64) | u128::from(x);
             let b = der(|w| w.integer_u128(uw));
-            assert_eq!(Reader::new(&b, Rules::Der).read_integer().unwrap().to_u128(), Some(uw));
+            assert_eq!(
+                Reader::new(&b, Rules::Der)
+                    .read_integer()
+                    .unwrap()
+                    .to_u128(),
+                Some(uw)
+            );
         }
     }
 
@@ -2671,19 +2975,30 @@ mod tests {
         assert_eq!(Tag::parse(&[0x7f, 0x81, 0x49]), Ok((t, 3)));
         assert_eq!(tag_bytes(Tag::context(30)), [0x9e]);
         assert_eq!(tag_bytes(Tag::context(31)), [0x9f, 0x1f]);
-        assert_eq!(tag_bytes(Tag::private(u32::MAX)), [0xdf, 0x8f, 0xff, 0xff, 0xff, 0x7f]);
-        assert_eq!(Tag::parse(&tag_bytes(Tag::private(u32::MAX))), Ok((Tag::private(u32::MAX), 6)));
+        assert_eq!(
+            tag_bytes(Tag::private(u32::MAX)),
+            [0xdf, 0x8f, 0xff, 0xff, 0xff, 0x7f]
+        );
+        assert_eq!(
+            Tag::parse(&tag_bytes(Tag::private(u32::MAX))),
+            Ok((Tag::private(u32::MAX), 6))
+        );
         // A long form for a number below 31, a leading zero group, and a
         // number past 32 bits.
         assert_eq!(Tag::parse(&[0x1f, 0x1e]), Err(Error::Tag));
         assert_eq!(Tag::parse(&[0x1f, 0x80, 0x7f]), Err(Error::Tag));
-        assert_eq!(Tag::parse(&[0x1f, 0x90, 0x80, 0x80, 0x80, 0x00]), Err(Error::Tag));
+        assert_eq!(
+            Tag::parse(&[0x1f, 0x90, 0x80, 0x80, 0x80, 0x00]),
+            Err(Error::Tag)
+        );
         assert_eq!(Tag::parse(&[0x1f, 0x81]), Err(Error::Truncated));
         assert_eq!(Tag::SEQUENCE.to_string(), "[UNIVERSAL 16] constructed");
         // A long-tagged element reads and writes.
         let b = der(|w| w.primitive(Tag::context(1000), b"x"));
         assert_eq!(b, [0x9f, 0x87, 0x68, 0x01, b'x']);
-        let e = Reader::new(&b, Rules::Der).read_expected(Tag::context(1000)).unwrap();
+        let e = Reader::new(&b, Rules::Der)
+            .read_expected(Tag::context(1000))
+            .unwrap();
         assert_eq!(e.contents(), b"x");
     }
 
@@ -2702,8 +3017,8 @@ mod tests {
         assert_eq!(
             b,
             [
-                0x30, 0x11, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x02, 0x12, 0x34, 0x82, 0x02, b'i', b'd', 0xa3, 0x02,
-                0x05, 0x00
+                0x30, 0x11, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x02, 0x12, 0x34, 0x82, 0x02, b'i',
+                b'd', 0xa3, 0x02, 0x05, 0x00
             ]
         );
         let mut r = Reader::new(&b, Rules::Der);
@@ -2741,7 +3056,12 @@ mod tests {
                 w.primitive(Tag::context(0), b"a");
             })
         });
-        assert_eq!(s, [0x31, 0x09, 0x02, 0x01, 0x05, 0x80, 0x01, b'a', 0x81, 0x01, b'b']);
+        assert_eq!(
+            s,
+            [
+                0x31, 0x09, 0x02, 0x01, 0x05, 0x80, 0x01, b'a', 0x81, 0x01, b'b'
+            ]
+        );
         let mut set = Reader::new(&s, Rules::Der).read_set().unwrap();
         assert_eq!(set.read_i64(), Ok(5));
         let so = der(|w| {
@@ -2751,7 +3071,12 @@ mod tests {
                 w.integer_i64(1);
             })
         });
-        assert_eq!(so, [0x31, 0x0a, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02, 0x02, 0x02, 0x01, 0x2c]);
+        assert_eq!(
+            so,
+            [
+                0x31, 0x0a, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02, 0x02, 0x02, 0x01, 0x2c
+            ]
+        );
         let got: Vec<i64> = Reader::new(&so, Rules::Der)
             .read_set_of()
             .unwrap()
@@ -2760,10 +3085,16 @@ mod tests {
         assert_eq!(got, [1, 2, 300]);
         // Out of order: DER refuses, BER does not care.
         let bad = [0x31, 0x06, 0x02, 0x01, 0x01, 0x01, 0x01, 0xff];
-        assert_eq!(Reader::new(&bad, Rules::Der).read_set().err(), Some(Error::SetOrder));
+        assert_eq!(
+            Reader::new(&bad, Rules::Der).read_set().err(),
+            Some(Error::SetOrder)
+        );
         assert!(Reader::new(&bad, Rules::Ber).read_set().is_ok());
         let bad_of = [0x31, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01];
-        assert_eq!(Reader::new(&bad_of, Rules::Der).read_set_of().err(), Some(Error::SetOrder));
+        assert_eq!(
+            Reader::new(&bad_of, Rules::Der).read_set_of().err(),
+            Some(Error::SetOrder)
+        );
         // A set with two elements of one tag cannot be written.
         let mut w = Writer::new();
         w.set(|w| {
@@ -2782,13 +3113,20 @@ mod tests {
             (StringKind::Ia5, "a@b.example", b"a@b.example"),
             (StringKind::Visible, "~x~", b"~x~"),
             (StringKind::Bmp, "Aé", &[0x00, 0x41, 0x00, 0xe9]),
-            (StringKind::Universal, "A😀", &[0, 0, 0, 0x41, 0, 0x01, 0xf6, 0x00]),
+            (
+                StringKind::Universal,
+                "A😀",
+                &[0, 0, 0, 0x41, 0, 0x01, 0xf6, 0x00],
+            ),
         ];
         for &(kind, text, bytes) in cases {
             let b = der(|w| w.text(kind, text));
             assert_eq!(&b[2..], bytes);
             assert_eq!(b[0] as u32, kind.tag().number);
-            assert_eq!(Reader::new(&b, Rules::Der).read_text(), Ok((kind, text.to_string())));
+            assert_eq!(
+                Reader::new(&b, Rules::Der).read_text(),
+                Ok((kind, text.to_string()))
+            );
         }
         // Characters a type does not allow.
         for (kind, text) in [
@@ -2802,14 +3140,31 @@ mod tests {
             w.text(kind, text);
             assert_eq!(w.finish(), Err(Error::Charset), "{kind:?}");
         }
-        assert_eq!(Reader::new(&[0x0c, 0x01, 0xff], Rules::Ber).read_text(), Err(Error::Charset));
-        assert_eq!(Reader::new(&[0x1e, 0x02, 0xd8, 0x00], Rules::Ber).read_text(), Err(Error::Charset));
-        assert_eq!(Reader::new(&[0x1e, 0x01, 0x41], Rules::Ber).read_text(), Err(Error::Charset));
-        assert_eq!(Reader::new(&[0x1c, 0x04, 0, 0x11, 0, 0], Rules::Ber).read_text(), Err(Error::Charset));
+        assert_eq!(
+            Reader::new(&[0x0c, 0x01, 0xff], Rules::Ber).read_text(),
+            Err(Error::Charset)
+        );
+        assert_eq!(
+            Reader::new(&[0x1e, 0x02, 0xd8, 0x00], Rules::Ber).read_text(),
+            Err(Error::Charset)
+        );
+        assert_eq!(
+            Reader::new(&[0x1e, 0x01, 0x41], Rules::Ber).read_text(),
+            Err(Error::Charset)
+        );
+        assert_eq!(
+            Reader::new(&[0x1c, 0x04, 0, 0x11, 0, 0], Rules::Ber).read_text(),
+            Err(Error::Charset)
+        );
         // Teletex is kept as bytes.
         let t = der(|w| w.string_bytes(StringKind::Teletex, &[0xc2, 0x61]));
-        let e = Reader::new(&t, Rules::Der).read_expected(Tag::TELETEX_STRING).unwrap();
-        assert_eq!(e.string_bytes(StringKind::Teletex).unwrap().as_ref(), [0xc2, 0x61]);
+        let e = Reader::new(&t, Rules::Der)
+            .read_expected(Tag::TELETEX_STRING)
+            .unwrap();
+        assert_eq!(
+            e.string_bytes(StringKind::Teletex).unwrap().as_ref(),
+            [0xc2, 0x61]
+        );
         assert_eq!(e.text(StringKind::Teletex), Err(Error::Charset));
         let mut w = Writer::new();
         w.text(StringKind::General, "x");
@@ -2817,7 +3172,10 @@ mod tests {
         // Not a string at all.
         assert_eq!(
             Reader::new(&[0x05, 0x00], Rules::Der).read_text(),
-            Err(Error::Unexpected { expected: Tag::UTF8_STRING, found: Tag::NULL })
+            Err(Error::Unexpected {
+                expected: Tag::UTF8_STRING,
+                found: Tag::NULL
+            })
         );
     }
 
@@ -2826,18 +3184,35 @@ mod tests {
         // X.680 47.3 example: 6 May 1991, 16:45:40 at UTC-7, and the same
         // instant in the one form DER allows.
         assert_eq!(check_utc_time(b"910506164540-0700", Rules::Ber), Ok(()));
-        assert_eq!(check_utc_time(b"910506164540-0700", Rules::Der), Err(Error::Time));
+        assert_eq!(
+            check_utc_time(b"910506164540-0700", Rules::Der),
+            Err(Error::Time)
+        );
         assert_eq!(check_utc_time(b"910506234540Z", Rules::Der), Ok(()));
         assert_eq!(check_utc_time(b"9105062345Z", Rules::Ber), Ok(()));
         assert_eq!(check_utc_time(b"9105062345Z", Rules::Der), Err(Error::Time));
         let b = der(|w| w.utc_time("910506234540Z"));
         assert_eq!(&b[..2], [0x17, 0x0d]);
-        assert_eq!(Reader::new(&b, Rules::Der).read_utc_time().unwrap(), "910506234540Z");
+        assert_eq!(
+            Reader::new(&b, Rules::Der).read_utc_time().unwrap(),
+            "910506234540Z"
+        );
         // GeneralizedTime, X.680 46.3 and X.690 11.7.
-        for ok in ["19920521000000Z", "19920622123421.5Z", "20001231235959.999Z"] {
-            assert_eq!(check_generalized_time(ok.as_bytes(), Rules::Der), Ok(()), "{ok}");
+        for ok in [
+            "19920521000000Z",
+            "19920622123421.5Z",
+            "20001231235959.999Z",
+        ] {
+            assert_eq!(
+                check_generalized_time(ok.as_bytes(), Rules::Der),
+                Ok(()),
+                "{ok}"
+            );
             let b = der(|w| w.generalized_time(ok));
-            assert_eq!(Reader::new(&b, Rules::Der).read_generalized_time().unwrap(), ok);
+            assert_eq!(
+                Reader::new(&b, Rules::Der).read_generalized_time().unwrap(),
+                ok
+            );
         }
         for ber_only in [
             "1992052100Z",
@@ -2847,8 +3222,16 @@ mod tests {
             "19851106210627.3-0500",
             "19851106210627.3+05",
         ] {
-            assert_eq!(check_generalized_time(ber_only.as_bytes(), Rules::Ber), Ok(()), "{ber_only}");
-            assert_eq!(check_generalized_time(ber_only.as_bytes(), Rules::Der), Err(Error::Time), "{ber_only}");
+            assert_eq!(
+                check_generalized_time(ber_only.as_bytes(), Rules::Ber),
+                Ok(()),
+                "{ber_only}"
+            );
+            assert_eq!(
+                check_generalized_time(ber_only.as_bytes(), Rules::Der),
+                Err(Error::Time),
+                "{ber_only}"
+            );
         }
         for bad in [
             "",
@@ -2864,12 +3247,22 @@ mod tests {
             "20000101000000+2400",
             "2000010100000a",
         ] {
-            assert_eq!(check_generalized_time(bad.as_bytes(), Rules::Ber), Err(Error::Time), "{bad}");
+            assert_eq!(
+                check_generalized_time(bad.as_bytes(), Rules::Ber),
+                Err(Error::Time),
+                "{bad}"
+            );
         }
         // Leap years: 2000 was one, 1900 was not.
-        assert_eq!(check_generalized_time(b"20000229000000Z", Rules::Der), Ok(()));
+        assert_eq!(
+            check_generalized_time(b"20000229000000Z", Rules::Der),
+            Ok(())
+        );
         assert_eq!(check_utc_time(b"000229000000Z", Rules::Der), Ok(()));
-        assert_eq!(check_utc_time(b"990229000000Z", Rules::Der), Err(Error::Time));
+        assert_eq!(
+            check_utc_time(b"990229000000Z", Rules::Der),
+            Err(Error::Time)
+        );
         assert_eq!(check_utc_time(b"9105062345", Rules::Ber), Err(Error::Time));
         assert_eq!(check_utc_time(&[b'1'; 70], Rules::Ber), Err(Error::Time));
         let mut w = Writer::new();
@@ -2883,7 +3276,10 @@ mod tests {
     #[test]
     fn indefinite_lengths() {
         // Nested indefinite lengths, with a definite one inside.
-        let b = [0x30, 0x80, 0x30, 0x80, 0x02, 0x01, 0x07, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00];
+        let b = [
+            0x30, 0x80, 0x30, 0x80, 0x02, 0x01, 0x07, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01,
+            0x01, 0x00,
+        ];
         let mut r = Reader::new(&b, Rules::Ber);
         let outer = r.read().unwrap();
         assert!(outer.is_indefinite());
@@ -2901,7 +3297,10 @@ mod tests {
         // Copied, it comes out as DER.
         let mut w = Writer::new();
         copy(outer, &mut w).unwrap();
-        assert_eq!(w.finish().unwrap(), [0x30, 0x07, 0x30, 0x03, 0x02, 0x01, 0x07, 0x05, 0x00]);
+        assert_eq!(
+            w.finish().unwrap(),
+            [0x30, 0x07, 0x30, 0x03, 0x02, 0x01, 0x07, 0x05, 0x00]
+        );
     }
 
     #[test]
@@ -2916,7 +3315,10 @@ mod tests {
         assert_eq!(ber(&[0x04, 0x83, 0x20, 0x00, 0x00]), Err(Error::TooLong));
         assert_eq!(ber(&[0x04, 0xff]), Err(Error::Length));
         assert_eq!(ber(&[0x04, 0x85, 0, 0, 0, 0, 1, 0]), Err(Error::Length));
-        assert_eq!(derr(&[0x04, 0x81, 0x05, 0, 0, 0, 0, 0]), Err(Error::NonMinimalLength));
+        assert_eq!(
+            derr(&[0x04, 0x81, 0x05, 0, 0, 0, 0, 0]),
+            Err(Error::NonMinimalLength)
+        );
         assert_eq!(derr(&[0x30, 0x80, 0x00, 0x00]), Err(Error::Indefinite));
         assert_eq!(ber(&[0x04, 0x80, 0x00, 0x00]), Err(Error::Indefinite));
         assert_eq!(ber(&[0x00, 0x00]), Err(Error::Eoc));
@@ -2927,41 +3329,102 @@ mod tests {
         assert_eq!(Reader::new(&[], Rules::Ber).read(), Err(Error::Empty));
         assert_eq!(
             Reader::new(&[0x02, 0x01, 0x00], Rules::Ber).read_boolean(),
-            Err(Error::Unexpected { expected: Tag::BOOLEAN, found: Tag::INTEGER })
+            Err(Error::Unexpected {
+                expected: Tag::BOOLEAN,
+                found: Tag::INTEGER
+            })
         );
-        assert_eq!(ber(&[0x04, 0x00]).unwrap().reader().err(), Some(Error::Primitive));
-        assert_eq!(ber(&[0x21, 0x03, 0x01, 0x01, 0xff]).unwrap().boolean(), Err(Error::Constructed));
-        assert_eq!(derr(&[0x24, 0x03, 0x04, 0x01, 0x00]).unwrap().octet_string(), Err(Error::Constructed));
-        assert_eq!(ber(&[0x01, 0x02, 0x00, 0x00]).unwrap().boolean(), Err(Error::Boolean));
+        assert_eq!(
+            ber(&[0x04, 0x00]).unwrap().reader().err(),
+            Some(Error::Primitive)
+        );
+        assert_eq!(
+            ber(&[0x21, 0x03, 0x01, 0x01, 0xff]).unwrap().boolean(),
+            Err(Error::Constructed)
+        );
+        assert_eq!(
+            derr(&[0x24, 0x03, 0x04, 0x01, 0x00])
+                .unwrap()
+                .octet_string(),
+            Err(Error::Constructed)
+        );
+        assert_eq!(
+            ber(&[0x01, 0x02, 0x00, 0x00]).unwrap().boolean(),
+            Err(Error::Boolean)
+        );
         assert_eq!(ber(&[0x01, 0x00]).unwrap().boolean(), Err(Error::Boolean));
         assert_eq!(ber(&[0x02, 0x00]).unwrap().integer(), Err(Error::Integer));
-        assert_eq!(ber(&[0x02, 0x02, 0x00, 0x7f]).unwrap().integer(), Err(Error::Integer));
-        assert_eq!(ber(&[0x02, 0x02, 0xff, 0x80]).unwrap().integer(), Err(Error::Integer));
+        assert_eq!(
+            ber(&[0x02, 0x02, 0x00, 0x7f]).unwrap().integer(),
+            Err(Error::Integer)
+        );
+        assert_eq!(
+            ber(&[0x02, 0x02, 0xff, 0x80]).unwrap().integer(),
+            Err(Error::Integer)
+        );
         assert_eq!(ber(&[0x05, 0x01, 0x00]).unwrap().null(), Err(Error::Null));
-        assert_eq!(ber(&[0x03, 0x00]).unwrap().bit_string(), Err(Error::BitString));
-        assert_eq!(ber(&[0x03, 0x01, 0x01]).unwrap().bit_string(), Err(Error::BitString));
-        assert_eq!(ber(&[0x03, 0x02, 0x08, 0x00]).unwrap().bit_string(), Err(Error::BitString));
-        assert_eq!(derr(&[0x03, 0x02, 0x01, 0x01]).unwrap().bit_string(), Err(Error::BitString));
+        assert_eq!(
+            ber(&[0x03, 0x00]).unwrap().bit_string(),
+            Err(Error::BitString)
+        );
+        assert_eq!(
+            ber(&[0x03, 0x01, 0x01]).unwrap().bit_string(),
+            Err(Error::BitString)
+        );
+        assert_eq!(
+            ber(&[0x03, 0x02, 0x08, 0x00]).unwrap().bit_string(),
+            Err(Error::BitString)
+        );
+        assert_eq!(
+            derr(&[0x03, 0x02, 0x01, 0x01]).unwrap().bit_string(),
+            Err(Error::BitString)
+        );
         assert!(ber(&[0x03, 0x02, 0x01, 0x01]).is_ok_and(|e| e.bit_string().is_ok()));
         // A segment other than the last with unused bits.
         let seg = [0x23, 0x08, 0x03, 0x02, 0x01, 0xfe, 0x03, 0x02, 0x00, 0xff];
         assert_eq!(ber(&seg).unwrap().bit_string(), Err(Error::BitString));
         assert_eq!(ber(&[0x06, 0x00]).unwrap().oid(), Err(Error::Oid));
         assert_eq!(ber(&[0x06, 0x01, 0x81]).unwrap().oid(), Err(Error::Oid));
-        assert_eq!(ber(&[0x06, 0x02, 0x80, 0x01]).unwrap().oid(), Err(Error::Oid));
-        assert_eq!(ber(&[0x06, 0x03, 0x2a, 0x80, 0x01]).unwrap().oid(), Err(Error::Oid));
-        assert_eq!(Oid::from_contents(&[0x01; MAX_OID_LEN + 1]), Err(Error::Oid));
+        assert_eq!(
+            ber(&[0x06, 0x02, 0x80, 0x01]).unwrap().oid(),
+            Err(Error::Oid)
+        );
+        assert_eq!(
+            ber(&[0x06, 0x03, 0x2a, 0x80, 0x01]).unwrap().oid(),
+            Err(Error::Oid)
+        );
+        assert_eq!(
+            Oid::from_contents(&[0x01; MAX_OID_LEN + 1]),
+            Err(Error::Oid)
+        );
         assert_eq!(Oid::from_arcs(&[1]), Err(Error::Oid));
         assert_eq!(Oid::from_arcs(&[3, 1]), Err(Error::Oid));
         assert_eq!(Oid::from_arcs(&[1, 40]), Err(Error::Oid));
         assert_eq!(Oid::from_arcs(&[2, u128::MAX]), Err(Error::Oid));
         assert_eq!(Oid::from_arcs(&[1; 300]), Err(Error::Oid));
-        for bad in ["", "1", "1.", ".1", "1..2", "1.+2", "1.2.x", "3.1", "1.2.340282366920938463463374607431768211456"]
-        {
+        for bad in [
+            "",
+            "1",
+            "1.",
+            ".1",
+            "1..2",
+            "1.+2",
+            "1.2.x",
+            "3.1",
+            "1.2.340282366920938463463374607431768211456",
+        ] {
             assert_eq!(bad.parse::<Oid>(), Err(Error::Oid), "{bad:?}");
         }
-        assert_eq!(ber(&[0x13, 0x01, b'@']).unwrap().text(StringKind::Printable), Err(Error::Charset));
-        assert_eq!(ber(&[0x17, 0x01, b'1']).unwrap().utc_time(), Err(Error::Time));
+        assert_eq!(
+            ber(&[0x13, 0x01, b'@'])
+                .unwrap()
+                .text(StringKind::Printable),
+            Err(Error::Charset)
+        );
+        assert_eq!(
+            ber(&[0x17, 0x01, b'1']).unwrap().utc_time(),
+            Err(Error::Time)
+        );
         assert_eq!(BitString::new(&[][..], 1), Err(Error::BitString));
         assert_eq!(BitString::new(&[1][..], 8), Err(Error::BitString));
         // Writer refusals.
@@ -2987,7 +3450,14 @@ mod tests {
         assert!(w.is_empty());
         assert_eq!(w.error(), Some(Error::Charset));
         // Every error has a message.
-        assert!(Error::Unexpected { expected: Tag::NULL, found: Tag::BOOLEAN }.to_string().contains("[UNIVERSAL 5]"));
+        assert!(
+            Error::Unexpected {
+                expected: Tag::NULL,
+                found: Tag::BOOLEAN
+            }
+            .to_string()
+            .contains("[UNIVERSAL 5]")
+        );
     }
 
     #[test]
@@ -3107,10 +3577,17 @@ mod tests {
                     w.constructed(Tag::private(5).as_constructed(), |w| w.null());
                 })
             }),
-            vec![0x30, 0x80, 0x24, 0x80, 0x04, 0x01, b'a', 0x00, 0x00, 0x02, 0x01, 0x01, 0x00, 0x00],
-            vec![0x23, 0x80, 0x03, 0x03, 0x00, 0x0a, 0x3b, 0x03, 0x05, 0x04, 0x5f, 0x29, 0x1c, 0xd0, 0x00, 0x00],
+            vec![
+                0x30, 0x80, 0x24, 0x80, 0x04, 0x01, b'a', 0x00, 0x00, 0x02, 0x01, 0x01, 0x00, 0x00,
+            ],
+            vec![
+                0x23, 0x80, 0x03, 0x03, 0x00, 0x0a, 0x3b, 0x03, 0x05, 0x04, 0x5f, 0x29, 0x1c, 0xd0,
+                0x00, 0x00,
+            ],
             vec![0x31, 0x80, 0x01, 0x01, 0x07, 0x02, 0x01, 0x00, 0x00, 0x00],
-            vec![0x7f, 0x81, 0x49, 0x84, 0x00, 0x00, 0x00, 0x03, 0x17, 0x01, b'9'],
+            vec![
+                0x7f, 0x81, 0x49, 0x84, 0x00, 0x00, 0x00, 0x03, 0x17, 0x01, b'9',
+            ],
             vec![0x04, 0x81, 0x02, 0xab, 0xcd],
         ]
     }
@@ -3134,8 +3611,16 @@ mod tests {
             let n = element_len(&s, Rules::Ber).unwrap().unwrap();
             assert_eq!(n, s.len());
             for k in 0..n {
-                assert_eq!(element_len(&s[..k], Rules::Ber), Ok(None), "{k} of {s:02x?}");
-                let want = if k == 0 { Error::Empty } else { Error::Truncated };
+                assert_eq!(
+                    element_len(&s[..k], Rules::Ber),
+                    Ok(None),
+                    "{k} of {s:02x?}"
+                );
+                let want = if k == 0 {
+                    Error::Empty
+                } else {
+                    Error::Truncated
+                };
                 assert_eq!(Reader::new(&s[..k], Rules::Ber).read(), Err(want));
             }
         }
@@ -3259,7 +3744,10 @@ mod tests {
             (&[0x05, 0x00, 0x05, 0x00], Error::Trailing),
             (&[0x30, 0x05, 0x30, 0x03, 0x01, 0x01, 0x01], Error::Boolean),
             (&[0x30, 0x04, 0x02, 0x02, 0x00, 0x01], Error::Integer),
-            (&[0x31, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01], Error::SetOrder),
+            (
+                &[0x31, 0x06, 0x02, 0x01, 0x02, 0x02, 0x01, 0x01],
+                Error::SetOrder,
+            ),
             (&[0x10, 0x00], Error::Primitive),
             (&[0x24, 0x03, 0x04, 0x01, 0x00], Error::Constructed),
             (&[0x13, 0x01, b'@'], Error::Charset),
@@ -3273,7 +3761,11 @@ mod tests {
         assert_eq!(der(|w| w.encoded(&[0x80, 0x01, 0xff])), [0x80, 0x01, 0xff]);
         // Depth counts from where it is written.
         fn nest(w: &mut Writer, n: usize, inner: &[u8]) {
-            if n == 0 { w.encoded(inner) } else { w.sequence(|w| nest(w, n - 1, inner)) }
+            if n == 0 {
+                w.encoded(inner)
+            } else {
+                w.sequence(|w| nest(w, n - 1, inner))
+            }
         }
         let mut w = Writer::new();
         nest(&mut w, MAX_DEPTH, &[0x30, 0x00]);
@@ -3283,16 +3775,28 @@ mod tests {
         check(&w.finish().unwrap());
         // Strings this module does not decode read as bytes.
         let t = der(|w| w.string_bytes(StringKind::General, b"x"));
-        assert_eq!(Reader::new(&t, Rules::Der).read_string_bytes(StringKind::General).unwrap().as_ref(), b"x");
+        assert_eq!(
+            Reader::new(&t, Rules::Der)
+                .read_string_bytes(StringKind::General)
+                .unwrap()
+                .as_ref(),
+            b"x"
+        );
         assert_eq!(
             Reader::new(&t, Rules::Der).read_string_bytes(StringKind::Ia5),
-            Err(Error::Unexpected { expected: Tag::IA5_STRING, found: Tag::GENERAL_STRING })
+            Err(Error::Unexpected {
+                expected: Tag::IA5_STRING,
+                found: Tag::GENERAL_STRING
+            })
         );
         let mut d = Stream::new(Elements::new(Rules::Der));
         assert_eq!(d.decoder().rules(), Rules::Der);
         assert_eq!(d.push(&t[..1]), 1);
         assert_eq!((d.next(), d.buffered()), (None, 1));
-        assert_eq!(BitString::new(vec![0; MAX_INPUT + 1], 0), Err(Error::TooLong));
+        assert_eq!(
+            BitString::new(vec![0; MAX_INPUT + 1], 0),
+            Err(Error::TooLong)
+        );
     }
 
     #[test]
@@ -3300,8 +3804,10 @@ mod tests {
         let mut rng = Lcg::new(0x2545_f491_4f6c_dd1d);
         let seeds = samples();
         // Bytes that make up most headers, so random input gets past them.
-        const COMMON: [u8; 16] =
-            [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0c, 0x13, 0x17, 0x18, 0x30, 0x31, 0x80, 0x81, 0xa0];
+        const COMMON: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0c, 0x13, 0x17, 0x18, 0x30, 0x31, 0x80,
+            0x81, 0xa0,
+        ];
         for round in 0..6000 {
             let mut data = if round % 2 == 0 {
                 seeds[rng.index(seeds.len())].clone()
@@ -3327,10 +3833,16 @@ mod tests {
         // empty constructed segment after a seven-bit one is still a later
         // segment.
         let b = [0x23, 0x06, 0x03, 0x02, 0x01, 0xfe, 0x23, 0x00];
-        assert_eq!(one(&b, Rules::Ber).unwrap().bit_string(), Err(Error::BitString));
+        assert_eq!(
+            one(&b, Rules::Ber).unwrap().bit_string(),
+            Err(Error::BitString)
+        );
         // Nested one level down too.
         let b = [0x23, 0x08, 0x23, 0x04, 0x03, 0x02, 0x01, 0xfe, 0x23, 0x00];
-        assert_eq!(one(&b, Rules::Ber).unwrap().bit_string(), Err(Error::BitString));
+        assert_eq!(
+            one(&b, Rules::Ber).unwrap().bit_string(),
+            Err(Error::BitString)
+        );
         // Empty segments before the last are fine.
         let b = [0x23, 0x06, 0x23, 0x00, 0x03, 0x02, 0x01, 0xfe];
         let v = one(&b, Rules::Ber).unwrap().bit_string().unwrap();
@@ -3342,15 +3854,31 @@ mod tests {
         // ISO 8601, which X.680 46 follows, writes a positive leap second
         // as second 60.
         for t in ["20161231235960Z", "20161231235960.5Z"] {
-            assert_eq!(check_generalized_time(t.as_bytes(), Rules::Der), Ok(()), "{t}");
+            assert_eq!(
+                check_generalized_time(t.as_bytes(), Rules::Der),
+                Ok(()),
+                "{t}"
+            );
             let mut w = Writer::new();
             w.generalized_time(t);
             let b = w.finish().unwrap();
-            assert_eq!(Reader::new(&b, Rules::Der).read_generalized_time().unwrap(), t);
+            assert_eq!(
+                Reader::new(&b, Rules::Der).read_generalized_time().unwrap(),
+                t
+            );
         }
-        assert_eq!(check_generalized_time(b"20170101085960+0900", Rules::Ber), Ok(()));
-        assert_eq!(check_generalized_time(b"20161231235961Z", Rules::Ber), Err(Error::Time));
-        assert_eq!(check_utc_time(b"161231235960Z", Rules::Der), Err(Error::Time));
+        assert_eq!(
+            check_generalized_time(b"20170101085960+0900", Rules::Ber),
+            Ok(())
+        );
+        assert_eq!(
+            check_generalized_time(b"20161231235961Z", Rules::Ber),
+            Err(Error::Time)
+        );
+        assert_eq!(
+            check_utc_time(b"161231235960Z", Rules::Der),
+            Err(Error::Time)
+        );
     }
 
     #[test]
@@ -3367,13 +3895,23 @@ mod tests {
             &[0x00, 0x1b, 0x00, 0x6e],
             &[0x00, 0x1b],
         ] {
-            assert_eq!(StringKind::Bmp.check(bad), Err(Error::Charset), "{bad:02x?}");
+            assert_eq!(
+                StringKind::Bmp.check(bad),
+                Err(Error::Charset),
+                "{bad:02x?}"
+            );
             let mut b = vec![0x1e, bad.len() as u8];
             b.extend_from_slice(bad);
             assert_eq!(Reader::new(&b, Rules::Der).read_text(), Err(Error::Charset));
         }
-        assert_eq!(StringKind::Universal.check(&[0, 0, 0, 0x0e]), Err(Error::Charset));
-        assert_eq!(StringKind::Universal.check(&[0, 0, 0, 0x1b, 0, 0, 0, 0x24]), Err(Error::Charset));
+        assert_eq!(
+            StringKind::Universal.check(&[0, 0, 0, 0x0e]),
+            Err(Error::Charset)
+        );
+        assert_eq!(
+            StringKind::Universal.check(&[0, 0, 0, 0x1b, 0, 0, 0, 0x24]),
+            Err(Error::Charset)
+        );
         let mut w = Writer::new();
         w.text(StringKind::Bmp, "\u{000e}");
         assert_eq!(w.finish(), Err(Error::Charset));
@@ -3404,9 +3942,20 @@ mod tests {
             assert!(StringKind::Bmp.encode(&back).unwrap() == b[5..]);
             // A UniversalString is measured by its own bytes too: 300,000
             // ASCII characters are 1,200,000 bytes.
-            assert_eq!(StringKind::Universal.encode(&"a".repeat(300_000)), Err(Error::TooLong));
-            assert_eq!(StringKind::Universal.encode(&"a".repeat(200_000)).map(|b| b.len()), Ok(800_000));
-            assert_eq!(StringKind::Utf8.encode(&"a".repeat(MAX_INPUT + 1)), Err(Error::TooLong));
+            assert_eq!(
+                StringKind::Universal.encode(&"a".repeat(300_000)),
+                Err(Error::TooLong)
+            );
+            assert_eq!(
+                StringKind::Universal
+                    .encode(&"a".repeat(200_000))
+                    .map(|b| b.len()),
+                Ok(800_000)
+            );
+            assert_eq!(
+                StringKind::Utf8.encode(&"a".repeat(MAX_INPUT + 1)),
+                Err(Error::TooLong)
+            );
         }
     }
 
@@ -3414,7 +3963,10 @@ mod tests {
     fn string_decode_is_bounded() {
         let big = vec![b'a'; MAX_INPUT + 1];
         assert_eq!(StringKind::Utf8.decode(&big), Err(Error::TooLong));
-        assert_eq!(StringKind::Utf8.decode(&big[..MAX_INPUT]).map(|s| s.len()), Ok(MAX_INPUT));
+        assert_eq!(
+            StringKind::Utf8.decode(&big[..MAX_INPUT]).map(|s| s.len()),
+            Ok(MAX_INPUT)
+        );
     }
 
     #[test]
@@ -3440,7 +3992,10 @@ mod tests {
             w.null();
         });
         assert_eq!(w.finish(), Err(Error::Implicit));
-        assert_eq!(der(|w| w.explicit(0, |w| w.null())), [0xa0, 0x02, 0x05, 0x00]);
+        assert_eq!(
+            der(|w| w.explicit(0, |w| w.null())),
+            [0xa0, 0x02, 0x05, 0x00]
+        );
     }
 
     #[test]
@@ -3592,12 +4147,23 @@ mod tests {
         assert_eq!(stream.next(), None);
         assert_eq!(stream.decoder().resume.unwrap().pos, 8);
         assert_eq!(stream.push(&[0, 0, 0, 0, 5, 0]), 6);
-        assert_eq!(stream.next(), Some(Ok(vec![0x30, 0x80, 5, 0, 0x30, 0x80, 5, 0, 0, 0, 0, 0])));
+        assert_eq!(
+            stream.next(),
+            Some(Ok(vec![0x30, 0x80, 5, 0, 0x30, 0x80, 5, 0, 0, 0, 0, 0]))
+        );
         assert_eq!(stream.next(), Some(Ok(vec![5, 0])));
         assert_eq!(stream.decoder().rules(), Rules::Ber);
         assert_eq!(stream.decoder().held(), 0);
         bytes.extend_from_slice(&[0x30, 0x80, 5, 0, 0, 0, 0, 0, 5, 0]);
-        contract::check_decode_with_alloc_limit(|| Elements::new(Rules::Ber), &bytes, 2 * MAX_INPUT);
-        contract::check_decode_with_alloc_limit(|| Elements::new(Rules::Der), &bytes, 2 * MAX_INPUT);
+        contract::check_decode_with_alloc_limit(
+            || Elements::new(Rules::Ber),
+            &bytes,
+            2 * MAX_INPUT,
+        );
+        contract::check_decode_with_alloc_limit(
+            || Elements::new(Rules::Der),
+            &bytes,
+            2 * MAX_INPUT,
+        );
     }
 }

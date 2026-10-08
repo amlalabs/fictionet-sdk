@@ -2,13 +2,13 @@
 //! world builds, as it writes them.
 #![no_main]
 
-use fictionet::stdlib::codec::Frames;
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Assembled, Wire};
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::cotp::{Connect, Data, Parameter, Tpdu, Variable};
 use fictionet::stdlib::cotp::{messages, over_tpkt};
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::tpkt::{
     Error, HEADER_LEN, Header, MAX_PACKET, MAX_PAYLOAD, MIN_PACKET, MIN_PAYLOAD, Packet,
 };
@@ -59,10 +59,7 @@ fn built(data: &[u8]) -> Result<()> {
         }
         Err(e) => {
             assert!(!fits);
-            assert_eq!(
-                e,
-                fictionet::stdlib::cotp::Error::Unwritable
-            );
+            assert_eq!(e, fictionet::stdlib::cotp::Error::Unwritable);
         }
     }
     // A connection request a world builds, with any fields, parameters,
@@ -125,7 +122,9 @@ fuzz_target!(|data: &[u8]| {
         check_decode(|| Frames::<Packet>::with_limit(limit), data);
         let (packets, _) = decode_all(|| Frames::<Packet>::with_limit(limit), data);
         for packet in packets {
-            assert!(packet.payload.len() + HEADER_LEN <= Frames::<Packet>::with_limit(limit).limit());
+            assert!(
+                packet.payload.len() + HEADER_LEN <= Frames::<Packet>::with_limit(limit).limit()
+            );
             assert!((MIN_PAYLOAD..=MAX_PAYLOAD).contains(&packet.payload.len()));
             check_wire_value(&packet);
             check_wire::<Tpdu>(&packet.payload);

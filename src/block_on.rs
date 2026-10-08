@@ -92,7 +92,9 @@ fn spin_on<F: Future>(future: F) -> F::Output {
         // coming due can wake the future.
         while !woken.0.swap(false, Ordering::AcqRel) {
             if crate::timer::timers().fire().is_none() && !woken.0.load(Ordering::Acquire) {
-                panic!("block_on: the future waits for something that nothing in this thread can wake");
+                panic!(
+                    "block_on: the future waits for something that nothing in this thread can wake"
+                );
             }
             std::hint::spin_loop();
         }

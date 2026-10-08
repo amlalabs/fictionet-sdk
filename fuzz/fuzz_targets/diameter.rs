@@ -4,19 +4,31 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::diameter::harness::FORMATS;
 use fictionet::stdlib::diameter::{
     Address, Avp, Format, Identity, MAX_AVP_DATA, Message, Uri, Value, base_format, check,
 };
-use fictionet::stdlib::diameter::harness::FORMATS;
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * Frames::<Message>::new().capacity());
+    contract::check_decode_with_alloc_limit(
+        Frames::<Message>::new,
+        data,
+        2 * Frames::<Message>::new().capacity(),
+    );
     contract::check_wire::<Message>(data);
-    contract::check_decode_with_alloc_limit(|| Frames::<Message>::with_limit(0), data, 2 * Frames::<Message>::with_limit(0).capacity());
-    contract::check_decode_with_alloc_limit(|| Frames::<Message>::with_limit(64), data, 2 * Frames::<Message>::with_limit(64).capacity());
+    contract::check_decode_with_alloc_limit(
+        || Frames::<Message>::with_limit(0),
+        data,
+        2 * Frames::<Message>::with_limit(0).capacity(),
+    );
+    contract::check_decode_with_alloc_limit(
+        || Frames::<Message>::with_limit(64),
+        data,
+        2 * Frames::<Message>::with_limit(64).capacity(),
+    );
     let mut built = Message::request(u32::from(data.first().copied().unwrap_or(0)) << 20, 0, 1, 2);
     built.error = true;
     built.avps.push(Avp {
@@ -44,7 +56,13 @@ fuzz_target!(|data: &[u8]| {
         let bytes = m.to_bytes().unwrap();
         let back = Message::parse(&bytes).unwrap();
         assert_eq!(&back, m);
-        let _ = check(&m.avps, |code, vendor| if vendor.is_none() { base_format(code) } else { None });
+        let _ = check(&m.avps, |code, vendor| {
+            if vendor.is_none() {
+                base_format(code)
+            } else {
+                None
+            }
+        });
         // Every AVP read as grouped goes down to the depth limit.
         let _ = check(&m.avps, |_, _| Some(Format::Grouped));
         let reply = m.answer();
@@ -56,7 +74,9 @@ fuzz_target!(|data: &[u8]| {
             for f in FORMATS {
                 if let Ok(v) = avp.value(f) {
                     let written = Avp::new(avp.code, &v).unwrap();
-                    if !matches!(f, Format::Grouped | Format::DiameterUri) && avp.data.len() <= MAX_AVP_DATA {
+                    if !matches!(f, Format::Grouped | Format::DiameterUri)
+                        && avp.data.len() <= MAX_AVP_DATA
+                    {
                         assert_eq!(written.data, avp.data, "{f:?}");
                     }
                     let v2 = written.value(f).unwrap();
@@ -72,7 +92,10 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(list) = Avp::parse_list(data)
         && data.len() <= MAX_AVP_DATA
     {
-        assert_eq!(Avp::parse_list(&Avp::new(1, &Value::Grouped(list.clone())).unwrap().data), Ok(list));
+        assert_eq!(
+            Avp::parse_list(&Avp::new(1, &Value::Grouped(list.clone())).unwrap().data),
+            Ok(list)
+        );
     }
     if let Ok(a) = Address::parse(data)
         && data.len() <= MAX_AVP_DATA

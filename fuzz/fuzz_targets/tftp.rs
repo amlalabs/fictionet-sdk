@@ -6,8 +6,8 @@
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::tftp::{
-    DEFAULT_BLOCK_SIZE, Event, MAX_BLOCK_SIZE, MAX_REQUEST, Negotiated, NetasciiBytes, NetasciiByte,
-    Packet, ReadTransfer, TftpOption, negotiate, parse_number,
+    DEFAULT_BLOCK_SIZE, Event, MAX_BLOCK_SIZE, MAX_REQUEST, Negotiated, NetasciiByte,
+    NetasciiBytes, Packet, ReadTransfer, TftpOption, negotiate, parse_number,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -29,8 +29,13 @@ fn receive(mut t: ReadTransfer) -> Vec<u8> {
                     Packet::parse(&packet.to_bytes().unwrap()),
                     Ok(packet.clone())
                 );
-                if let Some(o) = options.iter().find(|o| o.name.eq_ignore_ascii_case("blksize")) {
-                    size = parse_number(&o.value).and_then(|v| usize::try_from(v).ok()).expect("a valid blksize");
+                if let Some(o) = options
+                    .iter()
+                    .find(|o| o.name.eq_ignore_ascii_case("blksize"))
+                {
+                    size = parse_number(&o.value)
+                        .and_then(|v| usize::try_from(v).ok())
+                        .expect("a valid blksize");
                 }
                 0
             }
@@ -71,28 +76,48 @@ fuzz_target!(|data: &[u8]| {
         };
         if let Some(options) = options {
             let agreed = negotiate(options, Some(data.len() as u64), MAX_BLOCK_SIZE);
-            let oack = Packet::OptionAck { options: agreed.oack.clone() };
+            let oack = Packet::OptionAck {
+                options: agreed.oack.clone(),
+            };
             contract::check_wire_value(&oack);
             assert!(oack.to_bytes().is_ok());
             // The transfer follows the parsed options as given, too, even
             // when they were not negotiated.
-            for agreed in [agreed.clone(), Negotiated { oack: options.clone(), ..agreed }] {
-                assert_eq!(receive(ReadTransfer::negotiated(data.to_vec(), &agreed)), data);
+            for agreed in [
+                agreed.clone(),
+                Negotiated {
+                    oack: options.clone(),
+                    ..agreed
+                },
+            ] {
+                assert_eq!(
+                    receive(ReadTransfer::negotiated(data.to_vec(), &agreed)),
+                    data
+                );
             }
         }
     }
     // A transfer of the input, with block size and ACKs taken from it.
     if let [a, b, rest @ ..] = data {
         let blksize = u16::from_be_bytes([*a, *b]).to_string();
-        let agreed = negotiate(&[TftpOption::new("blksize", &blksize)], None, MAX_BLOCK_SIZE);
+        let agreed = negotiate(
+            &[TftpOption::new("blksize", &blksize)],
+            None,
+            MAX_BLOCK_SIZE,
+        );
         let mut t = ReadTransfer::negotiated(rest.to_vec(), &agreed);
         for ack in rest.chunks_exact(2) {
-            if let Event::Send(Packet::Data { data, .. }) = t.receive_ack(u16::from_be_bytes([ack[0], ack[1]])) {
+            if let Event::Send(Packet::Data { data, .. }) =
+                t.receive_ack(u16::from_be_bytes([ack[0], ack[1]]))
+            {
                 assert!(data.len() <= usize::from(t.block_size()));
             }
         }
         let _ = t.current();
-        assert_eq!(receive(ReadTransfer::negotiated(rest.to_vec(), &agreed)), rest);
+        assert_eq!(
+            receive(ReadTransfer::negotiated(rest.to_vec(), &agreed)),
+            rest
+        );
         assert_eq!(receive(ReadTransfer::new(rest.to_vec())), rest);
     }
     let mut encoded = Vec::new();

@@ -1,12 +1,10 @@
 //! RESP (Redis) commands and values through the shared codec driver.
 
-use fictionet::stdlib::codec::{
-    Decode, Fail, Lcg, Stream, Wire, finish, pump,
-};
+use fictionet::stdlib::codec::{Decode, Fail, Lcg, Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::{decode_all, mutate};
 use fictionet::stdlib::resp;
+use fictionet::stdlib::test_support::{decode_all, mutate};
 
 const RESP_LIMIT: usize = 128;
 
@@ -172,10 +170,7 @@ fn resp_strict_writers_preserve_types_and_roll_back() {
     ] {
         contract::check_wire_value(&value);
         let mut out = b"prefix".to_vec();
-        assert_eq!(
-            Wire::write(&value, &mut out),
-            Err(resp::Error::Unwritable)
-        );
+        assert_eq!(Wire::write(&value, &mut out), Err(resp::Error::Unwritable));
         assert_eq!(out, b"prefix");
     }
     let mut deep = resp::Value::Null;

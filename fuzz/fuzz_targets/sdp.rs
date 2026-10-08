@@ -5,16 +5,20 @@
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::sdp::{
-    Attribute, SessionDescriptions, MAX_LINE_LEN, MAX_LINES, SessionDescription,
-};
 use fictionet::stdlib::sdp::harness::check_attribute;
+use fictionet::stdlib::sdp::{
+    Attribute, MAX_LINE_LEN, MAX_LINES, SessionDescription, SessionDescriptions,
+};
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(SessionDescriptions::new, data, 2 * (MAX_LINE_LEN + 2));
-    contract::check_decode_with_held_limit(SessionDescriptions::new, data, fictionet::stdlib::sdp::MAX_LEN);
+    contract::check_decode_with_held_limit(
+        SessionDescriptions::new,
+        data,
+        fictionet::stdlib::sdp::MAX_LEN,
+    );
     contract::check_wire::<SessionDescription>(data);
     // The input as one attribute value, as a trickled ICE candidate comes
     // on its own, not inside a description. The helpers refuse values
@@ -29,7 +33,10 @@ fuzz_target!(|data: &[u8]| {
     let whole = SessionDescription::parse(data);
     let expected = match &whole {
         Ok(description) => (vec![description.clone()], None),
-        Err(error) => (vec![], Some(fictionet::stdlib::codec::Fail::Protocol(*error))),
+        Err(error) => (
+            vec![],
+            Some(fictionet::stdlib::codec::Fail::Protocol(*error)),
+        ),
     };
     assert_eq!(decode_all(SessionDescriptions::new, data), expected);
 

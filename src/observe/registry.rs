@@ -79,7 +79,10 @@ pub struct Registry {
 impl std::fmt::Debug for Registry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Registry")
-            .field("names", &self.entries.iter().map(|e| &e.name).collect::<Vec<_>>())
+            .field(
+                "names",
+                &self.entries.iter().map(|e| &e.name).collect::<Vec<_>>(),
+            )
             .field("choice", &self.choice)
             .finish()
     }

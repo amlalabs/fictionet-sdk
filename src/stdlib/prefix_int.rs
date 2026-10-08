@@ -150,7 +150,6 @@ mod tests {
     use super::*;
     use fictionet::stdlib::test_support::hex;
 
-
     #[test]
     fn prefix_reads_and_failed_writes_preserve_their_boundaries() {
         let bytes = [0x3f, 0x9a, 0x0a, 0xff];

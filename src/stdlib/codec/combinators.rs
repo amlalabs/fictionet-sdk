@@ -1,8 +1,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use fictionet::stdlib::codec::{Buffer, Decode, Step, Wire};
 use core::{convert::Infallible, error::Error, fmt, marker::PhantomData};
+use fictionet::stdlib::codec::{Buffer, Decode, Step, Wire};
 
 /// Applies a closure to each item without changing framing or errors.
 pub struct Map<D, F> {
@@ -184,9 +184,10 @@ impl Decode for Lines {
         }
         if self.skipping {
             self.scanned = 0;
-            if let Some(i) = input.iter().position(|b| {
-                *b == b'\n' || (self.ending == Ending::LfOrCrOrCrlf && *b == b'\r')
-            }) {
+            if let Some(i) = input
+                .iter()
+                .position(|b| *b == b'\n' || (self.ending == Ending::LfOrCrOrCrlf && *b == b'\r'))
+            {
                 let mut n = i.saturating_add(1);
                 if self.ending == Ending::LfOrCrOrCrlf && input.get(i) == Some(&b'\r') {
                     if input.get(n) == Some(&b'\n') {
@@ -212,9 +213,7 @@ impl Decode for Lines {
             .get(scan..stop)
             .unwrap_or_default()
             .iter()
-            .position(|b| {
-                *b == b'\n' || (self.ending == Ending::LfOrCrOrCrlf && *b == b'\r')
-            })
+            .position(|b| *b == b'\n' || (self.ending == Ending::LfOrCrOrCrlf && *b == b'\r'))
             .map(|i| scan.saturating_add(i));
         if let Some(i) = newline {
             let any_cr = self.ending == Ending::LfOrCrOrCrlf;

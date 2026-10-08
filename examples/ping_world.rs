@@ -21,9 +21,14 @@ use fictionet::stdlib::{icmp, ip};
 use fictionet::{Attachment, Cx, Interface, Packet, RecvError, Result};
 
 fn main() -> Result {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/run/fictionet/world.sock".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/run/fictionet/world.sock".into());
     let (attacher, mut attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
+    let _listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(path.clone().into()),
+        attacher,
+    )?;
     println!("listening on {path}");
     fictionet::block_on(fictionet::run(move |fcx| async move {
         // `next` returns `Cancelled` when the world stops, and `?` ends
@@ -44,7 +49,9 @@ async fn serve(fcx: Cx, sandbox: Attachment) -> Result {
         match pings.recv(&fcx).await {
             Ok(packet) => {
                 // Answer at whatever address the sandbox pinged.
-                let Some(addr) = destination(&packet) else { continue };
+                let Some(addr) = destination(&packet) else {
+                    continue;
+                };
                 if let Some(reply) = icmp::echo_reply(&packet, addr) {
                     pings.send(reply);
                     answered += 1;

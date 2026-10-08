@@ -7,17 +7,17 @@
 //! In its own test binary, because it measures the process's memory. The
 //! tests take turns, so one does not count the other's memory.
 
-#[path = "common/timeout.rs"]
-mod timeout;
-#[path = "common/sandbox.rs"]
-mod sandbox;
-#[path = "common/wait.rs"]
-mod wait;
 #[path = "common/machine.rs"]
 mod machine;
+#[path = "common/sandbox.rs"]
+mod sandbox;
+#[path = "common/timeout.rs"]
+mod timeout;
+#[path = "common/wait.rs"]
+mod wait;
 
-use sandbox::Machine;
 use machine::machine;
+use sandbox::Machine;
 use timeout::timeout;
 
 use std::convert::Infallible;
@@ -95,7 +95,16 @@ fn udp(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8]) -> Pac
 }
 
 #[allow(clippy::too_many_arguments)]
-fn tcp_seg(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, seq: u32, ack: u32, flags: u8, data: &[u8]) -> Packet {
+fn tcp_seg(
+    src: Ipv4Addr,
+    sport: u16,
+    dst: Ipv4Addr,
+    dport: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    data: &[u8],
+) -> Packet {
     let mut t = Vec::new();
     t.extend_from_slice(&sport.to_be_bytes());
     t.extend_from_slice(&dport.to_be_bytes());
@@ -149,8 +158,17 @@ impl Machine {
     /// One HTTP/1.0 request for `host` at `to`. How long it took.
     async fn get(&self, fcx: &Cx, to: Ipv4Addr, host: &str) -> Duration {
         let started = fcx.now();
-        let mut conn = self.tcp.connect(fcx, SocketAddr::new(to.into(), 80)).await.expect("the other sandbox connects");
-        conn.write_all(fcx, format!("GET / HTTP/1.0\r\nHost: {host}\r\n\r\n").as_bytes()).await.unwrap();
+        let mut conn = self
+            .tcp
+            .connect(fcx, SocketAddr::new(to.into(), 80))
+            .await
+            .expect("the other sandbox connects");
+        conn.write_all(
+            fcx,
+            format!("GET / HTTP/1.0\r\nHost: {host}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
         let mut got = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
@@ -160,7 +178,10 @@ impl Machine {
             }
         }
         let text = String::from_utf8_lossy(&got);
-        assert!(text.starts_with("HTTP/1.0 200") && text.ends_with("hello\n"), "{text}");
+        assert!(
+            text.starts_with("HTTP/1.0 200") && text.ends_with("hello\n"),
+            "{text}"
+        );
         let now = fcx.now();
         now.since_start() - started.since_start()
     }
@@ -197,7 +218,11 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
             // 1. Names: 150,000 made up, past the 100,000 kept; 5,000 under
             //    the wildcard, past the 1,000 sites this world allows.
             for i in 0..155_000u32 {
-                let name = if i < 150_000 { format!("n{i}.made-up.test") } else { format!("w{i}.wild.test") };
+                let name = if i < 150_000 {
+                    format!("n{i}.made-up.test")
+                } else {
+                    format!("w{i}.wild.test")
+                };
                 raw.send(udp(ME, 5353, GATEWAY, 53, &query(&name, i as u16)));
                 if i % 256 == 255 {
                     drain(&fcx, &mut raw, Duration::from_millis(1)).await;
@@ -242,7 +267,11 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
             count(drain(&fcx, &mut raw, Duration::from_millis(300)).await);
             report.push(("SYNs", rss()));
             // One address has its share of the backlog: 256 waiting.
-            assert!(!synacks.is_empty() && synacks.len() <= 256, "{} SYN-ACKs", synacks.len());
+            assert!(
+                !synacks.is_empty() && synacks.len() <= 256,
+                "{} SYN-ACKs",
+                synacks.len()
+            );
             other.get(&fcx, wild, "first.wild.test").await;
 
             // 4. HTTP connections: 1,000 complete handshakes and requests,
@@ -278,7 +307,16 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
                         let off = (t[12] >> 4) as usize * 4;
                         if t[13] & (SYN | ACK) == SYN | ACK {
                             if answered.insert(port) {
-                                raw.send(tcp_seg(ME, port, plain, 80, 1001, seq.wrapping_add(1), ACK, request));
+                                raw.send(tcp_seg(
+                                    ME,
+                                    port,
+                                    plain,
+                                    80,
+                                    1001,
+                                    seq.wrapping_add(1),
+                                    ACK,
+                                    request,
+                                ));
                             }
                         } else if t[13] & 0x04 != 0 {
                             reset.insert(port);
@@ -311,7 +349,9 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
         }));
         let _ = tx.send(result.map_err(|e| e.to_string()));
     });
-    let result = rx.recv_timeout(Duration::from_secs(180)).expect("timed out");
+    let result = rx
+        .recv_timeout(Duration::from_secs(180))
+        .expect("timed out");
     assert_eq!(result, Err("done".to_owned()));
 }
 
@@ -329,9 +369,17 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let path = format!("{}/fictionet-test-{}-flood.sock", std::env::temp_dir().display(), std::process::id());
+    let path = format!(
+        "{}/fictionet-test-{}-flood.sock",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
     let (attacher, attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher.clone()).unwrap();
+    let _listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(path.clone().into()),
+        attacher.clone(),
+    )
+    .unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let world_sent = sent.clone();
@@ -342,7 +390,8 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
     let world_path = path.clone();
     std::thread::spawn(move || {
         let result = block_on(run(move |fcx| async move {
-            let sites = web::Sites::new(|host| (host == "plain.test").then(|| web::Site::new(Hello)));
+            let sites =
+                web::Sites::new(|host| (host == "plain.test").then(|| web::Site::new(Hello)));
             sites.serve(&fcx, attachments)?;
             let other = machine(&fcx, &attacher, "other", Ipv4Addr::new(10, 0, 0, 100));
             let plain = other.lookup(&fcx, "plain.test").await;
@@ -351,11 +400,17 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
             // and the links carry traffic both ways.
             let senders: Vec<_> = (0..4u8)
                 .map(|i| {
-                    let (path, stop, sent) = (world_path.clone(), world_stop.clone(), world_sent.clone());
+                    let (path, stop, sent) =
+                        (world_path.clone(), world_stop.clone(), world_sent.clone());
                     let attached = world_attached.clone();
                     std::thread::spawn(move || {
                         let fd = unix::connect(&path).unwrap();
-                        let hello = Hello { version: relay::VERSION, mtu: 1500, kind: "tun".into(), name: format!("s{i}") };
+                        let hello = Hello {
+                            version: relay::VERSION,
+                            mtu: 1500,
+                            kind: "tun".into(),
+                            name: format!("s{i}"),
+                        };
                         unix::send(fd.as_raw_fd(), &Message::Hello(hello).encode(), false).unwrap();
                         let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
                         let n = unix::recv(fd.as_raw_fd(), &mut buf, false).unwrap();
@@ -363,7 +418,9 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
                         attached.fetch_add(1, Ordering::Relaxed);
                         let p = udp(Ipv4Addr::new(10, 0, 0, 2 + i), 5000, GATEWAY, 9, &[0; 100]);
                         while !stop.load(Ordering::Relaxed) {
-                            if unix::send_parts(fd.as_raw_fd(), &[&[relay::PACKET], &p.0], false).is_err() {
+                            if unix::send_parts(fd.as_raw_fd(), &[&[relay::PACKET], &p.0], false)
+                                .is_err()
+                            {
                                 return;
                             }
                             sent.fetch_add(1, Ordering::Relaxed);
@@ -381,24 +438,49 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
             let start = rss();
             let sent_before = world_sent.load(Ordering::Relaxed);
             wait::until(&fcx, Duration::from_secs(30), || {
-                world_attached.load(Ordering::Relaxed) == 4 && world_sent.load(Ordering::Relaxed) - sent_before > 100_000
-            }).await;
+                world_attached.load(Ordering::Relaxed) == 4
+                    && world_sent.load(Ordering::Relaxed) - sent_before > 100_000
+            })
+            .await;
             let middle = rss();
             let sent_middle = world_sent.load(Ordering::Relaxed);
             wait::until(&fcx, Duration::from_secs(30), || {
                 world_sent.load(Ordering::Relaxed) - sent_middle > 100_000
-            }).await;
+            })
+            .await;
             let end = rss();
-            let took = timeout(&fcx, Duration::from_secs(10), other.get(&fcx, plain, "plain.test")).await;
+            let took = timeout(
+                &fcx,
+                Duration::from_secs(10),
+                other.get(&fcx, plain, "plain.test"),
+            )
+            .await;
             world_stop.store(true, Ordering::Relaxed);
             // The flood ran: the senders kept sending while memory was read.
             let flooded = world_sent.load(Ordering::Relaxed) - sent_before;
             assert!(flooded > 100_000, "only {flooded} packets were sent");
-            assert_eq!(world_attached.load(Ordering::Relaxed), 4, "a sender was not attached");
+            assert_eq!(
+                world_attached.load(Ordering::Relaxed),
+                4,
+                "a sender was not attached"
+            );
             let (first, second) = (middle.saturating_sub(start), end.saturating_sub(middle));
-            eprintln!("four sandboxes flooding: +{:.1} MiB, then +{:.1} MiB", mib(first), mib(second));
-            assert!(second < 16 << 20, "the world kept growing: +{:.1} MiB, then +{:.1} MiB", mib(first), mib(second));
-            assert!(first + second < 64 << 20, "the world grew by {:.1} MiB", mib(first + second));
+            eprintln!(
+                "four sandboxes flooding: +{:.1} MiB, then +{:.1} MiB",
+                mib(first),
+                mib(second)
+            );
+            assert!(
+                second < 16 << 20,
+                "the world kept growing: +{:.1} MiB, then +{:.1} MiB",
+                mib(first),
+                mib(second)
+            );
+            assert!(
+                first + second < 64 << 20,
+                "the world grew by {:.1} MiB",
+                mib(first + second)
+            );
             assert!(took.is_some(), "the other sandbox was not served");
             // Joined outside the world: a sender may wait on its socket
             // until the world reads it.

@@ -1,9 +1,5 @@
 #![no_main]
-use fictionet::stdlib::{
-    codec::{Wire},
-    test_support::contract,
-    http2,
-};
+use fictionet::stdlib::{codec::Wire, http2, test_support::contract};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

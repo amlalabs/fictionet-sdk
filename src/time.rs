@@ -39,7 +39,9 @@ pub struct Instant {
 
 impl Instant {
     /// The moment the run started.
-    pub const ZERO: Instant = Instant { since_start: Duration::ZERO };
+    pub const ZERO: Instant = Instant {
+        since_start: Duration::ZERO,
+    };
 
     /// Time since the run started.
     pub fn since_start(self) -> Duration {
@@ -59,7 +61,9 @@ impl std::ops::Add<Duration> for Instant {
     type Output = Instant;
 
     fn add(self, d: Duration) -> Instant {
-        Instant { since_start: self.since_start + d }
+        Instant {
+            since_start: self.since_start + d,
+        }
     }
 }
 

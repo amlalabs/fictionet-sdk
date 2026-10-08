@@ -1,8 +1,6 @@
 //! Session handoffs and bounded mail and print bodies through the codec driver.
 
-use fictionet::stdlib::codec::{
-    Collect, CollectError, Decode, Fail, Step, Stream, Wire, pump,
-};
+use fictionet::stdlib::codec::{Collect, CollectError, Decode, Fail, Step, Stream, Wire, pump};
 use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::chunks;
@@ -48,7 +46,10 @@ fn postgres_frontend_and_backend_round_trips() {
     for message in &frontend {
         bytes.extend_from_slice(&contract::check_written(message));
     }
-    assert_eq!(check(pg::FrontendMessages::new, &bytes), (frontend.iter().cloned().map(Ok).collect::<Vec<_>>(), None));
+    assert_eq!(
+        check(pg::FrontendMessages::new, &bytes),
+        (frontend.iter().cloned().map(Ok).collect::<Vec<_>>(), None)
+    );
 
     let backend = vec![
         pg::BackendMessage::Authentication(pg::Authentication::Ok),
@@ -99,7 +100,10 @@ fn postgres_encryption_requests_end_with_exact_unread_transport_bytes() {
         assert_eq!(buffer.offset(), boundary as u64);
         decoder.start_encryption();
         let startup = pg::FrontendMessage::Startup(pg::Startup::new("u", "d"));
-        assert_eq!(check(|| decoder.clone(), &Wire::to_bytes(&startup).unwrap()), (vec![Ok(startup)], None));
+        assert_eq!(
+            check(|| decoder.clone(), &Wire::to_bytes(&startup).unwrap()),
+            (vec![Ok(startup)], None)
+        );
 
         // On the client, only the one-byte acceptance belongs to PostgreSQL.
         let make = || {
@@ -222,7 +226,10 @@ fn postgres_repeated_negotiation_and_direct_tls_keep_bytes() {
     decoder.start_encryption();
     assert_eq!(
         decoder.decode(&request, false),
-        Ok(Step::Item(Ok(pg::FrontendMessage::SslRequest), request.len()))
+        Ok(Step::Item(
+            Ok(pg::FrontendMessage::SslRequest),
+            request.len()
+        ))
     );
 }
 
@@ -272,7 +279,10 @@ fn postgres_body_errors_are_items_and_framing_errors_end_once() {
         check(|| pg::BackendEvents::with_limit(64), &bytes),
         (
             vec![
-                Err(pg::Error::BadStatus { tag: b'Z', status: b'?' }),
+                Err(pg::Error::BadStatus {
+                    tag: b'Z',
+                    status: b'?'
+                }),
                 Ok(pg::BackendEvent::Message(pg::BackendMessage::BindComplete)),
             ],
             None,
@@ -354,7 +364,10 @@ fn postgres_modes_and_minimum_limit_are_explicit() {
     let frontend = pg::FrontendMessages::established(0);
     assert_eq!(frontend.limit(), 4);
     assert_eq!(frontend.phase(), pg::Phase::Messages);
-    assert_eq!(check(|| frontend.clone(), b"S\0\0\0\x04"), (vec![Ok(pg::FrontendMessage::Sync)], None));
+    assert_eq!(
+        check(|| frontend.clone(), b"S\0\0\0\x04"),
+        (vec![Ok(pg::FrontendMessage::Sync)], None)
+    );
     failure(
         frontend,
         b"C\0\0\0\x06",
@@ -460,7 +473,10 @@ fn imf_header_and_collected_body_round_trip() {
             (Ok(header.clone()), body.clone())
         );
     }
-    assert_eq!(check(make, &Wire::to_bytes(&header).unwrap()), (vec![Ok(header)], None));
+    assert_eq!(
+        check(make, &Wire::to_bytes(&header).unwrap()),
+        (vec![Ok(header)], None)
+    );
 }
 
 #[test]
@@ -526,7 +542,10 @@ fn ipp_head_and_collected_document_round_trip() {
             (Ok(head.clone()), document.clone())
         );
     }
-    assert_eq!(check(make, &Wire::to_bytes(&head).unwrap()), (vec![Ok(head)], None));
+    assert_eq!(
+        check(make, &Wire::to_bytes(&head).unwrap()),
+        (vec![Ok(head)], None)
+    );
 }
 
 #[test]
@@ -534,7 +553,10 @@ fn ipp_attribute_errors_carry_request_ids_and_bad_lengths_end_once() {
     let bytes = b"\x01\x01\0\x02\0\0\0\x07\0\x03document";
     let make = || ipp::Head::with_limit(64);
     check(make, bytes);
-    let error = ipp::Error::BadRequest { request_id: 7, error: Box::new(ipp::Error::ReservedGroup) };
+    let error = ipp::Error::BadRequest {
+        request_id: 7,
+        error: Box::new(ipp::Error::ReservedGroup),
+    };
     for pattern in [&[][..], &[1], &[3, 7]] {
         assert_eq!(
             read_head_and_body(make(), bytes, pattern, ipp::MAX_DOCUMENT),
@@ -566,7 +588,10 @@ fn ipp_overlong_names_are_bad_request_items() {
     );
     check(ipp::Head::new, &bytes);
     bytes.extend_from_slice(b"document");
-    let error = ipp::Error::BadRequest { request_id: 7, error: Box::new(ipp::Error::BadName) };
+    let error = ipp::Error::BadRequest {
+        request_id: 7,
+        error: Box::new(ipp::Error::BadName),
+    };
     for pattern in [&[][..], &[1], &[3, 7]] {
         assert_eq!(
             read_head_and_body(ipp::Head::new(), &bytes, pattern, ipp::MAX_DOCUMENT),
@@ -687,7 +712,10 @@ fn strict_writers_reject_lossy_values_without_changing_the_destination() {
 
 #[test]
 fn wire_parsers_require_exact_units() {
-    for message in [pg::FrontendMessage::SslRequest, pg::FrontendMessage::Query("q".into())] {
+    for message in [
+        pg::FrontendMessage::SslRequest,
+        pg::FrontendMessage::Query("q".into()),
+    ] {
         let mut bytes = Wire::to_bytes(&message).unwrap();
         bytes.push(0);
         assert_eq!(
@@ -793,9 +821,9 @@ fn malformed_startup_body_ends_the_stream_once() {
         pg::FrontendMessages::new(),
         &bytes,
         false,
-        Fail::Protocol(pg::FrameError::Startup(
-            pg::Error::UnterminatedString { tag: 0 },
-        )),
+        Fail::Protocol(pg::FrameError::Startup(pg::Error::UnterminatedString {
+            tag: 0,
+        })),
     );
 }
 
@@ -872,6 +900,12 @@ fn malformed_startup_requests_end_the_stream_once() {
 fn empty_heads_end_cleanly_without_an_item() {
     assert_eq!(check(imf::Head::new, b""), (vec![], None));
     assert_eq!(check(ipp::Head::new, b""), (vec![], None));
-    assert_eq!(check(imf::Head::new, b"\r\n"), (vec![Ok(imf::Header::default())], None));
-    assert_eq!(check(imf::Head::new, b"bad field"), (vec![Err(imf::Error::FieldName)], None));
+    assert_eq!(
+        check(imf::Head::new, b"\r\n"),
+        (vec![Ok(imf::Header::default())], None)
+    );
+    assert_eq!(
+        check(imf::Head::new, b"bad field"),
+        (vec![Err(imf::Error::FieldName)], None)
+    );
 }

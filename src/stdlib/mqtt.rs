@@ -59,10 +59,10 @@
 //! assert!(!topic_matches("#", "$SYS/broker/uptime"));
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Wire, Reader, Truncated, Trailing};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire};
 
 /// The TCP port MQTT brokers listen on, without TLS.
 pub const PORT: u16 = 1883;
@@ -432,10 +432,15 @@ impl std::fmt::Display for Error {
             Error::Unwritable => f.write_str("MQTT value cannot be written without changing it"),
             Error::ReservedType(t) => write!(f, "reserved packet type {t}"),
             Error::Flags { packet_type, flags } => {
-                write!(f, "flags {flags:#06b} not allowed on packet type {packet_type}")
+                write!(
+                    f,
+                    "flags {flags:#06b} not allowed on packet type {packet_type}"
+                )
             }
             Error::RemainingLength => f.write_str("remaining length longer than four bytes"),
-            Error::TooLarge { size, max } => write!(f, "packet of {size} bytes, over the limit of {max}"),
+            Error::TooLarge { size, max } => {
+                write!(f, "packet of {size} bytes, over the limit of {max}")
+            }
             Error::Truncated => f.write_str("a field runs past the end of the packet"),
             Error::TrailingBytes => f.write_str("bytes left after the packet's last field"),
             Error::Utf8 => f.write_str("string is not well-formed UTF-8"),
@@ -443,7 +448,10 @@ impl std::fmt::Display for Error {
             Error::TooLong(n) => write!(f, "field of {n} bytes, over the limit of {MAX_STRING}"),
             Error::ProtocolName => f.write_str("protocol name is not MQTT"),
             Error::UnsupportedVersion(v) => {
-                write!(f, "protocol version not supported (level {v}); only MQTT 3.1.1, level 4 named MQTT, is read")
+                write!(
+                    f,
+                    "protocol version not supported (level {v}); only MQTT 3.1.1, level 4 named MQTT, is read"
+                )
             }
             Error::ConnectFlags(b) => write!(f, "CONNECT flags {b:#010b} break the rules"),
             Error::ConnAckFlags(b) => write!(f, "CONNACK flags {b:#010b} break the rules"),
@@ -471,7 +479,11 @@ fn read_remaining_length(b: &[u8]) -> Result<Option<(usize, usize)>, Error> {
             return Ok(Some((value, i + 1)));
         }
     }
-    if b.len() >= MAX_REMAINING_LENGTH_BYTES { Err(Error::RemainingLength) } else { Ok(None) }
+    if b.len() >= MAX_REMAINING_LENGTH_BYTES {
+        Err(Error::RemainingLength)
+    } else {
+        Ok(None)
+    }
 }
 
 /// MQTT's base-128 remaining length, from zero through [`MAX_REMAINING_LENGTH`].
@@ -577,7 +589,9 @@ pub fn topic_matches(filter: &str, topic: &str) -> bool {
         if f == "#" {
             return true;
         }
-        let Some(t) = topic_levels.next() else { return false };
+        let Some(t) = topic_levels.next() else {
+            return false;
+        };
         if f != "+" && f != t {
             return false;
         }
@@ -598,16 +612,27 @@ fn check_first_byte(byte: u8) -> Result<(), Error> {
         packet_type::PUBREL | packet_type::SUBSCRIBE | packet_type::UNSUBSCRIBE => flags == 0x02,
         _ => flags == 0,
     };
-    if ok { Ok(()) } else { Err(Error::Flags { packet_type: t, flags }) }
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Flags {
+            packet_type: t,
+            flags,
+        })
+    }
 }
 
 /// Finds the packet at the start of `b`: its first byte and where its body
 /// is. It returns `Ok(None)` if `b` holds only part of it, and an error as
 /// soon as the bytes so far show one.
 fn frame(b: &[u8], max: usize) -> Result<Option<(u8, std::ops::Range<usize>)>, Error> {
-    let Some(&first) = b.first() else { return Ok(None) };
+    let Some(&first) = b.first() else {
+        return Ok(None);
+    };
     check_first_byte(first)?;
-    let Some((length, used)) = read_remaining_length(&b[1..])? else { return Ok(None) };
+    let Some((length, used)) = read_remaining_length(&b[1..])? else {
+        return Ok(None);
+    };
     let start = 1 + used;
     // At most 5 + 268,435,455, so this cannot overflow.
     let end = start + length;
@@ -710,7 +735,9 @@ impl Packet {
     /// of `b` it took. A bad first byte or remaining length is an error as
     /// soon as it arrives, before the rest of the packet.
     fn parse_prefix(b: &[u8]) -> Result<Option<(Packet, usize)>, Error> {
-        let Some((first, body)) = frame(b, MAX_PACKET)? else { return Ok(None) };
+        let Some((first, body)) = frame(b, MAX_PACKET)? else {
+            return Ok(None);
+        };
         let end = body.end;
         Ok(Some((parse_body(first, &b[body])?, end)))
     }
@@ -750,7 +777,10 @@ impl Packet {
         let mut count = Count(0);
         let flags = self.write_body(&mut count)?;
         if count.0 > MAX_REMAINING_LENGTH {
-            return Err(Error::TooLarge { size: count.0, max: MAX_REMAINING_LENGTH });
+            return Err(Error::TooLarge {
+                size: count.0,
+                max: MAX_REMAINING_LENGTH,
+            });
         }
         Ok((flags, count.0))
     }
@@ -806,7 +836,10 @@ impl Packet {
             Packet::Publish(p) => {
                 flags = (u8::from(p.dup) << 3) | (p.qos.level() << 1) | u8::from(p.retain);
                 if p.dup && p.qos == QoS::AtMostOnce {
-                    return Err(Error::Flags { packet_type: packet_type::PUBLISH, flags });
+                    return Err(Error::Flags {
+                        packet_type: packet_type::PUBLISH,
+                        flags,
+                    });
                 }
                 check_topic_name(&p.topic)?;
                 put_string(body, &p.topic)?;
@@ -817,7 +850,10 @@ impl Packet {
                 }
                 body.put(&p.payload);
             }
-            Packet::PubAck(id) | Packet::PubRec(id) | Packet::PubComp(id) | Packet::UnsubAck(id) => {
+            Packet::PubAck(id)
+            | Packet::PubRec(id)
+            | Packet::PubComp(id)
+            | Packet::UnsubAck(id) => {
                 put_packet_id(body, *id)?;
             }
             Packet::PubRel(id) => {
@@ -872,18 +908,28 @@ fn parse_body(first: u8, body: &[u8]) -> Result<Packet, Error> {
             let ack_flags = r.u8()?;
             let raw = r.u8()?;
             let code = ConnectReturnCode::from_code(raw).ok_or(Error::ReturnCode(raw))?;
-            if ack_flags & 0xfe != 0 || (ack_flags & 1 != 0 && code != ConnectReturnCode::Accepted) {
+            if ack_flags & 0xfe != 0 || (ack_flags & 1 != 0 && code != ConnectReturnCode::Accepted)
+            {
                 return Err(Error::ConnAckFlags(ack_flags));
             }
-            Packet::ConnAck(ConnAck { session_present: ack_flags & 1 != 0, code })
+            Packet::ConnAck(ConnAck {
+                session_present: ack_flags & 1 != 0,
+                code,
+            })
         }
         packet_type::PUBLISH => {
             // The first byte's check has ruled out QoS 3.
-            let qos =
-                QoS::from_level((flags >> 1) & 3).ok_or(Error::Flags { packet_type: packet_type::PUBLISH, flags })?;
+            let qos = QoS::from_level((flags >> 1) & 3).ok_or(Error::Flags {
+                packet_type: packet_type::PUBLISH,
+                flags,
+            })?;
             let topic = r.string()?;
             check_topic_name(&topic)?;
-            let packet_id = if qos == QoS::AtMostOnce { None } else { Some(r.packet_id()?) };
+            let packet_id = if qos == QoS::AtMostOnce {
+                None
+            } else {
+                Some(r.packet_id()?)
+            };
             Packet::Publish(Publish {
                 dup: flags & 0x08 != 0,
                 qos,
@@ -960,7 +1006,8 @@ fn parse_connect(r: &mut Reader<'_>) -> Result<Connect, Error> {
         return Err(Error::UnsupportedVersion(level));
     }
     let flags = r.u8()?;
-    let (has_will, will_qos, will_retain) = (flags & 0x04 != 0, (flags >> 3) & 3, flags & 0x20 != 0);
+    let (has_will, will_qos, will_retain) =
+        (flags & 0x04 != 0, (flags >> 3) & 3, flags & 0x20 != 0);
     let (has_user, has_password) = (flags & 0x80 != 0, flags & 0x40 != 0);
     let bad = flags & 0x01 != 0
         || will_qos == 3
@@ -976,13 +1023,29 @@ fn parse_connect(r: &mut Reader<'_>) -> Result<Connect, Error> {
         check_topic_name(&topic)?;
         let message = r.binary()?.to_vec();
         let qos = QoS::from_level(will_qos).ok_or(Error::ConnectFlags(flags))?;
-        Some(Will { topic, message, qos, retain: will_retain })
+        Some(Will {
+            topic,
+            message,
+            qos,
+            retain: will_retain,
+        })
     } else {
         None
     };
     let username = if has_user { Some(r.string()?) } else { None };
-    let password = if has_password { Some(r.binary()?.to_vec()) } else { None };
-    Ok(Connect { clean_session: flags & 0x02 != 0, keep_alive, client_id, will, username, password })
+    let password = if has_password {
+        Some(r.binary()?.to_vec())
+    } else {
+        None
+    };
+    Ok(Connect {
+        clean_session: flags & 0x02 != 0,
+        keep_alive,
+        client_id,
+        will,
+        username,
+        password,
+    })
 }
 
 impl Wire for Packet {
@@ -1041,10 +1104,14 @@ impl Prefixed for Packet {
     const NAME: &'static str = "MQTT 3.1.1";
 
     #[inline]
-    fn default_limit() -> Self::Limit { DEFAULT_MAX_PACKET }
+    fn default_limit() -> Self::Limit {
+        DEFAULT_MAX_PACKET
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(2, MAX_PACKET) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.clamp(2, MAX_PACKET)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -1053,35 +1120,41 @@ impl Prefixed for Packet {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
-        let Some((first, body)) = frame(input, limit)? else { return Ok(None) };
+        let Some((first, body)) = frame(input, limit)? else {
+            return Ok(None);
+        };
         let used = body.end;
         let body = input.get(body).ok_or(Error::Truncated)?;
         Ok(Some((parse_body(first, body)?, used)))
     }
 }
 
-
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Truncated }
+    fn from(_: Truncated) -> Self {
+        Error::Truncated
+    }
 }
 
 impl From<Trailing> for Error {
     #[inline]
-    fn from(_: Trailing) -> Self { Error::TrailingBytes }
+    fn from(_: Trailing) -> Self {
+        Error::TrailingBytes
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
-    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, pump,
-    };
+    use fictionet::stdlib::codec::{Decode, Step};
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn connect_bytes() -> Vec<u8> {
@@ -1124,18 +1197,32 @@ mod tests {
                     clean_session: false,
                     keep_alive: 0,
                     client_id: String::new(),
-                    will: Some(Will { topic: "w".into(), message: vec![], qos: QoS::ExactlyOnce, retain: true }),
+                    will: Some(Will {
+                        topic: "w".into(),
+                        message: vec![],
+                        qos: QoS::ExactlyOnce,
+                        retain: true,
+                    }),
                     username: Some(String::new()),
                     password: None,
                 }),
-                vec![0x10, 19, 0, 4, b'M', b'Q', b'T', b'T', 4, 0xb4, 0, 0, 0, 0, 0, 1, b'w', 0, 0, 0, 0],
+                vec![
+                    0x10, 19, 0, 4, b'M', b'Q', b'T', b'T', 4, 0xb4, 0, 0, 0, 0, 0, 1, b'w', 0, 0,
+                    0, 0,
+                ],
             ),
             (
-                Packet::ConnAck(ConnAck { session_present: true, code: ConnectReturnCode::Accepted }),
+                Packet::ConnAck(ConnAck {
+                    session_present: true,
+                    code: ConnectReturnCode::Accepted,
+                }),
                 vec![0x20, 2, 1, 0],
             ),
             (
-                Packet::ConnAck(ConnAck { session_present: false, code: ConnectReturnCode::NotAuthorized }),
+                Packet::ConnAck(ConnAck {
+                    session_present: false,
+                    code: ConnectReturnCode::NotAuthorized,
+                }),
                 vec![0x20, 2, 0, 5],
             ),
             (
@@ -1167,7 +1254,10 @@ mod tests {
             (
                 Packet::Subscribe(Subscribe {
                     packet_id: 7,
-                    filters: vec![("a/+".into(), QoS::AtMostOnce), ("#".into(), QoS::ExactlyOnce)],
+                    filters: vec![
+                        ("a/+".into(), QoS::AtMostOnce),
+                        ("#".into(), QoS::ExactlyOnce),
+                    ],
                 }),
                 vec![0x82, 12, 0, 7, 0, 3, b'a', b'/', b'+', 0, 0, 1, b'#', 2],
             ),
@@ -1179,7 +1269,10 @@ mod tests {
                 vec![0x90, 4, 0, 7, 0, 0x80],
             ),
             (
-                Packet::Unsubscribe(Unsubscribe { packet_id: 8, filters: vec!["a/+".into()] }),
+                Packet::Unsubscribe(Unsubscribe {
+                    packet_id: 8,
+                    filters: vec!["a/+".into()],
+                }),
                 vec![0xa2, 7, 0, 8, 0, 3, b'a', b'/', b'+'],
             ),
             (Packet::UnsubAck(8), vec![0xb0, 2, 0, 8]),
@@ -1204,17 +1297,30 @@ mod tests {
     #[test]
     fn every_prefix_is_incomplete() {
         for (packet, bytes) in samples() {
-            contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * DEFAULT_MAX_PACKET);
+            contract::check_decode_with_alloc_limit(
+                Frames::<Packet>::new,
+                &bytes,
+                2 * DEFAULT_MAX_PACKET,
+            );
             for n in 0..bytes.len() {
-                assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Truncated), "{packet:?} cut to {n}");
-                assert_eq!(Frames::<Packet>::new().decode(&bytes[..n], false), Ok(Step::Need));
+                assert_eq!(
+                    Packet::parse(&bytes[..n]),
+                    Err(Error::Truncated),
+                    "{packet:?} cut to {n}"
+                );
+                assert_eq!(
+                    Frames::<Packet>::new().decode(&bytes[..n], false),
+                    Ok(Step::Need)
+                );
             }
         }
     }
 
     #[test]
     fn connect_example() {
-        let Packet::Connect(c) = Packet::parse(&connect_bytes()).unwrap() else { panic!() };
+        let Packet::Connect(c) = Packet::parse(&connect_bytes()).unwrap() else {
+            panic!()
+        };
         assert_eq!(c, connect());
         // Trailing bytes after the password are not allowed.
         let mut b = connect_bytes();
@@ -1245,21 +1351,40 @@ mod tests {
                 assert_eq!(RemainingLength::parse(&bytes[..k]), Err(Error::Truncated));
             }
         }
-        assert_eq!(RemainingLength::parse(&[0xff, 0xff, 0xff, 0xff]), Err(Error::RemainingLength));
-        assert_eq!(RemainingLength::parse(&[0x80, 0x80, 0x80, 0x80, 0x01]), Err(Error::RemainingLength));
+        assert_eq!(
+            RemainingLength::parse(&[0xff, 0xff, 0xff, 0xff]),
+            Err(Error::RemainingLength)
+        );
+        assert_eq!(
+            RemainingLength::parse(&[0x80, 0x80, 0x80, 0x80, 0x01]),
+            Err(Error::RemainingLength)
+        );
         // A longer encoding than needed is still read.
-        assert_eq!(RemainingLength::parse(&[0x80, 0x00]), Ok(RemainingLength(0)));
+        assert_eq!(
+            RemainingLength::parse(&[0x80, 0x00]),
+            Ok(RemainingLength(0))
+        );
         assert_eq!(Packet::parse(&[0xc0, 0x80, 0x00]), Ok(Packet::PingReq));
         let mut out = Vec::new();
-        assert_eq!(RemainingLength(MAX_REMAINING_LENGTH + 1).write(&mut out), Err(Error::Unwritable));
+        assert_eq!(
+            RemainingLength(MAX_REMAINING_LENGTH + 1).write(&mut out),
+            Err(Error::Unwritable)
+        );
         assert!(out.is_empty());
-        assert_eq!(Packet::parse(&[0x30, 0xff, 0xff, 0xff, 0xff]), Err(Error::RemainingLength));
+        assert_eq!(
+            Packet::parse(&[0x30, 0xff, 0xff, 0xff, 0xff]),
+            Err(Error::RemainingLength)
+        );
     }
 
     #[test]
     fn topic_matching_examples() {
         // Section 4.7.1.2.
-        for t in ["sport/tennis/player1", "sport/tennis/player1/ranking", "sport/tennis/player1/score/wimbledon"] {
+        for t in [
+            "sport/tennis/player1",
+            "sport/tennis/player1/ranking",
+            "sport/tennis/player1/score/wimbledon",
+        ] {
             assert!(topic_matches("sport/tennis/player1/#", t), "{t}");
         }
         assert!(topic_matches("sport/#", "sport"));
@@ -1268,7 +1393,10 @@ mod tests {
         // Section 4.7.1.3.
         assert!(topic_matches("sport/tennis/+", "sport/tennis/player1"));
         assert!(topic_matches("sport/tennis/+", "sport/tennis/player2"));
-        assert!(!topic_matches("sport/tennis/+", "sport/tennis/player1/ranking"));
+        assert!(!topic_matches(
+            "sport/tennis/+",
+            "sport/tennis/player1/ranking"
+        ));
         assert!(!topic_matches("sport/+", "sport"));
         assert!(topic_matches("sport/+", "sport/"));
         assert!(topic_matches("+/+", "/finance"));
@@ -1293,10 +1421,27 @@ mod tests {
 
     #[test]
     fn topic_validation() {
-        for f in ["#", "+", "sport/#", "+/tennis/#", "sport/+/player1", "/", "a//+", "$SYS/#"] {
+        for f in [
+            "#",
+            "+",
+            "sport/#",
+            "+/tennis/#",
+            "sport/+/player1",
+            "/",
+            "a//+",
+            "$SYS/#",
+        ] {
             assert_eq!(check_topic_filter(f), Ok(()), "{f}");
         }
-        for f in ["", "sport/tennis#", "sport/tennis/#/ranking", "sport+", "#/a", "a/++", "a/#/"] {
+        for f in [
+            "",
+            "sport/tennis#",
+            "sport/tennis/#/ranking",
+            "sport+",
+            "#/a",
+            "a/++",
+            "a/#/",
+        ] {
             assert_eq!(check_topic_filter(f), Err(Error::TopicFilter), "{f}");
         }
         for t in ["a", "/", "a b/c", "$SYS"] {
@@ -1308,7 +1453,10 @@ mod tests {
         assert_eq!(check_topic_name("a\0b"), Err(Error::NullChar));
         let long = "a".repeat(MAX_STRING + 1);
         assert_eq!(check_topic_name(&long), Err(Error::TooLong(MAX_STRING + 1)));
-        assert_eq!(check_topic_filter(&long), Err(Error::TooLong(MAX_STRING + 1)));
+        assert_eq!(
+            check_topic_filter(&long),
+            Err(Error::TooLong(MAX_STRING + 1))
+        );
         assert_eq!(check_string(&long[1..]), Ok(()));
     }
 
@@ -1317,14 +1465,56 @@ mod tests {
         assert_eq!(Packet::parse(&[0x00]), Err(Error::ReservedType(0)));
         assert_eq!(Packet::parse(&[0xf0, 0]), Err(Error::ReservedType(15)));
         // Fixed flags on each type that has them.
-        assert_eq!(Packet::parse(&[0x11]), Err(Error::Flags { packet_type: 1, flags: 1 }));
-        assert_eq!(Packet::parse(&[0x60, 2, 0, 1]), Err(Error::Flags { packet_type: 6, flags: 0 }));
-        assert_eq!(Packet::parse(&[0x80]), Err(Error::Flags { packet_type: 8, flags: 0 }));
-        assert_eq!(Packet::parse(&[0xa3]), Err(Error::Flags { packet_type: 10, flags: 3 }));
-        assert_eq!(Packet::parse(&[0xe8, 0]), Err(Error::Flags { packet_type: 14, flags: 8 }));
+        assert_eq!(
+            Packet::parse(&[0x11]),
+            Err(Error::Flags {
+                packet_type: 1,
+                flags: 1
+            })
+        );
+        assert_eq!(
+            Packet::parse(&[0x60, 2, 0, 1]),
+            Err(Error::Flags {
+                packet_type: 6,
+                flags: 0
+            })
+        );
+        assert_eq!(
+            Packet::parse(&[0x80]),
+            Err(Error::Flags {
+                packet_type: 8,
+                flags: 0
+            })
+        );
+        assert_eq!(
+            Packet::parse(&[0xa3]),
+            Err(Error::Flags {
+                packet_type: 10,
+                flags: 3
+            })
+        );
+        assert_eq!(
+            Packet::parse(&[0xe8, 0]),
+            Err(Error::Flags {
+                packet_type: 14,
+                flags: 8
+            })
+        );
         // PUBLISH: QoS 3, and DUP at QoS 0.
-        assert_eq!(Packet::parse(&[0x36]), Err(Error::Flags { packet_type: 3, flags: 6 }));
-        assert_eq!(Packet::parse(&[0x38]), Err(Error::Flags { packet_type: 3, flags: 8 }));
+        assert_eq!(
+            Packet::parse(&[0x36]),
+            Err(Error::Flags {
+                packet_type: 3,
+                flags: 6
+            })
+        );
+        assert_eq!(
+            Packet::parse(&[0x38]),
+            Err(Error::Flags {
+                packet_type: 3,
+                flags: 8
+            })
+        );
         assert_eq!(Packet::parse(&[0x3b]), Err(Error::Truncated));
     }
 
@@ -1335,40 +1525,85 @@ mod tests {
         assert_eq!(Packet::parse(&[0x30, 2, 0, 5]), Err(Error::Truncated));
         assert_eq!(Packet::parse(&[0x20, 1, 0]), Err(Error::Truncated));
         // Bytes left over.
-        assert_eq!(Packet::parse(&[0x40, 3, 0, 1, 0]), Err(Error::TrailingBytes));
+        assert_eq!(
+            Packet::parse(&[0x40, 3, 0, 1, 0]),
+            Err(Error::TrailingBytes)
+        );
         assert_eq!(Packet::parse(&[0xc0, 1, 0]), Err(Error::TrailingBytes));
-        assert_eq!(Packet::parse(&[0x20, 3, 0, 0, 0]), Err(Error::TrailingBytes));
+        assert_eq!(
+            Packet::parse(&[0x20, 3, 0, 0, 0]),
+            Err(Error::TrailingBytes)
+        );
         // Strings: bad UTF-8, a surrogate, and U+0000.
         assert_eq!(Packet::parse(&[0x30, 3, 0, 1, 0xff]), Err(Error::Utf8));
-        assert_eq!(Packet::parse(&[0x30, 5, 0, 3, 0xed, 0xa0, 0x80]), Err(Error::Utf8));
+        assert_eq!(
+            Packet::parse(&[0x30, 5, 0, 3, 0xed, 0xa0, 0x80]),
+            Err(Error::Utf8)
+        );
         assert_eq!(Packet::parse(&[0x30, 3, 0, 1, 0]), Err(Error::NullChar));
         // Topic names.
         assert_eq!(Packet::parse(&[0x30, 2, 0, 0]), Err(Error::TopicName));
         assert_eq!(Packet::parse(&[0x30, 3, 0, 1, b'#']), Err(Error::TopicName));
         // Packet identifiers of 0.
-        assert_eq!(Packet::parse(&[0x32, 5, 0, 1, b'a', 0, 0]), Err(Error::PacketIdZero));
+        assert_eq!(
+            Packet::parse(&[0x32, 5, 0, 1, b'a', 0, 0]),
+            Err(Error::PacketIdZero)
+        );
         assert_eq!(Packet::parse(&[0x40, 2, 0, 0]), Err(Error::PacketIdZero));
-        assert_eq!(Packet::parse(&[0x82, 6, 0, 0, 0, 1, b'a', 0]), Err(Error::PacketIdZero));
+        assert_eq!(
+            Packet::parse(&[0x82, 6, 0, 0, 0, 1, b'a', 0]),
+            Err(Error::PacketIdZero)
+        );
         // CONNACK.
         assert_eq!(Packet::parse(&[0x20, 2, 0, 6]), Err(Error::ReturnCode(6)));
         assert_eq!(Packet::parse(&[0x20, 2, 2, 0]), Err(Error::ConnAckFlags(2)));
         assert_eq!(Packet::parse(&[0x20, 2, 1, 4]), Err(Error::ConnAckFlags(1)));
         // SUBSCRIBE and UNSUBSCRIBE.
-        assert_eq!(Packet::parse(&[0x82, 2, 0, 1]), Err(Error::EmptySubscription));
-        assert_eq!(Packet::parse(&[0xa2, 2, 0, 1]), Err(Error::EmptySubscription));
-        assert_eq!(Packet::parse(&[0x82, 6, 0, 1, 0, 1, b'a', 3]), Err(Error::SubscribeOptions(3)));
-        assert_eq!(Packet::parse(&[0x82, 6, 0, 1, 0, 1, b'a', 0x04]), Err(Error::SubscribeOptions(4)));
-        assert_eq!(Packet::parse(&[0x82, 7, 0, 1, 0, 2, b'a', b'#', 0]), Err(Error::TopicFilter));
+        assert_eq!(
+            Packet::parse(&[0x82, 2, 0, 1]),
+            Err(Error::EmptySubscription)
+        );
+        assert_eq!(
+            Packet::parse(&[0xa2, 2, 0, 1]),
+            Err(Error::EmptySubscription)
+        );
+        assert_eq!(
+            Packet::parse(&[0x82, 6, 0, 1, 0, 1, b'a', 3]),
+            Err(Error::SubscribeOptions(3))
+        );
+        assert_eq!(
+            Packet::parse(&[0x82, 6, 0, 1, 0, 1, b'a', 0x04]),
+            Err(Error::SubscribeOptions(4))
+        );
+        assert_eq!(
+            Packet::parse(&[0x82, 7, 0, 1, 0, 2, b'a', b'#', 0]),
+            Err(Error::TopicFilter)
+        );
         assert_eq!(
             Packet::parse(&[0xa2, 5, 0, 1, 0, 1, b'+']),
-            Ok(Packet::Unsubscribe(Unsubscribe { packet_id: 1, filters: vec!["+".into()] }))
+            Ok(Packet::Unsubscribe(Unsubscribe {
+                packet_id: 1,
+                filters: vec!["+".into()]
+            }))
         );
-        assert_eq!(Packet::parse(&[0xa2, 6, 0, 1, 0, 2, b'+', b'a']), Err(Error::TopicFilter));
-        assert_eq!(Packet::parse(&[0x82, 5, 0, 1, 0, 1, b'a']), Err(Error::Truncated));
+        assert_eq!(
+            Packet::parse(&[0xa2, 6, 0, 1, 0, 2, b'+', b'a']),
+            Err(Error::TopicFilter)
+        );
+        assert_eq!(
+            Packet::parse(&[0x82, 5, 0, 1, 0, 1, b'a']),
+            Err(Error::Truncated)
+        );
         // SUBACK.
-        assert_eq!(Packet::parse(&[0x90, 3, 0, 1, 3]), Err(Error::ReturnCode(3)));
+        assert_eq!(
+            Packet::parse(&[0x90, 3, 0, 1, 3]),
+            Err(Error::ReturnCode(3))
+        );
         // A SUBACK answers at least one filter, so it has at least one code.
-        assert_eq!(Packet::parse(&[0x90, 2, 0, 1]), Err(Error::EmptySubscription));
+        assert_eq!(
+            Packet::parse(&[0x90, 2, 0, 1]),
+            Err(Error::EmptySubscription)
+        );
     }
 
     fn connect_with(name: &[u8], level: u8, flags: u8, rest: &[u8]) -> Vec<u8> {
@@ -1387,26 +1622,61 @@ mod tests {
         let id = [0, 1, b'a'];
         assert!(Packet::parse(&connect_with(b"MQTT", 4, 0x02, &id)).is_ok());
         // MQTT 5, with its properties length, and MQTT 3.1.
-        assert_eq!(Packet::parse(&connect_with(b"MQTT", 5, 0x02, &[0, 0, 1, b'a'])), Err(Error::UnsupportedVersion(5)));
-        assert_eq!(Packet::parse(&connect_with(b"MQIsdp", 3, 0x02, &id)), Err(Error::UnsupportedVersion(3)));
-        assert_eq!(Packet::parse(&connect_with(b"MQTT", 3, 0x02, &id)), Err(Error::UnsupportedVersion(3)));
-        assert_eq!(Packet::parse(&connect_with(b"HTTP", 4, 0x02, &id)), Err(Error::ProtocolName));
+        assert_eq!(
+            Packet::parse(&connect_with(b"MQTT", 5, 0x02, &[0, 0, 1, b'a'])),
+            Err(Error::UnsupportedVersion(5))
+        );
+        assert_eq!(
+            Packet::parse(&connect_with(b"MQIsdp", 3, 0x02, &id)),
+            Err(Error::UnsupportedVersion(3))
+        );
+        assert_eq!(
+            Packet::parse(&connect_with(b"MQTT", 3, 0x02, &id)),
+            Err(Error::UnsupportedVersion(3))
+        );
+        assert_eq!(
+            Packet::parse(&connect_with(b"HTTP", 4, 0x02, &id)),
+            Err(Error::ProtocolName)
+        );
         // The reserved bit.
-        assert_eq!(Packet::parse(&connect_with(b"MQTT", 4, 0x03, &id)), Err(Error::ConnectFlags(0x03)));
+        assert_eq!(
+            Packet::parse(&connect_with(b"MQTT", 4, 0x03, &id)),
+            Err(Error::ConnectFlags(0x03))
+        );
         // Will QoS or retain without a will.
-        assert_eq!(Packet::parse(&connect_with(b"MQTT", 4, 0x0a, &id)), Err(Error::ConnectFlags(0x0a)));
-        assert_eq!(Packet::parse(&connect_with(b"MQTT", 4, 0x22, &id)), Err(Error::ConnectFlags(0x22)));
+        assert_eq!(
+            Packet::parse(&connect_with(b"MQTT", 4, 0x0a, &id)),
+            Err(Error::ConnectFlags(0x0a))
+        );
+        assert_eq!(
+            Packet::parse(&connect_with(b"MQTT", 4, 0x22, &id)),
+            Err(Error::ConnectFlags(0x22))
+        );
         // Will QoS 3.
-        assert_eq!(Packet::parse(&connect_with(b"MQTT", 4, 0x1e, &id)), Err(Error::ConnectFlags(0x1e)));
+        assert_eq!(
+            Packet::parse(&connect_with(b"MQTT", 4, 0x1e, &id)),
+            Err(Error::ConnectFlags(0x1e))
+        );
         // A password without a user name.
-        assert_eq!(Packet::parse(&connect_with(b"MQTT", 4, 0x42, &id)), Err(Error::ConnectFlags(0x42)));
+        assert_eq!(
+            Packet::parse(&connect_with(b"MQTT", 4, 0x42, &id)),
+            Err(Error::ConnectFlags(0x42))
+        );
         // A will whose topic has a wildcard.
         assert_eq!(
-            Packet::parse(&connect_with(b"MQTT", 4, 0x06, &[0, 1, b'a', 0, 1, b'+', 0, 0])),
+            Packet::parse(&connect_with(
+                b"MQTT",
+                4,
+                0x06,
+                &[0, 1, b'a', 0, 1, b'+', 0, 0]
+            )),
             Err(Error::TopicName)
         );
         // A user name flag with no user name.
-        assert_eq!(Packet::parse(&connect_with(b"MQTT", 4, 0x82, &id)), Err(Error::Truncated));
+        assert_eq!(
+            Packet::parse(&connect_with(b"MQTT", 4, 0x82, &id)),
+            Err(Error::Truncated)
+        );
     }
 
     #[test]
@@ -1437,46 +1707,93 @@ mod tests {
         assert_eq!(p(&|x| x.dup = true), Err(Error::Unwritable));
         assert_eq!(p(&|x| x.topic = "a/#".into()), Err(Error::Unwritable));
         assert_eq!(p(&|x| x.topic = "a\0".into()), Err(Error::Unwritable));
-        assert_eq!(p(&|x| x.topic = "a".repeat(MAX_STRING + 1)), Err(Error::Unwritable));
+        assert_eq!(
+            p(&|x| x.topic = "a".repeat(MAX_STRING + 1)),
+            Err(Error::Unwritable)
+        );
 
         let mut c = connect();
         c.username = None;
-        assert_eq!(Packet::Connect(c.clone()).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Packet::Connect(c.clone()).to_bytes(),
+            Err(Error::Unwritable)
+        );
         c.password = None;
         c.will.as_mut().unwrap().topic = "+".into();
-        assert_eq!(Packet::Connect(c.clone()).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Packet::Connect(c.clone()).to_bytes(),
+            Err(Error::Unwritable)
+        );
         c.will = None;
         c.password = Some(vec![0; MAX_STRING + 1]);
         c.username = Some("u".into());
         assert_eq!(Packet::Connect(c).to_bytes(), Err(Error::Unwritable));
 
         assert_eq!(Packet::PubAck(0).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(Packet::Subscribe(Subscribe { packet_id: 1, filters: vec![] }).to_bytes(), Err(Error::Unwritable));
         assert_eq!(
-            Packet::Unsubscribe(Unsubscribe { packet_id: 1, filters: vec![] }).to_bytes(),
+            Packet::Subscribe(Subscribe {
+                packet_id: 1,
+                filters: vec![]
+            })
+            .to_bytes(),
             Err(Error::Unwritable)
         );
         assert_eq!(
-            Packet::Subscribe(Subscribe { packet_id: 1, filters: vec![("a#".into(), QoS::AtMostOnce)] }).to_bytes(),
+            Packet::Unsubscribe(Unsubscribe {
+                packet_id: 1,
+                filters: vec![]
+            })
+            .to_bytes(),
             Err(Error::Unwritable)
         );
         assert_eq!(
-            Packet::Unsubscribe(Unsubscribe { packet_id: 1, filters: vec![String::new()] }).to_bytes(),
+            Packet::Subscribe(Subscribe {
+                packet_id: 1,
+                filters: vec![("a#".into(), QoS::AtMostOnce)]
+            })
+            .to_bytes(),
             Err(Error::Unwritable)
         );
-        assert_eq!(Packet::SubAck(SubAck { packet_id: 0, codes: vec![] }).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(Packet::SubAck(SubAck { packet_id: 1, codes: vec![] }).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Packet::Unsubscribe(Unsubscribe {
+                packet_id: 1,
+                filters: vec![String::new()]
+            })
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Packet::SubAck(SubAck {
+                packet_id: 0,
+                codes: vec![]
+            })
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(
+            Packet::SubAck(SubAck {
+                packet_id: 1,
+                codes: vec![]
+            })
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
     fn connack_writer_refuses_session_present_on_a_refusal() {
         // The reader refuses these flags, so the writer does too, rather
         // than write a different value than it was given.
-        let refused =
-            Packet::ConnAck(ConnAck { session_present: true, code: ConnectReturnCode::BadUsernameOrPassword });
+        let refused = Packet::ConnAck(ConnAck {
+            session_present: true,
+            code: ConnectReturnCode::BadUsernameOrPassword,
+        });
         assert_eq!(refused.to_bytes(), Err(Error::Unwritable));
         assert_eq!(refused.encoded_len(), Err(Error::Unwritable));
-        let ok = Packet::ConnAck(ConnAck { session_present: false, code: ConnectReturnCode::BadUsernameOrPassword });
+        let ok = Packet::ConnAck(ConnAck {
+            session_present: false,
+            code: ConnectReturnCode::BadUsernameOrPassword,
+        });
         assert_eq!(Packet::parse(&ok.to_bytes().unwrap()), Ok(ok));
     }
 
@@ -1502,7 +1819,10 @@ mod tests {
         assert_eq!(over.encoded_len(), Err(Error::Unwritable));
         assert_eq!(over.to_bytes(), Err(Error::Unwritable));
         drop(over);
-        assert_eq!(publish(MAX_REMAINING_LENGTH - 3).encoded_len(), Ok(MAX_PACKET));
+        assert_eq!(
+            publish(MAX_REMAINING_LENGTH - 3).encoded_len(),
+            Ok(MAX_PACKET)
+        );
         // Invalid fields are refused even when the packet fits the size limit.
         let mut bad = Publish {
             dup: false,
@@ -1512,7 +1832,10 @@ mod tests {
             packet_id: None,
             payload: vec![],
         };
-        assert_eq!(Packet::Publish(bad.clone()).encoded_len(), Err(Error::Unwritable));
+        assert_eq!(
+            Packet::Publish(bad.clone()).encoded_len(),
+            Err(Error::Unwritable)
+        );
         bad.topic = "t".into();
         assert_eq!(Packet::Publish(bad).encoded_len(), Ok(5));
     }
@@ -1523,13 +1846,22 @@ mod tests {
         let make = || Frames::<Packet>::with_limit(2);
         assert_eq!(make().capacity(), 5);
         contract::check_decode_with_alloc_limit(make, &bytes, 10);
-        assert_eq!(decode_all(make, &bytes), (vec![Packet::PingReq; 1000], None));
+        assert_eq!(
+            decode_all(make, &bytes),
+            (vec![Packet::PingReq; 1000], None)
+        );
         assert_eq!(
             make().decode(&[0x30, 0x80, 0x80, 0x80, 0x01], false),
-            Err(Error::TooLarge { size: 2_097_157, max: 2 })
+            Err(Error::TooLarge {
+                size: 2_097_157,
+                max: 2
+            })
         );
         let mut stream = Stream::new(Frames::<Packet>::new());
-        assert_eq!(stream.push(&vec![0xc0; 2 * DEFAULT_MAX_PACKET]), DEFAULT_MAX_PACKET);
+        assert_eq!(
+            stream.push(&vec![0xc0; 2 * DEFAULT_MAX_PACKET]),
+            DEFAULT_MAX_PACKET
+        );
     }
 
     #[test]
@@ -1556,15 +1888,20 @@ mod tests {
         let samples = samples();
         let bytes: Vec<_> = samples.iter().flat_map(|(_, b)| b.clone()).collect();
         let want: Vec<_> = samples.into_iter().map(|(p, _)| p).collect();
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * DEFAULT_MAX_PACKET);
+        contract::check_decode_with_alloc_limit(
+            Frames::<Packet>::new,
+            &bytes,
+            2 * DEFAULT_MAX_PACKET,
+        );
         assert_eq!(decode_all(Frames::<Packet>::new, &bytes), (want, None));
     }
 
     #[test]
     fn stream_stays_broken() {
-        for (bytes, expected) in
-            [(&[0x00, 0xd0, 0][..], Error::ReservedType(0)), (&[0x40, 2, 0, 0, 0xc0, 0][..], Error::PacketIdZero)]
-        {
+        for (bytes, expected) in [
+            (&[0x00, 0xd0, 0][..], Error::ReservedType(0)),
+            (&[0x40, 2, 0, 0, 0xc0, 0][..], Error::PacketIdZero),
+        ] {
             let mut stream = Stream::new(Frames::<Packet>::new());
             assert_eq!(stream.push(&[0xc0, 0]), 2);
             assert_eq!(stream.next(), Some(Ok(Packet::PingReq)));
@@ -1577,21 +1914,25 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
-        assert_linear("stream_takes_many_small_packets_in_linear_time", rounds(1 << 19), |size| {
-            let data = [0xc0u8, 0].repeat(size);
-            let mut stream = Stream::new(Frames::<Packet>::new());
-            let mut n = 0;
-            pump(&mut stream, &data[..data.len() - 1], |p| {
-                assert_eq!(p, Packet::PingReq);
-                n += 1;
-            })
-            .unwrap();
-            assert_eq!(n, (size) - 1);
-            assert_eq!(stream.buffered(), 1);
-            assert_eq!(stream.push(&[0]), 1);
-            assert_eq!(stream.next(), Some(Ok(Packet::PingReq)));
-            assert_eq!(stream.buffered(), 0);
-        });
+        assert_linear(
+            "stream_takes_many_small_packets_in_linear_time",
+            rounds(1 << 19),
+            |size| {
+                let data = [0xc0u8, 0].repeat(size);
+                let mut stream = Stream::new(Frames::<Packet>::new());
+                let mut n = 0;
+                pump(&mut stream, &data[..data.len() - 1], |p| {
+                    assert_eq!(p, Packet::PingReq);
+                    n += 1;
+                })
+                .unwrap();
+                assert_eq!(n, (size) - 1);
+                assert_eq!(stream.buffered(), 1);
+                assert_eq!(stream.push(&[0]), 1);
+                assert_eq!(stream.next(), Some(Ok(Packet::PingReq)));
+                assert_eq!(stream.buffered(), 0);
+            },
+        );
     }
 
     #[test]
@@ -1630,21 +1971,33 @@ mod tests {
         let _ = d.push(&[0x30, 8, 0, 1, b't', 1, 2, 3, 4, 5]);
         assert!(matches!(d.next(), Some(Ok(Packet::Publish(_)))));
         let _ = d.push(&[0x30, 9]);
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::TooLarge { size: 11, max: 10 }))));
+        assert_eq!(
+            d.next(),
+            Some(Err(Fail::Protocol(Error::TooLarge { size: 11, max: 10 })))
+        );
         assert_eq!(Frames::<Packet>::with_limit(0).limit(), 2);
         assert_eq!(Frames::<Packet>::with_limit(usize::MAX).limit(), MAX_PACKET);
         assert_eq!(Frames::<Packet>::new().limit(), DEFAULT_MAX_PACKET);
         // The largest header is refused at once by the default limit.
         let mut d = Stream::new(Frames::<Packet>::new());
         let _ = d.push(&[0x30, 0xff, 0xff, 0xff, 0x7f]);
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::TooLarge { size: MAX_PACKET, max: DEFAULT_MAX_PACKET }))));
+        assert_eq!(
+            d.next(),
+            Some(Err(Fail::Protocol(Error::TooLarge {
+                size: MAX_PACKET,
+                max: DEFAULT_MAX_PACKET
+            })))
+        );
     }
 
     #[test]
     fn errors_display() {
         let all = [
             Error::ReservedType(0),
-            Error::Flags { packet_type: 3, flags: 6 },
+            Error::Flags {
+                packet_type: 3,
+                flags: 6,
+            },
             Error::RemainingLength,
             Error::TooLarge { size: 9, max: 8 },
             Error::Truncated,
@@ -1677,7 +2030,11 @@ mod tests {
 
     fn check(data: &[u8], small: usize) {
         contract::check_wire::<Packet>(data);
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * DEFAULT_MAX_PACKET);
+        contract::check_decode_with_alloc_limit(
+            Frames::<Packet>::new,
+            data,
+            2 * DEFAULT_MAX_PACKET,
+        );
         let make = || Frames::<Packet>::with_limit(small);
         contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
         for packet in decode_all(Frames::<Packet>::new, data).0 {
@@ -1720,8 +2077,11 @@ mod tests {
         let mut rng = Lcg::new(42);
         let alphabet = ['a', 'b', '/', '+', '#', '$', '\0'];
         for _ in 0..3000 {
-            let make =
-                |rng: &mut Lcg| -> String { (0..rng.index(7)).map(|_| alphabet[rng.index(alphabet.len())]).collect() };
+            let make = |rng: &mut Lcg| -> String {
+                (0..rng.index(7))
+                    .map(|_| alphabet[rng.index(alphabet.len())])
+                    .collect()
+            };
             let (filter, topic) = (make(&mut rng), make(&mut rng));
             let matched = topic_matches(&filter, &topic);
             if matched {

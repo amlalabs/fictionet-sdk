@@ -65,10 +65,10 @@
 //! assert_eq!(Packet::new(vec![21]).to_bytes().unwrap().len(), 16);
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Decode, Step, Wire, Reader as ByteReader, Truncated};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::{Decode, Reader as ByteReader, Step, Truncated, Wire};
 
 /// The TCP port SSH servers listen on.
 pub const PORT: u16 = 22;
@@ -228,7 +228,12 @@ impl Identification {
         Self::with_ending(proto, software, comments, 2)
     }
 
-    fn with_ending(proto: &str, software: &str, comments: Option<&str>, ending: usize) -> Result<Self, Error> {
+    fn with_ending(
+        proto: &str,
+        software: &str,
+        comments: Option<&str>,
+        ending: usize,
+    ) -> Result<Self, Error> {
         // Everything is checked before anything is copied, so a long part
         // costs no allocation.
         if !version_part(proto.as_bytes()) || !version_part(software.as_bytes()) {
@@ -261,7 +266,9 @@ impl Identification {
             Some(sp) => (&rest[..sp], Some(&rest[sp + 1..])),
             None => (rest, None),
         };
-        fn text(b: &[u8]) -> Result<&str, Error> { core::str::from_utf8(b).map_err(|_| Error::BadVersion) }
+        fn text(b: &[u8]) -> Result<&str, Error> {
+            core::str::from_utf8(b).map_err(|_| Error::BadVersion)
+        }
         let comments = match comments {
             Some(c) => Some(text(c)?),
             None => None,
@@ -320,12 +327,13 @@ fn line_pending(b: &[u8], scanned: usize) -> bool {
         MAX_BANNER_LINE
     };
     b.len() < limit
-        && b.get(scanned..)
-            .is_some_and(|new| !new.iter().any(|&c| {
+        && b.get(scanned..).is_some_and(|new| {
+            !new.iter().any(|&c| {
                 #[cfg(test)]
                 LINE_BYTES_SCANNED.with(|count| count.set(count.get().saturating_add(1)));
                 c == b'\n' || c == 0
-            }))
+            })
+        })
 }
 
 /// Whether `b` may be a protocol or software version: not empty, and
@@ -406,7 +414,11 @@ impl Wire for Identification {
             out.push(b' ');
             out.extend_from_slice(c.as_bytes());
         }
-        out.extend_from_slice(if self.len() <= MAX_VERSION_LINE { b"\r\n" } else { b"\n" });
+        out.extend_from_slice(if self.len() <= MAX_VERSION_LINE {
+            b"\r\n"
+        } else {
+            b"\n"
+        });
         Ok(())
     }
 }
@@ -611,16 +623,25 @@ impl Prefixed for Packet {
     const NAME: &'static str = "SSH cleartext packets";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_PACKET }
+    fn default_limit() -> Self::Limit {
+        MAX_PACKET
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(MIN_PACKET, MAX_PACKET) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.clamp(MIN_PACKET, MAX_PACKET)
+    }
 
     #[inline]
-    fn capacity(limit: &Self::Limit) -> usize { *limit }
+    fn capacity(limit: &Self::Limit) -> usize {
+        *limit
+    }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         if let Some(&[a, b, c, d]) = input.get(..4) {
             let length = u32::from_be_bytes([a, b, c, d]);
@@ -632,7 +653,6 @@ impl Prefixed for Packet {
         Packet::parse_prefix(input)
     }
 }
-
 
 /// What a [`Events`] finds in the stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -805,7 +825,9 @@ pub struct Reader<'a> {
 impl<'a> Reader<'a> {
     /// A reader over `b`.
     pub fn new(b: &'a [u8]) -> Reader<'a> {
-        Reader { cursor: ByteReader::new(b) }
+        Reader {
+            cursor: ByteReader::new(b),
+        }
     }
 
     /// The next `n` bytes.
@@ -1372,8 +1394,7 @@ impl Wire for Message {
     /// known-number `Other` variants, and values exceeding [`MAX_PAYLOAD`].
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let (size, list_lengths) = self.encoded_lengths()?;
-        out.try_reserve_exact(size)
-            .map_err(|_| Error::Unwritable)?;
+        out.try_reserve_exact(size).map_err(|_| Error::Unwritable)?;
         out.push(self.number());
         match self {
             Self::Disconnect {
@@ -1483,17 +1504,17 @@ fn is_known(n: u8) -> bool {
 
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Truncated }
+    fn from(_: Truncated) -> Self {
+        Error::Truncated
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, pump,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -1557,13 +1578,19 @@ mod tests {
     #[test]
     fn review_version_line_endings_at_limit() {
         for ending in ["\n", "\r\n"] {
-            let text = format!("SSH-2.0-{}", "x".repeat(MAX_VERSION_LINE - 8 - ending.len()));
+            let text = format!(
+                "SSH-2.0-{}",
+                "x".repeat(MAX_VERSION_LINE - 8 - ending.len())
+            );
             let bytes = format!("{text}{ending}").into_bytes();
             assert_eq!(bytes.len(), MAX_VERSION_LINE);
             let id = Identification::parse(&bytes).unwrap();
             assert_eq!(Identification::parse(&id.to_bytes().unwrap()), Ok(id));
             let long = format!("{text}x{ending}");
-            assert_eq!(Identification::parse(long.as_bytes()), Err(Error::LineTooLong));
+            assert_eq!(
+                Identification::parse(long.as_bytes()),
+                Err(Error::LineTooLong)
+            );
         }
     }
 
@@ -1686,10 +1713,7 @@ mod tests {
             Reader::new(&[0xff, 0xff, 0xff, 0xff]).string(),
             Err(Error::Truncated)
         );
-        assert_eq!(
-            Reader::new(&[0, 0, 0, 1, 0xff]).text(10),
-            Err(Error::Utf8)
-        );
+        assert_eq!(Reader::new(&[0, 0, 0, 1, 0xff]).text(10), Err(Error::Utf8));
         assert_eq!(
             Reader::new(&[0, 0, 0, 2, b'a', b'b']).text(1),
             Err(Error::FieldTooLong)
@@ -1754,14 +1778,8 @@ mod tests {
     fn message_errors() {
         assert_eq!(Message::parse(&[]), Err(Error::Empty));
         assert_eq!(Message::parse(&[21, 0]), Err(Error::Trailing));
-        assert_eq!(
-            Message::parse(&[3, 0, 0, 0, 1, 9]),
-            Err(Error::Trailing)
-        );
-        assert_eq!(
-            Message::parse(&[5, 0, 0, 0, 1, 0xff]),
-            Err(Error::Utf8)
-        );
+        assert_eq!(Message::parse(&[3, 0, 0, 0, 1, 9]), Err(Error::Trailing));
+        assert_eq!(Message::parse(&[5, 0, 0, 0, 1, 0xff]), Err(Error::Utf8));
         assert_eq!(
             Message::parse(&vec![50; MAX_PAYLOAD + 1]),
             Err(Error::FieldTooLong)
@@ -2056,20 +2074,11 @@ mod tests {
                 Err(Error::PacketLength(length))
             );
         }
-        assert_eq!(
-            Packet::parse(&[0, 0, 0x88, 0xb4]),
-            Err(Error::Truncated)
-        );
+        assert_eq!(Packet::parse(&[0, 0, 0x88, 0xb4]), Err(Error::Truncated));
         for pad in [3, 12] {
-            assert_eq!(
-                Packet::parse(&[0, 0, 0, 12, pad]),
-                Err(Error::Padding(pad))
-            );
+            assert_eq!(Packet::parse(&[0, 0, 0, 12, pad]), Err(Error::Padding(pad)));
         }
-        assert_eq!(
-            Packet::parse(&[0, 0, 0, 12, 11]),
-            Err(Error::Truncated)
-        );
+        assert_eq!(Packet::parse(&[0, 0, 0, 12, 11]), Err(Error::Truncated));
         assert_eq!(
             Packet::parse(&[0, 0, 0x88, 0xb4, 4]),
             Err(Error::PayloadTooLong(34991))
@@ -2261,24 +2270,28 @@ mod tests {
 
     #[test]
     fn stream_takes_many_packets_and_partial_suffixes() {
-        assert_linear("stream_takes_many_packets_and_partial_suffixes", rounds(100_000), |size| {
-            let one = Packet::from_message(&Message::NewKeys)
-                .unwrap()
-                .to_bytes()
-                .unwrap();
-            let mut bytes = one.repeat(size);
-            bytes.extend_from_slice(&one[..3]);
-            let (events, failure) = decode_all(Events::after_version, &bytes);
-            assert_eq!(events.len(), size);
-            assert_eq!(failure, Some(Fail::Truncated { unread: 3 }));
-            assert!(matches!(
-                events.last(),
-                Some(Event::Packet {
-                    sequence,
-                    ..
-                }) if *sequence as usize == size - 1
-            ));
-        });
+        assert_linear(
+            "stream_takes_many_packets_and_partial_suffixes",
+            rounds(100_000),
+            |size| {
+                let one = Packet::from_message(&Message::NewKeys)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap();
+                let mut bytes = one.repeat(size);
+                bytes.extend_from_slice(&one[..3]);
+                let (events, failure) = decode_all(Events::after_version, &bytes);
+                assert_eq!(events.len(), size);
+                assert_eq!(failure, Some(Fail::Truncated { unread: 3 }));
+                assert!(matches!(
+                    events.last(),
+                    Some(Event::Packet {
+                        sequence,
+                        ..
+                    }) if *sequence as usize == size - 1
+                ));
+            },
+        );
     }
 
     #[test]
@@ -2304,7 +2317,11 @@ mod tests {
         assert_eq!(banners, MAX_BANNER_LINES);
         assert_eq!(stream.buffered(), 0);
         let scanned = LINE_BYTES_SCANNED.with(|count| count.get());
-        assert!(scanned <= bytes.len(), "scanned {scanned} bytes for {} input bytes", bytes.len());
+        assert!(
+            scanned <= bytes.len(),
+            "scanned {scanned} bytes for {} input bytes",
+            bytes.len()
+        );
     }
 
     #[test]
@@ -2390,7 +2407,9 @@ mod tests {
                 padding: g.bytes(20),
             };
             contract::check_wire_value(&packet);
-            if let Ok(id) = Identification::new(&text(&mut g, 3), &text(&mut g, 10), Some(&text(&mut g, 3))) {
+            if let Ok(id) =
+                Identification::new(&text(&mut g, 3), &text(&mut g, 10), Some(&text(&mut g, 3)))
+            {
                 contract::check_wire_value(&id);
             }
             contract::check_wire_value(&Line::Banner(g.bytes(100)));

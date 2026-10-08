@@ -881,7 +881,10 @@ impl Message {
         let bytes = self.render()?;
         reserve(
             out,
-            bytes.len().checked_add(1).ok_or(problem(ErrorKind::Allocation))?,
+            bytes
+                .len()
+                .checked_add(1)
+                .ok_or(problem(ErrorKind::Allocation))?,
         )?;
         out.extend_from_slice(&bytes);
         out.push(b'\n');
@@ -1159,10 +1162,10 @@ impl Decode for Messages {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::decode_all;
+    use fictionet::stdlib::test_support::rounds;
 
     fn value(text: &str) -> Value {
         Value::parse(text.as_bytes()).unwrap()
@@ -1523,7 +1526,8 @@ mod tests {
             "10e-1",
         ] {
             assert!(
-                ErrorObject::from_value(value(&format!(r#"{{"code":{code},"message":"x"}}"#))).is_ok(),
+                ErrorObject::from_value(value(&format!(r#"{{"code":{code},"message":"x"}}"#)))
+                    .is_ok(),
                 "{code}"
             );
         }
@@ -1578,7 +1582,12 @@ mod tests {
         );
         let bytes = format!("{}\n{good}\n", "x".repeat(300));
         let (items, failure) = decode_all(
-            || Messages::with_limits(Limits { size: 64, ..Limits::default() }),
+            || {
+                Messages::with_limits(Limits {
+                    size: 64,
+                    ..Limits::default()
+                })
+            },
             bytes.as_bytes(),
         );
         assert_eq!(failure, None);
@@ -1591,7 +1600,10 @@ mod tests {
         for ending in ["\n", "\r\n"] {
             assert!(
                 decode_all(
-                    || Messages::with_limits(Limits { size: good.len(), ..Limits::default() }),
+                    || Messages::with_limits(Limits {
+                        size: good.len(),
+                        ..Limits::default()
+                    }),
                     format!("{good}{ending}").as_bytes()
                 )
                 .0
@@ -1602,7 +1614,11 @@ mod tests {
         }
         assert_eq!(Messages::new().capacity(), MAX_LINE + 2);
         assert_eq!(
-            Messages::with_limits(Limits { size: usize::MAX, ..Limits::default() }).capacity(),
+            Messages::with_limits(Limits {
+                size: usize::MAX,
+                ..Limits::default()
+            })
+            .capacity(),
             MAX_LINE + 2
         );
         assert_eq!(Messages::new().held(), 0);
@@ -1615,13 +1631,19 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            decode_all(|| Messages::with_limits(Limits { size: 0, ..Limits::default() }), b"\n")
-                .0
-                .first()
-                .unwrap()
-                .as_ref()
-                .unwrap_err()
-                .kind,
+            decode_all(
+                || Messages::with_limits(Limits {
+                    size: 0,
+                    ..Limits::default()
+                }),
+                b"\n"
+            )
+            .0
+            .first()
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .kind,
             ErrorKind::BlankLine
         );
     }

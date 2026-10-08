@@ -5,13 +5,12 @@
 use fictionet::stdlib::asn1::{Oid, StringKind};
 use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::x509::{
-    BasicConstraints, Certificate, Crl, ExtensionValue, GeneralName,
-    KeyUsage, MAX_PEM_DATA, MAX_PEM_FRAME, Name, PemBlock, PemBlocks,
-    RevokedCertificate, SubjectAltName, TbsCertList, TbsCertificate, Value,
-    pem_decode,
-};
 use fictionet::stdlib::x509::harness::check_extension_value;
+use fictionet::stdlib::x509::{
+    BasicConstraints, Certificate, Crl, ExtensionValue, GeneralName, KeyUsage, MAX_PEM_DATA,
+    MAX_PEM_FRAME, Name, PemBlock, PemBlocks, RevokedCertificate, SubjectAltName, TbsCertList,
+    TbsCertificate, Value, pem_decode,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// A value built from the input, not read from it: its writer either

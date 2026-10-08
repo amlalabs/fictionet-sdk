@@ -78,7 +78,12 @@ pub(crate) enum Why {
 
 impl Link {
     pub(crate) fn new(v4: Family<Ipv4Addr>, v6: Family<Ipv6Addr>, mtu: u16) -> Link {
-        Link { v4, v6, mtu, vm: None }
+        Link {
+            v4,
+            v6,
+            mtu,
+            vm: None,
+        }
     }
 
     pub(crate) fn vm_mac(&self) -> Option<Mac> {
@@ -101,7 +106,9 @@ impl Link {
 
     /// Decides what to do with one frame from the VM.
     pub(crate) fn frame_from_vm<'a>(&mut self, frame: &'a [u8]) -> FromVm<'a> {
-        let Some(f) = Frame::parse(frame) else { return FromVm::Drop(Why::Malformed) };
+        let Some(f) = Frame::parse(frame) else {
+            return FromVm::Drop(Why::Malformed);
+        };
         if frame.len() > ether::HEADER + self.mtu as usize {
             return FromVm::Drop(Why::TooBig);
         }
@@ -134,14 +141,24 @@ impl Link {
     }
 
     fn ipv4<'a>(&self, p: &'a [u8], vm: Mac) -> FromVm<'a> {
-        let Ok(upper) = ether::upper(p) else { return FromVm::Drop(Why::Malformed) };
+        let Ok(upper) = ether::upper(p) else {
+            return FromVm::Drop(Why::Malformed);
+        };
         match upper {
-            Upper::Udp { port: dhcp::SERVER_PORT, payload: request } => {
+            Upper::Udp {
+                port: dhcp::SERVER_PORT,
+                payload: request,
+            } => {
                 return match &self.v4 {
                     Family::Serve(lease) => match addresses::dhcp4(lease, self.mtu, request) {
                         Some((packet, broadcast)) => {
                             let to = if broadcast { ether::BROADCAST } else { vm };
-                            FromVm::Answer(ether::frame(to, ether::GATEWAY_MAC, ether::IPV4, &packet))
+                            FromVm::Answer(ether::frame(
+                                to,
+                                ether::GATEWAY_MAC,
+                                ether::IPV4,
+                                &packet,
+                            ))
                         }
                         None => FromVm::Drop(Why::Handled),
                     },
@@ -153,7 +170,9 @@ impl Link {
             // fragmented DHCP request, and lets none past when it owns DHCP.
             // The rest of the request cannot be put together in the world
             // without this first fragment.
-            Upper::UdpFragment { port: dhcp::SERVER_PORT } if self.v4 != Family::FromWorld => {
+            Upper::UdpFragment {
+                port: dhcp::SERVER_PORT,
+            } if self.v4 != Family::FromWorld => {
                 return FromVm::Drop(Why::Handled);
             }
             _ => {}
@@ -171,20 +190,32 @@ impl Link {
     }
 
     fn ipv6<'a>(&self, p: &'a [u8], vm: Mac) -> FromVm<'a> {
-        let Ok(upper) = ether::upper(p) else { return FromVm::Drop(Why::Malformed) };
+        let Ok(upper) = ether::upper(p) else {
+            return FromVm::Drop(Why::Malformed);
+        };
         match upper {
             // Neighbor discovery is never fragmented (RFC 6980), and only
             // makes sense on the link.
-            Upper::Icmp6 { kind, fragment: true, .. } if ether::is_neighbor_discovery(kind) => {
+            Upper::Icmp6 {
+                kind,
+                fragment: true,
+                ..
+            } if ether::is_neighbor_discovery(kind) => {
                 return FromVm::Drop(Why::Handled);
             }
-            Upper::Icmp6 { kind: ether::NEIGHBOR_SOLICITATION, .. } => {
+            Upper::Icmp6 {
+                kind: ether::NEIGHBOR_SOLICITATION,
+                ..
+            } => {
                 return match ether::neighbor_advert(p, vm, self.own_v6()) {
                     Some(reply) => FromVm::Answer(reply),
                     None => FromVm::Drop(Why::Handled),
                 };
             }
-            Upper::Icmp6 { kind: ether::ROUTER_SOLICITATION, .. } => {
+            Upper::Icmp6 {
+                kind: ether::ROUTER_SOLICITATION,
+                ..
+            } => {
                 return match &self.v6 {
                     Family::Serve(_) => match self.router_advert() {
                         Some(ra) => FromVm::Answer(ra),
@@ -198,12 +229,20 @@ impl Link {
             Upper::Icmp6 { kind, .. } if ether::is_neighbor_discovery(kind) => {
                 return FromVm::Drop(Why::Handled);
             }
-            Upper::Udp { port: addresses::DHCP6_SERVER_PORT, payload: request } => {
+            Upper::Udp {
+                port: addresses::DHCP6_SERVER_PORT,
+                payload: request,
+            } => {
                 return match &self.v6 {
                     Family::Serve(lease) => match addresses::dhcp6(lease, request) {
                         Some(answer) => {
                             let packet = addresses::dhcp6_packet(p, &answer);
-                            FromVm::Answer(ether::frame(vm, ether::GATEWAY_MAC, ether::IPV6, &packet))
+                            FromVm::Answer(ether::frame(
+                                vm,
+                                ether::GATEWAY_MAC,
+                                ether::IPV6,
+                                &packet,
+                            ))
                         }
                         None => FromVm::Drop(Why::Handled),
                     },
@@ -213,7 +252,9 @@ impl Link {
             }
             // As for DHCP over IPv4: no answer to a fragment, and none past
             // when attach owns DHCPv6.
-            Upper::UdpFragment { port: addresses::DHCP6_SERVER_PORT } if self.v6 != Family::FromWorld => {
+            Upper::UdpFragment {
+                port: addresses::DHCP6_SERVER_PORT,
+            } if self.v6 != Family::FromWorld => {
                 return FromVm::Drop(Why::Handled);
             }
             _ => {}
@@ -239,7 +280,9 @@ impl Link {
 
     /// A router advertisement frame, when attach hands out IPv6 addresses.
     pub(crate) fn router_advert(&self) -> Option<Vec<u8>> {
-        let Family::Serve(lease) = &self.v6 else { return None };
+        let Family::Serve(lease) = &self.v6 else {
+            return None;
+        };
         let ra = addresses::router_advert(lease, self.mtu);
         let (dst, _) = ether::destination(&ra, self.vm, None)?;
         Some(ether::frame(dst, ether::GATEWAY_MAC, ether::IPV6, &ra))
@@ -271,7 +314,9 @@ pub(crate) fn run(args: TapArgs) -> Result<(), Failure> {
     };
     // The ready file is this attach's only once it holds the lock: an
     // attach that failed to take it leaves the running one's file alone.
-    if lock.is_some() && let Some(path) = &args.ready_file {
+    if lock.is_some()
+        && let Some(path) = &args.ready_file
+    {
         let _ = std::fs::remove_file(path);
     }
     // The lock is held until the process exits, which releases it. Until
@@ -279,15 +324,27 @@ pub(crate) fn run(args: TapArgs) -> Result<(), Failure> {
     // signal handler can touch a new attach's ready file or redirect.
     std::mem::forget(lock);
     match result? {
-        End::Qemu => eprintln!("fictionet attach: QEMU closed the connection; {} detached", args.name),
-        End::DeviceGone(name) => eprintln!("fictionet attach: {name} was removed; {} detached", args.name),
+        End::Qemu => eprintln!(
+            "fictionet attach: QEMU closed the connection; {} detached",
+            args.name
+        ),
+        End::DeviceGone(name) => eprintln!(
+            "fictionet attach: {name} was removed; {} detached",
+            args.name
+        ),
         End::World => eprintln!("fictionet attach: the world closed the connection"),
     }
     Ok(())
 }
 
 fn greeting<'a>(args: &'a TapArgs) -> Greeting<'a> {
-    Greeting { world: &args.world, world_wait: args.world_wait, kind: "tap", name: &args.name, mtu: args.mtu }
+    Greeting {
+        world: &args.world,
+        world_wait: args.world_wait,
+        kind: "tap",
+        name: &args.name,
+        mtu: args.mtu,
+    }
 }
 
 /// Marks this attach as the owner of its VM link: from here on, the ready
@@ -305,20 +362,31 @@ fn take_ready_file(args: &TapArgs, lock: &mut Option<OwnedFd>, held: OwnedFd) {
 /// the world, then serves QEMU's one connection.
 fn run_qemu(args: &TapArgs, path: &Path, lock: &mut Option<OwnedFd>) -> Result<End, Failure> {
     take_ready_file(args, lock, lock_path(path)?);
-    let listener = listen(path).map_err(|e| Failure::Error(format!("listening at {}: {e}", path.display())))?;
+    let listener = listen(path)
+        .map_err(|e| Failure::Error(format!("listening at {}: {e}", path.display())))?;
     // Until QEMU connects, the socket file goes with this process.
     let mut unlink = Some(Unlink::new(path).map_err(err("checking the socket file"))?);
     let sock = world::handshake(&greeting(args))?;
-    eprintln!("fictionet attach: {} attached; waiting for QEMU at {}", args.name, path.display());
+    eprintln!(
+        "fictionet attach: {} attached; waiting for QEMU at {}",
+        args.name,
+        path.display()
+    );
     world::write_ready_file(args.ready_file.as_deref(), &args.name)?;
-    let Some(vm) = accept(&listener, sock.as_raw_fd())? else { return Ok(End::World) };
+    let Some(vm) = accept(&listener, sock.as_raw_fd())? else {
+        return Ok(End::World);
+    };
     // One connection only: the socket file goes now, so a second QEMU
     // cannot connect, and a restarted attach can make a new one at the
     // same path.
     drop(listener);
     drop(unlink.take());
     eprintln!("fictionet attach: QEMU connected");
-    let mut port = Port::Stream { fd: vm, decoder: Decoder::new(), outbox: Outbox::new(OUTBOX) };
+    let mut port = Port::Stream {
+        fd: vm,
+        decoder: Decoder::new(),
+        outbox: Outbox::new(OUTBOX),
+    };
     relay_and_report(args, &mut port, sock.as_raw_fd())
 }
 
@@ -327,7 +395,10 @@ fn run_qemu(args: &TapArgs, path: &Path, lock: &mut Option<OwnedFd>) -> Result<E
 fn run_device(args: &TapArgs, name: &str, lock: &mut Option<OwnedFd>) -> Result<End, Failure> {
     // Enter the namespace first, while the process has one thread.
     if let Some(netns) = &args.netns {
-        tun::enter_netns(netns).map_err(err(&format!("entering the network namespace {}", netns.display())))?;
+        tun::enter_netns(netns).map_err(err(&format!(
+            "entering the network namespace {}",
+            netns.display()
+        )))?;
     }
     let vm_index = tun::index_of(name).map_err(|e| {
         Failure::Error(format!(
@@ -344,7 +415,12 @@ fn run_device(args: &TapArgs, name: &str, lock: &mut Option<OwnedFd>) -> Result<
     let sock = world::handshake(&greeting(args))?;
     eprintln!("fictionet attach: {} attached through {name}", args.name);
     world::write_ready_file(args.ready_file.as_deref(), &args.name)?;
-    let mut port = Port::Device { fd, buf: vec![0u8; 65_536 + ether::HEADER], name: name.to_owned(), index: vm_index };
+    let mut port = Port::Device {
+        fd,
+        buf: vec![0u8; 65_536 + ether::HEADER],
+        name: name.to_owned(),
+        index: vm_index,
+    };
     let end = relay_and_report(args, &mut port, sock.as_raw_fd());
     drop(mirror);
     end
@@ -364,14 +440,20 @@ fn relay_and_report(args: &TapArgs, port: &mut Port, world: RawFd) -> Result<End
 fn open_tap(vm_dev: &str) -> Result<(OwnedFd, String), Failure> {
     let fd = tun::open_tun_file()?;
     let want = format!("{vm_dev}-fn");
-    let want = if want.len() <= 15 { want } else { "fntap%d".to_owned() };
+    let want = if want.len() <= 15 {
+        want
+    } else {
+        "fntap%d".to_owned()
+    };
     let mut ifr = [0u8; 40];
     ifr[..want.len()].copy_from_slice(want.as_bytes());
     ifr[16..18].copy_from_slice(&(IFF_TAP | tun::IFF_NO_PI).to_ne_bytes());
     // SAFETY: `ifr` is as large as struct ifreq.
     if unsafe { libc::ioctl(fd.as_raw_fd(), tun::TUNSETIFF as _, ifr.as_mut_ptr()) } < 0 {
         let e = io::Error::last_os_error();
-        return Err(Failure::Error(format!("creating the TAP device {want} (does attach have CAP_NET_ADMIN?): {e}")));
+        return Err(Failure::Error(format!(
+            "creating the TAP device {want} (does attach have CAP_NET_ADMIN?): {e}"
+        )));
     }
     let len = ifr[..16].iter().position(|&b| b == 0).unwrap_or(16);
     Ok((fd, String::from_utf8_lossy(&ifr[..len]).into_owned()))
@@ -404,7 +486,10 @@ enum Step {
     /// Remove a qdisc an earlier attach left on the VM's device.
     ClearVm,
     AddIngress(u32),
-    Redirect { from: u32, to: u32 },
+    Redirect {
+        from: u32,
+        to: u32,
+    },
     /// Bring the VM's device up, once both redirects are in place.
     VmUp,
 }
@@ -432,26 +517,36 @@ impl Mirror {
         // The cleanup is in place before anything changes: dropping the
         // guard, or SIGTERM, SIGINT and SIGHUP (whose handler does the same
         // as dropping it), set the VM's device down and remove its qdisc.
-        crate::netlink_on_signal([netlink::link_down(vm).finish(), netlink::del_ingress(vm).finish()].concat());
+        crate::netlink_on_signal(
+            [
+                netlink::link_down(vm).finish(),
+                netlink::del_ingress(vm).finish(),
+            ]
+            .concat(),
+        );
         let mirror = Mirror { vm };
         for step in mirror_steps(vm, own) {
             match step {
                 Step::VmDown => {
-                    nl.call(netlink::link_down(vm)).map_err(|e| context(e, "setting the VM's device down"))?;
+                    nl.call(netlink::link_down(vm))
+                        .map_err(|e| context(e, "setting the VM's device down"))?;
                 }
                 Step::NoIpv6(index) => {
                     let name = if index == vm { vm_name } else { own_name };
                     let _ = nl.call(netlink::no_ipv6_link_local(index));
-                    let _ = std::fs::write(format!("/proc/sys/net/ipv6/conf/{name}/disable_ipv6"), "1");
+                    let _ =
+                        std::fs::write(format!("/proc/sys/net/ipv6/conf/{name}/disable_ipv6"), "1");
                 }
                 Step::OwnUp => {
-                    nl.call(netlink::link_up(own, mtu as u32)).map_err(|e| context(e, "bringing up attach's device"))?;
+                    nl.call(netlink::link_up(own, mtu as u32))
+                        .map_err(|e| context(e, "bringing up attach's device"))?;
                 }
                 Step::ClearVm => {
                     let _ = nl.call(netlink::del_ingress(vm));
                 }
                 Step::AddIngress(index) => {
-                    nl.call(netlink::add_ingress(index)).map_err(|e| context(e, "adding an ingress qdisc"))?;
+                    nl.call(netlink::add_ingress(index))
+                        .map_err(|e| context(e, "adding an ingress qdisc"))?;
                 }
                 Step::Redirect { from, to } => {
                     nl.call(netlink::redirect_ingress(from, to)).map_err(|e| {
@@ -459,7 +554,8 @@ impl Mirror {
                     })?;
                 }
                 Step::VmUp => {
-                    nl.call(netlink::set_up(vm)).map_err(|e| context(e, "bringing up the VM's device"))?;
+                    nl.call(netlink::set_up(vm))
+                        .map_err(|e| context(e, "bringing up the VM's device"))?;
                 }
             }
         }
@@ -590,15 +686,25 @@ enum End {
 /// is bound to, as `/proc/net/unix` lists them, or any other file, is an
 /// error.
 fn listen(path: &Path) -> io::Result<OwnedFd> {
-    CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::other("the path holds a NUL byte"))?;
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::other("the path holds a NUL byte"))?;
     // SAFETY: plain syscall; the fd is owned from here.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let (addr, len) = unix::address(path).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "the socket path must be 1 to 107 bytes")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the socket path must be 1 to 107 bytes",
+        )
     })?;
     let bind = || {
         // The file is made with mode 0600. umask is per process, and attach
@@ -616,7 +722,10 @@ fn listen(path: &Path) -> io::Result<OwnedFd> {
             use std::os::unix::fs::FileTypeExt;
             let meta = std::fs::symlink_metadata(path)?;
             if !meta.file_type().is_socket() {
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "the path exists and is not a socket"));
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "the path exists and is not a socket",
+                ));
             }
             if socket_bound_at(path)? {
                 return Err(io::Error::new(
@@ -642,7 +751,11 @@ fn socket_bound_at(path: &Path) -> io::Result<bool> {
     let list = std::fs::read("/proc/net/unix")?;
     let absolute = std::path::absolute(path)?;
     let want = [path.as_os_str().as_bytes(), absolute.as_os_str().as_bytes()];
-    Ok(list.split(|&b| b == b'\n').skip(1).filter_map(bound_path).any(|p| want.contains(&p)))
+    Ok(list
+        .split(|&b| b == b'\n')
+        .skip(1)
+        .filter_map(bound_path)
+        .any(|p| want.contains(&p)))
 }
 
 /// The path in one line of `/proc/net/unix`: everything after its seven
@@ -667,8 +780,16 @@ fn accept(listener: &OwnedFd, world: RawFd) -> Result<Option<OwnedFd>, Failure> 
     let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
     loop {
         let mut fds = [
-            libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: world, events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: world,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         // SAFETY: `fds` is valid for the call.
         if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
@@ -693,7 +814,12 @@ fn accept(listener: &OwnedFd, world: RawFd) -> Result<Option<OwnedFd>, Failure> 
             };
             if fd < 0 {
                 let e = io::Error::last_os_error();
-                if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted) {
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                        | io::ErrorKind::ConnectionAborted
+                ) {
                     continue;
                 }
                 return Err(Failure::Error(format!("accepting QEMU's connection: {e}")));
@@ -744,13 +870,22 @@ impl Stats {
             eprintln!("fictionet attach: {n} frames from the VM dropped: {what}");
         }
         if self.to_world_full > 0 {
-            eprintln!("fictionet attach: {} packets to the world dropped on a full buffer", self.to_world_full);
+            eprintln!(
+                "fictionet attach: {} packets to the world dropped on a full buffer",
+                self.to_world_full
+            );
         }
         if self.to_vm_full > 0 {
-            eprintln!("fictionet attach: {} frames to the VM dropped on a full queue", self.to_vm_full);
+            eprintln!(
+                "fictionet attach: {} frames to the VM dropped on a full queue",
+                self.to_vm_full
+            );
         }
         if self.from_world_bad > 0 {
-            eprintln!("fictionet attach: {} packets from the world dropped: not IP, over the MTU, or unicast before the VM's MAC is known", self.from_world_bad);
+            eprintln!(
+                "fictionet attach: {} packets from the world dropped: not IP, over the MTU, or unicast before the VM's MAC is known",
+                self.from_world_bad
+            );
         }
     }
 }
@@ -772,7 +907,11 @@ const RA_EVERY: Duration = Duration::from_secs(600);
 enum Port {
     /// QEMU's stream socket: frames with a length prefix, written through a
     /// queue because one frame may go out in pieces.
-    Stream { fd: OwnedFd, decoder: Decoder, outbox: Outbox },
+    Stream {
+        fd: OwnedFd,
+        decoder: Decoder,
+        outbox: Outbox,
+    },
     /// Attach's TAP device: one frame per read and per write.
     Device {
         fd: OwnedFd,
@@ -797,19 +936,32 @@ impl Port {
         match self {
             Port::Stream { outbox, .. } => Ok(outbox.push(parts)),
             Port::Device { fd, .. } => {
-                let mut stack = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+                let mut stack = [libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                }; 2];
                 let heap: Vec<libc::iovec>;
                 let iov: &[libc::iovec] = if parts.len() <= stack.len() {
                     for (v, p) in stack.iter_mut().zip(parts) {
-                        *v = libc::iovec { iov_base: p.as_ptr() as *mut _, iov_len: p.len() };
+                        *v = libc::iovec {
+                            iov_base: p.as_ptr() as *mut _,
+                            iov_len: p.len(),
+                        };
                     }
                     &stack[..parts.len()]
                 } else {
-                    heap = parts.iter().map(|p| libc::iovec { iov_base: p.as_ptr() as *mut _, iov_len: p.len() }).collect();
+                    heap = parts
+                        .iter()
+                        .map(|p| libc::iovec {
+                            iov_base: p.as_ptr() as *mut _,
+                            iov_len: p.len(),
+                        })
+                        .collect();
                     &heap
                 };
                 // SAFETY: the iovecs point into `parts`, valid for the call.
-                let n = unsafe { libc::writev(fd.as_raw_fd(), iov.as_ptr(), iov.len() as libc::c_int) };
+                let n =
+                    unsafe { libc::writev(fd.as_raw_fd(), iov.as_ptr(), iov.len() as libc::c_int) };
                 if n >= 0 {
                     return Ok(true);
                 }
@@ -872,7 +1024,10 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
             wake = Some(wake.map_or(next_check, |w| w.min(next_check)));
         }
         let timeout = match wake {
-            Some(at) => at.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32,
+            Some(at) => at
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(i32::MAX as u128) as i32,
             None => -1,
         };
         let vm_events = match port {
@@ -880,8 +1035,16 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
             _ => libc::POLLIN,
         };
         let mut fds = [
-            libc::pollfd { fd: vm, events: vm_events, revents: 0 },
-            libc::pollfd { fd: world, events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: vm,
+                events: vm_events,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: world,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         // SAFETY: `fds` is valid for the call.
         if unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } < 0 {
@@ -908,7 +1071,9 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
             return Ok((End::World, stats));
         }
 
-        if fds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 && matches!(port, Port::Device { .. }) {
+        if fds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0
+            && matches!(port, Port::Device { .. })
+        {
             return Err(Failure::Error("attach's TAP device failed".into()));
         }
         if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
@@ -917,18 +1082,34 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
             let mut answers: Vec<Vec<u8>> = Vec::new();
             let mut answer_bytes = 0;
             for _ in 0..BATCH {
-                let mut handle = |frame: &[u8], stats: &mut Stats| -> Result<Option<End>, Failure> {
+                let mut handle = |frame: &[u8],
+                                  stats: &mut Stats|
+                 -> Result<Option<End>, Failure> {
                     match link.frame_from_vm(frame) {
-                        FromVm::World(p) => match unix::send_parts(world, &[&[relay::PACKET], p], true) {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::ENOBUFS) => {
-                                stats.to_world_full += 1;
+                        FromVm::World(p) => {
+                            match unix::send_parts(world, &[&[relay::PACKET], p], true) {
+                                Ok(()) => {}
+                                Err(e)
+                                    if e.kind() == io::ErrorKind::WouldBlock
+                                        || e.raw_os_error() == Some(libc::ENOBUFS) =>
+                                {
+                                    stats.to_world_full += 1;
+                                }
+                                Err(e)
+                                    if matches!(
+                                        e.kind(),
+                                        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                                    ) =>
+                                {
+                                    return Ok(Some(End::World));
+                                }
+                                Err(e) => {
+                                    return Err(Failure::Error(format!(
+                                        "sending to the world: {e}"
+                                    )));
+                                }
                             }
-                            Err(e) if matches!(e.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset) => {
-                                return Ok(Some(End::World));
-                            }
-                            Err(e) => return Err(Failure::Error(format!("sending to the world: {e}"))),
-                        },
+                        }
                         FromVm::Answer(f) => {
                             if answer_bytes + f.len() > OUTBOX {
                                 stats.to_vm_full += 1;
@@ -945,14 +1126,20 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
                     Port::Stream { fd, decoder, .. } => {
                         let spare = decoder.spare();
                         // SAFETY: `spare` is valid for writes of its length.
-                        let n = unsafe { libc::read(fd.as_raw_fd(), spare.as_mut_ptr().cast(), spare.len()) };
+                        let n = unsafe {
+                            libc::read(fd.as_raw_fd(), spare.as_mut_ptr().cast(), spare.len())
+                        };
                         if n < 0 {
                             let e = io::Error::last_os_error();
                             match e.kind() {
                                 io::ErrorKind::WouldBlock => break,
                                 io::ErrorKind::Interrupted => continue,
                                 io::ErrorKind::ConnectionReset => return Ok((End::Qemu, stats)),
-                                _ => return Err(Failure::Error(format!("reading QEMU's socket: {e}"))),
+                                _ => {
+                                    return Err(Failure::Error(format!(
+                                        "reading QEMU's socket: {e}"
+                                    )));
+                                }
                             }
                         }
                         if n == 0 {
@@ -976,13 +1163,19 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
                     }
                     Port::Device { fd, buf, .. } => {
                         // SAFETY: `buf` is valid for writes of its length.
-                        let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                        let n = unsafe {
+                            libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+                        };
                         if n < 0 {
                             let e = io::Error::last_os_error();
                             match e.kind() {
                                 io::ErrorKind::WouldBlock => break,
                                 io::ErrorKind::Interrupted => continue,
-                                _ => return Err(Failure::Error(format!("reading attach's TAP device: {e}"))),
+                                _ => {
+                                    return Err(Failure::Error(format!(
+                                        "reading attach's TAP device: {e}"
+                                    )));
+                                }
                             }
                         }
                         if let Some(end) = handle(&buf[..n as usize], &mut stats)? {
@@ -998,7 +1191,11 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
             }
             if !learned && let Some(mac) = link.vm_mac() {
                 learned = true;
-                let m = mac.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
+                let m = mac
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(":");
                 eprintln!("fictionet attach: the VM's MAC is {m}");
             }
         }
@@ -1012,7 +1209,14 @@ fn flush(vm: RawFd, outbox: &mut Outbox) -> Result<bool, Failure> {
         let p = outbox.pending();
         // SAFETY: `p` is valid for reads of its length. MSG_NOSIGNAL: a
         // closed socket is an error here, not a SIGPIPE.
-        let n = unsafe { libc::send(vm, p.as_ptr().cast(), p.len(), libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) };
+        let n = unsafe {
+            libc::send(
+                vm,
+                p.as_ptr().cast(),
+                p.len(),
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+            )
+        };
         if n < 0 {
             let e = io::Error::last_os_error();
             match e.kind() {
@@ -1031,18 +1235,24 @@ fn flush(vm: RawFd, outbox: &mut Outbox) -> Result<bool, Failure> {
 mod tests {
     use super::*;
     use crate::args::{Cidr, Lease};
-    use fictionet::stdlib::codec::Wire;
     use crate::ether::tests::{VM, solicitation};
+    use fictionet::stdlib::codec::Wire;
 
     fn served() -> Link {
         Link::new(
             Family::Serve(Lease {
-                addr: Cidr { addr: Ipv4Addr::new(10, 0, 0, 2), prefix: 24 },
+                addr: Cidr {
+                    addr: Ipv4Addr::new(10, 0, 0, 2),
+                    prefix: 24,
+                },
                 gateway: Some(Ipv4Addr::new(10, 0, 0, 1)),
                 dns: Some(Ipv4Addr::new(10, 0, 0, 1)),
             }),
             Family::Serve(Lease {
-                addr: Cidr { addr: "fd00::2".parse().unwrap(), prefix: 64 },
+                addr: Cidr {
+                    addr: "fd00::2".parse().unwrap(),
+                    prefix: 64,
+                },
                 gateway: Some("fd00::1".parse().unwrap()),
                 dns: None,
             }),
@@ -1058,35 +1268,73 @@ mod tests {
         let mut m = dhcp::Message::new(dhcp::BOOTREQUEST, 7);
         m.chaddr[..6].copy_from_slice(&VM);
         m.push(dhcp::opt::MESSAGE_TYPE, [dhcp::DISCOVER]);
-        let p = ether::udp4(Ipv4Addr::UNSPECIFIED, 68, Ipv4Addr::BROADCAST, 67, &m.to_bytes().unwrap());
+        let p = ether::udp4(
+            Ipv4Addr::UNSPECIFIED,
+            68,
+            Ipv4Addr::BROADCAST,
+            67,
+            &m.to_bytes().unwrap(),
+        );
         eth(VM, ether::BROADCAST, ether::IPV4, &p)
     }
 
     #[test]
     fn learns_the_vm_mac_and_drops_other_sources() {
         let mut link = served();
-        let ping = ether::ipv4(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1), 1, &[8, 0, 0, 0]);
+        let ping = ether::ipv4(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(10, 0, 0, 1),
+            1,
+            &[8, 0, 0, 0],
+        );
         let f = eth(VM, ether::GATEWAY_MAC, ether::IPV4, &ping);
-        assert_eq!(link.frame_from_vm(&f), FromVm::World(&ping[..]), "padding trimmed");
+        assert_eq!(
+            link.frame_from_vm(&f),
+            FromVm::World(&ping[..]),
+            "padding trimmed"
+        );
         assert_eq!(link.vm_mac(), Some(VM));
-        let other = eth([0x52, 0, 0, 0, 0, 9], ether::GATEWAY_MAC, ether::IPV4, &ping);
+        let other = eth(
+            [0x52, 0, 0, 0, 0, 9],
+            ether::GATEWAY_MAC,
+            ether::IPV4,
+            &ping,
+        );
         assert_eq!(link.frame_from_vm(&other), FromVm::Drop(Why::OtherSource));
-        let group = eth([0x01, 0, 0, 0, 0, 9], ether::GATEWAY_MAC, ether::IPV4, &ping);
-        assert_eq!(Link::new(Family::Off, Family::Off, 1500).frame_from_vm(&group), FromVm::Drop(Why::OtherSource));
+        let group = eth(
+            [0x01, 0, 0, 0, 0, 9],
+            ether::GATEWAY_MAC,
+            ether::IPV4,
+            &ping,
+        );
+        assert_eq!(
+            Link::new(Family::Off, Family::Off, 1500).frame_from_vm(&group),
+            FromVm::Drop(Why::OtherSource)
+        );
         let elsewhere = eth(VM, [0x52, 0, 0, 0, 0, 1], ether::IPV4, &ping);
         assert_eq!(link.frame_from_vm(&elsewhere), FromVm::Drop(Why::NotForUs));
-        assert_eq!(link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, 0x8100, &ping)), FromVm::Drop(Why::OtherType));
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, 0x8100, &ping)),
+            FromVm::Drop(Why::OtherType)
+        );
         assert_eq!(link.frame_from_vm(&f[..13]), FromVm::Drop(Why::Malformed));
         let mut lying = ping.clone();
         lying[2..4].copy_from_slice(&100u16.to_be_bytes());
-        assert_eq!(link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &lying)), FromVm::Drop(Why::Malformed));
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &lying)),
+            FromVm::Drop(Why::Malformed)
+        );
     }
 
     #[test]
     fn the_vm_device_stays_down_until_both_redirects_are_in_place() {
         let steps = mirror_steps(7, 8);
         assert_eq!(steps[0], Step::VmDown, "down before anything else changes");
-        assert_eq!(steps[steps.len() - 1], Step::VmUp, "up after everything else");
+        assert_eq!(
+            steps[steps.len() - 1],
+            Step::VmUp,
+            "up after everything else"
+        );
         let at = |s: Step| steps.iter().position(|&x| x == s).unwrap();
         assert!(at(Step::Redirect { from: 7, to: 8 }) < at(Step::VmUp));
         assert!(at(Step::Redirect { from: 8, to: 7 }) < at(Step::VmUp));
@@ -1107,26 +1355,55 @@ mod tests {
             assert_eq!(link.to_vm(&p).unwrap()[..6], mac);
         }
         for prefix in [0, 30, 31, 32] {
-            let Family::Serve(lease) = &mut link.v4 else { unreachable!() };
+            let Family::Serve(lease) = &mut link.v4 else {
+                unreachable!()
+            };
             lease.addr.prefix = prefix;
-            let dst = if prefix == 0 { Ipv4Addr::BROADCAST } else { Ipv4Addr::new(10, 0, 0, if prefix == 32 { 2 } else { 3 }) };
+            let dst = if prefix == 0 {
+                Ipv4Addr::BROADCAST
+            } else {
+                Ipv4Addr::new(10, 0, 0, if prefix == 32 { 2 } else { 3 })
+            };
             let p = ether::ipv4(Ipv4Addr::new(10, 0, 0, 1), dst, 1, &[]);
             let mac = if prefix < 31 { ether::BROADCAST } else { VM };
             assert_eq!(link.to_vm(&p).unwrap()[..6], mac);
         }
         link.v4 = Family::FromWorld;
-        let p = ether::ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 255), 1, &[]);
+        let p = ether::ipv4(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 255),
+            1,
+            &[],
+        );
         assert_eq!(link.to_vm(&p).unwrap()[..6], VM);
     }
 
     #[test]
     fn frames_over_the_mtu_are_dropped_both_ways() {
         let mut link = served();
-        let big = ether::udp4(Ipv4Addr::new(10, 0, 0, 2), 1, Ipv4Addr::new(10, 0, 0, 1), 2, &[0; 1472]);
+        let big = ether::udp4(
+            Ipv4Addr::new(10, 0, 0, 2),
+            1,
+            Ipv4Addr::new(10, 0, 0, 1),
+            2,
+            &[0; 1472],
+        );
         assert_eq!(big.len(), 1500);
-        assert!(matches!(link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &big)), FromVm::World(_)));
-        let bigger = ether::udp4(Ipv4Addr::new(10, 0, 0, 2), 1, Ipv4Addr::new(10, 0, 0, 1), 2, &[0; 1473]);
-        assert_eq!(link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &bigger)), FromVm::Drop(Why::TooBig));
+        assert!(matches!(
+            link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &big)),
+            FromVm::World(_)
+        ));
+        let bigger = ether::udp4(
+            Ipv4Addr::new(10, 0, 0, 2),
+            1,
+            Ipv4Addr::new(10, 0, 0, 1),
+            2,
+            &[0; 1473],
+        );
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &bigger)),
+            FromVm::Drop(Why::TooBig)
+        );
         assert!(link.to_vm(&big).is_some());
         assert!(link.to_vm(&bigger).is_none());
         assert!(link.to_vm(&[0x10; 40]).is_none(), "not IP");
@@ -1143,7 +1420,9 @@ mod tests {
     #[test]
     fn dhcp_is_answered_passed_or_dropped_by_the_flags() {
         let mut link = served();
-        let FromVm::Answer(offer) = link.frame_from_vm(&discover()) else { panic!("no offer") };
+        let FromVm::Answer(offer) = link.frame_from_vm(&discover()) else {
+            panic!("no offer")
+        };
         let f = Frame::parse(&offer).unwrap();
         assert_eq!((f.dst, f.src), (ether::BROADCAST, ether::GATEWAY_MAC));
         let (port, payload) = ether::udp_to(f.payload).unwrap();
@@ -1161,10 +1440,27 @@ mod tests {
     #[test]
     fn served_addresses_are_the_only_sources_passed() {
         let mut link = served();
-        let spoof = ether::ipv4(Ipv4Addr::new(10, 0, 0, 77), Ipv4Addr::new(10, 0, 0, 1), 1, &[]);
-        assert_eq!(link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &spoof)), FromVm::Drop(Why::Spoofed));
-        let spoof6 = ether::udp6("fd00::77".parse().unwrap(), 1, "fd00::1".parse().unwrap(), 2, &[]);
-        assert_eq!(link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV6, &spoof6)), FromVm::Drop(Why::Spoofed));
+        let spoof = ether::ipv4(
+            Ipv4Addr::new(10, 0, 0, 77),
+            Ipv4Addr::new(10, 0, 0, 1),
+            1,
+            &[],
+        );
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &spoof)),
+            FromVm::Drop(Why::Spoofed)
+        );
+        let spoof6 = ether::udp6(
+            "fd00::77".parse().unwrap(),
+            1,
+            "fd00::1".parse().unwrap(),
+            2,
+            &[],
+        );
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV6, &spoof6)),
+            FromVm::Drop(Why::Spoofed)
+        );
         // A multicast listener report: a hop-by-hop header with a router
         // alert, then ICMPv6 type 143.
         let mld = ether::ipv6(
@@ -1174,13 +1470,28 @@ mod tests {
             1,
             &[ether::ICMPV6, 0, 5, 2, 0, 0, 1, 0, 143, 0, 0, 0, 0, 0, 0, 0],
         );
-        assert_eq!(link.frame_from_vm(&eth(VM, [0x33, 0x33, 0, 0, 0, 0x16], ether::IPV6, &mld)), FromVm::Drop(Why::Handled));
-        let ok6 = ether::udp6("fd00::2".parse().unwrap(), 1, "fd00::1".parse().unwrap(), 2, &[]);
-        assert!(matches!(link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV6, &ok6)), FromVm::World(_)));
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, [0x33, 0x33, 0, 0, 0, 0x16], ether::IPV6, &mld)),
+            FromVm::Drop(Why::Handled)
+        );
+        let ok6 = ether::udp6(
+            "fd00::2".parse().unwrap(),
+            1,
+            "fd00::1".parse().unwrap(),
+            2,
+            &[],
+        );
+        assert!(matches!(
+            link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV6, &ok6)),
+            FromVm::World(_)
+        ));
         // With the address left to the world, any source goes to the world,
         // which decides.
         let mut world = Link::new(Family::FromWorld, Family::FromWorld, 1500);
-        assert!(matches!(world.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &spoof)), FromVm::World(_)));
+        assert!(matches!(
+            world.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &spoof)),
+            FromVm::World(_)
+        ));
     }
 
     #[test]
@@ -1188,14 +1499,25 @@ mod tests {
         let mut link = served();
         let ll = ether::link_local(VM);
         let ns = solicitation(ll, "fd00::1".parse().unwrap(), 255);
-        let FromVm::Answer(na) = link.frame_from_vm(&eth(VM, [0x33, 0x33, 0xff, 0, 0, 1], ether::IPV6, &ns)) else {
+        let FromVm::Answer(na) =
+            link.frame_from_vm(&eth(VM, [0x33, 0x33, 0xff, 0, 0, 1], ether::IPV6, &ns))
+        else {
             panic!("no advertisement")
         };
-        assert_eq!(Frame::parse(&na).unwrap().payload[40], ether::NEIGHBOR_ADVERTISEMENT);
+        assert_eq!(
+            Frame::parse(&na).unwrap().payload[40],
+            ether::NEIGHBOR_ADVERTISEMENT
+        );
 
-        let rs = ether::icmp6(ll, "ff02::2".parse().unwrap(), vec![ether::ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0]);
+        let rs = ether::icmp6(
+            ll,
+            "ff02::2".parse().unwrap(),
+            vec![ether::ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0],
+        );
         let rs_frame = eth(VM, [0x33, 0x33, 0, 0, 0, 2], ether::IPV6, &rs);
-        let FromVm::Answer(ra) = link.frame_from_vm(&rs_frame) else { panic!("no advertisement") };
+        let FromVm::Answer(ra) = link.frame_from_vm(&rs_frame) else {
+            panic!("no advertisement")
+        };
         let f = Frame::parse(&ra).unwrap();
         assert_eq!(f.dst, [0x33, 0x33, 0, 0, 0, 1]);
         assert_eq!(f.payload[40], ether::ROUTER_ADVERTISEMENT);
@@ -1208,14 +1530,24 @@ mod tests {
         let mut off = Link::new(Family::Off, Family::Off, 1500);
         assert_eq!(off.frame_from_vm(&rs_frame), FromVm::Drop(Why::Handled));
         // An advertisement from the VM never leaves the link.
-        let ra_from_vm = ether::icmp6(ll, "ff02::1".parse().unwrap(), vec![ether::ROUTER_ADVERTISEMENT, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(link.frame_from_vm(&eth(VM, [0x33, 0x33, 0, 0, 0, 1], ether::IPV6, &ra_from_vm)), FromVm::Drop(Why::Handled));
+        let ra_from_vm = ether::icmp6(
+            ll,
+            "ff02::1".parse().unwrap(),
+            vec![ether::ROUTER_ADVERTISEMENT, 0, 0, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, [0x33, 0x33, 0, 0, 0, 1], ether::IPV6, &ra_from_vm)),
+            FromVm::Drop(Why::Handled)
+        );
         // Also behind a hop-by-hop header, with the world left to set up IPv6.
         let mut ext = vec![ether::ICMPV6, 0, 1, 4, 0, 0, 0, 0];
         ext.extend_from_slice(&ra_from_vm[40..]);
         let hidden = ether::ipv6(ll, "ff02::1".parse().unwrap(), 0, 255, &ext);
         let mut world = Link::new(Family::Off, Family::FromWorld, 1500);
-        assert_eq!(world.frame_from_vm(&eth(VM, [0x33, 0x33, 0, 0, 0, 1], ether::IPV6, &hidden)), FromVm::Drop(Why::Handled));
+        assert_eq!(
+            world.frame_from_vm(&eth(VM, [0x33, 0x33, 0, 0, 0, 1], ether::IPV6, &hidden)),
+            FromVm::Drop(Why::Handled)
+        );
     }
 
     #[test]
@@ -1225,8 +1557,16 @@ mod tests {
         solicit.extend_from_slice(&[0, 1, 0, 10, 0, 3, 0, 1]);
         solicit.extend_from_slice(&VM);
         solicit.extend_from_slice(&[0, 3, 0, 12, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
-        let p = ether::udp6(ether::link_local(VM), 546, "ff02::1:2".parse().unwrap(), 547, &solicit);
-        let FromVm::Answer(adv) = link.frame_from_vm(&eth(VM, [0x33, 0x33, 0, 1, 0, 2], ether::IPV6, &p)) else {
+        let p = ether::udp6(
+            ether::link_local(VM),
+            546,
+            "ff02::1:2".parse().unwrap(),
+            547,
+            &solicit,
+        );
+        let FromVm::Answer(adv) =
+            link.frame_from_vm(&eth(VM, [0x33, 0x33, 0, 1, 0, 2], ether::IPV6, &p))
+        else {
             panic!("no advertise")
         };
         let f = Frame::parse(&adv).unwrap();
@@ -1241,8 +1581,14 @@ mod tests {
         let mut a = vec![0, 1, 8, 0, 6, 4, 0, 1];
         a.extend_from_slice(&VM);
         a.extend_from_slice(&[10, 0, 0, 2, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1]);
-        let FromVm::Answer(reply) = link.frame_from_vm(&eth(VM, ether::BROADCAST, ether::ARP, &a)) else { panic!("no reply") };
-        assert_eq!(&Frame::parse(&reply).unwrap().payload[8..18], &[0x02, 0x66, 0x6e, 0, 0, 1, 10, 0, 0, 1]);
+        let FromVm::Answer(reply) = link.frame_from_vm(&eth(VM, ether::BROADCAST, ether::ARP, &a))
+        else {
+            panic!("no reply")
+        };
+        assert_eq!(
+            &Frame::parse(&reply).unwrap().payload[8..18],
+            &[0x02, 0x66, 0x6e, 0, 0, 1, 10, 0, 0, 1]
+        );
     }
 
     /// `n` destination options headers in front of `inner`, whose protocol
@@ -1259,7 +1605,10 @@ mod tests {
     /// The first `cut` bytes of `packet`'s payload as an IPv6 first
     /// fragment, and the rest as the second.
     fn fragments6(packet: &[u8], cut: usize) -> (Vec<u8>, Vec<u8>) {
-        let (src, dst) = (ether::source_v6(packet), Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()));
+        let (src, dst) = (
+            ether::source_v6(packet),
+            Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()),
+        );
         let body = &packet[40..];
         let mut first = vec![packet[6], 0, 0, 1, 0, 0, 0, 42];
         first.extend_from_slice(&body[..cut]);
@@ -1267,13 +1616,19 @@ mod tests {
         second.extend_from_slice(&(cut as u16).to_be_bytes());
         second.extend_from_slice(&[0, 0, 0, 42]);
         second.extend_from_slice(&body[cut..]);
-        (ether::ipv6(src, dst, 44, packet[7], &first), ether::ipv6(src, dst, 44, packet[7], &second))
+        (
+            ether::ipv6(src, dst, 44, packet[7], &first),
+            ether::ipv6(src, dst, 44, packet[7], &second),
+        )
     }
 
     /// The first `cut` bytes of `packet`'s payload as an IPv4 first
     /// fragment, and the rest as the second.
     fn fragments4(packet: &[u8], cut: usize) -> (Vec<u8>, Vec<u8>) {
-        let (src, dst) = (ether::source_v4(packet), Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]));
+        let (src, dst) = (
+            ether::source_v4(packet),
+            Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
+        );
         let mut first = ether::ipv4(src, dst, packet[9], &packet[20..20 + cut]);
         first[6] = 0x20;
         let mut second = ether::ipv4(src, dst, packet[9], &packet[20 + cut..]);
@@ -1285,26 +1640,47 @@ mod tests {
     fn control_messages_behind_any_extension_headers_stay_on_the_link() {
         let ll = ether::link_local(VM);
         let all: Ipv6Addr = "ff02::1".parse().unwrap();
-        let ra = ether::icmp6(ll, all, vec![ether::ROUTER_ADVERTISEMENT, 0, 0, 0, 64, 0, 0, 0]);
+        let ra = ether::icmp6(
+            ll,
+            all,
+            vec![ether::ROUTER_ADVERTISEMENT, 0, 0, 0, 64, 0, 0, 0],
+        );
         let to_all = [0x33, 0x33, 0, 0, 0, 1];
         for v6 in [Family::FromWorld, Family::Off] {
             let mut link = Link::new(Family::Off, v6, 1500);
             for n in [1, 8, 9, 30] {
                 let p = behind_options(ll, all, n, ether::ICMPV6, &ra[40..]);
-                assert_eq!(link.frame_from_vm(&eth(VM, to_all, ether::IPV6, &p)), FromVm::Drop(Why::Handled), "{n}");
+                assert_eq!(
+                    link.frame_from_vm(&eth(VM, to_all, ether::IPV6, &p)),
+                    FromVm::Drop(Why::Handled),
+                    "{n}"
+                );
             }
             // Behind an authentication header.
             let mut ah = vec![ether::ICMPV6, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
             ah.extend_from_slice(&ra[40..]);
             let p = ether::ipv6(ll, all, 51, 255, &ah);
-            assert_eq!(link.frame_from_vm(&eth(VM, to_all, ether::IPV6, &p)), FromVm::Drop(Why::Handled));
+            assert_eq!(
+                link.frame_from_vm(&eth(VM, to_all, ether::IPV6, &p)),
+                FromVm::Drop(Why::Handled)
+            );
             // A redirect in a first fragment.
-            let redirect = ether::icmp6(ll, all, [vec![ether::REDIRECT, 0, 0, 0], vec![0; 36]].concat());
+            let redirect = ether::icmp6(
+                ll,
+                all,
+                [vec![ether::REDIRECT, 0, 0, 0], vec![0; 36]].concat(),
+            );
             let (first, _) = fragments6(&redirect, 8);
-            assert_eq!(link.frame_from_vm(&eth(VM, to_all, ether::IPV6, &first)), FromVm::Drop(Why::Handled));
+            assert_eq!(
+                link.frame_from_vm(&eth(VM, to_all, ether::IPV6, &first)),
+                FromVm::Drop(Why::Handled)
+            );
             // A chain that cannot be read is dropped, not passed on.
             let cut = ether::ipv6(ll, all, 60, 255, &[ether::ICMPV6, 3, 0, 0, 0, 0, 0, 0]);
-            assert_eq!(link.frame_from_vm(&eth(VM, to_all, ether::IPV6, &cut)), FromVm::Drop(Why::Malformed));
+            assert_eq!(
+                link.frame_from_vm(&eth(VM, to_all, ether::IPV6, &cut)),
+                FromVm::Drop(Why::Malformed)
+            );
         }
     }
 
@@ -1322,15 +1698,31 @@ mod tests {
         let atomic = |p: &[u8]| {
             let mut body = vec![p[6], 0, 0, 0, 0, 0, 0, 9];
             body.extend_from_slice(&p[40..]);
-            ether::ipv6(ether::source_v6(p), Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).unwrap()), 44, 255, &body)
+            ether::ipv6(
+                ether::source_v6(p),
+                Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).unwrap()),
+                44,
+                255,
+                &body,
+            )
         };
         let to = [0x33, 0x33, 0xff, 0, 0, 1];
-        assert_eq!(link.frame_from_vm(&eth(VM, to, ether::IPV6, &atomic(&ns))), FromVm::Drop(Why::Handled));
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, to, ether::IPV6, &atomic(&ns))),
+            FromVm::Drop(Why::Handled)
+        );
         let ll = ether::link_local(VM);
-        let rs = ether::icmp6(ll, "ff02::2".parse().unwrap(), vec![ether::ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0]);
+        let rs = ether::icmp6(
+            ll,
+            "ff02::2".parse().unwrap(),
+            vec![ether::ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0],
+        );
         let mut world = Link::new(Family::Off, Family::FromWorld, 1500);
         let to = [0x33, 0x33, 0, 0, 0, 2];
-        assert_eq!(world.frame_from_vm(&eth(VM, to, ether::IPV6, &atomic(&rs))), FromVm::Drop(Why::Handled));
+        assert_eq!(
+            world.frame_from_vm(&eth(VM, to, ether::IPV6, &atomic(&rs))),
+            FromVm::Drop(Why::Handled)
+        );
     }
 
     #[test]
@@ -1339,22 +1731,48 @@ mod tests {
         let mut m = dhcp::Message::new(dhcp::BOOTREQUEST, 7);
         m.chaddr[..6].copy_from_slice(&VM);
         m.push(dhcp::opt::MESSAGE_TYPE, [dhcp::DISCOVER]);
-        let whole = ether::udp4(Ipv4Addr::new(10, 0, 0, 2), 68, Ipv4Addr::BROADCAST, 67, &m.to_bytes().unwrap());
+        let whole = ether::udp4(
+            Ipv4Addr::new(10, 0, 0, 2),
+            68,
+            Ipv4Addr::BROADCAST,
+            67,
+            &m.to_bytes().unwrap(),
+        );
         let (first, second) = fragments4(&whole, 64);
         let frame = |p: &[u8]| eth(VM, ether::BROADCAST, ether::IPV4, p);
         let mut off = Link::new(Family::Off, Family::Off, 1500);
-        assert_eq!(off.frame_from_vm(&frame(&whole)), FromVm::Drop(Why::Handled));
-        assert_eq!(off.frame_from_vm(&frame(&first)), FromVm::Drop(Why::Handled), "--no-ip-addr");
+        assert_eq!(
+            off.frame_from_vm(&frame(&whole)),
+            FromVm::Drop(Why::Handled)
+        );
+        assert_eq!(
+            off.frame_from_vm(&frame(&first)),
+            FromVm::Drop(Why::Handled),
+            "--no-ip-addr"
+        );
         // The second fragment alone carries no UDP header, and the world
         // cannot put the request together without the first.
-        assert!(matches!(off.frame_from_vm(&frame(&second)), FromVm::World(_)));
+        assert!(matches!(
+            off.frame_from_vm(&frame(&second)),
+            FromVm::World(_)
+        ));
         let mut link = served();
-        assert_eq!(link.frame_from_vm(&frame(&first)), FromVm::Drop(Why::Handled), "attach answers no fragment");
+        assert_eq!(
+            link.frame_from_vm(&frame(&first)),
+            FromVm::Drop(Why::Handled),
+            "attach answers no fragment"
+        );
         let mut world = Link::new(Family::FromWorld, Family::Off, 1500);
-        assert!(matches!(world.frame_from_vm(&frame(&first)), FromVm::World(_)), "left to the world");
+        assert!(
+            matches!(world.frame_from_vm(&frame(&first)), FromVm::World(_)),
+            "left to the world"
+        );
         // A first fragment cut inside the UDP header cannot be read.
         let (stub, _) = fragments4(&whole, 0);
-        assert_eq!(off.frame_from_vm(&frame(&stub)), FromVm::Drop(Why::Malformed));
+        assert_eq!(
+            off.frame_from_vm(&frame(&stub)),
+            FromVm::Drop(Why::Malformed)
+        );
     }
 
     #[test]
@@ -1364,25 +1782,49 @@ mod tests {
         solicit.extend_from_slice(&VM);
         solicit.extend_from_slice(&[0, 3, 0, 12, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
         solicit.extend_from_slice(&[0; 80]);
-        let whole = ether::udp6(ether::link_local(VM), 546, "ff02::1:2".parse().unwrap(), 547, &solicit);
+        let whole = ether::udp6(
+            ether::link_local(VM),
+            546,
+            "ff02::1:2".parse().unwrap(),
+            547,
+            &solicit,
+        );
         let (first, _) = fragments6(&whole, 48);
         let to = [0x33, 0x33, 0, 1, 0, 2];
         let mut link = served();
-        assert_eq!(link.frame_from_vm(&eth(VM, to, ether::IPV6, &first)), FromVm::Drop(Why::Handled));
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, to, ether::IPV6, &first)),
+            FromVm::Drop(Why::Handled)
+        );
         let mut off = Link::new(Family::Off, Family::Off, 1500);
-        assert_eq!(off.frame_from_vm(&eth(VM, to, ether::IPV6, &first)), FromVm::Drop(Why::Handled));
+        assert_eq!(
+            off.frame_from_vm(&eth(VM, to, ether::IPV6, &first)),
+            FromVm::Drop(Why::Handled)
+        );
         let mut world = Link::new(Family::Off, Family::FromWorld, 1500);
-        assert!(matches!(world.frame_from_vm(&eth(VM, to, ether::IPV6, &first)), FromVm::World(_)));
+        assert!(matches!(
+            world.frame_from_vm(&eth(VM, to, ether::IPV6, &first)),
+            FromVm::World(_)
+        ));
         // A UDP length that does not fit the packet is not clamped to it.
         let mut lying = whole.clone();
         lying[44..46].copy_from_slice(&200u16.to_be_bytes());
-        assert_eq!(link.frame_from_vm(&eth(VM, to, ether::IPV6, &lying)), FromVm::Drop(Why::Malformed));
+        assert_eq!(
+            link.frame_from_vm(&eth(VM, to, ether::IPV6, &lying)),
+            FromVm::Drop(Why::Malformed)
+        );
     }
 
     #[test]
     fn world_unicast_waits_for_the_vm_mac() {
         let mut link = served();
-        let unicast = ether::ipv6("fd00::1".parse().unwrap(), "fd00::2".parse().unwrap(), 6, 64, &[]);
+        let unicast = ether::ipv6(
+            "fd00::1".parse().unwrap(),
+            "fd00::2".parse().unwrap(),
+            6,
+            64,
+            &[],
+        );
         assert!(link.to_vm(&unicast).is_none());
         for (dst, mac) in [
             (Ipv4Addr::BROADCAST, ether::BROADCAST),
@@ -1393,14 +1835,24 @@ mod tests {
         }
         let ra = link.router_advert().unwrap();
         assert_eq!(ra[..6], [0x33, 0x33, 0, 0, 0, 1]);
-        let FromVm::Answer(answer) = link.frame_from_vm(&discover()) else { panic!("DHCP answer") };
+        let FromVm::Answer(answer) = link.frame_from_vm(&discover()) else {
+            panic!("DHCP answer")
+        };
         assert_eq!(answer[..6], ether::BROADCAST);
         let mut renew = dhcp::Message::new(dhcp::BOOTREQUEST, 8);
         renew.chaddr[..6].copy_from_slice(&VM);
         renew.ciaddr = Ipv4Addr::new(10, 0, 0, 2);
         renew.push(dhcp::opt::MESSAGE_TYPE, [dhcp::REQUEST]);
-        let p = ether::udp4(renew.ciaddr, 68, Ipv4Addr::new(10, 0, 0, 1), 67, &renew.to_bytes().unwrap());
-        let FromVm::Answer(answer) = link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &p)) else {
+        let p = ether::udp4(
+            renew.ciaddr,
+            68,
+            Ipv4Addr::new(10, 0, 0, 1),
+            67,
+            &renew.to_bytes().unwrap(),
+        );
+        let FromVm::Answer(answer) =
+            link.frame_from_vm(&eth(VM, ether::GATEWAY_MAC, ether::IPV4, &p))
+        else {
             panic!("DHCP renewal answer");
         };
         assert_eq!(answer[..6], VM);
@@ -1410,7 +1862,12 @@ mod tests {
     #[test]
     fn world_packets_get_the_vm_or_group_mac() {
         let mut link = served();
-        let to_vm = ether::ipv4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2), 1, &[]);
+        let to_vm = ether::ipv4(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            1,
+            &[],
+        );
         assert!(link.to_vm(&to_vm).is_none(), "before the VM's MAC is known");
         link.frame_from_vm(&discover());
         let h = link.to_vm(&to_vm).unwrap();

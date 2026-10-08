@@ -3,10 +3,10 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::spnego::{
     Error, Frames, InitialContextToken, MAX_TOKEN, Mech, NegotiationToken, token_len,
 };
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

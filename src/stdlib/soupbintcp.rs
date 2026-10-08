@@ -72,11 +72,11 @@
 //! # Ok::<(), fictionet::stdlib::soupbintcp::Error>(())
 //! ```
 
-use fictionet::stdlib::session::Action;
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Wire};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::session::Action;
 use std::fmt;
 
 /// Bytes in the length prefix.
@@ -483,10 +483,14 @@ impl Prefixed for Packet {
     const NAME: &'static str = "SoupBinTCP";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_PAYLOAD }
+    fn default_limit() -> Self::Limit {
+        MAX_PAYLOAD
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_PAYLOAD) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_PAYLOAD)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -495,7 +499,10 @@ impl Prefixed for Packet {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         let Some((prefix, rest)) = input.split_at_checked(LENGTH_PREFIX) else {
             return Ok(None);
@@ -760,7 +767,11 @@ impl Client {
     /// Handles one packet from the server. A packet a server may not send,
     /// or one out of turn, closes the session with
     /// [`CloseReason::Protocol`]. Refuses a closed session.
-    pub fn receive(&mut self, packet: &Packet, now_ms: u64) -> Result<Vec<Action<Packet, Event>>, Error> {
+    pub fn receive(
+        &mut self,
+        packet: &Packet,
+        now_ms: u64,
+    ) -> Result<Vec<Action<Packet, Event>>, Error> {
         let mut s = *self;
         s.clock.advance(now_ms)?;
         let actions = s.receive_inner(packet)?;
@@ -903,7 +914,11 @@ impl Server {
     /// Handles one packet from the client. A packet a client may not send,
     /// or one out of turn, closes the session with
     /// [`CloseReason::Protocol`]. Refuses a closed session.
-    pub fn receive(&mut self, packet: &Packet, now_ms: u64) -> Result<Vec<Action<Packet, Event>>, Error> {
+    pub fn receive(
+        &mut self,
+        packet: &Packet,
+        now_ms: u64,
+    ) -> Result<Vec<Action<Packet, Event>>, Error> {
         let mut s = *self;
         s.clock.advance(now_ms)?;
         if s.phase == ServerPhase::Closed {
@@ -956,7 +971,11 @@ impl Server {
         })])
     }
     /// Refuses the pending login and closes (2.2.2).
-    pub fn reject(&mut self, reason: RejectReason, now_ms: u64) -> Result<Vec<Action<Packet, Event>>, Error> {
+    pub fn reject(
+        &mut self,
+        reason: RejectReason,
+        now_ms: u64,
+    ) -> Result<Vec<Action<Packet, Event>>, Error> {
         if self.phase != ServerPhase::LoginPending {
             return Err(Error::State);
         }
@@ -994,7 +1013,11 @@ impl Server {
         actions.extend(self.close(CloseReason::EndOfSession));
         Ok(actions)
     }
-    session_tick!(ServerPhase, ServerPhase::AwaitingLogin | ServerPhase::LoginPending, Packet::ServerHeartbeat);
+    session_tick!(
+        ServerPhase,
+        ServerPhase::AwaitingLogin | ServerPhase::LoginPending,
+        Packet::ServerHeartbeat
+    );
     fn close(&mut self, reason: CloseReason) -> Vec<Action<Packet, Event>> {
         self.phase = ServerPhase::Closed;
         vec![Action::Event(Event::Disconnected(reason))]
@@ -1035,12 +1058,12 @@ pub mod harness {
 #[cfg(test)]
 mod tests {
     use super::harness::{check_actions, login};
-    use fictionet::stdlib::test_support::check_atomic;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
+    use fictionet::stdlib::test_support::check_atomic;
+    use fictionet::stdlib::test_support::contract::{
+        check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
     };
-    use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn alpha<const N: usize>(text: &[u8; N]) -> Alpha<N> {
@@ -1599,17 +1622,40 @@ mod tests {
         let (mut client, mut server) = pair();
         let _ = server.send(b"m", 100).unwrap();
         let server_state = |s: &Server| format!("{s:?}");
-        assert_eq!(check_atomic(&mut server, |s| s.send(b"m", 99), server_state), Err(Error::Time));
-        assert_eq!(check_atomic(&mut server, |s| s.tick(99), server_state), Err(Error::Time));
-        assert_eq!(check_atomic(&mut server,
-            |s| s.send(&vec![0; MAX_PAYLOAD + 1], 200), server_state), Err(Error::TooLong));
-        assert_eq!(check_atomic(&mut server,
-            |s| s.accept(session(), 1, 200), server_state), Err(Error::State));
+        assert_eq!(
+            check_atomic(&mut server, |s| s.send(b"m", 99), server_state),
+            Err(Error::Time)
+        );
+        assert_eq!(
+            check_atomic(&mut server, |s| s.tick(99), server_state),
+            Err(Error::Time)
+        );
+        assert_eq!(
+            check_atomic(
+                &mut server,
+                |s| s.send(&vec![0; MAX_PAYLOAD + 1], 200),
+                server_state
+            ),
+            Err(Error::TooLong)
+        );
+        assert_eq!(
+            check_atomic(&mut server, |s| s.accept(session(), 1, 200), server_state),
+            Err(Error::State)
+        );
         let _ = client.receive(&Packet::ServerHeartbeat, 100).unwrap();
         let client_state = |c: &Client| format!("{c:?}");
-        assert_eq!(check_atomic(&mut client,
-            |c| c.receive(&Packet::SequencedData(Vec::new()), 50), client_state), Err(Error::Time));
-        assert_eq!(check_atomic(&mut client, |c| c.start(200), client_state), Err(Error::State));
+        assert_eq!(
+            check_atomic(
+                &mut client,
+                |c| c.receive(&Packet::SequencedData(Vec::new()), 50),
+                client_state
+            ),
+            Err(Error::Time)
+        );
+        assert_eq!(
+            check_atomic(&mut client, |c| c.start(200), client_state),
+            Err(Error::State)
+        );
         assert_eq!(
             Timers {
                 heartbeat_ms: 0,

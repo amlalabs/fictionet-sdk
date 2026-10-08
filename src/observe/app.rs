@@ -40,7 +40,17 @@ pub(super) fn info(d: &mut Decoded, level: u8, proto: &str, text: &str) {
 // TCP conversations
 
 fn looks_like_http1(b: &[u8]) -> bool {
-    let methods: [&[u8]; 9] = [b"GET ", b"POST ", b"PUT ", b"HEAD ", b"DELETE ", b"OPTIONS ", b"PATCH ", b"CONNECT ", b"TRACE "];
+    let methods: [&[u8]; 9] = [
+        b"GET ",
+        b"POST ",
+        b"PUT ",
+        b"HEAD ",
+        b"DELETE ",
+        b"OPTIONS ",
+        b"PATCH ",
+        b"CONNECT ",
+        b"TRACE ",
+    ];
     b.starts_with(b"HTTP/1.") || methods.iter().any(|m| b.starts_with(m))
 }
 
@@ -139,8 +149,8 @@ pub(super) fn register(registry: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::test_support::hex;
     use crate::observe::{Conversation, Observed, Place};
+    use fictionet::stdlib::test_support::hex;
     use http2::PREFACE as HTTP2_PREFACE;
 
     fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
@@ -170,7 +180,12 @@ mod tests {
             let mut d = Decoded::default();
             for piece in bytes.chunks(chunk) {
                 d = Decoded::default();
-                let place = Place { stream_start: self.at[dir as usize], buf: 0, offset: Some(0), len: piece.len() };
+                let place = Place {
+                    stream_start: self.at[dir as usize],
+                    buf: 0,
+                    offset: Some(0),
+                    len: piece.len(),
+                };
                 self.c.data(dir, piece, place, &mut d, &[]);
                 self.at[dir as usize] += piece.len() as u64;
             }
@@ -188,13 +203,15 @@ mod tests {
     /// Every field with no bytes of its own, as (name, value).
     fn notes(d: &Decoded) -> Vec<(String, String)> {
         let fields = d.layers.iter().flat_map(|l| &l.fields);
-        fields.filter(|f| f.range.is_none()).map(|f| (f.name.clone(), f.value.clone())).collect()
+        fields
+            .filter(|f| f.range.is_none())
+            .map(|f| (f.name.clone(), f.value.clone()))
+            .collect()
     }
 
     fn has(d: &Decoded, name: &str, value: &str) -> bool {
         notes(d).iter().any(|(n, v)| n == name && v == value)
     }
-
 
     const X_OLD: &str = "4001 7803 6f6c 64";
     const X_NEW: &str = "4001 7803 6e65 77";
@@ -233,11 +250,19 @@ mod tests {
         let mut f = Feeder::h2();
         f.send(true, &frame(1, 0x4, 1, &hex(X_OLD)), 1500);
         // PADDED, a pad length of 64, and seven bytes that read as x: new.
-        let d = f.send(true, &frame(1, 0xc, 3, &hex("40 4001 7803 6e65 77")[1..]), 1500);
+        let d = f.send(
+            true,
+            &frame(1, 0xc, 3, &hex("40 4001 7803 6e65 77")[1..]),
+            1500,
+        );
         assert!(d.tags.contains(&"malformed"));
         assert!(!has(&d, "x", "new"));
         let d = f.send(true, &frame(1, 0x4, 5, &[0x88, 0xbe]), 1500);
-        assert!(!has(&d, "x", "new") && !has(&d, "x", "old"), "{:?}", notes(&d));
+        assert!(
+            !has(&d, "x", "new") && !has(&d, "x", "old"),
+            "{:?}",
+            notes(&d)
+        );
     }
 
     /// A PUSH_PROMISE's header block changes the table that later blocks
@@ -271,7 +296,13 @@ mod tests {
         // Entry 62 was x: old, but the cut-off block may have added one.
         let d = f.send(true, &frame(1, 0x4, 7, &[0x88, 0xbe]), 1500);
         assert!(!has(&d, "x", "old"), "{:?}", notes(&d));
-        assert!(notes(&d).iter().any(|(n, v)| n == "Header" && v.starts_with("not known")), "{:?}", notes(&d));
+        assert!(
+            notes(&d)
+                .iter()
+                .any(|(n, v)| n == "Header" && v.starts_with("not known")),
+            "{:?}",
+            notes(&d)
+        );
         // A HEADERS frame does not continue an unfinished block either.
         f.send(true, &frame(1, 0, 9, &hex("82")), 1500);
         let d = f.send(true, &frame(1, 0x4, 9, &hex("82")), 1500);
@@ -284,12 +315,20 @@ mod tests {
     fn lost_bytes_end_http2_decoding() {
         let mut session = Observed::new(capture::Capture::default());
         let mut packet = Decoded::default();
-        session.data(&frame(1, 0x4, 1, &hex(X_OLD)), Place::default(), &mut packet);
+        session.data(
+            &frame(1, 0x4, 1, &hex(X_OLD)),
+            Place::default(),
+            &mut packet,
+        );
         assert!(has(&packet, "x", "old"));
         session.data(&frame(1, 0, 3, &[0x88]), Place::default(), &mut packet);
         session = session.reset();
         let mut packet = Decoded::default();
-        session.data(&frame(1, 0x4, 3, &[0x88, 0xbe]), Place::default(), &mut packet);
+        session.data(
+            &frame(1, 0x4, 3, &[0x88, 0xbe]),
+            Place::default(),
+            &mut packet,
+        );
         assert!(packet.layers.is_empty());
         assert!(!session.waiting());
     }
@@ -323,7 +362,13 @@ mod tests {
             infos.push(f.send(true, piece, 1400).info);
         }
         assert_eq!(infos[0], "DNS message of 39959 bytes, not decoded");
-        assert!(infos.last().unwrap().starts_with("Standard query response 0x1234"), "{infos:?}");
+        assert!(
+            infos
+                .last()
+                .unwrap()
+                .starts_with("Standard query response 0x1234"),
+            "{infos:?}"
+        );
     }
 
     #[test]
@@ -361,7 +406,10 @@ mod tests {
         // Split across packets, it is decoded when the last byte comes.
         let d = f.send(false, &query, 5);
         assert_eq!(d.proto, "Modbus/TCP");
-        assert_eq!(d.info, "Query: Trans: 7; Unit: 1, Func: 3: Read Holding Registers");
+        assert_eq!(
+            d.info,
+            "Query: Trans: 7; Unit: 1, Func: 3: Read Holding Registers"
+        );
         assert!(has(&d, "Request", "address 2, quantity 1"));
         let d = f.send(true, &[0, 7, 0, 0, 0, 5, 1, 3, 2, 0x04, 0xd2], 1500);
         assert!(has(&d, "Response", "registers [1234]"));

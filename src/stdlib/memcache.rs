@@ -77,10 +77,10 @@
 //! assert_eq!(out, b"STORED\r\nVALUE greeting 5 5\r\nhello\r\nEND\r\nERROR\r\n");
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{be16, be32, be64, self, Decode, Step, Wire};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::{self, Decode, Step, Wire, be16, be32, be64};
 
 /// The port memcached listens on, for both TCP and UDP.
 pub const PORT: u16 = 11211;
@@ -205,7 +205,9 @@ impl Error {
             | Error::Reserved(_)
             | Error::Sequence { .. }
             | Error::PayloadTooLong(_) => Response::Error,
-            Error::Format | Error::Key => Response::ClientError(b"bad command line format".to_vec()),
+            Error::Format | Error::Key => {
+                Response::ClientError(b"bad command line format".to_vec())
+            }
             Error::Delta => Response::ClientError(b"invalid numeric delta argument".to_vec()),
             Error::Exptime => Response::ClientError(b"invalid exptime argument".to_vec()),
             Error::TooLarge(_) => Response::ServerError(b"object too large for cache".to_vec()),
@@ -222,7 +224,10 @@ impl std::fmt::Display for Error {
             Error::Format => f.write_str("bad command line format"),
             Error::Delta => f.write_str("delta not a number from 0 to 2^64 - 1"),
             Error::Exptime => f.write_str("expiration time not a 32-bit signed number"),
-            Error::Key => write!(f, "key empty, over {MAX_KEY} bytes, or holding a space or control byte"),
+            Error::Key => write!(
+                f,
+                "key empty, over {MAX_KEY} bytes, or holding a space or control byte"
+            ),
             Error::TooLarge(n) => write!(f, "data block of {n} bytes exceeds the configured limit"),
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::BadDataChunk => f.write_str("data block not ended by CR LF"),
@@ -231,11 +236,21 @@ impl std::fmt::Display for Error {
             Error::Magic(m) => write!(f, "magic byte {m:#04x}, not 0x80 or 0x81"),
             Error::KeyLength(n) => write!(f, "key of {n} bytes, over {MAX_KEY}"),
             Error::ExtrasLength(n) => write!(f, "extras of {n} bytes, over 255"),
-            Error::BodyLength(n) => write!(f, "body length {n}, over {MAX_BODY} or short of extras and key"),
-            Error::Extras { expected, actual } => write!(f, "extras require {expected} bytes, got {actual}"),
-            Error::Short(n) => write!(f, "datagram of {n} bytes, shorter than the {UDP_HEADER_LEN}-byte header"),
+            Error::BodyLength(n) => write!(
+                f,
+                "body length {n}, over {MAX_BODY} or short of extras and key"
+            ),
+            Error::Extras { expected, actual } => {
+                write!(f, "extras require {expected} bytes, got {actual}")
+            }
+            Error::Short(n) => write!(
+                f,
+                "datagram of {n} bytes, shorter than the {UDP_HEADER_LEN}-byte header"
+            ),
             Error::Reserved(r) => write!(f, "reserved field {r}, not 0"),
-            Error::Sequence { sequence, total } => write!(f, "sequence {sequence} of {total} datagrams"),
+            Error::Sequence { sequence, total } => {
+                write!(f, "sequence {sequence} of {total} datagrams")
+            }
             Error::PayloadTooLong(n) => write!(f, "{n} bytes, too many for UDP"),
         }
     }
@@ -295,7 +310,10 @@ pub struct MetaFlag {
 impl MetaFlag {
     /// A flag with its token.
     pub fn new(flag: u8, token: &[u8]) -> MetaFlag {
-        MetaFlag { flag, token: token.to_vec() }
+        MetaFlag {
+            flag,
+            token: token.to_vec(),
+        }
     }
 }
 
@@ -622,7 +640,11 @@ impl Fail {
     /// block too large to take is dropped whatever `skip` says, as
     /// memcached does.
     fn new(error: Error, skip: u64, quiet: bool) -> Fail {
-        let skip = if let Error::TooLarge(n) = error { n as u64 + 2 } else { skip };
+        let skip = if let Error::TooLarge(n) = error {
+            n as u64 + 2
+        } else {
+            skip
+        };
         Fail { error, skip, quiet }
     }
 }
@@ -647,35 +669,82 @@ fn parse_command(line: &[u8]) -> Result<(Command, Option<usize>), Fail> {
 /// many bytes that is. Once a classic command's `noreply` is known,
 /// `quiet` says whether it was there, since memcached sends no reply for
 /// an error after that.
-fn parse_command_line(line: &[u8], skip: &mut u64, quiet: &mut bool) -> Result<(Command, Option<usize>), Error> {
+fn parse_command_line(
+    line: &[u8],
+    skip: &mut u64,
+    quiet: &mut bool,
+) -> Result<(Command, Option<usize>), Error> {
     let t = tokens(line);
-    let Some((&verb, args)) = t.split_first() else { return Err(Error::UnknownCommand) };
+    let Some((&verb, args)) = t.split_first() else {
+        return Err(Error::UnknownCommand);
+    };
     if let Some(verb) = StoreVerb::from_name(verb) {
         let (args, noreply) = optional_noreply(args, 4)?;
         *quiet = noreply;
-        let [key, flags, exptime, bytes] = args else { return Err(Error::UnknownCommand) };
-        let (key, flags, exptime, n) = (key_of(key)?, small(flags)?, signed(exptime)?, length(bytes)?);
-        return block(Command::Store { verb, key, flags, exptime, data: Vec::new(), noreply }, n);
+        let [key, flags, exptime, bytes] = args else {
+            return Err(Error::UnknownCommand);
+        };
+        let (key, flags, exptime, n) = (
+            key_of(key)?,
+            small(flags)?,
+            signed(exptime)?,
+            length(bytes)?,
+        );
+        return block(
+            Command::Store {
+                verb,
+                key,
+                flags,
+                exptime,
+                data: Vec::new(),
+                noreply,
+            },
+            n,
+        );
     }
     let command = match verb {
         b"cas" => {
             let (args, noreply) = optional_noreply(args, 5)?;
             *quiet = noreply;
-            let [key, flags, exptime, bytes, unique] = args else { return Err(Error::UnknownCommand) };
-            let (key, flags, exptime, n) = (key_of(key)?, small(flags)?, signed(exptime)?, length(bytes)?);
+            let [key, flags, exptime, bytes, unique] = args else {
+                return Err(Error::UnknownCommand);
+            };
+            let (key, flags, exptime, n) = (
+                key_of(key)?,
+                small(flags)?,
+                signed(exptime)?,
+                length(bytes)?,
+            );
             let unique = unsigned(unique)?;
-            return block(Command::Cas { key, flags, exptime, unique, data: Vec::new(), noreply }, n);
+            return block(
+                Command::Cas {
+                    key,
+                    flags,
+                    exptime,
+                    unique,
+                    data: Vec::new(),
+                    noreply,
+                },
+                n,
+            );
         }
         b"get" | b"gets" => {
             if args.is_empty() {
                 return Err(Error::UnknownCommand);
             }
-            Command::Get { keys: keys_of(args)?, cas: verb == b"gets" }
+            Command::Get {
+                keys: keys_of(args)?,
+                cas: verb == b"gets",
+            }
         }
         b"gat" | b"gats" => {
             let (exptime, keys) = args.split_first().ok_or(Error::UnknownCommand)?;
             let exptime = signed(exptime).map_err(|_| Error::Exptime)?;
-            Command::Gat { exptime, keys: keys_of(keys)?, cas: verb == b"gats" }
+            Command::Gat {
+                exptime,
+                keys: keys_of(keys)?,
+                cas: verb == b"gats",
+            }
         }
         b"delete" => {
             if args.is_empty() || args.len() > 3 {
@@ -685,24 +754,50 @@ fn parse_command_line(line: &[u8], skip: &mut u64, quiet: &mut bool) -> Result<(
             *quiet = noreply;
             // memcached still takes an old time argument, if it is 0.
             match args {
-                [key] => Command::Delete { key: key_of(key)?, noreply },
-                [key, time] if *time == b"0" => Command::Delete { key: key_of(key)?, noreply },
+                [key] => Command::Delete {
+                    key: key_of(key)?,
+                    noreply,
+                },
+                [key, time] if *time == b"0" => Command::Delete {
+                    key: key_of(key)?,
+                    noreply,
+                },
                 _ => return Err(Error::Format),
             }
         }
         b"incr" | b"decr" => {
             let (args, noreply) = optional_noreply(args, 2)?;
             *quiet = noreply;
-            let [key, delta] = args else { return Err(Error::UnknownCommand) };
+            let [key, delta] = args else {
+                return Err(Error::UnknownCommand);
+            };
             let (key, delta) = (key_of(key)?, unsigned(delta).map_err(|_| Error::Delta)?);
-            if verb == b"incr" { Command::Incr { key, delta, noreply } } else { Command::Decr { key, delta, noreply } }
+            if verb == b"incr" {
+                Command::Incr {
+                    key,
+                    delta,
+                    noreply,
+                }
+            } else {
+                Command::Decr {
+                    key,
+                    delta,
+                    noreply,
+                }
+            }
         }
         b"touch" => {
             let (args, noreply) = optional_noreply(args, 2)?;
             *quiet = noreply;
-            let [key, exptime] = args else { return Err(Error::UnknownCommand) };
+            let [key, exptime] = args else {
+                return Err(Error::UnknownCommand);
+            };
             let key = key_of(key)?;
-            Command::Touch { key, exptime: signed(exptime).map_err(|_| Error::Exptime)?, noreply }
+            Command::Touch {
+                key,
+                exptime: signed(exptime).map_err(|_| Error::Exptime)?,
+                noreply,
+            }
         }
         b"stats" => {
             let args = args.iter().map(|a| token_of(a)).collect::<Result<_, _>>()?;
@@ -715,8 +810,13 @@ fn parse_command_line(line: &[u8], skip: &mut u64, quiet: &mut bool) -> Result<(
         b"verbosity" => {
             let (args, noreply) = optional_noreply(args, 1)?;
             *quiet = noreply;
-            let [level] = args else { return Err(Error::UnknownCommand) };
-            Command::Verbosity { level: small(level)?, noreply }
+            let [level] = args else {
+                return Err(Error::UnknownCommand);
+            };
+            Command::Verbosity {
+                level: small(level)?,
+                noreply,
+            }
         }
         b"flush_all" => {
             if args.len() > 2 {
@@ -727,12 +827,20 @@ fn parse_command_line(line: &[u8], skip: &mut u64, quiet: &mut bool) -> Result<(
             let (args, noreply) = strip_noreply(args, 0);
             *quiet = noreply;
             match args.first() {
-                None => Command::FlushAll { delay: None, noreply },
-                Some(delay) => Command::FlushAll { delay: Some(signed(delay)?), noreply },
+                None => Command::FlushAll {
+                    delay: None,
+                    noreply,
+                },
+                Some(delay) => Command::FlushAll {
+                    delay: Some(signed(delay)?),
+                    noreply,
+                },
             }
         }
         b"ms" => {
-            let [key, bytes, flags @ ..] = args else { return Err(Error::Format) };
+            let [key, bytes, flags @ ..] = args else {
+                return Err(Error::Format);
+            };
             // As in memcached, a line with too many flags is refused before
             // its length is read. Once the length is known, a bad flag drops
             // the data block too, so its bytes are not read as commands.
@@ -744,10 +852,19 @@ fn parse_command_line(line: &[u8], skip: &mut u64, quiet: &mut bool) -> Result<(
             *skip = n as u64 + 2;
             let flags = meta_flags(flags)?;
             check_meta(b"ms", &key, &flags)?;
-            return block(Command::MetaSet { key, flags, data: Vec::new() }, n);
+            return block(
+                Command::MetaSet {
+                    key,
+                    flags,
+                    data: Vec::new(),
+                },
+                n,
+            );
         }
         b"mg" | b"md" | b"ma" | b"me" => {
-            let [key, flags @ ..] = args else { return Err(Error::Format) };
+            let [key, flags @ ..] = args else {
+                return Err(Error::Format);
+            };
             let (key, flags) = (key_of(key)?, meta_flags(flags)?);
             check_meta(verb, &key, &flags)?;
             match verb {
@@ -763,7 +880,9 @@ fn parse_command_line(line: &[u8], skip: &mut u64, quiet: &mut bool) -> Result<(
 }
 
 fn attach_command(command: &mut Command, block: Vec<u8>) {
-    if let Command::Store { data, .. } | Command::Cas { data, .. } | Command::MetaSet { data, .. } = command {
+    if let Command::Store { data, .. } | Command::Cas { data, .. } | Command::MetaSet { data, .. } =
+        command
+    {
         *data = block;
     }
 }
@@ -803,7 +922,11 @@ fn parse_response_line(line: &[u8], skip: &mut u64) -> Result<(Response, Option<
         _ => None,
     };
     if let Some(r) = fixed {
-        return if rest.is_none() { Ok((r, None)) } else { Err(Error::Format) };
+        return if rest.is_none() {
+            Ok((r, None))
+        } else {
+            Err(Error::Format)
+        };
     }
     let text = |t: Option<&[u8]>| -> Result<Vec<u8>, Error> {
         let t = t.unwrap_or(b"");
@@ -817,7 +940,10 @@ fn parse_response_line(line: &[u8], skip: &mut u64) -> Result<(Response, Option<
         b"STAT" => {
             let rest = rest.ok_or(Error::Format)?;
             let i = rest.iter().position(|&b| b == b' ').ok_or(Error::Format)?;
-            Response::Stat { name: token_of(&rest[..i])?, value: text(Some(&rest[i + 1..]))? }
+            Response::Stat {
+                name: token_of(&rest[..i])?,
+                value: text(Some(&rest[i + 1..]))?,
+            }
         }
         b"ME" => {
             let rest = rest.ok_or(Error::Format)?;
@@ -825,7 +951,10 @@ fn parse_response_line(line: &[u8], skip: &mut u64) -> Result<(Response, Option<
                 Some(i) => (&rest[..i], Some(&rest[i + 1..])),
                 None => (rest, None),
             };
-            Response::MetaDebug { key: key_of(key)?, info: text(info)? }
+            Response::MetaDebug {
+                key: key_of(key)?,
+                info: text(info)?,
+            }
         }
         b"VALUE" => {
             let t = tokens(rest.unwrap_or(b""));
@@ -839,18 +968,37 @@ fn parse_response_line(line: &[u8], skip: &mut u64) -> Result<(Response, Option<
             let n = length(bytes)?;
             *skip = n as u64 + 2;
             let (key, flags, cas) = (key_of(key)?, small(flags)?, cas.map(unsigned).transpose()?);
-            return block(Response::Value { key, flags, cas, data: Vec::new() }, n);
+            return block(
+                Response::Value {
+                    key,
+                    flags,
+                    cas,
+                    data: Vec::new(),
+                },
+                n,
+            );
         }
         b"VA" => {
             let t = tokens(rest.unwrap_or(b""));
-            let [bytes, flags @ ..] = &t[..] else { return Err(Error::Format) };
+            let [bytes, flags @ ..] = &t[..] else {
+                return Err(Error::Format);
+            };
             let n = length(bytes)?;
             *skip = n as u64 + 2;
             let flags = meta_flags(flags)?;
-            return block(Response::MetaValue { flags, data: Vec::new() }, n);
+            return block(
+                Response::MetaValue {
+                    flags,
+                    data: Vec::new(),
+                },
+                n,
+            );
         }
         code => match MetaStatus::from_code(code) {
-            Some(status) => Response::Meta { status, flags: meta_flags(&tokens(rest.unwrap_or(b"")))? },
+            Some(status) => Response::Meta {
+                status,
+                flags: meta_flags(&tokens(rest.unwrap_or(b"")))?,
+            },
             None => return Err(Error::UnknownCommand),
         },
     };
@@ -866,7 +1014,9 @@ fn attach_response(response: &mut Response, block: Vec<u8>) {
 /// The words of a line: the runs of bytes between spaces. memcached skips
 /// empty words, so two spaces count as one.
 fn tokens(line: &[u8]) -> Vec<&[u8]> {
-    line.split(|&b| b == b' ').filter(|t| !t.is_empty()).collect()
+    line.split(|&b| b == b' ')
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 /// The words before a final `noreply`, and whether it was there. It is a
@@ -883,7 +1033,10 @@ fn strip_noreply<'a, 'b>(args: &'a [&'b [u8]], required: usize) -> (&'a [&'b [u8
 /// that word was `noreply`. memcached ignores any other word in that place.
 /// Fewer or more words are [`Error::UnknownCommand`], since memcached
 /// answers them with `ERROR`.
-fn optional_noreply<'a, 'b>(args: &'a [&'b [u8]], required: usize) -> Result<(&'a [&'b [u8]], bool), Error> {
+fn optional_noreply<'a, 'b>(
+    args: &'a [&'b [u8]],
+    required: usize,
+) -> Result<(&'a [&'b [u8]], bool), Error> {
     if args.len() == required {
         Ok((args, false))
     } else if args.len() == required + 1 {
@@ -937,7 +1090,10 @@ fn meta_flags(ts: &[&[u8]]) -> Result<Vec<MetaFlag>, Error> {
     ts.iter()
         .map(|t| {
             let t = token_of(t)?;
-            Ok(MetaFlag { flag: t[0], token: t[1..].to_vec() })
+            Ok(MetaFlag {
+                flag: t[0],
+                token: t[1..].to_vec(),
+            })
         })
         .collect()
 }
@@ -960,7 +1116,9 @@ fn check_meta(verb: &[u8], key: &[u8], flags: &[MetaFlag]) -> Result<(), Error> 
     let mut seen = [false; 128];
     for f in flags {
         // Every known flag is ASCII, so the index is in range.
-        if !META_COMMAND_FLAGS.contains(&f.flag) || std::mem::replace(&mut seen[usize::from(f.flag)], true) {
+        if !META_COMMAND_FLAGS.contains(&f.flag)
+            || std::mem::replace(&mut seen[usize::from(f.flag)], true)
+        {
             return Err(Error::Format);
         }
         let t = &f.token[..];
@@ -1007,14 +1165,22 @@ fn is_base64(key: &[u8]) -> bool {
 
 /// Message text: anything but CR and LF.
 fn check_text(t: &[u8]) -> Result<(), Error> {
-    if t.iter().any(|&b| b == b'\r' || b == b'\n') { Err(Error::Format) } else { Ok(()) }
+    if t.iter().any(|&b| b == b'\r' || b == b'\n') {
+        Err(Error::Format)
+    } else {
+        Ok(())
+    }
 }
 
 fn unsigned(t: &[u8]) -> Result<u64, Error> {
     if t.is_empty() || !t.iter().all(u8::is_ascii_digit) {
         return Err(Error::Format);
     }
-    t.iter().try_fold(0u64, |n, &d| n.checked_mul(10)?.checked_add(u64::from(d - b'0'))).ok_or(Error::Format)
+    t.iter()
+        .try_fold(0u64, |n, &d| {
+            n.checked_mul(10)?.checked_add(u64::from(d - b'0'))
+        })
+        .ok_or(Error::Format)
 }
 
 fn small(t: &[u8]) -> Result<u32, Error> {
@@ -1025,7 +1191,9 @@ fn small(t: &[u8]) -> Result<u32, Error> {
 /// refuses one that does not fit.
 fn signed(t: &[u8]) -> Result<i32, Error> {
     match t.split_first() {
-        Some((b'-', digits)) => i32::try_from(-i128::from(unsigned(digits)?)).map_err(|_| Error::Format),
+        Some((b'-', digits)) => {
+            i32::try_from(-i128::from(unsigned(digits)?)).map_err(|_| Error::Format)
+        }
         _ => i32::try_from(unsigned(t)?).map_err(|_| Error::Format),
     }
 }
@@ -1041,7 +1209,11 @@ fn length(t: &[u8]) -> Result<usize, Error> {
 /// A message whose data block of `n` bytes comes next, or the error for a
 /// block too large to take.
 fn block<T>(message: T, n: usize) -> Result<(T, Option<usize>), Error> {
-    if n > MAX_VALUE { Err(Error::TooLarge(n)) } else { Ok((message, Some(n))) }
+    if n > MAX_VALUE {
+        Err(Error::TooLarge(n))
+    } else {
+        Ok((message, Some(n)))
+    }
 }
 
 /// A line being written. Each word is checked against `limit`, counting
@@ -1055,7 +1227,10 @@ struct Line {
 
 impl Line {
     fn new(limit: usize) -> Line {
-        Line { buf: Vec::new(), limit }
+        Line {
+            buf: Vec::new(),
+            limit,
+        }
     }
 
     /// Whether `n` more bytes fit, with the CR LF.
@@ -1101,7 +1276,11 @@ impl Line {
     }
 
     fn noreply(&mut self, noreply: bool) -> Result<(), Error> {
-        if noreply { self.word(&[b"noreply"]) } else { Ok(()) }
+        if noreply {
+            self.word(&[b"noreply"])
+        } else {
+            Ok(())
+        }
     }
 
     /// Adds message text, which may hold spaces, after a space. Empty text
@@ -1136,7 +1315,13 @@ impl Line {
         Ok(())
     }
 
-    fn meta(&mut self, verb: &[u8], key: &[u8], n: Option<usize>, flags: &[MetaFlag]) -> Result<(), Error> {
+    fn meta(
+        &mut self,
+        verb: &[u8],
+        key: &[u8],
+        n: Option<usize>,
+        flags: &[MetaFlag],
+    ) -> Result<(), Error> {
         self.word(&[verb])?;
         self.key(key)?;
         if let Some(n) = n {
@@ -1459,8 +1644,16 @@ impl Wire for StoreExtras {
 
     /// Reads exactly 8 bytes. Refuses every other length.
     fn parse(extras: &[u8]) -> Result<Self, Error> {
-        let [a, b, c, d, e, f, g, h] = *extras else { return Err(Error::Extras { expected: 8, actual: extras.len() }) };
-        Ok(StoreExtras { flags: u32::from_be_bytes([a, b, c, d]), expiration: u32::from_be_bytes([e, f, g, h]) })
+        let [a, b, c, d, e, f, g, h] = *extras else {
+            return Err(Error::Extras {
+                expected: 8,
+                actual: extras.len(),
+            });
+        };
+        Ok(StoreExtras {
+            flags: u32::from_be_bytes([a, b, c, d]),
+            expiration: u32::from_be_bytes([e, f, g, h]),
+        })
     }
 
     /// Appends the 8 bytes of extras. Every value is representable;
@@ -1492,10 +1685,20 @@ impl Wire for CounterExtras {
     /// Reads exactly 20 bytes. Refuses every other length.
     fn parse(extras: &[u8]) -> Result<Self, Error> {
         if extras.len() != 20 {
-            return Err(Error::Extras { expected: 20, actual: extras.len() });
+            return Err(Error::Extras {
+                expected: 20,
+                actual: extras.len(),
+            });
         }
-        let bad = Error::Extras { expected: 20, actual: extras.len() };
-        Ok(CounterExtras { delta: be64(extras, 0).ok_or(bad)?, initial: be64(extras, 8).ok_or(bad)?, expiration: be32(extras, 16).ok_or(bad)? })
+        let bad = Error::Extras {
+            expected: 20,
+            actual: extras.len(),
+        };
+        Ok(CounterExtras {
+            delta: be64(extras, 0).ok_or(bad)?,
+            initial: be64(extras, 8).ok_or(bad)?,
+            expiration: be32(extras, 16).ok_or(bad)?,
+        })
     }
 
     /// Appends the 20 bytes of extras. Every value is representable;
@@ -1542,7 +1745,11 @@ impl Wire for UdpFrame {
         if datagram.len() < UDP_HEADER_LEN {
             return Err(Error::Short(datagram.len()));
         }
-        let (sequence, total, reserved) = (be16(datagram, 2).ok_or(Error::Short(datagram.len()))?, be16(datagram, 4).ok_or(Error::Short(datagram.len()))?, be16(datagram, 6).ok_or(Error::Short(datagram.len()))?);
+        let (sequence, total, reserved) = (
+            be16(datagram, 2).ok_or(Error::Short(datagram.len()))?,
+            be16(datagram, 4).ok_or(Error::Short(datagram.len()))?,
+            be16(datagram, 6).ok_or(Error::Short(datagram.len()))?,
+        );
         if reserved != 0 {
             return Err(Error::Reserved(reserved));
         }
@@ -1553,14 +1760,22 @@ impl Wire for UdpFrame {
         if payload.len() > MAX_UDP_PAYLOAD {
             return Err(Error::PayloadTooLong(payload.len()));
         }
-        Ok(UdpFrame { request_id: be16(datagram, 0).ok_or(Error::Short(datagram.len()))?, sequence, total, payload: payload.to_vec() })
+        Ok(UdpFrame {
+            request_id: be16(datagram, 0).ok_or(Error::Short(datagram.len()))?,
+            sequence,
+            total,
+            payload: payload.to_vec(),
+        })
     }
 
     /// Appends one datagram. Refuses invalid sequence counts and payloads
     /// over [`MAX_UDP_PAYLOAD`], leaving `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.sequence >= self.total {
-            return Err(Error::Sequence { sequence: self.sequence, total: self.total });
+            return Err(Error::Sequence {
+                sequence: self.sequence,
+                total: self.total,
+            });
         }
         if self.payload.len() > MAX_UDP_PAYLOAD {
             return Err(Error::PayloadTooLong(self.payload.len()));
@@ -1586,7 +1801,12 @@ impl UdpFrame {
         for sequence in 0..total {
             let from = usize::from(sequence) * chunk;
             let to = (from + chunk).min(message.len());
-            frames.push(UdpFrame { request_id, sequence, total, payload: message[from..to].to_vec() });
+            frames.push(UdpFrame {
+                request_id,
+                sequence,
+                total,
+                payload: message[from..to].to_vec(),
+            });
         }
         Ok(frames)
     }
@@ -1765,9 +1985,7 @@ impl<T> TextUnits<T> {
                     }
                 }
             }
-            Step::Item(Err(codec::LineError::TooLong { .. }), _) => {
-                Err(FrameError::LineTooLong)
-            }
+            Step::Item(Err(codec::LineError::TooLong { .. }), _) => Err(FrameError::LineTooLong),
             Step::Item(Err(_), _) => Err(FrameError::Incomplete),
             Step::Skip(n) => Ok(Step::Skip(n)),
             Step::Need if self.long_line && input.len() >= MAX_LINE => {
@@ -1956,10 +2174,7 @@ where
 }
 
 fn exact_command(bytes: &[u8]) -> Result<Command, Error> {
-    exact_text(
-        Commands::new(),
-        bytes,
-    )
+    exact_text(Commands::new(), bytes)
 }
 
 impl Wire for Command {
@@ -1981,11 +2196,22 @@ impl Wire for Command {
     /// [`MAX_VALUE`], and values that would read back differently.
     /// Refused values leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let limit = if matches!(self, Command::Get { .. }) { MAX_GET_LINE } else { MAX_LINE };
+        let limit = if matches!(self, Command::Get { .. }) {
+            MAX_GET_LINE
+        } else {
+            MAX_LINE
+        };
         let mut line = Line::new(limit);
         let mut data = None;
         match self {
-            Command::Store { verb, key, flags, exptime, data: d, noreply } => {
+            Command::Store {
+                verb,
+                key,
+                flags,
+                exptime,
+                data: d,
+                noreply,
+            } => {
                 line.word(&[verb.name().as_bytes()])?;
                 line.key(key)?;
                 line.number(flags)?;
@@ -1994,7 +2220,14 @@ impl Wire for Command {
                 line.noreply(*noreply)?;
                 data = Some(d);
             }
-            Command::Cas { key, flags, exptime, unique, data: d, noreply } => {
+            Command::Cas {
+                key,
+                flags,
+                exptime,
+                unique,
+                data: d,
+                noreply,
+            } => {
                 line.word(&[b"cas"])?;
                 line.key(key)?;
                 line.number(flags)?;
@@ -2018,13 +2251,30 @@ impl Wire for Command {
                 line.key(key)?;
                 line.noreply(*noreply)?;
             }
-            Command::Incr { key, delta, noreply } | Command::Decr { key, delta, noreply } => {
-                line.word(&[if matches!(self, Command::Incr { .. }) { b"incr" } else { b"decr" }])?;
+            Command::Incr {
+                key,
+                delta,
+                noreply,
+            }
+            | Command::Decr {
+                key,
+                delta,
+                noreply,
+            } => {
+                line.word(&[if matches!(self, Command::Incr { .. }) {
+                    b"incr"
+                } else {
+                    b"decr"
+                }])?;
                 line.key(key)?;
                 line.number(delta)?;
                 line.noreply(*noreply)?;
             }
-            Command::Touch { key, exptime, noreply } => {
+            Command::Touch {
+                key,
+                exptime,
+                noreply,
+            } => {
                 line.word(&[b"touch"])?;
                 line.key(key)?;
                 line.number(exptime)?;
@@ -2051,7 +2301,11 @@ impl Wire for Command {
             }
             Command::Quit => line.word(&[b"quit"])?,
             Command::MetaGet { key, flags } => line.meta(b"mg", key, None, flags)?,
-            Command::MetaSet { key, flags, data: d } => {
+            Command::MetaSet {
+                key,
+                flags,
+                data: d,
+            } => {
                 line.meta(b"ms", key, Some(d.len()), flags)?;
                 data = Some(d);
             }
@@ -2070,10 +2324,7 @@ impl Wire for Command {
 }
 
 fn exact_response(bytes: &[u8]) -> Result<Response, Error> {
-    exact_text(
-        Responses::new(),
-        bytes,
-    )
+    exact_text(Responses::new(), bytes)
 }
 
 impl Wire for Response {
@@ -2113,7 +2364,12 @@ impl Wire for Response {
             Response::ClientError(m) => line.text(b"CLIENT_ERROR", m)?,
             Response::ServerError(m) => line.text(b"SERVER_ERROR", m)?,
             Response::Version(v) => line.text(b"VERSION", v)?,
-            Response::Value { key, flags, cas, data: d } => {
+            Response::Value {
+                key,
+                flags,
+                cas,
+                data: d,
+            } => {
                 line.word(&[b"VALUE"])?;
                 line.key(key)?;
                 line.number(flags)?;
@@ -2168,10 +2424,14 @@ impl Prefixed for Packet {
     const NAME: &'static str = "memcache binary";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_BODY }
+    fn default_limit() -> Self::Limit {
+        MAX_BODY
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_BODY) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_BODY)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -2180,7 +2440,10 @@ impl Prefixed for Packet {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         if let Some(&m) = input.first() {
             Magic::from_byte(m).ok_or(Error::Magic(m))?;
@@ -2190,7 +2453,8 @@ impl Prefixed for Packet {
             if key_len > MAX_KEY {
                 return Err(Error::KeyLength(key_len));
             }
-            let body = usize::try_from(be32(header, 8).ok_or(Error::Incomplete)?).unwrap_or(usize::MAX);
+            let body =
+                usize::try_from(be32(header, 8).ok_or(Error::Incomplete)?).unwrap_or(usize::MAX);
             if body > limit {
                 return Err(Error::BodyLength(body));
             }
@@ -2198,7 +2462,6 @@ impl Prefixed for Packet {
         Packet::parse_prefix(input)
     }
 }
-
 
 impl Wire for Packet {
     type ParseError = Error;
@@ -2221,8 +2484,12 @@ impl Wire for Packet {
         if self.key.len() > MAX_KEY {
             return Err(Error::KeyLength(self.key.len()));
         }
-        let extras_len = u8::try_from(self.extras.len()).map_err(|_| Error::ExtrasLength(self.extras.len()))?;
-        let body = self.extras.len().checked_add(self.key.len())
+        let extras_len =
+            u8::try_from(self.extras.len()).map_err(|_| Error::ExtrasLength(self.extras.len()))?;
+        let body = self
+            .extras
+            .len()
+            .checked_add(self.key.len())
             .and_then(|n| n.checked_add(self.value.len()))
             .ok_or(Error::BodyLength(usize::MAX))?;
         if body > MAX_BODY {
@@ -2248,9 +2515,7 @@ impl Wire for Packet {
 mod tests {
     use super::*;
 
-    use codec::{
-        Lcg, Stream,
-    };
+    use codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
 
     use fictionet::stdlib::test_support::{decode_all, mutate};
@@ -2316,28 +2581,94 @@ mod tests {
                 data: b"z".to_vec(),
                 noreply: true,
             },
-            Command::Cas { key: key("a"), flags: 0, exptime: 0, unique: u64::MAX, data: b"v".to_vec(), noreply: false },
-            Command::Get { keys: vec![key("a"), key("b")], cas: false },
-            Command::Get { keys: vec![key("noreply")], cas: true },
-            Command::Gat { exptime: 10, keys: vec![key("a")], cas: false },
-            Command::Gat { exptime: i32::MIN, keys: vec![key("a")], cas: true },
-            Command::Delete { key: key("noreply"), noreply: false },
-            Command::Delete { key: key("noreply"), noreply: true },
-            Command::Incr { key: key("n"), delta: 5, noreply: false },
-            Command::Decr { key: key("n"), delta: u64::MAX, noreply: true },
-            Command::Touch { key: key("t"), exptime: 30, noreply: false },
+            Command::Cas {
+                key: key("a"),
+                flags: 0,
+                exptime: 0,
+                unique: u64::MAX,
+                data: b"v".to_vec(),
+                noreply: false,
+            },
+            Command::Get {
+                keys: vec![key("a"), key("b")],
+                cas: false,
+            },
+            Command::Get {
+                keys: vec![key("noreply")],
+                cas: true,
+            },
+            Command::Gat {
+                exptime: 10,
+                keys: vec![key("a")],
+                cas: false,
+            },
+            Command::Gat {
+                exptime: i32::MIN,
+                keys: vec![key("a")],
+                cas: true,
+            },
+            Command::Delete {
+                key: key("noreply"),
+                noreply: false,
+            },
+            Command::Delete {
+                key: key("noreply"),
+                noreply: true,
+            },
+            Command::Incr {
+                key: key("n"),
+                delta: 5,
+                noreply: false,
+            },
+            Command::Decr {
+                key: key("n"),
+                delta: u64::MAX,
+                noreply: true,
+            },
+            Command::Touch {
+                key: key("t"),
+                exptime: 30,
+                noreply: false,
+            },
             Command::Stats { args: vec![] },
-            Command::Stats { args: vec![key("cachedump"), key("1"), key("2")] },
+            Command::Stats {
+                args: vec![key("cachedump"), key("1"), key("2")],
+            },
             Command::Version,
-            Command::Verbosity { level: 1, noreply: true },
-            Command::FlushAll { delay: None, noreply: false },
-            Command::FlushAll { delay: Some(5), noreply: true },
+            Command::Verbosity {
+                level: 1,
+                noreply: true,
+            },
+            Command::FlushAll {
+                delay: None,
+                noreply: false,
+            },
+            Command::FlushAll {
+                delay: Some(5),
+                noreply: true,
+            },
             Command::Quit,
-            Command::MetaGet { key: key("foo"), flags: vec![f(b'v', ""), f(b'T', "30"), f(b'O', "abc")] },
-            Command::MetaSet { key: key("foo"), flags: vec![f(b'F', "1")], data: b"hi".to_vec() },
-            Command::MetaDelete { key: key("foo"), flags: vec![f(b'q', "")] },
-            Command::MetaArithmetic { key: key("n"), flags: vec![f(b'D', "2"), f(b'M', "I")] },
-            Command::MetaDebug { key: key("foo"), flags: vec![] },
+            Command::MetaGet {
+                key: key("foo"),
+                flags: vec![f(b'v', ""), f(b'T', "30"), f(b'O', "abc")],
+            },
+            Command::MetaSet {
+                key: key("foo"),
+                flags: vec![f(b'F', "1")],
+                data: b"hi".to_vec(),
+            },
+            Command::MetaDelete {
+                key: key("foo"),
+                flags: vec![f(b'q', "")],
+            },
+            Command::MetaArithmetic {
+                key: key("n"),
+                flags: vec![f(b'D', "2"), f(b'M', "I")],
+            },
+            Command::MetaDebug {
+                key: key("foo"),
+                flags: vec![],
+            },
             Command::MetaNoop,
         ]
     }
@@ -2356,22 +2687,65 @@ mod tests {
             Response::ClientError(b"bad data chunk".to_vec()),
             Response::ClientError(vec![]),
             Response::ServerError(b"out of memory".to_vec()),
-            Response::Value { key: key("a"), flags: 3, cas: None, data: b"hello".to_vec() },
-            Response::Value { key: key("a"), flags: 0, cas: Some(77), data: vec![] },
-            Response::Stat { name: key("pid"), value: key("1234") },
-            Response::Stat { name: key("version"), value: key("1.6 beta") },
+            Response::Value {
+                key: key("a"),
+                flags: 3,
+                cas: None,
+                data: b"hello".to_vec(),
+            },
+            Response::Value {
+                key: key("a"),
+                flags: 0,
+                cas: Some(77),
+                data: vec![],
+            },
+            Response::Stat {
+                name: key("pid"),
+                value: key("1234"),
+            },
+            Response::Stat {
+                name: key("version"),
+                value: key("1.6 beta"),
+            },
             Response::Version(b"1.6.21".to_vec()),
             Response::Number(0),
             Response::Number(u64::MAX),
-            Response::Meta { status: MetaStatus::Header, flags: vec![MetaFlag::new(b'O', b"123")] },
-            Response::Meta { status: MetaStatus::Miss, flags: vec![] },
-            Response::Meta { status: MetaStatus::NotStored, flags: vec![] },
-            Response::Meta { status: MetaStatus::Exists, flags: vec![] },
-            Response::Meta { status: MetaStatus::NotFound, flags: vec![] },
-            Response::Meta { status: MetaStatus::Noop, flags: vec![] },
-            Response::MetaValue { flags: vec![MetaFlag::new(b't', b"-1")], data: b"hi".to_vec() },
-            Response::MetaDebug { key: key("foo"), info: b"exp=-1 la=3 cas=2 fetch=no cls=1 size=63".to_vec() },
-            Response::MetaDebug { key: key("foo"), info: vec![] },
+            Response::Meta {
+                status: MetaStatus::Header,
+                flags: vec![MetaFlag::new(b'O', b"123")],
+            },
+            Response::Meta {
+                status: MetaStatus::Miss,
+                flags: vec![],
+            },
+            Response::Meta {
+                status: MetaStatus::NotStored,
+                flags: vec![],
+            },
+            Response::Meta {
+                status: MetaStatus::Exists,
+                flags: vec![],
+            },
+            Response::Meta {
+                status: MetaStatus::NotFound,
+                flags: vec![],
+            },
+            Response::Meta {
+                status: MetaStatus::Noop,
+                flags: vec![],
+            },
+            Response::MetaValue {
+                flags: vec![MetaFlag::new(b't', b"-1")],
+                data: b"hi".to_vec(),
+            },
+            Response::MetaDebug {
+                key: key("foo"),
+                info: b"exp=-1 la=3 cas=2 fetch=no cls=1 size=63".to_vec(),
+            },
+            Response::MetaDebug {
+                key: key("foo"),
+                info: vec![],
+            },
         ]
     }
 
@@ -2397,7 +2771,14 @@ mod tests {
         let c = one(b"cas k 7 0 1 12345 noreply\r\nx\r\n");
         assert_eq!(
             c,
-            Command::Cas { key: key("k"), flags: 7, exptime: 0, unique: 12345, data: b"x".to_vec(), noreply: true }
+            Command::Cas {
+                key: key("k"),
+                flags: 7,
+                exptime: 0,
+                unique: 12345,
+                data: b"x".to_vec(),
+                noreply: true
+            }
         );
         assert!(c.is_quiet());
         // Data may hold CR LF; only its length counts.
@@ -2416,14 +2797,37 @@ mod tests {
 
     #[test]
     fn retrieval_example() {
-        assert_eq!(one(b"get a b c\r\n"), Command::Get { keys: vec![key("a"), key("b"), key("c")], cas: false });
-        assert_eq!(one(b"gats 100 a\r\n"), Command::Gat { exptime: 100, keys: vec![key("a")], cas: true });
+        assert_eq!(
+            one(b"get a b c\r\n"),
+            Command::Get {
+                keys: vec![key("a"), key("b"), key("c")],
+                cas: false
+            }
+        );
+        assert_eq!(
+            one(b"gats 100 a\r\n"),
+            Command::Gat {
+                exptime: 100,
+                keys: vec![key("a")],
+                cas: true
+            }
+        );
         let got = responses(b"VALUE a 0 5 99\r\nhello\r\nVALUE c 2 0\r\n\r\nEND\r\n");
         assert_eq!(
             got,
             [
-                Ok(Response::Value { key: key("a"), flags: 0, cas: Some(99), data: b"hello".to_vec() }),
-                Ok(Response::Value { key: key("c"), flags: 2, cas: None, data: vec![] }),
+                Ok(Response::Value {
+                    key: key("a"),
+                    flags: 0,
+                    cas: Some(99),
+                    data: b"hello".to_vec()
+                }),
+                Ok(Response::Value {
+                    key: key("c"),
+                    flags: 2,
+                    cas: None,
+                    data: vec![]
+                }),
                 Ok(Response::End),
             ]
         );
@@ -2431,21 +2835,89 @@ mod tests {
 
     #[test]
     fn other_commands_example() {
-        assert_eq!(one(b"delete k\r\n"), Command::Delete { key: key("k"), noreply: false });
-        assert_eq!(one(b"delete k 0 noreply\r\n"), Command::Delete { key: key("k"), noreply: true });
-        assert_eq!(one(b"incr n 10\r\n"), Command::Incr { key: key("n"), delta: 10, noreply: false });
-        assert_eq!(one(b"decr n 3 noreply\r\n"), Command::Decr { key: key("n"), delta: 3, noreply: true });
-        assert_eq!(one(b"touch k -1\r\n"), Command::Touch { key: key("k"), exptime: -1, noreply: false });
-        assert_eq!(one(b"stats slabs\r\n"), Command::Stats { args: vec![key("slabs")] });
+        assert_eq!(
+            one(b"delete k\r\n"),
+            Command::Delete {
+                key: key("k"),
+                noreply: false
+            }
+        );
+        assert_eq!(
+            one(b"delete k 0 noreply\r\n"),
+            Command::Delete {
+                key: key("k"),
+                noreply: true
+            }
+        );
+        assert_eq!(
+            one(b"incr n 10\r\n"),
+            Command::Incr {
+                key: key("n"),
+                delta: 10,
+                noreply: false
+            }
+        );
+        assert_eq!(
+            one(b"decr n 3 noreply\r\n"),
+            Command::Decr {
+                key: key("n"),
+                delta: 3,
+                noreply: true
+            }
+        );
+        assert_eq!(
+            one(b"touch k -1\r\n"),
+            Command::Touch {
+                key: key("k"),
+                exptime: -1,
+                noreply: false
+            }
+        );
+        assert_eq!(
+            one(b"stats slabs\r\n"),
+            Command::Stats {
+                args: vec![key("slabs")]
+            }
+        );
         assert_eq!(one(b"version\n"), Command::Version);
-        assert_eq!(one(b"verbosity 1\r\n"), Command::Verbosity { level: 1, noreply: false });
-        assert_eq!(one(b"flush_all noreply\r\n"), Command::FlushAll { delay: None, noreply: true });
-        assert_eq!(one(b"flush_all 10\r\n"), Command::FlushAll { delay: Some(10), noreply: false });
+        assert_eq!(
+            one(b"verbosity 1\r\n"),
+            Command::Verbosity {
+                level: 1,
+                noreply: false
+            }
+        );
+        assert_eq!(
+            one(b"flush_all noreply\r\n"),
+            Command::FlushAll {
+                delay: None,
+                noreply: true
+            }
+        );
+        assert_eq!(
+            one(b"flush_all 10\r\n"),
+            Command::FlushAll {
+                delay: Some(10),
+                noreply: false
+            }
+        );
         assert_eq!(one(b"quit\r\n"), Command::Quit);
         // Extra spaces count as one.
-        assert_eq!(one(b"get  a   b \r\n"), Command::Get { keys: vec![key("a"), key("b")], cas: false });
+        assert_eq!(
+            one(b"get  a   b \r\n"),
+            Command::Get {
+                keys: vec![key("a"), key("b")],
+                cas: false
+            }
+        );
         // A key named noreply is a key when the command needs one.
-        assert_eq!(one(b"delete noreply\r\n"), Command::Delete { key: key("noreply"), noreply: false });
+        assert_eq!(
+            one(b"delete noreply\r\n"),
+            Command::Delete {
+                key: key("noreply"),
+                noreply: false
+            }
+        );
         // memcached ignores a word other than noreply after the last one
         // a command needs, and any words after version, quit and mn.
         assert_eq!(
@@ -2459,21 +2931,63 @@ mod tests {
                 noreply: false
             }
         );
-        assert_eq!(one(b"incr n 1 x\r\n"), Command::Incr { key: key("n"), delta: 1, noreply: false });
-        assert_eq!(one(b"touch k 1 noreply\r\n"), Command::Touch { key: key("k"), exptime: 1, noreply: true });
-        assert_eq!(one(b"flush_all 1 2\r\n"), Command::FlushAll { delay: Some(1), noreply: false });
+        assert_eq!(
+            one(b"incr n 1 x\r\n"),
+            Command::Incr {
+                key: key("n"),
+                delta: 1,
+                noreply: false
+            }
+        );
+        assert_eq!(
+            one(b"touch k 1 noreply\r\n"),
+            Command::Touch {
+                key: key("k"),
+                exptime: 1,
+                noreply: true
+            }
+        );
+        assert_eq!(
+            one(b"flush_all 1 2\r\n"),
+            Command::FlushAll {
+                delay: Some(1),
+                noreply: false
+            }
+        );
         assert_eq!(one(b"version now\r\n"), Command::Version);
         assert_eq!(one(b"quit 1\r\n"), Command::Quit);
         assert_eq!(one(b"mn x\r\n"), Command::MetaNoop);
         // Expiration times are 32-bit signed numbers.
-        assert_eq!(one(b"gat -2147483648 k\r\n"), Command::Gat { exptime: i32::MIN, keys: vec![key("k")], cas: false });
-        assert_eq!(one(b"touch k 2147483647\r\n"), Command::Touch { key: key("k"), exptime: i32::MAX, noreply: false });
-        let got = responses(b"STAT pid 2233\r\nSTAT uptime 45\r\nEND\r\n42\r\nVERSION 1.6.21\r\nTOUCHED\r\n");
+        assert_eq!(
+            one(b"gat -2147483648 k\r\n"),
+            Command::Gat {
+                exptime: i32::MIN,
+                keys: vec![key("k")],
+                cas: false
+            }
+        );
+        assert_eq!(
+            one(b"touch k 2147483647\r\n"),
+            Command::Touch {
+                key: key("k"),
+                exptime: i32::MAX,
+                noreply: false
+            }
+        );
+        let got = responses(
+            b"STAT pid 2233\r\nSTAT uptime 45\r\nEND\r\n42\r\nVERSION 1.6.21\r\nTOUCHED\r\n",
+        );
         assert_eq!(
             got,
             [
-                Ok(Response::Stat { name: key("pid"), value: key("2233") }),
-                Ok(Response::Stat { name: key("uptime"), value: key("45") }),
+                Ok(Response::Stat {
+                    name: key("pid"),
+                    value: key("2233")
+                }),
+                Ok(Response::Stat {
+                    name: key("uptime"),
+                    value: key("45")
+                }),
                 Ok(Response::End),
                 Ok(Response::Number(42)),
                 Ok(Response::Version(key("1.6.21"))),
@@ -2494,7 +3008,9 @@ mod tests {
             }
         );
         let c = one(b"mg foo v t q\r\n");
-        let Command::MetaGet { flags, .. } = &c else { panic!() };
+        let Command::MetaGet { flags, .. } = &c else {
+            panic!()
+        };
         assert_eq!(meta_token(flags, b't'), Some(&b""[..]));
         assert_eq!(meta_token(flags, b'k'), None);
         assert!(c.is_quiet());
@@ -2503,14 +3019,26 @@ mod tests {
         assert_eq!(
             got,
             [
-                Ok(Response::MetaValue { flags: vec![MetaFlag::new(b't', b"-1")], data: b"hi".to_vec() }),
-                Ok(Response::Meta { status: MetaStatus::Miss, flags: vec![] }),
+                Ok(Response::MetaValue {
+                    flags: vec![MetaFlag::new(b't', b"-1")],
+                    data: b"hi".to_vec()
+                }),
+                Ok(Response::Meta {
+                    status: MetaStatus::Miss,
+                    flags: vec![]
+                }),
                 Ok(Response::Meta {
                     status: MetaStatus::Header,
                     flags: vec![MetaFlag::new(b'O', b"123"), MetaFlag::new(b'k', b"")]
                 }),
-                Ok(Response::Meta { status: MetaStatus::Noop, flags: vec![] }),
-                Ok(Response::MetaDebug { key: key("foo"), info: b"exp=-1 la=3".to_vec() }),
+                Ok(Response::Meta {
+                    status: MetaStatus::Noop,
+                    flags: vec![]
+                }),
+                Ok(Response::MetaDebug {
+                    key: key("foo"),
+                    info: b"exp=-1 la=3".to_vec()
+                }),
             ]
         );
     }
@@ -2534,7 +3062,12 @@ mod tests {
         let mut stream = Vec::new();
         for r in &all {
             let bytes = r.to_bytes().unwrap();
-            assert_eq!(responses(&bytes), [Ok(r.clone())], "{}", String::from_utf8_lossy(&bytes));
+            assert_eq!(
+                responses(&bytes),
+                [Ok(r.clone())],
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
             stream.extend(bytes);
         }
         let got: Vec<_> = responses(&stream).into_iter().map(Result::unwrap).collect();
@@ -2548,9 +3081,10 @@ mod tests {
             contract::check_decode_with_alloc_limit(Commands::new, &bytes, 2 * MAX_LINE);
             for end in 1..bytes.len() {
                 assert!(Command::parse(&bytes[..end]).is_err());
-                assert_eq!(decode_all(Commands::new, &bytes[..end]), (
-                    vec![], Some(codec::Fail::Protocol(FrameError::Incomplete)),
-                ));
+                assert_eq!(
+                    decode_all(Commands::new, &bytes[..end]),
+                    (vec![], Some(codec::Fail::Protocol(FrameError::Incomplete)),)
+                );
             }
         }
         for response in sample_responses() {
@@ -2558,9 +3092,10 @@ mod tests {
             contract::check_decode_with_alloc_limit(Responses::new, &bytes, 2 * MAX_LINE);
             for end in 1..bytes.len() {
                 assert!(Response::parse(&bytes[..end]).is_err());
-                assert_eq!(decode_all(Responses::new, &bytes[..end]), (
-                    vec![], Some(codec::Fail::Protocol(FrameError::Incomplete)),
-                ));
+                assert_eq!(
+                    decode_all(Responses::new, &bytes[..end]),
+                    (vec![], Some(codec::Fail::Protocol(FrameError::Incomplete)),)
+                );
             }
         }
     }
@@ -2568,7 +3103,10 @@ mod tests {
     #[test]
     fn command_errors() {
         // Unknown commands, and an empty line.
-        assert_eq!(commands(b"frob\r\n\r\nGET a\r\n"), [const { Err(Error::UnknownCommand) }; 3]);
+        assert_eq!(
+            commands(b"frob\r\n\r\nGET a\r\n"),
+            [const { Err(Error::UnknownCommand) }; 3]
+        );
         // Wrong word counts and bad numbers.
         // Too few or too many words: memcached answers ERROR.
         for line in [
@@ -2586,14 +3124,38 @@ mod tests {
             b"verbosity\r\n",
             b"flush_all 1 2 3\r\n",
         ] {
-            assert_eq!(commands(line), [Err(Error::UnknownCommand)], "{}", String::from_utf8_lossy(line));
+            assert_eq!(
+                commands(line),
+                [Err(Error::UnknownCommand)],
+                "{}",
+                String::from_utf8_lossy(line)
+            );
         }
         // A bad delta or expiration time has its own reply.
-        for line in [&b"incr k -1\r\n"[..], b"incr k 18446744073709551616\r\n", b"decr k x\r\n"] {
-            assert_eq!(commands(line), [Err(Error::Delta)], "{}", String::from_utf8_lossy(line));
+        for line in [
+            &b"incr k -1\r\n"[..],
+            b"incr k 18446744073709551616\r\n",
+            b"decr k x\r\n",
+        ] {
+            assert_eq!(
+                commands(line),
+                [Err(Error::Delta)],
+                "{}",
+                String::from_utf8_lossy(line)
+            );
         }
-        for line in [&b"touch k x\r\n"[..], b"touch k 2147483648\r\n", b"gat x k\r\n", b"gats -2147483649 k\r\n"] {
-            assert_eq!(commands(line), [Err(Error::Exptime)], "{}", String::from_utf8_lossy(line));
+        for line in [
+            &b"touch k x\r\n"[..],
+            b"touch k 2147483648\r\n",
+            b"gat x k\r\n",
+            b"gats -2147483649 k\r\n",
+        ] {
+            assert_eq!(
+                commands(line),
+                [Err(Error::Exptime)],
+                "{}",
+                String::from_utf8_lossy(line)
+            );
         }
         for line in [
             &b"set k x 0 1\r\n"[..],
@@ -2612,14 +3174,23 @@ mod tests {
             b"stats a\x01\r\n",
             b"mg k \x7f\r\n",
         ] {
-            assert_eq!(commands(line), [Err(Error::Format)], "{}", String::from_utf8_lossy(line));
+            assert_eq!(
+                commands(line),
+                [Err(Error::Format)],
+                "{}",
+                String::from_utf8_lossy(line)
+            );
         }
         let many = format!("mg k{}\r\n", " v".repeat(MAX_META_FLAGS + 1));
         assert_eq!(commands(many.as_bytes()), [Err(Error::Format)]);
         // The most flags, each a different one.
         let most = "mg k k s t c f v h u q x l O1 P L I N1 T1 R1 F1 C1 E1 J1 D1 MZ\r\n";
         assert_eq!(most.split(' ').count() - 2, MAX_META_FLAGS);
-        assert!(commands(most.as_bytes())[0].is_ok(), "{:?}", commands(most.as_bytes()));
+        assert!(
+            commands(most.as_bytes())[0].is_ok(),
+            "{:?}",
+            commands(most.as_bytes())
+        );
         // Bad keys.
         let long = format!("get {}\r\n", "k".repeat(MAX_KEY + 1));
         assert_eq!(commands(long.as_bytes()), [Err(Error::Key)]);
@@ -2627,30 +3198,66 @@ mod tests {
         assert_eq!(commands(b"get a\tb\r\n"), [Err(Error::Key)]);
         assert_eq!(commands(b"get a\rb\r\n"), [Err(Error::Key)]);
         // After a bad storage line, the data block is read as a command.
-        assert_eq!(commands(b"set k x 0 4\r\nquit\r\n"), [Err(Error::Format), Ok(Command::Quit)]);
+        assert_eq!(
+            commands(b"set k x 0 4\r\nquit\r\n"),
+            [Err(Error::Format), Ok(Command::Quit)]
+        );
         // But an ms line whose length was read drops its block on a bad
         // flag, as memcached does, so the block is not run as a command.
-        assert_eq!(commands(b"ms k 4 \x01\r\nquit\r\nmn\r\n"), [Err(Error::Format), Ok(Command::MetaNoop)]);
+        assert_eq!(
+            commands(b"ms k 4 \x01\r\nquit\r\nmn\r\n"),
+            [Err(Error::Format), Ok(Command::MetaNoop)]
+        );
         let bad = b"ms k 4 v \x7f\r\nquit\r\nmn\r\n";
         assert_eq!(commands(bad), [Err(Error::Format), Ok(Command::MetaNoop)]);
         contract::check_decode_with_alloc_limit(Commands::new, bad, 2 * MAX_LINE);
         // Too many flags is refused before the length is read, so the
         // block is read as a command.
         let many = format!("ms k 4{}\r\nquit\r\n", " v".repeat(MAX_META_FLAGS + 1));
-        assert_eq!(commands(many.as_bytes()), [Err(Error::Format), Ok(Command::Quit)]);
+        assert_eq!(
+            commands(many.as_bytes()),
+            [Err(Error::Format), Ok(Command::Quit)]
+        );
         // A data block not ended by CR LF is skipped, and reading goes on.
-        assert_eq!(commands(b"set k 0 0 2\r\nabcdversion\r\n"), [Err(Error::BadDataChunk), Ok(Command::Version)]);
-        assert_eq!(commands(b"set k 0 0 2\r\nab\n\nversion\r\n"), [Err(Error::BadDataChunk), Ok(Command::Version)]);
+        assert_eq!(
+            commands(b"set k 0 0 2\r\nabcdversion\r\n"),
+            [Err(Error::BadDataChunk), Ok(Command::Version)]
+        );
+        assert_eq!(
+            commands(b"set k 0 0 2\r\nab\n\nversion\r\n"),
+            [Err(Error::BadDataChunk), Ok(Command::Version)]
+        );
         // Each error has the reply memcached sends.
-        assert_eq!(Error::UnknownCommand.reply().to_bytes().unwrap(), b"ERROR\r\n");
+        assert_eq!(
+            Error::UnknownCommand.reply().to_bytes().unwrap(),
+            b"ERROR\r\n"
+        );
         assert_eq!(Error::Unwritable.reply(), Response::Error);
         assert_eq!(Error::Unwritable.reply().to_bytes().unwrap(), b"ERROR\r\n");
-        assert_eq!(Error::BadDataChunk.reply().to_bytes().unwrap(), b"CLIENT_ERROR bad data chunk\r\n");
-        assert_eq!(Error::Key.reply().to_bytes().unwrap(), b"CLIENT_ERROR bad command line format\r\n");
-        assert_eq!(Error::TooLarge(5).reply().to_bytes().unwrap(), b"SERVER_ERROR object too large for cache\r\n");
-        assert_eq!(Error::LineTooLong.reply().to_bytes().unwrap(), b"CLIENT_ERROR line too long\r\n");
-        assert_eq!(Error::Delta.reply().to_bytes().unwrap(), b"CLIENT_ERROR invalid numeric delta argument\r\n");
-        assert_eq!(Error::Exptime.reply().to_bytes().unwrap(), b"CLIENT_ERROR invalid exptime argument\r\n");
+        assert_eq!(
+            Error::BadDataChunk.reply().to_bytes().unwrap(),
+            b"CLIENT_ERROR bad data chunk\r\n"
+        );
+        assert_eq!(
+            Error::Key.reply().to_bytes().unwrap(),
+            b"CLIENT_ERROR bad command line format\r\n"
+        );
+        assert_eq!(
+            Error::TooLarge(5).reply().to_bytes().unwrap(),
+            b"SERVER_ERROR object too large for cache\r\n"
+        );
+        assert_eq!(
+            Error::LineTooLong.reply().to_bytes().unwrap(),
+            b"CLIENT_ERROR line too long\r\n"
+        );
+        assert_eq!(
+            Error::Delta.reply().to_bytes().unwrap(),
+            b"CLIENT_ERROR invalid numeric delta argument\r\n"
+        );
+        assert_eq!(
+            Error::Exptime.reply().to_bytes().unwrap(),
+            b"CLIENT_ERROR invalid exptime argument\r\n"
+        );
         for e in [
             Error::LineTooLong,
             Error::UnknownCommand,
@@ -2672,18 +3279,26 @@ mod tests {
         let mut stream = format!("set k 0 0 {n}\r\n").into_bytes();
         stream.extend(vec![b'x'; n]);
         stream.extend_from_slice(b"\r\nversion\r\n");
-        assert_eq!(commands(&stream), [Err(Error::TooLarge(n)), Ok(Command::Version)]);
+        assert_eq!(
+            commands(&stream),
+            [Err(Error::TooLarge(n)), Ok(Command::Version)]
+        );
         contract::check_decode_with_alloc_limit(Commands::new, &stream, 2 * MAX_LINE);
         contract::check_decode_with_held_limit(Commands::new, &stream, MAX_TEXT_HELD);
         let mut big = format!("VALUE k 0 {n}\r\n").into_bytes();
         big.extend(vec![0; n + 2]);
         big.extend_from_slice(b"END\r\n");
-        assert_eq!(responses(&big), [Err(Error::TooLarge(n)), Ok(Response::End)]);
+        assert_eq!(
+            responses(&big),
+            [Err(Error::TooLarge(n)), Ok(Response::End)]
+        );
         // The largest block that fits is taken.
         let mut fits = format!("ms k {MAX_VALUE}\r\n").into_bytes();
         fits.extend(vec![b'y'; MAX_VALUE]);
         fits.extend_from_slice(b"\r\n");
-        assert!(matches!(&commands(&fits)[..], [Ok(Command::MetaSet { data, .. })] if data.len() == MAX_VALUE));
+        assert!(
+            matches!(&commands(&fits)[..], [Ok(Command::MetaSet { data, .. })] if data.len() == MAX_VALUE)
+        );
     }
 
     #[test]
@@ -2692,15 +3307,27 @@ mod tests {
         assert_eq!(stream.push(&vec![b'a'; MAX_LINE - 1]), MAX_LINE - 1);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(b"a"), 1);
-        assert_eq!(stream.next(), Some(Err(codec::Fail::Protocol(FrameError::LineTooLong))));
+        assert_eq!(
+            stream.next(),
+            Some(Err(codec::Fail::Protocol(FrameError::LineTooLong)))
+        );
         assert_eq!(stream.push(b"version\r\n"), 9);
         assert_eq!(stream.next(), None);
-        assert_eq!(stream.failed(), Some(&codec::Fail::Protocol(FrameError::LineTooLong)));
+        assert_eq!(
+            stream.failed(),
+            Some(&codec::Fail::Protocol(FrameError::LineTooLong))
+        );
         let line = [b"stats ".as_slice(), &vec![b'k'; MAX_LINE - 8], b"\r\n"].concat();
         assert!(commands(&line)[0].is_ok());
         let bare = [line[..line.len() - 2].to_vec(), b"k\n".to_vec()].concat();
-        assert_eq!(decode_all(Commands::new, &bare).1, Some(codec::Fail::Protocol(FrameError::LineTooLong)));
-        assert_eq!(decode_all(Responses::new, &vec![b'1'; MAX_LINE]).1, Some(codec::Fail::Protocol(FrameError::LineTooLong)));
+        assert_eq!(
+            decode_all(Commands::new, &bare).1,
+            Some(codec::Fail::Protocol(FrameError::LineTooLong))
+        );
+        assert_eq!(
+            decode_all(Responses::new, &vec![b'1'; MAX_LINE]).1,
+            Some(codec::Fail::Protocol(FrameError::LineTooLong))
+        );
     }
 
     #[test]
@@ -2720,41 +3347,106 @@ mod tests {
             b"ME\r\n",
             b"CLIENT_ERROR a\rb\r\n",
         ] {
-            assert_eq!(responses(line), [Err(Error::Format)], "{}", String::from_utf8_lossy(line));
+            assert_eq!(
+                responses(line),
+                [Err(Error::Format)],
+                "{}",
+                String::from_utf8_lossy(line)
+            );
         }
         assert_eq!(responses(b"VALUE \x01 0 1\r\n"), [Err(Error::Key)]);
-        assert_eq!(responses(b"BOGUS\r\nhd\r\n\r\n"), [const { Err(Error::UnknownCommand) }; 3]);
+        assert_eq!(
+            responses(b"BOGUS\r\nhd\r\n\r\n"),
+            [const { Err(Error::UnknownCommand) }; 3]
+        );
         assert_eq!(
             responses(b"VA 1\r\nxy\r\nEND\r\n"),
-            [Err(Error::BadDataChunk), Err(Error::UnknownCommand), Ok(Response::End)]
+            [
+                Err(Error::BadDataChunk),
+                Err(Error::UnknownCommand),
+                Ok(Response::End)
+            ]
         );
         // Message text may be empty, and may hold spaces.
-        assert_eq!(responses(b"SERVER_ERROR\r\n"), [Ok(Response::ServerError(vec![]))]);
-        assert_eq!(responses(b"CLIENT_ERROR  two  spaces\r\n"), [Ok(Response::ClientError(b" two  spaces".to_vec()))]);
+        assert_eq!(
+            responses(b"SERVER_ERROR\r\n"),
+            [Ok(Response::ServerError(vec![]))]
+        );
+        assert_eq!(
+            responses(b"CLIENT_ERROR  two  spaces\r\n"),
+            [Ok(Response::ClientError(b" two  spaces".to_vec()))]
+        );
     }
 
     #[test]
     fn writers_refuse_what_readers_refuse() {
-        let bad_key = Command::Get { keys: vec![key("a b")], cas: false };
+        let bad_key = Command::Get {
+            keys: vec![key("a b")],
+            cas: false,
+        };
         assert_eq!(bad_key.to_bytes(), Err(Error::Key));
-        assert_eq!(Command::Delete { key: vec![], noreply: false }.to_bytes(), Err(Error::Key));
         assert_eq!(
-            Command::Touch { key: vec![b'k'; MAX_KEY + 1], exptime: 0, noreply: false }.to_bytes(),
+            Command::Delete {
+                key: vec![],
+                noreply: false
+            }
+            .to_bytes(),
             Err(Error::Key)
         );
-        assert_eq!(Command::Get { keys: vec![], cas: false }.to_bytes(), Err(Error::Format));
-        assert_eq!(Command::Stats { args: vec![vec![]] }.to_bytes(), Err(Error::Format));
         assert_eq!(
-            Command::MetaGet { key: key("k"), flags: vec![MetaFlag::new(b' ', b"")] }.to_bytes(),
+            Command::Touch {
+                key: vec![b'k'; MAX_KEY + 1],
+                exptime: 0,
+                noreply: false
+            }
+            .to_bytes(),
+            Err(Error::Key)
+        );
+        assert_eq!(
+            Command::Get {
+                keys: vec![],
+                cas: false
+            }
+            .to_bytes(),
             Err(Error::Format)
         );
         assert_eq!(
-            Command::MetaGet { key: key("k"), flags: vec![MetaFlag::new(b'v', b"a b")] }.to_bytes(),
+            Command::Stats { args: vec![vec![]] }.to_bytes(),
+            Err(Error::Format)
+        );
+        assert_eq!(
+            Command::MetaGet {
+                key: key("k"),
+                flags: vec![MetaFlag::new(b' ', b"")]
+            }
+            .to_bytes(),
+            Err(Error::Format)
+        );
+        assert_eq!(
+            Command::MetaGet {
+                key: key("k"),
+                flags: vec![MetaFlag::new(b'v', b"a b")]
+            }
+            .to_bytes(),
             Err(Error::Format)
         );
         let flags = vec![MetaFlag::new(b'v', b""); MAX_META_FLAGS + 1];
-        assert_eq!(Command::MetaGet { key: key("k"), flags: flags.clone() }.to_bytes(), Err(Error::Format));
-        assert_eq!(Response::Meta { status: MetaStatus::Header, flags }.to_bytes(), Err(Error::Format));
+        assert_eq!(
+            Command::MetaGet {
+                key: key("k"),
+                flags: flags.clone()
+            }
+            .to_bytes(),
+            Err(Error::Format)
+        );
+        assert_eq!(
+            Response::Meta {
+                status: MetaStatus::Header,
+                flags
+            }
+            .to_bytes(),
+            Err(Error::Format)
+        );
         let big = vec![0; MAX_VALUE + 1];
         let store = Command::Store {
             verb: StoreVerb::Set,
@@ -2765,24 +3457,63 @@ mod tests {
             noreply: false,
         };
         assert_eq!(store.to_bytes(), Err(Error::TooLarge(MAX_VALUE + 1)));
-        assert_eq!(Response::MetaValue { flags: vec![], data: big }.to_bytes(), Err(Error::TooLarge(MAX_VALUE + 1)));
+        assert_eq!(
+            Response::MetaValue {
+                flags: vec![],
+                data: big
+            }
+            .to_bytes(),
+            Err(Error::TooLarge(MAX_VALUE + 1))
+        );
         let keys = vec![key("kkkkkkkk"); MAX_LINE / 9 + 1];
-        assert_eq!(Command::Gat { exptime: 0, keys, cas: false }.to_bytes(), Err(Error::LineTooLong));
-        assert_eq!(Response::ClientError(b"a\nb".to_vec()).to_bytes(), Err(Error::Format));
-        assert_eq!(Response::Version(b"\r".to_vec()).to_bytes(), Err(Error::Format));
-        assert_eq!(Response::Stat { name: key("a b"), value: vec![] }.to_bytes(), Err(Error::Format));
-        assert_eq!(Response::MetaDebug { key: key("k"), info: b"\n".to_vec() }.to_bytes(), Err(Error::Format));
-        assert_eq!(Response::ServerError(vec![b'x'; MAX_LINE]).to_bytes(), Err(Error::LineTooLong));
+        assert_eq!(
+            Command::Gat {
+                exptime: 0,
+                keys,
+                cas: false
+            }
+            .to_bytes(),
+            Err(Error::LineTooLong)
+        );
+        assert_eq!(
+            Response::ClientError(b"a\nb".to_vec()).to_bytes(),
+            Err(Error::Format)
+        );
+        assert_eq!(
+            Response::Version(b"\r".to_vec()).to_bytes(),
+            Err(Error::Format)
+        );
+        assert_eq!(
+            Response::Stat {
+                name: key("a b"),
+                value: vec![]
+            }
+            .to_bytes(),
+            Err(Error::Format)
+        );
+        assert_eq!(
+            Response::MetaDebug {
+                key: key("k"),
+                info: b"\n".to_vec()
+            }
+            .to_bytes(),
+            Err(Error::Format)
+        );
+        assert_eq!(
+            Response::ServerError(vec![b'x'; MAX_LINE]).to_bytes(),
+            Err(Error::LineTooLong)
+        );
     }
 
     // From the binary protocol wiki: a get of "Hello" and its response.
     const GET_REQUEST: [u8; 29] = [
-        0x80, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, b'H', b'e', b'l', b'l', b'o',
+        0x80, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, b'H', b'e', b'l', b'l', b'o',
     ];
     const GET_RESPONSE: [u8; 33] = [
-        0x81, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef, b'W', b'o', b'r', b'l', b'd',
+        0x81, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xde, 0xad, 0xbe, 0xef, b'W', b'o',
+        b'r', b'l', b'd',
     ];
 
     #[test]
@@ -2800,20 +3531,46 @@ mod tests {
         assert_eq!(resp.to_bytes().unwrap(), GET_RESPONSE);
         assert_eq!(Packet::parse(&GET_RESPONSE).unwrap(), resp);
         for n in 0..GET_REQUEST.len() {
-            assert_eq!(Frames::<Packet>::new().decode(&GET_REQUEST[..n], false), Ok(Step::Need), "{n} bytes");
+            assert_eq!(
+                Frames::<Packet>::new().decode(&GET_REQUEST[..n], false),
+                Ok(Step::Need),
+                "{n} bytes"
+            );
         }
     }
 
     #[test]
     fn binary_extras() {
-        let s = StoreExtras { flags: 0xdeadbeef, expiration: 0xe10 };
-        assert_eq!(s.to_bytes().unwrap(), [0xde, 0xad, 0xbe, 0xef, 0, 0, 0x0e, 0x10]);
+        let s = StoreExtras {
+            flags: 0xdeadbeef,
+            expiration: 0xe10,
+        };
+        assert_eq!(
+            s.to_bytes().unwrap(),
+            [0xde, 0xad, 0xbe, 0xef, 0, 0, 0x0e, 0x10]
+        );
         assert_eq!(StoreExtras::parse(&s.to_bytes().unwrap()), Ok(s));
-        assert_eq!(StoreExtras::parse(&[0; 7]), Err(Error::Extras { expected: 8, actual: 7 }));
-        let c = CounterExtras { delta: 1, initial: 0, expiration: 0xe10 };
+        assert_eq!(
+            StoreExtras::parse(&[0; 7]),
+            Err(Error::Extras {
+                expected: 8,
+                actual: 7
+            })
+        );
+        let c = CounterExtras {
+            delta: 1,
+            initial: 0,
+            expiration: 0xe10,
+        };
         assert_eq!(c.to_bytes().unwrap()[7], 1);
         assert_eq!(CounterExtras::parse(&c.to_bytes().unwrap()), Ok(c));
-        assert_eq!(CounterExtras::parse(&[0; 21]), Err(Error::Extras { expected: 20, actual: 21 }));
+        assert_eq!(
+            CounterExtras::parse(&[0; 21]),
+            Err(Error::Extras {
+                expected: 20,
+                actual: 21
+            })
+        );
         for code in 0..=u16::MAX {
             assert_eq!(Status::from_code(code).code(), code);
         }
@@ -2843,9 +3600,12 @@ mod tests {
         assert_eq!(p.to_bytes(), Err(Error::BodyLength(MAX_BODY + 1)));
         p.value = vec![0; MAX_BODY];
         assert!(Packet::parse(&p.to_bytes().unwrap()).is_ok());
-        for e in
-            [Error::Magic(0), Error::KeyLength(1), Error::ExtrasLength(1), Error::BodyLength(1)]
-        {
+        for e in [
+            Error::Magic(0),
+            Error::KeyLength(1),
+            Error::ExtrasLength(1),
+            Error::BodyLength(1),
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -2855,34 +3615,95 @@ mod tests {
         let bytes = [GET_REQUEST.as_slice(), GET_RESPONSE.as_slice()].concat();
         let (packets, failure) = decode_all(Frames::<Packet>::new, &bytes);
         assert_eq!(failure, None);
-        assert_eq!(packets.iter().map(|p| p.magic).collect::<Vec<_>>(), [Magic::Request, Magic::Response]);
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_BINARY_BUFFERED);
+        assert_eq!(
+            packets.iter().map(|p| p.magic).collect::<Vec<_>>(),
+            [Magic::Request, Magic::Response]
+        );
+        contract::check_decode_with_alloc_limit(
+            Frames::<Packet>::new,
+            &bytes,
+            2 * MAX_BINARY_BUFFERED,
+        );
         let mut stream = Stream::new(Frames::<Packet>::new());
         assert_eq!(stream.push(&[0]), 1);
-        assert_eq!(stream.next(), Some(Err(codec::Fail::Protocol(Error::Magic(0)))));
+        assert_eq!(
+            stream.next(),
+            Some(Err(codec::Fail::Protocol(Error::Magic(0))))
+        );
         assert_eq!(stream.push(&GET_REQUEST), GET_REQUEST.len());
         assert!(stream.next().is_none());
-        assert_eq!(stream.failed(), Some(&codec::Fail::Protocol(Error::Magic(0))));
+        assert_eq!(
+            stream.failed(),
+            Some(&codec::Fail::Protocol(Error::Magic(0)))
+        );
     }
 
     #[test]
     fn udp_frames() {
         let f = UdpFrame::parse(b"\x00\x07\x00\x00\x00\x01\x00\x00get a\r\n").unwrap();
-        assert_eq!(f, UdpFrame { request_id: 7, sequence: 0, total: 1, payload: b"get a\r\n".to_vec() });
-        assert_eq!(f.to_bytes().unwrap(), b"\x00\x07\x00\x00\x00\x01\x00\x00get a\r\n");
+        assert_eq!(
+            f,
+            UdpFrame {
+                request_id: 7,
+                sequence: 0,
+                total: 1,
+                payload: b"get a\r\n".to_vec()
+            }
+        );
+        assert_eq!(
+            f.to_bytes().unwrap(),
+            b"\x00\x07\x00\x00\x00\x01\x00\x00get a\r\n"
+        );
         for n in 0..UDP_HEADER_LEN {
             assert_eq!(UdpFrame::parse(&[0; 8][..n]), Err(Error::Short(n)));
         }
-        assert_eq!(UdpFrame::parse(&[0, 0, 0, 0, 0, 1, 0, 1]), Err(Error::Reserved(1)));
-        assert_eq!(UdpFrame::parse(&[0, 0, 0, 1, 0, 1, 0, 0]), Err(Error::Sequence { sequence: 1, total: 1 }));
-        assert_eq!(UdpFrame::parse(&[0; 8]), Err(Error::Sequence { sequence: 0, total: 0 }));
+        assert_eq!(
+            UdpFrame::parse(&[0, 0, 0, 0, 0, 1, 0, 1]),
+            Err(Error::Reserved(1))
+        );
+        assert_eq!(
+            UdpFrame::parse(&[0, 0, 0, 1, 0, 1, 0, 0]),
+            Err(Error::Sequence {
+                sequence: 1,
+                total: 1
+            })
+        );
+        assert_eq!(
+            UdpFrame::parse(&[0; 8]),
+            Err(Error::Sequence {
+                sequence: 0,
+                total: 0
+            })
+        );
         let mut long = vec![0, 0, 0, 0, 0, 1, 0, 0];
         long.extend(vec![0; MAX_UDP_PAYLOAD + 1]);
-        assert_eq!(UdpFrame::parse(&long), Err(Error::PayloadTooLong(MAX_UDP_PAYLOAD + 1)));
-        let bad = UdpFrame { request_id: 0, sequence: 2, total: 2, payload: vec![] };
-        assert_eq!(bad.to_bytes(), Err(Error::Sequence { sequence: 2, total: 2 }));
-        let bad = UdpFrame { request_id: 0, sequence: 0, total: 1, payload: vec![0; MAX_UDP_PAYLOAD + 1] };
-        assert_eq!(bad.to_bytes(), Err(Error::PayloadTooLong(MAX_UDP_PAYLOAD + 1)));
+        assert_eq!(
+            UdpFrame::parse(&long),
+            Err(Error::PayloadTooLong(MAX_UDP_PAYLOAD + 1))
+        );
+        let bad = UdpFrame {
+            request_id: 0,
+            sequence: 2,
+            total: 2,
+            payload: vec![],
+        };
+        assert_eq!(
+            bad.to_bytes(),
+            Err(Error::Sequence {
+                sequence: 2,
+                total: 2
+            })
+        );
+        let bad = UdpFrame {
+            request_id: 0,
+            sequence: 0,
+            total: 1,
+            payload: vec![0; MAX_UDP_PAYLOAD + 1],
+        };
+        assert_eq!(
+            bad.to_bytes(),
+            Err(Error::PayloadTooLong(MAX_UDP_PAYLOAD + 1))
+        );
         // A reply split and put back together.
         let message: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
         let frames = UdpFrame::split(9, &message).unwrap();
@@ -2900,7 +3721,10 @@ mod tests {
         for e in [
             Error::Short(1),
             Error::Reserved(1),
-            Error::Sequence { sequence: 1, total: 0 },
+            Error::Sequence {
+                sequence: 1,
+                total: 0,
+            },
             Error::PayloadTooLong(1),
         ] {
             assert!(!e.to_string().is_empty());
@@ -2942,7 +3766,10 @@ mod tests {
 
     #[test]
     fn fuzz_text_decoders() {
-        let mut pieces: Vec<Vec<u8>> = sample_commands().iter().map(|c| c.to_bytes().unwrap()).collect();
+        let mut pieces: Vec<Vec<u8>> = sample_commands()
+            .iter()
+            .map(|c| c.to_bytes().unwrap())
+            .collect();
         pieces.extend(sample_responses().iter().map(|r| r.to_bytes().unwrap()));
         pieces.push(b"set k 0 0 99999999\r\n".to_vec());
         pieces.push(b"\r\n".to_vec());
@@ -2956,12 +3783,18 @@ mod tests {
             for command in commands(&bytes).iter().flatten() {
                 contract::check_wire_value(command);
                 let bytes = command.to_bytes().unwrap();
-                assert_eq!(decode_all(Commands::new, &bytes), (vec![Ok(command.clone())], None));
+                assert_eq!(
+                    decode_all(Commands::new, &bytes),
+                    (vec![Ok(command.clone())], None)
+                );
             }
             for response in responses(&bytes).iter().flatten() {
                 contract::check_wire_value(response);
                 let bytes = response.to_bytes().unwrap();
-                assert_eq!(decode_all(Responses::new, &bytes), (vec![Ok(response.clone())], None));
+                assert_eq!(
+                    decode_all(Responses::new, &bytes),
+                    (vec![Ok(response.clone())], None)
+                );
             }
         }
     }
@@ -2970,14 +3803,27 @@ mod tests {
     fn fuzz_binary_and_udp() {
         let mut set = Packet::parse(&GET_REQUEST).unwrap();
         set.opcode = opcode::SET;
-        set.extras = StoreExtras { flags: 1, expiration: 2 }.to_bytes().unwrap();
+        set.extras = StoreExtras {
+            flags: 1,
+            expiration: 2,
+        }
+        .to_bytes()
+        .unwrap();
         set.value = b"value".to_vec();
-        let pieces = vec![GET_REQUEST.to_vec(), GET_RESPONSE.to_vec(), set.to_bytes().unwrap(),
-            b"\x00\x01\x00\x00\x00\x01\x00\x00x".to_vec()];
+        let pieces = vec![
+            GET_REQUEST.to_vec(),
+            GET_RESPONSE.to_vec(),
+            set.to_bytes().unwrap(),
+            b"\x00\x01\x00\x00\x00\x01\x00\x00x".to_vec(),
+        ];
         let mut rng = Lcg::new(2);
         for _ in 0..4000 {
             let bytes = fuzz_buffer(&mut rng, &pieces);
-            contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_BINARY_BUFFERED);
+            contract::check_decode_with_alloc_limit(
+                Frames::<Packet>::new,
+                &bytes,
+                2 * MAX_BINARY_BUFFERED,
+            );
             contract::check_wire::<Packet>(&bytes);
             contract::check_wire::<UdpFrame>(&bytes);
             contract::check_wire::<StoreExtras>(&bytes);
@@ -3002,12 +3848,23 @@ mod tests {
         assert_eq!(stream.push(&bytes), MAX_LINE);
         assert_eq!(stream.push(&bytes), 0);
         assert_eq!(commands(&bytes).len(), MAX_LINE);
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &[0; 4096], 2 * MAX_BINARY_BUFFERED);
+        contract::check_decode_with_alloc_limit(
+            Frames::<Packet>::new,
+            &[0; 4096],
+            2 * MAX_BINARY_BUFFERED,
+        );
         let mut packet = Packet::parse(&GET_REQUEST).unwrap();
         packet.value = vec![0; MAX_BODY - packet.key.len()];
         let bytes = packet.to_bytes().unwrap();
-        assert_eq!(decode_all(Frames::<Packet>::new, &bytes), (vec![packet], None));
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_BINARY_BUFFERED);
+        assert_eq!(
+            decode_all(Frames::<Packet>::new, &bytes),
+            (vec![packet], None)
+        );
+        contract::check_decode_with_alloc_limit(
+            Frames::<Packet>::new,
+            &bytes,
+            2 * MAX_BINARY_BUFFERED,
+        );
     }
 
     /// The loop of the module's example: replies for every command, until
@@ -3061,27 +3918,79 @@ mod tests {
         assert!(line.buf.capacity() < MAX_LINE, "{}", line.buf.capacity());
         assert_eq!(line.buf, b"SERVER_ERROR");
         // The same through the public writers.
-        assert_eq!(Response::ServerError(big.clone()).to_bytes(), Err(Error::LineTooLong));
-        assert_eq!(Command::Stats { args: vec![big.clone()] }.to_bytes(), Err(Error::LineTooLong));
-        assert_eq!(Response::Stat { name: key("a"), value: big.clone() }.to_bytes(), Err(Error::LineTooLong));
+        assert_eq!(
+            Response::ServerError(big.clone()).to_bytes(),
+            Err(Error::LineTooLong)
+        );
+        assert_eq!(
+            Command::Stats {
+                args: vec![big.clone()]
+            }
+            .to_bytes(),
+            Err(Error::LineTooLong)
+        );
+        assert_eq!(
+            Response::Stat {
+                name: key("a"),
+                value: big.clone()
+            }
+            .to_bytes(),
+            Err(Error::LineTooLong)
+        );
         let flags = vec![MetaFlag::new(b'O', &big)];
-        assert_eq!(Response::Meta { status: MetaStatus::Header, flags }.to_bytes(), Err(Error::LineTooLong));
+        assert_eq!(
+            Response::Meta {
+                status: MetaStatus::Header,
+                flags
+            }
+            .to_bytes(),
+            Err(Error::LineTooLong)
+        );
         // A line that just fits is written.
         let fits = vec![b'x'; MAX_LINE - 2 - b"SERVER_ERROR ".len()];
-        assert_eq!(Response::ServerError(fits).to_bytes().unwrap().len(), MAX_LINE);
+        assert_eq!(
+            Response::ServerError(fits).to_bytes().unwrap().len(),
+            MAX_LINE
+        );
     }
 
     #[test]
     fn sasl_status_codes_are_memcacheds() {
         // A SASL auth response asking for another step, as memcached sends it.
         let continue_auth = [
-            0x81, opcode::SASL_AUTH, 0, 0, 0, 0, 0x00, 0x21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0x81,
+            opcode::SASL_AUTH,
+            0,
+            0,
+            0,
+            0,
+            0x00,
+            0x21,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         ];
         let p = Packet::parse(&continue_auth).unwrap();
         assert_eq!(Status::from_code(p.status), Status::AuthContinue);
         assert_eq!(Status::from_code(0x20), Status::AuthError);
         assert_eq!(Status::AuthError.code(), 0x20);
-        assert_eq!(p.reply(Status::AuthError).to_bytes().unwrap()[6..8], [0x00, 0x20]);
+        assert_eq!(
+            p.reply(Status::AuthError).to_bytes().unwrap()[6..8],
+            [0x00, 0x20]
+        );
         assert_eq!(Status::from_code(0x08), Status::Other(0x08));
         assert_eq!(Status::from_code(0x09), Status::Other(0x09));
     }
@@ -3109,11 +4018,22 @@ mod tests {
             b"mg ==== b\r\n",
             b"mg A=== b\r\n",
         ] {
-            assert_eq!(commands(line), [Err(Error::Format)], "{}", String::from_utf8_lossy(line));
+            assert_eq!(
+                commands(line),
+                [Err(Error::Format)],
+                "{}",
+                String::from_utf8_lossy(line)
+            );
         }
         // ms drops its block after a bad flag.
-        assert_eq!(commands(b"ms k 1 MZ\r\nx\r\nmn\r\n"), [Err(Error::Format), Ok(Command::MetaNoop)]);
-        assert_eq!(commands(b"ms k 1 T1 T2\r\nx\r\nmn\r\n"), [Err(Error::Format), Ok(Command::MetaNoop)]);
+        assert_eq!(
+            commands(b"ms k 1 MZ\r\nx\r\nmn\r\n"),
+            [Err(Error::Format), Ok(Command::MetaNoop)]
+        );
+        assert_eq!(
+            commands(b"ms k 1 T1 T2\r\nx\r\nmn\r\n"),
+            [Err(Error::Format), Ok(Command::MetaNoop)]
+        );
         // What memcached takes.
         for line in [
             &b"mg k v T-1 N30 R5\r\n"[..],
@@ -3126,7 +4046,11 @@ mod tests {
             b"mg Zg== b\r\n",
             b"me k Z Z\r\n",
         ] {
-            assert!(matches!(&commands(line)[..], [Ok(_)]), "{}", String::from_utf8_lossy(line));
+            assert!(
+                matches!(&commands(line)[..], [Ok(_)]),
+                "{}",
+                String::from_utf8_lossy(line)
+            );
         }
         // Writers refuse the same.
         let f = |flag, token: &str| MetaFlag::new(flag, token.as_bytes());
@@ -3139,12 +4063,22 @@ mod tests {
             ("mg", vec![f(b'b', "")]),
         ] {
             let c = match verb {
-                "mg" => Command::MetaGet { key: key("k"), flags },
-                _ => Command::MetaArithmetic { key: key("k"), flags },
+                "mg" => Command::MetaGet {
+                    key: key("k"),
+                    flags,
+                },
+                _ => Command::MetaArithmetic {
+                    key: key("k"),
+                    flags,
+                },
             };
             assert_eq!(c.to_bytes(), Err(Error::Format), "{c:?}");
         }
-        let ms = Command::MetaSet { key: key("k"), flags: vec![f(b'M', "Z")], data: b"x".to_vec() };
+        let ms = Command::MetaSet {
+            key: key("k"),
+            flags: vec![f(b'M', "Z")],
+            data: b"x".to_vec(),
+        };
         assert_eq!(ms.to_bytes(), Err(Error::Format));
     }
 
@@ -3158,7 +4092,11 @@ mod tests {
                 let n = d.push(rest);
                 rest = &rest[n..];
                 while let Some(r) = d.next() {
-                    out.push(r.unwrap().map(|_| ()).map_err(|e| (e, d.decoder().quiet_error())));
+                    out.push(
+                        r.unwrap()
+                            .map(|_| ())
+                            .map_err(|e| (e, d.decoder().quiet_error())),
+                    );
                 }
             }
             out
@@ -3168,41 +4106,91 @@ mod tests {
         big.extend(vec![b'x'; n]);
         big.extend_from_slice(b"\r\nmn\r\n");
         assert_eq!(errors(&big), [Err((Error::TooLarge(n), true)), Ok(())]);
-        assert_eq!(errors(b"set k 0 0 1 noreply\r\nxy\r\n")[0], Err((Error::BadDataChunk, true)));
-        assert_eq!(errors(b"cas k 0 0 1 1 noreply\r\nxy\r\n")[0], Err((Error::BadDataChunk, true)));
-        assert_eq!(errors(b"set k x 0 1 noreply\r\n"), [Err((Error::Format, true))]);
+        assert_eq!(
+            errors(b"set k 0 0 1 noreply\r\nxy\r\n")[0],
+            Err((Error::BadDataChunk, true))
+        );
+        assert_eq!(
+            errors(b"cas k 0 0 1 1 noreply\r\nxy\r\n")[0],
+            Err((Error::BadDataChunk, true))
+        );
+        assert_eq!(
+            errors(b"set k x 0 1 noreply\r\n"),
+            [Err((Error::Format, true))]
+        );
         assert_eq!(errors(b"incr k x noreply\r\n"), [Err((Error::Delta, true))]);
-        assert_eq!(errors(b"touch k x noreply\r\n"), [Err((Error::Exptime, true))]);
-        assert_eq!(errors(b"delete k 5 noreply\r\n"), [Err((Error::Format, true))]);
-        assert_eq!(errors(b"flush_all x noreply\r\n"), [Err((Error::Format, true))]);
+        assert_eq!(
+            errors(b"touch k x noreply\r\n"),
+            [Err((Error::Exptime, true))]
+        );
+        assert_eq!(
+            errors(b"delete k 5 noreply\r\n"),
+            [Err((Error::Format, true))]
+        );
+        assert_eq!(
+            errors(b"flush_all x noreply\r\n"),
+            [Err((Error::Format, true))]
+        );
         // Without noreply, a word count memcached answers with ERROR, a
         // word other than noreply, and every meta error are not quiet.
-        assert_eq!(errors(b"set k 0 0 1\r\nxy\r\n")[0], Err((Error::BadDataChunk, false)));
-        assert_eq!(errors(b"set k x 0 1 nope\r\n"), [Err((Error::Format, false))]);
-        assert_eq!(errors(b"set k 0 noreply\r\n"), [Err((Error::UnknownCommand, false))]);
-        assert_eq!(errors(b"ms k 1 q\r\nxy\r\n")[0], Err((Error::BadDataChunk, false)));
+        assert_eq!(
+            errors(b"set k 0 0 1\r\nxy\r\n")[0],
+            Err((Error::BadDataChunk, false))
+        );
+        assert_eq!(
+            errors(b"set k x 0 1 nope\r\n"),
+            [Err((Error::Format, false))]
+        );
+        assert_eq!(
+            errors(b"set k 0 noreply\r\n"),
+            [Err((Error::UnknownCommand, false))]
+        );
+        assert_eq!(
+            errors(b"ms k 1 q\r\nxy\r\n")[0],
+            Err((Error::BadDataChunk, false))
+        );
         assert_eq!(errors(b"mg k q v v\r\n"), [Err((Error::Format, false))]);
         // A command after a quiet error is not quiet.
         let mut d = Stream::new(Commands::new());
-        assert_eq!(d.push(b"incr k x noreply\r\nmn\r\n"), b"incr k x noreply\r\nmn\r\n".len());
+        assert_eq!(
+            d.push(b"incr k x noreply\r\nmn\r\n"),
+            b"incr k x noreply\r\nmn\r\n".len()
+        );
         assert!(d.next().unwrap().unwrap().is_err() && d.decoder().quiet_error());
         assert!(d.next().unwrap().unwrap().is_ok() && !d.decoder().quiet_error());
     }
 
     #[test]
     fn a_bad_value_line_drops_its_block() {
-        assert_eq!(responses(b"VALUE k 0 8 nope\r\nSTORED\r\n\r\nEND\r\n"), [Err(Error::Format), Ok(Response::End)]);
-        assert_eq!(responses(b"VALUE k x 3\r\nEND\r\nEND\r\n"), [Err(Error::Format), Ok(Response::End)]);
-        assert_eq!(responses(b"VALUE \x01 0 3\r\nEND\r\nEND\r\n"), [Err(Error::Key), Ok(Response::End)]);
-        assert_eq!(responses(b"VA 3 \x01\r\nEND\r\nEND\r\n"), [Err(Error::Format), Ok(Response::End)]);
+        assert_eq!(
+            responses(b"VALUE k 0 8 nope\r\nSTORED\r\n\r\nEND\r\n"),
+            [Err(Error::Format), Ok(Response::End)]
+        );
+        assert_eq!(
+            responses(b"VALUE k x 3\r\nEND\r\nEND\r\n"),
+            [Err(Error::Format), Ok(Response::End)]
+        );
+        assert_eq!(
+            responses(b"VALUE \x01 0 3\r\nEND\r\nEND\r\n"),
+            [Err(Error::Key), Ok(Response::End)]
+        );
+        assert_eq!(
+            responses(b"VA 3 \x01\r\nEND\r\nEND\r\n"),
+            [Err(Error::Format), Ok(Response::End)]
+        );
         contract::check_decode_with_alloc_limit(
-            Responses::new, b"VALUE k 0 8 nope\r\nSTORED\r\n\r\nEND\r\n", 2 * MAX_LINE,
+            Responses::new,
+            b"VALUE k 0 8 nope\r\nSTORED\r\n\r\nEND\r\n",
+            2 * MAX_LINE,
         );
     }
 
     #[test]
     fn a_decremented_number_may_be_padded() {
-        assert_eq!(responses(b"12 \r\n9   \r\n"), [Ok(Response::Number(12)), Ok(Response::Number(9))]);
+        assert_eq!(
+            responses(b"12 \r\n9   \r\n"),
+            [Ok(Response::Number(12)), Ok(Response::Number(9))]
+        );
         assert_eq!(responses(b"12 x\r\n"), [Err(Error::Format)]);
         assert_eq!(responses(b"12  3\r\n"), [Err(Error::Format)]);
     }
@@ -3212,14 +4200,22 @@ mod tests {
         assert_eq!(responses(b"RESET\r\n"), [Ok(Response::Reset)]);
         assert_eq!(Response::Reset.to_bytes().unwrap(), b"RESET\r\n");
         assert_eq!(responses(b"RESET now\r\n"), [Err(Error::Format)]);
-        assert_eq!(one(b"stats reset\r\n"), Command::Stats { args: vec![key("reset")] });
+        assert_eq!(
+            one(b"stats reset\r\n"),
+            Command::Stats {
+                args: vec![key("reset")]
+            }
+        );
     }
 
     #[test]
     fn long_multigets_are_taken() {
         // 33 keys of the longest length: over MAX_LINE.
         let keys: Vec<Vec<u8>> = (0..33u8).map(|i| vec![b'a' + i % 26; MAX_KEY]).collect();
-        let get = Command::Get { keys: keys.clone(), cas: false };
+        let get = Command::Get {
+            keys: keys.clone(),
+            cas: false,
+        };
         let bytes = get.to_bytes().unwrap();
         assert!(bytes.len() > MAX_LINE);
         assert_eq!(one(&bytes), get);
@@ -3233,20 +4229,39 @@ mod tests {
         // than 100 spaces, and one past MAX_GET_LINE.
         let mut far = format!("{}get", " ".repeat(101)).into_bytes();
         far.extend_from_slice(&bytes[3..]);
-        assert_eq!(decode_all(Commands::new, &far).1, Some(codec::Fail::Protocol(FrameError::LineTooLong)));
+        assert_eq!(
+            decode_all(Commands::new, &far).1,
+            Some(codec::Fail::Protocol(FrameError::LineTooLong))
+        );
         let mut gat = b"gat 0".to_vec();
         gat.extend_from_slice(&bytes[3..]);
-        assert_eq!(decode_all(Commands::new, &gat).1, Some(codec::Fail::Protocol(FrameError::LineTooLong)));
+        assert_eq!(
+            decode_all(Commands::new, &gat).1,
+            Some(codec::Fail::Protocol(FrameError::LineTooLong))
+        );
         let huge = vec![vec![b'k'; MAX_KEY]; MAX_GET_LINE / MAX_KEY];
-        assert_eq!(Command::Get { keys: huge.clone(), cas: false }.to_bytes(), Err(Error::LineTooLong));
+        assert_eq!(
+            Command::Get {
+                keys: huge.clone(),
+                cas: false
+            }
+            .to_bytes(),
+            Err(Error::LineTooLong)
+        );
         let mut line = b"get".to_vec();
         for k in &huge {
             line.push(b' ');
             line.extend_from_slice(k);
         }
         line.extend_from_slice(b"\r\n");
-        assert_eq!(decode_all(Commands::new, &line).1, Some(codec::Fail::Protocol(FrameError::LineTooLong)));
+        assert_eq!(
+            decode_all(Commands::new, &line).1,
+            Some(codec::Fail::Protocol(FrameError::LineTooLong))
+        );
         // Replies are held to MAX_LINE.
-        assert_eq!(decode_all(Responses::new, &bytes).1, Some(codec::Fail::Protocol(FrameError::LineTooLong)));
+        assert_eq!(
+            decode_all(Responses::new, &bytes).1,
+            Some(codec::Fail::Protocol(FrameError::LineTooLong))
+        );
     }
 }

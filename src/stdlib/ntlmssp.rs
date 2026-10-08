@@ -89,7 +89,7 @@
 //! assert_eq!(v2.client.challenge, [9; 8]);
 //! ```
 
-use fictionet::stdlib::codec::{le16, le32, Wire};
+use fictionet::stdlib::codec::{Wire, le16, le32};
 
 /// The 8 bytes every NTLMSSP message starts with.
 pub const SIGNATURE: [u8; 8] = *b"NTLMSSP\0";
@@ -225,7 +225,12 @@ pub struct Version {
 impl Version {
     /// Reads a version from its 8 bytes.
     pub fn from_bytes(b: [u8; VERSION_LEN]) -> Version {
-        Version { major: b[0], minor: b[1], build: u16::from_le_bytes([b[2], b[3]]), revision: b[7] }
+        Version {
+            major: b[0],
+            minor: b[1],
+            build: u16::from_le_bytes([b[2], b[3]]),
+            revision: b[7],
+        }
     }
 }
 
@@ -281,18 +286,30 @@ impl std::fmt::Display for Error {
         match self {
             Error::Unicode => f.write_str("invalid UTF-16LE name"),
             Error::Trailing => f.write_str("bytes after the payload"),
-            Error::TooLong => write!(f, "longer than {MAX_MESSAGE} bytes, or a response longer than {MAX_FIELD}"),
+            Error::TooLong => write!(
+                f,
+                "longer than {MAX_MESSAGE} bytes, or a response longer than {MAX_FIELD}"
+            ),
             Error::Truncated => f.write_str("too short for its fixed fields"),
             Error::Signature => f.write_str("does not start with NTLMSSP\\0"),
             Error::MessageType(t) => write!(f, "message type {t} where another was expected"),
             Error::Field(name) => write!(f, "the {name} field lies outside the message payload"),
-            Error::AvPairs => f.write_str("an AV pair list that runs past its end or has no end marker"),
+            Error::AvPairs => {
+                f.write_str("an AV pair list that runs past its end or has no end marker")
+            }
             Error::AvEolLength(n) => write!(f, "an AV pair end marker of length {n}, not 0"),
             Error::TooManyAvPairs => write!(f, "more than {MAX_AV_PAIRS} AV pairs"),
             Error::ResponseLength(n) => write!(f, "a response of {n} bytes, which no layout has"),
-            Error::AvValue(id) => write!(f, "an AV pair with ID {id} whose value has the wrong length"),
-            Error::OddUnicode(name) => write!(f, "the Unicode {name} field has an odd offset or length"),
-            Error::ResponseVersion(a, b) => write!(f, "an NTLMv2 response of versions {a} and {b}, not 1 and 1"),
+            Error::AvValue(id) => write!(
+                f,
+                "an AV pair with ID {id} whose value has the wrong length"
+            ),
+            Error::OddUnicode(name) => {
+                write!(f, "the Unicode {name} field has an odd offset or length")
+            }
+            Error::ResponseVersion(a, b) => {
+                write!(f, "an NTLMv2 response of versions {a} and {b}, not 1 and 1")
+            }
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
@@ -321,7 +338,9 @@ fn av_value_fits(id: u16, value: &[u8]) -> bool {
         av_id::FLAGS => value.len() == 4,
         av_id::TIMESTAMP => value.len() == 8,
         av_id::CHANNEL_BINDINGS => value.len() == 16,
-        av_id::NB_COMPUTER_NAME..=av_id::DNS_TREE_NAME | av_id::TARGET_NAME => value.len().is_multiple_of(2),
+        av_id::NB_COMPUTER_NAME..=av_id::DNS_TREE_NAME | av_id::TARGET_NAME => {
+            value.len().is_multiple_of(2)
+        }
         _ => true,
     }
 }
@@ -414,7 +433,12 @@ pub enum Message {
 /// Checks the signature and the message type, and that `b` holds `fixed`
 /// bytes. It returns the flags at `flags_at` and where the payload may
 /// start, past the version if the flags say there is one.
-fn header(b: &[u8], kind: u32, fixed: usize, flags_at: usize) -> Result<(u32, Option<Version>, usize), Error> {
+fn header(
+    b: &[u8],
+    kind: u32,
+    fixed: usize,
+    flags_at: usize,
+) -> Result<(u32, Option<Version>, usize), Error> {
     if b.len() > MAX_MESSAGE {
         return Err(Error::TooLong);
     }
@@ -447,7 +471,11 @@ fn header(b: &[u8], kind: u32, fixed: usize, flags_at: usize) -> Result<(u32, Op
 
 /// Where the payload field described at `at` starts, if it is not empty.
 fn field_offset(b: &[u8], at: usize) -> Option<usize> {
-    if le16(b, at)? != 0 { Some(le32(b, at + 4)? as usize) } else { None }
+    if le16(b, at)? != 0 {
+        Some(le32(b, at + 4)? as usize)
+    } else {
+        None
+    }
 }
 
 /// The payload field described at `at`: a length, a maximum length (not
@@ -463,15 +491,27 @@ fn field(b: &[u8], at: usize, start: usize, name: &'static str) -> Result<Vec<u8
         return Err(Error::Field(name));
     }
     let end = offset.checked_add(len).ok_or(Error::Field(name))?;
-    b.get(offset..end).map(<[u8]>::to_vec).ok_or(Error::Field(name))
+    b.get(offset..end)
+        .map(<[u8]>::to_vec)
+        .ok_or(Error::Field(name))
 }
 
 /// The payload field described at `at`, read as [`field`] reads it. When
 /// `unicode` is true it is a UTF-16LE string, and a string that is not
 /// empty must have an even offset and an even length.
-fn text_field(b: &[u8], at: usize, start: usize, name: &'static str, unicode: bool) -> Result<Vec<u8>, Error> {
+fn text_field(
+    b: &[u8],
+    at: usize,
+    start: usize,
+    name: &'static str,
+    unicode: bool,
+) -> Result<Vec<u8>, Error> {
     let v = field(b, at, start, name)?;
-    if unicode && !v.is_empty() && (!v.len().is_multiple_of(2) || !le32(b, at + 4).ok_or(Error::Truncated)?.is_multiple_of(2)) {
+    if unicode
+        && !v.is_empty()
+        && (!v.len().is_multiple_of(2)
+            || !le32(b, at + 4).ok_or(Error::Truncated)?.is_multiple_of(2))
+    {
         return Err(Error::OddUnicode(name));
     }
     Ok(v)
@@ -579,7 +619,13 @@ fn check_written(fixed: usize, fields: &[&[u8]]) -> Result<(), Error> {
 
 /// The first bytes of a message: signature and type, then zeros up to
 /// `fixed`, the flags at `flags_at`, and the version if there is one.
-fn start(kind: u32, fixed: usize, flags_at: usize, flags: u32, version: Option<Version>) -> Vec<u8> {
+fn start(
+    kind: u32,
+    fixed: usize,
+    flags_at: usize,
+    flags: u32,
+    version: Option<Version>,
+) -> Vec<u8> {
     let mut out = vec![0u8; fixed];
     out[..8].copy_from_slice(&SIGNATURE);
     out[8..12].copy_from_slice(&kind.to_le_bytes());
@@ -604,8 +650,14 @@ impl Challenge {
 }
 
 /// Where each AUTHENTICATE payload field is described, and its name.
-const AUTH_FIELDS: [(usize, &str); 6] =
-    [(12, "LM response"), (20, "NT response"), (28, "domain"), (36, "user"), (44, "workstation"), (52, "session key")];
+const AUTH_FIELDS: [(usize, &str); 6] = [
+    (12, "LM response"),
+    (20, "NT response"),
+    (28, "domain"),
+    (36, "user"),
+    (44, "workstation"),
+    (52, "session key"),
+];
 
 impl Authenticate {
     /// The NT response, read with [`NtResponse::parse`].
@@ -640,7 +692,14 @@ impl Authenticate {
 
     /// The six payload fields, in the order the message describes them.
     fn fields(&self) -> [&[u8]; 6] {
-        [&self.lm_response, &self.nt_response, &self.domain, &self.user, &self.workstation, &self.session_key]
+        [
+            &self.lm_response,
+            &self.nt_response,
+            &self.domain,
+            &self.user,
+            &self.workstation,
+            &self.session_key,
+        ]
     }
 }
 
@@ -736,11 +795,18 @@ impl Wire for UnicodeName {
 
     /// Appends UTF-16LE. Refuses names above [`MAX_FIELD`] bytes.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        let len = self.0.encode_utf16().count().checked_mul(2).ok_or(Error::Unwritable)?;
+        let len = self
+            .0
+            .encode_utf16()
+            .count()
+            .checked_mul(2)
+            .ok_or(Error::Unwritable)?;
         if len > MAX_FIELD {
             return Err(Error::Unwritable);
         }
-        for unit in self.0.encode_utf16() { dst.extend_from_slice(&unit.to_le_bytes()); }
+        for unit in self.0.encode_utf16() {
+            dst.extend_from_slice(&unit.to_le_bytes());
+        }
         Ok(())
     }
 }
@@ -750,8 +816,14 @@ fn decode_utf16le(b: &[u8]) -> Option<String> {
     if !b.len().is_multiple_of(2) {
         return None;
     }
-    let units = b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]]));
-    char::decode_utf16(units).collect::<Result<String, _>>().ok()
+    let units = b
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes([c[0], c[1]]));
+    char::decode_utf16(units)
+        .collect::<Result<String, _>>()
+        .ok()
 }
 
 /// The original AUTHENTICATE layout with its MIC field set to zero.
@@ -827,7 +899,10 @@ impl AvPairs {
             if !av_value_fits(id, value) {
                 return Err(Error::AvValue(id));
             }
-            pairs.push(AvPair { id, value: value.to_vec() });
+            pairs.push(AvPair {
+                id,
+                value: value.to_vec(),
+            });
             at = end;
         }
     }
@@ -901,7 +976,10 @@ impl Wire for Negotiate {
         let (flags, version, start) = header(b, message_type::NEGOTIATE, NEGOTIATE_HEADER_LEN, 12)?;
         let n = Negotiate {
             flags,
-            domain: optional(flags & flags::NEGOTIATE_OEM_DOMAIN_SUPPLIED != 0, field(b, 16, start, "domain"))?,
+            domain: optional(
+                flags & flags::NEGOTIATE_OEM_DOMAIN_SUPPLIED != 0,
+                field(b, 16, start, "domain"),
+            )?,
             workstation: optional(
                 flags & flags::NEGOTIATE_OEM_WORKSTATION_SUPPLIED != 0,
                 field(b, 24, start, "workstation"),
@@ -917,7 +995,13 @@ impl Wire for Negotiate {
     /// flags and version. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         check_version(self.flags, self.version)?;
-        let mut out = start(message_type::NEGOTIATE, NEGOTIATE_HEADER_LEN, 12, self.flags, self.version);
+        let mut out = start(
+            message_type::NEGOTIATE,
+            NEGOTIATE_HEADER_LEN,
+            12,
+            self.flags,
+            self.version,
+        );
         put_fields(&mut out, &[(16, &self.domain), (24, &self.workstation)])?;
         dst.extend_from_slice(&out);
         Ok(())
@@ -941,7 +1025,8 @@ impl Wire for Challenge {
         let unicode = flags & flags::NEGOTIATE_UNICODE != 0;
         let mut server_challenge = [0u8; 8];
         server_challenge.copy_from_slice(&b[24..32]);
-        let info = field(b, 40, start, "target info").and_then(|t| check_target_info(&t).map(|()| t));
+        let info =
+            field(b, 40, start, "target info").and_then(|t| check_target_info(&t).map(|()| t));
         let c = Challenge {
             flags,
             target_name: optional(
@@ -969,7 +1054,13 @@ impl Wire for Challenge {
         if self.target_info.len() <= MAX_FIELD && check_target_info(&self.target_info).is_err() {
             return Err(Error::Unwritable);
         }
-        let mut out = start(message_type::CHALLENGE, CHALLENGE_HEADER_LEN, 20, self.flags, self.version);
+        let mut out = start(
+            message_type::CHALLENGE,
+            CHALLENGE_HEADER_LEN,
+            20,
+            self.flags,
+            self.version,
+        );
         out[24..32].copy_from_slice(&self.server_challenge);
         put_fields(
             &mut out,
@@ -998,7 +1089,8 @@ impl Wire for Authenticate {
     /// an empty key and does not move where the payload starts.
     /// Refuses malformed or trailing input.
     fn parse(b: &[u8]) -> Result<Authenticate, Error> {
-        let (flags, version, mut start) = header(b, message_type::AUTHENTICATE, AUTHENTICATE_HEADER_LEN, 60)?;
+        let (flags, version, mut start) =
+            header(b, message_type::AUTHENTICATE, AUTHENTICATE_HEADER_LEN, 60)?;
         let unicode = flags & flags::NEGOTIATE_UNICODE != 0;
         let key_exch = flags & flags::NEGOTIATE_KEY_EXCH != 0;
         let [lm, nt, domain, user, workstation, key] = AUTH_FIELDS;
@@ -1044,7 +1136,13 @@ impl Wire for Authenticate {
         if self.nt_response.len() <= MAX_FIELD && NtResponse::parse(&self.nt_response).is_err() {
             return Err(Error::Unwritable);
         }
-        let mut out = start(message_type::AUTHENTICATE, AUTHENTICATE_HEADER_LEN, 60, self.flags, self.version);
+        let mut out = start(
+            message_type::AUTHENTICATE,
+            AUTHENTICATE_HEADER_LEN,
+            60,
+            self.flags,
+            self.version,
+        );
         if let Some(m) = self.mic {
             out.resize(MIC_END - MIC_LEN, 0);
             out.extend_from_slice(&m);
@@ -1110,7 +1208,10 @@ impl Wire for LmV2Response {
         response.copy_from_slice(&b[..16]);
         let mut client_challenge = [0u8; 8];
         client_challenge.copy_from_slice(&b[16..]);
-        Ok(LmV2Response { response, client_challenge })
+        Ok(LmV2Response {
+            response,
+            client_challenge,
+        })
     }
 
     /// Appends the 16-byte response and 8-byte challenge. Refuses no values.
@@ -1183,7 +1284,11 @@ impl Wire for ClientChallenge {
         let challenge = b[16..24].try_into().map_err(|_| Error::Truncated)?;
         let (av_pairs, used) = AvPairs::parse_prefix(&b[CLIENT_CHALLENGE_HEADER_LEN..])?;
         Ok(Self {
-            resp_type: b[0], hi_resp_type: b[1], timestamp, challenge, av_pairs,
+            resp_type: b[0],
+            hi_resp_type: b[1],
+            timestamp,
+            challenge,
+            av_pairs,
             trailing: b[CLIENT_CHALLENGE_HEADER_LEN + used..].to_vec(),
         })
     }
@@ -1196,8 +1301,10 @@ impl Wire for ClientChallenge {
         }
         let mut pairs = Vec::new();
         write_pairs(&self.av_pairs, &mut pairs)?;
-        let total = CLIENT_CHALLENGE_HEADER_LEN.checked_add(pairs.len())
-            .and_then(|n| n.checked_add(self.trailing.len())).ok_or(Error::Unwritable)?;
+        let total = CLIENT_CHALLENGE_HEADER_LEN
+            .checked_add(pairs.len())
+            .and_then(|n| n.checked_add(self.trailing.len()))
+            .ok_or(Error::Unwritable)?;
         if total > MAX_FIELD - NT_PROOF_LEN {
             return Err(Error::Unwritable);
         }
@@ -1217,9 +1324,14 @@ impl Wire for NtlmV2Response {
 
     /// Reads the proof and complete client blob. Refuses short or invalid blobs.
     fn parse(b: &[u8]) -> Result<Self, Error> {
-        let (proof, blob) = b.split_at_checked(NT_PROOF_LEN).ok_or(Error::ResponseLength(b.len()))?;
+        let (proof, blob) = b
+            .split_at_checked(NT_PROOF_LEN)
+            .ok_or(Error::ResponseLength(b.len()))?;
         let nt_proof = proof.try_into().map_err(|_| Error::Truncated)?;
-        Ok(Self { nt_proof, client: ClientChallenge::parse(blob)? })
+        Ok(Self {
+            nt_proof,
+            client: ClientChallenge::parse(blob)?,
+        })
     }
 
     /// Appends the proof and client blob. Refuses invalid or oversized blobs.
@@ -1255,13 +1367,18 @@ impl Wire for AvPair {
         if !av_value_fits(id, &b[4..]) {
             return Err(Error::AvValue(id));
         }
-        Ok(Self { id, value: b[4..].to_vec() })
+        Ok(Self {
+            id,
+            value: b[4..].to_vec(),
+        })
     }
 
     /// Appends one pair. Refuses invalid values, lengths above [`MAX_FIELD`] and nonempty end markers.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        if self.value.len() > MAX_FIELD - 4 || !av_value_fits(self.id, &self.value)
-            || (self.id == av_id::EOL && !self.value.is_empty()) {
+        if self.value.len() > MAX_FIELD - 4
+            || !av_value_fits(self.id, &self.value)
+            || (self.id == av_id::EOL && !self.value.is_empty())
+        {
             return Err(Error::Unwritable);
         }
         dst.extend_from_slice(&self.id.to_le_bytes());
@@ -1278,7 +1395,10 @@ fn check_end(b: &[u8], fixed: usize, slots: &[usize]) -> Result<(), Error> {
         let len = usize::from(le16(b, slot).ok_or(Error::Truncated)?);
         if len != 0 {
             let start = le32(b, slot + 4).ok_or(Error::Truncated)? as usize;
-            if let Some(last) = start.checked_add(len).filter(|last| start >= fixed && *last <= b.len()) {
+            if let Some(last) = start
+                .checked_add(len)
+                .filter(|last| start >= fixed && *last <= b.len())
+            {
                 end = end.max(last);
             }
         }
@@ -1317,12 +1437,18 @@ mod tests {
 
     /// The CHALLENGE message from \[MS-NLMP\] section 4.2.4.3.
     const SPEC_CHALLENGE: [u8; 104] = [
-        0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x0c, 0x00, //
-        0x38, 0x00, 0x00, 0x00, 0x33, 0x82, 0x8a, 0xe2, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, //
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x00, 0x24, 0x00, 0x44, 0x00, 0x00, 0x00, //
-        0x06, 0x00, 0x70, 0x17, 0x00, 0x00, 0x00, 0x0f, 0x53, 0x00, 0x65, 0x00, 0x72, 0x00, 0x76, 0x00, //
-        0x65, 0x00, 0x72, 0x00, 0x02, 0x00, 0x0c, 0x00, 0x44, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x61, 0x00, //
-        0x69, 0x00, 0x6e, 0x00, 0x01, 0x00, 0x0c, 0x00, 0x53, 0x00, 0x65, 0x00, 0x72, 0x00, 0x76, 0x00, //
+        0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x0c,
+        0x00, //
+        0x38, 0x00, 0x00, 0x00, 0x33, 0x82, 0x8a, 0xe2, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef, //
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x00, 0x24, 0x00, 0x44, 0x00, 0x00,
+        0x00, //
+        0x06, 0x00, 0x70, 0x17, 0x00, 0x00, 0x00, 0x0f, 0x53, 0x00, 0x65, 0x00, 0x72, 0x00, 0x76,
+        0x00, //
+        0x65, 0x00, 0x72, 0x00, 0x02, 0x00, 0x0c, 0x00, 0x44, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x61,
+        0x00, //
+        0x69, 0x00, 0x6e, 0x00, 0x01, 0x00, 0x0c, 0x00, 0x53, 0x00, 0x65, 0x00, 0x72, 0x00, 0x76,
+        0x00, //
         0x65, 0x00, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
@@ -1332,15 +1458,38 @@ mod tests {
         assert_eq!(c.flags, 0xe28a_8233);
         assert_ne!(c.flags & flags::NEGOTIATE_VERSION, 0);
         assert_ne!(c.flags & flags::NEGOTIATE_TARGET_INFO, 0);
-        assert_eq!(c.server_challenge, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
-        assert_eq!(c.version, Some(Version { major: 6, minor: 0, build: 6000, revision: NTLMSSP_REVISION_W2K3 }));
-        assert_eq!(UnicodeName::parse(&c.target_name).ok().map(|name| name.0).as_deref(), Some("Server"));
+        assert_eq!(
+            c.server_challenge,
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+        );
+        assert_eq!(
+            c.version,
+            Some(Version {
+                major: 6,
+                minor: 0,
+                build: 6000,
+                revision: NTLMSSP_REVISION_W2K3
+            })
+        );
+        assert_eq!(
+            UnicodeName::parse(&c.target_name)
+                .ok()
+                .map(|name| name.0)
+                .as_deref(),
+            Some("Server")
+        );
         let AvPairs(pairs) = AvPairs::parse(&c.target_info).unwrap();
         assert_eq!(
             pairs,
             vec![
-                AvPair { id: av_id::NB_DOMAIN_NAME, value: UnicodeName("Domain".into()).to_bytes().unwrap() },
-                AvPair { id: av_id::NB_COMPUTER_NAME, value: UnicodeName("Server".into()).to_bytes().unwrap() },
+                AvPair {
+                    id: av_id::NB_DOMAIN_NAME,
+                    value: UnicodeName("Domain".into()).to_bytes().unwrap()
+                },
+                AvPair {
+                    id: av_id::NB_COMPUTER_NAME,
+                    value: UnicodeName("Server".into()).to_bytes().unwrap()
+                },
             ]
         );
         assert_eq!(AvPairs(pairs.to_vec()).to_bytes().unwrap(), c.target_info);
@@ -1351,20 +1500,34 @@ mod tests {
 
     /// The AUTHENTICATE message from \[MS-NLMP\] section 4.2.4.3.
     const SPEC_AUTHENTICATE: [u8; 232] = [
-        0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00, 0x03, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, //
-        0x6c, 0x00, 0x00, 0x00, 0x54, 0x00, 0x54, 0x00, 0x84, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x0c, 0x00, //
-        0x48, 0x00, 0x00, 0x00, 0x08, 0x00, 0x08, 0x00, 0x54, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00, //
-        0x5c, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00, 0xd8, 0x00, 0x00, 0x00, 0x35, 0x82, 0x88, 0xe2, //
-        0x05, 0x01, 0x28, 0x0a, 0x00, 0x00, 0x00, 0x0f, 0x44, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x61, 0x00, //
-        0x69, 0x00, 0x6e, 0x00, 0x55, 0x00, 0x73, 0x00, 0x65, 0x00, 0x72, 0x00, 0x43, 0x00, 0x4f, 0x00, //
-        0x4d, 0x00, 0x50, 0x00, 0x55, 0x00, 0x54, 0x00, 0x45, 0x00, 0x52, 0x00, 0x86, 0xc3, 0x50, 0x97, //
-        0xac, 0x9c, 0xec, 0x10, 0x25, 0x54, 0x76, 0x4a, 0x57, 0xcc, 0xcc, 0x19, 0xaa, 0xaa, 0xaa, 0xaa, //
-        0xaa, 0xaa, 0xaa, 0xaa, 0x68, 0xcd, 0x0a, 0xb8, 0x51, 0xe5, 0x1c, 0x96, 0xaa, 0xbc, 0x92, 0x7b, //
-        0xeb, 0xef, 0x6a, 0x1c, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
-        0x00, 0x00, 0x00, 0x00, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x00, 0x00, 0x00, 0x00, //
-        0x02, 0x00, 0x0c, 0x00, 0x44, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x61, 0x00, 0x69, 0x00, 0x6e, 0x00, //
-        0x01, 0x00, 0x0c, 0x00, 0x53, 0x00, 0x65, 0x00, 0x72, 0x00, 0x76, 0x00, 0x65, 0x00, 0x72, 0x00, //
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc5, 0xda, 0xd2, 0x54, 0x4f, 0xc9, 0x79, 0x90, //
+        0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00, 0x03, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18,
+        0x00, //
+        0x6c, 0x00, 0x00, 0x00, 0x54, 0x00, 0x54, 0x00, 0x84, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x0c,
+        0x00, //
+        0x48, 0x00, 0x00, 0x00, 0x08, 0x00, 0x08, 0x00, 0x54, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10,
+        0x00, //
+        0x5c, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00, 0xd8, 0x00, 0x00, 0x00, 0x35, 0x82, 0x88,
+        0xe2, //
+        0x05, 0x01, 0x28, 0x0a, 0x00, 0x00, 0x00, 0x0f, 0x44, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x61,
+        0x00, //
+        0x69, 0x00, 0x6e, 0x00, 0x55, 0x00, 0x73, 0x00, 0x65, 0x00, 0x72, 0x00, 0x43, 0x00, 0x4f,
+        0x00, //
+        0x4d, 0x00, 0x50, 0x00, 0x55, 0x00, 0x54, 0x00, 0x45, 0x00, 0x52, 0x00, 0x86, 0xc3, 0x50,
+        0x97, //
+        0xac, 0x9c, 0xec, 0x10, 0x25, 0x54, 0x76, 0x4a, 0x57, 0xcc, 0xcc, 0x19, 0xaa, 0xaa, 0xaa,
+        0xaa, //
+        0xaa, 0xaa, 0xaa, 0xaa, 0x68, 0xcd, 0x0a, 0xb8, 0x51, 0xe5, 0x1c, 0x96, 0xaa, 0xbc, 0x92,
+        0x7b, //
+        0xeb, 0xef, 0x6a, 0x1c, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, //
+        0x00, 0x00, 0x00, 0x00, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x00, 0x00, 0x00,
+        0x00, //
+        0x02, 0x00, 0x0c, 0x00, 0x44, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x61, 0x00, 0x69, 0x00, 0x6e,
+        0x00, //
+        0x01, 0x00, 0x0c, 0x00, 0x53, 0x00, 0x65, 0x00, 0x72, 0x00, 0x76, 0x00, 0x65, 0x00, 0x72,
+        0x00, //
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc5, 0xda, 0xd2, 0x54, 0x4f, 0xc9, 0x79,
+        0x90, //
         0x94, 0xce, 0x1c, 0xe9, 0x0b, 0xc9, 0xd0, 0x3e, //
     ];
 
@@ -1372,18 +1535,53 @@ mod tests {
     fn spec_authenticate() {
         let a = Authenticate::parse(&SPEC_AUTHENTICATE).unwrap();
         assert_eq!(a.flags, 0xe288_8235);
-        assert_eq!(a.version, Some(Version { major: 5, minor: 1, build: 2600, revision: NTLMSSP_REVISION_W2K3 }));
+        assert_eq!(
+            a.version,
+            Some(Version {
+                major: 5,
+                minor: 1,
+                build: 2600,
+                revision: NTLMSSP_REVISION_W2K3
+            })
+        );
         // The payload starts right after the version, so there is no MIC.
         assert_eq!(a.mic, None);
-        assert_eq!(UnicodeName::parse(&a.domain).ok().map(|name| name.0).as_deref(), Some("Domain"));
-        assert_eq!(UnicodeName::parse(&a.user).ok().map(|name| name.0).as_deref(), Some("User"));
-        assert_eq!(UnicodeName::parse(&a.workstation).ok().map(|name| name.0).as_deref(), Some("COMPUTER"));
+        assert_eq!(
+            UnicodeName::parse(&a.domain)
+                .ok()
+                .map(|name| name.0)
+                .as_deref(),
+            Some("Domain")
+        );
+        assert_eq!(
+            UnicodeName::parse(&a.user)
+                .ok()
+                .map(|name| name.0)
+                .as_deref(),
+            Some("User")
+        );
+        assert_eq!(
+            UnicodeName::parse(&a.workstation)
+                .ok()
+                .map(|name| name.0)
+                .as_deref(),
+            Some("COMPUTER")
+        );
         assert_eq!(a.session_key, SPEC_AUTHENTICATE[0xd8..].to_vec());
         let lm = LmV2Response::parse(&a.lm_response).unwrap();
         assert_eq!(lm.client_challenge, [0xaa; 8]);
-        let NtResponse::V2(v2) = NtResponse::parse(&a.nt_response).unwrap() else { panic!() };
+        let NtResponse::V2(v2) = NtResponse::parse(&a.nt_response).unwrap() else {
+            panic!()
+        };
         assert_eq!(v2.nt_proof[..4], [0x68, 0xcd, 0x0a, 0xb8]);
-        assert_eq!((v2.client.resp_type, v2.client.hi_resp_type, v2.client.timestamp), (1, 1, 0));
+        assert_eq!(
+            (
+                v2.client.resp_type,
+                v2.client.hi_resp_type,
+                v2.client.timestamp
+            ),
+            (1, 1, 0)
+        );
         assert_eq!(v2.client.challenge, [0xaa; 8]);
         // The client copied the server's target info into its blob.
         let c = Challenge::parse(&SPEC_CHALLENGE).unwrap();
@@ -1403,23 +1601,33 @@ mod tests {
     fn spec_lmv2_response() {
         // The LMv2 response from \[MS-NLMP\] section 4.2.4.2.1.
         let b = [
-            0x86, 0xc3, 0x50, 0x97, 0xac, 0x9c, 0xec, 0x10, 0x25, 0x54, 0x76, 0x4a, 0x57, 0xcc, 0xcc, 0x19, 0xaa, 0xaa,
-            0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+            0x86, 0xc3, 0x50, 0x97, 0xac, 0x9c, 0xec, 0x10, 0x25, 0x54, 0x76, 0x4a, 0x57, 0xcc,
+            0xcc, 0x19, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
         ];
         let r = LmV2Response::parse(&b).unwrap();
         assert_eq!(r.client_challenge, [0xaa; 8]);
         assert_eq!(r.response[0], 0x86);
         assert_eq!(r.to_bytes().unwrap(), b);
-        assert_eq!(LmV2Response::parse(&b[..23]), Err(Error::ResponseLength(23)));
+        assert_eq!(
+            LmV2Response::parse(&b[..23]),
+            Err(Error::ResponseLength(23))
+        );
     }
 
     #[test]
     fn negotiate_layout() {
         let n = Negotiate {
-            flags: flags::NEGOTIATE_UNICODE | flags::NEGOTIATE_OEM_DOMAIN_SUPPLIED | flags::NEGOTIATE_VERSION,
+            flags: flags::NEGOTIATE_UNICODE
+                | flags::NEGOTIATE_OEM_DOMAIN_SUPPLIED
+                | flags::NEGOTIATE_VERSION,
             domain: b"CORP".to_vec(),
             workstation: Vec::new(),
-            version: Some(Version { major: 10, minor: 0, build: 19041, revision: 15 }),
+            version: Some(Version {
+                major: 10,
+                minor: 0,
+                build: 19041,
+                revision: 15,
+            }),
         };
         let b = n.to_bytes().unwrap();
         assert_eq!(&b[..12], b"NTLMSSP\0\x01\0\0\0");
@@ -1441,7 +1649,12 @@ mod tests {
             user: UnicodeName("u".into()).to_bytes().unwrap(),
             workstation: Vec::new(),
             session_key: vec![5; 16],
-            version: Some(Version { major: 6, minor: 1, build: 7601, revision: 15 }),
+            version: Some(Version {
+                major: 6,
+                minor: 1,
+                build: 7601,
+                revision: 15,
+            }),
             mic: Some([0x11; 16]),
         };
         let b = a.to_bytes().unwrap();
@@ -1452,7 +1665,10 @@ mod tests {
         assert_eq!(&b[12..20], &[24, 0, 24, 0, 88, 0, 0, 0]);
         assert_eq!(Authenticate::parse(&b), Ok(a.clone()));
         // With no MIC, the payload starts at 72 and none is read.
-        let no_mic = Authenticate { mic: None, ..a.clone() };
+        let no_mic = Authenticate {
+            mic: None,
+            ..a.clone()
+        };
         let b = no_mic.to_bytes().unwrap();
         assert_eq!(&b[12..20], &[24, 0, 24, 0, 72, 0, 0, 0]);
         assert_eq!(Authenticate::parse(&b), Ok(no_mic));
@@ -1465,7 +1681,10 @@ mod tests {
             session_key: Vec::new(),
             ..a
         };
-        assert_eq!(Authenticate::parse(&empty.to_bytes().unwrap()), Ok(empty.clone()));
+        assert_eq!(
+            Authenticate::parse(&empty.to_bytes().unwrap()),
+            Ok(empty.clone())
+        );
         let empty = Authenticate { mic: None, ..empty };
         assert_eq!(Authenticate::parse(&empty.to_bytes().unwrap()), Ok(empty));
     }
@@ -1485,27 +1704,35 @@ mod tests {
         b.extend_from_slice(&[0, 0, 0, 0]);
         b.extend_from_slice(&[6, 0, 4, 0, 2, 0, 0, 0, 0, 0, 0, 0]);
         b.extend_from_slice(&[0, 0, 0, 0]);
-        let NtResponse::V2(v2) = NtResponse::parse(&b).unwrap() else { panic!() };
+        let NtResponse::V2(v2) = NtResponse::parse(&b).unwrap() else {
+            panic!()
+        };
         assert_eq!(v2.nt_proof, [0xee; 16]);
         assert_eq!((v2.client.resp_type, v2.client.hi_resp_type), (1, 1));
         assert_eq!(v2.client.timestamp, 0x01d0_0000_0000_0000);
         assert_eq!(v2.client.challenge, [0xaa; 8]);
-        assert_eq!(v2.client.av_pairs, vec![AvPair { id: av_id::FLAGS, value: vec![2, 0, 0, 0] }]);
+        assert_eq!(
+            v2.client.av_pairs,
+            vec![AvPair {
+                id: av_id::FLAGS,
+                value: vec![2, 0, 0, 0]
+            }]
+        );
         assert_eq!(v2.client.trailing, vec![0, 0, 0, 0]);
         assert_eq!(NtResponse::V2(v2).to_bytes().unwrap(), b);
         // A list with no end marker.
         assert_eq!(NtResponse::parse(&b[..b.len() - 8]), Err(Error::AvPairs));
-        assert_eq!(NtResponse::parse(&vec![0; MAX_FIELD + 1]), Err(Error::TooLong));
+        assert_eq!(
+            NtResponse::parse(&vec![0; MAX_FIELD + 1]),
+            Err(Error::TooLong)
+        );
     }
 
     #[test]
     fn av_pair_errors() {
         assert_eq!(AvPairs::parse(&[]), Err(Error::AvPairs));
         assert_eq!(AvPairs::parse(&[0, 0, 0]), Err(Error::AvPairs));
-        assert_eq!(
-            AvPairs::parse(&[0, 0, 1, 0, 9]),
-            Err(Error::AvEolLength(1))
-        );
+        assert_eq!(AvPairs::parse(&[0, 0, 1, 0, 9]), Err(Error::AvEolLength(1)));
         assert_eq!(AvPairs::parse(&[1, 0, 2, 0, 9]), Err(Error::AvPairs));
         assert_eq!(AvPairs::parse(&[0, 0, 0, 0, 7]), Err(Error::Trailing));
         // An ID the specification does not define keeps any value.
@@ -1516,7 +1743,13 @@ mod tests {
                 value: vec![9]
             }]))
         );
-        let many = vec![AvPair { id: 1, value: Vec::new() }; MAX_AV_PAIRS + 1];
+        let many = vec![
+            AvPair {
+                id: 1,
+                value: Vec::new()
+            };
+            MAX_AV_PAIRS + 1
+        ];
         assert_eq!(AvPairs(many.to_vec()).to_bytes(), Err(Error::Unwritable));
         let mut b = Vec::new();
         for _ in 0..=MAX_AV_PAIRS {
@@ -1525,10 +1758,29 @@ mod tests {
         b.extend_from_slice(&[0, 0, 0, 0]);
         assert_eq!(AvPairs::parse(&b), Err(Error::TooManyAvPairs));
         assert_eq!(AvPairs::parse(&b[4..]).unwrap().0.len(), MAX_AV_PAIRS);
-        assert_eq!(AvPairs(vec![AvPair { id: 0, value: Vec::new() }]).to_bytes(), Err(Error::Unwritable));
-        let big = AvPair { id: 1, value: vec![0; 65536] };
+        assert_eq!(
+            AvPairs(vec![AvPair {
+                id: 0,
+                value: Vec::new()
+            }])
+            .to_bytes(),
+            Err(Error::Unwritable)
+        );
+        let big = AvPair {
+            id: 1,
+            value: vec![0; 65536],
+        };
         assert_eq!(AvPairs([big].to_vec()).to_bytes(), Err(Error::Unwritable));
-        let pairs = [AvPair { id: 9, value: vec![1] }, AvPair { id: 9, value: vec![2] }];
+        let pairs = [
+            AvPair {
+                id: 9,
+                value: vec![1],
+            },
+            AvPair {
+                id: 9,
+                value: vec![2],
+            },
+        ];
         assert_eq!(AvPair::find(&pairs, 9), Some(&pairs[0]));
         assert_eq!(AvPair::find(&pairs, 3), None);
     }
@@ -1542,12 +1794,24 @@ mod tests {
             version: None,
         };
         let good = n.to_bytes().unwrap();
-        assert_eq!(Message::parse(&vec![0; MAX_MESSAGE + 1]), Err(Error::TooLong));
-        assert_eq!(Negotiate::parse(&vec![0; MAX_MESSAGE + 1]), Err(Error::TooLong));
-        assert_eq!(Message::parse(b"NTLMSSX\0\x01\0\0\0"), Err(Error::Signature));
+        assert_eq!(
+            Message::parse(&vec![0; MAX_MESSAGE + 1]),
+            Err(Error::TooLong)
+        );
+        assert_eq!(
+            Negotiate::parse(&vec![0; MAX_MESSAGE + 1]),
+            Err(Error::TooLong)
+        );
+        assert_eq!(
+            Message::parse(b"NTLMSSX\0\x01\0\0\0"),
+            Err(Error::Signature)
+        );
         assert_eq!(Message::parse(b"X"), Err(Error::Signature));
         assert_eq!(Message::parse(b"NTLM"), Err(Error::Truncated));
-        assert_eq!(Message::parse(b"NTLMSSP\0\x04\0\0\0"), Err(Error::MessageType(4)));
+        assert_eq!(
+            Message::parse(b"NTLMSSP\0\x04\0\0\0"),
+            Err(Error::MessageType(4))
+        );
         assert_eq!(Challenge::parse(&good), Err(Error::MessageType(1)));
         assert_eq!(Authenticate::parse(&good), Err(Error::MessageType(1)));
         assert_eq!(Negotiate::parse(&good[..31]), Err(Error::Truncated));
@@ -1577,13 +1841,31 @@ mod tests {
 
     #[test]
     fn encode_errors() {
-        let n =
-            Negotiate { flags: flags::NEGOTIATE_VERSION, domain: Vec::new(), workstation: Vec::new(), version: None };
+        let n = Negotiate {
+            flags: flags::NEGOTIATE_VERSION,
+            domain: Vec::new(),
+            workstation: Vec::new(),
+            version: None,
+        };
         assert_eq!(n.to_bytes(), Err(Error::Unwritable));
-        let v = Version { major: 1, minor: 2, build: 3, revision: 4 };
-        let n = Negotiate { flags: 0, version: Some(v), ..n };
+        let v = Version {
+            major: 1,
+            minor: 2,
+            build: 3,
+            revision: 4,
+        };
+        let n = Negotiate {
+            flags: 0,
+            version: Some(v),
+            ..n
+        };
         assert_eq!(n.to_bytes(), Err(Error::Unwritable));
-        let n = Negotiate { flags: 0, version: None, domain: vec![0; MAX_FIELD + 1], workstation: Vec::new() };
+        let n = Negotiate {
+            flags: 0,
+            version: None,
+            domain: vec![0; MAX_FIELD + 1],
+            workstation: Vec::new(),
+        };
         assert_eq!(n.to_bytes(), Err(Error::Unwritable));
         let a = Authenticate {
             flags: 0,
@@ -1601,11 +1883,24 @@ mod tests {
         assert_eq!(b.len(), MIC_END);
         assert_eq!(Authenticate::parse(&b), Ok(a.clone()));
         // The padding byte that keeps a field at an even offset counts.
-        let n = Negotiate { flags: 0, version: None, domain: vec![1], workstation: vec![2; MAX_MESSAGE - 33] };
+        let n = Negotiate {
+            flags: 0,
+            version: None,
+            domain: vec![1],
+            workstation: vec![2; MAX_MESSAGE - 33],
+        };
         assert_eq!(n.to_bytes(), Err(Error::Unwritable));
-        let n = Negotiate { workstation: vec![2; MAX_MESSAGE - 34], ..n };
+        let n = Negotiate {
+            workstation: vec![2; MAX_MESSAGE - 34],
+            ..n
+        };
         assert_eq!(n.to_bytes().unwrap().len(), MAX_MESSAGE);
-        let a = Authenticate { mic: None, user: vec![0; MAX_FIELD], domain: vec![0; MAX_FIELD], ..a };
+        let a = Authenticate {
+            mic: None,
+            user: vec![0; MAX_FIELD],
+            domain: vec![0; MAX_FIELD],
+            ..a
+        };
         assert_eq!(a.to_bytes(), Err(Error::Unwritable));
         let c = Challenge {
             flags: 0,
@@ -1709,13 +2004,19 @@ mod tests {
         }
         let c = Challenge::parse(&SPEC_CHALLENGE).unwrap();
         assert_eq!(c.target_info_pairs().unwrap().len(), 2);
-        assert_eq!(Challenge::default().target_info_pairs(), Err(Error::AvPairs));
+        assert_eq!(
+            Challenge::default().target_info_pairs(),
+            Err(Error::AvPairs)
+        );
         let a = Authenticate::parse(&SPEC_AUTHENTICATE).unwrap();
         assert!(matches!(a.nt(), Ok(NtResponse::V2(_))));
         // The spec message has no MIC, so there is none to zero.
         assert_eq!(Authenticate::mic_input(&SPEC_AUTHENTICATE), None);
         assert_eq!(Authenticate::mic_input(&SPEC_CHALLENGE), None);
-        let with = Authenticate { mic: Some([7; MIC_LEN]), ..Authenticate::default() };
+        let with = Authenticate {
+            mic: Some([7; MIC_LEN]),
+            ..Authenticate::default()
+        };
         let b = with.to_bytes().unwrap();
         let z = Authenticate::mic_input(&b).unwrap().to_bytes().unwrap();
         assert_eq!(z[..MIC_END - MIC_LEN], b[..MIC_END - MIC_LEN]);
@@ -1728,10 +2029,22 @@ mod tests {
 
     #[test]
     fn utf16() {
-        assert_eq!(UnicodeName("Ab".into()).to_bytes().unwrap(), [0x41, 0, 0x62, 0]);
-        assert_eq!(UnicodeName::parse(&[0x41, 0, 0x62, 0]).ok().map(|name| name.0).as_deref(), Some("Ab"));
+        assert_eq!(
+            UnicodeName("Ab".into()).to_bytes().unwrap(),
+            [0x41, 0, 0x62, 0]
+        );
+        assert_eq!(
+            UnicodeName::parse(&[0x41, 0, 0x62, 0])
+                .ok()
+                .map(|name| name.0)
+                .as_deref(),
+            Some("Ab")
+        );
         assert_eq!(UnicodeName::parse(&[0x41]).ok().map(|name| name.0), None);
-        assert_eq!(UnicodeName::parse(&[0x00, 0xd8]).ok().map(|name| name.0), None);
+        assert_eq!(
+            UnicodeName::parse(&[0x00, 0xd8]).ok().map(|name| name.0),
+            None
+        );
         assert_eq!(UnicodeName("\u{1f600}".into()).to_bytes().unwrap().len(), 4);
     }
 
@@ -1745,7 +2058,12 @@ mod tests {
                     | flags::NEGOTIATE_OEM_WORKSTATION_SUPPLIED,
                 domain: b"D".to_vec(),
                 workstation: b"W".to_vec(),
-                version: Some(Version { major: 1, minor: 2, build: 3, revision: 15 }),
+                version: Some(Version {
+                    major: 1,
+                    minor: 2,
+                    build: 3,
+                    revision: 15,
+                }),
             }),
             Message::Authenticate(Authenticate {
                 flags: flags::NEGOTIATE_VERSION | flags::NEGOTIATE_KEY_EXCH,
@@ -1755,7 +2073,12 @@ mod tests {
                 user: vec![4; 2],
                 workstation: vec![5; 2],
                 session_key: vec![6; 16],
-                version: Some(Version { major: 1, minor: 2, build: 3, revision: 15 }),
+                version: Some(Version {
+                    major: 1,
+                    minor: 2,
+                    build: 3,
+                    revision: 15,
+                }),
                 mic: Some([9; 16]),
             }),
         ];
@@ -1774,7 +2097,10 @@ mod tests {
                 hi_resp_type: 1,
                 timestamp: 5,
                 challenge: [2; 8],
-                av_pairs: vec![AvPair { id: 1, value: vec![1, 2] }],
+                av_pairs: vec![AvPair {
+                    id: 1,
+                    value: vec![1, 2],
+                }],
                 trailing: Vec::new(),
             },
         });
@@ -1784,7 +2110,15 @@ mod tests {
                 assert!(NtResponse::parse(&b[..n]).is_err(), "prefix {n}");
             }
         }
-        let list = AvPairs([AvPair { id: 2, value: vec![1, 2, 3, 4] }].to_vec()).to_bytes().unwrap();
+        let list = AvPairs(
+            [AvPair {
+                id: 2,
+                value: vec![1, 2, 3, 4],
+            }]
+            .to_vec(),
+        )
+        .to_bytes()
+        .unwrap();
         for n in 0..list.len() {
             assert!(AvPairs::parse(&list[..n]).is_err());
         }
@@ -1810,7 +2144,10 @@ mod tests {
     #[test]
     fn mic_claimed_by_av_flags() {
         // \[MS-NLMP\] 2.2.2.1: MsvAvFlags bit 0x2 says a MIC is there.
-        let flagged = v2_with(vec![AvPair { id: av_id::FLAGS, value: 2u32.to_le_bytes().to_vec() }]);
+        let flagged = v2_with(vec![AvPair {
+            id: av_id::FLAGS,
+            value: 2u32.to_le_bytes().to_vec(),
+        }]);
         let with = Authenticate {
             flags: flags::NEGOTIATE_UNICODE,
             nt_response: flagged.clone(),
@@ -1823,18 +2160,43 @@ mod tests {
         assert_eq!(a.mic, Some([3; MIC_LEN]));
         // The MIC dropped, the payload moved up to byte 72: the message
         // still says it has one, which a server can see.
-        let dropped = Authenticate { mic: None, ..with.clone() };
+        let dropped = Authenticate {
+            mic: None,
+            ..with.clone()
+        };
         let a = Authenticate::parse(&dropped.to_bytes().unwrap()).unwrap();
         assert_eq!(a.mic, None);
         assert!(a.claims_mic());
         assert_eq!(Authenticate::mic_input(&dropped.to_bytes().unwrap()), None);
         // No flag, or flags without the bit, or an NTLMv1 response: no claim.
-        let plain = Authenticate { nt_response: v2_with(Vec::new()), ..with.clone() };
+        let plain = Authenticate {
+            nt_response: v2_with(Vec::new()),
+            ..with.clone()
+        };
         assert!(!plain.claims_mic());
-        let other = v2_with(vec![AvPair { id: av_id::FLAGS, value: 1u32.to_le_bytes().to_vec() }]);
-        assert!(!Authenticate { nt_response: other, ..with.clone() }.claims_mic());
-        assert!(!Authenticate { nt_response: vec![0; 24], ..with }.claims_mic());
-        assert!(!Authenticate::parse(&SPEC_AUTHENTICATE).unwrap().claims_mic());
+        let other = v2_with(vec![AvPair {
+            id: av_id::FLAGS,
+            value: 1u32.to_le_bytes().to_vec(),
+        }]);
+        assert!(
+            !Authenticate {
+                nt_response: other,
+                ..with.clone()
+            }
+            .claims_mic()
+        );
+        assert!(
+            !Authenticate {
+                nt_response: vec![0; 24],
+                ..with
+            }
+            .claims_mic()
+        );
+        assert!(
+            !Authenticate::parse(&SPEC_AUTHENTICATE)
+                .unwrap()
+                .claims_mic()
+        );
     }
 
     #[test]
@@ -1853,7 +2215,13 @@ mod tests {
         // spec's own CHALLENGE sends a target name without REQUEST_TARGET.
         let c = Challenge::parse(&SPEC_CHALLENGE).unwrap();
         assert_eq!(c.flags & flags::REQUEST_TARGET, 0);
-        assert_eq!(UnicodeName::parse(&c.target_name).ok().map(|name| name.0).as_deref(), Some("Server"));
+        assert_eq!(
+            UnicodeName::parse(&c.target_name)
+                .ok()
+                .map(|name| name.0)
+                .as_deref(),
+            Some("Server")
+        );
         // \[MS-NLMP\] 2.2.1.2: target name and target info, flags clear.
         let mut b = Challenge::default().to_bytes().unwrap();
         b[12..20].copy_from_slice(&[4, 0, 4, 0, 0xff, 0xff, 0xff, 0xff]);
@@ -1863,24 +2231,46 @@ mod tests {
         assert_eq!(Challenge::parse(&b), Err(Error::Field("target info")));
         // \[MS-NLMP\] 2.2.1.3: the session key without KEY_EXCH. A bad
         // descriptor neither fails the message nor hides its MIC.
-        let a = Authenticate { mic: Some([8; MIC_LEN]), user: b"u".to_vec(), ..Authenticate::default() };
+        let a = Authenticate {
+            mic: Some([8; MIC_LEN]),
+            user: b"u".to_vec(),
+            ..Authenticate::default()
+        };
         let mut b = a.to_bytes().unwrap();
         b[52..60].copy_from_slice(&[16, 0, 16, 0, 0xff, 0xff, 0xff, 0xff]);
         assert_eq!(Authenticate::parse(&b), Ok(a));
         b[60..64].copy_from_slice(&flags::NEGOTIATE_KEY_EXCH.to_le_bytes());
-        assert_eq!(Authenticate::parse(&b).unwrap_err(), Error::Field("session key"));
+        assert_eq!(
+            Authenticate::parse(&b).unwrap_err(),
+            Error::Field("session key")
+        );
     }
 
     #[test]
     fn nested_fields_read_with_their_own_readers() {
         // A target info that is not an AV pair list is not written.
-        let c = Challenge { flags: flags::NEGOTIATE_TARGET_INFO, target_info: vec![1], ..Challenge::default() };
+        let c = Challenge {
+            flags: flags::NEGOTIATE_TARGET_INFO,
+            target_info: vec![1],
+            ..Challenge::default()
+        };
         assert_eq!(c.to_bytes(), Err(Error::Unwritable));
         // Nor is one with bytes after its end marker, and such bytes read
         // from a peer are an error.
-        let mut junk = AvPairs([AvPair { id: av_id::NB_DOMAIN_NAME, value: vec![b'D', 0] }].to_vec()).to_bytes().unwrap();
+        let mut junk = AvPairs(
+            [AvPair {
+                id: av_id::NB_DOMAIN_NAME,
+                value: vec![b'D', 0],
+            }]
+            .to_vec(),
+        )
+        .to_bytes()
+        .unwrap();
         junk.push(7);
-        let c = Challenge { target_info: junk.clone(), ..c };
+        let c = Challenge {
+            target_info: junk.clone(),
+            ..c
+        };
         assert_eq!(c.to_bytes(), Err(Error::Unwritable));
         assert_eq!(c.target_info_pairs(), Err(Error::AvPairs));
         let mut b = SPEC_CHALLENGE.to_vec();
@@ -1888,7 +2278,10 @@ mod tests {
         b.push(7);
         assert_eq!(Challenge::parse(&b), Err(Error::AvPairs));
         // An NT response no layout has is not written, nor read.
-        let a = Authenticate { nt_response: vec![1], ..Authenticate::default() };
+        let a = Authenticate {
+            nt_response: vec![1],
+            ..Authenticate::default()
+        };
         assert_eq!(a.to_bytes(), Err(Error::Unwritable));
         let mut b = SPEC_AUTHENTICATE.to_vec();
         b[20] = 25;
@@ -1902,18 +2295,38 @@ mod tests {
             AvPairs::parse(&[6, 0, 1, 0, 2, 0, 0, 0, 0]),
             Err(Error::AvValue(av_id::FLAGS))
         );
-        for (id, len) in [(av_id::FLAGS, 4), (av_id::TIMESTAMP, 8), (av_id::CHANNEL_BINDINGS, 16)] {
+        for (id, len) in [
+            (av_id::FLAGS, 4),
+            (av_id::TIMESTAMP, 8),
+            (av_id::CHANNEL_BINDINGS, 16),
+        ] {
             for n in [0, 1, len - 1, len + 1] {
-                let p = AvPair { id, value: vec![0; n] };
+                let p = AvPair {
+                    id,
+                    value: vec![0; n],
+                };
                 assert_eq!(AvPairs([p].to_vec()).to_bytes(), Err(Error::Unwritable));
             }
-            let p = AvPair { id, value: vec![0; len] };
+            let p = AvPair {
+                id,
+                value: vec![0; len],
+            };
             let list = AvPairs(vec![p.clone()]).to_bytes().unwrap();
             assert_eq!(AvPairs::parse(&list), Ok(AvPairs(vec![p])));
         }
         // Names are UTF-16LE, so of even length.
         for id in [1, 2, 3, 4, 5, 9] {
-            assert_eq!(AvPairs([AvPair { id, value: vec![b'A'] }].to_vec()).to_bytes(), Err(Error::Unwritable));
+            assert_eq!(
+                AvPairs(
+                    [AvPair {
+                        id,
+                        value: vec![b'A']
+                    }]
+                    .to_vec()
+                )
+                .to_bytes(),
+                Err(Error::Unwritable)
+            );
             assert_eq!(
                 AvPairs::parse(&[id as u8, 0, 1, 0, b'A', 0, 0, 0, 0]),
                 Err(Error::AvValue(id))
@@ -1924,15 +2337,30 @@ mod tests {
     #[test]
     fn unicode_names_have_even_offsets_and_lengths() {
         // \[MS-NLMP\] 2.2.1.3: a Unicode user name has an even length.
-        let a = Authenticate { flags: flags::NEGOTIATE_UNICODE, user: vec![0x41], ..Authenticate::default() };
+        let a = Authenticate {
+            flags: flags::NEGOTIATE_UNICODE,
+            user: vec![0x41],
+            ..Authenticate::default()
+        };
         assert_eq!(a.to_bytes(), Err(Error::Unwritable));
         // OEM names may be any length.
-        let oem = Authenticate { flags: flags::NEGOTIATE_OEM, ..a };
+        let oem = Authenticate {
+            flags: flags::NEGOTIATE_OEM,
+            ..a
+        };
         assert_eq!(Authenticate::parse(&oem.to_bytes().unwrap()), Ok(oem));
-        let c = Challenge { flags: flags::NEGOTIATE_UNICODE, target_name: vec![1], ..Challenge::default() };
+        let c = Challenge {
+            flags: flags::NEGOTIATE_UNICODE,
+            target_name: vec![1],
+            ..Challenge::default()
+        };
         assert_eq!(c.to_bytes(), Err(Error::Unwritable));
         // A two-byte user name at an odd offset, and one of odd length.
-        let a = Authenticate { flags: flags::NEGOTIATE_UNICODE, user: UnicodeName("u".into()).to_bytes().unwrap(), ..Authenticate::default() };
+        let a = Authenticate {
+            flags: flags::NEGOTIATE_UNICODE,
+            user: UnicodeName("u".into()).to_bytes().unwrap(),
+            ..Authenticate::default()
+        };
         let mut b = a.to_bytes().unwrap();
         assert_eq!(Authenticate::parse(&b), Ok(a));
         assert_eq!(b[40], 64);
@@ -1953,13 +2381,18 @@ mod tests {
     #[test]
     fn ntlmv2_versions_are_one() {
         // \[MS-NLMP\] 2.2.2.7: RespType and HiRespType MUST be 1.
-        assert_eq!(NtResponse::parse(&[0; 48]), Err(Error::ResponseVersion(0, 0)));
+        assert_eq!(
+            NtResponse::parse(&[0; 48]),
+            Err(Error::ResponseVersion(0, 0))
+        );
         let mut b = v2_with(Vec::new());
         assert!(matches!(NtResponse::parse(&b), Ok(NtResponse::V2(_))));
         b[17] = 2;
         assert_eq!(NtResponse::parse(&b), Err(Error::ResponseVersion(1, 2)));
         b[17] = 1;
-        let Ok(NtResponse::V2(mut v2)) = NtResponse::parse(&b) else { panic!() };
+        let Ok(NtResponse::V2(mut v2)) = NtResponse::parse(&b) else {
+            panic!()
+        };
         v2.client.resp_type = 0;
         assert_eq!(NtResponse::V2(v2).to_bytes(), Err(Error::Unwritable));
     }
@@ -1968,12 +2401,21 @@ mod tests {
     fn av_lists_fit_in_a_field() {
         // Two pairs of 40000 bytes: too long for any field, refused before
         // anything is copied.
-        let big = vec![AvPair { id: 0x40, value: vec![0; 40000] }; 2];
+        let big = vec![
+            AvPair {
+                id: 0x40,
+                value: vec![0; 40000]
+            };
+            2
+        ];
         assert_eq!(AvPairs(big.to_vec()).to_bytes(), Err(Error::Unwritable));
         let one = AvPairs(big[..1].to_vec()).to_bytes().unwrap();
         assert_eq!(one.len(), 40008);
         // The longest list that fits is written and read.
-        let fits = [AvPair { id: 0x40, value: vec![0; MAX_FIELD - 8] }];
+        let fits = [AvPair {
+            id: 0x40,
+            value: vec![0; MAX_FIELD - 8],
+        }];
         let list = AvPairs(fits.to_vec()).to_bytes().unwrap();
         assert_eq!(list.len(), MAX_FIELD);
         assert_eq!(AvPairs::parse(&list), Ok(AvPairs(fits.to_vec())));

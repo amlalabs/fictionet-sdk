@@ -4,11 +4,11 @@
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::postgres::{
     BackendEvent, BackendEvents, BackendMessage, EncryptionReply, FrontendMessage,
     FrontendMessages, Password, SaslInitialResponse, Startup,
 };
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

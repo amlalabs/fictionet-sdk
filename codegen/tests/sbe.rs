@@ -151,7 +151,10 @@ fn maps_scalars_nulls_constants_and_layouts() {
     let checked = validate(schema, Limits::default()).unwrap();
     assert!(matches!(
         fields(checked.schema(), "M")[7].ty,
-        Type::BlockGroup { limit: Some(4096), .. }
+        Type::BlockGroup {
+            limit: Some(4096),
+            ..
+        }
     ));
 }
 

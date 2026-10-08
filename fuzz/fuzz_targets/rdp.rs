@@ -2,19 +2,18 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
 
+use fictionet::stdlib::rdp::harness::{check_parsers, plaintext, roundtrip};
 use fictionet::stdlib::rdp::{
     ActiveKind, ActivePdu, CapabilitySet, CapabilityType, ChannelDefinition, ClientInfo,
     Connection, ConnectionKind, DataBlock, DataBlocks, FailureCode, Frame, GccConference,
     INFO_RESERVED, INFO_UNICODE, LicenseError, MAX_CAPABILITY, MAX_CHANNELS, MAX_CONNECTION_DATA,
-    MAX_EXTRA_INFO, MAX_FAST_PATH, MAX_FRAME, MAX_INFO_STRING, MAX_PDU,
-    MAX_PER_LENGTH, McsPdu, Negotiation, Protocols, SERVER_CHANNEL_ID, SecurityPayload,
-    read_data, write_data,
+    MAX_EXTRA_INFO, MAX_FAST_PATH, MAX_FRAME, MAX_INFO_STRING, MAX_PDU, MAX_PER_LENGTH, McsPdu,
+    Negotiation, Protocols, SERVER_CHANNEL_ID, SecurityPayload, read_data, write_data,
 };
-use fictionet::stdlib::rdp::harness::{check_parsers, plaintext, roundtrip};
 use libfuzzer_sys::fuzz_target;
 
 // Bound work and every test-owned allocation even with huge fuzzer inputs.

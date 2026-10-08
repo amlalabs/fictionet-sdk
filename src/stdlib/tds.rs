@@ -70,10 +70,12 @@
 //! assert_eq!(TokenStream::parse(&message.data), Ok(reply));
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{be16, le16, le32, le64, Decode, Step, Wire, Reader, Truncated, Trailing};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::{
+    Decode, Reader, Step, Trailing, Truncated, Wire, be16, le16, le32, le64,
+};
 
 /// The TCP port SQL Server listens on.
 pub const PORT: u16 = 1433;
@@ -445,7 +447,9 @@ impl Packet {
             return Err(Error::Length(length));
         }
         let end = usize::from(length);
-        if end > limit.clamp(HEADER_LEN, MAX_PACKET) { return Err(Error::TooLong(end)); }
+        if end > limit.clamp(HEADER_LEN, MAX_PACKET) {
+            return Err(Error::TooLong(end));
+        }
         if b.len() < end {
             return Ok(None);
         }
@@ -459,7 +463,6 @@ impl Packet {
         };
         Ok(Some((packet, end)))
     }
-
 }
 
 impl Wire for Packet {
@@ -507,21 +510,29 @@ impl Prefixed for Packet {
     const NAME: &'static str = "TDS";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_PACKET }
+    fn default_limit() -> Self::Limit {
+        MAX_PACKET
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(HEADER_LEN, MAX_PACKET) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.clamp(HEADER_LEN, MAX_PACKET)
+    }
 
     #[inline]
-    fn capacity(limit: &Self::Limit) -> usize { *limit }
+    fn capacity(limit: &Self::Limit) -> usize {
+        *limit
+    }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         Packet::parse_prefix(input, limit)
     }
 }
-
 
 /// One whole message: the data of all its packets, joined.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -572,10 +583,20 @@ impl Message {
         for index in 0..count {
             let len = rest.len().min(chunk);
             let mut bits = self.status & !(last_only | first_only);
-            if index == 0 { bits |= self.status & first_only; }
-            if index + 1 == count { bits |= self.status & last_only; }
-            out.push(Packet { packet_type: self.packet_type, status: bits, spid: self.spid,
-                id, window: 0, data: rest[..len].to_vec() });
+            if index == 0 {
+                bits |= self.status & first_only;
+            }
+            if index + 1 == count {
+                bits |= self.status & last_only;
+            }
+            out.push(Packet {
+                packet_type: self.packet_type,
+                status: bits,
+                spid: self.spid,
+                id,
+                window: 0,
+                data: rest[..len].to_vec(),
+            });
             rest = &rest[len..];
             id = id.wrapping_add(1);
         }
@@ -609,7 +630,10 @@ impl Wire for Message {
         let packets = self.packets(4096)?;
         let start = out.len();
         for packet in packets {
-            if let Err(error) = packet.write(out) { out.truncate(start); return Err(error); }
+            if let Err(error) = packet.write(out) {
+                out.truncate(start);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -626,17 +650,28 @@ pub struct Messages {
 
 impl Messages {
     /// Reads messages up to [`MAX_MESSAGE`] data bytes.
-    pub fn new() -> Self { Self::with_limit(MAX_MESSAGE) }
+    pub fn new() -> Self {
+        Self::with_limit(MAX_MESSAGE)
+    }
 
     /// Sets the data limit, clamped to [`MAX_MESSAGE`]. Zero allows empty messages.
-    pub fn with_limit(limit: usize) -> Self { Self { limit: limit.min(MAX_MESSAGE), partial: None } }
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_MESSAGE),
+            partial: None,
+        }
+    }
 
     /// The maximum assembled data length.
-    pub fn limit(&self) -> usize { self.limit }
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
 }
 
 impl Default for Messages {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Decode for Messages {
@@ -644,41 +679,74 @@ impl Decode for Messages {
     type Error = Error;
     const NAME: &'static str = "TDS messages";
 
-    fn capacity(&self) -> usize { (self.limit + HEADER_LEN).min(MAX_PACKET) }
-    fn held(&self) -> usize { self.partial.as_ref().map_or(0, |p| p.data.len()) }
+    fn capacity(&self) -> usize {
+        (self.limit + HEADER_LEN).min(MAX_PACKET)
+    }
+    fn held(&self) -> usize {
+        self.partial.as_ref().map_or(0, |p| p.data.len())
+    }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, Error> {
         let Some(&[kind, bits, hi, lo]) = input.get(..4) else {
-            if eof && input.is_empty() && self.partial.is_some() { return Err(Error::Incomplete); }
+            if eof && input.is_empty() && self.partial.is_some() {
+                return Err(Error::Incomplete);
+            }
             return Ok(Step::Need);
         };
         let length = u16::from_be_bytes([hi, lo]);
-        if usize::from(length) < HEADER_LEN { return Err(Error::Length(length)); }
+        if usize::from(length) < HEADER_LEN {
+            return Err(Error::Length(length));
+        }
         if let Some(partial) = &self.partial
             && partial.packet_type != kind
         {
-            return Err(Error::TypeChanged { expected: partial.packet_type, got: kind });
+            return Err(Error::TypeChanged {
+                expected: partial.packet_type,
+                got: kind,
+            });
         }
         let used = usize::from(length);
-        let total = self.held().checked_add(used - HEADER_LEN).ok_or(Error::TooLong(usize::MAX))?;
-        if total > self.limit { return Err(Error::TooLong(total)); }
-        let Some(packet) = input.get(..used) else { return Ok(Step::Need) };
+        let total = self
+            .held()
+            .checked_add(used - HEADER_LEN)
+            .ok_or(Error::TooLong(usize::MAX))?;
+        if total > self.limit {
+            return Err(Error::TooLong(total));
+        }
+        let Some(packet) = input.get(..used) else {
+            return Ok(Step::Need);
+        };
         let resets = status::RESET_CONNECTION | status::RESET_CONNECTION_SKIP_TRAN;
         let mut message = match self.partial.take() {
             Some(message) => message,
-            None => Message { packet_type: kind, status: bits & resets, spid: be16(packet, 4).ok_or(Error::Truncated)?, data: Vec::new() },
+            None => Message {
+                packet_type: kind,
+                status: bits & resets,
+                spid: be16(packet, 4).ok_or(Error::Truncated)?,
+                data: Vec::new(),
+            },
         };
         let last = bits & status::EOM != 0;
         message.status |= bits & !(resets | status::IGNORE);
-        if last { message.status |= bits & status::IGNORE; }
+        if last {
+            message.status |= bits & status::IGNORE;
+        }
         if total > message.data.capacity() {
-            let target = total.max(message.data.capacity().saturating_mul(2)).min(self.limit);
-            message.data.try_reserve_exact(target.saturating_sub(message.data.len()))
+            let target = total
+                .max(message.data.capacity().saturating_mul(2))
+                .min(self.limit);
+            message
+                .data
+                .try_reserve_exact(target.saturating_sub(message.data.len()))
                 .map_err(|_| Error::TooLong(total))?;
         }
         message.data.extend_from_slice(&packet[HEADER_LEN..]);
-        if last { Ok(Step::Item(message, used)) }
-        else { self.partial = Some(message); Ok(Step::Skip(used)) }
+        if last {
+            Ok(Step::Item(message, used))
+        } else {
+            self.partial = Some(message);
+            Ok(Step::Skip(used))
+        }
     }
 }
 
@@ -732,7 +800,10 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Truncated => write!(f, "data ends before a complete packet or in the middle of a field"),
+            Error::Truncated => write!(
+                f,
+                "data ends before a complete packet or in the middle of a field"
+            ),
             Error::Trailing => f.write_str("bytes follow the TDS packet"),
             Error::Length(n) => write!(f, "packet length {n}, below the 8-byte header"),
             Error::TypeChanged { expected, got } => {
@@ -778,9 +849,18 @@ impl Wire for Version {
 
     /// Reads six bytes. Refuses short input and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() < 6 { return Err(Error::Truncated); }
-        if bytes.len() > 6 { return Err(Error::Invalid("bytes after VERSION")); }
-        Ok(Self { major: bytes[0], minor: bytes[1], build: be16(bytes, 2).ok_or(Error::Truncated)?, sub_build: be16(bytes, 4).ok_or(Error::Truncated)? })
+        if bytes.len() < 6 {
+            return Err(Error::Truncated);
+        }
+        if bytes.len() > 6 {
+            return Err(Error::Invalid("bytes after VERSION"));
+        }
+        Ok(Self {
+            major: bytes[0],
+            minor: bytes[1],
+            build: be16(bytes, 2).ok_or(Error::Truncated)?,
+            sub_build: be16(bytes, 4).ok_or(Error::Truncated)?,
+        })
     }
 
     /// Appends the six version bytes. Every value is representable.
@@ -815,7 +895,13 @@ impl Prelogin {
     /// A PRELOGIN message with the VERSION and ENCRYPTION options.
     pub fn new(version: Version, encryption: u8) -> Prelogin {
         let mut p = Prelogin::default();
-        p.set(prelogin_option::VERSION, match version.to_bytes() { Ok(bytes) => bytes, Err(never) => match never {} });
+        p.set(
+            prelogin_option::VERSION,
+            match version.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(never) => match never {},
+            },
+        );
         p.set(prelogin_option::ENCRYPTION, vec![encryption]);
         p
     }
@@ -861,7 +947,9 @@ impl Prelogin {
         if !options.iter().all(Prelogin::option_valid) {
             return Err(Error::Invalid("PRELOGIN option length or value"));
         }
-        if end.max(i + 1) != data.len() { return Err(Error::Invalid("bytes after PRELOGIN")); }
+        if end.max(i + 1) != data.len() {
+            return Err(Error::Invalid("bytes after PRELOGIN"));
+        }
         Ok(Prelogin { options })
     }
 
@@ -891,13 +979,20 @@ impl Prelogin {
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
-        if self.options.len() > MAX_PRELOGIN_OPTIONS ||
-            !matches!(self.options.first(), Some(o) if o.token == prelogin_option::VERSION) ||
-            !self.options.iter().all(Self::option_valid) { return Err(Error::Unwritable); }
+        if self.options.len() > MAX_PRELOGIN_OPTIONS
+            || !matches!(self.options.first(), Some(o) if o.token == prelogin_option::VERSION)
+            || !self.options.iter().all(Self::option_valid)
+        {
+            return Err(Error::Unwritable);
+        }
         let mut size = 5 * self.options.len() + 1;
         for option in &self.options {
-            size = size.checked_add(option.data.len()).ok_or(Error::Unwritable)?;
-            if size > 0xffff { return Err(Error::Unwritable); }
+            size = size
+                .checked_add(option.data.len())
+                .ok_or(Error::Unwritable)?;
+            if size > 0xffff {
+                return Err(Error::Unwritable);
+            }
         }
         let mut out = Vec::with_capacity(size);
         let mut offset = 5 * self.options.len() + 1;
@@ -908,7 +1003,9 @@ impl Prelogin {
             offset += option.data.len();
         }
         out.push(prelogin_option::TERMINATOR);
-        for option in &self.options { out.extend_from_slice(&option.data); }
+        for option in &self.options {
+            out.extend_from_slice(&option.data);
+        }
         Ok(out)
     }
 
@@ -1077,14 +1174,21 @@ impl Login7 {
             return Err(Error::Invalid("LOGIN7 length"));
         }
         let b = data.get(..length).ok_or(Error::Truncated)?;
-        if data.len() != length { return Err(Error::Invalid("bytes after LOGIN7")); }
+        if data.len() != length {
+            return Err(Error::Invalid("bytes after LOGIN7"));
+        }
         // ibHostName marks where the variable part starts, even when the
         // host name is empty.
         let host_at = usize::from(le16(b, 36).ok_or(Error::Truncated)?);
         if host_at < LOGIN7_FIXED_LEN || host_at > length {
             return Err(Error::Invalid("LOGIN7 host name offset"));
         }
-        let field = |at: usize| -> Result<_, Error> { Ok((usize::from(le16(b, at).ok_or(Error::Truncated)?), usize::from(le16(b, at + 2).ok_or(Error::Truncated)?))) };
+        let field = |at: usize| -> Result<_, Error> {
+            Ok((
+                usize::from(le16(b, at).ok_or(Error::Truncated)?),
+                usize::from(le16(b, at + 2).ok_or(Error::Truncated)?),
+            ))
+        };
         let text = |at: usize, max: usize| -> Result<String, Error> {
             let (ib, cch) = field(at)?;
             Ok(utf16_string(login_bytes(b, ib, cch, max)?))
@@ -1259,7 +1363,10 @@ impl Login7 {
                 return Err(Error::Unwritable);
             }
             // The features and the 0xFF that ends them.
-            let block = features.iter().try_fold(1usize, |n, f| n.checked_add(5)?.checked_add(f.data.len())).ok_or(Error::Unwritable)?;
+            let block = features
+                .iter()
+                .try_fold(1usize, |n, f| n.checked_add(5)?.checked_add(f.data.len()))
+                .ok_or(Error::Unwritable)?;
             if block > MAX_LOGIN7.saturating_sub(LOGIN7_FIXED_LEN + var.len()) {
                 return Err(Error::Unwritable);
             }
@@ -1352,7 +1459,9 @@ fn parse_features(b: &[u8]) -> Result<(Vec<Feature>, usize), Error> {
 }
 
 fn write_features(out: &mut Vec<u8>, features: &[Feature]) -> Result<(), Error> {
-    if features.len() > MAX_FEATURES || features.iter().any(|f| f.id == 0xff) { return Err(Error::Unwritable); }
+    if features.len() > MAX_FEATURES || features.iter().any(|f| f.id == 0xff) {
+        return Err(Error::Unwritable);
+    }
     for f in features {
         room(out, f.data.len().checked_add(5).ok_or(Error::Unwritable)?)?;
         out.push(f.id);
@@ -1451,7 +1560,9 @@ impl SqlBatch {
     /// only headers whose data fits their type (see
     /// [`StreamHeader::is_valid`]).
     pub fn parse(data: &[u8], all_headers: bool) -> Result<SqlBatch, Error> {
-        if data.len() > MAX_MESSAGE { return Err(Error::Limit("SQL batch data")); }
+        if data.len() > MAX_MESSAGE {
+            return Err(Error::Limit("SQL batch data"));
+        }
         let (headers, rest) = if all_headers {
             let mut c = Reader::new(data);
             let total = c.u32_le()? as usize;
@@ -1508,11 +1619,20 @@ impl SqlBatch {
     /// invalid headers, too many headers, and ALL_HEADERS without a
     /// transaction descriptor. Preserves the selected TDS layout.
     pub fn message(&self) -> Result<Message, Error> {
-        let text_len = self.text.encode_utf16().take(MAX_MESSAGE / 2 + 1).count()
-            .checked_mul(2).ok_or(Error::Unwritable)?;
+        let text_len = self
+            .text
+            .encode_utf16()
+            .take(MAX_MESSAGE / 2 + 1)
+            .count()
+            .checked_mul(2)
+            .ok_or(Error::Unwritable)?;
         let mut size = text_len;
         if let Some(headers) = &self.headers {
-            if headers.len() > MAX_HEADERS || !headers.iter().any(|h| h.kind == header_type::TRANSACTION_DESCRIPTOR) {
+            if headers.len() > MAX_HEADERS
+                || !headers
+                    .iter()
+                    .any(|h| h.kind == header_type::TRANSACTION_DESCRIPTOR)
+            {
                 return Err(Error::Unwritable);
             }
             size = size.checked_add(4).ok_or(Error::Unwritable)?;
@@ -1520,10 +1640,15 @@ impl SqlBatch {
                 if !header.is_valid() || headers[..index].iter().any(|h| h.kind == header.kind) {
                     return Err(Error::Unwritable);
                 }
-                size = size.checked_add(6).and_then(|n| n.checked_add(header.data.len())).ok_or(Error::Unwritable)?;
+                size = size
+                    .checked_add(6)
+                    .and_then(|n| n.checked_add(header.data.len()))
+                    .ok_or(Error::Unwritable)?;
             }
         }
-        if size > MAX_MESSAGE { return Err(Error::Unwritable); }
+        if size > MAX_MESSAGE {
+            return Err(Error::Unwritable);
+        }
         let mut data = Vec::with_capacity(size);
         if let Some(headers) = &self.headers {
             data.extend_from_slice(&((size - text_len) as u32).to_le_bytes());
@@ -1533,7 +1658,9 @@ impl SqlBatch {
                 data.extend_from_slice(&header.data);
             }
         }
-        for unit in self.text.encode_utf16() { data.extend_from_slice(&unit.to_le_bytes()); }
+        for unit in self.text.encode_utf16() {
+            data.extend_from_slice(&unit.to_le_bytes());
+        }
         Ok(Message::new(packet_type::SQL_BATCH, data))
     }
 }
@@ -1812,9 +1939,10 @@ fn decode_number(ty: u8, b: &[u8]) -> Result<Value, Error> {
         (FLT4 | FLTN, 4) => Value::Real(le32(b, 0).ok_or(Error::Truncated)?),
         (FLT8 | FLTN, 8) => Value::Float(le64(b, 0).ok_or(Error::Truncated)?),
         (MONEY4 | MONEYN, 4) => Value::SmallMoney(le32(b, 0).ok_or(Error::Truncated)? as i32),
-        (MONEY | MONEYN, 8) => {
-            Value::Money((((u64::from(le32(b, 0).ok_or(Error::Truncated)?)) << 32) | u64::from(le32(b, 4).ok_or(Error::Truncated)?)) as i64)
-        }
+        (MONEY | MONEYN, 8) => Value::Money(
+            (((u64::from(le32(b, 0).ok_or(Error::Truncated)?)) << 32)
+                | u64::from(le32(b, 4).ok_or(Error::Truncated)?)) as i64,
+        ),
         (DATETIM4 | DATETIMN, 4) => Value::SmallDateTime {
             days: le16(b, 0).ok_or(Error::Truncated)?,
             minutes: le16(b, 2).ok_or(Error::Truncated)?,
@@ -1926,7 +2054,9 @@ fn check_variant(b: &[u8]) -> Result<(), Error> {
                     && byte_len_value_ok(&TypeInfo::decimal(precision, scale), data)
             }
         }
-        BIGVARBINARY | BIGBINARY => *prop == 2 && data.len() <= usize::from(le16(props, 0).ok_or(Error::Truncated)?),
+        BIGVARBINARY | BIGBINARY => {
+            *prop == 2 && data.len() <= usize::from(le16(props, 0).ok_or(Error::Truncated)?)
+        }
         BIGVARCHAR | BIGCHAR | NVARCHAR | NCHAR => {
             let even = !matches!(*base, NVARCHAR | NCHAR) || data.len() % 2 == 0;
             *prop == 7 && even && data.len() <= usize::from(le16(props, 5).ok_or(Error::Truncated)?)
@@ -2101,7 +2231,10 @@ fn read_value(c: &mut Reader, t: &TypeInfo) -> Result<Value, Error> {
             if n > tl && le_uint(&b[tl..tl + 3]) as u32 > MAX_DATE {
                 return Err(Error::Invalid("date past 9999-12-31"));
             }
-            if n == tl + 5 && !(-MAX_OFFSET..=MAX_OFFSET).contains(&(le16(b, tl + 3).ok_or(Error::Truncated)? as i16)) {
+            if n == tl + 5
+                && !(-MAX_OFFSET..=MAX_OFFSET)
+                    .contains(&(le16(b, tl + 3).ok_or(Error::Truncated)? as i16))
+            {
                 return Err(Error::Invalid("time zone offset"));
             }
             Ok(match t.ty {
@@ -2190,11 +2323,21 @@ fn write_value(out: &mut Vec<u8>, t: &TypeInfo, v: &Value) -> Result<(), Error> 
         (Class::UShort { .. }, Value::Bytes(_) | Value::Text(_)) => {
             let data = match v {
                 Value::Text(s) => units_to_bytes(&utf16_units(s, MAX_MESSAGE / 2)?),
-                Value::Bytes(b) => { room(out, b.len())?; b.clone() },
+                Value::Bytes(b) => {
+                    room(out, b.len())?;
+                    b.clone()
+                }
                 _ => Vec::new(),
             };
-            let overhead = if t.max_len == 0xffff { 12 + 4 * data.len().div_ceil(PLP_CHUNK) } else { 2 };
-            room(out, data.len().checked_add(overhead).ok_or(Error::Unwritable)?)?;
+            let overhead = if t.max_len == 0xffff {
+                12 + 4 * data.len().div_ceil(PLP_CHUNK)
+            } else {
+                2
+            };
+            room(
+                out,
+                data.len().checked_add(overhead).ok_or(Error::Unwritable)?,
+            )?;
             if t.max_len == 0xffff {
                 out.extend_from_slice(&(data.len() as u64).to_le_bytes());
                 for chunk in data.chunks(PLP_CHUNK) {
@@ -2203,7 +2346,9 @@ fn write_value(out: &mut Vec<u8>, t: &TypeInfo, v: &Value) -> Result<(), Error> 
                 }
                 out.extend_from_slice(&[0; 4]);
             } else {
-                if data.len() > 0xfffe { return Err(Error::Unwritable); }
+                if data.len() > 0xfffe {
+                    return Err(Error::Unwritable);
+                }
                 out.extend_from_slice(&(data.len() as u16).to_le_bytes());
                 out.extend_from_slice(&data);
             }
@@ -2221,7 +2366,9 @@ fn write_value(out: &mut Vec<u8>, t: &TypeInfo, v: &Value) -> Result<(), Error> 
             out.extend_from_slice(&value.to_le_bytes()[..w]);
         }
         (Class::Date, Value::Date(d)) => {
-            if *d > MAX_DATE { return Err(Error::Unwritable); }
+            if *d > MAX_DATE {
+                return Err(Error::Unwritable);
+            }
             out.push(3);
             out.extend_from_slice(&d.to_le_bytes()[..3]);
         }
@@ -2233,7 +2380,10 @@ fn write_value(out: &mut Vec<u8>, t: &TypeInfo, v: &Value) -> Result<(), Error> 
                 Value::DateTimeOffset { time, date, offset } => (time, Some(date), Some(offset)),
                 _ => return Err(Error::Unwritable),
             };
-            if time >= day_units(t.scale) || date.is_some_and(|d| d > MAX_DATE) || offset.is_some_and(|o| !(-MAX_OFFSET..=MAX_OFFSET).contains(&o)) {
+            if time >= day_units(t.scale)
+                || date.is_some_and(|d| d > MAX_DATE)
+                || offset.is_some_and(|o| !(-MAX_OFFSET..=MAX_OFFSET).contains(&o))
+            {
                 return Err(Error::Unwritable);
             }
             let n = tl + if date.is_some() { 3 } else { 0 } + if offset.is_some() { 2 } else { 0 };
@@ -2254,7 +2404,9 @@ fn write_value(out: &mut Vec<u8>, t: &TypeInfo, v: &Value) -> Result<(), Error> 
         }
         _ => return Err(Error::Unwritable),
     }
-    if out.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+    if out.len() > MAX_MESSAGE {
+        return Err(Error::Unwritable);
+    }
     Ok(())
 }
 
@@ -2757,7 +2909,9 @@ fn write_token(out: &mut Vec<u8>, tok: &Token, columns: Option<&[Column]>) -> Re
                 EnvChange::Bytes { kind, new, old } => {
                     body.push(*kind);
                     for v in [new, old] {
-                        if v.len() > 255 { return Err(Error::Unwritable); }
+                        if v.len() > 255 {
+                            return Err(Error::Unwritable);
+                        }
                         body.push(v.len() as u8);
                         body.extend_from_slice(v);
                     }
@@ -2888,19 +3042,25 @@ fn write_token(out: &mut Vec<u8>, tok: &Token, columns: Option<&[Column]>) -> Re
         Token::Other { token: t, data } => {
             out.push(*t);
             match other_len(*t).ok_or(Error::Unwritable)? {
-                OtherLen::U16 => {
-                    out.extend_from_slice(&u16::try_from(data.len()).map_err(|_| Error::Unwritable)?.to_le_bytes())
-                }
-                OtherLen::U32 => {
-                    out.extend_from_slice(&u32::try_from(data.len()).map_err(|_| Error::Unwritable)?.to_le_bytes())
-                }
+                OtherLen::U16 => out.extend_from_slice(
+                    &u16::try_from(data.len())
+                        .map_err(|_| Error::Unwritable)?
+                        .to_le_bytes(),
+                ),
+                OtherLen::U32 => out.extend_from_slice(
+                    &u32::try_from(data.len())
+                        .map_err(|_| Error::Unwritable)?
+                        .to_le_bytes(),
+                ),
                 OtherLen::Fixed(_) => {}
             }
             room(out, data.len())?;
             out.extend_from_slice(data);
         }
     }
-    if out.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+    if out.len() > MAX_MESSAGE {
+        return Err(Error::Unwritable);
+    }
     Ok(())
 }
 
@@ -3024,8 +3184,12 @@ impl Wire for TokenStream {
     /// layouts, invalid types or values, rows without columns, partial
     /// tokens, and data above [`MAX_MESSAGE`].
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() > MAX_MESSAGE { return Err(Error::Limit("response past MAX_MESSAGE")); }
-        TokenReader::new(bytes).collect::<Result<Vec<_>, _>>().map(Self)
+        if bytes.len() > MAX_MESSAGE {
+            return Err(Error::Limit("response past MAX_MESSAGE"));
+        }
+        TokenReader::new(bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self)
     }
 
     /// Appends the response. Refuses rows without columns, mismatched
@@ -3041,7 +3205,9 @@ impl Wire for TokenStream {
                 Ok((back, used)) if used == bytes.len() - start && back == *token => {}
                 _ => return Err(Error::Unwritable),
             }
-            if let Token::ColMetadata(Some(cols)) = token { columns = Some(cols); }
+            if let Token::ColMetadata(Some(cols)) = token {
+                columns = Some(cols);
+            }
         }
         out.extend_from_slice(&bytes);
         Ok(())
@@ -3055,7 +3221,9 @@ macro_rules! payload_wire {
             type WriteError = Error;
 
             #[doc = $parse_doc]
-            fn parse(bytes: &[u8]) -> Result<Self, Error> { Self::read(bytes) }
+            fn parse(bytes: &[u8]) -> Result<Self, Error> {
+                Self::read(bytes)
+            }
 
             #[doc = $write_doc]
             fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -3066,12 +3234,16 @@ macro_rules! payload_wire {
         }
     };
 }
-payload_wire!(Prelogin,
+payload_wire!(
+    Prelogin,
     "Reads one PRELOGIN payload. Refuses missing or misplaced VERSION, invalid option lengths or values, more than MAX_PRELOGIN_OPTIONS, offsets outside the payload, combined fields above 65535 bytes, and trailing bytes. VERSION holds six bytes. Option data may overlap.",
-    "Appends the option table and each option in order. Refuses missing or misplaced VERSION, invalid option lengths or values, too many options, and offsets above 65535. Leaves the destination unchanged on error.");
-payload_wire!(Login7,
+    "Appends the option table and each option in order. Refuses missing or misplaced VERSION, invalid option lengths or values, too many options, and offsets above 65535. Leaves the destination unchanged on error."
+);
+payload_wire!(
+    Login7,
     "Reads one LOGIN7 record. Refuses short input, trailing bytes, invalid offsets, strings or SSPI beyond their limits, a new password without its flag, invalid feature blocks, and fields whose combined layout exceeds MAX_LOGIN7. Shared field bytes are allowed. Invalid UTF-16 units become U+FFFD.",
-    "Appends a LOGIN7 record with obfuscated passwords. Refuses strings or SSPI beyond their limits, a new password without its flag, an EXTENSION flag that disagrees with features, too many features, feature ID 0xFF, and records above MAX_LOGIN7. Without CHANGE_PASSWORD, the new password offset is zero. Leaves the destination unchanged on error.");
+    "Appends a LOGIN7 record with obfuscated passwords. Refuses strings or SSPI beyond their limits, a new password without its flag, an EXTENSION flag that disagrees with features, too many features, feature ID 0xFF, and records above MAX_LOGIN7. Without CHANGE_PASSWORD, the new password offset is zero. Leaves the destination unchanged on error."
+);
 
 // ---------------------------------------------------------------------
 // Helpers.
@@ -3116,7 +3288,9 @@ fn utf16_string(b: &[u8]) -> String {
 
 fn utf16_units(s: &str, max: usize) -> Result<Vec<u16>, Error> {
     let units: Vec<_> = s.encode_utf16().take(max + 1).collect();
-    if units.len() > max { return Err(Error::Unwritable); }
+    if units.len() > max {
+        return Err(Error::Unwritable);
+    }
     Ok(units)
 }
 
@@ -3125,7 +3299,9 @@ fn units_to_bytes(units: &[u16]) -> Vec<u8> {
 }
 
 fn room(out: &[u8], additional: usize) -> Result<(), Error> {
-    if additional > MAX_MESSAGE.saturating_sub(out.len()) { return Err(Error::Unwritable); }
+    if additional > MAX_MESSAGE.saturating_sub(out.len()) {
+        return Err(Error::Unwritable);
+    }
     Ok(())
 }
 
@@ -3155,25 +3331,26 @@ fn le_uint(b: &[u8]) -> u64 {
 
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Truncated }
+    fn from(_: Truncated) -> Self {
+        Error::Truncated
+    }
 }
 
 impl From<Trailing> for Error {
     #[inline]
-    fn from(_: Trailing) -> Self { Error::Invalid("bytes after the token's fields") }
+    fn from(_: Trailing) -> Self {
+        Error::Invalid("bytes after the token's fields")
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
-    use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::hex;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
-
 
     // Examples from MS-TDS section 4.
 
@@ -3234,7 +3411,10 @@ mod tests {
 
     fn one_message(bytes: &[u8]) -> Message {
         let message = Message::parse(bytes).unwrap();
-        assert_eq!(decode_all(Messages::new, bytes), (vec![message.clone()], None));
+        assert_eq!(
+            decode_all(Messages::new, bytes),
+            (vec![message.clone()], None)
+        );
         message
     }
 
@@ -3309,7 +3489,10 @@ mod tests {
     fn password_obfuscation() {
         // "a" is 0x61 0x00 in UTF-16: swapped 0x16, XOR 0xA5 = 0xB3;
         // 0x00 becomes 0xA5.
-        let login = Login7 { password: "a".into(), ..Login7::new() };
+        let login = Login7 {
+            password: "a".into(),
+            ..Login7::new()
+        };
         let bytes = login.to_bytes().unwrap();
         let start = usize::from(le16(&bytes, 44).unwrap());
         assert_eq!(&bytes[start..start + 2], &[0xb3, 0xa5]);
@@ -3515,7 +3698,10 @@ mod tests {
             text: "SELECT 1".into(),
         };
         assert_eq!(old.transaction_descriptor(), None);
-        assert_eq!(SqlBatch::parse(&old.message().unwrap().data, false), Ok(old));
+        assert_eq!(
+            SqlBatch::parse(&old.message().unwrap().data, false),
+            Ok(old)
+        );
     }
 
     #[test]
@@ -3664,20 +3850,28 @@ mod tests {
 
     #[test]
     fn packets_and_reassembly() {
-        let m = Message { packet_type: packet_type::SQL_BATCH,
-            status: status::EOM | status::RESET_CONNECTION, spid: 0,
-            data: (0..5000u32).map(|i| i as u8).collect() };
+        let m = Message {
+            packet_type: packet_type::SQL_BATCH,
+            status: status::EOM | status::RESET_CONNECTION,
+            spid: 0,
+            data: (0..5000u32).map(|i| i as u8).collect(),
+        };
         let packets = m.packets(512).unwrap();
         assert_eq!(packets.len(), 10);
         let mut bytes = Vec::new();
-        for packet in &packets { packet.write(&mut bytes).unwrap(); }
+        for packet in &packets {
+            packet.write(&mut bytes).unwrap();
+        }
         assert_eq!(bytes.len(), 5000 + 10 * HEADER_LEN);
         let first = Packet::parse(&bytes[..512]).unwrap();
         assert_eq!((first.status, first.id), (status::RESET_CONNECTION, 1));
         assert_eq!(first.to_bytes().unwrap(), bytes[..512]);
         for n in 0..512 {
             assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Truncated));
-            assert_eq!(Frames::<Packet>::new().decode(&bytes[..n], false), Ok(Step::Need));
+            assert_eq!(
+                Frames::<Packet>::new().decode(&bytes[..n], false),
+                Ok(Step::Need)
+            );
         }
         contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_PACKET);
         assert_eq!(one_message(&bytes), m);
@@ -3689,9 +3883,16 @@ mod tests {
         assert_eq!(packets.len(), 300);
         assert_eq!(packets[256].id, 1);
         let mut bytes = Vec::new();
-        for packet in packets { packet.write(&mut bytes).unwrap(); }
+        for packet in packets {
+            packet.write(&mut bytes).unwrap();
+        }
         assert_eq!(one_message(&bytes), big);
-        assert_eq!(Message::new(1, vec![0; 70_000]).packets(100_000).unwrap()[0].data.len(), MAX_PACKET_SIZE - HEADER_LEN);
+        assert_eq!(
+            Message::new(1, vec![0; 70_000]).packets(100_000).unwrap()[0]
+                .data
+                .len(),
+            MAX_PACKET_SIZE - HEADER_LEN
+        );
     }
 
     #[test]
@@ -3706,35 +3907,60 @@ mod tests {
         assert_eq!(stream.next(), None);
         assert_eq!(stream.unread(), [1, 1, 0, 3]);
         let changed = [1, 0, 0, 9, 0, 0, 1, 0, b'x', 3, 1, 0, 8];
-        assert_eq!(decode_all(Messages::new, &changed).1,
-            Some(Fail::Protocol(Error::TypeChanged { expected: 1, got: 3 })));
+        assert_eq!(
+            decode_all(Messages::new, &changed).1,
+            Some(Fail::Protocol(Error::TypeChanged {
+                expected: 1,
+                got: 3
+            }))
+        );
         let mut stream = Stream::new(Messages::with_limit(10));
         assert_eq!(stream.push(&[1, 0, 0, 16, 0, 0, 1, 0]), 8);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(&[1, 1, 0, 11]), 4);
         assert_eq!(stream.next(), None);
         let oversized = [1, 0, 0, 16, 0, 0, 1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 1, 1, 0, 11];
-        assert_eq!(decode_all(|| Messages::with_limit(10), &oversized).1, Some(Fail::Protocol(Error::TooLong(11))));
+        assert_eq!(
+            decode_all(|| Messages::with_limit(10), &oversized).1,
+            Some(Fail::Protocol(Error::TooLong(11)))
+        );
         let incomplete = [1, 0, 0, 8, 0, 0, 1, 0];
-        assert_eq!(decode_all(Messages::new, &incomplete).1, Some(Fail::Protocol(Error::Incomplete)));
+        assert_eq!(
+            decode_all(Messages::new, &incomplete).1,
+            Some(Fail::Protocol(Error::Incomplete))
+        );
         for bytes in [&changed[..], &oversized, &incomplete] {
             contract::check_decode_with_alloc_limit(|| Messages::with_limit(10), bytes, 36);
         }
-        for error in [Error::Length(1), Error::TypeChanged { expected: 1, got: 2 },
-            Error::TooLong(5), Error::Incomplete, Error::Unwritable] {
+        for error in [
+            Error::Length(1),
+            Error::TypeChanged {
+                expected: 1,
+                got: 2,
+            },
+            Error::TooLong(5),
+            Error::Incomplete,
+            Error::Unwritable,
+        ] {
             assert!(!error.to_string().is_empty());
         }
     }
 
     #[test]
     fn stream_reads_many_small_messages_in_linear_time() {
-        assert_linear("stream_reads_many_small_messages_in_linear_time", rounds(50_000), |size| {
-            let one = Message::new(packet_type::SQL_BATCH, vec![b'x', 0]).to_bytes().unwrap();
-            let bytes = one.repeat(size);
-            let (messages, failure) = decode_all(Messages::new, &bytes);
-            assert_eq!(messages.len(), size);
-            assert_eq!(failure, None);
-        });
+        assert_linear(
+            "stream_reads_many_small_messages_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let one = Message::new(packet_type::SQL_BATCH, vec![b'x', 0])
+                    .to_bytes()
+                    .unwrap();
+                let bytes = one.repeat(size);
+                let (messages, failure) = decode_all(Messages::new, &bytes);
+                assert_eq!(messages.len(), size);
+                assert_eq!(failure, None);
+            },
+        );
     }
 
     #[test]
@@ -3974,9 +4200,15 @@ mod tests {
     fn writer_refuses_what_would_not_read_back() {
         let mut w = TokenStream::default();
         let mut out = vec![7];
-        assert_eq!(TokenStream(vec![Token::Row(vec![])]).write(&mut out), Err(Error::Unwritable));
+        assert_eq!(
+            TokenStream(vec![Token::Row(vec![])]).write(&mut out),
+            Err(Error::Unwritable)
+        );
         assert_eq!(out, [7]);
-        assert_eq!(TokenReader::new(&[token::ROW]).next(), Some(Err(Error::NoColumns)));
+        assert_eq!(
+            TokenReader::new(&[token::ROW]).next(),
+            Some(Err(Error::NoColumns))
+        );
         let cols = vec![Column::new("a", TypeInfo::fixed(data_type::INT4))];
         w.0.push(Token::ColMetadata(Some(cols)));
         w.write(&mut out).unwrap();
@@ -4494,7 +4726,13 @@ mod tests {
         let w = TokenStream::default();
         let col = Column::new("n", TypeInfo::fixed(data_type::NULL));
         assert_eq!(
-            TokenStream(w.0.iter().cloned().chain([Token::ColMetadata(Some(vec![col]))]).collect()).write(&mut Vec::new()),
+            TokenStream(
+                w.0.iter()
+                    .cloned()
+                    .chain([Token::ColMetadata(Some(vec![col]))])
+                    .collect()
+            )
+            .write(&mut Vec::new()),
             Err(Error::Unwritable)
         );
         assert!(w.to_bytes().unwrap().as_slice().is_empty());
@@ -4507,7 +4745,8 @@ mod tests {
     fn takes(ti: TypeInfo, v: Value) -> Result<(), Error> {
         let mut w = TokenStream::default();
         w.0.push(Token::ColMetadata(Some(vec![Column::new("c", ti)])));
-        TokenStream(w.0.iter().cloned().chain([Token::Row(vec![v])]).collect()).write(&mut Vec::new())
+        TokenStream(w.0.iter().cloned().chain([Token::Row(vec![v])]).collect())
+            .write(&mut Vec::new())
     }
 
     /// Stream input and assembled data each stay within their limits.
@@ -4521,12 +4760,18 @@ mod tests {
         assert!(stream.next().unwrap().is_err());
         assert_eq!(stream.push(&flood), flood.len());
         assert_eq!(stream.next(), None);
-        let one = Message::new(packet_type::SQL_BATCH, vec![7; 600]).to_bytes().unwrap();
+        let one = Message::new(packet_type::SQL_BATCH, vec![7; 600])
+            .to_bytes()
+            .unwrap();
         let bytes = one.repeat(400);
         let (messages, failure) = decode_all(|| Messages::with_limit(600), &bytes);
         assert_eq!(failure, None);
         assert_eq!(messages.len(), 400);
-        contract::check_decode_with_alloc_limit(|| Messages::with_limit(600), &bytes, 2 * (600 + HEADER_LEN));
+        contract::check_decode_with_alloc_limit(
+            || Messages::with_limit(600),
+            &bytes,
+            2 * (600 + HEADER_LEN),
+        );
     }
 
     /// Oversized messages and token streams fail without partial output.
@@ -4540,8 +4785,10 @@ mod tests {
         let at = Message::new(packet_type::SQL_BATCH, vec![b' '; MAX_MESSAGE]);
         assert_eq!(one_message(&at.to_bytes().unwrap()), at);
         let col = Column::new("b", TypeInfo::binary(data_type::BIGVARBINARY, 0xffff));
-        let mut tokens = TokenStream(vec![Token::ColMetadata(Some(vec![col])),
-            Token::Row(vec![Value::Bytes(vec![1; MAX_MESSAGE])])]);
+        let mut tokens = TokenStream(vec![
+            Token::ColMetadata(Some(vec![col])),
+            Token::Row(vec![Value::Bytes(vec![1; MAX_MESSAGE])]),
+        ]);
         assert_eq!(tokens.write(&mut out), Err(Error::Unwritable));
         assert_eq!(out, [7]);
         tokens.0[1] = Token::Row(vec![Value::Bytes(vec![1; 1000])]);
@@ -4637,19 +4884,37 @@ mod tests {
     /// and a reset bit in a later packet was or'd into the message.
     #[test]
     fn packet_status_bits_per_packet() {
-        let m = Message { packet_type: packet_type::SQL_BATCH,
+        let m = Message {
+            packet_type: packet_type::SQL_BATCH,
             status: status::EOM | status::IGNORE | status::RESET_CONNECTION,
-            spid: 0, data: vec![1; 600] };
+            spid: 0,
+            data: vec![1; 600],
+        };
         let packets = m.packets(512).unwrap();
         assert_eq!(packets[0].status, status::RESET_CONNECTION);
         assert_eq!(packets[1].status, status::EOM | status::IGNORE);
         let mut bytes = Vec::new();
-        for packet in packets { packet.write(&mut bytes).unwrap(); }
+        for packet in packets {
+            packet.write(&mut bytes).unwrap();
+        }
         assert_eq!(one_message(&bytes), m);
         let mut bytes = vec![packet_type::SQL_BATCH, status::IGNORE, 0, 9, 0, 0, 1, 0, 5];
-        bytes.extend([packet_type::SQL_BATCH, status::RESET_CONNECTION_SKIP_TRAN | status::EOM, 0, 9, 0, 0, 1, 0, 5]);
+        bytes.extend([
+            packet_type::SQL_BATCH,
+            status::RESET_CONNECTION_SKIP_TRAN | status::EOM,
+            0,
+            9,
+            0,
+            0,
+            1,
+            0,
+            5,
+        ]);
         assert_eq!(one_message(&bytes).status, status::EOM);
-        assert_eq!(Message { status: 0, ..m }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Message { status: 0, ..m }.to_bytes(),
+            Err(Error::Unwritable)
+        );
     }
 
     /// MS-TDS 2.2.6.5: MARS and FEDAUTHREQUIRED are one byte of 0 or 1,
@@ -4855,7 +5120,10 @@ mod tests {
             text: "x".into(),
         };
         let good = with(vec![3; 20]);
-        assert_eq!(SqlBatch::parse(&good.message().unwrap().data, true), Ok(good));
+        assert_eq!(
+            SqlBatch::parse(&good.message().unwrap().data, true),
+            Ok(good)
+        );
         // Written by hand with one byte of data, it is refused.
         let mut b = with(vec![3; 20]).message().unwrap().data;
         let total = le32(&b, 0).unwrap() - 19;
@@ -4932,7 +5200,11 @@ mod tests {
                 ..rv
             },
         ] {
-            assert!(TokenStream(vec![Token::ReturnValue(bad)]).to_bytes().is_err());
+            assert!(
+                TokenStream(vec![Token::ReturnValue(bad)])
+                    .to_bytes()
+                    .is_err()
+            );
         }
     }
 
@@ -4970,7 +5242,10 @@ mod tests {
         contract::check_wire::<TokenStream>(bytes);
         for all_headers in [true, false] {
             if let Ok(batch) = SqlBatch::parse(bytes, all_headers) {
-                assert_eq!(SqlBatch::parse(&batch.message().unwrap().data, all_headers), Ok(batch));
+                assert_eq!(
+                    SqlBatch::parse(&batch.message().unwrap().data, all_headers),
+                    Ok(batch)
+                );
             }
         }
         let tokens: Vec<_> = TokenReader::new(bytes).map_while(Result::ok).collect();
@@ -5011,7 +5286,9 @@ mod tests {
         let samples = samples();
         let mut rng = Lcg::new(0x7d5_1433);
         for round in 0..6000 {
-            let bytes = if round % 4 == 0 { rng.bytes(120) } else {
+            let bytes = if round % 4 == 0 {
+                rng.bytes(120)
+            } else {
                 let mut bytes = samples[rng.index(samples.len())].clone();
                 mutate(&mut rng, &mut bytes);
                 bytes
@@ -5026,8 +5303,16 @@ mod tests {
                     stream[i + 3] = 8 + rng.index(12) as u8;
                 }
             }
-            contract::check_decode_with_alloc_limit(|| Messages::with_limit(64), &stream, 2 * (64 + HEADER_LEN));
-            contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), &stream, 128);
+            contract::check_decode_with_alloc_limit(
+                || Messages::with_limit(64),
+                &stream,
+                2 * (64 + HEADER_LEN),
+            );
+            contract::check_decode_with_alloc_limit(
+                || Frames::<Packet>::with_limit(64),
+                &stream,
+                128,
+            );
             for message in decode_all(|| Messages::with_limit(64), &stream).0 {
                 assert!(message.to_bytes().is_ok(), "{message:?}");
                 contract::check_wire_value(&message);

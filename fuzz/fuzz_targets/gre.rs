@@ -3,11 +3,19 @@
 #![no_main]
 
 use fictionet::stdlib::gre::{Header, Packet};
-use fictionet::stdlib::{codec::{Wire, Collect}, test_support::contract, gre};
+use fictionet::stdlib::{
+    codec::{Collect, Wire},
+    gre,
+    test_support::contract,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(|| Collect::<gre::Packet>::new(gre::MAX_PACKET), data, 2 * (gre::MAX_PACKET + 1));
+    contract::check_decode_with_alloc_limit(
+        || Collect::<gre::Packet>::new(gre::MAX_PACKET),
+        data,
+        2 * (gre::MAX_PACKET + 1),
+    );
     contract::check_wire::<gre::Packet>(data);
 
     let payload = data.iter().take(gre::MAX_PACKET + 1).copied().collect();

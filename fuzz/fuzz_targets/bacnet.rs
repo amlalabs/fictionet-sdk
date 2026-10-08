@@ -24,8 +24,16 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Bvlc>(data);
     contract::check_wire::<Npdu>(data);
     contract::check_wire::<Apdu>(data);
-    contract::check_decode_with_alloc_limit(Frames::<Tag>::new, data, 2 * Frames::<Tag>::new().capacity());
-    contract::check_decode_with_alloc_limit(Frames::<Value>::new, data, 2 * Frames::<Value>::new().capacity());
+    contract::check_decode_with_alloc_limit(
+        Frames::<Tag>::new,
+        data,
+        2 * Frames::<Tag>::new().capacity(),
+    );
+    contract::check_decode_with_alloc_limit(
+        Frames::<Value>::new,
+        data,
+        2 * Frames::<Value>::new().capacity(),
+    );
     let _ = ContextValue::<9>::read(data, data.first().copied().unwrap_or(0));
     contract::check_wire::<Tag>(data);
     contract::check_wire::<Value>(data);
@@ -67,7 +75,10 @@ fn writers(b: &[u8]) {
     });
     let npdu = Npdu {
         destination: (byte(3) & 1 != 0).then(|| Destination {
-            address: NetAddress { network: word(4), mac: vec![byte(6); usize::from(byte(3) % 8)] },
+            address: NetAddress {
+                network: word(4),
+                mac: vec![byte(6); usize::from(byte(3) % 8)],
+            },
             hop_count: byte(7),
         }),
         source: (byte(3) & 2 != 0).then(|| NetAddress {

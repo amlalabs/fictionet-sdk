@@ -84,11 +84,11 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use fictionet::stdlib::codec::field;
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Wire};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::field;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
@@ -228,7 +228,9 @@ impl FromStr for Price {
     type Err = Error;
     /// Reads "102.5" or "102" as dollars; refuses more than four places.
     fn from_str(s: &str) -> Result<Self, Error> {
-        field::parse_decimal(s, 4).map_err(|_| Error::Price).map(Self)
+        field::parse_decimal(s, 4)
+            .map_err(|_| Error::Price)
+            .map(Self)
     }
 }
 impl Field for Price {
@@ -392,7 +394,9 @@ pub struct Unknown {
 }
 
 fn check_length(b: &[u8], len: usize) -> Result<(), Error> {
-    if b.len() < len { return Err(Error::Length); }
+    if b.len() < len {
+        return Err(Error::Length);
+    }
     Ok(())
 }
 
@@ -410,7 +414,9 @@ fn envelope(b: &[u8]) -> Result<(u8, &[u8]), Error> {
 }
 
 fn write_unknown(u: &Unknown, kinds: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
-    if kinds.contains(&u.kind) { return Err(Error::Type(u.kind)); }
+    if kinds.contains(&u.kind) {
+        return Err(Error::Type(u.kind));
+    }
     write_head(u.kind, 2 + u.body.len(), out)?;
     out.extend_from_slice(&u.body);
     Ok(())
@@ -1261,16 +1267,25 @@ impl Prefixed for Unit {
     const NAME: &'static str = "PITCH";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_UNIT_LENGTH }
+    fn default_limit() -> Self::Limit {
+        MAX_UNIT_LENGTH
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(HEADER_LENGTH, MAX_UNIT_LENGTH) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.clamp(HEADER_LENGTH, MAX_UNIT_LENGTH)
+    }
 
     #[inline]
-    fn capacity(limit: &Self::Limit) -> usize { *limit }
+    fn capacity(limit: &Self::Limit) -> usize {
+        *limit
+    }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         let Some(prefix) = input.get(..2) else {
             return Ok(None);
@@ -1288,7 +1303,6 @@ impl Prefixed for Unit {
         Ok(Some((Unit::parse(unit), length)))
     }
 }
-
 
 /// Missing messages on one unit, ready to request from the GRP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1849,11 +1863,11 @@ fn level(price: Price, a: &Aggregate) -> Level {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg,
+    use fictionet::stdlib::codec::{Fail, Lcg};
+    use fictionet::stdlib::test_support::contract::{
+        check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
     };
-    use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value};
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn sym6(s: &str) -> Symbol6 {
@@ -3053,10 +3067,7 @@ mod tests {
         // A modify that empties its level may open another.
         book.apply(1, &modify(1, 90, 5)).unwrap();
         // One that leaves its level behind may not.
-        assert_eq!(
-            book.apply(1, &modify(2, 70, 5)),
-            Err(Error::TooManyLevels)
-        );
+        assert_eq!(book.apply(1, &modify(2, 70, 5)), Err(Error::TooManyLevels));
         // The last order of a symbol may move to a new symbol's place.
         let mut book = Book::new(BookConfig {
             max_symbols: 1,

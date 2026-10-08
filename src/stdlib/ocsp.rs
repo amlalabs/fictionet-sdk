@@ -84,9 +84,11 @@
 //! assert_eq!(basic.data.responses[0].cert_id.serial_number, [0x12, 0x34]);
 //! ```
 
+use fictionet::stdlib::asn1::{
+    self, Class, Element, Header, Length, Oid, Reader, Rules, Tag, Writer,
+};
 use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::base64::{self, Padding};
-use fictionet::stdlib::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, Tag, Writer};
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port OCSP responders usually listen on, since OCSP runs over
@@ -195,7 +197,9 @@ impl std::fmt::Display for Error {
             Error::Certificate => f.write_str("certificate not a SEQUENCE"),
             Error::GetPath => f.write_str("GET path not percent-encoded base64"),
             Error::ResponseBytes => f.write_str("responseBytes do not match the status"),
-            Error::RequestorName => f.write_str("requestor name missing from a signed request, or not a GeneralName"),
+            Error::RequestorName => {
+                f.write_str("requestor name missing from a signed request, or not a GeneralName")
+            }
             Error::Nonce => f.write_str("nonce not 1 to 128 bytes long"),
             Error::HashLength => f.write_str("hash not as long as its algorithm makes it"),
             Error::NoRequests => f.write_str("request asks about no certificates"),
@@ -233,12 +237,18 @@ pub struct AlgorithmIdentifier {
 impl AlgorithmIdentifier {
     /// SHA-1 with NULL parameters, as most clients name their CertID hash.
     pub fn sha1() -> AlgorithmIdentifier {
-        AlgorithmIdentifier { algorithm: known_oid(oid::SHA1), parameters: Some(vec![0x05, 0x00]) }
+        AlgorithmIdentifier {
+            algorithm: known_oid(oid::SHA1),
+            parameters: Some(vec![0x05, 0x00]),
+        }
     }
 
     /// SHA-256 with NULL parameters.
     pub fn sha256() -> AlgorithmIdentifier {
-        AlgorithmIdentifier { algorithm: known_oid(oid::SHA256), parameters: Some(vec![0x05, 0x00]) }
+        AlgorithmIdentifier {
+            algorithm: known_oid(oid::SHA256),
+            parameters: Some(vec![0x05, 0x00]),
+        }
     }
 }
 
@@ -285,7 +295,11 @@ impl Extension {
         }
         let mut w = Writer::new();
         w.octet_string(nonce);
-        Ok(Extension { id: known_oid(oid::NONCE), critical: false, value: w.finish()? })
+        Ok(Extension {
+            id: known_oid(oid::NONCE),
+            critical: false,
+            value: w.finish()?,
+        })
     }
 }
 
@@ -348,7 +362,13 @@ pub struct Request {
 impl Request {
     /// A v1 request about `requests`, unsigned, with no extensions.
     pub fn new(requests: Vec<SingleRequest>) -> Request {
-        Request { version: 0, requestor_name: None, requests, extensions: vec![], signature: None }
+        Request {
+            version: 0,
+            requestor_name: None,
+            requests,
+            extensions: vec![],
+            signature: None,
+        }
     }
 
     fn decode(b: &[u8]) -> Result<Request, Error> {
@@ -381,7 +401,10 @@ impl Request {
             let cert_id = read_cert_id(&mut one)?;
             let extensions = read_extensions(&mut one, 0)?;
             one.finish()?;
-            requests.push(SingleRequest { cert_id, extensions });
+            requests.push(SingleRequest {
+                cert_id,
+                extensions,
+            });
         }
         if requests.is_empty() {
             return Err(Error::NoRequests);
@@ -396,7 +419,11 @@ impl Request {
                 let signature = read_signature_bits(&mut s)?;
                 let certs = read_certs(&mut s)?;
                 s.finish()?;
-                Some(Signature { algorithm, signature, certs })
+                Some(Signature {
+                    algorithm,
+                    signature,
+                    certs,
+                })
             }
             None => None,
         };
@@ -404,7 +431,16 @@ impl Request {
         if signature.is_some() && requestor_name.is_none() {
             return Err(Error::RequestorName);
         }
-        Ok((Request { version, requestor_name, requests, extensions, signature }, tbs_element.raw()))
+        Ok((
+            Request {
+                version,
+                requestor_name,
+                requests,
+                extensions,
+                signature,
+            },
+            tbs_element.raw(),
+        ))
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -563,12 +599,18 @@ pub struct Response {
 impl Response {
     /// A response that says only that the request failed with `status`.
     pub fn error(status: ResponseStatus) -> Response {
-        Response { status, bytes: None }
+        Response {
+            status,
+            bytes: None,
+        }
     }
 
     /// A successful response carrying `basic`.
     pub fn basic(basic: BasicResponse) -> Response {
-        Response { status: ResponseStatus::Successful, bytes: Some(ResponseBytes::Basic(basic)) }
+        Response {
+            status: ResponseStatus::Successful,
+            bytes: Some(ResponseBytes::Basic(basic)),
+        }
     }
 
     /// The basic response it carries, if any.
@@ -594,7 +636,10 @@ impl Response {
                 Some(if response_type.as_bytes() == oid::BASIC {
                     ResponseBytes::Basic(BasicResponse::parse(&response)?)
                 } else {
-                    ResponseBytes::Other { response_type, response: response.into_owned() }
+                    ResponseBytes::Other {
+                        response_type,
+                        response: response.into_owned(),
+                    }
                 })
             }
             None => None,
@@ -613,7 +658,10 @@ impl Response {
                 basic = (known_oid(oid::BASIC), b.encode()?);
                 (Some(&basic.0), &basic.1)
             }
-            Some(ResponseBytes::Other { response_type, response }) => {
+            Some(ResponseBytes::Other {
+                response_type,
+                response,
+            }) => {
                 if response_type.as_bytes() == oid::BASIC {
                     return Err(Error::ResponseBytes);
                 }
@@ -664,7 +712,12 @@ impl BasicResponse {
         let signature = read_signature_bits(&mut s)?;
         let certs = read_certs(&mut s)?;
         s.finish()?;
-        Ok(BasicResponse { data, signature_algorithm, signature, certs })
+        Ok(BasicResponse {
+            data,
+            signature_algorithm,
+            signature,
+            certs,
+        })
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
@@ -952,7 +1005,9 @@ impl Frames {
     /// Zero refuses every message. Oversized messages are refused from
     /// their headers, before their contents arrive.
     pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.min(MAX_MESSAGE) }
+        Self {
+            limit: limit.min(MAX_MESSAGE),
+        }
     }
 
     /// The maximum message size, including its ASN.1 header.
@@ -1012,20 +1067,32 @@ fn outer(b: &[u8]) -> Result<Reader<'_>, Error> {
 /// A writer's bytes, or its error, or [`Error::TooLong`].
 fn finish(w: Writer) -> Result<Vec<u8>, Error> {
     let b = w.finish()?;
-    if b.len() > MAX_MESSAGE { Err(Error::TooLong) } else { Ok(b) }
+    if b.len() > MAX_MESSAGE {
+        Err(Error::TooLong)
+    } else {
+        Ok(b)
+    }
 }
 
 /// Refuses a status and responseBytes that disagree (RFC 6960 4.2.1).
 fn check_status(status: ResponseStatus, bytes: &Option<ResponseBytes>) -> Result<(), Error> {
     let successful = status == ResponseStatus::Successful;
-    if successful == bytes.is_some() { Ok(()) } else { Err(Error::ResponseBytes) }
+    if successful == bytes.is_some() {
+        Ok(())
+    } else {
+        Err(Error::ResponseBytes)
+    }
 }
 
 /// Refuses a time with fractional seconds, which RFC 6960 4.2.2.1 rules
 /// out by taking RFC 5280's form, `YYYYMMDDHHMMSSZ`. The rest of the form
 /// is checked as DER by the asn1 reader and writer.
 fn check_time(t: &str) -> Result<(), Error> {
-    if t.contains(['.', ',']) { Err(Error::Asn1(asn1::Error::Time)) } else { Ok(()) }
+    if t.contains(['.', ',']) {
+        Err(Error::Asn1(asn1::Error::Time))
+    } else {
+        Ok(())
+    }
 }
 
 /// A GeneralizedTime in the form RFC 5280 allows.
@@ -1036,7 +1103,11 @@ fn read_time(r: &mut Reader<'_>) -> Result<String, Error> {
 }
 
 fn limit<T>(items: &[T], max: usize) -> Result<(), Error> {
-    if items.len() > max { Err(Error::TooMany) } else { Ok(()) }
+    if items.len() > max {
+        Err(Error::TooMany)
+    } else {
+        Ok(())
+    }
 }
 
 fn check_certs(certs: &[Vec<u8>]) -> Result<(), Error> {
@@ -1074,7 +1145,11 @@ fn read_version(r: &mut Reader<'_>) -> Result<i64, Error> {
         Some(mut inner) => {
             let v = inner.read_i64()?;
             inner.finish()?;
-            if v == 0 { Err(Error::ExplicitDefault) } else { Ok(v) }
+            if v == 0 {
+                Err(Error::ExplicitDefault)
+            } else {
+                Ok(v)
+            }
         }
         None => Ok(0),
     }
@@ -1089,9 +1164,16 @@ fn write_version(w: &mut Writer, v: i64) {
 fn read_algorithm(r: &mut Reader<'_>) -> Result<AlgorithmIdentifier, Error> {
     let mut s = r.read_sequence()?;
     let algorithm = s.read_oid()?;
-    let parameters = if s.is_empty() { None } else { Some(checked_raw(&s.read()?)?) };
+    let parameters = if s.is_empty() {
+        None
+    } else {
+        Some(checked_raw(&s.read()?)?)
+    };
     s.finish()?;
-    Ok(AlgorithmIdentifier { algorithm, parameters })
+    Ok(AlgorithmIdentifier {
+        algorithm,
+        parameters,
+    })
 }
 
 fn write_algorithm(w: &mut Writer, a: &AlgorithmIdentifier) {
@@ -1110,7 +1192,12 @@ fn read_cert_id(r: &mut Reader<'_>) -> Result<CertId, Error> {
     let issuer_key_hash = s.read_octet_string()?.into_owned();
     let serial_number = s.read_integer()?.as_bytes().to_vec();
     s.finish()?;
-    let id = CertId { hash_algorithm, issuer_name_hash, issuer_key_hash, serial_number };
+    let id = CertId {
+        hash_algorithm,
+        issuer_name_hash,
+        issuer_key_hash,
+        serial_number,
+    };
     check_cert_id(&id)?;
     Ok(id)
 }
@@ -1135,7 +1222,11 @@ fn check_cert_id(c: &CertId) -> Result<(), Error> {
         Some(n) => h.len() == n,
         None => !h.is_empty(),
     };
-    if ok(&c.issuer_name_hash) && ok(&c.issuer_key_hash) { Ok(()) } else { Err(Error::HashLength) }
+    if ok(&c.issuer_name_hash) && ok(&c.issuer_key_hash) {
+        Ok(())
+    } else {
+        Err(Error::HashLength)
+    }
 }
 
 /// Refuses DER that is not one GeneralName (RFC 5280 4.2.1.6): a context
@@ -1157,7 +1248,9 @@ fn check_general_name(der: &[u8]) -> Result<(), Error> {
         (0, true) => {
             let mut inner = e.reader().map_err(|_| bad)?;
             inner.read_oid().is_ok()
-                && inner.read().is_ok_and(|v| v.tag() == Tag::context(0).as_constructed())
+                && inner
+                    .read()
+                    .is_ok_and(|v| v.tag() == Tag::context(0).as_constructed())
                 && inner.is_empty()
         }
         // rfc822Name [1], dNSName [2], uniformResourceIdentifier [6]: IA5String
@@ -1208,7 +1301,11 @@ fn read_extensions(r: &mut Reader<'_>, n: u32) -> Result<Vec<Extension>, Error> 
         };
         let value = s.read_octet_string()?.into_owned();
         s.finish()?;
-        out.push(Extension { id, critical, value });
+        out.push(Extension {
+            id,
+            critical,
+            value,
+        });
     }
     if out.is_empty() {
         return Err(Error::EmptyExtensions);
@@ -1317,7 +1414,13 @@ fn read_response_data(r: &mut Reader<'_>) -> Result<ResponseData, Error> {
     }
     let extensions = read_extensions(&mut s, 1)?;
     s.finish()?;
-    Ok(ResponseData { version, responder_id, produced_at, responses, extensions })
+    Ok(ResponseData {
+        version,
+        responder_id,
+        produced_at,
+        responses,
+        extensions,
+    })
 }
 
 fn write_response_data(w: &mut Writer, d: &ResponseData) {
@@ -1381,7 +1484,13 @@ fn read_single_response(r: &mut Reader<'_>) -> Result<SingleResponse, Error> {
     };
     let extensions = read_extensions(&mut s, 1)?;
     s.finish()?;
-    Ok(SingleResponse { cert_id, status, this_update, next_update, extensions })
+    Ok(SingleResponse {
+        cert_id,
+        status,
+        this_update,
+        next_update,
+        extensions,
+    })
 }
 
 fn write_single_response(w: &mut Writer, r: &SingleResponse) {
@@ -1418,9 +1527,7 @@ fictionet::der_wire!(asn1, impl Wire for ResponseData, Error, Error::Unwritable,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{chunks, mutate};
 
@@ -1437,7 +1544,9 @@ mod tests {
     /// no extensions, as RFC 6960 4.1.1 lays it out.
     fn minimal_request_der() -> Vec<u8> {
         let mut b = vec![0x30, 0x42, 0x30, 0x40, 0x30, 0x3e, 0x30, 0x3c, 0x30, 0x3a];
-        b.extend_from_slice(&[0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00]);
+        b.extend_from_slice(&[
+            0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00,
+        ]);
         b.extend_from_slice(&[0x04, 0x14]);
         b.extend_from_slice(&[0x11; 20]);
         b.extend_from_slice(&[0x04, 0x14]);
@@ -1448,7 +1557,10 @@ mod tests {
 
     fn full_request() -> Request {
         let mut req = Request::new(vec![
-            SingleRequest { cert_id: cert_id(&[0x01]), extensions: vec![] },
+            SingleRequest {
+                cert_id: cert_id(&[0x01]),
+                extensions: vec![],
+            },
             SingleRequest {
                 cert_id: CertId {
                     hash_algorithm: AlgorithmIdentifier::sha256(),
@@ -1456,7 +1568,11 @@ mod tests {
                     issuer_key_hash: vec![0x44; 32],
                     ..cert_id(&[0x00, 0x80, 0x01])
                 },
-                extensions: vec![Extension { id: "1.2.3.4".parse().unwrap(), critical: true, value: vec![5, 0] }],
+                extensions: vec![Extension {
+                    id: "1.2.3.4".parse().unwrap(),
+                    critical: true,
+                    value: vec![5, 0],
+                }],
             },
         ]);
         req.version = 0;
@@ -1464,7 +1580,10 @@ mod tests {
         req.requestor_name = Some(vec![0xa4, 0x02, 0x30, 0x00]);
         req.extensions.push(Extension::nonce(&[0xab; 16]).unwrap());
         req.signature = Some(Signature {
-            algorithm: AlgorithmIdentifier { algorithm: "1.2.840.113549.1.1.11".parse().unwrap(), parameters: None },
+            algorithm: AlgorithmIdentifier {
+                algorithm: "1.2.840.113549.1.1.11".parse().unwrap(),
+                parameters: None,
+            },
             signature: vec![0x5a; 32],
             certs: vec![vec![0x30, 0x03, 0x02, 0x01, 0x07]],
         });
@@ -1481,7 +1600,11 @@ mod tests {
         };
         let mut unknown = single(CertStatus::Unknown, &[3]);
         unknown.next_update = None;
-        unknown.extensions.push(Extension { id: "1.2.3".parse().unwrap(), critical: false, value: vec![] });
+        unknown.extensions.push(Extension {
+            id: "1.2.3".parse().unwrap(),
+            critical: false,
+            value: vec![],
+        });
         Response::basic(BasicResponse {
             data: ResponseData {
                 version: 0,
@@ -1496,7 +1619,13 @@ mod tests {
                         },
                         &[2],
                     ),
-                    single(CertStatus::Revoked { time: "20260102000000Z".to_string(), reason: None }, &[4]),
+                    single(
+                        CertStatus::Revoked {
+                            time: "20260102000000Z".to_string(),
+                            reason: None,
+                        },
+                        &[4],
+                    ),
                     unknown,
                 ],
                 extensions: vec![Extension::nonce(&[0xab; 16]).unwrap()],
@@ -1515,7 +1644,13 @@ mod tests {
         let der = minimal_request_der();
         assert_eq!(der.len(), 68);
         let req = Request::parse(&der).unwrap();
-        assert_eq!(req, Request::new(vec![SingleRequest { cert_id: cert_id(&[1]), extensions: vec![] }]));
+        assert_eq!(
+            req,
+            Request::new(vec![SingleRequest {
+                cert_id: cert_id(&[1]),
+                extensions: vec![]
+            }])
+        );
         assert_eq!(req.nonce(), None);
         assert_eq!(req.to_bytes().unwrap(), der);
     }
@@ -1554,7 +1689,10 @@ mod tests {
         assert_eq!(ext.value, [0x04, 0x03, b'a', b'b', b'c']);
         assert_eq!(find_nonce(std::slice::from_ref(&ext)), Some(&b"abc"[..]));
         // Old clients put the bare bytes in the value.
-        let bare = Extension { value: b"xyz".to_vec(), ..ext };
+        let bare = Extension {
+            value: b"xyz".to_vec(),
+            ..ext
+        };
         assert_eq!(find_nonce(&[bare]), Some(&b"xyz"[..]));
         assert_eq!(find_nonce(&[]), None);
     }
@@ -1609,20 +1747,33 @@ mod tests {
     fn other_response_types_are_kept() {
         let r = Response {
             status: ResponseStatus::Successful,
-            bytes: Some(ResponseBytes::Other { response_type: "1.2.3.4".parse().unwrap(), response: vec![1, 2, 3] }),
+            bytes: Some(ResponseBytes::Other {
+                response_type: "1.2.3.4".parse().unwrap(),
+                response: vec![1, 2, 3],
+            }),
         };
         assert_eq!(Response::parse(&r.to_bytes().unwrap()).unwrap(), r);
         // With the basic type's identifier the bytes must be a basic response.
         let bad = Response {
             status: ResponseStatus::Successful,
-            bytes: Some(ResponseBytes::Other { response_type: known_oid(oid::BASIC), response: vec![1, 2, 3] }),
+            bytes: Some(ResponseBytes::Other {
+                response_type: known_oid(oid::BASIC),
+                response: vec![1, 2, 3],
+            }),
         };
         assert_eq!(bad.to_bytes(), Err(Error::ResponseBytes));
         // Even when they are one: it would read back as Basic, not as it was.
-        let basic = full_response().basic_response().unwrap().to_bytes().unwrap();
+        let basic = full_response()
+            .basic_response()
+            .unwrap()
+            .to_bytes()
+            .unwrap();
         let as_other = Response {
             status: ResponseStatus::Successful,
-            bytes: Some(ResponseBytes::Other { response_type: known_oid(oid::BASIC), response: basic }),
+            bytes: Some(ResponseBytes::Other {
+                response_type: known_oid(oid::BASIC),
+                response: basic,
+            }),
         };
         assert_eq!(as_other.to_bytes(), Err(Error::ResponseBytes));
         // Bytes over a message are refused before they are copied.
@@ -1643,9 +1794,15 @@ mod tests {
         // 30 42 30 40 30 3e ... is "MEIwQDA+..." in base64, with + escaped.
         assert!(path.starts_with("MEIwQDA%2BMDwwOjAJ"), "{path}");
         assert_eq!(decode_get_path(&path).unwrap(), der);
-        assert_eq!(Request::from_get_path(&path).unwrap().to_bytes().unwrap(), der);
+        assert_eq!(
+            Request::from_get_path(&path).unwrap().to_bytes().unwrap(),
+            der
+        );
         // Unescaped, lowercase escapes and no padding all read.
-        let plain = path.replace("%2B", "+").replace("%2F", "/").replace("%3D", "=");
+        let plain = path
+            .replace("%2B", "+")
+            .replace("%2F", "/")
+            .replace("%3D", "=");
         assert_eq!(decode_get_path(&plain).unwrap(), der);
         assert_eq!(decode_get_path(&path.replace("%2B", "%2b")).unwrap(), der);
         assert_eq!(decode_get_path(plain.trim_end_matches('=')).unwrap(), der);
@@ -1656,18 +1813,32 @@ mod tests {
         }
         assert_eq!(encode_get_path(b"\xfb\xff").unwrap(), "%2B%2F8%3D");
         let full = full_request();
-        assert_eq!(Request::from_get_path(&encode_get_path(&full.to_bytes().unwrap()).unwrap()).unwrap(), full);
+        assert_eq!(
+            Request::from_get_path(&encode_get_path(&full.to_bytes().unwrap()).unwrap()).unwrap(),
+            full
+        );
     }
 
     #[test]
     fn get_path_errors() {
-        for bad in ["A", "AB=C", "ABC==", "AB===", "AB%", "AB%4", "AB%G0", "AB-_", "AB C", "ABCDE"] {
+        for bad in [
+            "A", "AB=C", "ABC==", "AB===", "AB%", "AB%4", "AB%G0", "AB-_", "AB C", "ABCDE",
+        ] {
             assert_eq!(decode_get_path(bad), Err(Error::GetPath), "{bad}");
         }
-        assert_eq!(decode_get_path(&"A".repeat(MAX_GET_PATH + 1)), Err(Error::TooLong));
+        assert_eq!(
+            decode_get_path(&"A".repeat(MAX_GET_PATH + 1)),
+            Err(Error::TooLong)
+        );
         // Under the path limit, but decoding to more than a message.
-        assert_eq!(decode_get_path(&"A".repeat((MAX_MESSAGE / 3 + 1) * 4)), Err(Error::TooLong));
-        assert_eq!(encode_get_path(&vec![0; MAX_MESSAGE + 1]), Err(Error::TooLong));
+        assert_eq!(
+            decode_get_path(&"A".repeat((MAX_MESSAGE / 3 + 1) * 4)),
+            Err(Error::TooLong)
+        );
+        assert_eq!(
+            encode_get_path(&vec![0; MAX_MESSAGE + 1]),
+            Err(Error::TooLong)
+        );
         assert!(encode_get_path(&vec![0xff; MAX_MESSAGE]).unwrap().len() <= MAX_GET_PATH);
         assert!(decode_get_path(&encode_get_path(&vec![0xff; MAX_MESSAGE]).unwrap()).is_ok());
     }
@@ -1697,12 +1868,21 @@ mod tests {
     #[test]
     fn request_errors() {
         // Not a SEQUENCE, trailing bytes, a short read.
-        assert!(matches!(Request::parse(&[0x31, 0x00]), Err(Error::Asn1(asn1::Error::Unexpected { .. }))));
+        assert!(matches!(
+            Request::parse(&[0x31, 0x00]),
+            Err(Error::Asn1(asn1::Error::Unexpected { .. }))
+        ));
         let mut trailing = minimal_request_der();
         trailing.push(0);
-        assert_eq!(Request::parse(&trailing), Err(Error::Asn1(asn1::Error::Trailing)));
+        assert_eq!(
+            Request::parse(&trailing),
+            Err(Error::Asn1(asn1::Error::Trailing))
+        );
         assert_eq!(Request::parse(&[]), Err(Error::Asn1(asn1::Error::Empty)));
-        assert_eq!(Request::parse(&vec![0x30; MAX_MESSAGE + 1]), Err(Error::TooLong));
+        assert_eq!(
+            Request::parse(&vec![0x30; MAX_MESSAGE + 1]),
+            Err(Error::TooLong)
+        );
         // Version v1 written out: [0] { INTEGER 0 }.
         assert_eq!(
             Request::parse(&request_with(&[0xa0, 0x03, 0x02, 0x01, 0x00], &[])),
@@ -1711,13 +1891,26 @@ mod tests {
         let v2 = Request::parse(&request_with(&[0xa0, 0x03, 0x02, 0x01, 0x01], &[])).unwrap();
         assert_eq!(v2.version, 1);
         // An empty list of extensions: [2] { SEQUENCE {} }.
-        assert_eq!(Request::parse(&request_with(&[], &[0xa2, 0x02, 0x30, 0x00])), Err(Error::EmptyExtensions));
+        assert_eq!(
+            Request::parse(&request_with(&[], &[0xa2, 0x02, 0x30, 0x00])),
+            Err(Error::EmptyExtensions)
+        );
         // critical FALSE written out.
-        let ext = [0xa2, 0x0c, 0x30, 0x0a, 0x30, 0x08, 0x06, 0x01, 0x2a, 0x01, 0x01, 0x00, 0x04, 0x00];
-        assert_eq!(Request::parse(&request_with(&[], &ext)), Err(Error::ExplicitDefault));
+        let ext = [
+            0xa2, 0x0c, 0x30, 0x0a, 0x30, 0x08, 0x06, 0x01, 0x2a, 0x01, 0x01, 0x00, 0x04, 0x00,
+        ];
+        assert_eq!(
+            Request::parse(&request_with(&[], &ext)),
+            Err(Error::ExplicitDefault)
+        );
         let mut ext_true = ext;
         ext_true[11] = 0xff;
-        assert!(Request::parse(&request_with(&[], &ext_true)).unwrap().extensions[0].critical);
+        assert!(
+            Request::parse(&request_with(&[], &ext_true))
+                .unwrap()
+                .extensions[0]
+                .critical
+        );
         // A requestor name that is not DER: a BOOLEAN of 0x01.
         assert_eq!(
             Request::parse(&request_with(&[0xa1, 0x03, 0x01, 0x01, 0x01], &[])),
@@ -1733,7 +1926,10 @@ mod tests {
                 }
             })
         });
-        assert_eq!(Request::parse(&request_with(&[], &w.finish().unwrap())), Err(Error::TooMany));
+        assert_eq!(
+            Request::parse(&request_with(&[], &w.finish().unwrap())),
+            Err(Error::TooMany)
+        );
         let mut w = Writer::new();
         w.sequence(|w| {
             w.sequence(|w| {
@@ -1752,14 +1948,20 @@ mod tests {
         let req = full_request();
         let der = req.to_bytes().unwrap();
         // The signature BIT STRING is 03 21 00 5a...; give it 1 unused bit.
-        let at = der.windows(3).position(|w| w == [0x03, 0x21, 0x00]).unwrap();
+        let at = der
+            .windows(3)
+            .position(|w| w == [0x03, 0x21, 0x00])
+            .unwrap();
         let mut odd = der.clone();
         odd[at + 2] = 1;
         odd[at + 34] = 0x5a & 0xfe;
         assert_eq!(Request::parse(&odd), Err(Error::UnusedBits));
         // A certificate that is not a SEQUENCE.
         let mut not_seq = der.clone();
-        let at = not_seq.windows(5).position(|w| w == [0x30, 0x03, 0x02, 0x01, 0x07]).unwrap();
+        let at = not_seq
+            .windows(5)
+            .position(|w| w == [0x30, 0x03, 0x02, 0x01, 0x07])
+            .unwrap();
         not_seq[at] = 0x31;
         assert_eq!(Request::parse(&not_seq), Err(Error::Certificate));
         // Too many certificates, either way.
@@ -1787,7 +1989,13 @@ mod tests {
     #[test]
     fn writer_errors() {
         let mut r = full_request();
-        r.requests = vec![SingleRequest { cert_id: cert_id(&[1]), extensions: vec![] }; MAX_REQUESTS + 1];
+        r.requests = vec![
+            SingleRequest {
+                cert_id: cert_id(&[1]),
+                extensions: vec![]
+            };
+            MAX_REQUESTS + 1
+        ];
         assert_eq!(r.to_bytes(), Err(Error::TooMany));
         let mut r = full_request();
         r.extensions = vec![Extension::nonce(b"x").unwrap(); MAX_EXTENSIONS + 1];
@@ -1801,23 +2009,35 @@ mod tests {
         r.signature.as_mut().unwrap().certs = vec![vec![0x02, 0x01, 0x00]];
         assert_eq!(r.to_bytes(), Err(Error::Certificate));
         let mut r = full_request();
-        r.extensions = vec![Extension { id: known_oid(oid::NONCE), critical: false, value: vec![0; MAX_MESSAGE] }];
+        r.extensions = vec![Extension {
+            id: known_oid(oid::NONCE),
+            critical: false,
+            value: vec![0; MAX_MESSAGE],
+        }];
         assert_eq!(r.to_bytes(), Err(Error::TooLong));
 
         let mut resp = full_response();
-        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
+        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else {
+            panic!()
+        };
         b.data.produced_at = "2026-10-05".to_string();
         assert_eq!(resp.to_bytes(), Err(Error::Asn1(asn1::Error::Time)));
         let mut resp = full_response();
-        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
+        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else {
+            panic!()
+        };
         b.data.responder_id = ResponderId::ByName(vec![0x04, 0x00]);
         assert_eq!(resp.to_bytes(), Err(Error::ResponderId));
         let mut resp = full_response();
-        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
+        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else {
+            panic!()
+        };
         b.data.responses = vec![b.data.responses[0].clone(); MAX_RESPONSES + 1];
         assert_eq!(resp.to_bytes(), Err(Error::TooMany));
         let mut resp = full_response();
-        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
+        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else {
+            panic!()
+        };
         b.signature_algorithm.parameters = Some(vec![0x05, 0x00, 0x05, 0x00]);
         assert_eq!(resp.to_bytes(), Err(Error::Asn1(asn1::Error::Trailing)));
     }
@@ -1825,7 +2045,11 @@ mod tests {
     #[test]
     fn response_errors() {
         let der = full_response().to_bytes().unwrap();
-        let basic = full_response().basic_response().unwrap().to_bytes().unwrap();
+        let basic = full_response()
+            .basic_response()
+            .unwrap()
+            .to_bytes()
+            .unwrap();
         let wrap = |basic: &[u8]| {
             let mut w = Writer::new();
             w.sequence(|w| {
@@ -1847,10 +2071,16 @@ mod tests {
         assert_eq!(Response::parse(&wrap(&bad)), Err(Error::CertStatus));
         // good with contents: [0] { 00 } in place of [0] {} needs a length change, so use a constructed [0].
         bad[at] = 0xa0;
-        assert_eq!(Response::parse(&wrap(&bad)), Err(Error::Asn1(asn1::Error::Constructed)));
+        assert_eq!(
+            Response::parse(&wrap(&bad)),
+            Err(Error::Asn1(asn1::Error::Constructed))
+        );
         // A responder ID of [3], and a name that is not a SEQUENCE.
         let mut bad = basic.clone();
-        let at = bad.windows(4).position(|w| w == [0xa1, 0x02, 0x30, 0x00]).unwrap();
+        let at = bad
+            .windows(4)
+            .position(|w| w == [0xa1, 0x02, 0x30, 0x00])
+            .unwrap();
         bad[at] = 0xa3;
         assert_eq!(BasicResponse::parse(&bad), Err(Error::ResponderId));
         bad[at] = 0xa1;
@@ -1860,18 +2090,36 @@ mod tests {
         let mut bad = basic.clone();
         let at = bad.windows(4).position(|w| w == *b"2026").unwrap();
         bad[at + 4] = b'9';
-        assert_eq!(BasicResponse::parse(&bad), Err(Error::Asn1(asn1::Error::Time)));
+        assert_eq!(
+            BasicResponse::parse(&bad),
+            Err(Error::Asn1(asn1::Error::Time))
+        );
         // A non-DER boolean in a certificate kept as raw DER.
         let mut bad = basic.clone();
-        let at = bad.windows(5).position(|w| w == [0x30, 0x03, 0x01, 0x01, 0xff]).unwrap();
+        let at = bad
+            .windows(5)
+            .position(|w| w == [0x30, 0x03, 0x01, 0x01, 0xff])
+            .unwrap();
         bad[at + 4] = 0x01;
-        assert_eq!(BasicResponse::parse(&bad), Err(Error::Asn1(asn1::Error::Boolean)));
+        assert_eq!(
+            BasicResponse::parse(&bad),
+            Err(Error::Asn1(asn1::Error::Boolean))
+        );
         // The error inside reaches the outer parse.
-        assert_eq!(Response::parse(&wrap(&bad)), Err(Error::Asn1(asn1::Error::Boolean)));
+        assert_eq!(
+            Response::parse(&wrap(&bad)),
+            Err(Error::Asn1(asn1::Error::Boolean))
+        );
         // An ENUMERATED too large for i64.
         let big = [0x30, 0x0b, 0x0a, 0x09, 0x01, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(Response::parse(&big), Err(Error::Asn1(asn1::Error::Integer)));
-        assert_eq!(Response::parse(&[0x30, 0x03, 0x0a, 0x01, 0x04]), Err(Error::Enumerated));
+        assert_eq!(
+            Response::parse(&big),
+            Err(Error::Asn1(asn1::Error::Integer))
+        );
+        assert_eq!(
+            Response::parse(&[0x30, 0x03, 0x0a, 0x01, 0x04]),
+            Err(Error::Enumerated)
+        );
     }
 
     #[test]
@@ -1890,7 +2138,11 @@ mod tests {
         for n in 0..der.len() {
             assert!(Response::parse(&der[..n]).is_err(), "{n}");
         }
-        let basic = full_response().basic_response().unwrap().to_bytes().unwrap();
+        let basic = full_response()
+            .basic_response()
+            .unwrap()
+            .to_bytes()
+            .unwrap();
         for n in 0..basic.len() {
             assert!(BasicResponse::parse(&basic[..n]).is_err(), "{n}");
         }
@@ -1926,7 +2178,10 @@ mod tests {
         let mut d = Stream::new(Frames::new());
         let fed = &[0x30, 0x80];
         assert_eq!(d.push(fed), fed.len());
-        assert!(matches!(d.next(), Some(Err(Fail::Protocol(Error::Asn1(_))))));
+        assert!(matches!(
+            d.next(),
+            Some(Err(Fail::Protocol(Error::Asn1(_))))
+        ));
         // A message just at the limit is fine.
         let mut d = Stream::new(Frames::new());
         let fed = &[0x04, 0x82, 0xff, 0xfc];
@@ -1941,14 +2196,21 @@ mod tests {
         // RFC 6960 4.2.2.1 takes the time format of RFC 5280 4.1.2.5.2:
         // YYYYMMDDHHMMSSZ, with no fractional seconds.
         let mut resp = full_response();
-        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
+        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else {
+            panic!()
+        };
         b.data.responses[0].this_update = "20261005000000.5Z".to_string();
         assert_eq!(resp.to_bytes(), Err(Error::Asn1(asn1::Error::Time)));
         for set in [
             |d: &mut ResponseData| d.produced_at = "20261005120000.25Z".to_string(),
-            |d: &mut ResponseData| d.responses[0].next_update = Some("20261012000000.1Z".to_string()),
             |d: &mut ResponseData| {
-                d.responses[0].status = CertStatus::Revoked { time: "20260101000000.9Z".to_string(), reason: None }
+                d.responses[0].next_update = Some("20261012000000.1Z".to_string())
+            },
+            |d: &mut ResponseData| {
+                d.responses[0].status = CertStatus::Revoked {
+                    time: "20260101000000.9Z".to_string(),
+                    reason: None,
+                }
             },
         ] {
             let mut d = full_response().basic_response().unwrap().data.clone();
@@ -1966,7 +2228,10 @@ mod tests {
             w.bit_string(&[1], 0);
         });
         let inner = w.finish().unwrap();
-        assert_eq!(BasicResponse::parse(&inner), Err(Error::Asn1(asn1::Error::Time)));
+        assert_eq!(
+            BasicResponse::parse(&inner),
+            Err(Error::Asn1(asn1::Error::Time))
+        );
     }
 
     #[test]
@@ -1978,9 +2243,15 @@ mod tests {
         assert_eq!(bad.to_bytes(), Err(Error::ResponseBytes));
         let empty = Response::error(ResponseStatus::Successful);
         assert_eq!(empty.to_bytes(), Err(Error::ResponseBytes));
-        assert_eq!(Response::parse(&[0x30, 0x03, 0x0a, 0x01, 0x00]), Err(Error::ResponseBytes));
+        assert_eq!(
+            Response::parse(&[0x30, 0x03, 0x0a, 0x01, 0x00]),
+            Err(Error::ResponseBytes)
+        );
         let mut der = full_response().to_bytes().unwrap();
-        let at = der.windows(3).position(|w| w == [0x0a, 0x01, 0x00]).unwrap();
+        let at = der
+            .windows(3)
+            .position(|w| w == [0x0a, 0x01, 0x00])
+            .unwrap();
         der[at + 2] = 3;
         assert_eq!(Response::parse(&der), Err(Error::ResponseBytes));
     }
@@ -2001,7 +2272,10 @@ mod tests {
                 })
             });
         });
-        assert_eq!(Request::parse(&w.finish().unwrap()), Err(Error::RequestorName));
+        assert_eq!(
+            Request::parse(&w.finish().unwrap()),
+            Err(Error::RequestorName)
+        );
         // Unsigned with a name is fine.
         let mut req = full_request();
         req.signature = None;
@@ -2014,11 +2288,24 @@ mod tests {
         // extension marker: 4 is not a status, and 7 not a reason.
         assert_eq!(ResponseStatus::from_code(4), None);
         assert_eq!(CrlReason::from_code(7), None);
-        assert_eq!(Response::parse(&[0x30, 0x03, 0x0a, 0x01, 0x07]), Err(Error::Enumerated));
-        assert_eq!(Response::parse(&[0x30, 0x03, 0x0a, 0x01, 0xff]), Err(Error::Enumerated));
-        let basic = full_response().basic_response().unwrap().to_bytes().unwrap();
+        assert_eq!(
+            Response::parse(&[0x30, 0x03, 0x0a, 0x01, 0x07]),
+            Err(Error::Enumerated)
+        );
+        assert_eq!(
+            Response::parse(&[0x30, 0x03, 0x0a, 0x01, 0xff]),
+            Err(Error::Enumerated)
+        );
+        let basic = full_response()
+            .basic_response()
+            .unwrap()
+            .to_bytes()
+            .unwrap();
         // The KeyCompromise reason is [0] { ENUMERATED 1 }; make it 7.
-        let at = basic.windows(5).position(|w| w == [0xa0, 0x03, 0x0a, 0x01, 0x01]).unwrap();
+        let at = basic
+            .windows(5)
+            .position(|w| w == [0xa0, 0x03, 0x0a, 0x01, 0x01])
+            .unwrap();
         let mut bad = basic.clone();
         bad[at + 4] = 7;
         assert_eq!(BasicResponse::parse(&bad), Err(Error::Enumerated));
@@ -2089,7 +2376,11 @@ mod tests {
             r.requestor_name = Some(bad.clone());
             assert_eq!(r.to_bytes(), Err(Error::RequestorName), "{bad:02x?}");
             let der = request_with(&tlv(0xa1, &bad), &[]);
-            assert_eq!(Request::parse(&der), Err(Error::RequestorName), "{bad:02x?}");
+            assert_eq!(
+                Request::parse(&der),
+                Err(Error::RequestorName),
+                "{bad:02x?}"
+            );
         }
     }
 
@@ -2099,23 +2390,41 @@ mod tests {
         assert_eq!(Extension::nonce(&[]), Err(Error::Nonce));
         assert_eq!(Extension::nonce(&[0; MAX_NONCE + 1]), Err(Error::Nonce));
         assert!(Extension::nonce(&[0; MAX_NONCE]).is_ok());
-        let ext = |value: Vec<u8>| Extension { id: known_oid(oid::NONCE), critical: false, value };
+        let ext = |value: Vec<u8>| Extension {
+            id: known_oid(oid::NONCE),
+            critical: false,
+            value,
+        };
         assert_eq!(find_nonce(&[ext(vec![0x04, 0x00])]), None);
         assert_eq!(find_nonce(&[ext(vec![])]), None);
         assert_eq!(find_nonce(&[ext(tlv(0x04, &[1; MAX_NONCE + 1]))]), None);
         assert_eq!(find_nonce(&[ext(vec![7; MAX_NONCE + 1])]), None);
-        assert_eq!(find_nonce(&[ext(tlv(0x04, &[1; MAX_NONCE]))]), Some(&[1; MAX_NONCE][..]));
+        assert_eq!(
+            find_nonce(&[ext(tlv(0x04, &[1; MAX_NONCE]))]),
+            Some(&[1; MAX_NONCE][..])
+        );
         // A request with an empty nonce reads, but carries no nonce.
-        let mut r = Request::new(vec![SingleRequest { cert_id: cert_id(&[1]), extensions: vec![] }]);
+        let mut r = Request::new(vec![SingleRequest {
+            cert_id: cert_id(&[1]),
+            extensions: vec![],
+        }]);
         r.extensions.push(ext(vec![0x04, 0x00]));
-        assert_eq!(Request::parse(&r.to_bytes().unwrap()).unwrap().nonce(), None);
+        assert_eq!(
+            Request::parse(&r.to_bytes().unwrap()).unwrap().nonce(),
+            None
+        );
     }
 
     #[test]
     fn hashes_have_their_lengths() {
         // RFC 6960 4.1.1: the CertID hashes are hashAlgorithm's; 4.2.1:
         // KeyHash is a SHA-1 hash.
-        let one = |c: CertId| Request::new(vec![SingleRequest { cert_id: c, extensions: vec![] }]);
+        let one = |c: CertId| {
+            Request::new(vec![SingleRequest {
+                cert_id: c,
+                extensions: vec![],
+            }])
+        };
         let mut c = cert_id(&[1]);
         c.issuer_name_hash.clear();
         assert_eq!(one(c).to_bytes(), Err(Error::HashLength));
@@ -2143,7 +2452,9 @@ mod tests {
         assert_eq!(Request::parse(&der), Err(Error::HashLength));
         // A responder key hash of other than 20 bytes, either way.
         let mut resp = full_response();
-        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
+        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else {
+            panic!()
+        };
         b.data.responder_id = ResponderId::ByKey(vec![]);
         assert_eq!(resp.to_bytes(), Err(Error::HashLength));
         let mut w = Writer::new();
@@ -2156,23 +2467,41 @@ mod tests {
             write_algorithm(w, &AlgorithmIdentifier::sha1());
             w.bit_string(&[1], 0);
         });
-        assert_eq!(BasicResponse::parse(&w.finish().unwrap()), Err(Error::HashLength));
+        assert_eq!(
+            BasicResponse::parse(&w.finish().unwrap()),
+            Err(Error::HashLength)
+        );
     }
 
     #[test]
     fn serial_numbers_write_as_they_read() {
         // A serial number in a longer form than DER's would read back
         // shorter, so a writer refuses it.
-        let one = |serial: &[u8]| Request::new(vec![SingleRequest { cert_id: cert_id(serial), extensions: vec![] }]);
+        let one = |serial: &[u8]| {
+            Request::new(vec![SingleRequest {
+                cert_id: cert_id(serial),
+                extensions: vec![],
+            }])
+        };
         for bad in [&[][..], &[0x00, 0x01], &[0xff, 0x80]] {
-            assert_eq!(one(bad).to_bytes(), Err(Error::Asn1(asn1::Error::Integer)), "{bad:02x?}");
+            assert_eq!(
+                one(bad).to_bytes(),
+                Err(Error::Asn1(asn1::Error::Integer)),
+                "{bad:02x?}"
+            );
         }
         for good in [&[0x00][..], &[0x00, 0x80], &[0x7f], &[0x01, 0x00]] {
             let r = one(good);
-            assert_eq!(Request::parse(&r.to_bytes().unwrap()).unwrap(), r, "{good:02x?}");
+            assert_eq!(
+                Request::parse(&r.to_bytes().unwrap()).unwrap(),
+                r,
+                "{good:02x?}"
+            );
         }
         let mut resp = full_response();
-        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
+        let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else {
+            panic!()
+        };
         b.data.responses[0].cert_id.serial_number = vec![0, 1];
         assert_eq!(resp.to_bytes(), Err(Error::Asn1(asn1::Error::Integer)));
     }
@@ -2196,13 +2525,18 @@ mod tests {
         // RFC 6960 4.1.2: the signature covers tbsRequest.
         let req = full_request();
         let der = req.to_bytes().unwrap();
-        let tbs = Request::tbs_request(&req.to_bytes().unwrap()).unwrap().to_vec();
+        let tbs = Request::tbs_request(&req.to_bytes().unwrap())
+            .unwrap()
+            .to_vec();
         let mut outer = Reader::new(&der, Rules::Der);
         let mut inner = outer.read_sequence().unwrap();
         assert_eq!(inner.read().unwrap().raw(), &tbs[..]);
         let mut unsigned = req.clone();
         unsigned.signature = None;
-        assert_eq!(Request::tbs_request(&unsigned.to_bytes().unwrap()).unwrap(), tbs);
+        assert_eq!(
+            Request::tbs_request(&unsigned.to_bytes().unwrap()).unwrap(),
+            tbs
+        );
         assert_eq!(unsigned.to_bytes().unwrap(), tlv(0x30, &tbs));
     }
 
@@ -2234,7 +2568,9 @@ mod tests {
                 Err(_) => refused += 1,
             }
             let mut resp = full_response();
-            let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
+            let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else {
+                panic!()
+            };
             b.data.responder_id = ResponderId::ByName(tlv(0x30, &name));
             b.data.responses[0].cert_id.hash_algorithm.parameters = Some(name.clone());
             b.certs = vec![tlv(0x30, &name)];
@@ -2262,7 +2598,10 @@ mod tests {
         if let Ok(r) = Request::parse(b) {
             let der = r.to_bytes().unwrap();
             assert_eq!(Request::parse(&der).unwrap(), r);
-            assert_eq!(Request::from_get_path(&encode_get_path(&r.to_bytes().unwrap()).unwrap()).unwrap(), r);
+            assert_eq!(
+                Request::from_get_path(&encode_get_path(&r.to_bytes().unwrap()).unwrap()).unwrap(),
+                r
+            );
             ok += 1;
         }
         if let Ok(r) = Response::parse(b) {
@@ -2289,8 +2628,14 @@ mod tests {
             minimal_request_der(),
             full_request().to_bytes().unwrap(),
             full_response().to_bytes().unwrap(),
-            full_response().basic_response().unwrap().to_bytes().unwrap(),
-            Response::error(ResponseStatus::TryLater).to_bytes().unwrap(),
+            full_response()
+                .basic_response()
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            Response::error(ResponseStatus::TryLater)
+                .to_bytes()
+                .unwrap(),
         ];
         let mut rng = Lcg::new(0x6f63_7370);
         let mut parsed = 0;
@@ -2315,8 +2660,13 @@ mod tests {
     #[test]
     fn module_example() {
         let id = cert_id(&[0x12, 0x34]);
-        let mut request = Request::new(vec![SingleRequest { cert_id: id, extensions: vec![] }]);
-        request.extensions.push(Extension::nonce(b"0123456789abcdef").unwrap());
+        let mut request = Request::new(vec![SingleRequest {
+            cert_id: id,
+            extensions: vec![],
+        }]);
+        request
+            .extensions
+            .push(Extension::nonce(b"0123456789abcdef").unwrap());
         let body = request.to_bytes().unwrap();
         let request = Request::parse(&body).unwrap();
         let data = ResponseData {
@@ -2334,7 +2684,11 @@ mod tests {
                     extensions: vec![],
                 })
                 .collect(),
-            extensions: request.nonce().and_then(|n| Extension::nonce(n).ok()).into_iter().collect(),
+            extensions: request
+                .nonce()
+                .and_then(|n| Extension::nonce(n).ok())
+                .into_iter()
+                .collect(),
         };
         let basic = BasicResponse {
             data,
@@ -2375,7 +2729,11 @@ mod tests {
         bytes.push(0);
         assert!(<Response as Wire>::parse(&bytes).is_err());
         let mut out = vec![42];
-        assert!(Response::error(ResponseStatus::Successful).write(&mut out).is_err());
+        assert!(
+            Response::error(ResponseStatus::Successful)
+                .write(&mut out)
+                .is_err()
+        );
         assert!(Request::new(Vec::new()).write(&mut out).is_err());
         assert_eq!(out, [42]);
     }

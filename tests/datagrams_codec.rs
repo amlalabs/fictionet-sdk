@@ -21,7 +21,11 @@ where
     let bytes = contract::check_written(value);
     assert!(bytes.len() <= limit);
     assert_eq!(
-        contract::check_decode_with_alloc_limit(|| Collect::<M>::new(limit), &bytes, 2 * (limit + 1)),
+        contract::check_decode_with_alloc_limit(
+            || Collect::<M>::new(limit),
+            &bytes,
+            2 * (limit + 1)
+        ),
         (vec![value.clone()], None)
     );
 
@@ -40,8 +44,15 @@ where
     if !bytes.is_empty() {
         let small = bytes.len() - 1;
         assert_eq!(
-            contract::check_decode_with_alloc_limit(|| Collect::<M>::new(small), &bytes, 2 * (small + 1)),
-            (vec![], Some(Fail::Protocol(CollectError::TooLong { limit: small })))
+            contract::check_decode_with_alloc_limit(
+                || Collect::<M>::new(small),
+                &bytes,
+                2 * (small + 1)
+            ),
+            (
+                vec![],
+                Some(Fail::Protocol(CollectError::TooLong { limit: small }))
+            )
         );
         let mut stream = Stream::new(Collect::<M>::new(small));
         assert_eq!(stream.push(&bytes), bytes.len());
@@ -58,8 +69,15 @@ where
 {
     let expected = M::parse(bytes).unwrap_err();
     assert_eq!(
-        contract::check_decode_with_alloc_limit(|| Collect::<M>::new(limit), bytes, 2 * (limit + 1)),
-        (vec![], Some(Fail::Protocol(CollectError::Parse(expected.clone()))))
+        contract::check_decode_with_alloc_limit(
+            || Collect::<M>::new(limit),
+            bytes,
+            2 * (limit + 1)
+        ),
+        (
+            vec![],
+            Some(Fail::Protocol(CollectError::Parse(expected.clone())))
+        )
     );
     let mut stream = Stream::new(Collect::<M>::new(limit));
     assert_eq!(stream.push(bytes), bytes.len());
@@ -334,7 +352,10 @@ fn ospf_context_stays_in_the_mapping() {
                 advertising_router: Ipv4Addr::new(192, 0, 2, 3),
             }]),
         };
-        let mut bytes = packet.frame(&endpoints).and_then(|frame| frame.to_bytes()).unwrap();
+        let mut bytes = packet
+            .frame(&endpoints)
+            .and_then(|frame| frame.to_bytes())
+            .unwrap();
         assert_eq!(ospf::Packet::parse(&bytes, &endpoints), Ok(packet));
         context_round_trip::<ospf::Datagram, _, _>(&bytes, ospf::MAX_MESSAGE, |b| {
             ospf::Packet::parse(b, &endpoints)
@@ -370,7 +391,10 @@ fn pim_context_stays_in_the_mapping() {
     ];
     for endpoints in endpoints {
         let message = pim::Message::Hello(vec![pim::HelloOption::Holdtime(105)]);
-        let mut bytes = message.frame(&endpoints).and_then(|frame| frame.to_bytes()).unwrap();
+        let mut bytes = message
+            .frame(&endpoints)
+            .and_then(|frame| frame.to_bytes())
+            .unwrap();
         assert_eq!(pim::Message::parse(&bytes, &endpoints), Ok(message));
         context_round_trip::<pim::Datagram, _, _>(&bytes, pim::MAX_MESSAGE, |b| {
             pim::Message::parse(b, &endpoints)
@@ -433,7 +457,10 @@ fn vrrp_context_stays_in_the_mapping() {
         ),
     ];
     for (endpoints, advertisement) in cases {
-        let mut bytes = advertisement.frame(&endpoints).and_then(|frame| frame.to_bytes()).unwrap();
+        let mut bytes = advertisement
+            .frame(&endpoints)
+            .and_then(|frame| frame.to_bytes())
+            .unwrap();
         assert_eq!(
             vrrp::Advertisement::parse(&bytes, &endpoints),
             Ok(advertisement)

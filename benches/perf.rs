@@ -36,7 +36,9 @@ use fictionet::relay::{self, Hello, Message as RelayMessage, unix};
 use fictionet::stdlib::dns::op::{Message, MessageType, Query, ResponseCode};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::{self, ConnError, Connection, ip, tcp, tls, udp, web};
-use fictionet::{Attacher, Cx, End, Interface, Packet, RecvError, WorldSocket, block_on, listen, pair, run};
+use fictionet::{
+    Attacher, Cx, End, Interface, Packet, RecvError, WorldSocket, block_on, listen, pair, run,
+};
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
@@ -91,7 +93,8 @@ fn cpu_us() -> u64 {
         libc::getrusage(libc::RUSAGE_SELF, r.as_mut_ptr());
         r.assume_init()
     };
-    ((r.ru_utime.tv_sec + r.ru_stime.tv_sec) * 1_000_000 + r.ru_utime.tv_usec + r.ru_stime.tv_usec) as u64
+    ((r.ru_utime.tv_sec + r.ru_stime.tv_sec) * 1_000_000 + r.ru_utime.tv_usec + r.ru_stime.tv_usec)
+        as u64
 }
 
 /// Heap bytes allocated and not yet freed, by the whole process.
@@ -110,25 +113,79 @@ struct Options {
 type Group = (&'static str, &'static str, fn(&Options));
 
 const GROUPS: &[Group] = &[
-    ("tcp", "bulk TCP between two endpoints on one pair: 1, 10 and 100 flows", tcp_direct),
-    ("path", "bulk TCP through a protocol split at each end and a router: 1, 10 and 100 flows", tcp_path),
-    ("idle", "one active TCP flow beside 0 and 99 idle connections on the same endpoints", tcp_idle),
-    ("delay", "bulk TCP over a delayed link (10 ms and 50 ms each way)", tcp_delay),
-    ("sched", "the scheduler: packet ping-pong through a pair, and small TCP exchanges", sched),
-    ("memory", "memory held by a delay and a bottleneck whose output is never read", memory),
-    ("relay", "the relay protocol: socketpair sends, and an echo through listen", relay_group),
-    ("sites", "HTTP/1.1 and HTTP/2 over TLS to a Sites site, from 1 and 10 sandboxes", sites),
-    ("observe", "the cost of an observer watching the graph and ten sandbox links", observe),
-    ("graph", "HTTP/2 latency with 1,000 sites while an observer watches the graph", graph),
-    ("proxy", "fictionet attach --type http_proxy: DNS queries for cold and missing names", proxy),
-    ("decoders", "in-memory TPKT/COTP, HTTP/1 requests and ITCH in 16 KiB chunks", decoders),
+    (
+        "tcp",
+        "bulk TCP between two endpoints on one pair: 1, 10 and 100 flows",
+        tcp_direct,
+    ),
+    (
+        "path",
+        "bulk TCP through a protocol split at each end and a router: 1, 10 and 100 flows",
+        tcp_path,
+    ),
+    (
+        "idle",
+        "one active TCP flow beside 0 and 99 idle connections on the same endpoints",
+        tcp_idle,
+    ),
+    (
+        "delay",
+        "bulk TCP over a delayed link (10 ms and 50 ms each way)",
+        tcp_delay,
+    ),
+    (
+        "sched",
+        "the scheduler: packet ping-pong through a pair, and small TCP exchanges",
+        sched,
+    ),
+    (
+        "memory",
+        "memory held by a delay and a bottleneck whose output is never read",
+        memory,
+    ),
+    (
+        "relay",
+        "the relay protocol: socketpair sends, and an echo through listen",
+        relay_group,
+    ),
+    (
+        "sites",
+        "HTTP/1.1 and HTTP/2 over TLS to a Sites site, from 1 and 10 sandboxes",
+        sites,
+    ),
+    (
+        "observe",
+        "the cost of an observer watching the graph and ten sandbox links",
+        observe,
+    ),
+    (
+        "graph",
+        "HTTP/2 latency with 1,000 sites while an observer watches the graph",
+        graph,
+    ),
+    (
+        "proxy",
+        "fictionet attach --type http_proxy: DNS queries for cold and missing names",
+        proxy,
+    ),
+    (
+        "decoders",
+        "in-memory TPKT/COTP, HTTP/1 requests and ITCH in 16 KiB chunks",
+        decoders,
+    ),
 ];
 
 fn main() {
     // `cargo bench` passes `--bench`; a filter after `--` names groups.
-    let mut args = std::env::args().skip(1).filter(|a| a != "--bench").peekable();
+    let mut args = std::env::args()
+        .skip(1)
+        .filter(|a| a != "--bench")
+        .peekable();
     let mut names = Vec::new();
-    let mut opts = Options { reps: 3, quick: false };
+    let mut opts = Options {
+        reps: 3,
+        quick: false,
+    };
     while let Some(a) = args.next() {
         match a.as_str() {
             "--reps" => opts.reps = args.next().and_then(|n| n.parse().ok()).expect("--reps N"),
@@ -158,7 +215,10 @@ struct Table {
 
 impl Table {
     fn new(head: &[&str]) -> Table {
-        Table { head: head.iter().map(|s| s.to_string()).collect(), rows: Vec::new() }
+        Table {
+            head: head.iter().map(|s| s.to_string()).collect(),
+            rows: Vec::new(),
+        }
     }
 
     fn row(&mut self, row: Vec<String>) {
@@ -173,12 +233,32 @@ impl Table {
             }
         }
         let line = |cells: &[String]| {
-            let s: Vec<String> =
-                cells.iter().enumerate().map(|(i, c)| if i == 0 { format!("{c:<0$}", w[i]) } else { format!("{c:>0$}", w[i]) }).collect();
+            let s: Vec<String> = cells
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i == 0 {
+                        format!("{c:<0$}", w[i])
+                    } else {
+                        format!("{c:>0$}", w[i])
+                    }
+                })
+                .collect();
             println!("| {} |", s.join(" | "));
         };
         line(&self.head);
-        println!("|{}|", w.iter().enumerate().map(|(i, n)| if i == 0 { format!(":{}", "-".repeat(n + 1)) } else { format!("{}:", "-".repeat(n + 1)) }).collect::<Vec<_>>().join("|"));
+        println!(
+            "|{}|",
+            w.iter()
+                .enumerate()
+                .map(|(i, n)| if i == 0 {
+                    format!(":{}", "-".repeat(n + 1))
+                } else {
+                    format!("{}:", "-".repeat(n + 1))
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        );
         for r in &self.rows {
             line(r);
         }
@@ -193,7 +273,11 @@ fn spread(v: &[f64], digits: usize) -> String {
     if s.len() == 1 {
         return format!("{med:.digits$}");
     }
-    format!("{med:.digits$} [{:.digits$}–{:.digits$}]", s[0], s[s.len() - 1])
+    format!(
+        "{med:.digits$} [{:.digits$}–{:.digits$}]",
+        s[0],
+        s[s.len() - 1]
+    )
 }
 
 fn median(v: &[f64]) -> f64 {
@@ -228,7 +312,7 @@ fn finish(result: fictionet::Result) {
 
 fn decoders(o: &Options) {
     use std::hint::black_box;
-    use stdlib::codec::{Decode, Stream, Wire, pump, finish};
+    use stdlib::codec::{Decode, Stream, Wire, finish, pump};
     use stdlib::{http1, itch, tpkt};
 
     // Keep construction here so a decoder rename changes just one line.
@@ -243,7 +327,10 @@ fn decoders(o: &Options) {
     }
 
     fn measure<D: Decode>(
-        o: &Options, name: &str, frame: &[u8], make: impl Fn() -> D,
+        o: &Options,
+        name: &str,
+        frame: &[u8],
+        make: impl Fn() -> D,
         mut consume: impl FnMut(D::Item),
     ) -> Vec<String>
     where
@@ -276,30 +363,56 @@ fn decoders(o: &Options) {
             items.push(decoded as f64 / seconds);
             per.push(allocations as f64 / decoded as f64);
         }
-        vec![name.to_string(), input.len().to_string(), count.to_string(),
-            spread(&rates, 1), spread(&items, 0), spread(&per, 4)]
+        vec![
+            name.to_string(),
+            input.len().to_string(),
+            count.to_string(),
+            spread(&rates, 1),
+            spread(&items, 0),
+            spread(&per, 4),
+        ]
     }
 
     // A COTP data TPDU with its end-of-message bit set and 128 payload bytes.
     let mut payload = vec![2, 0xf0, 0x80];
     payload.extend_from_slice(&[0x42; 128]);
     let packet = tpkt::Packet::new(payload).to_bytes().unwrap();
-    let request = b"POST /orders HTTP/1.1\r\nHost: bench.local\r\nContent-Length: 16\r\n\r\n0123456789abcdef";
+    let request =
+        b"POST /orders HTTP/1.1\r\nHost: bench.local\r\nContent-Length: 16\r\n\r\n0123456789abcdef";
     let order = itch::AddOrder {
-        header: itch::Header { locate: 7, tracking: 0, timestamp: itch::Timestamp::new(34_200_000_000_000).unwrap() },
+        header: itch::Header {
+            locate: 7,
+            tracking: 0,
+            timestamp: itch::Timestamp::new(34_200_000_000_000).unwrap(),
+        },
         order_ref: 1,
         side: itch::Side::Buy,
         shares: 300,
         stock: itch::Alpha::right_padded("ZXZZT").unwrap(),
         price: itch::Price4(102_500),
-    }.to_bytes().unwrap();
+    }
+    .to_bytes()
+    .unwrap();
     let mut message = (order.len() as u16).to_be_bytes().to_vec();
     message.extend_from_slice(&order);
 
-    let mut t = Table::new(&["decoder", "bytes/run", "items/run", "MB/s", "items/s", "allocs/item"]);
-    t.row(measure(o, "TPKT/COTP", &packet, packets, |item| { black_box(item); }));
-    t.row(measure(o, "HTTP/1 requests", request, requests, |item| { black_box(item); }));
-    t.row(measure(o, "ITCH add orders", &message, messages, |item| { black_box(item.unwrap()); }));
+    let mut t = Table::new(&[
+        "decoder",
+        "bytes/run",
+        "items/run",
+        "MB/s",
+        "items/s",
+        "allocs/item",
+    ]);
+    t.row(measure(o, "TPKT/COTP", &packet, packets, |item| {
+        black_box(item);
+    }));
+    t.row(measure(o, "HTTP/1 requests", request, requests, |item| {
+        black_box(item);
+    }));
+    t.row(measure(o, "ITCH add orders", &message, messages, |item| {
+        black_box(item.unwrap());
+    }));
     t.print();
 }
 
@@ -398,12 +511,40 @@ fn tcp_bulk(topology: Topology, flows: usize, idle: usize, per_flow: usize, opts
                 );
                 let (a, u1, i1, o1) = ip::split_protocols(&fcx, a);
                 let (b, u2, i2, o2) = ip::split_protocols(&fcx, b);
-                (a, b, vec![Box::new(router), Box::new(u1), Box::new(i1), Box::new(o1), Box::new(u2), Box::new(i2), Box::new(o2)])
+                (
+                    a,
+                    b,
+                    vec![
+                        Box::new(router),
+                        Box::new(u1),
+                        Box::new(i1),
+                        Box::new(o1),
+                        Box::new(u2),
+                        Box::new(i2),
+                        Box::new(o2),
+                    ],
+                )
             }
         };
         let (ca, cb) = (Arc::new(Counts::default()), Arc::new(Counts::default()));
-        let client = endpoint(&fcx, Counted { inner: a, counts: ca.clone() }, "10.0.0.1", opts);
-        let server = endpoint(&fcx, Counted { inner: b, counts: cb.clone() }, "10.0.0.2", opts);
+        let client = endpoint(
+            &fcx,
+            Counted {
+                inner: a,
+                counts: ca.clone(),
+            },
+            "10.0.0.1",
+            opts,
+        );
+        let server = endpoint(
+            &fcx,
+            Counted {
+                inner: b,
+                counts: cb.clone(),
+            },
+            "10.0.0.2",
+            opts,
+        );
         let mut listener = server.listen(80)?;
         let mut conns = Vec::new();
         for _ in 0..flows + idle {
@@ -438,7 +579,10 @@ fn tcp_bulk(topology: Topology, flows: usize, idle: usize, per_flow: usize, opts
                 while left > 0 {
                     let n = left.min(buf.len());
                     c_read_exact(&fcx, &mut c, &mut buf[..n]).await?;
-                    assert!(buf[..n].iter().all(|&v| v == 0x5a), "TCP delivered the wrong bytes");
+                    assert!(
+                        buf[..n].iter().all(|&v| v == 0x5a),
+                        "TCP delivered the wrong bytes"
+                    );
                     left -= n;
                 }
                 c.write_all(&fcx, &[1]).await?;
@@ -453,8 +597,14 @@ fn tcp_bulk(topology: Topology, flows: usize, idle: usize, per_flow: usize, opts
         // Let the last ACKs and FINs land before counting what was lost.
         fcx.sleep(fictionet::time::ms(200)).await?;
         let sent = ca.sent.load(Ordering::Relaxed) + cb.sent.load(Ordering::Relaxed) - sent0;
-        let got = ca.delivered.load(Ordering::Relaxed) + cb.delivered.load(Ordering::Relaxed) - got0;
-        *result.lock().unwrap() = Some(Bulk { secs, sent, lost: sent.saturating_sub(got), allocs });
+        let got =
+            ca.delivered.load(Ordering::Relaxed) + cb.delivered.load(Ordering::Relaxed) - got0;
+        *result.lock().unwrap() = Some(Bulk {
+            secs,
+            sent,
+            lost: sent.saturating_sub(got),
+            allocs,
+        });
         drop(quiet);
         fcx.cancel();
         Ok(())
@@ -496,13 +646,30 @@ fn bulk_row(t: &mut Table, label: String, reps: usize, f: impl Fn() -> (Bulk, us
 }
 
 fn flows_table(o: &Options, topology: Topology) {
-    let mut t = Table::new(&["flows × bytes each", "MB/s", "packets sent", "packets lost", "allocs/MB"]);
-    let cases: &[(usize, usize)] =
-        if o.quick { &[(1, 8 << 20), (10, 1 << 20), (100, 256 << 10)] } else { &[(1, 32 << 20), (10, 4 << 20), (100, 1 << 20)] };
+    let mut t = Table::new(&[
+        "flows × bytes each",
+        "MB/s",
+        "packets sent",
+        "packets lost",
+        "allocs/MB",
+    ]);
+    let cases: &[(usize, usize)] = if o.quick {
+        &[(1, 8 << 20), (10, 1 << 20), (100, 256 << 10)]
+    } else {
+        &[(1, 32 << 20), (10, 4 << 20), (100, 1 << 20)]
+    };
     for &(flows, per_flow) in cases {
-        bulk_row(&mut t, format!("{flows} × {} KiB", per_flow >> 10), o.reps, || {
-            (tcp_bulk(topology, flows, 0, per_flow, TcpOpts { buffer: None }), flows * per_flow)
-        });
+        bulk_row(
+            &mut t,
+            format!("{flows} × {} KiB", per_flow >> 10),
+            o.reps,
+            || {
+                (
+                    tcp_bulk(topology, flows, 0, per_flow, TcpOpts { buffer: None }),
+                    flows * per_flow,
+                )
+            },
+        );
     }
     t.print();
 }
@@ -516,16 +683,33 @@ fn tcp_path(o: &Options) {
 }
 
 fn tcp_idle(o: &Options) {
-    let mut t = Table::new(&["active + idle connections", "MB/s", "packets sent", "packets lost", "allocs/MB"]);
+    let mut t = Table::new(&[
+        "active + idle connections",
+        "MB/s",
+        "packets sent",
+        "packets lost",
+        "allocs/MB",
+    ]);
     let size = if o.quick { 8 << 20 } else { 32 << 20 };
     for idle in [0, 99] {
-        bulk_row(&mut t, format!("1 + {idle}"), o.reps, || (tcp_bulk(Topology::Direct, 1, idle, size, TcpOpts { buffer: None }), size));
+        bulk_row(&mut t, format!("1 + {idle}"), o.reps, || {
+            (
+                tcp_bulk(Topology::Direct, 1, idle, size, TcpOpts { buffer: None }),
+                size,
+            )
+        });
     }
     t.print();
 }
 
 fn tcp_delay(o: &Options) {
-    let mut t = Table::new(&["delay each way, flows × bytes, buffer", "MB/s", "packets sent", "packets lost", "allocs/MB"]);
+    let mut t = Table::new(&[
+        "delay each way, flows × bytes, buffer",
+        "MB/s",
+        "packets sent",
+        "packets lost",
+        "allocs/MB",
+    ]);
     let cases: &[(u64, usize, usize)] = if o.quick {
         &[(10, 1, 4 << 20), (10, 10, 1 << 20)]
     } else {
@@ -539,7 +723,10 @@ fn tcp_delay(o: &Options) {
                 buffer.map_or("default".to_string(), |b| format!("{} KiB", b >> 10))
             );
             bulk_row(&mut t, label, o.reps, || {
-                (tcp_bulk(Topology::Delay(ms), flows, 0, per_flow, TcpOpts { buffer }), flows * per_flow)
+                (
+                    tcp_bulk(Topology::Delay(ms), flows, 0, per_flow, TcpOpts { buffer }),
+                    flows * per_flow,
+                )
             });
         }
     }
@@ -555,7 +742,12 @@ fn buffer_sizes() -> Vec<Option<usize>> {
 // The scheduler
 
 fn sched(o: &Options) {
-    let mut t = Table::new(&["workload", "time, ms", "allocations", "allocs per round trip"]);
+    let mut t = Table::new(&[
+        "workload",
+        "time, ms",
+        "allocations",
+        "allocs per round trip",
+    ]);
     let n = if o.quick { 100_000 } else { 500_000 };
     let mut times = Vec::new();
     let mut counts = Vec::new();
@@ -565,7 +757,12 @@ fn sched(o: &Options) {
         counts.push(a);
     }
     let a = median_u(&counts);
-    t.row(vec![format!("{n} packet round trips through a pair"), spread(&times, 1), a.to_string(), format!("{:.2}", a as f64 / n as f64)]);
+    t.row(vec![
+        format!("{n} packet round trips through a pair"),
+        spread(&times, 1),
+        a.to_string(),
+        format!("{:.2}", a as f64 / n as f64),
+    ]);
     let n = if o.quick { 2_000 } else { 10_000 };
     let mut times = Vec::new();
     let mut counts = Vec::new();
@@ -575,7 +772,12 @@ fn sched(o: &Options) {
         counts.push(a);
     }
     let a = median_u(&counts);
-    t.row(vec![format!("{n} TCP 64-byte request/reply exchanges"), spread(&times, 1), a.to_string(), format!("{:.2}", a as f64 / n as f64)]);
+    t.row(vec![
+        format!("{n} TCP 64-byte request/reply exchanges"),
+        spread(&times, 1),
+        a.to_string(),
+        format!("{:.2}", a as f64 / n as f64),
+    ]);
     t.print();
 }
 
@@ -646,13 +848,25 @@ fn tcp_exchanges(n: usize) -> (f64, u64) {
 // Memory
 
 fn memory(o: &Options) {
-    let mut t = Table::new(&["unread link", "packets sent", "payload, MB", "heap growth, MB", "packets in the unread end"]);
+    let mut t = Table::new(&[
+        "unread link",
+        "packets sent",
+        "payload, MB",
+        "heap growth, MB",
+        "packets in the unread end",
+    ]);
     let n = if o.quick { 10_000 } else { 40_000 };
     for kind in ["delay 60 s", "bottleneck, 64-packet queue"] {
         let runs: Vec<(i64, u64)> = (0..o.reps).map(|_| unread(kind, n)).collect();
         let grew: Vec<f64> = runs.iter().map(|r| r.0 as f64 / 1e6).collect();
         let kept = median_u(&runs.iter().map(|r| r.1).collect::<Vec<_>>());
-        t.row(vec![kind.to_string(), n.to_string(), format!("{:.1}", n as f64 * 1500.0 / 1e6), spread(&grew, 1), kept.to_string()]);
+        t.row(vec![
+            kind.to_string(),
+            n.to_string(),
+            format!("{:.1}", n as f64 * 1500.0 / 1e6),
+            spread(&grew, 1),
+            kept.to_string(),
+        ]);
     }
     t.print();
 }
@@ -709,7 +923,11 @@ fn relay_group(o: &Options) {
         rates.push(n as f64 / secs / 1e6);
         per.push(a as f64 / n as f64);
     }
-    t.row(vec![format!("{n} sends of 1,500 bytes on a socketpair"), format!("{} M/s", spread(&rates, 2)), format!("{:.2}", median(&per))]);
+    t.row(vec![
+        format!("{n} sends of 1,500 bytes on a socketpair"),
+        format!("{} M/s", spread(&rates, 2)),
+        format!("{:.2}", median(&per)),
+    ]);
     for outstanding in [1, 64] {
         let n = if o.quick { 20_000 } else { 100_000 };
         let mut rates = Vec::new();
@@ -734,7 +952,14 @@ fn relay_group(o: &Options) {
 fn socketpair_sends(n: usize, size: usize) -> (f64, u64) {
     let mut fds = [0; 2];
     // SAFETY: socketpair fills two fds, owned from here.
-    let r = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) };
+    let r = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
     assert_eq!(r, 0, "socketpair");
     let (a, b) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let reader = std::thread::spawn(move || {
@@ -760,7 +985,9 @@ static SOCKETS: AtomicU64 = AtomicU64::new(0);
 
 /// A path for a world socket, in the build's target directory.
 fn socket_path(tag: &str) -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("bench-sockets");
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("bench-sockets");
     std::fs::create_dir_all(&dir).unwrap();
     let n = SOCKETS.fetch_add(1, Ordering::Relaxed);
     let path = dir.join(format!("{tag}-{}-{n}.sock", std::process::id()));
@@ -788,7 +1015,12 @@ fn listen_echo(n: usize, outstanding: usize) -> (f64, u64) {
         })));
     });
     let fd = unix::connect(&path).unwrap();
-    let hello = Hello { version: relay::VERSION, mtu: 1500, kind: "tun".into(), name: "agent".into() };
+    let hello = Hello {
+        version: relay::VERSION,
+        mtu: 1500,
+        kind: "tun".into(),
+        name: "agent".into(),
+    };
     unix::send(fd.as_raw_fd(), &RelayMessage::Hello(hello).encode(), false).unwrap();
     let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
     let got = unix::recv(fd.as_raw_fd(), &mut buf, false).unwrap();
@@ -873,10 +1105,34 @@ fn sites(o: &Options) {
     let mut t = http_table();
     for h2 in [false, true] {
         for sandboxes in [1, 10] {
-            http_row(&mut t, o.reps, HttpCase { sandboxes, h2, requests, body: 1024, sites: 1, watch: Watch::None, hooks: false });
+            http_row(
+                &mut t,
+                o.reps,
+                HttpCase {
+                    sandboxes,
+                    h2,
+                    requests,
+                    body: 1024,
+                    sites: 1,
+                    watch: Watch::None,
+                    hooks: false,
+                },
+            );
         }
     }
-    http_row(&mut t, o.reps, HttpCase { sandboxes: 10, h2: false, requests, body: 1024, sites: 1, watch: Watch::None, hooks: true });
+    http_row(
+        &mut t,
+        o.reps,
+        HttpCase {
+            sandboxes: 10,
+            h2: false,
+            requests,
+            body: 1024,
+            sites: 1,
+            watch: Watch::None,
+            hooks: true,
+        },
+    );
     t.print();
 }
 
@@ -886,7 +1142,19 @@ fn observe(o: &Options) {
     let requests = if o.quick { 40_000 } else { 200_000 };
     let mut t = http_table();
     for watch in [Watch::None, Watch::Graph, Watch::Packets] {
-        http_row(&mut t, o.reps, HttpCase { sandboxes: 10, h2: false, requests, body: 1024, sites: 1, watch, hooks: false });
+        http_row(
+            &mut t,
+            o.reps,
+            HttpCase {
+                sandboxes: 10,
+                h2: false,
+                requests,
+                body: 1024,
+                sites: 1,
+                watch,
+                hooks: false,
+            },
+        );
     }
     t.print();
 }
@@ -895,13 +1163,34 @@ fn graph(o: &Options) {
     let requests = if o.quick { 40_000 } else { 150_000 };
     let mut t = http_table();
     for watch in [Watch::None, Watch::Graph] {
-        http_row(&mut t, o.reps, HttpCase { sandboxes: 1, h2: true, requests, body: 1024, sites: 1000, watch, hooks: false });
+        http_row(
+            &mut t,
+            o.reps,
+            HttpCase {
+                sandboxes: 1,
+                h2: true,
+                requests,
+                body: 1024,
+                sites: 1000,
+                watch,
+                hooks: false,
+            },
+        );
     }
     t.print();
 }
 
 fn http_table() -> Table {
-    Table::new(&["case", "requests/s", "p50 µs", "p99 µs", "max µs", "CPU µs/req", "allocs/req", "observer rows"])
+    Table::new(&[
+        "case",
+        "requests/s",
+        "p50 µs",
+        "p99 µs",
+        "max µs",
+        "CPU µs/req",
+        "allocs/req",
+        "observer rows",
+    ])
 }
 
 fn http_row(t: &mut Table, reps: usize, case: HttpCase) {
@@ -911,8 +1200,16 @@ fn http_row(t: &mut Table, reps: usize, case: HttpCase) {
         "{} × {}{}{}{}",
         if case.h2 { "HTTP/2" } else { "HTTP/1.1" },
         case.sandboxes,
-        if case.sites > 1 { format!(", {} sites", case.sites) } else { String::new() },
-        if case.hooks { ", events subscribed" } else { "" },
+        if case.sites > 1 {
+            format!(", {} sites", case.sites)
+        } else {
+            String::new()
+        },
+        if case.hooks {
+            ", events subscribed"
+        } else {
+            ""
+        },
         match case.watch {
             Watch::None => "",
             Watch::Graph => ", graph watched",
@@ -942,11 +1239,18 @@ struct Machine {
 fn machine(fcx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Machine {
     let end = attacher.attach(name).unwrap();
     let (tcp, udp, icmp, _other) = ip::split_protocols(fcx, end);
-    Machine { tcp: tcp::endpoint(fcx, tcp, addr.into()), udp: udp::endpoint(fcx, udp, addr.into()), _icmp: icmp }
+    Machine {
+        tcp: tcp::endpoint(fcx, tcp, addr.into()),
+        udp: udp::endpoint(fcx, udp, addr.into()),
+        _icmp: icmp,
+    }
 }
 
 async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Ipv4Addr {
-    let mut socket = m.udp.bind(40000 + (fcx.random_u64() % 20000) as u16).unwrap();
+    let mut socket = m
+        .udp
+        .bind(40000 + (fcx.random_u64() % 20000) as u16)
+        .unwrap();
     let mut q = Message::query();
     q.metadata.id = fcx.random_u64() as u16;
     q.metadata.recursion_desired = true;
@@ -965,7 +1269,11 @@ async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Ipv4Addr {
         .expect("an A record")
 }
 
-fn certs() -> (RootCertStore, Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+fn certs() -> (
+    RootCertStore,
+    Vec<CertificateDer<'static>>,
+    PrivateKeyDer<'static>,
+) {
     let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca_key = KeyPair::generate().unwrap();
@@ -976,7 +1284,11 @@ fn certs() -> (RootCertStore, Vec<CertificateDer<'static>>, PrivateKeyDer<'stati
     let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
-    (roots, vec![leaf.der().clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())))
+    (
+        roots,
+        vec![leaf.der().clone()],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+    )
 }
 
 /// One Sites world with `case.sandboxes` sandboxes, each holding one TLS
@@ -992,8 +1304,11 @@ fn http_run(case: HttpCase) -> HttpRun {
     let ready = Arc::new(AtomicBool::new(false));
     let measuring = Arc::new(AtomicBool::new(false));
     let observer = (case.watch != Watch::None).then(|| {
-        let (stop, ready, measuring, path) = (stop.clone(), ready.clone(), measuring.clone(), path.clone());
-        std::thread::spawn(move || watch_world(&path, case.watch, case.sandboxes, &stop, &ready, &measuring))
+        let (stop, ready, measuring, path) =
+            (stop.clone(), ready.clone(), measuring.clone(), path.clone());
+        std::thread::spawn(move || {
+            watch_world(&path, case.watch, case.sandboxes, &stop, &ready, &measuring)
+        })
     });
     let timing = measuring.clone();
     let out = Arc::new(Mutex::new(None));
@@ -1003,10 +1318,14 @@ fn http_run(case: HttpCase) -> HttpRun {
         let (roots, chain, key) = certs();
         let roots = Arc::new(roots);
         let config = Arc::new(
-            tls::config_builder(&fcx, SystemTime::now(), rustls::crypto::ring::default_provider())
-                .with_safe_default_protocol_versions()?
-                .with_no_client_auth()
-                .with_single_cert(chain, key)?,
+            tls::config_builder(
+                &fcx,
+                SystemTime::now(),
+                rustls::crypto::ring::default_provider(),
+            )
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(chain, key)?,
         );
         let page = Page(Bytes::from(vec![b'x'; case.body]));
         let sites = web::Sites::new(move |_| {
@@ -1017,18 +1336,31 @@ fn http_run(case: HttpCase) -> HttpRun {
             fcx.events().subscribe(|_| {});
         }
         sites.serve(&fcx, attachments)?;
-        let machines: Vec<Machine> =
-            (0..case.sandboxes).map(|i| machine(&fcx, &attacher, &format!("sandbox{i}"), Ipv4Addr::new(10, 0, 0, 2 + i as u8))).collect();
+        let machines: Vec<Machine> = (0..case.sandboxes)
+            .map(|i| {
+                machine(
+                    &fcx,
+                    &attacher,
+                    &format!("sandbox{i}"),
+                    Ipv4Addr::new(10, 0, 0, 2 + i as u8),
+                )
+            })
+            .collect();
         let addr = lookup(&fcx, &machines[0], "bench.test").await;
         for i in 1..case.sites {
             lookup(&fcx, &machines[0], &format!("site{i}.test")).await;
         }
         let mut clients = Vec::new();
         for m in &machines {
-            let conn = m.tcp.connect(&fcx, SocketAddr::new(addr.into(), 443)).await?;
+            let conn = m
+                .tcp
+                .connect(&fcx, SocketAddr::new(addr.into(), 443))
+                .await?;
             let alpn: &[u8] = if case.h2 { b"h2" } else { b"http/1.1" };
             let mut t = TlsClient::new(conn, &roots, "bench.test", alpn);
-            t.handshake(&fcx).await.map_err(|e| fictionet::Error::msg(format!("{e:?}")))?;
+            t.handshake(&fcx)
+                .await
+                .map_err(|e| fictionet::Error::msg(format!("{e:?}")))?;
             let mut c = Client::new(&fcx, t, case.h2).await;
             for _ in 0..100 {
                 c.get().await;
@@ -1056,7 +1388,14 @@ fn http_run(case: HttpCase) -> HttpRun {
                     let (status, version, len) = c.get().await;
                     assert_eq!(status, StatusCode::OK);
                     assert_eq!(len, case.body);
-                    assert_eq!(version, if case.h2 { Version::HTTP_2 } else { Version::HTTP_11 });
+                    assert_eq!(
+                        version,
+                        if case.h2 {
+                            Version::HTTP_2
+                        } else {
+                            Version::HTTP_11
+                        }
+                    );
                     samples.push(t.elapsed().as_nanos() as u64);
                 }
                 lat.lock().unwrap().extend(samples);
@@ -1110,7 +1449,9 @@ fn watch_world(
 ) -> u64 {
     let path = path.to_str().unwrap();
     let mut client = relay::observer::Client::connect(path, "bench").expect("an observer session");
-    client.set_timeout(Some(Duration::from_millis(100))).unwrap();
+    client
+        .set_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
     // Wait until every sandbox has a link in the graph.
     let links = loop {
         let graph = client.call(r#"{"op":"graph"}"#).expect("a graph");
@@ -1126,7 +1467,9 @@ fn watch_world(
     client.request(r#"{"op":"watch"}"#).unwrap();
     if watch == Watch::Packets {
         for link in &links {
-            client.request(&format!(r#"{{"op":"packets","link":"{link}","after":0}}"#)).unwrap();
+            client
+                .request(&format!(r#"{{"op":"packets","link":"{link}","after":0}}"#))
+                .unwrap();
         }
         waiting += links.len();
     }
@@ -1134,14 +1477,17 @@ fn watch_world(
     while !stop.load(Ordering::Acquire) {
         match client.next_value() {
             Ok(Some(v)) => {
-                if v.bytes.starts_with(br#"{"event":"snapshot""#) || v.bytes.starts_with(br#"{"event":"link""#) {
+                if v.bytes.starts_with(br#"{"event":"snapshot""#)
+                    || v.bytes.starts_with(br#"{"event":"link""#)
+                {
                     waiting -= 1;
                     if waiting == 0 {
                         ready.store(true, Ordering::Release);
                     }
                 }
                 // Rows of packets sent while the requests were timed.
-                if v.bytes.starts_with(br#"{"event":"packet""#) && measuring.load(Ordering::Acquire) {
+                if v.bytes.starts_with(br#"{"event":"packet""#) && measuring.load(Ordering::Acquire)
+                {
                     rows += 1;
                 }
             }
@@ -1162,12 +1508,20 @@ fn sandbox_links(graph: &str) -> Vec<String> {
         Some(obj[at..].split('"').next()?.to_string())
     };
     let objects: Vec<&str> = graph.split('{').collect();
-    let sandboxes: Vec<String> =
-        objects.iter().filter(|o| o.contains(r#""kind":"sandbox""#)).filter_map(|o| field(o, "id")).collect();
+    let sandboxes: Vec<String> = objects
+        .iter()
+        .filter(|o| o.contains(r#""kind":"sandbox""#))
+        .filter_map(|o| field(o, "id"))
+        .collect();
     objects
         .iter()
         .filter(|o| o.starts_with(r#""id":"e"#))
-        .filter(|o| [field(o, "a"), field(o, "b")].iter().flatten().any(|end| sandboxes.contains(end)))
+        .filter(|o| {
+            [field(o, "a"), field(o, "b")]
+                .iter()
+                .flatten()
+                .any(|end| sandboxes.contains(end))
+        })
         .filter_map(|o| field(o, "id"))
         .collect()
 }
@@ -1184,14 +1538,25 @@ struct TlsClient<C> {
 
 impl<C: Connection + Unpin> TlsClient<C> {
     fn new(conn: C, roots: &Arc<RootCertStore>, name: &str, alpn: &[u8]) -> Self {
-        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(roots.clone())
-            .with_no_client_auth();
+        let mut config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots.clone())
+                .with_no_client_auth();
         config.alpn_protocols = vec![alpn.to_vec()];
-        let tls = ClientConnection::new(Arc::new(config), ServerName::try_from(name.to_owned()).unwrap()).unwrap();
-        TlsClient { conn, tls, out: Vec::new(), inbuf: vec![0; 16384].into_boxed_slice(), pending: Vec::new() }
+        let tls = ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from(name.to_owned()).unwrap(),
+        )
+        .unwrap();
+        TlsClient {
+            conn,
+            tls,
+            out: Vec::new(),
+            inbuf: vec![0; 16384].into_boxed_slice(),
+            pending: Vec::new(),
+        }
     }
 
     fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
@@ -1269,7 +1634,12 @@ impl<C: Connection + Unpin> TlsClient<C> {
 }
 
 impl<C: Connection + Unpin> Connection for TlsClient<C> {
-    fn poll_read(&mut self, fcx: &Cx, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_read(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, ConnError>> {
         loop {
             match self.tls.reader().read(buf) {
                 Ok(n) => return Poll::Ready(Ok(n)),
@@ -1282,14 +1652,21 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
             }
             match self.poll_fill(fcx, cx) {
                 Poll::Ready(Ok(true)) => {}
-                Poll::Ready(Ok(false)) => return Poll::Ready(Ok(self.tls.reader().read(buf).unwrap_or(0))),
+                Poll::Ready(Ok(false)) => {
+                    return Poll::Ready(Ok(self.tls.reader().read(buf).unwrap_or(0)));
+                }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         }
     }
 
-    fn poll_write(&mut self, fcx: &Cx, cx: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+    fn poll_write(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<Result<usize, ConnError>> {
         if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
             return Poll::Ready(Err(e));
         }
@@ -1315,7 +1692,11 @@ struct Io<C> {
 }
 
 impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: hyper::rt::ReadBufCursor<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let mut tmp = [0u8; 16 * 1024];
         let tmp = &mut tmp[..buf.remaining().min(16 * 1024)];
@@ -1331,16 +1712,24 @@ impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
 }
 
 impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        this.conn.poll_write(&this.fcx, cx, data).map_err(std::io::Error::other)
+        this.conn
+            .poll_write(&this.fcx, cx, data)
+            .map_err(std::io::Error::other)
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        this.conn.poll_shutdown(&this.fcx, cx).map_err(std::io::Error::other)
+        this.conn
+            .poll_shutdown(&this.fcx, cx)
+            .map_err(std::io::Error::other)
     }
 }
 
@@ -1363,9 +1752,14 @@ enum Client {
 
 impl Client {
     async fn new<C: Connection + Unpin>(fcx: &Cx, conn: C, h2: bool) -> Client {
-        let io = Io { fcx: fcx.clone(), conn };
+        let io = Io {
+            fcx: fcx.clone(),
+            conn,
+        };
         if h2 {
-            let (send, conn) = hyper::client::conn::http2::handshake(Exec(fcx.clone()), io).await.unwrap();
+            let (send, conn) = hyper::client::conn::http2::handshake(Exec(fcx.clone()), io)
+                .await
+                .unwrap();
             fcx.spawn(move |_| async move {
                 let _ = conn.await;
                 Ok(())
@@ -1387,12 +1781,19 @@ impl Client {
         let response = match self {
             Client::H1(s) => {
                 s.ready().await.unwrap();
-                let r = Request::builder().uri("/").header("host", "bench.test").body(Empty::new()).unwrap();
+                let r = Request::builder()
+                    .uri("/")
+                    .header("host", "bench.test")
+                    .body(Empty::new())
+                    .unwrap();
                 s.send_request(r).await.unwrap()
             }
             Client::H2(s) => {
                 s.ready().await.unwrap();
-                let r = Request::builder().uri("https://bench.test/").body(Empty::new()).unwrap();
+                let r = Request::builder()
+                    .uri("https://bench.test/")
+                    .body(Empty::new())
+                    .unwrap();
                 s.send_request(r).await.unwrap()
             }
         };
@@ -1420,8 +1821,16 @@ fn proxy(o: &Options) {
     let burst = 32;
     let sequential = if o.quick { 20 } else { 50 };
     let mut rows: Vec<(String, Vec<u64>, Vec<f64>)> = vec![
-        (format!("{burst} requests at once to one cold name"), Vec::new(), Vec::new()),
-        (format!("{sequential} requests in a row to a missing name"), Vec::new(), Vec::new()),
+        (
+            format!("{burst} requests at once to one cold name"),
+            Vec::new(),
+            Vec::new(),
+        ),
+        (
+            format!("{sequential} requests in a row to a missing name"),
+            Vec::new(),
+            Vec::new(),
+        ),
     ];
     for _ in 0..o.reps {
         let (cold, missing) = proxy_run(burst, sequential);
@@ -1431,7 +1840,11 @@ fn proxy(o: &Options) {
         rows[1].2.push(missing.1);
     }
     for (label, queries, times) in rows {
-        t.row(vec![label, median_u(&queries).to_string(), spread(&times, 1)]);
+        t.row(vec![
+            label,
+            median_u(&queries).to_string(),
+            spread(&times, 1),
+        ]);
     }
     t.print();
 }
@@ -1463,7 +1876,10 @@ fn proxy_run(burst: usize, sequential: usize) -> ((u64, f64), (u64, f64)) {
                         *queries.lock().unwrap().entry(name.to_owned()).or_default() += 1;
                     }
                 });
-                web::Sites::new(move |host: &str| (host == "plain.test").then(|| web::Site::new(page.clone()).plain_http())).serve(&fcx, attachments)?;
+                web::Sites::new(move |host: &str| {
+                    (host == "plain.test").then(|| web::Site::new(page.clone()).plain_http())
+                })
+                .serve(&fcx, attachments)?;
                 while !stop.load(Ordering::Acquire) {
                     fcx.sleep(fictionet::time::ms(10)).await?;
                 }
@@ -1473,8 +1889,25 @@ fn proxy_run(burst: usize, sequential: usize) -> ((u64, f64), (u64, f64)) {
         })
     };
     let mut child = std::process::Command::new(fictionet_bin())
-        .args(["attach", "--world", &format!("unix:{}", path.display()), "--name", "agent", "--type", "http_proxy"])
-        .args(["--listen", "127.0.0.1:0", "--token-file", token.to_str().unwrap(), "--ip-addr", "10.0.0.2", "--dns", "10.0.0.1"])
+        .args([
+            "attach",
+            "--world",
+            &format!("unix:{}", path.display()),
+            "--name",
+            "agent",
+            "--type",
+            "http_proxy",
+        ])
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--token-file",
+            token.to_str().unwrap(),
+            "--ip-addr",
+            "10.0.0.2",
+            "--dns",
+            "10.0.0.1",
+        ])
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("fictionet attach");

@@ -671,7 +671,14 @@ pub fn emit(checked: &ValidatedSchema, inputs: &[String]) -> Result<String, Erro
             ids.push(if matches!(f.ty, Type::Constant(_)) {
                 None
             } else {
-                Some(add(&f.ty, &mut nodes, &mut indices, &t.name, checked, false)?)
+                Some(add(
+                    &f.ty,
+                    &mut nodes,
+                    &mut indices,
+                    &t.name,
+                    checked,
+                    false,
+                )?)
             });
         }
         field_nodes.push(ids);

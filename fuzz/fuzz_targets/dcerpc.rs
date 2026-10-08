@@ -2,23 +2,31 @@
 //! reads them, and values a world builds, as it writes them.
 #![no_main]
 
-use fictionet::stdlib::codec::Frames;
 use arbitrary::{Result, Unstructured};
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::dcerpc::harness::rewrite;
+use fictionet::stdlib::dcerpc::{
+    Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Error, MAX_FRAG,
+    MAX_FRAGMENTS, Pdu, Reassembler, SyntaxId, Uuid, flags,
+};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::dcerpc::{
-    Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Error,
-    MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, SyntaxId, Uuid, flags,
-};
-use fictionet::stdlib::dcerpc::harness::rewrite;
 use libfuzzer_sys::fuzz_target;
 
 fn syntax(u: &mut Unstructured) -> Result<SyntaxId> {
-    Ok(SyntaxId { uuid: Uuid(u.arbitrary()?), major: u.arbitrary()?, minor: u.arbitrary()? })
+    Ok(SyntaxId {
+        uuid: Uuid(u.arbitrary()?),
+        major: u.arbitrary()?,
+        minor: u.arbitrary()?,
+    })
 }
 
-fn list<T>(u: &mut Unstructured, max: usize, f: impl Fn(&mut Unstructured) -> Result<T>) -> Result<Vec<T>> {
+fn list<T>(
+    u: &mut Unstructured,
+    max: usize,
+    f: impl Fn(&mut Unstructured) -> Result<T>,
+) -> Result<Vec<T>> {
     let n = u.int_in_range(0..=max)?;
     (0..n).map(|_| f(u)).collect()
 }
@@ -34,7 +42,11 @@ fn bind(u: &mut Unstructured) -> Result<Bind> {
         max_recv_frag: u.arbitrary()?,
         assoc_group: u.arbitrary()?,
         contexts: list(u, 260, |u| {
-            Ok(Context { id: u.arbitrary()?, abstract_syntax: syntax(u)?, transfer_syntaxes: list(u, 260, syntax)? })
+            Ok(Context {
+                id: u.arbitrary()?,
+                abstract_syntax: syntax(u)?,
+                transfer_syntaxes: list(u, 260, syntax)?,
+            })
         })?,
     })
 }
@@ -46,7 +58,11 @@ fn bind_ack(u: &mut Unstructured) -> Result<BindAck> {
         assoc_group: u.arbitrary()?,
         secondary_address: bytes(u, 300)?,
         results: list(u, 260, |u| {
-            Ok(ContextResult { result: u.arbitrary()?, reason: u.arbitrary()?, transfer_syntax: syntax(u)? })
+            Ok(ContextResult {
+                result: u.arbitrary()?,
+                reason: u.arbitrary()?,
+                transfer_syntax: syntax(u)?,
+            })
         })?,
     })
 }
@@ -58,7 +74,11 @@ fn pdu(u: &mut Unstructured) -> Result<Pdu> {
             alloc_hint: u.arbitrary()?,
             context_id: u.arbitrary()?,
             opnum: u.arbitrary()?,
-            object: if u.arbitrary()? { Some(Uuid(u.arbitrary()?)) } else { None },
+            object: if u.arbitrary()? {
+                Some(Uuid(u.arbitrary()?))
+            } else {
+                None
+            },
             stub: bytes(u, 70_000)?,
         },
         1 => Body::Response {
@@ -79,14 +99,22 @@ fn pdu(u: &mut Unstructured) -> Result<Pdu> {
         4 => Body::AlterContext(bind(u)?),
         5 => Body::BindAck(bind_ack(u)?),
         6 => Body::AlterContextResp(bind_ack(u)?),
-        7 => Body::BindNak(BindNak { reason: u.arbitrary()?, versions: list(u, 260, |u| u.arbitrary())? }),
+        7 => Body::BindNak(BindNak {
+            reason: u.arbitrary()?,
+            versions: list(u, 260, |u| u.arbitrary())?,
+        }),
         8 => Body::Auth3,
         9 => Body::Shutdown,
         10 => Body::Cancel,
         _ => Body::Orphaned,
     };
     let auth = if u.arbitrary()? {
-        Some(Auth { kind: u.arbitrary()?, level: u.arbitrary()?, context_id: u.arbitrary()?, value: bytes(u, 300)? })
+        Some(Auth {
+            kind: u.arbitrary()?,
+            level: u.arbitrary()?,
+            context_id: u.arbitrary()?,
+            value: bytes(u, 300)?,
+        })
     } else {
         None
     };
@@ -120,7 +148,9 @@ fn built(data: &[u8]) -> Result<()> {
     }
     let max: u16 = u.arbitrary()?;
     let call = matches!(p.body, Body::Request { .. } | Body::Response { .. });
-    let Ok(parts) = p.fragments(max) else { return Ok(()) };
+    let Ok(parts) = p.fragments(max) else {
+        return Ok(());
+    };
     assert!(parts.len() <= MAX_FRAGMENTS);
     let mut r = Reassembler::default();
     let mut got = None;
@@ -132,7 +162,11 @@ fn built(data: &[u8]) -> Result<()> {
         assert_eq!(Pdu::parse(&bytes), Ok(f.clone()));
         // A nonzero hint counts down by the stub data already sent.
         if let (Some(whole), Some(hint)) = (alloc_hint(&p), alloc_hint(f)) {
-            let left = if whole == 0 { 0 } else { whole.saturating_sub(u32::try_from(sent).unwrap_or(u32::MAX)) };
+            let left = if whole == 0 {
+                0
+            } else {
+                whole.saturating_sub(u32::try_from(sent).unwrap_or(u32::MAX))
+            };
             assert_eq!(hint, left);
         }
         sent += f.body.stub().map_or(0, <[u8]>::len);
@@ -156,8 +190,17 @@ fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<(
     let first: Option<(u8, u8, u32)> = u.arbitrary()?;
     let mut fail = None;
     for (i, f) in parts.iter_mut().enumerate() {
-        let s = if i == 0 || u.ratio(3, 4)? { first } else { u.arbitrary()? };
-        f.auth = s.map(|(kind, level, context_id)| Auth { kind, level, context_id, value: vec![1] });
+        let s = if i == 0 || u.ratio(3, 4)? {
+            first
+        } else {
+            u.arbitrary()?
+        };
+        f.auth = s.map(|(kind, level, context_id)| Auth {
+            kind,
+            level,
+            context_id,
+            value: vec![1],
+        });
         if i > 0 && s != first && fail.is_none() {
             fail = Some(i);
         }
@@ -172,7 +215,10 @@ fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<(
         }
     }
     // A response's cancel count is the highest any fragment gave.
-    if let Body::Response { cancel_count: w, .. } = &mut want.body {
+    if let Body::Response {
+        cancel_count: w, ..
+    } = &mut want.body
+    {
         *w = parts
             .iter()
             .filter_map(|f| match f.body {
@@ -187,7 +233,12 @@ fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<(
         let got = r.push(f);
         match fail {
             Some(at) if i == at => {
-                assert_eq!(got, Err(Error::UnexpectedFragment { call_id: want.call_id }));
+                assert_eq!(
+                    got,
+                    Err(Error::UnexpectedFragment {
+                        call_id: want.call_id
+                    })
+                );
                 return Ok(());
             }
             _ if i + 1 == n => assert_eq!(got, Ok(Some(want.clone()))),
@@ -198,10 +249,22 @@ fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<(
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::<Pdu>::new, data, 2 * Frames::<Pdu>::new().capacity());
+    contract::check_decode_with_alloc_limit(
+        Frames::<Pdu>::new,
+        data,
+        2 * Frames::<Pdu>::new().capacity(),
+    );
     contract::check_wire::<Pdu>(data);
-    contract::check_decode_with_alloc_limit(|| Frames::<Pdu>::with_limit(0), data, 2 * Frames::<Pdu>::with_limit(0).capacity());
-    contract::check_decode_with_alloc_limit(|| Frames::<Pdu>::with_limit(64), data, 2 * Frames::<Pdu>::with_limit(64).capacity());
+    contract::check_decode_with_alloc_limit(
+        || Frames::<Pdu>::with_limit(0),
+        data,
+        2 * Frames::<Pdu>::with_limit(0).capacity(),
+    );
+    contract::check_decode_with_alloc_limit(
+        || Frames::<Pdu>::with_limit(64),
+        data,
+        2 * Frames::<Pdu>::with_limit(64).capacity(),
+    );
 
     let (results, _) = decode_all(Frames::<Pdu>::new, data);
     let mut rest = data;

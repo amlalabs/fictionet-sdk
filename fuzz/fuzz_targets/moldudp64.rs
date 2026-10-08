@@ -2,16 +2,14 @@
 //! and the receiver's gap recovery driven by whatever parses.
 #![no_main]
 
-use fictionet::stdlib::session::Action;
-use fictionet::stdlib::codec::{
-    Wire,
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::moldudp64::{
+    Blocks, Downstream, Event, HEADER_LENGTH, Receiver, ReceiverConfig, Request, Retransmitter,
+    Session, StoreConfig,
 };
+use fictionet::stdlib::session::Action;
 use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::moldudp64::{
-    Blocks, Downstream, Event, HEADER_LENGTH, Receiver, ReceiverConfig, Request,
-    Retransmitter, Session, StoreConfig,
-};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;

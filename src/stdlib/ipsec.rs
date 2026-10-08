@@ -72,7 +72,7 @@
 //! assert_eq!(Datagram::parse(&[0, 0, 0, 0, 1]), Ok(Datagram::Ike(vec![1])));
 //! ```
 
-use fictionet::stdlib::codec::{be32, Wire};
+use fictionet::stdlib::codec::{Wire, be32};
 
 /// The IP protocol number that marks an ESP packet.
 pub const ESP_PROTOCOL: u8 = 50;
@@ -181,7 +181,10 @@ impl std::fmt::Display for Error {
             Error::TooLong => write!(f, "IPsec packet longer than {MAX_PACKET} bytes"),
             Error::ZeroSpi => f.write_str("SPI of zero"),
             Error::AhLength(n) => write!(f, "AH payload length {n}, below 1"),
-            Error::IcvLength(n) => write!(f, "AH ICV of {n} bytes, not a multiple of 4 up to {MAX_ICV}"),
+            Error::IcvLength(n) => write!(
+                f,
+                "AH ICV of {n} bytes, not a multiple of 4 up to {MAX_ICV}"
+            ),
             Error::PadLength(n) => write!(f, "ESP pad length {n}, longer than the plaintext"),
             Error::Padding(n) => write!(f, "{n} ESP padding bytes, above {MAX_PADDING}"),
             Error::BlockSize(n) => write!(f, "block size {n}, outside 1..={MAX_BLOCK_SIZE}"),
@@ -213,7 +216,11 @@ impl EspPacket {
     /// [`Error::Truncated`] if that leaves fewer than
     /// [`ESP_TRAILER_LEN`] bytes before the ICV.
     pub fn split_icv(&self, icv_len: usize) -> Result<(&[u8], &[u8]), Error> {
-        let rest = self.payload.len().checked_sub(icv_len).ok_or(Error::Truncated)?;
+        let rest = self
+            .payload
+            .len()
+            .checked_sub(icv_len)
+            .ok_or(Error::Truncated)?;
         if rest < ESP_TRAILER_LEN {
             return Err(Error::Truncated);
         }
@@ -276,7 +283,11 @@ impl Plaintext {
             return Err(Error::Padding(pad));
         }
         let padding = (1..=pad).map(|i| i as u8).collect();
-        let p = Plaintext { data, padding, next_header };
+        let p = Plaintext {
+            data,
+            padding,
+            next_header,
+        };
         if p.len() > MAX_PACKET {
             return Err(Error::TooLong);
         }
@@ -287,12 +298,18 @@ impl Plaintext {
     /// receiver using an algorithm with no padding rules of its own should
     /// check it (RFC 4303, section 2.4).
     pub fn has_default_padding(&self) -> bool {
-        self.padding.iter().enumerate().all(|(i, &b)| usize::from(b) == i + 1)
+        self.padding
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| usize::from(b) == i + 1)
     }
 
     /// How many bytes the plaintext takes.
     pub fn len(&self) -> usize {
-        self.data.len().saturating_add(self.padding.len()).saturating_add(ESP_TRAILER_LEN)
+        self.data
+            .len()
+            .saturating_add(self.padding.len())
+            .saturating_add(ESP_TRAILER_LEN)
     }
 
     /// Whether the plaintext takes no bytes. It never does: the trailer
@@ -328,7 +345,13 @@ pub struct AhHeader {
 impl AhHeader {
     /// A header with the reserved field set to zero, as a sender must.
     pub fn new(next_header: u8, spi: u32, sequence: u32, icv: Vec<u8>) -> AhHeader {
-        AhHeader { next_header, reserved: 0, spi, sequence, icv }
+        AhHeader {
+            next_header,
+            reserved: 0,
+            spi,
+            sequence,
+            icv,
+        }
     }
 
     /// Reads the AH header at the start of `b`, and returns it and its
@@ -485,7 +508,11 @@ impl Wire for EspPacket {
         if b.len() < MIN_ESP_LEN {
             return Err(Error::Truncated);
         }
-        Ok(EspPacket { spi: be32(b, 0).ok_or(Error::Truncated)?, sequence: be32(b, 4).ok_or(Error::Truncated)?, payload: b[ESP_HEADER_LEN..].to_vec() })
+        Ok(EspPacket {
+            spi: be32(b, 0).ok_or(Error::Truncated)?,
+            sequence: be32(b, 4).ok_or(Error::Truncated)?,
+            payload: b[ESP_HEADER_LEN..].to_vec(),
+        })
     }
 
     /// The packet's bytes: the SPI, the sequence number and the payload.
@@ -530,7 +557,11 @@ impl Wire for Plaintext {
         let Some(data_len) = body.checked_sub(usize::from(pad_len)) else {
             return Err(Error::PadLength(pad_len));
         };
-        Ok(Plaintext { data: b[..data_len].to_vec(), padding: b[data_len..body].to_vec(), next_header: b[body + 1] })
+        Ok(Plaintext {
+            data: b[..data_len].to_vec(),
+            padding: b[data_len..body].to_vec(),
+            next_header: b[body + 1],
+        })
     }
 
     /// The plaintext's bytes, ready for world code to encrypt. It fails
@@ -563,7 +594,10 @@ impl Wire for AhPacket {
     /// [`MAX_PACKET`] bytes.
     fn parse(b: &[u8]) -> Result<Self, Error> {
         let (header, payload) = AhPacket::split(b)?;
-        Ok(AhPacket { header, payload: payload.to_vec() })
+        Ok(AhPacket {
+            header,
+            payload: payload.to_vec(),
+        })
     }
 
     /// Appends an AH packet. Refuses a zero SPI, an ICV length that is not
@@ -659,27 +693,38 @@ impl Wire for AhHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{
-        Collect, CollectError, Fail, Lcg,
-    };
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn check<M>(limit: usize, b: &[u8]) -> Result<M, Error>
-    where M: Wire<ParseError = Error, WriteError = Error> + Clone + std::fmt::Debug + PartialEq {
+    where
+        M: Wire<ParseError = Error, WriteError = Error> + Clone + std::fmt::Debug + PartialEq,
+    {
         let make = || Collect::<M>::new(limit);
         contract::check_decode_with_alloc_limit(make, b, 2 * (limit + 1));
         contract::check_wire::<M>(b);
         let parsed = M::parse(b);
         let (items, failure) = decode_all(make, b);
         if b.len() <= limit {
-            assert_eq!(failure, parsed.clone().err().map(|e| Fail::Protocol(CollectError::Parse(e))));
+            assert_eq!(
+                failure,
+                parsed
+                    .clone()
+                    .err()
+                    .map(|e| Fail::Protocol(CollectError::Parse(e)))
+            );
             assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
         } else {
             assert!(items.is_empty());
-            assert_eq!(failure, Some(Fail::Protocol(CollectError::TooLong { limit })));
+            assert_eq!(
+                failure,
+                Some(Fail::Protocol(CollectError::TooLong { limit }))
+            );
         }
-        if let Ok(p) = &parsed { assert_eq!(p.to_bytes().unwrap(), b); }
+        if let Ok(p) = &parsed {
+            assert_eq!(p.to_bytes().unwrap(), b);
+        }
         contract::check_wire::<Plaintext>(b);
         parsed
     }
@@ -695,7 +740,11 @@ mod tests {
     }
 
     fn esp(spi: u32, sequence: u32, payload: &[u8]) -> EspPacket {
-        EspPacket { spi, sequence, payload: payload.to_vec() }
+        EspPacket {
+            spi,
+            sequence,
+            payload: payload.to_vec(),
+        }
     }
 
     fn ah(next_header: u8, spi: u32, sequence: u32, icv: &[u8]) -> AhHeader {
@@ -707,7 +756,9 @@ mod tests {
 
     #[test]
     fn esp_layout() {
-        let b = [0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2a, 0xde, 0xad, 0xbe, 0xef];
+        let b = [
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2a, 0xde, 0xad, 0xbe, 0xef,
+        ];
         let p = check::<EspPacket>(MAX_PACKET, &b).unwrap();
         assert_eq!(p, esp(0x100, 42, &[0xde, 0xad, 0xbe, 0xef]));
         assert_eq!(p.to_bytes().unwrap(), b);
@@ -736,7 +787,14 @@ mod tests {
     fn plaintext_trailer() {
         // No padding at all: pad length 0.
         let p = Plaintext::parse(&[9, 9, 0, 41]).unwrap();
-        assert_eq!(p, Plaintext { data: vec![9, 9], padding: vec![], next_header: next_header::IPV6 });
+        assert_eq!(
+            p,
+            Plaintext {
+                data: vec![9, 9],
+                padding: vec![],
+                next_header: next_header::IPV6
+            }
+        );
         assert!(p.has_default_padding());
         // The smallest plaintext: no data, no padding.
         let p = Plaintext::parse(&[0, 59]).unwrap();
@@ -764,7 +822,10 @@ mod tests {
                         // Only a block size above 64 that is not a multiple
                         // of 4 can need more than 255 bytes to reach a
                         // multiple of both it and 4.
-                        assert!(pad > MAX_PADDING && block > 64 && block % 4 != 0, "block {block}, {n} bytes");
+                        assert!(
+                            pad > MAX_PADDING && block > 64 && block % 4 != 0,
+                            "block {block}, {n} bytes"
+                        );
                         continue;
                     }
                     Err(e) => panic!("block {block}, {n} bytes: {e}"),
@@ -783,7 +844,10 @@ mod tests {
         // Block sizes up to 64 never need too much padding.
         for block in 1..=64 {
             for n in 0..300 {
-                assert!(Plaintext::padded(vec![0; n], 4, block).is_ok(), "block {block}, {n} bytes");
+                assert!(
+                    Plaintext::padded(vec![0; n], 4, block).is_ok(),
+                    "block {block}, {n} bytes"
+                );
             }
         }
         // A block of 255 bytes aligns to 1020, which can need too much.
@@ -823,13 +887,28 @@ mod tests {
         b.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
         let p = AhPacket::parse(&b).unwrap();
         assert!(p.header.is_ipv6_aligned());
-        assert_eq!(p.header.split_icv(16), Ok((&[0x77; 16][..], &[0xaa, 0xbb, 0xcc, 0xdd][..])));
+        assert_eq!(
+            p.header.split_icv(16),
+            Ok((&[0x77; 16][..], &[0xaa, 0xbb, 0xcc, 0xdd][..]))
+        );
         let mut want = b[..12].to_vec();
         want.extend_from_slice(&[0; 16]);
         want.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
-        assert_eq!(p.header.for_icv(16).and_then(|header| header.to_bytes()).unwrap(), want);
+        assert_eq!(
+            p.header
+                .for_icv(16)
+                .and_then(|header| header.to_bytes())
+                .unwrap(),
+            want
+        );
         // A tag that fills the field zeroes all of it.
-        assert_eq!(&p.header.for_icv(20).and_then(|header| header.to_bytes()).unwrap()[12..], [0; 20]);
+        assert_eq!(
+            &p.header
+                .for_icv(20)
+                .and_then(|header| header.to_bytes())
+                .unwrap()[12..],
+            [0; 20]
+        );
         assert_eq!(p.header.split_icv(21), Err(Error::Truncated));
         // The bytes as sent are unchanged.
         assert_eq!(p.to_bytes().unwrap(), b);
@@ -841,7 +920,10 @@ mod tests {
         // 20 more go to the IP header. Longer datagrams cannot be sent.
         assert_eq!(MAX_DATAGRAM, 65527);
         assert_eq!(MAX_DATAGRAM_IPV4, 65507);
-        assert_eq!(Datagram::Ike(vec![0; 65_531]).to_bytes(), Err(Error::TooLong));
+        assert_eq!(
+            Datagram::Ike(vec![0; 65_531]).to_bytes(),
+            Err(Error::TooLong)
+        );
         let ike = Datagram::Ike(vec![0; MAX_DATAGRAM - 4]);
         assert_eq!(ike.to_bytes().unwrap().len(), MAX_DATAGRAM);
         assert!(!ike.fits_ipv4());
@@ -870,7 +952,10 @@ mod tests {
         let mut b = vec![6, 4, 0, 0, 0, 0, 0x12, 0x34, 0, 0, 0, 5];
         b.extend_from_slice(&icv);
         b.extend_from_slice(b"segment");
-        let p = AhPacket { header: h.clone(), payload: b"segment".to_vec() };
+        let p = AhPacket {
+            header: h.clone(),
+            payload: b"segment".to_vec(),
+        };
         assert_eq!(p.to_bytes().unwrap(), b);
         assert_eq!(check::<AhPacket>(MAX_PACKET, &b), Ok(p));
         assert_eq!(h.len(), 24);
@@ -903,10 +988,19 @@ mod tests {
     fn ah_reserved_field_is_kept() {
         let b = [4, 1, 0xab, 0xcd, 0, 0, 0, 9, 0, 0, 0, 1];
         let p = check::<AhPacket>(MAX_PACKET, &b).unwrap();
-        assert_eq!(p.header, AhHeader { reserved: 0xabcd, ..ah(4, 9, 1, &[]) });
+        assert_eq!(
+            p.header,
+            AhHeader {
+                reserved: 0xabcd,
+                ..ah(4, 9, 1, &[])
+            }
+        );
         assert_eq!(p.to_bytes().unwrap(), b);
         // A new header writes it as zero.
-        assert_eq!(ah(4, 9, 1, &[]).to_bytes().unwrap(), [4, 1, 0, 0, 0, 0, 0, 9, 0, 0, 0, 1]);
+        assert_eq!(
+            ah(4, 9, 1, &[]).to_bytes().unwrap(),
+            [4, 1, 0, 0, 0, 0, 0, 9, 0, 0, 0, 1]
+        );
     }
 
     #[test]
@@ -914,35 +1008,64 @@ mod tests {
         // RFC 4302, section 2.3: the receiver ignores the reserved field,
         // but its value is part of the ICV computation, so the zeroed form
         // must keep the bytes that came in.
-        let b = [4, 2, 0xab, 0xcd, 0, 0, 0, 9, 0, 0, 0, 1, 0xee, 0xee, 0xee, 0xee];
+        let b = [
+            4, 2, 0xab, 0xcd, 0, 0, 0, 9, 0, 0, 0, 1, 0xee, 0xee, 0xee, 0xee,
+        ];
         let p = AhPacket::parse(&b).unwrap();
-        assert_eq!(p.header.for_icv(4).and_then(|header| header.to_bytes()).unwrap(), [4, 2, 0xab, 0xcd, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(
+            p.header
+                .for_icv(4)
+                .and_then(|header| header.to_bytes())
+                .unwrap(),
+            [4, 2, 0xab, 0xcd, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0, 0]
+        );
         assert_eq!(p.to_bytes().unwrap(), b);
     }
 
     #[test]
     fn udp_datagrams() {
-        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &[0xff]), Ok(Datagram::Keepalive));
+        assert_eq!(
+            check::<Datagram>(MAX_DATAGRAM, &[0xff]),
+            Ok(Datagram::Keepalive)
+        );
         assert_eq!(Datagram::Keepalive.to_bytes().unwrap(), [0xff]);
         // An IKE message after the non-ESP marker. An IKE header is longer;
         // its bytes are kept as they are.
         let b = [0, 0, 0, 0, 0x21, 0x22, 0x23];
-        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &b), Ok(Datagram::Ike(vec![0x21, 0x22, 0x23])));
+        assert_eq!(
+            check::<Datagram>(MAX_DATAGRAM, &b),
+            Ok(Datagram::Ike(vec![0x21, 0x22, 0x23]))
+        );
         assert_eq!(Datagram::Ike(vec![0x21, 0x22, 0x23]).to_bytes().unwrap(), b);
-        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &[0, 0, 0, 0]), Ok(Datagram::Ike(vec![])));
+        assert_eq!(
+            check::<Datagram>(MAX_DATAGRAM, &[0, 0, 0, 0]),
+            Ok(Datagram::Ike(vec![]))
+        );
         // Anything else is ESP.
         let b = [0, 0, 0x10, 0, 0, 0, 0, 3, 0, 4];
-        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &b), Ok(Datagram::Esp(esp(0x1000, 3, &[0, 4]))));
+        assert_eq!(
+            check::<Datagram>(MAX_DATAGRAM, &b),
+            Ok(Datagram::Esp(esp(0x1000, 3, &[0, 4])))
+        );
         // Two keepalive bytes are not a keepalive.
-        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &[0xff, 0xff]), Err(Error::Truncated));
+        assert_eq!(
+            check::<Datagram>(MAX_DATAGRAM, &[0xff, 0xff]),
+            Err(Error::Truncated)
+        );
     }
 
     #[test]
     fn each_read_error() {
         // ESP.
         assert_eq!(check::<EspPacket>(MAX_PACKET, &[]), Err(Error::Truncated));
-        assert_eq!(check::<EspPacket>(MAX_PACKET, &[0, 0, 0, 0, 0, 0, 0, 1, 0, 4]), Err(Error::ZeroSpi));
-        assert_eq!(check::<EspPacket>(MAX_PACKET, &[0, 0, 0, 1, 0, 0, 0, 1, 0]), Err(Error::Truncated));
+        assert_eq!(
+            check::<EspPacket>(MAX_PACKET, &[0, 0, 0, 0, 0, 0, 0, 1, 0, 4]),
+            Err(Error::ZeroSpi)
+        );
+        assert_eq!(
+            check::<EspPacket>(MAX_PACKET, &[0, 0, 0, 1, 0, 0, 0, 1, 0]),
+            Err(Error::Truncated)
+        );
         let mut long = vec![0, 0, 0, 1];
         long.resize(MAX_PACKET + 1, 0);
         assert_eq!(check::<EspPacket>(MAX_PACKET, &long), Err(Error::TooLong));
@@ -950,17 +1073,35 @@ mod tests {
         assert!(check::<EspPacket>(MAX_PACKET, &long).is_ok());
         // AH.
         assert_eq!(check::<AhPacket>(MAX_PACKET, &[4]), Err(Error::Truncated));
-        assert_eq!(check::<AhPacket>(MAX_PACKET, &[4, 0, 0, 0, 0, 0, 0, 1]), Err(Error::AhLength(0)));
-        assert_eq!(check::<AhPacket>(MAX_PACKET, &[4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), Err(Error::ZeroSpi));
+        assert_eq!(
+            check::<AhPacket>(MAX_PACKET, &[4, 0, 0, 0, 0, 0, 0, 1]),
+            Err(Error::AhLength(0))
+        );
+        assert_eq!(
+            check::<AhPacket>(MAX_PACKET, &[4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            Err(Error::ZeroSpi)
+        );
         // A payload length of 3 says 20 bytes; 16 are there.
-        assert_eq!(check::<AhPacket>(MAX_PACKET, &[4, 3, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0]), Err(Error::Truncated));
+        assert_eq!(
+            check::<AhPacket>(
+                MAX_PACKET,
+                &[4, 3, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0]
+            ),
+            Err(Error::Truncated)
+        );
         let mut long = vec![4, 1, 0, 0, 0, 0, 0, 1];
         long.resize(MAX_PACKET + 1, 0);
         assert_eq!(check::<AhPacket>(MAX_PACKET, &long), Err(Error::TooLong));
         // UDP.
         assert_eq!(check::<Datagram>(MAX_DATAGRAM, &[]), Err(Error::Truncated));
-        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &[0x7f]), Err(Error::Truncated));
-        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &[0, 0, 0, 1, 0, 0, 0, 1]), Err(Error::Truncated));
+        assert_eq!(
+            check::<Datagram>(MAX_DATAGRAM, &[0x7f]),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            check::<Datagram>(MAX_DATAGRAM, &[0, 0, 0, 1, 0, 0, 0, 1]),
+            Err(Error::Truncated)
+        );
         let mut long = vec![0; MAX_PACKET + 1];
         assert_eq!(check::<Datagram>(MAX_DATAGRAM, &long), Err(Error::TooLong));
         long[3] = 1;
@@ -970,47 +1111,115 @@ mod tests {
         assert_eq!(Plaintext::parse(&[4]), Err(Error::Truncated));
         assert_eq!(Plaintext::parse(&[1, 2, 4]), Err(Error::PadLength(2)));
         assert_eq!(Plaintext::parse(&[255, 4]), Err(Error::PadLength(255)));
-        assert_eq!(Plaintext::parse(&vec![0; MAX_PACKET + 1]), Err(Error::TooLong));
+        assert_eq!(
+            Plaintext::parse(&vec![0; MAX_PACKET + 1]),
+            Err(Error::TooLong)
+        );
     }
 
     #[test]
     fn each_write_error() {
         assert_eq!(esp(0, 1, &[0, 4]).to_bytes(), Err(Error::ZeroSpi));
         assert_eq!(esp(1, 1, &[4]).to_bytes(), Err(Error::Truncated));
-        assert_eq!(esp(1, 1, &vec![0; MAX_PACKET - 7]).to_bytes(), Err(Error::TooLong));
+        assert_eq!(
+            esp(1, 1, &vec![0; MAX_PACKET - 7]).to_bytes(),
+            Err(Error::TooLong)
+        );
         assert!(esp(1, 1, &vec![0; MAX_PACKET - 8]).to_bytes().is_ok());
-        assert_eq!(Datagram::Esp(esp(0, 1, &[0, 4])).to_bytes(), Err(Error::ZeroSpi));
-        assert_eq!(Datagram::Ike(vec![0; MAX_DATAGRAM - 3]).to_bytes(), Err(Error::TooLong));
+        assert_eq!(
+            Datagram::Esp(esp(0, 1, &[0, 4])).to_bytes(),
+            Err(Error::ZeroSpi)
+        );
+        assert_eq!(
+            Datagram::Ike(vec![0; MAX_DATAGRAM - 3]).to_bytes(),
+            Err(Error::TooLong)
+        );
         assert!(Datagram::Ike(vec![0; MAX_DATAGRAM - 4]).to_bytes().is_ok());
 
         assert_eq!(ah(4, 0, 1, &[]).to_bytes(), Err(Error::ZeroSpi));
-        assert_eq!(ah(4, 0, 1, &[]).for_icv(0).and_then(|header| header.to_bytes()), Err(Error::ZeroSpi));
-        assert_eq!(ah(4, 1, 1, &[0; 12]).for_icv(16).and_then(|header| header.to_bytes()), Err(Error::Truncated));
-        assert_eq!(ah(4, 1, 1, &[0; 12]).for_icv(usize::MAX).and_then(|header| header.to_bytes()), Err(Error::Truncated));
+        assert_eq!(
+            ah(4, 0, 1, &[])
+                .for_icv(0)
+                .and_then(|header| header.to_bytes()),
+            Err(Error::ZeroSpi)
+        );
+        assert_eq!(
+            ah(4, 1, 1, &[0; 12])
+                .for_icv(16)
+                .and_then(|header| header.to_bytes()),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            ah(4, 1, 1, &[0; 12])
+                .for_icv(usize::MAX)
+                .and_then(|header| header.to_bytes()),
+            Err(Error::Truncated)
+        );
         assert_eq!(ah(4, 1, 1, &[0; 3]).to_bytes(), Err(Error::IcvLength(3)));
-        assert_eq!(ah(4, 1, 1, &[0; MAX_ICV + 4]).to_bytes(), Err(Error::IcvLength(MAX_ICV + 4)));
-        let p = AhPacket { header: ah(4, 1, 1, &[0; 3]), payload: vec![] };
+        assert_eq!(
+            ah(4, 1, 1, &[0; MAX_ICV + 4]).to_bytes(),
+            Err(Error::IcvLength(MAX_ICV + 4))
+        );
+        let p = AhPacket {
+            header: ah(4, 1, 1, &[0; 3]),
+            payload: vec![],
+        };
         assert_eq!(p.to_bytes(), Err(Error::IcvLength(3)));
-        let p = AhPacket { header: ah(4, 1, 1, &[0; 12]), payload: vec![0; MAX_PACKET - 23] };
+        let p = AhPacket {
+            header: ah(4, 1, 1, &[0; 12]),
+            payload: vec![0; MAX_PACKET - 23],
+        };
         assert_eq!(p.to_bytes(), Err(Error::TooLong));
-        let p = AhPacket { header: ah(4, 1, 1, &[0; 12]), payload: vec![0; MAX_PACKET - 24] };
+        let p = AhPacket {
+            header: ah(4, 1, 1, &[0; 12]),
+            payload: vec![0; MAX_PACKET - 24],
+        };
         assert_eq!(p.to_bytes().unwrap().len(), MAX_PACKET);
         assert_eq!(
-            AhPacket { header: ah(4, 0, 1, &[]), payload: vec![] }.to_bytes(),
+            AhPacket {
+                header: ah(4, 0, 1, &[]),
+                payload: vec![]
+            }
+            .to_bytes(),
             Err(Error::ZeroSpi)
         );
 
-        let p = Plaintext { data: vec![], padding: vec![0; 256], next_header: 4 };
+        let p = Plaintext {
+            data: vec![],
+            padding: vec![0; 256],
+            next_header: 4,
+        };
         assert_eq!(p.to_bytes(), Err(Error::Padding(256)));
-        let p = Plaintext { data: vec![0; MAX_PACKET - 1], padding: vec![], next_header: 4 };
+        let p = Plaintext {
+            data: vec![0; MAX_PACKET - 1],
+            padding: vec![],
+            next_header: 4,
+        };
         assert_eq!(p.to_bytes(), Err(Error::TooLong));
         assert_eq!(Plaintext::padded(vec![], 4, 0), Err(Error::BlockSize(0)));
-        assert_eq!(Plaintext::padded(vec![], 4, 257), Err(Error::BlockSize(257)));
-        assert_eq!(Plaintext::padded(vec![0; MAX_PACKET - 1], 4, 1), Err(Error::TooLong));
-        assert_eq!(Plaintext::padded(vec![0; MAX_PACKET + 1], 4, 1), Err(Error::TooLong));
+        assert_eq!(
+            Plaintext::padded(vec![], 4, 257),
+            Err(Error::BlockSize(257))
+        );
+        assert_eq!(
+            Plaintext::padded(vec![0; MAX_PACKET - 1], 4, 1),
+            Err(Error::TooLong)
+        );
+        assert_eq!(
+            Plaintext::padded(vec![0; MAX_PACKET + 1], 4, 1),
+            Err(Error::TooLong)
+        );
         // 65535 is not a multiple of 4, so padding to it overflows.
-        assert_eq!(Plaintext::padded(vec![0; MAX_PACKET - 2], 4, 1), Err(Error::TooLong));
-        assert_eq!(Plaintext::padded(vec![0; MAX_PACKET - 5], 4, 1).unwrap().len(), MAX_PACKET - 3);
+        assert_eq!(
+            Plaintext::padded(vec![0; MAX_PACKET - 2], 4, 1),
+            Err(Error::TooLong)
+        );
+        assert_eq!(
+            Plaintext::padded(vec![0; MAX_PACKET - 5], 4, 1)
+                .unwrap()
+                .len(),
+            MAX_PACKET - 3
+        );
     }
 
     #[test]
@@ -1032,19 +1241,32 @@ mod tests {
     }
 
     fn esp_samples() -> Vec<EspPacket> {
-        vec![esp(1, 0, &[0, 4]), esp(0xffff_ffff, 0xffff_ffff, b"ciphertext and icv")]
+        vec![
+            esp(1, 0, &[0, 4]),
+            esp(0xffff_ffff, 0xffff_ffff, b"ciphertext and icv"),
+        ]
     }
 
     fn ah_samples() -> Vec<AhPacket> {
         vec![
-            AhPacket { header: ah(4, 1, 1, &[]), payload: vec![] },
-            AhPacket { header: ah(6, 0x200, 9, &[0xcc; 12]), payload: b"inner".to_vec() },
+            AhPacket {
+                header: ah(4, 1, 1, &[]),
+                payload: vec![],
+            },
+            AhPacket {
+                header: ah(6, 0x200, 9, &[0xcc; 12]),
+                payload: b"inner".to_vec(),
+            },
         ]
     }
 
     fn udp_samples() -> Vec<Datagram> {
-        vec![Datagram::Keepalive, Datagram::Ike(vec![]), Datagram::Ike(b"ike message".to_vec()),
-            Datagram::Esp(esp(0x1000, 2, &[1, 2, 3, 4, 2, 4]))]
+        vec![
+            Datagram::Keepalive,
+            Datagram::Ike(vec![]),
+            Datagram::Ike(b"ike message".to_vec()),
+            Datagram::Esp(esp(0x1000, 2, &[1, 2, 3, 4, 2, 4])),
+        ]
     }
 
     #[test]
@@ -1053,8 +1275,11 @@ mod tests {
             let b = p.to_bytes().unwrap();
             for n in 0..b.len() {
                 let got = check::<EspPacket>(MAX_PACKET, &b[..n]);
-                if n >= MIN_ESP_LEN { assert!(got.is_ok()); }
-                else { assert_eq!(got, Err(Error::Truncated)); }
+                if n >= MIN_ESP_LEN {
+                    assert!(got.is_ok());
+                } else {
+                    assert_eq!(got, Err(Error::Truncated));
+                }
             }
             assert_eq!(check::<EspPacket>(MAX_PACKET, &b), Ok(p));
         }
@@ -1066,7 +1291,9 @@ mod tests {
                     let got = got.unwrap();
                     assert_eq!(got.header, p.header);
                     assert_eq!(got.payload, p.payload[..n - p.header.len()]);
-                } else { assert_eq!(got, Err(Error::Truncated)); }
+                } else {
+                    assert_eq!(got, Err(Error::Truncated));
+                }
             }
             assert_eq!(check::<AhPacket>(MAX_PACKET, &b), Ok(p));
         }
@@ -1076,30 +1303,45 @@ mod tests {
                 let got = check::<Datagram>(MAX_DATAGRAM, &b[..n]);
                 match &p {
                     Datagram::Esp(_) if n >= MIN_ESP_LEN => assert!(got.is_ok()),
-                    Datagram::Ike(m) if n >= 4 => assert_eq!(got, Ok(Datagram::Ike(m[..n - 4].to_vec()))),
+                    Datagram::Ike(m) if n >= 4 => {
+                        assert_eq!(got, Ok(Datagram::Ike(m[..n - 4].to_vec())))
+                    }
                     _ => assert_eq!(got, Err(Error::Truncated)),
                 }
             }
             assert_eq!(check::<Datagram>(MAX_DATAGRAM, &b), Ok(p));
         }
-        let b = Plaintext::padded(b"abcdefg".to_vec(), 4, 8).unwrap().to_bytes().unwrap();
+        let b = Plaintext::padded(b"abcdefg".to_vec(), 4, 8)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
         for n in 0..b.len() {
             let got = check::<Plaintext>(MAX_PACKET, &b[..n]);
-            if n < 2 { assert_eq!(got, Err(Error::Truncated)); }
+            if n < 2 {
+                assert_eq!(got, Err(Error::Truncated));
+            }
         }
     }
 
     #[test]
     fn collection_chunk_contract() {
         let mut rng = Lcg::new(2410);
-        for _ in 0..2_000 { random_packet(&mut rng).check(); }
+        for _ in 0..2_000 {
+            random_packet(&mut rng).check();
+        }
     }
 
     #[test]
     fn collection_errors_and_limits() {
         assert_eq!(check::<EspPacket>(MAX_PACKET, &[0; 4]), Err(Error::ZeroSpi));
-        assert_eq!(check::<AhPacket>(MAX_PACKET, &[4, 0]), Err(Error::AhLength(0)));
-        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &vec![1; 70_000]), Err(Error::TooLong));
+        assert_eq!(
+            check::<AhPacket>(MAX_PACKET, &[4, 0]),
+            Err(Error::AhLength(0))
+        );
+        assert_eq!(
+            check::<Datagram>(MAX_DATAGRAM, &vec![1; 70_000]),
+            Err(Error::TooLong)
+        );
         let mut big = vec![1; 3 * MAX_PACKET];
         big[..4].copy_from_slice(&[0, 0, 0, 1]);
         assert_eq!(check::<EspPacket>(MAX_PACKET, &big), Err(Error::TooLong));
@@ -1109,7 +1351,10 @@ mod tests {
     fn values_can_key_maps() {
         fn check<T: std::hash::Hash + Eq + Clone>(values: Vec<T>) {
             let mut seen = std::collections::HashSet::new();
-            for p in values { assert!(seen.insert(p.clone())); assert!(!seen.insert(p)); }
+            for p in values {
+                assert!(seen.insert(p.clone()));
+                assert!(!seen.insert(p));
+            }
         }
         check(esp_samples());
         check(ah_samples());
@@ -1135,7 +1380,12 @@ mod tests {
     impl Packet {
         fn check(self) -> Vec<u8> {
             fn round_trip<M>(value: M, limit: usize) -> Vec<u8>
-            where M: Wire<ParseError = Error, WriteError = Error> + Clone + std::fmt::Debug + PartialEq {
+            where
+                M: Wire<ParseError = Error, WriteError = Error>
+                    + Clone
+                    + std::fmt::Debug
+                    + PartialEq,
+            {
                 contract::check_wire_value(&value);
                 let bytes = value.to_bytes().unwrap();
                 assert_eq!(check::<M>(limit, &bytes), Ok(value));
@@ -1153,17 +1403,28 @@ mod tests {
         let esp_packet = |rng: &mut Lcg| {
             let mut payload = rng.bytes(40);
             payload.extend_from_slice(&[0, 4]);
-            EspPacket { spi: rng.spi(), sequence: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)), payload }
+            EspPacket {
+                spi: rng.spi(),
+                sequence: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
+                payload,
+            }
         };
         match rng.index(5) {
             0 => Packet::Esp(esp_packet(rng)),
             1 => {
                 let mut icv = vec![0; rng.index(9) * 4];
                 rng.fill(&mut icv);
-                let header = AhHeader { next_header: rng.next() as u8,
+                let header = AhHeader {
+                    next_header: rng.next() as u8,
                     reserved: if rng.coin() { 0 } else { rng.next() as u16 },
-                    spi: rng.spi(), sequence: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)), icv };
-                Packet::Ah(AhPacket { header, payload: rng.bytes(32) })
+                    spi: rng.spi(),
+                    sequence: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
+                    icv,
+                };
+                Packet::Ah(AhPacket {
+                    header,
+                    payload: rng.bytes(32),
+                })
             }
             2 => Packet::Udp(Datagram::Keepalive),
             3 => Packet::Udp(Datagram::Ike(rng.bytes(32))),

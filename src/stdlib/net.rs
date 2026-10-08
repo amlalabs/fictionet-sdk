@@ -118,16 +118,20 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::task::Poll;
 use std::time::Duration;
 
+use fictionet::events::{ConnInfo, Event, Fields, Level, Sandbox, opt as jopt};
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::dhcp::{self, opt};
 use fictionet::stdlib::dns::op::{Edns, Message, MessageType, OpCode, ResponseCode};
 use fictionet::stdlib::dns::rr::{DNSClass, RData, Record, RecordType, rdata::A, rdata::AAAA};
 use fictionet::stdlib::ip::{Header, Intake, Reassembly};
-use fictionet::events::{ConnInfo, Event, Fields, Level, Sandbox, opt as jopt};
 use fictionet::stdlib::route::{self, Prefix, Router};
 use fictionet::stdlib::serve::{self, Budget, Counted, ServeOptions, Service, TlsSelect};
 use fictionet::stdlib::tls::ServerConfig;
-use fictionet::stdlib::{ConnError, Connection, ConnectionExt, ports::{self, Ports}, icmp, ip, tcp, udp};
+use fictionet::stdlib::{
+    ConnError, Connection, ConnectionExt, icmp, ip,
+    ports::{self, Ports},
+    tcp, udp,
+};
 use fictionet::time::Instant;
 use fictionet::{Attachment, Attachments, Cx, End, Error, Interface, InterfaceExt, Packet};
 
@@ -285,7 +289,12 @@ struct ServiceAccept<S: Service, M> {
 
 impl<S: Service, M> ServiceAccept<S, M> {
     fn new(state: Arc<S::State>, make: M, opts: ServeOptions) -> ServiceAccept<S, M> {
-        ServiceAccept { state, make, opts, open: Arc::default() }
+        ServiceAccept {
+            state,
+            make,
+            opts,
+            open: Arc::default(),
+        }
     }
 }
 
@@ -298,8 +307,16 @@ where
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let Some(guard) = Counted::enter(&self.open, self.opts.max_conns) else {
             let (src, dst) = (arrival.info.peer, arrival.info.local);
-            let event = blocked_event(BlockedWhy::TooManyConnections, Some(PROTO_TCP), src.map(|a| a.ip()), dst.map(|a| a.ip()));
-            let conn = ConnInfo { sandbox: arrival.info.sandbox.clone(), ..ConnInfo::default() };
+            let event = blocked_event(
+                BlockedWhy::TooManyConnections,
+                Some(PROTO_TCP),
+                src.map(|a| a.ip()),
+                dst.map(|a| a.ip()),
+            );
+            let conn = ConnInfo {
+                sandbox: arrival.info.sandbox.clone(),
+                ..ConnInfo::default()
+            };
             fcx.record_repeat(event.conn(&conn), port_detail(dst.map(|a| a.port())));
             arrival.socket.reset();
             return Box::pin(async {});
@@ -322,7 +339,8 @@ where
 
 /// Starts serving a UDP port of a machine: the socket, its address, the
 /// seed, and who the sandboxes are.
-type UdpStart = Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, u64, Option<serve::SandboxOf>) + Send + Sync>;
+type UdpStart =
+    Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, u64, Option<serve::SandboxOf>) + Send + Sync>;
 
 /// Which names a TLS service on a port answers to, by the SNI the client
 /// sends.
@@ -346,7 +364,11 @@ impl From<&str> for Sni {
 #[derive(Clone)]
 enum PortSpec {
     Tcp(Arc<dyn Accept>),
-    Tls { sni: Sni, config: ConfigFor, accept: Arc<dyn Accept> },
+    Tls {
+        sni: Sni,
+        config: ConfigFor,
+        accept: Arc<dyn Accept>,
+    },
     Udp(UdpStart),
 }
 
@@ -366,7 +388,15 @@ pub struct Host {
 impl Host {
     /// A host called `label` (for observers), with no names or services.
     pub fn new(label: &str) -> Host {
-        Host { label: label.to_owned(), names: Vec::new(), at: None, at_v6: None, family: Family::Both, ports: Vec::new(), lan: None }
+        Host {
+            label: label.to_owned(),
+            names: Vec::new(),
+            at: None,
+            at_v6: None,
+            family: Family::Both,
+            ports: Vec::new(),
+            lan: None,
+        }
     }
 
     /// Serves the host at `addr`, IPv4 or IPv6, which sets its address of
@@ -380,8 +410,14 @@ impl Host {
     /// gets NXDOMAIN.
     pub fn at(self, addr: impl Into<IpAddr>) -> Host {
         match addr.into() {
-            IpAddr::V4(a) => Host { at: Some(a), ..self },
-            IpAddr::V6(a) => Host { at_v6: Some(a), ..self },
+            IpAddr::V4(a) => Host {
+                at: Some(a),
+                ..self
+            },
+            IpAddr::V6(a) => Host {
+                at_v6: Some(a),
+                ..self
+            },
         }
     }
 
@@ -390,17 +426,26 @@ impl Host {
     /// with [`at`](Self::at), or a free one), and shares the subnet with
     /// the LAN's other hosts and members.
     pub fn on(self, lan: &str) -> Host {
-        Host { lan: Some(lan.to_owned()), ..self }
+        Host {
+            lan: Some(lan.to_owned()),
+            ..self
+        }
     }
 
     /// Gives the host only an IPv4 address.
     pub fn ipv4_only(self) -> Host {
-        Host { family: Family::V4, ..self }
+        Host {
+            family: Family::V4,
+            ..self
+        }
     }
 
     /// Gives the host only an IPv6 address.
     pub fn ipv6_only(self) -> Host {
-        Host { family: Family::V6, ..self }
+        Host {
+            family: Family::V6,
+            ..self
+        }
     }
 
     /// Makes the gateway's DNS answer `name` with the host's addresses. A
@@ -428,7 +473,13 @@ impl Host {
     /// limit, a connection cap, a STARTTLS config. The sandbox's budget
     /// applies when `opts` has none. A STARTTLS handshake has
     /// [`Limits::handshake`], whatever `opts` says.
-    pub fn tcp_with<S, M>(self, port: u16, state: Arc<S::State>, make: M, opts: ServeOptions) -> Host
+    pub fn tcp_with<S, M>(
+        self,
+        port: u16,
+        state: Arc<S::State>,
+        make: M,
+        opts: ServeOptions,
+    ) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
@@ -466,8 +517,18 @@ impl Host {
 
     /// Serves TCP `port` with TLS for the names `sni` gives, with the
     /// config `config_for` returns for each handshake, then `accept`.
-    pub fn tls_accept(mut self, port: u16, sni: impl Into<Sni>, config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static, accept: impl Accept) -> Host {
-        let spec = PortSpec::Tls { sni: sni.into(), config: Arc::new(config_for), accept: Arc::new(accept) };
+    pub fn tls_accept(
+        mut self,
+        port: u16,
+        sni: impl Into<Sni>,
+        config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
+        accept: impl Accept,
+    ) -> Host {
+        let spec = PortSpec::Tls {
+            sni: sni.into(),
+            config: Arc::new(config_for),
+            accept: Arc::new(accept),
+        };
         self.ports.push((port, spec));
         self
     }
@@ -485,7 +546,13 @@ impl Host {
 
     /// The same with these options. The network names each datagram's
     /// sandbox ([`ServeOptions::sandbox`]).
-    pub fn udp_with<S, M>(mut self, port: u16, state: Arc<S::State>, make: M, opts: ServeOptions) -> Host
+    pub fn udp_with<S, M>(
+        mut self,
+        port: u16,
+        state: Arc<S::State>,
+        make: M,
+        opts: ServeOptions,
+    ) -> Host
     where
         S: Service,
         M: Fn() -> S + Send + Sync + 'static,
@@ -543,8 +610,14 @@ impl Net {
     /// An empty network with the default subnets, dual-stack.
     pub fn new() -> Net {
         Net {
-            subnet: Prefix { addr: Ipv4Addr::new(10, 0, 0, 0).into(), len: 24 },
-            subnet_v6: Prefix { addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).into(), len: 64 },
+            subnet: Prefix {
+                addr: Ipv4Addr::new(10, 0, 0, 0).into(),
+                len: 24,
+            },
+            subnet_v6: Prefix {
+                addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).into(),
+                len: 64,
+            },
             ipv6: true,
             hosts: Vec::new(),
             resolver: None,
@@ -568,14 +641,20 @@ impl Net {
     pub fn subnet(self, subnet: Prefix) -> Net {
         match subnet.addr {
             IpAddr::V4(_) => Net { subnet, ..self },
-            IpAddr::V6(_) => Net { subnet_v6: subnet, ..self },
+            IpAddr::V6(_) => Net {
+                subnet_v6: subnet,
+                ..self
+            },
         }
     }
 
     /// Turns IPv6 off: hosts have only IPv4 addresses, DNS answers AAAA
     /// with NODATA, and every IPv6 packet from a sandbox is dropped.
     pub fn ipv4_only(self) -> Net {
-        Net { ipv6: false, ..self }
+        Net {
+            ipv6: false,
+            ..self
+        }
     }
 
     /// Adds the fields of the `run.start` event the network records first
@@ -605,7 +684,10 @@ impl Net {
     /// that cannot be served is recorded as a `net.error` event, and its
     /// name gets NXDOMAIN.
     pub fn resolve(self, resolve: impl Fn(&str) -> Option<Host> + Send + Sync + 'static) -> Net {
-        Net { resolver: Some(Arc::new(resolve)), ..self }
+        Net {
+            resolver: Some(Arc::new(resolve)),
+            ..self
+        }
     }
 
     /// Sets how many names may get a host from [`resolve`](Net::resolve).
@@ -655,12 +737,18 @@ impl Net {
     /// Installs `registry` for observers when the network starts, so the
     /// dashboard decodes the services' protocols.
     pub fn observe(self, registry: fictionet::observe::Registry) -> Net {
-        Net { registry: Some(registry), ..self }
+        Net {
+            registry: Some(registry),
+            ..self
+        }
     }
 
     /// Names the group observers see for the network's tasks.
     pub fn group(self, name: &str) -> Net {
-        Net { group: name.to_owned(), ..self }
+        Net {
+            group: name.to_owned(),
+            ..self
+        }
     }
 
     /// Sets the network's limits and timers.
@@ -683,7 +771,11 @@ impl Net {
     /// subnet cannot be used, or a host cannot be served as declared.
     pub fn serve(self, fcx: &Cx, mut attachments: Attachments) -> Result<(), Error> {
         let subnet = Subnet::new(self.subnet)?;
-        let subnet6 = if self.ipv6 { Some(Subnet6::new(self.subnet_v6)?) } else { None };
+        let subnet6 = if self.ipv6 {
+            Some(Subnet6::new(self.subnet_v6)?)
+        } else {
+            None
+        };
         fcx.events().start(fcx, self.start);
         if let Some(registry) = self.registry {
             fcx.observe_protocols(registry);
@@ -696,12 +788,24 @@ impl Net {
 
         // Everything without a better route: answered with "host unreachable".
         let (router_side, unreachable_side) = link();
-        router.add(Prefix { addr: Ipv4Addr::UNSPECIFIED.into(), len: 0 }, Box::new(router_side));
+        router.add(
+            Prefix {
+                addr: Ipv4Addr::UNSPECIFIED.into(),
+                len: 0,
+            },
+            Box::new(router_side),
+        );
         let gateway = subnet.gateway;
         fcx.spawn(move |fcx| unreachable(fcx, unreachable_side, gateway.into()));
         if let Some(subnet6) = subnet6 {
             let (router_side, unreachable_side) = link();
-            router.add(Prefix { addr: Ipv6Addr::UNSPECIFIED.into(), len: 0 }, Box::new(router_side));
+            router.add(
+                Prefix {
+                    addr: Ipv6Addr::UNSPECIFIED.into(),
+                    len: 0,
+                },
+                Box::new(router_side),
+            );
             let gateway = subnet6.gateway;
             fcx.spawn(move |fcx| unreachable(fcx, unreachable_side, gateway.into()));
         }
@@ -710,7 +814,15 @@ impl Net {
             conns: AtomicU64::new(0),
             attached: Mutex::default(),
         });
-        let lans = make_lans(fcx, &router, &hooks, &subnet, subnet6.as_ref(), self.lans, &self.members)?;
+        let lans = make_lans(
+            fcx,
+            &router,
+            &hooks,
+            &subnet,
+            subnet6.as_ref(),
+            self.lans,
+            &self.members,
+        )?;
         let routes: Vec<(String, Prefix)> = self.routes;
         let shared = Arc::new(Shared {
             fcx: fcx.clone(),
@@ -738,7 +850,9 @@ impl Net {
             for host in self.hosts {
                 let names = host.names.clone();
                 let label = host.label.clone();
-                let placed = shared.place(&mut world, host).map_err(|e| fictionet::Error::msg(format!("host {label}: {e}")))?;
+                let placed = shared
+                    .place(&mut world, host)
+                    .map_err(|e| fictionet::Error::msg(format!("host {label}: {e}")))?;
                 for name in names {
                     world.names.insert(name, Known::Host(placed));
                 }
@@ -753,7 +867,9 @@ impl Net {
                     shared.router.add(*prefix, Box::new(sandbox));
                     continue;
                 }
-                if let Some((name, lan, addr)) = members.iter().find(|(n, _, _)| n == sandbox.name()) {
+                if let Some((name, lan, addr)) =
+                    members.iter().find(|(n, _, _)| n == sandbox.name())
+                {
                     shared.join_lan(&fcx, name, lan, *addr, sandbox);
                     continue;
                 }
@@ -799,7 +915,12 @@ impl Hooks {
             IpAddr::V4(a) => (Some(a), None),
             IpAddr::V6(a) => (None, Some(a)),
         };
-        Sandbox { id: 0, name: Arc::from(""), addr: v4, addr_v6: v6 }
+        Sandbox {
+            id: 0,
+            name: Arc::from(""),
+            addr: v4,
+            addr_v6: v6,
+        }
     }
 
     fn is_attached(&self, id: u64) -> bool {
@@ -817,7 +938,10 @@ impl Hooks {
 }
 
 fn sandbox_only(sandbox: Sandbox) -> ConnInfo {
-    ConnInfo { sandbox: Some(sandbox), ..ConnInfo::default() }
+    ConnInfo {
+        sandbox: Some(sandbox),
+        ..ConnInfo::default()
+    }
 }
 
 /// The sandboxes' subnet.
@@ -831,14 +955,24 @@ struct Subnet {
 impl Subnet {
     fn new(p: Prefix) -> Result<Subnet, Error> {
         let IpAddr::V4(a) = p.addr else {
-            return Err(fictionet::Error::msg(format!("the sandboxes' subnet {}/{} must be IPv4", p.addr, p.len)));
+            return Err(fictionet::Error::msg(format!(
+                "the sandboxes' subnet {}/{} must be IPv4",
+                p.addr, p.len
+            )));
         };
         if !(8..=30).contains(&p.len) {
-            return Err(fictionet::Error::msg(format!("the sandboxes' subnet {a}/{} must have a length from 8 to 30", p.len)));
+            return Err(fictionet::Error::msg(format!(
+                "the sandboxes' subnet {a}/{} must have a length from 8 to 30",
+                p.len
+            )));
         }
         let mask = u32::MAX << (32 - p.len as u32);
         let net = u32::from(a) & mask;
-        Ok(Subnet { net, mask, gateway: Ipv4Addr::from(net + 1) })
+        Ok(Subnet {
+            net,
+            mask,
+            gateway: Ipv4Addr::from(net + 1),
+        })
     }
 
     fn contains(&self, a: Ipv4Addr) -> bool {
@@ -874,19 +1008,32 @@ struct Subnet6 {
 impl Subnet6 {
     fn new(p: Prefix) -> Result<Subnet6, Error> {
         let IpAddr::V6(a) = p.addr else {
-            return Err(fictionet::Error::msg(format!("the sandboxes' IPv6 subnet {}/{} must be IPv6", p.addr, p.len)));
+            return Err(fictionet::Error::msg(format!(
+                "the sandboxes' IPv6 subnet {}/{} must be IPv6",
+                p.addr, p.len
+            )));
         };
         if !(8..=126).contains(&p.len) {
-            return Err(fictionet::Error::msg(format!("the sandboxes' IPv6 subnet {a}/{} must have a length from 8 to 126", p.len)));
+            return Err(fictionet::Error::msg(format!(
+                "the sandboxes' IPv6 subnet {a}/{} must have a length from 8 to 126",
+                p.len
+            )));
         }
         let mask = u128::MAX << (128 - p.len as u32);
         let net = u128::from(a) & mask;
         let global = net >> 125 == 0b001;
         let ula = net >> 121 == 0b111_1110;
         if !(global || ula) {
-            return Err(fictionet::Error::msg(format!("the sandboxes' IPv6 subnet {a}/{} must lie inside 2000::/3 or fc00::/7", p.len)));
+            return Err(fictionet::Error::msg(format!(
+                "the sandboxes' IPv6 subnet {a}/{} must lie inside 2000::/3 or fc00::/7",
+                p.len
+            )));
         }
-        Ok(Subnet6 { net, mask, gateway: Ipv6Addr::from(net + 1) })
+        Ok(Subnet6 {
+            net,
+            mask,
+            gateway: Ipv6Addr::from(net + 1),
+        })
     }
 
     fn contains(&self, a: Ipv6Addr) -> bool {
@@ -906,7 +1053,11 @@ struct Placed {
 }
 
 fn may_serve_v4(a: Ipv4Addr, subnet: &Subnet) -> bool {
-    !(subnet.contains(a) || a.is_unspecified() || a.is_broadcast() || a.is_multicast() || a.is_loopback())
+    !(subnet.contains(a)
+        || a.is_unspecified()
+        || a.is_broadcast()
+        || a.is_multicast()
+        || a.is_loopback())
 }
 
 fn may_serve_v6(a: Ipv6Addr, subnet: &Subnet6) -> bool {
@@ -1055,7 +1206,8 @@ fn nth(p: &Prefix, n: u128) -> Option<IpAddr> {
         }
         IpAddr::V6(a) => {
             let bits = 128 - u32::from(p.len.min(128));
-            (bits == 128 || n < (1u128 << bits)).then(|| IpAddr::V6(Ipv6Addr::from(u128::from(a) + n)))
+            (bits == 128 || n < (1u128 << bits))
+                .then(|| IpAddr::V6(Ipv6Addr::from(u128::from(a) + n)))
         }
     }
 }
@@ -1076,51 +1228,95 @@ fn make_lans(
     lans: Vec<(String, Prefix)>,
     members: &[(String, String, IpAddr)],
 ) -> Result<HashMap<String, LanSeg>, Error> {
-    let sandboxes4 = Prefix { addr: IpAddr::V4(Ipv4Addr::from(subnet.net)), len: subnet.mask.count_ones() as u8 };
-    let sandboxes6 = subnet6.map(|s| Prefix { addr: IpAddr::V6(Ipv6Addr::from(s.net)), len: s.mask.count_ones() as u8 });
+    let sandboxes4 = Prefix {
+        addr: IpAddr::V4(Ipv4Addr::from(subnet.net)),
+        len: subnet.mask.count_ones() as u8,
+    };
+    let sandboxes6 = subnet6.map(|s| Prefix {
+        addr: IpAddr::V6(Ipv6Addr::from(s.net)),
+        len: s.mask.count_ones() as u8,
+    });
     let mut made: HashMap<String, LanSeg> = HashMap::new();
     for (name, prefix) in lans {
         let max = if prefix.addr.is_ipv4() { 30 } else { 126 };
         if prefix.len > max {
-            return Err(fictionet::Error::msg(format!("LAN {name}: {}/{} leaves no room for members", prefix.addr, prefix.len)));
+            return Err(fictionet::Error::msg(format!(
+                "LAN {name}: {}/{} leaves no room for members",
+                prefix.addr, prefix.len
+            )));
         }
-        if overlap(&prefix, &sandboxes4) || sandboxes6.as_ref().is_some_and(|s| overlap(&prefix, s)) {
-            return Err(fictionet::Error::msg(format!("LAN {name}: {}/{} overlaps the sandboxes' subnet", prefix.addr, prefix.len)));
+        if overlap(&prefix, &sandboxes4) || sandboxes6.as_ref().is_some_and(|s| overlap(&prefix, s))
+        {
+            return Err(fictionet::Error::msg(format!(
+                "LAN {name}: {}/{} overlaps the sandboxes' subnet",
+                prefix.addr, prefix.len
+            )));
         }
-        if let Some((other, _)) = made.iter().find(|(n, l)| **n == name || overlap(&prefix, &l.prefix)) {
-            return Err(fictionet::Error::msg(format!("LAN {name}: {}/{} overlaps LAN {other}", prefix.addr, prefix.len)));
+        if let Some((other, _)) = made
+            .iter()
+            .find(|(n, l)| **n == name || overlap(&prefix, &l.prefix))
+        {
+            return Err(fictionet::Error::msg(format!(
+                "LAN {name}: {}/{} overlaps LAN {other}",
+                prefix.addr, prefix.len
+            )));
         }
         let segment = name.clone();
         let names = hooks.clone();
-        let lan = route::lan::<Box<dyn Interface>, _>(&fcx.group(format!("lan {name}")), prefix, move |mut event| {
-            // A packet from the gateway has no member to name. Its source
-            // passed a sandbox filter's address check, so the address
-            // names the sandbox that sent it.
-            if event.conn.sandbox.is_none() {
-                let src = event.str("src").and_then(|a| a.parse::<IpAddr>().ok());
-                event.conn.sandbox = src.and_then(|a| lock(&names.by_addr).get(&a).cloned());
-            }
-            event.field("lan", segment.clone())
-        });
+        let lan = route::lan::<Box<dyn Interface>, _>(
+            &fcx.group(format!("lan {name}")),
+            prefix,
+            move |mut event| {
+                // A packet from the gateway has no member to name. Its source
+                // passed a sandbox filter's address check, so the address
+                // names the sandbox that sent it.
+                if event.conn.sandbox.is_none() {
+                    let src = event.str("src").and_then(|a| a.parse::<IpAddr>().ok());
+                    event.conn.sandbox = src.and_then(|a| lock(&names.by_addr).get(&a).cloned());
+                }
+                event.field("lan", segment.clone())
+            },
+        );
         let (lan_side, router_side) = link();
         lan.gateway(Box::new(lan_side))?;
         router.add(prefix, Box::new(router_side));
-        let dns = nth(&prefix, 1).ok_or_else(|| fictionet::Error::msg("a LAN has room for its DNS"))?;
-        made.insert(name, LanSeg { prefix, lan, dns, members: HashSet::new() });
+        let dns =
+            nth(&prefix, 1).ok_or_else(|| fictionet::Error::msg("a LAN has room for its DNS"))?;
+        made.insert(
+            name,
+            LanSeg {
+                prefix,
+                lan,
+                dns,
+                members: HashSet::new(),
+            },
+        );
     }
     for (member, lan, addr) in members {
         let Some(seg) = made.get_mut(lan) else {
-            return Err(fictionet::Error::msg(format!("member {member}: there is no LAN called {lan}")));
+            return Err(fictionet::Error::msg(format!(
+                "member {member}: there is no LAN called {lan}"
+            )));
         };
         let broadcast = match seg.prefix.addr {
-            IpAddr::V4(a) => Some(IpAddr::V4(Ipv4Addr::from(u32::from(a) | (u32::MAX >> seg.prefix.len)))),
+            IpAddr::V4(a) => Some(IpAddr::V4(Ipv4Addr::from(
+                u32::from(a) | (u32::MAX >> seg.prefix.len),
+            ))),
             IpAddr::V6(_) => None,
         };
-        if !prefix_contains(&seg.prefix, *addr) || *addr == seg.prefix.addr || *addr == seg.dns || Some(*addr) == broadcast {
-            return Err(fictionet::Error::msg(format!("member {member}: {addr} is not a member address of LAN {lan}")));
+        if !prefix_contains(&seg.prefix, *addr)
+            || *addr == seg.prefix.addr
+            || *addr == seg.dns
+            || Some(*addr) == broadcast
+        {
+            return Err(fictionet::Error::msg(format!(
+                "member {member}: {addr} is not a member address of LAN {lan}"
+            )));
         }
         if !seg.members.insert(*addr) {
-            return Err(fictionet::Error::msg(format!("member {member}: another member of LAN {lan} has {addr}")));
+            return Err(fictionet::Error::msg(format!(
+                "member {member}: another member of LAN {lan} has {addr}"
+            )));
         }
     }
     Ok(made)
@@ -1129,11 +1325,19 @@ fn make_lans(
 fn prefix_contains(p: &Prefix, a: IpAddr) -> bool {
     match (p.addr, a) {
         (IpAddr::V4(n), IpAddr::V4(a)) => {
-            let mask = if p.len == 0 { 0 } else { u32::MAX << (32 - u32::from(p.len.min(32))) };
+            let mask = if p.len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - u32::from(p.len.min(32)))
+            };
             u32::from(n) & mask == u32::from(a) & mask
         }
         (IpAddr::V6(n), IpAddr::V6(a)) => {
-            let mask = if p.len == 0 { 0 } else { u128::MAX << (128 - u32::from(p.len.min(128))) };
+            let mask = if p.len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - u32::from(p.len.min(128)))
+            };
             u128::from(n) & mask == u128::from(a) & mask
         }
         _ => false,
@@ -1151,7 +1355,9 @@ impl Shared {
                 Known::NoHost => Lookup::NoHost,
             };
         }
-        let Some(resolver) = &self.resolver else { return Lookup::NoHost };
+        let Some(resolver) = &self.resolver else {
+            return Lookup::NoHost;
+        };
         let known = match resolver(name) {
             Some(_) if world.resolved >= world.max_hosts => return Lookup::Full,
             Some(mut host) => {
@@ -1162,7 +1368,11 @@ impl Shared {
                 match self.place(&mut world, host) {
                     Ok(p) => Known::Host(p),
                     Err(e) => {
-                        let event = Event::new("net", "error").level(Level::Notice).summary(format!("host {label} for {name}: {e}")).field("name", name).field("error", e);
+                        let event = Event::new("net", "error")
+                            .level(Level::Notice)
+                            .summary(format!("host {label} for {name}: {e}"))
+                            .field("name", name)
+                            .field("error", e);
                         self.hooks.record(&self.fcx, &ConnInfo::default(), event);
                         Known::NoHost
                     }
@@ -1184,9 +1394,20 @@ impl Shared {
         if let Some(name) = &host.lan {
             return self.place_on_lan(world, name, &host);
         }
-        for a in host.at.map(IpAddr::V4).into_iter().chain(host.at_v6.map(IpAddr::V6)) {
-            if let Some((name, _)) = self.lans.iter().find(|(_, l)| prefix_contains(&l.prefix, a)) {
-                return Err(format!("{a} is on LAN {name}: place the host there with Host::on"));
+        for a in host
+            .at
+            .map(IpAddr::V4)
+            .into_iter()
+            .chain(host.at_v6.map(IpAddr::V6))
+        {
+            if let Some((name, _)) = self
+                .lans
+                .iter()
+                .find(|(_, l)| prefix_contains(&l.prefix, a))
+            {
+                return Err(format!(
+                    "{a} is on LAN {name}: place the host there with Host::on"
+                ));
             }
         }
         let wants_v4 = host.family != Family::V6;
@@ -1209,8 +1430,16 @@ impl Shared {
         if placed == Placed::default() {
             return Err("no address is left for it".into());
         }
-        let label = host.names.first().cloned().unwrap_or_else(|| host.label.clone());
-        let addrs = placed.v4.map(IpAddr::V4).into_iter().chain(placed.v6.map(IpAddr::V6));
+        let label = host
+            .names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| host.label.clone());
+        let addrs = placed
+            .v4
+            .map(IpAddr::V4)
+            .into_iter()
+            .chain(placed.v6.map(IpAddr::V6));
         for addr in addrs {
             let machine = match world.machines.get(&addr) {
                 Some(m) => m.clone(),
@@ -1227,13 +1456,32 @@ impl Shared {
 
     /// Places `host` on the LAN `name`, at its `at` address of the LAN's
     /// family or the first free one from the LAN's second address up.
-    fn place_on_lan(self: &Arc<Self>, world: &mut World, name: &str, host: &Host) -> Result<Placed, String> {
-        let seg = self.lans.get(name).ok_or_else(|| format!("there is no LAN called {name}"))?;
+    fn place_on_lan(
+        self: &Arc<Self>,
+        world: &mut World,
+        name: &str,
+        host: &Host,
+    ) -> Result<Placed, String> {
+        let seg = self
+            .lans
+            .get(name)
+            .ok_or_else(|| format!("there is no LAN called {name}"))?;
         let v4 = seg.prefix.addr.is_ipv4();
-        let given = if v4 { host.at.map(IpAddr::V4) } else { host.at_v6.map(IpAddr::V6) };
+        let given = if v4 {
+            host.at.map(IpAddr::V4)
+        } else {
+            host.at_v6.map(IpAddr::V6)
+        };
         let free = |a: IpAddr| a != seg.dns && !seg.members.contains(&a);
         let addr = match given {
-            Some(a) if prefix_contains(&seg.prefix, a) && a != seg.prefix.addr && free(a) && !a.is_multicast() => a,
+            Some(a)
+                if prefix_contains(&seg.prefix, a)
+                    && a != seg.prefix.addr
+                    && free(a)
+                    && !a.is_multicast() =>
+            {
+                a
+            }
             Some(a) => return Err(format!("{a} is not a free address on LAN {name}")),
             None => (2..1u128 << 16)
                 .map_while(|n| nth(&seg.prefix, n))
@@ -1244,7 +1492,11 @@ impl Shared {
         let machine = match world.machines.get(&addr) {
             Some(m) => m.clone(),
             None => {
-                let label = host.names.first().cloned().unwrap_or_else(|| host.label.clone());
+                let label = host
+                    .names
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| host.label.clone());
                 let m = Machine::start(self, addr, &label, Some(&seg.lan))?;
                 world.machines.insert(addr, m.clone());
                 m
@@ -1252,8 +1504,14 @@ impl Shared {
         };
         machine.add(host)?;
         Ok(match addr {
-            IpAddr::V4(a) => Placed { v4: Some(a), v6: None },
-            IpAddr::V6(a) => Placed { v4: None, v6: Some(a) },
+            IpAddr::V4(a) => Placed {
+                v4: Some(a),
+                v6: None,
+            },
+            IpAddr::V6(a) => Placed {
+                v4: None,
+                v6: Some(a),
+            },
         })
     }
 
@@ -1261,24 +1519,52 @@ impl Shared {
     /// filter, and events know it by that address. It detaches as any
     /// sandbox does when the LAN lets its interface go: when it closes,
     /// when another takes its address, or when it could not join.
-    fn join_lan(self: &Arc<Self>, fcx: &Cx, name: &str, lan: &str, addr: IpAddr, sandbox: Attachment) {
-        let Some(seg) = self.lans.get(lan) else { return };
+    fn join_lan(
+        self: &Arc<Self>,
+        fcx: &Cx,
+        name: &str,
+        lan: &str,
+        addr: IpAddr,
+        sandbox: Attachment,
+    ) {
+        let Some(seg) = self.lans.get(lan) else {
+            return;
+        };
         let attached = Arc::new(Attached::new(self, fcx, Arc::from(name), Some(addr)));
         let hooks = &self.hooks;
         let me = Sandbox {
             id: attached.owner,
             name: Arc::from(name),
-            addr: if let IpAddr::V4(a) = addr { Some(a) } else { None },
-            addr_v6: if let IpAddr::V6(a) = addr { Some(a) } else { None },
+            addr: if let IpAddr::V4(a) = addr {
+                Some(a)
+            } else {
+                None
+            },
+            addr_v6: if let IpAddr::V6(a) = addr {
+                Some(a)
+            } else {
+                None
+            },
         };
         lock(&hooks.by_addr).insert(addr, me.clone());
-        let member = Member { sandbox, _attached: attached.clone() };
+        let member = Member {
+            sandbox,
+            _attached: attached.clone(),
+        };
         let joined = seg.lan.add(addr, Box::new(member), Some(me.clone()));
         let event = match joined {
-            Ok(()) => Event::new("net", "attached").summary(format!("sandbox {name} joined LAN {lan} at {addr}")),
-            Err(e) => Event::new("net", "error").level(Level::Notice).summary(format!("sandbox {name} could not join LAN {lan}: {e}")).field("error", e.to_string()),
+            Ok(()) => Event::new("net", "attached")
+                .summary(format!("sandbox {name} joined LAN {lan} at {addr}")),
+            Err(e) => Event::new("net", "error")
+                .level(Level::Notice)
+                .summary(format!("sandbox {name} could not join LAN {lan}: {e}"))
+                .field("error", e.to_string()),
         };
-        hooks.record(fcx, &sandbox_only(me), event.field("lan", lan).field("addr", addr.to_string()));
+        hooks.record(
+            fcx,
+            &sandbox_only(me),
+            event.field("lan", lan).field("addr", addr.to_string()),
+        );
     }
 }
 // ---------------------------------------------------------------------------
@@ -1293,7 +1579,10 @@ struct Peers {
 
 impl Peers {
     fn new(max: usize) -> Arc<Peers> {
-        Arc::new(Peers { open: Mutex::default(), max })
+        Arc::new(Peers {
+            open: Mutex::default(),
+            max,
+        })
     }
 
     fn enter(self: &Arc<Self>, peer: IpAddr) -> Option<PeerGuard> {
@@ -1303,7 +1592,10 @@ impl Peers {
             return None;
         }
         *n += 1;
-        Some(PeerGuard { peers: self.clone(), peer })
+        Some(PeerGuard {
+            peers: self.clone(),
+            peer,
+        })
     }
 }
 
@@ -1376,11 +1668,18 @@ struct Machine {
 impl Machine {
     /// Starts a machine at `addr`: a route, TCP and UDP with no ports open,
     /// and ping replies, in a group named after `label` and the address.
-    fn start(shared: &Arc<Shared>, addr: IpAddr, label: &str, lan: Option<&route::Lan<Box<dyn Interface>>>) -> Result<Arc<Machine>, String> {
+    fn start(
+        shared: &Arc<Shared>,
+        addr: IpAddr,
+        label: &str,
+        lan: Option<&route::Lan<Box<dyn Interface>>>,
+    ) -> Result<Arc<Machine>, String> {
         let fcx = &shared.fcx.group(format!("{label} ({addr})"));
         let (router_side, side) = link();
         match lan {
-            Some(lan) => lan.add(addr, Box::new(router_side), None).map_err(|e| e.to_string())?,
+            Some(lan) => lan
+                .add(addr, Box::new(router_side), None)
+                .map_err(|e| e.to_string())?,
             None => shared.router.add(host_prefix(addr), Box::new(router_side)),
         }
         let (tcp, udp, icmp, _other) = ip::split_protocols(fcx, side);
@@ -1405,7 +1704,10 @@ impl Machine {
         if let Some(p) = ports.get(&port) {
             return Ok(p.clone());
         }
-        let listener = self.tcp.listen(port).map_err(|e| format!("TCP port {port} at {}: {e}", self.addr))?;
+        let listener = self
+            .tcp
+            .listen(port)
+            .map_err(|e| format!("TCP port {port} at {}: {e}", self.addr))?;
         let p: Arc<Port> = Arc::default();
         ports.insert(port, p.clone());
         let (m, slot) = (self.clone(), p.clone());
@@ -1427,13 +1729,29 @@ impl Machine {
                     if !lock(&self.udp_ports).insert(*number) {
                         return Err(format!("UDP port {number} at {addr} is already served"));
                     }
-                    let socket = self.udp.bind(*number).map_err(|e| format!("UDP port {number} at {addr}: {e}"))?;
-                    start(&self.fcx, socket, SocketAddr::new(addr, *number), seed, sandbox.clone());
+                    let socket = self
+                        .udp
+                        .bind(*number)
+                        .map_err(|e| format!("UDP port {number} at {addr}: {e}"))?;
+                    start(
+                        &self.fcx,
+                        socket,
+                        SocketAddr::new(addr, *number),
+                        seed,
+                        sandbox.clone(),
+                    );
                 }
                 PortSpec::Tcp(accept) => {
                     let port = self.port(*number)?;
-                    if !port.tls.read().unwrap_or_else(|e| e.into_inner()).is_empty() {
-                        return Err(format!("TCP port {number} at {addr} serves TLS, and cannot serve without it too"));
+                    if !port
+                        .tls
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty()
+                    {
+                        return Err(format!(
+                            "TCP port {number} at {addr} serves TLS, and cannot serve without it too"
+                        ));
                     }
                     let mut plain = port.plain.write().unwrap_or_else(|e| e.into_inner());
                     match &*plain {
@@ -1443,27 +1761,46 @@ impl Machine {
                         }
                         Some(front) => {
                             if !front.share(&host.names, accept) {
-                                return Err(format!("TCP port {number} at {addr} is already served by another host"));
+                                return Err(format!(
+                                    "TCP port {number} at {addr} is already served by another host"
+                                ));
                             }
                         }
                     }
                 }
-                PortSpec::Tls { sni, config, accept } => {
+                PortSpec::Tls {
+                    sni,
+                    config,
+                    accept,
+                } => {
                     let port = self.port(*number)?;
-                    if port.plain.read().unwrap_or_else(|e| e.into_inner()).is_some() {
-                        return Err(format!("TCP port {number} at {addr} serves without TLS, and cannot serve TLS too"));
+                    if port
+                        .plain
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "TCP port {number} at {addr} serves without TLS, and cannot serve TLS too"
+                        ));
                     }
                     let names: Vec<String> = match sni {
                         Sni::Any => vec![String::new()],
                         Sni::Name(n) => vec![n.clone()],
                         Sni::Names if host.names.is_empty() => {
-                            return Err(format!("TLS on port {number} is for the host's names, and it has none"));
+                            return Err(format!(
+                                "TLS on port {number} is for the host's names, and it has none"
+                            ));
                         }
                         Sni::Names => host.names.clone(),
                     };
                     let mut tls = port.tls.write().unwrap_or_else(|e| e.into_inner());
                     if let Some(taken) = names.iter().find(|n| tls.contains_key(*n)) {
-                        let name = if taken.is_empty() { "any name" } else { taken.as_str() };
+                        let name = if taken.is_empty() {
+                            "any name"
+                        } else {
+                            taken.as_str()
+                        };
                         return Err(format!("TLS port {number} at {addr} already serves {name}"));
                     }
                     let front = tls.values().next().map(|t| t.accept.clone());
@@ -1476,7 +1813,12 @@ impl Machine {
                     };
                     for name in names {
                         let alpn = served_by.alpn();
-                        let entry = TlsName { config: config.clone(), accept: served_by.clone(), alpn, last: Mutex::new(None) };
+                        let entry = TlsName {
+                            config: config.clone(),
+                            accept: served_by.clone(),
+                            alpn,
+                            last: Mutex::new(None),
+                        };
                         tls.insert(name, Arc::new(entry));
                     }
                 }
@@ -1498,24 +1840,43 @@ impl Machine {
 
 /// The route to one address: `/32` or `/128`.
 fn host_prefix(addr: IpAddr) -> Prefix {
-    Prefix { addr, len: if addr.is_ipv4() { 32 } else { 128 } }
+    Prefix {
+        addr,
+        len: if addr.is_ipv4() { 32 } else { 128 },
+    }
 }
 
 /// Records that a connection was reset for being past its sandbox's
 /// limit.
 fn too_many(fcx: &Cx, hooks: &Hooks, conn: &tcp::TcpConnection) {
     let (peer, local) = (conn.peer_addr(), conn.local_addr());
-    let event = blocked_event(BlockedWhy::TooManyConnections, Some(PROTO_TCP), Some(peer.ip()), Some(local.ip()));
-    hooks.blocked(fcx, &sandbox_only(hooks.sandbox_at(peer.ip())), (event, port_detail(Some(local.port()))));
+    let event = blocked_event(
+        BlockedWhy::TooManyConnections,
+        Some(PROTO_TCP),
+        Some(peer.ip()),
+        Some(local.ip()),
+    );
+    hooks.blocked(
+        fcx,
+        &sandbox_only(hooks.sandbox_at(peer.ip())),
+        (event, port_detail(Some(local.port()))),
+    );
 }
 
 /// Accepts connections on one port of a machine. Each is served in its own
 /// region.
-async fn accept(fcx: Cx, mut listener: tcp::Listener, machine: Arc<Machine>, port: Arc<Port>) -> fictionet::Result {
+async fn accept(
+    fcx: Cx,
+    mut listener: tcp::Listener,
+    machine: Arc<Machine>,
+    port: Arc<Port>,
+) -> fictionet::Result {
     loop {
         match listener.accept(&fcx).await {
             Ok(conn) => {
-                let Some(shared) = machine.shared.upgrade() else { return Ok(()) };
+                let Some(shared) = machine.shared.upgrade() else {
+                    return Ok(());
+                };
                 let hooks = shared.hooks.clone();
                 let Some(guard) = machine.peers.enter(conn.peer_addr().ip()) else {
                     too_many(&fcx, &hooks, &conn);
@@ -1524,7 +1885,8 @@ async fn accept(fcx: Cx, mut listener: tcp::Listener, machine: Arc<Machine>, por
                 };
                 conn.hold_until_gone(Box::new(guard));
                 let sandbox = Some(hooks.sandbox_at(conn.peer_addr().ip()));
-                let info = ConnInfo::new(hooks.next_conn(), conn.local_addr(), conn.peer_addr()).from_sandbox(sandbox);
+                let info = ConnInfo::new(hooks.next_conn(), conn.local_addr(), conn.peer_addr())
+                    .from_sandbox(sandbox);
                 let accepted = fcx.now();
                 let port = port.clone();
                 fcx.spawn(move |fcx| async move {
@@ -1545,7 +1907,14 @@ async fn accept(fcx: Cx, mut listener: tcp::Listener, machine: Arc<Machine>, por
 
 /// Serves one connection: TLS by SNI first if the port has TLS names, then
 /// the name's accept.
-async fn connection(fcx: Cx, conn: tcp::TcpConnection, info: ConnInfo, accepted: Instant, port: Arc<Port>, shared: Arc<Shared>) {
+async fn connection(
+    fcx: Cx,
+    conn: tcp::TcpConnection,
+    info: ConnInfo,
+    accepted: Instant,
+    port: Arc<Port>,
+    shared: Arc<Shared>,
+) {
     let hooks = shared.hooks.clone();
     let socket = conn.gone_watch();
     let sandbox_id = info.sandbox.as_ref().map(|s| s.id);
@@ -1558,11 +1927,17 @@ async fn connection(fcx: Cx, conn: tcp::TcpConnection, info: ConnInfo, accepted:
         handshake: shared.limits.handshake,
         seed: shared.seed,
     };
-    let has_tls = !port.tls.read().unwrap_or_else(|e| e.into_inner()).is_empty();
+    let has_tls = !port
+        .tls
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty();
     if !has_tls {
         let plain = port.plain.read().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(accept) = plain {
-            accept.serve(fcx.clone(), arrival(Box::new(conn), info)).await;
+            accept
+                .serve(fcx.clone(), arrival(Box::new(conn), info))
+                .await;
         }
         return;
     }
@@ -1571,18 +1946,26 @@ async fn connection(fcx: Cx, conn: tcp::TcpConnection, info: ConnInfo, accepted:
     let pick = chosen.clone();
     let select: TlsSelect = Arc::new(move |sni, fcx| {
         let tls = names.tls.read().unwrap_or_else(|e| e.into_inner());
-        let name = sni.and_then(|n| tls.get(n)).or_else(|| tls.get(""))?.clone();
+        let name = sni
+            .and_then(|n| tls.get(n))
+            .or_else(|| tls.get(""))?
+            .clone();
         let config = name.config(fcx);
         *lock(&pick) = Some(name);
         Some(config)
     });
     let detached = || sandbox_id.is_some_and(|id| !hooks.is_attached(id));
     let deadline = accepted + shared.limits.handshake;
-    let Ok((tls, info)) = serve::accept_tls(&fcx, conn, &info, &select, deadline, detached).await else {
+    let Ok((tls, info)) = serve::accept_tls(&fcx, conn, &info, &select, deadline, detached).await
+    else {
         return;
     };
-    let Some(name) = lock(&chosen).take() else { return };
-    name.accept.serve(fcx.clone(), arrival(Box::new(tls), info)).await;
+    let Some(name) = lock(&chosen).take() else {
+        return;
+    };
+    name.accept
+        .serve(fcx.clone(), arrival(Box::new(tls), info))
+        .await;
 }
 
 /// Answers pings to `addr`.
@@ -1604,11 +1987,14 @@ async fn pings(fcx: Cx, mut icmp: End, addr: IpAddr) -> fictionet::Result {
 /// DNS over UDP and TCP on port 53, and ping replies. DHCP is answered in
 /// each sandbox's filter, which knows which sandbox asked.
 fn start_gateway(shared: &Arc<Shared>) -> Result<(), Error> {
-    let gateways = std::iter::once(IpAddr::V4(shared.subnet.gateway)).chain(shared.subnet6.map(|s| IpAddr::V6(s.gateway)));
+    let gateways = std::iter::once(IpAddr::V4(shared.subnet.gateway))
+        .chain(shared.subnet6.map(|s| IpAddr::V6(s.gateway)));
     let fcx = &shared.fcx.group("gateway");
     for gateway in gateways {
         let (router_side, side) = link();
-        shared.router.add(host_prefix(gateway), Box::new(router_side));
+        shared
+            .router
+            .add(host_prefix(gateway), Box::new(router_side));
         start_dns(shared, fcx, side, gateway)?;
     }
     Ok(())
@@ -1653,11 +2039,20 @@ struct Answered {
 
 impl Answered {
     fn none() -> Answered {
-        Answered { reply: None, name: None, qtype: None, answer: DnsAnswer::None }
+        Answered {
+            reply: None,
+            name: None,
+            qtype: None,
+            answer: DnsAnswer::None,
+        }
     }
 
     fn event(&self, tcp: bool) -> Event {
-        let answer = if self.reply.is_some() { self.answer.clone() } else { DnsAnswer::None };
+        let answer = if self.reply.is_some() {
+            self.answer.clone()
+        } else {
+            DnsAnswer::None
+        };
         let (kind, addr, rcode) = match &answer {
             DnsAnswer::Addr(a) => ("addr", Some(a.to_string()), None),
             DnsAnswer::NoData => ("nodata", None, None),
@@ -1666,7 +2061,12 @@ impl Answered {
             DnsAnswer::None => ("none", None, None),
         };
         Event::new("dns", "query")
-            .summary(format!("{} {}: {}", self.name.as_deref().unwrap_or("-"), self.qtype.unwrap_or(0), addr.as_deref().unwrap_or(kind)))
+            .summary(format!(
+                "{} {}: {}",
+                self.name.as_deref().unwrap_or("-"),
+                self.qtype.unwrap_or(0),
+                addr.as_deref().unwrap_or(kind)
+            ))
             .field("tcp", tcp)
             .field("name", jopt(self.name.clone()))
             .field("qtype", jopt(self.qtype.map(u32::from)))
@@ -1685,8 +2085,15 @@ fn answer(shared: &Arc<Shared>, bytes: &[u8]) -> Answered {
                 return Answered::none();
             }
             let id = u16::from_be_bytes([bytes[0], bytes[1]]);
-            let reply = Message::error_msg(id, OpCode::Query, ResponseCode::FormErr).to_vec().ok();
-            return Answered { reply, name: None, qtype: None, answer: DnsAnswer::Error(1) };
+            let reply = Message::error_msg(id, OpCode::Query, ResponseCode::FormErr)
+                .to_vec()
+                .ok();
+            return Answered {
+                reply,
+                name: None,
+                qtype: None,
+                answer: DnsAnswer::Error(1),
+            };
         }
     };
     if query.metadata.message_type != MessageType::Query {
@@ -1716,7 +2123,11 @@ fn answer(shared: &Arc<Shared>, bytes: &[u8]) -> Answered {
     } else {
         let q = &query.queries[0];
         let name = name.as_deref().unwrap_or_default();
-        let found = if name.is_empty() { Lookup::NoHost } else { shared.lookup(name) };
+        let found = if name.is_empty() {
+            Lookup::NoHost
+        } else {
+            shared.lookup(name)
+        };
         match found {
             Lookup::NoHost => {
                 reply.metadata.response_code = ResponseCode::NXDomain;
@@ -1740,7 +2151,9 @@ fn answer(shared: &Arc<Shared>, bytes: &[u8]) -> Answered {
                             RData::AAAA(a) => a.0.into(),
                             _ => unreachable!("only A and AAAA are made"),
                         });
-                        reply.answers.push(Record::from_rdata(q.name().clone(), TTL, rdata));
+                        reply
+                            .answers
+                            .push(Record::from_rdata(q.name().clone(), TTL, rdata));
                     }
                     None => event_answer = DnsAnswer::NoData,
                 }
@@ -1748,7 +2161,12 @@ fn answer(shared: &Arc<Shared>, bytes: &[u8]) -> Answered {
         }
     }
     let qtype = if name.is_some() { qtype } else { None };
-    Answered { reply: reply.to_vec().ok(), name, qtype, answer: event_answer }
+    Answered {
+        reply: reply.to_vec().ok(),
+        name,
+        qtype,
+        answer: event_answer,
+    }
 }
 
 /// DNS over UDP on the gateway's port 53.
@@ -1757,7 +2175,11 @@ async fn dns_udp(fcx: Cx, mut socket: udp::Socket, shared: Arc<Shared>) -> ficti
     let hooks = shared.hooks.clone();
     while let Ok((query, from)) = socket.recv(&fcx).await {
         let answered = answer(&shared, &query);
-        let info = ConnInfo { sandbox: Some(hooks.sandbox_at(from.ip())), peer: Some(from), ..ConnInfo::default() };
+        let info = ConnInfo {
+            sandbox: Some(hooks.sandbox_at(from.ip())),
+            peer: Some(from),
+            ..ConnInfo::default()
+        };
         hooks.record(&fcx, &info, answered.event(false));
         if let Some(reply) = answered.reply {
             socket.send_to(&reply, from);
@@ -1794,7 +2216,11 @@ async fn dns_tcp(fcx: Cx, mut listener: tcp::Listener, shared: Arc<Shared>) -> f
     }
 }
 
-async fn dns_conn(fcx: &Cx, mut conn: tcp::TcpConnection, shared: &Arc<Shared>) -> Result<(), ConnError> {
+async fn dns_conn(
+    fcx: &Cx,
+    mut conn: tcp::TcpConnection,
+    shared: &Arc<Shared>,
+) -> Result<(), ConnError> {
     let hooks = shared.hooks.clone();
     let info = ConnInfo {
         sandbox: Some(hooks.sandbox_at(conn.peer_addr().ip())),
@@ -1814,19 +2240,32 @@ async fn dns_conn(fcx: &Cx, mut conn: tcp::TcpConnection, shared: &Arc<Shared>) 
             }
             Ok(Some(query))
         };
-        let Ok(read) = fcx.race(Some(fcx.now() + shared.limits.dns_tcp_idle), read).await else { return Ok(()) };
+        let Ok(read) = fcx
+            .race(Some(fcx.now() + shared.limits.dns_tcp_idle), read)
+            .await
+        else {
+            return Ok(());
+        };
         let Some(query) = read? else { return Ok(()) };
         let answered = answer(shared, &query);
         hooks.record(fcx, &info, answered.event(true));
-        let Some(reply) = answered.reply else { continue };
-        let Ok(n) = u16::try_from(reply.len()) else { continue };
+        let Some(reply) = answered.reply else {
+            continue;
+        };
+        let Ok(n) = u16::try_from(reply.len()) else {
+            continue;
+        };
         let mut framed = n.to_be_bytes().to_vec();
         framed.extend_from_slice(&reply);
         conn.write_all(fcx, &framed).await?;
     }
 }
 
-async fn read_exact<C: Connection>(fcx: &Cx, conn: &mut C, buf: &mut [u8]) -> Result<bool, ConnError> {
+async fn read_exact<C: Connection>(
+    fcx: &Cx,
+    conn: &mut C,
+    buf: &mut [u8],
+) -> Result<bool, ConnError> {
     let mut at = 0;
     while at < buf.len() {
         let n = conn.read(fcx, &mut buf[at..]).await?;
@@ -1933,14 +2372,19 @@ impl Shared {
         if let Some((a, false)) = mine {
             return Some(a);
         }
-        let a = self.subnet.sandboxes().find(|a| !leases.by_addr.contains_key(a))?;
+        let a = self
+            .subnet
+            .sandboxes()
+            .find(|a| !leases.by_addr.contains_key(a))?;
         leases.set(owner, a, false);
         Some(a)
     }
 
     fn may_bind(&self, owner: u64, a: Ipv4Addr) -> bool {
         let leases = lock(&self.leases);
-        !matches!(leases.of(owner), Some((_, true))) && self.subnet.is_sandbox(a) && leases.free_for(owner, a)
+        !matches!(leases.of(owner), Some((_, true)))
+            && self.subnet.is_sandbox(a)
+            && leases.free_for(owner, a)
     }
 
     fn bind(&self, owner: u64, a: Ipv4Addr) -> Bind {
@@ -1957,10 +2401,16 @@ impl Shared {
     }
 
     fn bind6(&self, owner: u64, a: Ipv6Addr) -> Bind {
-        let Some(subnet) = &self.subnet6 else { return Bind::Refused };
+        let Some(subnet) = &self.subnet6 else {
+            return Bind::Refused;
+        };
         let mut leases = lock(&self.leases);
         if let Some(b) = leases.by_owner6.get(&owner) {
-            return if a == *b { Bind::Already } else { Bind::Refused };
+            return if a == *b {
+                Bind::Already
+            } else {
+                Bind::Refused
+            };
         }
         if subnet.is_sandbox(a) && !leases.by_addr6.contains_key(&a) {
             leases.by_addr6.insert(a, owner);
@@ -1971,7 +2421,12 @@ impl Shared {
         }
     }
 
-    fn dhcp(&self, owner: u64, src: Ipv4Addr, m: &dhcp::Message) -> (Option<Packet>, Option<Ipv4Addr>) {
+    fn dhcp(
+        &self,
+        owner: u64,
+        src: Ipv4Addr,
+        m: &dhcp::Message,
+    ) -> (Option<Packet>, Option<Ipv4Addr>) {
         if m.op != dhcp::BOOTREQUEST {
             return (None, None);
         }
@@ -1981,20 +2436,30 @@ impl Shared {
                 None => (None, None),
             },
             Some(dhcp::REQUEST) => {
-                if m.option_addr(opt::SERVER_ID).is_some_and(|s| s != self.subnet.gateway) {
+                if m.option_addr(opt::SERVER_ID)
+                    .is_some_and(|s| s != self.subnet.gateway)
+                {
                     return (None, None);
                 }
-                let wanted = m.option_addr(opt::REQUESTED_IP).or((!m.ciaddr.is_unspecified()).then_some(m.ciaddr));
-                let Some(wanted) = wanted else { return (None, None) };
+                let wanted = m
+                    .option_addr(opt::REQUESTED_IP)
+                    .or((!m.ciaddr.is_unspecified()).then_some(m.ciaddr));
+                let Some(wanted) = wanted else {
+                    return (None, None);
+                };
                 match self.bind(owner, wanted) {
                     Bind::New => (Some(self.dhcp_reply(m, dhcp::ACK, wanted)), Some(wanted)),
                     Bind::Already => (Some(self.dhcp_reply(m, dhcp::ACK, wanted)), None),
-                    Bind::Refused => (Some(self.dhcp_reply(m, dhcp::NAK, Ipv4Addr::UNSPECIFIED)), None),
+                    Bind::Refused => (
+                        Some(self.dhcp_reply(m, dhcp::NAK, Ipv4Addr::UNSPECIFIED)),
+                        None,
+                    ),
                 }
             }
-            Some(dhcp::INFORM) if !m.ciaddr.is_unspecified() && m.ciaddr == src => {
-                (Some(self.dhcp_reply(m, dhcp::INFORM, Ipv4Addr::UNSPECIFIED)), None)
-            }
+            Some(dhcp::INFORM) if !m.ciaddr.is_unspecified() && m.ciaddr == src => (
+                Some(self.dhcp_reply(m, dhcp::INFORM, Ipv4Addr::UNSPECIFIED)),
+                None,
+            ),
             _ => (None, None),
         }
     }
@@ -2011,7 +2476,14 @@ impl Shared {
         if kind == dhcp::INFORM {
             m.ciaddr = request.ciaddr;
         }
-        m.push(opt::MESSAGE_TYPE, [if kind == dhcp::INFORM { dhcp::ACK } else { kind }]);
+        m.push(
+            opt::MESSAGE_TYPE,
+            [if kind == dhcp::INFORM {
+                dhcp::ACK
+            } else {
+                kind
+            }],
+        );
         m.push(opt::SERVER_ID, gateway.octets());
         if kind != dhcp::NAK {
             if kind != dhcp::INFORM {
@@ -2023,8 +2495,18 @@ impl Shared {
             m.push(opt::ROUTER, gateway.octets());
             m.push(opt::DNS, gateway.octets());
         }
-        let to = if kind != dhcp::NAK && !request.ciaddr.is_unspecified() { request.ciaddr } else { Ipv4Addr::BROADCAST };
-        udp_packet(gateway, dhcp::SERVER_PORT, to, dhcp::CLIENT_PORT, &m.to_bytes().expect("a reply with distinct options writes"))
+        let to = if kind != dhcp::NAK && !request.ciaddr.is_unspecified() {
+            request.ciaddr
+        } else {
+            Ipv4Addr::BROADCAST
+        };
+        udp_packet(
+            gateway,
+            dhcp::SERVER_PORT,
+            to,
+            dhcp::CLIENT_PORT,
+            &m.to_bytes().expect("a reply with distinct options writes"),
+        )
     }
 }
 
@@ -2080,7 +2562,13 @@ impl Attached {
     fn new(shared: &Arc<Shared>, fcx: &Cx, name: Arc<str>, fixed: Option<IpAddr>) -> Attached {
         let owner = lock(&shared.leases).new_owner();
         lock(&shared.hooks.attached).insert(owner, Budget::new(shared.limits.sandbox_budget));
-        Attached { shared: shared.clone(), owner, fcx: fcx.clone(), name, fixed }
+        Attached {
+            shared: shared.clone(),
+            owner,
+            fcx: fcx.clone(),
+            name,
+            fixed,
+        }
     }
 }
 
@@ -2093,13 +2581,20 @@ impl Drop for Attached {
             Some(IpAddr::V6(a)) => (None, Some(a)),
             None => {
                 let leases = lock(&shared.leases);
-                let v4 = leases.of(self.owner).and_then(|(a, bound)| bound.then_some(a));
+                let v4 = leases
+                    .of(self.owner)
+                    .and_then(|(a, bound)| bound.then_some(a));
                 (v4, leases.by_owner6.get(&self.owner).copied())
             }
         };
-        let addrs: Vec<IpAddr> = bound.map(IpAddr::V4).into_iter().chain(bound6.map(IpAddr::V6)).collect();
+        let addrs: Vec<IpAddr> = bound
+            .map(IpAddr::V4)
+            .into_iter()
+            .chain(bound6.map(IpAddr::V6))
+            .collect();
         if !addrs.is_empty() {
-            let machines: Vec<Arc<Machine>> = lock(&shared.world).machines.values().cloned().collect();
+            let machines: Vec<Arc<Machine>> =
+                lock(&shared.world).machines.values().cloned().collect();
             for m in machines {
                 for a in &addrs {
                     m.tcp.abort_peer(*a);
@@ -2112,9 +2607,17 @@ impl Drop for Attached {
             }
         }
         lock(&shared.leases).release_all(self.owner);
-        let sandbox = Sandbox { id: self.owner, name: self.name.clone(), addr: bound, addr_v6: bound6 };
-        let event = Event::new("net", "detached").summary(format!("sandbox {} detached", self.name));
-        shared.hooks.record(&self.fcx, &sandbox_only(sandbox), event);
+        let sandbox = Sandbox {
+            id: self.owner,
+            name: self.name.clone(),
+            addr: bound,
+            addr_v6: bound6,
+        };
+        let event =
+            Event::new("net", "detached").summary(format!("sandbox {} detached", self.name));
+        shared
+            .hooks
+            .record(&self.fcx, &sandbox_only(sandbox), event);
     }
 }
 
@@ -2126,7 +2629,11 @@ struct Member {
 }
 
 impl Interface for Member {
-    fn poll_recv(&mut self, fcx: &Cx, cx: &mut std::task::Context<'_>) -> Poll<Result<Packet, fictionet::RecvError>> {
+    fn poll_recv(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Packet, fictionet::RecvError>> {
         self.sandbox.poll_recv(fcx, cx)
     }
 
@@ -2218,10 +2725,20 @@ impl BlockedWhy {
 
 /// A `net.blocked` event. The destination port goes in its detail
 /// ([`port_detail`]), since a scan changes it with every packet.
-fn blocked_event(why: BlockedWhy, protocol: Option<u8>, src: Option<IpAddr>, dst: Option<IpAddr>) -> Event {
+fn blocked_event(
+    why: BlockedWhy,
+    protocol: Option<u8>,
+    src: Option<IpAddr>,
+    dst: Option<IpAddr>,
+) -> Event {
     Event::new("net", "blocked")
         .level(Level::Notice)
-        .summary(format!("blocked {}: {} -> {}", why.as_str(), src.map_or("-".into(), |a| a.to_string()), dst.map_or("-".into(), |a| a.to_string())))
+        .summary(format!(
+            "blocked {}: {} -> {}",
+            why.as_str(),
+            src.map_or("-".into(), |a| a.to_string()),
+            dst.map_or("-".into(), |a| a.to_string())
+        ))
         .field("why", why.as_str())
         .field("protocol", jopt(protocol.map(u32::from)))
         .field("src", jopt(src.map(|a| a.to_string())))
@@ -2236,7 +2753,10 @@ fn port_detail(port: Option<u16>) -> Fields {
 /// The event for a blocked packet, and its detail.
 fn blocked(why: BlockedWhy, p: &[u8]) -> (Event, Fields) {
     match Header::parse_truncated(p) {
-        Some(h) => (blocked_event(why, Some(h.protocol), Some(h.src), Some(h.dst)), port_detail(h.dst_port(p))),
+        Some(h) => (
+            blocked_event(why, Some(h.protocol), Some(h.src), Some(h.dst)),
+            port_detail(h.dst_port(p)),
+        ),
         None => (blocked_event(why, None, None, None), port_detail(None)),
     }
 }
@@ -2255,16 +2775,25 @@ struct Filter {
 
 impl Filter {
     fn me(&self) -> Sandbox {
-        Sandbox { id: self.owner, name: self.name.clone(), addr: self.bound, addr_v6: self.bound6 }
+        Sandbox {
+            id: self.owner,
+            name: self.name.clone(),
+            addr: self.bound,
+            addr_v6: self.bound6,
+        }
     }
 
     fn block(&self, fcx: &Cx, why: BlockedWhy, packet: &[u8]) {
-        self.shared.hooks.blocked(fcx, &sandbox_only(self.me()), blocked(why, packet));
+        self.shared
+            .hooks
+            .blocked(fcx, &sandbox_only(self.me()), blocked(why, packet));
     }
 
     fn bound_now(&mut self, fcx: &Cx, addr: IpAddr, by_dhcp: bool) {
         let (router_side, mine) = link();
-        self.shared.router.add(host_prefix(addr), Box::new(router_side));
+        self.shared
+            .router
+            .add(host_prefix(addr), Box::new(router_side));
         let port = self.ports.add(Box::new(mine));
         match addr {
             IpAddr::V4(a) => (self.bound, self.route4) = (Some(a), Some(port)),
@@ -2272,7 +2801,12 @@ impl Filter {
         }
         let sandbox = self.me();
         let mut by_addr = lock(&self.shared.hooks.by_addr);
-        for a in self.bound.map(IpAddr::V4).into_iter().chain(self.bound6.map(IpAddr::V6)) {
+        for a in self
+            .bound
+            .map(IpAddr::V4)
+            .into_iter()
+            .chain(self.bound6.map(IpAddr::V6))
+        {
             by_addr.insert(a, sandbox.clone());
         }
         drop(by_addr);
@@ -2290,11 +2824,14 @@ impl Filter {
             self.block(fcx, BlockedWhy::Malformed, &packet.0);
             return;
         };
-        let (IpAddr::V4(src), IpAddr::V4(dst)) = (h.src, h.dst) else { return };
+        let (IpAddr::V4(src), IpAddr::V4(dst)) = (h.src, h.dst) else {
+            return;
+        };
         if let Some(message) = to_dhcp_server(&packet.0, &h, gateway) {
             let Some(message) = message else { return };
-            let inform_first =
-                self.bound.is_none() && message.message_type() == Some(dhcp::INFORM) && shared.may_bind(self.owner, src);
+            let inform_first = self.bound.is_none()
+                && message.message_type() == Some(dhcp::INFORM)
+                && shared.may_bind(self.owner, src);
             if !(src.is_unspecified() || Some(src) == self.bound || inform_first) {
                 self.block(fcx, BlockedWhy::NotItsAddress, &packet.0);
                 return;
@@ -2343,7 +2880,9 @@ impl Filter {
             self.block(fcx, BlockedWhy::Malformed, &packet.0);
             return;
         };
-        let (IpAddr::V6(src), IpAddr::V6(dst)) = (h.src, h.dst) else { return };
+        let (IpAddr::V6(src), IpAddr::V6(dst)) = (h.src, h.dst) else {
+            return;
+        };
         if dst.is_multicast() || dst.is_unspecified() {
             self.block(fcx, BlockedWhy::Broadcast, &packet.0);
             return;
@@ -2405,7 +2944,9 @@ impl Shared {
 
     /// Whether `p` is for the gateway or a machine.
     fn is_host(&self, p: &[u8]) -> bool {
-        let Some(dst) = ip::destination(p) else { return false };
+        let Some(dst) = ip::destination(p) else {
+            return false;
+        };
         self.is_gateway(dst) || lock(&self.world).machines.contains_key(&dst)
     }
 
@@ -2419,11 +2960,24 @@ impl Shared {
         }
         let machine = lock(&self.world).machines.get(&dst).cloned();
         match machine {
-            Some(m) => closed(&|proto, p| if proto == PROTO_TCP { m.serves_tcp(p) } else { m.serves_udp(p) })
-                .then_some(BlockedWhy::ClosedPort),
+            Some(m) => closed(&|proto, p| {
+                if proto == PROTO_TCP {
+                    m.serves_tcp(p)
+                } else {
+                    m.serves_udp(p)
+                }
+            })
+            .then_some(BlockedWhy::ClosedPort),
             // A trusted sandbox's prefix, or a LAN, which reports its own
             // drops.
-            None if self.fixed.iter().chain(self.lans.values().map(|l| &l.prefix)).any(|p| prefix_contains(p, dst)) => None,
+            None if self
+                .fixed
+                .iter()
+                .chain(self.lans.values().map(|l| &l.prefix))
+                .any(|p| prefix_contains(p, dst)) =>
+            {
+                None
+            }
             None => Some(BlockedWhy::NoRoute),
         }
     }
@@ -2434,7 +2988,9 @@ impl Shared {
 /// checksum is good. The port is looked up first, so only a packet for a
 /// closed port has its checksum checked.
 fn answered_closed(p: &[u8], open: impl Fn(u8, u16) -> bool) -> bool {
-    let Some(h) = Header::parse_whole(p) else { return false };
+    let Some(h) = Header::parse_whole(p) else {
+        return false;
+    };
     if !matches!(h.protocol, PROTO_TCP | PROTO_UDP) {
         return false;
     }
@@ -2453,20 +3009,28 @@ fn answered_closed(p: &[u8], open: impl Fn(u8, u16) -> bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
 
     #[test]
     fn a_full_automatic_range_is_not_scanned_again() {
-        assert_linear("a_full_automatic_range_is_not_scanned_again", rounds(2_000_000), |size| {
-            let mut w = World::new(MAX_HOSTS);
-            let subnet = Subnet::new(Prefix { addr: Ipv4Addr::new(198, 0, 0, 0).into(), len: 8 }).unwrap();
-            assert_eq!(w.free_auto(&subnet), None);
-            assert!(w.auto_full);
-            for _ in 0..size {
-                assert_eq!(std::hint::black_box(&mut w).free_auto(&subnet), None);
-            }
-        });
+        assert_linear(
+            "a_full_automatic_range_is_not_scanned_again",
+            rounds(2_000_000),
+            |size| {
+                let mut w = World::new(MAX_HOSTS);
+                let subnet = Subnet::new(Prefix {
+                    addr: Ipv4Addr::new(198, 0, 0, 0).into(),
+                    len: 8,
+                })
+                .unwrap();
+                assert_eq!(w.free_auto(&subnet), None);
+                assert!(w.auto_full);
+                for _ in 0..size {
+                    assert_eq!(std::hint::black_box(&mut w).free_auto(&subnet), None);
+                }
+            },
+        );
     }
 
     #[test]
@@ -2479,7 +3043,13 @@ mod tests {
         }
         assert_eq!((w.names.len(), w.unknown), (3, 3));
         for i in 0..10 {
-            w.remember(&format!("s{i}.test"), Known::Host(Placed { v4: Some(Ipv4Addr::new(198, 18, 0, i + 1)), v6: None }));
+            w.remember(
+                &format!("s{i}.test"),
+                Known::Host(Placed {
+                    v4: Some(Ipv4Addr::new(198, 18, 0, i + 1)),
+                    v6: None,
+                }),
+            );
         }
         assert_eq!((w.names.len(), w.resolved), (13, 10));
         let mut w = World::new(MAX_HOSTS);
@@ -2499,7 +3069,15 @@ mod tests {
         for not in ["2001:db8::", "2001:db8::1", "2001:db8:0:1::2"] {
             assert!(!s.is_sandbox(not.parse().unwrap()), "{not}");
         }
-        for bad in ["fe80::/64", "ff02::/16", "::/8", "::ffff:0:0/96", "2001:db8::/127", "2000::/4", "10.0.0.0/24"] {
+        for bad in [
+            "fe80::/64",
+            "ff02::/16",
+            "::/8",
+            "::ffff:0:0/96",
+            "2001:db8::/127",
+            "2000::/4",
+            "10.0.0.0/24",
+        ] {
             assert!(subnet6(bad).is_err(), "{bad}");
         }
     }
@@ -2513,14 +3091,24 @@ mod tests {
         let mut w = World::new(MAX_HOSTS);
         let inside = subnet6("2001:2::/120").unwrap();
         assert_eq!(w.free_auto6(&inside), Some("2001:2::100".parse().unwrap()));
-        assert_eq!(World::new(MAX_HOSTS).free_auto6(&subnet6("2001::/16").unwrap()), None);
+        assert_eq!(
+            World::new(MAX_HOSTS).free_auto6(&subnet6("2001::/16").unwrap()),
+            None
+        );
     }
 
     #[test]
     fn hosts_cannot_have_addresses_a_host_cannot_have() {
         let s = subnet6("2001:db8::/64").unwrap();
         assert!(may_serve_v6("2a02:ec80:300:ed1a::1".parse().unwrap(), &s));
-        for bad in ["::", "::1", "ff02::1", "fe80::1", "::ffff:1.2.3.4", "2001:db8::5"] {
+        for bad in [
+            "::",
+            "::1",
+            "ff02::1",
+            "fe80::1",
+            "::ffff:1.2.3.4",
+            "2001:db8::5",
+        ] {
             assert!(!may_serve_v6(bad.parse().unwrap(), &s), "{bad}");
         }
     }
@@ -2544,10 +3132,17 @@ mod tests {
             }
         };
         assert!(!answered_closed(&bad, open(true)));
-        assert_eq!(looked.load(Ordering::Relaxed), 1, "the port of a packet with a bad checksum is looked up");
+        assert_eq!(
+            looked.load(Ordering::Relaxed),
+            1,
+            "the port of a packet with a bad checksum is looked up"
+        );
         assert!(!answered_closed(&good, open(true)));
         assert!(answered_closed(&good, open(false)));
-        assert!(!answered_closed(&bad, open(false)), "a bad checksum to a closed port is dropped, not answered");
+        assert!(
+            !answered_closed(&bad, open(false)),
+            "a bad checksum to a closed port is dropped, not answered"
+        );
         // A TCP SYN to a closed port is answered; a RST is not.
         let tcp = |flags: u8| {
             let mut t = vec![0u8; 20];

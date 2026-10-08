@@ -32,17 +32,31 @@ struct Tun {
 }
 
 impl Interface for Tun {
-    fn poll_recv(&mut self, fcx: &Cx, cx: &mut std::task::Context<'_>) -> Poll<Result<Packet, RecvError>> {
+    fn poll_recv(
+        &mut self,
+        fcx: &Cx,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Packet, RecvError>> {
         self.rx.poll_recv(fcx, cx)
     }
     fn send(&mut self, packet: Packet) {
-        unsafe { libc::write(self.fd.as_raw_fd(), packet.0.as_ptr().cast(), packet.0.len()) };
+        unsafe {
+            libc::write(
+                self.fd.as_raw_fd(),
+                packet.0.as_ptr().cast(),
+                packet.0.len(),
+            )
+        };
     }
 }
 
 fn open_tun(name: &str) -> Tun {
     let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR) };
-    assert!(fd >= 0, "open /dev/net/tun: {}", std::io::Error::last_os_error());
+    assert!(
+        fd >= 0,
+        "open /dev/net/tun: {}",
+        std::io::Error::last_os_error()
+    );
     let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
     let mut req = [0u8; 40];
     req[..name.len()].copy_from_slice(name.as_bytes());
@@ -66,7 +80,11 @@ fn open_tun(name: &str) -> Tun {
 }
 
 fn sh(cmd: &str) {
-    let s = std::process::Command::new("sh").arg("-c").arg(cmd).status().unwrap();
+    let s = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .status()
+        .unwrap();
     assert!(s.success(), "{cmd} failed");
 }
 
@@ -90,8 +108,15 @@ fn demux(fcx: &Cx, tun: Tun) -> [End; 4] {
             if loss == 0 {
                 return false;
             }
-            let (proto, hdr) = if p.0[0] >> 4 == 4 { (p.0[9], (p.0[0] & 15) as usize * 4) } else { (p.0[6], 40) };
-            if proto != 6 || p.0.len() < hdr + 20 || p.0.len() <= hdr + ((p.0[hdr + 12] >> 4) as usize) * 4 {
+            let (proto, hdr) = if p.0[0] >> 4 == 4 {
+                (p.0[9], (p.0[0] & 15) as usize * 4)
+            } else {
+                (p.0[6], 40)
+            };
+            if proto != 6
+                || p.0.len() < hdr + 20
+                || p.0.len() <= hdr + ((p.0[hdr + 12] >> 4) as usize) * 4
+            {
                 return false;
             }
             seed ^= seed << 13;
@@ -120,7 +145,11 @@ fn demux(fcx: &Cx, tun: Tun) -> [End; 4] {
                 Ok(_) if lost => {}
                 Ok((Some(_), p)) => tun.send(p),
                 Ok((None, p)) => {
-                    let (v6, proto) = if p.0[0] >> 4 == 6 { (true, p.0[6]) } else { (false, p.0[9]) };
+                    let (v6, proto) = if p.0[0] >> 4 == 6 {
+                        (true, p.0[6])
+                    } else {
+                        (false, p.0[9])
+                    };
                     let i = match (v6, proto) {
                         (false, 6) => 0,
                         (false, 17) => 1,
@@ -138,12 +167,17 @@ fn demux(fcx: &Cx, tun: Tun) -> [End; 4] {
 }
 
 /// The last packets seen, printed when the traffic stalls.
-static RING: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+static RING: Mutex<std::collections::VecDeque<String>> =
+    Mutex::new(std::collections::VecDeque::new());
 static LAST: Mutex<Option<Instant>> = Mutex::new(None);
 
 fn trace_packet(fcx: &Cx, from_kernel: bool, p: &Packet, print: bool, lost: bool) {
     *LAST.lock().unwrap() = Some(Instant::now());
-    let (proto, hdr) = if p.0[0] >> 4 == 4 { (p.0[9], (p.0[0] & 15) as usize * 4) } else { (p.0[6], 40) };
+    let (proto, hdr) = if p.0[0] >> 4 == 4 {
+        (p.0[9], (p.0[0] & 15) as usize * 4)
+    } else {
+        (p.0[6], 40)
+    };
     if proto != 6 {
         return;
     }
@@ -270,7 +304,10 @@ fn client(log: &Mutex<Vec<String>>) {
         writer.join().unwrap();
         assert!(back == data, "{host}: the echo differs");
         let t = started.elapsed();
-        say(format!("{host}: 10 MiB echoed in {t:?} ({:.0} Mbit/s each way)", data.len() as f64 * 8.0 / t.as_secs_f64() / 1e6));
+        say(format!(
+            "{host}: 10 MiB echoed in {t:?} ({:.0} Mbit/s each way)",
+            data.len() as f64 * 8.0 / t.as_secs_f64() / 1e6
+        ));
 
         // Download.
         let started = Instant::now();
@@ -279,16 +316,27 @@ fn client(log: &Mutex<Vec<String>>) {
         s.read_to_end(&mut got).unwrap();
         assert!(got == pattern(DOWNLOAD, 7), "{host}: the download differs");
         let t = started.elapsed();
-        say(format!("{host}: 20 MiB download in {t:?} ({:.0} Mbit/s)", got.len() as f64 * 8.0 / t.as_secs_f64() / 1e6));
+        say(format!(
+            "{host}: 20 MiB download in {t:?} ({:.0} Mbit/s)",
+            got.len() as f64 * 8.0 / t.as_secs_f64() / 1e6
+        ));
 
         // A closed port.
         let started = Instant::now();
-        let e = TcpStream::connect_timeout(&SocketAddr::new(ip, 82), Duration::from_millis(300)).unwrap_err();
+        let e = TcpStream::connect_timeout(&SocketAddr::new(ip, 82), Duration::from_millis(300))
+            .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::ConnectionRefused, "{host}: {e}");
-        say(format!("{host}: closed port refused in {:?}", started.elapsed()));
+        say(format!(
+            "{host}: closed port refused in {:?}",
+            started.elapsed()
+        ));
 
         // UDP echo, and port unreachable on a connected socket.
-        let local: SocketAddr = if ip.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
+        let local: SocketAddr = if ip.is_ipv4() {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            "[::]:0".parse().unwrap()
+        };
         let u = UdpSocket::bind(local).unwrap();
         u.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         u.connect(SocketAddr::new(ip, 53)).unwrap();
@@ -299,7 +347,11 @@ fn client(log: &Mutex<Vec<String>>) {
         u.connect(SocketAddr::new(ip, 54)).unwrap();
         u.send(b"anyone?").unwrap();
         let e = u.recv(&mut buf).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::ConnectionRefused, "{host}: UDP to a closed port: {e}");
+        assert_eq!(
+            e.kind(),
+            ErrorKind::ConnectionRefused,
+            "{host}: UDP to a closed port: {e}"
+        );
         say(format!("{host}: UDP echo and port unreachable work"));
     }
 
@@ -334,11 +386,19 @@ fn client(log: &Mutex<Vec<String>>) {
     let mut open = open.lock().unwrap().clone();
     open.sort();
     let failures = failures.lock().unwrap().clone();
-    say(format!("scan of 65,535 ports in {:?}: open {open:?}, failures {}", started.elapsed(), failures.len()));
+    say(format!(
+        "scan of 65,535 ports in {:?}: open {open:?}, failures {}",
+        started.elapsed(),
+        failures.len()
+    ));
     if !only_loss {
         assert_eq!(open, [80, 81]);
     }
-    assert!(failures.is_empty(), "ports that were not refused: {:?}", &failures[..failures.len().min(20)]);
+    assert!(
+        failures.is_empty(),
+        "ports that were not refused: {:?}",
+        &failures[..failures.len().min(20)]
+    );
 
     // A download with 1% of the data packets lost, each way.
     LOSS.store(10, Ordering::Relaxed);
@@ -348,7 +408,10 @@ fn client(log: &Mutex<Vec<String>>) {
     s.read_to_end(&mut got).unwrap();
     assert!(got == pattern(DOWNLOAD, 7), "the lossy download differs");
     let t = started.elapsed();
-    say(format!("20 MiB download with 1% loss in {t:?} ({:.0} Mbit/s)", got.len() as f64 * 8.0 / t.as_secs_f64() / 1e6));
+    say(format!(
+        "20 MiB download with 1% loss in {t:?} ({:.0} Mbit/s)",
+        got.len() as f64 * 8.0 / t.as_secs_f64() / 1e6
+    ));
     LOSS.store(0, Ordering::Relaxed);
 }
 
@@ -356,7 +419,9 @@ fn client(log: &Mutex<Vec<String>>) {
 #[ignore = "needs root and /dev/net/tun; tests/docker/tcpudp/run.sh runs it"]
 fn a_linux_client_through_tun() {
     let tun = open_tun("fn0");
-    sh("ip link set fn0 up mtu 1500 && ip addr add 10.9.0.1/24 dev fn0 && ip -6 addr add fd09::1/64 dev fn0 nodad");
+    sh(
+        "ip link set fn0 up mtu 1500 && ip addr add 10.9.0.1/24 dev fn0 && ip -6 addr add fd09::1/64 dev fn0 nodad",
+    );
     let log = Arc::new(Mutex::new(Vec::new()));
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let l = log.clone();
@@ -381,7 +446,10 @@ fn a_linux_client_through_tun() {
                 Ok(()) => break,
                 Err(mpsc::TryRecvError::Empty) => {
                     fcx.sleep(Duration::from_millis(50)).await?;
-                    let quiet = LAST.lock().unwrap().is_some_and(|t| t.elapsed() > Duration::from_secs(5));
+                    let quiet = LAST
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|t| t.elapsed() > Duration::from_secs(5));
                     if quiet && !dumped {
                         dumped = true;
                         eprintln!("STALL: no packets for 5 s. The last ones:");
@@ -392,8 +460,13 @@ fn a_linux_client_through_tun() {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     let e = checks.join().unwrap_err();
-                    let msg = e.downcast_ref::<String>().cloned().or(e.downcast_ref::<&str>().map(|s| s.to_string()));
-                    return Err(fictionet::Error::msg(format!("the client checks failed: {msg:?}")));
+                    let msg = e
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or(e.downcast_ref::<&str>().map(|s| s.to_string()));
+                    return Err(fictionet::Error::msg(format!(
+                        "the client checks failed: {msg:?}"
+                    )));
                 }
             }
         }

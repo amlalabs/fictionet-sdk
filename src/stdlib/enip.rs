@@ -75,11 +75,11 @@
 //! assert_eq!(request.path[0], PathSegment::Class(1));
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
+use core::convert::Infallible;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{le16, le32, Wire};
-use core::convert::Infallible;
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::{Wire, le16, le32};
 
 /// The TCP port EtherNet/IP devices listen on.
 pub const PORT: u16 = 44818;
@@ -337,11 +337,13 @@ impl Prefixed for Packet {
     /// Accepts all header fields and never returns an error. Use
     /// [`Packet::check`] for protocol limits and options.
     #[inline]
-    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        _limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         Ok(Packet::parse_prefix(input))
     }
 }
-
 
 /// Why bytes do not form the structure a reader named, or why a value
 /// cannot be written. A writer returns one of these rather than write
@@ -386,9 +388,7 @@ impl std::fmt::Display for Error {
             Error::BadSegment => f.write_str("malformed EPATH segment"),
             Error::ReplyFlag => f.write_str("service reply bit does not match the message"),
             Error::Options => f.write_str("encapsulation options are not zero"),
-            Error::Items => {
-                f.write_str("send-data items are not an address item and a data item")
-            }
+            Error::Items => f.write_str("send-data items are not an address item and a data item"),
             Error::OddLength => f.write_str("word-counted bytes are an odd number"),
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
@@ -768,9 +768,7 @@ fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, Error> {
                     if t != ELECTRONIC_KEY {
                         return Err(Error::UnknownSegment(t));
                     }
-                    let end = i
-                        .checked_add(ELECTRONIC_KEY_LEN)
-                        .ok_or(Error::TooLong)?;
+                    let end = i.checked_add(ELECTRONIC_KEY_LEN).ok_or(Error::TooLong)?;
                     if end > b.len() {
                         return Err(Error::Truncated);
                     }
@@ -1443,13 +1441,13 @@ impl Wire for MessageResponse {
         let status = b[2];
         let extra_words = usize::from(b[3]);
         let extra_bytes = extra_words * 2;
-        let end = 4usize
-            .checked_add(extra_bytes)
-            .ok_or(Error::TooLong)?;
+        let end = 4usize.checked_add(extra_bytes).ok_or(Error::TooLong)?;
         if end > b.len() {
             return Err(Error::Truncated);
         }
-        let additional_status = (0..extra_words).map(|w| le16(b, 4 + 2 * w).ok_or(Error::Truncated)).collect::<Result<_, _>>()?;
+        let additional_status = (0..extra_words)
+            .map(|w| le16(b, 4 + 2 * w).ok_or(Error::Truncated))
+            .collect::<Result<_, _>>()?;
         Ok(MessageResponse {
             service,
             status,
@@ -1664,13 +1662,11 @@ impl Wire for ForwardCloseResponse {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
-    use fictionet::stdlib::codec::{
-        Lcg, Stream, pump,
-    };
+    use fictionet::stdlib::codec::{Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{self, decode_all};
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
 
     #[test]
     fn register_session_round_trip() {
@@ -1681,10 +1677,7 @@ mod tests {
         let bytes = rs.to_bytes().unwrap();
         assert_eq!(bytes, [1, 0, 0, 0]);
         assert_eq!(RegisterSession::parse(&bytes), Ok(rs));
-        assert_eq!(
-            RegisterSession::parse(&[1, 0, 0]),
-            Err(Error::Truncated)
-        );
+        assert_eq!(RegisterSession::parse(&[1, 0, 0]), Err(Error::Truncated));
         assert_eq!(
             RegisterSession::parse(&[1, 0, 0, 0, 0]),
             Err(Error::Trailing)
@@ -1764,29 +1757,28 @@ mod tests {
 
     #[test]
     fn decoder_takes_many_small_packets_in_linear_time() {
-        assert_linear("decoder_takes_many_small_packets_in_linear_time", rounds(50_000), |size| {
-            let one = Packet {
-                command: Command::Nop,
-                session_handle: 0,
-                status: 0,
-                sender_context: [0; 8],
-                options: 0,
-                data: Vec::new(),
-            }
-            .to_bytes()
-            .unwrap();
-            let stream: Vec<u8> = one
-                .iter()
-                .copied()
-                .cycle()
-                .take(one.len() * size)
-                .collect();
-            let mut d = Stream::new(Frames::<Packet>::new());
-            let mut n = 0;
-            pump(&mut d, &stream, |_| n += 1).unwrap();
-            assert_eq!(n, size);
-            assert_eq!(d.buffered(), 0);
-        });
+        assert_linear(
+            "decoder_takes_many_small_packets_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let one = Packet {
+                    command: Command::Nop,
+                    session_handle: 0,
+                    status: 0,
+                    sender_context: [0; 8],
+                    options: 0,
+                    data: Vec::new(),
+                }
+                .to_bytes()
+                .unwrap();
+                let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
+                let mut d = Stream::new(Frames::<Packet>::new());
+                let mut n = 0;
+                pump(&mut d, &stream, |_| n += 1).unwrap();
+                assert_eq!(n, size);
+                assert_eq!(d.buffered(), 0);
+            },
+        );
     }
 
     #[test]
@@ -1808,10 +1800,7 @@ mod tests {
         // Count says 1 item but the item header is cut.
         assert_eq!(Cpf::parse(&[1, 0, 0, 0, 2]), Err(Error::Truncated));
         // Item length runs past the end.
-        assert_eq!(
-            Cpf::parse(&[1, 0, 0, 0, 4, 0, 1, 2]),
-            Err(Error::Truncated)
-        );
+        assert_eq!(Cpf::parse(&[1, 0, 0, 0, 4, 0, 1, 2]), Err(Error::Truncated));
         // Bytes left over after the items.
         assert_eq!(Cpf::parse(&[0, 0, 9]), Err(Error::Trailing));
         // Too many items.
@@ -1837,10 +1826,7 @@ mod tests {
         };
         let bytes = send.to_bytes().unwrap();
         assert_eq!(SendData::parse(&bytes), Ok(send));
-        assert_eq!(
-            SendData::parse(&[0, 0, 0, 0, 0]),
-            Err(Error::Truncated)
-        );
+        assert_eq!(SendData::parse(&[0, 0, 0, 0, 0]), Err(Error::Truncated));
     }
 
     #[test]
@@ -1893,10 +1879,7 @@ mod tests {
     #[test]
     fn path_errors() {
         // A logical type this module does not read (service ID, type 6).
-        assert_eq!(
-            parse_path(&[0x38, 0x00]),
-            Err(Error::UnknownSegment(0x38))
-        );
+        assert_eq!(parse_path(&[0x38, 0x00]), Err(Error::UnknownSegment(0x38)));
         // An ANSI symbol whose name runs past the end, or whose pad byte is
         // missing.
         assert_eq!(parse_path(&[0x91, 0x04, b'a']), Err(Error::Truncated));
@@ -1904,10 +1887,7 @@ mod tests {
         // A reserved logical format.
         assert_eq!(parse_path(&[0x23, 0x00]), Err(Error::BadSegment));
         // A segment type this module does not read (symbolic, 0x60).
-        assert_eq!(
-            parse_path(&[0x60, 0x00]),
-            Err(Error::UnknownSegment(0x60))
-        );
+        assert_eq!(parse_path(&[0x60, 0x00]), Err(Error::UnknownSegment(0x60)));
         // A network segment cut short.
         assert_eq!(parse_path(&[0x43]), Err(Error::Truncated));
         assert_eq!(parse_path(&[0x51, 0x02, 0, 0]), Err(Error::Truncated));
@@ -1972,10 +1952,7 @@ mod tests {
         let bytes = fail.to_bytes().unwrap();
         assert_eq!(bytes, [0x90, 0x00, 0x14, 0x01, 0x34, 0x12]);
         assert_eq!(MessageResponse::parse(&bytes), Ok(fail));
-        assert_eq!(
-            MessageResponse::parse(&[0x8e, 0, 0]),
-            Err(Error::Truncated)
-        );
+        assert_eq!(MessageResponse::parse(&[0x8e, 0, 0]), Err(Error::Truncated));
         // An additional status count that runs past the end.
         assert_eq!(
             MessageResponse::parse(&[0x8e, 0, 0, 2, 0, 0]),
@@ -2010,10 +1987,7 @@ mod tests {
         };
         let bytes = req.to_bytes().unwrap();
         assert_eq!(ForwardOpenRequest::parse(&bytes), Ok(req));
-        assert_eq!(
-            ForwardOpenRequest::parse(&[0; 10]),
-            Err(Error::Truncated)
-        );
+        assert_eq!(ForwardOpenRequest::parse(&[0; 10]), Err(Error::Truncated));
 
         let resp = ForwardOpenResponse {
             o_t_connection_id: 0,
@@ -2027,10 +2001,7 @@ mod tests {
         };
         let bytes = resp.to_bytes().unwrap();
         assert_eq!(ForwardOpenResponse::parse(&bytes), Ok(resp));
-        assert_eq!(
-            ForwardOpenResponse::parse(&[0; 20]),
-            Err(Error::Truncated)
-        );
+        assert_eq!(ForwardOpenResponse::parse(&[0; 20]), Err(Error::Truncated));
         // Trailing bytes past the reply.
         let mut extra = ForwardOpenResponse {
             o_t_connection_id: 0,
@@ -2045,10 +2016,7 @@ mod tests {
         .to_bytes()
         .unwrap();
         extra.push(0xff);
-        assert_eq!(
-            ForwardOpenResponse::parse(&extra),
-            Err(Error::Trailing)
-        );
+        assert_eq!(ForwardOpenResponse::parse(&extra), Err(Error::Trailing));
     }
 
     #[test]
@@ -2069,10 +2037,7 @@ mod tests {
         };
         let bytes = req.to_bytes().unwrap();
         assert_eq!(ForwardCloseRequest::parse(&bytes), Ok(req));
-        assert_eq!(
-            ForwardCloseRequest::parse(&[0; 8]),
-            Err(Error::Truncated)
-        );
+        assert_eq!(ForwardCloseRequest::parse(&[0; 8]), Err(Error::Truncated));
 
         let resp = ForwardCloseResponse {
             connection_serial: 0x1234,
@@ -2082,10 +2047,7 @@ mod tests {
         };
         let bytes = resp.to_bytes().unwrap();
         assert_eq!(ForwardCloseResponse::parse(&bytes), Ok(resp));
-        assert_eq!(
-            ForwardCloseResponse::parse(&[0; 6]),
-            Err(Error::Truncated)
-        );
+        assert_eq!(ForwardCloseResponse::parse(&[0; 6]), Err(Error::Truncated));
     }
 
     fn packet(command: Command, options: u32, data: Vec<u8>) -> Packet {
@@ -2170,14 +2132,8 @@ mod tests {
             data: vec![0; MAX_DATA - 3],
         };
         assert_eq!(too_long.to_bytes(), Err(Error::TooLong));
-        assert_eq!(
-            Cpf::parse(&vec![0; MAX_DATA + 1]),
-            Err(Error::TooLong)
-        );
-        assert_eq!(
-            SendData::parse(&vec![0; MAX_DATA + 1]),
-            Err(Error::TooLong)
-        );
+        assert_eq!(Cpf::parse(&vec![0; MAX_DATA + 1]), Err(Error::TooLong));
+        assert_eq!(SendData::parse(&vec![0; MAX_DATA + 1]), Err(Error::TooLong));
     }
 
     #[test]
@@ -2514,7 +2470,10 @@ mod tests {
             Err(Error::Unwritable)
         );
         let other = packet(Command::Other(0x72), 0, Vec::new());
-        assert_eq!(Packet::parse_prefix(&other.to_bytes().unwrap()).unwrap().0, other);
+        assert_eq!(
+            Packet::parse_prefix(&other.to_bytes().unwrap()).unwrap().0,
+            other
+        );
         // A request's service with the reply bit, or a reply's.
         let req = MessageRequest {
             service: 0x8e,
@@ -2605,21 +2564,14 @@ mod tests {
         assert_eq!(parse_path(&bytes), Ok(vec![key.clone()]));
         assert_eq!(write_path(std::slice::from_ref(&key)).unwrap(), bytes);
         for n in 1..bytes.len() {
-            assert_eq!(
-                parse_path(&bytes[..n]),
-                Err(Error::Truncated),
-                "{n} bytes"
-            );
+            assert_eq!(parse_path(&bytes[..n]), Err(Error::Truncated), "{n} bytes");
         }
         // Another key format.
         let mut other = bytes;
         other[1] = 0x05;
         assert_eq!(parse_path(&other), Err(Error::BadSegment));
         // A special segment that is not an electronic key.
-        assert_eq!(
-            parse_path(&[0x35, 0x00]),
-            Err(Error::UnknownSegment(0x35))
-        );
+        assert_eq!(parse_path(&[0x35, 0x00]), Err(Error::UnknownSegment(0x35)));
     }
 
     #[test]
@@ -2662,11 +2614,7 @@ mod tests {
             if n == 10 {
                 continue;
             }
-            assert_eq!(
-                parse_path(&bytes[..n]),
-                Err(Error::Truncated),
-                "{n} bytes"
-            );
+            assert_eq!(parse_path(&bytes[..n]), Err(Error::Truncated), "{n} bytes");
         }
         // An even-length name has no pad byte.
         let even = vec![PathSegment::Symbol(b"ab".to_vec())];
@@ -2678,10 +2626,7 @@ mod tests {
             Ok(vec![PathSegment::Symbol(Vec::new())])
         );
         // A data segment that is neither simple data nor an ANSI symbol.
-        assert_eq!(
-            parse_path(&[0x81, 0x00]),
-            Err(Error::UnknownSegment(0x81))
-        );
+        assert_eq!(parse_path(&[0x81, 0x00]), Err(Error::UnknownSegment(0x81)));
         // A name past the limit is refused when written, not cut.
         let long = MessageRequest {
             service: service::GET_ATTRIBUTE_SINGLE,

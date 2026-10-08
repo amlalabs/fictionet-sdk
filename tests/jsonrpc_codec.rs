@@ -1,14 +1,14 @@
 //! JSON-RPC envelopes and stdio/HTTP framing through public codec tools.
 
 use fictionet::stdlib::codec::{
-    Carry, Collect, CollectError, Demux, Ending, Fail, Layered, Lcg, Lines, Pipe, Stream, Wire, finish, pump,
-    try_pump,
+    Carry, Collect, CollectError, Demux, Ending, Fail, Layered, Lcg, Lines, Pipe, Stream, Wire,
+    finish, pump, try_pump,
 };
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 use fictionet::stdlib::json::{self, Limits, Value};
 use fictionet::stdlib::jsonrpc::{self, Batch, Body, ErrorKind, Id, Message, Messages, Request};
+use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
 #[test]
 fn line_write_decode_round_trips_under_all_chunkings() {
@@ -201,7 +201,12 @@ fn recoverable_errors_and_eof_contracts() {
         b"\n{\"jsonrpc\":\"2.0\",\"method\":\"ok\"}\n".to_vec(),
     ]
     .concat();
-    let make = || Messages::with_limits(Limits { size: 40, ..Limits::default() });
+    let make = || {
+        Messages::with_limits(Limits {
+            size: 40,
+            ..Limits::default()
+        })
+    };
     contract::check_decode(make, &oversized);
     let (items, failure) = decode_all(make, &oversized);
     assert_eq!(failure, None);
@@ -212,7 +217,15 @@ fn recoverable_errors_and_eof_contracts() {
     ));
     assert!(items.last().unwrap().is_ok());
     for limit in [0, 1, 2, 32, 64] {
-        contract::check_decode(|| Messages::with_limits(Limits { size: limit, ..Limits::default() }), bytes);
+        contract::check_decode(
+            || {
+                Messages::with_limits(Limits {
+                    size: limit,
+                    ..Limits::default()
+                })
+            },
+            bytes,
+        );
         contract::check_decode(|| Collect::<Body>::new(limit), bytes);
     }
 }
@@ -372,16 +385,28 @@ fn lines_take_one_byte_at_a_time_in_linear_time() {
         ErrorKind::Line(fictionet::stdlib::codec::LineError::TooLong { .. })
     ));
     assert!(items[2].is_ok());
-    fictionet::stdlib::test_support::assert_linear("JSON-RPC bytewise lines", jsonrpc::MAX_LINE / 8, |n| {
-        let bytes = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{}\"}}\n", "x".repeat(n));
-        let mut stream = Stream::new(Messages::new());
-        let mut count = 0;
-        for byte in bytes.as_bytes().chunks(1) {
-            pump(&mut stream, byte, |item| { item.unwrap(); count += 1; }).unwrap();
-        }
-        finish(&mut stream, |item| { item.unwrap(); count += 1; }).unwrap();
-        assert_eq!(count, 1);
-    });
+    fictionet::stdlib::test_support::assert_linear(
+        "JSON-RPC bytewise lines",
+        jsonrpc::MAX_LINE / 8,
+        |n| {
+            let bytes = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{}\"}}\n", "x".repeat(n));
+            let mut stream = Stream::new(Messages::new());
+            let mut count = 0;
+            for byte in bytes.as_bytes().chunks(1) {
+                pump(&mut stream, byte, |item| {
+                    item.unwrap();
+                    count += 1;
+                })
+                .unwrap();
+            }
+            finish(&mut stream, |item| {
+                item.unwrap();
+                count += 1;
+            })
+            .unwrap();
+            assert_eq!(count, 1);
+        },
+    );
 }
 
 #[test]
@@ -427,7 +452,12 @@ fn bounded_body_pipe_and_independent_stdio_streams() {
         (vec![Layered::Inner(expected)], None)
     );
 
-    let mut streams = Demux::new(2, 1024, |_| Messages::with_limits(Limits { size: 64, ..Limits::default() }));
+    let mut streams = Demux::new(2, 1024, |_| {
+        Messages::with_limits(Limits {
+            size: 64,
+            ..Limits::default()
+        })
+    });
     let bytes = b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n";
     for key in [1, 2] {
         assert_eq!(streams.push(&key, bytes), bytes.len());
@@ -453,6 +483,14 @@ fn mutations_preserve_decoder_and_writer_contracts() {
         contract::check_wire::<Batch>(&input);
         contract::check_wire::<Body>(&input);
         input.push(b'\n');
-        contract::check_decode(|| Messages::with_limits(Limits { size: 256, ..Limits::default() }), &input);
+        contract::check_decode(
+            || {
+                Messages::with_limits(Limits {
+                    size: 256,
+                    ..Limits::default()
+                })
+            },
+            &input,
+        );
     }
 }

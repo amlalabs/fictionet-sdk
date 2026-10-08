@@ -4,11 +4,11 @@
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::syslog::{
-    BsdMessage, BsdTimestamp, Entry, Frame, Frames, Framing, MAX_BUFFERED, MAX_MESSAGE_LEN, Message, Priority,
-    SdElement, Timestamp,
+    BsdMessage, BsdTimestamp, Entry, Frame, Frames, Framing, MAX_BUFFERED, MAX_MESSAGE_LEN,
+    Message, Priority, SdElement, Timestamp,
 };
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -30,11 +30,17 @@ fuzz_target!(|data: &[u8]| {
     let entry = Entry::Bsd(BsdMessage::new(priority, rest));
     contract::check_wire_value(&entry);
     let mut message = Message::new(priority);
-    let value = String::from_utf8_lossy(rest).repeat(1 + MAX_MESSAGE_LEN / rest.len().saturating_add(1) / 2);
-    message.structured_data.push(SdElement::new("x@32473").param("p", value));
+    let value = String::from_utf8_lossy(rest)
+        .repeat(1 + MAX_MESSAGE_LEN / rest.len().saturating_add(1) / 2);
+    message
+        .structured_data
+        .push(SdElement::new("x@32473").param("p", value));
     contract::check_wire_value(&message);
     for framing in [Framing::OctetCounting, Framing::NonTransparent] {
-        let mut frame = Frame::new(framing, rest.iter().take(MAX_MESSAGE_LEN + 1).copied().collect());
+        let mut frame = Frame::new(
+            framing,
+            rest.iter().take(MAX_MESSAGE_LEN + 1).copied().collect(),
+        );
         contract::check_wire_value(&frame);
         frame.truncated = true;
         contract::check_wire_value(&frame);

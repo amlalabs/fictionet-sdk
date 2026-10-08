@@ -152,7 +152,10 @@ impl<I: Interface> Ports<I> {
             None => {
                 let i = self.ports.len();
                 self.ports.push(None);
-                self.wakers.push(Waker::from(Arc::new(SlotWaker { ready: self.ready.clone(), slot: i })));
+                self.wakers.push(Waker::from(Arc::new(SlotWaker {
+                    ready: self.ready.clone(),
+                    slot: i,
+                })));
                 i
             }
         };
@@ -176,7 +179,9 @@ impl<I: Interface> Ports<I> {
 
     /// Drops port `i`, which closes its interface.
     pub fn close(&mut self, i: usize) {
-        if let Some(p) = self.ports.get_mut(i) && p.take().is_some() {
+        if let Some(p) = self.ports.get_mut(i)
+            && p.take().is_some()
+        {
             self.open -= 1;
             self.free.insert(i);
         }
@@ -214,7 +219,9 @@ impl<I: Interface> Ports<I> {
         if fcx.is_cancelled() {
             return Err(Cancelled);
         }
-        if let Some(d) = deadline && d <= fcx.now() {
+        if let Some(d) = deadline
+            && d <= fcx.now()
+        {
             self.run += 1;
             return Ok(Event::Timer);
         }
@@ -236,8 +243,12 @@ impl<I: Interface> Ports<I> {
                 }
             }
             loop {
-                let Some(i) = self.lock_ready().pop() else { break };
-                let Some(port) = self.ports[i].as_mut() else { continue };
+                let Some(i) = self.lock_ready().pop() else {
+                    break;
+                };
+                let Some(port) = self.ports[i].as_mut() else {
+                    continue;
+                };
                 let mut slot_cx = Context::from_waker(&self.wakers[i]);
                 match port.poll_recv(fcx, &mut slot_cx) {
                     Poll::Ready(Ok(packet)) => {

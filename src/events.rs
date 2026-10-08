@@ -120,8 +120,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::lock;
 use crate::Cx;
+use crate::lock;
 use crate::stdlib::codec::Wire;
 use crate::stdlib::json::{Number, Value};
 use crate::time::Instant;
@@ -131,8 +131,16 @@ use crate::time::Instant;
 /// [repeat](crate::events#repeats)). Its length, its destination port and
 /// `detail` change with each packet, so they are its detail.
 /// `enrich` adds context to the owned event before it is recorded.
-pub fn record_drop<F>(fcx: &Cx, source: &'static str, packet: &crate::Packet, why: &'static str, detail: Fields, enrich: F)
-where F: FnOnce(Event) -> Event {
+pub fn record_drop<F>(
+    fcx: &Cx,
+    source: &'static str,
+    packet: &crate::Packet,
+    why: &'static str,
+    detail: Fields,
+    enrich: F,
+) where
+    F: FnOnce(Event) -> Event,
+{
     let h = crate::stdlib::ip::Header::parse_truncated(&packet.0);
     let port = h.as_ref().and_then(|h| h.dst_port(&packet.0));
     let (src, dst) = match &h {
@@ -146,7 +154,9 @@ where F: FnOnce(Event) -> Event {
         .field("dst", opt(h.as_ref().map(|_| dst)))
         .field("protocol", opt(h.as_ref().map(|h| u32::from(h.protocol))))
         .field("why", why);
-    let mut all = Fields::new().with("len", packet.0.len() as u64).with("dst_port", opt(port.map(u32::from)));
+    let mut all = Fields::new()
+        .with("len", packet.0.len() as u64)
+        .with("dst_port", opt(port.map(u32::from)));
     all.extend(detail);
     fcx.record_repeat(enrich(event), all);
 }
@@ -271,7 +281,12 @@ impl Fields {
 
     /// The fields as one JSON object.
     pub fn to_json(&self) -> Value {
-        Value::Object(self.0.iter().map(|(n, v)| ((*n).to_owned(), v.clone())).collect())
+        Value::Object(
+            self.0
+                .iter()
+                .map(|(n, v)| ((*n).to_owned(), v.clone()))
+                .collect(),
+        )
     }
 }
 
@@ -365,7 +380,12 @@ pub struct ConnInfo {
 impl ConnInfo {
     /// A connection with this number between `local` and `peer`.
     pub fn new(id: u64, local: SocketAddr, peer: SocketAddr) -> ConnInfo {
-        ConnInfo { id: Some(id), local: Some(local), peer: Some(peer), ..ConnInfo::default() }
+        ConnInfo {
+            id: Some(id),
+            local: Some(local),
+            peer: Some(peer),
+            ..ConnInfo::default()
+        }
     }
 
     /// The same, from `sandbox`.
@@ -494,7 +514,13 @@ impl Event {
     /// [`MAX_EVENT_BYTES`].
     pub fn size(&self) -> usize {
         let slot = std::mem::size_of::<(&str, Value)>();
-        let fields = self.fields.0.capacity() * slot + self.fields.0.iter().map(|(_, v)| value_size(v)).sum::<usize>();
+        let fields = self.fields.0.capacity() * slot
+            + self
+                .fields
+                .0
+                .iter()
+                .map(|(_, v)| value_size(v))
+                .sum::<usize>();
         ALLOC + std::mem::size_of::<Event>() + heap(self.summary.capacity()) + heap(fields)
     }
 
@@ -514,18 +540,33 @@ impl Event {
             ("kind".into(), self.kind.into()),
             ("level".into(), self.level.as_str().into()),
             ("summary".into(), self.summary.as_str().into()),
-            ("sandbox".into(), c.sandbox.as_ref().map_or(Value::Null, Sandbox::to_json)),
+            (
+                "sandbox".into(),
+                c.sandbox.as_ref().map_or(Value::Null, Sandbox::to_json),
+            ),
             ("conn".into(), opt(c.id)),
             ("local".into(), opt(c.local.map(|a| a.to_string()))),
             ("peer".into(), opt(c.peer.map(|a| a.to_string()))),
             ("transport".into(), c.transport.as_str().into()),
             ("tls".into(), c.tls.into()),
             ("sni".into(), opt(c.sni.as_deref())),
-            ("alpn".into(), opt(c.alpn.as_deref().map(|a| String::from_utf8_lossy(a).into_owned()))),
+            (
+                "alpn".into(),
+                opt(c
+                    .alpn
+                    .as_deref()
+                    .map(|a| String::from_utf8_lossy(a).into_owned())),
+            ),
             ("fields".into(), self.fields.to_json()),
         ];
         if let Some(o) = &self.origin {
-            let id = |t: u64| if t == 0 { Value::Null } else { Value::String(format!("t{t}")) };
+            let id = |t: u64| {
+                if t == 0 {
+                    Value::Null
+                } else {
+                    Value::String(format!("t{t}"))
+                }
+            };
             out.push(("node".into(), id(o.task)));
             out.push(("task".into(), crate::watch::short_name(&o.name).into()));
             out.push(("file".into(), o.file.into()));
@@ -550,7 +591,10 @@ impl Event {
         for (n, v) in self.fields.iter() {
             let text = match v {
                 Value::String(s) => s.clone(),
-                other => other.to_bytes().map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default(),
+                other => other
+                    .to_bytes()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default(),
             };
             layer.note(n, text);
         }
@@ -562,7 +606,9 @@ impl Event {
     fn dropped(seq: u64, at: Instant, count: u64) -> Event {
         let mut event = Event::new("events", "dropped")
             .level(Level::Notice)
-            .summary(format!("{count} earlier events were dropped for the log's limits"))
+            .summary(format!(
+                "{count} earlier events were dropped for the log's limits"
+            ))
             .field("count", count);
         event.seq = seq;
         event.at = at;
@@ -584,10 +630,16 @@ fn value_size(v: &Value) -> usize {
         Value::Null | Value::Bool(_) => 0,
         Value::Number(n) => heap(n.text().len()),
         Value::String(s) => heap(s.capacity()),
-        Value::Array(items) => heap(items.capacity() * std::mem::size_of::<Value>()) + items.iter().map(value_size).sum::<usize>(),
+        Value::Array(items) => {
+            heap(items.capacity() * std::mem::size_of::<Value>())
+                + items.iter().map(value_size).sum::<usize>()
+        }
         Value::Object(members) => {
             heap(members.capacity() * std::mem::size_of::<(String, Value)>())
-                + members.iter().map(|(k, v)| heap(k.capacity()) + value_size(v)).sum::<usize>()
+                + members
+                    .iter()
+                    .map(|(k, v)| heap(k.capacity()) + value_size(v))
+                    .sum::<usize>()
         }
     }
 }
@@ -617,7 +669,12 @@ struct Part {
 
 impl Part {
     fn new(max: usize, max_bytes: usize) -> Part {
-        Part { events: VecDeque::new(), bytes: 0, max, max_bytes }
+        Part {
+            events: VecDeque::new(),
+            bytes: 0,
+            max,
+            max_bytes,
+        }
     }
 
     /// Keeps `event`, of `size` bytes, and drops the oldest past the
@@ -626,8 +683,11 @@ impl Part {
         self.events.push_back(event);
         self.bytes += size;
         let mut dropped = 0;
-        while self.events.len() > self.max || (self.bytes > self.max_bytes && self.events.len() > 1) {
-            let Some(old) = self.events.pop_front() else { break };
+        while self.events.len() > self.max || (self.bytes > self.max_bytes && self.events.len() > 1)
+        {
+            let Some(old) = self.events.pop_front() else {
+                break;
+            };
             self.bytes -= old.size();
             dropped += 1;
         }
@@ -679,7 +739,9 @@ impl Window {
         event.at = self.last;
         event.fields.set("count", self.count);
         for (name, low, high) in self.ranges {
-            event.fields.set(name, Value::Array(vec![low.into(), high.into()]));
+            event
+                .fields
+                .set(name, Value::Array(vec![low.into(), high.into()]));
         }
         Some(event)
     }
@@ -714,7 +776,11 @@ impl State {
         event.seq = self.last;
         let size = event.size();
         let event = Arc::new(event);
-        let part = if repeat { &mut self.repeats } else { &mut self.events };
+        let part = if repeat {
+            &mut self.repeats
+        } else {
+            &mut self.events
+        };
         self.dropped += part.push(event.clone(), size);
         out.push(event);
     }
@@ -729,7 +795,9 @@ impl State {
 
     /// Records the count of the oldest run of repeats, and forgets it.
     fn close_oldest(&mut self, out: &mut Vec<Arc<Event>>) {
-        let Some((_, key)) = self.due.pop_front() else { return };
+        let Some((_, key)) = self.due.pop_front() else {
+            return;
+        };
         if let Some(event) = self.open.remove(&key).and_then(Window::summary) {
             self.keep(event, true, out);
         }
@@ -767,7 +835,12 @@ impl Store {
     /// Keeps `event` as a repeat, or counts it. See
     /// [Repeats](self#repeats).
     pub(crate) fn push_repeat(&self, mut event: Event, detail: Fields) {
-        let key = RepeatKey { source: event.source, kind: event.kind, conn: std::mem::take(&mut event.conn), fields: std::mem::take(&mut event.fields) };
+        let key = RepeatKey {
+            source: event.source,
+            kind: event.kind,
+            conn: std::mem::take(&mut event.conn),
+            fields: std::mem::take(&mut event.fields),
+        };
         let mut out = Vec::new();
         let mut s = lock(&self.state);
         s.advance(event.at, &mut out);
@@ -779,7 +852,12 @@ impl Store {
             }
             event.conn = key.conn.clone();
             event.fields = key.fields.clone();
-            let first = Window { first: event.clone(), count: 0, last: event.at, ranges: Vec::new() };
+            let first = Window {
+                first: event.clone(),
+                count: 0,
+                last: event.at,
+                ranges: Vec::new(),
+            };
             let key = Arc::new(key);
             let due = s.clock + REPEAT_WINDOW;
             s.open.insert(key.clone(), first);
@@ -830,7 +908,10 @@ impl Store {
                 s.close_oldest(&mut out);
             }
             s.closed = true;
-            (std::mem::replace(&mut s.subscribers, Arc::new([])), std::mem::take(&mut s.writers))
+            (
+                std::mem::replace(&mut s.subscribers, Arc::new([])),
+                std::mem::take(&mut s.writers),
+            )
         };
         for event in &out {
             for f in subscribers.iter() {
@@ -899,7 +980,11 @@ impl std::fmt::Debug for EventLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = lock(&self.store.state);
         let held = s.events.events.len() + s.repeats.events.len();
-        f.debug_struct("EventLog").field("recorded", &s.last).field("held", &held).field("dropped", &s.dropped).finish()
+        f.debug_struct("EventLog")
+            .field("recorded", &s.last)
+            .field("held", &held)
+            .field("dropped", &s.dropped)
+            .finish()
     }
 }
 
@@ -914,7 +999,11 @@ impl EventLog {
     /// `count`), numbered as the last one missed, so the next call can go
     /// on from the last event returned.
     pub fn after(&self, after: u64, max: usize) -> Vec<Event> {
-        self.store.after(after, max).into_iter().map(|e| (*e).clone()).collect()
+        self.store
+            .after(after, max)
+            .into_iter()
+            .map(|e| (*e).clone())
+            .collect()
     }
 
     /// Every event the log holds, oldest first, with an `events.dropped`
@@ -926,7 +1015,10 @@ impl EventLog {
     /// The events of `source`'s `kind` the log holds.
     pub fn of(&self, source: &str, kind: &str) -> Vec<Event> {
         let s = lock(&self.store.state);
-        held(&s, 0).filter(|e| e.is(source, kind)).map(|e| (**e).clone()).collect()
+        held(&s, 0)
+            .filter(|e| e.is(source, kind))
+            .map(|e| (**e).clone())
+            .collect()
     }
 
     /// The number of the last event recorded: how many there have been.
@@ -994,10 +1086,14 @@ impl EventLog {
                 .expect("the event writer's thread starts")
         };
         self.subscribe(move |event| {
-            let Ok(mut line) = event.to_json().to_bytes() else { return };
+            let Ok(mut line) = event.to_json().to_bytes() else {
+                return;
+            };
             line.push(b'\n');
             let len = line.len();
-            if queued.fetch_add(len, Ordering::Relaxed) + len > FILE_QUEUE_BYTES || tx.try_send(line).is_err() {
+            if queued.fetch_add(len, Ordering::Relaxed) + len > FILE_QUEUE_BYTES
+                || tx.try_send(line).is_err()
+            {
                 queued.fetch_sub(len, Ordering::Relaxed);
                 lost.fetch_add(1, Ordering::Relaxed);
             }
@@ -1031,9 +1127,15 @@ impl EventLog {
         let wall = if cfg!(target_arch = "wasm32") {
             Value::Null
         } else {
-            fcx.graph().start_wall.duration_since(crate::sys::UNIX_EPOCH).map_or(Value::Null, |d| float(d.as_secs_f64()))
+            fcx.graph()
+                .start_wall
+                .duration_since(crate::sys::UNIX_EPOCH)
+                .map_or(Value::Null, |d| float(d.as_secs_f64()))
         };
-        let event = Event::new("run", "start").summary("the run started").fields(fields).field("wall", wall);
+        let event = Event::new("run", "start")
+            .summary("the run started")
+            .fields(fields)
+            .field("wall", wall);
         fcx.record_at(Instant::ZERO, event);
     }
 
@@ -1043,13 +1145,22 @@ impl EventLog {
     /// counts of [repeats](self#repeats) that are due. Returns early with
     /// [`Cancelled`](crate::Cancelled) if `fcx`'s [region](Cx#regions) is
     /// cancelled.
-    pub async fn wait(&self, fcx: &Cx, n: usize, limit: std::time::Duration, mut pick: impl FnMut(&Event) -> bool) -> Result<Vec<Event>, crate::Cancelled> {
+    pub async fn wait(
+        &self,
+        fcx: &Cx,
+        n: usize,
+        limit: std::time::Duration,
+        mut pick: impl FnMut(&Event) -> bool,
+    ) -> Result<Vec<Event>, crate::Cancelled> {
         let deadline = fcx.now() + limit;
         loop {
             self.store.advance(fcx.now());
             let got: Vec<Event> = {
                 let s = lock(&self.store.state);
-                held(&s, 0).filter(|e| pick(e)).map(|e| (**e).clone()).collect()
+                held(&s, 0)
+                    .filter(|e| pick(e))
+                    .map(|e| (**e).clone())
+                    .collect()
             };
             if got.len() >= n || fcx.now() >= deadline {
                 return Ok(got);
@@ -1061,7 +1172,12 @@ impl EventLog {
 
 /// Writes the lines from `rx` to `out` until the run is over. After a
 /// failed write or flush, only counts them as lost.
-fn write_lines(rx: Receiver<Vec<u8>>, mut out: Box<dyn Write + Send>, lost: &AtomicU64, queued: &AtomicUsize) {
+fn write_lines(
+    rx: Receiver<Vec<u8>>,
+    mut out: Box<dyn Write + Send>,
+    lost: &AtomicU64,
+    queued: &AtomicUsize,
+) {
     let mut reported = 0;
     // Lines written since the last flush that worked.
     let mut unflushed = 0u64;
@@ -1093,9 +1209,15 @@ fn write_lines(rx: Receiver<Vec<u8>>, mut out: Box<dyn Write + Send>, lost: &Ato
 /// Writes an `events.lost` line if more were lost since the last, then
 /// flushes. Returns whether that failed, counting the unflushed lines as
 /// lost if so.
-fn finish_batch(out: &mut Box<dyn Write + Send>, lost: &AtomicU64, reported: &mut u64, unflushed: &mut u64) -> bool {
+fn finish_batch(
+    out: &mut Box<dyn Write + Send>,
+    lost: &AtomicU64,
+    reported: &mut u64,
+    unflushed: &mut u64,
+) -> bool {
     let n = lost.load(Ordering::Relaxed);
-    let report = format!("{{\"source\":\"events\",\"kind\":\"lost\",\"fields\":{{\"count\":{n}}}}}\n");
+    let report =
+        format!("{{\"source\":\"events\",\"kind\":\"lost\",\"fields\":{{\"count\":{n}}}}}\n");
     let ok = (n == *reported || out.write_all(report.as_bytes()).is_ok()) && out.flush().is_ok();
     *reported = n;
     if ok {
@@ -1138,7 +1260,10 @@ mod tests {
         // One that read up to the 5th is told it missed the rest of those
         // dropped.
         let late = log.after(5, 2);
-        assert_eq!((late[0].seq, late[0].u64("count"), late[1].seq), (gone, Some(gone - 5), gone + 1));
+        assert_eq!(
+            (late[0].seq, late[0].u64("count"), late[1].seq),
+            (gone, Some(gone - 5), gone + 1)
+        );
         assert!(log.after(total, 10).is_empty());
         assert_eq!(log.all().len() as u64, held + 1);
     }
@@ -1182,7 +1307,10 @@ mod tests {
 
     /// A refused packet, as the network records one: the port is detail.
     fn refused(store: &Store, ms: u64, dst: &str, port: u16) {
-        let mut event = Event::new("net", "blocked").summary(format!("to {dst}")).field("why", "ClosedPort").field("dst", dst);
+        let mut event = Event::new("net", "blocked")
+            .summary(format!("to {dst}"))
+            .field("why", "ClosedPort")
+            .field("dst", dst);
         event.at = at(ms);
         store.push_repeat(event, Fields::new().with("dst_port", u32::from(port)));
     }
@@ -1205,26 +1333,55 @@ mod tests {
         // Past it, the counts come first, then the event that came after.
         store.push(timed(Event::new("http", "request"), 1200));
         let all = log.all();
-        let shown: Vec<_> = all.iter().map(|e| (e.kind, e.str("dst"), e.u64("count"), e.get("dst_port").cloned())).collect();
+        let shown: Vec<_> = all
+            .iter()
+            .map(|e| {
+                (
+                    e.kind,
+                    e.str("dst"),
+                    e.u64("count"),
+                    e.get("dst_port").cloned(),
+                )
+            })
+            .collect();
         let ports = |lo: u64, hi: u64| Some(Value::Array(vec![lo.into(), hi.into()]));
         assert_eq!(
             shown,
             [
-                ("blocked", Some("192.0.2.1"), Some(1), Some(Value::from(1u32))),
-                ("blocked", Some("192.0.2.2"), Some(1), Some(Value::from(22u32))),
+                (
+                    "blocked",
+                    Some("192.0.2.1"),
+                    Some(1),
+                    Some(Value::from(1u32))
+                ),
+                (
+                    "blocked",
+                    Some("192.0.2.2"),
+                    Some(1),
+                    Some(Value::from(22u32))
+                ),
                 ("request", None, None, None),
                 ("blocked", Some("192.0.2.1"), Some(999), ports(2, 1000)),
                 ("request", None, None, None),
             ]
         );
-        assert_eq!((all[3].at, all[3].summary.as_str()), (at(100), "999 more: to 192.0.2.1"));
+        assert_eq!(
+            (all[3].at, all[3].summary.as_str()),
+            (at(100), "999 more: to 192.0.2.1")
+        );
         // A new window after the old one closed starts with a recorded one.
         refused(&store, 1300, "192.0.2.1", 7);
-        assert_eq!(log.of("net", "blocked").last().and_then(|e| e.u64("count")), Some(1));
+        assert_eq!(
+            log.of("net", "blocked").last().and_then(|e| e.u64("count")),
+            Some(1)
+        );
         // The run's end records every count still open.
         refused(&store, 1301, "192.0.2.1", 8);
         store.close();
-        assert_eq!(log.of("net", "blocked").last().and_then(|e| e.u64("count")), Some(1));
+        assert_eq!(
+            log.of("net", "blocked").last().and_then(|e| e.u64("count")),
+            Some(1)
+        );
         assert_eq!(log.of("net", "blocked").len(), 5);
     }
 
@@ -1241,7 +1398,12 @@ mod tests {
         // Every packet to a new address: a new run each time.
         let flood = MAX_EVENTS as u64 + 10;
         for i in 0..flood {
-            refused(&store, i, &format!("10.{}.{}.{}", i >> 16, (i >> 8) & 255, i & 255), 1);
+            refused(
+                &store,
+                i,
+                &format!("10.{}.{}.{}", i >> 16, (i >> 8) & 255, i & 255),
+                1,
+            );
             if i == flood / 2 {
                 store.push(Event::new("dns", "query"));
             }
@@ -1256,12 +1418,24 @@ mod tests {
         // `events.dropped` event, in order.
         let mut next = 1;
         for e in log.all() {
-            let first = if e.is("events", "dropped") { e.seq + 1 - e.u64("count").unwrap() } else { e.seq };
+            let first = if e.is("events", "dropped") {
+                e.seq + 1 - e.u64("count").unwrap()
+            } else {
+                e.seq
+            };
             assert_eq!(first, next, "{e:?}");
             next = e.seq + 1;
         }
         assert_eq!(next, log.recorded() + 1);
-        assert_eq!(log.dropped() + (log.all().iter().filter(|e| !e.is("events", "dropped")).count() as u64), log.recorded());
+        assert_eq!(
+            log.dropped()
+                + (log
+                    .all()
+                    .iter()
+                    .filter(|e| !e.is("events", "dropped"))
+                    .count() as u64),
+            log.recorded()
+        );
     }
 
     /// An event's JSON says whether its connection was TLS, and its ALPN.
@@ -1270,10 +1444,17 @@ mod tests {
         let addr = SocketAddr::from(([10, 0, 0, 2], 443));
         let plain = Event::new("http", "request").conn(&ConnInfo::new(1, addr, addr));
         let line = plain.to_line();
-        assert!(line.contains(r#""tls":false,"sni":null,"alpn":null"#), "{line}");
-        let tls = Event::new("http", "request").conn(&ConnInfo::new(1, addr, addr).over_tls(Some("a.test"), Some(b"h2")));
+        assert!(
+            line.contains(r#""tls":false,"sni":null,"alpn":null"#),
+            "{line}"
+        );
+        let tls = Event::new("http", "request")
+            .conn(&ConnInfo::new(1, addr, addr).over_tls(Some("a.test"), Some(b"h2")));
         let line = tls.to_line();
-        assert!(line.contains(r#""tls":true,"sni":"a.test","alpn":"h2""#), "{line}");
+        assert!(
+            line.contains(r#""tls":true,"sni":"a.test","alpn":"h2""#),
+            "{line}"
+        );
     }
 
     /// A shared buffer a test writes events into, slowly, or failing after
@@ -1288,7 +1469,10 @@ mod tests {
     impl Write for Sink {
         fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
             let mut bytes = self.bytes.lock().unwrap();
-            if self.fail_after.is_some_and(|n| bytes.iter().filter(|b| **b == b'\n').count() >= n) {
+            if self
+                .fail_after
+                .is_some_and(|n| bytes.iter().filter(|b| **b == b'\n').count() >= n)
+            {
                 return Err(std::io::Error::other("the disk is full"));
             }
             if self.slow {
@@ -1306,7 +1490,10 @@ mod tests {
     /// The run's end waits for a file writer to write every line.
     #[test]
     fn the_run_waits_for_its_file_writer() {
-        let sink = Sink { slow: true, ..Sink::default() };
+        let sink = Sink {
+            slow: true,
+            ..Sink::default()
+        };
         let out = sink.clone();
         let kept = Arc::new(Mutex::new(None));
         let keep = kept.clone();
@@ -1320,14 +1507,23 @@ mod tests {
         }))
         .unwrap();
         let log = kept.lock().unwrap().take().unwrap();
-        let lines = sink.bytes.lock().unwrap().iter().filter(|b| **b == b'\n').count();
+        let lines = sink
+            .bytes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count();
         assert_eq!((lines, log.lost()), (500, 0));
     }
 
     /// A write that fails is counted as lost, with every line after it.
     #[test]
     fn a_failed_write_is_counted_as_lost() {
-        let sink = Sink { fail_after: Some(100), ..Sink::default() };
+        let sink = Sink {
+            fail_after: Some(100),
+            ..Sink::default()
+        };
         let out = sink.clone();
         let kept = Arc::new(Mutex::new(None));
         let keep = kept.clone();
@@ -1341,11 +1537,21 @@ mod tests {
         }))
         .unwrap();
         let log = kept.lock().unwrap().take().unwrap();
-        let lines = sink.bytes.lock().unwrap().iter().filter(|b| **b == b'\n').count() as u64;
+        let lines = sink
+            .bytes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count() as u64;
         // Lines written but not yet flushed when the write failed count as
         // lost too: they may not have reached the file.
         assert_eq!(lines, 100);
-        assert!(log.lost() >= 200 && lines + log.lost() >= 300, "{}", log.lost());
+        assert!(
+            log.lost() >= 200 && lines + log.lost() >= 300,
+            "{}",
+            log.lost()
+        );
     }
 
     /// Events are recorded with no reader at all, numbered and dated on
@@ -1361,9 +1567,17 @@ mod tests {
             assert_eq!(events.len(), 2);
             assert_eq!((events[0].seq, events[1].seq), (1, 2));
             assert!(events[0].at < events[1].at && events[1].at <= fcx.now());
-            assert_eq!(events[0].origin.as_ref().map(|o| o.task), Some(1), "the world function is the first task");
+            assert_eq!(
+                events[0].origin.as_ref().map(|o| o.task),
+                Some(1),
+                "the world function is the first task"
+            );
             let json = events[1].to_line();
-            assert!(json.contains(r#""source":"world","kind":"hello""#) && json.contains(r#""node":"t1""#), "{json}");
+            assert!(
+                json.contains(r#""source":"world","kind":"hello""#)
+                    && json.contains(r#""node":"t1""#),
+                "{json}"
+            );
             Ok(())
         }))
         .unwrap();

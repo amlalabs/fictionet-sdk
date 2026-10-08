@@ -86,7 +86,9 @@ pub(crate) fn main(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let bound = listener.local_addr().expect("a bound listener has an address");
+    let bound = listener
+        .local_addr()
+        .expect("a bound listener has an address");
     println!("fictionet dashboard: serving the world at {path} on http://{bound}/");
     let path: Arc<str> = path.into();
     let connections = Arc::new(AtomicUsize::new(0));
@@ -134,7 +136,9 @@ pub(crate) fn parse_request(buf: &[u8]) -> Option<Request> {
         .collect();
     let (mut host, mut fetch_site, mut origin) = (None, None, None);
     for line in lines {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         let v = Some(v.trim().to_owned());
         match k.trim().to_ascii_lowercase().as_str() {
             "host" => host = v,
@@ -143,7 +147,14 @@ pub(crate) fn parse_request(buf: &[u8]) -> Option<Request> {
             _ => {}
         }
     }
-    Some(Request { method, path: path.to_owned(), query, host, fetch_site, origin })
+    Some(Request {
+        method,
+        path: path.to_owned(),
+        query,
+        host,
+        fetch_site,
+        origin,
+    })
 }
 
 /// Undoes `%xx` and `+` in a query part.
@@ -155,7 +166,8 @@ fn unescape(s: &str) -> String {
         match b[i] {
             b'+' => out.push(b' '),
             b'%' if i + 2 < b.len() => {
-                match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
+                match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16)
+                {
                     Ok(v) => {
                         out.push(v);
                         i += 2;
@@ -213,7 +225,11 @@ pub(crate) fn same_site(req: &Request) -> bool {
 pub(crate) fn observe_request(op: &str, query: &[(String, String)]) -> String {
     let mut out = format!("{{\"op\":{}", quote(op));
     for (k, v) in query {
-        let value = if !v.is_empty() && v.len() < 16 && v.bytes().all(|b| b.is_ascii_digit()) { v.clone() } else { quote(v) };
+        let value = if !v.is_empty() && v.len() < 16 && v.bytes().all(|b| b.is_ascii_digit()) {
+            v.clone()
+        } else {
+            quote(v)
+        };
         out.push_str(&format!(",{}:{value}", quote(k)));
     }
     out.push('}');
@@ -234,7 +250,13 @@ fn quote(s: &str) -> String {
     out
 }
 
-fn respond(conn: &mut TcpStream, status: &str, kind: &str, body: &[u8], extra: &str) -> io::Result<()> {
+fn respond(
+    conn: &mut TcpStream,
+    status: &str,
+    kind: &str,
+    body: &[u8],
+    extra: &str,
+) -> io::Result<()> {
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\
          X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n\
@@ -265,22 +287,68 @@ fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream) -> io::Result<()> 
         buf.extend_from_slice(&chunk[..n]);
     }
     let text = "text/plain; charset=utf-8";
-    let Some(req) = parse_request(&buf) else { return Ok(()) };
+    let Some(req) = parse_request(&buf) else {
+        return Ok(());
+    };
     if !host_allowed(req.host.as_deref(), bound) {
         return respond(&mut conn, "403 Forbidden", text, b"bad Host header\n", "");
     }
     if req.method != "GET" {
-        return respond(&mut conn, "405 Method Not Allowed", text, b"GET only\n", "Allow: GET\r\n");
+        return respond(
+            &mut conn,
+            "405 Method Not Allowed",
+            text,
+            b"GET only\n",
+            "Allow: GET\r\n",
+        );
     }
     match req.path.as_str() {
-        "/" | "/index.html" => respond(&mut conn, "200 OK", "text/html; charset=utf-8", INDEX_HTML.as_bytes(), ""),
-        "/app.js" => respond(&mut conn, "200 OK", "text/javascript; charset=utf-8", APP_JS.as_bytes(), ""),
-        "/groups.js" => respond(&mut conn, "200 OK", "text/javascript; charset=utf-8", GROUPS_JS.as_bytes(), ""),
-        "/app.css" => respond(&mut conn, "200 OK", "text/css; charset=utf-8", APP_CSS.as_bytes(), ""),
-        "/icon.svg" => respond(&mut conn, "200 OK", "image/svg+xml", ICON_SVG.as_bytes(), ""),
+        "/" | "/index.html" => respond(
+            &mut conn,
+            "200 OK",
+            "text/html; charset=utf-8",
+            INDEX_HTML.as_bytes(),
+            "",
+        ),
+        "/app.js" => respond(
+            &mut conn,
+            "200 OK",
+            "text/javascript; charset=utf-8",
+            APP_JS.as_bytes(),
+            "",
+        ),
+        "/groups.js" => respond(
+            &mut conn,
+            "200 OK",
+            "text/javascript; charset=utf-8",
+            GROUPS_JS.as_bytes(),
+            "",
+        ),
+        "/app.css" => respond(
+            &mut conn,
+            "200 OK",
+            "text/css; charset=utf-8",
+            APP_CSS.as_bytes(),
+            "",
+        ),
+        "/icon.svg" => respond(
+            &mut conn,
+            "200 OK",
+            "image/svg+xml",
+            ICON_SVG.as_bytes(),
+            "",
+        ),
         path => match path.strip_prefix("/api/") {
-            Some(_) if !same_site(&req) => respond(&mut conn, "403 Forbidden", text, b"cross-site request\n", ""),
-            Some(op) if !op.is_empty() && op.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') => {
+            Some(_) if !same_site(&req) => respond(
+                &mut conn,
+                "403 Forbidden",
+                text,
+                b"cross-site request\n",
+                "",
+            ),
+            Some(op)
+                if !op.is_empty() && op.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
+            {
                 api(world, conn, op, &req.query)
             }
             _ => respond(&mut conn, "404 Not Found", text, b"not found\n", ""),
@@ -294,14 +362,30 @@ fn api(world: &str, mut conn: TcpStream, op: &str, query: &[(String, String)]) -
         Ok(c) => c,
         Err(msg) => {
             let body = format!("{{\"error\":{}}}", quote(&msg));
-            return respond(&mut conn, "502 Bad Gateway", "application/json", body.as_bytes(), "");
+            return respond(
+                &mut conn,
+                "502 Bad Gateway",
+                "application/json",
+                body.as_bytes(),
+                "",
+            );
         }
     };
     if let Some(links) = merged_links(op, query) {
         if links.len() > MAX_MERGED {
-            return respond(&mut conn, "400 Bad Request", "application/json", br#"{"error":"too many links"}"#, "");
+            return respond(
+                &mut conn,
+                "400 Bad Request",
+                "application/json",
+                br#"{"error":"too many links"}"#,
+                "",
+            );
         }
-        return if op == "packets" { stream_merged(client, conn, query, &links) } else { pcap_merged(client, conn, &links) };
+        return if op == "packets" {
+            stream_merged(client, conn, query, &links)
+        } else {
+            pcap_merged(client, conn, &links)
+        };
     }
     let request = observe_request(op, query);
     client.request(&request)?;
@@ -310,21 +394,40 @@ fn api(world: &str, mut conn: TcpStream, op: &str, query: &[(String, String)]) -
     }
     client.set_timeout(Some(Duration::from_secs(30)))?;
     let Some(value) = client.next_value()? else {
-        return respond(&mut conn, "502 Bad Gateway", "application/json", br#"{"error":"the world closed"}"#, "");
+        return respond(
+            &mut conn,
+            "502 Bad Gateway",
+            "application/json",
+            br#"{"error":"the world closed"}"#,
+            "",
+        );
     };
     if value.binary {
         let (kind, name) = match op {
             "pcap" => (
                 "application/vnd.tcpdump.pcap",
-                format!("fictionet-{}.pcapng", query.iter().find(|(k, _)| k == "link").map_or("link", |(_, v)| v)),
+                format!(
+                    "fictionet-{}.pcapng",
+                    query
+                        .iter()
+                        .find(|(k, _)| k == "link")
+                        .map_or("link", |(_, v)| v)
+                ),
             ),
             _ => ("text/plain; charset=utf-8", format!("fictionet-{op}.txt")),
         };
-        let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.')).collect();
+        let name: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+            .collect();
         let disposition = format!("Content-Disposition: attachment; filename=\"{name}\"\r\n");
         return respond(&mut conn, "200 OK", kind, &value.bytes, &disposition);
     }
-    let status = if value.bytes.starts_with(br#"{"error":"#) { "404 Not Found" } else { "200 OK" };
+    let status = if value.bytes.starts_with(br#"{"error":"#) {
+        "404 Not Found"
+    } else {
+        "200 OK"
+    };
     respond(&mut conn, status, "application/json", &value.bytes, "")
 }
 
@@ -337,14 +440,30 @@ fn merged_links(op: &str, query: &[(String, String)]) -> Option<Vec<String>> {
     if !value.contains(',') {
         return None;
     }
-    let mut links: Vec<String> = value.split(',').filter(|l| !l.is_empty()).map(str::to_owned).collect();
+    let mut links: Vec<String> = value
+        .split(',')
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
     links.dedup();
     Some(links)
 }
 
 /// The query with `link` set to one link.
 fn with_link(query: &[(String, String)], link: &str) -> Vec<(String, String)> {
-    query.iter().map(|(k, v)| (k.clone(), if k == "link" { link.to_owned() } else { v.clone() })).collect()
+    query
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                if k == "link" {
+                    link.to_owned()
+                } else {
+                    v.clone()
+                },
+            )
+        })
+        .collect()
 }
 
 /// `data` (a JSON object) with `"link":"<link>"` added first.
@@ -359,7 +478,12 @@ pub(crate) fn add_link(data: &str, link: &str) -> String {
 /// Relays the `packets` streams of several links as one stream of
 /// server-sent events. Each event's data gets the link it is from. A link
 /// whose stream ends sends `link_end`; the stream ends when all have.
-fn stream_merged(mut client: Client, conn: TcpStream, query: &[(String, String)], links: &[String]) -> io::Result<()> {
+fn stream_merged(
+    mut client: Client,
+    conn: TcpStream,
+    query: &[(String, String)],
+    links: &[String],
+) -> io::Result<()> {
     let mut open = std::collections::HashMap::new();
     for link in links {
         let id = client.request(&observe_request("packets", &with_link(query, link)))?;
@@ -375,12 +499,21 @@ fn stream_merged(mut client: Client, conn: TcpStream, query: &[(String, String)]
     while !open.is_empty() {
         match client.next_value() {
             Ok(Some(value)) => {
-                let Some(link) = open.get(&value.id).cloned() else { continue };
+                let Some(link) = open.get(&value.id).cloned() else {
+                    continue;
+                };
                 match split_event(&value.bytes) {
-                    Some(("end", data)) => write!(out, "event: link_end\ndata: {}\n\n", add_link(data, &link))?,
-                    Some((name, data)) => write!(out, "event: {name}\ndata: {}\n\n", add_link(data, &link))?,
+                    Some(("end", data)) => {
+                        write!(out, "event: link_end\ndata: {}\n\n", add_link(data, &link))?
+                    }
+                    Some((name, data)) => {
+                        write!(out, "event: {name}\ndata: {}\n\n", add_link(data, &link))?
+                    }
                     None => {
-                        let data = format!("{{\"error\":{}}}", quote(&String::from_utf8_lossy(&value.bytes)));
+                        let data = format!(
+                            "{{\"error\":{}}}",
+                            quote(&String::from_utf8_lossy(&value.bytes))
+                        );
                         write!(out, "event: link_end\ndata: {}\n\n", add_link(&data, &link))?
                     }
                 }
@@ -390,14 +523,22 @@ fn stream_merged(mut client: Client, conn: TcpStream, query: &[(String, String)]
                 }
             }
             Ok(None) => break,
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
                 out.write_all(b": ping\n\n")?;
                 out.flush()?;
             }
             Err(e) => return Err(e),
         }
     }
-    write!(out, "event: end\ndata: {{\"reason\":\"every link closed\"}}\n\n")?;
+    write!(
+        out,
+        "event: end\ndata: {{\"reason\":\"every link closed\"}}\n\n"
+    )?;
     out.flush()
 }
 
@@ -406,16 +547,31 @@ fn pcap_merged(mut client: Client, mut conn: TcpStream, links: &[String]) -> io:
     client.set_timeout(Some(Duration::from_secs(30)))?;
     let mut file = Vec::new();
     for link in links {
-        let value = client.call(&observe_request("pcap", &[("link".to_owned(), link.clone())]))?;
+        let value = client.call(&observe_request(
+            "pcap",
+            &[("link".to_owned(), link.clone())],
+        ))?;
         if value.binary {
             file.extend_from_slice(&value.bytes);
         }
     }
     if file.is_empty() {
-        return respond(&mut conn, "404 Not Found", "application/json", br#"{"error":"nothing is watching those links"}"#, "");
+        return respond(
+            &mut conn,
+            "404 Not Found",
+            "application/json",
+            br#"{"error":"nothing is watching those links"}"#,
+            "",
+        );
     }
     let disposition = "Content-Disposition: attachment; filename=\"fictionet-links.pcapng\"\r\n";
-    respond(&mut conn, "200 OK", "application/vnd.tcpdump.pcap", &file, disposition)
+    respond(
+        &mut conn,
+        "200 OK",
+        "application/vnd.tcpdump.pcap",
+        &file,
+        disposition,
+    )
 }
 
 /// Splits a stream value, `{"event":"<name>","data":<data>}`, into its
@@ -444,7 +600,11 @@ fn stream(mut client: Client, conn: TcpStream) -> io::Result<()> {
             Ok(Some(value)) => {
                 match split_event(&value.bytes) {
                     Some((name, data)) => write!(out, "event: {name}\ndata: {data}\n\n")?,
-                    None => write!(out, "event: error\ndata: {}\n\n", String::from_utf8_lossy(&value.bytes))?,
+                    None => write!(
+                        out,
+                        "event: error\ndata: {}\n\n",
+                        String::from_utf8_lossy(&value.bytes)
+                    )?,
                 }
                 out.flush()?;
                 if value.end {
@@ -452,10 +612,18 @@ fn stream(mut client: Client, conn: TcpStream) -> io::Result<()> {
                 }
             }
             Ok(None) => {
-                write!(out, "event: end\ndata: {{\"reason\":\"the world closed\"}}\n\n")?;
+                write!(
+                    out,
+                    "event: end\ndata: {{\"reason\":\"the world closed\"}}\n\n"
+                )?;
                 return out.flush();
             }
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
                 out.write_all(b": ping\n\n")?;
                 out.flush()?;
             }
@@ -470,17 +638,31 @@ mod tests {
 
     #[test]
     fn api_paths_become_observe_requests() {
-        let r = parse_request(b"GET /api/packet?link=e5&seq=12&q=a%20b HTTP/1.1\r\nHost: localhost:7878\r\n\r\n").unwrap();
+        let r = parse_request(
+            b"GET /api/packet?link=e5&seq=12&q=a%20b HTTP/1.1\r\nHost: localhost:7878\r\n\r\n",
+        )
+        .unwrap();
         assert_eq!(r.path, "/api/packet");
         assert_eq!(r.host.as_deref(), Some("localhost:7878"));
-        assert_eq!(observe_request("packet", &r.query), r#"{"op":"packet","link":"e5","seq":12,"q":"a b"}"#);
+        assert_eq!(
+            observe_request("packet", &r.query),
+            r#"{"op":"packet","link":"e5","seq":12,"q":"a b"}"#
+        );
     }
 
     #[test]
     fn cross_site_requests_are_told_apart() {
-        let req = |extra: &str| parse_request(format!("GET /api/graph HTTP/1.1\r\nHost: 127.0.0.1:7878\r\n{extra}\r\n").as_bytes()).unwrap();
+        let req = |extra: &str| {
+            parse_request(
+                format!("GET /api/graph HTTP/1.1\r\nHost: 127.0.0.1:7878\r\n{extra}\r\n")
+                    .as_bytes(),
+            )
+            .unwrap()
+        };
         assert!(same_site(&req("")));
-        assert!(same_site(&req("Sec-Fetch-Site: same-origin\r\nOrigin: http://127.0.0.1:7878\r\n")));
+        assert!(same_site(&req(
+            "Sec-Fetch-Site: same-origin\r\nOrigin: http://127.0.0.1:7878\r\n"
+        )));
         assert!(same_site(&req("Sec-Fetch-Site: none\r\n")));
         assert!(!same_site(&req("Sec-Fetch-Site: cross-site\r\n")));
         assert!(!same_site(&req("Sec-Fetch-Site: same-site\r\n")));
@@ -489,19 +671,33 @@ mod tests {
 
     #[test]
     fn merged_calls_name_several_links() {
-        let q = |v: &str| vec![("link".to_owned(), v.to_owned()), ("after".to_owned(), "0".to_owned())];
-        assert_eq!(merged_links("packets", &q("e3,e7,e7")), Some(vec!["e3".to_owned(), "e7".to_owned()]));
+        let q = |v: &str| {
+            vec![
+                ("link".to_owned(), v.to_owned()),
+                ("after".to_owned(), "0".to_owned()),
+            ]
+        };
+        assert_eq!(
+            merged_links("packets", &q("e3,e7,e7")),
+            Some(vec!["e3".to_owned(), "e7".to_owned()])
+        );
         assert_eq!(merged_links("pcap", &q("e3,e7")).map(|l| l.len()), Some(2));
         assert_eq!(merged_links("packets", &q("e3")), None);
         assert_eq!(merged_links("packet", &q("e3,e7")), None);
-        assert_eq!(observe_request("packets", &with_link(&q("e3,e7"), "e7")), r#"{"op":"packets","link":"e7","after":0}"#);
+        assert_eq!(
+            observe_request("packets", &with_link(&q("e3,e7"), "e7")),
+            r#"{"op":"packets","link":"e7","after":0}"#
+        );
         assert_eq!(add_link(r#"{"seq":1}"#, "e7"), r#"{"link":"e7","seq":1}"#);
         assert_eq!(add_link("{}", "e7"), r#"{"link":"e7"}"#);
     }
 
     #[test]
     fn stream_values_split_into_events() {
-        assert_eq!(split_event(br#"{"event":"node","data":{"id":"t1"}}"#), Some(("node", r#"{"id":"t1"}"#)));
+        assert_eq!(
+            split_event(br#"{"event":"node","data":{"id":"t1"}}"#),
+            Some(("node", r#"{"id":"t1"}"#))
+        );
         assert_eq!(split_event(br#"{"error":"x"}"#), None);
     }
 

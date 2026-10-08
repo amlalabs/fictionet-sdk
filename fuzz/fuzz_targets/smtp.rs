@@ -4,11 +4,11 @@
 use fictionet::stdlib::codec::{Decode, Fail, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::smtp::{
     Command, Data, Error, FrameError, Input, Inputs, MAX_DATA, MAX_DATA_LINE, MAX_LINE,
     MAX_REPLY_TEXT, Replies, Reply, Request,
 };
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fn data_server() -> Inputs {

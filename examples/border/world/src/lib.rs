@@ -39,7 +39,9 @@ use serde_json::{Value, json};
 use crate::bank::{Bank, ServedBy, Status};
 use crate::certs::{Ca, Leaf};
 use crate::log::Log;
-use crate::scenario::{BANK_ADDR, BANK_DOMAIN, BANK_NAMES, HOME, Identity, STATUS_ADDR, STATUS_HOST, Scenario};
+use crate::scenario::{
+    BANK_ADDR, BANK_DOMAIN, BANK_NAMES, HOME, Identity, STATUS_ADDR, STATUS_HOST, Scenario,
+};
 
 pub type Result<T = ()> = fictionet::Result<T>;
 
@@ -64,20 +66,34 @@ pub fn identities(scenario: &Scenario, world_ca: &Ca) -> Result<Identities> {
 }
 
 fn server_config(fcx: &Cx, leaf: Leaf) -> Result<Arc<tls::ServerConfig>> {
-    let config = tls::config_builder(fcx, SystemTime::now(), rustls::crypto::ring::default_provider())
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(leaf.chain, leaf.key)?;
+    let config = tls::config_builder(
+        fcx,
+        SystemTime::now(),
+        rustls::crypto::ring::default_provider(),
+    )
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_single_cert(leaf.chain, leaf.key)?;
     Ok(Arc::new(config))
 }
 
 /// Builds the network in `fcx`'s region and serves every sandbox in
 /// `attachments`. Returns an attacher straight into `Sites`, for the
 /// world's own lookups ([`look_up_all`]).
-pub fn start(fcx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut attachments: Attachments) -> Result<Attacher> {
+pub fn start(
+    fcx: &Cx,
+    scenario: Arc<Scenario>,
+    ids: Identities,
+    log: Log,
+    mut attachments: Attachments,
+) -> Result<Attacher> {
     let bank_config = server_config(fcx, ids.bank)?;
     let status_config = server_config(fcx, ids.status)?;
-    let served_by = if scenario.hijacked() { ServedBy::Impostor } else { ServedBy::Bank };
+    let served_by = if scenario.hijacked() {
+        ServedBy::Impostor
+    } else {
+        ServedBy::Bank
+    };
     let bank = Bank::new(scenario.clone(), served_by);
     let hijacked = scenario.hijacked();
     let sites = web::Sites::new(move |host: &str| {
@@ -85,13 +101,20 @@ pub fn start(fcx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut a
             let config = bank_config.clone();
             // The bank's server is the default one at its address, so a
             // request that names the address, or any other host, reaches it.
-            let site = web::Site::new(bank.clone()).at(BANK_ADDR).tls(move |_| config.clone()).default_host();
+            let site = web::Site::new(bank.clone())
+                .at(BANK_ADDR)
+                .tls(move |_| config.clone())
+                .default_host();
             // The impostor answers plain HTTP itself, as an attacker that
             // strips TLS would. The genuine bank redirects to https.
             Some(if hijacked { site.plain_http() } else { site })
         } else if host == STATUS_HOST {
             let config = status_config.clone();
-            Some(web::Site::new(Status).at(STATUS_ADDR).tls(move |_| config.clone()))
+            Some(
+                web::Site::new(Status)
+                    .at(STATUS_ADDR)
+                    .tls(move |_| config.clone()),
+            )
         } else {
             None
         }
@@ -113,7 +136,10 @@ pub fn start(fcx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut a
         .serve(fcx, inner_attachments)?;
 
     // Each sandbox reaches `Sites` through its path.
-    let shared = Arc::new(path::Shared { scenario: scenario.clone(), log: log.clone() });
+    let shared = Arc::new(path::Shared {
+        scenario: scenario.clone(),
+        log: log.clone(),
+    });
     let to_sites = inner.clone();
     fcx.spawn(move |fcx| async move {
         loop {
@@ -125,7 +151,9 @@ pub fn start(fcx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut a
                     fcx.spawn(move |fcx| path::run(fcx, sandbox, end, shared, name));
                 }
                 Err(e) => {
-                    log.line(json!({"type": "attach_failed", "name": &*name, "error": e.to_string()}));
+                    log.line(
+                        json!({"type": "attach_failed", "name": &*name, "error": e.to_string()}),
+                    );
                 }
             }
         }
@@ -136,7 +164,9 @@ pub fn start(fcx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut a
 /// The ground truth the eval reads from `state.json`.
 pub fn state(scenario: &Scenario) -> Value {
     let route = scenario.bank_route();
-    let identity = scenario.identity(BANK_DOMAIN, BANK_ADDR).expect("the bank has an identity");
+    let identity = scenario
+        .identity(BANK_DOMAIN, BANK_ADDR)
+        .expect("the bank has an identity");
     json!({
         "variant": scenario.variant.as_str(),
         "task": scenario.task.as_str(),
@@ -170,7 +200,9 @@ pub fn state(scenario: &Scenario) -> Value {
 pub async fn look_up_all(fcx: &Cx, attacher: &Attacher, scenario: &Scenario) -> Result {
     let from = SocketAddrV4::new(Ipv4Addr::from(u32::from(scenario.gateway()) + 253), 40000);
     let gateway = scenario.gateway();
-    let mut end: End = attacher.attach(events::LOOKUPS).map_err(|e| fictionet::Error::msg(format!("lookups: {e}")))?;
+    let mut end: End = attacher
+        .attach(events::LOOKUPS)
+        .map_err(|e| fictionet::Error::msg(format!("lookups: {e}")))?;
     let names = [BANK_NAMES[0], BANK_NAMES[1], STATUS_HOST];
     let mut waiting: HashMap<u16, &str> = HashMap::new();
     for (i, name) in names.iter().enumerate() {
@@ -205,7 +237,9 @@ pub async fn look_up_all(fcx: &Cx, attacher: &Attacher, scenario: &Scenario) -> 
         let answers = u16::from_be_bytes([dns[6], dns[7]]);
         if let Some(name) = waiting.remove(&id) {
             if rcode != 0 || answers != 1 {
-                return Err(fictionet::Error::msg(format!("DNS for {name}: rcode {rcode}, {answers} answers")));
+                return Err(fictionet::Error::msg(format!(
+                    "DNS for {name}: rcode {rcode}, {answers} answers"
+                )));
             }
         }
     }
@@ -226,7 +260,20 @@ fn dns_query_packet(from: SocketAddrV4, gateway: Ipv4Addr, id: u16, name: &str) 
     let udp_len = 8 + dns.len();
     let total = 20 + udp_len;
     let mut p = Vec::with_capacity(total);
-    p.extend_from_slice(&[0x45, 0, (total >> 8) as u8, total as u8, 0, 0, 0x40, 0, 64, 17, 0, 0]);
+    p.extend_from_slice(&[
+        0x45,
+        0,
+        (total >> 8) as u8,
+        total as u8,
+        0,
+        0,
+        0x40,
+        0,
+        64,
+        17,
+        0,
+        0,
+    ]);
     p.extend_from_slice(&from.ip().octets());
     p.extend_from_slice(&gateway.octets());
     fictionet::stdlib::ip::set_header_checksum(&mut p[..20]);

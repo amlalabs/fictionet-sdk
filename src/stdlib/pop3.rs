@@ -49,8 +49,8 @@
 
 extern crate alloc;
 
-use fictionet::stdlib::codec::ascii::{self, hex_value as hex};
 use self::alloc::{collections::VecDeque, string::String, vec::Vec};
+use fictionet::stdlib::codec::ascii::{self, hex_value as hex};
 use fictionet::stdlib::codec::{self, Decode, Wire};
 use std::num::NonZeroU32;
 
@@ -798,9 +798,7 @@ impl Wire for Reply {
                     }
                     return Ok(reply);
                 }
-                codec::Step::Skip(used) => {
-                    bytes = bytes.get(used..).ok_or(Error::Incomplete)?
-                }
+                codec::Step::Skip(used) => bytes = bytes.get(used..).ok_or(Error::Incomplete)?,
                 _ => return Err(Error::Incomplete),
             }
         }
@@ -833,9 +831,7 @@ impl Wire for Reply {
             {
                 return Err(Error::Unwritable);
             }
-            size = size
-                .checked_add(code.len() + 3)
-                .ok_or(Error::Unwritable)?;
+            size = size.checked_add(code.len() + 3).ok_or(Error::Unwritable)?;
             let room = (MAX_REPLY_LINE - 2)
                 .checked_sub(size)
                 .ok_or(Error::Unwritable)?;
@@ -935,8 +931,7 @@ impl Wire for ScanListing {
     /// failure and leaves `out` unchanged. Every value fits the line limit.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let line = format!("{} {}", self.message, self.octets);
-        out.try_reserve(line.len())
-            .map_err(|_| Error::Unwritable)?;
+        out.try_reserve(line.len()).map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(line.as_bytes());
         Ok(())
     }
@@ -1273,8 +1268,7 @@ impl Decode for Outputs {
             let sent = sent.strip_suffix(b"\r").unwrap_or(sent);
             if sent == b"+" || sent.starts_with(b"+ ") {
                 return Ok(codec::Step::Item(
-                    line.map(Output::Line)
-                        .map_err(|_| Error::BadStatus),
+                    line.map(Output::Line).map_err(|_| Error::BadStatus),
                     used,
                 ));
             }
@@ -1305,18 +1299,12 @@ impl Decode for Outputs {
                 }
                 Err(_) if multi => return Err(FrameError::BadStatus),
                 reply => {
-                    return Ok(codec::Step::Item(
-                        reply.map(Output::Reply),
-                        used,
-                    ));
+                    return Ok(codec::Step::Item(reply.map(Output::Reply), used));
                 }
             }
         }
         if line.as_deref() == Ok(b".".as_slice()) {
-            let reply = self
-                .pending
-                .take()
-                .ok_or(Error::BadStatus);
+            let reply = self.pending.take().ok_or(Error::BadStatus);
             self.lines = codec::Lines::new(MAX_REPLY_LINE - 2, codec::Ending::Crlf);
             self.body_size = 0;
             return Ok(codec::Step::Item(
@@ -1366,12 +1354,10 @@ impl Decode for Outputs {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
-    use codec::{
-        Fail, Lcg, Stream,
-    };
+    use codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn scan(bytes: &[u8]) -> Option<(NonZeroU32, u64)> {
@@ -1449,42 +1435,15 @@ mod tests {
 
     #[test]
     fn command_errors() {
-        assert_eq!(
-            command(b""),
-            Err(Error::BadKeyword)
-        );
-        assert_eq!(
-            command(b"RE 1"),
-            Err(Error::BadKeyword)
-        );
-        assert_eq!(
-            command(b"RETRY 1"),
-            Err(Error::BadKeyword)
-        );
-        assert_eq!(
-            command(b"RE\xc3\xa9 1"),
-            Err(Error::BadKeyword)
-        );
-        assert_eq!(
-            command(b" RETR 1"),
-            Err(Error::BadKeyword)
-        );
-        assert_eq!(
-            command(b"RETR\t1"),
-            Err(Error::BadCharacter)
-        );
-        assert_eq!(
-            command(b"PASS a\rb"),
-            Err(Error::BadCharacter)
-        );
-        assert_eq!(
-            command(b"PASS \xff"),
-            Err(Error::BadCharacter)
-        );
-        assert_eq!(
-            command(b"PASS \x7f"),
-            Err(Error::BadCharacter)
-        );
+        assert_eq!(command(b""), Err(Error::BadKeyword));
+        assert_eq!(command(b"RE 1"), Err(Error::BadKeyword));
+        assert_eq!(command(b"RETRY 1"), Err(Error::BadKeyword));
+        assert_eq!(command(b"RE\xc3\xa9 1"), Err(Error::BadKeyword));
+        assert_eq!(command(b" RETR 1"), Err(Error::BadKeyword));
+        assert_eq!(command(b"RETR\t1"), Err(Error::BadCharacter));
+        assert_eq!(command(b"PASS a\rb"), Err(Error::BadCharacter));
+        assert_eq!(command(b"PASS \xff"), Err(Error::BadCharacter));
+        assert_eq!(command(b"PASS \x7f"), Err(Error::BadCharacter));
         let long = [b"PASS ".as_slice(), &[b'a'; 249]].concat();
         assert!(matches!(
             command(&long),
@@ -1791,7 +1750,10 @@ mod tests {
             2 * (MAX_AUTH_LINE + 2),
         );
         contract::check_wire::<Reply>(wire);
-        assert_eq!(contract::check_refused(&Reply::ok("x").with_body(b".a\nb".to_vec())), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Reply::ok("x").with_body(b".a\nb".to_vec())),
+            Error::Unwritable
+        );
         let empty = Reply::ok("").with_body(vec![]);
         assert_eq!(empty.to_bytes().unwrap(), b"+OK\r\n.\r\n");
         assert_eq!(Reply::parse(&empty.to_bytes().unwrap()), Ok(empty));
@@ -1799,7 +1761,10 @@ mod tests {
         assert_eq!(stream.push(b"-ERR no\r\n1 2\r\n.\r\n"), 17);
         assert_eq!(stream.next(), Some(Ok(Ok(Output::Reply(Reply::err("no"))))));
         assert_eq!(stream.unread(), b"1 2\r\n.\r\n");
-        assert_eq!(contract::check_refused(&Reply::err("no").with_body(b"x".to_vec())), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Reply::err("no").with_body(b"x".to_vec())),
+            Error::Unwritable
+        );
     }
 
     #[test]
@@ -1814,11 +1779,7 @@ mod tests {
             b"+OK a\0b",
             b"+OK a\rb",
         ] {
-            assert_eq!(
-                status(line),
-                Err(Error::BadStatus),
-                "{line:?}"
-            );
+            assert_eq!(status(line), Err(Error::BadStatus), "{line:?}");
         }
         for line in [b"+OK [IN-USE".as_slice(), b"+OK [/X]", b"+OK [A B]"] {
             assert_eq!(status(line).unwrap().code, None, "{line:?}");
@@ -1997,10 +1958,13 @@ mod tests {
             ("x-ab", Some("")),
             ("NOOP", Some("a\tb")),
         ] {
-            assert_eq!(contract::check_refused(&Command {
-                keyword: keyword.into(),
-                argument: argument.map(String::from),
-            }), Error::Unwritable);
+            assert_eq!(
+                contract::check_refused(&Command {
+                    keyword: keyword.into(),
+                    argument: argument.map(String::from),
+                }),
+                Error::Unwritable
+            );
         }
         for reply in [
             Reply::ok(&format!("[x\n{}", "é".repeat(400))),
@@ -2025,10 +1989,13 @@ mod tests {
             })
         );
         assert!(command(b"\xc3\xa9AB").is_err());
-        assert_eq!(contract::check_refused(&Command {
-            keyword: "x-ab".into(),
-            argument: None,
-        }), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Command {
+                keyword: "x-ab".into(),
+                argument: None,
+            }),
+            Error::Unwritable
+        );
         assert_eq!(command(b"x-ab").unwrap().to_bytes().unwrap(), b"X-AB\r\n");
     }
 
@@ -2038,10 +2005,13 @@ mod tests {
         assert!(user.len() > 40);
         let request = Request::User(user.into());
         assert_eq!(Request::parse(&request.to_bytes().unwrap()), Ok(request));
-        assert_eq!(contract::check_refused(&Request::Apop {
-            name: user.repeat(10),
-            digest: [1; 16],
-        }), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Request::Apop {
+                name: user.repeat(10),
+                digest: [1; 16],
+            }),
+            Error::Unwritable
+        );
     }
 
     #[test]
@@ -2077,21 +2047,27 @@ mod tests {
         let mut text_reply = Reply::ok("");
         let mut requests = [Request::Pass(String::new()), Request::User(String::new())];
         // Keep buffer capacity between runs to avoid timing fresh page faults.
-        assert_linear("writers_stop_reading_input_past_their_limits", MAX_BODY / 4, |size| {
-            let body = body_reply.body.as_mut().unwrap();
-            body.clear();
-            body.resize(size * 8, b'\n');
-            assert_eq!(contract::check_refused(&body_reply), Error::Unwritable);
-            text_reply.text.clear();
-            text_reply.text.extend(std::iter::repeat_n('t', size));
-            assert_eq!(contract::check_refused(&text_reply), Error::Unwritable);
-            for request in &mut requests {
-                let (Request::Pass(text) | Request::User(text)) = request else { unreachable!() };
-                text.clear();
-                text.extend(std::iter::repeat_n('t', size));
-                assert_eq!(contract::check_refused(request), Error::Unwritable);
-            }
-        });
+        assert_linear(
+            "writers_stop_reading_input_past_their_limits",
+            MAX_BODY / 4,
+            |size| {
+                let body = body_reply.body.as_mut().unwrap();
+                body.clear();
+                body.resize(size * 8, b'\n');
+                assert_eq!(contract::check_refused(&body_reply), Error::Unwritable);
+                text_reply.text.clear();
+                text_reply.text.extend(std::iter::repeat_n('t', size));
+                assert_eq!(contract::check_refused(&text_reply), Error::Unwritable);
+                for request in &mut requests {
+                    let (Request::Pass(text) | Request::User(text)) = request else {
+                        unreachable!()
+                    };
+                    text.clear();
+                    text.extend(std::iter::repeat_n('t', size));
+                    assert_eq!(contract::check_refused(request), Error::Unwritable);
+                }
+            },
+        );
     }
 
     #[test]
@@ -2146,9 +2122,19 @@ mod tests {
     #[test]
     fn bodies_that_do_not_fit_are_refused_not_cut() {
         let line = [vec![b'b'; MAX_DATA_LINE - 2], b"\r\n".to_vec()].concat();
-        assert_eq!(contract::check_refused(&Reply::ok("1 message")
-                .with_body([vec![b'a'; MAX_DATA_LINE], b"\r\n".to_vec()].concat())), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Reply::ok("").with_body(line.repeat(MAX_BODY / line.len() + 1))), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(
+                &Reply::ok("1 message")
+                    .with_body([vec![b'a'; MAX_DATA_LINE], b"\r\n".to_vec()].concat())
+            ),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(
+                &Reply::ok("").with_body(line.repeat(MAX_BODY / line.len() + 1))
+            ),
+            Error::Unwritable
+        );
         let dotted = [b".".as_slice(), &[b'c'; MAX_DATA_LINE - 4], b"\r\n"].concat();
         let reply = Reply::ok("").with_body([line.clone(), dotted].concat());
         assert_eq!(Reply::parse(&reply.to_bytes().unwrap()), Ok(reply));
@@ -2178,7 +2164,10 @@ mod tests {
         assert_eq!(Request::from_command(&many), Err(Error::ExtraArgument));
         assert_eq!(request(b"TOP 1 2 3 "), Err(Error::ArgumentSpacing));
         assert_eq!(request(b"USER a b c d"), Err(Error::ExtraArgument));
-        assert_eq!(contract::check_refused(&Reply::err("").with_code(&"A".repeat(rounds(16 << 20)))), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Reply::err("").with_code(&"A".repeat(rounds(16 << 20)))),
+            Error::Unwritable
+        );
         let reply = Reply::ok("").with_body(b"a\nb\r\nc".to_vec());
         let mut lines = reply.lines();
         assert_eq!(lines.next(), Some(b"a".as_slice()));
@@ -2188,7 +2177,10 @@ mod tests {
 
     #[test]
     fn credentials_are_written_unchanged() {
-        assert_eq!(contract::check_refused(&Request::Pass("p".repeat(249))), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Request::Pass("p".repeat(249))),
+            Error::Unwritable
+        );
         for request in [
             Request::Pass("p".repeat(248)),
             Request::Pass("open sesame ".into()),
@@ -2222,7 +2214,10 @@ mod tests {
             "a b".into(),
             "aé".into(),
         ] {
-            assert_eq!(contract::check_refused(&UniqueIdListing { message: n(1), id }), Error::Unwritable);
+            assert_eq!(
+                contract::check_refused(&UniqueIdListing { message: n(1), id }),
+                Error::Unwritable
+            );
         }
         let value = UniqueIdListing {
             message: n(1),
@@ -2240,9 +2235,17 @@ mod tests {
         let reply = Reply::parse(&wire).unwrap();
         assert_eq!(reply.text.len(), 499);
         assert_eq!(reply.to_bytes().unwrap(), wire);
-        assert_eq!(contract::check_refused(&Reply::err(&format!(" {}", "y".repeat(498))).with_code("AUTH")), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(
+                &Reply::err(&format!(" {}", "y".repeat(498))).with_code("AUTH")
+            ),
+            Error::Unwritable
+        );
         for text in [" more", "more", "é"] {
-            assert_eq!(contract::check_refused(&Reply::ok(text).with_code(&"A".repeat(MAX_CODE - 1))), Error::Unwritable);
+            assert_eq!(
+                contract::check_refused(&Reply::ok(text).with_code(&"A".repeat(MAX_CODE - 1))),
+                Error::Unwritable
+            );
         }
         for reply in [
             Reply::ok("a\nb"),

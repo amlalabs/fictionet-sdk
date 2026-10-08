@@ -16,11 +16,18 @@ fuzz_target!(|data: &[u8]| {
     let packet = Packet(data.to_vec());
     // The address the packet is for, so the reply path runs too.
     let to: Option<IpAddr> = match data.first().map(|b| b >> 4) {
-        Some(4) if data.len() >= 20 => Some(Ipv4Addr::new(data[16], data[17], data[18], data[19]).into()),
-        Some(6) if data.len() >= 40 => Some(Ipv6Addr::from(<[u8; 16]>::try_from(&data[24..40]).unwrap()).into()),
+        Some(4) if data.len() >= 20 => {
+            Some(Ipv4Addr::new(data[16], data[17], data[18], data[19]).into())
+        }
+        Some(6) if data.len() >= 40 => {
+            Some(Ipv6Addr::from(<[u8; 16]>::try_from(&data[24..40]).unwrap()).into())
+        }
         _ => None,
     };
-    for addr in to.into_iter().chain([IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), IpAddr::V6(Ipv6Addr::LOCALHOST)]) {
+    for addr in to.into_iter().chain([
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ]) {
         if let Some(reply) = icmp::echo_reply(&packet, addr) {
             // A reply is the same size as the request's ICMP message plus a
             // fresh header, and is never itself a request.

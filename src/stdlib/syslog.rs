@@ -228,7 +228,10 @@ impl Facility {
 
     /// The facility called `name`, ignoring case.
     pub fn from_name(name: &str) -> Option<Facility> {
-        FACILITIES.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map(|&(f, _)| f)
+        FACILITIES
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(name))
+            .map(|&(f, _)| f)
     }
 }
 
@@ -290,11 +293,18 @@ impl Severity {
     /// The severity called `name`, ignoring case. The older spellings
     /// `panic`, `error` and `warn` are read too.
     pub fn from_name(name: &str) -> Option<Severity> {
-        let alias = [("panic", Severity::Emergency), ("error", Severity::Error), ("warn", Severity::Warning)];
+        let alias = [
+            ("panic", Severity::Emergency),
+            ("error", Severity::Error),
+            ("warn", Severity::Warning),
+        ];
         if let Some(&(_, s)) = alias.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
             return Some(s);
         }
-        SEVERITIES.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map(|&(s, _)| s)
+        SEVERITIES
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(name))
+            .map(|&(s, _)| s)
     }
 }
 
@@ -327,7 +337,10 @@ impl Priority {
 
     /// The priority with value `v`, if `v` is at most [`MAX_PRIVAL`].
     pub fn from_value(v: u8) -> Option<Priority> {
-        Some(Priority { facility: Facility::from_code(v / 8)?, severity: Severity::from_code(v % 8)? })
+        Some(Priority {
+            facility: Facility::from_code(v / 8)?,
+            severity: Severity::from_code(v % 8)?,
+        })
     }
 }
 
@@ -413,11 +426,18 @@ impl Timestamp {
         let mut i = 19;
         let mut fraction = None;
         if t.get(i) == Some(&b'.') {
-            let digits = t.get(i + 1..)?.iter().take_while(|b| b.is_ascii_digit()).count();
+            let digits = t
+                .get(i + 1..)?
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
             if digits == 0 || digits > 6 {
                 return None;
             }
-            fraction = Some(Fraction { value: num(t, i + 1, digits)?, digits: digits as u8 });
+            fraction = Some(Fraction {
+                value: num(t, i + 1, digits)?,
+                digits: digits as u8,
+            });
             i += 1 + digits;
         }
         let offset = match t.get(i)? {
@@ -451,7 +471,16 @@ impl Timestamp {
         if hour > 23 || minute > 59 || second > 59 {
             return None;
         }
-        Some(Timestamp { year, month, day, hour, minute, second, fraction, offset })
+        Some(Timestamp {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            fraction,
+            offset,
+        })
     }
 }
 
@@ -487,7 +516,11 @@ impl Wire for Timestamp {
             if !(1..=6).contains(&fr.digits) || fr.value >= 10u32.pow(u32::from(fr.digits)) {
                 return Err(Error::Unwritable);
             }
-            text.push_str(&format!(".{:0width$}", fr.value, width = usize::from(fr.digits)));
+            text.push_str(&format!(
+                ".{:0width$}",
+                fr.value,
+                width = usize::from(fr.digits)
+            ));
         }
         match self.offset {
             Offset::Utc => text.push('Z'),
@@ -536,18 +569,27 @@ pub struct SdElement {
 impl SdElement {
     /// An element with this ID and no parameters.
     pub fn new(id: impl Into<String>) -> SdElement {
-        SdElement { id: id.into(), params: Vec::new() }
+        SdElement {
+            id: id.into(),
+            params: Vec::new(),
+        }
     }
 
     /// The element with one more parameter.
     pub fn param(mut self, name: impl Into<String>, value: impl Into<String>) -> SdElement {
-        self.params.push(SdParam { name: name.into(), value: value.into() });
+        self.params.push(SdParam {
+            name: name.into(),
+            value: value.into(),
+        });
         self
     }
 
     /// The value of the first parameter called `name`.
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.params.iter().find(|p| p.name == name).map(|p| p.value.as_str())
+        self.params
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.value.as_str())
     }
 }
 
@@ -639,7 +681,10 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::TooLong(n) => write!(f, "message of {n} bytes, over the limit of {MAX_MESSAGE_LEN}"),
+            Error::TooLong(n) => write!(
+                f,
+                "message of {n} bytes, over the limit of {MAX_MESSAGE_LEN}"
+            ),
             Error::Priority => f.write_str("missing or malformed priority"),
             Error::Version => f.write_str("malformed version"),
             Error::Truncated => f.write_str("message ends inside its header"),
@@ -653,7 +698,9 @@ impl std::fmt::Display for Error {
             Error::Utf8 => f.write_str("text marked as UTF-8 is not UTF-8"),
             Error::Length(c) => write!(f, "octet count followed by byte {c:#04x}, not a space"),
             Error::CountTooLarge => f.write_str("octet count too large"),
-            Error::Incomplete { remaining } => write!(f, "syslog message needs {remaining} more bytes"),
+            Error::Incomplete { remaining } => {
+                write!(f, "syslog message needs {remaining} more bytes")
+            }
             Error::Trailing => f.write_str("bytes after the syslog frame"),
             Error::FrameTooLong => f.write_str("syslog frame exceeds its wire limit"),
             Error::Unwritable => f.write_str("syslog value cannot be written without changing it"),
@@ -702,7 +749,11 @@ impl Wire for Message {
             return Err(Error::TooLong(b.len()));
         }
         let (priority, mut pos) = parse_pri(b).ok_or(Error::Priority)?;
-        let digits = b[pos..].iter().take(4).take_while(|c| c.is_ascii_digit()).count();
+        let digits = b[pos..]
+            .iter()
+            .take(4)
+            .take_while(|c| c.is_ascii_digit())
+            .count();
         if digits == 0 || digits > 3 || b[pos] == b'0' {
             return Err(Error::Version);
         }
@@ -711,7 +762,11 @@ impl Wire for Message {
         space(b, &mut pos, Error::Version)?;
 
         let t = token(b, &mut pos);
-        let timestamp = if t == b"-" { None } else { Some(Timestamp::parse(t)?) };
+        let timestamp = if t == b"-" {
+            None
+        } else {
+            Some(Timestamp::parse(t)?)
+        };
         space(b, &mut pos, Error::Timestamp)?;
         let hostname = header_field(token(b, &mut pos), MAX_HOSTNAME, Error::Hostname)?;
         space(b, &mut pos, Error::Hostname)?;
@@ -737,7 +792,18 @@ impl Wire for Message {
             }
             Some(_) => return Err(Error::StructuredData),
         };
-        Ok(Message { priority, version, timestamp, hostname, app_name, proc_id, msg_id, structured_data, bom, msg })
+        Ok(Message {
+            priority,
+            version,
+            timestamp,
+            hostname,
+            app_name,
+            proc_id,
+            msg_id,
+            structured_data,
+            bom,
+            msg,
+        })
     }
 
     /// Appends an RFC 5424 message. Refuses invalid headers, timestamps,
@@ -765,7 +831,9 @@ impl Wire for Message {
         ] {
             bytes.push(b' ');
             match field {
-                Some(s) if valid_field(s, max, b"") && s != "-" => bytes.extend_from_slice(s.as_bytes()),
+                Some(s) if valid_field(s, max, b"") && s != "-" => {
+                    bytes.extend_from_slice(s.as_bytes())
+                }
                 Some(_) => return Err(Error::Unwritable),
                 None => bytes.push(b'-'),
             }
@@ -813,8 +881,9 @@ pub struct BsdTimestamp {
     pub second: u8,
 }
 
-const MONTHS: [&[u8; 3]; 12] =
-    [b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec"];
+const MONTHS: [&[u8; 3]; 12] = [
+    b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec",
+];
 
 /// How many bytes an RFC 3164 timestamp takes.
 pub const BSD_TIMESTAMP_LEN: usize = 15;
@@ -840,7 +909,13 @@ impl BsdTimestamp {
         if day == 0 || day > days_in_month(2000, month) || hour > 23 || minute > 59 || second > 59 {
             return None;
         }
-        Some(BsdTimestamp { month, day, hour, minute, second })
+        Some(BsdTimestamp {
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        })
     }
 }
 
@@ -871,7 +946,11 @@ impl Wire for BsdTimestamp {
         }
         out.extend_from_slice(MONTHS[usize::from(self.month - 1)]);
         out.extend_from_slice(
-            format!(" {:>2} {:02}:{:02}:{:02}", self.day, self.hour, self.minute, self.second).as_bytes(),
+            format!(
+                " {:>2} {:02}:{:02}:{:02}",
+                self.day, self.hour, self.minute, self.second
+            )
+            .as_bytes(),
         );
         Ok(())
     }
@@ -916,7 +995,13 @@ pub struct BsdMessage {
 impl BsdMessage {
     /// A message with this priority and content, and no header or tag.
     pub fn new(priority: Priority, content: impl Into<Vec<u8>>) -> BsdMessage {
-        BsdMessage { priority, header: None, tag: None, pid: None, content: content.into() }
+        BsdMessage {
+            priority,
+            header: None,
+            tag: None,
+            pid: None,
+            content: content.into(),
+        }
     }
 
     /// The content, with bytes that are not UTF-8 replaced.
@@ -947,7 +1032,10 @@ impl Wire for BsdMessage {
             let host = &after[..host_len];
             if !host.is_empty() && host.len() <= MAX_HOSTNAME && host.iter().all(|&c| is_print(c)) {
                 let hostname = String::from_utf8_lossy(host).into_owned();
-                header = Some(BsdHeader { timestamp, hostname });
+                header = Some(BsdHeader {
+                    timestamp,
+                    hostname,
+                });
                 rest = after.get(host_len + 1..).unwrap_or(&[]);
             }
         }
@@ -955,7 +1043,13 @@ impl Wire for BsdMessage {
             Some((tag, pid, content)) => (Some(tag), pid, content),
             None => (None, None, rest),
         };
-        Ok(BsdMessage { priority, header, tag, pid, content: content.to_vec() })
+        Ok(BsdMessage {
+            priority,
+            header,
+            tag,
+            pid,
+            content: content.to_vec(),
+        })
     }
 
     /// Appends a BSD message. Refuses invalid headers, tags, process IDs,
@@ -1042,7 +1136,11 @@ impl Wire for Entry {
         }
         let (_, pos) = parse_pri(b).ok_or(Error::Priority)?;
         let rest = &b[pos..];
-        let digits = rest.iter().take(4).take_while(|c| c.is_ascii_digit()).count();
+        let digits = rest
+            .iter()
+            .take(4)
+            .take_while(|c| c.is_ascii_digit())
+            .count();
         if (1..=3).contains(&digits)
             && rest[0] != b'0'
             && rest.get(digits) == Some(&b' ')
@@ -1095,7 +1193,11 @@ pub struct Frame {
 impl Frame {
     /// A frame holding `message`, whole.
     pub fn new(framing: Framing, message: Vec<u8>) -> Frame {
-        Frame { framing, message, truncated: false }
+        Frame {
+            framing,
+            message,
+            truncated: false,
+        }
     }
 }
 
@@ -1152,7 +1254,9 @@ impl Frames {
         let mut length = 0usize;
         let mut at = 0usize;
         loop {
-            let Some(&byte) = input.get(at) else { return Ok(Step::Need) };
+            let Some(&byte) = input.get(at) else {
+                return Ok(Step::Need);
+            };
             if byte == b' ' {
                 break;
             }
@@ -1168,13 +1272,19 @@ impl Frames {
         let start = at.checked_add(1).ok_or(Error::CountTooLarge)?;
         let keep = length.min(MAX_MESSAGE_LEN);
         let used = start.checked_add(keep).ok_or(Error::CountTooLarge)?;
-        let Some(message) = input.get(start..used) else { return Ok(Step::Need) };
+        let Some(message) = input.get(start..used) else {
+            return Ok(Step::Need);
+        };
         if length > keep {
             self.skip = Skip::Bytes(length - keep);
         }
         self.scanned = 0;
         Ok(Step::Item(
-            Frame { framing: Framing::OctetCounting, message: message.to_vec(), truncated: length > keep },
+            Frame {
+                framing: Framing::OctetCounting,
+                message: message.to_vec(),
+                truncated: length > keep,
+            },
             used,
         ))
     }
@@ -1183,8 +1293,11 @@ impl Frames {
         let suffix = input.get(self.scanned..).unwrap_or_default();
         if let Some(n) = suffix.iter().position(|&byte| byte == b'\n') {
             let at = self.scanned.saturating_add(n);
-            let end =
-                if at.checked_sub(1).and_then(|i| input.get(i)) == Some(&b'\r') { at.saturating_sub(1) } else { at };
+            let end = if at.checked_sub(1).and_then(|i| input.get(i)) == Some(&b'\r') {
+                at.saturating_sub(1)
+            } else {
+                at
+            };
             let keep = end.min(MAX_MESSAGE_LEN);
             self.scanned = 0;
             let used = at.saturating_add(1);
@@ -1234,10 +1347,18 @@ impl Decode for Frames {
         match self.skip {
             Skip::Bytes(remaining) => {
                 if input.is_empty() {
-                    return if eof { Err(Error::Incomplete { remaining }) } else { Ok(Step::Need) };
+                    return if eof {
+                        Err(Error::Incomplete { remaining })
+                    } else {
+                        Ok(Step::Need)
+                    };
                 }
                 let used = remaining.min(input.len());
-                self.skip = if used == remaining { Skip::Nothing } else { Skip::Bytes(remaining - used) };
+                self.skip = if used == remaining {
+                    Skip::Nothing
+                } else {
+                    Skip::Bytes(remaining - used)
+                };
                 return Ok(Step::Skip(used));
             }
             Skip::Line => {
@@ -1255,7 +1376,9 @@ impl Decode for Frames {
             }
             Skip::Nothing => {}
         }
-        let Some(&first) = input.first() else { return Ok(Step::Need) };
+        let Some(&first) = input.first() else {
+            return Ok(Step::Need);
+        };
         if matches!(first, b'1'..=b'9') {
             self.octet_counted(input)
         } else {
@@ -1289,7 +1412,8 @@ impl Wire for Frame {
         if self.truncated
             || msg.is_empty()
             || msg.len() > MAX_MESSAGE_LEN
-            || (self.framing == Framing::NonTransparent && (matches!(msg[0], b'1'..=b'9') || msg.contains(&b'\n')))
+            || (self.framing == Framing::NonTransparent
+                && (matches!(msg[0], b'1'..=b'9') || msg.contains(&b'\n')))
         {
             return Err(Error::Unwritable);
         }
@@ -1314,8 +1438,13 @@ fn parse_pri(b: &[u8]) -> Option<(Priority, usize)> {
     if b.first() != Some(&b'<') {
         return None;
     }
-    let digits = b[1..].iter().take(4).take_while(|c| c.is_ascii_digit()).count();
-    if digits == 0 || digits > 3 || (digits > 1 && b[1] == b'0') || b.get(1 + digits) != Some(&b'>') {
+    let digits = b[1..]
+        .iter()
+        .take(4)
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    if digits == 0 || digits > 3 || (digits > 1 && b[1] == b'0') || b.get(1 + digits) != Some(&b'>')
+    {
         return None;
     }
     let v = num(b, 1, digits)?;
@@ -1400,7 +1529,11 @@ fn write_sd_element(out: &mut Vec<u8>, id: &str, params: &[SdParam]) -> Result<(
 }
 
 fn append(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
-    if out.len().checked_add(bytes.len()).is_none_or(|n| n > MAX_MESSAGE_LEN) {
+    if out
+        .len()
+        .checked_add(bytes.len())
+        .is_none_or(|n| n > MAX_MESSAGE_LEN)
+    {
         return Err(Error::Unwritable);
     }
     out.extend_from_slice(bytes);
@@ -1492,7 +1625,11 @@ fn parse_sd(b: &[u8], pos: &mut usize) -> Result<Vec<SdElement>, Error> {
 /// than `=`, space, `]` and `"`.
 fn sd_name_at(b: &[u8], pos: &mut usize) -> Result<String, Error> {
     let rest = b.get(*pos..).unwrap_or(&[]);
-    let n = rest.iter().take(MAX_SD_NAME + 1).take_while(|&&c| is_sd_name(c)).count();
+    let n = rest
+        .iter()
+        .take(MAX_SD_NAME + 1)
+        .take_while(|&&c| is_sd_name(c))
+        .count();
     if n == 0 || n > MAX_SD_NAME {
         return Err(Error::StructuredData);
     }
@@ -1509,8 +1646,13 @@ fn is_sd_name(c: u8) -> bool {
 /// holds no at-sign and the number is decimal, its parts split by periods,
 /// such as `32473` or `32473.1.2`.
 fn is_sd_id(id: &str) -> bool {
-    let Some((name, pen)) = id.split_once('@') else { return true };
-    !name.is_empty() && pen.split('.').all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+    let Some((name, pen)) = id.split_once('@') else {
+        return true;
+    };
+    !name.is_empty()
+        && pen
+            .split('.')
+            .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
 }
 
 fn is_print(c: u8) -> bool {
@@ -1520,7 +1662,11 @@ fn is_print(c: u8) -> bool {
 /// The tag, process ID and content of an RFC 3164 message part, if it
 /// starts with a tag.
 fn split_tag(m: &[u8]) -> Option<(String, Option<String>, &[u8])> {
-    let n = m.iter().take(MAX_TAG + 1).take_while(|&&c| is_print(c) && !matches!(c, b'[' | b']' | b':')).count();
+    let n = m
+        .iter()
+        .take(MAX_TAG + 1)
+        .take_while(|&&c| is_print(c) && !matches!(c, b'[' | b']' | b':'))
+        .count();
     if n == 0 || n > MAX_TAG {
         return None;
     }
@@ -1529,7 +1675,11 @@ fn split_tag(m: &[u8]) -> Option<(String, Option<String>, &[u8])> {
     let mut pid = None;
     if m.get(i) == Some(&b'[') {
         let rest = &m[i + 1..];
-        let p = rest.iter().take(MAX_PID + 1).take_while(|&&c| is_print(c) && c != b']').count();
+        let p = rest
+            .iter()
+            .take(MAX_PID + 1)
+            .take_while(|&&c| is_print(c) && c != b']')
+            .count();
         if p == 0 || p > MAX_PID || rest.get(p) != Some(&b']') {
             return None;
         }
@@ -1562,12 +1712,10 @@ fn expect(t: &[u8], i: usize, c: u8) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, pump,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// The four examples of RFC 5424 section 6.5, with the BOM bytes in
@@ -1591,12 +1739,24 @@ mod tests {
     #[test]
     fn rfc5424_example_1() {
         let m = Message::parse(EX1).unwrap();
-        assert_eq!(m.priority, Priority::new(Facility::Auth, Severity::Critical));
+        assert_eq!(
+            m.priority,
+            Priority::new(Facility::Auth, Severity::Critical)
+        );
         assert_eq!(m.priority.to_string(), "auth.crit");
         assert_eq!(m.version, 1);
         let t = m.timestamp.unwrap();
-        assert_eq!((t.year, t.month, t.day, t.hour, t.minute, t.second), (2003, 10, 11, 22, 14, 15));
-        assert_eq!(t.fraction, Some(Fraction { value: 3, digits: 3 }));
+        assert_eq!(
+            (t.year, t.month, t.day, t.hour, t.minute, t.second),
+            (2003, 10, 11, 22, 14, 15)
+        );
+        assert_eq!(
+            t.fraction,
+            Some(Fraction {
+                value: 3,
+                digits: 3
+            })
+        );
         assert_eq!(t.fraction.unwrap().micros(), 3000);
         assert_eq!(t.offset, Offset::Utc);
         assert_eq!(m.hostname.as_deref(), Some("mymachine.example.com"));
@@ -1612,9 +1772,18 @@ mod tests {
     #[test]
     fn rfc5424_example_2() {
         let m = Message::parse(EX2).unwrap();
-        assert_eq!(m.priority, Priority::new(Facility::Local4, Severity::Notice));
+        assert_eq!(
+            m.priority,
+            Priority::new(Facility::Local4, Severity::Notice)
+        );
         let t = m.timestamp.unwrap();
-        assert_eq!(t.fraction, Some(Fraction { value: 3, digits: 6 }));
+        assert_eq!(
+            t.fraction,
+            Some(Fraction {
+                value: 3,
+                digits: 6
+            })
+        );
         assert_eq!(t.offset, Offset::Minutes(-7 * 60));
         assert_eq!(m.hostname.as_deref(), Some("192.0.2.1"));
         assert_eq!(m.proc_id.as_deref(), Some("8710"));
@@ -1637,7 +1806,10 @@ mod tests {
 
         let m = Message::parse(EX4).unwrap();
         assert_eq!(m.structured_data.len(), 2);
-        assert_eq!(m.element("examplePriority@32473").unwrap().get("class"), Some("high"));
+        assert_eq!(
+            m.element("examplePriority@32473").unwrap().get("class"),
+            Some("high")
+        );
         assert!(m.msg.is_empty() && !m.bom);
         assert_eq!(m.to_bytes().unwrap(), EX4);
     }
@@ -1674,7 +1846,11 @@ mod tests {
             "2003-10-11T22:14:15ZZ",
             "2003-10-11 22:14:15Z",
         ] {
-            assert_eq!(Timestamp::parse(bad.as_bytes()), Err(Error::Timestamp), "{bad}");
+            assert_eq!(
+                Timestamp::parse(bad.as_bytes()),
+                Err(Error::Timestamp),
+                "{bad}"
+            );
         }
         // -00:00 is UTC with the local offset not known (RFC 3339 section
         // 4.3), which +00:00 is not, so the two stay apart.
@@ -1689,11 +1865,25 @@ mod tests {
     #[test]
     fn rfc3164_examples() {
         // RFC 3164 section 5.4.
-        let m =
-            BsdMessage::parse(b"<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8").unwrap();
-        assert_eq!(m.priority, Priority::new(Facility::Auth, Severity::Critical));
+        let m = BsdMessage::parse(
+            b"<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8",
+        )
+        .unwrap();
+        assert_eq!(
+            m.priority,
+            Priority::new(Facility::Auth, Severity::Critical)
+        );
         let h = m.header.as_ref().unwrap();
-        assert_eq!(h.timestamp, BsdTimestamp { month: 10, day: 11, hour: 22, minute: 14, second: 15 });
+        assert_eq!(
+            h.timestamp,
+            BsdTimestamp {
+                month: 10,
+                day: 11,
+                hour: 22,
+                minute: 14,
+                second: 15
+            }
+        );
         assert_eq!(h.hostname, "mymachine");
         assert_eq!(m.tag.as_deref(), Some("su"));
         assert_eq!(m.pid, None);
@@ -1711,14 +1901,19 @@ mod tests {
         assert_eq!(m.content, b"Use the BFG!");
         assert_eq!(m.to_bytes().unwrap(), raw);
 
-        let m = BsdMessage::parse(b"<165>Aug 24 05:34:00 CST 1987 mymachine myproc[10]: %% It's time").unwrap();
+        let m =
+            BsdMessage::parse(b"<165>Aug 24 05:34:00 CST 1987 mymachine myproc[10]: %% It's time")
+                .unwrap();
         assert_eq!(m.priority.facility, Facility::Local4);
         assert_eq!(m.header.as_ref().unwrap().hostname, "CST");
         assert_eq!(m.content, b"1987 mymachine myproc[10]: %% It's time");
 
         let raw = b"<0>1990 Oct 22 10:52:01 TZ-6 scapegoat.dmz.example.org 10.1.2.3 sched[0]: That's All Folks!";
         let m = BsdMessage::parse(raw).unwrap();
-        assert_eq!(m.priority, Priority::new(Facility::Kern, Severity::Emergency));
+        assert_eq!(
+            m.priority,
+            Priority::new(Facility::Kern, Severity::Emergency)
+        );
         assert_eq!(m.header, None);
         assert_eq!(m.content, &raw[3..]);
         assert_eq!(Entry::parse(raw), Ok(Entry::Bsd(m)));
@@ -1727,9 +1922,15 @@ mod tests {
     #[test]
     fn rfc3164_tags() {
         let m = BsdMessage::parse(b"<13>Oct  5 01:02:03 gw sshd[42]: hello").unwrap();
-        assert_eq!((m.tag.as_deref(), m.pid.as_deref()), (Some("sshd"), Some("42")));
+        assert_eq!(
+            (m.tag.as_deref(), m.pid.as_deref()),
+            (Some("sshd"), Some("42"))
+        );
         assert_eq!(m.content, b"hello");
-        assert_eq!(m.to_bytes().unwrap(), b"<13>Oct  5 01:02:03 gw sshd[42]: hello");
+        assert_eq!(
+            m.to_bytes().unwrap(),
+            b"<13>Oct  5 01:02:03 gw sshd[42]: hello"
+        );
         // No space after the colon, and no content.
         let m = BsdMessage::parse(b"<13>app:x").unwrap();
         assert_eq!((m.tag.as_deref(), &m.content[..]), (Some("app"), &b"x"[..]));
@@ -1737,7 +1938,12 @@ mod tests {
         assert_eq!((m.tag.as_deref(), &m.content[..]), (Some("app"), &b""[..]));
         assert_eq!(m.to_bytes().unwrap(), b"<13>app:");
         // Not tags: an unclosed bracket, an empty process ID, a tag too long.
-        for raw in [&b"<13>app[12: x"[..], b"<13>app[]: x", b"<13>abcdefghijklmnopqrstuvwxyz0123456: x", b"<13>:x"] {
+        for raw in [
+            &b"<13>app[12: x"[..],
+            b"<13>app[]: x",
+            b"<13>abcdefghijklmnopqrstuvwxyz0123456: x",
+            b"<13>:x",
+        ] {
             let m = BsdMessage::parse(raw).unwrap();
             assert_eq!(m.tag, None);
             assert_eq!(m.content, &raw[4..]);
@@ -1752,11 +1958,23 @@ mod tests {
         let m = BsdMessage::parse(b"<13>Oct  5 01:02:03  x").unwrap();
         assert_eq!(m.header, None);
         // Bad dates are not timestamps.
-        assert_eq!(BsdTimestamp::parse(b"Feb 30 01:02:03"), Err(Error::Timestamp));
+        assert_eq!(
+            BsdTimestamp::parse(b"Feb 30 01:02:03"),
+            Err(Error::Timestamp)
+        );
         assert_eq!(BsdTimestamp::parse(b"Feb 29 01:02:03").unwrap().day, 29);
-        assert_eq!(BsdTimestamp::parse(b"Oct  0 01:02:03"), Err(Error::Timestamp));
-        assert_eq!(BsdTimestamp::parse(b"oct  1 01:02:03"), Err(Error::Timestamp));
-        assert_eq!(BsdTimestamp::parse(b"Oct  1 24:02:03"), Err(Error::Timestamp));
+        assert_eq!(
+            BsdTimestamp::parse(b"Oct  0 01:02:03"),
+            Err(Error::Timestamp)
+        );
+        assert_eq!(
+            BsdTimestamp::parse(b"oct  1 01:02:03"),
+            Err(Error::Timestamp)
+        );
+        assert_eq!(
+            BsdTimestamp::parse(b"Oct  1 24:02:03"),
+            Err(Error::Timestamp)
+        );
     }
 
     #[test]
@@ -1782,11 +2000,24 @@ mod tests {
         assert_eq!(Severity::from_name("WARN"), Some(Severity::Warning));
         assert_eq!(Facility::from_name("LOCAL7"), Some(Facility::Local7));
         assert_eq!(Facility::from_name("nope"), None);
-        assert_eq!(Priority::from_value(165).unwrap().to_string(), "local4.notice");
+        assert_eq!(
+            Priority::from_value(165).unwrap().to_string(),
+            "local4.notice"
+        );
         // PRI forms.
         assert!(parse_pri(b"<0>").is_some());
         assert!(parse_pri(b"<191>").is_some());
-        for bad in [&b"<192>"[..], b"<00>", b"<01>", b"<1000>", b"<>", b"<1", b"1>", b"<a>", b""] {
+        for bad in [
+            &b"<192>"[..],
+            b"<00>",
+            b"<01>",
+            b"<1000>",
+            b"<>",
+            b"<1",
+            b"1>",
+            b"<a>",
+            b"",
+        ] {
             assert_eq!(parse_pri(bad), None, "{:?}", String::from_utf8_lossy(bad));
         }
     }
@@ -1807,9 +2038,15 @@ mod tests {
             (b"<34>1 - h\x01 - - - -", Error::Hostname),
             (b"<34>1 -  - - - -", Error::Hostname),
             (b"<34>1 - - \xc3\xa9 - - -", Error::AppName),
-            (b"<34>1 - - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa - - -", Error::AppName),
+            (
+                b"<34>1 - - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa - - -",
+                Error::AppName,
+            ),
             (b"<34>1 - - - p\x7f - -", Error::ProcId),
-            (b"<34>1 - - - - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -", Error::MsgId),
+            (
+                b"<34>1 - - - - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -",
+                Error::MsgId,
+            ),
             (b"<34>1 - - - - - x", Error::StructuredData),
             (b"<34>1 - - - - - -x", Error::StructuredData),
             (b"<34>1 - - - - - [a", Error::StructuredData),
@@ -1821,18 +2058,35 @@ mod tests {
             (b"<34>1 - - - - - [a b=\"\xff\"]", Error::StructuredData),
             (b"<34>1 - - - - - [a  b=\"c\"]", Error::StructuredData),
             (b"<34>1 - - - - - [a][b]x", Error::StructuredData),
-            (b"<34>1 - - - - - [aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]", Error::StructuredData),
+            (
+                b"<34>1 - - - - - [aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]",
+                Error::StructuredData,
+            ),
             (b"<34>1 - - - - - [a][a]", Error::DuplicateSdId),
             (b"<34>1 - - - - - - \xef\xbb\xbf\xff", Error::Utf8),
         ];
         for (raw, want) in cases {
-            assert_eq!(Message::parse(raw), Err(*want), "{:?}", String::from_utf8_lossy(raw));
+            assert_eq!(
+                Message::parse(raw),
+                Err(*want),
+                "{:?}",
+                String::from_utf8_lossy(raw)
+            );
             assert!(!want.to_string().is_empty());
         }
         let long = vec![b'<'; MAX_MESSAGE_LEN + 1];
-        assert_eq!(Message::parse(&long), Err(Error::TooLong(MAX_MESSAGE_LEN + 1)));
-        assert_eq!(BsdMessage::parse(&long), Err(Error::TooLong(MAX_MESSAGE_LEN + 1)));
-        assert_eq!(Entry::parse(&long), Err(Error::TooLong(MAX_MESSAGE_LEN + 1)));
+        assert_eq!(
+            Message::parse(&long),
+            Err(Error::TooLong(MAX_MESSAGE_LEN + 1))
+        );
+        assert_eq!(
+            BsdMessage::parse(&long),
+            Err(Error::TooLong(MAX_MESSAGE_LEN + 1))
+        );
+        assert_eq!(
+            Entry::parse(&long),
+            Err(Error::TooLong(MAX_MESSAGE_LEN + 1))
+        );
         assert_eq!(BsdMessage::parse(b"no priority"), Err(Error::Priority));
         assert_eq!(Entry::parse(b""), Err(Error::Priority));
         // Too many elements and parameters.
@@ -1864,13 +2118,23 @@ mod tests {
         // The invalid escape `\n` is kept as it was (RFC 5424 section
         // 6.3.3). A backslash before an ordinary character reads the same
         // escaped or not, and is written as it.
-        assert_eq!(again, br#"<34>1 - - - - - [x@1 a="q\"b\s\]e" b="\n" c="" a="2"]"#);
+        assert_eq!(
+            again,
+            br#"<34>1 - - - - - [x@1 a="q\"b\s\]e" b="\n" c="" a="2"]"#
+        );
         // A backslash before a character that must be escaped, or at the
         // end, is escaped itself.
         let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
-        m.structured_data.push(SdElement::new("x").param("a", r#"\"\\\]\"#).param("b", r"C:\path"));
+        m.structured_data.push(
+            SdElement::new("x")
+                .param("a", r#"\"\\\]\"#)
+                .param("b", r"C:\path"),
+        );
         let bytes = m.to_bytes().unwrap();
-        assert_eq!(bytes, br#"<13>1 - - - - - [x a="\\\"\\\\\\\]\\" b="C:\path"]"#);
+        assert_eq!(
+            bytes,
+            br#"<13>1 - - - - - [x a="\\\"\\\\\\\]\\" b="C:\path"]"#
+        );
         assert_eq!(Message::parse(&bytes).unwrap(), m);
         // A trailing space means an empty text.
         let m = Message::parse(b"<34>1 - - - - - - ").unwrap();
@@ -1885,12 +2149,17 @@ mod tests {
     #[test]
     fn entry_picks_the_format() {
         assert!(matches!(Entry::parse(EX1), Ok(Entry::Rfc5424(_))));
-        assert!(matches!(Entry::parse(b"<13>Oct  5 01:02:03 gw x"), Ok(Entry::Bsd(_))));
+        assert!(matches!(
+            Entry::parse(b"<13>Oct  5 01:02:03 gw x"),
+            Ok(Entry::Bsd(_))
+        ));
         assert!(matches!(Entry::parse(b"<13>0 x"), Ok(Entry::Bsd(_))));
         assert!(matches!(Entry::parse(b"<13>1234 x"), Ok(Entry::Bsd(_))));
         // Bytes that start like RFC 5424 but do not read as it are BSD.
         assert_eq!(Message::parse(b"<13>12 x"), Err(Error::Timestamp));
-        let Ok(Entry::Bsd(m)) = Entry::parse(b"<13>12 x") else { panic!("not BSD") };
+        let Ok(Entry::Bsd(m)) = Entry::parse(b"<13>12 x") else {
+            panic!("not BSD")
+        };
         assert_eq!(m.content, b"12 x");
         let e = Entry::parse(EX2).unwrap();
         assert_eq!(e.priority().value(), 165);
@@ -1902,14 +2171,34 @@ mod tests {
         let base = Message::new(Priority::new(Facility::Kern, Severity::Debug));
         let mut values = Vec::new();
         for version in [0, MAX_VERSION + 1] {
-            values.push(Message { version, ..base.clone() });
+            values.push(Message {
+                version,
+                ..base.clone()
+            });
         }
-        for hostname in ["host name\n".into(), "x".repeat(MAX_HOSTNAME + 1), String::new(), "-".into()] {
-            values.push(Message { hostname: Some(hostname), ..base.clone() });
+        for hostname in [
+            "host name\n".into(),
+            "x".repeat(MAX_HOSTNAME + 1),
+            String::new(),
+            "-".into(),
+        ] {
+            values.push(Message {
+                hostname: Some(hostname),
+                ..base.clone()
+            });
         }
-        values.push(Message { app_name: Some("é".repeat(100)), ..base.clone() });
-        values.push(Message { proc_id: Some(String::new()), ..base.clone() });
-        values.push(Message { msg_id: Some("-".into()), ..base.clone() });
+        values.push(Message {
+            app_name: Some("é".repeat(100)),
+            ..base.clone()
+        });
+        values.push(Message {
+            proc_id: Some(String::new()),
+            ..base.clone()
+        });
+        values.push(Message {
+            msg_id: Some("-".into()),
+            ..base.clone()
+        });
         for structured_data in [
             vec![SdElement::new("a=b")],
             vec![SdElement::new("a").param("x y", "v")],
@@ -1919,14 +2208,34 @@ mod tests {
             (0..400).map(|i| SdElement::new(format!("e{i}"))).collect(),
             vec![SdElement {
                 id: "x".into(),
-                params: vec![SdParam { name: "v".into(), value: "x".into() }; MAX_SD_PARAMS + 1],
+                params: vec![
+                    SdParam {
+                        name: "v".into(),
+                        value: "x".into()
+                    };
+                    MAX_SD_PARAMS + 1
+                ],
             }],
         ] {
-            values.push(Message { structured_data, ..base.clone() });
+            values.push(Message {
+                structured_data,
+                ..base.clone()
+            });
         }
-        values.push(Message { bom: true, msg: vec![0xff, 0xfe], ..base.clone() });
-        values.push(Message { msg: [&BOM[..], &BOM, b"x"].concat(), ..base.clone() });
-        values.push(Message { bom: true, msg: "é".repeat(MAX_MESSAGE_LEN).into_bytes(), ..base.clone() });
+        values.push(Message {
+            bom: true,
+            msg: vec![0xff, 0xfe],
+            ..base.clone()
+        });
+        values.push(Message {
+            msg: [&BOM[..], &BOM, b"x"].concat(),
+            ..base.clone()
+        });
+        values.push(Message {
+            bom: true,
+            msg: "é".repeat(MAX_MESSAGE_LEN).into_bytes(),
+            ..base.clone()
+        });
         for m in values {
             assert!(m.to_bytes().is_err());
             contract::check_wire_value(&m);
@@ -1939,17 +2248,51 @@ mod tests {
             Timestamp { hour: 99, ..t },
             Timestamp { minute: 99, ..t },
             Timestamp { second: 60, ..t },
-            Timestamp { fraction: Some(Fraction { value: 12345678, digits: 9 }), ..t },
-            Timestamp { fraction: Some(Fraction { value: 10, digits: 1 }), ..t },
-            Timestamp { fraction: Some(Fraction { value: 0, digits: 0 }), ..t },
-            Timestamp { offset: Offset::Minutes(-5000), ..t },
+            Timestamp {
+                fraction: Some(Fraction {
+                    value: 12345678,
+                    digits: 9,
+                }),
+                ..t
+            },
+            Timestamp {
+                fraction: Some(Fraction {
+                    value: 10,
+                    digits: 1,
+                }),
+                ..t
+            },
+            Timestamp {
+                fraction: Some(Fraction {
+                    value: 0,
+                    digits: 0,
+                }),
+                ..t
+            },
+            Timestamp {
+                offset: Offset::Minutes(-5000),
+                ..t
+            },
         ] {
             assert!(bad.to_bytes().is_err());
             contract::check_wire_value(&bad);
-            assert!(Message { timestamp: Some(bad), ..base.clone() }.to_bytes().is_err());
+            assert!(
+                Message {
+                    timestamp: Some(bad),
+                    ..base.clone()
+                }
+                .to_bytes()
+                .is_err()
+            );
         }
         let base = BsdMessage::new(base.priority, "x");
-        let t = BsdTimestamp { month: 1, day: 31, hour: 12, minute: 0, second: 0 };
+        let t = BsdTimestamp {
+            month: 1,
+            day: 31,
+            hour: 12,
+            minute: 0,
+            second: 0,
+        };
         for bad in [
             BsdTimestamp { month: 0, ..t },
             BsdTimestamp { day: 40, ..t },
@@ -1961,12 +2304,34 @@ mod tests {
             contract::check_wire_value(&bad);
         }
         for bad in [
-            BsdMessage { header: Some(BsdHeader { timestamp: t, hostname: String::new() }), ..base.clone() },
-            BsdMessage { tag: Some("my app".into()), ..base.clone() },
-            BsdMessage { tag: Some("app".into()), pid: Some("1]".into()), ..base.clone() },
-            BsdMessage { pid: Some("7".into()), ..base.clone() },
-            BsdMessage { content: vec![b'x'; 2 * MAX_MESSAGE_LEN], ..base.clone() },
-            BsdMessage { content: b"app: x".to_vec(), ..base.clone() },
+            BsdMessage {
+                header: Some(BsdHeader {
+                    timestamp: t,
+                    hostname: String::new(),
+                }),
+                ..base.clone()
+            },
+            BsdMessage {
+                tag: Some("my app".into()),
+                ..base.clone()
+            },
+            BsdMessage {
+                tag: Some("app".into()),
+                pid: Some("1]".into()),
+                ..base.clone()
+            },
+            BsdMessage {
+                pid: Some("7".into()),
+                ..base.clone()
+            },
+            BsdMessage {
+                content: vec![b'x'; 2 * MAX_MESSAGE_LEN],
+                ..base.clone()
+            },
+            BsdMessage {
+                content: b"app: x".to_vec(),
+                ..base.clone()
+            },
         ] {
             assert!(bad.to_bytes().is_err());
             contract::check_wire_value(&bad);
@@ -1978,12 +2343,24 @@ mod tests {
         // RFC 6587 section 3.4.1: octet counting.
         let mut d = Stream::new(Frames::new());
         assert_eq!(d.push(b"7 <34>1 x"), b"7 <34>1 x".len());
-        assert_eq!(d.next(), Some(Ok(Frame::new(Framing::OctetCounting, b"<34>1 x".to_vec()))));
+        assert_eq!(
+            d.next(),
+            Some(Ok(Frame::new(Framing::OctetCounting, b"<34>1 x".to_vec())))
+        );
         assert_eq!(d.next(), None);
         // Section 3.4.2: a trailer ends the message.
-        assert_eq!(d.push(b"<13>a\r\n\n\n<13>b\n<13>c"), b"<13>a\r\n\n\n<13>b\n<13>c".len());
-        assert_eq!(d.next(), Some(Ok(Frame::new(Framing::NonTransparent, b"<13>a".to_vec()))));
-        assert_eq!(d.next(), Some(Ok(Frame::new(Framing::NonTransparent, b"<13>b".to_vec()))));
+        assert_eq!(
+            d.push(b"<13>a\r\n\n\n<13>b\n<13>c"),
+            b"<13>a\r\n\n\n<13>b\n<13>c".len()
+        );
+        assert_eq!(
+            d.next(),
+            Some(Ok(Frame::new(Framing::NonTransparent, b"<13>a".to_vec())))
+        );
+        assert_eq!(
+            d.next(),
+            Some(Ok(Frame::new(Framing::NonTransparent, b"<13>b".to_vec())))
+        );
         assert_eq!(d.next(), None);
         assert_eq!(d.buffered(), 5);
         // Octet counted messages may hold newlines.
@@ -1993,14 +2370,22 @@ mod tests {
         assert_eq!(d.buffered(), 0);
 
         // Writers.
-        assert_eq!(Frame::new(Framing::OctetCounting, b"<1>x".to_vec()).to_bytes().unwrap(), b"4 <1>x");
+        assert_eq!(
+            Frame::new(Framing::OctetCounting, b"<1>x".to_vec())
+                .to_bytes()
+                .unwrap(),
+            b"4 <1>x"
+        );
         for frame in [
             Frame::new(Framing::NonTransparent, b"<1>x\ny".to_vec()),
             Frame::new(Framing::NonTransparent, b"12".to_vec()),
             Frame::new(Framing::NonTransparent, Vec::new()),
             Frame::new(Framing::OctetCounting, Vec::new()),
             Frame::new(Framing::OctetCounting, vec![b'x'; MAX_MESSAGE_LEN + 10]),
-            Frame { truncated: true, ..Frame::new(Framing::OctetCounting, b"x".to_vec()) },
+            Frame {
+                truncated: true,
+                ..Frame::new(Framing::OctetCounting, b"x".to_vec())
+            },
         ] {
             assert!(frame.to_bytes().is_err());
             contract::check_wire_value(&frame);
@@ -2023,19 +2408,28 @@ mod tests {
         );
         assert_eq!(d.next(), None);
         let mut d = Stream::new(Frames::new());
-        assert_eq!(d.push(b"99999999999999999999999999"), b"99999999999999999999999999".len());
+        assert_eq!(
+            d.push(b"99999999999999999999999999"),
+            b"99999999999999999999999999".len()
+        );
         assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::CountTooLarge))));
 
         // A message without a newline may be MAX_MESSAGE_LEN bytes; past
         // that it is cut.
         let mut d = Stream::new(Frames::new());
-        assert_eq!(d.push(&vec![b'<'; MAX_MESSAGE_LEN]), vec![b'<'; MAX_MESSAGE_LEN].len());
+        assert_eq!(
+            d.push(&vec![b'<'; MAX_MESSAGE_LEN]),
+            vec![b'<'; MAX_MESSAGE_LEN].len()
+        );
         assert_eq!(d.next(), None);
         assert_eq!(d.push(b"\n"), b"\n".len());
         let f = d.next().unwrap().unwrap();
         assert_eq!((f.message.len(), f.truncated), (MAX_MESSAGE_LEN, false));
         let mut d = Stream::new(Frames::new());
-        assert_eq!(d.push(&vec![b'<'; MAX_MESSAGE_LEN + 1]), vec![b'<'; MAX_MESSAGE_LEN + 1].len());
+        assert_eq!(
+            d.push(&vec![b'<'; MAX_MESSAGE_LEN + 1]),
+            vec![b'<'; MAX_MESSAGE_LEN + 1].len()
+        );
         assert_eq!(d.next(), None);
         assert_eq!(d.push(b"<"), b"<".len());
         assert!(d.next().unwrap().unwrap().truncated);
@@ -2043,7 +2437,8 @@ mod tests {
         assert_eq!(d.push(b"<<\n<13>x\n"), b"<<\n<13>x\n".len());
         assert_eq!(d.next().unwrap().unwrap().message, b"<13>x");
         assert!(!Error::CountTooLarge.to_string().is_empty());
-        let kinds: std::collections::HashSet<Error> = [Error::CountTooLarge, Error::Length(0)].into();
+        let kinds: std::collections::HashSet<Error> =
+            [Error::CountTooLarge, Error::Length(0)].into();
         assert_eq!(kinds.len(), 2);
         let kinds: std::collections::HashSet<Error> = [Error::Priority, Error::Utf8].into();
         assert_eq!(kinds.len(), 2);
@@ -2094,18 +2489,37 @@ mod tests {
     fn sd_ids_with_an_at_sign() {
         // RFC 5424 section 6.3.2: name@<private enterprise number>, the
         // name without an at-sign, the number decimal with dotted parts.
-        for ok in ["[a@1]", "[exampleSDID@32473]", "[a@32473.1.2]", "[timeQuality]"] {
+        for ok in [
+            "[a@1]",
+            "[exampleSDID@32473]",
+            "[a@32473.1.2]",
+            "[timeQuality]",
+        ] {
             let raw = format!("<34>1 - - - - - {ok}");
             assert!(Message::parse(raw.as_bytes()).is_ok(), "{ok}");
         }
-        for bad in ["[a@b@1]", "[a@x]", "[@1]", "[a@]", "[a@1.]", "[a@.1]", "[a@1..2]", "[a@1@2]"] {
+        for bad in [
+            "[a@b@1]", "[a@x]", "[@1]", "[a@]", "[a@1.]", "[a@.1]", "[a@1..2]", "[a@1@2]",
+        ] {
             let raw = format!("<34>1 - - - - - {bad}");
-            assert_eq!(Message::parse(raw.as_bytes()), Err(Error::StructuredData), "{bad}");
+            assert_eq!(
+                Message::parse(raw.as_bytes()),
+                Err(Error::StructuredData),
+                "{bad}"
+            );
         }
         // Parameter names may hold an at-sign.
         assert!(Message::parse(b"<34>1 - - - - - [a@1 b@c=\"\"]").is_ok());
         // The writer makes IDs the reader takes.
-        for id in ["a@b@1", "a@x", "@1", "a@", "a@1.", "x@32473", "abcdefghijklmnopqrstuvwxyz0123@1234"] {
+        for id in [
+            "a@b@1",
+            "a@x",
+            "@1",
+            "a@",
+            "a@1.",
+            "x@32473",
+            "abcdefghijklmnopqrstuvwxyz0123@1234",
+        ] {
             let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
             m.structured_data.push(SdElement::new(id));
             assert_eq!(m.to_bytes().is_ok(), id == "x@32473", "{id}");
@@ -2113,14 +2527,23 @@ mod tests {
         }
         let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
         m.structured_data.push(SdElement::new("x@32473"));
-        assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap().structured_data[0].id, "x@32473");
+        assert_eq!(
+            Message::parse(&m.to_bytes().unwrap())
+                .unwrap()
+                .structured_data[0]
+                .id,
+            "x@32473"
+        );
     }
 
     #[test]
     fn crlf_trailers() {
         // RFC 6587 section 3.4.2: some senders end each message with CR LF.
         let mut d = Stream::new(Frames::new());
-        assert_eq!(d.push(b"<34>1 - - - - - -\r\n\r\n<13>b\r\r\n"), b"<34>1 - - - - - -\r\n\r\n<13>b\r\r\n".len());
+        assert_eq!(
+            d.push(b"<34>1 - - - - - -\r\n\r\n<13>b\r\r\n"),
+            b"<34>1 - - - - - -\r\n\r\n<13>b\r\r\n".len()
+        );
         let f = d.next().unwrap().unwrap();
         assert_eq!(f.message, b"<34>1 - - - - - -");
         assert!(Message::parse(&f.message).is_ok());
@@ -2157,36 +2580,43 @@ mod tests {
         // A message of exactly the limit is whole.
         let exact = vec![b'<'; MAX_MESSAGE_LEN];
         let mut d = Stream::new(Frames::new());
-        assert_eq!(d.push(&[exact.as_slice(), b"\r\n"].concat()), [exact.as_slice(), b"\r\n"].concat().len());
+        assert_eq!(
+            d.push(&[exact.as_slice(), b"\r\n"].concat()),
+            [exact.as_slice(), b"\r\n"].concat().len()
+        );
         let f = d.next().unwrap().unwrap();
         assert_eq!((f.message.len(), f.truncated), (MAX_MESSAGE_LEN, false));
     }
 
     #[test]
     fn many_frames_in_one_push_take_linear_time() {
-        assert_linear("many_frames_in_one_push_take_linear_time", rounds(100000), |size| {
-            let n = size;
-            let data = b"<13>x\n".repeat(n);
-            let mut stream = Stream::new(Frames::new());
-            let mut count = 0;
-            pump(&mut stream, &data, |f| {
-                assert_eq!(f.message, b"<13>x");
-                count += 1;
-            })
-            .unwrap();
-            assert_eq!((count, stream.buffered()), (n, 0));
-            pump(&mut stream, &vec![b'\n'; 6 * n], |_| panic!("blank frame")).unwrap();
-            assert_eq!(stream.buffered(), 0);
-            // Bytes held after a frame is taken still count, and still frame.
-            let mut d = Stream::new(Frames::new());
-            assert_eq!(d.push(b"<13>a\n<13>b\n<13>"), b"<13>a\n<13>b\n<13>".len());
-            assert_eq!(d.next().unwrap().unwrap().message, b"<13>a");
-            assert_eq!(d.buffered(), 10);
-            assert_eq!(d.push(b"c\n"), b"c\n".len());
-            assert_eq!(d.next().unwrap().unwrap().message, b"<13>b");
-            assert_eq!(d.next().unwrap().unwrap().message, b"<13>c");
-            assert_eq!(d.buffered(), 0);
-        });
+        assert_linear(
+            "many_frames_in_one_push_take_linear_time",
+            rounds(100000),
+            |size| {
+                let n = size;
+                let data = b"<13>x\n".repeat(n);
+                let mut stream = Stream::new(Frames::new());
+                let mut count = 0;
+                pump(&mut stream, &data, |f| {
+                    assert_eq!(f.message, b"<13>x");
+                    count += 1;
+                })
+                .unwrap();
+                assert_eq!((count, stream.buffered()), (n, 0));
+                pump(&mut stream, &vec![b'\n'; 6 * n], |_| panic!("blank frame")).unwrap();
+                assert_eq!(stream.buffered(), 0);
+                // Bytes held after a frame is taken still count, and still frame.
+                let mut d = Stream::new(Frames::new());
+                assert_eq!(d.push(b"<13>a\n<13>b\n<13>"), b"<13>a\n<13>b\n<13>".len());
+                assert_eq!(d.next().unwrap().unwrap().message, b"<13>a");
+                assert_eq!(d.buffered(), 10);
+                assert_eq!(d.push(b"c\n"), b"c\n".len());
+                assert_eq!(d.next().unwrap().unwrap().message, b"<13>b");
+                assert_eq!(d.next().unwrap().unwrap().message, b"<13>c");
+                assert_eq!(d.buffered(), 0);
+            },
+        );
     }
 
     #[test]
@@ -2200,8 +2630,14 @@ mod tests {
                 Frame::new(Framing::NonTransparent, b"<13>last".to_vec())
             ]
         );
-        assert!(matches!(decode_all(Frames::new, b"10 <13>").1, Some(Fail::Truncated { .. })));
-        assert!(matches!(decode_all(Frames::new, b"1x").1, Some(Fail::Protocol(_))));
+        assert!(matches!(
+            decode_all(Frames::new, b"10 <13>").1,
+            Some(Fail::Truncated { .. })
+        ));
+        assert!(matches!(
+            decode_all(Frames::new, b"1x").1,
+            Some(Fail::Protocol(_))
+        ));
         assert_eq!(decode_all(Frames::new, b""), (vec![], None));
         for len in [MAX_MESSAGE_LEN + 1, MAX_MESSAGE_LEN + 2] {
             let bytes = vec![b'<'; len];
@@ -2209,13 +2645,19 @@ mod tests {
             let (frames, error) = decode_all(Frames::new, &bytes);
             assert_eq!(error, None);
             assert_eq!(frames.len(), 1);
-            assert_eq!((frames[0].message.len(), frames[0].truncated), (MAX_MESSAGE_LEN, true));
+            assert_eq!(
+                (frames[0].message.len(), frames[0].truncated),
+                (MAX_MESSAGE_LEN, true)
+            );
         }
         let mut frames = Frames::new();
         assert_eq!(frames.decode(b"<13>x", false), Ok(Step::Need));
         assert_eq!(
             frames.clone().decode(b"<13>x\n", false),
-            Ok(Step::Item(Frame::new(Framing::NonTransparent, b"<13>x".to_vec()), 6))
+            Ok(Step::Item(
+                Frame::new(Framing::NonTransparent, b"<13>x".to_vec()),
+                6
+            ))
         );
     }
 
@@ -2225,18 +2667,37 @@ mod tests {
         message.hostname = Some("mymachine.example.com".into());
         message.app_name = Some("su".into());
         message.msg_id = Some("ID47".into());
-        message.structured_data.push(SdElement::new("origin").param("ip", "192.0.2.1"));
+        message
+            .structured_data
+            .push(SdElement::new("origin").param("ip", "192.0.2.1"));
         message.msg = b"'su root' failed".to_vec();
         let bytes = message.to_bytes().unwrap();
-        assert_eq!(bytes, b"<34>1 - mymachine.example.com su - ID47 [origin ip=\"192.0.2.1\"] 'su root' failed");
+        assert_eq!(
+            bytes,
+            b"<34>1 - mymachine.example.com su - ID47 [origin ip=\"192.0.2.1\"] 'su root' failed"
+        );
         let mut decoder = Stream::new(Frames::new());
         assert_eq!(
-            decoder.push(&Frame::new(Framing::OctetCounting, bytes.clone()).to_bytes().unwrap()),
-            Frame::new(Framing::OctetCounting, bytes.clone()).to_bytes().unwrap().len()
+            decoder.push(
+                &Frame::new(Framing::OctetCounting, bytes.clone())
+                    .to_bytes()
+                    .unwrap()
+            ),
+            Frame::new(Framing::OctetCounting, bytes.clone())
+                .to_bytes()
+                .unwrap()
+                .len()
         );
         assert_eq!(
-            decoder.push(&Frame::new(Framing::NonTransparent, bytes.clone()).to_bytes().unwrap()),
-            Frame::new(Framing::NonTransparent, bytes).to_bytes().unwrap().len()
+            decoder.push(
+                &Frame::new(Framing::NonTransparent, bytes.clone())
+                    .to_bytes()
+                    .unwrap()
+            ),
+            Frame::new(Framing::NonTransparent, bytes)
+                .to_bytes()
+                .unwrap()
+                .len()
         );
         assert_eq!(
             decoder.push(b"<13>Oct  5 12:00:00 gw sshd[42]: Accepted publickey\n"),
@@ -2248,7 +2709,9 @@ mod tests {
         }
         assert_eq!(got.len(), 3);
         assert_eq!(got[0], Entry::Rfc5424(message));
-        let Entry::Bsd(bsd) = &got[2] else { panic!("not a BSD message") };
+        let Entry::Bsd(bsd) = &got[2] else {
+            panic!("not a BSD message")
+        };
         assert_eq!(bsd.priority.facility, Facility::User);
         assert_eq!(bsd.priority.severity, Severity::Notice);
         assert_eq!(bsd.tag.as_deref(), Some("sshd"));
@@ -2264,10 +2727,20 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(frames.len(), 1);
         assert!(frames[0].truncated);
-        let bytes = [format!("{} ", usize::MAX).as_bytes(), &vec![b'x'; MAX_MESSAGE_LEN]].concat();
+        let bytes = [
+            format!("{} ", usize::MAX).as_bytes(),
+            &vec![b'x'; MAX_MESSAGE_LEN],
+        ]
+        .concat();
         let (frames, error) = decode_all(Frames::new, &bytes);
-        assert_eq!((frames[0].message.len(), frames[0].truncated), (MAX_MESSAGE_LEN, true));
-        assert!(matches!(error, Some(Fail::Protocol(Error::Incomplete { .. }))));
+        assert_eq!(
+            (frames[0].message.len(), frames[0].truncated),
+            (MAX_MESSAGE_LEN, true)
+        );
+        assert!(matches!(
+            error,
+            Some(Fail::Protocol(Error::Incomplete { .. }))
+        ));
         let mut stream = Stream::new(Frames::new());
         assert_eq!(stream.push(b"1x"), 2);
         assert!(stream.next().unwrap().is_err());
@@ -2279,11 +2752,15 @@ mod tests {
         // Escaping a value used to build the whole element, twice the
         // value's size, before checking it fit.
         let mut out = b"<13>1 - - - - - ".to_vec();
-        let params = [SdParam { name: "p".into(), value: "\\".repeat(1 << 20) }];
+        let params = [SdParam {
+            name: "p".into(),
+            value: "\\".repeat(1 << 20),
+        }];
         assert!(write_sd_element(&mut out, "x", &params).is_err());
         assert!(out.len() <= MAX_MESSAGE_LEN + 2);
         let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
-        m.structured_data.push(SdElement::new("x").param("p", "\\".repeat(1 << 20)));
+        m.structured_data
+            .push(SdElement::new("x").param("p", "\\".repeat(1 << 20)));
         assert!(m.to_bytes().is_err());
     }
 
@@ -2291,7 +2768,12 @@ mod tests {
     fn parsed_messages_near_the_limit_write_back_whole() {
         // Each invalid escape used to be written as three bytes, so this
         // 44 kB message grew past the limit and lost its element.
-        let raw = [&b"<13>1 - - - - - [x@32473 p=\""[..], &br"\n".repeat(22_000), b"\"]"].concat();
+        let raw = [
+            &b"<13>1 - - - - - [x@32473 p=\""[..],
+            &br"\n".repeat(22_000),
+            b"\"]",
+        ]
+        .concat();
         let m = Message::parse(&raw).unwrap();
         assert_eq!(m.to_bytes().unwrap(), raw);
         assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
@@ -2302,7 +2784,10 @@ mod tests {
         assert_eq!(m.to_bytes().unwrap(), raw);
         assert_eq!(BsdMessage::parse(&m.to_bytes().unwrap()).unwrap(), m);
         // A required separator cannot displace content at the size limit.
-        let mut m = BsdMessage::new(Priority::new(Facility::User, Severity::Notice), vec![b' '; MAX_MESSAGE_LEN]);
+        let mut m = BsdMessage::new(
+            Priority::new(Facility::User, Severity::Notice),
+            vec![b' '; MAX_MESSAGE_LEN],
+        );
         m.tag = Some("app".into());
         assert!(m.to_bytes().is_err());
         contract::check_wire_value(&m);
@@ -2313,11 +2798,17 @@ mod tests {
         // A BSD message whose text starts with a short number and a space
         // used to be written as bytes Entry::parse rejected.
         for content in [&b"1 x"[..], b"12 - x", b"999 "] {
-            let e = Entry::Bsd(BsdMessage::new(Priority::new(Facility::User, Severity::Notice), content));
+            let e = Entry::Bsd(BsdMessage::new(
+                Priority::new(Facility::User, Severity::Notice),
+                content,
+            ));
             assert_eq!(Entry::parse(&e.to_bytes().unwrap()), Ok(e));
         }
         // Content that is an RFC 5424 message reads as one.
-        let e = Entry::Bsd(BsdMessage::new(Priority::new(Facility::User, Severity::Notice), "1 - - - - - -"));
+        let e = Entry::Bsd(BsdMessage::new(
+            Priority::new(Facility::User, Severity::Notice),
+            "1 - - - - - -",
+        ));
         assert!(e.to_bytes().is_err());
         contract::check_wire_value(&e);
     }
@@ -2440,9 +2931,16 @@ mod tests {
                     fraction: if rng.coin() {
                         None
                     } else {
-                        Some(Fraction { value: rng.next() as u32, digits: rng.index(9) as u8 })
+                        Some(Fraction {
+                            value: rng.next() as u32,
+                            digits: rng.index(9) as u8,
+                        })
                     },
-                    offset: if rng.coin() { Offset::Utc } else { Offset::Minutes(rng.next() as i16) },
+                    offset: if rng.coin() {
+                        Offset::Utc
+                    } else {
+                        Offset::Minutes(rng.next() as i16)
+                    },
                 });
             }
             m.hostname = (rng.index(3) > 0).then(|| rng.text(300));
@@ -2483,7 +2981,12 @@ mod tests {
                         *m %= MAX_OFFSET_MINUTES + 1;
                     }
                 }
-                for field in [&mut m.hostname, &mut m.app_name, &mut m.proc_id, &mut m.msg_id] {
+                for field in [
+                    &mut m.hostname,
+                    &mut m.app_name,
+                    &mut m.proc_id,
+                    &mut m.msg_id,
+                ] {
                     if field.is_some() {
                         *field = Some(format!("field{}", rng.index(10000)));
                     }
@@ -2497,14 +3000,19 @@ mod tests {
                 m.msg = rng.text(20).into_bytes();
             }
             if m.bom && rng.coin() {
-                m.msg.extend_from_slice(alphabet[rng.index(alphabet.len())].as_bytes());
+                m.msg
+                    .extend_from_slice(alphabet[rng.index(alphabet.len())].as_bytes());
             }
             if round % 2 == 0 {
                 assert!(m.to_bytes().is_ok());
             }
             contract::check_wire_value(&m);
             if let Ok(bytes) = m.to_bytes() {
-                let framing = if rng.coin() { Framing::OctetCounting } else { Framing::NonTransparent };
+                let framing = if rng.coin() {
+                    Framing::OctetCounting
+                } else {
+                    Framing::NonTransparent
+                };
                 let frame = Frame::new(framing, bytes);
                 contract::check_wire_value(&frame);
                 if let Ok(bytes) = frame.to_bytes() {

@@ -50,7 +50,10 @@ pub fn pair_with_limit(limit: usize) -> (End, End) {
 
 fn make(guard: Option<Box<dyn Send>>, limit: Option<usize>) -> (End, End) {
     let cable = Arc::new(Cable {
-        dirs: [Mutex::new(Direction::default()), Mutex::new(Direction::default())],
+        dirs: [
+            Mutex::new(Direction::default()),
+            Mutex::new(Direction::default()),
+        ],
         guard: Mutex::new(guard),
         meter: Meter::new(),
         limit,
@@ -58,8 +61,18 @@ fn make(guard: Option<Box<dyn Send>>, limit: Option<usize>) -> (End, End) {
     let counted: Weak<dyn Counted> = Arc::downgrade(&cable) as Weak<Cable>;
     cable.meter.count_in(counted);
     (
-        End { cable: cable.clone(), side: 0, wait: CancelWait::default(), seen: 0 },
-        End { cable, side: 1, wait: CancelWait::default(), seen: 0 },
+        End {
+            cable: cable.clone(),
+            side: 0,
+            wait: CancelWait::default(),
+            seen: 0,
+        },
+        End {
+            cable,
+            side: 1,
+            wait: CancelWait::default(),
+            seen: 0,
+        },
     )
 }
 
@@ -143,7 +156,11 @@ impl Interface for End {
                 return;
             }
             let cost = packet.0.len() + PACKET_COST;
-            if self.cable.limit.is_some_and(|limit| dir.queued + cost > limit) {
+            if self
+                .cable
+                .limit
+                .is_some_and(|limit| dir.queued + cost > limit)
+            {
                 return;
             }
             dir.queued += cost;
@@ -206,7 +223,11 @@ impl End {
     pub(crate) fn peer_gone_check(&self) -> impl Fn() -> bool + Send + Sync + 'static {
         let cable = Arc::downgrade(&self.cable);
         let side = self.side;
-        move || cable.upgrade().is_none_or(|c| c.dirs[side].lock().unwrap().closed)
+        move || {
+            cable
+                .upgrade()
+                .is_none_or(|c| c.dirs[side].lock().unwrap().closed)
+        }
     }
 
     /// The counts and tap of this end's pair.
@@ -218,8 +239,14 @@ impl End {
 impl Counted for Cable {
     fn totals(&self) -> [u64; 4] {
         // End `s` sends into `dirs[1 - s]`.
-        let (p1, b1) = { let d = self.dirs[0].lock().unwrap(); (d.packets, d.bytes) };
-        let (p0, b0) = { let d = self.dirs[1].lock().unwrap(); (d.packets, d.bytes) };
+        let (p1, b1) = {
+            let d = self.dirs[0].lock().unwrap();
+            (d.packets, d.bytes)
+        };
+        let (p0, b0) = {
+            let d = self.dirs[1].lock().unwrap();
+            (d.packets, d.bytes)
+        };
         [p0, b0, p1, b1]
     }
 }

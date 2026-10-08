@@ -1,9 +1,9 @@
 //! RTCP protocol cases moved from the former RTP control-packet implementation.
 use fictionet::stdlib::{
-    codec::{Wire},
-    test_support::contract,
+    codec::Wire,
     rtcp::{self, *},
     rtp,
+    test_support::contract,
 };
 
 fn report() -> Packet {
@@ -55,12 +55,22 @@ fn rtp_and_rtcp_packets_go_in_one_frame_writer() {
         Ok(bytes)
     }
     let media = rtp::Packet {
-        marker: false, payload_type: 96, sequence: 1, timestamp: 2, ssrc: 3,
-        csrcs: vec![], extension: None, payload: vec![4], padding: 0,
+        marker: false,
+        payload_type: 96,
+        sequence: 1,
+        timestamp: 2,
+        ssrc: 3,
+        csrcs: vec![],
+        extension: None,
+        payload: vec![4],
+        padding: 0,
     };
     for (bytes, packet) in [
         (framed(&media).unwrap(), rtp::Demux::Rtp(media)),
-        (framed(&report()).unwrap(), rtp::Demux::Rtcp(Datagram(vec![report()]))),
+        (
+            framed(&report()).unwrap(),
+            rtp::Demux::Rtcp(Datagram(vec![report()])),
+        ),
     ] {
         let frame = rtcp::Frame::parse(&bytes).unwrap();
         assert_eq!(rtp::Demux::parse(&frame.0), Ok(packet.clone()));
@@ -78,10 +88,7 @@ fn rtcp_errors() {
         Datagram::parse(&[0x80, 201, 0, 1, 0, 0]),
         Err(Error::Truncated)
     );
-    assert_eq!(
-        Datagram::parse(&[0x40, 201, 0, 0]),
-        Err(Error::Version(1))
-    );
+    assert_eq!(Datagram::parse(&[0x40, 201, 0, 0]), Err(Error::Version(1)));
     assert_eq!(
         Datagram::parse(&vec![0; MAX_DATAGRAM + 1]),
         Err(Error::TooLong(MAX_DATAGRAM + 1))
@@ -149,13 +156,13 @@ fn rtcp_errors() {
 #[test]
 fn rtp_demux_checks_typed_feedback_and_xr_layouts() {
     for (pt, fmt, body) in [
-        (205, 3, vec![0; 8]), // TMMBR needs an entry.
+        (205, 3, vec![0; 8]),  // TMMBR needs an entry.
         (205, 3, vec![0; 12]), // TMMBR and TMMBN entries occupy two words.
         (205, 4, vec![0; 12]),
         (206, 4, vec![0; 8]), // FIR needs a two-word entry.
         (206, 4, vec![0; 12]),
         (206, 15, [vec![0; 8], b"REMB".to_vec()].concat()),
-        (207, 0, vec![]), // XR needs an SSRC.
+        (207, 0, vec![]),                       // XR needs an SSRC.
         (207, 0, vec![0, 0, 0, 1, 4, 0, 0, 0]), // RRT needs two words.
     ] {
         let mut bytes = vec![0x80 | fmt, pt, 0, (body.len() / 4) as u8];
@@ -173,13 +180,22 @@ fn rtp_demux_checks_typed_feedback_and_xr_layouts() {
     let mut remb = Packet::from(Body::PayloadFeedback(PayloadFeedback {
         sender_ssrc: 1,
         media_ssrc: 0,
-        message: PayloadMessage::Remb(Remb { exponent: 0, mantissa: 1, ssrcs: vec![2] }),
-    })).to_bytes().unwrap();
+        message: PayloadMessage::Remb(Remb {
+            exponent: 0,
+            mantissa: 1,
+            ssrcs: vec![2],
+        }),
+    }))
+    .to_bytes()
+    .unwrap();
     assert!(rtp::Demux::parse(&remb).is_ok());
     remb[0] |= 0x20;
     remb[3] += 1;
     remb.extend([0, 0, 0, 4]);
-    assert_eq!(rtp::Demux::parse(&remb), Err(rtp::Error::Rtcp(Error::Malformed(206))));
+    assert_eq!(
+        rtp::Demux::parse(&remb),
+        Err(rtp::Error::Rtcp(Error::Malformed(206)))
+    );
 }
 
 #[test]
@@ -352,13 +368,20 @@ fn compound_round_trip_and_truncated_prefixes() {
             data: vec![1, 2, 3, 4],
         })),
         payload(PayloadMessage::Pli),
-        payload(PayloadMessage::Sli(vec![Sli { first: 1, number: 2, picture_id: 3 }])),
+        payload(PayloadMessage::Sli(vec![Sli {
+            first: 1,
+            number: 2,
+            picture_id: 3,
+        }])),
         payload(PayloadMessage::Rpsi(Rpsi {
             padding_bits: 11,
             payload_type: 96,
             data: vec![0xf8, 0],
         })),
-        payload(PayloadMessage::Other { fmt: 8, fci: vec![1, 2, 3, 4] }),
+        payload(PayloadMessage::Other {
+            fmt: 8,
+            fci: vec![1, 2, 3, 4],
+        }),
         transport(TransportMessage::Nack(vec![Nack { pid: 5, blp: 3 }])),
         Packet::from(Body::Other {
             packet_type: 208,
@@ -378,7 +401,10 @@ fn compound_round_trip_and_truncated_prefixes() {
         rtp::Demux::parse(&bytes),
         Ok(rtp::Demux::Rtcp(Datagram(packets.clone())))
     );
-    assert_eq!(rtp::Demux::Rtcp(Datagram(packets.clone())).to_bytes(), Ok(bytes.clone()));
+    assert_eq!(
+        rtp::Demux::Rtcp(Datagram(packets.clone())).to_bytes(),
+        Ok(bytes.clone())
+    );
     let mut ends = vec![];
     let mut end = 0;
     for p in &packets {
@@ -395,7 +421,10 @@ fn compound_round_trip_and_truncated_prefixes() {
         } else {
             assert_eq!(Datagram::parse(&bytes[..n]), Err(Error::Truncated));
             if n >= 2 {
-                assert_eq!(rtp::Demux::parse(&bytes[..n]), Err(rtp::Error::Rtcp(Error::Truncated)));
+                assert_eq!(
+                    rtp::Demux::parse(&bytes[..n]),
+                    Err(rtp::Error::Rtcp(Error::Truncated))
+                );
             }
         }
     }
@@ -408,10 +437,16 @@ fn padding_on_the_last_packet() {
     let bytes = Compound(vec![report(), last.clone()]).to_bytes().unwrap();
     let packets = Compound::parse(&bytes).unwrap();
     assert_eq!(packets.0[1], last);
-    assert_eq!(rtp::Demux::parse(&bytes), Ok(rtp::Demux::Rtcp(Datagram(packets.0))));
+    assert_eq!(
+        rtp::Demux::parse(&bytes),
+        Ok(rtp::Demux::Rtcp(Datagram(packets.0)))
+    );
     let mut bad = bytes.clone();
     bad[0] |= 0x20;
-    assert_eq!(rtp::Demux::parse(&bad), Err(rtp::Error::Rtcp(Error::Padding)));
+    assert_eq!(
+        rtp::Demux::parse(&bad),
+        Err(rtp::Error::Rtcp(Error::Padding))
+    );
 
     // The first packet's padding is valid on its own, but not before SDES.
     let first = Packet::from(Body::ReceiverReport(ReceiverReport {
@@ -424,7 +459,10 @@ fn padding_on_the_last_packet() {
     bad[0] |= 0x20;
     let datagram = Datagram::parse(&bad).unwrap();
     assert_eq!(datagram.0[0].padding, 4);
-    assert_eq!(rtp::Demux::parse(&bad), Err(rtp::Error::Rtcp(Error::Padding)));
+    assert_eq!(
+        rtp::Demux::parse(&bad),
+        Err(rtp::Error::Rtcp(Error::Padding))
+    );
     let packet = rtp::Demux::Rtcp(datagram);
     let mut out = vec![9, 8, 7];
     assert_eq!(packet.write(&mut out), Err(rtp::Error::Unwritable));
@@ -441,10 +479,7 @@ fn padding_on_the_last_packet() {
         *bad.last_mut().unwrap() = count;
         assert_eq!(Datagram::parse(&bad), Err(Error::Padding));
     }
-    assert_eq!(
-        Datagram::parse(&[0xa0, 203, 0, 0]),
-        Err(Error::Padding)
-    );
+    assert_eq!(Datagram::parse(&[0xa0, 203, 0, 0]), Err(Error::Padding));
     assert_eq!(
         Datagram::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 4]),
         Err(Error::Malformed(201))

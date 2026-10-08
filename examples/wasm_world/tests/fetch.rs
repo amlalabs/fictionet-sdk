@@ -11,7 +11,10 @@ fn check(fetched: Fetched, version: Version) {
     assert_eq!(fetched.address, SITE);
     assert_eq!(fetched.status, 200);
     assert_eq!(fetched.version, version);
-    assert_eq!(fetched.body, format!("hello from {NAME}: GET /from-the-browser\n"));
+    assert_eq!(
+        fetched.body,
+        format!("hello from {NAME}: GET /from-the-browser\n")
+    );
 }
 
 /// HTTP/2 with prior knowledge, with `block_on` driving the world. In a
@@ -19,7 +22,10 @@ fn check(fetched: Fetched, version: Version) {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn http2_with_block_on() {
-    check(fictionet::block_on(fetch(false, Version::HTTP_2)).unwrap(), Version::HTTP_2);
+    check(
+        fictionet::block_on(fetch(false, Version::HTTP_2)).unwrap(),
+        Version::HTTP_2,
+    );
 }
 
 /// HTTPS with HTTP/2, with the JavaScript event loop driving the world, as
@@ -34,13 +40,22 @@ async fn https_on_the_event_loop() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn https_with_block_on() {
-    check(fictionet::block_on(fetch(true, Version::HTTP_2)).unwrap(), Version::HTTP_2);
+    check(
+        fictionet::block_on(fetch(true, Version::HTTP_2)).unwrap(),
+        Version::HTTP_2,
+    );
 }
 
 /// HTTP/1.1, plain and over TLS.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn http1_with_block_on() {
-    check(fictionet::block_on(fetch(false, Version::HTTP_11)).unwrap(), Version::HTTP_11);
-    check(fictionet::block_on(fetch(true, Version::HTTP_11)).unwrap(), Version::HTTP_11);
+    check(
+        fictionet::block_on(fetch(false, Version::HTTP_11)).unwrap(),
+        Version::HTTP_11,
+    );
+    check(
+        fictionet::block_on(fetch(true, Version::HTTP_11)).unwrap(),
+        Version::HTTP_11,
+    );
 }

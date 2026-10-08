@@ -43,8 +43,8 @@
 //! `readOnly`, and `writeOnly` do not assert anything; request/response policy
 //! belongs to the caller. This module performs no I/O.
 
-use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::Lcg;
+use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::json::{Number, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -887,10 +887,7 @@ impl Paths {
     }
     fn child(&mut self, parent: usize, token: &str, max: usize) -> Result<usize, &'static str> {
         let bytes = token.bytes().try_fold(
-            self.0[parent]
-                .bytes
-                .checked_add(1)
-                .ok_or("pointer_bytes")?,
+            self.0[parent].bytes.checked_add(1).ok_or("pointer_bytes")?,
             |n, b| {
                 n.checked_add(if matches!(b, b'~' | b'/') { 2 } else { 1 })
                     .ok_or("pointer_bytes")
@@ -3540,9 +3537,9 @@ fn multiply_small(d: &Decimal, n: i64) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support;
     use fictionet::stdlib::json;
+    use fictionet::stdlib::test_support;
+    use fictionet::stdlib::test_support::contract;
 
     fn value(text: &str) -> Value {
         json::parse_with(text.as_bytes(), &json::Limits::default()).unwrap()

@@ -82,8 +82,8 @@
 //! assert_eq!(Packet::parse_with(&wire[2..], Wrapping::None), Ok(reply));
 //! ```
 
-use fictionet::stdlib::codec::{Prefixed, Frames};
-use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated};
+use fictionet::stdlib::codec::{Decode, Reader, Step, Truncated, Wire};
+use fictionet::stdlib::codec::{Frames, Prefixed};
 
 /// The port OpenVPN servers listen on, over UDP and over TCP.
 pub const PORT: u16 = 1194;
@@ -213,7 +213,10 @@ impl ControlKind {
     /// [`ControlKind::ControlWkcV1`]. They are only sent with tls-crypt-v2,
     /// so they are read only with [`Wrapping::TlsCrypt`].
     pub fn carries_wrapped_key(self) -> bool {
-        matches!(self, ControlKind::HardResetClientV3 | ControlKind::ControlWkcV1)
+        matches!(
+            self,
+            ControlKind::HardResetClientV3 | ControlKind::ControlWkcV1
+        )
     }
 
     /// The fewest bytes the encrypted part of a tls-crypt packet of this
@@ -339,7 +342,11 @@ fn wrapped_key_len(ct: &[u8]) -> Result<usize, Error> {
 /// Checks that a tls-crypt ciphertext has room for what a packet of
 /// `kind` encrypts, and the wrapped client key if the kind has one.
 fn check_tls_crypt(kind: ControlKind, ct: &[u8]) -> Result<(), Error> {
-    let body = if kind.carries_wrapped_key() { ct.len() - wrapped_key_len(ct)? } else { ct.len() };
+    let body = if kind.carries_wrapped_key() {
+        ct.len() - wrapped_key_len(ct)?
+    } else {
+        ct.len()
+    };
     if body < kind.min_tls_crypt_body() {
         return Err(Error::Truncated);
     }
@@ -447,10 +454,15 @@ impl std::fmt::Display for Error {
             Error::HmacLen(n) => write!(f, "tls-auth HMAC of {n} bytes, over {MAX_HMAC_LEN}"),
             Error::NeedsTlsCrypt(kind) => write!(f, "{kind:?} needs tls-crypt-v2"),
             Error::WrappedKeyLen(n) => {
-                write!(f, "wrapped client key of {n} bytes, outside {MIN_WRAPPED_KEY_LEN} to {MAX_WRAPPED_KEY_LEN}")
+                write!(
+                    f,
+                    "wrapped client key of {n} bytes, outside {MIN_WRAPPED_KEY_LEN} to {MAX_WRAPPED_KEY_LEN}"
+                )
             }
             Error::ZeroLength => f.write_str("OpenVPN TCP frame has zero length"),
-            Error::OverLimit { length, limit } => write!(f, "OpenVPN packet of {length} bytes, over {limit}"),
+            Error::OverLimit { length, limit } => {
+                write!(f, "OpenVPN packet of {length} bytes, over {limit}")
+            }
             Error::Trailing => f.write_str("bytes follow the OpenVPN TCP envelope"),
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
@@ -492,11 +504,20 @@ impl Packet {
         let mut r = Reader::new(b);
         let (op, key_id) = split_first_byte(r.u8().map_err(|_| Error::Empty)?);
         match op {
-            opcode::P_DATA_V1 => return Ok(Packet::DataV1 { key_id, payload: r.rest().to_vec() }),
+            opcode::P_DATA_V1 => {
+                return Ok(Packet::DataV1 {
+                    key_id,
+                    payload: r.rest().to_vec(),
+                });
+            }
             opcode::P_DATA_V2 => {
                 let p = r.take(3)?;
                 let peer_id = u32::from_be_bytes([0, p[0], p[1], p[2]]);
-                return Ok(Packet::DataV2 { key_id, peer_id, payload: r.rest().to_vec() });
+                return Ok(Packet::DataV2 {
+                    key_id,
+                    peer_id,
+                    payload: r.rest().to_vec(),
+                });
             }
             _ => {}
         }
@@ -516,7 +537,11 @@ impl Packet {
             Wrapping::None => None,
             Wrapping::TlsAuth { hmac_len } => {
                 let hmac = r.take(hmac_len)?.to_vec();
-                Some(TlsAuth { hmac, packet_id: r.u32_be()?, net_time: r.u32_be()? })
+                Some(TlsAuth {
+                    hmac,
+                    packet_id: r.u32_be()?,
+                    net_time: r.u32_be()?,
+                })
             }
             Wrapping::TlsCrypt => {
                 let packet_id = r.u32_be()?;
@@ -525,8 +550,18 @@ impl Packet {
                 tag.copy_from_slice(r.take(TLS_CRYPT_TAG_LEN)?);
                 let ciphertext = r.rest();
                 check_tls_crypt(kind, ciphertext)?;
-                let body = TlsCrypt { session_id, packet_id, net_time, tag, ciphertext: ciphertext.to_vec() };
-                return Ok(Packet::Control { kind, key_id, body: ControlBody::TlsCrypt(body) });
+                let body = TlsCrypt {
+                    session_id,
+                    packet_id,
+                    net_time,
+                    tag,
+                    ciphertext: ciphertext.to_vec(),
+                };
+                return Ok(Packet::Control {
+                    kind,
+                    key_id,
+                    body: ControlBody::TlsCrypt(body),
+                });
             }
         };
         let count = r.u8()?;
@@ -540,13 +575,30 @@ impl Packet {
             for _ in 0..count {
                 ids.push(r.u32_be()?);
             }
-            Some(Ack { ids, remote_session_id: r.session_id()? })
+            Some(Ack {
+                ids,
+                remote_session_id: r.session_id()?,
+            })
         };
         // OpenVPN reads no message ID from P_ACK_V1 and ignores the rest.
-        let message_id = if kind == ControlKind::AckV1 { 0 } else { r.u32_be()? };
+        let message_id = if kind == ControlKind::AckV1 {
+            0
+        } else {
+            r.u32_be()?
+        };
         let payload = r.rest().to_vec();
-        let body = Control { session_id, tls_auth, ack, message_id, payload };
-        Ok(Packet::Control { kind, key_id, body: ControlBody::Plain(body) })
+        let body = Control {
+            session_id,
+            tls_auth,
+            ack,
+            message_id,
+            payload,
+        };
+        Ok(Packet::Control {
+            kind,
+            key_id,
+            body: ControlBody::Plain(body),
+        })
     }
 
     /// The packet's opcode.
@@ -570,7 +622,9 @@ impl Packet {
     /// The packet's key ID.
     pub fn key_id(&self) -> u8 {
         match self {
-            Packet::Control { key_id, .. } | Packet::DataV1 { key_id, .. } | Packet::DataV2 { key_id, .. } => *key_id,
+            Packet::Control { key_id, .. }
+            | Packet::DataV1 { key_id, .. }
+            | Packet::DataV2 { key_id, .. } => *key_id,
         }
     }
 
@@ -578,10 +632,19 @@ impl Packet {
     /// give [`Wrapping::None`], since they ignore it.
     pub fn wrapping(&self) -> Wrapping {
         match self {
-            Packet::Control { body: ControlBody::TlsCrypt(_), .. } => Wrapping::TlsCrypt,
-            Packet::Control { body: ControlBody::Plain(Control { tls_auth: Some(a), .. }), .. } => {
-                Wrapping::TlsAuth { hmac_len: a.hmac.len() }
-            }
+            Packet::Control {
+                body: ControlBody::TlsCrypt(_),
+                ..
+            } => Wrapping::TlsCrypt,
+            Packet::Control {
+                body:
+                    ControlBody::Plain(Control {
+                        tls_auth: Some(a), ..
+                    }),
+                ..
+            } => Wrapping::TlsAuth {
+                hmac_len: a.hmac.len(),
+            },
             _ => Wrapping::None,
         }
     }
@@ -597,14 +660,20 @@ impl Packet {
         let mut out = vec![first_byte(self.opcode(), key_id)];
         let payload: &[u8] = match self {
             Packet::DataV1 { payload, .. } => payload,
-            Packet::DataV2 { peer_id, payload, .. } => {
+            Packet::DataV2 {
+                peer_id, payload, ..
+            } => {
                 if *peer_id > MAX_PEER_ID {
                     return Err(Error::Unwritable);
                 }
                 out.extend_from_slice(&peer_id.to_be_bytes()[1..]);
                 payload
             }
-            Packet::Control { kind, body: ControlBody::TlsCrypt(c), .. } => {
+            Packet::Control {
+                kind,
+                body: ControlBody::TlsCrypt(c),
+                ..
+            } => {
                 check_tls_crypt(*kind, &c.ciphertext).map_err(|_| Error::Unwritable)?;
                 out.extend_from_slice(&c.session_id);
                 out.extend_from_slice(&c.packet_id.to_be_bytes());
@@ -612,7 +681,11 @@ impl Packet {
                 out.extend_from_slice(&c.tag);
                 &c.ciphertext
             }
-            Packet::Control { kind, body: ControlBody::Plain(c), .. } => {
+            Packet::Control {
+                kind,
+                body: ControlBody::Plain(c),
+                ..
+            } => {
                 if kind.carries_wrapped_key() {
                     return Err(Error::Unwritable);
                 }
@@ -698,10 +771,7 @@ impl Wire for Frame {
 
     /// Reads one envelope. Refuses zero length, truncation, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        match Frames::<Frame>::new()
-            .decode(bytes, true)
-?
-        {
+        match Frames::<Frame>::new().decode(bytes, true)? {
             Step::Item(frame, used) if used == bytes.len() => Ok(frame),
             Step::Item(_, _) => Err(Error::Trailing),
             _ => Err(Error::Truncated),
@@ -806,10 +876,14 @@ impl Prefixed for Frame {
     const NAME: &'static str = "OpenVPN/TCP";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_PACKET }
+    fn default_limit() -> Self::Limit {
+        MAX_PACKET
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_PACKET) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_PACKET)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -818,35 +892,34 @@ impl Prefixed for Frame {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         if let Some(&[hi, lo]) = input.get(..LENGTH_PREFIX_LEN) {
             let length = usize::from(u16::from_be_bytes([hi, lo]));
             if length > limit {
-                return Err(Error::OverLimit {
-                    length,
-                    limit,
-                });
+                return Err(Error::OverLimit { length, limit });
             }
         }
         Ok(split_tcp(input)?.map(|(packet, used)| (Frame(packet.to_vec()), used)))
     }
 }
 
-
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Truncated }
+    fn from(_: Truncated) -> Self {
+        Error::Truncated
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn wire(packet: &Packet) -> Result<Vec<u8>, Error> {
@@ -863,12 +936,12 @@ mod tests {
                     };
                 }
                 authenticated!(
-                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-                    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-                    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
-                    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
+                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                    22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41,
+                    42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61,
+                    62, 63, 64
                 )
-            },
+            }
         }
     }
 
@@ -880,7 +953,11 @@ mod tests {
     const SERVER_SID: SessionId = [0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8];
 
     fn plain(kind: ControlKind, c: Control) -> Packet {
-        Packet::Control { kind, key_id: 0, body: ControlBody::Plain(c) }
+        Packet::Control {
+            kind,
+            key_id: 0,
+            body: ControlBody::Plain(c),
+        }
     }
 
     // Layouts from doc/protocol and ssl_pkt.h in the OpenVPN source.
@@ -906,7 +983,13 @@ mod tests {
         let p = Packet::parse_with(&bytes, Wrapping::None).unwrap();
         let want = plain(
             ControlKind::HardResetClientV2,
-            Control { session_id: CLIENT_SID, tls_auth: None, ack: None, message_id: 0, payload: vec![] },
+            Control {
+                session_id: CLIENT_SID,
+                tls_auth: None,
+                ack: None,
+                message_id: 0,
+                payload: vec![],
+            },
         );
         assert_eq!(p, want);
         assert_eq!(wire(&p).unwrap(), bytes);
@@ -924,12 +1007,22 @@ mod tests {
         bytes.extend_from_slice(&[0, 0, 0, 0]);
         let p = Packet::parse_with(&bytes, Wrapping::None).unwrap();
         let ControlBody::Plain(c) = (match &p {
-            Packet::Control { kind: ControlKind::HardResetServerV2, body, .. } => body.clone(),
+            Packet::Control {
+                kind: ControlKind::HardResetServerV2,
+                body,
+                ..
+            } => body.clone(),
             _ => panic!(),
         }) else {
             panic!()
         };
-        assert_eq!(c.ack, Some(Ack { ids: vec![0], remote_session_id: CLIENT_SID }));
+        assert_eq!(
+            c.ack,
+            Some(Ack {
+                ids: vec![0],
+                remote_session_id: CLIENT_SID
+            })
+        );
         assert_eq!(c.session_id, SERVER_SID);
         assert_eq!(wire(&p).unwrap(), bytes);
     }
@@ -939,11 +1032,18 @@ mod tests {
         let c = Control {
             session_id: CLIENT_SID,
             tls_auth: None,
-            ack: Some(Ack { ids: vec![1, 2], remote_session_id: SERVER_SID }),
+            ack: Some(Ack {
+                ids: vec![1, 2],
+                remote_session_id: SERVER_SID,
+            }),
             message_id: 3,
             payload: vec![0x16, 0x03, 0x01],
         };
-        let p = Packet::Control { kind: ControlKind::ControlV1, key_id: 2, body: ControlBody::Plain(c) };
+        let p = Packet::Control {
+            kind: ControlKind::ControlV1,
+            key_id: 2,
+            body: ControlBody::Plain(c),
+        };
         let b = wire(&p).unwrap();
         assert_eq!(b[0], 0x22);
         assert_eq!(b.len(), 1 + 8 + 1 + 8 + 8 + 4 + 3);
@@ -963,7 +1063,11 @@ mod tests {
         // The writer refuses a message ID set by mistake, which the reader
         // would not give back.
         let mut odd = p.clone();
-        if let Packet::Control { body: ControlBody::Plain(c), .. } = &mut odd {
+        if let Packet::Control {
+            body: ControlBody::Plain(c),
+            ..
+        } = &mut odd
+        {
             c.message_id = 9;
         }
         assert_eq!(wire(&odd), Err(Error::Unwritable));
@@ -971,7 +1075,13 @@ mod tests {
         // message ID for P_ACK_V1 and stops), so they are kept as payload.
         bytes.extend_from_slice(&[0xaa, 0xbb]);
         let p = Packet::parse_with(&bytes, Wrapping::None).unwrap();
-        let Packet::Control { body: ControlBody::Plain(c), .. } = &p else { panic!() };
+        let Packet::Control {
+            body: ControlBody::Plain(c),
+            ..
+        } = &p
+        else {
+            panic!()
+        };
         assert_eq!((c.message_id, &c.payload[..]), (0, &[0xaa, 0xbb][..]));
         assert_eq!(wire(&p).unwrap(), bytes);
     }
@@ -979,11 +1089,29 @@ mod tests {
     #[test]
     fn data_packets() {
         let p = Packet::parse_with(&[0x30, 1, 2, 3], Wrapping::None).unwrap();
-        assert_eq!(p, Packet::DataV1 { key_id: 0, payload: vec![1, 2, 3] });
-        let p = Packet::parse_with(&[0x49, 0x00, 0x00, 0x05, 0xde, 0xad], Wrapping::TlsCrypt).unwrap();
-        assert_eq!(p, Packet::DataV2 { key_id: 1, peer_id: 5, payload: vec![0xde, 0xad] });
+        assert_eq!(
+            p,
+            Packet::DataV1 {
+                key_id: 0,
+                payload: vec![1, 2, 3]
+            }
+        );
+        let p =
+            Packet::parse_with(&[0x49, 0x00, 0x00, 0x05, 0xde, 0xad], Wrapping::TlsCrypt).unwrap();
+        assert_eq!(
+            p,
+            Packet::DataV2 {
+                key_id: 1,
+                peer_id: 5,
+                payload: vec![0xde, 0xad]
+            }
+        );
         assert_eq!(wire(&p).unwrap(), [0x49, 0, 0, 5, 0xde, 0xad]);
-        let p = Packet::DataV2 { key_id: 1, peer_id: NO_PEER_ID, payload: vec![] };
+        let p = Packet::DataV2 {
+            key_id: 1,
+            peer_id: NO_PEER_ID,
+            payload: vec![],
+        };
         assert_eq!(wire(&p).unwrap(), [0x49, 0xff, 0xff, 0xff]);
         assert_eq!(
             Packet::parse_with(&wire(&p).unwrap(), Wrapping::None),
@@ -999,8 +1127,21 @@ mod tests {
         bytes.extend_from_slice(&[0, 0, 0, 1, 0x5f, 0, 0, 0]);
         bytes.extend_from_slice(&[0, 0, 0, 0, 0]);
         let p = Packet::parse_with(&bytes, Wrapping::TlsAuth { hmac_len: 20 }).unwrap();
-        let Packet::Control { body: ControlBody::Plain(c), .. } = &p else { panic!() };
-        assert_eq!(c.tls_auth, Some(TlsAuth { hmac: vec![0xee; 20], packet_id: 1, net_time: 0x5f00_0000 }));
+        let Packet::Control {
+            body: ControlBody::Plain(c),
+            ..
+        } = &p
+        else {
+            panic!()
+        };
+        assert_eq!(
+            c.tls_auth,
+            Some(TlsAuth {
+                hmac: vec![0xee; 20],
+                packet_id: 1,
+                net_time: 0x5f00_0000
+            })
+        );
         assert_eq!(p.wrapping(), Wrapping::TlsAuth { hmac_len: 20 });
         assert_eq!(wire(&p).unwrap(), bytes);
         assert_eq!(
@@ -1033,7 +1174,14 @@ mod tests {
             .is_ok()
         );
         assert_eq!(p.session_id(), Some(CLIENT_SID));
-        assert_eq!(Packet::DataV1 { key_id: 0, payload: vec![] }.session_id(), None);
+        assert_eq!(
+            Packet::DataV1 {
+                key_id: 0,
+                payload: vec![]
+            }
+            .session_id(),
+            None
+        );
     }
 
     /// A wrapped client key of `len` bytes, ending with its length.
@@ -1053,11 +1201,24 @@ mod tests {
         bytes.extend_from_slice(&[0x77; 32]);
         bytes.extend_from_slice(&ciphertext);
         let p = Packet::parse_with(&bytes, Wrapping::TlsCrypt).unwrap();
-        let want = TlsCrypt { session_id: CLIENT_SID, packet_id: 1, net_time: 2, tag: [0x77; 32], ciphertext };
-        assert_eq!(want.split_wrapped_key(), Some((&[9, 8, 7, 6, 5][..], &want.ciphertext[5..])));
+        let want = TlsCrypt {
+            session_id: CLIENT_SID,
+            packet_id: 1,
+            net_time: 2,
+            tag: [0x77; 32],
+            ciphertext,
+        };
+        assert_eq!(
+            want.split_wrapped_key(),
+            Some((&[9, 8, 7, 6, 5][..], &want.ciphertext[5..]))
+        );
         assert_eq!(
             p,
-            Packet::Control { kind: ControlKind::HardResetClientV3, key_id: 0, body: ControlBody::TlsCrypt(want) }
+            Packet::Control {
+                kind: ControlKind::HardResetClientV3,
+                key_id: 0,
+                body: ControlBody::TlsCrypt(want)
+            }
         );
         assert_eq!(p.wrapping(), Wrapping::TlsCrypt);
         assert_eq!(wire(&p).unwrap(), bytes);
@@ -1077,7 +1238,10 @@ mod tests {
     fn tls_crypt_v2_kinds_need_tls_crypt() {
         // A V3 hard reset or a WKC control packet is only sent with
         // tls-crypt-v2, so no other wrapping reads one.
-        for (first, kind) in [(0x50, ControlKind::HardResetClientV3), (0x58, ControlKind::ControlWkcV1)] {
+        for (first, kind) in [
+            (0x50, ControlKind::HardResetClientV3),
+            (0x58, ControlKind::ControlWkcV1),
+        ] {
             let mut b = vec![first];
             b.extend_from_slice(&[1; 8]);
             b.extend_from_slice(&[0; 5]);
@@ -1091,7 +1255,13 @@ mod tests {
             );
             let p = plain(
                 kind,
-                Control { session_id: CLIENT_SID, tls_auth: None, ack: None, message_id: 0, payload: vec![] },
+                Control {
+                    session_id: CLIENT_SID,
+                    tls_auth: None,
+                    ack: None,
+                    message_id: 0,
+                    payload: vec![],
+                },
             );
             assert_eq!(wire(&p), Err(Error::Unwritable));
         }
@@ -1134,9 +1304,19 @@ mod tests {
             }
         }
         // The writer refuses what the reader refuses.
-        let t = TlsCrypt { session_id: CLIENT_SID, packet_id: 0, net_time: 0, tag: [0; 32], ciphertext: vec![9, 8, 7] };
+        let t = TlsCrypt {
+            session_id: CLIENT_SID,
+            packet_id: 0,
+            net_time: 0,
+            tag: [0; 32],
+            ciphertext: vec![9, 8, 7],
+        };
         assert_eq!(t.split_wrapped_key(), None);
-        let p = Packet::Control { kind: ControlKind::HardResetClientV3, key_id: 0, body: ControlBody::TlsCrypt(t) };
+        let p = Packet::Control {
+            kind: ControlKind::HardResetClientV3,
+            key_id: 0,
+            body: ControlBody::TlsCrypt(t),
+        };
         assert_eq!(wire(&p), Err(Error::Unwritable));
     }
 
@@ -1144,12 +1324,33 @@ mod tests {
     fn tls_crypt_ciphertext_has_room_for_its_fields() {
         // A control packet encrypts at least an ack count and a message
         // packet ID, 5 bytes, and a P_ACK_V1 at least the count.
-        for (first, kind) in [(0x20, ControlKind::ControlV1), (0x38, ControlKind::HardResetClientV2)] {
-            assert_eq!(Packet::parse_with(&tls_crypt_bytes(first, &[]), Wrapping::TlsCrypt), Err(Error::Truncated));
-            assert_eq!(Packet::parse_with(&tls_crypt_bytes(first, &[0; 4]), Wrapping::TlsCrypt), Err(Error::Truncated));
-            assert!(Packet::parse_with(&tls_crypt_bytes(first, &[0; 5]), Wrapping::TlsCrypt).is_ok());
-            let t = TlsCrypt { session_id: CLIENT_SID, packet_id: 0, net_time: 0, tag: [0; 32], ciphertext: vec![] };
-            let p = Packet::Control { kind, key_id: 0, body: ControlBody::TlsCrypt(t) };
+        for (first, kind) in [
+            (0x20, ControlKind::ControlV1),
+            (0x38, ControlKind::HardResetClientV2),
+        ] {
+            assert_eq!(
+                Packet::parse_with(&tls_crypt_bytes(first, &[]), Wrapping::TlsCrypt),
+                Err(Error::Truncated)
+            );
+            assert_eq!(
+                Packet::parse_with(&tls_crypt_bytes(first, &[0; 4]), Wrapping::TlsCrypt),
+                Err(Error::Truncated)
+            );
+            assert!(
+                Packet::parse_with(&tls_crypt_bytes(first, &[0; 5]), Wrapping::TlsCrypt).is_ok()
+            );
+            let t = TlsCrypt {
+                session_id: CLIENT_SID,
+                packet_id: 0,
+                net_time: 0,
+                tag: [0; 32],
+                ciphertext: vec![],
+            };
+            let p = Packet::Control {
+                kind,
+                key_id: 0,
+                body: ControlBody::TlsCrypt(t),
+            };
             assert_eq!(wire(&p), Err(Error::Unwritable));
         }
         assert_eq!(
@@ -1215,38 +1416,89 @@ mod tests {
             assert!(!e.to_string().is_empty());
         }
         assert!(!Error::ZeroLength.to_string().is_empty());
-        assert_eq!(Error::Unwritable.to_string(), "value cannot be written without changing it");
+        assert_eq!(
+            Error::Unwritable.to_string(),
+            "value cannot be written without changing it"
+        );
     }
 
     /// Every packet the tests build, with the wrapping that reads it.
     fn samples() -> Vec<Packet> {
-        let ack = Some(Ack { ids: vec![4, 5, 6], remote_session_id: SERVER_SID });
-        let tls_auth = Some(TlsAuth { hmac: vec![3; 20], packet_id: 7, net_time: 8 });
+        let ack = Some(Ack {
+            ids: vec![4, 5, 6],
+            remote_session_id: SERVER_SID,
+        });
+        let tls_auth = Some(TlsAuth {
+            hmac: vec![3; 20],
+            packet_id: 7,
+            net_time: 8,
+        });
         let mut out = vec![
-            Packet::DataV1 { key_id: 3, payload: vec![1, 2, 3] },
-            Packet::DataV2 { key_id: 1, peer_id: 77, payload: vec![4, 5] },
+            Packet::DataV1 {
+                key_id: 3,
+                payload: vec![1, 2, 3],
+            },
+            Packet::DataV2 {
+                key_id: 1,
+                peer_id: 77,
+                payload: vec![4, 5],
+            },
         ];
         for kind in ControlKind::ALL {
             if kind.carries_wrapped_key() {
                 // Only ever sent with tls-crypt-v2.
                 let mut ciphertext = vec![6; 10];
                 ciphertext.extend_from_slice(&wrapped_key(MIN_WRAPPED_KEY_LEN));
-                let t = TlsCrypt { session_id: CLIENT_SID, packet_id: 1, net_time: 2, tag: [5; 32], ciphertext };
-                out.push(Packet::Control { kind, key_id: 0, body: ControlBody::TlsCrypt(t) });
+                let t = TlsCrypt {
+                    session_id: CLIENT_SID,
+                    packet_id: 1,
+                    net_time: 2,
+                    tag: [5; 32],
+                    ciphertext,
+                };
+                out.push(Packet::Control {
+                    kind,
+                    key_id: 0,
+                    body: ControlBody::TlsCrypt(t),
+                });
                 continue;
             }
-            for (tls_auth, ack) in [(None, None), (tls_auth.clone(), ack.clone()), (None, ack.clone())] {
+            for (tls_auth, ack) in [
+                (None, None),
+                (tls_auth.clone(), ack.clone()),
+                (None, ack.clone()),
+            ] {
                 let payload = vec![0x16, 3, 3];
                 let message_id = if kind == ControlKind::AckV1 { 0 } else { 42 };
-                let c = Control { session_id: CLIENT_SID, tls_auth, ack, message_id, payload };
-                out.push(Packet::Control { kind, key_id: 2, body: ControlBody::Plain(c) });
+                let c = Control {
+                    session_id: CLIENT_SID,
+                    tls_auth,
+                    ack,
+                    message_id,
+                    payload,
+                };
+                out.push(Packet::Control {
+                    kind,
+                    key_id: 2,
+                    body: ControlBody::Plain(c),
+                });
             }
             let mut ciphertext = vec![6; 10];
             if kind.carries_wrapped_key() {
                 ciphertext.extend_from_slice(&wrapped_key(MIN_WRAPPED_KEY_LEN));
             }
-            let t = TlsCrypt { session_id: CLIENT_SID, packet_id: 1, net_time: 2, tag: [5; 32], ciphertext };
-            out.push(Packet::Control { kind, key_id: 0, body: ControlBody::TlsCrypt(t) });
+            let t = TlsCrypt {
+                session_id: CLIENT_SID,
+                packet_id: 1,
+                net_time: 2,
+                tag: [5; 32],
+                ciphertext,
+            };
+            out.push(Packet::Control {
+                kind,
+                key_id: 0,
+                body: ControlBody::TlsCrypt(t),
+            });
         }
         out
     }
@@ -1270,8 +1522,14 @@ mod tests {
             let w = p.wrapping();
             // Where the fixed fields end and the payload starts.
             let header = match &p {
-                Packet::DataV1 { payload, .. } | Packet::DataV2 { payload, .. } => b.len() - payload.len(),
-                Packet::Control { kind, body: ControlBody::TlsCrypt(t), .. } => {
+                Packet::DataV1 { payload, .. } | Packet::DataV2 { payload, .. } => {
+                    b.len() - payload.len()
+                }
+                Packet::Control {
+                    kind,
+                    body: ControlBody::TlsCrypt(t),
+                    ..
+                } => {
                     if kind.carries_wrapped_key() {
                         // Cutting the end cuts the wrapped key's length, so
                         // no prefix reads.
@@ -1280,7 +1538,10 @@ mod tests {
                         b.len() - t.ciphertext.len() + kind.min_tls_crypt_body()
                     }
                 }
-                Packet::Control { body: ControlBody::Plain(c), .. } => b.len() - c.payload.len(),
+                Packet::Control {
+                    body: ControlBody::Plain(c),
+                    ..
+                } => b.len() - c.payload.len(),
             };
             for n in 0..b.len() {
                 let got = Packet::parse_with(&b[..n], w);
@@ -1303,37 +1564,91 @@ mod tests {
     fn writers_refuse_what_the_reader_would_not_give_back() {
         // The longest packet is written whole, and one byte more is refused
         // rather than cut.
-        let p = Packet::DataV1 { key_id: 0, payload: vec![7; MAX_PACKET - 1] };
-        assert_eq!(Packet::parse_with(&wire(&p).unwrap(), Wrapping::None), Ok(p.clone()));
+        let p = Packet::DataV1 {
+            key_id: 0,
+            payload: vec![7; MAX_PACKET - 1],
+        };
+        assert_eq!(
+            Packet::parse_with(&wire(&p).unwrap(), Wrapping::None),
+            Ok(p.clone())
+        );
         assert_eq!(envelope(&p).unwrap().len(), MAX_TCP_FRAME);
-        let p = Packet::DataV1 { key_id: 0, payload: vec![0; MAX_PACKET] };
+        let p = Packet::DataV1 {
+            key_id: 0,
+            payload: vec![0; MAX_PACKET],
+        };
         assert_eq!(wire(&p), Err(Error::Unwritable));
         assert_eq!(envelope(&p), Err(Error::Unwritable));
         // A tls-crypt ciphertext is never cut, which would leave its tag
         // over bytes that are not there.
-        let t =
-            TlsCrypt { session_id: CLIENT_SID, packet_id: 0, net_time: 0, tag: [0; 32], ciphertext: vec![1; 65487] };
-        let p = Packet::Control { kind: ControlKind::ControlV1, key_id: 0, body: ControlBody::TlsCrypt(t) };
+        let t = TlsCrypt {
+            session_id: CLIENT_SID,
+            packet_id: 0,
+            net_time: 0,
+            tag: [0; 32],
+            ciphertext: vec![1; 65487],
+        };
+        let p = Packet::Control {
+            kind: ControlKind::ControlV1,
+            key_id: 0,
+            body: ControlBody::TlsCrypt(t),
+        };
         assert_eq!(wire(&p), Err(Error::Unwritable));
         // Key IDs and peer IDs too large for their bits.
-        let p = Packet::DataV2 { key_id: 9, peer_id: 5, payload: vec![] };
+        let p = Packet::DataV2 {
+            key_id: 9,
+            peer_id: 5,
+            payload: vec![],
+        };
         assert_eq!(wire(&p), Err(Error::Unwritable));
-        let p = Packet::DataV2 { key_id: 1, peer_id: 0x0100_0005, payload: vec![] };
+        let p = Packet::DataV2 {
+            key_id: 1,
+            peer_id: 0x0100_0005,
+            payload: vec![],
+        };
         assert_eq!(wire(&p), Err(Error::Unwritable));
-        let control = |tls_auth, ack| Control { session_id: CLIENT_SID, tls_auth, ack, message_id: 1, payload: vec![] };
-        let p =
-            Packet::Control { kind: ControlKind::ControlV1, key_id: 8, body: ControlBody::Plain(control(None, None)) };
+        let control = |tls_auth, ack| Control {
+            session_id: CLIENT_SID,
+            tls_auth,
+            ack,
+            message_id: 1,
+            payload: vec![],
+        };
+        let p = Packet::Control {
+            kind: ControlKind::ControlV1,
+            key_id: 8,
+            body: ControlBody::Plain(control(None, None)),
+        };
         assert_eq!(wire(&p), Err(Error::Unwritable));
         // An HMAC too long, too many acks, and an Ack with none.
         let p = plain(
             ControlKind::ControlV1,
-            control(Some(TlsAuth { hmac: vec![1; MAX_HMAC_LEN + 1], packet_id: 0, net_time: 0 }), None),
+            control(
+                Some(TlsAuth {
+                    hmac: vec![1; MAX_HMAC_LEN + 1],
+                    packet_id: 0,
+                    net_time: 0,
+                }),
+                None,
+            ),
         );
-        assert_eq!(p.wrapping(), Wrapping::TlsAuth { hmac_len: MAX_HMAC_LEN + 1 });
+        assert_eq!(
+            p.wrapping(),
+            Wrapping::TlsAuth {
+                hmac_len: MAX_HMAC_LEN + 1
+            }
+        );
         assert_eq!(wire(&p), Err(Error::Unwritable));
         let p = plain(
             ControlKind::ControlV1,
-            control(Some(TlsAuth { hmac: vec![1; MAX_HMAC_LEN], packet_id: 0, net_time: 0 }), None),
+            control(
+                Some(TlsAuth {
+                    hmac: vec![1; MAX_HMAC_LEN],
+                    packet_id: 0,
+                    net_time: 0,
+                }),
+                None,
+            ),
         );
         assert_eq!(Packet::parse_with(&wire(&p).unwrap(), p.wrapping()), Ok(p));
         for (n, want) in [
@@ -1341,7 +1656,10 @@ mod tests {
             (MAX_ACKS + 1, Some(Error::Unwritable)),
             (300, Some(Error::Unwritable)),
         ] {
-            let ack = Ack { ids: (0..n as u32).collect(), remote_session_id: SERVER_SID };
+            let ack = Ack {
+                ids: (0..n as u32).collect(),
+                remote_session_id: SERVER_SID,
+            };
             let p = plain(ControlKind::ControlV1, control(None, Some(ack)));
             match want {
                 None => assert_eq!(
@@ -1351,7 +1669,16 @@ mod tests {
                 Some(e) => assert_eq!(wire(&p), Err(e)),
             }
         }
-        let p = plain(ControlKind::ControlV1, control(None, Some(Ack { ids: vec![], remote_session_id: SERVER_SID })));
+        let p = plain(
+            ControlKind::ControlV1,
+            control(
+                None,
+                Some(Ack {
+                    ids: vec![],
+                    remote_session_id: SERVER_SID,
+                }),
+            ),
+        );
         assert_eq!(wire(&p), Err(Error::Unwritable));
         assert_eq!(Frame(vec![]).to_bytes(), Err(Error::Unwritable));
         assert_eq!(
@@ -1373,10 +1700,7 @@ mod tests {
         );
         let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&[0, 0, 0, 1, 0x30]), 5);
-        assert_eq!(
-            stream.next(),
-            Some(Err(Fail::Protocol(Error::ZeroLength)))
-        );
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::ZeroLength))));
         assert!(stream.next().is_none());
         assert_eq!(stream.push(&a), a.len());
     }
@@ -1393,29 +1717,36 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
-        assert_linear("stream_takes_many_small_packets_in_linear_time", rounds(50_000), |size| {
-            let bytes = Frame(vec![0x30, 1]).to_bytes().unwrap().repeat(size);
-            let (items, error) = decode_all(Frames::<Frame>::new, &bytes);
-            assert_eq!(error, None);
-            assert_eq!(items.len(), size);
-            assert!(items.iter().all(|p| p.0 == [0x30, 1]));
-        });
+        assert_linear(
+            "stream_takes_many_small_packets_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let bytes = Frame(vec![0x30, 1]).to_bytes().unwrap().repeat(size);
+                let (items, error) = decode_all(Frames::<Frame>::new, &bytes);
+                assert_eq!(error, None);
+                assert_eq!(items.len(), size);
+                assert!(items.iter().all(|p| p.0 == [0x30, 1]));
+            },
+        );
     }
 
     #[test]
     fn authenticated_writes_every_supported_hmac_length() {
         for hmac_len in 0..=MAX_HMAC_LEN {
-            let packet = plain(ControlKind::ControlV1, Control {
-                session_id: CLIENT_SID,
-                tls_auth: Some(TlsAuth {
-                    hmac: vec![0x5a; hmac_len],
-                    packet_id: 1,
-                    net_time: 2,
-                }),
-                ack: None,
-                message_id: 3,
-                payload: vec![4],
-            });
+            let packet = plain(
+                ControlKind::ControlV1,
+                Control {
+                    session_id: CLIENT_SID,
+                    tls_auth: Some(TlsAuth {
+                        hmac: vec![0x5a; hmac_len],
+                        packet_id: 1,
+                        net_time: 2,
+                    }),
+                    ack: None,
+                    message_id: 3,
+                    payload: vec![4],
+                },
+            );
             let bytes = wire(&packet).unwrap();
             assert_eq!(Packet::parse_with(&bytes, packet.wrapping()), Ok(packet));
         }
@@ -1429,7 +1760,9 @@ mod tests {
             Wrapping::TlsAuth { hmac_len: 0 },
             Wrapping::TlsAuth { hmac_len: 20 },
             Wrapping::TlsAuth { hmac_len: 32 },
-            Wrapping::TlsAuth { hmac_len: MAX_HMAC_LEN },
+            Wrapping::TlsAuth {
+                hmac_len: MAX_HMAC_LEN,
+            },
             Wrapping::TlsCrypt,
         ];
         for i in 0..rounds(20_000) {
@@ -1454,8 +1787,13 @@ mod tests {
             if let Some(&first) = b.first()
                 && ControlKind::from_opcode(split_first_byte(first).0).is_some()
             {
-                let too_long = Wrapping::TlsAuth { hmac_len: MAX_HMAC_LEN + 1 };
-                assert_eq!(Packet::parse_with(&b, too_long), Err(Error::HmacLen(MAX_HMAC_LEN + 1)));
+                let too_long = Wrapping::TlsAuth {
+                    hmac_len: MAX_HMAC_LEN + 1,
+                };
+                assert_eq!(
+                    Packet::parse_with(&b, too_long),
+                    Err(Error::HmacLen(MAX_HMAC_LEN + 1))
+                );
             }
             contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_TCP_FRAME);
             contract::check_wire::<Frame>(&b);
@@ -1502,14 +1840,21 @@ mod tests {
                     .is_some_and(|a| a.ids.is_empty() || a.ids.len() > MAX_ACKS)
                 || (kind == ControlKind::AckV1 && message_id != 0))
                 .then_some(Error::Unwritable);
-            let p = Packet::Control { kind, key_id, body: ControlBody::Plain(c) };
+            let p = Packet::Control {
+                kind,
+                key_id,
+                body: ControlBody::Plain(c),
+            };
             match want {
                 Some(e) => assert_eq!(wire(&p), Err(e), "{p:?}"),
                 None => {
                     let b = wire(&p).unwrap();
                     assert_eq!(Packet::parse_with(&b, p.wrapping()), Ok(p.clone()));
                     let bytes = Frame(b.clone()).to_bytes().unwrap();
-                    assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (vec![Frame(b)], None));
+                    assert_eq!(
+                        decode_all(Frames::<Frame>::new, &bytes),
+                        (vec![Frame(b)], None)
+                    );
                 }
             }
             // The same kind wrapped with tls-crypt, with a ciphertext that
@@ -1520,12 +1865,31 @@ mod tests {
             if with_key {
                 ciphertext.extend_from_slice(&wrapped_key(MIN_WRAPPED_KEY_LEN + rng.index(4)));
             }
-            let body_len = ciphertext.len() - if with_key { wrapped_key_len(&ciphertext).unwrap() } else { 0 };
+            let body_len = ciphertext.len()
+                - if with_key {
+                    wrapped_key_len(&ciphertext).unwrap()
+                } else {
+                    0
+                };
             let fits = key_id <= MAX_KEY_ID
                 && (!kind.carries_wrapped_key() || with_key)
-                && if kind.carries_wrapped_key() { body_len } else { ciphertext.len() } >= kind.min_tls_crypt_body();
-            let t = TlsCrypt { session_id: [4; 8], packet_id: 5, net_time: 6, tag: [7; 32], ciphertext };
-            let p = Packet::Control { kind, key_id, body: ControlBody::TlsCrypt(t) };
+                && if kind.carries_wrapped_key() {
+                    body_len
+                } else {
+                    ciphertext.len()
+                } >= kind.min_tls_crypt_body();
+            let t = TlsCrypt {
+                session_id: [4; 8],
+                packet_id: 5,
+                net_time: 6,
+                tag: [7; 32],
+                ciphertext,
+            };
+            let p = Packet::Control {
+                kind,
+                key_id,
+                body: ControlBody::TlsCrypt(t),
+            };
             match wire(&p) {
                 Ok(b) => {
                     assert!(fits, "{p:?}");
@@ -1541,14 +1905,20 @@ mod tests {
             let payload_len = rng.index(20);
             let payload = rng.bytes(payload_len);
             for p in [
-                Packet::DataV1 { key_id, payload: payload.clone() },
-                Packet::DataV2 { key_id, peer_id, payload: payload.clone() },
+                Packet::DataV1 {
+                    key_id,
+                    payload: payload.clone(),
+                },
+                Packet::DataV2 {
+                    key_id,
+                    peer_id,
+                    payload: payload.clone(),
+                },
             ] {
                 match wire(&p) {
                     Ok(b) => assert_eq!(Packet::parse_with(&b, Wrapping::None), Ok(p)),
                     Err(e) => assert!(
-                        e == Error::Unwritable
-                            && (key_id > MAX_KEY_ID || peer_id > MAX_PEER_ID),
+                        e == Error::Unwritable && (key_id > MAX_KEY_ID || peer_id > MAX_PEER_ID),
                         "{p:?}: {e}"
                     ),
                 }

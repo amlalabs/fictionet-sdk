@@ -22,7 +22,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Poll, Waker};
 
 use fictionet::events::{self, Level};
-use fictionet::stdlib::{ports::{self, Ports}, ip};
+use fictionet::stdlib::{
+    ip,
+    ports::{self, Ports},
+};
 use fictionet::{Cx, Error, Interface, Packet};
 
 /// An address prefix, such as `104.18.32.7/32` or `::/0`.
@@ -48,16 +51,25 @@ impl FromStr for Prefix {
             Some((a, l)) => (a, Some(l)),
             None => (s, None),
         };
-        let addr: IpAddr = addr.parse().map_err(|_| fictionet::Error::msg(format!("{s:?} is not an address prefix")))?;
+        let addr: IpAddr = addr
+            .parse()
+            .map_err(|_| fictionet::Error::msg(format!("{s:?} is not an address prefix")))?;
         let max = if addr.is_ipv4() { 32 } else { 128 };
         let len = match len {
             None => max,
             Some(l) => match l.parse::<u8>() {
                 Ok(n) if n <= max && !l.starts_with('+') => n,
-                _ => return Err(fictionet::Error::msg(format!("{s:?}: the length must be 0 to {max}"))),
+                _ => {
+                    return Err(fictionet::Error::msg(format!(
+                        "{s:?}: the length must be 0 to {max}"
+                    )));
+                }
             },
         };
-        Ok(Prefix { addr: mask(addr, len), len })
+        Ok(Prefix {
+            addr: mask(addr, len),
+            len,
+        })
     }
 }
 
@@ -67,7 +79,10 @@ impl Prefix {
     /// whole address.
     pub fn canonical(self) -> Prefix {
         let len = self.len.min(if self.addr.is_ipv4() { 32 } else { 128 });
-        Prefix { addr: mask(self.addr, len), len }
+        Prefix {
+            addr: mask(self.addr, len),
+            len,
+        }
     }
 
     /// Whether `addr` is in this prefix. An address of the other family
@@ -88,12 +103,20 @@ fn mask(addr: IpAddr, len: u8) -> IpAddr {
     match addr {
         IpAddr::V4(a) => {
             let bits = u32::from(a);
-            let m = if len == 0 { 0 } else { u32::MAX << (32 - len.min(32) as u32) };
+            let m = if len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - len.min(32) as u32)
+            };
             IpAddr::V4(Ipv4Addr::from(bits & m))
         }
         IpAddr::V6(a) => {
             let bits = u128::from(a);
-            let m = if len == 0 { 0 } else { u128::MAX << (128 - len.min(128) as u32) };
+            let m = if len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - len.min(128) as u32)
+            };
             IpAddr::V6(Ipv6Addr::from(bits & m))
         }
     }
@@ -159,87 +182,122 @@ fn mask(addr: IpAddr, len: u8) -> IpAddr {
 /// told to [`keep_ttl`](Router::keep_ttl) changes no packet.
 #[track_caller]
 pub fn router<I: Interface>(fcx: &Cx, routes: Vec<(Prefix, I)>) -> Router<I> {
-    let (sender, changes) = Changes::channel(routes.into_iter().map(|(p, i)| Edit::Route(p, i)).collect());
-    let router = Router { handle: Arc::new(sender) };
-    fcx.spawn_as(|| "router".into(), move |fcx| async move {
-        let mut ports = Ports::new(Vec::new());
-        // Which port each prefix goes out on.
-        let mut table = Table::default();
-        let mut handles_gone = false;
-        let mut addrs = (None, None);
-        let mut keep_ttl = false;
-        loop {
-            let (edits, gone) = changes.drain();
-            handles_gone = handles_gone || gone;
-            for edit in edits {
-                let (prefix, interface) = match edit {
-                    Edit::Route(prefix, interface) => (prefix, interface),
-                    Edit::Address(addr) => {
-                        match addr {
-                            IpAddr::V4(a) => addrs.0 = Some(a),
-                            IpAddr::V6(a) => addrs.1 = Some(a),
+    let (sender, changes) =
+        Changes::channel(routes.into_iter().map(|(p, i)| Edit::Route(p, i)).collect());
+    let router = Router {
+        handle: Arc::new(sender),
+    };
+    fcx.spawn_as(
+        || "router".into(),
+        move |fcx| async move {
+            let mut ports = Ports::new(Vec::new());
+            // Which port each prefix goes out on.
+            let mut table = Table::default();
+            let mut handles_gone = false;
+            let mut addrs = (None, None);
+            let mut keep_ttl = false;
+            loop {
+                let (edits, gone) = changes.drain();
+                handles_gone = handles_gone || gone;
+                for edit in edits {
+                    let (prefix, interface) = match edit {
+                        Edit::Route(prefix, interface) => (prefix, interface),
+                        Edit::Address(addr) => {
+                            match addr {
+                                IpAddr::V4(a) => addrs.0 = Some(a),
+                                IpAddr::V6(a) => addrs.1 = Some(a),
+                            }
+                            continue;
                         }
-                        continue;
+                        Edit::KeepTtl => {
+                            keep_ttl = true;
+                            continue;
+                        }
+                    };
+                    let prefix = prefix.canonical();
+                    if let Some(link) = interface.observe_link() {
+                        link.label(&fcx, format!("{}/{}", prefix.addr, prefix.len));
                     }
-                    Edit::KeepTtl => { keep_ttl = true; continue; }
-                };
-                let prefix = prefix.canonical();
-                if let Some(link) = interface.observe_link() {
-                    link.label(&fcx, format!("{}/{}", prefix.addr, prefix.len));
+                    match table.routes.get(&prefix) {
+                        Some(&i) => ports.replace(i, interface),
+                        None => {
+                            let i = ports.add(interface);
+                            table.insert(prefix, i);
+                        }
+                    }
                 }
-                match table.routes.get(&prefix) {
-                    Some(&i) => ports.replace(i, interface),
-                    None => {
-                        let i = ports.add(interface);
-                        table.insert(prefix, i);
+                if table.is_empty() && handles_gone {
+                    return Ok(());
+                }
+                let event = ports
+                    .next(&fcx, None, |cx| changes.poll(cx, handles_gone))
+                    .await?;
+                match event {
+                    ports::Event::Packet(_, mut packet) => {
+                        let Some(dst) = ip::destination(&packet.0) else {
+                            continue;
+                        };
+                        if !keep_ttl
+                            && !is_own(addrs, dst)
+                            && !ip::source(&packet.0).is_some_and(|src| is_own(addrs, src))
+                            && ip::hop(&mut packet.0) == ip::Hop::Expired
+                        {
+                            expired(&fcx, addrs, &table, &mut ports, packet);
+                            continue;
+                        }
+                        if let Some(i) = table.best(dst) {
+                            ports.send(i, packet);
+                        }
                     }
+                    ports::Event::Closed(i) => {
+                        if let Some(prefix) = table.by_port.get(&i) {
+                            let prefix = format!("{}/{}", prefix.addr, prefix.len);
+                            let event = events::Event::new("router", "route_removed")
+                                .level(Level::Notice)
+                                .summary(format!("{prefix}: its interface closed"))
+                                .field("prefix", prefix);
+                            fcx.record(event);
+                        }
+                        table.remove_port(i)
+                    }
+                    ports::Event::Extra | ports::Event::Timer => {}
                 }
             }
-            if table.is_empty() && handles_gone {
-                return Ok(());
-            }
-            let event = ports
-                .next(&fcx, None, |cx| changes.poll(cx, handles_gone))
-                .await?;
-            match event {
-                ports::Event::Packet(_, mut packet) => {
-                    let Some(dst) = ip::destination(&packet.0) else { continue };
-                    if !keep_ttl
-                        && !is_own(addrs, dst)
-                        && !ip::source(&packet.0).is_some_and(|src| is_own(addrs, src))
-                        && ip::hop(&mut packet.0) == ip::Hop::Expired
-                    {
-                        expired(&fcx, addrs, &table, &mut ports, packet);
-                        continue;
-                    }
-                    if let Some(i) = table.best(dst) {
-                        ports.send(i, packet);
-                    }
-                }
-                ports::Event::Closed(i) => {
-                    if let Some(prefix) = table.by_port.get(&i) {
-                        let prefix = format!("{}/{}", prefix.addr, prefix.len);
-                        let event = events::Event::new("router", "route_removed").level(Level::Notice).summary(format!("{prefix}: its interface closed")).field("prefix", prefix);
-                        fcx.record(event);
-                    }
-                    table.remove_port(i)
-                }
-                ports::Event::Extra | ports::Event::Timer => {}
-            }
-        }
-    });
+        },
+    );
     router
 }
 
 /// Drops a packet whose TTL or hop limit ran out, records the drop, and
 /// sends the "time exceeded" answer back toward its source, when the router
 /// has an address of its family.
-fn expired<I: Interface>(fcx: &Cx, addrs: Addrs, table: &Table, ports: &mut Ports<I>, packet: Packet) {
+fn expired<I: Interface>(
+    fcx: &Cx,
+    addrs: Addrs,
+    table: &Table,
+    ports: &mut Ports<I>,
+    packet: Packet,
+) {
     let v4 = ip::version(&packet.0) == Some(4);
-    let why = if v4 { "its TTL ran out" } else { "its hop limit ran out" };
-    fictionet::events::record_drop(fcx, "router", &packet, why, events::Fields::new(), |event| event);
+    let why = if v4 {
+        "its TTL ran out"
+    } else {
+        "its hop limit ran out"
+    };
+    fictionet::events::record_drop(
+        fcx,
+        "router",
+        &packet,
+        why,
+        events::Fields::new(),
+        |event| event,
+    );
     let (a4, a6) = addrs;
-    let from = if v4 { a4.map(IpAddr::V4) } else { a6.map(IpAddr::V6) };
+    let from = if v4 {
+        a4.map(IpAddr::V4)
+    } else {
+        a6.map(IpAddr::V6)
+    };
     let answer = from.and_then(|from| fictionet::stdlib::icmp::time_exceeded(&packet.0, from));
     if let Some(answer) = answer
         && let Some(src) = ip::source(&packet.0)
@@ -281,12 +339,17 @@ impl Table {
     fn insert(&mut self, prefix: Prefix, port: usize) {
         self.routes.insert(prefix, port);
         self.by_port.insert(port, prefix);
-        *self.lengths.entry((prefix.addr.is_ipv4(), prefix.len)).or_default() += 1;
+        *self
+            .lengths
+            .entry((prefix.addr.is_ipv4(), prefix.len))
+            .or_default() += 1;
     }
 
     /// Drops the route that goes out on `port`.
     fn remove_port(&mut self, port: usize) {
-        let Some(prefix) = self.by_port.remove(&port) else { return };
+        let Some(prefix) = self.by_port.remove(&port) else {
+            return;
+        };
         self.routes.remove(&prefix);
         let key = (prefix.addr.is_ipv4(), prefix.len);
         if let Some(n) = self.lengths.get_mut(&key) {
@@ -303,7 +366,14 @@ impl Table {
         self.lengths
             .range((v4, 0)..=(v4, u8::MAX))
             .rev()
-            .find_map(|(&(_, len), _)| self.routes.get(&Prefix { addr: mask(dst, len), len }).copied())
+            .find_map(|(&(_, len), _)| {
+                self.routes
+                    .get(&Prefix {
+                        addr: mask(dst, len),
+                        len,
+                    })
+                    .copied()
+            })
     }
 }
 
@@ -320,7 +390,12 @@ struct Receiver<C>(Arc<Mutex<Changes<C>>>);
 
 impl<C> Changes<C> {
     fn channel(queue: Vec<C>) -> (Sender<C>, Receiver<C>) {
-        let shared = Arc::new(Mutex::new(Self { queue, waker: None, closed: false, stopped: false }));
+        let shared = Arc::new(Mutex::new(Self {
+            queue,
+            waker: None,
+            closed: false,
+            stopped: false,
+        }));
         (Sender(shared.clone()), Receiver(shared))
     }
 }
@@ -335,7 +410,9 @@ impl<C> Sender<C> {
             s.queue.push(change);
             s.waker.take()
         };
-        if let Some(w) = waker { w.wake(); }
+        if let Some(w) = waker {
+            w.wake();
+        }
         Ok(())
     }
 }
@@ -347,7 +424,9 @@ impl<C> Drop for Sender<C> {
             s.closed = true;
             s.waker.take()
         };
-        if let Some(w) = waker { w.wake(); }
+        if let Some(w) = waker {
+            w.wake();
+        }
     }
 }
 
@@ -398,7 +477,9 @@ pub struct Router<I: Interface> {
 
 impl<I: Interface> Clone for Router<I> {
     fn clone(&self) -> Self {
-        Self { handle: self.handle.clone() }
+        Self {
+            handle: self.handle.clone(),
+        }
     }
 }
 
@@ -504,30 +585,37 @@ where
 {
     let subnet = subnet.canonical();
     let (sender, changes) = Changes::channel(Vec::new());
-    let lan = Lan { handle: Arc::new(LanHandle { subnet, sender }) };
-    fcx.spawn_as(|| "lan".into(), move |fcx| async move {
-        let mut ports = Ports::new(Vec::new());
-        let mut members = Members::new(enrich);
-        let mut handles_gone = false;
-        loop {
-            let (joins, gone) = changes.drain();
-            handles_gone = handles_gone || gone;
-            for join in joins {
-                members.join(&fcx, &mut ports, join);
+    let lan = Lan {
+        handle: Arc::new(LanHandle { subnet, sender }),
+    };
+    fcx.spawn_as(
+        || "lan".into(),
+        move |fcx| async move {
+            let mut ports = Ports::new(Vec::new());
+            let mut members = Members::new(enrich);
+            let mut handles_gone = false;
+            loop {
+                let (joins, gone) = changes.drain();
+                handles_gone = handles_gone || gone;
+                for join in joins {
+                    members.join(&fcx, &mut ports, join);
+                }
+                if members.is_empty() && handles_gone {
+                    return Ok(());
+                }
+                let event = ports
+                    .next(&fcx, None, |cx| changes.poll(cx, handles_gone))
+                    .await?;
+                match event {
+                    ports::Event::Packet(from, packet) => {
+                        members.forward(&fcx, &mut ports, subnet, from, packet)
+                    }
+                    ports::Event::Closed(i) => members.remove_port(&fcx, i),
+                    ports::Event::Extra | ports::Event::Timer => {}
+                }
             }
-            if members.is_empty() && handles_gone {
-                return Ok(());
-            }
-            let event = ports
-                .next(&fcx, None, |cx| changes.poll(cx, handles_gone))
-                .await?;
-            match event {
-                ports::Event::Packet(from, packet) => members.forward(&fcx, &mut ports, subnet, from, packet),
-                ports::Event::Closed(i) => members.remove_port(&fcx, i),
-                ports::Event::Extra | ports::Event::Timer => {}
-            }
-        }
-    });
+        },
+    );
     lan
 }
 
@@ -537,7 +625,9 @@ where
 fn floods(subnet: Prefix, dst: IpAddr) -> bool {
     match (subnet.addr, dst) {
         (IpAddr::V4(network), IpAddr::V4(dst)) => {
-            dst.is_multicast() || dst == Ipv4Addr::BROADCAST || Some(dst) == broadcast4(network, subnet.len)
+            dst.is_multicast()
+                || dst == Ipv4Addr::BROADCAST
+                || Some(dst) == broadcast4(network, subnet.len)
         }
         (IpAddr::V6(_), IpAddr::V6(dst)) => dst.is_multicast(),
         _ => false,
@@ -563,17 +653,36 @@ fn link_local(addr: IpAddr) -> bool {
 }
 
 /// Records one LAN drop with its ingress attachment and caller context.
-fn dropped<F>(fcx: &Cx, packet: &Packet, why: &'static str, sandbox: Option<&events::Sandbox>, enrich: &F)
-where F: Fn(events::Event) -> events::Event {
-    events::record_drop(fcx, "lan", packet, why, events::Fields::new(), |mut event| {
-        event.conn.sandbox = sandbox.cloned();
-        enrich(event)
-    });
+fn dropped<F>(
+    fcx: &Cx,
+    packet: &Packet,
+    why: &'static str,
+    sandbox: Option<&events::Sandbox>,
+    enrich: &F,
+) where
+    F: Fn(events::Event) -> events::Event,
+{
+    events::record_drop(
+        fcx,
+        "lan",
+        packet,
+        why,
+        events::Fields::new(),
+        |mut event| {
+            event.conn.sandbox = sandbox.cloned();
+            enrich(event)
+        },
+    );
 }
 
 /// Records a change to a LAN's members.
 fn member_event(fcx: &Cx, kind: &'static str, member: String, what: &str) {
-    fcx.record(events::Event::new("lan", kind).level(Level::Notice).summary(format!("{member}: {what}")).field("member", member));
+    fcx.record(
+        events::Event::new("lan", kind)
+            .level(Level::Notice)
+            .summary(format!("{member}: {what}"))
+            .field("member", member),
+    );
 }
 
 /// A LAN's members: which port each address goes out on, and the gateway.
@@ -597,7 +706,13 @@ enum Join<I: Interface> {
 
 impl<F: Fn(events::Event) -> events::Event> Members<F> {
     fn new(enrich: F) -> Self {
-        Self { by_addr: BTreeMap::new(), by_port: HashMap::new(), gateway: None, attachments: HashMap::new(), enrich }
+        Self {
+            by_addr: BTreeMap::new(),
+            by_port: HashMap::new(),
+            gateway: None,
+            attachments: HashMap::new(),
+            enrich,
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -615,7 +730,12 @@ impl<F: Fn(events::Event) -> events::Event> Members<F> {
                 let i = match self.by_addr.get(&addr).copied() {
                     Some(i) => {
                         ports.replace(i, interface);
-                        member_event(fcx, "member_replaced", addr.to_string(), "a new interface took over, and the old one is closed");
+                        member_event(
+                            fcx,
+                            "member_replaced",
+                            addr.to_string(),
+                            "a new interface took over, and the old one is closed",
+                        );
                         i
                     }
                     None => {
@@ -626,8 +746,12 @@ impl<F: Fn(events::Event) -> events::Event> Members<F> {
                     }
                 };
                 match attachment {
-                    Some(attachment) => { self.attachments.insert(i, attachment); }
-                    None => { self.attachments.remove(&i); }
+                    Some(attachment) => {
+                        self.attachments.insert(i, attachment);
+                    }
+                    None => {
+                        self.attachments.remove(&i);
+                    }
                 }
             }
             Join::Gateway(interface) => {
@@ -637,7 +761,12 @@ impl<F: Fn(events::Event) -> events::Event> Members<F> {
                 match self.gateway {
                     Some(i) => {
                         ports.replace(i, interface);
-                        member_event(fcx, "member_replaced", "the gateway".into(), "a new interface took over, and the old one is closed");
+                        member_event(
+                            fcx,
+                            "member_replaced",
+                            "the gateway".into(),
+                            "a new interface took over, and the old one is closed",
+                        );
                     }
                     None => self.gateway = Some(ports.add(interface)),
                 }
@@ -650,21 +779,48 @@ impl<F: Fn(events::Event) -> events::Event> Members<F> {
         self.attachments.remove(&port);
         if let Some(addr) = self.by_port.remove(&port) {
             self.by_addr.remove(&addr);
-            member_event(fcx, "member_removed", addr.to_string(), "its interface closed");
+            member_event(
+                fcx,
+                "member_removed",
+                addr.to_string(),
+                "its interface closed",
+            );
         } else if self.gateway == Some(port) {
             self.gateway = None;
-            member_event(fcx, "member_removed", "the gateway".into(), "its interface closed");
+            member_event(
+                fcx,
+                "member_removed",
+                "the gateway".into(),
+                "its interface closed",
+            );
         }
     }
 
     /// Sends `packet`, which arrived on port `from`, where it belongs, or
     /// drops it with an event.
-    fn forward<I: Interface>(&self, fcx: &Cx, ports: &mut Ports<I>, subnet: Prefix, from: usize, packet: Packet) {
+    fn forward<I: Interface>(
+        &self,
+        fcx: &Cx,
+        ports: &mut Ports<I>,
+        subnet: Prefix,
+        from: usize,
+        packet: Packet,
+    ) {
         let Some(dst) = ip::destination(&packet.0) else {
-            return dropped(fcx, &packet, "not an IP packet", self.attachments.get(&from), &self.enrich);
+            return dropped(
+                fcx,
+                &packet,
+                "not an IP packet",
+                self.attachments.get(&from),
+                &self.enrich,
+            );
         };
         if dst.is_ipv4() != subnet.addr.is_ipv4() {
-            let why = if dst.is_ipv4() { "IPv4 on an IPv6 LAN" } else { "IPv6 on an IPv4 LAN" };
+            let why = if dst.is_ipv4() {
+                "IPv4 on an IPv6 LAN"
+            } else {
+                "IPv6 on an IPv4 LAN"
+            };
             return dropped(fcx, &packet, why, self.attachments.get(&from), &self.enrich);
         }
         if floods(subnet, dst) {
@@ -679,15 +835,39 @@ impl<F: Fn(events::Event) -> events::Event> Members<F> {
             ports.spend(sent);
         } else if subnet.contains(dst) || link_local(dst) {
             match self.by_addr.get(&dst) {
-                Some(&to) if to == from => dropped(fcx, &packet, "sent to its own address", self.attachments.get(&from), &self.enrich),
+                Some(&to) if to == from => dropped(
+                    fcx,
+                    &packet,
+                    "sent to its own address",
+                    self.attachments.get(&from),
+                    &self.enrich,
+                ),
                 Some(&to) => ports.send(to, packet),
-                None => dropped(fcx, &packet, "no member at that address", self.attachments.get(&from), &self.enrich),
+                None => dropped(
+                    fcx,
+                    &packet,
+                    "no member at that address",
+                    self.attachments.get(&from),
+                    &self.enrich,
+                ),
             }
         } else {
             match self.gateway {
                 Some(to) if to != from => ports.send(to, packet),
-                Some(_) => dropped(fcx, &packet, "from the gateway, for an address outside the subnet", self.attachments.get(&from), &self.enrich),
-                None => dropped(fcx, &packet, "outside the subnet, and the LAN has no gateway", self.attachments.get(&from), &self.enrich),
+                Some(_) => dropped(
+                    fcx,
+                    &packet,
+                    "from the gateway, for an address outside the subnet",
+                    self.attachments.get(&from),
+                    &self.enrich,
+                ),
+                None => dropped(
+                    fcx,
+                    &packet,
+                    "outside the subnet, and the LAN has no gateway",
+                    self.attachments.get(&from),
+                    &self.enrich,
+                ),
             }
         }
     }
@@ -718,7 +898,9 @@ pub struct Lan<I: Interface> {
 
 impl<I: Interface> Clone for Lan<I> {
     fn clone(&self) -> Self {
-        Self { handle: self.handle.clone() }
+        Self {
+            handle: self.handle.clone(),
+        }
     }
 }
 
@@ -735,13 +917,23 @@ impl<I: Interface> Lan<I> {
     ///
     /// Fails, and drops `interface`, if `addr` is not such an address or
     /// the LAN has stopped.
-    pub fn add(&self, addr: IpAddr, interface: I, attachment: Option<events::Sandbox>) -> Result<(), Error> {
+    pub fn add(
+        &self,
+        addr: IpAddr,
+        interface: I,
+        attachment: Option<events::Sandbox>,
+    ) -> Result<(), Error> {
         let subnet = self.handle.subnet;
         if !subnet.contains(addr) {
-            return Err(fictionet::Error::msg(format!("{addr} is outside the LAN's subnet {}/{}", subnet.addr, subnet.len)));
+            return Err(fictionet::Error::msg(format!(
+                "{addr} is outside the LAN's subnet {}/{}",
+                subnet.addr, subnet.len
+            )));
         }
         if addr.is_unspecified() || floods(subnet, addr) {
-            return Err(fictionet::Error::msg(format!("{addr} is not a unicast address, so no member can have it")));
+            return Err(fictionet::Error::msg(format!(
+                "{addr} is not a unicast address, so no member can have it"
+            )));
         }
         self.handle.join(Join::Member(addr, interface, attachment))
     }
@@ -814,7 +1006,8 @@ mod tests {
     }
 
     fn ip(src: &str, dst: &str, ttl: u8) -> Packet {
-        let mut p = fictionet::stdlib::ip::packet(src.parse().unwrap(), dst.parse().unwrap(), 17, &[0; 8]);
+        let mut p =
+            fictionet::stdlib::ip::packet(src.parse().unwrap(), dst.parse().unwrap(), 17, &[0; 8]);
         if p.0[0] >> 4 == 4 {
             p.0[8] = ttl;
             ip::set_header_checksum(&mut p.0[..20]);
@@ -834,17 +1027,26 @@ mod tests {
             let (r1_s6, mut s6) = fictionet::pair();
             let (r1_r2, r2_r1) = fictionet::pair();
             let (r1_r2_6, r2_r1_6) = fictionet::pair();
-            let r1 = router(&fcx, vec![
-                ("10.0.0.2/32".parse()?, Box::new(r1_s4) as Box<dyn Interface>),
-                ("fd00::2/128".parse()?, Box::new(r1_s6)),
-                ("0.0.0.0/0".parse()?, Box::new(r1_r2)),
-                ("::/0".parse()?, Box::new(r1_r2_6)),
-            ]);
+            let r1 = router(
+                &fcx,
+                vec![
+                    (
+                        "10.0.0.2/32".parse()?,
+                        Box::new(r1_s4) as Box<dyn Interface>,
+                    ),
+                    ("fd00::2/128".parse()?, Box::new(r1_s6)),
+                    ("0.0.0.0/0".parse()?, Box::new(r1_r2)),
+                    ("::/0".parse()?, Box::new(r1_r2_6)),
+                ],
+            );
             r1.address("10.0.0.1".parse()?);
-            let r2 = router(&fcx, vec![
-                ("0.0.0.0/0".parse()?, Box::new(r2_r1) as Box<dyn Interface>),
-                ("::/0".parse()?, Box::new(r2_r1_6)),
-            ]);
+            let r2 = router(
+                &fcx,
+                vec![
+                    ("0.0.0.0/0".parse()?, Box::new(r2_r1) as Box<dyn Interface>),
+                    ("::/0".parse()?, Box::new(r2_r1_6)),
+                ],
+            );
             r2.address("fd00:1::1".parse()?);
 
             // TTL 5: r1 sends it on with 4, r2 with 3, r1 with 2, r2 with
@@ -856,18 +1058,37 @@ mod tests {
 
             let answer = ready(&fcx, &mut s4).expect("a time exceeded answer");
             assert_eq!(ip::source(&answer.0), Some("10.0.0.1".parse()?));
-            assert_eq!((answer.0[9], answer.0[20], answer.0[21]), (ip::protocol::ICMP, 11, 0));
+            assert_eq!(
+                (answer.0[9], answer.0[20], answer.0[21]),
+                (ip::protocol::ICMP, 11, 0)
+            );
             assert!(ready(&fcx, &mut s4).is_none());
             let answer = ready(&fcx, &mut s6).expect("a time exceeded answer");
             assert_eq!(ip::source(&answer.0), Some("fd00:1::1".parse()?));
-            assert_eq!((answer.0[6], answer.0[40], answer.0[41]), (ip::protocol::ICMPV6, 3, 0));
+            assert_eq!(
+                (answer.0[6], answer.0[40], answer.0[41]),
+                (ip::protocol::ICMPV6, 3, 0)
+            );
             // r1 forwarded r2's answer: one hop.
             assert_eq!(answer.0[7], 63);
 
-            let drops: Vec<String> = fcx.events().of("router", "drop").into_iter().map(|e| e.summary).collect();
+            let drops: Vec<String> = fcx
+                .events()
+                .of("router", "drop")
+                .into_iter()
+                .map(|e| e.summary)
+                .collect();
             assert_eq!(drops.len(), 2, "{drops:?}");
-            assert!(drops.iter().any(|d| d == "10.0.0.2 → 192.0.2.1: its TTL ran out"), "{drops:?}");
-            assert!(drops.iter().any(|d| d.ends_with("its hop limit ran out")), "{drops:?}");
+            assert!(
+                drops
+                    .iter()
+                    .any(|d| d == "10.0.0.2 → 192.0.2.1: its TTL ran out"),
+                "{drops:?}"
+            );
+            assert!(
+                drops.iter().any(|d| d.ends_with("its hop limit ran out")),
+                "{drops:?}"
+            );
             fcx.cancel();
             Ok(())
         }))
@@ -882,11 +1103,14 @@ mod tests {
             let (ra, mut a) = fictionet::pair();
             let (rb, mut b) = fictionet::pair();
             let (rg, mut g) = fictionet::pair();
-            let r = router(&fcx, vec![
-                ("10.0.0.2/32".parse()?, Box::new(ra) as Box<dyn Interface>),
-                ("10.0.0.3/32".parse()?, Box::new(rb)),
-                ("10.0.0.1/32".parse()?, Box::new(rg)),
-            ]);
+            let r = router(
+                &fcx,
+                vec![
+                    ("10.0.0.2/32".parse()?, Box::new(ra) as Box<dyn Interface>),
+                    ("10.0.0.3/32".parse()?, Box::new(rb)),
+                    ("10.0.0.1/32".parse()?, Box::new(rg)),
+                ],
+            );
             r.address("10.0.0.1".parse()?);
             a.send(ip("10.0.0.2", "10.0.0.3", 64));
             let p = b.recv(&fcx).await?;
@@ -912,7 +1136,11 @@ mod tests {
     fn lan_floods_in_address_order() {
         struct Receiver(u8, Arc<Mutex<Vec<u8>>>);
         impl Interface for Receiver {
-            fn poll_recv(&mut self, _: &Cx, _: &mut std::task::Context<'_>) -> Poll<Result<Packet, fictionet::RecvError>> {
+            fn poll_recv(
+                &mut self,
+                _: &Cx,
+                _: &mut std::task::Context<'_>,
+            ) -> Poll<Result<Packet, fictionet::RecvError>> {
                 Poll::Pending
             }
 
@@ -927,19 +1155,32 @@ mod tests {
                 let mut members = Members::new(|event| event);
                 let mut ports = Ports::new(Vec::new());
                 for n in [40, 10, 30, 20, 50] {
-                    members.join(&fcx, &mut ports, Join::Member(
-                        Ipv4Addr::new(10, 0, 0, n).into(), Receiver(n, sent.clone()), None,
-                    ));
+                    members.join(
+                        &fcx,
+                        &mut ports,
+                        Join::Member(
+                            Ipv4Addr::new(10, 0, 0, n).into(),
+                            Receiver(n, sent.clone()),
+                            None,
+                        ),
+                    );
                 }
                 members.join(&fcx, &mut ports, Join::Gateway(Receiver(99, sent.clone())));
                 for dst in [[255; 4], [10, 0, 0, 255], [224, 0, 0, 1]] {
-                    members.forward(&fcx, &mut ports, "10.0.0.0/24".parse()?, 2, v4([10, 0, 0, 30], dst));
+                    members.forward(
+                        &fcx,
+                        &mut ports,
+                        "10.0.0.0/24".parse()?,
+                        2,
+                        v4([10, 0, 0, 30], dst),
+                    );
                     assert_eq!(*lock(&sent), [10, 20, 40, 50]);
                     lock(&sent).clear();
                 }
             }
             Ok(())
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     #[test]
@@ -951,19 +1192,45 @@ mod tests {
         assert!(floods(lan24, a("255.255.255.255")));
         assert!(floods(lan24, a("224.0.0.252")));
         assert!(floods(lan24, a("239.255.255.250")));
-        assert!(!floods(lan24, a("192.168.56.0")), "the network address is an ordinary address");
+        assert!(
+            !floods(lan24, a("192.168.56.0")),
+            "the network address is an ordinary address"
+        );
         assert!(!floods(lan24, a("192.168.56.10")));
-        assert!(!floods(lan24, a("192.168.57.255")), "another subnet's broadcast is unicast here");
-        assert!(!floods(lan24, a("ff02::1:3")), "the other family never floods");
+        assert!(
+            !floods(lan24, a("192.168.57.255")),
+            "another subnet's broadcast is unicast here"
+        );
+        assert!(
+            !floods(lan24, a("ff02::1:3")),
+            "the other family never floods"
+        );
         // A /31 or /32 has no broadcast address.
         assert!(!floods(p("10.0.0.0/31"), a("10.0.0.1")));
         assert!(!floods(p("10.0.0.1/32"), a("10.0.0.1")));
         assert!(floods(p("10.0.0.0/31"), a("255.255.255.255")));
-        assert_eq!(broadcast4(Ipv4Addr::UNSPECIFIED, 0), Some(Ipv4Addr::BROADCAST));
+        assert_eq!(
+            broadcast4(Ipv4Addr::UNSPECIFIED, 0),
+            Some(Ipv4Addr::BROADCAST)
+        );
         // A length past the address is the whole address, so no shift
         // reaches 32.
-        assert_eq!(Prefix { addr: a("10.0.0.1"), len: 40 }.canonical(), p("10.0.0.1/32"));
-        assert!(!floods(Prefix { addr: a("10.0.0.1"), len: 40 }.canonical(), a("10.0.0.1")));
+        assert_eq!(
+            Prefix {
+                addr: a("10.0.0.1"),
+                len: 40
+            }
+            .canonical(),
+            p("10.0.0.1/32")
+        );
+        assert!(!floods(
+            Prefix {
+                addr: a("10.0.0.1"),
+                len: 40
+            }
+            .canonical(),
+            a("10.0.0.1")
+        ));
         let lan6 = p("fd00::/64");
         assert!(floods(lan6, a("ff02::1:3")));
         assert!(!floods(lan6, a("fd00::1")));
@@ -974,11 +1241,25 @@ mod tests {
     fn member_addresses_are_unicast_in_the_subnet() {
         fictionet::block_on(fictionet::run(|fcx| async move {
             let lan = lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
-            for bad in ["192.168.57.1", "192.168.56.255", "255.255.255.255", "224.0.0.252", "0.0.0.0", "fd00::1"] {
+            for bad in [
+                "192.168.57.1",
+                "192.168.56.255",
+                "255.255.255.255",
+                "224.0.0.252",
+                "0.0.0.0",
+                "fd00::1",
+            ] {
                 let (end, mut far) = fictionet::pair();
-                let err = lan.add(bad.parse()?, Box::new(end), None).unwrap_err().to_string();
+                let err = lan
+                    .add(bad.parse()?, Box::new(end), None)
+                    .unwrap_err()
+                    .to_string();
                 assert!(err.contains(bad), "{bad}: {err}");
-                assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed), "{bad}: the interface is dropped");
+                assert_eq!(
+                    far.recv(&fcx).await,
+                    Err(fictionet::RecvError::Closed),
+                    "{bad}: the interface is dropped"
+                );
             }
             let (end, _far) = fictionet::pair();
             lan.add("192.168.56.0".parse()?, Box::new(end), None)?;
@@ -1009,8 +1290,18 @@ mod tests {
             drop(b2);
             fcx.sleep(Duration::from_millis(20)).await?;
 
-            let events: Vec<(&str, String)> = fcx.events().all().into_iter().filter(|e| e.source == "lan").map(|e| (e.kind, e.summary)).collect();
-            let drops: Vec<&str> = events.iter().filter(|(k, _)| *k == "drop").map(|(_, t)| t.as_str()).collect();
+            let events: Vec<(&str, String)> = fcx
+                .events()
+                .all()
+                .into_iter()
+                .filter(|e| e.source == "lan")
+                .map(|e| (e.kind, e.summary))
+                .collect();
+            let drops: Vec<&str> = events
+                .iter()
+                .filter(|(k, _)| *k == "drop")
+                .map(|(_, t)| t.as_str())
+                .collect();
             let reasons = [
                 "no member at that address",
                 "outside the subnet, and the LAN has no gateway",
@@ -1022,7 +1313,11 @@ mod tests {
             for (text, why) in drops.iter().zip(reasons) {
                 assert!(text.ends_with(why), "{text:?} should end with {why:?}");
             }
-            assert!(drops[0].starts_with("192.168.56.10 → 192.168.56.12"), "{:?}", drops[0]);
+            assert!(
+                drops[0].starts_with("192.168.56.10 → 192.168.56.12"),
+                "{:?}",
+                drops[0]
+            );
             let changes: Vec<_> = events.iter().filter(|(k, _)| *k != "drop").collect();
             assert_eq!(changes.len(), 2, "{changes:?}");
             assert_eq!(changes[0].0, "member_replaced");
@@ -1050,10 +1345,18 @@ mod tests {
             assert_eq!(r.unwrap_err().to_string(), "stop");
             let lan = lock(&kept).take().unwrap();
             let (end, mut far) = fictionet::pair();
-            assert_eq!(lan.add("10.0.0.2".parse()?, Box::new(end), None).unwrap_err().to_string(), "the LAN has stopped");
+            assert_eq!(
+                lan.add("10.0.0.2".parse()?, Box::new(end), None)
+                    .unwrap_err()
+                    .to_string(),
+                "the LAN has stopped"
+            );
             assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed));
             let (end, mut far) = fictionet::pair();
-            assert_eq!(lan.gateway(Box::new(end)).unwrap_err().to_string(), "the LAN has stopped");
+            assert_eq!(
+                lan.gateway(Box::new(end)).unwrap_err().to_string(),
+                "the LAN has stopped"
+            );
             assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed));
             Ok(())
         }))

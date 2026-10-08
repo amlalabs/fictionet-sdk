@@ -57,21 +57,32 @@ pub fn endpoint(fcx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
     let shared = Arc::new(Shared {
         addr,
         inner: Mutex::new(Box::new(inner)),
-        state: Mutex::new(State { sockets: HashMap::new(), stopped: false, ip_id: fcx.random_u64() as u16, groups: Vec::new() }),
+        state: Mutex::new(State {
+            sockets: HashMap::new(),
+            stopped: false,
+            ip_id: fcx.random_u64() as u16,
+            groups: Vec::new(),
+        }),
     });
     let driver = shared.clone();
-    fcx.spawn_as(|| "udp::endpoint".into(), move |fcx| async move {
-        drive(&fcx, &driver).await;
-        let wakers: Vec<Waker> = {
-            let mut st = driver.state.lock().unwrap();
-            st.stopped = true;
-            st.sockets.values_mut().filter_map(|s| s.waker.take()).collect()
-        };
-        for w in wakers {
-            w.wake();
-        }
-        Ok(())
-    });
+    fcx.spawn_as(
+        || "udp::endpoint".into(),
+        move |fcx| async move {
+            drive(&fcx, &driver).await;
+            let wakers: Vec<Waker> = {
+                let mut st = driver.state.lock().unwrap();
+                st.stopped = true;
+                st.sockets
+                    .values_mut()
+                    .filter_map(|s| s.waker.take())
+                    .collect()
+            };
+            for w in wakers {
+                w.wake();
+            }
+            Ok(())
+        },
+    );
     Endpoint { shared }
 }
 
@@ -134,7 +145,9 @@ async fn drive(fcx: &Cx, shared: &Shared) {
 /// Puts one packet from the interface into its socket, or answers it with port
 /// unreachable.
 fn deliver(shared: &Shared, packet: Packet) {
-    let Some(ip) = Header::parse_whole(&packet.0) else { return };
+    let Some(ip) = Header::parse_whole(&packet.0) else {
+        return;
+    };
     if ip.protocol != protocol::UDP {
         return;
     }
@@ -200,7 +213,10 @@ impl Endpoint {
     /// Fails if `group` is not a multicast address of the endpoint's family.
     pub fn join(&self, group: IpAddr) -> Result<(), Error> {
         if !group.is_multicast() || group.is_ipv4() != self.shared.addr.is_ipv4() {
-            return Err(fictionet::Error::msg(format!("{group} is not a multicast group {} can join", self.shared.addr)));
+            return Err(fictionet::Error::msg(format!(
+                "{group} is not a multicast group {} can join",
+                self.shared.addr
+            )));
         }
         let mut st = self.shared.state.lock().unwrap();
         if !st.groups.contains(&group) {
@@ -211,7 +227,12 @@ impl Endpoint {
 
     /// Leaves the multicast group `group`.
     pub fn leave(&self, group: IpAddr) {
-        self.shared.state.lock().unwrap().groups.retain(|g| *g != group);
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .groups
+            .retain(|g| *g != group);
     }
 
     /// Opens a socket on `port`.
@@ -224,10 +245,17 @@ impl Endpoint {
         }
         let mut st = self.shared.state.lock().unwrap();
         if st.sockets.contains_key(&port) {
-            return Err(fictionet::Error::msg(format!("UDP port {port} is already bound on {}", self.shared.addr)));
+            return Err(fictionet::Error::msg(format!(
+                "UDP port {port} is already bound on {}",
+                self.shared.addr
+            )));
         }
         st.sockets.insert(port, Queue::default());
-        Ok(Socket { shared: self.shared.clone(), port, wait: CancelWait::default() })
+        Ok(Socket {
+            shared: self.shared.clone(),
+            port,
+            wait: CancelWait::default(),
+        })
     }
 }
 
@@ -266,7 +294,10 @@ impl Socket {
             {
                 let mut st = shared.state.lock().unwrap();
                 let stopped = st.stopped;
-                let q = st.sockets.get_mut(&port).expect("a bound socket has a queue");
+                let q = st
+                    .sockets
+                    .get_mut(&port)
+                    .expect("a bound socket has a queue");
                 if let Some(d) = q.datagrams.pop_front() {
                     q.bytes -= d.0.len() + DATAGRAM_COST;
                     return Poll::Ready(Ok(d));
@@ -297,7 +328,11 @@ impl Socket {
         let src = self.shared.addr;
         // IPv4's total length counts its 20-byte header; IPv6's payload
         // length does not count its 40-byte header.
-        let max = if src.is_ipv4() { 65_535 - 20 - 8 } else { 65_535 - 8 };
+        let max = if src.is_ipv4() {
+            65_535 - 20 - 8
+        } else {
+            65_535 - 8
+        };
         if src.is_ipv4() != to.is_ipv4() || data.len() > max {
             return;
         }
@@ -320,7 +355,16 @@ impl Socket {
             st.ip_id = st.ip_id.wrapping_add(1);
             st.ip_id
         };
-        let packet = ip::packet_with(src, to.ip(), protocol::UDP, Fields { id, ..Fields::default() }, &udp);
+        let packet = ip::packet_with(
+            src,
+            to.ip(),
+            protocol::UDP,
+            Fields {
+                id,
+                ..Fields::default()
+            },
+            &udp,
+        );
         self.shared.inner.lock().unwrap().send(packet);
     }
 }
@@ -349,8 +393,15 @@ mod tests {
     /// A UDP datagram from 10.0.0.2 to port 53 of 10.0.0.1, with a good
     /// checksum.
     fn datagram(data: &[u8]) -> Packet {
-        let (src, dst): (IpAddr, IpAddr) = ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
-        let mut u = [&[0, 9, 0, 53][..], &((8 + data.len()) as u16).to_be_bytes(), &[0, 0], data].concat();
+        let (src, dst): (IpAddr, IpAddr) =
+            ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
+        let mut u = [
+            &[0, 9, 0, 53][..],
+            &((8 + data.len()) as u16).to_be_bytes(),
+            &[0, 0],
+            data,
+        ]
+        .concat();
         let sum = ip::transport_checksum(src, dst, protocol::UDP, &u);
         u[6..8].copy_from_slice(&sum.to_be_bytes());
         ip::packet(src, dst, protocol::UDP, &u)

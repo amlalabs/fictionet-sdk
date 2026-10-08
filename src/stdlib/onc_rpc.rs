@@ -70,8 +70,10 @@
 //! );
 //! ```
 
-use fictionet::stdlib::codec::{self, Assemble, AssembleError, Assembled, Decode, Step, Wire, Reader as ByteReader, Truncated};
 use core::convert::Infallible;
+use fictionet::stdlib::codec::{
+    self, Assemble, AssembleError, Assembled, Decode, Reader as ByteReader, Step, Truncated, Wire,
+};
 
 /// The port the portmapper and rpcbind listen on, over TCP and UDP.
 pub const PORT: u16 = 111;
@@ -214,7 +216,9 @@ pub struct Reader<'a> {
 impl<'a> Reader<'a> {
     /// A reader at the start of `buf`.
     pub fn new(buf: &'a [u8]) -> Reader<'a> {
-        Reader { cursor: ByteReader::new(buf) }
+        Reader {
+            cursor: ByteReader::new(buf),
+        }
     }
 
     /// How many bytes have been read.
@@ -505,9 +509,7 @@ impl Writer {
         let mut used = 0usize;
         for (written, value) in items.into_iter().enumerate() {
             if written >= max {
-                self.reject(Error::TooLong(
-                    u32::try_from(written).unwrap_or(u32::MAX),
-                ));
+                self.reject(Error::TooLong(u32::try_from(written).unwrap_or(u32::MAX)));
                 return;
             }
             let mut one = Writer::new();
@@ -521,9 +523,7 @@ impl Writer {
                 }
             };
             let Some(total) = used.checked_add(one.len()).filter(|n| *n <= max_bytes) else {
-                self.reject(Error::TooLong(
-                    u32::try_from(max_bytes).unwrap_or(u32::MAX),
-                ));
+                self.reject(Error::TooLong(u32::try_from(max_bytes).unwrap_or(u32::MAX)));
                 return;
             };
             self.opaque_fixed(&one);
@@ -545,7 +545,9 @@ impl Writer {
     #[inline]
     pub fn try_opaque(&mut self, bytes: &[u8], max: usize) -> Result<(), Error> {
         if bytes.len() > max {
-            return Err(Error::TooLong(u32::try_from(bytes.len()).unwrap_or(u32::MAX)));
+            return Err(Error::TooLong(
+                u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+            ));
         }
         self.opaque(bytes);
         Ok(())
@@ -1003,9 +1005,7 @@ impl Message {
     /// last field does.
     pub fn parse(b: &[u8]) -> Result<Message, Error> {
         if b.len() > MAX_RECORD {
-            return Err(Error::TooLong(
-                u32::try_from(b.len()).unwrap_or(u32::MAX),
-            ));
+            return Err(Error::TooLong(u32::try_from(b.len()).unwrap_or(u32::MAX)));
         }
         let mut r = Reader::new(b);
         let xid = r.uint()?;
@@ -1234,14 +1234,9 @@ impl Wire for Fragment {
     /// Short input returns [`Error::Short`]; bytes after the
     /// fragment return [`Error::Trailing`].
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        match Fragments::new()
-            .decode(bytes, true)
-?
-        {
+        match Fragments::new().decode(bytes, true)? {
             Step::Item(fragment, used) if used == bytes.len() => Ok(fragment),
-            Step::Item(_, used) => {
-                Err(Error::Trailing(bytes.len().saturating_sub(used)))
-            }
+            Step::Item(_, used) => Err(Error::Trailing(bytes.len().saturating_sub(used))),
             _ => Err(Error::Short),
         }
     }
@@ -1454,20 +1449,23 @@ pub fn encode_fragments(record: &[u8], fragment_len: usize) -> Result<Vec<u8>, E
 
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Short }
+    fn from(_: Truncated) -> Self {
+        Error::Short
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support;
     use fictionet::stdlib::portmap::{
-        self, Mapping, Rpcb, silent_on_failure, PmapRequest, PmapResult, Request, RpcbRequest, RpcbResult,
+        self, Mapping, PmapRequest, PmapResult, Request, Rpcb, RpcbRequest, RpcbResult,
+        silent_on_failure,
     };
+    use fictionet::stdlib::test_support;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use std::net::SocketAddr;
 
     #[test]
@@ -1618,9 +1616,7 @@ mod tests {
         assert_eq!(Record::parse(&[]), Err(Error::Short));
         assert_eq!(
             Record::parse(&[0, 0, 0, 0]),
-            Err(Error::Incomplete {
-                held: 0
-            })
+            Err(Error::Incomplete { held: 0 })
         );
     }
 
@@ -1768,10 +1764,7 @@ mod tests {
             xid: 1,
             body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(0)))),
         };
-        assert_eq!(
-            alias.write(&mut Vec::new()),
-            Err(Error::Unwritable)
-        );
+        assert_eq!(alias.write(&mut Vec::new()), Err(Error::Unwritable));
         contract::check_wire_value(&alias);
     }
 
@@ -2226,20 +2219,14 @@ mod tests {
                 xid: 1,
                 body: Body::Call(call),
             };
-            assert_eq!(
-                message.to_bytes(),
-                Err(Error::Unwritable)
-            );
+            assert_eq!(message.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&message);
         }
         let message = Message {
             xid: 1,
             body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(5)))),
         };
-        assert_eq!(
-            message.to_bytes(),
-            Err(Error::Unwritable)
-        );
+        assert_eq!(message.to_bytes(), Err(Error::Unwritable));
         assert_eq!(AuthSys::parse(&sys.to_bytes().unwrap()), Ok(sys));
     }
 
@@ -2474,7 +2461,10 @@ mod tests {
         }
         let mut call = Request::Pmap(PmapRequest::Set(map)).to_call().unwrap();
         call.program = 100_003;
-        assert_eq!(Request::from_call(&call), Err(portmap::Error::Program(100_003)));
+        assert_eq!(
+            Request::from_call(&call),
+            Err(portmap::Error::Program(100_003))
+        );
         call.program = PMAP_PROGRAM;
         call.version = 5;
         assert_eq!(Request::from_call(&call), Err(portmap::Error::Version(5)));

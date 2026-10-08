@@ -63,8 +63,8 @@
 
 extern crate alloc;
 
-use fictionet::stdlib::codec::{self, Decode, Wire};
 use alloc::vec::Vec;
+use fictionet::stdlib::codec::{self, Decode, Wire};
 
 /// The UDP port senders use most often, the discard port.
 pub const PORT: u16 = 9;
@@ -348,9 +348,7 @@ pub fn wakes(payload: &[u8], mac: Mac, password: Option<&Password>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::{
-        Lcg, Stream,
-    };
+    use codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
@@ -496,16 +494,10 @@ mod tests {
         assert!(!wakes(&p, MAC, None));
         let mut s = Stream::new(MagicPackets::new());
         assert_eq!(s.push(&p), MAX_PAYLOAD + 1);
-        assert_eq!(
-            s.next(),
-            Some(Err(codec::Fail::Protocol(Error::TooLong)))
-        );
+        assert_eq!(s.next(), Some(Err(codec::Fail::Protocol(Error::TooLong))));
         assert_eq!(s.push(&p), p.len());
         assert_eq!(s.next(), None);
-        assert_eq!(
-            s.failed(),
-            Some(&codec::Fail::Protocol(Error::TooLong))
-        );
+        assert_eq!(s.failed(), Some(&codec::Fail::Protocol(Error::TooLong)));
         assert!(Error::TooLong.to_string().contains("65535"));
     }
 

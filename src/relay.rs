@@ -90,9 +90,16 @@ pub enum Message<'a> {
     Refuse(String),
     Packet(&'a [u8]),
     /// An observer's request: its id, and a JSON object with an `op`.
-    Request { id: u32, body: &'a [u8] },
+    Request {
+        id: u32,
+        body: &'a [u8],
+    },
     /// The world's reply to request `id`: flags, then a piece of a value.
-    Reply { id: u32, flags: u8, body: &'a [u8] },
+    Reply {
+        id: u32,
+        flags: u8,
+        body: &'a [u8],
+    },
 }
 
 impl Message<'_> {
@@ -119,7 +126,9 @@ impl Message<'_> {
             Message::Refuse(reason) => [&[REFUSE][..], reason.as_bytes()].concat(),
             Message::Packet(packet) => [&[PACKET][..], packet].concat(),
             Message::Request { id, body } => [&[REQUEST][..], &id.to_be_bytes(), body].concat(),
-            Message::Reply { id, flags, body } => [&[REPLY][..], &id.to_be_bytes(), &[*flags], body].concat(),
+            Message::Reply { id, flags, body } => {
+                [&[REPLY][..], &id.to_be_bytes(), &[*flags], body].concat()
+            }
         }
     }
 }
@@ -132,11 +141,14 @@ pub fn decode(message: &[u8]) -> Result<Message<'_>, DecodeError> {
         HELLO => decode_hello(body).map(Message::Hello),
         ACCEPT if body.is_empty() => Ok(Message::Accept),
         ACCEPT => Err(DecodeError::BadBody),
-        REFUSE => String::from_utf8(body.to_vec()).map(Message::Refuse).map_err(|_| DecodeError::BadBody),
+        REFUSE => String::from_utf8(body.to_vec())
+            .map(Message::Refuse)
+            .map_err(|_| DecodeError::BadBody),
         PACKET => Ok(Message::Packet(body)),
-        REQUEST if body.len() >= 4 => {
-            Ok(Message::Request { id: u32::from_be_bytes(body[..4].try_into().unwrap()), body: &body[4..] })
-        }
+        REQUEST if body.len() >= 4 => Ok(Message::Request {
+            id: u32::from_be_bytes(body[..4].try_into().unwrap()),
+            body: &body[4..],
+        }),
         REPLY if body.len() >= 5 => Ok(Message::Reply {
             id: u32::from_be_bytes(body[..4].try_into().unwrap()),
             flags: body[4],
@@ -166,11 +178,18 @@ fn decode_hello(body: &[u8]) -> Result<Hello, DecodeError> {
     }
     let kind = String::from_utf8(kind.to_vec()).unwrap();
     let name_len = take(1)?[0] as usize;
-    let name = std::str::from_utf8(take(name_len)?).map_err(|_| DecodeError::BadBody)?.to_owned();
+    let name = std::str::from_utf8(take(name_len)?)
+        .map_err(|_| DecodeError::BadBody)?
+        .to_owned();
     if !rest.is_empty() {
         return Err(DecodeError::BadBody);
     }
-    Ok(Hello { version, mtu, kind, name })
+    Ok(Hello {
+        version,
+        mtu,
+        kind,
+        name,
+    })
 }
 
 pub mod proxy;
@@ -180,14 +199,28 @@ pub mod unix {
     use super::*;
 
     pub(crate) fn cvt(n: libc::c_int) -> io::Result<libc::c_int> {
-        if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n) }
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n)
+        }
     }
 
     /// Sets a socket's receive or send timeout. `None` waits forever.
-    pub fn set_timeout(fd: RawFd, option: libc::c_int, timeout: Option<Duration>) -> io::Result<()> {
+    pub fn set_timeout(
+        fd: RawFd,
+        option: libc::c_int,
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
         let tv = match timeout {
-            Some(t) => libc::timeval { tv_sec: t.as_secs() as _, tv_usec: t.subsec_micros() as _ },
-            None => libc::timeval { tv_sec: 0, tv_usec: 0 },
+            Some(t) => libc::timeval {
+                tv_sec: t.as_secs() as _,
+                tv_usec: t.subsec_micros() as _,
+            },
+            None => libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
         };
         // SAFETY: setsockopt with a timeval.
         cvt(unsafe {
@@ -210,7 +243,10 @@ pub mod unix {
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
         let bytes = path.as_os_str().as_bytes();
         if bytes.is_empty() || bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad Unix socket path"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bad Unix socket path",
+            ));
         }
         for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
             *dst = *src as libc::c_char;
@@ -226,7 +262,10 @@ pub mod unix {
     /// burst would lose packets. Failure is fine: the defaults still work.
     pub fn raise_buffers(fd: std::os::fd::RawFd) {
         let size: libc::c_int = 4 << 20;
-        for (force, plain) in [(libc::SO_SNDBUFFORCE, libc::SO_SNDBUF), (libc::SO_RCVBUFFORCE, libc::SO_RCVBUF)] {
+        for (force, plain) in [
+            (libc::SO_SNDBUFFORCE, libc::SO_SNDBUF),
+            (libc::SO_RCVBUFFORCE, libc::SO_RCVBUF),
+        ] {
             for opt in [force, plain] {
                 // SAFETY: setsockopt with an int value.
                 let r = unsafe {
@@ -277,7 +316,11 @@ pub mod unix {
     pub fn set_nonblocking(fd: RawFd, nonblocking: bool) -> io::Result<()> {
         // SAFETY: fcntl on an fd the caller owns.
         let flags = cvt(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
-        let flags = if nonblocking { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
+        let flags = if nonblocking {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
         cvt(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) })?;
         Ok(())
     }
@@ -290,10 +333,16 @@ pub mod unix {
 
     /// Sends the concatenation of `parts` as one datagram.
     pub fn send_parts(fd: RawFd, parts: &[&[u8]], nonblocking: bool) -> io::Result<()> {
-        let iovec = |p: &&[u8]| libc::iovec { iov_base: p.as_ptr() as *mut libc::c_void, iov_len: p.len() };
+        let iovec = |p: &&[u8]| libc::iovec {
+            iov_base: p.as_ptr() as *mut libc::c_void,
+            iov_len: p.len(),
+        };
         // Every caller passes one or two parts (a kind byte or header, then
         // a payload), so those need no allocation.
-        let mut stack = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 2];
+        let mut stack = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; 2];
         let mut heap: Vec<libc::iovec>;
         let iov: &mut [libc::iovec] = if parts.len() <= stack.len() {
             for (v, p) in stack.iter_mut().zip(parts) {
@@ -377,11 +426,23 @@ pub mod observer {
         /// Connects to the world socket at `path` as an observer called
         /// `name`. Fails with the world's reason if it refuses.
         pub fn connect(path: &str, name: &str) -> Result<Client, String> {
-            let fd = unix::connect(path).map_err(|e| format!("connecting to the world at {path}: {e}"))?;
-            let hello = Hello { version: VERSION, mtu: 0, kind: OBSERVE.into(), name: name.into() };
-            unix::send(fd.as_raw_fd(), &Message::Hello(hello).encode(), false).map_err(|e| e.to_string())?;
-            let mut client = Client { fd, next_id: 1, buf: vec![0; MAX_MESSAGE + 1] };
-            let n = unix::recv(client.fd.as_raw_fd(), &mut client.buf, false).map_err(|e| e.to_string())?;
+            let fd = unix::connect(path)
+                .map_err(|e| format!("connecting to the world at {path}: {e}"))?;
+            let hello = Hello {
+                version: VERSION,
+                mtu: 0,
+                kind: OBSERVE.into(),
+                name: name.into(),
+            };
+            unix::send(fd.as_raw_fd(), &Message::Hello(hello).encode(), false)
+                .map_err(|e| e.to_string())?;
+            let mut client = Client {
+                fd,
+                next_id: 1,
+                buf: vec![0; MAX_MESSAGE + 1],
+            };
+            let n = unix::recv(client.fd.as_raw_fd(), &mut client.buf, false)
+                .map_err(|e| e.to_string())?;
             match decode(&client.buf[..n]) {
                 Ok(Message::Accept) => Ok(client),
                 Ok(Message::Refuse(reason)) => Err(format!("the world refused: {reason}")),
@@ -395,7 +456,15 @@ pub mod observer {
         pub fn request(&mut self, json: &str) -> io::Result<u32> {
             let id = self.next_id;
             self.next_id += 1;
-            unix::send(self.fd.as_raw_fd(), &Message::Request { id, body: json.as_bytes() }.encode(), false)?;
+            unix::send(
+                self.fd.as_raw_fd(),
+                &Message::Request {
+                    id,
+                    body: json.as_bytes(),
+                }
+                .encode(),
+                false,
+            )?;
             Ok(id)
         }
 
@@ -411,7 +480,12 @@ pub mod observer {
                 let Ok(Message::Reply { id, flags, body }) = decode(&self.buf[..n]) else {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "not a reply"));
                 };
-                let v = value.get_or_insert_with(|| Value { id, bytes: Vec::new(), binary: false, end: false });
+                let v = value.get_or_insert_with(|| Value {
+                    id,
+                    bytes: Vec::new(),
+                    binary: false,
+                    end: false,
+                });
                 v.bytes.extend_from_slice(body);
                 v.binary = flags & BINARY != 0;
                 v.end = flags & END != 0;
@@ -424,7 +498,8 @@ pub mod observer {
         /// Sends a request and returns its first value.
         pub fn call(&mut self, json: &str) -> io::Result<Value> {
             self.request(json)?;
-            self.next_value()?.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "the world closed"))
+            self.next_value()?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "the world closed"))
         }
 
         /// Gives up waiting for replies after `timeout`, or never.
@@ -440,11 +515,18 @@ mod tests {
 
     #[test]
     fn observer_messages_round_trip() {
-        let req = Message::Request { id: 7, body: br#"{"op":"graph"}"# };
+        let req = Message::Request {
+            id: 7,
+            body: br#"{"op":"graph"}"#,
+        };
         let bytes = req.encode();
         assert_eq!(&bytes[..5], &[5, 0, 0, 0, 7]);
         assert_eq!(decode(&bytes), Ok(req));
-        let reply = Message::Reply { id: 7, flags: MORE | BINARY, body: &[1, 2] };
+        let reply = Message::Reply {
+            id: 7,
+            flags: MORE | BINARY,
+            body: &[1, 2],
+        };
         let bytes = reply.encode();
         assert_eq!(bytes, [6, 0, 0, 0, 7, 5, 1, 2]);
         assert_eq!(decode(&bytes), Ok(reply));
@@ -454,22 +536,39 @@ mod tests {
 
     #[test]
     fn hello_round_trip() {
-        let hello = Hello { version: 1, mtu: 1500, kind: "tun".into(), name: "abc".into() };
+        let hello = Hello {
+            version: 1,
+            mtu: 1500,
+            kind: "tun".into(),
+            name: "abc".into(),
+        };
         let bytes = Message::Hello(hello.clone()).encode();
-        assert_eq!(bytes, [1, 0, 1, 5, 220, 3, b't', b'u', b'n', 3, b'a', b'b', b'c']);
+        assert_eq!(
+            bytes,
+            [1, 0, 1, 5, 220, 3, b't', b'u', b'n', 3, b'a', b'b', b'c']
+        );
         assert_eq!(decode(&bytes), Ok(Message::Hello(hello)));
     }
 
     #[test]
     fn other_messages() {
         assert_eq!(decode(&Message::Accept.encode()), Ok(Message::Accept));
-        assert_eq!(decode(&Message::Refuse("no".into()).encode()), Ok(Message::Refuse("no".into())));
-        assert_eq!(decode(&Message::Packet(&[1, 2, 3]).encode()), Ok(Message::Packet(&[1, 2, 3])));
+        assert_eq!(
+            decode(&Message::Refuse("no".into()).encode()),
+            Ok(Message::Refuse("no".into()))
+        );
+        assert_eq!(
+            decode(&Message::Packet(&[1, 2, 3]).encode()),
+            Ok(Message::Packet(&[1, 2, 3]))
+        );
         assert_eq!(decode(&[9]), Err(DecodeError::UnknownKind(9)));
         assert_eq!(decode(&[7]), Err(DecodeError::UnknownKind(7)));
         assert_eq!(decode(&[]), Err(DecodeError::Empty));
         assert_eq!(decode(&[1, 0, 1]), Err(DecodeError::BadBody));
         // Trailing bytes after the name.
-        assert_eq!(decode(&[1, 0, 1, 5, 220, 0, 1, b'a', 0]), Err(DecodeError::BadBody));
+        assert_eq!(
+            decode(&[1, 0, 1, 5, 220, 0, 1, b'a', 0]),
+            Err(DecodeError::BadBody)
+        );
     }
 }

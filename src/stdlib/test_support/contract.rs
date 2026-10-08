@@ -18,11 +18,9 @@
 extern crate alloc;
 
 use alloc::{rc::Rc, vec::Vec};
-use fictionet::stdlib::codec::{
-    Buffer, Decode, Fail, Lcg, Step, Stream, Wire,
-};
-use fictionet::stdlib::test_support::{chunks, random_chunks};
 use core::{cell::RefCell, fmt::Debug};
+use fictionet::stdlib::codec::{Buffer, Decode, Fail, Lcg, Step, Stream, Wire};
+use fictionet::stdlib::test_support::{chunks, random_chunks};
 
 /// Maximum retained items in one harness run. Limits the harness itself
 /// when a decoder produces many items without consuming bytes.
@@ -423,9 +421,17 @@ pub fn check_exact<M: Wire + PartialEq + Debug>(value: &M) -> Vec<u8> {
 pub fn check_refused<M: Wire + Debug>(value: &M) -> M::WriteError {
     let prefix = [0x5a, 0xc3, 0x17];
     let mut out = prefix.to_vec();
-    let error = value.write(&mut out).expect_err("test value must refuse writing");
-    assert_eq!(out, prefix, "writer changed destination on error: {value:?}");
-    assert!(value.to_bytes().is_err(), "refused value wrote into a new vector: {value:?}");
+    let error = value
+        .write(&mut out)
+        .expect_err("test value must refuse writing");
+    assert_eq!(
+        out, prefix,
+        "writer changed destination on error: {value:?}"
+    );
+    assert!(
+        value.to_bytes().is_err(),
+        "refused value wrote into a new vector: {value:?}"
+    );
     error
 }
 
@@ -484,12 +490,17 @@ mod tests {
     use super::*;
     use core::fmt::Error as TestError;
 
-    enum Fault { Error, Need }
+    enum Fault {
+        Error,
+        Need,
+    }
     impl Decode for Fault {
         type Item = ();
         type Error = TestError;
         const NAME: &'static str = "fault";
-        fn capacity(&self) -> usize { 4 }
+        fn capacity(&self) -> usize {
+            4
+        }
         fn decode(&mut self, _: &[u8], _: bool) -> Result<Step<()>, TestError> {
             match self {
                 Self::Error => Err(TestError),

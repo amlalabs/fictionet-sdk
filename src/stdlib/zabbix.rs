@@ -58,13 +58,17 @@
 //! assert_eq!(&bytes[13..], br#"{"response":"success","info":"processed: 1; failed: 0; total: 1"}"#);
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Prefixed;
 extern crate alloc;
 
-use fictionet::stdlib::codec::{Wire};
-use alloc::{format, string::{String, ToString}, vec::Vec};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use fictionet::stdlib::codec::Wire;
 
 /// The TCP port a Zabbix agent listens on for the server's questions.
 pub const AGENT_PORT: u16 = 10050;
@@ -149,7 +153,9 @@ impl core::fmt::Display for Error {
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Magic => f.write_str("packet does not start with ZBXD"),
             Error::Flags(b) => write!(f, "flags byte {b:#04x} is not a Zabbix protocol packet"),
-            Error::TooLarge { len, limit } => write!(f, "data length {len} is over the limit of {limit}"),
+            Error::TooLarge { len, limit } => {
+                write!(f, "data length {len} is over the limit of {limit}")
+            }
             Error::ReservedTooLarge { len, limit } => {
                 write!(f, "reserved length {len} is over the limit of {limit}")
             }
@@ -196,13 +202,24 @@ impl Header {
             return Err(Error::Flags(flag_byte));
         }
         let large = flag_byte & flags::LARGE != 0;
-        let (len, width) = if large { (LARGE_HEADER_LEN, 8) } else { (HEADER_LEN, 4) };
+        let (len, width) = if large {
+            (LARGE_HEADER_LEN, 8)
+        } else {
+            (HEADER_LEN, 4)
+        };
         if b.len() < len {
             return Ok(None);
         }
         let data_len = le(&b[5..5 + width]);
         let reserved = le(&b[5 + width..len]);
-        Ok(Some((Header { flags: flag_byte, data_len, reserved }, len)))
+        Ok(Some((
+            Header {
+                flags: flag_byte,
+                data_len,
+                reserved,
+            },
+            len,
+        )))
     }
 }
 
@@ -223,7 +240,8 @@ impl Wire for Header {
     /// Appends the header. Refuses invalid flags and lengths that need
     /// the large flag when it is absent, without changing `out`.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        if self.flags & flags::PROTOCOL == 0 || self.flags & !flags::KNOWN != 0
+        if self.flags & flags::PROTOCOL == 0
+            || self.flags & !flags::KNOWN != 0
             || (self.flags & flags::LARGE == 0
                 && (self.data_len > u64::from(u32::MAX) || self.reserved > u64::from(u32::MAX)))
         {
@@ -243,7 +261,9 @@ impl Wire for Header {
 }
 
 fn le(b: &[u8]) -> u64 {
-    b.iter().rev().fold(0u64, |acc, &x| (acc << 8) | u64::from(x))
+    b.iter()
+        .rev()
+        .fold(0u64, |acc, &x| (acc << 8) | u64::from(x))
 }
 
 /// One Zabbix packet: the header's flags and reserved length, and the data.
@@ -262,7 +282,11 @@ pub struct Packet {
 impl Packet {
     /// A packet of uncompressed data with a 4-byte-length header.
     pub fn new(data: Vec<u8>) -> Packet {
-        Packet { flags: flags::PROTOCOL, reserved: 0, data }
+        Packet {
+            flags: flags::PROTOCOL,
+            reserved: 0,
+            data,
+        }
     }
 
     /// Reads one packet prefix with data up to `limit` bytes. A limit over
@@ -276,18 +300,36 @@ impl Packet {
         };
         let len = match usize::try_from(header.data_len) {
             Ok(n) if n <= limit => n,
-            _ => return Err(Error::TooLarge { len: header.data_len, limit }),
+            _ => {
+                return Err(Error::TooLarge {
+                    len: header.data_len,
+                    limit,
+                });
+            }
         };
         if !usize::try_from(header.reserved).is_ok_and(|n| n <= limit) {
-            return Err(Error::ReservedTooLarge { len: header.reserved, limit });
+            return Err(Error::ReservedTooLarge {
+                len: header.reserved,
+                limit,
+            });
         }
         let Some(end) = used.checked_add(len) else {
-            return Err(Error::TooLarge { len: header.data_len, limit });
+            return Err(Error::TooLarge {
+                len: header.data_len,
+                limit,
+            });
         };
         let Some(data) = b.get(used..end) else {
             return Ok(None);
         };
-        Ok(Some((Packet { flags: header.flags, reserved: header.reserved, data: data.to_vec() }, end)))
+        Ok(Some((
+            Packet {
+                flags: header.flags,
+                reserved: header.reserved,
+                data: data.to_vec(),
+            },
+            end,
+        )))
     }
 
     /// Whether the data is zlib-compressed. This module does not
@@ -330,7 +372,11 @@ impl Wire for Packet {
         if self.data.len() > MAX_DATA || self.reserved > MAX_DATA as u64 {
             return Err(Error::Unwritable);
         }
-        let header = Header { flags: self.flags, data_len: self.data.len() as u64, reserved: self.reserved };
+        let header = Header {
+            flags: self.flags,
+            data_len: self.data.len() as u64,
+            reserved: self.reserved,
+        };
         header.write(out)?;
         out.extend_from_slice(&self.data);
         Ok(())
@@ -368,10 +414,14 @@ impl Prefixed for Packet {
     const NAME: &'static str = "Zabbix";
 
     #[inline]
-    fn default_limit() -> Self::Limit { DEFAULT_LIMIT }
+    fn default_limit() -> Self::Limit {
+        DEFAULT_LIMIT
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_DATA) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_DATA)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -380,12 +430,14 @@ impl Prefixed for Packet {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         Packet::parse_limited(input, limit)
     }
 }
-
 
 /// What a JSON message is, from its top-level `request` or `response`
 /// member.
@@ -469,7 +521,10 @@ impl Wire for Message {
             (None, Some(r)) => Kind::Response(r),
             (None, None) => return Err(Error::NoKind),
         };
-        Ok(Message { kind, json: json.to_string() })
+        Ok(Message {
+            kind,
+            json: json.to_string(),
+        })
     }
 
     /// Appends the original JSON text. Refuses no constructed values.
@@ -533,7 +588,12 @@ impl Message {
     /// An active agent's collected values, in session `session`, sent at
     /// `clock` seconds and `ns` nanoseconds. The caller gives the time,
     /// since this module reads no clock.
-    pub fn agent_data(session: &str, values: &[AgentValue], clock: u64, ns: u32) -> Result<Message, Error> {
+    pub fn agent_data(
+        session: &str,
+        values: &[AgentValue],
+        clock: u64,
+        ns: u32,
+    ) -> Result<Message, Error> {
         let mut j = String::from(r#"{"request":"agent data","session":"#);
         push_str(&mut j, session)?;
         j.push_str(r#","data":["#);
@@ -547,7 +607,10 @@ impl Message {
             push_str(&mut j, &v.key)?;
             j.push_str(r#","value":"#);
             push_str(&mut j, &v.value)?;
-            j.push_str(&format!(r#","id":{},"clock":{},"ns":{}}}"#, v.id, v.clock, v.ns));
+            j.push_str(&format!(
+                r#","id":{},"clock":{},"ns":{}}}"#,
+                v.id, v.clock, v.ns
+            ));
             if j.len() > MAX_DATA {
                 return Err(Error::TooLong);
             }
@@ -579,13 +642,16 @@ impl Message {
 
 /// Appends `s` as a JSON string, quoted and escaped.
 fn push_str(out: &mut String, s: &str) -> Result<(), Error> {
-    let length = s.chars().try_fold(2usize, |n, c| {
-        n.checked_add(match c {
-            '"' | '\\' | '\n' | '\r' | '\t' => 2,
-            c if (c as u32) < 0x20 => 6,
-            c => c.len_utf8(),
+    let length = s
+        .chars()
+        .try_fold(2usize, |n, c| {
+            n.checked_add(match c {
+                '"' | '\\' | '\n' | '\r' | '\t' => 2,
+                c if (c as u32) < 0x20 => 6,
+                c => c.len_utf8(),
+            })
         })
-    }).and_then(|n| out.len().checked_add(n));
+        .and_then(|n| out.len().checked_add(n));
     if length.is_none_or(|n| n > MAX_DATA) {
         return Err(Error::TooLong);
     }
@@ -736,7 +802,11 @@ fn claim(key: String, seen: &mut [bool; 2]) -> Option<String> {
         "response" => &mut seen[1],
         _ => return None,
     };
-    if core::mem::replace(slot, true) { None } else { Some(key) }
+    if core::mem::replace(slot, true) {
+        None
+    } else {
+        Some(key)
+    }
 }
 
 struct Scanner<'a> {
@@ -770,7 +840,11 @@ impl Scanner<'_> {
     }
 
     fn literal(&mut self, word: &[u8]) -> Result<(), Error> {
-        if self.b.get(self.i..).is_some_and(|rest| rest.starts_with(word)) {
+        if self
+            .b
+            .get(self.i..)
+            .is_some_and(|rest| rest.starts_with(word))
+        {
             self.i += word.len();
             Ok(())
         } else {
@@ -861,7 +935,9 @@ impl Scanner<'_> {
                         b'u' => {
                             let hi = self.hex4()?;
                             let code = if (0xd800..0xdc00).contains(&hi) {
-                                if self.peek() != Some(b'\\') || self.b.get(self.i + 1) != Some(&b'u') {
+                                if self.peek() != Some(b'\\')
+                                    || self.b.get(self.i + 1) != Some(&b'u')
+                                {
                                     return Err(Error::Syntax(self.i));
                                 }
                                 self.i += 2;
@@ -892,13 +968,11 @@ impl Scanner<'_> {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
-    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, finish, pump,
-    };
+    use fictionet::stdlib::codec::{Decode, Step};
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn packet_bytes(flags: u8, data: &[u8], reserved: u32) -> Vec<u8> {
@@ -942,44 +1016,98 @@ mod tests {
         big.extend_from_slice(&0u64.to_le_bytes());
         big.extend_from_slice(b"abc");
         let h = Header::parse(&big[..LARGE_HEADER_LEN]).unwrap();
-        assert_eq!(h, Header { flags: 5, data_len: 3, reserved: 0 });
+        assert_eq!(
+            h,
+            Header {
+                flags: 5,
+                data_len: 3,
+                reserved: 0
+            }
+        );
         let p = Packet::parse(&big).unwrap();
 
         assert!(p.is_large());
         assert_eq!(p.to_bytes().unwrap(), big);
 
         // Large lengths require an explicit large flag.
-        let h = Header { flags: 0x03, data_len: 1, reserved: 1 << 40 };
+        let h = Header {
+            flags: 0x03,
+            data_len: 1,
+            reserved: 1 << 40,
+        };
         contract::check_wire_value(&h);
         assert_eq!(h.to_bytes(), Err(Error::Unwritable));
         let h = Header { flags: 0x07, ..h };
         contract::check_wire_value(&h);
         assert_eq!(Header::parse(&h.to_bytes().unwrap()), Ok(h));
-        let p = Packet { flags: 0xf8, reserved: 0, data: vec![] };
+        let p = Packet {
+            flags: 0xf8,
+            reserved: 0,
+            data: vec![],
+        };
         contract::check_wire_value(&p);
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
     fn packet_errors() {
-        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXE", false), Err(Error::Magic));
-        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(b"X", false), Err(Error::Magic));
-        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(b"HTTP/1.1", false), Err(Error::Magic));
-        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXD\x00", false), Err(Error::Flags(0)));
-        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXD\x02", false), Err(Error::Flags(2)));
-        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXD\x09", false), Err(Error::Flags(9)));
+        assert_eq!(
+            Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXE", false),
+            Err(Error::Magic)
+        );
+        assert_eq!(
+            Frames::<Packet>::with_limit(MAX_DATA).decode(b"X", false),
+            Err(Error::Magic)
+        );
+        assert_eq!(
+            Frames::<Packet>::with_limit(MAX_DATA).decode(b"HTTP/1.1", false),
+            Err(Error::Magic)
+        );
+        assert_eq!(
+            Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXD\x00", false),
+            Err(Error::Flags(0))
+        );
+        assert_eq!(
+            Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXD\x02", false),
+            Err(Error::Flags(2))
+        );
+        assert_eq!(
+            Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXD\x09", false),
+            Err(Error::Flags(9))
+        );
         let bytes = packet_bytes(1, b"hello", 0);
-        assert_eq!(Frames::<Packet>::with_limit(4).decode(&bytes, false), Err(Error::TooLarge { len: 5, limit: 4 }));
-        assert!(matches!(Frames::<Packet>::with_limit(5).decode(&bytes, false).unwrap(), Step::Item(_, _)));
+        assert_eq!(
+            Frames::<Packet>::with_limit(4).decode(&bytes, false),
+            Err(Error::TooLarge { len: 5, limit: 4 })
+        );
+        assert!(matches!(
+            Frames::<Packet>::with_limit(5)
+                .decode(&bytes, false)
+                .unwrap(),
+            Step::Item(_, _)
+        ));
         // Over the limit is known from the header alone.
-        assert_eq!(Frames::<Packet>::with_limit(4).decode(&bytes[..13], false), Err(Error::TooLarge { len: 5, limit: 4 }));
+        assert_eq!(
+            Frames::<Packet>::with_limit(4).decode(&bytes[..13], false),
+            Err(Error::TooLarge { len: 5, limit: 4 })
+        );
         let mut huge = b"ZBXD\x05".to_vec();
         huge.extend_from_slice(&u64::MAX.to_le_bytes());
         huge.extend_from_slice(&0u64.to_le_bytes());
-        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(&huge, false), Err(Error::TooLarge { len: u64::MAX, limit: MAX_DATA }));
+        assert_eq!(
+            Frames::<Packet>::with_limit(MAX_DATA).decode(&huge, false),
+            Err(Error::TooLarge {
+                len: u64::MAX,
+                limit: MAX_DATA
+            })
+        );
         // A limit over MAX_DATA counts as MAX_DATA.
         assert_eq!(Frames::<Packet>::with_limit(usize::MAX).limit(), MAX_DATA);
-        for e in [Error::Magic, Error::Flags(0), Error::TooLarge { len: 1, limit: 0 }] {
+        for e in [
+            Error::Magic,
+            Error::Flags(0),
+            Error::TooLarge { len: 1, limit: 0 },
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -989,20 +1117,54 @@ mod tests {
     #[test]
     fn reserved_length_is_checked_against_the_limit() {
         let bytes = packet_bytes(3, &[0x78, 0x9c], 100);
-        assert_eq!(Frames::<Packet>::with_limit(99).decode(&bytes, false), Err(Error::ReservedTooLarge { len: 100, limit: 99 }));
-        assert!(matches!(Frames::<Packet>::with_limit(100).decode(&bytes, false).unwrap(), Step::Item(_, _)));
+        assert_eq!(
+            Frames::<Packet>::with_limit(99).decode(&bytes, false),
+            Err(Error::ReservedTooLarge {
+                len: 100,
+                limit: 99
+            })
+        );
+        assert!(matches!(
+            Frames::<Packet>::with_limit(100)
+                .decode(&bytes, false)
+                .unwrap(),
+            Step::Item(_, _)
+        ));
         // Known from the header alone.
-        assert_eq!(Frames::<Packet>::with_limit(99).decode(&bytes[..13], false), Err(Error::ReservedTooLarge { len: 100, limit: 99 }));
+        assert_eq!(
+            Frames::<Packet>::with_limit(99).decode(&bytes[..13], false),
+            Err(Error::ReservedTooLarge {
+                len: 100,
+                limit: 99
+            })
+        );
         let plain = packet_bytes(1, b"x", 5);
-        assert_eq!(Frames::<Packet>::with_limit(4).decode(&plain, false), Err(Error::ReservedTooLarge { len: 5, limit: 4 }));
+        assert_eq!(
+            Frames::<Packet>::with_limit(4).decode(&plain, false),
+            Err(Error::ReservedTooLarge { len: 5, limit: 4 })
+        );
         let mut d = Stream::new(Frames::<Packet>::with_limit(10));
         assert_eq!(d.push(&packet_bytes(3, &[1], 11)[..13]), 13);
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::ReservedTooLarge { len: 11, limit: 10 }))));
+        assert_eq!(
+            d.next(),
+            Some(Err(Fail::Protocol(Error::ReservedTooLarge {
+                len: 11,
+                limit: 10
+            })))
+        );
         assert!(d.next().is_none());
-        let p = Packet { flags: 0x03, reserved: 1 << 40, data: vec![1] };
+        let p = Packet {
+            flags: 0x03,
+            reserved: 1 << 40,
+            data: vec![1],
+        };
         contract::check_wire_value(&p);
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
-        assert!(!Error::ReservedTooLarge { len: 1, limit: 0 }.to_string().is_empty());
+        assert!(
+            !Error::ReservedTooLarge { len: 1, limit: 0 }
+                .to_string()
+                .is_empty()
+        );
     }
 
     // Text that is not JSON at all is a syntax error, not "not an object".
@@ -1024,11 +1186,19 @@ mod tests {
     #[test]
     fn first_member_counts_even_when_not_a_string() {
         use Error::*;
-        assert_eq!(Message::parse(br#"{"request":1,"request":"x"}"#), Err(NoKind));
-        assert_eq!(Message::parse(br#"{"response":null,"response":"success"}"#), Err(NoKind));
-        let m = Message::parse(br#"{"request":[],"response":"failed","request":"active checks"}"#).unwrap();
+        assert_eq!(
+            Message::parse(br#"{"request":1,"request":"x"}"#),
+            Err(NoKind)
+        );
+        assert_eq!(
+            Message::parse(br#"{"response":null,"response":"success"}"#),
+            Err(NoKind)
+        );
+        let m = Message::parse(br#"{"request":[],"response":"failed","request":"active checks"}"#)
+            .unwrap();
         assert_eq!(m.kind(), &Kind::Response("failed".into()));
-        let m = Message::parse(br#"{"request":{"a":"b"},"request":"x","response":"success"}"#).unwrap();
+        let m =
+            Message::parse(br#"{"request":{"a":"b"},"request":"x","response":"success"}"#).unwrap();
         assert_eq!(m.kind(), &Kind::Response("success".into()));
     }
 
@@ -1038,9 +1208,16 @@ mod tests {
         large.extend_from_slice(&4u64.to_le_bytes());
         large.extend_from_slice(&9u64.to_le_bytes());
         large.extend_from_slice(b"wxyz");
-        for bytes in [packet_bytes(1, b"{\"request\":\"active checks\",\"host\":\"a\"}", 0), large] {
+        for bytes in [
+            packet_bytes(1, b"{\"request\":\"active checks\",\"host\":\"a\"}", 0),
+            large,
+        ] {
             for n in 0..bytes.len() {
-                assert_eq!(Frames::<Packet>::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
+                assert_eq!(
+                    Frames::<Packet>::new().decode(&bytes[..n], false),
+                    Ok(Step::Need),
+                    "{n} bytes"
+                );
                 assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Truncated));
             }
             assert!(Packet::parse(&bytes).is_ok());
@@ -1070,7 +1247,10 @@ mod tests {
         assert_eq!(m.kind(), &Kind::OtherRequest("proxy config".into()));
         // Escapes in the kind are decoded; the first member wins; a
         // nested request does not count.
-        let m = Message::parse(br#"{"x":{"request":"no"},"request":"sender\u0020data","request":"later"}"#).unwrap();
+        let m = Message::parse(
+            br#"{"x":{"request":"no"},"request":"sender\u0020data","request":"later"}"#,
+        )
+        .unwrap();
         assert_eq!(m.kind(), &Kind::SenderData);
         let m = Message::parse(br#"{"response":"failed","request":"active checks"}"#).unwrap();
         assert_eq!(m.kind(), &Kind::ActiveChecks);
@@ -1089,9 +1269,17 @@ mod tests {
         assert_eq!(Message::parse(b"{}"), Err(NoKind));
         assert_eq!(Message::parse(br#"{"request":1}"#), Err(NoKind));
         assert_eq!(Message::parse(br#"{"a":{"request":"x"}}"#), Err(NoKind));
-        let deep = format!("{{\"request\":\"x\",\"a\":{}{}}}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+        let deep = format!(
+            "{{\"request\":\"x\",\"a\":{}{}}}",
+            "[".repeat(MAX_DEPTH),
+            "]".repeat(MAX_DEPTH)
+        );
         assert_eq!(Message::parse(deep.as_bytes()), Err(TooDeep));
-        let ok = format!("{{\"request\":\"x\",\"a\":{}{}}}", "[".repeat(MAX_DEPTH - 1), "]".repeat(MAX_DEPTH - 1));
+        let ok = format!(
+            "{{\"request\":\"x\",\"a\":{}{}}}",
+            "[".repeat(MAX_DEPTH - 1),
+            "]".repeat(MAX_DEPTH - 1)
+        );
         assert!(Message::parse(ok.as_bytes()).is_ok());
         for bad in [
             &br#"{"request":"x",}"#[..],
@@ -1114,7 +1302,11 @@ mod tests {
             b"{\"request\":\"x\",\"a\":\"\x01\"}",
             br#"{"request":"x","a":+1}"#,
         ] {
-            assert!(matches!(Message::parse(bad), Err(Syntax(_))), "{}", String::from_utf8_lossy(bad));
+            assert!(
+                matches!(Message::parse(bad), Err(Syntax(_))),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
         }
         for e in [Utf8, Syntax(3), TooDeep, NotObject, NoKind, TooLong] {
             assert!(!e.to_string().is_empty());
@@ -1124,9 +1316,23 @@ mod tests {
     #[test]
     fn writers_round_trip() {
         let m = Message::active_checks("web \"1\"\n\u{1}").unwrap();
-        assert_eq!(m.json(), r#"{"request":"active checks","host":"web \"1\"\n\u0001"}"#);
-        let sv = SenderValue { host: "h".into(), key: "k[\\]".into(), value: "v\t".into() };
-        let av = AgentValue { host: "h".into(), key: "agent.version".into(), value: "7.0".into(), id: 1, clock: 1400675595, ns: 76808644 };
+        assert_eq!(
+            m.json(),
+            r#"{"request":"active checks","host":"web \"1\"\n\u0001"}"#
+        );
+        let sv = SenderValue {
+            host: "h".into(),
+            key: "k[\\]".into(),
+            value: "v\t".into(),
+        };
+        let av = AgentValue {
+            host: "h".into(),
+            key: "agent.version".into(),
+            value: "7.0".into(),
+            id: 1,
+            clock: 1400675595,
+            ns: 76808644,
+        };
         let all = [
             m,
             Message::sender_data(&[sv.clone(), sv]).unwrap(),
@@ -1144,7 +1350,13 @@ mod tests {
         let m = Message::response(true, None).unwrap();
         assert_eq!(m.clone().into_json(), m.json());
         assert_eq!(
-            Message::sender_data(&[SenderValue { host: "a".into(), key: "b".into(), value: "c".into() }]).unwrap().json(),
+            Message::sender_data(&[SenderValue {
+                host: "a".into(),
+                key: "b".into(),
+                value: "c".into()
+            }])
+            .unwrap()
+            .json(),
             r#"{"request":"sender data","data":[{"host":"a","key":"b","value":"c"}]}"#
         );
     }
@@ -1152,14 +1364,28 @@ mod tests {
     #[test]
     fn stream_splits_packets() {
         let a = Message::active_checks("a").unwrap().to_packet();
-        let b = Packet { flags: 3, reserved: 7, data: vec![1, 2, 3] };
+        let b = Packet {
+            flags: 3,
+            reserved: 7,
+            data: vec![1, 2, 3],
+        };
         let mut bytes = a.to_bytes().unwrap();
         b.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * Frames::<Packet>::new().capacity());
-        assert_eq!(decode_all(Frames::<Packet>::new, &bytes), (vec![a, b], None));
+        contract::check_decode_with_alloc_limit(
+            Frames::<Packet>::new,
+            &bytes,
+            2 * Frames::<Packet>::new().capacity(),
+        );
+        assert_eq!(
+            decode_all(Frames::<Packet>::new, &bytes),
+            (vec![a, b], None)
+        );
         let mut d = Stream::new(Frames::<Packet>::with_limit(4));
         assert_eq!(d.push(&packet_bytes(1, b"hello", 0)[..13]), 13);
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::TooLarge { len: 5, limit: 4 }))));
+        assert_eq!(
+            d.next(),
+            Some(Err(Fail::Protocol(Error::TooLarge { len: 5, limit: 4 })))
+        );
         assert_eq!(d.push(&bytes), bytes.len());
         assert!(d.next().is_none());
         assert_eq!(d.buffered(), 13);
@@ -1167,20 +1393,28 @@ mod tests {
 
     #[test]
     fn stream_reads_many_small_packets_in_linear_time() {
-        assert_linear("stream_reads_many_small_packets_in_linear_time", rounds(50_000), |size| {
-            let one = Packet::new(vec![b'x'; 3]).to_bytes().unwrap();
-            let bytes = one.repeat(size);
-            let mut stream = Stream::new(Frames::<Packet>::new());
-            let mut n = 0;
-            pump(&mut stream, &bytes, |_| n += 1).unwrap();
-            finish(&mut stream, |_| n += 1).unwrap();
-            assert_eq!(n, size);
-            assert_eq!(stream.buffered(), 0);
-        });
+        assert_linear(
+            "stream_reads_many_small_packets_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let one = Packet::new(vec![b'x'; 3]).to_bytes().unwrap();
+                let bytes = one.repeat(size);
+                let mut stream = Stream::new(Frames::<Packet>::new());
+                let mut n = 0;
+                pump(&mut stream, &bytes, |_| n += 1).unwrap();
+                finish(&mut stream, |_| n += 1).unwrap();
+                assert_eq!(n, size);
+                assert_eq!(stream.buffered(), 0);
+            },
+        );
     }
 
     fn check_stream(data: &[u8], limit: usize) {
-        contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(limit), data, 2 * Frames::<Packet>::with_limit(limit).capacity());
+        contract::check_decode_with_alloc_limit(
+            || Frames::<Packet>::with_limit(limit),
+            data,
+            2 * Frames::<Packet>::with_limit(limit).capacity(),
+        );
         contract::check_wire::<Packet>(data);
         contract::check_wire::<Header>(data);
         contract::check_wire::<Message>(data);
@@ -1198,7 +1432,11 @@ mod tests {
         assert_eq!(Message::parse(m.json().as_bytes()), Ok(m));
         let m = Message::response(false, Some(&text)).unwrap();
         assert_eq!(Message::parse(&m.to_packet().data), Ok(m));
-        let v = SenderValue { host: text.to_string(), key: text.to_string(), value: text.to_string() };
+        let v = SenderValue {
+            host: text.to_string(),
+            key: text.to_string(),
+            value: text.to_string(),
+        };
         let m = Message::sender_data(&[v]).unwrap();
         assert_eq!(Message::parse(m.json().as_bytes()), Ok(m));
     }
@@ -1207,10 +1445,24 @@ mod tests {
     fn lcg_fuzz() {
         let mut r = Lcg::new(0x5e_ed2a_bb1c);
         let seeds: Vec<Vec<u8>> = vec![
-            packet_bytes(1, br#"{"request":"sender data","data":[{"host":"h","key":"k","value":"1"}]}"#, 0),
+            packet_bytes(
+                1,
+                br#"{"request":"sender data","data":[{"host":"h","key":"k","value":"1"}]}"#,
+                0,
+            ),
             packet_bytes(3, &[0x78, 0x9c, 0, 0], 40),
-            Packet { flags: 5, reserved: 0, data: br#"{"response":"success"}"#.to_vec() }.to_bytes().unwrap(),
-            Message::agent_data("s", &[], 1, 2).unwrap().to_packet().to_bytes().unwrap(),
+            Packet {
+                flags: 5,
+                reserved: 0,
+                data: br#"{"response":"success"}"#.to_vec(),
+            }
+            .to_bytes()
+            .unwrap(),
+            Message::agent_data("s", &[], 1, 2)
+                .unwrap()
+                .to_packet()
+                .to_bytes()
+                .unwrap(),
         ];
         let alphabet = b"{}[]\":,\\ -0123456789.eEtrufalsnquxdABZD\x01\x05\x07";
         for round in 0..6000 {

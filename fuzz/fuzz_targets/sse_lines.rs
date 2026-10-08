@@ -1,13 +1,13 @@
 //! SSE raw fields, comments, ignored fields, UTF-8, and line boundaries.
 #![no_main]
 
-use fictionet::stdlib::codec::{
-    Wire,
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract::{
+    check_decode, check_decode_with_held_limit, check_wire, check_wire_value,
 };
-use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_held_limit, check_wire, check_wire_value};
 
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::sse::{Line, RawLines};
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

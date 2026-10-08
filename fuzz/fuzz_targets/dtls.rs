@@ -3,12 +3,12 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::dtls::{
     ClientHello, ContentType, Datagram, Error, Fragment, Fragments, Handshake, HelloVerifyRequest,
     MAX_MESSAGE_LEN, MAX_REASSEMBLY_BYTES, MAX_RECORDS_PER_DATAGRAM, PlainRecord, Reassembler,
     Record, Sequence, ServerHello, UnifiedRecord,
 };
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 /// Records built from the bytes, 24 at a time: plain and unified, with and
@@ -23,7 +23,11 @@ fn records_from(data: &[u8]) -> Vec<Record> {
             if k & 1 == 0 {
                 let with_cid = k & 2 != 0;
                 Record::Plain(PlainRecord {
-                    content_type: if with_cid { ContentType::TLS12_CID } else { ContentType::HANDSHAKE },
+                    content_type: if with_cid {
+                        ContentType::TLS12_CID
+                    } else {
+                        ContentType::HANDSHAKE
+                    },
                     version: 0xfefd,
                     epoch: u16::from(k & 4 != 0),
                     sequence: u64::from(k),
@@ -59,12 +63,18 @@ fn records(data: &[u8], cid_len: u8) {
     for record in &built {
         if let Ok(datagram) = record.datagram(cid_len) {
             contract::check_wire_value(&datagram);
-            assert_eq!(Record::read(&datagram.to_bytes().unwrap(), cid_len).as_ref(), Ok(record));
+            assert_eq!(
+                Record::read(&datagram.to_bytes().unwrap(), cid_len).as_ref(),
+                Ok(record)
+            );
         }
     }
     if let Ok(datagram) = Datagram::new(&built, cid_len) {
         contract::check_wire_value(&datagram);
-        assert_eq!(Datagram::read(&datagram.to_bytes().unwrap(), cid_len), Ok(built));
+        assert_eq!(
+            Datagram::read(&datagram.to_bytes().unwrap(), cid_len),
+            Ok(built)
+        );
     }
 }
 
@@ -103,7 +113,11 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         let body = data[..data.len().min(MAX_MESSAGE_LEN)].to_vec();
-        let next = Handshake { msg_type: cid_len, message_seq: r.next_seq(), body };
+        let next = Handshake {
+            msg_type: cid_len,
+            message_seq: r.next_seq(),
+            body,
+        };
         match r.add(&next.to_fragment().unwrap()) {
             Ok(_) => assert!(r.next_message().is_some()),
             Err(e) => assert_eq!(e, Error::FragmentConflict),
@@ -114,7 +128,11 @@ fuzz_target!(|data: &[u8]| {
     // The bytes as a message, sent a byte at a time, come back whole.
     // Fragment constructors refuse bodies above the message limit.
     if data.len() <= MAX_MESSAGE_LEN {
-        let m = Handshake { msg_type: cid_len, message_seq: 0, body: data.to_vec() };
+        let m = Handshake {
+            msg_type: cid_len,
+            message_seq: 0,
+            body: data.to_vec(),
+        };
         let mut r = Reassembler::new();
         for f in m.fragments(1).unwrap() {
             contract::check_wire_value(&f);

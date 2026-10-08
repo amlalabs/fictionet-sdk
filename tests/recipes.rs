@@ -19,7 +19,13 @@ mod route_change {
 
     /// The bank's machine at 203.0.113.10, on `side`.
     pub fn bank(fcx: &Cx, side: impl Interface) {
-        web_machine(fcx, side, "203.0.113.10".parse().unwrap(), "the real bank\n").unwrap();
+        web_machine(
+            fcx,
+            side,
+            "203.0.113.10".parse().unwrap(),
+            "the real bank\n",
+        )
+        .unwrap();
     }
 }
 
@@ -45,13 +51,23 @@ fn route_change_answers_get_with_the_body_and_head_without() {
             let (client, server) = pair();
             route_change::bank(&fcx, server);
             let client = tcp::endpoint(&fcx, client, "10.0.0.2".parse()?);
-            let get = ask(&fcx, &client, b"GET / HTTP/1.1\r\nHost: bank\r\nConnection: close\r\n\r\n").await?;
+            let get = ask(
+                &fcx,
+                &client,
+                b"GET / HTTP/1.1\r\nHost: bank\r\nConnection: close\r\n\r\n",
+            )
+            .await?;
             let get = std::str::from_utf8(&get).unwrap();
             let (headers, body) = get.split_once("\r\n\r\n").unwrap();
             assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
             assert!(headers.lines().any(|line| line == "content-length: 14"));
             assert_eq!(body, "the real bank\n");
-            let head = ask(&fcx, &client, b"HEAD / HTTP/1.1\r\nHost: bank\r\nConnection: close\r\n\r\n").await?;
+            let head = ask(
+                &fcx,
+                &client,
+                b"HEAD / HTTP/1.1\r\nHost: bank\r\nConnection: close\r\n\r\n",
+            )
+            .await?;
             let head = std::str::from_utf8(&head).unwrap();
             let (headers, body) = head.split_once("\r\n\r\n").unwrap();
             assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -78,7 +94,8 @@ fn route_change_limits_unfinished_requests() {
             let mut conns = Vec::new();
             for _ in 0..route_change::MAX + 16 {
                 let mut conn = client.connect(&fcx, "203.0.113.10:80".parse()?).await?;
-                conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: bank").await?;
+                conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: bank")
+                    .await?;
                 conns.push(conn);
             }
             // The connections past the limit are reset without an answer.
@@ -93,8 +110,14 @@ fn route_change_limits_unfinished_requests() {
                 assert_eq!(conn.read(&fcx, &mut byte).await, Ok(0));
             }
             let waited = fcx.now().since_start() - started.since_start();
-            assert!(waited >= route_change::LIMIT - Duration::from_secs(1), "{waited:?}");
-            assert!(waited <= route_change::LIMIT + Duration::from_secs(10), "{waited:?}");
+            assert!(
+                waited >= route_change::LIMIT - Duration::from_secs(1),
+                "{waited:?}"
+            );
+            assert!(
+                waited <= route_change::LIMIT + Duration::from_secs(10),
+                "{waited:?}"
+            );
             fcx.cancel();
             Ok(())
         }))

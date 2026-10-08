@@ -39,7 +39,7 @@
 //!
 //! [spec]: https://www.fixtrading.org/wp-content/uploads/download-manager-files/FAST-Specification-1-x-1.pdf
 
-use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated};
+use fictionet::stdlib::codec::{Decode, Reader, Step, Truncated, Wire};
 use fictionet::stdlib::xml;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -206,7 +206,11 @@ struct Fields<'a> {
 }
 impl Fields<'_> {
     fn byte(&mut self) -> Result<u8, Error> {
-        limit(add(self.cursor.position(), 1)?, MAX_MESSAGE_BYTES, "MAX_MESSAGE_BYTES")?;
+        limit(
+            add(self.cursor.position(), 1)?,
+            MAX_MESSAGE_BYTES,
+            "MAX_MESSAGE_BYTES",
+        )?;
         let b = self.cursor.u8()?;
         Ok(b)
     }
@@ -2452,7 +2456,11 @@ impl Scanner {
             if !matches!(frame.header, Header::None) {
                 let mut r = Fields {
                     input,
-                    cursor: { let mut cursor = Reader::new(input); cursor.skip(self.pos)?; cursor },
+                    cursor: {
+                        let mut cursor = Reader::new(input);
+                        cursor.skip(self.pos)?;
+                        cursor
+                    },
                     probe: &mut self.probe,
                 };
                 let mut map = Map::read(&mut r)?;
@@ -2519,7 +2527,11 @@ impl Scanner {
             }
             let mut r = Fields {
                 input,
-                cursor: { let mut cursor = Reader::new(input); cursor.skip(self.pos)?; cursor },
+                cursor: {
+                    let mut cursor = Reader::new(input);
+                    cursor.skip(self.pos)?;
+                    cursor
+                },
                 probe: &mut self.probe,
             };
             let mut child = None;
@@ -3243,18 +3255,19 @@ impl Encoder {
 
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Truncated }
+    fn from(_: Truncated) -> Self {
+        Error::Truncated
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::check_atomic;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Stream,
-        finish, pump,
+    use fictionet::stdlib::codec::{Stream, finish, pump};
+    use fictionet::stdlib::test_support::check_atomic;
+    use fictionet::stdlib::test_support::contract::{
+        check_decode_with_alloc_limit, check_wire, check_wire_value,
     };
-    use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_wire, check_wire_value};
     use fictionet::stdlib::test_support::{chunks, decode_all};
 
     fn templates(fields: &str) -> Templates {
@@ -4101,10 +4114,25 @@ mod tests {
         // Also change the copied template ID before failing.
         let other = [0xe0, 0x82, b'n', 0xb4, 0x81, 0xff];
         for refused in [&bad[..], &other[..]] {
-            let capture = |m: &Messages| (m.state.template_id, m.state.bytes,
-                m.state.entries.iter().map(|e| (e.kind, e.value.clone())).collect::<Vec<_>>());
-            assert_eq!(check_atomic(&mut exact, |m| m.parse_exact(refused), capture), Err(Error::Text));
-            assert_eq!(check_atomic(&mut frames, |m| m.decode(refused, false), capture), Err(Error::Text));
+            let capture = |m: &Messages| {
+                (
+                    m.state.template_id,
+                    m.state.bytes,
+                    m.state
+                        .entries
+                        .iter()
+                        .map(|e| (e.kind, e.value.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            assert_eq!(
+                check_atomic(&mut exact, |m| m.parse_exact(refused), capture),
+                Err(Error::Text)
+            );
+            assert_eq!(
+                check_atomic(&mut frames, |m| m.decode(refused, false), capture),
+                Err(Error::Text)
+            );
             assert_eq!(
                 exact.parse_exact(&[0x80, 0x80, 0x80, 0x80, 0x82, b'O', b'K']),
                 Ok(valid.clone())
@@ -4333,7 +4361,11 @@ mod tests {
             check_wire::<ByteVector>(&bytes);
             check_wire::<Decimal>(&bytes);
             check_wire::<PresenceMap>(&bytes);
-            check_decode_with_alloc_limit(|| Messages::new(t.clone()), &bytes, 2 * MAX_MESSAGE_BYTES);
+            check_decode_with_alloc_limit(
+                || Messages::new(t.clone()),
+                &bytes,
+                2 * MAX_MESSAGE_BYTES,
+            );
         }
     }
     #[test]

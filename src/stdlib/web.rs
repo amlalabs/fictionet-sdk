@@ -519,14 +519,13 @@
 //! addresses are bound or how DNS answers, is
 //! [`net`](fictionet::stdlib::net)'s, and a copy of that file changes it.
 
-
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use http::{Request, Response};
 
-pub use fictionet::stdlib::httpd::{Body, Target};
 use fictionet::stdlib::httpd::{self, Handler, Website};
+pub use fictionet::stdlib::httpd::{Body, Target};
 use fictionet::stdlib::net::{Host, Net};
 use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::tls::ServerConfig;
@@ -561,8 +560,14 @@ impl Sites {
     {
         Sites {
             site_for: Arc::new(site_for),
-            subnet: Prefix { addr: Ipv4Addr::new(10, 0, 0, 0).into(), len: 24 },
-            subnet_v6: Prefix { addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).into(), len: 64 },
+            subnet: Prefix {
+                addr: Ipv4Addr::new(10, 0, 0, 0).into(),
+                len: 24,
+            },
+            subnet_v6: Prefix {
+                addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).into(),
+                len: 64,
+            },
             ipv6: true,
             max_sites: fictionet::stdlib::net::MAX_HOSTS,
             date: None,
@@ -574,7 +579,10 @@ impl Sites {
     /// it, responses have no `Date` header; the host's clock is never used.
     /// See [`httpd`'s Dates](fictionet::stdlib::httpd#dates).
     pub fn date(self, start: std::time::SystemTime) -> Sites {
-        Sites { date: Some(start), ..self }
+        Sites {
+            date: Some(start),
+            ..self
+        }
     }
 
     /// Sets the sandboxes' IPv4 or IPv6 subnet, whichever `subnet` is. The
@@ -591,7 +599,10 @@ impl Sites {
     pub fn subnet(self, subnet: Prefix) -> Sites {
         match subnet.addr {
             IpAddr::V4(_) => Sites { subnet, ..self },
-            IpAddr::V6(_) => Sites { subnet_v6: subnet, ..self },
+            IpAddr::V6(_) => Sites {
+                subnet_v6: subnet,
+                ..self
+            },
         }
     }
 
@@ -602,7 +613,10 @@ impl Sites {
     ///
     /// Without this, the network is dual-stack: see [IPv6](self#ipv6).
     pub fn ipv4_only(self) -> Sites {
-        Sites { ipv6: false, ..self }
+        Sites {
+            ipv6: false,
+            ..self
+        }
     }
 
     /// Sets how many names may have a site. The default is 20,000.
@@ -687,7 +701,12 @@ impl Site {
     /// A site served by an [`httpd::Handler`], such as an
     /// [`httpd::Router`].
     pub fn handler(handler: impl Handler) -> Site {
-        Site { website: Website::new(handler), at: None, at_v6: None, family: Family::Both }
+        Site {
+            website: Website::new(handler),
+            at: None,
+            at_v6: None,
+            family: Family::Both,
+        }
     }
 
     /// Serves the site at `addr`, for example the address it has on the
@@ -719,15 +738,24 @@ impl Site {
     /// serve a site at `169.254.169.254`.
     pub fn at(self, addr: impl Into<IpAddr>) -> Site {
         match addr.into() {
-            IpAddr::V4(a) => Site { at: Some(a), ..self },
-            IpAddr::V6(a) => Site { at_v6: Some(a), ..self },
+            IpAddr::V4(a) => Site {
+                at: Some(a),
+                ..self
+            },
+            IpAddr::V6(a) => Site {
+                at_v6: Some(a),
+                ..self
+            },
         }
     }
 
     /// Gives the site only an IPv4 address. DNS answers AAAA queries for
     /// its name with NODATA, so clients connect over IPv4.
     pub fn ipv4_only(self) -> Site {
-        Site { family: Family::V4, ..self }
+        Site {
+            family: Family::V4,
+            ..self
+        }
     }
 
     /// Gives the site only an IPv6 address. DNS answers A queries for its
@@ -735,7 +763,10 @@ impl Site {
     /// network with IPv6 turned off ([`Sites::ipv4_only`]) the site has
     /// no address at all, and its name gets NXDOMAIN.
     pub fn ipv6_only(self) -> Site {
-        Site { family: Family::V6, ..self }
+        Site {
+            family: Family::V6,
+            ..self
+        }
     }
 
     /// Serves the site over HTTPS. `config_for` runs on every handshake and
@@ -749,7 +780,10 @@ impl Site {
     where
         F: Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
     {
-        Site { website: self.website.tls(config_for), ..self }
+        Site {
+            website: self.website.tls(config_for),
+            ..self
+        }
     }
 
     /// Serves a site with [`tls`](Site::tls) over plain HTTP on port 80
@@ -761,7 +795,10 @@ impl Site {
     /// that strips TLS does. The handler tells the two kinds of request
     /// apart by [`Target::scheme`].
     pub fn plain_http(self) -> Site {
-        Site { website: self.website.plain_http(), ..self }
+        Site {
+            website: self.website.plain_http(),
+            ..self
+        }
     }
 
     /// Makes the site the default one at its address: it answers requests
@@ -778,7 +815,10 @@ impl Site {
     ///
     /// The first default site that appears at an address keeps the role.
     pub fn default_host(self) -> Site {
-        Site { website: self.website.default_host(), ..self }
+        Site {
+            website: self.website.default_host(),
+            ..self
+        }
     }
 
     /// The site as a host of a [`Net`], named `name`.
@@ -828,7 +868,9 @@ impl Site {
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub fn proxy() -> Proxy {
-    Proxy { client: Arc::new(proxy_client()) }
+    Proxy {
+        client: Arc::new(proxy_client()),
+    }
 }
 
 /// The handler made by [`proxy`].
@@ -843,9 +885,13 @@ pub struct Proxy {
 impl tower_service::Service<Request<Body>> for Proxy {
     type Response = Response<hyper::body::Incoming>;
     type Error = Error;
-    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Error>> + Send>>;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Error>> + Send>>;
 
-    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Error>> {
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Error>> {
         std::task::Poll::Ready(Ok(()))
     }
 
@@ -870,14 +916,23 @@ fn proxy_client() -> ProxyClient {
         .enable_http1()
         .enable_http2()
         .build();
-    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector)
+    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build(connector)
 }
 
 /// Headers that belong to one connection and are not passed on (RFC 9110,
 /// section 7.6.1).
 #[cfg(feature = "tokio")]
-const HOP_BY_HOP: [&str; 8] =
-    ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization"];
+const HOP_BY_HOP: [&str; 8] = [
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-authorization",
+];
 
 #[cfg(feature = "tokio")]
 fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
@@ -887,24 +942,44 @@ fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()))
         .collect();
-    for name in HOP_BY_HOP.iter().copied().chain(named.iter().map(String::as_str)) {
+    for name in HOP_BY_HOP
+        .iter()
+        .copied()
+        .chain(named.iter().map(String::as_str))
+    {
         headers.remove(name);
     }
 }
 
 /// Forwards one request to its [`Target`] over the world's own network.
 #[cfg(feature = "tokio")]
-async fn forward(client: Arc<ProxyClient>, request: Request<Body>) -> Result<Response<hyper::body::Incoming>, Error> {
+async fn forward(
+    client: Arc<ProxyClient>,
+    request: Request<Body>,
+) -> Result<Response<hyper::body::Incoming>, Error> {
     use http::uri::Scheme;
     let target = request
         .extensions()
         .get::<Target>()
         .cloned()
-        .ok_or_else(|| fictionet::Error::msg("web::proxy() serves only requests that web::Sites routed: there is no web::Target"))?;
+        .ok_or_else(|| {
+            fictionet::Error::msg(
+                "web::proxy() serves only requests that web::Sites routed: there is no web::Target",
+            )
+        })?;
     let (mut parts, body) = request.into_parts();
-    let default_port = (target.scheme == Scheme::HTTP && target.port == 80) || (target.scheme == Scheme::HTTPS && target.port == 443);
-    let authority = if default_port { target.host.clone() } else { format!("{}:{}", target.host, target.port) };
-    let path = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let default_port = (target.scheme == Scheme::HTTP && target.port == 80)
+        || (target.scheme == Scheme::HTTPS && target.port == 443);
+    let authority = if default_port {
+        target.host.clone()
+    } else {
+        format!("{}:{}", target.host, target.port)
+    };
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
     parts.uri = format!("{}://{}{}", target.scheme, authority, path).parse()?;
     parts.version = http::Version::HTTP_11;
     parts.extensions = http::Extensions::new();

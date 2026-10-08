@@ -5,22 +5,32 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::fastcgi::{
+    BeginRequest, Client, ClientEvent, EndRequest, Error, MAX_CONTENT, MAX_HELD, MAX_REQUESTS,
+    Pairs, Record, RecordStream, Request, Response, Server, ServerEvent, UnknownType, kind,
+};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::fastcgi::{
-    BeginRequest, Client, ClientEvent, EndRequest, Error, MAX_CONTENT, MAX_HELD, MAX_REQUESTS, Record,
-    Pairs, Request, Response, RecordStream, UnknownType, Server, ServerEvent, kind,
-};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::<Record>::new, data, 2 * Frames::<Record>::new().capacity());
+    contract::check_decode_with_alloc_limit(
+        Frames::<Record>::new,
+        data,
+        2 * Frames::<Record>::new().capacity(),
+    );
     contract::check_wire::<Record>(data);
     let limit = usize::from(data.first().copied().unwrap_or(0));
     contract::check_decode_with_alloc_limit(
-        || Frames::<Record>::with_limit(limit), data, 2 * Frames::<Record>::with_limit(limit).capacity(),
+        || Frames::<Record>::with_limit(limit),
+        data,
+        2 * Frames::<Record>::with_limit(limit).capacity(),
     );
-    contract::check_decode_with_alloc_limit(|| Frames::<Record>::new().map(|record| BeginRequest::parse(&record.content)), data, 2 * Frames::<Record>::new().capacity());
+    contract::check_decode_with_alloc_limit(
+        || Frames::<Record>::new().map(|record| BeginRequest::parse(&record.content)),
+        data,
+        2 * Frames::<Record>::new().capacity(),
+    );
     let built = Record {
         kind: data.first().copied().unwrap_or(0),
         request_id: 1,
@@ -60,7 +70,8 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(got, Some(req));
         }
         // So can a response. One with an error reported is never given.
-        let failed_before = matches!(r.kind, kind::STDOUT | kind::STDERR) && client_failed.contains(&r.request_id);
+        let failed_before =
+            matches!(r.kind, kind::STDOUT | kind::STDERR) && client_failed.contains(&r.request_id);
         let got = client.receive(r);
         match &got {
             Err(Error::AfterEnd { id, .. } | Error::TooLarge { id, .. }) => {
@@ -97,7 +108,11 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Request>(data);
     contract::check_wire::<Response>(data);
 
-    let stream = RecordStream { kind: kind::STDOUT, request_id: 1, data: data.to_vec() };
+    let stream = RecordStream {
+        kind: kind::STDOUT,
+        request_id: 1,
+        data: data.to_vec(),
+    };
     contract::check_wire_value(&stream);
     if let Ok(bytes) = stream.to_bytes() {
         let mut client = Client::new();

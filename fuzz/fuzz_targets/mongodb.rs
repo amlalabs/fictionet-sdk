@@ -4,11 +4,13 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_wire, check_wire_value};
-use fictionet::stdlib::mongodb::{
-    Body, Bson, Compressed, Document, Message, Msg, Query, Reply, Sequence, MAX_MESSAGE_SIZE,
-};
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::mongodb::{
+    Body, Bson, Compressed, Document, MAX_MESSAGE_SIZE, Message, Msg, Query, Reply, Sequence,
+};
+use fictionet::stdlib::test_support::contract::{
+    check_decode_with_alloc_limit, check_wire, check_wire_value,
+};
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
@@ -35,13 +37,28 @@ fn value(b: &mut Bytes<'_>, depth: u8) -> Bson {
         1 => Bson::String(b.text()),
         2 if depth > 0 => Bson::Document(document(b, depth - 1)),
         3 if depth > 0 => Bson::Array((0..b.u8() % 4).map(|_| value(b, depth - 1)).collect()),
-        4 => Bson::Binary { subtype: b.u8(), bytes: (0..b.u8() % 8).map(|_| b.u8()).collect() },
-        5 => Bson::Regex { pattern: b.text(), options: b.text() },
+        4 => Bson::Binary {
+            subtype: b.u8(),
+            bytes: (0..b.u8() % 8).map(|_| b.u8()).collect(),
+        },
+        5 => Bson::Regex {
+            pattern: b.text(),
+            options: b.text(),
+        },
         6 => Bson::Double(f64::from(b.u8()) / 3.0),
         7 => Bson::Boolean(b.u8() & 1 == 1),
-        8 if depth > 0 => Bson::JavaScriptWithScope { code: b.text(), scope: document(b, depth - 1) },
-        9 => Bson::Timestamp { time: u32::from(b.u8()), increment: u32::from(b.u8()) },
-        10 => Bson::DbPointer { namespace: b.text(), id: [b.u8(); 12] },
+        8 if depth > 0 => Bson::JavaScriptWithScope {
+            code: b.text(),
+            scope: document(b, depth - 1),
+        },
+        9 => Bson::Timestamp {
+            time: u32::from(b.u8()),
+            increment: u32::from(b.u8()),
+        },
+        10 => Bson::DbPointer {
+            namespace: b.text(),
+            id: [b.u8(); 12],
+        },
         _ => Bson::Null,
     }
 }
@@ -59,10 +76,15 @@ fn message(b: &mut Bytes<'_>) -> Message {
     let body = match b.u8() % 4 {
         0 => {
             let mut m = Msg::new(document(b, 3));
-            m.flags = u32::from(b.u8() & 3) | (u32::from(b.u8() & 1) << 16) | (u32::from(b.u8() & 1) << 20);
+            m.flags = u32::from(b.u8() & 3)
+                | (u32::from(b.u8() & 1) << 16)
+                | (u32::from(b.u8() & 1) << 20);
             for _ in 0..b.u8() % 3 {
                 let documents = (0..b.u8() % 3).map(|_| document(b, 2)).collect();
-                m.sequences.push(Sequence { identifier: b.text(), documents });
+                m.sequences.push(Sequence {
+                    identifier: b.text(),
+                    documents,
+                });
             }
             Body::Msg(m)
         }
@@ -72,12 +94,22 @@ fn message(b: &mut Bytes<'_>) -> Message {
             number_to_skip: 0,
             number_to_return: -1,
             query: document(b, 3),
-            fields: if b.u8() & 1 == 1 { Some(document(b, 1)) } else { None },
+            fields: if b.u8() & 1 == 1 {
+                Some(document(b, 1))
+            } else {
+                None
+            },
         }),
-        2 => Body::Reply(Reply::new((0..b.u8() % 3).map(|_| document(b, 3)).collect())),
+        2 => Body::Reply(Reply::new(
+            (0..b.u8() % 3).map(|_| document(b, 3)).collect(),
+        )),
         _ => {
             let data: Vec<u8> = (0..b.u8() % 8).map(|_| b.u8()).collect();
-            let size = if b.u8() & 1 == 1 { data.len() as i32 } else { i32::from(b.u8()) - 8 };
+            let size = if b.u8() & 1 == 1 {
+                data.len() as i32
+            } else {
+                i32::from(b.u8()) - 8
+            };
             Body::Compressed(Compressed {
                 original_op_code: 2013,
                 uncompressed_size: size,
@@ -86,7 +118,11 @@ fn message(b: &mut Bytes<'_>) -> Message {
             })
         }
     };
-    Message { request_id: 1, response_to: 0, body }
+    Message {
+        request_id: 1,
+        response_to: 0,
+        body,
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -94,7 +130,11 @@ fuzz_target!(|data: &[u8]| {
     check_decode_with_alloc_limit(|| Frames::<Message>::with_limit(64), data, 128);
     check_wire::<Message>(data);
     check_wire::<Document>(data);
-    for message in decode_all(Frames::<Message>::new, data).0.into_iter().flatten() {
+    for message in decode_all(Frames::<Message>::new, data)
+        .0
+        .into_iter()
+        .flatten()
+    {
         assert!(message.to_bytes().is_ok(), "{message:?}");
         check_wire_value(&message);
     }

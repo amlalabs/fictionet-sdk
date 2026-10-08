@@ -21,14 +21,24 @@ use fictionet::{Attacher, Cx, attachments};
 pub const SITE_ADDR: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
 pub const DEFAULT_ADDR: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 40);
 /// The names the world serves. `*.wild.test` is any name under it.
-pub const NAMES: [&str; 8] =
-    ["plain.test", "tls.test", "both.test", "broken.test", "default.test", "other.test", "x.wild.test", "nxdomain.test"];
+pub const NAMES: [&str; 8] = [
+    "plain.test",
+    "tls.test",
+    "both.test",
+    "broken.test",
+    "default.test",
+    "other.test",
+    "x.wild.test",
+    "nxdomain.test",
+];
 
 /// The certificate for the TLS sites, and its key.
 pub fn cert() -> &'static (Vec<u8>, Vec<u8>) {
     static CERT: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
     CERT.get_or_init(|| {
-        let c = rcgen::generate_simple_self_signed(vec!["tls.test".to_owned(), "both.test".to_owned()]).unwrap();
+        let c =
+            rcgen::generate_simple_self_signed(vec!["tls.test".to_owned(), "both.test".to_owned()])
+                .unwrap();
         (c.cert.der().to_vec(), c.key_pair.serialize_der())
     })
 }
@@ -56,7 +66,11 @@ impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Echo {
             };
             let text = format!("{} {} {:?} {n}\n", parts.method, parts.uri, parts.version);
             let big = parts.uri.path() == "/big";
-            let body = if big { Bytes::from(vec![b'x'; 256 * 1024]) } else { Bytes::from(text) };
+            let body = if big {
+                Bytes::from(vec![b'x'; 256 * 1024])
+            } else {
+                Bytes::from(text)
+            };
             Ok(Response::new(Full::new(body)))
         })
     }
@@ -84,19 +98,31 @@ impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Broken {
 pub fn serve(fcx: &Cx) -> Attacher {
     let (der, key) = cert();
     let config = Arc::new(
-        tls::config_builder(fcx, UNIX_EPOCH + Duration::from_secs(1_800_000_000), rustls::crypto::ring::default_provider())
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![CertificateDer::from(der.clone())], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.clone())))
-            .unwrap(),
+        tls::config_builder(
+            fcx,
+            UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+            rustls::crypto::ring::default_provider(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(der.clone())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.clone())),
+        )
+        .unwrap(),
     );
     let sites = web::Sites::new(move |host| {
         let c = config.clone();
         match host {
             "plain.test" => Some(web::Site::new(Echo)),
             "tls.test" => Some(web::Site::new(Echo).at(SITE_ADDR).tls(move |_| c.clone())),
-            "both.test" => Some(web::Site::new(Echo).at(SITE_ADDR).tls(move |_| c.clone()).plain_http()),
+            "both.test" => Some(
+                web::Site::new(Echo)
+                    .at(SITE_ADDR)
+                    .tls(move |_| c.clone())
+                    .plain_http(),
+            ),
             "broken.test" => Some(web::Site::new(Broken).at(SITE_ADDR)),
             "default.test" => Some(web::Site::new(Echo).at(DEFAULT_ADDR).default_host()),
             "other.test" => Some(web::Site::new(Echo).at(DEFAULT_ADDR)),
@@ -127,7 +153,11 @@ impl Client {
         use fictionet::stdlib::{ip, tcp, udp};
         let end = attacher.attach(name).unwrap();
         let (t, u, icmp, _other) = ip::split_protocols(fcx, end);
-        Client { tcp: tcp::endpoint(fcx, t, addr.into()), udp: udp::endpoint(fcx, u, addr.into()), _icmp: icmp }
+        Client {
+            tcp: tcp::endpoint(fcx, t, addr.into()),
+            udp: udp::endpoint(fcx, u, addr.into()),
+            _icmp: icmp,
+        }
     }
 
     /// Looks `name` up at the gateway. `None` if there is no address.
@@ -137,7 +167,10 @@ impl Client {
         let mut socket = self.udp.bind(5353).ok()?;
         let mut m = Message::query();
         m.metadata.id = 7;
-        m.add_query(Query::query(Name::from_ascii(format!("{name}.")).ok()?, RecordType::A));
+        m.add_query(Query::query(
+            Name::from_ascii(format!("{name}.")).ok()?,
+            RecordType::A,
+        ));
         socket.send_to(&m.to_vec().ok()?, "10.0.0.1:53".parse().unwrap());
         let (reply, _) = socket.recv(fcx).await.ok()?;
         let reply = Message::from_vec(&reply).ok()?;
@@ -183,19 +216,23 @@ impl rustls::client::danger::ServerCertVerifier for AnyCert {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
 /// A TLS client config that trusts any certificate, with these ALPN
 /// protocols.
 pub fn client_config(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
-    let mut c = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AnyCert))
-        .with_no_client_auth();
+    let mut c = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(AnyCert))
+    .with_no_client_auth();
     c.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Arc::new(c)
 }

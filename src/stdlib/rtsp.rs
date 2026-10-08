@@ -85,9 +85,9 @@
 //! assert_eq!(stream.next(), None);
 //! ```
 
-use fictionet::stdlib::codec::ascii::{self, trim_ows_str as trim_ws, is_tchar as is_token_byte};
-use fictionet::stdlib::codec::{Decode, LineError, Step, Wire};
+use fictionet::stdlib::codec::ascii::{self, is_tchar as is_token_byte, trim_ows_str as trim_ws};
 use fictionet::stdlib::codec::head_body::{self, Header, Scanner};
+use fictionet::stdlib::codec::{Decode, LineError, Step, Wire};
 
 /// The TCP port RTSP servers listen on.
 pub const PORT: u16 = 554;
@@ -221,10 +221,16 @@ impl std::fmt::Display for Error {
             Error::Trailing => f.write_str("bytes after wire unit"),
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::TooLong => {
-                write!(f, "head or header value over {MAX_HEAD}, body over {MAX_BODY} or frame over {MAX_INTERLEAVED} bytes")
+                write!(
+                    f,
+                    "head or header value over {MAX_HEAD}, body over {MAX_BODY} or frame over {MAX_INTERLEAVED} bytes"
+                )
             }
             Error::TooMany => {
-                write!(f, "over {MAX_HEADERS} headers, {MAX_TRANSPORTS} transports or {MAX_PARAMS} parameters")
+                write!(
+                    f,
+                    "over {MAX_HEADERS} headers, {MAX_TRANSPORTS} transports or {MAX_PARAMS} parameters"
+                )
             }
             Error::LineEnding => f.write_str("CR or LF outside a CRLF pair"),
             Error::Utf8 => f.write_str("head or header value is not UTF-8"),
@@ -282,7 +288,11 @@ impl Message {
     /// A request with no headers and no body.
     pub fn request(version: Version, method: &str, uri: &str) -> Message {
         Message {
-            start: StartLine::Request { method: method.to_string(), uri: uri.to_string(), version },
+            start: StartLine::Request {
+                method: method.to_string(),
+                uri: uri.to_string(),
+                version,
+            },
             headers: Vec::new(),
             body: Vec::new(),
         }
@@ -291,7 +301,11 @@ impl Message {
     /// A response with no headers and no body.
     pub fn response(version: Version, code: u16, reason: &str) -> Message {
         Message {
-            start: StartLine::Status { version, code, reason: reason.to_string() },
+            start: StartLine::Status {
+                version,
+                code,
+                reason: reason.to_string(),
+            },
             headers: Vec::new(),
             body: Vec::new(),
         }
@@ -337,8 +351,13 @@ impl Message {
     }
 
     /// The headers named `name`, in order. Case does not matter.
-    pub fn headers_named<'a, 'n>(&'a self, name: &'n str) -> impl Iterator<Item = &'a Header> + use<'a, 'n> {
-        self.headers.iter().filter(move |h| h.name.eq_ignore_ascii_case(name))
+    pub fn headers_named<'a, 'n>(
+        &'a self,
+        name: &'n str,
+    ) -> impl Iterator<Item = &'a Header> + use<'a, 'n> {
+        self.headers
+            .iter()
+            .filter(move |h| h.name.eq_ignore_ascii_case(name))
     }
 
     /// The value of the first header named `name`.
@@ -354,16 +373,27 @@ impl Message {
     /// Adds a header from a wire value. Refuses a failed value write or
     /// invalid UTF-8, and leaves the headers unchanged on error.
     /// The message writer checks the header name, text, and size limits.
-    pub fn push_value(&mut self, name: &str, value: &impl Wire<WriteError = Error>) -> Result<(), Error> {
+    pub fn push_value(
+        &mut self,
+        name: &str,
+        value: &impl Wire<WriteError = Error>,
+    ) -> Result<(), Error> {
         let value = String::from_utf8(value.to_bytes()?).map_err(|_| Error::Utf8)?;
-        self.headers.push(Header { name: name.to_string(), value });
+        self.headers.push(Header {
+            name: name.to_string(),
+            value,
+        });
         Ok(())
     }
 
     /// Sets the header named `name` to `value`: the first one is changed
     /// and any others are removed. With none, it is added at the end.
     pub fn set_header(&mut self, name: &str, value: &str) {
-        match self.headers.iter().position(|h| h.name.eq_ignore_ascii_case(name)) {
+        match self
+            .headers
+            .iter()
+            .position(|h| h.name.eq_ignore_ascii_case(name))
+        {
             Some(i) => {
                 self.headers[i].value = value.to_string();
                 let mut seen = 0usize;
@@ -452,7 +482,11 @@ impl Message {
         reply.headers = self
             .headers
             .iter()
-            .filter(|h| ["CSeq", "Session", "Timestamp"].iter().any(|n| h.name.eq_ignore_ascii_case(n)))
+            .filter(|h| {
+                ["CSeq", "Session", "Timestamp"]
+                    .iter()
+                    .any(|n| h.name.eq_ignore_ascii_case(n))
+            })
             .cloned()
             .collect();
         reply
@@ -497,8 +531,16 @@ impl Interleaved {
         }
         let n = usize::from(u16::from_be_bytes([b[2], b[3]]));
         let end = INTERLEAVED_HEADER_LEN + n;
-        let Some(data) = b.get(INTERLEAVED_HEADER_LEN..end) else { return Ok(None) };
-        Ok(Some((Interleaved { channel: b[1], data: data.to_vec() }, end)))
+        let Some(data) = b.get(INTERLEAVED_HEADER_LEN..end) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            Interleaved {
+                channel: b[1],
+                data: data.to_vec(),
+            },
+            end,
+        )))
     }
 }
 
@@ -546,7 +588,9 @@ pub struct Frames {
 
 impl core::fmt::Debug for Frames {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Frames").field("scanner", &self.scanner).finish_non_exhaustive()
+        f.debug_struct("Frames")
+            .field("scanner", &self.scanner)
+            .finish_non_exhaustive()
     }
 }
 
@@ -559,7 +603,9 @@ impl Default for Frames {
 impl Frames {
     /// Creates a decoder using [`MAX_LINE`], [`MAX_HEAD`], and [`MAX_BODY`].
     pub fn new() -> Self {
-        Self { scanner: Scanner::new(MAX_LINE, MAX_HEAD, false) }
+        Self {
+            scanner: Scanner::new(MAX_LINE, MAX_HEAD, false),
+        }
     }
 }
 
@@ -602,20 +648,32 @@ impl Decode for Frames {
 // start line or unrelated header be returned as an item at a known boundary.
 // Only offsets and lengths survive Need; header strings are never cached.
 fn frame_body_length(head: &[u8]) -> Result<usize, Error> {
-    let mut lines = head.split(|&b| b == b'\n').map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+    let mut lines = head
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
     let first = lines.next().unwrap_or_default();
     if let Ok(text) = core::str::from_utf8(first)
         && let Ok((version, code, _, _)) = start_line_parts(text)
     {
-        if version == Version::Rtsp20 && head.windows(2).any(|pair| pair[1] == b'\n' && pair[0] != b'\r') {
+        if version == Version::Rtsp20
+            && head
+                .windows(2)
+                .any(|pair| pair[1] == b'\n' && pair[0] != b'\r')
+        {
             return Err(Error::LineEnding);
         }
         if code.is_some_and(|code| bodyless(version, code)) {
             return Ok(0);
         }
     }
-    head_body::content_length(lines, |name| name.eq_ignore_ascii_case(b"Content-Length"),
-        parse_content_length, true, Error::ContentLength).map(|length| length.unwrap_or(0))
+    head_body::content_length(
+        lines,
+        |name| name.eq_ignore_ascii_case(b"Content-Length"),
+        parse_content_length,
+        true,
+        Error::ContentLength,
+    )
+    .map(|length| length.unwrap_or(0))
 }
 
 #[inline]
@@ -679,14 +737,22 @@ impl Wire for Message {
         let total = message_size(self)?;
         out.try_reserve(total).map_err(|_| Error::TooLong)?;
         match &self.start {
-            StartLine::Request { method, uri, version } => {
+            StartLine::Request {
+                method,
+                uri,
+                version,
+            } => {
                 out.extend_from_slice(method.as_bytes());
                 out.push(b' ');
                 out.extend_from_slice(uri.as_bytes());
                 out.push(b' ');
                 out.extend_from_slice(version.as_str().as_bytes());
             }
-            StartLine::Status { version, code, reason } => {
+            StartLine::Status {
+                version,
+                code,
+                reason,
+            } => {
                 out.extend_from_slice(version.as_str().as_bytes());
                 out.extend_from_slice(format!(" {code} {reason}").as_bytes());
             }
@@ -714,17 +780,29 @@ fn message_size(message: &Message) -> Result<usize, Error> {
     }
     // Count before formatting or copying caller-owned strings.
     let start = match &message.start {
-        StartLine::Request { method, uri, version } => method
+        StartLine::Request {
+            method,
+            uri,
+            version,
+        } => method
             .len()
             .checked_add(uri.len())
             .and_then(|n| n.checked_add(version.as_str().len()))
             .and_then(|n| n.checked_add(2))
             .ok_or(too_long)?,
-        StartLine::Status { version, code, reason } => {
+        StartLine::Status {
+            version,
+            code,
+            reason,
+        } => {
             if !(100..=599).contains(code) {
                 return Err(Error::StartLine);
             }
-            reason.len().checked_add(version.as_str().len()).and_then(|n| n.checked_add(5)).ok_or(too_long)?
+            reason
+                .len()
+                .checked_add(version.as_str().len())
+                .and_then(|n| n.checked_add(5))
+                .ok_or(too_long)?
         }
     };
     if start > MAX_LINE {
@@ -732,11 +810,19 @@ fn message_size(message: &Message) -> Result<usize, Error> {
     }
     let mut head = start.checked_add(4).ok_or(too_long)?;
     for header in &message.headers {
-        let line = header.name.len().checked_add(header.value.len()).and_then(|n| n.checked_add(2)).ok_or(too_long)?;
+        let line = header
+            .name
+            .len()
+            .checked_add(header.value.len())
+            .and_then(|n| n.checked_add(2))
+            .ok_or(too_long)?;
         if line > MAX_LINE {
             return Err(too_long);
         }
-        head = head.checked_add(line).and_then(|n| n.checked_add(2)).ok_or(too_long)?;
+        head = head
+            .checked_add(line)
+            .and_then(|n| n.checked_add(2))
+            .ok_or(too_long)?;
         if head > MAX_HEAD {
             return Err(too_long);
         }
@@ -852,9 +938,16 @@ impl Session {
             if !trim_ws(name).eq_ignore_ascii_case("timeout") || timeout.is_some() {
                 return Err(BAD);
             }
-            timeout = Some(parse_u64(trim_ws(value)).filter(|&t| t <= MAX_SECONDS).ok_or(BAD)?);
+            timeout = Some(
+                parse_u64(trim_ws(value))
+                    .filter(|&t| t <= MAX_SECONDS)
+                    .ok_or(BAD)?,
+            );
         }
-        Ok(Session { id: id.to_string(), timeout })
+        Ok(Session {
+            id: id.to_string(),
+            timeout,
+        })
     }
 
     fn format_value(&self) -> Result<String, Error> {
@@ -1025,7 +1118,12 @@ impl Transport {
         if both_deliveries(&params) {
             return Err(BAD);
         }
-        Ok(Transport { protocol: protocol.to_string(), profile: profile.to_string(), lower, params })
+        Ok(Transport {
+            protocol: protocol.to_string(),
+            profile: profile.to_string(),
+            lower,
+            params,
+        })
     }
 
     /// Reads a Transport header's value: one or more specifications
@@ -1039,7 +1137,8 @@ impl Transport {
 
     fn format_value(&self) -> Result<String, Error> {
         const BAD: Error = Error::Malformed("Transport");
-        let profile_ok = is_token(&self.profile) || (self.profile.is_empty() && self.lower.is_none());
+        let profile_ok =
+            is_token(&self.profile) || (self.profile.is_empty() && self.lower.is_none());
         if !is_token(&self.protocol) || !profile_ok {
             return Err(BAD);
         }
@@ -1050,7 +1149,11 @@ impl Transport {
             return Err(BAD);
         }
         // Bound all caller-owned text before cloning or joining it.
-        let mut size = self.protocol.len().checked_add(self.profile.len()).ok_or(Error::TooLong)?;
+        let mut size = self
+            .protocol
+            .len()
+            .checked_add(self.profile.len())
+            .ok_or(Error::TooLong)?;
         if let Some(Lower::Other(lower)) = &self.lower {
             size = size.checked_add(lower.len()).ok_or(Error::TooLong)?;
         }
@@ -1069,7 +1172,9 @@ impl Transport {
                     values
                 }
                 TransportParam::Other { name, value } => {
-                    size = size.checked_add(value.as_ref().map_or(0, String::len)).ok_or(Error::TooLong)?;
+                    size = size
+                        .checked_add(value.as_ref().map_or(0, String::len))
+                        .ok_or(Error::TooLong)?;
                     core::slice::from_ref(name)
                 }
                 _ => &[],
@@ -1155,7 +1260,9 @@ impl Transport {
     /// them; many RTSP 1.0 servers take such a request as unicast, so world
     /// code that cares checks for [`TransportParam::Unicast`] too.
     pub fn is_multicast(&self) -> bool {
-        self.params.iter().any(|p| matches!(p, TransportParam::Multicast))
+        self.params
+            .iter()
+            .any(|p| matches!(p, TransportParam::Multicast))
     }
 }
 
@@ -1281,21 +1388,39 @@ impl Range {
                 if a.is_empty() && b.is_empty() {
                     return Err(BAD);
                 }
-                (trim_ws(unit), (!a.is_empty()).then_some(a), (!b.is_empty()).then_some(b))
+                (
+                    trim_ws(unit),
+                    (!a.is_empty()).then_some(a),
+                    (!b.is_empty()).then_some(b),
+                )
             }
         };
         let span = if unit.eq_ignore_ascii_case("npt") {
-            Span::Npt { start: opt(a, parse_npt).ok_or(BAD)?, end: opt(b, parse_npt).ok_or(BAD)? }
+            Span::Npt {
+                start: opt(a, parse_npt).ok_or(BAD)?,
+                end: opt(b, parse_npt).ok_or(BAD)?,
+            }
         } else if unit.eq_ignore_ascii_case("clock") {
             let utc = |s: &str| valid_utc(s).then(|| s.to_string());
-            Span::Clock { start: opt(a, utc).ok_or(BAD)?, end: opt(b, utc).ok_or(BAD)? }
+            Span::Clock {
+                start: opt(a, utc).ok_or(BAD)?,
+                end: opt(b, utc).ok_or(BAD)?,
+            }
         } else {
-            let rate = [SmpteRate::Smpte30, SmpteRate::Smpte30Drop, SmpteRate::Smpte25]
-                .into_iter()
-                .find(|r| unit.eq_ignore_ascii_case(r.as_str()))
-                .ok_or(BAD)?;
+            let rate = [
+                SmpteRate::Smpte30,
+                SmpteRate::Smpte30Drop,
+                SmpteRate::Smpte25,
+            ]
+            .into_iter()
+            .find(|r| unit.eq_ignore_ascii_case(r.as_str()))
+            .ok_or(BAD)?;
             let smpte = |s: &str| parse_smpte(s, rate);
-            Span::Smpte { rate, start: opt(a, smpte).ok_or(BAD)?, end: opt(b, smpte).ok_or(BAD)? }
+            Span::Smpte {
+                rate,
+                start: opt(a, smpte).ok_or(BAD)?,
+                end: opt(b, smpte).ok_or(BAD)?,
+            }
         };
         Ok(Range { span, time })
     }
@@ -1306,10 +1431,18 @@ impl Range {
         }
         const BAD: Error = Error::Malformed("Range");
         let (unit, start, end) = match &self.span {
-            Span::Npt { start, end } => ("npt", opt(start.as_ref(), write_npt), opt(end.as_ref(), write_npt)),
+            Span::Npt { start, end } => (
+                "npt",
+                opt(start.as_ref(), write_npt),
+                opt(end.as_ref(), write_npt),
+            ),
             Span::Smpte { rate, start, end } => {
                 let smpte = |t: &Smpte| write_smpte(t, *rate);
-                (rate.as_str(), opt(start.as_ref(), smpte), opt(end.as_ref(), smpte))
+                (
+                    rate.as_str(),
+                    opt(start.as_ref(), smpte),
+                    opt(end.as_ref(), smpte),
+                )
             }
             Span::Clock { start, end } => {
                 let utc = |s: &String| valid_utc(s).then(|| s.clone());
@@ -1318,7 +1451,11 @@ impl Range {
         };
         let mut out = match (start.ok_or(BAD)?, end.ok_or(BAD)?) {
             (None, None) => unit.to_string(),
-            (start, end) => format!("{unit}={}-{}", start.unwrap_or_default(), end.unwrap_or_default()),
+            (start, end) => format!(
+                "{unit}={}-{}",
+                start.unwrap_or_default(),
+                end.unwrap_or_default()
+            ),
         };
         if let Some(t) = &self.time {
             if !valid_utc(t) {
@@ -1355,7 +1492,10 @@ fn parse_npt(s: &str) -> Option<Npt> {
     }
     let mut nanos = 0u32;
     for i in 0..9 {
-        let d = fraction.as_bytes().get(i).map_or(0, |d| u32::from(d - b'0'));
+        let d = fraction
+            .as_bytes()
+            .get(i)
+            .map_or(0, |d| u32::from(d - b'0'));
         nanos = nanos * 10 + d;
     }
     let seconds = if whole.contains(':') {
@@ -1394,7 +1534,13 @@ fn write_npt(t: &Npt) -> Option<String> {
 /// Reads `hh:mm:ss`, `hh:mm:ss:ff` or `hh:mm:ss:ff.ss`, each part one or
 /// two digits, and checks the time exists at `rate`.
 fn parse_smpte(s: &str, rate: SmpteRate) -> Option<Smpte> {
-    let two = |p: &str| if (1..=2).contains(&p.len()) { parse_u64(p).map(|n| n as u8) } else { None };
+    let two = |p: &str| {
+        if (1..=2).contains(&p.len()) {
+            parse_u64(p).map(|n| n as u8)
+        } else {
+            None
+        }
+    };
     let mut parts = s.split(':');
     let (h, m, sec) = (parts.next()?, parts.next()?, parts.next()?);
     let last = parts.next();
@@ -1408,7 +1554,13 @@ fn parse_smpte(s: &str, rate: SmpteRate) -> Option<Smpte> {
             None => (Some(two(f)?), None),
         },
     };
-    let t = Smpte { hours: two(h)?, minutes: two(m)?, seconds: two(sec)?, frames, subframes };
+    let t = Smpte {
+        hours: two(h)?,
+        minutes: two(m)?,
+        seconds: two(sec)?,
+        frames,
+        subframes,
+    };
     smpte_exists(&t, rate).then_some(t)
 }
 
@@ -1472,7 +1624,11 @@ fn valid_utc(s: &str) -> bool {
         2 => 28,
         _ => 0,
     };
-    fraction_ok && (1..=days).contains(&day) && n(&b[9..11]) <= 23 && n(&b[11..13]) <= 59 && n(&b[13..15]) <= 60
+    fraction_ok
+        && (1..=days).contains(&day)
+        && n(&b[9..11]) <= 23
+        && n(&b[11..13]) <= 59
+        && n(&b[13..15]) <= 60
 }
 
 /// Whether `l` can be [`Lower::Other`]: tokens joined by `/`, and not
@@ -1488,7 +1644,11 @@ fn both_deliveries(params: &[TransportParam]) -> bool {
 
 /// Whether `v` is a `setup` value (`setup` true) or a `connection` value.
 fn valid_tcp_choice(v: &str, setup: bool) -> bool {
-    let allowed: &[&str] = if setup { &["active", "passive", "actpass"] } else { &["new", "existing"] };
+    let allowed: &[&str] = if setup {
+        &["active", "passive", "actpass"]
+    } else {
+        &["new", "existing"]
+    };
     allowed.iter().any(|a| v.eq_ignore_ascii_case(a))
 }
 
@@ -1513,10 +1673,15 @@ fn parse_param(p: &str) -> Option<TransportParam> {
             None => Some(P::Destination(None)),
             Some(v) => is_plain_value(v).then(|| P::Destination(Some(v.to_string()))),
         },
-        "source" => value.filter(|v| is_plain_value(v)).map(|v| P::Source(v.to_string())),
+        "source" => value
+            .filter(|v| is_plain_value(v))
+            .map(|v| P::Source(v.to_string())),
         "interleaved" => {
             let (a, b) = pair(value?, 3)?;
-            Some(P::Interleaved(u8::try_from(a).ok()?, opt(b, |b| u8::try_from(b).ok())?))
+            Some(P::Interleaved(
+                u8::try_from(a).ok()?,
+                opt(b, |b| u8::try_from(b).ok())?,
+            ))
         }
         "ttl" => Some(P::Ttl(u8::try_from(parse_digits(value?, 3)?).ok()?)),
         "layers" => Some(P::Layers(u32::try_from(parse_u64(value?)?).ok()?)),
@@ -1533,7 +1698,10 @@ fn parse_param(p: &str) -> Option<TransportParam> {
             let mut out = Vec::new();
             for h in value?.split('/') {
                 let h = trim_ws(h);
-                if out.len() >= MAX_PARAMS || h.len() != 8 || !h.bytes().all(|d| d.is_ascii_hexdigit()) {
+                if out.len() >= MAX_PARAMS
+                    || h.len() != 8
+                    || !h.bytes().all(|d| d.is_ascii_hexdigit())
+                {
                     return None;
                 }
                 out.push(u32::from_str_radix(h, 16).ok()?);
@@ -1560,13 +1728,21 @@ fn parse_param(p: &str) -> Option<TransportParam> {
         }
         "dest_addr" => parse_addr_list(value?).map(P::DestAddr),
         "src_addr" => parse_addr_list(value?).map(P::SrcAddr),
-        "setup" => value.filter(|v| valid_tcp_choice(v, true)).map(|v| P::Setup(v.to_string())),
-        "connection" => value.filter(|v| valid_tcp_choice(v, false)).map(|v| P::Connection(v.to_string())),
+        "setup" => value
+            .filter(|v| valid_tcp_choice(v, true))
+            .map(|v| P::Setup(v.to_string())),
+        "connection" => value
+            .filter(|v| valid_tcp_choice(v, false))
+            .map(|v| P::Connection(v.to_string())),
         _ => match value {
-            None => Some(P::Other { name: name.to_string(), value: None }),
-            Some(v) if valid_ext_value(v) => {
-                Some(P::Other { name: name.to_string(), value: Some(v.to_string()) })
-            }
+            None => Some(P::Other {
+                name: name.to_string(),
+                value: None,
+            }),
+            Some(v) if valid_ext_value(v) => Some(P::Other {
+                name: name.to_string(),
+                value: Some(v.to_string()),
+            }),
             Some(_) => None,
         },
     }
@@ -1599,10 +1775,17 @@ fn write_param(out: &mut String, p: &TransportParam) -> Result<(), Error> {
             if !is_plain_value(v) {
                 return Err(BAD);
             }
-            out.push_str(if matches!(p, P::Source(_)) { "source=" } else { "destination=" });
+            out.push_str(if matches!(p, P::Source(_)) {
+                "source="
+            } else {
+                "destination="
+            });
             out.push_str(v);
         }
-        P::Interleaved(a, b) => out.push_str(&format!("interleaved={}", range(u16::from(*a), b.map(u16::from)))),
+        P::Interleaved(a, b) => out.push_str(&format!(
+            "interleaved={}",
+            range(u16::from(*a), b.map(u16::from))
+        )),
         P::Ttl(t) => out.push_str(&format!("ttl={t}")),
         P::Layers(n) => out.push_str(&format!("layers={n}")),
         P::Port(a, b) => out.push_str(&format!("port={}", range(*a, *b))),
@@ -1628,7 +1811,11 @@ fn write_param(out: &mut String, p: &TransportParam) -> Result<(), Error> {
             if !list.iter().all(|a| valid_addr(a)) {
                 return Err(BAD);
             }
-            out.push_str(if matches!(p, P::DestAddr(_)) { "dest_addr=" } else { "src_addr=" });
+            out.push_str(if matches!(p, P::DestAddr(_)) {
+                "dest_addr="
+            } else {
+                "src_addr="
+            });
             let quoted: Vec<String> = list.iter().map(|a| format!("\"{a}\"")).collect();
             out.push_str(&quoted.join("/"));
         }
@@ -1636,7 +1823,11 @@ fn write_param(out: &mut String, p: &TransportParam) -> Result<(), Error> {
             if !valid_tcp_choice(v, matches!(p, P::Setup(_))) {
                 return Err(BAD);
             }
-            out.push_str(if matches!(p, P::Setup(_)) { "setup=" } else { "connection=" });
+            out.push_str(if matches!(p, P::Setup(_)) {
+                "setup="
+            } else {
+                "connection="
+            });
             out.push_str(v);
         }
         P::Other { name, value } => {
@@ -1705,13 +1896,17 @@ fn parse_addr_list(v: &str) -> Option<Vec<String>> {
 
 /// Whether `s` can sit inside the quotes of `dest_addr` or `src_addr`.
 fn valid_addr(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
 }
 
 /// Whether `s` is an unquoted parameter value: printable ASCII but for
 /// `"`, `;` and `,`.
 fn is_plain_value(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b';' | b','))
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b';' | b','))
 }
 
 /// Whether `s` is an extension parameter's value: a run, possibly empty,
@@ -1762,7 +1957,12 @@ fn quoted_end(b: &[u8], i: usize) -> Option<usize> {
 /// `s` split at each `sep` outside quoted strings. More than `max` parts
 /// is [`Error::TooMany`], and an empty or unclosed part is
 /// [`Error::Malformed`]. A part may be empty only when `sep` is `;`.
-fn split_unquoted<'a>(s: &'a str, sep: u8, max: usize, name: &'static str) -> Result<Vec<&'a str>, Error> {
+fn split_unquoted<'a>(
+    s: &'a str,
+    sep: u8,
+    max: usize,
+    name: &'static str,
+) -> Result<Vec<&'a str>, Error> {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut push = |part: &'a str| {
@@ -1793,7 +1993,8 @@ fn split_unquoted<'a>(s: &'a str, sep: u8, max: usize, name: &'static str) -> Re
 
 fn valid_session_id(s: &str) -> bool {
     (1..=MAX_SESSION_ID).contains(&s.len())
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'$' | b'-' | b'_' | b'.' | b'+'))
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'$' | b'-' | b'_' | b'.' | b'+'))
 }
 
 /// How many bytes of CRLF pairs and bare LFs start `b`.
@@ -1869,21 +2070,37 @@ fn parse_head(head: &[u8]) -> Result<Message, Error> {
     if !headers.iter().all(|h| valid_value(&h.value)) {
         return Err(Error::HeaderValue);
     }
-    Ok(Message { start, headers, body: Vec::new() })
+    Ok(Message {
+        start,
+        headers,
+        body: Vec::new(),
+    })
 }
 
 fn parse_start_line(line: &str) -> Result<StartLine, Error> {
     let (version, code, first, second) = start_line_parts(line)?;
     Ok(match code {
-        Some(code) => StartLine::Status { version, code, reason: first.to_owned() },
-        None => StartLine::Request { version, method: first.to_owned(), uri: second.to_owned() },
+        Some(code) => StartLine::Status {
+            version,
+            code,
+            reason: first.to_owned(),
+        },
+        None => StartLine::Request {
+            version,
+            method: first.to_owned(),
+            uri: second.to_owned(),
+        },
     })
 }
 
 // Validate without allocating while finding the frame boundary.
 #[inline]
 fn start_line_parts(line: &str) -> Result<(Version, Option<u16>, &str, &str), Error> {
-    if line.as_bytes().get(..5).is_some_and(|p| p.eq_ignore_ascii_case(b"RTSP/")) {
+    if line
+        .as_bytes()
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"RTSP/"))
+    {
         let (version, rest) = line.split_once(' ').ok_or(Error::StartLine)?;
         let version = parse_version(version)?;
         let (code, reason) = rest.split_once(' ').unwrap_or((rest, ""));
@@ -1897,7 +2114,8 @@ fn start_line_parts(line: &str) -> Result<(Version, Option<u16>, &str, &str), Er
         return Ok((version, Some(code), reason, ""));
     }
     let mut parts = line.splitn(3, ' ');
-    let (Some(method), Some(uri), Some(version)) = (parts.next(), parts.next(), parts.next()) else {
+    let (Some(method), Some(uri), Some(version)) = (parts.next(), parts.next(), parts.next())
+    else {
         return Err(Error::StartLine);
     };
     let version = parse_version(version)?;
@@ -1911,7 +2129,10 @@ fn start_line_parts(line: &str) -> Result<(Version, Option<u16>, &str, &str), Er
 /// as RFC 2068 section 3.1, which RFC 2326 section 3.1 adopts, says.
 /// Another well-formed version is [`Error::Version`].
 fn parse_version(s: &str) -> Result<Version, Error> {
-    let rest = s.get(5..).filter(|_| s.as_bytes()[..5].eq_ignore_ascii_case(b"RTSP/")).ok_or(Error::StartLine)?;
+    let rest = s
+        .get(5..)
+        .filter(|_| s.as_bytes()[..5].eq_ignore_ascii_case(b"RTSP/"))
+        .ok_or(Error::StartLine)?;
     match rest {
         "1.0" => Ok(Version::Rtsp10),
         "2.0" => Ok(Version::Rtsp20),
@@ -1937,7 +2158,10 @@ fn parse_content_length(v: &str) -> Result<usize, Error> {
     }
     let mut n = 0usize;
     for d in v.bytes() {
-        n = n.checked_mul(10).and_then(|n| n.checked_add(usize::from(d - b'0'))).ok_or(Error::TooLong)?;
+        n = n
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(usize::from(d - b'0')))
+            .ok_or(Error::TooLong)?;
         if n > MAX_BODY {
             return Err(Error::TooLong);
         }
@@ -2122,7 +2346,10 @@ pub mod harness {
             return;
         }
         if let Err(error) = item.to_bytes() {
-            assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {item:?}");
+            assert!(
+                matches!(error, Error::TooLong | Error::TooMany),
+                "{error:?} for {item:?}"
+            );
             return;
         }
         if let Frame::Message(message) = item {
@@ -2144,36 +2371,50 @@ pub mod harness {
             if message.method().is_some() {
                 let reply = message.reply(100, "Continue");
                 contract::check_wire_value(&reply);
-                assert!(matches!(reply.to_bytes(), Ok(_) | Err(Error::TooLong | Error::TooMany)));
+                assert!(matches!(
+                    reply.to_bytes(),
+                    Ok(_) | Err(Error::TooLong | Error::TooMany)
+                ));
             }
         }
     }
 
     /// Checks a value read directly from text.
-    pub fn text_value<T: Wire<ParseError = Error, WriteError = Error> + PartialEq + core::fmt::Debug>(value: Result<T, Error>) {
+    pub fn text_value<
+        T: Wire<ParseError = Error, WriteError = Error> + PartialEq + core::fmt::Debug,
+    >(
+        value: Result<T, Error>,
+    ) {
         if let Ok(value) = value {
             contract::check_wire_value(&value);
-            assert!(matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)), "{value:?}");
+            assert!(
+                matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)),
+                "{value:?}"
+            );
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::{round_trip, text_value};
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     #[test]
     fn unexpected_line_error_is_malformed_head() {
-        assert_eq!(super::framing_error(super::LineError::Unterminated), super::Error::LineEnding);
-        assert_eq!(super::framing_error(super::LineError::BareLf), super::Error::LineEnding);
+        assert_eq!(
+            super::framing_error(super::LineError::Unterminated),
+            super::Error::LineEnding
+        );
+        assert_eq!(
+            super::framing_error(super::LineError::BareLf),
+            super::Error::LineEnding
+        );
     }
 
     use super::*;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::codec::{
-        Lcg,
-    };
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn wire_text<T: Wire<WriteError = Error>>(value: &T) -> Result<String, Error> {
@@ -2187,11 +2428,13 @@ mod tests {
     // RFC 2326 section 10.1.
     const OPTIONS: &[u8] = b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nRequire: implicit-play\r\n\
         Proxy-Require: gzipped-messages\r\n\r\n";
-    const OPTIONS_OK: &[u8] = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nPublic: DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE\r\n\r\n";
+    const OPTIONS_OK: &[u8] =
+        b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nPublic: DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE\r\n\r\n";
 
     // RFC 2326 section 10.2, with an SDP body.
     fn describe_ok() -> Vec<u8> {
-        let body = b"v=0\r\no=mhandley 2890844526 2890842807 IN IP4 126.16.64.4\r\ns=SDP Seminar\r\n";
+        let body =
+            b"v=0\r\no=mhandley 2890844526 2890842807 IN IP4 126.16.64.4\r\ns=SDP Seminar\r\n";
         let mut b = format!(
             "RTSP/1.0 200 OK\r\nCSeq: 312\r\nDate: 23 Jan 1997 15:35:06 GMT\r\n\
              Content-Type: application/sdp\r\nContent-Length: {}\r\n\r\n",
@@ -2209,7 +2452,14 @@ mod tests {
     #[test]
     fn options_example() {
         let m = msg(OPTIONS);
-        assert_eq!(m.start, StartLine::Request { method: "OPTIONS".into(), uri: "*".into(), version: Version::Rtsp10 });
+        assert_eq!(
+            m.start,
+            StartLine::Request {
+                method: "OPTIONS".into(),
+                uri: "*".into(),
+                version: Version::Rtsp10
+            }
+        );
         assert_eq!(m.cseq(), Ok(1));
         assert_eq!(m.header("require"), Some("implicit-play"));
         let r = msg(OPTIONS_OK);
@@ -2239,32 +2489,78 @@ mod tests {
         assert_eq!(m.version(), Version::Rtsp20);
         assert_eq!(m.method(), Some(method::PLAY));
         assert_eq!(m.uri(), Some("rtsp://example.com/audio"));
-        assert_eq!(m.session(), Ok(Session { id: "ULExwZCXh2pd0xuFgkgZJW".into(), timeout: None }));
+        assert_eq!(
+            m.session(),
+            Ok(Session {
+                id: "ULExwZCXh2pd0xuFgkgZJW".into(),
+                timeout: None
+            })
+        );
         let r = m.range().unwrap();
-        assert_eq!(r.span, Span::Npt { start: Some(Npt::Time { seconds: 3, nanos: 520_000_000 }), end: None });
+        assert_eq!(
+            r.span,
+            Span::Npt {
+                start: Some(Npt::Time {
+                    seconds: 3,
+                    nanos: 520_000_000
+                }),
+                end: None
+            }
+        );
         assert_eq!(wire_text(&r).unwrap(), "npt=3.52-");
         let reply = m.reply(200, "OK");
         assert_eq!(reply.version(), Version::Rtsp20);
         assert_eq!(reply.header("Session"), Some("ULExwZCXh2pd0xuFgkgZJW"));
-        assert!(reply.to_bytes().unwrap().starts_with(b"RTSP/2.0 200 OK\r\nCSeq: 836\r\n"));
+        assert!(
+            reply
+                .to_bytes()
+                .unwrap()
+                .starts_with(b"RTSP/2.0 200 OK\r\nCSeq: 836\r\n")
+        );
     }
 
     #[test]
     fn sessions() {
         let s = Session::parse("47112344;timeout=60".as_bytes()).unwrap();
-        assert_eq!(s, Session { id: "47112344".into(), timeout: Some(60) });
+        assert_eq!(
+            s,
+            Session {
+                id: "47112344".into(),
+                timeout: Some(60)
+            }
+        );
         assert_eq!(wire_text(&s).unwrap(), "47112344;timeout=60");
         assert_eq!(
-            Session::parse(" QKyjN8nt2WqbWw4tIYof52 ; Timeout = 60 ".as_bytes()).unwrap().timeout,
+            Session::parse(" QKyjN8nt2WqbWw4tIYof52 ; Timeout = 60 ".as_bytes())
+                .unwrap()
+                .timeout,
             Some(60)
         );
-        for bad in ["", "a b", "x;timeout", "x;timeout=", "x;timeout=1;timeout=2", "x;foo=1", "a\"b"] {
-            assert_eq!(Session::parse(bad.as_bytes()), Err(Error::Malformed("Session")), "{bad}");
+        for bad in [
+            "",
+            "a b",
+            "x;timeout",
+            "x;timeout=",
+            "x;timeout=1;timeout=2",
+            "x;foo=1",
+            "a\"b",
+        ] {
+            assert_eq!(
+                Session::parse(bad.as_bytes()),
+                Err(Error::Malformed("Session")),
+                "{bad}"
+            );
         }
         assert!(Session::parse("a".repeat(MAX_SESSION_ID).as_bytes()).is_ok());
         assert!(Session::parse("a".repeat(MAX_SESSION_ID + 1).as_bytes()).is_err());
         assert!(Session::parse("x;timeout=99999999999999999999".as_bytes()).is_err());
-        assert!(wire_text(&Session { id: "a;b".into(), timeout: None }).is_err());
+        assert!(
+            wire_text(&Session {
+                id: "a;b".into(),
+                timeout: None
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -2274,7 +2570,10 @@ mod tests {
         assert_eq!(t.protocol, "RTP");
         assert_eq!(t.profile, "AVP");
         assert_eq!(t.lower, None);
-        assert_eq!(t.params, [P::Multicast, P::Ttl(127), P::Mode(vec!["PLAY".into()])]);
+        assert_eq!(
+            t.params,
+            [P::Multicast, P::Ttl(127), P::Mode(vec!["PLAY".into()])]
+        );
         assert!(t.is_multicast());
         let t = Transport::parse("RTP/AVP/TCP;interleaved=0-1".as_bytes()).unwrap();
         assert_eq!(t.lower, Some(Lower::Tcp));
@@ -2291,9 +2590,15 @@ mod tests {
         assert_eq!(list[0].client_port(), Some((3456, Some(3457))));
         assert_eq!(list[1].server_port(), Some((9000, None)));
         assert_eq!(list[1].ssrc(), Some(&[0x0A13C760][..]));
-        assert_eq!(list[1].modes(), Some(&["PLAY".to_string(), "RECORD".to_string()][..]));
+        assert_eq!(
+            list[1].modes(),
+            Some(&["PLAY".to_string(), "RECORD".to_string()][..])
+        );
         assert_eq!(list[0].ssrc(), None);
-        assert_eq!(Transport::parse("RTP/AVP".as_bytes()).unwrap().modes(), None);
+        assert_eq!(
+            Transport::parse("RTP/AVP".as_bytes()).unwrap().modes(),
+            None
+        );
         assert_eq!(
             list[1].params,
             [
@@ -2305,7 +2610,10 @@ mod tests {
                 P::Append,
             ]
         );
-        let text = wire_text(&Transports { values: list.clone() }).unwrap();
+        let text = wire_text(&Transports {
+            values: list.clone(),
+        })
+        .unwrap();
         assert_eq!(Transports::parse(text.as_bytes()).unwrap().values, list);
     }
 
@@ -2318,7 +2626,13 @@ mod tests {
         )
         .unwrap()
         .values;
-        assert_eq!(list[0].params, [P::Unicast, P::DestAddr(vec![":4588".into(), ":4589".into()])]);
+        assert_eq!(
+            list[0].params,
+            [
+                P::Unicast,
+                P::DestAddr(vec![":4588".into(), ":4589".into()])
+            ]
+        );
         let t = Transport::parse(
             "RTP/SAVPF/TCP;unicast;src_addr=\"192.0.2.5:6256\"/\"192.0.2.5:6257\";setup=passive;\
              connection=new;RTCP-mux;ssrc=93CB001E/0000002a;MIKEY=AQAFgM0XflABAAAAAAAAAAAAAAsAyO"
@@ -2335,15 +2649,32 @@ mod tests {
                 P::Connection("new".into()),
                 P::RtcpMux,
                 P::Ssrc(vec![0x93CB001E, 0x2a]),
-                P::Other { name: "MIKEY".into(), value: Some("AQAFgM0XflABAAAAAAAAAAAAAAsAyO".into()) },
+                P::Other {
+                    name: "MIKEY".into(),
+                    value: Some("AQAFgM0XflABAAAAAAAAAAAAAAsAyO".into())
+                },
             ]
         );
-        assert_eq!(Transport::parse(wire_text(&t).unwrap().as_bytes()).unwrap(), t);
+        assert_eq!(
+            Transport::parse(wire_text(&t).unwrap().as_bytes()).unwrap(),
+            t
+        );
         // A trailing semicolon and spaces are allowed.
-        assert_eq!(Transport::parse(" RTP/AVP ; unicast ; ".as_bytes()).unwrap().params, [P::Unicast]);
+        assert_eq!(
+            Transport::parse(" RTP/AVP ; unicast ; ".as_bytes())
+                .unwrap()
+                .params,
+            [P::Unicast]
+        );
         // Quoted values of unknown parameters keep their quotes.
         let t = Transport::parse("RTP/AVP;x=\"a;b,c\"".as_bytes()).unwrap();
-        assert_eq!(t.params, [P::Other { name: "x".into(), value: Some("\"a;b,c\"".into()) }]);
+        assert_eq!(
+            t.params,
+            [P::Other {
+                name: "x".into(),
+                value: Some("\"a;b,c\"".into())
+            }]
+        );
     }
 
     #[test]
@@ -2384,7 +2715,10 @@ mod tests {
         assert_eq!(Transports::parse(many.as_bytes()), Err(Error::TooMany));
         let params = format!("RTP/AVP{}", ";unicast".repeat(MAX_PARAMS + 1));
         assert_eq!(Transport::parse(params.as_bytes()), Err(Error::TooMany));
-        assert!(Transport::parse(format!("RTP/AVP{}", ";unicast".repeat(MAX_PARAMS)).as_bytes()).is_ok());
+        assert!(
+            Transport::parse(format!("RTP/AVP{}", ";unicast".repeat(MAX_PARAMS)).as_bytes())
+                .is_ok()
+        );
         // A message with too many across its headers.
         let mut m = Message::request(Version::Rtsp10, "SETUP", "rtsp://h/a");
         for _ in 0..=MAX_TRANSPORTS {
@@ -2396,11 +2730,22 @@ mod tests {
     #[test]
     fn transport_writer_checks() {
         use TransportParam as P;
-        let mut t = Transport { protocol: "RTP".into(), profile: "AVP".into(), lower: None, params: vec![] };
+        let mut t = Transport {
+            protocol: "RTP".into(),
+            profile: "AVP".into(),
+            lower: None,
+            params: vec![],
+        };
         assert_eq!(wire_text(&t).unwrap(), "RTP/AVP");
         for p in [
-            P::Other { name: "unicast".into(), value: None },
-            P::Other { name: "x".into(), value: Some("a;b".into()) },
+            P::Other {
+                name: "unicast".into(),
+                value: None,
+            },
+            P::Other {
+                name: "x".into(),
+                value: Some("a;b".into()),
+            },
             P::Mode(vec![]),
             P::Mode(vec!["a b".into()]),
             P::Ssrc(vec![]),
@@ -2427,16 +2772,40 @@ mod tests {
         assert_eq!(
             r.span,
             Span::Npt {
-                start: Some(Npt::Time { seconds: 10, nanos: 0 }),
-                end: Some(Npt::Time { seconds: 15, nanos: 0 })
+                start: Some(Npt::Time {
+                    seconds: 10,
+                    nanos: 0
+                }),
+                end: Some(Npt::Time {
+                    seconds: 15,
+                    nanos: 0
+                })
             }
         );
         let r = Range::parse("npt=12:05:35.3-".as_bytes()).unwrap();
-        assert_eq!(r.span, Span::Npt { start: Some(Npt::Time { seconds: 43535, nanos: 300_000_000 }), end: None });
+        assert_eq!(
+            r.span,
+            Span::Npt {
+                start: Some(Npt::Time {
+                    seconds: 43535,
+                    nanos: 300_000_000
+                }),
+                end: None
+            }
+        );
         assert_eq!(wire_text(&r).unwrap(), "npt=43535.3-");
         let r = Range::parse("npt=now-".as_bytes()).unwrap();
-        assert_eq!(r.span, Span::Npt { start: Some(Npt::Now), end: None });
-        assert_eq!(wire_text(&Range::parse("npt=-20".as_bytes()).unwrap()).unwrap(), "npt=-20");
+        assert_eq!(
+            r.span,
+            Span::Npt {
+                start: Some(Npt::Now),
+                end: None
+            }
+        );
+        assert_eq!(
+            wire_text(&Range::parse("npt=-20".as_bytes()).unwrap()).unwrap(),
+            "npt=-20"
+        );
         assert_eq!(
             wire_text(&Range::parse("npt=1.-2.0000000019".as_bytes()).unwrap()).unwrap(),
             "npt=1-2.000000001"
@@ -2446,18 +2815,40 @@ mod tests {
             r.span,
             Span::Smpte {
                 rate: SmpteRate::Smpte30,
-                start: Some(Smpte { hours: 10, minutes: 7, seconds: 0, frames: None, subframes: None }),
-                end: Some(Smpte { hours: 10, minutes: 7, seconds: 33, frames: Some(5), subframes: Some(1) }),
+                start: Some(Smpte {
+                    hours: 10,
+                    minutes: 7,
+                    seconds: 0,
+                    frames: None,
+                    subframes: None
+                }),
+                end: Some(Smpte {
+                    hours: 10,
+                    minutes: 7,
+                    seconds: 33,
+                    frames: Some(5),
+                    subframes: Some(1)
+                }),
             }
         );
         assert_eq!(wire_text(&r).unwrap(), "smpte=10:07:00-10:07:33:05.01");
         let r = Range::parse("smpte-25=10:07:00:10-".as_bytes()).unwrap();
-        assert!(matches!(r.span, Span::Smpte { rate: SmpteRate::Smpte25, .. }));
+        assert!(matches!(
+            r.span,
+            Span::Smpte {
+                rate: SmpteRate::Smpte25,
+                ..
+            }
+        ));
         let r = Range::parse("clock=19961108T142300Z-19961108T143520Z".as_bytes()).unwrap();
-        assert_eq!(wire_text(&r).unwrap(), "clock=19961108T142300Z-19961108T143520Z");
+        assert_eq!(
+            wire_text(&r).unwrap(),
+            "clock=19961108T142300Z-19961108T143520Z"
+        );
         let r = Range::parse("clock=19961110T1925-19961110T2015;time=19970123T153600Z".as_bytes());
         assert!(r.is_err());
-        let r = Range::parse("clock=19961110T192500Z-;time=19970123T153600.25Z".as_bytes()).unwrap();
+        let r =
+            Range::parse("clock=19961110T192500Z-;time=19970123T153600.25Z".as_bytes()).unwrap();
         assert_eq!(r.time.as_deref(), Some("19970123T153600.25Z"));
         assert_eq!(Range::parse(wire_text(&r).unwrap().as_bytes()).unwrap(), r);
         for bad in [
@@ -2484,17 +2875,46 @@ mod tests {
             "npt=0-;time=19970123T153600Z;time=19970123T153600Z",
             "npt=0-,npt=5-",
         ] {
-            assert_eq!(Range::parse(bad.as_bytes()), Err(Error::Malformed("Range")), "{bad}");
+            assert_eq!(
+                Range::parse(bad.as_bytes()),
+                Err(Error::Malformed("Range")),
+                "{bad}"
+            );
         }
         let bad = Range {
-            span: Span::Npt { start: Some(Npt::Time { seconds: 0, nanos: 2_000_000_000 }), end: None },
+            span: Span::Npt {
+                start: Some(Npt::Time {
+                    seconds: 0,
+                    nanos: 2_000_000_000,
+                }),
+                end: None,
+            },
             time: None,
         };
         assert!(wire_text(&bad).is_err());
-        let s = Smpte { hours: 1, minutes: 2, seconds: 3, frames: None, subframes: Some(1) };
-        let bad = Range { span: Span::Smpte { rate: SmpteRate::Smpte30Drop, start: Some(s), end: None }, time: None };
+        let s = Smpte {
+            hours: 1,
+            minutes: 2,
+            seconds: 3,
+            frames: None,
+            subframes: Some(1),
+        };
+        let bad = Range {
+            span: Span::Smpte {
+                rate: SmpteRate::Smpte30Drop,
+                start: Some(s),
+                end: None,
+            },
+            time: None,
+        };
         assert!(wire_text(&bad).is_err());
-        let bad = Range { span: Span::Clock { start: Some("x".into()), end: None }, time: None };
+        let bad = Range {
+            span: Span::Clock {
+                start: Some("x".into()),
+                end: None,
+            },
+            time: None,
+        };
         assert!(wire_text(&bad).is_err());
     }
 
@@ -2503,22 +2923,46 @@ mod tests {
         use TransportParam as P;
         let bad = Error::Malformed("Transport");
         // RFC 2326 section 3.4 and RFC 7826 section 20.2.3: safe is `$ - _ . +`.
-        assert_eq!(Session::parse("a~b".as_bytes()), Err(Error::Malformed("Session")));
-        assert!(wire_text(&Session { id: "a~b".into(), timeout: None }).is_err());
+        assert_eq!(
+            Session::parse("a~b".as_bytes()),
+            Err(Error::Malformed("Session"))
+        );
+        assert!(
+            wire_text(&Session {
+                id: "a~b".into(),
+                timeout: None
+            })
+            .is_err()
+        );
         // Both RFCs: an SSRC is exactly 8 hex digits.
-        for t in ["RTP/AVP;ssrc=1", "RTP/AVP;ssrc=0A13C76", "RTP/AVP;ssrc=0A13C760/2a"] {
+        for t in [
+            "RTP/AVP;ssrc=1",
+            "RTP/AVP;ssrc=0A13C76",
+            "RTP/AVP;ssrc=0A13C760/2a",
+        ] {
             assert_eq!(Transport::parse(t.as_bytes()), Err(bad), "{t}");
         }
         // Both RFCs: ttl and channel are 1 to 3 digits, a port 1 to 5.
-        for t in ["RTP/AVP;ttl=0127", "RTP/AVP;interleaved=0000", "RTP/AVP;client_port=000001-2"] {
+        for t in [
+            "RTP/AVP;ttl=0127",
+            "RTP/AVP;interleaved=0000",
+            "RTP/AVP;client_port=000001-2",
+        ] {
             assert_eq!(Transport::parse(t.as_bytes()), Err(bad), "{t}");
         }
         assert_eq!(
-            Transport::parse("RTP/AVP;ttl=001;port=00001".as_bytes()).unwrap().params,
+            Transport::parse("RTP/AVP;ttl=001;port=00001".as_bytes())
+                .unwrap()
+                .params,
             [P::Ttl(1), P::Port(1, None)]
         );
         // Both RFCs quote mode-spec, even with one mode.
-        let mut t = Transport { protocol: "RTP".into(), profile: "AVP".into(), lower: None, params: vec![] };
+        let mut t = Transport {
+            protocol: "RTP".into(),
+            profile: "AVP".into(),
+            lower: None,
+            params: vec![],
+        };
         t.params = vec![P::Mode(vec!["PLAY".into()])];
         assert_eq!(wire_text(&t).unwrap(), "RTP/AVP;mode=\"PLAY\"");
         // RFC 7826 section 20.2.3: lower-transport may be any token.
@@ -2536,13 +2980,38 @@ mod tests {
         }
         // RFC 7826: trn-par-value may be empty.
         let t = Transport::parse("RTP/AVP;x=".as_bytes()).unwrap();
-        assert_eq!(t.params, [P::Other { name: "x".into(), value: Some(String::new()) }]);
+        assert_eq!(
+            t.params,
+            [P::Other {
+                name: "x".into(),
+                value: Some(String::new())
+            }]
+        );
         assert_eq!(wire_text(&t).unwrap(), "RTP/AVP;x=");
         // RFC 7826 section 4.4: a Range may name only its format.
         let only = [
-            ("npt", Span::Npt { start: None, end: None }),
-            ("smpte-25", Span::Smpte { rate: SmpteRate::Smpte25, start: None, end: None }),
-            ("clock", Span::Clock { start: None, end: None }),
+            (
+                "npt",
+                Span::Npt {
+                    start: None,
+                    end: None,
+                },
+            ),
+            (
+                "smpte-25",
+                Span::Smpte {
+                    rate: SmpteRate::Smpte25,
+                    start: None,
+                    end: None,
+                },
+            ),
+            (
+                "clock",
+                Span::Clock {
+                    start: None,
+                    end: None,
+                },
+            ),
         ];
         for (v, span) in only {
             let r = Range::parse(v.as_bytes()).unwrap();
@@ -2550,7 +3019,11 @@ mod tests {
             assert_eq!(wire_text(&r).unwrap(), v);
         }
         for v in ["npt=", "npt=-", " = 1-"] {
-            assert_eq!(Range::parse(v.as_bytes()), Err(Error::Malformed("Range")), "{v}");
+            assert_eq!(
+                Range::parse(v.as_bytes()),
+                Err(Error::Malformed("Range")),
+                "{v}"
+            );
         }
     }
 
@@ -2562,9 +3035,13 @@ mod tests {
             RTSP/1.0 200 OK\r\nCSeq: 2\r\n\r\n";
         let items = items_of(stream);
         assert_eq!(items.len(), 2, "{items:?}");
-        let Ok(Frame::Message(first)) = &items[0] else { panic!() };
+        let Ok(Frame::Message(first)) = &items[0] else {
+            panic!()
+        };
         assert!(first.body.is_empty());
-        let Ok(Frame::Message(second)) = &items[1] else { panic!() };
+        let Ok(Frame::Message(second)) = &items[1] else {
+            panic!()
+        };
         assert_eq!(second.cseq(), Ok(2));
         // RFC 7826 section 5.4: in RTSP 2.0 the Content-Length always counts.
         let m = msg(b"RTSP/2.0 304 Not Modified\r\nCSeq: 1\r\nContent-Length: 2\r\n\r\nab");
@@ -2575,7 +3052,11 @@ mod tests {
             m.body = b"ab".to_vec();
             m.push_header("Content-Length", "2");
             assert_eq!(m.to_bytes(), Err(Error::Unwritable), "{code}");
-            m.start = StartLine::Status { version: Version::Rtsp20, code, reason: "x".into() };
+            m.start = StartLine::Status {
+                version: Version::Rtsp20,
+                code,
+                reason: "x".into(),
+            };
             assert!(m.to_bytes().is_ok());
         }
     }
@@ -2585,7 +3066,10 @@ mod tests {
         use TransportParam as P;
         let bad = Error::Malformed("Transport");
         // RFC 2326 section 12.39, RFC 7826 section 18.54: mutually exclusive.
-        assert_eq!(Transport::parse("RTP/AVP;unicast;multicast".as_bytes()), Err(bad));
+        assert_eq!(
+            Transport::parse("RTP/AVP;unicast;multicast".as_bytes()),
+            Err(bad)
+        );
         let both = Transport {
             protocol: "RTP".into(),
             profile: "AVP".into(),
@@ -2594,38 +3078,78 @@ mod tests {
         };
         assert_eq!(wire_text(&both), Err(bad));
         // RFC 7826 section 20.1: SLASH allows whitespace around it.
-        let t =
-            Transport::parse("RTP/AVP;ssrc=00000001 / 00000002;dest_addr=\":5004\" / \":5005\"".as_bytes())
-                .unwrap();
-        assert_eq!(t.params, [P::Ssrc(vec![1, 2]), P::DestAddr(vec![":5004".into(), ":5005".into()])]);
+        let t = Transport::parse(
+            "RTP/AVP;ssrc=00000001 / 00000002;dest_addr=\":5004\" / \":5005\"".as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            t.params,
+            [
+                P::Ssrc(vec![1, 2]),
+                P::DestAddr(vec![":5004".into(), ":5005".into()])
+            ]
+        );
         // RFC 7826 section 20.2.3: other-trans is one token or more.
-        let list =
-            Transports::parse("X;unicast,RTP/AVP/TCP;unicast;interleaved=0-1".as_bytes()).unwrap().values;
+        let list = Transports::parse("X;unicast,RTP/AVP/TCP;unicast;interleaved=0-1".as_bytes())
+            .unwrap()
+            .values;
         assert_eq!(list.len(), 2);
-        assert_eq!((list[0].protocol.as_str(), list[0].profile.as_str(), &list[0].lower), ("X", "", &None));
+        assert_eq!(
+            (
+                list[0].protocol.as_str(),
+                list[0].profile.as_str(),
+                &list[0].lower
+            ),
+            ("X", "", &None)
+        );
         assert_eq!(wire_text(&list[0]).unwrap(), "X;unicast");
         let t = Transport::parse("A/B/C/D;unicast".as_bytes()).unwrap();
         assert_eq!(t.lower, Some(Lower::Other("C/D".into())));
         assert_eq!(wire_text(&t).unwrap(), "A/B/C/D;unicast");
         let t = Transport::parse("RTP/AVP/TCP/X".as_bytes()).unwrap();
         assert_eq!(t.lower, Some(Lower::Other("TCP/X".into())));
-        assert_eq!(Transport::parse(wire_text(&t).unwrap().as_bytes()).unwrap(), t);
-        let no_profile = Transport { protocol: "X".into(), profile: String::new(), lower: Some(Lower::Tcp), params: vec![] };
+        assert_eq!(
+            Transport::parse(wire_text(&t).unwrap().as_bytes()).unwrap(),
+            t
+        );
+        let no_profile = Transport {
+            protocol: "X".into(),
+            profile: String::new(),
+            lower: Some(Lower::Tcp),
+            params: vec![],
+        };
         assert_eq!(wire_text(&no_profile), Err(bad));
         // RFC 7826 section 20.2.3: setup and connection take fixed values.
         for v in ["RTP/AVP;setup=banana", "RTP/AVP;connection=banana"] {
             assert_eq!(Transport::parse(v.as_bytes()), Err(bad), "{v}");
         }
         let t = Transport::parse("RTP/AVP;setup=actpass;connection=existing".as_bytes()).unwrap();
-        assert_eq!(t.params, [P::Setup("actpass".into()), P::Connection("existing".into())]);
+        assert_eq!(
+            t.params,
+            [P::Setup("actpass".into()), P::Connection("existing".into())]
+        );
         for p in [P::Setup("banana".into()), P::Connection("old".into())] {
-            let t = Transport { protocol: "RTP".into(), profile: "AVP".into(), lower: None, params: vec![p] };
+            let t = Transport {
+                protocol: "RTP".into(),
+                profile: "AVP".into(),
+                lower: None,
+                params: vec![p],
+            };
             assert_eq!(wire_text(&t), Err(bad));
         }
         // trn-par-value is a run of unreserved bytes and quoted strings.
         let t = Transport::parse("RTP/AVP;unicast;x=a\"b\"c".as_bytes()).unwrap();
-        assert_eq!(t.params[1], P::Other { name: "x".into(), value: Some("a\"b\"c".into()) });
-        assert_eq!(Transport::parse(wire_text(&t).unwrap().as_bytes()).unwrap(), t);
+        assert_eq!(
+            t.params[1],
+            P::Other {
+                name: "x".into(),
+                value: Some("a\"b\"c".into())
+            }
+        );
+        assert_eq!(
+            Transport::parse(wire_text(&t).unwrap().as_bytes()).unwrap(),
+            t
+        );
         assert_eq!(Transport::parse("RTP/AVP;x=a\"b".as_bytes()), Err(bad));
     }
 
@@ -2635,57 +3159,126 @@ mod tests {
         let mut m = Message::request(Version::Rtsp20, "PLAY", "rtsp://h/a");
         // RFC 7826 section 4.4.1: frames below the rate, minutes and
         // seconds below 60.
-        for v in ["smpte-25=00:00:00:25-", "smpte=00:00:00:30-", "smpte=00:60:00-", "smpte=00:00:60-"] {
+        for v in [
+            "smpte-25=00:00:00:25-",
+            "smpte=00:00:00:30-",
+            "smpte=00:60:00-",
+            "smpte=00:00:60-",
+        ] {
             m.set_header("Range", v);
             assert_eq!(m.range(), Err(bad), "{v}");
             assert_eq!(Range::parse(v.as_bytes()), Err(bad), "{v}");
         }
         m.set_header("Range", "smpte-25=00:59:59:24-");
-        assert_eq!(m.range(), Ok(Range {
+        assert_eq!(
+            m.range(),
+            Ok(Range {
+                span: Span::Smpte {
+                    rate: SmpteRate::Smpte25,
+                    start: Some(Smpte {
+                        hours: 0,
+                        minutes: 59,
+                        seconds: 59,
+                        frames: Some(24),
+                        subframes: None
+                    }),
+                    end: None,
+                },
+                time: None,
+            })
+        );
+        assert!(Range::parse("smpte-25=00:00:00:24-".as_bytes()).is_ok());
+        let s = Smpte {
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+            frames: Some(25),
+            subframes: None,
+        };
+        let r = Range {
             span: Span::Smpte {
                 rate: SmpteRate::Smpte25,
-                start: Some(Smpte { hours: 0, minutes: 59, seconds: 59, frames: Some(24), subframes: None }),
+                start: Some(s),
                 end: None,
             },
             time: None,
-        }));
-        assert!(Range::parse("smpte-25=00:00:00:24-".as_bytes()).is_ok());
-        let s = Smpte { hours: 0, minutes: 0, seconds: 0, frames: Some(25), subframes: None };
-        let r = Range { span: Span::Smpte { rate: SmpteRate::Smpte25, start: Some(s), end: None }, time: None };
+        };
         assert_eq!(wire_text(&r), Err(bad));
         // RFC 7826 section 4.4.3: a real UTC date and time, and at most 9
         // fraction digits.
-        for v in ["clock=20230230T000000Z-", "clock=20230101T250000Z-", "clock=20231301T000000Z-", "clock=20230229T000000Z-"] {
+        for v in [
+            "clock=20230230T000000Z-",
+            "clock=20230101T250000Z-",
+            "clock=20231301T000000Z-",
+            "clock=20230229T000000Z-",
+        ] {
             m.set_header("Range", v);
             assert_eq!(m.range(), Err(bad), "{v}");
             assert_eq!(Range::parse(v.as_bytes()), Err(bad), "{v}");
         }
         assert!(Range::parse("clock=20240229T235960.123456789Z-".as_bytes()).is_ok());
-        assert_eq!(Range::parse("clock=20240229T000000.1234567890Z-".as_bytes()), Err(bad));
+        assert_eq!(
+            Range::parse("clock=20240229T000000.1234567890Z-".as_bytes()),
+            Err(bad)
+        );
         // RFC 7826 section 20.2.3: 1*19DIGIT seconds.
         m.set_header("Range", "npt=10000000000000000000-");
         assert_eq!(m.range(), Err(bad));
         m.set_header("Range", "npt=9999999999999999999-");
-        assert_eq!(m.range(), Ok(Range {
-            span: Span::Npt { start: Some(Npt::Time { seconds: 9_999_999_999_999_999_999, nanos: 0 }), end: None },
-            time: None,
-        }));
-        assert_eq!(Range::parse("npt=10000000000000000000-".as_bytes()), Err(bad));
+        assert_eq!(
+            m.range(),
+            Ok(Range {
+                span: Span::Npt {
+                    start: Some(Npt::Time {
+                        seconds: 9_999_999_999_999_999_999,
+                        nanos: 0
+                    }),
+                    end: None
+                },
+                time: None,
+            })
+        );
+        assert_eq!(
+            Range::parse("npt=10000000000000000000-".as_bytes()),
+            Err(bad)
+        );
         assert!(Range::parse("npt=9999999999999999999-".as_bytes()).is_ok());
-        let r = Range { span: Span::Npt { start: Some(Npt::Time { seconds: u64::MAX, nanos: 0 }), end: None }, time: None };
+        let r = Range {
+            span: Span::Npt {
+                start: Some(Npt::Time {
+                    seconds: u64::MAX,
+                    nanos: 0,
+                }),
+                end: None,
+            },
+            time: None,
+        };
         assert_eq!(wire_text(&r), Err(bad));
-        let s = Session { id: "a".into(), timeout: Some(u64::MAX) };
+        let s = Session {
+            id: "a".into(),
+            timeout: Some(u64::MAX),
+        };
         assert!(wire_text(&s).is_err());
         m.set_header("Session", "a;timeout=10000000000000000000");
         assert_eq!(m.session(), Err(Error::Malformed("Session")));
         m.set_header("Session", "a;timeout=9999999999999999999");
-        assert_eq!(m.session(), Ok(Session { id: "a".into(), timeout: Some(9_999_999_999_999_999_999) }));
+        assert_eq!(
+            m.session(),
+            Ok(Session {
+                id: "a".into(),
+                timeout: Some(9_999_999_999_999_999_999)
+            })
+        );
         assert!(Session::parse("a;timeout=10000000000000000000".as_bytes()).is_err());
         assert!(Session::parse("a;timeout=9999999999999999999".as_bytes()).is_ok());
         // RFC 7826 has no time parameter on Range.
         m.set_header("Range", "npt=0-;time=19970123T153600Z");
         assert_eq!(m.range(), Err(bad));
-        m.start = StartLine::Request { method: "PLAY".into(), uri: "rtsp://h/a".into(), version: Version::Rtsp10 };
+        m.start = StartLine::Request {
+            method: "PLAY".into(),
+            uri: "rtsp://h/a".into(),
+            version: Version::Rtsp10,
+        };
         assert!(m.range().is_ok());
     }
 
@@ -2708,21 +3301,33 @@ mod tests {
         assert_eq!(m.cseq(), Ok(1));
         let m = msg(b"\nOPTIONS * RTSP/1.0\r\nCSeq: 1\n\r\n");
         assert_eq!(m.cseq(), Ok(1));
-        assert_eq!(Message::parse(b"OPTIONS * RTSP/2.0\nCSeq: 1\n\n"), Err(Error::LineEnding));
-        assert_eq!(Message::parse(b"OPTIONS * RTSP/2.0\r\nCSeq: 1\r\n\n"), Err(Error::LineEnding));
+        assert_eq!(
+            Message::parse(b"OPTIONS * RTSP/2.0\nCSeq: 1\n\n"),
+            Err(Error::LineEnding)
+        );
+        assert_eq!(
+            Message::parse(b"OPTIONS * RTSP/2.0\r\nCSeq: 1\r\n\n"),
+            Err(Error::LineEnding)
+        );
         // RFC 2068 section 3.1, which RFC 2326 section 3.1 adopts: leading
         // zeros in the version are ignored.
         let m = msg(b"OPTIONS * RTSP/01.00\r\nCSeq: 1\r\n\r\n");
         assert_eq!(m.version(), Version::Rtsp10);
         assert_eq!(msg(b"RTSP/002.0 200 OK\r\n\r\n").version(), Version::Rtsp20);
         let p = |b: &[u8]| Message::parse(b).map(|_| ());
-        assert_eq!(p(b"OPTIONS * RTSP/99999999999999999999991.0\r\n\r\n"), Err(Error::Version));
+        assert_eq!(
+            p(b"OPTIONS * RTSP/99999999999999999999991.0\r\n\r\n"),
+            Err(Error::Version)
+        );
         assert_eq!(p(b"OPTIONS * RTSP/1.01\r\n\r\n"), Err(Error::Version));
     }
 
     #[test]
     fn interleaved_frames() {
-        let frame = Interleaved { channel: 0, data: vec![0x80, 0x60, 0, 1] };
+        let frame = Interleaved {
+            channel: 0,
+            data: vec![0x80, 0x60, 0, 1],
+        };
         let bytes = frame.to_bytes().unwrap();
         // RFC 2326 section 10.12.
         assert_eq!(bytes, [b'$', 0, 0, 4, 0x80, 0x60, 0, 1]);
@@ -2731,13 +3336,28 @@ mod tests {
             assert_eq!(Interleaved::parse(&bytes[..n]), Err(Error::Incomplete));
         }
         assert_eq!(Interleaved::parse(b"R"), Err(Error::Marker));
-        let big = Interleaved { channel: 1, data: vec![7; MAX_INTERLEAVED] };
-        assert_eq!(big.to_bytes().unwrap().len(), MAX_INTERLEAVED + INTERLEAVED_HEADER_LEN);
-        let too_big = Interleaved { channel: 1, data: vec![7; MAX_INTERLEAVED + 1] };
+        let big = Interleaved {
+            channel: 1,
+            data: vec![7; MAX_INTERLEAVED],
+        };
+        assert_eq!(
+            big.to_bytes().unwrap().len(),
+            MAX_INTERLEAVED + INTERLEAVED_HEADER_LEN
+        );
+        let too_big = Interleaved {
+            channel: 1,
+            data: vec![7; MAX_INTERLEAVED + 1],
+        };
         assert_eq!(too_big.to_bytes(), Err(Error::TooLong));
         let mut stream = Stream::new(Frames::new());
         assert_eq!(stream.push(b"\r\n$\x01\x00\x00x"), 7);
-        assert_eq!(stream.next(), Some(Ok(Ok(Frame::Interleaved(Interleaved { channel: 1, data: vec![] })))));
+        assert_eq!(
+            stream.next(),
+            Some(Ok(Ok(Frame::Interleaved(Interleaved {
+                channel: 1,
+                data: vec![]
+            }))))
+        );
         assert_eq!(stream.unread(), b"x");
         assert_eq!(Frame::parse(b"\r\n$\x01\x00\x00x"), Err(Error::Trailing));
     }
@@ -2745,12 +3365,30 @@ mod tests {
     #[test]
     fn every_error_path() {
         let p = |b: &[u8]| Message::parse(b);
-        assert_eq!(p(b"OPTIONS * RTSP/1.0\r\nX: \x01\r\n\r\n"), Err(Error::HeaderValue));
-        assert_eq!(p(b"OPTIONS * RTSP/1.0\r\nX\r\n\r\n"), Err(Error::HeaderLine));
-        assert_eq!(p(b"OPTIONS * RTSP/1.0\r\n Y: z\r\n\r\n"), Err(Error::HeaderLine));
-        assert_eq!(p(b"OPTIONS * RTSP/1.0\r\nA B: z\r\n\r\n"), Err(Error::HeaderLine));
-        assert_eq!(p(b"OPTIONS * RTSP/2.0\nX: y\r\n\r\n"), Err(Error::LineEnding));
-        assert_eq!(p(b"OPTIONS * RTSP/1.0\r\nX: y\rz\r\n\r\n"), Err(Error::LineEnding));
+        assert_eq!(
+            p(b"OPTIONS * RTSP/1.0\r\nX: \x01\r\n\r\n"),
+            Err(Error::HeaderValue)
+        );
+        assert_eq!(
+            p(b"OPTIONS * RTSP/1.0\r\nX\r\n\r\n"),
+            Err(Error::HeaderLine)
+        );
+        assert_eq!(
+            p(b"OPTIONS * RTSP/1.0\r\n Y: z\r\n\r\n"),
+            Err(Error::HeaderLine)
+        );
+        assert_eq!(
+            p(b"OPTIONS * RTSP/1.0\r\nA B: z\r\n\r\n"),
+            Err(Error::HeaderLine)
+        );
+        assert_eq!(
+            p(b"OPTIONS * RTSP/2.0\nX: y\r\n\r\n"),
+            Err(Error::LineEnding)
+        );
+        assert_eq!(
+            p(b"OPTIONS * RTSP/1.0\r\nX: y\rz\r\n\r\n"),
+            Err(Error::LineEnding)
+        );
         assert_eq!(p(b"OPTIONS \xff RTSP/1.0\r\n\r\n"), Err(Error::Utf8));
         assert_eq!(p(b"OPTIONS * RTSP/1.1\r\n\r\n"), Err(Error::Version));
         assert_eq!(p(b"RTSP/3.0 200 OK\r\n\r\n"), Err(Error::Version));
@@ -2766,9 +3404,18 @@ mod tests {
         assert_eq!(p(b"RTSP/1.0\r\n\r\n"), Err(Error::StartLine));
         assert_eq!(p(b"RTSP/1.x 200 OK\r\n\r\n"), Err(Error::StartLine));
         assert_eq!(p(b"RTSP/1.0 200 O\x7fK\r\n\r\n"), Err(Error::StartLine));
-        assert_eq!(p(b"RTSP/1.0 200 OK\r\nContent-Length: x\r\n\r\n"), Err(Error::ContentLength));
-        assert_eq!(p(b"RTSP/1.0 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"), Err(Error::ContentLength));
-        assert_eq!(p(b"RTSP/1.0 200 OK\r\nContent-Length: 1048577\r\n\r\n"), Err(Error::TooLong));
+        assert_eq!(
+            p(b"RTSP/1.0 200 OK\r\nContent-Length: x\r\n\r\n"),
+            Err(Error::ContentLength)
+        );
+        assert_eq!(
+            p(b"RTSP/1.0 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"),
+            Err(Error::ContentLength)
+        );
+        assert_eq!(
+            p(b"RTSP/1.0 200 OK\r\nContent-Length: 1048577\r\n\r\n"),
+            Err(Error::TooLong)
+        );
         assert_eq!(p(&vec![b'A'; MAX_HEAD]), Err(Error::TooLong));
         assert_eq!(p(&vec![b'A'; MAX_HEAD - 1]), Err(Error::Incomplete));
         let mut many = b"OPTIONS * RTSP/1.0\r\n".to_vec();
@@ -2780,11 +3427,16 @@ mod tests {
         // A status line with no reason phrase.
         assert_eq!(
             p(b"RTSP/1.0 200\r\n\r\n").unwrap().start,
-            StartLine::Status { version: Version::Rtsp10, code: 200, reason: String::new() }
+            StartLine::Status {
+                version: Version::Rtsp10,
+                code: 200,
+                reason: String::new()
+            }
         );
 
         // Header reads.
-        let m = msg(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nCSeq: 2\r\nSession: a b\r\nRange: x\r\n\r\n");
+        let m =
+            msg(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nCSeq: 2\r\nSession: a b\r\nRange: x\r\n\r\n");
         assert_eq!(m.cseq(), Err(Error::Malformed("CSeq")));
         assert_eq!(m.session(), Err(Error::Malformed("Session")));
         assert_eq!(m.range(), Err(Error::Malformed("Range")));
@@ -2804,12 +3456,30 @@ mod tests {
 
         // Writers.
         let w = |m: &Message| m.to_bytes();
-        assert_eq!(w(&Message::request(Version::Rtsp10, "A B", "*")), Err(Error::StartLine));
-        assert_eq!(w(&Message::request(Version::Rtsp10, "$A", "*")), Err(Error::StartLine));
-        assert_eq!(w(&Message::request(Version::Rtsp10, "A", "a b")), Err(Error::StartLine));
-        assert_eq!(w(&Message::request(Version::Rtsp10, "A", "")), Err(Error::StartLine));
-        assert_eq!(w(&Message::response(Version::Rtsp10, 99, "x")), Err(Error::StartLine));
-        assert_eq!(w(&Message::response(Version::Rtsp10, 200, "a\r\n")), Err(Error::StartLine));
+        assert_eq!(
+            w(&Message::request(Version::Rtsp10, "A B", "*")),
+            Err(Error::StartLine)
+        );
+        assert_eq!(
+            w(&Message::request(Version::Rtsp10, "$A", "*")),
+            Err(Error::StartLine)
+        );
+        assert_eq!(
+            w(&Message::request(Version::Rtsp10, "A", "a b")),
+            Err(Error::StartLine)
+        );
+        assert_eq!(
+            w(&Message::request(Version::Rtsp10, "A", "")),
+            Err(Error::StartLine)
+        );
+        assert_eq!(
+            w(&Message::response(Version::Rtsp10, 99, "x")),
+            Err(Error::StartLine)
+        );
+        assert_eq!(
+            w(&Message::response(Version::Rtsp10, 200, "a\r\n")),
+            Err(Error::StartLine)
+        );
         let mut m = Message::response(Version::Rtsp20, 200, "OK");
         m.push_header("A:", "x");
         assert_eq!(w(&m), Err(Error::HeaderLine));
@@ -2828,13 +3498,28 @@ mod tests {
         }
         assert_eq!(w(&m), Err(Error::TooMany));
         m.headers.pop();
-        assert_eq!(Message::parse(&w(&m).unwrap()).unwrap().headers.len(), MAX_HEADERS);
+        assert_eq!(
+            Message::parse(&w(&m).unwrap()).unwrap().headers.len(),
+            MAX_HEADERS
+        );
     }
 
     #[test]
     fn every_truncated_prefix_waits() {
-        let mut items = vec![OPTIONS.to_vec(), OPTIONS_OK.to_vec(), describe_ok(), PLAY2.to_vec()];
-        items.push(Interleaved { channel: 3, data: vec![1, 2, 3, 4, 5] }.to_bytes().unwrap());
+        let mut items = vec![
+            OPTIONS.to_vec(),
+            OPTIONS_OK.to_vec(),
+            describe_ok(),
+            PLAY2.to_vec(),
+        ];
+        items.push(
+            Interleaved {
+                channel: 3,
+                data: vec![1, 2, 3, 4, 5],
+            }
+            .to_bytes()
+            .unwrap(),
+        );
         for bytes in &items {
             contract::check_decode_with_alloc_limit(Frames::new, bytes, 2 * MAX_MESSAGE);
             for n in 0..bytes.len() {
@@ -2868,17 +3553,29 @@ mod tests {
         message.push_value("Transport", &transport).unwrap();
         assert_eq!(message.transports(), Ok(vec![transport]));
         let before = message.clone();
-        let invalid = Session { id: "a;b".into(), timeout: None };
-        assert_eq!(message.push_value("Session", &invalid), Err(Error::Malformed("Session")));
+        let invalid = Session {
+            id: "a;b".into(),
+            timeout: None,
+        };
+        assert_eq!(
+            message.push_value("Session", &invalid),
+            Err(Error::Malformed("Session"))
+        );
         assert_eq!(message, before);
-        let binary = Interleaved { channel: 0xff, data: vec![] };
+        let binary = Interleaved {
+            channel: 0xff,
+            data: vec![],
+        };
         assert_eq!(message.push_value("X", &binary), Err(Error::Utf8));
         assert_eq!(message, before);
     }
 
     #[test]
     fn stream_splits_messages_and_frames() {
-        let frame = Interleaved { channel: 0, data: b"rtp!".to_vec() };
+        let frame = Interleaved {
+            channel: 0,
+            data: b"rtp!".to_vec(),
+        };
         let mut bytes = OPTIONS.to_vec();
         frame.write(&mut bytes).unwrap();
         bytes.extend(b"\r\n");
@@ -2909,22 +3606,34 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_items_in_linear_time() {
-        assert_linear("stream_takes_many_small_items_in_linear_time", rounds(12_500), |size| {
-            let mut one = OPTIONS.to_vec();
-            Interleaved { channel: 0, data: vec![9; 10] }.write(&mut one).unwrap();
-            let bytes = one.repeat(size);
-            let (items, failure) = decode_all(Frames::new, &bytes);
-            assert_eq!(failure, None);
-            assert_eq!(items.len(), size * 2);
-            assert!(items.iter().all(Result::is_ok));
-        });
+        assert_linear(
+            "stream_takes_many_small_items_in_linear_time",
+            rounds(12_500),
+            |size| {
+                let mut one = OPTIONS.to_vec();
+                Interleaved {
+                    channel: 0,
+                    data: vec![9; 10],
+                }
+                .write(&mut one)
+                .unwrap();
+                let bytes = one.repeat(size);
+                let (items, failure) = decode_all(Frames::new, &bytes);
+                assert_eq!(failure, None);
+                assert_eq!(items.len(), size * 2);
+                assert!(items.iter().all(Result::is_ok));
+            },
+        );
         assert_linear("large_rtsp_body", MAX_BODY / 4, |size| {
             let mut message = Message::response(Version::Rtsp10, 200, "OK");
             message.body = vec![b'x'; size];
             message.push_header("Content-Length", &size.to_string());
             let bytes = message.to_bytes().unwrap();
             contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
-            assert_eq!(decode_all(Frames::new, &bytes), (vec![Ok(Frame::Message(message))], None));
+            assert_eq!(
+                decode_all(Frames::new, &bytes),
+                (vec![Ok(Frame::Message(message))], None)
+            );
         });
     }
 
@@ -2964,16 +3673,29 @@ mod tests {
     #[test]
     fn fuzz_loop() {
         let mut rng = Lcg::new(0x5eed_0554);
-        let frame = Interleaved { channel: 1, data: b"\r\n\r\nRTSP".to_vec() }.to_bytes().unwrap();
+        let frame = Interleaved {
+            channel: 1,
+            data: b"\r\n\r\nRTSP".to_vec(),
+        }
+        .to_bytes()
+        .unwrap();
         let mut setup = b"SETUP rtsp://h/s RTSP/2.0\r\nCSeq: 3\r\nSession: abc;timeout=30\r\n\
             Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=\"PLAY,RECORD\", RTP/AVP;dest_addr=\":1\"/\":2\"\r\n\
             Range: smpte=10:07:00-10:07:33:05.01;time=19970123T153600Z\r\n\r\n"
             .to_vec();
         setup.extend(&frame);
         let bare = b"OPTIONS * RTSP/1.0\nCSeq: 1\nX: a\n b\r\n\n".to_vec();
-        let not_modified = b"RTSP/1.0 304 Not Modified\r\nCSeq: 2\r\nContent-Length: 4\r\n\r\n".to_vec();
-        let seeds: Vec<Vec<u8>> =
-            vec![OPTIONS.to_vec(), OPTIONS_OK.to_vec(), describe_ok(), PLAY2.to_vec(), setup, bare, not_modified];
+        let not_modified =
+            b"RTSP/1.0 304 Not Modified\r\nCSeq: 2\r\nContent-Length: 4\r\n\r\n".to_vec();
+        let seeds: Vec<Vec<u8>> = vec![
+            OPTIONS.to_vec(),
+            OPTIONS_OK.to_vec(),
+            describe_ok(),
+            PLAY2.to_vec(),
+            setup,
+            bare,
+            not_modified,
+        ];
         let mut stream = Vec::new();
         for s in &seeds {
             stream.extend(s);
@@ -3015,7 +3737,10 @@ mod tests {
     fn writers_only_write_what_reads_back() {
         use TransportParam as P;
         let mut rng = Lcg::new(42);
-        let words = ["", "a", "PLAY", "a b", "x;y", "q\"", ":1", "AQ==", "\"z\"", "\"", "TCP", "unicast", "é"];
+        let words = [
+            "", "a", "PLAY", "a b", "x;y", "q\"", ":1", "AQ==", "\"z\"", "\"", "TCP", "unicast",
+            "é",
+        ];
         let mut written = 0;
         for _ in 0..rounds(20_000) {
             let w = |rng: &mut Lcg| {
@@ -3029,7 +3754,11 @@ mod tests {
             for _ in 0..rng.index(4) {
                 let n = rng.next() as u32;
                 params.push(match rng.index(12) {
-                    0 => P::Destination(if n.is_multiple_of(2) { None } else { Some(w(&mut rng)) }),
+                    0 => P::Destination(if n.is_multiple_of(2) {
+                        None
+                    } else {
+                        Some(w(&mut rng))
+                    }),
                     1 => P::Source(w(&mut rng)),
                     2 => P::Interleaved(n as u8, n.is_multiple_of(3).then_some((n >> 8) as u8)),
                     3 => P::ClientPort(n as u16, n.is_multiple_of(3).then_some((n >> 16) as u16)),
@@ -3037,13 +3766,25 @@ mod tests {
                     5 => P::Mode((0..rng.index(3)).map(|_| w(&mut rng)).collect()),
                     6 => P::DestAddr((0..rng.index(3)).map(|_| w(&mut rng)).collect()),
                     7 => P::Setup(w(&mut rng)),
-                    8 => P::Other { name: w(&mut rng), value: if n.is_multiple_of(2) { None } else { Some(w(&mut rng)) } },
+                    8 => P::Other {
+                        name: w(&mut rng),
+                        value: if n.is_multiple_of(2) {
+                            None
+                        } else {
+                            Some(w(&mut rng))
+                        },
+                    },
                     9 => P::Ttl(n as u8),
                     10 => P::Layers(n),
                     _ => P::RtcpMux,
                 });
             }
-            let lowers = [None, Some(Lower::Tcp), Some(Lower::Udp), Some(Lower::Other(w(&mut rng)))];
+            let lowers = [
+                None,
+                Some(Lower::Tcp),
+                Some(Lower::Udp),
+                Some(Lower::Other(w(&mut rng))),
+            ];
             let t = Transport {
                 protocol: w(&mut rng),
                 profile: w(&mut rng),
@@ -3055,7 +3796,10 @@ mod tests {
                 assert_eq!(Transport::parse(text.as_bytes()).unwrap(), t, "{text}");
                 written += 1;
             }
-            let s = Session { id: w(&mut rng), timeout: rng.coin().then(|| rng.next()) };
+            let s = Session {
+                id: w(&mut rng),
+                timeout: rng.coin().then(|| rng.next()),
+            };
             contract::check_wire_value(&s);
             if let Ok(text) = wire_text(&s) {
                 assert_eq!(Session::parse(text.as_bytes()).unwrap(), s);
@@ -3064,7 +3808,10 @@ mod tests {
             let npt = |n: u32| match n % 3 {
                 0 => None,
                 1 => Some(Npt::Now),
-                _ => Some(Npt::Time { seconds: u64::from(n), nanos: n % 1_100_000_000 }),
+                _ => Some(Npt::Time {
+                    seconds: u64::from(n),
+                    nanos: n % 1_100_000_000,
+                }),
             };
             let smpte = |n: u32| {
                 (!n.is_multiple_of(3)).then(|| Smpte {
@@ -3076,11 +3823,26 @@ mod tests {
                 })
             };
             let span = match rng.index(3) {
-                0 => Span::Npt { start: npt(n), end: npt(n >> 3) },
-                1 => Span::Smpte { rate: SmpteRate::Smpte30Drop, start: smpte(n), end: smpte(n >> 4) },
-                _ => Span::Clock { start: Some(w(&mut rng)), end: Some("19961108T142300Z".into()) },
+                0 => Span::Npt {
+                    start: npt(n),
+                    end: npt(n >> 3),
+                },
+                1 => Span::Smpte {
+                    rate: SmpteRate::Smpte30Drop,
+                    start: smpte(n),
+                    end: smpte(n >> 4),
+                },
+                _ => Span::Clock {
+                    start: Some(w(&mut rng)),
+                    end: Some("19961108T142300Z".into()),
+                },
             };
-            let r = Range { span, time: n.is_multiple_of(4).then(|| "19970123T153600.1Z".to_string()) };
+            let r = Range {
+                span,
+                time: n
+                    .is_multiple_of(4)
+                    .then(|| "19970123T153600.1Z".to_string()),
+            };
             contract::check_wire_value(&r);
             if let Ok(text) = wire_text(&r) {
                 assert_eq!(Range::parse(text.as_bytes()).unwrap(), r, "{text}");

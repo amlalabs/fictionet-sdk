@@ -79,7 +79,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
 use std::task::Poll;
 
-use fictionet::stdlib::{ports::{Event, Ports}, icmp};
+use fictionet::stdlib::{
+    icmp,
+    ports::{Event, Ports},
+};
 use fictionet::time::{Duration, Instant};
 use fictionet::{Cx, End, Interface, Packet};
 
@@ -114,15 +117,23 @@ pub fn split_versions(fcx: &Cx, inner: impl Interface) -> (End, End, End) {
     let (v4, v4_mine) = capped();
     let (v6, v6_mine) = capped();
     let (other, other_mine) = capped();
-    fcx.spawn_as(|| "split_versions".into(), move |fcx| async move {
-        let ports = Ports::new(vec![Box::new(inner) as Box<dyn Interface>, Box::new(v4_mine), Box::new(v6_mine), Box::new(other_mine)]);
-        split(fcx, ports, None, |packet| match version(&packet.0) {
-            Some(4) => 1,
-            Some(6) => 2,
-            _ => 3,
-        })
-        .await
-    });
+    fcx.spawn_as(
+        || "split_versions".into(),
+        move |fcx| async move {
+            let ports = Ports::new(vec![
+                Box::new(inner) as Box<dyn Interface>,
+                Box::new(v4_mine),
+                Box::new(v6_mine),
+                Box::new(other_mine),
+            ]);
+            split(fcx, ports, None, |packet| match version(&packet.0) {
+                Some(4) => 1,
+                Some(6) => 2,
+                _ => 3,
+            })
+            .await
+        },
+    );
     (v4, v6, other)
 }
 
@@ -246,22 +257,30 @@ pub fn split_protocols(fcx: &Cx, inner: impl Interface) -> (End, End, End, End) 
     let (udp, udp_mine) = capped();
     let (icmp, icmp_mine) = capped();
     let (other, other_mine) = capped();
-    fcx.spawn_as(|| "split_protocols".into(), move |fcx| async move {
-        let ports = Ports::new(vec![
-            Box::new(inner) as Box<dyn Interface>,
-            Box::new(tcp_mine),
-            Box::new(udp_mine),
-            Box::new(icmp_mine),
-            Box::new(other_mine),
-        ]);
-        split(fcx, ports, Some(Reassembly::default()), |packet| match protocol_end(&packet.0) {
-            protocol::TCP => 1,
-            protocol::UDP => 2,
-            protocol::ICMP | protocol::ICMPV6 => 3,
-            _ => 4,
-        })
-        .await
-    });
+    fcx.spawn_as(
+        || "split_protocols".into(),
+        move |fcx| async move {
+            let ports = Ports::new(vec![
+                Box::new(inner) as Box<dyn Interface>,
+                Box::new(tcp_mine),
+                Box::new(udp_mine),
+                Box::new(icmp_mine),
+                Box::new(other_mine),
+            ]);
+            split(
+                fcx,
+                ports,
+                Some(Reassembly::default()),
+                |packet| match protocol_end(&packet.0) {
+                    protocol::TCP => 1,
+                    protocol::UDP => 2,
+                    protocol::ICMP | protocol::ICMPV6 => 3,
+                    _ => 4,
+                },
+            )
+            .await
+        },
+    );
     (tcp, udp, icmp, other)
 }
 
@@ -270,13 +289,18 @@ pub fn split_protocols(fcx: &Cx, inner: impl Interface) -> (End, End, End, End) 
 /// anything else for the last end. ICMP errors are sorted by the protocol
 /// of the packet they quote.
 pub fn protocol_end(packet: &[u8]) -> u8 {
-    let Some(h) = Header::parse_whole(packet) else { return protocol::NONE };
+    let Some(h) = Header::parse_whole(packet) else {
+        return protocol::NONE;
+    };
     let icmp = h.payload(packet);
     match h.protocol {
         // Destination unreachable (including "fragmentation needed"),
         // source quench, time exceeded, parameter problem.
         protocol::ICMP if h.src.is_ipv4() => {
-            if icmp.len() >= 8 && matches!(icmp[0], 3 | 4 | 11 | 12) && let Some(p) = quoted_protocol(&icmp[8..]) {
+            if icmp.len() >= 8
+                && matches!(icmp[0], 3 | 4 | 11 | 12)
+                && let Some(p) = quoted_protocol(&icmp[8..])
+            {
                 return p;
             }
             protocol::ICMP
@@ -284,7 +308,10 @@ pub fn protocol_end(packet: &[u8]) -> u8 {
         // Types below 128 are errors: destination unreachable, packet too
         // big, time exceeded, parameter problem.
         protocol::ICMPV6 if h.src.is_ipv6() => {
-            if icmp.len() >= 8 && icmp[0] < 128 && let Some(p) = quoted_protocol(&icmp[8..]) {
+            if icmp.len() >= 8
+                && icmp[0] < 128
+                && let Some(p) = quoted_protocol(&icmp[8..])
+            {
                 return p;
             }
             protocol::ICMP
@@ -320,8 +347,17 @@ const PARTIAL_COST: usize = 192;
 /// Which packet a fragment belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Key {
-    V4 { src: Ipv4Addr, dst: Ipv4Addr, id: u16, proto: u8 },
-    V6 { src: Ipv6Addr, dst: Ipv6Addr, id: u32 },
+    V4 {
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        id: u16,
+        proto: u8,
+    },
+    V6 {
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        id: u32,
+    },
 }
 
 /// One packet being put back together, or dropped.
@@ -413,7 +449,9 @@ impl Reassembly {
         {
             return refused(packet, reject);
         }
-        let Some(whole) = self.reassemble(packet, now) else { return Intake::Waiting };
+        let Some(whole) = self.reassemble(packet, now) else {
+            return Intake::Waiting;
+        };
         if version(&whole.0) != Some(6) {
             return Intake::Whole(whole);
         }
@@ -441,7 +479,9 @@ impl Reassembly {
 
     /// [`reassemble`](Reassembly::reassemble), without the cap.
     fn push_fragment(&mut self, packet: Packet, now: Instant) -> Option<Packet> {
-        let Some(frag) = arrived(&packet.0) else { return Some(packet) };
+        let Some(frag) = arrived(&packet.0) else {
+            return Some(packet);
+        };
         // A packet in one fragment needs no waiting (RFC 6946).
         if frag.offset == 0 && !frag.more {
             let header = frag.header?;
@@ -499,7 +539,12 @@ impl Reassembly {
                 Some(t) if t != end => ok = false,
                 _ => {}
             }
-            if partial.pieces.iter().next_back().is_some_and(|(o, d)| o + d.len() > end) {
+            if partial
+                .pieces
+                .iter()
+                .next_back()
+                .is_some_and(|(o, d)| o + d.len() > end)
+            {
                 ok = false;
             }
             partial.total = Some(end);
@@ -514,7 +559,9 @@ impl Reassembly {
             {
                 ok = false;
             }
-            if let Some((o, _)) = partial.pieces.range(frag.offset + 1..).next() && *o < end {
+            if let Some((o, _)) = partial.pieces.range(frag.offset + 1..).next()
+                && *o < end
+            {
                 ok = false;
             }
         }
@@ -523,7 +570,9 @@ impl Reassembly {
             return None;
         }
         let mut added = frag.data.len() + PIECE_COST;
-        if let Some(h) = frag.header && partial.header.is_none() {
+        if let Some(h) = frag.header
+            && partial.header.is_none()
+        {
             added += h.len();
             partial.header = Some(h);
         }
@@ -535,7 +584,11 @@ impl Reassembly {
         // never pass the end, so counting their bytes is enough.
         if partial.header.is_some() && partial.total == Some(partial.have) {
             let partial = self.take(&key).unwrap();
-            let pieces: Vec<(usize, &[u8])> = partial.pieces.iter().map(|(o, d)| (*o, d.as_slice())).collect();
+            let pieces: Vec<(usize, &[u8])> = partial
+                .pieces
+                .iter()
+                .map(|(o, d)| (*o, d.as_slice()))
+                .collect();
             return finish(partial.header.unwrap(), &pieces, partial.have).map(Packet);
         }
         None
@@ -557,7 +610,9 @@ impl Reassembly {
     /// as dead until it expires, so its later fragments are dropped too
     /// (RFC 5722).
     fn kill(&mut self, key: &Key) {
-        let Some(p) = self.partial.get_mut(key) else { return };
+        let Some(p) = self.partial.get_mut(key) else {
+            return;
+        };
         self.size -= p.size - PARTIAL_COST;
         p.size = PARTIAL_COST;
         p.dead = true;
@@ -613,9 +668,16 @@ fn arrived(packet: &[u8]) -> Option<Arrived<'_>> {
         4 => {
             let h = v4(packet, false)?;
             let f = h.fragment?;
-            let (IpAddr::V4(src), IpAddr::V4(dst)) = (h.src, h.dst) else { return None };
+            let (IpAddr::V4(src), IpAddr::V4(dst)) = (h.src, h.dst) else {
+                return None;
+            };
             Some(Arrived {
-                key: Key::V4 { src, dst, id: f.id as u16, proto: h.protocol },
+                key: Key::V4 {
+                    src,
+                    dst,
+                    id: f.id as u16,
+                    proto: h.protocol,
+                },
                 offset: f.offset,
                 more: f.more,
                 data: h.payload(packet),
@@ -628,7 +690,9 @@ fn arrived(packet: &[u8]) -> Option<Arrived<'_>> {
             let (at, next_at) = chain.frag?;
             let h = v6(packet, &chain);
             let f = h.fragment?;
-            let (IpAddr::V6(src), IpAddr::V6(dst)) = (h.src, h.dst) else { return None };
+            let (IpAddr::V6(src), IpAddr::V6(dst)) = (h.src, h.dst) else {
+                return None;
+            };
             // The headers in front of the fragment header, with the "next
             // header" byte that named it naming what it named.
             let header = (f.offset == 0).then(|| {
@@ -655,7 +719,11 @@ fn arrived(packet: &[u8]) -> Option<Arrived<'_>> {
 /// IPv6. The data alone stays within 65,535 bytes, but headers come on top.
 fn finish(mut header: Vec<u8>, pieces: &[(usize, &[u8])], total: usize) -> Option<Vec<u8>> {
     let head = header.len();
-    let len = if header[0] >> 4 == 4 { head + total } else { head - 40 + total };
+    let len = if header[0] >> 4 == 4 {
+        head + total
+    } else {
+        head - 40 + total
+    };
     let len = u16::try_from(len).ok()?;
     header.reserve(total);
     for (_, d) in pieces {
@@ -725,8 +793,12 @@ pub fn destination(packet: &[u8]) -> Option<IpAddr> {
 #[inline]
 fn address(packet: &[u8], v4: usize, v6: usize) -> Option<IpAddr> {
     match version(packet)? {
-        4 => Some(IpAddr::V4(<[u8; 4]>::try_from(packet.get(v4..v4 + 4)?).ok()?.into())),
-        6 if packet.len() >= 40 => Some(IpAddr::V6(<[u8; 16]>::try_from(&packet[v6..v6 + 16]).ok()?.into())),
+        4 => Some(IpAddr::V4(
+            <[u8; 4]>::try_from(packet.get(v4..v4 + 4)?).ok()?.into(),
+        )),
+        6 if packet.len() >= 40 => Some(IpAddr::V6(
+            <[u8; 16]>::try_from(&packet[v6..v6 + 16]).ok()?.into(),
+        )),
         _ => None,
     }
 }
@@ -884,7 +956,9 @@ impl Header {
     /// read from. `None` for other protocols, for a fragment after the
     /// first, and when the port's bytes are not there.
     pub fn dst_port(&self, packet: &[u8]) -> Option<u16> {
-        if self.fragment.is_some_and(|f| f.offset != 0) || !matches!(self.protocol, protocol::TCP | protocol::UDP) {
+        if self.fragment.is_some_and(|f| f.offset != 0)
+            || !matches!(self.protocol, protocol::TCP | protocol::UDP)
+        {
             return None;
         }
         let t = self.payload(packet);
@@ -934,10 +1008,26 @@ fn v6(bytes: &[u8], chain: &Chain) -> Header {
     let fragment = chain.frag.map(|(at, _)| {
         let f = &bytes[at..at + 8];
         let off_m = u16::from_be_bytes([f[2], f[3]]);
-        Fragment { id: u32::from_be_bytes([f[4], f[5], f[6], f[7]]), offset: (off_m & 0xfff8) as usize, more: off_m & 1 != 0 }
+        Fragment {
+            id: u32::from_be_bytes([f[4], f[5], f[6], f[7]]),
+            offset: (off_m & 0xfff8) as usize,
+            more: off_m & 1 != 0,
+        }
     });
-    let addr = |at: usize| IpAddr::V6(<[u8; 16]>::try_from(&bytes[at..at + 16]).expect("a whole IPv6 header").into());
-    Header { src: addr(8), dst: addr(24), protocol: chain.proto, payload: chain.upper..chain.end, fragment }
+    let addr = |at: usize| {
+        IpAddr::V6(
+            <[u8; 16]>::try_from(&bytes[at..at + 16])
+                .expect("a whole IPv6 header")
+                .into(),
+        )
+    };
+    Header {
+        src: addr(8),
+        dst: addr(24),
+        protocol: chain.proto,
+        payload: chain.upper..chain.end,
+        fragment,
+    }
 }
 
 // The IPv6 extension-header chain (RFC 8200, section 4)
@@ -994,7 +1084,9 @@ fn chain6(bytes: &[u8], walk: Walk) -> Result<Chain, Reject> {
     }
     // A first fragment: offset 0, more to come.
     let first = |frag: Option<(usize, usize)>| {
-        frag.is_some_and(|(at, _): (usize, usize)| u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) & 0xfff9 == 1)
+        frag.is_some_and(|(at, _): (usize, usize)| {
+            u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) & 0xfff9 == 1
+        })
     };
     let mut next = bytes[6];
     let mut next_at = 6;
@@ -1002,7 +1094,10 @@ fn chain6(bytes: &[u8], walk: Walk) -> Result<Chain, Reject> {
     let mut frag = None;
     loop {
         if check && next == HOP_BY_HOP && next_at != 6 {
-            return Err(Problem { code: 1, pointer: next_at as u32 });
+            return Err(Problem {
+                code: 1,
+                pointer: next_at as u32,
+            });
         }
         // The header's length, for the headers that say it.
         let len = match next {
@@ -1015,13 +1110,31 @@ fn chain6(bytes: &[u8], walk: Walk) -> Result<Chain, Reject> {
         let Some(len) = len.filter(|len| at + len <= end) else {
             // The header runs past the packet.
             if check {
-                return Err(if first(frag) && next != FRAGMENT { Problem { code: 3, pointer: 0 } } else { Discard });
+                return Err(if first(frag) && next != FRAGMENT {
+                    Problem {
+                        code: 3,
+                        pointer: 0,
+                    }
+                } else {
+                    Discard
+                });
             }
-            return Ok(Chain { proto: protocol::NONE, upper: at.min(end), proto_at: next_at, frag, end });
+            return Ok(Chain {
+                proto: protocol::NONE,
+                upper: at.min(end),
+                proto_at: next_at,
+                frag,
+                end,
+            });
         };
         match next {
             HOP_BY_HOP | DEST_OPTIONS if check => check_options(&bytes[at..at + len], at)?,
-            ROUTING if check && bytes[at + 3] != 0 => return Err(Problem { code: 0, pointer: (at + 2) as u32 }),
+            ROUTING if check && bytes[at + 3] != 0 => {
+                return Err(Problem {
+                    code: 0,
+                    pointer: (at + 2) as u32,
+                });
+            }
             FRAGMENT => {
                 if frag.is_some() {
                     if check {
@@ -1035,7 +1148,8 @@ fn chain6(bytes: &[u8], walk: Walk) -> Result<Chain, Reject> {
         }
         // Only the first fragment carries the headers after a fragment
         // header.
-        let later = next == FRAGMENT && u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) & 0xfff8 != 0;
+        let later =
+            next == FRAGMENT && u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) & 0xfff8 != 0;
         (next, next_at, at) = (bytes[at], at, at + len);
         if later {
             break;
@@ -1048,9 +1162,18 @@ fn chain6(bytes: &[u8], walk: Walk) -> Result<Chain, Reject> {
         _ => 0,
     };
     if check && first(frag) && end - at < need {
-        return Err(Problem { code: 3, pointer: 0 });
+        return Err(Problem {
+            code: 3,
+            pointer: 0,
+        });
     }
-    Ok(Chain { proto: next, upper: at, proto_at: next_at, frag, end })
+    Ok(Chain {
+        proto: next,
+        upper: at,
+        proto_at: next_at,
+        frag,
+        end,
+    })
 }
 
 /// Checks the options of one Hop-by-Hop or Destination Options header,
@@ -1110,7 +1233,9 @@ pub fn strip_extension_headers(packet: &[u8]) -> Result<Option<Vec<u8>>, Reject>
 /// [`icmp::error`]. It comes from the packet's destination. `None` for
 /// [`Reject::Discard`], and where `icmp::error` sends no answer.
 pub fn parameter_problem(packet: &[u8], reject: Reject) -> Option<Packet> {
-    let Reject::Problem { code, pointer } = reject else { return None };
+    let Reject::Problem { code, pointer } = reject else {
+        return None;
+    };
     let from = destination(packet)?;
     icmp::error(packet, from, 4, code, pointer)
 }
@@ -1215,7 +1340,12 @@ pub struct Fields {
 
 impl Default for Fields {
     fn default() -> Fields {
-        Fields { ttl: 64, tos: 0, id: 0, dont_fragment: true }
+        Fields {
+            ttl: 64,
+            tos: 0,
+            id: 0,
+            dont_fragment: true,
+        }
     }
 }
 
@@ -1237,16 +1367,30 @@ pub fn packet(src: IpAddr, dst: IpAddr, protocol: u8, payload: &[u8]) -> Packet 
 /// # Panics
 ///
 /// As [`packet`].
-pub fn packet_with(src: IpAddr, dst: IpAddr, protocol: u8, fields: Fields, payload: &[u8]) -> Packet {
+pub fn packet_with(
+    src: IpAddr,
+    dst: IpAddr,
+    protocol: u8,
+    fields: Fields,
+    payload: &[u8],
+) -> Packet {
     let mut p;
     match (src, dst) {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
-            let total = u16::try_from(20 + payload.len()).expect("a payload that fits one IPv4 packet");
+            let total =
+                u16::try_from(20 + payload.len()).expect("a payload that fits one IPv4 packet");
             p = Vec::with_capacity(20 + payload.len());
             p.extend_from_slice(&[0x45, fields.tos]);
             p.extend_from_slice(&total.to_be_bytes());
             p.extend_from_slice(&fields.id.to_be_bytes());
-            p.extend_from_slice(&[if fields.dont_fragment { 0x40 } else { 0 }, 0, fields.ttl, protocol, 0, 0]);
+            p.extend_from_slice(&[
+                if fields.dont_fragment { 0x40 } else { 0 },
+                0,
+                fields.ttl,
+                protocol,
+                0,
+                0,
+            ]);
             p.extend_from_slice(&s.octets());
             p.extend_from_slice(&d.octets());
             set_header_checksum(&mut p);
@@ -1310,14 +1454,25 @@ pub fn hop(packet: &mut [u8]) -> Hop {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
+    use fictionet::stdlib::test_support::rounds;
 
     /// An IPv4 header with a correct checksum, from `src` to `dst`, for
     /// `payload_len` bytes of `proto` after `options` (a multiple of 4
     /// bytes).
-    fn v4_header(proto: u8, src: Ipv4Addr, dst: Ipv4Addr, id: u16, options: &[u8], payload_len: usize) -> Vec<u8> {
-        let fields = Fields { id, dont_fragment: false, ..Fields::default() };
+    fn v4_header(
+        proto: u8,
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        id: u16,
+        options: &[u8],
+        payload_len: usize,
+    ) -> Vec<u8> {
+        let fields = Fields {
+            id,
+            dont_fragment: false,
+            ..Fields::default()
+        };
         let mut h = packet_with(src.into(), dst.into(), proto, fields, &[]).0;
         h.extend_from_slice(options);
         h[0] = 0x40 | (h.len() / 4) as u8;
@@ -1335,7 +1490,14 @@ mod tests {
 
     /// The same, with `data` as the data.
     fn frag4_of(id: u16, offset: usize, data: &[u8], more: bool) -> Packet {
-        let mut h = v4_header(protocol::UDP, Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(1, 1, 1, 1), id, &[], data.len());
+        let mut h = v4_header(
+            protocol::UDP,
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(1, 1, 1, 1),
+            id,
+            &[],
+            data.len(),
+        );
         let flags: u16 = if more { 0x2000 } else { 0 };
         h[6..8].copy_from_slice(&((offset / 8) as u16 | flags).to_be_bytes());
         set_header_checksum(&mut h[..20]);
@@ -1367,7 +1529,9 @@ mod tests {
         assert!(r.reassemble(frag4(1, 16, 8, false), at(31)).is_none());
         // Within the time, both halves make one.
         assert!(r.reassemble(frag4(2, 0, 16, true), at(40)).is_none());
-        let whole = r.reassemble(frag4(2, 16, 8, false), at(69)).expect("a whole packet");
+        let whole = r
+            .reassemble(frag4(2, 16, 8, false), at(69))
+            .expect("a whole packet");
         assert_eq!(whole.0.len(), 20 + 24);
         assert_eq!(checksum(&whole.0[..20]), 0);
     }
@@ -1424,7 +1588,9 @@ mod tests {
             assert!(r.reassemble(frag4(9, k * 8, 8, true), at(0)).is_none());
         }
         r.check();
-        let whole = r.reassemble(frag4(9, 0, 8, true), at(0)).expect("a whole packet");
+        let whole = r
+            .reassemble(frag4(9, 0, 8, true), at(0))
+            .expect("a whole packet");
         assert_eq!(whole.0.len(), 20 + 69);
         assert!(r.partial.is_empty() && r.by_expiry.is_empty());
         assert_eq!(r.size, 0);
@@ -1443,13 +1609,25 @@ mod tests {
             let more = offset + len < 65_535;
             let options: &[u8] = if offset == 0 { &[1; 40] } else { &[] };
             let src = Ipv4Addr::new(10, 0, 0, 2);
-            let mut h = v4_header(protocol::UDP, src, Ipv4Addr::new(1, 1, 1, 1), 7, options, len);
+            let mut h = v4_header(
+                protocol::UDP,
+                src,
+                Ipv4Addr::new(1, 1, 1, 1),
+                7,
+                options,
+                len,
+            );
             let flags: u16 = if more { 0x2000 } else { 0 };
             h[6..8].copy_from_slice(&((offset / 8) as u16 | flags).to_be_bytes());
             let ihl = h.len();
             set_header_checksum(&mut h[..ihl]);
             h.extend(std::iter::repeat_n(0xab, len));
-            assert_eq!(r.reassemble(Packet(h), at(0)), None, "a packet of {} bytes came out", 40 + 20 + offset + len);
+            assert_eq!(
+                r.reassemble(Packet(h), at(0)),
+                None,
+                "a packet of {} bytes came out",
+                40 + 20 + offset + len
+            );
             offset += len;
         }
         assert!(r.partial.is_empty());
@@ -1472,13 +1650,34 @@ mod tests {
             p.extend_from_slice(&[60, 64]);
             p.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
             p.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-            p.extend_from_slice(&[protocol::FRAGMENT, 1, 1, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            p.extend_from_slice(&[
+                protocol::FRAGMENT,
+                1,
+                1,
+                12,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]);
             p.push(protocol::UDP);
             p.push(0);
             p.extend_from_slice(&(offset as u16 | more as u16).to_be_bytes());
             p.extend_from_slice(&9u32.to_be_bytes());
             p.extend(std::iter::repeat_n(0xab, len));
-            assert_eq!(r.reassemble(Packet(p), at(0)), None, "a packet came out at offset {offset}");
+            assert_eq!(
+                r.reassemble(Packet(p), at(0)),
+                None,
+                "a packet came out at offset {offset}"
+            );
             offset += len;
         }
         assert!(r.partial.is_empty());
@@ -1494,7 +1693,14 @@ mod tests {
             let (_tcp, _udp, _icmp, other) = split_protocols(&fcx, side);
             // 20 MiB of protocol 99, which goes to `other`.
             for _ in 0..20 * 1024 {
-                let h = v4_header(99, Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1), 0, &[], 1000);
+                let h = v4_header(
+                    99,
+                    Ipv4Addr::new(10, 0, 0, 2),
+                    Ipv4Addr::new(10, 0, 0, 1),
+                    0,
+                    &[],
+                    1000,
+                );
                 let mut p = h;
                 p.extend_from_slice(&[0; 1000]);
                 raw.send(Packet(p));
@@ -1550,7 +1756,9 @@ mod tests {
         r.expire(at(30));
         assert!(r.partial.is_empty());
         assert!(r.reassemble(frag4_of(1, 0, &first, true), at(31)).is_none());
-        let whole = r.reassemble(frag4(1, 16, 8, false), at(31)).expect("a whole packet");
+        let whole = r
+            .reassemble(frag4(1, 16, 8, false), at(31))
+            .expect("a whole packet");
         assert_eq!(&whole.0[20..36], &first);
         // An exact copy is ignored.
         assert!(r.reassemble(frag4_of(2, 0, &first, true), at(40)).is_none());
@@ -1564,7 +1772,10 @@ mod tests {
     fn fragments_too_long_for_ip_keep_nothing() {
         let mut r = Reassembly::default();
         for id in 0..rounds(20_000) {
-            assert!(r.reassemble(frag4(id as u16, 65_528, 16, false), at(0)).is_none());
+            assert!(
+                r.reassemble(frag4(id as u16, 65_528, 16, false), at(0))
+                    .is_none()
+            );
         }
         assert!(r.partial.is_empty());
         assert_eq!(r.size, 0);
@@ -1591,18 +1802,35 @@ mod tests {
     fn a_copy_with_another_more_flag_drops_the_packet() {
         for last_first in [false, true] {
             let mut r = Reassembly::default();
-            let (a, b) = if last_first { (false, true) } else { (true, false) };
+            let (a, b) = if last_first {
+                (false, true)
+            } else {
+                (true, false)
+            };
             assert!(r.reassemble(frag4_of(1, 8, &[2; 8], a), at(0)).is_none());
             assert!(r.reassemble(frag4_of(1, 8, &[2; 8], b), at(0)).is_none());
-            assert!(r.reassemble(frag4_of(1, 0, &[1; 8], true), at(0)).is_none(), "last first: {last_first}");
-            assert!(r.reassemble(frag4_of(1, 16, &[3; 8], false), at(0)).is_none(), "last first: {last_first}");
+            assert!(
+                r.reassemble(frag4_of(1, 0, &[1; 8], true), at(0)).is_none(),
+                "last first: {last_first}"
+            );
+            assert!(
+                r.reassemble(frag4_of(1, 16, &[3; 8], false), at(0))
+                    .is_none(),
+                "last first: {last_first}"
+            );
             assert_eq!(live(&r), 0);
             r.check();
         }
         // A true copy of the last fragment is still ignored.
         let mut r = Reassembly::default();
-        assert!(r.reassemble(frag4_of(1, 8, &[2; 8], false), at(0)).is_none());
-        assert!(r.reassemble(frag4_of(1, 8, &[2; 8], false), at(0)).is_none());
+        assert!(
+            r.reassemble(frag4_of(1, 8, &[2; 8], false), at(0))
+                .is_none()
+        );
+        assert!(
+            r.reassemble(frag4_of(1, 8, &[2; 8], false), at(0))
+                .is_none()
+        );
         assert!(r.reassemble(frag4_of(1, 0, &[1; 8], true), at(0)).is_some());
     }
 
@@ -1640,14 +1868,42 @@ mod tests {
     #[test]
     fn headers_that_ask_nothing_are_walked() {
         let plain = v6(protocol::UDP, &[0; 8]);
-        assert_eq!(checked(&plain), Ok(Chain { proto: protocol::UDP, upper: 40, proto_at: 6, frag: None, end: 48 }));
+        assert_eq!(
+            checked(&plain),
+            Ok(Chain {
+                proto: protocol::UDP,
+                upper: 40,
+                proto_at: 6,
+                frag: None,
+                end: 48
+            })
+        );
         // An Authentication header is read past.
         let ah = chained(protocol::AUTH, &[&[17, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]);
-        assert_eq!(checked(&ah).map(|c| (c.proto, c.upper)), Ok((protocol::UDP, 52)));
+        assert_eq!(
+            checked(&ah).map(|c| (c.proto, c.upper)),
+            Ok((protocol::UDP, 52))
+        );
         // Hop-by-Hop with PadN, a Routing header with no segments left, and
         // Destination Options with an unknown option to skip and Pad1.
-        let p = chained(0, &[&[43, 0, 1, 4, 0, 0, 0, 0], &[60, 0, 250, 0, 0, 0, 0, 0], &[17, 0, 0x1e, 3, 9, 9, 9, 0]]);
-        assert_eq!(checked(&p), Ok(Chain { proto: protocol::UDP, upper: 64, proto_at: 56, frag: None, end: 72 }));
+        let p = chained(
+            0,
+            &[
+                &[43, 0, 1, 4, 0, 0, 0, 0],
+                &[60, 0, 250, 0, 0, 0, 0, 0],
+                &[17, 0, 0x1e, 3, 9, 9, 9, 0],
+            ],
+        );
+        assert_eq!(
+            checked(&p),
+            Ok(Chain {
+                proto: protocol::UDP,
+                upper: 64,
+                proto_at: 56,
+                frag: None,
+                end: 72
+            })
+        );
         let stripped = strip_extension_headers(&p).unwrap().unwrap();
         assert_eq!(stripped, v6(protocol::UDP, &[0, 1, 0, 2, 0, 8, 0, 0]));
         assert_eq!(strip_extension_headers(&plain), Ok(None));
@@ -1656,22 +1912,52 @@ mod tests {
     #[test]
     fn headers_a_host_must_refuse_are_refused() {
         // Unknown options, by their two high bits.
-        assert_eq!(checked(&chained(60, &[&[17, 0, 0x40, 0, 0, 0, 0, 0]])), Err(Reject::Discard));
-        assert_eq!(checked(&chained(60, &[&[17, 0, 0x80, 0, 0, 0, 0, 0]])), problem(2, 42));
-        assert_eq!(checked(&chained(0, &[&[17, 0, 1, 0, 0xc2, 0, 0, 0]])), problem(2, 44));
+        assert_eq!(
+            checked(&chained(60, &[&[17, 0, 0x40, 0, 0, 0, 0, 0]])),
+            Err(Reject::Discard)
+        );
+        assert_eq!(
+            checked(&chained(60, &[&[17, 0, 0x80, 0, 0, 0, 0, 0]])),
+            problem(2, 42)
+        );
+        assert_eq!(
+            checked(&chained(0, &[&[17, 0, 1, 0, 0xc2, 0, 0, 0]])),
+            problem(2, 44)
+        );
         // A Routing header with segments left, of any type.
         for kind in [0, 2, 3, 4, 250] {
-            assert_eq!(checked(&chained(43, &[&[17, 0, kind, 1, 0, 0, 0, 0]])), problem(0, 42));
+            assert_eq!(
+                checked(&chained(43, &[&[17, 0, kind, 1, 0, 0, 0, 0]])),
+                problem(0, 42)
+            );
         }
         // Hop-by-Hop anywhere but first, even cut short.
-        assert_eq!(checked(&chained(60, &[&[0, 0, 0, 0, 0, 0, 0, 0], &[17, 0, 0, 0, 0, 0, 0, 0]])), problem(1, 40));
-        assert_eq!(checked(&v6(60, &[0, 0, 0, 0, 0, 0, 0, 0, 17])), problem(1, 40));
+        assert_eq!(
+            checked(&chained(
+                60,
+                &[&[0, 0, 0, 0, 0, 0, 0, 0], &[17, 0, 0, 0, 0, 0, 0, 0]]
+            )),
+            problem(1, 40)
+        );
+        assert_eq!(
+            checked(&v6(60, &[0, 0, 0, 0, 0, 0, 0, 0, 17])),
+            problem(1, 40)
+        );
         // An option that runs past its header, and headers that run past
         // the packet.
-        assert_eq!(checked(&chained(60, &[&[17, 0, 1, 5, 0, 0, 0, 0]])), Err(Reject::Discard));
-        assert_eq!(checked(&v6(60, &[17, 1, 0, 0, 0, 0, 0, 0])), Err(Reject::Discard));
+        assert_eq!(
+            checked(&chained(60, &[&[17, 0, 1, 5, 0, 0, 0, 0]])),
+            Err(Reject::Discard)
+        );
+        assert_eq!(
+            checked(&v6(60, &[17, 1, 0, 0, 0, 0, 0, 0])),
+            Err(Reject::Discard)
+        );
         assert_eq!(checked(&v6(43, &[17, 0, 0, 0])), Err(Reject::Discard));
-        assert_eq!(checked(&v6(protocol::FRAGMENT, &[17, 0, 0, 0])), Err(Reject::Discard));
+        assert_eq!(
+            checked(&v6(protocol::FRAGMENT, &[17, 0, 0, 0])),
+            Err(Reject::Discard)
+        );
         // A length field longer than the bytes present.
         let mut cut = v6(protocol::UDP, &[0; 8]);
         cut.truncate(44);
@@ -1681,21 +1967,47 @@ mod tests {
     #[test]
     fn fragments_are_noted_and_not_stripped() {
         // A first fragment: the walk goes on past it.
-        let first = chained(protocol::FRAGMENT, &[&[60, 0, 0, 1, 0, 0, 0, 7], &[17, 0, 0, 0, 0, 0, 0, 0]]);
+        let first = chained(
+            protocol::FRAGMENT,
+            &[&[60, 0, 0, 1, 0, 0, 0, 7], &[17, 0, 0, 0, 0, 0, 0, 0]],
+        );
         let chain = checked(&first).unwrap();
-        assert_eq!((chain.proto, chain.upper, chain.frag), (protocol::UDP, 56, Some((40, 6))));
-        assert_eq!(Header::check(&first).unwrap().fragment, Some(Fragment { id: 7, offset: 0, more: true }));
+        assert_eq!(
+            (chain.proto, chain.upper, chain.frag),
+            (protocol::UDP, 56, Some((40, 6)))
+        );
+        assert_eq!(
+            Header::check(&first).unwrap().fragment,
+            Some(Fragment {
+                id: 7,
+                offset: 0,
+                more: true
+            })
+        );
         // A later fragment: the walk stops at it.
         let later = chained(protocol::FRAGMENT, &[&[60, 0, 0, 16, 0, 0, 0, 7]]);
         let chain = checked(&later).unwrap();
         assert_eq!((chain.proto, chain.upper), (protocol::DEST_OPTIONS, 48));
-        assert_eq!(Header::check(&later).unwrap().fragment, Some(Fragment { id: 7, offset: 16, more: false }));
+        assert_eq!(
+            Header::check(&later).unwrap().fragment,
+            Some(Fragment {
+                id: 7,
+                offset: 16,
+                more: false
+            })
+        );
         assert_eq!(strip_extension_headers(&first), Err(Reject::Discard));
         assert_eq!(Header::parse_whole(&first), None);
         // A second fragment header: refused by a host, read past otherwise.
-        let twice = chained(protocol::FRAGMENT, &[&[44, 0, 0, 1, 0, 0, 0, 7], &[17, 0, 0, 0, 0, 0, 0, 7]]);
+        let twice = chained(
+            protocol::FRAGMENT,
+            &[&[44, 0, 0, 1, 0, 0, 0, 7], &[17, 0, 0, 0, 0, 0, 0, 7]],
+        );
         assert_eq!(checked(&twice), Err(Reject::Discard));
-        assert_eq!(Header::parse(&twice).map(|h| (h.protocol, h.payload.start)), Some((protocol::UDP, 56)));
+        assert_eq!(
+            Header::parse(&twice).map(|h| (h.protocol, h.payload.start)),
+            Some((protocol::UDP, 56))
+        );
     }
 
     /// Before there was one walker, `Header::parse` and
@@ -1708,19 +2020,45 @@ mod tests {
     #[test]
     fn every_reader_walks_the_same_chain() {
         for next in [135, 139, 140, 253, 254] {
-            let p = v6(next, &[protocol::UDP, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0, 8, 0, 0]);
+            let p = v6(
+                next,
+                &[protocol::UDP, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0, 8, 0, 0],
+            );
             let read = |h: Option<Header>| h.map(|h| (h.protocol, h.payload.start));
-            assert_eq!(read(Header::parse(&p)), Some((next, 40)), "parse, next header {next}");
-            assert_eq!(read(Header::parse_truncated(&p)), Some((next, 40)), "parse_truncated, next header {next}");
-            assert_eq!(read(Header::parse_truncated(&p[..44])), Some((next, 40)), "cut short, next header {next}");
-            assert_eq!(read(Header::check(&p).ok()), Some((next, 40)), "check, next header {next}");
-            assert_eq!(read(Header::parse_whole(&p)), Some((next, 40)), "parse_whole, next header {next}");
+            assert_eq!(
+                read(Header::parse(&p)),
+                Some((next, 40)),
+                "parse, next header {next}"
+            );
+            assert_eq!(
+                read(Header::parse_truncated(&p)),
+                Some((next, 40)),
+                "parse_truncated, next header {next}"
+            );
+            assert_eq!(
+                read(Header::parse_truncated(&p[..44])),
+                Some((next, 40)),
+                "cut short, next header {next}"
+            );
+            assert_eq!(
+                read(Header::check(&p).ok()),
+                Some((next, 40)),
+                "check, next header {next}"
+            );
+            assert_eq!(
+                read(Header::parse_whole(&p)),
+                Some((next, 40)),
+                "parse_whole, next header {next}"
+            );
             assert_eq!(protocol_end(&p), next, "the split, next header {next}");
         }
         // A chain cut short reads as "no next header" only to the reader
         // that allows it.
         let cut = chained(60, &[&[17, 1, 0, 0, 0, 0, 0, 0]]);
-        assert_eq!(Header::parse_truncated(&cut[..44]).map(|h| h.protocol), Some(protocol::NONE));
+        assert_eq!(
+            Header::parse_truncated(&cut[..44]).map(|h| h.protocol),
+            Some(protocol::NONE)
+        );
         assert_eq!(Header::parse(&cut[..44]), None);
     }
 
@@ -1730,12 +2068,18 @@ mod tests {
         let reject = checked(&bad).unwrap_err();
         let answer = parameter_problem(&bad, reject).expect("an answer").0;
         let ip = Header::parse(&answer).unwrap();
-        assert_eq!((ip.src, ip.dst, ip.protocol), (DST.into(), SRC.into(), protocol::ICMPV6));
+        assert_eq!(
+            (ip.src, ip.dst, ip.protocol),
+            (DST.into(), SRC.into(), protocol::ICMPV6)
+        );
         let icmp = ip.payload(&answer);
         assert_eq!(&icmp[..2], &[4, 0]);
         assert_eq!(&icmp[4..8], &42u32.to_be_bytes());
         assert_eq!(&icmp[8..], &bad[..]);
-        assert_eq!(transport_checksum(DST.into(), SRC.into(), protocol::ICMPV6, icmp), 0);
+        assert_eq!(
+            transport_checksum(DST.into(), SRC.into(), protocol::ICMPV6, icmp),
+            0
+        );
         // Nothing for a silent discard, to a multicast address, from an
         // unspecified one, or for an ICMPv6 error.
         assert_eq!(parameter_problem(&bad, Reject::Discard), None);
@@ -1745,16 +2089,51 @@ mod tests {
         let mut unspecified = bad.clone();
         unspecified[8..24].fill(0);
         assert_eq!(parameter_problem(&unspecified, reject), None);
-        let error = v6(43, &[protocol::ICMPV6, 0, 250, 1, 0, 0, 0, 0, 1, 4, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(parameter_problem(&error, checked(&error).unwrap_err()), None);
+        let error = v6(
+            43,
+            &[
+                protocol::ICMPV6,
+                0,
+                250,
+                1,
+                0,
+                0,
+                0,
+                0,
+                1,
+                4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert_eq!(
+            parameter_problem(&error, checked(&error).unwrap_err()),
+            None
+        );
         // Nor for the first fragment of an ICMPv6 error, cut short (RFC
         // 7112): its type is there to read.
-        let first = v6(protocol::FRAGMENT, &[protocol::ICMPV6, 0, 0, 1, 0, 0, 0, 9, 1, 4]);
+        let first = v6(
+            protocol::FRAGMENT,
+            &[protocol::ICMPV6, 0, 0, 1, 0, 0, 0, 9, 1, 4],
+        );
         let reject = checked(&first).unwrap_err();
-        assert_eq!(reject, Reject::Problem { code: 3, pointer: 0 });
+        assert_eq!(
+            reject,
+            Reject::Problem {
+                code: 3,
+                pointer: 0
+            }
+        );
         assert_eq!(parameter_problem(&first, reject), None);
         // An echo request cut short the same way is answered.
-        let ping = v6(protocol::FRAGMENT, &[protocol::ICMPV6, 0, 0, 1, 0, 0, 0, 9, 128, 0]);
+        let ping = v6(
+            protocol::FRAGMENT,
+            &[protocol::ICMPV6, 0, 0, 1, 0, 0, 0, 9, 128, 0],
+        );
         assert!(parameter_problem(&ping, checked(&ping).unwrap_err()).is_some());
         // A big packet is quoted up to the minimum MTU.
         let mut big = chained(43, &[&[17, 0, 250, 1, 0, 0, 0, 0]]);
@@ -1780,29 +2159,82 @@ mod tests {
 
     #[test]
     fn checksums_match_rfc_1071_at_every_length() {
-        let data: Vec<u8> = (0..2000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let data: Vec<u8> = (0..2000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
         for len in 0..data.len() {
-            assert_eq!(checksum(&data[..len]), reference_checksum(&data[..len]), "{len} bytes");
+            assert_eq!(
+                checksum(&data[..len]),
+                reference_checksum(&data[..len]),
+                "{len} bytes"
+            );
         }
-        assert_eq!(checksum(&[0xff; 65_536]), reference_checksum(&[0xff; 65_536]));
+        assert_eq!(
+            checksum(&[0xff; 65_536]),
+            reference_checksum(&[0xff; 65_536])
+        );
         // A pseudo-header is the addresses, the protocol and the length.
-        let (s, d): (Ipv4Addr, Ipv4Addr) = ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
+        let (s, d): (Ipv4Addr, Ipv4Addr) =
+            ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
         let udp = [0, 1, 0, 2, 0, 9, 0, 0, 0xab];
         let pseudo = [&s.octets()[..], &d.octets(), &[0, 17, 0, 9], &udp].concat();
-        assert_eq!(transport_checksum(s.into(), d.into(), protocol::UDP, &udp), reference_checksum(&pseudo));
-        assert_eq!(transport_checksum(s.into(), DST.into(), protocol::UDP, &udp), 1);
+        assert_eq!(
+            transport_checksum(s.into(), d.into(), protocol::UDP, &udp),
+            reference_checksum(&pseudo)
+        );
+        assert_eq!(
+            transport_checksum(s.into(), DST.into(), protocol::UDP, &udp),
+            1
+        );
     }
 
     #[test]
     fn built_packets_read_back() {
         let (s, d): (IpAddr, IpAddr) = ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
-        let p = packet_with(s, d, protocol::UDP, Fields { ttl: 9, tos: 0x10, id: 7, dont_fragment: false }, &[1; 8]).0;
-        assert_eq!(&p[..12], &[0x45, 0x10, 0, 28, 0, 7, 0, 0, 9, 17, p[10], p[11]]);
+        let p = packet_with(
+            s,
+            d,
+            protocol::UDP,
+            Fields {
+                ttl: 9,
+                tos: 0x10,
+                id: 7,
+                dont_fragment: false,
+            },
+            &[1; 8],
+        )
+        .0;
+        assert_eq!(
+            &p[..12],
+            &[0x45, 0x10, 0, 28, 0, 7, 0, 0, 9, 17, p[10], p[11]]
+        );
         assert_eq!(checksum(&p[..20]), 0);
-        assert_eq!(Header::parse(&p), Some(Header { src: s, dst: d, protocol: protocol::UDP, payload: 20..28, fragment: None }));
-        let p = packet_with(SRC.into(), DST.into(), protocol::UDP, Fields { tos: 0xab, ..Fields::default() }, &[1; 8]).0;
+        assert_eq!(
+            Header::parse(&p),
+            Some(Header {
+                src: s,
+                dst: d,
+                protocol: protocol::UDP,
+                payload: 20..28,
+                fragment: None
+            })
+        );
+        let p = packet_with(
+            SRC.into(),
+            DST.into(),
+            protocol::UDP,
+            Fields {
+                tos: 0xab,
+                ..Fields::default()
+            },
+            &[1; 8],
+        )
+        .0;
         assert_eq!(&p[..8], &[0x6a, 0xb0, 0, 0, 0, 8, 17, 64]);
-        assert_eq!((source(&p), destination(&p)), (Some(SRC.into()), Some(DST.into())));
+        assert_eq!(
+            (source(&p), destination(&p)),
+            (Some(SRC.into()), Some(DST.into()))
+        );
         // A router hop lowers the TTL and keeps the header checksum right.
         let mut p = packet(s, d, protocol::UDP, &[]).0;
         assert_eq!(hop(&mut p), Hop::Forward);
@@ -1814,8 +2246,12 @@ mod tests {
 
     #[test]
     fn a_zero_checksum_means_none_only_over_ipv4() {
-        let (v4a, v4b): (IpAddr, IpAddr) = ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
-        let (v6a, v6b): (IpAddr, IpAddr) = ("2001:db8::2".parse().unwrap(), "2001:db8::1".parse().unwrap());
+        let (v4a, v4b): (IpAddr, IpAddr) =
+            ("10.0.0.2".parse().unwrap(), "10.0.0.1".parse().unwrap());
+        let (v6a, v6b): (IpAddr, IpAddr) = (
+            "2001:db8::2".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+        );
         let mut u = vec![0, 1, 0, 2, 0, 10, 0, 0, 0xab, 0xcd];
         assert!(udp_checksum_ok(v4a, v4b, &u));
         assert!(!udp_checksum_ok(v6a, v6b, &u));

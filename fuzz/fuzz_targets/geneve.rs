@@ -3,7 +3,11 @@
 #![no_main]
 
 use fictionet::stdlib::geneve::{GeneveOption, Header, Packet};
-use fictionet::stdlib::{codec::{Wire, Collect}, test_support::contract, geneve};
+use fictionet::stdlib::{
+    codec::{Collect, Wire},
+    geneve,
+    test_support::contract,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// A packet built from any field values, valid or not. Each option takes
@@ -14,7 +18,9 @@ fn packet_from(data: &[u8]) -> Option<Packet> {
     let mut options = Vec::new();
     // At most 70 options: enough to pass the 63 a header holds.
     while options.len() < 70 {
-        let Some((h, tail)) = rest.split_first_chunk::<4>() else { break };
+        let Some((h, tail)) = rest.split_first_chunk::<4>() else {
+            break;
+        };
         let n = usize::from(h[3]).min(tail.len());
         let (body, after) = tail.split_at(n);
         options.push(GeneveOption {
@@ -31,11 +37,18 @@ fn packet_from(data: &[u8]) -> Option<Packet> {
         vni: u32::from_be_bytes([fixed[3], fixed[4], fixed[5], fixed[6]]),
         options,
     };
-    Some(Packet { header, payload: rest.to_vec() })
+    Some(Packet {
+        header,
+        payload: rest.to_vec(),
+    })
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(|| Collect::<geneve::Packet>::new(geneve::MAX_DATAGRAM), data, 2 * (geneve::MAX_DATAGRAM + 1));
+    contract::check_decode_with_alloc_limit(
+        || Collect::<geneve::Packet>::new(geneve::MAX_DATAGRAM),
+        data,
+        2 * (geneve::MAX_DATAGRAM + 1),
+    );
     contract::check_wire::<geneve::Packet>(data);
     contract::check_wire::<Header>(data);
 
@@ -53,7 +66,10 @@ fuzz_target!(|data: &[u8]| {
         // options or with every option kept.
         let reply = p.reply(payload.to_vec());
         assert!(Packet::parse(&reply.to_bytes().unwrap()).is_ok());
-        let echo = Packet { header: p.header.clone(), payload: payload.to_vec() };
+        let echo = Packet {
+            header: p.header.clone(),
+            payload: payload.to_vec(),
+        };
         assert_eq!(Packet::parse(&echo.to_bytes().unwrap()), Ok(echo));
     }
     // Any bytes as the start of a header on their own.
@@ -71,7 +87,10 @@ fuzz_target!(|data: &[u8]| {
         }
         let mut out = vec![0xee];
         match p.header.write(&mut out) {
-            Ok(()) => assert_eq!(Header::parse_prefix(&out[1..]), Ok(Some((p.header.clone(), out.len() - 1)))),
+            Ok(()) => assert_eq!(
+                Header::parse_prefix(&out[1..]),
+                Ok(Some((p.header.clone(), out.len() - 1)))
+            ),
             Err(_) => assert_eq!(out, [0xee]),
         }
     }

@@ -1,5 +1,5 @@
-use fictionet::stdlib::codec::Frames;
 use fictionet::observe::{Decoded, KeyLine, Layer, Observed, Place, Placement, Present, Protocol};
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Step};
 use fictionet::stdlib::http1;
 use std::collections::VecDeque;
@@ -107,7 +107,7 @@ macro_rules! display_presenter {
 
 /// Modbus/TCP capture frames. Framing is provided by the stdlib decoder.
 pub struct Modbus {
-    frames: Frames::<fictionet::stdlib::modbus::Frame>,
+    frames: Frames<fictionet::stdlib::modbus::Frame>,
     request: bool,
 }
 impl Modbus {
@@ -696,7 +696,8 @@ fn dns_display(msg: &[u8]) -> Display {
 
 fn dhcp_display(bytes: &[u8]) -> Display {
     let mut packet = Decoded::default();
-    let Ok(m) = <fictionet::stdlib::dhcp::Message as fictionet::stdlib::codec::Wire>::parse(bytes) else {
+    let Ok(m) = <fictionet::stdlib::dhcp::Message as fictionet::stdlib::codec::Wire>::parse(bytes)
+    else {
         return Display::from_packet(packet, "DHCP message");
     };
     let d = &mut packet;
@@ -955,12 +956,24 @@ fn read_head(head: &[u8], methods: &mut Methods) -> Option<(String, &'static str
     if head.starts_with(b"HTTP/") {
         let (r, _) = http1::ResponseHead::parse_lenient(head).ok().flatten()?;
         let code = r.status;
-        let line = format!("{} {code} {}", r.version.as_str(), String::from_utf8_lossy(&r.reason));
-        let method = if (100..200).contains(&code) { None } else { methods.0.pop_front() };
+        let line = format!(
+            "{} {code} {}",
+            r.version.as_str(),
+            String::from_utf8_lossy(&r.reason)
+        );
+        let method = if (100..200).contains(&code) {
+            None
+        } else {
+            methods.0.pop_front()
+        };
         let body = match method {
             Some(Method::Connect) if (200..300).contains(&code) => Http1State::Tunnel,
             Some(Method::Head) => Http1State::Head,
-            _ => body_kind(&r.headers, (100..200).contains(&code) || code == 204 || code == 304, true),
+            _ => body_kind(
+                &r.headers,
+                (100..200).contains(&code) || code == 204 || code == 304,
+                true,
+            ),
         };
         Some((line, "response", body))
     } else {
@@ -975,7 +988,10 @@ fn read_head(head: &[u8], methods: &mut Methods) -> Option<(String, &'static str
 fn preview(b: &[u8]) -> Option<String> {
     let cut = &b[..b.len().min(160)];
     let text = std::str::from_utf8(cut).ok()?;
-    if text.chars().all(|c| !c.is_control() || c == '\n' || c == '\r' || c == '\t') {
+    if text
+        .chars()
+        .all(|c| !c.is_control() || c == '\n' || c == '\r' || c == '\t')
+    {
         let mut t = text.replace("\r\n", "\\r\\n").replace('\n', "\\n");
         if b.len() > cut.len() {
             t.push('…');

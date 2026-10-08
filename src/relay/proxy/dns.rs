@@ -32,7 +32,9 @@ pub fn normalize(host: &str) -> Option<String> {
     let ok = host.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
-            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     });
     ok.then_some(host)
 }
@@ -42,7 +44,10 @@ pub fn query(name: &str, id: u16) -> Option<Vec<u8>> {
     let mut m = Message::query();
     m.metadata.id = id;
     m.metadata.recursion_desired = true;
-    m.add_query(Query::query(Name::from_ascii(format!("{name}.")).ok()?, RecordType::A));
+    m.add_query(Query::query(
+        Name::from_ascii(format!("{name}.")).ok()?,
+        RecordType::A,
+    ));
     m.to_vec().ok()
 }
 
@@ -109,7 +114,16 @@ mod tests {
     fn names_are_checked_and_lowercased() {
         assert_eq!(normalize("Example.TEST.").as_deref(), Some("example.test"));
         assert_eq!(normalize("a_b-c.test").as_deref(), Some("a_b-c.test"));
-        for bad in ["", ".", "a..b", "a b", "a/b", "ex\u{e4}mple.test", &"a".repeat(64), &"a.".repeat(128)] {
+        for bad in [
+            "",
+            ".",
+            "a..b",
+            "a b",
+            "a/b",
+            "ex\u{e4}mple.test",
+            &"a".repeat(64),
+            &"a.".repeat(128),
+        ] {
             assert_eq!(normalize(bad), None, "{bad:?}");
         }
     }
@@ -119,9 +133,16 @@ mod tests {
         let q = query("example.test", 7).unwrap();
         let r = reply(&q, |r| {
             let name = Name::from_ascii("example.test.").unwrap();
-            r.answers.push(Record::from_rdata(name, 300, RData::A(A(Ipv4Addr::new(203, 0, 113, 10)))));
+            r.answers.push(Record::from_rdata(
+                name,
+                300,
+                RData::A(A(Ipv4Addr::new(203, 0, 113, 10))),
+            ));
         });
-        assert_eq!(answer(&r, server(), server(), "example.test", 7), Some(Ok((Ipv4Addr::new(203, 0, 113, 10), 60))));
+        assert_eq!(
+            answer(&r, server(), server(), "example.test", 7),
+            Some(Ok((Ipv4Addr::new(203, 0, 113, 10), 60)))
+        );
     }
 
     #[test]
@@ -130,21 +151,41 @@ mod tests {
         let r = reply(&q, |r| {
             let www = Name::from_ascii("www.example.test.").unwrap();
             let target = Name::from_ascii("example.test.").unwrap();
-            r.answers.push(Record::from_rdata(www, 30, RData::CNAME(CNAME(target.clone()))));
-            r.answers.push(Record::from_rdata(target, 20, RData::A(A(Ipv4Addr::new(203, 0, 113, 11)))));
+            r.answers.push(Record::from_rdata(
+                www,
+                30,
+                RData::CNAME(CNAME(target.clone())),
+            ));
+            r.answers.push(Record::from_rdata(
+                target,
+                20,
+                RData::A(A(Ipv4Addr::new(203, 0, 113, 11))),
+            ));
         });
-        assert_eq!(answer(&r, server(), server(), "www.example.test", 9), Some(Ok((Ipv4Addr::new(203, 0, 113, 11), 20))));
+        assert_eq!(
+            answer(&r, server(), server(), "www.example.test", 9),
+            Some(Ok((Ipv4Addr::new(203, 0, 113, 11), 20)))
+        );
     }
 
     #[test]
     fn nxdomain_nodata_and_servfail() {
         let q = query("nope.test", 1).unwrap();
         let nx = reply(&q, |r| r.metadata.response_code = ResponseCode::NXDomain);
-        assert_eq!(answer(&nx, server(), server(), "nope.test", 1), Some(Err(Lookup::NoSuchName)));
+        assert_eq!(
+            answer(&nx, server(), server(), "nope.test", 1),
+            Some(Err(Lookup::NoSuchName))
+        );
         let nodata = reply(&q, |_| {});
-        assert_eq!(answer(&nodata, server(), server(), "nope.test", 1), Some(Err(Lookup::NoSuchName)));
+        assert_eq!(
+            answer(&nodata, server(), server(), "nope.test", 1),
+            Some(Err(Lookup::NoSuchName))
+        );
         let fail = reply(&q, |r| r.metadata.response_code = ResponseCode::ServFail);
-        assert!(matches!(answer(&fail, server(), server(), "nope.test", 1), Some(Err(Lookup::Failed(_)))));
+        assert!(matches!(
+            answer(&fail, server(), server(), "nope.test", 1),
+            Some(Err(Lookup::Failed(_)))
+        ));
     }
 
     #[test]
@@ -152,7 +193,16 @@ mod tests {
         let q = query("example.test", 5).unwrap();
         let good = reply(&q, |_| {});
         // From another address or port.
-        assert_eq!(answer(&good, "10.0.0.9:53".parse().unwrap(), server(), "example.test", 5), None);
+        assert_eq!(
+            answer(
+                &good,
+                "10.0.0.9:53".parse().unwrap(),
+                server(),
+                "example.test",
+                5
+            ),
+            None
+        );
         // Another ID.
         assert_eq!(answer(&good, server(), server(), "example.test", 6), None);
         // Another question.
@@ -160,7 +210,10 @@ mod tests {
         // The query itself, echoed: not a response.
         assert_eq!(answer(&q, server(), server(), "example.test", 5), None);
         // Not DNS.
-        assert_eq!(answer(b"hello", server(), server(), "example.test", 5), None);
+        assert_eq!(
+            answer(b"hello", server(), server(), "example.test", 5),
+            None
+        );
         // The question in another case is the same question.
         let upper = reply(&query("EXAMPLE.test", 5).unwrap(), |_| {});
         assert!(answer(&upper, server(), server(), "example.test", 5).is_some());

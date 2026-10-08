@@ -347,7 +347,9 @@ where
                         &self.place,
                         packet,
                     );
-                }) else { break };
+                }) else {
+                    break;
+                };
                 if let Err(error) = result {
                     D::error(&error, packet);
                 }
@@ -392,7 +394,9 @@ where
                     &self.place,
                     packet,
                 );
-            }) else { break };
+            }) else {
+                break;
+            };
             if let Err(error) = result {
                 D::error(&error, packet);
             }

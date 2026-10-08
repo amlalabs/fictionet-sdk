@@ -349,22 +349,34 @@ impl std::fmt::Display for Error {
             Error::UnknownCommand(b) => write!(f, "IAC followed by {b}, which is no command"),
             Error::StraySubnegotiationEnd => f.write_str("IAC SE with no subnegotiation open"),
             Error::SubnegotiationTooLong { option } => {
-                write!(f, "subnegotiation for option {option} longer than {MAX_SUBNEGOTIATION} bytes")
+                write!(
+                    f,
+                    "subnegotiation for option {option} longer than {MAX_SUBNEGOTIATION} bytes"
+                )
             }
             Error::SubnegotiationInterrupted { option } => {
-                write!(f, "subnegotiation for option {option} cut off by another command")
+                write!(
+                    f,
+                    "subnegotiation for option {option} cut off by another command"
+                )
             }
             Error::Truncated => f.write_str("stream ended inside a command"),
             Error::Empty => f.write_str("terminal type subnegotiation with no data"),
             Error::UnknownCode(c) => write!(f, "terminal type code {c}, not IS or SEND"),
             Error::TrailingAfterSend => f.write_str("bytes after terminal type SEND"),
             Error::NameLength(n) => {
-                write!(f, "terminal type name of {n} bytes, outside 1..={MAX_TERMINAL_TYPE}")
+                write!(
+                    f,
+                    "terminal type name of {n} bytes, outside 1..={MAX_TERMINAL_TYPE}"
+                )
             }
             Error::NameByte(b) => write!(f, "byte {b} in a terminal type name"),
             Error::WindowSizeLength(n) => write!(f, "window size of {n} bytes, not 4"),
             Error::DataTooLong(n) => {
-                write!(f, "subnegotiation data of {n} bytes, more than {MAX_SUBNEGOTIATION}")
+                write!(
+                    f,
+                    "subnegotiation data of {n} bytes, more than {MAX_SUBNEGOTIATION}"
+                )
             }
             Error::Incomplete => f.write_str("incomplete Telnet event"),
             Error::Trailing => f.write_str("bytes after Telnet event"),
@@ -424,7 +436,9 @@ impl Subnegotiation {
                             return Err(Error::NameByte(b));
                         }
                         // Every byte is ASCII, so this is one char per byte.
-                        Ok(Subnegotiation::TerminalTypeIs(rest.iter().map(|&b| char::from(b)).collect()))
+                        Ok(Subnegotiation::TerminalTypeIs(
+                            rest.iter().map(|&b| char::from(b)).collect(),
+                        ))
                     }
                     c => Err(Error::UnknownCode(c)),
                 }
@@ -437,14 +451,19 @@ impl Subnegotiation {
                 _ => Err(Error::WindowSizeLength(data.len())),
             },
             _ if data.len() > MAX_SUBNEGOTIATION => Err(Error::DataTooLong(data.len())),
-            _ => Ok(Subnegotiation::Other { option, data: data.to_vec() }),
+            _ => Ok(Subnegotiation::Other {
+                option,
+                data: data.to_vec(),
+            }),
         }
     }
 
     /// The option this subnegotiation is for.
     pub fn option(&self) -> u8 {
         match self {
-            Subnegotiation::TerminalTypeSend | Subnegotiation::TerminalTypeIs(_) => option::TERMINAL_TYPE,
+            Subnegotiation::TerminalTypeSend | Subnegotiation::TerminalTypeIs(_) => {
+                option::TERMINAL_TYPE
+            }
             Subnegotiation::WindowSize { .. } => option::NAWS,
             Subnegotiation::Other { option, .. } => *option,
         }
@@ -588,8 +607,8 @@ impl Events {
                 self.count += 1; // Bounded by data_limit.
                 continue;
             }
-            let command =
-                input.get(self.scanned) == Some(&IAC) && (input.get(self.scanned.saturating_add(1)).is_some() || eof);
+            let command = input.get(self.scanned) == Some(&IAC)
+                && (input.get(self.scanned.saturating_add(1)).is_some() || eof);
             if self.count > 0 && (command || eof && self.scanned == input.len()) {
                 return self.data_item(input);
             }
@@ -600,14 +619,21 @@ impl Events {
     fn subnegotiation(&mut self, input: &[u8], option: u8) -> Step<Event> {
         self.scanned = self.scanned.max(3);
         loop {
-            let Some(&byte) = input.get(self.scanned) else { return Step::Need };
+            let Some(&byte) = input.get(self.scanned) else {
+                return Step::Need;
+            };
             if byte == IAC {
-                let Some(&next) = input.get(self.scanned.saturating_add(1)) else { return Step::Need };
+                let Some(&next) = input.get(self.scanned.saturating_add(1)) else {
+                    return Step::Need;
+                };
                 if next != IAC {
                     let end = self.scanned;
                     self.reset_scan();
                     if next != cmd::SE {
-                        return Step::Item(Event::Error(Error::SubnegotiationInterrupted { option }), end);
+                        return Step::Item(
+                            Event::Error(Error::SubnegotiationInterrupted { option }),
+                            end,
+                        );
                     }
                     let raw = input.get(3..end).unwrap_or_default();
                     let mut data = Vec::new();
@@ -616,7 +642,10 @@ impl Events {
                         data.push(b);
                         at = at.saturating_add(if b == IAC { 2 } else { 1 });
                     }
-                    return Step::Item(Event::Subnegotiation { option, data }, end.saturating_add(2));
+                    return Step::Item(
+                        Event::Subnegotiation { option, data },
+                        end.saturating_add(2),
+                    );
                 }
             }
             self.scanned = self.scanned.saturating_add(if byte == IAC { 2 } else { 1 });
@@ -634,13 +663,21 @@ impl Events {
         let mut at = 0usize;
         while let Some(&byte) = input.get(at) {
             if byte == IAC {
-                let Some(&next) = input.get(at.saturating_add(1)) else { break };
+                let Some(&next) = input.get(at.saturating_add(1)) else {
+                    break;
+                };
                 if next != IAC {
                     self.dropping = None;
                     return Ok(if next == cmd::SE {
-                        Step::Item(Event::Error(Error::SubnegotiationTooLong { option }), at.saturating_add(2))
+                        Step::Item(
+                            Event::Error(Error::SubnegotiationTooLong { option }),
+                            at.saturating_add(2),
+                        )
                     } else {
-                        Step::Item(Event::Error(Error::SubnegotiationInterrupted { option }), at)
+                        Step::Item(
+                            Event::Error(Error::SubnegotiationInterrupted { option }),
+                            at,
+                        )
                     });
                 }
             }
@@ -684,7 +721,9 @@ impl codec::Decode for Events {
         if let Some(option) = self.dropping {
             return self.discard(input, eof, option);
         }
-        let Some(&first) = input.first() else { return Ok(Step::Need) };
+        let Some(&first) = input.first() else {
+            return Ok(Step::Need);
+        };
         if first != IAC && self.cr_nul {
             self.cr_nul = false;
             if first == NUL {
@@ -694,13 +733,19 @@ impl codec::Decode for Events {
         if first != IAC || input.get(1) == Some(&IAC) {
             return Ok(self.data(input, eof));
         }
-        let Some(&command) = input.get(1) else { return Ok(Step::Need) };
+        let Some(&command) = input.get(1) else {
+            return Ok(Step::Need);
+        };
         if let Some(verb) = Verb::from_byte(command) {
-            let Some(&option) = input.get(2) else { return Ok(Step::Need) };
+            let Some(&option) = input.get(2) else {
+                return Ok(Step::Need);
+            };
             return Ok(Step::Item(Event::Negotiation { verb, option }, 3));
         }
         if command == cmd::SB {
-            let Some(&option) = input.get(2) else { return Ok(Step::Need) };
+            let Some(&option) = input.get(2) else {
+                return Ok(Step::Need);
+            };
             return Ok(self.subnegotiation(input, option));
         }
         let event = if let Some(command) = Command::from_byte(command) {
@@ -732,7 +777,9 @@ impl Event {
 
     fn write_with(&self, out: &mut Vec<u8>, binary: bool) -> Result<(), Error> {
         let limit = match self {
-            Self::Data(data) if !data.is_empty() && data.len() <= MAX_DATA => data.len().checked_mul(2),
+            Self::Data(data) if !data.is_empty() && data.len() <= MAX_DATA => {
+                data.len().checked_mul(2)
+            }
             Self::Command(_) => Some(2),
             Self::Negotiation { .. } => Some(3),
             Self::Subnegotiation { data, .. } if data.len() <= MAX_SUBNEGOTIATION => {
@@ -754,7 +801,9 @@ impl Event {
                 }
             }
             Self::Command(command) => out.extend_from_slice(&[IAC, command.byte()]),
-            Self::Negotiation { verb, option } => out.extend_from_slice(&[IAC, verb.byte(), *option]),
+            Self::Negotiation { verb, option } => {
+                out.extend_from_slice(&[IAC, verb.byte(), *option])
+            }
             Self::Subnegotiation { option, data } => {
                 out.extend_from_slice(&[IAC, cmd::SB, *option]);
                 for &byte in data {
@@ -824,7 +873,10 @@ impl Subnegotiation {
         let data = match self {
             Self::TerminalTypeSend => vec![terminal_type::SEND],
             Self::TerminalTypeIs(name) => {
-                if name.is_empty() || name.len() > MAX_TERMINAL_TYPE || !name.as_bytes().iter().all(is_name_byte) {
+                if name.is_empty()
+                    || name.len() > MAX_TERMINAL_TYPE
+                    || !name.as_bytes().iter().all(is_name_byte)
+                {
                     return Err(Error::Unwritable);
                 }
                 let mut data = vec![terminal_type::IS];
@@ -837,7 +889,9 @@ impl Subnegotiation {
                 vec![w0, w1, h0, h1]
             }
             Self::Other { option, data } => {
-                if matches!(*option, option::TERMINAL_TYPE | option::NAWS) || data.len() > MAX_SUBNEGOTIATION {
+                if matches!(*option, option::TERMINAL_TYPE | option::NAWS)
+                    || data.len() > MAX_SUBNEGOTIATION
+                {
                     return Err(Error::Unwritable);
                 }
                 data.clone()
@@ -859,9 +913,7 @@ impl Wire for Subnegotiation {
     /// lengths, and oversized payloads.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         match Event::parse(bytes)? {
-            Event::Subnegotiation { option, data } => {
-                Self::parse_data(option, &data)
-            }
+            Event::Subnegotiation { option, data } => Self::parse_data(option, &data),
             _ => Err(Error::UnexpectedEvent),
         }
     }
@@ -1008,7 +1060,11 @@ impl Negotiation {
             Verb::Dont => (Side::Local, false, false),
         };
         let state = *self.slot(side, option);
-        let (next, reply) = if option == option::TIMING_MARK && side == Side::Remote && on && state == OptionState::No {
+        let (next, reply) = if option == option::TIMING_MARK
+            && side == Side::Remote
+            && on
+            && state == OptionState::No
+        {
             // A WILL TIMING-MARK this end did not ask for is ignored. A DO
             // in answer could make the peer send another WILL.
             (OptionState::No, Some(false))
@@ -1055,9 +1111,19 @@ impl Negotiation {
     /// Moves `side`'s `option` to `next`, and says what to send and what
     /// changed. `send` is whether to ask for the option on (`Some(true)`)
     /// or off (`Some(false)`).
-    fn update(&mut self, side: Side, option: u8, next: OptionState, send: Option<bool>) -> Reaction {
+    fn update(
+        &mut self,
+        side: Side,
+        option: u8,
+        next: OptionState,
+        send: Option<bool>,
+    ) -> Reaction {
         // A timing mark is never left on, so the next request is answered.
-        let next = if option == option::TIMING_MARK && next == OptionState::Yes { OptionState::No } else { next };
+        let next = if option == option::TIMING_MARK && next == OptionState::Yes {
+            OptionState::No
+        } else {
+            next
+        };
         let slot = self.slot(side, option);
         let was = enabled(side, *slot);
         *slot = next;
@@ -1069,8 +1135,15 @@ impl Negotiation {
             (Side::Remote, false) => Verb::Dont,
         };
         Reaction {
-            send: send.map(|on| Event::Negotiation { verb: verb(on), option }),
-            change: (was != now).then_some(Change { side, option, enabled: now }),
+            send: send.map(|on| Event::Negotiation {
+                verb: verb(on),
+                option,
+            }),
+            change: (was != now).then_some(Change {
+                side,
+                option,
+                enabled: now,
+            }),
         }
     }
 }
@@ -1143,13 +1216,11 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::harness::merged;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, finish, pump,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// Adjacent data events joined, so streams split in different places
@@ -1168,8 +1239,14 @@ mod tests {
     #[test]
     fn iac_escaping() {
         assert_eq!(decode(&[b'a', 255, 255, b'b']), [data(&[b'a', 255, b'b'])]);
-        assert_eq!(data(&[b'a', 255, b'b']).to_bytes().unwrap(), [b'a', 255, 255, b'b']);
-        assert_eq!(BinaryEvent(data(&[255, 255])).to_bytes().unwrap(), [255, 255, 255, 255]);
+        assert_eq!(
+            data(&[b'a', 255, b'b']).to_bytes().unwrap(),
+            [b'a', 255, 255, b'b']
+        );
+        assert_eq!(
+            BinaryEvent(data(&[255, 255])).to_bytes().unwrap(),
+            [255, 255, 255, 255]
+        );
     }
 
     // RFC 854: CR is followed by LF (new line) or NUL (a bare CR).
@@ -1178,7 +1255,10 @@ mod tests {
         assert_eq!(decode(b"a\r\nb"), [data(b"a\r\nb")]);
         assert_eq!(decode(b"a\r\0b"), [data(b"a\rb")]);
         assert_eq!(decode(b"a\rb"), [data(b"a\rb")]);
-        assert_eq!(decode(&[13, 255, 241]), [data(b"\r"), Event::Command(Command::Nop)]);
+        assert_eq!(
+            decode(&[13, 255, 241]),
+            [data(b"\r"), Event::Command(Command::Nop)]
+        );
         let mut stream = Stream::new(Events::new());
         assert_eq!(stream.push(b"x\r"), 2);
         assert_eq!(stream.next(), Some(Ok(data(b"x"))));
@@ -1203,7 +1283,10 @@ mod tests {
             match Command::from_byte(b) {
                 Some(c) => {
                     assert_eq!(c.byte(), b);
-                    assert_eq!(decode(&Event::Command(c).to_bytes().unwrap()), [Event::Command(c)]);
+                    assert_eq!(
+                        decode(&Event::Command(c).to_bytes().unwrap()),
+                        [Event::Command(c)]
+                    );
                 }
                 None => assert!(b < 236 || b == cmd::SE || b >= cmd::SB, "{b}"),
             }
@@ -1211,7 +1294,11 @@ mod tests {
         assert_eq!(Command::from_byte(cmd::SB), None);
         assert_eq!(
             decode(b"hi\xff\xf4there"),
-            [data(b"hi"), Event::Command(Command::InterruptProcess), data(b"there")]
+            [
+                data(b"hi"),
+                Event::Command(Command::InterruptProcess),
+                data(b"there")
+            ]
         );
     }
 
@@ -1225,7 +1312,10 @@ mod tests {
         for c in [Command::EndOfFile, Command::Suspend, Command::Abort] {
             assert_eq!(Command::from_byte(c.byte()), Some(c));
         }
-        assert_eq!(decode(&[255, 235]), [Event::Error(Error::UnknownCommand(235))]);
+        assert_eq!(
+            decode(&[255, 235]),
+            [Event::Error(Error::UnknownCommand(235))]
+        );
     }
 
     // A CR read outside binary mode drops its NUL, even if binary mode is
@@ -1261,7 +1351,10 @@ mod tests {
             (31, &[0, 80, 0, 24, 9]),
             (24, b"\0VT100"),
         ] {
-            let sub = Subnegotiation::Other { option, data: data.to_vec() };
+            let sub = Subnegotiation::Other {
+                option,
+                data: data.to_vec(),
+            };
             let mut out = vec![7];
             assert_eq!(sub.write(&mut out), Err(Error::Unwritable));
             assert_eq!(out, [7]);
@@ -1324,9 +1417,17 @@ mod tests {
     fn terminal_type_example() {
         let send = [255, 250, 24, 1, 255, 240];
         assert_eq!(Subnegotiation::TerminalTypeSend.to_bytes().unwrap(), send);
-        assert_eq!(decode(&send), [Event::Subnegotiation { option: 24, data: vec![1] }]);
+        assert_eq!(
+            decode(&send),
+            [Event::Subnegotiation {
+                option: 24,
+                data: vec![1]
+            }]
+        );
         let is = b"\xff\xfa\x18\x00DEC-VT52\xff\xf0";
-        let [Event::Subnegotiation { option, data }] = &decode(is)[..] else { panic!() };
+        let [Event::Subnegotiation { option, data }] = &decode(is)[..] else {
+            panic!()
+        };
         let sub = Subnegotiation::parse_data(*option, data).unwrap();
         assert_eq!(sub, Subnegotiation::TerminalTypeIs("DEC-VT52".to_string()));
         assert_eq!(sub.to_bytes().unwrap(), is);
@@ -1336,12 +1437,31 @@ mod tests {
     #[test]
     fn window_size_example() {
         let bytes = [255, 250, 31, 0, 80, 0, 24, 255, 240];
-        assert_eq!(Subnegotiation::WindowSize { width: 80, height: 24 }.to_bytes().unwrap(), bytes);
-        assert_eq!(decode(&bytes), [Event::Subnegotiation { option: 31, data: vec![0, 80, 0, 24] }]);
-        let wide = Subnegotiation::WindowSize { width: 255, height: 0xff00 };
+        assert_eq!(
+            Subnegotiation::WindowSize {
+                width: 80,
+                height: 24
+            }
+            .to_bytes()
+            .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            decode(&bytes),
+            [Event::Subnegotiation {
+                option: 31,
+                data: vec![0, 80, 0, 24]
+            }]
+        );
+        let wide = Subnegotiation::WindowSize {
+            width: 255,
+            height: 0xff00,
+        };
         let bytes = wide.to_bytes().unwrap();
         assert_eq!(bytes, [255, 250, 31, 0, 255, 255, 255, 255, 0, 255, 240]);
-        let [Event::Subnegotiation { option, data }] = &decode(&bytes)[..] else { panic!() };
+        let [Event::Subnegotiation { option, data }] = &decode(&bytes)[..] else {
+            panic!()
+        };
         assert_eq!(Subnegotiation::parse_data(*option, data), Ok(wide));
     }
 
@@ -1351,7 +1471,10 @@ mod tests {
         let tt = option::TERMINAL_TYPE;
         assert_eq!(Subnegotiation::parse_data(tt, &[]), Err(Empty));
         assert_eq!(Subnegotiation::parse_data(tt, &[2]), Err(UnknownCode(2)));
-        assert_eq!(Subnegotiation::parse_data(tt, &[1, 0]), Err(TrailingAfterSend));
+        assert_eq!(
+            Subnegotiation::parse_data(tt, &[1, 0]),
+            Err(TrailingAfterSend)
+        );
         assert_eq!(Subnegotiation::parse_data(tt, &[0]), Err(NameLength(0)));
         assert_eq!(
             Subnegotiation::parse_data(tt, &[b'A'; 42][..]).map(|_| ()),
@@ -1361,8 +1484,14 @@ mod tests {
         long.extend_from_slice(&[b'A'; 41]);
         assert_eq!(Subnegotiation::parse_data(tt, &long), Err(NameLength(41)));
         assert!(Subnegotiation::parse_data(tt, &long[..41]).is_ok());
-        assert_eq!(Subnegotiation::parse_data(tt, b"\0VT\t100"), Err(NameByte(b'\t')));
-        assert_eq!(Subnegotiation::parse_data(tt, b"\0VT\xc3\xa9"), Err(NameByte(0xc3)));
+        assert_eq!(
+            Subnegotiation::parse_data(tt, b"\0VT\t100"),
+            Err(NameByte(b'\t'))
+        );
+        assert_eq!(
+            Subnegotiation::parse_data(tt, b"\0VT\xc3\xa9"),
+            Err(NameByte(0xc3))
+        );
         assert_eq!(
             Subnegotiation::parse_data(option::NAWS, &[0, 80, 0]),
             Err(WindowSizeLength(3))
@@ -1373,10 +1502,20 @@ mod tests {
         );
         assert_eq!(
             Subnegotiation::parse_data(option::LINEMODE, &[1, 2]),
-            Ok(Subnegotiation::Other { option: option::LINEMODE, data: vec![1, 2] })
+            Ok(Subnegotiation::Other {
+                option: option::LINEMODE,
+                data: vec![1, 2]
+            })
         );
-        for e in [Empty, UnknownCode(2), TrailingAfterSend, NameLength(0), NameByte(1), WindowSizeLength(3), DataTooLong(1025)]
-        {
+        for e in [
+            Empty,
+            UnknownCode(2),
+            TrailingAfterSend,
+            NameLength(0),
+            NameByte(1),
+            WindowSizeLength(3),
+            DataTooLong(1025),
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1390,7 +1529,10 @@ mod tests {
         }
         let sub = Subnegotiation::TerminalTypeIs("MTTS 137".into());
         assert_eq!(Subnegotiation::parse(&sub.to_bytes().unwrap()), Ok(sub));
-        let sub = Subnegotiation::Other { option: 99, data: vec![IAC; 5000] };
+        let sub = Subnegotiation::Other {
+            option: 99,
+            data: vec![IAC; 5000],
+        };
         assert_eq!(sub.to_bytes(), Err(Error::Unwritable));
         assert_eq!(
             Event::Error(Error::Truncated).to_bytes(),
@@ -1401,40 +1543,86 @@ mod tests {
     #[test]
     fn decode_errors() {
         use Error::*;
-        assert_eq!(decode(&[b'a', 255, 7, b'b']), [data(b"a"), Event::Error(UnknownCommand(7)), data(b"b")]);
+        assert_eq!(
+            decode(&[b'a', 255, 7, b'b']),
+            [data(b"a"), Event::Error(UnknownCommand(7)), data(b"b")]
+        );
         assert_eq!(decode(&[255, 240]), [Event::Error(StraySubnegotiationEnd)]);
         // Too long: dropped, and the stream goes on.
         let mut long = vec![255, 250, 99];
         long.extend(std::iter::repeat_n(b'x', MAX_SUBNEGOTIATION + 1));
         long.extend_from_slice(&[255, 240, b'k']);
-        assert_eq!(decode(&long), [Event::Error(SubnegotiationTooLong { option: 99 }), data(b"k")]);
+        assert_eq!(
+            decode(&long),
+            [
+                Event::Error(SubnegotiationTooLong { option: 99 }),
+                data(b"k")
+            ]
+        );
         // Exactly the limit is fine.
         let mut fits = vec![255, 250, 99];
         fits.extend(std::iter::repeat_n(b'x', MAX_SUBNEGOTIATION));
         fits.extend_from_slice(&[255, 240]);
-        assert!(matches!(&decode(&fits)[..], [Event::Subnegotiation { option: 99, .. }]));
+        assert!(matches!(
+            &decode(&fits)[..],
+            [Event::Subnegotiation { option: 99, .. }]
+        ));
         // Cut off by another command, which is then read.
         assert_eq!(
             decode(&[255, 250, 24, 1, 255, 241, b'z']),
-            [Event::Error(SubnegotiationInterrupted { option: 24 }), Event::Command(Command::Nop), data(b"z")]
+            [
+                Event::Error(SubnegotiationInterrupted { option: 24 }),
+                Event::Command(Command::Nop),
+                data(b"z")
+            ]
         );
         assert_eq!(
             decode(&[255, 250, 24, 1, 255, 253, 1]),
-            [Event::Error(SubnegotiationInterrupted { option: 24 }), Event::Negotiation { verb: Verb::Do, option: 1 }]
+            [
+                Event::Error(SubnegotiationInterrupted { option: 24 }),
+                Event::Negotiation {
+                    verb: Verb::Do,
+                    option: 1
+                }
+            ]
         );
         // A new subnegotiation can cut off the old one.
         assert_eq!(
             decode(&[255, 250, 24, 1, 255, 250, 31, 0, 1, 0, 2, 255, 240]),
             [
                 Event::Error(SubnegotiationInterrupted { option: 24 }),
-                Event::Subnegotiation { option: 31, data: vec![0, 1, 0, 2] }
+                Event::Subnegotiation {
+                    option: 31,
+                    data: vec![0, 1, 0, 2]
+                }
             ]
         );
         // Truncated, at every point inside a command.
-        for bytes in [&[255][..], &[255, 251], &[255, 250], &[255, 250, 24], &[255, 250, 24, 1], &[255, 250, 24, 255]] {
-            assert_eq!(decode_all(Events::new, bytes), (vec![], Some(Fail::Truncated { unread: bytes.len() })), "{bytes:?}");
+        for bytes in [
+            &[255][..],
+            &[255, 251],
+            &[255, 250],
+            &[255, 250, 24],
+            &[255, 250, 24, 1],
+            &[255, 250, 24, 255],
+        ] {
+            assert_eq!(
+                decode_all(Events::new, bytes),
+                (
+                    vec![],
+                    Some(Fail::Truncated {
+                        unread: bytes.len()
+                    })
+                ),
+                "{bytes:?}"
+            );
         }
-        for e in [UnknownCommand(1), StraySubnegotiationEnd, SubnegotiationTooLong { option: 1 }, Truncated] {
+        for e in [
+            UnknownCommand(1),
+            StraySubnegotiationEnd,
+            SubnegotiationTooLong { option: 1 },
+            Truncated,
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1449,11 +1637,16 @@ mod tests {
         .write(&mut s)
         .unwrap();
         s.extend_from_slice(&[b'a', 255, 255, 13, 0, b'b']);
-        Subnegotiation::WindowSize { width: 255, height: 13 }
+        Subnegotiation::WindowSize {
+            width: 255,
+            height: 13,
+        }
+        .write(&mut s)
+        .unwrap();
+        Event::Command(Command::AreYouThere).write(&mut s).unwrap();
+        Subnegotiation::TerminalTypeIs("VT100".into())
             .write(&mut s)
             .unwrap();
-        Event::Command(Command::AreYouThere).write(&mut s).unwrap();
-        Subnegotiation::TerminalTypeIs("VT100".into()).write(&mut s).unwrap();
         s.extend_from_slice(&[255, 7, 255, 240, 13]);
         s
     }
@@ -1462,13 +1655,19 @@ mod tests {
     fn partitions_and_prefixes_obey_contract() {
         let bytes = sample();
         contract::check_decode_with_alloc_limit(Events::new, &bytes, 2 * MAX_EVENT_WIRE);
-        contract::check_decode_with_alloc_limit(|| Events::with_limit(MAX_DATA), &bytes, 2 * MAX_EVENT_WIRE);
+        contract::check_decode_with_alloc_limit(
+            || Events::with_limit(MAX_DATA),
+            &bytes,
+            2 * MAX_EVENT_WIRE,
+        );
         let whole = decode(&bytes);
         for cut in 0..=bytes.len() {
             let (part, _) = decode_all(|| Events::with_limit(MAX_DATA), &bytes[..cut]);
             let mut part = merged(part);
             if let Some(Event::Data(a)) = part.last() {
-                let Some(Event::Data(b)) = whole.get(part.len() - 1) else { panic!("prefix {cut}") };
+                let Some(Event::Data(b)) = whole.get(part.len() - 1) else {
+                    panic!("prefix {cut}")
+                };
                 assert!(b.starts_with(a), "prefix {cut}");
                 part.pop();
             }
@@ -1510,29 +1709,71 @@ mod tests {
         assert_eq!(received(Yes, true, false), (Yes, None));
         assert_eq!(received(WantNo { opposite: false }, true, true), (No, None));
         assert_eq!(received(WantNo { opposite: true }, true, true), (Yes, None));
-        assert_eq!(received(WantYes { opposite: false }, true, false), (Yes, None));
-        assert_eq!(received(WantYes { opposite: true }, true, true), (WantNo { opposite: false }, Some(false)));
+        assert_eq!(
+            received(WantYes { opposite: false }, true, false),
+            (Yes, None)
+        );
+        assert_eq!(
+            received(WantYes { opposite: true }, true, true),
+            (WantNo { opposite: false }, Some(false))
+        );
         // Received WONT (or DONT).
         assert_eq!(received(No, false, true), (No, None));
         assert_eq!(received(Yes, false, true), (No, Some(false)));
-        assert_eq!(received(WantNo { opposite: false }, false, true), (No, None));
-        assert_eq!(received(WantNo { opposite: true }, false, true), (WantYes { opposite: false }, Some(true)));
-        assert_eq!(received(WantYes { opposite: false }, false, true), (No, None));
-        assert_eq!(received(WantYes { opposite: true }, false, true), (No, None));
+        assert_eq!(
+            received(WantNo { opposite: false }, false, true),
+            (No, None)
+        );
+        assert_eq!(
+            received(WantNo { opposite: true }, false, true),
+            (WantYes { opposite: false }, Some(true))
+        );
+        assert_eq!(
+            received(WantYes { opposite: false }, false, true),
+            (No, None)
+        );
+        assert_eq!(
+            received(WantYes { opposite: true }, false, true),
+            (No, None)
+        );
         // Asked to enable.
         assert_eq!(asked(No, true), (WantYes { opposite: false }, Some(true)));
         assert_eq!(asked(Yes, true), (Yes, None));
-        assert_eq!(asked(WantNo { opposite: false }, true), (WantNo { opposite: true }, None));
-        assert_eq!(asked(WantNo { opposite: true }, true), (WantNo { opposite: true }, None));
-        assert_eq!(asked(WantYes { opposite: false }, true), (WantYes { opposite: false }, None));
-        assert_eq!(asked(WantYes { opposite: true }, true), (WantYes { opposite: false }, None));
+        assert_eq!(
+            asked(WantNo { opposite: false }, true),
+            (WantNo { opposite: true }, None)
+        );
+        assert_eq!(
+            asked(WantNo { opposite: true }, true),
+            (WantNo { opposite: true }, None)
+        );
+        assert_eq!(
+            asked(WantYes { opposite: false }, true),
+            (WantYes { opposite: false }, None)
+        );
+        assert_eq!(
+            asked(WantYes { opposite: true }, true),
+            (WantYes { opposite: false }, None)
+        );
         // Asked to disable.
         assert_eq!(asked(No, false), (No, None));
         assert_eq!(asked(Yes, false), (WantNo { opposite: false }, Some(false)));
-        assert_eq!(asked(WantNo { opposite: false }, false), (WantNo { opposite: false }, None));
-        assert_eq!(asked(WantNo { opposite: true }, false), (WantNo { opposite: false }, None));
-        assert_eq!(asked(WantYes { opposite: false }, false), (WantYes { opposite: true }, None));
-        assert_eq!(asked(WantYes { opposite: true }, false), (WantYes { opposite: true }, None));
+        assert_eq!(
+            asked(WantNo { opposite: false }, false),
+            (WantNo { opposite: false }, None)
+        );
+        assert_eq!(
+            asked(WantNo { opposite: true }, false),
+            (WantNo { opposite: false }, None)
+        );
+        assert_eq!(
+            asked(WantYes { opposite: false }, false),
+            (WantYes { opposite: true }, None)
+        );
+        assert_eq!(
+            asked(WantYes { opposite: true }, false),
+            (WantYes { opposite: true }, None)
+        );
     }
 
     #[test]
@@ -1559,14 +1800,40 @@ mod tests {
         // Allowed: answered once, then quiet.
         n.allow_local(1, true);
         let r = n.receive(Verb::Do, 1);
-        assert_eq!(r.send, Some(Event::Negotiation { verb: Verb::Will, option: 1 }));
-        assert_eq!(r.change, Some(Change { side: Side::Local, option: 1, enabled: true }));
+        assert_eq!(
+            r.send,
+            Some(Event::Negotiation {
+                verb: Verb::Will,
+                option: 1
+            })
+        );
+        assert_eq!(
+            r.change,
+            Some(Change {
+                side: Side::Local,
+                option: 1,
+                enabled: true
+            })
+        );
         assert!(n.local(1));
         assert_eq!(n.receive(Verb::Do, 1), Reaction::default());
         // Turned off by the peer: acknowledged.
         let r = n.receive(Verb::Dont, 1);
-        assert_eq!(r.send, Some(Event::Negotiation { verb: Verb::Wont, option: 1 }));
-        assert_eq!(r.change, Some(Change { side: Side::Local, option: 1, enabled: false }));
+        assert_eq!(
+            r.send,
+            Some(Event::Negotiation {
+                verb: Verb::Wont,
+                option: 1
+            })
+        );
+        assert_eq!(
+            r.change,
+            Some(Change {
+                side: Side::Local,
+                option: 1,
+                enabled: false
+            })
+        );
         assert_eq!(n.receive(Verb::Dont, 1), Reaction::default());
         // This end asks; the peer's answer completes it.
         assert_eq!(
@@ -1576,7 +1843,10 @@ mod tests {
                 option: 3
             })
         );
-        assert_eq!(n.state(Side::Remote, 3), OptionState::WantYes { opposite: false });
+        assert_eq!(
+            n.state(Side::Remote, 3),
+            OptionState::WantYes { opposite: false }
+        );
         assert_eq!(n.enable_remote(3), Reaction::default());
         assert_eq!(n.receive(Verb::Will, 3).send, None);
         assert!(n.remote(3));
@@ -1588,8 +1858,18 @@ mod tests {
             })
         );
         assert!(n.remote(3));
-        let off = Change { side: Side::Remote, option: 3, enabled: false };
-        assert_eq!(n.receive(Verb::Wont, 3), Reaction { send: None, change: Some(off) });
+        let off = Change {
+            side: Side::Remote,
+            option: 3,
+            enabled: false,
+        };
+        assert_eq!(
+            n.receive(Verb::Wont, 3),
+            Reaction {
+                send: None,
+                change: Some(off)
+            }
+        );
         assert!(!n.remote(3));
         // Asked on, then off before the answer: the answer is turned down.
         n.enable_local(5);
@@ -1601,7 +1881,10 @@ mod tests {
                 option: 5
             })
         );
-        assert_eq!(n.state(Side::Local, 5), OptionState::WantNo { opposite: false });
+        assert_eq!(
+            n.state(Side::Local, 5),
+            OptionState::WantNo { opposite: false }
+        );
         assert_eq!(n.receive(Verb::Dont, 5), Reaction::default());
         assert_eq!(n.state(Side::Local, 5), OptionState::No);
     }
@@ -1667,13 +1950,27 @@ mod tests {
         );
         assert!(n.remote(option::BINARY));
         let r = n.receive(Verb::Wont, option::BINARY);
-        assert_eq!(r.change, Some(Change { side: Side::Remote, option: 0, enabled: false }));
+        assert_eq!(
+            r.change,
+            Some(Change {
+                side: Side::Remote,
+                option: 0,
+                enabled: false
+            })
+        );
         assert!(!n.remote(option::BINARY));
         // This end stops doing a local option as soon as it says WONT.
         n.allow_local(option::BINARY, true);
         n.receive(Verb::Do, option::BINARY);
         let r = n.disable_local(option::BINARY);
-        assert_eq!(r.change, Some(Change { side: Side::Local, option: 0, enabled: false }));
+        assert_eq!(
+            r.change,
+            Some(Change {
+                side: Side::Local,
+                option: 0,
+                enabled: false
+            })
+        );
         assert!(!n.local(option::BINARY));
     }
 
@@ -1732,15 +2029,28 @@ mod tests {
     // which is CR NUL, a bare CR.
     #[test]
     fn cr_nul_around_a_command() {
-        let will_echo = Event::Negotiation { verb: Verb::Will, option: 1 };
-        assert_eq!(decode(&[13, 255, 251, 1, 0, b'a']), [data(b"\r"), will_echo.clone(), data(b"a")]);
+        let will_echo = Event::Negotiation {
+            verb: Verb::Will,
+            option: 1,
+        };
+        assert_eq!(
+            decode(&[13, 255, 251, 1, 0, b'a']),
+            [data(b"\r"), will_echo.clone(), data(b"a")]
+        );
         assert_eq!(
             decode(&[13, 255, 241, 255, 241, 0]),
-            [data(b"\r"), Event::Command(Command::Nop), Event::Command(Command::Nop)]
+            [
+                data(b"\r"),
+                Event::Command(Command::Nop),
+                Event::Command(Command::Nop)
+            ]
         );
         // A data byte in between ends the wait: here an escaped IAC.
         assert_eq!(decode(&[13, 255, 255, 0]), [data(&[13, 255, 0])]);
-        assert_eq!(decode(&[13, 255, 251, 1, 10]), [data(b"\r"), will_echo, data(b"\n")]);
+        assert_eq!(
+            decode(&[13, 255, 251, 1, 10]),
+            [data(b"\r"), will_echo, data(b"\n")]
+        );
     }
 
     // MTTS clients send names with a space, such as "MTTS 137"; RFC 1091
@@ -1750,7 +2060,9 @@ mod tests {
         let sub = Subnegotiation::parse_data(24, b"\0MTTS 137");
         assert_eq!(sub, Ok(Subnegotiation::TerminalTypeIs("MTTS 137".into())));
         assert_eq!(
-            Subnegotiation::TerminalTypeIs("MTTS 137".into()).to_event().unwrap(),
+            Subnegotiation::TerminalTypeIs("MTTS 137".into())
+                .to_event()
+                .unwrap(),
             Event::Subnegotiation {
                 option: 24,
                 data: b"\0MTTS 137".to_vec()
@@ -1804,7 +2116,9 @@ mod tests {
             let n = (rng.index(4)).min(wires[who].len());
             let chunk: Vec<u8> = wires[who].drain(..n).collect();
             pump(&mut decoders[1 - who], &chunk, |e| {
-                let Event::Negotiation { verb, option } = e else { panic!("{e:?}") };
+                let Event::Negotiation { verb, option } = e else {
+                    panic!("{e:?}")
+                };
                 let r = ends[1 - who].receive(verb, option);
                 if let Some(reply) = r.send {
                     reply.write(&mut wires[1 - who]).unwrap();
@@ -1822,7 +2136,9 @@ mod tests {
             for who in 0..2 {
                 let chunk = std::mem::take(&mut wires[who]);
                 pump(&mut decoders[1 - who], &chunk, |e| {
-                    let Event::Negotiation { verb, option } = e else { panic!() };
+                    let Event::Negotiation { verb, option } = e else {
+                        panic!()
+                    };
                     let r = ends[1 - who].receive(verb, option);
                     if let Some(reply) = r.send {
                         reply.write(&mut wires[1 - who]).unwrap();
@@ -1835,11 +2151,20 @@ mod tests {
         for o in 0..4u8 {
             // Once quiet, each side's view of each option agrees, and
             // nothing is left waiting.
-            assert_eq!(ends[0].state(Side::Local, o), ends[1].state(Side::Remote, o));
-            assert_eq!(ends[0].state(Side::Remote, o), ends[1].state(Side::Local, o));
+            assert_eq!(
+                ends[0].state(Side::Local, o),
+                ends[1].state(Side::Remote, o)
+            );
+            assert_eq!(
+                ends[0].state(Side::Remote, o),
+                ends[1].state(Side::Local, o)
+            );
             for end in &ends {
                 for side in [Side::Local, Side::Remote] {
-                    assert!(matches!(end.state(side, o), OptionState::Yes | OptionState::No));
+                    assert!(matches!(
+                        end.state(side, o),
+                        OptionState::Yes | OptionState::No
+                    ));
                 }
             }
         }
@@ -1863,7 +2188,10 @@ mod tests {
             contract::check_wire::<BinaryEvent>(&bytes);
             contract::check_wire::<Subnegotiation>(&bytes);
             let (events, _) = decode_all(make, &bytes);
-            let kept: Vec<_> = events.into_iter().filter(|event| !matches!(event, Event::Error(_))).collect();
+            let kept: Vec<_> = events
+                .into_iter()
+                .filter(|event| !matches!(event, Event::Error(_)))
+                .collect();
             let mut written = Vec::new();
             for event in &kept {
                 if binary {

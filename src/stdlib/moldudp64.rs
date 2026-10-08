@@ -57,8 +57,8 @@
 //! # Ok::<(), fictionet::stdlib::moldudp64::Error>(())
 //! ```
 
-use fictionet::stdlib::session::Action;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::session::Action;
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -520,7 +520,11 @@ impl Receiver {
         self.pending.map(|p| p.request)
     }
     /// Handles one downstream packet.
-    pub fn receive(&mut self, packet: &Downstream, now_ms: u64) -> Result<Vec<Action<Request, Event>>, Error> {
+    pub fn receive(
+        &mut self,
+        packet: &Downstream,
+        now_ms: u64,
+    ) -> Result<Vec<Action<Request, Event>>, Error> {
         let mut s = *self;
         s.advance(now_ms)?;
         let session = *s.session.get_or_insert(packet.session);
@@ -794,12 +798,12 @@ impl Retransmitter {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::check_atomic;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg,
+    use fictionet::stdlib::codec::{Fail, Lcg};
+    use fictionet::stdlib::test_support::check_atomic;
+    use fictionet::stdlib::test_support::contract::{
+        check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
     };
-    use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn session() -> Session {
@@ -1114,7 +1118,10 @@ mod tests {
             ]
         );
         assert_eq!(r.expected(), Some(3));
-        assert_eq!(check_atomic(&mut r, |r| r.tick(299), |r| format!("{r:?}")), Err(Error::Time));
+        assert_eq!(
+            check_atomic(&mut r, |r| r.tick(299), |r| format!("{r:?}")),
+            Err(Error::Time)
+        );
     }
 
     #[test]
@@ -1309,13 +1316,14 @@ mod tests {
             .unwrap();
             let mut got = Vec::new();
             let mut now = 0;
-            let deliver = |p: &Downstream, actions: &[Action<Request, Event>], got: &mut Vec<Vec<u8>>| {
-                for a in actions {
-                    if let Action::Event(Event::Deliver { skip, count, .. }) = a {
-                        got.extend_from_slice(&p.messages()[*skip..*skip + *count]);
+            let deliver =
+                |p: &Downstream, actions: &[Action<Request, Event>], got: &mut Vec<Vec<u8>>| {
+                    for a in actions {
+                        if let Action::Event(Event::Deliver { skip, count, .. }) = a {
+                            got.extend_from_slice(&p.messages()[*skip..*skip + *count]);
+                        }
                     }
-                }
-            };
+                };
             for i in 0..200u32 {
                 now += 10;
                 let seq = server.push(&i.to_be_bytes()).unwrap();

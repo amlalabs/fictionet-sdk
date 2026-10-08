@@ -64,7 +64,9 @@
 //! assert_eq!(NegotiationToken::parse(&bytes).unwrap(), reply);
 //! ```
 
-use fictionet::stdlib::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, StringKind, Tag, Writer};
+use fictionet::stdlib::asn1::{
+    self, Class, Element, Header, Length, Oid, Reader, Rules, StringKind, Tag, Writer,
+};
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 use std::fmt;
 
@@ -191,13 +193,41 @@ impl std::hash::Hash for Mech {
 /// Each named mechanism, its object identifier's contents, and its dotted
 /// form.
 static NAMED: [(Mech, &[u8], &str); 7] = [
-    (Mech::Spnego, &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02], "1.3.6.1.5.5.2"),
-    (Mech::Kerberos, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02], "1.2.840.113554.1.2.2"),
-    (Mech::MsKerberos, &[0x2a, 0x86, 0x48, 0x82, 0xf7, 0x12, 0x01, 0x02, 0x02], "1.2.840.48018.1.2.2"),
-    (Mech::KerberosUser2User, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02, 0x03], "1.2.840.113554.1.2.2.3"),
-    (Mech::Iakerb, &[0x2b, 0x06, 0x01, 0x05, 0x02, 0x05], "1.3.6.1.5.2.5"),
-    (Mech::Ntlm, &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a], "1.3.6.1.4.1.311.2.2.10"),
-    (Mech::NegoEx, &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x1e], "1.3.6.1.4.1.311.2.2.30"),
+    (
+        Mech::Spnego,
+        &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02],
+        "1.3.6.1.5.5.2",
+    ),
+    (
+        Mech::Kerberos,
+        &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02],
+        "1.2.840.113554.1.2.2",
+    ),
+    (
+        Mech::MsKerberos,
+        &[0x2a, 0x86, 0x48, 0x82, 0xf7, 0x12, 0x01, 0x02, 0x02],
+        "1.2.840.48018.1.2.2",
+    ),
+    (
+        Mech::KerberosUser2User,
+        &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02, 0x03],
+        "1.2.840.113554.1.2.2.3",
+    ),
+    (
+        Mech::Iakerb,
+        &[0x2b, 0x06, 0x01, 0x05, 0x02, 0x05],
+        "1.3.6.1.5.2.5",
+    ),
+    (
+        Mech::Ntlm,
+        &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a],
+        "1.3.6.1.4.1.311.2.2.10",
+    ),
+    (
+        Mech::NegoEx,
+        &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x1e],
+        "1.3.6.1.4.1.311.2.2.30",
+    ),
 ];
 
 impl Mech {
@@ -232,7 +262,10 @@ impl Mech {
     pub fn contents(&self) -> &[u8] {
         match self {
             Mech::Other(oid) => oid.as_bytes(),
-            named => named.named().and_then(|i| NAMED.get(i)).map_or(&[][..], |(_, c, _)| *c),
+            named => named
+                .named()
+                .and_then(|i| NAMED.get(i))
+                .map_or(&[][..], |(_, c, _)| *c),
         }
     }
 
@@ -252,7 +285,12 @@ impl fmt::Display for Mech {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Mech::Other(oid) => write!(f, "{oid}"),
-            named => f.write_str(named.named().and_then(|i| NAMED.get(i)).map_or("", |(_, _, s)| *s)),
+            named => f.write_str(
+                named
+                    .named()
+                    .and_then(|i| NAMED.get(i))
+                    .map_or("", |(_, _, s)| *s),
+            ),
         }
     }
 }
@@ -289,7 +327,10 @@ impl InitialContextToken {
         if matches!(token, NegotiationToken::Resp(_)) {
             return Err(Error::WrappedResp);
         }
-        let wrapper = Self { mech: Mech::Spnego, inner: token.to_bytes()? };
+        let wrapper = Self {
+            mech: Mech::Spnego,
+            inner: token.to_bytes()?,
+        };
         wrapper.encode()?;
         Ok(wrapper)
     }
@@ -314,12 +355,18 @@ impl InitialContextToken {
         }
         let mut r = Reader::new(&b[h.len..end], Rules::Ber);
         let oid = r.read_oid()?;
-        Ok(InitialContextToken { mech: Mech::from_oid(&oid), inner: r.remaining().to_vec() })
+        Ok(InitialContextToken {
+            mech: Mech::from_oid(&oid),
+            inner: r.remaining().to_vec(),
+        })
     }
 
     fn encode(&self) -> Result<Vec<u8>, Error> {
         let oid = self.mech.element();
-        let body = oid.len().checked_add(self.inner.len()).ok_or(Error::TooLong)?;
+        let body = oid
+            .len()
+            .checked_add(self.inner.len())
+            .ok_or(Error::TooLong)?;
         if body > MAX_TOKEN {
             return Err(Error::TooLong);
         }
@@ -516,7 +563,10 @@ impl NegotiationToken {
                 if t.mech_types.is_empty() && t.neg_hints.is_none() {
                     return Err(Error::MissingMechTypes);
                 }
-                if t.neg_hints.as_ref().is_some_and(|h| h.hint_address.is_some()) {
+                if t.neg_hints
+                    .as_ref()
+                    .is_some_and(|h| h.hint_address.is_some())
+                {
                     return Err(Error::HintAddress);
                 }
                 add(&t.mech_token);
@@ -569,7 +619,10 @@ fn parse_bare(b: &[u8]) -> Result<NegotiationToken, Error> {
 }
 
 /// The one element inside an explicit tag.
-fn explicit_one<'a, T>(e: &Element<'a>, f: impl FnOnce(&mut Reader<'a>) -> Result<T, asn1::Error>) -> Result<T, Error> {
+fn explicit_one<'a, T>(
+    e: &Element<'a>,
+    f: impl FnOnce(&mut Reader<'a>) -> Result<T, asn1::Error>,
+) -> Result<T, Error> {
     let mut r = e.reader()?;
     let v = f(&mut r)?;
     r.finish()?;
@@ -656,13 +709,16 @@ fn parse_init(seq: Reader<'_>) -> Result<NegTokenInit, Error> {
 
 /// Whether an explicit tag holds an OCTET STRING, in either form, first.
 fn holds_octet_string(e: &Element<'_>) -> bool {
-    e.reader().and_then(|r| r.peek()).is_ok_and(|x| x.tag().same_type(Tag::OCTET_STRING))
+    e.reader()
+        .and_then(|r| r.peek())
+        .is_ok_and(|x| x.tag().same_type(Tag::OCTET_STRING))
 }
 
 fn parse_hints(mut s: Reader<'_>) -> Result<NegHints, Error> {
     let mut h = NegHints::default();
     if let Some(e) = s.read_optional(Tag::context(0))? {
-        h.hint_name = Some(explicit_one(&e, |r| r.read_string_bytes(StringKind::General))?.into_owned());
+        h.hint_name =
+            Some(explicit_one(&e, |r| r.read_string_bytes(StringKind::General))?.into_owned());
     }
     if let Some(e) = s.read_optional(Tag::context(1))? {
         h.hint_address = Some(explicit_one(&e, |r| r.read_octet_string())?.into_owned());
@@ -855,7 +911,9 @@ impl Frames {
     /// Zero refuses every token. Oversized tokens are refused from
     /// their headers, before their contents arrive.
     pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.min(MAX_TOKEN) }
+        Self {
+            limit: limit.min(MAX_TOKEN),
+        }
     }
 
     /// The maximum token size, including its ASN.1 header.
@@ -889,12 +947,10 @@ impl Decode for Frames {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
     /// The hint name Windows and Samba send in a NegTokenInit2.
@@ -906,8 +962,8 @@ mod tests {
         let mut b = vec![
             0x60, 0x48, 0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02, // wrapper, SPNEGO
             0xa0, 0x3e, 0x30, 0x3c, // negTokenInit, SEQUENCE
-            0xa0, 0x0e, 0x30, 0x0c, 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a, 0xa3, 0x2a,
-            0x30, 0x28, 0xa0, 0x26, 0x1b, 0x24, // negHints, hintName
+            0xa0, 0x0e, 0x30, 0x0c, 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02,
+            0x02, 0x0a, 0xa3, 0x2a, 0x30, 0x28, 0xa0, 0x26, 0x1b, 0x24, // negHints, hintName
         ];
         b.extend_from_slice(HINT);
         b
@@ -938,14 +994,28 @@ mod tests {
                 mech_list_mic: Some(vec![9; 16]),
             }),
             NegotiationToken::Init(NegTokenInit {
-                mech_types: vec![Mech::Ntlm, Mech::Iakerb, Mech::KerberosUser2User, Mech::Spnego],
+                mech_types: vec![
+                    Mech::Ntlm,
+                    Mech::Iakerb,
+                    Mech::KerberosUser2User,
+                    Mech::Spnego,
+                ],
                 req_flags: None,
                 mech_token: None,
-                neg_hints: Some(NegHints { hint_name: Some(HINT.to_vec()), hint_address: None }),
+                neg_hints: Some(NegHints {
+                    hint_name: Some(HINT.to_vec()),
+                    hint_address: None,
+                }),
                 mech_list_mic: Some(vec![7; 3]),
             }),
-            NegotiationToken::Init(NegTokenInit { neg_hints: Some(NegHints::default()), ..NegTokenInit::default() }),
-            NegotiationToken::Init(NegTokenInit { mech_types: vec![Mech::Spnego], ..NegTokenInit::default() }),
+            NegotiationToken::Init(NegTokenInit {
+                neg_hints: Some(NegHints::default()),
+                ..NegTokenInit::default()
+            }),
+            NegotiationToken::Init(NegTokenInit {
+                mech_types: vec![Mech::Spnego],
+                ..NegTokenInit::default()
+            }),
             NegotiationToken::Resp(NegTokenResp::default()),
             NegotiationToken::Resp(NegTokenResp {
                 neg_state: Some(NegState::RequestMic),
@@ -958,24 +1028,47 @@ mod tests {
 
     #[test]
     fn review_encoders_validate_before_writing() {
-        assert_eq!(NegotiationToken::Init(NegTokenInit::default()).to_bytes(), Err(Error::MissingMechTypes));
-        let wrapped = InitialContextToken { mech: Mech::Spnego, inner: vec![RESP_TAG, 0] };
+        assert_eq!(
+            NegotiationToken::Init(NegTokenInit::default()).to_bytes(),
+            Err(Error::MissingMechTypes)
+        );
+        let wrapped = InitialContextToken {
+            mech: Mech::Spnego,
+            inner: vec![RESP_TAG, 0],
+        };
         assert_eq!(wrapped.to_bytes(), Err(Error::WrappedResp));
-        let huge = InitialContextToken { mech: Mech::Ntlm, inner: vec![0; MAX_TOKEN] };
+        let huge = InitialContextToken {
+            mech: Mech::Ntlm,
+            inner: vec![0; MAX_TOKEN],
+        };
         assert_eq!(huge.to_bytes(), Err(Error::TooLong));
         let named = Mech::Other("1.3.6.1.4.1.311.2.2.10".parse().unwrap());
-        let token = NegotiationToken::Resp(NegTokenResp { supported_mech: Some(named), ..Default::default() });
-        assert_eq!(NegotiationToken::parse(&token.to_bytes().unwrap()), Ok(token));
+        let token = NegotiationToken::Resp(NegTokenResp {
+            supported_mech: Some(named),
+            ..Default::default()
+        });
+        assert_eq!(
+            NegotiationToken::parse(&token.to_bytes().unwrap()),
+            Ok(token)
+        );
     }
 
     #[test]
     fn samba_negtokeninit2() {
         let b = samba_init2();
-        let NegotiationToken::Init(t) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        let NegotiationToken::Init(t) = NegotiationToken::parse(&b).unwrap() else {
+            panic!()
+        };
         assert_eq!(t.mech_types, [Mech::Ntlm]);
         assert_eq!(t.req_flags, None);
         assert_eq!(t.mech_token, None);
-        assert_eq!(t.neg_hints, Some(NegHints { hint_name: Some(HINT.to_vec()), hint_address: None }));
+        assert_eq!(
+            t.neg_hints,
+            Some(NegHints {
+                hint_name: Some(HINT.to_vec()),
+                hint_address: None
+            })
+        );
         assert_eq!(t.mech_list_mic, None);
         // Written back, byte for byte.
         assert_eq!(
@@ -1040,17 +1133,24 @@ mod tests {
         });
         let b = t.to_bytes().unwrap();
         // [0] { [0] { 1.2 } [1] { BIT STRING 2 unused, 84 } }
-        assert_eq!(b, init_of(&[MECH_1_2, &[0xa1, 0x04, 0x03, 0x02, 0x02, 0x84]]));
+        assert_eq!(
+            b,
+            init_of(&[MECH_1_2, &[0xa1, 0x04, 0x03, 0x02, 0x02, 0x84]])
+        );
         // A short bit string, with garbage in its unused bits, as BER allows.
         let short = init_of(&[MECH_1_2, &[0xa1, 0x04, 0x03, 0x02, 0x01, 0x63]]);
-        let NegotiationToken::Init(i) = NegotiationToken::parse(&short).unwrap() else { panic!() };
+        let NegotiationToken::Init(i) = NegotiationToken::parse(&short).unwrap() else {
+            panic!()
+        };
         let f = i.req_flags.unwrap();
         assert_eq!(f, ContextFlags(0x6200_0000));
         assert!(f.contains(ContextFlags::MUTUAL | ContextFlags::REPLAY | ContextFlags::INTEG));
         assert!(!f.contains(ContextFlags::DELEG));
         // Bits past the 32nd are dropped.
         let l = init_of(&[MECH_1_2, &[0xa1, 0x08, 0x03, 0x06, 0x00, 1, 2, 3, 4, 5]]);
-        let NegotiationToken::Init(i) = NegotiationToken::parse(&l).unwrap() else { panic!() };
+        let NegotiationToken::Init(i) = NegotiationToken::parse(&l).unwrap() else {
+            panic!()
+        };
         assert_eq!(i.req_flags, Some(ContextFlags(0x0102_0304)));
     }
 
@@ -1070,11 +1170,25 @@ mod tests {
         assert!(Mech::from_contents(&[]).is_err());
         // A long identifier needs a long-form length.
         let long = Mech::Other(
-            Oid::from_arcs(&[1, 2, 1 << 120, 1 << 120, 1 << 120, 1 << 120, 1 << 120, 1 << 120, 1 << 120, 1 << 120])
-                .unwrap(),
+            Oid::from_arcs(&[
+                1,
+                2,
+                1 << 120,
+                1 << 120,
+                1 << 120,
+                1 << 120,
+                1 << 120,
+                1 << 120,
+                1 << 120,
+                1 << 120,
+            ])
+            .unwrap(),
         );
         assert!(long.contents().len() >= 128);
-        let t = NegotiationToken::Resp(NegTokenResp { supported_mech: Some(long), ..NegTokenResp::default() });
+        let t = NegotiationToken::Resp(NegTokenResp {
+            supported_mech: Some(long),
+            ..NegTokenResp::default()
+        });
         assert_eq!(NegotiationToken::parse(&t.to_bytes().unwrap()).unwrap(), t);
     }
 
@@ -1092,56 +1206,97 @@ mod tests {
                 assert_eq!(token_len(&wrapped), Ok(Some(wrapped.len())));
             }
         }
-        let k = InitialContextToken { mech: Mech::Kerberos, inner: vec![1, 0, 0x6e, 0x00] };
-        assert_eq!(InitialContextToken::parse(&k.to_bytes().unwrap()).unwrap(), k);
-        let empty = InitialContextToken { mech: Mech::Ntlm, inner: Vec::new() };
-        assert_eq!(InitialContextToken::parse(&empty.to_bytes().unwrap()).unwrap(), empty);
+        let k = InitialContextToken {
+            mech: Mech::Kerberos,
+            inner: vec![1, 0, 0x6e, 0x00],
+        };
+        assert_eq!(
+            InitialContextToken::parse(&k.to_bytes().unwrap()).unwrap(),
+            k
+        );
+        let empty = InitialContextToken {
+            mech: Mech::Ntlm,
+            inner: Vec::new(),
+        };
+        assert_eq!(
+            InitialContextToken::parse(&empty.to_bytes().unwrap()).unwrap(),
+            empty
+        );
     }
 
     #[test]
     fn ber_forms_are_read() {
         // accept-completed with indefinite lengths and a long-form length.
-        let b = [0xa1, 0x80, 0x30, 0x80, 0xa0, 0x81, 0x03, 0x0a, 0x01, 0x00, 0, 0, 0, 0];
-        assert_eq!(NegotiationToken::parse(&b).unwrap(), NegotiationToken::parse(&ACCEPT_COMPLETED).unwrap());
+        let b = [
+            0xa1, 0x80, 0x30, 0x80, 0xa0, 0x81, 0x03, 0x0a, 0x01, 0x00, 0, 0, 0, 0,
+        ];
+        assert_eq!(
+            NegotiationToken::parse(&b).unwrap(),
+            NegotiationToken::parse(&ACCEPT_COMPLETED).unwrap()
+        );
         // A responseToken split into two segments.
-        let b = [0xa1, 0x0e, 0x30, 0x0c, 0xa2, 0x0a, 0x24, 0x08, 0x04, 0x02, 1, 2, 0x04, 0x02, 3, 4];
-        let NegotiationToken::Resp(r) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        let b = [
+            0xa1, 0x0e, 0x30, 0x0c, 0xa2, 0x0a, 0x24, 0x08, 0x04, 0x02, 1, 2, 0x04, 0x02, 3, 4,
+        ];
+        let NegotiationToken::Resp(r) = NegotiationToken::parse(&b).unwrap() else {
+            panic!()
+        };
         assert_eq!(r.response_token, Some(vec![1, 2, 3, 4]));
         // A wrapper with a long-form length that is not minimal.
         let samba = samba_init2();
         let mut w = vec![0x60, 0x82, 0x00, 0x48];
         w.extend_from_slice(&samba[2..]);
-        assert_eq!(NegotiationToken::parse(&w).unwrap(), NegotiationToken::parse(&samba).unwrap());
+        assert_eq!(
+            NegotiationToken::parse(&w).unwrap(),
+            NegotiationToken::parse(&samba).unwrap()
+        );
     }
 
     #[test]
     fn ber_values_are_read_and_written_as_der() {
         // reqFlags as a constructed bit string, and as an empty one.
         let b = init_of(&[MECH_1_2, &[0xa1, 0x06, 0x23, 0x04, 0x03, 0x02, 0x00, 0xff]]);
-        let NegotiationToken::Init(i) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        let NegotiationToken::Init(i) = NegotiationToken::parse(&b).unwrap() else {
+            panic!()
+        };
         assert_eq!(i.req_flags, Some(ContextFlags(0xff00_0000)));
         let b = init_of(&[MECH_1_2, &[0xa1, 0x03, 0x03, 0x01, 0x00]]);
         let t = NegotiationToken::parse(&b).unwrap();
-        let NegotiationToken::Init(i) = &t else { panic!() };
+        let NegotiationToken::Init(i) = &t else {
+            panic!()
+        };
         assert_eq!(i.req_flags, Some(ContextFlags(0)));
         assert_eq!(t.to_bytes().unwrap(), b);
         // Garbage in the unused bits is dropped when written.
         let b = init_of(&[MECH_1_2, &[0xa1, 0x04, 0x03, 0x02, 0x01, 0x63]]);
         let t = NegotiationToken::parse(&b).unwrap();
-        assert_eq!(t.to_bytes().unwrap(), init_of(&[MECH_1_2, &[0xa1, 0x04, 0x03, 0x02, 0x01, 0x62]]));
+        assert_eq!(
+            t.to_bytes().unwrap(),
+            init_of(&[MECH_1_2, &[0xa1, 0x04, 0x03, 0x02, 0x01, 0x62]])
+        );
         // A hint name in two OCTET STRING segments, as X.690 8.23.6 allows.
         let b = [
-            0xa0, 0x14, 0x30, 0x12, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x0c, 0x30, 0x0a, 0xa0, 0x08, 0x3b, 0x06, 0x04, 0x01,
-            b'a', 0x04, 0x01, b'b',
+            0xa0, 0x14, 0x30, 0x12, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x0c, 0x30, 0x0a, 0xa0, 0x08,
+            0x3b, 0x06, 0x04, 0x01, b'a', 0x04, 0x01, b'b',
         ];
         let t = NegotiationToken::parse(&b).unwrap();
-        let NegotiationToken::Init(i) = &t else { panic!() };
-        assert_eq!(i.neg_hints.as_ref().and_then(|h| h.hint_name.as_deref()), Some(&b"ab"[..]));
+        let NegotiationToken::Init(i) = &t else {
+            panic!()
+        };
+        assert_eq!(
+            i.neg_hints.as_ref().and_then(|h| h.hint_name.as_deref()),
+            Some(&b"ab"[..])
+        );
         assert_eq!(NegotiationToken::parse(&t.to_bytes().unwrap()).unwrap(), t);
         // An identifier with a padded arc is not read, so it is never
         // written back.
-        let b = [0xa0, 0x0a, 0x30, 0x08, 0xa0, 0x06, 0x30, 0x04, 0x06, 0x02, 0x80, 0x01];
-        assert_eq!(NegotiationToken::parse(&b), Err(Error::Asn1(asn1::Error::Oid)));
+        let b = [
+            0xa0, 0x0a, 0x30, 0x08, 0xa0, 0x06, 0x30, 0x04, 0x06, 0x02, 0x80, 0x01,
+        ];
+        assert_eq!(
+            NegotiationToken::parse(&b),
+            Err(Error::Asn1(asn1::Error::Oid))
+        );
         assert_eq!(
             InitialContextToken::parse(&[0x60, 0x04, 0x06, 0x02, 0x80, 0x01]),
             Err(Error::Asn1(asn1::Error::Oid))
@@ -1151,7 +1306,10 @@ mod tests {
     #[test]
     fn wrapped_resp_is_rejected() {
         let response = NegotiationToken::Resp(NegTokenResp::default());
-        assert_eq!(InitialContextToken::spnego(&response), Err(Error::WrappedResp));
+        assert_eq!(
+            InitialContextToken::spnego(&response),
+            Err(Error::WrappedResp)
+        );
         // RFC 4178 4.1: tokens after the first are never wrapped, and a
         // negTokenResp is never a first token.
         for inner in [
@@ -1204,24 +1362,41 @@ mod tests {
         // RFC 4178 4.2: unknown fields are ignored. With no [3], a [4]
         // that is not an OCTET STRING cannot be an Init2 mechListMIC.
         let b = init_of(&[MECH_1_2, &[0xa4, 0x03, 0x02, 0x01, 0x07]]);
-        let NegotiationToken::Init(i) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        let NegotiationToken::Init(i) = NegotiationToken::parse(&b).unwrap() else {
+            panic!()
+        };
         assert_eq!(i.mech_list_mic, None);
         let b = init_of(&[MECH_1_2, &[0x84, 0x00]]);
         assert!(NegotiationToken::parse(&b).is_ok());
         // After hints, [4] is the Init2 mechListMIC and must be one.
-        let b = [0xa0, 0x0f, 0x30, 0x0d, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x02, 0x30, 0x00, 0xa4, 0x03, 0x02, 0x01, 0x07];
-        assert!(matches!(NegotiationToken::parse(&b), Err(Error::Asn1(asn1::Error::Unexpected { .. }))));
+        let b = [
+            0xa0, 0x0f, 0x30, 0x0d, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x02, 0x30, 0x00, 0xa4, 0x03,
+            0x02, 0x01, 0x07,
+        ];
+        assert!(matches!(
+            NegotiationToken::parse(&b),
+            Err(Error::Asn1(asn1::Error::Unexpected { .. }))
+        ));
     }
 
     #[test]
     fn extensions_are_skipped() {
         // A NegTokenResp with a [5] field after the known ones.
-        let b = [0xa1, 0x0c, 0x30, 0x0a, 0xa0, 0x03, 0x0a, 0x01, 0x02, 0xa5, 0x03, 0x02, 0x01, 0x07];
-        let NegotiationToken::Resp(r) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        let b = [
+            0xa1, 0x0c, 0x30, 0x0a, 0xa0, 0x03, 0x0a, 0x01, 0x02, 0xa5, 0x03, 0x02, 0x01, 0x07,
+        ];
+        let NegotiationToken::Resp(r) = NegotiationToken::parse(&b).unwrap() else {
+            panic!()
+        };
         assert_eq!(r.neg_state, Some(NegState::Reject));
         // A NegTokenInit with a mechListMIC at [3] and an extension at [4].
-        let b = init_of(&[MECH_1_2, &[0xa3, 0x03, 0x04, 0x01, 0xaa, 0xa4, 0x03, 0x04, 0x01, 0xbb]]);
-        let NegotiationToken::Init(i) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        let b = init_of(&[
+            MECH_1_2,
+            &[0xa3, 0x03, 0x04, 0x01, 0xaa, 0xa4, 0x03, 0x04, 0x01, 0xbb],
+        ]);
+        let NegotiationToken::Init(i) = NegotiationToken::parse(&b).unwrap() else {
+            panic!()
+        };
         assert_eq!(i.mech_list_mic, Some(vec![0xaa]));
     }
 
@@ -1235,43 +1410,85 @@ mod tests {
         assert_eq!(p(&[0x80, 0x00]), Err(Error::Asn1(A::Primitive)));
         assert_eq!(p(&[0xa1, 0x00]), Err(Error::Asn1(A::Empty)));
         assert_eq!(p(&[0xa1, 0x03, 0x30, 0x00]), Err(Error::Asn1(A::Truncated)));
-        assert_eq!(p(&[0xa1, 0x02, 0x30, 0x00, 0x30, 0x00]), Err(Error::Asn1(A::Trailing)));
-        assert_eq!(p(&[0xa1, 0x04, 0x30, 0x00, 0x30, 0x00]), Err(Error::Asn1(A::Trailing)));
+        assert_eq!(
+            p(&[0xa1, 0x02, 0x30, 0x00, 0x30, 0x00]),
+            Err(Error::Asn1(A::Trailing))
+        );
+        assert_eq!(
+            p(&[0xa1, 0x04, 0x30, 0x00, 0x30, 0x00]),
+            Err(Error::Asn1(A::Trailing))
+        );
         // NegTokenInit without mechTypes.
         assert_eq!(p(&[0xa0, 0x02, 0x30, 0x00]), Err(Error::MissingMechTypes));
         // Fields out of order or repeated. One of another class is an
         // extension, skipped.
-        assert_eq!(p(&[0xa1, 0x0a, 0x30, 0x08, 0xa2, 0x02, 0x04, 0x00, 0xa0, 0x02, 0x04, 0x00]), Err(Error::Field));
-        assert_eq!(p(&[0xa1, 0x0a, 0x30, 0x08, 0xa2, 0x02, 0x04, 0x00, 0xa2, 0x02, 0x04, 0x00]), Err(Error::Field));
-        assert_eq!(p(&[0xa1, 0x04, 0x30, 0x02, 0x04, 0x00]), Ok(NegotiationToken::Resp(NegTokenResp::default())));
+        assert_eq!(
+            p(&[
+                0xa1, 0x0a, 0x30, 0x08, 0xa2, 0x02, 0x04, 0x00, 0xa0, 0x02, 0x04, 0x00
+            ]),
+            Err(Error::Field)
+        );
+        assert_eq!(
+            p(&[
+                0xa1, 0x0a, 0x30, 0x08, 0xa2, 0x02, 0x04, 0x00, 0xa2, 0x02, 0x04, 0x00
+            ]),
+            Err(Error::Field)
+        );
+        assert_eq!(
+            p(&[0xa1, 0x04, 0x30, 0x02, 0x04, 0x00]),
+            Ok(NegotiationToken::Resp(NegTokenResp::default()))
+        );
         // A field holding the wrong type, or two values, or a primitive tag.
-        assert!(matches!(p(&[0xa1, 0x06, 0x30, 0x04, 0xa2, 0x02, 0x02, 0x00]), Err(Error::Asn1(A::Unexpected { .. }))));
-        assert_eq!(p(&[0xa1, 0x08, 0x30, 0x06, 0xa2, 0x04, 0x04, 0x00, 0x04, 0x00]), Err(Error::Asn1(A::Trailing)));
-        assert_eq!(p(&[0xa1, 0x04, 0x30, 0x02, 0x82, 0x00]), Err(Error::Asn1(A::Primitive)));
+        assert!(matches!(
+            p(&[0xa1, 0x06, 0x30, 0x04, 0xa2, 0x02, 0x02, 0x00]),
+            Err(Error::Asn1(A::Unexpected { .. }))
+        ));
+        assert_eq!(
+            p(&[0xa1, 0x08, 0x30, 0x06, 0xa2, 0x04, 0x04, 0x00, 0x04, 0x00]),
+            Err(Error::Asn1(A::Trailing))
+        );
+        assert_eq!(
+            p(&[0xa1, 0x04, 0x30, 0x02, 0x82, 0x00]),
+            Err(Error::Asn1(A::Primitive))
+        );
         assert_eq!(p(&[0x81, 0x02, 0x30, 0x00]), Err(Error::Asn1(A::Primitive)));
         // A negState outside 0..=3.
-        assert_eq!(p(&[0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0x04]), Err(Error::NegState(4)));
-        assert_eq!(p(&[0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0xff]), Err(Error::NegState(-1)));
+        assert_eq!(
+            p(&[0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0x04]),
+            Err(Error::NegState(4))
+        );
+        assert_eq!(
+            p(&[0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0xff]),
+            Err(Error::NegState(-1))
+        );
         assert_eq!(NegState::from_value(9), Err(Error::NegState(9)));
         // A negState too large for an i64.
         let mut big = vec![0xa1, 0x10, 0x30, 0x0e, 0xa0, 0x0c, 0x0a, 0x0a, 0x01];
         big.extend_from_slice(&[0; 9]);
         assert_eq!(p(&big), Err(Error::Asn1(A::Integer)));
         // Hints with an unknown field.
-        assert_eq!(p(&init_of(&[MECH_1_2, &[0xa3, 0x04, 0x30, 0x02, 0x85, 0x00]])), Err(Error::Asn1(A::Trailing)));
+        assert_eq!(
+            p(&init_of(&[MECH_1_2, &[0xa3, 0x04, 0x30, 0x02, 0x85, 0x00]])),
+            Err(Error::Asn1(A::Trailing))
+        );
         // [3] holding neither an OCTET STRING nor a SEQUENCE.
         assert!(matches!(
             p(&init_of(&[MECH_1_2, &[0xa3, 0x03, 0x02, 0x01, 0x00]])),
             Err(Error::Asn1(A::Unexpected { .. }))
         ));
         // [3] empty.
-        assert_eq!(p(&init_of(&[MECH_1_2, &[0xa3, 0x00]])), Err(Error::Asn1(A::Empty)));
+        assert_eq!(
+            p(&init_of(&[MECH_1_2, &[0xa3, 0x00]])),
+            Err(Error::Asn1(A::Empty))
+        );
         // Too many mechanisms, read and written.
         let mut list = Vec::new();
         for _ in 0..=MAX_MECHS {
             list.extend_from_slice(&[0x06, 0x01, 0x2a]);
         }
-        let mut b = vec![0xa0, 0x82, 0, 0, 0x30, 0x82, 0, 0, 0xa0, 0x82, 0, 0, 0x30, 0x82, 0, 0];
+        let mut b = vec![
+            0xa0, 0x82, 0, 0, 0x30, 0x82, 0, 0, 0xa0, 0x82, 0, 0, 0x30, 0x82, 0, 0,
+        ];
         let n = list.len();
         b[14..16].copy_from_slice(&(n as u16).to_be_bytes());
         b[10..12].copy_from_slice(&(n as u16 + 4).to_be_bytes());
@@ -1279,22 +1496,47 @@ mod tests {
         b[2..4].copy_from_slice(&(n as u16 + 12).to_be_bytes());
         b.extend_from_slice(&list);
         assert_eq!(p(&b), Err(Error::TooManyMechs));
-        let too_many = NegTokenInit { mech_types: vec![Mech::Ntlm; MAX_MECHS + 1], ..NegTokenInit::default() };
-        assert_eq!(NegotiationToken::Init(too_many).to_bytes(), Err(Error::TooManyMechs));
-        let most = NegTokenInit { mech_types: vec![Mech::Ntlm; MAX_MECHS], ..NegTokenInit::default() };
+        let too_many = NegTokenInit {
+            mech_types: vec![Mech::Ntlm; MAX_MECHS + 1],
+            ..NegTokenInit::default()
+        };
+        assert_eq!(
+            NegotiationToken::Init(too_many).to_bytes(),
+            Err(Error::TooManyMechs)
+        );
+        let most = NegTokenInit {
+            mech_types: vec![Mech::Ntlm; MAX_MECHS],
+            ..NegTokenInit::default()
+        };
         let most = NegotiationToken::Init(most);
         assert_eq!(p(&most.to_bytes().unwrap()).unwrap(), most);
         // Too long, read and written.
         assert_eq!(p(&vec![0xa1; MAX_TOKEN + 1]), Err(Error::TooLong));
-        assert_eq!(InitialContextToken::parse(&vec![0x60; MAX_TOKEN + 1]), Err(Error::TooLong));
-        let huge = NegTokenResp { response_token: Some(vec![0; MAX_TOKEN]), ..NegTokenResp::default() };
+        assert_eq!(
+            InitialContextToken::parse(&vec![0x60; MAX_TOKEN + 1]),
+            Err(Error::TooLong)
+        );
+        let huge = NegTokenResp {
+            response_token: Some(vec![0; MAX_TOKEN]),
+            ..NegTokenResp::default()
+        };
         assert_eq!(NegotiationToken::Resp(huge).to_bytes(), Err(Error::TooLong));
-        let near = NegTokenResp { response_token: Some(vec![0; MAX_TOKEN - 20]), ..NegTokenResp::default() };
+        let near = NegTokenResp {
+            response_token: Some(vec![0; MAX_TOKEN - 20]),
+            ..NegTokenResp::default()
+        };
         let near = NegotiationToken::Resp(near);
         let bytes = near.to_bytes().unwrap();
         assert!(bytes.len() <= MAX_TOKEN);
         assert_eq!(p(&bytes).unwrap(), near);
-        assert_eq!(InitialContextToken { mech: Mech::Spnego, inner: bytes }.to_bytes(), Err(Error::TooLong));
+        assert_eq!(
+            InitialContextToken {
+                mech: Mech::Spnego,
+                inner: bytes
+            }
+            .to_bytes(),
+            Err(Error::TooLong)
+        );
         let near = NegTokenInit {
             mech_types: vec![Mech::Ntlm],
             mech_token: Some(vec![0; MAX_TOKEN - 40]),
@@ -1306,24 +1548,46 @@ mod tests {
             InitialContextToken::spnego(&near).and_then(|token| token.to_bytes()),
             Err(Error::TooLong)
         );
-        let big = InitialContextToken { mech: Mech::Ntlm, inner: vec![0; MAX_TOKEN] };
+        let big = InitialContextToken {
+            mech: Mech::Ntlm,
+            inner: vec![0; MAX_TOKEN],
+        };
         assert_eq!(big.to_bytes(), Err(Error::TooLong));
         // Wrapper errors.
         let ic = InitialContextToken::parse;
         assert_eq!(ic(&[0x61, 0x00]), Err(Error::NotToken));
         assert_eq!(ic(&[0x40, 0x00]), Err(Error::NotToken));
-        assert_eq!(ic(&[0x60, 0x80, 0x06, 0x01, 0x2a, 0, 0]), Err(Error::Indefinite));
-        assert_eq!(ic(&[0x60, 0x03, 0x06, 0x01]), Err(Error::Asn1(A::Truncated)));
-        assert_eq!(ic(&[0x60, 0x03, 0x06, 0x01, 0x2a, 0x00]), Err(Error::Asn1(A::Trailing)));
+        assert_eq!(
+            ic(&[0x60, 0x80, 0x06, 0x01, 0x2a, 0, 0]),
+            Err(Error::Indefinite)
+        );
+        assert_eq!(
+            ic(&[0x60, 0x03, 0x06, 0x01]),
+            Err(Error::Asn1(A::Truncated))
+        );
+        assert_eq!(
+            ic(&[0x60, 0x03, 0x06, 0x01, 0x2a, 0x00]),
+            Err(Error::Asn1(A::Trailing))
+        );
         assert_eq!(ic(&[0x60, 0x00]), Err(Error::Asn1(A::Empty)));
         assert_eq!(ic(&[0x60, 0x02, 0x06, 0x00]), Err(Error::Asn1(A::Oid)));
         assert_eq!(ic(&[0x60]), Err(Error::Asn1(A::Truncated)));
         assert_eq!(ic(&[0x60, 0xff]), Err(Error::Asn1(A::Length)));
         // A wrapper for another mechanism.
-        let k = InitialContextToken { mech: Mech::Kerberos, inner: samba_init2()[10..].to_vec() }.to_bytes().unwrap();
+        let k = InitialContextToken {
+            mech: Mech::Kerberos,
+            inner: samba_init2()[10..].to_vec(),
+        }
+        .to_bytes()
+        .unwrap();
         assert_eq!(p(&k), Err(Error::WrongMech));
         // A wrapper around nothing SPNEGO reads.
-        let w = InitialContextToken { mech: Mech::Spnego, inner: vec![0x30, 0x00] }.to_bytes().unwrap();
+        let w = InitialContextToken {
+            mech: Mech::Spnego,
+            inner: vec![0x30, 0x00],
+        }
+        .to_bytes()
+        .unwrap();
         assert_eq!(p(&w), Err(Error::NotToken));
         // A hint name the writer cannot write is impossible: GeneralString
         // bytes are not checked. Every error has a message.
@@ -1350,8 +1614,14 @@ mod tests {
         assert_eq!(token_len(&[0x30]), Err(Error::NotToken));
         assert_eq!(token_len(&[0xa1]), Ok(None));
         assert_eq!(token_len(&[0xa1, 0x80]), Err(Error::Indefinite));
-        assert_eq!(token_len(&[0xa1, 0xff]), Err(Error::Asn1(asn1::Error::Length)));
-        assert_eq!(token_len(&[0xa1, 0x83, 0x01, 0x00, 0x00]), Err(Error::TooLong));
+        assert_eq!(
+            token_len(&[0xa1, 0xff]),
+            Err(Error::Asn1(asn1::Error::Length))
+        );
+        assert_eq!(
+            token_len(&[0xa1, 0x83, 0x01, 0x00, 0x00]),
+            Err(Error::TooLong)
+        );
         assert_eq!(token_len(&[0xa1, 0x82, 0xff]), Ok(None));
         assert_eq!(token_len(&[0xa1, 0x82, 0xff, 0xfc]), Ok(None));
         assert_eq!(token_len(&[0xa1, 0x82, 0xff, 0xfd]), Err(Error::TooLong));
@@ -1368,7 +1638,10 @@ mod tests {
         }
         for b in &all {
             for n in 0..b.len() {
-                assert!(NegotiationToken::parse(&b[..n]).is_err(), "prefix {n} of {b:02x?}");
+                assert!(
+                    NegotiationToken::parse(&b[..n]).is_err(),
+                    "prefix {n} of {b:02x?}"
+                );
                 assert_eq!(token_len(&b[..n]), Ok(None));
                 if b[0] == GSS_TAG {
                     assert!(InitialContextToken::parse(&b[..n]).is_err());
@@ -1474,11 +1747,13 @@ mod tests {
     fn init2_mic_without_hints_stays_at_4() {
         // A NegTokenInit2 with mechTypes and a mechListMIC at [4], no [3].
         let b = [
-            0xa0, 0x17, 0x30, 0x15, 0xa0, 0x0e, 0x30, 0x0c, 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02,
-            0x02, 0x0a, 0xa4, 0x03, 0x04, 0x01, 0xaa,
+            0xa0, 0x17, 0x30, 0x15, 0xa0, 0x0e, 0x30, 0x0c, 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04,
+            0x01, 0x82, 0x37, 0x02, 0x02, 0x0a, 0xa4, 0x03, 0x04, 0x01, 0xaa,
         ];
         let t = NegotiationToken::parse(&b).unwrap();
-        let NegotiationToken::Init(i) = &t else { panic!() };
+        let NegotiationToken::Init(i) = &t else {
+            panic!()
+        };
         assert_eq!(i.mech_list_mic, Some(vec![0xaa]));
         let out = t.to_bytes().unwrap();
         // Written back as a NegTokenInit2: the MIC is still at [4].
@@ -1491,7 +1766,9 @@ mod tests {
         // [MS-SPNG] 2.2.1: mechTypes is optional in a NegTokenInit2.
         let b = [0xa0, 0x06, 0x30, 0x04, 0xa3, 0x02, 0x30, 0x00];
         let t = NegotiationToken::parse(&b).unwrap();
-        let NegotiationToken::Init(i) = &t else { panic!() };
+        let NegotiationToken::Init(i) = &t else {
+            panic!()
+        };
         assert!(i.mech_types.is_empty());
         assert_eq!(i.neg_hints, Some(NegHints::default()));
         assert_eq!(t.to_bytes().unwrap(), b);
@@ -1500,9 +1777,14 @@ mod tests {
         let t = NegotiationToken::parse(&b).unwrap();
         assert_eq!(NegotiationToken::parse(&t.to_bytes().unwrap()).unwrap(), t);
         // An empty list in a NegTokenInit2 is written as no list.
-        let b = [0xa0, 0x0a, 0x30, 0x08, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x02, 0x30, 0x00];
+        let b = [
+            0xa0, 0x0a, 0x30, 0x08, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x02, 0x30, 0x00,
+        ];
         let t = NegotiationToken::parse(&b).unwrap();
-        assert_eq!(t.to_bytes().unwrap(), [0xa0, 0x06, 0x30, 0x04, 0xa3, 0x02, 0x30, 0x00]);
+        assert_eq!(
+            t.to_bytes().unwrap(),
+            [0xa0, 0x06, 0x30, 0x04, 0xa3, 0x02, 0x30, 0x00]
+        );
     }
 
     #[test]
@@ -1510,12 +1792,21 @@ mod tests {
         // RFC 4178 4.2.1: a NegTokenInit offers one or more mechanisms.
         let b = [0xa0, 0x06, 0x30, 0x04, 0xa0, 0x02, 0x30, 0x00];
         assert_eq!(NegotiationToken::parse(&b), Err(Error::MissingMechTypes));
-        let b = [0xa0, 0x0b, 0x30, 0x09, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x03, 0x04, 0x01, 0xaa];
+        let b = [
+            0xa0, 0x0b, 0x30, 0x09, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x03, 0x04, 0x01, 0xaa,
+        ];
         assert_eq!(NegotiationToken::parse(&b), Err(Error::MissingMechTypes));
-        assert_eq!(NegotiationToken::Init(NegTokenInit::default()).to_bytes(), Err(Error::MissingMechTypes));
-        let t = NegTokenInit { mech_list_mic: Some(vec![1]), ..NegTokenInit::default() };
         assert_eq!(
-            InitialContextToken::spnego(&NegotiationToken::Init(t)).and_then(|token| token.to_bytes()),
+            NegotiationToken::Init(NegTokenInit::default()).to_bytes(),
+            Err(Error::MissingMechTypes)
+        );
+        let t = NegTokenInit {
+            mech_list_mic: Some(vec![1]),
+            ..NegTokenInit::default()
+        };
+        assert_eq!(
+            InitialContextToken::spnego(&NegotiationToken::Init(t))
+                .and_then(|token| token.to_bytes()),
             Err(Error::MissingMechTypes)
         );
     }
@@ -1523,15 +1814,27 @@ mod tests {
     #[test]
     fn unknown_extensions_of_any_class_are_skipped() {
         // accept-completed, then a NULL added after the extension marker.
-        let b = [0xa1, 0x09, 0x30, 0x07, 0xa0, 0x03, 0x0a, 0x01, 0x00, 0x05, 0x00];
-        assert_eq!(NegotiationToken::parse(&b).unwrap(), NegotiationToken::parse(&ACCEPT_COMPLETED).unwrap());
+        let b = [
+            0xa1, 0x09, 0x30, 0x07, 0xa0, 0x03, 0x0a, 0x01, 0x00, 0x05, 0x00,
+        ];
+        assert_eq!(
+            NegotiationToken::parse(&b).unwrap(),
+            NegotiationToken::parse(&ACCEPT_COMPLETED).unwrap()
+        );
         // An application-class and a private-class addition, in a
         // NegTokenInit.
-        let b = [0xa0, 0x0d, 0x30, 0x0b, 0xa0, 0x05, 0x30, 0x03, 0x06, 0x01, 0x2a, 0x41, 0x00, 0xc2, 0x00];
-        let NegotiationToken::Init(i) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        let b = [
+            0xa0, 0x0d, 0x30, 0x0b, 0xa0, 0x05, 0x30, 0x03, 0x06, 0x01, 0x2a, 0x41, 0x00, 0xc2,
+            0x00,
+        ];
+        let NegotiationToken::Init(i) = NegotiationToken::parse(&b).unwrap() else {
+            panic!()
+        };
         assert_eq!(i.mech_types, [Mech::from_contents(&[0x2a]).unwrap()]);
         // A known field after an unknown one is out of order.
-        let b = [0xa1, 0x09, 0x30, 0x07, 0x05, 0x00, 0xa0, 0x03, 0x0a, 0x01, 0x00];
+        let b = [
+            0xa1, 0x09, 0x30, 0x07, 0x05, 0x00, 0xa0, 0x03, 0x0a, 0x01, 0x00,
+        ];
         assert_eq!(NegotiationToken::parse(&b), Err(Error::Field));
     }
 
@@ -1541,7 +1844,10 @@ mod tests {
         for addr in [Vec::new(), vec![1, 2]] {
             let t = NegotiationToken::Init(NegTokenInit {
                 mech_types: vec![Mech::Ntlm],
-                neg_hints: Some(NegHints { hint_name: Some(HINT.to_vec()), hint_address: Some(addr) }),
+                neg_hints: Some(NegHints {
+                    hint_name: Some(HINT.to_vec()),
+                    hint_address: Some(addr),
+                }),
                 ..NegTokenInit::default()
             });
             assert_eq!(t.to_bytes(), Err(Error::HintAddress));
@@ -1551,7 +1857,10 @@ mod tests {
             );
         }
         // The Wire domain excludes received hint addresses too.
-        let b = [0xa0, 0x0e, 0x30, 0x0c, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x06, 0x30, 0x04, 0xa1, 0x02, 0x04, 0x00];
+        let b = [
+            0xa0, 0x0e, 0x30, 0x0c, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x06, 0x30, 0x04, 0xa1, 0x02,
+            0x04, 0x00,
+        ];
         assert_eq!(NegotiationToken::parse(&b), Err(Error::HintAddress));
         contract::check_decode_with_alloc_limit(Frames::new, &b, 2 * MAX_TOKEN);
     }
@@ -1570,7 +1879,10 @@ mod tests {
             assert_eq!(&other, named);
             assert_eq!(hash(&other), hash(named));
             assert_eq!(other.to_string(), named.to_string());
-            let t = NegotiationToken::Resp(NegTokenResp { supported_mech: Some(other), ..NegTokenResp::default() });
+            let t = NegotiationToken::Resp(NegTokenResp {
+                supported_mech: Some(other),
+                ..NegTokenResp::default()
+            });
             assert_eq!(NegotiationToken::parse(&t.to_bytes().unwrap()).unwrap(), t);
         }
         assert_ne!(Mech::Ntlm, Mech::NegoEx);
@@ -1585,7 +1897,9 @@ mod tests {
             _ if rng.next().is_multiple_of(4) => {
                 Mech::Other(NAMED[rng.index(NAMED.len())].2.parse().unwrap())
             }
-            _ => Mech::Other(Oid::from_arcs(&[2, u128::from(rng.next()), u128::from(rng.next())]).unwrap()),
+            _ => Mech::Other(
+                Oid::from_arcs(&[2, u128::from(rng.next()), u128::from(rng.next())]).unwrap(),
+            ),
         }
     }
 
@@ -1595,7 +1909,10 @@ mod tests {
             let neg_hints = if !rng.coin() {
                 None
             } else {
-                Some(NegHints { hint_name: rng.coin().then(|| rng.bytes(20)), hint_address: None })
+                Some(NegHints {
+                    hint_name: rng.coin().then(|| rng.bytes(20)),
+                    hint_address: None,
+                })
             };
             let least = usize::from(neg_hints.is_none());
             NegotiationToken::Init(NegTokenInit {
@@ -1615,7 +1932,11 @@ mod tests {
                     4 => None,
                     v => Some(NegState::from_value(v as i64).unwrap()),
                 },
-                supported_mech: if !rng.coin() { None } else { Some(make_mech(rng)) },
+                supported_mech: if !rng.coin() {
+                    None
+                } else {
+                    Some(make_mech(rng))
+                },
                 response_token: rng.coin().then(|| rng.bytes(40)),
                 mech_list_mic: rng.coin().then(|| rng.bytes(20)),
             })
@@ -1698,11 +2019,17 @@ mod tests {
         // A received hint address is outside the Wire domain.
         let bytes = [0xa0, 10, 0x30, 8, 0xa3, 6, 0x30, 4, 0xa1, 2, 4, 0];
         let token = NegotiationToken::Init(NegTokenInit {
-            neg_hints: Some(NegHints { hint_name: None, hint_address: Some(Vec::new()) }),
+            neg_hints: Some(NegHints {
+                hint_name: None,
+                hint_address: Some(Vec::new()),
+            }),
             ..Default::default()
         });
         assert_eq!(token.to_bytes(), Err(Error::HintAddress));
-        assert_eq!(<NegotiationToken as Wire>::parse(&bytes), Err(Error::HintAddress));
+        assert_eq!(
+            <NegotiationToken as Wire>::parse(&bytes),
+            Err(Error::HintAddress)
+        );
         contract::check_wire::<NegotiationToken>(&bytes);
         contract::check_wire_value(&token);
         let mut out = vec![42];
@@ -1710,7 +2037,10 @@ mod tests {
         assert_eq!(out, [42]);
         let good = NegotiationToken::Resp(NegTokenResp::default());
         contract::check_wire_value(&good);
-        let wrapper = InitialContextToken { mech: Mech::Kerberos, inner: vec![1, 0, 5, 0] };
+        let wrapper = InitialContextToken {
+            mech: Mech::Kerberos,
+            inner: vec![1, 0, 5, 0],
+        };
         contract::check_wire_value(&wrapper);
         let mut bytes = wrapper.to_bytes().unwrap();
         bytes.push(0);

@@ -152,7 +152,9 @@ impl Value {
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Value::Atom(a) => Some(a.as_bytes()),
-            Value::Quoted(b) | Value::Literal { data: b, .. } | Value::Binary { data: b, .. } => Some(b),
+            Value::Quoted(b) | Value::Literal { data: b, .. } | Value::Binary { data: b, .. } => {
+                Some(b)
+            }
             Value::List(_) => None,
         }
     }
@@ -199,7 +201,11 @@ pub struct Command {
 impl Command {
     /// A command with `tag`, `name` and `args`.
     pub fn new(tag: &str, name: &str, args: Vec<Value>) -> Command {
-        Command { tag: tag.to_string(), name: name.to_ascii_uppercase(), args }
+        Command {
+            tag: tag.to_string(),
+            name: name.to_ascii_uppercase(),
+            args,
+        }
     }
 
     /// Whether the command's name is `name`, in any case.
@@ -212,7 +218,10 @@ impl Command {
         if b.len() > MAX_MESSAGE {
             return Err(Error::TooLong);
         }
-        let syntax = |reason| Error::Syntax { tag: tag.clone(), reason };
+        let syntax = |reason| Error::Syntax {
+            tag: tag.clone(),
+            reason,
+        };
         let mut c = Cursor { b, i: 0, lits: 0 };
         let t = c.take_while(tag_char);
         if t.is_empty() {
@@ -232,7 +241,11 @@ impl Command {
         if b.len().saturating_sub(c.lits) > MAX_TEXT {
             return Err(Error::TooLong);
         }
-        Ok(Command { tag: tag_s, name, args })
+        Ok(Command {
+            tag: tag_s,
+            name,
+            args,
+        })
     }
 
     /// Finds continuation boundaries in one complete encoded command.
@@ -253,9 +266,7 @@ impl Command {
                     at = at.checked_add(used).ok_or(Error::Incomplete)?;
                     offsets.push(at);
                 }
-                codec::Step::Skip(used) => {
-                    at = at.checked_add(used).ok_or(Error::Incomplete)?
-                }
+                codec::Step::Skip(used) => at = at.checked_add(used).ok_or(Error::Incomplete)?,
                 codec::Step::Item(Ok(Input::Command(_)), _) => return Ok(offsets),
                 codec::Step::Item(Err(e), _) => return Err(e),
                 _ => return Err(Error::Incomplete),
@@ -293,9 +304,15 @@ impl Status {
     }
 
     fn from_word(w: &[u8]) -> Option<Status> {
-        [Status::Ok, Status::No, Status::Bad, Status::Preauth, Status::Bye]
-            .into_iter()
-            .find(|s| w.eq_ignore_ascii_case(s.as_str().as_bytes()))
+        [
+            Status::Ok,
+            Status::No,
+            Status::Bad,
+            Status::Preauth,
+            Status::Bye,
+        ]
+        .into_iter()
+        .find(|s| w.eq_ignore_ascii_case(s.as_str().as_bytes()))
     }
 }
 
@@ -331,12 +348,22 @@ pub enum Response {
 impl Response {
     /// A tagged status response that ends command `tag`.
     pub fn tagged(tag: &str, status: Status, text: &str) -> Response {
-        Response::Status { tag: Some(tag.to_string()), status, code: None, text: text.to_string() }
+        Response::Status {
+            tag: Some(tag.to_string()),
+            status,
+            code: None,
+            text: text.to_string(),
+        }
     }
 
     /// An untagged status response, such as a greeting or `BYE`.
     pub fn untagged(status: Status, text: &str) -> Response {
-        Response::Status { tag: None, status, code: None, text: text.to_string() }
+        Response::Status {
+            tag: None,
+            status,
+            code: None,
+            text: text.to_string(),
+        }
     }
 
     /// This response with a response code, if it is a status response.
@@ -359,7 +386,9 @@ impl Response {
 
     /// A continuation request, `+ text`.
     pub fn continue_req(text: &str) -> Response {
-        Response::Continue { text: text.to_string() }
+        Response::Continue {
+            text: text.to_string(),
+        }
     }
 
     /// `* CAPABILITY` and the capabilities, such as `IMAP4rev2`.
@@ -403,8 +432,13 @@ impl Response {
             Some(d) if !d.is_control() => Value::string(d.to_string().as_bytes()),
             _ => Value::nil(),
         };
-        let astring = mailbox.iter().all(|&b| atom_char(b) || b == b']') && !mailbox.eq_ignore_ascii_case(b"NIL");
-        let name = if astring && atom_ok(mailbox) { Value::Atom(ascii(mailbox)) } else { Value::string(mailbox) };
+        let astring = mailbox.iter().all(|&b| atom_char(b) || b == b']')
+            && !mailbox.eq_ignore_ascii_case(b"NIL");
+        let name = if astring && atom_ok(mailbox) {
+            Value::Atom(ascii(mailbox))
+        } else {
+            Value::string(mailbox)
+        };
         Response::Data(vec![Value::atom("LIST"), Value::List(attrs), delim, name])
     }
 
@@ -417,7 +451,11 @@ impl Response {
 
     /// `* n FETCH (items)`, where `items` alternate names and values.
     pub fn fetch(n: u32, items: Vec<Value>) -> Response {
-        Response::Data(vec![Value::number(n.into()), Value::atom("FETCH"), Value::List(items)])
+        Response::Data(vec![
+            Value::number(n.into()),
+            Value::atom("FETCH"),
+            Value::List(items),
+        ])
     }
 
     fn parse_message(b: &[u8]) -> Result<Response, Error> {
@@ -425,7 +463,10 @@ impl Response {
         if b.len() > MAX_MESSAGE {
             return Err(Error::TooLong);
         }
-        let syntax = |reason| Error::Syntax { tag: tag.clone(), reason };
+        let syntax = |reason| Error::Syntax {
+            tag: tag.clone(),
+            reason,
+        };
         let first_lf = b.iter().position(|&x| x == b'\n');
         let first = content(&b[..first_lf.map_or(b.len(), |p| p + 1)]);
         let kind = classify(first);
@@ -435,10 +476,15 @@ impl Response {
             }
             let mut c = Cursor { b, i: 1, lits: 0 };
             // A server never waits for a continuation request.
-            let values = parse_values(&mut c, false).map_err(|e| match e.into_error(tag.clone()) {
-                Error::LiteralTooLarge { tag, size, .. } => Error::LiteralTooLarge { tag, size, waiting: false },
-                e => e,
-            })?;
+            let values =
+                parse_values(&mut c, false).map_err(|e| match e.into_error(tag.clone()) {
+                    Error::LiteralTooLarge { tag, size, .. } => Error::LiteralTooLarge {
+                        tag,
+                        size,
+                        waiting: false,
+                    },
+                    e => e,
+                })?;
             if b.len().saturating_sub(c.lits) > MAX_TEXT {
                 return Err(Error::TooLong);
             }
@@ -457,12 +503,18 @@ impl Response {
                 Some([b' ', rest @ ..]) => text_str(rest).map_err(syntax)?,
                 Some(_) => return Err(syntax("a space must follow +")),
             };
-            return Ok(Response::Continue { text: text.to_string() });
+            return Ok(Response::Continue {
+                text: text.to_string(),
+            });
         }
         // classify() found a tag or `*`, a space, a status word, and then
         // a space or the end of the line.
         let sp = line.iter().position(|&x| x == b' ').unwrap_or(line.len());
-        let rtag = if &line[..sp] == b"*" { None } else { Some(ascii(&line[..sp])) };
+        let rtag = if &line[..sp] == b"*" {
+            None
+        } else {
+            Some(ascii(&line[..sp]))
+        };
         let rest = line.get(sp + 1..).unwrap_or(&[]);
         let w = rest.iter().position(|&x| x == b' ').unwrap_or(rest.len());
         let status = Status::from_word(&rest[..w]).ok_or_else(|| syntax("unknown status"))?;
@@ -470,7 +522,12 @@ impl Response {
             return Err(syntax("PREAUTH and BYE are never tagged"));
         }
         let (code, text) = resp_text(rest.get(w + 1..).unwrap_or(&[])).map_err(syntax)?;
-        Ok(Response::Status { tag: rtag, status, code, text })
+        Ok(Response::Status {
+            tag: rtag,
+            status,
+            code,
+            text,
+        })
     }
 }
 
@@ -531,7 +588,9 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Syntax { reason, .. } => write!(f, "IMAP syntax error: {reason}"),
-            Error::LiteralTooLarge { size, .. } => write!(f, "literal of {size} bytes is too large"),
+            Error::LiteralTooLarge { size, .. } => {
+                write!(f, "literal of {size} bytes is too large")
+            }
             Error::TooLong => write!(f, "IMAP command or response is too long"),
             Error::Framing(_) => f.write_str("IMAP framing failed"),
             Error::Incomplete => f.write_str("incomplete IMAP value"),
@@ -583,13 +642,21 @@ fn classify(line: &[u8]) -> Kind {
     if line.first() == Some(&b'+') {
         return Kind::Continue;
     }
-    let n = if line.first() == Some(&b'*') { 1 } else { line.iter().take_while(|&&x| tag_char(x)).count() };
+    let n = if line.first() == Some(&b'*') {
+        1
+    } else {
+        line.iter().take_while(|&&x| tag_char(x)).count()
+    };
     if n == 0 || line.get(n) != Some(&b' ') {
         return Kind::Data;
     }
     let rest = &line[n + 1..];
     let w = rest.iter().position(|&x| x == b' ').unwrap_or(rest.len());
-    if Status::from_word(&rest[..w]).is_some() { Kind::Status } else { Kind::Data }
+    if Status::from_word(&rest[..w]).is_some() {
+        Kind::Status
+    } else {
+        Kind::Data
+    }
 }
 
 /// A line without its LF, and without a CR before it.
@@ -617,14 +684,17 @@ fn marker(line: &[u8], allow_non_sync: bool) -> Option<(u64, bool)> {
 
 /// The value of ASCII digits, or `u64::MAX` if it does not fit.
 fn number(digits: &[u8]) -> u64 {
-    digits
-        .iter()
-        .fold(0u64, |n, &d| n.checked_mul(10).and_then(|n| n.checked_add(u64::from(d - b'0'))).unwrap_or(u64::MAX))
+    digits.iter().fold(0u64, |n, &d| {
+        n.checked_mul(10)
+            .and_then(|n| n.checked_add(u64::from(d - b'0')))
+            .unwrap_or(u64::MAX)
+    })
 }
 
 /// A byte an atom may hold (RFC 9051 `ATOM-CHAR`).
 fn atom_char(b: u8) -> bool {
-    (0x21..=0x7e).contains(&b) && !matches!(b, b'(' | b')' | b'{' | b'%' | b'*' | b'"' | b'\\' | b']')
+    (0x21..=0x7e).contains(&b)
+        && !matches!(b, b'(' | b')' | b'{' | b'%' | b'*' | b'"' | b'\\' | b']')
 }
 
 /// A byte a tag may hold: `ASTRING-CHAR` except `+`.
@@ -640,7 +710,13 @@ fn word_char(b: u8) -> bool {
 
 /// The words a section in square brackets follows (RFC 9051 `fetch-att`
 /// and `msg-att-static`).
-const SECTIONED: &[&[u8]] = &[b"BODY", b"BODY.PEEK", b"BINARY", b"BINARY.PEEK", b"BINARY.SIZE"];
+const SECTIONED: &[&[u8]] = &[
+    b"BODY",
+    b"BODY.PEEK",
+    b"BINARY",
+    b"BINARY.PEEK",
+    b"BINARY.SIZE",
+];
 
 /// Reads the word at the cursor. After one of [`SECTIONED`], a `[` opens
 /// a section that runs to its `]` and may hold spaces, parentheses,
@@ -652,7 +728,11 @@ fn scan_word(c: &mut Cursor<'_>, literals: Option<bool>) -> Result<String, Fault
     let start = c.i;
     let mut out = String::new();
     while let Some(x) = c.peek() {
-        if x == b'[' && SECTIONED.iter().any(|w| c.b[start..c.i].eq_ignore_ascii_case(w)) {
+        if x == b'['
+            && SECTIONED
+                .iter()
+                .any(|w| c.b[start..c.i].eq_ignore_ascii_case(w))
+        {
             c.i += 1;
             out.push('[');
             scan_section(c, &mut out, literals)?;
@@ -678,9 +758,12 @@ fn scan_section(c: &mut Cursor<'_>, out: &mut String, literals: Option<bool>) ->
             Some(b'"') => push_quoted(out, &parse_quoted(c)?),
             Some(b'{') if literals.is_some() => {
                 let (data, _) = parse_literal(c, literals == Some(true), false)?;
-                let quotable = data.len() <= MAX_QUOTED && !data.iter().any(|&b| matches!(b, b'\r' | b'\n'));
+                let quotable =
+                    data.len() <= MAX_QUOTED && !data.iter().any(|&b| matches!(b, b'\r' | b'\n'));
                 if !quotable || std::str::from_utf8(&data).is_err() {
-                    return Err(Fault::Syntax("a literal in a section must be a short line of UTF-8"));
+                    return Err(Fault::Syntax(
+                        "a literal in a section must be a short line of UTF-8",
+                    ));
                 }
                 push_quoted(out, &data);
             }
@@ -707,13 +790,21 @@ fn push_quoted(out: &mut String, s: &[u8]) {
 
 /// Whether `s` is written as an atom.
 fn atom_ok(s: &[u8]) -> bool {
-    let mut c = Cursor { b: s, i: 0, lits: 0 };
+    let mut c = Cursor {
+        b: s,
+        i: 0,
+        lits: 0,
+    };
     !s.is_empty() && matches!(scan_word(&mut c, None), Ok(w) if c.i == s.len() && w.as_bytes() == s)
 }
 
 /// The well-formed tag at the start of `b`, if it has one.
 fn tag_of(b: &[u8]) -> Option<String> {
-    let n = b.iter().take(MAX_TEXT).take_while(|&&x| tag_char(x)).count();
+    let n = b
+        .iter()
+        .take(MAX_TEXT)
+        .take_while(|&&x| tag_char(x))
+        .count();
     (n > 0 && b.get(n) == Some(&b' ')).then(|| ascii(&b[..n]))
 }
 
@@ -754,7 +845,11 @@ impl Fault {
     fn into_error(self, tag: Option<String>) -> Error {
         match self {
             Fault::Syntax(reason) => Error::Syntax { tag, reason },
-            Fault::TooLarge { size, non_sync } => Error::LiteralTooLarge { tag, size, waiting: !non_sync },
+            Fault::TooLarge { size, non_sync } => Error::LiteralTooLarge {
+                tag,
+                size,
+                waiting: !non_sync,
+            },
         }
     }
 }
@@ -860,7 +955,9 @@ fn parse_quoted(c: &mut Cursor<'_>) -> Result<Vec<u8>, Fault> {
     c.i += 1;
     let mut out = Vec::new();
     loop {
-        let Some(x) = c.peek() else { return Err(Fault::Syntax("a quoted string has no closing quote")) };
+        let Some(x) = c.peek() else {
+            return Err(Fault::Syntax("a quoted string has no closing quote"));
+        };
         c.i += 1;
         match x {
             b'"' if std::str::from_utf8(&out).is_err() => {
@@ -885,7 +982,11 @@ fn parse_quoted(c: &mut Cursor<'_>) -> Result<Vec<u8>, Fault> {
 
 /// Reads a literal from its `{`: its bytes, and whether it was
 /// non-synchronizing. Only a `binary` one, after `~`, may hold NUL.
-fn parse_literal(c: &mut Cursor<'_>, allow_non_sync: bool, binary: bool) -> Result<(Vec<u8>, bool), Fault> {
+fn parse_literal(
+    c: &mut Cursor<'_>,
+    allow_non_sync: bool,
+    binary: bool,
+) -> Result<(Vec<u8>, bool), Fault> {
     c.i += 1;
     let digits = c.take_while(|b| b.is_ascii_digit());
     if digits.is_empty() {
@@ -895,7 +996,9 @@ fn parse_literal(c: &mut Cursor<'_>, allow_non_sync: bool, binary: bool) -> Resu
     let non_sync = c.peek() == Some(b'+');
     if non_sync {
         if !allow_non_sync {
-            return Err(Fault::Syntax("a server literal cannot be non-synchronizing"));
+            return Err(Fault::Syntax(
+                "a server literal cannot be non-synchronizing",
+            ));
         }
         c.i += 1;
     }
@@ -907,7 +1010,9 @@ fn parse_literal(c: &mut Cursor<'_>, allow_non_sync: bool, binary: bool) -> Resu
         return Err(Fault::TooLarge { size, non_sync });
     }
     let n = size as usize;
-    let data = c.b.get(c.i..c.i.saturating_add(n)).ok_or(Fault::Syntax("a literal is cut short"))?;
+    let data =
+        c.b.get(c.i..c.i.saturating_add(n))
+            .ok_or(Fault::Syntax("a literal is cut short"))?;
     if !binary && data.contains(&0) {
         return Err(Fault::Syntax("a literal holds NUL"));
     }
@@ -1047,9 +1152,7 @@ impl Wire for Response {
                     }
                     return Ok(response);
                 }
-                codec::Step::Skip(used) => {
-                    bytes = bytes.get(used..).ok_or(Error::Incomplete)?
-                }
+                codec::Step::Skip(used) => bytes = bytes.get(used..).ok_or(Error::Incomplete)?,
                 _ => return Err(Error::Incomplete),
             }
         }
@@ -1447,7 +1550,11 @@ impl MessageLines {
                 let tag = self.tag.as_deref().map(String::from);
                 if !self.response && !non_sync {
                     self.reset();
-                    let error = Error::LiteralTooLarge { tag, size, waiting: true };
+                    let error = Error::LiteralTooLarge {
+                        tag,
+                        size,
+                        waiting: true,
+                    };
                     return Ok(codec::Step::Item(Err(error), used));
                 }
                 return Err(FrameError::LiteralTooLarge { tag, size });
@@ -1666,12 +1773,10 @@ impl Decode for Responses {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::*;
-    use codec::{
-        Fail, Lcg, Step, Stream,
-    };
+    use codec::{Fail, Lcg, Step, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn cmd(bytes: &[u8]) -> Command {
@@ -1696,7 +1801,14 @@ mod tests {
     #[test]
     fn rfc_commands() {
         let c = cmd(b"a001 login SMITH SESAME\r\n");
-        assert_eq!(c, Command { tag: "a001".into(), name: "LOGIN".into(), args: atoms(&["SMITH", "SESAME"]) });
+        assert_eq!(
+            c,
+            Command {
+                tag: "a001".into(),
+                name: "LOGIN".into(),
+                args: atoms(&["SMITH", "SESAME"])
+            }
+        );
         assert!(c.is("Login"));
         assert_eq!(cmd(b"a002 NOOP\r\n").args, vec![]);
         let c = cmd(b"A142 SELECT INBOX\r\n");
@@ -1706,9 +1818,22 @@ mod tests {
         let c = cmd(b"A682 LIST \"\" *\r\n");
         assert_eq!(c.args, vec![Value::Quoted(vec![]), Value::atom("*")]);
         let c = cmd(b"A654 FETCH 2:4 (FLAGS BODY[HEADER.FIELDS (DATE FROM)])\r\n");
-        assert_eq!(c.args, vec![Value::atom("2:4"), Value::List(atoms(&["FLAGS", "BODY[HEADER.FIELDS (DATE FROM)]"]))]);
+        assert_eq!(
+            c.args,
+            vec![
+                Value::atom("2:4"),
+                Value::List(atoms(&["FLAGS", "BODY[HEADER.FIELDS (DATE FROM)]"]))
+            ]
+        );
         let c = cmd(b"A003 STORE 2:4 +FLAGS (\\Deleted)\r\n");
-        assert_eq!(c.args, vec![Value::atom("2:4"), Value::atom("+FLAGS"), Value::List(atoms(&["\\Deleted"]))]);
+        assert_eq!(
+            c.args,
+            vec![
+                Value::atom("2:4"),
+                Value::atom("+FLAGS"),
+                Value::List(atoms(&["\\Deleted"]))
+            ]
+        );
         let c = cmd(b"A999 UID FETCH 4827313:4828442 FLAGS\r\n");
         assert_eq!(c.name, "UID");
         assert_eq!(c.args, atoms(&["FETCH", "4827313:4828442", "FLAGS"]));
@@ -1719,13 +1844,22 @@ mod tests {
             vec![
                 Value::atom("saved-messages"),
                 Value::List(atoms(&["\\Seen"])),
-                Value::Literal { data: b"Hello Joe!\r\n".to_vec(), non_sync: false },
+                Value::Literal {
+                    data: b"Hello Joe!\r\n".to_vec(),
+                    non_sync: false
+                },
             ]
         );
         let c = cmd(b"a LOGIN {5+}\r\nalice \"p\\\"w\\\\\"\r\n");
         assert_eq!(
             c.args,
-            vec![Value::Literal { data: b"alice".to_vec(), non_sync: true }, Value::Quoted(b"p\"w\\".to_vec())]
+            vec![
+                Value::Literal {
+                    data: b"alice".to_vec(),
+                    non_sync: true
+                },
+                Value::Quoted(b"p\"w\\".to_vec())
+            ]
         );
         assert_eq!(c.args[1].as_str(), Some("p\"w\\"));
         let c = cmd(b"x SEARCH (OR 1 2) NIL () 42\r\n");
@@ -1739,28 +1873,53 @@ mod tests {
     fn rfc_responses() {
         let r = Response::parse(b"* OK IMAP4rev2 Service Ready\r\n").unwrap();
         assert_eq!(r, Response::greeting("IMAP4rev2 Service Ready"));
-        assert_eq!(Response::parse(b"* 172 EXISTS\r\n").unwrap(), Response::exists(172));
+        assert_eq!(
+            Response::parse(b"* 172 EXISTS\r\n").unwrap(),
+            Response::exists(172)
+        );
         let r = Response::parse(b"* OK [UIDVALIDITY 3857529045] UIDs valid\r\n").unwrap();
-        assert_eq!(r, Response::untagged(Status::Ok, "UIDs valid").with_code("UIDVALIDITY 3857529045"));
+        assert_eq!(
+            r,
+            Response::untagged(Status::Ok, "UIDs valid").with_code("UIDVALIDITY 3857529045")
+        );
         let r = Response::parse(b"A142 ok [READ-WRITE] SELECT completed\r\n").unwrap();
-        assert_eq!(r, Response::tagged("A142", Status::Ok, "SELECT completed").with_code("READ-WRITE"));
-        let r = Response::parse(b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n").unwrap();
-        assert_eq!(r, Response::flags(&["\\Answered", "\\Flagged", "\\Deleted", "\\Seen", "\\Draft"]));
+        assert_eq!(
+            r,
+            Response::tagged("A142", Status::Ok, "SELECT completed").with_code("READ-WRITE")
+        );
+        let r = Response::parse(b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n")
+            .unwrap();
+        assert_eq!(
+            r,
+            Response::flags(&["\\Answered", "\\Flagged", "\\Deleted", "\\Seen", "\\Draft"])
+        );
         let r = Response::parse(b"* LIST (\\Noselect) \"/\" \"\"\r\n").unwrap();
         assert_eq!(r, Response::list(&["\\Noselect"], Some('/'), b""));
-        assert_eq!(Response::parse(b"* SEARCH 2 84 882\r\n").unwrap(), Response::search(&[2, 84, 882]));
+        assert_eq!(
+            Response::parse(b"* SEARCH 2 84 882\r\n").unwrap(),
+            Response::search(&[2, 84, 882])
+        );
         assert_eq!(
             Response::parse(b"* CAPABILITY IMAP4rev2 STARTTLS AUTH=GSSAPI\r\n").unwrap(),
             Response::capability(&["IMAP4rev2", "STARTTLS", "AUTH=GSSAPI"])
         );
         let r = Response::parse(b"+ Ready for additional command text\r\n").unwrap();
-        assert_eq!(r, Response::continue_req("Ready for additional command text"));
-        assert_eq!(Response::parse(b"+\r\n").unwrap(), Response::continue_req(""));
+        assert_eq!(
+            r,
+            Response::continue_req("Ready for additional command text")
+        );
+        assert_eq!(
+            Response::parse(b"+\r\n").unwrap(),
+            Response::continue_req("")
+        );
         assert_eq!(
             Response::parse(b"* BYE IMAP4rev2 Server logging out\r\n").unwrap(),
             Response::bye("IMAP4rev2 Server logging out")
         );
-        let r = Response::parse(b"* 12 FETCH (FLAGS (\\Seen) BODY[HEADER] {13}\r\nSubject: hi\r\n)\r\n").unwrap();
+        let r = Response::parse(
+            b"* 12 FETCH (FLAGS (\\Seen) BODY[HEADER] {13}\r\nSubject: hi\r\n)\r\n",
+        )
+        .unwrap();
         assert_eq!(
             r,
             Response::fetch(
@@ -1769,14 +1928,20 @@ mod tests {
                     Value::atom("FLAGS"),
                     Value::List(atoms(&["\\Seen"])),
                     Value::atom("BODY[HEADER]"),
-                    Value::Literal { data: b"Subject: hi\r\n".to_vec(), non_sync: false },
+                    Value::Literal {
+                        data: b"Subject: hi\r\n".to_vec(),
+                        non_sync: false
+                    },
                 ]
             )
         );
         // Codes are recognized only when a space or the end follows ].
         let r = Response::parse(b"a NO [x]y\r\n").unwrap();
         assert_eq!(r, Response::tagged("a", Status::No, "[x]y"));
-        assert_eq!(Response::parse(b"a BAD\r\n").unwrap(), Response::tagged("a", Status::Bad, ""));
+        assert_eq!(
+            Response::parse(b"a BAD\r\n").unwrap(),
+            Response::tagged("a", Status::Bad, "")
+        );
         assert_eq!(
             Response::parse(b"* PREAUTH [ALERT]\r\n").unwrap(),
             Response::untagged(Status::Preauth, "").with_code("ALERT")
@@ -1912,13 +2077,20 @@ mod tests {
         );
         assert_eq!(r.to_bytes().unwrap(), b"* X ((a)(b))\r\n");
         // A list after other items, as in body-ext, keeps its space.
-        let r = Response::Data(vec![Value::List(vec![Value::nil(), Value::List(vec![]), Value::List(vec![])])]);
+        let r = Response::Data(vec![Value::List(vec![
+            Value::nil(),
+            Value::List(vec![]),
+            Value::List(vec![]),
+        ])]);
         assert_eq!(r.to_bytes().unwrap(), b"* (NIL () ())\r\n");
         // Commands keep spaces between lists, as search-key wants.
         let c = Command::new(
             "a",
             "SEARCH",
-            vec![Value::List(vec![Value::List(atoms(&["SEEN"])), Value::List(atoms(&["NEW"]))])],
+            vec![Value::List(vec![
+                Value::List(atoms(&["SEEN"])),
+                Value::List(atoms(&["NEW"])),
+            ])],
         );
         assert_eq!(c.to_bytes().unwrap(), b"a SEARCH ((SEEN) (NEW))\r\n");
         assert!(syntax(b"a SEARCH ((SEEN)(NEW))\r\n"));
@@ -1927,7 +2099,10 @@ mod tests {
         for _ in 0..MAX_DEPTH - 1 {
             value = Value::List(vec![value]);
         }
-        assert_eq!(contract::check_refused(&Response::Data(vec![value])), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Response::Data(vec![value])),
+            Error::Unwritable
+        );
     }
     #[test]
     fn brackets_open_sections_only_after_fetch_items() {
@@ -1944,7 +2119,10 @@ mod tests {
                 .unwrap(),
             b"a SELECT foo[\r\n"
         );
-        assert_eq!(contract::check_refused(&Command::new("a", "X", vec![Value::atom("BODY[")])), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Command::new("a", "X", vec![Value::atom("BODY[")])),
+            Error::Unwritable
+        );
         // header-fld-name is an astring, so it may be quoted or a literal.
         let b: &[u8] = b"a FETCH 1 BODY.PEEK[HEADER.FIELDS ({4}\r\nFrom \"a]b\")]\r\n";
         let ev = events(b);
@@ -1983,19 +2161,40 @@ mod tests {
         // in FETCH BINARY responses and in APPEND.
         let b: &[u8] = b"* 1 FETCH (BINARY[1] ~{3}\r\na\0b)\r\n";
         let r = Response::parse(b).unwrap();
-        let bin = Value::Binary { data: b"a\0b".to_vec(), non_sync: false };
-        assert_eq!(r, Response::fetch(1, vec![Value::atom("BINARY[1]"), bin.clone()]));
+        let bin = Value::Binary {
+            data: b"a\0b".to_vec(),
+            non_sync: false,
+        };
+        assert_eq!(
+            r,
+            Response::fetch(1, vec![Value::atom("BINARY[1]"), bin.clone()])
+        );
         assert_eq!(r.to_bytes().unwrap(), b);
         assert_eq!(responses(b), vec![Ok(r)]);
         let b: &[u8] = b"a APPEND INBOX ~{3+}\r\na\0b\r\n";
         let c = cmd(b);
-        assert_eq!(c.args[1], Value::Binary { data: b"a\0b".to_vec(), non_sync: true });
+        assert_eq!(
+            c.args[1],
+            Value::Binary {
+                data: b"a\0b".to_vec(),
+                non_sync: true
+            }
+        );
         assert_eq!(c.to_bytes().unwrap(), b);
         let ev = events(b"a APPEND INBOX ~{3}\r\na\0b\r\n");
         assert!(matches!(ev[0], Ok(Input::Continue { size: 3, .. })));
         assert!(matches!(&ev[1], Ok(Input::Command(c)) if c.args[1] == bin));
         // Servers never write ~{n+}.
-        let r = Response::fetch(1, vec![Value::atom("BINARY[]"), Value::Binary { data: vec![0], non_sync: true }]);
+        let r = Response::fetch(
+            1,
+            vec![
+                Value::atom("BINARY[]"),
+                Value::Binary {
+                    data: vec![0],
+                    non_sync: true,
+                },
+            ],
+        );
         assert_eq!(contract::check_refused(&r), Error::Unwritable);
         // A plain literal still may not hold NUL, and ~ alone is a word.
         assert!(syntax(b"a X {1}\r\n\0\r\n"));
@@ -2183,11 +2382,7 @@ mod tests {
                 tag: tag.map(String::from),
                 reason,
             };
-            assert_eq!(
-                Command::parse(bytes),
-                Err(error.clone()),
-                "{bytes:?}"
-            );
+            assert_eq!(Command::parse(bytes), Err(error.clone()), "{bytes:?}");
             assert_eq!(decode_all(Inputs::new, bytes), (vec![Err(error)], None));
             contract::check_decode_with_alloc_limit(Inputs::new, bytes, 2 * MAX_LINE);
         }
@@ -2220,10 +2415,7 @@ mod tests {
                     tag: Some("a".into()),
                     reason: "lists nest too deeply",
                 };
-                assert_eq!(
-                    Command::parse(&bytes),
-                    Err(error.clone())
-                );
+                assert_eq!(Command::parse(&bytes), Err(error.clone()));
                 assert_eq!(decode_all(Inputs::new, &bytes), (vec![Err(error)], None));
             }
         }
@@ -2237,10 +2429,7 @@ mod tests {
             tag: Some("a".into()),
             reason: "a quoted string is too long",
         };
-        assert_eq!(
-            Command::parse(&quoted),
-            Err(error.clone())
-        );
+        assert_eq!(Command::parse(&quoted), Err(error.clone()));
         assert_eq!(decode_all(Inputs::new, &quoted), (vec![Err(error)], None));
         assert_eq!(
             Command::parse(b"a X {99999999999999999999999}\r\n"),
@@ -2466,43 +2655,69 @@ mod tests {
 
     #[test]
     fn writers_refuse_size_and_nesting_overflow() {
-        assert_eq!(contract::check_refused(&Command::new(
-            "a",
-            "APPEND",
-            vec![Value::Literal {
-                data: vec![b'x'; MAX_LITERAL + 10],
-                non_sync: true,
-            }],
-        )), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Response::Data(vec![
-            Value::Literal {
-                data: vec![b'y'; MAX_LITERAL],
-                non_sync: false
-            };
-            6
-        ])), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Command::new(
-            "a",
-            "X",
-            vec![Value::atom(&"z".repeat(1000)); 100],
-        )), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Response::greeting(&"é".repeat(MAX_TEXT)).with_code(&"c".repeat(MAX_TEXT))), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Response::continue_req(&"é".repeat(MAX_TEXT))), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Command::new(
-            &"t".repeat(MAX_TEXT * 2),
-            &"n".repeat(MAX_TEXT),
-            vec![Value::nil()],
-        )), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Command::new(
+                "a",
+                "APPEND",
+                vec![Value::Literal {
+                    data: vec![b'x'; MAX_LITERAL + 10],
+                    non_sync: true,
+                }],
+            )),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&Response::Data(vec![
+                Value::Literal {
+                    data: vec![b'y'; MAX_LITERAL],
+                    non_sync: false
+                };
+                6
+            ])),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&Command::new(
+                "a",
+                "X",
+                vec![Value::atom(&"z".repeat(1000)); 100],
+            )),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(
+                &Response::greeting(&"é".repeat(MAX_TEXT)).with_code(&"c".repeat(MAX_TEXT))
+            ),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&Response::continue_req(&"é".repeat(MAX_TEXT))),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&Command::new(
+                &"t".repeat(MAX_TEXT * 2),
+                &"n".repeat(MAX_TEXT),
+                vec![Value::nil()],
+            )),
+            Error::Unwritable
+        );
         let mut value = Value::nil();
         for _ in 0..MAX_DEPTH + 5 {
             value = Value::List(vec![value]);
         }
-        assert_eq!(contract::check_refused(&Command::new("a", "X", vec![value])), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Command::new(
-            "a",
-            "X",
-            vec![Value::Quoted(vec![b'q'; MAX_QUOTED + 1])],
-        )), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Command::new("a", "X", vec![value])),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&Command::new(
+                "a",
+                "X",
+                vec![Value::Quoted(vec![b'q'; MAX_QUOTED + 1])],
+            )),
+            Error::Unwritable
+        );
     }
 
     #[test]
@@ -2521,21 +2736,27 @@ mod tests {
             items[1],
             Ok(Input::Command(Command::new("b", "NOOP", vec![])))
         );
-        assert_eq!(contract::check_refused(&Command::new(
-            "a",
-            "X",
-            vec![
-                Value::string(b"a\0b"),
-                Value::Literal {
-                    data: b"\0c\0".to_vec(),
-                    non_sync: true,
-                },
-            ],
-        )), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Response::fetch(
-            1,
-            vec![Value::atom("BODY[]"), Value::string(b"x\r\n\0")],
-        )), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Command::new(
+                "a",
+                "X",
+                vec![
+                    Value::string(b"a\0b"),
+                    Value::Literal {
+                        data: b"\0c\0".to_vec(),
+                        non_sync: true,
+                    },
+                ],
+            )),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&Response::fetch(
+                1,
+                vec![Value::atom("BODY[]"), Value::string(b"x\r\n\0")],
+            )),
+            Error::Unwritable
+        );
     }
 
     #[test]
@@ -2553,15 +2774,21 @@ mod tests {
         let command = cmd("a X \"é\"\r\n".as_bytes());
         assert_eq!(command.args[0].as_str(), Some("é"));
         assert_eq!(cmd(&command.to_bytes().unwrap()), command);
-        assert_eq!(contract::check_refused(&Command::new(
-            "a",
-            "X",
-            vec![Value::Quoted(b"\xff".to_vec())],
-        )), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Response::Data(vec![
-            Value::atom("X"),
-            Value::Quoted(b"a\x80".to_vec()),
-        ])), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Command::new(
+                "a",
+                "X",
+                vec![Value::Quoted(b"\xff".to_vec())],
+            )),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&Response::Data(vec![
+                Value::atom("X"),
+                Value::Quoted(b"a\x80".to_vec()),
+            ])),
+            Error::Unwritable
+        );
         let command = Command::new(
             "a",
             "X",
@@ -2652,10 +2879,16 @@ mod tests {
             };
             100
         ]);
-        assert_eq!(contract::check_refused(&Response::Data(vec![value])), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Response::Data(vec![Value::List(vec![Value::atom(
-            &"a".repeat(MAX_TEXT + 1),
-        )])])), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Response::Data(vec![value])),
+            Error::Unwritable
+        );
+        assert_eq!(
+            contract::check_refused(&Response::Data(vec![Value::List(vec![Value::atom(
+                &"a".repeat(MAX_TEXT + 1),
+            )])])),
+            Error::Unwritable
+        );
     }
 
     #[test]
@@ -2670,14 +2903,17 @@ mod tests {
             }],
         );
         assert!(command.to_bytes().unwrap().starts_with(b"a X {4097}\r\n"));
-        assert_eq!(contract::check_refused(&Command::new(
-            "a",
-            "X",
-            vec![Value::Literal {
-                data: long,
-                non_sync: true,
-            }],
-        )), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Command::new(
+                "a",
+                "X",
+                vec![Value::Literal {
+                    data: long,
+                    non_sync: true,
+                }],
+            )),
+            Error::Unwritable
+        );
         let command = Command::new(
             "a",
             "X",
@@ -2719,7 +2955,10 @@ mod tests {
             data: vec![b'y'; MAX_LITERAL],
             non_sync: false,
         };
-        assert_eq!(contract::check_refused(&Command::new("a", "X", vec![big; 6])), Error::Unwritable);
+        assert_eq!(
+            contract::check_refused(&Command::new("a", "X", vec![big; 6])),
+            Error::Unwritable
+        );
     }
 
     #[test]

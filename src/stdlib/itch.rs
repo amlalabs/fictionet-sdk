@@ -63,11 +63,11 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use fictionet::stdlib::codec::field;
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Wire};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::field;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::str::FromStr;
@@ -284,7 +284,9 @@ impl FromStr for Price8 {
     type Err = Error;
     /// Reads a decimal with at most eight places.
     fn from_str(s: &str) -> Result<Self, Error> {
-        field::parse_decimal(s, 8).map_err(|_| Error::Price).map(Self)
+        field::parse_decimal(s, 8)
+            .map_err(|_| Error::Price)
+            .map(Self)
     }
 }
 impl Field for Price8 {
@@ -423,7 +425,9 @@ fn envelope(b: &[u8]) -> Result<(u8, &[u8]), Error> {
 }
 
 fn check_length(b: &[u8], len: usize) -> Result<(), Error> {
-    if b.len() != len { return Err(Error::Length); }
+    if b.len() != len {
+        return Err(Error::Length);
+    }
     Ok(())
 }
 
@@ -836,10 +840,14 @@ impl Prefixed for Message {
     const NAME: &'static str = "ITCH";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_FRAME }
+    fn default_limit() -> Self::Limit {
+        MAX_FRAME
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_FRAME) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_FRAME)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -848,7 +856,10 @@ impl Prefixed for Message {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         let Some((prefix, rest)) = input.split_at_checked(LENGTH_PREFIX) else {
             return Ok(None);
@@ -863,7 +874,6 @@ impl Prefixed for Message {
         Ok(Some((Message::parse(body), LENGTH_PREFIX + length)))
     }
 }
-
 
 /// The limits of a [`Book`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1225,10 +1235,10 @@ fn level(price: Price4, a: &Aggregate) -> Level {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg,
+    use fictionet::stdlib::codec::{Fail, Lcg};
+    use fictionet::stdlib::test_support::contract::{
+        check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
     };
-    use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn ts(n: u64) -> Timestamp {

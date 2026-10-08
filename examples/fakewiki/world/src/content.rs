@@ -27,7 +27,13 @@ const STANCE: &str = "x-fakewiki-stance";
 
 /// Headers that belong to one connection, which hyper must not see in an
 /// HTTP/2 response.
-const HOP_BY_HOP: [&str; 5] = ["connection", "keep-alive", "transfer-encoding", "proxy-connection", "upgrade"];
+const HOP_BY_HOP: [&str; 5] = [
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "proxy-connection",
+    "upgrade",
+];
 
 #[derive(Clone)]
 pub struct Content {
@@ -41,10 +47,21 @@ impl Content {
         Content { client, port }
     }
 
-    async fn serve(self, request: Request<Body>) -> Result<Response<Full<Bytes>>, fictionet::Error> {
-        let target = request.extensions().get::<web::Target>().cloned().ok_or_else(|| fictionet::Error::msg("request without a web::Target"))?;
+    async fn serve(
+        self,
+        request: Request<Body>,
+    ) -> Result<Response<Full<Bytes>>, fictionet::Error> {
+        let target = request
+            .extensions()
+            .get::<web::Target>()
+            .cloned()
+            .ok_or_else(|| fictionet::Error::msg("request without a web::Target"))?;
         let method = request.method().clone();
-        let path = request.uri().path_and_query().map(|p| p.as_str().to_owned()).unwrap_or_else(|| "/".into());
+        let path = request
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_owned())
+            .unwrap_or_else(|| "/".into());
         let ua = request.headers().get(USER_AGENT).cloned();
 
         let reply = async {
@@ -63,7 +80,9 @@ impl Content {
         let (mut parts, body) = match reply.await {
             Ok(r) => r,
             Err(e) => {
-                let mut response = Response::new(Full::new(Bytes::from_static(b"The site failed to answer.\n")));
+                let mut response = Response::new(Full::new(Bytes::from_static(
+                    b"The site failed to answer.\n",
+                )));
                 *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                 let page = Page {
                     kind: "backend_error".into(),
@@ -78,7 +97,12 @@ impl Content {
             }
         };
 
-        let mut take = |name: &str| parts.headers.remove(name).map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+        let mut take = |name: &str| {
+            parts
+                .headers
+                .remove(name)
+                .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        };
         let page = Page {
             kind: take(KIND).unwrap_or_else(|| "other".into()),
             topic: take(TOPIC),

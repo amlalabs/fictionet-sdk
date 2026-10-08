@@ -45,27 +45,30 @@ fn parse(argv: &[String], env: impl Fn(&str) -> Option<String>) -> Result<Args, 
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--api-server" => {
-                let host = env("KUBERNETES_SERVICE_HOST").ok_or("--api-server: KUBERNETES_SERVICE_HOST is not set")?;
-                let port = env("KUBERNETES_SERVICE_PORT").ok_or("--api-server: KUBERNETES_SERVICE_PORT is not set")?;
-                let ip = host
-                    .parse::<std::net::IpAddr>()
-                    .map_err(|_| format!("--api-server: KUBERNETES_SERVICE_HOST is {host:?}, not an IP address"))?;
-                let port = port
-                    .parse::<u16>()
-                    .map_err(|_| format!("--api-server: KUBERNETES_SERVICE_PORT is {port:?}, not a port"))?;
+                let host = env("KUBERNETES_SERVICE_HOST")
+                    .ok_or("--api-server: KUBERNETES_SERVICE_HOST is not set")?;
+                let port = env("KUBERNETES_SERVICE_PORT")
+                    .ok_or("--api-server: KUBERNETES_SERVICE_PORT is not set")?;
+                let ip = host.parse::<std::net::IpAddr>().map_err(|_| {
+                    format!("--api-server: KUBERNETES_SERVICE_HOST is {host:?}, not an IP address")
+                })?;
+                let port = port.parse::<u16>().map_err(|_| {
+                    format!("--api-server: KUBERNETES_SERVICE_PORT is {port:?}, not a port")
+                })?;
                 addresses.push(SocketAddr::new(ip, port));
             }
             "--timeout" => {
                 let v = it.next().ok_or("--timeout needs a value")?;
-                let secs = v
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|&s| s >= 1)
-                    .ok_or_else(|| format!("--timeout: {v:?} is not a whole number of seconds, at least 1"))?;
+                let secs = v.parse::<u64>().ok().filter(|&s| s >= 1).ok_or_else(|| {
+                    format!("--timeout: {v:?} is not a whole number of seconds, at least 1")
+                })?;
                 timeout = Duration::from_secs(secs);
             }
             a if a.starts_with('-') => return Err(format!("unknown flag {a}")),
-            a => addresses.push(a.parse().map_err(|_| format!("{a:?} is not an ip:port address"))?),
+            a => addresses.push(
+                a.parse()
+                    .map_err(|_| format!("{a:?} is not an ip:port address"))?,
+            ),
         }
     }
     if addresses.is_empty() {
@@ -99,11 +102,18 @@ fn classify(e: &std::io::Error) -> Outcome {
 
 fn probe(a: SocketAddr) -> Outcome {
     // A socket that cannot even be made says nothing about the network.
-    let family = if a.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let family = if a.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
     // SAFETY: socket takes no pointers; the descriptor is closed at once.
     let fd = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
-        return Outcome::Unknown(format!("making a socket: {}", std::io::Error::last_os_error()));
+        return Outcome::Unknown(format!(
+            "making a socket: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // SAFETY: fd is a descriptor this function just made.
     unsafe { libc::close(fd) };
@@ -116,17 +126,27 @@ fn probe(a: SocketAddr) -> Outcome {
 /// Each address with what trying it showed, tried all at once.
 fn try_all(addresses: &[SocketAddr]) -> Vec<(SocketAddr, Outcome)> {
     std::thread::scope(|s| {
-        let tries: Vec<_> = addresses.iter().map(|&a| s.spawn(move || (a, probe(a)))).collect();
+        let tries: Vec<_> = addresses
+            .iter()
+            .map(|&a| s.spawn(move || (a, probe(a))))
+            .collect();
         tries
             .into_iter()
             .zip(addresses)
-            .map(|(t, &a)| t.join().unwrap_or((a, Outcome::Unknown("the probe thread panicked".into()))))
+            .map(|(t, &a)| {
+                t.join()
+                    .unwrap_or((a, Outcome::Unknown("the probe thread panicked".into())))
+            })
             .collect()
     })
 }
 
 fn list(addresses: &[SocketAddr]) -> String {
-    addresses.iter().map(SocketAddr::to_string).collect::<Vec<_>>().join(", ")
+    addresses
+        .iter()
+        .map(SocketAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The addresses that are not blocked, and why, for the log.
@@ -135,7 +155,9 @@ fn describe(outcomes: &[(SocketAddr, Outcome)]) -> String {
         .iter()
         .filter_map(|(a, o)| match o {
             Outcome::Open => Some(format!("{a} still reachable")),
-            Outcome::Unknown(why) => Some(format!("{a} failed ({why}), which does not show a block")),
+            Outcome::Unknown(why) => {
+                Some(format!("{a} failed ({why}), which does not show a block"))
+            }
             Outcome::Blocked => None,
         })
         .collect::<Vec<_>>()
@@ -181,7 +203,11 @@ pub(crate) fn main(argv: &[String]) -> i32 {
                 "fictionet wait-blocked: after {} s, {}. Check that the cluster's CNI enforces NetworkPolicy, \
                  and that no other policy allows this pod's traffic",
                 args.timeout.as_secs(),
-                if now.is_empty() { last.as_str() } else { now.as_str() },
+                if now.is_empty() {
+                    last.as_str()
+                } else {
+                    now.as_str()
+                },
             );
             return 1;
         }
@@ -205,8 +231,18 @@ mod tests {
             "KUBERNETES_SERVICE_PORT" => Some("443".to_string()),
             _ => None,
         };
-        let a = parse(&args(&["--api-server", "1.1.1.1:443", "--timeout", "5"]), env).unwrap();
-        assert_eq!(a.addresses, ["[fd00:10:96::1]:443".parse().unwrap(), "1.1.1.1:443".parse().unwrap()]);
+        let a = parse(
+            &args(&["--api-server", "1.1.1.1:443", "--timeout", "5"]),
+            env,
+        )
+        .unwrap();
+        assert_eq!(
+            a.addresses,
+            [
+                "[fd00:10:96::1]:443".parse().unwrap(),
+                "1.1.1.1:443".parse().unwrap()
+            ]
+        );
         assert_eq!(a.timeout, Duration::from_secs(5));
     }
 
@@ -221,8 +257,20 @@ mod tests {
         ] {
             assert_eq!(classify(&Error::from(kind)), Outcome::Blocked, "{kind:?}");
         }
-        for errno in [libc::EPERM, libc::EACCES, libc::EMFILE, libc::EADDRNOTAVAIL, libc::ENOBUFS] {
-            assert!(matches!(classify(&Error::from_raw_os_error(errno)), Outcome::Unknown(_)), "{errno}");
+        for errno in [
+            libc::EPERM,
+            libc::EACCES,
+            libc::EMFILE,
+            libc::EADDRNOTAVAIL,
+            libc::ENOBUFS,
+        ] {
+            assert!(
+                matches!(
+                    classify(&Error::from_raw_os_error(errno)),
+                    Outcome::Unknown(_)
+                ),
+                "{errno}"
+            );
         }
     }
 

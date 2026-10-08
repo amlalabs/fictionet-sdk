@@ -28,7 +28,10 @@ pub(crate) struct Moved {
 /// on the world's side, or one on the client's side other than a reset.
 /// Clients often close with a reset, such as curl with TLS data it did not
 /// read, so that is an ordinary end.
-pub(crate) async fn tunnel(client: &mut TcpStream, world: &mut Compat<TcpConnection>) -> (Moved, Option<String>) {
+pub(crate) async fn tunnel(
+    client: &mut TcpStream,
+    world: &mut Compat<TcpConnection>,
+) -> (Moved, Option<String>) {
     let (mut cr, mut cw) = client.split();
     let (mut wr, mut ww) = tokio::io::split(world);
     let mut moved = Moved::default();
@@ -36,7 +39,12 @@ pub(crate) async fn tunnel(client: &mut TcpStream, world: &mut Compat<TcpConnect
     let mut error = None;
     {
         let mut up = std::pin::pin!(copy_counting(&mut cr, &mut ww, &mut moved.up, Side::Client));
-        let mut down = std::pin::pin!(copy_counting(&mut wr, &mut cw, &mut moved.down, Side::World));
+        let mut down = std::pin::pin!(copy_counting(
+            &mut wr,
+            &mut cw,
+            &mut moved.down,
+            Side::World
+        ));
         std::future::poll_fn(|cx| {
             if !up_done && let Poll::Ready(r) = up.as_mut().poll(cx) {
                 up_done = true;
@@ -51,12 +59,23 @@ pub(crate) async fn tunnel(client: &mut TcpStream, world: &mut Compat<TcpConnect
                 }
             }
             // An error on one side ends the other at once.
-            if (up_done && down_done) || error.is_some() { Poll::Ready(()) } else { Poll::Pending }
+            if (up_done && down_done) || error.is_some() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
         })
         .await;
     }
     let why = error.and_then(|(side, e)| match side {
-        Side::Client if matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe) => None,
+        Side::Client
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            None
+        }
         Side::Client => Some(format!("the client: {e}")),
         Side::World => Some(format!("the world: {e}")),
     });
@@ -81,7 +100,12 @@ impl Side {
 
 /// Copies `from` (on side `from_side`) to `to` until `from` ends, then
 /// shuts `to`'s sending side down. Counts the bytes in `count` as they go.
-async fn copy_counting<R, W>(from: &mut R, to: &mut W, count: &mut u64, from_side: Side) -> Result<(), (Side, io::Error)>
+async fn copy_counting<R, W>(
+    from: &mut R,
+    to: &mut W,
+    count: &mut u64,
+    from_side: Side,
+) -> Result<(), (Side, io::Error)>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -92,7 +116,9 @@ where
         if n == 0 {
             return to.shutdown().await.map_err(|e| (from_side.other(), e));
         }
-        to.write_all(&buf[..n]).await.map_err(|e| (from_side.other(), e))?;
+        to.write_all(&buf[..n])
+            .await
+            .map_err(|e| (from_side.other(), e))?;
         *count += n as u64;
     }
 }
@@ -102,7 +128,10 @@ where
 /// rest of a request body, before it is dropped. For a plain-HTTP request
 /// forwarded with `Connection: close`, where the world's answer ends the
 /// exchange. Returns `up`'s result, if it finished, and `down`'s.
-pub(crate) async fn until_down_ends<U: Future, D: Future>(up: U, down: D) -> (Option<U::Output>, D::Output) {
+pub(crate) async fn until_down_ends<U: Future, D: Future>(
+    up: U,
+    down: D,
+) -> (Option<U::Output>, D::Output) {
     let mut up = std::pin::pin!(up);
     let mut down = std::pin::pin!(down);
     let mut up_result = None;

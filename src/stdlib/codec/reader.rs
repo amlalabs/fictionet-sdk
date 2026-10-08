@@ -15,7 +15,9 @@ pub fn be16(bytes: &[u8], at: usize) -> Option<u16> {
 #[inline]
 pub fn be24(bytes: &[u8], at: usize) -> Option<u32> {
     let end = at.checked_add(3)?;
-    let &[a, b, c] = bytes.get(at..end)? else { return None; };
+    let &[a, b, c] = bytes.get(at..end)? else {
+        return None;
+    };
     Some(u32::from_be_bytes([0, a, b, c]))
 }
 
@@ -40,7 +42,9 @@ pub fn le16(bytes: &[u8], at: usize) -> Option<u16> {
 #[inline]
 pub fn le24(bytes: &[u8], at: usize) -> Option<u32> {
     let end = at.checked_add(3)?;
-    let &[a, b, c] = bytes.get(at..end)? else { return None; };
+    let &[a, b, c] = bytes.get(at..end)? else {
+        return None;
+    };
     Some(u32::from_le_bytes([a, b, c, 0]))
 }
 
@@ -100,28 +104,40 @@ pub struct Reader<'a> {
 impl<'a> Reader<'a> {
     /// Starts at the first byte of `bytes`.
     #[inline]
-    pub fn new(bytes: &'a [u8]) -> Self { Self { bytes, position: 0 } }
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
 
     /// Returns the number of unread bytes.
     #[inline]
-    pub fn remaining(&self) -> usize { self.bytes.len() - self.position }
+    pub fn remaining(&self) -> usize {
+        self.bytes.len() - self.position
+    }
 
     /// Returns the number of bytes consumed.
     #[inline]
-    pub fn position(&self) -> usize { self.position }
+    pub fn position(&self) -> usize {
+        self.position
+    }
 
     /// Reports whether every byte has been consumed.
     #[inline]
-    pub fn is_empty(&self) -> bool { self.remaining() == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.remaining() == 0
+    }
 
     /// Returns the next byte without consuming it.
     #[inline]
-    pub fn peek_u8(&self) -> Option<u8> { self.bytes.get(self.position).copied() }
+    pub fn peek_u8(&self) -> Option<u8> {
+        self.bytes.get(self.position).copied()
+    }
 
     /// Consumes `n` bytes or leaves the position unchanged on truncation.
     #[inline]
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], Truncated> {
-        if n > self.remaining() { return Err(Truncated); }
+        if n > self.remaining() {
+            return Err(Truncated);
+        }
         let start = self.position;
         self.position += n;
         Ok(&self.bytes[start..self.position])
@@ -129,7 +145,9 @@ impl<'a> Reader<'a> {
 
     /// Skips `n` bytes or leaves the position unchanged on truncation.
     #[inline]
-    pub fn skip(&mut self, n: usize) -> Result<(), Truncated> { self.take(n).map(|_| ()) }
+    pub fn skip(&mut self, n: usize) -> Result<(), Truncated> {
+        self.take(n).map(|_| ())
+    }
 
     /// Consumes an array of `N` bytes.
     #[inline]
@@ -141,67 +159,99 @@ impl<'a> Reader<'a> {
 
     /// Consumes one byte.
     #[inline]
-    pub fn u8(&mut self) -> Result<u8, Truncated> { Ok(self.take(1)?[0]) }
+    pub fn u8(&mut self) -> Result<u8, Truncated> {
+        Ok(self.take(1)?[0])
+    }
 
     /// Consumes a u16 in big-endian order.
     #[inline]
-    pub fn u16_be(&mut self) -> Result<u16, Truncated> { self.array().map(u16::from_be_bytes) }
+    pub fn u16_be(&mut self) -> Result<u16, Truncated> {
+        self.array().map(u16::from_be_bytes)
+    }
 
     /// Consumes a u16 in little-endian order.
     #[inline]
-    pub fn u16_le(&mut self) -> Result<u16, Truncated> { self.array().map(u16::from_le_bytes) }
+    pub fn u16_le(&mut self) -> Result<u16, Truncated> {
+        self.array().map(u16::from_le_bytes)
+    }
 
     /// Consumes a u32 in big-endian order.
     #[inline]
-    pub fn u32_be(&mut self) -> Result<u32, Truncated> { self.array().map(u32::from_be_bytes) }
+    pub fn u32_be(&mut self) -> Result<u32, Truncated> {
+        self.array().map(u32::from_be_bytes)
+    }
 
     /// Consumes a u32 in little-endian order.
     #[inline]
-    pub fn u32_le(&mut self) -> Result<u32, Truncated> { self.array().map(u32::from_le_bytes) }
+    pub fn u32_le(&mut self) -> Result<u32, Truncated> {
+        self.array().map(u32::from_le_bytes)
+    }
 
     /// Consumes a u64 in big-endian order.
     #[inline]
-    pub fn u64_be(&mut self) -> Result<u64, Truncated> { self.array().map(u64::from_be_bytes) }
+    pub fn u64_be(&mut self) -> Result<u64, Truncated> {
+        self.array().map(u64::from_be_bytes)
+    }
 
     /// Consumes a u64 in little-endian order.
     #[inline]
-    pub fn u64_le(&mut self) -> Result<u64, Truncated> { self.array().map(u64::from_le_bytes) }
+    pub fn u64_le(&mut self) -> Result<u64, Truncated> {
+        self.array().map(u64::from_le_bytes)
+    }
 
     /// Consumes a i16 in big-endian order.
     #[inline]
-    pub fn i16_be(&mut self) -> Result<i16, Truncated> { self.array().map(i16::from_be_bytes) }
+    pub fn i16_be(&mut self) -> Result<i16, Truncated> {
+        self.array().map(i16::from_be_bytes)
+    }
 
     /// Consumes a i16 in little-endian order.
     #[inline]
-    pub fn i16_le(&mut self) -> Result<i16, Truncated> { self.array().map(i16::from_le_bytes) }
+    pub fn i16_le(&mut self) -> Result<i16, Truncated> {
+        self.array().map(i16::from_le_bytes)
+    }
 
     /// Consumes a i32 in big-endian order.
     #[inline]
-    pub fn i32_be(&mut self) -> Result<i32, Truncated> { self.array().map(i32::from_be_bytes) }
+    pub fn i32_be(&mut self) -> Result<i32, Truncated> {
+        self.array().map(i32::from_be_bytes)
+    }
 
     /// Consumes a i32 in little-endian order.
     #[inline]
-    pub fn i32_le(&mut self) -> Result<i32, Truncated> { self.array().map(i32::from_le_bytes) }
+    pub fn i32_le(&mut self) -> Result<i32, Truncated> {
+        self.array().map(i32::from_le_bytes)
+    }
 
     /// Consumes a i64 in big-endian order.
     #[inline]
-    pub fn i64_be(&mut self) -> Result<i64, Truncated> { self.array().map(i64::from_be_bytes) }
+    pub fn i64_be(&mut self) -> Result<i64, Truncated> {
+        self.array().map(i64::from_be_bytes)
+    }
 
     /// Consumes a i64 in little-endian order.
     #[inline]
-    pub fn i64_le(&mut self) -> Result<i64, Truncated> { self.array().map(i64::from_le_bytes) }
+    pub fn i64_le(&mut self) -> Result<i64, Truncated> {
+        self.array().map(i64::from_le_bytes)
+    }
 
     /// Consumes a f64 in big-endian order.
     #[inline]
-    pub fn f64_be(&mut self) -> Result<f64, Truncated> { self.array().map(f64::from_be_bytes) }
+    pub fn f64_be(&mut self) -> Result<f64, Truncated> {
+        self.array().map(f64::from_be_bytes)
+    }
 
     /// Consumes a f64 in little-endian order.
     #[inline]
-    pub fn f64_le(&mut self) -> Result<f64, Truncated> { self.array().map(f64::from_le_bytes) }
+    pub fn f64_le(&mut self) -> Result<f64, Truncated> {
+        self.array().map(f64::from_le_bytes)
+    }
 
     /// Consumes a signed byte.
     #[inline]
-    pub fn i8(&mut self) -> Result<i8, Truncated> { self.u8().map(|b| b as i8) }
+    pub fn i8(&mut self) -> Result<i8, Truncated> {
+        self.u8().map(|b| b as i8)
+    }
 
     /// Consumes a three-byte integer in big-endian order.
     #[inline]
@@ -228,7 +278,11 @@ impl<'a> Reader<'a> {
     /// Checks that no unread bytes remain.
     #[inline]
     pub fn finish(&self) -> Result<(), Trailing> {
-        if self.is_empty() { Ok(()) } else { Err(Trailing(self.remaining())) }
+        if self.is_empty() {
+            Ok(())
+        } else {
+            Err(Trailing(self.remaining()))
+        }
     }
 }
 

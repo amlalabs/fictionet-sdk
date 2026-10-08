@@ -38,19 +38,31 @@ use fictionet::stdlib::bgp::afi;
 
 use fictionet::stdlib::bgp::kind;
 
+use fictionet::stdlib::bgp::harness::{encode, mixes};
 use fictionet::stdlib::bgp::safi;
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::bgp::harness::{encode, mixes};
 use libfuzzer_sys::fuzz_target;
 
 /// Every combination of the session settings.
 const CONTEXTS: [Context; 4] = [
-    Context { four_octet_as: false, enhanced_route_refresh: false },
-    Context { four_octet_as: true, enhanced_route_refresh: false },
-    Context { four_octet_as: false, enhanced_route_refresh: true },
-    Context { four_octet_as: true, enhanced_route_refresh: true },
+    Context {
+        four_octet_as: false,
+        enhanced_route_refresh: false,
+    },
+    Context {
+        four_octet_as: true,
+        enhanced_route_refresh: false,
+    },
+    Context {
+        four_octet_as: false,
+        enhanced_route_refresh: true,
+    },
+    Context {
+        four_octet_as: true,
+        enhanced_route_refresh: true,
+    },
 ];
 
 /// An UPDATE built from the bytes as world code would build one, with
@@ -61,28 +73,44 @@ fn update_from(data: &[u8]) -> Update {
     let mut byte = move || it.next().unwrap_or(0);
     let prefix = |b: &mut dyn FnMut() -> u8| {
         let addr = Ipv4Addr::new(b(), b(), b(), b());
-        Prefix { addr: IpAddr::V4(addr), length: b() % 34 }
+        Prefix {
+            addr: IpAddr::V4(addr),
+            length: b() % 34,
+        }
     };
     let what = byte();
-    let withdrawn = (0..usize::from(byte()) * 17).map(|_| prefix(&mut byte)).collect();
+    let withdrawn = (0..usize::from(byte()) * 17)
+        .map(|_| prefix(&mut byte))
+        .collect();
     let mut attributes = Vec::new();
     if what & 1 != 0 {
         attributes.push(Attribute::MpReach(MpReach {
-            afi: if byte() % 2 == 0 { afi::IPV4 } else { afi::IPV6 },
+            afi: if byte() % 2 == 0 {
+                afi::IPV4
+            } else {
+                afi::IPV6
+            },
             safi: safi::UNICAST,
             next_hop: vec![0x20; usize::from(byte() % 40)],
-            nlri: Nlri::Prefixes(vec![Prefix::new(IpAddr::V6(Ipv6Addr::LOCALHOST), byte() % 129).unwrap()]),
+            nlri: Nlri::Prefixes(vec![
+                Prefix::new(IpAddr::V6(Ipv6Addr::LOCALHOST), byte() % 129).unwrap(),
+            ]),
         }));
     }
     if what & 2 != 0 {
         attributes.push(Attribute::Origin(Origin::Igp));
-        attributes
-            .push(Attribute::AsPath(vec![Segment { kind: SegmentKind::Sequence, asns: vec![u32::from(byte() % 3)] }]));
+        attributes.push(Attribute::AsPath(vec![Segment {
+            kind: SegmentKind::Sequence,
+            asns: vec![u32::from(byte() % 3)],
+        }]));
         attributes.push(Attribute::NextHop(Ipv4Addr::new(byte(), 0, 0, 1)));
     }
     if what & 4 != 0 {
         let values = (0..byte() % 3).map(|n| u32::from(n)).collect();
-        attributes.push(Attribute::Communities { values, partial: byte() % 2 == 0 });
+        attributes.push(Attribute::Communities {
+            values,
+            partial: byte() % 2 == 0,
+        });
     }
     if what & 8 != 0 {
         attributes.push(Attribute::Aggregator {
@@ -93,17 +121,37 @@ fn update_from(data: &[u8]) -> Update {
     }
     if what & 16 != 0 {
         let value = (0..byte() % 12).map(|_| byte()).collect();
-        attributes.push(Attribute::Unknown { flags: byte(), kind: 16 + byte() % 4, value });
+        attributes.push(Attribute::Unknown {
+            flags: byte(),
+            kind: 16 + byte() % 4,
+            value,
+        });
     }
-    let nlri = if what & 32 != 0 { vec![prefix(&mut byte)] } else { vec![] };
-    Update { withdrawn, attributes, nlri }
+    let nlri = if what & 32 != 0 {
+        vec![prefix(&mut byte)]
+    } else {
+        vec![]
+    };
+    Update {
+        withdrawn,
+        attributes,
+        nlri,
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * Frames::<Frame>::new().capacity());
+    contract::check_decode_with_alloc_limit(
+        Frames::<Frame>::new,
+        data,
+        2 * Frames::<Frame>::new().capacity(),
+    );
     contract::check_wire::<Frame>(data);
     contract::check_wire::<Open>(data);
-    contract::check_decode_with_alloc_limit(|| Frames::<Frame>::new().map(|frame| Message::decode(&frame, &Context::default())), data, 2 * Frames::<Frame>::new().capacity());
+    contract::check_decode_with_alloc_limit(
+        || Frames::<Frame>::new().map(|frame| Message::decode(&frame, &Context::default())),
+        data,
+        2 * Frames::<Frame>::new().capacity(),
+    );
     let built = Frame {
         kind: data.first().copied().unwrap_or(0),
         body: data.iter().take(MAX_BODY_LEN + 1).copied().collect(),
@@ -113,7 +161,10 @@ fuzz_target!(|data: &[u8]| {
     let frames = decode_all(Frames::<Frame>::new, data).0;
 
     // Any bytes as the body of each message type, too.
-    let bodies = (1..=6).map(|kind| Frame { kind, body: data.to_vec() });
+    let bodies = (1..=6).map(|kind| Frame {
+        kind,
+        body: data.to_vec(),
+    });
     for f in frames.into_iter().chain(bodies) {
         for negotiated in CONTEXTS {
             let strict = Message::decode(&f, &negotiated);
@@ -131,7 +182,13 @@ fuzz_target!(|data: &[u8]| {
                     }
                     Err(e) => {
                         assert!(strict.is_err());
-                        assert!(encode(&Message::Notification(e.notification().unwrap()), &negotiated).is_ok());
+                        assert!(
+                            encode(
+                                &Message::Notification(e.notification().unwrap()),
+                                &negotiated
+                            )
+                            .is_ok()
+                        );
                     }
                 }
             }
@@ -158,11 +215,20 @@ fuzz_target!(|data: &[u8]| {
     // The body readers on their own, given bodies of any length: what
     // they read can be written, and their errors can be sent.
     let negotiated = CONTEXTS[1];
-    let read = [Open::parse(data).map(Message::Open), Update::parse(data, &negotiated).map(Message::Update)];
+    let read = [
+        Open::parse(data).map(Message::Open),
+        Update::parse(data, &negotiated).map(Message::Update),
+    ];
     for r in read {
         match r {
             Ok(m) => assert!(mixes(&m) || encode(&m, &negotiated).is_ok()),
-            Err(e) => assert!(encode(&Message::Notification(e.notification().unwrap()), &negotiated).is_ok()),
+            Err(e) => assert!(
+                encode(
+                    &Message::Notification(e.notification().unwrap()),
+                    &negotiated
+                )
+                .is_ok()
+            ),
         }
     }
     // An UPDATE built from public fields: a frame the writer gives fits in

@@ -27,9 +27,11 @@ pub fn hex(text: &str) -> Vec<u8> {
     let mut digits = text.bytes().filter(|b| !b.is_ascii_whitespace());
     let mut out = Vec::new();
     while let Some(high) = digits.next() {
-        let high = fictionet::stdlib::codec::ascii::hex_value(high).expect("non-hex character in test data");
+        let high = fictionet::stdlib::codec::ascii::hex_value(high)
+            .expect("non-hex character in test data");
         let low = digits.next().expect("odd hex digit count in test data");
-        let low = fictionet::stdlib::codec::ascii::hex_value(low).expect("non-hex character in test data");
+        let low = fictionet::stdlib::codec::ascii::hex_value(low)
+            .expect("non-hex character in test data");
         out.push(high << 4 | low);
     }
     out
@@ -280,20 +282,26 @@ pub fn check_work<D: Decode>(
     measured: impl Fn(&D) -> u64,
     fixed_allowance: u64,
     units_per_byte: u64,
-) where D::Error: Clone {
+) where
+    D::Error: Clone,
+{
     for chunk in [bytes.len().max(1), 1] {
         let mut stream = Stream::new(make());
         let mut accepted = 0usize;
         let mut previous = 0;
         let mut audit = |stream: &mut Stream<D>, accepted: usize| {
-            let allowance = u64::try_from(accepted).ok()
+            let allowance = u64::try_from(accepted)
+                .ok()
                 .and_then(|n| units_per_byte.checked_mul(n))
                 .and_then(|n| fixed_allowance.checked_add(n))
                 .expect("work allowance overflow");
             let used = measured(stream.decoder());
             assert!(used < u64::MAX, "work measurement saturated");
             assert!(used >= previous, "work measurement decreased");
-            assert!(used <= allowance, "work {used} exceeds allowance {allowance}");
+            assert!(
+                used <= allowance,
+                "work {used} exceeds allowance {allowance}"
+            );
             previous = used;
         };
         audit(&mut stream, accepted);
@@ -383,8 +391,14 @@ mod tests {
         type Item = ();
         type Error = core::convert::Infallible;
         const NAME: &'static str = "counted";
-        fn capacity(&self) -> usize { 1024 }
-        fn decode(&mut self, _: &[u8], _: bool) -> Result<fictionet::stdlib::codec::Step<()>, Self::Error> {
+        fn capacity(&self) -> usize {
+            1024
+        }
+        fn decode(
+            &mut self,
+            _: &[u8],
+            _: bool,
+        ) -> Result<fictionet::stdlib::codec::Step<()>, Self::Error> {
             self.0 += 1;
             Ok(fictionet::stdlib::codec::Step::Need)
         }
@@ -417,12 +431,29 @@ mod tests {
     #[test]
     #[should_panic(expected = "refused operation changed state")]
     fn atomic_check_detects_mutation() {
-        let _ = super::check_atomic(&mut 0, |v| { *v = 1; Err::<(), _>(()) }, |v| *v);
+        let _ = super::check_atomic(
+            &mut 0,
+            |v| {
+                *v = 1;
+                Err::<(), _>(())
+            },
+            |v| *v,
+        );
     }
 
     #[test]
     fn atomic_check_allows_success() {
-        assert_eq!(super::check_atomic(&mut 0, |v| { *v = 1; Ok::<_, ()>(2) }, |v| *v), Ok(2));
+        assert_eq!(
+            super::check_atomic(
+                &mut 0,
+                |v| {
+                    *v = 1;
+                    Ok::<_, ()>(2)
+                },
+                |v| *v
+            ),
+            Ok(2)
+        );
     }
 
     fn work(steps: usize) {

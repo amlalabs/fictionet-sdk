@@ -57,7 +57,12 @@ pub fn echo_reply(packet: &Packet, addr: IpAddr) -> Option<Packet> {
     // IPv6. The checksum covers a pseudo-header only over IPv6.
     let (proto, request, reply, sum) = match addr {
         IpAddr::V4(_) => (protocol::ICMP, 8, 0, ip::checksum(icmp)),
-        IpAddr::V6(_) => (protocol::ICMPV6, 128, 129, ip::transport_checksum(ip.src, addr, protocol::ICMPV6, icmp)),
+        IpAddr::V6(_) => (
+            protocol::ICMPV6,
+            128,
+            129,
+            ip::transport_checksum(ip.src, addr, protocol::ICMPV6, icmp),
+        ),
     };
     if ip.protocol != proto || icmp.len() < 8 || icmp[0] != request || icmp[1] != 0 || sum != 0 {
         return None;
@@ -67,7 +72,12 @@ pub fn echo_reply(packet: &Packet, addr: IpAddr) -> Option<Packet> {
     set_checksum(&mut message, addr, ip.src);
     // The IPv4 identification and type of service, and the IPv6 traffic
     // class and flow label, as in the request.
-    let fields = Fields { id: u16::from_be_bytes([bytes[4], bytes[5]]), tos: bytes[1], dont_fragment: false, ..Fields::default() };
+    let fields = Fields {
+        id: u16::from_be_bytes([bytes[4], bytes[5]]),
+        tos: bytes[1],
+        dont_fragment: false,
+        ..Fields::default()
+    };
     let mut out = ip::packet_with(addr, ip.src, proto, fields, &message);
     if addr.is_ipv6() {
         out.0[..4].copy_from_slice(&bytes[..4]);
@@ -145,22 +155,32 @@ pub fn error(packet: &[u8], from: IpAddr, kind: u8, code: u8, word: u32) -> Opti
     let first = ip.payload(packet).first().copied();
     let (proto, limit) = match (ip.src, ip.dst, from) {
         (IpAddr::V4(src), IpAddr::V4(dst), IpAddr::V4(_)) => {
-            if later || src.is_unspecified() || src.is_broadcast() || src.is_multicast() || src.is_loopback() {
+            if later
+                || src.is_unspecified()
+                || src.is_broadcast()
+                || src.is_multicast()
+                || src.is_loopback()
+            {
                 return None;
             }
             if dst.is_broadcast() || dst.is_multicast() {
                 return None;
             }
-            if ip.protocol == protocol::ICMP && !first.is_some_and(|k| matches!(k, 0 | 8 | 13..=18)) {
+            if ip.protocol == protocol::ICMP && !first.is_some_and(|k| matches!(k, 0 | 8 | 13..=18))
+            {
                 return None;
             }
             (protocol::ICMP, 576 - 28)
         }
         (IpAddr::V6(src), IpAddr::V6(dst), IpAddr::V6(_)) => {
-            if src.is_unspecified() || src.is_multicast() || src.is_loopback() || dst.is_multicast() {
+            if src.is_unspecified() || src.is_multicast() || src.is_loopback() || dst.is_multicast()
+            {
                 return None;
             }
-            if ip.protocol == protocol::ICMPV6 && !later && first.is_none_or(|t| t < 128 || (133..=137).contains(&t)) {
+            if ip.protocol == protocol::ICMPV6
+                && !later
+                && first.is_none_or(|t| t < 128 || (133..=137).contains(&t))
+            {
                 return None;
             }
             (protocol::ICMPV6, 1280 - 48)
@@ -187,10 +207,33 @@ mod tests {
     /// A fragment of an IPv6 packet from `SRC` to `DST` at `offset`, whose
     /// first fragment carries ICMPv6 of type `kind`.
     fn fragment6(offset: u16, kind: u8) -> Vec<u8> {
-        let frag = [protocol::ICMPV6, 0, (offset >> 8) as u8, offset as u8 | 1, 0, 0, 0, 9];
-        let body = if offset == 0 { vec![kind, 0, 0, 0, 0, 0, 0, 0] } else { vec![kind; 8] };
-        let fields = Fields { ttl: 1, ..Fields::default() };
-        ip::packet_with(SRC.into(), DST.into(), protocol::FRAGMENT, fields, &[&frag[..], &body].concat()).0
+        let frag = [
+            protocol::ICMPV6,
+            0,
+            (offset >> 8) as u8,
+            offset as u8 | 1,
+            0,
+            0,
+            0,
+            9,
+        ];
+        let body = if offset == 0 {
+            vec![kind, 0, 0, 0, 0, 0, 0, 0]
+        } else {
+            vec![kind; 8]
+        };
+        let fields = Fields {
+            ttl: 1,
+            ..Fields::default()
+        };
+        ip::packet_with(
+            SRC.into(),
+            DST.into(),
+            protocol::FRAGMENT,
+            fields,
+            &[&frag[..], &body].concat(),
+        )
+        .0
     }
 
     /// Time exceeded and address unreachable now come from the one ICMP
@@ -202,11 +245,17 @@ mod tests {
         let later = fragment6(8, 1);
         let answer = time_exceeded(&later, ROUTER.into()).expect("an answer").0;
         let h = Header::parse(&answer).unwrap();
-        assert_eq!((h.src, h.dst, h.protocol), (ROUTER.into(), SRC.into(), protocol::ICMPV6));
+        assert_eq!(
+            (h.src, h.dst, h.protocol),
+            (ROUTER.into(), SRC.into(), protocol::ICMPV6)
+        );
         let icmp = h.payload(&answer);
         assert_eq!((icmp[0], icmp[1]), (3, 0));
         assert_eq!(&icmp[8..], &later[..]);
-        assert_eq!(ip::transport_checksum(ROUTER.into(), SRC.into(), protocol::ICMPV6, icmp), 0);
+        assert_eq!(
+            ip::transport_checksum(ROUTER.into(), SRC.into(), protocol::ICMPV6, icmp),
+            0
+        );
         assert!(address_unreachable(&later, ROUTER).is_some());
         // A first fragment shows its type: an error gets no error, a ping
         // does.
@@ -216,16 +265,40 @@ mod tests {
 
     #[test]
     fn errors_go_only_to_one_host() {
-        let to = |src: &str, dst: &str| ip::packet(src.parse().unwrap(), dst.parse().unwrap(), protocol::UDP, &[0; 8]).0;
+        let to = |src: &str, dst: &str| {
+            ip::packet(
+                src.parse().unwrap(),
+                dst.parse().unwrap(),
+                protocol::UDP,
+                &[0; 8],
+            )
+            .0
+        };
         let from = "10.0.0.1".parse().unwrap();
         assert!(error(&to("10.0.0.2", "10.0.0.9"), from, 3, 3, 0).is_some());
-        for (src, dst) in [("0.0.0.0", "10.0.0.9"), ("127.0.0.1", "10.0.0.9"), ("224.0.0.1", "10.0.0.9"), ("10.0.0.2", "255.255.255.255")] {
-            assert!(error(&to(src, dst), from, 3, 3, 0).is_none(), "{src} to {dst}");
+        for (src, dst) in [
+            ("0.0.0.0", "10.0.0.9"),
+            ("127.0.0.1", "10.0.0.9"),
+            ("224.0.0.1", "10.0.0.9"),
+            ("10.0.0.2", "255.255.255.255"),
+        ] {
+            assert!(
+                error(&to(src, dst), from, 3, 3, 0).is_none(),
+                "{src} to {dst}"
+            );
         }
         // Not from an address of the other family.
         assert!(error(&to("10.0.0.2", "10.0.0.9"), ROUTER.into(), 3, 3, 0).is_none());
         // An IPv4 ICMP error gets none; a ping does.
-        let icmp = |kind: u8| ip::packet("10.0.0.2".parse().unwrap(), "10.0.0.9".parse().unwrap(), protocol::ICMP, &[kind, 0, 0, 0, 0, 0, 0, 0]).0;
+        let icmp = |kind: u8| {
+            ip::packet(
+                "10.0.0.2".parse().unwrap(),
+                "10.0.0.9".parse().unwrap(),
+                protocol::ICMP,
+                &[kind, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .0
+        };
         assert!(host_unreachable(&icmp(3), "10.0.0.1".parse().unwrap()).is_none());
         assert!(host_unreachable(&icmp(8), "10.0.0.1".parse().unwrap()).is_some());
     }

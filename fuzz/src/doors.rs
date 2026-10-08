@@ -8,11 +8,13 @@ use std::task::{Context, Poll};
 use arbitrary::Arbitrary;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use fictionet::relay::proxy::Host;
 use fictionet::relay::proxy::auth::{Token, base64_decode};
 use fictionet::relay::proxy::dns;
-use fictionet::relay::proxy::http::{Target, error_response, forward_head, parse_request, rewrite_response};
+use fictionet::relay::proxy::http::{
+    Target, error_response, forward_head, parse_request, rewrite_response,
+};
 use fictionet::relay::proxy::socks5::handshake;
-use fictionet::relay::proxy::Host;
 use fictionet::stdlib::http1::{RequestHead, ResponseHead};
 
 /// The HTTP door: a request head, the token check, and the answer's head.
@@ -54,7 +56,10 @@ pub fn http(data: &[u8]) {
         }
         // Text from the client reaches a reason only quoted, as `{:?}`.
         let r = error_response(400, &format!("cannot read the URL {s:?}"));
-        assert!(matches!(ResponseHead::parse_lenient(&r), Ok(Some(_))), "an error answer does not parse");
+        assert!(
+            matches!(ResponseHead::parse_lenient(&r), Ok(Some(_))),
+            "an error answer does not parse"
+        );
     }
 }
 
@@ -74,8 +79,15 @@ struct Stream {
 }
 
 impl AsyncRead for Stream {
-    fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let want = self.pieces.get(self.piece).map_or(usize::MAX, |&n| n.max(1) as usize);
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let want = self
+            .pieces
+            .get(self.piece)
+            .map_or(usize::MAX, |&n| n.max(1) as usize);
         self.piece += 1;
         let n = want.min(buf.remaining()).min(self.bytes.len() - self.at);
         let at = self.at;
@@ -86,7 +98,11 @@ impl AsyncRead for Stream {
 }
 
 impl AsyncWrite for Stream {
-    fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
         self.written.extend_from_slice(data);
         Poll::Ready(Ok(data.len()))
     }
@@ -98,18 +114,30 @@ impl AsyncWrite for Stream {
     }
 }
 
-
 /// The SOCKS5 door: the handshake up to the target.
 pub fn socks5(input: Input) {
     let token = Token::new(b"s3cret-token").unwrap();
-    let mut s = Stream { bytes: input.bytes, at: 0, pieces: input.pieces, piece: 0, written: Vec::new() };
+    let mut s = Stream {
+        bytes: input.bytes,
+        at: 0,
+        pieces: input.pieces,
+        piece: 0,
+        written: Vec::new(),
+    };
     // The stream never waits, so the handshake finishes in one poll.
     let result = fictionet::block_on(handshake(&mut s, &token));
     if result.is_ok() {
         // Only a client that gave the token gets a target: the token must
         // be in what it sent, whatever the door answered.
-        assert!(s.bytes.windows(12).any(|w| w == b"s3cret-token"), "a target without the token");
-        assert!(s.written.ends_with(&[1, 0]), "a target without the login answered: {:?}", s.written);
+        assert!(
+            s.bytes.windows(12).any(|w| w == b"s3cret-token"),
+            "a target without the token"
+        );
+        assert!(
+            s.written.ends_with(&[1, 0]),
+            "a target without the login answered: {:?}",
+            s.written
+        );
     }
     assert!(s.written.len() <= 2 + 2 + 10);
 }
@@ -118,7 +146,9 @@ pub fn socks5(input: Input) {
 pub fn dns_answer(data: &[u8]) {
     let server: std::net::SocketAddr = "10.0.0.1:53".parse().unwrap();
     // The answer's own ID, so a well-formed answer gets past that check.
-    let id = data.get(..2).map_or(0, |b| u16::from_be_bytes([b[0], b[1]]));
+    let id = data
+        .get(..2)
+        .map_or(0, |b| u16::from_be_bytes([b[0], b[1]]));
     for name in ["example.test", "a.b.c"] {
         if let Some(Ok((_, ttl))) = dns::answer(data, server, server, name, id) {
             assert!(ttl <= dns::MAX_TTL);

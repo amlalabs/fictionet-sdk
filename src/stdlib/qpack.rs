@@ -54,9 +54,9 @@
 //! encoder.apply_instruction(ack.unwrap()).unwrap();
 //! ```
 
-use fictionet::stdlib::codec::{Prefixed, Frames};
-use fictionet::stdlib::quic::MAX_VARINT;
+use fictionet::stdlib::codec::{Frames, Prefixed};
 use fictionet::stdlib::codec::{Reader, Truncated};
+use fictionet::stdlib::quic::MAX_VARINT;
 
 use std::collections::VecDeque;
 
@@ -173,8 +173,14 @@ pub const STATIC_TABLE: [(&str, &str); 99] = [
     ("content-type", "text/plain;charset=utf-8"),
     ("range", "bytes=0-"),
     ("strict-transport-security", "max-age=31536000"),
-    ("strict-transport-security", "max-age=31536000; includesubdomains"),
-    ("strict-transport-security", "max-age=31536000; includesubdomains; preload"),
+    (
+        "strict-transport-security",
+        "max-age=31536000; includesubdomains",
+    ),
+    (
+        "strict-transport-security",
+        "max-age=31536000; includesubdomains; preload",
+    ),
     ("vary", "accept-encoding"),
     ("vary", "origin"),
     ("x-content-type-options", "nosniff"),
@@ -201,7 +207,10 @@ pub const STATIC_TABLE: [(&str, &str); 99] = [
     ("access-control-request-method", "post"),
     ("alt-svc", "clear"),
     ("authorization", ""),
-    ("content-security-policy", "script-src 'none'; object-src 'none'; base-uri 'none'"),
+    (
+        "content-security-policy",
+        "script-src 'none'; object-src 'none'; base-uri 'none'",
+    ),
     ("early-data", "1"),
     ("expect-ct", ""),
     ("forwarded", ""),
@@ -219,17 +228,26 @@ pub const STATIC_TABLE: [(&str, &str); 99] = [
 
 /// The static entry at `index`, if there is one.
 pub fn static_entry(index: u64) -> Option<(&'static str, &'static str)> {
-    usize::try_from(index).ok().and_then(|i| STATIC_TABLE.get(i)).copied()
+    usize::try_from(index)
+        .ok()
+        .and_then(|i| STATIC_TABLE.get(i))
+        .copied()
 }
 
 /// The index of the static entry with this name and value.
 pub fn static_find(name: &[u8], value: &[u8]) -> Option<u64> {
-    STATIC_TABLE.iter().position(|(n, v)| n.as_bytes() == name && v.as_bytes() == value).map(|i| i as u64)
+    STATIC_TABLE
+        .iter()
+        .position(|(n, v)| n.as_bytes() == name && v.as_bytes() == value)
+        .map(|i| i as u64)
 }
 
 /// The index of the first static entry with this name.
 pub fn static_find_name(name: &[u8]) -> Option<u64> {
-    STATIC_TABLE.iter().position(|(n, _)| n.as_bytes() == name).map(|i| i as u64)
+    STATIC_TABLE
+        .iter()
+        .position(|(n, _)| n.as_bytes() == name)
+        .map(|i| i as u64)
 }
 
 /// Why bytes could not be read, or an instruction could not be applied.
@@ -433,7 +451,11 @@ pub struct Field {
 impl Field {
     /// A field that may be indexed.
     pub fn new(name: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Field {
-        Field { name: name.as_ref().to_vec(), value: value.as_ref().to_vec(), never_index: false }
+        Field {
+            name: name.as_ref().to_vec(),
+            value: value.as_ref().to_vec(),
+            never_index: false,
+        }
     }
 
     /// The field's size: its name and value plus [`ENTRY_OVERHEAD`]. Both
@@ -444,7 +466,9 @@ impl Field {
 }
 
 fn entry_size(name: &[u8], value: &[u8]) -> u64 {
-    (name.len() as u64).saturating_add(value.len() as u64).saturating_add(ENTRY_OVERHEAD)
+    (name.len() as u64)
+        .saturating_add(value.len() as u64)
+        .saturating_add(ENTRY_OVERHEAD)
 }
 
 /// The dynamic table: entries inserted in order, each with an absolute
@@ -549,7 +573,10 @@ impl Table {
 
     /// The absolute index of the newest entry with this name and value.
     pub fn find(&self, name: &[u8], value: &[u8]) -> Option<u64> {
-        let i = self.entries.iter().rposition(|(n, v)| n == name && v == value)?;
+        let i = self
+            .entries
+            .iter()
+            .rposition(|(n, v)| n == name && v == value)?;
         Some(self.first_index() + i as u64)
     }
 
@@ -581,7 +608,10 @@ impl Table {
             return Err(Error::EntryTooLarge);
         }
         let index = self.inserted;
-        self.inserted = index.checked_add(1).filter(|n| *n <= MAX_VARINT).ok_or(Error::IntegerOverflow)?;
+        self.inserted = index
+            .checked_add(1)
+            .filter(|n| *n <= MAX_VARINT)
+            .ok_or(Error::IntegerOverflow)?;
         self.evict_to(self.capacity - size);
         self.size += size;
         name.shrink_to_fit();
@@ -598,11 +628,19 @@ impl Table {
         let (name, value) = match instruction {
             EncoderInstruction::SetCapacity(n) => return self.set_capacity(n),
             EncoderInstruction::InsertWithLiteralName { name, value } => (name, value),
-            EncoderInstruction::InsertWithNameRef { static_table: true, index, value } => {
+            EncoderInstruction::InsertWithNameRef {
+                static_table: true,
+                index,
+                value,
+            } => {
                 let (name, _) = static_entry(index).ok_or(Error::StaticIndex(index))?;
                 (name.as_bytes().to_vec(), value)
             }
-            EncoderInstruction::InsertWithNameRef { static_table: false, index, value } => {
+            EncoderInstruction::InsertWithNameRef {
+                static_table: false,
+                index,
+                value,
+            } => {
                 let (name, _) = self.get_relative(index).ok_or(Error::DynamicIndex(index))?;
                 (name.to_vec(), value)
             }
@@ -695,11 +733,18 @@ impl EncoderInstruction {
                 let static_table = first & 0x40 != 0;
                 let index = c.int(6)?;
                 let value = c.raw_string(7)?.decode()?;
-                EncoderInstruction::InsertWithNameRef { static_table, index, value }
+                EncoderInstruction::InsertWithNameRef {
+                    static_table,
+                    index,
+                    value,
+                }
             } else if first & 0x40 != 0 {
                 let name = c.raw_string(5)?;
                 let value = c.raw_string(7)?;
-                EncoderInstruction::InsertWithLiteralName { name: name.decode()?, value: value.decode()? }
+                EncoderInstruction::InsertWithLiteralName {
+                    name: name.decode()?,
+                    value: value.decode()?,
+                }
             } else if first & 0x20 != 0 {
                 EncoderInstruction::SetCapacity(c.int(5)?)
             } else {
@@ -770,7 +815,11 @@ pub fn encode_insert_count(required: u64, max_entries: u64) -> Option<u64> {
 /// The Required Insert Count from its encoded form, given the decoder's
 /// maximum entries and how many inserts it has received (RFC 9204 section
 /// 4.5.1.1).
-pub fn decode_insert_count(encoded: u64, max_entries: u64, total_inserts: u64) -> Result<u64, Error> {
+pub fn decode_insert_count(
+    encoded: u64,
+    max_entries: u64,
+    total_inserts: u64,
+) -> Result<u64, Error> {
     if encoded == 0 {
         return Ok(0);
     }
@@ -778,9 +827,13 @@ pub fn decode_insert_count(encoded: u64, max_entries: u64, total_inserts: u64) -
     if encoded > full {
         return Err(Error::InsertCount);
     }
-    let max_value = total_inserts.checked_add(max_entries).ok_or(Error::InsertCount)?;
+    let max_value = total_inserts
+        .checked_add(max_entries)
+        .ok_or(Error::InsertCount)?;
     let max_wrapped = max_value / full * full;
-    let mut required = max_wrapped.checked_add(encoded - 1).ok_or(Error::InsertCount)?;
+    let mut required = max_wrapped
+        .checked_add(encoded - 1)
+        .ok_or(Error::InsertCount)?;
     if required > max_value {
         if required <= full {
             return Err(Error::InsertCount);
@@ -807,7 +860,11 @@ pub struct SectionPrefix {
 impl SectionPrefix {
     /// Reads the prefix at the start of `b`, given the decoder's maximum
     /// entries and inserts received, and returns it and its length.
-    pub fn parse(b: &[u8], max_entries: u64, total_inserts: u64) -> Result<(SectionPrefix, usize), Error> {
+    pub fn parse(
+        b: &[u8],
+        max_entries: u64,
+        total_inserts: u64,
+    ) -> Result<(SectionPrefix, usize), Error> {
         let mut c = Reader::new(b);
         let mut read = || -> Result<SectionPrefix, Stop> {
             let encoded = c.int(8)?;
@@ -815,11 +872,17 @@ impl SectionPrefix {
             let negative = c.peek_u8().ok_or(Stop::More)? & 0x80 != 0;
             let delta = c.int(7)?;
             let base = if negative {
-                delta.checked_add(1).and_then(|d| required.checked_sub(d)).ok_or(Error::Base)?
+                delta
+                    .checked_add(1)
+                    .and_then(|d| required.checked_sub(d))
+                    .ok_or(Error::Base)?
             } else {
                 required.checked_add(delta).ok_or(Error::IntegerOverflow)?
             };
-            Ok(SectionPrefix { required_insert_count: required, base })
+            Ok(SectionPrefix {
+                required_insert_count: required,
+                base,
+            })
         };
         match read() {
             Ok(p) => Ok((p, c.position())),
@@ -840,11 +903,19 @@ impl SectionPrefix {
             return Err(Error::Unwritable);
         }
         let negative = self.base < required;
-        let delta_base = if negative { required - self.base - 1 } else { self.base - required };
+        let delta_base = if negative {
+            required - self.base - 1
+        } else {
+            self.base - required
+        };
         if delta_base > MAX_VARINT {
             return Err(Error::Unwritable);
         }
-        Ok(EncodedPrefix { encoded_insert_count: encoded, negative, delta_base })
+        Ok(EncodedPrefix {
+            encoded_insert_count: encoded,
+            negative,
+            delta_base,
+        })
     }
 }
 
@@ -865,7 +936,14 @@ impl EncodedPrefix {
         let encoded_insert_count = c.int(8).map_err(parse_stop)?;
         let negative = c.peek_u8().ok_or(Stop::More).map_err(parse_stop)? & 0x80 != 0;
         let delta_base = c.int(7).map_err(parse_stop)?;
-        Ok((Self { encoded_insert_count, negative, delta_base }, c.position()))
+        Ok((
+            Self {
+                encoded_insert_count,
+                negative,
+                delta_base,
+            },
+            c.position(),
+        ))
     }
 }
 
@@ -926,7 +1004,10 @@ impl Wire for FieldSection {
             used += n;
             representations.push(rep);
         }
-        Ok(Self { prefix, representations })
+        Ok(Self {
+            prefix,
+            representations,
+        })
     }
 
     /// Writes a complete section. Refuses invalid lines and excessive encoded size or field count.
@@ -1003,24 +1084,40 @@ impl Representation {
         let read = |c: &mut Reader| -> Result<Representation, Stop> {
             let first = c.peek_u8().ok_or(Stop::More)?;
             Ok(if first & 0x80 != 0 {
-                Representation::Indexed { static_table: first & 0x40 != 0, index: c.int(6)? }
+                Representation::Indexed {
+                    static_table: first & 0x40 != 0,
+                    index: c.int(6)?,
+                }
             } else if first & 0x40 != 0 {
                 let (never_index, static_table) = (first & 0x20 != 0, first & 0x10 != 0);
                 let index = c.int(4)?;
                 let value = c.raw_string(7)?.decode()?;
-                Representation::LiteralNameRef { never_index, static_table, index, value }
+                Representation::LiteralNameRef {
+                    never_index,
+                    static_table,
+                    index,
+                    value,
+                }
             } else if first & 0x20 != 0 {
                 let never_index = first & 0x10 != 0;
                 let name = c.raw_string(3)?;
                 let value = c.raw_string(7)?;
-                Representation::LiteralName { never_index, name: name.decode()?, value: value.decode()? }
+                Representation::LiteralName {
+                    never_index,
+                    name: name.decode()?,
+                    value: value.decode()?,
+                }
             } else if first & 0x10 != 0 {
                 Representation::IndexedPostBase(c.int(4)?)
             } else {
                 let never_index = first & 0x08 != 0;
                 let index = c.int(3)?;
                 let value = c.raw_string(7)?.decode()?;
-                Representation::LiteralPostBaseNameRef { never_index, index, value }
+                Representation::LiteralPostBaseNameRef {
+                    never_index,
+                    index,
+                    value,
+                }
             })
         };
         match read(&mut c) {
@@ -1032,8 +1129,16 @@ impl Representation {
 }
 
 /// Decodes the field lines after a section's prefix.
-fn decode_fields(table: &Table, prefix: SectionPrefix, b: &[u8], limit: u64) -> Result<Vec<Field>, Error> {
-    let SectionPrefix { required_insert_count: required, base } = prefix;
+fn decode_fields(
+    table: &Table,
+    prefix: SectionPrefix,
+    b: &[u8],
+    limit: u64,
+) -> Result<Vec<Field>, Error> {
+    let SectionPrefix {
+        required_insert_count: required,
+        base,
+    } = prefix;
     let mut fields = Vec::new();
     let mut size = 0u64;
     let mut largest: Option<u64> = None;
@@ -1047,20 +1152,29 @@ fn decode_fields(table: &Table, prefix: SectionPrefix, b: &[u8], limit: u64) -> 
         abs: Option<u64>,
         sent: u64,
     ) -> Result<(&'t [u8], &'t [u8]), Error> {
-        let abs = abs.filter(|&a| a < required).ok_or(Error::DynamicIndex(sent))?;
+        let abs = abs
+            .filter(|&a| a < required)
+            .ok_or(Error::DynamicIndex(sent))?;
         let entry = table.get(abs).ok_or(Error::DynamicIndex(sent))?;
         *largest = Some(largest.map_or(abs, |l| l.max(abs)));
         Ok(entry)
     }
-    let mut dynamic = |abs: Option<u64>, sent: u64| lookup(table, required, &mut largest, abs, sent);
+    let mut dynamic =
+        |abs: Option<u64>, sent: u64| lookup(table, required, &mut largest, abs, sent);
     let relative = |index: u64| index.checked_add(1).and_then(|d| base.checked_sub(d));
     let static_ = |index: u64| static_entry(index).ok_or(Error::StaticIndex(index));
     while i < b.len() {
         let (rep, used) = Representation::parse_prefix(&b[i..])?;
         i += used;
         let field = match rep {
-            Representation::Indexed { static_table: true, index } => Field::new(static_(index)?.0, static_(index)?.1),
-            Representation::Indexed { static_table: false, index } => {
+            Representation::Indexed {
+                static_table: true,
+                index,
+            } => Field::new(static_(index)?.0, static_(index)?.1),
+            Representation::Indexed {
+                static_table: false,
+                index,
+            } => {
                 let (n, v) = dynamic(relative(index), index)?;
                 Field::new(n, v)
             }
@@ -1068,19 +1182,44 @@ fn decode_fields(table: &Table, prefix: SectionPrefix, b: &[u8], limit: u64) -> 
                 let (n, v) = dynamic(base.checked_add(index), index)?;
                 Field::new(n, v)
             }
-            Representation::LiteralNameRef { never_index, static_table, index, value } => {
+            Representation::LiteralNameRef {
+                never_index,
+                static_table,
+                index,
+                value,
+            } => {
                 let name = if static_table {
                     static_(index)?.0.as_bytes().to_vec()
                 } else {
                     dynamic(relative(index), index)?.0.to_vec()
                 };
-                Field { name, value, never_index }
+                Field {
+                    name,
+                    value,
+                    never_index,
+                }
             }
-            Representation::LiteralPostBaseNameRef { never_index, index, value } => {
+            Representation::LiteralPostBaseNameRef {
+                never_index,
+                index,
+                value,
+            } => {
                 let name = dynamic(base.checked_add(index), index)?.0.to_vec();
-                Field { name, value, never_index }
+                Field {
+                    name,
+                    value,
+                    never_index,
+                }
             }
-            Representation::LiteralName { never_index, name, value } => Field { name, value, never_index },
+            Representation::LiteralName {
+                never_index,
+                name,
+                value,
+            } => Field {
+                name,
+                value,
+                never_index,
+            },
         };
         if fields.len() >= MAX_FIELDS {
             return Err(Error::TooManyFields);
@@ -1148,14 +1287,26 @@ impl Encoder {
     /// acknowledgment uses, or the oldest insert the decoder has not yet
     /// acknowledged, whichever is older.
     fn evict_limit(&self) -> u64 {
-        self.outstanding.iter().map(|o| o.oldest).min().unwrap_or(u64::MAX).min(self.known_received)
+        self.outstanding
+            .iter()
+            .map(|o| o.oldest)
+            .min()
+            .unwrap_or(u64::MAX)
+            .min(self.known_received)
     }
 
     /// Whether room for `size` more within `capacity` keeps every entry
     /// that is not evictable.
     fn room(&self, size: u64, capacity: u64) -> Result<(), Error> {
-        let kept = self.table.first_kept(size, capacity).ok_or(Error::EntryTooLarge)?;
-        if kept > self.evict_limit() { Err(Error::Referenced) } else { Ok(()) }
+        let kept = self
+            .table
+            .first_kept(size, capacity)
+            .ok_or(Error::EntryTooLarge)?;
+        if kept > self.evict_limit() {
+            Err(Error::Referenced)
+        } else {
+            Ok(())
+        }
     }
 
     /// Sets the table's capacity and returns the instruction. A capacity
@@ -1180,18 +1331,33 @@ impl Encoder {
     /// one whose insert the decoder has not acknowledged, is
     /// [`Error::Referenced`].
     /// On an error nothing changes.
-    pub fn insert(&mut self, name: &[u8], value: &[u8]) -> Result<(u64, EncoderInstruction), Error> {
+    pub fn insert(
+        &mut self,
+        name: &[u8],
+        value: &[u8],
+    ) -> Result<(u64, EncoderInstruction), Error> {
         if name.len() > MAX_STRING || value.len() > MAX_STRING {
             return Err(Error::StringTooLong);
         }
         self.room(entry_size(name, value), self.table.capacity())?;
         let ins = if let Some(index) = static_find_name(name) {
-            EncoderInstruction::InsertWithNameRef { static_table: true, index, value: value.to_vec() }
+            EncoderInstruction::InsertWithNameRef {
+                static_table: true,
+                index,
+                value: value.to_vec(),
+            }
         } else if let Some(abs) = self.table.find_name(name) {
             let index = self.table.insert_count() - 1 - abs;
-            EncoderInstruction::InsertWithNameRef { static_table: false, index, value: value.to_vec() }
+            EncoderInstruction::InsertWithNameRef {
+                static_table: false,
+                index,
+                value: value.to_vec(),
+            }
         } else {
-            EncoderInstruction::InsertWithLiteralName { name: name.to_vec(), value: value.to_vec() }
+            EncoderInstruction::InsertWithLiteralName {
+                name: name.to_vec(),
+                value: value.to_vec(),
+            }
         };
         let abs = self.table.insert(name.to_vec(), value.to_vec())?;
         Ok((abs, ins))
@@ -1271,17 +1437,30 @@ impl Encoder {
             Line::Dynamic(a) | Line::DynamicName(a) => Some(*a),
             _ => None,
         });
-        let (oldest, newest) = used.fold((None, None), |(lo, hi): (Option<u64>, Option<u64>), a| {
-            (Some(lo.map_or(a, |l| l.min(a))), Some(hi.map_or(a, |h| h.max(a))))
-        });
+        let (oldest, newest) =
+            used.fold((None, None), |(lo, hi): (Option<u64>, Option<u64>), a| {
+                (
+                    Some(lo.map_or(a, |l| l.min(a))),
+                    Some(hi.map_or(a, |h| h.max(a))),
+                )
+            });
         let required = newest.map_or(0, |n| n + 1);
-        let prefix = SectionPrefix { required_insert_count: required, base: required };
+        let prefix = SectionPrefix {
+            required_insert_count: required,
+            base: required,
+        };
         let prefix = prefix.encoded(self.table.max_entries())?;
         let mut representations = Vec::with_capacity(fields.len());
         for (line, f) in lines.iter().zip(fields) {
             let rep = match *line {
-                Line::Static(index) => Representation::Indexed { static_table: true, index },
-                Line::Dynamic(a) => Representation::Indexed { static_table: false, index: required - 1 - a },
+                Line::Static(index) => Representation::Indexed {
+                    static_table: true,
+                    index,
+                },
+                Line::Dynamic(a) => Representation::Indexed {
+                    static_table: false,
+                    index: required - 1 - a,
+                },
                 Line::StaticName(index) => Representation::LiteralNameRef {
                     never_index: f.never_index,
                     static_table: true,
@@ -1303,9 +1482,16 @@ impl Encoder {
             representations.push(rep);
         }
         if let Some(oldest) = oldest {
-            self.outstanding.push_back(Outstanding { stream, required, oldest });
+            self.outstanding.push_back(Outstanding {
+                stream,
+                required,
+                oldest,
+            });
         }
-        Ok(FieldSection { prefix, representations })
+        Ok(FieldSection {
+            prefix,
+            representations,
+        })
     }
 
     /// Applies one decoded peer instruction between items.
@@ -1322,12 +1508,18 @@ impl Encoder {
     fn apply(&mut self, ins: DecoderInstruction) -> Result<(), Error> {
         match ins {
             DecoderInstruction::SectionAck(stream) => {
-                let i = self.outstanding.iter().position(|o| o.stream == stream).ok_or(Error::UnknownStream(stream))?;
+                let i = self
+                    .outstanding
+                    .iter()
+                    .position(|o| o.stream == stream)
+                    .ok_or(Error::UnknownStream(stream))?;
                 if let Some(o) = self.outstanding.remove(i) {
                     self.known_received = self.known_received.max(o.required);
                 }
             }
-            DecoderInstruction::StreamCancel(stream) => self.outstanding.retain(|o| o.stream != stream),
+            DecoderInstruction::StreamCancel(stream) => {
+                self.outstanding.retain(|o| o.stream != stream)
+            }
             DecoderInstruction::InsertCountIncrement(0) => return Err(Error::ZeroIncrement),
             DecoderInstruction::InsertCountIncrement(n) => {
                 let k = self.known_received.checked_add(n).ok_or(Error::Increment)?;
@@ -1365,8 +1557,13 @@ impl Prefixed for EncoderInstruction {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
-        let Some(used) = encoder_instruction_len(input)? else { return Ok(None) };
+    fn parse_prefix(
+        input: &[u8],
+        _limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let Some(used) = encoder_instruction_len(input)? else {
+            return Ok(None);
+        };
         let bytes = input.get(..used).ok_or(Error::Truncated)?;
         let item = EncoderInstruction::parse_prefix(bytes).and_then(|parsed| {
             let (ins, _) = parsed.ok_or(Error::Truncated)?;
@@ -1376,7 +1573,6 @@ impl Prefixed for EncoderInstruction {
         Ok(Some((item, used)))
     }
 }
-
 
 // Find the boundary without decoding strings. Even a bad Huffman string
 // has a trusted length, so its error consumes exactly one instruction.
@@ -1406,7 +1602,11 @@ fn check_encoder_instruction(ins: &EncoderInstruction) -> Result<(), Error> {
     match ins {
         EncoderInstruction::SetCapacity(n) if *n > MAX_TABLE_CAPACITY => Err(Error::Capacity(*n)),
         EncoderInstruction::Duplicate(n) if *n > MAX_VARINT => Err(Error::IntegerOverflow),
-        EncoderInstruction::InsertWithNameRef { static_table, index, value } => {
+        EncoderInstruction::InsertWithNameRef {
+            static_table,
+            index,
+            value,
+        } => {
             if *index > MAX_VARINT {
                 return Err(Error::IntegerOverflow);
             }
@@ -1421,9 +1621,12 @@ fn check_encoder_instruction(ins: &EncoderInstruction) -> Result<(), Error> {
 }
 
 fn check_strings(name: &[u8], value: &[u8]) -> Result<(), Error> {
-    if name.len() > MAX_STRING || value.len() > MAX_STRING { Err(Error::StringTooLong) } else { Ok(()) }
+    if name.len() > MAX_STRING || value.len() > MAX_STRING {
+        Err(Error::StringTooLong)
+    } else {
+        Ok(())
+    }
 }
-
 
 /// Reads one decoder instruction per call without owning input.
 ///
@@ -1447,15 +1650,19 @@ impl Prefixed for DecoderInstruction {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        _limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         Ok(match DecoderInstruction::parse_prefix(input)? {
-            Some((DecoderInstruction::InsertCountIncrement(0), used)) => Some((Err(Error::ZeroIncrement), used)),
+            Some((DecoderInstruction::InsertCountIncrement(0), used)) => {
+                Some((Err(Error::ZeroIncrement), used))
+            }
             Some((ins, used)) => Some((Ok(ins), used)),
             None => None,
         })
     }
 }
-
 
 /// Strict encoding and exact parsing. SetCapacity is limited to
 /// [`MAX_TABLE_CAPACITY`] in both directions, even if the peer advertises more.
@@ -1479,7 +1686,11 @@ impl Wire for EncoderInstruction {
         check_encoder_instruction(self).map_err(|_| Error::Unwritable)?;
         match self {
             EncoderInstruction::SetCapacity(c) => put_integer(out, 5, 0x20, *c)?,
-            EncoderInstruction::InsertWithNameRef { static_table, index, value } => {
+            EncoderInstruction::InsertWithNameRef {
+                static_table,
+                index,
+                value,
+            } => {
                 put_integer(out, 6, if *static_table { 0xc0 } else { 0x80 }, *index)?;
                 put_string(out, 7, 0, value)?;
             }
@@ -1549,9 +1760,8 @@ impl Wire for Representation {
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let (index, name, value): (u64, &[u8], &[u8]) = match self {
             Self::Indexed { index, .. } | Self::IndexedPostBase(index) => (*index, &[], &[]),
-            Self::LiteralNameRef { index, value, .. } | Self::LiteralPostBaseNameRef { index, value, .. } => {
-                (*index, &[], value)
-            }
+            Self::LiteralNameRef { index, value, .. }
+            | Self::LiteralPostBaseNameRef { index, value, .. } => (*index, &[], value),
             Self::LiteralName { name, value, .. } => (0, name, value),
         };
         if index > MAX_VARINT {
@@ -1564,16 +1774,31 @@ impl Wire for Representation {
                 index,
             } => put_integer(out, 6, if *static_table { 0xc0 } else { 0x80 }, *index)?,
             Representation::IndexedPostBase(index) => put_integer(out, 4, 0x10, *index)?,
-            Representation::LiteralNameRef { never_index, static_table, index, value } => {
-                let flags = 0x40 | if *never_index { 0x20 } else { 0 } | if *static_table { 0x10 } else { 0 };
+            Representation::LiteralNameRef {
+                never_index,
+                static_table,
+                index,
+                value,
+            } => {
+                let flags = 0x40
+                    | if *never_index { 0x20 } else { 0 }
+                    | if *static_table { 0x10 } else { 0 };
                 put_integer(out, 4, flags, *index)?;
                 put_string(out, 7, 0, value)?;
             }
-            Representation::LiteralPostBaseNameRef { never_index, index, value } => {
+            Representation::LiteralPostBaseNameRef {
+                never_index,
+                index,
+                value,
+            } => {
                 put_integer(out, 3, if *never_index { 0x08 } else { 0 }, *index)?;
                 put_string(out, 7, 0, value)?;
             }
-            Representation::LiteralName { never_index, name, value } => {
+            Representation::LiteralName {
+                never_index,
+                name,
+                value,
+            } => {
                 put_string(out, 3, if *never_index { 0x30 } else { 0x20 }, name)?;
                 put_string(out, 7, 0, value)?;
             }
@@ -1630,7 +1855,13 @@ impl BlockedSection {
         if self.required_insert_count() > table.insert_count() {
             return Ok(SectionResult::Blocked(self));
         }
-        section_fields(table, self.stream, self.prefix, &self.body, self.field_limit)
+        section_fields(
+            table,
+            self.stream,
+            self.prefix,
+            &self.body,
+            self.field_limit,
+        )
     }
 }
 
@@ -1643,7 +1874,9 @@ fn section_fields(
 ) -> Result<SectionResult, Error> {
     let fields = decode_fields(table, prefix, body, limit)?;
     let ack = (prefix.required_insert_count != 0).then_some(DecoderInstruction::SectionAck(stream));
-    table.reported.set(table.reported.get().max(prefix.required_insert_count));
+    table
+        .reported
+        .set(table.reported.get().max(prefix.required_insert_count));
     Ok(SectionResult::Fields { fields, ack })
 }
 
@@ -1701,7 +1934,12 @@ pub fn decode_section_with_limit(
     let (prefix, used) = SectionPrefix::parse(bytes, table.max_entries(), table.insert_count())?;
     let body = bytes.get(used..).ok_or(Error::Truncated)?;
     if prefix.required_insert_count > table.insert_count() {
-        return Ok(SectionResult::Blocked(BlockedSection { stream, prefix, body: body.to_vec(), field_limit }));
+        return Ok(SectionResult::Blocked(BlockedSection {
+            stream,
+            prefix,
+            body: body.to_vec(),
+            field_limit,
+        }));
     }
     section_fields(table, stream, prefix, body, field_limit)
 }
@@ -1721,7 +1959,11 @@ pub struct BlockedSections {
 impl BlockedSections {
     /// Creates empty storage with the negotiated blocked-stream limit.
     pub fn new(max_streams: usize) -> Self {
-        Self { sections: VecDeque::new(), bytes: 0, max_streams: max_streams.min(MAX_BLOCKED_STREAMS) }
+        Self {
+            sections: VecDeque::new(),
+            bytes: 0,
+            max_streams: max_streams.min(MAX_BLOCKED_STREAMS),
+        }
     }
     /// Encoded body bytes retained across all sections.
     pub fn buffered(&self) -> usize {
@@ -1778,20 +2020,20 @@ impl BlockedSections {
 
 impl From<Truncated> for Stop {
     #[inline]
-    fn from(_: Truncated) -> Self { Stop::More }
+    fn from(_: Truncated) -> Self {
+        Stop::More
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::assert_linear;
     use super::*;
-    use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::codec::{
-        Lcg,
-    };
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::prefix_int::Integer;
+    use fictionet::stdlib::test_support::assert_linear;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::hex;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn apply(table: &mut Table, bytes: &[u8]) -> Result<(), Error> {
         let (items, error) = decode_all(Frames::<EncoderInstruction>::new, bytes);
@@ -1803,13 +2045,16 @@ mod tests {
     }
 
     fn blocked(table: &Table, stream: u64, bytes: &[u8]) -> BlockedSection {
-        let SectionResult::Blocked(section) = decode_section(table, stream, bytes).unwrap() else { panic!("ready") };
+        let SectionResult::Blocked(section) = decode_section(table, stream, bytes).unwrap() else {
+            panic!("ready")
+        };
         section
     }
 
-
     fn fields(section: SectionResult) -> Vec<Field> {
-        let SectionResult::Fields { fields, .. } = section else { panic!("blocked") };
+        let SectionResult::Fields { fields, .. } = section else {
+            panic!("blocked")
+        };
         fields
     }
 
@@ -1817,11 +2062,47 @@ mod tests {
 
     #[test]
     fn integer_examples() {
-        assert_eq!(Integer::<5> { flags: 0, value: 10 }.to_bytes().unwrap(), [0x0a]);
-        assert_eq!(Integer::<5> { flags: 0, value: 1337 }.to_bytes().unwrap(), [0x1f, 0x9a, 0x0a]);
-        assert_eq!(Integer::<5>::parse(&[0x1f, 0x9a, 0x0a]), Ok(Integer { flags: 0, value: 1337 }));
-        assert_eq!(Integer::<8> { flags: 0, value: 42 }.to_bytes().unwrap(), [0x2a]);
-        assert_eq!(Integer::<5>::parse(&[0xea]), Ok(Integer { flags: 0xe0, value: 10 }));
+        assert_eq!(
+            Integer::<5> {
+                flags: 0,
+                value: 10
+            }
+            .to_bytes()
+            .unwrap(),
+            [0x0a]
+        );
+        assert_eq!(
+            Integer::<5> {
+                flags: 0,
+                value: 1337
+            }
+            .to_bytes()
+            .unwrap(),
+            [0x1f, 0x9a, 0x0a]
+        );
+        assert_eq!(
+            Integer::<5>::parse(&[0x1f, 0x9a, 0x0a]),
+            Ok(Integer {
+                flags: 0,
+                value: 1337
+            })
+        );
+        assert_eq!(
+            Integer::<8> {
+                flags: 0,
+                value: 42
+            }
+            .to_bytes()
+            .unwrap(),
+            [0x2a]
+        );
+        assert_eq!(
+            Integer::<5>::parse(&[0xea]),
+            Ok(Integer {
+                flags: 0xe0,
+                value: 10
+            })
+        );
         for n in 0..3 {
             assert_eq!(
                 Integer::<5>::parse(&[0x1f, 0x9a, 0x0a][..n]),
@@ -1833,9 +2114,21 @@ mod tests {
     #[test]
     fn integer_limits() {
         fn check<const P: u8>() {
-            for value in
-                [0, 1, 30, 31, 127, 128, 255, 256, 1 << 40, MAX_VARINT - 1, MAX_VARINT, MAX_VARINT + 1, u64::MAX]
-            {
+            for value in [
+                0,
+                1,
+                30,
+                31,
+                127,
+                128,
+                255,
+                256,
+                1 << 40,
+                MAX_VARINT - 1,
+                MAX_VARINT,
+                MAX_VARINT + 1,
+                u64::MAX,
+            ] {
                 let unit = Integer::<P> { flags: 0, value };
                 contract::check_wire_value(&unit);
                 let bytes = unit.to_bytes().unwrap();
@@ -1865,7 +2158,13 @@ mod tests {
             Err(prefix_int::Error::Prefix)
         );
         assert_eq!(Integer::<9>::parse(&[0]), Err(prefix_int::Error::Prefix));
-        assert_eq!(Integer::<8>::parse(&hex("ff 80feffffffffffff3f")), Ok(Integer { flags: 0, value: MAX_VARINT }));
+        assert_eq!(
+            Integer::<8>::parse(&hex("ff 80feffffffffffff3f")),
+            Ok(Integer {
+                flags: 0,
+                value: MAX_VARINT
+            })
+        );
         // MAX_VARINT + 1 with an eight-bit prefix.
         for bytes in [vec![0xff; 30], hex("ff 81feffffffffffff3f")] {
             let mut c = Reader::new(&bytes);
@@ -1900,7 +2199,10 @@ mod tests {
         let section = hex("0000 510b 2f69 6e64 6578 2e68 746d 6c");
         assert_eq!(
             decode_section(&table, 0, &section),
-            Ok(SectionResult::Fields { fields: vec![Field::new(":path", "/index.html")], ack: None })
+            Ok(SectionResult::Fields {
+                fields: vec![Field::new(":path", "/index.html")],
+                ack: None
+            })
         );
         assert_eq!(table.take_increment(), None);
     }
@@ -1912,7 +2214,11 @@ mod tests {
         let s4 = hex("0381 10 11");
         held.push(blocked(&table, 4, &s4)).unwrap();
         let enc = hex("3fbd01 c00f7777772e6578616d706c652e636f6d c10c2f73616d706c652f70617468");
-        contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &enc, 2 * MAX_INSTRUCTION);
+        contract::check_decode_with_alloc_limit(
+            Frames::<EncoderInstruction>::new,
+            &enc,
+            2 * MAX_INSTRUCTION,
+        );
         apply(&mut table, &enc).unwrap();
         assert_eq!(table.size(), 106);
         assert_eq!(
@@ -1920,22 +2226,38 @@ mod tests {
             Some((
                 4,
                 Ok(SectionResult::Fields {
-                    fields: vec![Field::new(":authority", "www.example.com"), Field::new(":path", "/sample/path")],
+                    fields: vec![
+                        Field::new(":authority", "www.example.com"),
+                        Field::new(":path", "/sample/path")
+                    ],
                     ack: Some(DecoderInstruction::SectionAck(4)),
                 })
             ))
         );
         assert_eq!(table.take_increment(), None);
-        apply(&mut table, &hex("4a637573746f6d2d6b65790c637573746f6d2d76616c7565")).unwrap();
+        apply(
+            &mut table,
+            &hex("4a637573746f6d2d6b65790c637573746f6d2d76616c7565"),
+        )
+        .unwrap();
         assert_eq!(table.size(), 160);
-        assert_eq!(table.take_increment(), Some(DecoderInstruction::InsertCountIncrement(1)));
+        assert_eq!(
+            table.take_increment(),
+            Some(DecoderInstruction::InsertCountIncrement(1))
+        );
         let s8 = hex("0500 80 c1 81");
         held.push(blocked(&table, 8, &s8)).unwrap();
-        assert_eq!(held.cancel(&table, 8), Some(DecoderInstruction::StreamCancel(8)));
+        assert_eq!(
+            held.cancel(&table, 8),
+            Some(DecoderInstruction::StreamCancel(8))
+        );
         apply(&mut table, &[2]).unwrap();
         assert_eq!(held.next_ready(&table), None);
         assert_eq!(table.size(), 217);
-        assert_eq!(table.get(3), Some((&b":authority"[..], &b"www.example.com"[..])));
+        assert_eq!(
+            table.get(3),
+            Some((&b":authority"[..], &b"www.example.com"[..]))
+        );
         assert_eq!(
             decode_section(&table, 12, &s8),
             Ok(SectionResult::Fields {
@@ -1950,8 +2272,14 @@ mod tests {
         apply(&mut table, &hex("810d637573746f6d2d76616c756532")).unwrap();
         assert_eq!(table.size(), 215);
         assert_eq!(table.first_index(), 1);
-        assert_eq!(table.get(4), Some((&b"custom-key"[..], &b"custom-value2"[..])));
-        assert_eq!(table.take_increment(), Some(DecoderInstruction::InsertCountIncrement(1)));
+        assert_eq!(
+            table.get(4),
+            Some((&b"custom-key"[..], &b"custom-value2"[..]))
+        );
+        assert_eq!(
+            table.take_increment(),
+            Some(DecoderInstruction::InsertCountIncrement(1))
+        );
     }
 
     #[test]
@@ -1979,40 +2307,89 @@ mod tests {
     #[test]
     fn section_prefix() {
         for (required, base) in [(0, 0), (2, 0), (4, 4), (4, 9), (5, 1), (100, 0)] {
-            let p = SectionPrefix { required_insert_count: required, base };
+            let p = SectionPrefix {
+                required_insert_count: required,
+                base,
+            };
             let bytes = p.encoded(128).unwrap().to_bytes().unwrap();
-            assert_eq!(SectionPrefix::parse(&bytes, 128, required), Ok((p, bytes.len())));
+            assert_eq!(
+                SectionPrefix::parse(&bytes, 128, required),
+                Ok((p, bytes.len()))
+            );
             for n in 0..bytes.len() {
-                assert_eq!(SectionPrefix::parse(&bytes[..n], 128, required), Err(Error::Truncated));
+                assert_eq!(
+                    SectionPrefix::parse(&bytes[..n], 128, required),
+                    Err(Error::Truncated)
+                );
             }
         }
         // A negative Base.
         assert_eq!(SectionPrefix::parse(&[0x00, 0x80], 6, 0), Err(Error::Base));
         assert_eq!(SectionPrefix::parse(&[0x03, 0x82], 6, 2), Err(Error::Base));
-        assert_eq!(SectionPrefix { required_insert_count: 1, base: 0 }.encoded(0), Err(Error::Unwritable));
-        let far = SectionPrefix { required_insert_count: 0, base: u64::MAX };
+        assert_eq!(
+            SectionPrefix {
+                required_insert_count: 1,
+                base: 0
+            }
+            .encoded(0),
+            Err(Error::Unwritable)
+        );
+        let far = SectionPrefix {
+            required_insert_count: 0,
+            base: u64::MAX,
+        };
         assert_eq!(far.encoded(6), Err(Error::Unwritable));
     }
 
     #[test]
     fn representations_round_trip() {
         let reps = [
-            Representation::Indexed { static_table: true, index: 98 },
-            Representation::Indexed { static_table: false, index: 0 },
-            Representation::Indexed { static_table: false, index: 1000 },
+            Representation::Indexed {
+                static_table: true,
+                index: 98,
+            },
+            Representation::Indexed {
+                static_table: false,
+                index: 0,
+            },
+            Representation::Indexed {
+                static_table: false,
+                index: 1000,
+            },
             Representation::IndexedPostBase(0),
             Representation::IndexedPostBase(70),
-            Representation::LiteralNameRef { never_index: true, static_table: true, index: 15, value: b"x".to_vec() },
+            Representation::LiteralNameRef {
+                never_index: true,
+                static_table: true,
+                index: 15,
+                value: b"x".to_vec(),
+            },
             Representation::LiteralNameRef {
                 never_index: false,
                 static_table: false,
                 index: 3,
                 value: b"some value".to_vec(),
             },
-            Representation::LiteralPostBaseNameRef { never_index: true, index: 9, value: vec![0, 1, 2, 255] },
-            Representation::LiteralPostBaseNameRef { never_index: false, index: 0, value: Vec::new() },
-            Representation::LiteralName { never_index: false, name: b"custom-key".to_vec(), value: b"v".to_vec() },
-            Representation::LiteralName { never_index: true, name: vec![0xff; 40], value: vec![b'a'; 300] },
+            Representation::LiteralPostBaseNameRef {
+                never_index: true,
+                index: 9,
+                value: vec![0, 1, 2, 255],
+            },
+            Representation::LiteralPostBaseNameRef {
+                never_index: false,
+                index: 0,
+                value: Vec::new(),
+            },
+            Representation::LiteralName {
+                never_index: false,
+                name: b"custom-key".to_vec(),
+                value: b"v".to_vec(),
+            },
+            Representation::LiteralName {
+                never_index: true,
+                name: vec![0xff; 40],
+                value: vec![b'a'; 300],
+            },
         ];
         for rep in &reps {
             contract::check_wire_value(rep);
@@ -2021,13 +2398,24 @@ mod tests {
                 assert_eq!(Representation::parse(&bytes[..n]), Err(Error::Incomplete));
             }
         }
-        let large =
-            Representation::LiteralName { never_index: false, name: b"n".to_vec(), value: vec![0; MAX_STRING + 1] };
+        let large = Representation::LiteralName {
+            never_index: false,
+            name: b"n".to_vec(),
+            value: vec![0; MAX_STRING + 1],
+        };
         assert_eq!(large.to_bytes(), Err(Error::Unwritable));
         let mut raw = vec![0x50];
-        Integer::<7> { flags: 0, value: MAX_STRING as u64 + 1 }.write(&mut raw).unwrap();
+        Integer::<7> {
+            flags: 0,
+            value: MAX_STRING as u64 + 1,
+        }
+        .write(&mut raw)
+        .unwrap();
         assert_eq!(Representation::parse(&raw), Err(Error::StringTooLong));
-        assert_eq!(Representation::parse(&[0x50, 0x81, 0xff]), Err(Error::Huffman));
+        assert_eq!(
+            Representation::parse(&[0x50, 0x81, 0xff]),
+            Err(Error::Huffman)
+        );
     }
 
     #[test]
@@ -2035,10 +2423,24 @@ mod tests {
         let enc = [
             EncoderInstruction::SetCapacity(0),
             EncoderInstruction::SetCapacity(220),
-            EncoderInstruction::InsertWithNameRef { static_table: true, index: 0, value: b"www.example.com".to_vec() },
-            EncoderInstruction::InsertWithNameRef { static_table: false, index: 200, value: Vec::new() },
-            EncoderInstruction::InsertWithLiteralName { name: b"custom-key".to_vec(), value: b"custom-value".to_vec() },
-            EncoderInstruction::InsertWithLiteralName { name: vec![1; 100], value: vec![2; 100] },
+            EncoderInstruction::InsertWithNameRef {
+                static_table: true,
+                index: 0,
+                value: b"www.example.com".to_vec(),
+            },
+            EncoderInstruction::InsertWithNameRef {
+                static_table: false,
+                index: 200,
+                value: Vec::new(),
+            },
+            EncoderInstruction::InsertWithLiteralName {
+                name: b"custom-key".to_vec(),
+                value: b"custom-value".to_vec(),
+            },
+            EncoderInstruction::InsertWithLiteralName {
+                name: vec![1; 100],
+                value: vec![2; 100],
+            },
             EncoderInstruction::Duplicate(0),
             EncoderInstruction::Duplicate(MAX_VARINT),
         ];
@@ -2050,26 +2452,42 @@ mod tests {
                 2 * MAX_INSTRUCTION,
             );
         }
-        assert_eq!(EncoderInstruction::SetCapacity(220).to_bytes().unwrap(), [0x3f, 0xbd, 0x01]);
+        assert_eq!(
+            EncoderInstruction::SetCapacity(220).to_bytes().unwrap(),
+            [0x3f, 0xbd, 0x01]
+        );
         assert_eq!(EncoderInstruction::Duplicate(2).to_bytes().unwrap(), [0x02]);
         for (ins, bytes) in [
             (DecoderInstruction::SectionAck(4), vec![0x84]),
             (DecoderInstruction::StreamCancel(8), vec![0x48]),
             (DecoderInstruction::InsertCountIncrement(1), vec![0x01]),
-            (DecoderInstruction::SectionAck(1 << 40), DecoderInstruction::SectionAck(1 << 40).to_bytes().unwrap()),
+            (
+                DecoderInstruction::SectionAck(1 << 40),
+                DecoderInstruction::SectionAck(1 << 40).to_bytes().unwrap(),
+            ),
         ] {
             assert_eq!(ins.to_bytes().unwrap(), bytes);
             contract::check_wire_value(&ins);
-            contract::check_decode_with_alloc_limit(Frames::<DecoderInstruction>::new, &bytes, 2 * MAX_INTEGER_BYTES);
+            contract::check_decode_with_alloc_limit(
+                Frames::<DecoderInstruction>::new,
+                &bytes,
+                2 * MAX_INTEGER_BYTES,
+            );
         }
-        assert_eq!(DecoderInstruction::parse(&[0xff; 12]), Err(Error::IntegerOverflow));
+        assert_eq!(
+            DecoderInstruction::parse(&[0xff; 12]),
+            Err(Error::IntegerOverflow)
+        );
     }
 
     #[test]
     fn dynamic_table_capacity_and_eviction() {
         let mut t = Table::new(100);
         assert_eq!(t.max_entries(), 3);
-        assert_eq!(t.insert(b"a".to_vec(), b"b".to_vec()), Err(Error::EntryTooLarge));
+        assert_eq!(
+            t.insert(b"a".to_vec(), b"b".to_vec()),
+            Err(Error::EntryTooLarge)
+        );
         assert_eq!(t.set_capacity(101), Err(Error::Capacity(101)));
         t.set_capacity(100).unwrap();
         assert_eq!(t.insert(b"a".to_vec(), b"1".to_vec()), Ok(0)); // 34
@@ -2088,7 +2506,10 @@ mod tests {
         // An entry as large as the capacity empties the table.
         assert_eq!(t.insert(vec![b'x'; 60], vec![b'y'; 8]), Ok(3));
         assert_eq!((t.len(), t.size()), (1, 100));
-        assert_eq!(t.insert(vec![b'x'; 60], vec![b'y'; 9]), Err(Error::EntryTooLarge));
+        assert_eq!(
+            t.insert(vec![b'x'; 60], vec![b'y'; 9]),
+            Err(Error::EntryTooLarge)
+        );
         assert_eq!(t.insert_count(), 4);
         t.set_capacity(0).unwrap();
         assert!(t.is_empty());
@@ -2108,19 +2529,46 @@ mod tests {
             assert_eq!(apply(&mut table.clone(), &bytes), Err(error));
         }
         // Field section errors.
-        assert_eq!(decode_section_with_limit(&table, 0, &[], 200), Err(Error::Truncated));
-        assert_eq!(decode_section_with_limit(&table, 0, &[0x00], 200), Err(Error::Truncated));
-        assert_eq!(decode_section_with_limit(&table, 0, &[0x00, 0x00, 0x51], 200), Err(Error::Truncated));
-        assert_eq!(decode_section_with_limit(&table, 0, &[0x00, 0x00, 0xff, 0x24], 200), Err(Error::StaticIndex(99)));
-        assert_eq!(decode_section_with_limit(&table, 0, &[0x00, 0x00, 0x80], 200), Err(Error::DynamicIndex(0)));
-        assert_eq!(decode_section_with_limit(&table, 0, &[0x00, 0x00, 0x10], 200), Err(Error::DynamicIndex(0)));
-        assert_eq!(decode_section_with_limit(&table, 0, &[0x0e, 0x00], 200), Err(Error::InsertCount));
-        assert_eq!(decode_section_with_limit(&table, 0, &[0x00, 0x80], 200), Err(Error::Base));
+        assert_eq!(
+            decode_section_with_limit(&table, 0, &[], 200),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            decode_section_with_limit(&table, 0, &[0x00], 200),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            decode_section_with_limit(&table, 0, &[0x00, 0x00, 0x51], 200),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            decode_section_with_limit(&table, 0, &[0x00, 0x00, 0xff, 0x24], 200),
+            Err(Error::StaticIndex(99))
+        );
+        assert_eq!(
+            decode_section_with_limit(&table, 0, &[0x00, 0x00, 0x80], 200),
+            Err(Error::DynamicIndex(0))
+        );
+        assert_eq!(
+            decode_section_with_limit(&table, 0, &[0x00, 0x00, 0x10], 200),
+            Err(Error::DynamicIndex(0))
+        );
+        assert_eq!(
+            decode_section_with_limit(&table, 0, &[0x0e, 0x00], 200),
+            Err(Error::InsertCount)
+        );
+        assert_eq!(
+            decode_section_with_limit(&table, 0, &[0x00, 0x80], 200),
+            Err(Error::Base)
+        );
         let mut big = vec![0x00, 0x00];
         for _ in 0..10 {
             big.push(0xc0 | 31); // static 31: 64 bytes counted
         }
-        assert_eq!(decode_section_with_limit(&table, 0, &big, 200), Err(Error::FieldSectionTooLarge));
+        assert_eq!(
+            decode_section_with_limit(&table, 0, &big, 200),
+            Err(Error::FieldSectionTooLarge)
+        );
         assert_eq!(
             decode_section_with_limit(&table, 0, &vec![0; MAX_SECTION_BYTES + 1], 200),
             Err(Error::FieldSectionTooLarge)
@@ -2128,15 +2576,37 @@ mod tests {
         let mut held = BlockedSections::new(1);
         held.push(blocked(&table, 0, &[2, 0, 0x80])).unwrap();
         assert!(held.push(blocked(&table, 4, &[2, 0, 0x80])).is_err());
-        apply(&mut table, &[0x3f, 0xbd, 0x01, 0x41, b'a', 1, b'b', 0x41, b'c', 1, b'd']).unwrap();
+        apply(
+            &mut table,
+            &[0x3f, 0xbd, 0x01, 0x41, b'a', 1, b'b', 0x41, b'c', 1, b'd'],
+        )
+        .unwrap();
         let (id, result) = held.next_ready(&table).unwrap();
-        assert_eq!((id, fields(result.unwrap())), (0, vec![Field::new("a", "b")]));
-        assert_eq!(decode_section(&table, 8, &[0x03, 0x00, 0x81]), Err(Error::InsertCount));
-        assert_eq!(decode_section(&table, 8, &[0x03, 0x00, 0xd1]), Err(Error::InsertCount));
-        assert_eq!(fields(decode_section(&table, 8, &[0x03, 0x00, 0x80, 0x81]).unwrap()).len(), 2);
+        assert_eq!(
+            (id, fields(result.unwrap())),
+            (0, vec![Field::new("a", "b")])
+        );
+        assert_eq!(
+            decode_section(&table, 8, &[0x03, 0x00, 0x81]),
+            Err(Error::InsertCount)
+        );
+        assert_eq!(
+            decode_section(&table, 8, &[0x03, 0x00, 0xd1]),
+            Err(Error::InsertCount)
+        );
+        assert_eq!(
+            fields(decode_section(&table, 8, &[0x03, 0x00, 0x80, 0x81]).unwrap()).len(),
+            2
+        );
         // An index at or past the Required Insert Count, post-base.
-        assert_eq!(decode_section(&table, 8, &[0x02, 0x80, 0x10, 0x11]), Err(Error::DynamicIndex(1)));
-        assert_eq!(fields(decode_section(&table, 8, &[0x03, 0x81, 0x10, 0x11]).unwrap()).len(), 2);
+        assert_eq!(
+            decode_section(&table, 8, &[0x02, 0x80, 0x10, 0x11]),
+            Err(Error::DynamicIndex(1))
+        );
+        assert_eq!(
+            fields(decode_section(&table, 8, &[0x03, 0x81, 0x10, 0x11]).unwrap()).len(),
+            2
+        );
         // Too many fields.
         let mut many = vec![0x00, 0x00];
         many.extend(std::iter::repeat_n(0xc0 | 17, MAX_FIELDS + 1));
@@ -2149,36 +2619,69 @@ mod tests {
         let mut e = Encoder::new(100, 1 << 16);
         assert_eq!(e.set_capacity(101), Err(Error::Capacity(101)));
         assert_eq!(e.insert(b"a", b"b"), Err(Error::EntryTooLarge));
-        assert_eq!(e.insert(&vec![0; MAX_STRING + 1], b""), Err(Error::StringTooLong));
+        assert_eq!(
+            e.insert(&vec![0; MAX_STRING + 1], b""),
+            Err(Error::StringTooLong)
+        );
         assert_eq!(e.duplicate(0), Err(Error::DynamicIndex(0)));
         e.set_capacity(100).unwrap();
         assert_eq!(e.insert(b"x-a", b"1").map(|v| v.0), Ok(0));
-        assert_eq!(e.apply_instruction(DecoderInstruction::InsertCountIncrement(1)), Ok(()));
-        assert_eq!(e.section(MAX_VARINT + 1, &[Field::new("x-a", "1")]), Err(Error::Unwritable));
+        assert_eq!(
+            e.apply_instruction(DecoderInstruction::InsertCountIncrement(1)),
+            Ok(())
+        );
+        assert_eq!(
+            e.section(MAX_VARINT + 1, &[Field::new("x-a", "1")]),
+            Err(Error::Unwritable)
+        );
         assert!(e.outstanding.is_empty());
         assert_eq!(e.table().insert_count(), 1);
         let section = e.section(4, &[Field::new("x-a", "1")]).unwrap();
         assert_eq!(section.to_bytes().unwrap(), [0x02, 0x00, 0x80]);
         // Entry 0 is in use until stream 4's section is acknowledged.
-        assert_eq!(e.insert(b"x-b", vec![b'2'; 40].as_slice()), Err(Error::Referenced));
+        assert_eq!(
+            e.insert(b"x-b", vec![b'2'; 40].as_slice()),
+            Err(Error::Referenced)
+        );
         assert_eq!(e.set_capacity(0), Err(Error::Referenced));
-        assert_eq!(e.apply_instruction(DecoderInstruction::SectionAck(4)), Ok(()));
-        assert_eq!(e.insert(b"x-b", vec![b'2'; 40].as_slice()).map(|v| v.0), Ok(1));
+        assert_eq!(
+            e.apply_instruction(DecoderInstruction::SectionAck(4)),
+            Ok(())
+        );
+        assert_eq!(
+            e.insert(b"x-b", vec![b'2'; 40].as_slice()).map(|v| v.0),
+            Ok(1)
+        );
         // Invalid acknowledgment values do not change session state.
         let mut f = e.clone();
-        assert_eq!(f.apply_instruction(DecoderInstruction::SectionAck(4)), Err(Error::UnknownStream(4)));
+        assert_eq!(
+            f.apply_instruction(DecoderInstruction::SectionAck(4)),
+            Err(Error::UnknownStream(4))
+        );
         let mut f = e.clone();
-        assert_eq!(f.apply_instruction(DecoderInstruction::InsertCountIncrement(0)), Err(Error::ZeroIncrement));
+        assert_eq!(
+            f.apply_instruction(DecoderInstruction::InsertCountIncrement(0)),
+            Err(Error::ZeroIncrement)
+        );
         let mut f = e.clone();
-        assert_eq!(f.apply_instruction(DecoderInstruction::InsertCountIncrement(2)), Err(Error::Increment));
+        assert_eq!(
+            f.apply_instruction(DecoderInstruction::InsertCountIncrement(2)),
+            Err(Error::Increment)
+        );
         // Section errors.
         let mut small = Encoder::new(0, 100);
         assert_eq!(
             small.section(0, &[Field::new(vec![b'n'; 40], vec![b'v'; 40])]),
             Err(Error::FieldSectionTooLarge)
         );
-        assert_eq!(small.section(0, &vec![Field::new("a", ""); MAX_FIELDS + 1]), Err(Error::TooManyFields));
-        assert_eq!(small.section(0, &[Field::new(vec![0; MAX_STRING + 1], "")]), Err(Error::StringTooLong));
+        assert_eq!(
+            small.section(0, &vec![Field::new("a", ""); MAX_FIELDS + 1]),
+            Err(Error::TooManyFields)
+        );
+        assert_eq!(
+            small.section(0, &[Field::new(vec![0; MAX_STRING + 1], "")]),
+            Err(Error::StringTooLong)
+        );
     }
 
     #[test]
@@ -2187,7 +2690,9 @@ mod tests {
         encoder.set_capacity(4096).unwrap();
         encoder.insert(b"x-a", b"1").unwrap();
         encoder.insert(b"x-b", b"2").unwrap();
-        encoder.apply_instruction(DecoderInstruction::InsertCountIncrement(2)).unwrap();
+        encoder
+            .apply_instruction(DecoderInstruction::InsertCountIncrement(2))
+            .unwrap();
         for (stream, name, value) in [(0, "x-a", "1"), (4, "x-a", "1"), (4, "x-b", "2")] {
             let section = encoder.section(stream, &[Field::new(name, value)]).unwrap();
             contract::check_wire_value(&section);
@@ -2195,18 +2700,30 @@ mod tests {
         assert_eq!(encoder.set_capacity(36), Err(Error::Referenced));
         let mut bytes = Vec::new();
         for stream in [0, 4, 4] {
-            DecoderInstruction::SectionAck(stream).write(&mut bytes).unwrap();
+            DecoderInstruction::SectionAck(stream)
+                .write(&mut bytes)
+                .unwrap();
         }
         let (instructions, failure) = decode_all(Frames::<DecoderInstruction>::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(instructions.len(), 3);
         for (i, instruction) in instructions.into_iter().enumerate() {
             encoder.apply_instruction(instruction.unwrap()).unwrap();
-            let expected = if i == 0 { Err(Error::Referenced) } else { Ok(EncoderInstruction::SetCapacity(36)) };
+            let expected = if i == 0 {
+                Err(Error::Referenced)
+            } else {
+                Ok(EncoderInstruction::SetCapacity(36))
+            };
             assert_eq!(encoder.set_capacity(36), expected);
         }
-        assert_eq!(encoder.set_capacity(0), Ok(EncoderInstruction::SetCapacity(0)));
-        assert_eq!(encoder.apply_instruction(DecoderInstruction::SectionAck(4)), Err(Error::UnknownStream(4)));
+        assert_eq!(
+            encoder.set_capacity(0),
+            Ok(EncoderInstruction::SetCapacity(0))
+        );
+        assert_eq!(
+            encoder.apply_instruction(DecoderInstruction::SectionAck(4)),
+            Err(Error::UnknownStream(4))
+        );
     }
 
     #[test]
@@ -2215,7 +2732,8 @@ mod tests {
         let mut table = Table::new(4096);
         table.apply(e.set_capacity(4096).unwrap()).unwrap();
         table.apply(e.insert(b"x-secret", b"s").unwrap().1).unwrap();
-        e.apply_instruction(table.take_increment().unwrap()).unwrap();
+        e.apply_instruction(table.take_increment().unwrap())
+            .unwrap();
         let mut secret = Field::new("x-secret", "s");
         secret.never_index = true;
         let mut auth = Field::new("authorization", "");
@@ -2225,7 +2743,13 @@ mod tests {
         assert_eq!(fields(decode_section(&table, 0, &bytes).unwrap()), list);
         let section = FieldSection::parse(&bytes).unwrap();
         let rep = &section.representations[0];
-        assert!(matches!(rep, Representation::LiteralNameRef { never_index: true, .. }));
+        assert!(matches!(
+            rep,
+            Representation::LiteralNameRef {
+                never_index: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2233,8 +2757,11 @@ mod tests {
         let mut e = Encoder::new(4096, 1 << 16);
         let mut table = Table::new(4096);
         table.apply(e.set_capacity(4096).unwrap()).unwrap();
-        table.apply(e.insert(b"x-one", b"first").unwrap().1).unwrap();
-        e.apply_instruction(table.take_increment().unwrap()).unwrap();
+        table
+            .apply(e.insert(b"x-one", b"first").unwrap().1)
+            .unwrap();
+        e.apply_instruction(table.take_increment().unwrap())
+            .unwrap();
         let list = vec![
             Field::new(":status", "200"),
             Field::new("x-one", "first"),
@@ -2263,14 +2790,20 @@ mod tests {
             let mut encoder = Encoder::new(cap, 1 << 16);
             let mut table = Table::new(cap);
             let capacity = cap - rng.index((cap / 2 + 1) as usize) as u64;
-            table.apply(encoder.set_capacity(capacity).unwrap()).unwrap();
+            table
+                .apply(encoder.set_capacity(capacity).unwrap())
+                .unwrap();
             let mut instructions = Vec::new();
             let mut acknowledgments = Vec::new();
             for step in 0..1600 {
                 let field = |rng: &mut Lcg| {
                     let name = names[rng.index(names.len())];
                     let value = format!("v{}", rng.index(8)).repeat(rng.index(6) + 1);
-                    Field { name: name.as_bytes().to_vec(), value: value.into_bytes(), never_index: rng.index(10) == 0 }
+                    Field {
+                        name: name.as_bytes().to_vec(),
+                        value: value.into_bytes(),
+                        never_index: rng.index(10) == 0,
+                    }
                 };
                 let insert = field(&mut rng);
                 if rng.coin() {
@@ -2278,7 +2811,8 @@ mod tests {
                         instructions.push(ins);
                     }
                 } else if !encoder.table().is_empty() {
-                    let index = encoder.table().first_index() + rng.index(encoder.table().len()) as u64;
+                    let index =
+                        encoder.table().first_index() + rng.index(encoder.table().len()) as u64;
                     if let Ok((_, ins)) = encoder.duplicate(index) {
                         instructions.push(ins);
                     }
@@ -2324,10 +2858,22 @@ mod tests {
     fn generated_wire_and_stream_contracts() {
         let mut rng = Lcg::new(0x9204);
         for round in 0..4000 {
-            let mut data = if round % 2 == 0 { rng.bytes(64) } else { vec![0, 0, 0xd1, 0x50, 1, b'x'] };
+            let mut data = if round % 2 == 0 {
+                rng.bytes(64)
+            } else {
+                vec![0, 0, 0xd1, 0x50, 1, b'x']
+            };
             mutate(&mut rng, &mut data);
-            contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &data, 2 * MAX_INSTRUCTION);
-            contract::check_decode_with_alloc_limit(Frames::<DecoderInstruction>::new, &data, 2 * MAX_INTEGER_BYTES);
+            contract::check_decode_with_alloc_limit(
+                Frames::<EncoderInstruction>::new,
+                &data,
+                2 * MAX_INSTRUCTION,
+            );
+            contract::check_decode_with_alloc_limit(
+                Frames::<DecoderInstruction>::new,
+                &data,
+                2 * MAX_INTEGER_BYTES,
+            );
             contract::check_wire::<EncoderInstruction>(&data);
             contract::check_wire::<DecoderInstruction>(&data);
             contract::check_wire::<Representation>(&data);
@@ -2341,10 +2887,18 @@ mod tests {
                     break;
                 }
             }
-            if let Ok(SectionResult::Fields { fields: list, .. }) = decode_section_with_limit(&table, 0, &data, 1 << 12)
+            if let Ok(SectionResult::Fields { fields: list, .. }) =
+                decode_section_with_limit(&table, 0, &data, 1 << 12)
             {
-                let bytes = Encoder::new(0, 1 << 12).section(0, &list).unwrap().to_bytes().unwrap();
-                assert_eq!(fields(decode_section(&Table::new(0), 0, &bytes).unwrap()), list);
+                let bytes = Encoder::new(0, 1 << 12)
+                    .section(0, &list)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap();
+                assert_eq!(
+                    fields(decode_section(&Table::new(0), 0, &bytes).unwrap()),
+                    list
+                );
             }
         }
     }
@@ -2355,19 +2909,33 @@ mod tests {
         let mut table = Table::new(4096);
         table.set_capacity(4096).unwrap();
         for i in 0..40 {
-            table.insert(format!("x-h{}", i % 7).into_bytes(), i.to_string().into_bytes()).unwrap();
+            table
+                .insert(
+                    format!("x-h{}", i % 7).into_bytes(),
+                    i.to_string().into_bytes(),
+                )
+                .unwrap();
         }
         for _ in 0..3000 {
             let mut data = vec![rng.index(80) as u8, rng.next() as u8];
             data.extend(rng.bytes(40));
-            if let Ok(SectionResult::Fields { fields, .. }) = decode_section_with_limit(&table, 0, &data, 1 << 14) {
+            if let Ok(SectionResult::Fields { fields, .. }) =
+                decode_section_with_limit(&table, 0, &data, 1 << 14)
+            {
                 assert!(fields.iter().map(Field::size).sum::<u64>() <= 1 << 14);
             }
-            contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &data, 2 * MAX_INSTRUCTION);
+            contract::check_decode_with_alloc_limit(
+                Frames::<EncoderInstruction>::new,
+                &data,
+                2 * MAX_INSTRUCTION,
+            );
             let mut changed = table.clone();
             let (instructions, _) = decode_all(Frames::<EncoderInstruction>::new, &data);
             for instruction in instructions {
-                if instruction.and_then(|instruction| changed.apply(instruction)).is_err() {
+                if instruction
+                    .and_then(|instruction| changed.apply(instruction))
+                    .is_err()
+                {
                     break;
                 }
                 assert!(changed.size() <= changed.capacity());
@@ -2383,16 +2951,24 @@ mod tests {
         let mut e = Encoder::new(100, 1 << 16);
         e.set_capacity(100).unwrap();
         assert_eq!(e.insert(b"x-a", b"1").map(|v| v.0), Ok(0)); // 36
-        assert_eq!(e.insert(b"x-b", vec![b'2'; 40].as_slice()), Err(Error::Referenced));
+        assert_eq!(
+            e.insert(b"x-b", vec![b'2'; 40].as_slice()),
+            Err(Error::Referenced)
+        );
         assert_eq!(e.duplicate(0).map(|v| v.0), Ok(1)); // 72
         assert_eq!(e.duplicate(1), Err(Error::Referenced));
         assert_eq!(e.set_capacity(40), Err(Error::Referenced));
         // Once both inserts are acknowledged, they may go.
-        e.apply_instruction(DecoderInstruction::InsertCountIncrement(2)).unwrap();
-        assert_eq!(e.insert(b"x-b", vec![b'2'; 40].as_slice()).map(|v| v.0), Ok(2));
+        e.apply_instruction(DecoderInstruction::InsertCountIncrement(2))
+            .unwrap();
+        assert_eq!(
+            e.insert(b"x-b", vec![b'2'; 40].as_slice()).map(|v| v.0),
+            Ok(2)
+        );
         assert_eq!(e.table().first_index(), 2);
         assert_eq!(e.set_capacity(0), Err(Error::Referenced));
-        e.apply_instruction(DecoderInstruction::InsertCountIncrement(1)).unwrap();
+        e.apply_instruction(DecoderInstruction::InsertCountIncrement(1))
+            .unwrap();
         assert_eq!(e.set_capacity(0), Ok(EncoderInstruction::SetCapacity(0)));
     }
 
@@ -2424,9 +3000,16 @@ mod tests {
     #[test]
     fn long_instruction_allocation_contract() {
         assert_linear("long_instruction_allocation_contract", 7_500, |size| {
-            let ins = EncoderInstruction::InsertWithLiteralName { name: vec![b'0'; size], value: vec![b'1'; size] };
+            let ins = EncoderInstruction::InsertWithLiteralName {
+                name: vec![b'0'; size],
+                value: vec![b'1'; size],
+            };
             let bytes = ins.to_bytes().unwrap();
-            contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &bytes, 2 * MAX_INSTRUCTION);
+            contract::check_decode_with_alloc_limit(
+                Frames::<EncoderInstruction>::new,
+                &bytes,
+                2 * MAX_INSTRUCTION,
+            );
             let mut table = Table::new(MAX_TABLE_CAPACITY);
             table.set_capacity(MAX_TABLE_CAPACITY).unwrap();
             apply(&mut table, &bytes).unwrap();
@@ -2476,25 +3059,43 @@ mod tests {
         held.push(blocked(&table, 0, &[2, 0, 0x80])).unwrap();
         apply(&mut table, &[0x41, b'a', 1, b'1']).unwrap();
         assert_eq!(held.next_ready(&table), None);
-        assert_eq!(table.take_increment(), Some(DecoderInstruction::InsertCountIncrement(1)));
+        assert_eq!(
+            table.take_increment(),
+            Some(DecoderInstruction::InsertCountIncrement(1))
+        );
         apply(&mut table, &[0x41, b'b', 1, b'2']).unwrap();
         for field in [Field::new("b", "2"), Field::new("a", "1")] {
             assert_eq!(
                 held.next_ready(&table),
                 Some((
                     0,
-                    Ok(SectionResult::Fields { fields: vec![field], ack: Some(DecoderInstruction::SectionAck(0)) })
+                    Ok(SectionResult::Fields {
+                        fields: vec![field],
+                        ack: Some(DecoderInstruction::SectionAck(0))
+                    })
                 ))
             );
         }
         assert_eq!(table.take_increment(), None);
         // The owner waits until the blocked section is taken before reading later frames.
-        assert_eq!(fields(decode_section(&table, 0, &[0, 0, 0xd1]).unwrap()), [Field::new(":method", "GET")]);
+        assert_eq!(
+            fields(decode_section(&table, 0, &[0, 0, 0xd1]).unwrap()),
+            [Field::new(":method", "GET")]
+        );
         held.push(blocked(&table, 4, &[4, 0, 0x80])).unwrap();
         apply(&mut table, &[0x41, b'c', 1, b'3']).unwrap();
-        assert_eq!(fields(decode_section(&table, 8, &[0, 0, 0xd1]).unwrap()), [Field::new(":method", "GET")]);
-        assert_eq!(fields(held.next_ready(&table).unwrap().1.unwrap()), [Field::new("c", "3")]);
-        assert_eq!(fields(decode_section(&table, 4, &[0, 0, 0xd1]).unwrap()), [Field::new(":method", "GET")]);
+        assert_eq!(
+            fields(decode_section(&table, 8, &[0, 0, 0xd1]).unwrap()),
+            [Field::new(":method", "GET")]
+        );
+        assert_eq!(
+            fields(held.next_ready(&table).unwrap().1.unwrap()),
+            [Field::new("c", "3")]
+        );
+        assert_eq!(
+            fields(decode_section(&table, 4, &[0, 0, 0xd1]).unwrap()),
+            [Field::new(":method", "GET")]
+        );
     }
 
     #[test]
@@ -2503,7 +3104,8 @@ mod tests {
         table.set_capacity(MAX_TABLE_CAPACITY).unwrap();
         let mut held = BlockedSections::new(1);
         for _ in 0..MAX_BLOCKED_SECTIONS {
-            held.push(blocked(&table, 0, &[2, 0, 0x80, 0x80, 0x80, 0x80])).unwrap();
+            held.push(blocked(&table, 0, &[2, 0, 0x80, 0x80, 0x80, 0x80]))
+                .unwrap();
         }
         table.insert(b"n".to_vec(), vec![b'v'; 60_000]).unwrap();
         assert!(held.push(blocked(&table, 0, &[3, 0, 0x80])).is_err());
@@ -2521,25 +3123,53 @@ mod tests {
         let mut table = Table::new(advertised);
         assert_eq!(encoder.table().max_entries(), 4096);
         assert_eq!(encoder.table().max_capacity(), MAX_TABLE_CAPACITY);
-        table.apply(encoder.set_capacity(MAX_TABLE_CAPACITY).unwrap()).unwrap();
+        table
+            .apply(encoder.set_capacity(MAX_TABLE_CAPACITY).unwrap())
+            .unwrap();
         for i in 0..4096 {
-            table.apply(encoder.insert(b"x", i.to_string().as_bytes()).unwrap().1).unwrap();
-            encoder.apply_instruction(table.take_increment().unwrap()).unwrap();
+            table
+                .apply(encoder.insert(b"x", i.to_string().as_bytes()).unwrap().1)
+                .unwrap();
+            encoder
+                .apply_instruction(table.take_increment().unwrap())
+                .unwrap();
         }
-        let bytes = encoder.section(0, &[Field::new("x", "4095")]).unwrap().to_bytes().unwrap();
+        let bytes = encoder
+            .section(0, &[Field::new("x", "4095")])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
         let (prefix, _) = SectionPrefix::parse(&bytes, advertised / ENTRY_OVERHEAD, 4096).unwrap();
         assert_eq!(prefix.required_insert_count, 4096);
-        assert_eq!(fields(decode_section(&table, 0, &bytes).unwrap()), [Field::new("x", "4095")]);
+        assert_eq!(
+            fields(decode_section(&table, 0, &bytes).unwrap()),
+            [Field::new("x", "4095")]
+        );
     }
 
     #[test]
     fn stream_readers_keep_bounded_buffers() {
-        contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &vec![0x20; 4096], 2 * MAX_INSTRUCTION);
-        contract::check_decode_with_alloc_limit(Frames::<DecoderInstruction>::new, &vec![0x40; 4096], 2 * MAX_INTEGER_BYTES);
-        let ins = EncoderInstruction::InsertWithLiteralName { name: b"n".to_vec(), value: vec![b'v'; 100] };
+        contract::check_decode_with_alloc_limit(
+            Frames::<EncoderInstruction>::new,
+            &vec![0x20; 4096],
+            2 * MAX_INSTRUCTION,
+        );
+        contract::check_decode_with_alloc_limit(
+            Frames::<DecoderInstruction>::new,
+            &vec![0x40; 4096],
+            2 * MAX_INTEGER_BYTES,
+        );
+        let ins = EncoderInstruction::InsertWithLiteralName {
+            name: b"n".to_vec(),
+            value: vec![b'v'; 100],
+        };
         let mut bytes = EncoderInstruction::SetCapacity(4096).to_bytes().unwrap();
         ins.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &bytes, 2 * MAX_INSTRUCTION);
+        contract::check_decode_with_alloc_limit(
+            Frames::<EncoderInstruction>::new,
+            &bytes,
+            2 * MAX_INSTRUCTION,
+        );
         let mut table = Table::new(4096);
         apply(&mut table, &bytes).unwrap();
         assert_eq!(table.len(), 1);
@@ -2549,7 +3179,10 @@ mod tests {
     fn instruction_values_do_not_accumulate_in_sessions() {
         let mut encoder = Encoder::new(4096, 1 << 16);
         for _ in 0..4096 {
-            assert_eq!(encoder.set_capacity(0), Ok(EncoderInstruction::SetCapacity(0)));
+            assert_eq!(
+                encoder.set_capacity(0),
+                Ok(EncoderInstruction::SetCapacity(0))
+            );
         }
         assert!(encoder.table().is_empty());
     }

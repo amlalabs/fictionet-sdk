@@ -339,7 +339,9 @@ impl Error {
                 high: RPCB_VERSION_HIGH,
             },
             Error::Procedure(_) => Accept::ProcUnavail,
-            Error::Xdr(_) | Error::TooLong | Error::TooMany | Error::RequestVersion(_) => Accept::GarbageArgs,
+            Error::Xdr(_) | Error::TooLong | Error::TooMany | Error::RequestVersion(_) => {
+                Accept::GarbageArgs
+            }
         }
     }
 
@@ -416,7 +418,8 @@ impl CallArgs {
 
     fn write(&self, w: &mut Writer) -> Result<(), Error> {
         w.uint(self.program).uint(self.version).uint(self.procedure);
-        w.try_opaque(&self.args, MAX_CALL_DATA).map_err(|_| Error::TooLong)
+        w.try_opaque(&self.args, MAX_CALL_DATA)
+            .map_err(|_| Error::TooLong)
     }
 }
 
@@ -480,7 +483,8 @@ impl Netbuf {
             return Err(Error::TooLong);
         }
         w.uint(self.maxlen);
-        w.try_opaque(&self.buf, MAX_NETBUF).map_err(|_| Error::TooLong)
+        w.try_opaque(&self.buf, MAX_NETBUF)
+            .map_err(|_| Error::TooLong)
     }
 }
 
@@ -761,7 +765,8 @@ impl PmapResult {
             })?,
             PmapResult::CallIt(c) => {
                 w.uint(c.port);
-                w.try_opaque(&c.results, MAX_CALL_DATA).map_err(|_| Error::TooLong)?;
+                w.try_opaque(&c.results, MAX_CALL_DATA)
+                    .map_err(|_| Error::TooLong)?;
             }
         }
         w.finish().map_err(|_| Error::TooLong)
@@ -934,7 +939,9 @@ impl RpcbResult {
             }),
             procedure::GETTIME => RpcbResult::Time(r.uint()?),
             procedure::UADDR2TADDR => RpcbResult::Netbuf(Netbuf::read(&mut r)?),
-            procedure::GETADDRLIST => RpcbResult::AddrList(r.list(MAX_LIST, usize::MAX, RpcbEntry::read)?),
+            procedure::GETADDRLIST => {
+                RpcbResult::AddrList(r.list(MAX_LIST, usize::MAX, RpcbEntry::read)?)
+            }
             procedure::GETSTAT => RpcbResult::Stat(Box::new([
                 RpcbStat::read(&mut r)?,
                 RpcbStat::read(&mut r)?,
@@ -972,16 +979,21 @@ impl RpcbResult {
                 w.bool(*b);
             }
             RpcbResult::Addr(s) => string(&mut w, s)?,
-            RpcbResult::Dump(list) => w.try_list(MAX_LIST, Error::TooMany, list, |w, b| b.write(w))?,
+            RpcbResult::Dump(list) => {
+                w.try_list(MAX_LIST, Error::TooMany, list, |w, b| b.write(w))?
+            }
             RpcbResult::CallIt(c) => {
                 string(&mut w, &c.addr)?;
-                w.try_opaque(&c.results, MAX_CALL_DATA).map_err(|_| Error::TooLong)?;
+                w.try_opaque(&c.results, MAX_CALL_DATA)
+                    .map_err(|_| Error::TooLong)?;
             }
             RpcbResult::Time(t) => {
                 w.uint(*t);
             }
             RpcbResult::Netbuf(n) => n.write(&mut w)?,
-            RpcbResult::AddrList(list) => w.try_list(MAX_LIST, Error::TooMany, list, |w, e| e.write(w))?,
+            RpcbResult::AddrList(list) => {
+                w.try_list(MAX_LIST, Error::TooMany, list, |w, e| e.write(w))?
+            }
             RpcbResult::Stat(stats) => {
                 for s in stats.iter() {
                     s.write(&mut w)?;
@@ -1127,9 +1139,9 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Assembled, Stream, Wire, finish, pump};
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support;
     use fictionet::stdlib::onc_rpc::{MAX_RECORD, Record, records};
+    use fictionet::stdlib::test_support;
+    use fictionet::stdlib::test_support::contract;
 
     fn rpcb(rng: &mut Lcg) -> Rpcb {
         Rpcb {
@@ -1624,10 +1636,7 @@ mod tests {
             ..Default::default()
         };
         let stats = Box::new([RpcbStat::default(), RpcbStat::default(), s]);
-        assert_eq!(
-            RpcbResult::Stat(stats).to_bytes(),
-            Err(Error::TooMany)
-        );
+        assert_eq!(RpcbResult::Stat(stats).to_bytes(), Err(Error::TooMany));
         let r = Request::Rpcb {
             version: 3,
             request: RpcbRequest::GetStat,
@@ -1643,11 +1652,7 @@ mod tests {
             request: RpcbRequest::Null,
         };
         assert_eq!(r.to_call(), Err(Error::RequestVersion(5)));
-        for e in [
-            Error::TooLong,
-            Error::TooMany,
-            Error::RequestVersion(3),
-        ] {
+        for e in [Error::TooLong, Error::TooMany, Error::RequestVersion(3)] {
             assert!(!e.to_string().is_empty());
         }
     }

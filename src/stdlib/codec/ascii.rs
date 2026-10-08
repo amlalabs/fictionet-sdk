@@ -54,12 +54,16 @@ pub fn trim_ows_str(s: &str) -> &str {
 /// Reads one or more unsigned ASCII digits, allowing leading zeros and enforcing both bounds.
 #[inline]
 pub fn decimal(b: &[u8], max_digits: usize, max: u64) -> Option<u64> {
-    if b.is_empty() || b.len() > max_digits { return None; }
+    if b.is_empty() || b.len() > max_digits {
+        return None;
+    }
     let mut n = 0u64;
     for &c in b {
         let d = c.checked_sub(b'0').filter(|&d| d < 10)?;
         n = n.checked_mul(10)?.checked_add(u64::from(d))?;
-        if n > max { return None; }
+        if n > max {
+            return None;
+        }
     }
     Some(n)
 }
@@ -70,11 +74,15 @@ pub fn percent_decode_into(bytes: &[u8], plus: bool, out: &mut Vec<u8>, max_len:
     while i < bytes.len() && out.len() < max_len {
         let b = bytes[i];
         if b == b'%'
-            && let (Some(h), Some(l)) = (bytes.get(i + 1).and_then(|&c| hex_value(c)), bytes.get(i + 2).and_then(|&c| hex_value(c))) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
+            && let (Some(h), Some(l)) = (
+                bytes.get(i + 1).and_then(|&c| hex_value(c)),
+                bytes.get(i + 2).and_then(|&c| hex_value(c)),
+            )
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
+        }
         out.push(if plus && b == b'+' { b' ' } else { b });
         i += 1;
     }
@@ -102,7 +110,10 @@ mod tests {
     fn digits_and_tokens() {
         for c in 0..=255u8 {
             assert_eq!(hex_value(c).map(u32::from), char::from(c).to_digit(16));
-            assert_eq!(is_tchar(c), c.is_ascii_graphic() && !b"()<>@,;:\\\"/[]?={}".contains(&c));
+            assert_eq!(
+                is_tchar(c),
+                c.is_ascii_graphic() && !b"()<>@,;:\\\"/[]?={}".contains(&c)
+            );
         }
         for n in 0..16 {
             assert_eq!(hex_value(hex_lower(n)), Some(n));
@@ -115,13 +126,27 @@ mod tests {
     #[test]
     fn whitespace_and_decimal() {
         for s in ["", " \t", " \tx \t", "\rx\n", " é "] {
-            assert_eq!(trim_ows(s.as_bytes()), s.trim_matches([' ', '\t']).as_bytes());
+            assert_eq!(
+                trim_ows(s.as_bytes()),
+                s.trim_matches([' ', '\t']).as_bytes()
+            );
             assert_eq!(trim_ows_str(s), s.trim_matches([' ', '\t']));
         }
-        for s in [b"".as_slice(), b"+1", b"-1", b" 1", b"1 ", b"a", b"18446744073709551616"] {
+        for s in [
+            b"".as_slice(),
+            b"+1",
+            b"-1",
+            b" 1",
+            b"1 ",
+            b"a",
+            b"18446744073709551616",
+        ] {
             assert_eq!(decimal(s, usize::MAX, u64::MAX), None);
         }
-        assert_eq!(decimal(b"18446744073709551615", 20, u64::MAX), Some(u64::MAX));
+        assert_eq!(
+            decimal(b"18446744073709551615", 20, u64::MAX),
+            Some(u64::MAX)
+        );
         assert_eq!(decimal(b"0001", 4, 1), Some(1));
         assert_eq!(decimal(b"0001", 3, 1), None);
         assert_eq!(decimal(b"2", 4, 1), None);

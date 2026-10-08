@@ -1,5 +1,5 @@
-use fictionet::stdlib::codec::{Buffer, Decode, Step};
 use core::{error::Error, fmt, ops::Range};
+use fictionet::stdlib::codec::{Buffer, Decode, Step};
 
 /// Why a stream stopped.
 ///

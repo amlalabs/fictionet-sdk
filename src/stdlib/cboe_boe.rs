@@ -121,12 +121,12 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use fictionet::stdlib::session::Action;
-use fictionet::stdlib::codec::field;
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Wire};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::field;
+use fictionet::stdlib::session::Action;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::marker::PhantomData;
@@ -1259,7 +1259,6 @@ fn envelope(b: &[u8]) -> Result<(u8, &[u8]), Error> {
     Ok((b[4], &b[5..]))
 }
 
-
 macro_rules! prefixed {
     ($item:ty) => {
         impl Prefixed for $item {
@@ -1268,12 +1267,21 @@ macro_rules! prefixed {
             type Limit = usize;
             const NAME: &'static str = "BOE";
             #[inline]
-            fn default_limit() -> usize { MAX_MESSAGE }
+            fn default_limit() -> usize {
+                MAX_MESSAGE
+            }
             #[inline]
-            fn normalize_limit(limit: usize) -> usize { limit.clamp(HEADER_LENGTH, MAX_MESSAGE) }
+            fn normalize_limit(limit: usize) -> usize {
+                limit.clamp(HEADER_LENGTH, MAX_MESSAGE)
+            }
             #[inline]
-            fn capacity(limit: &usize) -> usize { *limit }
-            fn parse_prefix(input: &[u8], limit: &usize) -> Result<Option<(Self::Item, usize)>, Error> {
+            fn capacity(limit: &usize) -> usize {
+                *limit
+            }
+            fn parse_prefix(
+                input: &[u8],
+                limit: &usize,
+            ) -> Result<Option<(Self::Item, usize)>, Error> {
                 let Some(head) = input.get(..4) else {
                     if input.first().is_some_and(|b| *b != 0xBA) {
                         return Err(Error::Start);
@@ -2597,7 +2605,12 @@ impl Server {
         self.clock.advance(now_ms)?;
         Ok(self.logout_now(reason, text, CloseReason::Logout))
     }
-    fn logout_now(&mut self, reason: u8, text: &str, close: CloseReason) -> Vec<Action<Outbound, Event>> {
+    fn logout_now(
+        &mut self,
+        reason: u8,
+        text: &str,
+        close: CloseReason,
+    ) -> Vec<Action<Outbound, Event>> {
         let logout = Logout {
             header: Header::default(),
             reason,
@@ -2796,10 +2809,7 @@ impl Exchange {
     /// An exchange with no orders that fills the return fields in
     /// `returns`, as [`Server::returns`] gives them. Refuses limits out of
     /// range and bitfields the [`ReturnTable`] cannot fill.
-    pub fn new(
-        config: ExchangeConfig,
-        returns: BTreeMap<u8, Vec<u8>>,
-    ) -> Result<Self, Error> {
+    pub fn new(config: ExchangeConfig, returns: BTreeMap<u8, Vec<u8>>) -> Result<Self, Error> {
         if !(1..=MAX_ORDERS).contains(&config.max_orders)
             || !(1..=MAX_EXECUTIONS).contains(&config.max_executions)
             || returns
@@ -2943,12 +2953,7 @@ impl Exchange {
 
     /// Accepts a pending New Order on matching unit `unit` (1 to 255) and
     /// returns its Order Acknowledgment, for [`Server::send`] to number.
-    pub fn accept(
-        &mut self,
-        cl_ord_id: ClOrdId,
-        unit: u8,
-        now: u64,
-    ) -> Result<Outbound, Error> {
+    pub fn accept(&mut self, cl_ord_id: ClOrdId, unit: u8, now: u64) -> Result<Outbound, Error> {
         let order_id = self.next_order_id;
         let next = order_id.checked_add(1).ok_or(Error::Exhausted)?;
         if unit == 0 {
@@ -3125,12 +3130,7 @@ impl Exchange {
     }
     /// Cancels a live order for the exchange's own `reason`, and returns
     /// the Order Cancelled.
-    pub fn cancel(
-        &mut self,
-        cl_ord_id: ClOrdId,
-        reason: u8,
-        now: u64,
-    ) -> Result<Outbound, Error> {
+    pub fn cancel(&mut self, cl_ord_id: ClOrdId, reason: u8, now: u64) -> Result<Outbound, Error> {
         let order = self.live(cl_ord_id)?;
         let reply = self.cancelled(order, reason, now);
         self.orders.remove(&cl_ord_id);
@@ -3181,12 +3181,7 @@ impl Exchange {
     /// Cancels (`corrected` 0) or corrects a remembered execution, and
     /// returns the Trade Cancel or Correct. The order's shares are not
     /// restored, as a bust does not reopen an order.
-    pub fn bust(
-        &mut self,
-        exec_id: u64,
-        corrected: Price,
-        now: u64,
-    ) -> Result<Outbound, Error> {
+    pub fn bust(&mut self, exec_id: u64, corrected: Price, now: u64) -> Result<Outbound, Error> {
         let e = self
             .executions
             .remove(&exec_id)
@@ -3493,11 +3488,11 @@ fn value(id: FieldId, fcx: &Context<'_>) -> Option<Opt> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg,
+    use fictionet::stdlib::codec::{Fail, Lcg};
+    use fictionet::stdlib::test_support::contract::{
+        check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
     };
-    use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value};
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn text<const N: usize>(s: &str) -> Text<N> {
@@ -4081,11 +4076,19 @@ mod tests {
     #[test]
     fn price_magnitude_bound() {
         assert_eq!("922337203685477.5807".parse::<Price>(), Ok(Price(i64::MAX)));
-        assert_eq!("-922337203685477.5807".parse::<Price>(), Ok(Price(-i64::MAX)));
+        assert_eq!(
+            "-922337203685477.5807".parse::<Price>(),
+            Ok(Price(-i64::MAX))
+        );
         assert_eq!(Price(i64::MIN).to_string(), "-922337203685477.5808");
         assert_eq!("-0".parse::<Price>(), Ok(Price(0)));
-        for bad in ["922337203685477.5808", "-922337203685477.5808",
-            "-9223372036854775808", "+1", "-+1"] {
+        for bad in [
+            "922337203685477.5808",
+            "-922337203685477.5808",
+            "-9223372036854775808",
+            "+1",
+            "-+1",
+        ] {
             assert_eq!(bad.parse::<Price>(), Err(Error::Price), "{bad}");
         }
     }
@@ -4494,8 +4497,14 @@ mod tests {
             server.tick(1_002).unwrap(),
             [Action::Send(ServerHeartbeat::default().into())]
         );
-        assert_eq!(fictionet::stdlib::test_support::check_atomic(
-            &mut server, |s| s.tick(1_000), |s| format!("{s:?}")), Err(Error::Time));
+        assert_eq!(
+            fictionet::stdlib::test_support::check_atomic(
+                &mut server,
+                |s| s.tick(1_000),
+                |s| format!("{s:?}")
+            ),
+            Err(Error::Time)
+        );
         server
             .receive(&ClientHeartbeat::default().into(), 1_003)
             .unwrap();
@@ -4642,10 +4651,7 @@ mod tests {
                 Opt::LeavesQty(200),
             ]
         );
-        assert_eq!(
-            x.execute(id, 201, Price(1), b'A', 3),
-            Err(Error::Shares)
-        );
+        assert_eq!(x.execute(id, 201, Price(1), b'A', 3), Err(Error::Shares));
         // Modify to 250 shares: LeavesQty 200 + (250 - 300) = 150.
         let modify: Inbound = ModifyOrder {
             header: Header::default(),
@@ -4677,10 +4683,7 @@ mod tests {
             panic!()
         };
         assert_eq!((t.last_shares, t.clearing_firm), (100, text("FIRM")));
-        assert_eq!(
-            x.bust(1, Price(0), 5),
-            Err(Error::UnknownExecution(1))
-        );
+        assert_eq!(x.bust(1, Price(0), 5), Err(Error::UnknownExecution(1)));
         // Restate, then cancel at the member's request.
         let Outbound::OrderRestated(r) = x.restate(text("A2"), 100, b'L', 6).unwrap() else {
             panic!()
@@ -4721,18 +4724,12 @@ mod tests {
             x.execute(text("A1"), 1, Price(1), b'A', 2).unwrap();
         }
         assert_eq!(x.executions.len(), 2);
-        assert_eq!(
-            x.bust(10, Price(0), 3),
-            Err(Error::UnknownExecution(10))
-        );
+        assert_eq!(x.bust(10, Price(0), 3), Err(Error::UnknownExecution(10)));
         let Outbound::TradeCancelOrCorrect(t) = x.bust(12, Price(0), 3).unwrap() else {
             panic!()
         };
         assert_eq!(t.exec_ref_id, 12);
-        assert_eq!(
-            x.bust(12, Price(0), 3),
-            Err(Error::UnknownExecution(12))
-        );
+        assert_eq!(x.bust(12, Price(0), 3), Err(Error::UnknownExecution(12)));
         assert!(x.bust(11, Price(0), 3).is_ok());
         assert!(x.executions.is_empty());
     }

@@ -33,7 +33,11 @@ pub(crate) fn timers() -> &'static Timers {
     static TIMERS: OnceLock<&'static Timers> = OnceLock::new();
     TIMERS.get_or_init(|| {
         let timers: &'static Timers = Box::leak(Box::new(Timers {
-            state: Mutex::new(State { heap: BinaryHeap::new(), entries: HashMap::new(), next_id: 0 }),
+            state: Mutex::new(State {
+                heap: BinaryHeap::new(),
+                entries: HashMap::new(),
+                next_id: 0,
+            }),
             #[cfg(not(target_arch = "wasm32"))]
             changed: Condvar::new(),
         }));
@@ -57,7 +61,11 @@ impl Timers {
         state.entries.insert(id, (deadline, waker));
         if state.heap.len() > 2 * state.entries.len() + 64 {
             // Too many stale entries: rebuild from the live ones.
-            state.heap = state.entries.iter().map(|(id, (d, _))| Reverse((*d, *id))).collect();
+            state.heap = state
+                .entries
+                .iter()
+                .map(|(id, (d, _))| Reverse((*d, *id)))
+                .collect();
         }
         drop(state);
         if earliest.is_none_or(|e| deadline < e) {
@@ -85,7 +93,11 @@ impl Timers {
         // heap entries whose deadline is not their timer's.
         state.heap.push(Reverse((deadline, id)));
         if state.heap.len() > 2 * state.entries.len() + 64 {
-            state.heap = state.entries.iter().map(|(id, (d, _))| Reverse((*d, *id))).collect();
+            state.heap = state
+                .entries
+                .iter()
+                .map(|(id, (d, _))| Reverse((*d, *id)))
+                .collect();
         }
         drop(state);
         drop(old);
@@ -129,7 +141,11 @@ impl Timers {
     pub(crate) fn fire(&self) -> Option<Instant> {
         loop {
             let mut due = Vec::new();
-            let next = self.state.lock().unwrap().take_due(Instant::now(), &mut due);
+            let next = self
+                .state
+                .lock()
+                .unwrap()
+                .take_due(Instant::now(), &mut due);
             if due.is_empty() {
                 return next;
             }

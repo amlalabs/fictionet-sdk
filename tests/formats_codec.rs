@@ -2,11 +2,9 @@
 //! bodies.
 
 use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Lcg;
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
-use fictionet::stdlib::codec::{
-    Lcg,
-};
 use fictionet::stdlib::test_support::{decode_all, mutate};
 use fictionet::stdlib::{json, mime_multipart as mime, protobuf, urlencoded_form as form, xml};
 use std::fmt::Debug;
@@ -103,7 +101,9 @@ fn json_chunked_round_trip_and_eof() {
     for partial in [b"tru".as_slice(), b"1e-", b"-", b"[1", b"\"abc"] {
         assert_eq!(
             decode_all(json::Values::new, partial).1,
-            Some(Fail::Truncated { unread: partial.len() })
+            Some(Fail::Truncated {
+                unread: partial.len()
+            })
         );
     }
     assert!(matches!(
@@ -132,10 +132,7 @@ fn json_rejects_oversize_at_named_capacity() {
     assert!(stream.next().is_none());
     let exact = json::Value::String("a".repeat(json::MAX_SIZE - 2));
     let bytes = Wire::to_bytes(&exact).unwrap();
-    assert_eq!(
-        decode_all(json::Values::new, &bytes),
-        (vec![exact], None)
-    );
+    assert_eq!(decode_all(json::Values::new, &bytes), (vec![exact], None));
 }
 
 #[test]
@@ -164,8 +161,13 @@ fn json_scalar_delimiter_errors() {
         (b"tr ", b' ', 2),
     ] {
         check(json::Values::new, input);
-        assert_eq!(decode_all(json::Values::new, input).1,
-            Some(Fail::Protocol(json::Error { kind: json::ErrorKind::UnexpectedByte(byte), offset })));
+        assert_eq!(
+            decode_all(json::Values::new, input).1,
+            Some(Fail::Protocol(json::Error {
+                kind: json::ErrorKind::UnexpectedByte(byte),
+                offset
+            }))
+        );
     }
 }
 
@@ -175,7 +177,13 @@ fn json_depth_errors() {
     nested.extend_from_slice(&[b'['; 128]);
     for (input, limits) in [
         (nested, json::Limits::default()),
-        (b"{{".to_vec(), json::Limits { depth: 1, ..json::Limits::default() }),
+        (
+            b"{{".to_vec(),
+            json::Limits {
+                depth: 1,
+                ..json::Limits::default()
+            },
+        ),
     ] {
         let expected = json::parse_with(&input, &limits).unwrap_err();
         assert_eq!(
@@ -188,8 +196,15 @@ fn json_depth_errors() {
 
 #[test]
 fn json_zero_depth_precedes_zero_size() {
-    let limits = json::Limits { depth: 0, size: 0, ..json::Limits::default() };
-    let expected = json::Error { kind: json::ErrorKind::TooDeep, offset: 0 };
+    let limits = json::Limits {
+        depth: 0,
+        size: 0,
+        ..json::Limits::default()
+    };
+    let expected = json::Error {
+        kind: json::ErrorKind::TooDeep,
+        offset: 0,
+    };
     assert_eq!(
         decode_all(|| json::Values::with_limits(limits), b"[").1,
         Some(Fail::Protocol(expected))
@@ -263,7 +278,9 @@ fn multipart_preamble_fuzz_crash_contract() {
     input.extend_from_slice(&[b'\t'; 2]);
     // The fuzz target uses 0x0d % 8 candidate bytes as the boundary.
     // They start with LF, so it falls back to "a" and drops only 0x0d.
-    assert!(!mime::valid_boundary(std::str::from_utf8(&input[1..6]).unwrap()));
+    assert!(!mime::valid_boundary(
+        std::str::from_utf8(&input[1..6]).unwrap()
+    ));
     check(|| mime::Parts::new("a").unwrap(), &input[1..]);
 }
 
@@ -277,7 +294,7 @@ fn multipart_preamble_keeps_limits_and_line_boundaries() {
         b"x\r\n--bx\r\n--b\r\n\r\nbody\r\n--b--\r\n",
         b"x\r\n--b-- \t",
     ] {
-            check(make, input);
+        check(make, input);
         match mime::Multipart::parse(input, "b") {
             Ok(body) => assert_eq!(decode_all(make, input), (body.parts, None)),
             Err(_) => assert!(decode_all(make, input).1.is_some()),
@@ -329,12 +346,21 @@ fn document_streams_distinguish_empty_from_unfinished() {
 fn grpc_composes_with_protobuf_messages() {
     use fictionet::stdlib::grpc;
     let message = protobuf::Message {
-        fields: vec![protobuf::Field { number: 1, value: protobuf::Value::Varint(1) }],
+        fields: vec![protobuf::Field {
+            number: 1,
+            value: protobuf::Value::Varint(1),
+        }],
     };
-    let frame = grpc::Message { compressed: false, data: message.to_bytes().unwrap() };
+    let frame = grpc::Message {
+        compressed: false,
+        data: message.to_bytes().unwrap(),
+    };
     let bytes = Wire::to_bytes(&frame).unwrap();
     check(Frames::<grpc::Message>::new, &bytes);
-    let (items, error) = decode_all(|| Frames::<grpc::Message>::new().map(|frame| protobuf::Message::parse(&frame.data)), &bytes);
+    let (items, error) = decode_all(
+        || Frames::<grpc::Message>::new().map(|frame| protobuf::Message::parse(&frame.data)),
+        &bytes,
+    );
     assert_eq!(items, [Ok(message)]);
     assert_eq!(error, None);
 }
@@ -345,7 +371,10 @@ fn xml_chunked_round_trip_and_eof() {
     check(xml::Events::new, bytes);
     contract::check_wire::<xml::Document>(bytes);
     let expected = xml::Document::parse(bytes).unwrap().events().unwrap();
-    assert_eq!(decode_all(xml::Events::new, bytes), (expected.clone(), None));
+    assert_eq!(
+        decode_all(xml::Events::new, bytes),
+        (expected.clone(), None)
+    );
     let frame = <xml::Document as Wire>::parse(bytes).unwrap();
     let encoded = Wire::to_bytes(&frame).unwrap();
     assert_eq!(encoded, bytes);
@@ -395,11 +424,15 @@ fn form_chunked_round_trip_and_eof() {
     let bytes = b"&name=Alice+Smith&&x=%E2%82%AC&flag&last=%";
     check(form::Fields::new, bytes);
     let expected: Vec<_> = form::Form::parse(bytes)
-        .unwrap().pairs
+        .unwrap()
+        .pairs
         .into_iter()
         .map(form::Field)
         .collect();
-    assert_eq!(decode_all(form::Fields::new, bytes), (expected.clone(), None));
+    assert_eq!(
+        decode_all(form::Fields::new, bytes),
+        (expected.clone(), None)
+    );
     let mut written = Vec::new();
     for frame in &expected {
         let one = Wire::to_bytes(frame).unwrap();
@@ -415,10 +448,7 @@ fn form_chunked_round_trip_and_eof() {
         <form::Field as Wire>::parse(b"a=b&c=d"),
         Err(form::Error::Trailing)
     );
-    assert_eq!(
-        <form::Field as Wire>::parse(b""),
-        Err(form::Error::Empty)
-    );
+    assert_eq!(<form::Field as Wire>::parse(b""), Err(form::Error::Empty));
     // Malformed escapes are complete fields under the form grammar.
     assert_eq!(
         decode_all(form::Fields::new, b"a=%A"),
@@ -470,9 +500,13 @@ fn multipart_chunked_round_trip_and_eof() {
         parts,
         ..mime::Multipart::default()
     }
-    .with_boundary("boundary").to_bytes()
+    .with_boundary("boundary")
+    .to_bytes()
     .unwrap();
-    assert_eq!(decode_all(make, entity_body(&rewritten)), (body.parts, None));
+    assert_eq!(
+        decode_all(make, entity_body(&rewritten)),
+        (body.parts, None)
+    );
     for bytes in [b"--boundary--".as_slice(), b"--boundary-- \t"] {
         assert_eq!(decode_all(make, bytes), (vec![], None));
     }
@@ -505,7 +539,10 @@ fn multipart_header_errors_before_body_ends() {
     }
     too_many.extend_from_slice(b"\r\nunterminated");
     for (input, expected) in [
-        (b"\r\n--b\r\n\r\r\n\r\n\xff a\r\n\xff\r\n\r".as_slice(), mime::Error::Header),
+        (
+            b"\r\n--b\r\n\r\r\n\r\n\xff a\r\n\xff\r\n\r".as_slice(),
+            mime::Error::Header,
+        ),
         (too_many.as_slice(), mime::Error::TooManyHeaders),
     ] {
         assert_eq!(mime::Multipart::parse(input, "b"), Err(expected));
@@ -515,7 +552,10 @@ fn multipart_header_errors_before_body_ends() {
             pump(&mut stream, input, |_| panic!("invalid headers")),
             Err(Fail::Protocol(expected))
         );
-        assert_eq!(decode_all(make, input), (vec![], Some(Fail::Protocol(expected))));
+        assert_eq!(
+            decode_all(make, input),
+            (vec![], Some(Fail::Protocol(expected)))
+        );
         check(make, input);
     }
 }
@@ -529,8 +569,19 @@ fn multipart_generated_bodies() {
         b"--b\r\nX: a\r\n folded\r\n\r\n",
     ];
     let tokens: &[&[u8]] = &[
-        b"X: a\r\n", b"\r\n", b"x", b"\r", b"\n", b"--b", b"--b--",
-        b"\t", b"\xff", b":", b" ", b"\r\n--b\r\n", b"\r\n--b--\r\n",
+        b"X: a\r\n",
+        b"\r\n",
+        b"x",
+        b"\r",
+        b"\n",
+        b"--b",
+        b"--b--",
+        b"\t",
+        b"\xff",
+        b":",
+        b" ",
+        b"\r\n--b\r\n",
+        b"\r\n--b--\r\n",
     ];
     let mut rng = Lcg::new(0x726f756e6432);
     for _ in 0..2000 {
@@ -555,7 +606,10 @@ fn multipart_generated_bodies() {
 fn multipart_parsed_headers_are_held_until_the_part_ends() {
     let mut stream = Stream::new(mime::Parts::new("b").unwrap());
     let initial = stream.held();
-    pump(&mut stream, b"--b\r\nX: value\r\n\r\n", |_| panic!("no part yet")).unwrap();
+    pump(&mut stream, b"--b\r\nX: value\r\n\r\n", |_| {
+        panic!("no part yet")
+    })
+    .unwrap();
     assert_eq!(stream.held(), initial + "X".len() + "value".len());
     pump(&mut stream, b"body", |_| panic!("no part yet")).unwrap();
     let mut parts = Vec::new();
@@ -586,7 +640,10 @@ fn multipart_rejects_oversize_at_named_capacity() {
 #[test]
 fn protobuf_round_trip_and_eof() {
     let message = protobuf::Message {
-        fields: vec![protobuf::Field { number: 1, value: protobuf::Value::Varint(150) }],
+        fields: vec![protobuf::Field {
+            number: 1,
+            value: protobuf::Value::Varint(150),
+        }],
     };
     let frame = protobuf::Frame::from_message(&message).unwrap();
     contract::check_wire_value(&message);
@@ -594,27 +651,54 @@ fn protobuf_round_trip_and_eof() {
     let bytes = Wire::to_bytes(&frame).unwrap();
     check(Frames::<protobuf::Frame>::new, &bytes);
     for cut in 1..bytes.len() {
-        assert!(matches!(decode_all(Frames::<protobuf::Frame>::new, &bytes[..cut]).1,
-            Some(Fail::Truncated { .. })));
+        assert!(matches!(
+            decode_all(Frames::<protobuf::Frame>::new, &bytes[..cut]).1,
+            Some(Fail::Truncated { .. })
+        ));
     }
-    assert_eq!(decode_all(Frames::<protobuf::Frame>::new, &bytes), (vec![frame], None));
+    assert_eq!(
+        decode_all(Frames::<protobuf::Frame>::new, &bytes),
+        (vec![frame], None)
+    );
     let mut batch = bytes.clone();
     protobuf::Frame { data: vec![0] }.write(&mut batch).unwrap();
     batch.extend_from_slice(&bytes);
     let make = || Frames::<protobuf::Frame>::new().map(|f| protobuf::Message::parse(&f.data));
     check(make, &batch);
-    assert_eq!(decode_all(make, &batch), (vec![Ok(message.clone()),
-        Err(protobuf::Error::FieldNumber(0)), Ok(message)], None));
-    assert_eq!(protobuf::Frame::parse(&batch), Err(protobuf::Error::Trailing { remaining: batch.len() - bytes.len() }));
+    assert_eq!(
+        decode_all(make, &batch),
+        (
+            vec![
+                Ok(message.clone()),
+                Err(protobuf::Error::FieldNumber(0)),
+                Ok(message)
+            ],
+            None
+        )
+    );
+    assert_eq!(
+        protobuf::Frame::parse(&batch),
+        Err(protobuf::Error::Trailing {
+            remaining: batch.len() - bytes.len()
+        })
+    );
 }
 
 #[test]
 fn protobuf_rejects_oversize_at_named_capacity() {
     let mut stream = Stream::new(Frames::<protobuf::Frame>::new());
-    assert_eq!(stream.decoder().capacity(), protobuf::MAX_MESSAGE + protobuf::MAX_VARINT_LEN);
-    let bytes = protobuf::Varint((protobuf::MAX_MESSAGE + 1) as u64).to_bytes().unwrap();
+    assert_eq!(
+        stream.decoder().capacity(),
+        protobuf::MAX_MESSAGE + protobuf::MAX_VARINT_LEN
+    );
+    let bytes = protobuf::Varint((protobuf::MAX_MESSAGE + 1) as u64)
+        .to_bytes()
+        .unwrap();
     assert_eq!(stream.push(&bytes), bytes.len());
-    assert_eq!(stream.next(), Some(Err(Fail::Protocol(protobuf::Error::TooLong))));
+    assert_eq!(
+        stream.next(),
+        Some(Err(Fail::Protocol(protobuf::Error::TooLong)))
+    );
     assert!(stream.next().is_none());
 }
 
@@ -631,7 +715,9 @@ fn strict_writers_leave_existing_output_unchanged() {
         },
         body: vec![],
     });
-    contract::check_wire_value(&protobuf::Frame { data: vec![0; protobuf::MAX_MESSAGE + 1] });
+    contract::check_wire_value(&protobuf::Frame {
+        data: vec![0; protobuf::MAX_MESSAGE + 1],
+    });
     contract::check_wire_value(&protobuf::Message {
         fields: vec![protobuf::Field {
             number: 0,
@@ -681,10 +767,7 @@ fn content_limits_accept_complete_units_at_the_limit() {
     let field = form::Field(("a".repeat(form::MAX_INPUT - 1), String::new()));
     let bytes = Wire::to_bytes(&field).unwrap();
     assert_eq!(bytes.len(), form::MAX_INPUT);
-    assert_eq!(
-        decode_all(form::Fields::new, &bytes),
-        (vec![field], None)
-    );
+    assert_eq!(decode_all(form::Fields::new, &bytes), (vec![field], None));
 
     let mut bytes = b"<r>".to_vec();
     bytes.resize(xml::MAX_DOCUMENT - 4, b'x');

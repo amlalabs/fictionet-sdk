@@ -15,7 +15,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::stdlib::codec::{Fail, Stream, Wire};
 use crate::stdlib::socks::{
-    self, Address, AuthReply, ClientMessage, ClientMessages, Command, FrameError, Method, Reply, ReplyCode, Selection,
+    self, Address, AuthReply, ClientMessage, ClientMessages, Command, FrameError, Method, Reply,
+    ReplyCode, Selection,
 };
 
 use super::Host;
@@ -66,7 +67,12 @@ where
                 return Err(refuse(s, e.reply_code(), why).await);
             }
             Some(Err(Fail::Protocol(FrameError::AddressType(_)))) => {
-                return Err(refuse(s, ReplyCode::AddressTypeNotSupported, "unknown address type").await);
+                return Err(refuse(
+                    s,
+                    ReplyCode::AddressTypeNotSupported,
+                    "unknown address type",
+                )
+                .await);
             }
             Some(Err(Fail::Protocol(FrameError::Version(_)))) => {
                 return Err(Refusal::Malformed(if phase == socks::ServerPhase::Auth {
@@ -92,40 +98,83 @@ where
         match message {
             ClientMessage::Greeting(g) => {
                 if !g.methods.contains(&Method::UsernamePassword) {
-                    let _ = s.write_all(&write(&Selection { method: Method::NoAcceptable })).await;
+                    let _ = s
+                        .write_all(&write(&Selection {
+                            method: Method::NoAcceptable,
+                        }))
+                        .await;
                     return Err(Refusal::NoMethod);
                 }
-                s.write_all(&write(&Selection { method: Method::UsernamePassword })).await.map_err(|_| SHORT)?;
+                s.write_all(&write(&Selection {
+                    method: Method::UsernamePassword,
+                }))
+                .await
+                .map_err(|_| SHORT)?;
                 stream.decoder().select(Method::UsernamePassword);
             }
             ClientMessage::Auth(login) => {
                 // The token may be the password, or the username with no
                 // password. Both are checked, so the time taken does not
                 // say which one matched.
-                let ok = token.matches(&login.password) | (login.password.is_empty() & token.matches(&login.username));
+                let ok = token.matches(&login.password)
+                    | (login.password.is_empty() & token.matches(&login.username));
                 stream.decoder().verified(ok);
                 if !ok {
                     let _ = s.write_all(&write(&AuthReply { status: 1 })).await;
                     return Err(Refusal::BadToken);
                 }
-                s.write_all(&write(&AuthReply { status: socks::AUTH_SUCCESS })).await.map_err(|_| SHORT)?;
+                s.write_all(&write(&AuthReply {
+                    status: socks::AUTH_SUCCESS,
+                }))
+                .await
+                .map_err(|_| SHORT)?;
             }
             ClientMessage::Request(req) => {
                 if req.command != Command::Connect {
-                    return Err(refuse(s, ReplyCode::CommandNotSupported, "only CONNECT is supported").await);
+                    return Err(refuse(
+                        s,
+                        ReplyCode::CommandNotSupported,
+                        "only CONNECT is supported",
+                    )
+                    .await);
                 }
                 let host = match &req.address {
                     Address::Ipv4(a) => Host::V4(*a),
-                    Address::Ipv6(_) => return Err(refuse(s, ReplyCode::AddressTypeNotSupported, "IPv6 is not supported").await),
-                    Address::Domain(name) => match std::str::from_utf8(name).ok().and_then(Host::parse) {
-                        Some(Host::V6(_)) => {
-                            return Err(refuse(s, ReplyCode::AddressTypeNotSupported, "IPv6 is not supported").await);
+                    Address::Ipv6(_) => {
+                        return Err(refuse(
+                            s,
+                            ReplyCode::AddressTypeNotSupported,
+                            "IPv6 is not supported",
+                        )
+                        .await);
+                    }
+                    Address::Domain(name) => {
+                        match std::str::from_utf8(name).ok().and_then(Host::parse) {
+                            Some(Host::V6(_)) => {
+                                return Err(refuse(
+                                    s,
+                                    ReplyCode::AddressTypeNotSupported,
+                                    "IPv6 is not supported",
+                                )
+                                .await);
+                            }
+                            Some(host) => host,
+                            None => {
+                                return Err(refuse(
+                                    s,
+                                    ReplyCode::HostUnreachable,
+                                    "the name is not a valid host name",
+                                )
+                                .await);
+                            }
                         }
-                        Some(host) => host,
-                        None => return Err(refuse(s, ReplyCode::HostUnreachable, "the name is not a valid host name").await),
-                    },
+                    }
                 };
-                return Ok(Connect { host, port: req.port, early: stream.unread().to_vec() });
+                return Ok(Connect {
+                    host,
+                    port: req.port,
+                    early: stream.unread().to_vec(),
+                });
             }
             ClientMessage::Socks4(_) => return Err(Refusal::Malformed("not SOCKS version 5")),
         }
@@ -136,7 +185,9 @@ fn write<W: Wire>(value: &W) -> Vec<u8>
 where
     W::WriteError: std::fmt::Debug,
 {
-    value.to_bytes().expect("the door writes only values it can")
+    value
+        .to_bytes()
+        .expect("the door writes only values it can")
 }
 
 async fn refuse<W: AsyncWrite + Unpin>(w: &mut W, code: ReplyCode, why: &'static str) -> Refusal {
@@ -147,7 +198,11 @@ async fn refuse<W: AsyncWrite + Unpin>(w: &mut W, code: ReplyCode, why: &'static
 /// The reply: VER, REP, RSV, ATYP 1, BND.ADDR, BND.PORT.
 pub fn reply(code: ReplyCode, bound: Option<SocketAddrV4>) -> Vec<u8> {
     let bound = bound.unwrap_or(SocketAddrV4::new([0, 0, 0, 0].into(), 0));
-    write(&Reply { code, address: Address::Ipv4(*bound.ip()), port: bound.port() })
+    write(&Reply {
+        code,
+        address: Address::Ipv4(*bound.ip()),
+        port: bound.port(),
+    })
 }
 
 #[cfg(test)]
@@ -171,7 +226,10 @@ mod tests {
     /// Feeds `input` to the handshake and returns its result and every
     /// byte it wrote back.
     pub(crate) fn run(input: Vec<u8>) -> (Result<Connect, Refusal>, Vec<u8>) {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             let (mut client, mut server) = duplex(4096);
             client.write_all(&input).await.unwrap();
@@ -205,9 +263,17 @@ mod tests {
         assert_eq!(target(r), Ok((Host::Name("example.test".into()), 443)));
         assert_eq!(out, [5, 2, 1, 0]);
         let (r, _) = run(full(&[5, 1, 0, 1, 203, 0, 113, 10, 0, 80]));
-        assert_eq!(target(r), Ok((Host::V4(Ipv4Addr::new(203, 0, 113, 10)), 80)));
+        assert_eq!(
+            target(r),
+            Ok((Host::V4(Ipv4Addr::new(203, 0, 113, 10)), 80))
+        );
         // The token as the username, with no password.
-        let (r, _) = run([&[5, 1, 2][..], &login(b"tok", b""), &connect_by_name("a.test", 1)].concat());
+        let (r, _) = run([
+            &[5, 1, 2][..],
+            &login(b"tok", b""),
+            &connect_by_name("a.test", 1),
+        ]
+        .concat());
         assert_eq!(target(r), Ok((Host::Name("a.test".into()), 1)));
     }
 
@@ -238,36 +304,75 @@ mod tests {
         // BIND and UDP ASSOCIATE.
         for cmd in [2, 3] {
             let (r, out) = run(full(&[5, cmd, 0, 1, 10, 0, 0, 1, 0, 53]));
-            assert_eq!(r, Err(Refusal::Reply(ReplyCode::CommandNotSupported, "only CONNECT is supported")));
+            assert_eq!(
+                r,
+                Err(Refusal::Reply(
+                    ReplyCode::CommandNotSupported,
+                    "only CONNECT is supported"
+                ))
+            );
             assert_eq!(&out[4..], [5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
         }
         // A command SOCKS5 does not have.
         let (r, out) = run(full(&[5, 9, 0, 1, 10, 0, 0, 1, 0, 53]));
-        assert_eq!(r, Err(Refusal::Reply(ReplyCode::CommandNotSupported, "only CONNECT is supported")));
+        assert_eq!(
+            r,
+            Err(Refusal::Reply(
+                ReplyCode::CommandNotSupported,
+                "only CONNECT is supported"
+            ))
+        );
         assert_eq!(out[5], 7);
         // IPv6, as an address and as a name.
         let mut v6 = vec![5, 1, 0, 4];
         v6.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         v6.extend_from_slice(&[1, 187]);
         let (r, out) = run(full(&v6));
-        assert_eq!(r, Err(Refusal::Reply(ReplyCode::AddressTypeNotSupported, "IPv6 is not supported")));
+        assert_eq!(
+            r,
+            Err(Refusal::Reply(
+                ReplyCode::AddressTypeNotSupported,
+                "IPv6 is not supported"
+            ))
+        );
         assert_eq!(out[5], 8);
         let (r, _) = run(full(&connect_by_name("[fd00::1]", 443)));
-        assert_eq!(r, Err(Refusal::Reply(ReplyCode::AddressTypeNotSupported, "IPv6 is not supported")));
+        assert_eq!(
+            r,
+            Err(Refusal::Reply(
+                ReplyCode::AddressTypeNotSupported,
+                "IPv6 is not supported"
+            ))
+        );
         // An unknown address type.
         let (r, out) = run(full(&[5, 1, 0, 9]));
-        assert_eq!(r, Err(Refusal::Reply(ReplyCode::AddressTypeNotSupported, "unknown address type")));
+        assert_eq!(
+            r,
+            Err(Refusal::Reply(
+                ReplyCode::AddressTypeNotSupported,
+                "unknown address type"
+            ))
+        );
         assert_eq!(out[5], 8);
         // A name that is not a host name.
         let (r, out) = run(full(&connect_by_name("a b", 80)));
-        assert_eq!(r, Err(Refusal::Reply(ReplyCode::HostUnreachable, "the name is not a valid host name")));
+        assert_eq!(
+            r,
+            Err(Refusal::Reply(
+                ReplyCode::HostUnreachable,
+                "the name is not a valid host name"
+            ))
+        );
         assert_eq!(out[5], 4);
     }
 
     #[test]
     fn malformed_and_short_input_closes() {
         assert_eq!(run(vec![4, 1, 0, 80]).0, Err(SHORT));
-        assert_eq!(run(b"GET / HTTP/1.1\r\n\r\n".to_vec()).0, Err(Refusal::Malformed("not SOCKS version 5")));
+        assert_eq!(
+            run(b"GET / HTTP/1.1\r\n\r\n".to_vec()).0,
+            Err(Refusal::Malformed("not SOCKS version 5"))
+        );
         let whole = full(&connect_by_name("example.test", 443));
         for n in 0..whole.len() {
             let (r, _) = run(whole[..n].to_vec());
@@ -276,9 +381,14 @@ mod tests {
         // Login with version 2, and a request with version 4.
         assert_eq!(
             run([&[5, 1, 2, 2][..], &[0, 0]].concat()).0,
-            Err(Refusal::Malformed("not version 1 of the username/password method"))
+            Err(Refusal::Malformed(
+                "not version 1 of the username/password method"
+            ))
         );
-        assert_eq!(run(full(&[4, 1, 0, 1, 10, 0, 0, 1, 0, 53])).0, Err(Refusal::Malformed("not SOCKS version 5")));
+        assert_eq!(
+            run(full(&[4, 1, 0, 1, 10, 0, 0, 1, 0, 53])).0,
+            Err(Refusal::Malformed("not SOCKS version 5"))
+        );
     }
 
     #[test]
@@ -307,7 +417,16 @@ mod tests {
 
     #[test]
     fn replies() {
-        assert_eq!(reply(ReplyCode::Succeeded, Some("10.0.0.2:50000".parse().unwrap())), [5, 0, 0, 1, 10, 0, 0, 2, 0xc3, 0x50]);
-        assert_eq!(reply(ReplyCode::ConnectionRefused, None), [5, 5, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            reply(
+                ReplyCode::Succeeded,
+                Some("10.0.0.2:50000".parse().unwrap())
+            ),
+            [5, 0, 0, 1, 10, 0, 0, 2, 0xc3, 0x50]
+        );
+        assert_eq!(
+            reply(ReplyCode::ConnectionRefused, None),
+            [5, 5, 0, 1, 0, 0, 0, 0, 0, 0]
+        );
     }
 }

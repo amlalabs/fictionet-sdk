@@ -70,13 +70,13 @@
 
 extern crate alloc;
 
-use fictionet::stdlib::codec::ascii;
-use fictionet::stdlib::codec::{self, Decode, Wire};
 use alloc::{
     string::{String, ToString},
     vec,
     vec::Vec,
 };
+use fictionet::stdlib::codec::ascii;
+use fictionet::stdlib::codec::{self, Decode, Wire};
 
 /// The media type SDP bodies carry, in a `Content-Type` header.
 pub const MIME_TYPE: &str = "application/sdp";
@@ -253,12 +253,18 @@ pub struct Attribute {
 impl Attribute {
     /// An attribute with a value: `a=name:value`.
     pub fn new(name: &str, value: &str) -> Attribute {
-        Attribute { name: name.to_string(), value: Some(value.to_string()) }
+        Attribute {
+            name: name.to_string(),
+            value: Some(value.to_string()),
+        }
     }
 
     /// An attribute with no value: `a=name`.
     pub fn flag(name: &str) -> Attribute {
-        Attribute { name: name.to_string(), value: None }
+        Attribute {
+            name: name.to_string(),
+            value: None,
+        }
     }
 }
 
@@ -430,12 +436,25 @@ impl Default for SessionDescriptions {
 impl SessionDescriptions {
     /// Creates a decoder for one body.
     pub fn new() -> Self {
-        Self { description: Some(Description::default()), total: 0, lines: 0, scanned: 0 }
+        Self {
+            description: Some(Description::default()),
+            total: 0,
+            lines: 0,
+            scanned: 0,
+        }
     }
 
-    fn line(&mut self, bytes: &[u8], used: usize) -> Result<codec::Step<SessionDescription>, Error> {
+    fn line(
+        &mut self,
+        bytes: &[u8],
+        used: usize,
+    ) -> Result<codec::Step<SessionDescription>, Error> {
         let text = bytes.strip_suffix(b"\r").unwrap_or(bytes);
-        let total = self.total.checked_add(text.len()).and_then(|n| n.checked_add(2)).ok_or(Error::TooLong)?;
+        let total = self
+            .total
+            .checked_add(text.len())
+            .and_then(|n| n.checked_add(2))
+            .ok_or(Error::TooLong)?;
         if total > MAX_LEN {
             return Err(Error::TooLong);
         }
@@ -466,25 +485,41 @@ impl Decode for SessionDescriptions {
 
     /// Counts consumed line bytes, including their canonical CRLF endings.
     fn held(&self) -> usize {
-        if self.description.is_some() { self.total } else { 0 }
+        if self.description.is_some() {
+            self.total
+        } else {
+            0
+        }
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<SessionDescription>, Error> {
+    fn decode(
+        &mut self,
+        input: &[u8],
+        eof: bool,
+    ) -> Result<codec::Step<SessionDescription>, Error> {
         if self.description.is_none() {
             return Ok(codec::Step::End);
         }
         // Resume at the first new byte. No line is copied while waiting.
         for (i, &byte) in input.iter().enumerate().skip(self.scanned) {
             let used = i.checked_add(1).ok_or(Error::TooLong)?;
-            let bare_lf = byte == b'\n' && i.checked_sub(1).and_then(|n| input.get(n)) != Some(&b'\r');
-            if self.total.saturating_add(used).saturating_add(usize::from(bare_lf)) > MAX_LEN {
+            let bare_lf =
+                byte == b'\n' && i.checked_sub(1).and_then(|n| input.get(n)) != Some(&b'\r');
+            if self
+                .total
+                .saturating_add(used)
+                .saturating_add(usize::from(bare_lf))
+                > MAX_LEN
+            {
                 return Err(Error::TooLong);
             }
             if byte == b'\n' {
                 return self.line(input.get(..i).unwrap_or_default(), used);
             }
             if used > MAX_LINE_LEN + 1 {
-                return Err(Error::LineTooLong { line: self.lines.saturating_add(1) });
+                return Err(Error::LineTooLong {
+                    line: self.lines.saturating_add(1),
+                });
             }
         }
         self.scanned = input.len();
@@ -544,7 +579,8 @@ impl Description {
         let value = core::str::from_utf8(&rest[1..]).map_err(|_| Error::Encoding { line: n })?;
         let stage = next_stage(self.stage, kind).ok_or(Error::Order { line: n, kind: k })?;
         self.stage = stage;
-        self.apply(stage, value).ok_or(Error::Syntax { line: n, kind: k })?;
+        self.apply(stage, value)
+            .ok_or(Error::Syntax { line: n, kind: k })?;
         let d = &self.desc;
         match stage {
             A => {
@@ -579,12 +615,18 @@ impl Description {
             I => d.information = Some(text(value)?),
             U => d.uri = Some(is_uri_reference(value).then(|| value.to_string())?),
             E => d.emails.push(is_email(value).then(|| value.to_string())?),
-            P => d.phones.push(is_phone_number(value).then(|| value.to_string())?),
+            P => d
+                .phones
+                .push(is_phone_number(value).then(|| value.to_string())?),
             C => d.connection = Some(parse_connection(value).filter(|c| is_connection(c, true))?),
             B => d.bandwidths.push(parse_bandwidth(value)?),
             T => {
                 let (start, stop) = value.split_once(' ')?;
-                d.times.push(Timing { start: start_time(start)?, stop: start_time(stop)?, ..Timing::default() });
+                d.times.push(Timing {
+                    start: start_time(start)?,
+                    stop: start_time(stop)?,
+                    ..Timing::default()
+                });
             }
             R => d.times.last_mut()?.repeats.push(parse_repeat(value)?),
             Z => d.times.last_mut()?.zones = parse_zones(value)?,
@@ -610,16 +652,25 @@ impl Description {
     }
 }
 
-static EMPTY_ATTRIBUTE: Attribute = Attribute { name: String::new(), value: None };
+static EMPTY_ATTRIBUTE: Attribute = Attribute {
+    name: String::new(),
+    value: None,
+};
 
 /// Whether `a` cannot follow `earlier` in one scope: a second direction
 /// attribute, or a second `rtpmap` or `fmtp` for the same format (RFC
 /// 8866, sections 6.6, 6.7 and 6.15).
 fn conflicts(earlier: &[Attribute], a: &Attribute) -> bool {
     if Direction::from_attribute(a).is_some() {
-        return earlier.iter().any(|e| Direction::from_attribute(e).is_some());
+        return earlier
+            .iter()
+            .any(|e| Direction::from_attribute(e).is_some());
     }
-    let format = |a: &Attribute| a.value.as_deref().map(|v| v.split(' ').next().unwrap_or(v).to_string());
+    let format = |a: &Attribute| {
+        a.value
+            .as_deref()
+            .map(|v| v.split(' ').next().unwrap_or(v).to_string())
+    };
     match a.name.as_str() {
         "rtpmap" | "fmtp" if a.value.is_some() => {
             let f = format(a);
@@ -631,7 +682,10 @@ fn conflicts(earlier: &[Attribute], a: &Attribute) -> bool {
 
 /// Whether `a` is an `a=charset` naming a character set other than UTF-8.
 fn names_other_charset(a: &Attribute) -> bool {
-    a.name == "charset" && a.value.as_deref().is_some_and(|v| !v.eq_ignore_ascii_case("UTF-8"))
+    a.name == "charset"
+        && a.value
+            .as_deref()
+            .is_some_and(|v| !v.eq_ignore_ascii_case("UTF-8"))
 }
 
 /// Whether `c` may join a media description's `c=` lines `before`: the
@@ -659,13 +713,20 @@ fn parse_origin(value: &str) -> Option<Origin> {
 
 fn parse_connection(value: &str) -> Option<Connection> {
     let mut it = value.split(' ');
-    let c = Connection { net_type: token(it.next()?)?, addr_type: token(it.next()?)?, address: non_ws(it.next()?)? };
+    let c = Connection {
+        net_type: token(it.next()?)?,
+        addr_type: token(it.next()?)?,
+        address: non_ws(it.next()?)?,
+    };
     it.next().is_none().then_some(c)
 }
 
 fn parse_bandwidth(value: &str) -> Option<Bandwidth> {
     let (kind, n) = value.split_once(':')?;
-    Some(Bandwidth { kind: token(kind)?, value: number(n)? })
+    Some(Bandwidth {
+        kind: token(kind)?,
+        value: number(n)?,
+    })
 }
 
 fn parse_repeat(value: &str) -> Option<Repeat> {
@@ -677,7 +738,11 @@ fn parse_repeat(value: &str) -> Option<Repeat> {
     let interval = typed_time(interval)?;
     let duration = typed_time(it.next()?)?;
     let offsets = it.map(typed_time).collect::<Option<Vec<u64>>>()?;
-    (!offsets.is_empty()).then_some(Repeat { interval, duration, offsets })
+    (!offsets.is_empty()).then_some(Repeat {
+        interval,
+        duration,
+        offsets,
+    })
 }
 
 fn parse_zones(value: &str) -> Option<Vec<ZoneAdjustment>> {
@@ -689,7 +754,10 @@ fn parse_zones(value: &str) -> Option<Vec<ZoneAdjustment>> {
             Some(m) => 0i64.checked_sub_unsigned(typed_time(m)?)?,
             None => i64::try_from(typed_time(offset)?).ok()?,
         };
-        zones.push(ZoneAdjustment { time: ntp_time(time)?, offset });
+        zones.push(ZoneAdjustment {
+            time: ntp_time(time)?,
+            offset,
+        });
     }
     (!zones.is_empty()).then_some(zones)
 }
@@ -715,13 +783,26 @@ fn parse_media(value: &str) -> Option<Media> {
     if formats.is_empty() || !formats_fit(proto, &formats) {
         return None;
     }
-    Some(Media { kind, port, port_count, proto: proto.to_string(), formats, ..Media::default() })
+    Some(Media {
+        kind,
+        port,
+        port_count,
+        proto: proto.to_string(),
+        formats,
+        ..Media::default()
+    })
 }
 
 fn parse_attribute(value: &str) -> Option<Attribute> {
     Some(match value.split_once(':') {
-        Some((name, v)) => Attribute { name: token(name)?, value: Some(text(v)?) },
-        None => Attribute { name: token(value)?, value: None },
+        Some((name, v)) => Attribute {
+            name: token(name)?,
+            value: Some(text(v)?),
+        },
+        None => Attribute {
+            name: token(value)?,
+            value: None,
+        },
     })
 }
 
@@ -729,7 +810,9 @@ fn parse_attribute(value: &str) -> Option<Attribute> {
 
 /// `token`: one or more of the characters RFC 8866 allows in names.
 fn is_token(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`{|}~".contains(&b))
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`{|}~".contains(&b))
 }
 
 /// `non-ws-string`: visible characters, no spaces or controls.
@@ -755,12 +838,17 @@ fn is_rtp(proto: &str) -> bool {
 
 /// Whether `formats` suit `proto`: for RTP, each a payload type number.
 fn formats_fit(proto: &str, formats: &[String]) -> bool {
-    !is_rtp(proto) || formats.iter().all(|f| integer(f).is_some_and(|p| p <= u64::from(MAX_PAYLOAD_TYPE)))
+    !is_rtp(proto)
+        || formats
+            .iter()
+            .all(|f| integer(f).is_some_and(|p| p <= u64::from(MAX_PAYLOAD_TYPE)))
 }
 
 /// `FQDN`: four or more letters, digits, `-` and `.`.
 fn is_fqdn(s: &str) -> bool {
-    s.len() >= 4 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    s.len() >= 4
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
 /// The `o=` address: for `IP4` and `IP6`, an address of that type or a
@@ -815,8 +903,12 @@ fn is_connection(c: &Connection, session: bool) -> bool {
 fn is_multicast(c: &Connection) -> bool {
     let base = c.address.split('/').next().unwrap_or("");
     match c.addr_type.as_str() {
-        "IP4" => base.parse::<core::net::Ipv4Addr>().is_ok_and(|ip| ip.is_multicast()),
-        "IP6" => base.parse::<core::net::Ipv6Addr>().is_ok_and(|ip| ip.is_multicast()),
+        "IP4" => base
+            .parse::<core::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_multicast()),
+        "IP6" => base
+            .parse::<core::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_multicast()),
         _ => false,
     }
 }
@@ -878,7 +970,10 @@ fn is_authority(a: &str) -> bool {
             None => (is_uri_chars(host_port, b""), ""),
         },
     };
-    let port_ok = port.is_empty() || port.strip_prefix(':').is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit()));
+    let port_ok = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit()));
     host_ok && port_ok
 }
 
@@ -897,7 +992,9 @@ fn is_ip_literal(s: &str) -> bool {
     !version.is_empty()
         && version.bytes().all(|b| b.is_ascii_hexdigit())
         && !addr.is_empty()
-        && addr.bytes().all(|b| is_unreserved(b) || is_sub_delim(b) || b == b':')
+        && addr
+            .bytes()
+            .all(|b| is_unreserved(b) || is_sub_delim(b) || b == b':')
 }
 
 /// RFC 3986 `URI-reference`, not empty: a URI, or a relative reference.
@@ -942,7 +1039,9 @@ fn is_atext(c: char) -> bool {
 
 /// RFC 5322 `dot-atom-text`.
 fn is_dot_atom(s: &str) -> bool {
-    !s.is_empty() && s.split('.').all(|p| !p.is_empty() && p.chars().all(is_atext))
+    !s.is_empty()
+        && s.split('.')
+            .all(|p| !p.is_empty() && p.chars().all(is_atext))
 }
 
 /// The length of the RFC 5322 `quoted-string` at the start of `s`.
@@ -975,11 +1074,16 @@ fn is_addr_spec(s: &str) -> bool {
     };
     let Some(domain) = domain else { return false };
     let literal = |d: &str| {
-        d.strip_prefix('[').and_then(|d| d.strip_suffix(']')).is_some_and(|inner| {
-            inner
-                .chars()
-                .all(|c| c == ' ' || c == '\t' || !c.is_ascii() || (c.is_ascii_graphic() && !"[]\\".contains(c)))
-        })
+        d.strip_prefix('[')
+            .and_then(|d| d.strip_suffix(']'))
+            .is_some_and(|inner| {
+                inner.chars().all(|c| {
+                    c == ' '
+                        || c == '\t'
+                        || !c.is_ascii()
+                        || (c.is_ascii_graphic() && !"[]\\".contains(c))
+                })
+            })
     };
     local_ok && (is_dot_atom(domain) || literal(domain))
 }
@@ -994,7 +1098,11 @@ fn is_email(s: &str) -> bool {
     {
         let (head, comment) = (&inner[..p], &inner[p + 1..]);
         let addr = head.trim_end_matches(' ');
-        if !comment.is_empty() && comment.chars().all(is_email_safe) && addr.len() < head.len() && is_addr_spec(addr) {
+        if !comment.is_empty()
+            && comment.chars().all(is_email_safe)
+            && addr.len() < head.len()
+            && is_addr_spec(addr)
+        {
             return true;
         }
     }
@@ -1002,7 +1110,11 @@ fn is_email(s: &str) -> bool {
         && let Some(p) = inner.find('<')
     {
         let (name, addr) = (&inner[..p], &inner[p + 1..]);
-        if name.len() >= 2 && name.ends_with(' ') && name.chars().all(is_email_safe) && is_addr_spec(addr) {
+        if name.len() >= 2
+            && name.ends_with(' ')
+            && name.chars().all(is_email_safe)
+            && is_addr_spec(addr)
+        {
             return true;
         }
     }
@@ -1117,7 +1229,14 @@ struct LineBuf<'a> {
 
 impl core::fmt::Write for LineBuf<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        if self.over || self.out.len().saturating_sub(self.start).saturating_add(s.len()) > MAX_LINE_LEN {
+        if self.over
+            || self
+                .out
+                .len()
+                .saturating_sub(self.start)
+                .saturating_add(s.len())
+                > MAX_LINE_LEN
+        {
             self.over = true;
         } else {
             self.out.push_str(s);
@@ -1150,7 +1269,11 @@ impl Writer {
             return Err(Error::Syntax { line, kind });
         }
         let start = self.out.len();
-        let mut buf = LineBuf { out: &mut self.out, start, over: false };
+        let mut buf = LineBuf {
+            out: &mut self.out,
+            start,
+            over: false,
+        };
         let _ = core::fmt::Write::write_char(&mut buf, kind);
         let _ = core::fmt::Write::write_char(&mut buf, '=');
         let _ = value(&mut buf);
@@ -1173,12 +1296,16 @@ impl Writer {
 
     fn connection(&mut self, c: &Connection, ok: bool) -> Result<(), Error> {
         use core::fmt::Write;
-        self.line_with('c', ok, |b| write!(b, "{} {} {}", c.net_type, c.addr_type, c.address))
+        self.line_with('c', ok, |b| {
+            write!(b, "{} {} {}", c.net_type, c.addr_type, c.address)
+        })
     }
 
     fn bandwidth(&mut self, b: &Bandwidth) -> Result<(), Error> {
         use core::fmt::Write;
-        self.line_with('b', is_token(&b.kind), |l| write!(l, "{}:{}", b.kind, b.value))
+        self.line_with('b', is_token(&b.kind), |l| {
+            write!(l, "{}:{}", b.kind, b.value)
+        })
     }
 
     fn attributes(&mut self, attributes: &[Attribute]) -> Result<(), Error> {
@@ -1186,10 +1313,15 @@ impl Writer {
         for (i, a) in attributes.iter().enumerate() {
             if conflicts(&attributes[..i], a) {
                 self.lines += 1;
-                return Err(Error::Order { line: self.lines, kind: 'a' });
+                return Err(Error::Order {
+                    line: self.lines,
+                    kind: 'a',
+                });
             }
             match &a.value {
-                Some(v) => self.line_with('a', is_token(&a.name) && is_text(v), |b| write!(b, "{}:{v}", a.name))?,
+                Some(v) => self.line_with('a', is_token(&a.name) && is_text(v), |b| {
+                    write!(b, "{}:{v}", a.name)
+                })?,
                 None => self.line('a', is_token(&a.name), &a.name)?,
             }
         }
@@ -1218,7 +1350,10 @@ impl SessionDescription {
     fn text_is_ascii(&self) -> bool {
         self.name.is_ascii()
             && self.information.as_deref().is_none_or(str::is_ascii)
-            && self.media.iter().all(|m| m.information.as_deref().is_none_or(str::is_ascii))
+            && self
+                .media
+                .iter()
+                .all(|m| m.information.as_deref().is_none_or(str::is_ascii))
     }
 }
 
@@ -1260,7 +1395,10 @@ impl Wire for SessionDescription {
         if self.connection.is_none() && self.media.iter().any(|m| m.connections.is_empty()) {
             return Err(Error::Missing('c'));
         }
-        let mut w = Writer { out: String::new(), lines: 0 };
+        let mut w = Writer {
+            out: String::new(),
+            lines: 0,
+        };
         w.line('v', true, "0")?;
         let o = &self.origin;
         let ok = is_non_ws(&o.username)
@@ -1296,7 +1434,9 @@ impl Wire for SessionDescription {
         }
         for t in &self.times {
             let start_ok = |t: u64| t == 0 || t >= MIN_TIME;
-            w.line_with('t', start_ok(t.start) && start_ok(t.stop), |b| write!(b, "{} {}", t.start, t.stop))?;
+            w.line_with('t', start_ok(t.start) && start_ok(t.stop), |b| {
+                write!(b, "{} {}", t.start, t.stop)
+            })?;
             for r in &t.repeats {
                 w.line_with('r', r.interval != 0 && !r.offsets.is_empty(), |b| {
                     write!(b, "{} {}", TypedTime(r.interval), TypedTime(r.duration))?;
@@ -1312,7 +1452,12 @@ impl Wire for SessionDescription {
                     for (i, z) in t.zones.iter().enumerate() {
                         let sep = if i == 0 { "" } else { " " };
                         let sign = if z.offset < 0 { "-" } else { "" };
-                        write!(b, "{sep}{} {sign}{}", z.time, TypedTime(z.offset.unsigned_abs()))?;
+                        write!(
+                            b,
+                            "{sep}{} {sign}{}",
+                            z.time,
+                            TypedTime(z.offset.unsigned_abs())
+                        )?;
                     }
                     Ok(())
                 })?;
@@ -1349,7 +1494,10 @@ impl Wire for SessionDescription {
                 w.text('i', i)?;
             }
             for (i, c) in m.connections.iter().enumerate() {
-                w.connection(c, is_connection(c, false) && is_layer(&m.connections[..i], c))?;
+                w.connection(
+                    c,
+                    is_connection(c, false) && is_layer(&m.connections[..i], c),
+                )?;
             }
             for b in &m.bandwidths {
                 w.bandwidth(b)?;
@@ -1368,14 +1516,20 @@ impl SessionDescription {
     }
 
     /// Every session-level attribute named `name`, in order.
-    pub fn attributes_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Attribute> + 'a {
+    pub fn attributes_named<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a Attribute> + 'a {
         self.attributes.iter().filter(move |a| a.name == name)
     }
 
     /// The direction a stream flows: its own direction attribute, else
     /// the session's, else [`Direction::SendRecv`], as RFC 8866 says.
     pub fn direction(&self, media: &Media) -> Direction {
-        media.direction().or_else(|| self.attributes.iter().find_map(Direction::from_attribute)).unwrap_or_default()
+        media
+            .direction()
+            .or_else(|| self.attributes.iter().find_map(Direction::from_attribute))
+            .unwrap_or_default()
     }
 }
 
@@ -1386,7 +1540,10 @@ impl Media {
     }
 
     /// Every attribute named `name`, in order.
-    pub fn attributes_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Attribute> + 'a {
+    pub fn attributes_named<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a Attribute> + 'a {
         self.attributes.iter().filter(move |a| a.name == name)
     }
 
@@ -1398,18 +1555,23 @@ impl Media {
     /// The well-formed `a=rtpmap` for `format`, if there is one.
     pub fn rtpmap(&self, format: &str) -> Option<RtpMap> {
         let payload = u8::try_from(integer(format)?).ok()?;
-        self.attributes_named("rtpmap").filter_map(|a| RtpMap::from_attribute(a).ok()).find(|r| r.payload == payload)
+        self.attributes_named("rtpmap")
+            .filter_map(|a| RtpMap::from_attribute(a).ok())
+            .find(|r| r.payload == payload)
     }
 
     /// The well-formed `a=fmtp` for `format`, if there is one.
     pub fn fmtp(&self, format: &str) -> Option<Fmtp> {
-        self.attributes_named("fmtp").filter_map(|a| Fmtp::from_attribute(a).ok()).find(|f| f.format == format)
+        self.attributes_named("fmtp")
+            .filter_map(|a| Fmtp::from_attribute(a).ok())
+            .find(|f| f.format == format)
     }
 
     /// The well-formed `a=candidate` lines, in order. Malformed ones are
     /// skipped.
     pub fn candidates(&self) -> impl Iterator<Item = Candidate> + '_ {
-        self.attributes_named("candidate").filter_map(|a| Candidate::from_attribute(a).ok())
+        self.attributes_named("candidate")
+            .filter_map(|a| Candidate::from_attribute(a).ok())
     }
 }
 
@@ -1429,7 +1591,11 @@ fn check(ok: bool) -> Result<(), Error> {
 /// `a=name:value`, of at most [`MAX_LINE_LEN`] bytes. The typed helpers
 /// read and write no longer values, so they never copy more than a line.
 fn fits(name: &str, value: &str) -> bool {
-    "a=:".len().saturating_add(name.len()).saturating_add(value.len()) <= MAX_LINE_LEN
+    "a=:"
+        .len()
+        .saturating_add(name.len())
+        .saturating_add(value.len())
+        <= MAX_LINE_LEN
 }
 
 /// The value of an attribute named `name` that fits on one line, or an
@@ -1443,8 +1609,13 @@ fn line_value<'a>(a: &'a Attribute, name: &str) -> Result<&'a str, Error> {
 /// Appends `parts` to `v`, or fails if the attribute named `name` would
 /// no longer fit on one line. Nothing is copied when it fails.
 fn push_fitting(v: &mut String, name: &str, parts: &[&str]) -> Result<(), Error> {
-    let more = parts.iter().map(|p| p.len()).fold(0usize, usize::saturating_add);
-    check(fits(name, "") && v.len().saturating_add(more) <= MAX_LINE_LEN - "a=:".len() - name.len())?;
+    let more = parts
+        .iter()
+        .map(|p| p.len())
+        .fold(0usize, usize::saturating_add);
+    check(
+        fits(name, "") && v.len().saturating_add(more) <= MAX_LINE_LEN - "a=:".len() - name.len(),
+    )?;
     for p in parts {
         v.push_str(p);
     }
@@ -1477,7 +1648,11 @@ impl RtpMap {
         let (pt, rest) = v.split_once(' ').ok_or(Error::Attribute)?;
         let mut parts = rest.splitn(3, '/');
         let encoding = parts.next().and_then(token).ok_or(Error::Attribute)?;
-        let clock = parts.next().and_then(integer).filter(|&c| c > 0).ok_or(Error::Attribute)?;
+        let clock = parts
+            .next()
+            .and_then(integer)
+            .filter(|&c| c > 0)
+            .ok_or(Error::Attribute)?;
         let params = match parts.next() {
             Some(p) => {
                 check(is_channels(p))?;
@@ -1485,7 +1660,9 @@ impl RtpMap {
             }
             None => None,
         };
-        let payload = integer(pt).filter(|&p| p <= u64::from(MAX_PAYLOAD_TYPE)).ok_or(Error::Attribute)?;
+        let payload = integer(pt)
+            .filter(|&p| p <= u64::from(MAX_PAYLOAD_TYPE))
+            .ok_or(Error::Attribute)?;
         Ok(RtpMap {
             payload: payload as u8,
             encoding,
@@ -1502,12 +1679,19 @@ impl RtpMap {
         check(self.payload <= MAX_PAYLOAD_TYPE && self.clock_rate > 0)?;
         check(is_token(&self.encoding) && self.params.as_deref().is_none_or(is_channels))?;
         let mut v = String::new();
-        push_fitting(&mut v, "rtpmap", &[&self.payload.to_string(), " ", &self.encoding])?;
+        push_fitting(
+            &mut v,
+            "rtpmap",
+            &[&self.payload.to_string(), " ", &self.encoding],
+        )?;
         push_fitting(&mut v, "rtpmap", &["/", &self.clock_rate.to_string()])?;
         if let Some(p) = &self.params {
             push_fitting(&mut v, "rtpmap", &["/", p])?;
         }
-        Ok(Attribute { name: "rtpmap".to_string(), value: Some(v) })
+        Ok(Attribute {
+            name: "rtpmap".to_string(),
+            value: Some(v),
+        })
     }
 }
 
@@ -1532,7 +1716,10 @@ impl Fmtp {
         let v = line_value(a, "fmtp")?;
         let (format, params) = v.split_once(' ').ok_or(Error::Attribute)?;
         check(is_token(format) && is_text(params))?;
-        Ok(Fmtp { format: format.to_string(), params: params.to_string() })
+        Ok(Fmtp {
+            format: format.to_string(),
+            params: params.to_string(),
+        })
     }
 
     /// The `fmtp` attribute. It fails if the format is not a token, the
@@ -1542,7 +1729,10 @@ impl Fmtp {
         check(is_token(&self.format) && is_text(&self.params))?;
         let mut v = String::new();
         push_fitting(&mut v, "fmtp", &[&self.format, " ", &self.params])?;
-        Ok(Attribute { name: "fmtp".to_string(), value: Some(v) })
+        Ok(Attribute {
+            name: "fmtp".to_string(),
+            value: Some(v),
+        })
     }
 
     /// The settings split at `;`, each a name and the value after its
@@ -1550,7 +1740,12 @@ impl Fmtp {
     /// them this way, though RFC 8866 does not require it.
     pub fn parameters(&self) -> Vec<(&str, Option<&str>)> {
         let mut out = Vec::new();
-        for p in self.params.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        for p in self
+            .params
+            .split(';')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
             out.push(match p.split_once('=') {
                 Some((k, v)) => (k.trim(), Some(v.trim())),
                 None => (p, None),
@@ -1703,13 +1898,17 @@ pub struct Candidate {
 pub const MAX_PRIORITY: u32 = 0x7fff_ffff;
 
 fn is_foundation(s: &str) -> bool {
-    (1..=MAX_FOUNDATION).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+    (1..=MAX_FOUNDATION).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
 /// The SIP `token` of RFC 3261, section 25, which ICE uses for transports,
 /// candidate types and extension names.
 fn is_sip_token(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.!%*_+`'~".contains(&b))
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-.!%*_+`'~".contains(&b))
 }
 
 /// `extension-att-value`: visible ASCII, possibly none.
@@ -1737,7 +1936,9 @@ impl Candidate {
         let neither = self.related_address.is_none() && self.related_port.is_none();
         match self.kind {
             CandidateType::Host => neither,
-            CandidateType::ServerReflexive | CandidateType::PeerReflexive | CandidateType::Relay => both,
+            CandidateType::ServerReflexive
+            | CandidateType::PeerReflexive
+            | CandidateType::Relay => both,
             CandidateType::Other(_) => true,
         }
     }
@@ -1807,10 +2008,29 @@ impl Candidate {
         )?;
         const NAME: &str = "candidate";
         let mut v = String::new();
-        let (component, priority, port) =
-            (self.component.to_string(), self.priority.to_string(), self.port.to_string());
-        push_fitting(&mut v, NAME, &[&self.foundation, " ", &component, " ", &self.transport, " ", &priority])?;
-        push_fitting(&mut v, NAME, &[" ", &self.address, " ", &port, " typ ", self.kind.as_str()])?;
+        let (component, priority, port) = (
+            self.component.to_string(),
+            self.priority.to_string(),
+            self.port.to_string(),
+        );
+        push_fitting(
+            &mut v,
+            NAME,
+            &[
+                &self.foundation,
+                " ",
+                &component,
+                " ",
+                &self.transport,
+                " ",
+                &priority,
+            ],
+        )?;
+        push_fitting(
+            &mut v,
+            NAME,
+            &[" ", &self.address, " ", &port, " typ ", self.kind.as_str()],
+        )?;
         if let Some(a) = &self.related_address {
             check(is_non_ws(a))?;
             push_fitting(&mut v, NAME, &[" raddr ", a])?;
@@ -1823,7 +2043,10 @@ impl Candidate {
             check(is_sip_token(name) && is_ice_value(value) && !related)?;
             push_fitting(&mut v, NAME, &[" ", name, " ", value])?;
         }
-        Ok(Attribute { name: NAME.to_string(), value: Some(v) })
+        Ok(Attribute {
+            name: NAME.to_string(),
+            value: Some(v),
+        })
     }
 }
 
@@ -1835,7 +2058,9 @@ pub mod harness {
 
     /// Checks typed attribute round trips and line limits.
     pub fn check_attribute(a: &Attribute) {
-        let fits = |b: &Attribute| "a=:".len() + b.name.len() + b.value.as_deref().map_or(0, str::len) <= MAX_LINE_LEN;
+        let fits = |b: &Attribute| {
+            "a=:".len() + b.name.len() + b.value.as_deref().map_or(0, str::len) <= MAX_LINE_LEN
+        };
         if let Ok(r) = RtpMap::from_attribute(a) {
             let back = r.to_attribute().unwrap();
             assert!(fits(&back));
@@ -1857,13 +2082,11 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
     use super::harness::check_attribute;
     use super::*;
-    use codec::{
-        Lcg, Stream,
-    };
+    use codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// The example in RFC 8866, section 5.
@@ -1916,7 +2139,11 @@ mod tests {
 
     // Adapter and chunking checks: Wire::parse also uses SessionDescriptions.
     fn check_description(b: &[u8]) -> Result<SessionDescription, Error> {
-        contract::check_decode_with_alloc_limit(SessionDescriptions::new, b, 2 * (MAX_LINE_LEN + 2));
+        contract::check_decode_with_alloc_limit(
+            SessionDescriptions::new,
+            b,
+            2 * (MAX_LINE_LEN + 2),
+        );
         contract::check_decode_with_held_limit(SessionDescriptions::new, b, MAX_LEN);
         let (mut items, failure) = decode_all(SessionDescriptions::new, b);
         match failure {
@@ -1938,17 +2165,31 @@ mod tests {
         assert_eq!(d.origin.address, "198.51.100.1");
         assert_eq!(d.name, "Call to John Smith");
         assert_eq!(d.information.as_deref(), Some("SDP Offer #1"));
-        assert_eq!(d.uri.as_deref(), Some("http://www.jdoe.example.com/home.html"));
+        assert_eq!(
+            d.uri.as_deref(),
+            Some("http://www.jdoe.example.com/home.html")
+        );
         assert_eq!(d.emails, ["Jane Doe <jane@jdoe.example.com>"]);
         assert_eq!(d.phones, ["+1 617 555-6011"]);
         assert_eq!(d.times, [Timing::default()]);
         assert_eq!(d.media.len(), 3);
         assert_eq!(d.media[1].port, 49180);
         let video = &d.media[2];
-        assert_eq!((video.kind.as_str(), video.proto.as_str()), ("video", "RTP/AVP"));
+        assert_eq!(
+            (video.kind.as_str(), video.proto.as_str()),
+            ("video", "RTP/AVP")
+        );
         assert_eq!(video.connections[0].address, "2001:db8::2");
         let map = video.rtpmap("99").unwrap();
-        assert_eq!(map, RtpMap { payload: 99, encoding: "h263-1998".into(), clock_rate: 90000, params: None });
+        assert_eq!(
+            map,
+            RtpMap {
+                payload: 99,
+                encoding: "h263-1998".into(),
+                clock_rate: 90000,
+                params: None
+            }
+        );
         // Written back, it is the same bytes.
         assert_eq!(d.to_bytes().unwrap(), RFC_EXAMPLE);
         assert_eq!(check_description(RFC_EXAMPLE), Ok(d));
@@ -1963,16 +2204,31 @@ mod tests {
         )
         .unwrap();
         let dirs: Vec<Direction> = d.media.iter().map(|m| d.direction(m)).collect();
-        assert_eq!(dirs, [Direction::SendRecv, Direction::Inactive, Direction::Inactive]);
+        assert_eq!(
+            dirs,
+            [
+                Direction::SendRecv,
+                Direction::Inactive,
+                Direction::Inactive
+            ]
+        );
         let mut d2 = d.clone();
         d2.attributes.clear();
         assert_eq!(d2.direction(&d2.media[1]), Direction::SendRecv);
         assert_eq!(Direction::SendOnly.reverse(), Direction::RecvOnly);
         assert_eq!(Direction::Inactive.reverse(), Direction::Inactive);
-        for dir in [Direction::SendRecv, Direction::SendOnly, Direction::RecvOnly, Direction::Inactive] {
+        for dir in [
+            Direction::SendRecv,
+            Direction::SendOnly,
+            Direction::RecvOnly,
+            Direction::Inactive,
+        ] {
             assert_eq!(Direction::from_attribute(&dir.to_attribute()), Some(dir));
         }
-        assert_eq!(Direction::from_attribute(&Attribute::new("sendonly", "x")), None);
+        assert_eq!(
+            Direction::from_attribute(&Attribute::new("sendonly", "x")),
+            None
+        );
     }
 
     #[test]
@@ -1982,17 +2238,42 @@ mod tests {
         assert_eq!(d.connection.as_ref().unwrap().address, "224.2.17.12/127");
         assert_eq!(
             d.bandwidths,
-            [Bandwidth { kind: "CT".into(), value: 128 }, Bandwidth { kind: "AS".into(), value: 64 }]
+            [
+                Bandwidth {
+                    kind: "CT".into(),
+                    value: 128
+                },
+                Bandwidth {
+                    kind: "AS".into(),
+                    value: 64
+                }
+            ]
         );
         assert_eq!(d.times.len(), 2);
         // The RFC's two ways of writing the same repeat.
-        let r = Repeat { interval: 604800, duration: 3600, offsets: vec![0, 90000] };
+        let r = Repeat {
+            interval: 604800,
+            duration: 3600,
+            offsets: vec![0, 90000],
+        };
         assert_eq!(d.times[0].repeats, [r.clone(), r]);
         assert_eq!(
             d.times[0].zones,
-            [ZoneAdjustment { time: 3730928400, offset: -3600 }, ZoneAdjustment { time: 3749680800, offset: 0 }]
+            [
+                ZoneAdjustment {
+                    time: 3730928400,
+                    offset: -3600
+                },
+                ZoneAdjustment {
+                    time: 3749680800,
+                    offset: 0
+                }
+            ]
         );
-        assert_eq!(d.attribute("tool").unwrap().value.as_deref(), Some("test 1.0"));
+        assert_eq!(
+            d.attribute("tool").unwrap().value.as_deref(),
+            Some("test 1.0")
+        );
         let audio = &d.media[0];
         assert_eq!((audio.port, audio.port_count), (49170, Some(2)));
         assert_eq!(audio.formats, ["0", "96"]);
@@ -2001,7 +2282,10 @@ mod tests {
         assert_eq!(audio.direction(), Some(Direction::SendOnly));
         assert_eq!(d.direction(&d.media[1]), Direction::RecvOnly);
         let fmtp = audio.fmtp("96").unwrap();
-        assert_eq!(fmtp.parameters(), [("minptime", Some("10")), ("useinbandfec", Some("1"))]);
+        assert_eq!(
+            fmtp.parameters(),
+            [("minptime", Some("10")), ("useinbandfec", Some("1"))]
+        );
         assert_eq!(audio.candidates().count(), 1);
         assert_eq!(d.media[1].formats, ["webrtc-datachannel"]);
         // A round trip: the writer uses the largest units, so the bytes
@@ -2018,12 +2302,22 @@ mod tests {
 
     #[test]
     fn line_endings() {
-        let lf: Vec<u8> = RFC_EXAMPLE.iter().copied().filter(|&b| b != b'\r').collect();
+        let lf: Vec<u8> = RFC_EXAMPLE
+            .iter()
+            .copied()
+            .filter(|&b| b != b'\r')
+            .collect();
         let want = SessionDescription::parse(RFC_EXAMPLE).unwrap();
         assert_eq!(SessionDescription::parse(&lf), Ok(want.clone()));
         // No ending on the last line.
-        assert_eq!(SessionDescription::parse(&RFC_EXAMPLE[..RFC_EXAMPLE.len() - 2]), Ok(want.clone()));
-        assert_eq!(SessionDescription::parse(&RFC_EXAMPLE[..RFC_EXAMPLE.len() - 1]), Ok(want));
+        assert_eq!(
+            SessionDescription::parse(&RFC_EXAMPLE[..RFC_EXAMPLE.len() - 2]),
+            Ok(want.clone())
+        );
+        assert_eq!(
+            SessionDescription::parse(&RFC_EXAMPLE[..RFC_EXAMPLE.len() - 1]),
+            Ok(want)
+        );
     }
 
     #[test]
@@ -2038,13 +2332,19 @@ mod tests {
         };
         let d = SessionDescription::new(origin, " ");
         let bytes = d.to_bytes().unwrap();
-        assert_eq!(bytes, b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns= \r\nt=0 0\r\n");
+        assert_eq!(
+            bytes,
+            b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns= \r\nt=0 0\r\n"
+        );
         assert_eq!(SessionDescription::parse(&bytes), Ok(d));
     }
 
     fn err(b: &[u8]) -> Error {
         let Err(e) = SessionDescription::parse(b) else {
-            panic!("parsed: {:?}", String::from_utf8_lossy(&b[..b.len().min(200)]))
+            panic!(
+                "parsed: {:?}",
+                String::from_utf8_lossy(&b[..b.len().min(200)])
+            )
         };
         assert_eq!(check_description(b), Err(e));
         e
@@ -2060,11 +2360,22 @@ mod tests {
     fn missing_lines() {
         assert_eq!(err(b""), Error::Missing('v'));
         assert_eq!(err(b"v=0\r\n"), Error::Missing('o'));
-        assert_eq!(err(b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\n"), Error::Missing('s'));
+        assert_eq!(
+            err(b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\n"),
+            Error::Missing('s')
+        );
         assert_eq!(err(HEAD.as_bytes()), Error::Missing('t'));
         assert_eq!(err(&with("c=IN IP4 1.2.3.4\r\n")), Error::Missing('t'));
-        assert_eq!(err(&with("t=0 0\r\nm=audio 1 RTP/AVP 0\r\n")), Error::Missing('c'));
-        assert!(SessionDescription::parse(&with("t=0 0\r\nm=audio 1 RTP/AVP 0\r\nc=IN IP4 1.2.3.4\r\n")).is_ok());
+        assert_eq!(
+            err(&with("t=0 0\r\nm=audio 1 RTP/AVP 0\r\n")),
+            Error::Missing('c')
+        );
+        assert!(
+            SessionDescription::parse(&with(
+                "t=0 0\r\nm=audio 1 RTP/AVP 0\r\nc=IN IP4 1.2.3.4\r\n"
+            ))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2074,7 +2385,10 @@ mod tests {
         assert_eq!(err(b"v 0\r\n"), Error::Malformed { line: 1 });
         assert_eq!(err(b"v"), Error::Malformed { line: 1 });
         assert_eq!(err(b"=0"), Error::Malformed { line: 1 });
-        assert_eq!(err(&with("t=0 0\r\nx=1\r\n")), Error::UnknownType { line: 5, kind: 'x' });
+        assert_eq!(
+            err(&with("t=0 0\r\nx=1\r\n")),
+            Error::UnknownType { line: 5, kind: 'x' }
+        );
         // Unknown even where the line could not come.
         assert_eq!(err(b"y=0\r\n"), Error::UnknownType { line: 1, kind: 'y' });
     }
@@ -2116,7 +2430,11 @@ mod tests {
             ("t=0 0\r\nr=99999999999999999d 1 0\r\n", 5, 'r'),
             ("t=0 0\r\nr=1 1 0\r\nz=1\r\n", 6, 'z'),
             ("t=0 0\r\nr=1 1 0\r\nz=3730928400 -\r\n", 6, 'z'),
-            ("t=0 0\r\nr=1 1 0\r\nz=3730928400 9223372036854775808\r\n", 6, 'z'),
+            (
+                "t=0 0\r\nr=1 1 0\r\nz=3730928400 9223372036854775808\r\n",
+                6,
+                'z',
+            ),
             ("t=0 0\r\nr=1 1 0\r\nz=-1 1\r\n", 6, 'z'),
             ("t=0 0\r\nk=\r\n", 5, 'k'),
             ("t=0 0\r\na=\r\n", 5, 'a'),
@@ -2138,10 +2456,22 @@ mod tests {
             assert_eq!(err(&with(rest)), Error::Syntax { line, kind }, "{rest:?}");
         }
         assert_eq!(err(b"v=1\r\n"), Error::Syntax { line: 1, kind: 'v' });
-        assert_eq!(err(b"v=0\r\no=- 1 1 IN IP4\r\n"), Error::Syntax { line: 2, kind: 'o' });
-        assert_eq!(err(b"v=0\r\no=- 1 1 IN IP4 a b\r\n"), Error::Syntax { line: 2, kind: 'o' });
-        assert_eq!(err(b"v=0\r\no=- x 1 IN IP4 192.0.2.9\r\n"), Error::Syntax { line: 2, kind: 'o' });
-        assert_eq!(err(b"v=0\r\no=- 1 1 IN IP4 192.0.2.9\r\ns=\r\n"), Error::Syntax { line: 3, kind: 's' });
+        assert_eq!(
+            err(b"v=0\r\no=- 1 1 IN IP4\r\n"),
+            Error::Syntax { line: 2, kind: 'o' }
+        );
+        assert_eq!(
+            err(b"v=0\r\no=- 1 1 IN IP4 a b\r\n"),
+            Error::Syntax { line: 2, kind: 'o' }
+        );
+        assert_eq!(
+            err(b"v=0\r\no=- x 1 IN IP4 192.0.2.9\r\n"),
+            Error::Syntax { line: 2, kind: 'o' }
+        );
+        assert_eq!(
+            err(b"v=0\r\no=- 1 1 IN IP4 192.0.2.9\r\ns=\r\n"),
+            Error::Syntax { line: 3, kind: 's' }
+        );
     }
 
     #[test]
@@ -2163,7 +2493,11 @@ mod tests {
             ("t=0 0\r\nb=AS:1\r\n", 5, 'b'),
             ("t=0 0\r\nz=1 1\r\n", 5, 'z'),
             ("t=0 0\r\nr=1 1 0\r\nz=3730928400 1\r\nr=1 1 0\r\n", 7, 'r'),
-            ("t=0 0\r\nr=1 1 0\r\nz=3730928400 1\r\nz=3730928400 1\r\n", 7, 'z'),
+            (
+                "t=0 0\r\nr=1 1 0\r\nz=3730928400 1\r\nz=3730928400 1\r\n",
+                7,
+                'z',
+            ),
             ("t=0 0\r\nk=prompt\r\nt=0 0\r\n", 6, 't'),
             ("t=0 0\r\nk=prompt\r\nk=prompt\r\n", 6, 'k'),
             ("t=0 0\r\na=x\r\nk=prompt\r\n", 6, 'k'),
@@ -2172,15 +2506,26 @@ mod tests {
             ("t=0 0\r\nm=audio 1 RTP/AVP 0\r\nu=a\r\n", 6, 'u'),
             ("t=0 0\r\nm=audio 1 RTP/AVP 0\r\ne=a\r\n", 6, 'e'),
             ("t=0 0\r\nm=audio 1 RTP/AVP 0\r\nr=1 1 0\r\n", 6, 'r'),
-            ("t=0 0\r\nm=audio 1 RTP/AVP 0\r\nc=IN IP4 192.0.2.9\r\ni=x\r\n", 7, 'i'),
-            ("t=0 0\r\nm=audio 1 RTP/AVP 0\r\nb=AS:1\r\nc=IN IP4 192.0.2.9\r\n", 7, 'c'),
+            (
+                "t=0 0\r\nm=audio 1 RTP/AVP 0\r\nc=IN IP4 192.0.2.9\r\ni=x\r\n",
+                7,
+                'i',
+            ),
+            (
+                "t=0 0\r\nm=audio 1 RTP/AVP 0\r\nb=AS:1\r\nc=IN IP4 192.0.2.9\r\n",
+                7,
+                'c',
+            ),
             ("t=0 0\r\nm=audio 1 RTP/AVP 0\r\na=x\r\nb=AS:1\r\n", 7, 'b'),
             ("t=0 0\r\nm=audio 1 RTP/AVP 0\r\nk=a\r\nk=a\r\n", 7, 'k'),
         ];
         for &(rest, line, kind) in bad {
             assert_eq!(err(&with(rest)), Error::Order { line, kind }, "{rest:?}");
         }
-        assert_eq!(err(b"o=- 1 1 IN IP4 192.0.2.9\r\n"), Error::Order { line: 1, kind: 'o' });
+        assert_eq!(
+            err(b"o=- 1 1 IN IP4 192.0.2.9\r\n"),
+            Error::Order { line: 1, kind: 'o' }
+        );
         assert_eq!(err(b"v=0\r\nv=0\r\n"), Error::Order { line: 2, kind: 'v' });
         assert_eq!(err(b"v=0\r\ns=x\r\n"), Error::Order { line: 2, kind: 's' });
     }
@@ -2195,10 +2540,16 @@ mod tests {
         // A long line is caught before its end comes.
         let mut d = Stream::new(SessionDescriptions::new());
         assert_eq!(d.push(&vec![b'a'; MAX_LINE_LEN + 2]), MAX_LINE_LEN + 2);
-        assert_eq!(d.next(), Some(Err(codec::Fail::Protocol(Error::LineTooLong { line: 1 }))));
+        assert_eq!(
+            d.next(),
+            Some(Err(codec::Fail::Protocol(Error::LineTooLong { line: 1 })))
+        );
         assert_eq!(d.push(b"\r\nv=0"), 5);
         assert_eq!(d.next(), None);
-        assert_eq!(d.failed(), Some(&codec::Fail::Protocol(Error::LineTooLong { line: 1 })));
+        assert_eq!(
+            d.failed(),
+            Some(&codec::Fail::Protocol(Error::LineTooLong { line: 1 }))
+        );
         // Too many lines.
         let many = format!("t=0 0\r\n{}", "a=x\r\n".repeat(MAX_LINES));
         assert_eq!(err(&with(&many)), Error::TooManyLines);
@@ -2252,19 +2603,49 @@ mod tests {
         check(&d, Error::Syntax { line: 9, kind: 'c' });
         let mut d = sample();
         d.bandwidths[0].kind = "A:S".into();
-        check(&d, Error::Syntax { line: 10, kind: 'b' });
+        check(
+            &d,
+            Error::Syntax {
+                line: 10,
+                kind: 'b',
+            },
+        );
         let mut d = sample();
         d.times[0].repeats[0].interval = 0;
-        check(&d, Error::Syntax { line: 13, kind: 'r' });
+        check(
+            &d,
+            Error::Syntax {
+                line: 13,
+                kind: 'r',
+            },
+        );
         let mut d = sample();
         d.times[0].repeats[1].offsets.clear();
-        check(&d, Error::Syntax { line: 14, kind: 'r' });
+        check(
+            &d,
+            Error::Syntax {
+                line: 14,
+                kind: 'r',
+            },
+        );
         let mut d = sample();
         d.attributes[1].name = "to ol".into();
-        check(&d, Error::Syntax { line: 18, kind: 'a' });
+        check(
+            &d,
+            Error::Syntax {
+                line: 18,
+                kind: 'a',
+            },
+        );
         let mut d = sample();
         d.attributes[1].value = Some(String::new());
-        check(&d, Error::Syntax { line: 18, kind: 'a' });
+        check(
+            &d,
+            Error::Syntax {
+                line: 18,
+                kind: 'a',
+            },
+        );
         for f in [
             |m: &mut Media| m.kind = String::new(),
             |m: &mut Media| m.port_count = Some(0),
@@ -2274,42 +2655,84 @@ mod tests {
         ] {
             let mut d = sample();
             f(&mut d.media[0]);
-            check(&d, Error::Syntax { line: 19, kind: 'm' });
+            check(
+                &d,
+                Error::Syntax {
+                    line: 19,
+                    kind: 'm',
+                },
+            );
         }
         let mut d = sample();
         d.media[0].information = Some(String::new());
-        check(&d, Error::Syntax { line: 20, kind: 'i' });
+        check(
+            &d,
+            Error::Syntax {
+                line: 20,
+                kind: 'i',
+            },
+        );
         let mut d = sample();
         d.media[0].connections[1].addr_type = "I P4".into();
-        check(&d, Error::Syntax { line: 22, kind: 'c' });
+        check(
+            &d,
+            Error::Syntax {
+                line: 22,
+                kind: 'c',
+            },
+        );
         let mut d = sample();
         d.media[0].bandwidths[0].kind = String::new();
-        check(&d, Error::Syntax { line: 23, kind: 'b' });
+        check(
+            &d,
+            Error::Syntax {
+                line: 23,
+                kind: 'b',
+            },
+        );
         let mut d = sample();
         d.media[0].attributes[0].name = "rtp:map".into();
-        check(&d, Error::Syntax { line: 24, kind: 'a' });
+        check(
+            &d,
+            Error::Syntax {
+                line: 24,
+                kind: 'a',
+            },
+        );
     }
 
     #[test]
     fn writer_limits() {
         let mut d = sample();
-        d.attributes.push(Attribute::new("x", &"y".repeat(MAX_LINE_LEN - 3)));
+        d.attributes
+            .push(Attribute::new("x", &"y".repeat(MAX_LINE_LEN - 3)));
         assert_eq!(d.to_bytes().err(), Some(Error::LineTooLong { line: 19 }));
         let mut d = sample();
-        d.attributes.push(Attribute::new("x", &"y".repeat(MAX_LINE_LEN - 4)));
+        d.attributes
+            .push(Attribute::new("x", &"y".repeat(MAX_LINE_LEN - 4)));
         let bytes = d.to_bytes().unwrap();
         assert_eq!(SessionDescription::parse(&bytes), Ok(d));
         let mut d = sample();
-        d.attributes.extend(std::iter::repeat_n(Attribute::flag("x"), MAX_LINES));
+        d.attributes
+            .extend(std::iter::repeat_n(Attribute::flag("x"), MAX_LINES));
         assert_eq!(d.to_bytes().err(), Some(Error::TooManyLines));
         // As many lines as fit.
         let mut d = sample();
-        let n = d.to_bytes().unwrap().iter().filter(|&&b| b == b'\n').count();
-        d.attributes.extend(std::iter::repeat_n(Attribute::flag("x"), MAX_LINES - n));
+        let n = d
+            .to_bytes()
+            .unwrap()
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        d.attributes
+            .extend(std::iter::repeat_n(Attribute::flag("x"), MAX_LINES - n));
         let bytes = d.to_bytes().unwrap();
         assert_eq!(SessionDescription::parse(&bytes), Ok(d));
         let mut d = sample();
-        d.attributes.extend(std::iter::repeat_n(Attribute::new("x", &"y".repeat(2000)), MAX_LINES / 2));
+        d.attributes.extend(std::iter::repeat_n(
+            Attribute::new("x", &"y".repeat(2000)),
+            MAX_LINES / 2,
+        ));
         assert_eq!(d.to_bytes().err(), Some(Error::TooLong));
         // Exactly MAX_LEN bytes.
         let mut d = sample();
@@ -2320,7 +2743,8 @@ mod tests {
             len += 4002;
         }
         let rest = MAX_LEN - len;
-        d.attributes.push(Attribute::new("x", &"y".repeat(rest - 6)));
+        d.attributes
+            .push(Attribute::new("x", &"y".repeat(rest - 6)));
         let bytes = d.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_LEN);
         assert_eq!(SessionDescription::parse(&bytes), Ok(d.clone()));
@@ -2332,13 +2756,32 @@ mod tests {
     fn zone_offsets_round_trip() {
         let mut d = sample();
         d.times[1].zones = vec![
-            ZoneAdjustment { time: MIN_TIME, offset: i64::MIN },
-            ZoneAdjustment { time: u64::MAX, offset: i64::MAX },
-            ZoneAdjustment { time: MIN_TIME + 4, offset: -1 },
-            ZoneAdjustment { time: MIN_TIME + 5, offset: -86_400 * 3 },
-            ZoneAdjustment { time: MIN_TIME + 6, offset: 0 },
+            ZoneAdjustment {
+                time: MIN_TIME,
+                offset: i64::MIN,
+            },
+            ZoneAdjustment {
+                time: u64::MAX,
+                offset: i64::MAX,
+            },
+            ZoneAdjustment {
+                time: MIN_TIME + 4,
+                offset: -1,
+            },
+            ZoneAdjustment {
+                time: MIN_TIME + 5,
+                offset: -86_400 * 3,
+            },
+            ZoneAdjustment {
+                time: MIN_TIME + 6,
+                offset: 0,
+            },
         ];
-        d.times[1].repeats = vec![Repeat { interval: 1, duration: 0, offsets: vec![0] }];
+        d.times[1].repeats = vec![Repeat {
+            interval: 1,
+            duration: 0,
+            offsets: vec![0],
+        }];
         let bytes = d.to_bytes().unwrap();
         assert_eq!(SessionDescription::parse(&bytes), Ok(d));
     }
@@ -2347,7 +2790,15 @@ mod tests {
     fn rtpmap() {
         let a = Attribute::new("rtpmap", "96 opus/48000/2");
         let r = RtpMap::from_attribute(&a).unwrap();
-        assert_eq!(r, RtpMap { payload: 96, encoding: "opus".into(), clock_rate: 48000, params: Some("2".into()) });
+        assert_eq!(
+            r,
+            RtpMap {
+                payload: 96,
+                encoding: "opus".into(),
+                clock_rate: 48000,
+                params: Some("2".into())
+            }
+        );
         assert_eq!(r.to_attribute(), Ok(a));
         for bad in [
             "96",
@@ -2359,11 +2810,26 @@ mod tests {
             "x opus/8000",
             "96 opus/4294967296",
         ] {
-            assert_eq!(RtpMap::from_attribute(&Attribute::new("rtpmap", bad)), Err(Error::Attribute), "{bad}");
+            assert_eq!(
+                RtpMap::from_attribute(&Attribute::new("rtpmap", bad)),
+                Err(Error::Attribute),
+                "{bad}"
+            );
         }
-        assert_eq!(RtpMap::from_attribute(&Attribute::new("fmtp", "96 opus/8000")), Err(Error::Attribute));
-        assert_eq!(RtpMap::from_attribute(&Attribute::flag("rtpmap")), Err(Error::Attribute));
-        let mut r = RtpMap { payload: 128, encoding: "PCMU".into(), clock_rate: 8000, params: None };
+        assert_eq!(
+            RtpMap::from_attribute(&Attribute::new("fmtp", "96 opus/8000")),
+            Err(Error::Attribute)
+        );
+        assert_eq!(
+            RtpMap::from_attribute(&Attribute::flag("rtpmap")),
+            Err(Error::Attribute)
+        );
+        let mut r = RtpMap {
+            payload: 128,
+            encoding: "PCMU".into(),
+            clock_rate: 8000,
+            params: None,
+        };
         assert_eq!(r.to_attribute(), Err(Error::Attribute));
         r.payload = 0;
         r.params = Some("a b".into());
@@ -2379,27 +2845,59 @@ mod tests {
         let f = Fmtp::from_attribute(&a).unwrap();
         assert_eq!(f.parameters(), [("0-15", None)]);
         assert_eq!(f.to_attribute(), Ok(a));
-        let f = Fmtp { format: "97".into(), params: "profile-level-id=42e01f ; packetization-mode=1;".into() };
+        let f = Fmtp {
+            format: "97".into(),
+            params: "profile-level-id=42e01f ; packetization-mode=1;".into(),
+        };
         let back = Fmtp::from_attribute(&f.to_attribute().unwrap()).unwrap();
-        assert_eq!(back.parameters(), [("profile-level-id", Some("42e01f")), ("packetization-mode", Some("1"))]);
+        assert_eq!(
+            back.parameters(),
+            [
+                ("profile-level-id", Some("42e01f")),
+                ("packetization-mode", Some("1"))
+            ]
+        );
         assert_eq!(back, f);
         for bad in ["97", "97 ", "9:7 x"] {
-            assert_eq!(Fmtp::from_attribute(&Attribute::new("fmtp", bad)), Err(Error::Attribute), "{bad}");
+            assert_eq!(
+                Fmtp::from_attribute(&Attribute::new("fmtp", bad)),
+                Err(Error::Attribute),
+                "{bad}"
+            );
         }
-        assert_eq!(Fmtp { format: "97".into(), params: String::new() }.to_attribute(), Err(Error::Attribute));
-        assert_eq!(Fmtp { format: "9 7".into(), params: "x".into() }.to_attribute(), Err(Error::Attribute));
+        assert_eq!(
+            Fmtp {
+                format: "97".into(),
+                params: String::new()
+            }
+            .to_attribute(),
+            Err(Error::Attribute)
+        );
+        assert_eq!(
+            Fmtp {
+                format: "9 7".into(),
+                params: "x".into()
+            }
+            .to_attribute(),
+            Err(Error::Attribute)
+        );
     }
 
     #[test]
     fn candidates() {
         // The examples in RFC 8839, section 5.1.
-        let host = Attribute::new("candidate", "1 1 UDP 2130706431 203.0.113.141 8998 typ host");
+        let host = Attribute::new(
+            "candidate",
+            "1 1 UDP 2130706431 203.0.113.141 8998 typ host",
+        );
         let c = Candidate::from_attribute(&host).unwrap();
         assert_eq!(c.kind, CandidateType::Host);
         assert_eq!((c.component, c.priority, c.port), (1, 2130706431, 8998));
         assert_eq!(c.to_attribute(), Ok(host));
-        let srflx =
-            Attribute::new("candidate", "2 1 UDP 1694498815 192.0.2.3 45664 typ srflx raddr 203.0.113.141 rport 8998");
+        let srflx = Attribute::new(
+            "candidate",
+            "2 1 UDP 1694498815 192.0.2.3 45664 typ srflx raddr 203.0.113.141 rport 8998",
+        );
         let c = Candidate::from_attribute(&srflx).unwrap();
         assert_eq!(c.kind, CandidateType::ServerReflexive);
         assert_eq!(c.related_address.as_deref(), Some("203.0.113.141"));
@@ -2411,7 +2909,13 @@ mod tests {
             "842163049 1 udp 1677729535 198.51.100.4 54400 typ srflx rport 51472 raddr 10.0.0.2 generation 0 network-cost 999",
         );
         let c = Candidate::from_attribute(&a).unwrap();
-        assert_eq!(c.extensions, [("generation".into(), "0".into()), ("network-cost".into(), "999".into())]);
+        assert_eq!(
+            c.extensions,
+            [
+                ("generation".into(), "0".into()),
+                ("network-cost".into(), "999".into())
+            ]
+        );
         let back = c.to_attribute().unwrap();
         assert_eq!(Candidate::from_attribute(&back), Ok(c.clone()));
         for t in ["prflx", "relay", "other"] {
@@ -2438,7 +2942,11 @@ mod tests {
             "1 1 UDP 1 a 1 typ host  generation 0",
         ];
         for v in bad {
-            assert_eq!(Candidate::from_attribute(&Attribute::new("candidate", v)), Err(Error::Attribute), "{v}");
+            assert_eq!(
+                Candidate::from_attribute(&Attribute::new("candidate", v)),
+                Err(Error::Attribute),
+                "{v}"
+            );
         }
         let mut c2 = c.clone();
         c2.extensions.push(("raddr".into(), "x".into()));
@@ -2464,11 +2972,17 @@ mod tests {
                 assert_eq!(check_description(part), got, "{n}");
                 match &got {
                     Ok(d) => {
-                        assert_eq!(SessionDescription::parse(&d.to_bytes().unwrap()), Ok(d.clone()));
+                        assert_eq!(
+                            SessionDescription::parse(&d.to_bytes().unwrap()),
+                            Ok(d.clone())
+                        );
                         assert!(d.media.len() <= whole.media.len());
                     }
                     Err(e) => assert!(
-                        matches!(e, Error::Missing(_) | Error::Syntax { .. } | Error::Malformed { .. }),
+                        matches!(
+                            e,
+                            Error::Missing(_) | Error::Syntax { .. } | Error::Malformed { .. }
+                        ),
                         "{n}: {e}"
                     ),
                 }
@@ -2527,8 +3041,22 @@ mod tests {
     #[test]
     fn fuzz_writer() {
         let mut rng = Lcg::new(42);
-        let words =
-            ["a", "IN", "IP4", "x y", "", "0", "rtp:map", "-", "\u{e9}", "a\r", "/", "RTP/AVP", "\0", "96 opus/48000"];
+        let words = [
+            "a",
+            "IN",
+            "IP4",
+            "x y",
+            "",
+            "0",
+            "rtp:map",
+            "-",
+            "\u{e9}",
+            "a\r",
+            "/",
+            "RTP/AVP",
+            "\0",
+            "96 opus/48000",
+        ];
         let mut written = 0;
         for _ in 0..fictionet::stdlib::test_support::rounds(750) {
             let mut d = sample();
@@ -2540,7 +3068,10 @@ mod tests {
                     1 => d.origin.address = w,
                     2 => d.name = w,
                     3 => d.information = Some(w),
-                    4 => d.attributes.push(Attribute { name: w, value: None }),
+                    4 => d.attributes.push(Attribute {
+                        name: w,
+                        value: None,
+                    }),
                     5 => d.attributes.push(Attribute::new("x", &w)),
                     6 => d.media[0].formats.push(w),
                     7 => d.media[0].proto = w,
@@ -2550,10 +3081,19 @@ mod tests {
                         duration: n,
                         offsets: vec![n; (n % 2) as usize],
                     }),
-                    10 => d.times[0].zones.push(ZoneAdjustment { time: n, offset: n as i64 }),
-                    11 => d.media[1].connections.push(Connection { net_type: w, ..Connection::default() }),
+                    10 => d.times[0].zones.push(ZoneAdjustment {
+                        time: n,
+                        offset: n as i64,
+                    }),
+                    11 => d.media[1].connections.push(Connection {
+                        net_type: w,
+                        ..Connection::default()
+                    }),
                     12 => d.bandwidths.push(Bandwidth { kind: w, value: n }),
-                    13 => d.media.push(Media { kind: w, ..Media::default() }),
+                    13 => d.media.push(Media {
+                        kind: w,
+                        ..Media::default()
+                    }),
                     14 => d.connection = None,
                     _ => d.uri = Some(w),
                 }
@@ -2572,22 +3112,50 @@ mod tests {
     fn zone_needs_a_repeat() {
         // RFC 8866 section 9 and appendix: a z= line modifies the r= lines
         // just before it, and z= with no r= before it is a syntax error.
-        assert_eq!(err(&with("t=0 0\r\nz=1 -1h\r\n")), Error::Order { line: 5, kind: 'z' });
-        assert!(SessionDescription::parse(&with("t=0 0\r\nr=1 1 0\r\nz=3730928400 -1h\r\n")).is_ok());
+        assert_eq!(
+            err(&with("t=0 0\r\nz=1 -1h\r\n")),
+            Error::Order { line: 5, kind: 'z' }
+        );
+        assert!(
+            SessionDescription::parse(&with("t=0 0\r\nr=1 1 0\r\nz=3730928400 -1h\r\n")).is_ok()
+        );
         let mut d = sample();
-        d.times[1].zones = vec![ZoneAdjustment { time: MIN_TIME, offset: 1 }];
-        assert_eq!(d.to_bytes(), Err(Error::Syntax { line: 17, kind: 'z' }));
+        d.times[1].zones = vec![ZoneAdjustment {
+            time: MIN_TIME,
+            offset: 1,
+        }];
+        assert_eq!(
+            d.to_bytes(),
+            Err(Error::Syntax {
+                line: 17,
+                kind: 'z'
+            })
+        );
     }
 
     #[test]
     fn rtpmap_numbers_follow_the_grammar() {
         // clock-rate is an integer, which starts with a nonzero digit, and
         // payload-type is "0" or such an integer.
-        for bad in ["96 opus/0", "96 opus/048000", "096 opus/48000", "00 PCMU/8000"] {
-            assert_eq!(RtpMap::from_attribute(&Attribute::new("rtpmap", bad)), Err(Error::Attribute), "{bad}");
+        for bad in [
+            "96 opus/0",
+            "96 opus/048000",
+            "096 opus/48000",
+            "00 PCMU/8000",
+        ] {
+            assert_eq!(
+                RtpMap::from_attribute(&Attribute::new("rtpmap", bad)),
+                Err(Error::Attribute),
+                "{bad}"
+            );
         }
         assert!(RtpMap::from_attribute(&Attribute::new("rtpmap", "0 PCMU/8000")).is_ok());
-        let r = RtpMap { payload: 0, encoding: "PCMU".into(), clock_rate: 0, params: None };
+        let r = RtpMap {
+            payload: 0,
+            encoding: "PCMU".into(),
+            clock_rate: 0,
+            params: None,
+        };
         assert_eq!(r.to_attribute(), Err(Error::Attribute));
         // A format that is not a plain number names no payload type.
         let d = SessionDescription::parse(&with(
@@ -2602,13 +3170,19 @@ mod tests {
     fn candidate_type_round_trips() {
         // A world may build Other with a name the reader maps to a known
         // type. Written, it would read back as a different value.
-        let host = Candidate::from_attribute(&Attribute::new("candidate", "1 1 UDP 1 a 1 typ host")).unwrap();
+        let host =
+            Candidate::from_attribute(&Attribute::new("candidate", "1 1 UDP 1 a 1 typ host"))
+                .unwrap();
         for name in ["host", "srflx", "prflx", "relay", "HOST"] {
             let mut c = host.clone();
             c.kind = CandidateType::Other(name.into());
             assert_eq!(c.to_attribute(), Err(Error::Attribute), "{name}");
         }
-        for kind in [CandidateType::Host, CandidateType::Relay, CandidateType::Other("x-new".into())] {
+        for kind in [
+            CandidateType::Host,
+            CandidateType::Relay,
+            CandidateType::Other("x-new".into()),
+        ] {
             assert_eq!(CandidateType::from_name(kind.as_str()), kind);
         }
     }
@@ -2617,12 +3191,21 @@ mod tests {
     fn candidate_keywords_ignore_case() {
         // RFC 8839 writes "typ", the type names, "raddr" and "rport" as ABNF
         // strings, which match in any case (RFC 5234, section 2.3).
-        let a = Attribute::new("candidate", "1 1 UDP 1 a 1 TYP Srflx RADDR 10.0.0.1 RPort 9");
+        let a = Attribute::new(
+            "candidate",
+            "1 1 UDP 1 a 1 TYP Srflx RADDR 10.0.0.1 RPort 9",
+        );
         let c = Candidate::from_attribute(&a).unwrap();
         assert_eq!(c.kind, CandidateType::ServerReflexive);
-        assert_eq!((c.related_address.as_deref(), c.related_port), (Some("10.0.0.1"), Some(9)));
+        assert_eq!(
+            (c.related_address.as_deref(), c.related_port),
+            (Some("10.0.0.1"), Some(9))
+        );
         assert!(c.extensions.is_empty());
-        assert_eq!(Candidate::from_attribute(&c.to_attribute().unwrap()), Ok(c.clone()));
+        assert_eq!(
+            Candidate::from_attribute(&c.to_attribute().unwrap()),
+            Ok(c.clone())
+        );
         // An extension named RADDR would read back as raddr.
         let mut c2 = c;
         c2.related_address = None;
@@ -2635,7 +3218,10 @@ mod tests {
     #[test]
     fn fuzz_candidate_writer() {
         let mut rng = Lcg::new(7);
-        let words = ["host", "HOST", "Relay", "x", "a b", "", "raddr", "RPORT", "typ", "1", "+/", "\u{e9}", "a\r"];
+        let words = [
+            "host", "HOST", "Relay", "x", "a b", "", "raddr", "RPORT", "typ", "1", "+/", "\u{e9}",
+            "a\r",
+        ];
         let mut written = 0;
         for _ in 0..3000 {
             let mut c = Candidate {
@@ -2658,7 +3244,10 @@ mod tests {
                 c.related_port = Some(rng.next() as u16);
             }
             for _ in 0..rng.index(3) {
-                c.extensions.push((words[rng.index(words.len())].into(), words[rng.index(words.len())].into()));
+                c.extensions.push((
+                    words[rng.index(words.len())].into(),
+                    words[rng.index(words.len())].into(),
+                ));
             }
             if let Ok(a) = c.to_attribute() {
                 written += 1;
@@ -2671,7 +3260,10 @@ mod tests {
     #[test]
     fn session_attributes_named() {
         let d = SessionDescription::parse(&with("t=0 0\r\na=x:1\r\na=y\r\na=x:2\r\n")).unwrap();
-        let xs: Vec<_> = d.attributes_named("x").map(|a| a.value.as_deref()).collect();
+        let xs: Vec<_> = d
+            .attributes_named("x")
+            .map(|a| a.value.as_deref())
+            .collect();
         assert_eq!(xs, [Some("1"), Some("2")]);
         assert_eq!(d.attribute("y"), Some(&Attribute::flag("y")));
         // Candidates and their types have defaults, so worlds can build them.
@@ -2683,7 +3275,17 @@ mod tests {
             ..Candidate::default()
         };
         assert_eq!(c.kind, CandidateType::Host);
-        assert!(Candidate::from_attribute(&Candidate { address: "a".into(), ..c }.to_attribute().unwrap()).is_ok());
+        assert!(
+            Candidate::from_attribute(
+                &Candidate {
+                    address: "a".into(),
+                    ..c
+                }
+                .to_attribute()
+                .unwrap()
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2725,13 +3327,22 @@ mod tests {
         // is copied, and so are long rtpmap and fmtp values.
         let base = "1 1 UDP 1 192.0.2.1 9 typ host";
         let long = format!("{base}{}", " x y".repeat(2000));
-        assert_eq!(Candidate::from_attribute(&Attribute::new("candidate", &long)), Err(Error::Attribute));
         assert_eq!(
-            Fmtp::from_attribute(&Attribute::new("fmtp", &format!("96 {}", "x;".repeat(5000)))),
+            Candidate::from_attribute(&Attribute::new("candidate", &long)),
+            Err(Error::Attribute)
+        );
+        assert_eq!(
+            Fmtp::from_attribute(&Attribute::new(
+                "fmtp",
+                &format!("96 {}", "x;".repeat(5000))
+            )),
             Err(Error::Attribute)
         );
         let enc = "a".repeat(MAX_LINE_LEN);
-        assert_eq!(RtpMap::from_attribute(&Attribute::new("rtpmap", &format!("96 {enc}/8000"))), Err(Error::Attribute));
+        assert_eq!(
+            RtpMap::from_attribute(&Attribute::new("rtpmap", &format!("96 {enc}/8000"))),
+            Err(Error::Attribute)
+        );
         // The longest candidate that fits on a line reads, writes and goes
         // in a description.
         let room = MAX_LINE_LEN - "a=candidate:".len() - base.len() - " x ".len();
@@ -2739,16 +3350,29 @@ mod tests {
         let c = Candidate::from_attribute(&Attribute::new("candidate", &fits)).unwrap();
         let a = c.to_attribute().unwrap();
         assert_eq!(a.value.as_deref(), Some(fits.as_str()));
-        let mut d = SessionDescription::parse(&with("c=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 1 RTP/AVP 0\r\n")).unwrap();
+        let mut d = SessionDescription::parse(&with(
+            "c=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 1 RTP/AVP 0\r\n",
+        ))
+        .unwrap();
         d.media[0].attributes.push(a);
         assert_eq!(SessionDescription::parse(&d.to_bytes().unwrap()), Ok(d));
         // One byte more is refused both ways.
         let over = format!("{fits}y");
-        assert_eq!(Candidate::from_attribute(&Attribute::new("candidate", &over)), Err(Error::Attribute));
+        assert_eq!(
+            Candidate::from_attribute(&Attribute::new("candidate", &over)),
+            Err(Error::Attribute)
+        );
         let mut c2 = c;
         c2.extensions[0].1.push('y');
         assert_eq!(c2.to_attribute(), Err(Error::Attribute));
-        assert_eq!(Fmtp { format: "96".into(), params: "x".repeat(MAX_LINE_LEN) }.to_attribute(), Err(Error::Attribute));
+        assert_eq!(
+            Fmtp {
+                format: "96".into(),
+                params: "x".repeat(MAX_LINE_LEN)
+            }
+            .to_attribute(),
+            Err(Error::Attribute)
+        );
     }
 
     #[test]
@@ -2756,7 +3380,11 @@ mod tests {
         // A line buffer never grows past the line limit, however much is
         // written to it.
         let mut out = String::new();
-        let mut b = LineBuf { out: &mut out, start: 0, over: false };
+        let mut b = LineBuf {
+            out: &mut out,
+            start: 0,
+            over: false,
+        };
         for _ in 0..rounds(100_000) {
             let _ = std::fmt::Write::write_str(&mut b, "18446744073709551615 ");
         }
@@ -2765,14 +3393,21 @@ mod tests {
         // So a repeat with a great many offsets fails without being
         // written out first.
         let mut d = sample();
-        d.times[1].repeats = vec![Repeat { interval: 1, duration: 1, offsets: vec![u64::MAX; rounds(100_000)] }];
+        d.times[1].repeats = vec![Repeat {
+            interval: 1,
+            duration: 1,
+            offsets: vec![u64::MAX; rounds(100_000)],
+        }];
         assert_eq!(d.to_bytes(), Err(Error::LineTooLong { line: 17 }));
     }
 
     #[test]
     fn what_the_reader_accepts_the_writer_writes() {
         // Units are kept compact, so the line does not grow.
-        let r = format!("c=IN IP4 192.0.2.1\r\nt=0 0\r\nr=1d 1h{}\r\n", " 1d".repeat(1000));
+        let r = format!(
+            "c=IN IP4 192.0.2.1\r\nt=0 0\r\nr=1d 1h{}\r\n",
+            " 1d".repeat(1000)
+        );
         let d = SessionDescription::parse(&with(&r)).unwrap();
         let bytes = d.to_bytes().unwrap();
         assert_eq!(SessionDescription::parse(&bytes), Ok(d));
@@ -2797,17 +3432,28 @@ mod tests {
         body.push_str("a=y\n");
         assert!(body.len() < MAX_LEN);
         assert_eq!(err(body.as_bytes()), Error::TooLong);
-        assert_eq!(check_description(body.trim_end().as_bytes()), Err(Error::TooLong));
+        assert_eq!(
+            check_description(body.trim_end().as_bytes()),
+            Err(Error::TooLong)
+        );
     }
 
     #[test]
     fn key_lines_are_dropped() {
-        let b = with("c=IN IP4 192.0.2.1\r\nt=0 0\r\nk=clear:secret\r\nm=audio 1 RTP/AVP 0\r\nk=clear:other\r\n");
+        let b = with(
+            "c=IN IP4 192.0.2.1\r\nt=0 0\r\nk=clear:secret\r\nm=audio 1 RTP/AVP 0\r\nk=clear:other\r\n",
+        );
         let d = SessionDescription::parse(&b).unwrap();
         let out = String::from_utf8(d.to_bytes().unwrap()).unwrap();
-        assert!(!out.contains("secret") && !out.contains("other") && !out.contains("k="), "{out}");
+        assert!(
+            !out.contains("secret") && !out.contains("other") && !out.contains("k="),
+            "{out}"
+        );
         // Their place is still checked.
-        assert_eq!(err(&with("t=0 0\r\na=x\r\nk=prompt\r\n")), Error::Order { line: 6, kind: 'k' });
+        assert_eq!(
+            err(&with("t=0 0\r\na=x\r\nk=prompt\r\n")),
+            Error::Order { line: 6, kind: 'k' }
+        );
     }
 
     #[test]
@@ -2817,7 +3463,11 @@ mod tests {
             "v=0\r\no=- 1 1 IN IP6 a:b\r\ns=x\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\n",
         ];
         for b in bad {
-            assert_eq!(err(b.as_bytes()), Error::Syntax { line: 2, kind: 'o' }, "{b}");
+            assert_eq!(
+                err(b.as_bytes()),
+                Error::Syntax { line: 2, kind: 'o' },
+                "{b}"
+            );
         }
         for c in [
             "c=IN IP4 239.1.1.1",
@@ -2833,7 +3483,11 @@ mod tests {
             "c=IN IP4 a",
             "c=IN IP4 a/b",
         ] {
-            assert_eq!(err(&with(&format!("{c}\r\nt=0 0\r\n"))), Error::Syntax { line: 4, kind: 'c' }, "{c}");
+            assert_eq!(
+                err(&with(&format!("{c}\r\nt=0 0\r\n"))),
+                Error::Syntax { line: 4, kind: 'c' },
+                "{c}"
+            );
         }
         for c in [
             "c=IN IP4 233.252.0.1/127",
@@ -2843,7 +3497,10 @@ mod tests {
             "c=IN IP4 host.example.com",
             "c=IN X25 anything/goes",
         ] {
-            assert!(SessionDescription::parse(&with(&format!("{c}\r\nt=0 0\r\n"))).is_ok(), "{c}");
+            assert!(
+                SessionDescription::parse(&with(&format!("{c}\r\nt=0 0\r\n"))).is_ok(),
+                "{c}"
+            );
         }
         // At the media level a multicast address may name several, and
         // several c= lines must all be multicast.
@@ -2853,14 +3510,21 @@ mod tests {
             "c=IN IP6 ff00::db8:0:101/2\r\n",
             "c=IN IP4 233.252.0.1/127\r\nc=IN IP4 233.252.0.2/127\r\n",
         ] {
-            assert!(SessionDescription::parse(&with(&format!("{media}{ok}"))).is_ok(), "{ok}");
+            assert!(
+                SessionDescription::parse(&with(&format!("{media}{ok}"))).is_ok(),
+                "{ok}"
+            );
         }
         for bad in [
             "c=IN IP4 192.0.2.1\r\nc=IN IP4 192.0.2.2\r\n",
             "c=IN IP4 233.252.0.1/127\r\nc=IN IP4 192.0.2.2\r\n",
             "c=IN IP4 192.0.2.1\r\nc=IN IP4 233.252.0.1/127\r\n",
         ] {
-            assert_eq!(err(&with(&format!("{media}{bad}"))), Error::Syntax { line: 7, kind: 'c' }, "{bad}");
+            assert_eq!(
+                err(&with(&format!("{media}{bad}"))),
+                Error::Syntax { line: 7, kind: 'c' },
+                "{bad}"
+            );
         }
         // The writer refuses the same.
         let mut d = sample();
@@ -2871,13 +3535,23 @@ mod tests {
         assert_eq!(d.to_bytes(), Err(Error::Syntax { line: 2, kind: 'o' }));
         let mut d = sample();
         d.media[0].connections[1].address = "192.0.2.8".into();
-        assert_eq!(d.to_bytes(), Err(Error::Syntax { line: 22, kind: 'c' }));
+        assert_eq!(
+            d.to_bytes(),
+            Err(Error::Syntax {
+                line: 22,
+                kind: 'c'
+            })
+        );
     }
 
     #[test]
     fn candidate_priority_range() {
-        let at =
-            |p: &str| Candidate::from_attribute(&Attribute::new("candidate", &format!("1 1 UDP {p} a 1 typ host")));
+        let at = |p: &str| {
+            Candidate::from_attribute(&Attribute::new(
+                "candidate",
+                &format!("1 1 UDP {p} a 1 typ host"),
+            ))
+        };
         for p in ["0", "2147483648", "4294967295"] {
             assert_eq!(at(p), Err(Error::Attribute), "{p}");
         }
@@ -2886,7 +3560,15 @@ mod tests {
         assert_eq!(c.priority, MAX_PRIORITY);
         assert!(c.to_attribute().is_ok());
         for p in [0, MAX_PRIORITY + 1, u32::MAX] {
-            assert_eq!(Candidate { priority: p, ..c.clone() }.to_attribute(), Err(Error::Attribute), "{p}");
+            assert_eq!(
+                Candidate {
+                    priority: p,
+                    ..c.clone()
+                }
+                .to_attribute(),
+                Err(Error::Attribute),
+                "{p}"
+            );
         }
     }
 
@@ -2902,7 +3584,10 @@ mod tests {
         ] {
             assert_eq!(at(v), Err(Error::Attribute), "{v}");
         }
-        for v in ["1 1 UDP 1 192.0.2.1 9 typ relay raddr 0.0.0.0 rport 9", "1 1 UDP 1 192.0.2.1 9 typ x-new rport 9"] {
+        for v in [
+            "1 1 UDP 1 192.0.2.1 9 typ relay raddr 0.0.0.0 rport 9",
+            "1 1 UDP 1 192.0.2.1 9 typ x-new rport 9",
+        ] {
             let c = at(v).unwrap();
             assert_eq!(c.to_attribute().map(|a| a.value), Ok(Some(v.to_string())));
         }
@@ -2952,12 +3637,24 @@ mod tests {
 
     #[test]
     fn rtpmap_channels_are_a_count() {
-        for bad in ["96 opus/48000/0", "96 opus/48000/02", "96 opus/48000/stereo/extra", "96 opus/48000/stereo"] {
-            assert_eq!(RtpMap::from_attribute(&Attribute::new("rtpmap", bad)), Err(Error::Attribute), "{bad}");
+        for bad in [
+            "96 opus/48000/0",
+            "96 opus/48000/02",
+            "96 opus/48000/stereo/extra",
+            "96 opus/48000/stereo",
+        ] {
+            assert_eq!(
+                RtpMap::from_attribute(&Attribute::new("rtpmap", bad)),
+                Err(Error::Attribute),
+                "{bad}"
+            );
         }
         let r = RtpMap::from_attribute(&Attribute::new("rtpmap", "96 opus/48000/2")).unwrap();
         for p in ["0", "02", "x"] {
-            let r = RtpMap { params: Some(p.into()), ..r.clone() };
+            let r = RtpMap {
+                params: Some(p.into()),
+                ..r.clone()
+            };
             assert_eq!(r.to_attribute(), Err(Error::Attribute), "{p}");
         }
     }
@@ -2971,23 +3668,33 @@ mod tests {
             ("a=rtpmap:96 opus/48000\r\na=rtpmap:96 PCMU/8000\r\n", 8),
             ("a=fmtp:96 a=1\r\na=fmtp:96 a=2\r\n", 8),
         ] {
-            assert_eq!(err(&with(&format!("{media}{extra}"))), Error::Order { line, kind: 'a' }, "{extra}");
+            assert_eq!(
+                err(&with(&format!("{media}{extra}"))),
+                Error::Order { line, kind: 'a' },
+                "{extra}"
+            );
         }
         assert_eq!(
-            err(&with("c=IN IP4 192.0.2.1\r\nt=0 0\r\na=inactive\r\na=sendrecv\r\n")),
+            err(&with(
+                "c=IN IP4 192.0.2.1\r\nt=0 0\r\na=inactive\r\na=sendrecv\r\n"
+            )),
             Error::Order { line: 7, kind: 'a' }
         );
         let ok = "a=rtpmap:96 opus/48000\r\na=rtpmap:97 PCMU/8000\r\na=fmtp:96 a=1\r\na=fmtp:97 a=1\r\na=sendonly\r\n";
         assert!(SessionDescription::parse(&with(&format!("{media}{ok}"))).is_ok());
         // The writer refuses the same.
         let mut d = sample();
-        d.media[0].attributes.push(Direction::RecvOnly.to_attribute());
+        d.media[0]
+            .attributes
+            .push(Direction::RecvOnly.to_attribute());
         assert!(matches!(d.to_bytes(), Err(Error::Order { kind: 'a', .. })));
         let mut d = sample();
         d.attributes.push(Direction::Inactive.to_attribute());
         assert!(matches!(d.to_bytes(), Err(Error::Order { kind: 'a', .. })));
         let mut d = sample();
-        d.media[0].attributes.push(Attribute::new("rtpmap", "96 PCMU/8000"));
+        d.media[0]
+            .attributes
+            .push(Attribute::new("rtpmap", "96 PCMU/8000"));
         assert!(matches!(d.to_bytes(), Err(Error::Order { kind: 'a', .. })));
     }
 
@@ -3000,18 +3707,31 @@ mod tests {
             "m=audio 49170 RTP/AVP 096",
             "m=audio 49170 UDP/TLS/RTP/SAVPF 0 x",
         ] {
-            assert_eq!(err(&with(&format!("{head}{m}\r\n"))), Error::Syntax { line: 6, kind: 'm' }, "{m}");
+            assert_eq!(
+                err(&with(&format!("{head}{m}\r\n"))),
+                Error::Syntax { line: 6, kind: 'm' },
+                "{m}"
+            );
         }
         for m in [
             "m=audio 49170 RTP/AVP 0 96 127",
             "m=audio 49170 udp banana",
             "m=application 9 UDP/DTLS/SCTP webrtc-datachannel",
         ] {
-            assert!(SessionDescription::parse(&with(&format!("{head}{m}\r\n"))).is_ok(), "{m}");
+            assert!(
+                SessionDescription::parse(&with(&format!("{head}{m}\r\n"))).is_ok(),
+                "{m}"
+            );
         }
         let mut d = sample();
         d.media[0].formats.push("banana".into());
-        assert_eq!(d.to_bytes(), Err(Error::Syntax { line: 19, kind: 'm' }));
+        assert_eq!(
+            d.to_bytes(),
+            Err(Error::Syntax {
+                line: 19,
+                kind: 'm'
+            })
+        );
     }
 
     #[test]
@@ -3044,17 +3764,36 @@ mod tests {
             ("t=999999999 0\r\n", 4, 't'),
             ("t=0 0\r\nr=1 1 0\r\nz=0 0\r\n", 6, 'z'),
             ("t=0 0\r\nr=1 1 0\r\nz=03730928400 0\r\n", 6, 'z'),
-            ("c=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 49170/01 RTP/AVP 0\r\n", 6, 'm'),
+            (
+                "c=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 49170/01 RTP/AVP 0\r\n",
+                6,
+                'm',
+            ),
         ] {
             assert_eq!(err(&with(rest)), Error::Syntax { line, kind }, "{rest:?}");
         }
-        assert!(SessionDescription::parse(&with("t=1000000000 0\r\nr=1 1 0\r\nz=1000000000 0\r\n")).is_ok());
+        assert!(
+            SessionDescription::parse(&with("t=1000000000 0\r\nr=1 1 0\r\nz=1000000000 0\r\n"))
+                .is_ok()
+        );
         let mut d = sample();
         d.times[1].start = 1;
-        assert_eq!(d.to_bytes(), Err(Error::Syntax { line: 16, kind: 't' }));
+        assert_eq!(
+            d.to_bytes(),
+            Err(Error::Syntax {
+                line: 16,
+                kind: 't'
+            })
+        );
         let mut d = sample();
         d.times[0].zones[0].time = MIN_TIME - 1;
-        assert_eq!(d.to_bytes(), Err(Error::Syntax { line: 15, kind: 'z' }));
+        assert_eq!(
+            d.to_bytes(),
+            Err(Error::Syntax {
+                line: 15,
+                kind: 'z'
+            })
+        );
     }
 
     #[test]
@@ -3075,7 +3814,10 @@ mod tests {
             "p=Jane Doe <+1 617 555 6011>",
         ];
         for l in ok {
-            assert!(SessionDescription::parse(&with(&format!("{l}\r\nt=0 0\r\n"))).is_ok(), "{l}");
+            assert!(
+                SessionDescription::parse(&with(&format!("{l}\r\nt=0 0\r\n"))).is_ok(),
+                "{l}"
+            );
         }
         let bad = [
             "u=not a uri",
@@ -3095,7 +3837,11 @@ mod tests {
         ];
         for l in bad {
             let kind = l.chars().next().unwrap();
-            assert_eq!(err(&with(&format!("{l}\r\nt=0 0\r\n"))), Error::Syntax { line: 4, kind }, "{l}");
+            assert_eq!(
+                err(&with(&format!("{l}\r\nt=0 0\r\n"))),
+                Error::Syntax { line: 4, kind },
+                "{l}"
+            );
         }
         let mut d = sample();
         d.uri = Some("not a uri".into());

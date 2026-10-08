@@ -2,8 +2,8 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::l2tp::*;
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

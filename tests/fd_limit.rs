@@ -45,7 +45,11 @@ fn ticks(stats: &[std::fs::File]) -> u64 {
 /// spin on the listening socket. It accepts again once descriptors are free.
 #[test]
 fn running_out_of_descriptors_does_not_spin_the_helper() {
-    let path = format!("{}/fictionet-test-{}-fdlimit.sock", std::env::temp_dir().display(), std::process::id());
+    let path = format!(
+        "{}/fictionet-test-{}-fdlimit.sock",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
     let (attacher, _attachments) = attachments();
     let _listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
     // A new thread sets its own name, so it may not have one yet.
@@ -57,9 +61,15 @@ fn running_out_of_descriptors_does_not_spin_the_helper() {
     assert_eq!(stats.len(), 1);
 
     // Use up every descriptor, keeping one back for the client.
-    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
-    let low = libc::rlimit { rlim_cur: 256.min(limit.rlim_max), rlim_max: limit.rlim_max };
+    let low = libc::rlimit {
+        rlim_cur: 256.min(limit.rlim_max),
+        rlim_max: limit.rlim_max,
+    };
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &low) }, 0);
     let null = std::fs::File::open("/dev/null").unwrap();
     let mut filler: Vec<OwnedFd> = Vec::new();
@@ -77,13 +87,26 @@ fn running_out_of_descriptors_does_not_spin_the_helper() {
     drop(filler);
     unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
     // Clock ticks are usually 10 ms: a spinning thread uses about 100.
-    assert!(used < 20, "the helper thread used {used} ticks in a second while it could not accept");
+    assert!(
+        used < 20,
+        "the helper thread used {used} ticks in a second while it could not accept"
+    );
 
     // With descriptors free again, the waiting client is accepted.
-    let _ = unix::set_timeout(client.as_raw_fd(), libc::SO_RCVTIMEO, Some(Duration::from_secs(5)));
-    let hello = Message::Hello(Hello { version: relay::VERSION, mtu: 1500, kind: "tun".into(), name: "late".into() });
+    let _ = unix::set_timeout(
+        client.as_raw_fd(),
+        libc::SO_RCVTIMEO,
+        Some(Duration::from_secs(5)),
+    );
+    let hello = Message::Hello(Hello {
+        version: relay::VERSION,
+        mtu: 1500,
+        kind: "tun".into(),
+        name: "late".into(),
+    });
     unix::send(client.as_raw_fd(), &hello.encode(), false).unwrap();
     let mut buf = vec![0u8; 16];
-    let n = unix::recv(client.as_raw_fd(), &mut buf, false).expect("no answer after descriptors were freed");
+    let n = unix::recv(client.as_raw_fd(), &mut buf, false)
+        .expect("no answer after descriptors were freed");
     assert_eq!(&buf[..n], &[relay::ACCEPT]);
 }

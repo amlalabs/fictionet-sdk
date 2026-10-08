@@ -45,9 +45,9 @@
 //! # Ok::<(), fictionet::stdlib::fix::Error>(())
 //! ```
 
-use fictionet::stdlib::session::Action;
 use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::session::Action;
 use std::convert::Infallible;
 use std::fmt;
 
@@ -250,7 +250,9 @@ fn data_tag(tag: u32) -> Option<u32> {
     LENGTH_DATA_PAIRS.iter().find(|p| p.0 == tag).map(|p| p.1)
 }
 fn decimal(b: &[u8]) -> Result<u32, Error> {
-    ascii::decimal(b, 10, u64::from(u32::MAX)).map(|n| n as u32).ok_or(Error::Field)
+    ascii::decimal(b, 10, u64::from(u32::MAX))
+        .map(|n| n as u32)
+        .ok_or(Error::Field)
 }
 fn digits(n: usize) -> usize {
     if n == 0 { 1 } else { n.ilog10() as usize + 1 }
@@ -1414,7 +1416,10 @@ pub enum Event {
     /// The caller should close the transport after sending any preceding actions.
     Disconnected(CloseReason),
 }
-fn action(actions: &mut Vec<Action<Message, Event>>, value: Action<Message, Event>) -> Result<(), Error> {
+fn action(
+    actions: &mut Vec<Action<Message, Event>>,
+    value: Action<Message, Event>,
+) -> Result<(), Error> {
     if actions.len() >= MAX_ACTIONS {
         return Err(Error::Limit);
     }
@@ -1603,7 +1608,11 @@ impl Session {
     /// Advances timers. Sends Heartbeat after outgoing silence, TestRequest
     /// after inbound silence plus grace, and disconnects on expired probes.
     /// Any non-garbled inbound message satisfies a probe (Vol 2 state row 14).
-    pub fn tick(&mut self, now_ms: u64, sending_time: &[u8]) -> Result<Vec<Action<Message, Event>>, Error> {
+    pub fn tick(
+        &mut self,
+        now_ms: u64,
+        sending_time: &[u8],
+    ) -> Result<Vec<Action<Message, Event>>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             match s.phase {
                 Phase::Closed => return Ok(()),
@@ -1871,10 +1880,7 @@ impl Session {
         Ok(actions)
     }
     fn initial(&self) -> bool {
-        matches!(
-            self.phase,
-            Phase::AwaitingLogon | Phase::LogonSent
-        )
+        matches!(self.phase, Phase::AwaitingLogon | Phase::LogonSent)
     }
     fn recovery_state(&self) -> Result<(), Error> {
         if matches!(
@@ -1961,7 +1967,11 @@ impl Session {
         }
         self.send_fresh(message, now, actions)
     }
-    fn close(&mut self, reason: CloseReason, actions: &mut Vec<Action<Message, Event>>) -> Result<(), Error> {
+    fn close(
+        &mut self,
+        reason: CloseReason,
+        actions: &mut Vec<Action<Message, Event>>,
+    ) -> Result<(), Error> {
         self.phase = Phase::Closed;
         self.test = None;
         action(actions, Action::Event(Event::Disconnected(reason)))
@@ -2676,14 +2686,14 @@ fn timestamp_nanos(value: [u32; 7]) -> Result<u128, Error> {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::check_atomic;
     use super::*;
-    use fictionet::stdlib::codec::{
-        Stream,
+    use fictionet::stdlib::codec::Stream;
+    use fictionet::stdlib::test_support::check_atomic;
+    use fictionet::stdlib::test_support::contract::{
+        check_decode_with_alloc_limit, check_wire, check_wire_value,
     };
-    use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_wire, check_wire_value};
     use fictionet::stdlib::test_support::decode_all;
+    use fictionet::stdlib::test_support::rounds;
 
     // LOGON is the public Wikipedia Financial Information eXchange example
     // (https://en.wikipedia.org/wiki/Financial_Information_eXchange).
@@ -2765,7 +2775,11 @@ mod tests {
     }
 
     // Constructed exact-byte fixtures for the cited public session test cases.
-    fn received_bytes(session: &mut Session, bytes: &[u8], now: u64) -> Vec<Action<Message, Event>> {
+    fn received_bytes(
+        session: &mut Session,
+        bytes: &[u8],
+        now: u64,
+    ) -> Vec<Action<Message, Event>> {
         check_wire::<Message>(bytes);
         let message = Message::parse(bytes).unwrap();
         let actions = session.receive(&message, now, TIME).unwrap();

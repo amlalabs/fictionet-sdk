@@ -10,12 +10,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use fictionet::{Cx, RaceError};
 use fictionet::prelude::*;
-use fictionet::stdlib::bgp::{self, Attribute, Context, Error, Frame, Message, Notification, Open, Origin, Segment, SegmentKind, Update, kind};
+use fictionet::stdlib::bgp::{
+    self, Attribute, Context, Error, Frame, Message, Notification, Open, Origin, Segment,
+    SegmentKind, Update, kind,
+};
 use fictionet::stdlib::codec::{Fail, Frames, Stream, Wire};
 use fictionet::stdlib::tcp::{Listener, TcpConnection};
 use fictionet::time::{Duration, Instant};
+use fictionet::{Cx, RaceError};
 use serde_json::{Value, json};
 
 use crate::log::Log;
@@ -44,7 +47,10 @@ fn name(kind: u8) -> &'static str {
 }
 
 fn bytes(message: Message) -> Vec<u8> {
-    message.to_frame(&Context::default()).and_then(|frame| frame.to_bytes()).expect("a valid message")
+    message
+        .to_frame(&Context::default())
+        .and_then(|frame| frame.to_bytes())
+        .expect("a valid message")
 }
 
 fn announcement(route: &Announcement) -> Message {
@@ -52,7 +58,10 @@ fn announcement(route: &Announcement) -> Message {
         withdrawn: vec![],
         attributes: vec![
             Attribute::Origin(Origin::Igp),
-            Attribute::AsPath(vec![Segment { kind: SegmentKind::Sequence, asns: route.as_path.iter().map(|&a| a.into()).collect() }]),
+            Attribute::AsPath(vec![Segment {
+                kind: SegmentKind::Sequence,
+                asns: route.as_path.iter().map(|&a| a.into()).collect(),
+            }]),
             Attribute::NextHop(HOME.router),
         ],
         nlri: vec![bgp::Prefix::new(route.prefix.addr, route.prefix.len).expect("an IPv4 prefix")],
@@ -63,7 +72,13 @@ fn announcement(route: &Announcement) -> Message {
 // The speaker
 
 /// Accepts BGP sessions on `listener` until it closes, one task each.
-pub async fn serve(fcx: Cx, mut listener: Listener, scenario: Arc<Scenario>, log: Log, sandbox: Arc<str>) -> fictionet::Result {
+pub async fn serve(
+    fcx: Cx,
+    mut listener: Listener,
+    scenario: Arc<Scenario>,
+    log: Log,
+    sandbox: Arc<str>,
+) -> fictionet::Result {
     while let Ok(conn) = listener.accept(&fcx).await {
         let (scenario, log, sandbox) = (scenario.clone(), log.clone(), sandbox.clone());
         fcx.spawn(move |fcx| async move {
@@ -101,7 +116,15 @@ pub struct Session {
 
 impl Session {
     /// A session on `conn` that offers `our_hold` seconds as its hold time.
-    pub fn new(fcx: Cx, conn: TcpConnection, scenario: Arc<Scenario>, log: Log, sandbox: Arc<str>, peer: SocketAddr, our_hold: u16) -> Session {
+    pub fn new(
+        fcx: Cx,
+        conn: TcpConnection,
+        scenario: Arc<Scenario>,
+        log: Log,
+        sandbox: Arc<str>,
+        peer: SocketAddr,
+        our_hold: u16,
+    ) -> Session {
         let hold_deadline = fcx.now() + OPEN_WAIT;
         Session {
             fcx,
@@ -132,7 +155,13 @@ impl Session {
 
     async fn send(&mut self, message: &[u8], observed: Value) -> Result<(), Ended> {
         let fcx = self.fcx.clone();
-        match fcx.race(Some(fcx.now() + WRITE_WAIT), self.conn.write_all(&fcx, message)).await {
+        match fcx
+            .race(
+                Some(fcx.now() + WRITE_WAIT),
+                self.conn.write_all(&fcx, message),
+            )
+            .await
+        {
             Ok(Ok(())) => {}
             Err(RaceError::Cancelled) => return Err(Ended),
             _ => {
@@ -161,7 +190,14 @@ impl Session {
             if let Some(frame) = self.stream.next() {
                 let frame = match frame {
                     Ok(frame) => frame,
-                    Err(Fail::Protocol(e)) => return Err(self.fail(e.notification().expect("a wire error"), "bad message header").await),
+                    Err(Fail::Protocol(e)) => {
+                        return Err(self
+                            .fail(
+                                e.notification().expect("a wire error"),
+                                "bad message header",
+                            )
+                            .await);
+                    }
                     Err(_) => return Err(Ended),
                 };
                 let decoded = if frame.kind == kind::ROUTE_REFRESH {
@@ -170,7 +206,12 @@ impl Session {
                     Message::decode(&frame, &self.context)
                 };
                 if let Err(e @ (Error::BadMessageLength(_) | Error::BadMessageType(_))) = decoded {
-                    return Err(self.fail(e.notification().expect("a header error"), "bad message header").await);
+                    return Err(self
+                        .fail(
+                            e.notification().expect("a header error"),
+                            "bad message header",
+                        )
+                        .await);
                 }
                 // Any message restarts the hold timer.
                 self.hold_deadline = self.fcx.now() + self.hold;
@@ -181,7 +222,9 @@ impl Session {
                 _ => self.hold_deadline,
             };
             let fcx = self.fcx.clone();
-            let read = fcx.race(Some(due), self.conn.read(&fcx, self.stream.spare())).await;
+            let read = fcx
+                .race(Some(due), self.conn.read(&fcx, self.stream.spare()))
+                .await;
             match read {
                 Ok(Ok(n)) if n > 0 => self.stream.commit(n),
                 Ok(_) => {
@@ -192,10 +235,23 @@ impl Session {
                 Err(RaceError::Deadline) => {
                     let now = fcx.now();
                     if now >= self.hold_deadline {
-                        return Err(self.fail(Notification { code: bgp::code::HOLD_TIMER_EXPIRED, subcode: 0, data: vec![] }, "hold timer expired").await);
+                        return Err(self
+                            .fail(
+                                Notification {
+                                    code: bgp::code::HOLD_TIMER_EXPIRED,
+                                    subcode: 0,
+                                    data: vec![],
+                                },
+                                "hold timer expired",
+                            )
+                            .await);
                     }
                     if self.keepalive_at.is_some_and(|k| now >= k) {
-                        self.send(&bytes(Message::Keepalive), json!({"event": "sent", "message": "KEEPALIVE"})).await?;
+                        self.send(
+                            &bytes(Message::Keepalive),
+                            json!({"event": "sent", "message": "KEEPALIVE"}),
+                        )
+                        .await?;
                         self.keepalive_at = Some(now + self.hold / 3);
                     }
                 }
@@ -204,7 +260,9 @@ impl Session {
     }
 
     async fn received_notification(&mut self, frame: &Frame) -> Ended {
-        let Ok(Message::Notification(n)) = Message::decode(frame, &self.context) else { unreachable!("a checked NOTIFICATION") };
+        let Ok(Message::Notification(n)) = Message::decode(frame, &self.context) else {
+            unreachable!("a checked NOTIFICATION")
+        };
         self.observe(json!({
             "event": "received",
             "message": "NOTIFICATION",
@@ -232,7 +290,11 @@ impl Session {
         let mut ours = Open::new(HOME.asn.into(), self.our_hold, HOME.router, vec![]);
         // Open::new adds a capability; Border offers none.
         ours.parameters.clear();
-        self.send(&bytes(Message::Open(ours.clone())), json!({"event": "sent", "message": "OPEN"})).await?;
+        self.send(
+            &bytes(Message::Open(ours.clone())),
+            json!({"event": "sent", "message": "OPEN"}),
+        )
+        .await?;
 
         // OpenSent: the peer's OPEN.
         let frame = self.next().await?;
@@ -240,14 +302,29 @@ impl Session {
         match kind {
             kind::NOTIFICATION => return Err(self.received_notification(&frame).await),
             kind::OPEN => {}
-            other => return Err(self.fail(Notification { code: bgp::code::FSM, subcode: 0, data: vec![] }, &format!("expected OPEN, got {}", name(other))).await),
+            other => {
+                return Err(self
+                    .fail(
+                        Notification {
+                            code: bgp::code::FSM,
+                            subcode: 0,
+                            data: vec![],
+                        },
+                        &format!("expected OPEN, got {}", name(other)),
+                    )
+                    .await);
+            }
         }
         let body = &frame.body;
         let peer = match Message::decode(&frame, &self.context) {
             Ok(Message::Open(peer)) => peer,
             Err(e) => {
                 // These fields are readable even when the timer or version is refused.
-                if matches!(e, Error::UnsupportedVersion(_) | Error::UnacceptableHoldTime) && body.len() == 10 + usize::from(body[9]) {
+                if matches!(
+                    e,
+                    Error::UnsupportedVersion(_) | Error::UnacceptableHoldTime
+                ) && body.len() == 10 + usize::from(body[9])
+                {
                     let peer_as = u16::from_be_bytes([body[1], body[2]]);
                     let peer_hold = u16::from_be_bytes([body[3], body[4]]);
                     self.observe(json!({"event": "received", "message": "OPEN", "peer_as": peer_as, "peer_hold": peer_hold}));
@@ -257,16 +334,26 @@ impl Session {
                     Error::UnacceptableHoldTime => "unacceptable hold time",
                     _ => "bad OPEN",
                 };
-                return Err(self.fail(e.notification().expect("an OPEN error"), reason).await);
+                return Err(self
+                    .fail(e.notification().expect("an OPEN error"), reason)
+                    .await);
             }
             _ => unreachable!("an OPEN frame"),
         };
         self.observe(json!({"event": "received", "message": "OPEN", "peer_as": peer.my_as, "peer_hold": peer.hold_time}));
         self.context = Context::negotiated(&ours, &peer);
         let negotiated = self.our_hold.min(peer.hold_time);
-        self.hold = if negotiated == 0 { IDLE_HOLD_ZERO } else { Duration::from_secs(u64::from(negotiated)) };
+        self.hold = if negotiated == 0 {
+            IDLE_HOLD_ZERO
+        } else {
+            Duration::from_secs(u64::from(negotiated))
+        };
         self.hold_deadline = self.fcx.now() + self.hold;
-        self.send(&bytes(Message::Keepalive), json!({"event": "sent", "message": "KEEPALIVE", "hold": negotiated})).await?;
+        self.send(
+            &bytes(Message::Keepalive),
+            json!({"event": "sent", "message": "KEEPALIVE", "hold": negotiated}),
+        )
+        .await?;
 
         // OpenConfirm: the peer's KEEPALIVE.
         let frame = self.next().await?;
@@ -274,7 +361,18 @@ impl Session {
         match kind {
             kind::NOTIFICATION => return Err(self.received_notification(&frame).await),
             kind::KEEPALIVE => {}
-            other => return Err(self.fail(Notification { code: bgp::code::FSM, subcode: 0, data: vec![] }, &format!("expected KEEPALIVE, got {}", name(other))).await),
+            other => {
+                return Err(self
+                    .fail(
+                        Notification {
+                            code: bgp::code::FSM,
+                            subcode: 0,
+                            data: vec![],
+                        },
+                        &format!("expected KEEPALIVE, got {}", name(other)),
+                    )
+                    .await);
+            }
         }
         self.observe(json!({"event": "received", "message": "KEEPALIVE"}));
         self.observe(json!({"event": "established", "hold": negotiated}));
@@ -285,14 +383,17 @@ impl Session {
         // Established: announce, then hold the session.
         for route in self.scenario.announcements() {
             let message = bytes(announcement(&route));
-            let observed = json!({"event": "sent", "message": "UPDATE", "route": self.route(&route)});
+            let observed =
+                json!({"event": "sent", "message": "UPDATE", "route": self.route(&route)});
             self.send(&message, observed).await?;
         }
         loop {
             let frame = self.next().await?;
             let kind = frame.kind;
             match kind {
-                kind::KEEPALIVE => self.observe(json!({"event": "received", "message": "KEEPALIVE"})),
+                kind::KEEPALIVE => {
+                    self.observe(json!({"event": "received", "message": "KEEPALIVE"}))
+                }
                 kind::UPDATE => match Message::decode(&frame, &self.context) {
                     Ok(Message::Update(u)) => self.observe(json!({
                         "event": "received",
@@ -300,11 +401,26 @@ impl Session {
                         "announced": u.nlri.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
                         "withdrawn": u.withdrawn.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
                     })),
-                    Err(e) => return Err(self.fail(e.notification().expect("an UPDATE error"), "bad UPDATE").await),
+                    Err(e) => {
+                        return Err(self
+                            .fail(e.notification().expect("an UPDATE error"), "bad UPDATE")
+                            .await);
+                    }
                     _ => unreachable!("an UPDATE frame"),
                 },
                 kind::NOTIFICATION => return Err(self.received_notification(&frame).await),
-                kind::OPEN => return Err(self.fail(Notification { code: bgp::code::FSM, subcode: 0, data: vec![] }, "unexpected OPEN").await),
+                kind::OPEN => {
+                    return Err(self
+                        .fail(
+                            Notification {
+                                code: bgp::code::FSM,
+                                subcode: 0,
+                                data: vec![],
+                            },
+                            "unexpected OPEN",
+                        )
+                        .await);
+                }
                 _ => unreachable!("a checked message type"),
             }
         }
@@ -317,11 +433,17 @@ mod tests {
 
     #[test]
     fn announcement_bytes_are_unchanged() {
-        let route = Announcement { prefix: crate::scenario::HIJACK_PREFIX, as_path: vec![65001, 65002] };
-        assert_eq!(bytes(announcement(&route)), [
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-            0, 48, 2, 0, 0, 0, 20, 64, 1, 1, 0, 64, 2, 6, 2, 2, 253, 233, 253, 234,
-            64, 3, 4, 84, 21, 44, 1, 25, 84, 21, 44, 0,
-        ]);
+        let route = Announcement {
+            prefix: crate::scenario::HIJACK_PREFIX,
+            as_path: vec![65001, 65002],
+        };
+        assert_eq!(
+            bytes(announcement(&route)),
+            [
+                255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0,
+                48, 2, 0, 0, 0, 20, 64, 1, 1, 0, 64, 2, 6, 2, 2, 253, 233, 253, 234, 64, 3, 4, 84,
+                21, 44, 1, 25, 84, 21, 44, 0,
+            ]
+        );
     }
 }

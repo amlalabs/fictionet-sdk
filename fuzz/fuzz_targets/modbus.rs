@@ -2,12 +2,12 @@
 //! reads them, and values a world builds, as it writes them.
 #![no_main]
 
-use fictionet::stdlib::codec::Frames;
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::modbus::{Exception, Frame, MAX_PDU, Request, Response, function};
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 /// A PDU read as a request and as a response. Whatever reads is written
@@ -30,12 +30,30 @@ fn request(u: &mut Unstructured) -> Result<Request> {
     let address = u.arbitrary()?;
     let n = u.int_in_range(0..=2100usize)?;
     Ok(match u.int_in_range(0..=8u8)? {
-        0 => Request::ReadCoils { address, quantity: n as u16 },
-        1 => Request::ReadDiscreteInputs { address, quantity: n as u16 },
-        2 => Request::ReadHoldingRegisters { address, quantity: n as u16 },
-        3 => Request::ReadInputRegisters { address, quantity: n as u16 },
-        4 => Request::WriteSingleCoil { address, value: u.arbitrary()? },
-        5 => Request::WriteSingleRegister { address, value: u.arbitrary()? },
+        0 => Request::ReadCoils {
+            address,
+            quantity: n as u16,
+        },
+        1 => Request::ReadDiscreteInputs {
+            address,
+            quantity: n as u16,
+        },
+        2 => Request::ReadHoldingRegisters {
+            address,
+            quantity: n as u16,
+        },
+        3 => Request::ReadInputRegisters {
+            address,
+            quantity: n as u16,
+        },
+        4 => Request::WriteSingleCoil {
+            address,
+            value: u.arbitrary()?,
+        },
+        5 => Request::WriteSingleRegister {
+            address,
+            value: u.arbitrary()?,
+        },
         6 => Request::WriteMultipleCoils {
             address,
             values: (0..n).map(|_| u.arbitrary()).collect::<Result<_>>()?,
@@ -58,9 +76,18 @@ fn response(u: &mut Unstructured) -> Result<Response> {
     Ok(match u.int_in_range(0..=6u8)? {
         0 => Response::Bits((0..n).map(|_| u.arbitrary()).collect::<Result<_>>()?),
         1 => Response::Registers((0..n).map(|_| u.arbitrary()).collect::<Result<_>>()?),
-        2 => Response::WriteSingleCoil { address, value: u.arbitrary()? },
-        3 => Response::WriteSingleRegister { address, value: u.arbitrary()? },
-        4 => Response::WriteMultiple { address, quantity: n as u16 },
+        2 => Response::WriteSingleCoil {
+            address,
+            value: u.arbitrary()?,
+        },
+        3 => Response::WriteSingleRegister {
+            address,
+            value: u.arbitrary()?,
+        },
+        4 => Response::WriteMultiple {
+            address,
+            quantity: n as u16,
+        },
         5 => Response::Exception(Exception::Other(u.arbitrary()?)),
         _ => Response::Other((0..n).map(|_| u.arbitrary()).collect::<Result<_>>()?),
     })
@@ -91,7 +118,11 @@ fn built(data: &[u8]) -> Result<()> {
         }
     }
     let n = u.int_in_range(0..=300usize)?;
-    let frame = Frame { transaction: u.arbitrary()?, unit: u.arbitrary()?, pdu: u.bytes(n)?.to_vec() };
+    let frame = Frame {
+        transaction: u.arbitrary()?,
+        unit: u.arbitrary()?,
+        pdu: u.bytes(n)?.to_vec(),
+    };
     check_wire_value(&frame);
     if let Ok(bytes) = frame.to_bytes() {
         assert_eq!(<Frame as Wire>::parse(&bytes), Ok(frame));

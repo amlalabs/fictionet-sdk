@@ -68,10 +68,10 @@
 //! assert_eq!(reply.to_bytes().unwrap(), [0, 7, 0, 0, 0, 5, 1, 3, 2, 0x04, 0xd2]);
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{be16, Wire};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::{Wire, be16};
 
 /// The TCP port Modbus/TCP servers listen on.
 pub const PORT: u16 = 502;
@@ -305,11 +305,13 @@ impl Prefixed for Frame {
     /// A length outside 2..=254 returns [`Error::Length`]. Partial input
     /// returns [`fictionet::stdlib::codec::Step::Need`], including at EOF.
     #[inline]
-    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        _limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         Frame::parse_prefix(input)
     }
 }
-
 
 /// The exception codes a server answers with when it cannot do what a
 /// request asks. Two exceptions are equal when their codes are, so
@@ -451,7 +453,10 @@ impl Request {
         };
         let read = |max: u16| -> Result<(u16, u16), Exception> {
             fixed(4)?;
-            let (address, quantity) = (be16(data, 0).ok_or(Exception::IllegalDataValue)?, be16(data, 2).ok_or(Exception::IllegalDataValue)?);
+            let (address, quantity) = (
+                be16(data, 0).ok_or(Exception::IllegalDataValue)?,
+                be16(data, 2).ok_or(Exception::IllegalDataValue)?,
+            );
             if quantity == 0 || quantity > max {
                 return Err(Exception::IllegalDataValue);
             }
@@ -625,7 +630,9 @@ impl Response {
         }
         let (&code, data) = pdu.split_first().ok_or(Error::BadResponse)?;
         if code & function::EXCEPTION_FLAG != 0 {
-            let [e] = data else { return Err(Error::BadResponse) };
+            let [e] = data else {
+                return Err(Error::BadResponse);
+            };
             return Ok((
                 code & !function::EXCEPTION_FLAG,
                 Response::Exception(Exception::from_code(*e)),
@@ -642,7 +649,10 @@ impl Response {
         };
         let pair = || {
             if data.len() == 4 {
-                Ok((be16(data, 0).ok_or(Error::Truncated)?, be16(data, 2).ok_or(Error::Truncated)?))
+                Ok((
+                    be16(data, 0).ok_or(Error::Truncated)?,
+                    be16(data, 2).ok_or(Error::Truncated)?,
+                ))
             } else {
                 Err(Error::BadResponse)
             }
@@ -691,7 +701,8 @@ impl Response {
                 } else {
                     MAX_WRITE_REGISTERS
                 };
-                check_quantity(address, usize::from(quantity), max).map_err(|_| Error::BadResponse)?;
+                check_quantity(address, usize::from(quantity), max)
+                    .map_err(|_| Error::BadResponse)?;
                 Response::WriteMultiple { address, quantity }
             }
             _ => Response::Other(data.to_vec()),
@@ -823,7 +834,11 @@ fn multiple(
     if data.len() < 5 {
         return Err(Exception::IllegalDataValue);
     }
-    let (address, quantity, count) = (be16(data, 0).ok_or(Exception::IllegalDataValue)?, be16(data, 2).ok_or(Exception::IllegalDataValue)?, usize::from(data[4]));
+    let (address, quantity, count) = (
+        be16(data, 0).ok_or(Exception::IllegalDataValue)?,
+        be16(data, 2).ok_or(Exception::IllegalDataValue)?,
+        usize::from(data[4]),
+    );
     if quantity == 0 || quantity > max || count != need(quantity) || data.len() != 5 + count {
         return Err(Exception::IllegalDataValue);
     }
@@ -854,12 +869,12 @@ fn pack_bits(bits: &[bool]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
-    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
+    use fictionet::stdlib::codec::{Decode, Step};
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump, try_pump};
-    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
 
     // Examples from the Modbus Application Protocol Specification v1.1b3,
     // section 6.
@@ -1075,7 +1090,10 @@ mod tests {
             Frame::parse_prefix(&[0, 1, 0, 0, 0, 255, 1]),
             Err(Error::Length(255))
         );
-        assert!(matches!(Frame::parse_prefix(&[0, 1, 0, 0, 0, 254, 1]), Ok(None)));
+        assert!(matches!(
+            Frame::parse_prefix(&[0, 1, 0, 0, 0, 254, 1]),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -1091,19 +1109,13 @@ mod tests {
             contract::check_wire::<Frame>(&bytes);
             for cut in 0..bytes.len() {
                 let prefix = bytes.get(..cut).unwrap();
-                assert_eq!(
-                    <Frame as Wire>::parse(prefix),
-                    Err(Error::Truncated)
-                );
+                assert_eq!(<Frame as Wire>::parse(prefix), Err(Error::Truncated));
                 assert_eq!(Frame::parse_prefix(prefix), Ok(None));
             }
             for suffix in [&[0][..], bytes.as_slice()] {
                 let mut trailing = bytes.clone();
                 trailing.extend_from_slice(suffix);
-                assert_eq!(
-                    <Frame as Wire>::parse(&trailing),
-                    Err(Error::Trailing)
-                );
+                assert_eq!(<Frame as Wire>::parse(&trailing), Err(Error::Trailing));
                 assert_eq!(
                     Frame::parse_prefix(&trailing),
                     Ok(Some((frame.clone(), bytes.len())))
@@ -1113,15 +1125,9 @@ mod tests {
         for (bytes, error) in [
             (&[0, 1, 0, 5][..], Error::Protocol(5)),
             (&[0, 1, 0, 0, 0, 1, 1][..], Error::Length(1)),
-            (
-                &[0, 1, 0, 0, 0xff, 0xff, 1][..],
-                Error::Length(u16::MAX),
-            ),
+            (&[0, 1, 0, 0, 0xff, 0xff, 1][..], Error::Length(u16::MAX)),
         ] {
-            assert_eq!(
-                <Frame as Wire>::parse(bytes),
-                Err(error)
-            );
+            assert_eq!(<Frame as Wire>::parse(bytes), Err(error));
         }
     }
 
@@ -1386,7 +1392,8 @@ mod tests {
             finish(&mut server, |_| panic!("unexpected request at EOF")).unwrap();
             assert_eq!(registers.get(2), Some(&1234));
             let mut client = Stream::new(
-                Frames::<Frame>::new().map(|frame| (frame.transaction, frame.unit, Response::parse(&frame.pdu))),
+                Frames::<Frame>::new()
+                    .map(|frame| (frame.transaction, frame.unit, Response::parse(&frame.pdu))),
             );
             let mut got = Vec::new();
             for chunk in test_support::chunks(&output, sizes) {
@@ -1446,33 +1453,32 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_frames_in_linear_time() {
-        assert_linear("stream_takes_many_small_frames_in_linear_time", rounds(50_000), |size| {
-            let one = Frame {
-                transaction: 1,
-                unit: 1,
-                pdu: vec![3, 0, 0, 0, 1],
-            }
-            .to_bytes()
-            .unwrap();
-            let stream: Vec<u8> = one
-                .iter()
-                .copied()
-                .cycle()
-                .take(one.len() * size)
-                .collect();
-            let mut d = Stream::new(Frames::<Frame>::new());
-            let mut rest = &stream[..];
-            let mut n = 0;
-            while !rest.is_empty() {
-                rest = &rest[d.push(rest)..];
-                while let Some(f) = d.next() {
-                    f.unwrap();
-                    n += 1;
+        assert_linear(
+            "stream_takes_many_small_frames_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let one = Frame {
+                    transaction: 1,
+                    unit: 1,
+                    pdu: vec![3, 0, 0, 0, 1],
                 }
-            }
-            assert_eq!(n, size);
-            assert_eq!(d.buffered(), 0);
-        });
+                .to_bytes()
+                .unwrap();
+                let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
+                let mut d = Stream::new(Frames::<Frame>::new());
+                let mut rest = &stream[..];
+                let mut n = 0;
+                while !rest.is_empty() {
+                    rest = &rest[d.push(rest)..];
+                    while let Some(f) = d.next() {
+                        f.unwrap();
+                        n += 1;
+                    }
+                }
+                assert_eq!(n, size);
+                assert_eq!(d.buffered(), 0);
+            },
+        );
     }
 
     #[test]
@@ -1661,7 +1667,10 @@ mod tests {
             unit: 1,
             pdu: vec![0x41],
         };
-        assert_eq!(Frame::parse_prefix(&one.to_bytes().unwrap()), Ok(Some((one, 8))));
+        assert_eq!(
+            Frame::parse_prefix(&one.to_bytes().unwrap()),
+            Ok(Some((one, 8)))
+        );
     }
 
     #[test]
@@ -1722,8 +1731,14 @@ mod tests {
         regs.resize(254, 0);
         assert_eq!(Response::parse(&regs), Err(Error::BadResponse));
         // Write acknowledgements of 0, too many, or past address 65535.
-        assert_eq!(Response::parse(&[0x10, 0, 0, 0, 0]), Err(Error::BadResponse));
-        assert_eq!(Response::parse(&[0x10, 0, 0, 0, 124]), Err(Error::BadResponse));
+        assert_eq!(
+            Response::parse(&[0x10, 0, 0, 0, 0]),
+            Err(Error::BadResponse)
+        );
+        assert_eq!(
+            Response::parse(&[0x10, 0, 0, 0, 124]),
+            Err(Error::BadResponse)
+        );
         assert_eq!(
             Response::parse(&[0x0f, 0, 0, 0x07, 0xb1]),
             Err(Error::BadResponse)
@@ -1742,10 +1757,7 @@ mod tests {
             Err(Error::Quantity)
         );
         assert_eq!(Response::Bits(vec![]).to_pdu(1), Err(Error::Quantity));
-        assert_eq!(
-            Response::Registers(vec![]).to_pdu(3),
-            Err(Error::Quantity)
-        );
+        assert_eq!(Response::Registers(vec![]).to_pdu(3), Err(Error::Quantity));
         assert_eq!(
             Response::WriteMultiple {
                 address: 0,
@@ -1770,10 +1782,7 @@ mod tests {
             .to_pdu(15),
             Err(Error::Address)
         );
-        assert_eq!(
-            Response::Other(vec![1]).to_pdu(0),
-            Err(Error::Function(0))
-        );
+        assert_eq!(Response::Other(vec![1]).to_pdu(0), Err(Error::Function(0)));
         let pdu = Response::Bits(vec![true; 2000]).to_pdu(2).unwrap();
         assert_eq!(
             Response::parse(&pdu),

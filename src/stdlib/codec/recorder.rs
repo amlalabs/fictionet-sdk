@@ -244,7 +244,8 @@ mod tests {
     #[test]
     fn empty_skips_do_not_evict_real_entries() {
         let mut log = Recorder::<(), core::convert::Infallible>::new(1, 4);
-        assert!(log.observe_tagged(0,
+        assert!(log.observe_tagged(
+            0,
             Direction::ClientToServer,
             StreamEvent::Skipped {
                 bytes: b"data",
@@ -252,7 +253,8 @@ mod tests {
             }
         ));
         for _ in 0..1000 {
-            assert!(!log.observe_tagged(0,
+            assert!(!log.observe_tagged(
+                0,
                 Direction::ClientToServer,
                 StreamEvent::Skipped {
                     bytes: b"",
@@ -269,7 +271,8 @@ mod tests {
     fn bounds_drop_oldest_and_truncate_oversized_incoming() {
         let mut log = Recorder::<u8, core::convert::Infallible>::new(2, 3);
         for i in 0..3u8 {
-            assert!(log.observe_tagged(0,
+            assert!(log.observe_tagged(
+                0,
                 Direction::ClientToServer,
                 StreamEvent::Item {
                     item: &i,
@@ -280,7 +283,8 @@ mod tests {
         }
         assert_eq!(log.len(), 2);
         assert_eq!(log.dropped(), 1);
-        assert!(log.observe_tagged(0,
+        assert!(log.observe_tagged(
+            0,
             Direction::ServerToClient,
             StreamEvent::Skipped {
                 bytes: b"long",
@@ -292,7 +296,8 @@ mod tests {
         assert_eq!(entry.bytes, b"lon");
         assert_eq!(entry.range, 0..4);
         assert!(entry.truncated);
-        assert!(log.observe_tagged(0,
+        assert!(log.observe_tagged(
+            0,
             Direction::ServerToClient,
             StreamEvent::Skipped {
                 bytes: b"abc",
@@ -313,7 +318,8 @@ mod tests {
         let mut log = Recorder::new(32, 32);
         for byte in b"abcdef\nx\n" {
             assert_eq!(stream.push(&[*byte]), 1);
-            while let Some(r) = stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
+            while let Some(r) =
+                stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
             {
                 r.unwrap();
             }
@@ -321,7 +327,8 @@ mod tests {
         stream.end();
         for _ in 0..2 {
             assert!(
-                stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
+                stream
+                    .with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
                     .is_none()
             );
         }
@@ -345,12 +352,14 @@ mod tests {
         assert_eq!(stream.push(b"abc"), 3);
         stream.end();
         assert!(
-            stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ServerToClient))
+            stream
+                .with_next_observed(|_, _, _| (), log.observer(0, Direction::ServerToClient))
                 .unwrap()
                 .is_err()
         );
         assert!(
-            stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ServerToClient))
+            stream
+                .with_next_observed(|_, _, _| (), log.observer(0, Direction::ServerToClient))
                 .is_none()
         );
         let entry = log.iter().next().unwrap();
@@ -367,7 +376,8 @@ mod tests {
         let mut stream = Stream::new(json::Values::new());
         let mut log = Recorder::new(0, 0);
         assert!(
-            stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
+            stream
+                .with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
                 .is_none()
         );
         assert_eq!(log.dropped(), 0);
@@ -375,7 +385,11 @@ mod tests {
         stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer));
         assert_eq!(log.dropped(), 1);
         let mut log = Recorder::<(), core::convert::Infallible>::new(1, 0);
-        assert!(log.observe_tagged(0, Direction::ClientToServer, StreamEvent::Ended { offset: 0 }));
+        assert!(log.observe_tagged(
+            0,
+            Direction::ClientToServer,
+            StreamEvent::Ended { offset: 0 }
+        ));
         assert_eq!(log.retained_bytes(), 0);
         assert_eq!(log.len(), 1);
     }

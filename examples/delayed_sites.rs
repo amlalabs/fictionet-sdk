@@ -7,13 +7,21 @@ use fictionet::stdlib::{self, web};
 use fictionet::time::ms;
 
 fn main() -> fictionet::Result {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/run/fictionet/world.sock".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/run/fictionet/world.sock".into());
     let (attacher, attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(path.clone().into()), attacher)?;
+    let _listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(path.clone().into()),
+        attacher,
+    )?;
     println!("listening on {path}");
 
     fictionet::block_on(fictionet::run(|fcx| async move {
-        let app = axum::Router::new().route("/", axum::routing::get(|| async { "hello from far away\n" }));
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(|| async { "hello from far away\n" }),
+        );
 
         // Every sandbox, as it attaches, gets a 200 ms delay each way.
         let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));

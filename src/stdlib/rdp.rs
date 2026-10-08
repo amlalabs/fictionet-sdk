@@ -46,15 +46,12 @@
 //! assert_eq!(request.to_packet().unwrap().to_bytes().unwrap(), bytes);
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Reader, Truncated, Trailing};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::{Reader, Trailing, Truncated};
 
-use fictionet::stdlib::{
-    codec::{Wire},
-    cotp, tpkt,
-};
+use fictionet::stdlib::{codec::Wire, cotp, tpkt};
 
 /// The usual RDP TCP port.
 pub const PORT: u16 = 3389;
@@ -191,7 +188,9 @@ trait ReadFields<'a> {
 impl<'a> ReadFields<'a> for Reader<'a> {
     #[inline]
     fn field_bytes(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        self.position().checked_add(n).ok_or(Error::Limit("length"))?;
+        self.position()
+            .checked_add(n)
+            .ok_or(Error::Limit("length"))?;
         self.take(n).map_err(Error::from)
     }
 
@@ -321,7 +320,10 @@ impl Write {
         Ok(())
     }
     fn block(&mut self, kind: u16, body: &[u8]) -> Result<(), Error> {
-        let length = body.len().checked_add(4).ok_or(Error::Limit("16-bit length"))?;
+        let length = body
+            .len()
+            .checked_add(4)
+            .ok_or(Error::Limit("16-bit length"))?;
         self.le16(kind)?;
         self.le16(u16_len(length)?)?;
         self.put(body)
@@ -520,11 +522,13 @@ impl Prefixed for Frame {
     /// Returns [`Error::Invalid`] for bad fast-path action bits or lengths,
     /// and [`Error::Tpkt`] for invalid TPKT headers.
     #[inline]
-    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        _limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         Frame::parse_prefix(input)
     }
 }
-
 
 /// Extracts the bytes of an unsegmented RDP X.224 Data TPDU using COTP.
 /// Use the sibling COTP reassembler yourself for non-RDP segmented traffic.
@@ -680,7 +684,8 @@ impl Connection {
             && r.clone().rest().first() != Some(&1)
         {
             let end = r
-                .clone().rest()
+                .clone()
+                .rest()
                 .windows(2)
                 .position(|x| x == b"\r\n")
                 .ok_or(Error::Invalid("routing token terminator"))?
@@ -1261,7 +1266,6 @@ pub struct SecurityPayload {
     pub data: Vec<u8>,
 }
 impl SecurityPayload {
-
     /// Returns plaintext bytes, or refuses an encrypted, redirection or
     /// security-exchange payload. Decryption is the caller's responsibility.
     pub fn plaintext(&self) -> Result<&[u8], Error> {
@@ -1646,7 +1650,10 @@ impl Wire for DataBlock {
                     let cert_len = size(r.u32_le()?)?;
                     check(random_len == SERVER_RANDOM_LEN, "server random length")?;
                     bound(cert_len, MAX_GCC_DATA, "certificate")?;
-                    (r.field_bytes(random_len)?.to_vec(), r.field_bytes(cert_len)?.to_vec())
+                    (
+                        r.field_bytes(random_len)?.to_vec(),
+                        r.field_bytes(cert_len)?.to_vec(),
+                    )
                 };
                 Self::ServerSecurity {
                     encryption_method,
@@ -2067,7 +2074,11 @@ impl Wire for McsPdu {
                 result: r.mcs_result(tag)?,
                 initiator: r.user_id()?,
                 requested: r.u16_be()?,
-                channel_id: if tag & 2 != 0 { Some(r.u16_be()?) } else { None },
+                channel_id: if tag & 2 != 0 {
+                    Some(r.u16_be()?)
+                } else {
+                    None
+                },
             },
             0x64 | 0x68 => {
                 let initiator = r.user_id()?;
@@ -2204,7 +2215,13 @@ impl Wire for ClientInfo {
         let flags = r.u32_le()?;
         check(flags & INFO_RESERVED == 0, "reserved info flags")?;
         let unicode = flags & INFO_UNICODE != 0;
-        let lengths = [r.u16_le()?, r.u16_le()?, r.u16_le()?, r.u16_le()?, r.u16_le()?];
+        let lengths = [
+            r.u16_le()?,
+            r.u16_le()?,
+            r.u16_le()?,
+            r.u16_le()?,
+            r.u16_le()?,
+        ];
         let mut strings = lengths.into_iter().map(|n| {
             let n = usize::from(n);
             bound(n + 1 + usize::from(unicode), MAX_INFO_STRING, "info string")?;
@@ -2285,7 +2302,10 @@ impl Wire for LicenseError {
         r.expect(&[0xff])?;
         let flags = r.u8()?;
         check(matches!(flags & 0x7f, 2 | 3), "license preamble flags")?;
-        check(usize::from(r.u16_le()?) == b.len(), "license message length")?;
+        check(
+            usize::from(r.u16_le()?) == b.len(),
+            "license message length",
+        )?;
         let error_code = r.u32_le()?;
         let state_transition = r.u32_le()?;
         let blob_type = r.u16_le()?;
@@ -2467,20 +2487,26 @@ impl Wire for ActivePdu {
 
 impl From<Truncated> for Error {
     #[inline]
-    fn from(_: Truncated) -> Self { Error::Truncated }
+    fn from(_: Truncated) -> Self {
+        Error::Truncated
+    }
 }
 
 impl From<Trailing> for Error {
     #[inline]
-    fn from(_: Trailing) -> Self { Error::Invalid("trailing bytes") }
+    fn from(_: Trailing) -> Self {
+        Error::Invalid("trailing bytes")
+    }
 }
 
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
 pub mod harness {
-    use super::{ActivePdu, CapabilitySet, ClientInfo, DataBlock, DataBlocks, GccConference,
-        LicenseError, MAX_GCC_DATA, MAX_PDU, McsConnect, McsPdu, Negotiation, SecurityPayload};
+    use super::{
+        ActivePdu, CapabilitySet, ClientInfo, DataBlock, DataBlocks, GccConference, LicenseError,
+        MAX_GCC_DATA, MAX_PDU, McsConnect, McsPdu, Negotiation, SecurityPayload,
+    };
     use fictionet::stdlib::codec::Wire;
     use fictionet::stdlib::test_support::contract;
 
@@ -2522,20 +2548,23 @@ mod tests {
     fn field_length_overflow_keeps_its_error() {
         let mut r = super::Reader::new(&[1, 2]);
         r.skip(1).unwrap();
-        assert_eq!(super::ReadFields::field_bytes(&mut r, usize::MAX), Err(super::Error::Limit("length")));
+        assert_eq!(
+            super::ReadFields::field_bytes(&mut r, usize::MAX),
+            Err(super::Error::Limit("length"))
+        );
         assert_eq!(r.position(), 1);
-        assert_eq!(super::ReadFields::field_bytes(&mut r, 2), Err(super::Error::Truncated));
+        assert_eq!(
+            super::ReadFields::field_bytes(&mut r, 2),
+            Err(super::Error::Truncated)
+        );
         assert_eq!(r.position(), 1);
     }
 
     use super::*;
-    use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, pump,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::{self, decode_all};
-
 
     // MS-RDPBCGR 4.1.3, complete 416-byte Connect Initial dump.
     fn initial_example() -> Vec<u8> {
@@ -2796,7 +2825,10 @@ mod tests {
         if let Ok(Some((f, n))) = Frame::parse_prefix(b) {
             assert!(n <= b.len());
             let bytes = f.to_bytes().unwrap();
-            assert_eq!(Frame::parse_prefix(&bytes), Ok(Some((f.clone(), bytes.len()))));
+            assert_eq!(
+                Frame::parse_prefix(&bytes),
+                Ok(Some((f.clone(), bytes.len())))
+            );
             if let Frame::SlowPath(p) = f {
                 if let Ok(c) = Connection::from_packet(&p) {
                     assert_eq!(Connection::from_packet(&c.to_packet().unwrap()), Ok(c));

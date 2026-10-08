@@ -1,16 +1,14 @@
 //! IPP heads, documents, and attribute values.
 #![no_main]
 
-use fictionet::stdlib::codec::{
-    Decode, Fail, Step, Stream, Wire,
-};
+use fictionet::stdlib::codec::{Decode, Fail, Step, Stream, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::ipp::{
-    Attribute, Error, FrameError, Head, Header, MAX_DOCUMENT, MAX_FIELD, MAX_HEAD, Message,
-    Value, tag,
+    Attribute, Error, FrameError, Head, Header, MAX_DOCUMENT, MAX_FIELD, MAX_HEAD, Message, Value,
+    tag,
 };
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -51,7 +49,13 @@ fuzz_target!(|data: &[u8]| {
             let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
             assert_eq!(
                 (items, failure),
-                (vec![Err(Error::BadRequest { request_id, error: Box::new(error) })], None)
+                (
+                    vec![Err(Error::BadRequest {
+                        request_id,
+                        error: Box::new(error)
+                    })],
+                    None
+                )
             );
         }
     }

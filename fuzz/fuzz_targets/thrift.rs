@@ -11,14 +11,34 @@ use fictionet::stdlib::thrift::{
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(EncodedMessages::new, data, 2 * EncodedMessages::new().capacity());
-    contract::check_decode_with_held_limit(EncodedMessages::new, data, EncodedMessages::new().held());
-    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * Frames::<Frame>::new().capacity());
+    contract::check_decode_with_alloc_limit(
+        EncodedMessages::new,
+        data,
+        2 * EncodedMessages::new().capacity(),
+    );
+    contract::check_decode_with_held_limit(
+        EncodedMessages::new,
+        data,
+        EncodedMessages::new().held(),
+    );
+    contract::check_decode_with_alloc_limit(
+        Frames::<Frame>::new,
+        data,
+        2 * Frames::<Frame>::new().capacity(),
+    );
     let limit = usize::from(data.first().copied().unwrap_or(0));
-    contract::check_decode_with_alloc_limit(|| Frames::<Frame>::with_limit(limit), data, 2 * Frames::<Frame>::with_limit(limit).capacity());
+    contract::check_decode_with_alloc_limit(
+        || Frames::<Frame>::with_limit(limit),
+        data,
+        2 * Frames::<Frame>::with_limit(limit).capacity(),
+    );
     contract::check_wire::<Frame>(data);
     contract::check_wire::<EncodedMessage>(data);
-    contract::check_decode_with_alloc_limit(|| Frames::<Frame>::new().map(|frame| EncodedMessage::parse(&frame.0)), data, 2 * Frames::<Frame>::new().capacity());
+    contract::check_decode_with_alloc_limit(
+        || Frames::<Frame>::new().map(|frame| EncodedMessage::parse(&frame.0)),
+        data,
+        2 * Frames::<Frame>::new().capacity(),
+    );
     contract::check_wire_value(&Frame(data.iter().take(MAX_FRAME + 1).copied().collect()));
     for frame in decode_all(Frames::<Frame>::new, data).0 {
         contract::check_wire_value(&frame);
@@ -46,7 +66,8 @@ fuzz_target!(|data: &[u8]| {
             let expected = EncodedMessage::parse(rest).unwrap_err();
             // An exact read checks the total length before the header. The
             // stream can report a malformed prefix before reaching that limit.
-            if rest.len() <= MAX_MESSAGE && !matches!(expected, Error::Truncated | Error::Trailing) {
+            if rest.len() <= MAX_MESSAGE && !matches!(expected, Error::Truncated | Error::Trailing)
+            {
                 assert_eq!(*error, expected);
             }
         }

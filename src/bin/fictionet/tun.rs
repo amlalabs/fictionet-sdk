@@ -20,7 +20,10 @@ pub(crate) fn run(args: AttachArgs) -> Result<(), Failure> {
     // Enter the sandbox's namespace first, so the device is made there.
     // This must happen while the process has one thread.
     if let Some(netns) = &args.netns {
-        enter_netns(netns).map_err(err(&format!("entering the network namespace {}", netns.display())))?;
+        enter_netns(netns).map_err(err(&format!(
+            "entering the network namespace {}",
+            netns.display()
+        )))?;
     }
 
     for link in &args.down_links {
@@ -62,7 +65,10 @@ pub(crate) fn run(args: AttachArgs) -> Result<(), Failure> {
         Ok(stats) => {
             eprintln!("fictionet attach: the world closed the connection; {dev} removed");
             if stats.dropped > 0 {
-                eprintln!("fictionet attach: {} packets dropped on full buffers", stats.dropped);
+                eprintln!(
+                    "fictionet attach: {} packets dropped on full buffers",
+                    stats.dropped
+                );
             }
             Ok(())
         }
@@ -95,8 +101,17 @@ pub(crate) fn open_tun_file() -> Result<OwnedFd, Failure> {
     let open = || {
         let path = c"/dev/net/tun";
         // SAFETY: plain syscall; the fd is owned from here.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK) };
-        if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
     };
     let blocked = |e: io::Error| {
         Failure::Error(format!(
@@ -145,7 +160,9 @@ fn make_tun_node() -> io::Result<()> {
 /// (`tun0`, `tun1`, ...). The device is removed when the fd is closed.
 fn open_tun() -> Result<(OwnedFd, String), Failure> {
     let fd = open_tun_file()?;
-    make_tun_device(fd).map_err(err("creating the tun device (does attach have CAP_NET_ADMIN?)"))
+    make_tun_device(fd).map_err(err(
+        "creating the tun device (does attach have CAP_NET_ADMIN?)",
+    ))
 }
 
 fn make_tun_device(fd: OwnedFd) -> io::Result<(OwnedFd, String)> {
@@ -179,7 +196,9 @@ fn make_tun_device(fd: OwnedFd) -> io::Result<(OwnedFd, String)> {
 fn take_down(link: &str) -> io::Result<()> {
     let index = index_of(link).map_err(|e| context(e, "no such link"))?;
     let nl = Netlink::open()?;
-    let routes = nl.dump(netlink::dump_routes()).map_err(|e| context(e, "listing the routes"))?;
+    let routes = nl
+        .dump(netlink::dump_routes())
+        .map_err(|e| context(e, "listing the routes"))?;
     for route in routes.iter().filter_map(|m| netlink::Route::parse(m)) {
         if route.oif != Some(index) {
             continue;
@@ -188,10 +207,17 @@ fn take_down(link: &str) -> io::Result<()> {
             Ok(()) => {}
             // Gone already: deleting an earlier one took it too.
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
-            Err(e) => return Err(context(e, &format!("deleting the route {}", route.describe()))),
+            Err(e) => {
+                return Err(context(
+                    e,
+                    &format!("deleting the route {}", route.describe()),
+                ));
+            }
         }
     }
-    let addresses = nl.dump(netlink::dump_addresses()).map_err(|e| context(e, "listing the addresses"))?;
+    let addresses = nl
+        .dump(netlink::dump_addresses())
+        .map_err(|e| context(e, "listing the addresses"))?;
     for address in addresses.iter().filter_map(|m| netlink::Address::parse(m)) {
         if address.index != index {
             continue;
@@ -200,12 +226,16 @@ fn take_down(link: &str) -> io::Result<()> {
             Ok(()) => {}
             Err(e) if matches!(e.raw_os_error(), Some(libc::EADDRNOTAVAIL | libc::ESRCH)) => {}
             Err(e) => {
-                let what = address.addr.map(|a| a.to_string()).unwrap_or_else(|| "an address".into());
+                let what = address
+                    .addr
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "an address".into());
                 return Err(context(e, &format!("deleting the address {what}")));
             }
         }
     }
-    nl.call(netlink::link_down(index)).map_err(|e| context(e, "setting it down"))?;
+    nl.call(netlink::link_down(index))
+        .map_err(|e| context(e, "setting it down"))?;
     Ok(())
 }
 
@@ -213,7 +243,11 @@ pub(crate) fn index_of(dev: &str) -> io::Result<u32> {
     let c = std::ffi::CString::new(dev).unwrap();
     // SAFETY: `c` is a valid C string.
     let index = unsafe { libc::if_nametoindex(c.as_ptr()) };
-    if index == 0 { Err(io::Error::last_os_error()) } else { Ok(index) }
+    if index == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(index)
+    }
 }
 
 /// Sets the MTU, addresses and default routes, and brings the device up.
@@ -226,7 +260,8 @@ fn configure(args: &AttachArgs, dev: &str) -> io::Result<()> {
         // device), and then there is no link-local address anyway.
         let _ = nl.call(netlink::no_ipv6_link_local(index));
     }
-    nl.call(netlink::link_up(index, args.mtu as u32)).map_err(|e| context(e, "bringing the device up"))?;
+    nl.call(netlink::link_up(index, args.mtu as u32))
+        .map_err(|e| context(e, "bringing the device up"))?;
     if let Some(a) = args.ip_addr.value() {
         nl.call(netlink::add_address(index, IpAddr::V4(a.addr), a.prefix))
             .map_err(|e| context(e, "adding the IPv4 address"))?;
@@ -237,10 +272,12 @@ fn configure(args: &AttachArgs, dev: &str) -> io::Result<()> {
         })?;
     }
     if let Some(gw) = args.gateway.value() {
-        nl.call(netlink::add_default_route(index, IpAddr::V4(*gw))).map_err(|e| default_route_error(e, "IPv4"))?;
+        nl.call(netlink::add_default_route(index, IpAddr::V4(*gw)))
+            .map_err(|e| default_route_error(e, "IPv4"))?;
     }
     if let Some(gw) = args.gateway_v6.value() {
-        nl.call(netlink::add_default_route(index, IpAddr::V6(*gw))).map_err(|e| default_route_error(e, "IPv6"))?;
+        nl.call(netlink::add_default_route(index, IpAddr::V6(*gw)))
+            .map_err(|e| default_route_error(e, "IPv6"))?;
     }
     Ok(())
 }
@@ -317,8 +354,16 @@ fn relay_packets(tun: RawFd, sock: RawFd) -> Result<Stats, Failure> {
     let mut from_world = vec![0u8; relay::MAX_MESSAGE + 1];
     loop {
         let mut fds = [
-            libc::pollfd { fd: tun, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: sock, events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: tun,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: sock,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         // SAFETY: `fds` is valid for the call.
         let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
@@ -364,11 +409,17 @@ fn relay_packets(tun: RawFd, sock: RawFd) -> Result<Stats, Failure> {
                 let packet = &from_tun[..n as usize];
                 match unix::send_parts(sock, &[&[relay::PACKET], packet], true) {
                     Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.raw_os_error() == Some(libc::ENOBUFS) => {
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.raw_os_error() == Some(libc::ENOBUFS) =>
+                    {
                         stats.dropped += 1;
                     }
                     Err(e)
-                        if matches!(e.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset) =>
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                        ) =>
                     {
                         return Ok(stats);
                     }
@@ -394,7 +445,10 @@ mod tests {
     /// left alone.
     #[test]
     fn resolv_conf_is_never_written_through_a_symlink() {
-        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!("fn-resolv-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let target = dir.join("shadow");
@@ -407,7 +461,11 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep\n");
         // A plain file is rewritten in place.
         let plain = dir.join("plain.conf");
-        fs::write(&plain, "an older and longer file than the new one\n".repeat(4)).unwrap();
+        fs::write(
+            &plain,
+            "an older and longer file than the new one\n".repeat(4),
+        )
+        .unwrap();
         write_resolv_conf(&plain, &servers).unwrap();
         assert_eq!(fs::read_to_string(&plain).unwrap(), resolv_conf(&servers));
         fs::remove_dir_all(&dir).unwrap();
@@ -416,7 +474,10 @@ mod tests {
     #[test]
     fn resolv_conf_lists_servers_in_order() {
         let s = resolv_conf(&["10.0.0.1".parse().unwrap(), "fd00::1".parse().unwrap()]);
-        assert_eq!(s, "# Written by attach.\nnameserver 10.0.0.1\nnameserver fd00::1\n");
+        assert_eq!(
+            s,
+            "# Written by attach.\nnameserver 10.0.0.1\nnameserver fd00::1\n"
+        );
         assert_eq!(resolv_conf(&[]), "# Written by attach.\n");
     }
 
@@ -426,16 +487,25 @@ mod tests {
                     --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6";
         let mut v: Vec<String> = line.split_whitespace().map(String::from).collect();
         let a = parse_run(&v);
-        assert_eq!(resolv_conf_path(&a), Some(PathBuf::from("/etc/resolv.conf")));
+        assert_eq!(
+            resolv_conf_path(&a),
+            Some(PathBuf::from("/etc/resolv.conf"))
+        );
         v.extend(["--netns".into(), "/run/netns/abc".into()]);
         let a = parse_run(&v);
-        assert_eq!(resolv_conf_path(&a), Some(PathBuf::from("/etc/netns/abc/resolv.conf")));
+        assert_eq!(
+            resolv_conf_path(&a),
+            Some(PathBuf::from("/etc/netns/abc/resolv.conf"))
+        );
 
         // --resolv-conf wins, with or without --netns.
         let mut w = v.clone();
         w.extend(["--resolv-conf".into(), "/run/agent/resolv.conf".into()]);
         let a = parse_run(&w);
-        assert_eq!(resolv_conf_path(&a), Some(PathBuf::from("/run/agent/resolv.conf")));
+        assert_eq!(
+            resolv_conf_path(&a),
+            Some(PathBuf::from("/run/agent/resolv.conf"))
+        );
 
         // --no-resolv-conf: no file at all.
         v.push("--no-resolv-conf".into());
@@ -449,7 +519,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("a/b/resolv.conf");
         write_resolv_conf(&path, &["10.0.0.1".parse().unwrap()]).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "# Written by attach.\nnameserver 10.0.0.1\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# Written by attach.\nnameserver 10.0.0.1\n"
+        );
 
         // A second write keeps the same file (the same inode), as a bind
         // mount of it needs.

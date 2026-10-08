@@ -3,7 +3,10 @@
 //! request, read from a stream in pieces of any size.
 #![no_main]
 
-use fictionet::stdlib::{test_support::contract, socks::{ClientMessages, Greeting, AuthRequest, Request, MAX_MESSAGE}};
+use fictionet::stdlib::{
+    socks::{AuthRequest, ClientMessages, Greeting, MAX_MESSAGE, Request},
+    test_support::contract,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: fictionet_fuzz::doors::Input| {

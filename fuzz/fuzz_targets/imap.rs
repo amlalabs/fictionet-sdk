@@ -4,11 +4,11 @@
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::imap::{
-    Command, Error, FrameError, Input, Inputs, MAX_HELD, MAX_LINE, MAX_LITERAL, MAX_TEXT,
-    Response, Responses, Value,
+    Command, Error, FrameError, Input, Inputs, MAX_HELD, MAX_LINE, MAX_LITERAL, MAX_TEXT, Response,
+    Responses, Value,
 };
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 struct Refusals<'a> {

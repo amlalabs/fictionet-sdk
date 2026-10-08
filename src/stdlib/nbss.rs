@@ -75,11 +75,13 @@
 //! assert_eq!(reply.to_bytes().unwrap(), [0x82, 0x00, 0x00, 0x00]);
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::nbns::{NAME_LEN, ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, encode_first_level, decode_first_level};
-use fictionet::stdlib::codec::{Wire};
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::nbns::{
+    ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level, encode_first_level,
+};
 
 /// The TCP port the session service listens on.
 pub const PORT: u16 = 139;
@@ -147,7 +149,10 @@ impl Name {
             *slot = b.to_ascii_uppercase();
         }
         bytes[NAME_LEN - 1] = suffix;
-        Name { bytes, scope: Vec::new() }
+        Name {
+            bytes,
+            scope: Vec::new(),
+        }
     }
 
     /// The name's characters: its first 15 bytes, without the spaces that
@@ -203,7 +208,9 @@ impl Wire for Name {
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let (name, used) = Self::read_prefix(bytes).ok_or(Error::Name)?;
         if used != bytes.len() {
-            return Err(Error::Trailing { remaining: bytes.len() - used });
+            return Err(Error::Trailing {
+                remaining: bytes.len() - used,
+            });
         }
         Ok(name)
     }
@@ -217,7 +224,10 @@ impl Wire for Name {
         out.extend_from_slice(&encode_first_level(&self.bytes));
         for label in &self.scope {
             // The label, its length byte, and the zero byte at the end.
-            if label.is_empty() || label.len() > MAX_LABEL || out.len() + 1 + label.len() + 1 > MAX_NAME_LEN {
+            if label.is_empty()
+                || label.len() > MAX_LABEL
+                || out.len() + 1 + label.len() + 1 > MAX_NAME_LEN
+            {
                 return Err(Error::Unwritable);
             }
             out.push(label.len() as u8);
@@ -376,7 +386,9 @@ impl Wire for Packet {
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         match parse_limited(bytes, MAX_LENGTH)? {
             Some((packet, used)) if used == bytes.len() => Ok(packet),
-            Some((_, used)) => Err(Error::Trailing { remaining: bytes.len() - used }),
+            Some((_, used)) => Err(Error::Trailing {
+                remaining: bytes.len() - used,
+            }),
             None => Err(Error::Incomplete),
         }
     }
@@ -415,7 +427,11 @@ impl Wire for Packet {
         };
         out.push(self.kind());
         // The body is at most MAX_LENGTH, which fits in 17 bits.
-        let flags = if body.len() > 0xffff { flags::EXTEND } else { 0 };
+        let flags = if body.len() > 0xffff {
+            flags::EXTEND
+        } else {
+            0
+        };
         out.push(flags);
         out.extend_from_slice(&((body.len() & 0xffff) as u16).to_be_bytes());
         out.extend_from_slice(body);
@@ -451,10 +467,14 @@ impl Prefixed for Packet {
     const NAME: &'static str = "NBSS";
 
     #[inline]
-    fn default_limit() -> Self::Limit { MAX_LENGTH }
+    fn default_limit() -> Self::Limit {
+        MAX_LENGTH
+    }
 
     #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_LENGTH) }
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_LENGTH)
+    }
 
     #[inline]
     fn capacity(limit: &Self::Limit) -> usize {
@@ -463,19 +483,26 @@ impl Prefixed for Packet {
     }
 
     #[inline]
-    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
         parse_limited(input, limit)
     }
 }
-
 
 /// Reads one packet whose body may be at most `limit` bytes.
 fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Error> {
     let Some(&t) = b.first() else { return Ok(None) };
     if !matches!(
         t,
-        kind::MESSAGE | kind::REQUEST | kind::POSITIVE | kind::NEGATIVE | kind::RETARGET | kind::KEEP_ALIVE
+        kind::MESSAGE
+            | kind::REQUEST
+            | kind::POSITIVE
+            | kind::NEGATIVE
+            | kind::RETARGET
+            | kind::KEEP_ALIVE
     ) {
         return Err(Error::Type(t));
     }
@@ -483,7 +510,9 @@ fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Erro
     if f & flags::RESERVED != 0 {
         return Err(Error::Flags(f));
     }
-    let (Some(&hi), Some(&lo)) = (b.get(2), b.get(3)) else { return Ok(None) };
+    let (Some(&hi), Some(&lo)) = (b.get(2), b.get(3)) else {
+        return Ok(None);
+    };
     let length = u32::from(f & flags::EXTEND) << 16 | u32::from(hi) << 8 | u32::from(lo);
     let len = length as usize;
     if len > limit.min(MAX_LENGTH) {
@@ -495,14 +524,18 @@ fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Erro
         kind::NEGATIVE => Some(1),
         kind::RETARGET => Some(RETARGET_LEN),
         // Two names, each at least 34 bytes and at most MAX_NAME_LEN.
-        kind::REQUEST if !(2 * (ENCODED_LEN + 2)..=2 * MAX_NAME_LEN).contains(&len) => return Err(Error::Body(t)),
+        kind::REQUEST if !(2 * (ENCODED_LEN + 2)..=2 * MAX_NAME_LEN).contains(&len) => {
+            return Err(Error::Body(t));
+        }
         _ => None,
     };
     if fixed.is_some_and(|n| n != len) {
         return Err(Error::Body(t));
     }
     let end = HEADER_LEN + len;
-    let Some(body) = b.get(HEADER_LEN..end) else { return Ok(None) };
+    let Some(body) = b.get(HEADER_LEN..end) else {
+        return Ok(None);
+    };
     let packet = match t {
         kind::MESSAGE => Packet::Message(body.to_vec()),
         kind::REQUEST => {
@@ -527,19 +560,20 @@ fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Erro
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+    use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// "FRED" padded with spaces, from RFC 1002, section 4.1.
     const FRED: &[u8; 32] = b"EGFCEFEECACACACACACACACACACACACA";
 
     fn fred() -> Name {
-        Name { bytes: *b"FRED            ", scope: Vec::new() }
+        Name {
+            bytes: *b"FRED            ",
+            scope: Vec::new(),
+        }
     }
 
     #[test]
@@ -548,12 +582,23 @@ mod tests {
         assert_eq!(decode_first_level(FRED), Some(fred().bytes));
         // Name::new pads the same way, with suffix 0x20, a space.
         assert_eq!(Name::new("Fred", b' '), fred());
-        assert_eq!(decode_first_level(b"EGFCEFEECACACACACACACACACACACACQ"), None);
-        assert_eq!(decode_first_level(b"egfcefeecacacacacacacacacacacaca"), None);
+        assert_eq!(
+            decode_first_level(b"EGFCEFEECACACACACACACACACACACACQ"),
+            None
+        );
+        assert_eq!(
+            decode_first_level(b"egfcefeecacacacacacacacacacacaca"),
+            None
+        );
         assert_eq!(decode_first_level(&FRED[..30]), None);
         for b in 0..=255u8 {
             let name = [b; NAME_LEN];
-            let bytes = Name { bytes: name, scope: vec![] }.to_bytes().unwrap();
+            let bytes = Name {
+                bytes: name,
+                scope: vec![],
+            }
+            .to_bytes()
+            .unwrap();
             assert_eq!(decode_first_level(&bytes[1..33]), Some(name));
         }
     }
@@ -561,7 +606,10 @@ mod tests {
     #[test]
     fn name_with_scope_example() {
         // FRED.NETBIOS.COM, from RFC 1002, section 4.1.
-        let name = Name { scope: vec![b"NETBIOS".to_vec(), b"COM".to_vec()], ..fred() };
+        let name = Name {
+            scope: vec![b"NETBIOS".to_vec(), b"COM".to_vec()],
+            ..fred()
+        };
         let mut want = vec![0x20];
         want.extend_from_slice(FRED);
         want.extend_from_slice(b"\x07NETBIOS\x03COM\x00");
@@ -595,7 +643,12 @@ mod tests {
     #[test]
     fn longest_name() {
         // Three 63-byte labels and one of 28 make exactly MAX_NAME_LEN.
-        let scope = vec![vec![b'A'; 63], vec![b'B'; 63], vec![b'C'; 63], vec![b'D'; 28]];
+        let scope = vec![
+            vec![b'A'; 63],
+            vec![b'B'; 63],
+            vec![b'C'; 63],
+            vec![b'D'; 28],
+        ];
         let name = Name { scope, ..fred() };
         let bytes = name.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_NAME_LEN);
@@ -613,7 +666,10 @@ mod tests {
         assert_eq!(over.to_bytes(), Err(Error::Unwritable));
         // Two of the longest names make the longest request.
         let full = Name::parse(&bytes).unwrap();
-        let req = Packet::Request { called: full.clone(), calling: full };
+        let req = Packet::Request {
+            called: full.clone(),
+            calling: full,
+        };
         let wire = req.to_bytes().unwrap();
         assert_eq!(wire.len(), HEADER_LEN + 2 * MAX_NAME_LEN);
         assert_eq!(Packet::parse(&wire), Ok(req));
@@ -624,7 +680,10 @@ mod tests {
         // Other holding a named code would read back as the named variant,
         // so the writer refuses it.
         for c in [0x80, 0x81, 0x82, 0x83, 0x8f] {
-            assert_eq!(Packet::Negative(NegativeCode::Other(c)).to_bytes(), Err(Error::Unwritable));
+            assert_eq!(
+                Packet::Negative(NegativeCode::Other(c)).to_bytes(),
+                Err(Error::Unwritable)
+            );
         }
         // Every value from_code gives writes and reads back the same.
         for c in 0..=255u8 {
@@ -644,7 +703,8 @@ mod tests {
         assert_eq!(stream.next(), Some(Ok(request())));
         let set: std::collections::HashSet<_> = [request(), Packet::KeepAlive].into();
         assert!(set.contains(&request()));
-        let errors: std::collections::HashSet<Error> = [Error::Body(0x81), Error::Body(0x81)].into();
+        let errors: std::collections::HashSet<Error> =
+            [Error::Body(0x81), Error::Body(0x81)].into();
         assert_eq!(errors.len(), 1);
     }
 
@@ -656,13 +716,20 @@ mod tests {
         assert_eq!(n.base(), b"ABCDEFGHIJKLMN");
         // A character that fits is kept as its UTF-8 bytes.
         assert_eq!(Name::new("caf\u{e9}", 0x20).base(), "CAF\u{e9}".as_bytes());
-        assert_eq!(Name::new("\u{1f600}\u{1f600}\u{1f600}\u{1f600}", 0).base(), "\u{1f600}\u{1f600}\u{1f600}".as_bytes());
+        assert_eq!(
+            Name::new("\u{1f600}\u{1f600}\u{1f600}\u{1f600}", 0).base(),
+            "\u{1f600}\u{1f600}\u{1f600}".as_bytes()
+        );
     }
 
     #[test]
     fn stream_bounds() {
         let data = [0x85, 0, 0, 0].repeat(1_000);
-        contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(0), &data, 2 * HEADER_LEN);
+        contract::check_decode_with_alloc_limit(
+            || Frames::<Packet>::with_limit(0),
+            &data,
+            2 * HEADER_LEN,
+        );
         let (packets, error) = decode_all(|| Frames::<Packet>::with_limit(0), &data);
         assert_eq!(packets, vec![Packet::KeepAlive; 1_000]);
         assert_eq!(error, None);
@@ -677,7 +744,10 @@ mod tests {
         assert_eq!(n.base(), b"*SMBSERVER");
         assert_eq!(n.suffix(), 0x20);
         assert_eq!(Name::new("", 0).base(), b"");
-        assert_eq!(Name::new("AVERYLONGNAMEINDEED", 3).base(), b"AVERYLONGNAMEIN");
+        assert_eq!(
+            Name::new("AVERYLONGNAMEINDEED", 3).base(),
+            b"AVERYLONGNAMEIN"
+        );
     }
 
     #[test]
@@ -710,25 +780,42 @@ mod tests {
             vec![vec![]],
             vec![b"NETBIOS".to_vec(), vec![]],
             vec![vec![b'A'; 64]],
-            vec![vec![b'A'; 63], vec![b'B'; 63], vec![b'C'; 63], vec![b'D'; 63]],
+            vec![
+                vec![b'A'; 63],
+                vec![b'B'; 63],
+                vec![b'C'; 63],
+                vec![b'D'; 63],
+            ],
         ];
         for scope in bad {
             let name = Name { scope, ..fred() };
             assert_eq!(name.to_bytes(), Err(Error::Unwritable));
-            let req = Packet::Request { called: name.clone(), calling: fred() };
+            let req = Packet::Request {
+                called: name.clone(),
+                calling: fred(),
+            };
             assert_eq!(req.to_bytes(), Err(Error::Unwritable));
-            let req = Packet::Request { called: fred(), calling: name };
+            let req = Packet::Request {
+                called: fred(),
+                calling: name,
+            };
             assert_eq!(req.to_bytes(), Err(Error::Unwritable));
         }
         // The longest label is fine.
-        let name = Name { scope: vec![vec![b'A'; 63]], ..fred() };
+        let name = Name {
+            scope: vec![vec![b'A'; 63]],
+            ..fred()
+        };
         let bytes = name.to_bytes().unwrap();
         assert_eq!(Name::parse(&bytes), Ok(name));
         assert!(!Error::Unwritable.to_string().is_empty());
     }
 
     fn request() -> Packet {
-        Packet::Request { called: Name::new("FILESERVER", 0x20), calling: Name::new("LAPTOP", 0) }
+        Packet::Request {
+            called: Name::new("FILESERVER", 0x20),
+            calling: Name::new("LAPTOP", 0),
+        }
     }
 
     #[test]
@@ -744,7 +831,11 @@ mod tests {
         assert_eq!(&bytes[69..71], b"AA");
         assert_eq!(Packet::parse(&bytes), Ok(request()));
         for n in 0..bytes.len() {
-            assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Incomplete), "{n} bytes");
+            assert_eq!(
+                Packet::parse(&bytes[..n]),
+                Err(Error::Incomplete),
+                "{n} bytes"
+            );
         }
     }
 
@@ -752,14 +843,31 @@ mod tests {
     fn fixed_packets() {
         assert_eq!(Packet::Positive.to_bytes().unwrap(), [0x82, 0, 0, 0]);
         assert_eq!(Packet::KeepAlive.to_bytes().unwrap(), [0x85, 0, 0, 0]);
-        assert_eq!(Packet::Negative(NegativeCode::CalledNameNotPresent).to_bytes().unwrap(), [0x83, 0, 0, 1, 0x82]);
-        let r = Packet::Retarget { address: [10, 0, 0, 7], port: 139 };
+        assert_eq!(
+            Packet::Negative(NegativeCode::CalledNameNotPresent)
+                .to_bytes()
+                .unwrap(),
+            [0x83, 0, 0, 1, 0x82]
+        );
+        let r = Packet::Retarget {
+            address: [10, 0, 0, 7],
+            port: 139,
+        };
         assert_eq!(r.to_bytes().unwrap(), [0x84, 0, 0, 6, 10, 0, 0, 7, 0, 139]);
-        for p in [Packet::Positive, Packet::KeepAlive, Packet::Negative(NegativeCode::Other(0x42)), r] {
+        for p in [
+            Packet::Positive,
+            Packet::KeepAlive,
+            Packet::Negative(NegativeCode::Other(0x42)),
+            r,
+        ] {
             let bytes = p.to_bytes().unwrap();
             assert_eq!(Packet::parse(&bytes), Ok(p));
             for n in 0..bytes.len() {
-                assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Incomplete), "{n} bytes");
+                assert_eq!(
+                    Packet::parse(&bytes[..n]),
+                    Err(Error::Incomplete),
+                    "{n} bytes"
+                );
             }
         }
     }
@@ -770,22 +878,37 @@ mod tests {
             assert_eq!(NegativeCode::from_code(c).code(), c);
         }
         assert_eq!(NegativeCode::from_code(0x8f), NegativeCode::Unspecified);
-        assert_eq!(NegativeCode::from_code(0x80), NegativeCode::NotListeningOnCalledName);
-        assert_eq!(NegativeCode::from_code(0x81), NegativeCode::NotListeningForCallingName);
-        assert_eq!(NegativeCode::from_code(0x83), NegativeCode::InsufficientResources);
+        assert_eq!(
+            NegativeCode::from_code(0x80),
+            NegativeCode::NotListeningOnCalledName
+        );
+        assert_eq!(
+            NegativeCode::from_code(0x81),
+            NegativeCode::NotListeningForCallingName
+        );
+        assert_eq!(
+            NegativeCode::from_code(0x83),
+            NegativeCode::InsufficientResources
+        );
     }
 
     #[test]
     fn messages_and_the_length_extension() {
         let short = Packet::Message(vec![0xfe, b'S', b'M', b'B']);
-        assert_eq!(short.to_bytes().unwrap(), [0, 0, 0, 4, 0xfe, b'S', b'M', b'B']);
+        assert_eq!(
+            short.to_bytes().unwrap(),
+            [0, 0, 0, 4, 0xfe, b'S', b'M', b'B']
+        );
         assert_eq!(Packet::Message(vec![]).to_bytes().unwrap(), [0, 0, 0, 0]);
         // 0x10000 bytes need the 17th bit.
         let long = Packet::Message(vec![7; 0x1_0000]);
         let bytes = long.to_bytes().unwrap();
         assert_eq!(bytes[..4], [0, 1, 0, 0]);
         assert_eq!(Packet::parse(&bytes), Ok(long));
-        assert_eq!(Packet::parse(&bytes[..bytes.len() - 1]), Err(Error::Incomplete));
+        assert_eq!(
+            Packet::parse(&bytes[..bytes.len() - 1]),
+            Err(Error::Incomplete)
+        );
         // The longest message, and one past it, which no packet holds.
         let longest = Packet::Message(vec![1; MAX_LENGTH]);
         let bytes = longest.to_bytes().unwrap();
@@ -813,7 +936,10 @@ mod tests {
         assert_eq!(Packet::parse(&[0x83, 0, 0, 2]), Err(Error::Body(0x83)));
         assert_eq!(Packet::parse(&[0x84, 0, 0, 5]), Err(Error::Body(0x84)));
         assert_eq!(Packet::parse(&[0x81, 0, 0, 67]), Err(Error::Body(0x81)));
-        assert_eq!(Packet::parse(&[0x81, 0, 0x01, 0xff]), Err(Error::Body(0x81)));
+        assert_eq!(
+            Packet::parse(&[0x81, 0, 0x01, 0xff]),
+            Err(Error::Body(0x81))
+        );
         assert_eq!(Packet::parse(&[0x81, 1, 0, 0]), Err(Error::Body(0x81)));
         // A request whose names are bad, known once the body is in.
         let mut bytes = request().to_bytes().unwrap();
@@ -841,9 +967,18 @@ mod tests {
         let make = || Frames::<Packet>::with_limit(10);
         assert_eq!(make().limit(), 10);
         let packet = Packet::Message(vec![1; 10]);
-        assert_eq!(decode_all(make, &packet.to_bytes().unwrap()), (vec![packet], None));
-        assert_eq!(decode_all(make, &[0, 0, 0, 11]).1, Some(Fail::Protocol(Error::TooLong(11))));
-        assert_eq!(decode_all(make, &request().to_bytes().unwrap()[..4]).1, Some(Fail::Protocol(Error::TooLong(68))));
+        assert_eq!(
+            decode_all(make, &packet.to_bytes().unwrap()),
+            (vec![packet], None)
+        );
+        assert_eq!(
+            decode_all(make, &[0, 0, 0, 11]).1,
+            Some(Fail::Protocol(Error::TooLong(11)))
+        );
+        assert_eq!(
+            decode_all(make, &request().to_bytes().unwrap()[..4]).1,
+            Some(Fail::Protocol(Error::TooLong(68)))
+        );
         assert_eq!(Frames::<Packet>::with_limit(usize::MAX).limit(), MAX_LENGTH);
         assert_eq!(Frames::<Packet>::default().limit(), MAX_LENGTH);
     }
@@ -856,22 +991,35 @@ mod tests {
             Packet::Message(b"\xffSMBr".to_vec()),
             Packet::KeepAlive,
             Packet::Message(vec![9; 70_000]),
-            Packet::Retarget { address: [192, 168, 1, 2], port: 1139 },
+            Packet::Retarget {
+                address: [192, 168, 1, 2],
+                port: 1139,
+            },
         ];
         let stream: Vec<u8> = packets.iter().flat_map(|p| p.to_bytes().unwrap()).collect();
         contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &stream, 2 * MAX_PACKET);
-        assert_eq!(decode_all(Frames::<Packet>::new, &stream), (packets.to_vec(), None));
-        assert_eq!(decode_all(Frames::<Packet>::new, &[0x99, 0, 0, 0]).1, Some(Fail::Protocol(Error::Type(0x99))));
+        assert_eq!(
+            decode_all(Frames::<Packet>::new, &stream),
+            (packets.to_vec(), None)
+        );
+        assert_eq!(
+            decode_all(Frames::<Packet>::new, &[0x99, 0, 0, 0]).1,
+            Some(Fail::Protocol(Error::Type(0x99)))
+        );
     }
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
-        assert_linear("stream_takes_many_small_packets_in_linear_time", rounds(50_000), |size| {
-            let bytes = Packet::KeepAlive.to_bytes().unwrap().repeat(size);
-            let (packets, error) = decode_all(Frames::<Packet>::new, &bytes);
-            assert_eq!(packets.len(), size);
-            assert_eq!(error, None);
-        });
+        assert_linear(
+            "stream_takes_many_small_packets_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let bytes = Packet::KeepAlive.to_bytes().unwrap().repeat(size);
+                let (packets, error) = decode_all(Frames::<Packet>::new, &bytes);
+                assert_eq!(packets.len(), size);
+                assert_eq!(error, None);
+            },
+        );
     }
 
     #[test]
@@ -907,7 +1055,10 @@ mod tests {
             if rng.index(8) == 0 {
                 scope.push(Vec::new());
             }
-            let name = Name { bytes: [rng.next() as u8; NAME_LEN], scope };
+            let name = Name {
+                bytes: [rng.next() as u8; NAME_LEN],
+                scope,
+            };
             let fits = name
                 .scope
                 .iter()
@@ -921,7 +1072,10 @@ mod tests {
                     <= MAX_NAME_LEN;
             assert_eq!(name.to_bytes().is_ok(), fits);
             contract::check_wire_value(&name);
-            contract::check_wire_value(&Packet::Request { called: name, calling: fred() });
+            contract::check_wire_value(&Packet::Request {
+                called: name,
+                calling: fred(),
+            });
             contract::check_wire_value(&Packet::Negative(NegativeCode::Other(rng.next() as u8)));
         }
     }

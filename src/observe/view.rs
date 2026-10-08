@@ -66,7 +66,11 @@ fn add_group(view: &mut View, group: &Arc<Group>) -> String {
             break;
         }
         let parent = g.parent.as_ref().map(|p| group_id(p.id));
-        let json = Object::new().str("id", &id).str("name", &g.name).opt_str("parent", parent.as_deref()).done();
+        let json = Object::new()
+            .str("id", &id)
+            .str("name", &g.name)
+            .opt_str("parent", parent.as_deref())
+            .done();
         view.groups.insert(id, json);
     }
     group_id(group.id)
@@ -127,7 +131,9 @@ fn copy(s: &mut GraphState) -> Copy {
     let live = |task: u64| (task != 0 && s.tasks.contains_key(&task)).then_some(task);
     let mut links = Vec::with_capacity(s.links.len());
     for (id, link) in &s.links {
-        let Some(meter) = link.meter.upgrade() else { continue };
+        let Some(meter) = link.meter.upgrade() else {
+            continue;
+        };
         let end = |side: usize| live(link.owners[side]).or_else(|| live(link.creator));
         let Some(a) = end(0) else { continue };
         let b = match &link.sandbox {
@@ -140,17 +146,34 @@ fn copy(s: &mut GraphState) -> Copy {
                 _ => continue,
             },
         };
-        links.push(LinkRow { id: *id, meter, a, b, label: link.label.clone() });
+        links.push(LinkRow {
+            id: *id,
+            meter,
+            a,
+            b,
+            label: link.label.clone(),
+        });
     }
-    Copy { ended: s.ended, tasks, links }
+    Copy {
+        ended: s.ended,
+        tasks,
+        links,
+    }
 }
 
 /// The graph as it was copied, in the form the browser sees.
 fn build(mut c: Copy) -> View {
-    let mut view = View { ended: c.ended, ..View::default() };
+    let mut view = View {
+        ended: c.ended,
+        ..View::default()
+    };
     c.tasks.sort_unstable_by_key(|t| t.id);
     for t in &c.tasks {
-        let kind = if t.name == "world" && t.parent == 0 { "world" } else { "task" };
+        let kind = if t.name == "world" && t.parent == 0 {
+            "world"
+        } else {
+            "task"
+        };
         let parent = (t.parent != 0).then(|| task_id(t.parent));
         let group = t.group.as_ref().map(|g| add_group(&mut view, g));
         let node = Object::new()
@@ -200,12 +223,20 @@ fn build(mut c: Copy) -> View {
 pub(crate) fn counters(graph: &Graph) -> String {
     let c = copy(&mut graph.state());
     let view = build(c);
-    Object::new().secs("t", graph.start.elapsed()).raw("edges", &counters_json(view.counters.iter())).done()
+    Object::new()
+        .secs("t", graph.start.elapsed())
+        .raw("edges", &counters_json(view.counters.iter()))
+        .done()
 }
 
 /// The `events` reply: at most `max` events after number `after`.
 pub(crate) fn events(graph: &Graph, after: u64, max: usize) -> String {
-    let events: Vec<String> = graph.events.after(after, max).iter().map(|e| e.to_line()).collect();
+    let events: Vec<String> = graph
+        .events
+        .after(after, max)
+        .iter()
+        .map(|e| e.to_line())
+        .collect();
     Object::new().raw("events", &json::array(events)).done()
 }
 
@@ -216,7 +247,14 @@ pub(crate) fn link(graph: &Graph, id: u64) -> Option<String> {
     let edge = view.edges.get(&edge_id(id))?;
     let c = view.counters.get(&edge_id(id))?;
     // The edge's JSON, with its counts added before the closing brace.
-    Some(format!("{},\"counters\":[{},{},{},{}]}}", &edge[..edge.len() - 1], c[0], c[1], c[2], c[3]))
+    Some(format!(
+        "{},\"counters\":[{},{},{},{}]}}",
+        &edge[..edge.len() - 1],
+        c[0],
+        c[1],
+        c[2],
+        c[3]
+    ))
 }
 
 fn counters_json<'a>(counters: impl Iterator<Item = (&'a String, &'a [u64; 4])>) -> String {
@@ -245,7 +283,10 @@ pub(crate) fn snapshot(graph: &Graph, after: Option<u64>) -> (View, Message) {
         }
         None => {
             let last = graph.events.last();
-            let events = graph.events.after(last.saturating_sub(SNAPSHOT_EVENTS), SNAPSHOT_EVENTS as usize + 1);
+            let events = graph.events.after(
+                last.saturating_sub(SNAPSHOT_EVENTS),
+                SNAPSHOT_EVENTS as usize + 1,
+            );
             view.event_seq = events.last().map_or(last, |e| e.seq);
             events
         }
@@ -253,7 +294,13 @@ pub(crate) fn snapshot(graph: &Graph, after: Option<u64>) -> (View, Message) {
     let events: Vec<String> = events.iter().map(|e| e.to_line()).collect();
     let data = Object::new()
         .secs("t", graph.start.elapsed())
-        .num("started", graph.start_wall.duration_since(crate::sys::UNIX_EPOCH).map_or(0, |d| d.as_millis()))
+        .num(
+            "started",
+            graph
+                .start_wall
+                .duration_since(crate::sys::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis()),
+        )
         .bool("ended", view.ended)
         .raw("groups", &json::array(view.groups.values()))
         .raw("nodes", &json::array(view.nodes.values()))
@@ -301,17 +348,26 @@ pub(crate) fn changes(graph: &Graph, old: &mut View) -> Vec<Message> {
     for id in old.groups.keys().filter(|id| !new.groups.contains_key(*id)) {
         out.push(("group_end", Object::new().str("id", id).done()));
     }
-    let changed = new.counters.iter().filter(|(id, c)| old.counters.get(*id) != Some(*c));
+    let changed = new
+        .counters
+        .iter()
+        .filter(|(id, c)| old.counters.get(*id) != Some(*c));
     let counters = counters_json(changed);
     if counters != "{}" {
-        let data = Object::new().secs("t", graph.start.elapsed()).raw("edges", &counters).done();
+        let data = Object::new()
+            .secs("t", graph.start.elapsed())
+            .raw("edges", &counters)
+            .done();
         out.push(("counters", data));
     }
     for event in events {
         out.push(("event", event));
     }
     if new.ended && !old.ended {
-        out.push(("ended", Object::new().secs("t", graph.start.elapsed()).done()));
+        out.push((
+            "ended",
+            Object::new().secs("t", graph.start.elapsed()).done(),
+        ));
     }
     *old = new;
     out
@@ -333,8 +389,8 @@ mod tests {
     /// while something in it lives.
     #[test]
     fn tasks_and_sandboxes_report_their_groups() {
-        use crate::prelude::*;
         use crate::Interface;
+        use crate::prelude::*;
         use crate::stdlib::{delay, route};
         use crate::time::ms;
         let graph = Graph::new();
@@ -350,7 +406,13 @@ mod tests {
             let sandbox = attachments.get(&fcx, "agent").await?;
             let slow = delay(&lan, ms(1), sandbox);
             let (to_host, host) = crate::pair();
-            route::router(&fcx, vec![("0.0.0.0/0".parse()?, Box::new(slow) as Box<dyn Interface>), ("10.0.0.5/32".parse()?, Box::new(to_host))]);
+            route::router(
+                &fcx,
+                vec![
+                    ("0.0.0.0/0".parse()?, Box::new(slow) as Box<dyn Interface>),
+                    ("10.0.0.5/32".parse()?, Box::new(to_host)),
+                ],
+            );
             hosts.spawn(move |fcx| async move {
                 // A task started by a grouped task is in the group too.
                 fcx.spawn(move |fcx| async move {
@@ -368,16 +430,41 @@ mod tests {
         }))
         .unwrap();
         let data = seen.lock().unwrap().pop().unwrap();
-        let groups: Vec<&str> = data.split(r#"{"id":"g"#).skip(1).map(|r| r.split('}').next().unwrap()).collect();
-        assert_eq!(groups, [r#"1","name":"office LAN","parent":null"#, r#"2","name":"hosts","parent":"g1""#], "{data}");
-        let node = |name: &str| data.split(r#"{"id":""#).find(|n| n.contains(&format!(r#""name":"{name}""#))).unwrap_or_else(|| panic!("{name}: {data}"));
+        let groups: Vec<&str> = data
+            .split(r#"{"id":"g"#)
+            .skip(1)
+            .map(|r| r.split('}').next().unwrap())
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                r#"1","name":"office LAN","parent":null"#,
+                r#"2","name":"hosts","parent":"g1""#
+            ],
+            "{data}"
+        );
+        let node = |name: &str| {
+            data.split(r#"{"id":""#)
+                .find(|n| n.contains(&format!(r#""name":"{name}""#)))
+                .unwrap_or_else(|| panic!("{name}: {data}"))
+        };
         assert!(node("delay").contains(r#""group":"g1""#), "{data}");
-        assert!(node("agent").contains(r#""kind":"sandbox""#) && node("agent").contains(r#""group":"g1""#), "{data}");
+        assert!(
+            node("agent").contains(r#""kind":"sandbox""#)
+                && node("agent").contains(r#""group":"g1""#),
+            "{data}"
+        );
         assert!(node("router").contains(r#""group":null"#), "{data}");
         assert!(node("world").contains(r#""group":null"#), "{data}");
         // The inner task: its future type is a closure in this test.
-        let inner = data.split(r#"{"id":""#).filter(|n| n.contains(r#""group":"g2""#)).count();
-        assert_eq!(inner, 1, "the task started by the grouped task, alone in g2: {data}");
+        let inner = data
+            .split(r#"{"id":""#)
+            .filter(|n| n.contains(r#""group":"g2""#))
+            .count();
+        assert_eq!(
+            inner, 1,
+            "the task started by the grouped task, alone in g2: {data}"
+        );
     }
 
     /// A group that empties is announced gone, after its nodes.
@@ -391,10 +478,17 @@ mod tests {
         graph.task_started(2, "delay".into(), Location::caller(), Some(inner));
         let m = changes(&graph, &mut view);
         assert_eq!(names(&m), ["group", "group", "node"]);
-        assert!(m[1].1.contains(r#""name":"inner","parent":"g1""#), "{}", m[1].1);
+        assert!(
+            m[1].1.contains(r#""name":"inner","parent":"g1""#),
+            "{}",
+            m[1].1
+        );
         assert!(m[2].1.contains(r#""group":"g2""#), "{}", m[2].1);
         graph.task_ended(2);
-        assert_eq!(names(&changes(&graph, &mut view)), ["node_end", "group_end", "group_end"]);
+        assert_eq!(
+            names(&changes(&graph, &mut view)),
+            ["node_end", "group_end", "group_end"]
+        );
     }
 
     #[test]
@@ -421,10 +515,18 @@ mod tests {
         assert_eq!(names(&changes(&graph, &mut view)), ["edge_end", "node_end"]);
 
         // Events are sent once each.
-        graph.events.push(crate::events::Event::new("bottleneck", "drop").summary("queue full"));
+        graph
+            .events
+            .push(crate::events::Event::new("bottleneck", "drop").summary("queue full"));
         let m = changes(&graph, &mut view);
         assert_eq!(names(&m), ["event"]);
-        assert!(m[0].1.contains(r#""source":"bottleneck","kind":"drop","level":"info","summary":"queue full""#), "{}", m[0].1);
+        assert!(
+            m[0].1.contains(
+                r#""source":"bottleneck","kind":"drop","level":"info","summary":"queue full""#
+            ),
+            "{}",
+            m[0].1
+        );
         assert!(changes(&graph, &mut view).is_empty());
 
         graph.run_ended();

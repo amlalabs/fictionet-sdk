@@ -245,7 +245,9 @@ fn parse_ifname(s: &str) -> Option<String> {
         && s.len() < 16
         && s != "."
         && s != ".."
-        && !s.bytes().any(|b| b == b'/' || b == b':' || b.is_ascii_whitespace());
+        && !s
+            .bytes()
+            .any(|b| b == b'/' || b == b':' || b.is_ascii_whitespace());
     ok.then(|| s.to_owned())
 }
 
@@ -259,7 +261,10 @@ fn parse_cidr<A: std::str::FromStr>(s: &str, max: u8) -> Option<Cidr<A>> {
     if prefix > max {
         return None;
     }
-    Some(Cidr { addr: addr.parse().ok()?, prefix })
+    Some(Cidr {
+        addr: addr.parse().ok()?,
+        prefix,
+    })
 }
 
 /// One address setting while the flags are read: its value, and whether
@@ -272,12 +277,20 @@ struct Pending<T> {
 
 impl<T> Pending<T> {
     fn new(flag: &'static str) -> Pending<T> {
-        Pending { flag, value: None, off: false }
+        Pending {
+            flag,
+            value: None,
+            off: false,
+        }
     }
 
     fn finish(self) -> Result<Setting<T>, String> {
         match (self.value, self.off) {
-            (Some(_), true) => Err(format!("give {flag} or --no-{name}, not both", flag = self.flag, name = &self.flag[2..])),
+            (Some(_), true) => Err(format!(
+                "give {flag} or --no-{name}, not both",
+                flag = self.flag,
+                name = &self.flag[2..]
+            )),
             (Some(v), false) => Ok(Setting::Value(v)),
             (None, true) => Ok(Setting::Off),
             (None, false) => Ok(Setting::FromWorld),
@@ -288,7 +301,11 @@ impl<T> Pending<T> {
 /// The flags in `group` that were left out, with both of their forms, such
 /// as `--dns (or --no-dns)`.
 fn left_out(group: &[(&str, bool)]) -> Vec<String> {
-    group.iter().filter(|(_, missing)| *missing).map(|(flag, _)| format!("{flag} (or --no-{})", &flag[2..])).collect()
+    group
+        .iter()
+        .filter(|(_, missing)| *missing)
+        .map(|(flag, _)| format!("{flag} (or --no-{})", &flag[2..]))
+        .collect()
 }
 
 /// What the arguments after `attach` ask for.
@@ -380,11 +397,17 @@ pub(crate) fn parse_attach(args: &[String]) -> Result<Parsed, String> {
             "--ip-addr" => ip_addr.value = Some(value),
             "--gateway" => gateway.value = Some(parse_value(&flag, &value, |s| s.parse().ok())?),
             "--dns" => dns.value = Some(parse_value(&flag, &value, |s| s.parse().ok())?),
-            "--ip-addr-v6" => ip_addr_v6.value = Some(parse_value(&flag, &value, |s| parse_cidr(s, 128))?),
-            "--gateway-v6" => gateway_v6.value = Some(parse_value(&flag, &value, |s| s.parse().ok())?),
+            "--ip-addr-v6" => {
+                ip_addr_v6.value = Some(parse_value(&flag, &value, |s| parse_cidr(s, 128))?)
+            }
+            "--gateway-v6" => {
+                gateway_v6.value = Some(parse_value(&flag, &value, |s| s.parse().ok())?)
+            }
             "--dns-v6" => dns_v6.value = Some(parse_value(&flag, &value, |s| s.parse().ok())?),
             "--mtu" => {
-                mtu = value.parse().map_err(|_| format!("--mtu: cannot read {value:?}"))?;
+                mtu = value
+                    .parse()
+                    .map_err(|_| format!("--mtu: cannot read {value:?}"))?;
                 if mtu < 1280 {
                     // IPv6 needs 1280, and the kernel refuses less on a
                     // device with IPv6.
@@ -408,7 +431,11 @@ pub(crate) fn parse_attach(args: &[String]) -> Result<Parsed, String> {
                 let secs: u32 = parse_value(&flag, &value, |s| s.parse().ok())?;
                 world_wait = std::time::Duration::from_secs(secs.into());
             }
-            "--listen" => listen = Some(parse_value(&flag, &value, |s| s.parse::<SocketAddr>().ok())?),
+            "--listen" => {
+                listen = Some(parse_value(&flag, &value, |s| {
+                    s.parse::<SocketAddr>().ok()
+                })?)
+            }
             "--token-file" => {
                 if value.is_empty() {
                     return Err("--token-file needs a path".into());
@@ -417,7 +444,10 @@ pub(crate) fn parse_attach(args: &[String]) -> Result<Parsed, String> {
             }
             "--vm" => vm = Some(value),
             "--port" => {
-                return Err("there is no --port: give --listen <ip:port>, such as --listen 127.0.0.1:8080".into());
+                return Err(
+                    "there is no --port: give --listen <ip:port>, such as --listen 127.0.0.1:8080"
+                        .into(),
+                );
             }
             other => return Err(format!("unknown flag {other}\n\n{ATTACH_USAGE}")),
         }
@@ -435,14 +465,30 @@ pub(crate) fn parse_attach(args: &[String]) -> Result<Parsed, String> {
         Some("http_proxy") => Some(ProxyKind::Http),
         Some("socks5") => Some(ProxyKind::Socks5),
         Some("tap") => {
-            let f = TapFlags { given: &given, vm, netns, ip_addr, gateway, dns, ip_addr_v6, gateway_v6, dns_v6 };
+            let f = TapFlags {
+                given: &given,
+                vm,
+                netns,
+                ip_addr,
+                gateway,
+                dns,
+                ip_addr_v6,
+                gateway_v6,
+                dns_v6,
+            };
             return parse_tap(world, name, f, mtu, ready_file, world_wait);
         }
         Some(other) => return Err(format!("unknown --type {other:?}")),
         None => return Err("--type is required: tun, tap, http_proxy or socks5".into()),
     };
     if let Some(kind) = proxy {
-        let flags = ProxyFlags { given: &given, ip_addr, dns, listen, token_file };
+        let flags = ProxyFlags {
+            given: &given,
+            ip_addr,
+            dns,
+            listen,
+            token_file,
+        };
         return parse_proxy(kind, world, name, flags, ready_file, world_wait);
     }
     if given.iter().any(|g| g == "--vm") {
@@ -450,12 +496,17 @@ pub(crate) fn parse_attach(args: &[String]) -> Result<Parsed, String> {
     }
     for flag in ["--listen", "--token-file"] {
         if given.iter().any(|g| g == flag) {
-            return Err(format!("{flag} is only for --type http_proxy and --type socks5"));
+            return Err(format!(
+                "{flag} is only for --type http_proxy and --type socks5"
+            ));
         }
     }
     let ip_addr = Pending {
         flag: ip_addr.flag,
-        value: ip_addr.value.map(|v| parse_value("--ip-addr", &v, |s| parse_cidr(s, 32))).transpose()?,
+        value: ip_addr
+            .value
+            .map(|v| parse_value("--ip-addr", &v, |s| parse_cidr(s, 32)))
+            .transpose()?,
         off: ip_addr.off,
     };
     let resolv_conf = match (resolv_conf_path, no_resolv_conf) {
@@ -465,7 +516,8 @@ pub(crate) fn parse_attach(args: &[String]) -> Result<Parsed, String> {
         (None, false) => ResolvConf::Default,
     };
     let (ip_addr, gateway, dns) = (ip_addr.finish()?, gateway.finish()?, dns.finish()?);
-    let (ip_addr_v6, gateway_v6, dns_v6) = (ip_addr_v6.finish()?, gateway_v6.finish()?, dns_v6.finish()?);
+    let (ip_addr_v6, gateway_v6, dns_v6) =
+        (ip_addr_v6.finish()?, gateway_v6.finish()?, dns_v6.finish()?);
 
     // Left out means "ask the world". This build cannot ask yet.
     let missing_v4 = left_out(&[
@@ -536,8 +588,14 @@ fn parse_tap(
 ) -> Result<Parsed, String> {
     let refused: [(&[&str], &str); 3] = [
         (&["--down-link"], "attach changes no link"),
-        (&["--resolv-conf", "--no-resolv-conf"], "the VM writes its own resolv.conf, from the DNS server it gets by DHCP"),
-        (&["--listen", "--token-file"], "those are for --type http_proxy and --type socks5"),
+        (
+            &["--resolv-conf", "--no-resolv-conf"],
+            "the VM writes its own resolv.conf, from the DNS server it gets by DHCP",
+        ),
+        (
+            &["--listen", "--token-file"],
+            "those are for --type http_proxy and --type socks5",
+        ),
     ];
     for (flags, why) in refused {
         if let Some(flag) = f.given.iter().find(|g| flags.contains(&g.as_str())) {
@@ -554,19 +612,33 @@ fn parse_tap(
         }
         Some(("qemu", path)) if !path.is_empty() => VmLink::Qemu(PathBuf::from(path)),
         Some(("tap", name)) => VmLink::Tap(
-            parse_ifname(name).ok_or_else(|| format!("--vm tap:<ifname>: {name:?} is not a link name"))?,
+            parse_ifname(name)
+                .ok_or_else(|| format!("--vm tap:<ifname>: {name:?} is not a link name"))?,
         ),
-        _ => return Err(format!("--vm must be qemu:<path> or tap:<ifname>, not {vm:?}")),
+        _ => {
+            return Err(format!(
+                "--vm must be qemu:<path> or tap:<ifname>, not {vm:?}"
+            ));
+        }
     };
     if matches!(vm, VmLink::Qemu(_)) && f.netns.is_some() {
         return Err("--type tap takes --netns only with --vm tap:<ifname>; QEMU's socket needs no namespace".into());
     }
     let ip_addr = Pending {
         flag: f.ip_addr.flag,
-        value: f.ip_addr.value.map(|v| parse_value("--ip-addr", &v, |s| parse_cidr(s, 32))).transpose()?,
+        value: f
+            .ip_addr
+            .value
+            .map(|v| parse_value("--ip-addr", &v, |s| parse_cidr(s, 32)))
+            .transpose()?,
         off: f.ip_addr.off,
     };
-    let v4 = tap_family(ip_addr.finish()?, f.gateway.finish()?, f.dns.finish()?, ["--ip-addr", "--gateway", "--dns"])?;
+    let v4 = tap_family(
+        ip_addr.finish()?,
+        f.gateway.finish()?,
+        f.dns.finish()?,
+        ["--ip-addr", "--gateway", "--dns"],
+    )?;
     let v6 = tap_family(
         f.ip_addr_v6.finish()?,
         f.gateway_v6.finish()?,
@@ -580,7 +652,10 @@ fn parse_tap(
         if let Some(gw) = l.gateway {
             let mask = crate::addresses::mask4(l.addr.prefix);
             if u32::from(gw) & mask != u32::from(l.addr.addr) & mask || gw == l.addr.addr {
-                return Err(format!("--gateway {gw} must be another address in the subnet of --ip-addr {}/{}", l.addr.addr, l.addr.prefix));
+                return Err(format!(
+                    "--gateway {gw} must be another address in the subnet of --ip-addr {}/{}",
+                    l.addr.addr, l.addr.prefix
+                ));
             }
         }
     }
@@ -589,7 +664,17 @@ fn parse_tap(
     {
         return Err("--ip-addr-v6: for --type tap, the prefix must be at most /64, the subnet the VM is told is on its link".into());
     }
-    Ok(Parsed::Tap(TapArgs { world, name, vm, netns: f.netns, v4, v6, mtu, ready_file, world_wait }))
+    Ok(Parsed::Tap(TapArgs {
+        world,
+        name,
+        vm,
+        netns: f.netns,
+        v4,
+        v6,
+        mtu,
+        ready_file,
+        world_wait,
+    }))
 }
 
 /// One family's three flags, for `--type tap`. With the address, the other
@@ -603,7 +688,10 @@ fn tap_family<A: Copy + PartialEq>(
 ) -> Result<Family<A>, String> {
     match addr {
         Setting::Value(addr) => {
-            let missing = left_out(&[(gw_flag, gateway == Setting::FromWorld), (dns_flag, dns == Setting::FromWorld)]);
+            let missing = left_out(&[
+                (gw_flag, gateway == Setting::FromWorld),
+                (dns_flag, dns == Setting::FromWorld),
+            ]);
             if !missing.is_empty() {
                 return Err(format!(
                     "{} left out: with {addr_flag}, attach hands the VM its address, gateway and DNS server \
@@ -611,11 +699,18 @@ fn tap_family<A: Copy + PartialEq>(
                     missing.join(", ")
                 ));
             }
-            Ok(Family::Serve(Lease { addr, gateway: gateway.value().copied(), dns: dns.value().copied() }))
+            Ok(Family::Serve(Lease {
+                addr,
+                gateway: gateway.value().copied(),
+                dns: dns.value().copied(),
+            }))
         }
         Setting::FromWorld | Setting::Off => {
             let off = addr == Setting::Off;
-            for (flag, set) in [(gw_flag, gateway.value().is_some()), (dns_flag, dns.value().is_some())] {
+            for (flag, set) in [
+                (gw_flag, gateway.value().is_some()),
+                (dns_flag, dns.value().is_some()),
+            ] {
                 if set {
                     return Err(format!(
                         "{flag} needs {addr_flag}: for --type tap, attach hands out the gateway and DNS server \
@@ -629,7 +724,11 @@ fn tap_family<A: Copy + PartialEq>(
             } else if gateway == Setting::Off || dns == Setting::Off {
                 Err(format!(
                     "--no-{} needs --no-{} or {addr_flag}: leave all three out so the VM's DHCP goes to the world",
-                    if gateway == Setting::Off { &gw_flag[2..] } else { &dns_flag[2..] },
+                    if gateway == Setting::Off {
+                        &gw_flag[2..]
+                    } else {
+                        &dns_flag[2..]
+                    },
                     &addr_flag[2..]
                 ))
             } else {
@@ -664,13 +763,35 @@ fn parse_proxy(
     // none of these, so each is refused rather than ignored.
     let refused: [(&[&str], &str); 7] = [
         (&["--vm"], "that is for --type tap"),
-        (&["--gateway", "--no-gateway"], "attach makes the packets itself, and there are no routes to set"),
-        (&["--netns"], "attach makes no device, so it enters no namespace"),
-        (&["--down-link"], "attach makes no device and changes no link"),
-        (&["--mtu"], "attach's TCP sends packets of at most 1,500 bytes"),
-        (&["--resolv-conf", "--no-resolv-conf"], "attach looks names up itself, and writes no resolv.conf"),
         (
-            &["--ip-addr-v6", "--gateway-v6", "--dns-v6", "--no-ip-addr-v6", "--no-gateway-v6", "--no-dns-v6"],
+            &["--gateway", "--no-gateway"],
+            "attach makes the packets itself, and there are no routes to set",
+        ),
+        (
+            &["--netns"],
+            "attach makes no device, so it enters no namespace",
+        ),
+        (
+            &["--down-link"],
+            "attach makes no device and changes no link",
+        ),
+        (
+            &["--mtu"],
+            "attach's TCP sends packets of at most 1,500 bytes",
+        ),
+        (
+            &["--resolv-conf", "--no-resolv-conf"],
+            "attach looks names up itself, and writes no resolv.conf",
+        ),
+        (
+            &[
+                "--ip-addr-v6",
+                "--gateway-v6",
+                "--dns-v6",
+                "--no-ip-addr-v6",
+                "--no-gateway-v6",
+                "--no-dns-v6",
+            ],
             "it is IPv4 only",
         ),
     ];
@@ -679,25 +800,49 @@ fn parse_proxy(
             return Err(format!("--type {t} takes no {flag}: {why}"));
         }
     }
-    let listen = f.listen.ok_or_else(|| format!("--type {t} needs --listen <ip:port>, such as --listen 127.0.0.1:8080"))?;
-    let token_file = f
-        .token_file
-        .ok_or_else(|| format!("--type {t} needs --token-file <path>: the sandbox's token, which clients must give"))?;
+    let listen = f.listen.ok_or_else(|| {
+        format!("--type {t} needs --listen <ip:port>, such as --listen 127.0.0.1:8080")
+    })?;
+    let token_file = f.token_file.ok_or_else(|| {
+        format!(
+            "--type {t} needs --token-file <path>: the sandbox's token, which clients must give"
+        )
+    })?;
     let ip_addr = match f.ip_addr.finish()? {
         Setting::Value(v) => match v.parse::<Ipv4Addr>() {
             Ok(a) => a,
             Err(_) if v.contains('/') => {
-                return Err(format!("--type {t} takes --ip-addr without a prefix length, such as 10.0.0.2, not {v:?}"));
+                return Err(format!(
+                    "--type {t} takes --ip-addr without a prefix length, such as 10.0.0.2, not {v:?}"
+                ));
             }
             Err(_) => return Err(format!("--ip-addr: cannot read {v:?}")),
         },
-        _ => return Err(format!("--type {t} needs --ip-addr <ip>: the source address of the packets attach makes")),
+        _ => {
+            return Err(format!(
+                "--type {t} needs --ip-addr <ip>: the source address of the packets attach makes"
+            ));
+        }
     };
     let dns = match f.dns.finish()? {
         Setting::Value(v) => v,
-        _ => return Err(format!("--type {t} needs --dns <ip>: the world's DNS server, where attach looks names up")),
+        _ => {
+            return Err(format!(
+                "--type {t} needs --dns <ip>: the world's DNS server, where attach looks names up"
+            ));
+        }
     };
-    Ok(Parsed::Proxy(ProxyArgs { kind, world, name, listen, token_file, ip_addr, dns, ready_file, world_wait }))
+    Ok(Parsed::Proxy(ProxyArgs {
+        kind,
+        world,
+        name,
+        listen,
+        token_file,
+        ip_addr,
+        dns,
+        ready_file,
+        world_wait,
+    }))
 }
 
 impl AttachArgs {
@@ -741,22 +886,39 @@ mod tests {
         let a = parse_attach(&args(FULL)).unwrap();
         assert_eq!(a.world, "/run/w.sock");
         assert_eq!(a.name, "abc");
-        assert_eq!(a.ip_addr, Setting::Value(Cidr { addr: Ipv4Addr::new(10, 0, 0, 2), prefix: 24 }));
+        assert_eq!(
+            a.ip_addr,
+            Setting::Value(Cidr {
+                addr: Ipv4Addr::new(10, 0, 0, 2),
+                prefix: 24
+            })
+        );
         assert_eq!(a.gateway, Setting::Value(Ipv4Addr::new(10, 0, 0, 1)));
         assert_eq!(a.ip_addr_v6.value().unwrap().prefix, 64);
         assert_eq!(a.dns_v6, Setting::Off);
         assert_eq!(a.mtu, 1500);
-        assert_eq!(a.dns_servers(), vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
+        assert_eq!(
+            a.dns_servers(),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]
+        );
         assert_eq!(a.resolv_conf, ResolvConf::Default);
     }
 
     #[test]
     fn every_setting_off() {
         let a = parse_attach(&args(ALL_OFF)).unwrap();
-        for off in [a.ip_addr == Setting::Off, a.gateway == Setting::Off, a.dns == Setting::Off] {
+        for off in [
+            a.ip_addr == Setting::Off,
+            a.gateway == Setting::Off,
+            a.dns == Setting::Off,
+        ] {
             assert!(off);
         }
-        for off in [a.ip_addr_v6 == Setting::Off, a.gateway_v6 == Setting::Off, a.dns_v6 == Setting::Off] {
+        for off in [
+            a.ip_addr_v6 == Setting::Off,
+            a.gateway_v6 == Setting::Off,
+            a.dns_v6 == Setting::Off,
+        ] {
             assert!(off);
         }
         assert!(a.dns_servers().is_empty());
@@ -774,8 +936,10 @@ mod tests {
         let e = parse_attach(&args("--world unix:/w --name abc --type tun")).unwrap_err();
         assert!(e.contains("--ip-addr (or --no-ip-addr), --gateway (or --no-gateway), --dns (or --no-dns) left out"), "{e}");
         assert!(e.contains("DHCP is not implemented yet"), "{e}");
-        let e = parse_attach(&args("--world unix:/w --name abc --type tun --no-ip-addr --no-gateway --no-dns"))
-            .unwrap_err();
+        let e = parse_attach(&args(
+            "--world unix:/w --name abc --type tun --no-ip-addr --no-gateway --no-dns",
+        ))
+        .unwrap_err();
         assert!(e.contains("--dns-v6 (or --no-dns-v6)"), "{e}");
         assert!(e.contains("router advertisements"), "{e}");
     }
@@ -785,7 +949,10 @@ mod tests {
         let e = parse_attach(&args(&format!("{FULL} --no-dns"))).unwrap_err();
         assert!(e.contains("give --dns or --no-dns, not both"), "{e}");
         let e = parse_attach(&args(&format!("{ALL_OFF} --ip-addr-v6 fd00::2/64"))).unwrap_err();
-        assert!(e.contains("give --ip-addr-v6 or --no-ip-addr-v6, not both"), "{e}");
+        assert!(
+            e.contains("give --ip-addr-v6 or --no-ip-addr-v6, not both"),
+            "{e}"
+        );
         let e = parse_attach(&args(&format!("{FULL} --no-gateway=1"))).unwrap_err();
         assert!(e.contains("--no-gateway takes no value"), "{e}");
     }
@@ -793,15 +960,28 @@ mod tests {
     #[test]
     fn none_is_no_longer_special() {
         let bad = |flag: &str| parse_attach(&args(&format!("{ALL_OFF} {flag} none"))).unwrap_err();
-        for flag in ["--ip-addr", "--gateway", "--dns", "--ip-addr-v6", "--gateway-v6", "--dns-v6"] {
-            assert!(bad(flag).contains(&format!("{flag}: cannot read \"none\"")), "{flag}");
+        for flag in [
+            "--ip-addr",
+            "--gateway",
+            "--dns",
+            "--ip-addr-v6",
+            "--gateway-v6",
+            "--dns-v6",
+        ] {
+            assert!(
+                bad(flag).contains(&format!("{flag}: cannot read \"none\"")),
+                "{flag}"
+            );
         }
     }
 
     #[test]
     fn resolv_conf_flags() {
         let a = parse_attach(&args(&format!("{FULL} --resolv-conf /run/dns/resolv.conf"))).unwrap();
-        assert_eq!(a.resolv_conf, ResolvConf::Path(PathBuf::from("/run/dns/resolv.conf")));
+        assert_eq!(
+            a.resolv_conf,
+            ResolvConf::Path(PathBuf::from("/run/dns/resolv.conf"))
+        );
         let a = parse_attach(&args(&format!("{FULL} --resolv-conf=/x"))).unwrap();
         assert_eq!(a.resolv_conf, ResolvConf::Path(PathBuf::from("/x")));
         // Any value is a path, even one called "none".
@@ -825,7 +1005,10 @@ mod tests {
         assert!(e.contains("--resolv-conf needs a value"), "{e}");
         // After =, any path is taken as it is.
         let a = parse_attach(&args(&format!("{FULL} --resolv-conf=--no-resolv-conf"))).unwrap();
-        assert_eq!(a.resolv_conf, ResolvConf::Path(PathBuf::from("--no-resolv-conf")));
+        assert_eq!(
+            a.resolv_conf,
+            ResolvConf::Path(PathBuf::from("--no-resolv-conf"))
+        );
     }
 
     #[test]
@@ -864,7 +1047,10 @@ mod tests {
     fn down_link_repeats_and_keeps_order() {
         let a = parse_attach(&args(FULL)).unwrap();
         assert!(a.down_links.is_empty());
-        let a = parse_attach(&args(&format!("{FULL} --down-link eth0 --down-link=net1 --down-link eth0"))).unwrap();
+        let a = parse_attach(&args(&format!(
+            "{FULL} --down-link eth0 --down-link=net1 --down-link eth0"
+        )))
+        .unwrap();
         assert_eq!(a.down_links, vec!["eth0".to_owned(), "net1".to_owned()]);
         let bad = |v: &str| parse_attach(&args(&format!("{FULL} --down-link={v}"))).unwrap_err();
         for v in ["", "a/b", "a:1", ".", "..", "sixteen-bytes-ab"] {
@@ -893,7 +1079,10 @@ mod tests {
     fn help_is_not_an_error() {
         for h in ["--help", "-h"] {
             assert_eq!(super::parse_attach(&args(h)), Ok(Parsed::Help));
-            assert_eq!(super::parse_attach(&args(&format!("{FULL} {h}"))), Ok(Parsed::Help));
+            assert_eq!(
+                super::parse_attach(&args(&format!("{FULL} {h}"))),
+                Ok(Parsed::Help)
+            );
         }
     }
 
@@ -905,12 +1094,18 @@ mod tests {
         assert!(bad("--gateway fd00::1").contains("--gateway"));
         assert!(bad("--mtu 500").contains("1280"));
         assert!(bad("--bogus 1").contains("unknown flag"));
-        let e = parse_attach(&args(&FULL.replace("unix:/run/w.sock", "tls:example.com:7000"))).unwrap_err();
+        let e = parse_attach(&args(
+            &FULL.replace("unix:/run/w.sock", "tls:example.com:7000"),
+        ))
+        .unwrap_err();
         assert!(e.contains("expected unix:<path>"), "{e}");
         let e = parse_attach(&args(&FULL.replace("--type tun", "--type wireguard"))).unwrap_err();
         assert!(e.contains("unknown --type \"wireguard\""), "{e}");
         let long = "x".repeat(256);
-        let e = parse_attach(&args(&FULL.replace("--name abc", &format!("--name {long}")))).unwrap_err();
+        let e = parse_attach(&args(
+            &FULL.replace("--name abc", &format!("--name {long}")),
+        ))
+        .unwrap_err();
         assert!(e.contains("1 to 255"));
     }
 
@@ -934,7 +1129,11 @@ mod tests {
         assert_eq!(p.ip_addr, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(p.dns, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(p.ready_file, None);
-        let p = parse_proxy(&format!("{} --ready-file /r --world-wait 5", PROXY.replace("http_proxy", "socks5"))).unwrap();
+        let p = parse_proxy(&format!(
+            "{} --ready-file /r --world-wait 5",
+            PROXY.replace("http_proxy", "socks5")
+        ))
+        .unwrap();
         assert_eq!(p.kind, ProxyKind::Socks5);
         assert_eq!(p.ready_file, Some(PathBuf::from("/r")));
         assert_eq!(p.world_wait, std::time::Duration::from_secs(5));
@@ -946,7 +1145,10 @@ mod tests {
     fn proxy_types_refuse_tun_flags() {
         let bad = |extra: &str| parse_proxy(&format!("{PROXY} {extra}")).unwrap_err();
         let e = bad("--gateway 10.0.0.1");
-        assert_eq!(e, "--type http_proxy takes no --gateway: attach makes the packets itself, and there are no routes to set");
+        assert_eq!(
+            e,
+            "--type http_proxy takes no --gateway: attach makes the packets itself, and there are no routes to set"
+        );
         assert!(bad("--no-gateway").contains("takes no --no-gateway"));
         assert!(bad("--netns /run/netns/a").contains("takes no --netns"));
         assert!(bad("--down-link eth0").contains("takes no --down-link"));
@@ -955,7 +1157,11 @@ mod tests {
         assert!(bad("--resolv-conf /x").contains("takes no --resolv-conf"));
         assert!(bad("--no-ip-addr-v6").contains("IPv4 only"));
         assert!(bad("--dns-v6 fd00::1").contains("IPv4 only"));
-        let e = parse_proxy(&format!("{} --gateway 10.0.0.1", PROXY.replace("http_proxy", "socks5"))).unwrap_err();
+        let e = parse_proxy(&format!(
+            "{} --gateway 10.0.0.1",
+            PROXY.replace("http_proxy", "socks5")
+        ))
+        .unwrap_err();
         assert!(e.starts_with("--type socks5 takes no --gateway"), "{e}");
     }
 
@@ -973,7 +1179,11 @@ mod tests {
         assert!(without("--dns").contains("needs --dns <ip>"));
         let e = parse_proxy(&PROXY.replace("10.0.0.2", "10.0.0.2/24")).unwrap_err();
         assert!(e.contains("without a prefix length"), "{e}");
-        assert!(parse_proxy(&PROXY.replace("--ip-addr 10.0.0.2", "--no-ip-addr")).unwrap_err().contains("needs --ip-addr"));
+        assert!(
+            parse_proxy(&PROXY.replace("--ip-addr 10.0.0.2", "--no-ip-addr"))
+                .unwrap_err()
+                .contains("needs --ip-addr")
+        );
         let e = parse_proxy(&PROXY.replace("127.0.0.1:8080", "8080")).unwrap_err();
         assert!(e.contains("--listen: cannot read"), "{e}");
         let e = parse_proxy(&PROXY.replace("--listen 127.0.0.1:8080", "--port 8080")).unwrap_err();
@@ -1013,15 +1223,26 @@ mod tests {
         ))
         .unwrap();
         let v4 = Lease {
-            addr: Cidr { addr: Ipv4Addr::new(10, 0, 0, 2), prefix: 24 },
+            addr: Cidr {
+                addr: Ipv4Addr::new(10, 0, 0, 2),
+                prefix: 24,
+            },
             gateway: Some(Ipv4Addr::new(10, 0, 0, 1)),
             dns: Some(Ipv4Addr::new(10, 0, 0, 1)),
         };
         assert_eq!(t.v4, Family::Serve(v4));
-        let Family::Serve(v6) = t.v6 else { panic!("{:?}", t.v6) };
-        assert_eq!((v6.gateway, v6.dns), (None, Some("fd00::1".parse().unwrap())));
+        let Family::Serve(v6) = t.v6 else {
+            panic!("{:?}", t.v6)
+        };
+        assert_eq!(
+            (v6.gateway, v6.dns),
+            (None, Some("fd00::1".parse().unwrap()))
+        );
         assert_eq!(t.mtu, 9000);
-        let t = parse_tap(&format!("{TAP} --no-ip-addr --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6")).unwrap();
+        let t = parse_tap(&format!(
+            "{TAP} --no-ip-addr --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6"
+        ))
+        .unwrap();
         assert_eq!((t.v4, t.v6), (Family::Off, Family::Off));
     }
 
@@ -1029,13 +1250,19 @@ mod tests {
     fn tap_address_flags_go_together() {
         let bad = |extra: &str| parse_tap(&format!("{TAP} {extra}")).unwrap_err();
         let e = bad("--ip-addr 10.0.0.2/24 --gateway 10.0.0.1");
-        assert!(e.starts_with("--dns (or --no-dns) left out: with --ip-addr"), "{e}");
+        assert!(
+            e.starts_with("--dns (or --no-dns) left out: with --ip-addr"),
+            "{e}"
+        );
         let e = bad("--gateway 10.0.0.1");
         assert!(e.starts_with("--gateway needs --ip-addr"), "{e}");
         let e = bad("--no-ip-addr --dns 10.0.0.1");
         assert!(e.starts_with("--dns needs --ip-addr"), "{e}");
         let e = bad("--no-dns-v6");
-        assert!(e.starts_with("--no-dns-v6 needs --no-ip-addr-v6 or --ip-addr-v6"), "{e}");
+        assert!(
+            e.starts_with("--no-dns-v6 needs --no-ip-addr-v6 or --ip-addr-v6"),
+            "{e}"
+        );
         let e = bad("--ip-addr 10.0.0.2/24 --gateway 10.0.1.1 --no-dns");
         assert!(e.contains("must be another address in the subnet"), "{e}");
         let e = bad("--ip-addr 10.0.0.2/24 --gateway 10.0.0.2 --no-dns");
@@ -1043,7 +1270,9 @@ mod tests {
         assert!(bad("--ip-addr 10.0.0.2/32 --no-gateway --no-dns").contains("from /8 to /30"));
         assert!(bad("--ip-addr 10.0.0.2/0 --no-gateway --no-dns").contains("from /8 to /30"));
         assert!(bad("--ip-addr 10.0.0.2/0 --gateway 10.0.0.1 --no-dns").contains("from /8 to /30"));
-        assert!(bad("--ip-addr-v6 fd00::2/120 --no-gateway-v6 --no-dns-v6").contains("at most /64"));
+        assert!(
+            bad("--ip-addr-v6 fd00::2/120 --no-gateway-v6 --no-dns-v6").contains("at most /64")
+        );
     }
 
     #[test]
@@ -1051,15 +1280,36 @@ mod tests {
         let e = parse_tap("--world unix:/w --name vm1 --type tap").unwrap_err();
         assert!(e.contains("needs --vm qemu:<path>"), "{e}");
         let e = parse_tap(&TAP.replace("qemu:", "firecracker:")).unwrap_err();
-        assert!(e.contains("--vm must be qemu:<path> or tap:<ifname>"), "{e}");
-        let t = parse_tap(&format!("{} --netns /run/netns/vm1", TAP.replace("qemu:/run/vm1.sock", "tap:tap0"))).unwrap();
-        assert_eq!((t.vm, t.netns), (VmLink::Tap("tap0".into()), Some(PathBuf::from("/run/netns/vm1"))));
-        assert!(parse_tap(&TAP.replace("qemu:/run/vm1.sock", "tap:a/b")).unwrap_err().contains("is not a link name"));
+        assert!(
+            e.contains("--vm must be qemu:<path> or tap:<ifname>"),
+            "{e}"
+        );
+        let t = parse_tap(&format!(
+            "{} --netns /run/netns/vm1",
+            TAP.replace("qemu:/run/vm1.sock", "tap:tap0")
+        ))
+        .unwrap();
+        assert_eq!(
+            (t.vm, t.netns),
+            (
+                VmLink::Tap("tap0".into()),
+                Some(PathBuf::from("/run/netns/vm1"))
+            )
+        );
+        assert!(
+            parse_tap(&TAP.replace("qemu:/run/vm1.sock", "tap:a/b"))
+                .unwrap_err()
+                .contains("is not a link name")
+        );
         let e = parse_tap(&format!("{TAP} --netns /run/netns/vm1")).unwrap_err();
         assert!(e.contains("--netns only with --vm tap:<ifname>"), "{e}");
         assert!(parse_tap(&TAP.replace("qemu:/run/vm1.sock", "qemu:")).is_err());
         let long = format!("qemu:/{}", "x".repeat(107));
-        assert!(parse_tap(&TAP.replace("qemu:/run/vm1.sock", &long)).unwrap_err().contains("at most 107 bytes"));
+        assert!(
+            parse_tap(&TAP.replace("qemu:/run/vm1.sock", &long))
+                .unwrap_err()
+                .contains("at most 107 bytes")
+        );
         let bad = |extra: &str| parse_tap(&format!("{TAP} {extra}")).unwrap_err();
         assert!(bad("--down-link eth0").starts_with("--type tap takes no --down-link"));
         assert!(bad("--no-resolv-conf").starts_with("--type tap takes no --no-resolv-conf"));

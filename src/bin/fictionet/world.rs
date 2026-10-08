@@ -56,31 +56,55 @@ pub(crate) fn handshake(g: &Greeting<'_>) -> Result<OwnedFd, Failure> {
     })?;
     let fd = sock.as_raw_fd();
     unix::raise_buffers(fd);
-    unix::set_timeout(fd, libc::SO_RCVTIMEO, Some(relay::HANDSHAKE_TIMEOUT + Duration::from_secs(1)))
-        .map_err(err("setting the handshake timeout"))?;
-    let hello = Hello { version: relay::VERSION, mtu: g.mtu, kind: g.kind.into(), name: g.name.into() };
+    unix::set_timeout(
+        fd,
+        libc::SO_RCVTIMEO,
+        Some(relay::HANDSHAKE_TIMEOUT + Duration::from_secs(1)),
+    )
+    .map_err(err("setting the handshake timeout"))?;
+    let hello = Hello {
+        version: relay::VERSION,
+        mtu: g.mtu,
+        kind: g.kind.into(),
+        name: g.name.into(),
+    };
     unix::send(fd, &Message::Hello(hello).encode(), false).map_err(err("sending hello"))?;
     let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
     let n = match unix::recv(fd, &mut buf, false) {
         Ok(n) => n,
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-            return Err(Failure::Error("the world did not answer hello in time".into()));
+            return Err(Failure::Error(
+                "the world did not answer hello in time".into(),
+            ));
         }
-        Err(e) => return Err(Failure::Error(format!("waiting for the world's answer: {e}"))),
+        Err(e) => {
+            return Err(Failure::Error(format!(
+                "waiting for the world's answer: {e}"
+            )));
+        }
     };
     if n == 0 {
-        return Err(Failure::Error("the world closed the connection without answering hello".into()));
+        return Err(Failure::Error(
+            "the world closed the connection without answering hello".into(),
+        ));
     }
     if n > relay::MAX_MESSAGE {
-        return Err(Failure::Error("the world answered hello with a message longer than 65,536 bytes".into()));
+        return Err(Failure::Error(
+            "the world answered hello with a message longer than 65,536 bytes".into(),
+        ));
     }
     match relay::decode(&buf[..n]) {
         Ok(Message::Accept) => {}
         Ok(Message::Refuse(reason)) => return Err(Failure::Refused(reason)),
-        Ok(other) => return Err(Failure::Error(format!("the world answered hello with {other:?}"))),
+        Ok(other) => {
+            return Err(Failure::Error(format!(
+                "the world answered hello with {other:?}"
+            )));
+        }
         Err(e) => return Err(Failure::Error(format!("the world's answer to hello: {e}"))),
     }
-    unix::set_timeout(fd, libc::SO_RCVTIMEO, None).map_err(err("clearing the handshake timeout"))?;
+    unix::set_timeout(fd, libc::SO_RCVTIMEO, None)
+        .map_err(err("clearing the handshake timeout"))?;
     unix::set_nonblocking(fd, true).map_err(err("making the socket nonblocking"))?;
     Ok(sock)
 }
@@ -95,17 +119,25 @@ fn connect(path: &str, wait: Duration) -> io::Result<OwnedFd> {
         match unix::connect(path) {
             Ok(sock) => return Ok(sock),
             Err(e)
-                if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
-                    && std::time::Instant::now() < deadline =>
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) && std::time::Instant::now() < deadline =>
             {
                 if !said {
-                    eprintln!("fictionet attach: waiting up to {} s for the world at {path}", wait.as_secs());
+                    eprintln!(
+                        "fictionet attach: waiting up to {} s for the world at {path}",
+                        wait.as_secs()
+                    );
                     said = true;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) if said => {
-                return Err(io::Error::new(e.kind(), format!("{e}, after waiting {} s", wait.as_secs())));
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("{e}, after waiting {} s", wait.as_secs()),
+                ));
             }
             Err(e) => return Err(e),
         }
@@ -128,7 +160,8 @@ pub(crate) fn write_ready_file(path: Option<&Path>, name: &str) -> Result<(), Fa
     if let Some(path) = path {
         let _ = fs::remove_file(path);
         let mut f = open_own_file(path, true).map_err(err("writing the ready file"))?;
-        io::Write::write_all(&mut f, format!("{name}\n").as_bytes()).map_err(err("writing the ready file"))?;
+        io::Write::write_all(&mut f, format!("{name}\n").as_bytes())
+            .map_err(err("writing the ready file"))?;
     }
     Ok(())
 }
@@ -141,7 +174,10 @@ pub(crate) fn write_ready_file(path: Option<&Path>, name: &str) -> Result<(), Fa
 pub(crate) fn open_own_file(path: &Path, new: bool) -> io::Result<fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut options = fs::OpenOptions::new();
-    options.write(true).mode(0o644).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    options
+        .write(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     if new {
         options.create_new(true);
     } else {
@@ -149,17 +185,26 @@ pub(crate) fn open_own_file(path: &Path, new: bool) -> io::Result<fs::File> {
     }
     let f = options.open(path).map_err(|e| {
         if e.raw_os_error() == Some(libc::ELOOP) {
-            io::Error::other(format!("{} is a symlink, which attach does not write through", path.display()))
+            io::Error::other(format!(
+                "{} is a symlink, which attach does not write through",
+                path.display()
+            ))
         } else {
             e
         }
     })?;
     let meta = f.metadata()?;
     if !meta.file_type().is_file() {
-        return Err(io::Error::other(format!("{} is not a regular file", path.display())));
+        return Err(io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
     }
     if meta.nlink() > 1 {
-        return Err(io::Error::other(format!("{} has other hard links, which attach does not write through", path.display())));
+        return Err(io::Error::other(format!(
+            "{} has other hard links, which attach does not write through",
+            path.display()
+        )));
     }
     Ok(f)
 }
@@ -196,12 +241,18 @@ pub(crate) fn read_packets(
 /// decode, or one longer than its limit ends attach with an error.
 fn world_packet(msg: &[u8]) -> Result<&[u8], Failure> {
     if msg.len() > relay::MAX_MESSAGE {
-        return Err(Failure::Error("the world sent a message longer than 65,536 bytes".into()));
+        return Err(Failure::Error(
+            "the world sent a message longer than 65,536 bytes".into(),
+        ));
     }
     match relay::decode(msg) {
         Ok(Message::Packet(p)) => Ok(p),
-        Ok(other) => Err(Failure::Error(format!("the world sent {other:?} after accept; closing"))),
-        Err(e) => Err(Failure::Error(format!("the world sent a bad message: {e}; closing"))),
+        Ok(other) => Err(Failure::Error(format!(
+            "the world sent {other:?} after accept; closing"
+        ))),
+        Err(e) => Err(Failure::Error(format!(
+            "the world sent a bad message: {e}; closing"
+        ))),
     }
 }
 
@@ -210,7 +261,10 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!("fn-world-{name}-{}-{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -224,7 +278,9 @@ mod tests {
         fs::write(&target, "keep\n").unwrap();
         let ready = dir.join("attach.ready");
         std::os::unix::fs::symlink(&target, &ready).unwrap();
-        write_ready_file(Some(&ready), "agent").map_err(|_| "write failed").unwrap();
+        write_ready_file(Some(&ready), "agent")
+            .map_err(|_| "write failed")
+            .unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep\n");
         assert!(fs::symlink_metadata(&ready).unwrap().file_type().is_file());
         assert_eq!(fs::read_to_string(&ready).unwrap(), "agent\n");
@@ -243,7 +299,10 @@ mod tests {
         fs::hard_link(&target, &hard).unwrap();
         assert!(open_own_file(&hard, false).is_err());
         assert!(open_own_file(&dir.join("fresh"), true).is_ok());
-        assert!(open_own_file(&dir.join("fresh"), true).is_err(), "new means new");
+        assert!(
+            open_own_file(&dir.join("fresh"), true).is_err(),
+            "new means new"
+        );
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep\n");
         fs::remove_dir_all(&dir).unwrap();
     }

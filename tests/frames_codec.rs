@@ -1,11 +1,9 @@
 //! Length-framed application streams: BGP, FastCGI, Kafka, Thrift, Zabbix.
 //! Bounded frame streams, exact wire values, and protocol errors.
 
-use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
-use fictionet::stdlib::codec::{
-    Decode, Fail, Stream, Wire, finish, pump,
-};
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::{bgp, fastcgi, kafka, thrift, zabbix};
 
@@ -15,7 +13,8 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    let (items, failure) = contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
+    let (items, failure) =
+        contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
     assert_eq!(items, expected);
     assert_eq!(failure, None);
     contract::check_decode_with_held_limit(&make, bytes, 0);
@@ -46,7 +45,10 @@ where
     let unread = stream.buffered();
     assert!(unread > 0);
     let error = Fail::Truncated { unread };
-    assert_eq!(contract::check_decode(&make, partial), (items, Some(error.clone())));
+    assert_eq!(
+        contract::check_decode(&make, partial),
+        (items, Some(error.clone()))
+    );
     assert_eq!(
         finish(&mut stream, |_| panic!("partial frame emitted")),
         Err(error.clone())
@@ -114,7 +116,10 @@ fn fastcgi_chunked_round_trip() {
     };
     let bytes = round_trip(Frames::<fastcgi::Record>::new, &[good.clone(), bad, good]);
     stack(
-        || Frames::<fastcgi::Record>::new().map(|record| fastcgi::BeginRequest::parse(&record.content)),
+        || {
+            Frames::<fastcgi::Record>::new()
+                .map(|record| fastcgi::BeginRequest::parse(&record.content))
+        },
         &bytes,
         &[Ok(body), Err(fastcgi::Error::BodyLength), Ok(body)],
     );
@@ -156,7 +161,12 @@ fn thrift_chunked_round_trip() {
         thrift::Protocol::BinaryOld,
         thrift::Protocol::Compact,
     ] {
-        let payload = thrift::EncodedMessage { message: call.clone(), protocol }.to_bytes().unwrap();
+        let payload = thrift::EncodedMessage {
+            message: call.clone(),
+            protocol,
+        }
+        .to_bytes()
+        .unwrap();
         let good = thrift::Frame(payload);
         let bytes = round_trip(
             Frames::<thrift::Frame>::new,
@@ -166,9 +176,15 @@ fn thrift_chunked_round_trip() {
             || Frames::<thrift::Frame>::new().map(|frame| thrift::EncodedMessage::parse(&frame.0)),
             &bytes,
             &[
-                Ok(thrift::EncodedMessage { message: call.clone(), protocol }),
+                Ok(thrift::EncodedMessage {
+                    message: call.clone(),
+                    protocol,
+                }),
                 Err(thrift::Error::Truncated),
-                Ok(thrift::EncodedMessage { message: call.clone(), protocol }),
+                Ok(thrift::EncodedMessage {
+                    message: call.clone(),
+                    protocol,
+                }),
             ],
         );
     }
@@ -221,7 +237,10 @@ fn bgp_rejects_oversize_at_named_limit() {
 
 #[test]
 fn fastcgi_rejects_oversize_at_named_limit() {
-    assert_eq!(Frames::<fastcgi::Record>::new().capacity(), fastcgi::MAX_RECORD);
+    assert_eq!(
+        Frames::<fastcgi::Record>::new().capacity(),
+        fastcgi::MAX_RECORD
+    );
     // The wire fields cannot exceed MAX_RECORD. Use MAX_CONTENT as the
     // configured total record limit to refuse a record that also needs padding.
     let make = || Frames::<fastcgi::Record>::with_limit(fastcgi::MAX_CONTENT);
@@ -301,7 +320,8 @@ fn zabbix_rejects_oversize_at_named_limit() {
             data_len: len,
             reserved: 0,
         }
-        .to_bytes().unwrap();
+        .to_bytes()
+        .unwrap();
         rejects(
             Frames::<zabbix::Packet>::new,
             &header,
@@ -315,7 +335,8 @@ fn zabbix_rejects_oversize_at_named_limit() {
             data_len: 0,
             reserved: len,
         }
-        .to_bytes().unwrap();
+        .to_bytes()
+        .unwrap();
         rejects(
             Frames::<zabbix::Packet>::new,
             &header,
@@ -357,7 +378,10 @@ fn strict_writers_are_transactional() {
 #[test]
 fn configurable_limits_clamp_and_accept_empty_frames() {
     assert_eq!(Frames::<thrift::Frame>::new().limit(), thrift::MAX_FRAME);
-    assert_eq!(Frames::<thrift::Frame>::default().limit(), thrift::MAX_FRAME);
+    assert_eq!(
+        Frames::<thrift::Frame>::default().limit(),
+        thrift::MAX_FRAME
+    );
     assert_eq!(
         Frames::<thrift::Frame>::with_limit(usize::MAX).limit(),
         thrift::MAX_FRAME
@@ -385,7 +409,10 @@ fn configurable_limits_clamp_and_accept_empty_frames() {
         Frames::<fastcgi::Record>::with_limit(usize::MAX).limit(),
         fastcgi::MAX_RECORD
     );
-    assert_eq!(Frames::<fastcgi::Record>::with_limit(0).limit(), fastcgi::HEADER_LEN);
+    assert_eq!(
+        Frames::<fastcgi::Record>::with_limit(0).limit(),
+        fastcgi::HEADER_LEN
+    );
     assert_eq!(
         Frames::<zabbix::Packet>::with_limit(usize::MAX).limit(),
         zabbix::MAX_DATA

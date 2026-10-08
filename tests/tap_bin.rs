@@ -11,8 +11,8 @@ use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use fictionet::stdlib::dhcp;
 use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::dhcp;
 use fictionet::stdlib::ip::checksum;
 use fictionet::{Interface, Packet, RecvError};
 
@@ -21,7 +21,10 @@ const VM: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 const GATEWAY: [u8; 6] = [0x02, 0x66, 0x6e, 0x00, 0x00, 0x01];
 
 fn temp_dir() -> std::path::PathBuf {
-    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
     let dir = std::env::temp_dir().join(format!("fn-tap-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -86,7 +89,10 @@ fn recv(qemu: &mut UnixStream) -> Vec<u8> {
 }
 
 /// Polls `recv` once: `None` if nothing is waiting.
-fn poll_once(fcx: &fictionet::Cx, i: &mut fictionet::Attachment) -> Option<Result<Packet, RecvError>> {
+fn poll_once(
+    fcx: &fictionet::Cx,
+    i: &mut fictionet::Attachment,
+) -> Option<Result<Packet, RecvError>> {
     let waker = std::task::Waker::noop();
     let mut cx = std::task::Context::from_waker(waker);
     match i.poll_recv(fcx, &mut cx) {
@@ -106,12 +112,32 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
     let vm_sock = dir.join("vm.sock");
     let ready = dir.join("ready");
     let (attacher, mut attachments) = fictionet::attachments();
-    let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(world.clone().into()), attacher).unwrap();
+    let listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(world.clone().into()),
+        attacher,
+    )
+    .unwrap();
 
     let attach = Command::new(BIN)
-        .args(["attach", "--world", &format!("unix:{world}"), "--name", "vm1", "--type", "tap"])
+        .args([
+            "attach",
+            "--world",
+            &format!("unix:{world}"),
+            "--name",
+            "vm1",
+            "--type",
+            "tap",
+        ])
         .arg(format!("--vm=qemu:{}", vm_sock.display()))
-        .args(["--ip-addr", "10.0.0.2/24", "--gateway", "10.0.0.1", "--dns", "10.0.0.1", "--no-ip-addr-v6"])
+        .args([
+            "--ip-addr",
+            "10.0.0.2/24",
+            "--gateway",
+            "10.0.0.1",
+            "--dns",
+            "10.0.0.1",
+            "--no-ip-addr-v6",
+        ])
         .arg(format!("--ready-file={}", ready.display()))
         .stderr(Stdio::piped())
         .spawn()
@@ -127,20 +153,31 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
         let mode = std::fs::metadata(&vm_sock).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "only attach's user may connect");
         let mut qemu = UnixStream::connect(&vm_sock).unwrap();
-        qemu.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        qemu.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
 
         // DHCP: discover, then the offer from attach, broadcast.
         let mut m = dhcp::Message::new(dhcp::BOOTREQUEST, 42);
         m.chaddr[..6].copy_from_slice(&VM);
         m.push(dhcp::opt::MESSAGE_TYPE, [dhcp::DISCOVER]);
-        send(&mut qemu, &frame([0xff; 6], 0x0800, &udp4([0; 4], 68, [255; 4], 67, &m.to_bytes().unwrap())));
+        send(
+            &mut qemu,
+            &frame(
+                [0xff; 6],
+                0x0800,
+                &udp4([0; 4], 68, [255; 4], 67, &m.to_bytes().unwrap()),
+            ),
+        );
         let offer = recv(&mut qemu);
         assert_eq!(&offer[0..12], &[[0xff; 6], GATEWAY].concat()[..]);
         let ip = &offer[14..];
         let reply = dhcp::Message::parse(&ip[28..]).unwrap();
         assert_eq!(reply.message_type(), Some(dhcp::OFFER));
         assert_eq!(reply.yiaddr, Ipv4Addr::new(10, 0, 0, 2));
-        assert_eq!(reply.option_addr(dhcp::opt::ROUTER), Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(
+            reply.option_addr(dhcp::opt::ROUTER),
+            Some(Ipv4Addr::new(10, 0, 0, 1))
+        );
 
         // The socket file is gone once QEMU is connected: one VM only.
         assert!(!vm_sock.exists());
@@ -152,14 +189,26 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
         send(&mut qemu, &frame([0xff; 6], 0x0806, &arp));
         let a = recv(&mut qemu);
         assert_eq!(&a[0..6], &VM);
-        assert_eq!(&a[14 + 8..14 + 18], &[GATEWAY.as_slice(), &[10, 0, 0, 1]].concat()[..]);
+        assert_eq!(
+            &a[14 + 8..14 + 18],
+            &[GATEWAY.as_slice(), &[10, 0, 0, 1]].concat()[..]
+        );
 
         // A spoofed ping, then a real one. Only the real one reaches the
         // world, which answers it.
-        send(&mut qemu, &frame(GATEWAY, 0x0800, &echo_request([10, 0, 0, 77])));
-        send(&mut qemu, &frame(GATEWAY, 0x0800, &echo_request([10, 0, 0, 2])));
+        send(
+            &mut qemu,
+            &frame(GATEWAY, 0x0800, &echo_request([10, 0, 0, 77])),
+        );
+        send(
+            &mut qemu,
+            &frame(GATEWAY, 0x0800, &echo_request([10, 0, 0, 2])),
+        );
         let back = recv(&mut qemu);
-        assert_eq!(&back[0..14], &[VM.as_slice(), &GATEWAY, &[8, 0]].concat()[..]);
+        assert_eq!(
+            &back[0..14],
+            &[VM.as_slice(), &GATEWAY, &[8, 0]].concat()[..]
+        );
         assert_eq!(&back[14..], &from_world()[..]);
         drop(qemu);
     });
@@ -190,15 +239,25 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
     drop(listening);
 
     let packets = seen.lock().unwrap().clone();
-    assert_eq!(packets.len(), 1, "only the real ping reached the world: {packets:?}");
+    assert_eq!(
+        packets.len(),
+        1,
+        "only the real ping reached the world: {packets:?}"
+    );
     assert_eq!(packets[0], echo_request([10, 0, 0, 2]));
 
     let out = attach.wait_with_output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{err}");
     assert!(err.contains("the VM's MAC is 52:54:00:12:34:56"), "{err}");
-    assert!(err.contains("1 frames from the VM dropped: from an address attach did not hand out"), "{err}");
-    assert!(err.contains("QEMU closed the connection; vm1 detached"), "{err}");
+    assert!(
+        err.contains("1 frames from the VM dropped: from an address attach did not hand out"),
+        "{err}"
+    );
+    assert!(
+        err.contains("QEMU closed the connection; vm1 detached"),
+        "{err}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -211,7 +270,15 @@ fn a_live_socket_is_refused_and_a_stale_one_replaced() {
     let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let run = || {
         Command::new(BIN)
-            .args(["attach", "--world", "unix:/nonexistent/w.sock", "--name", "vm1", "--type", "tap"])
+            .args([
+                "attach",
+                "--world",
+                "unix:/nonexistent/w.sock",
+                "--name",
+                "vm1",
+                "--type",
+                "tap",
+            ])
             .arg(format!("--vm=qemu:{}", path.display()))
             .output()
             .unwrap()
@@ -241,10 +308,22 @@ fn a_second_attach_leaves_the_waiting_one_alone() {
     let vm_sock = dir.join("vm one.sock");
     let ready = dir.join("ready");
     let (attacher, _attachments) = fictionet::attachments();
-    let listening = fictionet::listen(fictionet::WorldSocket::UnixSocket(world.clone().into()), attacher).unwrap();
+    let listening = fictionet::listen(
+        fictionet::WorldSocket::UnixSocket(world.clone().into()),
+        attacher,
+    )
+    .unwrap();
     let attach = |name: &str| {
         Command::new(BIN)
-            .args(["attach", "--world", &format!("unix:{world}"), "--name", name, "--type", "tap"])
+            .args([
+                "attach",
+                "--world",
+                &format!("unix:{world}"),
+                "--name",
+                name,
+                "--type",
+                "tap",
+            ])
             .arg(format!("--vm=qemu:{}", vm_sock.display()))
             .arg(format!("--ready-file={}", ready.display()))
             .stderr(Stdio::piped())
@@ -266,7 +345,15 @@ fn a_second_attach_leaves_the_waiting_one_alone() {
     // The same path, spelled relative to the directory.
     let third = Command::new(BIN)
         .current_dir(&dir)
-        .args(["attach", "--world", &format!("unix:{world}"), "--name", "vm3", "--type", "tap"])
+        .args([
+            "attach",
+            "--world",
+            &format!("unix:{world}"),
+            "--name",
+            "vm3",
+            "--type",
+            "tap",
+        ])
         .arg("--vm=qemu:./vm one.sock")
         .arg(format!("--ready-file={}", ready.display()))
         .output()
@@ -275,14 +362,20 @@ fn a_second_attach_leaves_the_waiting_one_alone() {
     assert_eq!(third.status.code(), Some(1), "{err}");
     assert!(err.contains("another attach is using"), "{err}");
     assert!(vm_sock.exists(), "the first attach's socket is still there");
-    assert!(ready.exists(), "the first attach's ready file is still there");
+    assert!(
+        ready.exists(),
+        "the first attach's ready file is still there"
+    );
     // The first attach is still waiting, and takes this connection.
     let qemu = UnixStream::connect(&vm_sock).unwrap();
     drop(qemu);
     let out = first.wait_with_output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{err}");
-    assert!(err.contains("QEMU connected") && err.contains("QEMU closed the connection; vm1 detached"), "{err}");
+    assert!(
+        err.contains("QEMU connected") && err.contains("QEMU closed the connection; vm1 detached"),
+        "{err}"
+    );
     drop(listening);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -304,14 +397,26 @@ fn fake_world(path: &std::path::Path, message: Vec<u8>) -> std::thread::JoinHand
     std::thread::spawn(move || {
         // SAFETY: as above.
         let conn = unsafe {
-            let fd = libc::accept(listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut());
+            let fd = libc::accept(
+                listener.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
             assert!(fd >= 0);
             OwnedFd::from_raw_fd(fd)
         };
         let mut buf = vec![0u8; 70_000];
         let n = fictionet::relay::unix::recv(conn.as_raw_fd(), &mut buf, false).unwrap();
-        assert!(matches!(fictionet::relay::decode(&buf[..n]), Ok(fictionet::relay::Message::Hello(_))));
-        fictionet::relay::unix::send(conn.as_raw_fd(), &fictionet::relay::Message::Accept.encode(), false).unwrap();
+        assert!(matches!(
+            fictionet::relay::decode(&buf[..n]),
+            Ok(fictionet::relay::Message::Hello(_))
+        ));
+        fictionet::relay::unix::send(
+            conn.as_raw_fd(),
+            &fictionet::relay::Message::Accept.encode(),
+            false,
+        )
+        .unwrap();
         fictionet::relay::unix::send(conn.as_raw_fd(), &message, false).unwrap();
         // Wait for attach to close its end.
         let _ = fictionet::relay::unix::recv(conn.as_raw_fd(), &mut buf, false);
@@ -324,9 +429,21 @@ fn fake_world(path: &std::path::Path, message: Vec<u8>) -> std::thread::JoinHand
 #[test]
 fn messages_from_the_world_are_checked_while_waiting_for_qemu() {
     let cases: [(&str, Vec<u8>, Option<&str>); 3] = [
-        ("packet", fictionet::relay::Message::Packet(&from_world()).encode(), None),
-        ("unknown kind", vec![99, 1, 2, 3], Some("the world sent a bad message")),
-        ("accept again", fictionet::relay::Message::Accept.encode(), Some("after accept")),
+        (
+            "packet",
+            fictionet::relay::Message::Packet(&from_world()).encode(),
+            None,
+        ),
+        (
+            "unknown kind",
+            vec![99, 1, 2, 3],
+            Some("the world sent a bad message"),
+        ),
+        (
+            "accept again",
+            fictionet::relay::Message::Accept.encode(),
+            Some("after accept"),
+        ),
     ];
     for (what, message, error) in cases {
         let dir = temp_dir();
@@ -335,7 +452,15 @@ fn messages_from_the_world_are_checked_while_waiting_for_qemu() {
         let ready = dir.join("ready");
         let world_side = fake_world(&world, message);
         let mut attach = Command::new(BIN)
-            .args(["attach", "--world", &format!("unix:{}", world.display()), "--name", "vm1", "--type", "tap"])
+            .args([
+                "attach",
+                "--world",
+                &format!("unix:{}", world.display()),
+                "--name",
+                "vm1",
+                "--type",
+                "tap",
+            ])
             .arg(format!("--vm=qemu:{}", vm_sock.display()))
             .arg(format!("--ready-file={}", ready.display()))
             .stderr(Stdio::piped())
@@ -353,17 +478,30 @@ fn messages_from_the_world_are_checked_while_waiting_for_qemu() {
             Some(want) => {
                 let status = exited.unwrap_or_else(|| panic!("{what}: attach kept waiting"));
                 let mut err = String::new();
-                attach.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+                attach
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut err)
+                    .unwrap();
                 assert_eq!(status.code(), Some(1), "{what}: {err}");
                 assert!(err.contains(want), "{what}: {err}");
-                assert!(!ready.exists() && !vm_sock.exists(), "{what}: attach cleaned up");
+                assert!(
+                    !ready.exists() && !vm_sock.exists(),
+                    "{what}: attach cleaned up"
+                );
             }
             None => {
                 assert!(exited.is_none(), "{what}: attach exited");
                 // Still waiting: QEMU connects, then leaves.
                 drop(UnixStream::connect(&vm_sock).unwrap());
                 let out = attach.wait_with_output().unwrap();
-                assert_eq!(out.status.code(), Some(0), "{what}: {}", String::from_utf8_lossy(&out.stderr));
+                assert_eq!(
+                    out.status.code(),
+                    Some(0),
+                    "{what}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
             }
         }
         world_side.join().unwrap();

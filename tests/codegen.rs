@@ -16,8 +16,8 @@ mod edges;
 
 use fictionet::stdlib::{
     codec::{Decode, Lcg, Step, Wire},
-    test_support::contract,
     onc_rpc::{self, Reader, Writer},
+    test_support::contract,
 };
 
 fn dynamic_read(bytes: &[u8]) -> Result<xdr::Record, onc_rpc::Error> {
@@ -163,11 +163,7 @@ fn recursive_depth_and_transactional_errors() {
     }
     bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0]);
     assert_eq!(Node::parse(&bytes), Err(Error::Depth));
-    contract::check_decode_with_alloc_limit(
-        || Nodes,
-        &bytes,
-        2 * (recursive::MAX_MESSAGE + 6),
-    );
+    contract::check_decode_with_alloc_limit(|| Nodes, &bytes, 2 * (recursive::MAX_MESSAGE + 6));
 }
 #[test]
 fn strict_data_null_float_and_set_writes() {
@@ -399,7 +395,10 @@ fn shared_helpers_preserve_fields_and_boxing() {
         negative: Some(0.0),
     };
     let bytes = value.to_bytes().unwrap();
-    assert_eq!(&bytes[..12], &[1, 2, 3, 4, 8, 7, 6, 5, b'a', b'b', b'c', b'd']);
+    assert_eq!(
+        &bytes[..12],
+        &[1, 2, 3, 4, 8, 7, 6, 5, b'a', b'b', b'c', b'd']
+    );
     let parsed = recursive::Shared::parse(&bytes).unwrap();
     assert_eq!(parsed, value);
     assert_eq!(parsed.positive.unwrap().to_bits(), (-0.0f32).to_bits());

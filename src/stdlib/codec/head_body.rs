@@ -3,9 +3,9 @@
 
 extern crate alloc;
 
-use fictionet::stdlib::codec::{Buffer, LineError};
-use fictionet::stdlib::codec::ascii::{trim_ows as trim_frame_ws, is_tchar as is_token_byte};
 use alloc::string::{String, ToString};
+use fictionet::stdlib::codec::ascii::{is_tchar as is_token_byte, trim_ows as trim_frame_ws};
+use fictionet::stdlib::codec::{Buffer, LineError};
 
 /// One header field: its name as it came and its value with folded lines
 /// joined by single spaces and the ends trimmed.
@@ -21,7 +21,10 @@ impl Header {
     /// A header with this name and value.
     #[inline]
     pub fn new(name: &str, value: &str) -> Header {
-        Header { name: name.to_string(), value: value.to_string() }
+        Header {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
     }
 }
 
@@ -45,8 +48,14 @@ impl Scanner {
     /// line. Length validation belongs to the callback passed to `scan`.
     #[inline]
     pub fn new(max_line: usize, max_head: usize, crlf: bool) -> Self {
-        Self { max_line: max_line.min(Buffer::MAX_LIMIT.saturating_sub(2)), max_head,
-            crlf, scanned: 0, line_scan: 0, body: None }
+        Self {
+            max_line: max_line.min(Buffer::MAX_LIMIT.saturating_sub(2)),
+            max_head,
+            crlf,
+            scanned: 0,
+            line_scan: 0,
+            body: None,
+        }
     }
 
     /// Whether no complete head line or body boundary has been retained.
@@ -65,7 +74,11 @@ impl Scanner {
             let stop = rest.len().min(room).min(self.max_line.saturating_add(2));
             let window = &rest[..stop];
             let from = self.line_scan.min(stop);
-            if let Some(i) = window[from..].iter().position(|&b| b == b'\n').map(|i| i + from) {
+            if let Some(i) = window[from..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|i| i + from)
+            {
                 let cr = i > 0 && window[i - 1] == b'\r';
                 let content = i - usize::from(cr);
                 if content > self.max_line {
@@ -82,7 +95,9 @@ impl Scanner {
             } else {
                 self.line_scan = stop;
                 if stop >= room || stop >= self.max_line.saturating_add(2) {
-                    return Err(LineError::TooLong { max: self.max_head.min(self.max_line) });
+                    return Err(LineError::TooLong {
+                        max: self.max_head.min(self.max_line),
+                    });
                 }
                 return Ok(None);
             }
@@ -94,15 +109,20 @@ impl Scanner {
     /// line error to a protocol error, including unexpected line errors.
     #[inline]
     pub fn scan<E>(
-        &mut self, input: &[u8], length: impl FnOnce(&[u8]) -> Result<usize, E>,
+        &mut self,
+        input: &[u8],
+        length: impl FnOnce(&[u8]) -> Result<usize, E>,
         line_error: impl Fn(LineError) -> E,
     ) -> Result<Option<(usize, usize)>, E> {
         if self.body.is_none() {
-            let Some(head) = self.scan_head(input).map_err(&line_error)? else { return Ok(None) };
+            let Some(head) = self.scan_head(input).map_err(&line_error)? else {
+                return Ok(None);
+            };
             self.body = Some((head, length(&input[..head])?));
         }
         let (head, length) = self.body.unwrap();
-        let used = head.checked_add(length)
+        let used = head
+            .checked_add(length)
             .ok_or_else(|| line_error(LineError::TooLong { max: self.max_head }))?;
         if input.len() < used {
             return Ok(None);
@@ -121,8 +141,11 @@ impl Scanner {
 /// that inserts a space inside a length and conflicting duplicates fail.
 #[inline]
 pub fn content_length<'a, E: Clone>(
-    lines: impl Iterator<Item = &'a [u8]>, is_length: impl Fn(&[u8]) -> bool,
-    parse: impl Fn(&str) -> Result<usize, E>, allow_equal: bool, malformed: E,
+    lines: impl Iterator<Item = &'a [u8]>,
+    is_length: impl Fn(&[u8]) -> bool,
+    parse: impl Fn(&str) -> Result<usize, E>,
+    allow_equal: bool,
+    malformed: E,
 ) -> Result<Option<usize>, E> {
     let mut length = None;
     let mut active = false;
@@ -141,7 +164,13 @@ pub fn content_length<'a, E: Clone>(
             continue;
         }
         if active {
-            store_length(&mut length, value.unwrap_or_default(), &parse, allow_equal, &malformed)?;
+            store_length(
+                &mut length,
+                value.unwrap_or_default(),
+                &parse,
+                allow_equal,
+                &malformed,
+            )?;
         }
         value = None;
         let colon = line.iter().position(|&b| b == b':');
@@ -151,13 +180,19 @@ pub fn content_length<'a, E: Clone>(
         if !active {
             // A recognizable length name with a missing colon or an invalid
             // suffix must not be mistaken for an unrelated bad header.
-            let token = name.split(|b| !is_token_byte(*b)).next().unwrap_or_default();
+            let token = name
+                .split(|b| !is_token_byte(*b))
+                .next()
+                .unwrap_or_default();
             if is_length(token) {
                 return Err(malformed.clone());
             }
         }
         if active {
-            let at = colon.ok_or(malformed.clone())?.checked_add(1).ok_or(malformed.clone())?;
+            let at = colon
+                .ok_or(malformed.clone())?
+                .checked_add(1)
+                .ok_or(malformed.clone())?;
             let bytes = line.get(at..).ok_or(malformed.clone())?;
             let bytes = trim_frame_ws(bytes);
             if !bytes.is_empty() {
@@ -166,15 +201,24 @@ pub fn content_length<'a, E: Clone>(
         }
     }
     if active {
-        store_length(&mut length, value.unwrap_or_default(), &parse, allow_equal, &malformed)?;
+        store_length(
+            &mut length,
+            value.unwrap_or_default(),
+            &parse,
+            allow_equal,
+            &malformed,
+        )?;
     }
     Ok(length)
 }
 
 #[inline]
 fn store_length<E: Clone>(
-    length: &mut Option<usize>, bytes: &[u8], parse: &impl Fn(&str) -> Result<usize, E>,
-    allow_equal: bool, malformed: &E,
+    length: &mut Option<usize>,
+    bytes: &[u8],
+    parse: &impl Fn(&str) -> Result<usize, E>,
+    allow_equal: bool,
+    malformed: &E,
 ) -> Result<(), E> {
     let value = core::str::from_utf8(bytes).map_err(|_| malformed.clone())?;
     let n = parse(value)?;
@@ -187,32 +231,53 @@ fn store_length<E: Clone>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{Decode, Fail, Step, Stream};
+    use super::*;
     use alloc::{vec, vec::Vec};
 
     struct Units(Scanner);
 
     fn length(head: &[u8]) -> Result<usize, &'static str> {
-        let lines = head.split(|&b| b == b'\n').skip(1)
+        let lines = head
+            .split(|&b| b == b'\n')
+            .skip(1)
             .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
-        content_length(lines, |name| name.eq_ignore_ascii_case(b"Content-Length"), |value| {
-            let n = value.parse::<usize>().map_err(|_| "length")?;
-            if n > 4 { return Err("limit"); }
-            Ok(n)
-        }, true, "length").map(|n| n.unwrap_or(0))
+        content_length(
+            lines,
+            |name| name.eq_ignore_ascii_case(b"Content-Length"),
+            |value| {
+                let n = value.parse::<usize>().map_err(|_| "length")?;
+                if n > 4 {
+                    return Err("limit");
+                }
+                Ok(n)
+            },
+            true,
+            "length",
+        )
+        .map(|n| n.unwrap_or(0))
     }
 
     impl Decode for Units {
         type Item = (Vec<u8>, Vec<u8>);
         type Error = LineError;
         const NAME: &'static str = "head-body test";
-        fn capacity(&self) -> usize { 132 }
+        fn capacity(&self) -> usize {
+            132
+        }
         fn decode(&mut self, input: &[u8], _: bool) -> Result<Step<Self::Item>, Self::Error> {
-            Ok(match self.0.scan(input, |head| length(head).map_err(|_| LineError::Unterminated), |error| error)? {
-                Some((head, used)) => Step::Item((input[..head].to_vec(), input[head..used].to_vec()), used),
-                None => Step::Need,
-            })
+            Ok(
+                match self.0.scan(
+                    input,
+                    |head| length(head).map_err(|_| LineError::Unterminated),
+                    |error| error,
+                )? {
+                    Some((head, used)) => {
+                        Step::Item((input[..head].to_vec(), input[head..used].to_vec()), used)
+                    }
+                    None => Step::Need,
+                },
+            )
         }
     }
 
@@ -221,7 +286,10 @@ mod tests {
         for crlf in [false, true] {
             let bytes = b"START\r\nContent-Length: 4\r\n\r\nbodyNEXT\r\n\r\n";
             let expected = vec![
-                (b"START\r\nContent-Length: 4\r\n\r\n".to_vec(), b"body".to_vec()),
+                (
+                    b"START\r\nContent-Length: 4\r\n\r\n".to_vec(),
+                    b"body".to_vec(),
+                ),
                 (b"NEXT\r\n\r\n".to_vec(), vec![]),
             ];
             for split in 0..=bytes.len() {
@@ -229,7 +297,9 @@ mod tests {
                 let mut items = Vec::new();
                 for chunk in [&bytes[..split], &bytes[split..]] {
                     assert_eq!(stream.push(chunk), chunk.len());
-                    while let Some(item) = stream.next() { items.push(item.unwrap()); }
+                    while let Some(item) = stream.next() {
+                        items.push(item.unwrap());
+                    }
                 }
                 stream.end();
                 assert_eq!(stream.next(), None);
@@ -239,7 +309,9 @@ mod tests {
             let mut items = Vec::new();
             for byte in bytes {
                 assert_eq!(stream.push(&[*byte]), 1);
-                while let Some(item) = stream.next() { items.push(item.unwrap()); }
+                while let Some(item) = stream.next() {
+                    items.push(item.unwrap());
+                }
             }
             assert_eq!(items, expected);
         }
@@ -250,7 +322,10 @@ mod tests {
         let mut scanner = Scanner::new(64, 128, true);
         let bytes = b"START\r\nContent-Length: 4\r\n\r\nbody";
         assert_eq!(scanner.scan(bytes, length, |_| "line"), Ok(Some((28, 32))));
-        assert_eq!(scanner.scan(b"START\r\nContent-Length: 5\r\n\r\n", length, |_| "line"), Err("limit"));
+        assert_eq!(
+            scanner.scan(b"START\r\nContent-Length: 5\r\n\r\n", length, |_| "line"),
+            Err("limit")
+        );
         for body in [b"".as_slice(), b"bod"] {
             let mut stream = Stream::new(Units(Scanner::new(64, 128, true)));
             let mut bytes = b"START\r\nContent-Length: 4\r\n\r\n".to_vec();
@@ -258,13 +333,21 @@ mod tests {
             assert_eq!(stream.push(&bytes), bytes.len());
             assert_eq!(stream.next(), None);
             stream.end();
-            assert_eq!(stream.next(), Some(Err(Fail::Truncated { unread: bytes.len() })));
+            assert_eq!(
+                stream.next(),
+                Some(Err(Fail::Truncated {
+                    unread: bytes.len()
+                }))
+            );
         }
     }
 
     #[test]
     fn malformed_lines_are_errors() {
         let mut scanner = Scanner::new(64, 128, true);
-        assert_eq!(scanner.scan(b"START\n\n", length, |_| "malformed head"), Err("malformed head"));
+        assert_eq!(
+            scanner.scan(b"START\n\n", length, |_| "malformed head"),
+            Err("malformed head")
+        );
     }
 }

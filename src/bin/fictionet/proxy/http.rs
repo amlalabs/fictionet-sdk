@@ -5,7 +5,10 @@
 use std::time::{Duration, Instant};
 
 use fictionet::relay::proxy::auth::Token;
-use fictionet::relay::proxy::http::{Answer, MAX_HEAD, Reject, Request, Target, error_response, forward_head, parse_request, rewrite_response};
+use fictionet::relay::proxy::http::{
+    Answer, MAX_HEAD, Reject, Request, Target, error_response, forward_head, parse_request,
+    rewrite_response,
+};
 use fictionet::stdlib::tcp::TcpConnection;
 use fictionet::tokio::{Compat, ConnectionTokioExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -72,7 +75,10 @@ pub(crate) async fn serve(mut client: TcpStream, stack: Stack, token: Token) {
     let mut buf = Vec::with_capacity(4096);
     let parsed = tokio::time::timeout(
         HEAD_TIMEOUT,
-        read_head(&mut client, &mut buf, parse_request, || Reject { status: 431, why: "the request head is longer than 64 KiB".into() }),
+        read_head(&mut client, &mut buf, parse_request, || Reject {
+            status: 431,
+            why: "the request head is longer than 64 KiB".into(),
+        }),
     )
     .await;
     let (req, len) = match parsed {
@@ -89,16 +95,32 @@ pub(crate) async fn serve(mut client: TcpStream, stack: Stack, token: Token) {
     };
     let what = match &req.target {
         Target::Connect { host, port } => format!("CONNECT {host}:{port}"),
-        Target::Forward { host, port, path, .. } => format!("{} http://{host}:{port}{path}", req.head.method),
+        Target::Forward {
+            host, port, path, ..
+        } => format!("{} http://{host}:{port}{path}", req.head.method),
     };
-    if !req.header("proxy-authorization").is_some_and(|v| token.check_header(v)) {
-        let why = if req.header("proxy-authorization").is_some() { "wrong token" } else { "no token" };
+    if !req
+        .header("proxy-authorization")
+        .is_some_and(|v| token.check_header(v))
+    {
+        let why = if req.header("proxy-authorization").is_some() {
+            "wrong token"
+        } else {
+            "no token"
+        };
         log(&format!("{what} 407 {why}"));
-        return answer(&mut client, 407, &format!("{why}: give the sandbox's token as the proxy password")).await;
+        return answer(
+            &mut client,
+            407,
+            &format!("{why}: give the sandbox's token as the proxy password"),
+        )
+        .await;
     }
     let started = Instant::now();
     let (host, port) = match &req.target {
-        Target::Connect { host, port } | Target::Forward { host, port, .. } => (host.clone(), *port),
+        Target::Connect { host, port } | Target::Forward { host, port, .. } => {
+            (host.clone(), *port)
+        }
     };
     let (conn, addr) = match stack.connect(&host, port).await {
         Ok(c) => c,
@@ -112,14 +134,24 @@ pub(crate) async fn serve(mut client: TcpStream, stack: Stack, token: Token) {
     let rest = buf.split_off(len);
     match req.target {
         Target::Connect { .. } => {
-            if client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.is_err() {
-                return log(&format!("{what} ({addr}) 200, but the client closed the connection first"));
+            if client
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .is_err()
+            {
+                return log(&format!(
+                    "{what} ({addr}) 200, but the client closed the connection first"
+                ));
             }
             if !rest.is_empty() && world.write_all(&rest).await.is_err() {
-                return log(&format!("{what} ({addr}) 200, but the site closed the connection first"));
+                return log(&format!(
+                    "{what} ({addr}) 200, but the site closed the connection first"
+                ));
             }
             let (moved, error) = pump::tunnel(&mut client, &mut world).await;
-            let end = error.map(|e| format!(", ended early by {e}")).unwrap_or_default();
+            let end = error
+                .map(|e| format!(", ended early by {e}"))
+                .unwrap_or_default();
             log(&format!(
                 "{what} ({addr}) 200, {} bytes up, {} down, {:.3} s{end}",
                 moved.up + rest.len() as u64,
@@ -146,7 +178,9 @@ async fn forward(
     let mut head = forward_head(req);
     head.extend_from_slice(&body_start);
     if ww.write_all(&head).await.is_err() {
-        log(&format!("{what} ({addr}) 502, the site closed the connection"));
+        log(&format!(
+            "{what} ({addr}) 502, the site closed the connection"
+        ));
         return answer(&mut cw, 502, "the site closed the connection").await;
     }
     let up = async {
@@ -158,11 +192,24 @@ async fn forward(
         let mut rbuf = Vec::new();
         let status;
         loop {
-            let found = read_head(&mut wr, &mut rbuf, rewrite_response, || "the answer's head is longer than 64 KiB".to_string()).await;
-            let Answer { head: out, status: code, interim, len } = match found {
+            let found = read_head(&mut wr, &mut rbuf, rewrite_response, || {
+                "the answer's head is longer than 64 KiB".to_string()
+            })
+            .await;
+            let Answer {
+                head: out,
+                status: code,
+                interim,
+                len,
+            } = match found {
                 Ok(Ok(Some(f))) => f,
                 Ok(Ok(None)) => {
-                    answer(&mut cw, 502, "the site closed the connection without an answer").await;
+                    answer(
+                        &mut cw,
+                        502,
+                        "the site closed the connection without an answer",
+                    )
+                    .await;
                     return Err(502);
                 }
                 Ok(Err(why)) => {
@@ -197,7 +244,9 @@ async fn forward(
             "{what} ({addr}) {status}, {up} bytes up, {n} down, {:.3} s",
             took.as_secs_f64()
         )),
-        Err(status) => log(&format!("{what} ({addr}) {status}, no answer from the site")),
+        Err(status) => log(&format!(
+            "{what} ({addr}) {status}, no answer from the site"
+        )),
     }
 }
 
@@ -209,13 +258,21 @@ mod tests {
     /// two parts: no read returns bytes of both. Returns the head's length
     /// and every byte after it, read or not.
     fn read_request(input: &[u8], split: usize) -> Result<(usize, Vec<u8>), Reject> {
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let (a, b) = input.split_at(split);
         let mut r = a.chain(b);
         let mut buf = Vec::new();
         rt.block_on(async {
-            let too_long = || Reject { status: 431, why: "too long".into() };
-            let (_, len) = read_head(&mut r, &mut buf, parse_request, too_long).await.unwrap()?.unwrap();
+            let too_long = || Reject {
+                status: 431,
+                why: "too long".into(),
+            };
+            let (_, len) = read_head(&mut r, &mut buf, parse_request, too_long)
+                .await
+                .unwrap()?
+                .unwrap();
             let mut rest = buf.split_off(len);
             r.read_to_end(&mut rest).await.unwrap();
             Ok((len, rest))
@@ -235,10 +292,17 @@ mod tests {
         // for the body.
         let mut input = head_of(MAX_HEAD);
         input.extend_from_slice(b"body");
-        assert_eq!(read_request(&input, MAX_HEAD - 1).unwrap(), (MAX_HEAD, b"body".to_vec()));
+        assert_eq!(
+            read_request(&input, MAX_HEAD - 1).unwrap(),
+            (MAX_HEAD, b"body".to_vec())
+        );
         // A longer head gets 431, even when its end arrives in the same
         // read as the bytes that take it past the limit.
-        for (len, split) in [(MAX_HEAD + 1, 0), (MAX_HEAD + 3, MAX_HEAD - 1), (MAX_HEAD + 4000, MAX_HEAD - 10)] {
+        for (len, split) in [
+            (MAX_HEAD + 1, 0),
+            (MAX_HEAD + 3, MAX_HEAD - 1),
+            (MAX_HEAD + 4000, MAX_HEAD - 10),
+        ] {
             let e = read_request(&head_of(len), split).unwrap_err();
             assert_eq!(e.status, 431, "{len} bytes, split at {split}");
         }

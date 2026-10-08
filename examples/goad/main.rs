@@ -44,12 +44,20 @@ fn main() -> Result {
         return Ok(());
     }
     if let Some(flag) = args.iter().find(|a| a.starts_with('-')) {
-        return Err(fictionet::Error::msg(format!("unknown option {flag:?}\n{USAGE}")));
+        return Err(fictionet::Error::msg(format!(
+            "unknown option {flag:?}\n{USAGE}"
+        )));
     }
     if args.len() > 2 {
-        return Err(fictionet::Error::msg(format!("unexpected argument {:?}\n{USAGE}", args[2])));
+        return Err(fictionet::Error::msg(format!(
+            "unexpected argument {:?}\n{USAGE}",
+            args[2]
+        )));
     }
-    let socket = args.first().cloned().unwrap_or_else(|| "/run/fictionet/goad.sock".into());
+    let socket = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "/run/fictionet/goad.sock".into());
     let prefix = parse_prefix(args.get(1).map_or("192.168.56", String::as_str))?;
 
     let subnet: Prefix = format!("{}.{}.{}.0/24", prefix[0], prefix[1], prefix[2]).parse()?;
@@ -84,7 +92,10 @@ fn main() -> Result {
                 continue;
             };
             println!("attached {name} at {addr}");
-            let event = Event::new("goad", "member_attached").summary(format!("{name} attached at {addr}")).field("name", name.as_str()).field("address", addr.to_string());
+            let event = Event::new("goad", "member_attached")
+                .summary(format!("{name} attached at {addr}"))
+                .field("name", name.as_str())
+                .field("address", addr.to_string());
             fcx.record(event);
             lan.add(addr, Box::new(sandbox) as Box<dyn Interface>, None)?;
         }
@@ -96,7 +107,11 @@ fn parse_prefix(text: &str) -> Result<[u8; 3]> {
         .split('.')
         .map(str::parse)
         .collect::<std::result::Result<Vec<u8>, _>>();
-    let not_octets = || fictionet::Error::msg(format!("{text:?} is not the first three octets of an IPv4 network"));
+    let not_octets = || {
+        fictionet::Error::msg(format!(
+            "{text:?} is not the first three octets of an IPv4 network"
+        ))
+    };
     let parts = parts.map_err(|_| not_octets())?;
     <[u8; 3]>::try_from(parts).map_err(|_| not_octets())
 }

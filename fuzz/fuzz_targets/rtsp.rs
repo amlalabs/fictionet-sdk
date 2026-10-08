@@ -4,12 +4,12 @@
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::rtsp::{
-    Frames, Interleaved, Frame, MAX_BODY, MAX_HEAD, MAX_INTERLEAVED, MAX_MESSAGE, Message, Range, Session, Transport,
-    Transports, Version,
-};
 use fictionet::stdlib::rtsp::harness::{round_trip, text_value};
+use fictionet::stdlib::rtsp::{
+    Frame, Frames, Interleaved, MAX_BODY, MAX_HEAD, MAX_INTERLEAVED, MAX_MESSAGE, Message, Range,
+    Session, Transport, Transports, Version,
+};
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -61,19 +61,33 @@ fuzz_target!(|data: &[u8]| {
 // Exercise message fields that parsed input has already normalized.
 fn writers(data: &[u8]) {
     let bounded = data.get(..MAX_HEAD + 1).unwrap_or(data);
-    let parts: Vec<String> =
-        bounded.split(|&b| b == 0xff).take(12).map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+    let parts: Vec<String> = bounded
+        .split(|&b| b == 0xff)
+        .take(12)
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
     let part = |i: usize| parts.get(i).cloned().unwrap_or_default();
-    let version = if data.first().is_some_and(|b| b & 1 == 1) { Version::Rtsp10 } else { Version::Rtsp20 };
+    let version = if data.first().is_some_and(|b| b & 1 == 1) {
+        Version::Rtsp10
+    } else {
+        Version::Rtsp20
+    };
     let mut message = if data.first().is_some_and(|b| b & 2 == 2) {
         Message::request(version, &part(0), &part(1))
     } else {
-        Message::response(version, u16::from(data.first().copied().unwrap_or(0)) * 3, &part(1))
+        Message::response(
+            version,
+            u16::from(data.first().copied().unwrap_or(0)) * 3,
+            &part(1),
+        )
     };
     for i in (2..parts.len()).step_by(2) {
         message.push_header(&part(i), &part(i + 1));
     }
-    message.body = parts.last().map(|p| p.as_bytes().to_vec()).unwrap_or_default();
+    message.body = parts
+        .last()
+        .map(|p| p.as_bytes().to_vec())
+        .unwrap_or_default();
     contract::check_wire_value(&message);
     message.set_header("Content-Length", &message.body.len().to_string());
     contract::check_wire_value(&message);

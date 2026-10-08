@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
-use crate::cx::{JoinState, Region, is_cancel};
 use crate::JoinError;
+use crate::cx::{JoinState, Region, is_cancel};
 use crate::watch::{Graph, Polling};
 use crate::{Cx, Result};
 
@@ -106,11 +106,28 @@ where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = Result> + Send + 'static,
 {
-    let shared = Arc::new(RunShared { start: graph.start, queue: Mutex::new(Queue { next_id: 1, ..Queue::default() }), graph });
+    let shared = Arc::new(RunShared {
+        start: graph.start,
+        queue: Mutex::new(Queue {
+            next_id: 1,
+            ..Queue::default()
+        }),
+        graph,
+    });
     let root = Region::root(Arc::downgrade(&shared));
-    let mut state =
-        RunState { shared: shared.clone(), root: root.clone(), slots: HashMap::new(), turn: VecDeque::new(), incoming: Vec::new() };
-    Cx { run: shared, region: root, group: None }.spawn_as(|| Cow::Borrowed("world"), world);
+    let mut state = RunState {
+        shared: shared.clone(),
+        root: root.clone(),
+        slots: HashMap::new(),
+        turn: VecDeque::new(),
+        incoming: Vec::new(),
+    };
+    Cx {
+        run: shared,
+        region: root,
+        group: None,
+    }
+    .spawn_as(|| Cow::Borrowed("world"), world);
     std::future::poll_fn(move |cx| state.poll(cx)).await
 }
 
@@ -169,8 +186,14 @@ impl RunShared {
             let id = q.next_id;
             q.next_id += 1;
             // Before the task can be polled, so its links find it.
-            self.graph.task_started(id, name(), location, group.cloned());
-            q.incoming.push(NewTask { id, future, region, join });
+            self.graph
+                .task_started(id, name(), location, group.cloned());
+            q.incoming.push(NewTask {
+                id,
+                future,
+                region,
+                join,
+            });
             if q.polling { None } else { q.outer.clone() }
         };
         if let Some(w) = outer {
@@ -225,9 +248,10 @@ impl Wake for TaskWaker {
 
     fn wake_by_ref(self: &Arc<Self>) {
         if !self.queued.swap(true, Ordering::AcqRel)
-            && let Some(run) = self.run.upgrade() {
-                run.schedule(self.id);
-            }
+            && let Some(run) = self.run.upgrade()
+        {
+            run.schedule(self.id);
+        }
     }
 }
 
@@ -299,7 +323,13 @@ impl RunState {
                 let waker = Waker::from(task_waker.clone());
                 self.slots.insert(
                     new.id,
-                    Slot { future: new.future, task_waker, waker, region: new.region, join: new.join },
+                    Slot {
+                        future: new.future,
+                        task_waker,
+                        waker,
+                        region: new.region,
+                        join: new.join,
+                    },
                 );
                 q.ready.push_back(new.id);
             }
@@ -307,7 +337,11 @@ impl RunState {
                 let mut ids: Vec<u64> = self.slots.keys().copied().collect();
                 ids.sort_unstable();
                 for id in ids {
-                    if !self.slots[&id].task_waker.queued.swap(true, Ordering::AcqRel) {
+                    if !self.slots[&id]
+                        .task_waker
+                        .queued
+                        .swap(true, Ordering::AcqRel)
+                    {
                         q.ready.push_back(id);
                     }
                 }
@@ -317,17 +351,26 @@ impl RunState {
 
         let run_ptr = Arc::as_ptr(&self.shared);
         while let Some(id) = turn.pop_front() {
-            let Some(slot) = self.slots.get_mut(&id) else { continue };
+            let Some(slot) = self.slots.get_mut(&id) else {
+                continue;
+            };
             slot.task_waker.queued.store(false, Ordering::Release);
             let result = {
                 let previous = CURRENT.with(|c| c.replace((run_ptr, slot.waker.data())));
                 let _guard = CurrentGuard(previous);
                 let _polling = Polling::enter(id);
-                slot.future.as_mut().poll(&mut Context::from_waker(&slot.waker))
+                slot.future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&slot.waker))
             };
             if let Poll::Ready(result) = result {
                 let slot = self.slots.remove(&id).unwrap();
-                let Slot { future, region, join, .. } = slot;
+                let Slot {
+                    future,
+                    region,
+                    join,
+                    ..
+                } = slot;
                 // The order matters, because each step can wake code that
                 // calls `Cx::cancel`, and a cancel discards later errors.
                 // 1. The region takes the error before anything else runs.
@@ -385,8 +428,11 @@ impl Drop for RunState {
             q.outer = None;
             std::mem::take(&mut q.incoming)
         };
-        let joins: Vec<Arc<JoinState>> =
-            incoming.iter().map(|t| t.join.clone()).chain(self.slots.values().map(|s| s.join.clone())).collect();
+        let joins: Vec<Arc<JoinState>> = incoming
+            .iter()
+            .map(|t| t.join.clone())
+            .chain(self.slots.values().map(|s| s.join.clone()))
+            .collect();
         drop(incoming);
         drop(std::mem::take(&mut self.slots));
         // Work spawned while the slots were dropped.
