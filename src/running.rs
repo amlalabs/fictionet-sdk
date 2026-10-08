@@ -56,7 +56,10 @@
 //!    closes the socket, and `let _ = listen(...)` drops it on the spot.
 //! 3. **[`run(seed, f)`](crate::run)** returns a future and does nothing else.
 //!    When the future is first polled, it makes the world's
-//!    [`Cx`](crate::Cx) and starts `f(fcx)` as the first task. Every task the
+//!    [`Cx`](crate::Cx) and starts `f(fcx)` as the first task. Every random
+//!    number the world draws comes from `seed`;
+//!    [`Seed::random`](crate::Seed::random) picks a fresh one, and the run
+//!    records it in its start event (see [Repeatable runs](#repeatable-runs)). Every task the
 //!    world starts with [`Cx::spawn`](crate::Cx::spawn), and every stdlib
 //!    task, is polled inside this same future.
 //! 4. **[`block_on`](crate::block_on)** polls the future on the current
@@ -217,7 +220,10 @@
 //! # In a test
 //!
 //! A test can run a world with no socket and no `fictionet attach`. It skips
-//! `listen`, keeps the `Attacher` for itself, and plays the sandbox.
+//! `listen`, keeps the `Attacher` for itself, and plays the sandbox. It runs
+//! the world with [`lab`](crate::lab) instead of `run`, so that time is
+//! simulated and the test gives the same answer every time (see
+//! [Repeatable runs](#repeatable-runs)).
 //! [`Attacher::attach`](crate::Attacher::attach) returns the sandbox's end of
 //! a [`pair`](crate::pair), and the world gets the other end as the
 //! `Attachment`. The test sends raw IP packets into its end, and reads what
@@ -248,7 +254,7 @@
 //! // The test plays the sandbox "agent": it holds the sandbox's end.
 //! let mut agent = attacher.attach("agent").unwrap();
 //!
-//! let test = fictionet::run(fictionet::Seed::random(), move |fcx| async move {
+//! let test = fictionet::lab(fictionet::Seed::from_u64(1), move |fcx| async move {
 //!     fcx.spawn(move |fcx| world(fcx, attachments));
 //!     agent.send(Packet(vec![0x45, 0, 0, 20]));
 //!     assert_eq!(agent.recv(&fcx).await?, Packet(vec![0x45, 0, 0, 20]));
@@ -262,7 +268,7 @@
 //! result.expect("the test timed out").expect("the world failed");
 //! ```
 //!
-//! The test's code runs inside the same `run` as the world, as one more
+//! The test's code runs inside the same lab as the world, as one more
 //! task. Both are polled on one thread, taking turns. The three outcomes
 //! stay apart:
 //!
@@ -287,6 +293,40 @@
 //! every test end in `Err`. A real failure in the world then looks like the
 //! expected end, unless every test compares error strings.
 //!
-//! Time is real time, so a test that depends on exact timing can be flaky.
-//! A simulated clock for tests is on the [roadmap](crate::roadmap#the-lab),
-//! along with running worlds from the `fictionet` binary and from Python.
+//! # Repeatable runs
+//!
+//! [`lab(seed, f)`](crate::lab) runs a world the way `run` does, on the same
+//! executor. Only what stands behind the [`Cx`](crate::Cx) changes:
+//!
+//! - **Time is a number.** It starts at zero. When every task is waiting,
+//!   it jumps to the earliest deadline. A test of a minute of traffic takes
+//!   milliseconds, and "a 1 Mbit/s link with a 10-packet queue drops the
+//!   11th packet of a burst" holds exactly.
+//! - **Randomness comes from the seed,** as in `run`.
+//! - **A lab run is closed.** The test plays the sandboxes through
+//!   [`attachments`](crate::attachments), as above, and fakes play other
+//!   services. Attachments that a [`listen`](crate::listen) socket feeds,
+//!   observer sessions and `web::proxy` refuse to work in a lab. Fictionet
+//!   cannot stop world code from using `std::net`, tokio timers or other
+//!   real I/O, so keeping the rest of a lab world closed is up to its author.
+//! - **The test runs inside the lab too.** The code that plays the
+//!   sandboxes is a task of the run, so time cannot jump past a timeout
+//!   before the test has had its turn.
+//! - **Nothing waits forever.** A lab whose tasks all wait with no deadline
+//!   ends with an error that says so.
+//!
+//! A lab run with the same seed and the same inputs repeats exactly: the
+//! same event log, byte for byte with its timestamps, and the same packets.
+//! TLS repeats too, with fixed certificates and the
+//! [`tls`](crate::stdlib::tls) provider, whose key exchange and signatures
+//! draw from the run's seed. One thing inside the SDK's dependencies still
+//! reads the system clock: h2 forgets an HTTP/2 stream the world reset after
+//! one second of real time (see [`httpd`](crate::stdlib::httpd)).
+//!
+//! A real run with the same seed makes the same random choices for the
+//! same inputs in the same order. But real sandboxes decide when packets
+//! arrive and in which order, so the times in its log, and anything that
+//! depends on them, differ from run to run. Repeating the world's side of
+//! a real run would take a log of every input: each inbound packet's
+//! bytes and the moment it arrived, and the order of attachments. The event
+//! log does not record that.

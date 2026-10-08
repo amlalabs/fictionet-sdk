@@ -151,7 +151,7 @@ fn ten_megabytes_both_ways() {
     const LEN: usize = 10 * 1024 * 1024;
     let elapsed = Arc::new(Mutex::new(Duration::ZERO));
     let e = elapsed.clone();
-    world(Duration::from_secs(120), move |fcx| async move {
+    world::real_world(Duration::from_secs(120), move |fcx| async move {
         let (ea, eb) = two_tcp(&fcx, A, B);
         let mut listener = eb.listen(9000)?;
         let up = pattern(LEN, 1);
@@ -190,15 +190,15 @@ fn a_closed_port_refuses_at_once() {
         let _eb = tcp::endpoint(&fcx, b, ip(B));
         let mut times = Vec::new();
         for port in 1..=200u16 {
-            let started = Instant::now();
+            let started = fcx.now();
             raw.send(tcp_syn(ip(A), 40000 + port, ip(B), port));
             let p = raw.recv(&fcx).await?;
-            times.push(started.elapsed());
+            times.push(fcx.now().since_start() - started.since_start());
             assert_eq!(p.0[20 + 13] & 0x04, 0x04, "a RST for port {port}");
         }
         times.sort();
         let (median, max) = (times[times.len() / 2], times[times.len() - 1]);
-        eprintln!("a refusal takes {median:?} (median), {max:?} at most");
+        assert_eq!((median, max), (Duration::ZERO, Duration::ZERO));
         Ok(())
     });
 }
@@ -208,13 +208,13 @@ fn five_hundred_closed_ports_are_refused() {
     world(Duration::from_secs(20), |fcx| async move {
         let (ea, eb) = two_tcp(&fcx, A, B);
         let _open = eb.listen(80)?;
-        let started = Instant::now();
+        let started = fcx.now();
         for port in 1000..1500 {
             let r = ea.connect(&fcx, SocketAddr::new(ip(B), port)).await;
             assert_eq!(r.err(), Some(ConnError::Refused), "port {port}");
         }
-        let t = started.elapsed();
-        eprintln!("500 refusals took {t:?}");
+        let t = fcx.now().since_start() - started.since_start();
+        assert_eq!(t, Duration::ZERO);
         // The open port still works.
         let conn = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
         drop(conn);
@@ -242,7 +242,7 @@ fn two_hundred_concurrent_connections() {
                 });
             }
         });
-        let started = Instant::now();
+        let started = fcx.now();
         let mut clients = Vec::new();
         for i in 0..200u64 {
             let ea = ea.clone();
@@ -257,7 +257,10 @@ fn two_hundred_concurrent_connections() {
         for c in clients {
             c.join(&fcx).await?;
         }
-        eprintln!("200 concurrent echoes took {:?}", started.elapsed());
+        eprintln!(
+            "200 concurrent echoes took {:?}",
+            (fcx.now().since_start() - started.since_start())
+        );
         Ok(())
     });
 }
@@ -929,7 +932,7 @@ fn transfers_survive_lost_packets() {
         let up = pattern(512 * 1024, 4);
         let down = pattern(256 * 1024, 5);
         let (up2, down2) = (up.clone(), down.clone());
-        let started = Instant::now();
+        let started = fcx.now();
         let server = fcx.spawn(move |fcx| async move {
             let mut conn = listener.accept(&fcx).await?;
             let got = duplex(&fcx, &mut conn, &down2).await?;
@@ -940,7 +943,7 @@ fn transfers_survive_lost_packets() {
         let got = duplex(&fcx, &mut conn, &up).await?;
         assert!(got == down, "the client got different bytes");
         server.join(&fcx).await?;
-        *e.lock().unwrap() = started.elapsed();
+        *e.lock().unwrap() = fcx.now().since_start() - started.since_start();
         Ok(())
     });
     eprintln!(
@@ -955,7 +958,7 @@ fn every_closed_port_is_refused() {
         let (mut raw, b) = pair();
         let eb = tcp::endpoint(&fcx, b, ip(B));
         let _open = eb.listen(443)?;
-        let started = Instant::now();
+        let started = fcx.now();
         // Many SYNs in flight at once, as from a port scan.
         let mut answered = 0u32;
         let mut open_seen = false;
@@ -978,7 +981,10 @@ fn every_closed_port_is_refused() {
         }
         assert_eq!(answered, 65535);
         assert!(open_seen);
-        eprintln!("65,535 ports answered in {:?}", started.elapsed());
+        eprintln!(
+            "65,535 ports answered in {:?}",
+            (fcx.now().since_start() - started.since_start())
+        );
         Ok(())
     });
 }
@@ -1055,7 +1061,7 @@ fn boxed_connections_and_write_all() {
 /// happens.
 #[test]
 fn idle_endpoints_stay_idle() {
-    world(Duration::from_secs(20), |fcx| async move {
+    world::real_world(Duration::from_secs(20), |fcx| async move {
         let (ea, eb) = two_tcp(&fcx, A, B);
         let mut listener = eb.listen(80)?;
         // Open, half-closed, closed and dropped connections, and one

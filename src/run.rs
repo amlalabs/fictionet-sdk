@@ -21,18 +21,19 @@ use crate::{Cx, Result};
 /// executor of its own. Without tokio, poll it with
 /// [`block_on`](crate::block_on).
 ///
-/// Time is the wall clock, and randomness comes from one seeded ChaCha20 stream.
-/// Use [`Seed::random`](crate::Seed::random) for a fresh OS seed or
-/// [`Seed::from_u64`](crate::Seed::from_u64) for a repeatable test seed.
-/// The run's start event records the seed as hexadecimal. Equal seeds give
-/// equal draws in the same call order; real-time scheduling and external
-/// inputs can still change that order.
-/// The real clock is what a run with a real sandbox needs, because the sandbox's
-/// kernel and programs time out on real time. Real sockets, Redis and the
-/// internet all work, and their times agree with [`Cx::now`]. Libraries
-/// built on tokio need a tokio runtime to poll the world, not
-/// [`block_on`](crate::block_on). Because the clock is real, timings vary
-/// a little from run to run.
+/// Time is the wall clock. That is what a run with a real sandbox needs,
+/// because the sandbox's kernel and programs time out on real time. Real
+/// sockets, Redis and the internet all work, and their times agree with
+/// [`Cx::now`]. Libraries built on tokio need a tokio runtime to poll the
+/// world, not [`block_on`](crate::block_on). Because the clock is real,
+/// timings vary a little from run to run. [`lab`] runs the same world on
+/// simulated time instead.
+///
+/// Randomness comes from `seed`: every random number the world draws
+/// through its [`Cx`] is the next part of one stream started from it. Use
+/// [`Seed::random`](crate::Seed::random) for a fresh seed, or
+/// [`Seed::from_u64`](crate::Seed::from_u64) for a fixed one. The run's
+/// start event records the seed.
 ///
 /// # When the future finishes
 ///
@@ -105,24 +106,23 @@ where
     run_with(Graph::new(seed, crate::RunMode::Real), world).await
 }
 
-/// Runs a closed world with virtual time, starting at zero.
+/// Runs a closed world on simulated time, for tests.
 ///
-/// Tasks use the same executor and seeded randomness as [`run`]. Once all
-/// runnable tasks have drained, the clock advances to the earliest live
-/// deadline and wakes equal deadlines in registration order. Real listeners,
-/// observer sessions and upstream proxies are unavailable. A world with live
-/// tasks but no runnable work or finite deadline returns a deadlock error.
-/// Infinite waits remain unarmed; virtual time cannot exceed signed
-/// microseconds. Foreign I/O and independently scheduled inputs are outside
-/// this closed-world contract. h2 expires reset streams using the host clock,
-/// so that behavior is outside the repeatability guarantee. TLS built with
-/// [`tls::config_builder`](crate::stdlib::tls::config_builder) draws key
-/// exchange and signing randomness from the run.
+/// A lab runs the world on the same executor as [`run`], with randomness
+/// from `seed` in the same way. Only the clock differs. It starts at zero,
+/// and when every task is waiting it jumps to the earliest deadline, waking
+/// timers due at the same instant in the order they were set. So the same
+/// seed and the same inputs give the same event log and the same packets.
+/// [Repeatable runs](crate::running#repeatable-runs) says what repeats and
+/// what does not.
 ///
-/// An attachment hub fed by [`listen`](crate::listen) cannot be used in a
-/// lab. Its first `get`, `next`, or `map` fails the region with an error
-/// naming the real listener, before handing out any attachment. `get` and
-/// `next` return [`Cancelled`](crate::Cancelled) in that case.
+/// The test plays the sandboxes as tasks of the lab, through
+/// [`attachments`](crate::attachments). A lab whose tasks all wait with no
+/// deadline ends with an error that says so; a wait with no deadline at all
+/// never moves the clock. Attachments fed by [`listen`](crate::listen) fail
+/// the lab on their first `get`, `next` or `map`, before handing out an
+/// attachment, and `get` and `next` return [`Cancelled`](crate::Cancelled).
+/// Observer sessions and `web::proxy` refuse a lab too.
 pub async fn lab<F, Fut>(seed: crate::Seed, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,

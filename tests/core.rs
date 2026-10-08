@@ -11,8 +11,8 @@ use std::time::Duration;
 use fictionet::prelude::*;
 use fictionet::time::ms;
 use fictionet::{
-    AttachError, Cancelled, Interface, JoinError, Packet, RecvError, attachments, block_on, pair,
-    run,
+    AttachError, Cancelled, Interface, JoinError, Packet, RecvError, Seed, attachments, block_on,
+    lab, pair, run,
 };
 
 #[derive(Debug)]
@@ -35,13 +35,13 @@ fn the_run_future_is_send() {
 fn sleeps_end_in_deadline_order() {
     let order = Arc::new(Mutex::new(Vec::new()));
     let o = order.clone();
-    let started = std::time::Instant::now();
     within(Duration::from_secs(5), move || {
-        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
             for d in [30u64, 10, 20] {
                 let o = o.clone();
                 fcx.spawn(move |fcx| async move {
                     fcx.sleep(ms(d)).await?;
+                    assert_eq!(fcx.now().since_start(), ms(d));
                     o.lock().unwrap().push(d);
                     Ok(())
                 });
@@ -51,19 +51,33 @@ fn sleeps_end_in_deadline_order() {
     })
     .unwrap();
     assert_eq!(*order.lock().unwrap(), [10, 20, 30]);
-    assert!(started.elapsed() >= ms(30));
 }
 
 #[test]
 fn now_follows_sleep() {
     within(Duration::from_secs(5), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let t0 = fcx.now();
             fcx.sleep(ms(20)).await?;
             let t1 = fcx.now();
-            assert!(t1.since_start() - t0.since_start() >= ms(20));
+            assert_eq!(t1.since_start() - t0.since_start(), ms(20));
             // A deadline in the past returns at once.
             fcx.sleep_until(t0).await?;
+            Ok(())
+        }))
+    })
+    .unwrap();
+}
+
+#[test]
+fn real_sleep_uses_the_host_clock() {
+    within(Duration::from_secs(5), || {
+        block_on(run(fictionet::Seed::from_u64(1), |fcx| async move {
+            let host = std::time::Instant::now();
+            let start = fcx.now();
+            fcx.sleep(ms(10)).await?;
+            assert!(host.elapsed() >= ms(10));
+            assert!(fcx.now() >= start + ms(10));
             Ok(())
         }))
     })
@@ -93,11 +107,11 @@ fn ok_does_not_cancel_and_the_run_waits_for_all_work() {
     let finished = Arc::new(AtomicBool::new(false));
     let saw_cancel = Arc::new(AtomicBool::new(true));
     let (f, c) = (finished.clone(), saw_cancel.clone());
-    let started = std::time::Instant::now();
     within(Duration::from_secs(5), move || {
-        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
             fcx.spawn(move |fcx| async move {
                 fcx.sleep(ms(50)).await?;
+                assert_eq!(fcx.now().since_start(), ms(50));
                 c.store(fcx.is_cancelled(), Ordering::SeqCst);
                 f.store(true, Ordering::SeqCst);
                 Ok(())
@@ -108,7 +122,6 @@ fn ok_does_not_cancel_and_the_run_waits_for_all_work() {
     .unwrap();
     assert!(finished.load(Ordering::SeqCst));
     assert!(!saw_cancel.load(Ordering::SeqCst));
-    assert!(started.elapsed() >= ms(50));
 }
 
 /// Every kind of wait ends with `Cancelled` when the region fails.
@@ -117,7 +130,7 @@ fn cancellation_ends_every_wait() {
     let results = Arc::new(Mutex::new(Vec::<String>::new()));
     let r = results.clone();
     let out = within(Duration::from_secs(5), move || {
-        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
             let (mut a, b) = pair();
             let r1 = r.clone();
             fcx.spawn(move |fcx| async move {
@@ -203,7 +216,7 @@ fn cancellation_ends_every_wait() {
                     }
                 }
             });
-            fcx.sleep(ms(20)).await?;
+            fcx.yield_now().await?;
             Err(Boom("stop").into())
         }))
     });
@@ -234,7 +247,7 @@ fn task_error_cancels_siblings_and_comes_out_of_run() {
     let sibling = Arc::new(Mutex::new(None));
     let s = sibling.clone();
     let out = within(Duration::from_secs(5), move || {
-        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
             fcx.spawn(move |fcx| async move {
                 *s.lock().unwrap() = Some(fcx.sleep(Duration::from_secs(60)).await);
                 Ok(())
@@ -257,7 +270,7 @@ fn task_error_cancels_siblings_and_comes_out_of_run() {
 #[test]
 fn join_returns_what_the_work_returned() {
     within(Duration::from_secs(5), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ok = fcx.spawn(|fcx| async move {
                 fcx.sleep(ms(5)).await?;
                 Ok(())
@@ -275,7 +288,7 @@ fn join_returns_what_the_work_returned() {
     let (out, joined) = within(Duration::from_secs(5), || {
         let joined = Arc::new(Mutex::new(None));
         let j = joined.clone();
-        let out = block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        let out = block_on(lab(Seed::from_u64(1), move |fcx| async move {
             let bad = fcx.spawn(|_fcx| async { Err(Boom("bad").into()) });
             // The join gets the error, though the failure also cancels the
             // region the joiner waits in.
@@ -309,7 +322,7 @@ fn a_busy_task_cannot_starve_another() {
     let spins = Arc::new(AtomicU64::new(0));
     let s = spins.clone();
     within(Duration::from_secs(5), move || {
-        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
             let stop = Arc::new(AtomicBool::new(false));
             let st = stop.clone();
             fcx.spawn(move |fcx| async move {
@@ -334,7 +347,7 @@ fn a_busy_task_cannot_starve_another() {
                 fcx.yield_now().await?;
                 turns += 1;
             }
-            fcx.sleep(ms(10)).await?;
+            fcx.yield_now().await?;
             stop.store(true, Ordering::SeqCst);
             Ok(())
         }))
@@ -592,7 +605,7 @@ fn runs_on_tokio() {
 #[test]
 fn a_sleep_without_end_waits_until_cancelled() {
     let res = within(Duration::from_secs(5), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             fcx.spawn(|fcx| async move {
                 assert_eq!(fcx.sleep(Duration::MAX).await, Err(Cancelled));
                 let far = fcx.now() + Duration::from_secs(u64::MAX / 2);

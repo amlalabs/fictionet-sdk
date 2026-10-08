@@ -134,6 +134,10 @@ pub fn alert_name(code: u8) -> &'static str {
 ///
 /// Ephemeral keys and RSA-PSS salts also come from the run. ECDSA uses
 /// deterministic RFC 6979 nonces, and Ed25519 signatures are deterministic.
+/// With fixed certificates and world date, a closed lab using this provider
+/// repeats its TLS records for the same seed and ordered inputs. A real run
+/// uses the same random stream, but real peers determine handshake timing
+/// and the order in which their inputs arrive.
 ///
 /// Random values are drawn while [`server`], [`ClientHello::finish`] or a
 /// [`TlsConnection`] is working, and come from the `Cx` passed to that call.
@@ -339,7 +343,7 @@ impl ActiveKeyExchange for Exchange {
                 let public = p256::PublicKey::from_sec1_bytes(peer).map_err(|_| invalid_share())?;
                 let shared =
                     p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
-                Ok(SharedSecret::from(shared.raw_secret_bytes().as_slice()))
+                Ok(SharedSecret::from(&shared.raw_secret_bytes()[..]))
             }
             ExchangeSecret::P384(secret) => {
                 if peer.len() != 97 || peer[0] != 4 {
@@ -348,7 +352,7 @@ impl ActiveKeyExchange for Exchange {
                 let public = p384::PublicKey::from_sec1_bytes(peer).map_err(|_| invalid_share())?;
                 let shared =
                     p384::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
-                Ok(SharedSecret::from(shared.raw_secret_bytes().as_slice()))
+                Ok(SharedSecret::from(&shared.raw_secret_bytes()[..]))
             }
         }
     }

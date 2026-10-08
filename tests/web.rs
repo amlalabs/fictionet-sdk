@@ -6,6 +6,9 @@
 #[path = "common/certs.rs"]
 mod certs;
 mod common;
+#[path = "common/tls_client.rs"]
+mod tls_client;
+use tls_client::{TlsClient, TlsError};
 #[path = "common/done.rs"]
 mod done;
 #[path = "common/machine.rs"]
@@ -27,8 +30,7 @@ use sandbox::Machine;
 use timeout::timeout;
 
 use std::convert::Infallible;
-use std::future::{Future, poll_fn};
-use std::io::{ErrorKind, Read, Write};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -45,7 +47,7 @@ use fictionet::stdlib::dns::op::{Message, MessageType, OpCode, Query, ResponseCo
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::tls;
 use fictionet::stdlib::{ConnError, Connection, dhcp, ip, tcp, web};
-use fictionet::{Attacher, Cx, End, Interface, Packet, block_on, run};
+use fictionet::{Attacher, Cx, End, Interface, Packet, Seed, block_on, lab, run};
 use http::{HeaderMap, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -64,6 +66,19 @@ where
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
     run_world::world(Duration::from_secs(60), move |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        let env = sites(&fcx).serve_with(&fcx, attachments)?;
+        f(fcx, attacher, env).await?;
+        Ok(())
+    });
+}
+
+fn real_world<F, Fut>(f: F)
+where
+    F: FnOnce(Cx, Attacher, Env) -> Fut + Send + 'static,
+    Fut: Future<Output = fictionet::Result> + Send + 'static,
+{
+    run_world::real_world(Duration::from_secs(60), move |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         let env = sites(&fcx).serve_with(&fcx, attachments)?;
         f(fcx, attacher, env).await?;
@@ -343,8 +358,7 @@ async fn dns(fcx: &Cx, m: &Machine, name: &str, kind: RecordType) -> (ResponseCo
         .udp
         .bind(40000 + (fcx.random_u64() % 20000) as u16)
         .unwrap();
-    let mut q = Message::query();
-    q.metadata.id = fcx.random_u64() as u16;
+    let mut q = Message::new(fcx.random_u64() as u16, MessageType::Query, OpCode::Query);
     q.metadata.recursion_desired = true;
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
     socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(GATEWAY.into(), 53));
@@ -377,188 +391,6 @@ async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Ipv4Addr {
     assert_eq!(code, ResponseCode::NoError, "{name}");
     assert_eq!(addrs.len(), 1, "{name}");
     addrs[0]
-}
-
-// ---------------------------------------------------------------------------
-// A rustls client as a Connection
-
-struct TlsClient<C> {
-    conn: C,
-    tls: ClientConnection,
-    out: Vec<u8>,
-    inbuf: Box<[u8]>,
-    /// Bytes read from `conn` that rustls could not take yet, because its
-    /// plaintext buffer was full.
-    pending: Vec<u8>,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-enum TlsError {
-    Conn(ConnError),
-    Tls(rustls::Error),
-}
-
-impl<C: Connection + Unpin> TlsClient<C> {
-    fn new(conn: C, roots: &Arc<RootCertStore>, name: &str, alpn: &[&[u8]]) -> Self {
-        let mut config =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(roots.clone())
-                .with_no_client_auth();
-        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-        let tls = ClientConnection::new(
-            Arc::new(config),
-            ServerName::try_from(name.to_owned()).unwrap(),
-        )
-        .unwrap();
-        TlsClient::with(conn, tls)
-    }
-
-    fn with(conn: C, tls: ClientConnection) -> Self {
-        TlsClient {
-            conn,
-            tls,
-            out: Vec::new(),
-            inbuf: vec![0; 4096].into_boxed_slice(),
-            pending: Vec::new(),
-        }
-    }
-
-    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        loop {
-            if self.out.is_empty() {
-                if !self.tls.wants_write() {
-                    return Poll::Ready(Ok(()));
-                }
-                self.tls.write_tls(&mut self.out).unwrap();
-            }
-            match self.conn.poll_write(fcx, cx, &self.out) {
-                Poll::Ready(Ok(n)) => {
-                    self.out.drain(..n);
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-
-    /// Reads from the connection into rustls once. `Ok(false)` at the end
-    /// of the stream.
-    fn poll_fill(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<bool, TlsError>> {
-        let fresh;
-        let mut data: &[u8] = if !self.pending.is_empty() {
-            fresh = std::mem::take(&mut self.pending);
-            &fresh
-        } else {
-            let n = match self.conn.poll_read(fcx, cx, &mut self.inbuf) {
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(TlsError::Conn(e))),
-                Poll::Pending => return Poll::Pending,
-            };
-            if n == 0 {
-                let _ = self.tls.read_tls(&mut &[][..]);
-            }
-            &self.inbuf[..n]
-        };
-        let n = data.len();
-        loop {
-            if !data.is_empty() && self.tls.read_tls(&mut data).is_err() {
-                // The plaintext buffer is full: the reader must take some
-                // first.
-                self.pending = data.to_vec();
-                return Poll::Ready(Ok(true));
-            }
-            let r = self.tls.process_new_packets();
-            if let Err(e) = r {
-                // Send our alert, best effort.
-                let _ = self.poll_flush(fcx, cx);
-                return Poll::Ready(Err(TlsError::Tls(e)));
-            }
-            if data.is_empty() {
-                return Poll::Ready(Ok(n > 0));
-            }
-        }
-    }
-
-    async fn handshake(&mut self, fcx: &Cx) -> Result<(), TlsError> {
-        poll_fn(|cx| {
-            loop {
-                match self.poll_flush(fcx, cx) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(TlsError::Conn(e))),
-                    Poll::Pending => return Poll::Pending,
-                }
-                if !self.tls.is_handshaking() {
-                    return Poll::Ready(Ok(()));
-                }
-                match self.poll_fill(fcx, cx) {
-                    Poll::Ready(Ok(true)) => {}
-                    Poll::Ready(Ok(false)) => {
-                        return Poll::Ready(Err(TlsError::Conn(ConnError::Closed)));
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-        })
-        .await
-    }
-}
-
-impl<C: Connection + Unpin> Connection for TlsClient<C> {
-    fn poll_read(
-        &mut self,
-        fcx: &Cx,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize, ConnError>> {
-        loop {
-            match self.tls.reader().read(buf) {
-                Ok(n) => return Poll::Ready(Ok(n)),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Poll::Ready(Ok(0)),
-                Err(_) => return Poll::Ready(Err(ConnError::Broken)),
-            }
-            if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
-                return Poll::Ready(Err(e));
-            }
-            match self.poll_fill(fcx, cx) {
-                Poll::Ready(Ok(true)) => {}
-                Poll::Ready(Ok(false)) => {
-                    return match self.tls.reader().read(buf) {
-                        Ok(n) => Poll::Ready(Ok(n)),
-                        Err(_) => Poll::Ready(Ok(0)),
-                    };
-                }
-                Poll::Ready(Err(_)) => return Poll::Ready(Err(ConnError::Broken)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-
-    fn poll_write(
-        &mut self,
-        fcx: &Cx,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<Result<usize, ConnError>> {
-        if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
-            return Poll::Ready(Err(e));
-        }
-        let n = self.tls.writer().write(data).unwrap();
-        let _ = self.poll_flush(fcx, cx);
-        Poll::Ready(Ok(n))
-    }
-
-    fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        self.tls.send_close_notify();
-        match self.poll_flush(fcx, cx) {
-            Poll::Ready(Ok(())) => self.conn.poll_shutdown(fcx, cx),
-            other => other,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -716,7 +548,7 @@ async fn tls_connect(
         .connect(fcx, SocketAddr::new(addr.into(), 443))
         .await
         .map_err(TlsError::Conn)?;
-    let mut client = TlsClient::new(tcp, &env.roots, sni, alpn);
+    let mut client = TlsClient::new(fcx, tcp, &env.roots, sni, alpn);
     client.handshake(fcx).await?;
     Ok(client)
 }
@@ -772,8 +604,7 @@ fn dns_answers_sites_nodata_and_nxdomain() {
             .await
             .unwrap();
         for (name, id) in [("secure.test", 7u16), ("nope.test", 8)] {
-            let mut q = Message::query();
-            q.metadata.id = id;
+            let mut q = Message::new(id, MessageType::Query, OpCode::Query);
             q.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
             let bytes = q.to_vec().unwrap();
             let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
@@ -878,7 +709,7 @@ fn dates_come_from_the_world() {
     let june_2019 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_559_347_200);
     for date in [Some(june_2019), None] {
         let result = within(Duration::from_secs(60), move || {
-            block_on(run(fictionet::Seed::random(), move |fcx| async move {
+            block_on(lab(Seed::from_u64(1), move |fcx| async move {
                 let (attacher, attachments) = fictionet::attachments();
                 let site = axum::Router::new()
                     .route(
@@ -1248,8 +1079,7 @@ fn unknown_addresses_get_host_unreachable_and_sites_appear_on_lookup() {
         assert_eq!((icmp[0], icmp[1]), (3, 1));
 
         // Look the name up (raw DNS over UDP), then the address answers.
-        let mut q = Message::query();
-        q.metadata.id = 99;
+        let mut q = Message::new(99, MessageType::Query, OpCode::Query);
         q.add_query(Query::query(
             Name::from_ascii("plain.test").unwrap(),
             RecordType::A,
@@ -1632,7 +1462,7 @@ fn dhcp_messages_round_trip() {
 #[test]
 fn a_subnet_that_cannot_work_is_an_error() {
     let result = within(Duration::from_secs(10), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             for bad in [
                 "10.0.0.0/31",
                 "10.0.0.0/4",
@@ -1891,7 +1721,7 @@ fn fragment(
 /// different packet, must not stall the gateway for everyone else.
 #[test]
 fn a_flood_of_unfinished_fragments_does_not_stall_the_gateway() {
-    world(|fcx, attacher, _env| async move {
+    real_world(|fcx, attacher, _env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         raw.send(ping(me, GATEWAY, 1));
@@ -2048,7 +1878,7 @@ async fn closed_ports(fcx: &Cx, raw: &mut End, d: Duration) -> std::collections:
 /// others share. Past that, the machine resets new ones at once.
 #[test]
 fn one_sandbox_cannot_hold_thousands_of_connections_open() {
-    world(|fcx, attacher, env| async move {
+    real_world(|fcx, attacher, env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
@@ -2103,7 +1933,7 @@ async fn get_and_hold(
 /// it may connect again.
 #[test]
 fn connections_left_half_open_still_count() {
-    world(|fcx, attacher, _env| async move {
+    real_world(|fcx, attacher, _env| async move {
         let a = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
         let to = lookup(&fcx, &a, "plain.test").await;
         let mut held = Vec::new();
@@ -2159,7 +1989,7 @@ fn connections_left_half_open_still_count() {
 /// second.
 #[test]
 fn connections_that_send_nothing_are_closed() {
-    run_world::world(Duration::from_secs(60), |fcx| async move {
+    run_world::real_world(Duration::from_secs(60), |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
         sites(&fcx)
             .sites
@@ -2175,8 +2005,7 @@ fn connections_that_send_nothing_are_closed() {
         let plain = Ipv4Addr::new(198, 18, 0, 1);
         // Look the names up, over raw DNS, so their machines exist.
         for name in ["secure.test", "plain.test"] {
-            let mut q = Message::query();
-            q.metadata.id = 7;
+            let mut q = Message::new(7, MessageType::Query, OpCode::Query);
             q.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
             raw.send(udp(me, 5353, GATEWAY, 53, &q.to_vec().unwrap()));
             assert!(
@@ -2265,7 +2094,7 @@ fn connections_that_send_nothing_are_closed() {
 /// lock the others out of a site they share.
 #[test]
 fn a_syn_flood_from_one_sandbox_does_not_lock_out_the_others() {
-    world(|fcx, attacher, env| async move {
+    real_world(|fcx, attacher, env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
@@ -2305,7 +2134,7 @@ async fn median_get(fcx: &Cx, m: &Machine, env: &Env) -> Duration {
 /// down: lookups stay quick, and so does every other request.
 #[test]
 fn ten_thousand_sites_do_not_slow_the_network() {
-    world(|fcx, attacher, env| async move {
+    real_world(|fcx, attacher, env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
@@ -2313,8 +2142,7 @@ fn ten_thousand_sites_do_not_slow_the_network() {
         let before = median_get(&fcx, &b, &env).await;
         let n = 10_000u32;
         for i in 0..n {
-            let mut q = Message::query();
-            q.metadata.id = i as u16;
+            let mut q = Message::new(i as u16, MessageType::Query, OpCode::Query);
             q.add_query(Query::query(
                 Name::from_ascii(format!("n{i}.wild.test")).unwrap(),
                 RecordType::A,
@@ -2404,7 +2232,7 @@ fn a_name_never_looked_up_is_not_served_by_host_or_sni() {
 /// cancels as soon as it opens them.
 #[test]
 fn http2_with_a_thousand_streams_and_cancelled_ones() {
-    world(|fcx, attacher, env| async move {
+    real_world(|fcx, attacher, env| async move {
         let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
         let addr = lookup(&fcx, &m, "secure.test").await;
         let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", &[b"h2"])
@@ -2462,8 +2290,7 @@ fn malformed_dns_does_not_break_the_server() {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let good = {
-            let mut q = Message::query();
-            q.metadata.id = 4242;
+            let mut q = Message::new(4242, MessageType::Query, OpCode::Query);
             q.add_query(Query::query(
                 Name::from_ascii("secure.test").unwrap(),
                 RecordType::A,
@@ -2577,8 +2404,7 @@ fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut a = attacher.attach("a").unwrap();
         // a looks plain.test up and opens a connection by hand.
-        let mut q = Message::query();
-        q.metadata.id = 1;
+        let mut q = Message::new(1, MessageType::Query, OpCode::Query);
         q.add_query(Query::query(
             Name::from_ascii("plain.test").unwrap(),
             RecordType::A,
@@ -2732,8 +2558,7 @@ async fn raw_dns(
     name: &str,
     id: u16,
 ) -> Option<(ResponseCode, Vec<Ipv4Addr>)> {
-    let mut q = Message::query();
-    q.metadata.id = id;
+    let mut q = Message::new(id, MessageType::Query, OpCode::Query);
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
     raw.send(udp(me, 5353, gw, 53, &q.to_vec().unwrap()));
     loop {
@@ -3391,8 +3216,7 @@ fn events_for_dns_queries() {
             .connect(&fcx, SocketAddr::new(GATEWAY.into(), 53))
             .await
             .unwrap();
-        let mut q = Message::query();
-        q.metadata.id = 7;
+        let mut q = Message::new(7, MessageType::Query, OpCode::Query);
         q.add_query(Query::query(
             Name::from_ascii("nope.test").unwrap(),
             RecordType::A,
@@ -3414,8 +3238,7 @@ fn events_for_dns_queries() {
             .unwrap();
         assert_eq!(reply[3] & 0x0f, 1, "FORMERR");
         // Two questions in one message: FORMERR, and no name.
-        let mut q = Message::query();
-        q.metadata.id = 10;
+        let mut q = Message::new(10, MessageType::Query, OpCode::Query);
         q.add_query(Query::query(
             Name::from_ascii("secure.test").unwrap(),
             RecordType::A,
@@ -3475,12 +3298,11 @@ fn events_for_dns_queries() {
 
 /// A rustls client config that trusts `roots`.
 fn client_config(roots: &Arc<RootCertStore>, alpn: &[&[u8]]) -> Arc<ClientConfig> {
-    let mut config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(roots.clone())
-            .with_no_client_auth();
+    let mut config = ClientConfig::builder_with_provider(Arc::new(tls::crypto_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots.clone())
+        .with_no_client_auth();
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Arc::new(config)
 }
@@ -3530,14 +3352,16 @@ fn events_for_tls_handshakes() {
         other.add(other_ca.der().clone()).unwrap();
         let other = Arc::new(other);
         let tcp = m.tcp.connect(&fcx, to(SECURE_ADDR)).await.unwrap();
-        let mut client = TlsClient::new(tcp, &other, "secure.test", &[]);
+        let mut client = TlsClient::new(&fcx, tcp, &other, "secure.test", &[]);
         assert!(client.handshake(&fcx).await.is_err());
         // 5. A hello split over several segments.
         let mut tcp = m.tcp.connect(&fcx, to(EVENTS_ADDR)).await.unwrap();
-        let mut tls = ClientConnection::new(
-            client_config(&env.roots, &[b"http/1.1"]),
-            ServerName::try_from("events.test".to_owned()).unwrap(),
-        )
+        let mut tls = tls::with_context(&fcx, || {
+            ClientConnection::new(
+                client_config(&env.roots, &[b"http/1.1"]),
+                ServerName::try_from("events.test".to_owned()).unwrap(),
+            )
+        })
         .unwrap();
         let mut hello = Vec::new();
         while tls.wants_write() {
@@ -3935,7 +3759,7 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
     let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = dropped.clone();
     let result = within(Duration::from_secs(30), move || {
-        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (seen, set) = (started.clone(), flag.clone());
@@ -4122,7 +3946,7 @@ fn events_for_clients_that_send_nothing() {
         let log = Log::new(&fcx);
         let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
-        let started = std::time::Instant::now();
+        let started = fcx.now();
         let _quiet_80 = m
             .tcp
             .connect(&fcx, SocketAddr::new(SECURE_ADDR.into(), 80))
@@ -4134,11 +3958,8 @@ fn events_for_clients_that_send_nothing() {
             .await
             .unwrap();
         let tls = wait_for_long(&fcx, &log, tls_seen).await;
-        let took = started.elapsed();
-        assert!(
-            took >= Duration::from_secs(1) && took < Duration::from_secs(10),
-            "{took:?}"
-        );
+        let took = fcx.now().since_start() - started.since_start();
+        assert_eq!(took, Duration::from_secs(1));
         assert_eq!(
             (tls.str("sni"), outcome(&tls)),
             (None, "timed_out".to_owned())
@@ -4562,8 +4383,7 @@ async fn raw_dns6(
     kind: RecordType,
 ) -> Option<(ResponseCode, Vec<IpAddr>)> {
     let id = fcx.random_u64() as u16;
-    let mut q = Message::query();
-    q.metadata.id = id;
+    let mut q = Message::new(id, MessageType::Query, OpCode::Query);
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
     raw.send(udp6(me, 5353, server, 53, &q.to_vec().unwrap()));
     loop {
@@ -4605,8 +4425,7 @@ async fn dns_at(
         .udp
         .bind(40000 + (fcx.random_u64() % 20000) as u16)
         .unwrap();
-    let mut q = Message::query();
-    q.metadata.id = fcx.random_u64() as u16;
+    let mut q = Message::new(fcx.random_u64() as u16, MessageType::Query, OpCode::Query);
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
     socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(server, 53));
     let (bytes, from) = timeout(fcx, Duration::from_secs(5), socket.recv(fcx))
@@ -4694,8 +4513,7 @@ fn dns_answers_aaaa_for_each_family_a_site_has() {
             .connect(&fcx, SocketAddr::new(GATEWAY6.into(), 53))
             .await
             .unwrap();
-        let mut q = Message::query();
-        q.metadata.id = 77;
+        let mut q = Message::new(77, MessageType::Query, OpCode::Query);
         q.add_query(Query::query(
             Name::from_ascii("v6only.test").unwrap(),
             RecordType::AAAA,
@@ -4801,7 +4619,7 @@ fn https_http2_and_plain_http_over_ipv6() {
             .connect(&fcx, SocketAddr::new(DUAL_ADDR6.into(), 443))
             .await
             .unwrap();
-        let mut bare = TlsClient::new(tcp, &env.roots, &DUAL_ADDR6.to_string(), &[]);
+        let mut bare = TlsClient::new(&fcx, tcp, &env.roots, &DUAL_ADDR6.to_string(), &[]);
         assert!(bare.handshake(&fcx).await.is_err());
 
         // The events name the IPv6 addresses.
@@ -5470,8 +5288,7 @@ fn extension_headers_a_host_must_refuse_are_refused() {
 fn dns_drops_a_zero_udp_checksum_over_ipv6() {
     world(|fcx, attacher, _| async move {
         let mut raw = attacher.attach("a").unwrap();
-        let mut q = Message::query();
-        q.metadata.id = 0;
+        let mut q = Message::new(0, MessageType::Query, OpCode::Query);
         q.add_query(Query::query(
             Name::from_ascii("plain.test").unwrap(),
             RecordType::AAAA,

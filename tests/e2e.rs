@@ -13,7 +13,7 @@ mod done;
 mod world;
 
 use certs::certs;
-use world::world;
+use world::real_world as world;
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr};

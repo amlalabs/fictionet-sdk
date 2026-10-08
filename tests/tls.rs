@@ -1,5 +1,5 @@
 //! TLS: the world as a TLS server, with a rustls client over an in-memory
-//! connection, all under `run`.
+//! connection, all under the lab, with a real-time throughput test.
 
 mod common;
 
@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fictionet::prelude::*;
 use fictionet::stdlib::tls::{self, ServerConfig};
 use fictionet::stdlib::{ConnError, Connection};
-use fictionet::{Cx, block_on, run};
+use fictionet::{Cx, Seed, block_on, lab};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };
@@ -169,7 +169,7 @@ impl Client {
         name: &str,
     ) -> Result<Client, ClientError> {
         let name = ServerName::try_from(name.to_owned()).unwrap();
-        let tls = ClientConnection::new(config, name).unwrap();
+        let tls = tls::with_context(fcx, || ClientConnection::new(config, name)).unwrap();
         let mut c = Client { conn, tls };
         while c.tls.is_handshaking() {
             c.flush(fcx).await?;
@@ -201,7 +201,7 @@ impl Client {
         let mut data = &buf[..n];
         loop {
             self.tls.read_tls(&mut data).unwrap();
-            let r = self.tls.process_new_packets();
+            let r = tls::with_context(fcx, || self.tls.process_new_packets());
             // Send any alert or reply before reporting.
             let _ = self.flush(fcx).await;
             r.map_err(ClientError::Tls)?;
@@ -298,13 +298,13 @@ impl Ca {
 }
 
 fn provider() -> rustls::crypto::CryptoProvider {
-    rustls::crypto::ring::default_provider()
+    tls::crypto_provider()
 }
 
 /// A server config for `name`, issued by `ca`, offering `alpn`.
 fn server_config(fcx: &Cx, ca: &Ca, name: &str, alpn: &[&[u8]]) -> Arc<ServerConfig> {
     let (chain, key) = ca.issue(&[name], 2000, 2100, ExtendedKeyUsagePurpose::ServerAuth);
-    let mut config = tls::config_builder(fcx, SystemTime::now())
+    let mut config = tls::config_builder(fcx, date(2030, 1, 1))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
@@ -327,11 +327,14 @@ impl rustls::time_provider::TimeProvider for FixedTime {
 }
 
 fn client_config(ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
-    let mut config = ClientConfig::builder_with_provider(Arc::new(provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(ca.roots())
-        .with_no_client_auth();
+    let mut config = ClientConfig::builder_with_details(
+        Arc::new(provider()),
+        Arc::new(FixedTime(date(2030, 1, 1))),
+    )
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(ca.roots())
+    .with_no_client_auth();
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Arc::new(config)
 }
@@ -342,7 +345,7 @@ fn client_config(ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
 #[test]
 fn handshake_with_sni_and_alpn() {
     within(Duration::from_secs(20), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new();
             let config = server_config(&fcx, &ca, "example.test", &[b"h2", b"http/1.1"]);
             let client_config = client_config(&ca, &[b"h2", b"http/1.1"]);
@@ -385,7 +388,7 @@ fn handshake_with_sni_and_alpn() {
 #[test]
 fn the_world_picks_a_config_per_handshake() {
     within(Duration::from_secs(20), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new();
             let a = server_config(&fcx, &ca, "a.test", &[]);
             let b = server_config(&fcx, &ca, "b.test", &[]);
@@ -446,7 +449,7 @@ fn the_world_picks_a_config_per_handshake() {
 #[test]
 fn reject_sends_unrecognized_name() {
     within(Duration::from_secs(20), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new();
             let client_config = client_config(&ca, &[]);
             let (server_side, client_side) = mem_pair();
@@ -478,7 +481,7 @@ fn reject_sends_unrecognized_name() {
 #[test]
 fn a_dropped_hello_closes_with_no_alert() {
     within(Duration::from_secs(20), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new();
             let client_config = client_config(&ca, &[]);
             let (server_side, client_side) = mem_pair();
@@ -501,7 +504,7 @@ fn a_dropped_hello_closes_with_no_alert() {
 #[test]
 fn a_first_message_that_is_not_a_hello_is_broken() {
     within(Duration::from_secs(20), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (server_side, mut client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
                 assert_eq!(
@@ -543,7 +546,7 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
         let r = result.clone();
         let outcome = Arc::new(Mutex::new(None));
         let o = outcome.clone();
-        block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
             let ca = Ca::new();
             // Valid only in 2019.
             let (client_chain, client_key) = ca.issue(
@@ -645,7 +648,7 @@ fn certificates_are_checked_against_the_worlds_date() {
 #[test]
 fn close_notify_both_ways() {
     within(Duration::from_secs(20), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new();
             let config = server_config(&fcx, &ca, "example.test", &[]);
             let client_config = client_config(&ca, &[]);
@@ -705,57 +708,60 @@ fn pattern(i: usize) -> u8 {
 fn five_megabytes_each_way() {
     const SIZE: usize = 5 * 1024 * 1024;
     within(Duration::from_secs(120), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
-            let ca = Ca::new();
-            let config = server_config(&fcx, &ca, "example.test", &[]);
-            let client_config = client_config(&ca, &[]);
-            let (server_side, client_side) = mem_pair();
-            let data: Arc<Vec<u8>> = Arc::new((0..SIZE).map(pattern).collect());
+        block_on(fictionet::run(
+            fictionet::Seed::random(),
+            |fcx| async move {
+                let ca = Ca::new();
+                let config = server_config(&fcx, &ca, "example.test", &[]);
+                let client_config = client_config(&ca, &[]);
+                let (server_side, client_side) = mem_pair();
+                let data: Arc<Vec<u8>> = Arc::new((0..SIZE).map(pattern).collect());
 
-            let d = data.clone();
-            let server = fcx.spawn(move |fcx| async move {
-                let mut conn = tls::server(&fcx, server_side)
-                    .await?
-                    .finish(&fcx, config)
-                    .await?;
-                // Odd-sized writes, so records do not line up with them.
-                for chunk in d.chunks(70_001) {
-                    conn.write_all(&fcx, chunk).await?;
-                }
-                let mut received = 0usize;
-                let mut buf = vec![0; 50_000];
-                loop {
-                    let n = conn.read(&fcx, &mut buf).await?;
-                    if n == 0 {
-                        break;
+                let d = data.clone();
+                let server = fcx.spawn(move |fcx| async move {
+                    let mut conn = tls::server(&fcx, server_side)
+                        .await?
+                        .finish(&fcx, config)
+                        .await?;
+                    // Odd-sized writes, so records do not line up with them.
+                    for chunk in d.chunks(70_001) {
+                        conn.write_all(&fcx, chunk).await?;
                     }
-                    for (i, b) in buf[..n].iter().enumerate() {
-                        assert_eq!(*b, pattern(received + i));
+                    let mut received = 0usize;
+                    let mut buf = vec![0; 50_000];
+                    loop {
+                        let n = conn.read(&fcx, &mut buf).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        for (i, b) in buf[..n].iter().enumerate() {
+                            assert_eq!(*b, pattern(received + i));
+                        }
+                        received += n;
                     }
-                    received += n;
-                }
-                assert_eq!(received, SIZE);
-                conn.shutdown(&fcx).await?;
-                Ok(())
-            });
+                    assert_eq!(received, SIZE);
+                    conn.shutdown(&fcx).await?;
+                    Ok(())
+                });
 
-            let mut client = Client::connect(&fcx, client_side, client_config, "example.test")
-                .await
-                .unwrap();
-            let mut received = Vec::with_capacity(SIZE);
-            let mut buf = vec![0; 40_000];
-            while received.len() < SIZE {
+                let mut client = Client::connect(&fcx, client_side, client_config, "example.test")
+                    .await
+                    .unwrap();
+                let mut received = Vec::with_capacity(SIZE);
+                let mut buf = vec![0; 40_000];
+                while received.len() < SIZE {
+                    let n = client.read(&fcx, &mut buf).await.unwrap();
+                    assert!(n > 0);
+                    received.extend_from_slice(&buf[..n]);
+                }
+                assert!(received == *data);
+                client.write_all(&fcx, &data).await.unwrap();
+                client.close(&fcx).await.unwrap();
                 let n = client.read(&fcx, &mut buf).await.unwrap();
-                assert!(n > 0);
-                received.extend_from_slice(&buf[..n]);
-            }
-            assert!(received == *data);
-            client.write_all(&fcx, &data).await.unwrap();
-            client.close(&fcx).await.unwrap();
-            let n = client.read(&fcx, &mut buf).await.unwrap();
-            assert_eq!(n, 0);
-            Ok(server.join(&fcx).await?)
-        }))
+                assert_eq!(n, 0);
+                Ok(server.join(&fcx).await?)
+            },
+        ))
     })
     .unwrap();
 }
@@ -763,7 +769,7 @@ fn five_megabytes_each_way() {
 #[test]
 fn tls12_clients_work_too() {
     within(Duration::from_secs(20), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new();
             let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
             // The config draws random values through Fictionet, not ring.
@@ -771,11 +777,14 @@ fn tls12_clients_work_too() {
                 format!("{:?}", config.crypto_provider().secure_random),
                 "CxRandom"
             );
-            let mut client_config = ClientConfig::builder_with_provider(Arc::new(provider()))
-                .with_protocol_versions(&[&rustls::version::TLS12])
-                .unwrap()
-                .with_root_certificates(ca.roots())
-                .with_no_client_auth();
+            let mut client_config = ClientConfig::builder_with_details(
+                Arc::new(provider()),
+                Arc::new(FixedTime(date(2030, 1, 1))),
+            )
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_root_certificates(ca.roots())
+            .with_no_client_auth();
             client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
             let (server_side, client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
@@ -818,7 +827,7 @@ fn tls12_clients_work_too() {
 #[test]
 fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
     within(Duration::from_secs(20), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new();
             let config = server_config(&fcx, &ca, "example.test", &[]);
             let client_config = client_config(&ca, &[]);
@@ -853,7 +862,7 @@ fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
     .unwrap();
 
     within(Duration::from_secs(20), || {
-        block_on(run(fictionet::Seed::random(), |fcx| async move {
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (server_side, _client_side) = mem_pair();
             fcx.region(|region_fcx| async move {
                 let stopper = region_fcx.clone();

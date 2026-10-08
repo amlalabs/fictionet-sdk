@@ -47,17 +47,15 @@ fuzz_target!(|data: &[u8]| {
     };
     let (der, key) = cert();
     world(move |fcx| async move {
-        let config = tls::config_builder(
-            &fcx,
-            UNIX_EPOCH + Duration::from_secs(1_900_000_000))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from(der.clone())],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.clone())),
-        )
-        .unwrap();
+        let config = tls::config_builder(&fcx, UNIX_EPOCH + Duration::from_secs(1_900_000_000))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(der.clone())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.clone())),
+            )
+            .unwrap();
         let mut config = config;
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let config = Arc::new(config);

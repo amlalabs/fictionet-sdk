@@ -30,6 +30,5 @@ filter = """
 binary(web) | binary(listen) | binary(recipes) | binary(tcpudp) | binary(core)
 | binary(e2e) | binary(attach_bin) | binary(tap_bin) | binary(proxy) | binary(tls)
 | binary(observe) | binary(observe_bin) | binary(observe_tls) | binary(tun_linux)
-| test(=stdlib::tcp::tests::quiet_connections_give_their_buffer_pages_back)
 """
 test-group = "worlds"

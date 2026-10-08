@@ -1746,7 +1746,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::ConnectionExt;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::{InterfaceExt, block_on, pair, run};
+    use fictionet::{InterfaceExt, Seed, block_on, lab, pair, run};
 
     struct WakeLog(u16, Arc<Mutex<Vec<u16>>>);
     impl std::task::Wake for WakeLog {
@@ -2400,7 +2400,7 @@ mod tests {
 
     #[test]
     fn quiet_connections_give_their_buffer_pages_back() {
-        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
+        let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
             let (a, b) = pair();
             let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
             let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());

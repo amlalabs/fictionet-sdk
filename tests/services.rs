@@ -2018,7 +2018,7 @@ fn named_timers_run_side_by_side() {
 /// were there and only then looked at its one timer.
 #[test]
 fn continuous_input_cannot_starve_a_timer() {
-    world(Duration::from_secs(60), |fcx| async move {
+    world::real_world(Duration::from_secs(60), |fcx| async move {
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -2632,7 +2632,7 @@ fn a_seeded_run_repeats_its_randomness() {
 /// calendar.
 #[test]
 fn a_net_starts_its_events_with_a_wall_clock_anchor() {
-    world::seeded_world(
+    world::seeded_real_world(
         fictionet::Seed::from_u64(42),
         Duration::from_secs(60),
         |fcx| async move {

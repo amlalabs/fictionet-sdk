@@ -98,17 +98,15 @@ impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Broken {
 pub fn serve(fcx: &Cx) -> Attacher {
     let (der, key) = cert();
     let config = Arc::new(
-        tls::config_builder(
-            fcx,
-            UNIX_EPOCH + Duration::from_secs(1_800_000_000))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from(der.clone())],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.clone())),
-        )
-        .unwrap(),
+        tls::config_builder(fcx, UNIX_EPOCH + Duration::from_secs(1_800_000_000))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(der.clone())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.clone())),
+            )
+            .unwrap(),
     );
     let sites = web::Sites::new(move |host| {
         let c = config.clone();

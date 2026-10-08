@@ -98,12 +98,10 @@ pub fn serve(
 ) -> fictionet::Result {
     let mut configs = HashMap::new();
     for (host, (chain, key)) in leaves {
-        let config = tls::config_builder(
-            fcx,
-            SystemTime::now())
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(chain, key)?;
+        let config = tls::config_builder(fcx, SystemTime::now())
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(chain, key)?;
         configs.insert(host, Arc::new(config));
     }
     let site_hosts = hosts.clone();

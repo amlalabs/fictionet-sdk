@@ -52,6 +52,12 @@ world's own certificate authority (CA), routing, whole networks of websites with
 [the catalog](src/stdlib/mod.rs). The crate is not on crates.io, so build it
 from this repository.
 
+A world's time and randomness come from one place, and its randomness from a
+seed. With real sandboxes it runs on real time. In a test it can run on
+simulated time instead, where the same seed and the same inputs give the same
+event log and the same packets, byte for byte
+([running a world](src/running.rs)).
+
 ## Try it
 
 ```console

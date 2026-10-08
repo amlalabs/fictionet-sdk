@@ -61,7 +61,12 @@
 //! the request and response bodies it holds to the connection's
 //! [`Budget`]. hyper's own buffers are not charged. HTTP/2 request body
 //! and write stall timeouts use Fictionet deadlines. Hyper runs without a
-//! timer, with keep-alive pings and adaptive windows disabled.
+//! timer, with keep-alive pings and adaptive windows disabled. h2 retains
+//! reset streams for its default `reset_stream_duration` of one second of
+//! real time. Its reset-stream expiry reads the system clock, so late
+//! frames for a stream the world reset more than one real second earlier
+//! can behave differently between lab runs. Hyper does not let a server
+//! change that setting, and h2 exposes no clock injection for it.
 //!
 //! ```
 //! use bytes::Bytes;
@@ -2637,8 +2642,8 @@ mod h2 {
 
         #[test]
         fn http2_body_timeout_uses_the_fictionet_deadline() {
-            fictionet::block_on(fictionet::run(
-                fictionet::Seed::random(),
+            fictionet::block_on(fictionet::lab(
+                fictionet::Seed::from_u64(1),
                 |fcx| async move {
                     let mut input = PREFACE.to_vec();
                     input.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
@@ -2689,8 +2694,7 @@ mod h2 {
                         .unwrap();
                     let started = event.get("started").unwrap().as_f64().unwrap();
                     let elapsed = event.at.since_start().as_secs_f64() - started;
-                    assert!(elapsed >= duration.as_secs_f64(), "{elapsed}");
-                    assert!(elapsed < 1.0, "{elapsed}");
+                    assert_eq!(elapsed, duration.as_secs_f64());
                     assert_eq!(event.str("answer"), Some("timeout"));
                     assert_eq!(event.u64("status"), Some(408));
                     assert_eq!(event.str("version"), Some("HTTP/2.0"));

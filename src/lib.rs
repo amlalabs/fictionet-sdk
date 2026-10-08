@@ -16,6 +16,12 @@
 //! built from, with commands to run: a delayed website, a slow or lossy
 //! link, a packet capture and a route that changes mid-run.
 //!
+//! A world's time and randomness come from one place, its [`Cx`], and its
+//! randomness from a seed. With real sandboxes it runs on real time
+//! ([`run`]). In a test it runs on simulated time ([`lab`]), where the same
+//! seed and the same inputs give the same event log and the same packets,
+//! byte for byte. [`running`] shows both.
+//!
 //! # How a sandbox connects to a world
 //!
 //! The world runs as its own process and listens on a Unix socket, such as

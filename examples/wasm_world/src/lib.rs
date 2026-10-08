@@ -70,12 +70,10 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
         // The world's date: certificates are checked against it.
         let date = std::time::Duration::from_secs(1_767_225_600); // 2026-01-01
         let server = Arc::new(
-            tls::config_builder(
-                &fcx,
-                std::time::UNIX_EPOCH + date)
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_single_cert(certs.chain, certs.key)?,
+            tls::config_builder(&fcx, std::time::UNIX_EPOCH + date)
+                .with_safe_default_protocol_versions()?
+                .with_no_client_auth()
+                .with_single_cert(certs.chain, certs.key)?,
         );
         let (attacher, attachments) = fictionet::attachments();
         let sites = web::Sites::new(move |host| match host {
