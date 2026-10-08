@@ -168,14 +168,10 @@ pub fn sites(
     plain: axum::Router,
 ) -> Result<impl Fn(&str) -> Option<web::Site> + Send + Sync + 'static> {
     let config = Arc::new(
-        tls::config_builder(
-            fcx,
-            SystemTime::now(),
-            rustls::crypto::ring::default_provider(),
-        )
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(chain, key)?,
+        tls::config_builder(fcx, SystemTime::now())
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(chain, key)?,
     );
     Ok(move |host: &str| {
         println!("lookup {host}");

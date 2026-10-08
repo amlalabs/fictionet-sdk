@@ -84,14 +84,10 @@ impl World {
                 fictionet::Seed::random(),
                 move |fcx| async move {
                     let config = Arc::new(
-                        tls::config_builder(
-                            &fcx,
-                            SystemTime::now(),
-                            rustls::crypto::ring::default_provider(),
-                        )
-                        .with_safe_default_protocol_versions()?
-                        .with_no_client_auth()
-                        .with_single_cert(chain, key)?,
+                        tls::config_builder(&fcx, SystemTime::now())
+                            .with_safe_default_protocol_versions()?
+                            .with_no_client_auth()
+                            .with_single_cert(chain, key)?,
                     );
                     let app = axum::Router::new()
                         .route("/", get(|| async { "plain site\n" }))

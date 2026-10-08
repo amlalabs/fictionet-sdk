@@ -261,8 +261,9 @@
 //! | `tokio` (default) | `web::proxy(&fcx)`, which passes requests through to the real site | `hyper-util`, `hyper-rustls` with `webpki-roots`, and hyper's client |
 //!
 //! The `tokio` runtime crate itself is always a dependency, because hyper
-//! and h2 run on it, and so are `rustls` (with the `ring` provider), `hyper`
-//! (server side), `h2`, `smoltcp` and `hickory-proto`. A world that needs
+//! and h2 run on it, and so are `rustls` (with run-aware key exchange and
+//! signing), `hyper` (server side), `h2`, `smoltcp` and `hickory-proto`.
+//! A world that needs
 //! no `web::proxy` can leave the feature out with `default-features = false`.
 //! The [`tokio`] connection adapters are available with either feature set.
 //!
@@ -271,10 +272,10 @@
 //! The library also builds for `wasm32-unknown-unknown`, with
 //! `default-features = false`. A world then runs inside a page: [`run`],
 //! [`Cx`] and its timers, [`block_on`], [`pair`], [`attachments`], the
-//! [`stdlib`] with smoltcp, DNS, `web::Sites` and TLS (rustls with ring,
-//! whose C code needs a clang with the wasm32 target). The page plays the
-//! sandboxes through [`Attacher::attach`], whose [`End`] carries raw IP
-//! packets.
+//! [`stdlib`] with smoltcp, DNS, `web::Sites` and TLS (rustls with the
+//! run-aware provider and ring, whose C code needs a clang with the wasm32
+//! target). The page plays the sandboxes through [`Attacher::attach`],
+//! whose [`End`] carries raw IP packets.
 //!
 //! What needs an operating system is left out of that build: [`listen`]
 //! and [`WorldSocket`], the `fictionet` command, observer sessions, and

@@ -292,8 +292,8 @@
 //! delayed, dropped or answered, in the same order, at the same lab
 //! instants, and every `fcx.random_*` call will return the same number.
 //!
-//! TLS key exchange draws randomness from the operating system inside
-//! ring, so TLS bytes differ from run to run. See
+//! TLS key exchange and signing use the run's randomness, so closed labs
+//! with fixed certificates and inputs reproduce TLS records. See
 //! [`tls::config_builder`](crate::stdlib::tls::config_builder).
 //!
 //! Hyper's HTTP/2 server also retains reset streams using h2's host clock.

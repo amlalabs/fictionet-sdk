@@ -304,7 +304,7 @@ fn provider() -> rustls::crypto::CryptoProvider {
 /// A server config for `name`, issued by `ca`, offering `alpn`.
 fn server_config(fcx: &Cx, ca: &Ca, name: &str, alpn: &[&[u8]]) -> Arc<ServerConfig> {
     let (chain, key) = ca.issue(&[name], 2000, 2100, ExtendedKeyUsagePurpose::ServerAuth);
-    let mut config = tls::config_builder(fcx, SystemTime::now(), provider())
+    let mut config = tls::config_builder(fcx, SystemTime::now())
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
@@ -565,7 +565,7 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
             .build()
             .unwrap();
             let config = Arc::new(
-                tls::config_builder(&fcx, start, provider())
+                tls::config_builder(&fcx, start)
                     .with_safe_default_protocol_versions()
                     .unwrap()
                     .with_client_cert_verifier(verifier)

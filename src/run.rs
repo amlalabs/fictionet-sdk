@@ -114,9 +114,10 @@ where
 /// tasks but no runnable work or finite deadline returns a deadlock error.
 /// Infinite waits remain unarmed; virtual time cannot exceed signed
 /// microseconds. Foreign I/O and independently scheduled inputs are outside
-/// this closed-world contract. TLS key exchange draws OS randomness inside
-/// ring, and h2 expires reset streams using the host clock, so these behaviors
-/// are outside the repeatability guarantee.
+/// this closed-world contract. h2 expires reset streams using the host clock,
+/// so that behavior is outside the repeatability guarantee. TLS built with
+/// [`tls::config_builder`](crate::stdlib::tls::config_builder) draws key
+/// exchange and signing randomness from the run.
 ///
 /// An attachment hub fed by [`listen`](crate::listen) cannot be used in a
 /// lab. Its first `get`, `next`, or `map` fails the region with an error

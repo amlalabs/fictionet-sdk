@@ -201,14 +201,10 @@ fn https_through_a_router(
         let server = machine(&fcx, server_cable, server_ip);
         let client = machine(&fcx, client_cable, client_ip);
 
-        let mut config = tls::config_builder(
-            &fcx,
-            SystemTime::now(),
-            rustls::crypto::ring::default_provider(),
-        )
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(certs.chain, certs.key)?;
+        let mut config = tls::config_builder(&fcx, SystemTime::now())
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(certs.chain, certs.key)?;
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let config: Arc<ServerConfig> = Arc::new(config);
 

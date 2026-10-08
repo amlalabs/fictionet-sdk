@@ -100,9 +100,7 @@ pub fn serve(fcx: &Cx) -> Attacher {
     let config = Arc::new(
         tls::config_builder(
             fcx,
-            UNIX_EPOCH + Duration::from_secs(1_800_000_000),
-            rustls::crypto::ring::default_provider(),
-        )
+            UNIX_EPOCH + Duration::from_secs(1_800_000_000))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()

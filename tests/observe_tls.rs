@@ -38,7 +38,7 @@ fn configs(fcx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     let cert = leaf.signed_by(&key, &ca, &ca_key).unwrap();
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
     let provider = rustls::crypto::ring::default_provider();
-    let server = tls::config_builder(fcx, SystemTime::now(), provider.clone())
+    let server = tls::config_builder(fcx, SystemTime::now())
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()

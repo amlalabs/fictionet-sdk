@@ -49,9 +49,7 @@ fuzz_target!(|data: &[u8]| {
     world(move |fcx| async move {
         let config = tls::config_builder(
             &fcx,
-            UNIX_EPOCH + Duration::from_secs(1_900_000_000),
-            rustls::crypto::ring::default_provider(),
-        )
+            UNIX_EPOCH + Duration::from_secs(1_900_000_000))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()

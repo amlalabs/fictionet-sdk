@@ -68,9 +68,7 @@ pub fn identities(scenario: &Scenario, world_ca: &Ca) -> Result<Identities> {
 fn server_config(fcx: &Cx, leaf: Leaf) -> Result<Arc<tls::ServerConfig>> {
     let config = tls::config_builder(
         fcx,
-        SystemTime::now(),
-        rustls::crypto::ring::default_provider(),
-    )
+        SystemTime::now())
     .with_safe_default_protocol_versions()?
     .with_no_client_auth()
     .with_single_cert(leaf.chain, leaf.key)?;

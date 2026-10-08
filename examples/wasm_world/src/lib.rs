@@ -72,9 +72,7 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
         let server = Arc::new(
             tls::config_builder(
                 &fcx,
-                std::time::UNIX_EPOCH + date,
-                rustls::crypto::ring::default_provider(),
-            )
+                std::time::UNIX_EPOCH + date)
             .with_safe_default_protocol_versions()?
             .with_no_client_auth()
             .with_single_cert(certs.chain, certs.key)?,

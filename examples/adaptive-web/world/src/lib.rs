@@ -322,7 +322,7 @@ impl Ca {
         let key = KeyPair::generate()?;
         let cert = params.signed_by(&key, &self.issuer, &self.key)?;
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-        let config = tls::config_builder(fcx, self.start, rustls::crypto::ring::default_provider())
+        let config = tls::config_builder(fcx, self.start)
             .with_safe_default_protocol_versions()?
             .with_no_client_auth()
             .with_single_cert(vec![cert.der().clone(), self.der.clone()], key)?;

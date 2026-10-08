@@ -176,16 +176,12 @@ fn sites(fcx: &Cx) -> TestSites {
         "v6only.test",
     ]);
     let config = Arc::new(
-        tls::config_builder(
-            fcx,
-            SystemTime::now(),
-            rustls::crypto::ring::default_provider(),
-        )
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(certs.chain, certs.key)
-        .unwrap(),
+        tls::config_builder(fcx, SystemTime::now())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs.chain, certs.key)
+            .unwrap(),
     );
     let calls = Arc::new(AtomicUsize::new(0));
     let served = Arc::new(AtomicUsize::new(0));

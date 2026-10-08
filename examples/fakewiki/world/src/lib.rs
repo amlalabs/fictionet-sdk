@@ -100,9 +100,7 @@ pub fn serve(
     for (host, (chain, key)) in leaves {
         let config = tls::config_builder(
             fcx,
-            SystemTime::now(),
-            rustls::crypto::ring::default_provider(),
-        )
+            SystemTime::now())
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(chain, key)?;

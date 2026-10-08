@@ -60,11 +60,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use rustls::ServerConfig;
 
-use rustls::crypto::{CryptoProvider, GetRandomFailed, SecureRandom};
-use rustls::pki_types::UnixTime;
+use p256::elliptic_curve::{sec1::ToEncodedPoint, zeroize::Zeroizing};
+use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey};
+use rustls::crypto::{
+    ActiveKeyExchange, CryptoProvider, GetRandomFailed, KeyProvider, SecureRandom, SharedSecret,
+    SupportedKxGroup,
+};
+use rustls::pki_types::{PrivateKeyDer, SubjectPublicKeyInfoDer, UnixTime};
 use rustls::server::{Acceptor, ServerConnection};
+use rustls::sign::{Signer, SigningKey};
 use rustls::time_provider::TimeProvider;
-use rustls::{ConfigBuilder, WantsVersions};
+use rustls::{ConfigBuilder, NamedGroup, SignatureAlgorithm, SignatureScheme, WantsVersions};
 
 use fictionet::Cx;
 use fictionet::stdlib::{ConnError, Connection};
@@ -124,27 +130,24 @@ pub fn alert_name(code: u8) -> &'static str {
 ///   world takes from its arguments (see [No dates](fictionet::time#no-dates)).
 ///   So a world set in 2019 checks certificates against 2019.
 /// - **Random values**, such as the server random, session IDs and ticket
-///   keys, come from [`Cx::fill_random`](fictionet::Cx::fill_random).
+///   identifiers, come from [`Cx::fill_random`](fictionet::Cx::fill_random).
 ///
-/// Key exchange is the exception. rustls's built-in providers make each
-/// ephemeral key with the operating system's randomness, inside the
-/// provider's key-exchange code. So the bytes of a TLS handshake differ from
-/// run to run.
+/// Ephemeral keys and RSA-PSS salts also come from the run. ECDSA uses
+/// deterministic RFC 6979 nonces, and Ed25519 signatures are deterministic.
 ///
 /// Random values are drawn while [`server`], [`ClientHello::finish`] or a
 /// [`TlsConnection`] is working, and come from the `Cx` passed to that call.
-/// A config handed to other TLS code, outside this module, fails random
-/// draws because no `Cx` is bound to that call.
+/// Code driving rustls directly must bind a `Cx` with [`with_context`];
+/// otherwise random draws fail.
 ///
-/// Pass the crypto provider to use, such as
-/// `rustls::crypto::ring::default_provider()`. Continue as with
-/// `ServerConfig::builder()`:
+/// Continue as with `ServerConfig::builder()`. Key loading does not draw
+/// randomness. Keep configs within their run because the clock holds `fcx`:
 ///
 /// ```
 /// # use fictionet::{Cx, Result, stdlib::tls};
 /// # use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 /// # fn make(fcx: Cx, start: std::time::SystemTime, chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result {
-/// let config = tls::config_builder(&fcx, start, rustls::crypto::ring::default_provider())
+/// let config = tls::config_builder(&fcx, start)
 ///     .with_safe_default_protocol_versions()?
 ///     .with_no_client_auth()
 ///     .with_single_cert(chain, key)?;
@@ -152,15 +155,8 @@ pub fn alert_name(code: u8) -> &'static str {
 /// # Ok(())
 /// # }
 /// ```
-pub fn config_builder(
-    fcx: &Cx,
-    start: SystemTime,
-    provider: CryptoProvider,
-) -> ConfigBuilder<ServerConfig, WantsVersions> {
-    let provider = CryptoProvider {
-        secure_random: &CxRandom,
-        ..provider
-    };
+pub fn config_builder(fcx: &Cx, start: SystemTime) -> ConfigBuilder<ServerConfig, WantsVersions> {
+    let provider = crypto_provider();
     let clock = CxClock {
         fcx: fcx.clone(),
         start,
@@ -196,8 +192,13 @@ thread_local! {
     static CURRENT: RefCell<Option<Cx>> = const { RefCell::new(None) };
 }
 
-/// Runs `f` with `fcx` as the source of [`CxRandom`].
-fn with_fcx<T>(fcx: &Cx, f: impl FnOnce() -> T) -> T {
+/// Runs synchronous TLS work with `fcx` as its source of randomness.
+///
+/// Bind each call that constructs or drives a rustls connection using
+/// [`crypto_provider`]. The binding lasts only until `f` returns, including
+/// during unwinding. Nested calls restore the previous context. Do not
+/// return a future expecting the binding to remain active when it is polled.
+pub fn with_context<T>(fcx: &Cx, f: impl FnOnce() -> T) -> T {
     struct Restore(Option<Cx>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -213,7 +214,7 @@ fn with_fcx<T>(fcx: &Cx, f: impl FnOnce() -> T) -> T {
 /// rustls's `SecureRandom`, from the `Cx` of the TLS work that draws it.
 ///
 /// rustls keeps it as a `&'static`, so it cannot hold a `Cx` itself: it
-/// reads the one [`with_fcx`] set for this thread.
+/// reads the one [`with_context`] set for this thread.
 #[derive(Debug)]
 struct CxRandom;
 
@@ -226,6 +227,396 @@ impl SecureRandom for CxRandom {
             }
             None => Err(GetRandomFailed),
         })
+    }
+}
+
+/// Builds the run-aware TLS crypto provider.
+///
+/// Cipher suites, verification algorithms and their preference order are
+/// ring's. Key exchange and signing use the run's entropy through
+/// [`with_context`]; without a context, operations needing entropy fail.
+/// X25519, P-256 and P-384 secrets are zeroized when dropped. The provider
+/// does not install a stateless ticketer; rustls's stateful cache remains
+/// available. Custom resolvers and signers must honor the same contract.
+///
+/// The provider supplies cryptography, not the certificate clock. For a
+/// client config, use `rustls::ClientConfig::builder_with_details` with a
+/// `TimeProvider` derived from [`Cx::now`] and the world's date.
+pub fn crypto_provider() -> CryptoProvider {
+    CryptoProvider {
+        secure_random: &CxRandom,
+        kx_groups: vec![
+            &CxGroup(rustls::NamedGroup::X25519),
+            &CxGroup(rustls::NamedGroup::secp256r1),
+            &CxGroup(rustls::NamedGroup::secp384r1),
+        ],
+        key_provider: &CxKeyProvider,
+        ..rustls::crypto::ring::default_provider()
+    }
+}
+
+#[derive(Debug)]
+struct CxGroup(NamedGroup);
+
+impl SupportedKxGroup for CxGroup {
+    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, rustls::Error> {
+        let secret = match self.0 {
+            NamedGroup::X25519 => {
+                let mut bytes = Zeroizing::new([0; 32]);
+                CxRandom.fill(bytes.as_mut())?;
+                ExchangeSecret::X25519(x25519_dalek::StaticSecret::from(*bytes))
+            }
+            NamedGroup::secp256r1 => loop {
+                let mut bytes = Zeroizing::new([0; 32]);
+                CxRandom.fill(bytes.as_mut())?;
+                if let Ok(secret) = p256::SecretKey::from_slice(bytes.as_ref()) {
+                    break ExchangeSecret::P256(secret);
+                }
+            },
+            NamedGroup::secp384r1 => loop {
+                let mut bytes = Zeroizing::new([0; 48]);
+                CxRandom.fill(bytes.as_mut())?;
+                if let Ok(secret) = p384::SecretKey::from_slice(bytes.as_ref()) {
+                    break ExchangeSecret::P384(secret);
+                }
+            },
+            _ => unreachable!(),
+        };
+        let public = match &secret {
+            ExchangeSecret::X25519(s) => x25519_dalek::PublicKey::from(s).as_bytes().to_vec(),
+            ExchangeSecret::P256(s) => s.public_key().to_encoded_point(false).as_bytes().to_vec(),
+            ExchangeSecret::P384(s) => s.public_key().to_encoded_point(false).as_bytes().to_vec(),
+        };
+        Ok(Box::new(Exchange {
+            secret,
+            public,
+            group: self.0,
+        }))
+    }
+
+    fn name(&self) -> NamedGroup {
+        self.0
+    }
+
+    fn ffdhe_group(&self) -> Option<rustls::ffdhe_groups::FfdheGroup<'static>> {
+        None
+    }
+}
+
+// Each primitive owns and zeroizes its secret on drop, including on failure.
+enum ExchangeSecret {
+    X25519(x25519_dalek::StaticSecret),
+    P256(p256::SecretKey),
+    P384(p384::SecretKey),
+}
+
+struct Exchange {
+    secret: ExchangeSecret,
+    public: Vec<u8>,
+    group: NamedGroup,
+}
+
+fn invalid_share() -> rustls::Error {
+    rustls::PeerMisbehaved::InvalidKeyShare.into()
+}
+
+impl ActiveKeyExchange for Exchange {
+    fn complete(self: Box<Self>, peer: &[u8]) -> Result<SharedSecret, rustls::Error> {
+        match &self.secret {
+            ExchangeSecret::X25519(secret) => {
+                let bytes: [u8; 32] = peer.try_into().map_err(|_| invalid_share())?;
+                let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(bytes));
+                if !shared.was_contributory() {
+                    return Err(invalid_share());
+                }
+                Ok(SharedSecret::from(shared.as_bytes().as_slice()))
+            }
+            ExchangeSecret::P256(secret) => {
+                if peer.len() != 65 || peer[0] != 4 {
+                    return Err(invalid_share());
+                }
+                // PublicKey parsing rejects off-curve points and the identity.
+                let public = p256::PublicKey::from_sec1_bytes(peer).map_err(|_| invalid_share())?;
+                let shared =
+                    p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
+                Ok(SharedSecret::from(shared.raw_secret_bytes().as_slice()))
+            }
+            ExchangeSecret::P384(secret) => {
+                if peer.len() != 97 || peer[0] != 4 {
+                    return Err(invalid_share());
+                }
+                let public = p384::PublicKey::from_sec1_bytes(peer).map_err(|_| invalid_share())?;
+                let shared =
+                    p384::ecdh::diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
+                Ok(SharedSecret::from(shared.raw_secret_bytes().as_slice()))
+            }
+        }
+    }
+    fn pub_key(&self) -> &[u8] {
+        &self.public
+    }
+    fn group(&self) -> NamedGroup {
+        self.group
+    }
+}
+
+#[derive(Debug)]
+struct CxKeyProvider;
+
+// Debug deliberately excludes private key material.
+enum KeyMaterial {
+    P256(p256::ecdsa::SigningKey),
+    P384(p384::ecdsa::SigningKey),
+    Rsa(Box<rsa::RsaPrivateKey>),
+}
+
+struct RunSigningKey {
+    material: Arc<KeyMaterial>,
+    public: Vec<u8>,
+}
+
+impl std::fmt::Debug for RunSigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunSigningKey")
+            .field("algorithm", &self.algorithm())
+            .finish()
+    }
+}
+
+fn key_error(e: impl std::fmt::Display) -> rustls::Error {
+    rustls::Error::General(format!("TLS private key: {e}"))
+}
+
+impl KeyProvider for CxKeyProvider {
+    fn load_private_key(
+        &self,
+        der: PrivateKeyDer<'static>,
+    ) -> Result<Arc<dyn SigningKey>, rustls::Error> {
+        use rsa::pkcs1::DecodeRsaPrivateKey;
+        let rsa = match &der {
+            PrivateKeyDer::Pkcs1(d) => {
+                rsa::RsaPrivateKey::from_pkcs1_der(d.secret_pkcs1_der()).ok()
+            }
+            PrivateKeyDer::Pkcs8(d) => {
+                rsa::RsaPrivateKey::from_pkcs8_der(d.secret_pkcs8_der()).ok()
+            }
+            _ => None,
+        };
+        if let Some(key) = rsa {
+            // Retain ring's key size and encoding validation, without signing
+            // or obtaining entropy from ring.
+            match &der {
+                PrivateKeyDer::Pkcs1(d) => {
+                    ring::signature::RsaKeyPair::from_der(d.secret_pkcs1_der())
+                }
+                PrivateKeyDer::Pkcs8(d) => {
+                    ring::signature::RsaKeyPair::from_pkcs8(d.secret_pkcs8_der())
+                }
+                _ => unreachable!(),
+            }
+            .map_err(key_error)?;
+            key.validate().map_err(key_error)?;
+            let public = key
+                .to_public_key()
+                .to_public_key_der()
+                .map_err(key_error)?
+                .as_bytes()
+                .to_vec();
+            return Ok(Arc::new(RunSigningKey {
+                material: Arc::new(KeyMaterial::Rsa(Box::new(key))),
+                public,
+            }));
+        }
+        let p256 = match &der {
+            PrivateKeyDer::Pkcs8(d) => p256::SecretKey::from_pkcs8_der(d.secret_pkcs8_der()).ok(),
+            PrivateKeyDer::Sec1(d) => p256::SecretKey::from_sec1_der(d.secret_sec1_der()).ok(),
+            _ => None,
+        };
+        if let Some(key) = p256 {
+            let public = key
+                .public_key()
+                .to_public_key_der()
+                .map_err(key_error)?
+                .as_bytes()
+                .to_vec();
+            return Ok(Arc::new(RunSigningKey {
+                material: Arc::new(KeyMaterial::P256(key.into())),
+                public,
+            }));
+        }
+        let p384 = match &der {
+            PrivateKeyDer::Pkcs8(d) => p384::SecretKey::from_pkcs8_der(d.secret_pkcs8_der()).ok(),
+            PrivateKeyDer::Sec1(d) => p384::SecretKey::from_sec1_der(d.secret_sec1_der()).ok(),
+            _ => None,
+        };
+        if let Some(key) = p384 {
+            let public = key
+                .public_key()
+                .to_public_key_der()
+                .map_err(key_error)?
+                .as_bytes()
+                .to_vec();
+            return Ok(Arc::new(RunSigningKey {
+                material: Arc::new(KeyMaterial::P384(key.into())),
+                public,
+            }));
+        }
+        if let PrivateKeyDer::Pkcs8(d) = &der {
+            // Ed25519 parsing and signing in ring take no RNG.
+            return rustls::crypto::ring::sign::any_eddsa_type(d);
+        }
+        Err(key_error("unsupported encoding or algorithm"))
+    }
+}
+
+const RSA_SCHEMES: &[SignatureScheme] = &[
+    SignatureScheme::RSA_PSS_SHA512,
+    SignatureScheme::RSA_PSS_SHA384,
+    SignatureScheme::RSA_PSS_SHA256,
+    SignatureScheme::RSA_PKCS1_SHA512,
+    SignatureScheme::RSA_PKCS1_SHA384,
+    SignatureScheme::RSA_PKCS1_SHA256,
+];
+
+impl SigningKey for RunSigningKey {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+        let supported: &[SignatureScheme] = match &*self.material {
+            KeyMaterial::P256(_) => &[SignatureScheme::ECDSA_NISTP256_SHA256],
+            KeyMaterial::P384(_) => &[SignatureScheme::ECDSA_NISTP384_SHA384],
+            KeyMaterial::Rsa(_) => RSA_SCHEMES,
+        };
+        let scheme = *supported.iter().find(|s| offered.contains(s))?;
+        Some(Box::new(RunSigner {
+            material: self.material.clone(),
+            scheme,
+        }))
+    }
+    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+        Some(self.public.as_slice().into())
+    }
+    fn algorithm(&self) -> SignatureAlgorithm {
+        match &*self.material {
+            KeyMaterial::P256(_) | KeyMaterial::P384(_) => SignatureAlgorithm::ECDSA,
+            KeyMaterial::Rsa(_) => SignatureAlgorithm::RSA,
+        }
+    }
+}
+
+struct RunSigner {
+    material: Arc<KeyMaterial>,
+    scheme: SignatureScheme,
+}
+
+impl std::fmt::Debug for RunSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunSigner")
+            .field("scheme", &self.scheme)
+            .finish()
+    }
+}
+
+// Own the capability for the duration of the primitive's synchronous call.
+// rand_core's infallible methods cannot report missing context, so construction
+// checks it before passing this adapter to RSA.
+struct CxRng(Cx);
+impl CxRng {
+    fn current() -> Result<Self, rustls::Error> {
+        CURRENT
+            .with(|c| c.borrow().clone())
+            .map(Self)
+            .ok_or_else(|| GetRandomFailed.into())
+    }
+}
+impl rsa::rand_core::CryptoRng for CxRng {}
+impl rsa::rand_core::RngCore for CxRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut bytes = [0; 4];
+        self.0.fill_random(&mut bytes);
+        u32::from_le_bytes(bytes)
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0.random_u64()
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.0.fill_random(dest);
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl Signer for RunSigner {
+    fn scheme(&self) -> SignatureScheme {
+        self.scheme
+    }
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+        use rsa::signature::hazmat::PrehashSigner;
+        match &*self.material {
+            KeyMaterial::P256(key) => {
+                let signature: p256::ecdsa::Signature = key
+                    .sign_prehash(ring::digest::digest(&ring::digest::SHA256, message).as_ref())
+                    .map_err(key_error)?;
+                Ok(signature.to_der().as_bytes().to_vec())
+            }
+            KeyMaterial::P384(key) => {
+                let signature: p384::ecdsa::Signature = key
+                    .sign_prehash(ring::digest::digest(&ring::digest::SHA384, message).as_ref())
+                    .map_err(key_error)?;
+                Ok(signature.to_der().as_bytes().to_vec())
+            }
+            KeyMaterial::Rsa(key) => {
+                let mut rng = CxRng::current()?;
+                let hash = match self.scheme {
+                    SignatureScheme::RSA_PSS_SHA256 | SignatureScheme::RSA_PKCS1_SHA256 => {
+                        &ring::digest::SHA256
+                    }
+                    SignatureScheme::RSA_PSS_SHA384 | SignatureScheme::RSA_PKCS1_SHA384 => {
+                        &ring::digest::SHA384
+                    }
+                    SignatureScheme::RSA_PSS_SHA512 | SignatureScheme::RSA_PKCS1_SHA512 => {
+                        &ring::digest::SHA512
+                    }
+                    _ => unreachable!(),
+                };
+                let digest = ring::digest::digest(hash, message);
+                // PSS uses digest-sized salts and RSA blinding draws from Cx too.
+                match self.scheme {
+                    SignatureScheme::RSA_PSS_SHA256 => key.sign_with_rng(
+                        &mut rng,
+                        rsa::Pss::new_blinded::<rsa::sha2::Sha256>(),
+                        digest.as_ref(),
+                    ),
+                    SignatureScheme::RSA_PSS_SHA384 => key.sign_with_rng(
+                        &mut rng,
+                        rsa::Pss::new_blinded::<rsa::sha2::Sha384>(),
+                        digest.as_ref(),
+                    ),
+                    SignatureScheme::RSA_PSS_SHA512 => key.sign_with_rng(
+                        &mut rng,
+                        rsa::Pss::new_blinded::<rsa::sha2::Sha512>(),
+                        digest.as_ref(),
+                    ),
+                    SignatureScheme::RSA_PKCS1_SHA256 => key.sign_with_rng(
+                        &mut rng,
+                        rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha256>(),
+                        digest.as_ref(),
+                    ),
+                    SignatureScheme::RSA_PKCS1_SHA384 => key.sign_with_rng(
+                        &mut rng,
+                        rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha384>(),
+                        digest.as_ref(),
+                    ),
+                    SignatureScheme::RSA_PKCS1_SHA512 => key.sign_with_rng(
+                        &mut rng,
+                        rsa::Pkcs1v15Sign::new::<rsa::sha2::Sha512>(),
+                        digest.as_ref(),
+                    ),
+                    _ => unreachable!(),
+                }
+                .map_err(key_error)
+            }
+        }
     }
 }
 
@@ -320,7 +711,7 @@ impl<C: Connection> Io<C> {
             }
             self.inbuf.drain(..n);
         }
-        let result = with_fcx(fcx, || tls.process_new_packets().map(|_| ()));
+        let result = with_context(fcx, || tls.process_new_packets().map(|_| ()));
         if let Err(e) = result {
             self.take_output(tls);
             return Err(match e {
@@ -557,7 +948,7 @@ impl<C: Connection> ClientHello<C> {
             eof: false,
         };
         let config = fictionet::observe::observed_config(fcx, config, self.server_name.as_deref());
-        let mut tls = match with_fcx(fcx, || self.accepted.into_connection(config)) {
+        let mut tls = match with_context(fcx, || self.accepted.into_connection(config)) {
             Ok(tls) => tls,
             Err((e, mut alert)) => {
                 // Best effort: tell the client why, then close.
@@ -723,7 +1114,7 @@ impl<C: Connection> Connection for TlsConnection<C> {
             return Poll::Ready(Ok(0));
         }
         let chunk = &data[..data.len().min(WRITE_CHUNK)];
-        let n = match self.tls.writer().write(chunk) {
+        let n = match with_context(fcx, || self.tls.writer().write(chunk)) {
             Ok(0) | Err(_) => return Poll::Ready(Err(ConnError::Closed)),
             Ok(n) => n,
         };
@@ -742,7 +1133,7 @@ impl<C: Connection> Connection for TlsConnection<C> {
     fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         if !self.closing {
             self.closing = true;
-            self.tls.send_close_notify();
+            with_context(fcx, || self.tls.send_close_notify());
             self.io.take_output(&mut self.tls);
         }
         match self.io.poll_flush(fcx, cx) {
@@ -770,7 +1161,7 @@ mod tests {
             let oracle = SeededEntropy::new(Seed::from_u64(42));
             let mut expected = [0; 1];
             oracle.fill_random(&mut expected);
-            super::with_fcx(&fcx, || super::CxRandom.fill(&mut byte)).unwrap();
+            super::with_context(&fcx, || super::CxRandom.fill(&mut byte)).unwrap();
             assert_eq!(byte, expected);
             assert_eq!(fcx.random_u64(), oracle.random_u64());
             Ok(())

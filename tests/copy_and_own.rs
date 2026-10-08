@@ -550,3 +550,62 @@ fn copied_generated_cme_module_frames_packets() {
     assert_eq!(messages, packet.messages);
     assert_eq!(cme_mdp3::Price9::EXPONENT, -9);
 }
+
+#[test]
+fn copied_tls_provider_uses_public_run_entropy() {
+    use fictionet::{Seed, block_on, lab};
+    use rustls::pki_types::PrivateKeyDer;
+    use std::sync::{Arc, Mutex};
+
+    fn draw(provider: rustls::crypto::CryptoProvider) -> Vec<Vec<u8>> {
+        let mut bytes = vec![0; 17];
+        provider.secure_random.fill(&mut bytes).unwrap();
+        let mut result = vec![bytes];
+        for group in provider.kx_groups {
+            let first = group.start().unwrap();
+            let second = group.start().unwrap();
+            let a = first.pub_key().to_vec();
+            let b = second.pub_key().to_vec();
+            let shared = first.complete(&b).unwrap();
+            assert_eq!(
+                shared.secret_bytes(),
+                second.complete(&a).unwrap().secret_bytes()
+            );
+            result.extend([a, b, shared.secret_bytes().to_vec()]);
+        }
+        let key = provider
+            .key_provider
+            .load_private_key(
+                PrivateKeyDer::try_from(include_bytes!("fixtures/tls/rsa.key.der").to_vec())
+                    .unwrap(),
+            )
+            .unwrap();
+        result.push(
+            key.choose_scheme(&[rustls::SignatureScheme::RSA_PSS_SHA256])
+                .unwrap()
+                .sign(b"copied TLS")
+                .unwrap(),
+        );
+        result
+    }
+
+    let exercise = |seed, copied| {
+        let result = Arc::new(Mutex::new(Vec::new()));
+        let output = result.clone();
+        block_on(lab(Seed::from_u64(seed), move |cx| async move {
+            let bytes = if copied {
+                tls::with_context(&cx, || draw(tls::crypto_provider()))
+            } else {
+                fictionet::stdlib::tls::with_context(&cx, || {
+                    draw(fictionet::stdlib::tls::crypto_provider())
+                })
+            };
+            *output.lock().unwrap() = bytes;
+            Ok(())
+        }))
+        .unwrap();
+        Arc::try_unwrap(result).unwrap().into_inner().unwrap()
+    };
+    assert_eq!(exercise(91, true), exercise(91, false));
+    assert_ne!(exercise(91, true), exercise(92, true));
+}
