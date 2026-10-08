@@ -547,13 +547,6 @@ pub struct FunctionCall {
     pub result_format: Format,
 }
 
-impl FunctionCall {
-    /// The format of argument `i`.
-    pub fn arg_format(&self, i: usize) -> Format {
-        format_for(&self.arg_formats, i)
-    }
-}
-
 /// A message a client sends. The first four are the startup phase's,
 /// which have no type byte; the rest are typed.
 #[derive(Clone, Debug, PartialEq, Eq)]

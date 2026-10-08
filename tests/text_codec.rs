@@ -91,7 +91,7 @@ fn ftp_line_errors_recover_and_accept_bare_lf() {
     );
     // Semantic validation remains a separate layer, as in the RPC stacks.
     let commands = || ftp::Commands::new().map(|item| item.map(|c| ftp::Request::from_command(&c)));
-    contract::check_stack(commands, b"ZZZZ\r\nNOOP\r\n");
+    contract::check_decode(commands, b"ZZZZ\r\nNOOP\r\n");
 }
 
 #[test]

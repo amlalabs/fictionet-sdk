@@ -11,7 +11,7 @@ where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
-    contract::check_stack(&make, bytes);
+    contract::check_decode(&make, bytes);
     for pattern in [&[1][..], &[1, 2, 5, 3, 127], &[7, 1, 64], &[]] {
         let mut stream = Stream::new(make());
         let mut got = Vec::new();

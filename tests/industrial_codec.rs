@@ -125,7 +125,7 @@ fn dnp3_application_request_and_response() {
         .collect();
     let bytes = round_trip(dnp3::Frames::new, &frames);
     let make = || dnp3::Frames.map(|frame| frame.segment().map(|s| dnp3::Fragment::parse(&s.data)));
-    contract::check_stack(make, &bytes);
+    contract::check_decode(make, &bytes);
     decode_chunks(make, &bytes, &[Ok(Ok(request)), Ok(Ok(response))]);
     eof_at_every_prefix(dnp3::Frames::new, &frames[0].to_bytes().unwrap());
 
@@ -170,7 +170,7 @@ fn iec104_information_acknowledgment_and_link_control() {
             _ => None,
         })
     };
-    contract::check_stack(make, &bytes);
+    contract::check_decode(make, &bytes);
     decode_chunks(make, &bytes, &[None, Some(Ok(asdu)), None]);
     eof_at_every_prefix(iec104::Frames::new, &frames[1].to_bytes().unwrap());
     let max = iec104::Frame::Information {
@@ -245,7 +245,7 @@ fn enip_cip_request_and_response() {
             enip::MessageRequest::parse(&item.data)
         })
     };
-    contract::check_stack(make, &bytes);
+    contract::check_decode(make, &bytes);
     decode_chunks(make, &bytes, &[Ok(request)]);
     let response = enip::MessageResponse {
         service: enip::service::GET_ATTRIBUTE_SINGLE,
@@ -527,7 +527,7 @@ fn rdp_slow_path_negotiation_data_and_fast_path() {
             _ => None,
         })
     };
-    contract::check_stack(make, &bytes);
+    contract::check_decode(make, &bytes);
     decode_chunks(
         make,
         &bytes,

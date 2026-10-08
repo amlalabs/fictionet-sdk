@@ -2,7 +2,7 @@ extern crate alloc;
 
 use alloc::{collections::VecDeque, vec::Vec};
 use core::ops::Range;
-use fictionet::stdlib::codec::{Buffer, Decode, Fail, Stream, StreamEvent};
+use fictionet::stdlib::codec::{Buffer, Fail, StreamEvent};
 
 /// Direction of bytes relative to the client endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,7 +34,7 @@ pub struct Record<T, E> {
     /// Endpoint direction. Each direction has its own stream offsets.
     pub direction: Direction,
     /// Consumed bytes for items and skips; unread bytes for failures.
-    /// Offsets saturate at `u64::MAX`, as they do in [`Stream`].
+    /// Offsets saturate at `u64::MAX`, as they do in [`Stream`](fictionet::stdlib::codec::Stream).
     pub range: Range<u64>,
     /// Whether the byte budget kept only a prefix of the observed bytes.
     pub truncated: bool,
@@ -59,7 +59,7 @@ pub struct Record<T, E> {
 /// bounds how many such values are held. Allocator overhead is separate.
 /// Use one recorder for all Demux keys and directions under one budget.
 /// Assign each stream a numeric tag with [`observer`](Self::observer).
-/// Untagged calls use zero. The recorder does not infer stream identity.
+/// The recorder does not infer stream identity.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Direction, Interceptor, Recorder, Rewrite, Stream}, modbus};
@@ -145,12 +145,6 @@ impl<T, E> Recorder<T, E> {
     }
 }
 impl<T: Clone, E: Clone> Recorder<T, E> {
-    /// Copies a driver observation with tag zero. Returns whether retained.
-    /// Byte truncation preserves the full range and kind under the budget.
-    pub fn observe(&mut self, direction: Direction, event: StreamEvent<'_, T, E>) -> bool {
-        self.observe_tagged(0, direction, event)
-    }
-
     /// Copies an observation with a caller-assigned stream key. Count and
     /// byte limits are shared across all tags and directions. Empty skips
     /// are ignored without eviction or incrementing the dropped count.
@@ -234,50 +228,20 @@ impl<T: Clone, E: Clone> Recorder<T, E> {
             self.observe_tagged(tag, direction, event);
         }
     }
-
-    /// Drives one item while recording every skip and terminal event along
-    /// the way. The callback receives the owned item and its borrowed bytes
-    /// after recording. For recording with rewrites or faults, pass
-    /// [`observer`](Self::observer) to `Interceptor::next_with_observed` or
-    /// `Faults::next_with_observed`. Those forward skips in the same pass.
-    /// Waiting for input allocates and copies nothing.
-    pub fn with_next<D: Decode<Item = T, Error = E>, R>(
-        &mut self,
-        direction: Direction,
-        stream: &mut Stream<D>,
-        f: impl FnOnce(T, &[u8], Range<u64>) -> R,
-    ) -> Option<Result<R, Fail<E>>> {
-        self.with_next_tagged(0, direction, stream, f)
-    }
-
-    /// Drives and records one keyed stream. Use one recorder across every
-    /// Demux key to keep an aggregate transcript bound. Offsets are local
-    /// to the supplied stream; the key and direction label them.
-    pub fn with_next_tagged<D: Decode<Item = T, Error = E>, R>(
-        &mut self,
-        tag: u64,
-        direction: Direction,
-        stream: &mut Stream<D>,
-        f: impl FnOnce(T, &[u8], Range<u64>) -> R,
-    ) -> Option<Result<R, Fail<E>>> {
-        stream.with_next_observed(f, |event| {
-            self.observe_tagged(tag, direction, event);
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use fictionet::stdlib::{
-        codec::{Ending, Lines},
+        codec::{Ending, Lines, Stream},
         json, modbus,
     };
 
     #[test]
     fn empty_skips_do_not_evict_real_entries() {
         let mut log = Recorder::<(), core::convert::Infallible>::new(1, 4);
-        assert!(log.observe(
+        assert!(log.observe_tagged(0,
             Direction::ClientToServer,
             StreamEvent::Skipped {
                 bytes: b"data",
@@ -285,7 +249,7 @@ mod tests {
             }
         ));
         for _ in 0..1000 {
-            assert!(!log.observe(
+            assert!(!log.observe_tagged(0,
                 Direction::ClientToServer,
                 StreamEvent::Skipped {
                     bytes: b"",
@@ -302,7 +266,7 @@ mod tests {
     fn bounds_drop_oldest_and_truncate_oversized_incoming() {
         let mut log = Recorder::<u8, core::convert::Infallible>::new(2, 3);
         for i in 0..3u8 {
-            assert!(log.observe(
+            assert!(log.observe_tagged(0,
                 Direction::ClientToServer,
                 StreamEvent::Item {
                     item: &i,
@@ -313,7 +277,7 @@ mod tests {
         }
         assert_eq!(log.len(), 2);
         assert_eq!(log.dropped(), 1);
-        assert!(log.observe(
+        assert!(log.observe_tagged(0,
             Direction::ServerToClient,
             StreamEvent::Skipped {
                 bytes: b"long",
@@ -325,7 +289,7 @@ mod tests {
         assert_eq!(entry.bytes, b"lon");
         assert_eq!(entry.range, 0..4);
         assert!(entry.truncated);
-        assert!(log.observe(
+        assert!(log.observe_tagged(0,
             Direction::ServerToClient,
             StreamEvent::Skipped {
                 bytes: b"abc",
@@ -346,7 +310,7 @@ mod tests {
         let mut log = Recorder::new(32, 32);
         for byte in b"abcdef\nx\n" {
             assert_eq!(stream.push(&[*byte]), 1);
-            while let Some(r) = log.with_next(Direction::ClientToServer, &mut stream, |_, _, _| ())
+            while let Some(r) = stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
             {
                 r.unwrap();
             }
@@ -354,7 +318,7 @@ mod tests {
         stream.end();
         for _ in 0..2 {
             assert!(
-                log.with_next(Direction::ClientToServer, &mut stream, |_, _, _| ())
+                stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
                     .is_none()
             );
         }
@@ -378,12 +342,12 @@ mod tests {
         assert_eq!(stream.push(b"abc"), 3);
         stream.end();
         assert!(
-            log.with_next(Direction::ServerToClient, &mut stream, |_, _, _| ())
+            stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ServerToClient))
                 .unwrap()
                 .is_err()
         );
         assert!(
-            log.with_next(Direction::ServerToClient, &mut stream, |_, _, _| ())
+            stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ServerToClient))
                 .is_none()
         );
         let entry = log.iter().next().unwrap();
@@ -400,15 +364,15 @@ mod tests {
         let mut stream = Stream::new(json::Values::new());
         let mut log = Recorder::new(0, 0);
         assert!(
-            log.with_next(Direction::ClientToServer, &mut stream, |_, _, _| ())
+            stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
                 .is_none()
         );
         assert_eq!(log.dropped(), 0);
         stream.end();
-        log.with_next(Direction::ClientToServer, &mut stream, |_, _, _| ());
+        stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer));
         assert_eq!(log.dropped(), 1);
         let mut log = Recorder::<(), core::convert::Infallible>::new(1, 0);
-        assert!(log.observe(Direction::ClientToServer, StreamEvent::Ended { offset: 0 }));
+        assert!(log.observe_tagged(0, Direction::ClientToServer, StreamEvent::Ended { offset: 0 }));
         assert_eq!(log.retained_bytes(), 0);
         assert_eq!(log.len(), 1);
     }

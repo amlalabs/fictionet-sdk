@@ -337,17 +337,6 @@ where
         );
     }
 }
-/// Checks a composed decoder with the same contract as each layer.
-/// The generic interface has no layer oracle. Compare with separately run
-/// layers in stack-specific tests when that comparison is needed.
-pub fn check_stack<D: Decode>(make: impl Fn() -> D, data: &[u8])
-where
-    D::Item: PartialEq + Debug,
-    D::Error: Clone + PartialEq + Debug,
-{
-    check_decode(make, data);
-}
-
 /// Checks a constructed value's strict, transactional writer. Successful
 /// output must reparse as the same value and re-encode identically. Refused
 /// values must leave a nonempty destination unchanged. Panics on failure.

@@ -487,14 +487,6 @@ pub fn text(status: StatusCode, body: &str) -> Response<Body> {
     response
 }
 
-/// A handler from a plain function: no routing, byte bodies.
-pub fn handler_fn<F>(f: F) -> Router
-where
-    F: Fn(&mut Exchange<'_>, Request<Bytes>) -> Response<Bytes> + Send + Sync + 'static,
-{
-    Router::new().fallback(f)
-}
-
 /// Runs a tower service as a [`Handler`]: see [`tower`].
 pub struct Tower<S> {
     service: Mutex<S>,

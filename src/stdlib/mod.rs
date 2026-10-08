@@ -35,8 +35,7 @@
 //! - **Networks.** [`net::Net`] builds all of the above for you: the
 //!   sandboxes' subnet, DNS, addresses, a router, one machine per address,
 //!   and each host's services. [`web::Sites`] is a preset on it for a world
-//!   of websites. Start there. [`scenario`] changes a running world on a
-//!   timeline and grades its events.
+//!   of websites. Start there.
 //!
 //! Every piece is ordinary code built from the same public items, so you
 //! can wire a network by hand when `Net` does not fit. To put a link in
@@ -236,7 +235,7 @@
 //! | [`json`] | JSON text to a tree of values and back, under limits. | yes | yes |  |  |  | yes | yes |
 //! | [`json_schema`] | Checked JSON schemas: compile one, validate values against it, and generate values from it. |  |  |  |  |  | yes | yes |
 //! | [`jsonrpc`] | JSON-RPC 2.0 requests, notifications, responses and batches, over lines or HTTP bodies. | yes | yes |  |  |  | yes | yes |
-//! | [`kafka`] | Apache Kafka frames, headers and primitive types, and the ApiVersions and Metadata messages. | yes | yes |  |  |  | yes | yes |
+//! | [`kafka`] | Apache Kafka frames, headers, and the ApiVersions and Metadata messages. | yes | yes |  |  |  | yes | yes |
 //! | [`kerberos`] | Kerberos V5 messages between a client, a KDC and a service, with no cryptography. | yes | yes |  |  |  | yes | yes |
 //! | [`l2tp`] | L2TP headers, control messages and AVPs, versions 2 and 3. | yes |  |  |  |  | yes | yes |
 //! | [`ldap`] | LDAP messages, search filters and distinguished names. | yes | yes |  |  |  | yes | yes |
@@ -280,7 +279,6 @@
 //! | [`rtp`] | RTP media packets and their header extensions, told apart from RTCP. | yes |  |  |  |  | yes | yes |
 //! | [`rtsp`] | RTSP messages and interleaved data, with transport and range headers. | yes | yes |  |  |  | yes | yes |
 //! | [`sbe`] | FIX Simple Binary Encoding 1.0 at run time: load a schema's XML, then read and write its messages. | yes | yes |  |  |  | yes | yes |
-//! | [`scenario`] | A timeline of changes to a running world, and the facts a grader expects or forbids in its events. |  |  |  |  |  |  | yes |
 //! | [`sdp`] | SDP session descriptions, with ICE candidates and RTP maps. | yes | yes |  |  |  | yes | yes |
 //! | [`serve`] | Services: the `Service` trait, the driver that runs one over a connection or a UDP socket, `listen`, a test harness, transcripts and fault plans. |  |  |  |  |  | yes | yes |
 //! | [`sftp`] | SFTP version 3 packets, requests and responses. | yes | yes |  |  |  | yes | yes |
@@ -447,7 +445,6 @@ pub mod route;
 pub mod rtcp;
 pub mod rtp;
 pub mod rtsp;
-pub mod scenario;
 pub mod sbe;
 pub mod sdp;
 pub mod serve;

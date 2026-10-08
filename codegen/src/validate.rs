@@ -142,10 +142,6 @@ impl ValidatedSchema {
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
-    /// Limits baked into the generated module.
-    pub fn limits(&self) -> Limits {
-        self.limits
-    }
     /// Source names participating in reference cycles, in sorted order.
     pub fn recursive_types(&self) -> impl Iterator<Item = &str> {
         self.recursion.types.iter().map(String::as_str)

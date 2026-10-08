@@ -422,14 +422,6 @@ impl Value {
         }
     }
 
-    /// The number in an integer, or `None` for any other value.
-    pub fn as_integer(&self) -> Option<i64> {
-        match self {
-            Value::Integer(n) => Some(*n),
-            _ => None,
-        }
-    }
-
     /// Whether the value is either kind of null.
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null | Value::NullArray)

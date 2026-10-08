@@ -1,9 +1,8 @@
 # Services and networks
 
 This guide builds a small world step by step: a service, a test for it,
-a network of hosts that serve it, a log a grader reads, and a scenario
-that changes the world while it runs. Every piece is a public module of
-`fictionet::stdlib`, so each file can be copied into a world's crate and
+a network of hosts that serve it, and a log a grader reads. Every piece is
+a public module of `fictionet::stdlib`, so each file can be copied into a world's crate and
 changed there. The events every piece records go to `fictionet::events`,
 the one log each run keeps.
 
@@ -13,7 +12,6 @@ the one log each run keeps.
 | `fictionet::events` | Not in the stdlib: the run's log of `Event`s, in one shape, kept whether or not anyone reads it, and read as a file, by callbacks, by a grader in the same process, and by the dashboard |
 | `net` | `Net`: the sandboxes' subnet, DNS, routing, one machine per address, and each `Host`'s services |
 | `httpd` | HTTP as a service: `Router`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
-| `scenario` | A timeline of changes to the world, and facts graded against its events |
 | `web` | `Sites`, a preset on `Net` for a world of websites |
 
 ## 1. A service
@@ -331,36 +329,7 @@ still open and waits for file writers to write every line. A line a
 file's writer could not keep up with, or could not write, is counted in
 `events.lost()`; a grader throws such a sample away.
 
-## 6. A scenario
-
-A scenario changes the world on a timeline and says what its events
-should show:
-
-```rust
-use std::time::Duration;
-use fictionet::stdlib::scenario::Scenario;
-use fictionet::stdlib::serve::{FaultPlan, Plan};
-use fictionet::stdlib::codec::{ByteFault, Rule, Trigger};
-
-let faults = FaultPlan::default();
-let scenario = Scenario::new()
-    .faults(Duration::from_secs(30), &faults, Plan {
-        seed: 7,
-        outbound: vec![Rule { when: Trigger::Always, fault: ByteFault::Delay(Duration::from_secs(2)) }],
-        ..Plan::default()
-    })
-    .forbid("the agent logged in", |e| e.is("prompt", "login") && e.get("right").and_then(|v| v.as_bool()) == Some(true));
-let checks = scenario.checks();
-let _timeline = scenario.run(&fcx, world_state);
-// During the run or after it:
-let report = checks.grade(&fcx.events().all());
-```
-
-A fault plan given to a service's `ServeOptions` (`Host::tcp_with`) acts
-on every connection from its next chunk or item: byte faults each way,
-and item faults on what the client sends.
-
-## 7. The dashboard
+## 6. The dashboard
 
 The dashboard lists the events under **Events**, from what the log held
 when it connected. To decode a service's packets there, register its decoder as a `Present`

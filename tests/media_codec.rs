@@ -47,7 +47,7 @@ fn rtsp_stream_round_trip_with_interleaved_media_and_recovery() {
         Ok(rtsp::Frame::Message(response)),
         Ok(rtsp::Frame::Message(body)),
     ];
-    contract::check_stack(rtsp::Frames::new, &bytes);
+    contract::check_decode(rtsp::Frames::new, &bytes);
     contract::check_decode_with_held_limit(rtsp::Frames::new, &bytes, 0);
     assert_eq!(decode_all(rtsp::Frames::new, &bytes), (expected.clone(), None));
     for item in expected.iter().flatten() {
@@ -75,7 +75,7 @@ fn sip_stream_round_trip_with_recovery_and_bodiless_response() {
     Wire::write(&response, &mut bytes).unwrap();
     Wire::write(&body, &mut bytes).unwrap();
     let expected = vec![Ok(body.clone()), Err(sip::Error::HeaderLine), Ok(response), Ok(body)];
-    contract::check_stack(sip::Messages::new, &bytes);
+    contract::check_decode(sip::Messages::new, &bytes);
     contract::check_decode_with_held_limit(sip::Messages::new, &bytes, 0);
     assert_eq!(decode_all(sip::Messages::new, &bytes), (expected.clone(), None));
     for message in expected.iter().flatten() {

@@ -1,5 +1,5 @@
 //! Apache Kafka: reading and writing the protocol's frames, headers and
-//! primitive types, and the ApiVersions and Metadata messages, with no
+//! the ApiVersions and Metadata messages, with no
 //! I/O.
 //!
 //! Kafka is a log of messages that many services write to and read from.
@@ -35,8 +35,7 @@
 //!
 //! Writers refuse with [`Error::Unwritable`] any value that cannot be
 //! preserved in its version, including excess lengths, invalid tags, and
-//! non-default fields that version lacks. Primitive fields have named
-//! wire values, such as [`Int32`], [`CompactString`], and [`TaggedFields`].
+//! non-default fields that version lacks.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
@@ -222,8 +221,7 @@ pub enum Error {
     /// A frame's size was negative or over the limit. The stream cannot be
     /// read any further, and a broker closes the connection.
     FrameSize(i32),
-    /// An input exceeds its size limit: [`MAX_FRAME`] for a payload or
-    /// header, or `MAX_FRAME + 5` for a standalone field.
+    /// An input exceeds its size limit: [`MAX_FRAME`] for a payload or header.
     TooLarge(usize),
     /// A varint ran past its last allowed byte.
     Varint,
@@ -296,16 +294,22 @@ trait ReadFields<'a> {
     fn bool(&mut self) -> Result<bool, Error>;
     fn uuid(&mut self) -> Result<[u8; 16], Error>;
     fn uvarint(&mut self) -> Result<u32, Error>;
+    #[cfg(test)]
     fn varint(&mut self) -> Result<i32, Error>;
+    #[cfg(test)]
     fn varlong(&mut self) -> Result<i64, Error>;
     fn utf8(&mut self, n: usize) -> Result<String, Error>;
     fn string(&mut self) -> Result<String, Error>;
     fn nullable_string(&mut self) -> Result<Option<String>, Error>;
     fn compact_string(&mut self) -> Result<String, Error>;
     fn compact_nullable_string(&mut self) -> Result<Option<String>, Error>;
+    #[cfg(test)]
     fn bytes(&mut self) -> Result<&'a [u8], Error>;
+    #[cfg(test)]
     fn nullable_bytes(&mut self) -> Result<Option<&'a [u8]>, Error>;
+    #[cfg(test)]
     fn compact_bytes(&mut self) -> Result<&'a [u8], Error>;
+    #[cfg(test)]
     fn compact_nullable_bytes(&mut self) -> Result<Option<&'a [u8]>, Error>;
     fn count(&self, n: usize) -> Result<usize, Error>;
     fn array_len(&mut self) -> Result<Option<usize>, Error>;
@@ -338,6 +342,7 @@ impl<'a> ReadFields<'a> for Reader<'a> {
 
     /// A VARINT: a zigzag-encoded i32 in an unsigned varint, so small
     /// negative numbers stay short.
+    #[cfg(test)]
     fn varint(&mut self) -> Result<i32, Error> {
         let v = self.uvarint()?;
         Ok((v >> 1) as i32 ^ -((v & 1) as i32))
@@ -345,6 +350,7 @@ impl<'a> ReadFields<'a> for Reader<'a> {
 
     /// A VARLONG: a zigzag-encoded i64 in at most 10 bytes, the tenth
     /// holding only the top bit.
+    #[cfg(test)]
     fn varlong(&mut self) -> Result<i64, Error> {
         let value = leb128::decode_with(|| self.u8().map_err(Error::from), 10, u64::MAX, Error::Varint)?;
         Ok((value >> 1) as i64 ^ -((value & 1) as i64))
@@ -391,11 +397,13 @@ impl<'a> ReadFields<'a> for Reader<'a> {
 
     /// BYTES: an INT32 length, then that many bytes. A length over
     /// [`MAX_FRAME`] is an error.
+    #[cfg(test)]
     fn bytes(&mut self) -> Result<&'a [u8], Error> {
         self.nullable_bytes()?.ok_or(Error::Null)
     }
 
     /// NULLABLE_BYTES: BYTES, or length -1 for null.
+    #[cfg(test)]
     fn nullable_bytes(&mut self) -> Result<Option<&'a [u8]>, Error> {
         match self.i32_be()? {
             -1 => Ok(None),
@@ -406,11 +414,13 @@ impl<'a> ReadFields<'a> for Reader<'a> {
 
     /// COMPACT_BYTES: an unsigned varint holding the length plus 1, then
     /// that many bytes. A length over [`MAX_FRAME`] is an error.
+    #[cfg(test)]
     fn compact_bytes(&mut self) -> Result<&'a [u8], Error> {
         self.compact_nullable_bytes()?.ok_or(Error::Null)
     }
 
     /// COMPACT_NULLABLE_BYTES: COMPACT_BYTES, or 0 for null.
+    #[cfg(test)]
     fn compact_nullable_bytes(&mut self) -> Result<Option<&'a [u8]>, Error> {
         match self.uvarint()? {
             0 => Ok(None),
@@ -502,267 +512,6 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     }
 }
 
-// Scalar and field units share exact parsing and transactional writing.
-macro_rules! wire_field {
-    ($name:ident, $read:expr, $write:expr) => {
-        impl Wire for $name {
-            type ParseError = Error;
-            type WriteError = Error;
-
-            /// Reads exactly one field. Refuses invalid encodings, excess
-            /// lengths or counts, incomplete input, and trailing bytes.
-            fn parse(bytes: &[u8]) -> Result<Self, Error> {
-                if bytes.len() > MAX_FRAME + 5 { return Err(Error::TooLarge(bytes.len())); }
-                let mut reader = Reader::new(bytes);
-                let value = ($read)(&mut reader)?;
-                reader.finish()?;
-                Ok(Self(value))
-            }
-
-            /// Appends the field. Refuses excess lengths or counts and
-            /// invalid tagged fields without changing `out`.
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                let mut writer = Writer::new();
-                writer.limit = MAX_FRAME + 5;
-                ($write)(&mut writer, &self.0);
-                out.extend_from_slice(&writer.finish()?);
-                Ok(())
-            }
-        }
-    };
-}
-
-/// A BOOLEAN; zero reads as false and every other byte as true.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Boolean(
-    /// The field value.
-    pub bool,
-);
-
-wire_field!(Boolean, |r: &mut Reader<'_>| r.bool(), |w: &mut Writer, v: &bool| w.bool(*v));
-
-/// An INT8.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Int8(
-    /// The field value.
-    pub i8,
-);
-
-wire_field!(Int8, |r: &mut Reader<'_>| r.i8(), |w: &mut Writer, v: &i8| w.i8(*v));
-
-/// An unsigned byte.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Uint8(
-    /// The field value.
-    pub u8,
-);
-
-wire_field!(Uint8, |r: &mut Reader<'_>| r.u8(), |w: &mut Writer, v: &u8| w.u8(*v));
-
-/// An INT16.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Int16(
-    /// The field value.
-    pub i16,
-);
-
-wire_field!(Int16, |r: &mut Reader<'_>| r.i16_be(), |w: &mut Writer, v: &i16| w.i16(*v));
-
-/// A UINT16.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Uint16(
-    /// The field value.
-    pub u16,
-);
-
-wire_field!(Uint16, |r: &mut Reader<'_>| r.u16_be(), |w: &mut Writer, v: &u16| w.u16(*v));
-
-/// An INT32.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Int32(
-    /// The field value.
-    pub i32,
-);
-
-wire_field!(Int32, |r: &mut Reader<'_>| r.i32_be(), |w: &mut Writer, v: &i32| w.i32(*v));
-
-/// A UINT32.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Uint32(
-    /// The field value.
-    pub u32,
-);
-
-wire_field!(Uint32, |r: &mut Reader<'_>| r.u32_be(), |w: &mut Writer, v: &u32| w.u32(*v));
-
-/// An INT64.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Int64(
-    /// The field value.
-    pub i64,
-);
-
-wire_field!(Int64, |r: &mut Reader<'_>| r.i64_be(), |w: &mut Writer, v: &i64| w.i64(*v));
-
-/// A FLOAT64, compared by its bits.
-#[derive(Clone, Debug)]
-pub struct Float64(
-    /// The field value.
-    pub f64,
-);
-
-wire_field!(Float64, |r: &mut Reader<'_>| r.f64_be(), |w: &mut Writer, v: &f64| w.f64(*v));
-
-/// A UUID.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Uuid(
-    /// The field value.
-    pub [u8; 16],
-);
-
-wire_field!(Uuid, |r: &mut Reader<'_>| r.uuid(), |w: &mut Writer, v: &[u8; 16]| w.uuid(v));
-
-/// An UNSIGNED_VARINT.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnsignedVarint(
-    /// The field value.
-    pub u32,
-);
-
-wire_field!(UnsignedVarint, |r: &mut Reader<'_>| r.uvarint(), |w: &mut Writer, v: &u32| w.uvarint(*v));
-
-/// A zigzag VARINT.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Varint(
-    /// The field value.
-    pub i32,
-);
-
-wire_field!(Varint, |r: &mut Reader<'_>| r.varint(), |w: &mut Writer, v: &i32| w.varint(*v));
-
-/// A zigzag VARLONG.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Varlong(
-    /// The field value.
-    pub i64,
-);
-
-wire_field!(Varlong, |r: &mut Reader<'_>| r.varlong(), |w: &mut Writer, v: &i64| w.varlong(*v));
-
-/// A STRING with a signed 16-bit length.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct String16(
-    /// The field value.
-    pub String,
-);
-
-wire_field!(String16, |r: &mut Reader<'_>| r.string(), |w: &mut Writer, v: &String| w.string(v));
-
-/// A NULLABLE_STRING.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NullableString(
-    /// The field value.
-    pub Option<String>,
-);
-
-wire_field!(NullableString, |r: &mut Reader<'_>| r.nullable_string(), |w: &mut Writer, v: &Option<String>| w.nullable_string(v.as_deref()));
-
-/// A COMPACT_STRING.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompactString(
-    /// The field value.
-    pub String,
-);
-
-wire_field!(CompactString, |r: &mut Reader<'_>| r.compact_string(), |w: &mut Writer, v: &String| w.compact_string(v));
-
-/// A COMPACT_NULLABLE_STRING.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompactNullableString(
-    /// The field value.
-    pub Option<String>,
-);
-
-wire_field!(CompactNullableString, |r: &mut Reader<'_>| r.compact_nullable_string(), |w: &mut Writer, v: &Option<String>| w.compact_nullable_string(v.as_deref()));
-
-/// A BYTES field.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BytesValue(
-    /// The field value.
-    pub Vec<u8>,
-);
-
-wire_field!(BytesValue, |r: &mut Reader<'_>| r.bytes().map(|bytes| bytes.to_vec()), |w: &mut Writer, v: &Vec<u8>| w.bytes(v));
-
-/// A NULLABLE_BYTES field.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NullableBytes(
-    /// The field value.
-    pub Option<Vec<u8>>,
-);
-
-wire_field!(NullableBytes, |r: &mut Reader<'_>| r.nullable_bytes().map(|value| value.map(|bytes| bytes.to_vec())), |w: &mut Writer, v: &Option<Vec<u8>>| w.nullable_bytes(v.as_deref()));
-
-/// A COMPACT_BYTES field.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompactBytes(
-    /// The field value.
-    pub Vec<u8>,
-);
-
-wire_field!(CompactBytes, |r: &mut Reader<'_>| r.compact_bytes().map(|bytes| bytes.to_vec()), |w: &mut Writer, v: &Vec<u8>| w.compact_bytes(v));
-
-/// A COMPACT_NULLABLE_BYTES field.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompactNullableBytes(
-    /// The field value.
-    pub Option<Vec<u8>>,
-);
-
-wire_field!(CompactNullableBytes, |r: &mut Reader<'_>| r.compact_nullable_bytes().map(|value| value.map(|bytes| bytes.to_vec())), |w: &mut Writer, v: &Option<Vec<u8>>| w.compact_nullable_bytes(v.as_deref()));
-
-/// A ARRAY count alone; elements are separate wire values.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ArrayLength(
-    /// The field value.
-    pub Option<usize>,
-);
-
-wire_field!(ArrayLength, |r: &mut Reader<'_>| read_array_count(r, false), |w: &mut Writer, v: &Option<usize>| w.array_len(*v));
-
-/// A COMPACT_ARRAY count alone; elements are separate wire values.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompactArrayLength(
-    /// The field value.
-    pub Option<usize>,
-);
-
-wire_field!(CompactArrayLength, |r: &mut Reader<'_>| read_array_count(r, true), |w: &mut Writer, v: &Option<usize>| w.compact_array_len(*v));
-
-/// A tagged-field section in strictly increasing tag order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TaggedFields(
-    /// The field value.
-    pub Vec<TaggedField>,
-);
-
-wire_field!(TaggedFields, |r: &mut Reader<'_>| r.tagged_fields(), |w: &mut Writer, v: &Vec<TaggedField>| w.tagged_fields(v));
-
-impl PartialEq for Float64 {
-    fn eq(&self, other: &Self) -> bool { self.0.to_bits() == other.0.to_bits() }
-}
-
-impl Eq for Float64 {}
-
-fn read_array_count(reader: &mut Reader<'_>, compact: bool) -> Result<Option<usize>, Error> {
-    let count = if compact { i64::from(reader.uvarint()?) - 1 } else { i64::from(reader.i32_be()?) };
-    match count {
-        -1 => Ok(None),
-        n if n >= 0 && n <= MAX_ARRAY as i64 => Ok(Some(n as usize)),
-        n => Err(Error::Length(n)),
-    }
-}
-
 /// Builds a bounded encoding for a Wire value.
 #[derive(Clone, Debug, Default)]
 struct Writer {
@@ -799,6 +548,7 @@ impl Writer {
     }
 
     /// An INT8.
+    #[cfg(test)]
     fn i8(&mut self, v: i8) {
         self.raw(&v.to_be_bytes());
     }
@@ -809,6 +559,7 @@ impl Writer {
     }
 
     /// A UINT16.
+    #[cfg(test)]
     fn u16(&mut self, v: u16) {
         self.raw(&v.to_be_bytes());
     }
@@ -819,16 +570,19 @@ impl Writer {
     }
 
     /// A UINT32.
+    #[cfg(test)]
     fn u32(&mut self, v: u32) {
         self.raw(&v.to_be_bytes());
     }
 
     /// An INT64.
+    #[cfg(test)]
     fn i64(&mut self, v: i64) {
         self.raw(&v.to_be_bytes());
     }
 
     /// A FLOAT64.
+    #[cfg(test)]
     fn f64(&mut self, v: f64) {
         self.raw(&v.to_be_bytes());
     }
@@ -844,11 +598,13 @@ impl Writer {
     }
 
     /// A VARINT.
+    #[cfg(test)]
     fn varint(&mut self, v: i32) {
         self.uvarint(((v << 1) ^ (v >> 31)) as u32);
     }
 
     /// A VARLONG.
+    #[cfg(test)]
     fn varlong(&mut self, v: i64) {
         leb128::encode_with(((v << 1) ^ (v >> 63)) as u64, |b| self.u8(b));
     }
@@ -884,6 +640,7 @@ impl Writer {
     }
 
     /// BYTES.
+    #[cfg(test)]
     fn bytes(&mut self, b: &[u8]) {
         if b.len() > MAX_FRAME { self.failed = true; return; }
         self.i32(b.len() as i32);
@@ -891,6 +648,7 @@ impl Writer {
     }
 
     /// NULLABLE_BYTES.
+    #[cfg(test)]
     fn nullable_bytes(&mut self, b: Option<&[u8]>) {
         match b {
             Some(b) => self.bytes(b),
@@ -899,6 +657,7 @@ impl Writer {
     }
 
     /// COMPACT_BYTES.
+    #[cfg(test)]
     fn compact_bytes(&mut self, b: &[u8]) {
         if b.len() > MAX_FRAME { self.failed = true; return; }
         self.uvarint(b.len() as u32 + 1);
@@ -906,6 +665,7 @@ impl Writer {
     }
 
     /// COMPACT_NULLABLE_BYTES.
+    #[cfg(test)]
     fn compact_nullable_bytes(&mut self, b: Option<&[u8]>) {
         match b {
             Some(b) => self.compact_bytes(b),
@@ -1220,37 +980,6 @@ impl Wire for RequestHeader {
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let mut writer = Writer::new();
         self.encode(&mut writer);
-        out.extend_from_slice(&writer.finish()?);
-        Ok(())
-    }
-}
-
-/// A response header with the version supplied by the request's schema.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResponseHead<const VERSION: u8>(
-    /// The correlation ID and tagged fields.
-    pub ResponseHeader,
-);
-
-impl<const VERSION: u8> Wire for ResponseHead<VERSION> {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    /// Reads exactly one response header. Refuses versions above 1,
-    /// malformed fields, input over [`MAX_FRAME`], incomplete input, and trailing bytes.
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() > MAX_FRAME { return Err(Error::TooLarge(bytes.len())); }
-        let mut reader = Reader::new(bytes);
-        let header = ResponseHeader::read_version(&mut reader, VERSION)?;
-        reader.finish()?;
-        Ok(Self(header))
-    }
-
-    /// Appends the header. Refuses versions above 1, excess lengths,
-    /// invalid tags, or tags in version 0 without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let mut writer = Writer::new();
-        self.0.encode(&mut writer, VERSION);
         out.extend_from_slice(&writer.finish()?);
         Ok(())
     }
@@ -2145,28 +1874,34 @@ mod tests {
         TaggedField { tag, data: data.to_vec() }
     }
 
+    fn encoded(write: impl FnOnce(&mut Writer)) -> Vec<u8> {
+        let mut writer = Writer::new();
+        write(&mut writer);
+        writer.finish().unwrap()
+    }
+
     // Varint examples from the protocol guide, which follows Protocol
     // Buffers' encoding.
 
     #[test]
     fn varint_examples() {
-        assert_eq!(UnsignedVarint(0).to_bytes().unwrap(), [0]);
-        assert_eq!(UnsignedVarint(1).to_bytes().unwrap(), [1]);
-        assert_eq!(UnsignedVarint(127).to_bytes().unwrap(), [0x7f]);
-        assert_eq!(UnsignedVarint(128).to_bytes().unwrap(), [0x80, 0x01]);
-        assert_eq!(UnsignedVarint(300).to_bytes().unwrap(), [0xac, 0x02]);
-        assert_eq!(UnsignedVarint(u32::MAX).to_bytes().unwrap(), [0xff, 0xff, 0xff, 0xff, 0x0f]);
+        assert_eq!(encoded(|w| w.uvarint(0)), [0]);
+        assert_eq!(encoded(|w| w.uvarint(1)), [1]);
+        assert_eq!(encoded(|w| w.uvarint(127)), [0x7f]);
+        assert_eq!(encoded(|w| w.uvarint(128)), [0x80, 0x01]);
+        assert_eq!(encoded(|w| w.uvarint(300)), [0xac, 0x02]);
+        assert_eq!(encoded(|w| w.uvarint(u32::MAX)), [0xff, 0xff, 0xff, 0xff, 0x0f]);
         // Zigzag: 0, -1, 1, -2 are 0, 1, 2, 3.
         for (v, z) in [(0, 0u8), (-1, 1), (1, 2), (-2, 3), (2147483647, 0xfe), (-2147483648, 0xff)] {
             let mut w = Vec::new();
-            Varint(v).write(&mut w).unwrap();
+            w.extend(encoded(|w| w.varint(v)));
             let b = w;
             assert_eq!(b[0], z, "{v}");
             assert_eq!(Reader::new(&b).varint(), Ok(v));
         }
         for v in [0i64, -1, 1, i64::MAX, i64::MIN, 1 << 40, -(1 << 50)] {
             let mut w = Vec::new();
-            Varlong(v).write(&mut w).unwrap();
+            w.extend(encoded(|w| w.varlong(v)));
             let b = w;
             assert!(b.len() <= 10);
             let mut r = Reader::new(&b);
@@ -2174,7 +1909,7 @@ mod tests {
             assert_eq!(r.finish(), Ok(()));
         }
         for v in [0u32, 1, 127, 128, 16383, 16384, 1 << 21, 1 << 28, u32::MAX] {
-            let b = UnsignedVarint(v).to_bytes().unwrap();
+            let b = encoded(|w| w.uvarint(v));
             assert_eq!(Reader::new(&b).uvarint(), Ok(v));
         }
         // A longer encoding of the same value reads too.
@@ -2198,28 +1933,28 @@ mod tests {
     fn primitives_round_trip() {
         let id = [7u8; 16];
         let mut w = Vec::new();
-        Boolean(true).write(&mut w).unwrap();
-        Int8(-3).write(&mut w).unwrap();
-        Int16(-300).write(&mut w).unwrap();
-        Uint16(65000).write(&mut w).unwrap();
-        Int32(-70000).write(&mut w).unwrap();
-        Uint32(4_000_000_000).write(&mut w).unwrap();
-        Int64(-1 << 40).write(&mut w).unwrap();
-        Float64(1.5).write(&mut w).unwrap();
-        Uuid(id).write(&mut w).unwrap();
-        String16("héllo".to_owned()).write(&mut w).unwrap();
-        NullableString(None.map(str::to_owned)).write(&mut w).unwrap();
-        CompactString("kafka".to_owned()).write(&mut w).unwrap();
-        CompactNullableString(None.map(str::to_owned)).write(&mut w).unwrap();
-        BytesValue(b"abc".to_vec()).write(&mut w).unwrap();
-        NullableBytes(None.map(<[u8]>::to_vec)).write(&mut w).unwrap();
-        CompactBytes(b"".to_vec()).write(&mut w).unwrap();
-        CompactNullableBytes(None.map(<[u8]>::to_vec)).write(&mut w).unwrap();
-        ArrayLength(Some(0)).write(&mut w).unwrap();
-        ArrayLength(None).write(&mut w).unwrap();
-        CompactArrayLength(Some(0)).write(&mut w).unwrap();
-        CompactArrayLength(None).write(&mut w).unwrap();
-        TaggedFields(vec![tag(1, b"yz"), tag(5, b"x")]).write(&mut w).unwrap();
+        w.extend(encoded(|w| w.bool(true)));
+        w.extend(encoded(|w| w.i8(-3)));
+        w.extend(encoded(|w| w.i16(-300)));
+        w.extend(encoded(|w| w.u16(65000)));
+        w.extend(encoded(|w| w.i32(-70000)));
+        w.extend(encoded(|w| w.u32(4_000_000_000)));
+        w.extend(encoded(|w| w.i64(-1 << 40)));
+        w.extend(encoded(|w| w.f64(1.5)));
+        w.extend(encoded(|w| w.uuid(&id)));
+        w.extend(encoded(|w| w.string("héllo")));
+        w.extend(encoded(|w| w.nullable_string(None)));
+        w.extend(encoded(|w| w.compact_string("kafka")));
+        w.extend(encoded(|w| w.compact_nullable_string(None)));
+        w.extend(encoded(|w| w.bytes(b"abc")));
+        w.extend(encoded(|w| w.nullable_bytes(None)));
+        w.extend(encoded(|w| w.compact_bytes(b"")));
+        w.extend(encoded(|w| w.compact_nullable_bytes(None)));
+        w.extend(encoded(|w| w.array_len(Some(0))));
+        w.extend(encoded(|w| w.array_len(None)));
+        w.extend(encoded(|w| w.compact_array_len(Some(0))));
+        w.extend(encoded(|w| w.compact_array_len(None)));
+        w.extend(encoded(|w| w.tagged_fields(&[tag(1, b"yz"), tag(5, b"x")])));
         assert!(!w.is_empty());
         let b = w;
         let mut r = Reader::new(&b);
@@ -2253,12 +1988,12 @@ mod tests {
     #[test]
     fn primitive_layouts() {
         let mut w = Vec::new();
-        String16("ab".to_owned()).write(&mut w).unwrap();
-        CompactString("ab".to_owned()).write(&mut w).unwrap();
-        CompactNullableString(None.map(str::to_owned)).write(&mut w).unwrap();
-        NullableString(None.map(str::to_owned)).write(&mut w).unwrap();
-        CompactArrayLength(Some(2)).write(&mut w).unwrap();
-        TaggedFields(vec![tag(0, &[9])]).write(&mut w).unwrap();
+        w.extend(encoded(|w| w.string("ab")));
+        w.extend(encoded(|w| w.compact_string("ab")));
+        w.extend(encoded(|w| w.compact_nullable_string(None)));
+        w.extend(encoded(|w| w.nullable_string(None)));
+        w.extend(encoded(|w| w.compact_array_len(Some(2))));
+        w.extend(encoded(|w| w.tagged_fields(&[tag(0, &[9])])));
         assert_eq!(w, [0, 2, b'a', b'b', 3, b'a', b'b', 0, 0xff, 0xff, 3, 1, 0, 1, 9]);
     }
 
@@ -2272,7 +2007,7 @@ mod tests {
         assert_eq!(Reader::new(&[2, 0xc3]).compact_string(), Err(Error::Utf8));
         // A compact string over the limit.
         let mut w = Vec::new();
-        UnsignedVarint(MAX_STRING as u32 + 2).write(&mut w).unwrap();
+        w.extend(encoded(|w| w.uvarint(MAX_STRING as u32 + 2)));
         assert_eq!(Reader::new(&w).compact_string(), Err(Error::Length(MAX_STRING as i64 + 1)));
         assert_eq!(Reader::new(&[0xff, 0xff, 0xff, 0xff]).bytes(), Err(Error::Null));
         assert_eq!(Reader::new(&[0xff, 0xff, 0xff, 0xfe]).nullable_bytes(), Err(Error::Length(-2)));
@@ -2292,7 +2027,7 @@ mod tests {
         assert_eq!(Reader::new(&[2, 3, 0, 3, 0]).tagged_fields(), Err(Error::TagOrder(3)));
         assert_eq!(Reader::new(&[3, 3, 0]).tagged_fields(), Err(Error::Length(3)));
         assert_eq!(Reader::new(&[1, 3, 4, 1]).tagged_fields(), Err(Error::Truncated));
-        let mut many = UnsignedVarint(MAX_TAGGED_FIELDS as u32 + 1).to_bytes().unwrap();
+        let mut many = encoded(|w| w.uvarint(MAX_TAGGED_FIELDS as u32 + 1));
         many.resize(5000, 0);
         assert_eq!(Reader::new(&many).tagged_fields(), Err(Error::Length(MAX_TAGGED_FIELDS as i64 + 1)));
         // Trailing bytes.
@@ -2303,24 +2038,33 @@ mod tests {
 
     #[test]
     fn writers_refuse_values_that_would_change() {
-        fn refuses(value: &(impl Wire + PartialEq + core::fmt::Debug)) {
-            contract::check_wire_value(value);
+        fn refuses(write: impl FnOnce(&mut Writer)) {
+            let mut writer = Writer::new();
+            write(&mut writer);
             let mut bytes = vec![7];
-            assert!(value.write(&mut bytes).is_err());
+            let result = writer.finish().map(|encoded| bytes.extend(encoded));
+            assert!(result.is_err());
             assert_eq!(bytes, [7]);
         }
         let long = "é".repeat(MAX_STRING);
-        refuses(&String16(long.clone()));
-        refuses(&CompactString(long));
-        refuses(&ArrayLength(Some(usize::MAX)));
-        refuses(&CompactArrayLength(Some(usize::MAX)));
-        refuses(&TaggedFields((0..2000).map(|tag| TaggedField { tag, data: vec![] }).collect()));
-        refuses(&TaggedFields(vec![tag(5, b"x"), tag(1, b"yz"), tag(5, b"dup")]));
-        refuses(&TaggedFields(vec![tag(1, b"x"), tag(1, b"dup")]));
-        for value in [ArrayLength(None), ArrayLength(Some(MAX_ARRAY))] { contract::check_wire_value(&value); }
-        contract::check_wire_value(&CompactArrayLength(Some(MAX_ARRAY)));
-        contract::check_wire_value(&String16("x".repeat(MAX_STRING)));
-        contract::check_wire_value(&Float64(f64::NAN));
+        refuses(|w| w.string(&long));
+        refuses(|w| w.compact_string(&long));
+        refuses(|w| w.array_len(Some(usize::MAX)));
+        refuses(|w| w.compact_array_len(Some(usize::MAX)));
+        refuses(|w| w.tagged_fields(&(0..2000).map(|tag| TaggedField { tag, data: vec![] }).collect::<Vec<_>>()));
+        refuses(|w| w.tagged_fields(&[tag(5, b"x"), tag(1, b"yz"), tag(5, b"dup")]));
+        refuses(|w| w.tagged_fields(&[tag(1, b"x"), tag(1, b"dup")]));
+        for value in [None, Some(MAX_ARRAY)] {
+            let bytes = encoded(|w| w.array_len(value));
+            assert_eq!(Reader::new(&bytes).i32_be().unwrap(), value.map_or(-1, |n| n as i32));
+        }
+        let bytes = encoded(|w| w.compact_array_len(Some(MAX_ARRAY)));
+        assert_eq!(Reader::new(&bytes).uvarint(), Ok(MAX_ARRAY as u32 + 1));
+        let string = "x".repeat(MAX_STRING);
+        let bytes = encoded(|w| w.string(&string));
+        assert_eq!(Reader::new(&bytes).string(), Ok(string));
+        let bytes = encoded(|w| w.f64(f64::NAN));
+        assert_eq!(Reader::new(&bytes).f64_be().unwrap().to_bits(), f64::NAN.to_bits());
     }
 
     #[test]
@@ -2801,7 +2545,10 @@ mod tests {
         contract::check_wire::<Frame>(data);
         contract::check_wire::<Request>(data);
         contract::check_wire::<RequestHeader>(data);
-        contract::check_wire::<TaggedFields>(data);
+        if let Ok(fields) = Reader::new(data).tagged_fields() {
+            let bytes = encoded(|w| w.tagged_fields(&fields));
+            assert_eq!(Reader::new(&bytes).tagged_fields(), Ok(fields));
+        }
         let frames = decode_all(Frames::new, data).0;
         let mut payloads: Vec<&[u8]> = frames.iter().map(|frame| frame.0.as_slice()).collect();
         payloads.push(data);
@@ -3186,7 +2933,7 @@ mod tests {
         p.resize(MAX_FRAME + 1, 0);
         assert_eq!(Request::parse(&p), Err(Error::TooLarge(MAX_FRAME + 1)));
         assert_eq!(RequestHeader::parse(&p), Err(Error::TooLarge(MAX_FRAME + 1)));
-        assert_eq!(ResponseHead::<1>::parse(&p), Err(Error::TooLarge(MAX_FRAME + 1)));
+        assert_eq!(Response::parse(&p, api_key::METADATA, 9), Err(Error::TooLarge(MAX_FRAME + 1)));
         assert_eq!(Response::parse(&p, api_key::PRODUCE, 0), Err(Error::TooLarge(MAX_FRAME + 1)));
         p.truncate(MAX_FRAME);
         let req = Request::parse(&p).unwrap();
@@ -3195,11 +2942,11 @@ mod tests {
         let mut big = ((MAX_FRAME + 1) as i32).to_be_bytes().to_vec();
         big.resize(MAX_FRAME + 5, 0);
         assert_eq!(Reader::new(&big).bytes(), Err(Error::Length(MAX_FRAME as i64 + 1)));
-        let mut big = UnsignedVarint(MAX_FRAME as u32 + 2).to_bytes().unwrap();
+        let mut big = encoded(|w| w.uvarint(MAX_FRAME as u32 + 2));
         big.resize(MAX_FRAME + 5, 0);
         assert_eq!(Reader::new(&big).compact_bytes(), Err(Error::Length(MAX_FRAME as i64 + 1)));
         let mut big = vec![1, 0];
-        big.extend(UnsignedVarint(MAX_FRAME as u32 + 1).to_bytes().unwrap());
+        big.extend(encoded(|w| w.uvarint(MAX_FRAME as u32 + 1)));
         big.resize(MAX_FRAME + 10, 0);
         assert_eq!(Reader::new(&big).tagged_fields(), Err(Error::Length(MAX_FRAME as i64 + 1)));
     }
@@ -3334,17 +3081,18 @@ mod tests {
     fn tags_are_31_bits() {
         let max = i32::MAX as u32;
         let mut ok = vec![1];
-        ok.extend(UnsignedVarint(max).to_bytes().unwrap());
+        ok.extend(encoded(|w| w.uvarint(max)));
         ok.push(0);
         assert_eq!(Reader::new(&ok).tagged_fields(), Ok(vec![tag(max, b"")]));
         for t in [max + 1, u32::MAX] {
             let mut b = vec![1];
-            b.extend(UnsignedVarint(t).to_bytes().unwrap());
+            b.extend(encoded(|w| w.uvarint(t)));
             b.push(0);
             assert!(matches!(Reader::new(&b).tagged_fields(), Err(Error::Invalid(_))), "{t}");
-            let fields = TaggedFields(vec![tag(t, b"x"), tag(3, b"y")]);
-            contract::check_wire_value(&fields);
-            assert_eq!(fields.to_bytes(), Err(Error::Unwritable));
+            let fields = vec![tag(t, b"x"), tag(3, b"y")];
+            let mut writer = Writer::new();
+            writer.tagged_fields(&fields);
+            assert_eq!(writer.finish(), Err(Error::Unwritable));
         }
     }
 

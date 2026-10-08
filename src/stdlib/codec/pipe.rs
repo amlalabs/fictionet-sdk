@@ -155,37 +155,6 @@ impl Spans {
         }
         None
     }
-    /// Resolves a nonempty range that covers whole spans with contiguous
-    /// outer ranges, giving the union of those outer ranges. A partial
-    /// span, an evicted span, or a gap in either coordinate returns `None`.
-    pub fn locate(&self, range: Range<u64>) -> Option<Range<u64>> {
-        if range.start >= range.end {
-            return None;
-        }
-        let mut at = range.start;
-        let mut result: Option<Range<u64>> = None;
-        for span in &self.ring {
-            if span.inner.end <= at {
-                continue;
-            }
-            if span.inner.start > at {
-                return None;
-            }
-            if span.inner.start != at || span.inner.end > range.end {
-                return None;
-            }
-            match &mut result {
-                Some(r) if r.end == span.outer.start => r.end = span.outer.end,
-                None => result = Some(span.outer.clone()),
-                _ => return None,
-            }
-            at = span.inner.end;
-            if at == range.end {
-                return result;
-            }
-        }
-        None
-    }
 }
 
 /// How an outer item contributes to a pipe.

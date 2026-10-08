@@ -1,6 +1,6 @@
 //! The service layer: `serve` (the Service trait, the driver, the
-//! harness, transcripts and faults), events, `httpd`, `net` and
-//! `scenario`, each tested on its own and together in one world: a PLC
+//! harness, transcripts and faults), events, `httpd` and `net`, each
+//! tested on its own and together in one world: a PLC
 //! that speaks Modbus/TCP and a web server, on one `Net`, with the
 //! dashboard's decoder reading both from the packets.
 
@@ -28,7 +28,6 @@ use fictionet::stdlib::json;
 use fictionet::stdlib::modbus::{self, Exception, Frame, Request as MbRequest, Response as MbResponse};
 use fictionet::stdlib::net::{Accept, Arrival, Net, Sni};
 use fictionet::stdlib::route::Prefix;
-use fictionet::stdlib::scenario::Scenario;
 use fictionet::stdlib::serve::{
     self, Budget, Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingDriver, Plan, Driver, ServeOptions, Served,
     Service, Timer, Transcript, Upgrade,
@@ -893,59 +892,6 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         let lines = kept.wait(&fcx, 1, Duration::from_secs(2), |e| e.is("echo", "line")).await?;
         assert_eq!(lines[0].conn.id, Some(1));
         assert_eq!(lines[0].conn.sandbox.as_ref().map(|s| s.id), Some(1));
-        Ok(())
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Scenarios
-
-#[test]
-fn a_scenario_changes_the_world_on_time_and_grades_the_events() {
-    world(|fcx| async move {
-        let kept = fcx.events();
-        let plant = Arc::new(Plant { limit: 1000, ..Plant::default() });
-        let faults = FaultPlan::default();
-        let scenario = Scenario::new()
-            .at(Duration::from_millis(50), |p: &Plant, _| p.registers.lock().unwrap()[1] = 7)
-            .at(Duration::from_millis(20), |p: &Plant, _| p.registers.lock().unwrap()[1] = 3)
-            .faults(
-                Duration::from_millis(60),
-                &faults,
-                Plan { seed: 3, outbound: vec![Rule { when: Trigger::Always, fault: ByteFault::Drop(None) }], ..Plan::default() },
-            )
-            .expect("a read", |e| e.is("modbus", "read"))
-            .forbid("an unsafe write", |e| e.level == Level::Alarm)
-            .expect("a payment", |e| e.is("bank", "pay"));
-        let checks = scenario.checks();
-        let started = fcx.now();
-        let task = scenario.run(&fcx, plant.clone());
-        fcx.sleep(Duration::from_millis(30)).await?;
-        assert_eq!(plant.registers.lock().unwrap()[1], 3);
-        task.join(&fcx).await?;
-        assert!(fcx.now().since_start() - started.since_start() >= Duration::from_millis(60));
-        assert_eq!(plant.registers.lock().unwrap()[1], 7);
-        assert_eq!(faults.get().seed, 3);
-
-        let (attacher, attachments) = fictionet::attachments();
-        Net::new()
-            .ipv4_only()
-            .host("plc", |h| h.at(PLC_ADDR).tcp_with(502, plant, || Plc, ServeOptions::default().faults(faults.clone())))
-            .serve(&fcx, attachments)?;
-        let s = sandbox(&fcx, attacher.attach("op")?, ME);
-        let mut conn = s.tcp.connect(&fcx, SocketAddr::new(PLC_ADDR.into(), 502)).await?;
-        conn.write_all(&fcx, &mb(1, MbRequest::ReadHoldingRegisters { address: 1, quantity: 1 })).await?;
-        // Every reply is dropped by the plan the scenario set.
-        assert_eq!(read_some(&fcx, &mut conn, 11).await, b"");
-        kept.wait(&fcx, 1, Duration::from_secs(2), |e| e.is("modbus", "read")).await?;
-        let report = checks.grade(&kept.all());
-        let passed: Vec<(String, bool, usize)> = report.facts.iter().map(|g| (g.fact.clone(), g.passed(), g.count)).collect();
-        assert_eq!(
-            passed,
-            [("a read".to_owned(), true, 1), ("an unsafe write".to_owned(), true, 0), ("a payment".to_owned(), false, 0)]
-        );
-        assert!(!report.passed());
-        assert_eq!(report.failures().len(), 1);
         Ok(())
     });
 }

@@ -716,11 +716,6 @@ impl Value {
             || !matches!(self, Value::Counter64(_) | Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView)
     }
 
-    /// Whether this is one of the three version 2 exception values.
-    pub fn is_exception(&self) -> bool {
-        matches!(self, Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView)
-    }
-
     /// Reads a value from an element's tag and content. Content longer
     /// than [`MAX_MESSAGE`] is [`Error::TooLong`], so it is never copied.
     pub fn from_ber(t: u8, c: &[u8]) -> Result<Value, Error> {

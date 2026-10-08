@@ -3397,7 +3397,7 @@ mod tests {
                 },
             })
         };
-        contract::check_stack(assemble, CHUNKED);
+        contract::check_decode(assemble, CHUNKED);
         let (items, error) = test_support::decode_all(assemble, CHUNKED);
         assert_eq!(error, None);
         assert_eq!(items.len(), 2);
@@ -3413,7 +3413,7 @@ mod tests {
                 },
             )
         };
-        contract::check_stack(pipe, &bytes);
+        contract::check_decode(pipe, &bytes);
         let (items, error) = test_support::decode_all(pipe, &bytes);
         assert_eq!(error, None);
         assert!(items.contains(&Layered::Inner(Ok(b"a".to_vec()))));

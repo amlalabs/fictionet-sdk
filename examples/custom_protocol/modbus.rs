@@ -1355,7 +1355,7 @@ mod tests {
                 (frame, request)
             })
         };
-        contract::check_stack(make_requests, &input);
+        contract::check_decode(make_requests, &input);
         for sizes in [&[][..], &[1][..], &[7, 1, 13][..]] {
             let mut registers = [0u16; 10];
             let mut server = Stream::new(make_requests());

@@ -111,11 +111,6 @@ impl Attachment {
         wraps.into_iter().fold(self, |attachment, wrap| wrap(attachment))
     }
 
-    /// The counts and tap of this attachment.
-    #[allow(dead_code)]
-    pub(crate) fn meter(&self) -> &Arc<Meter> {
-        &self.meter
-    }
 }
 
 impl std::fmt::Debug for Attachment {

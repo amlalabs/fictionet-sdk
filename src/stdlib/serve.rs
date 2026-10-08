@@ -424,7 +424,7 @@ impl PendingDriver<'_> {
 }
 
 /// Wakes one connection's service from anywhere: the world, another
-/// connection, a scenario step. Cheap to clone. Get one with
+/// connection, a timed task. Cheap to clone. Get one with
 /// [`Driver::wake_handle`] and keep it where the event happens, such as
 /// in an order book next to the order it belongs to.
 ///
@@ -900,8 +900,7 @@ pub struct Plan {
     pub items: Vec<Rule<ItemFault<Vec<u8>>>>,
 }
 
-/// A fault plan the world can change while connections run: a
-/// [`Scenario`](crate::stdlib::scenario::Scenario) step sets a new one, and
+/// A fault plan the world can change while connections run. When it changes,
 /// every connection served with it uses the new rules from its next chunk
 /// or item. Cheap to clone; clones share the plan.
 #[derive(Clone, Default)]
@@ -1135,8 +1134,7 @@ pub enum Served<C> {
     Closed(Ended),
     /// The service asked for an upgrade the caller performs: the
     /// connection with its unread bytes. [`serve`] performs
-    /// [`Upgrade::Tls`] itself and returns only [`Upgrade::Handoff`];
-    /// [`serve_once`] returns both.
+    /// [`Upgrade::Tls`] itself and returns only [`Upgrade::Handoff`].
     Upgraded(Upgrade, Prefixed<C>),
 }
 
@@ -1441,7 +1439,7 @@ enum Next {
 
 /// One connection's state, with no I/O: the decoder and the bytes waiting
 /// for it, the service's timers and deferred work, and what is to be
-/// written. [`serve_once`] and [`Harness`] both run it.
+/// written. [`serve`] and [`Harness`] both run it.
 struct Core<S: Service> {
     fcx: Option<Cx>,
     stream: Stream<S::Decoder>,
@@ -2150,26 +2148,6 @@ fn tls_failed<E>(e: HandshakeError) -> Result<Served<Box<dyn Connection>>, Serve
         HandshakeError::Cancelled => Err(ServeError::Cancelled),
         _ => Ok(Served::Closed(Ended::Conn(ConnError::Broken))),
     }
-}
-
-/// Serves one connection with `service` until it ends or asks for
-/// [`Upgrade::Tls`] or [`Upgrade::Handoff`], which it returns with the
-/// connection and its unread bytes. [`serve`] runs this and performs the
-/// TLS upgrades.
-pub async fn serve_once<S, C>(
-    fcx: &Cx,
-    conn: C,
-    info: ConnInfo,
-    service: &mut S,
-    state: &S::State,
-    opts: &ServeOptions,
-) -> Result<Served<C>, ServeError<S::Error>>
-where
-    S: Service,
-    C: Connection,
-    <S::Decoder as Decode>::Error: Clone + Send,
-{
-    run(fcx, conn, info, service, state, opts, true, WakeHandle::new()).await
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -332,7 +332,7 @@ fn pipe_carries_http2_data_across_frames_and_checks_inner_eof() {
         ),
     ];
     for (bytes, expected, failure) in cases {
-        contract::check_stack(make, &bytes);
+        contract::check_decode(make, &bytes);
         let (items, failed) = test_support::decode_all(make, &bytes);
         assert_eq!(
             items,

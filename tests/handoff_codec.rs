@@ -32,7 +32,7 @@ where
     D::Error: Clone + PartialEq + Debug,
 {
     let wire = [units, PAYLOAD].concat();
-    contract::check_stack(&make, &wire);
+    contract::check_decode(&make, &wire);
     for pattern in [&[][..], &[1], &[3, 1, 7, 2, 64], &[units.len().saturating_sub(1), 64]] {
         let mut stream = Stream::with_buffer(make(), wire.len());
         let mut accepted = 0;

@@ -1610,27 +1610,6 @@ impl LenencInt {
     }
 }
 
-/// A non-NULL length-encoded byte string.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LenencString(
-    /// String bytes.
-    pub Vec<u8>,
-);
-impl LenencString {
-    fn read(payload: &[u8]) -> Result<Self, Error> {
-        let mut reader = Reader::new(payload);
-        let value = reader.lenenc_str()?;
-        if !reader.is_empty() { return Err(Error::Trailing); }
-        Ok(Self(value.to_vec()))
-    }
-    fn encode(&self) -> Result<Vec<u8>, Error> {
-        payload_size(lenenc_size(self.0.len() as u64), [self.0.len()])?;
-        let mut out = Vec::new();
-        put_lenenc_str(&mut out, &self.0);
-        Ok(out)
-    }
-}
-
 /// A whole text result set, for a world that plays a server to write as
 /// the answer to a query.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2003,10 +1982,6 @@ payload_wire!(LocalInfile,
 payload_wire!(LenencInt,
     "Reads exactly one non-NULL length-encoded integer. Values below 251 use one byte. Prefixes 0xFC, 0xFD, and 0xFE introduce 2, 3, and 8 bytes. Refuses 0xFB (NULL), 0xFF, incomplete input, and trailing bytes.",
     "Appends a non-NULL integer in its shortest length-encoded form. Every integer value is representable.");
-payload_wire!(LenencString,
-    "Reads exactly one non-NULL length-encoded byte string. Refuses NULL, invalid prefixes, incomplete input, and trailing bytes.",
-    "Appends a length and the complete byte string. Refuses a payload above MAX_MESSAGE.");
-
 macro_rules! contextual_message {
     ($($ty:ty),+ $(,)?) => {$ (
         impl $ty {
@@ -2449,12 +2424,12 @@ mod tests {
         assert_eq!(LenencInt::parse(&[0xfb]), Err(Error::LengthPrefix(0xfb)));
         assert_eq!(LenencInt::parse(&[0xff]), Err(Error::LengthPrefix(0xff)));
         let mut s = Vec::new();
-        LenencString(b"hello".to_vec()).write(&mut s).unwrap();
+        Row(vec![Some(b"hello".to_vec())]).write(&mut s).unwrap();
         assert_eq!(s, b"\x05hello");
-        assert_eq!(LenencString::parse(&s), Ok(LenencString(b"hello".to_vec())));
-        assert_eq!(LenencString::parse(&s[..5]), Err(Error::Truncated));
+        assert_eq!(Row::parse(&s), Ok(Row(vec![Some(b"hello".to_vec())])));
+        assert_eq!(Row::parse(&s[..5]), Err(Error::Truncated));
         // A length past anything that could follow.
-        assert_eq!(LenencString::parse(&[0xfe, 0, 0, 0, 0, 0, 0, 0, 0x80]), Err(Error::Truncated));
+        assert_eq!(Row::parse(&[0xfe, 0, 0, 0, 0, 0, 0, 0, 0x80]), Err(Error::Truncated));
     }
 
     #[test]
@@ -2927,7 +2902,6 @@ mod tests {
         contract::check_wire::<Column>(bytes);
         contract::check_wire::<Row>(bytes);
         contract::check_wire::<LenencInt>(bytes);
-        contract::check_wire::<LenencString>(bytes);
         for caps in CAPS_SETS {
             if let Ok(value) = OkPacket::parse(bytes, caps) {
                 let message = value.message(0, caps).unwrap();

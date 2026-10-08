@@ -274,12 +274,6 @@ impl Attribute {
         }
     }
 
-    /// Whether a receiver must understand this attribute to process the
-    /// message: its type is below `0x8000`.
-    pub fn comprehension_required(&self) -> bool {
-        self.typ() < attr::OPTIONAL_START
-    }
-
     /// Reads one attribute's value. `transaction` is the message's, needed
     /// to undo the XOR in XOR-MAPPED-ADDRESS. FINGERPRINT is not read here,
     /// since it depends on the bytes before it; it comes back as an error.

@@ -206,8 +206,8 @@
 //! ```
 //!
 //! [`stdlib::web::Sites`] is a preset on `Net` for a world of websites. The
-//! guide in `docs/services.md` walks through services, `Net`, events
-//! and scenarios step by step.
+//! guide in `docs/services.md` walks through services, `Net`, and events
+//! step by step.
 //!
 //! # Protocols
 //!

@@ -30,7 +30,9 @@ fn payload(bytes: &[u8]) {
     contract::check_wire::<Column>(bytes);
     contract::check_wire::<Row>(bytes);
     contract::check_wire::<LenencInt>(bytes);
-    contract::check_wire::<LenencString>(bytes);
+    if let Ok(row) = parse_row(bytes, 1) {
+        contract::check_wire_value(&row);
+    }
     contract::check_wire::<LocalInfile>(bytes);
     for caps in CAPS {
         if let Ok(value) = OkPacket::parse(bytes, caps) {

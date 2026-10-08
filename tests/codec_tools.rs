@@ -1,7 +1,7 @@
 use core::{convert::Infallible, time::Duration};
 use fictionet::stdlib::{
     codec::{
-        Buffer, ByteFault, Carry, Decode, Demux, Direction, Ending, Fail, Faults, Interceptor,
+        Buffer, ByteFault, Carry, Decode, Demux, Direction, Ending, Fail, Faults, InterceptError, Interceptor,
         ItemFault, Layered, Lines, RecordKind, Recorder, Rewrite, RewriteError, Rule, Stream,
         Trigger, Wire, contract, test_support, write_bounded,
     },
@@ -187,7 +187,7 @@ fn json_line_calls_are_logged_dropped_duplicated_and_results_rewritten() {
                 {
                     call_count += 1;
                 }
-                log.observe(Direction::ClientToServer, event);
+                log.observe_tagged(0, Direction::ClientToServer, event);
             })
         {
             r.unwrap();
@@ -239,7 +239,7 @@ fn byte_faults_run_before_modbus_and_line_decoding() {
     assert_eq!(stream.push(&damaged), 7);
     stream.end();
     assert_eq!(
-        log.with_next(Direction::ClientToServer, &mut stream, |_, _, _| ()),
+        stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer)),
         Some(Err(Fail::Truncated { unread: 7 }))
     );
     assert_eq!(log.iter().next().unwrap().bytes, damaged);
@@ -295,7 +295,7 @@ fn pipe_inner_items_require_explicit_outer_framing() {
         pdu: b"ab\n".to_vec(),
     };
     let bytes = outer.to_bytes().unwrap();
-    contract::check_stack(make, &bytes);
+    contract::check_decode(make, &bytes);
     let mut stream = Stream::new(make());
     let mut log = Recorder::new(8, 256);
     let mut faults = Faults::new(1, 256, 8).with_skips(fictionet::stdlib::codec::SkipPolicy::Drop);
@@ -336,7 +336,7 @@ fn pipe_inner_items_require_explicit_outer_framing() {
                     assert!(raw.is_empty());
                     assert_eq!(*range, bytes.len() as u64..bytes.len() as u64);
                 }
-                log.observe(Direction::ClientToServer, event);
+                log.observe_tagged(0, Direction::ClientToServer, event);
             },
         )
         .unwrap()
@@ -528,8 +528,7 @@ where
     let mut out = Vec::new();
     for chunk in test_support::chunks(input, &[1]) {
         assert_eq!(
-            proxy
-                .intercept_with(
+            rewrite_input(&proxy,
                     &mut stream,
                     chunk,
                     &mut out,
@@ -541,8 +540,7 @@ where
         );
     }
     stream.end();
-    proxy
-        .intercept_with(
+    rewrite_input(&proxy,
             &mut stream,
             &[],
             &mut out,
@@ -622,7 +620,7 @@ fn recorder_preserves_oversized_failure_ranges_with_truncation() {
         let mut stream = Stream::new(modbus::Frames);
         assert_eq!(stream.push(&[0, 0, 0, 1, 0, 2, 1, 3]), 8);
         assert!(
-            log.with_next(Direction::ClientToServer, &mut stream, |_, _, _| ())
+            stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
                 .unwrap()
                 .is_err()
         );
@@ -643,7 +641,7 @@ fn recorder_preserves_oversized_failure_ranges_with_truncation() {
     assert_eq!(stream.push(&bytes), 40);
     stream.end();
     assert!(
-        log.with_next(Direction::ClientToServer, &mut stream, |_, _, _| ())
+        stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
             .unwrap()
             .is_err()
     );
@@ -707,8 +705,7 @@ fn skip_output_is_transactional_on_limits_writes_and_decode_failure() {
 
     let mut stream = Stream::new(json::Values::new());
     let proxy = Interceptor::new(64).with_skips(SkipPolicy::Drop);
-    proxy
-        .intercept(&mut stream, input, &mut out, |_, _, _| Rewrite::Forward)
+    forward_input(&proxy, &mut stream, input, &mut out, |_, _, _| Rewrite::Forward)
         .unwrap();
     assert_eq!(out, b"*{}");
     let mut stream = Stream::new(json::Values::new());
@@ -742,7 +739,7 @@ fn forward_composes_with_collect_and_assemble() {
             },
         )
     };
-    contract::check_stack(make, input);
+    contract::check_decode(make, input);
     assert_forwarded(make(), input);
 }
 
@@ -753,8 +750,7 @@ fn intercept_helper_keeps_prior_items_and_handoff_bytes() {
     let input = frame(1).to_bytes().unwrap().repeat(2);
     let mut calls = 0;
     let mut out = vec![42];
-    let error = proxy
-        .intercept(&mut stream, &input, &mut out, |_, _, _| {
+    let error = forward_input(&proxy, &mut stream, &input, &mut out, |_, _, _| {
             calls += 1;
             if calls == 1 {
                 Rewrite::Forward
@@ -780,8 +776,7 @@ fn intercept_helper_keeps_prior_items_and_handoff_bytes() {
     let header = b"PROXY UNKNOWN\r\n";
     let input = [header.as_slice(), b"rest"].concat();
     let mut stream = Stream::new(fictionet::stdlib::proxy_protocol::Headers::new());
-    let taken = proxy
-        .intercept_with(
+    let taken = rewrite_input(&proxy,
             &mut stream,
             &input,
             &mut out,
@@ -802,15 +797,13 @@ fn intercept_after_eof_does_not_accept_new_input() {
     assert_eq!(stream.push(b"1"), 1);
     stream.end();
     assert_eq!(
-        proxy
-            .intercept(&mut stream, b"2", &mut out, |_, _, _| Rewrite::Forward)
+        forward_input(&proxy, &mut stream, b"2", &mut out, |_, _, _| Rewrite::Forward)
             .unwrap(),
         0
     );
     assert_eq!(out, b"1");
     assert_eq!(
-        proxy
-            .intercept(&mut stream, b"3", &mut out, |_, _, _| Rewrite::Forward)
+        forward_input(&proxy, &mut stream, b"3", &mut out, |_, _, _| Rewrite::Forward)
             .unwrap(),
         0
     );
@@ -823,8 +816,7 @@ fn intercept_keeps_good_frame_before_decode_failure() {
     let input = [first.as_slice(), &[0, 2, 0, 1, 0, 2]].concat();
     let mut stream = Stream::new(modbus::Frames);
     let mut out = Vec::new();
-    let (accepted, error) = Interceptor::new(128)
-        .intercept(&mut stream, &input, &mut out, |_, _, _| Rewrite::Forward)
+    let (accepted, error) = forward_input(&Interceptor::new(128), &mut stream, &input, &mut out, |_, _, _| Rewrite::Forward)
         .unwrap_err();
     assert_eq!(accepted, input.len());
     assert!(matches!(
@@ -1036,8 +1028,7 @@ fn intercept_reports_accepted_prefix_before_unaccepted_suffix() {
     input.resize(1024, 0);
     let mut stream = Stream::new(modbus::Frames);
     let mut out = Vec::new();
-    let (accepted, error) = Interceptor::new(4096)
-        .intercept(&mut stream, &input, &mut out, |_, _, _| Rewrite::Forward)
+    let (accepted, error) = forward_input(&Interceptor::new(4096), &mut stream, &input, &mut out, |_, _, _| Rewrite::Forward)
         .unwrap_err();
     assert!(matches!(
         error,
@@ -1050,4 +1041,99 @@ fn intercept_reports_accepted_prefix_before_unaccepted_suffix() {
         [out.as_slice(), stream.unread(), &input[accepted..]].concat(),
         input
     );
+}
+
+#[test]
+fn intercept_accepts_only_what_output_can_hold_and_resumes_after_draining() {
+    let input = b"1 ".repeat(16);
+    let proxy = Interceptor::new(16);
+    let mut stream = Stream::new(json::Values::new());
+    let mut out = Vec::new();
+    let mut spaces = 0;
+    let mut accepted = 0;
+    for _ in 0..64 {
+        let result = forward_input(&proxy, &mut stream, &input[accepted..], &mut out, |_, _, _| {
+            Rewrite::<json::Value>::Drop
+        });
+        let taken = match result {
+            Ok(taken) => taken,
+            Err((taken, InterceptError::Rewrite(RewriteError::TooLong { limit: 16 }))) => taken,
+            Err((_, error)) => panic!("unexpected {error:?}"),
+        };
+        assert!(stream.buffered() <= proxy.limit());
+        accepted += taken;
+        spaces += out.len();
+        out.clear();
+        if accepted == input.len() {
+            break;
+        }
+    }
+    assert_eq!(accepted, input.len());
+    stream.end();
+    assert_eq!(
+        forward_input(&proxy, &mut stream, b"", &mut out, |_, _, _| {
+            Rewrite::<json::Value>::Drop
+        }),
+        Ok(0)
+    );
+    assert_eq!(spaces + out.len(), 16);
+    assert_eq!(stream.buffered(), 0);
+}
+
+// Drive input under the interceptor budget and retain accepted-byte assertions.
+#[allow(clippy::type_complexity)]
+fn forward_input<D: Decode>(
+    proxy: &Interceptor,
+    stream: &mut Stream<D>,
+    bytes: &[u8],
+    out: &mut Vec<u8>,
+    policy: impl FnMut(&D::Item, &[u8], core::ops::Range<u64>) -> Rewrite<D::Item>,
+) -> Result<usize, (usize, InterceptError<D::Error, <D::Item as Wire>::WriteError>)>
+where
+    D::Item: Wire,
+    D::Error: Clone,
+{
+    rewrite_input(proxy, stream, bytes, out, policy, write_bounded)
+}
+
+fn rewrite_input<D: Decode, T, E>(
+    proxy: &Interceptor,
+    stream: &mut Stream<D>,
+    mut bytes: &[u8],
+    out: &mut Vec<u8>,
+    mut policy: impl FnMut(&D::Item, &[u8], core::ops::Range<u64>) -> Rewrite<T>,
+    mut write: impl FnMut(&T, &mut Buffer) -> Result<(), RewriteError<E>>,
+) -> Result<usize, (usize, InterceptError<D::Error, E>)>
+where
+    D::Error: Clone,
+{
+    let length = bytes.len();
+    loop {
+        // Drain first so EOF and handoff leave new input unaccepted.
+        while let Some(result) = proxy.next_with(stream, out, &mut policy, &mut write) {
+            if let Err(error) = result {
+                return Err((length - bytes.len(), error));
+            }
+        }
+        if bytes.is_empty() || stream.is_done() {
+            return Ok(length - bytes.len());
+        }
+        let room = proxy.room(stream, out);
+        if room == 0 {
+            return Err((
+                length - bytes.len(),
+                InterceptError::Rewrite(RewriteError::TooLong { limit: proxy.limit() }),
+            ));
+        }
+        let taken = stream.push(&bytes[..bytes.len().min(room)]);
+        if taken == 0 {
+            // A live, drained stream has room. A refused push means
+            // its buffer could not reserve storage. Do not retry here.
+            return Err((
+                length - bytes.len(),
+                InterceptError::Rewrite(RewriteError::Allocation),
+            ));
+        }
+        bytes = &bytes[taken..];
+    }
 }

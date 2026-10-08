@@ -75,8 +75,7 @@
 //!   after the run ([`EventLog::to_file`]);
 //! - callbacks in the same process ([`EventLog::subscribe`]);
 //! - a grader or a test in the same process, which reads the log itself,
-//!   during the run or after it ([`EventLog::all`], [`EventLog::wait`],
-//!   and [`scenario`](crate::stdlib::scenario) checks).
+//!   during the run or after it ([`EventLog::all`] and [`EventLog::wait`]).
 //!
 //! A reader that starts late misses nothing the log still holds: a file
 //! or a callback set halfway through a run first gets what the log kept,
@@ -154,7 +153,7 @@ pub enum Level {
     /// Worth a look: a refused handshake, a malformed request, a dropped
     /// packet.
     Notice,
-    /// The fact a scenario watches for: a safety limit crossed, a password
+    /// The fact a grader watches for: a safety limit crossed, a password
     /// sent to the wrong host, a tool's false answer accepted.
     Alarm,
 }

@@ -693,7 +693,7 @@ fn pipe_two_layers_cross_payloads_and_match_separate_decoding() {
     assert_eq!(combined, separate);
     assert_eq!(s.decoder().spans().outer_offset(), data.len() as u64);
     assert_eq!(s.decoder().spans().iter().last().unwrap().outer, 11..14);
-    contract::check_stack(|| Pipe::new(Frames, Pairs, carry), &data);
+    contract::check_decode(|| Pipe::new(Frames, Pairs, carry), &data);
 }
 #[test]
 fn pipe_pending_larger_than_inner_buffer_is_not_overwritten() {
@@ -711,7 +711,7 @@ fn pipe_pending_larger_than_inner_buffer_is_not_overwritten() {
             Layered::Inner(vec![7, 8])
         ]
     );
-    contract::check_stack(|| Pipe::new(Frames, Pairs, carry), &data);
+    contract::check_decode(|| Pipe::new(Frames, Pairs, carry), &data);
 }
 #[test]
 fn pipe_eof_collect_empty_and_nonempty() {
@@ -728,7 +728,7 @@ fn pipe_eof_collect_empty_and_nonempty() {
                 b"abc".to_vec()
             }))]
         );
-        contract::check_stack(|| Pipe::new(Frames, Collect::<Blob>::new(8), carry), data);
+        contract::check_decode(|| Pipe::new(Frames, Collect::<Blob>::new(8), carry), data);
     }
 }
 #[test]
@@ -780,22 +780,22 @@ fn spans_coarse_gaps_eviction_and_zero_retention() {
     spans.push(3, 3);
     spans.push(2, 2);
     // Equal lengths are still coarse: only whole spans resolve.
-    assert_eq!(spans.locate(1..4), None);
-    assert_eq!(spans.locate(0..3), Some(0..3));
-    assert_eq!(spans.locate(0..5), Some(0..5));
+    assert_eq!(whole_spans(&spans, 1..4), None);
+    assert_eq!(whole_spans(&spans, 0..3), Some(0..3));
+    assert_eq!(whole_spans(&spans, 0..5), Some(0..5));
     spans.skip(2);
     spans.push(3, 3);
-    assert_eq!(spans.locate(4..7), None);
-    assert_eq!(spans.locate(5..7), None);
-    assert_eq!(spans.locate(5..8), Some(7..10));
-    assert_eq!(spans.locate(3..8), None);
+    assert_eq!(whole_spans(&spans, 4..7), None);
+    assert_eq!(whole_spans(&spans, 5..7), None);
+    assert_eq!(whole_spans(&spans, 5..8), Some(7..10));
+    assert_eq!(whole_spans(&spans, 3..8), None);
     spans.push(5, 2);
     assert_eq!(spans.len(), 3);
-    assert_eq!(spans.locate(0..1), None);
-    assert_eq!(spans.locate(8..10), Some(10..15));
-    assert_eq!(spans.locate(5..10), Some(7..15));
-    assert_eq!(spans.locate(8..9), None);
-    assert_eq!(spans.locate(8..8), None);
+    assert_eq!(whole_spans(&spans, 0..1), None);
+    assert_eq!(whole_spans(&spans, 8..10), Some(10..15));
+    assert_eq!(whole_spans(&spans, 5..10), Some(7..15));
+    assert_eq!(whole_spans(&spans, 8..9), None);
+    assert_eq!(whole_spans(&spans, 8..8), None);
     let mut disabled = Spans::new(0);
     disabled.push(5, 3);
     assert!(disabled.is_empty());
@@ -1331,7 +1331,7 @@ fn pipe_random_payload_partitions_preserve_inner_stream() {
             rng.fill(&mut payload);
             input.extend_from_slice(payload.get(..n).unwrap());
         }
-        contract::check_stack(|| Pipe::new(Frames, Pairs, carry), &input);
+        contract::check_decode(|| Pipe::new(Frames, Pairs, carry), &input);
     }
 }
 
@@ -1376,7 +1376,7 @@ fn regression_large_payload_zero_items() {
     pump(&mut s, &input, |_| count += 1).unwrap();
     finish(&mut s, |_| count += 1).unwrap();
     assert_eq!(count, input.len());
-    contract::check_stack(
+    contract::check_decode(
         || {
             Pipe::new(
                 Collect::<Body>::new(1 << 20),
@@ -1409,7 +1409,7 @@ fn regression_assemble_pipe_zero_fragments() {
     pump(&mut s, &data, |item| items.push(item)).unwrap();
     finish(&mut s, |_| panic!()).unwrap();
     assert_eq!(items, vec![Assembled::Message(b"a".to_vec())]);
-    contract::check_stack(make, &data);
+    contract::check_decode(make, &data);
 }
 
 #[test]
@@ -1433,7 +1433,7 @@ fn regression_nested_expanding_pipe() {
     pump(&mut s, &data, |_| count += 1).unwrap();
     finish(&mut s, |_| count += 1).unwrap();
     assert_eq!(count, 16);
-    contract::check_stack(make, &data);
+    contract::check_decode(make, &data);
 }
 
 #[test]
@@ -1797,7 +1797,7 @@ fn regression_lines_expanding_pipe_bytewise() {
         assert_eq!(s.offset(), data.len() as u64);
         assert_eq!(s.held(), 0);
     }
-    contract::check_stack(make, data);
+    contract::check_decode(make, data);
 }
 
 #[test]
@@ -1823,7 +1823,7 @@ fn regression_pipe_over_expanding_assemble() {
         items,
         vec![Layered::Inner(Assembled::Message(b"abababab".to_vec()))]
     );
-    contract::check_stack(make, &[3, 2, b'a', b'b', 1, 0]);
+    contract::check_decode(make, &[3, 2, b'a', b'b', 1, 0]);
 }
 
 fn expanding_frame_pipe()
@@ -1859,7 +1859,7 @@ fn regression_nested_expanding_pipe_waits_for_payload() {
 
 #[test]
 fn regression_nested_expanding_pipe_contract() {
-    contract::check_stack(expanding_frame_pipe, &[2, 1, 1, 2, 1, 2]);
+    contract::check_decode(expanding_frame_pipe, &[2, 1, 1, 2, 1, 2]);
 }
 
 #[test]
@@ -1886,7 +1886,7 @@ fn regression_nested_expanding_pipe_into_collect() {
         items,
         vec![Layered::Inner(Layered::Inner(Body(b"aaaa".to_vec())))]
     );
-    contract::check_stack(make, &[2, 1, b'a']);
+    contract::check_decode(make, &[2, 1, b'a']);
 }
 
 #[derive(Default)]
@@ -1933,12 +1933,12 @@ fn regression_pipe_over_growing_table() {
     assert_eq!(pump(&mut s, &[1, b'x'], |i| items.push(i)), Ok(2));
     finish(&mut s, |i| items.push(i)).unwrap();
     assert_eq!(items, vec![Layered::Inner(b'x')]);
-    contract::check_stack(make, &[1, b't', 1, b'x']);
+    contract::check_decode(make, &[1, b't', 1, b'x']);
 }
 
 #[test]
 fn regression_pipe_over_growing_table_contract() {
-    contract::check_stack(
+    contract::check_decode(
         || Pipe::new(Frames, Table::default(), carry),
         &[
             2, 0, 116, 187, 6, 116, 116, 227, 67, 19, 116, 63, 251, 0, 202,
@@ -2160,8 +2160,8 @@ fn regression_pipe_spans_cover_assembled_message() {
             outer: 0..8
         }]
     );
-    assert_eq!(spans.locate(0..1), None);
-    assert_eq!(spans.locate(0..4), Some(0..8));
+    assert_eq!(whole_spans(spans, 0..1), None);
+    assert_eq!(whole_spans(spans, 0..4), Some(0..8));
 }
 
 #[test]
@@ -2169,4 +2169,34 @@ fn pad_to_four_edges() {
     for (n, want) in [(0, 0), (1, 4), (3, 4), (4, 4), (5, 8), (usize::MAX - 3, usize::MAX - 3)] {
         assert_eq!(super::pad_to_4(n), want);
     }
+}
+
+// Resolve whole coarse spans through the retained mappings.
+fn whole_spans(spans: &Spans, range: core::ops::Range<u64>) -> Option<core::ops::Range<u64>> {
+    if range.start >= range.end {
+        return None;
+    }
+    let mut at = range.start;
+    let mut result: Option<core::ops::Range<u64>> = None;
+    for span in spans.iter() {
+        if span.inner.end <= at {
+            continue;
+        }
+        if span.inner.start > at {
+            return None;
+        }
+        if span.inner.start != at || span.inner.end > range.end {
+            return None;
+        }
+        match &mut result {
+            Some(r) if r.end == span.outer.start => r.end = span.outer.end,
+            None => result = Some(span.outer.clone()),
+            _ => return None,
+        }
+        at = span.inner.end;
+        if at == range.end {
+            return result;
+        }
+    }
+    None
 }

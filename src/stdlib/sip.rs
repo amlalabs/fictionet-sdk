@@ -101,38 +101,6 @@ pub const MAX_VALUES: usize = 256;
 /// headers a URI may have.
 pub const MAX_PARAMS: usize = 64;
 
-/// Request methods from RFC 3261 and the RFCs that extend it.
-pub mod method {
-    /// The `INVITE` request method.
-    pub const INVITE: &str = "INVITE";
-    /// The `ACK` request method.
-    pub const ACK: &str = "ACK";
-    /// The `BYE` request method.
-    pub const BYE: &str = "BYE";
-    /// The `CANCEL` request method.
-    pub const CANCEL: &str = "CANCEL";
-    /// The `OPTIONS` request method.
-    pub const OPTIONS: &str = "OPTIONS";
-    /// The `REGISTER` request method.
-    pub const REGISTER: &str = "REGISTER";
-    /// The `PRACK` request method.
-    pub const PRACK: &str = "PRACK";
-    /// The `SUBSCRIBE` request method.
-    pub const SUBSCRIBE: &str = "SUBSCRIBE";
-    /// The `NOTIFY` request method.
-    pub const NOTIFY: &str = "NOTIFY";
-    /// The `PUBLISH` request method.
-    pub const PUBLISH: &str = "PUBLISH";
-    /// The `INFO` request method.
-    pub const INFO: &str = "INFO";
-    /// The `REFER` request method.
-    pub const REFER: &str = "REFER";
-    /// The `MESSAGE` request method.
-    pub const MESSAGE: &str = "MESSAGE";
-    /// The `UPDATE` request method.
-    pub const UPDATE: &str = "UPDATE";
-}
-
 /// Compact header names and the full names they stand for. RFC 3261
 /// section 7.3.3 defines c, e, f, i, k, l, m, s, t and v. The others come
 /// from later RFCs.

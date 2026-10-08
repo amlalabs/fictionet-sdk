@@ -174,8 +174,7 @@ and one driver runs it over any connection. HTTP is a service
 (`stdlib::httpd`), and `web::Sites` is a preset on `Net` for websites. Every
 service records what it sees in the run's one log of events
 (`fictionet::events`), which every run keeps: a file a grader reads after the
-run, callbacks, or the dashboard. A scenario (`stdlib::scenario`) changes the
-world on a timeline and grades its events.
+run, callbacks, or the dashboard.
 [docs/services.md](docs/services.md) builds a small world this way, step by
 step.
 

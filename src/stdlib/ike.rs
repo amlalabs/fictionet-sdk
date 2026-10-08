@@ -748,6 +748,25 @@ impl EncryptedFragment {
 /// and pad length taken off. An SK or SKF payload ends the chain, and must
 /// end the bytes too. More than [`MAX_CHAIN`] bytes is
 /// [`Error::Limit`].
+///
+/// To write a payload chain, put the payloads in a [`Message`]
+/// and write it. Byte 16 gives the first type; bytes from [`HEADER_LEN`] onward
+/// are the inner chain. The temporary header is excluded from the plaintext
+/// encrypted for an SK payload.
+///
+/// ```
+/// use fictionet::stdlib::codec::Wire;
+/// use fictionet::stdlib::ike::{Body, Message, Payload, HEADER_LEN, exchange, parse_payloads};
+/// let payloads = vec![Payload::new(Body::Nonce(vec![7; 32]))];
+/// let envelope = Message {
+///     initiator_spi: 0, responder_spi: 0, minor_version: 0,
+///     exchange: exchange::INFORMATIONAL, flags: 0, message_id: 0,
+///     payloads: payloads.clone(),
+/// };
+/// let bytes = envelope.to_bytes().unwrap();
+/// let (first, chain) = (bytes[16], &bytes[HEADER_LEN..]);
+/// assert_eq!(parse_payloads(first, chain).unwrap(), payloads);
+/// ```
 pub fn parse_payloads(first: u8, b: &[u8]) -> Result<Vec<Payload>, Error> {
     if b.len() > MAX_CHAIN {
         return Err(Error::Limit("chain bytes"));
@@ -1403,51 +1422,6 @@ impl Wire for NatT {
     }
 }
 
-/// An IKE payload chain whose first payload type is supplied by its enclosing header.
-/// When that type is known only at run time, put the payloads in a [`Message`]
-/// and write it. Byte 16 gives the first type; bytes from [`HEADER_LEN`] onward
-/// are the inner chain. The temporary header is excluded from the plaintext
-/// encrypted for an SK payload. This uses the same limits as `Payloads`.
-///
-/// ```
-/// use fictionet::stdlib::codec::Wire;
-/// use fictionet::stdlib::ike::{Body, Message, Payload, HEADER_LEN, exchange, parse_payloads};
-/// let payloads = vec![Payload::new(Body::Nonce(vec![7; 32]))];
-/// let envelope = Message {
-///     initiator_spi: 0, responder_spi: 0, minor_version: 0,
-///     exchange: exchange::INFORMATIONAL, flags: 0, message_id: 0,
-///     payloads: payloads.clone(),
-/// };
-/// let bytes = envelope.to_bytes().unwrap();
-/// let (first, chain) = (bytes[16], &bytes[HEADER_LEN..]);
-/// assert_eq!(parse_payloads(first, chain).unwrap(), payloads);
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Payloads<const FIRST: u8>(
-    /// Payloads in chain order.
-    pub Vec<Payload>,
-);
-
-impl<const FIRST: u8> Wire for Payloads<FIRST> {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    /// Reads a whole chain. Refuses malformed payloads, trailing bytes and named limits.
-    fn parse(b: &[u8]) -> Result<Self, Error> {
-        parse_payloads(FIRST, b).map(Self)
-    }
-
-    /// Appends the whole chain. Refuses a different first type or any field that would change.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let (first, bytes) = write_chain(&self.0, MAX_CHAIN).ok_or(Error::Unwritable)?;
-        if first != FIRST || parse_payloads(first, &bytes).as_ref() != Ok(&self.0) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
-    }
-}
-
 impl From<Truncated> for Error {
     #[inline]
     fn from(_: Truncated) -> Self { Error::Short }
@@ -1796,24 +1770,28 @@ mod tests {
         // The chain on its own, as inside an SK payload.
         let bytes = m.to_bytes().unwrap();
         let first = bytes[16];
-        let chain = bytes[HEADER_LEN..].to_vec();
+        let chain = &bytes[HEADER_LEN..];
         assert_eq!(first, payload::SA);
-        assert_eq!(chain, bytes[HEADER_LEN..]);
-        assert_eq!(parse_payloads(first, &chain), Ok(m.payloads));
+        assert_eq!(chain, &bytes[HEADER_LEN..]);
+        assert_eq!(parse_payloads(first, chain), Ok(m.payloads));
         assert_eq!(parse_payloads(0, &[]), Ok(vec![]));
     }
 
     #[test]
-    fn payloads_write_and_refuse_a_different_first_type() {
+    fn payload_chains_round_trip_and_refuse_a_different_first_type() {
+        fn chain_bytes(first: u8, payloads: Vec<Payload>) -> Result<Vec<u8>, Error> {
+            let bytes = message(payloads).to_bytes()?;
+            if bytes[16] != first { return Err(Error::Unwritable); }
+            Ok(bytes[HEADER_LEN..].to_vec())
+        }
         let payloads = every_body();
-        let chain = Payloads::<{ payload::SA }>(payloads.clone());
-        let bytes = chain.to_bytes().unwrap();
-        assert_eq!(Payloads::<{ payload::SA }>::parse(&bytes), Ok(chain.clone()));
+        let chain = message(payloads.clone());
+        let bytes = chain_bytes(payload::SA, payloads.clone()).unwrap();
+        assert_eq!(parse_payloads(payload::SA, &bytes), Ok(chain.payloads.clone()));
         contract::check_wire_value(&chain);
-        let wrong = Payloads::<{ payload::NONCE }>(payloads);
-        assert_eq!(wrong.to_bytes(), Err(Error::Unwritable));
-        contract::check_wire_value(&wrong);
-        contract::check_wire_value(&Payloads::<0>(vec![]));
+        assert_eq!(chain_bytes(payload::NONCE, payloads.clone()), Err(Error::Unwritable));
+        contract::check_wire_value(&message(payloads));
+        contract::check_wire_value(&message(vec![]));
     }
 
     #[test]
@@ -1953,9 +1931,9 @@ mod tests {
         assert_eq!(back, m);
         let bytes = back.to_bytes().unwrap();
         let first = bytes[16];
-        let chain = bytes[HEADER_LEN..].to_vec();
-        assert_eq!(chain, bytes[HEADER_LEN..]);
-        assert_eq!(parse_payloads(first, &chain), Ok(back.payloads));
+        let chain = &bytes[HEADER_LEN..];
+        assert_eq!(chain, &bytes[HEADER_LEN..]);
+        assert_eq!(parse_payloads(first, chain), Ok(back.payloads));
         // One byte more than a message can hold.
         let long = vec![0; MAX_CHAIN + 1];
         assert_eq!(parse_payloads(payload::VENDOR_ID, &long), Err(Error::Limit("chain bytes")));
@@ -2012,16 +1990,26 @@ mod tests {
         assert_eq!(m.unsupported_critical(), None);
     }
 
+    fn check_chain(first: u8, data: &[u8]) {
+        if let Ok(payloads) = parse_payloads(first, data) {
+            let value = message(payloads.clone());
+            contract::check_wire_value(&value);
+            let bytes = value.to_bytes().unwrap();
+            assert_eq!(bytes[16], first);
+            assert_eq!(parse_payloads(first, &bytes[HEADER_LEN..]), Ok(payloads));
+        }
+    }
+
     /// What the fuzz target checks: whatever reads, writes and reads back
     /// the same, and every prefix and chain reader runs without a panic.
     fn check(data: &[u8]) {
         contract::check_wire::<Header>(data);
         contract::check_wire::<Message>(data);
         contract::check_wire::<NatT>(data);
-        contract::check_wire::<Payloads<0>>(data);
-        contract::check_wire::<Payloads<33>>(data);
-        contract::check_wire::<Payloads<40>>(data);
-        contract::check_wire::<Payloads<46>>(data);
+        check_chain(0, data);
+        check_chain(33, data);
+        check_chain(40, data);
+        check_chain(46, data);
 
         if let Ok(m) = Message::parse(data) {
             let bytes = m.to_bytes().unwrap();
@@ -2032,8 +2020,8 @@ mod tests {
             }
             let bytes = m.to_bytes().unwrap();
         let first = bytes[16];
-        let chain = bytes[HEADER_LEN..].to_vec();
-            assert_eq!(parse_payloads(first, &chain).as_ref(), Ok(&m.payloads));
+        let chain = &bytes[HEADER_LEN..];
+            assert_eq!(parse_payloads(first, chain).as_ref(), Ok(&m.payloads));
         }
         if let Ok(NatT::Ike(m)) = NatT::parse(data) {
             assert_eq!(NatT::parse(&NatT::Ike(m.clone()).to_bytes().unwrap()), Ok(NatT::Ike(m)));

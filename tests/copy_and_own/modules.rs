@@ -211,8 +211,6 @@ macro_rules! protocols {
         pub mod rtsp;
         #[path = "../../src/stdlib/sbe.rs"]
         pub mod sbe;
-        #[path = "../../src/stdlib/scenario.rs"]
-        pub mod scenario;
         #[path = "../../src/stdlib/sdp.rs"]
         pub mod sdp;
         #[path = "../../src/stdlib/serve.rs"]

@@ -121,7 +121,10 @@ pub enum SkipPolicy {
 /// let proxy = Interceptor::new(1024);
 /// let input = [0, 1, 0, 0, 0, 2, 1, 3];
 /// let mut out = Vec::new();
-/// assert_eq!(proxy.intercept(&mut stream, &input, &mut out, |_, _, _| Rewrite::Forward).map_err(|(_, error)| error)?, input.len());
+/// assert_eq!(stream.push(&input), input.len());
+/// while let Some(result) = proxy.next(&mut stream, &mut out, |_, _, _| Rewrite::Forward) {
+///     result?;
+/// }
 /// assert_eq!(out, input);
 /// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
@@ -136,8 +139,7 @@ impl Interceptor {
     /// No output queue is retained by this type.
     ///
     /// With Forward skips, every buffered byte may reach output, so the
-    /// stream's buffered bytes must fit the limit. [`intercept`](Self::intercept)
-    /// keeps to this. Callers that push directly push at most
+    /// stream's buffered bytes must fit the limit. Push at most
     /// [`room`](Self::room) bytes before each call.
     pub fn new(limit: usize) -> Self {
         Self {
@@ -343,83 +345,6 @@ impl Interceptor {
                     PumpError::Handler(error)
                 })
             }),
-        }
-    }
-
-    /// Pushes and drains input, using the decoded type's Wire writer.
-    /// Returns the number of bytes accepted. A clean handoff can leave a
-    /// suffix unaccepted or unread in the stream. After EOF, no new bytes
-    /// are accepted. Each push stays within [`room`](Self::room). When
-    /// input remains and there is no room, the result is
-    /// `Err((accepted, TooLong))`: drain `out` and pass the unaccepted
-    /// suffix again. Call with empty input
-    /// after [`Stream::end`] to drain EOF items and trailing skips.
-    /// Each item has its own output transaction. Errors return the accepted
-    /// byte count and keep earlier items' output. A decode failure also keeps
-    /// consumed skips. A rewrite error rolls back only its item call.
-    #[allow(clippy::type_complexity)]
-    pub fn intercept<D: Decode>(
-        &self,
-        stream: &mut Stream<D>,
-        bytes: &[u8],
-        out: &mut Vec<u8>,
-        policy: impl FnMut(&D::Item, &[u8], Range<u64>) -> Rewrite<D::Item>,
-    ) -> Result<
-        usize,
-        (
-            usize,
-            InterceptError<D::Error, <D::Item as Wire>::WriteError>,
-        ),
-    >
-    where
-        D::Item: Wire,
-        D::Error: Clone,
-    {
-        self.intercept_with(stream, bytes, out, policy, write_bounded)
-    }
-
-    /// Pushes and drains input with caller-owned replacement framing.
-    /// This also supports mapped items and combinators without Wire impls.
-    /// Acceptance, EOF, and rollback follow [`intercept`](Self::intercept).
-    pub fn intercept_with<D: Decode, T, E>(
-        &self,
-        stream: &mut Stream<D>,
-        mut bytes: &[u8],
-        out: &mut Vec<u8>,
-        mut policy: impl FnMut(&D::Item, &[u8], Range<u64>) -> Rewrite<T>,
-        mut write: impl FnMut(&T, &mut Buffer) -> Result<(), RewriteError<E>>,
-    ) -> Result<usize, (usize, InterceptError<D::Error, E>)>
-    where
-        D::Error: Clone,
-    {
-        let length = bytes.len();
-        loop {
-            // Drain first so EOF and handoff leave new input unaccepted.
-            while let Some(result) = self.next_with(stream, out, &mut policy, &mut write) {
-                if let Err(error) = result {
-                    return Err((length - bytes.len(), error));
-                }
-            }
-            if bytes.is_empty() || stream.is_done() {
-                return Ok(length - bytes.len());
-            }
-            let room = self.room(stream, out);
-            if room == 0 {
-                return Err((
-                    length - bytes.len(),
-                    InterceptError::Rewrite(RewriteError::TooLong { limit: self.limit }),
-                ));
-            }
-            let taken = stream.push(&bytes[..bytes.len().min(room)]);
-            if taken == 0 {
-                // A live, drained stream has room. A refused push means
-                // its buffer could not reserve storage. Do not retry here.
-                return Err((
-                    length - bytes.len(),
-                    InterceptError::Rewrite(RewriteError::Allocation),
-                ));
-            }
-            bytes = &bytes[taken..];
         }
     }
 
@@ -683,43 +608,6 @@ mod tests {
                 })
                 .is_none()
         );
-    }
-
-    #[test]
-    fn intercept_accepts_only_what_output_can_hold_and_resumes_after_draining() {
-        let input = b"1 ".repeat(16);
-        let proxy = Interceptor::new(16);
-        let mut stream = Stream::new(json::Values::new());
-        let mut out = Vec::new();
-        let mut spaces = 0;
-        let mut accepted = 0;
-        for _ in 0..64 {
-            let result = proxy.intercept(&mut stream, &input[accepted..], &mut out, |_, _, _| {
-                Rewrite::<json::Value>::Drop
-            });
-            let taken = match result {
-                Ok(taken) => taken,
-                Err((taken, InterceptError::Rewrite(RewriteError::TooLong { limit: 16 }))) => taken,
-                Err((_, error)) => panic!("unexpected {error:?}"),
-            };
-            assert!(stream.buffered() <= proxy.limit());
-            accepted += taken;
-            spaces += out.len();
-            out.clear();
-            if accepted == input.len() {
-                break;
-            }
-        }
-        assert_eq!(accepted, input.len());
-        stream.end();
-        assert_eq!(
-            proxy.intercept(&mut stream, b"", &mut out, |_, _, _| {
-                Rewrite::<json::Value>::Drop
-            }),
-            Ok(0)
-        );
-        assert_eq!(spaces + out.len(), 16);
-        assert_eq!(stream.buffered(), 0);
     }
 
     #[test]
