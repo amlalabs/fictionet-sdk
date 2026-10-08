@@ -82,7 +82,7 @@
 //! assert_eq!(back.message(), Ok(reply));
 //! ```
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{be16, be32, Wire};
 
 /// The UDP port L2TP peers listen on.
 pub const PORT: u16 = 1701;
@@ -684,16 +684,6 @@ fn v3_word(b: &[u8]) -> Result<u16, Error> {
     Ok(word)
 }
 
-/// The big-endian 16-bit number at `i`. Callers check the length first.
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
-/// The big-endian 32-bit number at `i`. Callers check the length first.
-fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
-}
-
 impl Wire for Avp {
     type ParseError = Error;
     type WriteError = Error;
@@ -837,7 +827,7 @@ impl Wire for V2Packet {
         let mut at = 2;
         let mut end = b.len();
         if l {
-            let length = be16(b, at);
+            let length = be16(b, at).ok_or(Error::Truncated)?;
             at += 2;
             if usize::from(length) < header {
                 return Err(Error::Length(length));
@@ -847,17 +837,17 @@ impl Wire for V2Packet {
             }
             end = usize::from(length);
         }
-        let tunnel = be16(b, at);
-        let session = be16(b, at + 2);
+        let tunnel = be16(b, at).ok_or(Error::Truncated)?;
+        let session = be16(b, at + 2).ok_or(Error::Truncated)?;
         at += 4;
         let sequence = if s {
             at += 4;
-            Some((be16(b, at - 4), be16(b, at - 2)))
+            Some((be16(b, at - 4).ok_or(Error::Truncated)?, be16(b, at - 2).ok_or(Error::Truncated)?))
         } else {
             None
         };
         let offset_pad = if o {
-            let size = be16(b, at);
+            let size = be16(b, at).ok_or(Error::Truncated)?;
             at += 2;
             let Some(pad) = b.get(at..end).and_then(|rest| rest.get(..usize::from(size))) else {
                 return Err(Error::Offset(size));
@@ -945,12 +935,12 @@ impl Wire for V3Control {
         if b.len() < CONTROL_HEADER_LEN {
             return Err(Error::Truncated);
         }
-        let length = be16(b, 2);
+        let length = be16(b, 2).ok_or(Error::Truncated)?;
         if usize::from(length) < CONTROL_HEADER_LEN {
             return Err(Error::Length(length));
         }
         let payload = b.get(CONTROL_HEADER_LEN..usize::from(length)).ok_or(Error::Truncated)?;
-        Ok(V3Control { connection: be32(b, 4), ns: be16(b, 8), nr: be16(b, 10), payload: payload.to_vec() })
+        Ok(V3Control { connection: be32(b, 4).ok_or(Error::Truncated)?, ns: be16(b, 8).ok_or(Error::Truncated)?, nr: be16(b, 10).ok_or(Error::Truncated)?, payload: payload.to_vec() })
     }
 
     /// Appends the complete control packet. Refuses oversized control bodies.
@@ -994,7 +984,7 @@ impl<const COOKIE_LEN: usize> Wire for V3Data<COOKIE_LEN> {
             return Err(Error::Truncated);
         };
         Ok(V3Data {
-            session: be32(b, 4),
+            session: be32(b, 4).ok_or(Error::Truncated)?,
             cookie: cookie.to_vec(),
             payload: b[V3_DATA_HEADER_LEN + cookie_len..].to_vec(),
         })

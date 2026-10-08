@@ -84,7 +84,7 @@
 //! assert_eq!(v2.client.challenge, [9; 8]);
 //! ```
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{le16, le32, Wire};
 
 /// The 8 bytes every NTLMSSP message starts with.
 pub const SIGNATURE: [u8; 8] = *b"NTLMSSP\0";
@@ -406,14 +406,6 @@ pub enum Message {
     Authenticate(Authenticate),
 }
 
-fn le16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
-}
-
-fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
-}
-
 /// Checks the signature and the message type, and that `b` holds `fixed`
 /// bytes. It returns the flags at `flags_at` and where the payload may
 /// start, past the version if the flags say there is one.
@@ -428,14 +420,14 @@ fn header(b: &[u8], kind: u32, fixed: usize, flags_at: usize) -> Result<(u32, Op
     if b.len() < 12 {
         return Err(Error::Truncated);
     }
-    let t = le32(b, 8);
+    let t = le32(b, 8).ok_or(Error::Truncated)?;
     if t != kind {
         return Err(Error::MessageType(t));
     }
     if b.len() < fixed {
         return Err(Error::Truncated);
     }
-    let flags = le32(b, flags_at);
+    let flags = le32(b, flags_at).ok_or(Error::Truncated)?;
     if flags & flags::NEGOTIATE_VERSION == 0 {
         return Ok((flags, None, fixed));
     }
@@ -450,18 +442,18 @@ fn header(b: &[u8], kind: u32, fixed: usize, flags_at: usize) -> Result<(u32, Op
 
 /// Where the payload field described at `at` starts, if it is not empty.
 fn field_offset(b: &[u8], at: usize) -> Option<usize> {
-    (le16(b, at) != 0).then(|| le32(b, at + 4) as usize)
+    if le16(b, at)? != 0 { Some(le32(b, at + 4)? as usize) } else { None }
 }
 
 /// The payload field described at `at`: a length, a maximum length (not
 /// read) and an offset. A field that is not empty must lie between `start`
 /// and the end of `b`.
 fn field(b: &[u8], at: usize, start: usize, name: &'static str) -> Result<Vec<u8>, Error> {
-    let len = usize::from(le16(b, at));
+    let len = usize::from(le16(b, at).ok_or(Error::Truncated)?);
     if len == 0 {
         return Ok(Vec::new());
     }
-    let offset = le32(b, at + 4) as usize;
+    let offset = le32(b, at + 4).ok_or(Error::Truncated)? as usize;
     if offset < start {
         return Err(Error::Field(name));
     }
@@ -474,7 +466,7 @@ fn field(b: &[u8], at: usize, start: usize, name: &'static str) -> Result<Vec<u8
 /// empty must have an even offset and an even length.
 fn text_field(b: &[u8], at: usize, start: usize, name: &'static str, unicode: bool) -> Result<Vec<u8>, Error> {
     let v = field(b, at, start, name)?;
-    if unicode && !v.is_empty() && (!v.len().is_multiple_of(2) || !le32(b, at + 4).is_multiple_of(2)) {
+    if unicode && !v.is_empty() && (!v.len().is_multiple_of(2) || !le32(b, at + 4).ok_or(Error::Truncated)?.is_multiple_of(2)) {
         return Err(Error::OddUnicode(name));
     }
     Ok(v)
@@ -1080,7 +1072,7 @@ impl Wire for Message {
         if b.len() < 12 {
             return Err(Error::Truncated);
         }
-        match le32(b, 8) {
+        match le32(b, 8).ok_or(Error::Truncated)? {
             message_type::NEGOTIATE => Negotiate::parse(b).map(Message::Negotiate),
             message_type::CHALLENGE => Challenge::parse(b).map(Message::Challenge),
             message_type::AUTHENTICATE => Authenticate::parse(b).map(Message::Authenticate),
@@ -1247,8 +1239,8 @@ impl Wire for AvPair {
         if b.len() < 4 {
             return Err(Error::AvPairs);
         }
-        let id = le16(b, 0);
-        let len = le16(b, 2);
+        let id = le16(b, 0).ok_or(Error::AvPairs)?;
+        let len = le16(b, 2).ok_or(Error::AvPairs)?;
         if id == av_id::EOL && len != 0 {
             return Err(Error::AvEolLength(len));
         }
@@ -1278,9 +1270,9 @@ impl Wire for AvPair {
 fn check_end(b: &[u8], fixed: usize, slots: &[usize]) -> Result<(), Error> {
     let mut end = fixed;
     for &slot in slots {
-        let len = usize::from(le16(b, slot));
+        let len = usize::from(le16(b, slot).ok_or(Error::Truncated)?);
         if len != 0 {
-            let start = le32(b, slot + 4) as usize;
+            let start = le32(b, slot + 4).ok_or(Error::Truncated)? as usize;
             if let Some(last) = start.checked_add(len).filter(|last| start >= fixed && *last <= b.len()) {
                 end = end.max(last);
             }
@@ -1424,7 +1416,7 @@ mod tests {
         };
         let b = n.to_bytes().unwrap();
         assert_eq!(&b[..12], b"NTLMSSP\0\x01\0\0\0");
-        assert_eq!(le32(&b, 12), n.flags);
+        assert_eq!(le32(&b, 12).unwrap(), n.flags);
         // Domain: length 4, maximum 4, at 40, after the version.
         assert_eq!(&b[16..24], &[4, 0, 4, 0, 40, 0, 0, 0]);
         assert_eq!(&b[32..40], &[10, 0, 0x61, 0x4a, 0, 0, 0, 15]);
@@ -1446,8 +1438,8 @@ mod tests {
             mic: Some([0x11; 16]),
         };
         let b = a.to_bytes().unwrap();
-        assert_eq!(le32(&b, 8), message_type::AUTHENTICATE);
-        assert_eq!(le32(&b, 60), a.flags);
+        assert_eq!(le32(&b, 8).unwrap(), message_type::AUTHENTICATE);
+        assert_eq!(le32(&b, 60).unwrap(), a.flags);
         assert_eq!(&b[72..88], &[0x11; 16]);
         // The LM response is first, right after the MIC.
         assert_eq!(&b[12..20], &[24, 0, 24, 0, 88, 0, 0, 0]);
@@ -1691,7 +1683,7 @@ mod tests {
         };
         let b = a.to_bytes().unwrap();
         for at in [28, 44] {
-            assert_eq!(le32(&b, at + 4) % 2, 0, "field at {at}");
+            assert_eq!(le32(&b, at + 4).unwrap() % 2, 0, "field at {at}");
         }
         assert_eq!(Authenticate::parse(&b), Ok(a));
     }
@@ -1705,7 +1697,7 @@ mod tests {
             Message::Authenticate(Authenticate::default()),
         ] {
             let b = m.to_bytes().unwrap();
-            assert_eq!(le32(&b, 8), m.message_type());
+            assert_eq!(le32(&b, 8).unwrap(), m.message_type());
             assert_eq!(Message::parse(&b), Ok(m));
         }
         let c = Challenge::parse(&SPEC_CHALLENGE).unwrap();

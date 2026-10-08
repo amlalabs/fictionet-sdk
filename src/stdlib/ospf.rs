@@ -95,6 +95,7 @@
 //! assert!(Packet::parse(&bad, &link).is_err());
 //! ```
 
+use fictionet::stdlib::codec::{be16, be32};
 use fictionet::stdlib::codec::Reader as ByteReader;
 
 use fictionet::stdlib::codec::Wire;
@@ -873,7 +874,7 @@ pub fn checksum(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
     if b.len() < hl {
         return None;
     }
-    let len = usize::from(be16(b, 2));
+    let len = usize::from(be16(b, 2)?);
     if len < hl || len > b.len() {
         return None;
     }
@@ -957,7 +958,7 @@ fn lsa_data(lsa: &[u8]) -> Option<&[u8]> {
     if lsa.len() < LSA_HEADER_LEN {
         return None;
     }
-    let len = usize::from(be16(lsa, 18));
+    let len = usize::from(be16(lsa, 18)?);
     if !(LSA_HEADER_LEN..=lsa.len()).contains(&len) {
         return None;
     }
@@ -1552,7 +1553,7 @@ impl Lsa {
         if b.len() < LSA_HEADER_LEN {
             return Err(Error::Truncated);
         }
-        let length = be16(b, 18);
+        let length = be16(b, 18).ok_or(Error::Truncated)?;
         let n = usize::from(length);
         if !(LSA_HEADER_LEN..=b.len()).contains(&n) {
             return Err(Error::LsaLength(length));
@@ -1651,7 +1652,7 @@ fn lls_checksum(block: &[u8]) -> u16 {
 fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Layout, Error> {
     let base = check_base(b, endpoints)?;
     let v = endpoints.version();
-    let len = usize::from(be16(b, 2));
+    let len = usize::from(be16(b, 2).ok_or(Error::Truncated)?);
     // Where the options byte holding the L bit sits, and the bit.
     let l_at = match (v, b[1]) {
         (Version::V2, packet_type::HELLO) => Some((HEADER_LEN_V2 + 6, OPTION_L_V2)),
@@ -1672,7 +1673,7 @@ fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Layout, Error> {
     if b.len() < base + 4 {
         return Err(Error::Truncated);
     }
-    let words = usize::from(be16(b, base + 2));
+    let words = usize::from(be16(b, base + 2).ok_or(Error::Truncated)?);
     let end = base + words * 4;
     if words == 0 || end > MAX_MESSAGE {
         return Err(Error::Lls);
@@ -1698,7 +1699,7 @@ fn check_base(b: &[u8], endpoints: &Endpoints) -> Result<usize, Error> {
     if b.len() < 4 {
         return Err(Error::Truncated);
     }
-    let length = be16(b, 2);
+    let length = be16(b, 2).ok_or(Error::Truncated)?;
     if usize::from(length) < v.header_len() {
         return Err(Error::Length(length));
     }
@@ -1708,7 +1709,7 @@ fn check_base(b: &[u8], endpoints: &Endpoints) -> Result<usize, Error> {
     if b.len() < 16 {
         return Err(Error::Truncated);
     }
-    if be16(b, 14) != auth_type::CRYPTOGRAPHIC {
+    if be16(b, 14).ok_or(Error::Truncated)? != auth_type::CRYPTOGRAPHIC {
         return Ok(usize::from(length));
     }
     let &n = b.get(19).ok_or(Error::Truncated)?;
@@ -1734,12 +1735,12 @@ impl Packet {
             return Err(Error::Trailing { remaining: b.len() - end });
         }
         let v = endpoints.version();
-        let len = usize::from(be16(b, 2));
-        let auth_kind = if v == Version::V2 { be16(b, 14) } else { 0 };
+        let len = usize::from(be16(b, 2).ok_or(Error::Truncated)?);
+        let auth_kind = if v == Version::V2 { be16(b, 14).ok_or(Error::Truncated)? } else { 0 };
         if v == Version::V3 || auth_kind != auth_type::CRYPTOGRAPHIC {
             // The header check made sure the length fits in `b`.
             let want = checksum(b, endpoints).ok_or(Error::Truncated)?;
-            if !same_checksum(want, be16(b, 12)) {
+            if !same_checksum(want, be16(b, 12).ok_or(Error::Truncated)?) {
                 return Err(Error::Checksum);
             }
         }
@@ -1752,7 +1753,7 @@ impl Packet {
                     auth_type::SIMPLE => Auth::Simple(data),
                     auth_type::CRYPTOGRAPHIC => Auth::Cryptographic {
                         key_id: b[18],
-                        sequence: be32(b, 20),
+                        sequence: be32(b, 20).ok_or(Error::Truncated)?,
                         digest: b[len..layout.base].to_vec(),
                     },
                     kind => Auth::Other { kind, data },
@@ -1768,12 +1769,12 @@ impl Packet {
         let block = &b[layout.base..end];
         let lls = if block.is_empty() {
             None
-        } else if auth_kind == auth_type::CRYPTOGRAPHIC || same_checksum(lls_checksum(block), be16(block, 0)) {
+        } else if auth_kind == auth_type::CRYPTOGRAPHIC || same_checksum(lls_checksum(block), be16(block, 0).ok_or(Error::Truncated)?) {
             Some(block[4..].to_vec())
         } else {
             None
         };
-        Ok(Packet { router_id: Ipv4Addr::from(be32(b, 4)), area_id: Ipv4Addr::from(be32(b, 8)), header, lls, body })
+        Ok(Packet { router_id: Ipv4Addr::from(be32(b, 4).ok_or(Error::Truncated)?), area_id: Ipv4Addr::from(be32(b, 8).ok_or(Error::Truncated)?), header, lls, body })
     }
 
     /// The packet's version, from its header.
@@ -1929,7 +1930,7 @@ fn parse_body(b: &[u8], v: Version, t: u8) -> Result<Body, Error> {
                     return Err(Error::BodyLength);
                 }
                 let rest = &b[r.cursor.position()..];
-                let length = be16(rest, 18);
+                let length = be16(rest, 18).ok_or(Error::BodyLength)?;
                 let n = usize::from(length);
                 if !(LSA_HEADER_LEN..=rest.len()).contains(&n) {
                     return Err(Error::LsaLength(length));
@@ -2143,14 +2144,6 @@ pub struct Datagram(
 );
 
 bounded_datagram_wire!(Datagram, Error, Error::TooLong, MAX_MESSAGE);
-
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
-fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
-}
 
 /// An LSA's bytes, interpreted with a separate [`Version`].
 /// Construct with [`Lsa::frame`] or copy a bounded payload with [`Wire::parse`].
@@ -2766,7 +2759,7 @@ mod tests {
         for id in 0..=0xffffu32 {
             let p = Packet { router_id: Ipv4Addr::from(id), ..hello_v2(ip4(0, 0, 0, 0), vec![]) };
             let mut b = p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
-            let c = be16(&b, 12);
+            let c = be16(&b, 12).unwrap();
             if c == 0 || c == 0xffff {
                 b[12..14].copy_from_slice(&(!c).to_be_bytes());
                 assert_eq!(Packet::parse(&b, &e), Ok(p));
@@ -3148,7 +3141,7 @@ mod tests {
         h.options |= OPTION_L_V3;
         hello.lls = Some(vec![0, 1, 0, 4, 0, 0, 0, 1]);
         let b = hello.frame(&e6).and_then(|frame| frame.to_bytes()).unwrap();
-        assert_eq!(usize::from(be16(&b, 2)), b.len() - 12);
+        assert_eq!(usize::from(be16(&b, 2).unwrap()), b.len() - 12);
         assert_eq!(Packet::parse(&b, &e6), Ok(hello.clone()));
         for (v, e, l) in [(Version::V2, v4_ends(), u32::from(OPTION_L_V2)), (Version::V3, e6, OPTION_L_V3)] {
             let mut dd = packets(v).remove(2);
@@ -3173,7 +3166,7 @@ mod tests {
         let mut b = good.to_vec();
         b[21] = 1;
         let b = fix_lsa(b);
-        assert_eq!(be16(&b, 16), 0x9b7a);
+        assert_eq!(be16(&b, 16).unwrap(), 0x9b7a);
         assert_eq!(Lsa::parse(&b, Version::V2), Err(Error::LsaBody));
         // A checksum byte of 0 stands for 255 in the sums, but writing the
         // LSA again would give 255, so it is refused.
@@ -3221,7 +3214,7 @@ mod tests {
                 let b = l.frame(v).and_then(|frame| frame.to_bytes()).unwrap();
                 let (back, _) = Lsa::parse(&b, v).unwrap();
                 assert_eq!(back.frame(v).and_then(|frame| frame.to_bytes()).unwrap(), b);
-                assert_eq!(back.header(v).unwrap().checksum, be16(&b, 16));
+                assert_eq!(back.header(v).unwrap().checksum, be16(&b, 16).unwrap());
             }
         }
     }
@@ -3749,10 +3742,10 @@ mod tests {
                 assert!(n <= data.len());
                 let b = l.frame(v).and_then(|frame| frame.to_bytes()).unwrap();
                 assert_eq!(b, data[..n]);
-                assert_eq!(l.header(v).map(|h| (h.checksum, h.length)), Ok((be16(data, 16), n as u16)));
+                assert_eq!(l.header(v).map(|h| (h.checksum, h.length)), Ok((be16(data, 16).unwrap(), n as u16)));
             }
             if data.len() >= LSA_HEADER_LEN {
-                let t = if v == Version::V2 { u16::from(data[3]) } else { be16(data, 2) };
+                let t = if v == Version::V2 { u16::from(data[3]) } else { be16(data, 2).unwrap() };
                 if let Ok(body) = LsaBody::parse(&data[LSA_HEADER_LEN..], v, t) {
                     assert_eq!(body.frame(v, t).and_then(|frame| frame.to_bytes()).as_deref(), Ok(&data[LSA_HEADER_LEN..]));
                 }

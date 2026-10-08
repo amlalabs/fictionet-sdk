@@ -70,7 +70,7 @@
 //! assert_eq!(request.path[0], PathSegment::Class(1));
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{le16, le32, Decode, Step, Wire};
 use core::convert::Infallible;
 
 /// The TCP port EtherNet/IP devices listen on.
@@ -206,7 +206,7 @@ impl Packet {
         if b.len() < HEADER_LEN {
             return None;
         }
-        let length = usize::from(le16(b, 2));
+        let length = usize::from(le16(b, 2)?);
         let end = HEADER_LEN.checked_add(length)?;
         if b.len() < end {
             return None;
@@ -214,11 +214,11 @@ impl Packet {
         let mut sender_context = [0u8; 8];
         sender_context.copy_from_slice(&b[12..20]);
         let packet = Packet {
-            command: Command::from_code(le16(b, 0)),
-            session_handle: le32(b, 4),
-            status: le32(b, 8),
+            command: Command::from_code(le16(b, 0)?),
+            session_handle: le32(b, 4)?,
+            status: le32(b, 8)?,
             sender_context,
-            options: le32(b, 20),
+            options: le32(b, 20)?,
             data: b[HEADER_LEN..end].to_vec(),
         };
         Some((packet, end))
@@ -776,9 +776,9 @@ fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, Error> {
                         return Err(Error::BadSegment);
                     }
                     segments.push(PathSegment::ElectronicKey {
-                        vendor_id: le16(b, i + 2),
-                        device_type: le16(b, i + 4),
-                        product_code: le16(b, i + 6),
+                        vendor_id: le16(b, i + 2).ok_or(Error::Truncated)?,
+                        device_type: le16(b, i + 4).ok_or(Error::Truncated)?,
+                        product_code: le16(b, i + 6).ok_or(Error::Truncated)?,
                         major_revision: b[i + 8],
                         minor_revision: b[i + 9],
                     });
@@ -796,13 +796,13 @@ fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, Error> {
                         if i + 4 > b.len() {
                             return Err(Error::Truncated);
                         }
-                        (u32::from(le16(b, i + 2)), 4)
+                        (u32::from(le16(b, i + 2).ok_or(Error::Truncated)?), 4)
                     }
                     2 => {
                         if i + 6 > b.len() {
                             return Err(Error::Truncated);
                         }
-                        (le32(b, i + 2), 6)
+                        (le32(b, i + 2).ok_or(Error::Truncated)?, 6)
                     }
                     _ => return Err(Error::BadSegment),
                 };
@@ -842,7 +842,7 @@ fn parse_path(b: &[u8]) -> Result<Vec<PathSegment>, Error> {
                     if j + 2 > b.len() {
                         return Err(Error::Truncated);
                     }
-                    let p = le16(b, j);
+                    let p = le16(b, j).ok_or(Error::Truncated)?;
                     j += 2;
                     p
                 } else {
@@ -1137,14 +1137,6 @@ fn check_words(b: &[u8]) -> Result<&[u8], Error> {
     Ok(b)
 }
 
-fn le16(b: &[u8], i: usize) -> u16 {
-    u16::from_le_bytes([b[i], b[i + 1]])
-}
-
-fn le32(b: &[u8], i: usize) -> u32 {
-    u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
-}
-
 impl Wire for RegisterSession {
     type ParseError = Error;
     type WriteError = Infallible;
@@ -1161,8 +1153,8 @@ impl Wire for RegisterSession {
             });
         }
         Ok(RegisterSession {
-            protocol_version: le16(b, 0),
-            options: le16(b, 2),
+            protocol_version: le16(b, 0).ok_or(Error::Truncated)?,
+            options: le16(b, 2).ok_or(Error::Truncated)?,
         })
     }
 
@@ -1194,7 +1186,7 @@ impl Wire for Cpf {
         if b.len() < 2 {
             return Err(Error::Truncated);
         }
-        let count = usize::from(le16(b, 0));
+        let count = usize::from(le16(b, 0).ok_or(Error::Truncated)?);
         if count > MAX_CPF_ITEMS {
             return Err(Error::TooLong);
         }
@@ -1204,8 +1196,8 @@ impl Wire for Cpf {
             if i + 4 > b.len() {
                 return Err(Error::Truncated);
             }
-            let type_id = le16(b, i);
-            let len = usize::from(le16(b, i + 2));
+            let type_id = le16(b, i).ok_or(Error::Truncated)?;
+            let len = usize::from(le16(b, i + 2).ok_or(Error::Truncated)?);
             let start = i + 4;
             let end = start.checked_add(len).ok_or(Error::TooLong)?;
             if end > b.len() {
@@ -1278,17 +1270,17 @@ impl Wire for Identity {
             return Err(Error::Trailing);
         }
         Ok(Identity {
-            protocol_version: le16(b, 0),
+            protocol_version: le16(b, 0).ok_or(Error::Truncated)?,
             socket_family: u16::from_be_bytes([b[2], b[3]]),
             socket_port: u16::from_be_bytes([b[4], b[5]]),
             socket_address: [b[6], b[7], b[8], b[9]],
             // b[10..18] are the socket address's zero bytes.
-            vendor_id: le16(b, 18),
-            device_type: le16(b, 20),
-            product_code: le16(b, 22),
+            vendor_id: le16(b, 18).ok_or(Error::Truncated)?,
+            device_type: le16(b, 20).ok_or(Error::Truncated)?,
+            product_code: le16(b, 22).ok_or(Error::Truncated)?,
             revision: [b[24], b[25]],
-            status: le16(b, 26),
-            serial_number: le32(b, 28),
+            status: le16(b, 26).ok_or(Error::Truncated)?,
+            serial_number: le32(b, 28).ok_or(Error::Truncated)?,
             product_name: b[name_start..name_start + name_len].to_vec(),
             state: b[end - 1],
         })
@@ -1343,8 +1335,8 @@ impl Wire for SendData {
             return Err(Error::Items);
         }
         Ok(SendData {
-            interface_handle: le32(b, 0),
-            timeout: le16(b, 4),
+            interface_handle: le32(b, 0).ok_or(Error::Truncated)?,
+            timeout: le16(b, 4).ok_or(Error::Truncated)?,
             cpf,
         })
     }
@@ -1455,7 +1447,7 @@ impl Wire for MessageResponse {
         if end > b.len() {
             return Err(Error::Truncated);
         }
-        let additional_status = (0..extra_words).map(|w| le16(b, 4 + 2 * w)).collect();
+        let additional_status = (0..extra_words).map(|w| le16(b, 4 + 2 * w).ok_or(Error::Truncated)).collect::<Result<_, _>>()?;
         Ok(MessageResponse {
             service,
             status,
@@ -1507,17 +1499,17 @@ impl Wire for ForwardOpenRequest {
         Ok(ForwardOpenRequest {
             priority_time_tick: b[0],
             timeout_ticks: b[1],
-            o_t_connection_id: le32(b, 2),
-            t_o_connection_id: le32(b, 6),
-            connection_serial: le16(b, 10),
-            vendor_id: le16(b, 12),
-            originator_serial: le32(b, 14),
+            o_t_connection_id: le32(b, 2).ok_or(Error::Truncated)?,
+            t_o_connection_id: le32(b, 6).ok_or(Error::Truncated)?,
+            connection_serial: le16(b, 10).ok_or(Error::Truncated)?,
+            vendor_id: le16(b, 12).ok_or(Error::Truncated)?,
+            originator_serial: le32(b, 14).ok_or(Error::Truncated)?,
             timeout_multiplier: b[18],
             // b[19..22] are three reserved bytes.
-            o_t_rpi: le32(b, 22),
-            o_t_params: le16(b, 26),
-            t_o_rpi: le32(b, 28),
-            t_o_params: le16(b, 32),
+            o_t_rpi: le32(b, 22).ok_or(Error::Truncated)?,
+            o_t_params: le16(b, 26).ok_or(Error::Truncated)?,
+            t_o_rpi: le32(b, 28).ok_or(Error::Truncated)?,
+            t_o_params: le16(b, 32).ok_or(Error::Truncated)?,
             transport_class_trigger: b[34],
             connection_path: parse_path(tail)?,
         })
@@ -1561,13 +1553,13 @@ impl Wire for ForwardOpenResponse {
     fn parse(b: &[u8]) -> Result<ForwardOpenResponse, Error> {
         let tail = word_tail(b, FORWARD_OPEN_REPLY_FIXED, 24)?;
         Ok(ForwardOpenResponse {
-            o_t_connection_id: le32(b, 0),
-            t_o_connection_id: le32(b, 4),
-            connection_serial: le16(b, 8),
-            vendor_id: le16(b, 10),
-            originator_serial: le32(b, 12),
-            o_t_api: le32(b, 16),
-            t_o_api: le32(b, 20),
+            o_t_connection_id: le32(b, 0).ok_or(Error::Truncated)?,
+            t_o_connection_id: le32(b, 4).ok_or(Error::Truncated)?,
+            connection_serial: le16(b, 8).ok_or(Error::Truncated)?,
+            vendor_id: le16(b, 10).ok_or(Error::Truncated)?,
+            originator_serial: le32(b, 12).ok_or(Error::Truncated)?,
+            o_t_api: le32(b, 16).ok_or(Error::Truncated)?,
+            t_o_api: le32(b, 20).ok_or(Error::Truncated)?,
             application_reply: tail.to_vec(),
         })
     }
@@ -1607,9 +1599,9 @@ impl Wire for ForwardCloseRequest {
         Ok(ForwardCloseRequest {
             priority_time_tick: b[0],
             timeout_ticks: b[1],
-            connection_serial: le16(b, 2),
-            vendor_id: le16(b, 4),
-            originator_serial: le32(b, 6),
+            connection_serial: le16(b, 2).ok_or(Error::Truncated)?,
+            vendor_id: le16(b, 4).ok_or(Error::Truncated)?,
+            originator_serial: le32(b, 6).ok_or(Error::Truncated)?,
             connection_path: parse_path(tail)?,
         })
     }
@@ -1644,9 +1636,9 @@ impl Wire for ForwardCloseResponse {
     fn parse(b: &[u8]) -> Result<ForwardCloseResponse, Error> {
         let tail = word_tail(b, FORWARD_CLOSE_REPLY_FIXED, 8)?;
         Ok(ForwardCloseResponse {
-            connection_serial: le16(b, 0),
-            vendor_id: le16(b, 2),
-            originator_serial: le32(b, 4),
+            connection_serial: le16(b, 0).ok_or(Error::Truncated)?,
+            vendor_id: le16(b, 2).ok_or(Error::Truncated)?,
+            originator_serial: le32(b, 4).ok_or(Error::Truncated)?,
             application_reply: tail.to_vec(),
         })
     }

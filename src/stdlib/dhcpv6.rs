@@ -69,6 +69,7 @@
 //! assert_eq!(lease.valid, 7200);
 //! ```
 
+use fictionet::stdlib::codec::be32;
 use core::convert::Infallible;
 use std::net::Ipv6Addr;
 
@@ -974,21 +975,21 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
         opt::IA_NA if nest => {
             at_least(12)?;
             let options = parse_options(&b[12..], depth + 1)?;
-            DhcpOption::IaNa(IaNa { iaid: be32(b, 0), t1: be32(b, 4), t2: be32(b, 8), options })
+            DhcpOption::IaNa(IaNa { iaid: be32(b, 0).ok_or(bad)?, t1: be32(b, 4).ok_or(bad)?, t2: be32(b, 8).ok_or(bad)?, options })
         }
         opt::IA_TA if nest => {
             at_least(4)?;
-            DhcpOption::IaTa(IaTa { iaid: be32(b, 0), options: parse_options(&b[4..], depth + 1)? })
+            DhcpOption::IaTa(IaTa { iaid: be32(b, 0).ok_or(bad)?, options: parse_options(&b[4..], depth + 1)? })
         }
         opt::IAADDR if nest => {
             at_least(24)?;
             let options = parse_options(&b[24..], depth + 1)?;
-            DhcpOption::IaAddr(IaAddr { address: addr(b, 0), preferred: be32(b, 16), valid: be32(b, 20), options })
+            DhcpOption::IaAddr(IaAddr { address: addr(b, 0), preferred: be32(b, 16).ok_or(bad)?, valid: be32(b, 20).ok_or(bad)?, options })
         }
         opt::IA_PD if nest => {
             at_least(12)?;
             let options = parse_options(&b[12..], depth + 1)?;
-            DhcpOption::IaPd(IaPd { iaid: be32(b, 0), t1: be32(b, 4), t2: be32(b, 8), options })
+            DhcpOption::IaPd(IaPd { iaid: be32(b, 0).ok_or(bad)?, t1: be32(b, 4).ok_or(bad)?, t2: be32(b, 8).ok_or(bad)?, options })
         }
         opt::IAPREFIX if nest => {
             at_least(25)?;
@@ -997,8 +998,8 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
             }
             let options = parse_options(&b[25..], depth + 1)?;
             DhcpOption::IaPrefix(IaPrefix {
-                preferred: be32(b, 0),
-                valid: be32(b, 4),
+                preferred: be32(b, 0).ok_or(bad)?,
+                valid: be32(b, 4).ok_or(bad)?,
                 prefix_len: b[8],
                 prefix: addr(b, 9),
                 options,
@@ -1056,7 +1057,7 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
         opt::VENDOR_CLASS => {
             // RFC 8415, section 21.16: one or more vendor classes.
             at_least(6)?;
-            DhcpOption::VendorClass { enterprise: be32(b, 0), classes: parse_counted(&b[4..]).ok_or(bad)? }
+            DhcpOption::VendorClass { enterprise: be32(b, 0).ok_or(bad)?, classes: parse_counted(&b[4..]).ok_or(bad)? }
         }
         opt::VENDOR_OPTS => {
             at_least(4)?;
@@ -1064,7 +1065,7 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
             if !options_in_form(&b[4..]) {
                 return Err(bad);
             }
-            DhcpOption::VendorOpts { enterprise: be32(b, 0), data: b[4..].to_vec() }
+            DhcpOption::VendorOpts { enterprise: be32(b, 0).ok_or(bad)?, data: b[4..].to_vec() }
         }
         opt::INTERFACE_ID => DhcpOption::InterfaceId(b.to_vec()),
         opt::RECONF_MSG => {
@@ -1088,7 +1089,7 @@ fn parse_option(code: u16, b: &[u8], depth: usize) -> Result<DhcpOption, Error> 
         },
         opt::INFORMATION_REFRESH_TIME | opt::SOL_MAX_RT | opt::INF_MAX_RT => {
             fixed(4)?;
-            let v = be32(b, 0);
+            let v = be32(b, 0).ok_or(bad)?;
             match code {
                 opt::INFORMATION_REFRESH_TIME => DhcpOption::InformationRefreshTime(v),
                 opt::SOL_MAX_RT => DhcpOption::SolMaxRt(v),
@@ -1345,10 +1346,6 @@ fn push_counted(out: &mut Vec<u8>, items: &[Vec<u8>], max: usize) -> Option<()> 
         push_fitting(out, item, max)?;
     }
     Some(())
-}
-
-fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
 }
 
 fn addr(b: &[u8], i: usize) -> Ipv6Addr {

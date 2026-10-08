@@ -76,7 +76,7 @@
 //! );
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated, Trailing};
+use fictionet::stdlib::codec::{be16, Decode, Step, Wire, Reader, Truncated, Trailing};
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -401,12 +401,12 @@ impl Bvlc {
     }
 }
 
-fn bip_address(b: &[u8]) -> SocketAddrV4 {
-    SocketAddrV4::new(Ipv4Addr::new(b[0], b[1], b[2], b[3]), be16(b, 4))
+fn bip_address(b: &[u8]) -> Result<SocketAddrV4, Error> {
+    Ok(SocketAddrV4::new(Ipv4Addr::new(b[0], b[1], b[2], b[3]), be16(b, 4).ok_or(Error::Truncated)?))
 }
 
-fn bdt_entry(e: &[u8]) -> BdtEntry {
-    BdtEntry { address: bip_address(e), mask: Ipv4Addr::new(e[6], e[7], e[8], e[9]) }
+fn bdt_entry(e: &[u8]) -> Result<BdtEntry, Error> {
+    Ok(BdtEntry { address: bip_address(e)?, mask: Ipv4Addr::new(e[6], e[7], e[8], e[9]) })
 }
 
 fn put_bip_address(out: &mut Vec<u8>, a: SocketAddrV4) {
@@ -1262,10 +1262,6 @@ fn int_bytes(v: i64) -> Vec<u8> {
     v.to_be_bytes()[8 - n..].to_vec()
 }
 
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
 impl Wire for Tag {
     type ParseError = Error;
     type WriteError = Error;
@@ -1358,7 +1354,7 @@ impl Wire for Bvlc {
             return Err(Error::NotBacnetIp(b[0]));
         }
         let code = b[1];
-        let length = be16(b, 2);
+        let length = be16(b, 2).ok_or(Error::Truncated)?;
         let n = usize::from(length);
         if !(BVLC_HEADER_LEN..=MAX_MESSAGE).contains(&n) || n != b.len() {
             return Err(Error::Length(length));
@@ -1371,23 +1367,23 @@ impl Wire for Bvlc {
         Ok(match code {
             function::RESULT => {
                 exact(2)?;
-                Bvlc::Result(be16(data, 0))
+                Bvlc::Result(be16(data, 0).ok_or(Error::Truncated)?)
             }
-            function::WRITE_BROADCAST_DISTRIBUTION_TABLE => Bvlc::WriteBdt(table(10)?.map(bdt_entry).collect()),
+            function::WRITE_BROADCAST_DISTRIBUTION_TABLE => Bvlc::WriteBdt(table(10)?.map(bdt_entry).collect::<Result<_, _>>()?),
             function::READ_BROADCAST_DISTRIBUTION_TABLE => {
                 exact(0)?;
                 Bvlc::ReadBdt
             }
-            function::READ_BROADCAST_DISTRIBUTION_TABLE_ACK => Bvlc::ReadBdtAck(table(10)?.map(bdt_entry).collect()),
+            function::READ_BROADCAST_DISTRIBUTION_TABLE_ACK => Bvlc::ReadBdtAck(table(10)?.map(bdt_entry).collect::<Result<_, _>>()?),
             function::FORWARDED_NPDU => {
                 if data.len() < 6 {
                     return Err(Error::FunctionData(code));
                 }
-                Bvlc::ForwardedNpdu { origin: bip_address(data), npdu: data[6..].to_vec() }
+                Bvlc::ForwardedNpdu { origin: bip_address(data)?, npdu: data[6..].to_vec() }
             }
             function::REGISTER_FOREIGN_DEVICE => {
                 exact(2)?;
-                Bvlc::RegisterForeignDevice { ttl: be16(data, 0) }
+                Bvlc::RegisterForeignDevice { ttl: be16(data, 0).ok_or(Error::Truncated)? }
             }
             function::READ_FOREIGN_DEVICE_TABLE => {
                 exact(0)?;
@@ -1395,12 +1391,12 @@ impl Wire for Bvlc {
             }
             function::READ_FOREIGN_DEVICE_TABLE_ACK => Bvlc::ReadFdtAck(
                 table(10)?
-                    .map(|e| FdtEntry { address: bip_address(e), ttl: be16(e, 6), remaining: be16(e, 8) })
-                    .collect(),
+                    .map(|e| Ok(FdtEntry { address: bip_address(e)?, ttl: be16(e, 6).ok_or(Error::Truncated)?, remaining: be16(e, 8).ok_or(Error::Truncated)? }))
+                    .collect::<Result<_, Error>>()?,
             ),
             function::DELETE_FOREIGN_DEVICE_TABLE_ENTRY => {
                 exact(6)?;
-                Bvlc::DeleteFdtEntry(bip_address(data))
+                Bvlc::DeleteFdtEntry(bip_address(data)?)
             }
             function::DISTRIBUTE_BROADCAST_TO_NETWORK => Bvlc::DistributeBroadcastToNetwork(data.to_vec()),
             function::ORIGINAL_UNICAST_NPDU => Bvlc::OriginalUnicastNpdu(data.to_vec()),

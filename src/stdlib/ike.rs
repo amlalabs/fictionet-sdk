@@ -81,7 +81,7 @@
 //! assert_eq!(back.notify(notify::INVALID_KE_PAYLOAD).unwrap().data, [0, 19]);
 //! ```
 
-use fictionet::stdlib::codec::{Reader, Truncated};
+use fictionet::stdlib::codec::{be16, Reader, Truncated};
 
 use fictionet::stdlib::codec::Wire;
 
@@ -765,7 +765,7 @@ pub fn parse_payloads(first: u8, b: &[u8]) -> Result<Vec<Payload>, Error> {
         }
         let next = rest[0];
         let critical = rest[1] & 0x80 != 0;
-        let len = usize::from(be16(rest, 2));
+        let len = usize::from(be16(rest, 2).ok_or(Error::PayloadLength(kind))?);
         if len < PAYLOAD_HEADER_LEN || len > rest.len() {
             return Err(Error::PayloadLength(kind));
         }
@@ -819,7 +819,7 @@ fn parse_body(kind: u8, next: u8, b: &[u8]) -> Result<Body, Error> {
         payload::SA => Body::SecurityAssociation(parse_sa(b)?),
         payload::KE => {
             let rest = b.get(4..).ok_or_else(short)?;
-            Body::KeyExchange(KeyExchange { group: be16(b, 0), data: rest.to_vec() })
+            Body::KeyExchange(KeyExchange { group: be16(b, 0).ok_or(short())?, data: rest.to_vec() })
         }
         payload::IDI | payload::IDR => {
             let rest = b.get(4..).ok_or_else(short)?;
@@ -836,7 +836,7 @@ fn parse_body(kind: u8, next: u8, b: &[u8]) -> Result<Body, Error> {
             Body::Notify(Notify {
                 protocol: b[0],
                 spi: spi.to_vec(),
-                kind: be16(b, 2),
+                kind: be16(b, 2).ok_or(short())?,
                 data: b[4 + spi_size..].to_vec(),
             })
         }
@@ -844,7 +844,7 @@ fn parse_body(kind: u8, next: u8, b: &[u8]) -> Result<Body, Error> {
             if b.len() < 4 {
                 return Err(short());
             }
-            let (spi_size, count) = (usize::from(b[1]), usize::from(be16(b, 2)));
+            let (spi_size, count) = (usize::from(b[1]), usize::from(be16(b, 2).ok_or(short())?));
             if count > MAX_DELETE_SPIS {
                 return Err(Error::Limit("SPIs to delete"));
             }
@@ -867,7 +867,7 @@ fn parse_body(kind: u8, next: u8, b: &[u8]) -> Result<Body, Error> {
         payload::SKF => {
             let rest = b.get(4..).ok_or_else(short)?;
             let f =
-                EncryptedFragment { first_payload: next, number: be16(b, 0), total: be16(b, 2), data: rest.to_vec() };
+                EncryptedFragment { first_payload: next, number: be16(b, 0).ok_or(short())?, total: be16(b, 2).ok_or(short())?, data: rest.to_vec() };
             if !f.is_valid() {
                 return Err(bad(kind, "fragment number, total or next payload breaks RFC 7383"));
             }
@@ -895,7 +895,7 @@ fn parse_sa(b: &[u8]) -> Result<Vec<Proposal>, Error> {
         if rest.len() < 8 {
             return Err(bad(k, "proposal header cut short"));
         }
-        let len = usize::from(be16(rest, 2));
+        let len = usize::from(be16(rest, 2).ok_or(bad(k, "proposal header cut short"))?);
         if len < 8 || len > rest.len() {
             return Err(bad(k, "proposal length out of range"));
         }
@@ -927,7 +927,7 @@ fn parse_transforms(b: &[u8], count: usize) -> Result<Vec<Transform>, Error> {
         if rest.len() < 8 {
             return Err(bad(k, "transform header cut short"));
         }
-        let len = usize::from(be16(rest, 2));
+        let len = usize::from(be16(rest, 2).ok_or(bad(k, "transform header cut short"))?);
         if len < 8 || len > rest.len() {
             return Err(bad(k, "transform length out of range"));
         }
@@ -936,7 +936,7 @@ fn parse_transforms(b: &[u8], count: usize) -> Result<Vec<Transform>, Error> {
         if !last_flag(rest[0], pos == b.len(), 3) {
             return Err(bad(k, "transform's last-substructure byte is wrong"));
         }
-        out.push(Transform { kind: rest[4], id: be16(rest, 6), attributes });
+        out.push(Transform { kind: rest[4], id: be16(rest, 6).ok_or(bad(k, "transform header cut short"))?, attributes });
     }
     if out.len() != count {
         return Err(bad(k, "fewer transforms than the proposal counts"));
@@ -956,13 +956,13 @@ fn parse_attributes(b: &[u8]) -> Result<Vec<Attribute>, Error> {
         if rest.len() < 4 {
             return Err(bad(k, "attribute cut short"));
         }
-        let t = be16(rest, 0);
+        let t = be16(rest, 0).ok_or(bad(k, "attribute cut short"))?;
         let kind = t & 0x7fff;
         if t & 0x8000 != 0 {
-            out.push(Attribute { kind, value: AttributeValue::Short(be16(rest, 2)) });
+            out.push(Attribute { kind, value: AttributeValue::Short(be16(rest, 2).ok_or(bad(k, "attribute cut short"))?) });
             pos += 4;
         } else {
-            let len = usize::from(be16(rest, 2));
+            let len = usize::from(be16(rest, 2).ok_or(bad(k, "attribute cut short"))?);
             let v = rest.get(4..4 + len).ok_or(bad(k, "attribute value cut short"))?;
             out.push(Attribute { kind, value: AttributeValue::Long(v.to_vec()) });
             pos += 4 + len;
@@ -989,7 +989,7 @@ fn parse_selectors(k: u8, b: &[u8]) -> Result<Vec<TrafficSelector>, Error> {
         if rest.len() < 4 {
             return Err(bad(k, "selector header cut short"));
         }
-        let (kind, protocol, len) = (rest[0], rest[1], usize::from(be16(rest, 2)));
+        let (kind, protocol, len) = (rest[0], rest[1], usize::from(be16(rest, 2).ok_or(bad(k, "selector header cut short"))?));
         if len < 4 || len > rest.len() {
             return Err(bad(k, "selector length out of range"));
         }
@@ -1000,7 +1000,7 @@ fn parse_selectors(k: u8, b: &[u8]) -> Result<Vec<TrafficSelector>, Error> {
                 if len != 8 + 2 * n {
                     return Err(bad(k, "address range selector has the wrong length"));
                 }
-                let (start_port, end_port) = (be16(s, 4), be16(s, 6));
+                let (start_port, end_port) = (be16(s, 4).ok_or(bad(k, "selector header cut short"))?, be16(s, 6).ok_or(bad(k, "selector header cut short"))?);
                 if n == 4 {
                     let a = |i: usize| Ipv4Addr::new(s[i], s[i + 1], s[i + 2], s[i + 3]);
                     TrafficSelector::Ipv4 { protocol, start_port, end_port, start: a(8), end: a(12) }
@@ -1259,11 +1259,6 @@ fn write_selectors(sel: &[TrafficSelector], room: usize, out: &mut Vec<u8>) -> O
     }
     out[0] = n;
     Some(())
-}
-
-/// The big-endian u16 at `i`. Callers check that `b` holds it.
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
 }
 
 impl Wire for Header {

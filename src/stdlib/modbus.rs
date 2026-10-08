@@ -62,7 +62,7 @@
 //! assert_eq!(reply.to_bytes().unwrap(), [0, 7, 0, 0, 0, 5, 1, 3, 2, 0x04, 0xd2]);
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{be16, Decode, Step, Wire};
 
 /// The TCP port Modbus/TCP servers listen on.
 pub const PORT: u16 = 502;
@@ -175,18 +175,18 @@ impl Frame {
         if b.len() < HEADER_LEN {
             // A bad protocol identifier is known before the rest comes.
             if b.len() >= 4 {
-                let protocol = be16(b, 2);
+                let protocol = be16(b, 2).ok_or(Error::Truncated)?;
                 if protocol != 0 {
                     return Err(Error::Protocol(protocol));
                 }
             }
             return Ok(None);
         }
-        let protocol = be16(b, 2);
+        let protocol = be16(b, 2).ok_or(Error::Truncated)?;
         if protocol != 0 {
             return Err(Error::Protocol(protocol));
         }
-        let length = be16(b, 4);
+        let length = be16(b, 4).ok_or(Error::Truncated)?;
         if length < 2 || usize::from(length) > MAX_PDU + 1 {
             return Err(Error::Length(length));
         }
@@ -195,7 +195,7 @@ impl Frame {
             return Ok(None);
         }
         let frame = Frame {
-            transaction: be16(b, 0),
+            transaction: be16(b, 0).ok_or(Error::Truncated)?,
             unit: b[6],
             pdu: b[HEADER_LEN..end].to_vec(),
         };
@@ -440,7 +440,7 @@ impl Request {
         };
         let read = |max: u16| -> Result<(u16, u16), Exception> {
             fixed(4)?;
-            let (address, quantity) = (be16(data, 0), be16(data, 2));
+            let (address, quantity) = (be16(data, 0).ok_or(Exception::IllegalDataValue)?, be16(data, 2).ok_or(Exception::IllegalDataValue)?);
             if quantity == 0 || quantity > max {
                 return Err(Exception::IllegalDataValue);
             }
@@ -466,21 +466,21 @@ impl Request {
             }
             function::WRITE_SINGLE_COIL => {
                 fixed(4)?;
-                let value = match be16(data, 2) {
+                let value = match be16(data, 2).ok_or(Exception::IllegalDataValue)? {
                     0xff00 => true,
                     0x0000 => false,
                     _ => return Err(Exception::IllegalDataValue),
                 };
                 Request::WriteSingleCoil {
-                    address: be16(data, 0),
+                    address: be16(data, 0).ok_or(Exception::IllegalDataValue)?,
                     value,
                 }
             }
             function::WRITE_SINGLE_REGISTER => {
                 fixed(4)?;
                 Request::WriteSingleRegister {
-                    address: be16(data, 0),
-                    value: be16(data, 2),
+                    address: be16(data, 0).ok_or(Exception::IllegalDataValue)?,
+                    value: be16(data, 2).ok_or(Exception::IllegalDataValue)?,
                 }
             }
             function::WRITE_MULTIPLE_COILS => {
@@ -495,8 +495,8 @@ impl Request {
                 let (address, quantity, bytes) =
                     multiple(data, MAX_WRITE_REGISTERS, |q| 2 * usize::from(q))?;
                 let values = (0..usize::from(quantity))
-                    .map(|i| be16(bytes, 2 * i))
-                    .collect();
+                    .map(|i| be16(bytes, 2 * i).ok_or(Exception::IllegalDataValue))
+                    .collect::<Result<_, _>>()?;
                 Request::WriteMultipleRegisters { address, values }
             }
             _ => Request::Other {
@@ -631,7 +631,7 @@ impl Response {
         };
         let pair = || {
             if data.len() == 4 {
-                Ok((be16(data, 0), be16(data, 2)))
+                Ok((be16(data, 0).ok_or(Error::Truncated)?, be16(data, 2).ok_or(Error::Truncated)?))
             } else {
                 Err(Error::BadResponse)
             }
@@ -812,7 +812,7 @@ fn multiple(
     if data.len() < 5 {
         return Err(Exception::IllegalDataValue);
     }
-    let (address, quantity, count) = (be16(data, 0), be16(data, 2), usize::from(data[4]));
+    let (address, quantity, count) = (be16(data, 0).ok_or(Exception::IllegalDataValue)?, be16(data, 2).ok_or(Exception::IllegalDataValue)?, usize::from(data[4]));
     if quantity == 0 || quantity > max || count != need(quantity) || data.len() != 5 + count {
         return Err(Exception::IllegalDataValue);
     }
@@ -839,10 +839,6 @@ fn pack_bits(bits: &[bool]) -> Vec<u8> {
         }
     }
     out
-}
-
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
 }
 
 #[cfg(test)]

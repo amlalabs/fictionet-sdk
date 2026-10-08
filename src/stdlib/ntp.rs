@@ -41,7 +41,7 @@
 //! assert_eq!(answer.origin, request.transmit);
 //! ```
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{be32, Wire};
 
 /// The UDP port NTP servers listen on.
 pub const PORT: u16 = 123;
@@ -231,8 +231,8 @@ impl Timestamp {
         Timestamp { seconds: (bits >> 32) as u32, fraction: bits as u32 }
     }
 
-    fn read(b: &[u8], i: usize) -> Timestamp {
-        Timestamp { seconds: be32(b, i), fraction: be32(b, i + 4) }
+    fn read(b: &[u8], i: usize) -> Result<Timestamp, Error> {
+        Ok(Timestamp { seconds: be32(b, i).ok_or(Error::Short(b.len()))?, fraction: be32(b, i + 4).ok_or(Error::Short(b.len()))? })
     }
 }
 
@@ -592,10 +592,6 @@ pub fn kiss_reply(request: &Packet, code: KissCode) -> Result<Packet, Error> {
     })
 }
 
-fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
-}
-
 impl Wire for Packet {
     type ParseError = Error;
     type WriteError = Error;
@@ -625,13 +621,13 @@ impl Wire for Packet {
             stratum: b[1],
             poll: b[2] as i8,
             precision: b[3] as i8,
-            root_delay: be32(b, 4),
-            root_dispersion: be32(b, 8),
+            root_delay: be32(b, 4).ok_or(Error::Short(b.len()))?,
+            root_dispersion: be32(b, 8).ok_or(Error::Short(b.len()))?,
             reference_id: [b[12], b[13], b[14], b[15]],
-            reference: Timestamp::read(b, 16),
-            origin: Timestamp::read(b, 24),
-            receive: Timestamp::read(b, 32),
-            transmit: Timestamp::read(b, 40),
+            reference: Timestamp::read(b, 16)?,
+            origin: Timestamp::read(b, 24)?,
+            receive: Timestamp::read(b, 32)?,
+            transmit: Timestamp::read(b, 40)?,
             trailer: trailer.to_vec(),
         })
     }
@@ -692,7 +688,7 @@ impl Wire for Timestamp {
         if b.len() != 8 {
             return Err(Error::FieldLength { want: 8, got: b.len() });
         }
-        Ok(Self::read(b, 0))
+        Self::read(b, 0)
     }
 
     /// Appends seconds and fraction in network order. Refuses no values.

@@ -93,7 +93,7 @@
 //! assert_eq!(reply.len(), 16 + 8 + 2 + 4 + 2 + 4 + 24);
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated};
+use fictionet::stdlib::codec::{be16, be32, le16, le32, Decode, Step, Wire, Reader, Truncated};
 
 /// The TCP port of the endpoint mapper.
 pub const PORT: u16 = 135;
@@ -818,7 +818,7 @@ impl Pdu {
         if b.len() < 10 {
             return Ok(None);
         }
-        let n = rd16(le, b, 8);
+        let Some(n) = (if le { le16(b, 8) } else { be16(b, 8) }) else { return Ok(None); };
         if usize::from(n) < HEADER_LEN {
             return Err(Error::FragLength(n));
         }
@@ -1126,8 +1126,8 @@ fn parse_fragment(f: &[u8]) -> Result<Pdu, Error> {
     let drep = DataRep([f[4], f[5], f[6], f[7]]);
     let le = drep.little_endian().ok_or(Error::IntegerRep(f[4] >> 4))?;
     let (version_minor, kind, pdu_flags) = (f[1], f[2], f[3]);
-    let auth_len = rd16(le, f, 10);
-    let call_id = rd32(le, f, 12);
+    let auth_len = (if le { le16(f, 10) } else { be16(f, 10) }).ok_or(Error::Truncated)?;
+    let call_id = (if le { le32(f, 12) } else { be32(f, 12) }).ok_or(Error::Truncated)?;
     if !matches!(kind, 0 | 2 | 3 | 11..=19) {
         return Err(Error::Type(kind));
     }
@@ -1149,7 +1149,7 @@ fn parse_fragment(f: &[u8]) -> Result<Pdu, Error> {
         auth = Some(Auth {
             kind: f[t],
             level: f[t + 1],
-            context_id: rd32(le, f, t + 4),
+            context_id: (if le { le32(f, t + 4) } else { be32(f, t + 4) }).ok_or(Error::Truncated)?,
             value: f[t + SEC_TRAILER_LEN..].to_vec(),
         });
     }
@@ -1341,16 +1341,6 @@ impl W {
 /// The auth type, level and context ID of a PDU's verifier, if it has one.
 fn security(p: &Pdu) -> Option<(u8, u8, u32)> {
     p.auth.as_ref().map(|a| (a.kind, a.level, a.context_id))
-}
-
-fn rd16(le: bool, b: &[u8], i: usize) -> u16 {
-    let v = [b[i], b[i + 1]];
-    if le { u16::from_le_bytes(v) } else { u16::from_be_bytes(v) }
-}
-
-fn rd32(le: bool, b: &[u8], i: usize) -> u32 {
-    let v = [b[i], b[i + 1], b[i + 2], b[i + 3]];
-    if le { u32::from_le_bytes(v) } else { u32::from_be_bytes(v) }
 }
 
 /// Joins the fragments of requests and responses into whole calls. Push

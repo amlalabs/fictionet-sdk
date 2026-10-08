@@ -65,7 +65,7 @@
 //! assert_eq!(transfer.current(), None);
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{be16, Decode, Step, Wire};
 
 /// The UDP port TFTP servers listen on for requests. The transfer itself
 /// runs from a port of the server's choosing.
@@ -816,10 +816,6 @@ fn put_options(out: &mut Vec<u8>, options: &[TftpOption], limit: usize) -> Resul
     Ok(())
 }
 
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
 impl Wire for Packet {
     type ParseError = Error;
     type WriteError = Error;
@@ -833,7 +829,7 @@ impl Wire for Packet {
         if b.len() < 2 {
             return Err(Error::Short);
         }
-        let op = be16(b, 0);
+        let op = be16(b, 0).ok_or(Error::Short)?;
         match op {
             opcode::RRQ | opcode::WRQ => {
                 if b.len() > MAX_REQUEST {
@@ -850,11 +846,11 @@ impl Wire for Packet {
                 if b.len() < 4 {
                     return Err(Error::Short);
                 }
-                Ok(Packet::Data { block: be16(b, 2), data: b[4..].to_vec() })
+                Ok(Packet::Data { block: be16(b, 2).ok_or(Error::Short)?, data: b[4..].to_vec() })
             }
             opcode::ACK => match b.len() {
                 0..4 => Err(Error::Short),
-                4 => Ok(Packet::Ack { block: be16(b, 2) }),
+                4 => Ok(Packet::Ack { block: be16(b, 2).ok_or(Error::Short)? }),
                 _ => Err(Error::TrailingBytes),
             },
             opcode::ERROR => {
@@ -866,7 +862,7 @@ impl Wire for Packet {
                 if pos != b.len() {
                     return Err(Error::TrailingBytes);
                 }
-                Ok(Packet::Error { code: ErrorCode::from_code(be16(b, 2)), message })
+                Ok(Packet::Error { code: ErrorCode::from_code(be16(b, 2).ok_or(Error::Short)?), message })
             }
             opcode::OACK => Ok(Packet::OptionAck { options: take_options(b, 2)? }),
             other => Err(Error::UnknownOpcode(other)),

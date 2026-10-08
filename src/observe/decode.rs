@@ -11,6 +11,7 @@ use std::fmt::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use super::json;
+use fictionet::stdlib::codec::{be16, be32};
 use fictionet::stdlib::tcp_reassembly::{FlowKey, Reassembler, Segment, Chunk, conversation_key};
 use crate::watch::KeyLine;
 
@@ -242,15 +243,6 @@ impl std::fmt::Debug for Dissector {
     }
 }
 
-/// The two big-endian bytes at `i`.
-pub(crate) fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
-pub(crate) fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
-}
-
 fn ip_proto_name(p: u8) -> &'static str {
     match p {
         1 => "ICMP",
@@ -294,7 +286,8 @@ impl Dissector {
             return truncated(d, "IPv4", p.len());
         }
         let ihl = usize::from(p[0] & 0x0f) * 4;
-        let total = usize::from(be16(p, 2));
+        let Some(total_length) = be16(p, 2) else { return truncated(d, "IPv4", p.len()); };
+        let total = usize::from(total_length);
         if ihl < 20 || p.len() < ihl {
             return truncated(d, "IPv4", p.len());
         }
@@ -303,14 +296,16 @@ impl Dissector {
         let dst = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
         let proto = p[9];
         let flags = p[6] >> 5;
-        let offset = (usize::from(be16(p, 6)) & 0x1fff) * 8;
+        let Some(fragment) = be16(p, 6) else { return truncated(d, "IPv4", p.len()); };
+        let offset = (usize::from(fragment) & 0x1fff) * 8;
         let mut l = Layer::new("Internet Protocol Version 4", 0, (0, ihl));
         l.summary = format!("Src: {src}, Dst: {dst}");
         l.field("Version", "4", (0, 1));
         l.field("Header length", format!("{ihl} bytes"), (0, 1));
         l.field("Differentiated services", format!("0x{:02x}", p[1]), (1, 2));
         l.field("Total length", total.to_string(), (2, 4));
-        l.field("Identification", format!("0x{:04x} ({})", be16(p, 4), be16(p, 4)), (4, 6));
+        let Some(identification) = be16(p, 4) else { return truncated(d, "IPv4", p.len()); };
+        l.field("Identification", format!("0x{:04x} ({})", identification, identification), (4, 6));
         let mut fl = Vec::new();
         if flags & 2 != 0 {
             fl.push("Don't fragment");
@@ -322,7 +317,8 @@ impl Dissector {
         l.field("Fragment offset", offset.to_string(), (6, 8));
         l.field("Time to live", p[8].to_string(), (8, 9));
         l.field("Protocol", format!("{} ({proto})", ip_proto_name(proto)), (9, 10));
-        l.field("Header checksum", format!("0x{:04x}", be16(p, 10)), (10, 12));
+        let Some(checksum) = be16(p, 10) else { return truncated(d, "IPv4", p.len()); };
+        l.field("Header checksum", format!("0x{:04x}", checksum), (10, 12));
         l.field("Source address", src.to_string(), (12, 16));
         l.field("Destination address", dst.to_string(), (16, 20));
         d.push(l);
@@ -345,13 +341,16 @@ impl Dissector {
         }
         let src = Ipv6Addr::from(<[u8; 16]>::try_from(&p[8..24]).unwrap());
         let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&p[24..40]).unwrap());
-        let payload = usize::from(be16(p, 4));
+        let Some(payload_length) = be16(p, 4) else { return truncated(d, "IPv6", p.len()); };
+        let payload = usize::from(payload_length);
         let end = (40 + payload).min(p.len());
         let mut l = Layer::new("Internet Protocol Version 6", 0, (0, 40));
         l.summary = format!("Src: {src}, Dst: {dst}");
         l.field("Version", "6", (0, 1));
-        l.field("Traffic class", format!("0x{:02x}", (be16(p, 0) >> 4) as u8), (0, 2));
-        l.field("Flow label", format!("0x{:05x}", be32(p, 0) & 0xfffff), (1, 4));
+        let Some(version_class) = be16(p, 0) else { return truncated(d, "IPv6", p.len()); };
+        l.field("Traffic class", format!("0x{:02x}", (version_class >> 4) as u8), (0, 2));
+        let Some(version_flow) = be32(p, 0) else { return truncated(d, "IPv6", p.len()); };
+        l.field("Flow label", format!("0x{:05x}", version_flow & 0xfffff), (1, 4));
         l.field("Payload length", payload.to_string(), (4, 6));
         l.field("Next header", format!("{} ({})", ip_proto_name(p[6]), p[6]), (6, 7));
         l.field("Hop limit", p[7].to_string(), (7, 8));
@@ -364,7 +363,8 @@ impl Dissector {
         let (mut next, mut at) = (p[6], 40);
         while matches!(next, 0 | 43 | 44 | 60) && at + 8 <= end {
             if next == 44 {
-                let offset = usize::from(be16(p, at + 2) & 0xfff8);
+                let Some(fragment) = be16(p, at + 2) else { return truncated(d, "IPv6", p.len()); };
+                let offset = usize::from(fragment & 0xfff8);
                 l.field("Fragment header", format!("offset {offset}, more: {}", p[at + 3] & 1 == 1), (at, at + 8));
                 if offset != 0 || p[at + 3] & 1 == 1 {
                     d.proto = "IPv6".into();
@@ -416,8 +416,13 @@ impl Dissector {
         if off < 20 || off > t.len() {
             return truncated(d, "TCP", t.len());
         }
-        let (sport, dport) = (be16(t, 0), be16(t, 2));
-        let (seq, ack, flags, win) = (be32(t, 4), be32(t, 8), t[13], be16(t, 14));
+        let Some(source_port) = be16(t, 0) else { return truncated(d, "TCP", t.len()); };
+        let Some(destination_port) = be16(t, 2) else { return truncated(d, "TCP", t.len()); };
+        let (sport, dport) = (source_port, destination_port);
+        let Some(sequence) = be32(t, 4) else { return truncated(d, "TCP", t.len()); };
+        let Some(acknowledgment) = be32(t, 8) else { return truncated(d, "TCP", t.len()); };
+        let Some(window) = be16(t, 14) else { return truncated(d, "TCP", t.len()); };
+        let (seq, ack, flags, win) = (sequence, acknowledgment, t[13], window);
         let payload = (at + off, end);
         let key = (src, sport, dst, dport);
         let flow = self.tcp.push(Segment {
@@ -450,8 +455,10 @@ impl Dissector {
         l.field("Header length", format!("{off} bytes"), r(12, 13));
         l.field("Flags", format!("0x{flags:03x} ({})", names.join(", ")), r(12, 14));
         l.field("Window", win.to_string(), r(14, 16));
-        l.field("Checksum", format!("0x{:04x}", be16(t, 16)), r(16, 18));
-        l.field("Urgent pointer", be16(t, 18).to_string(), r(18, 20));
+        let Some(checksum) = be16(t, 16) else { return truncated(d, "TCP", t.len()); };
+        l.field("Checksum", format!("0x{:04x}", checksum), r(16, 18));
+        let Some(urgent) = be16(t, 18) else { return truncated(d, "TCP", t.len()); };
+        l.field("Urgent pointer", urgent.to_string(), r(18, 20));
         let opts = tcp_options(&t[20..off]);
         if !opts.is_empty() {
             l.field("Options", opts.join(", "), r(20, off));
@@ -538,11 +545,17 @@ fn tcp_options(o: &[u8]) -> Vec<String> {
                 }
                 let v = &o[i + 2..i + len];
                 out.push(match (kind, v.len()) {
-                    (2, 2) => format!("MSS={}", be16(v, 0)),
+                    (2, 2) => {
+                        let Some(mss) = be16(v, 0) else { break; };
+                        format!("MSS={mss}")
+                    },
                     (3, 1) => format!("WS={}", 1u32 << v[0].min(14)),
                     (4, 0) => "SACK_PERM".to_owned(),
                     (5, _) => format!("SACK({} blocks)", v.len() / 8),
-                    (8, 8) => format!("TSval={} TSecr={}", be32(v, 0), be32(v, 4)),
+                    (8, 8) => {
+                        let (Some(value), Some(echo)) = (be32(v, 0), be32(v, 4)) else { break; };
+                        format!("TSval={value} TSecr={echo}")
+                    },
                     _ => format!("option {kind}"),
                 });
                 i += len;
@@ -557,7 +570,10 @@ fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, registry: &super::Regis
     if u.len() < 8 {
         return truncated(d, "UDP", u.len());
     }
-    let (sport, dport, len) = (be16(u, 0), be16(u, 2), be16(u, 4));
+    let Some(source_port) = be16(u, 0) else { return truncated(d, "UDP", u.len()); };
+    let Some(destination_port) = be16(u, 2) else { return truncated(d, "UDP", u.len()); };
+    let Some(length) = be16(u, 4) else { return truncated(d, "UDP", u.len()); };
+    let (sport, dport, len) = (source_port, destination_port, length);
     // The datagram is as long as its header says, if the packet holds that
     // much: bytes after it are not part of it.
     let ulen = usize::from(len);
@@ -569,7 +585,8 @@ fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, registry: &super::Regis
     l.field("Source port", sport.to_string(), (at, at + 2));
     l.field("Destination port", dport.to_string(), (at + 2, at + 4));
     l.field("Length", len.to_string(), (at + 4, at + 6));
-    l.field("Checksum", format!("0x{:04x}", be16(u, 6)), (at + 6, at + 8));
+    let Some(checksum) = be16(u, 6) else { return truncated(d, "UDP", u.len()); };
+    l.field("Checksum", format!("0x{:04x}", checksum), (at + 6, at + 8));
     d.push(l);
     d.src = sock(&d.src, sport);
     d.dst = sock(&d.dst, dport);
@@ -606,11 +623,14 @@ fn icmp(p: &[u8], at: usize, end: usize, d: &mut Decoded, v6: bool) {
     l.summary = what.clone();
     l.field("Type", format!("{kind} ({what})"), (at, at + 1));
     l.field("Code", code.to_string(), (at + 1, at + 2));
-    l.field("Checksum", format!("0x{:04x}", be16(c, 2)), (at + 2, at + 4));
+    let Some(checksum) = be16(c, 2) else { return truncated(d, name, c.len()); };
+    l.field("Checksum", format!("0x{:04x}", checksum), (at + 2, at + 4));
     let mut info = what;
     let echo = if v6 { matches!(kind, 128 | 129) } else { matches!(kind, 0 | 8) };
     if echo && c.len() >= 8 {
-        let (id, seq) = (be16(c, 4), be16(c, 6));
+        let Some(identifier) = be16(c, 4) else { return truncated(d, name, c.len()); };
+        let Some(sequence) = be16(c, 6) else { return truncated(d, name, c.len()); };
+        let (id, seq) = (identifier, sequence);
         l.field("Identifier", format!("0x{id:04x}"), (at + 4, at + 6));
         l.field("Sequence number", seq.to_string(), (at + 6, at + 8));
         l.note("Data", format!("{} bytes", c.len() - 8));
@@ -645,7 +665,9 @@ fn quoted_summary(q: &[u8]) -> String {
         _ => return "a packet".into(),
     };
     if matches!(proto, 6 | 17) && q.len() >= at + 4 {
-        format!("{} → {} {}", sock(&src.to_string(), be16(q, at)), sock(&dst.to_string(), be16(q, at + 2)), ip_proto_name(proto))
+        let Some(source_port) = be16(q, at) else { return format!("{src} → {dst} {}", ip_proto_name(proto)); };
+        let Some(destination_port) = be16(q, at + 2) else { return format!("{src} → {dst} {}", ip_proto_name(proto)); };
+        format!("{} → {} {}", sock(&src.to_string(), source_port), sock(&dst.to_string(), destination_port), ip_proto_name(proto))
     } else {
         format!("{src} → {dst} {}", ip_proto_name(proto))
     }

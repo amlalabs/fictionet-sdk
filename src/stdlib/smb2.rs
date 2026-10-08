@@ -69,7 +69,7 @@
 //! assert_eq!(out[..8], [0, 0, 0, 129, 0xfe, b'S', b'M', b'B']);
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{le16, le32, le64, Decode, Step, Wire};
 
 /// The TCP port SMB servers listen on for direct TCP.
 pub const PORT: u16 = 445;
@@ -684,16 +684,16 @@ impl Wire for Transform {
         if b.len() <= TRANSFORM_HEADER_LEN {
             return Err(Error::Truncated);
         }
-        let flags = le16(b, 42)?;
+        let flags = le16(b, 42).ok_or(Error::Truncated)?;
         if flags != 1 {
             return Err(Error::TransformFlags(flags));
         }
         Ok(Transform {
             signature: arr(b, 4)?,
             nonce: arr(b, 20)?,
-            original_size: le32(b, 36)?,
+            original_size: le32(b, 36).ok_or(Error::Truncated)?,
             flags,
-            session_id: le64(b, 44)?,
+            session_id: le64(b, 44).ok_or(Error::Truncated)?,
             data: b[TRANSFORM_HEADER_LEN..].to_vec(),
         })
     }
@@ -787,17 +787,17 @@ impl Wire for Compressed {
         if b.len() > MAX_MESSAGE {
             return Err(Error::TooLong);
         }
-        let original_size = le32(b, 4)?;
-        let flags = le16(b, 10)?;
+        let original_size = le32(b, 4).ok_or(Error::Truncated)?;
+        let flags = le16(b, 10).ok_or(Error::Truncated)?;
         if flags == 0 {
             if b.len() < COMPRESSION_HEADER_LEN {
                 return Err(Error::Truncated);
             }
-            let algorithm = le16(b, 8)?;
+            let algorithm = le16(b, 8).ok_or(Error::Truncated)?;
             if algorithm == 0 {
                 return Err(Error::CompressionAlgorithm);
             }
-            let offset = le32(b, 12)?;
+            let offset = le32(b, 12).ok_or(Error::Truncated)?;
             let data = b[COMPRESSION_HEADER_LEN..].to_vec();
             if offset as usize > data.len() {
                 return Err(Error::Buffer);
@@ -810,12 +810,12 @@ impl Wire for Compressed {
         let mut payloads = Vec::new();
         let mut at = 8;
         while at < b.len() {
-            let algorithm = le16(b, at)?;
-            let flags = le16(b, at + 2)?;
+            let algorithm = le16(b, at).ok_or(Error::Truncated)?;
+            let flags = le16(b, at + 2).ok_or(Error::Truncated)?;
             if at > 8 && flags != 0 {
                 return Err(Error::CompressionFlags(flags));
             }
-            let len = le32(b, at + 4)? as usize;
+            let len = le32(b, at + 4).ok_or(Error::Truncated)? as usize;
             let start = at + 8;
             let end = start.checked_add(len).ok_or(Error::Buffer)?;
             let data = b.get(start..end).ok_or(Error::Buffer)?.to_vec();
@@ -965,28 +965,28 @@ impl Header {
         if b.len() < HEADER_LEN {
             return Err(Error::Truncated);
         }
-        let size = le16(b, 4)?;
+        let size = le16(b, 4).ok_or(Error::Truncated)?;
         if size != HEADER_LEN as u16 {
             return Err(Error::HeaderSize(size));
         }
-        let flags = le32(b, 16)?;
+        let flags = le32(b, 16).ok_or(Error::Truncated)?;
         let target = if flags & flags::ASYNC_COMMAND != 0 {
-            Target::Async { async_id: le64(b, 32)? }
+            Target::Async { async_id: le64(b, 32).ok_or(Error::Truncated)? }
         } else {
-            Target::Sync { process_id: le32(b, 32)?, tree_id: le32(b, 36)? }
+            Target::Sync { process_id: le32(b, 32).ok_or(Error::Truncated)?, tree_id: le32(b, 36).ok_or(Error::Truncated)? }
         };
         let header = Header {
-            credit_charge: le16(b, 6)?,
-            status: le32(b, 8)?,
-            command: le16(b, 12)?,
-            credits: le16(b, 14)?,
+            credit_charge: le16(b, 6).ok_or(Error::Truncated)?,
+            status: le32(b, 8).ok_or(Error::Truncated)?,
+            command: le16(b, 12).ok_or(Error::Truncated)?,
+            credits: le16(b, 14).ok_or(Error::Truncated)?,
             flags,
-            message_id: le64(b, 24)?,
+            message_id: le64(b, 24).ok_or(Error::Truncated)?,
             target,
-            session_id: le64(b, 40)?,
+            session_id: le64(b, 40).ok_or(Error::Truncated)?,
             signature: arr(b, 48)?,
         };
-        Ok((header, le32(b, 20)?))
+        Ok((header, le32(b, 20).ok_or(Error::Truncated)?))
     }
 
     /// The header's 64 bytes, with `next_command` as its NextCommand.
@@ -1166,7 +1166,7 @@ impl FileId {
     pub const RELATED: FileId = FileId { persistent: u64::MAX, volatile: u64::MAX };
 
     fn read(b: &[u8], at: usize) -> Result<FileId, Error> {
-        Ok(FileId { persistent: le64(b, at)?, volatile: le64(b, at + 8)? })
+        Ok(FileId { persistent: le64(b, at).ok_or(Error::Truncated)?, volatile: le64(b, at + 8).ok_or(Error::Truncated)? })
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -1199,13 +1199,13 @@ impl FileInfo {
     /// Reads the 52 bytes from `at`: four times, two sizes, attributes.
     fn read(b: &[u8], at: usize) -> Result<FileInfo, Error> {
         Ok(FileInfo {
-            creation_time: le64(b, at)?,
-            last_access_time: le64(b, at + 8)?,
-            last_write_time: le64(b, at + 16)?,
-            change_time: le64(b, at + 24)?,
-            allocation_size: le64(b, at + 32)?,
-            end_of_file: le64(b, at + 40)?,
-            file_attributes: le32(b, at + 48)?,
+            creation_time: le64(b, at).ok_or(Error::Truncated)?,
+            last_access_time: le64(b, at + 8).ok_or(Error::Truncated)?,
+            last_write_time: le64(b, at + 16).ok_or(Error::Truncated)?,
+            change_time: le64(b, at + 24).ok_or(Error::Truncated)?,
+            allocation_size: le64(b, at + 32).ok_or(Error::Truncated)?,
+            end_of_file: le64(b, at + 40).ok_or(Error::Truncated)?,
+            file_attributes: le32(b, at + 48).ok_or(Error::Truncated)?,
         })
     }
 
@@ -1258,9 +1258,9 @@ impl NegotiateContext {
             return None;
         }
         let d = &self.data;
-        let hashes = usize::from(le16(d, 0).ok()?);
-        let salt = usize::from(le16(d, 2).ok()?);
-        let list = (0..hashes).map(|i| le16(d, 4 + 2 * i).ok()).collect::<Option<Vec<u16>>>()?;
+        let hashes = usize::from(le16(d, 0).ok_or(Error::Truncated).ok()?);
+        let salt = usize::from(le16(d, 2).ok_or(Error::Truncated).ok()?);
+        let list = (0..hashes).map(|i| le16(d, 4 + 2 * i).ok_or(Error::Truncated).ok()).collect::<Option<Vec<u16>>>()?;
         let start = 4 + 2 * hashes;
         Some((list, d.get(start..start + salt)?.to_vec()))
     }
@@ -1281,8 +1281,8 @@ impl NegotiateContext {
     /// The IDs of a context written by [`NegotiateContext::algorithms`], or
     /// `None` if its count does not fit its data.
     pub fn algorithm_list(&self) -> Option<Vec<u16>> {
-        let n = usize::from(le16(&self.data, 0).ok()?);
-        (0..n).map(|i| le16(&self.data, 2 + 2 * i).ok()).collect()
+        let n = usize::from(le16(&self.data, 0).ok_or(Error::Truncated).ok()?);
+        (0..n).map(|i| le16(&self.data, 2 + 2 * i).ok_or(Error::Truncated).ok()).collect()
     }
 }
 
@@ -1653,21 +1653,21 @@ impl Request {
         Ok(match command {
             command::NEGOTIATE => {
                 fixed(b, 36)?;
-                let count = usize::from(le16(b, 2)?);
+                let count = usize::from(le16(b, 2).ok_or(Error::Truncated)?);
                 if count == 0 {
                     return Err(Error::NoDialects);
                 }
-                let dialects = (0..count).map(|i| le16(b, 36 + 2 * i)).collect::<Result<Vec<u16>, Error>>()?;
+                let dialects = (0..count).map(|i| le16(b, 36 + 2 * i).ok_or(Error::Truncated)).collect::<Result<Vec<u16>, Error>>()?;
                 let (client_start_time, contexts) = if dialects.contains(&dialect::SMB_3_1_1) {
                     // The dialect list, as a buffer, from byte 36 of the body.
                     let list = (HEADER_LEN as u32 + 36, 2 * count as u32);
-                    (0, negotiate_contexts(b, le32(b, 28)?, le16(b, 32)?, list)?)
+                    (0, negotiate_contexts(b, le32(b, 28).ok_or(Error::Truncated)?, le16(b, 32).ok_or(Error::Truncated)?, list)?)
                 } else {
-                    (le64(b, 28)?, Vec::new())
+                    (le64(b, 28).ok_or(Error::Truncated)?, Vec::new())
                 };
                 Request::Negotiate(NegotiateRequest {
-                    security_mode: le16(b, 4)?,
-                    capabilities: le32(b, 8)?,
+                    security_mode: le16(b, 4).ok_or(Error::Truncated)?,
+                    capabilities: le32(b, 8).ok_or(Error::Truncated)?,
                     client_guid: arr(b, 12)?,
                     dialects,
                     client_start_time,
@@ -1679,10 +1679,10 @@ impl Request {
                 Request::SessionSetup(SessionSetupRequest {
                     flags: b[2],
                     security_mode: b[3],
-                    capabilities: le32(b, 4)?,
-                    channel: le32(b, 8)?,
-                    previous_session_id: le64(b, 16)?,
-                    security_buffer: buffer(b, le16(b, 12)?.into(), le16(b, 14)?.into())?.to_vec(),
+                    capabilities: le32(b, 4).ok_or(Error::Truncated)?,
+                    channel: le32(b, 8).ok_or(Error::Truncated)?,
+                    previous_session_id: le64(b, 16).ok_or(Error::Truncated)?,
+                    security_buffer: buffer(b, le16(b, 12).ok_or(Error::Truncated)?.into(), le16(b, 14).ok_or(Error::Truncated)?.into())?.to_vec(),
                 })
             }
             command::LOGOFF => {
@@ -1691,8 +1691,8 @@ impl Request {
             }
             command::TREE_CONNECT => {
                 fixed(b, 9)?;
-                let flags = le16(b, 2)?;
-                let path = (u32::from(le16(b, 4)?), u32::from(le16(b, 6)?));
+                let flags = le16(b, 2).ok_or(Error::Truncated)?;
+                let path = (u32::from(le16(b, 4).ok_or(Error::Truncated)?), u32::from(le16(b, 6).ok_or(Error::Truncated)?));
                 if flags & TREE_CONNECT_EXTENSION_PRESENT != 0 {
                     // The extension's 16-byte header comes first, at 72.
                     if b.len() < 8 + TREE_CONNECT_EXTENSION_LEN
@@ -1713,11 +1713,11 @@ impl Request {
                 if b.len() < 57 {
                     return Err(Error::Truncated);
                 }
-                let name = (u32::from(le16(b, 44)?), u32::from(le16(b, 46)?));
+                let name = (u32::from(le16(b, 44).ok_or(Error::Truncated)?), u32::from(le16(b, 46).ok_or(Error::Truncated)?));
                 if name.1 != 0 && !name.0.is_multiple_of(8) {
                     return Err(Error::Align(name.0));
                 }
-                let region = (le32(b, 48)?, le32(b, 52)?);
+                let region = (le32(b, 48).ok_or(Error::Truncated)?, le32(b, 52).ok_or(Error::Truncated)?);
                 let name_bytes = buffer(b, name.0, name.1)?;
                 let region_bytes = buffer(b, region.0, region.1)?;
                 if region.1 != 0 {
@@ -1725,19 +1725,19 @@ impl Request {
                 }
                 Request::Create(CreateRequest {
                     oplock_level: b[3],
-                    impersonation_level: le32(b, 4)?,
-                    desired_access: le32(b, 24)?,
-                    file_attributes: le32(b, 28)?,
-                    share_access: le32(b, 32)?,
-                    create_disposition: le32(b, 36)?,
-                    create_options: le32(b, 40)?,
+                    impersonation_level: le32(b, 4).ok_or(Error::Truncated)?,
+                    desired_access: le32(b, 24).ok_or(Error::Truncated)?,
+                    file_attributes: le32(b, 28).ok_or(Error::Truncated)?,
+                    share_access: le32(b, 32).ok_or(Error::Truncated)?,
+                    create_disposition: le32(b, 36).ok_or(Error::Truncated)?,
+                    create_options: le32(b, 40).ok_or(Error::Truncated)?,
                     name: string(name_bytes)?,
                     contexts: create_contexts(region_bytes)?,
                 })
             }
             command::CLOSE => {
                 fixed(b, 24)?;
-                Request::Close { flags: le16(b, 2)?, file_id: FileId::read(b, 8)? }
+                Request::Close { flags: le16(b, 2).ok_or(Error::Truncated)?, file_id: FileId::read(b, 8)? }
             }
             command::FLUSH => {
                 fixed(b, 24)?;
@@ -1745,46 +1745,46 @@ impl Request {
             }
             command::READ => {
                 fixed(b, 49)?;
-                let channel = le32(b, 36)?;
+                let channel = le32(b, 36).ok_or(Error::Truncated)?;
                 // With channel NONE the server ignores the channel info.
                 let channel_info = if channel == 0 {
                     Vec::new()
                 } else {
-                    buffer(b, le16(b, 44)?.into(), le16(b, 46)?.into())?.to_vec()
+                    buffer(b, le16(b, 44).ok_or(Error::Truncated)?.into(), le16(b, 46).ok_or(Error::Truncated)?.into())?.to_vec()
                 };
                 Request::Read(ReadRequest {
                     padding: b[2],
                     flags: b[3],
-                    length: le32(b, 4)?,
-                    offset: le64(b, 8)?,
+                    length: le32(b, 4).ok_or(Error::Truncated)?,
+                    offset: le64(b, 8).ok_or(Error::Truncated)?,
                     file_id: FileId::read(b, 16)?,
-                    minimum_count: le32(b, 32)?,
+                    minimum_count: le32(b, 32).ok_or(Error::Truncated)?,
                     channel,
-                    remaining_bytes: le32(b, 40)?,
+                    remaining_bytes: le32(b, 40).ok_or(Error::Truncated)?,
                     channel_info,
                 })
             }
             command::WRITE => {
                 fixed(b, 49)?;
-                let data = (u32::from(le16(b, 2)?), le32(b, 4)?);
-                let channel = le32(b, 32)?;
+                let data = (u32::from(le16(b, 2).ok_or(Error::Truncated)?), le32(b, 4).ok_or(Error::Truncated)?);
+                let channel = le32(b, 32).ok_or(Error::Truncated)?;
                 // With channel NONE the server ignores the channel info.
-                let info = if channel == 0 { (0, 0) } else { (u32::from(le16(b, 40)?), u32::from(le16(b, 42)?)) };
+                let info = if channel == 0 { (0, 0) } else { (u32::from(le16(b, 40).ok_or(Error::Truncated)?), u32::from(le16(b, 42).ok_or(Error::Truncated)?)) };
                 let (data_bytes, info_bytes) = (buffer(b, data.0, data.1)?, buffer(b, info.0, info.1)?);
                 apart(data, info)?;
                 Request::Write(WriteRequest {
-                    offset: le64(b, 8)?,
+                    offset: le64(b, 8).ok_or(Error::Truncated)?,
                     file_id: FileId::read(b, 16)?,
                     channel,
-                    remaining_bytes: le32(b, 36)?,
-                    flags: le32(b, 44)?,
+                    remaining_bytes: le32(b, 36).ok_or(Error::Truncated)?,
+                    flags: le32(b, 44).ok_or(Error::Truncated)?,
                     data: data_bytes.to_vec(),
                     channel_info: info_bytes.to_vec(),
                 })
             }
             command::LOCK => {
                 fixed(b, 48)?;
-                let count = usize::from(le16(b, 2)?);
+                let count = usize::from(le16(b, 2).ok_or(Error::Truncated)?);
                 if count == 0 {
                     return Err(Error::NoLocks);
                 }
@@ -1795,26 +1795,26 @@ impl Request {
                 let locks = (0..count)
                     .map(|i| {
                         let at = 24 + 24 * i;
-                        Ok(Lock { offset: le64(b, at)?, length: le64(b, at + 8)?, flags: le32(b, at + 16)? })
+                        Ok(Lock { offset: le64(b, at).ok_or(Error::Truncated)?, length: le64(b, at + 8).ok_or(Error::Truncated)?, flags: le32(b, at + 16).ok_or(Error::Truncated)? })
                     })
                     .collect::<Result<Vec<Lock>, Error>>()?;
-                Request::Lock(LockRequest { lock_sequence: le32(b, 4)?, file_id: FileId::read(b, 8)?, locks })
+                Request::Lock(LockRequest { lock_sequence: le32(b, 4).ok_or(Error::Truncated)?, file_id: FileId::read(b, 8)?, locks })
             }
             command::IOCTL => {
                 fixed(b, 57)?;
                 // 2.2.31: the client MUST set OutputCount to 0.
-                if le32(b, 40)? != 0 {
+                if le32(b, 40).ok_or(Error::Truncated)? != 0 {
                     return Err(Error::Buffer);
                 }
-                let input = buffer(b, le32(b, 24)?, le32(b, 28)?)?;
+                let input = buffer(b, le32(b, 24).ok_or(Error::Truncated)?, le32(b, 28).ok_or(Error::Truncated)?)?;
                 Request::Ioctl(IoctlRequest {
-                    ctl_code: le32(b, 4)?,
+                    ctl_code: le32(b, 4).ok_or(Error::Truncated)?,
                     file_id: FileId::read(b, 8)?,
                     input: input.to_vec(),
-                    max_input_response: le32(b, 32)?,
+                    max_input_response: le32(b, 32).ok_or(Error::Truncated)?,
                     output: Vec::new(),
-                    max_output_response: le32(b, 44)?,
-                    flags: le32(b, 48)?,
+                    max_output_response: le32(b, 44).ok_or(Error::Truncated)?,
+                    flags: le32(b, 48).ok_or(Error::Truncated)?,
                 })
             }
             command::CANCEL => {
@@ -1830,19 +1830,19 @@ impl Request {
                 Request::QueryDirectory(QueryDirectoryRequest {
                     file_information_class: b[2],
                     flags: b[3],
-                    file_index: le32(b, 4)?,
+                    file_index: le32(b, 4).ok_or(Error::Truncated)?,
                     file_id: FileId::read(b, 8)?,
-                    pattern: string(buffer(b, le16(b, 24)?.into(), le16(b, 26)?.into())?)?,
-                    output_buffer_length: le32(b, 28)?,
+                    pattern: string(buffer(b, le16(b, 24).ok_or(Error::Truncated)?.into(), le16(b, 26).ok_or(Error::Truncated)?.into())?)?,
+                    output_buffer_length: le32(b, 28).ok_or(Error::Truncated)?,
                 })
             }
             command::CHANGE_NOTIFY => {
                 fixed(b, 32)?;
                 Request::ChangeNotify(ChangeNotifyRequest {
-                    flags: le16(b, 2)?,
-                    output_buffer_length: le32(b, 4)?,
+                    flags: le16(b, 2).ok_or(Error::Truncated)?,
+                    output_buffer_length: le32(b, 4).ok_or(Error::Truncated)?,
                     file_id: FileId::read(b, 8)?,
-                    completion_filter: le32(b, 24)?,
+                    completion_filter: le32(b, 24).ok_or(Error::Truncated)?,
                 })
             }
             command::QUERY_INFO => {
@@ -1850,10 +1850,10 @@ impl Request {
                 Request::QueryInfo(QueryInfoRequest {
                     info_type: b[2],
                     file_info_class: b[3],
-                    output_buffer_length: le32(b, 4)?,
-                    input: buffer(b, le16(b, 8)?.into(), le32(b, 12)?)?.to_vec(),
-                    additional_information: le32(b, 16)?,
-                    flags: le32(b, 20)?,
+                    output_buffer_length: le32(b, 4).ok_or(Error::Truncated)?,
+                    input: buffer(b, le16(b, 8).ok_or(Error::Truncated)?.into(), le32(b, 12).ok_or(Error::Truncated)?)?.to_vec(),
+                    additional_information: le32(b, 16).ok_or(Error::Truncated)?,
+                    flags: le32(b, 20).ok_or(Error::Truncated)?,
                     file_id: FileId::read(b, 24)?,
                 })
             }
@@ -1862,8 +1862,8 @@ impl Request {
                 Request::SetInfo(SetInfoRequest {
                     info_type: b[2],
                     file_info_class: b[3],
-                    data: buffer(b, le16(b, 8)?.into(), le32(b, 4)?)?.to_vec(),
-                    additional_information: le32(b, 12)?,
+                    data: buffer(b, le16(b, 8).ok_or(Error::Truncated)?.into(), le32(b, 4).ok_or(Error::Truncated)?)?.to_vec(),
+                    additional_information: le32(b, 12).ok_or(Error::Truncated)?,
                     file_id: FileId::read(b, 16)?,
                 })
             }
@@ -2305,9 +2305,9 @@ impl Response {
         if b.len() > MAX_MESSAGE {
             return Err(Error::TooLong);
         }
-        if error_body(command, status, le16(b, 0).ok()) {
+        if error_body(command, status, le16(b, 0).ok_or(Error::Truncated).ok()) {
             fixed(b, 9)?;
-            let n = le32(b, 4)? as usize;
+            let n = le32(b, 4).ok_or(Error::Truncated)? as usize;
             let data = b.get(8..8usize.checked_add(n).ok_or(Error::Buffer)?).ok_or(Error::Buffer)?;
             if !error_contexts_fit(b[2], data) {
                 return Err(Error::Buffer);
@@ -2317,11 +2317,11 @@ impl Response {
         Ok(match command {
             command::NEGOTIATE => {
                 fixed(b, 65)?;
-                let dialect = le16(b, 4)?;
-                let security = (u32::from(le16(b, 56)?), u32::from(le16(b, 58)?));
+                let dialect = le16(b, 4).ok_or(Error::Truncated)?;
+                let security = (u32::from(le16(b, 56).ok_or(Error::Truncated)?), u32::from(le16(b, 58).ok_or(Error::Truncated)?));
                 let security_buffer = buffer(b, security.0, security.1)?.to_vec();
                 let contexts = if dialect == dialect::SMB_3_1_1 {
-                    let contexts = negotiate_contexts(b, le32(b, 60)?, le16(b, 6)?, security)?;
+                    let contexts = negotiate_contexts(b, le32(b, 60).ok_or(Error::Truncated)?, le16(b, 6).ok_or(Error::Truncated)?, security)?;
                     if !response_contexts_ok(&contexts) {
                         return Err(Error::NegotiateContexts);
                     }
@@ -2330,15 +2330,15 @@ impl Response {
                     Vec::new()
                 };
                 Response::Negotiate(NegotiateResponse {
-                    security_mode: le16(b, 2)?,
+                    security_mode: le16(b, 2).ok_or(Error::Truncated)?,
                     dialect,
                     server_guid: arr(b, 8)?,
-                    capabilities: le32(b, 24)?,
-                    max_transact_size: le32(b, 28)?,
-                    max_read_size: le32(b, 32)?,
-                    max_write_size: le32(b, 36)?,
-                    system_time: le64(b, 40)?,
-                    server_start_time: le64(b, 48)?,
+                    capabilities: le32(b, 24).ok_or(Error::Truncated)?,
+                    max_transact_size: le32(b, 28).ok_or(Error::Truncated)?,
+                    max_read_size: le32(b, 32).ok_or(Error::Truncated)?,
+                    max_write_size: le32(b, 36).ok_or(Error::Truncated)?,
+                    system_time: le64(b, 40).ok_or(Error::Truncated)?,
+                    server_start_time: le64(b, 48).ok_or(Error::Truncated)?,
                     security_buffer,
                     contexts,
                 })
@@ -2346,8 +2346,8 @@ impl Response {
             command::SESSION_SETUP => {
                 fixed(b, 9)?;
                 Response::SessionSetup {
-                    session_flags: le16(b, 2)?,
-                    security_buffer: buffer(b, le16(b, 4)?.into(), le16(b, 6)?.into())?.to_vec(),
+                    session_flags: le16(b, 2).ok_or(Error::Truncated)?,
+                    security_buffer: buffer(b, le16(b, 4).ok_or(Error::Truncated)?.into(), le16(b, 6).ok_or(Error::Truncated)?.into())?.to_vec(),
                 }
             }
             command::LOGOFF => fixed(b, 4).map(|_| Response::Logoff)?,
@@ -2355,9 +2355,9 @@ impl Response {
                 fixed(b, 16)?;
                 Response::TreeConnect(TreeConnectResponse {
                     share_type: b[2],
-                    share_flags: le32(b, 4)?,
-                    capabilities: le32(b, 8)?,
-                    maximal_access: le32(b, 12)?,
+                    share_flags: le32(b, 4).ok_or(Error::Truncated)?,
+                    capabilities: le32(b, 8).ok_or(Error::Truncated)?,
+                    maximal_access: le32(b, 12).ok_or(Error::Truncated)?,
                 })
             }
             command::TREE_DISCONNECT => fixed(b, 4).map(|_| Response::TreeDisconnect)?,
@@ -2368,11 +2368,11 @@ impl Response {
                 Response::Create(CreateResponse {
                     oplock_level: b[2],
                     flags: b[3],
-                    create_action: le32(b, 4)?,
+                    create_action: le32(b, 4).ok_or(Error::Truncated)?,
                     info: FileInfo::read(b, 8)?,
                     file_id: FileId::read(b, 64)?,
                     contexts: {
-                        let region = (le32(b, 80)?, le32(b, 84)?);
+                        let region = (le32(b, 80).ok_or(Error::Truncated)?, le32(b, 84).ok_or(Error::Truncated)?);
                         let bytes = buffer(b, region.0, region.1)?;
                         if region.1 != 0 {
                             contexts_after(region.0, (0, 0))?;
@@ -2383,26 +2383,26 @@ impl Response {
             }
             command::CLOSE => {
                 fixed(b, 60)?;
-                Response::Close { flags: le16(b, 2)?, info: FileInfo::read(b, 8)? }
+                Response::Close { flags: le16(b, 2).ok_or(Error::Truncated)?, info: FileInfo::read(b, 8)? }
             }
             command::FLUSH => fixed(b, 4).map(|_| Response::Flush)?,
             command::READ => {
                 fixed(b, 17)?;
                 Response::Read {
-                    data: buffer(b, b[2].into(), le32(b, 4)?)?.to_vec(),
-                    data_remaining: le32(b, 8)?,
-                    flags: le32(b, 12)?,
+                    data: buffer(b, b[2].into(), le32(b, 4).ok_or(Error::Truncated)?)?.to_vec(),
+                    data_remaining: le32(b, 8).ok_or(Error::Truncated)?,
+                    flags: le32(b, 12).ok_or(Error::Truncated)?,
                 }
             }
             command::WRITE => {
                 fixed(b, 17)?;
-                Response::Write { count: le32(b, 4)?, remaining: le32(b, 8)? }
+                Response::Write { count: le32(b, 4).ok_or(Error::Truncated)?, remaining: le32(b, 8).ok_or(Error::Truncated)? }
             }
             command::LOCK => fixed(b, 4).map(|_| Response::Lock)?,
             command::IOCTL => {
                 fixed(b, 49)?;
-                let input = (le32(b, 24)?, le32(b, 28)?);
-                let output = (le32(b, 32)?, le32(b, 36)?);
+                let input = (le32(b, 24).ok_or(Error::Truncated)?, le32(b, 28).ok_or(Error::Truncated)?);
+                let output = (le32(b, 32).ok_or(Error::Truncated)?, le32(b, 36).ok_or(Error::Truncated)?);
                 let (input_bytes, output_bytes) = (buffer(b, input.0, input.1)?, buffer(b, output.0, output.1)?);
                 // 2.2.32: output starts at the end of the input rounded up
                 // to a multiple of 8. Padding past that is allowed.
@@ -2415,11 +2415,11 @@ impl Response {
                     }
                 }
                 Response::Ioctl(IoctlResponse {
-                    ctl_code: le32(b, 4)?,
+                    ctl_code: le32(b, 4).ok_or(Error::Truncated)?,
                     file_id: FileId::read(b, 8)?,
                     input: input_bytes.to_vec(),
                     output: output_bytes.to_vec(),
-                    flags: le32(b, 40)?,
+                    flags: le32(b, 40).ok_or(Error::Truncated)?,
                 })
             }
             command::ECHO => fixed(b, 4).map(|_| Response::Echo)?,
@@ -2467,7 +2467,7 @@ impl Response {
         }
         let w = self.encode_fields()?;
         let is_error = matches!(self, Response::Error(_));
-        if error_body(command, status, le16(&w, 0).ok()) != is_error {
+        if error_body(command, status, le16(&w, 0).ok_or(Error::Truncated).ok()) != is_error {
             return Err(Error::Unwritable);
         }
         Ok(w)
@@ -2631,8 +2631,8 @@ fn error_contexts_fit(count: u8, data: &[u8]) -> bool {
         if i > 0 {
             at = at.next_multiple_of(8);
         }
-        let Ok(len) = le32(data, at) else { return false };
-        if le32(data, at + 4).is_err() {
+        let Ok(len) = le32(data, at).ok_or(Error::Truncated) else { return false };
+        if le32(data, at + 4).ok_or(Error::Truncated).is_err() {
             return false;
         }
         let Some(end) = (at + 8).checked_add(len as usize) else { return false };
@@ -2691,7 +2691,7 @@ fn known(command: u16) -> bool {
 /// Checks a body's StructureSize, and that it holds the fixed part: the
 /// StructureSize rounded down to even.
 fn fixed(b: &[u8], size: u16) -> Result<(), Error> {
-    let found = le16(b, 0)?;
+    let found = le16(b, 0).ok_or(Error::Truncated)?;
     if found != size {
         return Err(Error::StructureSize(found));
     }
@@ -2704,7 +2704,7 @@ fn fixed(b: &[u8], size: u16) -> Result<(), Error> {
 /// A QUERY_DIRECTORY, CHANGE_NOTIFY or QUERY_INFO response's output.
 fn output(b: &[u8]) -> Result<Vec<u8>, Error> {
     fixed(b, 9)?;
-    Ok(buffer(b, le16(b, 2)?.into(), le32(b, 4)?)?.to_vec())
+    Ok(buffer(b, le16(b, 2).ok_or(Error::Truncated)?.into(), le32(b, 4).ok_or(Error::Truncated)?)?.to_vec())
 }
 
 /// The bytes at `offset`, counted from the header's start, and `len` long.
@@ -2716,7 +2716,7 @@ fn buffer(b: &[u8], offset: u32, len: u32) -> Result<&[u8], Error> {
     if len == 0 {
         return Ok(&[]);
     }
-    let fixed = usize::from(le16(b, 0)? & !1);
+    let fixed = usize::from(le16(b, 0).ok_or(Error::Truncated)? & !1);
     let start = (offset as usize).checked_sub(HEADER_LEN).ok_or(Error::Buffer)?;
     if start < fixed {
         return Err(Error::Buffer);
@@ -2777,7 +2777,7 @@ fn negotiate_contexts(b: &[u8], offset: u32, count: u16, before: (u32, u32)) -> 
     if count == 0 {
         return Ok(out);
     }
-    let fixed = usize::from(le16(b, 0)? & !1);
+    let fixed = usize::from(le16(b, 0).ok_or(Error::Truncated)? & !1);
     let mut at = (offset as usize).checked_sub(HEADER_LEN).ok_or(Error::Buffer)?;
     if at < fixed {
         return Err(Error::Buffer);
@@ -2787,8 +2787,8 @@ fn negotiate_contexts(b: &[u8], offset: u32, count: u16, before: (u32, u32)) -> 
         if i > 0 {
             at = at.checked_next_multiple_of(8).ok_or(Error::Buffer)?;
         }
-        let kind = le16(b, at).map_err(|_| Error::Buffer)?;
-        let len = usize::from(le16(b, at.checked_add(2).ok_or(Error::Buffer)?).map_err(|_| Error::Buffer)?);
+        let kind = le16(b, at).ok_or(Error::Truncated).map_err(|_| Error::Buffer)?;
+        let len = usize::from(le16(b, at.checked_add(2).ok_or(Error::Buffer)?).ok_or(Error::Truncated).map_err(|_| Error::Buffer)?);
         let start = at.checked_add(8).ok_or(Error::Buffer)?;
         let end = start.checked_add(len).ok_or(Error::Buffer)?;
         let data = b.get(start..end).ok_or(Error::Buffer)?;
@@ -2829,7 +2829,7 @@ fn create_contexts(region: &[u8]) -> Result<Vec<CreateContext>, Error> {
         if rest.len() < 16 {
             return Err(Error::Buffer);
         }
-        let next = le32(rest, 0)? as usize;
+        let next = le32(rest, 0).ok_or(Error::Truncated)? as usize;
         let this = if next == 0 {
             rest
         } else if next >= 16 && next <= rest.len() {
@@ -2846,8 +2846,8 @@ fn create_contexts(region: &[u8]) -> Result<Vec<CreateContext>, Error> {
             }
             Ok(this.get(off..off.checked_add(len).ok_or(Error::Buffer)?).ok_or(Error::Buffer)?.to_vec())
         };
-        let (name_at, name_len) = (le16(rest, 4)?, le16(rest, 6)?);
-        let (data_at, data_len) = (le16(rest, 10)?, le32(rest, 12)?);
+        let (name_at, name_len) = (le16(rest, 4).ok_or(Error::Truncated)?, le16(rest, 6).ok_or(Error::Truncated)?);
+        let (data_at, data_len) = (le16(rest, 10).ok_or(Error::Truncated)?, le32(rest, 12).ok_or(Error::Truncated)?);
         if name_len != 0 {
             if name_at < 16 {
                 return Err(Error::Buffer);
@@ -2917,7 +2917,7 @@ fn write_create_contexts(w: &mut Vec<u8>, contexts: &[CreateContext], field: usi
 /// Ends a body: one whose StructureSize is odd counts one byte of its
 /// buffer, so a body with an empty buffer gets a zero byte.
 fn finish(w: &mut Vec<u8>) {
-    if let Ok(size) = le16(w, 0)
+    if let Ok(size) = le16(w, 0).ok_or(Error::Truncated)
         && size % 2 == 1
         && w.len() < usize::from(size)
     {
@@ -2964,18 +2964,6 @@ fn put64(w: &mut Vec<u8>, v: u64) {
 fn arr<const N: usize>(b: &[u8], at: usize) -> Result<[u8; N], Error> {
     let end = at.checked_add(N).ok_or(Error::Truncated)?;
     b.get(at..end).and_then(|s| s.try_into().ok()).ok_or(Error::Truncated)
-}
-
-fn le16(b: &[u8], at: usize) -> Result<u16, Error> {
-    arr(b, at).map(u16::from_le_bytes)
-}
-
-fn le32(b: &[u8], at: usize) -> Result<u32, Error> {
-    arr(b, at).map(u32::from_le_bytes)
-}
-
-fn le64(b: &[u8], at: usize) -> Result<u64, Error> {
-    arr(b, at).map(u64::from_le_bytes)
 }
 
 #[cfg(test)]
@@ -3295,10 +3283,10 @@ mod tests {
             contexts: vec![CreateContext { name: b"MxAc".to_vec(), data: vec![0, 0, 0, 0, 0xff, 1, 0x1f, 0] }],
         });
         let bytes = resp.message(&Header::new(command::CREATE, 0), 0).map(|m| m.body).unwrap();
-        assert_eq!(le16(&bytes, 0), Ok(89));
-        assert_eq!(le32(&bytes, 56), Ok(0x20)); // FileAttributes
-        assert_eq!(le64(&bytes, 64), Ok(5)); // FileId
-        assert_eq!(le32(&bytes, 80), Ok(152)); // CreateContextsOffset
+        assert_eq!(le16(&bytes, 0).ok_or(Error::Truncated), Ok(89));
+        assert_eq!(le32(&bytes, 56).ok_or(Error::Truncated), Ok(0x20)); // FileAttributes
+        assert_eq!(le64(&bytes, 64).ok_or(Error::Truncated), Ok(5)); // FileId
+        assert_eq!(le32(&bytes, 80).ok_or(Error::Truncated), Ok(152)); // CreateContextsOffset
         assert_eq!(Response::parse(command::CREATE, 0, &bytes), Ok(resp));
         // Without contexts: the fixed part and one zero byte.
         let plain = Response::Create(CreateResponse::default());
@@ -3427,7 +3415,7 @@ mod tests {
         assert_eq!(req.message(0).map(|m| m.body).unwrap(), body);
         let resp = Response::Ioctl(IoctlResponse { ctl_code: 0x0014_0204, output: vec![5; 24], ..Default::default() });
         let bytes = resp.message(&Header::new(command::IOCTL, 0), 0).map(|m| m.body).unwrap();
-        assert_eq!(le32(&bytes, 32), Ok(112));
+        assert_eq!(le32(&bytes, 32).ok_or(Error::Truncated), Ok(112));
         assert_eq!(Response::parse(command::IOCTL, 0, &bytes), Ok(resp.clone()));
         // An IOCTL body may come with a failing status, as copychunk does.
         let b = resp.message(&Header::new(command::IOCTL, 0), status::INVALID_PARAMETER).map(|m| m.body).unwrap();
@@ -3548,11 +3536,11 @@ mod tests {
         let Packet::Smb2(back) = Packet::parse(&bytes).unwrap() else { panic!() };
         assert_eq!(back.len(), 3);
         // The READ body (49 bytes) was padded to 56 to keep the CLOSE aligned.
-        let first = le32(&bytes, 20).unwrap() as usize;
+        let first = le32(&bytes, 20).ok_or(Error::Truncated).unwrap() as usize;
         assert_eq!(first % 8, 0);
-        let second = le32(&bytes, first + 20).unwrap() as usize;
+        let second = le32(&bytes, first + 20).ok_or(Error::Truncated).unwrap() as usize;
         assert_eq!(second, 64 + 56);
-        assert_eq!(le32(&bytes, first + second + 20), Ok(0));
+        assert_eq!(le32(&bytes, first + second + 20).ok_or(Error::Truncated), Ok(0));
         assert_eq!(back[1].body.len(), 56);
         assert_eq!(back[1].request(), messages[1].request());
         assert_eq!(back[2], messages[2]);
@@ -3593,9 +3581,9 @@ mod tests {
         };
         let b = t.to_bytes().unwrap();
         assert_eq!(b[..4], protocol::TRANSFORM);
-        assert_eq!(le32(&b, 36), Ok(100));
-        assert_eq!(le16(&b, 42), Ok(1));
-        assert_eq!(le64(&b, 44), Ok(9));
+        assert_eq!(le32(&b, 36).ok_or(Error::Truncated), Ok(100));
+        assert_eq!(le16(&b, 42).ok_or(Error::Truncated), Ok(1));
+        assert_eq!(le64(&b, 44).ok_or(Error::Truncated), Ok(9));
         assert_eq!(Packet::parse(&b), Ok(Packet::Transform(t)));
         assert_eq!(Packet::parse(&b[..51]), Err(Error::Truncated));
         // 3.3.5.2.1.1: a header with no message after it.
@@ -3669,7 +3657,7 @@ mod tests {
         assert_eq!(Request::parse(command::TREE_CONNECT, &b), Err(Error::OddString));
         // Create contexts that run off their region, or link backwards.
         let mut body = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
-        let offset = le32(&body, 48).unwrap() as usize - 64;
+        let offset = le32(&body, 48).ok_or(Error::Truncated).unwrap() as usize - 64;
         body[offset] = 8; // Next below 16
         assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Buffer));
         body[offset] = 0xf0;
@@ -3938,7 +3926,7 @@ mod tests {
         assert_eq!(Request::parse(command::NEGOTIATE, &body), Err(Error::Align(105)));
         // 2.2.13.2: create contexts, their Next and their DataOffset too.
         let good = Request::Create(create_request()).message(0).map(|m| m.body).unwrap();
-        let offset = le32(&good, 48).unwrap() as usize - 64;
+        let offset = le32(&good, 48).ok_or(Error::Truncated).unwrap() as usize - 64;
         let mut body = good.clone();
         body.insert(offset, 0);
         body[48..52].copy_from_slice(&(offset as u32 + 65).to_le_bytes());
@@ -4009,9 +3997,9 @@ mod tests {
         let req = Request::TreeConnect(TreeConnectRequest { flags: 4, path: utf16("\\\\server\\share") });
         let body = req.message(0).map(|m| m.body).unwrap();
         let path = u16s("\\\\server\\share");
-        assert_eq!(le16(&body, 2), Ok(4));
-        assert_eq!(le16(&body, 4), Ok(88));
-        assert_eq!(le16(&body, 6), Ok(path.len() as u16));
+        assert_eq!(le16(&body, 2).ok_or(Error::Truncated), Ok(4));
+        assert_eq!(le16(&body, 4).ok_or(Error::Truncated), Ok(88));
+        assert_eq!(le16(&body, 6).ok_or(Error::Truncated), Ok(path.len() as u16));
         assert_eq!(body[8..24], [0; 16]);
         assert_eq!(body[24..], path[..]);
         assert_eq!(Request::parse(command::TREE_CONNECT, &body), Ok(req));
@@ -4037,8 +4025,8 @@ mod tests {
         // 2.2.32: OutputOffset is InputOffset + InputCount rounded up to 8.
         let resp = Response::Ioctl(IoctlResponse { input: vec![1], output: vec![2], ..Default::default() });
         let body = resp.message(&Header::new(command::IOCTL, 0), 0).map(|m| m.body).unwrap();
-        assert_eq!((le32(&body, 24), le32(&body, 28)), (Ok(112), Ok(1)));
-        assert_eq!((le32(&body, 32), le32(&body, 36)), (Ok(120), Ok(1)));
+        assert_eq!((le32(&body, 24).ok_or(Error::Truncated), le32(&body, 28).ok_or(Error::Truncated)), (Ok(112), Ok(1)));
+        assert_eq!((le32(&body, 32).ok_or(Error::Truncated), le32(&body, 36).ok_or(Error::Truncated)), (Ok(120), Ok(1)));
         assert_eq!(body[56], 2);
         assert_eq!(Response::parse(command::IOCTL, 0, &body), Ok(resp));
         // Output right after the input, unaligned, is refused.
@@ -4051,7 +4039,7 @@ mod tests {
         assert_eq!(Response::parse(command::IOCTL, 0, &bad), Err(Error::Overlap));
         // No output: OutputOffset 0.
         let none = Response::Ioctl(IoctlResponse { input: vec![1], ..Default::default() });
-        assert_eq!(le32(&none.message(&Header::new(command::IOCTL, 0), 0).map(|m| m.body).unwrap(), 32), Ok(0));
+        assert_eq!(le32(&none.message(&Header::new(command::IOCTL, 0), 0).map(|m| m.body).unwrap(), 32).ok_or(Error::Truncated), Ok(0));
     }
 
     #[test]
@@ -4088,7 +4076,7 @@ mod tests {
         let mut body = good.message(&Header::new(0, 0), 0).map(|m| m.body).unwrap();
         assert_eq!(Response::parse(0, 0, &body), Ok(good));
         // The same bytes with the preauth context made a signing one.
-        let first = le32(&body, 60).unwrap() as usize - HEADER_LEN;
+        let first = le32(&body, 60).ok_or(Error::Truncated).unwrap() as usize - HEADER_LEN;
         body[first..first + 2].copy_from_slice(&8u16.to_le_bytes());
         assert_eq!(Response::parse(0, 0, &body), Err(Error::NegotiateContexts));
         // A 3.1.1 response with a count of 0.
@@ -4254,7 +4242,7 @@ mod tests {
         let req = Request::Ioctl(IoctlRequest { output: vec![1], ..Default::default() });
         assert_eq!(req.message(0).map(|m| m.body), Err(Error::Unwritable));
         let mut body = Request::Ioctl(IoctlRequest { input: vec![1; 8], ..Default::default() }).message(0).map(|m| m.body).unwrap();
-        assert_eq!((le32(&body, 36), le32(&body, 40)), (Ok(0), Ok(0)));
+        assert_eq!((le32(&body, 36).ok_or(Error::Truncated), le32(&body, 40).ok_or(Error::Truncated)), (Ok(0), Ok(0)));
         body[36..40].copy_from_slice(&128u32.to_le_bytes());
         assert!(Request::parse(command::IOCTL, &body).is_ok());
         body[40..44].copy_from_slice(&1u32.to_le_bytes());
@@ -4471,7 +4459,7 @@ mod tests {
     /// (see [`Request::parse`]).
     fn no_longer(command: u16, new: &[u8], old: &[u8]) -> bool {
         let slack = if command == command::CREATE { 7 } else { 0 };
-        new.len() <= old.len() + slack || le16(new, 0).is_ok_and(|size| new.len() <= usize::from(size))
+        new.len() <= old.len() + slack || le16(new, 0).ok_or(Error::Truncated).is_ok_and(|size| new.len() <= usize::from(size))
     }
 
     /// Reads a payload every way there is, checks that what reads writes
@@ -4518,7 +4506,7 @@ mod tests {
         // Each body cut short of its fixed part is refused.
         for req in requests() {
             let body = req.message(0).map(|m| m.body).unwrap();
-            let size = usize::from(le16(&body, 0).unwrap() & !1);
+            let size = usize::from(le16(&body, 0).ok_or(Error::Truncated).unwrap() & !1);
             if matches!(req, Request::Other { .. }) {
                 continue;
             }
@@ -4531,7 +4519,7 @@ mod tests {
             if matches!(resp, Response::Other { .. }) {
                 continue;
             }
-            let size = usize::from(le16(&body, 0).unwrap() & !1);
+            let size = usize::from(le16(&body, 0).ok_or(Error::Truncated).unwrap() & !1);
             for n in 0..size {
                 assert!(Response::parse(c, s, &body[..n]).is_err(), "{resp:?} at {n}");
             }

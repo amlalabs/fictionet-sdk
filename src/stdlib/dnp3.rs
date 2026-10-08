@@ -33,7 +33,7 @@
 //! assert_eq!(decoder.next().unwrap().unwrap(), frame);
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{le16, Decode, Step, Wire};
 
 /// The usual TCP and UDP port.
 pub const PORT: u16 = 20000;
@@ -165,8 +165,8 @@ impl Frame {
         Ok(Some((
             Self {
                 control: b[3],
-                destination: le16(b, 4),
-                source: le16(b, 6),
+                destination: le16(b, 4).ok_or(Error::Truncated)?,
+                source: le16(b, 6).ok_or(Error::Truncated)?,
                 data,
             },
             at,
@@ -265,12 +265,8 @@ impl Decode for Frames {
     }
 }
 
-fn le16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
-}
-
 fn check_crc(b: &[u8], at: usize, size: usize) -> Result<(), Error> {
-    if crc(&b[at..at + size]) == le16(b, at + size) {
+    if crc(&b[at..at + size]) == le16(b, at + size).ok_or(Error::Truncated)? {
         Ok(())
     } else {
         Err(Error::Crc(at + size))
@@ -424,7 +420,7 @@ impl Wire for Fragment {
         Ok(Self {
             control: b[0],
             function: b[1],
-            indications: response.then(|| le16(b, 2)),
+            indications: if response { Some(le16(b, 2).ok_or(Error::FragmentLength)?) } else { None },
             objects: b[header..].to_vec(),
         })
     }

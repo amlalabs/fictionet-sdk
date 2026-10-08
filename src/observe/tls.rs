@@ -1,4 +1,5 @@
 use fictionet::events::Transport;
+use fictionet::stdlib::codec::{be16, be24};
 use fictionet::observe::{
     Conversation, Decoded, KeyLine, Layer, Observed, Place, Placement, Present, Protocol, Registry,
     protocols,
@@ -83,7 +84,8 @@ const MAX_HANDSHAKE: usize = 64 << 10;
 fn whole_messages(b: &[u8]) -> usize {
     let mut at = 0;
     while at + 4 <= b.len() {
-        let len = (usize::from(b[at + 1]) << 16) | usize::from(be16(b, at + 2));
+        let Some(len) = be24(b, at + 1) else { break; };
+        let len = len as usize;
         if at + 4 + len > b.len() {
             break;
         }
@@ -549,7 +551,8 @@ impl Tls {
         let mut at = 0;
         while at + 4 <= b.len() {
             let t = b[at];
-            let len = (usize::from(b[at + 1]) << 16) | usize::from(be16(b, at + 2));
+            let Some(len) = be24(b, at + 1) else { return names; };
+            let len = len as usize;
             let end = (at + 4 + len).min(b.len());
             let m = &b[at + 4..end];
             names.push(handshake_name(t).to_owned());
@@ -580,12 +583,12 @@ impl Tls {
                 2 if m.len() >= 38 && !decrypted => {
                     let sid = usize::from(m[34]);
                     if m.len() >= 35 + sid + 2 {
-                        let c = be16(m, 35 + sid);
+                        let Some(c) = be16(m, 35 + sid) else { return names; };
                         self.cipher = Some(c);
                         l.note("Cipher suite", cipher_name(c));
                     }
                     for (ext, data) in extensions(m, false) {
-                        if ext == 43 && data.len() == 2 && be16(data, 0) == 0x0304 {
+                        if ext == 43 && data.len() == 2 && be16(data, 0) == Some(0x0304) {
                             self.tls13 = true;
                             l.note("Version", "TLS 1.3");
                         }
@@ -636,7 +639,8 @@ fn extensions(m: &[u8], client: bool) -> Vec<(u16, &[u8])> {
         if i + 2 > m.len() {
             return Vec::new();
         }
-        i += 2 + usize::from(be16(m, i));
+        let Some(length) = be16(m, i) else { return Vec::new(); };
+        i += 2 + usize::from(length);
         let Some(&comp) = m.get(i) else {
             return Vec::new();
         };
@@ -653,10 +657,12 @@ fn extensions_at(m: &[u8], mut i: usize) -> Vec<(u16, &[u8])> {
     if i + 2 > m.len() {
         return out;
     }
-    let end = (i + 2 + usize::from(be16(m, i))).min(m.len());
+    let Some(length) = be16(m, i) else { return out; };
+    let end = (i + 2 + usize::from(length)).min(m.len());
     i += 2;
     while i + 4 <= end {
-        let (t, n) = (be16(m, i), usize::from(be16(m, i + 2)));
+        let (Some(t), Some(n)) = (be16(m, i), be16(m, i + 2)) else { return out; };
+        let n = usize::from(n);
         if i + 4 + n > end {
             break;
         }
@@ -664,14 +670,6 @@ fn extensions_at(m: &[u8], mut i: usize) -> Vec<(u16, &[u8])> {
         i += 4 + n;
     }
     out
-}
-
-fn be16(bytes: &[u8], at: usize) -> u16 {
-    at.checked_add(2)
-        .and_then(|end| bytes.get(at..end))
-        .and_then(|b| b.try_into().ok())
-        .map(u16::from_be_bytes)
-        .unwrap_or(0)
 }
 
 fn hex(bytes: &[u8]) -> String {

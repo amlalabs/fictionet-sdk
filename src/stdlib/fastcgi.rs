@@ -69,7 +69,7 @@
 
 extern crate alloc;
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{be16, Decode, Step, Wire};
 use alloc::{collections::BTreeMap, vec::Vec};
 
 /// The TCP port FastCGI applications such as PHP-FPM listen on by
@@ -341,7 +341,8 @@ impl Record {
         if b.len() < HEADER_LEN {
             return Ok(None);
         }
-        let content_len = usize::from(be16(b, 4));
+        let Some(content_len) = be16(b, 4).map(usize::from) else { return Ok(None); };
+        let Some(request_id) = be16(b, 2) else { return Ok(None); };
         let padding = b[6];
         let content_end = HEADER_LEN + content_len;
         let end = content_end + usize::from(padding);
@@ -349,7 +350,7 @@ impl Record {
             return Ok(None);
         }
         let record =
-            Record { kind: b[1], request_id: be16(b, 2), content: b[HEADER_LEN..content_end].to_vec(), padding };
+            Record { kind: b[1], request_id, content: b[HEADER_LEN..content_end].to_vec(), padding };
         Ok(Some((record, end)))
     }
 
@@ -648,7 +649,7 @@ macro_rules! fixed_body {
             /// Reserved bytes may hold anything.
             fn parse(content: &[u8]) -> Result<Self, Error> {
                 if content.len() != 8 { return Err(Error::BodyLength); }
-                Ok(($read)(content))
+                ($read)(content)
             }
 
             /// Appends eight bytes with zero reserved bytes. Refuses no values.
@@ -661,16 +662,16 @@ macro_rules! fixed_body {
 }
 
 fixed_body!(BeginRequest,
-    |b: &[u8]| BeginRequest { role: Role::from_code(be16(b, 0)), flags: b[2] },
+    |b: &[u8]| Ok(BeginRequest { role: Role::from_code(be16(b, 0).ok_or(Error::BodyLength)?), flags: b[2] }),
     |v: &BeginRequest| {
         let [a, b] = v.role.code().to_be_bytes();
         [a, b, v.flags, 0, 0, 0, 0, 0]
     });
 fixed_body!(EndRequest,
-    |b: &[u8]| EndRequest {
+    |b: &[u8]| Ok(EndRequest {
         app_status: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
         protocol_status: ProtocolStatus::from_code(b[4]),
-    },
+    }),
     |v: &EndRequest| {
         let [a, b, c, d] = v.app_status.to_be_bytes();
         [a, b, c, d, v.protocol_status.code(), 0, 0, 0]
@@ -684,7 +685,7 @@ pub struct UnknownType(
 );
 
 fixed_body!(UnknownType,
-    |b: &[u8]| UnknownType(b[0]),
+    |b: &[u8]| Ok(UnknownType(b[0])),
     |v: &UnknownType| [v.0, 0, 0, 0, 0, 0, 0, 0]);
 
 /// A list of FastCGI name and value pairs, bounded by [`MAX_PARAMS`].
@@ -1343,10 +1344,6 @@ impl Client {
             _ => Ok(None),
         }
     }
-}
-
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
 }
 
 #[cfg(test)]

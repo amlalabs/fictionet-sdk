@@ -60,10 +60,7 @@ pub(crate) fn pcapng(packets: &[(u64, &[u8])], keylog: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn u32_at(b: &[u8], i: usize) -> u32 {
-        u32::from_le_bytes(b[i..i + 4].try_into().unwrap())
-    }
+    use fictionet::stdlib::codec::le32;
 
     /// Walks the blocks: every block's two lengths agree and are a
     /// multiple of four, and the blocks come in the expected order.
@@ -74,9 +71,9 @@ mod tests {
         let mut kinds = Vec::new();
         let mut i = 0;
         while i < file.len() {
-            let (kind, len) = (u32_at(&file, i), u32_at(&file, i + 4) as usize);
+            let (kind, len) = (le32(&file, i).unwrap(), le32(&file, i + 4).unwrap() as usize);
             assert_eq!(len % 4, 0);
-            assert_eq!(u32_at(&file, i + len - 4) as usize, len);
+            assert_eq!(le32(&file, i + len - 4).unwrap() as usize, len);
             kinds.push(kind);
             i += len;
         }
@@ -84,7 +81,7 @@ mod tests {
         assert_eq!(kinds, [0x0a0d_0d0a, 1, 0x0a, 6]);
         // The packet block holds the packet whole.
         let epb = file.len() - (12 + 20 + 24);
-        assert_eq!(u32_at(&file, epb + 20), 21);
+        assert_eq!(le32(&file, epb + 20).unwrap(), 21);
         assert_eq!(&file[epb + 28..epb + 28 + 21], &packet);
     }
 }

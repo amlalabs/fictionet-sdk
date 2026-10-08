@@ -187,7 +187,7 @@ pub mod xr {
     pub const VOIP_METRICS: u8 = 7;
 }
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{be16, be32, Decode, Step, Wire};
 
 /// One RTCP packet: what it carries, and how many bytes of padding follow.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -644,14 +644,12 @@ impl XrBlock {
         if self.block_type != xr::DLRR || !self.data.len().is_multiple_of(12) {
             return None;
         }
-        Some(
-            self.data
-                .as_chunks::<12>()
-                .0
-                .iter()
-                .map(|c| DlrrItem { ssrc: be32(c, 0), last_rr: be32(c, 4), delay_since_last_rr: be32(c, 8) })
-                .collect(),
-        )
+        self.data
+            .as_chunks::<12>()
+            .0
+            .iter()
+            .map(|c| Some(DlrrItem { ssrc: be32(c, 0)?, last_rr: be32(c, 4)?, delay_since_last_rr: be32(c, 8)? }))
+            .collect()
     }
 }
 
@@ -766,12 +764,12 @@ impl Body {
                     return Err(bad);
                 }
                 Body::SenderReport(SenderReport {
-                    ssrc: be32(c, 0),
-                    ntp_timestamp: u64::from(be32(c, 4)) << 32 | u64::from(be32(c, 8)),
-                    rtp_timestamp: be32(c, 12),
-                    packet_count: be32(c, 16),
-                    octet_count: be32(c, 20),
-                    reports: report_blocks(&c[24..], n),
+                    ssrc: be32(c, 0).ok_or(bad)?,
+                    ntp_timestamp: u64::from(be32(c, 4).ok_or(bad)?) << 32 | u64::from(be32(c, 8).ok_or(bad)?),
+                    rtp_timestamp: be32(c, 12).ok_or(bad)?,
+                    packet_count: be32(c, 16).ok_or(bad)?,
+                    octet_count: be32(c, 20).ok_or(bad)?,
+                    reports: report_blocks(&c[24..], n)?,
                     extension: c[24 + n * REPORT_BLOCK_LEN..].to_vec(),
                 })
             }
@@ -780,8 +778,8 @@ impl Body {
                     return Err(bad);
                 }
                 Body::ReceiverReport(ReceiverReport {
-                    ssrc: be32(c, 0),
-                    reports: report_blocks(&c[4..], n),
+                    ssrc: be32(c, 0).ok_or(bad)?,
+                    reports: report_blocks(&c[4..], n)?,
                     extension: c[4 + n * REPORT_BLOCK_LEN..].to_vec(),
                 })
             }
@@ -790,7 +788,7 @@ impl Body {
                 if c.len() < 4 * n {
                     return Err(bad);
                 }
-                let sources = (0..n).map(|i| be32(c, 4 * i)).collect();
+                let sources = (0..n).map(|i| be32(c, 4 * i).ok_or(bad)).collect::<Result<_, _>>()?;
                 let rest = &c[4 * n..];
                 let reason = match rest.split_first() {
                     None => None,
@@ -814,7 +812,7 @@ impl Body {
                 }
                 Body::App(App {
                     subtype: count,
-                    ssrc: be32(c, 0),
+                    ssrc: be32(c, 0).ok_or(bad)?,
                     name: [c[4], c[5], c[6], c[7]],
                     data: c[8..].to_vec(),
                 })
@@ -824,14 +822,14 @@ impl Body {
                     return Err(bad);
                 }
                 let fci = &c[8..];
-                let mut media_ssrc = be32(c, 4);
+                let mut media_ssrc = be32(c, 4).ok_or(bad)?;
                 let message = match count {
                     rtpfb::NACK => {
                         if fci.is_empty() {
                             return Err(bad);
                         }
                         TransportMessage::Nack(
-                            fci.as_chunks::<4>().0.iter().map(|e| Nack { pid: be16(e, 0), blp: be16(e, 2) }).collect(),
+                            fci.as_chunks::<4>().0.iter().map(|e| Ok(Nack { pid: be16(e, 0).ok_or(bad)?, blp: be16(e, 2).ok_or(bad)? })).collect::<Result<_, Error>>()?,
                         )
                     }
                     rtpfb::TMMBR | rtpfb::TMMBN => {
@@ -843,15 +841,15 @@ impl Body {
                             .0
                             .iter()
                             .map(|e| {
-                                let v = be32(e, 4);
-                                Tmmb {
-                                    ssrc: be32(e, 0),
+                                let v = be32(e, 4).ok_or(bad)?;
+                                Ok(Tmmb {
+                                    ssrc: be32(e, 0).ok_or(bad)?,
                                     exponent: (v >> 26) as u8,
                                     mantissa: v >> 9 & 0x1_ffff,
                                     overhead: (v & 0x1ff) as u16,
-                                }
+                                })
                             })
-                            .collect();
+                            .collect::<Result<_, Error>>()?;
                         // The media SSRC is unused, and ignored on reading.
                         media_ssrc = 0;
                         if count == rtpfb::TMMBR {
@@ -862,14 +860,14 @@ impl Body {
                     }
                     fmt => TransportMessage::Other { fmt, fci: fci.to_vec() },
                 };
-                Body::TransportFeedback(TransportFeedback { sender_ssrc: be32(c, 0), media_ssrc, message })
+                Body::TransportFeedback(TransportFeedback { sender_ssrc: be32(c, 0).ok_or(bad)?, media_ssrc, message })
             }
             packet_type::PSFB => {
                 if c.len() < 8 {
                     return Err(bad);
                 }
                 let fci = &c[8..];
-                let mut media_ssrc = be32(c, 4);
+                let mut media_ssrc = be32(c, 4).ok_or(bad)?;
                 let message = match count {
                     psfb::PLI => {
                         if !fci.is_empty() {
@@ -884,14 +882,14 @@ impl Body {
                         PayloadMessage::Sli(
                             fci.as_chunks::<4>().0.iter()
                                 .map(|e| {
-                                    let v = be32(e, 0);
-                                    Sli {
+                                    let v = be32(e, 0).ok_or(bad)?;
+                                    Ok(Sli {
                                         first: (v >> 19) as u16,
                                         number: (v >> 6 & 0x1fff) as u16,
                                         picture_id: (v & 0x3f) as u8,
-                                    }
+                                    })
                                 })
-                                .collect(),
+                                .collect::<Result<_, Error>>()?,
                         )
                     }
                     psfb::RPSI => {
@@ -909,7 +907,7 @@ impl Body {
                         // The media SSRC is unused, and ignored on reading.
                         media_ssrc = 0;
                         PayloadMessage::Fir(
-                            fci.as_chunks::<8>().0.iter().map(|e| Fir { ssrc: be32(e, 0), sequence: e[4] }).collect(),
+                            fci.as_chunks::<8>().0.iter().map(|e| Ok(Fir { ssrc: be32(e, 0).ok_or(bad)?, sequence: e[4] })).collect::<Result<_, Error>>()?,
                         )
                     }
                     psfb::AFB if fci.starts_with(REMB_ID) => {
@@ -920,7 +918,7 @@ impl Body {
                     psfb::AFB => PayloadMessage::Afb(fci.to_vec()),
                     fmt => PayloadMessage::Other { fmt, fci: fci.to_vec() },
                 };
-                Body::PayloadFeedback(PayloadFeedback { sender_ssrc: be32(c, 0), media_ssrc, message })
+                Body::PayloadFeedback(PayloadFeedback { sender_ssrc: be32(c, 0).ok_or(bad)?, media_ssrc, message })
             }
             packet_type::XR => {
                 if c.len() < 4 {
@@ -931,7 +929,7 @@ impl Body {
                 while pos < c.len() {
                     // The header and the length it gives must fit.
                     let header = c.get(pos..pos + 4).ok_or(bad)?;
-                    let len = 4 * (usize::from(be16(header, 2)) + 1);
+                    let len = 4 * (usize::from(be16(header, 2).ok_or(bad)?) + 1);
                     let block = c.get(pos..pos + len).ok_or(bad)?;
                     let (block_type, data) = (header[0], &block[4..]);
                     if !xr_layout_ok(block_type, data.len()) {
@@ -942,7 +940,7 @@ impl Body {
                     blocks.push(XrBlock { block_type, type_specific, data: data.to_vec() });
                     pos += len;
                 }
-                Body::ExtendedReport(ExtendedReport { ssrc: be32(c, 0), blocks })
+                Body::ExtendedReport(ExtendedReport { ssrc: be32(c, 0).ok_or(bad)?, blocks })
             }
             _ => Body::Other { packet_type: pt, count, data: c.to_vec() },
         })
@@ -1190,7 +1188,7 @@ impl Packet {
         let padded = b[0] & 0x20 != 0;
         let count = b[0] & 0x1f;
         let pt = b[1];
-        let len = 4 * (usize::from(be16(b, 2)) + 1);
+        let len = 4 * (usize::from(be16(b, 2).ok_or(Error::Truncated)?) + 1);
         if len > MAX_PACKET {
             return Err(Error::TooLong(len));
         }
@@ -1554,22 +1552,22 @@ impl Decode for Frames {
 }
 
 /// Reads `n` report blocks from the start of `b`, which holds them all.
-fn report_blocks(b: &[u8], n: usize) -> Vec<ReportBlock> {
+fn report_blocks(b: &[u8], n: usize) -> Result<Vec<ReportBlock>, Error> {
     b.as_chunks::<REPORT_BLOCK_LEN>().0.iter()
         .take(n)
         .map(|r| {
-            let raw = be32(r, 4) & 0xff_ffff;
+            let raw = be32(r, 4).ok_or(Error::Truncated)? & 0xff_ffff;
             // Sign-extend the 24-bit loss.
             let lost = if raw & 0x80_0000 != 0 { raw as i32 - (1 << 24) } else { raw as i32 };
-            ReportBlock {
-                ssrc: be32(r, 0),
+            Ok(ReportBlock {
+                ssrc: be32(r, 0).ok_or(Error::Truncated)?,
                 fraction_lost: r[4],
                 cumulative_lost: lost,
-                highest_sequence: be32(r, 8),
-                jitter: be32(r, 12),
-                last_sr: be32(r, 16),
-                delay_since_last_sr: be32(r, 20),
-            }
+                highest_sequence: be32(r, 8).ok_or(Error::Truncated)?,
+                jitter: be32(r, 12).ok_or(Error::Truncated)?,
+                last_sr: be32(r, 16).ok_or(Error::Truncated)?,
+                delay_since_last_sr: be32(r, 20).ok_or(Error::Truncated)?,
+            })
         })
         .collect()
 }
@@ -1607,7 +1605,7 @@ fn parse_sdes(c: &[u8], n: usize) -> Option<Vec<SdesChunk>> {
     let mut chunks = Vec::new();
     let mut pos = 0usize;
     for _ in 0..n {
-        let ssrc = be32(c.get(pos..pos + 4)?, 0);
+        let ssrc = be32(c.get(pos..pos + 4)?, 0)?;
         pos += 4;
         let mut items = Vec::new();
         loop {
@@ -1648,7 +1646,7 @@ fn parse_remb(fci: &[u8]) -> Option<Remb> {
     if !head.starts_with(REMB_ID) {
         return None;
     }
-    let v = be32(head, 4);
+    let v = be32(head, 4)?;
     let n = (v >> 24) as usize;
     if n == 0 || rest.len() != 4 * n {
         return None;
@@ -1656,7 +1654,7 @@ fn parse_remb(fci: &[u8]) -> Option<Remb> {
     Some(Remb {
         exponent: (v >> 18 & 0x3f) as u8,
         mantissa: v & 0x3_ffff,
-        ssrcs: rest.as_chunks::<4>().0.iter().map(|s| be32(s, 0)).collect(),
+        ssrcs: rest.as_chunks::<4>().0.iter().map(|s| be32(s, 0)).collect::<Option<_>>()?,
     })
 }
 
@@ -1761,24 +1759,6 @@ fn check_size(n: usize) -> Result<(), Error> {
         Err(Error::Unwritable)
     } else {
         Ok(())
-    }
-}
-
-/// The big-endian `u16` at `b[i..i + 2]`, or 0 past the end. Callers check
-/// lengths first.
-fn be16(b: &[u8], i: usize) -> u16 {
-    match b.get(i..i + 2) {
-        Some(&[x, y]) => u16::from_be_bytes([x, y]),
-        _ => 0,
-    }
-}
-
-/// The big-endian `u32` at `b[i..i + 4]`, or 0 past the end. Callers check
-/// lengths first.
-fn be32(b: &[u8], i: usize) -> u32 {
-    match b.get(i..i + 4) {
-        Some(&[w, x, y, z]) => u32::from_be_bytes([w, x, y, z]),
-        _ => 0,
     }
 }
 

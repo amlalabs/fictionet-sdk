@@ -59,6 +59,7 @@
 //! assert_eq!(Header::parse(&bytes), Ok(header));
 //! ```
 
+use fictionet::stdlib::codec::be16;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use fictionet::stdlib::codec::{self, Decode, Wire};
@@ -727,10 +728,6 @@ impl Addresses {
     }
 }
 
-fn be16(b: &[u8], at: usize) -> u16 {
-    u16::from_be_bytes([b[at], b[at + 1]])
-}
-
 /// The address block length and transport for a family and transport
 /// byte, or `None` if the specification does not allow the byte.
 fn family(fam: u8) -> Option<(usize, Transport)> {
@@ -765,7 +762,7 @@ fn parse_v2(b: &[u8]) -> Result<Option<(V2, usize)>, Error> {
     if b.len() < V2_HEADER_LEN {
         return Ok(None);
     }
-    let len = be16(b, 14);
+    let len = be16(b, 14).ok_or(Error::Truncated)?;
     if let (true, Some((block, _))) = (proxy, family(fam))
         && usize::from(len) < block {
             return Err(Error::Length(len));
@@ -791,7 +788,7 @@ fn parse_v2(b: &[u8]) -> Result<Option<(V2, usize)>, Error> {
 /// `b[..total]`, whose family and transport byte is `fam`.
 fn parse_v2_body(b: &[u8], fam: u8, total: usize) -> Result<(Addresses, Vec<Tlv>), Error> {
     let (block, transport) = family(fam).ok_or(Error::Family(fam))?;
-    let len = be16(b, 14);
+    let len = be16(b, 14).ok_or(Error::Truncated)?;
     if usize::from(len) < block {
         return Err(Error::Length(len));
     }
@@ -801,8 +798,8 @@ fn parse_v2_body(b: &[u8], fam: u8, total: usize) -> Result<(Addresses, Vec<Tlv>
             transport,
             src: Ipv4Addr::new(a[0], a[1], a[2], a[3]),
             dst: Ipv4Addr::new(a[4], a[5], a[6], a[7]),
-            src_port: be16(a, 8),
-            dst_port: be16(a, 10),
+            src_port: be16(a, 8).ok_or(Error::Truncated)?,
+            dst_port: be16(a, 10).ok_or(Error::Truncated)?,
         },
         2 => {
             let mut src = [0u8; 16];
@@ -813,8 +810,8 @@ fn parse_v2_body(b: &[u8], fam: u8, total: usize) -> Result<(Addresses, Vec<Tlv>
                 transport,
                 src: Ipv6Addr::from(src),
                 dst: Ipv6Addr::from(dst),
-                src_port: be16(a, 32),
-                dst_port: be16(a, 34),
+                src_port: be16(a, 32).ok_or(Error::Truncated)?,
+                dst_port: be16(a, 34).ok_or(Error::Truncated)?,
             }
         }
         3 => {
@@ -880,7 +877,7 @@ fn next_tlv(b: &[u8], i: usize, end: usize) -> Result<(u8, &[u8], usize, usize),
     }
     let kind = b[i];
     let value_at = i + 3;
-    let next = value_at + usize::from(be16(b, i + 1));
+    let next = value_at + usize::from(be16(b, i + 1).ok_or(Error::TlvTruncated)?);
     if next > end {
         return Err(Error::TlvTruncated);
     }

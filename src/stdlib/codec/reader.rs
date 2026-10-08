@@ -2,6 +2,72 @@
 
 use core::fmt;
 
+/// Reads a 2-byte big-endian integer at `at`.
+/// Returns `None` if the full value is unavailable, including offset overflow.
+#[inline]
+pub fn be16(bytes: &[u8], at: usize) -> Option<u16> {
+    let end = at.checked_add(2)?;
+    Some(u16::from_be_bytes(bytes.get(at..end)?.try_into().ok()?))
+}
+
+/// Reads a 3-byte big-endian integer at `at`.
+/// Returns `None` if the full value is unavailable, including offset overflow.
+#[inline]
+pub fn be24(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(3)?;
+    let &[a, b, c] = bytes.get(at..end)? else { return None; };
+    Some(u32::from_be_bytes([0, a, b, c]))
+}
+
+/// Reads a 4-byte big-endian integer at `at`.
+/// Returns `None` if the full value is unavailable, including offset overflow.
+#[inline]
+pub fn be32(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(4)?;
+    Some(u32::from_be_bytes(bytes.get(at..end)?.try_into().ok()?))
+}
+
+/// Reads a 2-byte little-endian integer at `at`.
+/// Returns `None` if the full value is unavailable, including offset overflow.
+#[inline]
+pub fn le16(bytes: &[u8], at: usize) -> Option<u16> {
+    let end = at.checked_add(2)?;
+    Some(u16::from_le_bytes(bytes.get(at..end)?.try_into().ok()?))
+}
+
+/// Reads a 3-byte little-endian integer at `at`.
+/// Returns `None` if the full value is unavailable, including offset overflow.
+#[inline]
+pub fn le24(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(3)?;
+    let &[a, b, c] = bytes.get(at..end)? else { return None; };
+    Some(u32::from_le_bytes([a, b, c, 0]))
+}
+
+/// Reads a 4-byte little-endian integer at `at`.
+/// Returns `None` if the full value is unavailable, including offset overflow.
+#[inline]
+pub fn le32(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(4)?;
+    Some(u32::from_le_bytes(bytes.get(at..end)?.try_into().ok()?))
+}
+
+/// Reads an 8-byte big-endian integer at `at`.
+/// Returns `None` if the full value is unavailable, including offset overflow.
+#[inline]
+pub fn be64(bytes: &[u8], at: usize) -> Option<u64> {
+    let end = at.checked_add(8)?;
+    Some(u64::from_be_bytes(bytes.get(at..end)?.try_into().ok()?))
+}
+
+/// Reads an 8-byte little-endian integer at `at`.
+/// Returns `None` if the full value is unavailable, including offset overflow.
+#[inline]
+pub fn le64(bytes: &[u8], at: usize) -> Option<u64> {
+    let end = at.checked_add(8)?;
+    Some(u64::from_le_bytes(bytes.get(at..end)?.try_into().ok()?))
+}
+
 /// Input ended inside a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Truncated;
@@ -169,6 +235,34 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_offsets_check_every_width_and_overflow() {
+        let bytes = [0xff, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0];
+        macro_rules! check {
+            ($read:ident, $width:expr, $value:expr) => {{
+                assert_eq!($read(&bytes, 1), Some($value));
+                assert_eq!($read(&bytes[1..1 + $width], 0), Some($value));
+                for len in 0..$width {
+                    assert_eq!($read(&bytes[1..1 + len], 0), None);
+                    assert_eq!($read(&bytes[..1 + len], 1), None);
+                }
+                for at in [bytes.len(), bytes.len() + 1, usize::MAX - 1, usize::MAX] {
+                    assert_eq!($read(&bytes, at), None);
+                    assert_eq!($read(&[], at), None);
+                }
+                assert_eq!($read(&[0; 8], 0), Some(0));
+            }};
+        }
+        check!(be16, 2, 0x1234);
+        check!(le16, 2, 0x3412);
+        check!(be24, 3, 0x123456);
+        check!(le24, 3, 0x563412);
+        check!(be32, 4, 0x12345678);
+        check!(le32, 4, 0x78563412);
+        check!(be64, 8, 0x123456789abcdef0);
+        check!(le64, 8, 0xf0debc9a78563412);
+    }
 
     #[test]
     fn truncated_reads_keep_position() {

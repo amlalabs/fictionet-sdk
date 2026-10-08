@@ -30,7 +30,7 @@
 //! assert_eq!(Frame::parse_prefix(&bytes).unwrap(), Some((frame, bytes.len())));
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{le16, le24, Decode, Step, Wire};
 
 /// The TCP port IEC 104 servers normally listen on.
 pub const PORT: u16 = 2404;
@@ -183,8 +183,8 @@ impl Frame {
                 return Ok(None);
             }
             Self::Information {
-                send: le16(b, 2) >> 1,
-                receive: le16(b, 4) >> 1,
+                send: le16(b, 2).ok_or(Error::Truncated)? >> 1,
+                receive: le16(b, 4).ok_or(Error::Truncated)? >> 1,
                 asdu: b[HEADER_LEN..end].to_vec(),
             }
         } else {
@@ -196,7 +196,7 @@ impl Frame {
                     return Err(Error::Control);
                 }
                 Self::Supervisory {
-                    receive: le16(b, 4) >> 1,
+                    receive: le16(b, 4).ok_or(Error::Truncated)? >> 1,
                 }
             } else {
                 if b[3..6] != [0, 0, 0] {
@@ -299,13 +299,6 @@ impl Decode for Frames {
     }
 }
 
-fn le16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
-}
-fn le24(b: &[u8]) -> u32 {
-    u32::from(b[0]) | u32::from(b[1]) << 8 | u32::from(b[2]) << 16
-}
-
 /// An ASDU header followed by opaque information object bytes. Unknown
 /// type IDs and causes are preserved. Object layout is checked separately
 /// by [`Asdu::objects`], because it depends on the type ID.
@@ -372,7 +365,7 @@ impl Asdu {
         if count == 0 {
             return Ok(Vec::new());
         }
-        let first = le24(&self.data);
+        let first = le24(&self.data, 0).ok_or(Error::Objects)?;
         if self.sequence && first + count as u32 - 1 > MAX_ADDRESS {
             return Err(Error::Address);
         }
@@ -382,7 +375,7 @@ impl Asdu {
             let address = if self.sequence {
                 first + i as u32
             } else {
-                let address = le24(&self.data[at..]);
+                let address = le24(&self.data, at).ok_or(Error::Objects)?;
                 at += 3;
                 address
             };
@@ -452,7 +445,7 @@ impl Wire for Asdu {
             negative: b[2] & 0x40 != 0,
             test: b[2] & 0x80 != 0,
             originator: b[3],
-            common_address: le16(b, 4),
+            common_address: le16(b, 4).ok_or(Error::Truncated)?,
             data: b[6..].to_vec(),
         })
     }

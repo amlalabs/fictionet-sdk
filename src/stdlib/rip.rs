@@ -82,7 +82,7 @@
 //! assert_eq!(Message::parse(&bytes), Ok(reply));
 //! ```
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{be16, be32, Wire};
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -524,7 +524,7 @@ impl Routes {
     /// Reads entry number `self.entry`, the 20 bytes `e` at offset `at`.
     fn entry_at(&mut self, command: Command, version: Version, at: usize, e: &[u8]) -> Result<(), Error> {
         let entry = self.entry;
-        let fam = be16(e, 0);
+        let fam = be16(e, 0).ok_or(Error::Truncated)?;
         if version == Version::V1 && (fam == family::WHOLE_TABLE || fam == family::INET) {
             for (off, len) in [(2, 2), (8, 4), (12, 4)] {
                 if e[off..off + len].iter().any(|&x| x != 0) {
@@ -537,13 +537,13 @@ impl Routes {
                 if entry != 0 {
                     return Err(Error::AuthPlace { entry });
                 }
-                let kind = be16(e, 2);
+                let kind = be16(e, 2).ok_or(Error::Truncated)?;
                 let mut data = [0u8; 16];
                 data.copy_from_slice(&e[4..20]);
                 self.auth = Some(match kind {
                     auth_type::PASSWORD => Auth::Password(data),
                     auth_type::CRYPTO => {
-                        let packet_len = be16(e, 4);
+                        let packet_len = be16(e, 4).ok_or(Error::Truncated)?;
                         let n = usize::from(packet_len);
                         let ok = n >= HEADER_LEN + ENTRY_LEN
                             && (n - HEADER_LEN).is_multiple_of(ENTRY_LEN)
@@ -552,7 +552,7 @@ impl Routes {
                             return Err(Error::PacketLength(packet_len));
                         }
                         self.entries_end = Some(n);
-                        Auth::Crypto(Crypto { key_id: e[6], data_len: e[7], sequence: be32(e, 8), data: Vec::new() })
+                        Auth::Crypto(Crypto { key_id: e[6], data_len: e[7], sequence: be32(e, 8).ok_or(Error::Truncated)?, data: Vec::new() })
                     }
                     _ => Auth::Other { kind, data },
                 });
@@ -562,7 +562,7 @@ impl Routes {
                 // other fields are ignored. It must be the first entry
                 // after any authentication entry.
                 let first = entry == usize::from(self.auth.is_some());
-                if command != Command::Request || self.whole || !first || be32(e, 16) != u32::from(INFINITY) {
+                if command != Command::Request || self.whole || !first || be32(e, 16).ok_or(Error::Truncated)? != u32::from(INFINITY) {
                     return Err(Error::WholeTable { entry });
                 }
                 self.whole = true;
@@ -571,19 +571,19 @@ impl Routes {
                 if self.whole {
                     return Err(Error::WholeTable { entry });
                 }
-                let mask = be32(e, 8);
+                let mask = be32(e, 8).ok_or(Error::Truncated)?;
                 if !contiguous(mask) {
                     return Err(Error::Mask { entry });
                 }
-                let metric = be32(e, 16);
+                let metric = be32(e, 16).ok_or(Error::Truncated)?;
                 if !command.allows_metric(metric) {
                     return Err(Error::Metric { entry, metric });
                 }
                 self.routes.push(RouteEntry {
-                    tag: be16(e, 2),
-                    address: Ipv4Addr::from(be32(e, 4)),
+                    tag: be16(e, 2).ok_or(Error::Truncated)?,
+                    address: Ipv4Addr::from(be32(e, 4).ok_or(Error::Truncated)?),
                     mask: Ipv4Addr::from(mask),
-                    next_hop: Ipv4Addr::from(be32(e, 12)),
+                    next_hop: Ipv4Addr::from(be32(e, 12).ok_or(Error::Truncated)?),
                     // Checked above to be at most 16.
                     metric: metric as u8,
                 });
@@ -718,7 +718,7 @@ fn ng_entry(command: Command, entry: usize, e: &[u8]) -> Result<NgEntry, Error> 
     if !command.allows_metric(u32::from(metric)) {
         return Err(Error::Metric { entry, metric: u32::from(metric) });
     }
-    Ok(NgEntry::Route(NgRoute { prefix, tag: be16(e, 16), prefix_len, metric }))
+    Ok(NgEntry::Route(NgRoute { prefix, tag: be16(e, 16).ok_or(Error::Truncated)?, prefix_len, metric }))
 }
 
 /// Whether a route asks for the whole table when it is a request's only
@@ -759,14 +759,6 @@ fn scan_ng(b: &[u8], mut skip: Option<&mut Vec<Error>>) -> Result<NgMessage, Err
         command == Command::Request && count == 1 && matches!(entries[..], [NgEntry::Route(r)] if is_whole_table_ng(r));
     let entries = if whole { NgEntries::WholeTable } else { NgEntries::Entries(entries) };
     Ok(NgMessage { command, entries })
-}
-
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
-fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
 }
 
 impl Wire for Message {

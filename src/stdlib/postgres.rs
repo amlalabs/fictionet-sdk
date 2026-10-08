@@ -74,6 +74,7 @@
 //! assert_eq!(bytes[bytes.len() - 6..], *b"Z\0\0\0\x05I");
 //! ```
 
+use fictionet::stdlib::codec::be32;
 use fictionet::stdlib::codec::Reader as ByteReader;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -2108,7 +2109,7 @@ fn split_typed(b: &[u8], limit: fn(u8) -> Option<usize>, max: usize) -> Result<O
     if b.len() < 5 {
         return Ok(None);
     }
-    let length = be32(b, 1);
+    let Some(length) = be32(b, 1) else { return Ok(None); };
     if length < 4 {
         return Err(Error::BadLength(length));
     }
@@ -2129,7 +2130,7 @@ fn split_startup(b: &[u8]) -> Result<Option<(&[u8], usize)>, Error> {
     if b.len() < 4 {
         return Ok(None);
     }
-    let length = be32(b, 0);
+    let Some(length) = be32(b, 0) else { return Ok(None); };
     if length < 8 {
         return Err(Error::BadLength(length));
     }
@@ -2138,7 +2139,7 @@ fn split_startup(b: &[u8]) -> Result<Option<(&[u8], usize)>, Error> {
         return Err(Error::TooLong { length, max: MAX_STARTUP + 4 });
     }
     if b.len() >= 8 {
-        let code = be32(b, 4);
+        let code = be32(b, 4).ok_or(Error::Incomplete)?;
         let known = matches!(code, SSL_REQUEST_CODE | GSSENC_REQUEST_CODE | CANCEL_REQUEST_CODE) || code >> 16 == 3;
         if !known {
             return Err(Error::UnsupportedProtocol(code));
@@ -2504,10 +2505,6 @@ impl<'a> Fields<'a> {
 /// The bytes a value takes: its length field and its bytes.
 fn value_size(v: Option<&[u8]>) -> usize {
     4usize.saturating_add(v.map_or(0, <[u8]>::len))
-}
-
-fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
 }
 
 /// A type byte for a message: the letter in quotes, or its number.

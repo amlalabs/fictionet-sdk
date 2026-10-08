@@ -53,6 +53,7 @@
 //! assert_eq!(reply.to_bytes().unwrap(), [5, 0, 0, 1, 10, 0, 0, 1, 0x10, 0xe1]);
 //! ```
 
+use fictionet::stdlib::codec::be16;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::codec::{self, Step, Wire};
@@ -860,7 +861,7 @@ fn parse_endpoint(b: &[u8], at: usize) -> Result<Option<(Address, u16, usize)>, 
         }
         _ => Address::Domain(raw.to_vec()),
     };
-    Ok(Some((address, be16(b, start + len), end)))
+    Ok(Some((address, be16(b, start + len).ok_or(Error::Truncated)?, end)))
 }
 
 /// Checks the first byte of `b` is `version`, if it has come.
@@ -1238,7 +1239,7 @@ impl Socks4Request {
         if b.len() < 8 {
             return Ok(None);
         }
-        let port = be16(b, 2);
+        let port = be16(b, 2).ok_or(Error::Truncated)?;
         let ip = Ipv4Addr::new(b[4], b[5], b[6], b[7]);
         let Some(nul) = find_nul(b, 8, MAX_USER_ID)? else { return Ok(None) };
         // Nothing is copied until the whole request has come.
@@ -1319,7 +1320,7 @@ impl Socks4Reply {
         }
         let reply = Socks4Reply {
             code: Socks4Code::from_code(b[1]),
-            port: be16(b, 2),
+            port: be16(b, 2).ok_or(Error::Truncated)?,
             ip: Ipv4Addr::new(b[4], b[5], b[6], b[7]),
         };
         Ok(Some((reply, SOCKS4_REPLY_LEN)))
@@ -1404,10 +1405,6 @@ pub enum ClientPhase {
     /// The proxy broke the protocol, or decoding failed. No tunnel handoff
     /// is allowed. The stream reports the error once.
     Failed,
-}
-
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
 }
 
 #[cfg(test)]

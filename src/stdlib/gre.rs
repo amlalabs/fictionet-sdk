@@ -48,7 +48,7 @@
 //! assert_eq!(back.header.key(), Some(7));
 //! ```
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{be16, be32, Wire};
 use fictionet::stdlib::ip::checksum;
 
 /// The IP protocol number that marks a GRE packet.
@@ -203,14 +203,6 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-fn be16(b: &[u8], at: usize) -> u16 {
-    u16::from_be_bytes([b[at], b[at + 1]])
-}
-
-fn be32(b: &[u8], at: usize) -> u32 {
-    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
-}
-
 impl Header {
     /// The version the header is written with: [`VERSION_GRE`] or
     /// [`VERSION_PPTP`].
@@ -272,7 +264,7 @@ impl Header {
         if b.len() < 2 {
             return Ok(None);
         }
-        let flags = be16(b, 0);
+        let flags = be16(b, 0).ok_or(Error::Truncated)?;
         let version = (flags & VERSION_BITS) as u8;
         match version {
             VERSION_GRE => {
@@ -295,7 +287,7 @@ impl Header {
         if b.len() < BASE_HEADER_LEN {
             return Ok(None);
         }
-        let proto = be16(b, 2);
+        let proto = be16(b, 2).ok_or(Error::Truncated)?;
         if version == VERSION_PPTP && proto != protocol::PPP {
             return Err(Error::PptpProtocol(proto));
         }
@@ -321,30 +313,30 @@ impl Header {
         // Fill in the fields, in the order they appear.
         let mut at = BASE_HEADER_LEN;
         let mut next = || {
-            let v = be32(b, at);
+            let v = be32(b, at).ok_or(Error::Truncated)?;
             at += FIELD_LEN;
-            v
+            Ok::<_, Error>(v)
         };
         let header = match header {
             Header::Gre(mut h) => {
                 if h.checksum {
                     // The checksum is checked over the whole packet, and
                     // the reserved half is ignored.
-                    next();
+                    next()?;
                 }
-                h.key = h.key.map(|_| next());
-                h.sequence = h.sequence.map(|_| next());
+                h.key = h.key.map(|_| next()).transpose()?;
+                h.sequence = h.sequence.map(|_| next()).transpose()?;
                 Header::Gre(h)
             }
             Header::Pptp(mut h) => {
                 // The payload length is the high half of the key field.
-                let has_payload = be16(b, BASE_HEADER_LEN) != 0;
+                let has_payload = be16(b, BASE_HEADER_LEN).ok_or(Error::Truncated)? != 0;
                 if h.sequence.is_some() != has_payload {
                     return Err(Error::PptpSequence);
                 }
-                h.call_id = next() as u16;
-                h.sequence = h.sequence.map(|_| next());
-                h.ack = h.ack.map(|_| next());
+                h.call_id = next()? as u16;
+                h.sequence = h.sequence.map(|_| next()).transpose()?;
+                h.ack = h.ack.map(|_| next()).transpose()?;
                 Header::Pptp(h)
             }
         };
@@ -368,7 +360,7 @@ impl Header {
                 Ok((header, &b[used..]))
             }
             Header::Pptp(_) => {
-                let end = used.checked_add(usize::from(be16(b, BASE_HEADER_LEN)))
+                let end = used.checked_add(usize::from(be16(b, BASE_HEADER_LEN).ok_or(Error::Truncated)?))
                     .ok_or(Error::TooLong)?;
                 let payload = b.get(used..end).ok_or(Error::Truncated)?;
                 if end != b.len() {

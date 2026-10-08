@@ -64,7 +64,7 @@
 //! assert_eq!(TokenStream::parse(&message.data), Ok(reply));
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated, Trailing};
+use fictionet::stdlib::codec::{be16, le16, le32, le64, Decode, Step, Wire, Reader, Truncated, Trailing};
 
 /// The TCP port SQL Server listens on.
 pub const PORT: u16 = 1433;
@@ -431,7 +431,7 @@ impl Packet {
         if b.len() < 4 {
             return Ok(None);
         }
-        let length = be16(b, 2);
+        let length = be16(b, 2).ok_or(Error::Truncated)?;
         if usize::from(length) < HEADER_LEN {
             return Err(Error::Length(length));
         }
@@ -443,7 +443,7 @@ impl Packet {
         let packet = Packet {
             packet_type: b[0],
             status: b[1],
-            spid: be16(b, 4),
+            spid: be16(b, 4).ok_or(Error::Truncated)?,
             id: b[6],
             window: b[7],
             data: b[HEADER_LEN..end].to_vec(),
@@ -678,9 +678,10 @@ impl Decode for Messages {
         if total > self.limit { return Err(Error::TooLong(total)); }
         let Some(packet) = input.get(..used) else { return Ok(Step::Need) };
         let resets = status::RESET_CONNECTION | status::RESET_CONNECTION_SKIP_TRAN;
-        let mut message = self.partial.take().unwrap_or_else(|| Message {
-            packet_type: kind, status: bits & resets, spid: be16(packet, 4), data: Vec::new(),
-        });
+        let mut message = match self.partial.take() {
+            Some(message) => message,
+            None => Message { packet_type: kind, status: bits & resets, spid: be16(packet, 4).ok_or(Error::Truncated)?, data: Vec::new() },
+        };
         let last = bits & status::EOM != 0;
         message.status |= bits & !(resets | status::IGNORE);
         if last { message.status |= bits & status::IGNORE; }
@@ -793,7 +794,7 @@ impl Wire for Version {
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() < 6 { return Err(Error::Truncated); }
         if bytes.len() > 6 { return Err(Error::Invalid("bytes after VERSION")); }
-        Ok(Self { major: bytes[0], minor: bytes[1], build: be16(bytes, 2), sub_build: be16(bytes, 4) })
+        Ok(Self { major: bytes[0], minor: bytes[1], build: be16(bytes, 2).ok_or(Error::Truncated)?, sub_build: be16(bytes, 4).ok_or(Error::Truncated)? })
     }
 
     /// Appends the six version bytes. Every value is representable.
@@ -847,8 +848,8 @@ impl Prelogin {
                 return Err(Error::Limit("PRELOGIN options"));
             }
             let entry = data.get(i..i + 5).ok_or(Error::Truncated)?;
-            let offset = usize::from(be16(entry, 1));
-            let len = usize::from(be16(entry, 3));
+            let offset = usize::from(be16(entry, 1).ok_or(Error::Truncated)?);
+            let len = usize::from(be16(entry, 3).ok_or(Error::Truncated)?);
             let bytes = data
                 .get(offset..offset + len)
                 .ok_or(Error::Invalid("PRELOGIN option outside the message"))?;
@@ -951,8 +952,8 @@ impl Prelogin {
         Some(Version {
             major: b[0],
             minor: b[1],
-            build: be16(b, 2),
-            sub_build: be16(b, 4),
+            build: be16(b, 2)?,
+            sub_build: be16(b, 4)?,
         })
     }
 
@@ -1085,7 +1086,7 @@ impl Login7 {
         if data.len() < LOGIN7_FIXED_LEN {
             return Err(Error::Truncated);
         }
-        let length = le32(data, 0) as usize;
+        let length = le32(data, 0).ok_or(Error::Truncated)? as usize;
         if !(LOGIN7_FIXED_LEN..=MAX_LOGIN7).contains(&length) {
             return Err(Error::Invalid("LOGIN7 length"));
         }
@@ -1093,22 +1094,22 @@ impl Login7 {
         if data.len() != length { return Err(Error::Invalid("bytes after LOGIN7")); }
         // ibHostName marks where the variable part starts, even when the
         // host name is empty.
-        let host_at = usize::from(le16(b, 36));
+        let host_at = usize::from(le16(b, 36).ok_or(Error::Truncated)?);
         if host_at < LOGIN7_FIXED_LEN || host_at > length {
             return Err(Error::Invalid("LOGIN7 host name offset"));
         }
-        let field = |at: usize| (usize::from(le16(b, at)), usize::from(le16(b, at + 2)));
+        let field = |at: usize| -> Result<_, Error> { Ok((usize::from(le16(b, at).ok_or(Error::Truncated)?), usize::from(le16(b, at + 2).ok_or(Error::Truncated)?))) };
         let text = |at: usize, max: usize| -> Result<String, Error> {
-            let (ib, cch) = field(at);
+            let (ib, cch) = field(at)?;
             Ok(utf16_string(login_bytes(b, ib, cch, max)?))
         };
         let option_flags3 = b[27];
         let password = {
-            let (ib, cch) = field(44);
+            let (ib, cch) = field(44)?;
             utf16_string(&deobfuscate(login_bytes(b, ib, cch, MAX_LOGIN_NAME)?))
         };
         let change_password = {
-            let (ib, cch) = field(86);
+            let (ib, cch) = field(86)?;
             // MS-TDS 2.2.6.4: without fChangePassword, ibChangePassword
             // MUST be 0, so there is no new password.
             if cch > 0 && option_flags3 & option_flags3::CHANGE_PASSWORD == 0 {
@@ -1119,10 +1120,10 @@ impl Login7 {
             utf16_string(&deobfuscate(login_bytes(b, ib, cch, MAX_LOGIN_NAME)?))
         };
         let sspi = {
-            let (ib, cb) = field(78);
+            let (ib, cb) = field(78)?;
             let mut len = cb;
             if cb == 0xffff {
-                let long = le32(b, 90) as usize;
+                let long = le32(b, 90).ok_or(Error::Truncated)? as usize;
                 if long > 0 {
                     len = long;
                 }
@@ -1137,12 +1138,12 @@ impl Login7 {
             }
         };
         let features = if option_flags3 & option_flags3::EXTENSION != 0 {
-            let (ib, cb) = field(56);
+            let (ib, cb) = field(56)?;
             if !(4..=MAX_LOGIN7_EXTENSION).contains(&cb) {
                 return Err(Error::Invalid("LOGIN7 extension length"));
             }
             let pointer = login_field(b, ib, cb)?;
-            let at = le32(pointer, 0) as usize;
+            let at = le32(pointer, 0).ok_or(Error::Truncated)? as usize;
             if at == 0 {
                 Some(Vec::new())
             } else {
@@ -1164,8 +1165,8 @@ impl Login7 {
         // after the other, so their lengths added up must fit too.
         let strings: usize = [36, 40, 44, 48, 52, 60, 64, 68, 82, 86]
             .iter()
-            .map(|&at| 2 * field(at).1)
-            .sum();
+            .map(|&at| field(at).map(|(_, len)| 2 * len))
+            .sum::<Result<usize, _>>()?;
         let block = match &features {
             None => 0,
             Some(f) if f.is_empty() => 4,
@@ -1177,17 +1178,17 @@ impl Login7 {
         let mut client_id = [0u8; 6];
         client_id.copy_from_slice(&b[72..78]);
         Ok(Login7 {
-            tds_version: le32(b, 4),
-            packet_size: le32(b, 8),
-            client_prog_ver: le32(b, 12),
-            client_pid: le32(b, 16),
-            connection_id: le32(b, 20),
+            tds_version: le32(b, 4).ok_or(Error::Truncated)?,
+            packet_size: le32(b, 8).ok_or(Error::Truncated)?,
+            client_prog_ver: le32(b, 12).ok_or(Error::Truncated)?,
+            client_pid: le32(b, 16).ok_or(Error::Truncated)?,
+            connection_id: le32(b, 20).ok_or(Error::Truncated)?,
             option_flags1: b[24],
             option_flags2: b[25],
             type_flags: b[26],
             option_flags3,
-            client_time_zone: le32(b, 28) as i32,
-            client_lcid: le32(b, 32),
+            client_time_zone: le32(b, 28).ok_or(Error::Truncated)? as i32,
+            client_lcid: le32(b, 32).ok_or(Error::Truncated)?,
             host_name: text(36, MAX_LOGIN_NAME)?,
             user_name: text(40, MAX_LOGIN_NAME)?,
             password,
@@ -1817,28 +1818,24 @@ fn widths(ty: u8) -> &'static [usize] {
 }
 
 /// A fixed or one-byte-length value of `ty`, from its bytes.
-fn decode_number(ty: u8, b: &[u8]) -> Value {
+fn decode_number(ty: u8, b: &[u8]) -> Result<Value, Error> {
     use data_type::*;
-    let le = |n: usize| -> u64 {
-        let mut x = [0u8; 8];
-        x[..n].copy_from_slice(&b[..n]);
-        u64::from_le_bytes(x)
-    };
-    match (ty, b.len()) {
+
+    Ok(match (ty, b.len()) {
         (BIT | BITN, _) => Value::Bit(b[0] != 0),
-        (FLT4 | FLTN, 4) => Value::Real(le(4) as u32),
-        (FLT8 | FLTN, 8) => Value::Float(le(8)),
-        (MONEY4 | MONEYN, 4) => Value::SmallMoney(le(4) as u32 as i32),
+        (FLT4 | FLTN, 4) => Value::Real(le32(b, 0).ok_or(Error::Truncated)?),
+        (FLT8 | FLTN, 8) => Value::Float(le64(b, 0).ok_or(Error::Truncated)?),
+        (MONEY4 | MONEYN, 4) => Value::SmallMoney(le32(b, 0).ok_or(Error::Truncated)? as i32),
         (MONEY | MONEYN, 8) => {
-            Value::Money((((le(4) as u32 as u64) << 32) | u64::from(le32(b, 4))) as i64)
+            Value::Money((((u64::from(le32(b, 0).ok_or(Error::Truncated)?)) << 32) | u64::from(le32(b, 4).ok_or(Error::Truncated)?)) as i64)
         }
         (DATETIM4 | DATETIMN, 4) => Value::SmallDateTime {
-            days: le16(b, 0),
-            minutes: le16(b, 2),
+            days: le16(b, 0).ok_or(Error::Truncated)?,
+            minutes: le16(b, 2).ok_or(Error::Truncated)?,
         },
         (DATETIME | DATETIMN, 8) => Value::DateTime {
-            days: le32(b, 0) as i32,
-            ticks: le32(b, 4),
+            days: le32(b, 0).ok_or(Error::Truncated)? as i32,
+            ticks: le32(b, 4).ok_or(Error::Truncated)?,
         },
         (GUID, 16) => {
             let mut g = [0u8; 16];
@@ -1846,11 +1843,11 @@ fn decode_number(ty: u8, b: &[u8]) -> Value {
             Value::Guid(g)
         }
         (_, 1) => Value::TinyInt(b[0]),
-        (_, 2) => Value::SmallInt(le(2) as u16 as i16),
-        (_, 4) => Value::Int(le(4) as u32 as i32),
-        (_, 8) => Value::BigInt(le(8) as i64),
+        (_, 2) => Value::SmallInt(le16(b, 0).ok_or(Error::Truncated)? as i16),
+        (_, 4) => Value::Int(le32(b, 0).ok_or(Error::Truncated)? as i32),
+        (_, 8) => Value::BigInt(le64(b, 0).ok_or(Error::Truncated)? as i64),
         _ => Value::Null,
-    }
+    })
 }
 
 /// The bytes of a fixed or one-byte-length value, if it is one.
@@ -1943,10 +1940,10 @@ fn check_variant(b: &[u8]) -> Result<(), Error> {
                     && byte_len_value_ok(&TypeInfo::decimal(precision, scale), data)
             }
         }
-        BIGVARBINARY | BIGBINARY => *prop == 2 && data.len() <= usize::from(le16(props, 0)),
+        BIGVARBINARY | BIGBINARY => *prop == 2 && data.len() <= usize::from(le16(props, 0).ok_or(Error::Truncated)?),
         BIGVARCHAR | BIGCHAR | NVARCHAR | NCHAR => {
             let even = !matches!(*base, NVARCHAR | NCHAR) || data.len() % 2 == 0;
-            *prop == 7 && even && data.len() <= usize::from(le16(props, 5))
+            *prop == 7 && even && data.len() <= usize::from(le16(props, 5).ok_or(Error::Truncated)?)
         }
         _ => false,
     };
@@ -2054,7 +2051,7 @@ fn read_value(c: &mut Reader, t: &TypeInfo) -> Result<Value, Error> {
     let chars_text = t.ty == data_type::NVARCHAR || t.ty == data_type::NCHAR;
     match class(t.ty).ok_or(Error::UnsupportedType(t.ty))? {
         Class::Fixed(0) => Ok(Value::Null),
-        Class::Fixed(n) => Ok(decode_number(t.ty, c.take(n)?)),
+        Class::Fixed(n) => decode_number(t.ty, c.take(n)?),
         Class::ByteLen => {
             let n = usize::from(c.u8()?);
             if n == 0 {
@@ -2063,7 +2060,7 @@ fn read_value(c: &mut Reader, t: &TypeInfo) -> Result<Value, Error> {
             if !widths(t.ty).contains(&n) || n > t.max_len as usize {
                 return Err(Error::Invalid("value length"));
             }
-            Ok(decode_number(t.ty, c.take(n)?))
+            decode_number(t.ty, c.take(n)?)
         }
         Class::Decimal => {
             let n = usize::from(c.u8()?);
@@ -2118,7 +2115,7 @@ fn read_value(c: &mut Reader, t: &TypeInfo) -> Result<Value, Error> {
             if n > tl && le_uint(&b[tl..tl + 3]) as u32 > MAX_DATE {
                 return Err(Error::Invalid("date past 9999-12-31"));
             }
-            if n == tl + 5 && !(-MAX_OFFSET..=MAX_OFFSET).contains(&(le16(b, tl + 3) as i16)) {
+            if n == tl + 5 && !(-MAX_OFFSET..=MAX_OFFSET).contains(&(le16(b, tl + 3).ok_or(Error::Truncated)? as i16)) {
                 return Err(Error::Invalid("time zone offset"));
             }
             Ok(match t.ty {
@@ -2130,7 +2127,7 @@ fn read_value(c: &mut Reader, t: &TypeInfo) -> Result<Value, Error> {
                 _ => Value::DateTimeOffset {
                     time,
                     date: le_uint(&b[tl..tl + 3]) as u32,
-                    offset: le16(b, tl + 3) as i16,
+                    offset: le16(b, tl + 3).ok_or(Error::Truncated)? as i16,
                 },
             })
         }
@@ -3170,18 +3167,6 @@ fn le_uint(b: &[u8]) -> u64 {
         .fold(0u64, |acc, &x| (acc << 8) | u64::from(x))
 }
 
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
-fn le16(b: &[u8], i: usize) -> u16 {
-    u16::from_le_bytes([b[i], b[i + 1]])
-}
-
-fn le32(b: &[u8], i: usize) -> u32 {
-    u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
-}
-
 impl From<Truncated> for Error {
     #[inline]
     fn from(_: Truncated) -> Self { Error::Truncated }
@@ -3331,7 +3316,7 @@ mod tests {
         // ibChangePassword: the example has 0x88 there without
         // fChangePassword, where 2.2.6.4 says it MUST be 0.
         let mut want = m.data.clone();
-        assert_eq!(le16(&want, 86), 0x88);
+        assert_eq!(le16(&want, 86).unwrap(), 0x88);
         want[86..88].copy_from_slice(&[0, 0]);
         assert_eq!(l.to_bytes().unwrap(), want);
     }
@@ -3342,7 +3327,7 @@ mod tests {
         // 0x00 becomes 0xA5.
         let login = Login7 { password: "a".into(), ..Login7::new() };
         let bytes = login.to_bytes().unwrap();
-        let start = usize::from(le16(&bytes, 44));
+        let start = usize::from(le16(&bytes, 44).unwrap());
         assert_eq!(&bytes[start..start + 2], &[0xb3, 0xa5]);
         assert_eq!(Login7::parse(&bytes), Ok(login));
         let mut l = Login7::new();
@@ -3506,7 +3491,7 @@ mod tests {
         short[0..4].copy_from_slice(&(cut as u32).to_le_bytes());
         assert_eq!(Login7::parse(&short), Err(Error::Truncated));
         let mut away = b.clone();
-        let p = usize::from(le16(&b, 56));
+        let p = usize::from(le16(&b, 56).unwrap());
         away[p..p + 4].copy_from_slice(&0x1000u32.to_le_bytes());
         assert_eq!(
             Login7::parse(&away),
@@ -4212,11 +4197,11 @@ mod tests {
         l.option_flags3 = option_flags3::CHANGE_PASSWORD;
         l.change_password = "new".into();
         let b = l.to_bytes().unwrap();
-        assert_eq!(le16(&b, 84), 5, "cchAtchDBFile");
-        assert_eq!(le16(&b, 88), 3, "cchChangePassword");
-        let at = usize::from(le16(&b, 82));
+        assert_eq!(le16(&b, 84).unwrap(), 5, "cchAtchDBFile");
+        assert_eq!(le16(&b, 88).unwrap(), 3, "cchChangePassword");
+        let at = usize::from(le16(&b, 82).unwrap());
         assert_eq!(utf16_string(&b[at..at + 10]), "a.mdf");
-        let at = usize::from(le16(&b, 86));
+        let at = usize::from(le16(&b, 86).unwrap());
         assert_eq!(&b[at..at + 6], &[0x43, 0xa5, 0xf3, 0xa5, 0xd2, 0xa5]);
         assert_eq!(Login7::parse(&b).unwrap().change_password, "new");
     }
@@ -4263,7 +4248,7 @@ mod tests {
             Err(Error::Invalid("LOGIN7 extension length"))
         );
         let mut inside = b.clone();
-        let p = usize::from(le16(&b, 56));
+        let p = usize::from(le16(&b, 56).unwrap());
         inside[p..p + 4].copy_from_slice(&10u32.to_le_bytes());
         assert_eq!(
             Login7::parse(&inside),
@@ -4478,8 +4463,8 @@ mod tests {
         l.features = Some(vec![]);
         let mut b = l.to_bytes().unwrap();
         // Point the extension at the SSPI data.
-        let sspi_at = le16(&b, 78);
-        let ext_at = usize::from(le16(&b, 56));
+        let sspi_at = le16(&b, 78).unwrap();
+        let ext_at = usize::from(le16(&b, 56).unwrap());
         b[ext_at..ext_at + 4].copy_from_slice(&u32::from(sspi_at).to_le_bytes());
         assert_eq!(
             Login7::parse(&b),
@@ -4493,8 +4478,8 @@ mod tests {
         small.sspi[1..5].copy_from_slice(&3u32.to_le_bytes());
         small.sspi[8] = 0xff;
         let mut b = small.to_bytes().unwrap();
-        let sspi_at = le16(&b, 78);
-        let ext_at = usize::from(le16(&b, 56));
+        let sspi_at = le16(&b, 78).unwrap();
+        let ext_at = usize::from(le16(&b, 56).unwrap());
         b[ext_at..ext_at + 4].copy_from_slice(&u32::from(sspi_at).to_le_bytes());
         let read = Login7::parse(&b).unwrap();
         assert_eq!(read.features.as_ref().map(Vec::len), Some(1));
@@ -4743,7 +4728,7 @@ mod tests {
     #[test]
     fn change_password_needs_its_flag() {
         let b = Login7::new().to_bytes().unwrap();
-        assert_eq!(le16(&b, 86), 0);
+        assert_eq!(le16(&b, 86).unwrap(), 0);
         let mut l = Login7::new();
         l.change_password = "new".into();
         assert_eq!(l.to_bytes(), Err(Error::Unwritable));
@@ -4889,7 +4874,7 @@ mod tests {
         assert_eq!(SqlBatch::parse(&good.message().unwrap().data, true), Ok(good));
         // Written by hand with one byte of data, it is refused.
         let mut b = with(vec![3; 20]).message().unwrap().data;
-        let total = le32(&b, 0) - 19;
+        let total = le32(&b, 0).unwrap() - 19;
         // The block's length, the descriptor's 18 bytes, then the trace
         // header's length and type at 22, and its data at 28.
         b.drain(29..48);

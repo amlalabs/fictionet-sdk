@@ -67,6 +67,7 @@
 //! assert_eq!(back.avp(avp::RESULT_CODE).and_then(Avp::as_u32), Some(result::SUCCESS));
 //! ```
 
+use fictionet::stdlib::codec::{be24, be32};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -589,7 +590,7 @@ impl Message {
         if b.len() < 4 {
             return Ok(None);
         }
-        let length = be24(b, 1);
+        let Some(length) = be24(b, 1) else { return Ok(None); };
         let len = length as usize;
         if len < HEADER_LEN || !len.is_multiple_of(4) {
             return Err(FrameError::MessageLength(length));
@@ -602,19 +603,19 @@ impl Message {
 
     /// The header fields of the at least [`HEADER_LEN`] bytes `h`, with
     /// no AVPs.
-    fn header(h: &[u8]) -> Message {
+    fn header(h: &[u8]) -> Option<Message> {
         let f = h[4];
-        Message {
+        Some(Message {
             request: f & flags::REQUEST != 0,
             proxiable: f & flags::PROXIABLE != 0,
             error: f & flags::ERROR != 0,
             retransmit: f & flags::RETRANSMIT != 0,
-            command: be24(h, 5),
-            application: be32(h, 8),
-            hop_by_hop: be32(h, 12),
-            end_to_end: be32(h, 16),
+            command: be24(h, 5)?,
+            application: be32(h, 8)?,
+            hop_by_hop: be32(h, 12)?,
+            end_to_end: be32(h, 16)?,
             avps: Vec::new(),
-        }
+        })
     }
 
     /// Checks the header's flags against RFC 6733, section 3: the E flag
@@ -641,7 +642,7 @@ impl Wire for Message {
         if bytes.len() != length {
             return Err(Error::Trailing { remaining: bytes.len() - length });
         }
-        Ok(Self { avps: Avp::parse_list(body)?, ..Self::header(bytes) })
+        Ok(Self { avps: Avp::parse_list(body)?, ..Self::header(bytes).ok_or(Error::Incomplete)? })
     }
 
     /// Appends one message. Refuses commands above 24 bits, more than
@@ -761,7 +762,7 @@ impl Decode for Messages {
         let Some(body) = input.get(HEADER_LEN..used) else {
             return Ok(Step::Need);
         };
-        let header = Message::header(input);
+        let Some(header) = Message::header(input) else { return Ok(Step::Need); };
         let message = match Avp::parse_list(body) {
             Ok(avps) => Ok(Message { avps, ..header }),
             Err(error) => Err(AvpFault { header, error }),
@@ -875,13 +876,12 @@ impl Avp {
     /// its padding, as some peers do; [`Avp::parse_list`] does not allow
     /// that.
     fn read_prefix(b: &[u8]) -> Result<(Avp, usize), Error> {
+        let code = be32(b, 0).unwrap_or(0);
         if b.len() < AVP_HEADER_LEN {
-            let code = if b.len() >= 4 { be32(b, 0) } else { 0 };
             return Err(Error::AvpLength { code, length: b.len() as u32 });
         }
-        let code = be32(b, 0);
         let f = b[4];
-        let length = be24(b, 5);
+        let length = be24(b, 5).ok_or(Error::AvpLength { code, length: b.len() as u32 })?;
         let len = length as usize;
         let has_vendor = f & avp_flags::VENDOR != 0;
         let header = if has_vendor { VENDOR_AVP_HEADER_LEN } else { AVP_HEADER_LEN };
@@ -890,7 +890,7 @@ impl Avp {
         }
         let avp = Avp {
             code,
-            vendor: if has_vendor { Some(be32(b, 8)) } else { None },
+            vendor: if has_vendor { Some(be32(b, 8).ok_or(Error::AvpLength { code, length })?) } else { None },
             mandatory: f & avp_flags::MANDATORY != 0,
             protected: f & avp_flags::PROTECTED != 0,
             data: b[header..len].to_vec(),
@@ -948,7 +948,7 @@ impl Avp {
                 if d.contains(&0) {
                     return Err(bad);
                 }
-                Value::Utf8String(String::from_utf8(d.to_vec()).map_err(|_| bad)?)
+                Value::Utf8String(core::str::from_utf8(d).map_err(|_| bad)?.to_owned())
             }
             Format::DiameterIdentity => {
                 let s = std::str::from_utf8(d).map_err(|_| bad)?;
@@ -1498,14 +1498,6 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 /// is called, so this cannot overflow.
 fn padded(len: usize) -> usize {
     (len + 3) & !3
-}
-
-fn be24(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([0, b[i], b[i + 1], b[i + 2]])
-}
-
-fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
 }
 
 #[cfg(test)]

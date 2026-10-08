@@ -90,7 +90,7 @@
 
 extern crate alloc;
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{be16, be32, Decode, Step, Wire};
 use alloc::{vec, vec::Vec};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -492,7 +492,7 @@ impl Frame {
         if b.len() < MARKER_LEN + 2 {
             return Ok(None);
         }
-        let length = be16(b, MARKER_LEN);
+        let Some(length) = be16(b, MARKER_LEN) else { return Ok(None); };
         let end = usize::from(length);
         if !(HEADER_LEN..=MAX_MESSAGE_LEN).contains(&end) {
             return Err(Error::BadMessageLength(length));
@@ -1584,8 +1584,8 @@ fn parse_as_path(mut r: &[u8], four: bool) -> Option<Vec<Segment>> {
         let bytes = take(&mut r, count * size)?;
         let asns: Vec<u32> = bytes
             .chunks_exact(size)
-            .map(|c| if four { u32::from_be_bytes([c[0], c[1], c[2], c[3]]) } else { u32::from(be16(c, 0)) })
-            .collect();
+            .map(|c| if four { be32(c, 0) } else { be16(c, 0).map(u32::from) })
+            .collect::<Option<_>>()?;
         if asns.contains(&0) {
             return None;
         }
@@ -1933,15 +1933,11 @@ fn take_u8(r: &mut &[u8]) -> Option<u8> {
 }
 
 fn take_u16(r: &mut &[u8]) -> Option<u16> {
-    take(r, 2).map(|b| be16(b, 0))
+    take(r, 2).and_then(|b| be16(b, 0))
 }
 
 fn take_u32(r: &mut &[u8]) -> Option<u32> {
-    take(r, 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-}
-
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
+    take(r, 4).and_then(|b| be32(b, 0))
 }
 
 #[cfg(test)]

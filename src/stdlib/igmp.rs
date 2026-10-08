@@ -101,7 +101,7 @@
 //! assert_eq!(reports[0].to_bytes().unwrap(), [0x22, 0, 0xea, 0xf9, 0, 0, 0, 1, 2, 0, 0, 0, 239, 1, 2, 3]);
 //! ```
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{be16, Wire};
 use fictionet::stdlib::ip::checksum;
 
 use std::net::Ipv4Addr;
@@ -394,11 +394,6 @@ fn known_type(t: u8) -> bool {
 fn addr(b: &[u8], i: usize) -> Option<Ipv4Addr> {
     let s = b.get(i..i.checked_add(4)?)?;
     Some(Ipv4Addr::new(s[0], s[1], s[2], s[3]))
-}
-
-fn be16(b: &[u8], i: usize) -> Option<u16> {
-    let s = b.get(i..i.checked_add(2)?)?;
-    Some(u16::from_be_bytes([s[0], s[1]]))
 }
 
 /// `n` source addresses starting at `at`, and where they end.

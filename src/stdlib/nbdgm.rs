@@ -72,7 +72,7 @@
 //! assert_eq!(d.data, announcement);
 //! ```
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{be16, Wire};
 
 use std::net::Ipv4Addr;
 
@@ -691,10 +691,6 @@ impl Reassembler {
     }
 }
 
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
 impl Wire for Name {
     type ParseError = Error;
     type WriteError = Error;
@@ -754,9 +750,9 @@ impl Wire for Packet {
             return Err(Error::Truncated);
         }
         let flags = Flags::from_byte(b[1]);
-        let id = be16(b, 2);
+        let id = be16(b, 2).ok_or(Error::Truncated)?;
         let source_ip = Ipv4Addr::new(b[4], b[5], b[6], b[7]);
-        let source_port = be16(b, 8);
+        let source_port = be16(b, 8).ok_or(Error::Truncated)?;
         let rest = &b[HEADER_LEN..];
         let body = match ty {
             msg_type::DIRECT_UNIQUE | msg_type::DIRECT_GROUP | msg_type::BROADCAST => {
@@ -768,8 +764,8 @@ impl Wire for Packet {
                 if rest.len() < 4 {
                     return Err(Error::Truncated);
                 }
-                let field = be16(rest, 0);
-                let offset = be16(rest, 2);
+                let field = be16(rest, 0).ok_or(Error::Truncated)?;
+                let offset = be16(rest, 2).ok_or(Error::Truncated)?;
                 let after = &rest[4..];
                 let want = usize::from(field);
                 if after.len() < want {
@@ -912,7 +908,7 @@ mod tests {
         assert_eq!(b[4..8], [10, 0, 0, 9]);
         assert_eq!(b[8..10], [0, 138]);
         // The length counts the names and the data.
-        assert_eq!(usize::from(be16(&b, 10)), 34 + 34 + 10);
+        assert_eq!(usize::from(be16(&b, 10).unwrap()), 34 + 34 + 10);
         assert_eq!(b[12..14], [0, 0]);
         assert_eq!(b[14], 32);
         assert_eq!(b[47], 0);

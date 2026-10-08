@@ -69,7 +69,7 @@
 //! );
 //! ```
 
-use fictionet::stdlib::codec::{self, Decode, Step, Stream, Wire, Reader};
+use fictionet::stdlib::codec::{be16, be32, self, Decode, Step, Stream, Wire, Reader};
 
 fn exact<T>(parsed: Result<Option<(T, usize)>, Error>, len: usize) -> Result<T, Error> {
     let (value, used) = parsed?.ok_or(Error::Truncated)?;
@@ -438,14 +438,6 @@ struct FrameScan {
     remaining: Option<usize>,
 }
 
-fn read_u16(b: &[u8], at: usize) -> Option<u16> {
-    let &[a, c] = b.get(at..at.checked_add(2)?)? else { return None };
-    Some(u16::from_be_bytes([a, c]))
-}
-fn read_u32(b: &[u8], at: usize) -> Option<u32> {
-    let &[a, c, d, e] = b.get(at..at.checked_add(4)?)? else { return None };
-    Some(u32::from_be_bytes([a, c, d, e]))
-}
 // The version line and pixel lengths are read by the body parsers too,
 // which report them as `Error`. Found while framing, they end the stream.
 // These readers fail only with Version, BitsPerPixel or TooLong.
@@ -461,7 +453,7 @@ fn sized_end(at: usize, count: usize, width: usize, limit: usize) -> Result<usiz
 }
 fn text_end(b: &[u8], at: usize, limit: usize) -> Result<Option<usize>, FrameError> {
     let header = sized_end(at, 4, 1, limit)?;
-    let Some(n) = read_u32(b, at) else { return Ok(None) };
+    let Some(n) = be32(b, at) else { return Ok(None) };
     let n = usize::try_from(n).map_err(|_| FrameError::TooLong)?;
     if n > MAX_TEXT {
         return Err(FrameError::TooLong);
@@ -469,7 +461,7 @@ fn text_end(b: &[u8], at: usize, limit: usize) -> Result<Option<usize>, FrameErr
     Ok(Some(sized_end(header, n, 1, limit)?))
 }
 fn counted_end(b: &[u8], at: usize, header: usize, width: usize, limit: usize) -> Result<Option<usize>, FrameError> {
-    let Some(n) = read_u16(b, at) else { return Ok(None) };
+    let Some(n) = be16(b, at) else { return Ok(None) };
     Ok(Some(sized_end(header, usize::from(n), width, limit)?))
 }
 
@@ -511,7 +503,7 @@ impl FrameScan {
                 VERSION_LEN
             }
             Phase::SecurityOffer => match dialect {
-                Dialect::V3_3 => match read_u32(b, 0) {
+                Dialect::V3_3 => match be32(b, 0) {
                     None => return Ok(None),
                     Some(0) => return text_end(b, 4, limit),
                     Some(_) => 4,
@@ -523,7 +515,7 @@ impl FrameScan {
                 },
             },
             Phase::VncChallenge => CHALLENGE_LEN,
-            Phase::SecurityResult => match read_u32(b, 0) {
+            Phase::SecurityResult => match be32(b, 0) {
                 None => return Ok(None),
                 Some(0) => 4,
                 Some(_) if dialect == Dialect::V3_8 => return text_end(b, 4, limit),
@@ -545,7 +537,7 @@ impl FrameScan {
 
     fn update_end(&mut self, b: &[u8], format: &PixelFormat, limit: usize) -> Result<Option<usize>, FrameError> {
         if self.remaining.is_none() {
-            let Some(n) = read_u16(b, 2) else { return Ok(None) };
+            let Some(n) = be16(b, 2) else { return Ok(None) };
             // Every rectangle needs at least its twelve-byte header.
             sized_end(4, usize::from(n), 12, limit)?;
             self.remaining = Some(usize::from(n));
@@ -557,9 +549,9 @@ impl FrameScan {
             if b.get(..header).is_none() {
                 return Ok(None);
             }
-            let width = read_u16(b, sized_end(at, 4, 1, limit)?).ok_or(FrameError::TooLong)?;
-            let height = read_u16(b, sized_end(at, 6, 1, limit)?).ok_or(FrameError::TooLong)?;
-            let encoding = read_u32(b, sized_end(at, 8, 1, limit)?).ok_or(FrameError::TooLong)? as i32;
+            let width = be16(b, sized_end(at, 4, 1, limit)?).ok_or(FrameError::TooLong)?;
+            let height = be16(b, sized_end(at, 6, 1, limit)?).ok_or(FrameError::TooLong)?;
+            let encoding = be32(b, sized_end(at, 8, 1, limit)?).ok_or(FrameError::TooLong)? as i32;
             let size = match encoding {
                 encoding::RAW => pixels_len(width, height, format).map_err(framing)?,
                 encoding::COPY_RECT => 4,

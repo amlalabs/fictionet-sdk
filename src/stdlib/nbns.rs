@@ -60,7 +60,7 @@
 //! assert_eq!(answer.answers[0].data, RData::Nb(vec![owner]));
 //! ```
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{be16, Wire};
 
 use std::net::Ipv4Addr;
 
@@ -486,13 +486,13 @@ pub struct NbEntry {
 }
 
 impl NbEntry {
-    fn parse(b: &[u8]) -> NbEntry {
-        let flags = be16(b, 0);
-        NbEntry {
+    fn parse(b: &[u8]) -> Result<NbEntry, Error> {
+        let flags = be16(b, 0).ok_or(Error::Truncated)?;
+        Ok(NbEntry {
             group: flags & 0x8000 != 0,
             node_type: NodeType::from_bits(flags >> 13),
             address: Ipv4Addr::new(b[2], b[3], b[4], b[5]),
-        }
+        })
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -587,9 +587,9 @@ impl RData {
         }
     }
 
-    fn parse(rr: u16, data: &[u8]) -> RData {
+    fn parse(rr: u16, data: &[u8]) -> Result<RData, Error> {
         if rr == rr_type::NB && data.len().is_multiple_of(NB_ENTRY_LEN) {
-            return RData::Nb(data.as_chunks::<NB_ENTRY_LEN>().0.iter().map(|e| NbEntry::parse(e)).collect());
+            return Ok(RData::Nb(data.as_chunks::<NB_ENTRY_LEN>().0.iter().map(|e| NbEntry::parse(e)).collect::<Result<_, _>>()?));
         }
         if rr == rr_type::NBSTAT
             && let Some((&n, rest)) = data.split_first()
@@ -602,13 +602,13 @@ impl RData {
                 .map(|c| {
                     let mut bytes = [0u8; NAME_LEN];
                     bytes.copy_from_slice(&c[..NAME_LEN]);
-                    NodeName { bytes, flags: be16(c, NAME_LEN) }
+                    Ok(NodeName { bytes, flags: be16(c, NAME_LEN).ok_or(Error::Truncated)? })
                 })
-                .collect();
+                .collect::<Result<_, Error>>()?;
             let statistics = rest[usize::from(n) * NODE_NAME_LEN..].to_vec();
-            return RData::NodeStatus(NodeStatus { names, statistics });
+            return Ok(RData::NodeStatus(NodeStatus { names, statistics }));
         }
-        RData::Other { rr_type: rr, data: data.to_vec() }
+        Ok(RData::Other { rr_type: rr, data: data.to_vec() })
     }
 
     /// Appends complete record data. Refuses oversized or ambiguous values.
@@ -1124,10 +1124,6 @@ fn read_labels(msg: &[u8], start: usize) -> Result<(Vec<Vec<u8>>, usize), Error>
     Ok((labels, after.unwrap_or(pos + 1)))
 }
 
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
 impl Wire for Name {
     type ParseError = Error;
     type WriteError = Error;
@@ -1195,10 +1191,10 @@ impl Wire for Packet {
         if b.len() < HEADER_LEN {
             return Err(Error::Truncated);
         }
-        let word = be16(b, 2);
+        let word = be16(b, 2).ok_or(Error::Truncated)?;
         let mut counts = [0usize; 4];
         for (i, c) in counts.iter_mut().enumerate() {
-            let n = be16(b, 4 + 2 * i);
+            let n = be16(b, 4 + 2 * i).ok_or(Error::Truncated)?;
             if usize::from(n) > MAX_RECORDS {
                 return Err(Error::TooManyRecords(n));
             }
@@ -1209,7 +1205,7 @@ impl Wire for Packet {
         for _ in 0..counts[0] {
             let (name, next) = read_name(b, pos)?;
             let fixed = b.get(next..next + 4).ok_or(Error::Truncated)?;
-            questions.push(Question { name, qtype: be16(fixed, 0), class: be16(fixed, 2) });
+            questions.push(Question { name, qtype: be16(fixed, 0).ok_or(Error::Truncated)?, class: be16(fixed, 2).ok_or(Error::Truncated)? });
             pos = next + 4;
         }
         let mut sections: [Vec<Record>; 3] = Default::default();
@@ -1218,10 +1214,10 @@ impl Wire for Packet {
             for _ in 0..count {
                 let (name, next) = read_rr_name(b, pos)?;
                 let fixed = b.get(next..next + 10).ok_or(Error::Truncated)?;
-                let len = usize::from(be16(fixed, 8));
+                let len = usize::from(be16(fixed, 8).ok_or(Error::Truncated)?);
                 let start = next + 10;
                 let data = b.get(start..start + len).ok_or(Error::Truncated)?;
-                let rr = be16(fixed, 0);
+                let rr = be16(fixed, 0).ok_or(Error::Truncated)?;
                 let data = if rr == rr_type::NS {
                     // The name server's name, whose pointers are followed
                     // now, since a writer may move what they point to.
@@ -1230,11 +1226,11 @@ impl Wire for Packet {
                         _ => return Err(Error::BadNsData),
                     }
                 } else {
-                    RData::parse(rr, data)
+                    RData::parse(rr, data)?
                 };
                 section.push(Record {
                     name,
-                    class: be16(fixed, 2),
+                    class: be16(fixed, 2).ok_or(Error::Truncated)?,
                     ttl: u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]),
                     data,
                 });
@@ -1243,7 +1239,7 @@ impl Wire for Packet {
         }
         let [answers, authority, additional] = sections;
         let packet = Packet {
-            id: be16(b, 0),
+            id: be16(b, 0).ok_or(Error::Truncated)?,
             response: word & 0x8000 != 0,
             opcode: Opcode::from_bits((word >> 11) as u8),
             flags: Flags::from_bits(word >> 4),

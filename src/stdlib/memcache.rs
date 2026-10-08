@@ -72,7 +72,7 @@
 //! assert_eq!(out, b"STORED\r\nVALUE greeting 5 5\r\nhello\r\nEND\r\nERROR\r\n");
 //! ```
 
-use fictionet::stdlib::codec::{self, Decode, Step, Wire};
+use fictionet::stdlib::codec::{be16, be32, be64, self, Decode, Step, Wire};
 
 /// The port memcached listens on, for both TCP and UDP.
 pub const PORT: u16 = 11211;
@@ -1389,9 +1389,9 @@ impl Packet {
         if b.len() < BINARY_HEADER_LEN {
             return Ok(None);
         }
-        let key_len = usize::from(be16(b, 2));
+        let key_len = usize::from(be16(b, 2).ok_or(Error::Incomplete)?);
         let extras_len = usize::from(b[4]);
-        let body = usize::try_from(be32(b, 8)).unwrap_or(usize::MAX);
+        let body = usize::try_from(be32(b, 8).ok_or(Error::Incomplete)?).unwrap_or(usize::MAX);
         if key_len > MAX_KEY {
             return Err(Error::KeyLength(key_len));
         }
@@ -1408,8 +1408,8 @@ impl Packet {
             magic,
             opcode: b[1],
             data_type: b[5],
-            status: be16(b, 6),
-            opaque: be32(b, 12),
+            status: be16(b, 6).ok_or(Error::Incomplete)?,
+            opaque: be32(b, 12).ok_or(Error::Incomplete)?,
             cas: u64::from_be_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]]),
             extras: extras.to_vec(),
             key: key.to_vec(),
@@ -1486,12 +1486,8 @@ impl Wire for CounterExtras {
         if extras.len() != 20 {
             return Err(Error::Extras { expected: 20, actual: extras.len() });
         }
-        let u64_at = |i: usize| {
-            let mut b = [0; 8];
-            b.copy_from_slice(&extras[i..i + 8]);
-            u64::from_be_bytes(b)
-        };
-        Ok(CounterExtras { delta: u64_at(0), initial: u64_at(8), expiration: be32(extras, 16) })
+        let bad = Error::Extras { expected: 20, actual: extras.len() };
+        Ok(CounterExtras { delta: be64(extras, 0).ok_or(bad)?, initial: be64(extras, 8).ok_or(bad)?, expiration: be32(extras, 16).ok_or(bad)? })
     }
 
     /// Appends the 20 bytes of extras. Every value is representable;
@@ -1538,7 +1534,7 @@ impl Wire for UdpFrame {
         if datagram.len() < UDP_HEADER_LEN {
             return Err(Error::Short(datagram.len()));
         }
-        let (sequence, total, reserved) = (be16(datagram, 2), be16(datagram, 4), be16(datagram, 6));
+        let (sequence, total, reserved) = (be16(datagram, 2).ok_or(Error::Short(datagram.len()))?, be16(datagram, 4).ok_or(Error::Short(datagram.len()))?, be16(datagram, 6).ok_or(Error::Short(datagram.len()))?);
         if reserved != 0 {
             return Err(Error::Reserved(reserved));
         }
@@ -1549,7 +1545,7 @@ impl Wire for UdpFrame {
         if payload.len() > MAX_UDP_PAYLOAD {
             return Err(Error::PayloadTooLong(payload.len()));
         }
-        Ok(UdpFrame { request_id: be16(datagram, 0), sequence, total, payload: payload.to_vec() })
+        Ok(UdpFrame { request_id: be16(datagram, 0).ok_or(Error::Short(datagram.len()))?, sequence, total, payload: payload.to_vec() })
     }
 
     /// Appends one datagram. Refuses invalid sequence counts and payloads
@@ -1586,14 +1582,6 @@ impl UdpFrame {
         }
         Ok(frames)
     }
-}
-
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
-fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
 }
 
 /// Maximum bytes retained while assembling a long line or a header and data block.
@@ -2202,11 +2190,11 @@ impl Decode for Packets {
             Magic::from_byte(m).ok_or(Error::Magic(m))?;
         }
         if let Some(header) = input.get(..BINARY_HEADER_LEN) {
-            let key_len = usize::from(be16(header, 2));
+            let key_len = usize::from(be16(header, 2).ok_or(Error::Incomplete)?);
             if key_len > MAX_KEY {
                 return Err(Error::KeyLength(key_len));
             }
-            let body = usize::try_from(be32(header, 8)).unwrap_or(usize::MAX);
+            let body = usize::try_from(be32(header, 8).ok_or(Error::Incomplete)?).unwrap_or(usize::MAX);
             if body > self.limit {
                 return Err(Error::BodyLength(body));
             }

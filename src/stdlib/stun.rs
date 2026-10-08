@@ -54,6 +54,7 @@
 
 extern crate alloc;
 
+use fictionet::stdlib::codec::{be16, be32};
 use alloc::{
     string::{String, ToString},
     vec,
@@ -1144,14 +1145,6 @@ enum Integrity {
 
 fn padded(len: usize) -> usize {
     len.div_ceil(4) * 4
-}
-
-fn be16(b: &[u8], i: usize) -> Option<u16> {
-    Some(u16::from_be_bytes(*b.get(i..)?.first_chunk::<2>()?))
-}
-
-fn be32(b: &[u8], i: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(*b.get(i..)?.first_chunk::<4>()?))
 }
 
 #[cfg(test)]

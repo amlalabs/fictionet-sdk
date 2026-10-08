@@ -77,7 +77,7 @@
 //! assert_eq!(Response::parse(&error.to_bytes().unwrap()).unwrap().result, ResultCode::AddressMismatch);
 //! ```
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{be16, be32, Wire};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -901,12 +901,12 @@ pub fn unsupported_version(datagram: &[u8]) -> Option<UnsupportedVersion> {
     }
     if b[0] == NAT_PMP_VERSION {
         let op_ok = b[1] == 0 || b[1] & RESPONSE_FLAG != 0;
-        return (op_ok && be16(b, 2) == 1).then_some(UnsupportedVersion { version: 0, lifetime: None });
+        return (op_ok && be16(b, 2)? == 1).then_some(UnsupportedVersion { version: 0, lifetime: None });
     }
     if b[1] & RESPONSE_FLAG == 0 || b[3] != ResultCode::UnsuppVersion.code() {
         return None;
     }
-    let lifetime = (b.len() >= 8).then(|| be32(b, 4));
+    let lifetime = be32(b, 4);
     Some(UnsupportedVersion { version: b[0], lifetime })
 }
 
@@ -987,18 +987,18 @@ fn read_body(op: u8, body: &[u8], strict: bool) -> Result<(Operation, Vec<PcpOpt
         opcode::ANNOUNCE => Ok((Operation::Announce, read_options(body, strict)?)),
         opcode::MAP => {
             let d = body.get(..MAP_LEN).ok_or_else(short)?;
-            Ok((Operation::Map(read_map(d)), read_options(&body[MAP_LEN..], strict)?))
+            Ok((Operation::Map(read_map(d).ok_or_else(short)?), read_options(&body[MAP_LEN..], strict)?))
         }
         opcode::PEER => {
             let d = body.get(..PEER_LEN).ok_or_else(short)?;
-            let m = read_map(&d[..MAP_LEN]);
+            let m = read_map(&d[..MAP_LEN]).ok_or_else(short)?;
             let peer = Peer {
                 nonce: m.nonce,
                 protocol: m.protocol,
                 internal_port: m.internal_port,
                 external_port: m.external_port,
                 external_address: m.external_address,
-                remote_port: be16(d, 36),
+                remote_port: be16(d, 36).ok_or_else(short)?,
                 remote_address: ip6(&d[40..56]),
             };
             Ok((Operation::Peer(peer), read_options(&body[PEER_LEN..], strict)?))
@@ -1023,16 +1023,16 @@ fn response_body(opcode: u8, body: &[u8]) -> (Operation, Vec<PcpOption>) {
 }
 
 /// Reads MAP data from exactly [`MAP_LEN`] bytes.
-fn read_map(d: &[u8]) -> Map {
+fn read_map(d: &[u8]) -> Option<Map> {
     let mut nonce = [0; 12];
     nonce.copy_from_slice(&d[..12]);
-    Map {
+    Some(Map {
         nonce,
         protocol: d[12],
-        internal_port: be16(d, 16),
-        external_port: be16(d, 18),
+        internal_port: be16(d, 16)?,
+        external_port: be16(d, 18)?,
         external_address: ip6(&d[20..36]),
-    }
+    })
 }
 
 /// Reads options until `b` ends.
@@ -1045,7 +1045,7 @@ fn read_options(b: &[u8], strict: bool) -> Result<Vec<PcpOption>, Error> {
             return Err(Error::MalformedOption);
         }
         let h = b.get(i..i + OPTION_HEADER_LEN).ok_or(Error::MalformedOption)?;
-        let (code, len) = (h[0], usize::from(be16(h, 2)));
+        let (code, len) = (h[0], usize::from(be16(h, 2).ok_or(Error::MalformedOption)?));
         let start = i + OPTION_HEADER_LEN;
         let end = start.checked_add(len).ok_or(Error::MalformedOption)?;
         let padded = end.next_multiple_of(4);
@@ -1058,7 +1058,7 @@ fn read_options(b: &[u8], strict: bool) -> Result<Vec<PcpOption>, Error> {
             (option_code::PREFER_FAILURE, 0) => PcpOption::PreferFailure,
             (option_code::FILTER, 20) => PcpOption::Filter {
                 prefix_length: data[1],
-                remote_port: be16(data, 2),
+                remote_port: be16(data, 2).ok_or(Error::MalformedOption)?,
                 remote_address: ip6(&data[4..20]),
             },
             (option_code::THIRD_PARTY | option_code::PREFER_FAILURE | option_code::FILTER, _) if strict => {
@@ -1155,14 +1155,6 @@ fn write_options(out: &mut Vec<u8>, options: &[PcpOption], request: bool) -> Res
     Ok(())
 }
 
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
-fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
-}
-
 /// An IPv6 address from the first 16 bytes of `b`.
 fn ip6(b: &[u8]) -> Ipv6Addr {
     let mut a = [0; 16];
@@ -1197,7 +1189,7 @@ impl Wire for Request {
         check_length(b)?;
         let op = b[1];
         let (operation, options) = read_body(op, &b[HEADER_LEN..], true)?;
-        Ok(Request { lifetime: be32(b, 4), client: ip6(&b[8..24]), operation, options })
+        Ok(Request { lifetime: be32(b, 4).ok_or(Error::Short(b.len()))?, client: ip6(&b[8..24]), operation, options })
     }
 
     /// Appends the request. Refuses oversized fields, unaligned opaque data, duplicate
@@ -1249,8 +1241,8 @@ impl Wire for Response {
         reserved.copy_from_slice(&b[12..24]);
         Ok(Response {
             result: ResultCode::from_code(b[3]),
-            lifetime: be32(b, 4),
-            epoch: be32(b, 8),
+            lifetime: be32(b, 4).ok_or(Error::Short(b.len()))?,
+            epoch: be32(b, 8).ok_or(Error::Short(b.len()))?,
             reserved,
             operation,
             options,
@@ -1306,9 +1298,9 @@ impl Wire for NatPmpRequest {
                 let protocol = if op == nat_pmp_opcode::MAP_UDP { NatPmpProtocol::Udp } else { NatPmpProtocol::Tcp };
                 NatPmpRequest::Map {
                     protocol,
-                    internal_port: be16(b, 4),
-                    external_port: be16(b, 6),
-                    lifetime: be32(b, 8),
+                    internal_port: be16(b, 4).ok_or(Error::NatPmpShort(b.len()))?,
+                    external_port: be16(b, 6).ok_or(Error::NatPmpShort(b.len()))?,
+                    lifetime: be32(b, 8).ok_or(Error::NatPmpShort(b.len()))?,
                 }
             }
             _ => NatPmpRequest::Unsupported { opcode: op, data: b[2..].to_vec() },
@@ -1366,19 +1358,19 @@ impl Wire for NatPmpResponse {
         if b[0] != NAT_PMP_VERSION {
             return Err(Error::NatPmpVersion(b[0]));
         }
-        let (op, result) = (b[1], NatPmpResult::from_code(be16(b, 2)));
+        let (op, result) = (b[1], NatPmpResult::from_code(be16(b, 2).ok_or(Error::NatPmpShort(b.len()))?));
         let need = |n: usize| {
             if b.len() < n { Err(Error::NatPmpShort(b.len())) } else if b.len() > n { Err(Error::NatPmpTrailing) } else { Ok(()) }
         };
         Ok(match op {
             0 if result == NatPmpResult::UnsupportedVersion => {
                 need(8)?;
-                NatPmpResponse::UnsupportedVersion { epoch: be32(b, 4) }
+                NatPmpResponse::UnsupportedVersion { epoch: be32(b, 4).ok_or(Error::NatPmpShort(b.len()))? }
             }
             0..=127 => return Err(Error::NatPmpWrongDirection),
             128 => {
                 need(12)?;
-                NatPmpResponse::ExternalAddress { result, epoch: be32(b, 4), address: ip4(&b[8..12]) }
+                NatPmpResponse::ExternalAddress { result, epoch: be32(b, 4).ok_or(Error::NatPmpShort(b.len()))?, address: ip4(&b[8..12]) }
             }
             129 | 130 => {
                 need(16)?;
@@ -1386,10 +1378,10 @@ impl Wire for NatPmpResponse {
                 NatPmpResponse::Map {
                     protocol,
                     result,
-                    epoch: be32(b, 4),
-                    internal_port: be16(b, 8),
-                    external_port: be16(b, 10),
-                    lifetime: be32(b, 12),
+                    epoch: be32(b, 4).ok_or(Error::NatPmpShort(b.len()))?,
+                    internal_port: be16(b, 8).ok_or(Error::NatPmpShort(b.len()))?,
+                    external_port: be16(b, 10).ok_or(Error::NatPmpShort(b.len()))?,
+                    lifetime: be32(b, 12).ok_or(Error::NatPmpShort(b.len()))?,
                 }
             }
             _ => NatPmpResponse::Other { opcode: op & !RESPONSE_FLAG, result, data: b[4..].to_vec() },

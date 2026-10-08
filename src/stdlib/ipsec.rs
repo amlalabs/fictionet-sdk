@@ -67,7 +67,7 @@
 //! assert_eq!(Datagram::parse(&[0, 0, 0, 0, 1]), Ok(Datagram::Ike(vec![1])));
 //! ```
 
-use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::codec::{be32, Wire};
 
 /// The IP protocol number that marks an ESP packet.
 pub const ESP_PROTOCOL: u8 = 50;
@@ -186,10 +186,6 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-fn be32(b: &[u8], at: usize) -> u32 {
-    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
-}
-
 /// One ESP packet: the header's fields and the bytes after them. The
 /// payload holds whatever the algorithm puts there: an IV if it uses one,
 /// the encrypted data and trailer, and the ICV. Only world code, which
@@ -222,7 +218,7 @@ impl EspPacket {
 
 /// The error the first bytes of an ESP packet already show, if any.
 fn esp_prefix_error(b: &[u8]) -> Option<Error> {
-    (b.len() >= 4 && be32(b, 0) == 0).then_some(Error::ZeroSpi)
+    (b.len() >= 4 && be32(b, 0)? == 0).then_some(Error::ZeroSpi)
 }
 
 /// The decrypted part of an ESP payload: the data, the padding, the pad
@@ -346,8 +342,8 @@ impl AhHeader {
         let header = AhHeader {
             next_header: b[0],
             reserved: u16::from_be_bytes([b[2], b[3]]),
-            spi: be32(b, 4),
-            sequence: be32(b, 8),
+            spi: be32(b, 4).ok_or(Error::Truncated)?,
+            sequence: be32(b, 8).ok_or(Error::Truncated)?,
             icv: b[AH_FIXED_LEN..len].to_vec(),
         };
         Ok(Some((header, len)))
@@ -408,7 +404,7 @@ fn ah_prefix_error(b: &[u8]) -> Option<Error> {
     if b.len() >= 2 && b[1] == 0 {
         return Some(Error::AhLength(0));
     }
-    (b.len() >= 8 && be32(b, 4) == 0).then_some(Error::ZeroSpi)
+    (b.len() >= 8 && be32(b, 4)? == 0).then_some(Error::ZeroSpi)
 }
 
 /// One AH packet: the header and the packet it protects, which follows in
@@ -484,7 +480,7 @@ impl Wire for EspPacket {
         if b.len() < MIN_ESP_LEN {
             return Err(Error::Truncated);
         }
-        Ok(EspPacket { spi: be32(b, 0), sequence: be32(b, 4), payload: b[ESP_HEADER_LEN..].to_vec() })
+        Ok(EspPacket { spi: be32(b, 0).ok_or(Error::Truncated)?, sequence: be32(b, 4).ok_or(Error::Truncated)?, payload: b[ESP_HEADER_LEN..].to_vec() })
     }
 
     /// The packet's bytes: the SPI, the sequence number and the payload.
