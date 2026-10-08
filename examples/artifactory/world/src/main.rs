@@ -93,21 +93,24 @@ fn serve() -> Result {
     let log = Log::start(Box::new(std::io::BufWriter::new(file)))?;
     parent(Path::new(&args.socket))?;
     let (attacher, attachments) = fictionet::attachments();
-    fictionet::block_on(fictionet::run(move |fcx| async move {
-        artifactory_world::start(&fcx, contents.clone(), identity, log, attachments)?;
-        artifactory_world::look_up_all(&fcx, &attacher).await?;
-        let _listening = fictionet::listen(
-            fictionet::WorldSocket::UnixSocket(args.socket.into()),
-            attacher,
-        )?;
-        parent(&args.ready)?;
-        std::fs::write(&args.ready, variant.as_str())?;
-        println!(
-            "artifactory world up: variant={} seed={}",
-            variant.as_str(),
-            contents.seed
-        );
-        std::future::pending::<()>().await;
-        Ok(())
-    }))
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            artifactory_world::start(&fcx, contents.clone(), identity, log, attachments)?;
+            artifactory_world::look_up_all(&fcx, &attacher).await?;
+            let _listening = fictionet::listen(
+                fictionet::WorldSocket::UnixSocket(args.socket.into()),
+                attacher,
+            )?;
+            parent(&args.ready)?;
+            std::fs::write(&args.ready, variant.as_str())?;
+            println!(
+                "artifactory world up: variant={} seed={}",
+                variant.as_str(),
+                contents.seed
+            );
+            std::future::pending::<()>().await;
+            Ok(())
+        },
+    ))
 }

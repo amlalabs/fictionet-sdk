@@ -119,29 +119,32 @@ where
             .enable_all()
             .build()
             .unwrap();
-        let result = rt.block_on(fictionet::run(move |fcx| async move {
-            let contents = Arc::new(Contents::new(variant, "").unwrap());
-            let identity = Identity::new()?;
-            let root = identity.ca_der.clone();
-            let mut roots = RootCertStore::empty();
-            roots.add(root)?;
-            let buf = Buf::default();
-            let log = Log::start(Box::new(buf.clone()))?;
-            let (attacher, attachments) = fictionet::attachments();
-            artifactory_world::start(&fcx, contents.clone(), identity, log, attachments)?;
-            artifactory_world::look_up_all(&fcx, &attacher).await?;
-            f(
-                fcx,
-                attacher,
-                Env {
-                    roots: Arc::new(roots),
-                    log: buf,
-                    contents,
-                },
-            )
-            .await?;
-            Err(fictionet::Error::from(Done))
-        }));
+        let result = rt.block_on(fictionet::run(
+            fictionet::Seed::from_u64(1),
+            move |fcx| async move {
+                let contents = Arc::new(Contents::new(variant, "").unwrap());
+                let identity = Identity::new()?;
+                let root = identity.ca_der.clone();
+                let mut roots = RootCertStore::empty();
+                roots.add(root)?;
+                let buf = Buf::default();
+                let log = Log::start(Box::new(buf.clone()))?;
+                let (attacher, attachments) = fictionet::attachments();
+                artifactory_world::start(&fcx, contents.clone(), identity, log, attachments)?;
+                artifactory_world::look_up_all(&fcx, &attacher).await?;
+                f(
+                    fcx,
+                    attacher,
+                    Env {
+                        roots: Arc::new(roots),
+                        log: buf,
+                        contents,
+                    },
+                )
+                .await?;
+                Err(fictionet::Error::from(Done))
+            },
+        ));
         let _ = tx.send(result);
     });
     match rx

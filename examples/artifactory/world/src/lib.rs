@@ -109,14 +109,10 @@ pub fn start(
         .into_iter()
         .map(|(leaf, key)| {
             Ok(Arc::new(
-                tls::config_builder(
-                    fcx,
-                    SystemTime::now(),
-                    rustls::crypto::ring::default_provider(),
-                )
-                .with_safe_default_protocol_versions()?
-                .with_no_client_auth()
-                .with_single_cert(vec![leaf], key)?,
+                tls::config_builder(fcx, SystemTime::now())
+                    .with_safe_default_protocol_versions()?
+                    .with_no_client_auth()
+                    .with_single_cert(vec![leaf], key)?,
             ))
         })
         .collect::<Result<Vec<_>>>()?;
