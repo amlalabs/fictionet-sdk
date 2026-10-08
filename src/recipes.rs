@@ -297,14 +297,12 @@
 //! for each machine, one router, and the
 //! [`Router`](crate::stdlib::route::Router) handle that adds the route
 //! later. The two machines are TCP endpoints that answer every HTTP
-//! request with one line. The agent controls how many connections it
-//! opens and how slowly it sends, so each machine serves at most 64
-//! connections at once, and gives each one 10 seconds. It ends every
-//! connection with
-//! [`TcpConnection::reset`](crate::stdlib::tcp::TcpConnection::reset), so
-//! a client cannot keep sockets open past the count. The time limit races
-//! the answer against [`Cx::sleep`](crate::Cx::sleep) with `tokio::select!`,
-//! which needs tokio's `macros` feature in your `Cargo.toml`:
+//! request with one line through an [`httpd::Router`](crate::stdlib::httpd::Router).
+//! [`serve::listen`](crate::stdlib::serve::listen) runs the HTTP service on
+//! each machine. [`ServeOptions::max_conns`](crate::stdlib::serve::ServeOptions::max_conns)
+//! allows at most 64 connections at once and resets any past the cap.
+//! [`ServeOptions::idle`](crate::stdlib::serve::ServeOptions::idle) closes
+//! connections after 10 seconds without input while the service waits:
 //!
 #![doc = concat!("```rust,no_run\n", include_str!("../examples/route_change.rs"), "```")]
 //!

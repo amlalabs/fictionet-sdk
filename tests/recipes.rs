@@ -51,10 +51,18 @@ fn route_change_answers_get_with_the_body_and_head_without() {
             let (client, server) = pair();
             route_change::bank(&fcx, server);
             let client = tcp::endpoint(&fcx, client, "10.0.0.2".parse()?);
-            let get = ask(&fcx, &client, b"GET / HTTP/1.1\r\nHost: bank\r\n\r\n").await?;
-            assert!(get.ends_with(b"content-length: 14\r\nconnection: close\r\n\r\nthe real bank\n"));
-            let head = ask(&fcx, &client, b"HEAD / HTTP/1.1\r\nHost: bank\r\n\r\n").await?;
-            assert!(head.ends_with(b"content-length: 14\r\nconnection: close\r\n\r\n"), "{head:?}");
+            let get = ask(&fcx, &client, b"GET / HTTP/1.1\r\nHost: bank\r\nConnection: close\r\n\r\n").await?;
+            let get = std::str::from_utf8(&get).unwrap();
+            let (headers, body) = get.split_once("\r\n\r\n").unwrap();
+            assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(headers.lines().any(|line| line == "content-length: 14"));
+            assert_eq!(body, "the real bank\n");
+            let head = ask(&fcx, &client, b"HEAD / HTTP/1.1\r\nHost: bank\r\nConnection: close\r\n\r\n").await?;
+            let head = std::str::from_utf8(&head).unwrap();
+            let (headers, body) = head.split_once("\r\n\r\n").unwrap();
+            assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(headers.lines().any(|line| line == "content-length: 14"));
+            assert!(body.is_empty());
             fcx.cancel();
             Ok(())
         }))
@@ -86,13 +94,14 @@ fn route_change_limits_unfinished_requests() {
                 assert_eq!(conn.read(&fcx, &mut byte).await, Err(ConnError::Reset));
             }
             assert!(fcx.now().since_start() - started.since_start() < Duration::from_secs(5));
-            // The rest are reset when their time is up.
+            // The rest close without an answer when their idle time is up.
             for conn in &mut conns[..route_change::MAX] {
                 let mut byte = [0];
-                assert_eq!(conn.read(&fcx, &mut byte).await, Err(ConnError::Reset));
+                assert_eq!(conn.read(&fcx, &mut byte).await, Ok(0));
             }
             let waited = fcx.now().since_start() - started.since_start();
             assert!(waited >= route_change::LIMIT - Duration::from_secs(1), "{waited:?}");
+            assert!(waited <= route_change::LIMIT + Duration::from_secs(1), "{waited:?}");
             fcx.cancel();
             Ok(())
         }))
