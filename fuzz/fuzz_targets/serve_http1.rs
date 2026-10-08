@@ -22,7 +22,7 @@ fn router() -> Router {
 }
 
 fn run(chunks: &[&[u8]]) -> (Vec<u8>, usize, bool) {
-    let mut h = Harness::new(Http1::new(router()), ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()), ());
     for chunk in chunks {
         if h.push(chunk).is_err() {
             break;

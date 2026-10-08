@@ -65,12 +65,14 @@ fn modbus_two_direction_proxy_records_input_and_faults_output() {
     let mut client = Stream::new(Frames::<modbus::Frame>::new());
     let mut server = Stream::new(Frames::<modbus::Frame>::new());
     let downstream = Interceptor::new(4096);
-    let mut faults = Faults::new(42, 4096, 8);
+    let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(42));
+    let mut faults = Faults::new(4096, 8);
     let mut sent = Vec::new();
     let mut markers = Vec::new();
     for chunk in test_support::chunks(&input, &[1]) {
         assert_eq!(client.push(chunk), chunk.len());
         while let Some(r) = faults.next_with_observed(
+            &entropy,
             &mut client,
             &mut sent,
             &rules,
@@ -86,6 +88,7 @@ fn modbus_two_direction_proxy_records_input_and_faults_output() {
     assert!(
         faults
             .next_with_observed(
+                &entropy,
                 &mut client,
                 &mut sent,
                 &rules,
@@ -159,7 +162,8 @@ fn json_line_calls_are_logged_dropped_duplicated_and_results_rewritten() {
     let mut log = Recorder::new(8, 4096);
     let mut streams = [Stream::new(json_lines()), Stream::new(json_lines())];
     let proxies = [Interceptor::new(4096), Interceptor::new(4096)];
-    let mut faults = Faults::new(4, 4096, 8);
+    let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(4));
+    let mut faults = Faults::new(4096, 8);
     let plan = [
         Rule {
             when: Trigger::At(1),
@@ -180,8 +184,13 @@ fn json_line_calls_are_logged_dropped_duplicated_and_results_rewritten() {
     let mut call_count = 0;
     for byte in &input {
         assert_eq!(streams[0].push(&[*byte]), 1);
-        while let Some(r) =
-            faults.next_with_observed(&mut streams[0], &mut sent, &plan, write_line, |event| {
+        while let Some(r) = faults.next_with_observed(
+            &entropy,
+            &mut streams[0],
+            &mut sent,
+            &plan,
+            write_line,
+            |event| {
                 if let fictionet::stdlib::codec::StreamEvent::Item {
                     item: Ok(value), ..
                 } = &event
@@ -190,8 +199,8 @@ fn json_line_calls_are_logged_dropped_duplicated_and_results_rewritten() {
                     call_count += 1;
                 }
                 log.observe_tagged(0, Direction::ClientToServer, event);
-            })
-        {
+            },
+        ) {
             r.unwrap();
         }
     }
@@ -224,10 +233,12 @@ fn json_line_calls_are_logged_dropped_duplicated_and_results_rewritten() {
 #[test]
 fn byte_faults_run_before_modbus_and_line_decoding() {
     let input = frame(1).to_bytes().unwrap();
-    let mut faults = Faults::new(3, 4096, 8);
+    let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(3));
+    let mut faults = Faults::new(4096, 8);
     let mut damaged = Vec::new();
     faults
         .bytes(
+            &entropy,
             &[Rule {
                 when: Trigger::Always,
                 fault: ByteFault::Truncate(7),
@@ -248,6 +259,7 @@ fn byte_faults_run_before_modbus_and_line_decoding() {
     damaged.clear();
     faults
         .bytes(
+            &entropy,
             &[Rule {
                 when: Trigger::Always,
                 fault: ByteFault::Corrupt {
@@ -268,6 +280,7 @@ fn byte_faults_run_before_modbus_and_line_decoding() {
     let mut edited = Vec::new();
     faults
         .bytes(
+            &entropy,
             &[Rule {
                 when: Trigger::Always,
                 fault: ByteFault::Replace(b"{\"result\":false}\n".to_vec()),
@@ -300,7 +313,8 @@ fn pipe_inner_items_require_explicit_outer_framing() {
     contract::check_decode(make, &bytes);
     let mut stream = Stream::new(make());
     let mut log = Recorder::new(8, 256);
-    let mut faults = Faults::new(1, 256, 8).with_skips(fictionet::stdlib::codec::SkipPolicy::Drop);
+    let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
+    let mut faults = Faults::new(256, 8).with_skips(fictionet::stdlib::codec::SkipPolicy::Drop);
     let plan = [Rule {
         when: Trigger::Always,
         fault: ItemFault::Action {
@@ -312,6 +326,7 @@ fn pipe_inner_items_require_explicit_outer_framing() {
     assert_eq!(stream.push(&bytes), bytes.len());
     faults
         .next_with_observed(
+            &entropy,
             &mut stream,
             &mut out,
             &plan,
@@ -359,7 +374,8 @@ fn pipe_inner_items_require_explicit_outer_framing() {
 #[test]
 fn demux_stream_access_composes_with_all_tools_and_shared_budget() {
     let mut demux = Demux::new(2, 1024, |_: &u8| Frames::<modbus::Frame>::new());
-    let mut faults = Faults::new(8, 1024, 8);
+    let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(8));
+    let mut faults = Faults::new(1024, 8);
     let mut log = Recorder::new(8, 512);
     let mut out = [Vec::new(), Vec::new()];
     for key in 0..2u8 {
@@ -373,6 +389,7 @@ fn demux_stream_access_composes_with_all_tools_and_shared_budget() {
             },
         }];
         while let Some(r) = faults.next_with_observed(
+            &entropy,
             demux.get_mut(&key).unwrap(),
             &mut out[usize::from(key)],
             &plan,
@@ -398,7 +415,8 @@ fn seeded_item_plans_are_repeatable_across_input_chunking() {
     let input: Vec<_> = (0..64).flat_map(|n| frame(n).to_bytes().unwrap()).collect();
     let run = |chunking: &[usize]| {
         let mut stream = Stream::new(Frames::<modbus::Frame>::new());
-        let mut faults = Faults::new(27, 4096, 8);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(27));
+        let mut faults = Faults::new(4096, 8);
         let mut out = Vec::new();
         let plan = [
             Rule {
@@ -420,13 +438,13 @@ fn seeded_item_plans_are_repeatable_across_input_chunking() {
             while !chunk.is_empty() {
                 let n = stream.push(chunk);
                 chunk = &chunk[n..];
-                while let Some(r) = faults.next(&mut stream, &mut out, &plan) {
+                while let Some(r) = faults.next(&entropy, &mut stream, &mut out, &plan) {
                     r.unwrap();
                 }
             }
         }
         stream.end();
-        while let Some(r) = faults.next(&mut stream, &mut out, &plan) {
+        while let Some(r) = faults.next(&entropy, &mut stream, &mut out, &plan) {
             r.unwrap();
         }
         out
@@ -583,7 +601,8 @@ fn forward_keeps_pipe_payloads() {
 
 #[test]
 fn hold_delivers_second_item_before_first() {
-    let mut faults = Faults::new(7, 128, 2);
+    let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(7));
+    let mut faults = Faults::new(128, 2);
     let plan = [Rule {
         when: Trigger::At(1),
         fault: ItemFault::<modbus::Frame>::Hold { window: 1 },
@@ -591,9 +610,9 @@ fn hold_delivers_second_item_before_first() {
     let first = frame(1).to_bytes().unwrap();
     let second = frame(2).to_bytes().unwrap();
     let mut out = Vec::new();
-    faults.item(&plan, &first, &mut out).unwrap();
+    faults.item(&entropy, &plan, &first, &mut out).unwrap();
     assert!(out.is_empty());
-    faults.item(&plan, &second, &mut out).unwrap();
+    faults.item(&entropy, &plan, &second, &mut out).unwrap();
     assert_eq!(
         test_support::decode_all(Frames::<modbus::Frame>::new, &out).0,
         [frame(2), frame(1)]
@@ -604,14 +623,18 @@ fn hold_delivers_second_item_before_first() {
 
 #[test]
 fn split_delivers_two_chunks_with_a_delay_between() {
-    let mut faults = Faults::new(7, 128, 2);
+    let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(7));
+    let mut faults = Faults::new(128, 2);
     let delay = Duration::from_millis(3);
     let plan = [Rule {
         when: Trigger::Always,
         fault: ByteFault::Split { at: 2, delay },
     }];
     let mut out = b"!".to_vec();
-    let marker = faults.bytes(&plan, b"abcd", &mut out).unwrap().unwrap();
+    let marker = faults
+        .bytes(&entropy, &plan, b"abcd", &mut out)
+        .unwrap()
+        .unwrap();
     let pushes = [&out[1..marker.at], &out[marker.at..]];
     assert_eq!(pushes, [b"ab".as_slice(), b"cd".as_slice()]);
     assert_eq!(marker.duration, delay);
@@ -884,7 +907,8 @@ where
     D::Error: Clone,
 {
     let mut stream = Stream::new(decoder);
-    let mut faults = Faults::new(1, 4096, 16);
+    let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
+    let mut faults = Faults::new(4096, 16);
     let mut log = Recorder::new(128, 4096);
     let mut out = Vec::new();
     for chunk in test_support::chunks(input, &[1]).chain(core::iter::once(&[][..])) {
@@ -894,6 +918,7 @@ where
             assert_eq!(stream.push(chunk), chunk.len());
         }
         while let Some(result) = faults.next_with_observed(
+            &entropy,
             &mut stream,
             &mut out,
             &[],
@@ -979,11 +1004,13 @@ fn holds_and_delays_share_recording_and_forwarded_skips() {
             },
         },
     ];
-    let mut faults = Faults::new(1, 128, 4);
+    let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(1));
+    let mut faults = Faults::new(128, 4);
     let mut log = Recorder::new(16, 128);
     let mut out = Vec::new();
     let mut markers = Vec::new();
     while let Some(result) = faults.next_with_observed(
+        &entropy,
         &mut stream,
         &mut out,
         &plan,

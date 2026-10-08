@@ -100,7 +100,7 @@ macro_rules! case {
             use $module as tcp;
             let out = Arc::new(Mutex::new(None));
             let result = out.clone();
-            let run_result = block_on(run(move |fcx| async move {
+            let run_result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
                 let (a, b) = pair();
                 let client = tcp::endpoint(&fcx, a, "10.0.0.1".parse()?);
                 let server = tcp::endpoint(&fcx, b, "10.0.0.2".parse()?);

@@ -271,6 +271,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "libc",
+ "rand_chacha",
  "rcgen",
  "ring",
  "rustls",

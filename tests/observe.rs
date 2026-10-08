@@ -30,30 +30,33 @@ fn start_world(path: &str) -> fictionet::Listening {
     let listening =
         fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
     std::thread::spawn(move || {
-        let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
-            while let Ok(mut sandbox) = attachments.next(&fcx).await {
-                fcx.spawn(move |fcx| async move {
-                    let (mut mine, mut theirs) = fictionet::pair();
+        let _ = fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            move |fcx| async move {
+                while let Ok(mut sandbox) = attachments.next(&fcx).await {
                     fcx.spawn(move |fcx| async move {
-                        while let Ok(p) = theirs.recv(&fcx).await {
-                            fcx.record(
-                                fictionet::events::Event::new("test", "echo")
-                                    .field("len", p.0.len() as u64),
-                            );
-                            theirs.send(p);
+                        let (mut mine, mut theirs) = fictionet::pair();
+                        fcx.spawn(move |fcx| async move {
+                            while let Ok(p) = theirs.recv(&fcx).await {
+                                fcx.record(
+                                    fictionet::events::Event::new("test", "echo")
+                                        .field("len", p.0.len() as u64),
+                                );
+                                theirs.send(p);
+                            }
+                            Ok(())
+                        });
+                        while let Ok(p) = sandbox.recv(&fcx).await {
+                            mine.send(p);
+                            let back = mine.recv(&fcx).await?;
+                            sandbox.send(back);
                         }
                         Ok(())
                     });
-                    while let Ok(p) = sandbox.recv(&fcx).await {
-                        mine.send(p);
-                        let back = mine.recv(&fcx).await?;
-                        sandbox.send(back);
-                    }
-                    Ok(())
-                });
-            }
-            Ok(())
-        }));
+                }
+                Ok(())
+            },
+        ));
     });
     listening
 }

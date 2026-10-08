@@ -20,7 +20,8 @@ where
     for empty_plan in [false, true] {
         let mut stream = Stream::new(make());
         let proxy = Interceptor::new(32768);
-        let mut faults = Faults::new(0, 32768, 8);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(0));
+        let mut faults = Faults::new(32768, 8);
         let mut recorder = Recorder::new(8, 512);
         let mut output = Vec::new();
         for chunk in input.chunks(1).chain(core::iter::once(&[][..])) {
@@ -44,6 +45,7 @@ where
                 let result = if empty_plan {
                     faults
                         .next_with_observed(
+                            &entropy,
                             &mut stream,
                             &mut output,
                             &[],
@@ -191,14 +193,17 @@ where
         },
     ];
     let mut stream = Stream::new(make());
-    let mut faults = Faults::new(seed, 65536, 8);
+    let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(seed));
+    let mut faults = Faults::new(65536, 8);
     let mut recorder = Recorder::new(8, 512);
     let mut output = Vec::new();
     let mut markers = Vec::new();
     let mut bytes = Vec::new();
     for chunk in test_support::chunks(input, &[7, 1, 31]).chain(core::iter::once(&[][..])) {
         bytes.clear();
-        let marker = faults.bytes(&byte_plan, chunk, &mut bytes).unwrap();
+        let marker = faults
+            .bytes(&entropy, &byte_plan, chunk, &mut bytes)
+            .unwrap();
         if chunk.is_empty() {
             stream.end();
         }
@@ -220,6 +225,7 @@ where
                     let start = output.len();
                     let offset = stream.offset();
                     let result = faults.next_with_observed(
+                        &entropy,
                         &mut stream,
                         &mut output,
                         &item_plan,

@@ -65,7 +65,7 @@ pub struct Fetched {
 pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
     let fetched = Arc::new(Mutex::new(None));
     let out = fetched.clone();
-    let ended = run(move |fcx| async move {
+    let ended = run(fictionet::Seed::random(), move |fcx| async move {
         let certs = certs()?;
         // The world's date: certificates are checked against it.
         let date = std::time::Duration::from_secs(1_767_225_600); // 2026-01-01

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use fictionet::events::{ConnInfo, Event};
-use fictionet::stdlib::codec::{Ending, ItemFault, Lcg, LineError, Lines, Rewrite, Rule, Trigger};
+use fictionet::stdlib::codec::{Ending, ItemFault, LineError, Lines, Rewrite, Rule, Trigger};
 use fictionet::stdlib::httpd::{
     self, Body, Exchange, Handler, Http1, HttpOptions, Limits, Reply, Router,
 };
@@ -144,7 +144,12 @@ fn reply_bytes_count_against_the_budget() {
     let opts = ServeOptions::default()
         .idle(None)
         .budget(Budget::new(256 << 10));
-    let mut h = Harness::with_options(Loud { size: 1 << 20 }, (), opts);
+    let mut h = Harness::with_options(
+        fictionet::Seed::from_u64(0),
+        Loud { size: 1 << 20 },
+        (),
+        opts,
+    );
     assert_eq!(h.push(b"go\n").unwrap(), b"");
     assert_eq!(h.end_reason(), Some(Ended::Budget));
 
@@ -152,7 +157,12 @@ fn reply_bytes_count_against_the_budget() {
     let opts = ServeOptions::default()
         .idle(None)
         .budget(Budget::new(256 << 10));
-    let mut h = Harness::with_options(Loud { size: 64 << 10 }, (), opts);
+    let mut h = Harness::with_options(
+        fictionet::Seed::from_u64(0),
+        Loud { size: 64 << 10 },
+        (),
+        opts,
+    );
     assert_eq!(h.push(b"go\n").unwrap().len(), 64 << 10);
     assert_eq!(h.end_reason(), None);
 }
@@ -164,7 +174,12 @@ fn a_response_body_waiting_to_be_written_counts_against_the_budget() {
     let opts = ServeOptions::default()
         .idle(None)
         .budget(Budget::new(512 << 10));
-    let mut h = Harness::with_options(Http1::new(page(1 << 20)), (), opts);
+    let mut h = Harness::with_options(
+        fictionet::Seed::from_u64(0),
+        Http1::new(page(1 << 20)),
+        (),
+        opts,
+    );
     assert_eq!(
         h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").unwrap(),
         b""
@@ -214,7 +229,6 @@ fn a_client_that_stops_reading_times_out() {
 #[test]
 fn item_faults_that_stop_record_why() {
     let plan = FaultPlan::new(Plan {
-        seed: 1,
         items: vec![Rule {
             when: Trigger::At(1000),
             fault: ItemFault::Action {
@@ -225,7 +239,7 @@ fn item_faults_that_stop_record_why() {
         ..Plan::default()
     });
     let opts = ServeOptions::default().idle(None).faults(plan);
-    let mut h = Harness::with_options(Http1::new(page(2)), (), opts);
+    let mut h = Harness::with_options(fictionet::Seed::from_u64(0), Http1::new(page(2)), (), opts);
     let _ = h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n\x00\x01 not http\r\n\r\n");
     let stopped = h
         .events()
@@ -268,7 +282,7 @@ impl Handler for Streams {
 /// fired.
 #[test]
 fn an_http10_body_of_unknown_length_closes_the_connection() {
-    let mut h = Harness::new(Http1::new(Streams), ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Streams), ());
     let reply = h
         .push(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
         .unwrap();
@@ -282,7 +296,7 @@ fn an_http10_body_of_unknown_length_closes_the_connection() {
     assert_eq!(h.end_reason(), Some(Ended::Closed));
 
     // With a known length, the connection stays open.
-    let mut h = Harness::new(Http1::new(page(3)), ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(page(3)), ());
     let reply = h
         .push(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
         .unwrap();
@@ -397,85 +411,90 @@ fn http2_caps_the_streams_a_connection_opens() {
 }
 
 /// HTTP/2 applies the body limit, charges bodies to the budget, and draws
-/// a handler's randomness from the connection's seed, as HTTP/1 does.
-/// Before, it took any body up to 64 MiB, charged nothing, and drew from
-/// the run's own randomness.
+/// a handler's randomness from the run's stream, as HTTP/1 does.
 #[test]
 fn http2_has_the_limits_budget_and_seed_of_http1() {
-    world(Duration::from_secs(60), |fcx| async move {
-        let (server, client) = two_machines(&fcx);
-        let kept = fcx.events();
-        let router = Router::new()
-            .get("/dice", |ex, _| {
-                http::Response::new(Bytes::from(ex.random_u64().to_string()))
-            })
-            .post("/echo", |_, request: http::Request<Bytes>| {
-                http::Response::new(request.into_body())
+    world::seeded_world(
+        fictionet::Seed::from_u64(7),
+        Duration::from_secs(60),
+        |fcx| async move {
+            let (server, client) = two_machines(&fcx);
+            let kept = fcx.events();
+            let router = Router::new()
+                .get("/dice", |ex, _| {
+                    http::Response::new(Bytes::from(ex.random_u64().to_string()))
+                })
+                .post("/echo", |_, request: http::Request<Bytes>| {
+                    http::Response::new(request.into_body())
+                });
+            let opts = HttpOptions {
+                limits: Limits {
+                    body: 3000,
+                    ..Limits::default()
+                },
+                budget: Some(Budget::new(2000)),
+                ..HttpOptions::default()
+            };
+            serve_http(&fcx, &server, 80, Arc::new(router), opts)?;
+            let conn = client
+                .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+                .await?;
+            let (mut send, driving) = hyper::client::conn::http2::handshake(
+                Exec(fcx.clone()),
+                Io {
+                    fcx: fcx.clone(),
+                    conn,
+                },
+            )
+            .await?;
+            fcx.spawn(move |_| async move {
+                let _ = driving.await;
+                Ok(())
             });
-        let opts = HttpOptions {
-            limits: Limits {
-                body: 3000,
-                ..Limits::default()
-            },
-            budget: Some(Budget::new(2000)),
-            seed: 7,
-            ..HttpOptions::default()
-        };
-        serve_http(&fcx, &server, 80, Arc::new(router), opts)?;
-        let conn = client
-            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
-            .await?;
-        let (mut send, driving) = hyper::client::conn::http2::handshake(
-            Exec(fcx.clone()),
-            Io {
-                fcx: fcx.clone(),
-                conn,
-            },
-        )
-        .await?;
-        fcx.spawn(move |_| async move {
-            let _ = driving.await;
+            let mut ask = async |method: http::Method,
+                                 path: &str,
+                                 body: Vec<u8>|
+                   -> fictionet::Result<(u16, Bytes)> {
+                send.ready().await?;
+                let request = http::Request::builder()
+                    .method(method)
+                    .uri(format!("http://a.test{path}"))
+                    .body(Full::new(Bytes::from(body)))?;
+                let response = send.send_request(request).await?;
+                let status = response.status().as_u16();
+                Ok((status, response.into_body().collect().await?.to_bytes()))
+            };
+
+            let (status, body) = ask(http::Method::GET, "/dice", vec![]).await?;
+            assert_eq!(status, 200);
+            use fictionet::Entropy;
+            let source = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(7));
+            // Each of the two TCP endpoints takes its interface seed and port start.
+            source.fill_random(&mut [0; 32]);
+            let expected = source.random_u64();
+            assert_eq!(body, expected.to_string());
+
+            // Within the budget and the limit.
+            let (status, body) = ask(http::Method::POST, "/echo", vec![b'a'; 1500]).await?;
+            assert_eq!((status, body.len()), (200, 1500));
+            // Within the limit, past the budget.
+            let (status, _) = ask(http::Method::POST, "/echo", vec![b'b'; 2500]).await?;
+            assert_eq!(status, 503);
+            // Past the limit.
+            let (status, _) = ask(http::Method::POST, "/echo", vec![b'c'; 3500]).await?;
+            assert_eq!(status, 413);
+
+            let events = kept
+                .wait(&fcx, 4, Duration::from_secs(5), |e| e.is("http", "request"))
+                .await?;
+            let answers: Vec<_> = events
+                .iter()
+                .map(|e| e.str("answer").unwrap_or("").to_owned())
+                .collect();
+            assert_eq!(answers, ["handler", "handler", "budget", "too_large"]);
             Ok(())
-        });
-        let mut ask = async |method: http::Method,
-                             path: &str,
-                             body: Vec<u8>|
-               -> fictionet::Result<(u16, Bytes)> {
-            send.ready().await?;
-            let request = http::Request::builder()
-                .method(method)
-                .uri(format!("http://a.test{path}"))
-                .body(Full::new(Bytes::from(body)))?;
-            let response = send.send_request(request).await?;
-            let status = response.status().as_u16();
-            Ok((status, response.into_body().collect().await?.to_bytes()))
-        };
-
-        let (status, body) = ask(http::Method::GET, "/dice", vec![]).await?;
-        assert_eq!(status, 200);
-        let expected = Lcg::new(serve::conn_seed(7, 1)).next();
-        assert_eq!(body, expected.to_string());
-
-        // Within the budget and the limit.
-        let (status, body) = ask(http::Method::POST, "/echo", vec![b'a'; 1500]).await?;
-        assert_eq!((status, body.len()), (200, 1500));
-        // Within the limit, past the budget.
-        let (status, _) = ask(http::Method::POST, "/echo", vec![b'b'; 2500]).await?;
-        assert_eq!(status, 503);
-        // Past the limit.
-        let (status, _) = ask(http::Method::POST, "/echo", vec![b'c'; 3500]).await?;
-        assert_eq!(status, 413);
-
-        let events = kept
-            .wait(&fcx, 4, Duration::from_secs(5), |e| e.is("http", "request"))
-            .await?;
-        let answers: Vec<_> = events
-            .iter()
-            .map(|e| e.str("answer").unwrap_or("").to_owned())
-            .collect();
-        assert_eq!(answers, ["handler", "handler", "budget", "too_large"]);
-        Ok(())
-    });
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

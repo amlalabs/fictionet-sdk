@@ -195,7 +195,7 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = block_on(run(|fcx| async move {
+        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
             let sites = web::Sites::new(|host| match host {
                 "plain.test" => Some(web::Site::new(Hello)),
                 h if h.ends_with(".wild.test") => Some(web::Site::new(Hello)),
@@ -389,7 +389,7 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
     let world_stop = stop.clone();
     let world_path = path.clone();
     std::thread::spawn(move || {
-        let result = block_on(run(move |fcx| async move {
+        let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let sites =
                 web::Sites::new(|host| (host == "plain.test").then(|| web::Site::new(Hello)));
             sites.serve(&fcx, attachments)?;

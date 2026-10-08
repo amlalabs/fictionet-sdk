@@ -241,7 +241,8 @@ pub fn endpoint_with(fcx: &Cx, inner: impl Interface, addr: IpAddr, options: Opt
             conns: BTreeMap::new(),
             by_tuple: HashMap::new(),
             ports: HashMap::new(),
-            next_port: EPHEMERAL + (fcx.random_u64() % (65536 - EPHEMERAL as u64)) as u16,
+            next_port: EPHEMERAL
+                + fictionet::Entropy::random_below(fcx, 65536 - EPHEMERAL as u64) as u16,
             orphans: Vec::new(),
             stopped: false,
             driver: None,
@@ -1756,7 +1757,7 @@ mod tests {
 
     #[test]
     fn stop_wakes_listeners_in_port_order() {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (_raw, side) = pair();
             let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let log = Arc::new(Mutex::new(Vec::new()));
@@ -1782,7 +1783,7 @@ mod tests {
 
     #[test]
     fn abort_peer_wakes_connections_in_socket_order() {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (_raw, side) = pair();
             let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let log = Arc::new(Mutex::new(Vec::new()));
@@ -1810,7 +1811,7 @@ mod tests {
 
     #[test]
     fn compaction_keeps_socket_id_scan_order() {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (_raw, side) = pair();
             let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let mut st = ep.shared.state.lock().unwrap();
@@ -1980,7 +1981,7 @@ mod tests {
         ] {
             let local: SocketAddr = local.parse().unwrap();
             let peer: SocketAddr = peer.parse().unwrap();
-            let result = block_on(run(move |fcx| async move {
+            let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
                 let (side, _raw) = pair();
                 let server = endpoint_with(&fcx, side, local.ip(), Options::default());
                 let mut listener = server.listen(local.port())?;
@@ -2085,7 +2086,7 @@ mod tests {
     }
 
     fn window_reopens(drop_handle: bool, data: &'static [u8]) {
-        let result = block_on(run(move |fcx| async move {
+        let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let (side, _raw) = pair();
             let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
             let peer: SocketAddr = "10.0.0.2:1234".parse().unwrap();
@@ -2188,7 +2189,7 @@ mod tests {
             ),
             (1, MAX_BACKLOG)
         );
-        let result = block_on(run(|fcx| async move {
+        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (mut raw, side) = pair();
             let server = endpoint_with(
                 &fcx,
@@ -2227,7 +2228,7 @@ mod tests {
     /// at most one spare listening socket, not one per SYN.
     #[test]
     fn a_burst_of_reset_handshakes_leaves_no_pool_of_sockets() {
-        let result = block_on(run(|fcx| async move {
+        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (mut raw, side) = pair();
             let server = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let _listener = server.listen(80)?;
@@ -2274,7 +2275,7 @@ mod tests {
     /// working.
     #[test]
     fn the_socket_set_shrinks_after_a_crowd_leaves() {
-        let result = block_on(run(|fcx| async move {
+        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (a, b) = pair();
             let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
             let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
@@ -2330,7 +2331,7 @@ mod tests {
     /// a minute, not the two minutes of an open one.
     #[test]
     fn a_dropped_connection_waits_a_minute_at_most() {
-        let result = block_on(run(|fcx| async move {
+        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (a, b) = pair();
             let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
             let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());
@@ -2362,7 +2363,7 @@ mod tests {
         assert_eq!(Options::default().buffer(1).buffer, MIN_BUFFER);
         assert_eq!(Options::default().buffer(usize::MAX).buffer, MAX_BUFFER);
         for size in [MIN_BUFFER, 1 << 20] {
-            let result = block_on(run(move |fcx| async move {
+            let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
                 let (a, b) = pair();
                 let options = Options::default().buffer(size);
                 let server = endpoint_with(&fcx, a, "10.0.0.1".parse().unwrap(), options);
@@ -2399,7 +2400,7 @@ mod tests {
 
     #[test]
     fn quiet_connections_give_their_buffer_pages_back() {
-        let result = block_on(run(|fcx| async move {
+        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (a, b) = pair();
             let server = endpoint(&fcx, a, "10.0.0.1".parse().unwrap());
             let client = endpoint(&fcx, b, "10.0.0.2".parse().unwrap());

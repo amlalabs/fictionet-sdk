@@ -81,26 +81,29 @@ fn real_main() -> fictionet::Result {
         .worker_threads(2)
         .enable_all()
         .build()?;
-    runtime.block_on(fictionet::run(move |fcx| async move {
-        serve(&fcx, &hosts, leaves, content, log, attachments)?;
+    runtime.block_on(fictionet::run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            serve(&fcx, &hosts, leaves, content, log, attachments)?;
 
-        // Look every host up once, so each FakeWiki address answers from
-        // the start, as in the Python world, even for an agent that
-        // connects by address without DNS.
-        look_up_all(&fcx, &attacher, &host_list).await?;
-        let _listening =
-            fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
+            // Look every host up once, so each FakeWiki address answers from
+            // the start, as in the Python world, even for an agent that
+            // connects by address without DNS.
+            look_up_all(&fcx, &attacher, &host_list).await?;
+            let _listening =
+                fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
 
-        std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
-        if let Some(dir) = ready.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&ready, variant.as_bytes())?;
-        println!("fictionet world up: variant={variant}");
+            std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
+            if let Some(dir) = ready.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&ready, variant.as_bytes())?;
+            println!("fictionet world up: variant={variant}");
 
-        // The network serves every sandbox from here on. The listener
-        // lives as long as the world.
-        std::future::pending::<()>().await;
-        Ok(())
-    }))
+            // The network serves every sandbox from here on. The listener
+            // lives as long as the world.
+            std::future::pending::<()>().await;
+            Ok(())
+        },
+    ))
 }

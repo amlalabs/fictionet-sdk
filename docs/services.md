@@ -148,7 +148,7 @@ reply.
 ```rust
 use fictionet::stdlib::serve::Harness;
 
-let mut h = Harness::new(Prompt, "hunter2".to_owned());
+let mut h = Harness::new(fictionet::Seed::from_u64(0), Prompt, "hunter2".to_owned());
 assert_eq!(h.open()?, b"password: ");
 assert_eq!(h.push(b"hunter2\n")?, b"welcome\n");
 assert!(h.closed());
@@ -157,7 +157,10 @@ assert_eq!(h.events()[0].kind, "login");
 
 The harness runs the same state machine as the driver: `advance` moves
 its clock and fires timers in order, `poll` runs deferred work and wakes,
-and `resume` goes on after an upgrade.
+and `resume` goes on after an upgrade. Its standalone entropy stream starts
+from the supplied `Seed`. Calling `with_fcx` before opening it binds both
+its clock and randomness to that run; use the run's sleeps and `poll` then,
+because manual `advance` is only available to standalone harnesses.
 
 ## 3. A network
 
@@ -209,11 +212,10 @@ replies, and what the service and its deferred work report holding.
 Memory outside those counts, such as hyper's own buffers, is not charged.
 `Net::limits` changes these limits and the TLS handshake and DNS timers.
 Its handshake timer also applies to STARTTLS. Tests set small ones.
-`Net::seed` seeds every service's randomness. A TCP service mixes it with
-the connection's number, and a UDP service with its port. So a run whose
-connections arrive in the same order draws the same numbers. On HTTP/2,
-the streams of one connection share its generator, so their handlers
-must also run in the same order.
+`fictionet::run(seed, world)` gives TCP, UDP, services, HTTP exchanges and
+fault decisions one ChaCha20 byte stream through `Cx`. The same seed and
+ordered draws produce the same numbers. HTTP/2 handlers also draw from
+this run stream, so their execution order matters.
 
 `Net::lan(name, prefix)` adds an IP subnet that hosts join with
 `Host::on(name)` and real virtual machines with
@@ -279,7 +281,7 @@ module reads and writes HTTP/2 frames and tracks a session's state, but it
 does not serve. Both versions share one set of `httpd::Limits`: body size,
 body and write timers, and 100 streams at once on an HTTP/2 connection.
 Both charge the request and response bodies they hold to the sandbox's
-budget, and both draw a handler's randomness from the connection's seed.
+budget, and both draw a handler's randomness from the run's stream.
 
 Each request is one `http.request` event. Its `sent` field counts the
 body bytes the connection took, and `complete` says whether it took all
@@ -310,7 +312,10 @@ The file has one JSON object per line: `seq`, `at`, `source`, `kind`,
 `level`, `summary`, `sandbox`, `conn`, `local`, `peer`, `transport`,
 `tls`, `sni`, `alpn`, `fields`, then the task that recorded it (`node`,
 `task`, `file`, `line`, `parent`). The network's first event is
-`run.start`, whose `wall` field puts the run's clock on a calendar. Field
+`run.start`, whose `wall` field puts the run's clock on a calendar and whose
+`seed` field contains the 32-byte run seed as 64 lowercase hexadecimal digits.
+The `rng` field is `chacha20-v1`: ChaCha20 with contiguous byte consumption,
+little-endian integers and the high 53 bits for fractions. Field
 names are fixed by the code that records; names that come from the wire,
 such as LDAP attributes, go under one field as an object.
 

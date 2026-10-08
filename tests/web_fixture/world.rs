@@ -446,14 +446,17 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let _ = rt.block_on(fictionet::run(move |fcx| async move {
-                let (attacher, attachments) = fictionet::attachments();
-                super::world(&fcx, chain, key, attachments)?;
-                let lines = report(&fcx, &attacher, roots).await;
-                let _ = tx.send(lines);
-                fcx.cancel();
-                Ok(())
-            }));
+            let _ = rt.block_on(fictionet::run(
+                fictionet::Seed::random(),
+                move |fcx| async move {
+                    let (attacher, attachments) = fictionet::attachments();
+                    super::world(&fcx, chain, key, attachments)?;
+                    let lines = report(&fcx, &attacher, roots).await;
+                    let _ = tx.send(lines);
+                    fcx.cancel();
+                    Ok(())
+                },
+            ));
         });
         let got = rx
             .recv_timeout(std::time::Duration::from_secs(120))

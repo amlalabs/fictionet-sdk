@@ -82,24 +82,27 @@ fn main() -> Result {
         println!("  {name:<11} {addr}");
     }
 
-    fictionet::block_on(fictionet::run(move |fcx| async move {
-        let lan = route::lan(&fcx, subnet, |event| event);
-        loop {
-            let sandbox = attachments.next(&fcx).await?;
-            let name = sandbox.name().to_owned();
-            let Some(&addr) = members.get(name.as_str()) else {
-                println!("turned away {name}: no address is assigned to that member");
-                continue;
-            };
-            println!("attached {name} at {addr}");
-            let event = Event::new("goad", "member_attached")
-                .summary(format!("{name} attached at {addr}"))
-                .field("name", name.as_str())
-                .field("address", addr.to_string());
-            fcx.record(event);
-            lan.add(addr, Box::new(sandbox) as Box<dyn Interface>, None)?;
-        }
-    }))
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let lan = route::lan(&fcx, subnet, |event| event);
+            loop {
+                let sandbox = attachments.next(&fcx).await?;
+                let name = sandbox.name().to_owned();
+                let Some(&addr) = members.get(name.as_str()) else {
+                    println!("turned away {name}: no address is assigned to that member");
+                    continue;
+                };
+                println!("attached {name} at {addr}");
+                let event = Event::new("goad", "member_attached")
+                    .summary(format!("{name} attached at {addr}"))
+                    .field("name", name.as_str())
+                    .field("address", addr.to_string());
+                fcx.record(event);
+                lan.add(addr, Box::new(sandbox) as Box<dyn Interface>, None)?;
+            }
+        },
+    ))
 }
 
 fn parse_prefix(text: &str) -> Result<[u8; 3]> {

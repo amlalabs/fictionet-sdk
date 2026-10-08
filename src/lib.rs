@@ -131,7 +131,7 @@
 //!     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 //!     let _listening = fictionet::listen(socket, attacher)?;
 //!     let args = std::env::args().skip(1).collect();
-//!     fictionet::block_on(fictionet::run(|fcx| world(fcx, attachments, args)))
+//!     fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments, args)))
 //! }
 //! ```
 //!
@@ -302,6 +302,7 @@ pub mod attaching;
 mod block_on;
 mod cable;
 mod cx;
+mod entropy;
 mod error;
 pub mod events;
 #[cfg(fuzzing)]
@@ -318,6 +319,7 @@ pub mod recipes;
 #[doc(hidden)]
 pub mod relay;
 pub mod roadmap;
+pub use entropy::{Entropy, Seed, SeededEntropy};
 mod run;
 pub mod running;
 pub mod stdlib;

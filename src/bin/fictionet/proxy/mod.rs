@@ -103,7 +103,7 @@ pub(crate) fn run(args: ProxyArgs) -> Result<(), Failure> {
         let limit = Arc::new(Semaphore::new(MAX_CLIENTS));
         let accepting: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::default();
         let (limit2, accepting2) = (limit.clone(), accepting.clone());
-        let ran = fictionet::run(move |fcx| async move {
+        let ran = fictionet::run(fictionet::Seed::random(), move |fcx| async move {
             let stack = Stack::new(&fcx, link, ip, dns);
             *accepting2.lock().unwrap() =
                 Some(tokio::spawn(accept(listener, stack, token, kind, limit2)));

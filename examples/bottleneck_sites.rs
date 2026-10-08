@@ -44,19 +44,22 @@ fn main() -> fictionet::Result {
     )?;
     println!("listening on {path}");
 
-    fictionet::block_on(fictionet::run(|fcx| async move {
-        let app = axum::Router::new()
-            .route("/4mb", get(|| async { vec![b'x'; 4 << 20] }))
-            .route(
-                "/upload",
-                post(
-                    |body: axum::body::Bytes| async move { format!("got {} bytes\n", body.len()) },
-                ),
-            )
-            // The agent sends this body, so keep a limit on it.
-            .layer(DefaultBodyLimit::max(8 << 20));
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::random(),
+        |fcx| async move {
+            let app =
+                axum::Router::new()
+                    .route("/4mb", get(|| async { vec![b'x'; 4 << 20] }))
+                    .route(
+                        "/upload",
+                        post(|body: axum::body::Bytes| async move {
+                            format!("got {} bytes\n", body.len())
+                        }),
+                    )
+                    // The agent sends this body, so keep a limit on it.
+                    .layer(DefaultBodyLimit::max(8 << 20));
 
-        let slow = attachments.map(&fcx, |fcx, sandbox| {
+            let slow = attachments.map(&fcx, |fcx, sandbox| {
             // Count packets on both sides of the bottleneck. A packet
             // that went in on one side and never came out of the other
             // was dropped by the queue.
@@ -97,11 +100,12 @@ fn main() -> fictionet::Result {
             link
         });
 
-        web::Sites::new(move |host: &str| match host {
-            "example.test" => Some(web::Site::new(app.clone())),
-            _ => None,
-        })
-        .serve(&fcx, slow)?;
-        Ok(())
-    }))
+            web::Sites::new(move |host: &str| match host {
+                "example.test" => Some(web::Site::new(app.clone())),
+                _ => None,
+            })
+            .serve(&fcx, slow)?;
+            Ok(())
+        },
+    ))
 }

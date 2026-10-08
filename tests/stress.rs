@@ -101,7 +101,7 @@ fn many_attachments_lose_nothing_and_idle_costs_nothing() {
     let world = std::thread::Builder::new()
         .name("world".into())
         .spawn(move || {
-            block_on(run(move |fcx| async move {
+            block_on(run(fictionet::Seed::random(), move |fcx| async move {
                 // A long timer stays pending the whole time.
                 fcx.spawn(|fcx| async move {
                     fcx.sleep(Duration::from_secs(3600)).await?;

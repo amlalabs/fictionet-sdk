@@ -30,14 +30,17 @@ fn main() -> Result {
         attacher,
     )?;
     println!("listening on {path}");
-    fictionet::block_on(fictionet::run(move |fcx| async move {
-        // `next` returns `Cancelled` when the world stops, and `?` ends
-        // the loop with it.
-        loop {
-            let sandbox = attachments.next(&fcx).await?;
-            fcx.spawn(move |fcx| serve(fcx, sandbox));
-        }
-    }))
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            // `next` returns `Cancelled` when the world stops, and `?` ends
+            // the loop with it.
+            loop {
+                let sandbox = attachments.next(&fcx).await?;
+                fcx.spawn(move |fcx| serve(fcx, sandbox));
+            }
+        },
+    ))
 }
 
 async fn serve(fcx: Cx, sandbox: Attachment) -> Result {

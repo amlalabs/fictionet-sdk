@@ -17,20 +17,23 @@ fn main() -> fictionet::Result {
     )?;
     println!("listening on {path}");
 
-    fictionet::block_on(fictionet::run(|fcx| async move {
-        let app = axum::Router::new().route(
-            "/",
-            axum::routing::get(|| async { "hello from far away\n" }),
-        );
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::random(),
+        |fcx| async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::get(|| async { "hello from far away\n" }),
+            );
 
-        // Every sandbox, as it attaches, gets a 200 ms delay each way.
-        let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
+            // Every sandbox, as it attaches, gets a 200 ms delay each way.
+            let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
 
-        web::Sites::new(move |host: &str| match host {
-            "example.test" => Some(web::Site::new(app.clone())),
-            _ => None,
-        })
-        .serve(&fcx, far)?;
-        Ok(())
-    }))
+            web::Sites::new(move |host: &str| match host {
+                "example.test" => Some(web::Site::new(app.clone())),
+                _ => None,
+            })
+            .serve(&fcx, far)?;
+            Ok(())
+        },
+    ))
 }

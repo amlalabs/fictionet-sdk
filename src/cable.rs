@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn a_limited_cable_drops_what_does_not_fit_and_frees_what_is_read() {
-        let result = block_on(run(|fcx| async move {
+        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
             // Room for exactly ten 36-byte packets.
             let (mut a, mut b) = pair_with_limit(10 * (36 + PACKET_COST));
             for i in 0..20u8 {

@@ -393,7 +393,7 @@ mod tests {
         use crate::prelude::*;
         use crate::stdlib::{delay, route};
         use crate::time::ms;
-        let graph = Graph::new();
+        let graph = Graph::new(crate::Seed::random());
         let g = graph.clone();
         let (attacher, mut attachments) = crate::attachments();
         let _sandbox = attacher.attach("agent").unwrap();
@@ -470,7 +470,7 @@ mod tests {
     /// A group that empties is announced gone, after its nodes.
     #[test]
     fn groups_come_and_go_with_their_tasks() {
-        let graph = Graph::new();
+        let graph = Graph::new(crate::Seed::random());
         graph.task_started(1, "world".into(), Location::caller(), None);
         let (mut view, _) = snapshot(&graph, None);
         let outer = Group::new(graph.next_group(), "outer".into(), None);
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn changes_follow_the_graph() {
-        let graph = Graph::new();
+        let graph = Graph::new(crate::Seed::random());
         graph.task_started(1, "world".into(), Location::caller(), None);
         let (mut view, (name, data)) = snapshot(&graph, None);
         assert_eq!(name, "snapshot");

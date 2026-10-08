@@ -2,8 +2,9 @@ extern crate alloc;
 
 use alloc::{string::String, vec::Vec};
 
-/// The shared deterministic generator for codec tools and protocol tests.
-/// This is not a cryptographic RNG.
+/// A deterministic test-data generator for codec tools and protocol tests.
+/// This is not a cryptographic RNG. Live world decisions use
+/// [`Entropy`](fictionet::Entropy) through [`Cx`](fictionet::Cx).
 #[derive(Clone, Debug)]
 pub struct Lcg(u64);
 impl Lcg {

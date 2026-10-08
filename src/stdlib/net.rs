@@ -249,8 +249,6 @@ pub struct Arrival {
     /// [`Limits::handshake`]: how long a client has to send its first
     /// bytes.
     pub handshake: Duration,
-    /// The network's seed ([`Net::seed`]), for [`ServeOptions::seed`].
-    pub seed: u64,
 }
 
 /// Serves connections on one port of a host. [`Host::tcp`] and
@@ -330,7 +328,6 @@ where
             opts.budget = arrival.budget;
         }
         opts.handshake = arrival.handshake;
-        opts.seed ^= arrival.seed;
         let (conn, info) = (arrival.conn, arrival.info);
         Box::pin(async move {
             let _ = serve::serve(&fcx, conn, info, &mut service, &state, &opts).await;
@@ -338,10 +335,9 @@ where
     }
 }
 
-/// Starts serving a UDP port of a machine: the socket, its address, the
-/// seed, and who the sandboxes are.
-type UdpStart =
-    Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, u64, Option<serve::SandboxOf>) + Send + Sync>;
+/// Starts serving a UDP port of a machine: the socket, its address,
+/// and who the sandboxes are.
+type UdpStart = Arc<dyn Fn(&Cx, udp::Socket, SocketAddr, Option<serve::SandboxOf>) + Send + Sync>;
 
 /// Which names a TLS service on a port answers to, by the SNI the client
 /// sends.
@@ -559,14 +555,13 @@ impl Host {
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decoder as Decode>::Error: Clone + Send,
     {
-        let start: UdpStart = Arc::new(move |fcx, socket, local, seed, sandbox| {
+        let start: UdpStart = Arc::new(move |fcx, socket, local, sandbox| {
             let mut service = make();
             let state = state.clone();
             let mut opts = opts.clone();
             if sandbox.is_some() {
                 opts.sandbox = sandbox;
             }
-            opts.seed ^= seed;
             fcx.spawn(move |fcx| async move {
                 Ok(serve::serve_datagram(&fcx, socket, local, &mut service, &state, &opts).await?)
             });
@@ -595,7 +590,6 @@ pub struct Net {
     registry: Option<fictionet::observe::Registry>,
     group: String,
     limits: Limits,
-    seed: u64,
     start: Fields,
     lans: Vec<(String, Prefix)>,
     members: Vec<(String, String, IpAddr)>,
@@ -627,7 +621,6 @@ impl Net {
             registry: None,
             group: "net".to_owned(),
             limits: Limits::default(),
-            seed: 0,
             start: Fields::new(),
             lans: Vec::new(),
             members: Vec::new(),
@@ -757,13 +750,6 @@ impl Net {
         Net { limits, ..self }
     }
 
-    /// Sets the seed every service's randomness is drawn from, mixed with
-    /// each connection's number ([`ServeOptions::seed`]). Default 0: runs
-    /// whose connections arrive in the same order draw the same numbers.
-    pub fn seed(self, seed: u64) -> Net {
-        Net { seed, ..self }
-    }
-
     /// Builds the network and starts it. Every sandbox in `attachments`,
     /// including ones that attach later, is connected.
     ///
@@ -837,7 +823,6 @@ impl Net {
             hooks,
             fixed: routes.iter().map(|(_, p)| *p).collect(),
             limits: self.limits,
-            seed: self.seed,
             lans,
         });
         start_gateway(&shared)?;
@@ -1179,7 +1164,6 @@ struct Shared {
     /// Prefixes of trusted sandboxes ([`Net::route`]).
     fixed: Vec<Prefix>,
     limits: Limits,
-    seed: u64,
     /// The LANs, by name.
     lans: BTreeMap<String, LanSeg>,
 }
@@ -1721,7 +1705,6 @@ impl Machine {
 
     /// Adds a host's services.
     fn add(self: &Arc<Self>, host: &Host) -> Result<(), String> {
-        let seed = self.shared.upgrade().map_or(0, |s| s.seed);
         let sandbox: Option<serve::SandboxOf> = self.shared.upgrade().map(|s| {
             let hooks = s.hooks.clone();
             Arc::new(move |a: IpAddr| Some(hooks.sandbox_at(a))) as serve::SandboxOf
@@ -1741,7 +1724,6 @@ impl Machine {
                         &self.fcx,
                         socket,
                         SocketAddr::new(addr, *number),
-                        seed,
                         sandbox.clone(),
                     );
                 }
@@ -1931,7 +1913,6 @@ async fn connection(
         socket: socket.clone(),
         budget: budget.clone(),
         handshake: shared.limits.handshake,
-        seed: shared.seed,
     };
     let has_tls = !port
         .tls
@@ -3027,57 +3008,59 @@ mod tests {
 
     #[test]
     fn lan_dns_endpoints_start_in_name_order() {
-        fictionet::block_on(fictionet::run(|fcx| async move {
-            let subnet = Subnet::new("198.18.0.0/16".parse().unwrap()).unwrap();
-            let router = route::router::<Box<dyn Interface>>(&fcx, Vec::new());
-            let hooks = Arc::new(Hooks {
-                by_addr: Mutex::default(),
-                conns: AtomicU64::new(0),
-                attached: Mutex::default(),
-            });
-            let lans = make_lans(
-                &fcx,
-                &router,
-                &hooks,
-                &subnet,
-                None,
-                [
-                    ("z", "10.0.1.0/24"),
-                    ("a", "10.0.3.0/24"),
-                    ("m", "10.0.2.0/24"),
-                ]
-                .map(|(name, prefix)| (name.to_owned(), prefix.parse().unwrap()))
-                .into(),
-                &[],
-            )?;
-            let shared = Arc::new(Shared {
-                fcx: fcx.clone(),
-                resolver: None,
-                subnet,
-                subnet6: None,
-                router,
-                world: Mutex::new(World::new(MAX_HOSTS)),
-                leases: Mutex::default(),
-                gateway_tcp: Mutex::default(),
-                hooks,
-                fixed: Vec::new(),
-                limits: Limits::default(),
-                seed: 0,
-                lans,
-            });
-            start_gateway(&shared)?;
-            let addresses: Vec<_> = lock(&shared.gateway_tcp)
-                .iter()
-                .map(tcp::Endpoint::addr)
-                .collect();
-            assert_eq!(
-                addresses,
-                ["198.18.0.1", "10.0.3.1", "10.0.2.1", "10.0.1.1"]
-                    .map(|s| s.parse::<IpAddr>().unwrap())
-            );
-            fcx.cancel();
-            Ok(())
-        }))
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            |fcx| async move {
+                let subnet = Subnet::new("198.18.0.0/16".parse().unwrap()).unwrap();
+                let router = route::router::<Box<dyn Interface>>(&fcx, Vec::new());
+                let hooks = Arc::new(Hooks {
+                    by_addr: Mutex::default(),
+                    conns: AtomicU64::new(0),
+                    attached: Mutex::default(),
+                });
+                let lans = make_lans(
+                    &fcx,
+                    &router,
+                    &hooks,
+                    &subnet,
+                    None,
+                    [
+                        ("z", "10.0.1.0/24"),
+                        ("a", "10.0.3.0/24"),
+                        ("m", "10.0.2.0/24"),
+                    ]
+                    .map(|(name, prefix)| (name.to_owned(), prefix.parse().unwrap()))
+                    .into(),
+                    &[],
+                )?;
+                let shared = Arc::new(Shared {
+                    fcx: fcx.clone(),
+                    resolver: None,
+                    subnet,
+                    subnet6: None,
+                    router,
+                    world: Mutex::new(World::new(MAX_HOSTS)),
+                    leases: Mutex::default(),
+                    gateway_tcp: Mutex::default(),
+                    hooks,
+                    fixed: Vec::new(),
+                    limits: Limits::default(),
+                    lans,
+                });
+                start_gateway(&shared)?;
+                let addresses: Vec<_> = lock(&shared.gateway_tcp)
+                    .iter()
+                    .map(tcp::Endpoint::addr)
+                    .collect();
+                assert_eq!(
+                    addresses,
+                    ["198.18.0.1", "10.0.3.1", "10.0.2.1", "10.0.1.1"]
+                        .map(|s| s.parse::<IpAddr>().unwrap())
+                );
+                fcx.cancel();
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 
@@ -3093,31 +3076,34 @@ mod tests {
                 false
             }
         }
-        fictionet::block_on(fictionet::run(|fcx| async move {
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let mut net = Net::new().ipv4_only();
-            for name in ["z.test", "a.test", "m.test", "b.test", "y.test"] {
-                net = net.host(name, |h| {
-                    h.at(Ipv4Addr::new(203, 0, 113, 8)).tls_accept(
-                        443,
-                        name,
-                        |_| panic!("no handshake"),
-                        Offers(name, log.clone()),
-                    )
-                });
-            }
-            let (_attacher, attachments) = fictionet::attachments();
-            net.serve(&fcx, attachments)?;
-            assert_eq!(
-                *lock(&log),
-                [
-                    "z.test", "z.test", "a.test", "z.test", "m.test", "z.test", "b.test", "z.test",
-                    "y.test"
-                ]
-            );
-            fcx.cancel();
-            Ok(())
-        }))
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            |fcx| async move {
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let mut net = Net::new().ipv4_only();
+                for name in ["z.test", "a.test", "m.test", "b.test", "y.test"] {
+                    net = net.host(name, |h| {
+                        h.at(Ipv4Addr::new(203, 0, 113, 8)).tls_accept(
+                            443,
+                            name,
+                            |_| panic!("no handshake"),
+                            Offers(name, log.clone()),
+                        )
+                    });
+                }
+                let (_attacher, attachments) = fictionet::attachments();
+                net.serve(&fcx, attachments)?;
+                assert_eq!(
+                    *lock(&log),
+                    [
+                        "z.test", "z.test", "a.test", "z.test", "m.test", "z.test", "b.test",
+                        "z.test", "y.test"
+                    ]
+                );
+                fcx.cancel();
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 

@@ -111,9 +111,10 @@ pub fn run(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(fictionet::run(move |fcx| async move {
-        world(&fcx, chain, key, attachments)
-    }))
+    runtime.block_on(fictionet::run(
+        fictionet::Seed::random(),
+        move |fcx| async move { world(&fcx, chain, key, attachments) },
+    ))
 }
 
 /// Builds the world's sites on `attachments`, with `chain` and `key` for

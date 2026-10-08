@@ -11,7 +11,7 @@
 //!
 //! ```
 //! use fictionet::events::{Event, Level};
-//! # fictionet::block_on(fictionet::run(|fcx| async move {
+//! # fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
 //! fcx.record(Event::new("modbus", "write_register")
 //!     .summary("register 40001 = 900")
 //!     .level(Level::Alarm)
@@ -1119,8 +1119,10 @@ impl EventLog {
     /// wall-clock time then, in seconds since the Unix epoch, as the run
     /// noted it when it began (`null` where there is no wall clock, as in a
     /// browser), so a reader can put every event's `at` on a calendar.
-    /// `fields` add the world's own facts, such as the date the world says
-    /// it is (`world_date`): the world owns its dates, and services take
+    /// The `seed` field is the run's 32-byte seed as 64 lowercase hexadecimal
+    /// digits. The `rng` field is `chacha20-v1`, identifying the algorithm and
+    /// contiguous-byte consumption convention. `fields` add the world's own
+    /// facts, such as the date the world says it is (`world_date`): the world owns its dates, and services take
     /// them from it, never from the host's clock.
     /// [`Net`](crate::stdlib::net::Net) records it when it starts serving.
     pub fn start(&self, fcx: &Cx, fields: Fields) {
@@ -1135,7 +1137,9 @@ impl EventLog {
         let event = Event::new("run", "start")
             .summary("the run started")
             .fields(fields)
-            .field("wall", wall);
+            .field("wall", wall)
+            .field("seed", fcx.graph().environment.seed.to_string())
+            .field("rng", "chacha20-v1");
         fcx.record_at(Instant::ZERO, event);
     }
 
@@ -1497,7 +1501,7 @@ mod tests {
         let out = sink.clone();
         let kept = Arc::new(Mutex::new(None));
         let keep = kept.clone();
-        crate::block_on(crate::run(|fcx| async move {
+        crate::block_on(crate::run(fictionet::Seed::random(), |fcx| async move {
             fcx.events().to_writer(Box::new(out));
             for i in 0..500u32 {
                 fcx.record(Event::new("test", "tick").field("i", i));
@@ -1527,7 +1531,7 @@ mod tests {
         let out = sink.clone();
         let kept = Arc::new(Mutex::new(None));
         let keep = kept.clone();
-        crate::block_on(crate::run(|fcx| async move {
+        crate::block_on(crate::run(fictionet::Seed::random(), |fcx| async move {
             fcx.events().to_writer(Box::new(out));
             for i in 0..300u32 {
                 fcx.record(Event::new("test", "tick").field("i", i));
@@ -1558,7 +1562,7 @@ mod tests {
     /// the run's clock, with the task that recorded them.
     #[test]
     fn every_run_records_its_events() {
-        crate::block_on(crate::run(|fcx| async move {
+        crate::block_on(crate::run(fictionet::Seed::random(), |fcx| async move {
             assert!(!fcx.observed());
             fcx.record(Event::new("world", "hello").field("n", 1u32));
             fcx.sleep(std::time::Duration::from_millis(5)).await?;

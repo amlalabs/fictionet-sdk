@@ -124,7 +124,7 @@ pub fn alert_name(code: u8) -> &'static str {
 ///   world takes from its arguments (see [No dates](fictionet::time#no-dates)).
 ///   So a world set in 2019 checks certificates against 2019.
 /// - **Random values**, such as the server random, session IDs and ticket
-///   keys, come from [`Cx::random_u64`](fictionet::Cx::random_u64).
+///   keys, come from [`Cx::fill_random`](fictionet::Cx::fill_random).
 ///
 /// Key exchange is the exception. rustls's built-in providers make each
 /// ephemeral key with the operating system's randomness, inside the
@@ -133,8 +133,8 @@ pub fn alert_name(code: u8) -> &'static str {
 ///
 /// Random values are drawn while [`server`], [`ClientHello::finish`] or a
 /// [`TlsConnection`] is working, and come from the `Cx` passed to that call.
-/// A config handed to other TLS code, outside this module, falls back to
-/// the operating system's randomness.
+/// A config handed to other TLS code, outside this module, fails random
+/// draws because no `Cx` is bound to that call.
 ///
 /// Pass the crypto provider to use, such as
 /// `rustls::crypto::ring::default_provider()`. Continue as with
@@ -221,18 +221,12 @@ impl SecureRandom for CxRandom {
     fn fill(&self, buf: &mut [u8]) -> Result<(), GetRandomFailed> {
         CURRENT.with(|c| match &*c.borrow() {
             Some(fcx) => {
-                for chunk in buf.chunks_mut(8) {
-                    chunk.copy_from_slice(&fcx.random_u64().to_le_bytes()[..chunk.len()]);
-                }
+                fcx.fill_random(buf);
                 Ok(())
             }
-            None => os_random(buf),
+            None => Err(GetRandomFailed),
         })
     }
-}
-
-fn os_random(buf: &mut [u8]) -> Result<(), GetRandomFailed> {
-    fictionet::random_bytes(buf).map_err(|_| GetRandomFailed)
 }
 
 /// How much to read from the connection underneath in one read.
@@ -765,6 +759,25 @@ impl<C: Connection> Connection for TlsConnection<C> {
 #[cfg(test)]
 mod tests {
     use super::alert_name;
+
+    #[test]
+    fn randomness_requires_context_and_preserves_partial_fills() {
+        use fictionet::{Entropy, Seed, SeededEntropy};
+        use rustls::crypto::SecureRandom;
+        let mut byte = [0; 1];
+        assert!(super::CxRandom.fill(&mut byte).is_err());
+        fictionet::block_on(fictionet::run(Seed::from_u64(42), |fcx| async move {
+            let oracle = SeededEntropy::new(Seed::from_u64(42));
+            let mut expected = [0; 1];
+            oracle.fill_random(&mut expected);
+            super::with_fcx(&fcx, || super::CxRandom.fill(&mut byte)).unwrap();
+            assert_eq!(byte, expected);
+            assert_eq!(fcx.random_u64(), oracle.random_u64());
+            Ok(())
+        }))
+        .unwrap();
+        assert!(super::CxRandom.fill(&mut byte).is_err());
+    }
 
     #[test]
     fn tls_alert_names() {

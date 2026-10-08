@@ -55,39 +55,42 @@ fn main() -> fictionet::Result {
     )?;
     println!("listening on {path}");
 
-    fictionet::block_on(fictionet::run(move |fcx| async move {
-        let agent = attachments.get(&fcx, "agent").await?;
-        let (to_bank, bank_side) = pair();
-        web_machine(&fcx, bank_side, "203.0.113.10".parse()?, "the real bank\n")?;
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let agent = attachments.get(&fcx, "agent").await?;
+            let (to_bank, bank_side) = pair();
+            web_machine(&fcx, bank_side, "203.0.113.10".parse()?, "the real bank\n")?;
 
-        // The sandbox's subnet leads to the sandbox, and the bank's
-        // network to the bank.
-        let router = route::router(
-            &fcx,
-            vec![
-                (
-                    "10.0.0.0/24".parse()?,
-                    Box::new(agent) as Box<dyn Interface>,
-                ),
-                ("203.0.113.0/24".parse()?, Box::new(to_bank)),
-            ],
-        );
-        println!("agent attached: 203.0.113.0/24 leads to the bank");
+            // The sandbox's subnet leads to the sandbox, and the bank's
+            // network to the bank.
+            let router = route::router(
+                &fcx,
+                vec![
+                    (
+                        "10.0.0.0/24".parse()?,
+                        Box::new(agent) as Box<dyn Interface>,
+                    ),
+                    ("203.0.113.0/24".parse()?, Box::new(to_bank)),
+                ],
+            );
+            println!("agent attached: 203.0.113.0/24 leads to the bank");
 
-        fcx.sleep(Duration::from_secs(after)).await?;
+            fcx.sleep(Duration::from_secs(after)).await?;
 
-        // A more specific route wins, as in a real hijack: the bank's
-        // address now leads to the impostor. The rest of 203.0.113.0/24
-        // still leads to the bank.
-        let (to_impostor, impostor_side) = pair();
-        web_machine(
-            &fcx,
-            impostor_side,
-            "203.0.113.10".parse()?,
-            "an impostor\n",
-        )?;
-        router.add("203.0.113.10/32".parse()?, Box::new(to_impostor));
-        println!("{after} s later: 203.0.113.10/32 leads to the impostor");
-        Ok(())
-    }))
+            // A more specific route wins, as in a real hijack: the bank's
+            // address now leads to the impostor. The rest of 203.0.113.0/24
+            // still leads to the bank.
+            let (to_impostor, impostor_side) = pair();
+            web_machine(
+                &fcx,
+                impostor_side,
+                "203.0.113.10".parse()?,
+                "an impostor\n",
+            )?;
+            router.add("203.0.113.10/32".parse()?, Box::new(to_impostor));
+            println!("{after} s later: 203.0.113.10/32 leads to the impostor");
+            Ok(())
+        },
+    ))
 }

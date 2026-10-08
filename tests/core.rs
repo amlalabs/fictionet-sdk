@@ -27,7 +27,7 @@ impl std::error::Error for Boom {}
 #[test]
 fn the_run_future_is_send() {
     fn assert_send<T: Send>(_: &T) {}
-    let future = run(|_fcx| async { Ok(()) });
+    let future = run(fictionet::Seed::random(), |_fcx| async { Ok(()) });
     assert_send(&future);
 }
 
@@ -37,7 +37,7 @@ fn sleeps_end_in_deadline_order() {
     let o = order.clone();
     let started = std::time::Instant::now();
     within(Duration::from_secs(5), move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             for d in [30u64, 10, 20] {
                 let o = o.clone();
                 fcx.spawn(move |fcx| async move {
@@ -57,7 +57,7 @@ fn sleeps_end_in_deadline_order() {
 #[test]
 fn now_follows_sleep() {
     within(Duration::from_secs(5), || {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let t0 = fcx.now();
             fcx.sleep(ms(20)).await?;
             let t1 = fcx.now();
@@ -73,7 +73,7 @@ fn now_follows_sleep() {
 #[test]
 fn random_numbers_differ() {
     within(Duration::from_secs(5), || {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let a: Vec<u64> = (0..8).map(|_| fcx.random_u64()).collect();
             assert!(a.windows(2).any(|w| w[0] != w[1]));
             for _ in 0..1000 {
@@ -95,7 +95,7 @@ fn ok_does_not_cancel_and_the_run_waits_for_all_work() {
     let (f, c) = (finished.clone(), saw_cancel.clone());
     let started = std::time::Instant::now();
     within(Duration::from_secs(5), move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             fcx.spawn(move |fcx| async move {
                 fcx.sleep(ms(50)).await?;
                 c.store(fcx.is_cancelled(), Ordering::SeqCst);
@@ -117,7 +117,7 @@ fn cancellation_ends_every_wait() {
     let results = Arc::new(Mutex::new(Vec::<String>::new()));
     let r = results.clone();
     let out = within(Duration::from_secs(5), move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let (mut a, b) = pair();
             let r1 = r.clone();
             fcx.spawn(move |fcx| async move {
@@ -234,7 +234,7 @@ fn task_error_cancels_siblings_and_comes_out_of_run() {
     let sibling = Arc::new(Mutex::new(None));
     let s = sibling.clone();
     let out = within(Duration::from_secs(5), move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             fcx.spawn(move |fcx| async move {
                 *s.lock().unwrap() = Some(fcx.sleep(Duration::from_secs(60)).await);
                 Ok(())
@@ -257,7 +257,7 @@ fn task_error_cancels_siblings_and_comes_out_of_run() {
 #[test]
 fn join_returns_what_the_work_returned() {
     within(Duration::from_secs(5), || {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let ok = fcx.spawn(|fcx| async move {
                 fcx.sleep(ms(5)).await?;
                 Ok(())
@@ -275,7 +275,7 @@ fn join_returns_what_the_work_returned() {
     let (out, joined) = within(Duration::from_secs(5), || {
         let joined = Arc::new(Mutex::new(None));
         let j = joined.clone();
-        let out = block_on(run(move |fcx| async move {
+        let out = block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let bad = fcx.spawn(|_fcx| async { Err(Boom("bad").into()) });
             // The join gets the error, though the failure also cancels the
             // region the joiner waits in.
@@ -309,7 +309,7 @@ fn a_busy_task_cannot_starve_another() {
     let spins = Arc::new(AtomicU64::new(0));
     let s = spins.clone();
     within(Duration::from_secs(5), move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let stop = Arc::new(AtomicBool::new(false));
             let st = stop.clone();
             fcx.spawn(move |fcx| async move {
@@ -346,7 +346,7 @@ fn a_busy_task_cannot_starve_another() {
 #[test]
 fn cable_delivers_in_order_then_closed() {
     within(Duration::from_secs(5), || {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (mut a, mut b) = pair();
             for i in 0..3u8 {
                 a.send(Packet(vec![i]));
@@ -379,7 +379,7 @@ fn cable_wakes_across_threads() {
                 }
             }
         });
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             for i in 0..100u8 {
                 assert_eq!(a.recv(&fcx).await?, Packet(vec![i]));
             }
@@ -394,7 +394,7 @@ fn cable_wakes_across_threads() {
 #[test]
 fn boxed_interfaces_work() {
     within(Duration::from_secs(5), || {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (a, mut b) = pair();
             let mut list: Vec<Box<dyn Interface>> = vec![Box::new(a)];
             list[0].send(Packet(vec![7]));
@@ -425,7 +425,7 @@ fn attacher_name_rules() {
     drop(long);
 
     within(Duration::from_secs(5), move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             // `get` skips other names, and sandboxes that detached before
             // they were handed out: the first "abc", and the long name.
             let mut second = attachments.get(&fcx, "abc").await?;
@@ -499,7 +499,7 @@ fn block_on_wakes_from_another_thread() {
 #[test]
 fn dropping_the_run_drops_everything() {
     let (world_end, mut outside) = pair();
-    let mut future = Box::pin(run(move |fcx| async move {
+    let mut future = Box::pin(run(fictionet::Seed::random(), move |fcx| async move {
         fcx.spawn(move |fcx| async move {
             let mut end = world_end;
             loop {
@@ -516,7 +516,7 @@ fn dropping_the_run_drops_everything() {
     }
     drop(future);
     let out = within(Duration::from_secs(5), move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             assert_eq!(outside.recv(&fcx).await, Err(RecvError::Closed));
             Ok(())
         }))
@@ -530,7 +530,7 @@ fn dropping_the_run_drops_everything() {
 fn cancellation_reaches_waits_outside_the_run() {
     let (tx, rx) = mpsc::channel();
     let out = within(Duration::from_secs(5), move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let outside = fcx.clone();
             let (mut a, _b) = pair();
             std::thread::spawn(move || {
@@ -563,7 +563,7 @@ fn runs_on_tokio() {
         .unwrap();
     rt.block_on(async {
         let (mut inside, mut outside) = pair();
-        let echo = tokio::spawn(run(move |fcx| async move {
+        let echo = tokio::spawn(run(fictionet::Seed::random(), move |fcx| async move {
             loop {
                 match inside.recv(&fcx).await {
                     Ok(p) => inside.send(p),
@@ -572,7 +572,7 @@ fn runs_on_tokio() {
                 }
             }
         }));
-        let client = tokio::spawn(run(move |fcx| async move {
+        let client = tokio::spawn(run(fictionet::Seed::random(), move |fcx| async move {
             for i in 0..100u8 {
                 outside.send(Packet(vec![i]));
                 assert_eq!(outside.recv(&fcx).await?, Packet(vec![i]));
@@ -592,7 +592,7 @@ fn runs_on_tokio() {
 #[test]
 fn a_sleep_without_end_waits_until_cancelled() {
     let res = within(Duration::from_secs(5), || {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             fcx.spawn(|fcx| async move {
                 assert_eq!(fcx.sleep(Duration::MAX).await, Err(Cancelled));
                 let far = fcx.now() + Duration::from_secs(u64::MAX / 2);
@@ -624,7 +624,7 @@ fn many_waits_outside_the_run_stay_idle() {
         .build()
         .unwrap();
     let out = rt.block_on(async move {
-        tokio::spawn(run(move |fcx| async move {
+        tokio::spawn(run(fictionet::Seed::random(), move |fcx| async move {
             for _ in 0..WAITERS {
                 let (mut mine, theirs) = pair();
                 k.lock().unwrap().push(theirs);
@@ -668,7 +668,7 @@ fn many_waits_outside_the_run_stay_idle() {
 fn dropping_the_run_ends_waits_outside_it() {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel();
-    let mut future = Box::pin(run(move |fcx| async move {
+    let mut future = Box::pin(run(fictionet::Seed::random(), move |fcx| async move {
         let task = fcx.spawn(|fcx| async move {
             fcx.cancelled().await;
             Ok(())
@@ -718,7 +718,7 @@ fn cancel_stops_the_world_cleanly() {
     let ended = Arc::new(AtomicU64::new(0));
     let e = ended.clone();
     let out = within(Duration::from_secs(5), move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             // An echo world: it passes the cancel up with `?`.
             fcx.spawn(move |fcx| async move {
                 let mut attachments = attachments;
@@ -749,7 +749,7 @@ fn cancel_stops_the_world_cleanly() {
 #[test]
 fn an_error_before_cancel_is_still_reported() {
     let out = within(Duration::from_secs(5), || {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let failing = fcx.spawn(|_fcx| async { Err(Boom("first").into()) });
             assert!(failing.join(&fcx).await.is_err());
             fcx.cancel();
@@ -762,7 +762,7 @@ fn an_error_before_cancel_is_still_reported() {
 #[test]
 fn errors_after_cancel_are_dropped_even_when_not_cancellations() {
     let out = within(Duration::from_secs(5), || {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             fcx.spawn(|fcx| async move {
                 fcx.cancelled().await;
                 Err(Boom("after").into())
@@ -782,7 +782,7 @@ fn cancel_from_another_thread_stops_the_run() {
         fcx.cancel();
     });
     let out = within(Duration::from_secs(5), move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             tx.send(fcx.clone()).unwrap();
             fcx.sleep(Duration::from_secs(60)).await?;
             Ok(())
@@ -799,7 +799,7 @@ fn an_outside_wait_raced_against_cancelled_ends() {
         .build()
         .unwrap();
     let out = runtime.block_on(async {
-        let world = run(|fcx| async move {
+        let world = run(fictionet::Seed::random(), |fcx| async move {
             fcx.spawn(|fcx| async move {
                 // A wait Fictionet knows nothing about.
                 let never = std::future::pending::<()>();
@@ -825,7 +825,7 @@ fn an_outside_wait_raced_against_cancelled_ends() {
 #[test]
 fn a_joiner_that_cancels_after_a_failure_keeps_the_error() {
     let out = within(Duration::from_secs(5), || {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (ready, mut waiting) = pair();
             let task = fcx.spawn(move |fcx| async move {
                 assert_eq!(waiting.recv(&fcx).await, Err(RecvError::Closed));
@@ -867,7 +867,7 @@ fn a_cancel_woken_by_dropping_a_failed_task_keeps_the_error() {
     let out = within(Duration::from_secs(5), || {
         let (inside, mut outside) = pair();
         let (tx, rx) = mpsc::channel();
-        let mut world = Box::pin(run(move |fcx| async move {
+        let mut world = Box::pin(run(fictionet::Seed::random(), move |fcx| async move {
             tx.send(fcx.clone()).unwrap();
             fcx.spawn(move |_| {
                 std::future::poll_fn(move |_| {
@@ -933,7 +933,7 @@ fn a_joiner_outside_the_run_gets_the_message_of_a_failed_task() {
     }
     let (out, joined) = within(Duration::from_secs(5), || {
         let (tx, rx) = mpsc::channel();
-        let mut world = Box::pin(run(move |fcx| async move {
+        let mut world = Box::pin(run(fictionet::Seed::random(), move |fcx| async move {
             let task = fcx.spawn(|_| async { Err(Boom("the worker failed").into()) });
             tx.send((task, fcx.clone())).unwrap();
             fcx.cancelled().await;
@@ -969,7 +969,7 @@ fn dropping_the_run_drops_tasks_in_spawn_order() {
     }
     let log = Arc::new(Mutex::new(Vec::new()));
     let inside = log.clone();
-    let mut future = Box::pin(run(move |fcx| async move {
+    let mut future = Box::pin(run(fictionet::Seed::random(), move |fcx| async move {
         for id in [8, 3, 12, 1, 9] {
             let guard = RecordDrop(id, inside.clone());
             fcx.spawn(move |_fcx| async move {

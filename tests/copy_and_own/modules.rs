@@ -385,3 +385,26 @@ fn copied_tls_server(fcx: &fictionet::Cx, conn: tcp::TcpConnection) {
 fn copied_router<I: fictionet::Interface>(fcx: &fictionet::Cx, interface: I) {
     let _ = route::router(fcx, vec![("10.0.0.0/24".parse().unwrap(), interface)]);
 }
+
+// Copied faults accept either the run capability or a public standalone source.
+fn copied_entropy(fcx: &fictionet::Cx) {
+    let seed = fictionet::Seed::from_u64(7);
+    let source = fictionet::SeededEntropy::new(seed);
+    let conn = fictionet::events::ConnInfo::default();
+    let mut exchange = httpd::Exchange::new(fcx.now(), &source, &conn);
+    let _ = exchange.random_u64();
+    let mut faults = faults::Faults::new(64, 0);
+    let plan = [faults::Rule {
+        when: faults::Trigger::Always,
+        fault: faults::ByteFault::Corrupt {
+            offset: None,
+            xor: 1,
+        },
+    }];
+    faults
+        .bytes(fcx, &plan, b"copied", &mut Vec::new())
+        .unwrap();
+    faults
+        .bytes(&source, &plan, b"copied", &mut Vec::new())
+        .unwrap();
+}

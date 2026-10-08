@@ -27,7 +27,10 @@ where
     F: FnOnce(Cx) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = fictionet::Result> + Send + 'static,
 {
-    within(Duration::from_secs(10), move || block_on(run(f))).unwrap();
+    within(Duration::from_secs(10), move || {
+        block_on(run(fictionet::Seed::random(), f))
+    })
+    .unwrap();
 }
 
 /// Waits up to 5 s for a packet on `end`.
@@ -1270,7 +1273,7 @@ fn every_task_stops_when_its_region_is_cancelled() {
     // The world fails while every kind of task is running with its cables
     // still open. The run then ends with the error instead of waiting.
     let result = within(Duration::from_secs(5), || {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let mut keep = Vec::new();
             let (a, b) = pair();
             keep.push(a);

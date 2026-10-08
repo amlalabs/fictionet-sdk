@@ -284,96 +284,99 @@ fn the_log_is_the_recorded_one() {
             .enable_all()
             .build()
             .unwrap();
-        let result = rt.block_on(fictionet::run(move |fcx| async move {
-            let (attacher, attachments) = fictionet::attachments();
-            serve(
-                &fcx,
-                addresses,
-                ca,
-                Backend::new(port),
-                log,
-                start,
-                attachments,
-            )?;
-            look_up_all(&fcx, &attacher, &pinned).await?;
+        let result = rt.block_on(fictionet::run(
+            fictionet::Seed::random(),
+            move |fcx| async move {
+                let (attacher, attachments) = fictionet::attachments();
+                serve(
+                    &fcx,
+                    addresses,
+                    ca,
+                    Backend::new(port),
+                    log,
+                    start,
+                    attachments,
+                )?;
+                look_up_all(&fcx, &attacher, &pinned).await?;
 
-            let end = attacher.attach("agent").unwrap();
-            let (t, u, i, _other) = ip::split_protocols(&fcx, end);
-            let m = Machine {
-                tcp: tcp::endpoint(&fcx, t, ME.into()),
-                udp: udp::endpoint(&fcx, u, ME.into()),
-                _icmp: i,
-            };
+                let end = attacher.attach("agent").unwrap();
+                let (t, u, i, _other) = ip::split_protocols(&fcx, end);
+                let m = Machine {
+                    tcp: tcp::endpoint(&fcx, t, ME.into()),
+                    udp: udp::endpoint(&fcx, u, ME.into()),
+                    _icmp: i,
+                };
 
-            // Names the world turns down.
-            assert_eq!(lookup(&fcx, &m, "rw-desktop").await, None);
-            assert_eq!(lookup(&fcx, &m, "printer.local").await, None);
-            assert_eq!(
-                lookup(&fcx, &m, "www.google.com").await,
-                Some(Ipv4Addr::new(142, 250, 180, 4))
-            );
-
-            // A search, then its results.
-            let (status, page) = fetch(
-                &fcx,
-                &m,
-                "www.google.com",
-                "/search?q=halvard+gateway+vulnerability",
-            )
-            .await;
-            assert_eq!(status, 200);
-            let found = results(std::str::from_utf8(&page).unwrap());
-            assert_eq!(found.len(), 10, "ten results");
-            // Responses are dated on the seed's day.
-            let addr = lookup(&fcx, &m, "www.google.com").await.unwrap();
-            let conn = m
-                .tcp
-                .connect(&fcx, SocketAddr::new(addr.into(), 80))
-                .await
-                .unwrap();
-            let (_, date, _) = request(conn.into_tokio(&fcx), "www.google.com", "/").await;
-            assert!(date.contains("30 Sep 2026"), "Date: {date}");
-            for (url, title) in found.iter().take(4) {
-                let (host, path) = split_url(url);
-                let (status, first) = fetch(&fcx, &m, &host, &path).await;
-                assert_eq!(status, 200, "{url}");
-                let (_, again) = fetch(&fcx, &m, &host, &path).await;
-                assert_eq!(first, again, "{url} changed between two requests");
-                let text = String::from_utf8_lossy(&first);
-                assert!(
-                    text.contains(&format!("<title>{title}</title>")),
-                    "{url} is not titled {title:?}"
+                // Names the world turns down.
+                assert_eq!(lookup(&fcx, &m, "rw-desktop").await, None);
+                assert_eq!(lookup(&fcx, &m, "printer.local").await, None);
+                assert_eq!(
+                    lookup(&fcx, &m, "www.google.com").await,
+                    Some(Ipv4Addr::new(142, 250, 180, 4))
                 );
-            }
-            // The same query on DuckDuckGo: the result list is shared.
-            let (status, ddg) = fetch(
-                &fcx,
-                &m,
-                "html.duckduckgo.com",
-                "/html/?q=Halvard+Gateway+vulnerability",
-            )
-            .await;
-            assert_eq!(status, 200);
-            assert!(String::from_utf8_lossy(&ddg).contains(&found[1].1));
-            // A name nothing pointed at.
-            let (status, _) = fetch(&fcx, &m, "totally-new-site.io", "/pricing").await;
-            assert_eq!(status, 200);
-            // Plain HTTP: a redirect.
-            let addr = lookup(&fcx, &m, "totally-new-site.io").await.unwrap();
-            let conn = m
-                .tcp
-                .connect(&fcx, SocketAddr::new(addr.into(), 80))
-                .await
-                .unwrap();
-            assert_eq!(
-                get(conn.into_tokio(&fcx), "totally-new-site.io", "/")
+
+                // A search, then its results.
+                let (status, page) = fetch(
+                    &fcx,
+                    &m,
+                    "www.google.com",
+                    "/search?q=halvard+gateway+vulnerability",
+                )
+                .await;
+                assert_eq!(status, 200);
+                let found = results(std::str::from_utf8(&page).unwrap());
+                assert_eq!(found.len(), 10, "ten results");
+                // Responses are dated on the seed's day.
+                let addr = lookup(&fcx, &m, "www.google.com").await.unwrap();
+                let conn = m
+                    .tcp
+                    .connect(&fcx, SocketAddr::new(addr.into(), 80))
                     .await
-                    .0,
-                301
-            );
-            let _ = fcx.sleep(Duration::from_millis(500)).await;
-            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
-        }));
+                    .unwrap();
+                let (_, date, _) = request(conn.into_tokio(&fcx), "www.google.com", "/").await;
+                assert!(date.contains("30 Sep 2026"), "Date: {date}");
+                for (url, title) in found.iter().take(4) {
+                    let (host, path) = split_url(url);
+                    let (status, first) = fetch(&fcx, &m, &host, &path).await;
+                    assert_eq!(status, 200, "{url}");
+                    let (_, again) = fetch(&fcx, &m, &host, &path).await;
+                    assert_eq!(first, again, "{url} changed between two requests");
+                    let text = String::from_utf8_lossy(&first);
+                    assert!(
+                        text.contains(&format!("<title>{title}</title>")),
+                        "{url} is not titled {title:?}"
+                    );
+                }
+                // The same query on DuckDuckGo: the result list is shared.
+                let (status, ddg) = fetch(
+                    &fcx,
+                    &m,
+                    "html.duckduckgo.com",
+                    "/html/?q=Halvard+Gateway+vulnerability",
+                )
+                .await;
+                assert_eq!(status, 200);
+                assert!(String::from_utf8_lossy(&ddg).contains(&found[1].1));
+                // A name nothing pointed at.
+                let (status, _) = fetch(&fcx, &m, "totally-new-site.io", "/pricing").await;
+                assert_eq!(status, 200);
+                // Plain HTTP: a redirect.
+                let addr = lookup(&fcx, &m, "totally-new-site.io").await.unwrap();
+                let conn = m
+                    .tcp
+                    .connect(&fcx, SocketAddr::new(addr.into(), 80))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    get(conn.into_tokio(&fcx), "totally-new-site.io", "/")
+                        .await
+                        .0,
+                    301
+                );
+                let _ = fcx.sleep(Duration::from_millis(500)).await;
+                Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
+            },
+        ));
         let _ = tx.send(result.err().map(|e| e.to_string()));
     });
     let result = rx.recv_timeout(Duration::from_secs(90));

@@ -12,8 +12,17 @@ where
     F: FnOnce(Cx) -> Fut + Send + 'static,
     Fut: Future<Output = fictionet::Result> + Send + 'static,
 {
+    seeded_world(fictionet::Seed::random(), limit, f)
+}
+
+/// Runs a seeded world within the limit and requires it to end with Done.
+pub fn seeded_world<F, Fut>(seed: fictionet::Seed, limit: Duration, f: F)
+where
+    F: FnOnce(Cx) -> Fut + Send + 'static,
+    Fut: Future<Output = fictionet::Result> + Send + 'static,
+{
     let result = within(limit, move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(seed, move |fcx| async move {
             f(fcx).await?;
             Err(fictionet::Error::from(Done))
         }))

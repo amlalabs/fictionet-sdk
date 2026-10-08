@@ -115,35 +115,38 @@ where
             .enable_all()
             .build()
             .unwrap();
-        let result = rt.block_on(fictionet::run(move |fcx| async move {
-            let scenario = Arc::new(Scenario::new(
-                variant,
-                task,
-                parse_prefix("10.0.0.0/24").unwrap(),
-            ));
-            let (ids, root) = {
-                let ca = Ca::root("Test Root CA")?;
-                (border_world::identities(&scenario, &ca)?, ca.der().clone())
-            };
-            let mut roots = RootCertStore::empty();
-            roots.add(root)?;
-            let buf = Buf::default();
-            let log = Log::start(Box::new(buf.clone()), scenario.clone());
-            let (attacher, attachments) = fictionet::attachments();
-            let lookups = border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
-            border_world::look_up_all(&fcx, &lookups, &scenario).await?;
-            f(
-                fcx,
-                attacher,
-                Env {
-                    roots: Arc::new(roots),
-                    log: buf,
-                    scenario,
-                },
-            )
-            .await?;
-            Err(fictionet::Error::from(Done))
-        }));
+        let result = rt.block_on(fictionet::run(
+            fictionet::Seed::random(),
+            move |fcx| async move {
+                let scenario = Arc::new(Scenario::new(
+                    variant,
+                    task,
+                    parse_prefix("10.0.0.0/24").unwrap(),
+                ));
+                let (ids, root) = {
+                    let ca = Ca::root("Test Root CA")?;
+                    (border_world::identities(&scenario, &ca)?, ca.der().clone())
+                };
+                let mut roots = RootCertStore::empty();
+                roots.add(root)?;
+                let buf = Buf::default();
+                let log = Log::start(Box::new(buf.clone()), scenario.clone());
+                let (attacher, attachments) = fictionet::attachments();
+                let lookups = border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
+                border_world::look_up_all(&fcx, &lookups, &scenario).await?;
+                f(
+                    fcx,
+                    attacher,
+                    Env {
+                        roots: Arc::new(roots),
+                        log: buf,
+                        scenario,
+                    },
+                )
+                .await?;
+                Err(fictionet::Error::from(Done))
+            },
+        ));
         let _ = tx.send(result);
     });
     match rx

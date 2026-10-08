@@ -306,7 +306,7 @@ fn mb(transaction: u16, request: MbRequest) -> Vec<u8> {
 
 #[test]
 fn the_harness_runs_a_service_with_no_runtime() {
-    let mut h = Harness::new(Echo, ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
     assert_eq!(h.open().unwrap(), b"hello\n");
     assert_eq!(h.push(b"one\ntw").unwrap(), b"one\n");
     assert_eq!(h.push(b"o\n").unwrap(), b"two\n");
@@ -324,7 +324,7 @@ fn the_harness_runs_a_service_with_no_runtime() {
 
 #[test]
 fn the_harness_moves_its_clock_and_ticks() {
-    let mut h = Harness::new(Ticker { ticks: 0 }, ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Ticker { ticks: 0 }, ());
     h.open().unwrap();
     assert!(h.deadline().is_some());
     assert_eq!(h.advance(Duration::from_millis(10)).unwrap(), b"");
@@ -336,7 +336,7 @@ fn the_harness_moves_its_clock_and_ticks() {
 
 #[test]
 fn a_half_close_ends_with_the_last_reply() {
-    let mut h = Harness::new(Echo, ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
     h.push(b"a\nb").unwrap();
     // The unterminated line is an error item at the end, then on_end.
     assert_eq!(h.end().unwrap(), b"too long\neof\n");
@@ -369,7 +369,11 @@ fn a_decoder_failure_is_handed_to_the_service_with_what_it_could_not_read() {
             Ok(())
         }
     }
-    let mut h = Harness::new(Strict { unread: Vec::new() }, ());
+    let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
+        Strict { unread: Vec::new() },
+        (),
+    );
     // Protocol id 7: not Modbus.
     let bad = [0, 1, 0, 7, 0, 6, 1, 3, 0, 0, 0, 1];
     assert!(matches!(h.push(&bad), Err(HarnessError::Decode(_))));
@@ -413,6 +417,7 @@ fn replies_do_not_depend_on_chunk_boundaries() {
     ));
     let whole = {
         let mut h = Harness::new(
+            fictionet::Seed::from_u64(0),
             Plc,
             Plant {
                 limit: 1000,
@@ -426,6 +431,7 @@ fn replies_do_not_depend_on_chunk_boundaries() {
     for a in 0..input.len() {
         for b in a..input.len() {
             let mut h = Harness::new(
+                fictionet::Seed::from_u64(0),
                 Plc,
                 Plant {
                     limit: 1000,
@@ -446,12 +452,12 @@ fn replies_do_not_depend_on_chunk_boundaries() {
     };
     let input = b"POST /e HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabcPOST /e HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nxy\r\n0\r\n\r\n";
     let whole = {
-        let mut h = Harness::new(Http1::new(router()), ());
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()), ());
         h.push(input).unwrap();
         h.output().to_vec()
     };
     for a in 0..input.len() {
-        let mut h = Harness::new(Http1::new(router()), ());
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()), ());
         h.push(&input[..a]).unwrap();
         h.push(&input[a..]).unwrap();
         assert_eq!(h.output(), whole, "split at {a}");
@@ -483,7 +489,7 @@ fn http1_answers_routes_head_errors_and_keep_alive() {
         .get("/files/*", |_, r| {
             http::Response::new(Bytes::from(r.uri().path().to_owned()))
         });
-    let mut h = Harness::new(Http1::new(router), ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
     // Two pipelined requests, then HEAD, then an unknown path and method.
     h.push(b"GET /hi HTTP/1.1\r\nHost: a.test\r\n\r\nPOST /echo HTTP/1.1\r\nHost: a.test\r\nContent-Length: 4\r\n\r\nping").unwrap();
     h.push(b"HEAD /hi HTTP/1.1\r\nHost: a.test\r\n\r\n")
@@ -542,7 +548,7 @@ fn http1_answers_routes_head_errors_and_keep_alive() {
 #[test]
 fn an_http11_request_with_no_host_reaches_the_handler_as_one_that_names_no_host() {
     let vhosts = httpd::VirtualHosts::new();
-    let mut h = Harness::new(Http1::new(vhosts), ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ());
     let _ = h.push(b"GET /x HTTP/1.1\r\nAccept: */*\r\n\r\n");
     assert!(
         http_text(&h).starts_with("HTTP/1.1 400 Bad Request"),
@@ -571,17 +577,17 @@ fn an_http11_request_with_no_host_reaches_the_handler_as_one_that_names_no_host(
 #[test]
 fn http1_closes_when_asked_and_on_http10() {
     let router = Router::new().get("/", |_, _| http::Response::new(Bytes::from("x")));
-    let mut h = Harness::new(Http1::new(router.clone()), ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router.clone()), ());
     h.push(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
         .unwrap();
     assert!(h.closed());
     assert!(http_text(&h).contains("connection: close\r\n"));
-    let mut h = Harness::new(Http1::new(router.clone()), ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router.clone()), ());
     h.push(b"GET / HTTP/1.0\r\n\r\n").unwrap();
     assert!(h.closed());
     assert!(http_text(&h).starts_with("HTTP/1.0 200 OK"));
     // HTTP/1.0 with keep-alive stays open.
-    let mut h = Harness::new(Http1::new(router), ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
     h.push(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
         .unwrap();
     assert!(!h.closed());
@@ -590,7 +596,7 @@ fn http1_closes_when_asked_and_on_http10() {
 
 #[test]
 fn http1_answers_bytes_that_are_not_http_with_400_and_an_error_event() {
-    let mut h = Harness::new(Http1::new(Router::new()), ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ());
     assert!(h.push(b"\x16\x03\x01\x00\x05hello\r\n\r\n").is_err());
     assert!(http_text(&h).starts_with("HTTP/1.1 400 Bad Request"));
     assert!(h.closed());
@@ -606,7 +612,7 @@ fn http1_sends_100_continue_and_a_cut_off_body_still_reaches_the_handler() {
         keep.lock().unwrap().push(r.body().len());
         http::Response::new(Bytes::new())
     });
-    let mut h = Harness::new(Http1::new(router), ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
     h.push(b"POST /u HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n")
         .unwrap();
     assert!(http_text(&h).starts_with("HTTP/1.1 100 Continue\r\n\r\n"));
@@ -624,7 +630,7 @@ fn http1_sends_100_continue_and_a_cut_off_body_still_reaches_the_handler() {
 
 #[test]
 fn http1_closes_after_its_header_timeout() {
-    let mut h = Harness::new(Http1::new(Router::new()), ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ());
     h.open().unwrap();
     assert_eq!(h.advance(Duration::from_secs(29)).unwrap(), b"");
     assert!(!h.closed());
@@ -651,7 +657,7 @@ fn virtual_hosts_pick_a_site_by_host() {
         "203.0.113.1:80".parse().unwrap(),
         "10.0.0.2:5000".parse().unwrap(),
     );
-    let mut h = Harness::new(Http1::new(vhosts), ()).with_conn(conn);
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(vhosts), ()).with_conn(conn);
     h.push(b"GET / HTTP/1.1\r\nHost: A.Test.\r\n\r\n").unwrap();
     h.push(b"GET /x?y HTTP/1.1\r\nHost: b.test\r\n\r\n")
         .unwrap();
@@ -824,7 +830,6 @@ fn fault_plans_change_bytes_and_items_both_ways() {
         // The first item from the client is dropped, and every write to it
         // has its first byte replaced.
         let plan = FaultPlan::new(Plan {
-            seed: 1,
             items: vec![Rule {
                 when: Trigger::At(1),
                 fault: ItemFault::Action {
@@ -852,7 +857,6 @@ fn fault_plans_change_bytes_and_items_both_ways() {
         // The plan changes while the connection runs: a delay on the way
         // in.
         plan.set(Plan {
-            seed: 1,
             inbound: vec![Rule {
                 when: Trigger::Always,
                 fault: ByteFault::Delay(Duration::from_millis(150)),
@@ -1466,7 +1470,7 @@ fn net_routes_tls_by_name_to_each_service() {
         .enable_all()
         .build()
         .unwrap();
-    let result = rt.block_on(run(move |fcx| async move {
+    let result = rt.block_on(run(fictionet::Seed::random(), move |fcx| async move {
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
         let (ca, cb) = (config.clone(), config.clone());
@@ -1568,7 +1572,7 @@ fn http1_survives_mixed_and_random_input() {
             })
     };
     let run = |chunks: &[&[u8]]| {
-        let mut h = Harness::new(Http1::new(router()), ());
+        let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router()), ());
         for c in chunks {
             if h.push(c).is_err() {
                 break;
@@ -1635,7 +1639,7 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
     }
     let mut input = vec![b'x'; 100];
     input.extend_from_slice(b"\nok\n");
-    let mut h = Harness::new(Short, ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Short, ());
     assert_eq!(h.push(&input).unwrap(), b"long\nok\n");
     assert!(!h.closed());
     world(Duration::from_secs(60), move |fcx| async move {
@@ -1666,7 +1670,7 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
 /// does. Before, it dropped the work and took an upgrade for a close.
 #[test]
 fn the_harness_runs_deferred_work_and_reports_upgrades() {
-    let mut h = Harness::new(Echo, ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
     let got = h.push(b"one\nlater\ntwo\n");
     assert_eq!(
         got.as_deref().map(String::from_utf8_lossy).unwrap(),
@@ -1731,7 +1735,7 @@ impl Service for Mail {
 
 #[test]
 fn the_harness_resumes_after_starttls() {
-    let mut h = Harness::new(Mail { tls: false }, ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Mail { tls: false }, ());
     assert_eq!(h.open().unwrap(), b"220 mail ready\r\n");
     let wake = h.wake_handle();
     let got = h.push(b"STARTTLS\r\n");
@@ -1760,7 +1764,7 @@ fn net_performs_starttls_for_a_service_that_asks() {
         .enable_all()
         .build()
         .unwrap();
-    let result = rt.block_on(run(move |fcx| async move {
+    let result = rt.block_on(run(fictionet::Seed::random(), move |fcx| async move {
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 25);
@@ -1873,6 +1877,7 @@ impl Service for Trader {
 #[test]
 fn another_connection_wakes_a_service_to_push_a_fill() {
     let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
         Trader {
             inbox: Arc::default(),
         },
@@ -1976,7 +1981,11 @@ impl Service for Session {
 
 #[test]
 fn named_timers_run_side_by_side() {
-    let mut h = Harness::new(Session { lines: 0, beats: 0 }, ());
+    let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
+        Session { lines: 0, beats: 0 },
+        (),
+    );
     h.open().unwrap();
     assert_eq!(
         h.timer("logon"),
@@ -1991,7 +2000,11 @@ fn named_timers_run_side_by_side() {
     assert_eq!(h.service().beats, 5);
 
     // Without a logon, the logon timer closes the session, heartbeats or not.
-    let mut h = Harness::new(Session { lines: 0, beats: 0 }, ());
+    let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
+        Session { lines: 0, beats: 0 },
+        (),
+    );
     h.open().unwrap();
     assert_eq!(
         h.advance(Duration::from_millis(30)).unwrap(),
@@ -2170,7 +2183,7 @@ fn keyed_work_interleaves_two_responses_while_reads_go_on() {
         open: true,
         ..Baton::default()
     }));
-    let mut h = Harness::new(Mux { streams: 0, baton }, ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Mux { streams: 0, baton }, ());
     let out = String::from_utf8(h.push(b"get\nget\n").unwrap()).unwrap();
     interleaved(&out);
     assert_eq!(h.pending(), (0, 0));
@@ -2318,7 +2331,7 @@ impl Service for Fragile {
 /// Before, the driver caught it and the world went on.
 #[test]
 fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
-    let mut h = Harness::new(Fragile, ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Fragile, ());
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.push(b"boom\n")));
     assert!(caught.is_err());
 
@@ -2344,7 +2357,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
     });
 
     let ran = std::thread::spawn(move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             Net::new()
                 .ipv4_only()
@@ -2578,31 +2591,35 @@ impl Service for Dice {
 }
 
 /// Two runs with the same seed and the same connections draw the same
-/// numbers; connections differ from each other. Before, each connection
-/// was seeded from the operating system.
+/// numbers; successive connections consume different parts of the stream.
 #[test]
 fn a_seeded_run_repeats_its_randomness() {
     let draws = |seed: u64| {
         let (tx, rx) = mpsc::channel();
-        world(Duration::from_secs(60), move |fcx| async move {
-            let (server, _su, client, _cu) = two_machines(&fcx);
-            serve::listen(
-                &fcx,
-                server.listen(7)?,
-                Arc::new(()),
-                || Dice,
-                ServeOptions::default().seed(seed),
-            );
-            let mut got = Vec::new();
-            for _ in 0..2 {
-                let mut conn = client
-                    .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
-                    .await?;
-                got.push(String::from_utf8(read_some(&fcx, &mut conn, 64).await).unwrap());
-            }
-            tx.send(got).unwrap();
-            Ok(())
-        });
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::from_u64(seed),
+            move |fcx| async move {
+                let (server, _su, client, _cu) = two_machines(&fcx);
+                serve::listen(
+                    &fcx,
+                    server.listen(7)?,
+                    Arc::new(()),
+                    || Dice,
+                    ServeOptions::default(),
+                );
+                let mut got = Vec::new();
+                for _ in 0..2 {
+                    let mut conn = client
+                        .connect(&fcx, SocketAddr::new(SERVER.into(), 7))
+                        .await?;
+                    got.push(String::from_utf8(read_some(&fcx, &mut conn, 64).await).unwrap());
+                }
+                tx.send(got).unwrap();
+                fcx.cancel();
+                Ok(())
+            },
+        ))
+        .unwrap();
         rx.recv().unwrap()
     };
     let first = draws(7);
@@ -2615,30 +2632,39 @@ fn a_seeded_run_repeats_its_randomness() {
 /// calendar.
 #[test]
 fn a_net_starts_its_events_with_a_wall_clock_anchor() {
-    world(Duration::from_secs(60), |fcx| async move {
-        let kept = fcx.events();
-        let (_attacher, attachments) = fictionet::attachments();
-        let date = Fields::new().with("world_date", "2026-10-06");
-        Net::new().start_fields(date).serve(&fcx, attachments)?;
-        let first = &kept.all()[0];
-        assert!(first.is("run", "start"));
-        assert_eq!(first.at, fictionet::time::Instant::ZERO);
-        assert_eq!(first.str("world_date"), Some("2026-10-06"));
-        assert!(
-            first
-                .get("wall")
-                .and_then(json::Value::as_f64)
-                .is_some_and(|w| w > 1.7e9)
-        );
-        Ok(())
-    });
+    world::seeded_world(
+        fictionet::Seed::from_u64(42),
+        Duration::from_secs(60),
+        |fcx| async move {
+            let kept = fcx.events();
+            let (_attacher, attachments) = fictionet::attachments();
+            let date = Fields::new().with("world_date", "2026-10-06");
+            Net::new().start_fields(date).serve(&fcx, attachments)?;
+            let first = &kept.all()[0];
+            assert!(first.is("run", "start"));
+            assert_eq!(first.at, fictionet::time::Instant::ZERO);
+            assert_eq!(
+                first.str("seed"),
+                Some(fictionet::Seed::from_u64(42).to_string().as_str())
+            );
+            assert_eq!(first.str("rng"), Some("chacha20-v1"));
+            assert_eq!(first.str("world_date"), Some("2026-10-06"));
+            assert!(
+                first
+                    .get("wall")
+                    .and_then(json::Value::as_f64)
+                    .is_some_and(|w| w > 1.7e9)
+            );
+            Ok(())
+        },
+    );
 }
 
 /// A body that trickles in is cut off by its own timer. Before, the head
 /// timer was cancelled on the head and nothing replaced it.
 #[test]
 fn http1_closes_a_request_whose_body_never_finishes() {
-    let mut h = Harness::new(Http1::new(Router::new()), ());
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ());
     h.push(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc")
         .unwrap();
     assert_eq!(h.advance(Duration::from_secs(29)).unwrap(), b"");
@@ -3242,6 +3268,54 @@ fn every_serving_wait_reports_a_cancel() {
         })
         .await;
         assert_eq!(got, "\"Other Some(Cancelled)\"");
+        Ok(())
+    });
+}
+
+#[test]
+fn harness_service_http_and_faults_share_the_context_stream() {
+    use fictionet::{Entropy, Seed, SeededEntropy};
+    let seed = Seed::from_u64(42);
+    world::seeded_world(seed, Duration::from_secs(10), move |fcx| async move {
+        let oracle = SeededEntropy::new(seed);
+        assert_eq!(fcx.random_u64(), oracle.random_u64());
+        let mut dice = Harness::new(Seed::from_u64(999), Dice, ()).with_fcx(fcx.clone());
+        assert_eq!(
+            dice.open().unwrap(),
+            format!("{}\n", oracle.random_u64()).as_bytes()
+        );
+
+        let mut faults = fictionet::stdlib::codec::Faults::new(64, 0);
+        let plan = [Rule {
+            when: Trigger::Chance { take: 1, out_of: 2 },
+            fault: ByteFault::Corrupt {
+                offset: None,
+                xor: 1,
+            },
+        }];
+        let mut bytes = Vec::new();
+        faults.bytes(&fcx, &plan, b"abc", &mut bytes).unwrap();
+        let mut expected = b"abc".to_vec();
+        if oracle.random_below(2) == 0 {
+            expected[oracle.random_below(3) as usize] ^= 1;
+        }
+        assert_eq!(bytes, expected);
+
+        let stamp = Arc::new(Mutex::new(None));
+        let seen = stamp.clone();
+        let router = Router::new().get("/", move |ex, _| {
+            *seen.lock().unwrap() = Some(ex.now());
+            http::Response::new(Bytes::from(ex.random_u64().to_le_bytes().to_vec()))
+        });
+        let mut http =
+            Harness::new(Seed::from_u64(999), Http1::new(router), ()).with_fcx(fcx.clone());
+        fcx.sleep(Duration::from_millis(1)).await?;
+        let before = fcx.now();
+        let reply = http.push(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n").unwrap();
+        assert!(reply.ends_with(&oracle.random_u64().to_le_bytes()));
+        let stamp = stamp.lock().unwrap().unwrap();
+        assert!(stamp >= before && stamp <= fcx.now());
+        assert_eq!(fcx.random_u64(), oracle.random_u64());
         Ok(())
     });
 }

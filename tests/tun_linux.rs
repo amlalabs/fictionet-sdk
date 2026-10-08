@@ -425,7 +425,7 @@ fn a_linux_client_through_tun() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let l = log.clone();
-    let result = block_on(run(move |fcx| async move {
+    let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
         let [t4, u4, t6, u6] = demux(&fcx, tun);
         let tcp4 = tcp::endpoint(&fcx, t4, "10.9.0.2".parse()?);
         let udp4 = udp::endpoint(&fcx, u4, "10.9.0.2".parse()?);

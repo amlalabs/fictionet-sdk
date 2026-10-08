@@ -191,7 +191,7 @@ impl Interface for Attachment {
 /// # fn main() -> Result {
 /// let (attacher, attachments) = fictionet::attachments();
 /// let agent = attacher.attach("agent")?; // the test holds the sandbox's end
-/// let world = fictionet::run(|fcx| world(fcx, attachments, vec![]));
+/// let world = fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments, vec![]));
 /// // send packets on `agent` and check what comes back while `world` runs
 /// # drop(agent);
 /// # fictionet::block_on(world)

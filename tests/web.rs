@@ -882,7 +882,7 @@ fn dates_come_from_the_world() {
     let june_2019 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_559_347_200);
     for date in [Some(june_2019), None] {
         let result = within(Duration::from_secs(60), move || {
-            block_on(run(move |fcx| async move {
+            block_on(run(fictionet::Seed::random(), move |fcx| async move {
                 let (attacher, attachments) = fictionet::attachments();
                 let site = axum::Router::new()
                     .route(
@@ -1636,7 +1636,7 @@ fn dhcp_messages_round_trip() {
 #[test]
 fn a_subnet_that_cannot_work_is_an_error() {
     let result = within(Duration::from_secs(10), || {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             for bad in [
                 "10.0.0.0/31",
                 "10.0.0.0/4",
@@ -1679,7 +1679,7 @@ fn the_sites_keep_running_after_the_world_returns() {
     let (attacher, attachments) = fictionet::attachments();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let r = block_on(run(move |fcx| async move {
+        let r = block_on(run(fictionet::Seed::random(), move |fcx| async move {
             web::Sites::new(|h| (h == "plain.test").then(|| web::Site::new(Plain("plain"))))
                 .serve(&fcx, attachments)?;
             let _ = tx.send(fcx.clone());
@@ -1737,7 +1737,7 @@ fn the_target_is_from_the_connection_not_the_headers() {
 async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        run(|fcx| async move {
+        run(fictionet::Seed::random(), |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(|h| (h == "nowhere.invalid").then(|| web::Site::new(web::proxy())))
                 .serve(&fcx, attachments)?;
@@ -1841,7 +1841,7 @@ async fn websocket_echo<C: Connection>(
 async fn websockets_work_through_sites() {
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        run(|fcx| async move {
+        run(fictionet::Seed::random(), |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(|h| (h == "ws.test").then(|| web::Site::new(echo_socket())))
                 .serve(&fcx, attachments)?;
@@ -3936,7 +3936,7 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
     let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = dropped.clone();
     let result = within(Duration::from_secs(30), move || {
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (seen, set) = (started.clone(), flag.clone());

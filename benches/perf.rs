@@ -491,124 +491,127 @@ fn endpoint(fcx: &Cx, inner: impl Interface, addr: &str, opts: TcpOpts) -> tcp::
 fn tcp_bulk(topology: Topology, flows: usize, idle: usize, per_flow: usize, opts: TcpOpts) -> Bulk {
     let out = Arc::new(Mutex::new(None));
     let result = out.clone();
-    finish(block_on(run(move |fcx| async move {
-        let (a, b, _keep): (End, End, Vec<Box<dyn Send>>) = match topology {
-            Topology::Direct => {
-                let (a, b) = pair();
-                (a, b, Vec::new())
-            }
-            Topology::Delay(ms) => {
-                let (a, b) = pair();
-                let b = stdlib::delay(&fcx, fictionet::time::ms(ms), b);
-                (a, b, Vec::new())
-            }
-            Topology::Path => {
-                let (a, ar) = pair();
-                let (br, b) = pair();
-                let router = stdlib::route::router(
-                    &fcx,
-                    vec![("10.0.0.1/32".parse()?, ar), ("10.0.0.2/32".parse()?, br)],
-                );
-                let (a, u1, i1, o1) = ip::split_protocols(&fcx, a);
-                let (b, u2, i2, o2) = ip::split_protocols(&fcx, b);
-                (
-                    a,
-                    b,
-                    vec![
-                        Box::new(router),
-                        Box::new(u1),
-                        Box::new(i1),
-                        Box::new(o1),
-                        Box::new(u2),
-                        Box::new(i2),
-                        Box::new(o2),
-                    ],
-                )
-            }
-        };
-        let (ca, cb) = (Arc::new(Counts::default()), Arc::new(Counts::default()));
-        let client = endpoint(
-            &fcx,
-            Counted {
-                inner: a,
-                counts: ca.clone(),
-            },
-            "10.0.0.1",
-            opts,
-        );
-        let server = endpoint(
-            &fcx,
-            Counted {
-                inner: b,
-                counts: cb.clone(),
-            },
-            "10.0.0.2",
-            opts,
-        );
-        let mut listener = server.listen(80)?;
-        let mut conns = Vec::new();
-        for _ in 0..flows + idle {
-            let c = client.connect(&fcx, "10.0.0.2:80".parse()?).await?;
-            let s = listener.accept(&fcx).await?;
-            conns.push((c, s));
-        }
-        let quiet = conns.split_off(flows);
-        let sent0 = ca.sent.load(Ordering::Relaxed) + cb.sent.load(Ordering::Relaxed);
-        let got0 = ca.delivered.load(Ordering::Relaxed) + cb.delivered.load(Ordering::Relaxed);
-        let a0 = allocs();
-        let start = Instant::now();
-        let mut joins = Vec::new();
-        for (mut c, mut s) in conns {
-            joins.push(fcx.spawn(move |fcx| async move {
-                let buf = vec![0x5a; 65536];
-                let mut left = per_flow;
-                while left > 0 {
-                    let n = left.min(buf.len());
-                    s.write_all(&fcx, &buf[..n]).await?;
-                    left -= n;
+    finish(block_on(run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let (a, b, _keep): (End, End, Vec<Box<dyn Send>>) = match topology {
+                Topology::Direct => {
+                    let (a, b) = pair();
+                    (a, b, Vec::new())
                 }
-                // Wait for the reader's one-byte "done", so the writer's
-                // side stays open until every byte has arrived.
-                let mut done = [0];
-                c_read_exact(&fcx, &mut s, &mut done).await?;
-                Ok(())
-            }));
-            joins.push(fcx.spawn(move |fcx| async move {
-                let mut buf = vec![0; 65536];
-                let mut left = per_flow;
-                while left > 0 {
-                    let n = left.min(buf.len());
-                    c_read_exact(&fcx, &mut c, &mut buf[..n]).await?;
-                    assert!(
-                        buf[..n].iter().all(|&v| v == 0x5a),
-                        "TCP delivered the wrong bytes"
+                Topology::Delay(ms) => {
+                    let (a, b) = pair();
+                    let b = stdlib::delay(&fcx, fictionet::time::ms(ms), b);
+                    (a, b, Vec::new())
+                }
+                Topology::Path => {
+                    let (a, ar) = pair();
+                    let (br, b) = pair();
+                    let router = stdlib::route::router(
+                        &fcx,
+                        vec![("10.0.0.1/32".parse()?, ar), ("10.0.0.2/32".parse()?, br)],
                     );
-                    left -= n;
+                    let (a, u1, i1, o1) = ip::split_protocols(&fcx, a);
+                    let (b, u2, i2, o2) = ip::split_protocols(&fcx, b);
+                    (
+                        a,
+                        b,
+                        vec![
+                            Box::new(router),
+                            Box::new(u1),
+                            Box::new(i1),
+                            Box::new(o1),
+                            Box::new(u2),
+                            Box::new(i2),
+                            Box::new(o2),
+                        ],
+                    )
                 }
-                c.write_all(&fcx, &[1]).await?;
-                Ok(())
-            }));
-        }
-        for j in joins {
-            j.join(&fcx).await?;
-        }
-        let secs = start.elapsed().as_secs_f64();
-        let allocs = allocs() - a0;
-        // Let the last ACKs and FINs land before counting what was lost.
-        fcx.sleep(fictionet::time::ms(200)).await?;
-        let sent = ca.sent.load(Ordering::Relaxed) + cb.sent.load(Ordering::Relaxed) - sent0;
-        let got =
-            ca.delivered.load(Ordering::Relaxed) + cb.delivered.load(Ordering::Relaxed) - got0;
-        *result.lock().unwrap() = Some(Bulk {
-            secs,
-            sent,
-            lost: sent.saturating_sub(got),
-            allocs,
-        });
-        drop(quiet);
-        fcx.cancel();
-        Ok(())
-    })));
+            };
+            let (ca, cb) = (Arc::new(Counts::default()), Arc::new(Counts::default()));
+            let client = endpoint(
+                &fcx,
+                Counted {
+                    inner: a,
+                    counts: ca.clone(),
+                },
+                "10.0.0.1",
+                opts,
+            );
+            let server = endpoint(
+                &fcx,
+                Counted {
+                    inner: b,
+                    counts: cb.clone(),
+                },
+                "10.0.0.2",
+                opts,
+            );
+            let mut listener = server.listen(80)?;
+            let mut conns = Vec::new();
+            for _ in 0..flows + idle {
+                let c = client.connect(&fcx, "10.0.0.2:80".parse()?).await?;
+                let s = listener.accept(&fcx).await?;
+                conns.push((c, s));
+            }
+            let quiet = conns.split_off(flows);
+            let sent0 = ca.sent.load(Ordering::Relaxed) + cb.sent.load(Ordering::Relaxed);
+            let got0 = ca.delivered.load(Ordering::Relaxed) + cb.delivered.load(Ordering::Relaxed);
+            let a0 = allocs();
+            let start = Instant::now();
+            let mut joins = Vec::new();
+            for (mut c, mut s) in conns {
+                joins.push(fcx.spawn(move |fcx| async move {
+                    let buf = vec![0x5a; 65536];
+                    let mut left = per_flow;
+                    while left > 0 {
+                        let n = left.min(buf.len());
+                        s.write_all(&fcx, &buf[..n]).await?;
+                        left -= n;
+                    }
+                    // Wait for the reader's one-byte "done", so the writer's
+                    // side stays open until every byte has arrived.
+                    let mut done = [0];
+                    c_read_exact(&fcx, &mut s, &mut done).await?;
+                    Ok(())
+                }));
+                joins.push(fcx.spawn(move |fcx| async move {
+                    let mut buf = vec![0; 65536];
+                    let mut left = per_flow;
+                    while left > 0 {
+                        let n = left.min(buf.len());
+                        c_read_exact(&fcx, &mut c, &mut buf[..n]).await?;
+                        assert!(
+                            buf[..n].iter().all(|&v| v == 0x5a),
+                            "TCP delivered the wrong bytes"
+                        );
+                        left -= n;
+                    }
+                    c.write_all(&fcx, &[1]).await?;
+                    Ok(())
+                }));
+            }
+            for j in joins {
+                j.join(&fcx).await?;
+            }
+            let secs = start.elapsed().as_secs_f64();
+            let allocs = allocs() - a0;
+            // Let the last ACKs and FINs land before counting what was lost.
+            fcx.sleep(fictionet::time::ms(200)).await?;
+            let sent = ca.sent.load(Ordering::Relaxed) + cb.sent.load(Ordering::Relaxed) - sent0;
+            let got =
+                ca.delivered.load(Ordering::Relaxed) + cb.delivered.load(Ordering::Relaxed) - got0;
+            *result.lock().unwrap() = Some(Bulk {
+                secs,
+                sent,
+                lost: sent.saturating_sub(got),
+                allocs,
+            });
+            drop(quiet);
+            fcx.cancel();
+            Ok(())
+        },
+    )));
     out.lock().unwrap().take().expect("the run reported")
 }
 
@@ -786,27 +789,30 @@ fn sched(o: &Options) {
 fn ping_pong(n: usize) -> (f64, u64) {
     let out = Arc::new(Mutex::new((0.0, 0)));
     let result = out.clone();
-    finish(block_on(run(move |fcx| async move {
-        let (mut a, mut b) = pair();
-        let echo = fcx.spawn(move |fcx| async move {
+    finish(block_on(run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let (mut a, mut b) = pair();
+            let echo = fcx.spawn(move |fcx| async move {
+                for _ in 0..n {
+                    let p = b.recv(&fcx).await?;
+                    b.send(p);
+                }
+                Ok(())
+            });
+            let mut p = Packet(vec![0x45; 1500]);
+            let a0 = allocs();
+            let start = Instant::now();
             for _ in 0..n {
-                let p = b.recv(&fcx).await?;
-                b.send(p);
+                a.send(p);
+                p = a.recv(&fcx).await?;
             }
+            echo.join(&fcx).await?;
+            *result.lock().unwrap() = (start.elapsed().as_secs_f64(), allocs() - a0);
+            fcx.cancel();
             Ok(())
-        });
-        let mut p = Packet(vec![0x45; 1500]);
-        let a0 = allocs();
-        let start = Instant::now();
-        for _ in 0..n {
-            a.send(p);
-            p = a.recv(&fcx).await?;
-        }
-        echo.join(&fcx).await?;
-        *result.lock().unwrap() = (start.elapsed().as_secs_f64(), allocs() - a0);
-        fcx.cancel();
-        Ok(())
-    })));
+        },
+    )));
     *out.lock().unwrap()
 }
 
@@ -814,33 +820,36 @@ fn ping_pong(n: usize) -> (f64, u64) {
 fn tcp_exchanges(n: usize) -> (f64, u64) {
     let out = Arc::new(Mutex::new((0.0, 0)));
     let result = out.clone();
-    finish(block_on(run(move |fcx| async move {
-        let (a, b) = pair();
-        let client = tcp::endpoint(&fcx, a, "10.0.0.1".parse()?);
-        let server = tcp::endpoint(&fcx, b, "10.0.0.2".parse()?);
-        let mut listener = server.listen(80)?;
-        let mut c = client.connect(&fcx, "10.0.0.2:80".parse()?).await?;
-        let mut s = listener.accept(&fcx).await?;
-        let echo = fcx.spawn(move |fcx| async move {
+    finish(block_on(run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let (a, b) = pair();
+            let client = tcp::endpoint(&fcx, a, "10.0.0.1".parse()?);
+            let server = tcp::endpoint(&fcx, b, "10.0.0.2".parse()?);
+            let mut listener = server.listen(80)?;
+            let mut c = client.connect(&fcx, "10.0.0.2:80".parse()?).await?;
+            let mut s = listener.accept(&fcx).await?;
+            let echo = fcx.spawn(move |fcx| async move {
+                let mut buf = [0; 64];
+                for _ in 0..n {
+                    c_read_exact(&fcx, &mut s, &mut buf).await?;
+                    s.write_all(&fcx, &buf).await?;
+                }
+                Ok(())
+            });
             let mut buf = [0; 64];
+            let a0 = allocs();
+            let start = Instant::now();
             for _ in 0..n {
-                c_read_exact(&fcx, &mut s, &mut buf).await?;
-                s.write_all(&fcx, &buf).await?;
+                c.write_all(&fcx, &[0x5a; 64]).await?;
+                c_read_exact(&fcx, &mut c, &mut buf).await?;
             }
+            echo.join(&fcx).await?;
+            *result.lock().unwrap() = (start.elapsed().as_secs_f64(), allocs() - a0);
+            fcx.cancel();
             Ok(())
-        });
-        let mut buf = [0; 64];
-        let a0 = allocs();
-        let start = Instant::now();
-        for _ in 0..n {
-            c.write_all(&fcx, &[0x5a; 64]).await?;
-            c_read_exact(&fcx, &mut c, &mut buf).await?;
-        }
-        echo.join(&fcx).await?;
-        *result.lock().unwrap() = (start.elapsed().as_secs_f64(), allocs() - a0);
-        fcx.cancel();
-        Ok(())
-    })));
+        },
+    )));
     *out.lock().unwrap()
 }
 
@@ -878,35 +887,38 @@ fn memory(o: &Options) {
 fn unread(kind: &'static str, n: usize) -> (i64, u64) {
     let out = Arc::new(Mutex::new((0, 0)));
     let result = out.clone();
-    finish(block_on(run(move |fcx| async move {
-        let (mut a, b) = pair();
-        let mut far = if kind.starts_with("delay") {
-            stdlib::delay(&fcx, fictionet::time::ms(60_000), b)
-        } else {
-            stdlib::bottleneck(&fcx, 1_000_000_000_000, 64, b)
-        };
-        let before = live();
-        for i in 0..n {
-            a.send(Packet(vec![0x45; 1500]));
-            if i % 32 == 31 {
+    finish(block_on(run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let (mut a, b) = pair();
+            let mut far = if kind.starts_with("delay") {
+                stdlib::delay(&fcx, fictionet::time::ms(60_000), b)
+            } else {
+                stdlib::bottleneck(&fcx, 1_000_000_000_000, 64, b)
+            };
+            let before = live();
+            for i in 0..n {
+                a.send(Packet(vec![0x45; 1500]));
+                if i % 32 == 31 {
+                    fcx.yield_now().await?;
+                }
+            }
+            // Give the link's task turns to take every packet from its input.
+            for _ in 0..1000 {
                 fcx.yield_now().await?;
             }
-        }
-        // Give the link's task turns to take every packet from its input.
-        for _ in 0..1000 {
-            fcx.yield_now().await?;
-        }
-        let grew = live() - before;
-        // Count what the bottleneck released into its output. A delay
-        // releases nothing within the run.
-        let mut kept = 0;
-        while let Poll::Ready(Ok(_)) = poll_fn(|t| Poll::Ready(far.poll_recv(&fcx, t))).await {
-            kept += 1;
-        }
-        *result.lock().unwrap() = (grew, kept);
-        fcx.cancel();
-        Ok(())
-    })));
+            let grew = live() - before;
+            // Count what the bottleneck released into its output. A delay
+            // releases nothing within the run.
+            let mut kept = 0;
+            while let Poll::Ready(Ok(_)) = poll_fn(|t| Poll::Ready(far.poll_recv(&fcx, t))).await {
+                kept += 1;
+            }
+            *result.lock().unwrap() = (grew, kept);
+            fcx.cancel();
+            Ok(())
+        },
+    )));
     *out.lock().unwrap()
 }
 
@@ -1004,15 +1016,18 @@ fn listen_echo(n: usize, outstanding: usize) -> (f64, u64) {
     let (attacher, mut attachments) = fictionet::attachments();
     let listening = listen(WorldSocket::UnixSocket(path.clone()), attacher).unwrap();
     let world = std::thread::spawn(move || {
-        finish(block_on(run(move |fcx| async move {
-            let mut agent = attachments.get(&fcx, "agent").await?;
-            loop {
-                match agent.recv(&fcx).await {
-                    Ok(p) => agent.send(p),
-                    Err(_) => return Ok(()),
+        finish(block_on(run(
+            fictionet::Seed::random(),
+            move |fcx| async move {
+                let mut agent = attachments.get(&fcx, "agent").await?;
+                loop {
+                    match agent.recv(&fcx).await {
+                        Ok(p) => agent.send(p),
+                        Err(_) => return Ok(()),
+                    }
                 }
-            }
-        })));
+            },
+        )));
     });
     let fd = unix::connect(&path).unwrap();
     let hello = Hello {
@@ -1314,117 +1329,120 @@ fn http_run(case: HttpCase) -> HttpRun {
     let out = Arc::new(Mutex::new(None));
     let result = out.clone();
     let wait_for = ready.clone();
-    finish(block_on(run(move |fcx| async move {
-        let (roots, chain, key) = certs();
-        let roots = Arc::new(roots);
-        let config = Arc::new(
-            tls::config_builder(
-                &fcx,
-                SystemTime::now(),
-                rustls::crypto::ring::default_provider(),
-            )
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_single_cert(chain, key)?,
-        );
-        let page = Page(Bytes::from(vec![b'x'; case.body]));
-        let sites = web::Sites::new(move |_| {
-            let config = config.clone();
-            Some(web::Site::new(page.clone()).tls(move |_| config.clone()))
-        });
-        if case.hooks {
-            fcx.events().subscribe(|_| {});
-        }
-        sites.serve(&fcx, attachments)?;
-        let machines: Vec<Machine> = (0..case.sandboxes)
-            .map(|i| {
-                machine(
+    finish(block_on(run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let (roots, chain, key) = certs();
+            let roots = Arc::new(roots);
+            let config = Arc::new(
+                tls::config_builder(
                     &fcx,
-                    &attacher,
-                    &format!("sandbox{i}"),
-                    Ipv4Addr::new(10, 0, 0, 2 + i as u8),
+                    SystemTime::now(),
+                    rustls::crypto::ring::default_provider(),
                 )
-            })
-            .collect();
-        let addr = lookup(&fcx, &machines[0], "bench.test").await;
-        for i in 1..case.sites {
-            lookup(&fcx, &machines[0], &format!("site{i}.test")).await;
-        }
-        let mut clients = Vec::new();
-        for m in &machines {
-            let conn = m
-                .tcp
-                .connect(&fcx, SocketAddr::new(addr.into(), 443))
-                .await?;
-            let alpn: &[u8] = if case.h2 { b"h2" } else { b"http/1.1" };
-            let mut t = TlsClient::new(conn, &roots, "bench.test", alpn);
-            t.handshake(&fcx)
-                .await
-                .map_err(|e| fictionet::Error::msg(format!("{e:?}")))?;
-            let mut c = Client::new(&fcx, t, case.h2).await;
-            for _ in 0..100 {
-                c.get().await;
+                .with_safe_default_protocol_versions()?
+                .with_no_client_auth()
+                .with_single_cert(chain, key)?,
+            );
+            let page = Page(Bytes::from(vec![b'x'; case.body]));
+            let sites = web::Sites::new(move |_| {
+                let config = config.clone();
+                Some(web::Site::new(page.clone()).tls(move |_| config.clone()))
+            });
+            if case.hooks {
+                fcx.events().subscribe(|_| {});
             }
-            clients.push(c);
-        }
-        // Wait until the observer is watching, while the world runs.
-        if case.watch != Watch::None {
-            while !wait_for.load(Ordering::Acquire) {
-                fcx.sleep(fictionet::time::ms(5)).await?;
+            sites.serve(&fcx, attachments)?;
+            let machines: Vec<Machine> = (0..case.sandboxes)
+                .map(|i| {
+                    machine(
+                        &fcx,
+                        &attacher,
+                        &format!("sandbox{i}"),
+                        Ipv4Addr::new(10, 0, 0, 2 + i as u8),
+                    )
+                })
+                .collect();
+            let addr = lookup(&fcx, &machines[0], "bench.test").await;
+            for i in 1..case.sites {
+                lookup(&fcx, &machines[0], &format!("site{i}.test")).await;
             }
-        }
-        let each = case.requests / case.sandboxes;
-        let lat = Arc::new(Mutex::new(Vec::with_capacity(case.requests)));
-        let (a0, cpu0) = (allocs(), cpu_us());
-        let start = Instant::now();
-        timing.store(true, Ordering::Release);
-        let mut tasks = Vec::new();
-        for mut c in clients {
-            let lat = lat.clone();
-            tasks.push(fcx.spawn(move |_| async move {
-                let mut samples = Vec::with_capacity(each);
-                for _ in 0..each {
-                    let t = Instant::now();
-                    let (status, version, len) = c.get().await;
-                    assert_eq!(status, StatusCode::OK);
-                    assert_eq!(len, case.body);
-                    assert_eq!(
-                        version,
-                        if case.h2 {
-                            Version::HTTP_2
-                        } else {
-                            Version::HTTP_11
-                        }
-                    );
-                    samples.push(t.elapsed().as_nanos() as u64);
+            let mut clients = Vec::new();
+            for m in &machines {
+                let conn = m
+                    .tcp
+                    .connect(&fcx, SocketAddr::new(addr.into(), 443))
+                    .await?;
+                let alpn: &[u8] = if case.h2 { b"h2" } else { b"http/1.1" };
+                let mut t = TlsClient::new(conn, &roots, "bench.test", alpn);
+                t.handshake(&fcx)
+                    .await
+                    .map_err(|e| fictionet::Error::msg(format!("{e:?}")))?;
+                let mut c = Client::new(&fcx, t, case.h2).await;
+                for _ in 0..100 {
+                    c.get().await;
                 }
-                lat.lock().unwrap().extend(samples);
-                Ok(())
-            }));
-        }
-        for t in tasks {
-            t.join(&fcx).await?;
-        }
-        let secs = start.elapsed().as_secs_f64();
-        let (a1, cpu1) = (allocs() - a0, cpu_us() - cpu0);
-        // Rows still on their way belong to the timed requests.
-        fcx.sleep(fictionet::time::ms(150)).await?;
-        timing.store(false, Ordering::Release);
-        let mut l = lat.lock().unwrap();
-        l.sort_unstable();
-        let total = l.len();
-        *result.lock().unwrap() = Some(HttpRun {
-            rps: total as f64 / secs,
-            p50: percentile(&l, 0.5),
-            p99: percentile(&l, 0.99),
-            max: percentile(&l, 1.0),
-            cpu_per_request: cpu1 as f64 / total as f64,
-            allocs_per_request: a1 as f64 / total as f64,
-            rows: 0,
-        });
-        fcx.cancel();
-        Ok(())
-    })));
+                clients.push(c);
+            }
+            // Wait until the observer is watching, while the world runs.
+            if case.watch != Watch::None {
+                while !wait_for.load(Ordering::Acquire) {
+                    fcx.sleep(fictionet::time::ms(5)).await?;
+                }
+            }
+            let each = case.requests / case.sandboxes;
+            let lat = Arc::new(Mutex::new(Vec::with_capacity(case.requests)));
+            let (a0, cpu0) = (allocs(), cpu_us());
+            let start = Instant::now();
+            timing.store(true, Ordering::Release);
+            let mut tasks = Vec::new();
+            for mut c in clients {
+                let lat = lat.clone();
+                tasks.push(fcx.spawn(move |_| async move {
+                    let mut samples = Vec::with_capacity(each);
+                    for _ in 0..each {
+                        let t = Instant::now();
+                        let (status, version, len) = c.get().await;
+                        assert_eq!(status, StatusCode::OK);
+                        assert_eq!(len, case.body);
+                        assert_eq!(
+                            version,
+                            if case.h2 {
+                                Version::HTTP_2
+                            } else {
+                                Version::HTTP_11
+                            }
+                        );
+                        samples.push(t.elapsed().as_nanos() as u64);
+                    }
+                    lat.lock().unwrap().extend(samples);
+                    Ok(())
+                }));
+            }
+            for t in tasks {
+                t.join(&fcx).await?;
+            }
+            let secs = start.elapsed().as_secs_f64();
+            let (a1, cpu1) = (allocs() - a0, cpu_us() - cpu0);
+            // Rows still on their way belong to the timed requests.
+            fcx.sleep(fictionet::time::ms(150)).await?;
+            timing.store(false, Ordering::Release);
+            let mut l = lat.lock().unwrap();
+            l.sort_unstable();
+            let total = l.len();
+            *result.lock().unwrap() = Some(HttpRun {
+                rps: total as f64 / secs,
+                p50: percentile(&l, 0.5),
+                p99: percentile(&l, 0.99),
+                max: percentile(&l, 1.0),
+                cpu_per_request: cpu1 as f64 / total as f64,
+                allocs_per_request: a1 as f64 / total as f64,
+                rows: 0,
+            });
+            fcx.cancel();
+            Ok(())
+        },
+    )));
     stop.store(true, Ordering::Release);
     let rows = observer.map_or(0, |o| o.join().unwrap());
     drop(listening);
@@ -1866,26 +1884,29 @@ fn proxy_run(burst: usize, sequential: usize) -> ((u64, f64), (u64, f64)) {
     let world = {
         let (queries, stop) = (queries.clone(), stop.clone());
         std::thread::spawn(move || {
-            finish(block_on(run(move |fcx| async move {
-                let page = Page(Bytes::from_static(b"plain site\n"));
-                fcx.events().subscribe(move |e| {
-                    if e.is("dns", "query")
-                        && let Some(name) = e.str("name")
-                        && e.u64("qtype") == Some(1)
-                    {
-                        *queries.lock().unwrap().entry(name.to_owned()).or_default() += 1;
+            finish(block_on(run(
+                fictionet::Seed::random(),
+                move |fcx| async move {
+                    let page = Page(Bytes::from_static(b"plain site\n"));
+                    fcx.events().subscribe(move |e| {
+                        if e.is("dns", "query")
+                            && let Some(name) = e.str("name")
+                            && e.u64("qtype") == Some(1)
+                        {
+                            *queries.lock().unwrap().entry(name.to_owned()).or_default() += 1;
+                        }
+                    });
+                    web::Sites::new(move |host: &str| {
+                        (host == "plain.test").then(|| web::Site::new(page.clone()).plain_http())
+                    })
+                    .serve(&fcx, attachments)?;
+                    while !stop.load(Ordering::Acquire) {
+                        fcx.sleep(fictionet::time::ms(10)).await?;
                     }
-                });
-                web::Sites::new(move |host: &str| {
-                    (host == "plain.test").then(|| web::Site::new(page.clone()).plain_http())
-                })
-                .serve(&fcx, attachments)?;
-                while !stop.load(Ordering::Acquire) {
-                    fcx.sleep(fictionet::time::ms(10)).await?;
-                }
-                fcx.cancel();
-                Ok(())
-            })));
+                    fcx.cancel();
+                    Ok(())
+                },
+            )));
         })
     };
     let mut child = std::process::Command::new(fictionet_bin())

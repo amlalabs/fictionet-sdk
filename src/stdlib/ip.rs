@@ -1688,28 +1688,31 @@ mod tests {
     /// packet the agent sends there.
     #[test]
     fn an_interface_never_read_holds_at_most_its_queue() {
-        let result = fictionet::block_on(fictionet::run(|fcx| async move {
-            let (mut raw, side) = fictionet::pair();
-            let (_tcp, _udp, _icmp, other) = split_protocols(&fcx, side);
-            // 20 MiB of protocol 99, which goes to `other`.
-            for _ in 0..20 * 1024 {
-                let h = v4_header(
-                    99,
-                    Ipv4Addr::new(10, 0, 0, 2),
-                    Ipv4Addr::new(10, 0, 0, 1),
-                    0,
-                    &[],
-                    1000,
-                );
-                let mut p = h;
-                p.extend_from_slice(&[0; 1000]);
-                raw.send(Packet(p));
-                fcx.yield_now().await?;
-            }
-            assert!(other.queued() <= QUEUE, "{} bytes wait", other.queued());
-            assert!(other.queued() > QUEUE / 2, "{} bytes wait", other.queued());
-            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
-        }));
+        let result = fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            |fcx| async move {
+                let (mut raw, side) = fictionet::pair();
+                let (_tcp, _udp, _icmp, other) = split_protocols(&fcx, side);
+                // 20 MiB of protocol 99, which goes to `other`.
+                for _ in 0..20 * 1024 {
+                    let h = v4_header(
+                        99,
+                        Ipv4Addr::new(10, 0, 0, 2),
+                        Ipv4Addr::new(10, 0, 0, 1),
+                        0,
+                        &[],
+                        1000,
+                    );
+                    let mut p = h;
+                    p.extend_from_slice(&[0; 1000]);
+                    raw.send(Packet(p));
+                    fcx.yield_now().await?;
+                }
+                assert!(other.queued() <= QUEUE, "{} bytes wait", other.queued());
+                assert!(other.queued() > QUEUE / 2, "{} bytes wait", other.queued());
+                Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
+            },
+        ));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
 

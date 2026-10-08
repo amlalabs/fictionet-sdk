@@ -80,61 +80,64 @@ impl World {
                 .enable_all()
                 .build()
                 .unwrap();
-            let _ = rt.block_on(fictionet::run(move |fcx| async move {
-                let config = Arc::new(
-                    tls::config_builder(
-                        &fcx,
-                        SystemTime::now(),
-                        rustls::crypto::ring::default_provider(),
-                    )
-                    .with_safe_default_protocol_versions()?
-                    .with_no_client_auth()
-                    .with_single_cert(chain, key)?,
-                );
-                let app = axum::Router::new()
-                    .route("/", get(|| async { "plain site\n" }))
-                    .route("/mb", get(|| async { vec![b'x'; 1 << 20] }))
-                    .route("/upload", post(upload).layer(DefaultBodyLimit::disable()));
-                let secure = axum::Router::new().route("/", get(|| async { "secure site\n" }));
-                fcx.events().subscribe(move |e| {
-                    if e.is("dns", "query")
-                        && e.u64("qtype") == Some(1)
-                        && let Some(name) = e.str("name")
-                    {
-                        *queries2.lock().unwrap().entry(name.to_owned()).or_default() += 1;
+            let _ = rt.block_on(fictionet::run(
+                fictionet::Seed::random(),
+                move |fcx| async move {
+                    let config = Arc::new(
+                        tls::config_builder(
+                            &fcx,
+                            SystemTime::now(),
+                            rustls::crypto::ring::default_provider(),
+                        )
+                        .with_safe_default_protocol_versions()?
+                        .with_no_client_auth()
+                        .with_single_cert(chain, key)?,
+                    );
+                    let app = axum::Router::new()
+                        .route("/", get(|| async { "plain site\n" }))
+                        .route("/mb", get(|| async { vec![b'x'; 1 << 20] }))
+                        .route("/upload", post(upload).layer(DefaultBodyLimit::disable()));
+                    let secure = axum::Router::new().route("/", get(|| async { "secure site\n" }));
+                    fcx.events().subscribe(move |e| {
+                        if e.is("dns", "query")
+                            && e.u64("qtype") == Some(1)
+                            && let Some(name) = e.str("name")
+                        {
+                            *queries2.lock().unwrap().entry(name.to_owned()).or_default() += 1;
+                        }
+                    });
+                    let ws = axum::Router::new().route(
+                        "/echo",
+                        get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
+                            ws.on_upgrade(|mut socket| async move {
+                                while let Some(Ok(axum::extract::ws::Message::Text(t))) =
+                                    socket.recv().await
+                                {
+                                    let reply = format!("echo: {}", t.as_str());
+                                    let _ = socket
+                                        .send(axum::extract::ws::Message::Text(reply.into()))
+                                        .await;
+                                }
+                            })
+                        }),
+                    );
+                    web::Sites::new(move |host: &str| match host {
+                        "plain.test" => Some(web::Site::new(app.clone())),
+                        "ws.test" => Some(web::Site::new(ws.clone())),
+                        "secure.test" => Some(web::Site::new(secure.clone()).at(SECURE).tls({
+                            let c = config.clone();
+                            move |_| c.clone()
+                        })),
+                        _ => None,
+                    })
+                    .serve(&fcx, attachments)?;
+                    while !stop2.load(Ordering::SeqCst) {
+                        fcx.sleep(fictionet::time::ms(20)).await?;
                     }
-                });
-                let ws = axum::Router::new().route(
-                    "/echo",
-                    get(|ws: axum::extract::ws::WebSocketUpgrade| async move {
-                        ws.on_upgrade(|mut socket| async move {
-                            while let Some(Ok(axum::extract::ws::Message::Text(t))) =
-                                socket.recv().await
-                            {
-                                let reply = format!("echo: {}", t.as_str());
-                                let _ = socket
-                                    .send(axum::extract::ws::Message::Text(reply.into()))
-                                    .await;
-                            }
-                        })
-                    }),
-                );
-                web::Sites::new(move |host: &str| match host {
-                    "plain.test" => Some(web::Site::new(app.clone())),
-                    "ws.test" => Some(web::Site::new(ws.clone())),
-                    "secure.test" => Some(web::Site::new(secure.clone()).at(SECURE).tls({
-                        let c = config.clone();
-                        move |_| c.clone()
-                    })),
-                    _ => None,
-                })
-                .serve(&fcx, attachments)?;
-                while !stop2.load(Ordering::SeqCst) {
-                    fcx.sleep(fictionet::time::ms(20)).await?;
-                }
-                // Ends the run: every attachment closes.
-                Err::<(), fictionet::Error>(fictionet::Error::msg("stopped"))
-            }));
+                    // Ends the run: every attachment closes.
+                    Err::<(), fictionet::Error>(fictionet::Error::msg("stopped"))
+                },
+            ));
             drop(listening);
         });
         ready_rx.recv().unwrap();
@@ -167,27 +170,30 @@ impl World {
             )
             .unwrap();
             ready_tx.send(()).unwrap();
-            let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
-                fcx.spawn(move |fcx| async move {
-                    while let Ok(mut sandbox) = attachments.next(&fcx).await {
-                        let seen = seen2.clone();
-                        fcx.spawn(move |fcx| async move {
-                            while let Ok(p) = sandbox.recv(&fcx).await {
-                                if let Some(addrs) = p.0.get(12..20) {
-                                    seen.lock().unwrap().insert(addrs.try_into().unwrap());
+            let _ = fictionet::block_on(fictionet::run(
+                fictionet::Seed::random(),
+                move |fcx| async move {
+                    fcx.spawn(move |fcx| async move {
+                        while let Ok(mut sandbox) = attachments.next(&fcx).await {
+                            let seen = seen2.clone();
+                            fcx.spawn(move |fcx| async move {
+                                while let Ok(p) = sandbox.recv(&fcx).await {
+                                    if let Some(addrs) = p.0.get(12..20) {
+                                        seen.lock().unwrap().insert(addrs.try_into().unwrap());
+                                    }
                                 }
-                            }
-                            Ok(())
-                        });
+                                Ok(())
+                            });
+                        }
+                        Ok(())
+                    });
+                    while !stop2.load(Ordering::SeqCst) {
+                        fcx.sleep(fictionet::time::ms(20)).await?;
                     }
-                    Ok(())
-                });
-                while !stop2.load(Ordering::SeqCst) {
-                    fcx.sleep(fictionet::time::ms(20)).await?;
-                }
-                // Ends the run: every attachment closes.
-                Err::<(), fictionet::Error>(fictionet::Error::msg("stopped"))
-            }));
+                    // Ends the run: every attachment closes.
+                    Err::<(), fictionet::Error>(fictionet::Error::msg("stopped"))
+                },
+            ));
             drop(listening);
         });
         ready_rx.recv().unwrap();

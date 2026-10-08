@@ -33,20 +33,23 @@ fn start_world(path: &str) -> fictionet::Listening {
     let listening =
         fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
     std::thread::spawn(move || {
-        let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
-            fcx.spawn(move |fcx| async move {
-                while let Ok(a) = attachments.next(&fcx).await {
-                    drop(a);
+        let _ = fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            move |fcx| async move {
+                fcx.spawn(move |fcx| async move {
+                    while let Ok(a) = attachments.next(&fcx).await {
+                        drop(a);
+                    }
+                    Ok(())
+                });
+                let mut n = 0i64;
+                loop {
+                    fcx.record(fictionet::events::Event::new("test", "tick").field("n", n));
+                    n += 1;
+                    fcx.sleep(fictionet::time::ms(50)).await?;
                 }
-                Ok(())
-            });
-            let mut n = 0i64;
-            loop {
-                fcx.record(fictionet::events::Event::new("test", "tick").field("n", n));
-                n += 1;
-                fcx.sleep(fictionet::time::ms(50)).await?;
-            }
-        }));
+            },
+        ));
     });
     listening
 }
@@ -211,37 +214,40 @@ fn start_two_links(path: &str) -> fictionet::Listening {
     let listening =
         fictionet::listen(fictionet::WorldSocket::UnixSocket(path.into()), attacher).unwrap();
     std::thread::spawn(move || {
-        let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
-            // Observers find a world once it takes attachments.
-            fcx.spawn(move |fcx| async move {
-                while let Ok(a) = attachments.next(&fcx).await {
-                    drop(a);
-                }
-                Ok(())
-            });
-            let lan = fcx.group("lan");
-            for _ in 0..2 {
-                let (mut a, mut b) = fictionet::pair();
-                lan.spawn(move |fcx| async move {
-                    while let Ok(p) = b.recv(&fcx).await {
-                        b.send(p);
+        let _ = fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            move |fcx| async move {
+                // Observers find a world once it takes attachments.
+                fcx.spawn(move |fcx| async move {
+                    while let Ok(a) = attachments.next(&fcx).await {
+                        drop(a);
                     }
                     Ok(())
                 });
-                fcx.spawn(move |fcx| async move {
-                    loop {
-                        // An IPv4 header with nothing after it.
-                        let p = vec![
-                            0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
-                        ];
-                        a.send(fictionet::Packet(p));
-                        a.recv(&fcx).await?;
-                        fcx.sleep(fictionet::time::ms(20)).await?;
-                    }
-                });
-            }
-            Ok(())
-        }));
+                let lan = fcx.group("lan");
+                for _ in 0..2 {
+                    let (mut a, mut b) = fictionet::pair();
+                    lan.spawn(move |fcx| async move {
+                        while let Ok(p) = b.recv(&fcx).await {
+                            b.send(p);
+                        }
+                        Ok(())
+                    });
+                    fcx.spawn(move |fcx| async move {
+                        loop {
+                            // An IPv4 header with nothing after it.
+                            let p = vec![
+                                0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
+                            ];
+                            a.send(fictionet::Packet(p));
+                            a.recv(&fcx).await?;
+                            fcx.sleep(fictionet::time::ms(20)).await?;
+                        }
+                    });
+                }
+                Ok(())
+            },
+        ));
     });
     listening
 }
@@ -376,18 +382,21 @@ fn a_watch_exits_0_when_the_world_ends() {
     // The world returns once the observer has its snapshot.
     let (stop, mut stopped) = fictionet::pair();
     let world_thread = std::thread::spawn(move || {
-        let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
-            fcx.spawn(move |fcx| async move {
-                while let Ok(a) = attachments.next(&fcx).await {
-                    drop(a);
-                }
+        let _ = fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            move |fcx| async move {
+                fcx.spawn(move |fcx| async move {
+                    while let Ok(a) = attachments.next(&fcx).await {
+                        drop(a);
+                    }
+                    Ok(())
+                });
+                assert_eq!(stopped.recv(&fcx).await, Err(fictionet::RecvError::Closed));
+                // Ends the run, with the task above.
+                fcx.cancel();
                 Ok(())
-            });
-            assert_eq!(stopped.recv(&fcx).await, Err(fictionet::RecvError::Closed));
-            // Ends the run, with the task above.
-            fcx.cancel();
-            Ok(())
-        }));
+            },
+        ));
         drop(listening);
     });
     let log = logged(child.stdout.take().unwrap(), r#""event":"snapshot""#);

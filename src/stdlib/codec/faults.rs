@@ -1,3 +1,4 @@
+use fictionet::Entropy;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
 extern crate alloc;
@@ -5,8 +6,8 @@ extern crate alloc;
 use alloc::{collections::BinaryHeap, vec::Vec};
 use core::{cmp::Ordering, convert::Infallible, error::Error, fmt, ops::Range, time::Duration};
 use fictionet::stdlib::codec::{
-    Buffer, Decode, Interceptor, Lcg, PumpError, Rewrite, RewriteError, SkipPolicy, Stream,
-    StreamEvent, Wire, append_bounded, write_bounded,
+    Buffer, Decode, Interceptor, PumpError, Rewrite, RewriteError, SkipPolicy, Stream, StreamEvent,
+    Wire, append_bounded, write_bounded,
 };
 
 /// When a rule applies. Call numbers start at one in each fault domain.
@@ -29,8 +30,8 @@ pub enum Trigger {
     Every(u64),
     /// Draw below `out_of` and match when below `take`.
     /// Zero `out_of` never matches; `take >= out_of` always matches.
-    /// Draws combine two 31-bit LCG outputs before modulo reduction.
-    /// All u32 denominators are supported, with a small modulo bias.
+    /// Draws use [`Entropy::random_below`] with rejection sampling.
+    /// All u32 denominators are supported without modulo bias.
     Chance {
         /// Number of matching outcomes.
         take: u32,
@@ -75,7 +76,7 @@ pub enum ByteFault {
     Truncate(usize),
     /// XOR one byte. Empty input and an out-of-range fixed offset are inert.
     Corrupt {
-        /// Byte index, or `None` to draw an index from the seeded LCG.
+        /// Byte index, or `None` to draw an index from the supplied entropy source.
         offset: Option<usize>,
         /// Bits to flip. Zero leaves the byte unchanged.
         xor: u8,
@@ -165,11 +166,11 @@ impl PartialOrd for Held {
     }
 }
 
-/// Deterministic byte and item fault plans with an explicit seed.
+/// Byte and item fault plans with caller-supplied entropy.
 ///
 /// Plans are borrowed per call and remain owned and bounded by world code.
-/// Byte and item calls have independent counters and share one LCG. The
-/// same seed, plans, and call sequence give the same decisions and bytes.
+/// Byte and item calls have independent counters. The same entropy stream,
+/// plans, and call sequence give the same decisions and bytes.
 /// Counters stop matching after `u64::MAX` calls instead of wrapping.
 /// Rules are checked in order; random draws occur only for reached rules
 /// and selected random corruption offsets. Each item call shares one
@@ -187,7 +188,8 @@ impl PartialOrd for Held {
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Direction, Faults, ItemFault, Recorder, Rule, Stream, Trigger, write_bounded}, json};
-/// let mut faults = Faults::new(7, 1024, 8);
+/// let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(7));
+/// let mut faults = Faults::new(1024, 8);
 /// let mut log = Recorder::new(16, 1024);
 /// let mut stream = Stream::new(json::Values::new());
 /// let plan = [Rule { when: Trigger::At(1), fault: ItemFault::<json::Value>::Hold { window: 1 } }];
@@ -195,7 +197,7 @@ impl PartialOrd for Held {
 /// assert_eq!(stream.push(input), input.len());
 /// stream.end();
 /// let mut output = Vec::new();
-/// while let Some(result) = faults.next_with_observed(&mut stream, &mut output, &plan,
+/// while let Some(result) = faults.next_with_observed(&entropy, &mut stream, &mut output, &plan,
 ///     write_bounded, log.observer(0, Direction::ClientToServer)) {
 ///     result?;
 /// }
@@ -206,7 +208,6 @@ impl PartialOrd for Held {
 /// ```
 #[derive(Clone, Debug)]
 pub struct Faults {
-    rng: Lcg,
     byte_at: Option<u64>,
     item_at: Option<u64>,
     output: Interceptor,
@@ -222,9 +223,8 @@ impl Faults {
     /// items, and is clamped to a representable allocation size.
     /// With Forward skips, the stream's buffered bytes must fit `max_output`:
     /// push at most [`room`](Self::room) bytes before each call.
-    pub fn new(seed: u64, max_output: usize, max_held: usize) -> Self {
+    pub fn new(max_output: usize, max_held: usize) -> Self {
         Self {
-            rng: Lcg::new(seed),
             byte_at: Some(1),
             item_at: Some(1),
             output: Interceptor::new(max_output),
@@ -256,6 +256,7 @@ impl Faults {
     /// and random draws. Retrying is a new plan call. No match copies input.
     pub fn bytes(
         &mut self,
+        entropy: &dyn Entropy,
         plan: &[Rule<ByteFault>],
         input: &[u8],
         out: &mut Vec<u8>,
@@ -264,7 +265,7 @@ impl Faults {
         self.byte_at = call.and_then(|n| n.checked_add(1));
         let fault = plan
             .iter()
-            .find(|rule| self.matches(rule.when, call))
+            .find(|rule| self.matches(entropy, rule.when, call))
             .map(|rule| &rule.fault);
         let start = out.len();
         let result = (|| {
@@ -305,7 +306,8 @@ impl Faults {
                 Some(ByteFault::Replace(bytes)) => self.output.append(bytes, 1, out)?,
                 Some(ByteFault::Corrupt { offset, xor }) => {
                     self.output.append(input, 1, out)?;
-                    let at = offset.unwrap_or_else(|| self.rng.index(input.len()));
+                    let at =
+                        offset.unwrap_or_else(|| entropy.random_below(input.len() as u64) as usize);
                     if let Some(byte) = out[start..].get_mut(at) {
                         *byte ^= xor;
                     }
@@ -333,6 +335,7 @@ impl Faults {
     #[allow(clippy::type_complexity)]
     pub fn next<D: Decode>(
         &mut self,
+        entropy: &dyn Entropy,
         stream: &mut Stream<D>,
         out: &mut Vec<u8>,
         plan: &[Rule<ItemFault<D::Item>>],
@@ -343,7 +346,7 @@ impl Faults {
         D::Error: Clone,
         D::Item: Wire,
     {
-        self.next_with_observed(stream, out, plan, write_bounded, |_| {})
+        self.next_with_observed(entropy, stream, out, plan, write_bounded, |_| {})
     }
 
     /// Drives one item with caller-owned replacement framing. The writer
@@ -351,6 +354,7 @@ impl Faults {
     #[allow(clippy::type_complexity)]
     pub fn next_with<D: Decode, T, E>(
         &mut self,
+        entropy: &dyn Entropy,
         stream: &mut Stream<D>,
         out: &mut Vec<u8>,
         plan: &[Rule<ItemFault<T>>],
@@ -359,7 +363,7 @@ impl Faults {
     where
         D::Error: Clone,
     {
-        self.next_with_observed(stream, out, plan, write, |_| {})
+        self.next_with_observed(entropy, stream, out, plan, write, |_| {})
     }
 
     /// Drives, faults, and observes one pass using the Interceptor's skip
@@ -378,6 +382,7 @@ impl Faults {
     #[allow(clippy::type_complexity)]
     pub fn next_with_observed<D: Decode, T, E>(
         &mut self,
+        entropy: &dyn Entropy,
         stream: &mut Stream<D>,
         out: &mut Vec<u8>,
         plan: &[Rule<ItemFault<T>>],
@@ -391,7 +396,7 @@ impl Faults {
         output.with_next_observed::<D, _, _, E>(
             stream,
             out,
-            |_, raw, _, out| self.item_with(plan, raw, out, write),
+            |_, raw, _, out| self.item_with(entropy, plan, raw, out, write),
             observe,
         )
     }
@@ -402,11 +407,12 @@ impl Faults {
     /// use [`next`](Self::next). See [`item_with`](Self::item_with) for errors.
     pub fn item<T: Wire>(
         &mut self,
+        entropy: &dyn Entropy,
         plan: &[Rule<ItemFault<T>>],
         raw: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<Option<FaultDelay>, FaultError<T::WriteError>> {
-        self.item_with(plan, raw, out, write_bounded)
+        self.item_with(entropy, plan, raw, out, write_bounded)
     }
 
     /// Applies a plan with caller-owned replacement framing, then releases
@@ -420,6 +426,7 @@ impl Faults {
     /// draws advance on errors. Each successful call advances old windows.
     pub fn item_with<T, E>(
         &mut self,
+        entropy: &dyn Entropy,
         plan: &[Rule<ItemFault<T>>],
         raw: &[u8],
         out: &mut Vec<u8>,
@@ -429,7 +436,7 @@ impl Faults {
         self.item_at = call.and_then(|n| n.checked_add(1));
         let fault = plan
             .iter()
-            .find(|rule| self.matches(rule.when, call))
+            .find(|rule| self.matches(entropy, rule.when, call))
             .map(|rule| &rule.fault);
         let start = out.len();
         let mut pending = None;
@@ -544,7 +551,7 @@ impl Faults {
         Ok(())
     }
 
-    fn matches(&mut self, trigger: Trigger, call: Option<u64>) -> bool {
+    fn matches(&mut self, entropy: &dyn Entropy, trigger: Trigger, call: Option<u64>) -> bool {
         let Some(call) = call else { return false };
         match trigger {
             Trigger::Always => true,
@@ -555,8 +562,7 @@ impl Faults {
             Trigger::Chance { take, out_of } => {
                 out_of != 0
                     && (take >= out_of || {
-                        let draw = (self.rng.next() << 31) | self.rng.next();
-                        draw % u64::from(out_of) < u64::from(take)
+                        entropy.random_below(u64::from(out_of)) < u64::from(take)
                     })
             }
         }
@@ -578,11 +584,12 @@ mod tests {
     #[test]
     fn many_distant_holds_do_not_walk_the_queue_per_call() {
         let count = test_support::rounds(40_000);
-        let mut faults = Faults::new(0, 0, count);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(0));
+        let mut faults = Faults::new(0, count);
         let plan = rule(ItemFault::<modbus::Frame>::Hold { window: u64::MAX });
         let mut out = Vec::new();
         for _ in 0..count {
-            faults.item(&plan, b"", &mut out).unwrap();
+            faults.item(&entropy, &plan, b"", &mut out).unwrap();
         }
         assert_eq!(faults.held_count(), count);
         assert_eq!(faults.held_bytes(), 0);
@@ -593,10 +600,12 @@ mod tests {
 
     #[test]
     fn due_entries_restore_after_partial_release_failure() {
-        let mut faults = Faults::new(0, 3, 4);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(0));
+        let mut faults = Faults::new(3, 4);
         let mut out = Vec::new();
         faults
             .item(
+                &entropy,
                 &rule(ItemFault::<modbus::Frame>::Hold { window: 2 }),
                 b"a",
                 &mut out,
@@ -604,16 +613,23 @@ mod tests {
             .unwrap();
         faults
             .item(
+                &entropy,
                 &rule(ItemFault::<modbus::Frame>::Hold { window: 1 }),
                 b"bb",
                 &mut out,
             )
             .unwrap();
-        assert!(faults.item::<modbus::Frame>(&[], b"c", &mut out).is_err());
+        assert!(
+            faults
+                .item::<modbus::Frame>(&entropy, &[], b"c", &mut out)
+                .is_err()
+        );
         assert_eq!(faults.held_count(), 2);
         assert_eq!(faults.held_bytes(), 3);
         assert!(out.is_empty());
-        faults.item::<modbus::Frame>(&[], b"", &mut out).unwrap();
+        faults
+            .item::<modbus::Frame>(&entropy, &[], b"", &mut out)
+            .unwrap();
         assert_eq!(out, b"abb");
         assert_eq!(faults.held_count(), 0);
     }
@@ -626,12 +642,13 @@ mod tests {
             delay: None,
             rewrite: Rewrite::Drop,
         });
-        let mut faults = Faults::new(0, 16, 4);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(0));
+        let mut faults = Faults::new(16, 4);
         let mut stream = Stream::new(Frames::<modbus::Frame>::new());
         assert_eq!(stream.push(&input), input.len());
         let mut out = Vec::new();
         assert!(matches!(
-            faults.next(&mut stream, &mut out, &plan),
+            faults.next(&entropy, &mut stream, &mut out, &plan),
             Some(Err(PumpError::Handler(FaultError::Rewrite(
                 RewriteError::Capacity {
                     buffered: 48,
@@ -647,7 +664,7 @@ mod tests {
             let room = faults.room(&stream, &out);
             assert!(room > 0);
             accepted += stream.push(&input[accepted..input.len().min(accepted + room)]);
-            while let Some(result) = faults.next(&mut stream, &mut out, &plan) {
+            while let Some(result) = faults.next(&entropy, &mut stream, &mut out, &plan) {
                 result.unwrap();
                 items += 1;
             }
@@ -658,12 +675,13 @@ mod tests {
 
     #[test]
     fn held_byte_error_reports_configured_limit() {
-        let mut faults = Faults::new(0, 4, 4);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(0));
+        let mut faults = Faults::new(4, 4);
         let plan = rule(ItemFault::<modbus::Frame>::Hold { window: 2 });
         let mut out = Vec::new();
-        faults.item(&plan, b"abc", &mut out).unwrap();
+        faults.item(&entropy, &plan, b"abc", &mut out).unwrap();
         assert_eq!(
-            faults.item(&plan, b"de", &mut out),
+            faults.item(&entropy, &plan, b"de", &mut out),
             Err(FaultError::Rewrite(RewriteError::TooLong { limit: 4 }))
         );
         assert_eq!(faults.held_bytes(), 3);
@@ -722,11 +740,13 @@ mod tests {
             (ByteFault::Replace(b"z".to_vec()), b"z", None),
             (ByteFault::Drop(Some(usize::MAX..usize::MAX)), b"abc", None),
         ];
-        let mut faults = Faults::new(7, 16, 2);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(7));
+        let mut faults = Faults::new(16, 2);
         for (fault, expected, at) in cases {
             let mut out = vec![42];
             let marker = faults
                 .bytes(
+                    &entropy,
                     &[Rule {
                         when: Trigger::Always,
                         fault,
@@ -753,11 +773,12 @@ mod tests {
             },
         }];
         let mut out = vec![42];
-        assert!(faults.bytes(&plan, b"abc", &mut out).is_err());
+        assert!(faults.bytes(&entropy, &plan, b"abc", &mut out).is_err());
         assert_eq!(out, [42]);
-        faults.bytes(&plan, b"", &mut out).unwrap();
+        faults.bytes(&entropy, &plan, b"", &mut out).unwrap();
         // Prefix and range fit, but the trailing bytes exceed the limit.
-        let mut faults = Faults::new(0, 4, 0);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(0));
+        let mut faults = Faults::new(4, 0);
         let plan = [Rule {
             when: Trigger::Always,
             fault: ByteFault::Repeat {
@@ -765,30 +786,35 @@ mod tests {
                 copies: 2,
             },
         }];
-        assert!(faults.bytes(&plan, b"abc", &mut out).is_err());
+        assert!(faults.bytes(&entropy, &plan, b"abc", &mut out).is_err());
         assert_eq!(out, [42]);
     }
 
     #[test]
     fn holds_obey_windows_flush_and_both_queue_bounds() {
-        let mut faults = Faults::new(0, 4, 2);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(0));
+        let mut faults = Faults::new(4, 2);
         let hold = rule(ItemFault::<modbus::Frame>::Hold { window: 2 });
         let mut out = Vec::new();
-        faults.item(&hold, b"a", &mut out).unwrap();
-        faults.item(&hold, b"b", &mut out).unwrap();
+        faults.item(&entropy, &hold, b"a", &mut out).unwrap();
+        faults.item(&entropy, &hold, b"b", &mut out).unwrap();
         assert_eq!((faults.held_count(), faults.held_bytes()), (2, 2));
         assert_eq!(
-            faults.item(&hold, b"", &mut out),
+            faults.item(&entropy, &hold, b"", &mut out),
             Err(FaultError::HeldLimit { limit: 2 })
         );
-        faults.item::<modbus::Frame>(&[], b"c", &mut out).unwrap();
+        faults
+            .item::<modbus::Frame>(&entropy, &[], b"c", &mut out)
+            .unwrap();
         assert_eq!(out, b"ca");
         faults.flush(&mut out).unwrap();
         assert_eq!(out, b"cab");
         faults.flush(&mut out).unwrap();
         assert_eq!((faults.held_count(), faults.held_bytes()), (0, 0));
-        faults.item(&hold, b"abcd", &mut Vec::new()).unwrap();
-        assert!(faults.item(&hold, b"e", &mut Vec::new()).is_err());
+        faults
+            .item(&entropy, &hold, b"abcd", &mut Vec::new())
+            .unwrap();
+        assert!(faults.item(&entropy, &hold, b"e", &mut Vec::new()).is_err());
         assert_eq!(faults.held_bytes(), 4);
         assert!(faults.flush(&mut out).is_err());
         assert_eq!(out, b"cab");
@@ -799,6 +825,7 @@ mod tests {
         out.clear();
         faults
             .item(
+                &entropy,
                 &rule(ItemFault::<modbus::Frame>::Hold { window: 0 }),
                 b"z",
                 &mut out,
@@ -806,32 +833,42 @@ mod tests {
             .unwrap();
         assert_eq!(out, b"z");
         assert_eq!(faults.held_count(), 0);
-        let mut faults = Faults::new(0, 0, 1);
-        faults.item(&hold, b"", &mut Vec::new()).unwrap();
-        assert!(faults.item(&hold, b"", &mut Vec::new()).is_err());
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(0));
+        let mut faults = Faults::new(0, 1);
+        faults.item(&entropy, &hold, b"", &mut Vec::new()).unwrap();
+        assert!(faults.item(&entropy, &hold, b"", &mut Vec::new()).is_err());
         faults.flush(&mut Vec::new()).unwrap();
     }
 
     #[test]
     fn due_release_failure_preserves_queue_and_output() {
-        let mut faults = Faults::new(0, 3, 2);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(0));
+        let mut faults = Faults::new(3, 2);
         let hold = rule(ItemFault::<modbus::Frame>::Hold { window: 1 });
         let mut out = vec![42];
-        faults.item(&hold, b"ab", &mut out).unwrap();
-        assert!(faults.item::<modbus::Frame>(&[], b"c", &mut out).is_err());
+        faults.item(&entropy, &hold, b"ab", &mut out).unwrap();
+        assert!(
+            faults
+                .item::<modbus::Frame>(&entropy, &[], b"c", &mut out)
+                .is_err()
+        );
         assert_eq!(out, [42]);
         assert_eq!(faults.held_count(), 1);
         out.clear();
-        faults.item::<modbus::Frame>(&[], b"c", &mut out).unwrap();
+        faults
+            .item::<modbus::Frame>(&entropy, &[], b"c", &mut out)
+            .unwrap();
         assert_eq!(out, b"cab");
     }
 
     #[test]
     fn shorter_windows_release_without_waiting_for_older_holds() {
-        let mut faults = Faults::new(0, 16, 4);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(0));
+        let mut faults = Faults::new(16, 4);
         let mut out = Vec::new();
         faults
             .item(
+                &entropy,
                 &rule(ItemFault::<modbus::Frame>::Hold { window: u64::MAX }),
                 b"a",
                 &mut out,
@@ -839,6 +876,7 @@ mod tests {
             .unwrap();
         faults
             .item(
+                &entropy,
                 &rule(ItemFault::<modbus::Frame>::Hold { window: 1 }),
                 b"b",
                 &mut out,
@@ -846,6 +884,7 @@ mod tests {
             .unwrap();
         faults
             .item(
+                &entropy,
                 &rule(ItemFault::<modbus::Frame>::Action {
                     delay: None,
                     rewrite: Rewrite::Drop,
@@ -861,7 +900,8 @@ mod tests {
 
     #[test]
     fn actions_combine_delay_with_raw_and_strict_replacements() {
-        let mut faults = Faults::new(0, 64, 2);
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(0));
+        let mut faults = Faults::new(64, 2);
         let duration = Duration::from_millis(1);
         let delay = Some(duration);
         let mut out = vec![42];
@@ -875,7 +915,7 @@ mod tests {
             rewrite: Rewrite::Replace(vec![frame.clone()]),
         });
         assert_eq!(
-            faults.item(&plan, b"original", &mut out).unwrap(),
+            faults.item(&entropy, &plan, b"original", &mut out).unwrap(),
             Some(FaultDelay { at: 1, duration })
         );
         assert_eq!(
@@ -890,6 +930,7 @@ mod tests {
         assert!(
             faults
                 .item(
+                    &entropy,
                     &rule(ItemFault::Action {
                         delay,
                         rewrite: Rewrite::Replace(vec![invalid])
@@ -905,26 +946,35 @@ mod tests {
             rewrite: Rewrite::Raw(b"raw".to_vec()),
         });
         let start = out.len();
-        assert_eq!(faults.item(&raw, b"", &mut out).unwrap().unwrap().at, start);
+        assert_eq!(
+            faults
+                .item(&entropy, &raw, b"", &mut out)
+                .unwrap()
+                .unwrap()
+                .at,
+            start
+        );
         assert_eq!(&out[start..], b"raw");
     }
 
     #[test]
     fn triggers_cover_windows_wide_chance_and_counter_exhaustion() {
-        let mut faults = Faults::new(27, 16, 0);
-        assert!(!faults.matches(Trigger::After(2), Some(1)));
-        assert!(faults.matches(Trigger::After(2), Some(2)));
-        assert!(faults.matches(Trigger::After(2), Some(3)));
+        let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(27));
+        let mut faults = Faults::new(16, 0);
+        assert!(!faults.matches(&entropy, Trigger::After(2), Some(1)));
+        assert!(faults.matches(&entropy, Trigger::After(2), Some(2)));
+        assert!(faults.matches(&entropy, Trigger::After(2), Some(3)));
         for (call, expected) in [(1, false), (2, true), (3, true), (4, false)] {
             assert_eq!(
-                faults.matches(Trigger::Window { start: 2, end: 3 }, Some(call)),
+                faults.matches(&entropy, Trigger::Window { start: 2, end: 3 }, Some(call)),
                 expected
             );
         }
-        assert!(!faults.matches(Trigger::Window { start: 3, end: 2 }, Some(3)));
-        assert!(!faults.matches(Trigger::Every(0), Some(1)));
-        assert!(!faults.matches(Trigger::At(0), Some(1)));
+        assert!(!faults.matches(&entropy, Trigger::Window { start: 3, end: 2 }, Some(3)));
+        assert!(!faults.matches(&entropy, Trigger::Every(0), Some(1)));
+        assert!(!faults.matches(&entropy, Trigger::At(0), Some(1)));
         assert!(!faults.matches(
+            &entropy,
             Trigger::Chance {
                 take: u32::MAX,
                 out_of: 0
@@ -932,10 +982,12 @@ mod tests {
             Some(1)
         ));
         let draw = |seed| {
-            let mut faults = Faults::new(seed, 16, 0);
+            let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(seed));
+            let mut faults = Faults::new(16, 0);
             (0..1000)
                 .map(|_| {
                     faults.matches(
+                        &entropy,
                         Trigger::Chance {
                             take: 1 << 31,
                             out_of: u32::MAX,
@@ -955,8 +1007,8 @@ mod tests {
             rewrite: Rewrite::Drop,
         });
         let mut out = Vec::new();
-        faults.item(&plan, b"a", &mut out).unwrap();
-        faults.item(&plan, b"b", &mut out).unwrap();
+        faults.item(&entropy, &plan, b"a", &mut out).unwrap();
+        faults.item(&entropy, &plan, b"b", &mut out).unwrap();
         assert_eq!(out, b"b");
     }
 }

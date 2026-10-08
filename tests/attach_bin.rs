@@ -196,47 +196,51 @@ fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
     let dir2 = dir.clone();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let out = slot.clone();
-    fictionet::block_on(fictionet::run(move |fcx| async move {
-        let mut abc = attachments.get(&fcx, "abc").await?;
-        let mtu = abc.mtu();
-        // Send echo requests until one is answered: the device may come up
-        // a moment after accept is sent.
-        let mut reply = None;
-        for seq in 0..50u16 {
-            abc.send(Packet(echo_request(seq)));
-            fcx.sleep(fictionet::time::ms(100)).await?;
-            // Drain what came back.
-            loop {
-                let next = futures_poll_once(&fcx, &mut abc);
-                match next {
-                    Some(Ok(Packet(p))) if p.len() >= 28 && p[9] == 1 && p[20] == 0 => {
-                        reply = Some(p)
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let mut abc = attachments.get(&fcx, "abc").await?;
+            let mtu = abc.mtu();
+            // Send echo requests until one is answered: the device may come up
+            // a moment after accept is sent.
+            let mut reply = None;
+            for seq in 0..50u16 {
+                abc.send(Packet(echo_request(seq)));
+                fcx.sleep(fictionet::time::ms(100)).await?;
+                // Drain what came back.
+                loop {
+                    let next = futures_poll_once(&fcx, &mut abc);
+                    match next {
+                        Some(Ok(Packet(p))) if p.len() >= 28 && p[9] == 1 && p[20] == 0 => {
+                            reply = Some(p)
+                        }
+                        Some(Ok(_)) => continue,
+                        Some(Err(RecvError::Closed)) => {
+                            return Err(fictionet::Error::msg("attach closed"));
+                        }
+                        Some(Err(RecvError::Cancelled)) => {
+                            return Err(fictionet::Error::msg("cancelled"));
+                        }
+                        None => break,
                     }
-                    Some(Ok(_)) => continue,
-                    Some(Err(RecvError::Closed)) => {
-                        return Err(fictionet::Error::msg("attach closed"));
-                    }
-                    Some(Err(RecvError::Cancelled)) => {
-                        return Err(fictionet::Error::msg("cancelled"));
-                    }
-                    None => break,
+                }
+                if reply.is_some() {
+                    break;
                 }
             }
-            if reply.is_some() {
-                break;
-            }
-        }
-        let reply = reply
-            .ok_or_else(|| fictionet::Error::msg("the sandbox never answered the echo request"))?;
+            let reply = reply.ok_or_else(|| {
+                fictionet::Error::msg("the sandbox never answered the echo request")
+            })?;
 
-        // A second attach under the same name is refused. Waiting for it
-        // blocks this thread, which is fine: the listen helper thread
-        // does the handshake.
-        let second = spawn_attach(&dir2, &sock2, "abc", "resolv-second").wait_with_output()?;
-        drop(abc);
-        *out.lock().unwrap() = Some((mtu, reply, second));
-        Ok(())
-    }))
+            // A second attach under the same name is refused. Waiting for it
+            // blocks this thread, which is fine: the listen helper thread
+            // does the handshake.
+            let second = spawn_attach(&dir2, &sock2, "abc", "resolv-second").wait_with_output()?;
+            drop(abc);
+            *out.lock().unwrap() = Some((mtu, reply, second));
+            Ok(())
+        },
+    ))
     .unwrap();
     let (mtu, reply, second) = slot.lock().unwrap().take().unwrap();
     drop(listening);
@@ -336,17 +340,20 @@ fn resolv_conf_flag_picks_the_file_and_a_failed_write_names_it() {
     let failed = attach("bad", bad).wait_with_output().unwrap();
 
     let written = custom.clone();
-    fictionet::block_on(fictionet::run(move |fcx| async move {
-        let abc = attachments.get(&fcx, "good").await?;
-        for _ in 0..100 {
-            if written.exists() {
-                break;
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let abc = attachments.get(&fcx, "good").await?;
+            for _ in 0..100 {
+                if written.exists() {
+                    break;
+                }
+                fcx.sleep(fictionet::time::ms(50)).await?;
             }
-            fcx.sleep(fictionet::time::ms(50)).await?;
-        }
-        drop(abc);
-        Ok(())
-    }))
+            drop(abc);
+            Ok(())
+        },
+    ))
     .unwrap();
     let out = good.wait_with_output().unwrap();
     drop(listening);
@@ -387,17 +394,20 @@ const V4_ONLY: &str = "--ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
 /// `done` exists (10 s at most), then closes it.
 fn hold_until(attachments: fictionet::Attachments, name: &'static str, done: std::path::PathBuf) {
     let mut attachments = attachments;
-    fictionet::block_on(fictionet::run(move |fcx| async move {
-        let held = attachments.get(&fcx, name).await?;
-        for _ in 0..200 {
-            if done.exists() {
-                break;
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let held = attachments.get(&fcx, name).await?;
+            for _ in 0..200 {
+                if done.exists() {
+                    break;
+                }
+                fcx.sleep(fictionet::time::ms(50)).await?;
             }
-            fcx.sleep(fictionet::time::ms(50)).await?;
-        }
-        drop(held);
-        Ok(())
-    }))
+            drop(held);
+            Ok(())
+        },
+    ))
     .unwrap();
 }
 

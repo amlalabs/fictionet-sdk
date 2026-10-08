@@ -49,7 +49,7 @@
 //!     }
 //! }
 //!
-//! let mut h = Harness::new(Echo, ());
+//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Echo, ());
 //! assert_eq!(h.push(b"hello\nwor")?, b"hello\n");
 //! assert_eq!(h.push(b"ld\nquit\n")?, b"world\n");
 //! assert!(h.closed());
@@ -142,6 +142,7 @@
 //!   tunnel. A decoder that ends ([`Step::End`](fictionet::stdlib::codec::Step::End))
 //!   asks [`Service::on_decoder_end`] which.
 
+use fictionet::{Entropy, Seed, SeededEntropy};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};
@@ -154,8 +155,8 @@ use std::time::Duration;
 
 use fictionet::events::{ConnInfo, Event, Level, Sandbox, Transport, opt};
 use fictionet::stdlib::codec::{
-    Buffer, ByteFault, Decode, Direction, Fail, FaultDelay, Faults, ItemFault, Lcg, Record,
-    Recorder, RewriteError, Rule, Stream, StreamEvent,
+    Buffer, ByteFault, Decode, Direction, Fail, FaultDelay, Faults, ItemFault, Record, Recorder,
+    RewriteError, Rule, Stream, StreamEvent,
 };
 use fictionet::stdlib::tls::{self, HandshakeError, ServerConfig, TlsConnection};
 use fictionet::stdlib::{Accept, Accepted, Datagram};
@@ -684,10 +685,14 @@ impl Driver<'_> {
         self.now
     }
 
-    /// A random number from the connection's own generator, seeded from
-    /// [`ServeOptions::seed`] and the connection's number.
+    /// The run's entropy source, or the standalone harness's seeded source.
+    pub fn entropy(&self) -> &dyn Entropy {
+        self.s.entropy.as_ref()
+    }
+
+    /// A random number from the run's stream, or the standalone harness's stream.
     pub fn random_u64(&mut self) -> u64 {
-        self.s.rng.next()
+        self.s.entropy.random_u64()
     }
 
     /// Arms the timer `name` to go off `d` after this call's reply is
@@ -777,7 +782,7 @@ struct Scratch {
     reply: Vec<u8>,
     events: Vec<Event>,
     datagrams: Vec<(SocketAddr, Vec<u8>)>,
-    rng: Lcg,
+    entropy: Arc<dyn Entropy>,
     timers: Vec<(Timer, Option<Duration>)>,
     ordered: Vec<Box<dyn Pending>>,
     keyed: Vec<(u64, Option<Box<dyn Pending>>)>,
@@ -787,12 +792,12 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(seed: u64) -> Scratch {
+    fn new(entropy: Arc<dyn Entropy>) -> Scratch {
         Scratch {
             reply: Vec::new(),
             events: Vec::new(),
             datagrams: Vec::new(),
-            rng: Lcg::new(seed),
+            entropy,
             timers: Vec::new(),
             ordered: Vec::new(),
             keyed: Vec::new(),
@@ -887,16 +892,6 @@ impl Drop for PanicNote {
             let _ = writeln!(std::io::stderr(), "fictionet: {self}");
         }
     }
-}
-
-/// A connection's seed: `seed` mixed with its number (SplitMix64), so
-/// connections draw different numbers and a run with the same connections
-/// repeats.
-pub fn conn_seed(seed: u64, id: u64) -> u64 {
-    let mut z = seed ^ id.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
 }
 
 // ---------------------------------------------------------------------------
@@ -994,7 +989,7 @@ impl Transcript {
 }
 
 /// A fault plan for [`Faults`]: byte rules for each direction and item
-/// rules for the client's items, with a seed.
+/// rules for the client's items. Decisions draw from the driver's entropy source.
 ///
 /// Item rules run on the client's decoded items before the service sees
 /// them, through a second decoder: a replacement is raw bytes the service
@@ -1002,9 +997,6 @@ impl Transcript {
 /// bytes after the delay's offset.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Plan {
-    /// The seed. Each connection seeds its own generator with this and its
-    /// connection number, so a run with the same connections repeats.
-    pub seed: u64,
     /// Rules for each chunk read from the client.
     pub inbound: Vec<Rule<ByteFault>>,
     /// Rules for each chunk written to the client.
@@ -1040,13 +1032,9 @@ impl FaultPlan {
         *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(plan);
     }
 
-    /// Removes every rule, keeping the seed.
+    /// Removes every rule.
     pub fn clear(&self) {
-        let seed = self.get().seed;
-        self.set(Plan {
-            seed,
-            ..Plan::default()
-        });
+        self.set(Plan::default());
     }
 
     /// The rules now.
@@ -1096,9 +1084,6 @@ pub struct ServeOptions {
     pub read_buffer: usize,
     /// The bytes each connection's holdings are charged to. Default none.
     pub budget: Option<Budget>,
-    /// The seed every connection's randomness ([`Driver::random_u64`])
-    /// is drawn from, mixed with its number ([`conn_seed`]). Default 0.
-    pub seed: u64,
     /// Names the sandbox each datagram came from, in its [`ConnInfo`].
     /// [`Net`](fictionet::stdlib::net::Net) sets it; a connection's sandbox is
     /// given with its `ConnInfo` instead.
@@ -1119,7 +1104,6 @@ impl Default for ServeOptions {
             connection_events: true,
             read_buffer: 0,
             budget: None,
-            seed: 0,
             sandbox: None,
         }
     }
@@ -1137,7 +1121,6 @@ impl std::fmt::Debug for ServeOptions {
             .field("starttls", &self.starttls.is_some())
             .field("connection_events", &self.connection_events)
             .field("budget", &self.budget)
-            .field("seed", &self.seed)
             .finish()
     }
 }
@@ -1211,11 +1194,6 @@ impl ServeOptions {
             budget: Some(budget),
             ..self
         }
-    }
-
-    /// Sets the seed.
-    pub fn seed(self, seed: u64) -> ServeOptions {
-        ServeOptions { seed, ..self }
     }
 
     /// Turns `conn.open` and `conn.close` events on or off.
@@ -1403,12 +1381,11 @@ impl<D: Decode> ConnFaults<D>
 where
     D::Error: Clone,
 {
-    fn new(plan: &FaultPlan, id: u64, decoder: D) -> ConnFaults<D> {
-        let seed = conn_seed(plan.get().seed, id);
+    fn new(plan: &FaultPlan, decoder: D) -> ConnFaults<D> {
         ConnFaults {
             plan: plan.clone(),
-            inbound: Faults::new(seed, FAULT_OUTPUT, FAULT_HELD),
-            outbound: Faults::new(seed ^ 1, FAULT_OUTPUT, FAULT_HELD),
+            inbound: Faults::new(FAULT_OUTPUT, FAULT_HELD),
+            outbound: Faults::new(FAULT_OUTPUT, FAULT_HELD),
             front: Some(Stream::new(decoder)),
             stopped: None,
         }
@@ -1416,7 +1393,13 @@ where
 
     /// Runs the byte rules for the client's chunk, then the item rules,
     /// and adds what comes out to `queue`.
-    fn inbound(&mut self, chunk: &[u8], eof: bool, queue: &mut VecDeque<Segment>) {
+    fn inbound(
+        &mut self,
+        entropy: &dyn Entropy,
+        chunk: &[u8],
+        eof: bool,
+        queue: &mut VecDeque<Segment>,
+    ) {
         let plan = self.plan.get();
         let mut pieces: Vec<Segment> = Vec::new();
         if chunk.is_empty() {
@@ -1424,7 +1407,7 @@ where
             pieces.push(Segment::Bytes(chunk.to_vec(), 0));
         } else {
             let mut out = Vec::new();
-            match self.inbound.bytes(&plan.inbound, chunk, &mut out) {
+            match self.inbound.bytes(entropy, &plan.inbound, chunk, &mut out) {
                 Ok(Some(FaultDelay { at, duration })) => {
                     let at = at.min(out.len());
                     let rest = out.split_off(at);
@@ -1438,17 +1421,24 @@ where
         }
         for piece in pieces {
             match piece {
-                Segment::Bytes(bytes, _) => self.items(&plan, &bytes, false, queue),
+                Segment::Bytes(bytes, _) => self.items(entropy, &plan, &bytes, false, queue),
                 wait => queue.push_back(wait),
             }
         }
         if eof {
-            self.items(&plan, &[], true, queue);
+            self.items(entropy, &plan, &[], true, queue);
         }
     }
 
     /// Runs the item rules over `bytes` through the front decoder.
-    fn items(&mut self, plan: &Plan, bytes: &[u8], eof: bool, queue: &mut VecDeque<Segment>) {
+    fn items(
+        &mut self,
+        entropy: &dyn Entropy,
+        plan: &Plan,
+        bytes: &[u8],
+        eof: bool,
+        queue: &mut VecDeque<Segment>,
+    ) {
         let Some(front) = self.front.as_mut() else {
             if !bytes.is_empty() {
                 queue.push_back(Segment::Bytes(bytes.to_vec(), 0));
@@ -1465,9 +1455,9 @@ where
                 front.end();
             }
             let mut moved = n > 0;
-            while let Some(result) = self
-                .inbound
-                .next_with(front, &mut out, &plan.items, write_raw)
+            while let Some(result) =
+                self.inbound
+                    .next_with(entropy, front, &mut out, &plan.items, write_raw)
             {
                 moved = true;
                 match result {
@@ -1541,13 +1531,16 @@ where
 
     /// Runs the outbound byte rules over one chunk: the bytes to write and
     /// where to wait.
-    fn outbound(&mut self, chunk: Vec<u8>) -> (Vec<u8>, Option<FaultDelay>) {
+    fn outbound(&mut self, entropy: &dyn Entropy, chunk: Vec<u8>) -> (Vec<u8>, Option<FaultDelay>) {
         let plan = self.plan.get();
         if plan.outbound.is_empty() {
             return (chunk, None);
         }
         let mut out = Vec::new();
-        match self.outbound.bytes(&plan.outbound, &chunk, &mut out) {
+        match self
+            .outbound
+            .bytes(entropy, &plan.outbound, &chunk, &mut out)
+        {
             Ok(delay) => (out, delay),
             Err(_) => (chunk, None),
         }
@@ -1657,14 +1650,14 @@ where
 {
     fn new(
         fcx: Option<Cx>,
+        entropy: Arc<dyn Entropy>,
         service: &S,
         info: ConnInfo,
         opts: &ServeOptions,
         wake: Option<WakeHandle>,
         now: Instant,
     ) -> Core<S> {
-        let id = info.id.unwrap_or(0);
-        let mut s = Scratch::new(conn_seed(opts.seed, id));
+        let mut s = Scratch::new(entropy);
         if let Some(w) = wake {
             s.wake = w;
         }
@@ -1675,7 +1668,7 @@ where
             faults: opts
                 .faults
                 .as_ref()
-                .map(|plan| ConnFaults::new(plan, id, service.decoder())),
+                .map(|plan| ConnFaults::new(plan, service.decoder())),
             queue: VecDeque::new(),
             record: opts.record.clone(),
             s,
@@ -1783,7 +1776,7 @@ where
         self.idle_from = now;
         match &mut self.faults {
             Some(f) => {
-                f.inbound(bytes, false, &mut self.queue);
+                f.inbound(self.s.entropy.as_ref(), bytes, false, &mut self.queue);
                 self.s.events.extend(f.stopped());
             }
             None if self.queue.is_empty() => {
@@ -1801,7 +1794,7 @@ where
     fn input_eof(&mut self) {
         self.eof = true;
         if let Some(f) = &mut self.faults {
-            f.inbound(&[], true, &mut self.queue);
+            f.inbound(self.s.entropy.as_ref(), &[], true, &mut self.queue);
             self.s.events.extend(f.stopped());
         }
     }
@@ -1860,7 +1853,7 @@ where
         }
         let credit = work.map(|id| (id, bytes.len() as u64));
         let (bytes, delay) = match &mut self.faults {
-            Some(f) => f.outbound(bytes),
+            Some(f) => f.outbound(self.s.entropy.as_ref(), bytes),
             None => (bytes, None),
         };
         match delay {
@@ -2510,6 +2503,7 @@ where
     let _note = PanicNote::new(std::any::type_name::<S>(), &info);
     let mut core: Core<S> = Core::new(
         Some(fcx.clone()),
+        Arc::new(fcx.clone()),
         service,
         info,
         opts,
@@ -2957,7 +2951,7 @@ where
         ..ConnInfo::default()
     };
     let _note = PanicNote::new(std::any::type_name::<S>(), &base);
-    let mut s = Scratch::new(conn_seed(opts.seed, u64::from(local.port())));
+    let mut s = Scratch::new(Arc::new(fcx.clone()));
     let mut timers: Vec<(Timer, Instant)> = Vec::new();
     let wake = s.wake.clone();
     // One call, then its datagrams and events. The reply stays for the
@@ -3183,8 +3177,8 @@ impl Wake for Flag {
 /// get the reply. For unit tests, fuzz targets and contract checks. It
 /// runs the same state machine as [`serve`], so timers, wakes, deferred
 /// work, upgrades and ends behave as they do over a connection. The clock
-/// stands still until [`advance`](Self::advance) moves it; inbound fault
-/// delays take no time.
+/// stands still until [`advance`](Self::advance) moves it, unless bound
+/// to a `Cx`, whose clock it reads instead; inbound fault delays take no time.
 ///
 /// Deferred work is polled until it waits on something other than
 /// itself; [`poll`](Self::poll) polls it again. Work that needs a [`Cx`]
@@ -3213,20 +3207,29 @@ where
     <S::Decoder as Decode>::Error: Clone,
 {
     /// A connection to `service`, with `state`, at time zero, numbered 1,
-    /// with no idle limit.
-    pub fn new(service: S, state: S::State) -> Harness<S> {
-        Harness::with_options(service, state, ServeOptions::default().idle(None))
+    /// with no idle limit and a standalone stream initialized by `seed`.
+    pub fn new(seed: Seed, service: S, state: S::State) -> Harness<S> {
+        Harness::with_options(seed, service, state, ServeOptions::default().idle(None))
     }
 
-    /// The same with `opts`: an idle limit, a fault plan, a budget, a
-    /// seed. TLS and the connection cap are not used, and events are kept
-    /// in the harness ([`Harness::events`]), not recorded.
-    pub fn with_options(service: S, state: S::State, opts: ServeOptions) -> Harness<S> {
+    /// The same with `opts`: an idle limit, a fault plan and a budget.
+    /// The standalone entropy stream starts from `seed`. TLS and the
+    /// connection cap are not used, and events are kept in the harness
+    /// ([`Harness::events`]), not recorded.
+    pub fn with_options(seed: Seed, service: S, state: S::State, opts: ServeOptions) -> Harness<S> {
         let info = ConnInfo {
             id: Some(1),
             ..ConnInfo::default()
         };
-        let core = Core::new(None, &service, info, &opts, None, Instant::ZERO);
+        let core = Core::new(
+            None,
+            Arc::new(SeededEntropy::new(seed)),
+            &service,
+            info,
+            &opts,
+            None,
+            Instant::ZERO,
+        );
         Harness {
             service,
             state,
@@ -3247,15 +3250,20 @@ where
         self
     }
 
-    /// Gives deferred work a [`Cx`] ([`PendingDriver::fcx`]), for work that
-    /// sleeps or spawns.
+    /// Binds the clock, entropy and deferred work to `fcx`. Call before
+    /// opening the harness. Manual [`advance`](Self::advance) then panics.
     pub fn with_fcx(mut self, fcx: Cx) -> Harness<S> {
+        assert!(!self.opened, "bind the context before opening the harness");
+        self.now = fcx.now();
+        self.core.idle_from = self.now;
+        self.core.s.entropy = Arc::new(fcx.clone());
         self.core.fcx = Some(fcx);
         self
     }
 
     /// Runs the state machine until it waits.
     fn run(&mut self) -> HarnessResult<S> {
+        self.read_clock();
         let mut reply = Vec::new();
         let flag = Arc::new(Flag(AtomicBool::new(false)));
         let waker = Waker::from(flag.clone());
@@ -3323,9 +3331,16 @@ where
         }
     }
 
+    fn read_clock(&mut self) {
+        if let Some(fcx) = &self.core.fcx {
+            self.now = fcx.now();
+        }
+    }
+
     /// Opens the connection, if it is not open yet: what the service
     /// sends first.
     pub fn open(&mut self) -> HarnessResult<S> {
+        self.read_clock();
         if self.opened {
             return Ok(Vec::new());
         }
@@ -3364,8 +3379,12 @@ where
 
     /// Moves the clock by `d`. Timers that come due go off, in order, each
     /// at its own time, so a timer set again from `on_timer` counts from
-    /// when it went off; returns their replies.
+    /// when it went off; returns their replies. Panics when bound to a `Cx`.
     pub fn advance(&mut self, d: Duration) -> HarnessResult<S> {
+        assert!(
+            self.core.fcx.is_none(),
+            "a context-bound harness uses the run clock"
+        );
         let until = self.now + d;
         let mut reply = Vec::new();
         loop {
@@ -3408,11 +3427,20 @@ where
         if self.upgraded.take().is_none() {
             return Ok(Vec::new());
         }
+        self.read_clock();
         self.reported = false;
         let unread = self.core.unread();
         let wake = self.core.s.wake.clone();
         let fcx = self.core.fcx.take();
-        let mut core = Core::new(fcx, &self.service, conn, &self.opts, Some(wake), self.now);
+        let mut core = Core::new(
+            fcx,
+            self.core.s.entropy.clone(),
+            &self.service,
+            conn,
+            &self.opts,
+            Some(wake),
+            self.now,
+        );
         core.s.bytes_in = self.core.s.bytes_in;
         if !unread.is_empty() {
             core.queue.push_back(Segment::Bytes(unread, 0));

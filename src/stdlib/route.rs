@@ -1022,76 +1022,79 @@ mod tests {
     /// says so, and the sender hears "time exceeded".
     #[test]
     fn a_routing_loop_ends_when_the_ttl_runs_out() {
-        fictionet::block_on(fictionet::run(|fcx| async move {
-            let (r1_s4, mut s4) = fictionet::pair();
-            let (r1_s6, mut s6) = fictionet::pair();
-            let (r1_r2, r2_r1) = fictionet::pair();
-            let (r1_r2_6, r2_r1_6) = fictionet::pair();
-            let r1 = router(
-                &fcx,
-                vec![
-                    (
-                        "10.0.0.2/32".parse()?,
-                        Box::new(r1_s4) as Box<dyn Interface>,
-                    ),
-                    ("fd00::2/128".parse()?, Box::new(r1_s6)),
-                    ("0.0.0.0/0".parse()?, Box::new(r1_r2)),
-                    ("::/0".parse()?, Box::new(r1_r2_6)),
-                ],
-            );
-            r1.address("10.0.0.1".parse()?);
-            let r2 = router(
-                &fcx,
-                vec![
-                    ("0.0.0.0/0".parse()?, Box::new(r2_r1) as Box<dyn Interface>),
-                    ("::/0".parse()?, Box::new(r2_r1_6)),
-                ],
-            );
-            r2.address("fd00:1::1".parse()?);
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            |fcx| async move {
+                let (r1_s4, mut s4) = fictionet::pair();
+                let (r1_s6, mut s6) = fictionet::pair();
+                let (r1_r2, r2_r1) = fictionet::pair();
+                let (r1_r2_6, r2_r1_6) = fictionet::pair();
+                let r1 = router(
+                    &fcx,
+                    vec![
+                        (
+                            "10.0.0.2/32".parse()?,
+                            Box::new(r1_s4) as Box<dyn Interface>,
+                        ),
+                        ("fd00::2/128".parse()?, Box::new(r1_s6)),
+                        ("0.0.0.0/0".parse()?, Box::new(r1_r2)),
+                        ("::/0".parse()?, Box::new(r1_r2_6)),
+                    ],
+                );
+                r1.address("10.0.0.1".parse()?);
+                let r2 = router(
+                    &fcx,
+                    vec![
+                        ("0.0.0.0/0".parse()?, Box::new(r2_r1) as Box<dyn Interface>),
+                        ("::/0".parse()?, Box::new(r2_r1_6)),
+                    ],
+                );
+                r2.address("fd00:1::1".parse()?);
 
-            // TTL 5: r1 sends it on with 4, r2 with 3, r1 with 2, r2 with
-            // 1, and r1 drops it.
-            s4.send(ip("10.0.0.2", "192.0.2.1", 5));
-            // Hop limit 4: r1, r2, r1, and r2 drops it.
-            s6.send(ip("fd00::2", "2001:db8::1", 4));
-            fcx.sleep(Duration::from_millis(100)).await?;
+                // TTL 5: r1 sends it on with 4, r2 with 3, r1 with 2, r2 with
+                // 1, and r1 drops it.
+                s4.send(ip("10.0.0.2", "192.0.2.1", 5));
+                // Hop limit 4: r1, r2, r1, and r2 drops it.
+                s6.send(ip("fd00::2", "2001:db8::1", 4));
+                fcx.sleep(Duration::from_millis(100)).await?;
 
-            let answer = ready(&fcx, &mut s4).expect("a time exceeded answer");
-            assert_eq!(ip::source(&answer.0), Some("10.0.0.1".parse()?));
-            assert_eq!(
-                (answer.0[9], answer.0[20], answer.0[21]),
-                (ip::protocol::ICMP, 11, 0)
-            );
-            assert!(ready(&fcx, &mut s4).is_none());
-            let answer = ready(&fcx, &mut s6).expect("a time exceeded answer");
-            assert_eq!(ip::source(&answer.0), Some("fd00:1::1".parse()?));
-            assert_eq!(
-                (answer.0[6], answer.0[40], answer.0[41]),
-                (ip::protocol::ICMPV6, 3, 0)
-            );
-            // r1 forwarded r2's answer: one hop.
-            assert_eq!(answer.0[7], 63);
+                let answer = ready(&fcx, &mut s4).expect("a time exceeded answer");
+                assert_eq!(ip::source(&answer.0), Some("10.0.0.1".parse()?));
+                assert_eq!(
+                    (answer.0[9], answer.0[20], answer.0[21]),
+                    (ip::protocol::ICMP, 11, 0)
+                );
+                assert!(ready(&fcx, &mut s4).is_none());
+                let answer = ready(&fcx, &mut s6).expect("a time exceeded answer");
+                assert_eq!(ip::source(&answer.0), Some("fd00:1::1".parse()?));
+                assert_eq!(
+                    (answer.0[6], answer.0[40], answer.0[41]),
+                    (ip::protocol::ICMPV6, 3, 0)
+                );
+                // r1 forwarded r2's answer: one hop.
+                assert_eq!(answer.0[7], 63);
 
-            let drops: Vec<String> = fcx
-                .events()
-                .of("router", "drop")
-                .into_iter()
-                .map(|e| e.summary)
-                .collect();
-            assert_eq!(drops.len(), 2, "{drops:?}");
-            assert!(
-                drops
-                    .iter()
-                    .any(|d| d == "10.0.0.2 → 192.0.2.1: its TTL ran out"),
-                "{drops:?}"
-            );
-            assert!(
-                drops.iter().any(|d| d.ends_with("its hop limit ran out")),
-                "{drops:?}"
-            );
-            fcx.cancel();
-            Ok(())
-        }))
+                let drops: Vec<String> = fcx
+                    .events()
+                    .of("router", "drop")
+                    .into_iter()
+                    .map(|e| e.summary)
+                    .collect();
+                assert_eq!(drops.len(), 2, "{drops:?}");
+                assert!(
+                    drops
+                        .iter()
+                        .any(|d| d == "10.0.0.2 → 192.0.2.1: its TTL ran out"),
+                    "{drops:?}"
+                );
+                assert!(
+                    drops.iter().any(|d| d.ends_with("its hop limit ran out")),
+                    "{drops:?}"
+                );
+                fcx.cancel();
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 
@@ -1099,36 +1102,39 @@ mod tests {
     /// holds. The router's own packets keep theirs.
     #[test]
     fn forwarding_lowers_the_ttl() {
-        fictionet::block_on(fictionet::run(|fcx| async move {
-            let (ra, mut a) = fictionet::pair();
-            let (rb, mut b) = fictionet::pair();
-            let (rg, mut g) = fictionet::pair();
-            let r = router(
-                &fcx,
-                vec![
-                    ("10.0.0.2/32".parse()?, Box::new(ra) as Box<dyn Interface>),
-                    ("10.0.0.3/32".parse()?, Box::new(rb)),
-                    ("10.0.0.1/32".parse()?, Box::new(rg)),
-                ],
-            );
-            r.address("10.0.0.1".parse()?);
-            a.send(ip("10.0.0.2", "10.0.0.3", 64));
-            let p = b.recv(&fcx).await?;
-            assert_eq!(p.0[8], 63);
-            assert_eq!(ip::checksum(&p.0[..20]), 0, "the header checksum holds");
-            // An expired packet for the router itself is still delivered.
-            a.send(ip("10.0.0.2", "10.0.0.1", 1));
-            assert_eq!(g.recv(&fcx).await?.0[8], 1);
-            g.send(ip("10.0.0.1", "10.0.0.2", 64));
-            assert_eq!(a.recv(&fcx).await?.0[8], 64);
-            // A private router changes nothing, and forwards even TTL 1.
-            r.keep_ttl();
-            fcx.sleep(Duration::from_millis(1)).await?;
-            a.send(ip("10.0.0.2", "10.0.0.3", 1));
-            assert_eq!(b.recv(&fcx).await?.0[8], 1);
-            fcx.cancel();
-            Ok(())
-        }))
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            |fcx| async move {
+                let (ra, mut a) = fictionet::pair();
+                let (rb, mut b) = fictionet::pair();
+                let (rg, mut g) = fictionet::pair();
+                let r = router(
+                    &fcx,
+                    vec![
+                        ("10.0.0.2/32".parse()?, Box::new(ra) as Box<dyn Interface>),
+                        ("10.0.0.3/32".parse()?, Box::new(rb)),
+                        ("10.0.0.1/32".parse()?, Box::new(rg)),
+                    ],
+                );
+                r.address("10.0.0.1".parse()?);
+                a.send(ip("10.0.0.2", "10.0.0.3", 64));
+                let p = b.recv(&fcx).await?;
+                assert_eq!(p.0[8], 63);
+                assert_eq!(ip::checksum(&p.0[..20]), 0, "the header checksum holds");
+                // An expired packet for the router itself is still delivered.
+                a.send(ip("10.0.0.2", "10.0.0.1", 1));
+                assert_eq!(g.recv(&fcx).await?.0[8], 1);
+                g.send(ip("10.0.0.1", "10.0.0.2", 64));
+                assert_eq!(a.recv(&fcx).await?.0[8], 64);
+                // A private router changes nothing, and forwards even TTL 1.
+                r.keep_ttl();
+                fcx.sleep(Duration::from_millis(1)).await?;
+                a.send(ip("10.0.0.2", "10.0.0.3", 1));
+                assert_eq!(b.recv(&fcx).await?.0[8], 1);
+                fcx.cancel();
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 
@@ -1149,37 +1155,40 @@ mod tests {
             }
         }
 
-        fictionet::block_on(fictionet::run(|fcx| async move {
-            for _ in 0..128 {
-                let sent = Arc::new(Mutex::new(Vec::new()));
-                let mut members = Members::new(|event| event);
-                let mut ports = Ports::new(Vec::new());
-                for n in [40, 10, 30, 20, 50] {
-                    members.join(
-                        &fcx,
-                        &mut ports,
-                        Join::Member(
-                            Ipv4Addr::new(10, 0, 0, n).into(),
-                            Receiver(n, sent.clone()),
-                            None,
-                        ),
-                    );
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            |fcx| async move {
+                for _ in 0..128 {
+                    let sent = Arc::new(Mutex::new(Vec::new()));
+                    let mut members = Members::new(|event| event);
+                    let mut ports = Ports::new(Vec::new());
+                    for n in [40, 10, 30, 20, 50] {
+                        members.join(
+                            &fcx,
+                            &mut ports,
+                            Join::Member(
+                                Ipv4Addr::new(10, 0, 0, n).into(),
+                                Receiver(n, sent.clone()),
+                                None,
+                            ),
+                        );
+                    }
+                    members.join(&fcx, &mut ports, Join::Gateway(Receiver(99, sent.clone())));
+                    for dst in [[255; 4], [10, 0, 0, 255], [224, 0, 0, 1]] {
+                        members.forward(
+                            &fcx,
+                            &mut ports,
+                            "10.0.0.0/24".parse()?,
+                            2,
+                            v4([10, 0, 0, 30], dst),
+                        );
+                        assert_eq!(*lock(&sent), [10, 20, 40, 50]);
+                        lock(&sent).clear();
+                    }
                 }
-                members.join(&fcx, &mut ports, Join::Gateway(Receiver(99, sent.clone())));
-                for dst in [[255; 4], [10, 0, 0, 255], [224, 0, 0, 1]] {
-                    members.forward(
-                        &fcx,
-                        &mut ports,
-                        "10.0.0.0/24".parse()?,
-                        2,
-                        v4([10, 0, 0, 30], dst),
-                    );
-                    assert_eq!(*lock(&sent), [10, 20, 40, 50]);
-                    lock(&sent).clear();
-                }
-            }
-            Ok(())
-        }))
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 
@@ -1239,32 +1248,36 @@ mod tests {
 
     #[test]
     fn member_addresses_are_unicast_in_the_subnet() {
-        fictionet::block_on(fictionet::run(|fcx| async move {
-            let lan = lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
-            for bad in [
-                "192.168.57.1",
-                "192.168.56.255",
-                "255.255.255.255",
-                "224.0.0.252",
-                "0.0.0.0",
-                "fd00::1",
-            ] {
-                let (end, mut far) = fictionet::pair();
-                let err = lan
-                    .add(bad.parse()?, Box::new(end), None)
-                    .unwrap_err()
-                    .to_string();
-                assert!(err.contains(bad), "{bad}: {err}");
-                assert_eq!(
-                    far.recv(&fcx).await,
-                    Err(fictionet::RecvError::Closed),
-                    "{bad}: the interface is dropped"
-                );
-            }
-            let (end, _far) = fictionet::pair();
-            lan.add("192.168.56.0".parse()?, Box::new(end), None)?;
-            Ok(())
-        }))
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            |fcx| async move {
+                let lan =
+                    lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
+                for bad in [
+                    "192.168.57.1",
+                    "192.168.56.255",
+                    "255.255.255.255",
+                    "224.0.0.252",
+                    "0.0.0.0",
+                    "fd00::1",
+                ] {
+                    let (end, mut far) = fictionet::pair();
+                    let err = lan
+                        .add(bad.parse()?, Box::new(end), None)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains(bad), "{bad}: {err}");
+                    assert_eq!(
+                        far.recv(&fcx).await,
+                        Err(fictionet::RecvError::Closed),
+                        "{bad}: the interface is dropped"
+                    );
+                }
+                let (end, _far) = fictionet::pair();
+                lan.add("192.168.56.0".parse()?, Box::new(end), None)?;
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 
@@ -1272,60 +1285,64 @@ mod tests {
     /// each with its reason, with no observer.
     #[test]
     fn drops_and_member_changes_are_recorded() {
-        fictionet::block_on(fictionet::run(|fcx| async move {
-            let lan = lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
-            let (a_lan, mut a) = fictionet::pair();
-            let (b_lan, _b) = fictionet::pair();
-            lan.add("192.168.56.10".parse()?, Box::new(a_lan), None)?;
-            lan.add("192.168.56.11".parse()?, Box::new(b_lan), None)?;
-            assert!(!fcx.observed());
-            a.send(v4([192, 168, 56, 10], [192, 168, 56, 12]));
-            a.send(v4([192, 168, 56, 10], [10, 0, 0, 1]));
-            a.send(v4([192, 168, 56, 10], [192, 168, 56, 10]));
-            a.send(v6("fe80::1".parse()?, "ff02::1:3".parse()?));
-            a.send(Packet(vec![1, 2, 3]));
-            let (b2_lan, b2) = fictionet::pair();
-            lan.add("192.168.56.11".parse()?, Box::new(b2_lan), None)?;
-            fcx.sleep(Duration::from_millis(20)).await?;
-            drop(b2);
-            fcx.sleep(Duration::from_millis(20)).await?;
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            |fcx| async move {
+                let lan =
+                    lan::<Box<dyn Interface>, _>(&fcx, "192.168.56.0/24".parse()?, |event| event);
+                let (a_lan, mut a) = fictionet::pair();
+                let (b_lan, _b) = fictionet::pair();
+                lan.add("192.168.56.10".parse()?, Box::new(a_lan), None)?;
+                lan.add("192.168.56.11".parse()?, Box::new(b_lan), None)?;
+                assert!(!fcx.observed());
+                a.send(v4([192, 168, 56, 10], [192, 168, 56, 12]));
+                a.send(v4([192, 168, 56, 10], [10, 0, 0, 1]));
+                a.send(v4([192, 168, 56, 10], [192, 168, 56, 10]));
+                a.send(v6("fe80::1".parse()?, "ff02::1:3".parse()?));
+                a.send(Packet(vec![1, 2, 3]));
+                let (b2_lan, b2) = fictionet::pair();
+                lan.add("192.168.56.11".parse()?, Box::new(b2_lan), None)?;
+                fcx.sleep(Duration::from_millis(20)).await?;
+                drop(b2);
+                fcx.sleep(Duration::from_millis(20)).await?;
 
-            let events: Vec<(&str, String)> = fcx
-                .events()
-                .all()
-                .into_iter()
-                .filter(|e| e.source == "lan")
-                .map(|e| (e.kind, e.summary))
-                .collect();
-            let drops: Vec<&str> = events
-                .iter()
-                .filter(|(k, _)| *k == "drop")
-                .map(|(_, t)| t.as_str())
-                .collect();
-            let reasons = [
-                "no member at that address",
-                "outside the subnet, and the LAN has no gateway",
-                "sent to its own address",
-                "IPv6 on an IPv4 LAN",
-                "not an IP packet",
-            ];
-            assert_eq!(drops.len(), reasons.len(), "{drops:?}");
-            for (text, why) in drops.iter().zip(reasons) {
-                assert!(text.ends_with(why), "{text:?} should end with {why:?}");
-            }
-            assert!(
-                drops[0].starts_with("192.168.56.10 → 192.168.56.12"),
-                "{:?}",
-                drops[0]
-            );
-            let changes: Vec<_> = events.iter().filter(|(k, _)| *k != "drop").collect();
-            assert_eq!(changes.len(), 2, "{changes:?}");
-            assert_eq!(changes[0].0, "member_replaced");
-            assert!(changes[0].1.starts_with("192.168.56.11"));
-            assert_eq!(changes[1].0, "member_removed");
-            assert!(changes[1].1.starts_with("192.168.56.11"));
-            Ok(())
-        }))
+                let events: Vec<(&str, String)> = fcx
+                    .events()
+                    .all()
+                    .into_iter()
+                    .filter(|e| e.source == "lan")
+                    .map(|e| (e.kind, e.summary))
+                    .collect();
+                let drops: Vec<&str> = events
+                    .iter()
+                    .filter(|(k, _)| *k == "drop")
+                    .map(|(_, t)| t.as_str())
+                    .collect();
+                let reasons = [
+                    "no member at that address",
+                    "outside the subnet, and the LAN has no gateway",
+                    "sent to its own address",
+                    "IPv6 on an IPv4 LAN",
+                    "not an IP packet",
+                ];
+                assert_eq!(drops.len(), reasons.len(), "{drops:?}");
+                for (text, why) in drops.iter().zip(reasons) {
+                    assert!(text.ends_with(why), "{text:?} should end with {why:?}");
+                }
+                assert!(
+                    drops[0].starts_with("192.168.56.10 → 192.168.56.12"),
+                    "{:?}",
+                    drops[0]
+                );
+                let changes: Vec<_> = events.iter().filter(|(k, _)| *k != "drop").collect();
+                assert_eq!(changes.len(), 2, "{changes:?}");
+                assert_eq!(changes[0].0, "member_replaced");
+                assert!(changes[0].1.starts_with("192.168.56.11"));
+                assert_eq!(changes[1].0, "member_removed");
+                assert!(changes[1].1.starts_with("192.168.56.11"));
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 
@@ -1333,33 +1350,36 @@ mod tests {
     /// dropped.
     #[test]
     fn joining_a_stopped_lan_fails() {
-        fictionet::block_on(fictionet::run(|fcx| async move {
-            let kept = Arc::new(Mutex::new(None::<Lan<Box<dyn Interface>>>));
-            let k = kept.clone();
-            let r = fcx
-                .region(|fcx| async move {
-                    *lock(&k) = Some(lan(&fcx, "10.0.0.0/24".parse()?, |event| event));
-                    Err(fictionet::Error::msg("stop"))
-                })
-                .await;
-            assert_eq!(r.unwrap_err().to_string(), "stop");
-            let lan = lock(&kept).take().unwrap();
-            let (end, mut far) = fictionet::pair();
-            assert_eq!(
-                lan.add("10.0.0.2".parse()?, Box::new(end), None)
-                    .unwrap_err()
-                    .to_string(),
-                "the LAN has stopped"
-            );
-            assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed));
-            let (end, mut far) = fictionet::pair();
-            assert_eq!(
-                lan.gateway(Box::new(end)).unwrap_err().to_string(),
-                "the LAN has stopped"
-            );
-            assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed));
-            Ok(())
-        }))
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            |fcx| async move {
+                let kept = Arc::new(Mutex::new(None::<Lan<Box<dyn Interface>>>));
+                let k = kept.clone();
+                let r = fcx
+                    .region(|fcx| async move {
+                        *lock(&k) = Some(lan(&fcx, "10.0.0.0/24".parse()?, |event| event));
+                        Err(fictionet::Error::msg("stop"))
+                    })
+                    .await;
+                assert_eq!(r.unwrap_err().to_string(), "stop");
+                let lan = lock(&kept).take().unwrap();
+                let (end, mut far) = fictionet::pair();
+                assert_eq!(
+                    lan.add("10.0.0.2".parse()?, Box::new(end), None)
+                        .unwrap_err()
+                        .to_string(),
+                    "the LAN has stopped"
+                );
+                assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed));
+                let (end, mut far) = fictionet::pair();
+                assert_eq!(
+                    lan.gateway(Box::new(end)).unwrap_err().to_string(),
+                    "the LAN has stopped"
+                );
+                assert_eq!(far.recv(&fcx).await, Err(fictionet::RecvError::Closed));
+                Ok(())
+            },
+        ))
         .unwrap();
     }
 }

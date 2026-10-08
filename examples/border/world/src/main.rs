@@ -114,26 +114,29 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
     }
 
     let (attacher, attachments) = fictionet::attachments();
-    fictionet::block_on(fictionet::run(move |fcx| async move {
-        let lookups = border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
-        border_world::look_up_all(&fcx, &lookups, &scenario).await?;
-        let _listening = fictionet::listen(
-            fictionet::WorldSocket::UnixSocket(args.socket.clone().into()),
-            attacher,
-        )?;
-        std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
-        if let Some(dir) = args.ready.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&args.ready, scenario.variant.as_str())?;
-        println!(
-            "border world up: variant={} task={}",
-            scenario.variant.as_str(),
-            scenario.task.as_str()
-        );
-        // The network serves every sandbox from here on. The listener lives
-        // as long as the world.
-        std::future::pending::<()>().await;
-        Ok(())
-    }))
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let lookups = border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
+            border_world::look_up_all(&fcx, &lookups, &scenario).await?;
+            let _listening = fictionet::listen(
+                fictionet::WorldSocket::UnixSocket(args.socket.clone().into()),
+                attacher,
+            )?;
+            std::fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
+            if let Some(dir) = args.ready.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&args.ready, scenario.variant.as_str())?;
+            println!(
+                "border world up: variant={} task={}",
+                scenario.variant.as_str(),
+                scenario.task.as_str()
+            );
+            // The network serves every sandbox from here on. The listener lives
+            // as long as the world.
+            std::future::pending::<()>().await;
+            Ok(())
+        },
+    ))
 }

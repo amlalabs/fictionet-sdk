@@ -155,15 +155,22 @@ impl Cx {
         }
     }
 
-    /// A random 64-bit number.
+    /// Fills `out` with random bytes from the run's stream.
     ///
-    /// World code should draw all of its randomness from here, so that every
-    /// random choice in a world goes through one place. Under
-    /// [`run`](crate::run) the numbers come from the operating system
-    /// (`getrandom`). Seeded, repeatable runs are on
-    /// [the roadmap](crate::roadmap#the-lab).
+    /// World code should draw all of its randomness from the [`Cx`], so
+    /// that every random choice in a world goes through one place. The
+    /// stream is ChaCha20, started from the run's [`Seed`](crate::Seed):
+    /// a run with the same seed that makes the same calls in the same order
+    /// gets the same bytes. [`random_u64`](Self::random_u64) and
+    /// [`random_f64`](Self::random_f64) read the same stream.
+    pub fn fill_random(&self, out: &mut [u8]) {
+        crate::Entropy::fill_random(&self.run.environment.entropy, out);
+    }
+
+    /// A random 64-bit number: the next eight bytes of the run's stream
+    /// ([`fill_random`](Self::fill_random)), read as little-endian.
     pub fn random_u64(&self) -> u64 {
-        os_random_u64()
+        crate::Entropy::random_u64(self)
     }
 
     /// A random number from 0 up to, but not including, 1.
@@ -171,7 +178,7 @@ impl Cx {
     /// Use it for choices such as "10% of the time":
     /// `fcx.random_f64() < 0.1`.
     pub fn random_f64(&self) -> f64 {
-        (self.random_u64() >> 11) as f64 / (1u64 << 53) as f64
+        crate::Entropy::random_f64(self)
     }
 
     /// Lets the other ready tasks of the run take a turn, then continues.
@@ -392,7 +399,7 @@ impl Cx {
     /// [`std::future::poll_fn`]: the first one ready gives the output.
     ///
     /// ```
-    /// # fictionet::block_on(fictionet::run(|fcx| async move {
+    /// # fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
     /// use fictionet::RaceError;
     /// let late = fcx.race(Some(fcx.now() + std::time::Duration::from_millis(5)), std::future::pending::<()>()).await;
     /// assert_eq!(late, Err(RaceError::Deadline));
@@ -1044,18 +1051,10 @@ impl Drop for Timer {
     }
 }
 
-/// Eight random bytes from the operating system.
-fn os_random_u64() -> u64 {
-    // Fuzzing runs repeat: the numbers come from the input's seed.
-    #[cfg(fuzzing)]
-    if let Some(n) = crate::fuzzing::next_random() {
-        return n;
+impl crate::Entropy for Cx {
+    fn fill_random(&self, out: &mut [u8]) {
+        Cx::fill_random(self, out);
     }
-    let mut buf = [0u8; 8];
-    if let Err(err) = crate::sys::random_bytes(&mut buf) {
-        panic!("getrandom failed: {err}");
-    }
-    u64::from_ne_bytes(buf)
 }
 
 #[cfg(test)]
@@ -1105,7 +1104,7 @@ mod tests {
             .await?;
             Ok(start.elapsed())
         }
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let mut timer = Timer::default();
             // Moved later: the old deadline does not end the wait.
             let waited = wait(&fcx, &mut timer, ms(10), ms(120)).await?;
@@ -1127,7 +1126,7 @@ mod tests {
     fn a_nested_region_waits_for_its_work_and_keeps_its_error() {
         let ended = Arc::new(AtomicUsize::new(0));
         let e = ended.clone();
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             // Ok: waits for the region's work.
             let e1 = e.clone();
             fcx.region(|fcx| async move {
@@ -1170,7 +1169,7 @@ mod tests {
     fn dropping_a_region_cancels_its_work() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let out = block_on(run(|fcx| async move {
+            let out = block_on(run(fictionet::Seed::random(), |fcx| async move {
                 let started = Arc::new(AtomicUsize::new(0));
                 let s = started.clone();
                 let mut region = std::pin::pin!(fcx.region(|fcx| async move {
@@ -1217,7 +1216,7 @@ mod tests {
                 self.0.cancel();
             }
         }
-        let res = block_on(run(|fcx| async move {
+        let res = block_on(run(fictionet::Seed::random(), |fcx| async move {
             use crate::Interface;
             let (inside, outside) = crate::pair();
             let watcher = Arc::new(Mutex::new(Some(outside)));
@@ -1248,7 +1247,7 @@ mod tests {
     /// nothing, is not cancelled, and its joiner hears `Cancelled`.
     #[test]
     fn a_task_that_ends_with_a_cancel_does_not_fail_its_region() {
-        let res = block_on(run(|fcx| async move {
+        let res = block_on(run(fictionet::Seed::random(), |fcx| async move {
             let mut stopped = None;
             fcx.region(|inner| {
                 stopped = Some(inner.clone());
@@ -1276,7 +1275,7 @@ mod tests {
     /// work used to say so.
     #[test]
     fn a_region_says_whether_it_was_stopped_or_cut_short() {
-        let res = block_on(run(|fcx| async move {
+        let res = block_on(run(fictionet::Seed::random(), |fcx| async move {
             let stopped = fcx
                 .region(|inner| async move {
                     inner.cancel();
@@ -1308,7 +1307,7 @@ mod tests {
 
     #[test]
     fn cancelling_a_region_cancels_regions_inside_it() {
-        let res = block_on(run(|fcx| async move {
+        let res = block_on(run(fictionet::Seed::random(), |fcx| async move {
             fcx.spawn(|fcx| async move {
                 let inner = fcx
                     .region(|fcx| async move {

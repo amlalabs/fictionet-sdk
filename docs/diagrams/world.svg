@@ -34,7 +34,7 @@
 <g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="13">
 <text x="170" y="30" text-anchor="middle">sandbox “agent”</text>
 <text x="170" y="46" text-anchor="middle" font-size="11.5">reached through fictionet attach</text>
-<text x="22" y="422" font-size="12">run(world): one future, polled on one thread</text>
+<text x="22" y="422" font-size="12">run(seed, world): one future, polled on one thread</text>
 <text x="178" y="108" font-family="'Source Code Pro',monospace" font-size="12.5">Attachment “agent”</text>
 <text x="170" y="153" text-anchor="middle" font-family="'Source Code Pro',monospace">delay</text>
 <text x="170" y="170" text-anchor="middle" font-size="11.5">50 ms each way</text>

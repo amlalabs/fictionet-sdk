@@ -113,49 +113,52 @@ fn an_observer_sees_http_inside_tls() {
     let fetched = Arc::new(std::sync::Mutex::new(None));
     let (g, f) = (go.clone(), fetched.clone());
     std::thread::spawn(move || {
-        let _ = fictionet::block_on(fictionet::run(move |fcx| async move {
-            // Taking attachments is what lets the world socket find this run.
-            fcx.spawn(move |fcx| async move {
-                let _ = attachments.next(&fcx).await;
-                Ok(())
-            });
-            let (server_cfg, client_cfg) = configs(&fcx);
-            let (a, b) = fictionet::pair();
-            let client = tcp::endpoint(&fcx, a, "10.0.0.2".parse()?);
-            let server = tcp::endpoint(&fcx, b, "10.0.0.1".parse()?);
-            let mut listener = server.listen(443)?;
-            fcx.spawn(move |fcx| async move {
-                let conn = listener.accept(&fcx).await?;
-                let mut conn = tls::server(&fcx, conn)
-                    .await?
-                    .finish(&fcx, server_cfg)
-                    .await?;
-                let mut request = Vec::new();
-                let mut buf = [0u8; 4096];
-                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    let n = conn.read(&fcx, &mut buf).await?;
-                    request.extend_from_slice(&buf[..n]);
+        let _ = fictionet::block_on(fictionet::run(
+            fictionet::Seed::random(),
+            move |fcx| async move {
+                // Taking attachments is what lets the world socket find this run.
+                fcx.spawn(move |fcx| async move {
+                    let _ = attachments.next(&fcx).await;
+                    Ok(())
+                });
+                let (server_cfg, client_cfg) = configs(&fcx);
+                let (a, b) = fictionet::pair();
+                let client = tcp::endpoint(&fcx, a, "10.0.0.2".parse()?);
+                let server = tcp::endpoint(&fcx, b, "10.0.0.1".parse()?);
+                let mut listener = server.listen(443)?;
+                fcx.spawn(move |fcx| async move {
+                    let conn = listener.accept(&fcx).await?;
+                    let mut conn = tls::server(&fcx, conn)
+                        .await?
+                        .finish(&fcx, server_cfg)
+                        .await?;
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = conn.read(&fcx, &mut buf).await?;
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    conn.write_all(&fcx, b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello")
+                        .await?;
+                    conn.shutdown(&fcx).await?;
+                    Ok(())
+                });
+                while !g.load(Ordering::SeqCst) {
+                    fcx.sleep(ms(10)).await?;
                 }
-                conn.write_all(&fcx, b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello")
-                    .await?;
-                conn.shutdown(&fcx).await?;
+                let conn = client.connect(&fcx, "10.0.0.1:443".parse()?).await?;
+                let response = fetch(
+                    &fcx,
+                    conn,
+                    client_cfg,
+                    b"GET /secret HTTP/1.1\r\nhost: secret.test\r\n\r\n",
+                )
+                .await?;
+                *f.lock().unwrap() = Some(response);
+                fcx.sleep(std::time::Duration::from_secs(60)).await?;
                 Ok(())
-            });
-            while !g.load(Ordering::SeqCst) {
-                fcx.sleep(ms(10)).await?;
-            }
-            let conn = client.connect(&fcx, "10.0.0.1:443".parse()?).await?;
-            let response = fetch(
-                &fcx,
-                conn,
-                client_cfg,
-                b"GET /secret HTTP/1.1\r\nhost: secret.test\r\n\r\n",
-            )
-            .await?;
-            *f.lock().unwrap() = Some(response);
-            fcx.sleep(std::time::Duration::from_secs(60)).await?;
-            Ok(())
-        }));
+            },
+        ));
     });
 
     let mut observer = Client::connect(&path, "test").unwrap();

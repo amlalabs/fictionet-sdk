@@ -31,8 +31,7 @@ where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    fictionet::fuzzing::seed_random(seed);
-    let result = block_on(run(move |fcx| {
+    let result = block_on(run(fictionet::Seed::from_u64(seed), move |fcx| {
         let fut = f(fcx);
         async move {
             fut.await;

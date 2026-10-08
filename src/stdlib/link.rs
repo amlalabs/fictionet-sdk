@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn a_delay_drops_what_does_not_fit() {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (mut sandbox, inner) = pair();
             let mut far = delay(&fcx, Duration::from_secs(1), inner);
             flood(&fcx, &mut sandbox, FIT + 500).await?;
@@ -381,7 +381,7 @@ mod tests {
     /// packet, so the flood pushes nothing else out of the log.
     #[test]
     fn a_flooded_bottleneck_counts_its_drops() {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (mut sandbox, inner) = pair();
             let _far = bottleneck(&fcx, 0, 10, inner);
             fcx.record(fictionet::events::Event::new("http", "request"));
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn an_unread_bottleneck_output_stops_growing() {
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (mut sandbox, inner) = pair();
             let mut far = bottleneck(&fcx, u64::MAX, 64, inner);
             flood(&fcx, &mut sandbox, FIT + 500).await?;

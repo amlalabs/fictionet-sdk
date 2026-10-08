@@ -390,6 +390,7 @@ pub(crate) const MAX_KEYS: usize = 20_000;
 /// Every run keeps one. Starting a task, and a task taking an end of a
 /// link, each take its lock once. Packets never do.
 pub(crate) struct Graph {
+    pub(crate) environment: Arc<crate::entropy::RunEnvironment>,
     pub(crate) start: Instant,
     pub(crate) start_wall: SystemTime,
     /// Observer sessions connected to the world. While there are none,
@@ -421,8 +422,9 @@ pub(crate) struct GraphState {
 }
 
 impl Graph {
-    pub(crate) fn new() -> Arc<Graph> {
+    pub(crate) fn new(seed: crate::Seed) -> Arc<Graph> {
         Arc::new(Graph {
+            environment: Arc::new(crate::entropy::RunEnvironment::new(seed)),
             start: Instant::now(),
             start_wall: SystemTime::now(),
             viewers: AtomicUsize::new(0),
@@ -599,7 +601,7 @@ mod tests {
     fn a_watched_run_records_tasks_owners_and_counts() {
         use crate::Interface;
         use crate::prelude::*;
-        let graph = Graph::new();
+        let graph = Graph::new(crate::Seed::random());
         let g = graph.clone();
         let (spawn_line, seen) = (Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(None)));
         let (line, s) = (spawn_line.clone(), seen.clone());
@@ -661,7 +663,7 @@ mod tests {
     fn pairs_count_their_packets() {
         use crate::Interface;
         use crate::prelude::*;
-        crate::block_on(crate::run(|fcx| async move {
+        crate::block_on(crate::run(fictionet::Seed::random(), |fcx| async move {
             let (mut a, mut b) = crate::pair();
             a.send(Packet(vec![0; 40]));
             b.recv(&fcx).await?;

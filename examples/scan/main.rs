@@ -137,7 +137,9 @@ fn main() -> Result {
         attacher,
     )?;
     println!("listening on {path}");
-    fictionet::block_on(fictionet::run(move |fcx| world(fcx, attachments)))
+    fictionet::block_on(fictionet::run(fictionet::Seed::random(), move |fcx| {
+        world(fcx, attachments)
+    }))
 }
 
 async fn world(fcx: Cx, attachments: Attachments) -> Result {
@@ -411,15 +413,18 @@ mod tests {
     fn the_scan_report_is_the_recorded_one() {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = fictionet::block_on(fictionet::run(move |fcx| async move {
-                let (attacher, attachments) = fictionet::attachments();
-                fcx.spawn(move |fcx| super::world(fcx, attachments));
-                container(&fcx, attacher.attach("container").unwrap());
-                let lines = report(&fcx, &attacher).await;
-                let _ = tx.send(lines);
-                fcx.cancel();
-                Ok(())
-            }));
+            let result = fictionet::block_on(fictionet::run(
+                fictionet::Seed::random(),
+                move |fcx| async move {
+                    let (attacher, attachments) = fictionet::attachments();
+                    fcx.spawn(move |fcx| super::world(fcx, attachments));
+                    container(&fcx, attacher.attach("container").unwrap());
+                    let lines = report(&fcx, &attacher).await;
+                    let _ = tx.send(lines);
+                    fcx.cancel();
+                    Ok(())
+                },
+            ));
             let _ = result;
         });
         let got = rx

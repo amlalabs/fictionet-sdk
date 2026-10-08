@@ -402,7 +402,7 @@ mod tests {
         let inside = log.clone();
         let sockets = Arc::new(Mutex::new(Vec::new()));
         let keep = sockets.clone();
-        block_on(run(|fcx| async move {
+        block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (_raw, side) = pair();
             let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             for port in [9000, 53, 443, 22, 8080] {
@@ -444,7 +444,7 @@ mod tests {
     /// held 1,024 of any size, 64 MiB of the largest.
     #[test]
     fn a_socket_holds_at_most_its_queue_in_bytes() {
-        let result = block_on(run(|fcx| async move {
+        let result = block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (mut raw, side) = pair();
             let mut socket = endpoint(&fcx, side, "10.0.0.1".parse().unwrap()).bind(53)?;
             let big = vec![7; 60_000];

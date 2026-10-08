@@ -21,8 +21,13 @@ use crate::{Cx, Result};
 /// executor of its own. Without tokio, poll it with
 /// [`block_on`](crate::block_on).
 ///
-/// Time is the wall clock, and randomness comes from the operating system.
-/// That is what a run with a real sandbox needs, because the sandbox's
+/// Time is the wall clock, and randomness comes from one seeded ChaCha20 stream.
+/// Use [`Seed::random`](crate::Seed::random) for a fresh OS seed or
+/// [`Seed::from_u64`](crate::Seed::from_u64) for a repeatable test seed.
+/// The run's start event records the seed as hexadecimal. Equal seeds give
+/// equal draws in the same call order; real-time scheduling and external
+/// inputs can still change that order.
+/// The real clock is what a run with a real sandbox needs, because the sandbox's
 /// kernel and programs time out on real time. Real sockets, Redis and the
 /// internet all work, and their times agree with [`Cx::now`]. Libraries
 /// built on tokio need a tokio runtime to poll the world, not
@@ -89,15 +94,15 @@ use crate::{Cx, Result};
 ///     let (attacher, attachments) = fictionet::attachments();
 ///     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 ///     let _listening = fictionet::listen(socket, attacher)?;
-///     fictionet::run(|fcx| world(fcx, attachments, db)).await
+///     fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments, db)).await
 /// }
 /// ```
-pub async fn run<F, Fut>(world: F) -> Result
+pub async fn run<F, Fut>(seed: crate::Seed, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,
     Fut: Future<Output = Result> + Send + 'static,
 {
-    run_with(Graph::new(), world).await
+    run_with(Graph::new(seed), world).await
 }
 
 /// [`run`], recording what happens in `graph`.
@@ -108,6 +113,7 @@ where
 {
     let shared = Arc::new(RunShared {
         start: graph.start,
+        environment: graph.environment.clone(),
         queue: Mutex::new(Queue {
             next_id: 1,
             ..Queue::default()
@@ -135,6 +141,7 @@ type BoxFuture = Pin<Box<dyn Future<Output = Result> + Send>>;
 
 /// The part of a run that wakers and every [`Cx`] share.
 pub(crate) struct RunShared {
+    pub(crate) environment: Arc<crate::entropy::RunEnvironment>,
     /// The moment the run started: [`Instant::ZERO`](crate::time::Instant::ZERO).
     pub(crate) start: crate::sys::Instant,
     queue: Mutex<Queue>,

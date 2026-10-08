@@ -21,7 +21,7 @@ fn map_wraps_each_sandbox_and_keeps_its_name() {
         let mut agent = attacher.attach("agent").unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let mut mapped = attachments.map(&fcx, move |fcx, sandbox| {
                 c.fetch_add(1, Ordering::SeqCst);
                 stdlib::delay(fcx, ms(30), sandbox)
@@ -55,7 +55,7 @@ fn map_wraps_each_sandbox_and_keeps_its_name() {
 fn dropping_the_mapped_attachments_ends_the_run() {
     within(Duration::from_secs(5), || {
         let (attacher, attachments) = attachments();
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let mapped = attachments.map(&fcx, |_fcx, sandbox| sandbox);
             drop(mapped);
             Ok(())
@@ -64,7 +64,7 @@ fn dropping_the_mapped_attachments_ends_the_run() {
         // The map task dropped the original `Attachments`, so a sandbox
         // that attaches now is turned away.
         let mut late = attacher.attach("late").unwrap();
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             assert_eq!(late.recv(&fcx).await, Err(RecvError::Closed));
             Ok(())
         }))
@@ -76,7 +76,7 @@ fn dropping_the_mapped_attachments_ends_the_run() {
 fn a_sandbox_that_detached_before_it_was_taken_is_skipped() {
     within(Duration::from_secs(5), || {
         let (attacher, attachments) = attachments();
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let mut mapped = attachments.map(&fcx, |fcx, sandbox| {
                 stdlib::filter(fcx, sandbox, |_, _, _| true)
             });
@@ -104,7 +104,7 @@ fn a_mapped_sandbox_is_not_read_until_the_world_takes_it() {
     within(Duration::from_secs(5), || {
         let (attacher, attachments) = attachments();
         let mut agent = attacher.attach("agent").unwrap();
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let (wraps, seen) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
             let (w, s) = (wraps.clone(), seen.clone());
             let counting = move |fcx: &fictionet::Cx, sandbox: fictionet::Attachment| {
@@ -145,7 +145,7 @@ fn maps_chain_with_the_first_closest_to_the_sandbox() {
     within(Duration::from_secs(5), || {
         let (attacher, attachments) = attachments();
         let mut agent = attacher.attach("agent").unwrap();
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             // The first map drops packets that start with 0. The second
             // sees only what the first let through.
             let seen = Arc::new(AtomicUsize::new(0));
@@ -176,7 +176,7 @@ fn maps_chain_with_the_first_closest_to_the_sandbox() {
 fn filter_sees_both_directions_and_drops_what_it_rejects() {
     within(Duration::from_secs(5), || {
         let (mut a, b) = fictionet::pair();
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let log = Arc::new(std::sync::Mutex::new(Vec::new()));
             let l = log.clone();
             let mut outer = stdlib::filter(&fcx, b, move |_, direction, packet| {
@@ -214,7 +214,7 @@ fn mapped_attachments_box_as_interfaces() {
     within(Duration::from_secs(5), || {
         let (attacher, attachments) = attachments();
         let mut agent = attacher.attach("agent").unwrap();
-        block_on(run(move |fcx| async move {
+        block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let mut mapped = attachments.map(&fcx, |_fcx, sandbox| {
                 Box::new(sandbox) as Box<dyn Interface>
             });

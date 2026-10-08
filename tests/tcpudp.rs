@@ -788,7 +788,7 @@ fn tcp_through_tokio_io() {
         .build()
         .unwrap();
     let result = rt.block_on(async {
-        run(|fcx| async move {
+        run(fictionet::Seed::random(), |fcx| async move {
             let (ea, eb) = two_tcp(&fcx, A, B);
             let mut listener = eb.listen(80)?;
             let server_fcx = fcx.clone();

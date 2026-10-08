@@ -71,7 +71,7 @@
 //! let router = Router::new()
 //!     .get("/hello", |_, _| http::Response::new(Bytes::from("hi\n")))
 //!     .post("/echo", |_, request: http::Request<Bytes>| http::Response::new(request.into_body()));
-//! let mut h = Harness::new(Http1::new(router), ());
+//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
 //! let reply = h.push(b"GET /hello HTTP/1.1\r\nHost: a.test\r\n\r\n")?;
 //! assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
 //! assert!(reply.ends_with(b"\r\n\r\nhi\n"));
@@ -308,19 +308,19 @@ pub struct Target {
 /// randomness, and the connection.
 pub struct Exchange<'a> {
     now: Instant,
-    rng: &'a mut dyn FnMut() -> u64,
+    entropy: &'a dyn fictionet::Entropy,
     conn: &'a ConnInfo,
 }
 
 impl<'a> Exchange<'a> {
     /// An exchange for a handler called outside a service, such as in a
     /// test.
-    pub fn new<R: FnMut() -> u64>(
+    pub fn new(
         now: Instant,
-        rng: &'a mut R,
+        entropy: &'a dyn fictionet::Entropy,
         conn: &'a ConnInfo,
     ) -> Exchange<'a> {
-        Exchange { now, rng, conn }
+        Exchange { now, entropy, conn }
     }
 
     /// The run's clock when the request was read.
@@ -328,9 +328,9 @@ impl<'a> Exchange<'a> {
         self.now
     }
 
-    /// A random number from the connection's generator.
+    /// A random number from the run's stream, or the standalone harness's stream.
     pub fn random_u64(&mut self) -> u64 {
-        (self.rng)()
+        self.entropy.random_u64()
     }
 
     /// The connection the request came over.
@@ -1019,11 +1019,9 @@ impl Http1 {
         let tracker = Tracker::new(&request, driver.conn(), self.started);
         let now = driver.now();
         let conn = driver.conn().clone();
-        let reply = {
-            let mut rng = || driver.random_u64();
-            self.handler
-                .call(request, &mut Exchange::new(now, &mut rng, &conn))
-        };
+        let reply = self
+            .handler
+            .call(request, &mut Exchange::new(now, driver.entropy(), &conn));
         let close = !keep_alive;
         // Every answer goes out as deferred work, so its event is made
         // once its bytes are written.
@@ -1628,9 +1626,6 @@ pub struct HttpOptions {
     /// HTTP/1 what the service holds, over HTTP/2 each request's body and
     /// each response body held in full.
     pub budget: Option<Budget>,
-    /// The seed of each connection's randomness ([`Exchange::random_u64`]),
-    /// mixed with its number ([`serve::conn_seed`]).
-    pub seed: u64,
     /// The world's date and time at the start of the run, for `Date`
     /// headers. `None`: no `Date` header. See [Dates](self#dates).
     pub date: Option<SystemTime>,
@@ -1705,7 +1700,6 @@ pub async fn serve_connection<C: Connection + Unpin>(
         write_timeout: Some(opts.limits.write_timeout),
         connection_events: false,
         budget: opts.budget.clone(),
-        seed: opts.seed,
         ..ServeOptions::default()
     };
     let mut service = Http1::with(handler.clone(), opts.limits);
@@ -1818,7 +1812,6 @@ impl Accept for Server {
             limits: self.limits,
             first_bytes: (!arrival.info.tls).then_some(arrival.handshake),
             budget: arrival.budget,
-            seed: arrival.seed,
             date: self.date,
         };
         let (conn, info) = (arrival.conn, arrival.info);
@@ -1936,7 +1929,6 @@ impl Website {
 /// Live HTTP/2 and HTTP/1 Upgrade serving on hyper.
 mod h2 {
     use super::*;
-    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::serve::{Charge, PanicNote};
     use hyper::body::Incoming;
 
@@ -2069,13 +2061,10 @@ mod h2 {
         date: Option<SystemTime>,
         limits: Limits,
         budget: Option<Budget>,
-        /// The connection's generator, seeded as an HTTP/1 connection's is.
-        rng: Arc<Mutex<Lcg>>,
     }
 
     impl Route {
         fn new(fcx: &Cx, handler: Arc<dyn Handler>, info: &ConnInfo, opts: &HttpOptions) -> Route {
-            let seed = serve::conn_seed(opts.seed, info.id.unwrap_or(0));
             Route {
                 fcx: fcx.clone(),
                 handler,
@@ -2083,7 +2072,6 @@ mod h2 {
                 date: opts.date,
                 limits: opts.limits,
                 budget: opts.budget.clone(),
-                rng: Arc::new(Mutex::new(Lcg::new(seed))),
             }
         }
 
@@ -2185,11 +2173,9 @@ mod h2 {
                         let mut request = Request::from_parts(parts, Body::from(body));
                         request.extensions_mut().insert((*route.info).clone());
                         let now = route.fcx.now();
-                        let rng = route.rng.clone();
-                        let mut rng = move || rng.lock().unwrap_or_else(|e| e.into_inner()).next();
                         let reply = route
                             .handler
-                            .call(request, &mut Exchange::new(now, &mut rng, &route.info));
+                            .call(request, &mut Exchange::new(now, &route.fcx, &route.info));
                         match reply {
                             Reply::Now(r) => r,
                             Reply::Later(work) => match work(route.fcx.clone()).await {
@@ -2594,66 +2580,69 @@ mod h2 {
 
         #[test]
         fn http2_body_timeout_uses_the_fictionet_deadline() {
-            fictionet::block_on(fictionet::run(|fcx| async move {
-                let mut input = PREFACE.to_vec();
-                input.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
-                // POST / over HTTP, with no END_STREAM on the headers.
-                let block = b"\x83\x86\x84\x01\x01a";
-                input.extend_from_slice(&[0, 0, block.len() as u8, 1, 4, 0, 0, 0, 1]);
-                input.extend_from_slice(block);
-                let conn = StalledBody {
-                    input: Bytes::from(input),
-                };
-                let duration = Duration::from_millis(40);
-                let opts = HttpOptions {
-                    limits: Limits {
-                        body_timeout: duration,
-                        ..Limits::default()
-                    },
-                    ..HttpOptions::default()
-                };
-                let handler = Router::new().post("/", |_, _| {
-                    panic!("a stalled body cannot reach the handler")
-                });
-                let mut served = pin!(serve(
-                    &fcx,
-                    conn,
-                    Arc::new(handler),
-                    ConnInfo::default(),
-                    &opts
-                ));
-                let log = fcx.events();
-                let wait = async {
-                    loop {
-                        if let Some(event) = log.of("http", "request").pop() {
-                            return event;
+            fictionet::block_on(fictionet::run(
+                fictionet::Seed::random(),
+                |fcx| async move {
+                    let mut input = PREFACE.to_vec();
+                    input.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+                    // POST / over HTTP, with no END_STREAM on the headers.
+                    let block = b"\x83\x86\x84\x01\x01a";
+                    input.extend_from_slice(&[0, 0, block.len() as u8, 1, 4, 0, 0, 0, 1]);
+                    input.extend_from_slice(block);
+                    let conn = StalledBody {
+                        input: Bytes::from(input),
+                    };
+                    let duration = Duration::from_millis(40);
+                    let opts = HttpOptions {
+                        limits: Limits {
+                            body_timeout: duration,
+                            ..Limits::default()
+                        },
+                        ..HttpOptions::default()
+                    };
+                    let handler = Router::new().post("/", |_, _| {
+                        panic!("a stalled body cannot reach the handler")
+                    });
+                    let mut served = pin!(serve(
+                        &fcx,
+                        conn,
+                        Arc::new(handler),
+                        ConnInfo::default(),
+                        &opts
+                    ));
+                    let log = fcx.events();
+                    let wait = async {
+                        loop {
+                            if let Some(event) = log.of("http", "request").pop() {
+                                return event;
+                            }
+                            fcx.sleep(Duration::from_millis(1)).await.unwrap();
                         }
-                        fcx.sleep(Duration::from_millis(1)).await.unwrap();
-                    }
-                };
-                let mut wait = pin!(wait);
-                let event = fcx
-                    .race(
-                        Some(fcx.now() + Duration::from_secs(2)),
-                        poll_fn(|cx| {
-                            assert!(served.as_mut().poll(cx).is_pending());
-                            wait.as_mut().poll(cx)
-                        }),
-                    )
-                    .await
-                    .unwrap();
-                let started = event.get("started").unwrap().as_f64().unwrap();
-                let elapsed = event.at.since_start().as_secs_f64() - started;
-                assert!(elapsed >= duration.as_secs_f64(), "{elapsed}");
-                assert!(elapsed < 1.0, "{elapsed}");
-                assert_eq!(event.str("answer"), Some("timeout"));
-                assert_eq!(event.u64("status"), Some(408));
-                assert_eq!(event.str("version"), Some("HTTP/2.0"));
-                assert_eq!(event.get("complete").and_then(Value::as_bool), Some(true));
-                assert_eq!(log.of("http", "request").len(), 1);
-                assert!(log.of("http", "error").is_empty());
-                Ok(())
-            }))
+                    };
+                    let mut wait = pin!(wait);
+                    let event = fcx
+                        .race(
+                            Some(fcx.now() + Duration::from_secs(2)),
+                            poll_fn(|cx| {
+                                assert!(served.as_mut().poll(cx).is_pending());
+                                wait.as_mut().poll(cx)
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    let started = event.get("started").unwrap().as_f64().unwrap();
+                    let elapsed = event.at.since_start().as_secs_f64() - started;
+                    assert!(elapsed >= duration.as_secs_f64(), "{elapsed}");
+                    assert!(elapsed < 1.0, "{elapsed}");
+                    assert_eq!(event.str("answer"), Some("timeout"));
+                    assert_eq!(event.u64("status"), Some(408));
+                    assert_eq!(event.str("version"), Some("HTTP/2.0"));
+                    assert_eq!(event.get("complete").and_then(Value::as_bool), Some(true));
+                    assert_eq!(log.of("http", "request").len(), 1);
+                    assert!(log.of("http", "error").is_empty());
+                    Ok(())
+                },
+            ))
             .unwrap();
         }
 
@@ -2661,30 +2650,33 @@ mod h2 {
         /// firing.
         #[test]
         fn a_cancelled_sleep_never_fires() {
-            fictionet::block_on(fictionet::run(|fcx| async move {
-                let slot: Arc<Mutex<Option<Cx>>> = Arc::default();
-                let s = slot.clone();
-                let _ = fcx
-                    .region(|inner| async move {
-                        *s.lock().unwrap() = Some(inner.clone());
-                        inner.cancel();
-                        Ok(())
-                    })
-                    .await;
-                let inner = slot.lock().unwrap().take().unwrap();
-                assert!(inner.is_cancelled());
-                let mut sleep = CxTimer { fcx: inner }.sleep(Duration::from_secs(5));
-                let pending = |sleep: &mut Pin<Box<dyn hyper::rt::Sleep>>| {
-                    sleep
-                        .as_mut()
-                        .poll(&mut Context::from_waker(std::task::Waker::noop()))
-                        .is_pending()
-                };
-                assert!(pending(&mut sleep));
-                fcx.sleep(Duration::from_millis(5)).await?;
-                assert!(pending(&mut sleep));
-                Ok(())
-            }))
+            fictionet::block_on(fictionet::run(
+                fictionet::Seed::random(),
+                |fcx| async move {
+                    let slot: Arc<Mutex<Option<Cx>>> = Arc::default();
+                    let s = slot.clone();
+                    let _ = fcx
+                        .region(|inner| async move {
+                            *s.lock().unwrap() = Some(inner.clone());
+                            inner.cancel();
+                            Ok(())
+                        })
+                        .await;
+                    let inner = slot.lock().unwrap().take().unwrap();
+                    assert!(inner.is_cancelled());
+                    let mut sleep = CxTimer { fcx: inner }.sleep(Duration::from_secs(5));
+                    let pending = |sleep: &mut Pin<Box<dyn hyper::rt::Sleep>>| {
+                        sleep
+                            .as_mut()
+                            .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                            .is_pending()
+                    };
+                    assert!(pending(&mut sleep));
+                    fcx.sleep(Duration::from_millis(5)).await?;
+                    assert!(pending(&mut sleep));
+                    Ok(())
+                },
+            ))
             .unwrap();
         }
     }

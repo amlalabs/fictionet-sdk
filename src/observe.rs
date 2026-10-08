@@ -639,7 +639,7 @@ mod tests {
     #[test]
     fn watches_copy_only_while_subscribed() {
         use crate::watch::Meter;
-        let graph = Graph::new();
+        let graph = Graph::new(crate::Seed::random());
         let meter = Meter::new();
         graph.owns(&meter, 0, 1);
         graph.task_started(1, "world".into(), std::panic::Location::caller(), None);
@@ -669,7 +669,7 @@ mod tests {
     #[test]
     fn a_world_registry_reaches_watch_json_without_a_socket() {
         use crate::watch::Meter;
-        let graph = Graph::new();
+        let graph = Graph::new(crate::Seed::random());
         let watched = graph.clone();
         crate::block_on(crate::run::run_with(graph, move |fcx| async move {
             let mut registry = Registry::new();
@@ -718,7 +718,7 @@ mod tests {
     #[test]
     fn idle_watches_are_forgotten_without_more_requests() {
         use crate::watch::Meter;
-        let graph = Graph::new();
+        let graph = Graph::new(crate::Seed::random());
         let meter = Meter::new();
         graph.owns(&meter, 0, 1);
         drop(watch(&graph, meter.id).unwrap());
@@ -741,7 +741,7 @@ mod tests {
     /// `filter` shows as `filter`, at the line that called it.
     #[test]
     fn filter_reports_its_caller() {
-        crate::block_on(crate::run(|fcx| async move {
+        crate::block_on(crate::run(fictionet::Seed::random(), |fcx| async move {
             let (a, _b) = crate::pair();
             let line = line!() + 1;
             let _f = crate::stdlib::filter(&fcx, a, |_, _, _| true);
@@ -760,7 +760,7 @@ mod tests {
     /// A router records a route it removes, with no observer.
     #[test]
     fn routers_record_routes_they_remove() {
-        crate::block_on(crate::run(|fcx| async move {
+        crate::block_on(crate::run(fictionet::Seed::random(), |fcx| async move {
             let (a, b) = crate::pair();
             let (c, d) = crate::pair();
             let router =

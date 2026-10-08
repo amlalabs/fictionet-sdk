@@ -215,25 +215,28 @@ fn a_fake_qemu_gets_dhcp_arp_and_the_world() {
 
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let out = seen.clone();
-    fictionet::block_on(fictionet::run(move |fcx| async move {
-        let mut vm1 = attachments.get(&fcx, "vm1").await?;
-        loop {
-            match poll_once(&fcx, &mut vm1) {
-                Some(Ok(Packet(p))) => {
-                    let from_vm = p[12..16] == [10, 0, 0, 2];
-                    out.lock().unwrap().push(p);
-                    if from_vm {
-                        vm1.send(Packet(from_world()));
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::random(),
+        move |fcx| async move {
+            let mut vm1 = attachments.get(&fcx, "vm1").await?;
+            loop {
+                match poll_once(&fcx, &mut vm1) {
+                    Some(Ok(Packet(p))) => {
+                        let from_vm = p[12..16] == [10, 0, 0, 2];
+                        out.lock().unwrap().push(p);
+                        if from_vm {
+                            vm1.send(Packet(from_world()));
+                        }
                     }
+                    // QEMU closed its socket: attach detached.
+                    Some(Err(RecvError::Closed)) => break,
+                    Some(Err(e)) => return Err(fictionet::Error::msg(format!("{e:?}"))),
+                    None => fcx.sleep(fictionet::time::ms(10)).await?,
                 }
-                // QEMU closed its socket: attach detached.
-                Some(Err(RecvError::Closed)) => break,
-                Some(Err(e)) => return Err(fictionet::Error::msg(format!("{e:?}"))),
-                None => fcx.sleep(fictionet::time::ms(10)).await?,
             }
-        }
-        Ok(())
-    }))
+            Ok(())
+        },
+    ))
     .unwrap();
     qemu_side.join().unwrap();
     drop(listening);
