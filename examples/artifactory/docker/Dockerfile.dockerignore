@@ -1,0 +1,14 @@
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!docs
+!dashboard
+!benches
+!codegen
+!tests/copy_and_own
+!examples/*.rs
+!examples/artifactory/world/Cargo.toml
+!examples/artifactory/world/Cargo.lock
+!examples/artifactory/world/src
+!examples/artifactory/docker/agent
