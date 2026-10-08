@@ -69,6 +69,49 @@ use rustls::{ConfigBuilder, WantsVersions};
 use crate::Cx;
 use crate::stdlib::{ConnError, Connection};
 
+/// The name of a TLS alert, or "unknown" for an unrecognized code.
+pub fn alert_name(code: u8) -> &'static str {
+    match code {
+        0 => "close_notify",
+        10 => "unexpected_message",
+        20 => "bad_record_mac",
+        21 => "decryption_failed",
+        22 => "record_overflow",
+        30 => "decompression_failure",
+        40 => "handshake_failure",
+        41 => "no_certificate",
+        42 => "bad_certificate",
+        43 => "unsupported_certificate",
+        44 => "certificate_revoked",
+        45 => "certificate_expired",
+        46 => "certificate_unknown",
+        47 => "illegal_parameter",
+        48 => "unknown_ca",
+        49 => "access_denied",
+        50 => "decode_error",
+        51 => "decrypt_error",
+        60 => "export_restriction",
+        70 => "protocol_version",
+        71 => "insufficient_security",
+        80 => "internal_error",
+        86 => "inappropriate_fallback",
+        90 => "user_canceled",
+        100 => "no_renegotiation",
+        109 => "missing_extension",
+        110 => "unsupported_extension",
+        111 => "certificate_unobtainable",
+        112 => "unrecognized_name",
+        113 => "bad_certificate_status_response",
+        114 => "bad_certificate_hash_value",
+        115 => "unknown_psk_identity",
+        116 => "certificate_required",
+        117 => "general_error",
+        120 => "no_application_protocol",
+        121 => "ech_required",
+        _ => "unknown",
+    }
+}
+
 /// Starts a rustls server config whose time and randomness come from `fcx`.
 ///
 /// rustls reads the current time, to check certificate validity and ticket
@@ -649,5 +692,56 @@ impl<C: Connection> Connection for TlsConnection<C> {
 
     fn poll_gone(&self, cx: &mut Context<'_>) -> Poll<()> {
         self.io.conn.poll_gone(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::alert_name;
+
+    #[test]
+    fn tls_alert_names() {
+        let known = [
+            (0, "close_notify"),
+            (10, "unexpected_message"),
+            (20, "bad_record_mac"),
+            (21, "decryption_failed"),
+            (22, "record_overflow"),
+            (30, "decompression_failure"),
+            (40, "handshake_failure"),
+            (41, "no_certificate"),
+            (42, "bad_certificate"),
+            (43, "unsupported_certificate"),
+            (44, "certificate_revoked"),
+            (45, "certificate_expired"),
+            (46, "certificate_unknown"),
+            (47, "illegal_parameter"),
+            (48, "unknown_ca"),
+            (49, "access_denied"),
+            (50, "decode_error"),
+            (51, "decrypt_error"),
+            (60, "export_restriction"),
+            (70, "protocol_version"),
+            (71, "insufficient_security"),
+            (80, "internal_error"),
+            (86, "inappropriate_fallback"),
+            (90, "user_canceled"),
+            (100, "no_renegotiation"),
+            (109, "missing_extension"),
+            (110, "unsupported_extension"),
+            (111, "certificate_unobtainable"),
+            (112, "unrecognized_name"),
+            (113, "bad_certificate_status_response"),
+            (114, "bad_certificate_hash_value"),
+            (115, "unknown_psk_identity"),
+            (116, "certificate_required"),
+            (117, "general_error"),
+            (120, "no_application_protocol"),
+            (121, "ech_required"),
+        ];
+        for code in 0..=u8::MAX {
+            let expected = known.iter().find(|(c, _)| *c == code).map_or("unknown", |(_, name)| *name);
+            assert_eq!(alert_name(code), expected, "alert {code}");
+        }
     }
 }

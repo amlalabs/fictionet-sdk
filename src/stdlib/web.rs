@@ -359,7 +359,8 @@
 //!   `error` or `none`), `addr` and `rcode`;
 //! - `tls.handshake`: every TLS handshake on port 443, with `addr`, `sni`
 //!   and `outcome` (`accepted` with `alpn`, `rejected`, `alert` with
-//!   `alert`, `failed` with `detail`, `closed`, `timed_out`, `detached`
+//!   `alert` (name) and `alert_code` (number), `failed` with `detail`,
+//!   `closed`, `timed_out`, `detached`
 //!   or `cancelled`);
 //! - `http.request`: every HTTP request, with who answered it (`answer`:
 //!   `handler`, `error`, `redirect`, `misdirected`, `no_host` or

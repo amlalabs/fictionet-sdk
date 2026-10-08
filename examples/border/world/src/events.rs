@@ -135,9 +135,8 @@ fn tls(scenario: &Scenario, e: &Entry) -> Value {
             fields.insert("alpn".into(), js(e.get("alpn")));
         }
         "alert" => {
-            let a = e.u64("alert").unwrap_or(0) as u8;
-            fields.insert("alert".into(), json!(alert_name(a)));
-            fields.insert("alert_code".into(), json!(a));
+            fields.insert("alert".into(), js(e.get("alert")));
+            fields.insert("alert_code".into(), js(e.get("alert_code")));
         }
         "failed" => {
             fields.insert("detail".into(), json!(e.str("detail").unwrap_or_default().chars().take(200).collect::<String>()));
@@ -150,36 +149,6 @@ fn tls(scenario: &Scenario, e: &Entry) -> Value {
     };
     fields.insert("outcome".into(), json!(outcome));
     line
-}
-
-/// The name of a TLS alert, as OpenSSL and the Python world wrote it.
-pub fn alert_name(a: u8) -> &'static str {
-    match a {
-        0 => "close_notify",
-        10 => "unexpected_message",
-        20 => "bad_record_mac",
-        40 => "handshake_failure",
-        42 => "bad_certificate",
-        43 => "unsupported_certificate",
-        44 => "certificate_revoked",
-        45 => "certificate_expired",
-        46 => "certificate_unknown",
-        47 => "illegal_parameter",
-        48 => "unknown_ca",
-        49 => "access_denied",
-        50 => "decode_error",
-        51 => "decrypt_error",
-        70 => "protocol_version",
-        71 => "insufficient_security",
-        80 => "internal_error",
-        90 => "user_canceled",
-        109 => "missing_extension",
-        110 => "unsupported_extension",
-        112 => "unrecognized_name",
-        116 => "certificate_required",
-        120 => "no_application_protocol",
-        _ => "unknown",
-    }
 }
 
 fn http(e: &Entry) -> Value {

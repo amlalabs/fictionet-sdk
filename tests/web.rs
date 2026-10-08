@@ -2406,12 +2406,12 @@ fn answer(e: &Entry) -> String {
     }
 }
 
-/// A TLS event's outcome, with its `alpn`, `alert` or nothing after a
+/// A TLS event's outcome, with its `alpn`, `alert_code` or nothing after a
 /// space: `accepted h2`, `alert 48`, `rejected`.
 fn outcome(e: &Entry) -> String {
     match e.str("outcome") {
         Some("accepted") => format!("accepted {}", e.str("alpn").unwrap_or("-")),
-        Some("alert") => format!("alert {}", e.u64("alert").unwrap_or_default()),
+        Some("alert") => format!("alert {}", e.u64("alert_code").unwrap_or_default()),
         Some(other) => other.to_owned(),
         None => "none".to_owned(),
     }
@@ -2670,6 +2670,8 @@ fn events_for_tls_handshakes() {
         assert_eq!(summary[1], (secure, None, "rejected".to_owned()));
         assert_eq!(summary[2], (secure, Some("shared.test"), "rejected".to_owned()));
         assert_eq!(summary[3], (secure, Some("secure.test"), "alert 48".to_owned()));
+        assert_eq!(got[3].str("alert"), Some("unknown_ca"));
+        assert_eq!(got[3].u64("alert_code"), Some(48));
         assert_eq!(summary[4], (events, Some("events.test"), "accepted http/1.1".to_owned()));
         assert_eq!(summary[5], (secure, None, "closed".to_owned()));
         assert_eq!((summary[6].1, summary[6].2.as_str()), (None, "failed"), "{:?}", summary[6]);

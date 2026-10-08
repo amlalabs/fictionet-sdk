@@ -2351,6 +2351,7 @@ pub enum TlsOutcome {
     /// Refused with `unrecognized_name`: no config for the SNI.
     Rejected,
     /// The client sent this alert, such as 48 (`unknown_ca`).
+    /// The event records its name as `alert` and its number as `alert_code`.
     Alert(u8),
     /// The bytes were not TLS, or broke the protocol.
     Failed(String),
@@ -2398,7 +2399,8 @@ impl TlsOutcome {
 
 /// Shakes hands as a TLS server on `conn`, with the config `select` picks
 /// for the client's SNI, by `deadline`. Records a `tls.handshake` event
-/// with the outcome. `detached` says whether the sandbox has detached, for
+/// with the outcome. A client alert has its name in `alert` and its number
+/// in `alert_code`. `detached` says whether the sandbox has detached, for
 /// a reset that came from the world.
 ///
 /// Returns the TLS connection and `info` with its SNI and ALPN, or how the
@@ -2446,7 +2448,7 @@ pub async fn accept_tls<C: Connection>(
         TlsOutcome::Accepted { alpn } => {
             event = event.field("alpn", opt(alpn.as_ref().map(|a| String::from_utf8_lossy(a).into_owned())));
         }
-        TlsOutcome::Alert(a) => event = event.field("alert", u32::from(*a)),
+        TlsOutcome::Alert(a) => event = event.field("alert", tls::alert_name(*a)).field("alert_code", u32::from(*a)),
         TlsOutcome::Failed(why) => event = event.field("detail", why.as_str()),
         _ => {}
     }

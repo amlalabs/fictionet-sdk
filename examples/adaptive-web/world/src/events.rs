@@ -95,7 +95,7 @@ fn tls(e: &Entry) -> Option<Value> {
     let error = match e.str("outcome")? {
         "accepted" => return None,
         "rejected" => return Some(json!({"type": "tls_reject", "sni": sni})),
-        "alert" => format!("the client sent alert {}", e.u64("alert").unwrap_or(0)),
+        "alert" => format!("the client sent alert {}", e.u64("alert_code").unwrap_or(0)),
         "failed" => e
             .str("detail")
             .unwrap_or_default()

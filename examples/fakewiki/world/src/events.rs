@@ -114,8 +114,9 @@ fn tls(e: &Entry) -> Option<Value> {
         "accepted" => return None,
         "rejected" => return Some(json!({"type": "tls_reject", "sni": sni, "in_world": false})),
         "alert" => {
-            let a = e.u64("alert").unwrap_or(0) as u8;
-            format!("the client sent alert {a} ({})", alert_name(a))
+            let code = e.u64("alert_code").unwrap_or(0);
+            let name = e.str("alert").unwrap_or("unknown");
+            format!("the client sent alert {code} ({name})")
         }
         "failed" => e.str("detail").unwrap_or_default().chars().take(200).collect(),
         "closed" => "the client closed the connection before the handshake finished".to_owned(),
@@ -123,35 +124,6 @@ fn tls(e: &Entry) -> Option<Value> {
         _ => "the handshake failed".to_owned(),
     };
     Some(json!({"type": "tls_error", "sni": sni, "error": error}))
-}
-
-fn alert_name(a: u8) -> &'static str {
-    match a {
-        0 => "close_notify",
-        10 => "unexpected_message",
-        20 => "bad_record_mac",
-        40 => "handshake_failure",
-        42 => "bad_certificate",
-        43 => "unsupported_certificate",
-        44 => "certificate_revoked",
-        45 => "certificate_expired",
-        46 => "certificate_unknown",
-        47 => "illegal_parameter",
-        48 => "unknown_ca",
-        49 => "access_denied",
-        50 => "decode_error",
-        51 => "decrypt_error",
-        70 => "protocol_version",
-        71 => "insufficient_security",
-        80 => "internal_error",
-        90 => "user_canceled",
-        109 => "missing_extension",
-        110 => "unsupported_extension",
-        112 => "unrecognized_name",
-        116 => "certificate_required",
-        120 => "no_application_protocol",
-        _ => "unknown",
-    }
 }
 
 /// An HTTP request, as main.py's handler logged it: the request, then
