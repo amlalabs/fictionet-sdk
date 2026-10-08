@@ -358,7 +358,7 @@ impl Request {
         let tbs_element = req.read_expected(Tag::SEQUENCE)?;
         let mut tbs = tbs_element.reader()?;
         let version = read_version(&mut tbs)?;
-        let requestor_name = match explicit(&mut tbs, 1)? {
+        let requestor_name = match tbs.read_optional_explicit(1)? {
             Some(mut inner) => {
                 let name = checked_raw(&inner.read()?)?;
                 inner.finish()?;
@@ -384,7 +384,7 @@ impl Request {
         }
         let extensions = read_extensions(&mut tbs, 2)?;
         tbs.finish()?;
-        let signature = match explicit(&mut req, 0)? {
+        let signature = match req.read_optional_explicit(0)? {
             Some(mut inner) => {
                 let mut s = inner.read_sequence()?;
                 inner.finish()?;
@@ -580,7 +580,7 @@ impl Response {
         let mut resp = top.read_sequence()?;
         top.finish()?;
         let status = ResponseStatus::from_code(read_enum(&mut resp)?).ok_or(Error::Enumerated)?;
-        let bytes = match explicit(&mut resp, 0)? {
+        let bytes = match resp.read_optional_explicit(0)? {
             Some(mut inner) => {
                 let mut rb = inner.read_sequence()?;
                 inner.finish()?;
@@ -886,71 +886,44 @@ pub fn decode_get_path(segment: &str) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-impl Wire for Request {
-    type ParseError = Error;
-    type WriteError = Error;
-
+fictionet::der_wire!(asn1, impl Wire for Request, Error, Error::Unwritable, [
     /// Reads a request from its DER, such as a POST body.
     /// Refuses trailing bytes, invalid fields, empty requests, exceeded lists,
     /// and input over [`MAX_MESSAGE`]. Signed requests must name a requestor.
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        Self::decode(bytes)
-    }
-
+], [
     /// Appends the request as DER, for a world that plays a client. It fails if a
     /// list is empty or over its limit, a hash has the wrong length, a raw
     /// DER part is not one well-formed element, the requestor name is not
     /// a GeneralName, the request is signed but names no requestor, or the
     /// whole is over [`MAX_MESSAGE`].
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
-    }
-}
+]);
 
-impl Wire for Response {
-    type ParseError = Error;
-    type WriteError = Error;
-
+fictionet::der_wire!(asn1, impl Wire for Response, Error, Error::Unwritable, [
     /// Reads a response from its DER, such as an HTTP reply's body. A basic
     /// response inside is read too, and an error in it is an error here.
     /// Refuses trailing bytes, unknown status codes, status/bytes mismatches,
     /// and input over [`MAX_MESSAGE`].
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        Self::decode(bytes)
-    }
-
+], [
     /// Appends the response as DER, for a world that plays a responder. It fails
     /// where [`BasicResponse::write`] does, if the status and the bytes
     /// disagree or [`ResponseBytes::Other`] has the basic type's
     /// identifier ([`Error::ResponseBytes`]), or if the whole is over
     /// [`MAX_MESSAGE`].
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
-    }
-}
+]);
 
-impl Wire for BasicResponse {
-    type ParseError = Error;
-    type WriteError = Error;
-
+fictionet::der_wire!(asn1, impl Wire for BasicResponse, Error, Error::Unwritable, [
     /// Reads a basic response from its DER: the contents of a response's
     /// OCTET STRING.
     /// Refuses trailing bytes, invalid fields, exceeded lists, and input over
     /// [`MAX_MESSAGE`].
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        Self::decode(bytes)
-    }
-
+], [
     /// Appends the basic response as DER. It fails if a list is over its limit, a
     /// time is not in the form RFC 5280 allows, a raw DER part is not one
     /// well-formed element, or the whole is over [`MAX_MESSAGE`].
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
-    }
-}
+]);
 
 /// Reads whole DER messages without holding input bytes.
 ///
@@ -1087,21 +1060,13 @@ fn checked_raw(e: &Element<'_>) -> Result<Vec<u8>, Error> {
     Ok(e.raw().to_vec())
 }
 
-/// The reader inside an explicitly tagged `[n]` field, if it is next.
-fn explicit<'a>(r: &mut Reader<'a>, n: u32) -> Result<Option<Reader<'a>>, Error> {
-    match r.read_optional(Tag::context(n))? {
-        Some(e) => Ok(Some(e.reader()?)),
-        None => Ok(None),
-    }
-}
-
 fn read_enum(r: &mut Reader<'_>) -> Result<i64, Error> {
     Ok(r.read_enumerated()?.to_i64().ok_or(asn1::Error::Integer)?)
 }
 
 /// `[0] EXPLICIT Version DEFAULT v1`.
 fn read_version(r: &mut Reader<'_>) -> Result<i64, Error> {
-    match explicit(r, 0)? {
+    match r.read_optional_explicit(0)? {
         Some(mut inner) => {
             let v = inner.read_i64()?;
             inner.finish()?;
@@ -1220,7 +1185,7 @@ fn write_cert_id(w: &mut Writer, c: &CertId) {
 
 /// `[n] EXPLICIT Extensions OPTIONAL`, read as an empty list when absent.
 fn read_extensions(r: &mut Reader<'_>, n: u32) -> Result<Vec<Extension>, Error> {
-    let Some(mut inner) = explicit(r, n)? else {
+    let Some(mut inner) = r.read_optional_explicit(n)? else {
         return Ok(Vec::new());
     };
     let mut list = inner.read_sequence()?;
@@ -1278,7 +1243,7 @@ fn read_signature_bits(r: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
 /// `[0] EXPLICIT SEQUENCE OF Certificate OPTIONAL`, read as an empty list
 /// when absent.
 fn read_certs(r: &mut Reader<'_>) -> Result<Vec<Vec<u8>>, Error> {
-    let Some(mut inner) = explicit(r, 0)? else {
+    let Some(mut inner) = r.read_optional_explicit(0)? else {
         return Ok(Vec::new());
     };
     let list = inner.read_sequence()?;
@@ -1383,7 +1348,7 @@ fn read_single_response(r: &mut Reader<'_>) -> Result<SingleResponse, Error> {
         (Class::ContextSpecific, 1) => {
             let mut info = e.reader()?;
             let time = read_time(&mut info)?;
-            let reason = match explicit(&mut info, 0)? {
+            let reason = match info.read_optional_explicit(0)? {
                 Some(mut inner) => {
                     let v = read_enum(&mut inner)?;
                     inner.finish()?;
@@ -1402,7 +1367,7 @@ fn read_single_response(r: &mut Reader<'_>) -> Result<SingleResponse, Error> {
         _ => return Err(Error::CertStatus),
     };
     let this_update = read_time(&mut s)?;
-    let next_update = match explicit(&mut s, 0)? {
+    let next_update = match s.read_optional_explicit(0)? {
         Some(mut inner) => {
             let t = read_time(&mut inner)?;
             inner.finish()?;
@@ -1436,24 +1401,15 @@ fn write_single_response(w: &mut Writer, r: &SingleResponse) {
     });
 }
 
-impl Wire for ResponseData {
-    type ParseError = Error;
-    type WriteError = Error;
-
+fictionet::der_wire!(asn1, impl Wire for ResponseData, Error, Error::Unwritable, [
     /// Reads one complete DER ResponseData. Refuses invalid fields, exceeded
     /// lists, trailing bytes, and input over [`MAX_MESSAGE`].
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        Self::decode(bytes)
-    }
-
+], [
     /// Appends the DER the responder signs, as it appears inside a
     /// [`BasicResponse`]. Refuses invalid fields, exceeded lists, invalid
     /// responder IDs, hash lengths or times, and output over [`MAX_MESSAGE`].
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
-    }
-}
+]);
 
 #[cfg(test)]
 mod tests {

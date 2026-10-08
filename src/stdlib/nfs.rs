@@ -397,7 +397,7 @@ impl FileHandle {
 
     /// Writes the handle. More than [`MAX_FH`] bytes sets a writer error.
     pub fn write(&self, w: &mut Writer) {
-        write_opaque(w, &self.0, MAX_FH);
+        w.opaque_bounded(&self.0, MAX_FH);
     }
 }
 
@@ -756,7 +756,7 @@ impl DirOp {
     /// refused by the writer.
     pub fn write(&self, w: &mut Writer) {
         self.dir.write(w);
-        write_opaque(w, &self.name, MAX_NAME);
+        w.opaque_bounded(&self.name, MAX_NAME);
     }
 }
 
@@ -1269,7 +1269,7 @@ impl Request {
             } => {
                 location.write(w);
                 attributes.write(w);
-                write_opaque(w, target, MAX_SYMLINK);
+                w.opaque_bounded(target, MAX_SYMLINK);
             }
             Request::Mknod { location, what } => {
                 location.write(w);
@@ -1721,7 +1721,7 @@ impl Response {
                     Ok(ReadDirOk {
                         attributes: read_post_op(r)?,
                         cookieverf: read_verifier(r)?,
-                        entries: read_list(r, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |r| {
+                        entries: r.list(MAX_DIR_ENTRIES, MAX_DIR_BYTES, |r| {
                             Ok(Entry {
                                 fileid: r.uhyper()?,
                                 name: read_name(r)?,
@@ -1739,7 +1739,7 @@ impl Response {
                     Ok(ReadDirPlusOk {
                         attributes: read_post_op(r)?,
                         cookieverf: read_verifier(r)?,
-                        entries: read_list(r, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |r| {
+                        entries: r.list(MAX_DIR_ENTRIES, MAX_DIR_BYTES, |r| {
                             Ok(EntryPlus {
                                 fileid: r.uhyper()?,
                                 name: read_name(r)?,
@@ -1891,7 +1891,7 @@ impl Response {
                 res,
                 |w, ok| {
                     write_post_op(w, &ok.attributes);
-                    write_opaque(w, &ok.target, MAX_SYMLINK);
+                    w.opaque_bounded(&ok.target, MAX_SYMLINK);
                 },
                 write_post_op,
             ),
@@ -1901,7 +1901,7 @@ impl Response {
                 |w, ok| {
                     write_post_op(w, &ok.attributes);
                     w.uint(ok.count).bool(ok.eof);
-                    write_opaque(w, &ok.data, MAX_DATA);
+                    w.opaque_bounded(&ok.data, MAX_DATA);
                 },
                 write_post_op,
             ),
@@ -1950,9 +1950,9 @@ impl Response {
                     write_post_op(w, &ok.attributes);
                     w.opaque_fixed(&ok.cookieverf);
                     let named = ok.entries.iter();
-                    write_list(w, named, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |w, e| {
+                    w.list(named, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |w, e| {
                         w.uhyper(e.fileid);
-                        write_opaque(w, &e.name, MAX_NAME);
+                        w.opaque_bounded(&e.name, MAX_NAME);
                         w.uhyper(e.cookie);
                     });
                     w.bool(ok.eof);
@@ -1966,9 +1966,9 @@ impl Response {
                     write_post_op(w, &ok.attributes);
                     w.opaque_fixed(&ok.cookieverf);
                     let named = ok.entries.iter();
-                    write_list(w, named, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |w, e| {
+                    w.list(named, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |w, e| {
                         w.uhyper(e.fileid);
-                        write_opaque(w, &e.name, MAX_NAME);
+                        w.opaque_bounded(&e.name, MAX_NAME);
                         w.uhyper(e.cookie);
                         write_post_op(w, &e.attributes);
                         w.optional(e.handle.as_ref(), |w, fh| fh.write(w));
@@ -2187,7 +2187,7 @@ impl MountRequest {
     pub fn to_args(&self) -> Result<Vec<u8>, Error> {
         let mut w = Writer::new();
         if let MountRequest::Mnt(path) | MountRequest::Umnt(path) = self {
-            write_opaque(&mut w, path, MAX_PATH);
+            w.opaque_bounded(path, MAX_PATH);
         }
         w.finish_value(self, |bytes| Self::read(self.procedure(), bytes))
     }
@@ -2276,7 +2276,7 @@ impl MountResponse {
                 Some(e) => Err(e),
             }),
             mount_procedure::DUMP => {
-                MountResponse::Dump(read_list(r, MAX_MOUNTS, usize::MAX, |r| {
+                MountResponse::Dump(r.list(MAX_MOUNTS, usize::MAX, |r| {
                     Ok(MountEntry {
                         hostname: read_mount_name(r)?,
                         directory: read_path(r)?,
@@ -2286,10 +2286,10 @@ impl MountResponse {
             mount_procedure::UMNT => MountResponse::Umnt,
             mount_procedure::UMNTALL => MountResponse::UmntAll,
             mount_procedure::EXPORT => {
-                MountResponse::Export(read_list(r, MAX_EXPORTS, EXPORT_LIST_BYTES, |r| {
+                MountResponse::Export(r.list(MAX_EXPORTS, EXPORT_LIST_BYTES, |r| {
                     Ok(ExportEntry {
                         directory: read_path(r)?,
-                        groups: read_list(r, MAX_GROUPS, usize::MAX, read_mount_name)?,
+                        groups: r.list(MAX_GROUPS, usize::MAX, read_mount_name)?,
                     })
                 })?)
             }
@@ -2337,19 +2337,19 @@ impl MountResponse {
             }
             MountResponse::Dump(mounts) => {
                 let kept = mounts.iter();
-                write_list(w, kept, MAX_MOUNTS, usize::MAX, |w, m| {
-                    write_opaque(w, m.hostname.as_bytes(), MAX_MOUNT_NAME);
-                    write_opaque(w, &m.directory, MAX_PATH);
+                w.list(kept, MAX_MOUNTS, usize::MAX, |w, m| {
+                    w.opaque_bounded(m.hostname.as_bytes(), MAX_MOUNT_NAME);
+                    w.opaque_bounded(&m.directory, MAX_PATH);
                 });
             }
             MountResponse::Export(exports) => {
                 // One export is at most about 68 KB, so the first always
                 // fits in EXPORT_LIST_BYTES.
                 let kept = exports.iter();
-                write_list(w, kept, MAX_EXPORTS, EXPORT_LIST_BYTES, |w, e| {
-                    write_opaque(w, &e.directory, MAX_PATH);
-                    write_list(w, e.groups.iter(), MAX_GROUPS, usize::MAX, |w, g| {
-                        write_opaque(w, g.as_bytes(), MAX_MOUNT_NAME);
+                w.list(kept, MAX_EXPORTS, EXPORT_LIST_BYTES, |w, e| {
+                    w.opaque_bounded(&e.directory, MAX_PATH);
+                    w.list(e.groups.iter(), MAX_GROUPS, usize::MAX, |w, g| {
+                        w.opaque_bounded(g.as_bytes(), MAX_MOUNT_NAME);
                     });
                 });
             }
@@ -2398,72 +2398,6 @@ fn write_outcome<T, F>(
 /// The most bytes the items of an EXPORT list take: all of
 /// [`MAX_EXPORT_BYTES`] but the word that ends the list.
 const EXPORT_LIST_BYTES: usize = MAX_EXPORT_BYTES - 4;
-
-/// Reads a linked list (a chain of optional items) of at most `max`
-/// items, in a loop, not by recursion. The items, each with the word
-/// before it, take at most `max_bytes`.
-fn read_list<'a, T>(
-    r: &mut Reader<'a>,
-    max: usize,
-    max_bytes: usize,
-    mut item: impl FnMut(&mut Reader<'a>) -> Result<T, Error>,
-) -> Result<Vec<T>, Error> {
-    let start = r.position();
-    let mut out = Vec::new();
-    while r.bool()? {
-        if out.len() >= max {
-            return Err(Error::TooLong(
-                u32::try_from(out.len())
-                    .unwrap_or(u32::MAX)
-                    .saturating_add(1),
-            ));
-        }
-        out.push(item(r)?);
-        let used = r.position() - start;
-        if used > max_bytes {
-            return Err(Error::TooLong(u32::try_from(used).unwrap_or(u32::MAX)));
-        }
-    }
-    Ok(out)
-}
-
-/// Appends a complete linked list within its count and byte limits.
-fn write_list<'a, T: 'a>(
-    w: &mut Writer,
-    items: impl IntoIterator<Item = &'a T>,
-    max: usize,
-    max_bytes: usize,
-    mut item: impl FnMut(&mut Writer, &T),
-) {
-    let mut used = 0usize;
-    for (written, value) in items.into_iter().enumerate() {
-        if written >= max {
-            w.reject(Error::TooLong(
-                u32::try_from(written).unwrap_or(u32::MAX),
-            ));
-            return;
-        }
-        let mut one = Writer::new();
-        one.bool(true);
-        item(&mut one, value);
-        let one = match one.finish() {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                w.reject(error);
-                return;
-            }
-        };
-        let Some(total) = used.checked_add(one.len()).filter(|n| *n <= max_bytes) else {
-            w.reject(Error::TooLong(
-                u32::try_from(max_bytes).unwrap_or(u32::MAX),
-            ));
-            return;
-        };
-        w.opaque_fixed(&one);
-        used = total;
-    }
-    w.bool(false);
-}
 
 /// Reads variable-length data of at most [`MAX_DATA`] bytes, which must be
 /// `count` bytes long.
@@ -2518,17 +2452,6 @@ fn read_symlink(r: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
 
 fn read_mount_name(r: &mut Reader<'_>) -> Result<String, Error> {
     Ok(r.string(MAX_MOUNT_NAME)?.to_owned())
-}
-
-/// Appends a bounded opaque field, or records a writer error.
-fn write_opaque(w: &mut Writer, bytes: &[u8], max: usize) {
-    if bytes.len() > max {
-        w.reject(Error::TooLong(
-            u32::try_from(bytes.len()).unwrap_or(u32::MAX),
-        ));
-    } else {
-        w.opaque(bytes);
-    }
 }
 
 #[cfg(test)]

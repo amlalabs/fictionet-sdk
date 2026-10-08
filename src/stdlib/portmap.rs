@@ -21,7 +21,7 @@
 //! [`PmapResult::to_bytes`] or [`RpcbResult::to_bytes`] as the results of
 //! a successful reply. What is registered, and what a forwarded call does,
 //! is up to world code. A portmapper sends no reply at all when CALLIT
-//! fails; [`silent_on_failure`](fictionet::stdlib::onc_rpc::silent_on_failure)
+//! fails; [`silent_on_failure`]
 //! says which calls those are.
 //!
 //! Over TCP, map [`onc_rpc::messages`] with a
@@ -51,9 +51,9 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
-//! use fictionet::stdlib::onc_rpc::{Accept, Body, Call, Message, Reply, silent_on_failure};
+//! use fictionet::stdlib::onc_rpc::{Accept, Body, Call, Message, Reply};
 //! use fictionet::stdlib::portmap::{
-//!     format_uaddr, parse_uaddr, procedure, Error, PmapRequest, PmapResult, Request, Rpcb,
+//!     silent_on_failure, format_uaddr, parse_uaddr, procedure, Error, PmapRequest, PmapResult, Request, Rpcb,
 //!     RpcbRequest, RpcbResult, IPPROTO_TCP,
 //! };
 //! use std::net::SocketAddr;
@@ -121,7 +121,98 @@ use fictionet::stdlib::onc_rpc::{
     self, Accept, Body, Call, MAX_RPCB_STRING, Message, PMAP_PROGRAM, PMAP_VERSION, RPC_VERSION,
     RPCB_VERSION_HIGH, RPCB_VERSION_LOW, Reader, Reject, Reply, Writer,
 };
-pub use fictionet::stdlib::onc_rpc::{IPPROTO_TCP, IPPROTO_UDP, Mapping, PORT, Rpcb};
+pub use fictionet::stdlib::onc_rpc::{IPPROTO_TCP, IPPROTO_UDP, PORT};
+
+/// A portmapper mapping: a program and version, a protocol, and the port
+/// it listens on (RFC 1833, section 3.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Mapping {
+    /// The program number.
+    pub program: u32,
+    /// The program's version.
+    pub version: u32,
+    /// [`IPPROTO_TCP`] or [`IPPROTO_UDP`].
+    pub protocol: u32,
+    /// The port. GETPORT and UNSET ignore it.
+    pub port: u32,
+}
+
+impl Mapping {
+    /// Reads a mapping from the reader.
+    pub fn read(r: &mut Reader<'_>) -> Result<Mapping, onc_rpc::Error> {
+        Ok(Mapping {
+            program: r.uint()?,
+            version: r.uint()?,
+            protocol: r.uint()?,
+            port: r.uint()?,
+        })
+    }
+
+    /// Writes the mapping.
+    pub fn write(&self, w: &mut Writer) {
+        w.uint(self.program)
+            .uint(self.version)
+            .uint(self.protocol)
+            .uint(self.port);
+    }
+}
+
+/// An rpcbind registration: a program and version, the network it is on,
+/// its address there, and who registered it (RFC 1833, section 2.1).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Rpcb {
+    /// The program number.
+    pub program: u32,
+    /// The program's version.
+    pub version: u32,
+    /// The network ID, such as "tcp", "udp", "tcp6" or "udp6".
+    pub netid: String,
+    /// The universal address, such as "10.0.0.5.8.1" for port 2049. See
+    /// [`portmap::format_uaddr`](fictionet::stdlib::portmap::format_uaddr).
+    pub addr: String,
+    /// Who registered it, usually a user ID as a string.
+    pub owner: String,
+}
+
+impl Rpcb {
+    /// Reads a registration from the reader. Each string may have at most
+    /// [`MAX_RPCB_STRING`] bytes.
+    pub fn read(r: &mut Reader<'_>) -> Result<Rpcb, onc_rpc::Error> {
+        Ok(Rpcb {
+            program: r.uint()?,
+            version: r.uint()?,
+            netid: r.string(MAX_RPCB_STRING)?.to_string(),
+            addr: r.string(MAX_RPCB_STRING)?.to_string(),
+            owner: r.string(MAX_RPCB_STRING)?.to_string(),
+        })
+    }
+
+    /// Writes the registration. Strings over [`MAX_RPCB_STRING`] bytes
+    /// set a writer error and return [`Error::TooLong`].
+    pub fn write(&self, w: &mut Writer) -> Result<(), Error> {
+        w.uint(self.program).uint(self.version);
+        for s in [&self.netid, &self.addr, &self.owner] {
+            if s.len() > MAX_RPCB_STRING {
+                w.reject(onc_rpc::Error::TooLong(
+                    u32::try_from(s.len()).unwrap_or(u32::MAX),
+                ));
+                return Err(Error::TooLong);
+            }
+            w.string(s);
+        }
+        Ok(())
+    }
+}
+
+/// Whether a call gets no reply when it fails: the portmapper's CALLIT and
+/// rpcbind's CALLIT and BCAST, all procedure 5 of program 100000 (RFC 1833,
+/// sections 2.2.1, 2.2.2 and 3.2). They reply only when the call they
+/// forward succeeds. rpcbind's INDIRECT replies with its errors.
+pub fn silent_on_failure(call: &Call) -> bool {
+    call.program == PMAP_PROGRAM
+        && (PMAP_VERSION..=RPCB_VERSION_HIGH).contains(&call.version)
+        && call.procedure == procedure::CALLIT
+}
 
 /// The longest string this module reads or writes: a network ID, a
 /// universal address, an owner, a protocol family or a protocol name.
@@ -325,7 +416,7 @@ impl CallArgs {
 
     fn write(&self, w: &mut Writer) -> Result<(), Error> {
         w.uint(self.program).uint(self.version).uint(self.procedure);
-        opaque(w, &self.args, MAX_CALL_DATA)
+        w.try_opaque(&self.args, MAX_CALL_DATA).map_err(|_| Error::TooLong)
     }
 }
 
@@ -389,7 +480,7 @@ impl Netbuf {
             return Err(Error::TooLong);
         }
         w.uint(self.maxlen);
-        opaque(w, &self.buf, MAX_NETBUF)
+        w.try_opaque(&self.buf, MAX_NETBUF).map_err(|_| Error::TooLong)
     }
 }
 
@@ -488,7 +579,7 @@ impl RpcbStat {
         }
         let setinfo = r.int()?;
         let unsetinfo = r.int()?;
-        let addrinfo = read_list(r, |r| {
+        let addrinfo = r.list(MAX_LIST, usize::MAX, |r| {
             Ok(AddrStat {
                 program: r.uint()?,
                 version: r.uint()?,
@@ -497,7 +588,7 @@ impl RpcbStat {
                 netid: r.string(MAX_STRING)?.to_string(),
             })
         })?;
-        let rmtinfo = read_list(r, |r| {
+        let rmtinfo = r.list(MAX_LIST, usize::MAX, |r| {
             Ok(RmtCallStat {
                 program: r.uint()?,
                 version: r.uint()?,
@@ -522,14 +613,14 @@ impl RpcbStat {
             w.int(n);
         }
         w.int(self.setinfo).int(self.unsetinfo);
-        write_list(w, &self.addrinfo, |w, a| {
+        w.try_list(MAX_LIST, Error::TooMany, &self.addrinfo, |w, a| {
             w.uint(a.program)
                 .uint(a.version)
                 .int(a.success)
                 .int(a.failure);
             string(w, &a.netid)
         })?;
-        write_list(w, &self.rmtinfo, |w, c| {
+        w.try_list(MAX_LIST, Error::TooMany, &self.rmtinfo, |w, c| {
             w.uint(c.program)
                 .uint(c.version)
                 .uint(c.procedure)
@@ -630,7 +721,7 @@ impl PmapResult {
             procedure::NULL => PmapResult::Null,
             procedure::SET | procedure::UNSET => PmapResult::Bool(r.bool()?),
             procedure::GETPORT => PmapResult::Port(r.uint()?),
-            procedure::DUMP => PmapResult::Dump(read_list(&mut r, Mapping::read)?),
+            procedure::DUMP => PmapResult::Dump(r.list(MAX_LIST, usize::MAX, Mapping::read)?),
             procedure::CALLIT => PmapResult::CallIt(CallResult {
                 port: r.uint()?,
                 results: r.opaque(MAX_CALL_DATA)?.to_vec(),
@@ -664,13 +755,13 @@ impl PmapResult {
             PmapResult::Port(p) => {
                 w.uint(*p);
             }
-            PmapResult::Dump(list) => write_list(&mut w, list, |w, m| {
+            PmapResult::Dump(list) => w.try_list(MAX_LIST, Error::TooMany, list, |w, m| {
                 m.write(w);
                 Ok(())
             })?,
             PmapResult::CallIt(c) => {
                 w.uint(c.port);
-                opaque(&mut w, &c.results, MAX_CALL_DATA)?;
+                w.try_opaque(&c.results, MAX_CALL_DATA).map_err(|_| Error::TooLong)?;
             }
         }
         w.finish().map_err(|_| Error::TooLong)
@@ -790,7 +881,7 @@ impl RpcbRequest {
             | RpcbRequest::Unset(b)
             | RpcbRequest::GetAddr(b)
             | RpcbRequest::GetVersAddr(b)
-            | RpcbRequest::GetAddrList(b) => write_rpcb(&mut w, b)?,
+            | RpcbRequest::GetAddrList(b) => b.write(&mut w)?,
             RpcbRequest::CallIt(c) | RpcbRequest::Indirect(c) => c.write(&mut w)?,
             RpcbRequest::Uaddr2Taddr(s) => string(&mut w, s)?,
             RpcbRequest::Taddr2Uaddr(n) => n.write(&mut w)?,
@@ -836,14 +927,14 @@ impl RpcbResult {
             procedure::GETADDR | procedure::TADDR2UADDR | procedure::GETVERSADDR => {
                 RpcbResult::Addr(r.string(MAX_STRING)?.to_string())
             }
-            procedure::DUMP => RpcbResult::Dump(read_list(&mut r, Rpcb::read)?),
+            procedure::DUMP => RpcbResult::Dump(r.list(MAX_LIST, usize::MAX, Rpcb::read)?),
             procedure::CALLIT | procedure::INDIRECT => RpcbResult::CallIt(RmtCallResult {
                 addr: r.string(MAX_STRING)?.to_string(),
                 results: r.opaque(MAX_CALL_DATA)?.to_vec(),
             }),
             procedure::GETTIME => RpcbResult::Time(r.uint()?),
             procedure::UADDR2TADDR => RpcbResult::Netbuf(Netbuf::read(&mut r)?),
-            procedure::GETADDRLIST => RpcbResult::AddrList(read_list(&mut r, RpcbEntry::read)?),
+            procedure::GETADDRLIST => RpcbResult::AddrList(r.list(MAX_LIST, usize::MAX, RpcbEntry::read)?),
             procedure::GETSTAT => RpcbResult::Stat(Box::new([
                 RpcbStat::read(&mut r)?,
                 RpcbStat::read(&mut r)?,
@@ -881,16 +972,16 @@ impl RpcbResult {
                 w.bool(*b);
             }
             RpcbResult::Addr(s) => string(&mut w, s)?,
-            RpcbResult::Dump(list) => write_list(&mut w, list, write_rpcb)?,
+            RpcbResult::Dump(list) => w.try_list(MAX_LIST, Error::TooMany, list, |w, b| b.write(w))?,
             RpcbResult::CallIt(c) => {
                 string(&mut w, &c.addr)?;
-                opaque(&mut w, &c.results, MAX_CALL_DATA)?;
+                w.try_opaque(&c.results, MAX_CALL_DATA).map_err(|_| Error::TooLong)?;
             }
             RpcbResult::Time(t) => {
                 w.uint(*t);
             }
             RpcbResult::Netbuf(n) => n.write(&mut w)?,
-            RpcbResult::AddrList(list) => write_list(&mut w, list, |w, e| e.write(w))?,
+            RpcbResult::AddrList(list) => w.try_list(MAX_LIST, Error::TooMany, list, |w, e| e.write(w))?,
             RpcbResult::Stat(stats) => {
                 for s in stats.iter() {
                     s.write(&mut w)?;
@@ -918,7 +1009,7 @@ pub enum Request {
 impl Request {
     /// Reads the request a call makes. When the call is not one, the
     /// error's [`Error::status`] is what a portmapper replies with,
-    /// unless [`silent_on_failure`](fictionet::stdlib::onc_rpc::silent_on_failure)
+    /// unless [`silent_on_failure`]
     /// says it sends no reply. A call whose RPC version is not 2 is
     /// [`Error::RpcVersion`], whose reply is
     /// [`Error::reply`]. The credentials are not checked.
@@ -1028,62 +1119,6 @@ fn string(w: &mut Writer, s: &str) -> Result<(), Error> {
         return Err(Error::TooLong);
     }
     w.string(s);
-    Ok(())
-}
-
-/// Writes opaque data of at most `max` bytes.
-fn opaque(w: &mut Writer, data: &[u8], max: usize) -> Result<(), Error> {
-    if data.len() > max {
-        return Err(Error::TooLong);
-    }
-    w.opaque(data);
-    Ok(())
-}
-
-/// Writes a registration whose strings are each at most [`MAX_STRING`]
-/// bytes, as [`Rpcb::read`] reads them.
-fn write_rpcb(w: &mut Writer, b: &Rpcb) -> Result<(), Error> {
-    w.uint(b.program).uint(b.version);
-    string(w, &b.netid)?;
-    string(w, &b.addr)?;
-    string(w, &b.owner)
-}
-
-/// Reads an XDR linked list: each entry behind a 1, ended by a 0. A list
-/// longer than [`MAX_LIST`] is refused. It reads in a loop, so a long
-/// list never deepens the stack.
-fn read_list<'a, T>(
-    r: &mut Reader<'a>,
-    mut item: impl FnMut(&mut Reader<'a>) -> Result<T, onc_rpc::Error>,
-) -> Result<Vec<T>, onc_rpc::Error> {
-    let mut out = Vec::new();
-    while r.bool()? {
-        if out.len() >= MAX_LIST {
-            return Err(onc_rpc::Error::TooLong(
-                u32::try_from(MAX_LIST)
-                    .unwrap_or(u32::MAX)
-                    .saturating_add(1),
-            ));
-        }
-        out.push(item(r)?);
-    }
-    Ok(out)
-}
-
-/// Writes an XDR linked list of at most [`MAX_LIST`] entries.
-fn write_list<T>(
-    w: &mut Writer,
-    items: &[T],
-    mut item: impl FnMut(&mut Writer, &T) -> Result<(), Error>,
-) -> Result<(), Error> {
-    if items.len() > MAX_LIST {
-        return Err(Error::TooMany);
-    }
-    for i in items {
-        w.bool(true);
-        item(w, i)?;
-    }
-    w.bool(false);
     Ok(())
 }
 
@@ -1891,7 +1926,7 @@ mod tests {
     /// when they fail. INDIRECT and the rest are not.
     #[test]
     fn silent_calls() {
-        use fictionet::stdlib::onc_rpc::silent_on_failure;
+        use fictionet::stdlib::portmap::silent_on_failure;
         let c = CallArgs::default();
         let silent = [
             Request::Pmap(PmapRequest::CallIt(c.clone())),

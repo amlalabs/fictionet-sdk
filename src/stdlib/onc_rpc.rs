@@ -24,11 +24,11 @@
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Assembled, Wire};
 //! use fictionet::stdlib::onc_rpc::{
-//!     records, silent_on_failure, Body, Call, Record, Mapping, Message, MAX_RECORD,
+//!     records, Body, Call, Record, Message, MAX_RECORD,
 //!     Reply, IPPROTO_TCP,
 //! };
 //!
-//! use fictionet::stdlib::portmap::{Request, PmapRequest, PmapResult};
+//! use fictionet::stdlib::portmap::{Mapping, silent_on_failure, Request, PmapRequest, PmapResult};
 //!
 //! /// A portmapper that knows one program: NFS version 3 on TCP port 2049.
 //! /// `None` means it sends no reply.
@@ -79,9 +79,9 @@ pub const PMAP_VERSION: u32 = 2;
 pub const RPCB_VERSION_LOW: u32 = 3;
 /// The highest rpcbind version (RFC 1833, section 2).
 pub const RPCB_VERSION_HIGH: u32 = 4;
-/// The protocol number a [`Mapping`] gives for TCP.
+/// The protocol number a [`Mapping`](fictionet::stdlib::portmap::Mapping) gives for TCP.
 pub const IPPROTO_TCP: u32 = 6;
-/// The protocol number a [`Mapping`] gives for UDP.
+/// The protocol number a [`Mapping`](fictionet::stdlib::portmap::Mapping) gives for UDP.
 pub const IPPROTO_UDP: u32 = 17;
 
 /// The longest body of a credential or verifier (RFC 5531, section 8.2).
@@ -330,6 +330,34 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    /// Reads a linked list (a chain of optional items) of at most `max`
+    /// items, in a loop, not by recursion. The items, each with the word
+    /// before it, take at most `max_bytes`.
+    pub fn list<T>(
+        &mut self,
+        max: usize,
+        max_bytes: usize,
+        mut item: impl FnMut(&mut Reader<'a>) -> Result<T, Error>,
+    ) -> Result<Vec<T>, Error> {
+        let start = self.position();
+        let mut out = Vec::new();
+        while self.bool()? {
+            if out.len() >= max {
+                return Err(Error::TooLong(
+                    u32::try_from(out.len())
+                        .unwrap_or(u32::MAX)
+                        .saturating_add(1),
+                ));
+            }
+            out.push(item(self)?);
+            let used = self.position() - start;
+            if used > max_bytes {
+                return Err(Error::TooLong(u32::try_from(used).unwrap_or(u32::MAX)));
+            }
+        }
+        Ok(out)
+    }
+
     /// An optional value: a boolean, then the value if it is 1.
     pub fn optional<T>(
         &mut self,
@@ -458,6 +486,83 @@ impl Writer {
         };
         self.uint(len);
         self.opaque_fixed(data)
+    }
+
+    /// Appends a complete linked list within its count and byte limits.
+    pub fn list<'a, T: 'a>(
+        &mut self,
+        items: impl IntoIterator<Item = &'a T>,
+        max: usize,
+        max_bytes: usize,
+        mut item: impl FnMut(&mut Writer, &T),
+    ) {
+        let mut used = 0usize;
+        for (written, value) in items.into_iter().enumerate() {
+            if written >= max {
+                self.reject(Error::TooLong(
+                    u32::try_from(written).unwrap_or(u32::MAX),
+                ));
+                return;
+            }
+            let mut one = Writer::new();
+            one.bool(true);
+            item(&mut one, value);
+            let one = match one.finish() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.reject(error);
+                    return;
+                }
+            };
+            let Some(total) = used.checked_add(one.len()).filter(|n| *n <= max_bytes) else {
+                self.reject(Error::TooLong(
+                    u32::try_from(max_bytes).unwrap_or(u32::MAX),
+                ));
+                return;
+            };
+            self.opaque_fixed(&one);
+            used = total;
+        }
+        self.bool(false);
+    }
+
+    /// Appends bounded opaque data, or records a writer error.
+    #[inline]
+    pub fn opaque_bounded(&mut self, bytes: &[u8], max: usize) {
+        if let Err(error) = self.try_opaque(bytes, max) {
+            self.reject(error);
+        }
+    }
+
+    /// Appends bounded opaque data. A field over `max` is refused before writing.
+    /// Buffer errors are still reported by [`Self::finish`].
+    #[inline]
+    pub fn try_opaque(&mut self, bytes: &[u8], max: usize) -> Result<(), Error> {
+        if bytes.len() > max {
+            return Err(Error::TooLong(u32::try_from(bytes.len()).unwrap_or(u32::MAX)));
+        }
+        self.opaque(bytes);
+        Ok(())
+    }
+
+    /// Writes a linked list, returning `too_many` before writing if its count exceeds `max`.
+    /// Callback errors are returned unchanged.
+    pub fn try_list<T, E>(
+        &mut self,
+        max: usize,
+        too_many: E,
+        items: &[T],
+        mut item: impl FnMut(&mut Writer, &T) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if items.len() > max {
+            return Err(too_many);
+        }
+        for i in items {
+            self.bool(true);
+            item(self, i)?;
+        }
+        self.bool(false);
+        Ok(())
     }
 
     /// A string, written like variable-length opaque data.
@@ -1341,96 +1446,6 @@ pub fn encode_fragments(record: &[u8], fragment_len: usize) -> Result<Vec<u8>, E
     Ok(out)
 }
 
-/// A portmapper mapping: a program and version, a protocol, and the port
-/// it listens on (RFC 1833, section 3.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Mapping {
-    /// The program number.
-    pub program: u32,
-    /// The program's version.
-    pub version: u32,
-    /// [`IPPROTO_TCP`] or [`IPPROTO_UDP`].
-    pub protocol: u32,
-    /// The port. GETPORT and UNSET ignore it.
-    pub port: u32,
-}
-
-impl Mapping {
-    /// Reads a mapping from the reader.
-    pub fn read(r: &mut Reader<'_>) -> Result<Mapping, Error> {
-        Ok(Mapping {
-            program: r.uint()?,
-            version: r.uint()?,
-            protocol: r.uint()?,
-            port: r.uint()?,
-        })
-    }
-
-    /// Writes the mapping.
-    pub fn write(&self, w: &mut Writer) {
-        w.uint(self.program)
-            .uint(self.version)
-            .uint(self.protocol)
-            .uint(self.port);
-    }
-}
-
-/// An rpcbind registration: a program and version, the network it is on,
-/// its address there, and who registered it (RFC 1833, section 2.1).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Rpcb {
-    /// The program number.
-    pub program: u32,
-    /// The program's version.
-    pub version: u32,
-    /// The network ID, such as "tcp", "udp", "tcp6" or "udp6".
-    pub netid: String,
-    /// The universal address, such as "10.0.0.5.8.1" for port 2049. See
-    /// [`portmap::format_uaddr`](fictionet::stdlib::portmap::format_uaddr).
-    pub addr: String,
-    /// Who registered it, usually a user ID as a string.
-    pub owner: String,
-}
-
-impl Rpcb {
-    /// Reads a registration from the reader. Each string may have at most
-    /// [`MAX_RPCB_STRING`] bytes.
-    pub fn read(r: &mut Reader<'_>) -> Result<Rpcb, Error> {
-        Ok(Rpcb {
-            program: r.uint()?,
-            version: r.uint()?,
-            netid: r.string(MAX_RPCB_STRING)?.to_string(),
-            addr: r.string(MAX_RPCB_STRING)?.to_string(),
-            owner: r.string(MAX_RPCB_STRING)?.to_string(),
-        })
-    }
-
-    /// Writes the registration. Strings over [`MAX_RPCB_STRING`] bytes
-    /// set a writer error.
-    pub fn write(&self, w: &mut Writer) {
-        w.uint(self.program).uint(self.version);
-        for s in [&self.netid, &self.addr, &self.owner] {
-            if s.len() > MAX_RPCB_STRING {
-                w.reject(Error::TooLong(
-                    u32::try_from(s.len()).unwrap_or(u32::MAX),
-                ));
-                return;
-            }
-            w.string(s);
-        }
-    }
-}
-
-/// Whether a call gets no reply when it fails: the portmapper's CALLIT and
-/// rpcbind's CALLIT and BCAST, all procedure 5 of program 100000 (RFC 1833,
-/// sections 2.2.1, 2.2.2 and 3.2). They reply only when the call they
-/// forward succeeds. rpcbind's INDIRECT replies with its errors.
-pub fn silent_on_failure(call: &Call) -> bool {
-    call.program == PMAP_PROGRAM
-        && (PMAP_VERSION..=RPCB_VERSION_HIGH).contains(&call.version)
-        && call.procedure == procedure::CALLIT
-}
-
 impl From<Truncated> for Error {
     #[inline]
     fn from(_: Truncated) -> Self { Error::Short }
@@ -1442,7 +1457,7 @@ mod tests {
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump, test_support};
     use fictionet::stdlib::portmap::{
-        self, PmapRequest, PmapResult, Request, RpcbRequest, RpcbResult,
+        self, Mapping, Rpcb, silent_on_failure, PmapRequest, PmapResult, Request, RpcbRequest, RpcbResult,
     };
     use std::net::SocketAddr;
 

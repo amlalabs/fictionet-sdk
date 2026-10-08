@@ -470,8 +470,8 @@ impl PrincipalName {
 
     fn read(r: &mut Reader<'_>) -> Result<PrincipalName, Error> {
         let mut s = r.read_sequence()?;
-        let name_type = field(&mut s, 0, int32)?;
-        let components = field(&mut s, 1, |r| seq_of(r, MAX_NAME_COMPONENTS, "name-string", kstring))?;
+        let name_type = s.read_explicit_with(0, int32)?;
+        let components = s.read_explicit_with(1, |r| seq_of(r, MAX_NAME_COMPONENTS, "name-string", kstring))?;
         s.finish()?;
         Ok(PrincipalName { name_type, components })
     }
@@ -541,8 +541,8 @@ impl HostAddress {
 
     fn read(r: &mut Reader<'_>) -> Result<HostAddress, Error> {
         let mut s = r.read_sequence()?;
-        let addr_type = field(&mut s, 0, int32)?;
-        let address = field(&mut s, 1, octets)?;
+        let addr_type = s.read_explicit_with(0, int32)?;
+        let address = s.read_explicit_with(1, octets)?;
         s.finish()?;
         let a = HostAddress { addr_type, address };
         a.check()?;
@@ -572,8 +572,8 @@ pub struct PaData {
 impl PaData {
     fn read(r: &mut Reader<'_>) -> Result<PaData, Error> {
         let mut s = r.read_sequence()?;
-        let padata_type = field(&mut s, 1, int32)?;
-        let value = field(&mut s, 2, octets)?;
+        let padata_type = s.read_explicit_with(1, int32)?;
+        let value = s.read_explicit_with(2, octets)?;
         s.finish()?;
         Ok(PaData { padata_type, value })
     }
@@ -610,9 +610,9 @@ impl EncryptedData {
 
     fn read(r: &mut Reader<'_>) -> Result<EncryptedData, Error> {
         let mut s = r.read_sequence()?;
-        let etype = field(&mut s, 0, int32)?;
-        let kvno = optional(&mut s, 1, uint32)?;
-        let cipher = field(&mut s, 2, octets)?;
+        let etype = s.read_explicit_with(0, int32)?;
+        let kvno = s.read_optional_explicit_with(1, uint32)?;
+        let cipher = s.read_explicit_with(2, octets)?;
         s.finish()?;
         Ok(EncryptedData { etype, kvno, cipher })
     }
@@ -661,10 +661,10 @@ impl Ticket {
         let mut o = outer.reader()?;
         let mut s = o.read_sequence()?;
         o.finish()?;
-        field(&mut s, 0, version)?;
-        let realm = field(&mut s, 1, realm)?;
-        let sname = field(&mut s, 2, PrincipalName::read)?;
-        let enc_part = field(&mut s, 3, EncryptedData::read)?;
+        s.read_explicit_with(0, version)?;
+        let realm = s.read_explicit_with(1, realm)?;
+        let sname = s.read_explicit_with(2, PrincipalName::read)?;
+        let enc_part = s.read_explicit_with(3, EncryptedData::read)?;
         s.finish()?;
         Ok(Ticket { realm, sname, enc_part })
     }
@@ -748,17 +748,17 @@ impl KdcReqBody {
     fn read(r: &mut Reader<'_>) -> Result<KdcReqBody, Error> {
         let mut s = r.read_sequence()?;
         let body = KdcReqBody {
-            kdc_options: field(&mut s, 0, flags)?,
-            cname: optional(&mut s, 1, PrincipalName::read)?,
-            realm: field(&mut s, 2, realm)?,
-            sname: optional(&mut s, 3, PrincipalName::read)?,
-            from: optional(&mut s, 4, ktime)?,
-            till: field(&mut s, 5, ktime)?,
-            rtime: optional(&mut s, 6, ktime)?,
-            nonce: field(&mut s, 7, uint32)?,
-            etypes: field(&mut s, 8, |r| seq_of(r, MAX_ETYPES, "etype", int32))?,
+            kdc_options: s.read_explicit_with(0, flags)?,
+            cname: s.read_optional_explicit_with(1, PrincipalName::read)?,
+            realm: s.read_explicit_with(2, realm)?,
+            sname: s.read_optional_explicit_with(3, PrincipalName::read)?,
+            from: s.read_optional_explicit_with(4, ktime)?,
+            till: s.read_explicit_with(5, ktime)?,
+            rtime: s.read_optional_explicit_with(6, ktime)?,
+            nonce: s.read_explicit_with(7, uint32)?,
+            etypes: s.read_explicit_with(8, |r| seq_of(r, MAX_ETYPES, "etype", int32))?,
             addresses: optional_list(&mut s, 9, MAX_ADDRESSES, "addresses", HostAddress::read)?,
-            enc_authorization_data: optional(&mut s, 10, EncryptedData::read)?,
+            enc_authorization_data: s.read_optional_explicit_with(10, EncryptedData::read)?,
             additional_tickets: optional_list(&mut s, 11, MAX_TICKETS, "additional-tickets", Ticket::read)?,
         };
         s.finish()?;
@@ -835,10 +835,10 @@ impl KdcReq {
 
     fn read(r: &mut Reader<'_>, msg_type: i64) -> Result<KdcReq, Error> {
         let mut s = r.read_sequence()?;
-        field(&mut s, 1, version)?;
-        field(&mut s, 2, |r| expect_type(r, msg_type))?;
+        s.read_explicit_with(1, version)?;
+        s.read_explicit_with(2, |r| expect_type(r, msg_type))?;
         let padata = optional_list(&mut s, 3, MAX_PADATA, "padata", PaData::read)?;
-        let body = field(&mut s, 4, KdcReqBody::read)?;
+        let body = s.read_explicit_with(4, KdcReqBody::read)?;
         s.finish()?;
         Ok(KdcReq { padata, body })
     }
@@ -887,14 +887,14 @@ impl KdcRep {
 
     fn read(r: &mut Reader<'_>, msg_type: i64) -> Result<KdcRep, Error> {
         let mut s = r.read_sequence()?;
-        field(&mut s, 0, version)?;
-        field(&mut s, 1, |r| expect_type(r, msg_type))?;
+        s.read_explicit_with(0, version)?;
+        s.read_explicit_with(1, |r| expect_type(r, msg_type))?;
         let rep = KdcRep {
             padata: optional_list(&mut s, 2, MAX_PADATA, "padata", PaData::read)?,
-            crealm: field(&mut s, 3, realm)?,
-            cname: field(&mut s, 4, PrincipalName::read)?,
-            ticket: field(&mut s, 5, Ticket::read)?,
-            enc_part: field(&mut s, 6, EncryptedData::read)?,
+            crealm: s.read_explicit_with(3, realm)?,
+            cname: s.read_explicit_with(4, PrincipalName::read)?,
+            ticket: s.read_explicit_with(5, Ticket::read)?,
+            enc_part: s.read_explicit_with(6, EncryptedData::read)?,
         };
         s.finish()?;
         Ok(rep)
@@ -929,12 +929,12 @@ pub struct ApReq {
 impl ApReq {
     fn read(r: &mut Reader<'_>) -> Result<ApReq, Error> {
         let mut s = r.read_sequence()?;
-        field(&mut s, 0, version)?;
-        field(&mut s, 1, |r| expect_type(r, msg_type::AP_REQ))?;
+        s.read_explicit_with(0, version)?;
+        s.read_explicit_with(1, |r| expect_type(r, msg_type::AP_REQ))?;
         let req = ApReq {
-            ap_options: field(&mut s, 2, flags)?,
-            ticket: field(&mut s, 3, Ticket::read)?,
-            authenticator: field(&mut s, 4, EncryptedData::read)?,
+            ap_options: s.read_explicit_with(2, flags)?,
+            ticket: s.read_explicit_with(3, Ticket::read)?,
+            authenticator: s.read_explicit_with(4, EncryptedData::read)?,
         };
         s.finish()?;
         Ok(req)
@@ -962,9 +962,9 @@ pub struct ApRep {
 impl ApRep {
     fn read(r: &mut Reader<'_>) -> Result<ApRep, Error> {
         let mut s = r.read_sequence()?;
-        field(&mut s, 0, version)?;
-        field(&mut s, 1, |r| expect_type(r, msg_type::AP_REP))?;
-        let enc_part = field(&mut s, 2, EncryptedData::read)?;
+        s.read_explicit_with(0, version)?;
+        s.read_explicit_with(1, |r| expect_type(r, msg_type::AP_REP))?;
+        let enc_part = s.read_explicit_with(2, EncryptedData::read)?;
         s.finish()?;
         Ok(ApRep { enc_part })
     }
@@ -1023,20 +1023,20 @@ impl KrbError {
 
     fn read(r: &mut Reader<'_>) -> Result<KrbError, Error> {
         let mut s = r.read_sequence()?;
-        field(&mut s, 0, version)?;
-        field(&mut s, 1, |r| expect_type(r, msg_type::KRB_ERROR))?;
+        s.read_explicit_with(0, version)?;
+        s.read_explicit_with(1, |r| expect_type(r, msg_type::KRB_ERROR))?;
         let e = KrbError {
-            ctime: optional(&mut s, 2, ktime)?,
-            cusec: optional(&mut s, 3, microseconds)?,
-            stime: field(&mut s, 4, ktime)?,
-            susec: field(&mut s, 5, microseconds)?,
-            error_code: field(&mut s, 6, int32)?,
-            crealm: optional(&mut s, 7, realm)?,
-            cname: optional(&mut s, 8, PrincipalName::read)?,
-            realm: field(&mut s, 9, realm)?,
-            sname: field(&mut s, 10, PrincipalName::read)?,
-            e_text: optional(&mut s, 11, kstring)?,
-            e_data: optional(&mut s, 12, octets)?,
+            ctime: s.read_optional_explicit_with(2, ktime)?,
+            cusec: s.read_optional_explicit_with(3, microseconds)?,
+            stime: s.read_explicit_with(4, ktime)?,
+            susec: s.read_explicit_with(5, microseconds)?,
+            error_code: s.read_explicit_with(6, int32)?,
+            crealm: s.read_optional_explicit_with(7, realm)?,
+            cname: s.read_optional_explicit_with(8, PrincipalName::read)?,
+            realm: s.read_explicit_with(9, realm)?,
+            sname: s.read_explicit_with(10, PrincipalName::read)?,
+            e_text: s.read_optional_explicit_with(11, kstring)?,
+            e_data: s.read_optional_explicit_with(12, octets)?,
         };
         s.finish()?;
         Ok(e)
@@ -1336,27 +1336,6 @@ fn whole<T>(b: &[u8], rules: Rules, f: impl FnOnce(&mut Reader<'_>) -> Result<T,
     Ok(v)
 }
 
-/// Reads the explicitly tagged field `[n]`, which must hold exactly what
-/// `f` reads.
-fn field<'a, T>(r: &mut Reader<'a>, n: u32, f: impl FnOnce(&mut Reader<'a>) -> Result<T, Error>) -> Result<T, Error> {
-    let mut inner = r.read_explicit(n)?;
-    let v = f(&mut inner)?;
-    inner.finish()?;
-    Ok(v)
-}
-
-/// Reads the OPTIONAL field `[n]`, if it comes next.
-fn optional<'a, T>(
-    r: &mut Reader<'a>,
-    n: u32,
-    f: impl FnOnce(&mut Reader<'a>) -> Result<T, Error>,
-) -> Result<Option<T>, Error> {
-    if r.is_empty() || !r.peek()?.tag().same_type(Tag::context(n)) {
-        return Ok(None);
-    }
-    field(r, n, f).map(Some)
-}
-
 /// Reads a SEQUENCE OF with at most `max` entries.
 fn seq_of<'a, T>(
     r: &mut Reader<'a>,
@@ -1384,7 +1363,7 @@ fn optional_list<'a, T>(
     what: &'static str,
     f: impl FnMut(&mut Reader<'a>) -> Result<T, Error>,
 ) -> Result<Option<Vec<T>>, Error> {
-    Ok(optional(r, n, |r| seq_of(r, max, what, f))?.filter(|v| !v.is_empty()))
+    Ok(r.read_optional_explicit_with(n, |r| seq_of(r, max, what, f))?.filter(|v| !v.is_empty()))
 }
 
 fn limit(len: usize, max: usize, what: &'static str) -> Result<(), Error> {

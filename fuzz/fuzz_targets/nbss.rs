@@ -4,9 +4,9 @@
 
 use fictionet::stdlib::codec::{Decode, Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::nbss::{
-    Error, HEADER_LEN, MAX_LABEL, MAX_LENGTH, MAX_NAME_LEN, NAME_LEN, Name, NegativeCode, Packet,
-    Packets, decode_first_level,
+    Error, HEADER_LEN, MAX_LENGTH, Name, NegativeCode, Packet, Packets,
 };
+use fictionet::stdlib::nbns::{MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

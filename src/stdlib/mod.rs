@@ -247,9 +247,9 @@
 //! | [`mongodb`] | MongoDB BSON documents and wire protocol messages. | yes | yes |  |  |  | yes | yes |
 //! | [`mqtt`] | MQTT 3.1.1 control packets and topic matching. | yes | yes |  |  |  | yes | yes |
 //! | [`mysql`] | The MySQL client/server protocol: packets, the handshake, commands and result sets. | yes | yes | `ResultReader` |  |  | yes | yes |
-//! | [`nbdgm`] | NetBIOS Datagram Service packets, with fragment reassembly. | yes |  |  |  |  | yes | yes |
+//! | [`nbdgm`] | NetBIOS Datagram Service packets, with fragment reassembly and `nbns` name encoding. | yes |  |  |  |  | yes | yes |
 //! | [`nbns`] | NetBIOS Name Service queries, registrations and node status, with reply helpers. | yes |  |  |  |  | yes | yes |
-//! | [`nbss`] | NetBIOS Session Service packets. | yes | yes |  |  |  | yes | yes |
+//! | [`nbss`] | NetBIOS Session Service packets, using `nbns` name encoding. | yes | yes |  |  |  | yes | yes |
 //! | [`net`] | A network of hosts and services in a few lines: the sandboxes' subnet, DHCP, DNS, a router, machines, LANs and each host's services. |  |  |  |  |  |  | yes |
 //! | [`nfs`] | NFS version 3 and MOUNT version 3: the arguments and results of every procedure, over `onc_rpc`. |  |  |  |  |  | yes | yes |
 //! | [`ntlmssp`] | NTLM authentication: the NEGOTIATE, CHALLENGE and AUTHENTICATE messages. | yes |  |  |  |  | yes | yes |
@@ -287,7 +287,7 @@
 //! | [`sip`] | SIP messages, URIs and the headers a proxy reads. | yes | yes |  |  |  | yes | yes |
 //! | [`smb2`] | SMB2 and SMB3 messages, compound chains and their bodies. | yes | yes |  |  |  | yes | yes |
 //! | [`smtp`] | SMTP commands, replies and DATA, with a server-side decoder that switches between them. | yes | yes |  |  |  | yes | yes |
-//! | [`snmp`] | SNMP v1 and v2c messages, PDUs and OIDs. | yes | yes |  |  |  | yes | yes |
+//! | [`snmp`] | SNMP v1 and v2c messages, PDUs and OIDs, using `asn1` integer and length helpers. | yes | yes |  |  |  | yes | yes |
 //! | [`socks`] | SOCKS4, SOCKS4a and SOCKS5 handshake messages and the UDP request header. | yes | yes |  |  |  | yes | yes |
 //! | [`soupbintcp`] | SoupBinTCP 3.0 packets, a framer, and client and server sessions. | yes | yes | `Client`, `Server` |  |  | yes | yes |
 //! | [`spnego`] | SPNEGO negotiation tokens, as HTTP Negotiate, SMB and LDAP carry them. | yes | yes |  |  |  | yes | yes |

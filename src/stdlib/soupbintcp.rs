@@ -641,6 +641,65 @@ impl Clock {
     }
 }
 
+// Both roles keep the same frame, debug and timer transitions.
+macro_rules! session_receive_frame {
+    ($phase:ident) => {
+        /// Handles a decoded frame. A parse error closes the session as a protocol error.
+        pub fn receive_frame(
+            &mut self,
+            frame: &Result<Packet, Error>,
+            now_ms: u64,
+        ) -> Result<Vec<Action>, Error> {
+            match frame {
+                Ok(packet) => self.receive(packet, now_ms),
+                Err(_) => {
+                    let mut s = *self;
+                    s.clock.advance(now_ms)?;
+                    if s.phase == $phase::Closed {
+                        return Err(Error::State);
+                    }
+                    let actions = s.close(CloseReason::Protocol);
+                    *self = s;
+                    Ok(actions)
+                }
+            }
+        }
+    };
+}
+macro_rules! session_debug {
+    ($phase:ident) => {
+        /// A Debug packet in any state but closed. Refuses payloads over `MAX_PAYLOAD`.
+        pub fn debug(&mut self, text: &[u8], now_ms: u64) -> Result<Packet, Error> {
+            if text.len() > MAX_PAYLOAD {
+                return Err(Error::TooLong);
+            }
+            if self.phase == $phase::Closed {
+                return Err(Error::State);
+            }
+            self.clock.advance(now_ms)?;
+            self.clock.sent = now_ms;
+            Ok(Packet::Debug(text.to_vec()))
+        }
+    };
+}
+macro_rules! session_tick {
+    ($phase:ident, $login:pat, $heartbeat:expr) => {
+        /// Runs login, idle and heartbeat timers. Closed sessions return no actions.
+        pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
+            self.clock.advance(now_ms)?;
+            Ok(match self.phase {
+                $login if self.clock.login_expired() => self.close(CloseReason::LoginTimeout),
+                $phase::LoggedIn if self.clock.idle() => self.close(CloseReason::IdleTimeout),
+                $phase::LoggedIn if self.clock.heartbeat_due() => {
+                    self.clock.sent = now_ms;
+                    vec![Action::Send($heartbeat)]
+                }
+                _ => Vec::new(),
+            })
+        }
+    };
+}
+
 /// Where a [`Client`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientPhase {
@@ -722,27 +781,7 @@ impl Client {
         *self = s;
         Ok(actions)
     }
-    /// [`receive`](Self::receive) for a [`Packets`] item. A packet that did
-    /// not parse closes the session with [`CloseReason::Protocol`].
-    pub fn receive_frame(
-        &mut self,
-        frame: &Result<Packet, Error>,
-        now_ms: u64,
-    ) -> Result<Vec<Action>, Error> {
-        match frame {
-            Ok(packet) => self.receive(packet, now_ms),
-            Err(_) => {
-                let mut s = *self;
-                s.clock.advance(now_ms)?;
-                if s.phase == ClientPhase::Closed {
-                    return Err(Error::State);
-                }
-                let actions = s.close(CloseReason::Protocol);
-                *self = s;
-                Ok(actions)
-            }
-        }
-    }
+    session_receive_frame!(ClientPhase);
     fn receive_inner(&mut self, packet: &Packet) -> Result<Vec<Action>, Error> {
         if self.phase == ClientPhase::Closed {
             return Err(Error::State);
@@ -789,18 +828,7 @@ impl Client {
     pub fn send(&mut self, message: &[u8], now_ms: u64) -> Result<Packet, Error> {
         self.outbound(now_ms, message, |m| Packet::UnsequencedData(m.to_vec()))
     }
-    /// A Debug packet carrying `text` (2.1), in any state but closed.
-    pub fn debug(&mut self, text: &[u8], now_ms: u64) -> Result<Packet, Error> {
-        if text.len() > MAX_PAYLOAD {
-            return Err(Error::TooLong);
-        }
-        if self.phase == ClientPhase::Closed {
-            return Err(Error::State);
-        }
-        self.clock.advance(now_ms)?;
-        self.clock.sent = now_ms;
-        Ok(Packet::Debug(text.to_vec()))
-    }
+    session_debug!(ClientPhase);
     fn outbound(
         &mut self,
         now_ms: u64,
@@ -828,25 +856,7 @@ impl Client {
         actions.extend(self.close(CloseReason::Logout));
         Ok(actions)
     }
-    /// Runs the timers: the login timeout, the idle timeout, and a client
-    /// heartbeat after [`Timers::heartbeat_ms`] of sending nothing (1.3).
-    /// A closed session returns nothing.
-    pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
-        self.clock.advance(now_ms)?;
-        Ok(match self.phase {
-            ClientPhase::Connected | ClientPhase::Closed => Vec::new(),
-            ClientPhase::LoginSent if self.clock.login_expired() => {
-                self.close(CloseReason::LoginTimeout)
-            }
-            ClientPhase::LoginSent => Vec::new(),
-            ClientPhase::LoggedIn if self.clock.idle() => self.close(CloseReason::IdleTimeout),
-            ClientPhase::LoggedIn if self.clock.heartbeat_due() => {
-                self.clock.sent = now_ms;
-                vec![Action::Send(Packet::ClientHeartbeat)]
-            }
-            ClientPhase::LoggedIn => Vec::new(),
-        })
-    }
+    session_tick!(ClientPhase, ClientPhase::LoginSent, Packet::ClientHeartbeat);
     fn close(&mut self, reason: CloseReason) -> Vec<Action> {
         self.phase = ClientPhase::Closed;
         vec![Action::Event(Event::Disconnected(reason))]
@@ -930,27 +940,7 @@ impl Server {
         *self = s;
         Ok(actions)
     }
-    /// [`receive`](Self::receive) for a [`Packets`] item. A packet that did
-    /// not parse closes the session with [`CloseReason::Protocol`].
-    pub fn receive_frame(
-        &mut self,
-        frame: &Result<Packet, Error>,
-        now_ms: u64,
-    ) -> Result<Vec<Action>, Error> {
-        match frame {
-            Ok(packet) => self.receive(packet, now_ms),
-            Err(_) => {
-                let mut s = *self;
-                s.clock.advance(now_ms)?;
-                if s.phase == ServerPhase::Closed {
-                    return Err(Error::State);
-                }
-                let actions = s.close(CloseReason::Protocol);
-                *self = s;
-                Ok(actions)
-            }
-        }
-    }
+    session_receive_frame!(ServerPhase);
     /// Accepts the pending login into `session`, with `sequence` the
     /// number of the next sequenced message to be sent (2.2.1). Sequence
     /// numbers start at 1 in each session (1.2); `sequence` must be at
@@ -1006,18 +996,7 @@ impl Server {
         self.clock.sent = now_ms;
         Ok(Packet::SequencedData(message.to_vec()))
     }
-    /// A Debug packet carrying `text` (2.1), in any state but closed.
-    pub fn debug(&mut self, text: &[u8], now_ms: u64) -> Result<Packet, Error> {
-        if text.len() > MAX_PAYLOAD {
-            return Err(Error::TooLong);
-        }
-        if self.phase == ServerPhase::Closed {
-            return Err(Error::State);
-        }
-        self.clock.advance(now_ms)?;
-        self.clock.sent = now_ms;
-        Ok(Packet::Debug(text.to_vec()))
-    }
+    session_debug!(ServerPhase);
     /// Sends End of Session and closes (2.2.5). Only once logged in.
     pub fn end_session(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
         if self.phase != ServerPhase::LoggedIn {
@@ -1029,28 +1008,7 @@ impl Server {
         actions.extend(self.close(CloseReason::EndOfSession));
         Ok(actions)
     }
-    /// Runs the timers: the login timeout, the idle timeout, and a server
-    /// heartbeat after [`Timers::heartbeat_ms`] of sending nothing (1.3).
-    /// A closed session returns nothing.
-    pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
-        self.clock.advance(now_ms)?;
-        Ok(match self.phase {
-            ServerPhase::Closed => Vec::new(),
-            ServerPhase::AwaitingLogin | ServerPhase::LoginPending => {
-                if self.clock.login_expired() {
-                    self.close(CloseReason::LoginTimeout)
-                } else {
-                    Vec::new()
-                }
-            }
-            ServerPhase::LoggedIn if self.clock.idle() => self.close(CloseReason::IdleTimeout),
-            ServerPhase::LoggedIn if self.clock.heartbeat_due() => {
-                self.clock.sent = now_ms;
-                vec![Action::Send(Packet::ServerHeartbeat)]
-            }
-            ServerPhase::LoggedIn => Vec::new(),
-        })
-    }
+    session_tick!(ServerPhase, ServerPhase::AwaitingLogin | ServerPhase::LoginPending, Packet::ServerHeartbeat);
     fn close(&mut self, reason: CloseReason) -> Vec<Action> {
         self.phase = ServerPhase::Closed;
         vec![Action::Event(Event::Disconnected(reason))]

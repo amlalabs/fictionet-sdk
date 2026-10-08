@@ -753,6 +753,89 @@ impl Decode for ServerMessages {
     }
 }
 
+trait SessionInput: Decode<Error = FrameError, Item = Result<Self::Message, Error>> {
+    type Message;
+    fn receiving(phase: Phase) -> bool;
+    fn sending(phase: Phase) -> bool;
+    fn sync(&mut self, state: &State);
+    fn out_of_turn(&mut self) -> &mut bool;
+    fn step(state: &mut State, message: &Self::Message) -> Result<(), Error>;
+}
+
+impl SessionInput for ClientMessages {
+    type Message = ClientMessage;
+    fn receiving(phase: Phase) -> bool { phase.client_turn() }
+    fn sending(phase: Phase) -> bool { phase.server_turn() }
+    fn sync(&mut self, state: &State) { self.phase = state.phase; }
+    fn out_of_turn(&mut self) -> &mut bool { &mut self.out_of_turn }
+    fn step(state: &mut State, message: &ClientMessage) -> Result<(), Error> { state.client_step(message) }
+}
+
+impl SessionInput for ServerMessages {
+    type Message = ServerMessage;
+    fn receiving(phase: Phase) -> bool { phase.server_turn() }
+    fn sending(phase: Phase) -> bool { phase.client_turn() }
+    fn sync(&mut self, state: &State) {
+        self.phase = state.phase;
+        self.dialect = state.dialect;
+        self.format = state.format;
+    }
+    fn out_of_turn(&mut self) -> &mut bool { &mut self.out_of_turn }
+    fn step(state: &mut State, message: &ServerMessage) -> Result<(), Error> { state.server_step(message) }
+}
+
+fn session_push<D: SessionInput>(state: &mut State, input: &mut Stream<D>, bytes: &[u8]) -> usize {
+    if input.is_done() {
+        return bytes.len();
+    }
+    if *input.decoder().out_of_turn() {
+        return 0;
+    }
+    if D::sending(state.phase) && state.phase != Phase::Normal {
+        let room = MAX_PENDING
+            .min(input.decoder().capacity())
+            .saturating_sub(input.buffered());
+        let accepted = input.push(&bytes[..bytes.len().min(room)]);
+        if bytes.len() > room {
+            *input.decoder().out_of_turn() = true;
+            state.phase = Phase::Closed;
+        }
+        return accepted;
+    }
+    input.push(bytes)
+}
+
+type SessionItem<T> = Result<Result<T, Error>, codec::Fail<FrameError>>;
+
+fn session_next<D: SessionInput>(state: &mut State, input: &mut Stream<D>)
+    -> Option<SessionItem<D::Message>>
+{
+    if !D::receiving(state.phase)
+        && !matches!(state.phase, Phase::Closed | Phase::Unsupported(_))
+    {
+        return None;
+    }
+    input.decoder().sync(state);
+    let result = input.next()?;
+    Some(result.map(|item| {
+        let item = item.and_then(|m| {
+            D::step(state, &m)?;
+            Ok(m)
+        });
+        if item.is_err() && state.phase != Phase::Normal {
+            state.phase = Phase::Closed;
+        }
+        if D::sending(state.phase)
+            && state.phase != Phase::Normal
+            && input.buffered() > MAX_PENDING
+        {
+            *input.decoder().out_of_turn() = true;
+            state.phase = Phase::Closed;
+        }
+        item
+    }))
+}
+
 /// A server session whose client byte layer is a [`Stream<ClientMessages>`].
 ///
 /// This keeps the same two-direction protocol rules as [`Server`].
@@ -795,24 +878,7 @@ impl Server {
     /// reports [`FrameError::OutOfTurn`]. After completion, takes and drops all bytes.
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, bytes: &[u8]) -> usize {
-        if self.input.is_done() {
-            return bytes.len();
-        }
-        if self.input.decoder().out_of_turn {
-            return 0;
-        }
-        if self.state.phase.server_turn() && self.state.phase != Phase::Normal {
-            let room = MAX_PENDING
-                .min(self.input.decoder().capacity())
-                .saturating_sub(self.input.buffered());
-            let accepted = self.input.push(&bytes[..bytes.len().min(room)]);
-            if bytes.len() > room {
-                self.input.decoder().out_of_turn = true;
-                self.state.phase = Phase::Closed;
-            }
-            return accepted;
-        }
-        self.input.push(bytes)
+        session_push(&mut self.state, &mut self.input, bytes)
     }
     /// Marks the peer's input as ended. Drain to report truncation.
     pub fn end(&mut self) {
@@ -825,30 +891,7 @@ impl Server {
     pub fn next(
         &mut self,
     ) -> Option<Result<Result<ClientMessage, Error>, codec::Fail<FrameError>>> {
-        if !self.state.phase.client_turn()
-            && !matches!(self.state.phase, Phase::Closed | Phase::Unsupported(_))
-        {
-            return None;
-        }
-        self.input.decoder().phase = self.state.phase;
-        let result = self.input.next()?;
-        Some(result.map(|item| {
-            let item = item.and_then(|m| {
-                self.state.client_step(&m)?;
-                Ok(m)
-            });
-            if item.is_err() && self.state.phase != Phase::Normal {
-                self.state.phase = Phase::Closed;
-            }
-            if self.state.phase.server_turn()
-                && self.state.phase != Phase::Normal
-                && self.input.buffered() > MAX_PENDING
-            {
-                self.input.decoder().out_of_turn = true;
-                self.state.phase = Phase::Closed;
-            }
-            item
-        }))
+        session_next(&mut self.state, &mut self.input)
     }
     /// Writes a server message and advances the session only on success.
     /// Normal framebuffer replies must satisfy the client's requests.
@@ -940,24 +983,7 @@ impl Client {
     /// reports [`FrameError::OutOfTurn`]. After completion, takes and drops all bytes.
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, bytes: &[u8]) -> usize {
-        if self.input.is_done() {
-            return bytes.len();
-        }
-        if self.input.decoder().out_of_turn {
-            return 0;
-        }
-        if self.state.phase.client_turn() && self.state.phase != Phase::Normal {
-            let room = MAX_PENDING
-                .min(self.input.decoder().capacity())
-                .saturating_sub(self.input.buffered());
-            let accepted = self.input.push(&bytes[..bytes.len().min(room)]);
-            if bytes.len() > room {
-                self.input.decoder().out_of_turn = true;
-                self.state.phase = Phase::Closed;
-            }
-            return accepted;
-        }
-        self.input.push(bytes)
+        session_push(&mut self.state, &mut self.input, bytes)
     }
     /// Marks the peer's input as ended. Drain to report truncation.
     pub fn end(&mut self) {
@@ -970,30 +996,7 @@ impl Client {
     pub fn next(
         &mut self,
     ) -> Option<Result<Result<ServerMessage, Error>, codec::Fail<FrameError>>> {
-        if !self.state.phase.server_turn()
-            && !matches!(self.state.phase, Phase::Closed | Phase::Unsupported(_))
-        {
-            return None;
-        }
-        self.sync();
-        let result = self.input.next()?;
-        Some(result.map(|item| {
-            let item = item.and_then(|m| {
-                self.state.server_step(&m)?;
-                Ok(m)
-            });
-            if item.is_err() && self.state.phase != Phase::Normal {
-                self.state.phase = Phase::Closed;
-            }
-            if self.state.phase.client_turn()
-                && self.state.phase != Phase::Normal
-                && self.input.buffered() > MAX_PENDING
-            {
-                self.input.decoder().out_of_turn = true;
-                self.state.phase = Phase::Closed;
-            }
-            item
-        }))
+        session_next(&mut self.state, &mut self.input)
     }
     fn sync(&mut self) {
         let dec = self.input.decoder();

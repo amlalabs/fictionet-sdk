@@ -158,7 +158,8 @@ pub mod name_flags {
 
 /// The first-level encoding of a 16-byte NetBIOS name: each byte becomes
 /// two letters, `A` plus its high half, then `A` plus its low half.
-fn encode_first_level(name: &[u8; NAME_LEN]) -> [u8; ENCODED_LEN] {
+#[inline]
+pub fn encode_first_level(name: &[u8; NAME_LEN]) -> [u8; ENCODED_LEN] {
     let mut out = [0u8; ENCODED_LEN];
     for (i, b) in name.iter().enumerate() {
         out[2 * i] = b'A' + (b >> 4);
@@ -169,6 +170,7 @@ fn encode_first_level(name: &[u8; NAME_LEN]) -> [u8; ENCODED_LEN] {
 
 /// The 16-byte name a first-level label encodes. It returns `None` unless
 /// the label is 32 bytes, each an uppercase letter from `A` to `P`.
+#[inline]
 pub fn decode_first_level(label: &[u8]) -> Option<[u8; NAME_LEN]> {
     if label.len() != ENCODED_LEN {
         return None;

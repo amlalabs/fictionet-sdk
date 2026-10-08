@@ -146,6 +146,7 @@ macro_rules! protocols {
         pub mod mqtt;
         #[path = "../../src/stdlib/mysql.rs"]
         pub mod mysql;
+        // NBDGM and NBSS use the public NBNS name encoding helpers.
         #[path = "../../src/stdlib/nbdgm.rs"]
         pub mod nbdgm;
         #[path = "../../src/stdlib/nbns.rs"]
@@ -224,6 +225,7 @@ macro_rules! protocols {
         pub mod smb2;
         #[path = "../../src/stdlib/smtp.rs"]
         pub mod smtp;
+        // SNMP uses the public ASN.1 integer and length helpers.
         #[path = "../../src/stdlib/snmp.rs"]
         pub mod snmp;
         #[path = "../../src/stdlib/socks.rs"]

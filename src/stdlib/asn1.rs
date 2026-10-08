@@ -60,6 +60,32 @@ use std::fmt;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
+/// Implements DER [`Wire`] parsing and checked writing for a protocol item.
+///
+/// Pass the local ASN.1 module path, item and error types, the refusal value,
+/// and docs for each method. The item supplies `encode` and `decode` methods.
+/// The module path keeps copied protocol modules independent of this crate.
+#[macro_export]
+macro_rules! der_wire {
+    ($asn1:ident, impl Wire for $item:ty, $error:ty, $unwritable:expr,
+     [$(#[$parse:meta])*], [$(#[$write:meta])*]) => {
+        impl fictionet::stdlib::codec::Wire for $item {
+            type ParseError = $error;
+            type WriteError = $error;
+
+            $(#[$parse])*
+            fn parse(bytes: &[u8]) -> Result<Self, $error> {
+                Self::decode(bytes)
+            }
+
+            $(#[$write])*
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), $error> {
+                $asn1::write_checked(self, Self::encode, Self::decode, $unwritable, out)
+            }
+        }
+    };
+}
+
 /// Encodes `value` and appends the bytes only if `decode` reads the same value.
 ///
 /// Use this in [`Wire::write`] implementations with separate encode and decode
@@ -408,9 +434,9 @@ impl Header {
     }
 }
 
-/// Appends a definite length in its shortest form. Lengths above
-/// [`MAX_INPUT`] are never written, so this takes at most 4 bytes.
-fn encode_length(n: usize, out: &mut Vec<u8>) {
+/// Appends a definite length in its shortest form.
+#[inline]
+pub fn encode_length(n: usize, out: &mut Vec<u8>) {
     if n < 0x80 {
         out.push(n as u8);
     } else {
@@ -1067,6 +1093,41 @@ impl<'a> Reader<'a> {
         }
         self.rest = &self.rest[e.raw.len()..];
         Ok(Some(e))
+    }
+
+    /// Reads an optional explicit context field and returns its contents reader.
+    /// A matching outer element is consumed before its form is checked.
+    #[inline]
+    pub fn read_optional_explicit(&mut self, number: u32) -> Result<Option<Reader<'a>>, Error> {
+        self.read_optional(Tag::context(number))?.map(|e| e.reader()).transpose()
+    }
+
+    /// Reads an optional explicit context field with `f` and checks its end.
+    /// An absent field leaves the reader unchanged.
+    #[inline]
+    pub fn read_optional_explicit_with<T, E: From<Error>>(
+        &mut self,
+        number: u32,
+        f: impl FnOnce(&mut Reader<'a>) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        if self.is_empty() || !self.peek()?.tag().same_type(Tag::context(number)) {
+            return Ok(None);
+        }
+        self.read_explicit_with(number, f).map(Some)
+    }
+
+    /// Reads an explicit context field with `f`, then checks that it is exhausted.
+    /// The callback's error type preserves the caller's field errors.
+    #[inline]
+    pub fn read_explicit_with<T, E: From<Error>>(
+        &mut self,
+        number: u32,
+        f: impl FnOnce(&mut Reader<'a>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut inner = self.read_explicit(number)?;
+        let value = f(&mut inner)?;
+        inner.finish()?;
+        Ok(value)
     }
 
     /// Reads a BOOLEAN.
@@ -2168,7 +2229,8 @@ fn check_der(e: &Element<'_>) -> Result<(), Error> {
 
 /// Two's-complement bytes without redundant leading bytes. No bytes at
 /// all is zero.
-fn minimal_twos(b: &[u8]) -> &[u8] {
+#[inline]
+pub fn minimal_twos(b: &[u8]) -> &[u8] {
     let mut b = b;
     while let [first, second, ..] = b {
         if (*first == 0 && second & 0x80 == 0) || (*first == 0xff && second & 0x80 != 0) {

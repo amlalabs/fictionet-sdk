@@ -58,6 +58,7 @@
 //! assert_eq!(back.pdu.bindings()[0].value, Value::OctetString(b"pump controller".to_vec()));
 //! ```
 
+use fictionet::stdlib::asn1;
 use std::fmt;
 use std::str::FromStr;
 
@@ -291,18 +292,6 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// The bytes of a length field, minimal.
-fn write_len(out: &mut Vec<u8>, len: usize) {
-    if len < 0x80 {
-        out.push(len as u8);
-    } else {
-        let bytes = (len as u64).to_be_bytes();
-        let skip = bytes.iter().take_while(|&&b| b == 0).count();
-        out.push(0x80 | (8 - skip) as u8);
-        out.extend_from_slice(&bytes[skip..]);
-    }
-}
-
 /// How many bytes an element takes whose content is `len` bytes long,
 /// or `usize::MAX` if that does not fit in a `usize`.
 fn tlv_len(len: usize) -> usize {
@@ -312,39 +301,31 @@ fn tlv_len(len: usize) -> usize {
 
 fn write_tlv(out: &mut Vec<u8>, t: u8, content: &[u8]) {
     out.push(t);
-    write_len(out, content.len());
+    asn1::encode_length(content.len(), out);
     out.extend_from_slice(content);
 }
 
 /// An integer's content as a number. Redundant leading sign bytes are
 /// allowed, so a value written by another encoder is still read.
 fn read_int(c: &[u8]) -> Result<i128, Error> {
-    let mut c = c;
-    while c.len() > 1 && ((c[0] == 0 && c[1] & 0x80 == 0) || (c[0] == 0xff && c[1] & 0x80 != 0)) {
-        c = &c[1..];
-    }
-    if c.is_empty() || c.len() > 9 {
+    if c.is_empty() {
         return Err(Error::Integer);
     }
-    let mut v: i128 = if c[0] & 0x80 != 0 { -1 } else { 0 };
-    for &b in c {
-        v = (v << 8) | i128::from(b);
+    let bytes = asn1::minimal_twos(c);
+    if bytes.len() > 9 {
+        return Err(Error::Integer);
     }
-    Ok(v)
+    asn1::Integer::from_bytes(bytes).ok().and_then(|n| n.to_i128()).ok_or(Error::Integer)
 }
 
 /// The minimal two's complement content of an integer.
+#[cfg(test)]
 fn int_content(v: i128) -> Vec<u8> {
-    let bytes = v.to_be_bytes();
-    let mut i = 0;
-    while i < 15 && ((bytes[i] == 0 && bytes[i + 1] & 0x80 == 0) || (bytes[i] == 0xff && bytes[i + 1] & 0x80 != 0)) {
-        i += 1;
-    }
-    bytes[i..].to_vec()
+    asn1::minimal_twos(&v.to_be_bytes()).to_vec()
 }
 
 fn write_int(out: &mut Vec<u8>, t: u8, v: i128) {
-    write_tlv(out, t, &int_content(v));
+    write_tlv(out, t, asn1::minimal_twos(&v.to_be_bytes()));
 }
 
 /// The length of a whole message at the start of `b`, for splitting a
@@ -772,13 +753,13 @@ impl Value {
     /// How many bytes the value's content takes.
     fn content_len(&self) -> usize {
         match self {
-            Value::Integer(v) => int_content((*v).into()).len(),
+            Value::Integer(v) => asn1::minimal_twos(&i128::from(*v).to_be_bytes()).len(),
             Value::OctetString(b) | Value::Opaque(b) => b.len(),
             Value::Null | Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView => 0,
             Value::ObjectIdentifier(o) => o.content_len(),
             Value::IpAddress(_) => 4,
-            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => int_content((*v).into()).len(),
-            Value::Counter64(v) => int_content((*v).into()).len(),
+            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => asn1::minimal_twos(&i128::from(*v).to_be_bytes()).len(),
+            Value::Counter64(v) => asn1::minimal_twos(&i128::from(*v).to_be_bytes()).len(),
         }
     }
 
@@ -791,7 +772,7 @@ impl Value {
             Value::Null | Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView => write_tlv(out, t, &[]),
             Value::ObjectIdentifier(o) => {
                 out.push(t);
-                write_len(out, o.content_len());
+                asn1::encode_length(o.content_len(), out);
                 o.write(out)?;
             }
             Value::IpAddress(a) => write_tlv(out, t, a),
@@ -832,9 +813,9 @@ impl VarBind {
     /// Writes the binding's whole element, straight into `out`.
     fn write_fields(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         out.push(tag::SEQUENCE);
-        write_len(out, self.content_len());
+        asn1::encode_length(self.content_len(), out);
         out.push(tag::OBJECT_IDENTIFIER);
-        write_len(out, self.name.content_len());
+        asn1::encode_length(self.name.content_len(), out);
         self.name.write(out)?;
         self.value.write_fields(out)?;
         Ok(())
@@ -1261,17 +1242,17 @@ impl Pdu {
                         i128::from(t.time_stamp),
                     ]
                     .iter()
-                    .map(|&v| tlv_len(int_content(v).len()))
+                    .map(|&v| tlv_len(asn1::minimal_twos(&v.to_be_bytes()).len()))
                     .sum::<usize>()
             }
             Pdu::GetBulk(b) => [b.request_id, b.non_repeaters, b.max_repetitions]
                 .iter()
-                .map(|&v| tlv_len(int_content(v.into()).len()))
+                .map(|&v| tlv_len(asn1::minimal_twos(&i128::from(v).to_be_bytes()).len()))
                 .sum(),
             _ => self.basic().map_or(0, |p| {
                 [p.request_id, p.error_status.code(), p.error_index]
                     .iter()
-                    .map(|&v| tlv_len(int_content(v.into()).len()))
+                    .map(|&v| tlv_len(asn1::minimal_twos(&i128::from(v).to_be_bytes()).len()))
                     .sum()
             }),
         }
@@ -1499,14 +1480,14 @@ impl Wire for Message {
         let content = 3 + tlv_len(self.community.len()) + tlv_len(pdu);
         let mut out = Vec::with_capacity(total);
         out.push(tag::SEQUENCE);
-        write_len(&mut out, content);
+        asn1::encode_length(content, &mut out);
         write_int(&mut out, tag::INTEGER, self.version.code().into());
         write_tlv(&mut out, tag::OCTET_STRING, &self.community);
         out.push(self.pdu.tag());
-        write_len(&mut out, pdu);
+        asn1::encode_length(pdu, &mut out);
         out.extend_from_slice(&head);
         out.push(tag::SEQUENCE);
-        write_len(&mut out, list);
+        asn1::encode_length(list, &mut out);
         for b in bindings {
             b.write_fields(&mut out).map_err(|_| Error::Unwritable)?;
         }
@@ -2335,7 +2316,7 @@ mod tests {
     fn tlv_len_matches_writer() {
         for n in [0usize, 1, 127, 128, 255, 256, 65_535, 65_536, 1 << 24] {
             let mut out = Vec::new();
-            write_len(&mut out, n);
+            asn1::encode_length(n, &mut out);
             assert_eq!(tlv_len(n), 1 + out.len() + n, "{n}");
         }
     }

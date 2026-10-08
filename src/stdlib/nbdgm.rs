@@ -72,6 +72,7 @@
 //! assert_eq!(d.data, announcement);
 //! ```
 
+use fictionet::stdlib::nbns::{NAME_LEN, ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, encode_first_level, decode_first_level};
 use fictionet::stdlib::codec::{be16, Wire};
 
 use std::net::Ipv4Addr;
@@ -89,15 +90,6 @@ pub const ERROR_LEN: usize = HEADER_LEN + 1;
 /// The longest packet this module reads or writes: the most bytes one UDP
 /// datagram over IPv4 can carry. A longer packet is refused.
 pub const MAX_PACKET: usize = 65_507;
-/// The length of a NetBIOS name: 15 characters and a suffix byte.
-pub const NAME_LEN: usize = 16;
-/// The length of a NetBIOS name in the first-level encoding.
-pub const ENCODED_LEN: usize = 2 * NAME_LEN;
-/// The longest label in a name's scope.
-pub const MAX_LABEL: usize = 63;
-/// The longest name on the wire: every label with its length byte, and
-/// the zero byte that ends the name.
-pub const MAX_NAME_LEN: usize = 255;
 /// The most datagram bytes a [`Reassembler`] puts back together. The
 /// offset field is 16 bits, so no whole datagram is meant to be longer.
 pub const MAX_REASSEMBLED: usize = 65_535;
@@ -133,31 +125,6 @@ pub mod flag {
     pub const NODE_TYPE: u8 = 0x0c;
     /// Bits the RFC reserves, which must be zero. Readers ignore them.
     pub const RESERVED: u8 = 0xf0;
-}
-
-/// The first-level encoding of a 16-byte NetBIOS name: each byte becomes
-/// two letters, `A` plus its high half, then `A` plus its low half.
-fn encode_first_level(name: &[u8; NAME_LEN]) -> [u8; ENCODED_LEN] {
-    let mut out = [0u8; ENCODED_LEN];
-    for (i, b) in name.iter().enumerate() {
-        out[2 * i] = b'A' + (b >> 4);
-        out[2 * i + 1] = b'A' + (b & 0x0f);
-    }
-    out
-}
-
-/// The 16-byte name a first-level label encodes. It returns `None` unless
-/// the label is 32 bytes, each an uppercase letter from `A` to `P`.
-pub fn decode_first_level(label: &[u8]) -> Option<[u8; NAME_LEN]> {
-    if label.len() != ENCODED_LEN {
-        return None;
-    }
-    let half = |c: u8| if (b'A'..=b'P').contains(&c) { Some(c - b'A') } else { None };
-    let mut out = [0u8; NAME_LEN];
-    for (i, pair) in label.as_chunks::<2>().0.iter().enumerate() {
-        out[i] = half(pair[0])? << 4 | half(pair[1])?;
-    }
-    Some(out)
 }
 
 /// A NetBIOS name, with its scope.
