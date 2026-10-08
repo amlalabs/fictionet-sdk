@@ -2671,6 +2671,7 @@ fn timestamp_nanos(value: [u32; 7]) -> Result<u128, Error> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::test_support::check_atomic;
     use super::*;
     use fictionet::stdlib::codec::{
         Stream,
@@ -4389,11 +4390,10 @@ mod tests {
     fn invalid_session_calls_are_transactional_and_time_is_checked() {
         let mut s = established(Version::Fix44);
         s.tick(10, TIME).unwrap();
-        let before = (s.next_inbound(), s.next_outbound(), s.last_now);
-        assert!(s.tick(9, TIME).is_err());
-        assert!(s.tick(11, b"20260230-12:00:00").is_err());
-        assert!(s.gap_fill(0, 1, TIME, 11, TIME).is_err());
-        assert_eq!((s.next_inbound(), s.next_outbound(), s.last_now), before);
+        let capture = |s: &Session| (s.next_inbound(), s.next_outbound(), s.last_now);
+        assert!(check_atomic(&mut s, |s| s.tick(9, TIME), capture).is_err());
+        assert!(check_atomic(&mut s, |s| s.tick(11, b"20260230-12:00:00"), capture).is_err());
+        assert!(check_atomic(&mut s, |s| s.gap_fill(0, 1, TIME, 11, TIME), capture).is_err());
         assert_eq!(
             timestamp(b"20261006-12:00:00").unwrap(),
             timestamp(b"20261006-12:00:00.000000000").unwrap()

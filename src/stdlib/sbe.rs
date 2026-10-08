@@ -32,7 +32,7 @@
 //! present in the value tree but occupy no wire bytes. Fields introduced
 //! after the acting version become [`Value::Absent`] (section 5.4).
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Work};
 use fictionet::stdlib::xml;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
@@ -1615,14 +1615,9 @@ impl Block {
 
     /// Adds the work of `count` entries to `work`, plus one visit of this
     /// definition, so an empty group still costs its member walk.
-    fn charge(&self, work: &mut usize, count: usize) -> Result<(), Error> {
-        *work = count
-            .checked_mul(self.work)
-            .and_then(|n| n.checked_add(self.members.len() + 1))
-            .and_then(|n| work.checked_add(n))
-            .filter(|n| *n <= MAX_VALUES)
-            .ok_or(Error::Limit("MAX_VALUES"))?;
-        Ok(())
+    fn charge(&self, work: &mut Work, count: usize) -> Result<(), Error> {
+        work.charge_product(count, self.work, self.members.len() + 1)
+            .map_err(|_| Error::Limit("MAX_VALUES"))
     }
     fn counts(&self, version: u64) -> (u64, u64) {
         let mut groups = 0;
@@ -1751,20 +1746,20 @@ impl Layout {
     }
 }
 
-#[derive(Default)]
 struct Budget {
-    nodes: usize,
+    nodes: Work,
     bytes: usize,
-    work: usize,
+    work: Work,
+}
+impl Default for Budget {
+    fn default() -> Self {
+        Self { nodes: Work::new("MAX_VALUES", MAX_VALUES), bytes: 0,
+            work: Work::new("MAX_VALUES", MAX_VALUES) }
+    }
 }
 impl Budget {
     fn nodes(&mut self, n: usize) -> Result<(), Error> {
-        self.nodes = self
-            .nodes
-            .checked_add(n)
-            .filter(|v| *v <= MAX_VALUES)
-            .ok_or(Error::Limit("MAX_VALUES"))?;
-        Ok(())
+        self.nodes.charge(n).map_err(|_| Error::Limit("MAX_VALUES"))
     }
     fn bytes(&mut self, n: usize) -> Result<(), Error> {
         self.bytes = self
@@ -1788,13 +1783,13 @@ impl Budget {
     }
 }
 
-struct Reader<'s, 'b> {
+struct Reader<'s, 'b, 'w> {
     schema: &'s Schema,
     input: &'b [u8],
     version: u64,
-    budget: Budget,
+    budget: &'w mut Budget,
 }
-impl Reader<'_, '_> {
+impl Reader<'_, '_, '_> {
     fn value(
         &mut self,
         id: usize,
@@ -2296,12 +2291,12 @@ impl Schema {
         Ok(())
     }
 
-    fn read_message(&self, input: &[u8], header: Header, block: usize) -> Result<Message, Error> {
+    fn read_message(&self, input: &[u8], header: Header, block: usize, budget: &mut Budget) -> Result<Message, Error> {
         let mut reader = Reader {
             schema: self,
             input,
             version: header.version,
-            budget: Budget::default(),
+            budget,
         };
         self.block(block)?.charge(&mut reader.budget.work, 1)?;
         let mut pos = self.header.length;
@@ -2407,7 +2402,8 @@ pub struct Messages<'s> {
     stack: [Option<ScanFrame>; MAX_NESTING],
     level: usize,
     pos: usize,
-    work: usize,
+    work: Work,
+    examined: u64,
 }
 impl<'s> Messages<'s> {
     /// Creates a decoder with a [`MAX_MESSAGE_BYTES`] input bound.
@@ -2427,8 +2423,15 @@ impl<'s> Messages<'s> {
             stack: [None; MAX_NESTING],
             level: 0,
             pos: 0,
-            work: 0,
+            work: Work::new("MAX_VALUES", MAX_VALUES),
+            examined: 0,
         }
+    }
+    /// Cumulative charged scanner and parser work, including failed calls.
+    /// Saturates at `u64::MAX`.
+    #[inline]
+    pub fn examined(&self) -> u64 {
+        self.examined
     }
     /// The largest message this decoder accepts, header included.
     pub fn limit(&self) -> usize {
@@ -2585,7 +2588,10 @@ impl Decode for Messages<'_> {
     /// short fixed blocks, and all named limits. Incomplete messages return
     /// `Need`, including at EOF. No input bytes are retained.
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, Error> {
-        let Some(used) = self.scan(input)? else {
+        let before = self.work.used();
+        let scanned = self.scan(input);
+        self.examined = self.examined.saturating_add((self.work.used() - before) as u64);
+        let Some(used) = scanned? else {
             // Every position the scan needs is checked against the limit,
             // so this is only a guard for rule 5 (progress at capacity).
             if !eof && input.len() >= self.limit {
@@ -2594,10 +2600,15 @@ impl Decode for Messages<'_> {
             return Ok(Step::Need);
         };
         let bytes = input.get(..used).ok_or(Error::Truncated)?;
-        let message =
-            self.schema
-                .read_message(bytes, self.header.ok_or(Error::Header)?, self.root)?;
+        let mut budget = Budget::default();
+        let message = self.schema.read_message(
+            bytes, self.header.ok_or(Error::Header)?, self.root, &mut budget);
+        self.examined = self.examined.saturating_add(budget.work.used() as u64)
+            .saturating_add(budget.nodes.used() as u64);
+        let message = message?;
+        let examined = self.examined;
         *self = Self::with_limit(self.schema, self.limit);
+        self.examined = examined;
         Ok(Step::Item(message, used))
     }
 }
@@ -2891,7 +2902,12 @@ mod tests {
             let bytes = empty_groups(10_000, block_length);
             let mut frames = Messages::new(&s);
             assert_eq!(frames.scan(&bytes), Ok(Some(bytes.len())));
-            assert!(frames.work <= 2 * bytes.len(), "{}", frames.work);
+            assert!(frames.work.used() <= 2 * bytes.len(), "{}", frames.work.used());
+            // Group counts reserve work before their entries arrive.
+            for count in [0, 1, 100, 10_000, 20_000] {
+                test_support::check_work(|| Messages::new(&s), &empty_groups(count, block_length),
+                    Messages::examined, MAX_VALUES as u64, 8);
+            }
             let m = s.decode(&bytes).unwrap();
             let mut out = vec![0xaa];
             s.write(&m, &mut out).unwrap();
@@ -3748,6 +3764,10 @@ mod tests {
     #[test]
     fn one_byte_stream_and_map() {
         let schema = Car::schema().unwrap();
+        for count in [1, 2, 8] {
+            test_support::check_work(|| Messages::new(schema), &CAR_BYTES.repeat(count),
+                Messages::examined, MAX_VALUES as u64, 16);
+        }
         let mut stream = Stream::new(Messages::new(schema).map(|m| m.header.template_id));
         for chunk in test_support::chunks(CAR_BYTES, &[1]) {
             assert_eq!(stream.push(chunk), chunk.len());

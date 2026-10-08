@@ -794,6 +794,7 @@ impl Retransmitter {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::test_support::check_atomic;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg,
@@ -1113,8 +1114,7 @@ mod tests {
             ]
         );
         assert_eq!(r.expected(), Some(3));
-        assert_eq!(r.tick(299), Err(Error::Time));
-        assert_eq!(r.expected(), Some(3));
+        assert_eq!(check_atomic(&mut r, |r| r.tick(299), |r| format!("{r:?}")), Err(Error::Time));
     }
 
     #[test]

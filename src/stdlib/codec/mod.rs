@@ -104,7 +104,7 @@
 //!   [`CollectError`], [`AssembleError`], [`PipeError`], [`LineError`],
 //!   [`InterceptError`], [`RewriteError`] and [`FaultError`]. A protocol
 //!   module adds none. An error that wraps another returns it from
-//!   [`source`](Error::source), and its `Display` says only its own
+//!   [`source`](core::error::Error::source), and its `Display` says only its own
 //!   context, never the inner error's text, so
 //!   [`ErrorChain`](crate::ErrorChain) shows each message once.
 //! - **N1.** A decoder that only frames a [`Wire`] value is [`Frames<T>`],
@@ -134,7 +134,6 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::error::Error;
 
 pub mod ascii;
 pub mod base64;
@@ -151,6 +150,7 @@ mod faults;
 mod frames;
 mod interceptor;
 mod lcg;
+mod work;
 mod pipe;
 mod reader;
 mod layout;
@@ -171,10 +171,36 @@ pub use interceptor::{
     InterceptError, Interceptor, Rewrite, RewriteError, SkipPolicy, append_bounded, write_bounded,
 };
 pub use lcg::Lcg;
+pub use work::Work;
 pub use pipe::{Carry, DEFAULT_SPANS, Layered, Pipe, PipeError, Span, Spans};
 pub use reader::{Reader, Trailing, Truncated, be16, be24, be32, be64, le16, le24, le32, le64};
 pub use recorder::{Direction, Record, RecordKind, Recorder};
 pub use stream::{Fail, PumpError, Stream, StreamEvent, finish, pump, try_pump};
+
+/// A refused codec operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// A charge exceeds the finite work allowance.
+    Work {
+        /// The allowance's name.
+        name: &'static str,
+        /// The maximum work allowed.
+        limit: usize,
+        /// Work already charged.
+        used: usize,
+        /// The refused charge, saturated on product overflow.
+        charge: usize,
+    },
+}
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Work { name, limit, used, charge } =>
+                write!(f, "{name}: work charge {charge} exceeds allowance {limit} with {used} used"),
+        }
+    }
+}
+impl core::error::Error for Error {}
 
 /// The result of one call to [`Decode::decode`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,8 +233,8 @@ pub trait Decode {
     /// An owned decoded unit. Recoverable unit errors belong here.
     type Item;
     /// A fault that ends framing of this stream. It owns its details, so
-    /// a wrapper can return it from [`source`](Error::source).
-    type Error: Error + 'static;
+    /// a wrapper can return it from [`source`](core::error::Error::source).
+    type Error: core::error::Error + 'static;
     /// A short name for logs and observation layers.
     const NAME: &'static str;
     /// The most unread bytes needed to make progress or report an error.
@@ -238,10 +264,10 @@ pub trait Decode {
 pub trait Wire: Sized {
     /// Why a complete byte slice is not a value. Owned, like
     /// [`Decode::Error`].
-    type ParseError: Error + 'static;
+    type ParseError: core::error::Error + 'static;
     /// Why a value cannot be represented on the wire. Owned, like
     /// [`Decode::Error`].
-    type WriteError: Error + 'static;
+    type WriteError: core::error::Error + 'static;
     /// Reads all bytes. Trailing bytes are an error.
     fn parse(b: &[u8]) -> Result<Self, Self::ParseError>;
     /// Appends the value's bytes, leaving `out` unchanged on error.

@@ -77,7 +77,7 @@ use fictionet::stdlib::codec::Frames;
 extern crate alloc;
 
 use fictionet::stdlib::codec::leb128;
-use fictionet::stdlib::codec::{Decode, Step, Wire, Reader as ByteReader, Truncated};
+use fictionet::stdlib::codec::{Decode, Step, Wire, Reader as ByteReader, Truncated, Work};
 use alloc::{string::String, vec, vec::Vec};
 
 /// The TCP port Thrift servers commonly listen on.
@@ -485,10 +485,7 @@ impl Message {
     /// protocol.
     fn parse_prefix(b: &[u8]) -> Result<(Message, Protocol, usize), Error> {
         let mut r = Fields::new(b, false);
-        let (name, kind, seq, protocol) = r.head()?;
-        r.enter(1)?;
-        let body = r.fields(1)?;
-        Ok((Message { name, kind, seq, body }, protocol, r.cursor.position()))
+        r.message()
     }
 
     fn encode(&self, protocol: Protocol) -> Result<Vec<u8>, Error> {
@@ -771,7 +768,8 @@ pub struct EncodedMessages {
     pos: usize,
     tasks: Vec<Task>,
     compact: bool,
-    values: usize,
+    values: Work,
+    examined: u64,
 }
 
 impl EncodedMessages {
@@ -781,7 +779,21 @@ impl EncodedMessages {
         // grow held storage. Each nesting level needs at most two tasks.
         let mut tasks = Vec::with_capacity(2 * MAX_DEPTH);
         tasks.push(Task::Head);
-        Self { pos: 0, tasks, compact: false, values: 0 }
+        Self { pos: 0, tasks, compact: false, values: Work::new("MAX_VALUES", MAX_VALUES), examined: 0 }
+    }
+
+    /// Cumulative charged scanner and parser work, including speculative calls.
+    /// Saturates at `u64::MAX`.
+    #[inline]
+    pub fn examined(&self) -> u64 {
+        self.examined
+    }
+
+    fn parse(&mut self, input: &[u8]) -> Result<(Message, Protocol, usize), Error> {
+        let mut reader = Fields::new(input, false);
+        let result = reader.message();
+        self.examined = self.examined.saturating_add(reader.values.used() as u64);
+        result
     }
 
     fn scan(&mut self, input: &[u8]) -> Result<bool, Error> {
@@ -790,12 +802,14 @@ impl EncodedMessages {
             self.tasks.clear();
             self.tasks.push(Task::Head);
             self.compact = false;
-            self.values = 0;
+            self.values = Work::new("MAX_VALUES", MAX_VALUES);
         }
         while let Some(&task) = self.tasks.last() {
             let mut r = Fields::new(input.get(self.pos..).ok_or(Error::Truncated)?, self.compact);
             r.values = self.values;
-            match step(task, &mut r, &mut self.tasks) {
+            let result = step(task, &mut r, &mut self.tasks);
+            self.examined = self.examined.saturating_add((r.values.used() - self.values.used()) as u64);
+            match result {
                 Ok(()) => {
                     self.pos += r.cursor.position();
                     self.values = r.values;
@@ -823,7 +837,7 @@ impl Clone for EncodedMessages {
         // Vec::clone drops spare capacity, which would let held storage grow on Need.
         let mut tasks = Vec::with_capacity(self.tasks.capacity());
         tasks.extend_from_slice(&self.tasks);
-        Self { pos: self.pos, tasks, compact: self.compact, values: self.values }
+        Self { pos: self.pos, tasks, compact: self.compact, values: self.values, examined: self.examined }
     }
 }
 
@@ -850,15 +864,15 @@ impl Decode for EncodedMessages {
         match self.scan(input) {
             Ok(false) => Ok(Step::Need),
             Ok(true) => {
-                let (message, protocol, used) = Message::parse_prefix(input.get(..self.pos).ok_or(Error::Truncated)?)?;
+                let (message, protocol, used) = self.parse(input.get(..self.pos).ok_or(Error::Truncated)?)?;
                 self.pos = 0;
                 self.tasks.clear();
                 self.tasks.push(Task::Head);
                 self.compact = false;
-                self.values = 0;
+                self.values = Work::new("MAX_VALUES", MAX_VALUES);
                 Ok(Step::Item(EncodedMessage { message, protocol }, used))
             }
-            Err(e) => Err(match Message::parse_prefix(input) {
+            Err(e) => Err(match self.parse(input) {
                 Err(first) if first != Error::Truncated => first,
                 _ => e,
             }),
@@ -959,12 +973,19 @@ fn step(task: Task, r: &mut Fields, tasks: &mut Vec<Task>) -> Result<(), Error> 
 struct Fields<'a> {
     cursor: ByteReader<'a>,
     compact: bool,
-    values: usize,
+    values: Work,
 }
 
 impl<'a> Fields<'a> {
     fn new(b: &'a [u8], compact: bool) -> Fields<'a> {
-        Fields { cursor: ByteReader::new(b), compact, values: 0 }
+        Fields { cursor: ByteReader::new(b), compact, values: Work::new("MAX_VALUES", MAX_VALUES) }
+    }
+
+    fn message(&mut self) -> Result<(Message, Protocol, usize), Error> {
+        let (name, kind, seq, protocol) = self.head()?;
+        self.enter(1)?;
+        let body = self.fields(1)?;
+        Ok((Message { name, kind, seq, body }, protocol, self.cursor.position()))
     }
 
     /// A variable-length integer of at most `max_bytes` bytes, no bigger
@@ -1062,11 +1083,7 @@ impl<'a> Fields<'a> {
         if depth > MAX_DEPTH {
             return Err(Error::TooDeep);
         }
-        self.values += 1;
-        if self.values > MAX_VALUES {
-            return Err(Error::TooMany);
-        }
-        Ok(())
+        self.values.charge(1).map_err(|_| Error::TooMany)
     }
 
     fn value(&mut self, ty: Type, depth: usize) -> Result<Value, Error> {
@@ -1218,14 +1235,14 @@ enum FieldHead {
 struct Writer<'o> {
     out: &'o mut Vec<u8>,
     compact: bool,
-    values: usize,
+    values: Work,
     limit: usize,
     failed: bool,
 }
 
 impl<'o> Writer<'o> {
     fn new(out: &'o mut Vec<u8>, compact: bool) -> Writer<'o> {
-        Writer { out, compact, values: 0, limit: MAX_VALUE_LEN, failed: false }
+        Writer { out, compact, values: Work::new("MAX_VALUES", MAX_VALUES), limit: MAX_VALUE_LEN, failed: false }
     }
 
     fn raw(&mut self, bytes: &[u8]) {
@@ -1249,10 +1266,7 @@ impl<'o> Writer<'o> {
         if depth > MAX_DEPTH {
             return Err(Error::Unwritable);
         }
-        self.values += 1;
-        if self.values > MAX_VALUES {
-            return Err(Error::Unwritable);
-        }
+        self.values.charge(1).map_err(|_| Error::Unwritable)?;
         self.check()
     }
 
@@ -1968,7 +1982,8 @@ mod tests {
         let binary = Message { body: vec![Field { id: 1, value: Value::Binary(vec![7; 1 << 20]) }], ..add_call() };
         for (message, protocol, size) in [(dense, Protocol::Compact, 1), (binary, Protocol::Binary, 16)] {
             let bytes = EncodedMessage { message: message.clone(), protocol }.to_bytes().unwrap();
-            let started = std::time::Instant::now();
+            fictionet::stdlib::codec::test_support::check_work(
+                EncodedMessages::new, &bytes, EncodedMessages::examined, 32, 16);
             let mut stream = Stream::new(EncodedMessages::new());
             let mut got = Vec::new();
             for part in chunks(&bytes, &[size]) {
@@ -1976,7 +1991,6 @@ mod tests {
             }
             finish(&mut stream, |item| got.push(item)).unwrap();
             assert_eq!(got, [EncodedMessage { message, protocol }]);
-            assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
         }
     }
 

@@ -2064,6 +2064,7 @@ fn canceled(token: Token, quantity: u32, reason: u8, now: u64) -> Outbound {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::test_support::check_atomic;
     use super::*;
     use fictionet::stdlib::codec::{
         Lcg, Wire,
@@ -3343,15 +3344,12 @@ mod tests {
         let mut x = Exchange::new(ExchangeConfig::default()).unwrap();
         x.receive(&enter(1, 100, Options::default()).into(), 5)
             .unwrap();
-        let before = format!("{x:?}");
-        assert_eq!(
-            x.receive(&enter(2, 100, Options::default()).into(), 4),
-            Err(Error::Time)
-        );
-        assert_eq!(x.accept(token(1), 4), Err(Error::Time));
-        assert_eq!(x.reject(token(1), 1, 4), Err(Error::Time));
-        assert_eq!(x.system_event(b'S', 4), Err(Error::Time));
-        assert_eq!(format!("{x:?}"), before);
+        let capture = |x: &Exchange| format!("{x:?}");
+        assert_eq!(check_atomic(&mut x,
+            |x| x.receive(&enter(2, 100, Options::default()).into(), 4), capture), Err(Error::Time));
+        assert_eq!(check_atomic(&mut x, |x| x.accept(token(1), 4), capture), Err(Error::Time));
+        assert_eq!(check_atomic(&mut x, |x| x.reject(token(1), 1, 4), capture), Err(Error::Time));
+        assert_eq!(check_atomic(&mut x, |x| x.system_event(b'S', 4), capture), Err(Error::Time));
         x.accept(token(1), 6).unwrap();
         assert_eq!(
             x.execute(token(1), 1, Price(1), b'A', 5),

@@ -239,10 +239,142 @@ fn thread_cpu_time() -> core::time::Duration {
     START.get_or_init(std::time::Instant::now).elapsed()
 }
 
+/// Checks cumulative work with whole input, byte chunks, and repeated `Need` calls.
+/// The allowance is `fixed_allowance + units_per_byte * accepted_bytes`.
+/// `measured` must include speculative work and survive message resets.
+/// Overflow, saturation, and decreasing measurements fail the check.
+/// This audits counted work; use contract checks for decoded results.
+///
+/// ```
+/// use fictionet::stdlib::{codec::test_support::check_work, thrift::EncodedMessages};
+/// check_work(EncodedMessages::new, &[0x82], EncodedMessages::examined, 16, 16);
+/// ```
+pub fn check_work<D: Decode>(
+    make: impl Fn() -> D,
+    bytes: &[u8],
+    measured: impl Fn(&D) -> u64,
+    fixed_allowance: u64,
+    units_per_byte: u64,
+) where D::Error: Clone {
+    for chunk in [bytes.len().max(1), 1] {
+        let mut stream = Stream::new(make());
+        let mut accepted = 0usize;
+        let mut previous = 0;
+        let mut audit = |stream: &mut Stream<D>, accepted: usize| {
+            let allowance = u64::try_from(accepted).ok()
+                .and_then(|n| units_per_byte.checked_mul(n))
+                .and_then(|n| fixed_allowance.checked_add(n))
+                .expect("work allowance overflow");
+            let used = measured(stream.decoder());
+            assert!(used < u64::MAX, "work measurement saturated");
+            assert!(used >= previous, "work measurement decreased");
+            assert!(used <= allowance, "work {used} exceeds allowance {allowance}");
+            previous = used;
+        };
+        audit(&mut stream, accepted);
+        loop {
+            if accepted < bytes.len() && !stream.is_done() {
+                let end = accepted + chunk.min(bytes.len() - accepted);
+                accepted += stream.push(&bytes[accepted..end]);
+            } else {
+                stream.end();
+            }
+            loop {
+                let item = stream.next();
+                audit(&mut stream, accepted);
+                match item {
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) => break,
+                    None => {
+                        for _ in 0..8 {
+                            assert!(stream.next().is_none(), "repeated Need changed result");
+                            audit(&mut stream, accepted);
+                        }
+                        break;
+                    }
+                }
+            }
+            if stream.is_done() || stream.failed().is_some() {
+                break;
+            }
+        }
+    }
+}
+
+/// Checks that a refused operation preserves the captured state.
+/// Returns the operation's result so callers can check its error.
+///
+/// ```
+/// use fictionet::stdlib::codec::test_support::check_atomic;
+/// let mut value = 7;
+/// let result = check_atomic(&mut value, |_| Err::<(), _>("refused"), |v| *v);
+/// assert_eq!(result, Err("refused"));
+/// ```
+pub fn check_atomic<T, R, E, S: PartialEq + core::fmt::Debug>(
+    value: &mut T,
+    operation: impl FnOnce(&mut T) -> Result<R, E>,
+    capture: impl Fn(&T) -> S,
+) -> Result<R, E> {
+    let before = capture(value);
+    let result = operation(value);
+    if result.is_err() {
+        assert_eq!(capture(value), before, "refused operation changed state");
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::assert_linear;
     use core::hint::black_box;
+
+    #[derive(Default)]
+    struct Counted(u64);
+    impl super::Decode for Counted {
+        type Item = ();
+        type Error = core::convert::Infallible;
+        const NAME: &'static str = "counted";
+        fn capacity(&self) -> usize { 1024 }
+        fn decode(&mut self, _: &[u8], _: bool) -> Result<super::super::Step<()>, Self::Error> {
+            self.0 += 1;
+            Ok(super::super::Step::Need)
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds allowance")]
+    fn repeated_need_work_is_counted() {
+        super::check_work(Counted::default, b"x", |d| d.0, 1, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "work allowance overflow")]
+    fn audit_overflow_fails() {
+        super::check_work(Counted::default, b"x", |d| d.0, u64::MAX, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "work measurement saturated")]
+    fn saturated_measurement_fails() {
+        super::check_work(|| Counted(u64::MAX), b"", |d| d.0, u64::MAX, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "work measurement decreased")]
+    fn decreasing_measurement_fails() {
+        super::check_work(Counted::default, b"x", |d| 10 - d.0, 10, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "refused operation changed state")]
+    fn atomic_check_detects_mutation() {
+        let _ = super::check_atomic(&mut 0, |v| { *v = 1; Err::<(), _>(()) }, |v| *v);
+    }
+
+    #[test]
+    fn atomic_check_allows_success() {
+        assert_eq!(super::check_atomic(&mut 0, |v| { *v = 1; Ok::<_, ()>(2) }, |v| *v), Ok(2));
+    }
 
     fn work(steps: usize) {
         let mut x = 0u64;

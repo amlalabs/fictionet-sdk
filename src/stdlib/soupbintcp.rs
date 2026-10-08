@@ -1003,6 +1003,7 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::test_support::check_atomic;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
@@ -1573,22 +1574,18 @@ mod tests {
     fn errors_leave_sessions_unchanged() {
         let (mut client, mut server) = pair();
         let _ = server.send(b"m", 100).unwrap();
-        assert_eq!(server.send(b"m", 99), Err(Error::Time));
-        assert_eq!(server.tick(99), Err(Error::Time));
-        assert_eq!(server.next_sequence(), 6);
-        assert_eq!(
-            server.send(&vec![0; MAX_PAYLOAD + 1], 200),
-            Err(Error::TooLong)
-        );
-        assert_eq!(server.next_sequence(), 6);
-        assert_eq!(server.accept(session(), 1, 200), Err(Error::State));
+        let server_state = |s: &Server| format!("{s:?}");
+        assert_eq!(check_atomic(&mut server, |s| s.send(b"m", 99), server_state), Err(Error::Time));
+        assert_eq!(check_atomic(&mut server, |s| s.tick(99), server_state), Err(Error::Time));
+        assert_eq!(check_atomic(&mut server,
+            |s| s.send(&vec![0; MAX_PAYLOAD + 1], 200), server_state), Err(Error::TooLong));
+        assert_eq!(check_atomic(&mut server,
+            |s| s.accept(session(), 1, 200), server_state), Err(Error::State));
         let _ = client.receive(&Packet::ServerHeartbeat, 100).unwrap();
-        assert_eq!(
-            client.receive(&Packet::SequencedData(Vec::new()), 50),
-            Err(Error::Time)
-        );
-        assert_eq!(client.next_sequence(), 5);
-        assert_eq!(client.start(200), Err(Error::State));
+        let client_state = |c: &Client| format!("{c:?}");
+        assert_eq!(check_atomic(&mut client,
+            |c| c.receive(&Packet::SequencedData(Vec::new()), 50), client_state), Err(Error::Time));
+        assert_eq!(check_atomic(&mut client, |c| c.start(200), client_state), Err(Error::State));
         assert_eq!(
             Timers {
                 heartbeat_ms: 0,

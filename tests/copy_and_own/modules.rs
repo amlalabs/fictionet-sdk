@@ -28,6 +28,8 @@ macro_rules! protocols {
         pub mod layout;
         #[path = "../../src/stdlib/codec/leb128.rs"]
         pub mod leb128;
+        #[path = "../../src/stdlib/codec/work.rs"]
+        pub mod work;
         #[path = "../../src/stdlib/codec/interceptor.rs"]
         pub mod interceptor;
         #[path = "../../src/stdlib/codec/recorder.rs"]

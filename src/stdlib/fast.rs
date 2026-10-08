@@ -3248,6 +3248,7 @@ impl From<Truncated> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::test_support::check_atomic;
     use super::*;
     use fictionet::stdlib::codec::{
         Stream,
@@ -4100,17 +4101,10 @@ mod tests {
         // Also change the copied template ID before failing.
         let other = [0xe0, 0x82, b'n', 0xb4, 0x81, 0xff];
         for refused in [&bad[..], &other[..]] {
-            let saved = exact.state.clone();
-            assert_eq!(exact.parse_exact(refused), Err(Error::Text));
-            assert_eq!(frames.decode(refused, false), Err(Error::Text));
-            for state in [&exact.state, &frames.state] {
-                assert_eq!(state.template_id, saved.template_id);
-                assert_eq!(state.bytes, saved.bytes);
-                for (a, b) in state.entries.iter().zip(&saved.entries) {
-                    assert_eq!(a.kind, b.kind);
-                    assert_eq!(a.value, b.value);
-                }
-            }
+            let capture = |m: &Messages| (m.state.template_id, m.state.bytes,
+                m.state.entries.iter().map(|e| (e.kind, e.value.clone())).collect::<Vec<_>>());
+            assert_eq!(check_atomic(&mut exact, |m| m.parse_exact(refused), capture), Err(Error::Text));
+            assert_eq!(check_atomic(&mut frames, |m| m.decode(refused, false), capture), Err(Error::Text));
             assert_eq!(
                 exact.parse_exact(&[0x80, 0x80, 0x80, 0x80, 0x82, b'O', b'K']),
                 Ok(valid.clone())

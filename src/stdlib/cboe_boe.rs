@@ -4499,7 +4499,8 @@ mod tests {
             server.tick(1_002).unwrap(),
             [Action::Send(ServerHeartbeat::default().into())]
         );
-        assert_eq!(server.tick(1_000), Err(Error::Time));
+        assert_eq!(fictionet::stdlib::codec::test_support::check_atomic(
+            &mut server, |s| s.tick(1_000), |s| format!("{s:?}")), Err(Error::Time));
         server
             .receive(&ClientHeartbeat::default().into(), 1_003)
             .unwrap();
