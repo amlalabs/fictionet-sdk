@@ -19,7 +19,7 @@
 //! is a 4-byte big-endian length followed by the message.
 //!
 //! Nothing here reads a socket. A world that plays a Thrift server
-//! passes TCP bytes to [`Stream<Frames>`](fictionet::stdlib::codec::Stream), reads
+//! passes TCP bytes to [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream), reads
 //! each frame's [`EncodedMessage`], and writes
 //! the reply's bytes back. Values are read without a schema, into a
 //! tree of [`Value`]s, so world code decides what each field number
@@ -31,8 +31,9 @@
 //! checks the same limits, so what it writes always reads back.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-//! use fictionet::stdlib::thrift::{exception_kind, field, Frames, Field, EncodedMessage, Message, Protocol, Value};
+//! use fictionet::stdlib::thrift::{exception_kind, field, Field, EncodedMessage, Message, Protocol, Value};
 //!
 //! /// A calculator service with one method: i32 add(1: i32 a, 2: i32 b).
 //! fn answer(call: &Message) -> Message {
@@ -45,7 +46,7 @@
 //!     }
 //! }
 //!
-//! let mut stream = Stream::new(Frames::new());
+//! let mut stream = Stream::new(Frames::<fictionet::stdlib::thrift::Frame>::new());
 //! let mut frames = Vec::new();
 //! // A framed call to add(2, 3), sequence number 1, in the strict binary form.
 //! pump(&mut stream, &[0, 0, 0, 30], |frame| frames.push(frame)).unwrap();
@@ -70,6 +71,9 @@
 //! );
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 extern crate alloc;
 
 use fictionet::stdlib::codec::leb128;
@@ -572,7 +576,7 @@ impl Wire for EncodedMessage {
 }
 
 /// Why bytes are not a Thrift message, value or frame, or a value cannot
-/// be written so that it reads back. A frame fault from [`Frames`] ends the
+/// be written so that it reads back. A frame fault from [`codec::Frames<Frame>`](fictionet::stdlib::codec::Frames) ends the
 /// stream: the connection holds no more frames a reader can find, and a
 /// real server closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -694,16 +698,17 @@ impl Wire for Frame {
 /// Reads framed Thrift payloads without holding input bytes.
 ///
 /// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`FRAME_HEADER_LEN`]
-/// plus [`Self::limit`]. Partial frames return [`Step::Need`], including at EOF.
+/// plus [`Frames::limit`](fictionet::stdlib::codec::Frames::limit). Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once. Map frames
 /// through [`EncodedMessage::parse`] to receive body errors as items.
 /// This reads framed transport; [`EncodedMessages`] reads unframed transport.
 ///
 /// ```
+/// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-/// use fictionet::stdlib::thrift::{Frame, Frames};
+/// use fictionet::stdlib::thrift::Frame;
 ///
-/// let mut stream = Stream::new(Frames::with_limit(16));
+/// let mut stream = Stream::new(Frames::<Frame>::with_limit(16));
 /// let mut frames = Vec::new();
 /// pump(&mut stream, &[0, 0], |frame| frames.push(frame))?;
 /// pump(&mut stream, &[0, 2, 7, 8], |frame| frames.push(frame))?;
@@ -711,51 +716,31 @@ impl Wire for Frame {
 /// assert_eq!(frames, [Frame(vec![7, 8])]);
 /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::thrift::Error>>(())
 /// ```
-#[derive(Clone, Copy, Debug)]
-pub struct Frames {
-    limit: usize,
-}
-
-impl Frames {
-    /// Accepts frames with up to [`MAX_FRAME`] payload bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_FRAME)
-    }
-
-    /// Sets the payload limit, clamped to [`MAX_FRAME`]. Zero accepts empty
-    /// payloads. An oversized frame is refused from its four-byte header.
-    pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.min(MAX_FRAME) }
-    }
-
-    /// The maximum payload length, excluding the size prefix.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Frames {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Frames {
+impl Prefixed for Frame {
     type Item = Frame;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "Thrift framed transport";
 
-    fn capacity(&self) -> usize {
-        FRAME_HEADER_LEN.saturating_add(self.limit)
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_FRAME }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_FRAME) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        FRAME_HEADER_LEN.saturating_add(limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        Ok(match parse_frame_limited(input, self.limit)? {
-            Some((payload, used)) => Step::Item(Frame(payload.to_vec()), used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        Ok(parse_frame_limited(input, limit)?.map(|(payload, used)| (Frame(payload.to_vec()), used)))
     }
 }
+
 
 /// Reads unframed Thrift messages without holding input bytes.
 ///
@@ -1525,7 +1510,7 @@ mod tests {
                 _ => call.exception(exception_kind::UNKNOWN_METHOD, "no such method"),
             }
         }
-        let mut decoder = Stream::new(Frames::new());
+        let mut decoder = Stream::new(Frames::<Frame>::new());
         assert_eq!(decoder.push(&[0, 0, 0, 30]), 4);
         assert_eq!(decoder.push(&[0x80, 0x01, 0x00, 0x01, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1]), 15);
         assert_eq!(decoder.push(&[0x08, 0, 1, 0, 0, 0, 2, 0x08, 0, 2, 0, 0, 0, 3, 0x00]), 15);
@@ -1826,7 +1811,7 @@ mod tests {
         contract::check_wire_value(&value);
         assert_eq!(Frame::parse(&bytes), Ok(value));
         for n in 0..bytes.len() {
-            assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
+            assert_eq!(Frames::<Frame>::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
             assert_eq!(Frame::parse(&bytes[..n]), Err(Error::FrameTruncated));
         }
         assert_eq!(Frame::parse(&[0; 4]), Ok(Frame(vec![])));
@@ -1840,9 +1825,9 @@ mod tests {
         let b = Message { seq: 2, ..add_call() }.to_frame(Protocol::Compact).unwrap();
         let mut bytes = a.to_bytes().unwrap();
         b.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * Frames::new().capacity());
-        assert_eq!(decode_all(Frames::new, &bytes), (vec![a, b], None));
-        let mut stream = Stream::new(Frames::new());
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * Frames::<Frame>::new().capacity());
+        assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (vec![a, b], None));
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&[0x80, 0, 0, 0]), 4);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::FrameLength(i32::MIN)))));
         assert_eq!(stream.push(&bytes), bytes.len());
@@ -1854,7 +1839,7 @@ mod tests {
     fn stream_reads_many_small_frames_in_linear_time() {
         let one = Frame(vec![1, 2, 3]).to_bytes().unwrap();
         let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Frames::<Frame>::new());
         let mut n = 0;
         pump(&mut stream, &one.repeat(200_000), |frame| { assert_eq!(frame.0, [1, 2, 3]); n += 1; }).unwrap();
         finish(&mut stream, |_| unreachable!()).unwrap();
@@ -2307,8 +2292,8 @@ mod tests {
                 let at = r.index(stream.len());
                 stream[at] = r.next() as u8;
             }
-            contract::check_decode_with_alloc_limit(Frames::new, &stream, 2 * Frames::new().capacity());
-            let frames = decode_all(Frames::new, &stream).0;
+            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &stream, 2 * Frames::<Frame>::new().capacity());
+            let frames = decode_all(Frames::<Frame>::new, &stream).0;
             // The same messages without frames, sometimes damaged.
             let mut bare = Vec::new();
             for _ in 0..1 + r.index(3) {

@@ -11,7 +11,7 @@
 //!
 //! A world that plays a Git server passes bytes from a
 //! [`tcp`](fictionet::stdlib::tcp) connection to
-//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream), reads the client's [`ProtoRequest`],
+//! [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), reads the client's [`ProtoRequest`],
 //! and writes back an
 //! [`Advertisement`] (version 0 or 1) or a [`CapabilityAdvertisement`]
 //! (version 2). It then reads the client's [`V2Request`]s or
@@ -59,6 +59,9 @@
 //! assert!(reply.ends_with(b" HEAD symref-target:refs/heads/main\n0000"));
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::ascii::hex_value as hex_digit;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
@@ -167,33 +170,27 @@ impl Wire for Packet {
 /// may follow. Before reading another item, the world must hand off with
 /// [`Stream::into_parts`](fictionet::stdlib::codec::Stream::into_parts), or
 /// [`Stream::swap`](fictionet::stdlib::codec::Stream::swap) to a pack decoder. Both
-/// preserve unread bytes; [`Packets`] cannot parse raw PACK data.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Packets;
-
-impl Packets {
-    /// Creates a packet decoder with no retained state.
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Decode for Packets {
+/// preserve unread bytes; [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames) cannot parse raw PACK data.
+impl Prefixed for Packet {
     type Item = Packet;
     type Error = Error;
+    type Limit = ();
     const NAME: &'static str = "Git pkt-line";
 
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         MAX_PACKET
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
-        Ok(match Pkt::parse(input)? {
-            Some((packet, used)) => Step::Item(packet.to_packet(), used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        Ok(Pkt::parse(input)?.map(|(packet, used)| (packet.to_packet(), used)))
     }
 }
+
 
 /// A packet borrowed from the bytes it was read from, so that a message
 /// can be checked without copying its data.
@@ -1536,7 +1533,7 @@ message_wire!(ServiceHeader,
     "Reads one smart HTTP service line followed by a flush. Refuses unknown services and any other packet layout.",
     "Appends the service announcement and flush. Every service value is representable.");
 message_wire!(Advertisement,
-    "Reads a version 0 or 1 ref advertisement through its flush. Refuses malformed refs or capabilities, object IDs inconsistent with object-format, and refs after shallow lines. An ERR line returns Error::Remote immediately, even before a flush; its text is limited to MAX_TEXT. Each parse starts at the beginning. For incremental input, collect packets with [`Stream<Packets>`](fictionet::stdlib::codec::Stream) and use [`Advertisement::from_packets`].",
+    "Reads a version 0 or 1 ref advertisement through its flush. Refuses malformed refs or capabilities, object IDs inconsistent with object-format, and refs after shallow lines. An ERR line returns Error::Remote immediately, even before a flush; its text is limited to MAX_TEXT. Each parse starts at the beginning. For incremental input, collect packets with [`Stream<Frames::<Packet>>`](fictionet::stdlib::codec::Stream) and use [`Advertisement::from_packets`].",
     "Appends refs, capabilities, shallow lines, and a flush. Refuses invalid fields, conflicting object formats, a first ref that would become the empty-ref marker, and values beyond the reader limits. SHA-1 is the default object format.");
 message_wire!(CapabilityAdvertisement,
     "Reads version 2 and its capabilities through a flush. Refuses missing version 2 or malformed capabilities. An ERR line returns Error::Remote immediately, even before a flush; its text is limited to MAX_TEXT.",
@@ -1638,7 +1635,7 @@ mod tests {
             assert_eq!(packet.to_bytes().unwrap(), bytes);
         }
         assert_eq!(Packet::parse(b"0000rest"), Err(Error::Trailing));
-        assert_eq!(Packets::new().decode(b"0000rest", false), Ok(Step::Item(Packet::Flush, 4)));
+        assert_eq!(Frames::<Packet>::new().decode(b"0000rest", false), Ok(Step::Item(Packet::Flush, 4)));
         assert_eq!(Packet::parse(b"0001"), Ok(Packet::Delim));
         assert_eq!(Packet::parse(b"0002"), Ok(Packet::ResponseEnd));
         assert_eq!(Packet::parse(b"000Bfoobar\n"), Ok(Packet::Data(b"foobar\n".to_vec())));
@@ -1654,11 +1651,11 @@ mod tests {
             assert_eq!(Packet::parse(bytes), Err(error.clone()));
             assert!(!error.to_string().is_empty());
         }
-        assert_eq!(Packets::new().decode(b"fff0", false), Ok(Step::Need));
+        assert_eq!(Frames::<Packet>::new().decode(b"fff0", false), Ok(Step::Need));
         let bytes = b"000bfoobar\n";
         for n in 0..bytes.len() {
             assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Truncated));
-            assert_eq!(Packets::new().decode(&bytes[..n], false), Ok(Step::Need));
+            assert_eq!(Frames::<Packet>::new().decode(&bytes[..n], false), Ok(Step::Need));
         }
     }
 
@@ -1682,10 +1679,10 @@ mod tests {
     #[test]
     fn stream_splits_packets() {
         let bytes = pkt(&["want x\n", "0001", "0000", "done\n"]);
-        contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_PACKET);
-        assert_eq!(decode_all(Packets::new, &bytes),
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_PACKET);
+        assert_eq!(decode_all(Frames::<Packet>::new, &bytes),
             (vec![Packet::text("want x"), Packet::Delim, Packet::Flush, Packet::text("done")], None));
-        let mut stream = Stream::new(Packets::new());
+        let mut stream = Stream::new(Frames::<Packet>::new());
         assert_eq!(stream.push(b"00"), 2);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.buffered(), 2);
@@ -1699,7 +1696,7 @@ mod tests {
     fn stream_takes_many_small_packets_in_linear_time() {
         let stream: Vec<u8> = b"0009done\n".iter().copied().cycle().take(9 * 200_000).collect();
         let started = std::time::Instant::now();
-        let (packets, failed) = decode_all(Packets::new, &stream);
+        let (packets, failed) = decode_all(Frames::<Packet>::new, &stream);
         assert_eq!(failed, None);
         assert_eq!(packets.len(), 200_000);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
@@ -2272,7 +2269,7 @@ mod tests {
         assert_eq!(decode_all(|| Bands, b"00010002000509"), (vec![Band::Delim, Band::ResponseEnd],
             Some(Fail::Protocol(Error::Syntax("band 1, 2 or 3")))));
         assert_eq!(decode_all(|| Bands, b"zz").1, Some(Fail::Protocol(Error::Header)));
-        let mut stream = Stream::new(Packets::new());
+        let mut stream = Stream::new(Frames::<Packet>::new());
         assert_eq!(stream.push(b"000dpackfile\n0006\x01P"), 19);
         assert_eq!(ServerLine::parse(stream.next().unwrap().unwrap().data().unwrap()), Ok(ServerLine::Section(Section::Packfile)));
         let mut stream = stream.swap(Bands);
@@ -2300,12 +2297,12 @@ mod tests {
     #[test]
     fn stream_buffer_is_bounded() {
         let bytes = b"0000".repeat(MAX_PACKET);
-        let mut stream = Stream::new(Packets::new());
+        let mut stream = Stream::new(Frames::<Packet>::new());
         assert_eq!(stream.push(&bytes), MAX_PACKET);
         assert_eq!(stream.push(b"0000"), 0);
         assert_eq!(stream.next(), Some(Ok(Packet::Flush)));
         assert_eq!(stream.push(b"0000"), 4);
-        contract::check_decode_with_alloc_limit(Packets::new, &bytes[..1024], 2 * MAX_PACKET);
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes[..1024], 2 * MAX_PACKET);
         let mut bands = Stream::new(Bands);
         assert_eq!(bands.push(&bytes), MAX_PACKET);
         assert_eq!(bands.buffered(), MAX_PACKET);
@@ -2316,11 +2313,11 @@ mod tests {
     #[test]
     fn stream_hands_over_raw_bytes() {
         let bytes = b"0008NAK\nPACK\x00\x00\x00\x02";
-        let mut stream = Stream::new(Packets::new());
+        let mut stream = Stream::new(Frames::<Packet>::new());
         assert_eq!(stream.push(bytes), bytes.len());
         assert_eq!(ServerLine::parse(stream.next().unwrap().unwrap().data().unwrap()), Ok(ServerLine::Nak));
         assert_eq!(stream.into_parts().0.unread(), b"PACK\x00\x00\x00\x02");
-        assert!(Stream::new(Packets::new()).into_parts().0.unread().is_empty());
+        assert!(Stream::new(Frames::<Packet>::new()).into_parts().0.unread().is_empty());
     }
 
     #[test]
@@ -2430,7 +2427,7 @@ mod tests {
     }
 
     fn check(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Packets::new, data, 2 * MAX_PACKET);
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_PACKET);
         contract::check_decode_with_alloc_limit(|| Bands, data, 2 * MAX_PACKET);
         contract::check_wire::<Packet>(data);
         contract::check_wire::<ProtoRequest>(data);
@@ -2439,7 +2436,7 @@ mod tests {
         contract::check_wire::<CapabilityAdvertisement>(data);
         contract::check_wire::<V2Request>(data);
         // Bytes still buffered are handed over without changes, even after a bad packet.
-        let mut stream = Stream::new(Packets::new());
+        let mut stream = Stream::new(Frames::<Packet>::new());
         let pushed = stream.push(data);
         let mut used = 0;
         while let Some(Ok(packet)) = stream.next() {
@@ -2447,7 +2444,7 @@ mod tests {
         }
         let (buffer, _) = stream.into_parts();
         assert_eq!(buffer.unread(), &data[used..pushed]);
-        for packet in decode_all(Packets::new, data).0 {
+        for packet in decode_all(Frames::<Packet>::new, data).0 {
             if let Some(bytes) = packet.data() {
                 contract::check_wire::<ClientLine>(bytes);
                 contract::check_wire::<ServerLine>(bytes);

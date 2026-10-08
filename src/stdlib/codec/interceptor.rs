@@ -1,3 +1,5 @@
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 extern crate alloc;
 
 use alloc::vec::Vec;
@@ -116,8 +118,9 @@ pub enum SkipPolicy {
 /// and an explicit skip policy. No inner-to-outer framing is inferred here.
 ///
 /// ```
+/// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::{codec::{Interceptor, Rewrite, Stream}, modbus};
-/// let mut stream = Stream::new(modbus::Frames);
+/// let mut stream = Stream::new(Frames::<modbus::Frame>::new());
 /// let proxy = Interceptor::new(1024);
 /// let input = [0, 1, 0, 0, 0, 2, 1, 3];
 /// let mut out = Vec::new();
@@ -574,7 +577,7 @@ mod tests {
         proxy
             .apply(b"", Rewrite::Replace(vec![good.clone()]), &mut out)
             .unwrap();
-        assert_eq!(decode_all(|| modbus::Frames, &out).0, [good]);
+        assert_eq!(decode_all(Frames::<modbus::Frame>::new, &out).0, [good]);
     }
 
     #[test]
@@ -590,7 +593,7 @@ mod tests {
             .apply::<json::Value>(b"", Rewrite::Repeat(usize::MAX), &mut out)
             .unwrap();
         assert_eq!(out, [7]);
-        let mut stream = Stream::new(modbus::Frames);
+        let mut stream = Stream::new(Frames::<modbus::Frame>::new());
         assert_eq!(stream.push(&[0, 0, 0, 1, 0, 2]), 6);
         assert!(matches!(
             proxy.next(&mut stream, &mut out, |_, _, _| {
@@ -613,7 +616,7 @@ mod tests {
     #[test]
     fn buffered_input_over_the_limit_is_a_capacity_error() {
         let frame = [0, 1, 0, 0, 0, 6, 1, 3, 0, 0, 0, 1];
-        let mut stream = Stream::new(modbus::Frames);
+        let mut stream = Stream::new(Frames::<modbus::Frame>::new());
         for _ in 0..4 {
             assert_eq!(stream.push(&frame), frame.len());
         }
@@ -630,7 +633,7 @@ mod tests {
         assert_eq!(stream.buffered(), 48);
         assert!(out.is_empty());
 
-        let mut stream = Stream::new(modbus::Frames);
+        let mut stream = Stream::new(Frames::<modbus::Frame>::new());
         assert_eq!(stream.push(&frame), frame.len());
         assert_eq!(proxy.room(&stream, &out), 4);
         assert_eq!(

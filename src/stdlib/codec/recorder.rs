@@ -1,3 +1,5 @@
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 extern crate alloc;
 
 use alloc::{collections::VecDeque, vec::Vec};
@@ -62,8 +64,9 @@ pub struct Record<T, E> {
 /// The recorder does not infer stream identity.
 ///
 /// ```
+/// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::{codec::{Direction, Interceptor, Recorder, Rewrite, Stream}, modbus};
-/// let mut stream = Stream::new(modbus::Frames);
+/// let mut stream = Stream::new(Frames::<modbus::Frame>::new());
 /// let mut log = Recorder::new(16, 1024);
 /// let proxy = Interceptor::new(1024);
 /// let input = [0, 1, 0, 0, 0, 2, 1, 3];
@@ -337,7 +340,7 @@ mod tests {
 
     #[test]
     fn failures_are_recorded_once_with_unread_bytes() {
-        let mut stream = Stream::new(modbus::Frames);
+        let mut stream = Stream::new(Frames::<modbus::Frame>::new());
         let mut log = Recorder::new(4, 16);
         assert_eq!(stream.push(b"abc"), 3);
         stream.end();

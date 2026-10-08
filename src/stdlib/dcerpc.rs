@@ -15,7 +15,7 @@
 //! chapter 12, and Microsoft's extensions in MS-RPCE, section 2.2.2.
 //!
 //! A world that plays an RPC server pushes bytes from a connection or pipe
-//! into a [`Stream<Pdus>`](fictionet::stdlib::codec::Stream), gets
+//! into a [`Stream<codec::Frames<Pdu>>`](fictionet::stdlib::codec::Stream), gets
 //! [`Pdu`]s back, and writes the bytes of its answers. A large call comes
 //! in several fragments, which a [`Reassembler`] joins, and
 //! [`Pdu::fragments`] splits an answer the same way. Which interfaces
@@ -32,9 +32,8 @@
 //! back as something else.
 //!
 //! ```
-//! use fictionet::stdlib::dcerpc::{
-//!     Bind, BindAck, Body, Context, ContextResult, EPMAPPER, NDR, Pdu, Pdus, reason,
-//! };
+//! use fictionet::stdlib::codec::Frames;
+//! use fictionet::stdlib::dcerpc::{Bind, BindAck, Body, Context, ContextResult, EPMAPPER, NDR, Pdu, reason};
 //!
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //!
@@ -78,7 +77,7 @@
 //! assert_eq!(bytes.len(), 72);
 //! assert_eq!(bytes[..4], [5, 0, 11, 3]);
 //!
-//! let mut decoder = Stream::new(Pdus::new());
+//! let mut decoder = Stream::new(Frames::<Pdu>::new());
 //! // The bind arrives in two pieces.
 //! assert_eq!(decoder.push(&bytes[..30]), 30);
 //! assert!(decoder.next().is_none());
@@ -93,8 +92,11 @@
 //! assert_eq!(reply.len(), 16 + 8 + 2 + 4 + 2 + 4 + 24);
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::ascii::hex_value as hex;
-use fictionet::stdlib::codec::{be16, be32, le16, le32, Decode, Step, Wire, Reader, Truncated};
+use fictionet::stdlib::codec::{be16, be32, le16, le32, Wire, Reader, Truncated};
 
 /// The TCP port of the endpoint mapper.
 pub const PORT: u16 = 135;
@@ -896,7 +898,7 @@ impl Wire for Pdu {
 
     /// Reads exactly one PDU. Refuses invalid headers or bodies, incomplete
     /// fragments, trailing bytes, and values whose canonical padding or
-    /// reserved fields would exceed [`MAX_FRAG`]. [`Pdus`] accepts those
+    /// reserved fields would exceed [`MAX_FRAG`]. [`codec::Frames<Pdu>`](fictionet::stdlib::codec::Frames) accepts those
     /// last values for forwarding through the driver's original bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let used = Self::frame_length(bytes)?.ok_or(Error::Incomplete)?;
@@ -1043,69 +1045,51 @@ impl Wire for Pdu {
 ///
 /// Items are `Result<Pdu, Error>`: body errors are recoverable items.
 /// Only a framing error ends the stream, for invalid headers or fragments above
-/// [`limit`](Self::limit). Lengths are checked as soon as their first ten
+/// [`limit`](fictionet::stdlib::codec::Frames::limit). Lengths are checked as soon as their first ten
 /// header bytes arrive, before any body is needed.
-/// Partial fragments return [`Step::Need`], including at EOF, so
+/// Partial fragments return [`fictionet::stdlib::codec::Step::Need`], including at EOF, so
 /// [`fictionet::stdlib::codec::Stream`] reports truncation. [`fictionet::stdlib::codec::Stream::with_next`] gives
 /// the original fragment bytes for authentication, including discarded padding.
 /// Proxies should forward those bytes: a received PDU can fit the limit while
 /// canonical padding or reserved fields would make [`Wire::write`] refuse it.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire}, dcerpc::{Body, Pdu, Pdus}};
+/// use fictionet::stdlib::codec::{Frames, Stream, Wire};
+/// use fictionet::stdlib::dcerpc::{Body, Pdu};
 /// let pdu = Pdu::new(7, Body::Shutdown);
 /// let bytes = Wire::to_bytes(&pdu)?;
-/// let mut stream = Stream::new(Pdus::new());
+/// let mut stream = Stream::new(Frames::<Pdu>::new());
 /// assert_eq!(stream.push(&bytes), bytes.len());
 /// assert_eq!(stream.next(), Some(Ok(Ok(pdu))));
 /// # Ok::<(), fictionet::stdlib::dcerpc::Error>(())
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Pdus {
-    limit: usize,
-}
-
-impl Pdus {
-    /// Creates a decoder accepting fragments up to [`MAX_FRAG`] bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_FRAG)
-    }
-
-    /// Sets the whole-fragment limit, clamped to [`HEADER_LEN`] through [`MAX_FRAG`].
-    pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.clamp(HEADER_LEN, MAX_FRAG) }
-    }
-
-    /// The largest accepted fragment, including its common header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Pdus {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Pdus {
+impl Prefixed for Pdu {
     type Item = Result<Pdu, Error>;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "DCE/RPC";
 
-    fn capacity(&self) -> usize {
-        self.limit
-    }
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_FRAG }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
-        let Some(used) = Pdu::frame_length(input)? else { return Ok(Step::Need) };
-        if used > self.limit {
-            return Err(Error::TooLong { length: used, limit: self.limit });
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(HEADER_LEN, MAX_FRAG) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize { *limit }
+
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        let Some(used) = Pdu::frame_length(input)? else { return Ok(None) };
+        if used > limit {
+            return Err(Error::TooLong { length: used, limit });
         }
-        let Some(bytes) = input.get(..used) else { return Ok(Step::Need) };
-        Ok(Step::Item(parse_fragment(bytes), used))
+        let Some(bytes) = input.get(..used) else { return Ok(None) };
+        Ok(Some((parse_fragment(bytes), used)))
     }
 }
+
 
 /// How many items a list holds, as its 8-bit count.
 fn count(n: usize) -> Result<u8, Error> {
@@ -2171,7 +2155,7 @@ mod tests {
         b[10] = 16;
         let mut stream = b.clone();
         stream.extend(BIND);
-        let mut d = Stream::new(Pdus::new());
+        let mut d = Stream::new(Frames::<Pdu>::new());
         assert_eq!(d.push(&stream), stream.len());
         let (p, frame) = d.with_next(|p, raw, _| (p, raw.to_vec())).unwrap().unwrap();
         assert_eq!(frame, &b[..]);
@@ -2196,13 +2180,13 @@ mod tests {
         // A PDU with a bad body, then a good one: the stream goes on.
         stream.extend_from_slice(&[5, 0, 9, 3, 0x10, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0]);
         stream.extend(BIND);
-        contract::check_decode_with_alloc_limit(Pdus::new, &stream, 2 * MAX_FRAG);
-        let (whole, error) = decode_all(Pdus::new, &stream);
+        contract::check_decode_with_alloc_limit(Frames::<Pdu>::new, &stream, 2 * MAX_FRAG);
+        let (whole, error) = decode_all(Frames::<Pdu>::new, &stream);
         assert_eq!(error, None);
         assert_eq!(whole.len(), all_bodies().len() + 2);
         assert_eq!(whole[whole.len() - 2], Err(Error::Type(9)));
         assert_eq!(whole[whole.len() - 1], Ok(bind()));
-        assert_eq!(decode_all(Pdus::new, &[6, 0, 0, 0]).1,
+        assert_eq!(decode_all(Frames::<Pdu>::new, &[6, 0, 0, 0]).1,
             Some(Fail::Protocol(Error::Version { major: 6, minor: 0 })));
     }
 
@@ -2211,12 +2195,12 @@ mod tests {
         let p = request(vec![3; MAX_FRAG - 24]);
         let one = p.to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 3).collect();
-        let mut d = Stream::new(Pdus::new());
+        let mut d = Stream::new(Frames::<Pdu>::new());
         assert_eq!(d.push(&stream), MAX_FRAG);
         assert_eq!(d.push(&stream[MAX_FRAG..]), 0);
         assert_eq!(d.next(), Some(Ok(Ok(p.clone()))));
         assert_eq!(d.push(&stream[MAX_FRAG..]), MAX_FRAG);
-        let (got, error) = decode_all(Pdus::new, &stream);
+        let (got, error) = decode_all(Frames::<Pdu>::new, &stream);
         assert_eq!(error, None);
         assert_eq!(got.len(), 3);
         assert!(got.iter().all(|r| r.as_ref() == Ok(&p)));
@@ -2226,7 +2210,7 @@ mod tests {
     fn stream_takes_many_small_pdus_in_linear_time() {
         let bytes = Pdu::new(1, Body::Shutdown).to_bytes().unwrap().repeat(200_000);
         let started = std::time::Instant::now();
-        let (pdus, error) = decode_all(Pdus::new, &bytes);
+        let (pdus, error) = decode_all(Frames::<Pdu>::new, &bytes);
         assert_eq!(pdus.len(), 200_000);
         assert!(pdus.iter().all(Result::is_ok));
         assert_eq!(error, None);
@@ -2278,9 +2262,9 @@ mod tests {
                 bytes
             };
             mutate(&mut rng, &mut data);
-            contract::check_decode_with_alloc_limit(Pdus::new, &data, 2 * MAX_FRAG);
+            contract::check_decode_with_alloc_limit(Frames::<Pdu>::new, &data, 2 * MAX_FRAG);
             contract::check_wire::<Pdu>(&data);
-            let (whole, _) = decode_all(Pdus::new, &data);
+            let (whole, _) = decode_all(Frames::<Pdu>::new, &data);
             let mut r = Reassembler::new(64);
             for p in whole.into_iter().flatten() {
                 // Whatever reads writes back and reads the same, unless the

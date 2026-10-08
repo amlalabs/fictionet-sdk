@@ -170,8 +170,9 @@
 //! One row per module. The columns:
 //!
 //! - **Wire**: message types that implement [`codec::Wire`].
-//! - **Decode**: a framer that implements [`codec::Decode`], such as a
-//!   `Frames`, `Messages` or `Commands` type.
+//! - **Decode**: [`codec::Frames<T>`] for a [`codec::Prefixed`] wire value,
+//!   or a protocol decoder such as `Messages` or `Commands` that implements
+//!   [`codec::Decode`] and keeps state or yields a different item.
 //! - **State**: a caller-driven state machine for one side of a
 //!   conversation, by name.
 //! - **Service**: a type that implements [`serve::Service`], ready for a

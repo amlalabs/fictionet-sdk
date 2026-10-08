@@ -17,7 +17,7 @@
 //! datagram it receives to [`Message::parse`], answers the [`Pdu`] inside
 //! from its own MIB, and sends the bytes of [`Message::response`] back.
 //! Which objects exist, what they hold, and which communities may read or
-//! write them is up to world code. Over TCP (RFC 3430), [`Stream<Messages>`](fictionet::stdlib::codec::Stream)
+//! write them is up to world code. Over TCP (RFC 3430), [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream)
 //! splits the stream into messages first. Body errors are items; invalid
 //! BER envelopes end the stream.
 //!
@@ -58,11 +58,14 @@
 //! assert_eq!(back.pdu.bindings()[0].value, Value::OctetString(b"pump controller".to_vec()));
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::asn1;
 use std::fmt;
 use std::str::FromStr;
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Wire};
 
 /// The UDP port agents listen on for requests.
 pub const PORT: u16 = 161;
@@ -1300,7 +1303,7 @@ fn parse_bindings(c: &[u8]) -> Result<Vec<VarBind>, Error> {
 }
 
 // ---------------------------------------------------------------------------
-// Messages.
+// fictionet::stdlib::codec::Frames::<Message>::new().
 
 /// One SNMP v1 or v2c message: what one UDP datagram carries.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1505,62 +1508,40 @@ const MAX_BER_HEADER: usize = 128;
 /// 128 bytes to read the longest permitted definite-length header, even
 /// when the configured limit is smaller. The header suffices to refuse
 /// an oversized message before its body arrives. Partial messages return
-/// [`Step::Need`], including at EOF, so [`fictionet::stdlib::codec::Stream`] reports
+/// [`fictionet::stdlib::codec::Step::Need`], including at EOF, so [`fictionet::stdlib::codec::Stream`] reports
 /// truncation. Redundant long-form BER lengths are accepted. Message bodies
 /// must use SNMP v1 or v2c.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Messages {
-    limit: usize,
-}
-
-impl Messages {
-    /// Creates a framer with [`MAX_MESSAGE`] as its whole-message limit.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_MESSAGE)
-    }
-
-    /// Sets the whole-message limit, clamped to [`MAX_MESSAGE`]. Zero
-    /// refuses every message. The BER tag and length count toward the limit.
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_MESSAGE),
-        }
-    }
-
-    /// The largest accepted message, including its BER header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Messages {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Messages {
+impl Prefixed for Message {
     type Item = Result<Message, Error>;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "SNMP/TCP";
 
-    fn capacity(&self) -> usize {
-        self.limit.max(MAX_BER_HEADER)
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_MESSAGE }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_MESSAGE) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        limit.max(MAX_BER_HEADER)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
         let Some(length) = message_len(input)? else {
-            return Ok(Step::Need);
+            return Ok(None);
         };
-        if length > self.limit {
+        if length > limit {
             return Err(Error::TooLong(length));
         }
-        Ok(match input.get(..length) {
-            Some(bytes) => Step::Item(Message::parse(bytes), length),
-            None => Step::Need,
-        })
+        Ok(input.get(..length).map(|bytes| (Message::parse(bytes), length)))
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -1923,7 +1904,7 @@ mod tests {
                 assert_eq!(Element::parse(&b[..n]), Err(Error::Truncated));
                 let len = message_len(&b[..n]).unwrap();
                 assert!(len.is_none() || len == Some(b.len()));
-                let mut d = Stream::new(Messages::new());
+                let mut d = Stream::new(Frames::<Message>::new());
                 assert_eq!(d.push(&b[..n]), n);
                 assert_eq!(d.next(), None);
             }
@@ -2134,7 +2115,7 @@ mod tests {
         assert_eq!(m.pdu.bindings().len(), 2);
         let e = Element::parse(&GET_SYS_DESCR).unwrap();
         assert_eq!(e.tag(), tag::SEQUENCE);
-        let mut d = Stream::new(Messages::new());
+        let mut d = Stream::new(Frames::<Message>::new());
         assert_eq!(d.push(&GET_SYS_DESCR[..10]), 10);
         assert!(d.next().is_none());
         assert_eq!(d.push(&GET_SYS_DESCR[10..]), 33);
@@ -2145,7 +2126,7 @@ mod tests {
     fn stream_takes_many_small_messages_in_linear_time() {
         let count = 2_000_000;
         let bytes = [0x30, 0].repeat(count);
-        let mut stream = Stream::new(Messages::new());
+        let mut stream = Stream::new(Frames::<Message>::new());
         let mut got = 0;
         let started = std::time::Instant::now();
         pump(&mut stream, &bytes, |item| {
@@ -2289,7 +2270,7 @@ mod tests {
         longest.push(0x29);
         longest.extend_from_slice(&GET_SYS_DESCR[2..]);
         assert_eq!(Message::parse(&longest), Message::parse(&GET_SYS_DESCR));
-        let mut d = Stream::new(Messages::new());
+        let mut d = Stream::new(Frames::<Message>::new());
         assert_eq!(d.push(&longest), longest.len());
         assert_eq!(d.next(), Some(Ok(Message::parse(&longest))));
     }
@@ -2297,11 +2278,11 @@ mod tests {
     #[test]
     fn stream_holds_at_most_capacity() {
         let bytes = GET_SYS_DESCR.repeat(10_000);
-        let mut stream = Stream::new(Messages::new());
+        let mut stream = Stream::new(Frames::<Message>::new());
         assert_eq!(stream.push(&bytes), MAX_MESSAGE);
         assert_eq!(stream.push(&bytes), 0);
-        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_MESSAGE);
-        let (items, failure) = decode_all(Messages::new, &bytes);
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &bytes, 2 * MAX_MESSAGE);
+        let (items, failure) = decode_all(Frames::<Message>::new, &bytes);
         assert_eq!(items.len(), 10_000);
         assert!(items.iter().all(Result::is_ok));
         assert_eq!(failure, None);
@@ -2323,16 +2304,16 @@ mod tests {
             .iter()
             .flat_map(|m| m.to_bytes().unwrap())
             .collect();
-        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &bytes, 2 * MAX_MESSAGE);
         assert_eq!(
-            decode_all(Messages::new, &bytes),
+            decode_all(Frames::<Message>::new, &bytes),
             (messages.into_iter().map(Ok).collect(), None)
         );
         for (bytes, error) in [
             (&[0x31, 0][..], Error::UnexpectedTag(0x31)),
             (&[0x30, 0x83, 1, 0, 0][..], Error::TooLong(0x10000)),
         ] {
-            let mut stream = Stream::new(Messages::new());
+            let mut stream = Stream::new(Frames::<Message>::new());
             assert_eq!(stream.push(bytes), bytes.len());
             assert_eq!(stream.next(), Some(Err(Fail::Protocol(error))));
             assert_eq!(stream.next(), None);
@@ -2368,7 +2349,7 @@ mod tests {
         if let Ok(o) = Oid::parse(data) {
             assert_eq!(Oid::parse(&o.to_bytes().unwrap()), Ok(o));
         }
-        contract::check_decode_with_alloc_limit(Messages::new, data, 2 * MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * MAX_MESSAGE);
         contract::check_wire::<Message>(data);
         contract::check_wire::<Element>(data);
         contract::check_wire::<Oid>(data);

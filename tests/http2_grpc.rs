@@ -1,3 +1,4 @@
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::{
     codec::{Demux, Wire},
     grpc, hpack, http2, tcp_reassembly,
@@ -58,7 +59,7 @@ fn data(stream: u32, payload: &[u8], end: bool) -> Vec<u8> {
 struct Stack {
     tcp: tcp_reassembly::Reassembler,
     h2: [http2::Session; 2],
-    calls: Demux<(usize, u32), grpc::Messages>,
+    calls: Demux<(usize, u32), Frames::<grpc::Message>>,
     messages: Vec<(usize, u32, Vec<u8>)>,
     statuses: Vec<grpc::Status>,
     requests: Vec<grpc::Request>,
@@ -76,7 +77,7 @@ impl Stack {
                 http2::Session::client_side(Default::default()),
                 http2::Session::server_side(Default::default()),
             ],
-            calls: Demux::new(16, 1024, |_| grpc::Messages::with_limit(128)),
+            calls: Demux::new(16, 1024, |_| Frames::<grpc::Message>::with_limit(128)),
             messages: Vec::new(),
             statuses: Vec::new(),
             requests: Vec::new(),

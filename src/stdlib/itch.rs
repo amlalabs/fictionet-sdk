@@ -22,7 +22,7 @@
 //!
 //! Messages travel one per MoldUDP64 message block, one per SoupBinTCP
 //! sequenced data packet, or in a binary file where each message has a
-//! two-byte length in front ([`Messages`]). Parse each block or payload
+//! two-byte length in front ([`codec::Frames<Message>`](fictionet::stdlib::codec::Frames)). Parse each block or payload
 //! with [`Message::parse`]. [`Book`] applies the order messages to
 //! per-stock bid and ask price levels, within named limits.
 //!
@@ -58,7 +58,10 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Wire};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::str::FromStr;
@@ -70,7 +73,7 @@ pub const HEADER_LENGTH: usize = 10;
 pub const MAX_MESSAGE_LENGTH: usize = 50;
 /// Bytes in the length prefix of a framed message.
 pub const LENGTH_PREFIX: usize = 2;
-/// The largest frame [`Messages`] can describe.
+/// The largest frame [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) can describe.
 pub const MAX_FRAME: usize = u16::MAX as usize;
 /// The largest timestamp the six-byte field holds.
 pub const MAX_TIMESTAMP: u64 = (1 << 48) - 1;
@@ -106,7 +109,7 @@ pub enum Error {
     Timestamp,
     /// A decimal price with more places than the field, or too large.
     Price,
-    /// A frame length prefix over the [`Messages`] limit.
+    /// A frame length prefix over the [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) limit.
     TooLong,
     /// A configuration value outside its named limits.
     Config,
@@ -936,13 +939,14 @@ pub mod codes {
 /// ends the stream with [`Error::TooLong`], read from the prefix alone.
 ///
 /// ```
+/// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::codec::{finish, pump, Stream, Wire};
-/// use fictionet::stdlib::itch::{Header, Message, Messages, MwcbStatus};
+/// use fictionet::stdlib::itch::{Header, Message, MwcbStatus};
 ///
 /// let status = MwcbStatus { header: Header::default(), breached_level: b'1' };
 /// let mut file = vec![0, 12];
 /// status.write(&mut file)?;
-/// let mut stream = Stream::new(Messages::default());
+/// let mut stream = Stream::new(Frames::<Message>::default());
 /// let mut messages = Vec::new();
 /// pump(&mut stream, &file[..5], |m| messages.push(m))?;
 /// pump(&mut stream, &file[5..], |m| messages.push(m))?;
@@ -950,51 +954,41 @@ pub mod codes {
 /// assert_eq!(messages, [Ok(Message::MwcbStatus(status))]);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Messages {
-    limit: usize,
-}
-impl Messages {
-    /// A framer that accepts frames up to `limit` bytes, at most
-    /// [`MAX_FRAME`].
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_FRAME),
-        }
-    }
-    /// The frame limit.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-impl Default for Messages {
-    /// Accepts every frame the length field can describe, so a message
-    /// type added after ITCH 5.0 frames and reads as an `Err` item.
-    fn default() -> Self {
-        Self::with_limit(MAX_FRAME)
-    }
-}
-impl Decode for Messages {
+impl Prefixed for Message {
     type Item = Result<Message, Error>;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "ITCH";
-    fn capacity(&self) -> usize {
-        LENGTH_PREFIX + self.limit
+
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_FRAME }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_FRAME) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        LENGTH_PREFIX + limit
     }
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
         let Some((prefix, rest)) = input.split_at_checked(LENGTH_PREFIX) else {
-            return Ok(Step::Need);
+            return Ok(None);
         };
         let length = usize::from(u16::from_be_bytes([prefix[0], prefix[1]]));
-        if length > self.limit {
+        if length > limit {
             return Err(Error::TooLong);
         }
         let Some(body) = rest.get(..length) else {
-            return Ok(Step::Need);
+            return Ok(None);
         };
-        Ok(Step::Item(Message::parse(body), LENGTH_PREFIX + length))
+        Ok(Some((Message::parse(body), LENGTH_PREFIX + length)))
     }
 }
+
 
 /// The limits of a [`Book`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1874,19 +1868,19 @@ mod tests {
         // An unknown type frames as an Err item; the stream goes on.
         bytes.extend_from_slice(&[0, 3, b'z', 1, 2]);
         bytes.extend_from_slice(&framed(&samples[..1]));
-        check_decode(Messages::default, &bytes);
-        check_decode(|| Messages::with_limit(MAX_MESSAGE_LENGTH), &bytes);
-        check_decode_with_alloc_limit(Messages::default, &bytes, 2 * (MAX_FRAME + 2));
-        let (items, failure) = decode_all(Messages::default, &bytes);
+        check_decode(Frames::<Message>::default, &bytes);
+        check_decode(|| Frames::<Message>::with_limit(MAX_MESSAGE_LENGTH), &bytes);
+        check_decode_with_alloc_limit(Frames::<Message>::default, &bytes, 2 * (MAX_FRAME + 2));
+        let (items, failure) = decode_all(Frames::<Message>::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(items.len(), samples.len() + 2);
         assert_eq!(items[samples.len()], Err(Error::Type(b'z')));
         for (item, m) in items.iter().zip(&samples) {
             assert_eq!(item, &Ok(*m));
         }
-        let (_, failure) = decode_all(|| Messages::with_limit(10), &bytes);
+        let (_, failure) = decode_all(|| Frames::<Message>::with_limit(10), &bytes);
         assert_eq!(failure, Some(Fail::Protocol(Error::TooLong)));
-        let (_, failure) = decode_all(Messages::default, &[0, 12, b'S']);
+        let (_, failure) = decode_all(Frames::<Message>::default, &[0, 12, b'S']);
         assert_eq!(failure, Some(Fail::Truncated { unread: 3 }));
     }
 
@@ -1908,7 +1902,7 @@ mod tests {
             .collect();
         assert_eq!(parsed, samples);
         // The block layout after the header is the file layout.
-        let (from_messages, _) = decode_all(Messages::default, &datagram[20..]);
+        let (from_messages, _) = decode_all(Frames::<Message>::default, &datagram[20..]);
         let (from_blocks, _) = decode_all(|| Blocks, &datagram[20..]);
         assert_eq!(from_messages.len(), from_blocks.len());
         for (m, b) in from_messages.iter().zip(&from_blocks) {
@@ -1940,7 +1934,7 @@ mod tests {
             for _ in 0..=rng.below(4) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_decode(Messages::default, &bytes);
+            check_decode(Frames::<Message>::default, &bytes);
         }
     }
 

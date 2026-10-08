@@ -5,6 +5,7 @@
 //! Run with `cargo run --example custom_protocol`. No network or root is needed.
 //! Compare the files with `diff -u src/stdlib/modbus.rs examples/custom_protocol/modbus.rs`.
 
+use fictionet::stdlib::codec::Frames;
 #[allow(dead_code)]
 mod modbus;
 
@@ -24,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bytes = Vec::new();
     request.write(&mut bytes)?;
 
-    let mut server = Stream::new(modbus::Frames.map(|frame| frame.planted_reply()));
+    let mut server = Stream::new(Frames::<modbus::Frame>::new().map(|frame| frame.planted_reply()));
     let mut reply_bytes = Vec::new();
     for chunk in bytes.chunks(3) {
         let taken = try_pump(&mut server, chunk, |reply| reply?.write(&mut reply_bytes))?;
@@ -34,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     finish(&mut server, |_| {})?;
 
-    let mut replies = Stream::new(client::Frames);
+    let mut replies = Stream::new(Frames::<client::Frame>::new());
     let mut received = Vec::new();
     pump(&mut replies, &reply_bytes, |frame| received.push(frame))?;
     finish(&mut replies, |frame| received.push(frame))?;

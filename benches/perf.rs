@@ -17,6 +17,7 @@
 //! commits by running the same groups on each, one after the other, and
 //! look at the counts first.
 
+use fictionet::stdlib::codec::Frames;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};
@@ -232,13 +233,13 @@ fn decoders(o: &Options) {
 
     // Keep construction here so a decoder rename changes just one line.
     fn packets() -> impl Decode<Item = tpkt::Packet, Error = tpkt::Error> {
-        tpkt::Packets::new()
+        Frames::<tpkt::Packet>::new()
     }
     fn requests() -> impl Decode<Item = http1::Request, Error = http1::Error> {
         http1::Requests::new()
     }
     fn messages() -> impl Decode<Item = Result<itch::Message, itch::Error>, Error = itch::Error> {
-        itch::Messages::default()
+        Frames::<itch::Message>::default()
     }
 
     fn measure<D: Decode>(

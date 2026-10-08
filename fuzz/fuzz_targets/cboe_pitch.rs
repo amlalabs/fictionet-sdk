@@ -3,9 +3,22 @@
 //! the units drive.
 #![no_main]
 
-use fictionet::stdlib::cboe_pitch::{
-    AddOrderExpanded, Book, BookConfig, Control, GapDetector, HEADER_LENGTH, Message, Unit, Units,
-};
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::cboe_pitch::AddOrderExpanded;
+
+use fictionet::stdlib::cboe_pitch::Book;
+
+use fictionet::stdlib::cboe_pitch::BookConfig;
+
+use fictionet::stdlib::cboe_pitch::Control;
+
+use fictionet::stdlib::cboe_pitch::GapDetector;
+
+use fictionet::stdlib::cboe_pitch::HEADER_LENGTH;
+
+use fictionet::stdlib::cboe_pitch::Message;
+
+use fictionet::stdlib::cboe_pitch::Unit;
 use fictionet::stdlib::codec::{
     Wire,
     contract::{check_decode, check_wire, check_wire_value},
@@ -23,9 +36,9 @@ fuzz_target!(|input: &[u8]| {
     check_wire::<Message>(data);
     check_wire::<Control>(data);
     check_wire::<AddOrderExpanded>(data);
-    check_decode(Units::default, data);
-    check_decode(|| Units::with_limit(HEADER_LENGTH + 64), data);
-    let (units, _) = decode_all(Units::default, data);
+    check_decode(Frames::<Unit>::default, data);
+    check_decode(|| Frames::<Unit>::with_limit(HEADER_LENGTH + 64), data);
+    let (units, _) = decode_all(Frames::<Unit>::default, data);
 
     // Every unit that parses goes through the gap detector, and its new
     // messages to a small book, whose limits must hold.

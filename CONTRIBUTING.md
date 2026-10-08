@@ -109,7 +109,9 @@ each with examples.
 - **E3.** An error the peer sends keeps the protocol's word (`modbus::Exception`, `grpc::Status`).
 - **E4.** No `DecodeError`, `EncodeError`, `ParseError`, `WireError`, `<Unit>ParseError`, `<Unit>Error`, `<Module>Error`.
 - **E5.** The only wrappers are the codec's (`Fail`, `PipeError`, ...). A wrapper returns its inner error from `source()`, and its `Display` says only its own context. `fictionet::ErrorChain` prints the whole chain.
-- **N1.** A `Decode` type is the plural of its item: `Frames` yields `Frame`, `Packets` yields `Packet`.
+- **N1.** A decoder that only frames a `Wire` value is `codec::Frames<T>`,
+  with `Prefixed` implemented on `T`. Other `Decode` types are the plural of
+  their item: `Messages` yields `Message`.
 - **N2.** A `Wire` type is the specification's word for its unit, with no module prefix (`rtp::Packet`).
 - **N3.** One decoder per direction: the items carry the side (`ClientMessages` yields `ClientMessage`).
 - **N4.** One side of a protocol is `Client` or `Server`, either side is `Session`, and its progress is `Phase`. A session fed bytes uses `push`, `next` and `end`; one fed messages uses `receive`, `send` and `tick`.

@@ -13,7 +13,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use fictionet::stdlib::bgp;
-use fictionet::stdlib::codec::{Stream, Wire};
+use fictionet::stdlib::codec::{Frames, Stream, Wire};
 use border_world::certs::Ca;
 use border_world::log::Log;
 use border_world::scenario::{parse_prefix, Scenario, Task, Variant};
@@ -274,7 +274,7 @@ pub fn bgp_bytes(message: bgp::Message) -> Vec<u8> {
 }
 
 /// Reads one whole BGP message: its kind and body.
-pub async fn bgp_read(fcx: &Cx, conn: &mut tcp::TcpConnection, stream: &mut Stream<bgp::Frames>) -> Result<(u8, Vec<u8>), ConnError> {
+pub async fn bgp_read(fcx: &Cx, conn: &mut tcp::TcpConnection, stream: &mut Stream<Frames<bgp::Frame>>) -> Result<(u8, Vec<u8>), ConnError> {
     loop {
         if let Some(frame) = stream.next() {
             let frame = frame.expect("a good frame");

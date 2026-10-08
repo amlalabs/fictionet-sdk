@@ -1,3 +1,4 @@
+use fictionet::stdlib::codec::Frames;
 use core::{convert::Infallible, time::Duration};
 use fictionet::stdlib::{
     codec::{
@@ -23,7 +24,7 @@ fn modbus_two_direction_proxy_records_input_and_faults_output() {
         .iter()
         .flat_map(|f| f.to_bytes().unwrap())
         .collect();
-    contract::check_decode(|| modbus::Frames, &input);
+    contract::check_decode(Frames::<modbus::Frame>::new, &input);
     let replacement = modbus::Frame {
         unit: 9,
         ..frame(1)
@@ -60,8 +61,8 @@ fn modbus_two_direction_proxy_records_input_and_faults_output() {
         },
     ];
     let mut log = Recorder::new(16, 4096);
-    let mut client = Stream::new(modbus::Frames);
-    let mut server = Stream::new(modbus::Frames);
+    let mut client = Stream::new(Frames::<modbus::Frame>::new());
+    let mut server = Stream::new(Frames::<modbus::Frame>::new());
     let downstream = Interceptor::new(4096);
     let mut faults = Faults::new(42, 4096, 8);
     let mut sent = Vec::new();
@@ -92,7 +93,7 @@ fn modbus_two_direction_proxy_records_input_and_faults_output() {
             )
             .is_none()
     );
-    let (forwarded, failure) = test_support::decode_all(|| modbus::Frames, &sent);
+    let (forwarded, failure) = test_support::decode_all(Frames::<modbus::Frame>::new, &sent);
     assert_eq!(failure, None);
     assert_eq!(forwarded, [replacement, frame(3), frame(3), frame(4)]);
     assert_eq!(markers, [(36, Duration::from_millis(10))]);
@@ -234,7 +235,7 @@ fn byte_faults_run_before_modbus_and_line_decoding() {
             &mut damaged,
         )
         .unwrap();
-    let mut stream = Stream::new(modbus::Frames);
+    let mut stream = Stream::new(Frames::<modbus::Frame>::new());
     let mut log = Recorder::new(8, 4096);
     assert_eq!(stream.push(&damaged), 7);
     stream.end();
@@ -258,7 +259,7 @@ fn byte_faults_run_before_modbus_and_line_decoding() {
         )
         .unwrap();
     assert!(matches!(
-        test_support::decode_all(|| modbus::Frames, &damaged).1,
+        test_support::decode_all(Frames::<modbus::Frame>::new, &damaged).1,
         Some(Fail::Protocol(modbus::Error::Protocol(1)))
     ));
 
@@ -284,7 +285,7 @@ fn byte_faults_run_before_modbus_and_line_decoding() {
 fn pipe_inner_items_require_explicit_outer_framing() {
     let make = || {
         fictionet::stdlib::codec::Pipe::new(
-            modbus::Frames,
+            Frames::<modbus::Frame>::new(),
             Lines::new(64, Ending::LfOrCrlf),
             |frame: modbus::Frame| Carry::Bytes(frame.pdu),
         )
@@ -356,7 +357,7 @@ fn pipe_inner_items_require_explicit_outer_framing() {
 
 #[test]
 fn demux_stream_access_composes_with_all_tools_and_shared_budget() {
-    let mut demux = Demux::new(2, 1024, |_: &u8| modbus::Frames);
+    let mut demux = Demux::new(2, 1024, |_: &u8| Frames::<modbus::Frame>::new());
     let mut faults = Faults::new(8, 1024, 8);
     let mut log = Recorder::new(8, 512);
     let mut out = [Vec::new(), Vec::new()];
@@ -395,7 +396,7 @@ fn demux_stream_access_composes_with_all_tools_and_shared_budget() {
 fn seeded_item_plans_are_repeatable_across_input_chunking() {
     let input: Vec<_> = (0..64).flat_map(|n| frame(n).to_bytes().unwrap()).collect();
     let run = |chunking: &[usize]| {
-        let mut stream = Stream::new(modbus::Frames);
+        let mut stream = Stream::new(Frames::<modbus::Frame>::new());
         let mut faults = Faults::new(27, 4096, 8);
         let mut out = Vec::new();
         let plan = [
@@ -477,7 +478,7 @@ fn recorded_end_leaves_handoff_bytes_and_is_not_repeated() {
         header.len() as u64..header.len() as u64
     );
     assert_eq!(stream.unread(), tail);
-    let mut stream = stream.swap(modbus::Frames);
+    let mut stream = stream.swap(Frames::<modbus::Frame>::new());
     proxy
         .next(&mut stream, &mut out, |_, _, _| {
             Rewrite::<modbus::Frame>::Forward
@@ -490,7 +491,7 @@ fn recorded_end_leaves_handoff_bytes_and_is_not_repeated() {
 #[test]
 fn failed_write_consumes_only_its_item_and_preserves_prior_output() {
     let input = frame(1).to_bytes().unwrap().repeat(2);
-    let mut stream = Stream::new(modbus::Frames);
+    let mut stream = Stream::new(Frames::<modbus::Frame>::new());
     let proxy = Interceptor::new(128);
     let mut out = vec![42];
     assert_eq!(stream.push(&input), input.len());
@@ -564,7 +565,7 @@ fn forward_keeps_json_whitespace() {
 #[test]
 fn forward_keeps_pipe_payloads() {
     let pipe = fictionet::stdlib::codec::Pipe::new(
-        modbus::Frames,
+        Frames::<modbus::Frame>::new(),
         Lines::new(64, Ending::LfOrCrlf),
         |frame: modbus::Frame| Carry::Bytes(frame.pdu),
     );
@@ -591,7 +592,7 @@ fn hold_delivers_second_item_before_first() {
     assert!(out.is_empty());
     faults.item(&plan, &second, &mut out).unwrap();
     assert_eq!(
-        test_support::decode_all(|| modbus::Frames, &out).0,
+        test_support::decode_all(Frames::<modbus::Frame>::new, &out).0,
         [frame(2), frame(1)]
     );
     faults.flush(&mut out).unwrap();
@@ -617,7 +618,7 @@ fn split_delivers_two_chunks_with_a_delay_between() {
 fn recorder_preserves_oversized_failure_ranges_with_truncation() {
     for max_bytes in [0, 4] {
         let mut log = Recorder::new(16, max_bytes);
-        let mut stream = Stream::new(modbus::Frames);
+        let mut stream = Stream::new(Frames::<modbus::Frame>::new());
         assert_eq!(stream.push(&[0, 0, 0, 1, 0, 2, 1, 3]), 8);
         assert!(
             stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
@@ -636,7 +637,7 @@ fn recorder_preserves_oversized_failure_ranges_with_truncation() {
     }
     let mut bytes = vec![0; 40];
     bytes[5] = 200;
-    let mut stream = Stream::new(modbus::Frames);
+    let mut stream = Stream::new(Frames::<modbus::Frame>::new());
     let mut log = Recorder::new(8, 32);
     assert_eq!(stream.push(&bytes), 40);
     stream.end();
@@ -746,7 +747,7 @@ fn forward_composes_with_collect_and_assemble() {
 #[test]
 fn intercept_helper_keeps_prior_items_and_handoff_bytes() {
     let proxy = Interceptor::new(128);
-    let mut stream = Stream::new(modbus::Frames);
+    let mut stream = Stream::new(Frames::<modbus::Frame>::new());
     let input = frame(1).to_bytes().unwrap().repeat(2);
     let mut calls = 0;
     let mut out = vec![42];
@@ -814,7 +815,7 @@ fn intercept_after_eof_does_not_accept_new_input() {
 fn intercept_keeps_good_frame_before_decode_failure() {
     let first = frame(1).to_bytes().unwrap();
     let input = [first.as_slice(), &[0, 2, 0, 1, 0, 2]].concat();
-    let mut stream = Stream::new(modbus::Frames);
+    let mut stream = Stream::new(Frames::<modbus::Frame>::new());
     let mut out = Vec::new();
     let (accepted, error) = forward_input(&Interceptor::new(128), &mut stream, &input, &mut out, |_, _, _| Rewrite::Forward)
         .unwrap_err();
@@ -1008,7 +1009,7 @@ fn holds_and_delays_share_recording_and_forwarded_skips() {
 #[test]
 fn empty_plan_records_and_forwards_pipe_payloads() {
     let pipe = fictionet::stdlib::codec::Pipe::new(
-        modbus::Frames,
+        Frames::<modbus::Frame>::new(),
         Lines::new(4, Ending::LfOrCrlf),
         |frame: modbus::Frame| Carry::Bytes(frame.pdu),
     );
@@ -1026,7 +1027,7 @@ fn intercept_reports_accepted_prefix_before_unaccepted_suffix() {
     let first = frame(1).to_bytes().unwrap();
     let mut input = [first.as_slice(), &[0, 2, 0, 1, 0, 2]].concat();
     input.resize(1024, 0);
-    let mut stream = Stream::new(modbus::Frames);
+    let mut stream = Stream::new(Frames::<modbus::Frame>::new());
     let mut out = Vec::new();
     let (accepted, error) = forward_input(&Interceptor::new(4096), &mut stream, &input, &mut out, |_, _, _| Rewrite::Forward)
         .unwrap_err();
@@ -1035,7 +1036,7 @@ fn intercept_reports_accepted_prefix_before_unaccepted_suffix() {
         fictionet::stdlib::codec::InterceptError::Decode(_)
     ));
     assert!(accepted < input.len());
-    assert_eq!(accepted, modbus::Frames.capacity());
+    assert_eq!(accepted, Frames::<modbus::Frame>::new().capacity());
     assert_eq!(out, first);
     assert_eq!(
         [out.as_slice(), stream.unread(), &input[accepted..]].concat(),

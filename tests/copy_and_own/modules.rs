@@ -278,3 +278,13 @@ macro_rules! protocols {
 }
 
 protocols!();
+
+// These are the copied types, so their Prefixed impls must use public APIs.
+fn copied_frames() {
+    use fictionet::stdlib::codec::{Decode, Frames, Prefixed};
+    fn check<T: Prefixed>(_decoder: Frames<T>) where Frames<T>: Decode {}
+    check(Frames::<modbus::Frame>::new());
+    check(Frames::<diameter::Message>::with_limit(1024));
+    check(Frames::<opcua::Chunk>::with_limit(opcua::Limits::default()));
+    check(Frames::<cboe_boe::Inbound>::new());
+}

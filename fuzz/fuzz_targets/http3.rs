@@ -1,14 +1,53 @@
 //! HTTP/3 streams, field sections, and Priority dictionaries.
 #![no_main]
 
-use fictionet::stdlib::{
-    codec::{Decode, Wire, contract, test_support::decode_all},
-    http3::{
-        self, Endpoint, Event, Frame, Frames, HeaderKind, HeaderList, MessageSide, Priority,
-        PriorityElement, RequestResult, RequestStream, Session, Settings, StreamHeader, StreamHeaders, StreamItem, StreamItems,
-    },
-    qpack::{self, SectionResult, Table},
-};
+use fictionet::stdlib::codec::{Frames, Decode};
+
+use fictionet::stdlib::codec::Wire;
+
+use fictionet::stdlib::codec::contract;
+
+use fictionet::stdlib::codec::test_support::decode_all;
+
+use fictionet::stdlib::http3;
+
+use fictionet::stdlib::http3::Endpoint;
+
+use fictionet::stdlib::http3::Event;
+
+use fictionet::stdlib::http3::Frame;
+
+use fictionet::stdlib::http3::HeaderKind;
+
+use fictionet::stdlib::http3::HeaderList;
+
+use fictionet::stdlib::http3::MessageSide;
+
+use fictionet::stdlib::http3::Priority;
+
+use fictionet::stdlib::http3::PriorityElement;
+
+use fictionet::stdlib::http3::RequestResult;
+
+use fictionet::stdlib::http3::RequestStream;
+
+use fictionet::stdlib::http3::Session;
+
+use fictionet::stdlib::http3::Settings;
+
+use fictionet::stdlib::http3::StreamHeader;
+
+use fictionet::stdlib::http3::StreamHeaders;
+
+use fictionet::stdlib::http3::StreamItem;
+
+use fictionet::stdlib::http3::StreamItems;
+
+use fictionet::stdlib::qpack;
+
+use fictionet::stdlib::qpack::SectionResult;
+
+use fictionet::stdlib::qpack::Table;
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 16 << 10;
@@ -160,7 +199,7 @@ fuzz_target!(|input: &[u8]| {
     contract::check_wire::<Settings>(bytes);
     contract::check_wire::<Priority>(bytes);
     contract::check_wire::<StreamHeader>(bytes);
-    contract::check_decode_with_alloc_limit(Frames::new, bytes, 2 * http3::MAX_FRAME);
+    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, bytes, 2 * http3::MAX_FRAME);
     contract::check_decode_with_alloc_limit(StreamHeaders::new, bytes, 2 * http3::MAX_STREAM_HEADER);
     contract::check_decode_with_alloc_limit(StreamItems::request, bytes, 2 * StreamItems::request().capacity());
     contract::check_decode_with_alloc_limit(
@@ -190,7 +229,7 @@ fuzz_target!(|input: &[u8]| {
     while session.next().is_some() {}
     assert!(session.buffered() <= budget);
     let table = Table::new(0);
-    let (items, _) = decode_all(Frames::new, bytes);
+    let (items, _) = decode_all(Frames::<Frame>::new, bytes);
     for frame in items.iter().flatten() {
         contract::check_wire_value(frame);
     }

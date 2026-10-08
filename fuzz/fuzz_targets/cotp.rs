@@ -2,6 +2,7 @@
 //! transport server reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::contract::{
     check_decode, check_decode_with_held_limit, check_wire, check_wire_value,
 };
@@ -15,7 +16,7 @@ fuzz_target!(|data: &[u8]| {
     check_decode(|| cotp::tpdus(tpkt::MAX_PACKET), data);
     check_decode_with_held_limit(|| cotp::messages(tpkt::MAX_PACKET, MESSAGE_LIMIT), data, MESSAGE_LIMIT);
     check_wire::<Tpdu>(data);
-    let (packets, _) = decode_all(tpkt::Packets::new, data);
+    let (packets, _) = decode_all(Frames::<tpkt::Packet>::new, data);
 
     let mut messages = Reassembler::with_limit(MESSAGE_LIMIT);
     // Each packet's TPDU, and any bytes as a TPDU on their own.

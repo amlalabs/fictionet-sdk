@@ -1,26 +1,28 @@
 //! Kafka frames, requests, and responses as a broker or client reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
+
 use fictionet::stdlib::codec::{Decode, Reader, Wire, contract, leb128, test_support::decode_all};
 use fictionet::stdlib::kafka::*;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
+    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * Frames::<Frame>::new().capacity());
     let limit = usize::from(data.first().copied().unwrap_or(0));
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(limit), data, 2 * Frames::with_limit(limit).capacity());
+    contract::check_decode_with_alloc_limit(|| Frames::<Frame>::with_limit(limit), data, 2 * Frames::<Frame>::with_limit(limit).capacity());
     contract::check_wire::<Frame>(data);
     contract::check_wire::<Request>(data);
     contract::check_wire::<RequestHeader>(data);
-    contract::check_decode_with_alloc_limit(|| Frames::new().map(|frame| Request::parse(&frame.0)), data, 2 * Frames::new().capacity());
+    contract::check_decode_with_alloc_limit(|| Frames::<Frame>::new().map(|frame| Request::parse(&frame.0)), data, 2 * Frames::<Frame>::new().capacity());
     contract::check_wire_value(&Frame(data.iter().take(MAX_FRAME + 1).copied().collect()));
 
-    let frames = decode_all(Frames::new, data).0;
+    let frames = decode_all(Frames::<Frame>::new, data).0;
     for payload in frames.iter().map(|frame| frame.0.as_slice()).chain(core::iter::once(data)) {
         if let Ok(request) = Request::parse(payload) {
             contract::check_wire_value(&request);
             let frame = request.to_frame().unwrap();
-            assert_eq!(decode_all(Frames::new, &frame.to_bytes().unwrap()), (vec![frame], None));
+            assert_eq!(decode_all(Frames::<Frame>::new, &frame.to_bytes().unwrap()), (vec![frame], None));
         }
         for key in [api_key::API_VERSIONS, api_key::METADATA, api_key::PRODUCE] {
             for version in 0..=13 {

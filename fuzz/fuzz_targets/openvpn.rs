@@ -2,8 +2,9 @@
 //! UDP datagrams and TCP streams, and as it builds them to write.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire, contract};
-use fictionet::stdlib::openvpn::{Frame, Frames};
+use fictionet::stdlib::openvpn::Frame;
 use fictionet::stdlib::openvpn::{
     Ack, Authenticated, Encrypted, Control, ControlBody, ControlKind, Error, MAX_HMAC_LEN,
     MAX_PACKET, MAX_TCP_FRAME, Packet, TlsAuth, TlsCrypt, Wrapping, split_first_byte,
@@ -87,9 +88,9 @@ fn build(data: &[u8]) -> Packet {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_TCP_FRAME);
+    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * MAX_TCP_FRAME);
     contract::check_decode_with_alloc_limit(
-        || Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+        || Frames::<Frame>::with_limit(usize::from(data.first().copied().unwrap_or(0))),
         data,
         514,
     );
@@ -117,7 +118,7 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(bytes.unwrap(), data);
         }
         contract::check_decode_with_alloc_limit(
-            || Frames::new().map(|frame| Packet::parse_with(&frame.0, wrapping)),
+            || Frames::<Frame>::new().map(|frame| Packet::parse_with(&frame.0, wrapping)),
             data,
             2 * MAX_TCP_FRAME,
         );

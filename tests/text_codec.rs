@@ -1,5 +1,6 @@
 //! Control lines and counted bodies through the shared codec driver.
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
     self, Decode, Fail, Lcg, Step, Stream, Wire, contract, finish, pump,
     test_support::{decode_all, mutate},
@@ -395,7 +396,7 @@ fn memcache_text_and_binary_round_trips() {
     round_trip(memcache::Responses::new, &bytes, &responses.map(Ok));
     let packets = [cache_packet(b"a\0\r\nb"), cache_packet(b"second")];
     let bytes = written(&packets);
-    round_trip(memcache::Packets::new, &bytes, &packets);
+    round_trip(Frames::<memcache::Packet>::new, &bytes, &packets);
 }
 
 #[test]
@@ -499,7 +500,7 @@ fn memcache_limits_are_checked_before_body_assembly() {
     let mut header = [0; memcache::BINARY_HEADER_LEN];
     header[0] = memcache::REQUEST_MAGIC;
     header[8..12].copy_from_slice(&4u32.to_be_bytes());
-    let mut binary = Stream::new(memcache::Packets::with_limit(3));
+    let mut binary = Stream::new(Frames::<memcache::Packet>::with_limit(3));
     assert_eq!(binary.push(&header), header.len());
     assert_eq!(
         binary.next(),
@@ -508,7 +509,7 @@ fn memcache_limits_are_checked_before_body_assembly() {
     assert_eq!(binary.buffered(), memcache::BINARY_HEADER_LEN);
     assert_eq!(binary.held(), 0);
     assert!(binary.next().is_none());
-    contract::check_decode(|| memcache::Packets::with_limit(3), &header);
+    contract::check_decode(|| Frames::<memcache::Packet>::with_limit(3), &header);
 }
 
 #[test]
@@ -544,8 +545,8 @@ fn memcache_eof_inside_headers_bodies_trailers_and_skips() {
     );
     let bytes = written(&[cache_packet(b"body")]);
     for cut in [1, 23, 24, bytes.len() - 1] {
-        contract::check_decode(memcache::Packets::new, &bytes[..cut]);
-        let (items, failure) = decode_all(memcache::Packets::new, &bytes[..cut]);
+        contract::check_decode(Frames::<memcache::Packet>::new, &bytes[..cut]);
+        let (items, failure) = decode_all(Frames::<memcache::Packet>::new, &bytes[..cut]);
         assert!(items.is_empty());
         assert_eq!(failure, Some(Fail::Truncated { unread: cut }));
     }
@@ -608,7 +609,7 @@ fn contracts_cover_random_and_mutated_input() {
         contract::check_decode_with_alloc_limit(|| whois::CollectedResponses::with_limit(17), &bytes, 2 * whois::RESPONSE_WINDOW);
         contract::check_decode_with_alloc_limit(memcache::Commands::new, &bytes, 2 * memcache::MAX_LINE);
         contract::check_decode_with_alloc_limit(memcache::Responses::new, &bytes, 2 * memcache::MAX_LINE);
-        contract::check_decode_with_alloc_limit(|| memcache::Packets::with_limit(17), &bytes, 2 * (memcache::BINARY_HEADER_LEN + 17));
+        contract::check_decode_with_alloc_limit(|| Frames::<memcache::Packet>::with_limit(17), &bytes, 2 * (memcache::BINARY_HEADER_LEN + 17));
         contract::check_wire::<ftp::Command>(&bytes);
         contract::check_wire::<ftp::Reply>(&bytes);
         contract::check_wire::<ftp::Request>(&bytes);
@@ -655,7 +656,7 @@ fn decoder_capacity_and_empty_eof() {
             whois::CollectedResponses::new(),
             memcache::Commands::new(),
             memcache::Responses::new(),
-            memcache::Packets::new(),
+            Frames::<memcache::Packet>::new(),
         )
     );
     assert_eq!(ftp::Commands::new().capacity(), ftp::MAX_LINE);
@@ -667,13 +668,13 @@ fn decoder_capacity_and_empty_eof() {
         whois::RESPONSE_WINDOW
     );
     assert_eq!(
-        memcache::Packets::with_limit(usize::MAX).capacity(),
+        Frames::<memcache::Packet>::with_limit(usize::MAX).capacity(),
         memcache::MAX_BINARY_BUFFERED
     );
     assert_eq!(memcache::Responses::new().capacity(), memcache::MAX_LINE);
     assert_eq!(memcache::Commands::new().capacity(), memcache::MAX_LINE);
     assert_eq!(
-        memcache::Packets::with_limit(0).decode(&[], true),
+        Frames::<memcache::Packet>::with_limit(0).decode(&[], true),
         Ok(Step::Need)
     );
     round_trip(ftp::Commands::new, b"", &[]);
@@ -689,7 +690,7 @@ fn decoder_capacity_and_empty_eof() {
     );
     round_trip(memcache::Commands::new, b"", &[]);
     round_trip(memcache::Responses::new, b"", &[]);
-    round_trip(memcache::Packets::new, b"", &[]);
+    round_trip(Frames::<memcache::Packet>::new, b"", &[]);
 }
 
 #[test]
@@ -762,10 +763,10 @@ fn memcache_binary_key_length_precedes_body_length() {
             Err(error)
         );
         assert_eq!(
-            memcache::Packets::with_limit(3).decode(&header, false),
+            Frames::<memcache::Packet>::with_limit(3).decode(&header, false),
             Err(error)
         );
-        assert_eq!(memcache::Packets::new().decode(&header, false), Err(error));
+        assert_eq!(Frames::<memcache::Packet>::new().decode(&header, false), Err(error));
     }
 }
 

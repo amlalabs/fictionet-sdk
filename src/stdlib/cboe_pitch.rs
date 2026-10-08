@@ -78,7 +78,10 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Wire};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
@@ -1356,12 +1359,13 @@ pub fn sequence_distance(from: u32, to: u32) -> u32 {
 /// the header alone.
 ///
 /// ```
-/// use fictionet::stdlib::cboe_pitch::{Control, LoginResponse, Unit, Units};
+/// use fictionet::stdlib::codec::Frames;
+/// use fictionet::stdlib::cboe_pitch::{Control, LoginResponse, Unit};
 /// use fictionet::stdlib::codec::{finish, pump, Stream, Wire};
 ///
 /// let response = Control::from(LoginResponse { status: b'A', extra: Vec::new() });
 /// let bytes = Unit::control(&response)?.to_bytes()?;
-/// let mut stream = Stream::new(Units::default());
+/// let mut stream = Stream::new(Frames::<Unit>::default());
 /// let mut units = Vec::new();
 /// pump(&mut stream, &bytes[..5], |u| units.push(u))?;
 /// pump(&mut stream, &bytes[5..], |u| units.push(u))?;
@@ -1370,52 +1374,41 @@ pub fn sequence_distance(from: u32, to: u32) -> u32 {
 /// assert_eq!(Control::parse(&unit.messages[0])?, response);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Units {
-    limit: usize,
-}
-impl Units {
-    /// A framer that accepts units up to `limit` bytes, at least the
-    /// header and at most [`MAX_UNIT_LENGTH`].
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.clamp(HEADER_LENGTH, MAX_UNIT_LENGTH),
-        }
-    }
-    /// The unit limit.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-impl Default for Units {
-    fn default() -> Self {
-        Self::with_limit(MAX_UNIT_LENGTH)
-    }
-}
-impl Decode for Units {
+impl Prefixed for Unit {
     type Item = Result<Unit, Error>;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "PITCH";
-    fn capacity(&self) -> usize {
-        self.limit
-    }
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_UNIT_LENGTH }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(HEADER_LENGTH, MAX_UNIT_LENGTH) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize { *limit }
+
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
         let Some(prefix) = input.get(..2) else {
-            return Ok(Step::Need);
+            return Ok(None);
         };
         let length = usize::from(u16::from_le_bytes([prefix[0], prefix[1]]));
         if length < HEADER_LENGTH {
             return Err(Error::Length);
         }
-        if length > self.limit {
+        if length > limit {
             return Err(Error::TooLong);
         }
         let Some(unit) = input.get(..length) else {
-            return Ok(Step::Need);
+            return Ok(None);
         };
-        Ok(Step::Item(Unit::parse(unit), length))
+        Ok(Some((Unit::parse(unit), length)))
     }
 }
+
 
 /// Missing messages on one unit, ready to request from the GRP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2908,18 +2901,18 @@ mod tests {
         // A block that frames but does not parse is an item.
         bytes.extend_from_slice(&[9, 0, 2, 0, 0, 0, 0, 0, 0]);
         Unit::heartbeat(0, 0).write(&mut bytes).unwrap();
-        check_decode(Units::default, &bytes);
-        check_decode(|| Units::with_limit(40), &bytes);
-        check_decode_with_alloc_limit(Units::default, &bytes, 2 * MAX_UNIT_LENGTH);
-        let (items, failure) = decode_all(Units::default, &bytes);
+        check_decode(Frames::<Unit>::default, &bytes);
+        check_decode(|| Frames::<Unit>::with_limit(40), &bytes);
+        check_decode_with_alloc_limit(Frames::<Unit>::default, &bytes, 2 * MAX_UNIT_LENGTH);
+        let (items, failure) = decode_all(Frames::<Unit>::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(items.len(), 5);
         assert_eq!(items[3], Err(Error::Length));
-        let (_, failure) = decode_all(|| Units::with_limit(10), &bytes);
+        let (_, failure) = decode_all(|| Frames::<Unit>::with_limit(10), &bytes);
         assert_eq!(failure, Some(Fail::Protocol(Error::TooLong)));
-        let (_, failure) = decode_all(Units::default, &[3, 0, 0]);
+        let (_, failure) = decode_all(Frames::<Unit>::default, &[3, 0, 0]);
         assert_eq!(failure, Some(Fail::Protocol(Error::Length)));
-        let (_, failure) = decode_all(Units::default, &[9, 0, 0]);
+        let (_, failure) = decode_all(Frames::<Unit>::default, &[9, 0, 0]);
         assert_eq!(failure, Some(Fail::Truncated { unread: 3 }));
     }
 
@@ -2972,7 +2965,7 @@ mod tests {
             for _ in 0..=rng.below(4) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_decode(Units::default, &bytes);
+            check_decode(Frames::<Unit>::default, &bytes);
         }
     }
 

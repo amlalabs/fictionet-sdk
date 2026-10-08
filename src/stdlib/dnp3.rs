@@ -7,7 +7,7 @@
 //! every CRC and removes them from its data; its writer puts them back.
 //! The framing follows IEEE 1815 (DNP3).
 //!
-//! Push connection bytes to a [`Stream<Frames>`](fictionet::stdlib::codec::Stream),
+//! Push connection bytes to a [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream),
 //! then read each data frame's [`Segment`]. A [`Reassembler`] joins transport
 //! segments into application fragments. Use one reassembler per source,
 //! destination and direction. Link acknowledgments, duplicate suppression
@@ -17,8 +17,9 @@
 //! Unknown link and application function codes are preserved.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::dnp3::{Frames, Frame, Fragment, Segment};
+//! use fictionet::stdlib::dnp3::{Frame, Fragment, Segment};
 //!
 //! // Read class 0 data: group 60, variation 1, all objects.
 //! let request = Fragment { control: 0xc0, function: 1, indications: None,
@@ -28,12 +29,15 @@
 //! let frame = Frame { control: 0xc4, destination: 1, source: 1024,
 //!                     data: segment.to_bytes().unwrap() };
 //! let bytes = frame.to_bytes().unwrap();
-//! let mut decoder = Stream::new(Frames::new());
+//! let mut decoder = Stream::new(Frames::<Frame>::new());
 //! assert_eq!(decoder.push(&bytes), bytes.len());
 //! assert_eq!(decoder.next().unwrap().unwrap(), frame);
 //! ```
 
-use fictionet::stdlib::codec::{le16, Decode, Step, Wire};
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{le16, Wire};
 
 /// The usual TCP and UDP port.
 pub const PORT: u16 = 20000;
@@ -232,38 +236,32 @@ impl Wire for Frame {
 
 /// Reads DNP3 frames without holding input bytes.
 ///
-/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for a buffer limited to
-/// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
+/// Use with [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) for a buffer limited to
+/// [`MAX_FRAME`]. Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
-
-impl Frames {
-    /// Creates a frame decoder with a capacity of [`MAX_FRAME`] bytes.
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Decode for Frames {
+impl Prefixed for Frame {
     type Item = Frame;
     type Error = Error;
+    type Limit = ();
     const NAME: &'static str = "DNP3";
 
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         MAX_FRAME
     }
 
-    /// Reads a frame prefix, returning [`Step::Need`] while incomplete.
+    /// Reads a frame prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.
     /// Returns [`Error::Start`], [`Error::FrameLength`] or
     /// [`Error::Crc`] for invalid start bytes, lengths or CRCs.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        Ok(match Frame::parse_prefix(input)? {
-            Some((frame, used)) => Step::Item(frame, used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        Frame::parse_prefix(input)
     }
 }
+
 
 fn check_crc(b: &[u8], at: usize, size: usize) -> Result<(), Error> {
     if crc(&b[at..at + size]) == le16(b, at + size).ok_or(Error::Truncated)? {
@@ -536,11 +534,11 @@ mod tests {
         let encoded = frame.to_bytes().unwrap();
         assert_eq!(encoded.len(), MAX_FRAME);
         let bytes = encoded.repeat(10);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_FRAME);
-        let (frames, failure) = decode_all(Frames::new, &bytes);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
+        let (frames, failure) = decode_all(Frames::<Frame>::new, &bytes);
         assert!(failure.is_none());
         assert_eq!(frames, vec![frame; 10]);
-        let mut stream = Stream::new(Frames);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&vec![0; MAX_FRAME + 1]), MAX_FRAME);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Start))));
         assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::Start)));

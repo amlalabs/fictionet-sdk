@@ -18,7 +18,7 @@
 //! and writes each [`Response`] back. A client uses
 //! [`Stream<Responses>`](fictionet::stdlib::codec::Stream). Headers accept CRLF or
 //! bare LF; counted data blocks require CRLF. Binary connections use
-//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream). [`UdpFrame`] describes each
+//! [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream). [`UdpFrame`] describes each
 //! datagram. Cache contents and expiration belong to world code.
 //!
 //! Every reader checks keys, line lengths, numbers and data lengths,
@@ -72,6 +72,9 @@
 //! assert_eq!(out, b"STORED\r\nVALUE greeting 5 5\r\nhello\r\nEND\r\nERROR\r\n");
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{be16, be32, be64, self, Decode, Step, Wire};
 
 /// The port memcached listens on, for both TCP and UDP.
@@ -1165,7 +1168,7 @@ pub const RESPONSE_MAGIC: u8 = 0x81;
 /// The longest binary body: the most extras, the longest key and the
 /// longest value.
 pub const MAX_BODY: usize = 255 + MAX_KEY + MAX_VALUE;
-/// The input capacity of [`Packets`]: one packet of the longest
+/// The input capacity of [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames): one packet of the longest
 /// body, with its header.
 pub const MAX_BINARY_BUFFERED: usize = BINARY_HEADER_LEN + MAX_BODY;
 
@@ -1802,7 +1805,7 @@ fn quiet_command(command: &Command) -> bool {
 /// windows under [`MAX_GET_LINE`].
 /// A parsed header supplies its body's exact count. The assembler consumes
 /// that many bytes without interpreting their content. No session mode or
-/// text/binary switch is inferred; choose [`Packets`] for binary streams.
+/// text/binary switch is inferred; choose [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames) for binary streams.
 ///
 /// Bad lines and blocks are error items. Oversized blocks and malformed
 /// meta storage blocks are skipped by their declared count, as memcached
@@ -2153,39 +2156,27 @@ impl Wire for Response {
 /// exceeding that limit is refused from the 24-byte header. All header
 /// errors are terminal. Partial packets return
 /// [`Step::Need`], so [`codec::Stream`] reports truncation at EOF.
-#[derive(Clone, Copy, Debug)]
-pub struct Packets {
-    limit: usize,
-}
-impl Packets {
-    /// Creates a reader with a body limit of [`MAX_BODY`].
-    pub fn new() -> Self {
-        Self::with_limit(MAX_BODY)
-    }
-    /// Sets the body limit, clamped to [`MAX_BODY`]. Zero accepts empty bodies.
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_BODY),
-        }
-    }
-    /// The maximum accepted body size, excluding the header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-impl Default for Packets {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl Decode for Packets {
+impl Prefixed for Packet {
     type Item = Packet;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "memcache binary";
-    fn capacity(&self) -> usize {
-        BINARY_HEADER_LEN.saturating_add(self.limit)
+
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_BODY }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_BODY) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        BINARY_HEADER_LEN.saturating_add(limit)
     }
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
+
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
         if let Some(&m) = input.first() {
             Magic::from_byte(m).ok_or(Error::Magic(m))?;
         }
@@ -2195,16 +2186,15 @@ impl Decode for Packets {
                 return Err(Error::KeyLength(key_len));
             }
             let body = usize::try_from(be32(header, 8).ok_or(Error::Incomplete)?).unwrap_or(usize::MAX);
-            if body > self.limit {
+            if body > limit {
                 return Err(Error::BodyLength(body));
             }
         }
-        Ok(match Packet::parse_prefix(input)? {
-            Some((packet, used)) => Step::Item(packet, used),
-            None => Step::Need,
-        })
+        Packet::parse_prefix(input)
     }
 }
+
+
 impl Wire for Packet {
     type ParseError = Error;
     type WriteError = Error;
@@ -2803,7 +2793,7 @@ mod tests {
         assert_eq!(resp.to_bytes().unwrap(), GET_RESPONSE);
         assert_eq!(Packet::parse(&GET_RESPONSE).unwrap(), resp);
         for n in 0..GET_REQUEST.len() {
-            assert_eq!(Packets::new().decode(&GET_REQUEST[..n], false), Ok(Step::Need), "{n} bytes");
+            assert_eq!(Frames::<Packet>::new().decode(&GET_REQUEST[..n], false), Ok(Step::Need), "{n} bytes");
         }
     }
 
@@ -2856,11 +2846,11 @@ mod tests {
     #[test]
     fn binary_decoder() {
         let bytes = [GET_REQUEST.as_slice(), GET_RESPONSE.as_slice()].concat();
-        let (packets, failure) = decode_all(Packets::new, &bytes);
+        let (packets, failure) = decode_all(Frames::<Packet>::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(packets.iter().map(|p| p.magic).collect::<Vec<_>>(), [Magic::Request, Magic::Response]);
-        contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_BINARY_BUFFERED);
-        let mut stream = Stream::new(Packets::new());
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_BINARY_BUFFERED);
+        let mut stream = Stream::new(Frames::<Packet>::new());
         assert_eq!(stream.push(&[0]), 1);
         assert_eq!(stream.next(), Some(Err(codec::Fail::Protocol(Error::Magic(0)))));
         assert_eq!(stream.push(&GET_REQUEST), GET_REQUEST.len());
@@ -2980,12 +2970,12 @@ mod tests {
         let mut rng = Lcg::new(2);
         for _ in 0..4000 {
             let bytes = fuzz_buffer(&mut rng, &pieces);
-            contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_BINARY_BUFFERED);
+            contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_BINARY_BUFFERED);
             contract::check_wire::<Packet>(&bytes);
             contract::check_wire::<UdpFrame>(&bytes);
             contract::check_wire::<StoreExtras>(&bytes);
             contract::check_wire::<CounterExtras>(&bytes);
-            for packet in decode_all(Packets::new, &bytes).0 {
+            for packet in decode_all(Frames::<Packet>::new, &bytes).0 {
                 contract::check_wire_value(&packet);
                 contract::check_wire::<StoreExtras>(&packet.extras);
                 contract::check_wire::<CounterExtras>(&packet.extras);
@@ -3005,12 +2995,12 @@ mod tests {
         assert_eq!(stream.push(&bytes), MAX_LINE);
         assert_eq!(stream.push(&bytes), 0);
         assert_eq!(commands(&bytes).len(), MAX_LINE);
-        contract::check_decode_with_alloc_limit(Packets::new, &[0; 4096], 2 * MAX_BINARY_BUFFERED);
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &[0; 4096], 2 * MAX_BINARY_BUFFERED);
         let mut packet = Packet::parse(&GET_REQUEST).unwrap();
         packet.value = vec![0; MAX_BODY - packet.key.len()];
         let bytes = packet.to_bytes().unwrap();
-        assert_eq!(decode_all(Packets::new, &bytes), (vec![packet], None));
-        contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_BINARY_BUFFERED);
+        assert_eq!(decode_all(Frames::<Packet>::new, &bytes), (vec![packet], None));
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_BINARY_BUFFERED);
     }
 
     /// The loop of the module's example: replies for every command, until

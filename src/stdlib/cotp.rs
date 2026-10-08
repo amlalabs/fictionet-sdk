@@ -74,6 +74,7 @@
 //! assert_eq!(messages.push(&data), Ok(Some(b"hi".to_vec())));
 //! ```
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::{
     codec::{Assemble, Decode, Fragment, Map, Wire},
     tpkt,
@@ -790,7 +791,7 @@ pub mod over_tpkt {
 /// TPKT already bounds each payload to [`MAX_TPDU`], so only the standalone
 /// [`Wire`] parser needs [`Error::TpduTooLong`]. Framing errors are
 /// [`tpkt::Error`].
-pub type Tpdus = Map<tpkt::Packets, fn(tpkt::Packet) -> Result<Tpdu, Error>>;
+pub type Tpdus = Map<Frames::<tpkt::Packet>, fn(tpkt::Packet) -> Result<Tpdu, Error>>;
 
 /// Creates a TPDU decoder with a TPKT packet limit, including its header.
 /// Clamps `packet_limit` to [`tpkt::MIN_PACKET`] through [`tpkt::MAX_PACKET`].
@@ -798,7 +799,7 @@ pub type Tpdus = Map<tpkt::Packets, fn(tpkt::Packet) -> Result<Tpdu, Error>>;
 /// with [`ErrorTpdu::rejecting`], use [`fictionet::stdlib::codec::Stream::with_next`]:
 /// its raw bytes are the TPKT packet, whose TPDU starts at [`tpkt::HEADER_LEN`].
 pub fn tpdus(packet_limit: usize) -> Tpdus {
-    tpkt::Packets::with_limit(packet_limit).map(|packet| Tpdu::parse(&packet.payload))
+    Frames::<tpkt::Packet>::with_limit(packet_limit).map(|packet| Tpdu::parse(&packet.payload))
 }
 
 /// Data TPDUs joined into messages by [`Assemble`].
@@ -1108,7 +1109,7 @@ mod codec_tests {
             Assembled::Message(b"next".to_vec()),
         ];
         let check = |chunks: Vec<&[u8]>| {
-            let read_packets = drive(tpkt::Packets::with_limit(132), &chunks);
+            let read_packets = drive(Frames::<tpkt::Packet>::with_limit(132), &chunks);
             assert_eq!(read_packets, packets);
             let read_tpdus = drive(tpdus(132), &chunks);
             assert_eq!(
@@ -1400,7 +1401,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, contract, pump, test_support};
-    use tpkt::{MAX_PACKET, MAX_PAYLOAD, Packet, Packets};
+    use tpkt::{MAX_PACKET, MAX_PAYLOAD, Packet};
 
     // An RDP connection request (MS-RDPBCGR 4.1.1) starts with a TPKT
     // header and an X.224 connection request. Its length indicator, 14,
@@ -1516,8 +1517,8 @@ mod tests {
             rng.fill(&mut message);
             for tpdu_size in [0usize, 128, 1024, 8192, MAX_PAYLOAD, usize::MAX] {
                 let bytes = over_tpkt::write_message(&message, tpdu_size).unwrap();
-                contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_PACKET);
-                let (packets, err) = test_support::decode_all(Packets::new, &bytes);
+                contract::check_decode_with_alloc_limit(Frames::<tpkt::Packet>::new, &bytes, 2 * MAX_PACKET);
+                let (packets, err) = test_support::decode_all(Frames::<tpkt::Packet>::new, &bytes);
                 assert_eq!(err, None);
                 let mut r = Reassembler::new();
                 let mut out = None;
@@ -2048,7 +2049,7 @@ mod tests {
         for p in &packets {
             for n in 0..p.len() {
                 assert_eq!(tpkt::Packet::parse_prefix(&p[..n]), Ok(None), "{n} of {p:?}");
-                let mut d = Stream::new(tpkt::Packets::new());
+                let mut d = Stream::new(Frames::<tpkt::Packet>::new());
                 assert_eq!(d.push(&p[..n]), n);
                 assert_eq!(d.next(), None);
                 assert_eq!(d.buffered(), n);
@@ -2222,8 +2223,8 @@ mod tests {
         .to_bytes()
         .unwrap();
         let bytes: Vec<u8> = a.iter().chain(&b).copied().collect();
-        contract::check_decode(tpkt::Packets::new, &bytes);
-        let mut stream = Stream::new(tpkt::Packets::new());
+        contract::check_decode(Frames::<tpkt::Packet>::new, &bytes);
+        let mut stream = Stream::new(Frames::<tpkt::Packet>::new());
         let mut got = Vec::new();
         pump(&mut stream, &bytes, |packet| got.push(packet.payload)).unwrap();
         assert_eq!(got, [a[4..].to_vec(), b[4..].to_vec()]);
@@ -2370,8 +2371,8 @@ mod tests {
         let one = packet.to_bytes().unwrap();
         let mut bytes = one.repeat(1000);
         bytes.extend_from_slice(&one[..10]);
-        contract::check_decode_with_alloc_limit(tpkt::Packets::new, &bytes, 2 * tpkt::MAX_PACKET);
-        let mut stream = Stream::new(tpkt::Packets::new());
+        contract::check_decode_with_alloc_limit(Frames::<tpkt::Packet>::new, &bytes, 2 * tpkt::MAX_PACKET);
+        let mut stream = Stream::new(Frames::<tpkt::Packet>::new());
         let mut count = 0;
         pump(&mut stream, &bytes, |_| count += 1).unwrap();
         assert_eq!(count, 1000);
@@ -2401,7 +2402,7 @@ mod tests {
             .take(one.len() * 200_000)
             .collect();
         let started = std::time::Instant::now();
-        let mut d = Stream::new(tpkt::Packets::new());
+        let mut d = Stream::new(Frames::<tpkt::Packet>::new());
         let mut n = 0;
         pump(&mut d, &stream, |_| n += 1).unwrap();
         assert_eq!(n, 200_000);
@@ -2415,11 +2416,11 @@ mod tests {
 
     /// The checks the fuzz target makes, on one buffer.
     fn check(data: &[u8]) {
-        contract::check_decode(tpkt::Packets::new, data);
+        contract::check_decode(Frames::<tpkt::Packet>::new, data);
         contract::check_decode(|| tpdus(tpkt::MAX_PACKET), data);
         contract::check_decode(|| messages(tpkt::MAX_PACKET, 64), data);
         contract::check_wire::<Tpdu>(data);
-        let (packets, _) = test_support::decode_all(tpkt::Packets::new, data);
+        let (packets, _) = test_support::decode_all(Frames::<tpkt::Packet>::new, data);
         // Any bytes cut into segments come back whole.
         let size = data.first().map_or(128, |&b| usize::from(b) * 3);
         let mut r = Reassembler::new();

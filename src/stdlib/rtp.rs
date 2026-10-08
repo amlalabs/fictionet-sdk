@@ -20,7 +20,7 @@
 //!
 //! Nothing here reads a socket. A world reads each UDP datagram with
 //! [`Demux::parse`], which tells RTP from RTCP using RFC 5761. Over TCP,
-//! [`Stream<rtcp::Frames>`](fictionet::stdlib::codec::Stream) splits RFC 4571 envelopes.
+//! [`Stream<codec::Frames<rtcp::Frame>>`](fictionet::stdlib::codec::Stream) splits RFC 4571 envelopes.
 //! [`rtcp::Frame`] supplies the length prefix when sending. Media contents and
 //! report policy belong to world code. SRTP and SRTCP are not handled here.
 //!
@@ -58,6 +58,8 @@ pub const TWO_BYTE_PROFILE: u16 = 0x1000;
 // ---------------------------------------------------------------------------
 // RTP
 
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Reader, Truncated};
 
 use fictionet::stdlib::{codec::Wire, rtcp};
@@ -907,20 +909,20 @@ mod tests {
             rtcp::Frame(vec![]).to_bytes().unwrap(),
         ]
         .concat();
-        contract::check_decode_with_alloc_limit(rtcp::Frames::new, &bytes, 2 * (MAX_PACKET + 2));
-        let (items, error) = decode_all(rtcp::Frames::new, &bytes);
+        contract::check_decode_with_alloc_limit(Frames::<rtcp::Frame>::new, &bytes, 2 * (MAX_PACKET + 2));
+        let (items, error) = decode_all(Frames::<rtcp::Frame>::new, &bytes);
         assert_eq!(error, None);
         assert_eq!(items, [rtcp::Frame(vec![]), a.clone(), rtcp::Frame(vec![])]);
         assert_eq!(Demux::parse(&items[1].0), Ok(Demux::Rtp(rtp(&[1]))));
         let large = rtcp::Frame(vec![1; MAX_PACKET]).to_bytes().unwrap();
-        contract::check_decode_with_alloc_limit(rtcp::Frames::new, &large, 2 * (MAX_PACKET + 2));
+        contract::check_decode_with_alloc_limit(Frames::<rtcp::Frame>::new, &large, 2 * (MAX_PACKET + 2));
         assert_eq!(
             rtcp::Frame(vec![1; MAX_PACKET + 1]).to_bytes(),
             Err(rtcp::Error::Unwritable)
         );
         let many = a.to_bytes().unwrap().repeat(200_000);
         let started = std::time::Instant::now();
-        let (items, error) = decode_all(rtcp::Frames::new, &many);
+        let (items, error) = decode_all(Frames::<rtcp::Frame>::new, &many);
         // Allow slow test hosts while catching repeated scans or front removal.
         assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
         assert_eq!(items.len(), 200_000);
@@ -994,7 +996,7 @@ mod tests {
                 }
                 contract::check_wire::<Packet>(&bytes);
                 contract::check_wire::<Demux>(&bytes);
-                contract::check_decode_with_alloc_limit(rtcp::Frames::new, &bytes, 2 * (MAX_PACKET + 2));
+                contract::check_decode_with_alloc_limit(Frames::<rtcp::Frame>::new, &bytes, 2 * (MAX_PACKET + 2));
                 mutate(&mut rng, &mut bytes);
             }
             let mut p = rtp(&rng.bytes(40));

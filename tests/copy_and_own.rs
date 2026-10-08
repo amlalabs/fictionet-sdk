@@ -1,6 +1,7 @@
 //! Check public codec traits through the separate consumer fixture.
 //! Copied modules compile without cfg(test) in fictionet-copy-modules.
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
 use fictionet_copy_modules::*;
 
@@ -34,7 +35,7 @@ fn copied_modbus_uses_the_public_driver_and_map() {
     let mut bytes = Vec::new();
     frame.write(&mut bytes).unwrap();
     assert_eq!(<modbus::Frame as Wire>::parse(&bytes).unwrap(), frame);
-    let mut stream = Stream::new(modbus::Frames.map(|frame| modbus::Request::parse(&frame.pdu)));
+    let mut stream = Stream::new(Frames::<modbus::Frame>::new().map(|frame| modbus::Request::parse(&frame.pdu)));
     let mut requests = Vec::new();
     for chunk in bytes.chunks(3) {
         assert_eq!(
@@ -288,7 +289,7 @@ fn copied_soupbintcp_frames_through_the_public_driver() {
     )
     .unwrap();
     client.start(0).unwrap();
-    let mut stream = Stream::new(soupbintcp::Packets::default());
+    let mut stream = Stream::new(Frames::<soupbintcp::Packet>::default());
     let mut events = Vec::new();
     for chunk in bytes.chunks(5) {
         pump(&mut stream, chunk, |frame| {
@@ -365,7 +366,7 @@ fn copied_itch_frames_a_file_and_builds_a_book() {
         file.extend_from_slice(&(m.wire_len() as u16).to_be_bytes());
         m.write(&mut file).unwrap();
     }
-    let mut stream = Stream::new(itch::Messages::default());
+    let mut stream = Stream::new(Frames::<itch::Message>::default());
     let mut book = itch::Book::new(itch::BookConfig::default()).unwrap();
     for chunk in file.chunks(7) {
         pump(&mut stream, chunk, |m| {
@@ -434,7 +435,7 @@ fn copied_cboe_pitch_frames_units_and_builds_a_book() {
     let unit = cboe_pitch::Unit::of(1, 1, &[add.into(), reduce.into()]).unwrap();
     let bytes = unit.to_bytes().unwrap();
     assert_eq!(bytes.len(), 50);
-    let mut stream = Stream::new(cboe_pitch::Units::default());
+    let mut stream = Stream::new(Frames::<cboe_pitch::Unit>::default());
     let mut book = cboe_pitch::Book::new(cboe_pitch::BookConfig::default()).unwrap();
     let mut gaps = cboe_pitch::GapDetector::new();
     for chunk in bytes.chunks(7) {
@@ -467,7 +468,7 @@ fn copied_cboe_boe_logs_in_and_acknowledges() {
     };
     let mut client = cboe_boe::Client::new(config, &[], 0).unwrap();
     let mut server = cboe_boe::Server::new(cboe_boe::Timers::default(), 0).unwrap();
-    let mut frames = Stream::new(cboe_boe::Messages::<cboe_boe::Inbound>::default());
+    let mut frames = Stream::new(Frames::<cboe_boe::Inbound>::default());
     for action in client.start(0).unwrap() {
         if let Action::Send(m) = action {
             let bytes = m.to_bytes().unwrap();

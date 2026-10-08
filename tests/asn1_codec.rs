@@ -1,5 +1,6 @@
 //! ASN.1 framing and its LDAP, OCSP, SPNEGO, PEM, and Kerberos consumers.
 
+use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
     Decode, Fail, Stream, Wire, contract, finish, pump, test_support::chunks,
@@ -126,7 +127,7 @@ fn ldap_messages_round_trip() -> Result<(), Box<dyn core::error::Error>> {
     let mut both = bytes.clone();
     request.write(&mut both)?;
     round_trip(
-        ldap::Messages::new,
+        Frames::<ldap::Message>::new,
         &both,
         &[request.clone(), request.clone()],
     );
@@ -136,9 +137,9 @@ fn ldap_messages_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         &both,
         &[Ok(request.clone()), Ok(request)],
     );
-    truncated(ldap::Messages::new, bytes.get(..bytes.len() - 1).unwrap());
+    truncated(Frames::<ldap::Message>::new, bytes.get(..bytes.len() - 1).unwrap());
     refused(
-        || ldap::Messages::with_limit(8),
+        || Frames::<ldap::Message>::with_limit(8),
         &[0x30, 9],
         ldap::Error::TooLarge(11),
     );

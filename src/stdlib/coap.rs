@@ -12,7 +12,7 @@
 //! Nothing here reads a socket. A world that plays a device reads each
 //! datagram it gets with [`Message::parse`], looks at its code, path and
 //! options, and sends back the bytes of [`Message::to_bytes`] for the
-//! reply. Over TCP it pushes the bytes it reads to a [`Stream<Frames>`](fictionet::stdlib::codec::Stream) and gets
+//! reply. Over TCP it pushes the bytes it reads to a [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) and gets
 //! [`Frame`]s back. Which resources exist, and what they hold, is up to
 //! world code.
 //!
@@ -53,8 +53,11 @@
 //! assert_eq!(reply.to_bytes().unwrap(), [0x61, 0x45, 0x12, 0x34, 0x77, 0xc0, 0xff, b'2', b'1', b'.', b'5']);
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::ascii::{self, hex_upper};
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Wire};
 
 /// The UDP and TCP port CoAP servers listen on.
 pub const PORT: u16 = 5683;
@@ -82,7 +85,7 @@ pub const MAX_FRAME_BODY: usize = 1 << 20;
 /// The longest TCP frame header: the length and token-length byte, a
 /// 4-byte extended length, and the code.
 pub const MAX_FRAME_HEADER: usize = 6;
-/// The most bytes a [`Stream<Frames>`](fictionet::stdlib::codec::Stream) holds: one whole frame of the largest
+/// The most bytes a [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) holds: one whole frame of the largest
 /// size.
 pub const MAX_BUFFERED: usize = MAX_FRAME_HEADER + MAX_TOKEN + MAX_FRAME_BODY;
 /// The longest body a [`Reassembler`] collects.
@@ -1209,47 +1212,43 @@ impl Wire for Frame {
 ///
 /// Use with [`fictionet::stdlib::codec::Stream`] for at most [`MAX_BUFFERED`] unread
 /// bytes. Header and body errors end the stream.
-/// Partial frames return [`Step::Need`], including at EOF. The driver
+/// Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The driver
 /// reports truncation. UDP datagrams use [`Wire`] on [`Message`] directly.
 ///
 /// ```
-/// use fictionet::stdlib::{coap::{Frame, Frames}, codec::{Stream, Wire}};
+/// use fictionet::stdlib::codec::Frames;
+/// use fictionet::stdlib::coap::Frame;
+/// use fictionet::stdlib::codec::{Stream, Wire};
 ///
 /// let frame = Frame::csm(4096, true);
 /// let bytes = Wire::to_bytes(&frame)?;
-/// let mut stream = Stream::new(Frames::new());
+/// let mut stream = Stream::new(Frames::<Frame>::new());
 /// assert_eq!(stream.push(&bytes), bytes.len());
 /// assert_eq!(stream.next(), Some(Ok(frame)));
 /// stream.end();
 /// assert_eq!(stream.next(), None);
 /// # Ok::<(), fictionet::stdlib::coap::Error>(())
 /// ```
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
-
-impl Frames {
-    /// Creates a TCP frame decoder with no retained state.
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Decode for Frames {
+impl Prefixed for Frame {
     type Item = Frame;
     type Error = Error;
+    type Limit = ();
     const NAME: &'static str = "CoAP over TCP";
 
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         MAX_BUFFERED
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        Ok(match Frame::parse_prefix(input)? {
-            Some((frame, used)) => Step::Item(frame, used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        Frame::parse_prefix(input)
     }
 }
+
 
 /// A Block1 or Block2 option (RFC 7959): which block of a body this is,
 /// whether more follow, and the block size.
@@ -1525,6 +1524,7 @@ fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usiz
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, contract, pump,
@@ -1878,7 +1878,7 @@ mod tests {
         assert_eq!(back.options.location_path().as_deref(), Some("/logs/17"));
         assert_eq!(back.options.accept(), Some(60));
         assert_eq!((&o).into_iter().count(), o.len());
-        let mut frames = Frames::new();
+        let mut frames = Frames::<Frame>::new();
         assert_eq!(frames.decode(&[0x01, 0xe2], false), Ok(Step::Need));
         assert!(matches!(frames.clone().decode(&[0x01, 0xe2, 0x42], false), Ok(Step::Item(_, 3))));
     }
@@ -1938,8 +1938,8 @@ mod tests {
     fn stream_holds_at_most_max_buffered() {
         let mut junk = vec![0; MAX_BUFFERED + 100];
         junk[0] = 9;
-        contract::check_decode_with_alloc_limit(Frames::new, &junk, 2 * MAX_BUFFERED);
-        assert_eq!(decode_all(Frames::new, &junk).1, Some(Fail::Protocol(Error::TokenLength(9))));
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &junk, 2 * MAX_BUFFERED);
+        assert_eq!(decode_all(Frames::<Frame>::new, &junk).1, Some(Fail::Protocol(Error::TokenLength(9))));
         let big = Frame {
             code: Code::CONTENT,
             token: vec![1; MAX_TOKEN],
@@ -1949,8 +1949,8 @@ mod tests {
         let one = big.to_bytes().unwrap();
         assert_eq!(one.len(), MAX_BUFFERED);
         let bytes = one.repeat(3);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_BUFFERED);
-        assert_eq!(decode_all(Frames::new, &bytes), (vec![big; 3], None));
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_BUFFERED);
+        assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (vec![big; 3], None));
     }
 
     #[test]
@@ -2252,9 +2252,9 @@ mod tests {
         let a = Frame::csm(1152, true);
         let b = Frame { token: vec![7; 8], options: m_options(), payload: vec![5; 300], ..Frame::new(Code::GET) };
         let bytes = [a.to_bytes().unwrap(), b.to_bytes().unwrap(), a.to_bytes().unwrap()].concat();
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_BUFFERED);
-        assert_eq!(decode_all(Frames::new, &bytes), (vec![a, b, Frame::csm(1152, true)], None));
-        let mut stream = Stream::new(Frames::new());
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_BUFFERED);
+        assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (vec![a, b, Frame::csm(1152, true)], None));
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&[0x0c, 0xe2]), 2);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TokenLength(12)))));
         assert_eq!(stream.push(&bytes), bytes.len());
@@ -2265,7 +2265,7 @@ mod tests {
     fn stream_takes_many_small_frames_in_linear_time() {
         let bytes = Frame { token: vec![1], ..Frame::new(Code::PING) }.to_bytes().unwrap().repeat(200_000);
         let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Frames::<Frame>::new());
         let mut n = 0;
         pump(&mut stream, &bytes, |_| n += 1).unwrap();
         assert_eq!(n, 200_000);
@@ -2351,8 +2351,8 @@ mod tests {
         let _ = peek_header(b);
         contract::check_wire::<Message>(b);
         contract::check_wire::<Frame>(b);
-        contract::check_decode_with_alloc_limit(Frames::new, b, 2 * MAX_BUFFERED);
-        for f in decode_all(Frames::new, b).0 {
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, b, 2 * MAX_BUFFERED);
+        for f in decode_all(Frames::<Frame>::new, b).0 {
             contract::check_wire_value(&f);
             let _ = (f.bad_option(), f.max_message_size(), f.pong());
         }

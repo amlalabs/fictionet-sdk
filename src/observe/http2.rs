@@ -3,15 +3,14 @@
 //! [`stdlib::http2`](fictionet::stdlib::http2)'s observation readers
 //! ([`Frames::for_observation`](fictionet::stdlib::http2::Frames::for_observation)
 //! and [`HeaderBlocks::for_observation`](fictionet::stdlib::http2::HeaderBlocks::for_observation))
-//! and [`grpc::Messages`](fictionet::stdlib::grpc::Messages).
+//! and [`codec::Frames<grpc::Message>`](fictionet::stdlib::codec::Frames<grpc::Message>).
 //!
 //! The file uses only public observe and stdlib APIs, so a copy of it can
 //! replace the built-in, registered the same way.
 
 use fictionet::observe::{Decoded, Layer, Placement, Present};
 use fictionet::stdlib::codec::{Decode, Demux, Fail, Spans, Step, Wire};
-use fictionet::stdlib::grpc;
-use fictionet::stdlib::hpack;
+use fictionet::stdlib::{grpc, hpack};
 use fictionet::stdlib::http2::{
     Error, ErrorCode, Frame, FrameHeader, FrameItem, Frames, HEADER_LEN, HeaderBlocks, MAX_WINDOW, PREFACE,
     Setting,
@@ -111,7 +110,7 @@ impl Default for CaptureBudget {
 }
 const CAPTURE_CALL_LIMIT: usize = 256;
 struct CaptureCalls {
-    messages: Demux<(bool, u32), grpc::Messages>,
+    messages: Demux<(bool, u32), fictionet::stdlib::codec::Frames::<grpc::Message>>,
     state: BTreeMap<(bool, u32), Call>,
     budget: CaptureBudget,
     charged: usize,
@@ -121,7 +120,7 @@ impl CaptureCalls {
     fn new(budget: CaptureBudget) -> Self {
         Self {
             messages: Demux::new(CAPTURE_CALL_LIMIT, budget.limit, |_| {
-                grpc::Messages::default()
+                fictionet::stdlib::codec::Frames::<grpc::Message>::default()
             }),
             state: BTreeMap::new(),
             budget,
@@ -217,7 +216,7 @@ impl core::error::Error for CaptureError {}
 /// Complete frames already available in bounded read-ahead are displayed.
 /// Missing bytes stop the direction and clear HPACK and DATA state.
 ///
-/// Recognized gRPC streams use [`Demux`] of [`grpc::Messages`]. Both directions
+/// Recognized gRPC streams use [`Demux`] of [`codec::Frames<grpc::Message>`](fictionet::stdlib::codec::Frames). Both directions
 /// share at most 256 call entries, each with at most 256 provenance spans.
 /// Consumed spans are pruned after each message. RST_STREAM releases both
 /// halves. GOAWAY releases only streams started by its receiver, above
@@ -1163,7 +1162,7 @@ mod tests {
 
     #[test]
     fn data_demux_has_one_budget_across_streams() {
-        let mut calls = Demux::new(4, 8, |_| grpc::Messages::with_limit(32));
+        let mut calls = Demux::new(4, 8, |_| fictionet::stdlib::codec::Frames::<grpc::Message>::with_limit(32));
         assert_eq!(calls.push(&1, &[0, 0, 0, 0]), 4);
         assert_eq!(calls.push(&3, &[0, 0, 0, 0]), 4);
         assert!(calls.next().is_none());

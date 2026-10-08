@@ -15,7 +15,7 @@
 //! refresh errors) and RFC 9072 (long OPEN optional parameters).
 //!
 //! Nothing here reads a socket. A world that plays a router passes the
-//! bytes it reads from a TCP connection to [`Stream<Frames>`](fictionet::stdlib::codec::Stream),
+//! bytes it reads from a TCP connection to [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream),
 //! gets [`Frame`]s back, and reads each one with [`Message::decode`].
 //! It builds a reply with [`Message::to_frame`] and writes its bytes
 //! back to the connection. Which routes exist,
@@ -36,10 +36,11 @@
 //! bytes a reader would refuse.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
 //! use core::net::Ipv4Addr;
 //! use fictionet::stdlib::bgp::{
-//!     afi, safi, Attribute, Capability, Context, Frames, Message, Open, Origin, Prefix, Segment, SegmentKind,
+//!     afi, safi, Attribute, Capability, Context, Message, Open, Origin, Prefix, Segment, SegmentKind,
 //!     Update, AS_TRANS,
 //! };
 //!
@@ -48,7 +49,7 @@
 //!     afi: afi::IPV4,
 //!     safi: safi::UNICAST,
 //! }]);
-//! let mut stream = Stream::new(Frames);
+//! let mut stream = Stream::new(Frames::<fictionet::stdlib::bgp::Frame>::new());
 //! let mut frames = Vec::new();
 //! let bytes = Message::Open(theirs).to_frame(&Context::default()).and_then(|frame| frame.to_bytes()).unwrap();
 //! pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
@@ -88,9 +89,12 @@
 //! finish(&mut stream, |_| unreachable!()).unwrap();
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 extern crate alloc;
 
-use fictionet::stdlib::codec::{be16, be32, Decode, Step, Wire};
+use fictionet::stdlib::codec::{be16, be32, Wire};
 use alloc::{vec, vec::Vec};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -536,42 +540,44 @@ impl Wire for Frame {
 /// Reads BGP frames without holding input bytes.
 ///
 /// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`MAX_MESSAGE_LEN`].
-/// Partial frames return [`Step::Need`], including at EOF. The stream reports
+/// Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and framing errors once. Map frames through
 /// [`Message::decode`] with the session's [`Context`] to read their bodies.
 ///
 /// ```
+/// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
-/// use fictionet::stdlib::bgp::{Context, Frames, Message};
+/// use fictionet::stdlib::bgp::{Context, Message};
 ///
 /// let context = Context::default();
 /// let bytes = Message::Keepalive.to_frame(&context).and_then(|frame| frame.to_bytes())?;
-/// let mut stream = Stream::new(Frames.map(|frame| Message::decode(&frame, &context)));
+/// let mut stream = Stream::new(Frames::<fictionet::stdlib::bgp::Frame>::new().map(|frame| Message::decode(&frame, &context)));
 /// let mut messages = Vec::new();
 /// pump(&mut stream, &bytes, |message| messages.push(message))?;
 /// finish(&mut stream, |message| messages.push(message))?;
 /// assert_eq!(messages, [Ok(Message::Keepalive)]);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
-
-impl Decode for Frames {
+impl Prefixed for Frame {
     type Item = Frame;
     type Error = Error;
+    type Limit = ();
     const NAME: &'static str = "BGP";
 
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         MAX_MESSAGE_LEN
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        Ok(match Frame::parse_prefix(input)? {
-            Some((frame, used)) => Step::Item(frame, used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        Frame::parse_prefix(input)
     }
 }
+
 
 /// A BGP message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1942,6 +1948,7 @@ fn take_u32(r: &mut &[u8]) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, contract, finish, pump,
@@ -1963,7 +1970,7 @@ mod tests {
     }
 
     fn decode(bytes: &[u8], negotiated: &Context) -> Result<Message, Error> {
-        let Step::Item(frame, used) = Frames.decode(bytes, true)? else { panic!("a whole frame") };
+        let Step::Item(frame, used) = Frames::<Frame>::new().decode(bytes, true)? else { panic!("a whole frame") };
         assert_eq!(used, bytes.len());
         Message::decode(&frame, negotiated)
     }
@@ -2249,12 +2256,12 @@ mod tests {
 
     #[test]
     fn header_errors() {
-        assert_eq!(Frames.decode(&[0xff, 0xff, 0xfe], false), Err(Error::ConnectionNotSynchronized));
+        assert_eq!(Frames::<Frame>::new().decode(&[0xff, 0xff, 0xfe], false), Err(Error::ConnectionNotSynchronized));
         let mut b = header(18, 4);
-        assert_eq!(Frames.decode(&b, false), Err(Error::BadMessageLength(18)));
+        assert_eq!(Frames::<Frame>::new().decode(&b, false), Err(Error::BadMessageLength(18)));
         b = header(4097, 4);
-        assert_eq!(Frames.decode(&b, false), Err(Error::BadMessageLength(4097)));
-        assert_eq!(Frames.decode(&header(4096, 4), false), Ok(Step::Need));
+        assert_eq!(Frames::<Frame>::new().decode(&b, false), Err(Error::BadMessageLength(4097)));
+        assert_eq!(Frames::<Frame>::new().decode(&header(4096, 4), false), Ok(Step::Need));
         b = header(19, 9);
         assert_eq!(decode(&b, &TWO), Err(Error::BadMessageType(9)));
         b = header(19, 0);
@@ -2688,7 +2695,7 @@ mod tests {
     fn every_truncated_prefix_waits_for_more() {
         for (b, negotiated) in samples() {
             for n in 0..b.len() {
-                assert_eq!(Frames.decode(&b[..n], false), Ok(Step::Need), "{n} of {} bytes", b.len());
+                assert_eq!(Frames::<Frame>::new().decode(&b[..n], false), Ok(Step::Need), "{n} of {} bytes", b.len());
             }
             // Bodies cut short never read as the whole message, and never
             // panic.
@@ -2707,11 +2714,11 @@ mod tests {
     fn stream_splits_frames() {
         let all = samples();
         let bytes: Vec<u8> = all.iter().filter(|(_, c)| *c == TWO).flat_map(|(b, _)| b.clone()).collect();
-        contract::check_decode_with_alloc_limit(|| Frames, &bytes, 2 * MAX_MESSAGE_LEN);
-        let (frames, error) = decode_all(|| Frames, &bytes);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_MESSAGE_LEN);
+        let (frames, error) = decode_all(Frames::<Frame>::new, &bytes);
         assert_eq!(error, None);
         assert_eq!(frames.iter().map(|f| f.kind).collect::<Vec<_>>(), [1, 2, 4, 5, 3, 2]);
-        let mut stream = Stream::new(Frames);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&[0xff, 0xff, 0]), 3);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::ConnectionNotSynchronized))));
         assert_eq!(stream.push(&bytes), bytes.len());
@@ -2724,7 +2731,7 @@ mod tests {
         let one = Message::Keepalive.to_frame(&TWO).unwrap().to_bytes().unwrap();
         let bytes = one.repeat(200_000);
         let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         let mut count = 0;
         pump(&mut stream, &bytes, |_| count += 1).unwrap();
         finish(&mut stream, |_| count += 1).unwrap();
@@ -2809,9 +2816,9 @@ mod tests {
                     }
                 }
             }
-            contract::check_decode_with_alloc_limit(|| Frames, &b, 2 * MAX_MESSAGE_LEN);
+            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_MESSAGE_LEN);
             contract::check_wire::<Frame>(&b);
-            for frame in decode_all(|| Frames, &b).0 {
+            for frame in decode_all(Frames::<Frame>::new, &b).0 {
                 check_frame(&frame);
             }
             // The body alone, as each message type.
@@ -3023,17 +3030,17 @@ mod tests {
 
     #[test]
     fn stream_holds_at_most_one_message() {
-        let mut stream = Stream::new(Frames);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&vec![0xff; 1 << 20]), MAX_MESSAGE_LEN);
         assert_eq!(stream.buffered(), MAX_MESSAGE_LEN);
         assert_eq!(stream.push(&[0xff]), 0);
         let note = Message::Notification(Notification { code: 6, subcode: 0, data: vec![0; MAX_BODY_LEN - 2] });
         let frame = note.to_frame(&TWO).unwrap();
         let bytes = frame.to_bytes().unwrap();
-        let mut stream = Stream::new(Frames);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Ok(frame.clone())));
-        let (frames, error) = decode_all(|| Frames, &bytes.repeat(50));
+        let (frames, error) = decode_all(Frames::<Frame>::new, &bytes.repeat(50));
         assert_eq!(error, None);
         assert_eq!(frames, vec![frame; 50]);
     }

@@ -1,6 +1,8 @@
 //! TDS packet, message, login, batch, and token contracts.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
+
 use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
 use fictionet::stdlib::tds::*;
 use libfuzzer_sys::fuzz_target;
@@ -33,8 +35,8 @@ fn value_for(ty: u8, b: &[u8]) -> Value {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Packets::new, data, 2 * MAX_PACKET);
-    contract::check_decode_with_alloc_limit(|| Packets::with_limit(64), data, 128);
+    contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_PACKET);
+    contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), data, 128);
     contract::check_decode_with_alloc_limit(|| Messages::with_limit(LIMIT), data, 2 * MAX_PACKET);
     contract::check_wire::<Packet>(data);
     contract::check_wire::<Message>(data);

@@ -2,6 +2,7 @@
 //! playing a server reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::codec::{Wire, test_support::decode_all};
 use fictionet::stdlib::opcua::{
@@ -9,7 +10,7 @@ use fictionet::stdlib::opcua::{
     ExtensionObject, Limits, LocalizedText, Message, MessageType, NodeId, QualifiedName, Reader,
     ResponseHeader, Service, Variant,
 };
-use fictionet::stdlib::opcua::{Chunks, Messages};
+use fictionet::stdlib::opcua::Messages;
 use libfuzzer_sys::fuzz_target;
 
 /// Checks permissive reads, including reserved Variant types that cannot be written.
@@ -48,7 +49,7 @@ fuzz_target!(|data: &[u8]| {
         },
     };
 
-    check_decode(|| Chunks::with_limits(limits), data);
+    check_decode(|| Frames::<Chunk>::with_limit(limits), data);
     check_wire::<Chunk>(data);
     let chunk = Chunk {
         message_type: match pick % 4 {

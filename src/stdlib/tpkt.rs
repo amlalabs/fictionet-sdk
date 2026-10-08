@@ -10,7 +10,7 @@
 //! ISO transport over TCP on IPv6 and for transport classes other than 0.
 //!
 //! Nothing here reads a socket. A world pushes bytes from a
-//! TCP connection into a [`Stream<Packets>`](fictionet::stdlib::codec::Stream), takes each
+//! TCP connection into a [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), takes each
 //! [`Packet`] out, and reads its payload. Most payloads are COTP TPDUs;
 //! [`fictionet::stdlib::cotp::over_tpkt`] provides conversions and a message writer.
 //! A world may set a size limit lower than the 65535 bytes the header allows, as
@@ -22,10 +22,11 @@
 //! rather than write a packet a reader would refuse.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::tpkt::{Packet, Packets};
+//! use fictionet::stdlib::tpkt::Packet;
 //!
-//! let mut decoder = Stream::new(Packets::new());
+//! let mut decoder = Stream::new(Frames::<Packet>::new());
 //! // A COTP data TPDU marked as the last of its message, carrying "hi".
 //! let bytes = [3, 0, 0, 9, 2, 0xf0, 0x80, b'h', b'i'];
 //! assert_eq!(decoder.push(&bytes), bytes.len());
@@ -39,7 +40,12 @@
 //! assert_eq!(Packet::parse_prefix(&[3, 0, 0, 7, 1, 2, 3]), Ok(Some((packet, 7))));
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Decode;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Wire};
 
 /// The TCP port ISO transport servers listen on.
 pub const PORT: u16 = 102;
@@ -73,7 +79,7 @@ pub struct Packet {
 }
 
 /// Why bytes are not a TPKT stream or packet, or why a writer refused a
-/// value. After an error from [`Packets`] the connection holds no more
+/// value. After an error from [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames) the connection holds no more
 /// packets a reader can find, and a real server closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -288,60 +294,34 @@ impl Wire for Packet {
 /// Splits a TPKT byte stream into packets.
 ///
 /// Use with [`fictionet::stdlib::codec::Stream`] for bounded input buffering. A partial
-/// packet returns [`Step::Need`], including at EOF. The stream reports
+/// packet returns [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and reports framing errors once. No input is retained.
-#[derive(Clone, Copy, Debug)]
-pub struct Packets {
-    limit: usize,
-}
-
-impl Default for Packets {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Packets {
-    /// Reads packets up to [`MAX_PACKET`] bytes, including their headers.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_PACKET)
-    }
-
-    /// Reads packets up to `limit` bytes, including their headers.
-    /// Clamps the limit to [`MIN_PACKET`] through [`MAX_PACKET`].
-    /// A larger declared packet is refused as soon as its header arrives.
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: clamp_limit(limit),
-        }
-    }
-
-    /// The maximum packet size, including its header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Decode for Packets {
+impl Prefixed for Packet {
     type Item = Packet;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "TPKT";
 
-    fn capacity(&self) -> usize {
-        self.limit
-    }
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_PACKET }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { clamp_limit(limit) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize { *limit }
 
     /// Reads one packet. Returns [`Error::Version`] for a version other
     /// than 3, [`Error::Length`] below [`MIN_PACKET`], or
     /// [`Error::OverLimit`] above the configured limit. Partial input
-    /// returns [`Step::Need`], including at EOF.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
-        Ok(match Packet::parse_limited(input, self.limit)? {
-            Some((packet, used)) => Step::Item(packet, used),
-            None => Step::Need,
-        })
+    /// returns [`fictionet::stdlib::codec::Step::Need`], including at EOF.
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        Packet::parse_limited(input, limit)
     }
 }
+
 
 #[cfg(test)]
 mod codec_tests {
@@ -396,7 +376,7 @@ mod codec_tests {
     #[test]
     fn frame_limits_eof_and_error_once() {
         for limit in [0, MIN_PACKET, 128, MAX_PACKET, usize::MAX] {
-            let frames = Packets::with_limit(limit);
+            let frames = Frames::<Packet>::with_limit(limit);
             assert_eq!(frames.capacity(), limit.clamp(MIN_PACKET, MAX_PACKET));
             assert_eq!(frames.held(), 0);
             for input in [
@@ -409,7 +389,7 @@ mod codec_tests {
                 contract::check_decode_with_held_limit(|| frames, input, 0);
             }
         }
-        let mut stream = Stream::new(Packets::with_limit(8));
+        let mut stream = Stream::new(Frames::<Packet>::with_limit(8));
         assert_eq!(stream.push(&[3, 0, 0, 9]), 4);
         let error = Fail::Protocol(Error::OverLimit {
             length: 9,
@@ -421,7 +401,7 @@ mod codec_tests {
         assert_eq!(stream.push(&[1, 2]), 2);
         assert_eq!(stream.buffered(), 4);
 
-        let mut stream = Stream::new(Packets::new());
+        let mut stream = Stream::new(Frames::<Packet>::new());
         assert_eq!(stream.push(&[3, 0, 0, 7, 2]), 5);
         assert_eq!(stream.next(), None);
         stream.end();
@@ -433,7 +413,7 @@ mod codec_tests {
     fn maximum_packet_in_byte_chunks() {
         let packet = Packet::new(vec![0x5a; MAX_PAYLOAD]);
         let bytes = packet.to_bytes().unwrap();
-        let mut stream = Stream::new(Packets::new());
+        let mut stream = Stream::new(Frames::<Packet>::new());
         for (i, byte) in fictionet::stdlib::codec::test_support::chunks(&bytes, &[1]).enumerate() {
             assert_eq!(stream.push(byte), 1);
             assert!(stream.buffered() <= MAX_PACKET);
@@ -608,14 +588,14 @@ mod tests {
         for p in &packets {
             stream.extend_from_slice(&p.to_bytes().unwrap());
         }
-        contract::check_decode_with_alloc_limit(Packets::new, &stream, 2 * MAX_PACKET);
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &stream, 2 * MAX_PACKET);
         assert_eq!(
-            test_support::decode_all(Packets::new, &stream),
+            test_support::decode_all(Frames::<Packet>::new, &stream),
             (packets.clone(), None)
         );
         // An error after good packets, and the decoder stays broken.
         stream.extend_from_slice(&[4, 0, 0, 7]);
-        let mut d = Stream::new(Packets::new());
+        let mut d = Stream::new(Frames::<Packet>::new());
         assert_eq!(d.push(&stream), stream.len());
         for p in &packets {
             assert_eq!(d.next(), Some(Ok(p.clone())));
@@ -624,12 +604,12 @@ mod tests {
         assert_eq!(d.next(), None);
         assert_eq!(d.push(&[1, 2, 3]), 3);
         assert_eq!(d.failed(), Some(&Fail::Protocol(Error::Version(4))));
-        assert_eq!(Packets::default().limit(), MAX_PACKET);
+        assert_eq!(Frames::<Packet>::default().limit(), MAX_PACKET);
     }
 
     #[test]
     fn stream_limit() {
-        let mut d = Stream::new(Packets::with_limit(100));
+        let mut d = Stream::new(Frames::<Packet>::with_limit(100));
         assert_eq!(d.decoder().limit(), 100);
         let ok = Packet::new(vec![1; 96]).to_bytes().unwrap();
         assert_eq!(d.push(&ok), 100);
@@ -644,11 +624,11 @@ mod tests {
             })))
         );
         // A decoder only takes what its limit holds.
-        let mut d = Stream::new(Packets::with_limit(10));
+        let mut d = Stream::new(Frames::<Packet>::with_limit(10));
         assert_eq!(d.push(&[3, 0, 0, 10, 0, 0, 0, 0, 0, 0, 3, 0]), 10);
         assert!(d.next().unwrap().is_ok());
-        assert_eq!(Packets::with_limit(0).limit(), MIN_PACKET);
-        assert_eq!(Packets::with_limit(usize::MAX).limit(), MAX_PACKET);
+        assert_eq!(Frames::<Packet>::with_limit(0).limit(), MIN_PACKET);
+        assert_eq!(Frames::<Packet>::with_limit(usize::MAX).limit(), MAX_PACKET);
     }
 
     #[test]
@@ -672,11 +652,11 @@ mod tests {
             }
             let limit = [MAX_PACKET, 7, 20, 64, 1000][rng.index(5)];
             contract::check_decode_with_alloc_limit(
-                || Packets::with_limit(limit),
+                || Frames::<Packet>::with_limit(limit),
                 &data,
                 2 * clamp_limit(limit),
             );
-            let whole = test_support::decode_all(|| Packets::with_limit(limit), &data);
+            let whole = test_support::decode_all(|| Frames::<Packet>::with_limit(limit), &data);
             for p in &whole.0 {
                 assert!(p.payload.len() + HEADER_LEN <= limit);
                 let bytes = p.to_bytes().unwrap();
@@ -698,8 +678,8 @@ mod tests {
             let raw = rng.bytes(19);
             let _ = Packet::parse_prefix(&raw);
             let _ = Packet::parse_limited(&raw, rng.index(usize::MAX));
-            contract::check_decode_with_alloc_limit(Packets::new, &raw, 2 * MAX_PACKET);
-            let _ = test_support::decode_all(Packets::new, &raw);
+            contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &raw, 2 * MAX_PACKET);
+            let _ = test_support::decode_all(Frames::<Packet>::new, &raw);
         }
     }
 }

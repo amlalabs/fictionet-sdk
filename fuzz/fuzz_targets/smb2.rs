@@ -3,11 +3,12 @@
 //! world writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::smb2::{
-    ChainedPayload, Compressed, Error, ErrorResponse, Frame, Header, Frames, HEADER_LEN, IoctlResponse, Message,
-    MAX_FRAME, MAX_MESSAGE, NegotiateContext, NegotiateResponse, Packet, ReadRequest, Request, Response, Transform,
-    TreeConnectRequest, WriteRequest, command, status,
+    ChainedPayload, Compressed, Error, ErrorResponse, Frame, Header, HEADER_LEN, IoctlResponse, Message,
+    MAX_FRAME, MAX_MESSAGE, NegotiateContext, NegotiateResponse, Packet, ReadRequest, Request, Response,
+    Transform, TreeConnectRequest, WriteRequest, command, status,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -205,9 +206,9 @@ fn constructed(data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_FRAME);
+    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * MAX_FRAME);
     contract::check_wire::<Frame>(data);
-    contract::check_decode_with_alloc_limit(|| Frames::new().map(|f| Packet::parse(&f.payload)), data, 2 * MAX_FRAME);
+    contract::check_decode_with_alloc_limit(|| Frames::<Frame>::new().map(|f| Packet::parse(&f.payload)), data, 2 * MAX_FRAME);
     contract::check_wire_value(&Frame {
         payload: data.to_vec(),
     });
@@ -217,7 +218,7 @@ fuzz_target!(|data: &[u8]| {
         });
     }
 
-    for frame in decode_all(Frames::new, data).0 {
+    for frame in decode_all(Frames::<Frame>::new, data).0 {
         contract::check_wire_value(&frame);
         payload(&frame.payload, 0);
     }

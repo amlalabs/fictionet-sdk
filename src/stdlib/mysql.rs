@@ -14,7 +14,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a database server
 //! sends a [`Handshake`] inside a [`Message`]. It reads packets with
-//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream), or uses [`Messages`] in that
+//! [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), or uses [`Messages`] in that
 //! driver to join split packets and check their sequence IDs. It reads
 //! each payload as a [`HandshakeResponse`] or [`Command`], then builds
 //! reply messages from [`OkPacket`], [`ErrPacket`], or [`ResultSet`].
@@ -71,6 +71,9 @@
 //! assert!(reader.is_done());
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated};
 
 /// The TCP port MySQL servers listen on.
@@ -82,7 +85,7 @@ pub const HEADER_LEN: usize = 4;
 /// of it ends with an empty packet.
 pub const MAX_PACKET_PAYLOAD: usize = 0xff_ffff;
 /// The longest wire packet, including its four-byte header.
-/// This is the default input capacity of [`Packets`].
+/// This is the default input capacity of [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames).
 pub const MAX_FRAME: usize = HEADER_LEN + MAX_PACKET_PAYLOAD;
 /// The longest message a [`Messages`] puts together, and the longest
 /// [`Message`] writes: 1 GiB, the largest `max_allowed_packet`
@@ -451,55 +454,35 @@ impl Wire for Packet {
 /// Reads individual MySQL packets without holding input bytes.
 ///
 /// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
-/// by [`HEADER_LEN`] plus [`limit`](Self::limit). Oversized payloads are
+/// by [`HEADER_LEN`] plus [`limit`](fictionet::stdlib::codec::Frames::limit). Oversized payloads are
 /// refused from the header. Partial packets return [`Step::Need`], including
 /// at EOF, so the stream reports truncation. Sequence IDs are preserved;
 /// message assembly and sequence checks remain in [`Messages`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Packets {
-    limit: usize,
-}
-
-impl Packets {
-    /// Reads packets with up to [`MAX_PACKET_PAYLOAD`] payload bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_PACKET_PAYLOAD)
-    }
-
-    /// Sets the payload limit, excluding the header. Clamps it to
-    /// [`MAX_PACKET_PAYLOAD`]. Zero permits empty packets.
-    pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.min(MAX_PACKET_PAYLOAD) }
-    }
-
-    /// The maximum payload size, excluding its header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Packets {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Packets {
+impl Prefixed for Packet {
     type Item = Packet;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "MySQL";
 
-    fn capacity(&self) -> usize {
-        HEADER_LEN.saturating_add(self.limit)
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_PACKET_PAYLOAD }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_PACKET_PAYLOAD) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        HEADER_LEN.saturating_add(limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
-        Ok(match Packet::parse_prefix(input, self.limit)? {
-            Some((packet, used)) => Step::Item(packet, used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        Packet::parse_prefix(input, limit)
     }
 }
+
 
 /// Why bytes are not the packet or message a reader expected, why a
 /// stream of packets cannot be read any further, or why a value cannot be
@@ -521,7 +504,7 @@ pub enum Error {
     },
     /// A message or packet payload exceeds its size limit. For
     /// [`Messages`], this is the assembled payload length, including
-    /// the packet that broke the limit. For [`Packets`], it is one
+    /// the packet that broke the limit. For [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames), it is one
     /// packet's payload length. Both exclude headers.
     TooLong(usize),
     /// The first byte is not the one this kind of packet starts with: a
@@ -2996,7 +2979,7 @@ mod tests {
             }
             let limit = 8 + rng.index(64);
             contract::check_decode_with_alloc_limit(|| Messages::with_limit(limit), &bytes, 2 * (limit + HEADER_LEN));
-            contract::check_decode_with_alloc_limit(|| Packets::with_limit(limit), &bytes, 2 * (limit + HEADER_LEN));
+            contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(limit), &bytes, 2 * (limit + HEADER_LEN));
             contract::check_wire::<Message>(&bytes);
             for message in decode_all(|| Messages::with_limit(limit), &bytes).0 {
                 check_payload(&message.payload);

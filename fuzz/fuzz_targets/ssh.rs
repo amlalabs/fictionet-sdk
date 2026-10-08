@@ -1,15 +1,17 @@
 //! SSH version exchange, cleartext packets, messages, and primitive fields.
 #![no_main]
+
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{contract, test_support::decode_all};
 use fictionet::stdlib::ssh::*;
 use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Packets::new, data, 2 * MAX_PACKET);
+    contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_PACKET);
     contract::check_decode_with_alloc_limit(Events::new, data, 2 * MAX_PACKET);
     contract::check_decode_with_alloc_limit(Events::after_version, data, 2 * MAX_PACKET);
     contract::check_decode_with_alloc_limit(Lines::new, data, 2 * MAX_BANNER_LINE);
     contract::check_decode_with_alloc_limit(
-        || Packets::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+        || Frames::<Packet>::with_limit(usize::from(data.first().copied().unwrap_or(0))),
         data,
         510,
     );

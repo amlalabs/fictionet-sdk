@@ -12,7 +12,7 @@
 //! definitions in Kafka's source.
 //!
 //! Nothing here reads a socket. A world that plays a broker passes TCP
-//! bytes to [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets each frame's
+//! bytes to [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream), gets each frame's
 //! payload back, reads it
 //! with [`Request::parse`], and writes the reply from
 //! [`Response::to_frame`] back to the connection. Which topics exist,
@@ -31,20 +31,21 @@
 //! and by the bytes that are there. A parsed body can take a few dozen
 //! times its size in memory, since each field of a few bytes becomes a
 //! struct. A world that wants less sets a lower frame limit with
-//! [`Frames::with_limit`].
+//! [`codec::Frames<Frame>::with_limit`](fictionet::stdlib::codec::Frames::with_limit).
 //!
 //! Writers refuse with [`Error::Unwritable`] any value that cannot be
 //! preserved in its version, including excess lengths, invalid tags, and
 //! non-default fields that version lacks.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
 //! use fictionet::stdlib::kafka::{
-//!     api_key, ApiVersion, ApiVersionsResponse, Frames, Request, RequestBody, Response, ResponseBody,
+//!     api_key, ApiVersion, ApiVersionsResponse, Request, RequestBody, Response, ResponseBody,
 //!     ResponseHeader,
 //! };
 //!
-//! let mut stream = Stream::new(Frames::new());
+//! let mut stream = Stream::new(Frames::<fictionet::stdlib::kafka::Frame>::new());
 //! let mut frames = Vec::new();
 //! // ApiVersions version 0, correlation ID 1, client ID "x".
 //! let bytes = [0, 0, 0, 11, 0, 18, 0, 0, 0, 0, 0, 1, 0, 1, b'x'];
@@ -66,10 +67,13 @@
 //! assert_eq!(Response::parse(&bytes[4..], api_key::API_VERSIONS, 0).unwrap(), response);
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 extern crate alloc;
 
 use fictionet::stdlib::codec::leb128;
-use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated, Trailing};
+use fictionet::stdlib::codec::{Wire, Reader, Truncated, Trailing};
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 
 /// The TCP port Kafka brokers listen on.
@@ -801,16 +805,17 @@ impl Wire for Frame {
 /// Reads Kafka frames without holding input bytes.
 ///
 /// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`SIZE_LEN`] plus
-/// [`Self::limit`]. Partial frames return [`Step::Need`], including at EOF.
+/// [`Frames::limit`](fictionet::stdlib::codec::Frames::limit). Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once. Map frames
 /// through [`Request::parse`] to receive body errors as items.
 ///
 /// ```
+/// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
-/// use fictionet::stdlib::kafka::{Frames, Request};
+/// use fictionet::stdlib::kafka::Request;
 ///
 /// let bytes = [0, 0, 0, 11, 0, 18, 0, 0, 0, 0, 0, 1, 0, 1, b'x'];
-/// let mut stream = Stream::new(Frames::new().map(|frame| Request::parse(&frame.0)));
+/// let mut stream = Stream::new(Frames::<fictionet::stdlib::kafka::Frame>::new().map(|frame| Request::parse(&frame.0)));
 /// let mut requests = Vec::new();
 /// pump(&mut stream, &bytes[..2], |request| requests.push(request))?;
 /// pump(&mut stream, &bytes[2..], |request| requests.push(request))?;
@@ -819,51 +824,31 @@ impl Wire for Frame {
 /// assert_eq!(requests[0].as_ref().unwrap().header.client_id.as_deref(), Some("x"));
 /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::kafka::Error>>(())
 /// ```
-#[derive(Clone, Copy, Debug)]
-pub struct Frames {
-    limit: usize,
-}
-
-impl Frames {
-    /// Accepts frames with up to [`MAX_FRAME`] payload bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_FRAME)
-    }
-
-    /// Sets the payload limit, clamped to [`MAX_FRAME`]. Zero accepts empty
-    /// payloads. An oversized frame is refused from its four-byte header.
-    pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.min(MAX_FRAME) }
-    }
-
-    /// The maximum payload length, excluding the size prefix.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Frames {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Frames {
+impl Prefixed for Frame {
     type Item = Frame;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "Kafka";
 
-    fn capacity(&self) -> usize {
-        SIZE_LEN.saturating_add(self.limit)
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_FRAME }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_FRAME) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        SIZE_LEN.saturating_add(limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        Ok(match parse_frame(input, self.limit)? {
-            Some((payload, used)) => Step::Item(Frame(payload.to_vec()), used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        Ok(parse_frame(input, limit)?.map(|(payload, used)| (Frame(payload.to_vec()), used)))
     }
 }
+
 
 /// A request header. Version 0 has the first three fields, version 1 adds
 /// the client ID, and version 2 adds tagged fields. The version follows
@@ -1818,6 +1803,7 @@ impl From<Trailing> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, contract, finish, pump,
@@ -2463,12 +2449,12 @@ mod tests {
         assert_eq!(bytes, [0, 0, 0, 3, 1, 2, 3]);
         assert_eq!(Frame::parse(&bytes), Ok(value));
         for n in 0..bytes.len() {
-            assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need), "{n}");
+            assert_eq!(Frames::<Frame>::new().decode(&bytes[..n], false), Ok(Step::Need), "{n}");
             assert_eq!(Frame::parse(&bytes[..n]), Err(Error::Truncated));
         }
         assert_eq!(Frame::parse(&[0; 4]), Ok(Frame(vec![])));
         assert_eq!(Frame::parse(&[0xff; 4]), Err(Error::FrameSize(-1)));
-        assert_eq!(Frames::with_limit(3).decode(&[0, 0, 0, 4], false), Err(Error::FrameSize(4)));
+        assert_eq!(Frames::<Frame>::with_limit(3).decode(&[0, 0, 0, 4], false), Err(Error::FrameSize(4)));
         assert_eq!(Frame::parse(&[0x7f, 0xff, 0xff, 0xff]), Err(Error::FrameSize(i32::MAX)));
         assert_eq!(Frame(vec![0; MAX_FRAME + 1]).to_bytes(), Err(Error::Unwritable));
     }
@@ -2479,21 +2465,21 @@ mod tests {
         let b = Frame(vec![0, 18, 0, 0, 0, 0, 0, 2, 0xff, 0xff]);
         let mut bytes = a.to_bytes().unwrap();
         b.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * Frames::new().capacity());
-        assert_eq!(decode_all(Frames::new, &bytes), (vec![a, b], None));
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * Frames::<Frame>::new().capacity());
+        assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (vec![a, b], None));
         for (limit, header, error) in [
             (MAX_FRAME, [0x80, 0, 0, 0], Error::FrameSize(i32::MIN)),
             (4, [0, 0, 0, 5], Error::FrameSize(5)),
             (usize::MAX, [0x7f, 0xff, 0xff, 0xff], Error::FrameSize(i32::MAX)),
         ] {
-            let mut stream = Stream::new(Frames::with_limit(limit));
+            let mut stream = Stream::new(Frames::<Frame>::with_limit(limit));
             assert_eq!(stream.push(&header), 4);
             assert_eq!(stream.next(), Some(Err(Fail::Protocol(error))));
             assert_eq!(stream.push(&bytes), bytes.len());
             assert!(stream.next().is_none());
         }
         // A cloned stateless decoder can read the same pending frame.
-        let mut decoder = Frames::new();
+        let mut decoder = Frames::<Frame>::new();
         assert_eq!(decoder.decode(&bytes[..3], false), Ok(Step::Need));
         let mut copy = decoder;
         assert_eq!(decoder.decode(&bytes, false), copy.decode(&bytes, false));
@@ -2503,7 +2489,7 @@ mod tests {
     fn stream_reads_many_small_frames_in_linear_time() {
         let one = Frame(vec![0, 18, 0, 0, 0, 0, 0, 1, 0xff, 0xff]).to_bytes().unwrap();
         let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Frames::<Frame>::new());
         let mut count = 0;
         pump(&mut stream, &one.repeat(200_000), |_| count += 1).unwrap();
         finish(&mut stream, |_| count += 1).unwrap();
@@ -2541,7 +2527,7 @@ mod tests {
 
     /// Exercises framing, exact requests, and contextual responses.
     fn check(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * Frames::<Frame>::new().capacity());
         contract::check_wire::<Frame>(data);
         contract::check_wire::<Request>(data);
         contract::check_wire::<RequestHeader>(data);
@@ -2549,7 +2535,7 @@ mod tests {
             let bytes = encoded(|w| w.tagged_fields(&fields));
             assert_eq!(Reader::new(&bytes).tagged_fields(), Ok(fields));
         }
-        let frames = decode_all(Frames::new, data).0;
+        let frames = decode_all(Frames::<Frame>::new, data).0;
         let mut payloads: Vec<&[u8]> = frames.iter().map(|frame| frame.0.as_slice()).collect();
         payloads.push(data);
         for p in payloads {
@@ -2855,7 +2841,7 @@ mod tests {
             let bytes = req.to_bytes().unwrap();
             assert_eq!(Request::parse(&bytes), Ok(req.clone()));
             let frame = req.to_frame().unwrap();
-            assert_eq!(decode_all(Frames::new, &frame.to_bytes().unwrap()), (vec![Frame(bytes)], None));
+            assert_eq!(decode_all(Frames::<Frame>::new, &frame.to_bytes().unwrap()), (vec![Frame(bytes)], None));
 
             let mut rbody = if !has_body(key, version) {
                 ResponseBody::Other(rng.bytes(4))
@@ -2906,19 +2892,19 @@ mod tests {
 
     #[test]
     fn stream_refuses_bad_sizes_with_bounded_input() {
-        let mut stream = Stream::new(Frames::with_limit(16));
+        let mut stream = Stream::new(Frames::<Frame>::with_limit(16));
         let mut junk = vec![0, 0, 0, 17];
         junk.resize(100_000, 0xaa);
         assert_eq!(stream.push(&junk), 20);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::FrameSize(17)))));
         assert_eq!(stream.buffered(), 20);
         assert!(stream.next().is_none());
-        let mut stream = Stream::new(Frames::with_limit(16));
+        let mut stream = Stream::new(Frames::<Frame>::with_limit(16));
         assert_eq!(stream.push(&[0, 0, 0, 1, 7, 0xff]), 6);
         assert_eq!(stream.next(), Some(Ok(Frame(vec![7]))));
         assert_eq!(stream.push(&[0xff, 0xff, 0xff, 1, 2, 3]), 6);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::FrameSize(-1)))));
-        let mut stream = Stream::new(Frames::with_limit(16));
+        let mut stream = Stream::new(Frames::<Frame>::with_limit(16));
         assert_eq!(stream.push(&[0, 0]), 2);
         assert!(stream.next().is_none());
         assert_eq!(stream.buffered(), 2);

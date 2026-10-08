@@ -1,6 +1,8 @@
 //! MySQL packet, payload, and result-set contracts.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
+
 use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
 use fictionet::stdlib::mysql::*;
 use libfuzzer_sys::fuzz_target;
@@ -114,8 +116,8 @@ fn values(bytes: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Packets::new, data, 2 * MAX_FRAME);
-    contract::check_decode_with_alloc_limit(|| Packets::with_limit(64), data, 2 * (64 + HEADER_LEN));
+    contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_FRAME);
+    contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), data, 2 * (64 + HEADER_LEN));
     contract::check_wire::<Packet>(data);
     contract::check_wire::<Message>(data);
     let frame = Packet { seq: data.first().copied().unwrap_or(0), payload: data.to_vec() };

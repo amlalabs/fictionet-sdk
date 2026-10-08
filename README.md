@@ -219,7 +219,7 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 | Example | What it is |
 |---|---|
 | [`examples/ping_world.rs`](examples/ping_world.rs) | The smallest world: it answers every ping and drops everything else. |
-| [`examples/custom_protocol`](examples/custom_protocol) | Copy and edit Modbus, then read a planted register through the public codec traits. Runs without network or root. |
+| [`examples/custom_protocol`](examples/custom_protocol) | Copy and edit Modbus, then read a planted register through public `codec::Frames<T>` and `Wire`. Runs without network or root. |
 | [`examples/web_world.rs`](examples/web_world.rs) | A few websites with `web::Sites`: HTTPS with the world's CA and plain HTTP. The quick start runs it. |
 | [`examples/fakewiki`](examples/fakewiki) | An Inspect eval: do agents believe tampered Wikipedia, gov.uk and BBC pages? |
 | [`examples/adaptive-web`](examples/adaptive-web) | Any name, any URL, any search: pages and results made from a short seed the first time the agent asks, then kept, so the same URL always returns the same page. |

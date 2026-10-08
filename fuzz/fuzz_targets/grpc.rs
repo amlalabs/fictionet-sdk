@@ -2,10 +2,11 @@
 //! a world playing a gRPC server reads them, and the writers that answer.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::grpc::{
-    Code, ContentType, Error, HEADER_LEN, MAX_MESSAGE, Message, Messages, MethodPath,
-    Rejection, Request, Status, Timeout, decode_message, encode_message,
+    Code, ContentType, Error, HEADER_LEN, MAX_MESSAGE, Message, MethodPath, Rejection, Request, Status,
+    Timeout, decode_message, encode_message,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -63,8 +64,8 @@ fn check_request(headers: &[(&[u8], &[u8])]) {
 }
 
 fn check_limit_agreement(data: &[u8], limit: usize) {
-    let (full, failure) = decode_all(|| Messages::with_limit(MAX_MESSAGE), data);
-    let (limited, limited_failure) = decode_all(|| Messages::with_limit(limit), data);
+    let (full, failure) = decode_all(|| Frames::<Message>::with_limit(MAX_MESSAGE), data);
+    let (limited, limited_failure) = decode_all(|| Frames::<Message>::with_limit(limit), data);
     let accepted = full
         .iter()
         .take_while(|message| message.data.len() <= limit)
@@ -94,11 +95,11 @@ fn check_limit_agreement(data: &[u8], limit: usize) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(|| Messages::with_limit(MAX_MESSAGE), data);
+    contract::check_decode(|| Frames::<Message>::with_limit(MAX_MESSAGE), data);
     contract::check_wire::<Message>(data);
 
     if let Some(&limit) = data.first() {
-        contract::check_decode(|| Messages::with_limit(usize::from(limit)), data);
+        contract::check_decode(|| Frames::<Message>::with_limit(usize::from(limit)), data);
         check_limit_agreement(data, usize::from(limit));
     }
     // A message built from the input, not read from it, writes and reads
@@ -110,7 +111,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire_value(&built);
     let bytes = built.to_bytes().unwrap();
     contract::check_wire::<Message>(&bytes);
-    contract::check_decode(|| Messages::with_limit(MAX_MESSAGE), &bytes);
+    contract::check_decode(|| Frames::<Message>::with_limit(MAX_MESSAGE), &bytes);
     check_limit_agreement(&bytes, data.first().copied().map_or(0, usize::from));
     assert_eq!(<Message as Wire>::parse(&bytes), Ok(built));
 

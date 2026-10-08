@@ -1,16 +1,17 @@
 //! DNP3 framing, CRCs, transport and application fragments.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::codec::{Wire, test_support::decode_all};
-use fictionet::stdlib::dnp3::Frames;
+
 use fictionet::stdlib::dnp3::{Fragment, Frame, MAX_FRAGMENT, Reassembler, Segment};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    check_decode(Frames::new, data);
+    check_decode(Frames::<Frame>::new, data);
     check_wire::<Frame>(data);
-    let (frames, _) = decode_all(Frames::new, data);
+    let (frames, _) = decode_all(Frames::<Frame>::new, data);
     for frame in &frames {
         check_wire_value(frame);
         if let Ok(segment) = frame.segment() {
@@ -27,8 +28,8 @@ fuzz_target!(|data: &[u8]| {
         };
         check_wire_value(&frame);
         let bytes = frame.to_bytes().unwrap();
-        check_decode(Frames::new, &bytes);
-        let (back, failure) = decode_all(Frames::new, &bytes);
+        check_decode(Frames::<Frame>::new, &bytes);
+        let (back, failure) = decode_all(Frames::<Frame>::new, &bytes);
         assert!(failure.is_none());
         assert_eq!(back, [frame]);
     }

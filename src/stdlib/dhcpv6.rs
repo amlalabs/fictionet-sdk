@@ -24,7 +24,7 @@
 //! [`Message::answer`], adds the addresses and prefixes it hands out, and
 //! sends [`Message::to_bytes`] back. Which addresses exist and who gets them
 //! is up to world code. For DHCPv6 over TCP, as leasequery uses, a
-//! [`Stream<Messages>`](fictionet::stdlib::codec::Stream) splits the stream into messages.
+//! [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream) splits the stream into messages.
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. Options nest at most [`MAX_DEPTH`] deep; deeper ones are
@@ -69,7 +69,7 @@
 //! assert_eq!(lease.valid, 7200);
 //! ```
 
-use fictionet::stdlib::codec::be32;
+use fictionet::stdlib::codec::{Prefixed, Frames, be32};
 use core::convert::Infallible;
 use std::net::Ipv6Addr;
 
@@ -90,10 +90,10 @@ pub const ALL_DHCP_SERVERS: Ipv6Addr = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 1, 3
 /// it.
 pub const MAX_MESSAGE: usize = 65_527;
 /// The longest message over TCP, where a 2-byte length comes before each
-/// message (RFC 5460, section 5.1). [`Stream<Messages>`](fictionet::stdlib::codec::Stream) reads messages this long,
+/// message (RFC 5460, section 5.1). [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream) reads messages this long,
 /// and [`Frame`] writes them.
 pub const MAX_TCP_MESSAGE: usize = 65_535;
-/// The most bytes a [`Stream<Messages>`](fictionet::stdlib::codec::Stream) holds that have not been taken out: one
+/// The most bytes a [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream) holds that have not been taken out: one
 /// whole message over TCP and its length.
 pub const MAX_BUFFERED: usize = 2 + MAX_TCP_MESSAGE;
 /// The length of a client or server message's header: the type and the
@@ -867,7 +867,7 @@ impl Wire for Frame {
     /// Reads exactly one length-prefixed TCP message.
     /// Refuses malformed messages, short prefixes or bodies, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let step = match Messages.decode(bytes, true) {
+        let step = match Frames::<Message>::new().decode(bytes, true) {
             Ok(step) => step,
             Err(never) => match never {},
         };
@@ -891,51 +891,50 @@ impl Wire for Frame {
 
 /// Reads DHCPv6 TCP messages without retaining input bytes.
 ///
-/// Use with [`Stream<Messages>`](fictionet::stdlib::codec::Stream) for at most [`MAX_BUFFERED`] unread bytes. Each
+/// Use with [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream) for at most [`MAX_BUFFERED`] unread bytes. Each
 /// two-byte length delimits one item. Malformed messages are error items,
 /// so the next message can still be read. Framing has no protocol errors.
 /// Partial prefixes and bodies return [`Step::Need`], including at EOF;
 /// the driver reports [`Fail::Truncated`](fictionet::stdlib::codec::Fail::Truncated). UDP uses [`Wire`] on [`Message`].
 ///
 /// ```
-/// use fictionet::stdlib::{dhcpv6::{Frame, Messages, Message, msg}, codec::{Stream, Wire}};
+/// use fictionet::stdlib::codec::Frames;
+/// use fictionet::stdlib::dhcpv6::{Frame, Message, msg};
+/// use fictionet::stdlib::codec::{Stream, Wire};
 ///
 /// let message = Message::new(msg::SOLICIT, 7);
 /// let bytes = Wire::to_bytes(&Frame(message.clone()))?;
-/// let mut stream = Stream::new(Messages::new());
+/// let mut stream = Stream::new(Frames::<Message>::new());
 /// assert_eq!(stream.push(&bytes), bytes.len());
 /// assert_eq!(stream.next(), Some(Ok(Ok(message))));
 /// stream.end();
 /// assert_eq!(stream.next(), None);
 /// # Ok::<(), fictionet::stdlib::dhcpv6::Error>(())
 /// ```
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Messages;
-
-impl Messages {
-    /// Creates a TCP message decoder with no retained state.
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Decode for Messages {
+impl Prefixed for Message {
     type Item = Result<Message, Error>;
     type Error = Infallible;
+    type Limit = ();
     const NAME: &'static str = "DHCPv6 over TCP";
 
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         MAX_BUFFERED
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Infallible> {
-        let Some(&[a, b]) = input.get(..2) else { return Ok(Step::Need) };
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let Some(&[a, b]) = input.get(..2) else { return Ok(None) };
         // The two-byte length is at most MAX_TCP_MESSAGE.
         let used = 2usize.saturating_add(usize::from(u16::from_be_bytes([a, b])));
-        let Some(body) = input.get(2..used) else { return Ok(Step::Need) };
-        Ok(Step::Item(Message::parse_within(body, MAX_TCP_MESSAGE), used))
+        let Some(body) = input.get(2..used) else { return Ok(None) };
+        Ok(Some((Message::parse_within(body, MAX_TCP_MESSAGE), used)))
     }
 }
+
 
 fn find_status(options: &[DhcpOption]) -> Option<&StatusCode> {
     options.iter().find_map(|o| if let DhcpOption::StatusCode(s) = o { Some(s) } else { None })
@@ -1744,7 +1743,7 @@ mod tests {
     #[test]
     fn stream_takes_many_small_messages_in_linear_time() {
         let n = 1_000_000;
-        let mut stream = Stream::new(Messages::new());
+        let mut stream = Stream::new(Frames::<Message>::new());
         let mut count = 0;
         pump(&mut stream, &vec![0; 2 * n], |m| {
             assert_eq!(m, Err(Error::Short));
@@ -1791,9 +1790,9 @@ mod tests {
             }
             // Over TCP, every prefix waits for more.
             let framed = Frame(Message::parse(&full).unwrap().clone()).to_bytes().unwrap();
-            contract::check_decode_with_alloc_limit(Messages::new, &framed, 2 * MAX_BUFFERED);
+            contract::check_decode_with_alloc_limit(Frames::<Message>::new, &framed, 2 * MAX_BUFFERED);
             for n in 0..framed.len() {
-                assert_eq!(Messages::new().decode(&framed[..n], false), Ok(Step::Need));
+                assert_eq!(Frames::<Message>::new().decode(&framed[..n], false), Ok(Step::Need));
             }
         }
     }
@@ -1805,9 +1804,9 @@ mod tests {
         let mut bytes = Frame(first.clone()).to_bytes().unwrap();
         bytes.extend_from_slice(&[0, 3, 1, 0, 0]);
         bytes.extend_from_slice(&Frame(second.clone()).to_bytes().unwrap());
-        contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_BUFFERED);
-        assert_eq!(decode_all(Messages::new, &bytes), (vec![Ok(first), Err(Error::Short), Ok(second)], None));
-        let (messages, error) = decode_all(Messages::new, &[0, 0, 0, 4, 2, 0, 0, 1]);
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &bytes, 2 * MAX_BUFFERED);
+        assert_eq!(decode_all(Frames::<Message>::new, &bytes), (vec![Ok(first), Err(Error::Short), Ok(second)], None));
+        let (messages, error) = decode_all(Frames::<Message>::new, &[0, 0, 0, 4, 2, 0, 0, 1]);
         assert_eq!(messages, [Err(Error::Short), Ok(Message::new(2, 1))]);
         assert_eq!(error, None);
     }
@@ -2039,7 +2038,7 @@ mod tests {
                     contract::check_wire_value(&inner);
                 }
             }
-            contract::check_decode_with_alloc_limit(Messages::new, &data, 2 * MAX_BUFFERED);
+            contract::check_decode_with_alloc_limit(Frames::<Message>::new, &data, 2 * MAX_BUFFERED);
         }
         assert!(accepted > 500, "{accepted}");
     }
@@ -2055,7 +2054,7 @@ mod tests {
         let value = Frame::parse(&frame).unwrap();
         assert_eq!(value.to_bytes().unwrap(), frame);
         assert!(value.0.to_bytes().is_err());
-        contract::check_decode_with_alloc_limit(Messages::new, &frame, 2 * MAX_BUFFERED);
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &frame, 2 * MAX_BUFFERED);
     }
 
     #[test]
@@ -2105,12 +2104,12 @@ mod tests {
 
     #[test]
     fn review_stream_holds_a_bounded_number_of_bytes() {
-        let mut stream = Stream::new(Messages::new());
+        let mut stream = Stream::new(Frames::<Message>::new());
         assert_eq!(stream.push(&vec![0; 2 * MAX_BUFFERED]), MAX_BUFFERED);
         assert_eq!(stream.buffered(), MAX_BUFFERED);
         assert_eq!(stream.next(), Some(Ok(Err(Error::Short))));
         assert_eq!(stream.push(&[0; 4096]), 2);
-        contract::check_decode_with_alloc_limit(Messages::new, &[0; 4096], 2 * MAX_BUFFERED);
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &[0; 4096], 2 * MAX_BUFFERED);
     }
 
     #[test]

@@ -2,14 +2,14 @@
 //! file of them, and the order book they drive.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
     Wire,
     contract::{check_decode, check_wire, check_wire_value},
     test_support::decode_all,
 };
 use fictionet::stdlib::itch::{
-    AddOrder, Book, BookConfig, MAX_MESSAGE_LENGTH, Message, Messages, Noii, OrderReplace,
-    StockDirectory,
+    AddOrder, Book, BookConfig, MAX_MESSAGE_LENGTH, Message, Noii, OrderReplace, StockDirectory,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -24,9 +24,9 @@ fuzz_target!(|input: &[u8]| {
     check_wire::<OrderReplace>(data);
     check_wire::<StockDirectory>(data);
     check_wire::<Noii>(data);
-    check_decode(Messages::default, data);
-    check_decode(|| Messages::with_limit(MAX_MESSAGE_LENGTH), data);
-    let (items, _) = decode_all(Messages::default, data);
+    check_decode(Frames::<Message>::default, data);
+    check_decode(|| Frames::<Message>::with_limit(MAX_MESSAGE_LENGTH), data);
+    let (items, _) = decode_all(Frames::<Message>::default, data);
 
     // Every framed message that parses goes to a small book, whose
     // limits must hold whatever it is fed.

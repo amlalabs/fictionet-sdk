@@ -25,7 +25,7 @@
 //! neither checks the HMAC nor decrypts.
 //!
 //! Nothing here reads a socket. A world that plays an OpenVPN server pushes
-//! TCP bytes through [`Stream<Frames>`](fictionet::stdlib::codec::Stream), or takes each
+//! TCP bytes through [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream), or takes each
 //! UDP datagram whole, reads it with [`Packet::parse_with`], and writes
 //! the reply's bytes back. What the TLS session says, and what the tunnel
 //! carries, is up to world code.
@@ -44,10 +44,11 @@
 //! writer writes, the reader reads back as the same value.
 //!
 //! ```
-//! use fictionet::stdlib::openvpn::{Ack, Control, ControlBody, ControlKind, Frames, Frame, Packet, Wrapping};
+//! use fictionet::stdlib::codec::Frames;
+//! use fictionet::stdlib::openvpn::{Ack, Control, ControlBody, ControlKind, Frame, Packet, Wrapping};
 //!
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! let mut stream = Stream::new(Frames::new());
+//! let mut stream = Stream::new(Frames::<Frame>::new());
 //! // A client's P_CONTROL_HARD_RESET_CLIENT_V2 over TCP: length 14,
 //! // opcode 7 and key 0, session ID 1..8, no acks, message packet ID 0.
 //! assert_eq!(stream.push(&[0, 14, 0x38, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0]), 16);
@@ -76,6 +77,7 @@
 //! assert_eq!(Packet::parse_with(&wire[2..], Wrapping::None), Ok(reply));
 //! ```
 
+use fictionet::stdlib::codec::{Prefixed, Frames};
 use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated};
 
 /// The port OpenVPN servers listen on, over UDP and over TCP.
@@ -691,7 +693,7 @@ impl Wire for Frame {
 
     /// Reads one envelope. Refuses zero length, truncation, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        match Frames::new()
+        match Frames::<Frame>::new()
             .decode(bytes, true)
 ?
         {
@@ -792,62 +794,40 @@ impl Frame {
 /// including at EOF, so [`fictionet::stdlib::codec::Stream`] reports truncation.
 /// Map each frame through [`Packet::parse_with`] with the connection's wrapping
 /// to receive packet errors as items while framing continues.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frames {
-    limit: usize,
-}
-
-impl Frames {
-    /// Creates a framer accepting payloads up to [`MAX_PACKET`] bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_PACKET)
-    }
-
-    /// Sets the payload limit, clamped to [`MAX_PACKET`]. Zero refuses
-    /// every packet. The two-byte prefix is excluded from this limit.
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_PACKET),
-        }
-    }
-
-    /// The largest accepted packet, excluding its length prefix.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Frames {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Frames {
+impl Prefixed for Frame {
     type Item = Frame;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "OpenVPN/TCP";
 
-    fn capacity(&self) -> usize {
-        LENGTH_PREFIX_LEN.saturating_add(self.limit)
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_PACKET }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_PACKET) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        LENGTH_PREFIX_LEN.saturating_add(limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
         if let Some(&[hi, lo]) = input.get(..LENGTH_PREFIX_LEN) {
             let length = usize::from(u16::from_be_bytes([hi, lo]));
-            if length > self.limit {
+            if length > limit {
                 return Err(Error::OverLimit {
                     length,
-                    limit: self.limit,
+                    limit,
                 });
             }
         }
-        Ok(match split_tcp(input)? {
-            Some((packet, used)) => Step::Item(Frame(packet.to_vec()), used),
-            None => Step::Need,
-        })
+        Ok(split_tcp(input)?.map(|(packet, used)| (Frame(packet.to_vec()), used)))
     }
 }
+
 
 impl From<Truncated> for Error {
     #[inline]
@@ -1379,12 +1359,12 @@ mod tests {
         let a = envelope(&samples()[0]).unwrap();
         let b = envelope(&samples()[5]).unwrap();
         let bytes = [a.clone(), b.clone()].concat();
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_TCP_FRAME);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_TCP_FRAME);
         assert_eq!(
-            decode_all(Frames::new, &bytes),
+            decode_all(Frames::<Frame>::new, &bytes),
             (vec![Frame(a[2..].to_vec()), Frame(b[2..].to_vec())], None)
         );
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&[0, 0, 0, 1, 0x30]), 5);
         assert_eq!(
             stream.next(),
@@ -1397,9 +1377,9 @@ mod tests {
     #[test]
     fn stream_holds_a_bounded_number_of_bytes() {
         let longest = Frame(vec![0x30; MAX_PACKET]).to_bytes().unwrap();
-        contract::check_decode_with_alloc_limit(Frames::new, &longest, 2 * MAX_TCP_FRAME);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &longest, 2 * MAX_TCP_FRAME);
         assert_eq!(
-            decode_all(Frames::new, &longest),
+            decode_all(Frames::<Frame>::new, &longest),
             (vec![Frame(longest[2..].to_vec())], None)
         );
     }
@@ -1408,7 +1388,7 @@ mod tests {
     fn stream_takes_many_small_packets_in_linear_time() {
         let bytes = Frame(vec![0x30, 1]).to_bytes().unwrap().repeat(200_000);
         let started = std::time::Instant::now();
-        let (items, error) = decode_all(Frames::new, &bytes);
+        let (items, error) = decode_all(Frames::<Frame>::new, &bytes);
         // Allow slow test hosts while catching repeated scans or front removal.
         assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
         assert_eq!(error, None);
@@ -1471,13 +1451,13 @@ mod tests {
                 let too_long = Wrapping::TlsAuth { hmac_len: MAX_HMAC_LEN + 1 };
                 assert_eq!(Packet::parse_with(&b, too_long), Err(Error::HmacLen(MAX_HMAC_LEN + 1)));
             }
-            contract::check_decode_with_alloc_limit(Frames::new, &b, 2 * MAX_TCP_FRAME);
+            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_TCP_FRAME);
             contract::check_wire::<Frame>(&b);
             contract::check_wire::<Packet>(&b);
             contract::check_wire::<Authenticated<20>>(&b);
             contract::check_wire::<Encrypted>(&b);
             mutate(&mut rng, &mut b);
-            contract::check_decode_with_alloc_limit(Frames::new, &b, 2 * MAX_TCP_FRAME);
+            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_TCP_FRAME);
         }
         // Built packets with random fields: each is written and read back
         // as the same value, or refused for the reason it breaks.
@@ -1523,7 +1503,7 @@ mod tests {
                     let b = wire(&p).unwrap();
                     assert_eq!(Packet::parse_with(&b, p.wrapping()), Ok(p.clone()));
                     let bytes = Frame(b.clone()).to_bytes().unwrap();
-                    assert_eq!(decode_all(Frames::new, &bytes), (vec![Frame(b)], None));
+                    assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (vec![Frame(b)], None));
                 }
             }
             // The same kind wrapped with tls-crypt, with a ciphertext that

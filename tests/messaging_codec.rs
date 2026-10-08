@@ -1,5 +1,6 @@
 //! Messaging streams, datagrams, and strict writers.
 
+use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
     Decode, Fail, Step, Stream, Wire, contract, test_support::decode_all,
@@ -116,7 +117,7 @@ fn mqtt_broker_round_trip_and_terminal_errors() {
         mqtt::Packet::PingReq,
     ];
     let bytes: Vec<u8> = packets.iter().flat_map(encoded).collect();
-    let make = || mqtt::Packets::with_limit(64);
+    let make = || Frames::<mqtt::Packet>::with_limit(64);
     check(make, &bytes);
     let (got, error) = decode_all(make, &bytes);
     assert_eq!((got.clone(), error), (packets.clone(), None));
@@ -159,20 +160,20 @@ fn coap_udp_and_tcp_round_trip() {
     };
     let frames = vec![coap::Frame::csm(4096, true), request.clone()];
     let bytes: Vec<u8> = frames.iter().flat_map(encoded).collect();
-    check(coap::Frames::new, &bytes);
-    assert_eq!(decode_all(coap::Frames::new, &bytes), (frames.clone(), None));
+    check(Frames::<coap::Frame>::new, &bytes);
+    assert_eq!(decode_all(Frames::<coap::Frame>::new, &bytes), (frames.clone(), None));
     let mut reply = request.reply(coap::Code::CONTENT);
     reply.payload = b"21.5".to_vec();
     assert_eq!(
-        decode_all(coap::Frames::new, &encoded(&reply)),
+        decode_all(Frames::<coap::Frame>::new, &encoded(&reply)),
         (vec![reply], None)
     );
 
     // A complete frame whose payload marker has no following payload.
     let bad = [0x10, coap::Code::GET.0, coap::PAYLOAD_MARKER];
-    check(coap::Frames::new, &bad);
+    check(Frames::<coap::Frame>::new, &bad);
     assert_eq!(
-        decode_all(coap::Frames::new, &bad),
+        decode_all(Frames::<coap::Frame>::new, &bad),
         (vec![], Some(Fail::Protocol(coap::Error::EmptyPayload)))
     );
 }
@@ -193,14 +194,14 @@ fn dhcpv6_tcp_recovers_messages_and_replies() {
     bytes.extend(encoded(&dhcpv6::Frame(request.clone())));
     bytes.extend_from_slice(&[0, 5, 1, 0, 0, 1, 0]); // Torn option inside a whole message.
     bytes.extend(encoded(&dhcpv6::Frame(request.clone())));
-    check(dhcpv6::Messages::new, &bytes);
+    check(Frames::<dhcpv6::Message>::new, &bytes);
     let expected = vec![
         Err(dhcpv6::Error::Short),
         Ok(request.clone()),
         Err(dhcpv6::Error::Truncated),
         Ok(request.clone()),
     ];
-    let (items, error) = decode_all(dhcpv6::Messages::new, &bytes);
+    let (items, error) = decode_all(Frames::<dhcpv6::Message>::new, &bytes);
     assert_eq!(error, None);
     assert_eq!(items, expected);
     let mut replies = Vec::new();
@@ -208,7 +209,7 @@ fn dhcpv6_tcp_recovers_messages_and_replies() {
         let answer = message.answer(dhcpv6::msg::ADVERTISE, &dhcpv6::Duid::en(32473, b"server"));
         let bytes = encoded(&dhcpv6::Frame(answer.clone()));
         assert_eq!(
-            decode_all(dhcpv6::Messages::new, &bytes),
+            decode_all(Frames::<dhcpv6::Message>::new, &bytes),
             (vec![Ok(answer.clone())], None)
         );
         replies.push(answer);
@@ -298,9 +299,9 @@ fn partial_units_and_header_faults() {
     );
 
     for bytes in [&[0x30][..], &[0x30, 3, 0][..], &[0x30, 0x80][..]] {
-        check(mqtt::Packets::new, bytes);
+        check(Frames::<mqtt::Packet>::new, bytes);
         assert_eq!(
-            decode_all(mqtt::Packets::new, bytes),
+            decode_all(Frames::<mqtt::Packet>::new, bytes),
             (
                 vec![],
                 Some(Fail::Truncated {
@@ -309,7 +310,7 @@ fn partial_units_and_header_faults() {
             )
         );
     }
-    let make = || mqtt::Packets::with_limit(0);
+    let make = || Frames::<mqtt::Packet>::with_limit(0);
     let bytes = [0x30, 0x80, 0x80, 0x80, 0x00];
     check(make, &bytes);
     assert_eq!(make().capacity(), 5);
@@ -322,16 +323,16 @@ fn partial_units_and_header_faults() {
     );
 
     for bytes in [&[0xf0][..], &[0, coap::Code::GET.0, 0x10][..]] {
-        check(coap::Frames::new, bytes);
+        check(Frames::<coap::Frame>::new, bytes);
     }
     assert_eq!(
-        decode_all(coap::Frames::new, &[0x10, 1]),
+        decode_all(Frames::<coap::Frame>::new, &[0x10, 1]),
         (vec![], Some(Fail::Truncated { unread: 2 }))
     );
     let huge = [0xf0, 0xff, 0xff, 0xff, 0xff];
-    check(coap::Frames::new, &huge);
+    check(Frames::<coap::Frame>::new, &huge);
     assert_eq!(
-        decode_all(coap::Frames::new, &huge),
+        decode_all(Frames::<coap::Frame>::new, &huge),
         (
             vec![],
             Some(Fail::Protocol(coap::Error::TooLong(
@@ -341,9 +342,9 @@ fn partial_units_and_header_faults() {
     );
 
     for bytes in [&[0][..], &[0, 4, 1][..]] {
-        check(dhcpv6::Messages::new, bytes);
+        check(Frames::<dhcpv6::Message>::new, bytes);
         assert_eq!(
-            decode_all(dhcpv6::Messages::new, bytes),
+            decode_all(Frames::<dhcpv6::Message>::new, bytes),
             (
                 vec![],
                 Some(Fail::Truncated {
@@ -506,14 +507,14 @@ fn dhcpv6_tcp_limit_and_stream_backpressure() {
     let frame = dhcpv6::Frame(message.clone());
     let bytes = encoded(&frame);
     assert_eq!(bytes.len(), dhcpv6::MAX_BUFFERED);
-    check(dhcpv6::Messages::new, &bytes);
+    check(Frames::<dhcpv6::Message>::new, &bytes);
     assert_eq!(
-        decode_all(dhcpv6::Messages::new, &bytes),
+        decode_all(Frames::<dhcpv6::Message>::new, &bytes),
         (vec![Ok(message.clone())], None)
     );
     let mut batch = bytes.clone();
     batch.extend_from_slice(&[0, 0]);
-    let mut stream = Stream::new(dhcpv6::Messages);
+    let mut stream = Stream::new(Frames::<dhcpv6::Message>::new());
     assert_eq!(stream.push(&batch), dhcpv6::MAX_BUFFERED);
     assert_eq!(stream.push(&[0]), 0);
     assert_eq!(stream.next(), Some(Ok(Ok(message))));
@@ -598,11 +599,11 @@ fn stream_errors_end_once_and_partial_counts_fail_at_eof() {
 #[test]
 fn decoders_have_bounded_capacity_and_no_held_input() {
     for limit in [0, 1, 2, 5, 4096, usize::MAX] {
-        let decoder = mqtt::Packets::with_limit(limit);
+        let decoder = Frames::<mqtt::Packet>::with_limit(limit);
         assert!((5..=mqtt::MAX_PACKET).contains(&decoder.capacity()));
         assert_eq!(decoder.held(), 0);
         check(
-            || mqtt::Packets::with_limit(limit),
+            || Frames::<mqtt::Packet>::with_limit(limit),
             &[0x30, 0x80, 0x80, 0x80, 0x80],
         );
     }
@@ -611,12 +612,12 @@ fn decoders_have_bounded_capacity_and_no_held_input() {
         assert_eq!(decoder.capacity(), amqp::frame_limit(limit) as usize);
         assert_eq!(decoder.held(), 0);
     }
-    assert_eq!(coap::Frames.capacity(), coap::MAX_BUFFERED);
-    assert_eq!(dhcpv6::Messages.capacity(), dhcpv6::MAX_BUFFERED);
+    assert_eq!(Frames::<coap::Frame>::new().capacity(), coap::MAX_BUFFERED);
+    assert_eq!(Frames::<dhcpv6::Message>::new().capacity(), dhcpv6::MAX_BUFFERED);
     assert_eq!(syslog::Frames::new().capacity(), syslog::MAX_BUFFERED);
     assert_eq!(amqp::Frames::new().decode(&[], true), Ok(Step::Need));
-    assert_eq!(mqtt::Packets::new().decode(&[], true), Ok(Step::Need));
-    assert_eq!(coap::Frames.decode(&[], true), Ok(Step::Need));
-    assert_eq!(dhcpv6::Messages.decode(&[], true), Ok(Step::Need));
+    assert_eq!(Frames::<mqtt::Packet>::new().decode(&[], true), Ok(Step::Need));
+    assert_eq!(Frames::<coap::Frame>::new().decode(&[], true), Ok(Step::Need));
+    assert_eq!(Frames::<dhcpv6::Message>::new().decode(&[], true), Ok(Step::Need));
     assert_eq!(syslog::Frames::new().decode(&[], true), Ok(Step::Need));
 }

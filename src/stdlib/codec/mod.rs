@@ -13,7 +13,8 @@
 //! [`Wire`] reads one complete value and writes it without changing its
 //! meaning. [`Map`] interprets each item, [`Assemble`] joins fragments, and
 //! [`Pipe`] feeds selected outer payloads into an inner decoder. [`Lines`]
-//! and [`Collect`] cover lines and values that end at EOF. [`Spans`] records
+//! and [`Collect`] cover lines and values that end at EOF. [`Frames<T>`]
+//! frames values through their [`Prefixed`] parser and protocol limits. [`Spans`] records
 //! bounded provenance; [`Demux`] shares a budget across keyed streams.
 //!
 //! This module uses only `core` and `alloc`. No function here performs
@@ -106,8 +107,9 @@
 //!   [`source`](Error::source), and its `Display` says only its own
 //!   context, never the inner error's text, so
 //!   [`ErrorChain`](crate::ErrorChain) shows each message once.
-//! - **N1.** A [`Decode`] type is the plural of its item: `Frames` yields
-//!   `Frame`, `Packets` yields `Packet`, and a `Result<T, E>` item counts
+//! - **N1.** A decoder that only frames a [`Wire`] value is [`Frames<T>`],
+//!   with [`Prefixed`] implemented on `T`. Other [`Decode`] types are the
+//!   plural of their item. A `Result<T, E>` item counts
 //!   as `T`. A raw-bytes item takes the protocol's word for its unit. A
 //!   decoder that yields one message head and then ends is `Head`.
 //! - **N2.** A [`Wire`] type takes the specification's word for its unit,
@@ -145,6 +147,7 @@ mod combinators;
 pub mod contract;
 mod demux;
 mod faults;
+mod frames;
 mod interceptor;
 mod lcg;
 mod pipe;
@@ -159,6 +162,7 @@ pub use combinators::{
     Map,
 };
 pub use demux::Demux;
+pub use frames::{Frames, Prefixed};
 pub use faults::{ByteFault, FaultDelay, FaultError, Faults, ItemFault, Rule, Trigger};
 pub use interceptor::{
     InterceptError, Interceptor, Rewrite, RewriteError, SkipPolicy, append_bounded, write_bounded,

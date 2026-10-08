@@ -1,6 +1,6 @@
 //! RDP connection messages from MS-RDPBCGR, with no I/O.
 //!
-//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream) separates TPKT slow-path
+//! [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) separates TPKT slow-path
 //! packets from fast-path packets.
 //! [`Connection`] reads X.224 connection requests and confirms, including
 //! cookies, routing tokens and security negotiation. [`McsConnect`] reads
@@ -27,13 +27,14 @@
 //! 2.2.8 and 4.1](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/).
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::rdp::{Connection, Frames, Frame, Negotiation, Protocols};
+//! use fictionet::stdlib::rdp::{Connection, Frame, Negotiation, Protocols};
 //!
 //! // MS-RDPBCGR connection request: TLS and CredSSP are supported.
 //! let bytes = [3, 0, 0, 19, 14, 0xe0, 0, 0, 0, 0, 0,
 //!              1, 0, 8, 0, 3, 0, 0, 0];
-//! let mut decoder = Stream::new(Frames::new());
+//! let mut decoder = Stream::new(Frames::<Frame>::new());
 //! assert_eq!(decoder.push(&bytes), bytes.len());
 //! let Frame::SlowPath(packet) = decoder.next().unwrap().unwrap() else {
 //!     panic!("expected TPKT");
@@ -45,10 +46,13 @@
 //! assert_eq!(request.to_packet().unwrap().to_bytes().unwrap(), bytes);
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Reader, Truncated, Trailing};
 
 use fictionet::stdlib::{
-    codec::{Decode, Step, Wire},
+    codec::{Wire},
     cotp, tpkt,
 };
 
@@ -494,39 +498,33 @@ impl Wire for Frame {
 
 /// Reads RDP slow-path and fast-path frames without holding input bytes.
 ///
-/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for a buffer limited to
-/// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
+/// Use with [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) for a buffer limited to
+/// [`MAX_FRAME`]. Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once.
 /// Slow-path framing uses the shared [`tpkt`] parser.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
-
-impl Frames {
-    /// Creates a frame decoder with a capacity of [`MAX_FRAME`] bytes.
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Decode for Frames {
+impl Prefixed for Frame {
     type Item = Frame;
     type Error = Error;
+    type Limit = ();
     const NAME: &'static str = "RDP";
 
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         MAX_FRAME
     }
 
-    /// Reads a frame prefix, returning [`Step::Need`] while incomplete.
+    /// Reads a frame prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.
     /// Returns [`Error::Invalid`] for bad fast-path action bits or lengths,
     /// and [`Error::Tpkt`] for invalid TPKT headers.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        Ok(match Frame::parse_prefix(input)? {
-            Some((frame, used)) => Step::Item(frame, used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        Frame::parse_prefix(input)
     }
 }
+
 
 /// Extracts the bytes of an unsegmented RDP X.224 Data TPDU using COTP.
 /// Use the sibling COTP reassembler yourself for non-RDP segmented traffic.
@@ -3920,11 +3918,11 @@ mod tests {
             .unwrap(),
         ];
         for b in samples {
-            contract::check_decode(Frames::new, &b);
+            contract::check_decode(Frames::<Frame>::new, &b);
             for n in 0..b.len() {
                 assert_eq!(Frame::parse_prefix(&b[..n]), Ok(None));
             }
-            let mut stream = Stream::new(Frames);
+            let mut stream = Stream::new(Frames::<Frame>::new());
             let mut frames = Vec::new();
             pump(&mut stream, &b, |frame| frames.push(frame)).unwrap();
             assert_eq!(frames, [Frame::parse_prefix(&b).unwrap().unwrap().0]);
@@ -3983,20 +3981,20 @@ mod tests {
     #[test]
     fn streaming_backpressure_and_terminal_error() {
         let bytes = [0, 2].repeat(MAX_FRAME);
-        contract::check_decode(Frames::new, &bytes);
-        let mut stream = Stream::new(Frames);
+        contract::check_decode(Frames::<Frame>::new, &bytes);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         let mut count = 0;
         pump(&mut stream, &bytes, |_| count += 1).unwrap();
         assert_eq!(count, MAX_FRAME);
         assert_eq!(stream.buffered(), 0);
-        let mut stream = Stream::new(Frames);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&bytes), MAX_FRAME);
         assert_eq!(stream.push(&[0]), 0);
         while let Some(frame) = stream.next() {
             frame.unwrap();
         }
         assert!(stream.buffered() <= 1);
-        let mut stream = Stream::new(Frames);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&[1]), 1);
         let error = Fail::Protocol(Error::Invalid("fast-path action"));
         assert_eq!(stream.next(), Some(Err(error)));
@@ -4008,8 +4006,8 @@ mod tests {
     fn maximum_frames_bytewise_and_mixed_stream() {
         let f = Frame::SlowPath(write_data(&vec![0; MAX_PDU]).unwrap());
         let b = f.to_bytes().unwrap();
-        contract::check_decode_with_alloc_limit(Frames::new, &b, 2 * MAX_FRAME);
-        let (frames, failure) = decode_all(Frames::new, &b);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_FRAME);
+        let (frames, failure) = decode_all(Frames::<Frame>::new, &b);
         assert!(failure.is_none());
         assert_eq!(frames, [f]);
         let mut b = connection().to_packet().unwrap().to_bytes().unwrap();
@@ -4022,8 +4020,8 @@ mod tests {
             .unwrap(),
         );
         b.extend_from_slice(&write_data(&[0x28]).unwrap().to_bytes().unwrap());
-        contract::check_decode_with_alloc_limit(Frames::new, &b, 2 * MAX_FRAME);
-        let (frames, failure) = decode_all(Frames::new, &b);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_FRAME);
+        let (frames, failure) = decode_all(Frames::<Frame>::new, &b);
         assert!(failure.is_none());
         assert_eq!(frames.len(), 3);
     }
@@ -4244,13 +4242,13 @@ mod tests {
         for _ in 0..2500 {
             let random = rng.bytes(511);
             check_parsers(&random);
-            contract::check_decode(Frames::new, &random);
+            contract::check_decode(Frames::<Frame>::new, &random);
             let mut b = seeds[rng.index(seeds.len())].clone();
             for _ in 0..rng.below(4) {
                 test_support::mutate(&mut rng, &mut b);
             }
             check_parsers(&b);
-            contract::check_decode(Frames::new, &b);
+            contract::check_decode(Frames::<Frame>::new, &b);
         }
     }
 }

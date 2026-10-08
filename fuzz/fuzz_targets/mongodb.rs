@@ -3,9 +3,10 @@
 //! writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::contract::{check_decode_with_alloc_limit, check_wire, check_wire_value};
 use fictionet::stdlib::mongodb::{
-    Body, Bson, Compressed, Document, Message, Messages, Msg, Query, Reply, Sequence, MAX_MESSAGE_SIZE,
+    Body, Bson, Compressed, Document, Message, Msg, Query, Reply, Sequence, MAX_MESSAGE_SIZE,
 };
 use fictionet::stdlib::codec::{Wire, test_support::decode_all};
 use libfuzzer_sys::fuzz_target;
@@ -88,11 +89,11 @@ fn message(b: &mut Bytes<'_>) -> Message {
 }
 
 fuzz_target!(|data: &[u8]| {
-    check_decode_with_alloc_limit(Messages::new, data, 2 * MAX_MESSAGE_SIZE);
-    check_decode_with_alloc_limit(|| Messages::with_limit(64), data, 128);
+    check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * MAX_MESSAGE_SIZE);
+    check_decode_with_alloc_limit(|| Frames::<Message>::with_limit(64), data, 128);
     check_wire::<Message>(data);
     check_wire::<Document>(data);
-    for message in decode_all(Messages::new, data).0.into_iter().flatten() {
+    for message in decode_all(Frames::<Message>::new, data).0.into_iter().flatten() {
         assert!(message.to_bytes().is_ok(), "{message:?}");
         check_wire_value(&message);
     }
@@ -101,6 +102,6 @@ fuzz_target!(|data: &[u8]| {
     let message = message(&mut bytes);
     check_wire_value(&message);
     if let Ok(encoded) = message.to_bytes() {
-        check_decode_with_alloc_limit(Messages::new, &encoded, 2 * MAX_MESSAGE_SIZE);
+        check_decode_with_alloc_limit(Frames::<Message>::new, &encoded, 2 * MAX_MESSAGE_SIZE);
     }
 });

@@ -2,14 +2,13 @@
 //! client and server sessions driven by whatever frames come out.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
     Wire,
     contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value},
     test_support::decode_all,
 };
-use fictionet::stdlib::soupbintcp::{
-    Action, Alpha, Client, Login, MAX_PACKET, Packet, Packets, Server, Timers,
-};
+use fictionet::stdlib::soupbintcp::{Action, Alpha, Client, Login, MAX_PACKET, Packet, Server, Timers};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;
@@ -42,13 +41,13 @@ fuzz_target!(|input: &[u8]| {
     if let Ok(packet) = Packet::parse_body(data) {
         check_wire_value(&packet);
     }
-    check_decode(Packets::default, data);
+    check_decode(Frames::<Packet>::default, data);
     check_decode_with_alloc_limit(
-        || Packets::with_limit(SMALL_LIMIT),
+        || Frames::<Packet>::with_limit(SMALL_LIMIT),
         data,
         2 * (SMALL_LIMIT + 3),
     );
-    let (frames, _) = decode_all(Packets::default, data);
+    let (frames, _) = decode_all(Frames::<Packet>::default, data);
 
     // A logged-in client and server each read every frame, with time
     // taken from the frame bytes.

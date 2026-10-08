@@ -2,28 +2,42 @@
 //! matching on any strings.
 #![no_main]
 
-use fictionet::stdlib::mqtt::{
-    ConnAck, ConnectReturnCode, Packets, MAX_PACKET, Packet, Publish, QoS, check_topic_filter, check_topic_name,
-    topic_matches,
-};
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::mqtt::ConnAck;
+
+use fictionet::stdlib::mqtt::ConnectReturnCode;
+
+use fictionet::stdlib::mqtt::MAX_PACKET;
+
+use fictionet::stdlib::mqtt::Packet;
+
+use fictionet::stdlib::mqtt::Publish;
+
+use fictionet::stdlib::mqtt::QoS;
+
+use fictionet::stdlib::mqtt::check_topic_filter;
+
+use fictionet::stdlib::mqtt::check_topic_name;
+
+use fictionet::stdlib::mqtt::topic_matches;
 use libfuzzer_sys::fuzz_target;
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{ Wire, contract, test_support::decode_all};
 
 fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Packet>(data);
     contract::check_wire::<fictionet::stdlib::mqtt::RemainingLength>(data);
     let small = usize::from(data.first().copied().unwrap_or(0) & 0x3f);
     for limit in [fictionet::stdlib::mqtt::DEFAULT_MAX_PACKET, MAX_PACKET, small] {
-        let make = || Packets::with_limit(limit);
+        let make = || Frames::<Packet>::with_limit(limit);
         contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
     }
-    let packets = decode_all(Packets::new, data).0;
+    let packets = decode_all(Frames::<Packet>::new, data).0;
     if let Ok(packet) = Packet::parse(data) {
         if data.len() <= fictionet::stdlib::mqtt::DEFAULT_MAX_PACKET {
             assert_eq!(packets.first(), Some(&packet));
         } else {
             // Exact parsing allows packets above the default stream limit.
-            assert_eq!(decode_all(|| Packets::with_limit(MAX_PACKET), data).0.first(), Some(&packet));
+            assert_eq!(decode_all(|| Frames::<Packet>::with_limit(MAX_PACKET), data).0.first(), Some(&packet));
         }
     }
     for packet in packets {

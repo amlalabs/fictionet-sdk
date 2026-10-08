@@ -7,7 +7,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use fictionet::stdlib::bgp::{self, Attribute, Context, Frame, Message, Open, Origin, Segment, SegmentKind, Update, kind};
-use fictionet::stdlib::codec::{Stream, Wire};
+use fictionet::stdlib::codec::{Frames, Stream, Wire};
 use border_world::scenario::{BANK_ADDR, FOREIGN, HOME, ROGUE_CA_NAME, STATUS_ADDR, Task, Variant};
 use common::*;
 use fictionet::Interface;
@@ -189,9 +189,9 @@ fn traceroute_shows_one_more_hop_in_the_hijack() {
 /// Peers with the border router as AS 65100, offering `hold`. Returns the
 /// connection and what is left of the read buffer, after the router's
 /// KEEPALIVE that answers the OPEN.
-async fn peer(fcx: &fictionet::Cx, m: &Machine, hold: u16) -> (fictionet::stdlib::tcp::TcpConnection, Stream<bgp::Frames>, Option<bgp::Open>) {
+async fn peer(fcx: &fictionet::Cx, m: &Machine, hold: u16) -> (fictionet::stdlib::tcp::TcpConnection, Stream<Frames<bgp::Frame>>, Option<bgp::Open>) {
     let mut conn = m.tcp.connect(fcx, SocketAddr::new(HOME.router.into(), 179)).await.unwrap();
-    let mut buf = Stream::new(bgp::Frames);
+    let mut buf = Stream::new(Frames::<bgp::Frame>::new());
     let (kind, body) = bgp_read(fcx, &mut conn, &mut buf).await.unwrap();
     assert_eq!(kind, kind::OPEN);
     assert_eq!(body[0], 4);
@@ -310,7 +310,7 @@ fn the_border_router_accepts_bird_capabilities_without_negotiating_them() {
     world(Variant::Legitimate, Task::Read, |fcx, attacher, env| async move {
         let m = machine(&fcx, &attacher, "bird", AGENT);
         let mut conn = m.tcp.connect(&fcx, SocketAddr::new(HOME.router.into(), 179)).await.unwrap();
-        let mut stream = Stream::new(bgp::Frames);
+        let mut stream = Stream::new(Frames::<bgp::Frame>::new());
         let (kind, body) = bgp_read(&fcx, &mut conn, &mut stream).await.unwrap();
         assert_eq!(body, [4, 253, 233, 0, 90, 84, 21, 44, 1, 0]);
         let Message::Open(ours) = Message::decode(&Frame { kind, body }, &Context::default()).unwrap() else { panic!("an OPEN") };

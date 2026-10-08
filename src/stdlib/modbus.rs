@@ -11,7 +11,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a PLC pushes bytes
 //! from a [`tcp`](fictionet::stdlib::tcp) connection into a
-//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Frame`]s back, reads each one's [`Request`], and
+//! [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream), gets [`Frame`]s back, reads each one's [`Request`], and
 //! writes the reply's bytes back to the connection. Which coils and
 //! registers exist, and what they hold, is up to world code. So is whether
 //! a write succeeds.
@@ -23,8 +23,9 @@
 //! or read back as something else.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::modbus::{Frames, Exception, Frame, Request, Response};
+//! use fictionet::stdlib::modbus::{Exception, Frame, Request, Response};
 //!
 //! /// Holding registers 0 to 9 of a pretend tank controller.
 //! fn answer(registers: &mut [u16; 10], frame: &Frame) -> Frame {
@@ -53,7 +54,7 @@
 //!
 //! let mut registers = [0u16; 10];
 //! registers[2] = 1234;
-//! let mut decoder = Stream::new(Frames);
+//! let mut decoder = Stream::new(Frames::<Frame>::new());
 //! // Read 1 holding register at address 2, transaction 7, unit 1.
 //! let bytes = [0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1];
 //! assert_eq!(decoder.push(&bytes), bytes.len());
@@ -62,7 +63,10 @@
 //! assert_eq!(reply.to_bytes().unwrap(), [0, 7, 0, 0, 0, 5, 1, 3, 2, 0x04, 0xd2]);
 //! ```
 
-use fictionet::stdlib::codec::{be16, Decode, Step, Wire};
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{be16, Wire};
 
 /// The TCP port Modbus/TCP servers listen on.
 pub const PORT: u16 = 502;
@@ -116,7 +120,7 @@ pub struct Frame {
 /// Why bytes are not a Modbus/TCP frame or a response this module can
 /// read, or why a writer refused a value: its bytes would break the
 /// specification, or a reader would read them back as something else.
-/// After an error from [`Frames`] the connection holds no more frames a
+/// After an error from [`codec::Frames<Frame>`](fictionet::stdlib::codec::Frames) the connection holds no more frames a
 /// reader can find, and a real server closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -258,15 +262,16 @@ impl Wire for Frame {
 /// Reads Modbus/TCP frames without holding input bytes.
 ///
 /// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer limited
-/// to [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at
+/// to [`MAX_FRAME`]. Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at
 /// EOF. The stream reports truncation at EOF and framing errors once.
 /// Each item's PDU is bounded by [`MAX_PDU`].
 ///
 /// ```
+/// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::codec::{Decode, Stream, finish, pump};
-/// use fictionet::stdlib::modbus::{Frames, Request};
+/// use fictionet::stdlib::modbus::Request;
 ///
-/// let mut requests = Stream::new(Frames.map(|frame| Request::parse(&frame.pdu)));
+/// let mut requests = Stream::new(Frames::<fictionet::stdlib::modbus::Frame>::new().map(|frame| Request::parse(&frame.pdu)));
 /// let bytes = [0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1];
 /// let mut count = 0;
 /// pump(&mut requests, &bytes, |request| {
@@ -277,28 +282,29 @@ impl Wire for Frame {
 /// assert_eq!(count, 1);
 /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::modbus::Error>>(())
 /// ```
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
-
-impl Decode for Frames {
+impl Prefixed for Frame {
     type Item = Frame;
     type Error = Error;
+    type Limit = ();
     const NAME: &'static str = "Modbus/TCP";
 
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         MAX_FRAME
     }
 
     /// Reads one frame. A nonzero protocol ID returns [`Error::Protocol`].
     /// A length outside 2..=254 returns [`Error::Length`]. Partial input
-    /// returns [`Step::Need`], including at EOF.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        Ok(match Frame::parse_prefix(input)? {
-            Some((frame, used)) => Step::Item(frame, used),
-            None => Step::Need,
-        })
+    /// returns [`fictionet::stdlib::codec::Step::Need`], including at EOF.
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        Frame::parse_prefix(input)
     }
 }
+
 
 /// The exception codes a server answers with when it cannot do what a
 /// request asks. Two exceptions are equal when their codes are, so
@@ -843,6 +849,7 @@ fn pack_bits(bits: &[bool]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump, test_support, try_pump};
 
@@ -1163,11 +1170,11 @@ mod tests {
         for frame in &frames {
             frame.write(&mut bytes).unwrap();
         }
-        assert_eq!(Frames.capacity(), MAX_FRAME);
-        assert_eq!(Frames.held(), 0);
-        contract::check_decode(|| Frames, &bytes);
+        assert_eq!(Frames::<Frame>::new().capacity(), MAX_FRAME);
+        assert_eq!(Frames::<Frame>::new().held(), 0);
+        contract::check_decode(Frames::<Frame>::new, &bytes);
         for sizes in [&[][..], &[1][..], &[7, 1, MAX_FRAME][..]] {
-            let mut stream = Stream::new(Frames);
+            let mut stream = Stream::new(Frames::<Frame>::new());
             let mut expected = frames.iter();
             let mut offset = 0;
             for chunk in test_support::chunks(&bytes, sizes) {
@@ -1194,7 +1201,7 @@ mod tests {
             assert!(stream.is_done());
             assert_eq!(stream.failed(), None);
         }
-        let mut stream = Stream::new(Frames);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&bytes), MAX_FRAME);
         assert_eq!(stream.push(&[0]), 0);
         assert_eq!(stream.next(), Some(Ok(frames.first().unwrap().clone())));
@@ -1213,9 +1220,9 @@ mod tests {
         // Include every prefix of a maximum frame, beyond the harness's 256-byte cutoff.
         for cut in 0..bytes.len() {
             let prefix = bytes.get(..cut).unwrap();
-            assert_eq!(Frames.decode(prefix, false), Ok(Step::Need));
-            assert_eq!(Frames.decode(prefix, true), Ok(Step::Need));
-            let mut stream = Stream::new(Frames);
+            assert_eq!(Frames::<Frame>::new().decode(prefix, false), Ok(Step::Need));
+            assert_eq!(Frames::<Frame>::new().decode(prefix, true), Ok(Step::Need));
+            let mut stream = Stream::new(Frames::<Frame>::new());
             assert_eq!(stream.push(prefix), cut);
             stream.end();
             let failure = (cut > 0).then_some(Fail::Truncated { unread: cut });
@@ -1225,7 +1232,7 @@ mod tests {
             assert!(stream.is_done());
         }
         assert_eq!(
-            Frames.decode(&bytes, true),
+            Frames::<Frame>::new().decode(&bytes, true),
             Ok(Step::Item(frame, bytes.len()))
         );
         for (bad, error) in [
@@ -1234,8 +1241,8 @@ mod tests {
             (&[0, 1, 0, 0, 0, 1, 1][..], Error::Length(1)),
             (&[0, 1, 0, 0, 0, 255, 1][..], Error::Length(255)),
         ] {
-            contract::check_decode(|| Frames, bad);
-            let mut stream = Stream::new(Frames);
+            contract::check_decode(Frames::<Frame>::new, bad);
+            let mut stream = Stream::new(Frames::<Frame>::new());
             assert_eq!(stream.push(bad), bad.len());
             assert_eq!(stream.next(), Some(Err(Fail::Protocol(error))));
             assert_eq!(stream.next(), None);
@@ -1326,7 +1333,7 @@ mod tests {
             (11, 17, Ok((3, Response::Registers(vec![1234])))),
         ];
         let make_requests = || {
-            Frames.map(|frame| {
+            Frames::<Frame>::new().map(|frame| {
                 let request = Request::parse(&frame.pdu);
                 (frame, request)
             })
@@ -1371,7 +1378,7 @@ mod tests {
             finish(&mut server, |_| panic!("unexpected request at EOF")).unwrap();
             assert_eq!(registers.get(2), Some(&1234));
             let mut client = Stream::new(
-                Frames.map(|frame| (frame.transaction, frame.unit, Response::parse(&frame.pdu))),
+                Frames::<Frame>::new().map(|frame| (frame.transaction, frame.unit, Response::parse(&frame.pdu))),
             );
             let mut got = Vec::new();
             for chunk in test_support::chunks(&output, sizes) {
@@ -1409,7 +1416,7 @@ mod tests {
         .to_bytes()
         .unwrap();
         let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
-        let mut d = Stream::new(Frames);
+        let mut d = Stream::new(Frames::<Frame>::new());
         // One byte at a time.
         let mut got = Vec::new();
         for byte in test_support::chunks(&stream, &[1]) {
@@ -1445,7 +1452,7 @@ mod tests {
             .take(one.len() * 200_000)
             .collect();
         let started = std::time::Instant::now();
-        let mut d = Stream::new(Frames);
+        let mut d = Stream::new(Frames::<Frame>::new());
         let mut rest = &stream[..];
         let mut n = 0;
         while !rest.is_empty() {
@@ -1468,9 +1475,9 @@ mod tests {
     fn stream_is_bounded() {
         // 64 KiB of zeros in one push: the decoder takes only what it may
         // hold, and the header it sees is already broken.
-        let mut d = Stream::new(Frames);
+        let mut d = Stream::new(Frames::<Frame>::new());
         let zeros = vec![0u8; 64 * 1024];
-        contract::check_decode_with_alloc_limit(|| Frames, &zeros, 2 * MAX_FRAME);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &zeros, 2 * MAX_FRAME);
         let took = d.push(&zeros);
         assert!(took <= MAX_FRAME);
         assert!(d.buffered() <= MAX_FRAME);
@@ -1491,12 +1498,12 @@ mod tests {
                 .unwrap(),
             );
         }
-        contract::check_decode_with_alloc_limit(|| Frames, &stream, 2 * MAX_FRAME);
-        let (frames, failure) = test_support::decode_all(|| Frames, &stream);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &stream, 2 * MAX_FRAME);
+        let (frames, failure) = test_support::decode_all(Frames::<Frame>::new, &stream);
         assert_eq!(failure, None);
         assert_eq!(frames.len(), 50);
         // A decoder that is full gives room back once frames are taken out.
-        let mut d = Stream::new(Frames);
+        let mut d = Stream::new(Frames::<Frame>::new());
         assert_eq!(d.push(&stream), MAX_FRAME);
         assert_eq!(d.push(&stream[MAX_FRAME..]), 0);
         assert!(d.next().unwrap().is_ok());

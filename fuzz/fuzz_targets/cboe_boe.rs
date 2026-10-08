@@ -2,8 +2,9 @@
 //! server and exchange driven by whatever inbound messages parse.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::cboe_boe::{
-    Action, ClientHeartbeat, Event, Exchange, ExchangeConfig, Inbound, LoginRequest, Messages,
+    Action, ClientHeartbeat, Event, Exchange, ExchangeConfig, Inbound, LoginRequest,
     NewOrder, OrderEvent, Outbound, Price, Server, Timers, UnitSequence,
 };
 use fictionet::stdlib::codec::{
@@ -23,8 +24,8 @@ fuzz_target!(|input: &[u8]| {
     check_wire::<Outbound>(data);
     check_wire::<NewOrder>(data);
     check_wire::<LoginRequest>(data);
-    check_decode(Messages::<Inbound>::default, data);
-    check_decode(Messages::<Outbound>::default, data);
+    check_decode(Frames::<Inbound>::default, data);
+    check_decode(Frames::<Outbound>::default, data);
 
     // A server logged in with no return fields; each piece split on 0xff
     // is one inbound message, and the byte after it steers the world.

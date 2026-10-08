@@ -2,10 +2,11 @@
 //! reads them, and values a world builds, as it writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::codec::{Wire, test_support::decode_all};
-use fictionet::stdlib::modbus::{Exception, Frame, Frames, MAX_PDU, Request, Response, function};
+use fictionet::stdlib::modbus::{Exception, Frame, MAX_PDU, Request, Response, function};
 use libfuzzer_sys::fuzz_target;
 
 /// A PDU read as a request and as a response. Whatever reads is written
@@ -98,10 +99,10 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    check_decode(|| Frames, data);
+    check_decode(Frames::<Frame>::new, data);
     check_wire::<Frame>(data);
 
-    let (frames, _) = decode_all(|| Frames, data);
+    let (frames, _) = decode_all(Frames::<Frame>::new, data);
     for frame in frames {
         check_wire_value(&frame);
         pdu(&frame.pdu);

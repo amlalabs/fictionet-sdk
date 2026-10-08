@@ -20,7 +20,7 @@
 //! AVPs included, down to [`MAX_DEPTH`] levels.
 //!
 //! A world that plays a Diameter server pushes connection bytes into a
-//! [`Stream<Messages>`](fictionet::stdlib::codec::Stream), gets [`Message`]s back,
+//! [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream), gets [`Message`]s back,
 //! and writes each answer's bytes to the connection. Which applications,
 //! subscribers and sessions exist is up to world code.
 //!
@@ -29,8 +29,9 @@
 //! with.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::diameter::{avp, command, result, Avp, Identity, Message, Messages, Value};
+//! use fictionet::stdlib::diameter::{avp, command, result, Avp, Identity, Message, Value};
 //!
 //! /// Answers a Device-Watchdog-Request, as the HSS of a pretend network.
 //! fn answer(request: &Message, host: &Identity, realm: &Identity) -> Option<Message> {
@@ -56,7 +57,7 @@
 //! // The header, then AVPs of 8 + 15 and 8 + 11 bytes, padded to 24 and 20.
 //! assert_eq!(bytes.len(), 20 + 24 + 20);
 //!
-//! let mut decoder = Stream::new(Messages::new());
+//! let mut decoder = Stream::new(Frames::<Message>::new());
 //! assert_eq!(decoder.push(&bytes), bytes.len());
 //! let got = decoder.next().unwrap().unwrap().unwrap();
 //! assert_eq!(got, dwr);
@@ -67,11 +68,14 @@
 //! assert_eq!(back.avp(avp::RESULT_CODE).and_then(Avp::as_u32), Some(result::SUCCESS));
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::pad_to_4 as padded;
 use fictionet::stdlib::codec::{be24, be32};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Wire};
 
 /// The port Diameter peers listen on, over TCP or SCTP.
 pub const PORT: u16 = 3868;
@@ -88,7 +92,7 @@ pub const VENDOR_AVP_HEADER_LEN: usize = 12;
 /// The longest message: the largest multiple of 4 the 24-bit length field
 /// can hold.
 pub const MAX_MESSAGE: usize = 0x00ff_fffc;
-/// The largest message accepted by [`Messages::new`].
+/// The largest message accepted by [`codec::Frames<Message>::new`](fictionet::stdlib::codec::Frames::new).
 pub const DEFAULT_LIMIT: usize = 65_536;
 /// The most data one AVP with a vendor ID can carry in a message. One
 /// without a vendor ID can carry 4 bytes more. Writers refuse data that
@@ -354,7 +358,7 @@ pub fn command_name(code: u32) -> Option<&'static str> {
 }
 
 /// Why a message's header cannot frame it: the faults that end a
-/// [`Messages`] stream, its [`Decode::Error`]. [`Message::parse`] reports
+/// [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) stream, its [`fictionet::stdlib::codec::Decode::Error`]. [`Message::parse`] reports
 /// them as [`Error::Frame`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FrameError {
@@ -674,7 +678,7 @@ impl Wire for Message {
 
 /// A framed message whose AVPs could not be read.
 ///
-/// [`Messages`] consumes the complete message and returns this as an item,
+/// [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) consumes the complete message and returns this as an item,
 /// so the caller can answer using the header and then read the next message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvpFault {
@@ -699,18 +703,19 @@ impl core::error::Error for AvpFault {
 /// Reads Diameter messages without retaining input.
 ///
 /// Use with [`fictionet::stdlib::codec::Stream`] for bounded buffering. The first four
-/// bytes suffice to refuse a message above [`limit`](Self::limit). Partial
-/// messages return [`Step::Need`], including at EOF. The driver reports
+/// bytes suffice to refuse a message above [`limit`](fictionet::stdlib::codec::Frames::limit). Partial
+/// messages return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The driver reports
 /// truncation and reports header errors once. Only a [`FrameError`] ends
 /// the stream. AVP errors
 /// yield [`AvpFault`] items with the header and no AVPs, then decoding
 /// continues at the next message. Use that header to construct an answer.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, diameter::{command, Message, Messages}};
+/// use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
+/// use fictionet::stdlib::diameter::{command, Message};
 /// let message = Message::request(command::DEVICE_WATCHDOG, 0, 7, 9);
 /// let bytes = Wire::to_bytes(&message)?;
-/// let mut stream = Stream::new(Messages::new());
+/// let mut stream = Stream::new(Frames::<Message>::new());
 /// let mut messages = Vec::new();
 /// for chunk in bytes.chunks(3) {
 ///     pump(&mut stream, chunk, |item| messages.push(item))?;
@@ -719,58 +724,39 @@ impl core::error::Error for AvpFault {
 /// assert_eq!(messages, vec![Ok(message)]);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Messages {
-    limit: usize,
-}
-
-impl Messages {
-    /// Creates a decoder with [`DEFAULT_LIMIT`] as its message limit.
-    pub fn new() -> Self {
-        Self::with_limit(DEFAULT_LIMIT)
-    }
-
-    /// Sets the whole-message limit, clamped to [`HEADER_LEN`] through [`MAX_MESSAGE`].
-    pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.clamp(HEADER_LEN, MAX_MESSAGE) }
-    }
-
-    /// The largest accepted message, including its header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Messages {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Messages {
+impl Prefixed for Message {
     type Item = Result<Message, AvpFault>;
     type Error = FrameError;
+    type Limit = usize;
     const NAME: &'static str = "Diameter";
 
-    fn capacity(&self) -> usize {
-        self.limit
-    }
+    #[inline]
+    fn default_limit() -> Self::Limit { DEFAULT_LIMIT }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, FrameError> {
-        let Some(used) = Message::frame_length(input, self.limit)? else {
-            return Ok(Step::Need);
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(HEADER_LEN, MAX_MESSAGE) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize { *limit }
+
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        let Some(used) = Message::frame_length(input, limit)? else {
+            return Ok(None);
         };
         let Some(body) = input.get(HEADER_LEN..used) else {
-            return Ok(Step::Need);
+            return Ok(None);
         };
-        let Some(header) = Message::header(input) else { return Ok(Step::Need); };
+        let Some(header) = Message::header(input) else { return Ok(None); };
         let message = match Avp::parse_list(body) {
             Ok(avps) => Ok(Message { avps, ..header }),
             Err(error) => Err(AvpFault { header, error }),
         };
-        Ok(Step::Item(message, used))
+        Ok(Some((message, used)))
     }
 }
+
 
 /// Checks the count and padded byte length before a list is copied.
 fn list_length(avps: &[Avp], limit: usize) -> Result<usize, Error> {
@@ -1497,6 +1483,7 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, contract,
@@ -1787,8 +1774,8 @@ mod tests {
         assert_eq!(Message::parse(&with(0, 0)), Err(Error::Frame(FrameError::Version(0))));
         assert_eq!(Message::parse(&[1, 0, 0, 16]), Err(Error::Frame(FrameError::MessageLength(16))));
         assert_eq!(Message::parse(&[1, 0, 0, 22]), Err(Error::Frame(FrameError::MessageLength(22))));
-        assert_eq!(Messages::with_limit(64).decode(&[1, 0, 0, 0x44], false), Err(FrameError::TooBig(0x44)));
-        assert_eq!(Messages::with_limit(64).decode(&ok, false), Ok(Step::Item(Ok(dwr()), 64)));
+        assert_eq!(Frames::<Message>::with_limit(64).decode(&[1, 0, 0, 0x44], false), Err(FrameError::TooBig(0x44)));
+        assert_eq!(Frames::<Message>::with_limit(64).decode(&ok, false), Ok(Step::Item(Ok(dwr()), 64)));
         // An AVP length shorter than its header.
         assert_eq!(Message::parse(&with(27, 7)), Err(Error::AvpLength { code: 264, length: 7 }));
         // A vendor flag on an AVP too short to hold the vendor ID.
@@ -1880,25 +1867,25 @@ mod tests {
         let mut second = dwr().answer();
         second.avps.push(Avp::new(avp::RESULT_CODE, &Value::Unsigned32(2001)).unwrap());
         let data = [dwr_bytes(), second.to_bytes().unwrap()].concat();
-        contract::check_decode_with_alloc_limit(Messages::new, &data, 2 * DEFAULT_LIMIT);
-        assert_eq!(decode_all(Messages::new, &data), (vec![Ok(dwr()), Ok(second)], None));
-        assert_eq!(decode_all(Messages::new, &[2, 0, 0, 20]).1, Some(Fail::Protocol(FrameError::Version(2))));
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &data, 2 * DEFAULT_LIMIT);
+        assert_eq!(decode_all(Frames::<Message>::new, &data), (vec![Ok(dwr()), Ok(second)], None));
+        assert_eq!(decode_all(Frames::<Message>::new, &[2, 0, 0, 20]).1, Some(Fail::Protocol(FrameError::Version(2))));
     }
 
     #[test]
     fn stream_limit() {
-        let mut d = Stream::new(Messages::with_limit(63));
+        let mut d = Stream::new(Frames::<Message>::with_limit(63));
         assert_eq!(d.push(&dwr_bytes()[..4]), 4);
         assert_eq!(d.next(), Some(Err(Fail::Protocol(FrameError::TooBig(64)))));
-        let mut d = Stream::new(Messages::with_limit(64));
+        let mut d = Stream::new(Frames::<Message>::with_limit(64));
         assert_eq!(d.push(&dwr_bytes()), 64);
         assert_eq!(d.next(), Some(Ok(Ok(dwr()))));
         // A tiny limit is raised to the header length.
-        let mut d = Stream::new(Messages::with_limit(0));
+        let mut d = Stream::new(Frames::<Message>::with_limit(0));
         assert_eq!(d.push(&[1, 0, 0, 20, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 20);
         assert!(matches!(d.next(), Some(Ok(_))));
         // The default limit.
-        let mut d = Stream::new(Messages::new());
+        let mut d = Stream::new(Frames::<Message>::new());
         let big = (DEFAULT_LIMIT + 4) as u32;
         assert_eq!(d.push(&[1, (big >> 16) as u8, (big >> 8) as u8, big as u8]), 4);
         assert_eq!(d.next(), Some(Err(Fail::Protocol(FrameError::TooBig(big)))));
@@ -1908,7 +1895,7 @@ mod tests {
     fn stream_takes_many_small_messages_in_linear_time() {
         let data = Message::request(command::DEVICE_WATCHDOG, 0, 1, 1).to_bytes().unwrap().repeat(200_000);
         let started = std::time::Instant::now();
-        let (messages, error) = decode_all(Messages::new, &data);
+        let (messages, error) = decode_all(Frames::<Message>::new, &data);
         assert_eq!(error, None);
         assert_eq!(messages.len(), 200_000);
         assert!(messages.iter().all(Result::is_ok));
@@ -1993,9 +1980,9 @@ mod tests {
     #[test]
     fn stream_holds_at_most_its_limit() {
         let data = dwr_bytes().repeat(100);
-        contract::check_decode_with_alloc_limit(|| Messages::with_limit(64), &data, 128);
-        assert_eq!(decode_all(|| Messages::with_limit(64), &data), (vec![Ok(dwr()); 100], None));
-        let mut stream = Stream::new(Messages::with_limit(64));
+        contract::check_decode_with_alloc_limit(|| Frames::<Message>::with_limit(64), &data, 128);
+        assert_eq!(decode_all(|| Frames::<Message>::with_limit(64), &data), (vec![Ok(dwr()); 100], None));
+        let mut stream = Stream::new(Frames::<Message>::with_limit(64));
         assert_eq!(stream.push(&data), 64);
         assert_eq!(stream.push(&data), 0);
         assert_eq!(stream.next(), Some(Ok(Ok(dwr()))));
@@ -2038,7 +2025,7 @@ mod tests {
         assert!(set.contains(&m));
         let formats: std::collections::HashSet<Format> = [Format::Grouped, Format::Time].into();
         assert_eq!(formats.len(), 2);
-        let d = Stream::new(Messages::new());
+        let d = Stream::new(Frames::<Message>::new());
         assert_eq!(d.buffered(), 0);
     }
 
@@ -2186,7 +2173,7 @@ mod tests {
         let mut data = dwr_bytes();
         data[27] = 7;
         data.extend_from_slice(&dwr_bytes());
-        let (messages, error) = decode_all(Messages::new, &data);
+        let (messages, error) = decode_all(Frames::<Message>::new, &data);
         assert_eq!(error, None);
         let malformed = messages[0].as_ref().unwrap_err();
         assert_eq!(malformed.error, Error::AvpLength { code: avp::ORIGIN_HOST, length: 7 });
@@ -2194,7 +2181,7 @@ mod tests {
         let reply = malformed.header.answer();
         assert_eq!((reply.hop_by_hop, reply.end_to_end), (0x1234_5678, 0x9abc_def0));
         assert_eq!(messages[1], Ok(dwr()));
-        contract::check_decode_with_alloc_limit(Messages::new, &data, 2 * DEFAULT_LIMIT);
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &data, 2 * DEFAULT_LIMIT);
     }
 
     const FORMATS: [Format; 14] = [
@@ -2272,14 +2259,14 @@ mod tests {
 
     /// Exercises framing, semantic checks, and every named wire unit.
     fn exercise(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Messages::new, data, 2 * DEFAULT_LIMIT);
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * DEFAULT_LIMIT);
         contract::check_wire::<Message>(data);
         contract::check_wire::<Avp>(data);
         contract::check_wire::<Address>(data);
         if let Ok(address) = Address::parse(data) {
             assert_eq!(address.to_bytes().unwrap(), data);
         }
-        for message in decode_all(Messages::new, data).0.into_iter().flatten() {
+        for message in decode_all(Frames::<Message>::new, data).0.into_iter().flatten() {
             contract::check_wire_value(&message);
             let _ = check(&message.avps, base);
             let _ = check(&message.avps, |_, _| Some(Format::Grouped));
@@ -2334,7 +2321,7 @@ mod tests {
                 _ => {
                     let ms: Vec<Message> = (0..1 + r.index(3)).map(|_| random_message(&mut r)).collect();
                     let d: Vec<u8> = ms.iter().flat_map(|m| m.to_bytes().unwrap()).collect();
-                    assert_eq!(decode_all(Messages::new, &d), (ms.into_iter().map(Ok).collect(), None));
+                    assert_eq!(decode_all(Frames::<Message>::new, &d), (ms.into_iter().map(Ok).collect(), None));
                     d
                 }
             };

@@ -13,7 +13,7 @@
 //! follows the Microsoft [MS-TDS] specification for TDS 7.2 to 7.4.
 //!
 //! Nothing here reads a socket. A world reads packets with
-//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream), or uses [`Messages`] in that
+//! [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), or uses [`Messages`] in that
 //! driver to assemble packets through EOM. It reads message data as
 //! [`Prelogin`], [`Login7`], or [`SqlBatch`]. It answers with [`Prelogin`]
 //! or a [`TokenStream`]. World code decides which users, databases, and
@@ -64,6 +64,9 @@
 //! assert_eq!(TokenStream::parse(&message.data), Ok(reply));
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{be16, le16, le32, le64, Decode, Step, Wire, Reader, Truncated, Trailing};
 
 /// The TCP port SQL Server listens on.
@@ -402,7 +405,7 @@ pub mod data_type {
 }
 
 // ---------------------------------------------------------------------
-// Packets and messages.
+// fictionet::stdlib::codec::Frames::<Packet> and messages.
 // ---------------------------------------------------------------------
 
 /// One packet: its header's fields and the data it carries. The length is
@@ -487,55 +490,32 @@ impl Wire for Packet {
 /// Reads individual TDS packets without holding input bytes.
 ///
 /// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
-/// by [`limit`](Self::limit), including the header. Oversized packets are
+/// by [`limit`](fictionet::stdlib::codec::Frames::limit), including the header. Oversized packets are
 /// refused from the first four bytes. Partial packets return [`Step::Need`],
 /// including at EOF, so the stream reports truncation. Message assembly
 /// and status handling remain in [`Messages`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Packets {
-    limit: usize,
-}
-
-impl Packets {
-    /// Reads packets up to [`MAX_PACKET`] bytes, header included.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_PACKET)
-    }
-
-    /// Sets the packet limit, including the header. Clamps it to
-    /// [`HEADER_LEN`] through [`MAX_PACKET`].
-    pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.clamp(HEADER_LEN, MAX_PACKET) }
-    }
-
-    /// The maximum packet size, including its header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Packets {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Packets {
+impl Prefixed for Packet {
     type Item = Packet;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "TDS";
 
-    fn capacity(&self) -> usize {
-        self.limit
-    }
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_PACKET }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
-        Ok(match Packet::parse_prefix(input, self.limit)? {
-            Some((packet, used)) => Step::Item(packet, used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(HEADER_LEN, MAX_PACKET) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize { *limit }
+
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        Packet::parse_prefix(input, limit)
     }
 }
+
 
 /// One whole message: the data of all its packets, joined.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -722,7 +702,7 @@ pub enum Error {
     },
     /// A message or packet exceeds its size limit. For [`Messages`],
     /// this is the assembled data length, including the packet that broke
-    /// the limit. For [`Packets`], it includes one packet's header.
+    /// the limit. For [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames), it includes one packet's header.
     TooLong(usize),
     /// The last packet did not carry EOM before EOF.
     Incomplete,
@@ -3693,7 +3673,7 @@ mod tests {
         assert_eq!(first.to_bytes().unwrap(), bytes[..512]);
         for n in 0..512 {
             assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Truncated));
-            assert_eq!(Packets::new().decode(&bytes[..n], false), Ok(Step::Need));
+            assert_eq!(Frames::<Packet>::new().decode(&bytes[..n], false), Ok(Step::Need));
         }
         contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_PACKET);
         assert_eq!(one_message(&bytes), m);
@@ -5043,7 +5023,7 @@ mod tests {
                 }
             }
             contract::check_decode_with_alloc_limit(|| Messages::with_limit(64), &stream, 2 * (64 + HEADER_LEN));
-            contract::check_decode_with_alloc_limit(|| Packets::with_limit(64), &stream, 128);
+            contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), &stream, 128);
             for message in decode_all(|| Messages::with_limit(64), &stream).0 {
                 assert!(message.to_bytes().is_ok(), "{message:?}");
                 contract::check_wire_value(&message);

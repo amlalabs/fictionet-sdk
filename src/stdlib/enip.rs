@@ -13,7 +13,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a device pushes the
 //! bytes it reads from a [`tcp`](fictionet::stdlib::tcp) connection to a
-//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
+//! [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
 //! checks each one with [`Packet::check`], reads its command, and for the
 //! data commands reads the [`SendData`] envelope, its [`Cpf`] items and
 //! the [`MessageRequest`] inside. It writes replies with the same types,
@@ -70,7 +70,10 @@
 //! assert_eq!(request.path[0], PathSegment::Class(1));
 //! ```
 
-use fictionet::stdlib::codec::{le16, le32, Decode, Step, Wire};
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{le16, le32, Wire};
 use core::convert::Infallible;
 
 /// The TCP port EtherNet/IP devices listen on.
@@ -86,7 +89,7 @@ pub const MAX_PACKET: usize = u16::MAX as usize;
 /// the header, 65511 bytes. The length field can name more; a packet that
 /// does fails [`Packet::check`].
 pub const MAX_DATA: usize = MAX_PACKET - HEADER_LEN;
-/// The input capacity of [`Packets`]: 65559 bytes, including the header
+/// The input capacity of [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames): 65559 bytes, including the header
 /// and every data length the 16-bit length field can name.
 /// This exceeds [`MAX_PACKET`] so framing can consume an oversized packet.
 /// [`Packet::check`] then reports the protocol length error.
@@ -309,37 +312,31 @@ impl Wire for Packet {
 /// Use [`Packet::check`] to decide whether to act on each packet.
 /// [`Stream::new`](fictionet::stdlib::codec::Stream::new) holds at most [`PACKETS_CAPACITY`]
 /// bytes (65559), including room for lengths above [`MAX_DATA`].
-/// Partial packets return [`Step::Need`], including at EOF, when the stream
+/// Partial packets return [`fictionet::stdlib::codec::Step::Need`], including at EOF, when the stream
 /// reports truncation.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Packets;
-
-impl Packets {
-    /// Creates a packet decoder with capacity [`PACKETS_CAPACITY`] (65559 bytes).
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Decode for Packets {
+impl Prefixed for Packet {
     type Item = Packet;
     type Error = Infallible;
+    type Limit = ();
     const NAME: &'static str = "EtherNet/IP";
 
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         PACKETS_CAPACITY
     }
 
-    /// Reads a packet prefix, returning [`Step::Need`] while incomplete.
+    /// Reads a packet prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.
     /// Accepts all header fields and never returns an error. Use
     /// [`Packet::check`] for protocol limits and options.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Infallible> {
-        Ok(match Packet::parse_prefix(input) {
-            Some((packet, used)) => Step::Item(packet, used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        Ok(Packet::parse_prefix(input))
     }
 }
+
 
 /// Why bytes do not form the structure a reader named, or why a value
 /// cannot be written. A writer returns one of these rather than write
@@ -1750,9 +1747,9 @@ mod tests {
         };
         let mut stream = a.to_bytes().unwrap();
         stream.extend_from_slice(&b.to_bytes().unwrap());
-        let mut d = Stream::new(Packets::new());
+        let mut d = Stream::new(Frames::<Packet>::new());
         let mut got = Vec::new();
-        contract::check_decode(Packets::new, &stream);
+        contract::check_decode(Frames::<Packet>::new, &stream);
         pump(&mut d, &stream, |packet| got.push(packet)).unwrap();
         assert_eq!(got, vec![a, b]);
         assert_eq!(d.buffered(), 0);
@@ -1777,7 +1774,7 @@ mod tests {
             .take(one.len() * 200_000)
             .collect();
         let started = std::time::Instant::now();
-        let mut d = Stream::new(Packets::new());
+        let mut d = Stream::new(Frames::<Packet>::new());
         let mut n = 0;
         pump(&mut d, &stream, |_| n += 1).unwrap();
         assert_eq!(n, 200_000);
@@ -2117,7 +2114,7 @@ mod tests {
             .cycle()
             .take(one.len() * 500_000)
             .collect();
-        let mut d = Stream::new(Packets::new());
+        let mut d = Stream::new(Frames::<Packet>::new());
         assert_eq!(d.push(&stream), PACKETS_CAPACITY);
         assert_eq!(d.buffered(), PACKETS_CAPACITY);
         // Full, it takes nothing more until packets are taken out.
@@ -2134,7 +2131,7 @@ mod tests {
         let mut big = vec![0u8; HEADER_LEN];
         big[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
         big.resize(PACKETS_CAPACITY, 0);
-        contract::check_decode_with_alloc_limit(Packets::new, &big, 2 * PACKETS_CAPACITY);
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &big, 2 * PACKETS_CAPACITY);
         assert_eq!(d.push(&big), PACKETS_CAPACITY);
         let p = d.next().unwrap().unwrap();
         assert_eq!(p.data.len(), u16::MAX as usize);
@@ -2948,11 +2945,11 @@ mod tests {
     /// Checks stream contracts, packet validation and nested CIP values.
     fn check(data: &[u8]) {
         assert_eq!(
-            Stream::new(Packets).push(data),
+            Stream::new(Frames::<Packet>::new()).push(data),
             data.len().min(PACKETS_CAPACITY)
         );
-        contract::check_decode(Packets::new, data);
-        let (packets, _) = decode_all(Packets::new, data);
+        contract::check_decode(Frames::<Packet>::new, data);
+        let (packets, _) = decode_all(Frames::<Packet>::new, data);
         for p in &packets {
             contract::check_wire_value(p);
             assert_eq!(p.check().is_ok(), p.to_bytes().is_ok());

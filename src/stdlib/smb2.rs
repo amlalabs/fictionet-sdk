@@ -14,7 +14,7 @@
 //! specification, sections 2.1 and 2.2.
 //!
 //! A world that plays a file server pushes connection bytes into a
-//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets the payload of
+//! [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream), gets the payload of
 //! each transport frame back, reads it as a [`Packet`], reads each
 //! [`Message`]'s [`Request`], and writes the bytes of its replies back to
 //! the connection. Which dialects, users, shares and files exist, and what
@@ -32,10 +32,11 @@
 //! refuse or read back as something else.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //! use fictionet::stdlib::smb2::{
-//!     Frames, Frame, Header, Message, NegotiateRequest, NegotiateResponse, Packet, Request, Response,
-//!     command, dialect, status,
+//!     Frame, Header, Message, NegotiateRequest, NegotiateResponse, Packet, Request, Response, command,
+//!     dialect, status,
 //! };
 //!
 //! // A client offers SMB 2.1 and SMB 3.0.2.
@@ -47,7 +48,7 @@
 //! let bytes = Frame::from_packet(&Packet::Smb2(vec![hello])).unwrap().to_bytes().unwrap();
 //!
 //! // The world reads it, in two pieces.
-//! let mut decoder = Stream::new(Frames::new());
+//! let mut decoder = Stream::new(Frames::<Frame>::new());
 //! assert_eq!(decoder.push(&bytes[..10]), 10);
 //! assert_eq!(decoder.next(), None);
 //! assert_eq!(decoder.push(&bytes[10..]), bytes.len() - 10);
@@ -69,6 +70,7 @@
 //! assert_eq!(out[..8], [0, 0, 0, 129, 0xfe, b'S', b'M', b'B']);
 //! ```
 
+use fictionet::stdlib::codec::{Prefixed, Frames};
 use fictionet::stdlib::codec::{le16, le32, le64, Decode, Step, Wire};
 
 /// The TCP port SMB servers listen on for direct TCP.
@@ -467,7 +469,7 @@ impl Wire for Frame {
     /// Reads one direct TCP frame. Refuses nonzero types, excessive lengths,
     /// incomplete frames, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        match Frames::new().decode(bytes, false)? {
+        match Frames::<Frame>::new().decode(bytes, false)? {
             Step::Item(frame, used) if used == bytes.len() => Ok(frame),
             Step::Item(_, used) => Err(Error::Trailing { remaining: bytes.len() - used }),
             _ => Err(Error::Incomplete),
@@ -490,76 +492,56 @@ impl Wire for Frame {
 /// Reads direct TCP frames without retaining input.
 ///
 /// Use with [`fictionet::stdlib::codec::Stream`] for a buffer bounded by the four-byte
-/// header plus [`limit`](Self::limit), at most [`MAX_FRAME`]. The header
+/// header plus [`limit`](fictionet::stdlib::codec::Frames::limit), at most [`MAX_FRAME`]. The header
 /// suffices to refuse a payload above the configured limit.
 /// Partial frames return [`Step::Need`], including at EOF, so the driver
 /// reports truncation. An invalid type or excessive length ends the stream.
 /// Map items through [`Packet::parse`] to receive payload errors as items.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Decode, Stream, Wire}, smb2::{Frame, Frames, Packet}};
+/// use fictionet::stdlib::codec::{Frames, Decode, Stream, Wire};
+/// use fictionet::stdlib::smb2::{Frame, Packet};
 /// let bytes = Wire::to_bytes(&Frame { payload: b"\xffSMBhello".to_vec() })?;
-/// let mut stream = Stream::new(Frames::new().map(|f| Packet::parse(&f.payload)));
+/// let mut stream = Stream::new(Frames::<Frame>::new().map(|f| Packet::parse(&f.payload)));
 /// assert_eq!(stream.push(&bytes), bytes.len());
 /// assert!(matches!(stream.next(), Some(Ok(Ok(Packet::Smb1(_))))));
 /// # Ok::<(), fictionet::stdlib::smb2::Error>(())
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frames {
-    limit: usize,
-}
-
-impl Frames {
-    /// Creates a decoder accepting payloads up to [`MAX_MESSAGE`] bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_MESSAGE)
-    }
-
-    /// Sets the payload limit, clamped to [`MAX_MESSAGE`]. Zero permits empty frames.
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_MESSAGE),
-        }
-    }
-
-    /// The largest accepted payload, excluding its four-byte transport header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Frames {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Frames {
+impl Prefixed for Frame {
     type Item = Frame;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "SMB direct TCP";
 
-    fn capacity(&self) -> usize {
-        FRAME_HEADER_LEN.saturating_add(self.limit)
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_MESSAGE }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_MESSAGE) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        FRAME_HEADER_LEN.saturating_add(limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        let Some(&first) = input.first() else { return Ok(Step::Need) };
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        let Some(&first) = input.first() else { return Ok(None) };
         if first != 0 {
             return Err(Error::FrameType(first));
         }
-        let Some(&[_, a, b, c]) = input.get(..FRAME_HEADER_LEN) else { return Ok(Step::Need) };
+        let Some(&[_, a, b, c]) = input.get(..FRAME_HEADER_LEN) else { return Ok(None) };
         let length = (usize::from(a) << 16) | (usize::from(b) << 8) | usize::from(c);
-        if length > self.limit {
-            return Err(Error::Length { length, limit: self.limit });
+        if length > limit {
+            return Err(Error::Length { length, limit });
         }
         let end = FRAME_HEADER_LEN + length;
-        Ok(match input.get(FRAME_HEADER_LEN..end) {
-            Some(payload) => Step::Item(Frame { payload: payload.to_vec() }, end),
-            None => Step::Need,
-        })
+        Ok(input.get(FRAME_HEADER_LEN..end).map(|payload| (Frame { payload: payload.to_vec() }, end)))
     }
 }
+
 
 // ---------------------------------------------------------------------
 // Payloads
@@ -3023,7 +3005,7 @@ mod tests {
         });
         let hello = Message::from_request(Header::new(command::NEGOTIATE, 0), &negotiate).unwrap();
         let bytes = Packet::Smb2(vec![hello]).to_bytes().and_then(|payload| Frame { payload }.to_bytes()).unwrap();
-        let mut decoder = Stream::new(Frames::new());
+        let mut decoder = Stream::new(Frames::<Frame>::new());
         assert_eq!(decoder.push(&bytes[..10]), 10);
         assert_eq!(decoder.next(), None);
         assert_eq!(decoder.push(&bytes[10..]), bytes.len() - 10);
@@ -3727,16 +3709,16 @@ mod tests {
         let second = Packet::Smb2(vec![Request::Echo.message(7).unwrap()]);
         let bytes = [Frame::from_packet(&first).unwrap().to_bytes().unwrap(),
             Frame::from_packet(&second).unwrap().to_bytes().unwrap()].concat();
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_FRAME);
-        let (frames, error) = decode_all(Frames::new, &bytes);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
+        let (frames, error) = decode_all(Frames::<Frame>::new, &bytes);
         assert_eq!(error, None);
         assert_eq!(frames.iter().map(|f| Packet::parse(&f.payload).unwrap()).collect::<Vec<_>>(), [first, second]);
-        assert_eq!(decode_all(Frames::new, &[0x81, 0, 0, 0]).1, Some(Fail::Protocol(Error::FrameType(0x81))));
+        assert_eq!(decode_all(Frames::<Frame>::new, &[0x81, 0, 0, 0]).1, Some(Fail::Protocol(Error::FrameType(0x81))));
     }
 
     #[test]
     fn stream_holds_at_most_max_buffered() {
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         let big = Frame { payload: vec![1; MAX_MESSAGE] }.to_bytes().unwrap();
         let stream: Vec<u8> = big.iter().chain(&big).copied().collect();
         assert_eq!(d.push(&stream), MAX_FRAME);
@@ -3751,7 +3733,7 @@ mod tests {
     fn stream_takes_many_small_frames_in_linear_time() {
         let bytes = Frame { payload: b"\xffSMB".to_vec() }.to_bytes().unwrap().repeat(200_000);
         let started = std::time::Instant::now();
-        let (frames, error) = decode_all(Frames::new, &bytes);
+        let (frames, error) = decode_all(Frames::<Frame>::new, &bytes);
         assert_eq!(frames.len(), 200_000);
         assert_eq!(error, None);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
@@ -4574,8 +4556,8 @@ mod tests {
                 Frame { payload: corpus[rng.index(corpus.len())].clone() }.write(&mut stream).unwrap();
             }
             mutate(&mut rng, &mut stream);
-            contract::check_decode_with_alloc_limit(Frames::new, &stream, 2 * MAX_FRAME);
-            for frame in decode_all(Frames::new, &stream).0 {
+            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &stream, 2 * MAX_FRAME);
+            for frame in decode_all(Frames::<Frame>::new, &stream).0 {
                 read_everything(&frame.payload, status);
             }
         }

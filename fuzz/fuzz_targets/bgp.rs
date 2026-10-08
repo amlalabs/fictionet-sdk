@@ -3,12 +3,42 @@
 //! way world code builds them.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::bgp::{
-    Attribute, Context, Error, Frame, Frames, MAX_BODY_LEN, Message, MpReach,
-    Nlri, Open, Origin, Prefix, Segment, SegmentKind, Update, afi, kind, safi,
-};
+use fictionet::stdlib::bgp::Attribute;
+
+use fictionet::stdlib::bgp::Context;
+
+use fictionet::stdlib::bgp::Error;
+
+use fictionet::stdlib::bgp::Frame;
+
+use fictionet::stdlib::bgp::MAX_BODY_LEN;
+
+use fictionet::stdlib::bgp::Message;
+
+use fictionet::stdlib::bgp::MpReach;
+
+use fictionet::stdlib::bgp::Nlri;
+
+use fictionet::stdlib::bgp::Open;
+
+use fictionet::stdlib::bgp::Origin;
+
+use fictionet::stdlib::bgp::Prefix;
+
+use fictionet::stdlib::bgp::Segment;
+
+use fictionet::stdlib::bgp::SegmentKind;
+
+use fictionet::stdlib::bgp::Update;
+
+use fictionet::stdlib::bgp::afi;
+
+use fictionet::stdlib::bgp::kind;
+
+use fictionet::stdlib::bgp::safi;
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use libfuzzer_sys::fuzz_target;
 
@@ -79,17 +109,17 @@ fn update_from(data: &[u8]) -> Update {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(|| Frames, data, 2 * Frames.capacity());
+    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * Frames::<Frame>::new().capacity());
     contract::check_wire::<Frame>(data);
     contract::check_wire::<Open>(data);
-    contract::check_decode_with_alloc_limit(|| Frames.map(|frame| Message::decode(&frame, &Context::default())), data, 2 * Frames.capacity());
+    contract::check_decode_with_alloc_limit(|| Frames::<Frame>::new().map(|frame| Message::decode(&frame, &Context::default())), data, 2 * Frames::<Frame>::new().capacity());
     let built = Frame {
         kind: data.first().copied().unwrap_or(0),
         body: data.iter().take(MAX_BODY_LEN + 1).copied().collect(),
     };
     contract::check_wire_value(&built);
 
-    let frames = decode_all(|| Frames, data).0;
+    let frames = decode_all(Frames::<Frame>::new, data).0;
 
     // Any bytes as the body of each message type, too.
     let bodies = (1..=6).map(|kind| Frame { kind, body: data.to_vec() });

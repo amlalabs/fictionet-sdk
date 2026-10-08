@@ -1,8 +1,10 @@
 //! BACnet wire units and their codec contracts.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
+
 use fictionet::stdlib::bacnet::*;
-use fictionet::stdlib::codec::{Decode, Wire, contract};
+use fictionet::stdlib::codec::{ Wire, contract};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -20,8 +22,8 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Bvlc>(data);
     contract::check_wire::<Npdu>(data);
     contract::check_wire::<Apdu>(data);
-    contract::check_decode_with_alloc_limit(|| Tags, data, 2 * Tags.capacity());
-    contract::check_decode_with_alloc_limit(|| Values, data, 2 * Values.capacity());
+    contract::check_decode_with_alloc_limit(Frames::<Tag>::new, data, 2 * Frames::<Tag>::new().capacity());
+    contract::check_decode_with_alloc_limit(Frames::<Value>::new, data, 2 * Frames::<Value>::new().capacity());
     let _ = ContextValue::<9>::read(data, data.first().copied().unwrap_or(0));
     contract::check_wire::<Tag>(data);
     contract::check_wire::<Value>(data);

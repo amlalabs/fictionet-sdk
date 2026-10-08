@@ -1,5 +1,6 @@
 //! Streaming RPC and authentication framers through the shared driver.
 
+use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
     Decode, Fail, Lcg, Step, Stream, Wire, contract, finish,
@@ -135,8 +136,8 @@ fn dcerpc_chunked_round_trip() {
     response.drep = dcerpc::DataRep::BIG_ENDIAN;
     let values = [request, response, dcerpc::Pdu::new(9, dcerpc::Body::Shutdown)];
     let expected = values.iter().cloned().map(Ok).collect::<Vec<_>>();
-    round_trip(|| dcerpc::Pdus::with_limit(80), &values, &expected);
-    truncations(dcerpc::Pdus::new, &Wire::to_bytes(&values[0]).unwrap());
+    round_trip(|| Frames::<dcerpc::Pdu>::with_limit(80), &values, &expected);
+    truncations(Frames::<dcerpc::Pdu>::new, &Wire::to_bytes(&values[0]).unwrap());
 }
 
 #[test]
@@ -149,8 +150,8 @@ fn dcerpc_body_errors_are_items_and_raw_spans_survive() {
     let mut bytes = bad_type.clone();
     bytes.extend_from_slice(&short_body);
     good.write(&mut bytes).unwrap();
-    contract::check_decode_with_alloc_limit(dcerpc::Pdus::new, &bytes, 2 * dcerpc::Pdus::new().capacity());
-    let mut stream = Stream::new(dcerpc::Pdus::new());
+    contract::check_decode_with_alloc_limit(Frames::<dcerpc::Pdu>::new, &bytes, 2 * Frames::<dcerpc::Pdu>::new().capacity());
+    let mut stream = Stream::new(Frames::<dcerpc::Pdu>::new());
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(
         stream.with_next(|item, raw, span| {
@@ -170,7 +171,7 @@ fn dcerpc_body_errors_are_items_and_raw_spans_survive() {
 fn dcerpc_header_errors_and_limits_end_the_stream() {
     let bytes = Wire::to_bytes(&rpc_request()).unwrap();
     terminal(
-        || dcerpc::Pdus::with_limit(24),
+        || Frames::<dcerpc::Pdu>::with_limit(24),
         &bytes[..10],
         dcerpc::Error::TooLong { length: bytes.len(), limit: 24 },
     );
@@ -179,12 +180,12 @@ fn dcerpc_header_errors_and_limits_end_the_stream() {
         (vec![5, 0, 0, 0, 0x20], dcerpc::Error::IntegerRep(2)),
         (vec![5, 0, 0, 0, 0x10, 0, 0, 0, 15, 0], dcerpc::Error::FragLength(15)),
     ] {
-        terminal(dcerpc::Pdus::new, &header, expected);
+        terminal(Frames::<dcerpc::Pdu>::new, &header, expected);
     }
     let mut broken = bytes;
     broken.extend_from_slice(&[4, 0]);
     rpc_request().write(&mut broken).unwrap();
-    let mut stream = Stream::new(dcerpc::Pdus::new());
+    let mut stream = Stream::new(Frames::<dcerpc::Pdu>::new());
     assert_eq!(stream.push(&broken), broken.len());
     assert_eq!(stream.next(), Some(Ok(Ok(rpc_request()))));
     assert!(matches!(stream.next(), Some(Err(Fail::Protocol(_)))));
@@ -223,14 +224,14 @@ fn dcerpc_wire_bounds_canonical_padding() {
     bytes[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
     bytes[10..12].copy_from_slice(&3u16.to_le_bytes());
     assert_eq!(bytes.len(), dcerpc::MAX_FRAG);
-    let Step::Item(Ok(received), _) = dcerpc::Pdus::new().decode(&bytes, false).unwrap() else { panic!() };
+    let Step::Item(Ok(received), _) = Frames::<dcerpc::Pdu>::new().decode(&bytes, false).unwrap() else { panic!() };
     assert_eq!(received.to_bytes(), Err(dcerpc::Error::Unwritable));
     assert_eq!(
         <dcerpc::Pdu as Wire>::parse(&bytes),
         Err(dcerpc::Error::Unwritable)
     );
     refused(&received);
-    assert_eq!(dcerpc::Pdus::new().decode(&bytes, false), Ok(Step::Item(Ok(received), bytes.len())));
+    assert_eq!(Frames::<dcerpc::Pdu>::new().decode(&bytes, false), Ok(Step::Item(Ok(received), bytes.len())));
     contract::check_wire::<dcerpc::Pdu>(&bytes);
 }
 
@@ -248,9 +249,9 @@ fn smb2_chunked_round_trip() {
         smb2::Frame { payload: b"\xffSMBopaque".to_vec() },
         smb2::Frame { payload: packet.to_bytes().unwrap() },
     ];
-    let bytes = round_trip(|| smb2::Frames::with_limit(80), &values, &values);
-    let make = || smb2::Frames::new().map(|frame| smb2::Packet::parse(&frame.payload));
-    contract::check_decode_with_alloc_limit(make, &bytes, 2 * smb2::Frames::new().capacity());
+    let bytes = round_trip(|| Frames::<smb2::Frame>::with_limit(80), &values, &values);
+    let make = || Frames::<smb2::Frame>::new().map(|frame| smb2::Packet::parse(&frame.payload));
+    contract::check_decode_with_alloc_limit(make, &bytes, 2 * Frames::<smb2::Frame>::new().capacity());
     let (got, error) = decode_all(make, &bytes);
     assert_eq!(error, None);
     assert_eq!(
@@ -262,13 +263,13 @@ fn smb2_chunked_round_trip() {
             Ok(packet)
         ]
     );
-    truncations(smb2::Frames::new, &Wire::to_bytes(&values[0]).unwrap());
+    truncations(Frames::<smb2::Frame>::new, &Wire::to_bytes(&values[0]).unwrap());
 }
 
 #[test]
 fn smb2_length_errors_report_bounds() {
     for limit in [0, 7, smb2::MAX_MESSAGE, usize::MAX] {
-        let mut frames = smb2::Frames::with_limit(limit);
+        let mut frames = Frames::<smb2::Frame>::with_limit(limit);
         let limit = frames.limit();
         let length = limit + 1;
         let bytes = (length as u32).to_be_bytes();
@@ -283,16 +284,16 @@ fn smb2_length_errors_report_bounds() {
 fn smb2_refuses_length_from_header_and_writer_rolls_back() {
     let length = smb2::MAX_MESSAGE + 1;
     let bytes = (length as u32).to_be_bytes();
-    terminal(smb2::Frames::new, &bytes, smb2::Error::Length { length, limit: smb2::MAX_MESSAGE });
-    terminal(smb2::Frames::new, &[0x81], smb2::Error::FrameType(0x81));
-    terminal(|| smb2::Frames::with_limit(7), &[0, 0, 0, 8], smb2::Error::Length { length: 8, limit: 7 });
-    let mut empty_only = smb2::Frames::with_limit(0);
+    terminal(Frames::<smb2::Frame>::new, &bytes, smb2::Error::Length { length, limit: smb2::MAX_MESSAGE });
+    terminal(Frames::<smb2::Frame>::new, &[0x81], smb2::Error::FrameType(0x81));
+    terminal(|| Frames::<smb2::Frame>::with_limit(7), &[0, 0, 0, 8], smb2::Error::Length { length: 8, limit: 7 });
+    let mut empty_only = Frames::<smb2::Frame>::with_limit(0);
     assert_eq!(empty_only.capacity(), smb2::FRAME_HEADER_LEN);
     assert_eq!(
         empty_only.decode(&[0, 0, 0, 0], false),
         Ok(Step::Item(smb2::Frame { payload: vec![] }, 4))
     );
-    terminal(|| smb2::Frames::with_limit(0), &[0, 0, 0, 1], smb2::Error::Length { length: 1, limit: 0 });
+    terminal(|| Frames::<smb2::Frame>::with_limit(0), &[0, 0, 0, 1], smb2::Error::Length { length: 1, limit: 0 });
     refused(&smb2::Frame {
         payload: vec![0; length],
     });
@@ -382,8 +383,8 @@ fn nbss_chunked_round_trip() {
         nbss::Packet::Negative(nbss::NegativeCode::Other(7)),
         nbss::Packet::Retarget { address: [192, 0, 2, 1], port: 139 },
     ];
-    round_trip(|| nbss::Packets::with_limit(128), &values, &values);
-    truncations(nbss::Packets::new, &Wire::to_bytes(&values[0]).unwrap());
+    round_trip(|| Frames::<nbss::Packet>::with_limit(128), &values, &values);
+    truncations(Frames::<nbss::Packet>::new, &Wire::to_bytes(&values[0]).unwrap());
 }
 
 #[test]
@@ -391,22 +392,22 @@ fn nbss_length_extension_and_zero_limit() {
     let packet = nbss::Packet::Message(vec![0x42; 0x1_0000]);
     let bytes = Wire::to_bytes(&packet).unwrap();
     assert_eq!(&bytes[..4], &[0, 1, 0, 0]);
-    contract::check_decode_with_alloc_limit(nbss::Packets::new, &bytes, 2 * nbss::Packets::new().capacity());
-    assert_eq!(nbss::Packets::new().decode(&bytes, false), Ok(Step::Item(packet, bytes.len())));
-    let mut frames = nbss::Packets::with_limit(0);
+    contract::check_decode_with_alloc_limit(Frames::<nbss::Packet>::new, &bytes, 2 * Frames::<nbss::Packet>::new().capacity());
+    assert_eq!(Frames::<nbss::Packet>::new().decode(&bytes, false), Ok(Step::Item(packet, bytes.len())));
+    let mut frames = Frames::<nbss::Packet>::with_limit(0);
     assert_eq!(frames.capacity(), nbss::HEADER_LEN);
     assert_eq!(frames.decode(&[0x85, 0, 0, 0], false), Ok(Step::Item(nbss::Packet::KeepAlive, 4)));
-    terminal(|| nbss::Packets::with_limit(0), &[0, 0, 0, 1], nbss::Error::TooLong(1));
-    terminal(|| nbss::Packets::with_limit(65_535), &bytes[..4], nbss::Error::TooLong(65_536));
+    terminal(|| Frames::<nbss::Packet>::with_limit(0), &[0, 0, 0, 1], nbss::Error::TooLong(1));
+    terminal(|| Frames::<nbss::Packet>::with_limit(65_535), &bytes[..4], nbss::Error::TooLong(65_536));
 }
 
 #[test]
 fn nbss_errors_end_stream_and_writes_are_transactional() {
-    terminal(nbss::Packets::new, &[0x99], nbss::Error::Type(0x99));
-    terminal(nbss::Packets::new, &[0, 2], nbss::Error::Flags(2));
+    terminal(Frames::<nbss::Packet>::new, &[0x99], nbss::Error::Type(0x99));
+    terminal(Frames::<nbss::Packet>::new, &[0, 2], nbss::Error::Flags(2));
     let mut bad = session_request().to_bytes().unwrap();
     bad[5] = b'Z';
-    terminal(nbss::Packets::new, &bad, nbss::Error::Body(nbss::kind::REQUEST));
+    terminal(Frames::<nbss::Packet>::new, &bad, nbss::Error::Body(nbss::kind::REQUEST));
     refused(&nbss::Packet::Negative(nbss::NegativeCode::Other(0x80)));
     refused(&nbss::Packet::Message(vec![0; nbss::MAX_LENGTH + 1]));
     refused(&nbss::Packet::Request {
@@ -429,14 +430,14 @@ fn radius_chunked_round_trip() {
     let request = radius_request();
     let reply = request.reply(radius::Code::AccessAccept);
     let values = [request, reply, radius::Packet::new(radius::Code::Other(240), 8, [0; 16])];
-    round_trip(|| radius::Packets::with_limit(64), &values, &values);
-    truncations(radius::Packets::new, &Wire::to_bytes(&values[0]).unwrap());
+    round_trip(|| Frames::<radius::Packet>::with_limit(64), &values, &values);
+    truncations(Frames::<radius::Packet>::new, &Wire::to_bytes(&values[0]).unwrap());
 }
 
 #[test]
 fn radius_length_errors_report_bounds() {
     for limit in [0, 20, 64, radius::MAX_PACKET, usize::MAX] {
-        let mut frames = radius::Packets::with_limit(limit);
+        let mut frames = Frames::<radius::Packet>::with_limit(limit);
         let limit = frames.limit();
         let length = limit as u16 + 1;
         let [hi, lo] = length.to_be_bytes();
@@ -452,18 +453,18 @@ fn radius_length_errors_report_bounds() {
 
 #[test]
 fn radius_refuses_lengths_and_attributes_without_recovery() {
-    terminal(radius::Packets::new, &[1, 0, 0x10, 1], radius::Error::Length { length: 4097, limit: radius::MAX_PACKET });
-    terminal(radius::Packets::new, &[1, 0, 0, 19], radius::Error::Length { length: 19, limit: radius::MAX_PACKET });
-    terminal(|| radius::Packets::with_limit(20), &[1, 0, 0, 21], radius::Error::Length { length: 21, limit: 20 });
+    terminal(Frames::<radius::Packet>::new, &[1, 0, 0x10, 1], radius::Error::Length { length: 4097, limit: radius::MAX_PACKET });
+    terminal(Frames::<radius::Packet>::new, &[1, 0, 0, 19], radius::Error::Length { length: 19, limit: radius::MAX_PACKET });
+    terminal(|| Frames::<radius::Packet>::with_limit(20), &[1, 0, 0, 21], radius::Error::Length { length: 21, limit: 20 });
     let empty = radius::Packet::new(radius::Code::AccessRequest, 0, [0; 16]);
     let bytes = Wire::to_bytes(&empty).unwrap();
     assert_eq!(
-        radius::Packets::with_limit(0).decode(&bytes, false),
+        Frames::<radius::Packet>::with_limit(0).decode(&bytes, false),
         Ok(Step::Item(empty, radius::HEADER_LEN))
     );
     let mut bad = radius_request().to_bytes().unwrap();
     bad[21] = 1;
-    terminal(radius::Packets::new, &bad, radius::Error::Attribute(20));
+    terminal(Frames::<radius::Packet>::new, &bad, radius::Error::Attribute(20));
 }
 
 #[test]
@@ -496,8 +497,8 @@ fn diameter_chunked_round_trip() {
     reply.avps.push(diameter::Avp::new(diameter::avp::RESULT_CODE, &diameter::Value::Unsigned32(2001)).unwrap());
     let values = [request, reply, diameter::Message::request(280, 0, 10, 11)];
     let expected = values.iter().cloned().map(Ok).collect::<Vec<_>>();
-    round_trip(|| diameter::Messages::with_limit(64), &values, &expected);
-    truncations(diameter::Messages::new, &Wire::to_bytes(&values[0]).unwrap());
+    round_trip(|| Frames::<diameter::Message>::with_limit(64), &values, &expected);
+    truncations(Frames::<diameter::Message>::new, &Wire::to_bytes(&values[0]).unwrap());
 }
 
 #[test]
@@ -527,7 +528,7 @@ fn diameter_bad_avp_keeps_header_and_next_message() {
     };
     let next = diameter::Message::request(diameter::command::DEVICE_WATCHDOG, 0, 7, 9);
     next.write(&mut bytes).unwrap();
-    let mut stream = Stream::new(diameter::Messages::new());
+    let mut stream = Stream::new(Frames::<diameter::Message>::new());
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(
         stream.with_next(|item, raw, span| {
@@ -541,15 +542,15 @@ fn diameter_bad_avp_keeps_header_and_next_message() {
     finish(&mut stream, |_| panic!("all items drained")).unwrap();
     assert!(stream.failed().is_none());
     assert_eq!(stream.offset(), bytes.len() as u64);
-    contract::check_decode_with_alloc_limit(diameter::Messages::new, &bytes, 2 * diameter::Messages::new().capacity());
-    assert_eq!(decode_all(diameter::Messages::new, &bytes), (vec![Err(malformed), Ok(next)], None));
+    contract::check_decode_with_alloc_limit(Frames::<diameter::Message>::new, &bytes, 2 * Frames::<diameter::Message>::new().capacity());
+    assert_eq!(decode_all(Frames::<diameter::Message>::new, &bytes), (vec![Err(malformed), Ok(next)], None));
 }
 
 #[test]
 fn diameter_header_errors_end_stream() {
-    terminal(|| diameter::Messages::with_limit(20), &[1, 0, 0, 24], diameter::FrameError::TooBig(24));
-    terminal(diameter::Messages::new, &[2], diameter::FrameError::Version(2));
-    terminal(diameter::Messages::new, &[1, 0, 0, 21], diameter::FrameError::MessageLength(21));
+    terminal(|| Frames::<diameter::Message>::with_limit(20), &[1, 0, 0, 24], diameter::FrameError::TooBig(24));
+    terminal(Frames::<diameter::Message>::new, &[2], diameter::FrameError::Version(2));
+    terminal(Frames::<diameter::Message>::new, &[1, 0, 0, 21], diameter::FrameError::MessageLength(21));
 }
 
 #[test]
@@ -563,7 +564,7 @@ fn diameter_too_many_avps_is_a_message_error() {
     bytes[1..4].copy_from_slice(&(length as u32).to_be_bytes()[1..]);
     let next = diameter::Message::request(diameter::command::DEVICE_WATCHDOG, 0, 7, 9);
     next.write(&mut bytes).unwrap();
-    let mut stream = Stream::new(diameter::Messages::new());
+    let mut stream = Stream::new(Frames::<diameter::Message>::new());
     assert_eq!(stream.push(&bytes), bytes.len());
     let malformed = diameter::AvpFault {
         header,
@@ -614,40 +615,40 @@ fn diameter_strict_writer_refuses_clipping_transactionally() {
 
 #[test]
 fn capacity_limits_are_real_and_clamped() {
-    assert_eq!(dcerpc::Pdus::with_limit(0).capacity(), dcerpc::HEADER_LEN);
-    assert_eq!(dcerpc::Pdus::with_limit(usize::MAX).limit(), dcerpc::MAX_FRAG);
-    assert_eq!(smb2::Frames::new().capacity(), smb2::MAX_FRAME);
-    assert_eq!(smb2::Frames::default(), smb2::Frames::new());
+    assert_eq!(Frames::<dcerpc::Pdu>::with_limit(0).capacity(), dcerpc::HEADER_LEN);
+    assert_eq!(Frames::<dcerpc::Pdu>::with_limit(usize::MAX).limit(), dcerpc::MAX_FRAG);
+    assert_eq!(Frames::<smb2::Frame>::new().capacity(), smb2::MAX_FRAME);
+    assert_eq!(Frames::<smb2::Frame>::default(), Frames::<smb2::Frame>::new());
     assert_eq!(
-        smb2::Frames::with_limit(usize::MAX).limit(),
+        Frames::<smb2::Frame>::with_limit(usize::MAX).limit(),
         smb2::MAX_MESSAGE
     );
     assert_eq!(
-        smb2::Frames::with_limit(7).capacity(),
+        Frames::<smb2::Frame>::with_limit(7).capacity(),
         smb2::FRAME_HEADER_LEN + 7
     );
     assert_eq!(
-        nbss::Packets::with_limit(usize::MAX).limit(),
+        Frames::<nbss::Packet>::with_limit(usize::MAX).limit(),
         nbss::MAX_LENGTH
     );
-    assert_eq!(radius::Packets::new().capacity(), radius::MAX_PACKET);
-    assert_eq!(radius::Packets::default(), radius::Packets::new());
-    assert_eq!(radius::Packets::with_limit(0).limit(), radius::HEADER_LEN);
+    assert_eq!(Frames::<radius::Packet>::new().capacity(), radius::MAX_PACKET);
+    assert_eq!(Frames::<radius::Packet>::default(), Frames::<radius::Packet>::new());
+    assert_eq!(Frames::<radius::Packet>::with_limit(0).limit(), radius::HEADER_LEN);
     assert_eq!(
-        radius::Packets::with_limit(usize::MAX).limit(),
+        Frames::<radius::Packet>::with_limit(usize::MAX).limit(),
         radius::MAX_PACKET
     );
     assert_eq!(
-        diameter::Messages::with_limit(0).limit(),
+        Frames::<diameter::Message>::with_limit(0).limit(),
         diameter::HEADER_LEN
     );
     assert_eq!(
-        diameter::Messages::with_limit(usize::MAX).capacity(),
+        Frames::<diameter::Message>::with_limit(usize::MAX).capacity(),
         diameter::MAX_MESSAGE
     );
-    assert_eq!(diameter::Messages::new().capacity(), diameter::DEFAULT_LIMIT);
+    assert_eq!(Frames::<diameter::Message>::new().capacity(), diameter::DEFAULT_LIMIT);
     for limit in [0, 1, 19, 20, 21, 63, 64] {
-        let mut frames = diameter::Messages::with_limit(limit);
+        let mut frames = Frames::<diameter::Message>::with_limit(limit);
         // A capacity not divisible by four still must decide from the header.
         let mut bytes = vec![0; frames.capacity()];
         bytes[..4].copy_from_slice(&[1, 0, 0, 64]);
@@ -669,11 +670,11 @@ fn contracts_on_deterministic_inputs_and_mutated_units() {
         for seed in &seeds {
             let mut bytes = seed.clone();
             mutate(&mut rng, &mut bytes);
-            contract::check_decode_with_alloc_limit(dcerpc::Pdus::new, &bytes, 2 * dcerpc::Pdus::new().capacity());
-            contract::check_decode_with_alloc_limit(smb2::Frames::new, &bytes, 2 * smb2::Frames::new().capacity());
-            contract::check_decode_with_alloc_limit(nbss::Packets::new, &bytes, 2 * nbss::Packets::new().capacity());
-            contract::check_decode_with_alloc_limit(radius::Packets::new, &bytes, 2 * radius::Packets::new().capacity());
-            contract::check_decode_with_alloc_limit(diameter::Messages::new, &bytes, 2 * diameter::Messages::new().capacity());
+            contract::check_decode_with_alloc_limit(Frames::<dcerpc::Pdu>::new, &bytes, 2 * Frames::<dcerpc::Pdu>::new().capacity());
+            contract::check_decode_with_alloc_limit(Frames::<smb2::Frame>::new, &bytes, 2 * Frames::<smb2::Frame>::new().capacity());
+            contract::check_decode_with_alloc_limit(Frames::<nbss::Packet>::new, &bytes, 2 * Frames::<nbss::Packet>::new().capacity());
+            contract::check_decode_with_alloc_limit(Frames::<radius::Packet>::new, &bytes, 2 * Frames::<radius::Packet>::new().capacity());
+            contract::check_decode_with_alloc_limit(Frames::<diameter::Message>::new, &bytes, 2 * Frames::<diameter::Message>::new().capacity());
             contract::check_wire::<dcerpc::Pdu>(&bytes);
             contract::check_wire::<smb2::Frame>(&bytes);
             contract::check_wire::<nbss::Packet>(&bytes);

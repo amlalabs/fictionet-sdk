@@ -94,7 +94,7 @@ frame boundary.
 Capture policy keeps complete frames already present in bounded read-ahead.
 An incomplete oversized frame becomes a header-only item, followed by `Skip`
 for its payload. Header blocks share the stdlib HPACK decoder. Recognized
-gRPC calls use `grpc::Messages` through `codec::Demux`, with an 8 MiB aggregate
+gRPC calls use `codec::Frames<grpc::Message>` through `codec::Demux`, with an 8 MiB aggregate
 DATA budget shared by every connection from the built-in registry and its
 clones, including nested TLS streams, through `Capture::pair_in`.
 Message layers point at payload bytes when one

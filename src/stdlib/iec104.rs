@@ -2,7 +2,7 @@
 //!
 //! IEC 104 carries telecontrol messages over TCP, usually on port 2404.
 //! [`Frame`] reads the I (information), S (acknowledgment) and U (link
-//! control) formats. [`Stream<Frames>`](fictionet::stdlib::codec::Stream) splits a byte
+//! control) formats. [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) splits a byte
 //! stream into those frames.
 //! Sequence numbers are checked for their 15-bit range; tracking which
 //! numbers have been sent or acknowledged belongs to world code.
@@ -30,7 +30,10 @@
 //! assert_eq!(Frame::parse_prefix(&bytes).unwrap(), Some((frame, bytes.len())));
 //! ```
 
-use fictionet::stdlib::codec::{le16, le24, Decode, Step, Wire};
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{le16, le24, Wire};
 
 /// The TCP port IEC 104 servers normally listen on.
 pub const PORT: u16 = 2404;
@@ -265,39 +268,33 @@ impl Wire for Frame {
 
 /// Reads IEC 104 frames without holding input bytes.
 ///
-/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for a buffer limited to
-/// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
+/// Use with [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) for a buffer limited to
+/// [`MAX_FRAME`]. Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
-
-impl Frames {
-    /// Creates a frame decoder with a capacity of [`MAX_FRAME`] bytes.
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Decode for Frames {
+impl Prefixed for Frame {
     type Item = Frame;
     type Error = Error;
+    type Limit = ();
     const NAME: &'static str = "IEC 104";
 
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         MAX_FRAME
     }
 
-    /// Reads an APDU prefix, returning [`Step::Need`] while incomplete.
+    /// Reads an APDU prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.
     /// Invalid start bytes, lengths, control fields or ASDU lengths return
     /// [`Error::Start`], [`Error::ApduLength`], [`Error::Control`]
     /// or [`Error::AsduLength`].
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        Ok(match Frame::parse_prefix(input)? {
-            Some((frame, used)) => Step::Item(frame, used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        Frame::parse_prefix(input)
     }
 }
+
 
 /// An ASDU header followed by opaque information object bytes. Unknown
 /// type IDs and causes are preserved. Object layout is checked separately
@@ -574,11 +571,11 @@ mod tests {
         let encoded = frame.to_bytes().unwrap();
         assert_eq!(encoded.len(), MAX_FRAME);
         let bytes = encoded.repeat(7);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_FRAME);
-        let (frames, failure) = decode_all(Frames::new, &bytes);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
+        let (frames, failure) = decode_all(Frames::<Frame>::new, &bytes);
         assert!(failure.is_none());
         assert_eq!(frames, vec![frame; 7]);
-        let mut stream = Stream::new(Frames);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&vec![0; MAX_FRAME + 1]), MAX_FRAME);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Start))));
         assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::Start)));

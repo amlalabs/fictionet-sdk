@@ -2,22 +2,21 @@
 //! playing a directory server reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
-use fictionet::stdlib::ldap::{
-    DerefAliases, Dn, Error, Filter, MAX_TEXT, Message, Messages, Op, Scope, SearchRequest,
-};
+use fictionet::stdlib::ldap::{DerefAliases, Dn, Error, Filter, MAX_TEXT, Message, Op, Scope, SearchRequest};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Messages::new, data);
-    contract::check_decode(|| Messages::with_limit(64), data);
+    contract::check_decode(Frames::<Message>::new, data);
+    contract::check_decode(|| Frames::<Message>::with_limit(64), data);
     contract::check_wire::<Message>(data);
 
-    let mut stream = Stream::new(Messages::new());
+    let mut stream = Stream::new(Frames::<Message>::new());
     let mut messages = Vec::new();
     let _ = pump(&mut stream, data, |m| messages.push(m));
     let _ = finish(&mut stream, |m| messages.push(m));
-    let mut low = Stream::new(Messages::with_limit(64));
+    let mut low = Stream::new(Frames::<Message>::with_limit(64));
     let mut smaller = Vec::new();
     let _ = pump(&mut low, data, |m| smaller.push(m));
     let _ = finish(&mut low, |m| smaller.push(m));

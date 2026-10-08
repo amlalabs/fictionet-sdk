@@ -2,34 +2,35 @@
 //! a world playing a cache server reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
     Wire,
     contract::{check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value},
     test_support::decode_all,
 };
 use fictionet::stdlib::memcache::{
-    BINARY_HEADER_LEN, Command, Commands, CounterExtras, Packets, MAX_BINARY_BUFFERED, MAX_LINE,
-    MAX_TEXT_HELD, MetaFlag, MetaStatus, Packet, Response, Responses, Status, StoreExtras,
-    UDP_HEADER_LEN, UDP_MAX_DATAGRAM, Error, UdpFrame,
+    BINARY_HEADER_LEN, Command, Commands, CounterExtras, MAX_BINARY_BUFFERED, MAX_LINE, MAX_TEXT_HELD,
+    MetaFlag, MetaStatus, Packet, Response, Responses, Status, StoreExtras, UDP_HEADER_LEN,
+    UDP_MAX_DATAGRAM, Error, UdpFrame,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     check_decode_with_alloc_limit(Commands::new, data, 2 * MAX_LINE);
     check_decode_with_alloc_limit(Responses::new, data, 2 * MAX_LINE);
-    check_decode_with_alloc_limit(Packets::new, data, 2 * MAX_BINARY_BUFFERED);
+    check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_BINARY_BUFFERED);
     check_decode_with_held_limit(Commands::new, data, MAX_TEXT_HELD);
     check_decode_with_held_limit(Responses::new, data, MAX_TEXT_HELD);
     check_decode_with_alloc_limit(|| Commands::with_limit(17), data, 2 * MAX_LINE);
     check_decode_with_alloc_limit(|| Responses::with_limit(17), data, 2 * MAX_LINE);
     check_decode_with_alloc_limit(
-        || Packets::with_limit(17),
+        || Frames::<Packet>::with_limit(17),
         data,
         2 * (BINARY_HEADER_LEN + 17),
     );
     check_decode_with_held_limit(|| Commands::with_limit(17), data, MAX_TEXT_HELD);
     check_decode_with_held_limit(|| Responses::with_limit(17), data, MAX_TEXT_HELD);
-    check_decode_with_held_limit(Packets::new, data, 0);
+    check_decode_with_held_limit(Frames::<Packet>::new, data, 0);
     check_wire::<Command>(data);
     check_wire::<Response>(data);
     check_wire::<Packet>(data);
@@ -61,7 +62,7 @@ fuzz_target!(|data: &[u8]| {
     check_wire_value(&Response::Stat { name: first.clone(), value: data.to_vec() });
     check_wire_value(&Response::Meta { status: MetaStatus::Header, flags });
 
-    for packet in decode_all(Packets::new, data).0 {
+    for packet in decode_all(Frames::<Packet>::new, data).0 {
         check_wire_value(&packet);
         assert_eq!(Packet::parse(&packet.to_bytes().unwrap()), Ok(packet.clone()));
         assert_eq!(Status::from_code(packet.status).code(), packet.status);

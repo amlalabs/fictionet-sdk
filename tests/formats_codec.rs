@@ -1,6 +1,7 @@
 //! Data formats: JSON, XML, protobuf, multipart, URL-encoded forms, gRPC
 //! bodies.
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, contract, finish, pump};
 use fictionet::stdlib::codec::{
     Lcg,
@@ -334,8 +335,8 @@ fn grpc_composes_with_protobuf_messages() {
     };
     let frame = grpc::Message { compressed: false, data: message.to_bytes().unwrap() };
     let bytes = Wire::to_bytes(&frame).unwrap();
-    check(grpc::Messages::new, &bytes);
-    let (items, error) = decode_all(|| grpc::Messages::new().map(|frame| protobuf::Message::parse(&frame.data)), &bytes);
+    check(Frames::<grpc::Message>::new, &bytes);
+    let (items, error) = decode_all(|| Frames::<grpc::Message>::new().map(|frame| protobuf::Message::parse(&frame.data)), &bytes);
     assert_eq!(items, [Ok(message)]);
     assert_eq!(error, None);
 }
@@ -593,16 +594,16 @@ fn protobuf_round_trip_and_eof() {
     contract::check_wire_value(&message);
     contract::check_wire_value(&frame);
     let bytes = Wire::to_bytes(&frame).unwrap();
-    check(protobuf::Frames::new, &bytes);
+    check(Frames::<protobuf::Frame>::new, &bytes);
     for cut in 1..bytes.len() {
-        assert!(matches!(decode_all(protobuf::Frames::new, &bytes[..cut]).1,
+        assert!(matches!(decode_all(Frames::<protobuf::Frame>::new, &bytes[..cut]).1,
             Some(Fail::Truncated { .. })));
     }
-    assert_eq!(decode_all(protobuf::Frames::new, &bytes), (vec![frame], None));
+    assert_eq!(decode_all(Frames::<protobuf::Frame>::new, &bytes), (vec![frame], None));
     let mut batch = bytes.clone();
     protobuf::Frame { data: vec![0] }.write(&mut batch).unwrap();
     batch.extend_from_slice(&bytes);
-    let make = || protobuf::Frames::new().map(|f| protobuf::Message::parse(&f.data));
+    let make = || Frames::<protobuf::Frame>::new().map(|f| protobuf::Message::parse(&f.data));
     check(make, &batch);
     assert_eq!(decode_all(make, &batch), (vec![Ok(message.clone()),
         Err(protobuf::Error::FieldNumber(0)), Ok(message)], None));
@@ -611,7 +612,7 @@ fn protobuf_round_trip_and_eof() {
 
 #[test]
 fn protobuf_rejects_oversize_at_named_capacity() {
-    let mut stream = Stream::new(protobuf::Frames::new());
+    let mut stream = Stream::new(Frames::<protobuf::Frame>::new());
     assert_eq!(stream.decoder().capacity(), protobuf::MAX_MESSAGE + protobuf::MAX_VARINT_LEN);
     let bytes = protobuf::Varint((protobuf::MAX_MESSAGE + 1) as u64).to_bytes().unwrap();
     assert_eq!(stream.push(&bytes), bytes.len());
@@ -661,7 +662,7 @@ fn contracts_on_malformed_and_mutated_inputs() {
             check(xml::Events::new, &bytes);
             check(form::Fields::new, &bytes);
             check(|| mime::Parts::new("b").unwrap(), &bytes);
-            check(protobuf::Frames::new, &bytes);
+            check(Frames::<protobuf::Frame>::new, &bytes);
             contract::check_wire::<json::Value>(&bytes);
             contract::check_wire::<xml::Document>(&bytes);
             contract::check_wire::<form::Field>(&bytes);

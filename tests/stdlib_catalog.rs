@@ -5,7 +5,7 @@
 //! source of truth:
 //!
 //! - the module list against the files in `src/stdlib/`;
-//! - **Wire**, **Decode** and **Service** against the `impl` blocks in the
+//! - **Wire**, **Decode** (including `Prefixed`) and **Service** against the `impl` blocks in the
 //!   module's file (doc comments and other comments are skipped first, so a
 //!   doctest's example impl does not count);
 //! - **State** against the `pub struct` and `pub enum` declarations;
@@ -239,7 +239,7 @@ fn wire_decode_and_service_columns_match_the_impls() {
     for row in catalog() {
         let code = code(&modules[&row.module]);
         assert_eq!(row.wire, code.contains("Wire for"), "{}: the Wire column", row.module);
-        assert_eq!(row.decode, code.contains("Decode for"), "{}: the Decode column", row.module);
+        assert_eq!(row.decode, (code.contains("Decode for") || code.contains("Prefixed for")), "{}: the Decode column", row.module);
         let services: BTreeSet<String> = idents_after(&code, "Service for ").into_iter().map(str::to_owned).collect();
         let listed: BTreeSet<String> = row.service.iter().cloned().collect();
         assert_eq!(listed, services, "{}: the Service column", row.module);

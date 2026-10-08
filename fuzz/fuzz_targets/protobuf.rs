@@ -1,10 +1,11 @@
 //! Protobuf messages, varints, and delimited framing.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use std::collections::BTreeMap;
 
 use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
-use fictionet::stdlib::protobuf::{Frame, Frames, Varint, MAX_MESSAGE, MAX_VARINT_LEN, MAX_FIELDS, Message, Value};
+use fictionet::stdlib::protobuf::{Frame, Varint, MAX_MESSAGE, MAX_VARINT_LEN, MAX_FIELDS, Message, Value};
 use libfuzzer_sys::fuzz_target;
 
 // Counts fields as MAX_FIELDS does: group members included.
@@ -13,7 +14,7 @@ fn total_fields(m: &Message) -> usize {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * (MAX_MESSAGE + MAX_VARINT_LEN));
+    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * (MAX_MESSAGE + MAX_VARINT_LEN));
     contract::check_wire::<Frame>(data);
     contract::check_wire::<Varint>(data);
     contract::check_wire::<Message>(data);
@@ -48,7 +49,7 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    for frame in decode_all(Frames::new, data).0 {
+    for frame in decode_all(Frames::<Frame>::new, data).0 {
         contract::check_wire_value(&frame);
         let _ = Message::parse(&frame.data);
     }

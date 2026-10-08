@@ -96,7 +96,33 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+//!
+//! Reads whole messages of one direction from a byte stream. Each item
+//! is one message, parsed: `Err` for one that frames but does not parse.
+//! A stream that does not start with `BA BA` at a message boundary, or a
+//! MessageLength below the header or over the limit, ends the stream,
+//! read from the first four bytes.
+//!
+//! ```
+//! use fictionet::stdlib::codec::Frames;
+//! use fictionet::stdlib::cboe_boe::{ClientHeartbeat, Inbound};
+//! use fictionet::stdlib::codec::{finish, pump, Stream, Wire};
+//!
+//! let bytes = ClientHeartbeat::default().to_bytes()?;
+//! assert_eq!(bytes, [0xBA, 0xBA, 8, 0, 3, 0, 0, 0, 0, 0]);
+//! let mut stream = Stream::new(Frames::<Inbound>::default());
+//! let mut items = Vec::new();
+//! pump(&mut stream, &bytes[..3], |m| items.push(m))?;
+//! pump(&mut stream, &bytes[3..], |m| items.push(m))?;
+//! finish(&mut stream, |m| items.push(m))?;
+//! assert_eq!(items, [Ok(Inbound::ClientHeartbeat(ClientHeartbeat::default()))]);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Wire};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::marker::PhantomData;
@@ -1249,10 +1275,49 @@ fn envelope(b: &[u8]) -> Result<(u8, &[u8]), Error> {
     Ok((b[4], &b[5..]))
 }
 
+
 /// Defines one direction's messages: a struct per message with its
 /// header, its fixed fields (their total checked at compile time against
 /// the offset where the tail starts) and its tail; then the enum over them.
 macro_rules! messages {
+    (@prefixed $item:ty) => {
+        impl Prefixed for $item {
+            type Item = Result<Self, Error>;
+            type Error = Error;
+            type Limit = usize;
+            const NAME: &'static str = "BOE";
+            #[inline]
+            fn default_limit() -> usize { MAX_MESSAGE }
+            #[inline]
+            fn normalize_limit(limit: usize) -> usize { limit.clamp(HEADER_LENGTH, MAX_MESSAGE) }
+            #[inline]
+            fn capacity(limit: &usize) -> usize { *limit }
+            #[inline]
+            fn parse_prefix(input: &[u8], limit: &usize) -> Result<Option<(Self::Item, usize)>, Error> {
+                let Some(head) = input.get(..4) else {
+                    if input.first().is_some_and(|b| *b != 0xBA) {
+                        return Err(Error::Start);
+                    }
+                    return Ok(None);
+                };
+                if head[..2] != START_OF_MESSAGE {
+                    return Err(Error::Start);
+                }
+                let length = usize::from(u16::from_le_bytes([head[2], head[3]]));
+                if length + 2 < HEADER_LENGTH {
+                    return Err(Error::Length);
+                }
+                let total = length + 2;
+                if total > *limit {
+                    return Err(Error::TooLong);
+                }
+                let Some(message) = input.get(..total) else {
+                    return Ok(None);
+                };
+                Ok(Some((Self::parse(message), total)))
+            }
+        }
+    };
     (
         $(#[doc = $edoc:literal])*
         $enum:ident;
@@ -1303,6 +1368,7 @@ macro_rules! messages {
                 }
             }
             const _: () = assert!(5 + <Header as Field>::LEN $(+ <$ty as Field>::LEN)* == $fixed);
+            messages!(@prefixed $name);
             impl Wire for $name {
                 type ParseError = Error;
                 type WriteError = Error;
@@ -1370,6 +1436,7 @@ macro_rules! messages {
                 }
             }
         }
+        messages!(@prefixed $enum);
         impl Wire for $enum {
             type ParseError = Error;
             type WriteError = Error;
@@ -1797,94 +1864,6 @@ pub mod codes {
     }
 }
 
-/// Reads whole messages of one direction from a byte stream. Each item
-/// is one message, parsed: `Err` for one that frames but does not parse.
-/// A stream that does not start with `BA BA` at a message boundary, or a
-/// MessageLength below the header or over the limit, ends the stream,
-/// read from the first four bytes.
-///
-/// ```
-/// use fictionet::stdlib::cboe_boe::{ClientHeartbeat, Inbound, Messages};
-/// use fictionet::stdlib::codec::{finish, pump, Stream, Wire};
-///
-/// let bytes = ClientHeartbeat::default().to_bytes()?;
-/// assert_eq!(bytes, [0xBA, 0xBA, 8, 0, 3, 0, 0, 0, 0, 0]);
-/// let mut stream = Stream::new(Messages::<Inbound>::default());
-/// let mut items = Vec::new();
-/// pump(&mut stream, &bytes[..3], |m| items.push(m))?;
-/// pump(&mut stream, &bytes[3..], |m| items.push(m))?;
-/// finish(&mut stream, |m| items.push(m))?;
-/// assert_eq!(items, [Ok(Inbound::ClientHeartbeat(ClientHeartbeat::default()))]);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub struct Messages<M> {
-    limit: usize,
-    message: PhantomData<fn() -> M>,
-}
-impl<M> Clone for Messages<M> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<M> Copy for Messages<M> {}
-impl<M> fmt::Debug for Messages<M> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Messages")
-            .field("limit", &self.limit)
-            .finish()
-    }
-}
-impl<M> Messages<M> {
-    /// A framer that accepts messages up to `limit` bytes, from
-    /// [`HEADER_LENGTH`] to [`MAX_MESSAGE`].
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.clamp(HEADER_LENGTH, MAX_MESSAGE),
-            message: PhantomData,
-        }
-    }
-    /// The message limit.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-impl<M> Default for Messages<M> {
-    fn default() -> Self {
-        Self::with_limit(MAX_MESSAGE)
-    }
-}
-impl<M: Wire<ParseError = Error>> Decode for Messages<M> {
-    type Item = Result<M, Error>;
-    type Error = Error;
-    const NAME: &'static str = "BOE";
-    fn capacity(&self) -> usize {
-        self.limit
-    }
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
-        let Some(head) = input.get(..4) else {
-            if input.first().is_some_and(|b| *b != 0xBA) {
-                return Err(Error::Start);
-            }
-            return Ok(Step::Need);
-        };
-        if head[..2] != START_OF_MESSAGE {
-            return Err(Error::Start);
-        }
-        let length = usize::from(u16::from_le_bytes([head[2], head[3]]));
-        if length + 2 < HEADER_LENGTH {
-            return Err(Error::Length);
-        }
-        let total = length + 2;
-        if total > self.limit {
-            return Err(Error::TooLong);
-        }
-        let Some(message) = input.get(..total) else {
-            return Ok(Step::Need);
-        };
-        Ok(Step::Item(M::parse(message), total))
-    }
-}
-
 /// The timers a session runs on. [`Timers::default`] is the
 /// specification's: a heartbeat after a second of sending nothing, and a
 /// five-second receive timeout ("Heartbeats"); the login timeout is this
@@ -2182,7 +2161,7 @@ impl Client {
         self.clock.advance(now_ms)?;
         Ok(self.receive_inner(message))
     }
-    /// [`receive`](Self::receive) for a [`Messages`] item. A message that did
+    /// [`receive`](Self::receive) for a [`codec::Frames`](fictionet::stdlib::codec::Frames) item. A message that did
     /// not parse closes the session with [`CloseReason::Protocol`].
     pub fn receive_frame(
         &mut self,
@@ -2433,7 +2412,7 @@ impl Server {
             }
         })
     }
-    /// [`receive`](Self::receive) for a [`Messages`] item. A message that did
+    /// [`receive`](Self::receive) for a [`codec::Frames`](fictionet::stdlib::codec::Frames) item. A message that did
     /// not parse is a protocol violation.
     pub fn receive_frame(
         &mut self,
@@ -4300,20 +4279,20 @@ mod tests {
         MassCancelAcknowledgment::default()
             .write(&mut bytes)
             .unwrap();
-        check_decode(Messages::<Outbound>::default, &bytes);
-        check_decode(|| Messages::<Outbound>::with_limit(12), &bytes);
-        check_decode_with_alloc_limit(Messages::<Outbound>::default, &bytes, 2 * MAX_MESSAGE);
-        let (items, failure) = decode_all(Messages::<Outbound>::default, &bytes);
+        check_decode(Frames::<Outbound>::default, &bytes);
+        check_decode(|| Frames::<Outbound>::with_limit(12), &bytes);
+        check_decode_with_alloc_limit(Frames::<Outbound>::default, &bytes, 2 * MAX_MESSAGE);
+        let (items, failure) = decode_all(Frames::<Outbound>::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(items.len(), 5);
         assert_eq!(items[2], Err(Error::Type(0x99)));
-        let (_, failure) = decode_all(Messages::<Outbound>::default, &[0xBA, 0xBB, 8, 0]);
+        let (_, failure) = decode_all(Frames::<Outbound>::default, &[0xBA, 0xBB, 8, 0]);
         assert_eq!(failure, Some(Fail::Protocol(Error::Start)));
-        let (_, failure) = decode_all(Messages::<Outbound>::default, &[0x00]);
+        let (_, failure) = decode_all(Frames::<Outbound>::default, &[0x00]);
         assert_eq!(failure, Some(Fail::Protocol(Error::Start)));
-        let (_, failure) = decode_all(Messages::<Outbound>::default, &[0xBA, 0xBA, 7, 0]);
+        let (_, failure) = decode_all(Frames::<Outbound>::default, &[0xBA, 0xBA, 7, 0]);
         assert_eq!(failure, Some(Fail::Protocol(Error::Length)));
-        let (_, failure) = decode_all(|| Messages::<Outbound>::with_limit(11), &bytes);
+        let (_, failure) = decode_all(|| Frames::<Outbound>::with_limit(11), &bytes);
         assert_eq!(failure, Some(Fail::Protocol(Error::TooLong)));
     }
 
@@ -5217,8 +5196,8 @@ mod tests {
             for _ in 0..=rng.below(4) {
                 mutate(&mut rng, &mut bytes);
             }
-            check_decode(Messages::<Inbound>::default, &bytes);
-            check_decode(Messages::<Outbound>::default, &bytes);
+            check_decode(Frames::<Inbound>::default, &bytes);
+            check_decode(Frames::<Outbound>::default, &bytes);
         }
     }
 

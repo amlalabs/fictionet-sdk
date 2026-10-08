@@ -120,6 +120,7 @@
 //! assert_eq!(&bytes[8..12], &7u32.to_le_bytes());
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{Decode, Step, Wire, Reader as ByteReader, Truncated};
 
 /// The TCP port OPC UA servers listen on.
@@ -260,7 +261,7 @@ impl StatusCode {
 
 /// Why bytes are not a value in the OPC UA binary encoding or a byte
 /// stream of OPC UA chunks, or why a value cannot be written. Every error
-/// from [`Chunks`] or [`Messages`] is fatal: the stream holds no more
+/// from [`codec::Frames<Chunk>`](fictionet::stdlib::codec::Frames) or [`Messages`] is fatal: the stream holds no more
 /// messages a reader can find, and a real server sends an ERR with
 /// [`Error::status`] and closes the connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2075,7 +2076,7 @@ impl Wire for Chunk {
     type WriteError = Error;
 
     /// Reads exactly one chunk bounded by [`MAX_BUFFER_SIZE`].
-    /// The body stays opaque. Negotiated limits belong to [`Chunks`].
+    /// The body stays opaque. Negotiated limits belong to [`codec::Frames<Chunk>`](fictionet::stdlib::codec::Frames).
     /// Handshake chunk type bytes read as [`ChunkType::Final`].
     /// Returns [`Error::End`] for incomplete input and
     /// [`Error::Trailing`] for extra bytes. Invalid message types,
@@ -2136,56 +2137,32 @@ impl Wire for Chunk {
 /// [`Stream`](fictionet::stdlib::codec::Stream) reports truncation.
 /// Message bodies, chunk counts, and sequence numbers are not checked here.
 /// Use [`Messages`] for message assembly and connection checks.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Chunks {
-    limits: Limits,
-}
-
-impl Chunks {
-    /// Creates a chunk decoder with [`Limits::default`].
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Creates a chunk decoder with the given receive buffer size.
-    /// [`Limits::chunk_limit`] clamps it to the module's bounds.
-    /// Message size and chunk count limits do not affect framing.
-    pub fn with_limits(limits: Limits) -> Self {
-        Self { limits }
-    }
-
-    /// Sets negotiated limits between calls to the stream's `next` method.
-    /// Chunks already returned are not checked again.
-    pub fn set_limits(&mut self, limits: Limits) {
-        self.limits = limits;
-    }
-
-    /// Returns the supplied limits before clamping the receive buffer size.
-    pub fn limits(&self) -> Limits {
-        self.limits
-    }
-}
-
-impl Decode for Chunks {
+impl Prefixed for Chunk {
     type Item = Chunk;
     type Error = Error;
+    type Limit = Limits;
     const NAME: &'static str = "OPC UA TCP";
 
-    fn capacity(&self) -> usize {
-        self.limits.chunk_limit().max(MAX_HANDSHAKE_SIZE) as usize
+    #[inline]
+    fn default_limit() -> Self::Limit { Limits::default() }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        limit.chunk_limit().max(MAX_HANDSHAKE_SIZE) as usize
     }
 
-    /// Reads a chunk prefix, returning [`Step::Need`] while incomplete.
+    /// Reads a chunk prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.
     /// Returns [`Error::MessageType`] or [`Error::ChunkType`] for
     /// invalid type bytes, [`Error::TooSmall`] below the header size,
     /// and [`Error::TooLarge`] above the negotiated limit.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Chunk>, Error> {
-        Ok(match Chunk::parse_prefix(input, &self.limits)? {
-            Some((chunk, used)) => Step::Item(chunk, used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        Chunk::parse_prefix(input, &limit)
     }
 }
+
 
 /// Reads the reason of an Error message or abort chunk. One longer than
 /// [`MAX_REASON_LEN`] is dropped unread and comes back empty, as Part 6
@@ -2860,7 +2837,7 @@ impl Decode for Messages {
     }
 
     /// Reads chunks and joins secure messages. Chunk header errors are those
-    /// of [`Chunks::decode`]. Invalid bodies return [`Error::Decode`];
+    /// of [`codec::Frames<Chunk>::decode`](fictionet::stdlib::codec::Decode::decode). Invalid bodies return [`Error::Decode`];
     /// undersized handshake buffers return [`Error::BufferSize`].
     /// Broken order or changed secure headers return [`Error::Sequence`]
     /// or [`Error::Interleaved`]. Changed channel or token IDs return

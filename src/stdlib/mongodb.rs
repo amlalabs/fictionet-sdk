@@ -13,7 +13,7 @@
 //!
 //! A world that plays a database server passes bytes from a
 //! [`tcp`](fictionet::stdlib::tcp) connection to
-//! [`Stream<Messages>`](fictionet::stdlib::codec::Stream), reads each message's command document,
+//! [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream), reads each message's command document,
 //! and writes the reply's bytes back to the connection. Which databases
 //! and collections exist, and what they hold, is up to world code.
 //!
@@ -26,12 +26,13 @@
 //! written. Compressed messages (OP_COMPRESSED) are reported with their
 //! compressor and bytes, not decompressed. Every writer checks the same
 //! limits, so what it writes always reads back. The faults that end a
-//! [`Messages`] stream, [`Error::Length`] and [`Error::SectionKind`], are the
+//! [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) stream, [`Error::Length`] and [`Error::SectionKind`], are the
 //! ones [`Message`]'s `parse` reports too, so the module has one [`Error`]
 //! and no `FrameError`.
 //!
 //! ```
-//! use fictionet::stdlib::mongodb::{Body, Bson, Document, Message, Messages, Msg, Reply};
+//! use fictionet::stdlib::codec::Frames;
+//! use fictionet::stdlib::mongodb::{Body, Bson, Document, Message, Msg, Reply};
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //!
 //! /// Answers the handshake and `ping`, and nothing else.
@@ -60,7 +61,7 @@
 //! assert_eq!(bytes.len(), 16 + 4 + 1 + 30);
 //! assert_eq!(bytes[12..16], [0xdd, 0x07, 0, 0]); // op code 2013, OP_MSG
 //!
-//! let mut stream = Stream::new(Messages::new());
+//! let mut stream = Stream::new(Frames::<Message>::new());
 //! for b in &bytes {
 //!     assert_eq!(stream.push(std::slice::from_ref(b)), 1);
 //! }
@@ -74,10 +75,13 @@
 //! assert_eq!(m.body.get("ok"), Some(&Bson::Double(1.0)));
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::crc32c::checksum as crc32c;
 use fictionet::stdlib::codec::Reader;
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Wire};
 
 /// The TCP port MongoDB servers listen on.
 pub const PORT: u16 = 27017;
@@ -468,7 +472,7 @@ pub enum Error {
     /// which only servers use among themselves, and kind 3, telemetry a
     /// client sends only to a server that says it takes it. The OP_MSG
     /// specification says the connection must then be closed, so
-    /// [`Messages`] stops here for good.
+    /// [`codec::Frames<Message>`](fictionet::stdlib::codec::Frames) stops here for good.
     SectionKind(u8),
     /// An OP_MSG has this many body sections, not exactly one.
     BodyCount(usize),
@@ -1274,63 +1278,43 @@ impl Wire for Message {
 /// Reads MongoDB messages without holding input bytes.
 ///
 /// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
-/// by [`limit`](Self::limit), including the header. Oversized messages
+/// by [`limit`](fictionet::stdlib::codec::Frames::limit), including the header. Oversized messages
 /// are refused from the first four bytes. Partial messages return
-/// [`Step::Need`], including at EOF, so the stream reports truncation.
+/// [`fictionet::stdlib::codec::Step::Need`], including at EOF, so the stream reports truncation.
 ///
 /// Items are `Result<Message, Error>`. A body error consumes its
 /// frame and is returned as an error item, so the next message can still
 /// be read. Only [`Error::Length`] from the length field and
 /// [`Error::SectionKind`] end the stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Messages {
-    limit: usize,
-}
-
-impl Messages {
-    /// Reads messages up to [`MAX_MESSAGE_SIZE`] bytes, header included.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_MESSAGE_SIZE)
-    }
-
-    /// Sets the message limit, including the header. Clamps it to
-    /// [`HEADER_LEN`] through [`MAX_MESSAGE_SIZE`].
-    pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.clamp(HEADER_LEN, MAX_MESSAGE_SIZE) }
-    }
-
-    /// The maximum message size, including its header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Messages {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Messages {
+impl Prefixed for Message {
     type Item = Result<Message, Error>;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "MongoDB";
 
-    fn capacity(&self) -> usize {
-        self.limit
-    }
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_MESSAGE_SIZE }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
-        let Some(len) = frame_len(input, self.limit)? else {
-            return Ok(Step::Need);
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(HEADER_LEN, MAX_MESSAGE_SIZE) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize { *limit }
+
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        let Some(len) = frame_len(input, limit)? else {
+            return Ok(None);
         };
         let message = Message::from_frame(&input[..len]);
         if let Err(e @ Error::SectionKind(_)) = message {
             return Err(e);
         }
-        Ok(Step::Item(message, len))
+        Ok(Some((message, len)))
     }
 }
+
 
 fn check_size(len: usize) -> Result<(), Error> {
     if len > MAX_MESSAGE_SIZE { Err(Error::Unwritable) } else { Ok(()) }
@@ -1538,6 +1522,7 @@ fn parse_reply(data: &[u8]) -> Result<Reply, Error> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, contract,
@@ -2031,7 +2016,7 @@ mod tests {
         let bytes = m.to_bytes().unwrap();
         for n in 0..bytes.len() {
             assert_eq!(Message::parse(&bytes[..n]), Err(Error::Truncated), "{n} bytes");
-            assert_eq!(Messages::new().decode(&bytes[..n], false), Ok(Step::Need));
+            assert_eq!(Frames::<Message>::new().decode(&bytes[..n], false), Ok(Step::Need));
         }
         assert_eq!(Message::parse(&bytes).unwrap(), m);
     }
@@ -2163,8 +2148,8 @@ mod tests {
         let b = msg(2, Document::new().with("hello", Bson::Int32(1))).to_bytes().unwrap();
         for (body, terminal) in [(&[0, 0, 0, 0, 9][..], true), (&[0, 0, 0, 0][..], false)] {
             let bytes = [&a[..], &frame(op_code::MSG, body), &b].concat();
-            contract::check_decode_with_alloc_limit(Messages::new, &bytes, 2 * MAX_MESSAGE_SIZE);
-            let (items, failure) = decode_all(Messages::new, &bytes);
+            contract::check_decode_with_alloc_limit(Frames::<Message>::new, &bytes, 2 * MAX_MESSAGE_SIZE);
+            let (items, failure) = decode_all(Frames::<Message>::new, &bytes);
             let ids: Vec<_> = items.into_iter().map(|m| m.map(|m| m.request_id)).collect();
             if terminal {
                 assert_eq!(ids, [Ok(1)]);
@@ -2174,7 +2159,7 @@ mod tests {
                 assert_eq!(failure, None);
             }
         }
-        let mut stream = Stream::new(Messages::new());
+        let mut stream = Stream::new(Frames::<Message>::new());
         assert_eq!(stream.push(&[3, 0, 0, 0]), 4);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Length(3)))));
         assert_eq!(stream.next(), None);
@@ -2184,11 +2169,11 @@ mod tests {
     #[test]
     fn stream_limit() {
         let a = msg(1, Document::new().with("ping", Bson::Int32(1))).to_bytes().unwrap();
-        assert_eq!(decode_all(|| Messages::with_limit(a.len()), &a).0.len(), 1);
-        assert_eq!(decode_all(|| Messages::with_limit(a.len() - 1), &a).1,
+        assert_eq!(decode_all(|| Frames::<Message>::with_limit(a.len()), &a).0.len(), 1);
+        assert_eq!(decode_all(|| Frames::<Message>::with_limit(a.len() - 1), &a).1,
             Some(Fail::Protocol(Error::Length(a.len() as i32))));
-        assert_eq!(Messages::with_limit(0).limit(), HEADER_LEN);
-        assert_eq!(Messages::with_limit(usize::MAX).limit(), MAX_MESSAGE_SIZE);
+        assert_eq!(Frames::<Message>::with_limit(0).limit(), HEADER_LEN);
+        assert_eq!(Frames::<Message>::with_limit(usize::MAX).limit(), MAX_MESSAGE_SIZE);
     }
 
     #[test]
@@ -2196,7 +2181,7 @@ mod tests {
         let one = msg(1, Document::new().with("ping", Bson::Int32(1))).to_bytes().unwrap();
         let bytes = one.repeat(100_000);
         let started = std::time::Instant::now();
-        let (items, failure) = decode_all(Messages::new, &bytes);
+        let (items, failure) = decode_all(Frames::<Message>::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(items.len(), 100_000);
         assert!(items.iter().all(Result::is_ok));
@@ -2207,9 +2192,9 @@ mod tests {
     fn stream_holds_at_most_one_message() {
         let a = msg(1, Document::new().with("ping", Bson::Int32(1))).to_bytes().unwrap();
         let bytes = a.repeat(1000);
-        contract::check_decode_with_alloc_limit(|| Messages::with_limit(a.len()), &bytes, 2 * a.len());
-        assert_eq!(decode_all(|| Messages::with_limit(a.len()), &bytes).0.len(), 1000);
-        let mut stream = Stream::new(Messages::with_limit(16));
+        contract::check_decode_with_alloc_limit(|| Frames::<Message>::with_limit(a.len()), &bytes, 2 * a.len());
+        assert_eq!(decode_all(|| Frames::<Message>::with_limit(a.len()), &bytes).0.len(), 1000);
+        let mut stream = Stream::new(Frames::<Message>::with_limit(16));
         assert_eq!(stream.push(&vec![0x41; 1 << 20]), 16);
         assert_eq!(stream.push(&[0x41; 8]), 0);
         assert_eq!(stream.buffered(), 16);
@@ -2425,8 +2410,8 @@ mod tests {
     fn check(data: &[u8]) {
         contract::check_wire::<Document>(data);
         contract::check_wire::<Message>(data);
-        contract::check_decode_with_alloc_limit(Messages::new, data, 2 * MAX_MESSAGE_SIZE);
-        for message in decode_all(Messages::new, data).0.into_iter().flatten() {
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * MAX_MESSAGE_SIZE);
+        for message in decode_all(Frames::<Message>::new, data).0.into_iter().flatten() {
             assert!(message.to_bytes().is_ok(), "{message:?}");
             contract::check_wire_value(&message);
         }

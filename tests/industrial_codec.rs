@@ -1,5 +1,6 @@
 //! Industrial transport frames through the shared codec driver.
 
+use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
     Decode, Fail, Step, Stream, Wire, contract, finish, pump, test_support::{chunks, decode_all},
@@ -123,18 +124,18 @@ fn dnp3_application_request_and_response() {
             .unwrap(),
         })
         .collect();
-    let bytes = round_trip(dnp3::Frames::new, &frames);
-    let make = || dnp3::Frames.map(|frame| frame.segment().map(|s| dnp3::Fragment::parse(&s.data)));
+    let bytes = round_trip(Frames::<dnp3::Frame>::new, &frames);
+    let make = || Frames::<dnp3::Frame>::new().map(|frame| frame.segment().map(|s| dnp3::Fragment::parse(&s.data)));
     contract::check_decode(make, &bytes);
     decode_chunks(make, &bytes, &[Ok(Ok(request)), Ok(Ok(response))]);
-    eof_at_every_prefix(dnp3::Frames::new, &frames[0].to_bytes().unwrap());
+    eof_at_every_prefix(Frames::<dnp3::Frame>::new, &frames[0].to_bytes().unwrap());
 
     // Repeated maximum frames exercise counted pushes and every data CRC.
     let large = dnp3::Frame {
         data: vec![0x42; dnp3::MAX_DATA],
         ..frames[0].clone()
     };
-    round_trip(dnp3::Frames::new, &[large.clone(), large.clone(), large]);
+    round_trip(Frames::<dnp3::Frame>::new, &[large.clone(), large.clone(), large]);
     rollback(&dnp3::Frame {
         data: vec![0; dnp3::MAX_DATA + 1],
         ..frames[0].clone()
@@ -163,22 +164,22 @@ fn iec104_information_acknowledgment_and_link_control() {
         },
         iec104::Frame::Supervisory { receive: 1 },
     ];
-    let bytes = round_trip(iec104::Frames::new, &frames);
+    let bytes = round_trip(Frames::<iec104::Frame>::new, &frames);
     let make = || {
-        iec104::Frames.map(|frame| match frame {
+        Frames::<iec104::Frame>::new().map(|frame| match frame {
             iec104::Frame::Information { asdu, .. } => Some(iec104::Asdu::parse(&asdu)),
             _ => None,
         })
     };
     contract::check_decode(make, &bytes);
     decode_chunks(make, &bytes, &[None, Some(Ok(asdu)), None]);
-    eof_at_every_prefix(iec104::Frames::new, &frames[1].to_bytes().unwrap());
+    eof_at_every_prefix(Frames::<iec104::Frame>::new, &frames[1].to_bytes().unwrap());
     let max = iec104::Frame::Information {
         send: 0x7fff,
         receive: 0x7fff,
         asdu: vec![0; iec104::MAX_ASDU],
     };
-    round_trip(iec104::Frames::new, &[max.clone(), max]);
+    round_trip(Frames::<iec104::Frame>::new, &[max.clone(), max]);
     for invalid in [
         iec104::Frame::Supervisory { receive: 0x8000 },
         iec104::Frame::Information {
@@ -237,9 +238,9 @@ fn enip_cip_request_and_response() {
         },
     };
     let packet = enip_packet(send.to_bytes().unwrap());
-    let bytes = round_trip(enip::Packets::new, core::slice::from_ref(&packet));
+    let bytes = round_trip(Frames::<enip::Packet>::new, core::slice::from_ref(&packet));
     let make = || {
-        enip::Packets.map(|p| {
+        Frames::<enip::Packet>::new().map(|p| {
             let send = enip::SendData::parse(&p.data)?;
             let item = send.cpf.items.get(1).ok_or(enip::Error::Items)?;
             enip::MessageRequest::parse(&item.data)
@@ -267,15 +268,15 @@ fn enip_cip_request_and_response() {
     };
     let reply = packet.reply(0, reply_data.to_bytes().unwrap());
     let make = || {
-        enip::Packets.map(|p| {
+        Frames::<enip::Packet>::new().map(|p| {
             let send = enip::SendData::parse(&p.data)?;
             let item = send.cpf.items.get(1).ok_or(enip::Error::Items)?;
             enip::MessageResponse::parse(&item.data)
         })
     };
     decode_chunks(make, &Wire::to_bytes(&reply).unwrap(), &[Ok(response)]);
-    round_trip(enip::Packets::new, &[packet.clone(), reply]);
-    eof_at_every_prefix(enip::Packets::new, &packet.to_bytes().unwrap());
+    round_trip(Frames::<enip::Packet>::new, &[packet.clone(), reply]);
+    eof_at_every_prefix(Frames::<enip::Packet>::new, &packet.to_bytes().unwrap());
     rollback(&enip::Packet {
         options: 1,
         ..packet.clone()
@@ -305,14 +306,14 @@ fn enip_preserves_permissive_framing_and_partial_packets() {
         Err(enip::Error::Options)
     );
     rollback(&raw);
-    decode_chunks(enip::Packets::new, &bytes, core::slice::from_ref(&raw));
+    decode_chunks(Frames::<enip::Packet>::new, &bytes, core::slice::from_ref(&raw));
     bytes[20..24].copy_from_slice(&0u32.to_le_bytes());
     assert_eq!(
         <enip::Packet as Wire>::parse(&bytes),
         Err(enip::Error::TooLong)
     );
 
-    let mut decoder = Stream::new(enip::Packets);
+    let mut decoder = Stream::new(Frames::<enip::Packet>::new());
     bytes.extend_from_slice(&valid.to_bytes().unwrap());
     assert_eq!(decoder.push(&bytes), enip::PACKETS_CAPACITY);
     let oversized = decoder.next().unwrap().unwrap();
@@ -327,7 +328,7 @@ fn enip_preserves_permissive_framing_and_partial_packets() {
     // A consumed packet may precede a partial packet.
     let mut joined = valid.to_bytes().unwrap();
     joined.extend_from_slice(&valid.to_bytes().unwrap());
-    let mut decoder = Stream::new(enip::Packets);
+    let mut decoder = Stream::new(Frames::<enip::Packet>::new());
     assert_eq!(
         decoder.push(&joined[..enip::HEADER_LEN + 3]),
         enip::HEADER_LEN + 3
@@ -374,14 +375,14 @@ fn opcua_handshake_and_multichunk_message() {
             chunk.write(&mut original).unwrap();
         }
     }
-    let (frames, failure) = decode_all(|| opcua::Chunks::with_limits(limits), &original);
+    let (frames, failure) = decode_all(|| Frames::<opcua::Chunk>::with_limit(limits), &original);
     assert!(failure.is_none());
     assert!(
         frames
             .iter()
             .any(|c| c.chunk_type == opcua::ChunkType::Intermediate)
     );
-    let bytes = round_trip(|| opcua::Chunks::with_limits(limits), &frames);
+    let bytes = round_trip(|| Frames::<opcua::Chunk>::with_limit(limits), &frames);
     assert_eq!(bytes, original);
     contract::check_decode_with_held_limit(
         || opcua::Messages::with_limits(limits),
@@ -394,7 +395,7 @@ fn opcua_handshake_and_multichunk_message() {
     finish(&mut stream, |message| parsed.push(message)).unwrap();
     assert_eq!(parsed, messages);
     assert_eq!(stream.held(), 0);
-    eof_at_every_prefix(opcua::Chunks::new, &Wire::to_bytes(&frames[0]).unwrap());
+    eof_at_every_prefix(Frames::<opcua::Chunk>::new, &Wire::to_bytes(&frames[0]).unwrap());
     for message_type in [
         opcua::MessageType::Hello,
         opcua::MessageType::Open,
@@ -417,12 +418,12 @@ fn opcua_handshake_and_multichunk_message() {
 #[test]
 fn opcua_limits_headers_and_handshake_normalization() {
     for size in [0, 1, opcua::MIN_BUFFER_SIZE, u32::MAX] {
-        let frames = opcua::Chunks::with_limits(opcua::Limits {
+        let frames = Frames::<opcua::Chunk>::with_limit(opcua::Limits {
             receive_buffer_size: size,
             max_message_size: 1,
             max_chunk_count: 1,
         });
-        assert_eq!(frames.limits().receive_buffer_size, size);
+        assert_eq!(frames.limit().receive_buffer_size, size);
         assert_eq!(
             frames.capacity(),
             size.clamp(opcua::MIN_BUFFER_SIZE, opcua::MAX_BUFFER_SIZE)
@@ -435,12 +436,12 @@ fn opcua_limits_headers_and_handshake_normalization() {
         size: opcua::MIN_BUFFER_SIZE + 1,
         limit: opcua::MIN_BUFFER_SIZE,
     };
-    let mut stream = Stream::new(opcua::Chunks::new());
+    let mut stream = Stream::new(Frames::<opcua::Chunk>::new());
     assert_eq!(stream.push(&header), header.len());
     assert_eq!(stream.next(), Some(Err(Fail::Protocol(error.clone()))));
     assert_eq!(stream.failed(), Some(&Fail::Protocol(error)));
     assert!(stream.next().is_none());
-    contract::check_decode(opcua::Chunks::new, &header);
+    contract::check_decode(Frames::<opcua::Chunk>::new, &header);
 
     // Limits can change between items; a larger capacity grows on demand.
     let chunk = opcua::Chunk {
@@ -448,8 +449,8 @@ fn opcua_limits_headers_and_handshake_normalization() {
         chunk_type: opcua::ChunkType::Final,
         body: vec![0; opcua::MIN_BUFFER_SIZE as usize],
     };
-    let mut stream = Stream::new(opcua::Chunks::new());
-    stream.decoder().set_limits(opcua::Limits {
+    let mut stream = Stream::new(Frames::<opcua::Chunk>::new());
+    stream.decoder().set_limit(opcua::Limits {
         receive_buffer_size: 65536,
         ..opcua::Limits::default()
     });
@@ -463,7 +464,7 @@ fn opcua_limits_headers_and_handshake_normalization() {
         chunk_type: opcua::ChunkType::Final,
         body: vec![0; opcua::MAX_HANDSHAKE_SIZE as usize - opcua::HEADER_LEN],
     };
-    round_trip(opcua::Chunks::new, core::slice::from_ref(&handshake));
+    round_trip(Frames::<opcua::Chunk>::new, core::slice::from_ref(&handshake));
     let mut bytes = Wire::to_bytes(&handshake).unwrap();
     bytes[3] = 0;
     assert_eq!(<opcua::Chunk as Wire>::parse(&bytes), Ok(handshake));
@@ -476,7 +477,7 @@ fn opcua_limits_headers_and_handshake_normalization() {
     };
     contract::check_wire_value(&max);
     let bytes = Wire::to_bytes(&max).unwrap();
-    let mut frames = opcua::Chunks::with_limits(opcua::Limits {
+    let mut frames = Frames::<opcua::Chunk>::with_limit(opcua::Limits {
         receive_buffer_size: u32::MAX,
         ..opcua::Limits::default()
     });
@@ -520,9 +521,9 @@ fn rdp_slow_path_negotiation_data_and_fast_path() {
             payload: vec![0; 126],
         },
     ];
-    let bytes = round_trip(rdp::Frames::new, &frames);
+    let bytes = round_trip(Frames::<rdp::Frame>::new, &frames);
     let make = || {
-        rdp::Frames.map(|frame| match frame {
+        Frames::<rdp::Frame>::new().map(|frame| match frame {
             rdp::Frame::SlowPath(packet) => Some(rdp::Connection::from_packet(&packet)),
             _ => None,
         })
@@ -543,8 +544,8 @@ fn rdp_slow_path_negotiation_data_and_fast_path() {
         panic!()
     };
     assert_eq!(rdp::read_data(packet).unwrap(), b"MCS payload");
-    eof_at_every_prefix(rdp::Frames::new, &frames[0].to_bytes().unwrap());
-    eof_at_every_prefix(rdp::Frames::new, &frames[4].to_bytes().unwrap());
+    eof_at_every_prefix(Frames::<rdp::Frame>::new, &frames[0].to_bytes().unwrap());
+    eof_at_every_prefix(Frames::<rdp::Frame>::new, &frames[4].to_bytes().unwrap());
     for invalid in [
         rdp::Frame::FastPath {
             header: 1,
@@ -589,29 +590,29 @@ fn framing_errors_are_terminal_once_and_keep_unread_bytes() {
         assert_eq!(stream.push(b"more"), 4);
         assert!(stream.next().is_none());
     }
-    check(dnp3::Frames::new, &[5, 0x64, 4], dnp3::Error::FrameLength);
+    check(Frames::<dnp3::Frame>::new, &[5, 0x64, 4], dnp3::Error::FrameLength);
     check(
-        dnp3::Frames::new,
+        Frames::<dnp3::Frame>::new,
         &[5, 0x64, 5, 0, 0, 0, 0, 0, 0, 0],
         dnp3::Error::Crc(8),
     );
     check(
-        iec104::Frames::new,
+        Frames::<iec104::Frame>::new,
         &[0x68, 254],
         iec104::Error::ApduLength,
     );
     check(
-        iec104::Frames::new,
+        Frames::<iec104::Frame>::new,
         &[0x68, 4, 3, 0, 0, 0],
         iec104::Error::Control,
     );
     check(
-        rdp::Frames::new,
+        Frames::<rdp::Frame>::new,
         &[1],
         rdp::Error::Invalid("fast-path action"),
     );
     check(
-        opcua::Chunks::new,
+        Frames::<opcua::Chunk>::new,
         b"OPNC",
         opcua::Error::ChunkType(opcua::MessageType::Open, b'C'),
     );

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 extern crate alloc;
 
 use alloc::{collections::BinaryHeap, vec::Vec};
@@ -625,7 +627,7 @@ mod tests {
             rewrite: Rewrite::Drop,
         });
         let mut faults = Faults::new(0, 16, 4);
-        let mut stream = Stream::new(modbus::Frames);
+        let mut stream = Stream::new(Frames::<modbus::Frame>::new());
         assert_eq!(stream.push(&input), input.len());
         let mut out = Vec::new();
         assert!(matches!(
@@ -638,7 +640,7 @@ mod tests {
             ))))
         ));
 
-        let mut stream = Stream::new(modbus::Frames);
+        let mut stream = Stream::new(Frames::<modbus::Frame>::new());
         let mut accepted = 0;
         let mut items = 0;
         while accepted < input.len() {
@@ -877,7 +879,7 @@ mod tests {
             Some(FaultDelay { at: 1, duration })
         );
         assert_eq!(
-            test_support::decode_all(|| modbus::Frames, &out[1..]).0,
+            test_support::decode_all(Frames::<modbus::Frame>::new, &out[1..]).0,
             core::slice::from_ref(&frame)
         );
         let before = out.clone();

@@ -2,9 +2,10 @@
 //! reads them, and packets a world builds, as it writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
-use fictionet::stdlib::rtcp::{Frame, Frames};
+use fictionet::stdlib::rtcp::Frame;
 use fictionet::stdlib::rtcp::{
     App, Body, Bye, Datagram, Compound, DlrrItem, ExtendedReport, Fir, MAX_DATAGRAM, MAX_PACKET, Nack, Packet,
     PayloadFeedback, PayloadMessage, ReceiverReport, Remb, ReportBlock, Rpsi, SdesChunk, SdesItem, SenderReport, Sli,
@@ -196,14 +197,14 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * (MAX_DATAGRAM + 2));
+    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * (MAX_DATAGRAM + 2));
     contract::check_decode_with_alloc_limit(
-        || Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+        || Frames::<Frame>::with_limit(usize::from(data.first().copied().unwrap_or(0))),
         data,
         514,
     );
     contract::check_decode_with_alloc_limit(
-        || Frames::new().map(|frame| Datagram::parse(&frame.0)),
+        || Frames::<Frame>::new().map(|frame| Datagram::parse(&frame.0)),
         data,
         2 * (MAX_DATAGRAM + 2),
     );
@@ -217,7 +218,7 @@ fuzz_target!(|data: &[u8]| {
 
     // The bytes as one datagram.
     datagram(data);
-    for frame in decode_all(Frames::new, data).0 {
+    for frame in decode_all(Frames::<Frame>::new, data).0 {
         datagram(&frame.0);
     }
     let _ = built(data);

@@ -1,9 +1,10 @@
 //! RDP connection codecs, transport framing and bounded streaming.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::codec::{Wire, test_support::decode_all};
-use fictionet::stdlib::rdp::Frames;
+
 use fictionet::stdlib::rdp::{
     ActiveKind, ActivePdu, CapabilitySet, CapabilityType, ChannelDefinition, ClientInfo,
     Connection, ConnectionKind, DataBlock, DataBlocks, FailureCode, Frame, GccConference,
@@ -259,10 +260,10 @@ fn built(data: &[u8]) {
 
 fuzz_target!(|data: &[u8]| {
     let data = prefix(data, MAX_FUZZ_INPUT);
-    check_decode(Frames::new, data);
+    check_decode(Frames::<Frame>::new, data);
     check_wire::<Frame>(data);
     pdu(data);
-    let (frames, _) = decode_all(Frames::new, data);
+    let (frames, _) = decode_all(Frames::<Frame>::new, data);
     for value in frames {
         frame(&value);
     }

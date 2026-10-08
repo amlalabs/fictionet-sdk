@@ -1,5 +1,6 @@
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use core::time::Duration;
 use fictionet::stdlib::{
     codec::{
@@ -268,12 +269,12 @@ fuzz_target!(|data: &[u8]| {
         .iter()
         .take(8)
         .fold(0u64, |seed, byte| (seed << 8) | u64::from(*byte));
-    forward(|| modbus::Frames, input);
+    forward(Frames::<modbus::Frame>::new, input);
     forward(json::Values::new, input);
     forward(
         || {
             Pipe::new(
-                modbus::Frames,
+                Frames::<modbus::Frame>::new(),
                 Lines::new(128, Ending::LfOrCrlf),
                 |frame: modbus::Frame| Carry::Bytes(frame.pdu),
             )
@@ -282,8 +283,8 @@ fuzz_target!(|data: &[u8]| {
     );
     forward(|| Lines::new(128, Ending::LfOrCrlf), input);
     assert_eq!(
-        faults(|| modbus::Frames, input, seed),
-        faults(|| modbus::Frames, input, seed)
+        faults(Frames::<modbus::Frame>::new, input, seed),
+        faults(Frames::<modbus::Frame>::new, input, seed)
     );
     assert_eq!(
         faults(|| Lines::new(128, Ending::LfOrCrlf), input, seed),

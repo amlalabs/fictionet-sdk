@@ -17,7 +17,7 @@
 //! extended vendor-specific attributes. Its dictionary holds every
 //! standard attribute from 1 to 101, and it reads the data types of RFC
 //! 6572 and RFC 8044. RFC 6613 and RFC 6614 carry the same packets
-//! over TCP and TLS. [`Stream<Packets>`](fictionet::stdlib::codec::Stream) reads those streams.
+//! over TCP and TLS. [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream) reads those streams.
 //!
 //! Nothing here reads a socket, and nothing here does cryptography. A
 //! world that plays a RADIUS server gives each datagram's bytes to
@@ -65,9 +65,12 @@
 //! assert_eq!(out[4..], [0; 16]);
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Wire};
 
 /// The UDP port RADIUS servers take Access-Requests on.
 pub const AUTH_PORT: u16 = 1812;
@@ -679,19 +682,20 @@ impl Wire for Packet {
 
 /// Reads RADIUS over TCP or TLS packets without retaining input.
 ///
-/// Use with [`fictionet::stdlib::codec::Stream`] for a buffer bounded by [`limit`](Self::limit).
+/// Use with [`fictionet::stdlib::codec::Stream`] for a buffer bounded by [`limit`](fictionet::stdlib::codec::Frames::limit).
 /// The first four bytes suffice to refuse an invalid or excessive length. Partial packets
-/// return [`Step::Need`], including at EOF, so the driver reports truncation.
+/// return [`fictionet::stdlib::codec::Step::Need`], including at EOF, so the driver reports truncation.
 /// An invalid length or malformed attributes ends the stream.
 /// [RFC 6613 §2.6.4] requires closing the connection on malformed attributes.
 ///
 /// [RFC 6613 §2.6.4]: https://www.rfc-editor.org/rfc/rfc6613.html#section-2.6.4
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, radius::{Code, Packet, Packets}};
+/// use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
+/// use fictionet::stdlib::radius::{Code, Packet};
 /// let packet = Packet::new(Code::AccessRequest, 7, [0; 16]);
 /// let bytes = Wire::to_bytes(&packet)?;
-/// let mut stream = Stream::new(Packets::with_limit(1024));
+/// let mut stream = Stream::new(Frames::<Packet>::with_limit(1024));
 /// let mut packets = Vec::new();
 /// for chunk in bytes.chunks(3) {
 ///     pump(&mut stream, chunk, |item| packets.push(item))?;
@@ -700,59 +704,38 @@ impl Wire for Packet {
 /// assert_eq!(packets, vec![packet]);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Packets {
-    limit: usize,
-}
-
-impl Packets {
-    /// Creates a decoder accepting packets up to [`MAX_PACKET`] bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_PACKET)
-    }
-
-    /// Sets the whole-packet limit, clamped to [`HEADER_LEN`] through [`MAX_PACKET`].
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.clamp(HEADER_LEN, MAX_PACKET),
-        }
-    }
-
-    /// The largest accepted packet, including its header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Packets {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Packets {
+impl Prefixed for Packet {
     type Item = Packet;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "RADIUS";
 
-    fn capacity(&self) -> usize {
-        self.limit
-    }
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_PACKET }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
-        let Some(&[_, _, hi, lo]) = input.get(..4) else { return Ok(Step::Need) };
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(HEADER_LEN, MAX_PACKET) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize { *limit }
+
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        let Some(&[_, _, hi, lo]) = input.get(..4) else { return Ok(None) };
         let length = u16::from_be_bytes([hi, lo]);
         let used = usize::from(length);
         if used < HEADER_LEN {
-            return Err(Error::Length { length: used, limit: self.limit });
+            return Err(Error::Length { length: used, limit });
         }
-        if used > self.limit {
-            return Err(Error::Length { length: used, limit: self.limit });
+        if used > limit {
+            return Err(Error::Length { length: used, limit });
         }
-        let Some(bytes) = input.get(..used) else { return Ok(Step::Need) };
-        Ok(Step::Item(Packet::parse(bytes)?, used))
+        let Some(bytes) = input.get(..used) else { return Ok(None) };
+        Ok(Some((Packet::parse(bytes)?, used)))
     }
 }
+
 
 /// Reads attributes (type, length, value) filling all of `b`. Each
 /// length must be at least `min`. On failure it gives the offset of the
@@ -1596,8 +1579,8 @@ pub const DICTIONARY: &[AttributeInfo] = {
         info(ACCT_SESSION_ID, "Acct-Session-Id", Text),
         info(ACCT_AUTHENTIC, "Acct-Authentic", Enum),
         info(ACCT_SESSION_TIME, "Acct-Session-Time", Integer),
-        info(ACCT_INPUT_PACKETS, "Acct-Input-Packets", Integer),
-        info(ACCT_OUTPUT_PACKETS, "Acct-Output-Packets", Integer),
+        info(ACCT_INPUT_PACKETS, "Acct-Input-Frames::<Packet>", Integer),
+        info(ACCT_OUTPUT_PACKETS, "Acct-Output-Frames::<Packet>", Integer),
         info(ACCT_TERMINATE_CAUSE, "Acct-Terminate-Cause", Enum),
         info(ACCT_MULTI_SESSION_ID, "Acct-Multi-Session-Id", Text),
         info(ACCT_LINK_COUNT, "Acct-Link-Count", Integer),
@@ -1634,7 +1617,7 @@ pub const DICTIONARY: &[AttributeInfo] = {
         info(TUNNEL_PREFERENCE, "Tunnel-Preference", String),
         info(ARAP_CHALLENGE_RESPONSE, "ARAP-Challenge-Response", String),
         info(ACCT_INTERIM_INTERVAL, "Acct-Interim-Interval", Integer),
-        info(ACCT_TUNNEL_PACKETS_LOST, "Acct-Tunnel-Packets-Lost", Integer),
+        info(ACCT_TUNNEL_PACKETS_LOST, "Acct-Tunnel-Frames::<Packet>-Lost", Integer),
         info(NAS_PORT_ID, "NAS-Port-Id", Text),
         info(FRAMED_POOL, "Framed-Pool", Text),
         info(CUI, "CUI", String),
@@ -1918,8 +1901,8 @@ mod tests {
                 }
                 assert_eq!(Packet::parse_datagram(&bytes[..n]), Err(e));
             }
-            contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_PACKET);
-            assert_eq!(decode_all(Packets::new, &bytes), (vec![Packet::parse(&bytes).unwrap()], None));
+            contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_PACKET);
+            assert_eq!(decode_all(Frames::<Packet>::new, &bytes), (vec![Packet::parse(&bytes).unwrap()], None));
         }
     }
 
@@ -2329,7 +2312,7 @@ mod tests {
             (attr::EGRESS_VLANID, "Egress-VLANID", DataType::Integer),
             (attr::INGRESS_FILTERS, "Ingress-Filters", DataType::Enum),
             (attr::TUNNEL_PRIVATE_GROUP_ID, "Tunnel-Private-Group-ID", DataType::String),
-            (attr::ACCT_TUNNEL_PACKETS_LOST, "Acct-Tunnel-Packets-Lost", DataType::Integer),
+            (attr::ACCT_TUNNEL_PACKETS_LOST, "Acct-Tunnel-Frames::<Packet>-Lost", DataType::Integer),
             (attr::CUI, "CUI", DataType::String),
             (attr::NAS_FILTER_RULE, "NAS-Filter-Rule", DataType::Text),
             (attr::LONG_EXTENDED_TYPE_1, "Long-Extended-Type-1", DataType::LongExtended),
@@ -2443,15 +2426,15 @@ mod tests {
     fn stream_splits_packets() {
         let a = hex(ACCESS_REQUEST);
         let data = [a.clone(), hex(ACCESS_ACCEPT)].concat();
-        contract::check_decode_with_alloc_limit(Packets::new, &data, 2 * MAX_PACKET);
-        let (packets, error) = decode_all(Packets::new, &data);
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &data, 2 * MAX_PACKET);
+        let (packets, error) = decode_all(Frames::<Packet>::new, &data);
         assert_eq!(error, None);
         assert_eq!(packets.iter().map(|p| p.code).collect::<Vec<_>>(), [Code::AccessRequest, Code::AccessAccept]);
-        assert_eq!(decode_all(Packets::new, &[1, 0, 0, 5]).1,
+        assert_eq!(decode_all(Frames::<Packet>::new, &[1, 0, 0, 5]).1,
             Some(Fail::Protocol(Error::Length { length: 5, limit: MAX_PACKET })));
         let mut bad = a;
         bad[21] = 1;
-        assert_eq!(decode_all(Packets::new, &bad).1, Some(Fail::Protocol(Error::Attribute(20))));
+        assert_eq!(decode_all(Frames::<Packet>::new, &bad).1, Some(Fail::Protocol(Error::Attribute(20))));
     }
 
     #[test]
@@ -2459,11 +2442,11 @@ mod tests {
         // A stream pushed in one call is taken a packet's worth at a time.
         let one = Packet::new(Code::StatusServer, 1, [0; 16]).to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 1000).collect();
-        let mut d = Stream::new(Packets::new());
+        let mut d = Stream::new(Frames::<Packet>::new());
         assert_eq!(d.push(&stream), MAX_PACKET);
         assert_eq!(d.push(&stream[MAX_PACKET..]), 0);
         assert_eq!(d.buffered(), MAX_PACKET);
-        let (packets, error) = decode_all(Packets::new, &stream);
+        let (packets, error) = decode_all(Frames::<Packet>::new, &stream);
         assert_eq!((packets.len(), error), (1000, None));
         // A packet of the longest length fills the decoder, and is read.
         let mut big = Packet::new(Code::AccessAccept, 2, [0; 16]);
@@ -2472,7 +2455,7 @@ mod tests {
         big.push(Attribute { kind: attr::CLASS, value: vec![2; room] }).unwrap();
         let bytes = big.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_PACKET);
-        let mut d = Stream::new(Packets::new());
+        let mut d = Stream::new(Frames::<Packet>::new());
         assert_eq!(d.push(&[bytes.clone(), bytes.clone()].concat()), MAX_PACKET);
         assert_eq!(d.next(), Some(Ok(big)));
         assert_eq!(d.buffered(), 0);
@@ -2483,7 +2466,7 @@ mod tests {
         let one = Packet::new(Code::StatusServer, 1, [0; 16]).to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100_000).collect();
         let started = std::time::Instant::now();
-        let (packets, error) = decode_all(Packets::new, &stream);
+        let (packets, error) = decode_all(Frames::<Packet>::new, &stream);
         assert_eq!((packets.len(), error), (100_000, None));
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
     }
@@ -2664,7 +2647,7 @@ mod tests {
             let again: Vec<Extended> = q.extended().into_iter().map(Result::unwrap).collect();
             assert_eq!(again, ext);
         }
-        contract::check_decode_with_alloc_limit(Packets::new, data, 2 * MAX_PACKET);
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_PACKET);
         contract::check_wire::<Packet>(data);
     }
 

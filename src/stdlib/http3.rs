@@ -7,7 +7,7 @@
 //! use the RFC 8941 grammar, including values and parameters we ignore.
 //!
 //! [`Session`] routes ordered stream bytes under a shared input budget.
-//! For a single stream, use [`Stream<Frames>`](fictionet::stdlib::codec::Stream),
+//! For a single stream, use [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream),
 //! [`ControlFrames`], or [`StreamHeaders`]. [`RequestStream`] validates decoded
 //! request and push frames. QPACK tables and blocked sections belong to the
 //! caller, who applies instructions and sends acknowledgment values between
@@ -40,6 +40,7 @@
 //! # Ok::<(), fictionet::stdlib::http3::Error>(())
 //! ```
 
+use fictionet::stdlib::codec::{Prefixed, Frames};
 use fictionet::stdlib::codec::ascii::{self, trim_ows, is_tchar as token};
 use fictionet::stdlib::{
     codec::{self, Decode, Step, Wire},
@@ -1272,7 +1273,7 @@ pub enum RequestResult {
 
 /// Request or push message state over decoded [`Frame`] values.
 ///
-/// Drive [`Frames`] with [`codec::Stream`] or route [`Session`] frame items
+/// Drive [`codec::Frames<Frame>`](fictionet::stdlib::codec::Frames) with [`codec::Stream`] or route [`Session`] frame items
 /// here. This state checks message order: HEADERS and
 /// DATA ordering, trailers, interim responses, CONNECT, and Content-Length.
 /// Received duplicate identical Content-Length values are normalized.
@@ -1288,13 +1289,14 @@ pub enum RequestResult {
 /// After the byte decoder reaches a clean FIN, call [`Self::finish`].
 ///
 /// ```
+/// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::{codec::{Stream, Wire}, http3::{self, Frame, MessageSide}, qpack};
 /// let headers = http3::HeaderList { fields: vec![
 ///     qpack::Field::new(":status", "200"), qpack::Field::new("content-length", "0"),
 /// ] };
 /// let mut encoder = qpack::Encoder::new(0, http3::MAX_FIELD_SECTION_SIZE);
 /// let section = headers.section(&mut encoder, 0, http3::HeaderKind::Response)?;
-/// let mut input = Stream::new(http3::Frames::new());
+/// let mut input = Stream::new(Frames::<http3::Frame>::new());
 /// let frame = Wire::to_bytes(&Frame::headers(&section)?)?;
 /// assert_eq!(input.push(&frame), frame.len());
 /// let table = qpack::Table::new(0);
@@ -1728,31 +1730,28 @@ impl Wire for StreamHeader {
 /// enforce the associated HTTP/3 connection or stream error policy.
 /// Partial frames return [`Step::Need`], including at EOF, so [`codec::Stream`]
 /// reports truncation. Allocation grows only when the driver receives bytes.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
-
-impl Frames {
-    /// Creates an input-free decoder bounded by [`MAX_FRAME`].
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Decode for Frames {
+impl Prefixed for Frame {
     type Item = Result<Frame, Error>;
     type Error = Error;
+    type Limit = ();
     const NAME: &'static str = "HTTP/3 frames";
 
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         MAX_FRAME
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
-        let Some((kind, start, end)) = frame_header(input)? else { return Ok(Step::Need) };
-        let Some(payload) = input.get(start..end) else { return Ok(Step::Need) };
-        Ok(Step::Item(Frame::parse_payload(kind, payload), end))
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let Some((kind, start, end)) = frame_header(input)? else { return Ok(None) };
+        let Some(payload) = input.get(start..end) else { return Ok(None) };
+        Ok(Some((Frame::parse_payload(kind, payload), end)))
     }
 }
+
 
 /// Reads one unidirectional stream header, then returns [`Step::End`].
 ///
@@ -1762,14 +1761,15 @@ impl Decode for Frames {
 /// the connection may discard that stream as RFC 9114 section 6.2 permits.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire}, http3::{Frame, Frames, StreamHeader, StreamHeaders}};
+/// use fictionet::stdlib::codec::{Frames, Stream, Wire};
+/// use fictionet::stdlib::http3::{Frame, StreamHeader, StreamHeaders};
 /// let mut bytes = Wire::to_bytes(&StreamHeader::Push(7))?;
 /// Wire::write(&Frame::Data(vec![1, 2]), &mut bytes)?;
 /// let mut stream = Stream::new(StreamHeaders::new());
 /// assert_eq!(stream.push(&bytes), bytes.len());
 /// assert_eq!(stream.next(), Some(Ok(StreamHeader::Push(7))));
 /// assert_eq!(stream.next(), None); // End leaves the DATA bytes unread.
-/// let mut stream = stream.swap(Frames::new());
+/// let mut stream = stream.swap(Frames::<Frame>::new());
 /// assert_eq!(stream.next(), Some(Ok(Ok(Frame::Data(vec![1, 2])))));
 /// # Ok::<(), fictionet::stdlib::http3::Error>(())
 /// ```
@@ -1840,7 +1840,7 @@ impl Decode for ControlFrames {
         if eof && input.is_empty() {
             return Err(Error::ClosedCriticalStream);
         }
-        Ok(match Frames.decode(input, eof)? {
+        Ok(match Frames::<Frame>::new().decode(input, eof)? {
             Step::Item(item, used) => Step::Item(
                 item.and_then(|frame| {
                     self.state.accept(&frame)?;
@@ -1959,7 +1959,7 @@ impl Decode for StreamItems {
             StreamKind::Header(decoder) => {
                 stream_step(decoder.decode(input, eof)?, |header| Ok(StreamItem::Header(header)))
             }
-            StreamKind::Frames => stream_step(Frames.decode(input, eof)?, |frame| Ok(StreamItem::Frame(frame?))),
+            StreamKind::Frames => stream_step(Frames::<Frame>::new().decode(input, eof)?, |frame| Ok(StreamItem::Frame(frame?))),
             StreamKind::Control(decoder) => {
                 stream_step(decoder.decode(input, eof)?, |frame| Ok(StreamItem::Frame(frame?)))
             }
@@ -1967,7 +1967,7 @@ impl Decode for StreamItems {
                 if eof && input.is_empty() {
                     return Err(Error::ClosedCriticalStream);
                 }
-                let step = qpack::EncoderInstructions.decode(input, eof).map_err(Error::QpackEncoderStream)?;
+                let step = Frames::<qpack::EncoderInstruction>::new().decode(input, eof).map_err(Error::QpackEncoderStream)?;
                 if eof && matches!(step, Step::Need) {
                     return Err(Error::ClosedCriticalStream);
                 }
@@ -1977,7 +1977,7 @@ impl Decode for StreamItems {
                 if eof && input.is_empty() {
                     return Err(Error::ClosedCriticalStream);
                 }
-                let step = qpack::DecoderInstructions.decode(input, eof).map_err(Error::QpackDecoderStream)?;
+                let step = Frames::<qpack::DecoderInstruction>::new().decode(input, eof).map_err(Error::QpackDecoderStream)?;
                 if eof && matches!(step, Step::Need) {
                     return Err(Error::ClosedCriticalStream);
                 }
@@ -2214,7 +2214,7 @@ mod tests {
     fn messages(side: MessageSide, frames: &[Frame]) -> (Vec<Event>, Result<(), Error>) {
         let mut state = RequestStream::new(0, side, false).unwrap();
         let table = plain_qpack();
-        let (items, failure) = decode_all(Frames::new, &join(frames));
+        let (items, failure) = decode_all(Frames::<Frame>::new, &join(frames));
         assert!(failure.is_none());
         let mut events = Vec::new();
         for frame in items {
@@ -2448,8 +2448,8 @@ mod tests {
         ] {
             let bytes = frame.to_bytes().unwrap();
             contract::check_wire_value(&frame);
-            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_FRAME);
-            assert_eq!(decode_all(Frames::new, &bytes), (vec![Ok(frame)], None));
+            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
+            assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (vec![Ok(frame)], None));
         }
     }
     #[test]
@@ -2488,18 +2488,18 @@ mod tests {
         let big = Frame::Data(vec![0xab; MAX_FRAME_PAYLOAD]);
         let frames = [Frame::Data(vec![]), big.clone(), big];
         let bytes = join(&frames);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_FRAME);
-        assert_eq!(decode_all(Frames::new, &bytes), (frames.into_iter().map(Ok).collect(), None));
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
+        assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (frames.into_iter().map(Ok).collect(), None));
     }
     #[test]
     fn framing_errors_are_terminal_and_fin_checks_truncation() {
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&[2, 0]), 2);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::UnexpectedFrame(2)))));
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(&[0, 0]), 2);
         for bytes in [vec![0x40], vec![0], vec![0, 1]] {
-            let (_, error) = decode_all(Frames::new, &bytes);
+            let (_, error) = decode_all(Frames::<Frame>::new, &bytes);
             assert!(matches!(error, Some(Fail::Truncated { .. })));
         }
     }
@@ -2584,7 +2584,7 @@ mod tests {
     fn request_frame_contract_and_message_sequence() {
         let frames = [headers(&request()), Frame::Data(vec![1; 80]), headers(&fields(&[("x-check", "ok")]))];
         let bytes = join(&frames);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_FRAME);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
         let (events, result) = messages(MessageSide::Request, &frames);
         assert_eq!(
             events,
@@ -3026,7 +3026,7 @@ mod tests {
             Frame::Data(vec![42; 100]),
             headers(&fields(&[("x", "end")])),
         ];
-        contract::check_decode_with_alloc_limit(Frames::new, &join(&frames), 2 * MAX_FRAME);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &join(&frames), 2 * MAX_FRAME);
         for push in [false, true] {
             let mut state = if push {
                 RequestStream::push(3).unwrap()
@@ -3065,7 +3065,7 @@ mod tests {
     #[test]
     fn request_fin_refuses_partial_frames_and_missing_headers() {
         for bytes in [vec![], vec![0x21, 0]] {
-            let (items, error) = decode_all(Frames::new, &bytes);
+            let (items, error) = decode_all(Frames::<Frame>::new, &bytes);
             assert!(error.is_none());
             let mut state = RequestStream::new(0, MessageSide::Request, false).unwrap();
             for frame in items {
@@ -3076,7 +3076,7 @@ mod tests {
         for suffix in [vec![0], vec![0, 2, 1], vec![0x40]] {
             let mut bytes = headers(&request()).to_bytes().unwrap();
             bytes.extend(suffix);
-            let (items, error) = decode_all(Frames::new, &bytes);
+            let (items, error) = decode_all(Frames::<Frame>::new, &bytes);
             assert_eq!(items.len(), 1);
             assert!(matches!(error, Some(Fail::Truncated { .. })));
         }
@@ -3218,7 +3218,7 @@ mod tests {
         for _ in 0..FUZZ_CASES {
             let mut bytes = rng.bytes(MAX_TEST_BYTES);
             mutate(&mut rng, &mut bytes);
-            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_FRAME);
+            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_FRAME);
             contract::check_decode_with_alloc_limit(StreamHeaders::new, &bytes, 2 * MAX_STREAM_HEADER);
             contract::check_wire::<Frame>(&bytes);
             contract::check_wire::<Settings>(&bytes);
@@ -3236,7 +3236,7 @@ mod tests {
             }
             while session.next().is_some() {}
             assert!(session.buffered() <= budget);
-            let (items, _) = decode_all(Frames::new, &bytes);
+            let (items, _) = decode_all(Frames::<Frame>::new, &bytes);
             for frame in items.iter().flatten() {
                 contract::check_wire_value(frame);
             }

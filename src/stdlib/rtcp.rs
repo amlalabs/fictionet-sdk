@@ -25,7 +25,7 @@
 //! Nothing here reads a socket. A world that plays a media server takes
 //! each UDP datagram it receives, tells RTP from RTCP and from STUN or DTLS
 //! with [`classify`], reads the RTCP with [`Compound::parse`], and sends the
-//! bytes of what it answers. Over TCP, [`Stream<Frames>`](fictionet::stdlib::codec::Stream)
+//! bytes of what it answers. Over TCP, [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream)
 //! splits the stream into datagrams. [`Frame`] supplies the length prefix
 //! when writing. Report contents and responses to NACK or PLI belong to
 //! world code. SRTCP encryption is not handled here.
@@ -187,6 +187,7 @@ pub mod xr {
     pub const VOIP_METRICS: u8 = 7;
 }
 
+use fictionet::stdlib::codec::{Prefixed, Frames};
 use fictionet::stdlib::codec::{be16, be32, Decode, Step, Wire};
 
 /// One RTCP packet: what it carries, and how many bytes of padding follow.
@@ -1463,7 +1464,7 @@ impl Wire for Frame {
     /// Reads exactly one RFC 4571 frame. Refuses truncated frames and
     /// trailing bytes. An empty payload is a valid null frame.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        match Frames::new()
+        match Frames::<Frame>::new()
             .decode(bytes, true)
 ?
         {
@@ -1492,64 +1493,42 @@ impl Wire for Frame {
 /// from the prefix. Partial frames return [`Step::Need`], including at EOF,
 /// so [`fictionet::stdlib::codec::Stream`] reports truncation. RTCP body errors belong
 /// in a mapping through [`Datagram::parse`], where they do not end framing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Frames {
-    limit: usize,
-}
-
-impl Frames {
-    /// Creates a framer accepting payloads up to [`MAX_FRAME`] bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_FRAME)
-    }
-
-    /// Sets the payload limit, clamped to [`MAX_FRAME`]. Zero accepts
-    /// only null frames. The two-byte prefix is excluded from this limit.
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_FRAME),
-        }
-    }
-
-    /// The largest accepted datagram, excluding its length prefix.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Frames {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Frames {
+impl Prefixed for Frame {
     type Item = Frame;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "RTP/RTCP RFC 4571";
 
-    fn capacity(&self) -> usize {
-        2usize.saturating_add(self.limit)
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_FRAME }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_FRAME) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        2usize.saturating_add(limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
         let Some(&[hi, lo]) = input.get(..2) else {
-            return Ok(Step::Need);
+            return Ok(None);
         };
         let length = usize::from(u16::from_be_bytes([hi, lo]));
-        if length > self.limit {
+        if length > limit {
             return Err(Error::OverLimit {
                 length,
-                limit: self.limit,
+                limit,
             });
         }
         let used = 2usize.saturating_add(length);
-        Ok(match input.get(2..used) {
-            Some(bytes) => Step::Item(Frame(bytes.to_vec()), used),
-            None => Step::Need,
-        })
+        Ok(input.get(2..used).map(|bytes| (Frame(bytes.to_vec()), used)))
     }
 }
+
 
 /// Reads `n` report blocks from the start of `b`, which holds them all.
 fn report_blocks(b: &[u8], n: usize) -> Result<Vec<ReportBlock>, Error> {
@@ -2473,14 +2452,14 @@ mod tests {
         let frames = vec![Frame(a), Frame(vec![]), Frame(b)];
         let mut bytes: Vec<u8> = frames.iter().flat_map(|f| f.to_bytes().unwrap()).collect();
         bytes.extend_from_slice(&[0, 9, 1]);
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * (2 + MAX_FRAME));
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * (2 + MAX_FRAME));
         assert_eq!(
-            decode_all(Frames::new, &bytes),
+            decode_all(Frames::<Frame>::new, &bytes),
             (frames, Some(Fail::Truncated { unread: 3 }))
         );
         let frames = vec![Frame(vec![7; MAX_FRAME]), Frame(vec![1])];
         let bytes: Vec<u8> = frames.iter().flat_map(|f| f.to_bytes().unwrap()).collect();
-        assert_eq!(decode_all(Frames::new, &bytes), (frames, None));
+        assert_eq!(decode_all(Frames::<Frame>::new, &bytes), (frames, None));
     }
 
     #[test]
@@ -2968,9 +2947,9 @@ mod tests {
             check(&data);
             let mut bytes = Frame(data.clone()).to_bytes().unwrap();
             bytes.extend_from_slice(&data);
-            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * (2 + MAX_FRAME));
+            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * (2 + MAX_FRAME));
             assert_eq!(
-                decode_all(Frames::new, &bytes).0.first(),
+                decode_all(Frames::<Frame>::new, &bytes).0.first(),
                 Some(&Frame(data))
             );
         }

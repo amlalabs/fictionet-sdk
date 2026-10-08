@@ -1,15 +1,33 @@
 //! QPACK wire units, instruction streams, and caller-owned session state.
 #![no_main]
 
-use fictionet::stdlib::{
-    codec::{Stream, Wire, contract, test_support::decode_all, try_pump},
-    huffman::HuffmanString,
-    prefix_int::Integer,
-    qpack::{
-        self, DecoderInstruction, DecoderInstructions, EncoderInstruction, EncoderInstructions,
-        FieldSection, Representation, SectionResult, Table,
-    },
-};
+use fictionet::stdlib::codec::{Frames, Stream};
+
+use fictionet::stdlib::codec::Wire;
+
+use fictionet::stdlib::codec::contract;
+
+use fictionet::stdlib::codec::test_support::decode_all;
+
+use fictionet::stdlib::codec::try_pump;
+
+use fictionet::stdlib::huffman::HuffmanString;
+
+use fictionet::stdlib::prefix_int::Integer;
+
+use fictionet::stdlib::qpack;
+
+use fictionet::stdlib::qpack::DecoderInstruction;
+
+use fictionet::stdlib::qpack::EncoderInstruction;
+
+use fictionet::stdlib::qpack::FieldSection;
+
+use fictionet::stdlib::qpack::Representation;
+
+use fictionet::stdlib::qpack::SectionResult;
+
+use fictionet::stdlib::qpack::Table;
 use libfuzzer_sys::fuzz_target;
 
 /// Retains sections from two streams across a partial encoder instruction.
@@ -19,7 +37,7 @@ fn blocked_sections(bytes: &[u8]) {
     let (instructions, sections) = rest.split_at(usize::from(split) * rest.len() / 255);
     let (early, late) = instructions.split_at(instructions.len() / 2);
     let mut table = Table::new(4096);
-    let mut input = Stream::new(EncoderInstructions::new());
+    let mut input = Stream::new(Frames::<EncoderInstruction>::new());
     let mut held = qpack::BlockedSections::new(2);
     let mut sent = [Vec::new(), Vec::new()];
     if try_pump(&mut input, early, |instruction| table.apply(instruction?)).is_ok() {
@@ -80,8 +98,8 @@ fuzz_target!(|input: &[u8]| {
     contract::check_wire::<DecoderInstruction>(bytes);
     contract::check_wire::<Representation>(bytes);
     contract::check_wire::<FieldSection>(bytes);
-    contract::check_decode_with_alloc_limit(EncoderInstructions::new, bytes, 2 * qpack::MAX_INSTRUCTION);
-    contract::check_decode_with_alloc_limit(DecoderInstructions::new, bytes, 2 * qpack::MAX_INTEGER_BYTES);
+    contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, bytes, 2 * qpack::MAX_INSTRUCTION);
+    contract::check_decode_with_alloc_limit(Frames::<DecoderInstruction>::new, bytes, 2 * qpack::MAX_INTEGER_BYTES);
 
     let integer = input.iter().take(8).fold(0u64, |n, b| (n << 8) | u64::from(*b));
     let value = input[..input.len().min(qpack::MAX_STRING + 1)].to_vec();
@@ -109,7 +127,7 @@ fuzz_target!(|input: &[u8]| {
     blocked_sections(bytes);
 
     let mut table = Table::new(4096);
-    let (instructions, _) = decode_all(EncoderInstructions::new, bytes);
+    let (instructions, _) = decode_all(Frames::<EncoderInstruction>::new, bytes);
     for instruction in instructions {
         if instruction.and_then(|instruction| table.apply(instruction)).is_err() {
             break;
@@ -167,7 +185,7 @@ fuzz_target!(|input: &[u8]| {
             encoder.section(stream, &[qpack::Field::new("x-fuzz", value), qpack::Field::new("x-other", "2")]).unwrap();
         contract::check_wire_value(&section);
     }
-    let (acks, _) = decode_all(DecoderInstructions::new, bytes);
+    let (acks, _) = decode_all(Frames::<DecoderInstruction>::new, bytes);
     for ack in acks {
         if ack.and_then(|ack| encoder.apply_instruction(ack)).is_err() {
             break;

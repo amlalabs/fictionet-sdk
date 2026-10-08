@@ -26,8 +26,8 @@
 //! data. The Who-Is and I-Am services, which a client uses to find devices,
 //! are read and written in full by [`WhoIs`] and [`IAm`]. Every other
 //! service body is kept as raw bytes. World code walks its fields with
-//! [`ContextValue::read`], [`Tags`] and [`Values`]. Repeated application
-//! values can use [`Stream<Values>`](fictionet::stdlib::codec::Stream).
+//! [`ContextValue::read`], [`codec::Frames<Tag>`](fictionet::stdlib::codec::Frames) and [`codec::Frames<Value>`](fictionet::stdlib::codec::Frames). Repeated application
+//! values can use [`Stream<codec::Frames<Value>>`](fictionet::stdlib::codec::Stream).
 //!
 //! Nothing here reads a socket. A world that plays a BACnet device reads
 //! each datagram from its UDP socket, passes it to [`Bvlc::parse`], reads
@@ -76,7 +76,10 @@
 //! );
 //! ```
 
-use fictionet::stdlib::codec::{be16, Decode, Step, Wire, Reader, Truncated, Trailing};
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{be16, Wire, Reader, Truncated, Trailing};
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -1823,55 +1826,61 @@ impl<const TYPE: u8> ContextValue<TYPE> {
 
 /// A stateless reader of tag headers, including opening and closing tags.
 /// It consumes only the header. Read its contents using the service schema.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Tags;
-
-impl Decode for Tags {
+impl Prefixed for Tag {
     type Item = Tag;
     type Error = Error;
+    type Limit = ();
     const NAME: &'static str = "BACnet tag";
 
-    /// A tag header needs at most seven bytes.
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         7
     }
 
     /// Reads one header. Refuses reserved tag numbers and application
     /// opening or closing tags. An incomplete header needs more bytes.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Tag>, Error> {
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         match Tag::parse_prefix(input) {
-            Ok((tag, used)) => Ok(Step::Item(tag, used)),
-            Err(Error::Truncated) => Ok(Step::Need),
+            Ok((tag, used)) => Ok(Some((tag, used))),
+            Err(Error::Truncated) => Ok(None),
             Err(error) => Err(error),
         }
     }
 }
 
-/// A stateless reader of application-tagged primitive values.
-/// Context fields use [`ContextValue::read`]; constructed tags use [`Tags`].
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Values;
 
-impl Decode for Values {
+/// A stateless reader of application-tagged primitive values.
+/// Context fields use [`ContextValue::read`]; constructed tags use [`codec::Frames<Tag>`](fictionet::stdlib::codec::Frames).
+impl Prefixed for Value {
     type Item = Value;
     type Error = Error;
+    type Limit = ();
     const NAME: &'static str = "BACnet primitive";
 
-    /// The largest value contents plus the largest tag header.
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         MAX_VALUE_LEN + 7
     }
 
     /// Reads one primitive. Refuses context tags, reserved types and invalid
     /// or oversized values. An incomplete value needs more bytes.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Value>, Error> {
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         match Value::parse_prefix(input) {
-            Ok((value, used)) => Ok(Step::Item(value, used)),
-            Err(Error::Truncated) => Ok(Step::Need),
+            Ok((value, used)) => Ok(Some((value, used))),
+            Err(Error::Truncated) => Ok(None),
             Err(error) => Err(error),
         }
     }
 }
+
 
 impl<const TYPE: u8> Wire for ContextValue<TYPE> {
     type ParseError = Error;
@@ -1964,6 +1973,7 @@ impl From<Trailing> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{Lcg, contract};
 
@@ -2260,15 +2270,15 @@ mod tests {
     fn prefix_readers_obey_bounded_decode_contracts() {
         use fictionet::stdlib::codec::test_support::decode_all;
         let tags = [0x3e, 0x3f, 0xf9, 15];
-        contract::check_decode_with_alloc_limit(|| Tags, &tags, 2 * Tags.capacity());
-        assert_eq!(decode_all(|| Tags, &tags).0.len(), 3);
+        contract::check_decode_with_alloc_limit(Frames::<Tag>::new, &tags, 2 * Frames::<Tag>::new().capacity());
+        assert_eq!(decode_all(Frames::<Tag>::new, &tags).0.len(), 3);
         let values = ValueList(vec![Value::Real(72.3), Value::Unsigned(85)]);
         let bytes = values.to_bytes().unwrap();
-        contract::check_decode_with_alloc_limit(|| Values, &bytes, 2 * Values.capacity());
-        assert_eq!(decode_all(|| Values, &bytes), (values.0, None));
+        contract::check_decode_with_alloc_limit(Frames::<Value>::new, &bytes, 2 * Frames::<Value>::new().capacity());
+        assert_eq!(decode_all(Frames::<Value>::new, &bytes), (values.0, None));
         let oversized = [0x65, 255, 0xff, 0xff, 0xff, 0xff];
-        contract::check_decode_with_alloc_limit(|| Values, &oversized, 2 * Values.capacity());
-        assert!(Values.decode(&oversized, false).is_err());
+        contract::check_decode_with_alloc_limit(Frames::<Value>::new, &oversized, 2 * Frames::<Value>::new().capacity());
+        assert!(Frames::<Value>::new().decode(&oversized, false).is_err());
     }
 
     #[test]
@@ -2296,13 +2306,13 @@ mod tests {
         let (read_property, used) = ContextValue::<{ tag::ENUMERATED }>::read(&data[at..], 1).unwrap();
         assert_eq!(read_property, property);
         at += used;
-        let Step::Item(opening, used) = Tags.decode(&data[at..], true).unwrap() else { panic!() };
+        let Step::Item(opening, used) = Frames::<Tag>::new().decode(&data[at..], true).unwrap() else { panic!() };
         assert_eq!(opening, Tag { number: 3, class: Class::Context, content: TagContent::Opening });
         at += used;
-        let Step::Item(value, used) = Values.decode(&data[at..], true).unwrap() else { panic!() };
+        let Step::Item(value, used) = Frames::<Value>::new().decode(&data[at..], true).unwrap() else { panic!() };
         assert_eq!(value, Value::Real(72.3));
         at += used;
-        let Step::Item(closing, used) = Tags.decode(&data[at..], true).unwrap() else { panic!() };
+        let Step::Item(closing, used) = Frames::<Tag>::new().decode(&data[at..], true).unwrap() else { panic!() };
         assert_eq!(closing, Tag { number: 3, class: Class::Context, content: TagContent::Closing });
         assert_eq!(at + used, data.len());
         assert_eq!(apdu.to_bytes().unwrap(), ack);
@@ -2921,7 +2931,7 @@ mod tests {
             let ab = apdu.to_bytes().unwrap();
             assert_eq!(Apdu::parse(&ab), Ok(apdu));
             check_prefixes(&ab);
-            // Values, application and context tagged, one byte at a time.
+            // fictionet::stdlib::codec::Frames::<Value>::new(), application and context tagged, one byte at a time.
             let i_am = IAm {
                 device: ObjectId::device(rng.index(MAX_INSTANCE as usize + 1) as u32),
                 max_apdu: u32::from(rng.next() as u8) << 4,

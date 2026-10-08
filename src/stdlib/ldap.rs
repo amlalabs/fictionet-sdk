@@ -13,7 +13,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a directory server pushes
 //! the bytes it reads from a [`tcp`](fictionet::stdlib::tcp) connection to a
-//! [`Stream<Messages>`](fictionet::stdlib::codec::Stream), gets [`Message`]s back, matches on each one's [`Op`], and
+//! [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream), gets [`Message`]s back, matches on each one's [`Op`], and
 //! writes the reply's bytes with [`Message::write`]. A CLDAP server reads
 //! each datagram with [`Message::parse`], and a client reads a reply that
 //! may hold several messages with [`Message::parse_datagram`]. Which entries
@@ -26,17 +26,16 @@
 //! constructed strings, so they are refused. Unknown fields at the end of a
 //! SEQUENCE are skipped, as RFC 4511 section 4 asks. RFC 4511 says a server that
 //! cannot read a message sends a notice of disconnection and closes the
-//! connection, so a [`Stream<Messages>`](fictionet::stdlib::codec::Stream) stops at the first [`Error`]. The writers
+//! connection, so a [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream) stops at the first [`Error`]. The writers
 //! check what they are given and return an error instead of bytes a reader
 //! would refuse.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::ldap::{
-//!     Authentication, BindResponse, Messages, Dn, Filter, LdapResult, Op, ResultCode,
-//! };
+//! use fictionet::stdlib::ldap::{Authentication, BindResponse, Dn, Filter, LdapResult, Op, ResultCode};
 //!
-//! let mut decoder = Stream::new(Messages::new());
+//! let mut decoder = Stream::new(Frames::<fictionet::stdlib::ldap::Message>::new());
 //! // An anonymous simple bind: message 1, LDAP version 3, no name, no password.
 //! let bind = [0x30, 0x0c, 0x02, 0x01, 0x01, 0x60, 0x07, 0x02, 0x01, 0x03, 0x04, 0x00, 0x80, 0x00];
 //! assert_eq!(decoder.push(&bind), bind.len());
@@ -60,9 +59,12 @@
 //! assert_eq!(dn.to_text().unwrap(), "uid=jdoe,dc=example,dc=com");
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::ascii::{hex_lower, hex_value as hex_digit};
 use fictionet::stdlib::asn1::{self, Class, Element, Length, Reader, Rules, Tag};
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Wire};
 use std::fmt;
 
 /// The port LDAP servers listen on, over TCP, and CLDAP over UDP.
@@ -72,7 +74,7 @@ pub const TLS_PORT: u16 = 636;
 /// The largest message ID, size limit and time limit: `maxInt` in RFC 4511.
 pub const MAX_INT: u32 = 2_147_483_647;
 /// The longest message, in bytes, a reader accepts and a writer writes.
-/// [`Messages::with_limit`] can set a lower limit.
+/// [`codec::Frames<Message>::with_limit`](fictionet::stdlib::codec::Frames::with_limit) can set a lower limit.
 pub const MAX_MESSAGE: usize = asn1::MAX_INPUT;
 /// How deep filters may nest. A filter with no `&`, `|` or `!` has depth 1.
 pub const MAX_FILTER_DEPTH: usize = 16;
@@ -2457,7 +2459,7 @@ impl Wire for Message {
 
 /// Reads LDAP messages without holding input bytes.
 ///
-/// Use with [`Stream<Messages>`](fictionet::stdlib::codec::Stream) for bounded input. Partial messages
+/// Use with [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream) for bounded input. Partial messages
 /// return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and errors once. A malformed message ends the stream.
 /// This includes a well-framed message that [`Message::parse`] rejects:
@@ -2465,51 +2467,30 @@ impl Wire for Message {
 /// requires termination for malformed envelopes and encodings. For parsing
 /// failures as individual items, use
 /// `asn1::Elements::new(Rules::Ber).map(|bytes| Message::parse(&bytes))`.
-#[derive(Clone, Copy, Debug)]
-pub struct Messages {
-    limit: usize,
-}
-
-impl Messages {
-    /// Creates a decoder accepting messages up to [`MAX_MESSAGE`] bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_MESSAGE)
-    }
-
-    /// Sets the whole-message limit, clamped to [`MAX_MESSAGE`].
-    /// The buffer holds at least [`asn1::HEADER_ROOM`] bytes to read or refuse any header.
-    /// Zero refuses every message.
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_MESSAGE),
-        }
-    }
-
-    /// The maximum message size, including its ASN.1 header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Messages {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Messages {
+impl Prefixed for Message {
     type Item = Message;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "LDAP";
 
-    fn capacity(&self) -> usize {
-        self.limit.max(asn1::HEADER_ROOM)
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_MESSAGE }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_MESSAGE) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        limit.max(asn1::HEADER_ROOM)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Message>, Error> {
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
         let header = match asn1::Header::parse(input, Rules::Ber) {
             Ok(header) => header,
-            Err(asn1::Error::Truncated) => return Ok(Step::Need),
+            Err(asn1::Error::Truncated) => return Ok(None),
             Err(asn1::Error::TooLong) => return Err(Error::TooLarge(declared_total(input))),
             Err(e) => return Err(Error::Ber(e)),
         };
@@ -2520,15 +2501,16 @@ impl Decode for Messages {
             return Err(Error::Ber(asn1::Error::Indefinite));
         };
         let total = header.len.saturating_add(n);
-        if total > self.limit {
+        if total > limit {
             return Err(Error::TooLarge(total));
         }
         Ok(match input.get(..total) {
-            Some(bytes) => Step::Item(Message::parse(bytes)?, total),
-            None => Step::Need,
+            Some(bytes) => Some((Message::parse(bytes)?, total)),
+            None => None,
         })
     }
 }
+
 
 /// The whole length a header at the start of `b` declares: the header and
 /// the contents. It is for a header [`asn1::Header::parse`] found too long,
@@ -2566,7 +2548,7 @@ mod tests {
     }
 
     /// Pushes bytes that fit.
-    fn put(d: &mut Stream<Messages>, b: &[u8]) {
+    fn put(d: &mut Stream<Frames::<Message>>, b: &[u8]) {
         assert_eq!(d.push(b), b.len());
     }
 
@@ -3090,7 +3072,7 @@ mod tests {
                 value: Some(vec![1]),
             });
             round_trip(&m);
-            let mut d = Stream::new(Messages::new());
+            let mut d = Stream::new(Frames::<Message>::new());
             put(&mut d, &m.to_bytes().unwrap());
             assert_eq!(d.next(), Some(Ok(m)));
             if let Ok(t) = f.to_text() {
@@ -3101,13 +3083,13 @@ mod tests {
 
     #[test]
     fn decoder_names_lengths_over_the_maximum_too_large() {
-        let mut d = Stream::new(Messages::new());
+        let mut d = Stream::new(Frames::<Message>::new());
         put(&mut d, &[0x30, 0x84, 0x7f, 0xff, 0xff, 0xff]);
         assert_eq!(
             d.next(),
             Some(Err(Fail::Protocol(Error::TooLarge(0x7fff_ffff + 6))))
         );
-        let mut d = Stream::new(Messages::new());
+        let mut d = Stream::new(Frames::<Message>::new());
         put(&mut d, &[0x30, 0x83, 0x10, 0x00, 0x01]);
         assert_eq!(
             d.next(),
@@ -3599,7 +3581,7 @@ mod tests {
                     "{n} of {}",
                     bytes.len()
                 );
-                let mut d = Stream::new(Messages::new());
+                let mut d = Stream::new(Frames::<Message>::new());
                 put(&mut d, &bytes[..n]);
                 assert_eq!(d.next(), None, "{n} of {}", bytes.len());
                 assert_eq!(d.buffered(), n);
@@ -3625,7 +3607,7 @@ mod tests {
         let a = msg(1, Op::DelRequest("cn=a".into())).to_bytes().unwrap();
         let b = msg(2, Op::UnbindRequest).to_bytes().unwrap();
         let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
-        let mut d = Stream::new(Messages::new());
+        let mut d = Stream::new(Frames::<Message>::new());
         let mut got = Vec::new();
         for byte in chunks(&stream, &[1]) {
             put(&mut d, byte);
@@ -3648,7 +3630,7 @@ mod tests {
         assert_eq!(d.next(), None);
         assert_eq!(d.failed(), e.as_ref().and_then(|r| r.as_ref().err()));
         // A bad message inside a good frame breaks it too.
-        let mut d = Stream::new(Messages::new());
+        let mut d = Stream::new(Frames::<Message>::new());
         put(&mut d, &[0x30, 0x03, 0x02, 0x01, 0x01]);
         put(&mut d, &a);
         assert_eq!(
@@ -3657,17 +3639,17 @@ mod tests {
         );
         assert_eq!(d.next(), None);
         // Indefinite lengths, and lengths over the limit, are known from the header.
-        let mut d = Stream::new(Messages::new());
+        let mut d = Stream::new(Frames::<Message>::new());
         put(&mut d, &[0x30, 0x80]);
         assert_eq!(
             d.next(),
             Some(Err(Fail::Protocol(Error::Ber(asn1::Error::Indefinite))))
         );
-        let mut d = Stream::new(Messages::with_limit(100));
+        let mut d = Stream::new(Frames::<Message>::with_limit(100));
         assert_eq!(d.decoder().limit(), 100);
         put(&mut d, &[0x30, 0x81, 0x80]);
         assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::TooLarge(131)))));
-        let mut d = Stream::new(Messages::with_limit(usize::MAX));
+        let mut d = Stream::new(Frames::<Message>::with_limit(usize::MAX));
         assert_eq!(d.decoder().limit(), MAX_MESSAGE);
         put(&mut d, &[0x30, 0x84, 0x7f, 0xff, 0xff, 0xff]);
         assert_eq!(
@@ -3686,7 +3668,7 @@ mod tests {
             .take(one.len() * 200_000)
             .collect();
         let started = std::time::Instant::now();
-        let mut d = Stream::new(Messages::new());
+        let mut d = Stream::new(Frames::<Message>::new());
         let mut rest = &stream[..];
         let mut n = 0;
         while !rest.is_empty() {
@@ -3708,7 +3690,7 @@ mod tests {
     #[test]
     fn decoder_holds_at_most_its_limit() {
         // Noise is taken only up to the limit, and fails at its header.
-        let mut d = Stream::new(Messages::with_limit(100));
+        let mut d = Stream::new(Frames::<Message>::with_limit(100));
         assert_eq!(d.push(&vec![0; 100_000]), 100);
         assert!(d.buffered() <= 100);
         assert!(matches!(d.next(), Some(Err(_))));
@@ -3719,7 +3701,7 @@ mod tests {
         // taken out.
         let one = msg(1, Op::UnbindRequest).to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 50).collect();
-        let mut d = Stream::new(Messages::with_limit(20));
+        let mut d = Stream::new(Frames::<Message>::with_limit(20));
         let (mut rest, mut n) = (&stream[..], 0);
         while !rest.is_empty() {
             let took = d.push(rest);
@@ -3732,7 +3714,7 @@ mod tests {
         }
         assert_eq!(n, 50);
         // A tiny limit still sees a header, and refuses the message.
-        let mut d = Stream::new(Messages::with_limit(0));
+        let mut d = Stream::new(Frames::<Message>::with_limit(0));
         assert_eq!(d.push(&one), one.len());
         assert_eq!(
             d.next(),
@@ -4255,8 +4237,8 @@ mod tests {
                 assert_eq!(Filter::parse_text(&t).as_ref(), Ok(&s.filter), "{t}");
             }
         }
-        let whole = decode_all(Messages::new, data);
-        contract::check_decode_with_alloc_limit(Messages::new, data, 2 * MAX_MESSAGE);
+        let whole = decode_all(Frames::<Message>::new, data);
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * MAX_MESSAGE);
         contract::check_wire::<Message>(data);
         for m in &whole.0 {
             assert_eq!(Message::parse(&m.to_bytes().unwrap()).as_ref(), Ok(m));
@@ -4324,15 +4306,15 @@ mod tests {
             check_text(&String::from_utf8_lossy(&tf));
         }
         // Check the generated stream across chunk boundaries and at EOF.
-        contract::check_decode_with_alloc_limit(Messages::new, &stream, 2 * MAX_MESSAGE);
-        let (all, err) = decode_all(Messages::new, &stream);
+        contract::check_decode_with_alloc_limit(Frames::<Message>::new, &stream, 2 * MAX_MESSAGE);
+        let (all, err) = decode_all(Frames::<Message>::new, &stream);
         assert_eq!(all.len(), ROUNDS);
         assert_eq!(err, None);
     }
 
     #[test]
     fn codec_frames_obey_small_limits_and_report_once() {
-        use fictionet::stdlib::codec::{Decode, Fail, Stream, contract};
+        use fictionet::stdlib::codec::{Fail, Stream, contract};
         let bytes = Message {
             id: 1,
             op: Op::UnbindRequest,
@@ -4341,11 +4323,11 @@ mod tests {
         .to_bytes()
         .unwrap();
         for limit in 0..=16 {
-            assert_eq!(Messages::with_limit(limit).capacity(), 16);
-            contract::check_decode_with_alloc_limit(|| Messages::with_limit(limit), &bytes, 2 * Messages::with_limit(limit).capacity());
+            assert_eq!(Frames::<Message>::with_limit(limit).capacity(), 16);
+            contract::check_decode_with_alloc_limit(|| Frames::<Message>::with_limit(limit), &bytes, 2 * Frames::<Message>::with_limit(limit).capacity());
         }
-        assert_eq!(Messages::with_limit(usize::MAX).limit(), MAX_MESSAGE);
-        let mut stream = Stream::new(Messages::new());
+        assert_eq!(Frames::<Message>::with_limit(usize::MAX).limit(), MAX_MESSAGE);
+        let mut stream = Stream::new(Frames::<Message>::new());
         assert_eq!(stream.push(&[0x30, 0x80]), 2);
         assert_eq!(
             stream.next(),

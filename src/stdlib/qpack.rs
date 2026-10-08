@@ -14,7 +14,7 @@
 //! [`huffman`].
 //!
 //! A server reads encoder instructions with
-//! [`Stream<EncoderInstructions>`](fictionet::stdlib::codec::Stream) and applies each to
+//! [`Stream<codec::Frames<EncoderInstruction>>`](fictionet::stdlib::codec::Stream) and applies each to
 //! a [`Table`]. [`decode_section`] returns fields and an acknowledgment or a
 //! [`BlockedSection`] to hold and retry. [`BlockedSections`] bounds that queue.
 //! [`Encoder`] returns instruction and field-section values. Write those values
@@ -49,6 +49,7 @@
 //! encoder.apply_instruction(ack.unwrap()).unwrap();
 //! ```
 
+use fictionet::stdlib::codec::{Prefixed, Frames};
 use fictionet::stdlib::quic::MAX_VARINT;
 use fictionet::stdlib::codec::{Reader, Truncated};
 
@@ -1303,7 +1304,7 @@ impl Encoder {
 
     /// Applies one decoded peer instruction between items.
     ///
-    /// Pair with [`DecoderInstructions`] and [`fictionet::stdlib::codec::Stream`]. This
+    /// Pair with [`codec::Frames<DecoderInstruction>`](fictionet::stdlib::codec::Frames) and [`fictionet::stdlib::codec::Stream`]. This
     /// resolves Section Acknowledgments against this session's outstanding
     /// sections and updates its known received count. Errors do not change
     /// session state; the caller must enforce the QPACK connection policy.
@@ -1343,15 +1344,33 @@ impl Encoder {
 /// lengths end framing. A complete instruction with invalid contents is an
 /// error item. Apply successful items with [`Table::apply`] between calls.
 /// Partial instructions return [`Step::Need`], including at EOF.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct EncoderInstructions;
+impl Prefixed for EncoderInstruction {
+    type Item = Result<EncoderInstruction, Error>;
+    type Error = Error;
+    type Limit = ();
+    const NAME: &'static str = "QPACK encoder stream";
 
-impl EncoderInstructions {
-    /// Creates a decoder bounded by [`MAX_INSTRUCTION`].
-    pub fn new() -> Self {
-        Self
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
+        MAX_INSTRUCTION
+    }
+
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let Some(used) = encoder_instruction_len(input)? else { return Ok(None) };
+        let bytes = input.get(..used).ok_or(Error::Truncated)?;
+        let item = EncoderInstruction::parse_prefix(bytes).and_then(|parsed| {
+            let (ins, _) = parsed.ok_or(Error::Truncated)?;
+            check_encoder_instruction(&ins)?;
+            Ok(ins)
+        });
+        Ok(Some((item, used)))
     }
 }
+
 
 // Find the boundary without decoding strings. Even a bad Huffman string
 // has a trusted length, so its error consumes exactly one instruction.
@@ -1399,26 +1418,6 @@ fn check_strings(name: &[u8], value: &[u8]) -> Result<(), Error> {
     if name.len() > MAX_STRING || value.len() > MAX_STRING { Err(Error::StringTooLong) } else { Ok(()) }
 }
 
-impl Decode for EncoderInstructions {
-    type Item = Result<EncoderInstruction, Error>;
-    type Error = Error;
-    const NAME: &'static str = "QPACK encoder stream";
-
-    fn capacity(&self) -> usize {
-        MAX_INSTRUCTION
-    }
-
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
-        let Some(used) = encoder_instruction_len(input)? else { return Ok(Step::Need) };
-        let bytes = input.get(..used).ok_or(Error::Truncated)?;
-        let item = EncoderInstruction::parse_prefix(bytes).and_then(|parsed| {
-            let (ins, _) = parsed.ok_or(Error::Truncated)?;
-            check_encoder_instruction(&ins)?;
-            Ok(ins)
-        });
-        Ok(Step::Item(item, used))
-    }
-}
 
 /// Reads one decoder instruction per call without owning input.
 ///
@@ -1427,33 +1426,30 @@ impl Decode for EncoderInstructions {
 /// truncation. Stream acknowledgments need the caller's section metadata;
 /// call [`Encoder::apply_instruction`] between items. This decoder has no
 /// table or pending output queue.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DecoderInstructions;
-
-impl DecoderInstructions {
-    /// Creates a decoder bounded by [`MAX_INTEGER_BYTES`].
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Decode for DecoderInstructions {
+impl Prefixed for DecoderInstruction {
     type Item = Result<DecoderInstruction, Error>;
     type Error = Error;
+    type Limit = ();
     const NAME: &'static str = "QPACK decoder stream";
 
-    fn capacity(&self) -> usize {
+    #[inline]
+    fn default_limit() -> Self::Limit {}
+
+    #[inline]
+    fn capacity(_limit: &Self::Limit) -> usize {
         MAX_INTEGER_BYTES
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+    #[inline]
+    fn parse_prefix(input: &[u8], _limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         Ok(match DecoderInstruction::parse_prefix(input)? {
-            Some((DecoderInstruction::InsertCountIncrement(0), used)) => Step::Item(Err(Error::ZeroIncrement), used),
-            Some((ins, used)) => Step::Item(Ok(ins), used),
-            None => Step::Need,
+            Some((DecoderInstruction::InsertCountIncrement(0), used)) => Some((Err(Error::ZeroIncrement), used)),
+            Some((ins, used)) => Some((Ok(ins), used)),
+            None => None,
         })
     }
 }
+
 
 /// Strict encoding and exact parsing. SetCapacity is limited to
 /// [`MAX_TABLE_CAPACITY`] in both directions, even if the peer advertises more.
@@ -1464,7 +1460,7 @@ impl Wire for EncoderInstruction {
     /// Reads exactly one instruction. Refuses truncation, trailing bytes, integer overflow,
     /// invalid Huffman strings, oversized strings or capacity, and invalid static name indexes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let parsed = match EncoderInstructions.decode(bytes, true)? {
+        let parsed = match Frames::<EncoderInstruction>::new().decode(bytes, true)? {
             Step::Item(item, used) => Ok((item, used)),
             _ => Err(Error::Incomplete),
         };
@@ -1509,7 +1505,7 @@ impl Wire for DecoderInstruction {
 
     /// Reads exactly one instruction. Refuses truncation, trailing bytes, overflow, and zero increments.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let parsed = match DecoderInstructions.decode(bytes, true)? {
+        let parsed = match Frames::<DecoderInstruction>::new().decode(bytes, true)? {
             Step::Item(item, used) => Ok((item, used)),
             _ => Err(Error::Incomplete),
         };
@@ -1660,9 +1656,10 @@ fn section_fields(
 /// a Stream Cancel does not replace it.
 ///
 /// ```
+/// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::{codec::{Stream, Wire}, qpack::{self, EncoderInstruction, Table}};
 /// let mut table = Table::new(128);
-/// let mut input = Stream::new(qpack::EncoderInstructions::new());
+/// let mut input = Stream::new(Frames::<qpack::EncoderInstruction>::new());
 /// let bytes = Wire::to_bytes(&EncoderInstruction::SetCapacity(128))?;
 /// assert_eq!(input.push(&bytes), bytes.len());
 /// if let Some(instruction) = input.next() {
@@ -1788,7 +1785,7 @@ mod tests {
     use fictionet::stdlib::prefix_int::Integer;
 
     fn apply(table: &mut Table, bytes: &[u8]) -> Result<(), Error> {
-        let (items, error) = decode_all(EncoderInstructions::new, bytes);
+        let (items, error) = decode_all(Frames::<EncoderInstruction>::new, bytes);
         assert!(error.is_none(), "{error:?}");
         for item in items {
             table.apply(item?)?;
@@ -1910,7 +1907,7 @@ mod tests {
         let s4 = hex("0381 10 11");
         held.push(blocked(&table, 4, &s4)).unwrap();
         let enc = hex("3fbd01 c00f7777772e6578616d706c652e636f6d c10c2f73616d706c652f70617468");
-        contract::check_decode_with_alloc_limit(EncoderInstructions::new, &enc, 2 * MAX_INSTRUCTION);
+        contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &enc, 2 * MAX_INSTRUCTION);
         apply(&mut table, &enc).unwrap();
         assert_eq!(table.size(), 106);
         assert_eq!(
@@ -2043,7 +2040,7 @@ mod tests {
         for ins in &enc {
             contract::check_wire_value(ins);
             contract::check_decode_with_alloc_limit(
-                EncoderInstructions::new,
+                Frames::<EncoderInstruction>::new,
                 &ins.to_bytes().unwrap(),
                 2 * MAX_INSTRUCTION,
             );
@@ -2058,7 +2055,7 @@ mod tests {
         ] {
             assert_eq!(ins.to_bytes().unwrap(), bytes);
             contract::check_wire_value(&ins);
-            contract::check_decode_with_alloc_limit(DecoderInstructions::new, &bytes, 2 * MAX_INTEGER_BYTES);
+            contract::check_decode_with_alloc_limit(Frames::<DecoderInstruction>::new, &bytes, 2 * MAX_INTEGER_BYTES);
         }
         assert_eq!(DecoderInstruction::parse(&[0xff; 12]), Err(Error::IntegerOverflow));
     }
@@ -2195,7 +2192,7 @@ mod tests {
         for stream in [0, 4, 4] {
             DecoderInstruction::SectionAck(stream).write(&mut bytes).unwrap();
         }
-        let (instructions, failure) = decode_all(DecoderInstructions::new, &bytes);
+        let (instructions, failure) = decode_all(Frames::<DecoderInstruction>::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(instructions.len(), 3);
         for (i, instruction) in instructions.into_iter().enumerate() {
@@ -2324,8 +2321,8 @@ mod tests {
         for round in 0..4000 {
             let mut data = if round % 2 == 0 { rng.bytes(64) } else { vec![0, 0, 0xd1, 0x50, 1, b'x'] };
             mutate(&mut rng, &mut data);
-            contract::check_decode_with_alloc_limit(EncoderInstructions::new, &data, 2 * MAX_INSTRUCTION);
-            contract::check_decode_with_alloc_limit(DecoderInstructions::new, &data, 2 * MAX_INTEGER_BYTES);
+            contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &data, 2 * MAX_INSTRUCTION);
+            contract::check_decode_with_alloc_limit(Frames::<DecoderInstruction>::new, &data, 2 * MAX_INTEGER_BYTES);
             contract::check_wire::<EncoderInstruction>(&data);
             contract::check_wire::<DecoderInstruction>(&data);
             contract::check_wire::<Representation>(&data);
@@ -2333,7 +2330,7 @@ mod tests {
             contract::check_wire::<FieldSection>(&data);
             let mut table = Table::new(220);
             let _ = apply(&mut table, &[]);
-            let (items, _) = decode_all(EncoderInstructions::new, &data);
+            let (items, _) = decode_all(Frames::<EncoderInstruction>::new, &data);
             for item in items {
                 if item.and_then(|ins| table.apply(ins)).is_err() {
                     break;
@@ -2361,9 +2358,9 @@ mod tests {
             if let Ok(SectionResult::Fields { fields, .. }) = decode_section_with_limit(&table, 0, &data, 1 << 14) {
                 assert!(fields.iter().map(Field::size).sum::<u64>() <= 1 << 14);
             }
-            contract::check_decode_with_alloc_limit(EncoderInstructions::new, &data, 2 * MAX_INSTRUCTION);
+            contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &data, 2 * MAX_INSTRUCTION);
             let mut changed = table.clone();
-            let (instructions, _) = decode_all(EncoderInstructions::new, &data);
+            let (instructions, _) = decode_all(Frames::<EncoderInstruction>::new, &data);
             for instruction in instructions {
                 if instruction.and_then(|instruction| changed.apply(instruction)).is_err() {
                     break;
@@ -2424,7 +2421,7 @@ mod tests {
         let ins = EncoderInstruction::InsertWithLiteralName { name: vec![b'0'; 30_000], value: vec![b'1'; 30_000] };
         let bytes = ins.to_bytes().unwrap();
         let start = std::time::Instant::now();
-        contract::check_decode_with_alloc_limit(EncoderInstructions::new, &bytes, 2 * MAX_INSTRUCTION);
+        contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &bytes, 2 * MAX_INSTRUCTION);
         assert!(start.elapsed() < std::time::Duration::from_secs(2), "instruction decoding exceeded two seconds");
         let mut table = Table::new(MAX_TABLE_CAPACITY);
         table.set_capacity(MAX_TABLE_CAPACITY).unwrap();
@@ -2532,12 +2529,12 @@ mod tests {
 
     #[test]
     fn stream_readers_keep_bounded_buffers() {
-        contract::check_decode_with_alloc_limit(EncoderInstructions::new, &vec![0x20; 4096], 2 * MAX_INSTRUCTION);
-        contract::check_decode_with_alloc_limit(DecoderInstructions::new, &vec![0x40; 4096], 2 * MAX_INTEGER_BYTES);
+        contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &vec![0x20; 4096], 2 * MAX_INSTRUCTION);
+        contract::check_decode_with_alloc_limit(Frames::<DecoderInstruction>::new, &vec![0x40; 4096], 2 * MAX_INTEGER_BYTES);
         let ins = EncoderInstruction::InsertWithLiteralName { name: b"n".to_vec(), value: vec![b'v'; 100] };
         let mut bytes = EncoderInstruction::SetCapacity(4096).to_bytes().unwrap();
         ins.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(EncoderInstructions::new, &bytes, 2 * MAX_INSTRUCTION);
+        contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &bytes, 2 * MAX_INSTRUCTION);
         let mut table = Table::new(4096);
         apply(&mut table, &bytes).unwrap();
         assert_eq!(table.len(), 1);

@@ -222,12 +222,12 @@ struct Plant {
 struct Plc;
 
 impl Service for Plc {
-    type Decoder = modbus::Frames;
+    type Decoder = fictionet::stdlib::codec::Frames::<modbus::Frame>;
     type State = Plant;
     type Error = Infallible;
 
-    fn decoder(&self) -> modbus::Frames {
-        modbus::Frames
+    fn decoder(&self) -> fictionet::stdlib::codec::Frames::<modbus::Frame> {
+        fictionet::stdlib::codec::Frames::<modbus::Frame>::new()
     }
 
     fn on_item(&mut self, frame: Frame, plant: &Plant, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
@@ -317,11 +317,11 @@ fn a_decoder_failure_is_handed_to_the_service_with_what_it_could_not_read() {
         unread: Vec<u8>,
     }
     impl Service for Strict {
-        type Decoder = modbus::Frames;
+        type Decoder = fictionet::stdlib::codec::Frames::<modbus::Frame>;
         type State = ();
         type Error = Infallible;
-        fn decoder(&self) -> modbus::Frames {
-            modbus::Frames
+        fn decoder(&self) -> fictionet::stdlib::codec::Frames::<modbus::Frame> {
+            fictionet::stdlib::codec::Frames::<modbus::Frame>::new()
         }
         fn on_item(&mut self, _: Frame, _: &(), _: &mut Driver<'_>) -> Result<Flow, Infallible> {
             Ok(Flow::Continue)

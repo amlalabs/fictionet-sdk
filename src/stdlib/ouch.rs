@@ -69,6 +69,8 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::Wire;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -3262,10 +3264,11 @@ mod tests {
     #[test]
     fn exchange_runs_over_soupbintcp() {
         use fictionet::stdlib::codec::{Stream, pump};
-        use fictionet::stdlib::soupbintcp::{
-            Action as SAction, Alpha as SAlpha, Client, Event as SEvent, Login, Packet, Packets,
-            Server, Timers,
-        };
+        use fictionet::stdlib::soupbintcp::Action as SAction;
+        use fictionet::stdlib::soupbintcp::Alpha as SAlpha;
+        use fictionet::stdlib::soupbintcp::Client;
+        use fictionet::stdlib::soupbintcp::Event as SEvent;
+        use fictionet::stdlib::soupbintcp::{Login, Packet, Server, Timers};
         let login = Login {
             username: SAlpha::right_padded("ALICE").unwrap(),
             password: SAlpha::right_padded("PW").unwrap(),
@@ -3300,7 +3303,7 @@ mod tests {
             .unwrap()
             .to_bytes()
             .unwrap();
-        let mut frames = Stream::new(Packets::default());
+        let mut frames = Stream::new(Frames::<fictionet::stdlib::soupbintcp::Packet>::default());
         let mut inbound = Vec::new();
         pump(&mut frames, &wire, |f| inbound.push(f)).unwrap();
         let Ok(Packet::UnsequencedData(payload)) = &inbound[0] else {

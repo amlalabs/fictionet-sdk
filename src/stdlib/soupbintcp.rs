@@ -12,7 +12,7 @@
 //! Every packet is a two-byte big-endian length, one type byte and a payload
 //! (1.1). The length counts the type byte and the payload. [`Packet`] is one
 //! whole packet, length prefix included, read and written through
-//! [`Wire`]. [`Packets`] reads packets from a byte stream for a
+//! [`Wire`]. [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames) reads packets from a byte stream for a
 //! [`Stream`](fictionet::stdlib::codec::Stream). A packet that frames but
 //! does not parse is an item (`Err`), so a session can close the
 //! connection as it chooses. The one fault that ends the stream,
@@ -28,10 +28,9 @@
 //! write, then events.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::soupbintcp::{
-//!     Action, Alpha, Client, Event, Login, Packet, Packets, Server, Timers,
-//! };
+//! use fictionet::stdlib::soupbintcp::{Action, Alpha, Client, Event, Login, Packet, Server, Timers};
 //!
 //! let login = Login {
 //!     username: Alpha::right_padded("ALICE")?,
@@ -49,7 +48,7 @@
 //!         packet.write(&mut wire)?;
 //!     }
 //! }
-//! let mut frames = Stream::new(Packets::default());
+//! let mut frames = Stream::new(Frames::<Packet>::default());
 //! assert_eq!(frames.push(&wire), wire.len());
 //! let frame = frames.next().unwrap().unwrap();
 //! let actions = server.receive_frame(&frame, 10)?;
@@ -72,7 +71,10 @@
 //! # Ok::<(), fictionet::stdlib::soupbintcp::Error>(())
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Wire};
 use std::fmt;
 
 /// Bytes in the length prefix.
@@ -105,7 +107,7 @@ pub enum Error {
     /// The length prefix disagrees with the bytes, or with the fixed size
     /// of the packet's type.
     Length,
-    /// A payload is longer than [`MAX_PAYLOAD`] or a [`Packets`] limit.
+    /// A payload is longer than [`MAX_PAYLOAD`] or a [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames) limit.
     TooLong,
     /// An unknown packet type byte.
     Type(u8),
@@ -459,10 +461,11 @@ impl Wire for Packet {
 /// prefix alone. A zero length prefix is an item, `Err(Error::Length)`.
 ///
 /// ```
+/// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::codec::{finish, pump, Stream};
-/// use fictionet::stdlib::soupbintcp::{Packet, Packets};
+/// use fictionet::stdlib::soupbintcp::Packet;
 ///
-/// let mut stream = Stream::new(Packets::default());
+/// let mut stream = Stream::new(Frames::<Packet>::default());
 /// let mut packets = Vec::new();
 /// // A server heartbeat, then sequenced data "hi", split across reads.
 /// pump(&mut stream, &[0, 1, b'H', 0, 3], |p| packets.push(p))?;
@@ -471,50 +474,41 @@ impl Wire for Packet {
 /// assert_eq!(packets, [Ok(Packet::ServerHeartbeat), Ok(Packet::SequencedData(b"hi".to_vec()))]);
 /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::soupbintcp::Error>>(())
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Packets {
-    limit: usize,
-}
-impl Packets {
-    /// A framer that accepts payloads up to `limit` bytes, at most
-    /// [`MAX_PAYLOAD`].
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_PAYLOAD),
-        }
-    }
-    /// The payload limit.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-impl Default for Packets {
-    /// Accepts every payload the length field can describe.
-    fn default() -> Self {
-        Self::with_limit(MAX_PAYLOAD)
-    }
-}
-impl Decode for Packets {
+impl Prefixed for Packet {
     type Item = Result<Packet, Error>;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "SoupBinTCP";
-    fn capacity(&self) -> usize {
-        LENGTH_PREFIX + 1 + self.limit
+
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_PAYLOAD }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_PAYLOAD) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        LENGTH_PREFIX + 1 + limit
     }
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
         let Some((prefix, rest)) = input.split_at_checked(LENGTH_PREFIX) else {
-            return Ok(Step::Need);
+            return Ok(None);
         };
         let length = usize::from(u16::from_be_bytes([prefix[0], prefix[1]]));
-        if length > self.limit + 1 {
+        if length > limit + 1 {
             return Err(Error::TooLong);
         }
         let Some(body) = rest.get(..length) else {
-            return Ok(Step::Need);
+            return Ok(None);
         };
-        Ok(Step::Item(Packet::parse_body(body), LENGTH_PREFIX + length))
+        Ok(Some((Packet::parse_body(body), LENGTH_PREFIX + length)))
     }
 }
+
 
 /// The timers a session runs on. [`Timers::default`] is the
 /// specification's: heartbeats after one second, an idle timeout of 15
@@ -716,7 +710,7 @@ pub enum ClientPhase {
 /// The client side of one SoupBinTCP connection, without I/O.
 ///
 /// Pass every packet read from the connection to [`receive`](Self::receive)
-/// (or each [`Packets`] item to [`receive_frame`](Self::receive_frame)),
+/// (or each [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames) item to [`receive_frame`](Self::receive_frame)),
 /// call [`tick`](Self::tick) at least every few hundred milliseconds, and
 /// write every [`Action::Send`] packet in order. Packets returned directly
 /// ([`send`](Self::send), [`debug`](Self::debug)) must be written too:
@@ -1220,9 +1214,9 @@ mod tests {
     #[test]
     fn frames_follow_the_contract() {
         let bytes = stream_of(&every_packet());
-        check_decode(Packets::default, &bytes);
-        check_decode_with_alloc_limit(|| Packets::with_limit(64), &bytes, 2 * (64 + 3));
-        let (items, failure) = decode_all(Packets::default, &bytes);
+        check_decode(Frames::<Packet>::default, &bytes);
+        check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), &bytes, 2 * (64 + 3));
+        let (items, failure) = decode_all(Frames::<Packet>::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(
             items,
@@ -1234,8 +1228,8 @@ mod tests {
     fn frames_pass_unparsed_packets_as_items() {
         let mut bytes = vec![0, 0, 0, 1, b'Q', 0, 2, b'H', 0];
         Packet::ServerHeartbeat.write(&mut bytes).unwrap();
-        check_decode(Packets::default, &bytes);
-        let (items, failure) = decode_all(Packets::default, &bytes);
+        check_decode(Frames::<Packet>::default, &bytes);
+        let (items, failure) = decode_all(Frames::<Packet>::default, &bytes);
         assert!(failure.is_none());
         assert_eq!(
             items,
@@ -1250,16 +1244,16 @@ mod tests {
 
     #[test]
     fn frames_refuse_over_limit_from_the_prefix() {
-        let mut s = Stream::new(Packets::with_limit(4));
+        let mut s = Stream::new(Frames::<Packet>::with_limit(4));
         assert_eq!(s.push(&[0, 6]), 2);
         assert_eq!(s.next(), Some(Err(Fail::Protocol(Error::TooLong))));
-        let mut s = Stream::new(Packets::with_limit(4));
+        let mut s = Stream::new(Frames::<Packet>::with_limit(4));
         assert_eq!(s.push(&[0, 5, b'S', 1, 2, 3, 4]), 7);
         assert_eq!(
             s.next(),
             Some(Ok(Ok(Packet::SequencedData(vec![1, 2, 3, 4]))))
         );
-        let (_, failure) = decode_all(Packets::default, &[0, 3, b'S', 1]);
+        let (_, failure) = decode_all(Frames::<Packet>::default, &[0, 3, b'S', 1]);
         assert_eq!(failure, Some(Fail::Truncated { unread: 4 }));
     }
 
@@ -1273,8 +1267,8 @@ mod tests {
                 mutate(&mut rng, &mut bytes);
             }
             check_wire::<Packet>(&bytes);
-            check_decode_with_alloc_limit(|| Packets::with_limit(256), &bytes, 2 * 259);
-            let (items, _) = decode_all(Packets::default, &bytes);
+            check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(256), &bytes, 2 * 259);
+            let (items, _) = decode_all(Frames::<Packet>::default, &bytes);
             for item in items.into_iter().flatten() {
                 check_wire_value(&item);
             }

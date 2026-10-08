@@ -13,7 +13,7 @@ use std::sync::Arc;
 use fictionet::{Cx, RaceError};
 use fictionet::prelude::*;
 use fictionet::stdlib::bgp::{self, Attribute, Context, Error, Frame, Message, Notification, Open, Origin, Segment, SegmentKind, Update, kind};
-use fictionet::stdlib::codec::{Fail, Stream, Wire};
+use fictionet::stdlib::codec::{Fail, Frames, Stream, Wire};
 use fictionet::stdlib::tcp::{Listener, TcpConnection};
 use fictionet::time::{Duration, Instant};
 use serde_json::{Value, json};
@@ -89,7 +89,7 @@ pub struct Session {
     peer: SocketAddr,
     our_hold: u16,
     /// Frames read from the peer.
-    stream: Stream<bgp::Frames>,
+    stream: Stream<Frames<bgp::Frame>>,
     context: Context,
     /// When the hold timer expires.
     hold_deadline: Instant,
@@ -111,7 +111,7 @@ impl Session {
             sandbox,
             peer,
             our_hold,
-            stream: Stream::new(bgp::Frames),
+            stream: Stream::new(Frames::<bgp::Frame>::new()),
             context: Context::default(),
             hold_deadline,
             hold: OPEN_WAIT,

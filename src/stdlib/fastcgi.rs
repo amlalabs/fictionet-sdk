@@ -13,7 +13,7 @@
 //! Specification 1.0.
 //!
 //! Nothing here reads a socket. A world that plays an application passes
-//! bytes from a connection to [`Stream<Records>`](fictionet::stdlib::codec::Stream),
+//! bytes from a connection to [`Stream<codec::Frames<Record>>`](fictionet::stdlib::codec::Stream),
 //! gets [`Record`]s back, and hands each one
 //! to a [`Server`], which puts the streams of each request back
 //! together and gives a [`Request`] once all of it has come. The world
@@ -28,8 +28,9 @@
 //! and the number of requests open at once.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-//! use fictionet::stdlib::fastcgi::{Pairs, Records, Request, Role, Server, ServerEvent};
+//! use fictionet::stdlib::fastcgi::{Pairs, Request, Role, Server, ServerEvent};
 //!
 //! // What a web server sends for GET /hello: two parameters and no body.
 //! let sent = Request {
@@ -45,7 +46,7 @@
 //! }
 //! .to_bytes().unwrap();
 //!
-//! let mut stream = Stream::new(Records::new());
+//! let mut stream = Stream::new(Frames::<fictionet::stdlib::fastcgi::Record>::new());
 //! let mut server = Server::new();
 //! let mut reply = Vec::new();
 //! pump(&mut stream, &sent, |record| {
@@ -67,9 +68,12 @@
 //! assert_eq!(reply[..8], [1, 6, 0, 1, 0, 33, 7, 0]);
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 extern crate alloc;
 
-use fictionet::stdlib::codec::{be16, Decode, Step, Wire};
+use fictionet::stdlib::codec::{be16, Wire};
 use alloc::{collections::BTreeMap, vec::Vec};
 
 /// The TCP port FastCGI applications such as PHP-FPM listen on by
@@ -169,7 +173,7 @@ pub struct Record {
 /// response, why a value cannot be written, or why a [`Server`] or
 /// [`Client`] cannot take a record into a request.
 ///
-/// A record fault from [`Records`] ends the stream: the connection holds
+/// A record fault from [`codec::Frames<Record>`](fictionet::stdlib::codec::Frames) ends the stream: the connection holds
 /// no more records a reader can find, and a real application closes it.
 ///
 /// For a [`Server`], an error about a request whose streams were coming in
@@ -450,17 +454,18 @@ fn parse_record_limited(b: &[u8], limit: usize) -> Result<Option<(Record, usize)
 
 /// Reads FastCGI records without holding input bytes.
 ///
-/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`Self::limit`].
-/// Partial records return [`Step::Need`], including at EOF. The stream reports
+/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`Frames::limit`](fictionet::stdlib::codec::Frames::limit).
+/// Partial records return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and framing errors once. Body parsing stays separate.
 ///
 /// ```
+/// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-/// use fictionet::stdlib::fastcgi::{Record, Records, kind};
+/// use fictionet::stdlib::fastcgi::{Record, kind};
 ///
 /// let record = Record { kind: kind::STDIN, request_id: 1, content: vec![7, 8], padding: 0 };
 /// let bytes = Wire::to_bytes(&record)?;
-/// let mut stream = Stream::new(Records::new());
+/// let mut stream = Stream::new(Frames::<Record>::new());
 /// let mut records = Vec::new();
 /// pump(&mut stream, &bytes[..3], |record| records.push(record))?;
 /// pump(&mut stream, &bytes[3..], |record| records.push(record))?;
@@ -468,52 +473,28 @@ fn parse_record_limited(b: &[u8], limit: usize) -> Result<Option<(Record, usize)
 /// assert_eq!(records, [record]);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Copy, Debug)]
-pub struct Records {
-    limit: usize,
-}
-
-impl Records {
-    /// Accepts records up to [`MAX_RECORD`] bytes, including padding.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_RECORD)
-    }
-
-    /// Sets the record limit, including its header and padding.
-    /// Clamps it to [`HEADER_LEN`] through [`MAX_RECORD`]. The header alone
-    /// suffices to refuse an oversized record.
-    pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.clamp(HEADER_LEN, MAX_RECORD) }
-    }
-
-    /// The maximum record length, including its header and padding.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Records {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Records {
+impl Prefixed for Record {
     type Item = Record;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "FastCGI";
 
-    fn capacity(&self) -> usize {
-        self.limit
-    }
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_RECORD }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Record>, Error> {
-        Ok(match parse_record_limited(input, self.limit)? {
-            Some((record, used)) => Step::Item(record, used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(HEADER_LEN, MAX_RECORD) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize { *limit }
+
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        parse_record_limited(input, limit)
     }
 }
+
 
 /// The role a request asks the application to play. Roles compare by
 /// number, so `Role::Other(1)` equals `Role::Responder`.
@@ -1348,6 +1329,7 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, contract, finish, pump,
@@ -1359,7 +1341,7 @@ mod tests {
     }
 
     fn records(bytes: &[u8]) -> Vec<Record> {
-        let (records, error) = decode_all(Records::new, bytes);
+        let (records, error) = decode_all(Frames::<Record>::new, bytes);
         assert_eq!(error, None);
         records
     }
@@ -1381,7 +1363,7 @@ mod tests {
             data: Vec::new(),
         }
         .to_bytes().unwrap();
-        let mut stream = Stream::new(Records::new());
+        let mut stream = Stream::new(Frames::<Record>::new());
         let mut server = Server::new();
         let mut reply = Vec::new();
         pump(&mut stream, &sent, |record| {
@@ -1485,7 +1467,7 @@ mod tests {
         assert_eq!(Record::parse(&odd), Err(Error::Trailing));
         assert_eq!(Record::parse(&odd[..11]), Ok(Record { kind: 6, request_id: 1, content: b"x".to_vec(), padding: 2 }));
         for n in 0..16 {
-            assert_eq!(Records::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
+            assert_eq!(Frames::<Record>::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
             assert_eq!(Record::parse(&bytes[..n]), Err(Error::RecordTruncated));
         }
         assert_eq!(Record::parse(&[2]), Err(Error::Version(2)));
@@ -1596,9 +1578,9 @@ mod tests {
         assert_eq!(s.receive(&begin(1, Role::Responder)), Ok(None));
         assert_eq!(s.receive(&begin(1, Role::Responder)), Err(Error::Duplicate { id: 1 }));
         assert_eq!(s.open(), 1);
-        // Records for a failed request are ignored.
+        // fictionet::stdlib::codec::Frames::<Record> for a failed request are ignored.
         assert_eq!(s.receive(&Record::new(kind::PARAMS, 1, b"x")), Ok(None));
-        // Records for requests that are not open are ignored.
+        // fictionet::stdlib::codec::Frames::<Record> for requests that are not open are ignored.
         assert_eq!(s.receive(&Record::new(kind::STDIN, 9, b"x")), Ok(None));
         // A stream record after its end.
         s.receive(&begin(2, Role::Responder)).unwrap();
@@ -1686,7 +1668,7 @@ mod tests {
             }
         }
         assert_eq!(result, Err(Error::TooLarge { id: 2, kind: kind::STDOUT }));
-        // Records a web server does not read are ignored.
+        // fictionet::stdlib::codec::Frames::<Record> a web server does not read are ignored.
         assert_eq!(c.receive(&Record::new(kind::STDIN, 3, b"x")), Ok(None));
         assert_eq!(c.receive(&Record::new(kind::GET_VALUES, 0, &[])), Ok(None));
     }
@@ -1845,9 +1827,9 @@ mod tests {
         let b = Record::new(kind::STDIN, 1, &[]);
         let mut bytes = a.to_bytes().unwrap();
         b.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(Records::new, &bytes, 2 * MAX_RECORD);
-        assert_eq!(decode_all(Records::new, &bytes), (vec![a, b], None));
-        let mut stream = Stream::new(Records::new());
+        contract::check_decode_with_alloc_limit(Frames::<Record>::new, &bytes, 2 * MAX_RECORD);
+        assert_eq!(decode_all(Frames::<Record>::new, &bytes), (vec![a, b], None));
+        let mut stream = Stream::new(Frames::<Record>::new());
         assert_eq!(stream.push(&[3, 1, 0, 1, 0, 0, 0, 0]), 8);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Version(3)))));
         assert_eq!(stream.push(&bytes), bytes.len());
@@ -1858,7 +1840,7 @@ mod tests {
     #[test]
     fn stream_reads_many_small_records_in_linear_time() {
         let one = Record::new(kind::STDIN, 1, b"x").to_bytes().unwrap();
-        let mut stream = Stream::new(Records::new());
+        let mut stream = Stream::new(Frames::<Record>::new());
         let mut count = 0;
         pump(&mut stream, &one.repeat(200_000), |_| count += 1).unwrap();
         finish(&mut stream, |_| count += 1).unwrap();
@@ -1880,11 +1862,11 @@ mod tests {
         let bytes = big.to_bytes().unwrap();
         let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&bytes).pop() else { panic!() };
         assert_eq!(got, big);
-        let mut stream = Stream::new(Records::new());
+        let mut stream = Stream::new(Frames::<Record>::new());
         assert_eq!(stream.push(&vec![1; MAX_RECORD + 1]), MAX_RECORD);
         assert_eq!(stream.buffered(), MAX_RECORD);
         let one = Record::new(kind::STDIN, 1, &vec![0; MAX_CONTENT]).to_bytes().unwrap();
-        let mut stream = Stream::new(Records::new());
+        let mut stream = Stream::new(Frames::<Record>::new());
         let mut count = 0;
         pump(&mut stream, &one.repeat(20), |_| count += 1).unwrap();
         finish(&mut stream, |_| count += 1).unwrap();
@@ -1949,7 +1931,7 @@ mod tests {
 
     /// Everything the fuzz target checks, on one input.
     fn check(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Records::new, data, 2 * MAX_RECORD);
+        contract::check_decode_with_alloc_limit(Frames::<Record>::new, data, 2 * MAX_RECORD);
         contract::check_wire::<Record>(data);
         contract::check_wire::<Pairs>(data);
         contract::check_wire::<BeginRequest>(data);
@@ -1958,7 +1940,7 @@ mod tests {
         contract::check_wire::<RecordStream>(data);
         contract::check_wire::<Request>(data);
         contract::check_wire::<Response>(data);
-        let recs = decode_all(Records::new, data).0;
+        let recs = decode_all(Frames::<Record>::new, data).0;
         let mut server = Server::new();
         let mut client = Client::new();
         for r in &recs {
@@ -2050,7 +2032,7 @@ mod tests {
             };
             let bytes = req.to_bytes().unwrap();
             contract::check_wire_value(&req);
-            contract::check_decode_with_alloc_limit(Records::new, &bytes, 2 * MAX_RECORD);
+            contract::check_decode_with_alloc_limit(Frames::<Record>::new, &bytes, 2 * MAX_RECORD);
             assert_eq!(Request::parse(&bytes), Ok(req));
             // Every truncated prefix leaves the request unfinished.
             let cut = rng.index(bytes.len());
@@ -2241,6 +2223,6 @@ mod tests {
     }
 
     fn records_prefix(bytes: &[u8]) -> Vec<Record> {
-        decode_all(Records::new, bytes).0
+        decode_all(Frames::<Record>::new, bytes).0
     }
 }

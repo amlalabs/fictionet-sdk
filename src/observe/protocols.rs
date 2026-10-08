@@ -1,3 +1,4 @@
+use fictionet::stdlib::codec::Frames;
 use fictionet::observe::{Decoded, KeyLine, Layer, Observed, Place, Placement, Present, Protocol};
 use fictionet::stdlib::codec::{Decode, Fail, Step};
 use fictionet::stdlib::http1;
@@ -106,14 +107,14 @@ macro_rules! display_presenter {
 
 /// Modbus/TCP capture frames. Framing is provided by the stdlib decoder.
 pub struct Modbus {
-    frames: fictionet::stdlib::modbus::Frames,
+    frames: Frames::<fictionet::stdlib::modbus::Frame>,
     request: bool,
 }
 impl Modbus {
     /// Selects request or response presentation for this direction.
     pub fn new(request: bool) -> Self {
         Self {
-            frames: fictionet::stdlib::modbus::Frames,
+            frames: Frames::<fictionet::stdlib::modbus::Frame>::new(),
             request,
         }
     }

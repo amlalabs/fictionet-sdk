@@ -1,6 +1,7 @@
 //! Length-framed application streams: BGP, FastCGI, Kafka, Thrift, Zabbix.
 //! Bounded frame streams, exact wire values, and protocol errors.
 
+use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
     Decode, Fail, Stream, Wire, contract, finish, pump, test_support::{chunks, decode_all},
@@ -105,9 +106,9 @@ fn bgp_chunked_round_trip() {
         kind: bgp::kind::KEEPALIVE,
         body: vec![0],
     };
-    let bytes = round_trip(|| bgp::Frames, &[good.clone(), bad, good]);
+    let bytes = round_trip(Frames::<bgp::Frame>::new, &[good.clone(), bad, good]);
     stack(
-        || bgp::Frames.map(|frame| bgp::Message::decode(&frame, &context)),
+        || Frames::<bgp::Frame>::new().map(|frame| bgp::Message::decode(&frame, &context)),
         &bytes,
         &[
             Ok(bgp::Message::Keepalive),
@@ -130,9 +131,9 @@ fn fastcgi_chunked_round_trip() {
         content: vec![],
         padding: 255,
     };
-    let bytes = round_trip(fastcgi::Records::new, &[good.clone(), bad, good]);
+    let bytes = round_trip(Frames::<fastcgi::Record>::new, &[good.clone(), bad, good]);
     stack(
-        || fastcgi::Records::new().map(|record| fastcgi::BeginRequest::parse(&record.content)),
+        || Frames::<fastcgi::Record>::new().map(|record| fastcgi::BeginRequest::parse(&record.content)),
         &bytes,
         &[Ok(body), Err(fastcgi::Error::BodyLength), Ok(body)],
     );
@@ -147,11 +148,11 @@ fn kafka_chunked_round_trip() {
     assert_eq!(request.header.client_id.as_deref(), Some("x"));
     let good = kafka::Frame(payload);
     let bytes = round_trip(
-        kafka::Frames::new,
+        Frames::<kafka::Frame>::new,
         &[good.clone(), kafka::Frame(vec![]), good],
     );
     stack(
-        || kafka::Frames::new().map(|frame| kafka::Request::parse(&frame.0)),
+        || Frames::<kafka::Frame>::new().map(|frame| kafka::Request::parse(&frame.0)),
         &bytes,
         &[
             Ok(request.clone()),
@@ -177,11 +178,11 @@ fn thrift_chunked_round_trip() {
         let payload = thrift::EncodedMessage { message: call.clone(), protocol }.to_bytes().unwrap();
         let good = thrift::Frame(payload);
         let bytes = round_trip(
-            thrift::Frames::new,
+            Frames::<thrift::Frame>::new,
             &[good.clone(), thrift::Frame(vec![]), good],
         );
         stack(
-            || thrift::Frames::new().map(|frame| thrift::EncodedMessage::parse(&frame.0)),
+            || Frames::<thrift::Frame>::new().map(|frame| thrift::EncodedMessage::parse(&frame.0)),
             &bytes,
             &[
                 Ok(thrift::EncodedMessage { message: call.clone(), protocol }),
@@ -198,15 +199,15 @@ fn zabbix_chunked_round_trip() {
     let good = message.to_packet();
     let mut large = good.clone();
     large.flags |= zabbix::flags::LARGE;
-    let bytes = round_trip(zabbix::Packets::new, &[good, large]);
+    let bytes = round_trip(Frames::<zabbix::Packet>::new, &[good, large]);
     stack(
-        || zabbix::Packets::new().map(|packet| zabbix::Message::parse(&packet.data)),
+        || Frames::<zabbix::Packet>::new().map(|packet| zabbix::Message::parse(&packet.data)),
         &bytes,
         &[Ok(message.clone()), Ok(message)],
     );
     // Compression flags and opaque compressed bytes survive the wire layer.
     round_trip(
-        zabbix::Packets::new,
+        Frames::<zabbix::Packet>::new,
         &[zabbix::Packet {
             flags: zabbix::flags::KNOWN,
             reserved: 64,
@@ -215,9 +216,9 @@ fn zabbix_chunked_round_trip() {
     );
     let invalid = zabbix::Packet::new(vec![0xff]);
     let valid = zabbix::Message::response(false, None).unwrap();
-    let bytes = round_trip(zabbix::Packets::new, &[invalid, valid.to_packet()]);
+    let bytes = round_trip(Frames::<zabbix::Packet>::new, &[invalid, valid.to_packet()]);
     stack(
-        || zabbix::Packets::new().map(|packet| zabbix::Message::parse(&packet.data)),
+        || Frames::<zabbix::Packet>::new().map(|packet| zabbix::Message::parse(&packet.data)),
         &bytes,
         &[Err(zabbix::Error::Utf8), Ok(valid)],
     );
@@ -225,13 +226,13 @@ fn zabbix_chunked_round_trip() {
 
 #[test]
 fn bgp_rejects_oversize_at_named_limit() {
-    assert_eq!(bgp::Frames.capacity(), bgp::MAX_MESSAGE_LEN);
+    assert_eq!(Frames::<bgp::Frame>::new().capacity(), bgp::MAX_MESSAGE_LEN);
     let mut header = vec![0xff; bgp::MARKER_LEN];
     let length = u16::try_from(bgp::MAX_MESSAGE_LEN + 1).unwrap();
     header.extend_from_slice(&length.to_be_bytes());
     header.push(bgp::kind::UPDATE);
     rejects(
-        || bgp::Frames,
+        Frames::<bgp::Frame>::new,
         &header,
         bgp::Error::BadMessageLength(length),
     );
@@ -239,10 +240,10 @@ fn bgp_rejects_oversize_at_named_limit() {
 
 #[test]
 fn fastcgi_rejects_oversize_at_named_limit() {
-    assert_eq!(fastcgi::Records::new().capacity(), fastcgi::MAX_RECORD);
+    assert_eq!(Frames::<fastcgi::Record>::new().capacity(), fastcgi::MAX_RECORD);
     // The wire fields cannot exceed MAX_RECORD. Use MAX_CONTENT as the
     // configured total record limit to refuse a record that also needs padding.
-    let make = || fastcgi::Records::with_limit(fastcgi::MAX_CONTENT);
+    let make = || Frames::<fastcgi::Record>::with_limit(fastcgi::MAX_CONTENT);
     assert_eq!(make().capacity(), fastcgi::MAX_CONTENT);
     let header = [
         fastcgi::VERSION,
@@ -270,7 +271,7 @@ fn fastcgi_rejects_oversize_at_named_limit() {
         padding: u8::MAX,
     };
     let bytes = Wire::to_bytes(&record).unwrap();
-    let mut stream = Stream::new(fastcgi::Records::new());
+    let mut stream = Stream::new(Frames::<fastcgi::Record>::new());
     assert_eq!(stream.push(&bytes), fastcgi::MAX_RECORD);
     assert_eq!(stream.next(), Some(Ok(record)));
 }
@@ -278,12 +279,12 @@ fn fastcgi_rejects_oversize_at_named_limit() {
 #[test]
 fn kafka_rejects_oversize_at_named_limit() {
     assert_eq!(
-        kafka::Frames::new().capacity(),
+        Frames::<kafka::Frame>::new().capacity(),
         kafka::MAX_FRAME + kafka::SIZE_LEN
     );
     let length = i32::try_from(kafka::MAX_FRAME + 1).unwrap();
     rejects(
-        kafka::Frames::new,
+        Frames::<kafka::Frame>::new,
         &length.to_be_bytes(),
         kafka::Error::FrameSize(length),
     );
@@ -292,12 +293,12 @@ fn kafka_rejects_oversize_at_named_limit() {
 #[test]
 fn thrift_rejects_oversize_at_named_limit() {
     assert_eq!(
-        thrift::Frames::new().capacity(),
+        Frames::<thrift::Frame>::new().capacity(),
         thrift::MAX_FRAME + thrift::FRAME_HEADER_LEN
     );
     let length = i32::try_from(thrift::MAX_FRAME + 1).unwrap();
     rejects(
-        thrift::Frames::new,
+        Frames::<thrift::Frame>::new,
         &length.to_be_bytes(),
         thrift::Error::FrameLength(length),
     );
@@ -306,7 +307,7 @@ fn thrift_rejects_oversize_at_named_limit() {
 #[test]
 fn zabbix_rejects_oversize_at_named_limit() {
     assert_eq!(
-        zabbix::Packets::new().capacity(),
+        Frames::<zabbix::Packet>::new().capacity(),
         zabbix::DEFAULT_LIMIT + zabbix::LARGE_HEADER_LEN
     );
     for flags in [
@@ -321,7 +322,7 @@ fn zabbix_rejects_oversize_at_named_limit() {
         }
         .to_bytes().unwrap();
         rejects(
-            zabbix::Packets::new,
+            Frames::<zabbix::Packet>::new,
             &header,
             zabbix::Error::TooLarge {
                 len,
@@ -335,7 +336,7 @@ fn zabbix_rejects_oversize_at_named_limit() {
         }
         .to_bytes().unwrap();
         rejects(
-            zabbix::Packets::new,
+            Frames::<zabbix::Packet>::new,
             &header,
             zabbix::Error::ReservedTooLarge {
                 len,
@@ -381,48 +382,48 @@ fn strict_writers_are_transactional() {
 
 #[test]
 fn configurable_limits_clamp_and_accept_empty_frames() {
-    assert_eq!(thrift::Frames::new().limit(), thrift::MAX_FRAME);
-    assert_eq!(thrift::Frames::default().limit(), thrift::MAX_FRAME);
+    assert_eq!(Frames::<thrift::Frame>::new().limit(), thrift::MAX_FRAME);
+    assert_eq!(Frames::<thrift::Frame>::default().limit(), thrift::MAX_FRAME);
     assert_eq!(
-        thrift::Frames::with_limit(usize::MAX).limit(),
+        Frames::<thrift::Frame>::with_limit(usize::MAX).limit(),
         thrift::MAX_FRAME
     );
     stack(
-        || thrift::Frames::with_limit(0),
+        || Frames::<thrift::Frame>::with_limit(0),
         &[0; thrift::FRAME_HEADER_LEN],
         &[thrift::Frame(vec![])],
     );
     stack(
-        || thrift::Frames::with_limit(2),
+        || Frames::<thrift::Frame>::with_limit(2),
         &[0, 0, 0, 2, 7, 8],
         &[thrift::Frame(vec![7, 8])],
     );
     rejects(
-        || thrift::Frames::with_limit(2),
+        || Frames::<thrift::Frame>::with_limit(2),
         &[0, 0, 0, 3],
         thrift::Error::FrameLength(3),
     );
     assert_eq!(
-        kafka::Frames::with_limit(usize::MAX).limit(),
+        Frames::<kafka::Frame>::with_limit(usize::MAX).limit(),
         kafka::MAX_FRAME
     );
     assert_eq!(
-        fastcgi::Records::with_limit(usize::MAX).limit(),
+        Frames::<fastcgi::Record>::with_limit(usize::MAX).limit(),
         fastcgi::MAX_RECORD
     );
-    assert_eq!(fastcgi::Records::with_limit(0).limit(), fastcgi::HEADER_LEN);
+    assert_eq!(Frames::<fastcgi::Record>::with_limit(0).limit(), fastcgi::HEADER_LEN);
     assert_eq!(
-        zabbix::Packets::with_limit(usize::MAX).limit(),
+        Frames::<zabbix::Packet>::with_limit(usize::MAX).limit(),
         zabbix::MAX_DATA
     );
     stack(
-        || kafka::Frames::with_limit(0),
+        || Frames::<kafka::Frame>::with_limit(0),
         &[0; kafka::SIZE_LEN],
         &[kafka::Frame(vec![])],
     );
     let packet = zabbix::Packet::new(vec![]);
     stack(
-        || zabbix::Packets::with_limit(0),
+        || Frames::<zabbix::Packet>::with_limit(0),
         &packet.to_bytes().unwrap(),
         &[packet],
     );
@@ -433,7 +434,7 @@ fn configurable_limits_clamp_and_accept_empty_frames() {
         padding: 0,
     };
     stack(
-        || fastcgi::Records::with_limit(0),
+        || Frames::<fastcgi::Record>::with_limit(0),
         &record.to_bytes().unwrap(),
         &[record],
     );

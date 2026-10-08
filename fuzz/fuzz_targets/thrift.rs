@@ -1,23 +1,24 @@
 //! Thrift frames, messages, and values in the binary and compact protocols.
 #![no_main]
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::thrift::{
-    EncodedMessage, EncodedMessages, Error, Frame, Frames, MAX_FRAME, MAX_MESSAGE, ValueBody,
+    EncodedMessage, EncodedMessages, Error, Frame, MAX_FRAME, MAX_MESSAGE, ValueBody,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(EncodedMessages::new, data, 2 * EncodedMessages::new().capacity());
     contract::check_decode_with_held_limit(EncodedMessages::new, data, EncodedMessages::new().held());
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
+    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * Frames::<Frame>::new().capacity());
     let limit = usize::from(data.first().copied().unwrap_or(0));
-    contract::check_decode_with_alloc_limit(|| Frames::with_limit(limit), data, 2 * Frames::with_limit(limit).capacity());
+    contract::check_decode_with_alloc_limit(|| Frames::<Frame>::with_limit(limit), data, 2 * Frames::<Frame>::with_limit(limit).capacity());
     contract::check_wire::<Frame>(data);
     contract::check_wire::<EncodedMessage>(data);
-    contract::check_decode_with_alloc_limit(|| Frames::new().map(|frame| EncodedMessage::parse(&frame.0)), data, 2 * Frames::new().capacity());
+    contract::check_decode_with_alloc_limit(|| Frames::<Frame>::new().map(|frame| EncodedMessage::parse(&frame.0)), data, 2 * Frames::<Frame>::new().capacity());
     contract::check_wire_value(&Frame(data.iter().take(MAX_FRAME + 1).copied().collect()));
-    for frame in decode_all(Frames::new, data).0 {
+    for frame in decode_all(Frames::<Frame>::new, data).0 {
         contract::check_wire_value(&frame);
         contract::check_wire::<EncodedMessage>(&frame.0);
     }

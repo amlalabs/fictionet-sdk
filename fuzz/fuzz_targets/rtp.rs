@@ -1,17 +1,18 @@
 //! RTP datagrams, multiplexed RTCP, and RFC 4571 envelopes.
 #![no_main]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire, contract};
 use fictionet::stdlib::{rtcp, rtp::*};
 use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(rtcp::Frames::new, data, 2 * (MAX_PACKET + 2));
+    contract::check_decode_with_alloc_limit(Frames::<rtcp::Frame>::new, data, 2 * (MAX_PACKET + 2));
     contract::check_decode_with_alloc_limit(
-        || rtcp::Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+        || Frames::<rtcp::Frame>::with_limit(usize::from(data.first().copied().unwrap_or(0))),
         data,
         514,
     );
     contract::check_decode_with_alloc_limit(
-        || rtcp::Frames::new().map(|frame| Demux::parse(&frame.0)),
+        || Frames::<rtcp::Frame>::new().map(|frame| Demux::parse(&frame.0)),
         data,
         2 * (MAX_PACKET + 2),
     );

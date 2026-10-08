@@ -21,7 +21,7 @@
 //!
 //! Nothing here reads a socket. A world pushes TCP bytes through
 //! [`Stream<Events>`](fictionet::stdlib::codec::Stream) for the version exchange and
-//! numbered packets, or [`Stream<Packets>`](fictionet::stdlib::codec::Stream) after it.
+//! numbered packets, or [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream) after it.
 //! It reads payloads with [`Message::parse`] and builds replies with
 //! [`Identification::new`] and [`Packet::from_message`]. Which
 //! algorithms the world offers, and what its software line says, is up to
@@ -32,6 +32,7 @@
 //! [`MAX_PACKET`], [`MAX_BANNER_LINES`] and [`MAX_PAYLOAD`].
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::ssh::{Events, Event, Identification, KexInit, Message, Packet};
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //!
@@ -60,10 +61,13 @@
 //! let server = ["ecdh-sha2-nistp256".to_string(), "curve25519-sha256".to_string()];
 //! assert_eq!(KexInit::choose(&theirs.kex_algorithms, &server), Some("curve25519-sha256"));
 //!
-//! // Packets are padded to a multiple of 8 bytes.
+//! // Frames::<Packet> are padded to a multiple of 8 bytes.
 //! assert_eq!(Packet::new(vec![21]).to_bytes().unwrap().len(), 16);
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Step, Wire, Reader as ByteReader, Truncated};
 
 /// The TCP port SSH servers listen on.
@@ -133,7 +137,7 @@ pub mod msg {
 
 /// Why bytes are not SSH, or not the data or message expected, or why a
 /// value cannot be written as it stands. After an error from [`Lines`],
-/// [`Packets`] or [`Events`] the stream cannot be read any further, and a
+/// [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames) or [`Events`] the stream cannot be read any further, and a
 /// real peer closes the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -600,60 +604,35 @@ impl Wire for Packet {
 /// Use [`Lines`] or [`Events`] for the bounded version exchange.
 /// Stop using this framer when keys take effect. It performs no encryption
 /// or MAC processing. Payload messages are parsed separately by [`Message::parse`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Packets {
-    limit: usize,
-}
-
-impl Packets {
-    /// Creates a framer with [`MAX_PACKET`] as its total packet limit.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_PACKET)
-    }
-
-    /// Sets the total packet limit, including the four-byte length field.
-    /// Clamps it to [`MIN_PACKET`] through [`MAX_PACKET`].
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.clamp(MIN_PACKET, MAX_PACKET),
-        }
-    }
-
-    /// The largest accepted packet, including its length field.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Packets {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Packets {
+impl Prefixed for Packet {
     type Item = Packet;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "SSH cleartext packets";
 
-    fn capacity(&self) -> usize {
-        self.limit
-    }
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_PACKET }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.clamp(MIN_PACKET, MAX_PACKET) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize { *limit }
+
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
         if let Some(&[a, b, c, d]) = input.get(..4) {
             let length = u32::from_be_bytes([a, b, c, d]);
             let total = usize::try_from(length).ok().and_then(|n| n.checked_add(4));
-            if total.is_none_or(|n| n > self.limit) {
+            if total.is_none_or(|n| n > limit) {
                 return Err(Error::PacketLength(length));
             }
         }
-        Ok(match Packet::parse_prefix(input)? {
-            Some((packet, used)) => Step::Item(packet, used),
-            None => Step::Need,
-        })
+        Packet::parse_prefix(input)
     }
 }
+
 
 /// What a [`Events`] finds in the stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2272,7 +2251,7 @@ mod tests {
             Some(Fail::Protocol(Error::LineTooLong))
         );
         contract::check_decode_with_alloc_limit(
-            Packets::new,
+            Frames::<Packet>::new,
             &[0, 0, 0x88, 0xb4, 4],
             2 * MAX_PACKET,
         );
@@ -2355,7 +2334,7 @@ mod tests {
             mutate(&mut g, &mut bytes);
             contract::check_decode_with_alloc_limit(Events::new, &bytes, 2 * MAX_PACKET);
             contract::check_decode_with_alloc_limit(Events::after_version, &bytes, 2 * MAX_PACKET);
-            contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_PACKET);
+            contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_PACKET);
             contract::check_decode_with_alloc_limit(Lines::new, &bytes, 2 * MAX_BANNER_LINE);
             contract::check_wire::<Message>(&bytes);
             contract::check_wire::<Packet>(&bytes);

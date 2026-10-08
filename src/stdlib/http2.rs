@@ -1299,7 +1299,7 @@ struct SettingsUpdate {
 /// unaccepted suffix, and drain again after [`end`](Self::end). An error is
 /// returned once and retained by [`failed`](Self::failed). DATA ownership
 /// passes to the caller; route it to a [`fictionet::stdlib::codec::Demux`]
-/// of [`fictionet::stdlib::grpc::Messages`] for gRPC under one shared budget.
+/// of [`fictionet::stdlib::codec::Frames<grpc::Message>`] for gRPC under one shared budget.
 pub struct Session {
     frames: Stream<Frames>,
     blocks: HeaderBlocks,

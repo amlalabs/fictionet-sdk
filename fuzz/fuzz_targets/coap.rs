@@ -2,15 +2,35 @@
 //! reads them.
 #![no_main]
 
-use fictionet::stdlib::coap::{
-    Reassembler, Block, Error, Code, Frame, Frames, MAX_BUFFERED, MAX_DATAGRAM, Message, Options, Type, option,
-    peek_header,
-};
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::coap::Reassembler;
+
+use fictionet::stdlib::coap::Block;
+
+use fictionet::stdlib::coap::Error;
+
+use fictionet::stdlib::coap::Code;
+
+use fictionet::stdlib::coap::Frame;
+
+use fictionet::stdlib::coap::MAX_BUFFERED;
+
+use fictionet::stdlib::coap::MAX_DATAGRAM;
+
+use fictionet::stdlib::coap::Message;
+
+use fictionet::stdlib::coap::Options;
+
+use fictionet::stdlib::coap::Type;
+
+use fictionet::stdlib::coap::option;
+
+use fictionet::stdlib::coap::peek_header;
 use libfuzzer_sys::fuzz_target;
 use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_BUFFERED);
+    contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * MAX_BUFFERED);
     contract::check_wire::<fictionet::stdlib::coap::Uint>(data);
     contract::check_wire::<Message>(data);
     contract::check_wire::<Frame>(data);
@@ -126,7 +146,7 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(a.body(), rest);
     }
 
-    for frame in decode_all(Frames::new, data).0 {
+    for frame in decode_all(Frames::<Frame>::new, data).0 {
         contract::check_wire_value(&frame);
         let _ = (frame.bad_option(), frame.max_message_size());
         assert!(frame.pong().to_bytes().is_ok());

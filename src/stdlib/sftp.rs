@@ -9,7 +9,7 @@
 //! OpenSSH and almost every other implementation speak.
 //!
 //! A world that plays a file server passes bytes from the SSH channel
-//! to [`Stream<Packets>`](fictionet::stdlib::codec::Stream), gets
+//! to [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), gets
 //! [`Packet`]s back, reads each one's [`Request`], and writes the bytes of
 //! a [`Response`] back to the channel. Which files exist, what they hold
 //! and who may touch them is up to world code.
@@ -20,7 +20,8 @@
 //! Writers leave the destination unchanged when a value cannot be written.
 //!
 //! ```
-//! use fictionet::stdlib::sftp::{Attrs, Packet, Packets, Request, Response, Status, VERSION};
+//! use fictionet::stdlib::codec::Frames;
+//! use fictionet::stdlib::sftp::{Attrs, Packet, Request, Response, Status, VERSION};
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //!
 //! /// A server holding one file, `/motd`, 12 bytes long.
@@ -42,7 +43,7 @@
 //!     }
 //! }
 //!
-//! let mut stream = Stream::new(Packets::new());
+//! let mut stream = Stream::new(Frames::<Packet>::new());
 //! // INIT, version 3: length 5, type 1, then the version.
 //! assert_eq!(stream.push(&[0, 0, 0, 5, 1, 0, 0, 0, 3]), 9);
 //! let init = stream.next().unwrap().unwrap();
@@ -65,7 +66,10 @@
 //! );
 //! ```
 
-use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated, Trailing};
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Wire, Reader, Truncated, Trailing};
 
 /// The SSH subsystem name a client asks for to start SFTP.
 pub const SUBSYSTEM: &str = "sftp";
@@ -78,7 +82,7 @@ pub const MAX_PACKET: usize = 256 * 1024;
 /// The length field before each packet.
 pub const LENGTH_LEN: usize = 4;
 /// The longest wire packet, including its four-byte length field.
-/// This is the default input capacity of [`Packets`].
+/// This is the default input capacity of [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames).
 pub const MAX_FRAME: usize = LENGTH_LEN + MAX_PACKET;
 /// The most bytes of file data one WRITE, DATA or EXTENDED packet may
 /// carry. A server should not answer a READ with more.
@@ -261,56 +265,35 @@ impl Wire for Packet {
 /// Reads SFTP packets without holding input bytes.
 ///
 /// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
-/// by [`LENGTH_LEN`] plus [`limit`](Self::limit). Oversized packets are
-/// refused from the length field. Partial packets return [`Step::Need`],
+/// by [`LENGTH_LEN`] plus [`limit`](fictionet::stdlib::codec::Frames::limit). Oversized packets are
+/// refused from the length field. Partial packets return [`fictionet::stdlib::codec::Step::Need`],
 /// including at EOF, so the stream reports truncation. Packet bodies
 /// remain bytes for [`Request::from_packet`] or [`Response::from_packet`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Packets {
-    limit: usize,
-}
-
-impl Packets {
-    /// Reads packets whose type and body occupy at most [`MAX_PACKET`] bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_PACKET)
-    }
-
-    /// Sets the length-field limit, counting the type byte and body.
-    /// Clamps it to [`MAX_PACKET`]. Zero refuses every packet from its
-    /// length field; capacity still includes [`LENGTH_LEN`].
-    pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.min(MAX_PACKET) }
-    }
-
-    /// The maximum type and body size, excluding the length field.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Packets {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Packets {
+impl Prefixed for Packet {
     type Item = Packet;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "SFTP";
 
-    fn capacity(&self) -> usize {
-        LENGTH_LEN.saturating_add(self.limit)
+    #[inline]
+    fn default_limit() -> Self::Limit { MAX_PACKET }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_PACKET) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        LENGTH_LEN.saturating_add(limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
-        Ok(match Packet::parse_prefix(input, self.limit)? {
-            Some((packet, used)) => Step::Item(packet, used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        Packet::parse_prefix(input, limit)
     }
 }
+
 
 /// Why bytes are not an SFTP packet, why a packet's body is not the
 /// request or response its type says, or why a value cannot be written.
@@ -1125,6 +1108,7 @@ fn packet_reader(packet: &Packet) -> Result<Reader<'_>, Error> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, contract,
@@ -1322,10 +1306,10 @@ mod tests {
             (&[0xff; 4][..], Error::PacketTooLong(u32::MAX))] {
             assert_eq!(Packet::parse(bytes), Err(error));
         }
-        assert_eq!(Packets::new().decode(&[0, 4, 0, 0], false), Ok(Step::Need));
-        assert_eq!(Packets::with_limit(8).decode(&[0, 0, 0, 9], false), Err(Error::PacketTooLong(9)));
-        assert_eq!(Packets::with_limit(8).decode(&[0, 0, 0, 8], false), Ok(Step::Need));
-        assert_eq!(Packets::with_limit(usize::MAX).decode(&[0, 4, 0, 1], false), Err(Error::PacketTooLong(0x40001)));
+        assert_eq!(Frames::<Packet>::new().decode(&[0, 4, 0, 0], false), Ok(Step::Need));
+        assert_eq!(Frames::<Packet>::with_limit(8).decode(&[0, 0, 0, 9], false), Err(Error::PacketTooLong(9)));
+        assert_eq!(Frames::<Packet>::with_limit(8).decode(&[0, 0, 0, 8], false), Ok(Step::Need));
+        assert_eq!(Frames::<Packet>::with_limit(usize::MAX).decode(&[0, 4, 0, 1], false), Err(Error::PacketTooLong(0x40001)));
         assert_eq!(Packet::parse(&[0, 0, 0, 1, 7, 9]), Err(Error::PacketTrailing));
         assert_eq!(Packet::parse(&[0, 0, 0, 1, 7]), Ok(Packet { kind: 7, body: vec![] }));
         assert!(Error::Empty.to_string().contains('0'));
@@ -1411,7 +1395,7 @@ mod tests {
             let bytes = p.to_bytes().unwrap();
             for n in 0..bytes.len() {
                 assert_eq!(Packet::parse(&bytes[..n]), Err(Error::PacketTruncated), "{p:?} at {n}");
-                assert_eq!(Packets::new().decode(&bytes[..n], false), Ok(Step::Need));
+                assert_eq!(Frames::<Packet>::new().decode(&bytes[..n], false), Ok(Step::Need));
             }
             let parse = |q: &Packet| {
                 if *is_request {
@@ -1449,25 +1433,25 @@ mod tests {
         let stat = Request::Stat { id: 1, path: s(b"/etc/passwd") };
         let b = stat.to_bytes().unwrap();
         let bytes = [&a[..], &b].concat();
-        contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_FRAME);
-        let (packets, failure) = decode_all(Packets::new, &bytes);
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_FRAME);
+        let (packets, failure) = decode_all(Frames::<Packet>::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(packets.len(), 2);
         assert_eq!(Request::from_packet(&packets[1]), Ok(stat));
-        let mut stream = Stream::new(Packets::new());
+        let mut stream = Stream::new(Frames::<Packet>::new());
         assert_eq!(stream.push(&[0, 0, 0, 0, 1]), 5);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Empty))));
         assert_eq!(stream.next(), None);
         assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::Empty)));
-        assert!(matches!(decode_all(|| Packets::with_limit(8), &b).1, Some(Fail::Protocol(Error::PacketTooLong(_)))));
-        assert_eq!(decode_all(Packets::new, &b[..6]).1, Some(Fail::Truncated { unread: 6 }));
+        assert!(matches!(decode_all(|| Frames::<Packet>::with_limit(8), &b).1, Some(Fail::Protocol(Error::PacketTooLong(_)))));
+        assert_eq!(decode_all(Frames::<Packet>::new, &b[..6]).1, Some(Fail::Truncated { unread: 6 }));
     }
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
         let one = Request::Readdir { id: 1, handle: s(b"d") }.to_bytes().unwrap();
         let started = std::time::Instant::now();
-        let (packets, failure) = decode_all(Packets::new, &one.repeat(200_000));
+        let (packets, failure) = decode_all(Frames::<Packet>::new, &one.repeat(200_000));
         assert_eq!(failure, None);
         assert_eq!(packets.len(), 200_000);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
@@ -1554,9 +1538,9 @@ mod tests {
     fn stream_holds_at_most_one_packet() {
         let one = Request::Readdir { id: 1, handle: s(b"d") }.to_bytes().unwrap();
         let bytes = one.repeat(100);
-        contract::check_decode_with_alloc_limit(|| Packets::with_limit(64), &bytes, 2 * (LENGTH_LEN + 64));
-        assert_eq!(decode_all(|| Packets::with_limit(64), &bytes).0.len(), 100);
-        let mut stream = Stream::new(Packets::with_limit(64));
+        contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), &bytes, 2 * (LENGTH_LEN + 64));
+        assert_eq!(decode_all(|| Frames::<Packet>::with_limit(64), &bytes).0.len(), 100);
+        let mut stream = Stream::new(Frames::<Packet>::with_limit(64));
         assert_eq!(stream.push(&bytes), LENGTH_LEN + 64);
         assert_eq!(stream.push(&one), 0);
     }
@@ -1627,7 +1611,7 @@ mod tests {
         for _ in 0..6000 {
             let mut bytes = if rng.coin() { seeds[rng.index(seeds.len())].clone() } else { rng.bytes(64) };
             mutate(&mut rng, &mut bytes);
-            contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * MAX_FRAME);
+            contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * MAX_FRAME);
             contract::check_wire::<Packet>(&bytes);
             contract::check_wire::<Request>(&bytes);
             contract::check_wire::<Response>(&bytes);

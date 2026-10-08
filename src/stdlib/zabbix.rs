@@ -14,7 +14,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a Zabbix server
 //! passes the bytes a [`tcp`](fictionet::stdlib::tcp) connection reads to a
-//! [`Stream<Packets>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
+//! [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
 //! reads each one's [`Message`], and writes the reply's bytes back to
 //! the connection. Compressed data is reported with
 //! [`Packet::is_compressed`] and left as it came; it is not
@@ -27,8 +27,9 @@
 //! would pass it, before the data comes.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-//! use fictionet::stdlib::zabbix::{Kind, Message, Packets};
+//! use fictionet::stdlib::zabbix::{Kind, Message};
 //!
 //! // What zabbix_sender sends for one value.
 //! let json = br#"{"request":"sender data","data":[{"host":"web1","key":"cpu","value":"0.5"}]}"#;
@@ -37,7 +38,7 @@
 //! sent.extend_from_slice(&[0, 0, 0, 0]);
 //! sent.extend_from_slice(json);
 //!
-//! let mut stream = Stream::new(Packets::new());
+//! let mut stream = Stream::new(Frames::<fictionet::stdlib::zabbix::Packet>::new());
 //! let mut packets = Vec::new();
 //! pump(&mut stream, &sent, |packet| packets.push(packet)).unwrap();
 //! finish(&mut stream, |_| unreachable!()).unwrap();
@@ -53,9 +54,12 @@
 //! assert_eq!(&bytes[13..], br#"{"response":"success","info":"processed: 1; failed: 0; total: 1"}"#);
 //! ```
 
+use fictionet::stdlib::codec::Prefixed;
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 extern crate alloc;
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Wire};
 use alloc::{format, string::{String, ToString}, vec::Vec};
 
 /// The TCP port a Zabbix agent listens on for the server's questions.
@@ -72,7 +76,7 @@ pub const LARGE_HEADER_LEN: usize = 21;
 /// The most data one packet may carry: 1 GiB, the limit Zabbix itself
 /// sets on what it receives.
 pub const MAX_DATA: usize = 1 << 30;
-/// The size limit used by [`Packets::new`].
+/// The size limit used by [`codec::Frames<Packet>::new`](fictionet::stdlib::codec::Frames::new).
 pub const DEFAULT_LIMIT: usize = 16 << 20;
 /// How deeply arrays and objects may nest in a message's JSON.
 pub const MAX_DEPTH: usize = 64;
@@ -332,19 +336,20 @@ impl Wire for Packet {
 /// Reads Zabbix packets without holding input bytes.
 ///
 /// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`LARGE_HEADER_LEN`]
-/// plus [`Self::limit`]. Partial packets return [`Step::Need`], including at
+/// plus [`Frames::limit`](fictionet::stdlib::codec::Frames::limit). Partial packets return [`fictionet::stdlib::codec::Step::Need`], including at
 /// EOF. The stream reports truncation at EOF and framing errors once.
 /// Compressed payloads remain bytes. Body parsing stays separate.
-/// [`Wire`] accepts data up to [`MAX_DATA`], but [`Packets::new`] refuses data
-/// over [`DEFAULT_LIMIT`]; use [`Packets::with_limit`] for larger packets.
+/// [`Wire`] accepts data up to [`MAX_DATA`], but [`codec::Frames<Packet>::new`](fictionet::stdlib::codec::Frames::new) refuses data
+/// over [`DEFAULT_LIMIT`]; use [`codec::Frames<Packet>::with_limit`](fictionet::stdlib::codec::Frames::with_limit) for larger packets.
 ///
 /// ```
+/// use fictionet::stdlib::codec::Frames;
 /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-/// use fictionet::stdlib::zabbix::{Packet, Packets};
+/// use fictionet::stdlib::zabbix::Packet;
 ///
 /// let packet = Packet::new(b"hello".to_vec());
 /// let bytes = Wire::to_bytes(&packet)?;
-/// let mut stream = Stream::new(Packets::with_limit(16));
+/// let mut stream = Stream::new(Frames::<Packet>::with_limit(16));
 /// let mut packets = Vec::new();
 /// pump(&mut stream, &bytes[..3], |packet| packets.push(packet))?;
 /// pump(&mut stream, &bytes[3..], |packet| packets.push(packet))?;
@@ -352,52 +357,31 @@ impl Wire for Packet {
 /// assert_eq!(packets, [packet]);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Copy, Debug)]
-pub struct Packets {
-    limit: usize,
-}
-
-impl Packets {
-    /// Accepts packets with data and reserved lengths up to [`DEFAULT_LIMIT`].
-    pub fn new() -> Self {
-        Self::with_limit(DEFAULT_LIMIT)
-    }
-
-    /// Sets the data and reserved length limit, clamped to [`MAX_DATA`].
-    /// Zero accepts only empty data and a zero reserved length. Oversized
-    /// lengths are refused from the header, before the data arrives.
-    pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.min(MAX_DATA) }
-    }
-
-    /// The maximum data and reserved length, excluding the header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Packets {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Packets {
+impl Prefixed for Packet {
     type Item = Packet;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "Zabbix";
 
-    fn capacity(&self) -> usize {
-        LARGE_HEADER_LEN.saturating_add(self.limit)
+    #[inline]
+    fn default_limit() -> Self::Limit { DEFAULT_LIMIT }
+
+    #[inline]
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit { limit.min(MAX_DATA) }
+
+    #[inline]
+    fn capacity(limit: &Self::Limit) -> usize {
+        let limit = *limit;
+        LARGE_HEADER_LEN.saturating_add(limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
-        Ok(match Packet::parse_limited(input, self.limit)? {
-            Some((packet, used)) => Step::Item(packet, used),
-            None => Step::Need,
-        })
+    #[inline]
+    fn parse_prefix(input: &[u8], limit: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Self::Error> {
+        let limit = *limit;
+        Packet::parse_limited(input, limit)
     }
 }
+
 
 /// What a JSON message is, from its top-level `request` or `response`
 /// member.
@@ -904,6 +888,7 @@ impl Scanner<'_> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, contract, finish, pump,
@@ -971,23 +956,23 @@ mod tests {
 
     #[test]
     fn packet_errors() {
-        assert_eq!(Packets::with_limit(MAX_DATA).decode(b"ZBXE", false), Err(Error::Magic));
-        assert_eq!(Packets::with_limit(MAX_DATA).decode(b"X", false), Err(Error::Magic));
-        assert_eq!(Packets::with_limit(MAX_DATA).decode(b"HTTP/1.1", false), Err(Error::Magic));
-        assert_eq!(Packets::with_limit(MAX_DATA).decode(b"ZBXD\x00", false), Err(Error::Flags(0)));
-        assert_eq!(Packets::with_limit(MAX_DATA).decode(b"ZBXD\x02", false), Err(Error::Flags(2)));
-        assert_eq!(Packets::with_limit(MAX_DATA).decode(b"ZBXD\x09", false), Err(Error::Flags(9)));
+        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXE", false), Err(Error::Magic));
+        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(b"X", false), Err(Error::Magic));
+        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(b"HTTP/1.1", false), Err(Error::Magic));
+        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXD\x00", false), Err(Error::Flags(0)));
+        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXD\x02", false), Err(Error::Flags(2)));
+        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXD\x09", false), Err(Error::Flags(9)));
         let bytes = packet_bytes(1, b"hello", 0);
-        assert_eq!(Packets::with_limit(4).decode(&bytes, false), Err(Error::TooLarge { len: 5, limit: 4 }));
-        assert!(matches!(Packets::with_limit(5).decode(&bytes, false).unwrap(), Step::Item(_, _)));
+        assert_eq!(Frames::<Packet>::with_limit(4).decode(&bytes, false), Err(Error::TooLarge { len: 5, limit: 4 }));
+        assert!(matches!(Frames::<Packet>::with_limit(5).decode(&bytes, false).unwrap(), Step::Item(_, _)));
         // Over the limit is known from the header alone.
-        assert_eq!(Packets::with_limit(4).decode(&bytes[..13], false), Err(Error::TooLarge { len: 5, limit: 4 }));
+        assert_eq!(Frames::<Packet>::with_limit(4).decode(&bytes[..13], false), Err(Error::TooLarge { len: 5, limit: 4 }));
         let mut huge = b"ZBXD\x05".to_vec();
         huge.extend_from_slice(&u64::MAX.to_le_bytes());
         huge.extend_from_slice(&0u64.to_le_bytes());
-        assert_eq!(Packets::with_limit(MAX_DATA).decode(&huge, false), Err(Error::TooLarge { len: u64::MAX, limit: MAX_DATA }));
+        assert_eq!(Frames::<Packet>::with_limit(MAX_DATA).decode(&huge, false), Err(Error::TooLarge { len: u64::MAX, limit: MAX_DATA }));
         // A limit over MAX_DATA counts as MAX_DATA.
-        assert_eq!(Packets::with_limit(usize::MAX).limit(), MAX_DATA);
+        assert_eq!(Frames::<Packet>::with_limit(usize::MAX).limit(), MAX_DATA);
         for e in [Error::Magic, Error::Flags(0), Error::TooLarge { len: 1, limit: 0 }] {
             assert!(!e.to_string().is_empty());
         }
@@ -998,13 +983,13 @@ mod tests {
     #[test]
     fn reserved_length_is_checked_against_the_limit() {
         let bytes = packet_bytes(3, &[0x78, 0x9c], 100);
-        assert_eq!(Packets::with_limit(99).decode(&bytes, false), Err(Error::ReservedTooLarge { len: 100, limit: 99 }));
-        assert!(matches!(Packets::with_limit(100).decode(&bytes, false).unwrap(), Step::Item(_, _)));
+        assert_eq!(Frames::<Packet>::with_limit(99).decode(&bytes, false), Err(Error::ReservedTooLarge { len: 100, limit: 99 }));
+        assert!(matches!(Frames::<Packet>::with_limit(100).decode(&bytes, false).unwrap(), Step::Item(_, _)));
         // Known from the header alone.
-        assert_eq!(Packets::with_limit(99).decode(&bytes[..13], false), Err(Error::ReservedTooLarge { len: 100, limit: 99 }));
+        assert_eq!(Frames::<Packet>::with_limit(99).decode(&bytes[..13], false), Err(Error::ReservedTooLarge { len: 100, limit: 99 }));
         let plain = packet_bytes(1, b"x", 5);
-        assert_eq!(Packets::with_limit(4).decode(&plain, false), Err(Error::ReservedTooLarge { len: 5, limit: 4 }));
-        let mut d = Stream::new(Packets::with_limit(10));
+        assert_eq!(Frames::<Packet>::with_limit(4).decode(&plain, false), Err(Error::ReservedTooLarge { len: 5, limit: 4 }));
+        let mut d = Stream::new(Frames::<Packet>::with_limit(10));
         assert_eq!(d.push(&packet_bytes(3, &[1], 11)[..13]), 13);
         assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::ReservedTooLarge { len: 11, limit: 10 }))));
         assert!(d.next().is_none());
@@ -1049,7 +1034,7 @@ mod tests {
         large.extend_from_slice(b"wxyz");
         for bytes in [packet_bytes(1, b"{\"request\":\"active checks\",\"host\":\"a\"}", 0), large] {
             for n in 0..bytes.len() {
-                assert_eq!(Packets::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
+                assert_eq!(Frames::<Packet>::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
                 assert_eq!(Packet::parse(&bytes[..n]), Err(Error::Truncated));
             }
             assert!(Packet::parse(&bytes).is_ok());
@@ -1164,9 +1149,9 @@ mod tests {
         let b = Packet { flags: 3, reserved: 7, data: vec![1, 2, 3] };
         let mut bytes = a.to_bytes().unwrap();
         b.write(&mut bytes).unwrap();
-        contract::check_decode_with_alloc_limit(Packets::new, &bytes, 2 * Packets::new().capacity());
-        assert_eq!(decode_all(Packets::new, &bytes), (vec![a, b], None));
-        let mut d = Stream::new(Packets::with_limit(4));
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, &bytes, 2 * Frames::<Packet>::new().capacity());
+        assert_eq!(decode_all(Frames::<Packet>::new, &bytes), (vec![a, b], None));
+        let mut d = Stream::new(Frames::<Packet>::with_limit(4));
         assert_eq!(d.push(&packet_bytes(1, b"hello", 0)[..13]), 13);
         assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::TooLarge { len: 5, limit: 4 }))));
         assert_eq!(d.push(&bytes), bytes.len());
@@ -1179,7 +1164,7 @@ mod tests {
         let one = Packet::new(vec![b'x'; 3]).to_bytes().unwrap();
         let bytes = one.repeat(200_000);
         let started = std::time::Instant::now();
-        let mut stream = Stream::new(Packets::new());
+        let mut stream = Stream::new(Frames::<Packet>::new());
         let mut n = 0;
         pump(&mut stream, &bytes, |_| n += 1).unwrap();
         finish(&mut stream, |_| n += 1).unwrap();
@@ -1189,11 +1174,11 @@ mod tests {
     }
 
     fn check_stream(data: &[u8], limit: usize) {
-        contract::check_decode_with_alloc_limit(|| Packets::with_limit(limit), data, 2 * Packets::with_limit(limit).capacity());
+        contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(limit), data, 2 * Frames::<Packet>::with_limit(limit).capacity());
         contract::check_wire::<Packet>(data);
         contract::check_wire::<Header>(data);
         contract::check_wire::<Message>(data);
-        for p in decode_all(|| Packets::with_limit(limit), data).0 {
+        for p in decode_all(|| Frames::<Packet>::with_limit(limit), data).0 {
             contract::check_wire_value(&p);
             if let Ok(m) = Message::parse(&p.data) {
                 assert_eq!(m.json().as_bytes(), &p.data[..]);
