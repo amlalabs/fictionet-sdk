@@ -4,15 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-# A new push to a pull request cancels the run for the one before it. Runs
-# on main always finish.
+# A newer run cancels an older run of the same kind on the same ref.
+# Pushes and nightly runs never cancel each other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -143,10 +146,11 @@ jobs:
         run: cargo +1.91 check --locked --workspace --all-targets
 
   fuzz:
-    name: fuzz (60 s per target)
+    name: fuzz (build; 60 s per target nightly)
     runs-on: ubuntu-latest
-    # About 135 targets at 60 s each, and the build.
-    timeout-minutes: 200
+    # Scheduled and manual runs allow for about 135 targets at 60 s each
+    # and the build. Other runs allow 45 minutes for the build and checks.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 200 || 45 }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -162,9 +166,10 @@ jobs:
         run: cargo +nightly fuzz build -O -a
       # Runs every target, even after one fails, and fails at the end if any did.
       - name: Run each target for 60 seconds
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
       - name: Keep what a target found
-        if: failure()
+        if: failure() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-artifacts
