@@ -1,4 +1,7 @@
-use super::{Buffer, Decode, Step, Wire, alloc::vec::Vec};
+extern crate alloc;
+
+use alloc::vec::Vec;
+use fictionet::stdlib::codec::{Buffer, Decode, Step, Wire};
 use core::{convert::Infallible, error::Error, fmt, marker::PhantomData};
 
 /// Applies a closure to each item without changing framing or errors.

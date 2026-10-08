@@ -15,9 +15,11 @@
 //! one-item interface. [`check_wire_value`] tests constructed writer values,
 //! including values a parser cannot produce.
 
-use super::{
+extern crate alloc;
+
+use alloc::{rc::Rc, vec::Vec};
+use fictionet::stdlib::codec::{
     Buffer, Decode, Fail, Lcg, Step, Stream, Wire,
-    alloc::{rc::Rc, vec::Vec},
     test_support::{chunks, random_chunks},
 };
 use core::{cell::RefCell, fmt::Debug};
@@ -134,16 +136,16 @@ fn drain<D: Decode>(
 {
     while let Some(result) = stream.next() {
         assert!(
-            stream.buffered() <= stream.dec.capacity(),
+            stream.buffered() <= stream.decoder().capacity(),
             "buffered exceeds capacity"
         );
         assert!(
-            stream.buf.allocated() <= alloc_limit,
+            stream.allocated() <= alloc_limit,
             "buffer allocation exceeds limit"
         );
         assert_eq!(
             stream.offset(),
-            stream.dec.state.borrow().consumed,
+            stream.decoder().state.borrow().consumed,
             "consumed accounting mismatch"
         );
         assert_eq!(
@@ -168,16 +170,16 @@ fn drain<D: Decode>(
         }
     }
     assert!(
-        stream.buffered() <= stream.dec.capacity(),
+        stream.buffered() <= stream.decoder().capacity(),
         "buffered exceeds capacity"
     );
     assert!(
-        stream.buf.allocated() <= alloc_limit,
+        stream.allocated() <= alloc_limit,
         "buffer allocation exceeds limit"
     );
     assert_eq!(
         stream.offset(),
-        stream.dec.state.borrow().consumed,
+        stream.decoder().state.borrow().consumed,
         "consumed accounting mismatch"
     );
     assert_eq!(

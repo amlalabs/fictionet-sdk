@@ -3,8 +3,8 @@
 
 extern crate alloc;
 
-use super::{Buffer, LineError};
-use super::ascii::{trim_ows as trim_frame_ws, is_tchar as is_token_byte};
+use fictionet::stdlib::codec::{Buffer, LineError};
+use fictionet::stdlib::codec::ascii::{trim_ows as trim_frame_ws, is_tchar as is_token_byte};
 use alloc::string::{String, ToString};
 
 /// One header field: its name as it came and its value with folded lines

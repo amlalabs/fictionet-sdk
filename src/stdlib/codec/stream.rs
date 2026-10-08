@@ -1,4 +1,4 @@
-use super::{Buffer, Decode, Step};
+use fictionet::stdlib::codec::{Buffer, Decode, Step};
 use core::{error::Error, fmt, ops::Range};
 
 /// Why a stream stopped.
@@ -24,7 +24,7 @@ pub enum Fail<E> {
         capacity: usize,
     },
     /// The owner refused more input: a buffer limit, an allocation failure,
-    /// a datagram larger than the buffer, or a [`Demux`](super::Demux)
+    /// a datagram larger than the buffer, or a [`Demux`](fictionet::stdlib::codec::Demux)
     /// shared budget.
     Refused {
         /// Unread input bytes at failure.
@@ -102,9 +102,9 @@ pub enum StreamEvent<'a, T, E> {
 /// [`failed`](Self::failed) retains the error. Driving methods require
 /// `D::Error: Clone` to keep an owned copy without changing [`Fail`].
 pub struct Stream<D: Decode> {
-    pub(super) buf: Buffer,
-    pub(super) dec: D,
-    pub(super) eof: bool,
+    buf: Buffer,
+    dec: D,
+    eof: bool,
     done: bool,
     failed: Option<Fail<D::Error>>,
 }
@@ -180,6 +180,16 @@ impl<D: Decode> Stream<D> {
     pub fn is_done(&self) -> bool {
         self.done
     }
+    /// Whether EOF has been marked.
+    #[inline]
+    pub fn is_eof(&self) -> bool {
+        self.eof
+    }
+    /// The input buffer's allocated capacity, including any consumed prefix.
+    #[inline]
+    pub fn allocated(&self) -> usize {
+        self.buf.allocated()
+    }
     /// The retained terminal error, if one occurred.
     pub fn failed(&self) -> Option<&Fail<D::Error>> {
         self.failed.as_ref()
@@ -214,13 +224,13 @@ impl<D: Decode> Stream<D> {
     pub fn into_parts(self) -> (Buffer, D) {
         (self.buf, self.dec)
     }
-    pub(super) fn stuck(&self) -> Fail<D::Error> {
+    fn stuck(&self) -> Fail<D::Error> {
         Fail::Stuck {
             unread: self.buf.len(),
             capacity: self.dec.capacity(),
         }
     }
-    pub(super) fn refused(&self) -> Fail<D::Error> {
+    fn refused(&self) -> Fail<D::Error> {
         Fail::Refused {
             unread: self.buf.len(),
             limit: self.buf.limit(),
@@ -231,7 +241,7 @@ impl<D: Decode> Stream<D>
 where
     D::Error: Clone,
 {
-    pub(super) fn fail<R>(&mut self, fail: Fail<D::Error>) -> Option<Result<R, Fail<D::Error>>> {
+    fn fail<R>(&mut self, fail: Fail<D::Error>) -> Option<Result<R, Fail<D::Error>>> {
         self.done = true;
         self.failed = Some(fail.clone());
         Some(Err(fail))

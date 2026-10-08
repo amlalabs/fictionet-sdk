@@ -301,7 +301,7 @@ pub struct Exchange<'a> {
 impl<'a> Exchange<'a> {
     /// An exchange for a handler called outside a service, such as in a
     /// test.
-    pub fn new(now: Instant, rng: &'a mut dyn FnMut() -> u64, conn: &'a ConnInfo) -> Exchange<'a> {
+    pub fn new<R: FnMut() -> u64>(now: Instant, rng: &'a mut R, conn: &'a ConnInfo) -> Exchange<'a> {
         Exchange { now, rng, conn }
     }
 

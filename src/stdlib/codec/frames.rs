@@ -1,7 +1,7 @@
 //! Stateless framing of owned wire values.
 
 use core::marker::PhantomData;
-use super::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// A wire value with a bounded prefix parser.
 ///

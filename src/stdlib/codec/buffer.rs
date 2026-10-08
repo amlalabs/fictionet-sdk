@@ -1,4 +1,6 @@
-use super::alloc::vec::Vec;
+extern crate alloc;
+
+use alloc::vec::Vec;
 
 /// A bounded unread suffix and its stream offset.
 ///
@@ -171,7 +173,10 @@ impl Buffer {
             self.end = 0;
         }
     }
-    pub(super) fn set_limit(&mut self, limit: usize) {
+    /// Sets the limit for new input, clamped to [`MAX_LIMIT`](Self::MAX_LIMIT).
+    /// Keeps unread bytes and invalidates any spare offer.
+    #[inline]
+    pub fn set_limit(&mut self, limit: usize) {
         self.limit = limit.min(Self::MAX_LIMIT);
         self.offered = 0;
     }

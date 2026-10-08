@@ -238,6 +238,16 @@ pub struct Socket {
     wait: CancelWait,
 }
 
+impl fictionet::stdlib::Datagram for Socket {
+    async fn recv(&mut self, fcx: &Cx) -> Result<(Vec<u8>, SocketAddr), RecvError> {
+        Socket::recv(self, fcx).await
+    }
+
+    fn send_to(&mut self, data: &[u8], to: SocketAddr) {
+        Socket::send_to(self, data, to);
+    }
+}
+
 impl Socket {
     /// Waits for the next datagram. Returns its bytes and who sent it.
     ///

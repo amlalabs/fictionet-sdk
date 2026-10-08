@@ -12,7 +12,7 @@
 //! [`serve`] is the one driver that joins a service to a
 //! [`Connection`]: it reads, decodes, calls the
 //! service, writes its reply, honors its timers, and closes. [`listen`]
-//! runs `serve` for every connection a [`Listener`] accepts, with a
+//! runs `serve` for every connection an [`Accept`] listener accepts, with a
 //! cap on how many are open, and TLS first when the options ask for it.
 //! [`serve_datagram`] does the same for a UDP socket. The driver and the
 //! [`Harness`] share one state machine, so a service that passes its
@@ -156,9 +156,8 @@ use fictionet::stdlib::codec::{
     Rule, Stream, StreamEvent,
 };
 use fictionet::events::{ConnInfo, Event, Level, Sandbox, Transport, opt};
-use fictionet::stdlib::tcp::Listener;
+use fictionet::stdlib::{Accept, Accepted, Datagram};
 use fictionet::stdlib::tls::{self, HandshakeError, ServerConfig, TlsConnection};
-use fictionet::stdlib::udp::Socket;
 use fictionet::stdlib::{ConnError, Connection, ConnectionExt};
 use fictionet::time::Instant;
 use fictionet::{Cancelled, Cx, ErrorChain, RaceError, RecvError, Task};
@@ -2450,7 +2449,7 @@ pub async fn accept_tls<C: Connection>(
 /// A connection's failure is that connection's: the run's events record
 /// it as `conn.error`, and its task ends with `Ok`, so it does not fail
 /// the world.
-pub fn listen<S, M>(fcx: &Cx, mut listener: Listener, state: Arc<S::State>, make: M, opts: ServeOptions) -> Task
+pub fn listen<S, M, A: Accept>(fcx: &Cx, mut listener: A, state: Arc<S::State>, make: M, opts: ServeOptions) -> Task
 where
     S: Service,
     M: Fn() -> S + Send + Sync + 'static,
@@ -2470,7 +2469,7 @@ where
                 conn.reset();
                 continue;
             };
-            conn.hold_until_gone(Box::new(guard));
+            conn.hold_until_gone(guard);
             ids += 1;
             let info = ConnInfo::new(ids, conn.local_addr(), conn.peer_addr());
             let (state, make, opts) = (state.clone(), make.clone(), opts.clone());
@@ -2525,7 +2524,7 @@ impl Drop for Counted {
 ///
 /// Returns `Ok(())` once the socket closes, and [`Cancelled`] if `fcx`'s
 /// [region](fictionet::Cx#regions) is cancelled.
-pub async fn serve_datagram<S>(fcx: &Cx, mut socket: Socket, local: SocketAddr, service: &mut S, state: &S::State, opts: &ServeOptions) -> Result<(), Cancelled>
+pub async fn serve_datagram<S, D: Datagram>(fcx: &Cx, mut socket: D, local: SocketAddr, service: &mut S, state: &S::State, opts: &ServeOptions) -> Result<(), Cancelled>
 where
     S: Service,
     <S::Decoder as Decode>::Error: Clone + Send,
@@ -2539,7 +2538,7 @@ where
     // caller to send, or drop.
     let called = |s: &mut Scratch,
                   timers: &[(Timer, Instant)],
-                  socket: &mut Socket,
+                  socket: &mut D,
                   info: &ConnInfo,
                   f: &mut dyn FnMut(&mut Driver<'_>) -> Result<Flow, S::Error>|
      -> Flow {

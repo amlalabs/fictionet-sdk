@@ -14,6 +14,28 @@ macro_rules! protocols {
         pub mod observe_tls;
         #[path = "../../src/observe/conversation.rs"]
         pub mod observe_conversation;
+        #[path = "../../src/stdlib/codec/buffer.rs"]
+        pub mod buffer;
+        #[path = "../../src/stdlib/codec/combinators.rs"]
+        pub mod combinators;
+        #[path = "../../src/stdlib/codec/contract.rs"]
+        pub mod contract;
+        #[path = "../../src/stdlib/codec/demux.rs"]
+        pub mod demux;
+        #[path = "../../src/stdlib/codec/frames.rs"]
+        pub mod frames;
+        #[path = "../../src/stdlib/codec/head_body.rs"]
+        pub mod head_body;
+        #[path = "../../src/stdlib/codec/pipe.rs"]
+        pub mod pipe;
+        #[path = "../../src/stdlib/codec/reader.rs"]
+        pub mod reader;
+        #[path = "../../src/stdlib/codec/stream.rs"]
+        pub mod stream;
+        #[path = "../../src/stdlib/codec/test_support.rs"]
+        pub mod test_support;
+        #[path = "../../src/stdlib/link.rs"]
+        pub mod link;
         #[path = "../../src/stdlib/tcp.rs"]
         pub mod tcp;
         #[path = "../../src/stdlib/udp.rs"]
@@ -305,4 +327,25 @@ fn copied_frames() {
     check(Frames::<diameter::Message>::with_limit(1024));
     check(Frames::<opcua::Chunk>::with_limit(opcua::Limits::default()));
     check(Frames::<cboe_boe::Inbound>::new());
+}
+
+// Copied transports must enter the SDK's serving drivers.
+fn copied_transports<S, M>(
+    fcx: &fictionet::Cx,
+    listener: tcp::Listener,
+    socket: udp::Socket,
+    local: std::net::SocketAddr,
+    service: &mut S,
+    state: std::sync::Arc<S::State>,
+    make: M,
+) where
+    S: fictionet::stdlib::serve::Service,
+    M: Fn() -> S + Send + Sync + 'static,
+    <S::Decoder as fictionet::stdlib::codec::Decode>::Error: Clone + Send,
+{
+    use fictionet::stdlib::serve::{listen, serve_datagram, ServeOptions};
+    let opts = ServeOptions::default();
+    listen(fcx, listener, state.clone(), make, opts.clone());
+    fn send_future(_: impl std::future::Future + Send) {}
+    send_future(serve_datagram(fcx, socket, local, service, &state, &opts));
 }

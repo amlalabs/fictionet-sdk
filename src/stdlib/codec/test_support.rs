@@ -8,7 +8,10 @@
 //! [`assert_linear`] checks that work grows linearly with input size by
 //! comparing two sizes, instead of holding a test to a wall-clock limit.
 
-use super::{Decode, Fail, Lcg, Stream, alloc::vec::Vec, finish, pump};
+extern crate alloc;
+
+use alloc::vec::Vec;
+use fictionet::stdlib::codec::{Decode, Fail, Lcg, Stream, finish, pump};
 
 /// The most bytes one [`mutate`] call adds. Only inserting a byte and
 /// duplicating a slice grow the input, by 1 and at most this many bytes.

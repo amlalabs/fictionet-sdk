@@ -310,6 +310,25 @@ fn copy_column_matches_the_copy_and_own_fixture() {
 }
 
 #[test]
+fn every_implementation_file_is_copied() {
+    let root = Path::new(ROOT);
+    let mut dirs = vec![root.join("src/stdlib")];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && path.file_name().is_some_and(|name| name != "mod.rs" && name != "tests.rs")
+            {
+                let relative = path.strip_prefix(root).unwrap().to_str().unwrap();
+                assert!(COPY_MODULES.contains(&format!("\"../../{relative}\"")), "{relative}: missing from the copy fixture");
+            }
+        }
+    }
+}
+
+#[test]
 fn descriptions_are_one_line_each() {
     for row in catalog() {
         assert!(row.what.len() <= 160, "{}: the description fits one line ({} chars)", row.module, row.what.len());

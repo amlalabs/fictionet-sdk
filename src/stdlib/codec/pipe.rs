@@ -1,6 +1,8 @@
-use super::{
+extern crate alloc;
+
+use alloc::{collections::VecDeque, vec::Vec};
+use fictionet::stdlib::codec::{
     Buffer, Decode, Fail, Step, Stream,
-    alloc::{collections::VecDeque, vec::Vec},
 };
 use core::{error::Error, fmt, ops::Range};
 
@@ -215,7 +217,7 @@ impl<OE: Error + 'static, IE: Error + 'static> Error for PipeError<OE, IE> {
 ///
 /// [`new`](Self::new) limits each payload to `outer.capacity()`.
 /// Use [`with_limits`](Self::with_limits) for larger payloads, including
-/// messages from an [`Assemble`](super::Assemble) outer or an expanding map.
+/// messages from an [`Assemble`](fictionet::stdlib::codec::Assemble) outer or an expanding map.
 pub struct Pipe<O: Decode, I: Decode, F> {
     outer: O,
     inner: Stream<I>,
@@ -324,7 +326,7 @@ where
                 self.pending.clear();
                 self.pushed = 0;
             }
-            if self.outer_ended && self.pending.is_empty() && !self.inner.eof {
+            if self.outer_ended && self.pending.is_empty() && !self.inner.is_eof() {
                 self.inner.end();
                 self.inner_ready = true;
             }
@@ -347,7 +349,7 @@ where
             }
             let after = self.inner.buffered().saturating_add(self.inner.held());
             if n == 0 && self.inner.offset() == offset && after >= before {
-                return Err(PipeError::Inner(self.inner.refused()));
+                return Err(PipeError::Inner(Fail::Refused { unread: self.inner.buffered(), limit: self.inner.limit() }));
             }
         }
         if self.outer_ended {

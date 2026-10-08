@@ -1,6 +1,8 @@
-use super::{
+extern crate alloc;
+
+use alloc::collections::{BTreeMap, BTreeSet};
+use fictionet::stdlib::codec::{
     Decode, Fail, Stream,
-    alloc::collections::{BTreeMap, BTreeSet},
 };
 use core::{
     cell::Cell,
@@ -88,7 +90,7 @@ impl<K: Ord + Clone, D: Decode, F: FnMut(&K) -> D> Demux<K, D, F> {
             return bytes.len();
         };
         let before = Self::bytes(stream);
-        let n = if stream.is_done() || stream.eof {
+        let n = if stream.is_done() || stream.is_eof() {
             stream.push(bytes)
         } else {
             stream.push(bytes.get(..room).unwrap_or(bytes))
