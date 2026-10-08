@@ -153,6 +153,8 @@ mod interceptor;
 mod lcg;
 mod pipe;
 mod reader;
+mod layout;
+pub use crate::layout;
 mod recorder;
 mod stream;
 pub mod test_support;

@@ -1,6 +1,7 @@
 //! Nasdaq TotalView-ITCH 5.0: every message type as a fixed-layout
 //! [`Wire`] value, a framer for length-prefixed message streams, and a
 //! bounded order book that applies the order messages, with no I/O.
+//! Message tables use [`codec::layout!`](fictionet::stdlib::codec::layout!).
 //!
 //! ITCH is Nasdaq's outbound market data feed: a sequence of binary
 //! messages that describe the day (system events, the stock directory,
@@ -412,137 +413,44 @@ pub type Stock = Alpha<8>;
 /// A four-byte market participant identifier.
 pub type Mpid = Alpha<4>;
 
-/// Defines each message: a struct of its fields after the header, its
-/// type byte and its length from the specification, checked at compile
-/// time against the sum of its fields. Then [`Message`], over them all.
-macro_rules! messages {
-    ($(
-        $(#[doc = $doc:literal])*
-        $name:ident = $kind:literal, $len:literal {
-            $( $(#[doc = $fdoc:literal])* $field:ident: $ty:ty, )*
-        }
-    )*) => {
-        $(
-            $(#[doc = $doc])*
-            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-            pub struct $name {
-                /// Stock locate, tracking number and timestamp.
-                pub header: Header,
-                $( $(#[doc = $fdoc])* pub $field: $ty, )*
-            }
-            impl $name {
-                /// The message type byte.
-                pub const KIND: u8 = $kind;
-                /// Bytes on the wire, type byte included.
-                pub const LEN: usize = $len;
-                fn read_body(mut b: &[u8]) -> Result<Self, Error> {
-                    let header = take(&mut b)?;
-                    $( let $field = take(&mut b)?; )*
-                    Ok(Self { header, $($field,)* })
-                }
-                fn write_body(&self, out: &mut Vec<u8>) {
-                    out.reserve(Self::LEN);
-                    out.push(Self::KIND);
-                    self.header.put(out);
-                    $( Field::put(&self.$field, out); )*
-                }
-            }
-            const _: () = assert!(1 + HEADER_LENGTH $(+ <$ty as Field>::LEN)* == $len);
-            impl Wire for $name {
-                type ParseError = Error;
-                type WriteError = Error;
-                /// Reads one whole message of this type.
-                fn parse(b: &[u8]) -> Result<Self, Error> {
-                    let (&kind, body) = b.split_first().ok_or(Error::Length)?;
-                    if kind != $kind {
-                        return Err(Error::Type(kind));
-                    }
-                    if b.len() != $len {
-                        return Err(Error::Length);
-                    }
-                    Self::read_body(body)
-                }
-                /// Writes the message. Every value of the type writes.
-                fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                    self.write_body(out);
-                    Ok(())
-                }
-            }
-            impl From<$name> for Message {
-                fn from(m: $name) -> Self {
-                    Message::$name(m)
-                }
-            }
-        )*
-
-        /// Any ITCH 5.0 message.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub enum Message {
-            $(
-                #[doc = concat!("A [`", stringify!($name), "`].")]
-                $name($name),
-            )*
-        }
-        impl Message {
-            /// The message type byte.
-            pub fn kind(&self) -> u8 {
-                match self {
-                    $( Message::$name(_) => $kind, )*
-                }
-            }
-            /// The common header.
-            pub fn header(&self) -> &Header {
-                match self {
-                    $( Message::$name(m) => &m.header, )*
-                }
-            }
-            /// Bytes on the wire, type byte included.
-            pub fn wire_len(&self) -> usize {
-                match self {
-                    $( Message::$name(_) => $len, )*
-                }
-            }
-            /// The fixed length of messages of type `kind`, or `None` for
-            /// a type ITCH 5.0 does not define.
-            pub fn length_of(kind: u8) -> Option<usize> {
-                match kind {
-                    $( $kind => Some($len), )*
-                    _ => None,
-                }
-            }
-            /// Every message type byte, in specification order.
-            pub const KINDS: &'static [u8] = &[$($kind),*];
-        }
-        impl Wire for Message {
-            type ParseError = Error;
-            type WriteError = Error;
-            /// Reads one whole message of any type.
-            fn parse(b: &[u8]) -> Result<Self, Error> {
-                let (&kind, body) = b.split_first().ok_or(Error::Length)?;
-                match kind {
-                    $(
-                        $kind => {
-                            if b.len() != $len {
-                                return Err(Error::Length);
-                            }
-                            $name::read_body(body).map(Message::$name)
-                        }
-                    )*
-                    other => Err(Error::Type(other)),
-                }
-            }
-            /// Writes the message. Every value of the type writes.
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                match self {
-                    $( Message::$name(m) => m.write_body(out), )*
-                }
-                Ok(())
-            }
-        }
-    };
+fn envelope(b: &[u8]) -> Result<(u8, &[u8]), Error> {
+    let (&kind, body) = b.split_first().ok_or(Error::Length)?;
+    Ok((kind, body))
 }
 
-messages! {
+fn check_length(b: &[u8], len: usize) -> Result<(), Error> {
+    if b.len() != len { return Err(Error::Length); }
+    Ok(())
+}
+
+fn write_head(kind: u8, len: usize, out: &mut Vec<u8>) -> Result<(), Error> {
+    out.reserve(len);
+    out.push(kind);
+    Ok(())
+}
+
+fictionet::stdlib::codec::layout! {
+    error = Error; type_error = Error::Type;
+    field = Field; take = take; put = Field::put; prefix = 1;
+    read = envelope; check = check_length; write = write_head;
+    unknown = |kind, _| Err(Error::Type(kind));
+    message = { [#[derive(Clone, Copy, Debug, PartialEq, Eq)]]
+        /// Bytes on the wire, type byte included.
+        const LEN; fn wire_len;
+    };
+    header = { /// Stock locate, tracking number and timestamp.
+        header: Header,
+    }; tail = {}; tail_ops = ();
+    items = []; access = { /// Stock locate, tracking number and timestamp.
+        header(&self) -> header: Header;
+    };
+    length = { /// The specified length for a known message type.
+        length_of
+    }; variants = {};
+    /// Any ITCH 5.0 message.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    Message;
+
     /// "S", System Event (1.1): a market or feed event. The locate is 0.
     SystemEvent = b'S', 12 {
         /// See [`codes::event`].

@@ -2,6 +2,7 @@
 //! every PITCH 2.X message and every Gap Request Proxy and Spin Server
 //! message as a [`Wire`] value, a framer for the TCP side, a gap detector
 //! per unit, and a bounded order book, with no I/O.
+//! Message tables use [`codec::layout!`](fictionet::stdlib::codec::layout!).
 //!
 //! PITCH is Cboe's depth-of-book market data feed for its BYX, BZX, EDGA
 //! and EDGX equities exchanges (and, with a few extra types and trailing
@@ -385,160 +386,29 @@ pub struct Unknown {
     pub body: Vec<u8>,
 }
 
-/// Defines one family's messages: a struct per message with its fixed
-/// fields (their total checked at compile time against the
-/// specification's Total Length) and the bytes past them; then the enum
-/// over them, with [`Unknown`] for any other type.
-macro_rules! messages {
-    (
-        $(#[doc = $edoc:literal])*
-        $enum:ident;
-        $(
-            $(#[doc = $doc:literal])*
-            $name:ident = $kind:literal, $len:literal {
-                $( $(#[doc = $fdoc:literal])* $field:ident: $ty:ty, )*
-            }
-        )*
-    ) => {
-        $(
-            $(#[doc = $doc])*
-            #[derive(Clone, Debug, PartialEq, Eq)]
-            pub struct $name {
-                $( $(#[doc = $fdoc])* pub $field: $ty, )*
-                /// Bytes after the fields this revision defines, kept so
-                /// the message writes back as read. Empty for a message of
-                /// exactly the specified length.
-                pub extra: Vec<u8>,
-            }
-            impl $name {
-                /// The message type byte.
-                pub const KIND: u8 = $kind;
-                /// The specified Total Length, Length and type bytes
-                /// included.
-                pub const LEN: usize = $len;
-                #[allow(unused_mut)]
-                fn read_body(mut b: &[u8]) -> Result<Self, Error> {
-                    $( let $field = take(&mut b)?; )*
-                    Ok(Self { $($field,)* extra: b.to_vec() })
-                }
-                /// Bytes on the wire.
-                pub fn wire_len(&self) -> usize {
-                    $len + self.extra.len()
-                }
-                fn write_body(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                    let len = u8::try_from(self.wire_len()).map_err(|_| Error::Length)?;
-                    out.reserve(self.wire_len());
-                    out.push(len);
-                    out.push(Self::KIND);
-                    $( Field::put(&self.$field, out); )*
-                    out.extend_from_slice(&self.extra);
-                    Ok(())
-                }
-            }
-            const _: () = assert!(2 $(+ <$ty as Field>::LEN)* == $len);
-            impl Wire for $name {
-                type ParseError = Error;
-                type WriteError = Error;
-                /// Reads one whole message of this type, Length byte first.
-                fn parse(b: &[u8]) -> Result<Self, Error> {
-                    let kind = framed(b)?;
-                    if kind != $kind {
-                        return Err(Error::Type(kind));
-                    }
-                    if b.len() < $len {
-                        return Err(Error::Length);
-                    }
-                    Self::read_body(b.get(2..).unwrap_or_default())
-                }
-                /// Writes the message. Refuses one longer than
-                /// [`MAX_MESSAGE_LENGTH`].
-                fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                    self.write_body(out)
-                }
-            }
-            impl From<$name> for $enum {
-                fn from(m: $name) -> Self {
-                    $enum::$name(m)
-                }
-            }
-        )*
+fn check_length(b: &[u8], len: usize) -> Result<(), Error> {
+    if b.len() < len { return Err(Error::Length); }
+    Ok(())
+}
 
-        $(#[doc = $edoc])*
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        pub enum $enum {
-            $(
-                #[doc = concat!("A [`", stringify!($name), "`].")]
-                $name($name),
-            )*
-            /// A type this module does not define.
-            Unknown(Unknown),
-        }
-        impl $enum {
-            /// The message type byte.
-            pub fn kind(&self) -> u8 {
-                match self {
-                    $( $enum::$name(_) => $kind, )*
-                    $enum::Unknown(u) => u.kind,
-                }
-            }
-            /// Bytes on the wire.
-            pub fn wire_len(&self) -> usize {
-                match self {
-                    $( $enum::$name(m) => m.wire_len(), )*
-                    $enum::Unknown(u) => 2 + u.body.len(),
-                }
-            }
-            /// The specified length of messages of type `kind`, or `None`
-            /// for a type this module does not define.
-            pub fn length_of(kind: u8) -> Option<usize> {
-                match kind {
-                    $( $kind => Some($len), )*
-                    _ => None,
-                }
-            }
-            /// Every type byte this module defines, in specification order.
-            pub const KINDS: &'static [u8] = &[$($kind),*];
-        }
-        impl Wire for $enum {
-            type ParseError = Error;
-            type WriteError = Error;
-            /// Reads one whole message, Length byte first. A type this
-            /// module does not define reads as `Unknown`.
-            fn parse(b: &[u8]) -> Result<Self, Error> {
-                let kind = framed(b)?;
-                let body = b.get(2..).unwrap_or_default();
-                match kind {
-                    $(
-                        $kind => {
-                            if b.len() < $len {
-                                return Err(Error::Length);
-                            }
-                            $name::read_body(body).map($enum::$name)
-                        }
-                    )*
-                    other => Ok($enum::Unknown(Unknown { kind: other, body: body.to_vec() })),
-                }
-            }
-            /// Writes the message. Refuses one longer than
-            /// [`MAX_MESSAGE_LENGTH`], and an `Unknown` with a defined type.
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                match self {
-                    $( $enum::$name(m) => m.write_body(out), )*
-                    $enum::Unknown(u) => {
-                        if Self::length_of(u.kind).is_some() {
-                            return Err(Error::Type(u.kind));
-                        }
-                        let len = u8::try_from(2 + u.body.len()).map_err(|_| Error::Length)?;
-                        out.reserve(usize::from(len));
-                        out.push(len);
-                        out.push(u.kind);
-                        out.extend_from_slice(&u.body);
-                        Ok(())
-                    }
-                }
-            }
-        }
-    };
+fn write_head(kind: u8, len: usize, out: &mut Vec<u8>) -> Result<(), Error> {
+    let length = u8::try_from(len).map_err(|_| Error::Length)?;
+    out.reserve(len);
+    out.push(length);
+    out.push(kind);
+    Ok(())
+}
+
+fn envelope(b: &[u8]) -> Result<(u8, &[u8]), Error> {
+    let kind = framed(b)?;
+    Ok((kind, &b[2..]))
+}
+
+fn write_unknown(u: &Unknown, kinds: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    if kinds.contains(&u.kind) { return Err(Error::Type(u.kind)); }
+    write_head(u.kind, 2 + u.body.len(), out)?;
+    out.extend_from_slice(&u.body);
+    Ok(())
 }
 
 /// Checks a message's Length byte against its bytes and returns its type.
@@ -549,8 +419,29 @@ fn framed(b: &[u8]) -> Result<u8, Error> {
     }
 }
 
-messages! {
+fictionet::stdlib::codec::layout! {
+    error = Error; type_error = Error::Type;
+    field = Field; take = take; put = Field::put; prefix = 2;
+    read = envelope; check = check_length; write = write_head;
+    unknown = |kind, body: &[u8]| Ok(Self::Unknown(Unknown { kind, body: body.to_vec() }));
+    message = { [#[derive(Clone, Debug, PartialEq, Eq)]]
+        /// The specified Total Length, Length and type bytes included.
+        const LEN; pub fn wire_len;
+    };
+    header = {}; tail = { /// Bytes after the fields this revision defines, kept so
+        /// the message writes back as read. Empty for a message of
+        /// exactly the specified length.
+        extra: Vec<u8> => (|b: &[u8]| Ok(b.to_vec()), |_: &Vec<u8>| Ok(()),
+            Vec::len, |extra: &Vec<u8>, out: &mut Vec<u8>| out.extend_from_slice(extra));
+    }; tail_ops = ();
+    items = []; access = {};
+    length = { /// The specified length for a known message type.
+        length_of
+    }; variants = { /// A type this module does not define.
+        Unknown(Unknown) => (|u: &Unknown| u.kind, |u: &Unknown| 2 + u.body.len(), write_unknown);
+    };
     /// Any PITCH 2.X message ("PITCH 2.X Messages").
+    #[derive(Clone, Debug, PartialEq, Eq)]
     Message;
 
     /// 0xB1, Time Reference: the midnight reference for later Time
@@ -995,10 +886,31 @@ messages! {
     }
 }
 
-messages! {
+fictionet::stdlib::codec::layout! {
+    error = Error; type_error = Error::Type;
+    field = Field; take = take; put = Field::put; prefix = 2;
+    read = envelope; check = check_length; write = write_head;
+    unknown = |kind, body: &[u8]| Ok(Self::Unknown(Unknown { kind, body: body.to_vec() }));
+    message = { [#[derive(Clone, Debug, PartialEq, Eq)]]
+        /// The specified Total Length, Length and type bytes included.
+        const LEN; pub fn wire_len;
+    };
+    header = {}; tail = { /// Bytes after the fields this revision defines, kept so
+        /// the message writes back as read. Empty for a message of
+        /// exactly the specified length.
+        extra: Vec<u8> => (|b: &[u8]| Ok(b.to_vec()), |_: &Vec<u8>| Ok(()),
+            Vec::len, |extra: &Vec<u8>, out: &mut Vec<u8>| out.extend_from_slice(extra));
+    }; tail_ops = ();
+    items = []; access = {};
+    length = { /// The specified length for a known message type.
+        length_of
+    }; variants = { /// A type this module does not define.
+        Unknown(Unknown) => (|u: &Unknown| u.kind, |u: &Unknown| 2 + u.body.len(), write_unknown);
+    };
     /// Any Gap Request Proxy or Spin Server message ("Gap Request Proxy
     /// Messages", "Spin Messages"). Both servers share Login and Login
     /// Response.
+    #[derive(Clone, Debug, PartialEq, Eq)]
     Control;
 
     /// 0x01, Login: the first message to a GRP or Spin Server.

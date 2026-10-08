@@ -2,6 +2,7 @@
 //! message as a [`Wire`] value with its bitfield-driven optional fields, a
 //! framer, a caller-driven client and exchange-side session, and an
 //! exchange-side order tracker, with no I/O and no clocks.
+//! Message tables use [`codec::layout!`](fictionet::stdlib::codec::layout!).
 //!
 //! BOE is Cboe's native order entry protocol for the BYX, BZX, EDGA and
 //! EDGX equities exchanges. A member logs in with the last sequence number
@@ -1257,11 +1258,8 @@ fn envelope(b: &[u8]) -> Result<(u8, &[u8]), Error> {
 }
 
 
-/// Defines one direction's messages: a struct per message with its
-/// header, its fixed fields (their total checked at compile time against
-/// the offset where the tail starts) and its tail; then the enum over them.
-macro_rules! messages {
-    (@prefixed $item:ty) => {
+macro_rules! prefixed {
+    ($item:ty) => {
         impl Prefixed for $item {
             type Item = Result<Self, Error>;
             type Error = Error;
@@ -1273,7 +1271,6 @@ macro_rules! messages {
             fn normalize_limit(limit: usize) -> usize { limit.clamp(HEADER_LENGTH, MAX_MESSAGE) }
             #[inline]
             fn capacity(limit: &usize) -> usize { *limit }
-            #[inline]
             fn parse_prefix(input: &[u8], limit: &usize) -> Result<Option<(Self::Item, usize)>, Error> {
                 let Some(head) = input.get(..4) else {
                     if input.first().is_some_and(|b| *b != 0xBA) {
@@ -1299,148 +1296,40 @@ macro_rules! messages {
             }
         }
     };
-    (
-        $(#[doc = $edoc:literal])*
-        $enum:ident;
-        $(
-            $(#[doc = $doc:literal])*
-            $name:ident = $kind:literal, $fixed:literal {
-                $( $(#[doc = $fdoc:literal])* $field:ident: $ty:ty, )*
-            } $(#[doc = $tdoc:literal])* $tail:ident: $tty:ty;
-        )*
-    ) => {
-        $(
-            $(#[doc = $doc])*
-            #[derive(Clone, Debug, Default, PartialEq, Eq)]
-            pub struct $name {
-                /// MatchingUnit and SequenceNumber.
-                pub header: Header,
-                $( $(#[doc = $fdoc])* pub $field: $ty, )*
-                $(#[doc = $tdoc])*
-                pub $tail: $tty,
-            }
-            impl $name {
-                /// The message type byte.
-                pub const KIND: u8 = $kind;
-                /// Bytes before the tail, StartOfMessage included: the
-                /// specification's offset of the first variable field.
-                pub const FIXED: usize = $fixed;
-                fn read_body(mut b: &[u8]) -> Result<Self, Error> {
-                    let header = take(&mut b)?;
-                    $( let $field = take(&mut b)?; )*
-                    let $tail = Tail::get(b)?;
-                    Ok(Self { header, $($field,)* $tail })
-                }
-                /// Bytes on the wire, StartOfMessage included.
-                pub fn wire_len(&self) -> usize {
-                    $fixed + Tail::len(&self.$tail)
-                }
-                fn write_body(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                    Check::check(&self.$tail)?;
-                    let length = u16::try_from(self.wire_len() - 2).map_err(|_| Error::TooLong)?;
-                    out.reserve(self.wire_len());
-                    out.extend_from_slice(&START_OF_MESSAGE);
-                    length.put(out);
-                    out.push(Self::KIND);
-                    self.header.put(out);
-                    $( Field::put(&self.$field, out); )*
-                    Tail::put(&self.$tail, out);
-                    Ok(())
-                }
-            }
-            const _: () = assert!(5 + <Header as Field>::LEN $(+ <$ty as Field>::LEN)* == $fixed);
-            messages!(@prefixed $name);
-            impl Wire for $name {
-                type ParseError = Error;
-                type WriteError = Error;
-                /// Reads one whole message of this type.
-                fn parse(b: &[u8]) -> Result<Self, Error> {
-                    let (kind, body) = envelope(b)?;
-                    if kind != $kind {
-                        return Err(Error::Type(kind));
-                    }
-                    Self::read_body(body)
-                }
-                /// Writes the message. Refuses lists longer than their
-                /// counts hold and a message over [`MAX_MESSAGE`].
-                fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                    self.write_body(out)
-                }
-            }
-            impl From<$name> for $enum {
-                fn from(m: $name) -> Self {
-                    $enum::$name(m)
-                }
-            }
-        )*
-
-        $(#[doc = $edoc])*
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        pub enum $enum {
-            $(
-                #[doc = concat!("A [`", stringify!($name), "`].")]
-                $name($name),
-            )*
-        }
-        impl $enum {
-            /// The message type byte.
-            pub fn kind(&self) -> u8 {
-                match self {
-                    $( $enum::$name(_) => $kind, )*
-                }
-            }
-            /// MatchingUnit and SequenceNumber.
-            pub fn header(&self) -> &Header {
-                match self {
-                    $( $enum::$name(m) => &m.header, )*
-                }
-            }
-            /// MatchingUnit and SequenceNumber, to set.
-            pub fn header_mut(&mut self) -> &mut Header {
-                match self {
-                    $( $enum::$name(m) => &mut m.header, )*
-                }
-            }
-            /// Bytes on the wire.
-            pub fn wire_len(&self) -> usize {
-                match self {
-                    $( $enum::$name(m) => m.wire_len(), )*
-                }
-            }
-            /// Every type byte of this direction, in specification order.
-            pub const KINDS: &'static [u8] = &[$($kind),*];
-            /// The offset of the tail of messages of type `kind`.
-            pub fn fixed_of(kind: u8) -> Option<usize> {
-                match kind {
-                    $( $kind => Some($fixed), )*
-                    _ => None,
-                }
-            }
-        }
-        messages!(@prefixed $enum);
-        impl Wire for $enum {
-            type ParseError = Error;
-            type WriteError = Error;
-            /// Reads one whole message of this direction.
-            fn parse(b: &[u8]) -> Result<Self, Error> {
-                let (kind, body) = envelope(b)?;
-                match kind {
-                    $( $kind => $name::read_body(body).map($enum::$name), )*
-                    other => Err(Error::Type(other)),
-                }
-            }
-            /// Writes the message.
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                match self {
-                    $( $enum::$name(m) => m.write_body(out), )*
-                }
-            }
-        }
-    };
 }
 
-messages! {
+fn write_head(kind: u8, len: usize, out: &mut Vec<u8>) -> Result<(), Error> {
+    let length = u16::try_from(len - 2).map_err(|_| Error::TooLong)?;
+    out.reserve(len);
+    out.extend_from_slice(&START_OF_MESSAGE);
+    length.put(out);
+    out.push(kind);
+    Ok(())
+}
+
+fictionet::stdlib::codec::layout! {
+    error = Error; type_error = Error::Type;
+    field = Field; take = take; put = Field::put; prefix = 5;
+    read = envelope; check = |_, _| Ok(()); write = write_head;
+    unknown = |kind, _| Err(Error::Type(kind));
+    message = { [#[derive(Clone, Debug, Default, PartialEq, Eq)]]
+        /// Bytes before the tail, StartOfMessage included: the
+        /// specification's offset of the first variable field.
+        const FIXED; pub fn wire_len;
+    };
+    header = { /// MatchingUnit and SequenceNumber.
+        header: Header,
+    }; tail = {}; tail_ops = (Tail::get, Check::check, Tail::len, Tail::put);
+    items = [prefixed]; access = { /// MatchingUnit and SequenceNumber.
+        header(&self) -> header: Header;
+        /// MatchingUnit and SequenceNumber, to set.
+        header_mut(&mut self) -> header: Header;
+    };
+    length = { /// The offset of the tail of messages of type `kind`.
+        fixed_of
+    }; variants = {};
     /// Any Member to Cboe message ("List of Message Types").
+    #[derive(Clone, Debug, PartialEq, Eq)]
     Inbound;
 
     /// 0x37, Login Request: the first message on a connection.
@@ -1451,17 +1340,17 @@ messages! {
         username: Text<4>,
         /// The password supplied by Cboe.
         password: Text<10>,
-    } /// Unit Sequences and Return Bitfields groups.
+    } => /// Unit Sequences and Return Bitfields groups.
     params: ParamGroups;
 
     /// 0x02, Logout Request.
     LogoutRequest = 0x02, 10 {
-    } /// Nothing.
+    } => /// Nothing.
     end: ();
 
     /// 0x03, Client Heartbeat.
     ClientHeartbeat = 0x03, 10 {
-    } /// Nothing.
+    } => /// Nothing.
     end: ();
 
     /// 0x38, New Order.
@@ -1472,14 +1361,14 @@ messages! {
         side: u8,
         /// Shares, at most [`MAX_ORDER_QTY`].
         order_qty: u32,
-    } /// Optional fields: Symbol and Capacity are required.
+    } => /// Optional fields: Symbol and Capacity are required.
     fields: Optional<NewOrderTable>;
 
     /// 0x39, Cancel Order.
     CancelOrder = 0x39, 30 {
         /// The ClOrdID of the order to cancel.
         orig_cl_ord_id: ClOrdId,
-    } /// Optional fields.
+    } => /// Optional fields.
     fields: Optional<CancelOrderTable>;
 
     /// 0x3A, Modify Order.
@@ -1488,19 +1377,40 @@ messages! {
         cl_ord_id: ClOrdId,
         /// The ClOrdID of the order to modify.
         orig_cl_ord_id: ClOrdId,
-    } /// Optional fields: OrderQty and Price are required.
+    } => /// Optional fields: OrderQty and Price are required.
     fields: Optional<ModifyOrderTable>;
 
     /// 0x47, Purge Orders (purge ports only).
     PurgeOrders = 0x47, 11 {
         /// Reserved for Cboe.
         reserved_internal: u8,
-    } /// Bitfields, RiskGroupIDs and optional fields.
+    } => /// Bitfields, RiskGroupIDs and optional fields.
     purge: PurgeFields;
 }
 
-messages! {
+fictionet::stdlib::codec::layout! {
+    error = Error; type_error = Error::Type;
+    field = Field; take = take; put = Field::put; prefix = 5;
+    read = envelope; check = |_, _| Ok(()); write = write_head;
+    unknown = |kind, _| Err(Error::Type(kind));
+    message = { [#[derive(Clone, Debug, Default, PartialEq, Eq)]]
+        /// Bytes before the tail, StartOfMessage included: the
+        /// specification's offset of the first variable field.
+        const FIXED; pub fn wire_len;
+    };
+    header = { /// MatchingUnit and SequenceNumber.
+        header: Header,
+    }; tail = {}; tail_ops = (Tail::get, Check::check, Tail::len, Tail::put);
+    items = [prefixed]; access = { /// MatchingUnit and SequenceNumber.
+        header(&self) -> header: Header;
+        /// MatchingUnit and SequenceNumber, to set.
+        header_mut(&mut self) -> header: Header;
+    };
+    length = { /// The offset of the tail of messages of type `kind`.
+        fixed_of
+    }; variants = {};
     /// Any Cboe to Member message ("List of Message Types").
+    #[derive(Clone, Debug, PartialEq, Eq)]
     Outbound;
 
     /// 0x24, Login Response.
@@ -1513,7 +1423,7 @@ messages! {
         no_unspecified_unit_replay: u8,
         /// The last inbound sequence number Cboe processed.
         last_received_sequence: u32,
-    } /// Units and echoed parameter groups.
+    } => /// Units and echoed parameter groups.
     tail: UnitsAndGroups;
 
     /// 0x08, Logout.
@@ -1524,17 +1434,17 @@ messages! {
         text: ReasonText,
         /// The last inbound sequence number Cboe processed.
         last_received_sequence: u32,
-    } /// The last sequence sent per unit.
+    } => /// The last sequence sent per unit.
     units: Units;
 
     /// 0x09, Server Heartbeat.
     ServerHeartbeat = 0x09, 10 {
-    } /// Nothing.
+    } => /// Nothing.
     end: ();
 
     /// 0x13, Replay Complete.
     ReplayComplete = 0x13, 10 {
-    } /// Nothing.
+    } => /// Nothing.
     end: ();
 
     /// 0x25, Order Acknowledgment (sequenced).
@@ -1547,7 +1457,7 @@ messages! {
         order_id: u64,
         /// Reserved for Cboe.
         reserved_internal: u8,
-    } /// Return fields.
+    } => /// Return fields.
     fields: Optional<ReturnTable>;
 
     /// 0x26, Order Rejected (unsequenced).
@@ -1562,7 +1472,7 @@ messages! {
         text: ReasonText,
         /// Reserved for Cboe.
         reserved_internal: u8,
-    } /// Return fields.
+    } => /// Return fields.
     fields: Optional<ReturnTable>;
 
     /// 0x27, Order Modified (sequenced).
@@ -1575,7 +1485,7 @@ messages! {
         order_id: u64,
         /// Reserved for Cboe.
         reserved_internal: u8,
-    } /// Return fields.
+    } => /// Return fields.
     fields: Optional<ReturnTable>;
 
     /// 0x28, Order Restated (sequenced).
@@ -1590,7 +1500,7 @@ messages! {
         restatement_reason: u8,
         /// Reserved for Cboe.
         reserved_internal: u8,
-    } /// Return fields.
+    } => /// Return fields.
     fields: Optional<ReturnTable>;
 
     /// 0x29, User Modify Rejected (unsequenced).
@@ -1605,7 +1515,7 @@ messages! {
         text: ReasonText,
         /// Reserved for Cboe.
         reserved_internal: u8,
-    } /// Return fields.
+    } => /// Return fields.
     fields: Optional<ReturnTable>;
 
     /// 0x2A, Order Cancelled (sequenced).
@@ -1618,7 +1528,7 @@ messages! {
         reason: u8,
         /// Reserved for Cboe.
         reserved_internal: u8,
-    } /// Return fields.
+    } => /// Return fields.
     fields: Optional<ReturnTable>;
 
     /// 0x2B, Cancel Rejected (unsequenced).
@@ -1633,7 +1543,7 @@ messages! {
         text: ReasonText,
         /// Reserved for Cboe.
         reserved_internal: u8,
-    } /// Return fields.
+    } => /// Return fields.
     fields: Optional<ReturnTable>;
 
     /// 0x2C, Order Execution (sequenced).
@@ -1658,7 +1568,7 @@ messages! {
         contra_broker: Text<4>,
         /// Reserved for Cboe.
         reserved_internal: u8,
-    } /// Return fields.
+    } => /// Return fields.
     fields: Optional<ReturnTable>;
 
     /// 0x2D, Trade Cancel or Correct (sequenced).
@@ -1689,7 +1599,7 @@ messages! {
         orig_time: u64,
         /// Reserved for Cboe.
         reserved_internal: u8,
-    } /// Return fields.
+    } => /// Return fields.
     fields: Optional<ReturnTable>;
 
     /// 0x36, Mass Cancel Acknowledgment (unsequenced, purge ports).
@@ -1702,7 +1612,7 @@ messages! {
         cancelled_order_count: u32,
         /// Reserved for Cboe.
         reserved_internal: u8,
-    } /// Nothing.
+    } => /// Nothing.
     end: ();
 
     /// 0x48, Purge Rejected (unsequenced, purge ports).
@@ -1715,7 +1625,7 @@ messages! {
         text: ReasonText,
         /// Reserved for Cboe.
         reserved_internal: u8,
-    } /// Return fields.
+    } => /// Return fields.
     fields: Optional<ReturnTable>;
 }
 

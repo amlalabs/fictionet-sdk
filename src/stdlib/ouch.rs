@@ -1,7 +1,8 @@
 //! Nasdaq OUCH 5.0: every inbound and outbound order entry message as a
-//! [`Wire`] value, with typed optional appendages, and a sans-IO
+//! [`Wire`](fictionet::stdlib::codec::Wire) value, with typed optional appendages, and a sans-IO
 //! exchange-side state machine that tracks open orders, so a world can be
 //! a fake exchange.
+//! Message tables use [`codec::layout!`](fictionet::stdlib::codec::layout!).
 //!
 //! OUCH is Nasdaq's native order entry protocol. A client enters,
 //! replaces, cancels and modifies orders ([`Inbound`]); the exchange
@@ -23,7 +24,8 @@
 //!
 //! OUCH rides SoupBinTCP: inbound messages in unsequenced data packets,
 //! outbound messages in sequenced data packets (1.1). Parse each packet's
-//! payload with [`Inbound::parse`] or [`Outbound::parse`]. [`Exchange`] is
+//! payload as [`Inbound`] or [`Outbound`] with
+//! [`Wire::parse`](fictionet::stdlib::codec::Wire::parse). [`Exchange`] is
 //! the exchange side of one OUCH port: UserRefNum sequencing, open orders
 //! by [`Token`], and the replies the specification defines; the world
 //! decides what to accept, execute and cancel.
@@ -72,7 +74,6 @@
 use fictionet::stdlib::codec::field;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Wire;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::str::FromStr;
@@ -669,126 +670,33 @@ impl Tail for Option<Options> {
     }
 }
 
-/// Defines one direction's messages: a struct per message with its type
-/// byte, its fixed fields (their total checked at compile time against
-/// the offset of the specification's Appendage Length) and its tail; then
-/// the enum over them.
-macro_rules! messages {
-    (
-        $(#[doc = $edoc:literal])*
-        $enum:ident;
-        $(
-            $(#[doc = $doc:literal])*
-            $name:ident = $kind:literal, $fixed:literal {
-                $( $(#[doc = $fdoc:literal])* $field:ident: $ty:ty, )*
-            } $(#[doc = $tdoc:literal])* $tail:ident: $tty:ty;
-        )*
-    ) => {
-        $(
-            $(#[doc = $doc])*
-            #[derive(Clone, Debug, PartialEq, Eq)]
-            pub struct $name {
-                $( $(#[doc = $fdoc])* pub $field: $ty, )*
-                $(#[doc = $tdoc])*
-                pub $tail: $tty,
-            }
-            impl $name {
-                /// The message type byte.
-                pub const KIND: u8 = $kind;
-                /// Bytes before the appendage length (or all of them, for a
-                /// message without one), type byte included.
-                pub const FIXED: usize = $fixed;
-                #[allow(unused_mut)]
-                fn read_body(mut b: &[u8]) -> Result<Self, Error> {
-                    $( let $field = take(&mut b)?; )*
-                    let $tail = Tail::get(b)?;
-                    Ok(Self { $($field,)* $tail })
-                }
-                /// Bytes on the wire.
-                pub fn wire_len(&self) -> usize {
-                    $fixed + Tail::len(&self.$tail)
-                }
-                fn write_body(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                    Tail::check(&self.$tail)?;
-                    out.reserve(self.wire_len());
-                    out.push(Self::KIND);
-                    $( Field::put(&self.$field, out); )*
-                    Tail::put(&self.$tail, out);
-                    Ok(())
-                }
-            }
-            const _: () = assert!(1 $(+ <$ty as Field>::LEN)* == $fixed);
-            impl Wire for $name {
-                type ParseError = Error;
-                type WriteError = Error;
-                /// Reads one whole message of this type.
-                fn parse(b: &[u8]) -> Result<Self, Error> {
-                    let (&kind, body) = b.split_first().ok_or(Error::Length)?;
-                    if kind != $kind {
-                        return Err(Error::Type(kind));
-                    }
-                    Self::read_body(body)
-                }
-                /// Writes the message. Refuses an invalid appendage.
-                fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                    self.write_body(out)
-                }
-            }
-            impl From<$name> for $enum {
-                fn from(m: $name) -> Self {
-                    $enum::$name(m)
-                }
-            }
-        )*
-
-        $(#[doc = $edoc])*
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        pub enum $enum {
-            $(
-                #[doc = concat!("A [`", stringify!($name), "`].")]
-                $name($name),
-            )*
-        }
-        impl $enum {
-            /// The message type byte.
-            pub fn kind(&self) -> u8 {
-                match self {
-                    $( $enum::$name(_) => $kind, )*
-                }
-            }
-            /// Bytes on the wire.
-            pub fn wire_len(&self) -> usize {
-                match self {
-                    $( $enum::$name(m) => m.wire_len(), )*
-                }
-            }
-            /// Every message type byte, in specification order.
-            pub const KINDS: &'static [u8] = &[$($kind),*];
-        }
-        impl Wire for $enum {
-            type ParseError = Error;
-            type WriteError = Error;
-            /// Reads one whole message of any type of this direction.
-            fn parse(b: &[u8]) -> Result<Self, Error> {
-                let (&kind, body) = b.split_first().ok_or(Error::Length)?;
-                match kind {
-                    $( $kind => $name::read_body(body).map($enum::$name), )*
-                    other => Err(Error::Type(other)),
-                }
-            }
-            /// Writes the message. Refuses an invalid appendage.
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                match self {
-                    $( $enum::$name(m) => m.write_body(out), )*
-                }
-            }
-        }
-    };
+fn envelope(b: &[u8]) -> Result<(u8, &[u8]), Error> {
+    let (&kind, body) = b.split_first().ok_or(Error::Length)?;
+    Ok((kind, body))
 }
 
-messages! {
+fn write_head(kind: u8, len: usize, out: &mut Vec<u8>) -> Result<(), Error> {
+    out.reserve(len);
+    out.push(kind);
+    Ok(())
+}
+
+fictionet::stdlib::codec::layout! {
+    error = Error; type_error = Error::Type;
+    field = Field; take = take; put = Field::put; prefix = 1;
+    read = envelope; check = |_, _| Ok(()); write = write_head;
+    unknown = |kind, _| Err(Error::Type(kind));
+    message = { [#[derive(Clone, Debug, PartialEq, Eq)]]
+        /// Bytes before the appendage length (or all of them, for a
+        /// message without one), type byte included.
+        const FIXED; pub fn wire_len;
+    };
+    header = {}; tail = {}; tail_ops = (Tail::get, Tail::check, Tail::len, Tail::put);
+    items = []; access = {};
+    length = {}; variants = {};
     /// A message from the client to the exchange (2), carried in
     /// SoupBinTCP unsequenced data.
+    #[derive(Clone, Debug, PartialEq, Eq)]
     Inbound;
 
     /// "O", Enter Order (2.1).
@@ -815,7 +723,7 @@ messages! {
         cross_type: u8,
         /// The client's identifier, not checked for uniqueness.
         cl_ord_id: ClOrdId,
-    }
+    } =>
     /// Firm, MinQty, CustomerType, MaxFloor, PriceType, PegOffset,
     /// discretion, PostOnly, RandomReserves, ExpireTime, TradeNow,
     /// HandleInst, GroupID, SharesLocated, LocateBroker, UserRefIdx, AIQ.
@@ -839,7 +747,7 @@ messages! {
         intermarket_sweep: u8,
         /// The replacement's client identifier.
         cl_ord_id: ClOrdId,
-    }
+    } =>
     /// The Enter Order options except Firm and GroupID, plus Side.
     options: Options;
 
@@ -849,7 +757,7 @@ messages! {
         user_ref: u32,
         /// The new intended order size; 0 cancels the rest.
         quantity: u32,
-    }
+    } =>
     /// UserRefIdx. The appendage is optional on this message.
     options: Option<Options>;
 
@@ -861,7 +769,7 @@ messages! {
         side: Side,
         /// The new intended order size; it may not grow.
         quantity: u32,
-    }
+    } =>
     /// UserRefIdx, SharesLocated, LocateBroker. Optional on this message.
     options: Option<Options>;
 
@@ -873,7 +781,7 @@ messages! {
         firm: Firm,
         /// The symbol, or blank for all.
         symbol: Symbol,
-    }
+    } =>
     /// Side, Group ID, UserRefIdx.
     options: Options;
 
@@ -883,7 +791,7 @@ messages! {
         user_ref: u32,
         /// The firm to block.
         firm: Firm,
-    }
+    } =>
     /// UserRefIdx.
     options: Options;
 
@@ -893,20 +801,33 @@ messages! {
         user_ref: u32,
         /// The firm to unblock.
         firm: Firm,
-    }
+    } =>
     /// UserRefIdx.
     options: Options;
 
     /// "Q", Account Query Request (2.8).
     AccountQuery = b'Q', 1 {
-    }
+    } =>
     /// UserRefIdx. Optional on this message.
     options: Option<Options>;
 }
 
-messages! {
+fictionet::stdlib::codec::layout! {
+    error = Error; type_error = Error::Type;
+    field = Field; take = take; put = Field::put; prefix = 1;
+    read = envelope; check = |_, _| Ok(()); write = write_head;
+    unknown = |kind, _| Err(Error::Type(kind));
+    message = { [#[derive(Clone, Debug, PartialEq, Eq)]]
+        /// Bytes before the appendage length (or all of them, for a
+        /// message without one), type byte included.
+        const FIXED; pub fn wire_len;
+    };
+    header = {}; tail = {}; tail_ops = (Tail::get, Tail::check, Tail::len, Tail::put);
+    items = []; access = {};
+    length = {}; variants = {};
     /// A message from the exchange to the client (3), carried in
     /// SoupBinTCP sequenced data.
+    #[derive(Clone, Debug, PartialEq, Eq)]
     Outbound;
 
     /// "S", System Event (3.1).
@@ -915,7 +836,7 @@ messages! {
         timestamp: u64,
         /// "S" start of day, "E" end of day.
         event: u8,
-    }
+    } =>
     /// No appendage.
     end: ();
 
@@ -949,7 +870,7 @@ messages! {
         order_state: u8,
         /// The client's identifier.
         cl_ord_id: ClOrdId,
-    }
+    } =>
     /// The accepted options.
     options: Options;
 
@@ -985,7 +906,7 @@ messages! {
         order_state: u8,
         /// The replacement's client identifier.
         cl_ord_id: ClOrdId,
-    }
+    } =>
     /// The accepted options.
     options: Options;
 
@@ -999,7 +920,7 @@ messages! {
         quantity: u32,
         /// See [`codes::cancel_reason`].
         reason: u8,
-    }
+    } =>
     /// UserRefIdx, present only for a nonzero channel.
     options: Option<Options>;
 
@@ -1021,7 +942,7 @@ messages! {
         liquidity_flag: u8,
         /// The strategy used.
         aiq_strategy: u8,
-    }
+    } =>
     /// UserRefIdx, present only for a nonzero channel.
     options: Option<Options>;
 
@@ -1039,7 +960,7 @@ messages! {
         liquidity_flag: u8,
         /// Shared by both sides of the trade.
         match_number: u64,
-    }
+    } =>
     /// UserRefIdx.
     options: Options;
 
@@ -1055,7 +976,7 @@ messages! {
         reason: u8,
         /// The client's identifier.
         cl_ord_id: ClOrdId,
-    }
+    } =>
     /// UserRefIdx, present only for a nonzero channel.
     options: Option<Options>;
 
@@ -1069,7 +990,7 @@ messages! {
         reason: u16,
         /// The client's identifier.
         cl_ord_id: ClOrdId,
-    }
+    } =>
     /// UserRefIdx, present only for a nonzero channel.
     options: Option<Options>;
 
@@ -1080,7 +1001,7 @@ messages! {
         timestamp: u64,
         /// The order.
         user_ref: u32,
-    }
+    } =>
     /// UserRefIdx, present only for a nonzero channel.
     options: Option<Options>;
 
@@ -1091,7 +1012,7 @@ messages! {
         timestamp: u64,
         /// The order.
         user_ref: u32,
-    }
+    } =>
     /// UserRefIdx, present only for a nonzero channel.
     options: Option<Options>;
 
@@ -1107,7 +1028,7 @@ messages! {
         display: u8,
         /// The new order reference number.
         order_ref: u64,
-    }
+    } =>
     /// UserRefIdx, present only for a nonzero channel.
     options: Option<Options>;
 
@@ -1121,7 +1042,7 @@ messages! {
         side: Side,
         /// Shares outstanding.
         quantity: u32,
-    }
+    } =>
     /// UserRefIdx, SharesLocated, LocateBroker; present only for a
     /// nonzero channel.
     options: Option<Options>;
@@ -1134,7 +1055,7 @@ messages! {
         user_ref: u32,
         /// "R" refresh of display, "P" update of displayed price.
         reason: u8,
-    }
+    } =>
     /// Display Quantity, Display Price, SecondaryOrdRefNum, UserRefIdx.
     options: Options;
 
@@ -1148,7 +1069,7 @@ messages! {
         firm: Firm,
         /// The symbol, or blank.
         symbol: Symbol,
-    }
+    } =>
     /// Side, Group ID, UserRefIdx, as requested.
     options: Options;
 
@@ -1160,7 +1081,7 @@ messages! {
         user_ref: u32,
         /// The firm.
         firm: Firm,
-    }
+    } =>
     /// UserRefIdx.
     options: Options;
 
@@ -1172,7 +1093,7 @@ messages! {
         user_ref: u32,
         /// The firm.
         firm: Firm,
-    }
+    } =>
     /// UserRefIdx.
     options: Options;
 
@@ -1182,7 +1103,7 @@ messages! {
         timestamp: u64,
         /// The next UserRefNum the channel may use.
         next_user_ref: u32,
-    }
+    } =>
     /// UserRefIdx, present only for a nonzero channel.
     options: Option<Options>;
 }
@@ -2152,7 +2073,7 @@ fn canceled(token: Token, quantity: u32, reason: u8, now: u64) -> Outbound {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Lcg,
+        Lcg, Wire,
         contract::{check_wire, check_wire_value},
         test_support::mutate,
     };
