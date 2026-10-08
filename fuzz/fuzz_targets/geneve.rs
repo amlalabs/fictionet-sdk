@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::geneve::{GeneveOption, Header, Packet};
-use fictionet::stdlib::{codec::{Wire, Collect, contract}, geneve};
+use fictionet::stdlib::{codec::{Wire, Collect}, test_support::contract, geneve};
 use libfuzzer_sys::fuzz_target;
 
 /// A packet built from any field values, valid or not. Each option takes

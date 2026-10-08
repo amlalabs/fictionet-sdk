@@ -2488,16 +2488,13 @@ mod tests {
     }
 
     use super::*;
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract, pump,
-        test_support::{self, decode_all},
+        Fail, Lcg, Stream, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{self, decode_all};
 
-    fn hex(s: &str) -> Vec<u8> {
-        s.split_whitespace()
-            .map(|x| u8::from_str_radix(x, 16).unwrap())
-            .collect()
-    }
 
     // MS-RDPBCGR 4.1.3, complete 416-byte Connect Initial dump.
     fn initial_example() -> Vec<u8> {

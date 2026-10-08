@@ -1313,7 +1313,10 @@ fn reply_list_limit(name: &Name, fixed_data: usize, entry_len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Lcg, contract, test_support::mutate};
+    use fictionet::stdlib::test_support::hex;
+    use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::mutate;
 
     const FRED: &[u8; 32] = b"EGFCEFEECACACACACACACACACACACACA";
 
@@ -1925,10 +1928,6 @@ mod tests {
         assert_eq!(NodeStatus::default().statistics, vec![0; STATISTICS_LEN]);
     }
 
-    fn hex(s: &str) -> Vec<u8> {
-        let s: String = s.split_whitespace().collect();
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
-    }
 
     /// A redirect name query response (RFC 1002 section 4.2.15): the
     /// name server NS.NETBIOS.COM, at 10.0.0.1, has authority over

@@ -448,7 +448,9 @@ impl Wire for Fragment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream, contract, test_support::decode_all};
+    use fictionet::stdlib::codec::{Fail, Stream};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::decode_all;
 
     // Reset link states: master 1024 to outstation 1, no user data.
     const RESET: &[u8] = &[5, 0x64, 5, 0xc0, 1, 0, 0, 4, 0xe9, 0x21];

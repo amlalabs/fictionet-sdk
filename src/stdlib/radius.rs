@@ -1779,14 +1779,13 @@ pub fn enum_name(kind: u8, value: u32) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
-    fn hex(s: &str) -> Vec<u8> {
-        s.split_whitespace().map(|h| u8::from_str_radix(h, 16).unwrap()).collect()
-    }
 
     // RFC 2865, section 7.1: User Telnet to Specified Host.
     const ACCESS_REQUEST: &str = "01 00 00 38 0f 40 3f 94 73 97 80 57 bd 83 d5 cb
@@ -2659,7 +2658,7 @@ mod tests {
     fn lcg_fuzz() {
         let mut rng = Lcg::new(0x5eed);
         let seeds = [hex(ACCESS_REQUEST), hex(ACCESS_ACCEPT), hex(CHAP_REQUEST), hex(CHALLENGE)];
-        for i in 0..fictionet::stdlib::codec::test_support::rounds(2750) {
+        for i in 0..fictionet::stdlib::test_support::rounds(2750) {
             let mut data = if i % 3 == 0 {
                 // Random bytes behind a plausible header.
                 let n = 20 + rng.index(300);

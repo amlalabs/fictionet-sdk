@@ -2173,9 +2173,10 @@ bounded_datagram_wire!(LsaBodyFrame, Error, Error::TooLong, MAX_LSA - LSA_HEADER
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Collect, CollectError, Fail, Lcg, contract,
-        test_support::{decode_all, mutate},
+        Collect, CollectError, Fail, Lcg,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Packet, Error> {
         use fictionet::stdlib::codec::Decode;

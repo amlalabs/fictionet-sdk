@@ -1,7 +1,10 @@
 //! Telnet events, option negotiation, and strict wire values.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Step, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::telnet::{
     self, BinaryEvent, Event, Events, Negotiation, Side, Subnegotiation, option,
 };

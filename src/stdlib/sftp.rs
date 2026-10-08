@@ -1115,9 +1115,10 @@ mod tests {
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn s(v: &[u8]) -> Vec<u8> {
         v.to_vec()
@@ -1464,9 +1465,7 @@ mod tests {
     #[test]
     fn writers_refuse_values_they_would_shorten() {
         fn refused<T: Wire<WriteError = Error> + std::fmt::Debug + PartialEq>(value: T) {
-            let mut out = vec![7];
-            assert_eq!(value.write(&mut out), Err(Error::Unwritable));
-            assert_eq!(out, [7]);
+            assert_eq!(contract::check_refused(&value), Error::Unwritable);
             contract::check_wire_value(&value);
         }
         let big = vec![b'a'; 2 * MAX_PACKET];

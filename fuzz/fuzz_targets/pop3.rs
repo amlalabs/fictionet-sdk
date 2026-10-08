@@ -1,7 +1,10 @@
 //! POP3 commands, reply expectations, AUTH lines, and strict wire values.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::pop3::{
     Command, Error, Input, Inputs, MAX_AUTH_LINE, MAX_REPLY_HELD, Output, Outputs, Reply,
     Request, ScanListing, UniqueIdListing,

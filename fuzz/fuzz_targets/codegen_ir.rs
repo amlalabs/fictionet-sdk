@@ -8,7 +8,7 @@
 #[path = "../../codegen/tests/golden/recursive.rs"]
 mod protocol;
 
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

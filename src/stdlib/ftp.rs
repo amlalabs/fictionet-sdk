@@ -1671,9 +1671,11 @@ mod tests {
     use std::net::SocketAddrV6;
 
     use codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn commands(bytes: &[u8]) -> Vec<Result<Command, Error>> {
         decode_all(Commands::new, bytes).0

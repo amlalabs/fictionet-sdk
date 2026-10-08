@@ -1416,19 +1416,15 @@ pub enum ClientPhase {
 mod tests {
     use super::*;
     use codec::{
-        Decode, Fail, Lcg, Stream, contract,
-        test_support::{chunks, decode_all, mutate},
+        Decode, Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
     fn request() -> Request {
         Request { command: Command::Connect, address: Address::Ipv4(Ipv4Addr::new(192, 168, 1, 2)), port: 8080 }
     }
 
-    fn refused<T: Wire<WriteError = Error>>(value: T) {
-        let mut out = vec![7, 8];
-        assert_eq!(value.write(&mut out), Err(Error::Unwritable));
-        assert_eq!(out, [7, 8]);
-    }
 
     #[test]
     fn rfc1928_greeting_and_selection() {
@@ -1517,7 +1513,7 @@ mod tests {
         assert_eq!(bytes.len(), 65_527);
         assert_eq!(UdpDatagram::parse(&bytes), Ok(full.clone()));
         contract::check_wire_value(&full);
-        refused(header.datagram(vec![7; MAX_DATAGRAM - 9]));
+        assert_eq!(contract::check_refused(&header.datagram(vec![7; MAX_DATAGRAM - 9])), Error::Unwritable);
         assert_eq!(UdpDatagram::parse(&vec![0; MAX_DATAGRAM + 1]), Err(Error::TooLong));
         assert_eq!(Error::TooLong.to_string(), "SOCKS datagram exceeds MAX_DATAGRAM");
     }
@@ -1556,9 +1552,9 @@ mod tests {
             assert_eq!(Socks4Request::parse(&bytes), Err(Error::FieldTooLong));
         }
         for destination in [Socks4Destination::Ip(Ipv4Addr::new(0, 0, 0, 7)), Socks4Destination::Domain(vec![b'x'; 256]), Socks4Destination::Domain(b"a\0b".to_vec())] {
-            refused(Socks4Request { destination, ..req.clone() });
+            assert_eq!(contract::check_refused(&Socks4Request { destination, ..req.clone() }), Error::Unwritable);
         }
-        for user_id in [b"ab\0cd".to_vec(), vec![b'u'; 256]] { refused(Socks4Request { user_id, ..req.clone() }); }
+        for user_id in [b"ab\0cd".to_vec(), vec![b'u'; 256]] { assert_eq!(contract::check_refused(&Socks4Request { user_id, ..req.clone() }), Error::Unwritable); }
     }
 
     #[test]
@@ -1582,13 +1578,13 @@ mod tests {
 
     #[test]
     fn writers_refuse_changes() {
-        refused(Greeting { methods: vec![Method::NoAuth; MAX_METHODS + 1] });
-        refused(Greeting { methods: vec![Method::Other(0)] });
-        refused(AuthRequest { username: vec![0; 256], password: vec![] });
-        refused(AuthRequest { username: vec![], password: vec![0; 256] });
-        refused(Request { address: Address::Domain(vec![0; 256]), ..request() });
-        refused(Reply { address: Address::Domain(vec![0; 256]), ..Reply::failure(ReplyCode::GeneralFailure) });
-        refused(UdpHeader { fragment: 0, address: Address::Domain(vec![0; 256]), port: 0 });
+        assert_eq!(contract::check_refused(&Greeting { methods: vec![Method::NoAuth; MAX_METHODS + 1] }), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Greeting { methods: vec![Method::Other(0)] }), Error::Unwritable);
+        assert_eq!(contract::check_refused(&AuthRequest { username: vec![0; 256], password: vec![] }), Error::Unwritable);
+        assert_eq!(contract::check_refused(&AuthRequest { username: vec![], password: vec![0; 256] }), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Request { address: Address::Domain(vec![0; 256]), ..request() }), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Reply { address: Address::Domain(vec![0; 256]), ..Reply::failure(ReplyCode::GeneralFailure) }), Error::Unwritable);
+        assert_eq!(contract::check_refused(&UdpHeader { fragment: 0, address: Address::Domain(vec![0; 256]), port: 0 }), Error::Unwritable);
         let greeting = Greeting { methods: vec![Method::NoAuth; MAX_METHODS] };
         assert!(greeting.to_bytes().is_ok());
         contract::check_wire_value(&greeting);
@@ -1683,7 +1679,7 @@ mod tests {
         // Offers past the wire limit cannot be written and do not authorize a selection.
         let mut offered = vec![Method::NoAuth; MAX_METHODS];
         offered.push(Method::Other(4));
-        refused(Greeting { methods: offered.clone() });
+        assert_eq!(contract::check_refused(&Greeting { methods: offered.clone() }), Error::Unwritable);
         let mut d = ServerMessages::socks5_offering(Command::Connect, &offered);
         assert_eq!(d.decode(&[5, 4], false), Ok(Step::Item(Err(Error::Method(4)), 2)));
     }

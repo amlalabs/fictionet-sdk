@@ -1,9 +1,11 @@
 //! Telnet sessions and WebSocket frames, assembly, and handoff.
 
 use fictionet::stdlib::codec::{
-    AssembleError, Decode, Fail, Lcg, Step, Stream, Wire, contract, finish, pump,
-    test_support::{chunks, decode_all},
+    AssembleError, Decode, Fail, Lcg, Step, Stream, Wire, finish, pump,
 };
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::{chunks, decode_all};
 use fictionet::stdlib::{telnet as tn, websocket as ws};
 
 fn bounded<D: Decode>(make: impl Fn() -> D, bytes: &[u8])

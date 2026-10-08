@@ -1,7 +1,8 @@
 //! PCP and NAT-PMP requests, reply construction and version negotiation.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::pcp::*;
 use libfuzzer_sys::fuzz_target;
 use std::net::Ipv4Addr;

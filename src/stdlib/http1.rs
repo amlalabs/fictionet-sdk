@@ -562,7 +562,7 @@ impl Decode for ResponseEvents {
 /// [`RequestEvents`] when the body must be streamed without accumulation.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire, test_support}, http1::Requests};
+/// use fictionet::stdlib::{codec::{Stream, Wire}, test_support, http1::Requests};
 /// let bytes = b"GET / HTTP/1.1\r\nHost:test\r\n\r\nGET /next HTTP/1.1\r\nHost:test\r\n\r\n";
 /// let mut stream = Stream::new(Requests::default());
 /// assert_eq!(stream.push(bytes), bytes.len());
@@ -1992,9 +1992,10 @@ impl Wire for Chunk {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Assemble, Assembled, Carry, Collect, CollectError, Demux, Fragment, Layered, Lcg, Pipe,
-        contract, pump, test_support,
+        Assemble, Assembled, Carry, Collect, CollectError, Demux, Fragment, Layered, Lcg, Pipe, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
 
     const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
     const POST: &[u8] =
@@ -2066,11 +2067,6 @@ mod tests {
         let (_, error) = test_support::decode_all(ResponseEvents::default, bytes);
         assert_eq!(error, Some(Fail::Protocol(expected)), "{bytes:?}");
         contract::check_decode(ResponseEvents::default, bytes);
-    }
-    fn refused<T: Wire<WriteError = Error> + fmt::Debug>(value: &T, expected: Error) {
-        let mut out = b"unchanged".to_vec();
-        assert_eq!(value.write(&mut out), Err(expected), "{value:?}");
-        assert_eq!(out, b"unchanged");
     }
 
     #[test]
@@ -2876,7 +2872,7 @@ mod tests {
         head.reason = vec![b'a'; Limits::default().start_line - 13];
         contract::check_wire_value(&head);
         head.reason.push(b'a');
-        refused(&head, Error::StartLineTooLong);
+        assert_eq!(contract::check_refused(&head), Error::StartLineTooLong);
     }
 
     #[test]
@@ -2893,7 +2889,7 @@ mod tests {
                 }
             );
         }
-        refused(&Response::status(99), Error::StartLine);
+        assert_eq!(contract::check_refused(&Response::status(99)), Error::StartLine);
         let response = Response::json(b" {\"ok\": true} \n").unwrap();
         assert_eq!(response.body, b" {\"ok\": true} \n");
         assert_eq!(
@@ -2952,7 +2948,7 @@ mod tests {
         Chunk(b"data: {}\n\n".to_vec()).write(&mut out).unwrap();
         Chunk(Vec::new()).write(&mut out).unwrap();
         assert_eq!(Response::parse(&out).unwrap().body, b"data: {}\n\n");
-        refused(&Response::event_stream("bad\r\nfield"), Error::Header);
+        assert_eq!(contract::check_refused(&Response::event_stream("bad\r\nfield")), Error::Header);
     }
 
     #[test]
@@ -3218,7 +3214,7 @@ mod tests {
         let mut out = Vec::new();
         value.write_for("HEAD", &mut out).unwrap();
         assert_eq!(out, head);
-        refused(&value, Error::BodyLength);
+        assert_eq!(contract::check_refused(&value), Error::BodyLength);
         assert_eq!(
             value.write_for("CONNECT", &mut out),
             Err(Error::ForbiddenFraming)
@@ -3287,13 +3283,13 @@ mod tests {
         let base = Request::parse(POST).unwrap();
         let mut value = base.clone();
         value.body.push(0);
-        refused(&value, Error::BodyLength);
+        assert_eq!(contract::check_refused(&value), Error::BodyLength);
         value = base.clone();
         value.head.method = "GET\r\n".into();
-        refused(&value, Error::StartLine);
+        assert_eq!(contract::check_refused(&value), Error::StartLine);
         value = base.clone();
         value.head.target = "/bad target".into();
-        refused(&value, Error::StartLine);
+        assert_eq!(contract::check_refused(&value), Error::StartLine);
         for (name, bytes) in [
             ("bad name", b"value".as_slice()),
             ("X", b"\r"),
@@ -3307,7 +3303,7 @@ mod tests {
                 name: name.into(),
                 value: bytes.to_vec(),
             });
-            refused(&value, Error::Header);
+            assert_eq!(contract::check_refused(&value), Error::Header);
             contract::check_wire_value(&value);
         }
         value = base.clone();
@@ -3315,51 +3311,48 @@ mod tests {
             name: "Transfer-Encoding".into(),
             value: b"chunked".to_vec(),
         });
-        refused(&value, Error::TransferEncodingAndContentLength);
+        assert_eq!(contract::check_refused(&value), Error::TransferEncodingAndContentLength);
         value = base.clone();
         value.body = vec![0; MAX_BODY.saturating_add(1)];
-        refused(&value, Error::BodyTooLong);
-        refused(
-            &Chunk(vec![0; MAX_BODY.saturating_add(1)]),
-            Error::BodyTooLong,
-        );
+        assert_eq!(contract::check_refused(&value), Error::BodyTooLong);
+        assert_eq!(contract::check_refused(&Chunk(vec![0; MAX_BODY.saturating_add(1)])), Error::BodyTooLong);
         value = base.clone();
         value.head.target = format!("/{}", "a".repeat(8192));
-        refused(&value, Error::StartLineTooLong);
+        assert_eq!(contract::check_refused(&value), Error::StartLineTooLong);
         value = base.clone();
         value.head.headers.push(Header {
             name: "X".into(),
             value: vec![b'a'; 8192],
         });
-        refused(&value, Error::HeaderLineTooLong);
+        assert_eq!(contract::check_refused(&value), Error::HeaderLineTooLong);
         value = base.clone();
         value.head.headers.extend((0..100).map(|_| Header {
             name: "X".into(),
             value: Vec::new(),
         }));
-        refused(&value, Error::TooManyHeaders);
+        assert_eq!(contract::check_refused(&value), Error::TooManyHeaders);
         value = base;
         value.head.headers.extend((0..9).map(|_| Header {
             name: "X".into(),
             value: vec![b'a'; 8000],
         }));
-        refused(&value, Error::HeadTooLong);
+        assert_eq!(contract::check_refused(&value), Error::HeadTooLong);
         let mut response = Response::parse(OK).unwrap();
         for status in [0, 99, 600, 1000] {
             response.head.status = status;
-            refused(&response, Error::StartLine);
+            assert_eq!(contract::check_refused(&response), Error::StartLine);
         }
         response.head.status = 200;
         response.head.reason = b"OK\r\nX: bad".to_vec();
-        refused(&response, Error::StartLine);
+        assert_eq!(contract::check_refused(&response), Error::StartLine);
         response = Response::parse(OK).unwrap();
         response.head.status = 204;
-        refused(&response, Error::ForbiddenFraming);
+        assert_eq!(contract::check_refused(&response), Error::ForbiddenFraming);
         response.head.status = 304;
-        refused(&response, Error::BodyLength);
+        assert_eq!(contract::check_refused(&response), Error::BodyLength);
         response.head.status = 200;
         response.body.clear();
-        refused(&response, Error::BodyLength);
+        assert_eq!(contract::check_refused(&response), Error::BodyLength);
         assert_eq!(
             Request::parse(&[GET, b"tail"].concat()),
             Err(Error::Trailing)

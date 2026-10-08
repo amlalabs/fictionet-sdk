@@ -3,7 +3,8 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
+use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::ldap::{DerefAliases, Dn, Error, Filter, MAX_TEXT, Message, Op, Scope, SearchRequest};
 use libfuzzer_sys::fuzz_target;
 

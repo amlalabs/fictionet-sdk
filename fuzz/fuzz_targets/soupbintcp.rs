@@ -6,9 +6,9 @@ use fictionet::stdlib::session::Action;
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
     Wire,
-    contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value},
-    test_support::decode_all,
 };
+use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value};
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::soupbintcp::{Alpha, Client, Login, MAX_PACKET, Packet, Server, Timers};
 use libfuzzer_sys::fuzz_target;
 

@@ -3,8 +3,10 @@
 use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
-    Decode, Fail, Stream, Wire, contract, finish, pump, test_support::chunks,
+    Decode, Fail, Stream, Wire, finish, pump,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::chunks;
 use fictionet::stdlib::{asn1, kerberos, ldap, ocsp, spnego, x509};
 
 fn round_trip<D: Decode>(make: impl Fn() -> D, bytes: &[u8], expected: &[D::Item])

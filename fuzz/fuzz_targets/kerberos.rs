@@ -3,7 +3,8 @@
 #![no_main]
 
 use fictionet::stdlib::asn1::Rules;
-use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
+use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::kerberos::{
     EncryptedData, Error, Frame, Frames, KdcReqBody, MAX_MESSAGE, Message, MethodData, Ticket,
 };

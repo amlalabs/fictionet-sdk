@@ -4,7 +4,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::smb2::{
     ChainedPayload, Compressed, Error, ErrorResponse, Frame, Header, HEADER_LEN, IoctlResponse, Message,
     MAX_FRAME, MAX_MESSAGE, NegotiateContext, NegotiateResponse, Packet, ReadRequest, Request, Response,

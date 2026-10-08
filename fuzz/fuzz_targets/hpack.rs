@@ -1,7 +1,8 @@
 //! HPACK wire contracts, complete blocks, table recovery, and round trips.
 #![no_main]
 use fictionet::stdlib::{
-    codec::{Collect, contract},
+    codec::{Collect},
+    test_support::contract,
     hpack::{self, Encoder, Field, StringLiteral, Table},
     prefix_int::Integer,
 };

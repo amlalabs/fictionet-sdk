@@ -3,10 +3,11 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::contract::{
+use fictionet::stdlib::test_support::contract::{
     check_decode, check_decode_with_held_limit, check_wire, check_wire_value,
 };
-use fictionet::stdlib::codec::{Wire, test_support::decode_all};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::cotp::{Error, ErrorTpdu, MAX_MESSAGE, Reassembler, Tpdu, segment};
 use fictionet::stdlib::{cotp, tpkt};
 use libfuzzer_sys::fuzz_target;

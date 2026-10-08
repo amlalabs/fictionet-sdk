@@ -1,7 +1,10 @@
 //! RESP values, commands, custom limits, and strict writer contracts.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Fail, Lcg, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Fail, Lcg, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::resp::{
     Command, Commands, Error, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, Resp2, Value, Values,
 };

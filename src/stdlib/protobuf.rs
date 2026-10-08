@@ -888,11 +888,12 @@ impl Prefixed for Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump};
+    use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
+    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::codec::{
         Lcg,
-        test_support::{decode_all, mutate},
     };
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn check(input: &[u8]) {
         contract::check_decode_with_alloc_limit(Frames::<Frame>::new, input, 2 * Frames::<Frame>::new().capacity());
@@ -1301,7 +1302,7 @@ mod tests {
             assert_eq!(stream.buffered(), 0);
         };
         read(MAX_MESSAGE);
-        fictionet::stdlib::codec::test_support::assert_linear("protobuf frames", MAX_MESSAGE / 64, read);
+        fictionet::stdlib::test_support::assert_linear("protobuf frames", MAX_MESSAGE / 64, read);
     }
 
     // Counts fields as MAX_FIELDS does: group members included.

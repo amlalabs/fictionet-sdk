@@ -1362,9 +1362,10 @@ fn addr(b: &[u8], i: usize) -> Ipv6Addr {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Lcg, Stream, contract, pump,
-        test_support::{decode_all, mutate},
+        Lcg, Stream, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn a(s: &str) -> Ipv6Addr {
         s.parse().unwrap()

@@ -4,8 +4,8 @@ use fictionet::stdlib::{
     codec::{
         Buffer, ByteFault, Carry, Decode, Demux, Direction, Ending, Fail, Faults, InterceptError, Interceptor,
         ItemFault, Layered, Lines, RecordKind, Recorder, Rewrite, RewriteError, Rule, Stream,
-        Trigger, Wire, contract, test_support, write_bounded,
-    },
+        Trigger, Wire, write_bounded,
+    }, test_support::contract, test_support,
     json, modbus,
 };
 

@@ -144,7 +144,6 @@ pub mod leb128;
 pub mod head_body;
 mod buffer;
 mod combinators;
-pub mod contract;
 mod demux;
 mod faults;
 mod frames;
@@ -157,7 +156,6 @@ mod layout;
 pub use fictionet::layout;
 mod recorder;
 mod stream;
-pub mod test_support;
 
 pub use buffer::Buffer;
 pub use combinators::{
@@ -228,7 +226,7 @@ pub enum Step<T> {
 /// move or expand that state. Each step need not reduce [`held`](Self::held).
 /// EOF must terminate. An error is terminal. Driving a stream requires
 /// `Self::Error: Clone`. Modes change only between items.
-/// See [`contract`] for executable checks.
+/// See [`fictionet::stdlib::test_support::contract`] for executable checks.
 pub trait Decode {
     /// An owned decoded unit. Recoverable unit errors belong here.
     type Item;

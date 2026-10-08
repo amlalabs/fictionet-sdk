@@ -1436,7 +1436,9 @@ impl Wire for Fragments {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Lcg, contract, test_support::mutate};
+    use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::mutate;
 
     /// A DTLS 1.2 handshake record, laid out field by field as in RFC 6347,
     /// section 4.1: type 22, version 0xfefd, epoch 1, sequence 5, length 3.

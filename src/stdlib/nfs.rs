@@ -2463,7 +2463,9 @@ fn read_mount_name(r: &mut Reader<'_>) -> Result<String, Error> {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Assembled, Wire, contract, test_support};
+    use fictionet::stdlib::codec::{Assembled, Wire};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
     use fictionet::stdlib::onc_rpc::{Body, MAX_RECORD, Record, records};
 
     fn fh(b: &[u8]) -> FileHandle {
@@ -3055,7 +3057,8 @@ mod tests {
     #[test]
     fn requests_compose_with_codec_records() {
         use fictionet::stdlib::{
-            codec::{Decode, Wire, contract},
+            codec::{Decode, Wire},
+            test_support::contract,
             onc_rpc,
         };
 

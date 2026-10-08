@@ -10,7 +10,8 @@ use fictionet::stdlib::portmap::{
     parse_uaddr,
 };
 use fictionet::stdlib::{
-    codec::{Decode, Wire, contract},
+    codec::{Decode, Wire},
+    test_support::contract,
     onc_rpc,
 };
 use libfuzzer_sys::fuzz_target;

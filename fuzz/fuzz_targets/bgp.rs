@@ -39,7 +39,9 @@ use fictionet::stdlib::bgp::afi;
 use fictionet::stdlib::bgp::kind;
 
 use fictionet::stdlib::bgp::safi;
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, Error> {

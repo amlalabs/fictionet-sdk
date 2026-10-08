@@ -1,7 +1,8 @@
 //! IKE wire units and their codec contracts.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::ike::*;
 use libfuzzer_sys::fuzz_target;
 

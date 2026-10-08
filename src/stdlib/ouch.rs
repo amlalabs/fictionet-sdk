@@ -2068,13 +2068,13 @@ fn canceled(token: Token, quantity: u32, reason: u8, now: u64) -> Outbound {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::test_support::check_atomic;
+    use fictionet::stdlib::test_support::check_atomic;
     use super::*;
     use fictionet::stdlib::codec::{
         Lcg, Wire,
-        contract::{check_wire, check_wire_value},
-        test_support::mutate,
     };
+    use fictionet::stdlib::test_support::contract::{check_wire, check_wire_value};
+    use fictionet::stdlib::test_support::mutate;
 
     fn alpha<const N: usize>(s: &str) -> Alpha<N> {
         Alpha::right_padded(s).unwrap()

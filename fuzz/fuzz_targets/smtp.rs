@@ -1,7 +1,10 @@
 //! SMTP commands, replies, DATA, and strict wire values.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Fail, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Fail, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::smtp::{
     Command, Data, Error, FrameError, Input, Inputs, MAX_DATA, MAX_DATA_LINE, MAX_LINE,
     MAX_REPLY_TEXT, Replies, Reply, Request,

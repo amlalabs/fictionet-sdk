@@ -2,9 +2,8 @@
 
 use fictionet::stdlib::{
     codec::{
-        self, Decode, Fail, Step, Stream, Wire, contract,
-        test_support::{chunks, decode_all},
-    },
+        self, Decode, Fail, Step, Stream, Wire,
+    }, test_support::contract, test_support::{chunks, decode_all},
     imap, pop3, smtp,
 };
 
@@ -565,10 +564,8 @@ fn exact_wire_and_transactional_writers() {
     assert!(<imap::Response as Wire>::parse(b"a OK x\r\nb OK y\r\n").is_err());
 
     fn refused<T: Wire + core::fmt::Debug + PartialEq>(value: &T) {
+        contract::check_refused(value);
         contract::check_wire_value(value);
-        let mut bytes = b"prefix".to_vec();
-        assert!(Wire::write(value, &mut bytes).is_err());
-        assert_eq!(bytes, b"prefix");
     }
     refused(&smtp::Command::new("noop", None));
     refused(&smtp::Reply {

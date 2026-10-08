@@ -3559,9 +3559,10 @@ impl From<Truncated> for Error {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract, pump,
-        test_support::{self, decode_all},
+        Fail, Lcg, Stream, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{self, decode_all};
 
     /// Writes chunks and fails the test with the original error on refusal.
     fn wire_chunks(chunks: Vec<Chunk>) -> Vec<u8> {

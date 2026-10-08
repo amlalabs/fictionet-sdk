@@ -2,7 +2,8 @@
 #![no_main]
 
 use fictionet::stdlib::{
-    codec::{self, Wire, contract, test_support::chunks},
+    codec::{self, Wire},
+    test_support::contract, test_support::chunks,
     rfb::{ClientMessages, ServerMessages},
 };
 

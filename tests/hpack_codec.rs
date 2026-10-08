@@ -1,6 +1,7 @@
 //! Public HPACK and shared Huffman values through the codec tools.
 use fictionet::stdlib::{
-    codec::{Collect, Lcg, Wire, contract, test_support},
+    codec::{Collect, Lcg, Wire},
+    test_support::contract, test_support,
     hpack::{self, Encoder, Field, StringLiteral, Table},
     huffman::{self, HuffmanString},
     prefix_int::Integer,

@@ -1529,9 +1529,10 @@ mod tests {
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn s(v: &str) -> Bson {
         Bson::String(v.to_owned())

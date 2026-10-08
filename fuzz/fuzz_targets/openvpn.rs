@@ -3,7 +3,8 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Decode, Wire, contract};
+use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::openvpn::Frame;
 use fictionet::stdlib::openvpn::{
     Ack, Authenticated, Encrypted, Control, ControlBody, ControlKind, Error, MAX_HMAC_LEN,

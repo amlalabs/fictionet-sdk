@@ -1,6 +1,7 @@
 #![no_main]
 
-use fictionet::stdlib::codec::{Collect, contract};
+use fictionet::stdlib::codec::Collect;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::http1::{
     Header, Limits, MAX_PENDING_REQUESTS, Response, ResponseEvents, ResponseHead, Version,
 };

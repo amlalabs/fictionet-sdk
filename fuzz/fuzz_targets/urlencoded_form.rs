@@ -1,7 +1,10 @@
 //! Form bodies, query strings, and percent-encoded URL components.
 #![no_main]
 
-use fictionet::stdlib::codec::{Fail, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Fail, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::urlencoded_form::{
     EncodeSet, Error, Field, Fields, Form, MAX_INPUT, MAX_PAIRS, PercentEncoded,
     decode_component, percent_decode, query_of,

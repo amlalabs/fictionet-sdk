@@ -5,8 +5,8 @@
 use fictionet::stdlib::session::Action;
 use fictionet::stdlib::codec::{
     Wire,
-    contract::{check_wire, check_wire_value},
 };
+use fictionet::stdlib::test_support::contract::{check_wire, check_wire_value};
 use fictionet::stdlib::ouch::{
     EnterOrder, Event, Exchange, ExchangeConfig, Inbound, Outbound, Price,
 };

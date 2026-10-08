@@ -3,8 +3,10 @@
 use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
-    Decode, Fail, Step, Stream, Wire, contract, finish, pump, test_support::{chunks, decode_all},
+    Decode, Fail, Step, Stream, Wire, finish, pump,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{chunks, decode_all};
 use fictionet::stdlib::{dnp3, enip, iec104, opcua, rdp, tpkt};
 
 fn decode_chunks<D>(make: impl Fn() -> D, bytes: &[u8], expected: &[D::Item])
@@ -66,9 +68,7 @@ where
     T::WriteError: Debug,
 {
     contract::check_wire_value(value);
-    let mut out = vec![0x5a, 0xc3, 0x17];
-    assert!(value.write(&mut out).is_err());
-    assert_eq!(out, [0x5a, 0xc3, 0x17]);
+    contract::check_refused(value);
 }
 
 fn eof_at_every_prefix<D>(make: impl Fn() -> D, bytes: &[u8])

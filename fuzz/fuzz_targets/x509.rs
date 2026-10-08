@@ -3,7 +3,8 @@
 #![no_main]
 
 use fictionet::stdlib::asn1::{Oid, StringKind};
-use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
+use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::x509::{
     AuthorityInfoAccess, AuthorityKeyIdentifier, BasicConstraints, Certificate, Crl,
     CrlDistributionPoints, CrlNumber, CrlReason, ExtendedKeyUsage, ExtensionValue, GeneralName,

@@ -1,9 +1,11 @@
 //! RTSP and SIP lines, SDP bodies, recovery, and strict wire values.
 
 use fictionet::stdlib::codec::{
-    Decode, Fail, Lcg, Step, Stream, Wire, contract, finish, pump,
-    test_support::{decode_all, mutate},
+    Decode, Fail, Lcg, Step, Stream, Wire, finish, pump,
 };
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::{decode_all, mutate};
 use fictionet::stdlib::{rtsp, sdp, sip};
 
 const SDP: &[u8] = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=media\r\nt=0 0\r\n";

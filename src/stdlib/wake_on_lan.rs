@@ -349,9 +349,10 @@ pub fn wakes(payload: &[u8], mac: Mac, password: Option<&Password>) -> bool {
 mod tests {
     use super::*;
     use codec::{
-        Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     const MAC: Mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
 
@@ -623,7 +624,7 @@ mod tests {
     fn lcg_fuzz() {
         let mut rng = Lcg::new(0x5eed);
         let mut found = 0;
-        let rounds = fictionet::stdlib::codec::test_support::rounds(1000);
+        let rounds = fictionet::stdlib::test_support::rounds(1000);
         for round in 0..rounds {
             let len = rng.index(400);
             // Bytes from a small alphabet, so sync streams and repeats turn

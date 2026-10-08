@@ -1491,9 +1491,10 @@ mod tests {
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn id(s: &str) -> Identity {
         Identity::new(s).unwrap()
@@ -2303,7 +2304,7 @@ mod tests {
     #[test]
     fn lcg_fuzz() {
         let mut r = Lcg::new(0x5eed_d1a3);
-        for round in 0..fictionet::stdlib::codec::test_support::rounds(9500) {
+        for round in 0..fictionet::stdlib::test_support::rounds(9500) {
             let data = match round % 3 {
                 // Random bytes behind a plausible header.
                 0 => {
@@ -2333,7 +2334,7 @@ mod tests {
             exercise(&data);
         }
         // Random AVPs: each value reads back in its own format, to the same bytes.
-        for _ in 0..fictionet::stdlib::codec::test_support::rounds(9500) {
+        for _ in 0..fictionet::stdlib::test_support::rounds(9500) {
             let (a, v) = random_avp(&mut r, 0);
             let back = Avp::parse(&a.to_bytes().unwrap()).unwrap();
             assert_eq!(back, a);
@@ -2341,7 +2342,7 @@ mod tests {
         }
         // Random strings as URIs.
         let alphabet = b"aAs:/;=0123456789.tcpransportoldiemu+x";
-        for _ in 0..fictionet::stdlib::codec::test_support::rounds(9500) {
+        for _ in 0..fictionet::stdlib::test_support::rounds(9500) {
             let mut s = String::from(["aaa://", "aaas://", "AaA://", ""][r.index(4)]);
             for byte in r.bytes(30) {
                 s.push(alphabet[usize::from(byte) % alphabet.len()] as char);

@@ -1804,7 +1804,10 @@ impl From<Truncated> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Lcg, contract, test_support::mutate};
+    use fictionet::stdlib::test_support::hex;
+    use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::mutate;
 
     fn datagram(packets: &[Packet]) -> Result<Vec<u8>, Error> {
         let len = packets
@@ -1832,10 +1835,6 @@ mod tests {
         }
     }
 
-    fn hex(s: &str) -> Vec<u8> {
-        let s: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
-        s.chunks(2).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap()).collect()
-    }
 
     fn roundtrip_frames(frames: &[Frame]) {
         let bytes = Payload((frames).to_vec()).to_bytes().unwrap();

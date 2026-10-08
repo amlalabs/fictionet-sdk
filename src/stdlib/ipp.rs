@@ -1548,9 +1548,10 @@ fn read_members(records: &mut Records<'_>, depth: usize) -> Result<Vec<Attribute
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// One record's bytes.
     fn rec(t: u8, name: &str, value: &[u8]) -> Vec<u8> {
@@ -1755,7 +1756,7 @@ mod tests {
 
     #[test]
     fn strict_head_covers_all_values_and_bounds_collection_depth() {
-        use fictionet::stdlib::codec::contract;
+        use fictionet::stdlib::test_support::contract;
         let mut message = Message::request(operation::PRINT_JOB, 3);
         message.add(
             tag::JOB_ATTRIBUTES,
@@ -2659,9 +2660,7 @@ mod tests {
 
     fn assert_unwritable<M: Wire<WriteError = Error> + PartialEq + std::fmt::Debug>(value: &M) {
         contract::check_wire_value(value);
-        let mut out = b"prefix".to_vec();
-        assert_eq!(value.write(&mut out), Err(Error::Unwritable));
-        assert_eq!(out, b"prefix");
+        assert_eq!(contract::check_refused(value), Error::Unwritable);
     }
 
     #[test]

@@ -1980,12 +1980,10 @@ impl From<Trailing> for Error {
 mod tests {
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
-    use fictionet::stdlib::codec::{Lcg, contract};
+    use fictionet::stdlib::test_support::hex;
+    use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::test_support::contract;
 
-    fn hex(s: &str) -> Vec<u8> {
-        let s: String = s.split_whitespace().collect();
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
-    }
 
     fn value(bytes: &[u8]) -> Value {
         Value::parse(bytes).unwrap()
@@ -2273,7 +2271,7 @@ mod tests {
 
     #[test]
     fn prefix_readers_obey_bounded_decode_contracts() {
-        use fictionet::stdlib::codec::test_support::decode_all;
+        use fictionet::stdlib::test_support::decode_all;
         let tags = [0x3e, 0x3f, 0xf9, 15];
         contract::check_decode_with_alloc_limit(Frames::<Tag>::new, &tags, 2 * Frames::<Tag>::new().capacity());
         assert_eq!(decode_all(Frames::<Tag>::new, &tags).0.len(), 3);

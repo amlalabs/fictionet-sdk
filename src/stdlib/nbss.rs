@@ -529,9 +529,10 @@ fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Erro
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// "FRED" padded with spaces, from RFC 1002, section 4.1.
     const FRED: &[u8; 32] = b"EGFCEFEECACACACACACACACACACACACA";
@@ -875,7 +876,7 @@ mod tests {
     #[test]
     fn generated_packets_and_names() {
         let mut rng = Lcg::new(0x5eed);
-        for _ in 0..fictionet::stdlib::codec::test_support::rounds(17_500) {
+        for _ in 0..fictionet::stdlib::test_support::rounds(17_500) {
             let mut data = if rng.coin() {
                 request().to_bytes().unwrap()
             } else {

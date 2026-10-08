@@ -869,7 +869,9 @@ fn be16(b: &[u8], i: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump, test_support, try_pump};
+    use fictionet::stdlib::codec::{Fail, Stream, finish, pump, try_pump};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
 
     // Examples from the Modbus Application Protocol Specification v1.1b3,
     // section 6.

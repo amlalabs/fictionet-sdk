@@ -3,7 +3,8 @@
 //! bytes, as a world playing a client or responder writes them.
 #![no_main]
 
-use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
+use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::ocsp::{
     AlgorithmIdentifier, BasicResponse, CertId, CertStatus, CrlReason, Extension, Frames,
     MAX_NONCE, Request, ResponderId, Response, ResponseBytes, ResponseData, ResponseStatus,

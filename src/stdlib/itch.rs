@@ -1227,9 +1227,9 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg,
-        contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value},
-        test_support::{decode_all, mutate},
     };
+    use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value};
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn ts(n: u64) -> Timestamp {
         Timestamp::new(n).unwrap()

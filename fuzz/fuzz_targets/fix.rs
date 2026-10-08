@@ -4,9 +4,9 @@ use fictionet::stdlib::session::Action;
 use fictionet::stdlib::{
     codec::{
         Stream, Wire,
-        contract::{check_decode_with_alloc_limit, check_wire, check_wire_value},
-        test_support::decode_all,
     },
+    test_support::contract::{check_decode_with_alloc_limit, check_wire, check_wire_value},
+    test_support::decode_all,
     fix::{
         ExecutionReport, GroupLayout, MAX_ACTIONS, MAX_MESSAGE_SIZE,
         MarketDataIncrementalRefresh, MarketDataRequest, MarketDataSnapshotFullRefresh, Message,

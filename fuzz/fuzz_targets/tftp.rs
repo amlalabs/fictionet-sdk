@@ -3,7 +3,8 @@
 //! the agent picks.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::tftp::{
     DEFAULT_BLOCK_SIZE, Event, MAX_BLOCK_SIZE, MAX_REQUEST, Negotiated, NetasciiBytes, NetasciiByte,
     Packet, ReadTransfer, TftpOption, negotiate, parse_number,
@@ -99,7 +100,7 @@ fuzz_target!(|data: &[u8]| {
         NetasciiByte(byte).write(&mut encoded).unwrap();
     }
     let (decoded, failure) =
-        fictionet::stdlib::codec::test_support::decode_all(|| NetasciiBytes, &encoded);
+        fictionet::stdlib::test_support::decode_all(|| NetasciiBytes, &encoded);
     assert_eq!(failure, None);
     assert_eq!(decoded.into_iter().map(|b| b.0).collect::<Vec<_>>(), data);
 });

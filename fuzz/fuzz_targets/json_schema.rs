@@ -1,7 +1,7 @@
 //! Document entries, schema/instance pairs, formats, dependencies, and examples.
 #![no_main]
 
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::json::{self, Value};
 use fictionet::stdlib::json_schema::{
     CompileErrorKind, Dialect, ErrorMode, FormatPolicy, GenerationLimits, Limits, Options,

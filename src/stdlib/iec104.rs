@@ -469,7 +469,9 @@ impl Wire for Asdu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream, contract, test_support::decode_all};
+    use fictionet::stdlib::codec::{Fail, Stream};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::decode_all;
 
     const INTERROGATION: &[u8] = &[0x68, 14, 0, 0, 0, 0, 100, 1, 6, 0, 1, 0, 0, 0, 0, 20];
 

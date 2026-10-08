@@ -1460,7 +1460,9 @@ impl From<Truncated> for Error {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump, test_support};
+    use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
     use fictionet::stdlib::portmap::{
         self, Mapping, Rpcb, silent_on_failure, PmapRequest, PmapResult, Request, RpcbRequest, RpcbResult,
     };

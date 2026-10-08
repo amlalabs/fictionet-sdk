@@ -1,9 +1,11 @@
 //! Session handoffs and bounded mail and print bodies through the codec driver.
 
 use fictionet::stdlib::codec::{
-    Collect, CollectError, Decode, Fail, Step, Stream, Wire, contract, pump,
-    test_support::{chunks, decode_all},
+    Collect, CollectError, Decode, Fail, Step, Stream, Wire, pump,
 };
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::{chunks, decode_all};
 use fictionet::stdlib::{imf, ipp, postgres as pg};
 
 fn read<D: Decode + Clone>(decoder: D, bytes: &[u8]) -> Vec<D::Item>

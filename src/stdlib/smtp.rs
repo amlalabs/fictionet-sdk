@@ -1106,9 +1106,10 @@ impl Decode for Replies {
 mod tests {
     use super::*;
     use codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn data_server() -> Inputs {
         let mut server = Inputs::new();
@@ -1116,11 +1117,6 @@ mod tests {
         server
     }
 
-    fn refused(value: &impl Wire<WriteError = Error>) {
-        let mut out = b"prefix".to_vec();
-        assert_eq!(value.write(&mut out), Err(Error::Unwritable));
-        assert_eq!(out, b"prefix");
-    }
 
     #[test]
     fn command_and_request_round_trips() {
@@ -1245,7 +1241,7 @@ mod tests {
         ];
         assert_eq!(decode_all(Inputs::new, &wire), (expected, None));
         contract::check_decode_with_alloc_limit(Inputs::new, &wire, 2 * (MAX_DATA_LINE + 1));
-        refused(&Command::new("NOOP", Some(&"a".repeat(MAX_LINE - 6))));
+        assert_eq!(contract::check_refused(&Command::new("NOOP", Some(&"a".repeat(MAX_LINE - 6)))), Error::Unwritable);
     }
 
     #[test]
@@ -1322,7 +1318,7 @@ mod tests {
             Reply::new(999, "bad"),
             Reply::new(250, "ok\r\n550 bad"),
         ] {
-            refused(&reply);
+            assert_eq!(contract::check_refused(&reply), Error::Unwritable);
         }
         let mut stream = Stream::new(Replies::new());
         let bad = b"250-first\r\n550 bad\r\n";
@@ -1397,7 +1393,7 @@ mod tests {
             assert_eq!(Data::parse(&wire), Ok(message.clone()));
             contract::check_decode_with_alloc_limit(data_server, &wire, 2 * (MAX_DATA_LINE + 1));
             message.bytes.insert(1, b'x');
-            refused(&message);
+            assert_eq!(contract::check_refused(&message), Error::Unwritable);
             let mut wire = message.bytes;
             if dot {
                 wire.insert(0, b'.');
@@ -1409,9 +1405,9 @@ mod tests {
             );
         }
         for bad in [&b"bare\n"[..], b"bare\r", b"nul\0\r\n", b"cr\rinside\r\n"] {
-            refused(&Data {
+            assert_eq!(contract::check_refused(&Data {
                 bytes: bad.to_vec(),
-            });
+            }), Error::Unwritable);
         }
     }
 
@@ -1455,9 +1451,9 @@ mod tests {
             Some(Err(Fail::Protocol(FrameError::TooMuchData)))
         );
         assert_eq!(stream.next(), None);
-        refused(&Data {
+        assert_eq!(contract::check_refused(&Data {
             bytes: vec![0; MAX_DATA + 1],
-        });
+        }), Error::Unwritable);
     }
 
     #[test]

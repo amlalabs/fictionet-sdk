@@ -62,7 +62,7 @@ with `opt-level = 2` (see `Cargo.toml`). The randomized protocol tests run
 about five times faster that way, and the dependencies are built once.
 
 Randomized and large-input tests size their loops with
-`stdlib::codec::test_support::rounds`. A default run is fast. For a deep
+`stdlib::test_support::rounds`. A default run is fast. For a deep
 run, scale them up:
 
 ```console
@@ -70,7 +70,7 @@ $ FICTIONET_TEST_SCALE=100 cargo nextest run --workspace
 ```
 
 A test that checks for linear time uses
-`stdlib::codec::test_support::assert_linear`. It compares the time for an
+`stdlib::test_support::assert_linear`. It compares the time for an
 input with the time for one 4 times larger, so it does not fail on a busy
 machine the way a fixed time limit would.
 

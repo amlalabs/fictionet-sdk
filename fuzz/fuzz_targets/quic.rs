@@ -2,7 +2,8 @@
 #![no_main]
 
 use fictionet::stdlib::{
-    codec::{Wire, contract},
+    codec::{Wire},
+    test_support::contract,
     quic::{self, Datagram, Frame, Payload, Reassembler, VarInt},
 };
 use libfuzzer_sys::fuzz_target;

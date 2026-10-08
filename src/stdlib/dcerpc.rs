@@ -1438,9 +1438,10 @@ impl From<Truncated> for Error {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// An endpoint mapper bind as Windows sends it: one context, the
     /// endpoint mapper over NDR.
@@ -1559,7 +1560,7 @@ mod tests {
 
     #[test]
     fn codec_writes_each_body_in_both_byte_orders() {
-        use fictionet::stdlib::codec::contract;
+        use fictionet::stdlib::test_support::contract;
 
         for mut pdu in all_bodies() {
             for drep in [DataRep::LITTLE_ENDIAN, DataRep::BIG_ENDIAN] {
@@ -2235,7 +2236,7 @@ mod tests {
             samples.push(p.to_bytes().unwrap());
         }
         let mut rng = Lcg::new(0xdce);
-        for _ in 0..fictionet::stdlib::codec::test_support::rounds(15_000) {
+        for _ in 0..fictionet::stdlib::test_support::rounds(15_000) {
             let mut data = if rng.coin() {
                 let mut bytes = samples[rng.index(samples.len())].clone();
                 if rng.coin() {

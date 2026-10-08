@@ -2957,9 +2957,10 @@ fn arr<const N: usize>(b: &[u8], at: usize) -> Result<[u8; N], Error> {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     // The byte layouts below are built field by field from MS-SMB2,
     // section 2.2, not with this module's writers.
@@ -4517,7 +4518,7 @@ mod tests {
     fn fuzz_loop() {
         let corpus = corpus();
         let mut rng = Lcg::new(0x5eed);
-        for _ in 0..fictionet::stdlib::codec::test_support::rounds(7500) {
+        for _ in 0..fictionet::stdlib::test_support::rounds(7500) {
             let mut payload = if rng.coin() {
                 corpus[rng.index(corpus.len())].clone()
             } else {

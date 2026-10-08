@@ -3,7 +3,8 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::snmp::{
     BasicPdu, Element, Error, ErrorStatus, MAX_MESSAGE, Message, Oid, Pdu, Value, VarBind,

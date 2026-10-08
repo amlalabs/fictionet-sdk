@@ -2,8 +2,11 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{
-    Decode, Fail, Step, Stream, Wire, contract, test_support::decode_all,
+    Decode, Fail, Step, Stream, Wire,
 };
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::ipp::{
     Attribute, Error, FrameError, Head, Header, MAX_DOCUMENT, MAX_FIELD, MAX_HEAD, Message,
     Value, tag,

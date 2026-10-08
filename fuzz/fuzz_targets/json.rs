@@ -1,7 +1,10 @@
 //! JSON texts, bounded values, and streams used by web APIs.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::json::{self, Limits, Value, Values};
 use libfuzzer_sys::fuzz_target;
 

@@ -2,7 +2,8 @@
 //! window it keeps for transport data counters.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::wireguard::{
     CookieReply, Data, Error, Initiation, MAX_ENCRYPTED, MAX_PLAINTEXT, Message, Plaintext,
     REJECT_AFTER_MESSAGES, ReplayWindow, Response, TAG_LEN, padding,

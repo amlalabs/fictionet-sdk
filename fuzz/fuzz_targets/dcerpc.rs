@@ -4,7 +4,9 @@
 
 use fictionet::stdlib::codec::Frames;
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::{Decode, Step, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::dcerpc::{
     AUTH_PAD_ALIGN, Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Error,
     MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, SEC_TRAILER_LEN, SyntaxId, Uuid, flags,

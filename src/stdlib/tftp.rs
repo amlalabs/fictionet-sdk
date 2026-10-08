@@ -919,7 +919,9 @@ impl Wire for Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Lcg, contract, test_support::mutate};
+    use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::mutate;
 
     fn rrq_example() -> Vec<u8> {
         b"\x00\x01boot.img\x00octet\x00blksize\x001024\x00tsize\x000\x00".to_vec()
@@ -1403,7 +1405,7 @@ mod tests {
     // splits and EOF, including a final CR.
     #[test]
     fn netascii_across_blocks() {
-        use fictionet::stdlib::codec::test_support::decode_all;
+        use fictionet::stdlib::test_support::decode_all;
         for (wire, text) in [
             (&b"1234567\r\0X"[..], &b"1234567\rX"[..]),
             (&b"1234567\r\nX"[..], &b"1234567\nX"[..]),
@@ -1471,7 +1473,7 @@ mod tests {
             }
             let mut encoded = Vec::new();
             for &byte in &buf { NetasciiByte(byte).write(&mut encoded).unwrap(); }
-            let (text, error) = fictionet::stdlib::codec::test_support::decode_all(|| NetasciiBytes, &encoded);
+            let (text, error) = fictionet::stdlib::test_support::decode_all(|| NetasciiBytes, &encoded);
             assert_eq!(error, None);
             assert_eq!(text.into_iter().map(|c| c.0).collect::<Vec<_>>(), buf);
             contract::check_decode_with_alloc_limit(|| NetasciiBytes, &buf, 4);

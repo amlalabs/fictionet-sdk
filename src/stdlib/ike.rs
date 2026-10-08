@@ -1430,7 +1430,9 @@ impl From<Truncated> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Lcg, contract, test_support::mutate};
+    use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::mutate;
 
     /// An IKE_SA_INIT request laid out by hand from the figures in RFC
     /// 7296 sections 3.1 to 3.10: header, SA, KE, Ni, and two notifies.

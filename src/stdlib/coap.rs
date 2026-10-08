@@ -1531,9 +1531,10 @@ mod tests {
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract, pump,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn get(path: &str, id: u16, token: &[u8]) -> Message {
         let mut m = Message::new(Type::Confirmable, Code::GET, id);
@@ -2051,7 +2052,7 @@ mod tests {
         // Only bad_option is timed, after the first call at each size
         // builds the message. The larger size is 60,000 of each kind.
         let mut messages = std::collections::HashMap::new();
-        fictionet::stdlib::codec::test_support::assert_linear("CoAP bad_option", 15_000, |n| {
+        fictionet::stdlib::test_support::assert_linear("CoAP bad_option", 15_000, |n| {
             let m = messages.entry(n).or_insert_with(|| message(n));
             assert_eq!(m.bad_option(), None);
         });

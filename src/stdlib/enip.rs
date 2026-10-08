@@ -1666,9 +1666,10 @@ impl Wire for ForwardCloseResponse {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Lcg, Stream, contract, pump,
-        test_support::{self, decode_all},
+        Lcg, Stream, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{self, decode_all};
 
     #[test]
     fn register_session_round_trip() {

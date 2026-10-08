@@ -148,13 +148,8 @@ impl<const PREFIX: u8> Wire for Integer<PREFIX> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::test_support::hex;
 
-    fn hex(s: &str) -> Vec<u8> {
-        s.as_bytes()
-            .chunks(2)
-            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
-            .collect()
-    }
 
     #[test]
     fn prefix_reads_and_failed_writes_preserve_their_boundaries() {
@@ -183,7 +178,7 @@ mod tests {
 
     #[test]
     fn integers_edges_overflow_and_strict_writers() {
-        use fictionet::stdlib::codec::contract;
+        use fictionet::stdlib::test_support::contract;
         assert_eq!(Integer::<5>::parse(&hex("0a")).unwrap().value, 10);
         assert_eq!(Integer::<5>::parse(&hex("1f9a0a")).unwrap().value, 1337);
         assert_eq!(Integer::<8>::parse(&hex("2a")).unwrap().value, 42);

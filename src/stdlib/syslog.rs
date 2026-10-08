@@ -1564,9 +1564,10 @@ fn expect(t: &[u8], i: usize, c: u8) -> Option<()> {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract, pump,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// The four examples of RFC 5424 section 6.5, with the BOM bytes in
     /// place of "BOM" and the third one's text shortened.

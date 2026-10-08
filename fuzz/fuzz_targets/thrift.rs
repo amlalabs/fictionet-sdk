@@ -2,7 +2,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire};
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::thrift::{
     EncodedMessage, EncodedMessages, Error, Frame, MAX_FRAME, MAX_MESSAGE, ValueBody,
 };

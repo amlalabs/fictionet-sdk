@@ -2676,13 +2676,13 @@ fn timestamp_nanos(value: [u32; 7]) -> Result<u128, Error> {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::test_support::check_atomic;
+    use fictionet::stdlib::test_support::check_atomic;
     use super::*;
     use fictionet::stdlib::codec::{
         Stream,
-        contract::{check_decode_with_alloc_limit, check_wire, check_wire_value},
-        test_support::decode_all,
     };
+    use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_wire, check_wire_value};
+    use fictionet::stdlib::test_support::decode_all;
 
     // LOGON is the public Wikipedia Financial Information eXchange example
     // (https://en.wikipedia.org/wiki/Financial_Information_eXchange).

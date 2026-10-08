@@ -1,7 +1,9 @@
 //! Git packets and payloads through shared contracts.
 #![no_main]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Stream, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Stream, Wire};
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::git_protocol::{
     Advertisement, Band, Bands, CapabilityAdvertisement, ClientLine, LsRef, LsRefsArg, MAX_DATA,
     MAX_PACKET, Packet, ProtoRequest, ServerLine, ServiceHeader, Sideband, V2Request, band_packets,

@@ -7,7 +7,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use fictionet::stdlib::pim::{
     ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, CandidateRp, Endpoints, Message, Error, checksum,
 };
-use fictionet::stdlib::{codec::{Wire, Collect, Decode, contract}, pim};
+use fictionet::stdlib::{codec::{Wire, Collect, Decode}, test_support::contract, pim};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

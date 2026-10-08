@@ -8,7 +8,8 @@ use fictionet::stdlib::nfs::{
 };
 use fictionet::stdlib::onc_rpc::{Body, Message};
 use fictionet::stdlib::{
-    codec::{Assembled, Decode, Wire, contract, test_support::decode_all},
+    codec::{Assembled, Decode, Wire},
+    test_support::contract, test_support::decode_all,
     onc_rpc,
 };
 use libfuzzer_sys::fuzz_target;

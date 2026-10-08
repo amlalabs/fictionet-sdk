@@ -4,8 +4,9 @@
 
 use fictionet::stdlib::codec::Frames;
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::codec::{Assembled, Wire, test_support::decode_all};
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::codec::{Assembled, Wire};
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::cotp::{Connect, Data, Parameter, Tpdu, Variable};
 use fictionet::stdlib::cotp::{messages, over_tpkt};
 use fictionet::stdlib::tpkt::{

@@ -1,7 +1,9 @@
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
-    Carry, Decode, Demux, Fail, Layered, Pipe, PipeError, Step, Wire, contract, test_support,
+    Carry, Decode, Demux, Fail, Layered, Pipe, PipeError, Step, Wire,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support;
 use fictionet::stdlib::grpc::{Code, Error, HEADER_LEN, Message, fail_status};
 use std::collections::BTreeMap;
 
@@ -113,7 +115,7 @@ fn route(chunk_size: usize) {
     let mut saw_backpressure = false;
     for frame in frames() {
         assert!(frame.payload.len() <= MAX_DATA);
-        for chunk in fictionet::stdlib::codec::test_support::chunks(frame.payload, &[chunk_size]) {
+        for chunk in fictionet::stdlib::test_support::chunks(frame.payload, &[chunk_size]) {
             let mut rest = chunk;
             while !rest.is_empty() {
                 let n = calls.push(&frame.key, rest);

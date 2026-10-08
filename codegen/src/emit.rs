@@ -1592,7 +1592,7 @@ pub fn emit_fuzz(
     header(&mut out, inputs)?;
     writeln!(
         out,
-        "#![no_main]\n\n#[allow(dead_code)]\n#[path = {module_path:?}]\nmod protocol;\n\nuse fictionet::stdlib::codec::contract;\nuse libfuzzer_sys::fuzz_target;\n\nfuzz_target!(|data: &[u8]| {{"
+        "#![no_main]\n\n#[allow(dead_code)]\n#[path = {module_path:?}]\nmod protocol;\n\nuse fictionet::stdlib::test_support::contract;\nuse libfuzzer_sys::fuzz_target;\n\nfuzz_target!(|data: &[u8]| {{"
     )?;
     for t in &checked.schema.types {
         writeln!(

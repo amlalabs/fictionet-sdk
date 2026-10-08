@@ -3,7 +3,10 @@
 
 use fictionet::stdlib::codec::Frames;
 
-use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::mysql::*;
 use libfuzzer_sys::fuzz_target;
 

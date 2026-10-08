@@ -2,7 +2,8 @@
 //! builds from them.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::ntp::{KissCode, Mode, Packet, ServerInfo, Timestamp, kiss_reply, server_reply};
 use libfuzzer_sys::fuzz_target;
 

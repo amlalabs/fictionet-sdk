@@ -3,7 +3,8 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::ntlmssp::{
     Authenticate, AvPair, AvPairs, Challenge, ClientChallenge, LmV2Response, MAX_AV_PAIRS,
     MAX_FIELD, MAX_MESSAGE, MIC_END, MIC_LEN, Message, MicInput, Negotiate, NtResponse,

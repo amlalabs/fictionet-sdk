@@ -2616,7 +2616,9 @@ impl Decode for Messages<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream, contract, test_support};
+    use fictionet::stdlib::codec::{Fail, Stream};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
     use std::sync::OnceLock;
 
     // A small rewrite of the public Real Logic car example, with nested refs,

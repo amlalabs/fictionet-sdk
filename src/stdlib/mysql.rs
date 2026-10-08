@@ -2006,10 +2006,12 @@ impl From<Truncated> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract, pump,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     const CAPS41: u32 = capability::PROTOCOL_41 | capability::SECURE_CONNECTION | capability::TRANSACTIONS;
     const CAPS_MODERN: u32 = CAPS41
@@ -2024,9 +2026,6 @@ mod tests {
     const CAPS_SETS: [u32; 5] =
         [0, capability::TRANSACTIONS, CAPS41, CAPS_MODERN, CAPS_MODERN | capability::QUERY_ATTRIBUTES];
 
-    fn hex(s: &str) -> Vec<u8> {
-        s.split_whitespace().map(|b| u8::from_str_radix(b, 16).unwrap()).collect()
-    }
 
     /// Every strict prefix of `full` is refused or reads as something else.
     fn prefixes<T: PartialEq + std::fmt::Debug>(full: &[u8], parse: impl Fn(&[u8]) -> Result<T, Error>) {

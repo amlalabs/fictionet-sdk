@@ -1,7 +1,8 @@
 //! Bounded SBE XML schemas, dynamic messages, and codec contracts.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::sbe::{
     Error, Messages, MAX_MESSAGE_BYTES, MessageWire, Scalar, Schema, SchemaSource, Value,
 };

@@ -1337,9 +1337,10 @@ mod tests {
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract, finish, pump,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream, finish, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn pair(n: &str, v: &str) -> (Vec<u8>, Vec<u8>) {
         (n.as_bytes().to_vec(), v.as_bytes().to_vec())

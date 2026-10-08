@@ -1012,8 +1012,10 @@ pub fn segment(message: &[u8], tpdu_size: usize) -> Vec<Data> {
 #[cfg(test)]
 mod codec_tests {
     use fictionet::stdlib::codec::{
-        AssembleError, Assembled, Fail, Stream, contract, finish, pump, test_support,
+        AssembleError, Assembled, Fail, Stream, finish, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
     use super::*;
 
     fn strict_packet(tpdu: &Tpdu) -> tpkt::Packet {
@@ -1404,7 +1406,9 @@ mod codec_tests {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream, contract, pump, test_support};
+    use fictionet::stdlib::codec::{Fail, Stream, pump};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
     use tpkt::{MAX_PACKET, MAX_PAYLOAD, Packet};
 
     // An RDP connection request (MS-RDPBCGR 4.1.1) starts with a TPKT

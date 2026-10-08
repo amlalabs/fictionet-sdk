@@ -5,9 +5,9 @@ use core::time::Duration;
 use fictionet::stdlib::{
     codec::{
         ByteFault, Carry, Decode, Direction, Ending, Faults, Interceptor, ItemFault, Lines, Pipe,
-        PumpError, Recorder, Rewrite, Rule, Stream, StreamEvent, Trigger, Wire, test_support,
+        PumpError, Recorder, Rewrite, Rule, Stream, StreamEvent, Trigger, Wire,
         write_bounded,
-    },
+    }, test_support,
     json, modbus,
 };
 use libfuzzer_sys::fuzz_target;

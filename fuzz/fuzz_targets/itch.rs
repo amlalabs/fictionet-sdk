@@ -5,9 +5,9 @@
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
     Wire,
-    contract::{check_decode, check_wire, check_wire_value},
-    test_support::decode_all,
 };
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::itch::{
     AddOrder, Book, BookConfig, MAX_MESSAGE_LENGTH, Message, Noii, OrderReplace, StockDirectory,
 };

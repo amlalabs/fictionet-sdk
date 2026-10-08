@@ -21,7 +21,9 @@ use fictionet::stdlib::mqtt::check_topic_name;
 
 use fictionet::stdlib::mqtt::topic_matches;
 use libfuzzer_sys::fuzz_target;
-use fictionet::stdlib::codec::{ Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 
 fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Packet>(data);

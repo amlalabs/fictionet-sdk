@@ -1479,7 +1479,9 @@ impl Wire for Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Lcg, contract, test_support::mutate};
+    use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::mutate;
 
     const LAPTOP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 20);
 

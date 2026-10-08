@@ -1118,11 +1118,12 @@ fn is_scalar_byte(c: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump};
+    use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
+    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::codec::{
         Lcg,
-        test_support::{decode_all, mutate},
     };
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn check(input: &[u8]) {
         contract::check_decode_with_alloc_limit(Values::new, input, 2 * (MAX_SIZE + 1));
@@ -1630,7 +1631,7 @@ mod tests {
             stream.into_parts().0.allocated()
         };
         assert!(read(MAX_SIZE) <= 2 * (MAX_SIZE + 1));
-        fictionet::stdlib::codec::test_support::assert_linear("json values", MAX_SIZE / 16, |size| {
+        fictionet::stdlib::test_support::assert_linear("json values", MAX_SIZE / 16, |size| {
             read(size);
         });
     }

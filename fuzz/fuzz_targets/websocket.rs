@@ -1,7 +1,10 @@
 //! WebSocket frames, messages, close payloads, and handshake fields.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Step, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::websocket::{
     Close, Error, Frame, Frames, Header, MAX_HEADERS, MAX_MESSAGE, Message, Messages, Opcode, Role, check_request,
     check_response, request_headers,

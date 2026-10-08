@@ -4,8 +4,10 @@
 use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
-    Decode, Fail, Stream, Wire, contract, finish, pump, test_support::{chunks, decode_all},
+    Decode, Fail, Stream, Wire, finish, pump,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{chunks, decode_all};
 use fictionet::stdlib::{bgp, fastcgi, kafka, thrift, zabbix};
 
 fn stack<D>(make: impl Fn() -> D, bytes: &[u8], expected: &[D::Item])
@@ -348,9 +350,7 @@ fn zabbix_rejects_oversize_at_named_limit() {
 
 fn refuses<M: Wire + PartialEq + Debug>(value: &M) {
     contract::check_wire_value(value);
-    let mut destination = vec![1, 2, 3];
-    assert!(value.write(&mut destination).is_err());
-    assert_eq!(destination, [1, 2, 3]);
+    contract::check_refused(value);
 }
 
 #[test]

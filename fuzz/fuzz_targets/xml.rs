@@ -4,7 +4,10 @@
 
 use std::sync::Arc;
 
-use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::xml::{Attribute, Builder, Document, ErrorKind, Event, Events, Name, Start, XMLNS_NAMESPACE};
 use libfuzzer_sys::fuzz_target;
 

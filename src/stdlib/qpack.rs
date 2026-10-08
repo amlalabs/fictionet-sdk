@@ -1783,10 +1783,12 @@ impl From<Truncated> for Stop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::{
-        Lcg, contract,
-        test_support::{decode_all, mutate},
+        Lcg,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
     use fictionet::stdlib::prefix_int::Integer;
 
     fn apply(table: &mut Table, bytes: &[u8]) -> Result<(), Error> {
@@ -1803,10 +1805,6 @@ mod tests {
         section
     }
 
-    fn hex(s: &str) -> Vec<u8> {
-        let s: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-        s.chunks(2).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap()).collect()
-    }
 
     fn fields(section: SectionResult) -> Vec<Field> {
         let SectionResult::Fields { fields, .. } = section else { panic!("blocked") };

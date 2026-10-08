@@ -902,9 +902,10 @@ impl Wire for NgMessage {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Collect, CollectError, Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Collect, CollectError, Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn collect(b: &[u8]) -> Result<Message, Error> {
         let make = || Collect::<Message>::new(MAX_MESSAGE);

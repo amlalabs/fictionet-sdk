@@ -1,6 +1,7 @@
 #![no_main]
 
-use fictionet::stdlib::codec::{Collect, contract};
+use fictionet::stdlib::codec::Collect;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::http1::{Chunk, Header, Limits, Request, RequestEvents, RequestHead, Version};
 use libfuzzer_sys::fuzz_target;
 

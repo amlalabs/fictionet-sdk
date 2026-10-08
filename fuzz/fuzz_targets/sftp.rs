@@ -1,7 +1,9 @@
 //! SFTP packets and typed payloads through the shared contracts.
 #![no_main]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::sftp::{Attrs, MAX_FRAME, MAX_PACKET, Packet, Request, Response, Status};
 use libfuzzer_sys::fuzz_target;
 

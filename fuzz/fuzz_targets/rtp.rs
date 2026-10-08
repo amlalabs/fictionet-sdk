@@ -1,7 +1,8 @@
 //! RTP datagrams, multiplexed RTCP, and RFC 4571 envelopes.
 #![no_main]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Decode, Wire, contract};
+use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::{rtcp, rtp::*};
 use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {

@@ -3,8 +3,10 @@
 use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
-    Decode, Fail, Step, Stream, Wire, contract, test_support::decode_all,
+    Decode, Fail, Step, Stream, Wire,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::{amqp, coap, dhcpv6, mqtt, syslog};
 
 fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8])
@@ -27,9 +29,7 @@ fn encoded<M: Wire + PartialEq + Debug>(value: &M) -> Vec<u8> {
 
 fn refuses<M: Wire + PartialEq + Debug>(value: &M) {
     contract::check_wire_value(value);
-    let mut out = vec![0x5a, 0xc3, 0x17];
-    assert!(value.write(&mut out).is_err());
-    assert_eq!(out, [0x5a, 0xc3, 0x17]);
+    contract::check_refused(value);
 }
 
 #[test]

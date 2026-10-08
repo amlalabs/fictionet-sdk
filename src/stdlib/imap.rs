@@ -1668,9 +1668,10 @@ impl Decode for Responses {
 mod tests {
     use super::*;
     use codec::{
-        Fail, Lcg, Step, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Step, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn cmd(bytes: &[u8]) -> Command {
         Command::parse(bytes).unwrap()
@@ -1690,11 +1691,6 @@ mod tests {
         let (items, failure) = decode_all(Responses::new, bytes);
         assert_eq!(failure, None);
         items
-    }
-    fn refused(value: &impl Wire<WriteError = Error>) {
-        let mut out = b"prefix".to_vec();
-        assert_eq!(value.write(&mut out), Err(Error::Unwritable));
-        assert_eq!(out, b"prefix");
     }
     #[test]
     fn rfc_commands() {
@@ -1930,7 +1926,7 @@ mod tests {
         for _ in 0..MAX_DEPTH - 1 {
             value = Value::List(vec![value]);
         }
-        refused(&Response::Data(vec![value]));
+        assert_eq!(contract::check_refused(&Response::Data(vec![value])), Error::Unwritable);
     }
     #[test]
     fn brackets_open_sections_only_after_fetch_items() {
@@ -1947,7 +1943,7 @@ mod tests {
                 .unwrap(),
             b"a SELECT foo[\r\n"
         );
-        refused(&Command::new("a", "X", vec![Value::atom("BODY[")]));
+        assert_eq!(contract::check_refused(&Command::new("a", "X", vec![Value::atom("BODY[")])), Error::Unwritable);
         // header-fld-name is an astring, so it may be quoted or a literal.
         let b: &[u8] = b"a FETCH 1 BODY.PEEK[HEADER.FIELDS ({4}\r\nFrom \"a]b\")]\r\n";
         let ev = events(b);
@@ -1999,7 +1995,7 @@ mod tests {
         assert!(matches!(&ev[1], Ok(Input::Command(c)) if c.args[1] == bin));
         // Servers never write ~{n+}.
         let r = Response::fetch(1, vec![Value::atom("BINARY[]"), Value::Binary { data: vec![0], non_sync: true }]);
-        refused(&r);
+        assert_eq!(contract::check_refused(&r), Error::Unwritable);
         // A plain literal still may not hold NUL, and ~ alone is a word.
         assert!(syntax(b"a X {1}\r\n\0\r\n"));
         assert_eq!(cmd(b"a X ~ ~a\r\n").args, atoms(&["~", "~a"]));
@@ -2025,7 +2021,7 @@ mod tests {
         let r = Response::parse(&b).unwrap();
         assert_eq!(r.to_bytes().unwrap(), b);
         let r = Response::tagged(&"t".repeat(MAX_TEXT), Status::Bad, "x").with_code("C");
-        refused(&r);
+        assert_eq!(contract::check_refused(&r), Error::Unwritable);
     }
 
     fn strings_needing_literals() -> Vec<Vec<u8>> {
@@ -2135,7 +2131,7 @@ mod tests {
             Command::new("a b", "", vec![]),
             Command::new("", "no op", vec![]),
         ] {
-            refused(&command);
+            assert_eq!(contract::check_refused(&command), Error::Unwritable);
         }
         for response in [
             Response::tagged("a", Status::Bye, "x"),
@@ -2143,7 +2139,7 @@ mod tests {
             Response::untagged(Status::Ok, "x").with_code("A]B"),
             Response::Data(atoms(&["OK", "x"])),
         ] {
-            refused(&response);
+            assert_eq!(contract::check_refused(&response), Error::Unwritable);
         }
     }
 
@@ -2469,43 +2465,43 @@ mod tests {
 
     #[test]
     fn writers_refuse_size_and_nesting_overflow() {
-        refused(&Command::new(
+        assert_eq!(contract::check_refused(&Command::new(
             "a",
             "APPEND",
             vec![Value::Literal {
                 data: vec![b'x'; MAX_LITERAL + 10],
                 non_sync: true,
             }],
-        ));
-        refused(&Response::Data(vec![
+        )), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Response::Data(vec![
             Value::Literal {
                 data: vec![b'y'; MAX_LITERAL],
                 non_sync: false
             };
             6
-        ]));
-        refused(&Command::new(
+        ])), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Command::new(
             "a",
             "X",
             vec![Value::atom(&"z".repeat(1000)); 100],
-        ));
-        refused(&Response::greeting(&"é".repeat(MAX_TEXT)).with_code(&"c".repeat(MAX_TEXT)));
-        refused(&Response::continue_req(&"é".repeat(MAX_TEXT)));
-        refused(&Command::new(
+        )), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Response::greeting(&"é".repeat(MAX_TEXT)).with_code(&"c".repeat(MAX_TEXT))), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Response::continue_req(&"é".repeat(MAX_TEXT))), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Command::new(
             &"t".repeat(MAX_TEXT * 2),
             &"n".repeat(MAX_TEXT),
             vec![Value::nil()],
-        ));
+        )), Error::Unwritable);
         let mut value = Value::nil();
         for _ in 0..MAX_DEPTH + 5 {
             value = Value::List(vec![value]);
         }
-        refused(&Command::new("a", "X", vec![value]));
-        refused(&Command::new(
+        assert_eq!(contract::check_refused(&Command::new("a", "X", vec![value])), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Command::new(
             "a",
             "X",
             vec![Value::Quoted(vec![b'q'; MAX_QUOTED + 1])],
-        ));
+        )), Error::Unwritable);
     }
 
     #[test]
@@ -2524,7 +2520,7 @@ mod tests {
             items[1],
             Ok(Input::Command(Command::new("b", "NOOP", vec![])))
         );
-        refused(&Command::new(
+        assert_eq!(contract::check_refused(&Command::new(
             "a",
             "X",
             vec![
@@ -2534,11 +2530,11 @@ mod tests {
                     non_sync: true,
                 },
             ],
-        ));
-        refused(&Response::fetch(
+        )), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Response::fetch(
             1,
             vec![Value::atom("BODY[]"), Value::string(b"x\r\n\0")],
-        ));
+        )), Error::Unwritable);
     }
 
     #[test]
@@ -2556,15 +2552,15 @@ mod tests {
         let command = cmd("a X \"é\"\r\n".as_bytes());
         assert_eq!(command.args[0].as_str(), Some("é"));
         assert_eq!(cmd(&command.to_bytes().unwrap()), command);
-        refused(&Command::new(
+        assert_eq!(contract::check_refused(&Command::new(
             "a",
             "X",
             vec![Value::Quoted(b"\xff".to_vec())],
-        ));
-        refused(&Response::Data(vec![
+        )), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Response::Data(vec![
             Value::atom("X"),
             Value::Quoted(b"a\x80".to_vec()),
-        ]));
+        ])), Error::Unwritable);
         let command = Command::new(
             "a",
             "X",
@@ -2655,10 +2651,10 @@ mod tests {
             };
             100
         ]);
-        refused(&Response::Data(vec![value]));
-        refused(&Response::Data(vec![Value::List(vec![Value::atom(
+        assert_eq!(contract::check_refused(&Response::Data(vec![value])), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Response::Data(vec![Value::List(vec![Value::atom(
             &"a".repeat(MAX_TEXT + 1),
-        )])]));
+        )])])), Error::Unwritable);
     }
 
     #[test]
@@ -2673,14 +2669,14 @@ mod tests {
             }],
         );
         assert!(command.to_bytes().unwrap().starts_with(b"a X {4097}\r\n"));
-        refused(&Command::new(
+        assert_eq!(contract::check_refused(&Command::new(
             "a",
             "X",
             vec![Value::Literal {
                 data: long,
                 non_sync: true,
             }],
-        ));
+        )), Error::Unwritable);
         let command = Command::new(
             "a",
             "X",
@@ -2722,7 +2718,7 @@ mod tests {
             data: vec![b'y'; MAX_LITERAL],
             non_sync: false,
         };
-        refused(&Command::new("a", "X", vec![big; 6]));
+        assert_eq!(contract::check_refused(&Command::new("a", "X", vec![big; 6])), Error::Unwritable);
     }
 
     #[test]

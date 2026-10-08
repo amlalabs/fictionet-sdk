@@ -205,13 +205,8 @@ pub fn decode_limited(bytes: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::contract;
-    fn hex(s: &str) -> Vec<u8> {
-        s.split_whitespace()
-            .flat_map(|s| s.as_bytes().chunks(2))
-            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
-            .collect()
-    }
+    use fictionet::stdlib::test_support::hex;
+    use fictionet::stdlib::test_support::contract;
     // RFC 7541 Appendix C.4: Huffman-coded strings.
 
     #[test]

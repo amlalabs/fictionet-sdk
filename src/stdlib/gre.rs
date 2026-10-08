@@ -469,9 +469,10 @@ impl Wire for Packet {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Collect, CollectError, Fail, Lcg, contract,
-        test_support::{decode_all, mutate},
+        Collect, CollectError, Fail, Lcg,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn collect(b: &[u8]) -> Result<Packet, Error> {
         let make = || Collect::<Packet>::new(MAX_PACKET);

@@ -1,7 +1,10 @@
 //! Multipart body framing, MIME entities, parts, and parameterized headers.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Fail, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Fail, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::mime_multipart::{
     Body, Entity, Error, Headers, MAX_ENTITY, Multipart, ParamValue, Part, Parts, boundary,
     valid_boundary,

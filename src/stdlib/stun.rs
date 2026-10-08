@@ -1146,7 +1146,9 @@ enum Integrity {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream, Wire, contract, finish, pump, test_support};
+    use fictionet::stdlib::codec::{Fail, Stream, Wire, finish, pump};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
 
     const TID: [u8; 12] = [
         0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
@@ -1541,7 +1543,7 @@ mod tests {
         stream.extend_from_slice(&SAMPLE_IPV4_RESPONSE);
         let mut d = Stream::new(Frames);
         let mut got = Vec::new();
-        for byte in codec::test_support::chunks(&stream, &[1]) {
+        for byte in test_support::chunks(&stream, &[1]) {
             put(&mut d, byte);
             while let Some(m) = d.next().map(|r| r.map(|frame| Message::parse(&frame))) {
                 got.push(m.unwrap().map(|m| m.class));
@@ -2198,9 +2200,7 @@ mod tests {
     }
 
     fn assert_write_error(message: &Message, error: Error) {
-        let mut out = vec![0x5a, 0xa5];
-        assert_eq!(message.write(&mut out), Err(error));
-        assert_eq!(out, [0x5a, 0xa5]);
+        assert_eq!(contract::check_refused(message), error);
         contract::check_wire_value(message);
         assert_eq!(message.to_bytes(), Err(error));
     }

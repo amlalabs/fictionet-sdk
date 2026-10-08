@@ -1457,10 +1457,12 @@ impl From<Trailing> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::{
-        Collect, CollectError, Fail, Lcg, Wire, contract,
-        test_support::{decode_all, mutate},
+        Collect, CollectError, Fail, Lcg, Wire,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Message, Error> {
         use fictionet::stdlib::codec::Decode;
@@ -1991,10 +1993,6 @@ mod tests {
         }
     }
 
-    /// Bytes written as hex pairs separated by spaces.
-    fn hex(s: &str) -> Vec<u8> {
-        s.split_whitespace().map(|h| u8::from_str_radix(h, 16).unwrap()).collect()
-    }
 
     #[test]
     fn bootstrap_no_forward_bit() {

@@ -3,9 +3,10 @@
 use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
-    Decode, Fail, Lcg, Step, Stream, Wire, contract, finish,
-    test_support::{decode_all, mutate},
+    Decode, Fail, Lcg, Step, Stream, Wire, finish,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{decode_all, mutate};
 use fictionet::stdlib::{dcerpc, diameter, nbss, radius, smb2};
 
 #[test]
@@ -110,9 +111,7 @@ where
 }
 
 fn refused<M: Wire + PartialEq + Debug>(value: &M) {
-    let mut out = vec![0xa5, 0x5a, 0x42];
-    assert!(value.write(&mut out).is_err());
-    assert_eq!(out, [0xa5, 0x5a, 0x42]);
+    contract::check_refused(value);
     contract::check_wire_value(value);
 }
 

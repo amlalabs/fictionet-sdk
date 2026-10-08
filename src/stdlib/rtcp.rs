@@ -1749,9 +1749,10 @@ fn check_size(n: usize) -> Result<(), Error> {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn rr(ssrc: u32) -> Packet {
         Body::ReceiverReport(ReceiverReport { ssrc, reports: vec![], extension: vec![] }).into()

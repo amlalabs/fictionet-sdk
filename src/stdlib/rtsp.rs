@@ -2115,11 +2115,12 @@ mod tests {
     }
 
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream, contract};
+    use fictionet::stdlib::codec::{Fail, Stream};
+    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::codec::{
         Lcg,
-        test_support::{decode_all, mutate},
     };
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn wire_text<T: Wire<WriteError = Error>>(value: &T) -> Result<String, Error> {
         String::from_utf8(value.to_bytes()?).map_err(|_| Error::Utf8)
@@ -2970,7 +2971,7 @@ mod tests {
             b"smpte-30-drop=1:2:3:4.5-",
         ];
         let mut read = 0;
-        for round in 0..fictionet::stdlib::codec::test_support::rounds(1500) {
+        for round in 0..fictionet::stdlib::test_support::rounds(1500) {
             let base: &[u8] = match round % 3 {
                 0 => &stream,
                 1 => seeds[rng.index(seeds.len())].as_slice(),
@@ -2984,7 +2985,7 @@ mod tests {
         }
         assert!(read > 3000, "only {read} items read");
         // Mix arbitrary bytes into text as well as checking byte noise.
-        for _ in 0..fictionet::stdlib::codec::test_support::rounds(750) {
+        for _ in 0..fictionet::stdlib::test_support::rounds(750) {
             let mut text = rng.text(200).into_bytes();
             let at = rng.index(text.len().saturating_add(1));
             text.splice(at..at, rng.bytes(4));

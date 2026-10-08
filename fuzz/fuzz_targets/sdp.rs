@@ -2,7 +2,10 @@
 //! peer reads them.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::sdp::{
     Attribute, Candidate, SessionDescriptions, Fmtp, MAX_LINE_LEN, MAX_LINES, RtpMap, SessionDescription,
 };

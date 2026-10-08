@@ -4,7 +4,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::fastcgi::{
     BeginRequest, Client, ClientEvent, EndRequest, Error, MAX_CONTENT, MAX_HELD, MAX_REQUESTS, Record,
     Pairs, Request, Response, RecordStream, UnknownType, Server, ServerEvent, kind,

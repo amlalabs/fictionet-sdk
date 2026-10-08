@@ -1311,7 +1311,9 @@ impl Wire for Version {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Lcg, contract, test_support::mutate};
+    use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::mutate;
 
     /// The CHALLENGE message from \[MS-NLMP\] section 4.2.4.3.
     const SPEC_CHALLENGE: [u8; 104] = [

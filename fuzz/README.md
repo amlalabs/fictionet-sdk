@@ -109,7 +109,7 @@ the process grows by less than 200 MiB and that another sandbox is still
 served.
 
 The `dnp3`, `iec104`, `enip`, `opcua`, and `rdp` targets drive `Frames`
-through `codec::Stream` and `codec::contract`. OPC UA also checks `Messages`
+through `codec::Stream` and `test_support::contract`. OPC UA also checks `Messages`
 with its assembly limit. Typed values use `Wire` writer contracts.
 RDP uses `DataBlocks` for bounded GCC block sequences.
 The module docs describe the APIs:

@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::cme_mdp3::{Message, Messages, PACKET_HEADER, Packet};
-use fictionet::stdlib::codec::contract::{check_decode_with_alloc_limit, check_wire};
+use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_wire};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 8192;

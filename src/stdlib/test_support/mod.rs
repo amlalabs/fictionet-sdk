@@ -13,6 +13,28 @@ extern crate alloc;
 use alloc::vec::Vec;
 use fictionet::stdlib::codec::{Decode, Fail, Lcg, Stream, finish, pump};
 
+pub mod contract;
+
+/// Parses pairs of hex digits for tests, skipping ASCII whitespace.
+///
+/// Panics on an odd digit count or a non-hex character.
+///
+/// ```
+/// use fictionet::stdlib::test_support::hex;
+/// assert_eq!(hex("0a b C\n01"), [10, 188, 1]);
+/// ```
+pub fn hex(text: &str) -> Vec<u8> {
+    let mut digits = text.bytes().filter(|b| !b.is_ascii_whitespace());
+    let mut out = Vec::new();
+    while let Some(high) = digits.next() {
+        let high = fictionet::stdlib::codec::ascii::hex_value(high).expect("non-hex character in test data");
+        let low = digits.next().expect("odd hex digit count in test data");
+        let low = fictionet::stdlib::codec::ascii::hex_value(low).expect("non-hex character in test data");
+        out.push(high << 4 | low);
+    }
+    out
+}
+
 /// The most bytes one [`mutate`] call adds. Only inserting a byte and
 /// duplicating a slice grow the input, by 1 and at most this many bytes.
 pub const MUTATE_GROWTH: usize = 16;
@@ -179,7 +201,7 @@ pub fn scale() -> usize {
 /// many rounds.
 ///
 /// ```
-/// use fictionet::stdlib::codec::test_support::{rounds, scale};
+/// use fictionet::stdlib::test_support::{rounds, scale};
 /// assert_eq!(rounds(500), 500 * scale());
 /// ```
 pub fn rounds(n: usize) -> usize {
@@ -221,9 +243,9 @@ pub fn assert_linear(name: &str, n: usize, mut run: impl FnMut(usize)) {
     );
 }
 
-/// The CPU time the calling thread has used, where the platform reports it,
-/// and the time since the first call otherwise.
-fn thread_cpu_time() -> core::time::Duration {
+/// Returns the CPU time used by the calling thread when available.
+/// Otherwise returns elapsed wall time since the first fallback call.
+pub fn thread_cpu_time() -> core::time::Duration {
     #[cfg(unix)]
     {
         let mut t = libc::timespec {
@@ -249,7 +271,7 @@ fn thread_cpu_time() -> core::time::Duration {
 /// This audits counted work; use contract checks for decoded results.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::test_support::check_work, thrift::EncodedMessages};
+/// use fictionet::stdlib::{test_support::check_work, thrift::EncodedMessages};
 /// check_work(EncodedMessages::new, &[0x82], EncodedMessages::examined, 16, 16);
 /// ```
 pub fn check_work<D: Decode>(
@@ -308,7 +330,7 @@ pub fn check_work<D: Decode>(
 /// Returns the operation's result so callers can check its error.
 ///
 /// ```
-/// use fictionet::stdlib::codec::test_support::check_atomic;
+/// use fictionet::stdlib::test_support::check_atomic;
 /// let mut value = 7;
 /// let result = check_atomic(&mut value, |_| Err::<(), _>("refused"), |v| *v);
 /// assert_eq!(result, Err("refused"));
@@ -331,6 +353,30 @@ mod tests {
     use super::assert_linear;
     use core::hint::black_box;
 
+    #[test]
+    fn hex_pairs_ignore_ascii_whitespace() {
+        assert_eq!(super::hex(" 0 a B\tc\n01\r\x0c"), [10, 188, 1]);
+        assert!(super::hex(" \t\n").is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "odd hex digit count")]
+    fn hex_rejects_odd_digits() {
+        super::hex("01 a");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-hex character")]
+    fn hex_rejects_non_hex() {
+        super::hex("0g");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-hex character")]
+    fn hex_rejects_non_ascii_whitespace() {
+        super::hex("01\u{a0}23");
+    }
+
     #[derive(Default)]
     struct Counted(u64);
     impl super::Decode for Counted {
@@ -338,9 +384,9 @@ mod tests {
         type Error = core::convert::Infallible;
         const NAME: &'static str = "counted";
         fn capacity(&self) -> usize { 1024 }
-        fn decode(&mut self, _: &[u8], _: bool) -> Result<super::super::Step<()>, Self::Error> {
+        fn decode(&mut self, _: &[u8], _: bool) -> Result<fictionet::stdlib::codec::Step<()>, Self::Error> {
             self.0 += 1;
-            Ok(super::super::Step::Need)
+            Ok(fictionet::stdlib::codec::Step::Need)
         }
     }
 

@@ -5,9 +5,11 @@ use core::fmt::Debug;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::codec::{
-    Collect, CollectError, Decode, Fail, Lcg, Stream, Wire, contract, finish, pump,
-    test_support::{chunks, decode_all, mutate},
+    Collect, CollectError, Decode, Fail, Lcg, Stream, Wire, finish, pump,
 };
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 use fictionet::stdlib::{geneve, gre, igmp, ipsec, ospf, pim, rip, vrrp, wake_on_lan as wol};
 
 fn round_trip<M>(value: &M, limit: usize) -> Vec<u8>
@@ -73,10 +75,8 @@ where
 }
 
 fn refused<M: Wire + Debug + PartialEq>(value: &M) {
+    contract::check_refused(value);
     contract::check_wire_value(value);
-    let mut out = vec![1, 2, 3];
-    assert!(Wire::write(value, &mut out).is_err());
-    assert_eq!(out, [1, 2, 3]);
 }
 
 #[test]

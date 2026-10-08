@@ -707,8 +707,9 @@ fn reserve(out: &mut Vec<u8>, size: usize) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::contract;
     use super::*;
-    use fictionet::stdlib::codec::test_support::decode_all;
+    use fictionet::stdlib::test_support::decode_all;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
 
     fn events(bytes: &[u8]) -> Vec<Event> {
@@ -1092,25 +1093,19 @@ mod tests {
         );
     }
 
-    fn refuses<T: Wire<WriteError = Error>>(value: T) {
-        let mut out = b"prefix".to_vec();
-        assert!(value.write(&mut out).is_err());
-        assert_eq!(out, b"prefix");
-    }
-
     #[test]
     fn event_writer_refusals_are_transactional() {
         for kind in ["", "a\rb", "a\nb"] {
-            refuses(event(kind, "x", ""));
+            contract::check_refused(&event(kind, "x", ""));
         }
         for id in ["a\rb", "a\nb", "a\0b"] {
-            refuses(event("message", "x", id));
+            contract::check_refused(&event("message", "x", id));
         }
-        refuses(Event::new("a\rb"));
-        refuses(Event::new("x".repeat(MAX_LINE)));
-        refuses(Event::new("x\n".repeat(MAX_EVENT / 2)));
-        refuses(event(&"x".repeat(MAX_LINE), "", ""));
-        refuses(event("message", "", &"x".repeat(MAX_LINE)));
+        contract::check_refused(&Event::new("a\rb"));
+        contract::check_refused(&Event::new("x".repeat(MAX_LINE)));
+        contract::check_refused(&Event::new("x\n".repeat(MAX_EVENT / 2)));
+        contract::check_refused(&event(&"x".repeat(MAX_LINE), "", ""));
+        contract::check_refused(&event("message", "", &"x".repeat(MAX_LINE)));
     }
 
     #[test]
@@ -1153,7 +1148,7 @@ mod tests {
                 value: "ok".into(),
             },
         ] {
-            refuses(line);
+            contract::check_refused(&line);
         }
     }
 

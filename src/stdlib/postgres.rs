@@ -2514,9 +2514,10 @@ fn show_tag(t: u8) -> String {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     #[test]
     fn all_message_variants_obey_wire_contract() {
@@ -3750,7 +3751,7 @@ mod tests {
         for message in all_backend() {
             message.write(&mut back).unwrap();
         }
-        for i in 0..fictionet::stdlib::codec::test_support::rounds(1000) {
+        for i in 0..fictionet::stdlib::test_support::rounds(1000) {
             let mut data = match i % 3 {
                 0 => rng.bytes(64),
                 1 => front.clone(),
@@ -3882,9 +3883,7 @@ mod tests {
 
     fn assert_unwritable<M: Wire<WriteError = Error> + PartialEq + std::fmt::Debug>(value: &M) {
         contract::check_wire_value(value);
-        let mut out = b"prefix".to_vec();
-        assert_eq!(value.write(&mut out), Err(Error::Unwritable));
-        assert_eq!(out, b"prefix");
+        assert_eq!(contract::check_refused(value), Error::Unwritable);
     }
 
     fn random_value(rng: &mut Lcg) -> Value {

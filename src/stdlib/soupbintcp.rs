@@ -1003,13 +1003,13 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::test_support::check_atomic;
+    use fictionet::stdlib::test_support::check_atomic;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
-        contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value},
-        test_support::{decode_all, mutate},
     };
+    use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value};
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn alpha<const N: usize>(text: &[u8; N]) -> Alpha<N> {
         Alpha::new(*text).unwrap()

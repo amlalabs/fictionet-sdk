@@ -2,7 +2,8 @@
 
 use core::{convert::Infallible, fmt::Debug};
 use fictionet::stdlib::{
-    codec::{self, Decode, Fail, Step, Stream, Wire, contract, test_support::chunks},
+    codec::{self, Decode, Fail, Step, Stream, Wire},
+    test_support::contract, test_support::chunks,
     proxy_protocol as proxy, rfb, socks,
 };
 use std::net::Ipv4Addr;

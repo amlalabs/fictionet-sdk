@@ -2,11 +2,12 @@
 //! bodies.
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, contract, finish, pump};
+use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, finish, pump};
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::codec::{
     Lcg,
-    test_support::{decode_all, mutate},
 };
+use fictionet::stdlib::test_support::{decode_all, mutate};
 use fictionet::stdlib::{json, mime_multipart as mime, protobuf, urlencoded_form as form, xml};
 use std::fmt::Debug;
 

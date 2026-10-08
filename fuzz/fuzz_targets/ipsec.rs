@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::ipsec::{AhPacket, EspPacket, Datagram, Error, Plaintext, MAX_DATAGRAM, MAX_PADDING};
-use fictionet::stdlib::{codec::{Wire, Collect, contract}, ipsec};
+use fictionet::stdlib::{codec::{Wire, Collect}, test_support::contract, ipsec};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

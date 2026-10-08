@@ -413,7 +413,7 @@ under the node budget. There is no speculative parsing of partial stream
 bodies. Returned values have bounded depth, including when dropped.
 
 Generated tests build bounded values with public `codec::Lcg` and run
-`contract::check_wire_value`. Each type and stream must sample and write
+`stdlib::test_support::contract::check_wire_value`. Each type and stream must sample and write
 successfully at least once. Seed zero selects the minimum shape.
 Stream tests also run `check_decode_with_alloc_limit`. Tests cover invalid writes, malformed
 bytes, recursion limits, every generator error category, CLI errors,

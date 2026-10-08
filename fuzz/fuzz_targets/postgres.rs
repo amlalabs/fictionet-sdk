@@ -1,7 +1,10 @@
 //! PostgreSQL startup, authentication, and typed messages.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::postgres::{
     BackendEvent, BackendEvents, BackendMessage, EncryptionReply, FrontendMessage,
     FrontendMessages, Password, SaslInitialResponse, Startup,

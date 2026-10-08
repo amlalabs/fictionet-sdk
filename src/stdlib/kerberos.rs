@@ -1573,9 +1573,10 @@ impl Wire for MethodData {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract, finish as finish_stream, pump,
-        test_support::{chunks, decode_all, mutate},
+        Fail, Lcg, Stream, finish as finish_stream, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
     fn time(s: &str) -> KerberosTime {
         KerberosTime::new(s).unwrap()
@@ -2348,7 +2349,8 @@ mod tests {
 
     #[test]
     fn codec_frames_bound_input_and_keep_empty_records() {
-        use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, contract};
+        use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire};
+        use fictionet::stdlib::test_support::contract;
         assert_eq!(Frames::new().capacity(), TCP_HEADER_LEN + MAX_MESSAGE);
         let frame = Frame(vec![9; MAX_MESSAGE]);
         let bytes = <Frame as Wire>::to_bytes(&frame).unwrap();
@@ -2365,7 +2367,8 @@ mod tests {
 
     #[test]
     fn codec_writers_are_exact_and_transactional() {
-        use fictionet::stdlib::codec::{Wire, contract};
+        use fictionet::stdlib::codec::Wire;
+        use fictionet::stdlib::test_support::contract;
         for message in all_messages() {
             contract::check_wire_value(&message);
             contract::check_wire::<Message>(&message.to_bytes().unwrap());

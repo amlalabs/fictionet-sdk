@@ -3248,14 +3248,14 @@ impl From<Truncated> for Error {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::test_support::check_atomic;
+    use fictionet::stdlib::test_support::check_atomic;
     use super::*;
     use fictionet::stdlib::codec::{
         Stream,
-        contract::{check_decode_with_alloc_limit, check_wire, check_wire_value},
         finish, pump,
-        test_support::{chunks, decode_all},
     };
+    use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_wire, check_wire_value};
+    use fictionet::stdlib::test_support::{chunks, decode_all};
 
     fn templates(fields: &str) -> Templates {
         xml_templates(&format!(

@@ -3,8 +3,10 @@
 use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
-    Decode, Fail, Lcg, Step, Stream, Wire, contract, finish, test_support::decode_all,
+    Decode, Fail, Lcg, Step, Stream, Wire, finish,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::{git_protocol, mongodb, mysql, sftp, tds};
 
 fn round_trip<D>(make: impl Fn() -> D + Copy, expected: &[D::Item])
@@ -94,9 +96,7 @@ fn exact_wire<M: Wire + PartialEq + Debug>(value: &M) -> Vec<u8> {
 }
 
 fn refused_write<M: Wire + PartialEq + Debug>(value: &M) {
-    let mut out = vec![0x55, 0xaa];
-    assert!(value.write(&mut out).is_err());
-    assert_eq!(out, [0x55, 0xaa]);
+    contract::check_refused(value);
     contract::check_wire_value(value);
 }
 

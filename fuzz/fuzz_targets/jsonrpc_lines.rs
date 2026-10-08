@@ -1,7 +1,10 @@
 //! Recoverable JSON-RPC stdio lines, boundaries, limits, and reply writes.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::{
     json::Limits,
     jsonrpc::{Message, Messages},

@@ -4,7 +4,8 @@
 use fictionet::stdlib::codec::Frames;
 
 use fictionet::stdlib::bacnet::*;
-use fictionet::stdlib::codec::{ Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

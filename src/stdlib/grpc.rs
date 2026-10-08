@@ -1473,7 +1473,9 @@ mod tests {
     use fictionet::stdlib::codec::Step;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Decode, Fail, Stream, contract, finish, pump, test_support};
+    use fictionet::stdlib::codec::{Decode, Fail, Stream, finish, pump};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
 
     #[test]
     fn status_details_refuse_varint_overflow() {

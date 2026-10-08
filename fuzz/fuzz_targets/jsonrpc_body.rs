@@ -2,8 +2,11 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{
-    Collect, CollectError, Decode, Fail, Wire, contract, test_support::decode_all,
+    Collect, CollectError, Decode, Fail, Wire,
 };
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::{
     json::{self, Limits, Value},
     jsonrpc::{self, Batch, Body, Error, Incoming, Message},

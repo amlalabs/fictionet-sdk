@@ -1,9 +1,11 @@
 //! RESP (Redis) commands and values through the shared codec driver.
 
 use fictionet::stdlib::codec::{
-    Decode, Fail, Lcg, Stream, Wire, contract, finish, pump,
-    test_support::{decode_all, mutate},
+    Decode, Fail, Lcg, Stream, Wire, finish, pump,
 };
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::{decode_all, mutate};
 use fictionet::stdlib::resp;
 
 const RESP_LIMIT: usize = 128;

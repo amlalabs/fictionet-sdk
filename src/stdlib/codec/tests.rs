@@ -1,4 +1,5 @@
 use super::*;
+use fictionet::stdlib::test_support::{self, contract};
 use alloc::{rc::Rc, vec, vec::Vec};
 use core::{cell::Cell, convert::Infallible, fmt};
 
@@ -1076,6 +1077,20 @@ fn harness_catches_nontransactional_write() {
 #[should_panic(expected = "parsed value does not write")]
 fn harness_catches_refusal_of_parsed_value() {
     contract::check_wire::<BadWire<3>>(&[1]);
+}
+#[test]
+#[should_panic(expected = "test value must refuse writing")]
+fn refusal_check_rejects_success() {
+    contract::check_refused(&BadWire::<4>(1));
+}
+#[test]
+#[should_panic(expected = "writer changed destination on error")]
+fn refusal_check_rejects_changed_destination() {
+    contract::check_refused(&BadWire::<2>(1));
+}
+#[test]
+fn refusal_check_returns_error() {
+    assert_eq!(contract::check_refused(&BadWire::<3>(1)), TestError);
 }
 #[test]
 fn wire_harness_accepts_valid_and_refused_values() {

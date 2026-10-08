@@ -1419,9 +1419,10 @@ fictionet::der_wire!(asn1, impl Wire for ResponseData, Error, Error::Unwritable,
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{chunks, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, mutate};
 
     fn cert_id(serial: &[u8]) -> CertId {
         CertId {
@@ -2351,7 +2352,8 @@ mod tests {
 
     #[test]
     fn codec_frames_bound_headers_and_report_once() {
-        use fictionet::stdlib::codec::{Decode, Fail, Stream, contract};
+        use fictionet::stdlib::codec::{Decode, Fail, Stream};
+        use fictionet::stdlib::test_support::contract;
         assert_eq!(Frames::new().capacity(), MAX_MESSAGE);
         let mut stream = Stream::new(Frames::new());
         let bytes = [0x30, 0x83, 1, 0, 0];
@@ -2364,7 +2366,8 @@ mod tests {
 
     #[test]
     fn codec_writers_are_exact_and_transactional() {
-        use fictionet::stdlib::codec::{Wire, contract};
+        use fictionet::stdlib::codec::Wire;
+        use fictionet::stdlib::test_support::contract;
         let response = Response::error(ResponseStatus::TryLater);
         contract::check_wire_value(&response);
         let mut bytes = <Response as Wire>::to_bytes(&response).unwrap();

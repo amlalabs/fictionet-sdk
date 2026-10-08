@@ -3,8 +3,10 @@
 use fictionet::stdlib::codec::Frames;
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
-    Decode, Fail, Lcg, Stream, Wire, contract, test_support::decode_all,
+    Decode, Fail, Lcg, Stream, Wire,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::{openvpn, rtcp, rtp, snmp, ssh};
 
 fn round_trip<D>(make: impl Fn() -> D, bytes: &[u8], expected: &[D::Item])
@@ -72,9 +74,7 @@ fn wire_bytes<T: Wire + Debug + PartialEq>(value: &T) -> Vec<u8> {
 
 fn refuses_value<T: Wire + Debug + PartialEq>(value: &T) {
     contract::check_wire_value(value);
-    let mut out = vec![9, 8, 7];
-    assert!(value.write(&mut out).is_err());
-    assert_eq!(out, [9, 8, 7]);
+    contract::check_refused(value);
 }
 
 fn vpn_control() -> openvpn::Packet {

@@ -2,7 +2,8 @@
 //! reads them, and packets built from the bytes, as world code writes them.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::vxlan::{Error, GpePacket, HEADER_LEN, MAX_DATAGRAM, MAX_PAYLOAD, MAX_VNI, Packet};
 use libfuzzer_sys::fuzz_target;
 

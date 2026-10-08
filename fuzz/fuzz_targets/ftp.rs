@@ -3,9 +3,10 @@
 
 use fictionet::stdlib::codec::{
     Wire,
-    contract::{check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value},
-    test_support::decode_all,
 };
+use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value};
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::ftp::{
     Command, Commands, EprtAddress, Feature, MAX_LINE, MAX_REPLY_BYTES, PortAddress,
     Replies, Reply, ReplyCode, Request,

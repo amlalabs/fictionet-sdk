@@ -1125,9 +1125,10 @@ fn asked(state: OptionState, on: bool) -> (OptionState, Option<bool>) {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract, finish, pump,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream, finish, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     /// Adjacent data events joined, so streams split in different places
     /// compare equal.

@@ -484,9 +484,10 @@ impl From<Truncated> for Error {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Lcg, contract,
-        test_support::{decode_all, mutate},
+        Lcg,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
     fn rtp(payload: &[u8]) -> Packet {
         Packet {
             marker: false,

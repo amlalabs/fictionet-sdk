@@ -2,7 +2,8 @@
 //! LAN reads them, and the reassembler that puts fragments back together.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::nbdgm::{ErrorCode, MAX_PENDING, Name, Packet, Reassembler};
 use libfuzzer_sys::fuzz_target;
 use std::net::Ipv4Addr;

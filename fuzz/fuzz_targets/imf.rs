@@ -1,7 +1,10 @@
 //! Internet Message Format headers and structured field values.
 #![no_main]
 
-use fictionet::stdlib::codec::{Fail, Stream, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Fail, Stream, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::imf::{
     Address, AddressList, DateTime, ENCODED_LINE_LEN, EncodedText, Error, FOLD_AT, Head, Header,
     MAX_FIELDS, MAX_HEADER_BYTES, MAX_LINE_BYTES, MAX_MESSAGE_IDS, MAX_VALUE_BYTES, Mailbox,

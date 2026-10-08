@@ -329,7 +329,8 @@ impl Prefixed for Packet {
 
 #[cfg(test)]
 mod codec_tests {
-    use fictionet::stdlib::codec::{Fail, Stream, contract};
+    use fictionet::stdlib::codec::{Fail, Stream};
+    use fictionet::stdlib::test_support::contract;
     use super::*;
 
     #[test]
@@ -418,7 +419,7 @@ mod codec_tests {
         let packet = Packet::new(vec![0x5a; MAX_PAYLOAD]);
         let bytes = packet.to_bytes().unwrap();
         let mut stream = Stream::new(Frames::<Packet>::new());
-        for (i, byte) in fictionet::stdlib::codec::test_support::chunks(&bytes, &[1]).enumerate() {
+        for (i, byte) in fictionet::stdlib::test_support::chunks(&bytes, &[1]).enumerate() {
             assert_eq!(stream.push(byte), 1);
             assert!(stream.buffered() <= MAX_PACKET);
             let result = stream.next();
@@ -438,7 +439,9 @@ mod codec_tests {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Fail, Stream, contract, test_support};
+    use fictionet::stdlib::codec::{Fail, Stream};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
 
     // RFC 1006 section 6: version 3, reserved, then the length of the
     // whole packet, header included. The smallest TPDU, a class 0 data

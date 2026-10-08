@@ -2539,9 +2539,10 @@ fn declared_total(b: &[u8]) -> usize {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{chunks, decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
     fn msg(id: u32, op: Op) -> Message {
         Message {
@@ -4318,7 +4319,8 @@ mod tests {
 
     #[test]
     fn codec_frames_obey_small_limits_and_report_once() {
-        use fictionet::stdlib::codec::{Fail, Stream, contract};
+        use fictionet::stdlib::codec::{Fail, Stream};
+        use fictionet::stdlib::test_support::contract;
         let bytes = Message {
             id: 1,
             op: Op::UnbindRequest,
@@ -4343,7 +4345,8 @@ mod tests {
 
     #[test]
     fn codec_message_writer_rolls_back() {
-        use fictionet::stdlib::codec::{Wire, contract};
+        use fictionet::stdlib::codec::{Wire};
+        use fictionet::stdlib::test_support::contract;
         let mut message = Message {
             id: 1,
             op: Op::UnbindRequest,

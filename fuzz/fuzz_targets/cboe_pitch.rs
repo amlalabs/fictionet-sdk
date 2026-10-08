@@ -21,9 +21,9 @@ use fictionet::stdlib::cboe_pitch::Message;
 use fictionet::stdlib::cboe_pitch::Unit;
 use fictionet::stdlib::codec::{
     Wire,
-    contract::{check_decode, check_wire, check_wire_value},
-    test_support::decode_all,
 };
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;

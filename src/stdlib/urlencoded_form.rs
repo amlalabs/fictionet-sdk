@@ -554,8 +554,10 @@ impl Decode for Fields {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream, contract, pump};
-    use fictionet::stdlib::codec::{Lcg, test_support::decode_all};
+    use fictionet::stdlib::codec::{Fail, Stream, pump};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::test_support::decode_all;
 
     fn check(input: &[u8]) {
         contract::check_decode_with_alloc_limit(Fields::new, input, 2 * (MAX_INPUT + 1));

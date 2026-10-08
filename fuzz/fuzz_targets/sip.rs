@@ -1,7 +1,10 @@
 //! SIP messages and header values through codec contracts.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::sip::{
     CSeq, Contacts, Error, Messages, MAX_BODY, MAX_HEAD, MAX_MESSAGE, Message, NameAddr, Param, Scheme, Uri, Via,
 };

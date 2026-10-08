@@ -1236,9 +1236,10 @@ pub fn unix_path(addr: &[u8; UNIX_ADDR_LEN]) -> &[u8] {
 mod tests {
     use super::*;
     use codec::{
-        Lcg, Stream, contract,
-        test_support::{chunks, decode_all, mutate},
+        Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
     fn tcp4() -> Header {
         Header::V2(V2 {
@@ -1607,16 +1608,11 @@ mod tests {
             .with_checksum().unwrap().to_bytes().unwrap()
     }
 
-    fn refused<T: Wire<WriteError = Error>>(value: T) {
-        let mut bytes = vec![1, 2];
-        assert_eq!(value.write(&mut bytes), Err(Error::Unwritable));
-        assert_eq!(bytes, [1, 2]);
-    }
 
     #[test]
     fn strict_writers_preserve_every_field() {
         for rest in [b" a\nb".to_vec(), vec![b' '; V1_MAX_UNKNOWN_REST + 1], b"foo".to_vec()] {
-            refused(Header::V1(V1::Unknown(rest)));
+            assert_eq!(contract::check_refused(&Header::V1(V1::Unknown(rest))), Error::Unwritable);
         }
         for rest in [b" \r".to_vec(), vec![b' '; V1_MAX_UNKNOWN_REST]] {
             let header = Header::V1(V1::Unknown(rest));
@@ -1629,10 +1625,10 @@ mod tests {
             Tlv::Other { kind: tlv_type::SSL, value: vec![] },
             Tlv::Ssl(Ssl { client: 0, verify: 1, tlvs: vec![SslTlv::Cipher(vec![3; 70_000])] }),
             Tlv::Ssl(Ssl { client: 0, verify: 1, tlvs: vec![SslTlv::Other { kind: tlv_type::SSL_CN, value: vec![] }] })] {
-            refused(Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs: vec![tlv] }));
+            assert_eq!(contract::check_refused(&Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs: vec![tlv] })), Error::Unwritable);
         }
         for tlvs in [vec![Tlv::Noop(vec![0; 40_000]); 2], vec![Tlv::Crc32c(0); 2], vec![Tlv::Crc32c(0)]] {
-            refused(Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs }));
+            assert_eq!(contract::check_refused(&Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs })), Error::Unwritable);
         }
         let h = Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs: vec![Tlv::Noop(vec![0; MAX_TLV_VALUE])] });
         let bytes = h.to_bytes().unwrap();

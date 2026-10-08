@@ -1627,9 +1627,10 @@ fn write_domain(out: &mut String, s: &str, err: Error, spaces: bool) -> Result<(
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn mailbox(name: Option<&str>, local: &str, domain: &str) -> Mailbox {
         Mailbox { name: name.map(str::to_string), local: local.to_string(), domain: domain.to_string() }
@@ -3083,7 +3084,7 @@ mod tests {
     #[test]
     fn lcg_fuzz() {
         let mut rng = Lcg::new(0x5e_ed1f);
-        for _ in 0..fictionet::stdlib::codec::test_support::rounds(1000) {
+        for _ in 0..fictionet::stdlib::test_support::rounds(1000) {
             let mut data = random_message(&mut rng);
             mutate(&mut rng, &mut data);
             check(&data);
@@ -3095,7 +3096,7 @@ mod tests {
             }
         }
         // Fully random bytes, too.
-        for _ in 0..fictionet::stdlib::codec::test_support::rounds(500) {
+        for _ in 0..fictionet::stdlib::test_support::rounds(500) {
             let data: Vec<u8> = rng.bytes(120);
             check(&data);
             check_value(&String::from_utf8_lossy(&data));

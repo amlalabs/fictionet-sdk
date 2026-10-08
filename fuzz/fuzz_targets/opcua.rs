@@ -3,8 +3,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::codec::{Wire, test_support::decode_all};
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::opcua::{
     Binary, Chunk, ChunkType, DataValue, DiagnosticInfo, Error, ExpandedNodeId,
     ExtensionObject, Limits, LocalizedText, Message, MessageType, NodeId, QualifiedName, Reader,
@@ -74,7 +75,7 @@ fuzz_target!(|data: &[u8]| {
     };
     check_wire_value(&chunk);
 
-    fictionet::stdlib::codec::contract::check_decode_with_held_limit(
+    fictionet::stdlib::test_support::contract::check_decode_with_held_limit(
         || Messages::with_limits(limits),
         data,
         limits.message_limit() as usize,

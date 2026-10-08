@@ -4,8 +4,9 @@
 
 use fictionet::stdlib::codec::Frames;
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::codec::{Wire, test_support::decode_all};
+use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::modbus::{Exception, Frame, MAX_PDU, Request, Response, function};
 use libfuzzer_sys::fuzz_target;
 

@@ -4,11 +4,12 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::contract::{check_decode_with_alloc_limit, check_wire, check_wire_value};
+use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_wire, check_wire_value};
 use fictionet::stdlib::mongodb::{
     Body, Bson, Compressed, Document, Message, Msg, Query, Reply, Sequence, MAX_MESSAGE_SIZE,
 };
-use fictionet::stdlib::codec::{Wire, test_support::decode_all};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 /// Bytes taken one at a time from the input, then zeros.

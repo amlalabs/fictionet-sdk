@@ -647,7 +647,7 @@ mod __wire {
             + std::fmt::Debug
             + PartialEq,
     {
-        use fictionet::stdlib::codec::contract;
+        use fictionet::stdlib::test_support::contract;
         let mut successes = 0;
         for seed in 0..32 {
             let mut s = Sampler::seed(seed);
@@ -675,7 +675,7 @@ mod __wire {
         T: Codec + std::fmt::Debug + PartialEq,
         D: fictionet::stdlib::codec::Decode<Item = T, Error = Error>,
     {
-        use fictionet::stdlib::codec::contract;
+        use fictionet::stdlib::test_support::contract;
         let mut successes = 0;
         for seed in 0..32 {
             let mut s = Sampler::seed(seed);

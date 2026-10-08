@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::gre::{Header, Packet};
-use fictionet::stdlib::{codec::{Wire, Collect, contract}, gre};
+use fictionet::stdlib::{codec::{Wire, Collect}, test_support::contract, gre};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

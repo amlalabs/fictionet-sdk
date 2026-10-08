@@ -2265,9 +2265,10 @@ fn sorted(contents: &[u8], order: Order) -> Result<Vec<u8>, Error> {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{chunks, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, mutate};
 
     /// Writes `e` again with a [`Writer`], if every value in it is one the
     /// writer has a method for. Read under DER, the copy must be the same
@@ -3550,7 +3551,8 @@ mod tests {
 
     #[test]
     fn codec_wire_is_exact_and_transactional() {
-        use fictionet::stdlib::codec::{Wire, contract};
+        use fictionet::stdlib::codec::Wire;
+        use fictionet::stdlib::test_support::contract;
         for bytes in [&[5, 0][..], &[0x30, 0x80, 5, 0, 0, 0], &[4], &[5, 0, 5, 0]] {
             contract::check_wire::<Frame>(bytes);
             contract::check_wire_value(&Frame(bytes.to_vec()));
@@ -3566,7 +3568,8 @@ mod tests {
 
     #[test]
     fn codec_indefinite_scan_survives_compaction() {
-        use fictionet::stdlib::codec::{Stream, contract};
+        use fictionet::stdlib::codec::Stream;
+        use fictionet::stdlib::test_support::contract;
         let mut w = Writer::new();
         w.octet_string(&[1; 256]);
         let first = w.finish().unwrap();

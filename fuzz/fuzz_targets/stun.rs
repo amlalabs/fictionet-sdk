@@ -2,7 +2,8 @@
 //! datagrams and TCP streams.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Stream, Wire, contract};
+use fictionet::stdlib::codec::{Decode, Stream, Wire};
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::stun::{Attribute, Frames, MAX_VALUE, Message, answer_binding};
 use libfuzzer_sys::fuzz_target;
 

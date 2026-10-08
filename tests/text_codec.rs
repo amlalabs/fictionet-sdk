@@ -2,9 +2,10 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
-    self, Decode, Fail, Lcg, Step, Stream, Wire, contract, finish, pump,
-    test_support::{decode_all, mutate},
+    self, Decode, Fail, Lcg, Step, Stream, Wire, finish, pump,
 };
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::{decode_all, mutate};
 use fictionet::stdlib::{ftp, memcache, whois};
 use std::fmt::Debug;
 

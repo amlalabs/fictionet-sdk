@@ -1,7 +1,10 @@
 //! IMAP literals, refusal decisions, raw lines, and strict wire values.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Step, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::imap::{
     Command, Error, FrameError, Input, Inputs, MAX_HELD, MAX_LINE, MAX_LITERAL, MAX_TEXT,
     Response, Responses, Value,

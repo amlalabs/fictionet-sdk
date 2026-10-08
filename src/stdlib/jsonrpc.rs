@@ -1160,7 +1160,8 @@ impl Decode for Messages {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{contract, test_support::decode_all};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::decode_all;
 
     fn value(text: &str) -> Value {
         Value::parse(text.as_bytes()).unwrap()

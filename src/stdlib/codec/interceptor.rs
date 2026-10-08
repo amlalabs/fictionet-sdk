@@ -489,7 +489,7 @@ fn reserve_output<E>(out: &mut Vec<u8>, added: usize, limit: usize) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::{codec::test_support::decode_all, json, modbus};
+    use fictionet::stdlib::{test_support::decode_all, json, modbus};
 
     #[test]
     fn replacement_writer_gets_remaining_budget_and_stops_on_excess() {

@@ -6,7 +6,7 @@ use fictionet::stdlib::asn1::{
     Class, Element, Elements, Error, Frame, MAX_INPUT, Oid, Reader, Rules, StringKind, Tag, Writer,
     check_generalized_time, check_utc_time, element_len,
 };
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 const KINDS: [StringKind; 11] = [

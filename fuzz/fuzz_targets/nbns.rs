@@ -2,7 +2,8 @@
 //! reads them, and the answers it builds from them.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::nbns::{
     MAX_DATAGRAM, MAX_PACKET, Name, NbEntry, NodeName, NodeType, Packet, Error, RrName,
     decode_first_level, rcode,

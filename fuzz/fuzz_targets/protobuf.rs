@@ -4,7 +4,10 @@
 use fictionet::stdlib::codec::Frames;
 use std::collections::BTreeMap;
 
-use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::protobuf::{Frame, Varint, MAX_MESSAGE, MAX_VARINT_LEN, MAX_FIELDS, Message, Value};
 use libfuzzer_sys::fuzz_target;
 

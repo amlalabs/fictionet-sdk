@@ -5,9 +5,9 @@
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
     Wire,
-    contract::{check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value},
-    test_support::decode_all,
 };
+use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value};
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::memcache::{
     BINARY_HEADER_LEN, Command, Commands, CounterExtras, MAX_BINARY_BUFFERED, MAX_LINE, MAX_TEXT_HELD,
     MetaFlag, MetaStatus, Packet, Response, Responses, Status, StoreExtras, UDP_HEADER_LEN,

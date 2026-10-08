@@ -1445,9 +1445,10 @@ impl From<Truncated> for Error {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract, finish, pump,
-        test_support::{chunks, decode_all, mutate},
+        Fail, Lcg, Stream, finish, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
     const ALL_TYPES: [Type; 12] = [
         Type::Bool,
@@ -1987,7 +1988,7 @@ mod tests {
         let binary = Message { body: vec![Field { id: 1, value: Value::Binary(vec![7; 1 << 20]) }], ..add_call() };
         for (message, protocol, size) in [(dense, Protocol::Compact, 1), (binary, Protocol::Binary, 16)] {
             let bytes = EncodedMessage { message: message.clone(), protocol }.to_bytes().unwrap();
-            fictionet::stdlib::codec::test_support::check_work(
+            fictionet::stdlib::test_support::check_work(
                 EncodedMessages::new, &bytes, EncodedMessages::examined, 32, 16);
             let mut stream = Stream::new(EncodedMessages::new());
             let mut got = Vec::new();
@@ -2247,7 +2248,7 @@ mod tests {
     #[test]
     fn lcg_fuzz() {
         let mut r = Lcg::new(9090);
-        for i in 0..fictionet::stdlib::codec::test_support::rounds(1000) {
+        for i in 0..fictionet::stdlib::test_support::rounds(1000) {
             let m = random_message(&mut r);
             let p = PROTOCOLS[i % 3];
             let b = EncodedMessage { message: m.clone(), protocol: p }.to_bytes().unwrap();

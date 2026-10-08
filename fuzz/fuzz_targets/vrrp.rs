@@ -13,7 +13,7 @@ use fictionet::stdlib::vrrp::{
     Addresses, Advertisement, AdvertisementV2, AdvertisementV3, Endpoints, GROUP_V4, GROUP_V6, MAX_ADDRESSES,
     Error, checksum, checksum_rfc5798,
 };
-use fictionet::stdlib::{codec::{Wire, Collect, Decode, contract}, vrrp};
+use fictionet::stdlib::{codec::{Wire, Collect, Decode}, test_support::contract, vrrp};
 use libfuzzer_sys::fuzz_target;
 
 const LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);

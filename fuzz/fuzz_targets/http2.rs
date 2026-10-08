@@ -1,6 +1,7 @@
 #![no_main]
 use fictionet::stdlib::{
-    codec::{Wire, contract},
+    codec::{Wire},
+    test_support::contract,
     http2,
 };
 use libfuzzer_sys::fuzz_target;

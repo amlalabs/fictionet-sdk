@@ -2,7 +2,8 @@
 //! DTLS server reads them from UDP datagrams.
 #![no_main]
 
-use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::dtls::{
     ClientHello, ContentType, Datagram, Error, Fragment, Fragments, Handshake, HelloVerifyRequest,
     MAX_MESSAGE_LEN, MAX_REASSEMBLY_BYTES, MAX_RECORDS_PER_DATAGRAM, PlainRecord, Reassembler,

@@ -1583,9 +1583,10 @@ line_wire!(LsRefsArg, LsRef, ClientLine, ServerLine);
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     const A: &str = "7217a7c7e582c46cec22a130adf4b9d7d950fba0";
     const B: &str = "1d3fcd5ced445d1abc402225c0b8a1299641f497";

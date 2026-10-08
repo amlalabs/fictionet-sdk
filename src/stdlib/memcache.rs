@@ -2249,9 +2249,11 @@ mod tests {
     use super::*;
 
     use codec::{
-        Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn commands(bytes: &[u8]) -> Vec<Result<Command, Error>> {
         decode_all(Commands::new, bytes).0
@@ -2907,7 +2909,7 @@ mod tests {
 
     #[test]
     fn decoder_takes_many_small_commands_in_linear_time() {
-        use fictionet::stdlib::codec::test_support::assert_linear;
+        use fictionet::stdlib::test_support::assert_linear;
         let one = b"set k 0 0 1\r\nx\r\nget k\r\n";
         assert_linear("memcache commands", 6_250, |n| {
             let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * n).collect();

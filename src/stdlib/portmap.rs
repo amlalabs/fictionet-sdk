@@ -1126,7 +1126,9 @@ fn string(w: &mut Writer, s: &str) -> Result<(), Error> {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
-    use fictionet::stdlib::codec::{Assembled, Stream, Wire, contract, finish, pump, test_support};
+    use fictionet::stdlib::codec::{Assembled, Stream, Wire, finish, pump};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
     use fictionet::stdlib::onc_rpc::{MAX_RECORD, Record, records};
 
     fn rpcb(rng: &mut Lcg) -> Rpcb {

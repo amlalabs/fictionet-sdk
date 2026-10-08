@@ -3,7 +3,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::dhcpv6::{
     DhcpOption, Duid, Frame, HOP_COUNT_LIMIT, MAX_BUFFERED, MAX_MESSAGE, Message, msg,
 };

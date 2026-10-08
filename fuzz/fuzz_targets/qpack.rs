@@ -5,9 +5,9 @@ use fictionet::stdlib::codec::{Frames, Stream};
 
 use fictionet::stdlib::codec::Wire;
 
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::test_support::contract;
 
-use fictionet::stdlib::codec::test_support::decode_all;
+use fictionet::stdlib::test_support::decode_all;
 
 use fictionet::stdlib::codec::try_pump;
 

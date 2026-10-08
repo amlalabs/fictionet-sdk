@@ -1,8 +1,11 @@
 //! TCP record marking through RPC, NFS, and portmap, in both directions.
 
 use fictionet::stdlib::codec::{
-    self, Assembled, Decode, Stream, Wire, contract, finish, pump, test_support::chunks,
+    self, Assembled, Decode, Stream, Wire, finish, pump,
 };
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::chunks;
 use fictionet::stdlib::{nfs, onc_rpc, portmap};
 use onc_rpc::{Accept, Body, Message, Reply};
 

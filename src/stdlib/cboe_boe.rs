@@ -3493,18 +3493,13 @@ fn value(id: FieldId, fcx: &Context<'_>) -> Option<Opt> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::{
         Fail, Lcg,
-        contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value},
-        test_support::{decode_all, mutate},
     };
+    use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value};
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
-    /// Bytes from the specification's hexadecimal examples.
-    fn hex(s: &str) -> Vec<u8> {
-        s.split_whitespace()
-            .map(|b| u8::from_str_radix(b, 16).unwrap())
-            .collect()
-    }
     fn text<const N: usize>(s: &str) -> Text<N> {
         Text::new(s).unwrap()
     }
@@ -4499,7 +4494,7 @@ mod tests {
             server.tick(1_002).unwrap(),
             [Action::Send(ServerHeartbeat::default().into())]
         );
-        assert_eq!(fictionet::stdlib::codec::test_support::check_atomic(
+        assert_eq!(fictionet::stdlib::test_support::check_atomic(
             &mut server, |s| s.tick(1_000), |s| format!("{s:?}")), Err(Error::Time));
         server
             .receive(&ClientHeartbeat::default().into(), 1_003)

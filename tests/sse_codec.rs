@@ -1,9 +1,9 @@
 use fictionet::stdlib::codec::{
     Decode, Fail, Lcg, Stream, StreamEvent, Wire,
-    contract::{check_decode, check_decode_with_held_limit, check_wire, check_wire_value},
     finish, pump,
-    test_support::{chunks, decode_all, mutate, random_chunks},
 };
+use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_held_limit, check_wire, check_wire_value};
+use fictionet::stdlib::test_support::{chunks, decode_all, mutate, random_chunks};
 use fictionet::stdlib::sse::{Event, Events, Limits, Line, RawLines};
 
 fn run<'a, D: Decode>(

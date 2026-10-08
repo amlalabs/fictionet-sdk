@@ -6,7 +6,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use fictionet::Packet;
-use fictionet::stdlib::codec::contract::check_wire;
+use fictionet::stdlib::test_support::contract::check_wire;
 use fictionet::stdlib::{dhcp, icmp};
 use libfuzzer_sys::fuzz_target;
 

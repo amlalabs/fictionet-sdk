@@ -3165,16 +3165,13 @@ impl From<Trailing> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
-    fn hex(s: &str) -> Vec<u8> {
-        s.split_whitespace()
-            .map(|h| u8::from_str_radix(h, 16).unwrap())
-            .collect()
-    }
 
     // Examples from MS-TDS section 4.
 

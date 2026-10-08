@@ -1403,9 +1403,10 @@ fn sha1_block(h: &mut [u32; 5], block: &[u8]) {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        AssembleError, Decode, Fail, Lcg, Stream, contract,
-        test_support::{decode_all, mutate},
+        AssembleError, Decode, Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     // RFC 6455 section 5.7.
     const HELLO: [u8; 7] = [0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f];

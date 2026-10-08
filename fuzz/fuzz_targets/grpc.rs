@@ -3,7 +3,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::{Fail, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Fail, Wire};
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::grpc::{
     Code, ContentType, Error, HEADER_LEN, MAX_MESSAGE, Message, MethodPath, Rejection, Request, Status,
     Timeout, decode_message, encode_message,

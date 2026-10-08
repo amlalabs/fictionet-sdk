@@ -6,7 +6,8 @@
 use fictionet::stdlib::codec::Frames;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::codec::{ Wire, contract};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::radius::{
     Attribute, Code, DataType, Error, Evs, Extended, MAX_PACKET, MAX_VALUE, Packet,
     RESERVED_EXTENDED_TYPES, Value, Vsa,

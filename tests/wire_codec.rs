@@ -2,7 +2,8 @@
 
 use fictionet::stdlib::{
     bacnet,
-    codec::{Wire, contract},
+    codec::{Wire},
+    test_support::contract,
     dtls, l2tp, nbns, ntlmssp, pcp,
 };
 use std::net::Ipv4Addr;

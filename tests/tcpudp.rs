@@ -7,6 +7,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use fictionet::prelude::*;
+use fictionet::stdlib::test_support::thread_cpu_time;
 use fictionet::stdlib::ip::{Fields, checksum, destination, packet_with, source, transport_checksum};
 use fictionet::stdlib::{ConnError, Connection, tcp, udp};
 use fictionet::{Cx, Interface, Packet, RecvError, block_on, pair, run};
@@ -974,12 +975,6 @@ fn boxed_connections_and_write_all() {
     });
 }
 
-fn thread_cpu() -> Duration {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
-}
-
 /// Endpoints with connections in many states use no CPU while nothing
 /// happens.
 #[test]
@@ -1020,9 +1015,9 @@ fn idle_endpoints_stay_idle() {
         }
         let _waiting = ea.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
         fcx.sleep(Duration::from_millis(100)).await?;
-        let before = thread_cpu();
+        let before = thread_cpu_time();
         fcx.sleep(Duration::from_secs(1)).await?;
-        let used = thread_cpu() - before;
+        let used = thread_cpu_time() - before;
         eprintln!("one idle second used {used:?} of CPU");
         assert!(used < Duration::from_millis(20), "idle endpoints used {used:?}");
         Ok(())

@@ -5,7 +5,8 @@
 use fictionet::stdlib::onc_rpc::{AuthSys, Body, MAX_ARRAY_RESERVE, Message, Reader, encode_fragments};
 use fictionet::stdlib::portmap::{PmapResult, Request, procedure};
 use fictionet::stdlib::{
-    codec::{Assembled, Wire, contract, test_support::decode_all},
+    codec::{Assembled, Wire},
+    test_support::contract, test_support::decode_all,
     onc_rpc,
 };
 use libfuzzer_sys::fuzz_target;

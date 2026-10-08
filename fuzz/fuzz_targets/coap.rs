@@ -27,7 +27,9 @@ use fictionet::stdlib::coap::option;
 
 use fictionet::stdlib::coap::peek_header;
 use libfuzzer_sys::fuzz_target;
-use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * MAX_BUFFERED);

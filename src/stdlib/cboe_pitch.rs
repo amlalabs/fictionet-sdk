@@ -1849,18 +1849,13 @@ fn level(price: Price, a: &Aggregate) -> Level {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::{
         Fail, Lcg,
-        contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value},
-        test_support::{decode_all, mutate},
     };
+    use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value};
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
-    /// Bytes from the specification's hexadecimal examples.
-    fn hex(s: &str) -> Vec<u8> {
-        s.split_whitespace()
-            .map(|b| u8::from_str_radix(b, 16).unwrap())
-            .collect()
-    }
     fn sym6(s: &str) -> Symbol6 {
         Alpha::right_padded(s).unwrap()
     }

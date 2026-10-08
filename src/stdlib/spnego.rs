@@ -891,9 +891,10 @@ impl Decode for Frames {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract,
-        test_support::{chunks, decode_all, mutate},
+        Fail, Lcg, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
     /// The hint name Windows and Samba send in a NegTokenInit2.
     const HINT: &[u8] = b"not_defined_in_RFC4178@please_ignore";
@@ -1677,7 +1678,8 @@ mod tests {
 
     #[test]
     fn codec_frames_bound_headers_and_report_once() {
-        use fictionet::stdlib::codec::{Decode, Fail, Stream, contract};
+        use fictionet::stdlib::codec::{Decode, Fail, Stream};
+        use fictionet::stdlib::test_support::contract;
         assert_eq!(Frames::new().capacity(), MAX_TOKEN);
         let mut stream = Stream::new(Frames::new());
         let bytes = [GSS_TAG, 0x83, 1, 0, 0];
@@ -1690,7 +1692,8 @@ mod tests {
 
     #[test]
     fn codec_wire_domain_excludes_hint_addresses() {
-        use fictionet::stdlib::codec::{Wire, contract};
+        use fictionet::stdlib::codec::Wire;
+        use fictionet::stdlib::test_support::contract;
         // A received hint address is outside the Wire domain.
         let bytes = [0xa0, 10, 0x30, 8, 0xa3, 6, 0x30, 4, 0xa1, 2, 4, 0];
         let token = NegotiationToken::Init(NegTokenInit {

@@ -139,6 +139,7 @@ pub(super) fn register(registry: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::test_support::hex;
     use crate::observe::{Conversation, Observed, Place};
     use http2::PREFACE as HTTP2_PREFACE;
 
@@ -194,10 +195,6 @@ mod tests {
         notes(d).iter().any(|(n, v)| n == name && v == value)
     }
 
-    fn hex(s: &str) -> Vec<u8> {
-        let s: String = s.split_whitespace().collect();
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
-    }
 
     const X_OLD: &str = "4001 7803 6f6c 64";
     const X_NEW: &str = "4001 7803 6e65 77";
@@ -382,7 +379,7 @@ mod tests {
     /// make a chunk of n frames take n^2 work.
     #[test]
     fn many_tiny_http2_frames_in_one_chunk_take_linear_time() {
-        use fictionet::stdlib::codec::test_support::assert_linear;
+        use fictionet::stdlib::test_support::assert_linear;
         let one = frame(0xff, 0, 1, &[]);
         assert_linear("HTTP/2 frames in one chunk", 20_000, |n| {
             let bytes = one.repeat(n);

@@ -1,7 +1,10 @@
 //! Syslog messages and TCP frames through the shared codec contracts.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::syslog::{
     BsdMessage, BsdTimestamp, Entry, Frame, Frames, Framing, MAX_BUFFERED, MAX_MESSAGE_LEN, Message, Priority,
     SdElement, Timestamp,

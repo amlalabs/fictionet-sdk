@@ -998,7 +998,8 @@ fn body_layer(d: &mut Decoded, total: u64, seen: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Lcg, Stream, contract::check_decode};
+    use fictionet::stdlib::codec::{Lcg, Stream};
+    use fictionet::stdlib::test_support::contract::check_decode;
 
     #[test]
     fn long_http_methods_keep_only_bounded_framing_state() {

@@ -15,7 +15,8 @@ mod budgets;
 mod edges;
 
 use fictionet::stdlib::{
-    codec::{Decode, Lcg, Step, Wire, contract},
+    codec::{Decode, Lcg, Step, Wire},
+    test_support::contract,
     onc_rpc::{self, Reader, Writer},
 };
 
@@ -97,7 +98,7 @@ fn xdr_differential_examples_generated_values_and_mutated_inputs() {
         }
         let mut mutated = bytes;
         for _ in 0..4 {
-            fictionet::stdlib::codec::test_support::mutate(&mut rng, &mut mutated);
+            fictionet::stdlib::test_support::mutate(&mut rng, &mut mutated);
             assert_eq!(
                 xdr::Record::parse(&mutated).ok(),
                 dynamic_read(&mutated).ok()
@@ -320,7 +321,7 @@ fn generator_handles_mutated_and_arbitrary_json() {
     for _ in 0..512 {
         let mut bytes = seed.to_vec();
         for _ in 0..4 {
-            fictionet::stdlib::codec::test_support::mutate(&mut rng, &mut bytes);
+            fictionet::stdlib::test_support::mutate(&mut rng, &mut bytes);
         }
         let _ = generate(
             "ir",

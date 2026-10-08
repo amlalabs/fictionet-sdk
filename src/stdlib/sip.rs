@@ -2001,11 +2001,12 @@ mod tests {
     }
 
     use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream, contract};
+    use fictionet::stdlib::codec::{Fail, Stream};
+    use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::codec::{
         Lcg,
-        test_support::{decode_all, mutate},
     };
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn wire_text<T: Wire<WriteError = Error>>(value: &T) -> Result<String, Error> {
         String::from_utf8(value.to_bytes()?).map_err(|_| Error::Utf8)
@@ -2886,7 +2887,7 @@ mod tests {
             b"<sip:a@b>;expires=60, \"C, D\" <sip:c@d>, mailto:x@y;q=0.1",
         ];
         let mut read = 0;
-        let rounds = fictionet::stdlib::codec::test_support::rounds(1500);
+        let rounds = fictionet::stdlib::test_support::rounds(1500);
         for round in 0..rounds {
             let base: &[u8] = match round % 3 {
                 0 => &stream,
@@ -2903,7 +2904,7 @@ mod tests {
         // rounds, 2800 in 6000); allow a small margin.
         assert!(read > rounds * 43 / 100, "only {read} messages read in {rounds} rounds");
         // Mix arbitrary bytes into text as well as checking byte noise.
-        for _ in 0..fictionet::stdlib::codec::test_support::rounds(750) {
+        for _ in 0..fictionet::stdlib::test_support::rounds(750) {
             let mut text = rng.text(200).into_bytes();
             let at = rng.index(text.len().saturating_add(1));
             text.splice(at..at, rng.bytes(4));

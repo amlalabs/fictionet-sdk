@@ -2,7 +2,8 @@
 
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::{
-    codec::{self, Decode, Fail, Stream, Wire, contract, finish, pump, test_support::chunks},
+    codec::{self, Decode, Fail, Stream, Wire, finish, pump},
+    test_support::contract, test_support::{self, chunks},
     http3::{self, Endpoint, Frame, Session, StreamHeader, StreamItem},
     qpack::{
         self, DecoderInstruction as DI, EncoderInstruction as EI, Field, Representation as Rep, SectionResult, Table,
@@ -705,7 +706,7 @@ fn qpack_instructions_table_sections_and_acknowledgments() {
     );
     {
         let mut table = Table::new(4096);
-        let (items, failure) = codec::test_support::decode_all(Frames::<qpack::EncoderInstruction>::new, &bytes);
+        let (items, failure) = test_support::decode_all(Frames::<qpack::EncoderInstruction>::new, &bytes);
         assert!(failure.is_none());
         let decoded: Vec<_> = items.into_iter().map(Result::unwrap).collect();
         for ins in &decoded {
@@ -740,7 +741,7 @@ fn qpack_instructions_table_sections_and_acknowledgments() {
         held.push(blocked).unwrap();
         assert!(held.next_ready(&table).is_none());
         let late = wire(&EI::Duplicate(3));
-        let (items, failure) = codec::test_support::decode_all(Frames::<qpack::EncoderInstruction>::new, &late);
+        let (items, failure) = test_support::decode_all(Frames::<qpack::EncoderInstruction>::new, &late);
         assert!(failure.is_none());
         for item in items {
             table.apply(item.unwrap()).unwrap();
@@ -769,7 +770,7 @@ fn qpack_instructions_table_sections_and_acknowledgments() {
             &ack_bytes,
             2 * (Frames::<qpack::DecoderInstruction>::new)().capacity(),
         );
-        let (items, failure) = codec::test_support::decode_all(Frames::<qpack::DecoderInstruction>::new, &ack_bytes);
+        let (items, failure) = test_support::decode_all(Frames::<qpack::DecoderInstruction>::new, &ack_bytes);
         assert!(failure.is_none());
         let got: Vec<_> = items.into_iter().map(Result::unwrap).collect();
         assert_eq!(got, ack_values);
@@ -1031,7 +1032,7 @@ fn http3_frame_round_trips_and_allocation_contract() {
         contract::check_wire::<Frame>(&wire(frame));
     }
     contract::check_decode_with_alloc_limit(Frames::<http3::Frame>::new, &bytes, 2 * (Frames::<http3::Frame>::new)().capacity());
-    let (items, failure) = codec::test_support::decode_all(Frames::<http3::Frame>::new, &bytes);
+    let (items, failure) = test_support::decode_all(Frames::<http3::Frame>::new, &bytes);
     assert!(failure.is_none());
     assert_eq!(items.into_iter().map(Result::unwrap).collect::<Vec<_>>(), frames);
 }

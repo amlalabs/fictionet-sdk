@@ -4,7 +4,7 @@
 use fictionet::stdlib::rip::{
     Entries, MAX_PREFIX_LEN, Message, NgEntries, NgEntry, NgMessage, Received,
 };
-use fictionet::stdlib::{codec::{Wire, Collect, Stream, contract}, rip};
+use fictionet::stdlib::{codec::{Wire, Collect, Stream}, test_support::contract, rip};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

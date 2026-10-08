@@ -3,7 +3,9 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::{Fail, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Fail, Wire};
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::wake_on_lan::{
     Error, MAX_PACKET_LEN, MAX_PAYLOAD, Mac, MagicPacket, MagicPackets, PACKET_LEN, Password, wakes,
 };

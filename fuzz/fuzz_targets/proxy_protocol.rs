@@ -2,7 +2,7 @@
 //! reads them at the start of a connection.
 #![no_main]
 
-use fictionet::stdlib::{codec::{contract, Wire}, proxy_protocol::Headers};
+use fictionet::stdlib::{codec::Wire, test_support::contract, proxy_protocol::Headers};
 
 use fictionet::stdlib::proxy_protocol::{Addresses, Command, Header, Ssl, SslTlv, Tlv, Transport, MAX_HEADER_LEN, MAX_TLV_VALUE, V1, V2};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};

@@ -1,6 +1,9 @@
 #![no_main]
 
-use fictionet::stdlib::codec::{Stream, Wire, contract, test_support};
+use fictionet::stdlib::codec::{Stream, Wire};
+use fictionet::stdlib::test_support::contract;
+
+use fictionet::stdlib::test_support;
 use fictionet::stdlib::http1::{Limits, Response, Responses};
 use libfuzzer_sys::fuzz_target;
 

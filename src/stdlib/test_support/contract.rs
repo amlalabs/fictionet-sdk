@@ -20,8 +20,8 @@ extern crate alloc;
 use alloc::{rc::Rc, vec::Vec};
 use fictionet::stdlib::codec::{
     Buffer, Decode, Fail, Lcg, Step, Stream, Wire,
-    test_support::{chunks, random_chunks},
 };
+use fictionet::stdlib::test_support::{chunks, random_chunks};
 use core::{cell::RefCell, fmt::Debug};
 
 /// Maximum retained items in one harness run. Limits the harness itself
@@ -339,6 +339,23 @@ where
         );
     }
 }
+/// Checks that a test value refuses writing without changing the destination.
+/// Also checks that writing into a new vector fails. Returns the write error.
+///
+/// ```
+/// use fictionet::stdlib::{smtp, test_support::contract};
+/// let value = smtp::Request::Helo("bad\r\nhost".into());
+/// assert_eq!(contract::check_refused(&value), smtp::Error::Unwritable);
+/// ```
+pub fn check_refused<M: Wire + Debug>(value: &M) -> M::WriteError {
+    let prefix = [0x5a, 0xc3, 0x17];
+    let mut out = prefix.to_vec();
+    let error = value.write(&mut out).expect_err("test value must refuse writing");
+    assert_eq!(out, prefix, "writer changed destination on error: {value:?}");
+    assert!(value.to_bytes().is_err(), "refused value wrote into a new vector: {value:?}");
+    error
+}
+
 /// Checks a constructed value's strict, transactional writer. Successful
 /// output must reparse as the same value and re-encode identically. Refused
 /// values must leave a nonempty destination unchanged. Panics on failure.
@@ -392,7 +409,21 @@ pub fn check_wire<M: Wire + PartialEq + Debug>(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::tests::{Fault, TestError};
+    use core::fmt::Error as TestError;
+
+    enum Fault { Error, Need }
+    impl Decode for Fault {
+        type Item = ();
+        type Error = TestError;
+        const NAME: &'static str = "fault";
+        fn capacity(&self) -> usize { 4 }
+        fn decode(&mut self, _: &[u8], _: bool) -> Result<Step<()>, TestError> {
+            match self {
+                Self::Error => Err(TestError),
+                Self::Need => Ok(Step::Need),
+            }
+        }
+    }
 
     #[test]
     #[should_panic(expected = "decoder called after Err or End")]

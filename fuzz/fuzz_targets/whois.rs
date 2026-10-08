@@ -6,9 +6,9 @@
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::{
     Wire,
-    contract::{check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value},
-    test_support::decode_all,
 };
+use fictionet::stdlib::test_support::contract::{check_decode_with_alloc_limit, check_decode_with_held_limit, check_wire, check_wire_value};
+use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::whois::{
     Field, MAX_QUERY, MAX_RESPONSE, RESPONSE_WINDOW, Queries, Query, Referral,
     ReferralKind, Response, CollectedResponses, find_referral, parse_fields,

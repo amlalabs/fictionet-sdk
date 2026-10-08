@@ -1813,7 +1813,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::contract;
+    use fictionet::stdlib::test_support::contract;
 
     fn raw(kind: u8, flags: u8, stream: u32, body: &[u8]) -> Vec<u8> {
         let mut out = FrameHeader {

@@ -712,15 +712,9 @@ impl From<Trailing> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::prefix_int::Integer;
 
-    fn hex(s: &str) -> Vec<u8> {
-        let s: String = s.split_whitespace().collect();
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
 
     fn pairs(h: &[Header]) -> Vec<(&str, &str)> {
         h.iter()
@@ -1089,7 +1083,7 @@ mod tests {
 
     #[test]
     fn strict_literal_writers() {
-        use fictionet::stdlib::codec::contract;
+        use fictionet::stdlib::test_support::contract;
         contract::check_wire_value(&StringLiteral(vec![0; MAX_STRING + 1]));
         contract::check_wire_value(&Field::new(vec![0; MAX_STRING + 1], b""));
         contract::check_wire_value(&Field::new(b"", vec![0; MAX_STRING + 1]));

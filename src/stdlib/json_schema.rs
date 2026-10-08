@@ -3540,7 +3540,8 @@ fn multiply_small(d: &Decimal, n: i64) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{contract, test_support};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
     use fictionet::stdlib::json;
 
     fn value(text: &str) -> Value {

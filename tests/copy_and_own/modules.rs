@@ -18,8 +18,6 @@ macro_rules! protocols {
         pub mod buffer;
         #[path = "../../src/stdlib/codec/combinators.rs"]
         pub mod combinators;
-        #[path = "../../src/stdlib/codec/contract.rs"]
-        pub mod contract;
         #[path = "../../src/stdlib/codec/demux.rs"]
         pub mod demux;
         #[path = "../../src/stdlib/codec/frames.rs"]
@@ -32,7 +30,7 @@ macro_rules! protocols {
         pub mod reader;
         #[path = "../../src/stdlib/codec/stream.rs"]
         pub mod stream;
-        #[path = "../../src/stdlib/codec/test_support.rs"]
+        #[path = "../../src/stdlib/test_support/mod.rs"]
         pub mod test_support;
         #[path = "../../src/stdlib/link.rs"]
         pub mod link;

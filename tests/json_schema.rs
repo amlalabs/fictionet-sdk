@@ -1,5 +1,7 @@
 //! Schema validation and mock values using only the public API.
-use fictionet::stdlib::codec::{Wire, contract, test_support};
+use fictionet::stdlib::codec::Wire;
+use fictionet::stdlib::test_support::contract;
+use fictionet::stdlib::test_support;
 use fictionet::stdlib::json::{self, Value};
 use fictionet::stdlib::json_schema::{
     Dialect, ErrorMode, GenerationLimits, Options, Schema, ValidationKind,

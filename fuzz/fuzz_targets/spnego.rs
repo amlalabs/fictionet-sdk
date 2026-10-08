@@ -2,7 +2,8 @@
 //! them from the agent and writes them back.
 #![no_main]
 
-use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
+use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::spnego::{
     Error, Frames, InitialContextToken, MAX_TOKEN, Mech, NegotiationToken, token_len,
 };

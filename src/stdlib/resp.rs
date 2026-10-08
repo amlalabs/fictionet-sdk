@@ -1668,11 +1668,13 @@ fn fmt_double(f: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support;
     use super::*;
     use codec::{
-        Lcg, Step as Decoded, Stream, contract,
-        test_support::{decode_all, mutate},
+        Lcg, Step as Decoded, Stream,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn value_step(b: &[u8], limits: Limits) -> Result<Decoded<Value>, Error> {
         Values::with_limits(limits).decode(b, false)
@@ -2502,7 +2504,7 @@ mod tests {
     fn fuzz_loop() {
         let mut r = Lcg::new(0x5eed);
         let small = Limits { bulk: 6, elements: 3, depth: 2, line: 6, frame: 30 };
-        let rounds = codec::test_support::rounds(1250);
+        let rounds = test_support::rounds(1250);
         for _ in 0..rounds {
             let mut b = Vec::new();
             for _ in 0..1 + r.index(3) {
@@ -2689,7 +2691,7 @@ mod tests {
             assert_eq!(commands.len(), 1);
             assert_eq!(commands[0].args.len(), n);
         };
-        codec::test_support::assert_linear("RESP big values", 12_500, run);
+        test_support::assert_linear("RESP big values", 12_500, run);
     }
 
     /// Feeds a stream one byte at a time, draining it after each byte, until

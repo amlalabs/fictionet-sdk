@@ -2818,9 +2818,10 @@ fictionet::der_wire!(asn1, impl Wire for Crl, Error, Error::Unwritable, [
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract, finish as finish_stream, pump,
-        test_support::{chunks, decode_all, mutate},
+        Fail, Lcg, Stream, finish as finish_stream, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
     /// A self-signed P-256 certificate made with OpenSSL, with every
     /// extension this module reads.
@@ -4360,7 +4361,8 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
 
     #[test]
     fn codec_pem_wire_is_exact_and_transactional() {
-        use fictionet::stdlib::codec::{Wire, contract};
+        use fictionet::stdlib::codec::Wire;
+        use fictionet::stdlib::test_support::contract;
         let block = PemBlock { label: "TEST".into(), data: vec![1, 2, 3, 4] };
         contract::check_wire_value(&block);
         let bytes = <PemBlock as Wire>::to_bytes(&block).unwrap();
@@ -4381,7 +4383,8 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
 
     #[test]
     fn codec_pem_scans_without_retaining_partial_bytes() {
-        use fictionet::stdlib::codec::{Decode, Fail, Stream, contract, finish, pump};
+        use fictionet::stdlib::codec::{Decode, Fail, Stream, finish, pump};
+        use fictionet::stdlib::test_support::contract;
         let text = b"-----BEGIN TEST-----\r\nAQID\r\n-----END TEST-----\r\n";
         contract::check_decode_with_alloc_limit(PemBlocks::new, text, 2 * PemBlocks::new().capacity());
         for limit in 0..=text.len() {

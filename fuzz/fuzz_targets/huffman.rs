@@ -1,7 +1,8 @@
 //! Shared HPACK/QPACK Huffman contracts and byte round trips.
 #![no_main]
 use fictionet::stdlib::{
-    codec::{Wire, contract},
+    codec::{Wire},
+    test_support::contract,
     huffman::{self, HuffmanString},
 };
 use libfuzzer_sys::fuzz_target;

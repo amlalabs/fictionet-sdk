@@ -1490,9 +1490,10 @@ impl From<Truncated> for Error {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream, contract, pump,
-        test_support::{chunks, decode_all, mutate},
+        Fail, Lcg, Stream, pump,
     };
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
     }
@@ -2324,7 +2325,7 @@ mod tests {
             value
         };
         let list = |g: &mut Lcg| (0..g.index(6)).map(|_| text(g, 80)).collect();
-        for _ in 0..fictionet::stdlib::codec::test_support::rounds(1000) {
+        for _ in 0..fictionet::stdlib::test_support::rounds(1000) {
             for sample in &payloads {
                 let mut payload = sample.clone();
                 mutate(&mut g, &mut payload);
