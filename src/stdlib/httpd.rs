@@ -55,7 +55,9 @@
 //! same events, with the same [`Limits`], the same charges to the
 //! connection's [`Budget`] and the same seeded randomness. When the
 //! stdlib's own HTTP/2 lands, it becomes a second `Service` here and
-//! [`serve_connection`] picks it; handlers do not change.
+//! [`serve_connection`] picks it; handlers do not change. HTTP/2 request body
+//! and write stall timeouts use Fictionet deadlines. Hyper runs without a
+//! timer, with keep-alive pings and adaptive windows disabled.
 //!
 //! ```
 //! use bytes::Bytes;
@@ -1657,17 +1659,11 @@ mod h2 {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let io = Io::new(fcx, conn, broke.clone(), opts.limits.write_timeout);
         let route = Route::new(fcx, handler, &info, opts);
-        // In a browser, `std::time::Instant::now` panics. hyper's timer API
-        // is in `Instant`, so there hyper runs without a timer. hyper never
-        // writes a `Date` header, which it would take from the host's
-        // clock: the route writes the world's.
-        let browser = cfg!(target_arch = "wasm32");
         let mut builder = hyper::server::conn::http2::Builder::new(Executor { fcx: fcx.clone() });
+        // hyper would take a `Date` header from the host's clock: the route
+        // writes the world's.
         builder.auto_date_header(false);
         builder.max_concurrent_streams(opts.limits.streams);
-        if !browser {
-            builder.timer(CxTimer { fcx: fcx.clone() });
-        }
         // hyper reads all the time on HTTP/2, so a reset ends it on its own.
         let served = builder.serve_connection(io, route);
         finish(fcx, &info, &broke, fcx.race(None, served).await)
@@ -2172,6 +2168,74 @@ mod h2 {
     mod tests {
         use super::*;
         use hyper::rt::Timer;
+
+        struct StalledBody {
+            input: Bytes,
+        }
+
+        impl Connection for StalledBody {
+            fn poll_read(&mut self, _: &Cx, _: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, ConnError>> {
+                if self.input.is_empty() {
+                    return Poll::Pending;
+                }
+                let n = buf.len().min(self.input.len());
+                buf[..n].copy_from_slice(&self.input.split_to(n));
+                Poll::Ready(Ok(n))
+            }
+
+            fn poll_write(&mut self, _: &Cx, _: &mut Context<'_>, data: &[u8]) -> Poll<Result<usize, ConnError>> {
+                Poll::Ready(Ok(data.len()))
+            }
+
+            fn poll_shutdown(&mut self, _: &Cx, _: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        #[test]
+        fn http2_body_timeout_uses_the_fictionet_deadline() {
+            fictionet::block_on(fictionet::run(|fcx| async move {
+                let mut input = PREFACE.to_vec();
+                input.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+                // POST / over HTTP, with no END_STREAM on the headers.
+                let block = b"\x83\x86\x84\x01\x01a";
+                input.extend_from_slice(&[0, 0, block.len() as u8, 1, 4, 0, 0, 0, 1]);
+                input.extend_from_slice(block);
+                let conn = StalledBody { input: Bytes::from(input) };
+                let duration = Duration::from_millis(40);
+                let opts = HttpOptions {
+                    limits: Limits { body_timeout: duration, ..Limits::default() },
+                    ..HttpOptions::default()
+                };
+                let handler = Router::new().post("/", |_, _| panic!("a stalled body cannot reach the handler"));
+                let mut served = pin!(serve(&fcx, conn, Arc::new(handler), ConnInfo::default(), &opts));
+                let log = fcx.events();
+                let wait = async {
+                    loop {
+                        if let Some(event) = log.of("http", "request").pop() {
+                            return event;
+                        }
+                        fcx.sleep(Duration::from_millis(1)).await.unwrap();
+                    }
+                };
+                let mut wait = pin!(wait);
+                let event = fcx.race(Some(fcx.now() + Duration::from_secs(2)), poll_fn(|cx| {
+                    assert!(served.as_mut().poll(cx).is_pending());
+                    wait.as_mut().poll(cx)
+                })).await.unwrap();
+                let started = event.get("started").unwrap().as_f64().unwrap();
+                let elapsed = event.at.since_start().as_secs_f64() - started;
+                assert!(elapsed >= duration.as_secs_f64(), "{elapsed}");
+                assert!(elapsed < 1.0, "{elapsed}");
+                assert_eq!(event.str("answer"), Some("timeout"));
+                assert_eq!(event.u64("status"), Some(408));
+                assert_eq!(event.str("version"), Some("HTTP/2.0"));
+                assert_eq!(event.get("complete").and_then(Value::as_bool), Some(true));
+                assert_eq!(log.of("http", "request").len(), 1);
+                assert!(log.of("http", "error").is_empty());
+                Ok(())
+            })).unwrap();
+        }
 
         /// A hyper sleep on a cancelled `Cx` stays pending instead of
         /// firing.
