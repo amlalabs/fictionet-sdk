@@ -14,12 +14,12 @@ services:
   upstream:
     build: *build
     image: fictionet-web:dev
-    command: ["web_world", "--upstream", "80"]
+    command: ["web_fixture", "--upstream", "80"]
 
   world:
     build: *build
     image: fictionet-web:dev
-    command: ["web_world", "/run/fictionet/world.sock", "/run/ca/ca.pem"]
+    command: ["web_fixture", "/run/fictionet/world.sock", "/run/ca/ca.pem"]
     # The world has the host's network (for the proxy). The sandbox never does.
     # NET_ADMIN lets the world raise its socket buffers to attach past the
     # system limit, so a burst of packets is not lost. The world is trusted.

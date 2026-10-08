@@ -14,14 +14,21 @@ COPY benches benches
 COPY codegen codegen
 COPY tests/copy_and_own tests/copy_and_own
 COPY examples examples
+COPY tests/web_fixture tests/web_fixture
+# The hosted example also copies web_world out of this image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-web-target \
-    cargo build --release --features tokio --bin fictionet --example web_world \
-    && cp target/release/fictionet target/release/examples/web_world /usr/local/bin/
+    cargo build --release --features tokio --bin fictionet --example web_world --example web_fixture \
+    && cp target/release/fictionet target/release/examples/web_world target/release/examples/web_fixture /usr/local/bin/
 
 # The world, the real upstream, and attach.
 FROM debian:bookworm-slim AS runtime
-COPY --from=build /usr/local/bin/fictionet /usr/local/bin/web_world /usr/local/bin/
+COPY --from=build /usr/local/bin/fictionet /usr/local/bin/web_world /usr/local/bin/web_fixture /usr/local/bin/
+
+# The fixture as a non-root world for the Kubernetes proxy test.
+FROM runtime AS fixture
+USER 65532:65532
+ENTRYPOINT ["web_fixture"]
 
 # The sandbox: curl, dig, ping and python3, and no special capabilities.
 FROM debian:bookworm-slim AS agent

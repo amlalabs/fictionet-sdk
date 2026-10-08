@@ -7,7 +7,7 @@
 #
 # It boots an outer VM (L1) under QEMU with KVM and -cpu host, so L1 can
 # run VMs of its own. Inside L1, as root, nested-l1.sh runs a world
-# (web_world) and, one after another, QEMU with -netdev tap, Firecracker
+# (web_fixture) and, one after another, QEMU with -netdev tap, Firecracker
 # and Cloud Hypervisor. Each nested guest (L2) is on a TAP device, tap0,
 # and attach redirects tap0's frames to a TAP device of its own. The
 # guest gets its address from attach by DHCP, then checks DNS, HTTPS,
@@ -37,8 +37,8 @@ for f in "$prepared_l1" "$assets/$kernel" "$assets/$fc_bin" "$assets/$ch_bin" "$
     [ -f "$f" ] || skip "$f is missing; run tests/vm/nested.sh --fetch once to make it"
 done
 
-echo "building fictionet and web_world (release)"
-(cd "$repo" && cargo build --quiet --release --features tokio --bin fictionet --example web_world)
+echo "building fictionet and web_fixture (release)"
+(cd "$repo" && cargo build --quiet --release --features tokio --bin fictionet --example web_fixture)
 target="$(target_dir)"
 
 run="$(mktemp -d "$vmdir/nested.XXXXXX")"
@@ -56,7 +56,7 @@ if [ ! -f "$assets_iso" ]; then
     mv "$assets_iso.part" "$assets_iso"
 fi
 genisoimage -quiet -output "$run/run.iso" -volid FNRUN -rock -graft-points \
-    "fictionet=$target/release/fictionet" "web_world=$target/release/examples/web_world" \
+    "fictionet=$target/release/fictionet" "web_fixture=$target/release/examples/web_fixture" \
     "nested-l1.sh=$here/nested-l1.sh" "l2-check.sh=$here/l2-check.sh"
 
 cat > "$run/user-data" <<'EOF'

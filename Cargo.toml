@@ -77,9 +77,16 @@ rcgen = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
-# The examples with tests: `cargo test` runs them with the crate's own.
+# Example targets. `cargo test` also runs those marked with `test = true`.
 [[example]]
 name = "web_world"
+required-features = ["tokio"]
+test = false
+
+# The web test world adds bulk transfers and a real upstream.
+[[example]]
+name = "web_fixture"
+path = "tests/web_fixture/world.rs"
 required-features = ["tokio"]
 test = true
 

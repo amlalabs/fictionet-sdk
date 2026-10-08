@@ -30,7 +30,7 @@ if [ ! -c /dev/kvm ]; then
     exit 0
 fi
 
-"$run/web_world" /run/fictionet/world.sock /run/fictionet/ca.pem > "$work/world.log" 2>&1 &
+"$run/web_fixture" /run/fictionet/world.sock /run/fictionet/ca.pem > "$work/world.log" 2>&1 &
 world_pid=$!
 for _ in $(seq 100); do [ -S /run/fictionet/world.sock ] && break; sleep 0.1; done
 

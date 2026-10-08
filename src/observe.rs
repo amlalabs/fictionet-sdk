@@ -269,9 +269,10 @@
 //! 31.9 ns per packet per hop, against 31.6 ns before the dashboard
 //! existed.
 //!
-//! A 16 MiB HTTPS download from a sandbox through the `web_world` example
-//! ran at a median of 442 MB/s with no observer, 430 MB/s with one
-//! following the graph, and 468 MB/s with one watching the sandbox's link.
+//! A 16 MiB HTTPS download from a sandbox through the web test's world
+//! (`tests/web_fixture`) ran at a median of 442 MB/s with no observer,
+//! 430 MB/s with one following the graph, and 468 MB/s with one watching
+//! the sandbox's link.
 //! Before the dashboard existed it ran at 461 MB/s. Runs varied more than
 //! that, from about 300 to 600 MB/s.
 //!

@@ -122,9 +122,9 @@ machine. Everything under `.vm/` is readable by you alone.
 the tracked files, and untracked ones that are not ignored, so uncommitted
 changes are included. File times are kept, so cargo rebuilds only what changed.
 `vm/guest/build.sh` then builds static musl binaries of `fictionet`, `web_world`,
-`border-world` and `fakewiki-world`, into `/opt/fictionet/bin`. Static binaries
-run in the VM and in any container image, so the demos put them straight into
-images, without a second build.
+`web_fixture`, `border-world` and `fakewiki-world`, into `/opt/fictionet/bin`.
+Static binaries run in the VM and in any container image, so the demos put them
+straight into images, without a second build.
 
 ## Why it is built this way
 

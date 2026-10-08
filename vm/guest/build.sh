@@ -3,7 +3,7 @@
 # tree at /src, as static musl executables. vm/run runs it; so can you,
 # with `vm/run build [sdk] [border] [fakewiki]`.
 #
-#   sdk       fictionet (attach and the other subcommands) and the web_world example
+#   sdk       fictionet, the web_world example and the web_fixture test world
 #   border    border-world, the world of examples/border
 #   fakewiki  fakewiki-world, the world of examples/fakewiki
 #
@@ -30,13 +30,14 @@ put() {
 for what in "${@:-sdk}"; do
     case "$what" in
         sdk)
-            echo "Building fictionet and web_world"
+            echo "Building fictionet, web_world and web_fixture"
             (cd /src && CARGO_TARGET_DIR=/cache/target/sdk cargo build --release --locked --target "$target" \
-                --features tokio --bin fictionet --example web_world)
+                --features tokio --bin fictionet --example web_world --example web_fixture)
             out=/cache/target/sdk/$target/release
             put "$out/fictionet"
             put "$out/examples/web_world"
-            install -m 0755 "$out/fictionet" "$out/examples/web_world" "$pre/out/"
+            put "$out/examples/web_fixture"
+            install -m 0755 "$out/fictionet" "$out/examples/web_world" "$out/examples/web_fixture" "$pre/out/"
             ;;
         border)
             echo "Building border-world"

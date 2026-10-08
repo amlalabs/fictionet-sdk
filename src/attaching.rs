@@ -647,8 +647,9 @@
 //!   `tun3`. `/dev/net/tun` is already there, so attach makes no node.
 //!
 //! Each packet crosses the gVisor kernel twice, once into attach and once
-//! into the world. A 16 MiB download over HTTPS from `web_world` took 0.33
-//! to 0.41 s under gVisor (41 to 51 MB/s), and 0.021 to 0.024 s under runc
+//! into the world. A 16 MiB download over HTTPS from the web test's world
+//! (`tests/web_fixture`) took 0.33 to 0.41 s under gVisor (41 to 51 MB/s),
+//! and 0.021 to 0.024 s under runc
 //! (690 to 790 MB/s).
 //!
 //! # Hosted sandboxes
@@ -952,8 +953,8 @@
 //! `NODE_EXTRA_CA_CERTS` for Node, `GIT_SSL_CAINFO` for git, and
 //! `SSL_CERT_FILE` for Go and Python's `ssl`.
 //!
-//! These programs were run through both proxy types with the `web_world`
-//! example (the Docker test in `tests/docker/proxy`):
+//! These programs were run through both proxy types with `web_fixture`
+//! (the Docker test in `tests/docker/proxy`):
 //!
 //! | Program | `http_proxy` | `socks5` |
 //! |---|---|---|
@@ -1356,7 +1357,7 @@
 //! ## Speed
 //!
 //! These numbers are from one Ryzen 9 9900X (12 cores, 24 threads), with
-//! release builds and the `web_world` example, through the HTTP proxy. The
+//! release builds and `web_fixture`, through the HTTP proxy. The
 //! SOCKS5 proxy was about the same. The machine was shared with other work,
 //! so the numbers moved from run to run. The table shows the ranges seen.
 //!
@@ -1713,7 +1714,7 @@
 //! missing (`--fetch` downloads them once).
 //!
 //! These numbers are from one Ryzen 9 9900X, with release builds and
-//! `web_world`. The nested VMs ran inside the outer VM, so they show the
+//! `web_fixture`. The nested VMs ran inside the outer VM, so they show the
 //! cost of nesting as well. The machine was shared with other work, so
 //! the table shows the range over two runs of each test.
 //!

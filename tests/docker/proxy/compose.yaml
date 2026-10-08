@@ -1,4 +1,4 @@
-# The proxy test: the web_world example, one attach with --type
+# The proxy test: the web_fixture example, one attach with --type
 # http_proxy and one with --type socks5, and a sandbox whose only network
 # is an internal one shared with the two attaches. Run it with ./run.sh,
 # which makes a token, checks the results and cleans up.
@@ -33,7 +33,7 @@ services:
   world:
     build: *build
     image: fictionet-proxy:dev
-    command: ["web_world", "/run/fictionet/world.sock", "/run/ca/ca.pem"]
+    command: ["web_fixture", "/run/fictionet/world.sock", "/run/ca/ca.pem"]
     # The world needs no network: attach reaches it through the socket.
     network_mode: none
     # Lets the world raise its socket buffers to attach past the system

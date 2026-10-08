@@ -13,7 +13,7 @@
 #
 # Two boots of the same image follow, each with a fresh disk overlay:
 #
-#   1. web_world, IPv4. The guest's own DHCP client gets its address from
+#   1. web_fixture, IPv4. The guest's own DHCP client gets its address from
 #      attach (--ip-addr). Then dig resolves a world name, curl --cacert
 #      fetches an HTTPS page and 16 MiB, ping reaches the gateway, and an
 #      unknown name and an unknown address both fail fast.
@@ -39,8 +39,8 @@ command -v qemu-system-x86_64 >/dev/null || skip "qemu-system-x86_64 is missing"
 command -v genisoimage >/dev/null || skip "genisoimage is missing"
 [ -f "$prepared" ] || skip "no VM image at $prepared; run tests/vm/run.sh --fetch once to make it"
 
-echo "building fictionet, web_world and ping_world"
-(cd "$repo" && cargo build --quiet --features tokio --bin fictionet --example web_world --example ping_world)
+echo "building fictionet, web_fixture and ping_world"
+(cd "$repo" && cargo build --quiet --features tokio --bin fictionet --example web_fixture --example ping_world)
 target="$(target_dir)"
 bin="$target/debug/fictionet"
 examples="$target/debug/examples"
@@ -155,8 +155,8 @@ says() { grep -Eq -- "$1" "$run/$2-guest.txt"; }
 # The time the command after the line matching $1 took, in ms.
 took() { grep -A20 -F -- "$1" "$run/$2-guest.txt" | grep -m1 -o 'took [0-9]*' | grep -o '[0-9]*'; }
 
-echo "=== 1. web_world, IPv4, DHCP from attach"
-"$examples/web_world" "$run/world.sock" "$run/ca.pem" > "$run/world.log" 2>&1 &
+echo "=== 1. web_fixture, IPv4, DHCP from attach"
+"$examples/web_fixture" "$run/world.sock" "$run/ca.pem" > "$run/world.log" 2>&1 &
 pids+=($!)
 start_attach --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 --no-ip-addr-v6
 boot web <<'EOF'

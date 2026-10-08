@@ -14,11 +14,12 @@ COPY benches benches
 COPY codegen codegen
 COPY tests/copy_and_own tests/copy_and_own
 COPY examples examples
+COPY tests/web_fixture tests/web_fixture
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-proxy-target \
-    find src examples -type f -exec touch {} + \
-    && cargo build --release --features tokio --bin fictionet --example web_world \
-    && cp target/release/fictionet target/release/examples/web_world /usr/local/bin/
+    find src examples tests/web_fixture -type f -exec touch {} + \
+    && cargo build --release --features tokio --bin fictionet --example web_fixture \
+    && cp target/release/fictionet target/release/examples/web_fixture /usr/local/bin/
 
 # A Go client built with the standard library only.
 FROM golang:1-bookworm AS go
@@ -28,7 +29,7 @@ RUN CGO_ENABLED=0 go build -buildvcs=false -trimpath -o /goclient .
 
 # The world and attach.
 FROM debian:bookworm-slim AS runtime
-COPY --from=build /usr/local/bin/fictionet /usr/local/bin/web_world /usr/local/bin/
+COPY --from=build /usr/local/bin/fictionet /usr/local/bin/web_fixture /usr/local/bin/
 
 # The sandbox: the clients an agent uses, as a user with no capabilities.
 # Python 3.13, which checks certificates strictly. No ping, dig or ip.

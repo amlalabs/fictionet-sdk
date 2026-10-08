@@ -6,7 +6,7 @@
 #   tests/k8s/proxy.sh
 #
 # Needs docker, kind, kubectl and helm on PATH. It builds the attach,
-# web_world and agent images, makes a kind cluster named
+# web_fixture and agent images, makes a kind cluster named
 # fictionet-k8s-test (or uses it if it is already there), loads the
 # images, and checks that:
 #   1. the proxy release is admitted under "restricted" with no warning,
@@ -61,7 +61,7 @@ check() {
 }
 
 docker build -q -f "$root/deploy/Dockerfile" --target attach -t fictionet-attach:dev "$root" >/dev/null
-docker build -q -f "$root/deploy/Dockerfile" --target web-world -t fictionet-web-world:dev "$root" >/dev/null
+docker build -q -f "$root/tests/docker/web/Dockerfile" --target fixture -t fictionet-web-fixture:dev "$root" >/dev/null
 docker build -q -f "$root/deploy/Dockerfile" --target agent -t fictionet-agent:dev "$root" >/dev/null
 
 if ! kind get clusters 2>/dev/null | grep -qx "$cluster"; then
@@ -69,7 +69,7 @@ if ! kind get clusters 2>/dev/null | grep -qx "$cluster"; then
     made_cluster=1
 fi
 kubectl config use-context "kind-$cluster" >/dev/null
-kind load docker-image --name "$cluster" fictionet-attach:dev fictionet-web-world:dev fictionet-agent:dev >/dev/null
+kind load docker-image --name "$cluster" fictionet-attach:dev fictionet-web-fixture:dev fictionet-agent:dev >/dev/null
 kubectl delete namespace "$ns" --wait >/dev/null 2>&1 || true
 kubectl create namespace "$ns" >/dev/null
 kubectl label namespace "$ns" pod-security.kubernetes.io/enforce=restricted \
@@ -77,6 +77,7 @@ kubectl label namespace "$ns" pod-security.kubernetes.io/enforce=restricted \
 
 # 1. Pod Security.
 out="$(helm install "$release" "$root/charts/fictionet-sandbox" -n "$ns" -f "$root/examples/attach/k8s-proxy.yaml" \
+    --set serviceDefaults.world.image=fictionet-web-fixture:dev \
     --wait --timeout 180s 2>&1)" || fail "helm install: $out"
 if grep -qi 'PodSecurity' <<<"$out"; then fail "Pod Security warnings: $out"; else pass "the proxy release is admitted under restricted, with no warning"; fi
 check "both sandboxes run" '^Running Running ?$' \
@@ -102,6 +103,7 @@ check "the agent started after wait-blocked exited" 'after' \
 # not start. Then a deny-all policy is applied by hand, and it starts.
 nopolicy_pod="fictionet-sandbox-fnnopolicy-default-0"
 helm install fnnopolicy "$root/charts/fictionet-sandbox" -n "$ns" -f "$root/examples/attach/k8s-proxy.yaml" \
+    --set serviceDefaults.world.image=fictionet-web-fixture:dev \
     --set networkPolicy.enabled=false >/dev/null
 sleep 20
 check "with no NetworkPolicy, wait-blocked is still waiting" 'still reachable; waiting' \
