@@ -282,10 +282,11 @@
 //! `Date.now()`, random bytes from `crypto.getRandomValues`, and timers
 //! from `setTimeout`. In a page, hand [`run`] to the event loop with
 //! `wasm_bindgen_futures`. [`block_on`] also works, but spins between
-//! timers. Two limits come from hyper and h2, which read `std`'s clock: a
-//! site serves HTTP/2 but not HTTP/1.1, and an HTTP/2 stream that the
-//! world's side resets panics. `examples/wasm_world` runs DNS, HTTP/2 and
-//! HTTPS through a world in Node.js.
+//! timers. HTTP/1.1 and HTTP/2 both work. Two cases read `std`'s clock,
+//! which panics on this target. An HTTP/1 Upgrade request goes to hyper's
+//! HTTP/1 server, and an HTTP/2 stream that the world's side resets goes
+//! through h2's timer. `examples/wasm_world` runs DNS, HTTP/1.1, HTTP/2
+//! and HTTPS through a world in Node.js.
 
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]

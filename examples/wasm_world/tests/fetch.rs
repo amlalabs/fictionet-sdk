@@ -1,8 +1,8 @@
 //! One request through the world, on the host and in a JavaScript engine.
 //!
-//! In a JavaScript engine, the HTTP/1.1 tests are ignored: hyper's HTTP/1
-//! server reads `SystemTime::now` on every poll, which panics on
-//! wasm32-unknown-unknown. The README has the details.
+//! A JavaScript engine runs all four tests. The host runs the three that
+//! use `block_on`. The README says which requests a world cannot serve in
+//! a JavaScript engine.
 
 use http::Version;
 use wasm_world::{Fetched, NAME, SITE, fetch};
@@ -39,7 +39,6 @@ fn https_with_block_on() {
 
 /// HTTP/1.1, plain and over TLS.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(target_arch = "wasm32", ignore = "hyper's HTTP/1 server needs SystemTime::now")]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn http1_with_block_on() {
     check(fictionet::block_on(fetch(false, Version::HTTP_11)).unwrap(), Version::HTTP_11);
