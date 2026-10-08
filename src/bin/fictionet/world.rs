@@ -56,7 +56,7 @@ pub(crate) fn handshake(g: &Greeting<'_>) -> Result<OwnedFd, Failure> {
     })?;
     let fd = sock.as_raw_fd();
     unix::raise_buffers(fd);
-    set_recv_timeout(fd, Some(relay::HANDSHAKE_TIMEOUT + Duration::from_secs(1)))
+    unix::set_timeout(fd, libc::SO_RCVTIMEO, Some(relay::HANDSHAKE_TIMEOUT + Duration::from_secs(1)))
         .map_err(err("setting the handshake timeout"))?;
     let hello = Hello { version: relay::VERSION, mtu: g.mtu, kind: g.kind.into(), name: g.name.into() };
     unix::send(fd, &Message::Hello(hello).encode(), false).map_err(err("sending hello"))?;
@@ -80,7 +80,7 @@ pub(crate) fn handshake(g: &Greeting<'_>) -> Result<OwnedFd, Failure> {
         Ok(other) => return Err(Failure::Error(format!("the world answered hello with {other:?}"))),
         Err(e) => return Err(Failure::Error(format!("the world's answer to hello: {e}"))),
     }
-    set_recv_timeout(fd, None).map_err(err("clearing the handshake timeout"))?;
+    unix::set_timeout(fd, libc::SO_RCVTIMEO, None).map_err(err("clearing the handshake timeout"))?;
     unix::set_nonblocking(fd, true).map_err(err("making the socket nonblocking"))?;
     Ok(sock)
 }
@@ -110,24 +110,6 @@ fn connect(path: &str, wait: Duration) -> io::Result<OwnedFd> {
             Err(e) => return Err(e),
         }
     }
-}
-
-fn set_recv_timeout(fd: RawFd, timeout: Option<Duration>) -> io::Result<()> {
-    let tv = match timeout {
-        Some(d) => libc::timeval { tv_sec: d.as_secs() as _, tv_usec: d.subsec_micros() as _ },
-        None => libc::timeval { tv_sec: 0, tv_usec: 0 },
-    };
-    // SAFETY: setsockopt with a timeval value.
-    let r = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            (&raw const tv).cast(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
 /// Removes a ready file left over from an earlier run, so it cannot report
@@ -180,6 +162,47 @@ pub(crate) fn open_own_file(path: &Path, new: bool) -> io::Result<fs::File> {
         return Err(io::Error::other(format!("{} has other hard links, which attach does not write through", path.display())));
     }
     Ok(f)
+}
+
+pub(crate) fn context(e: io::Error, what: &str) -> io::Error {
+    io::Error::new(e.kind(), format!("{what}: {e}"))
+}
+
+/// Reads until blocked, with an optional message limit. `false` means the world closed.
+pub(crate) fn read_packets(
+    fd: RawFd,
+    buf: &mut [u8],
+    mut limit: Option<usize>,
+    mut packet: impl FnMut(&[u8]) -> Result<(), Failure>,
+) -> Result<bool, Failure> {
+    while limit != Some(0) {
+        if let Some(left) = &mut limit {
+            *left -= 1;
+        }
+        let n = match unix::recv(fd, buf, true) {
+            Ok(0) => return Ok(false),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(false),
+            Err(e) => return Err(Failure::Error(format!("reading from the world: {e}"))),
+        };
+        packet(world_packet(&buf[..n])?)?;
+    }
+    Ok(true)
+}
+
+/// Reads one message from the world. After `accept`, the relay protocol
+/// allows only `packet`: anything else, a message the protocol cannot
+/// decode, or one longer than its limit ends attach with an error.
+fn world_packet(msg: &[u8]) -> Result<&[u8], Failure> {
+    if msg.len() > relay::MAX_MESSAGE {
+        return Err(Failure::Error("the world sent a message longer than 65,536 bytes".into()));
+    }
+    match relay::decode(msg) {
+        Ok(Message::Packet(p)) => Ok(p),
+        Ok(other) => Err(Failure::Error(format!("the world sent {other:?} after accept; closing"))),
+        Err(e) => Err(Failure::Error(format!("the world sent a bad message: {e}; closing"))),
+    }
 }
 
 #[cfg(test)]

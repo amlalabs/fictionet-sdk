@@ -32,16 +32,7 @@ impl Client {
     }
 
     fn set_timeout(&self, d: Duration) {
-        let tv = libc::timeval { tv_sec: d.as_secs() as _, tv_usec: d.subsec_micros() as _ };
-        unsafe {
-            libc::setsockopt(
-                self.fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                (&raw const tv).cast(),
-                std::mem::size_of::<libc::timeval>() as u32,
-            )
-        };
+        let _ = unix::set_timeout(self.fd.as_raw_fd(), libc::SO_RCVTIMEO, Some(d));
     }
 
     /// The next message, or `None` if none comes within the timeout.

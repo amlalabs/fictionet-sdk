@@ -486,9 +486,10 @@ mod pcap;
 mod session;
 mod view;
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::lock;
 use crate::watch::Graph;
 use crate::Cx;
 pub(crate) use keys::observed_config;
@@ -500,10 +501,6 @@ const WATCH_LINGER: Duration = if cfg!(test) { Duration::from_millis(200) } else
 /// How often the reaper looks for watches to forget.
 #[cfg(not(target_arch = "wasm32"))]
 const REAP_EVERY: Duration = if cfg!(test) { Duration::from_millis(50) } else { Duration::from_secs(5) };
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// Serves one observer session on `fd`, which has been accepted on the
 /// world socket of `attacher`.

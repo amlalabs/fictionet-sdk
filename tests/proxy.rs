@@ -705,19 +705,13 @@ fn clients_waiting_for_a_connection_hear_that_the_world_is_gone() {
 /// listens on `sock` before this returns.
 fn answer_hello(sock: &Path, answer: Vec<u8>) -> std::thread::JoinHandle<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
     // SAFETY: plain syscalls on fds this function owns, and a sockaddr_un
     // filled within its bounds.
     let listener = unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
         assert!(fd >= 0);
         let listener = OwnedFd::from_raw_fd(fd);
-        let mut addr: libc::sockaddr_un = std::mem::zeroed();
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        for (d, s) in addr.sun_path.iter_mut().zip(sock.as_os_str().as_bytes()) {
-            *d = *s as libc::c_char;
-        }
-        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let (addr, len) = fictionet::relay::unix::address(sock).unwrap();
         assert_eq!(libc::bind(fd, (&raw const addr).cast(), len), 0);
         assert_eq!(libc::listen(fd, 1), 0);
         listener

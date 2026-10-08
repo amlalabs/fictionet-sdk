@@ -7,11 +7,11 @@ use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use fictionet::relay::{self, Message, unix};
+use fictionet::relay::{self, unix};
 
 use crate::args::{AttachArgs, ResolvConf};
 use crate::netlink::{self, Netlink};
-use crate::world::{self, Failure, Greeting, err};
+use crate::world::{self, Failure, Greeting, context, err};
 
 /// Runs attach to the end. `Ok` means the world closed the connection.
 pub(crate) fn run(args: AttachArgs) -> Result<(), Failure> {
@@ -261,10 +261,6 @@ fn default_route_error(e: io::Error, family: &str) -> io::Error {
     context(e, &format!("adding the {family} default route"))
 }
 
-fn context(e: io::Error, what: &str) -> io::Error {
-    io::Error::new(e.kind(), format!("{what}: {e}"))
-}
-
 /// Where `--dns` goes: the `--resolv-conf` path, nowhere with
 /// `--no-resolv-conf`, and otherwise attach's own `/etc/resolv.conf`, or with
 /// `--netns`, `/etc/netns/<name>/resolv.conf`, which `ip netns exec` mounts
@@ -334,35 +330,20 @@ fn relay_packets(tun: RawFd, sock: RawFd) -> Result<Stats, Failure> {
             return Err(Failure::Error(format!("poll: {e}")));
         }
 
-        if fds[1].revents != 0 {
-            for _ in 0..BATCH {
-                let n = match unix::recv(sock, &mut from_world, true) {
-                    Ok(0) => return Ok(stats),
-                    Ok(n) => n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(stats),
-                    Err(e) => return Err(Failure::Error(format!("reading from the world: {e}"))),
-                };
-                if n > relay::MAX_MESSAGE {
-                    return Err(Failure::Error("the world sent a message longer than 65,536 bytes".into()));
+        if fds[1].revents != 0
+            && !world::read_packets(sock, &mut from_world, Some(BATCH), |p| {
+                // SAFETY: `p` is valid for reads of its length.
+                let w = unsafe { libc::write(tun, p.as_ptr().cast(), p.len()) };
+                if w < 0 {
+                    // A full queue drops the packet. So does a packet
+                    // the kernel will not take (EINVAL: not IPv4 or
+                    // IPv6), which a world may send on purpose.
+                    stats.dropped += 1;
                 }
-                match relay::decode(&from_world[..n]) {
-                    Ok(Message::Packet(p)) => {
-                        // SAFETY: `p` is valid for reads of its length.
-                        let w = unsafe { libc::write(tun, p.as_ptr().cast(), p.len()) };
-                        if w < 0 {
-                            // A full queue drops the packet. So does a packet
-                            // the kernel will not take (EINVAL: not IPv4 or
-                            // IPv6), which a world may send on purpose.
-                            stats.dropped += 1;
-                        }
-                    }
-                    Ok(other) => {
-                        return Err(Failure::Error(format!("the world sent {other:?} after accept; closing")));
-                    }
-                    Err(e) => return Err(Failure::Error(format!("the world sent a bad message: {e}; closing"))),
-                }
-            }
+                Ok(())
+            })?
+        {
+            return Ok(stats);
         }
 
         if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {

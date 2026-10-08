@@ -10,6 +10,7 @@ use std::time::Instant;
 use crate::attach::NameGuard;
 use crate::cx::CancelWait;
 use crate::relay::{self, Message, unix};
+use crate::relay::unix::cvt;
 use crate::{Attacher, Attachment, Cx, Packet, RecvError};
 
 /// Where a world listens for attach and observers.
@@ -158,10 +159,6 @@ pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listen
         .name("fictionet-listen".into())
         .spawn(move || helper(helper_shared, listener, helper_attacher, closed_tx))?;
     Ok(Listening { shared, path, closed: closed_rx, attacher })
-}
-
-fn cvt(n: libc::c_int) -> io::Result<libc::c_int> {
-    if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n) }
 }
 
 fn epoll_ctl(epoll: RawFd, op: libc::c_int, fd: RawFd, events: u32, token: u64) -> io::Result<()> {

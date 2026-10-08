@@ -81,16 +81,7 @@ fn running_out_of_descriptors_does_not_spin_the_helper() {
     assert!(used < 20, "the helper thread used {used} ticks in a second while it could not accept");
 
     // With descriptors free again, the waiting client is accepted.
-    let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
-    unsafe {
-        libc::setsockopt(
-            client.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            (&raw const tv).cast(),
-            std::mem::size_of::<libc::timeval>() as u32,
-        )
-    };
+    let _ = unix::set_timeout(client.as_raw_fd(), libc::SO_RCVTIMEO, Some(Duration::from_secs(5)));
     let hello = Message::Hello(Hello { version: relay::VERSION, mtu: 1500, kind: "tun".into(), name: "late".into() });
     unix::send(client.as_raw_fd(), &hello.encode(), false).unwrap();
     let mut buf = vec![0u8; 16];

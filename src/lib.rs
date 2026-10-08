@@ -531,3 +531,9 @@ impl std::error::Error for RecvError {
     "```\n",
 )]
 pub struct ReadmeExample;
+
+/// Locks `m`. A poisoned lock is used anyway: a panic elsewhere leaves
+/// what these locks hold whole.
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}

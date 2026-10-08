@@ -179,12 +179,31 @@ pub mod proxy;
 pub mod unix {
     use super::*;
 
-    fn cvt(n: libc::c_int) -> io::Result<libc::c_int> {
+    pub(crate) fn cvt(n: libc::c_int) -> io::Result<libc::c_int> {
         if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n) }
     }
 
+    /// Sets a socket's receive or send timeout. `None` waits forever.
+    pub fn set_timeout(fd: RawFd, option: libc::c_int, timeout: Option<Duration>) -> io::Result<()> {
+        let tv = match timeout {
+            Some(t) => libc::timeval { tv_sec: t.as_secs() as _, tv_usec: t.subsec_micros() as _ },
+            None => libc::timeval { tv_sec: 0, tv_usec: 0 },
+        };
+        // SAFETY: setsockopt with a timeval.
+        cvt(unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&raw const tv).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        })?;
+        Ok(())
+    }
+
     /// A `sockaddr_un` for `path`.
-    pub(crate) fn address(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    pub fn address(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
         use std::os::unix::ffi::OsStrExt;
         // SAFETY: an all-zero sockaddr_un is valid.
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -410,21 +429,7 @@ pub mod observer {
 
         /// Gives up waiting for replies after `timeout`, or never.
         pub fn set_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-            let tv = match timeout {
-                Some(t) => libc::timeval { tv_sec: t.as_secs() as _, tv_usec: t.subsec_micros() as _ },
-                None => libc::timeval { tv_sec: 0, tv_usec: 0 },
-            };
-            // SAFETY: setsockopt with a timeval.
-            let r = unsafe {
-                libc::setsockopt(
-                    self.fd.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVTIMEO,
-                    (&raw const tv).cast(),
-                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-                )
-            };
-            if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+            unix::set_timeout(self.fd.as_raw_fd(), libc::SO_RCVTIMEO, timeout)
         }
     }
 }

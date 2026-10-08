@@ -23,7 +23,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use fictionet::relay::{self, Message, unix};
+use fictionet::relay::{self, unix};
 use fictionet::stdlib::dhcp;
 
 use crate::addresses;
@@ -31,7 +31,7 @@ use crate::args::{Family, TapArgs, VmLink};
 use crate::ether::{self, Decoder, Frame, Mac, Outbox, Upper};
 use crate::netlink::{self, Netlink};
 use crate::tun;
-use crate::world::{self, Failure, Greeting, err};
+use crate::world::{self, Failure, Greeting, context, err};
 
 /// The VM's side of the link, as attach sees it: what to do with each
 /// frame from the VM, and how to frame each packet from the world. It does
@@ -476,10 +476,6 @@ impl Drop for Mirror {
     }
 }
 
-fn context(e: io::Error, what: &str) -> io::Error {
-    io::Error::new(e.kind(), format!("{what}: {e}"))
-}
-
 /// Takes the lock for a QEMU socket path: an exclusive `flock` on
 /// `<path>.lock`, made with mode 0600 if it is missing, and held until
 /// attach exits. One attach at a time owns a socket path, so a second one
@@ -537,9 +533,9 @@ fn lock_device(name: &str, index: u32) -> Result<OwnedFd, Failure> {
     for (dst, src) in addr.sun_path[1..].iter_mut().zip(id.as_bytes()) {
         *dst = *src as libc::c_char;
     }
-    let len = std::mem::size_of::<libc::sa_family_t>() + 1 + id.len();
+    let len = (std::mem::size_of::<libc::sa_family_t>() + 1 + id.len()) as libc::socklen_t;
     // SAFETY: `addr` is a valid sockaddr_un of `len` bytes.
-    if unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), len as libc::socklen_t) } < 0 {
+    if unsafe { libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), len) } < 0 {
         let e = io::Error::last_os_error();
         if e.raw_os_error() == Some(libc::EADDRINUSE) {
             return Err(Failure::Error(format!("another attach is using {name}")));
@@ -594,14 +590,16 @@ enum End {
 /// is bound to, as `/proc/net/unix` lists them, or any other file, is an
 /// error.
 fn listen(path: &Path) -> io::Result<OwnedFd> {
-    let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::other("the path holds a NUL byte"))?;
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| io::Error::other("the path holds a NUL byte"))?;
     // SAFETY: plain syscall; the fd is owned from here.
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let (addr, len) = sockaddr(&c)?;
+    let (addr, len) = unix::address(path).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "the socket path must be 1 to 107 bytes")
+    })?;
     let bind = || {
         // The file is made with mode 0600. umask is per process, and attach
         // has one thread here.
@@ -661,21 +659,6 @@ fn bound_path(line: &[u8]) -> Option<&[u8]> {
     Some(&rest[start..])
 }
 
-fn sockaddr(path: &CString) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
-    // SAFETY: an all-zero sockaddr_un is valid.
-    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    let bytes = path.as_bytes();
-    if bytes.is_empty() || bytes.len() >= addr.sun_path.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "the socket path must be 1 to 107 bytes"));
-    }
-    for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
-        *dst = *src as libc::c_char;
-    }
-    let len = std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1;
-    Ok((addr, len as libc::socklen_t))
-}
-
 /// Waits for QEMU to connect. `None` if the world closed its connection
 /// first. Packets the world sends meanwhile are dropped, since there is no
 /// VM to take them yet. Any other message ends attach with an error, as it
@@ -695,18 +678,8 @@ fn accept(listener: &OwnedFd, world: RawFd) -> Result<Option<OwnedFd>, Failure> 
             }
             return Err(Failure::Error(format!("poll: {e}")));
         }
-        if fds[1].revents != 0 {
-            loop {
-                match unix::recv(world, &mut buf, true) {
-                    Ok(0) => return Ok(None),
-                    Ok(n) => {
-                        world_packet(&buf[..n])?;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(None),
-                    Err(e) => return Err(Failure::Error(format!("reading from the world: {e}"))),
-                }
-            }
+        if fds[1].revents != 0 && !world::read_packets(world, &mut buf, None, |_| Ok(()))? {
+            return Ok(None);
         }
         if fds[0].revents != 0 {
             // SAFETY: plain syscall; the fd is owned from here.
@@ -919,16 +892,8 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
             return Err(Failure::Error(format!("poll: {e}")));
         }
 
-        if fds[1].revents != 0 {
-            for _ in 0..BATCH {
-                let n = match unix::recv(world, &mut from_world, true) {
-                    Ok(0) => return Ok((End::World, stats)),
-                    Ok(n) => n,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok((End::World, stats)),
-                    Err(e) => return Err(Failure::Error(format!("reading from the world: {e}"))),
-                };
-                let p = world_packet(&from_world[..n])?;
+        if fds[1].revents != 0
+            && !world::read_packets(world, &mut from_world, Some(BATCH), |p| {
                 match link.to_vm(p) {
                     Some(h) => {
                         if !port.send(&[&h, p])? {
@@ -937,7 +902,10 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
                     }
                     None => stats.from_world_bad += 1,
                 }
-            }
+                Ok(())
+            })?
+        {
+            return Ok((End::World, stats));
         }
 
         if fds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 && matches!(port, Port::Device { .. }) {
@@ -1034,20 +1002,6 @@ fn relay(link: &mut Link, port: &mut Port, world: RawFd) -> Result<(End, Stats),
                 eprintln!("fictionet attach: the VM's MAC is {m}");
             }
         }
-    }
-}
-
-/// Reads one message from the world. After `accept`, the relay protocol
-/// allows only `packet`: anything else, a message the protocol cannot
-/// decode, or one longer than its limit ends attach with an error.
-fn world_packet(msg: &[u8]) -> Result<&[u8], Failure> {
-    if msg.len() > relay::MAX_MESSAGE {
-        return Err(Failure::Error("the world sent a message longer than 65,536 bytes".into()));
-    }
-    match relay::decode(msg) {
-        Ok(Message::Packet(p)) => Ok(p),
-        Ok(other) => Err(Failure::Error(format!("the world sent {other:?} after accept; closing"))),
-        Err(e) => Err(Failure::Error(format!("the world sent a bad message: {e}; closing"))),
     }
 }
 

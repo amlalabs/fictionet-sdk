@@ -121,6 +121,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::lock;
 use crate::Cx;
 use crate::stdlib::codec::Wire;
 use crate::stdlib::json::{Number, Value};
@@ -574,10 +575,6 @@ type Subscriber = Arc<dyn Fn(&Event) + Send + Sync>;
 const FILE_QUEUE: usize = 100_000;
 /// How many bytes of lines may wait for a file's writer thread.
 const FILE_QUEUE_BYTES: usize = MAX_EVENT_BYTES;
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 /// What a run's log holds.
 pub(crate) struct Store {

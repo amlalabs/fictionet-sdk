@@ -290,19 +290,13 @@ fn a_second_attach_leaves_the_waiting_one_alone() {
 /// A world that accepts the attachment, then sends `message`.
 fn fake_world(path: &std::path::Path, message: Vec<u8>) -> std::thread::JoinHandle<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
     // SAFETY: plain syscalls on fds owned here; `addr` is a valid
     // sockaddr_un.
     let listener = unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
         assert!(fd >= 0);
         let fd = OwnedFd::from_raw_fd(fd);
-        let mut addr: libc::sockaddr_un = std::mem::zeroed();
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        for (d, s) in addr.sun_path.iter_mut().zip(path.as_os_str().as_bytes()) {
-            *d = *s as libc::c_char;
-        }
-        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let (addr, len) = fictionet::relay::unix::address(path).unwrap();
         assert_eq!(libc::bind(fd.as_raw_fd(), (&raw const addr).cast(), len), 0);
         assert_eq!(libc::listen(fd.as_raw_fd(), 1), 0);
         fd

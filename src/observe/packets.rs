@@ -3,11 +3,12 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use super::decode::Dissector;
 use super::json::{self, Object};
 use super::view::{edge_id, task_id};
+use crate::lock;
 use crate::sys::{Instant, UNIX_EPOCH};
 use crate::watch::{Graph, KeyLine, Meter, TapGuard};
 
@@ -70,10 +71,6 @@ struct Inner {
     /// when they were taken.
     keys: VecDeque<KeyLine>,
     keys_seen: u64,
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// One `packets` stream's hold on a watch. While any is held, the link's

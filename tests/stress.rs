@@ -42,16 +42,7 @@ fn ticks(stats: &[(String, std::fs::File)]) -> Vec<(String, u64)> {
 
 fn connect(path: &str, name: &str) -> OwnedFd {
     let fd = unix::connect(path).unwrap();
-    let tv = libc::timeval { tv_sec: 15, tv_usec: 0 };
-    unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            (&raw const tv).cast(),
-            std::mem::size_of::<libc::timeval>() as u32,
-        )
-    };
+    let _ = unix::set_timeout(fd.as_raw_fd(), libc::SO_RCVTIMEO, Some(Duration::from_secs(15)));
     let hello = Message::Hello(Hello { version: relay::VERSION, mtu: 1500, kind: "tun".into(), name: name.into() });
     unix::send(fd.as_raw_fd(), &hello.encode(), false).unwrap();
     let mut buf = [0u8; 64];

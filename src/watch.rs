@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
+use crate::lock;
 use crate::Packet;
 use crate::sys::{Instant, SystemTime};
 
@@ -70,10 +71,6 @@ impl std::hash::Hasher for IdHasher {
     fn write_u64(&mut self, n: u64) {
         self.0 = n.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ---------------------------------------------------------------------------

@@ -103,7 +103,7 @@ impl Session {
         let fd = self.fd.as_raw_fd();
         // Sends block, up to a limit; reads never do.
         unix::set_nonblocking(fd, false)?;
-        set_send_timeout(fd, SEND_TIMEOUT);
+        let _ = unix::set_timeout(fd, libc::SO_SNDTIMEO, Some(SEND_TIMEOUT));
         let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
         loop {
             let wait = self.subs.iter().map(|s| match s {
@@ -344,20 +344,6 @@ fn world(graph: Option<&Graph>) -> String {
             o.bool("running", !ended).bool("ended", ended).num("started", started).secs("t", g.start.elapsed()).done()
         }
     }
-}
-
-fn set_send_timeout(fd: std::os::fd::RawFd, t: Duration) {
-    let tv = libc::timeval { tv_sec: t.as_secs() as _, tv_usec: t.subsec_micros() as _ };
-    // SAFETY: setsockopt with a timeval.
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDTIMEO,
-            (&raw const tv).cast(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
 }
 
 #[cfg(test)]
