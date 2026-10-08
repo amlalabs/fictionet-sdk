@@ -1,0 +1,5 @@
+# The default rustfmt style. cargo fmt takes the edition from Cargo.toml.
+# This file sets it for rustfmt run on one file, as editors do. The code
+# generator writes this style too, and a stdlib file copied into another
+# crate stays formatted under that crate's own cargo fmt.
+edition = "2024"

@@ -59,6 +59,25 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets ${{ matrix.features }} -- -D warnings
 
+  # Every crate in the repository is formatted with the default rustfmt
+  # style (rustfmt.toml). From the crate root, so rust-toolchain.toml there
+  # picks the toolchain for all of them.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: Check formatting
+        run: |
+          for manifest in Cargo.toml fuzz/Cargo.toml tests/copy_and_own/Cargo.toml \
+              examples/wasm_world/Cargo.toml examples/border/world/Cargo.toml \
+              examples/fakewiki/world/Cargo.toml examples/adaptive-web/world/Cargo.toml; do
+            cargo fmt --all --check --manifest-path "$manifest"
+          done
+
   # The crates outside the workspace and the Python projects: the tests of
   # Border's, FakeWiki's and the adaptive web's worlds (and the adaptive
   # web's offline backend), of the browser example (on the host and in

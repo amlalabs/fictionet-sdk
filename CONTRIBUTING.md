@@ -29,6 +29,11 @@ $ RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --no-defau
 $ cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
 ```
 
+CI also checks that every crate in the repository is formatted with the
+default rustfmt style. Run `cargo fmt --all` before you push. The crates
+outside the workspace (`fuzz`, `tests/copy_and_own` and the example worlds)
+each need `cargo fmt --all --manifest-path <crate>/Cargo.toml`.
+
 The library also builds for the browser, and CI checks that too. It needs the
 `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`) and
 a clang with that target, which compiles ring's C code:
