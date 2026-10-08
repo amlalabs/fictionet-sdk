@@ -175,7 +175,7 @@ fn a_page_that_names_an_attach_flag_links_to_attaching() {
         let text = doc_text(path, text);
         let named: Vec<_> =
             flags(&prose(&text)).into_iter().filter(|f| known.contains(f) && !shared.contains(&f.as_str())).collect();
-        let links = text.contains("crate::attaching") || text.contains("(attaching") || text.contains("[`attaching`]") || text.contains("src/attaching.rs");
+        let links = text.contains("crate::attaching") || text.contains("fictionet::attaching") || text.contains("(attaching") || text.contains("[`attaching`]") || text.contains("src/attaching.rs");
         if !named.is_empty() && !links {
             bad.push(format!("{path} names {named:?} but never links to attaching"));
         }

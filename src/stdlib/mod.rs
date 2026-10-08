@@ -328,6 +328,9 @@ pub mod cboe_pitch;
 /// of longer blocks from newer senders and refuse acting versions below
 /// 13. Constants, such as a price's exponent, are associated constants.
 ///
+/// There is no feed session, recovery engine, order book, `Service` or
+/// live transport. The file is editable without running the generator.
+///
 /// The packet layer is written by hand at the end of the file.
 /// [`Packet`](cme_mdp3::Packet) is one UDP datagram: the binary packet
 /// header (`MsgSeqNum` and `SendingTime`), then messages, each after a
