@@ -1666,6 +1666,7 @@ impl Decode for Responses {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use codec::{
         Fail, Lcg, Step, Stream,
@@ -2574,7 +2575,7 @@ mod tests {
 
     #[test]
     fn many_messages_in_one_push() {
-        let count = 200_000;
+        let count = rounds(200_000);
         let wire = b"a NOOP\r\n".repeat(count);
         let items = events(&wire);
         assert_eq!(items.len(), count);

@@ -1528,6 +1528,7 @@ fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usiz
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
@@ -2268,13 +2269,13 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_frames_in_linear_time() {
-        let bytes = Frame { token: vec![1], ..Frame::new(Code::PING) }.to_bytes().unwrap().repeat(200_000);
-        let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames::<Frame>::new());
-        let mut n = 0;
-        pump(&mut stream, &bytes, |_| n += 1).unwrap();
-        assert_eq!(n, 200_000);
-        assert!(started.elapsed().as_secs() < 5);
+        assert_linear("stream_takes_many_small_frames_in_linear_time", rounds(50_000), |size| {
+            let bytes = Frame { token: vec![1], ..Frame::new(Code::PING) }.to_bytes().unwrap().repeat(size);
+            let mut stream = Stream::new(Frames::<Frame>::new());
+            let mut n = 0;
+            pump(&mut stream, &bytes, |_| n += 1).unwrap();
+            assert_eq!(n, size);
+        });
     }
 
     #[test]

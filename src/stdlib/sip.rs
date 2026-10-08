@@ -2064,6 +2064,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::{round_trip, cseq_round_trip, text_value};
     #[test]
     fn unexpected_line_error_is_malformed_head() {
@@ -2805,14 +2806,14 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_messages_in_linear_time() {
-        let one = b"\r\nOPTIONS sip:a@b SIP/2.0\r\nl: 1\r\n\r\nx";
-        let bytes = one.repeat(50_000);
-        let started = std::time::Instant::now();
-        let (items, failure) = decode_all(Messages::new, &bytes);
-        assert_eq!(failure, None);
-        assert_eq!(items.len(), 50_000);
-        assert!(items.iter().all(Result::is_ok));
-        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+        assert_linear("stream_takes_many_small_messages_in_linear_time", rounds(12_500), |size| {
+            let one = b"\r\nOPTIONS sip:a@b SIP/2.0\r\nl: 1\r\n\r\nx";
+            let bytes = one.repeat(size);
+            let (items, failure) = decode_all(Messages::new, &bytes);
+            assert_eq!(failure, None);
+            assert_eq!(items.len(), size);
+            assert!(items.iter().all(Result::is_ok));
+        });
     }
 
     #[test]
@@ -2942,7 +2943,7 @@ mod tests {
         };
         let words = ["", "alice", "a b", "x%20", "%zz", "sip", "[::1]", "::1", "host.com", "a;b", "q\"", "UDP"];
         let mut written = 0;
-        for _ in 0..20_000 {
+        for _ in 0..rounds(20_000) {
             let mut u =
                 Uri::new(if rng.coin() { Scheme::Sip } else { Scheme::Sips }, words[rng.index(words.len())]);
             if rng.coin() {
@@ -3032,9 +3033,10 @@ mod tests {
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(&bytes), bytes.len());
         let one = b"OPTIONS sip:a@b SIP/2.0\r\nl: 4\r\n\r\nbody";
-        let (items, failure) = decode_all(Messages::new, &one.repeat(40_000));
+        let n = rounds(40_000);
+        let (items, failure) = decode_all(Messages::new, &one.repeat(n));
         assert_eq!(failure, None);
-        assert_eq!(items.len(), 40_000);
+        assert_eq!(items.len(), n);
         assert!(items.iter().all(Result::is_ok));
         let mut crlfs = b"\r\n".repeat(MAX_MESSAGE);
         crlfs.extend(one);

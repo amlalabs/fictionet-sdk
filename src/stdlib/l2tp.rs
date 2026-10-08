@@ -1054,6 +1054,7 @@ impl Wire for Packet {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
@@ -1378,7 +1379,7 @@ mod tests {
 
     #[test]
     fn writers_refuse_oversized_values() {
-        let huge = vec![1u8; 100_000];
+        let huge = vec![1u8; rounds(100_000)];
         let mut p = V2Packet::data(1, 2, huge.clone());
         p.has_length = true;
         p.sequence = Some((1, 2));
@@ -1558,7 +1559,7 @@ mod tests {
         let mut rng = Lcg::new(0x5eed_1701);
         let mut parsed = 0;
         let mut messages = 0;
-        for i in 0..20_000 {
+        for i in 0..rounds(20_000) {
             let len = rng.index(64);
             let mut data = vec![0; len];
             rng.fill(&mut data);

@@ -1144,6 +1144,7 @@ enum Integrity {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, Wire, finish, pump};
@@ -1871,67 +1872,64 @@ mod tests {
     // taking one message out does not move the bytes after it.
     #[test]
     fn stream_is_linear() {
-        let one = Message::binding_request([1; 12]).to_bytes().unwrap();
-        let n = 1_000_000;
-        let mut stream = Vec::with_capacity(one.len() * n);
-        for _ in 0..n {
-            stream.extend_from_slice(&one);
-        }
-        let mut d = Stream::new(Frames);
-        let start = std::time::Instant::now();
-        let mut count = 0;
-        let mut rest = &stream[..];
-        while !rest.is_empty() {
-            let took = d.push(rest);
-            assert!(took > 0 || d.buffered() == MAX_MESSAGE);
-            rest = &rest[took..];
-            while let Some(m) = d.next().map(|r| r.map(|frame| Message::parse(&frame))) {
-                assert!(m.is_ok());
-                count += 1;
+        assert_linear("stream_is_linear", rounds(250000), |size| {
+            let one = Message::binding_request([1; 12]).to_bytes().unwrap();
+            let n = size;
+            let mut stream = Vec::with_capacity(one.len() * n);
+            for _ in 0..n {
+                stream.extend_from_slice(&one);
             }
-        }
-        assert_eq!(count, n);
-        assert_eq!(d.buffered(), 0);
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(10),
-            "{:?}",
-            start.elapsed()
-        );
-        // Interleaved pushes keep working once part of the buffer is read.
-        put(&mut d, &one[..5]);
-        assert_eq!(
-            d.next().map(|r| r.map(|frame| Message::parse(&frame))),
-            None
-        );
-        assert_eq!(d.buffered(), 5);
-        put(&mut d, &one[5..]);
-        put(&mut d, &one);
-        assert!(
-            d.next()
-                .map(|r| r.map(|frame| Message::parse(&frame)))
-                .unwrap()
-                .is_ok()
-        );
-        assert_eq!(d.buffered(), one.len());
-        put(&mut d, &one[..3]);
-        assert!(
-            d.next()
-                .map(|r| r.map(|frame| Message::parse(&frame)))
-                .unwrap()
-                .is_ok()
-        );
-        assert_eq!(
-            d.next().map(|r| r.map(|frame| Message::parse(&frame))),
-            None
-        );
-        assert_eq!(d.buffered(), 3);
-        assert_eq!(d.into_parts().0.len(), 3);
+            let mut d = Stream::new(Frames);
+            let mut count = 0;
+            let mut rest = &stream[..];
+            while !rest.is_empty() {
+                let took = d.push(rest);
+                assert!(took > 0 || d.buffered() == MAX_MESSAGE);
+                rest = &rest[took..];
+                while let Some(m) = d.next().map(|r| r.map(|frame| Message::parse(&frame))) {
+                    assert!(m.is_ok());
+                    count += 1;
+                }
+            }
+            assert_eq!(count, n);
+            assert_eq!(d.buffered(), 0);
+            // Interleaved pushes keep working once part of the buffer is read.
+            put(&mut d, &one[..5]);
+            assert_eq!(
+                d.next().map(|r| r.map(|frame| Message::parse(&frame))),
+                None
+            );
+            assert_eq!(d.buffered(), 5);
+            put(&mut d, &one[5..]);
+            put(&mut d, &one);
+            assert!(
+                d.next()
+                    .map(|r| r.map(|frame| Message::parse(&frame)))
+                    .unwrap()
+                    .is_ok()
+            );
+            assert_eq!(d.buffered(), one.len());
+            put(&mut d, &one[..3]);
+            assert!(
+                d.next()
+                    .map(|r| r.map(|frame| Message::parse(&frame)))
+                    .unwrap()
+                    .is_ok()
+            );
+            assert_eq!(
+                d.next().map(|r| r.map(|frame| Message::parse(&frame))),
+                None
+            );
+            assert_eq!(d.buffered(), 3);
+            assert_eq!(d.into_parts().0.len(), 3);
+        });
     }
 
     #[test]
     fn stream_is_bounded() {
         let one = Message::binding_request([1; 12]).to_bytes().unwrap();
-        let bytes = one.repeat(100_000);
+        let n = rounds(100_000);
+        let bytes = one.repeat(n);
         contract::check_decode_with_alloc_limit(|| Frames, &bytes, 2 * MAX_MESSAGE);
         let mut stream = Stream::new(Frames);
         let took = stream.push(&bytes);
@@ -1940,7 +1938,7 @@ mod tests {
         let mut count = 0;
         codec::pump(&mut stream, &bytes[took..], |_| count += 1).unwrap();
         codec::finish(&mut stream, |_| count += 1).unwrap();
-        assert_eq!(count, 100_000);
+        assert_eq!(count, n);
         assert_eq!(stream.buffered(), 0);
     }
 

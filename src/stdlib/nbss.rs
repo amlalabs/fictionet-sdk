@@ -527,6 +527,7 @@ fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Erro
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
@@ -865,12 +866,12 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
-        let bytes = Packet::KeepAlive.to_bytes().unwrap().repeat(200_000);
-        let started = std::time::Instant::now();
-        let (packets, error) = decode_all(Frames::<Packet>::new, &bytes);
-        assert_eq!(packets.len(), 200_000);
-        assert_eq!(error, None);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("stream_takes_many_small_packets_in_linear_time", rounds(50_000), |size| {
+            let bytes = Packet::KeepAlive.to_bytes().unwrap().repeat(size);
+            let (packets, error) = decode_all(Frames::<Packet>::new, &bytes);
+            assert_eq!(packets.len(), size);
+            assert_eq!(error, None);
+        });
     }
 
     #[test]

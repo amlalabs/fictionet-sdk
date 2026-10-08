@@ -1664,6 +1664,7 @@ impl Wire for ForwardCloseResponse {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::{
         Lcg, Stream, pump,
@@ -1763,33 +1764,29 @@ mod tests {
 
     #[test]
     fn decoder_takes_many_small_packets_in_linear_time() {
-        let one = Packet {
-            command: Command::Nop,
-            session_handle: 0,
-            status: 0,
-            sender_context: [0; 8],
-            options: 0,
-            data: Vec::new(),
-        }
-        .to_bytes()
-        .unwrap();
-        let stream: Vec<u8> = one
-            .iter()
-            .copied()
-            .cycle()
-            .take(one.len() * 200_000)
-            .collect();
-        let started = std::time::Instant::now();
-        let mut d = Stream::new(Frames::<Packet>::new());
-        let mut n = 0;
-        pump(&mut d, &stream, |_| n += 1).unwrap();
-        assert_eq!(n, 200_000);
-        assert_eq!(d.buffered(), 0);
-        assert!(
-            started.elapsed().as_secs() < 5,
-            "took {:?}",
-            started.elapsed()
-        );
+        assert_linear("decoder_takes_many_small_packets_in_linear_time", rounds(50_000), |size| {
+            let one = Packet {
+                command: Command::Nop,
+                session_handle: 0,
+                status: 0,
+                sender_context: [0; 8],
+                options: 0,
+                data: Vec::new(),
+            }
+            .to_bytes()
+            .unwrap();
+            let stream: Vec<u8> = one
+                .iter()
+                .copied()
+                .cycle()
+                .take(one.len() * size)
+                .collect();
+            let mut d = Stream::new(Frames::<Packet>::new());
+            let mut n = 0;
+            pump(&mut d, &stream, |_| n += 1).unwrap();
+            assert_eq!(n, size);
+            assert_eq!(d.buffered(), 0);
+        });
     }
 
     #[test]
@@ -2113,12 +2110,13 @@ mod tests {
     #[test]
     fn stream_holds_at_most_packets_capacity() {
         // A stream of empty NOPs far longer than the decoder may hold.
+        let count = rounds(500_000);
         let one = packet(Command::Nop, 0, Vec::new()).to_bytes().unwrap();
         let stream: Vec<u8> = one
             .iter()
             .copied()
             .cycle()
-            .take(one.len() * 500_000)
+            .take(one.len() * count)
             .collect();
         let mut d = Stream::new(Frames::<Packet>::new());
         assert_eq!(d.push(&stream), PACKETS_CAPACITY);
@@ -2131,7 +2129,7 @@ mod tests {
             n += 1;
         }
         pump(&mut d, &stream[PACKETS_CAPACITY..], |_| n += 1).unwrap();
-        assert_eq!(n, 500_000);
+        assert_eq!(n, count);
         assert_eq!(d.buffered(), 0);
         // The longest frame the length field can name still fits whole.
         let mut big = vec![0u8; HEADER_LEN];

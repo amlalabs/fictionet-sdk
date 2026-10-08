@@ -1458,6 +1458,7 @@ impl From<Truncated> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
@@ -2266,7 +2267,7 @@ mod tests {
 
     #[test]
     fn many_small_records_take_linear_time() {
-        let count = 1 << 21;
+        let count = rounds(1 << 21);
         let mut stream = Stream::new(super::records(64));
         let mut got = 0;
         codec::pump(&mut stream, &[0x80, 0, 0, 0].repeat(count), |item| {
@@ -2761,7 +2762,7 @@ mod tests {
     fn fuzz_parse_and_round_trip() {
         let mut rng = Lcg::new(0x5531_4506);
         let mut parsed = 0;
-        for _ in 0..20_000 {
+        for _ in 0..rounds(20_000) {
             let bytes = random_bytes(&mut rng);
             if let Ok(m) = Message::parse(&bytes) {
                 parsed += 1;

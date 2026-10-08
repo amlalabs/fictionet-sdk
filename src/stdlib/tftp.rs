@@ -918,6 +918,7 @@ impl Wire for Packet {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
@@ -1363,8 +1364,8 @@ mod tests {
     // written, not by the caller's list.
     #[test]
     fn negotiated_keeps_a_bounded_oack() {
-        let big = "x".repeat(100_000);
-        let mut oack: Vec<TftpOption> = (0..100_000).map(|i| TftpOption::new(&format!("o{i}"), "1")).collect();
+        let big = "x".repeat(rounds(100_000));
+        let mut oack: Vec<TftpOption> = (0..rounds(100_000)).map(|i| TftpOption::new(&format!("o{i}"), "1")).collect();
         oack.insert(0, TftpOption::new(&big, &big));
         let agreed = Negotiated { block_size: 512, timeout: None, transfer_size: None, oack };
         let t = ReadTransfer::negotiated(vec![], &agreed);

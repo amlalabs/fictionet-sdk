@@ -2160,6 +2160,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::{round_trip, text_value};
     #[test]
     fn unexpected_line_error_is_malformed_head() {
@@ -2908,23 +2909,23 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_items_in_linear_time() {
-        let mut one = OPTIONS.to_vec();
-        Interleaved { channel: 0, data: vec![9; 10] }.write(&mut one).unwrap();
-        let bytes = one.repeat(50_000);
-        let started = std::time::Instant::now();
-        let (items, failure) = decode_all(Frames::new, &bytes);
-        assert_eq!(failure, None);
-        assert_eq!(items.len(), 100_000);
-        assert!(items.iter().all(Result::is_ok));
-        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
-        let mut message = Message::response(Version::Rtsp10, 200, "OK");
-        message.body = vec![b'x'; MAX_BODY];
-        message.push_header("Content-Length", &MAX_BODY.to_string());
-        let bytes = message.to_bytes().unwrap();
-        let started = std::time::Instant::now();
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
-        assert_eq!(decode_all(Frames::new, &bytes), (vec![Ok(Frame::Message(message))], None));
-        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+        assert_linear("stream_takes_many_small_items_in_linear_time", rounds(12_500), |size| {
+            let mut one = OPTIONS.to_vec();
+            Interleaved { channel: 0, data: vec![9; 10] }.write(&mut one).unwrap();
+            let bytes = one.repeat(size);
+            let (items, failure) = decode_all(Frames::new, &bytes);
+            assert_eq!(failure, None);
+            assert_eq!(items.len(), size * 2);
+            assert!(items.iter().all(Result::is_ok));
+        });
+        assert_linear("large_rtsp_body", MAX_BODY / 4, |size| {
+            let mut message = Message::response(Version::Rtsp10, 200, "OK");
+            message.body = vec![b'x'; size];
+            message.push_header("Content-Length", &size.to_string());
+            let bytes = message.to_bytes().unwrap();
+            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
+            assert_eq!(decode_all(Frames::new, &bytes), (vec![Ok(Frame::Message(message))], None));
+        });
     }
 
     fn items_of(bytes: &[u8]) -> Vec<Result<Frame, Error>> {
@@ -3016,7 +3017,7 @@ mod tests {
         let mut rng = Lcg::new(42);
         let words = ["", "a", "PLAY", "a b", "x;y", "q\"", ":1", "AQ==", "\"z\"", "\"", "TCP", "unicast", "é"];
         let mut written = 0;
-        for _ in 0..20_000 {
+        for _ in 0..rounds(20_000) {
             let w = |rng: &mut Lcg| {
                 let mut value = words[rng.index(words.len())].to_string();
                 if rng.index(16) == 0 {

@@ -2451,19 +2451,20 @@ fn answered_closed(p: &[u8], open: impl Fn(u8, u16) -> bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
 
     #[test]
     fn a_full_automatic_range_is_not_scanned_again() {
-        let mut w = World::new(MAX_HOSTS);
-        let subnet = Subnet::new(Prefix { addr: Ipv4Addr::new(198, 0, 0, 0).into(), len: 8 }).unwrap();
-        assert_eq!(w.free_auto(&subnet), None);
-        assert!(w.auto_full);
-        let started = std::time::Instant::now();
-        for _ in 0..10_000 {
+        assert_linear("a_full_automatic_range_is_not_scanned_again", rounds(2_000_000), |size| {
+            let mut w = World::new(MAX_HOSTS);
+            let subnet = Subnet::new(Prefix { addr: Ipv4Addr::new(198, 0, 0, 0).into(), len: 8 }).unwrap();
             assert_eq!(w.free_auto(&subnet), None);
-        }
-        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+            assert!(w.auto_full);
+            for _ in 0..size {
+                assert_eq!(std::hint::black_box(&mut w).free_auto(&subnet), None);
+            }
+        });
     }
 
     #[test]

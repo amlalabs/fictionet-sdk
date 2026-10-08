@@ -1234,6 +1234,7 @@ pub fn unix_path(addr: &[u8; UNIX_ADDR_LEN]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::assert_linear;
     use super::*;
     use codec::{
         Lcg, Stream,
@@ -1711,19 +1712,19 @@ mod tests {
 
     #[test]
     fn longest_header_byte_at_a_time_is_bounded() {
-        let header = V2 { command: Command::Proxy, addresses: Addresses::Unspec,
-            tlvs: vec![Tlv::Noop(vec![0; MAX_TLV_VALUE])] };
-        let bytes = header.to_bytes().unwrap();
-        let mut stream = Stream::new(Headers::new());
-        let started = std::time::Instant::now();
-        for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
-            assert_eq!(stream.push(chunk), 1);
-            if i + 1 < bytes.len() { assert_eq!(stream.next(), None); }
-            assert!(stream.buffered() <= MAX_HEADER_LEN);
-        }
-        assert_eq!(stream.next(), Some(Ok(Ok(Header::V2(header)))));
-        assert_eq!(stream.buffered(), 0);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("longest_header_byte_at_a_time_is_bounded", MAX_TLV_VALUE / 4, |size| {
+            let header = V2 { command: Command::Proxy, addresses: Addresses::Unspec,
+                tlvs: vec![Tlv::Noop(vec![0; size])] };
+            let bytes = header.to_bytes().unwrap();
+            let mut stream = Stream::new(Headers::new());
+            for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
+                assert_eq!(stream.push(chunk), 1);
+                if i + 1 < bytes.len() { assert_eq!(stream.next(), None); }
+                assert!(stream.buffered() <= MAX_HEADER_LEN);
+            }
+            assert_eq!(stream.next(), Some(Ok(Ok(Header::V2(header)))));
+            assert_eq!(stream.buffered(), 0);
+        });
     }
 
     fn random_v2(rng: &mut Lcg) -> V2 {

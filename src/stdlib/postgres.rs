@@ -2512,6 +2512,7 @@ fn show_tag(t: u8) -> String {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
@@ -2834,7 +2835,7 @@ mod tests {
         for value in [
             SaslInitialResponse {
                 mechanism: "M".into(),
-                data: Some(vec![7; 100_000]),
+                data: Some(vec![7; rounds(100_000)]),
             },
             SaslInitialResponse {
                 mechanism: "M\0N".into(),

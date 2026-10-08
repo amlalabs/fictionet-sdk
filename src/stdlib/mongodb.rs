@@ -1526,6 +1526,7 @@ fn parse_reply(data: &[u8]) -> Result<Reply, Error> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
@@ -2183,14 +2184,14 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_messages_in_linear_time() {
-        let one = msg(1, Document::new().with("ping", Bson::Int32(1))).to_bytes().unwrap();
-        let bytes = one.repeat(100_000);
-        let started = std::time::Instant::now();
-        let (items, failure) = decode_all(Frames::<Message>::new, &bytes);
-        assert_eq!(failure, None);
-        assert_eq!(items.len(), 100_000);
-        assert!(items.iter().all(Result::is_ok));
-        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+        assert_linear("stream_takes_many_small_messages_in_linear_time", rounds(25_000), |size| {
+            let one = msg(1, Document::new().with("ping", Bson::Int32(1))).to_bytes().unwrap();
+            let bytes = one.repeat(size);
+            let (items, failure) = decode_all(Frames::<Message>::new, &bytes);
+            assert_eq!(failure, None);
+            assert_eq!(items.len(), size);
+            assert!(items.iter().all(Result::is_ok));
+        });
     }
 
     #[test]

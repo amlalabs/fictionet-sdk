@@ -2851,6 +2851,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::assert_linear;
     use super::harness::check_extension_value;
     use super::*;
     use fictionet::stdlib::codec::{
@@ -3829,19 +3830,19 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
 
     #[test]
     fn pem_decoder_takes_a_big_block_a_byte_at_a_time_in_linear_time() {
-        let big = PemBlock { label: "X".into(), data: vec![0x5a; MAX_PEM_DATA] }.to_bytes().unwrap();
-        let started = std::time::Instant::now();
-        let mut d = Stream::new(PemBlocks::new());
-        let mut n = 0;
-        for b in chunks(&big, &[1]) {
-            assert_eq!(d.push(b), 1);
-            while let Some(r) = d.next() {
-                assert_eq!(r.unwrap().data.len(), MAX_PEM_DATA);
-                n += 1;
+        assert_linear("pem_decoder_takes_a_big_block_a_byte_at_a_time_in_linear_time", MAX_PEM_DATA / 4, |size| {
+            let big = PemBlock { label: "X".into(), data: vec![0x5a; size] }.to_bytes().unwrap();
+            let mut d = Stream::new(PemBlocks::new());
+            let mut n = 0;
+            for b in chunks(&big, &[1]) {
+                assert_eq!(d.push(b), 1);
+                while let Some(r) = d.next() {
+                    assert_eq!(r.unwrap().data.len(), size);
+                    n += 1;
+                }
             }
-        }
-        assert_eq!(n, 1);
-        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+            assert_eq!(n, 1);
+        });
     }
 
     /// The checks the fuzz target makes, on one input.

@@ -1414,6 +1414,7 @@ pub enum ClientPhase {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::assert_linear;
     use super::*;
     use codec::{
         Decode, Fail, Lcg, Stream,
@@ -1559,21 +1560,23 @@ mod tests {
 
     #[test]
     fn requests_byte_at_a_time_are_bounded() {
-        let request = Socks4Request { command: Socks4Command::Connect, port: 80,
-            destination: Socks4Destination::Domain(vec![b'd'; MAX_SOCKS4_DOMAIN]), user_id: vec![b'u'; MAX_USER_ID] };
-        let bytes = request.to_bytes().unwrap();
-        let started = std::time::Instant::now();
-        for _ in 0..2000 {
-            let mut stream = Stream::new(ClientMessages::new());
-            for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
-                assert_eq!(stream.push(chunk), 1);
-                if i + 1 < bytes.len() { assert_eq!(stream.next(), None); }
-                assert!(stream.buffered() <= MAX_MESSAGE);
+        let check = |size| {
+            let request = Socks4Request { command: Socks4Command::Connect, port: 80,
+                destination: Socks4Destination::Domain(vec![b'd'; size]), user_id: vec![b'u'; size] };
+            let bytes = request.to_bytes().unwrap();
+            for _ in 0..2000 {
+                let mut stream = Stream::new(ClientMessages::new());
+                for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
+                    assert_eq!(stream.push(chunk), 1);
+                    if i + 1 < bytes.len() { assert_eq!(stream.next(), None); }
+                    assert!(stream.buffered() <= MAX_MESSAGE);
+                }
+                assert_eq!(stream.next(), Some(Ok(Ok(ClientMessage::Socks4(request.clone())))));
+                assert_eq!(stream.buffered(), 0);
             }
-            assert_eq!(stream.next(), Some(Ok(Ok(ClientMessage::Socks4(request.clone())))));
-            assert_eq!(stream.buffered(), 0);
-        }
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        };
+        check(MAX_USER_ID);
+        assert_linear("requests_byte_at_a_time_are_bounded", MAX_USER_ID / 4, check);
     }
 
     #[test]

@@ -324,6 +324,7 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
@@ -522,7 +523,7 @@ mod tests {
     fn fuzz_loop() {
         let mut rng = Lcg::new(0x5eed_4789);
         let mut parsed = 0;
-        for _ in 0..20_000 {
+        for _ in 0..rounds(20_000) {
             let len = rng.index(40);
             let mut data = vec![0; len];
             rng.fill(&mut data);

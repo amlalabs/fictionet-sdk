@@ -1159,6 +1159,7 @@ impl Decode for Messages {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::decode_all;
@@ -1942,7 +1943,7 @@ mod tests {
     #[test]
     fn refusing_deep_hand_built_params_drops_them_iteratively() {
         let mut params = Value::Null;
-        for _ in 0..200_000 {
+        for _ in 0..rounds(200_000) {
             params = Value::Array(vec![params]);
         }
         let request = Value::Object(vec![

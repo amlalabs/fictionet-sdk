@@ -1973,6 +1973,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::{encode, mixes};
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
@@ -2690,7 +2691,7 @@ mod tests {
         many.push(Attribute::Communities { values: vec![1; 1100], partial: false });
         assert_eq!(bad(route(many), &TWO), Error::Unwritable);
         let mut huge = well_known();
-        huge.push(Attribute::Communities { values: vec![1; 10_000_000], partial: false });
+        huge.push(Attribute::Communities { values: vec![1; rounds(10_000_000)], partial: false });
         assert_eq!(bad(route(huge), &TWO), Error::Unwritable);
         let mut unknown = well_known();
         unknown.push(Attribute::Unknown { flags: 0x80, kind: 99, value: vec![0; 5000] });
@@ -2751,16 +2752,16 @@ mod tests {
 
     #[test]
     fn stream_reads_many_small_frames_in_linear_time() {
-        let one = Message::Keepalive.to_frame(&TWO).unwrap().to_bytes().unwrap();
-        let bytes = one.repeat(200_000);
-        let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames::<Frame>::new());
-        let mut count = 0;
-        pump(&mut stream, &bytes, |_| count += 1).unwrap();
-        finish(&mut stream, |_| count += 1).unwrap();
-        assert_eq!(count, 200_000);
-        assert_eq!(stream.buffered(), 0);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("stream_reads_many_small_frames_in_linear_time", rounds(50_000), |size| {
+            let one = Message::Keepalive.to_frame(&TWO).unwrap().to_bytes().unwrap();
+            let bytes = one.repeat(size);
+            let mut stream = Stream::new(Frames::<Frame>::new());
+            let mut count = 0;
+            pump(&mut stream, &bytes, |_| count += 1).unwrap();
+            finish(&mut stream, |_| count += 1).unwrap();
+            assert_eq!(count, size);
+            assert_eq!(stream.buffered(), 0);
+        });
     }
 
     /// Checks what the fuzz target checks: a message read can be written,
@@ -2850,7 +2851,7 @@ mod tests {
         // attribute readers see most of the inputs.
         let mut r = Lcg::new(7);
         let mut read = 0;
-        for _ in 0..20_000 {
+        for _ in 0..rounds(20_000) {
             let mut attrs = Vec::new();
             for _ in 0..r.index(4) {
                 let kind = [1, 2, 3, 4, 5, 6, 7, 8, 14, 15, 99][r.index(11)];

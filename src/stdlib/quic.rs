@@ -1820,6 +1820,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::harness::check_payload;
     use super::*;
     use fictionet::stdlib::test_support::hex;
@@ -1911,7 +1912,7 @@ mod tests {
         assert_eq!(PacketNumber { value: 0, len: 1 }.decode(Some(MAX_VARINT - 1)), Some((1 << 62) - 256));
         // Every encoding decodes back to the full number.
         let mut largest = None;
-        for full in (0..2_000_000u64).step_by(997) {
+        for full in (0..rounds(2_000_000) as u64).step_by(997) {
             let pn = PacketNumber::encode(full, largest).unwrap();
             assert_eq!(pn.decode(largest), Some(full));
             largest = Some(full);
@@ -2714,17 +2715,20 @@ mod tests {
         // A reassembler read one byte at a time, with a byte held at the
         // far end of its window, gives the stream in order. With a queue,
         // each read costs the bytes read, not the bytes held.
-        let mut r = Reassembler::new();
-        let mut read = Vec::new();
-        for i in 0..20_000u64 {
-            r.insert(i + MAX_REASSEMBLY as u64 - 1, &[9]).unwrap();
-            r.insert(i, &[i as u8]).unwrap();
-            read.extend(r.read());
-            assert_eq!(r.buffered(), MAX_REASSEMBLY - 1);
+        for offset in (0..rounds(20_000)).step_by(20_000) {
+            let n = (rounds(20_000) - offset).min(20_000);
+            let mut r = Reassembler::new();
+            let mut read = Vec::new();
+            for i in 0..n as u64 {
+                r.insert(i + MAX_REASSEMBLY as u64 - 1, &[9]).unwrap();
+                r.insert(i, &[i as u8]).unwrap();
+                read.extend(r.read());
+                assert_eq!(r.buffered(), MAX_REASSEMBLY - 1);
+            }
+            assert_eq!(read, (0..n as u64).map(|i| i as u8).collect::<Vec<_>>());
+            assert_eq!(r.clone(), r);
+            assert_eq!(Reassembler::new(), Reassembler::default());
         }
-        assert_eq!(read, (0..20_000u64).map(|i| i as u8).collect::<Vec<_>>());
-        assert_eq!(r.clone(), r);
-        assert_eq!(Reassembler::new(), Reassembler::default());
     }
 
     fn random_value(rng: &mut Lcg) -> u64 {

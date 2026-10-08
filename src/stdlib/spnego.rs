@@ -889,6 +889,7 @@ impl Decode for Frames {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
@@ -1405,7 +1406,7 @@ mod tests {
     fn decoder_holds_at_most_max_token() {
         // Pushed again and again without taking tokens out.
         let mut d = Stream::new(Frames::new());
-        for _ in 0..40_000 {
+        for _ in 0..rounds(40_000) {
             let _ = d.push(&ACCEPT_COMPLETED);
             assert!(d.buffered() <= MAX_TOKEN);
         }

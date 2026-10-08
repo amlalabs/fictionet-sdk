@@ -1429,6 +1429,7 @@ impl From<Truncated> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
@@ -1872,7 +1873,7 @@ mod tests {
 
     #[test]
     fn writers_refuse_oversized_values() {
-        let huge = vec![0xab; 100_000];
+        let huge = vec![0xab; rounds(100_000)];
         let m = message(vec![Payload::new(Body::Nonce(huge.clone())), Payload::new(Body::VendorId(huge.clone()))]);
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&m);

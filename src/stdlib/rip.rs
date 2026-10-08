@@ -900,6 +900,7 @@ impl Wire for NgMessage {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::{
         Collect, CollectError, Fail, Lcg, Stream,
@@ -1409,7 +1410,7 @@ mod tests {
     fn streams_report_parse_errors_once() {
         assert_eq!(collect(&[7]), Err(Error::Command(7)));
         assert_eq!(ng_collect(&[1, 2]), Err(Error::Version(2)));
-        let b = [2, 2, 0, 0, 0, 2].repeat(10_000);
+        let b = [2, 2, 0, 0, 0, 2].repeat(rounds(10_000));
         contract::check_decode_with_alloc_limit(|| Collect::<Message>::new(MAX_MESSAGE), &b, 2 * (MAX_MESSAGE + 1));
     }
 
@@ -1678,7 +1679,7 @@ mod tests {
         assert_eq!(check(&repeated), Err(Error::TooManyEntries));
         let (mut ok, mut ng_ok) = (0, 0);
         // Deeper mutations need more trials to keep reaching valid messages.
-        for _ in 0..12_000 {
+        for _ in 0..rounds(12_000) {
             let b = shaped(&mut rng, &pool);
             if check(&b).is_ok() {
                 ok += 1;

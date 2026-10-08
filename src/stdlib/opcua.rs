@@ -3581,6 +3581,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::check_reader;
     use super::*;
     use fictionet::stdlib::codec::{
@@ -5187,26 +5188,22 @@ mod tests {
 
     #[test]
     fn decoder_takes_many_small_messages_in_linear_time() {
-        let mut stream = Vec::new();
-        for seq in 0..100_000 {
-            stream.extend_from_slice(
-                &msg(1, seq, 1, vec![1, 2, 3])
-                    .chunks(&Limits::default())
-                    .map(wire_chunks)
-                    .unwrap(),
-            );
-        }
-        let started = std::time::Instant::now();
-        let mut d = Stream::new(Messages::new());
-        let mut n = 0;
-        pump(&mut d, &stream, |_| n += 1).unwrap();
-        assert_eq!(n, 100_000);
-        assert_eq!(d.buffered(), 0);
-        assert!(
-            started.elapsed().as_secs() < 5,
-            "took {:?}",
-            started.elapsed()
-        );
+        assert_linear("decoder_takes_many_small_messages_in_linear_time", rounds(25_000), |size| {
+            let mut stream = Vec::new();
+            for seq in 0..size {
+                stream.extend_from_slice(
+                    &msg(1, seq as u32, 1, vec![1, 2, 3])
+                        .chunks(&Limits::default())
+                        .map(wire_chunks)
+                        .unwrap(),
+                );
+            }
+            let mut d = Stream::new(Messages::new());
+            let mut n = 0;
+            pump(&mut d, &stream, |_| n += 1).unwrap();
+            assert_eq!(n, size);
+            assert_eq!(d.buffered(), 0);
+        });
     }
 
     #[test]
@@ -5308,29 +5305,24 @@ mod tests {
 
     #[test]
     fn single_chunk_messages_are_counted_before_they_are_split() {
-        // A header leaving one byte per chunk, and a 16 MiB body: refused
-        // without first making 16 million slices.
-        let policy = "urn:other".to_string();
-        let fixed = HEADER_LEN + 4 + (4 + policy.len()) + 4 + 4 + 8;
-        let header = AsymmetricHeader {
-            policy_uri: policy,
-            sender_certificate: Some(vec![0; MIN_BUFFER_SIZE as usize - fixed - 1]),
-            receiver_thumbprint: None,
-        };
-        let opn = SecureMessage {
-            kind: SecureKind::Open(header),
-            channel_id: 0,
-            sequence_number: 0,
-            request_id: 0,
-            body: vec![0; MAX_MESSAGE_SIZE as usize],
-        };
-        let started = std::time::Instant::now();
-        assert_eq!(opn.chunks(&Limits::default()), Err(Error::TooLong));
-        assert!(
-            started.elapsed().as_millis() < 500,
-            "took {:?}",
-            started.elapsed()
-        );
+        assert_linear("single_chunk_messages_are_counted_before_they_are_split", MAX_MESSAGE_SIZE as usize / 4, |size| {
+            // A header leaving one byte per chunk is refused before splitting.
+            let policy = "urn:other".to_string();
+            let fixed = HEADER_LEN + 4 + (4 + policy.len()) + 4 + 4 + 8;
+            let header = AsymmetricHeader {
+                policy_uri: policy,
+                sender_certificate: Some(vec![0; MIN_BUFFER_SIZE as usize - fixed - 1]),
+                receiver_thumbprint: None,
+            };
+            let opn = SecureMessage {
+                kind: SecureKind::Open(header),
+                channel_id: 0,
+                sequence_number: 0,
+                request_id: 0,
+                body: vec![0; size],
+            };
+            assert_eq!(opn.chunks(&Limits::default()), Err(Error::TooLong));
+        });
     }
 
     #[test]

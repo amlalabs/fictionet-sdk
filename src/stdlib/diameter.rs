@@ -1513,6 +1513,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::FORMATS;
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
@@ -1925,13 +1926,13 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_messages_in_linear_time() {
-        let data = Message::request(command::DEVICE_WATCHDOG, 0, 1, 1).to_bytes().unwrap().repeat(200_000);
-        let started = std::time::Instant::now();
-        let (messages, error) = decode_all(Frames::<Message>::new, &data);
-        assert_eq!(error, None);
-        assert_eq!(messages.len(), 200_000);
-        assert!(messages.iter().all(Result::is_ok));
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("stream_takes_many_small_messages_in_linear_time", rounds(50_000), |size| {
+            let data = Message::request(command::DEVICE_WATCHDOG, 0, 1, 1).to_bytes().unwrap().repeat(size);
+            let (messages, error) = decode_all(Frames::<Message>::new, &data);
+            assert_eq!(error, None);
+            assert_eq!(messages.len(), size);
+            assert!(messages.iter().all(Result::is_ok));
+        });
     }
 
     #[test]

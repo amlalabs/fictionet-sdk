@@ -1143,6 +1143,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::harness::merged;
     use super::*;
     use fictionet::stdlib::codec::{
@@ -1813,7 +1814,7 @@ mod tests {
         }
         // Drain what is left, with no new requests.
         let mut quiet = 0;
-        for _ in 0..10_000 {
+        for _ in 0..rounds(10_000) {
             if wires[0].is_empty() && wires[1].is_empty() {
                 quiet += 1;
                 break;

@@ -1546,6 +1546,7 @@ fn read_members(records: &mut Records<'_>, depth: usize) -> Result<Vec<Attribute
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
@@ -2169,17 +2170,20 @@ mod tests {
         );
         assert_unwritable(&m);
         // Very deep input is cut off without deep recursion.
-        let mut bytes = vec![1, 1, 0, 2, 0, 0, 0, 1, 2];
-        bytes.extend(rec(0x34, "deep", b""));
-        for _ in 0..50_000 {
-            bytes.extend(rec(0x4a, "", b"m"));
-            bytes.extend(rec(0x34, "", b""));
+        for offset in (0..rounds(50_000)).step_by(50_000) {
+            let count = (rounds(50_000) - offset).min(50_000);
+            let mut bytes = vec![1, 1, 0, 2, 0, 0, 0, 1, 2];
+            bytes.extend(rec(0x34, "deep", b""));
+            for _ in 0..count {
+                bytes.extend(rec(0x4a, "", b"m"));
+                bytes.extend(rec(0x34, "", b""));
+            }
+            bytes.push(3);
+            assert_eq!(
+                Message::parse(&bytes),
+                Err(Error::TooDeep)
+            );
         }
-        bytes.push(3);
-        assert_eq!(
-            Message::parse(&bytes),
-            Err(Error::TooDeep)
-        );
     }
 
     #[test]
@@ -2239,26 +2243,22 @@ mod tests {
 
     #[test]
     fn head_scans_a_large_input_in_linear_time() {
-        let mut message = Message::request(operation::PRINT_JOB, 1);
-        for i in 0..30_000 {
-            message.add(
-                tag::JOB_ATTRIBUTES,
-                Attribute::new(format!("n{i}"), Value::Integer(i)),
+        assert_linear("head_scans_a_large_input_in_linear_time", 7_500, |size| {
+            let mut message = Message::request(operation::PRINT_JOB, 1);
+            for i in 0..size {
+                message.add(
+                    tag::JOB_ATTRIBUTES,
+                    Attribute::new(format!("n{i}"), Value::Integer(i as i32)),
+                );
+            }
+            let bytes = message.to_bytes().unwrap();
+            assert!(bytes.len() < MAX_HEAD);
+            contract::check_decode_with_alloc_limit(Head::new, &bytes, 2 * MAX_HEAD);
+            assert_eq!(
+                decode_all(Head::new, &bytes),
+                (vec![Ok(Header::from(message))], None)
             );
-        }
-        let bytes = message.to_bytes().unwrap();
-        assert!(bytes.len() < MAX_HEAD);
-        let started = std::time::Instant::now();
-        contract::check_decode_with_alloc_limit(Head::new, &bytes, 2 * MAX_HEAD);
-        assert_eq!(
-            decode_all(Head::new, &bytes),
-            (vec![Ok(Header::from(message))], None)
-        );
-        assert!(
-            started.elapsed().as_secs() < 10,
-            "took {:?}",
-            started.elapsed()
-        );
+        });
     }
 
     #[test]

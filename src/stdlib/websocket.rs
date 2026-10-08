@@ -1419,6 +1419,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::bounded;
     use super::*;
     use fictionet::stdlib::codec::{
@@ -1953,34 +1954,31 @@ mod tests {
 
     #[test]
     fn decoder_reads_many_frames_from_one_push_in_linear_time() {
-        // Two-byte pongs, two million of them, pushed at once. Removing each
-        // frame from the front of the buffer would move the rest every
-        // time, about 4 * 10^12 bytes in all.
-        let n = 1 << 21;
-        let stream: Vec<u8> = [0x8a, 0x00].repeat(n);
-        let start = std::time::Instant::now();
-        let mut d = Stream::new(Messages::new(Role::Client));
-        push(&mut d, &stream);
-        let mut count = 0;
-        while let Some(m) = d.next() {
-            assert_eq!(m, Ok(Message::Pong(vec![])));
-            count += 1;
-        }
-        assert_eq!(count, n);
-        assert_eq!(d.buffered(), 0);
-        assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
-        // Pushing after some frames are taken out keeps the order.
-        let mut d = Stream::new(Messages::new(Role::Client));
-        push(&mut d, &[&PING[..], &HEL, &PING].concat());
-        assert_eq!(d.next(), Some(Ok(Message::Ping(b"Hello".to_vec()))));
-        assert_eq!(d.buffered(), HEL.len() + PING.len());
-        push(&mut d, &LO[..1]);
-        assert_eq!(d.next(), Some(Ok(Message::Ping(b"Hello".to_vec()))));
-        assert_eq!(d.buffered(), 1);
-        assert_eq!(d.next(), None);
-        push(&mut d, &LO[1..]);
-        assert_eq!(d.next(), Some(Ok(Message::Text("Hello".into()))));
-        assert_eq!(d.buffered(), 0);
+        assert_linear("decoder_reads_many_frames_from_one_push_in_linear_time", rounds(524288), |size| {
+            let n = size;
+            let stream: Vec<u8> = [0x8a, 0x00].repeat(n);
+            let mut d = Stream::new(Messages::new(Role::Client));
+            push(&mut d, &stream);
+            let mut count = 0;
+            while let Some(m) = d.next() {
+                assert_eq!(m, Ok(Message::Pong(vec![])));
+                count += 1;
+            }
+            assert_eq!(count, n);
+            assert_eq!(d.buffered(), 0);
+            // Pushing after some frames are taken out keeps the order.
+            let mut d = Stream::new(Messages::new(Role::Client));
+            push(&mut d, &[&PING[..], &HEL, &PING].concat());
+            assert_eq!(d.next(), Some(Ok(Message::Ping(b"Hello".to_vec()))));
+            assert_eq!(d.buffered(), HEL.len() + PING.len());
+            push(&mut d, &LO[..1]);
+            assert_eq!(d.next(), Some(Ok(Message::Ping(b"Hello".to_vec()))));
+            assert_eq!(d.buffered(), 1);
+            assert_eq!(d.next(), None);
+            push(&mut d, &LO[1..]);
+            assert_eq!(d.next(), Some(Ok(Message::Text("Hello".into()))));
+            assert_eq!(d.buffered(), 0);
+        });
     }
 
     #[test]
@@ -2327,7 +2325,7 @@ mod tests {
         assert!(d.buffered() <= MAX_HEADER_LEN + MAX_CONTROL_PAYLOAD, "{}", d.buffered());
         // Repeated pushes without taking messages out stop growing.
         let mut d = Stream::new(Messages::new(Role::Client));
-        let chunk = [0x8a, 0x00].repeat(1 << 22);
+        let chunk = [0x8a, 0x00].repeat(rounds(1 << 22));
         for _ in 0..3 {
             let _ = d.push(&chunk);
         }

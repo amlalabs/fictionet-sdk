@@ -482,6 +482,7 @@ impl From<Truncated> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::{
         Lcg,
@@ -897,41 +898,40 @@ mod tests {
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         p.extension = Some(HeaderExtension::Other {
             profile: 1,
-            data: vec![0; 300_000],
+            data: vec![0; rounds(300_000)],
         });
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         p.extension = None;
-        p.payload = vec![0; 100_000];
+        p.payload = vec![0; rounds(100_000)];
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
     fn stream_splits_packets_and_null_frames() {
-        let a = rtcp::Frame::from_packet(&rtp(&[1])).unwrap();
-        let bytes = [
-            rtcp::Frame(vec![]).to_bytes().unwrap(),
-            a.to_bytes().unwrap(),
-            rtcp::Frame(vec![]).to_bytes().unwrap(),
-        ]
-        .concat();
-        contract::check_decode_with_alloc_limit(Frames::<rtcp::Frame>::new, &bytes, 2 * (MAX_PACKET + 2));
-        let (items, error) = decode_all(Frames::<rtcp::Frame>::new, &bytes);
-        assert_eq!(error, None);
-        assert_eq!(items, [rtcp::Frame(vec![]), a.clone(), rtcp::Frame(vec![])]);
-        assert_eq!(Demux::parse(&items[1].0), Ok(Demux::Rtp(rtp(&[1]))));
-        let large = rtcp::Frame(vec![1; MAX_PACKET]).to_bytes().unwrap();
-        contract::check_decode_with_alloc_limit(Frames::<rtcp::Frame>::new, &large, 2 * (MAX_PACKET + 2));
-        assert_eq!(
-            rtcp::Frame(vec![1; MAX_PACKET + 1]).to_bytes(),
-            Err(rtcp::Error::Unwritable)
-        );
-        let many = a.to_bytes().unwrap().repeat(200_000);
-        let started = std::time::Instant::now();
-        let (items, error) = decode_all(Frames::<rtcp::Frame>::new, &many);
-        // Allow slow test hosts while catching repeated scans or front removal.
-        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
-        assert_eq!(items.len(), 200_000);
-        assert_eq!(error, None);
+        assert_linear("stream_splits_packets_and_null_frames", rounds(50_000), |size| {
+            let a = rtcp::Frame::from_packet(&rtp(&[1])).unwrap();
+            let bytes = [
+                rtcp::Frame(vec![]).to_bytes().unwrap(),
+                a.to_bytes().unwrap(),
+                rtcp::Frame(vec![]).to_bytes().unwrap(),
+            ]
+            .concat();
+            contract::check_decode_with_alloc_limit(Frames::<rtcp::Frame>::new, &bytes, 2 * (MAX_PACKET + 2));
+            let (items, error) = decode_all(Frames::<rtcp::Frame>::new, &bytes);
+            assert_eq!(error, None);
+            assert_eq!(items, [rtcp::Frame(vec![]), a.clone(), rtcp::Frame(vec![])]);
+            assert_eq!(Demux::parse(&items[1].0), Ok(Demux::Rtp(rtp(&[1]))));
+            let large = rtcp::Frame(vec![1; MAX_PACKET]).to_bytes().unwrap();
+            contract::check_decode_with_alloc_limit(Frames::<rtcp::Frame>::new, &large, 2 * (MAX_PACKET + 2));
+            assert_eq!(
+                rtcp::Frame(vec![1; MAX_PACKET + 1]).to_bytes(),
+                Err(rtcp::Error::Unwritable)
+            );
+            let many = a.to_bytes().unwrap().repeat(size);
+            let (items, error) = decode_all(Frames::<rtcp::Frame>::new, &many);
+            assert_eq!(items.len(), size);
+            assert_eq!(error, None);
+        });
     }
 
     #[test]

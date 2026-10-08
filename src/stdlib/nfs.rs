@@ -2490,6 +2490,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::harness::check;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
@@ -3886,7 +3887,7 @@ mod tests {
         for r in mount_responses() {
             seeds.push((r.procedure(), r.to_results().unwrap()));
         }
-        for _ in 0..20_000 {
+        for _ in 0..rounds(20_000) {
             let (p, seed) = &seeds[rng.index(seeds.len())];
             let mut b = seed.clone();
             // Edit bytes and sometimes replace a complete XDR word.

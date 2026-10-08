@@ -1404,6 +1404,7 @@ mod codec_tests {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, pump};
@@ -2393,33 +2394,29 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
-        let one = Tpdu::Data(Data {
-            eot: true,
-            number: 0,
-            data: vec![1],
-        })
-        .to_bytes()
-        .map(tpkt::Packet::new)
-        .unwrap()
-        .to_bytes()
-        .unwrap();
-        let stream: Vec<u8> = one
-            .iter()
-            .copied()
-            .cycle()
-            .take(one.len() * 200_000)
-            .collect();
-        let started = std::time::Instant::now();
-        let mut d = Stream::new(Frames::<tpkt::Packet>::new());
-        let mut n = 0;
-        pump(&mut d, &stream, |_| n += 1).unwrap();
-        assert_eq!(n, 200_000);
-        assert_eq!(d.buffered(), 0);
-        assert!(
-            started.elapsed().as_secs() < 5,
-            "took {:?}",
-            started.elapsed()
-        );
+        assert_linear("stream_takes_many_small_packets_in_linear_time", rounds(50_000), |size| {
+            let one = Tpdu::Data(Data {
+                eot: true,
+                number: 0,
+                data: vec![1],
+            })
+            .to_bytes()
+            .map(tpkt::Packet::new)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+            let stream: Vec<u8> = one
+                .iter()
+                .copied()
+                .cycle()
+                .take(one.len() * size)
+                .collect();
+            let mut d = Stream::new(Frames::<tpkt::Packet>::new());
+            let mut n = 0;
+            pump(&mut d, &stream, |_| n += 1).unwrap();
+            assert_eq!(n, size);
+            assert_eq!(d.buffered(), 0);
+        });
     }
 
     /// The checks the fuzz target makes, on one buffer.
@@ -2484,7 +2481,7 @@ mod tests {
     #[test]
     fn lcg_fuzz() {
         let mut rng = Lcg::new(0x0102_0304_0506_0708);
-        for i in 0..20_000 {
+        for i in 0..rounds(20_000) {
             let mut b = rng.bytes(79);
             // Most buffers look like packets, so the deeper code runs.
             if i % 4 != 0 && b.len() >= 5 {

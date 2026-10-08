@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn many_distant_holds_do_not_walk_the_queue_per_call() {
-        let count = 40_000;
+        let count = test_support::rounds(40_000);
         let mut faults = Faults::new(0, 0, count);
         let plan = rule(ItemFault::<modbus::Frame>::Hold { window: u64::MAX });
         let mut out = Vec::new();

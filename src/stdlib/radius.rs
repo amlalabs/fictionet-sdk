@@ -1838,6 +1838,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::check_datagram;
     use super::*;
     use fictionet::stdlib::test_support::hex;
@@ -2527,12 +2528,12 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
-        let one = Packet::new(Code::StatusServer, 1, [0; 16]).to_bytes().unwrap();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100_000).collect();
-        let started = std::time::Instant::now();
-        let (packets, error) = decode_all(Frames::<Packet>::new, &stream);
-        assert_eq!((packets.len(), error), (100_000, None));
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("stream_takes_many_small_packets_in_linear_time", rounds(25_000), |size| {
+            let one = Packet::new(Code::StatusServer, 1, [0; 16]).to_bytes().unwrap();
+            let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
+            let (packets, error) = decode_all(Frames::<Packet>::new, &stream);
+            assert_eq!((packets.len(), error), (size, None));
+        });
     }
 
     #[test]

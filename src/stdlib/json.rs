@@ -1117,6 +1117,7 @@ fn is_scalar_byte(c: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
@@ -1362,7 +1363,7 @@ mod tests {
             .stack_size(256 * 1024)
             .spawn(|| {
                 let mut value = Value::Null;
-                for _ in 0..100_000 {
+                for _ in 0..rounds(100_000) {
                     value = Value::Array(vec![Value::from("sibling"), value]);
                     value = Value::Object(vec![("child".into(), value)]);
                 }
@@ -1451,7 +1452,7 @@ mod tests {
     #[test]
     fn stream_releases_consumed_bytes() {
         let mut stream = Stream::new(Values::new());
-        for _ in 0..10_000 {
+        for _ in 0..rounds(10_000) {
             assert_eq!(stream.push(b"{}"), 2);
             assert_eq!(stream.next(), Some(Ok(Value::Object(vec![]))));
             assert_eq!(stream.buffered(), 0);
@@ -1674,7 +1675,7 @@ mod tests {
     fn generated_and_mutated_values() {
         let mut rng = Lcg::new(0x5eed_1234);
         let mut parsed = 0;
-        for _ in 0..20_000 {
+        for _ in 0..rounds(20_000) {
             parsed += usize::from(check_parsed(&random_input(&mut rng)));
         }
         assert!(parsed > 100, "only {parsed} parsed inputs");

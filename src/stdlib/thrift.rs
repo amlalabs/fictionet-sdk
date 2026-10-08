@@ -1443,6 +1443,7 @@ impl From<Truncated> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, finish, pump,
@@ -1857,15 +1858,15 @@ mod tests {
 
     #[test]
     fn stream_reads_many_small_frames_in_linear_time() {
-        let one = Frame(vec![1, 2, 3]).to_bytes().unwrap();
-        let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames::<Frame>::new());
-        let mut n = 0;
-        pump(&mut stream, &one.repeat(200_000), |frame| { assert_eq!(frame.0, [1, 2, 3]); n += 1; }).unwrap();
-        finish(&mut stream, |_| unreachable!()).unwrap();
-        assert_eq!(n, 200_000);
-        assert_eq!(stream.buffered(), 0);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("stream_reads_many_small_frames_in_linear_time", rounds(50_000), |size| {
+            let one = Frame(vec![1, 2, 3]).to_bytes().unwrap();
+            let mut stream = Stream::new(Frames::<Frame>::new());
+            let mut n = 0;
+            pump(&mut stream, &one.repeat(size), |frame| { assert_eq!(frame.0, [1, 2, 3]); n += 1; }).unwrap();
+            finish(&mut stream, |_| unreachable!()).unwrap();
+            assert_eq!(n, size);
+            assert_eq!(stream.buffered(), 0);
+        });
     }
 
     fn check_messages(bytes: &[u8]) {
@@ -1981,22 +1982,23 @@ mod tests {
 
     #[test]
     fn messages_scan_in_linear_time() {
-        // Scanning 400,000 boolean fields from the start for every byte
-        // would require about 10^11 steps.
-        let body = (0..400_000).map(|i| Field { id: (i % 15 + 1) as i16, value: Value::Bool(i % 3 == 0) }).collect();
-        let dense = Message { body, ..add_call() };
-        let binary = Message { body: vec![Field { id: 1, value: Value::Binary(vec![7; 1 << 20]) }], ..add_call() };
-        for (message, protocol, size) in [(dense, Protocol::Compact, 1), (binary, Protocol::Binary, 16)] {
-            let bytes = EncodedMessage { message: message.clone(), protocol }.to_bytes().unwrap();
-            fictionet::stdlib::test_support::check_work(
-                EncodedMessages::new, &bytes, EncodedMessages::examined, 32, 16);
-            let mut stream = Stream::new(EncodedMessages::new());
-            let mut got = Vec::new();
-            for part in chunks(&bytes, &[size]) {
-                pump(&mut stream, part, |item| got.push(item)).unwrap();
+        for offset in (0..rounds(400_000)).step_by(400_000) {
+            let size = (rounds(400_000) - offset).min(400_000);
+            let body = (0..size).map(|i| Field { id: (i % 15 + 1) as i16, value: Value::Bool(i % 3 == 0) }).collect();
+            let dense = Message { body, ..add_call() };
+            let binary = Message { body: vec![Field { id: 1, value: Value::Binary(vec![7; 1 << 20]) }], ..add_call() };
+            for (message, protocol, size) in [(dense, Protocol::Compact, 1), (binary, Protocol::Binary, 16)] {
+                let bytes = EncodedMessage { message: message.clone(), protocol }.to_bytes().unwrap();
+                fictionet::stdlib::test_support::check_work(
+                    EncodedMessages::new, &bytes, EncodedMessages::examined, 32, 16);
+                let mut stream = Stream::new(EncodedMessages::new());
+                let mut got = Vec::new();
+                for part in chunks(&bytes, &[size]) {
+                    pump(&mut stream, part, |item| got.push(item)).unwrap();
+                }
+                finish(&mut stream, |item| got.push(item)).unwrap();
+                assert_eq!(got, [EncodedMessage { message, protocol }]);
             }
-            finish(&mut stream, |item| got.push(item)).unwrap();
-            assert_eq!(got, [EncodedMessage { message, protocol }]);
         }
     }
 

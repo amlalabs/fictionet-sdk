@@ -1782,6 +1782,7 @@ impl From<Truncated> for Stop {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::assert_linear;
     use super::*;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::{
@@ -2421,15 +2422,15 @@ mod tests {
 
     #[test]
     fn long_instruction_allocation_contract() {
-        let ins = EncoderInstruction::InsertWithLiteralName { name: vec![b'0'; 30_000], value: vec![b'1'; 30_000] };
-        let bytes = ins.to_bytes().unwrap();
-        let start = std::time::Instant::now();
-        contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &bytes, 2 * MAX_INSTRUCTION);
-        assert!(start.elapsed() < std::time::Duration::from_secs(2), "instruction decoding exceeded two seconds");
-        let mut table = Table::new(MAX_TABLE_CAPACITY);
-        table.set_capacity(MAX_TABLE_CAPACITY).unwrap();
-        apply(&mut table, &bytes).unwrap();
-        assert_eq!(table.len(), 1);
+        assert_linear("long_instruction_allocation_contract", 7_500, |size| {
+            let ins = EncoderInstruction::InsertWithLiteralName { name: vec![b'0'; size], value: vec![b'1'; size] };
+            let bytes = ins.to_bytes().unwrap();
+            contract::check_decode_with_alloc_limit(Frames::<EncoderInstruction>::new, &bytes, 2 * MAX_INSTRUCTION);
+            let mut table = Table::new(MAX_TABLE_CAPACITY);
+            table.set_capacity(MAX_TABLE_CAPACITY).unwrap();
+            apply(&mut table, &bytes).unwrap();
+            assert_eq!(table.len(), 1);
+        });
     }
 
     #[test]

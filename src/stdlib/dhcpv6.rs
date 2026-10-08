@@ -1360,6 +1360,7 @@ fn addr(b: &[u8], i: usize) -> Ipv6Addr {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::{
         Lcg, Stream, pump,
@@ -1748,7 +1749,7 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_messages_in_linear_time() {
-        let n = 1_000_000;
+        let n = rounds(1_000_000);
         let mut stream = Stream::new(Frames::<Message>::new());
         let mut count = 0;
         pump(&mut stream, &vec![0; 2 * n], |m| {

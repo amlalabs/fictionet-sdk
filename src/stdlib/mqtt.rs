@@ -1075,6 +1075,7 @@ impl From<Trailing> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
@@ -1576,25 +1577,21 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
-        // 4 MiB of PINGREQs, pushed at once. Moving the rest of the buffer
-        // down after each packet took about 23 s here (1.4 s for 1 MiB,
-        // optimized); taking them by offset takes milliseconds. The 5 s
-        // bound is loose so a slow machine still passes.
-        let data = [0xc0u8, 0].repeat(1 << 21);
-        let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames::<Packet>::new());
-        let mut n = 0;
-        pump(&mut stream, &data[..data.len() - 1], |p| {
-            assert_eq!(p, Packet::PingReq);
-            n += 1;
-        })
-        .unwrap();
-        assert_eq!(n, (1 << 21) - 1);
-        assert_eq!(stream.buffered(), 1);
-        assert_eq!(stream.push(&[0]), 1);
-        assert_eq!(stream.next(), Some(Ok(Packet::PingReq)));
-        assert_eq!(stream.buffered(), 0);
-        assert!(started.elapsed().as_secs() < 5);
+        assert_linear("stream_takes_many_small_packets_in_linear_time", rounds(1 << 19), |size| {
+            let data = [0xc0u8, 0].repeat(size);
+            let mut stream = Stream::new(Frames::<Packet>::new());
+            let mut n = 0;
+            pump(&mut stream, &data[..data.len() - 1], |p| {
+                assert_eq!(p, Packet::PingReq);
+                n += 1;
+            })
+            .unwrap();
+            assert_eq!(n, (size) - 1);
+            assert_eq!(stream.buffered(), 1);
+            assert_eq!(stream.push(&[0]), 1);
+            assert_eq!(stream.next(), Some(Ok(Packet::PingReq)));
+            assert_eq!(stream.buffered(), 0);
+        });
     }
 
     #[test]

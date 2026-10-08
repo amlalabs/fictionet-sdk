@@ -1334,6 +1334,7 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
@@ -1845,12 +1846,13 @@ mod tests {
 
     #[test]
     fn stream_reads_many_small_records_in_linear_time() {
+        let n = rounds(200_000);
         let one = Record::new(kind::STDIN, 1, b"x").to_bytes().unwrap();
         let mut stream = Stream::new(Frames::<Record>::new());
         let mut count = 0;
-        pump(&mut stream, &one.repeat(200_000), |_| count += 1).unwrap();
+        pump(&mut stream, &one.repeat(n), |_| count += 1).unwrap();
         finish(&mut stream, |_| count += 1).unwrap();
-        assert_eq!(count, 200_000);
+        assert_eq!(count, n);
         assert_eq!(stream.buffered(), 0);
     }
 
@@ -2095,9 +2097,12 @@ mod tests {
         let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&req.to_bytes().unwrap()).pop() else { panic!() };
         assert_eq!(got, req);
         // A pair too long for one record still spans records and comes back.
-        let big = Request { params: Pairs(vec![pair("A", "1"), (b"B".to_vec(), vec![7; 100_000]), pair("C", "3")]), ..req };
-        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&big.to_bytes().unwrap()).pop() else { panic!() };
-        assert_eq!(got, big);
+        for offset in (0..rounds(100_000)).step_by(100_000) {
+            let size = (rounds(100_000) - offset).min(100_000);
+            let big = Request { params: Pairs(vec![pair("A", "1"), (b"B".to_vec(), vec![7; size]), pair("C", "3")]), ..req.clone() };
+            let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&big.to_bytes().unwrap()).pop() else { panic!() };
+            assert_eq!(got, big);
+        }
     }
 
     // A record stream preserves every byte or refuses the value.

@@ -435,6 +435,7 @@ impl Wire for Header {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::{
         Collect, CollectError, Fail, Lcg,
@@ -875,7 +876,7 @@ mod tests {
         for _ in 0..20 {
             seeds.push(random_packet(&mut rng).to_bytes().unwrap());
         }
-        for i in 0..20_000 {
+        for i in 0..rounds(20_000) {
             let mut data = if i % 4 == 0 {
                 let n = rng.index(80);
                 rng.bytes(n)

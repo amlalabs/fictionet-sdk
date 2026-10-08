@@ -1667,6 +1667,7 @@ impl Wire for Reply {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use std::net::SocketAddrV6;
 
@@ -2150,7 +2151,7 @@ mod tests {
             (Request::Other(Command::new("noop", None)), Error::Unwritable),
             (Request::Other(Command::new("abcd", None)), Error::Unwritable),
             (Request::Stor("é".repeat(MAX_LINE)), Error::LineTooLong),
-            (Request::Stor("x".repeat(64 << 20)), Error::LineTooLong),
+            (Request::Stor("x".repeat(rounds(64 << 20))), Error::LineTooLong),
         ] {
             let mut out = b"prefix".to_vec();
             assert_eq!(request.write(&mut out), Err(error));
@@ -2267,16 +2268,16 @@ mod tests {
 
     #[test]
     fn decoders_take_many_short_lines_in_linear_time() {
-        let started = std::time::Instant::now();
-        let stream = b"NOOP\r\n".repeat(500_000);
-        let got = commands(&stream);
-        assert_eq!(got.len(), 500_000);
-        assert!(got.iter().all(|c| *c == Ok(Command::new("NOOP", None))));
-        let stream = b"200 ok\r\n".repeat(500_000);
-        let got = replies(&stream);
-        assert_eq!(got.len(), 500_000);
-        assert!(got.iter().all(|r| *r == Ok(Reply::new(code::OK, "ok"))));
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("decoders_take_many_short_lines_in_linear_time", rounds(125_000), |size| {
+            let stream = b"NOOP\r\n".repeat(size);
+            let got = commands(&stream);
+            assert_eq!(got.len(), size);
+            assert!(got.iter().all(|c| *c == Ok(Command::new("NOOP", None))));
+            let stream = b"200 ok\r\n".repeat(size);
+            let got = replies(&stream);
+            assert_eq!(got.len(), size);
+            assert!(got.iter().all(|r| *r == Ok(Reply::new(code::OK, "ok"))));
+        });
     }
 
     #[test]

@@ -2450,6 +2450,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::harness::{check, copy};
     use super::*;
     use fictionet::stdlib::codec::{
@@ -3391,21 +3392,22 @@ mod tests {
 
     #[test]
     fn large_bmp_text_round_trips() {
-        // 400,000 characters of U+0800 are 800,000 bytes as a BMPString
-        // but 1,200,000 bytes of UTF-8. What a reader gives, a writer
-        // takes back.
-        let s = "\u{800}".repeat(400_000);
-        let mut w = Writer::new();
-        w.text(StringKind::Bmp, &s);
-        let b = w.finish().unwrap();
-        let (kind, back) = Reader::new(&b, Rules::Der).read_text().unwrap();
-        assert_eq!((kind, back.len()), (StringKind::Bmp, s.len()));
-        assert!(StringKind::Bmp.encode(&back).unwrap() == b[5..]);
-        // A UniversalString is measured by its own bytes too: 300,000
-        // ASCII characters are 1,200,000 bytes.
-        assert_eq!(StringKind::Universal.encode(&"a".repeat(300_000)), Err(Error::TooLong));
-        assert_eq!(StringKind::Universal.encode(&"a".repeat(200_000)).map(|b| b.len()), Ok(800_000));
-        assert_eq!(StringKind::Utf8.encode(&"a".repeat(MAX_INPUT + 1)), Err(Error::TooLong));
+        for offset in (0..rounds(400_000)).step_by(400_000) {
+            let size = (rounds(400_000) - offset).min(400_000);
+            // BMPString counts encoded bytes, not UTF-8 bytes.
+            let s = "\u{800}".repeat(size);
+            let mut w = Writer::new();
+            w.text(StringKind::Bmp, &s);
+            let b = w.finish().unwrap();
+            let (kind, back) = Reader::new(&b, Rules::Der).read_text().unwrap();
+            assert_eq!((kind, back.len()), (StringKind::Bmp, s.len()));
+            assert!(StringKind::Bmp.encode(&back).unwrap() == b[5..]);
+            // A UniversalString is measured by its own bytes too: 300,000
+            // ASCII characters are 1,200,000 bytes.
+            assert_eq!(StringKind::Universal.encode(&"a".repeat(300_000)), Err(Error::TooLong));
+            assert_eq!(StringKind::Universal.encode(&"a".repeat(200_000)).map(|b| b.len()), Ok(800_000));
+            assert_eq!(StringKind::Utf8.encode(&"a".repeat(MAX_INPUT + 1)), Err(Error::TooLong));
+        }
     }
 
     #[test]

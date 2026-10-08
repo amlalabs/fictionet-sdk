@@ -2676,6 +2676,7 @@ fn timestamp_nanos(value: [u32; 7]) -> Result<u128, Error> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::check_atomic;
     use super::*;
     use fictionet::stdlib::codec::{
@@ -3521,14 +3522,14 @@ mod tests {
         // body field is not MsgType, so the cheap checks refuse it unread.
         let period = b"8=FIX.4.4\x019=988000\x0110=000\x01";
         assert_eq!(period.len(), 26);
-        let (frames, count, _) = pump_bounded(&period.repeat(76_000));
+        let (frames, count, _) = pump_bounded(&period.repeat(rounds(76_000)));
         assert_eq!((count, frames.examined()), (0, 0));
         // With MsgType first, every candidate passes the cheap checks and
         // fails only its CheckSum, after a fold of about 1 MB.
         let period = b"8=FIX.4.4\x019=988006\x0135=0\x0110=000\x01";
         assert_eq!(period.len(), 31);
         assert_eq!((19 + 988_006 + 7) % 31, 0);
-        let bytes = period.repeat(64_000);
+        let bytes = period.repeat(rounds(64_000));
         let (frames, count, bound) = pump_bounded(&bytes);
         assert_eq!(count, 0);
         assert!(frames.garbled() > 0);

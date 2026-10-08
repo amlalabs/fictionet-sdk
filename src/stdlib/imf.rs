@@ -1625,6 +1625,7 @@ fn write_domain(out: &mut String, s: &str, err: Error, spaces: bool) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
@@ -2478,7 +2479,7 @@ mod tests {
 
     #[test]
     fn head_bounds_its_buffer() {
-        let input = vec![b'x'; 1_000_000];
+        let input = vec![b'x'; rounds(1_000_000)];
         let mut stream = Stream::new(Head::new());
         assert_eq!(stream.push(&input), MAX_HEADER_BYTES);
         assert_eq!(stream.push(&input), 0);

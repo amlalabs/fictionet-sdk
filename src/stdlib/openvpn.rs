@@ -841,6 +841,7 @@ impl From<Truncated> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
@@ -1392,14 +1393,13 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
-        let bytes = Frame(vec![0x30, 1]).to_bytes().unwrap().repeat(200_000);
-        let started = std::time::Instant::now();
-        let (items, error) = decode_all(Frames::<Frame>::new, &bytes);
-        // Allow slow test hosts while catching repeated scans or front removal.
-        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
-        assert_eq!(error, None);
-        assert_eq!(items.len(), 200_000);
-        assert!(items.iter().all(|p| p.0 == [0x30, 1]));
+        assert_linear("stream_takes_many_small_packets_in_linear_time", rounds(50_000), |size| {
+            let bytes = Frame(vec![0x30, 1]).to_bytes().unwrap().repeat(size);
+            let (items, error) = decode_all(Frames::<Frame>::new, &bytes);
+            assert_eq!(error, None);
+            assert_eq!(items.len(), size);
+            assert!(items.iter().all(|p| p.0 == [0x30, 1]));
+        });
     }
 
     #[test]
@@ -1432,7 +1432,7 @@ mod tests {
             Wrapping::TlsAuth { hmac_len: MAX_HMAC_LEN },
             Wrapping::TlsCrypt,
         ];
-        for i in 0..20_000 {
+        for i in 0..rounds(20_000) {
             let len = rng.index(120);
             let mut b = rng.bytes(len);
             // Mostly known opcodes and small ack counts, so parsing gets deep.
@@ -1467,7 +1467,7 @@ mod tests {
         }
         // Built packets with random fields: each is written and read back
         // as the same value, or refused for the reason it breaks.
-        for _ in 0..20_000 {
+        for _ in 0..rounds(20_000) {
             let kind = ControlKind::ALL[rng.index(9)];
             let key_id = rng.index(10) as u8;
             let ids: Vec<u32> = (0..rng.index(11)).map(|_| rng.next() as u32).collect();

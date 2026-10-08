@@ -2062,6 +2062,7 @@ impl From<Truncated> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, pump,
@@ -2477,7 +2478,7 @@ mod tests {
     fn deep_input_is_refused_not_recursed() {
         // A hundred thousand arrays, each holding the next, all lengths
         // right. Reading stops at MAX_DEPTH.
-        let n = 100_000;
+        let n = rounds(100_000);
         let mut arrays = Vec::with_capacity(5 * n + 1);
         for i in 0..n {
             arrays.push(b'A');
@@ -2746,14 +2747,14 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_frames_in_linear_time() {
-        let bytes = Frame::heartbeat().to_bytes().unwrap().repeat(200_000);
-        let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames::new());
-        let mut n = 0;
-        pump(&mut stream, &bytes, |_| n += 1).unwrap();
-        assert_eq!(n, 200_000);
-        assert_eq!(stream.buffered(), 0);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("stream_takes_many_small_frames_in_linear_time", rounds(50_000), |size| {
+            let bytes = Frame::heartbeat().to_bytes().unwrap().repeat(size);
+            let mut stream = Stream::new(Frames::new());
+            let mut n = 0;
+            pump(&mut stream, &bytes, |_| n += 1).unwrap();
+            assert_eq!(n, size);
+            assert_eq!(stream.buffered(), 0);
+        });
     }
 
     #[test]
@@ -2798,7 +2799,7 @@ mod tests {
         // reads the properties where they are, so it stops at MAX_DEPTH
         // rather than copying every level first.
         let mut v = FieldValue::Void;
-        for _ in 0..100_000 {
+        for _ in 0..rounds(100_000) {
             v = FieldValue::Array(vec![v]);
         }
         let mut t = Table::new();
@@ -2816,7 +2817,7 @@ mod tests {
 
     #[test]
     fn stream_buffer_is_bounded() {
-        let chunk = vec![3u8; 100_000];
+        let chunk = vec![3u8; rounds(100_000)];
         contract::check_decode_with_alloc_limit(Frames::new, &chunk, 2 * DEFAULT_FRAME_MAX as usize);
         assert!(matches!(decode_all(Frames::new, &chunk).1, Some(Fail::Protocol(Error::FrameTooLarge { .. }))));
         let one = Frame::method(1, &Method::BasicAck { delivery_tag: 1, multiple: false }).unwrap();

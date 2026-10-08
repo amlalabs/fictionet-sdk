@@ -1571,6 +1571,7 @@ impl Wire for MethodData {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, finish as finish_stream, pump,
@@ -2108,12 +2109,13 @@ mod tests {
     #[test]
     fn decoder_takes_many_small_messages_in_linear_time() {
         let one = Frame(Message::ApRep(ApRep { enc_part: enc(18, None, &[]) }).to_bytes().unwrap()).to_bytes().unwrap();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100_000).collect();
+        let count = rounds(100_000);
+        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * count).collect();
         let mut d = Stream::new(Frames::new());
         let mut n = 0;
         pump(&mut d, &stream, |_| n += 1).unwrap();
         finish_stream(&mut d, |_| n += 1).unwrap();
-        assert_eq!(n, 100_000);
+        assert_eq!(n, count);
         assert_eq!(d.buffered(), 0);
     }
 

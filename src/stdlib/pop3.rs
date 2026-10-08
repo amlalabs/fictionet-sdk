@@ -1366,6 +1366,7 @@ impl Decode for Outputs {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use codec::{
         Fail, Lcg, Stream,
@@ -2072,17 +2073,25 @@ mod tests {
 
     #[test]
     fn writers_stop_reading_input_past_their_limits() {
-        let started = std::time::Instant::now();
-        assert_eq!(contract::check_refused(&Reply::ok("").with_body(vec![b'\n'; MAX_BODY * 8])), Error::Unwritable);
-        let text = "t".repeat(MAX_BODY);
-        assert_eq!(contract::check_refused(&Reply::ok(&text)), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Request::Pass(text.clone())), Error::Unwritable);
-        assert_eq!(contract::check_refused(&Request::User(text)), Error::Unwritable);
-        assert!(
-            started.elapsed().as_secs() < 5,
-            "took {:?}",
-            started.elapsed()
-        );
+        let mut body_reply = Reply::ok("").with_body(Vec::new());
+        let mut text_reply = Reply::ok("");
+        let mut requests = [Request::Pass(String::new()), Request::User(String::new())];
+        // Keep buffer capacity between runs to avoid timing fresh page faults.
+        assert_linear("writers_stop_reading_input_past_their_limits", MAX_BODY / 4, |size| {
+            let body = body_reply.body.as_mut().unwrap();
+            body.clear();
+            body.resize(size * 8, b'\n');
+            assert_eq!(contract::check_refused(&body_reply), Error::Unwritable);
+            text_reply.text.clear();
+            text_reply.text.extend(std::iter::repeat_n('t', size));
+            assert_eq!(contract::check_refused(&text_reply), Error::Unwritable);
+            for request in &mut requests {
+                let (Request::Pass(text) | Request::User(text)) = request else { unreachable!() };
+                text.clear();
+                text.extend(std::iter::repeat_n('t', size));
+                assert_eq!(contract::check_refused(request), Error::Unwritable);
+            }
+        });
     }
 
     #[test]
@@ -2159,7 +2168,7 @@ mod tests {
     fn arguments_are_counted_not_collected() {
         let spaces = Command {
             keyword: "USER".into(),
-            argument: Some(" ".repeat(8 << 20)),
+            argument: Some(" ".repeat(rounds(8 << 20))),
         };
         assert_eq!(Request::from_command(&spaces), Err(Error::ArgumentSpacing));
         let many = Command {
@@ -2169,7 +2178,7 @@ mod tests {
         assert_eq!(Request::from_command(&many), Err(Error::ExtraArgument));
         assert_eq!(request(b"TOP 1 2 3 "), Err(Error::ArgumentSpacing));
         assert_eq!(request(b"USER a b c d"), Err(Error::ExtraArgument));
-        assert_eq!(contract::check_refused(&Reply::err("").with_code(&"A".repeat(16 << 20))), Error::Unwritable);
+        assert_eq!(contract::check_refused(&Reply::err("").with_code(&"A".repeat(rounds(16 << 20)))), Error::Unwritable);
         let reply = Reply::ok("").with_body(b"a\nb\r\nc".to_vec());
         let mut lines = reply.lines();
         assert_eq!(lines.next(), Some(b"a".as_slice()));

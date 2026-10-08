@@ -2537,6 +2537,7 @@ fn declared_total(b: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
@@ -3660,38 +3661,34 @@ mod tests {
 
     #[test]
     fn decoder_takes_many_small_messages_in_linear_time() {
-        let one = msg(1, Op::UnbindRequest).to_bytes().unwrap();
-        let stream: Vec<u8> = one
-            .iter()
-            .copied()
-            .cycle()
-            .take(one.len() * 200_000)
-            .collect();
-        let started = std::time::Instant::now();
-        let mut d = Stream::new(Frames::<Message>::new());
-        let mut rest = &stream[..];
-        let mut n = 0;
-        while !rest.is_empty() {
-            rest = &rest[d.push(rest)..];
-            while let Some(m) = d.next() {
-                m.unwrap();
-                n += 1;
+        assert_linear("decoder_takes_many_small_messages_in_linear_time", rounds(50_000), |size| {
+            let one = msg(1, Op::UnbindRequest).to_bytes().unwrap();
+            let stream: Vec<u8> = one
+                .iter()
+                .copied()
+                .cycle()
+                .take(one.len() * size)
+                .collect();
+            let mut d = Stream::new(Frames::<Message>::new());
+            let mut rest = &stream[..];
+            let mut n = 0;
+            while !rest.is_empty() {
+                rest = &rest[d.push(rest)..];
+                while let Some(m) = d.next() {
+                    m.unwrap();
+                    n += 1;
+                }
             }
-        }
-        assert_eq!(n, 200_000);
-        assert_eq!(d.buffered(), 0);
-        assert!(
-            started.elapsed().as_secs() < 5,
-            "took {:?}",
-            started.elapsed()
-        );
+            assert_eq!(n, size);
+            assert_eq!(d.buffered(), 0);
+        });
     }
 
     #[test]
     fn decoder_holds_at_most_its_limit() {
         // Noise is taken only up to the limit, and fails at its header.
         let mut d = Stream::new(Frames::<Message>::with_limit(100));
-        assert_eq!(d.push(&vec![0; 100_000]), 100);
+        assert_eq!(d.push(&vec![0; rounds(100_000)]), 100);
         assert!(d.buffered() <= 100);
         assert!(matches!(d.next(), Some(Err(_))));
         let held = d.buffered();

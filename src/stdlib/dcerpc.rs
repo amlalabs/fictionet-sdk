@@ -1477,6 +1477,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::rewrite;
     use super::*;
     use fictionet::stdlib::codec::{
@@ -1922,11 +1923,11 @@ mod tests {
         let n = MAX_FRAGMENTS;
         assert_eq!(request(vec![0; n]).fragments(25).map(|v| v.len()), Ok(n));
         assert_eq!(request(vec![0; n + 1]).fragments(25), Err(Error::Unwritable));
-        let started = std::time::Instant::now();
-        let parts = request(vec![1; 60_000]).fragments(25).unwrap();
-        assert_eq!(parts.len(), 60_000);
-        assert!(parts.iter().all(|p| p.body.stub() == Some(&[1][..])));
-        assert!(started.elapsed().as_secs() < 2, "took {:?}", started.elapsed());
+        assert_linear("fragments_are_bounded_and_linear", 15_000, |size| {
+            let parts = request(vec![1; size]).fragments(25).unwrap();
+            assert_eq!(parts.len(), size);
+            assert!(parts.iter().all(|p| p.body.stub() == Some(&[1][..])));
+        });
     }
 
     #[test]
@@ -2249,13 +2250,13 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_pdus_in_linear_time() {
-        let bytes = Pdu::new(1, Body::Shutdown).to_bytes().unwrap().repeat(200_000);
-        let started = std::time::Instant::now();
-        let (pdus, error) = decode_all(Frames::<Pdu>::new, &bytes);
-        assert_eq!(pdus.len(), 200_000);
-        assert!(pdus.iter().all(Result::is_ok));
-        assert_eq!(error, None);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("stream_takes_many_small_pdus_in_linear_time", rounds(50_000), |size| {
+            let bytes = Pdu::new(1, Body::Shutdown).to_bytes().unwrap().repeat(size);
+            let (pdus, error) = decode_all(Frames::<Pdu>::new, &bytes);
+            assert_eq!(pdus.len(), size);
+            assert!(pdus.iter().all(Result::is_ok));
+            assert_eq!(error, None);
+        });
     }
 
     #[test]

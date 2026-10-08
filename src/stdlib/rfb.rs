@@ -2146,6 +2146,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use codec::{
         Lcg,
@@ -2612,31 +2613,33 @@ mod tests {
 
     #[test]
     fn session_messages_byte_at_a_time_are_bounded() {
-        let rectangles = vec![Rectangle { x: 0, y: 0, width: 1, height: 1,
-            contents: Contents::Raw(vec![1, 2, 3, 4]) }; MAX_ITEMS];
-        let update = ServerMessage::FramebufferUpdate(rectangles);
-        let bytes = server_bytes(&update, Dialect::V3_8, &PixelFormat::TRUE_COLOR_32).unwrap();
-        let (mut server, mut client) = normal_pair();
-        let started = std::time::Instant::now();
-        for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
-            assert_eq!(client.push(chunk), 1);
-            if i + 1 < bytes.len() { assert_eq!(client.next(), None); }
-            assert!(client.buffered() <= MAX_MESSAGE);
-        }
-        assert_eq!(client.next(), Some(Ok(Ok(update))));
-        assert_eq!(client.buffered(), 0);
-        let message = ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 };
-        let bytes = message.to_bytes().unwrap();
-        for _ in 0..100_000 {
+        let check = |size| {
+            let rectangles = vec![Rectangle { x: 0, y: 0, width: 1, height: 1,
+                contents: Contents::Raw(vec![1, 2, 3, 4]) }; size];
+            let update = ServerMessage::FramebufferUpdate(rectangles);
+            let bytes = server_bytes(&update, Dialect::V3_8, &PixelFormat::TRUE_COLOR_32).unwrap();
+            let (mut server, mut client) = normal_pair();
             for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
-                assert_eq!(server.push(chunk), 1);
-                if i + 1 < bytes.len() { assert_eq!(server.next(), None); }
-                assert!(server.buffered() <= MAX_CLIENT_MESSAGE);
+                assert_eq!(client.push(chunk), 1);
+                if i + 1 < bytes.len() { assert_eq!(client.next(), None); }
+                assert!(client.buffered() <= MAX_MESSAGE);
             }
-            assert_eq!(server.next(), Some(Ok(Ok(message.clone()))));
-        }
-        assert_eq!(server.buffered(), 0);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+            assert_eq!(client.next(), Some(Ok(Ok(update))));
+            assert_eq!(client.buffered(), 0);
+            let message = ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 };
+            let bytes = message.to_bytes().unwrap();
+            for _ in 0..size * 2 {
+                for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
+                    assert_eq!(server.push(chunk), 1);
+                    if i + 1 < bytes.len() { assert_eq!(server.next(), None); }
+                    assert!(server.buffered() <= MAX_CLIENT_MESSAGE);
+                }
+                assert_eq!(server.next(), Some(Ok(Ok(message.clone()))));
+            }
+            assert_eq!(server.buffered(), 0);
+        };
+        check(MAX_ITEMS);
+        assert_linear("session_messages_byte_at_a_time_are_bounded", MAX_ITEMS / 4, check);
     }
 
     #[test]
@@ -2873,28 +2876,30 @@ mod tests {
 
     #[test]
     fn sends_between_pushes_keep_update_progress() {
-        // A client that sends pointer events while an update comes in does
-        // not read the update's rectangles over again.
-        let rects = vec![Rectangle { x: 0, y: 0, width: 1, height: 1, contents: Contents::Raw(vec![1, 2, 3, 4]) }; MAX_ITEMS];
-        let bytes = server_bytes(&ServerMessage::FramebufferUpdate(rects), Dialect::V3_8, &PixelFormat::TRUE_COLOR_32).unwrap();
-        let (_, mut c) = normal_pair();
-        let started = std::time::Instant::now();
-        let _ = c.push(&bytes[..4]);
-        let mut got = 0;
-        for r in chunks(&bytes[4..], &[16]) {
-            let _ = c.push(r);
-            match c.next() {
-                Some(m) => {
-                    m.unwrap().unwrap();
-                    got += 1;
-                }
-                None => {
-                    c.send(&ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 }).unwrap();
+        let check = |size| {
+            // A client that sends pointer events while an update comes in does
+            // not read the update's rectangles over again.
+            let rects = vec![Rectangle { x: 0, y: 0, width: 1, height: 1, contents: Contents::Raw(vec![1, 2, 3, 4]) }; size];
+            let bytes = server_bytes(&ServerMessage::FramebufferUpdate(rects), Dialect::V3_8, &PixelFormat::TRUE_COLOR_32).unwrap();
+            let (_, mut c) = normal_pair();
+            let _ = c.push(&bytes[..4]);
+            let mut got = 0;
+            for r in chunks(&bytes[4..], &[16]) {
+                let _ = c.push(r);
+                match c.next() {
+                    Some(m) => {
+                        m.unwrap().unwrap();
+                        got += 1;
+                    }
+                    None => {
+                        c.send(&ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 }).unwrap();
+                    }
                 }
             }
-        }
-        assert_eq!(got, 1);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+            assert_eq!(got, 1);
+        };
+        check(MAX_ITEMS);
+        assert_linear("sends_between_pushes_keep_update_progress", MAX_ITEMS / 4, check);
     }
 
     #[test]
@@ -3138,7 +3143,7 @@ mod tests {
         let f = PixelFormat::TRUE_COLOR_32;
         let bytes = server_bytes(&ServerMessage::FramebufferUpdate(vec![rect; MAX_ITEMS]), Dialect::V3_8, &f).unwrap();
         contract::check_decode_with_alloc_limit(|| normal_server(f), &bytes, 2 * MAX_MESSAGE);
-        let bytes = ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 }.to_bytes().unwrap().repeat(20_000);
+        let bytes = ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 }.to_bytes().unwrap().repeat(rounds(20_000));
         contract::check_decode_with_alloc_limit(normal_client, &bytes, 2 * MAX_CLIENT_MESSAGE);
     }
 

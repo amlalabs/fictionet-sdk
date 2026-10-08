@@ -892,6 +892,7 @@ impl Scanner<'_> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
@@ -1166,16 +1167,16 @@ mod tests {
 
     #[test]
     fn stream_reads_many_small_packets_in_linear_time() {
-        let one = Packet::new(vec![b'x'; 3]).to_bytes().unwrap();
-        let bytes = one.repeat(200_000);
-        let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames::<Packet>::new());
-        let mut n = 0;
-        pump(&mut stream, &bytes, |_| n += 1).unwrap();
-        finish(&mut stream, |_| n += 1).unwrap();
-        assert_eq!(n, 200_000);
-        assert_eq!(stream.buffered(), 0);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("stream_reads_many_small_packets_in_linear_time", rounds(50_000), |size| {
+            let one = Packet::new(vec![b'x'; 3]).to_bytes().unwrap();
+            let bytes = one.repeat(size);
+            let mut stream = Stream::new(Frames::<Packet>::new());
+            let mut n = 0;
+            pump(&mut stream, &bytes, |_| n += 1).unwrap();
+            finish(&mut stream, |_| n += 1).unwrap();
+            assert_eq!(n, size);
+            assert_eq!(stream.buffered(), 0);
+        });
     }
 
     fn check_stream(data: &[u8], limit: usize) {

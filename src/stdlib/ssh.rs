@@ -1488,6 +1488,7 @@ impl From<Truncated> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, pump,
@@ -1874,19 +1875,15 @@ mod tests {
 
     #[test]
     fn choose_takes_linear_time() {
-        let client: Vec<String> = (0..50_000).map(|i| format!("client-{i:08}")).collect();
-        let server: Vec<String> = (0..50_000).map(|i| format!("server-{i:08}")).collect();
-        let started = std::time::Instant::now();
-        assert_eq!(KexInit::choose(&client, &server), None);
-        let mut both = server.clone();
-        both.push(client[49_999].clone());
-        both.push(client[123].clone());
-        assert_eq!(KexInit::choose(&client, &both), Some("client-00000123"));
-        assert!(
-            started.elapsed().as_millis() < 1000,
-            "took {:?}",
-            started.elapsed()
-        );
+        assert_linear("choose_takes_linear_time", rounds(12_500), |size| {
+            let client: Vec<String> = (0..size).map(|i| format!("client-{i:08}")).collect();
+            let server: Vec<String> = (0..size).map(|i| format!("server-{i:08}")).collect();
+            assert_eq!(KexInit::choose(&client, &server), None);
+            let mut both = server.clone();
+            both.push(client[size - 1].clone());
+            both.push(client[123].clone());
+            assert_eq!(KexInit::choose(&client, &both), Some("client-00000123"));
+        });
     }
 
     #[test]
@@ -2245,7 +2242,7 @@ mod tests {
         let bytes = big.repeat(3);
         contract::check_decode_with_alloc_limit(Events::after_version, &bytes, 2 * MAX_PACKET);
         assert_eq!(decode_all(Events::after_version, &bytes).0.len(), 3);
-        let long_line = vec![b'x'; 200_000];
+        let long_line = vec![b'x'; rounds(200_000)];
         contract::check_decode_with_alloc_limit(Events::new, &long_line, 2 * MAX_PACKET);
         assert_eq!(
             decode_all(Events::new, &long_line).1,
@@ -2264,25 +2261,24 @@ mod tests {
 
     #[test]
     fn stream_takes_many_packets_and_partial_suffixes() {
-        let one = Packet::from_message(&Message::NewKeys)
-            .unwrap()
-            .to_bytes()
-            .unwrap();
-        let mut bytes = one.repeat(400_000);
-        bytes.extend_from_slice(&one[..3]);
-        let started = std::time::Instant::now();
-        let (events, failure) = decode_all(Events::after_version, &bytes);
-        // Allow slow test hosts while catching repeated scans or front removal.
-        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
-        assert_eq!(events.len(), 400_000);
-        assert_eq!(failure, Some(Fail::Truncated { unread: 3 }));
-        assert!(matches!(
-            events.last(),
-            Some(Event::Packet {
-                sequence: 399_999,
-                ..
-            })
-        ));
+        assert_linear("stream_takes_many_packets_and_partial_suffixes", rounds(100_000), |size| {
+            let one = Packet::from_message(&Message::NewKeys)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+            let mut bytes = one.repeat(size);
+            bytes.extend_from_slice(&one[..3]);
+            let (events, failure) = decode_all(Events::after_version, &bytes);
+            assert_eq!(events.len(), size);
+            assert_eq!(failure, Some(Fail::Truncated { unread: 3 }));
+            assert!(matches!(
+                events.last(),
+                Some(Event::Packet {
+                    sequence,
+                    ..
+                }) if *sequence as usize == size - 1
+            ));
+        });
     }
 
     #[test]

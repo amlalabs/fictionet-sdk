@@ -1353,6 +1353,7 @@ fn valid_value(v: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::assert_linear;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
@@ -1833,40 +1834,41 @@ Content-Type: text/plain
 
     #[test]
     fn slow_headers_take_linear_time() {
-        // Header blocks near the limit, decoded a byte at a time. The parser
-        // looks at each new byte once, not at the whole block again.
-        let mut part = format!("--b\r\nA: {}\r\n\r\nx\r\n", "v".repeat(MAX_HEADER_BYTES - 9)).into_bytes();
-        part = part.repeat(64);
-        part.extend_from_slice(b"--b--");
-        let start = std::time::Instant::now();
-        check(&part, "b");
-        let m = Multipart::parse(&part, "b").unwrap();
-        assert_eq!(m.parts.len(), 64);
-        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+        let check = |size| {
+            // Header blocks near the limit, decoded a byte at a time. The parser
+            // looks at each new byte once, not at the whole block again.
+            let mut part = format!("--b\r\nA: {}\r\n\r\nx\r\n", "v".repeat(size)).into_bytes();
+            part = part.repeat(64);
+            part.extend_from_slice(b"--b--");
+            check(&part, "b");
+            let m = Multipart::parse(&part, "b").unwrap();
+            assert_eq!(m.parts.len(), 64);
+        };
+        check(MAX_HEADER_BYTES - 9);
+        assert_linear("slow_headers_take_linear_time", (MAX_HEADER_BYTES - 9) / 4, check);
     }
 
     #[test]
     fn many_parts_read_in_linear_time() {
-        // A whole body of MAX_PARTS parts, each 40 KB. Reading a part must
-        // not copy the bytes after it.
-        let mut body = Vec::new();
-        for _ in 0..MAX_PARTS {
-            body.extend_from_slice(b"--b\r\n\r\n");
-            body.extend(std::iter::repeat_n(b'x', 40_000));
-            body.extend_from_slice(b"\r\n");
-        }
-        body.extend_from_slice(b"--b--");
-        let start = std::time::Instant::now();
-        let m = Multipart::parse(raw(&body), "b").unwrap();
-        assert_eq!(m.parts.len(), MAX_PARTS);
-        assert!(m.parts.iter().all(|p| p.body.len() == 40_000));
-        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
-        let mut stream = Stream::new(Parts::new("b").unwrap());
-        let mut count = 0;
-        pump(&mut stream, &body, |_| count += 1).unwrap();
-        finish(&mut stream, |_| count += 1).unwrap();
-        assert_eq!(count, MAX_PARTS);
-        assert!(stream.into_parts().0.allocated() <= 2 * Parts::new("b").unwrap().capacity());
+        assert_linear("many_parts_read_in_linear_time", MAX_PARTS / 4, |size| {
+            // Reading a part must not copy the bytes after it.
+            let mut body = Vec::new();
+            for _ in 0..size {
+                body.extend_from_slice(b"--b\r\n\r\n");
+                body.extend(std::iter::repeat_n(b'x', 40_000));
+                body.extend_from_slice(b"\r\n");
+            }
+            body.extend_from_slice(b"--b--");
+            let m = Multipart::parse(raw(&body), "b").unwrap();
+            assert_eq!(m.parts.len(), size);
+            assert!(m.parts.iter().all(|p| p.body.len() == 40_000));
+            let mut stream = Stream::new(Parts::new("b").unwrap());
+            let mut count = 0;
+            pump(&mut stream, &body, |_| count += 1).unwrap();
+            finish(&mut stream, |_| count += 1).unwrap();
+            assert_eq!(count, size);
+            assert!(stream.into_parts().0.allocated() <= 2 * Parts::new("b").unwrap().capacity());
+        });
     }
 
     #[test]

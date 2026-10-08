@@ -3164,6 +3164,7 @@ impl From<Trailing> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::{
@@ -3726,13 +3727,13 @@ mod tests {
 
     #[test]
     fn stream_reads_many_small_messages_in_linear_time() {
-        let one = Message::new(packet_type::SQL_BATCH, vec![b'x', 0]).to_bytes().unwrap();
-        let bytes = one.repeat(200_000);
-        let started = std::time::Instant::now();
-        let (messages, failure) = decode_all(Messages::new, &bytes);
-        assert_eq!(messages.len(), 200_000);
-        assert_eq!(failure, None);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("stream_reads_many_small_messages_in_linear_time", rounds(50_000), |size| {
+            let one = Message::new(packet_type::SQL_BATCH, vec![b'x', 0]).to_bytes().unwrap();
+            let bytes = one.repeat(size);
+            let (messages, failure) = decode_all(Messages::new, &bytes);
+            assert_eq!(messages.len(), size);
+            assert_eq!(failure, None);
+        });
     }
 
     #[test]

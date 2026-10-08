@@ -1607,6 +1607,7 @@ impl Connection for TcpConnection {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::ConnectionExt;
     use fictionet::{InterfaceExt, block_on, pair, run};
@@ -1963,7 +1964,14 @@ mod tests {
             }
             assert!(server.shared.state.lock().unwrap().slots >= 401);
             drop(crowd);
-            fcx.sleep(Duration::from_millis(300)).await?;
+            let deadline = fcx.now() + 100 * ACK_DELAY;
+            while ![&server, &client].iter().all(|e| {
+                let st = e.shared.state.lock().unwrap();
+                st.handles.len() <= 3 && st.slots < COMPACT_SLOTS
+            }) {
+                assert!(fcx.now() < deadline, "closed connections kept socket slots");
+                fcx.sleep(Duration::from_millis(5)).await?;
+            }
             for e in [&server, &client] {
                 let st = e.shared.state.lock().unwrap();
                 assert!(st.handles.len() <= 3, "{} sockets left", st.handles.len());
@@ -1972,7 +1980,8 @@ mod tests {
                 assert!(st.slots < COMPACT_SLOTS, "{} slots left", st.slots);
                 assert_eq!(st.sockets.iter().count(), st.handles.len());
             }
-            let data = pattern(1 << 20, 9);
+            let size = rounds(1 << 20);
+            let data = pattern(size, 9);
             let writer = {
                 let data = data.clone();
                 fcx.spawn(move |fcx| async move {
@@ -1980,7 +1989,7 @@ mod tests {
                     Ok(())
                 })
             };
-            let mut got = vec![0u8; 1 << 20];
+            let mut got = vec![0u8; size];
             let mut at = 0;
             while at < got.len() {
                 at += keep_c.read(&fcx, &mut got[at..]).await?;
@@ -2064,16 +2073,17 @@ mod tests {
             // A fresh connection costs (almost) no pages.
             assert!(resident(&server) <= 4, "{}", resident(&server));
 
+            let size = rounds(1 << 20);
             for round in 0..2u8 {
-                // 1 MiB down and 1 MiB up, through the 256 KiB buffers.
-                let down = pattern(1 << 20, round);
-                let up = pattern(1 << 20, round + 100);
+                // Transfers in both directions fill the 256 KiB buffers.
+                let down = pattern(size, round);
+                let up = pattern(size, round + 100);
                 let slot = Arc::new(Mutex::new(None));
                 let writer = {
                     let (down, slot) = (down.clone(), slot.clone());
                     fcx.spawn(move |fcx| async move {
                         s.write_all(&fcx, &down).await?;
-                        let mut got = vec![0u8; 1 << 20];
+                        let mut got = vec![0u8; size];
                         let mut at = 0;
                         while at < got.len() {
                             at += s.read(&fcx, &mut got[at..]).await?;
@@ -2082,7 +2092,7 @@ mod tests {
                         Ok(())
                     })
                 };
-                let mut got = vec![0u8; 1 << 20];
+                let mut got = vec![0u8; size];
                 let mut at = 0;
                 while at < got.len() {
                     at += c.read(&fcx, &mut got[at..]).await?;
@@ -2097,7 +2107,13 @@ mod tests {
                 assert!(resident(&server) >= 64, "{}", resident(&server));
                 // Once the connection is quiet, its pages go back, while it
                 // stays open.
-                fcx.sleep(Duration::from_millis(2500)).await?;
+                let deadline = fcx.now() + 3 * RELEASE_EVERY;
+                while resident(&server) != 0 || resident(&client) != 0 {
+                    assert!(fcx.now() < deadline,
+                        "quiet connections kept buffer pages: server {}, client {}",
+                        resident(&server), resident(&client));
+                    fcx.sleep(Duration::from_millis(50)).await?;
+                }
                 assert_eq!(resident(&server), 0);
                 assert_eq!(resident(&client), 0);
             }

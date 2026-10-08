@@ -1857,6 +1857,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::harness::check_attribute;
     use super::*;
     use codec::{
@@ -2756,7 +2757,7 @@ mod tests {
         // written to it.
         let mut out = String::new();
         let mut b = LineBuf { out: &mut out, start: 0, over: false };
-        for _ in 0..100_000 {
+        for _ in 0..rounds(100_000) {
             let _ = std::fmt::Write::write_str(&mut b, "18446744073709551615 ");
         }
         assert!(b.over);
@@ -2764,7 +2765,7 @@ mod tests {
         // So a repeat with a great many offsets fails without being
         // written out first.
         let mut d = sample();
-        d.times[1].repeats = vec![Repeat { interval: 1, duration: 1, offsets: vec![u64::MAX; 100_000] }];
+        d.times[1].repeats = vec![Repeat { interval: 1, duration: 1, offsets: vec![u64::MAX; rounds(100_000)] }];
         assert_eq!(d.to_bytes(), Err(Error::LineTooLong { line: 17 }));
     }
 

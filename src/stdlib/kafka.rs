@@ -1808,6 +1808,7 @@ impl From<Trailing> for Error {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
@@ -2493,15 +2494,15 @@ mod tests {
 
     #[test]
     fn stream_reads_many_small_frames_in_linear_time() {
-        let one = Frame(vec![0, 18, 0, 0, 0, 0, 0, 1, 0xff, 0xff]).to_bytes().unwrap();
-        let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames::<Frame>::new());
-        let mut count = 0;
-        pump(&mut stream, &one.repeat(200_000), |_| count += 1).unwrap();
-        finish(&mut stream, |_| count += 1).unwrap();
-        assert_eq!(count, 200_000);
-        assert_eq!(stream.buffered(), 0);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("stream_reads_many_small_frames_in_linear_time", rounds(50_000), |size| {
+            let one = Frame(vec![0, 18, 0, 0, 0, 0, 0, 1, 0xff, 0xff]).to_bytes().unwrap();
+            let mut stream = Stream::new(Frames::<Frame>::new());
+            let mut count = 0;
+            pump(&mut stream, &one.repeat(size), |_| count += 1).unwrap();
+            finish(&mut stream, |_| count += 1).unwrap();
+            assert_eq!(count, size);
+            assert_eq!(stream.buffered(), 0);
+        });
     }
 
     #[test]

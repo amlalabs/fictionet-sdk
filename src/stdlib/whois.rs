@@ -1001,6 +1001,7 @@ impl Decode for CollectedResponses {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use codec::{
         Lcg, Stream,
@@ -1612,14 +1613,17 @@ mod tests {
             Err(Error::ResponseTooLong)
         );
         // Empty further lines are written as "+" and CR LF.
-        let value = format!("a{}", "\n".repeat(100_000));
-        assert_eq!(
-            Response::from_fields(&[Field::new(0, "k", &value)])
-                .unwrap()
-                .as_bytes()
-                .len(),
-            300_006
-        );
+        for offset in (0..rounds(100_000)).step_by(100_000) {
+            let size = (rounds(100_000) - offset).min(100_000);
+            let value = format!("a{}", "\n".repeat(size));
+            assert_eq!(
+                Response::from_fields(&[Field::new(0, "k", &value)])
+                    .unwrap()
+                    .as_bytes()
+                    .len(),
+                3 * size + 6
+            );
+        }
         // A blank line between blocks counts too.
         let fields = [Field::new(0, "k", ""), Field::new(1, "k", &"a".repeat(MAX_RESPONSE - 11))];
         assert_eq!(

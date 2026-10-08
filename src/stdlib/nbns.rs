@@ -1312,6 +1312,7 @@ fn reply_list_limit(name: &Name, fixed_data: usize, entry_len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::Lcg;
@@ -1907,7 +1908,7 @@ mod tests {
         assert_eq!(long.scope.len(), 111);
         assert_eq!(long.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&long);
-        let huge = Name::new("FRED", 0x20).with_scope(&"a.".repeat(100_000));
+        let huge = Name::new("FRED", 0x20).with_scope(&"a.".repeat(rounds(100_000)));
         assert_eq!(huge.to_bytes(), Err(Error::Unwritable));
         // A label of MAX_LABEL bytes is written; one byte more is refused.
         let name = Name::new("FRED", 0x20).with_scope(&"x".repeat(MAX_LABEL));

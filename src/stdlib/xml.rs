@@ -2167,6 +2167,7 @@ fn escape(out: &mut String, s: &str, attr: bool, limit: usize) -> Result<(), Err
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, pump};
     use fictionet::stdlib::test_support::contract;
@@ -2275,42 +2276,27 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "wall-clock performance comparison; run manually on an idle machine"]
     fn codec_namespace_heavy_decode_cost() {
-        use std::time::{Duration, Instant};
-
-        let mut document = String::new();
-        for level in 0..250 {
-            document.push_str("<a");
-            for prefix in 0..4 {
-                document.push_str(&format!(
-                    " xmlns:p{level}_{prefix}=\"urn:{level}:{prefix}\""
-                ));
+        assert_linear("codec_namespace_heavy_decode_cost", 10_000, |size| {
+            let mut document = String::new();
+            for level in 0..250 {
+                document.push_str("<a");
+                for prefix in 0..4 {
+                    document.push_str(&format!(
+                        " xmlns:p{level}_{prefix}=\"urn:{level}:{prefix}\""
+                    ));
+                }
+                document.push('>');
             }
-            document.push('>');
-        }
-        document.push_str(&"<b/>".repeat(40_000));
-        document.push_str(&"</a>".repeat(250));
-        let input = document.as_bytes();
-        let mut parsed = Duration::MAX;
-        let mut streamed = Duration::MAX;
-        for _ in 0..3 {
-            let start = Instant::now();
+            document.push_str(&"<b/>".repeat(size));
+            document.push_str(&"</a>".repeat(250));
+            let input = document.as_bytes();
             let events = read_events(input).unwrap();
-            parsed = parsed.min(start.elapsed());
             let expected = events.len();
-            drop(events);
-
-            let start = Instant::now();
             let (events, error) = decode_all(Events::new, input);
             assert_eq!(error, None);
-            streamed = streamed.min(start.elapsed());
             assert_eq!(events.len(), expected);
-        }
-        assert!(
-            streamed < parsed * 5,
-            "stream {streamed:?}, parse {parsed:?}"
-        );
+        });
     }
 
     fn kind(doc: &str) -> ErrorKind {
@@ -2560,34 +2546,34 @@ mod tests {
 
     #[test]
     fn shared_namespaces() {
-        let started = std::time::Instant::now();
-        // A long URI, declared once, is shared by every name in it rather
-        // than copied, so a short element does not cost the URI's length.
-        let uri = "u".repeat(64 << 10);
-        let mut doc = format!("<p:r xmlns:p='{uri}' xmlns='{uri}'>");
-        for _ in 0..20_000 {
-            doc.push_str("<p:a p:b=''/><c/>");
-        }
-        doc.push_str("</p:r>");
-        let events = read_events(doc.as_bytes()).unwrap();
-        assert_eq!(events.len(), 80_002);
-        let namespace = |i: usize| match &events[i] {
-            Event::Start(s) => s.name.namespace.clone().unwrap(),
-            _ => panic!(),
-        };
-        // The prefix and the default are two declarations, each shared.
-        let (p, default) = (namespace(0), namespace(3));
-        assert_eq!(*p, *default);
-        for e in &events[1..events.len() - 1] {
-            let Event::Start(s) = e else { continue };
-            let want = if s.name.prefix.is_some() { &p } else { &default };
-            assert!(Arc::ptr_eq(want, s.name.namespace.as_ref().unwrap()));
-            for a in &s.attributes {
-                assert!(Arc::ptr_eq(&p, a.name.namespace.as_ref().unwrap()));
+        assert_linear("shared_namespaces", 5_000, |size| {
+            // A long URI, declared once, is shared by every name in it rather
+            // than copied, so a short element does not cost the URI's length.
+            let uri = "u".repeat(64 << 10);
+            let mut doc = format!("<p:r xmlns:p='{uri}' xmlns='{uri}'>");
+            for _ in 0..size {
+                doc.push_str("<p:a p:b=''/><c/>");
             }
-        }
-        assert_eq!(decode_all(Events::new, doc.as_bytes()), (events, None));
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+            doc.push_str("</p:r>");
+            let events = read_events(doc.as_bytes()).unwrap();
+            assert_eq!(events.len(), 4 * size + 2);
+            let namespace = |i: usize| match &events[i] {
+                Event::Start(s) => s.name.namespace.clone().unwrap(),
+                _ => panic!(),
+            };
+            // The prefix and the default are two declarations, each shared.
+            let (p, default) = (namespace(0), namespace(3));
+            assert_eq!(*p, *default);
+            for e in &events[1..events.len() - 1] {
+                let Event::Start(s) = e else { continue };
+                let want = if s.name.prefix.is_some() { &p } else { &default };
+                assert!(Arc::ptr_eq(want, s.name.namespace.as_ref().unwrap()));
+                for a in &s.attributes {
+                    assert!(Arc::ptr_eq(&p, a.name.namespace.as_ref().unwrap()));
+                }
+            }
+            assert_eq!(decode_all(Events::new, doc.as_bytes()), (events, None));
+        });
     }
 
     #[test]
@@ -2814,23 +2800,19 @@ mod tests {
         // Two URIs that share a long prefix, bound to two prefixes, and many
         // tags with an attribute in each. Telling the attributes apart must
         // not compare the URIs each time.
-        let shared = "u".repeat(1 << 20);
-        let time = |child: &str| {
-            let mut doc = format!("<r xmlns:p='{shared}a' xmlns:q='{shared}b'>");
-            while doc.len() < MAX_DOCUMENT - 100 {
-                doc.push_str(child);
+        assert_linear("long_namespace_prefixes", 1 << 18, |size| {
+            let shared = "u".repeat(size);
+            for child in ["<x p:a='' b=''/>  ", "<x p:a='' q:a=''/>"] {
+                let mut doc = format!("<r xmlns:p='{shared}a' xmlns:q='{shared}b'>");
+                for _ in 0..size / 10 {
+                    doc.push_str(child);
+                }
+                doc.push_str("</r>");
+                assert!(read_events(doc.as_bytes()).is_ok());
             }
-            doc.push_str("</r>");
-            let begin = std::time::Instant::now();
-            assert!(read_events(doc.as_bytes()).is_ok());
-            begin.elapsed()
-        };
-        // The same document with one prefixed attribute per tag, which
-        // needs no comparison, is the baseline.
-        let one = time("<x p:a='' b=''/>  ");
-        let two = time("<x p:a='' q:a=''/>");
-        assert!(two < one * 3 + std::time::Duration::from_millis(200), "{two:?} against {one:?}");
+        });
         // The same URI under two prefixes is still a duplicate.
+        let shared = "u".repeat(1 << 20);
         let bad = format!("<r xmlns:p='{shared}' xmlns:q='{shared}'><x p:a='' q:a=''/></r>");
         assert_eq!(kind(&bad), ErrorKind::DuplicateAttribute);
         let bad = format!("<r xmlns:p='{shared}'><x xmlns:q='{shared}' p:a='' q:a=''/></r>");
@@ -2905,8 +2887,11 @@ mod tests {
         // Content models nest, up to a limit.
         let nested = format!("<!DOCTYPE r [<!ELEMENT r {}a{}>]><r/>", "(".repeat(MAX_DEPTH), ")".repeat(MAX_DEPTH));
         assert!(read_events(nested.as_bytes()).is_ok());
-        let nested = format!("<!DOCTYPE r [<!ELEMENT r {}a{}>]><r/>", "(".repeat(100_000), ")".repeat(100_000));
-        assert_eq!(kind(&nested), ErrorKind::TooDeep);
+        for offset in (0..rounds(100_000)).step_by(100_000) {
+            let count = (rounds(100_000) - offset).min(100_000);
+            let nested = format!("<!DOCTYPE r [<!ELEMENT r {}a{}>]><r/>", "(".repeat(count), ")".repeat(count));
+            assert_eq!(kind(&nested), ErrorKind::TooDeep);
+        }
     }
 
     #[test]

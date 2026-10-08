@@ -350,7 +350,16 @@ mod tests {
                     fcx.yield_now().await?;
                 }
             }
-            fcx.sleep(Duration::from_millis(1500)).await?;
+            let deadline = fcx.now() + 3 * fictionet::events::REPEAT_WINDOW;
+            let mut next = 1;
+            loop {
+                let drops = fcx.events().wait(&fcx, next, Duration::from_millis(50),
+                    |e| e.source == "bottleneck" && e.kind == "drop").await?;
+                let reported = drops.iter().map(|e| e.u64("count").unwrap()).sum::<u64>();
+                if reported == flood as u64 - 10 { break; }
+                assert!(fcx.now() < deadline, "drop report counted {reported} of {} packets", flood - 10);
+                next = drops.len() + 1;
+            }
             fcx.record(fictionet::events::Event::new("http", "request"));
             let events = fcx.events();
             assert_eq!(events.of("http", "request").len(), 2);

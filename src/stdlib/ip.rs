@@ -1305,6 +1305,7 @@ pub fn hop(packet: &mut [u8]) -> Hop {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
 
     /// An IPv4 header with a correct checksum, from `src` to `dst`, for
@@ -1390,7 +1391,7 @@ mod tests {
         let mut r = Reassembly::default();
         // 8-byte fragments of 200,000 different packets: far more memory
         // than their bytes, so the cap holds them to a few thousand.
-        for i in 0..200_000u32 {
+        for i in 0..rounds(200_000) {
             let t = Instant::from_since_start(Duration::from_micros(i as u64));
             let mut f = frag4((i % 65_536) as u16, 0, 8, true);
             f.0[15] = (i / 65_536) as u8; // another source for each round of ids
@@ -1557,13 +1558,13 @@ mod tests {
     #[test]
     fn fragments_too_long_for_ip_keep_nothing() {
         let mut r = Reassembly::default();
-        for id in 0..20_000u16 {
-            assert!(r.reassemble(frag4(id, 65_528, 16, false), at(0)).is_none());
+        for id in 0..rounds(20_000) {
+            assert!(r.reassemble(frag4(id as u16, 65_528, 16, false), at(0)).is_none());
         }
         assert!(r.partial.is_empty());
         assert_eq!(r.size, 0);
         // Dead entries count against the cap like any other.
-        for id in 0..40_000u32 {
+        for id in 0..rounds(40_000) {
             let mut first = frag4_of((id % 65_536) as u16, 0, &[1; 16], true);
             first.0[15] = (id / 65_536) as u8 + 1;
             set_header_checksum(&mut first.0[..20]);

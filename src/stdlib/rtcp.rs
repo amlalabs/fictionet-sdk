@@ -1747,6 +1747,7 @@ fn check_size(n: usize) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg,
@@ -2926,7 +2927,7 @@ mod tests {
             })),
         ].to_vec()).to_bytes()
         .unwrap();
-        for i in 0..20000 {
+        for i in 0..rounds(20_000) {
             let data = if i % 2 == 0 {
                 // Random bytes, often with a version-2 header in front.
                 let mut d = r.bytes(79);
@@ -2964,7 +2965,7 @@ mod tests {
         let mut r = Lcg::new(0x7772_6974);
         let mut written = 0;
         let mut kinds = std::collections::BTreeSet::new();
-        for _ in 0..20000 {
+        for _ in 0..rounds(20_000) {
             let p = random_packet(&mut r);
             contract::check_wire_value(&p);
             if let Ok(bytes) = p.to_bytes() {

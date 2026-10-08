@@ -632,6 +632,7 @@ impl Wire for Data {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
@@ -1026,7 +1027,7 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         let mut highest: Option<u64> = None;
         let mut s = Lcg::new(7);
-        for _ in 0..20_000 {
+        for _ in 0..rounds(20_000) {
             let base = highest.unwrap_or(0);
             let c = match s.index(4) {
                 0 => base.saturating_sub(s.below(WINDOW_BITS + 10)),
@@ -1050,7 +1051,7 @@ mod tests {
     fn fuzz_loop() {
         let mut s = Lcg::new(0x5eed);
         let sizes = [0, 3, 4, 31, 32, 63, 64, 65, 91, 92, 93, 147, 148, 149, 200, 1500];
-        for i in 0..20_000 {
+        for i in 0..rounds(20_000) {
             let len =
                 if i % 2 == 0 { sizes[s.index(sizes.len())] } else { s.index(300) };
             let mut b = vec![0; len];

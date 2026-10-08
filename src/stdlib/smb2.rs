@@ -2969,6 +2969,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::no_longer;
     use super::*;
     use fictionet::stdlib::codec::{
@@ -3752,12 +3753,12 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_frames_in_linear_time() {
-        let bytes = Frame { payload: b"\xffSMB".to_vec() }.to_bytes().unwrap().repeat(200_000);
-        let started = std::time::Instant::now();
-        let (frames, error) = decode_all(Frames::<Frame>::new, &bytes);
-        assert_eq!(frames.len(), 200_000);
-        assert_eq!(error, None);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("stream_takes_many_small_frames_in_linear_time", rounds(50_000), |size| {
+            let bytes = Frame { payload: b"\xffSMB".to_vec() }.to_bytes().unwrap().repeat(size);
+            let (frames, error) = decode_all(Frames::<Frame>::new, &bytes);
+            assert_eq!(frames.len(), size);
+            assert_eq!(error, None);
+        });
     }
 
     #[test]

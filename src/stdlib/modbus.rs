@@ -854,6 +854,7 @@ fn pack_bits(bits: &[bool]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump, try_pump};
@@ -1445,37 +1446,33 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_frames_in_linear_time() {
-        let one = Frame {
-            transaction: 1,
-            unit: 1,
-            pdu: vec![3, 0, 0, 0, 1],
-        }
-        .to_bytes()
-        .unwrap();
-        let stream: Vec<u8> = one
-            .iter()
-            .copied()
-            .cycle()
-            .take(one.len() * 200_000)
-            .collect();
-        let started = std::time::Instant::now();
-        let mut d = Stream::new(Frames::<Frame>::new());
-        let mut rest = &stream[..];
-        let mut n = 0;
-        while !rest.is_empty() {
-            rest = &rest[d.push(rest)..];
-            while let Some(f) = d.next() {
-                f.unwrap();
-                n += 1;
+        assert_linear("stream_takes_many_small_frames_in_linear_time", rounds(50_000), |size| {
+            let one = Frame {
+                transaction: 1,
+                unit: 1,
+                pdu: vec![3, 0, 0, 0, 1],
             }
-        }
-        assert_eq!(n, 200_000);
-        assert_eq!(d.buffered(), 0);
-        assert!(
-            started.elapsed().as_secs() < 5,
-            "took {:?}",
-            started.elapsed()
-        );
+            .to_bytes()
+            .unwrap();
+            let stream: Vec<u8> = one
+                .iter()
+                .copied()
+                .cycle()
+                .take(one.len() * size)
+                .collect();
+            let mut d = Stream::new(Frames::<Frame>::new());
+            let mut rest = &stream[..];
+            let mut n = 0;
+            while !rest.is_empty() {
+                rest = &rest[d.push(rest)..];
+                while let Some(f) = d.next() {
+                    f.unwrap();
+                    n += 1;
+                }
+            }
+            assert_eq!(n, size);
+            assert_eq!(d.buffered(), 0);
+        });
     }
 
     #[test]

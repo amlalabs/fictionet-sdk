@@ -1990,6 +1990,7 @@ impl Wire for Chunk {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::{
         Assemble, Assembled, Carry, Collect, CollectError, Demux, Fragment, Layered, Lcg, Pipe, pump,
@@ -2233,7 +2234,7 @@ mod tests {
             events,
             test_support::decode_all(|| RequestEvents::with_limits(small()), CHUNKED).0
         );
-        let body = vec![b'x'; 100_003];
+        let body = vec![b'x'; rounds(100_003)];
         let bytes = request_with(&format!("Content-Length: {}\r\n", body.len()), &body);
         let limits = Limits {
             head: 1024,

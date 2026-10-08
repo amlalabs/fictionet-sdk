@@ -1694,6 +1694,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
     use super::harness::wire_same;
     use fictionet::stdlib::test_support;
     use super::*;
@@ -2713,37 +2714,33 @@ mod tests {
         }
     }
 
-    /// Long lines keep the stream contract and complete within a tight time
-    /// bound when fed one byte at a time.
+    /// Long lines keep the stream contract with linear work byte by byte.
     #[test]
     fn stream_is_linear_in_one_long_line() {
-        let mut elapsed = std::time::Duration::ZERO;
-        let n = MAX_LINE_LEN - 2;
-        for (lead, byte) in [(&b"+"[..], b'a'), (b"$", b'1')] {
-            let mut bytes = lead.to_vec();
-            bytes.extend(std::iter::repeat_n(byte, n));
-            bytes.extend_from_slice(b"\r\n");
-            check_values(&bytes, Limits::DEFAULT);
-            let start = std::time::Instant::now();
-            byte_at_a_time(Stream::new(Values::new()), &bytes);
-            elapsed += start.elapsed();
-            let (items, error) = decode_all(Values::new, &bytes);
-            assert_eq!(items.len(), usize::from(byte == b'a'));
-            assert_eq!(error.is_none(), byte == b'a');
-        }
-        for (lead, byte, end) in [(&b"x"[..], b'a', &b"\n"[..]), (b"*1\r\n$", b'1', b"\r\n")] {
-            let mut bytes = lead.to_vec();
-            bytes.extend(std::iter::repeat_n(byte, n));
-            bytes.extend_from_slice(end);
-            check_commands(&bytes, Limits::DEFAULT);
-            let start = std::time::Instant::now();
-            byte_at_a_time(Stream::new(Commands::new()), &bytes);
-            elapsed += start.elapsed();
-            let (items, error) = decode_all(Commands::new, &bytes);
-            assert_eq!(items.len(), usize::from(byte == b'a'));
-            assert_eq!(error.is_none(), byte == b'a');
-        }
-        assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+        let check = |size| {
+            for (lead, byte) in [(&b"+"[..], b'a'), (b"$", b'1')] {
+                let mut bytes = lead.to_vec();
+                bytes.extend(std::iter::repeat_n(byte, size));
+                bytes.extend_from_slice(b"\r\n");
+                check_values(&bytes, Limits::DEFAULT);
+                byte_at_a_time(Stream::new(Values::new()), &bytes);
+                let (items, error) = decode_all(Values::new, &bytes);
+                assert_eq!(items.len(), usize::from(byte == b'a'));
+                assert_eq!(error.is_none(), byte == b'a');
+            }
+            for (lead, byte, end) in [(&b"x"[..], b'a', &b"\n"[..]), (b"*1\r\n$", b'1', b"\r\n")] {
+                let mut bytes = lead.to_vec();
+                bytes.extend(std::iter::repeat_n(byte, size));
+                bytes.extend_from_slice(end);
+                check_commands(&bytes, Limits::DEFAULT);
+                byte_at_a_time(Stream::new(Commands::new()), &bytes);
+                let (items, error) = decode_all(Commands::new, &bytes);
+                assert_eq!(items.len(), usize::from(byte == b'a'));
+                assert_eq!(error.is_none(), byte == b'a');
+            }
+        };
+        check(MAX_LINE_LEN - 2);
+        assert_linear("stream_is_linear_in_one_long_line", (MAX_LINE_LEN - 2) / 4, check);
     }
 
     /// Attributes retain every entry and their value, or writing fails.
@@ -2770,7 +2767,7 @@ mod tests {
     #[test]
     fn depth_has_a_ceiling() {
         let limits = Limits { depth: 100_000, ..Limits::DEFAULT };
-        let mut b = b"*1\r\n".repeat(100_000);
+        let mut b = b"*1\r\n".repeat(rounds(100_000));
         b.extend_from_slice(b"_\r\n");
         check_values(&b, limits);
         assert_eq!(value_step(&b, limits), Err(Error::TooDeep));

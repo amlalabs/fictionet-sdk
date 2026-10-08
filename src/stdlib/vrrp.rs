@@ -777,6 +777,7 @@ impl Wire for Datagram {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::codec::{
         Collect, CollectError, Fail, Lcg, Wire,
@@ -1136,8 +1137,9 @@ mod tests {
         assert_eq!(a.addresses().collect::<Vec<_>>(), vec![IpAddr::V4(ip4(1, 2, 3, 4))]);
         // The accessors borrow: a huge caller-made list is walked, not
         // copied.
-        let huge = Addresses::V4(vec![Ipv4Addr::LOCALHOST; 100_000]);
-        assert_eq!(huge.iter().len(), 100_000);
+        let n = rounds(100_000);
+        let huge = Addresses::V4(vec![Ipv4Addr::LOCALHOST; n]);
+        assert_eq!(huge.iter().len(), n);
         assert_eq!(huge.iter().nth(99_999), Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         // Every error has a message.
         for err in [

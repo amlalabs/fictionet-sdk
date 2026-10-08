@@ -2056,6 +2056,7 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::test_support::rounds;
     use super::*;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::{
@@ -2636,7 +2637,7 @@ mod tests {
 
     #[test]
     fn stream_many_small_messages_in_one_push() {
-        let n = 1 << 18;
+        let n = rounds(1 << 18);
         let bytes: Vec<u8> = (0..n).flat_map(|i| [0, 0, 0, i as u8]).collect();
         let (messages, failure) = decode_all(Messages::new, &bytes);
         assert_eq!(failure, None);
