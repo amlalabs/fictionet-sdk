@@ -1005,7 +1005,7 @@ impl Client {
     pub fn send(&mut self, msg: &ClientMessage) -> Result<Vec<u8>, Error> {
         if matches!(msg, ClientMessage::SetPixelFormat(_))
             && self.state.phase == Phase::Normal
-            && (self.state.requested || self.input.unread().first() == Some(&server_type::FRAMEBUFFER_UPDATE))
+            && (self.state.requested || !self.input.unread().is_empty())
         {
             return Err(Error::Outstanding);
         }
@@ -1172,8 +1172,7 @@ pub enum Error {
     /// are true color.
     NotRequested,
     /// SetPixelFormat while a framebuffer update request is outstanding or
-    /// an update is being read, when the client could not tell which
-    /// format the update is in.
+    /// server bytes remain unread. Pending updates must keep their format.
     Outstanding,
     /// A message sent in a phase where it does not belong.
     Phase(Phase),
@@ -2120,6 +2119,16 @@ mod tests {
             ServerMessage::Bell,
             ServerMessage::ServerCutText(b"copied".to_vec()),
         ]
+    }
+
+    #[test]
+    fn review_pixel_format_waits_after_bell() {
+        let (_, mut c) = normal_pair();
+        assert_eq!(c.push(&[server_type::BELL, server_type::FRAMEBUFFER_UPDATE, 0]), 3);
+        assert_eq!(c.send(&ClientMessage::SetPixelFormat(PixelFormat::TRUE_COLOR_32)), Err(Error::Outstanding));
+        assert_eq!(c.next(), Some(Ok(Ok(ServerMessage::Bell))));
+        assert_eq!(c.next(), None);
+        assert_eq!(c.send(&ClientMessage::SetPixelFormat(PixelFormat::TRUE_COLOR_32)), Err(Error::Outstanding));
     }
 
     #[test]

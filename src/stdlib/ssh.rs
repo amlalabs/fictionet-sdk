@@ -221,6 +221,10 @@ impl Identification {
         software: &str,
         comments: Option<&str>,
     ) -> Result<Identification, Error> {
+        Self::with_ending(proto, software, comments, 2)
+    }
+
+    fn with_ending(proto: &str, software: &str, comments: Option<&str>, ending: usize) -> Result<Self, Error> {
         // Everything is checked before anything is copied, so a long part
         // costs no allocation.
         if !version_part(proto.as_bytes()) || !version_part(software.as_bytes()) {
@@ -231,7 +235,7 @@ impl Identification {
         {
             return Err(Error::BadVersion);
         }
-        if line_len(proto, software, comments) > MAX_VERSION_LINE {
+        if line_len(proto, software, comments).saturating_sub(2 - ending) > MAX_VERSION_LINE {
             return Err(Error::LineTooLong);
         }
         Ok(Identification {
@@ -242,7 +246,7 @@ impl Identification {
     }
 
     /// Reads a version line's text, without its line ending.
-    fn parse_text(line: &[u8]) -> Result<Identification, Error> {
+    fn parse_text(line: &[u8], ending: usize) -> Result<Identification, Error> {
         let rest = line.strip_prefix(b"SSH-").ok_or(Error::BadVersion)?;
         let dash = rest
             .iter()
@@ -253,12 +257,12 @@ impl Identification {
             Some(sp) => (&rest[..sp], Some(&rest[sp + 1..])),
             None => (rest, None),
         };
-        let text = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| Error::BadVersion);
+        fn text(b: &[u8]) -> Result<&str, Error> { core::str::from_utf8(b).map_err(|_| Error::BadVersion) }
         let comments = match comments {
             Some(c) => Some(text(c)?),
             None => None,
         };
-        Identification::new(&text(proto)?, &text(software)?, comments.as_deref())
+        Identification::with_ending(text(proto)?, text(software)?, comments, ending)
     }
 
     /// The protocol version, such as `2.0`.
@@ -358,7 +362,7 @@ fn parse_line(b: &[u8]) -> Result<Option<(Line, usize)>, Error> {
             let text = &b[..i];
             let text = text.strip_suffix(b"\r").unwrap_or(text);
             let line = if text.starts_with(b"SSH-") {
-                Line::Version(Identification::parse_text(text)?)
+                Line::Version(Identification::parse_text(text, len - text.len())?)
             } else {
                 Line::Banner(text.to_vec())
             };
@@ -384,7 +388,8 @@ impl Wire for Identification {
         }
     }
 
-    /// Appends the identification with CR LF. Refuses allocation failure.
+    /// Appends the identification with CR LF, or LF when only that fits.
+    /// Refuses allocation failure.
     /// Construction already checks its fields and length.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         out.try_reserve_exact(self.len())
@@ -397,7 +402,7 @@ impl Wire for Identification {
             out.push(b' ');
             out.extend_from_slice(c.as_bytes());
         }
-        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(if self.len() <= MAX_VERSION_LINE { b"\r\n" } else { b"\n" });
         Ok(())
     }
 }
@@ -1566,6 +1571,19 @@ mod tests {
                 data: vec![],
             },
         ]
+    }
+
+    #[test]
+    fn review_version_line_endings_at_limit() {
+        for ending in ["\n", "\r\n"] {
+            let text = format!("SSH-2.0-{}", "x".repeat(MAX_VERSION_LINE - 8 - ending.len()));
+            let bytes = format!("{text}{ending}").into_bytes();
+            assert_eq!(bytes.len(), MAX_VERSION_LINE);
+            let id = Identification::parse(&bytes).unwrap();
+            assert_eq!(Identification::parse(&id.to_bytes().unwrap()), Ok(id));
+            let long = format!("{text}x{ending}");
+            assert_eq!(Identification::parse(long.as_bytes()), Err(Error::LineTooLong));
+        }
     }
 
     #[test]

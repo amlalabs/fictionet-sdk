@@ -1271,7 +1271,7 @@ impl Wire for NatPmpRequest {
     type ParseError = Error;
     type WriteError = Error;
 
-    /// Reads a request, ignoring bytes past a fixed opcode body.
+    /// Reads exactly one request, refusing bytes past a fixed opcode body.
     /// Refuses incomplete headers or bodies, responses and oversized input.
     fn parse(b: &[u8]) -> Result<NatPmpRequest, Error> {
         if b.len() < 2 {
@@ -1289,11 +1289,17 @@ impl Wire for NatPmpRequest {
         }
         Ok(match op {
             nat_pmp_opcode::EXTERNAL_ADDRESS => {
+                if b.len() > 2 {
+                    return Err(Error::NatPmpTrailing);
+                }
                 NatPmpRequest::ExternalAddress
             },
             nat_pmp_opcode::MAP_UDP | nat_pmp_opcode::MAP_TCP => {
                 if b.len() < 12 {
                     return Err(Error::NatPmpShort(b.len()));
+                }
+                if b.len() > 12 {
+                    return Err(Error::NatPmpTrailing);
                 }
                 let protocol = if op == nat_pmp_opcode::MAP_UDP { NatPmpProtocol::Udp } else { NatPmpProtocol::Tcp };
                 NatPmpRequest::Map {
@@ -1524,6 +1530,15 @@ mod tests {
     }
 
     // RFC 6887 figures 2, 9 and 13: a MAP request, byte by byte.
+    #[test]
+    fn review_nat_pmp_request_trailing() {
+        for mut bytes in [vec![0, 0], vec![0, 1, 0, 0, 0, 1, 0, 2, 0, 0, 0, 3], vec![0, 2, 0, 0, 0, 1, 0, 2, 0, 0, 0, 3]] {
+            assert!(NatPmpRequest::parse(&bytes).is_ok());
+            bytes.push(0);
+            assert_eq!(NatPmpRequest::parse(&bytes), Err(Error::NatPmpTrailing));
+        }
+    }
+
     #[test]
     fn map_request_layout() {
         let mut r = map_request();

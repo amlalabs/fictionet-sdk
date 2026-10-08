@@ -1572,6 +1572,24 @@ fn exact<T>(parsed: Step<T>, len: usize) -> Result<T, Error> {
     }
 }
 
+// A streamed aggregate spends seven bytes on its header and terminator.
+// A fixed count needs more only at five digits. Other parsed fields shrink
+// or keep their length, except doubles written without an exponent.
+fn parsed_may_expand(value: &Value) -> bool {
+    match value {
+        Value::Double(_) => true,
+        Value::Array(items) | Value::Set(items) | Value::Push(items) => {
+            items.len() >= 10_000 || items.iter().any(parsed_may_expand)
+        }
+        Value::Map(entries) | Value::Attribute { attributes: entries, .. } => {
+            entries.len() >= 10_000
+                || entries.iter().any(|(key, value)| parsed_may_expand(key) || parsed_may_expand(value))
+                || matches!(value, Value::Attribute { value, .. } if parsed_may_expand(value))
+        }
+        _ => false,
+    }
+}
+
 impl Wire for Value {
     type ParseError = Error;
     type WriteError = Error;
@@ -1583,11 +1601,13 @@ impl Wire for Value {
     /// can expand when written.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let value = exact(value_top(bytes, &Limits::DEFAULT), bytes.len())?;
-        // Parsing validates every field. Only size expansion can make writing fail:
-        // doubles expand, and streamed bulk chunks can exceed the plain bulk limit.
-        value
-            .write(&mut Vec::new())
-            .map_err(|_| Error::FrameTooLarge)?;
+        // Scalar encodings fit the frame limit. Aggregates can expand when
+        // doubles use decimal notation or streamed counts gain digits.
+        if matches!(value, Value::Array(_) | Value::Set(_) | Value::Push(_)
+            | Value::Map(_) | Value::Attribute { .. }) && parsed_may_expand(&value)
+        {
+            value.write(&mut Vec::new()).map_err(|_| Error::FrameTooLarge)?;
+        }
         Ok(value)
     }
 
@@ -1711,15 +1731,11 @@ impl Wire for Command {
     /// Array counts and bulk lengths allow no `+`, leading zero, or `-0`.
     /// Blank lines and arrays with zero or negative counts have no arguments.
     /// Refuses malformed, incomplete, oversized, or trailing input and
-    /// commands whose array encoding exceeds the default limits.
+    /// commands exceeding the default limits.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let command = exact(command_top(bytes, &Limits::DEFAULT), bytes.len())?;
-        // Parsed arguments already meet field limits. Only expansion from an
-        // inline command to an array of bulk strings can exceed the frame limit.
-        command
-            .write(&mut Vec::new())
-            .map_err(|_| Error::FrameTooLarge)?;
-        Ok(command)
+        // Inline input is capped at MAX_LINE_LEN; its bulk encoding fits
+        // MAX_FRAME_LEN. Array arguments already have their wire lengths.
+        exact(command_top(bytes, &Limits::DEFAULT), bytes.len())
     }
 
     /// Appends an array of bulk strings under [`Limits::DEFAULT`].
@@ -1981,6 +1997,20 @@ mod tests {
         b"~?\r\n.\r\n",
         b"%?\r\n+a\r\n:1\r\n+b\r\n:2\r\n.\r\n",
     ];
+
+    #[test]
+    fn review_scalar_and_inline_writability() {
+        assert!(!parsed_may_expand(&Value::Array(vec![Value::bulk("ordinary"), Value::Integer(1)])));
+        assert!(parsed_may_expand(&Value::Array(vec![Value::Double(1e300)])));
+        assert!(parsed_may_expand(&Value::Array(vec![Value::Null; 10_000])));
+        for bytes in [b"+OK\r\n".as_slice(), b",1e300\r\n", b"*2\r\n:1\r\n+ok\r\n"] {
+            let value = Value::parse(bytes).unwrap();
+            assert_eq!(Value::parse(&value.to_bytes().unwrap()), Ok(value));
+        }
+        let bytes = [b"x ".repeat(MAX_LINE_LEN / 2), b"\n".to_vec()].concat();
+        let command = Command::parse(&bytes).unwrap();
+        assert!(command.to_bytes().unwrap().len() < MAX_FRAME_LEN);
+    }
 
     #[test]
     fn resp2_get_missing_without_hello() {

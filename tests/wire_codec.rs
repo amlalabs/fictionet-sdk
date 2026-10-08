@@ -54,7 +54,7 @@ fn complete_units_refuse_a_second_unit() {
 }
 
 #[test]
-fn control_and_nat_pmp_units_ignore_trailing_bytes() {
+fn control_ignores_trailing_bytes_and_nat_pmp_refuses_them() {
     let control = l2tp::V3Control::new(1, 2, 3, &l2tp::ControlMessage::zlb()).unwrap();
     let mut bytes = control.to_bytes().unwrap();
     bytes.push(0);
@@ -63,7 +63,7 @@ fn control_and_nat_pmp_units_ignore_trailing_bytes() {
 
     let mut bytes = pcp::NatPmpRequest::ExternalAddress.to_bytes().unwrap();
     bytes.push(0);
-    assert_eq!(pcp::NatPmpRequest::parse(&bytes), Ok(pcp::NatPmpRequest::ExternalAddress));
+    assert_eq!(pcp::NatPmpRequest::parse(&bytes), Err(pcp::Error::NatPmpTrailing));
     contract::check_wire::<pcp::NatPmpRequest>(&bytes);
 }
 
