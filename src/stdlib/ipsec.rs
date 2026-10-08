@@ -1,5 +1,10 @@
 //! IPsec: reading and writing ESP and AH headers, with no I/O.
 //!
+//! `EspPacket`, `AhPacket`, and NAT traversal datagrams implement `Wire`.
+//! `Plaintext` reads and writes decrypted ESP payloads. There is no
+//! cryptography, security association state machine, protocol stream decoder,
+//! or live tunnel transport.
+//!
 //! IPsec protects IP packets with keys two hosts agree on, usually through
 //! IKE. It adds one of two headers. ESP (the Encapsulating Security
 //! Payload, IP protocol 50) encrypts what it carries: after a 4-byte SPI,

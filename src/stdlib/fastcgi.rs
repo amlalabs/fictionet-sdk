@@ -1,6 +1,11 @@
 //! FastCGI: reading and writing records, name and value pairs, and whole
 //! requests and responses, with no I/O.
 //!
+//! `Record` and complete requests and responses implement `Wire`.
+//! `codec::Frames<Record>` decodes the stream. `Client` and `Server` provide
+//! caller-driven request bookkeeping, but there is no `Service`, process
+//! manager, or live transport.
+//!
 //! FastCGI is how a web server hands a request to an application running
 //! in a separate process, such as PHP-FPM behind nginx. The web server
 //! opens a connection, usually TCP port 9000 or a Unix socket, and sends

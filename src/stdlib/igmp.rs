@@ -1,6 +1,11 @@
 //! IGMP: reading and writing multicast group membership messages, with no
 //! I/O.
 //!
+//! `Message` reads and writes complete multicast membership messages through
+//! `Wire`. There is no protocol stream decoder, membership state machine,
+//! querier timer, or `Service`. The caller maintains groups and sends IP
+//! packets.
+//!
 //! IGMP (the Internet Group Management Protocol, IP protocol 2) is how an
 //! IPv4 host tells the routers on its link which multicast groups it wants
 //! to hear. A router sends a query, every host answers with a report for

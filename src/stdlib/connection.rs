@@ -1,3 +1,9 @@
+//! Contracts for byte connections, accepted streams, and datagram sockets.
+//!
+//! These traits let transports supply reads, writes, acceptance, and address
+//! information to the serving driver. They provide no protocol parser,
+//! session, service implementation, or encryption of their own.
+
 use std::future::Future;
 use std::task::{Context, Poll};
 

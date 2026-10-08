@@ -1,4 +1,8 @@
 //! Packet delays, rate limits, and filters.
+//!
+//! These functions start tasks that forward packets through interfaces with
+//! delays, rate limits, or caller-selected filtering. They do not parse or
+//! write protocol messages, implement sessions or services, or encrypt traffic.
 
 use std::collections::VecDeque;
 use std::task::Poll;

@@ -1,6 +1,10 @@
 //! OCSP: reading and writing certificate status requests and responses,
 //! with no I/O.
 //!
+//! DER request and response types implement `Wire`, and `Frames` decodes
+//! successive DER values. There is no responder `Service`, HTTP transport,
+//! signature generation, or signature verification.
+//!
 //! The Online Certificate Status Protocol is how a client asks a
 //! certificate authority whether a certificate is still good. The client
 //! names each certificate by a [`CertId`]: hashes of its issuer's name and

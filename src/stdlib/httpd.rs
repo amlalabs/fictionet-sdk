@@ -2,6 +2,11 @@
 //! adapter that runs any tower service (axum included), and name-based
 //! virtual hosting, all on [`serve`].
 //!
+//! `Http1` is a caller-driven `Service` on the `http1` decoder.
+//! `serve_connection` runs it over a live connection. HTTP/2 and HTTP/1 Upgrade
+//! handling use hyper, not the `http2` frame layer. TLS comes from
+//! `fictionet::stdlib::tls`. This module supplies no HTTP client.
+//!
 //! A [`Handler`] answers one request. Three kinds come ready:
 //!
 //! - [`Router`]: routes by method and path to plain functions. A handler
@@ -51,11 +56,9 @@
 //! set in 2019 never sends a date from the year it runs in. A `Date` the
 //! handler sets itself is sent as it is.
 //!
-//! HTTP/2 runs on hyper for now, behind the same [`Handler`] trait and the
+//! HTTP/2 runs on hyper, behind the same [`Handler`] trait and the
 //! same events, with the same [`Limits`], the same charges to the
-//! connection's [`Budget`] and the same seeded randomness. When the
-//! stdlib's own HTTP/2 lands, it becomes a second `Service` here and
-//! [`serve_connection`] picks it; handlers do not change. HTTP/2 request body
+//! connection's [`Budget`] and the same seeded randomness. HTTP/2 request body
 //! and write stall timeouts use Fictionet deadlines. Hyper runs without a
 //! timer, with keep-alive pings and adaptive windows disabled.
 //!

@@ -1,6 +1,11 @@
 //! BGP-4: reading and writing messages, from OPEN to ROUTE-REFRESH, with
 //! no I/O.
 //!
+//! `Frame` implements `Wire` and supports `codec::Frames<Frame>` stream
+//! decoding. `Context` holds negotiated parsing options. There is no peer
+//! session or routing `Service`. Timers, message ordering, route selection, and
+//! TCP belong to the caller.
+//!
 //! BGP is how networks on the Internet tell each other which addresses
 //! they can reach. Two routers (speakers) hold a TCP connection, usually
 //! on port 179, and send each other messages: an OPEN to start, then

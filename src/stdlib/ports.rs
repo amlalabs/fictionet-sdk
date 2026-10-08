@@ -1,4 +1,9 @@
 //! Ready-slot polling for packet interfaces, deadlines and extra sources.
+//!
+//! `Ports` waits for packets, closures, a deadline, or a caller-supplied extra
+//! source, with bounded work before yielding. It does not read or write
+//! protocol values or implement sessions or services. Packet processing belongs
+//! to the task that calls it.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::future::{Future, poll_fn};

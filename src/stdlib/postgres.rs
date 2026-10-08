@@ -1,6 +1,11 @@
 //! PostgreSQL: reading and writing the frontend/backend protocol, version
 //! 3, with no I/O.
 //!
+//! `FrontendMessage` and `BackendMessage` implement `Wire`. Directional
+//! decoders track startup and encryption-reply framing. They do not implement a
+//! database session, authentication, SQL execution, a `Service`, or encrypted
+//! transport.
+//!
 //! A PostgreSQL client talks to its server over one TCP connection,
 //! usually on port 5432. The connection opens with a startup phase, in
 //! which the client sends messages with no type byte: a StartupMessage

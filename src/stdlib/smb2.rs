@@ -1,6 +1,11 @@
 //! SMB2 and SMB3: reading and writing messages, compound chains and their
 //! bodies, with no I/O.
 //!
+//! `Packet` and message envelopes implement `Wire`, and `codec::Frames<Frame>`
+//! decodes TCP framing. These are wire messages only, with no client or server
+//! session or file-server `Service`. Signing, encryption, decompression,
+//! authentication, and file storage belong to the caller.
+//!
 //! SMB is how Windows shares files, printers and named pipes. A client opens
 //! a TCP connection to port 445, negotiates a dialect, sets up a session
 //! (authentication rides inside it as opaque security blobs), connects to a

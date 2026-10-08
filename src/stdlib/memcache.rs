@@ -1,6 +1,11 @@
 //! memcached: reading and writing the text protocol, the binary protocol
 //! and UDP frames, with no I/O.
 //!
+//! `Command`, `Response`, `Packet`, and `UdpFrame` implement `Wire`. Text
+//! decoders and `codec::Frames<Packet>` handle streams. There is no cache
+//! session or `Service`, storage engine, expiration scheduler, or live
+//! transport.
+//!
 //! memcached is a cache that keeps values under keys in memory. Web
 //! applications put it in front of slow databases, and many other servers
 //! speak its protocol. Clients reach it over TCP or UDP, usually on port

@@ -1,6 +1,11 @@
 //! QPACK, the header compression of HTTP/3: reading and writing field
 //! sections and the encoder and decoder streams, with no I/O.
 //!
+//! Field sections and instruction values implement `Wire`. `codec::Frames`
+//! decodes the encoder and decoder instruction streams. Tables, encoding, and
+//! blocked-section bookkeeping are caller-driven. There is no HTTP/3 session,
+//! `Service`, or QUIC transport here.
+//!
 //! HTTP/3 does not send header fields as text. Each request and response
 //! carries an encoded field section: a short prefix, then one field line
 //! per field. A field line can name an entry in a fixed table of 99 common

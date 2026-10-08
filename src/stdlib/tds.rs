@@ -1,6 +1,11 @@
 //! TDS (SQL Server): reading and writing packets, logins, SQL batches and
 //! response tokens, with no I/O.
 //!
+//! `Packet`, `Message`, and `TokenStream` implement `Wire`. Stream decoders
+//! assemble packets, and `TokenReader` retains column metadata. There is no
+//! login or query session, database `Service`, SQL engine, authentication, or
+//! TLS transport.
+//!
 //! TDS, the Tabular Data Stream, is how clients talk to Microsoft SQL
 //! Server, usually over TCP port 1433. Every message travels in packets
 //! with an 8-byte header: a type, a status, a length and a few other

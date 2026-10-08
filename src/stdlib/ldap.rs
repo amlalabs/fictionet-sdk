@@ -1,6 +1,10 @@
 //! LDAP: reading and writing messages, search filters and distinguished
 //! names, with no I/O.
 //!
+//! `Message` implements `Wire` and supports `codec::Frames<Message>` stream
+//! decoding. These are wire messages only, with no bind session, directory
+//! `Service`, authentication, or TLS transport.
+//!
 //! LDAP is how most directories are read and changed: Active Directory,
 //! OpenLDAP and the address books behind mail servers. A client binds (logs
 //! in), then searches, adds, modifies, renames and deletes entries, each

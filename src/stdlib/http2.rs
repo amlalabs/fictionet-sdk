@@ -1,5 +1,11 @@
 //! HTTP/2 frames and directional state (RFC 9113).
 //!
+//! `Frame` implements `Wire`, `Frames` decodes the stream, and `Session` tracks
+//! one direction rather than a whole client or server. This module has no
+//! `Service` or live transport. HTTP/2 serving uses hyper through
+//! `fictionet::stdlib::httpd`. The observe presenter uses this frame layer
+//! independently of that server.
+//!
 //! Use [`Session`] for strict decoding. A capture reads frames with
 //! [`Frames::for_observation`] and header blocks with
 //! [`HeaderBlocks::for_observation`], which report what they cannot read

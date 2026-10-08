@@ -1,6 +1,12 @@
 //! WebSocket (RFC 6455): the opening handshake, frames and messages, with
 //! no I/O.
 //!
+//! `Frame` implements `Wire`. `Frames` and `Messages` decode frames and
+//! reassemble messages. Handshake helpers do not implement an HTTP Upgrade
+//! transport or a WebSocket session or `Service`. Ping replies, closing, and
+//! TLS belong to the caller. Extensions, including compression, are
+//! unsupported.
+//!
 //! A WebSocket is a long-lived, two-way channel that starts as an HTTP/1.1
 //! request. The client sends a `GET` with `Upgrade: websocket` and a random
 //! `Sec-WebSocket-Key`. The server answers `101 Switching Protocols` with a

@@ -1,5 +1,10 @@
 //! XML 1.0: a pull parser and a writer, with no I/O.
 //!
+//! `Document` implements `Wire`, and `Events` decodes a UTF-8 XML stream with
+//! namespace resolution. This is a nonvalidating parser. It checks DTD syntax
+//! and applies attribute defaults, but does not expand declared entities or
+//! load external resources. It supplies no SOAP or XMPP session or `Service`.
+//!
 //! XML carries the bodies of SOAP calls, XMPP streams, RSS and Atom feeds,
 //! SAML assertions and many web APIs. A document is a tree of elements,
 //! each with a name and attributes, holding text and other elements. This

@@ -1,6 +1,11 @@
 //! RTSP: reading and writing Real-Time Streaming Protocol messages and
 //! interleaved data, with no I/O.
 //!
+//! `Message` and `Frame` implement `Wire`, and `Frames` decodes messages and
+//! interleaved data. `Session` represents a header value, not a connection
+//! state machine. This module has no streaming `Service`, media transport, or
+//! playback engine.
+//!
 //! RTSP is how IP cameras, video recorders and media servers are told to
 //! stream. A client asks about a stream with DESCRIBE, agrees on how the
 //! media travels with SETUP, and starts and stops it with PLAY, PAUSE and

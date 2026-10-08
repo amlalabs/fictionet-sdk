@@ -4,6 +4,11 @@
 //! per unit, and a bounded order book, with no I/O.
 //! Message tables use [`codec::layout!`](fictionet::stdlib::codec::layout!).
 //!
+//! `Unit` supplies complete-value reading and writing and TCP stream framing.
+//! `GapDetector` and `Book` track feed state. This module has no GRP or Spin
+//! Server session, `Service`, or live transport. Callers request gaps and
+//! coordinate recovery.
+//!
 //! PITCH is Cboe's depth-of-book market data feed for its BYX, BZX, EDGA
 //! and EDGX equities exchanges (and, with a few extra types and trailing
 //! bytes, its options exchanges). This module follows the

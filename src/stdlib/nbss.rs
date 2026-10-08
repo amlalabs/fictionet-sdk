@@ -1,6 +1,11 @@
 //! The NetBIOS Session Service: reading and writing session packets, with
 //! no I/O.
 //!
+//! `Packet` implements `Wire` and supports `codec::Frames<Packet>` stream
+//! decoding. Despite the protocol name, this module has no session state
+//! machine or `Service`. The caller handles session acceptance, SMB payloads,
+//! and TCP.
+//!
 //! Before SMB ran straight over TCP port 445, Windows file sharing ran over
 //! NetBIOS sessions on TCP port 139, and many hosts still answer there. A
 //! client opens a TCP connection, sends a session request that names the

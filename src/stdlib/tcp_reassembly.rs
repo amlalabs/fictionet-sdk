@@ -1,5 +1,10 @@
 //! Bounded TCP capture reassembly with ordered bytes, gaps, and end signals.
 //!
+//! This is passive capture state, not a live TCP endpoint or a protocol
+//! `Decode` implementation. It neither writes TCP packets nor decrypts or
+//! presents application messages. Callers supply captured segments and consume
+//! the resulting chunks.
+//!
 //! Feed captured [`Segment`] values to [`Reassembler::push`]. Route each
 //! [`Chunk`] by its [`FlowKey`] to the application's directional decoder.
 //! A gap invalidates framing and compression state. An end marks input EOF.

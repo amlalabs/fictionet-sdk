@@ -1,5 +1,9 @@
 //! WHOIS: reading and writing queries and responses, with no I/O.
 //!
+//! `Query` and `Response` implement `Wire`. `Queries` decodes lines and
+//! `CollectedResponses` collects a reply through EOF. There is no lookup
+//! session, referral-following client, registry `Service`, or live transport.
+//!
 //! WHOIS is how people and tools look up who holds a domain name, an IP
 //! block or an AS number. A client connects to a server over TCP, on port
 //! 43, and sends one line of text: the query, ended by CR LF. The server

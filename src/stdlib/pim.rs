@@ -1,6 +1,10 @@
 //! PIM: reading and writing Protocol Independent Multicast version 2
 //! messages, with no I/O.
 //!
+//! Message readers and writers handle complete packets, with `Datagram` as the
+//! `Wire` carrier. There is no protocol stream decoder, neighbor or
+//! multicast-tree state machine, routing `Service`, or live transport.
+//!
 //! PIM (IP protocol 103) is how routers build the trees that carry
 //! multicast traffic. Neighbors find each other with Hello messages. A
 //! router that wants a group's traffic sends a Join/Prune message upstream,

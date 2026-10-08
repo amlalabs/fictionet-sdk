@@ -2,6 +2,11 @@
 //! the ApiVersions and Metadata messages, with no
 //! I/O.
 //!
+//! `Frame` implements `Wire` and supports `codec::Frames<Frame>` stream
+//! decoding. Typed bodies cover ApiVersions 0 through 5 and Metadata 0 through
+//! 13. Other bodies remain bytes. There is no producer or consumer session,
+//! broker `Service`, or live transport.
+//!
 //! Kafka is a log of messages that many services write to and read from.
 //! Clients talk to a broker over TCP, usually on port 9092. Every message
 //! is a frame: a 4-byte big-endian size, then that many bytes. A request

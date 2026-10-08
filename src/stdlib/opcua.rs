@@ -1,6 +1,11 @@
 //! OPC UA over TCP: reading and writing the binary transport, its built-in
 //! types and the OpenSecureChannel service, with no I/O.
 //!
+//! `Chunk` and service bodies implement `Wire`, while `Messages` decodes and
+//! reassembles transport chunks. Typed services cover opening and closing a
+//! secure channel under policy None. There is no cryptography, client or server
+//! session, address-space `Service`, or live transport.
+//!
 //! OPC UA is how much modern industrial equipment is read and controlled.
 //! A server (a PLC, a gateway, a SCADA host) exposes an address space of
 //! nodes, and a client reads, writes and subscribes to them. The binary

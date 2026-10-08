@@ -1,6 +1,11 @@
 //! ASN.1 BER and DER: reading and writing tags, lengths and values, with no
 //! I/O.
 //!
+//! This is an encoding layer. `Frame` implements `Wire`, `Elements` decodes a
+//! stream, and `Reader` and `Writer` handle individual values. It does not
+//! compile ASN.1 schemas or implement the sessions, services, or cryptography
+//! of protocols that use ASN.1.
+//!
 //! ASN.1 describes data structures, and its encoding rules turn them into
 //! bytes. The Basic Encoding Rules (BER) allow several encodings of one
 //! value. The Distinguished Encoding Rules (DER) allow exactly one. LDAP,

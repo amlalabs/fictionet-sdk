@@ -1,6 +1,11 @@
 //! EtherNet/IP and CIP: reading and writing the encapsulation layer, the
 //! common packet format and CIP message router messages, with no I/O.
 //!
+//! `Packet` and typed CIP bodies implement `Wire`, and `codec::Frames<Packet>`
+//! decodes encapsulation packets. There is no registration or I/O connection
+//! state machine, device `Service`, or live transport. CIP object behavior
+//! belongs to the caller.
+//!
 //! EtherNet/IP carries the Common Industrial Protocol (CIP) over ordinary
 //! networks. A client opens a TCP connection to a device on port 44818,
 //! registers a session, and then sends CIP messages inside an

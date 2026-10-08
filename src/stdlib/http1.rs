@@ -1,5 +1,8 @@
 //! HTTP/1 request and response heads and bodies, with RFC 9112 framing.
 //!
+//! Complete requests, responses, and heads implement `Wire`. Directional
+//! decoders yield whole messages or head/body events. Serving belongs to
+//! `fictionet::stdlib::httpd`, and this module provides no live transport.
 //! Content-Length, chunked bodies, connection close, Expect: 100-continue,
 //! and CONNECT handoff use the shared codec drivers. Non-empty trailers and
 //! chunk extensions are refused. Requests ignore Upgrade offers and continue

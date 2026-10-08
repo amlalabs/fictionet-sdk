@@ -1,5 +1,10 @@
 //! FIX tag=value messages, repeating-group views, and caller-driven sessions.
 //!
+//! `Message` implements `Wire`, `Messages` decodes the stream, and `Session` is
+//! a caller-driven state machine for either side. There is no `Service` or live
+//! transport. The caller supplies time, authentication decisions, and
+//! application behavior.
+//!
 //! The wire rules follow FIX 4.4 Volume 2, “Standard Message header”,
 //! “Data Integrity”, and “Session Protocol”, and FIXT 1.1 (March 2008), “Session Protocol” and
 //! “Administrative Messages”. The session also follows FIX Session Layer

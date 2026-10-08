@@ -1,6 +1,10 @@
 //! VXLAN and VXLAN-GPE: reading and writing the headers that carry one
 //! network's frames inside UDP datagrams, with no I/O.
 //!
+//! `Packet` and `GpePacket` read and write complete datagrams through `Wire`,
+//! leaving the inner frame as bytes. There is no stream decoder, tunnel
+//! endpoint state, learning bridge, `Service`, or live transport.
+//!
 //! VXLAN stretches a layer 2 network across a layer 3 one. A tunnel
 //! endpoint (a VTEP: a hypervisor, a switch, a container host) takes an
 //! Ethernet frame, puts an 8-byte VXLAN header in front of it, and sends

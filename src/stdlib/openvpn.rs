@@ -1,5 +1,10 @@
 //! OpenVPN: reading and writing packets, over UDP and TCP, with no I/O.
 //!
+//! Packet readers and writers handle control and data envelopes, and
+//! `codec::Frames<Frame>` decodes TCP framing. There is no cryptography, TLS
+//! session, reliable control-channel state machine, VPN `Service`, or live
+//! tunnel transport.
+//!
 //! OpenVPN builds a VPN tunnel from two channels. The control channel
 //! carries a TLS session in small, numbered, acknowledged packets, and
 //! sets up the keys. The data channel carries the tunnel's IP packets,

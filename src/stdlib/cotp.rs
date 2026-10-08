@@ -1,6 +1,10 @@
 //! TPKT and COTP: reading and writing ISO transport packets on TCP, with no
 //! I/O.
 //!
+//! `Tpdu` reads and writes complete values, while `Tpdus` and `messages`
+//! compose TPKT decoding and segment reassembly. These helpers do not implement
+//! connection establishment as a session, a `Service`, or a live TCP transport.
+//!
 //! ISO transport (COTP, the connection-oriented transport protocol) runs
 //! under Siemens S7 PLCs, IEC 61850 substations, ICCP links between control
 //! centers, and the start of every RDP session. On TCP, usually port 102

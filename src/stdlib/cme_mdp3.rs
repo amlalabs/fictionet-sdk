@@ -2,7 +2,12 @@
 // You own this file. You may copy and edit it. Regenerate only by choice.
 // Input: "templates_FixBinary.xml"
 
-#![doc = "SBE schema mktdata id 1 version 13. 20230411"]
+//! SBE schema mktdata id 1 version 13. 20230411.
+//!
+//! Generated CME MDP 3.0 values implement `Wire`. `Packet` reads and writes
+//! packet envelopes, and `Messages` decodes size-prefixed SBE messages.
+//! There is no feed session, recovery engine, order book, `Service`, or live
+//! transport. This file is editable without running the code generator.
 
 /// Maximum encoded bytes in one value.
 pub const MAX_MESSAGE: usize = 1048576;

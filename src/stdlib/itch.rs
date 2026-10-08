@@ -3,6 +3,10 @@
 //! bounded order book that applies the order messages, with no I/O.
 //! Message tables use [`codec::layout!`](fictionet::stdlib::codec::layout!).
 //!
+//! `Book` is feed state, not a client or server session. The module supplies no
+//! feed recovery, `Service`, or live transport. Callers supply MoldUDP64 or
+//! SoupBinTCP payloads, or use the length-prefixed stream decoder.
+//!
 //! ITCH is Nasdaq's outbound market data feed: a sequence of binary
 //! messages that describe the day (system events, the stock directory,
 //! trading actions) and every displayed order's life (add, execute,

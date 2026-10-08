@@ -1,6 +1,11 @@
 //! Modbus/TCP: reading and writing frames, requests and responses, with no
 //! I/O.
 //!
+//! `Frame` implements `Wire` and supports `codec::Frames<Frame>`. Request and
+//! response helpers interpret its PDU. There is no device session, `Service`,
+//! register store, or live transport. The observe presenter is separate from
+//! this wire layer.
+//!
 //! Modbus is how most industrial equipment is read and controlled: a PLC
 //! holds coils (single bits it can switch) and registers (16-bit values),
 //! and a client reads and writes them by address. Modbus/TCP carries each

@@ -1,5 +1,9 @@
 //! Wake-on-LAN: finding and writing magic packets, with no I/O.
 //!
+//! `MagicPacket` implements `Wire`, and `MagicPackets` searches a bounded
+//! payload ending at EOF. These helpers do not send packets, change host power
+//! state, or provide a `Service`. World code acts on a match.
+//!
 //! A machine that is asleep or switched off can keep its network card
 //! powered and listening. When the card sees a "magic packet" for its own
 //! address, it wakes the machine. The magic packet is a sync stream of six

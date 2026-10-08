@@ -1,5 +1,10 @@
 //! Diameter: reading and writing messages and AVPs, with no I/O.
 //!
+//! `Message` and `Avp` implement `Wire`, and `codec::Frames<Message>` decodes
+//! the message stream. There is no peer session or `Service`. Capability
+//! exchange, watchdog timing, request correlation, and transport belong to
+//! world code.
+//!
 //! Diameter is the authentication, authorization and accounting protocol
 //! of mobile and carrier networks. An MME asks an HSS whether a subscriber
 //! may attach, and a gateway asks a charging server how much credit is

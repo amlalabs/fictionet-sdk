@@ -1,6 +1,11 @@
 //! TFTP: reading and writing packets, negotiating options, and serving one
 //! read transfer, with no I/O.
 //!
+//! `Packet` implements `Wire`, and `ReadTransfer` is a caller-driven state
+//! machine for one read. `NetasciiBytes` decodes text payloads. There is no
+//! write-transfer state machine, client session, `Service`, live UDP transport,
+//! or retry scheduler.
+//!
 //! TFTP (the Trivial File Transfer Protocol) moves files over UDP with
 //! almost no machinery. Network boot uses it to fetch kernels and boot
 //! images, and switches, routers and phones use it to load firmware and

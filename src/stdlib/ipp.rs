@@ -1,6 +1,11 @@
 //! IPP, the Internet Printing Protocol: reading and writing requests and
 //! responses, with no I/O.
 //!
+//! `Message` implements `Wire` for complete IPP values, and `Head` decodes
+//! attribute sections while leaving document bytes unread. There is no
+//! print-job session or printer `Service`, HTTP transport, or document
+//! renderer.
+//!
 //! IPP is how computers talk to printers. A client sends a request in the
 //! body of an HTTP POST, usually to TCP port 631, with the media type
 //! `application/ipp`. The printer answers in the body of the HTTP

@@ -4,6 +4,10 @@
 //! a fake exchange.
 //! Message tables use [`codec::layout!`](fictionet::stdlib::codec::layout!).
 //!
+//! `Exchange` is caller-driven order state. It leaves acceptance and execution
+//! decisions to world code. This module has no stream decoder, SoupBinTCP login
+//! session, `Service`, or live transport.
+//!
 //! OUCH is Nasdaq's native order entry protocol. A client enters,
 //! replaces, cancels and modifies orders ([`Inbound`]); the exchange
 //! answers with accepted, replaced, canceled, executed and rejected

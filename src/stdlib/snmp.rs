@@ -1,5 +1,9 @@
 //! SNMP v1 and v2c: reading and writing messages, with no I/O.
 //!
+//! `Message` implements `Wire` and supports `codec::Frames<Message>` stream
+//! decoding for SNMP v1 and v2c. There is no SNMPv3, manager or agent session,
+//! MIB store, `Service`, or live transport.
+//!
 //! SNMP is how network equipment is watched and managed. A device runs an
 //! agent that holds a tree of named values (the MIB): uptime, interface
 //! counters, a printer's toner level. A manager asks for values by name

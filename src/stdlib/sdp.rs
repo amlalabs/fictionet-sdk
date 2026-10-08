@@ -1,5 +1,9 @@
 //! SDP: reading and writing session descriptions, with no I/O.
 //!
+//! `SessionDescription` implements `Wire`, and `SessionDescriptions` decodes a
+//! body ending at EOF. These are descriptions only. There is no offer/answer
+//! state machine, ICE connectivity checking, media transport, or `Service`.
+//!
 //! The Session Description Protocol says what a media session carries and
 //! where: which streams (audio, video, data), on which ports, with which
 //! codecs. It is not sent on its own. It rides as the body of a SIP

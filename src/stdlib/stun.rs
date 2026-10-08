@@ -1,6 +1,10 @@
 //! STUN: reading and writing Session Traversal Utilities for NAT messages,
 //! with no I/O.
 //!
+//! `Message` implements `Wire`, `Frames` decodes stream messages, and
+//! `answer_binding` builds a stateless Binding reply. There is no ICE or TURN
+//! session, `Service`, live transport, or HMAC computation or verification.
+//!
 //! STUN is how a host behind a NAT learns the public address and port its
 //! packets leave from. A client sends a Binding request, usually over UDP to
 //! port 3478, and the server answers with the source address it saw, in an

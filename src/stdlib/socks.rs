@@ -1,6 +1,11 @@
 //! SOCKS4, SOCKS4a and SOCKS5: reading and writing the handshake messages
 //! and the UDP request header, with no I/O.
 //!
+//! Complete handshake values use `Wire`. `ClientMessages` and `ServerMessages`
+//! decode each direction with caller-selected phases. These are handshake
+//! readers, not a proxy session or `Service`. Connection establishment,
+//! authentication decisions, and TCP or UDP relaying belong to the caller.
+//!
 //! SOCKS is how a client asks a proxy to open a connection for it. The
 //! client connects to the proxy, usually on TCP port 1080, says where it
 //! wants to go, and the proxy answers whether it got there. After that the

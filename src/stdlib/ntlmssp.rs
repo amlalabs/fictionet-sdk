@@ -1,6 +1,11 @@
 //! NTLMSSP: reading and writing the NEGOTIATE, CHALLENGE and AUTHENTICATE
 //! messages of NTLM authentication, with no I/O.
 //!
+//! The message and response types read and write complete values through
+//! `Wire`. There is no stream decoder, authentication state machine, or
+//! `Service`. Hashes, response verification, signing, and sealing belong to the
+//! caller.
+//!
 //! NTLM is how Windows machines prove who a user is without a domain
 //! controller in the path of every request. A client opens with a
 //! NEGOTIATE message that lists what it supports. The server answers with

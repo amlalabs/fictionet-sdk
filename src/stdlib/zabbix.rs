@@ -1,6 +1,10 @@
 //! The Zabbix protocol: reading and writing packets and the JSON messages
 //! agents, senders and servers exchange, with no I/O.
 //!
+//! `Packet` and `Message` implement `Wire`, and `codec::Frames<Packet>` decodes
+//! packet framing. There is no agent or server session, monitoring `Service`,
+//! live transport, or decompression. Message bodies retain their JSON text.
+//!
 //! Zabbix monitors servers and network gear. An agent on each host answers
 //! the server's questions on TCP port 10050, and agents in active mode,
 //! along with tools like `zabbix_sender`, push values to the server on

@@ -1,6 +1,10 @@
 //! FTP: reading and writing the control connection's commands and replies,
 //! with no I/O.
 //!
+//! `Command`, `Request`, and `Reply` implement `Wire`. `Commands` and `Replies`
+//! decode the two control directions. There is no login or transfer session,
+//! `Service`, data-connection transport, or TLS handling.
+//!
 //! FTP moves files between a client and a server. The client sends
 //! commands over a TCP connection, usually to port 21, one per line, such
 //! as `USER anonymous` or `RETR notes.txt`. The server answers each with a

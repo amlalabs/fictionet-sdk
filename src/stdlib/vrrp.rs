@@ -1,5 +1,9 @@
 //! VRRP: reading and writing virtual router advertisements, with no I/O.
 //!
+//! Advertisement readers and writers handle complete values, with `Datagram` as
+//! the `Wire` carrier. There is no protocol stream decoder, master/backup state
+//! machine, election timer, router `Service`, or live transport.
+//!
 //! VRRP (the Virtual Router Redundancy Protocol, IP protocol 112) lets
 //! several routers on a link share one gateway address. The routers form a
 //! virtual router, named by a number from 1 to 255 (the VRID). The one with

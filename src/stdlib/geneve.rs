@@ -1,6 +1,11 @@
 //! Geneve: reading and writing tunnel headers and their options, with no
 //! I/O.
 //!
+//! `Header` and `Packet` read and write complete values through `Wire`. There
+//! is no protocol stream decoder, tunnel state machine, `Service`, or live
+//! transport. The caller supplies datagram boundaries and handles the inner
+//! payload.
+//!
 //! Geneve (Generic Network Virtualization Encapsulation) carries one
 //! network's packets inside UDP datagrams of another, usually on port
 //! 6081. Cloud networks use it to keep each tenant's traffic apart: every

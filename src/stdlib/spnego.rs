@@ -1,6 +1,10 @@
 //! SPNEGO: reading and writing the GSS-API negotiation tokens that HTTP
 //! Negotiate, SMB and LDAP carry, with no I/O.
 //!
+//! `NegotiationToken` implements `Wire`, and `Frames` decodes successive
+//! tokens. There is no negotiation session or `Service`, mechanism
+//! authentication, cryptography, or live transport. Inner tokens remain bytes.
+//!
 //! SPNEGO lets a client and a server agree on how to authenticate, usually
 //! Kerberos or NTLM, and carries the chosen mechanism's own tokens while
 //! they do. The client opens with a NegTokenInit that lists the mechanisms

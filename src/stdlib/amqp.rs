@@ -1,6 +1,10 @@
 //! AMQP 0-9-1: reading and writing frames, methods, field tables and
 //! content headers, with no I/O.
 //!
+//! Complete frames and payload values use `Wire`, and `Frames` decodes the byte
+//! stream. There is no connection or channel session, broker `Service`, or live
+//! transport. World code handles negotiation, heartbeats, queues, and delivery.
+//!
 //! AMQP 0-9-1 is the protocol RabbitMQ speaks. A client opens a TCP
 //! connection, usually to port 5672, and sends an 8-byte protocol header.
 //! After that both sides send frames. Each frame has a type, a channel

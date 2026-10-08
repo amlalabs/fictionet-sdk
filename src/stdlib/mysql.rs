@@ -1,6 +1,11 @@
 //! MySQL: reading and writing the client/server protocol's packets, with
 //! no I/O.
 //!
+//! `Packet` and `Message` implement `Wire`. Stream decoders join packets and
+//! `ResultReader` tracks result-set parsing. That state is not a login or query
+//! session. Authentication, SQL execution, a database `Service`, and TLS
+//! transport are outside this module.
+//!
 //! MySQL clients talk to a server over TCP, usually on port 3306. Every
 //! message travels in packets with a 4-byte header: a 3-byte length and a
 //! 1-byte sequence ID. A packet holds at most 16 MiB less one byte. A

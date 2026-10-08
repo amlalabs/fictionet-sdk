@@ -1,5 +1,9 @@
 //! RIP and RIPng: reading and writing routing messages, with no I/O.
 //!
+//! `Message` and `NgMessage` read and write complete routing messages through
+//! `Wire`. There is no protocol stream decoder, routing-table state machine,
+//! update timer, authentication verification, or `Service`.
+//!
 //! RIP (the Routing Information Protocol) is the oldest routing protocol
 //! still in use. Each router sends its neighbors the routes it knows, each
 //! with a metric: the number of hops to the destination. A router that

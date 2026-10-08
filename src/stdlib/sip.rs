@@ -1,6 +1,10 @@
 //! SIP: reading and writing Session Initiation Protocol messages, with no
 //! I/O.
 //!
+//! `Message` implements `Wire`, and `Messages` decodes TCP message framing.
+//! There is no transaction or dialog state machine, retransmission scheduler,
+//! SIP `Service`, authentication, or media transport.
+//!
 //! SIP is how VoIP phones, PBXs and proxies set up calls. A phone sends a
 //! request such as INVITE, REGISTER or OPTIONS to a SIP URI like
 //! `sip:bob@biloxi.com`, and the other side answers with a status such as

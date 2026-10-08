@@ -1,6 +1,10 @@
 //! The PROXY protocol: reading and writing the header a proxy puts in
 //! front of a TCP connection, with no I/O.
 //!
+//! `Header` implements `Wire`, and `Headers` decodes one initial header before
+//! handing off the remaining bytes. This module supplies no proxy session,
+//! `Service`, forwarding loop, or TLS termination.
+//!
 //! A load balancer or TLS terminator that passes a connection on loses the
 //! client's address: the server sees the proxy's. The PROXY protocol fixes
 //! that. Before any of the client's bytes, the proxy sends one header that

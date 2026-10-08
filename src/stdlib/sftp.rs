@@ -1,6 +1,10 @@
 //! SFTP version 3: reading and writing packets, requests and responses,
 //! with no I/O.
 //!
+//! `Packet` implements `Wire` and supports `codec::Frames<Packet>`. Request and
+//! response helpers interpret its payload. There is no file-transfer session,
+//! filesystem `Service`, SSH channel implementation, or encrypted transport.
+//!
 //! SFTP is how most file transfers over SSH happen. The client opens an
 //! SSH channel, asks for the `sftp` subsystem, and then sends requests
 //! (open a file, read 32 KiB at an offset, list a directory) as packets.

@@ -1,6 +1,10 @@
 //! OSPF: reading and writing OSPFv2 and OSPFv3 packets and LSAs, with no
 //! I/O.
 //!
+//! Packet and LSA readers and writers handle complete values. `Datagram`
+//! carries packet bytes through `Wire`. There is no protocol stream decoder,
+//! neighbor state machine, routing database, route calculation, or `Service`.
+//!
 //! OSPF (Open Shortest Path First, IP protocol 89) is a link-state routing
 //! protocol that many enterprise and campus networks run inside. Routers on
 //! a link find each other with Hello packets and elect a designated router.

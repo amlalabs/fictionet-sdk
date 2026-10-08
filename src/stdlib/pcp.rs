@@ -1,6 +1,10 @@
 //! PCP and NAT-PMP: reading and writing port mapping requests and
 //! responses, and the version negotiation between them, with no I/O.
 //!
+//! Requests and responses implement `Wire`, and `receive` supplies stateless
+//! validation and reply decisions. There is no stream decoder, mapping-lifetime
+//! state machine, NAT implementation, `Service`, or live transport.
+//!
 //! A host behind a NAT asks the gateway to open a port with one of two
 //! protocols, both on UDP port 5351. NAT-PMP (RFC 6886, version 0) came
 //! first. It can ask for the gateway's external IPv4 address and map a

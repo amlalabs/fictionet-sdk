@@ -1,6 +1,10 @@
 //! Syslog: reading and writing log messages in the formats of RFC 5424 and
 //! RFC 3164, and splitting a TCP stream of them per RFC 6587, with no I/O.
 //!
+//! `Message`, `BsdMessage`, and `Entry` implement `Wire`, and `Frames` decodes
+//! RFC 6587 stream envelopes. There is no collector session or `Service`, log
+//! storage, or TLS transport.
+//!
 //! Syslog is how Unix machines, routers, firewalls and most appliances send
 //! their logs to a collector. Every message starts with a priority in angle
 //! brackets, such as `<34>`, which packs two numbers: the facility (which

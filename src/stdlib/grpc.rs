@@ -1,6 +1,11 @@
 //! gRPC: message framing, status codes, timeouts and the header rules a
 //! server follows, with no I/O.
 //!
+//! `Message` implements `Wire` and supports `codec::Frames<Message>` for
+//! length-prefixed payloads. Header and status helpers do not provide an RPC
+//! session, `Service`, HTTP/2 transport, or protobuf decoding. Compressed
+//! payloads stay as bytes.
+//!
 //! gRPC is how many services call each other: a client names a method,
 //! sends one or more messages, and gets messages back followed by a
 //! status. It runs over HTTP/2, usually on TCP port 443 with TLS or 50051

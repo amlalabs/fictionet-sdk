@@ -2,6 +2,10 @@
 //! I/O. The DHCP server in [`web::Sites`](fictionet::stdlib::web::Sites) uses
 //! it, and so does the DHCP server that `fictionet attach --type tap` runs
 //! for a VM.
+//!
+//! `Message` reads and writes complete datagrams through `Wire`. This file
+//! supplies no stream decoder, lease state machine, or `Service`. Address
+//! assignment and socket handling belong to its callers.
 
 use std::net::Ipv4Addr;
 

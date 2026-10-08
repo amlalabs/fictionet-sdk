@@ -1,5 +1,9 @@
 //! DCE/RPC over connections: reading and writing PDUs, with no I/O.
 //!
+//! `Pdu` implements `Wire` and supports `codec::Frames<Pdu>`. `Reassembler`
+//! joins call fragments. There is no bind or call session, RPC `Service`,
+//! authentication, or NDR stub decoder.
+//!
 //! DCE/RPC is the remote procedure call protocol under most of Windows
 //! administration: the endpoint mapper on TCP port 135, services on the
 //! dynamic ports it hands out, and the named pipes of SMB (`\pipe\samr`,

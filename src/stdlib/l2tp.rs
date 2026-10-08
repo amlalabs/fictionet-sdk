@@ -1,6 +1,11 @@
 //! L2TP: reading and writing the headers, control messages and AVPs of
 //! the Layer 2 Tunneling Protocol over UDP, with no I/O.
 //!
+//! The packet and control-message types read and write complete values through
+//! `Wire`. There is no stream decoder, tunnel or session state machine,
+//! `Service`, or live transport. Sequencing, retries, and hidden AVP recovery
+//! belong to the caller.
+//!
 //! L2TP carries a link layer, such as a PPP session or an Ethernet
 //! pseudowire, between two hosts over an IP network. A VPN concentrator
 //! and its clients use it, and so do the access networks of most ISPs.

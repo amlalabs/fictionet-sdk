@@ -1,5 +1,9 @@
 //! MQTT 3.1.1: reading and writing control packets, with no I/O.
 //!
+//! `Packet` implements `Wire` and supports `codec::Frames<Packet>` stream
+//! decoding. There is no broker session or `Service`, QoS delivery state,
+//! keepalive scheduler, or live transport, and MQTT 5 is unsupported.
+//!
 //! MQTT is the publish and subscribe protocol much of the Internet of
 //! Things speaks: sensors, gateways and dashboards connect to a broker,
 //! publish messages under topic names such as `plant/tank1/level`, and

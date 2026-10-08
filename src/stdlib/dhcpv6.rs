@@ -1,6 +1,11 @@
 //! DHCPv6: reading and writing client, server and relay messages and their
 //! options, with no I/O.
 //!
+//! `Message` reads and writes datagrams, and `codec::Frames<Message>` decodes
+//! length-prefixed TCP messages. There is no lease or relay session, `Service`,
+//! or live transport. The caller owns addresses, lease lifetimes, and
+//! retransmissions.
+//!
 //! DHCPv6 is how a host on an IPv6 network gets addresses, delegated
 //! prefixes and settings such as DNS servers. A client sends to UDP port
 //! 547 on the multicast address `ff02::1:2`, and servers and relay agents

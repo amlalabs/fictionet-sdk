@@ -1,5 +1,9 @@
 //! RTCP: reading and writing RTP control packets, with no I/O.
 //!
+//! Packet and compound-datagram types implement `Wire`, and
+//! `codec::Frames<Frame>` decodes RFC 4571 stream envelopes. There is no media
+//! session, report scheduler, `Service`, live transport, or SRTCP cryptography.
+//!
 //! RTCP travels beside RTP media and says how the media is doing. Senders
 //! and receivers send reports on loss and jitter, name themselves in source
 //! descriptions (SDES), say goodbye (BYE), and ask for lost packets, new

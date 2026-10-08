@@ -1,6 +1,10 @@
 //! TPKT: reading and writing the packets that carry ISO transport on TCP,
 //! with no I/O.
 //!
+//! `Packet` implements `Wire` and supports `codec::Frames<Packet>` stream
+//! decoding. It keeps the TPDU as bytes and supplies no COTP session,
+//! `Service`, or live TCP transport.
+//!
 //! ISO transport was made for networks other than TCP. RFC 1006 carries it
 //! over TCP anyway, usually on port 102, by putting each transport message
 //! (a TPDU) in a TPKT: a 4-byte header that holds a version, which is

@@ -1,6 +1,10 @@
 //! MongoDB: reading and writing BSON documents and wire protocol messages,
 //! with no I/O.
 //!
+//! `Document` and `Message` implement `Wire`, and `codec::Frames<Message>`
+//! decodes the stream. There is no database session, authentication, query
+//! engine, or `Service`. OP_COMPRESSED payloads are kept without decompression.
+//!
 //! A MongoDB client talks to a server over TCP, usually on port 27017. Each
 //! message starts with a 16-byte header that gives its length, its request
 //! ID, the request it answers, and its op code. Clients send commands as

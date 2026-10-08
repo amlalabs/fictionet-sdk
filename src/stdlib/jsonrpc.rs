@@ -1,5 +1,9 @@
 //! JSON-RPC 2.0 envelopes for requests, notifications, and responses.
 //!
+//! `Message`, `Batch`, and `Body` read and write complete values through
+//! `Wire`, and `Messages` decodes single-message lines. This module supplies no
+//! request-tracking session, MCP session, `Service`, or HTTP transport.
+//!
 //! This follows the [JSON-RPC specification](https://www.jsonrpc.org/specification).
 //! Envelopes keep an ordered [`Value`], including extension members and exact
 //! number text. Edit that value to rewrite a tool result without rebuilding

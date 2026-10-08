@@ -1,6 +1,10 @@
 //! Telnet: separating data from commands, negotiating options, and reading
 //! and writing the terminal type and window size, with no I/O.
 //!
+//! `Event` and `BinaryEvent` implement `Wire`, `Events` decodes the stream, and
+//! `Negotiation` tracks option state with the Q method. There is no login
+//! session, terminal emulator, `Service`, or live transport.
+//!
 //! Telnet is the oldest remote login protocol, and many routers, switches,
 //! PLCs and embedded boards still offer it on TCP port 23. Both ends send
 //! text, and mix commands into it: each command starts with the byte 255,

@@ -1,6 +1,11 @@
 //! The Git wire protocol: pkt-lines, requests, ref advertisements and
 //! negotiation lines, read and written with no I/O.
 //!
+//! `Packet` implements `Wire` and supports `codec::Frames<Packet>`. `Bands`
+//! decodes side-band payloads. Request and advertisement helpers do not
+//! implement a fetch or push session, repository storage, packfile processing,
+//! or a `Service`.
+//!
 //! Git clients fetch and push over TCP port 9418 (`git://`), over SSH and
 //! over smart HTTP. All three carry the same messages, split into
 //! pkt-lines: a four-digit hex length, then the data. A flush packet

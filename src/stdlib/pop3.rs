@@ -1,5 +1,9 @@
 //! POP3: reading and writing commands and replies, with no I/O.
 //!
+//! `Command`, `Request`, and `Reply` implement `Wire`. `Inputs` and `Outputs`
+//! decode the two directions. Reply expectations are framing state, not an
+//! authenticated mail session. There is no mailbox `Service` or TLS transport.
+//!
 //! POP3 is how a mail client downloads mail from its server. The client
 //! connects over TCP, usually to port 110, and sends commands one per
 //! line, such as `USER alice` or `RETR 1`. The server answers each with a

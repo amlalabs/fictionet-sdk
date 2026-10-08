@@ -1,5 +1,9 @@
 //! IMAP: reading and writing commands and responses, with no I/O.
 //!
+//! `Command` and `Response` implement `Wire`. `Inputs` and `Responses` decode
+//! commands, literals, and replies. Their framing modes do not implement an
+//! authenticated mailbox session, a `Service`, storage, or TLS.
+//!
 //! IMAP is how mail clients read mail kept on a server, usually over TCP
 //! port 143. A client sends commands. Each is a line that starts with a
 //! tag the client picks, then a command name and its arguments. The

@@ -1,6 +1,10 @@
 //! GRE: reading and writing Generic Routing Encapsulation headers, with no
 //! I/O.
 //!
+//! `Packet` reads and writes complete GRE and PPTP GRE packets through `Wire`.
+//! There is no protocol stream decoder, PPTP control session, tunnel `Service`,
+//! or live transport. The caller handles the inner payload.
+//!
 //! GRE carries one network's packets inside IP packets of another, as IP
 //! protocol 47. Routers use it to build tunnels, and PPTP VPNs use it to
 //! carry PPP frames. Every packet starts with a 4-byte header: flag bits,

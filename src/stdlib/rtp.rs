@@ -1,6 +1,10 @@
 //! RTP and RTCP: reading and writing media packets and their control
 //! packets, with no I/O.
 //!
+//! `Packet` and `Demux` implement `Wire`. TCP envelope decoding comes from
+//! `rtcp::Frame`. There is no media session, codec, jitter buffer, `Service`,
+//! live transport, or SRTP cryptography.
+//!
 //! RTP carries audio and video in real time: voice calls, video calls,
 //! WebRTC, IP cameras and media servers all send it. Each RTP packet has a
 //! 12-byte header with a payload type, a sequence number, a timestamp and

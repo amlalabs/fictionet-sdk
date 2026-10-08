@@ -1,5 +1,9 @@
 //! RADIUS: reading and writing packets and attributes, with no I/O.
 //!
+//! `Packet` implements `Wire` and supports `codec::Frames<Packet>` for TCP
+//! framing. There is no authentication session, `Service`, or cryptography.
+//! Authenticators and hidden passwords remain the caller's responsibility.
+//!
 //! RADIUS is how network equipment asks a central server whether a user
 //! may connect. A Wi-Fi access point, VPN gateway or switch (the NAS, for
 //! network access server) sends an Access-Request over UDP to port 1812,

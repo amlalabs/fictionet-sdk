@@ -1,6 +1,11 @@
 //! RFB, the remote framebuffer protocol behind VNC: the handshake and the
 //! messages, read and written with no I/O.
 //!
+//! Complete wire values, directional decoders, and caller-driven `Client` and
+//! `Server` sessions cover the handshake and supported framebuffer messages.
+//! Updates support Raw, CopyRect, Cursor, and DesktopSize only. There is no DES
+//! authentication computation, encrypted transport, or VNC `Service`.
+//!
 //! RFB lets a client see and drive a remote screen. The server sends
 //! pictures of its framebuffer, and the client sends key presses and
 //! pointer moves. Servers usually listen on TCP port 5900. This module

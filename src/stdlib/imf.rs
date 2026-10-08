@@ -1,6 +1,10 @@
 //! Internet Message Format headers: fields, addresses, dates, message IDs
 //! and encoded words, with no I/O.
 //!
+//! `Header` reads and writes complete header sections through `Wire`, and
+//! `Head` decodes a header from a stream. This module does not decode mail
+//! bodies or provide an SMTP session, mail `Service`, or live transport.
+//!
 //! Mail messages start with a header: lines of `Name: value`, then a blank
 //! line, then the body. HTTP borrows the same layout for its own headers.
 //! This module reads and writes that header. It follows RFC 5322 (the

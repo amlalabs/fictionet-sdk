@@ -1,6 +1,11 @@
 //! IP: sorting packets by IP version and by the protocol they carry, and
 //! reading, checking and building IP headers.
 //!
+//! The packet helpers read and build IPv4 and IPv6 headers, `Reassembly` joins
+//! fragments, and the split functions run tasks on interfaces. This is a packet
+//! layer, with no `Wire` or `Decode` implementation, application session, or
+//! `Service`. TCP and UDP are separate modules.
+//!
 //! Use this module to build a [machine](fictionet::stdlib#what-you-build-with-it),
 //! one IP address on the simulated network. A machine's packets arrive on one
 //! [`Interface`], all mixed together. [`split_protocols`] sorts them into
