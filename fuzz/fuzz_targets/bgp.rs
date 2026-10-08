@@ -42,11 +42,8 @@ use fictionet::stdlib::bgp::safi;
 use fictionet::stdlib::codec::{Decode, Wire};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
+use fictionet::stdlib::bgp::harness::{encode, mixes};
 use libfuzzer_sys::fuzz_target;
-
-fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, Error> {
-    message.to_frame(context)?.to_bytes()
-}
 
 /// Every combination of the session settings.
 const CONTEXTS: [Context; 4] = [
@@ -55,14 +52,6 @@ const CONTEXTS: [Context; 4] = [
     Context { four_octet_as: false, enhanced_route_refresh: true },
     Context { four_octet_as: true, enhanced_route_refresh: true },
 ];
-
-/// Whether an UPDATE mixes kinds of routes, which a reader takes from
-/// older speakers but a writer refuses (RFC 7606 section 5.1).
-fn mixes(m: &Message) -> bool {
-    let Message::Update(u) = m else { return false };
-    let mp = u.attributes.iter().filter(|a| matches!(a, Attribute::MpReach(_) | Attribute::MpUnreach(_))).count();
-    usize::from(!u.withdrawn.is_empty()) + usize::from(!u.nlri.is_empty()) + mp > 1
-}
 
 /// An UPDATE built from the bytes as world code would build one, with
 /// fields a reader would never give: prefixes with bits past their

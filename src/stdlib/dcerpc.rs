@@ -1434,8 +1434,50 @@ impl From<Truncated> for Error {
     fn from(_: Truncated) -> Self { Error::Truncated }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{AUTH_PAD_ALIGN, Body, Error, MAX_FRAG, Pdu, SEC_TRAILER_LEN};
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks PDU round trips and fragment limits including authentication padding.
+    pub fn rewrite(pdu: &Pdu) {
+        contract::check_wire_value(pdu);
+        match pdu.to_bytes() {
+            Ok(bytes) => {
+                assert!(bytes.len() <= MAX_FRAG);
+                assert_eq!(Pdu::parse(&bytes), Ok(pdu.clone()));
+            }
+            Err(e) => {
+                assert_eq!(e, Error::Unwritable);
+                let mut bare = pdu.clone();
+                let auth = bare
+                    .auth
+                    .take()
+                    .expect("only auth padding can exceed the limit");
+                let reserved = if matches!(bare.body, Body::Auth3) {
+                    bare.body = Body::Shutdown;
+                    4
+                } else {
+                    0
+                };
+                let length = bare.to_bytes().unwrap().len() + reserved;
+                let (alignment, padded) = pdu
+                    .body
+                    .stub()
+                    .map_or((4, length), |stub| (AUTH_PAD_ALIGN, stub.len()));
+                let padding = (alignment - padded % alignment) % alignment;
+                assert!(length + padding + SEC_TRAILER_LEN + auth.value.len() > MAX_FRAG);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::rewrite;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
@@ -2266,32 +2308,7 @@ mod tests {
             let (whole, _) = decode_all(Frames::<Pdu>::new, &data);
             let mut r = Reassembler::new(64);
             for p in whole.into_iter().flatten() {
-                // Whatever reads writes back and reads the same, unless the
-                // writer's padding or reserved fields make it too long.
-                match p.to_bytes() {
-                    Ok(bytes) => assert_eq!(Pdu::parse(&bytes), Ok(p.clone())),
-                    Err(e) => {
-                        assert_eq!(e, Error::Unwritable);
-                        let mut bare = p.clone();
-                        let auth = bare
-                            .auth
-                            .take()
-                            .expect("only auth padding can exceed the limit");
-                        let reserved = if matches!(bare.body, Body::Auth3) {
-                            bare.body = Body::Shutdown;
-                            4
-                        } else {
-                            0
-                        };
-                        let length = bare.to_bytes().unwrap().len() + reserved;
-                        let (alignment, padded) = p
-                            .body
-                            .stub()
-                            .map_or((4, length), |stub| (AUTH_PAD_ALIGN, stub.len()));
-                        let padding = (alignment - padded % alignment) % alignment;
-                        assert!(length + padding + SEC_TRAILER_LEN + auth.value.len() > MAX_FRAG);
-                    }
-                }
+                rewrite(&p);
                 if p.auth.is_none()
                     && let Ok(parts) = p.fragments(40 + rng.index(256) as u16)
                 {

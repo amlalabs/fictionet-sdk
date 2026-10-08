@@ -1827,8 +1827,37 @@ impl Candidate {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Attribute, Candidate, Fmtp, MAX_LINE_LEN, RtpMap};
+
+    /// Checks typed attribute round trips and line limits.
+    pub fn check_attribute(a: &Attribute) {
+        let fits = |b: &Attribute| "a=:".len() + b.name.len() + b.value.as_deref().map_or(0, str::len) <= MAX_LINE_LEN;
+        if let Ok(r) = RtpMap::from_attribute(a) {
+            let back = r.to_attribute().unwrap();
+            assert!(fits(&back));
+            assert_eq!(RtpMap::from_attribute(&back), Ok(r));
+        }
+        if let Ok(f) = Fmtp::from_attribute(a) {
+            assert!(f.parameters().len() <= MAX_LINE_LEN);
+            let back = f.to_attribute().unwrap();
+            assert!(fits(&back));
+            assert_eq!(Fmtp::from_attribute(&back), Ok(f));
+        }
+        if let Ok(c) = Candidate::from_attribute(a) {
+            let back = c.to_attribute().unwrap();
+            assert!(fits(&back));
+            assert_eq!(Candidate::from_attribute(&back), Ok(c));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::check_attribute;
     use super::*;
     use codec::{
         Lcg, Stream,
@@ -2456,15 +2485,7 @@ mod tests {
             assert_eq!(SessionDescription::parse(&out), Ok(desc.clone()));
             for m in &desc.media {
                 for a in &m.attributes {
-                    if let Ok(r) = RtpMap::from_attribute(a) {
-                        assert_eq!(RtpMap::from_attribute(&r.to_attribute().unwrap()), Ok(r));
-                    }
-                    if let Ok(f) = Fmtp::from_attribute(a) {
-                        assert_eq!(Fmtp::from_attribute(&f.to_attribute().unwrap()), Ok(f));
-                    }
-                    if let Ok(c) = Candidate::from_attribute(a) {
-                        assert_eq!(Candidate::from_attribute(&c.to_attribute().unwrap()), Ok(c));
-                    }
+                    check_attribute(a);
                 }
                 let _ = desc.direction(m);
             }

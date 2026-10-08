@@ -6,8 +6,9 @@ use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::sip::{
-    CSeq, Contacts, Error, Messages, MAX_BODY, MAX_HEAD, MAX_MESSAGE, Message, NameAddr, Param, Scheme, Uri, Via,
+    CSeq, Contacts, Messages, MAX_BODY, MAX_HEAD, MAX_MESSAGE, Message, NameAddr, Param, Scheme, Uri, Via,
 };
+use fictionet::stdlib::sip::harness::{round_trip, cseq_round_trip, text_value};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -99,62 +100,4 @@ fn writers(data: &[u8]) {
     contract::check_wire_value(&message);
     message.set_header("Content-Length", &message.body.len().to_string());
     contract::check_wire_value(&message);
-}
-
-fn round_trip(message: &Message) {
-    contract::check_wire_value(message);
-    if let Err(error) = message.to_bytes() {
-        assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {message:?}");
-        return;
-    }
-    if let Ok(vias) = message.vias() {
-        for value in vias {
-            contract::check_wire_value(&value);
-            value.to_bytes().unwrap();
-        }
-    }
-    for read in [Message::from, Message::to] {
-        if let Ok(value) = read(message) {
-            contract::check_wire_value(&value);
-            value.to_bytes().unwrap();
-        }
-    }
-    if let Ok(value) = message.cseq() {
-        cseq_round_trip(&value);
-    }
-    if let Ok(value) = message.contacts() {
-        contract::check_wire_value(&value);
-        if let Err(error) = value.to_bytes() {
-            assert_eq!(value, Contacts::List(vec![]), "{error:?}");
-        }
-    }
-    if let Some(uri) = message.request_uri()
-        && let Ok(value) = NameAddr::new(uri).sip_uri()
-    {
-        contract::check_wire_value(&value);
-        value.to_bytes().unwrap();
-        for param in &value.params {
-            assert!(value.param(&param.name).is_some());
-        }
-    }
-    if message.method().is_some() {
-        let mut reply = message.reply(100, "Trying");
-        reply.set_header("Content-Length", "0");
-        contract::check_wire_value(&reply);
-        assert!(matches!(reply.to_bytes(), Ok(_) | Err(Error::TooLong | Error::TooMany)));
-    }
-}
-
-fn cseq_round_trip(value: &CSeq) {
-    contract::check_wire_value(value);
-    if let Err(error) = value.to_bytes() {
-        assert!(value.seq >= 1 << 31, "{error:?} for {value:?}");
-    }
-}
-
-fn text_value<T: Wire<ParseError = Error, WriteError = Error> + PartialEq + core::fmt::Debug>(value: Result<T, Error>) {
-    if let Ok(value) = value {
-        contract::check_wire_value(&value);
-        assert!(matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)), "{value:?}");
-    }
 }

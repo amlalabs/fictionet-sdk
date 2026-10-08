@@ -1992,8 +1992,79 @@ wire_value!(
     write
 );
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{CSeq, Contacts, Error, Message, NameAddr};
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks parsed values and their public accessors.
+    pub fn round_trip(message: &Message) {
+        contract::check_wire_value(message);
+        if let Err(error) = message.to_bytes() {
+            assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {message:?}");
+            return;
+        }
+        if let Ok(vias) = message.vias() {
+            for value in vias {
+                contract::check_wire_value(&value);
+                value.to_bytes().unwrap();
+            }
+        }
+        for read in [Message::from, Message::to] {
+            if let Ok(value) = read(message) {
+                contract::check_wire_value(&value);
+                value.to_bytes().unwrap();
+            }
+        }
+        if let Ok(value) = message.cseq() {
+            cseq_round_trip(&value);
+        }
+        if let Ok(value) = message.contacts() {
+            contract::check_wire_value(&value);
+            if let Err(error) = value.to_bytes() {
+                assert_eq!(value, Contacts::List(vec![]), "{error:?}");
+            }
+        }
+        if let Some(uri) = message.request_uri()
+            && let Ok(value) = NameAddr::new(uri).sip_uri()
+        {
+            contract::check_wire_value(&value);
+            value.to_bytes().unwrap();
+            for param in &value.params {
+                assert!(value.param(&param.name).is_some());
+            }
+        }
+        if message.method().is_some() {
+            let mut reply = message.reply(100, "Trying");
+            reply.set_header("Content-Length", "0");
+            contract::check_wire_value(&reply);
+            assert!(matches!(reply.to_bytes(), Ok(_) | Err(Error::TooLong | Error::TooMany)));
+        }
+    }
+
+    /// Checks parsed values and their public accessors.
+    pub fn cseq_round_trip(value: &CSeq) {
+        contract::check_wire_value(value);
+        if let Err(error) = value.to_bytes() {
+            assert!(value.seq >= 1 << 31, "{error:?} for {value:?}");
+        }
+    }
+
+    /// Checks a value read directly from text.
+    pub fn text_value<T: Wire<ParseError = Error, WriteError = Error> + PartialEq + core::fmt::Debug>(value: Result<T, Error>) {
+        if let Ok(value) = value {
+            contract::check_wire_value(&value);
+            assert!(matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)), "{value:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::{round_trip, cseq_round_trip, text_value};
     #[test]
     fn unexpected_line_error_is_malformed_head() {
         assert_eq!(super::framing_error(super::LineError::Unterminated), super::Error::LineEnding);
@@ -2797,67 +2868,13 @@ mod tests {
         items.iter().flatten().count() + datagrams
     }
 
-    fn round_trip(message: &Message) {
-        contract::check_wire_value(message);
-        if let Err(error) = message.to_bytes() {
-            assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {message:?}");
-            return;
-        }
-        if let Ok(vias) = message.vias() {
-            for value in vias {
-                contract::check_wire_value(&value);
-                value.to_bytes().unwrap();
-            }
-        }
-        for read in [Message::from, Message::to] {
-            if let Ok(value) = read(message) {
-                contract::check_wire_value(&value);
-                value.to_bytes().unwrap();
-            }
-        }
-        if let Ok(value) = message.cseq() {
-            cseq_round_trip(&value);
-        }
-        if let Ok(value) = message.contacts() {
-            contract::check_wire_value(&value);
-            if let Err(error) = value.to_bytes() {
-                assert_eq!(value, Contacts::List(vec![]), "{error:?}");
-            }
-        }
-        if let Some(uri) = message.request_uri()
-            && let Ok(value) = Uri::read_value(uri)
-        {
-            contract::check_wire_value(&value);
-            value.to_bytes().unwrap();
-            for param in &value.params {
-                assert!(value.param(&param.name).is_some());
-            }
-        }
-        if message.method().is_some() {
-            let mut reply = message.reply(100, "Trying");
-            reply.set_header("Content-Length", "0");
-            contract::check_wire_value(&reply);
-            assert!(matches!(reply.to_bytes(), Ok(_) | Err(Error::TooLong | Error::TooMany)));
-        }
-    }
-
-    fn cseq_round_trip(value: &CSeq) {
-        contract::check_wire_value(value);
-        if let Err(error) = value.to_bytes() {
-            assert!(value.seq >= 1 << 31, "{error:?} for {value:?}");
-        }
-    }
-
     fn values_round_trip(bytes: &[u8]) {
         macro_rules! check {
             ($($ty:ty),+) => {$(
                 contract::check_wire::<$ty>(bytes);
                 // Read text directly so a writer failure cannot hide as a parse refusal.
-                if let Ok(text) = core::str::from_utf8(bytes)
-                    && let Ok(value) = <$ty>::read_value(text)
-                {
-                    contract::check_wire_value(&value);
-                    assert!(matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)), "{value:?}");
+                if let Ok(text) = core::str::from_utf8(bytes) {
+                    text_value(<$ty>::read_value(text));
                 }
             )+};
         }

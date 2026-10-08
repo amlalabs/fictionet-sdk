@@ -885,8 +885,21 @@ impl Prefixed for Frame {
 }
 
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Message, Value};
+
+    /// Counts fields including group members.
+    pub fn total_fields(m: &Message) -> usize {
+        m.fields.iter().map(|f| 1 + if let Value::Group(g) = &f.value { total_fields(g) } else { 0 }).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::total_fields;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
@@ -1303,11 +1316,6 @@ mod tests {
         };
         read(MAX_MESSAGE);
         fictionet::stdlib::test_support::assert_linear("protobuf frames", MAX_MESSAGE / 64, read);
-    }
-
-    // Counts fields as MAX_FIELDS does: group members included.
-    fn total_fields(m: &Message) -> usize {
-        m.fields.iter().map(|f| 1 + if let Value::Group(g) = &f.value { total_fields(g) } else { 0 }).sum()
     }
 
     #[test]

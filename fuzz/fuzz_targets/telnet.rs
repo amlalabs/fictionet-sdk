@@ -8,6 +8,7 @@ use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::telnet::{
     self, BinaryEvent, Event, Events, Negotiation, Side, Subnegotiation, option,
 };
+use fictionet::stdlib::telnet::harness::merged;
 use libfuzzer_sys::fuzz_target;
 
 struct Session {
@@ -54,18 +55,6 @@ impl Decode for Session {
         }
         Ok(step)
     }
-}
-
-fn merged(events: Vec<Event>) -> Vec<Event> {
-    let mut out: Vec<Event> = Vec::new();
-    for event in events {
-        if let (Event::Data(data), Some(Event::Data(last))) = (&event, out.last_mut()) {
-            last.extend_from_slice(data);
-        } else {
-            out.push(event);
-        }
-    }
-    out
 }
 
 fuzz_target!(|data: &[u8]| {

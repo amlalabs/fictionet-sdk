@@ -11,6 +11,7 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     if let Ok(bvlc) = Bvlc::parse(data) {
         assert_eq!(bvlc.to_bytes().unwrap(), data);
+        // Each strict prefix fails a constant-time header check, so this loop is linear.
         for n in 0..data.len() {
             assert!(Bvlc::parse(&data[..n]).is_err());
         }
@@ -31,19 +32,10 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<ValueList>(data);
     contract::check_wire::<WhoIs>(data);
     contract::check_wire::<IAm>(data);
-    contract::check_wire::<ContextValue<0>>(data);
-    contract::check_wire::<ContextValue<1>>(data);
-    contract::check_wire::<ContextValue<2>>(data);
-    contract::check_wire::<ContextValue<3>>(data);
-    contract::check_wire::<ContextValue<4>>(data);
-    contract::check_wire::<ContextValue<5>>(data);
-    contract::check_wire::<ContextValue<6>>(data);
-    contract::check_wire::<ContextValue<7>>(data);
-    contract::check_wire::<ContextValue<8>>(data);
-    contract::check_wire::<ContextValue<9>>(data);
-    contract::check_wire::<ContextValue<10>>(data);
-    contract::check_wire::<ContextValue<11>>(data);
-    contract::check_wire::<ContextValue<12>>(data);
+    macro_rules! context_values {
+        ($($tag:literal),+) => {$(contract::check_wire::<ContextValue<$tag>>(data);)+};
+    }
+    context_values!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
 });
 
 /// Checks an NPDU and its APDU payload through their complete units.

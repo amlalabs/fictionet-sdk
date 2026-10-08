@@ -2613,18 +2613,18 @@ impl Decode for Messages<'_> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fictionet::stdlib::codec::{Fail, Stream};
-    use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support;
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Error, Schema, SchemaSource};
     use std::sync::OnceLock;
 
     // A small rewrite of the public Real Logic car example, with nested refs,
     // explicit version additions, and a smaller set of fields. Test data only.
     // https://github.com/real-logic/simple-binary-encoding/blob/master/sbe-samples/src/main/resources/example-schema.xml
-    const CAR: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+    /// Car example schema.
+    pub const CAR: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe" id="7" version="2" byteOrder="littleEndian">
       <types>
         <composite name="messageHeader">
@@ -2672,7 +2672,8 @@ mod tests {
       </sbe:message>
     </sbe:messageSchema>"#;
 
-    const CAR_BYTES: &[u8] = &[
+    /// Encoded car fixture.
+    pub const CAR_BYTES: &[u8] = &[
         20, 0, 1, 0, 7, 0, 2, 0, // header
         0xd2, 4, 0, 0, b'A', 0x89, 0xd0, 7, 4, 0xd4, 0xfe, b'S', b'B', b'E', 0, 3, 0, 5, 0, 9, 2,
         0, 1, 0, 100, 0, // one performance entry
@@ -2681,7 +2682,8 @@ mod tests {
         1, 0, 0, 0, // empty service group
         3, b'A', b'B', b'C', 0,
     ];
-    struct Car;
+    /// Schema source for the car fixture.
+    pub struct Car;
     impl SchemaSource for Car {
         fn schema() -> Result<&'static Schema, Error> {
             static S: OnceLock<Result<Schema, Error>> = OnceLock::new();
@@ -2690,6 +2692,17 @@ mod tests {
                 .map_err(|e| *e)
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::harness::{CAR, CAR_BYTES, Car};
+    use super::*;
+    use fictionet::stdlib::codec::{Fail, Stream};
+    use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support;
+    use std::sync::OnceLock;
+
     fn named(name: &str, value: Value) -> NamedValue {
         NamedValue {
             name: name.into(),

@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::nfs::{
-    DirOp, FileHandle, MAX_FH, MAX_NAME, MountRequest, MountResponse, Status, Request, Response,
+    DirOp, FileHandle, MAX_FH, MAX_NAME, MountRequest, Status, Request, Response,
     procedure,
 };
 use fictionet::stdlib::onc_rpc::{Body, Message};
@@ -12,31 +12,8 @@ use fictionet::stdlib::{
     test_support::contract, test_support::decode_all,
     onc_rpc,
 };
+use fictionet::stdlib::nfs::harness::check;
 use libfuzzer_sys::fuzz_target;
-
-/// Reads `bytes` as the arguments and the results of procedure `p`. Any
-/// that read must write back as the same bytes, and READ and WRITE must
-/// count the data they carry.
-fn check(p: u32, bytes: &[u8]) {
-    if let Ok(req) = Request::read(p, bytes) {
-        assert_eq!(req.to_args().unwrap(), bytes);
-        if let Request::Write { count, data, .. } = &req {
-            assert_eq!(*count as usize, data.len());
-        }
-    }
-    if let Ok(resp) = Response::parse(p, bytes) {
-        assert_eq!(resp.to_results().unwrap(), bytes);
-        if let Response::Read(Ok(ok)) = &resp {
-            assert_eq!(ok.count as usize, ok.data.len());
-        }
-    }
-    if let Ok(req) = MountRequest::read(p, bytes) {
-        assert_eq!(req.to_args().unwrap(), bytes);
-    }
-    if let Ok(resp) = MountResponse::parse(p, bytes) {
-        assert_eq!(resp.to_results().unwrap(), bytes);
-    }
-}
 
 fuzz_target!(|data: &[u8]| {
     // The first byte picks a procedure. The rest is its arguments or

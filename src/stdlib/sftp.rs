@@ -1110,8 +1110,30 @@ fn packet_reader(packet: &Packet) -> Result<Reader<'_>, Error> {
     Ok(Reader::new(&packet.body))
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Packet, Request, Response};
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks typed packet readers and writers.
+    pub fn check_packet(packet: &Packet) {
+        if let Ok(request) = Request::from_packet(packet) {
+            assert!(request.to_bytes().is_ok(), "{request:?}");
+            contract::check_wire_value(&request);
+        }
+        if let Ok(response) = Response::from_packet(packet) {
+            assert!(response.to_bytes().is_ok(), "{response:?}");
+            contract::check_wire_value(&response);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::{check_packet};
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
@@ -1621,14 +1643,7 @@ mod tests {
             contract::check_wire::<Attrs>(&bytes);
             for kind in 0..=255 {
                 let packet = Packet { kind, body: bytes.clone() };
-                if let Ok(request) = Request::from_packet(&packet) {
-                    assert!(request.to_bytes().is_ok(), "{request:?}");
-                    contract::check_wire_value(&request);
-                }
-                if let Ok(response) = Response::from_packet(&packet) {
-                    assert!(response.to_bytes().is_ok(), "{response:?}");
-                    contract::check_wire_value(&response);
-                }
+                check_packet(&packet);
             }
         }
     }

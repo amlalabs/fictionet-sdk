@@ -1666,8 +1666,35 @@ fn fmt_double(f: f64) -> String {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::Value;
+
+    /// Compares every field, treating NaN values as equal.
+    pub fn wire_same(a: &Value, b: &Value) -> bool {
+        let all = |x: &[Value], y: &[Value]| x.len() == y.len() && x.iter().zip(y).all(|(x, y)| wire_same(x, y));
+        let pairs = |x: &[(Value, Value)], y: &[(Value, Value)]| {
+            x.len() == y.len() && x.iter().zip(y).all(|((a, b), (c, d))| wire_same(a, c) && wire_same(b, d))
+        };
+        match (a, b) {
+            (Value::Double(x), Value::Double(y)) => x == y || (x.is_nan() && y.is_nan()),
+            (Value::Array(x), Value::Array(y)) | (Value::Set(x), Value::Set(y)) | (Value::Push(x), Value::Push(y)) => {
+                all(x, y)
+            }
+            (Value::Map(x), Value::Map(y)) => pairs(x, y),
+            (Value::Attribute { attributes: x, value: v }, Value::Attribute { attributes: y, value: w }) => {
+                pairs(x, y) && wire_same(v, w)
+            }
+            _ => a == b,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::wire_same;
     use fictionet::stdlib::test_support;
     use super::*;
     use codec::{
@@ -1730,25 +1757,6 @@ mod tests {
             "{} {limits:?}",
             bytes.escape_ascii()
         );
-    }
-
-    // Compare every field, including values too large to encode; NaN has one wire spelling.
-    fn wire_same(a: &Value, b: &Value) -> bool {
-        let all = |x: &[Value], y: &[Value]| x.len() == y.len() && x.iter().zip(y).all(|(x, y)| wire_same(x, y));
-        let pairs = |x: &[(Value, Value)], y: &[(Value, Value)]| {
-            x.len() == y.len() && x.iter().zip(y).all(|((a, b), (c, d))| wire_same(a, c) && wire_same(b, d))
-        };
-        match (a, b) {
-            (Value::Double(x), Value::Double(y)) => x == y || (x.is_nan() && y.is_nan()),
-            (Value::Array(x), Value::Array(y)) | (Value::Set(x), Value::Set(y)) | (Value::Push(x), Value::Push(y)) => {
-                all(x, y)
-            }
-            (Value::Map(x), Value::Map(y)) => pairs(x, y),
-            (Value::Attribute { attributes: x, value: v }, Value::Attribute { attributes: y, value: w }) => {
-                pairs(x, y) && wire_same(v, w)
-            }
-            _ => a == b,
-        }
     }
 
     fn one(b: &[u8]) -> Value {

@@ -2152,8 +2152,31 @@ impl Session {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Endpoint, Session};
+
+    /// Checks session buffering across pushes and stream ends.
+    pub fn check_session_budget(bytes: &[u8], budget: usize) {
+        let mut session = Session::new(Endpoint::Client, 5, budget);
+        for (index, chunk) in bytes.chunks(17).enumerate() {
+            let _ = session.push([0, 2, 4, 6, 10][index % 5], chunk);
+            while session.next().is_some() {}
+            assert!(session.buffered() <= budget);
+        }
+        for id in [0, 2, 4, 6, 10] {
+            session.end(id);
+        }
+        while session.next().is_some() {}
+        assert!(session.buffered() <= budget);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::{check_session_budget};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
@@ -3225,17 +3248,7 @@ mod tests {
             contract::check_wire::<Priority>(&bytes);
             contract::check_wire::<StreamHeader>(&bytes);
             let budget = MAX_FRAME + MAX_TEST_BYTES;
-            let mut session = Session::new(Endpoint::Client, 5, budget);
-            for (index, chunk) in bytes.chunks(17).enumerate() {
-                let _ = session.push([0, 2, 4, 6, 10][index % 5], chunk);
-                while session.next().is_some() {}
-                assert!(session.buffered() <= budget);
-            }
-            for id in [0, 2, 4, 6, 10] {
-                session.end(id);
-            }
-            while session.next().is_some() {}
-            assert!(session.buffered() <= budget);
+            check_session_budget(&bytes, budget);
             let (items, _) = decode_all(Frames::<Frame>::new, &bytes);
             for frame in items.iter().flatten() {
                 contract::check_wire_value(frame);

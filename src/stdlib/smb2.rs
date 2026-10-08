@@ -2953,8 +2953,23 @@ fn arr<const N: usize>(b: &[u8], at: usize) -> Result<[u8; N], Error> {
     b.get(at..end).and_then(|s| s.try_into().ok()).ok_or(Error::Truncated)
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::command;
+
+    /// Checks body length against the input, CREATE padding, and StructureSize.
+    pub fn no_longer(command: u16, new: &[u8], old: &[u8]) -> bool {
+        let slack = if command == command::CREATE { 7 } else { 0 };
+        new.len() <= old.len() + slack
+            || new.get(..2).is_some_and(|s| new.len() <= usize::from(u16::from_le_bytes([s[0], s[1]])))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::no_longer;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
@@ -4438,16 +4453,6 @@ mod tests {
             .unwrap(),
         );
         out
-    }
-
-    /// Whether a body written back is no longer than the one read, or no
-    /// longer than its own fixed part and one byte. Then a message read
-    /// whole always fits [`MAX_MESSAGE`] when written back. A CREATE may
-    /// grow by 7 bytes when its last create context put data before name
-    /// (see [`Request::parse`]).
-    fn no_longer(command: u16, new: &[u8], old: &[u8]) -> bool {
-        let slack = if command == command::CREATE { 7 } else { 0 };
-        new.len() <= old.len() + slack || le16(new, 0).ok_or(Error::Truncated).is_ok_and(|size| new.len() <= usize::from(size))
     }
 
     /// Reads a payload every way there is, checks that what reads writes

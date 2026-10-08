@@ -7,9 +7,10 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::snmp::{
-    BasicPdu, Element, Error, ErrorStatus, MAX_MESSAGE, Message, Oid, Pdu, Value, VarBind,
+    BasicPdu, Error, MAX_MESSAGE, Message, Oid, Pdu, Value, VarBind,
     Version,
 };
+use fictionet::stdlib::snmp::harness::{check_message, check_scalars};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -21,23 +22,7 @@ fuzz_target!(|data: &[u8]| {
     );
     contract::check_wire::<Message>(data);
 
-    // The bytes as one datagram.
-    if let Ok(m) = Message::parse(data) {
-        // A message read can be written, and reads back the same. Writing
-        // never makes it longer.
-        let bytes = m.to_bytes().unwrap();
-        assert!(bytes.len() <= data.len());
-        assert_eq!(Message::parse(&bytes), Ok(m.clone()));
-        // Answers to it follow its version and are no longer than it, so
-        // they are written whole and read back the same.
-        let answers = [m.response(m.pdu.bindings().to_vec()), m.error_response(ErrorStatus::GenErr, 1)];
-        for r in answers.into_iter().flatten() {
-            assert!(m.follows_version() && r.follows_version());
-            let b = r.to_bytes().unwrap();
-            assert!(b.len() <= data.len());
-            assert_eq!(Message::parse(&b), Ok(r));
-        }
-    }
+    check_message(data);
 
     // A message built from the bytes, as world code builds one: it is
     // written whole and reads back the same, or refused as too long.
@@ -68,9 +53,5 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    contract::check_wire::<Element>(data);
-    contract::check_wire::<Oid>(data);
-    if let Ok(Ok(oid)) = std::str::from_utf8(data).map(str::parse::<Oid>) {
-        assert_eq!(oid.to_string().parse::<Oid>(), Ok(oid));
-    }
+    check_scalars(data);
 });

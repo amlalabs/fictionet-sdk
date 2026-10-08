@@ -9,16 +9,8 @@ use fictionet::stdlib::websocket::{
     Close, Error, Frame, Frames, Header, MAX_HEADERS, MAX_MESSAGE, Message, Messages, Opcode, Role, check_request,
     check_response, request_headers,
 };
+use fictionet::stdlib::websocket::harness::bounded;
 use libfuzzer_sys::fuzz_target;
-
-fn bounded<D: Decode>(make: impl Fn() -> D, bytes: &[u8])
-where
-    D::Item: PartialEq + core::fmt::Debug,
-    D::Error: Clone + PartialEq + core::fmt::Debug,
-{
-    let limit = make().capacity().checked_mul(2).unwrap();
-    contract::check_decode_with_alloc_limit(make, bytes, limit);
-}
 
 fn check_clone(mut decoder: Messages, data: &[u8]) {
     let middle = data.len() / 2;

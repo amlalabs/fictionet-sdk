@@ -2814,8 +2814,44 @@ fictionet::der_wire!(asn1, impl Wire for Crl, Error, Error::Unwritable, [
     /// Leaves the destination unchanged on error.
 ]);
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{AuthorityInfoAccess, AuthorityKeyIdentifier, BasicConstraints, CrlDistributionPoints,
+        CrlNumber, CrlReason, ExtendedKeyUsage, ExtensionValue, IssuerAltName, KeyUsage,
+        SubjectAltName, SubjectKeyIdentifier};
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks extension parsing, writing, and extension bytes.
+    pub fn round_trip<T: ExtensionValue + PartialEq + std::fmt::Debug>(data: &[u8]) {
+        contract::check_wire::<T>(data);
+        if let Ok(v) = T::parse(data) {
+            let der = v.to_bytes().unwrap();
+            assert_eq!(T::parse(&der).unwrap(), v);
+            assert_eq!(v.to_extension(true).unwrap().value, der);
+        }
+    }
+
+    /// Checks each supported typed extension.
+    pub fn check_extension_value(data: &[u8]) {
+        round_trip::<BasicConstraints>(data);
+        round_trip::<KeyUsage>(data);
+        round_trip::<ExtendedKeyUsage>(data);
+        round_trip::<SubjectAltName>(data);
+        round_trip::<SubjectKeyIdentifier>(data);
+        round_trip::<AuthorityKeyIdentifier>(data);
+        round_trip::<CrlDistributionPoints>(data);
+        round_trip::<AuthorityInfoAccess>(data);
+        round_trip::<IssuerAltName>(data);
+        round_trip::<CrlNumber>(data);
+        round_trip::<CrlReason>(data);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::check_extension_value;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, finish as finish_stream, pump,
@@ -3847,29 +3883,6 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             let _ = n.to_string();
         }
         check_extension_value(data);
-    }
-
-    fn round_trip<T: ExtensionValue + PartialEq + std::fmt::Debug>(data: &[u8]) {
-        contract::check_wire::<T>(data);
-        if let Ok(v) = T::parse(data) {
-            let der = v.to_bytes().unwrap();
-            assert_eq!(T::parse(&der).unwrap(), v);
-            assert_eq!(v.to_extension(true).unwrap().value, der);
-        }
-    }
-
-    fn check_extension_value(data: &[u8]) {
-        round_trip::<BasicConstraints>(data);
-        round_trip::<KeyUsage>(data);
-        round_trip::<ExtendedKeyUsage>(data);
-        round_trip::<SubjectAltName>(data);
-        round_trip::<SubjectKeyIdentifier>(data);
-        round_trip::<AuthorityKeyIdentifier>(data);
-        round_trip::<CrlDistributionPoints>(data);
-        round_trip::<AuthorityInfoAccess>(data);
-        round_trip::<IssuerAltName>(data);
-        round_trip::<CrlNumber>(data);
-        round_trip::<CrlReason>(data);
     }
 
     #[test]

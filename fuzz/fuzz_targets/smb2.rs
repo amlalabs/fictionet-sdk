@@ -12,17 +12,8 @@ use fictionet::stdlib::smb2::{
     MAX_FRAME, MAX_MESSAGE, NegotiateContext, NegotiateResponse, Packet, ReadRequest, Request, Response,
     Transform, TreeConnectRequest, WriteRequest, command, status,
 };
+use fictionet::stdlib::smb2::harness::no_longer;
 use libfuzzer_sys::fuzz_target;
-
-/// Whether a body written back is no longer than the one read, or no
-/// longer than its own StructureSize. Then a message read whole always fits
-/// MAX_MESSAGE when written back. A CREATE may grow by 7 bytes, when its
-/// last create context put its data before its name.
-fn no_longer(command: u16, new: &[u8], old: &[u8]) -> bool {
-    let slack = if command == command::CREATE { 7 } else { 0 };
-    new.len() <= old.len() + slack
-        || new.get(..2).is_some_and(|s| new.len() <= usize::from(u16::from_le_bytes([s[0], s[1]])))
-}
 
 /// A body read alone can fit while its message header or CREATE padding
 /// puts the complete message past the limit.

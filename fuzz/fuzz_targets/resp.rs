@@ -8,6 +8,7 @@ use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::resp::{
     Command, Commands, Error, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, Resp2, Value, Values,
 };
+use fictionet::stdlib::resp::harness::wire_same;
 use libfuzzer_sys::fuzz_target;
 
 // The harness needs reflexive equality. NaN has one RESP wire spelling.
@@ -95,22 +96,4 @@ fn partial_oracle<T: Wire<ParseError = Error, WriteError = Error>>(
     };
     let actual: Vec<_> = decoded.0.iter().map(|value| value.to_bytes().unwrap()).collect();
     assert_eq!((actual, decoded.1.clone()), expected);
-}
-
-fn wire_same(a: &Value, b: &Value) -> bool {
-    let all = |x: &[Value], y: &[Value]| x.len() == y.len() && x.iter().zip(y).all(|(x, y)| wire_same(x, y));
-    let pairs = |x: &[(Value, Value)], y: &[(Value, Value)]| {
-        x.len() == y.len() && x.iter().zip(y).all(|((a, b), (c, d))| wire_same(a, c) && wire_same(b, d))
-    };
-    match (a, b) {
-        (Value::Double(x), Value::Double(y)) => x == y || (x.is_nan() && y.is_nan()),
-        (Value::Array(x), Value::Array(y)) | (Value::Set(x), Value::Set(y)) | (Value::Push(x), Value::Push(y)) => {
-            all(x, y)
-        }
-        (Value::Map(x), Value::Map(y)) => pairs(x, y),
-        (Value::Attribute { attributes: x, value: v }, Value::Attribute { attributes: y, value: w }) => {
-            pairs(x, y) && wire_same(v, w)
-        }
-        _ => a == b,
-    }
 }

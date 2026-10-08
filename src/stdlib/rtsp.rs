@@ -2106,8 +2106,61 @@ wire_value!(
     write
 );
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Error, Frame, Transports};
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks parsed values and their public accessors.
+    pub fn round_trip(item: &Frame) {
+        contract::check_wire_value(item);
+        if let Frame::Interleaved(frame) = item {
+            frame.to_bytes().unwrap();
+            return;
+        }
+        if let Err(error) = item.to_bytes() {
+            assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {item:?}");
+            return;
+        }
+        if let Frame::Message(message) = item {
+            if let Ok(value) = message.session() {
+                contract::check_wire_value(&value);
+                value.to_bytes().unwrap();
+            }
+            if let Ok(value) = message.range() {
+                contract::check_wire_value(&value);
+                value.to_bytes().unwrap();
+            }
+            if let Ok(values) = message.transports()
+                && !values.is_empty()
+            {
+                let value = Transports { values };
+                contract::check_wire_value(&value);
+                value.to_bytes().unwrap();
+            }
+            if message.method().is_some() {
+                let reply = message.reply(100, "Continue");
+                contract::check_wire_value(&reply);
+                assert!(matches!(reply.to_bytes(), Ok(_) | Err(Error::TooLong | Error::TooMany)));
+            }
+        }
+    }
+
+    /// Checks a value read directly from text.
+    pub fn text_value<T: Wire<ParseError = Error, WriteError = Error> + PartialEq + core::fmt::Debug>(value: Result<T, Error>) {
+        if let Ok(value) = value {
+            contract::check_wire_value(&value);
+            assert!(matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)), "{value:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::{round_trip, text_value};
     #[test]
     fn unexpected_line_error_is_malformed_head() {
         assert_eq!(super::framing_error(super::LineError::Unterminated), super::Error::LineEnding);
@@ -2894,50 +2947,13 @@ mod tests {
         items.iter().flatten().count()
     }
 
-    fn round_trip(item: &Frame) {
-        contract::check_wire_value(item);
-        if let Frame::Interleaved(frame) = item {
-            frame.to_bytes().unwrap();
-            return;
-        }
-        if let Err(error) = item.to_bytes() {
-            assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {item:?}");
-            return;
-        }
-        if let Frame::Message(message) = item {
-            if let Ok(value) = message.session() {
-                contract::check_wire_value(&value);
-                value.to_bytes().unwrap();
-            }
-            if let Ok(value) = message.range() {
-                contract::check_wire_value(&value);
-                value.to_bytes().unwrap();
-            }
-            if let Ok(values) = message.transports()
-                && !values.is_empty()
-            {
-                let value = Transports { values };
-                contract::check_wire_value(&value);
-                value.to_bytes().unwrap();
-            }
-            if message.method().is_some() {
-                let reply = message.reply(100, "Continue");
-                contract::check_wire_value(&reply);
-                assert!(matches!(reply.to_bytes(), Ok(_) | Err(Error::TooLong | Error::TooMany)));
-            }
-        }
-    }
-
     fn values_round_trip(bytes: &[u8]) {
         macro_rules! check {
             ($($ty:ty),+) => {$(
                 contract::check_wire::<$ty>(bytes);
                 // Read text directly so a writer failure cannot hide as a parse refusal.
-                if let Ok(text) = core::str::from_utf8(bytes)
-                    && let Ok(value) = <$ty>::read_value(text)
-                {
-                    contract::check_wire_value(&value);
-                    assert!(matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)), "{value:?}");
+                if let Ok(text) = core::str::from_utf8(bytes) {
+                    text_value(<$ty>::read_value(text));
                 }
             )+};
         }

@@ -1399,8 +1399,27 @@ fn sha1_block(h: &mut [u32; 5], block: &[u8]) {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use fictionet::stdlib::codec::Decode;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks decoding with at most twice the decoder capacity allocated.
+    pub fn bounded<D: Decode>(make: impl Fn() -> D, bytes: &[u8])
+    where
+        D::Item: PartialEq + core::fmt::Debug,
+        D::Error: Clone + PartialEq + core::fmt::Debug,
+    {
+        let limit = make().capacity().checked_mul(2).unwrap();
+        contract::check_decode_with_alloc_limit(make, bytes, limit);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::bounded;
     use super::*;
     use fictionet::stdlib::codec::{
         AssembleError, Decode, Fail, Lcg, Stream,
@@ -2186,8 +2205,8 @@ mod tests {
     /// What the fuzz target checks, for one buffer.
     fn check_buffer(data: &[u8]) {
         for role in [Role::Server, Role::Client] {
-            contract::check_decode_with_alloc_limit(|| Frames::new(role), data, 2 * (MAX_HEADER_LEN + MAX_PAYLOAD));
-            contract::check_decode_with_alloc_limit(|| Messages::new(role), data, 2 * (MAX_HEADER_LEN + MAX_PAYLOAD));
+            bounded(|| Frames::new(role), data);
+            bounded(|| Messages::new(role), data);
             contract::check_decode_with_held_limit(|| Messages::new(role), data, MAX_MESSAGE);
             let mask = if role == Role::Server { Some([5, 6, 7, 8]) } else { None };
             for message in decode(role, data).0 {

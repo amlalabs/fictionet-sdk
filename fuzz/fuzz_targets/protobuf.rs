@@ -8,13 +8,9 @@ use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::protobuf::{Frame, Varint, MAX_MESSAGE, MAX_VARINT_LEN, MAX_FIELDS, Message, Value};
+use fictionet::stdlib::protobuf::{Frame, Varint, MAX_MESSAGE, MAX_VARINT_LEN, MAX_FIELDS, Message};
+use fictionet::stdlib::protobuf::harness::total_fields;
 use libfuzzer_sys::fuzz_target;
-
-// Counts fields as MAX_FIELDS does: group members included.
-fn total_fields(m: &Message) -> usize {
-    m.fields.iter().map(|f| 1 + if let Value::Group(g) = &f.value { total_fields(g) } else { 0 }).sum()
-}
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Frames::<Frame>::new, data, 2 * (MAX_MESSAGE + MAX_VARINT_LEN));

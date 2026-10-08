@@ -10,10 +10,11 @@ use fictionet::stdlib::rdp::{
     ActiveKind, ActivePdu, CapabilitySet, CapabilityType, ChannelDefinition, ClientInfo,
     Connection, ConnectionKind, DataBlock, DataBlocks, FailureCode, Frame, GccConference,
     INFO_RESERVED, INFO_UNICODE, LicenseError, MAX_CAPABILITY, MAX_CHANNELS, MAX_CONNECTION_DATA,
-    MAX_EXTRA_INFO, MAX_FAST_PATH, MAX_FRAME, MAX_GCC_DATA, MAX_INFO_STRING, MAX_PDU,
-    MAX_PER_LENGTH, McsConnect, McsPdu, Negotiation, Protocols, SERVER_CHANNEL_ID, SecurityPayload,
+    MAX_EXTRA_INFO, MAX_FAST_PATH, MAX_FRAME, MAX_INFO_STRING, MAX_PDU,
+    MAX_PER_LENGTH, McsPdu, Negotiation, Protocols, SERVER_CHANNEL_ID, SecurityPayload,
     read_data, write_data,
 };
+use fictionet::stdlib::rdp::harness::{check_parsers, plaintext, roundtrip};
 use libfuzzer_sys::fuzz_target;
 
 // Bound work and every test-owned allocation even with huge fuzzer inputs.
@@ -24,35 +25,9 @@ fn prefix(data: &[u8], n: usize) -> &[u8] {
     data.get(..data.len().min(n)).unwrap_or_default()
 }
 
-fn roundtrip<T: Wire + PartialEq + core::fmt::Debug>(data: &[u8]) {
-    if let Ok(value) = T::parse(data) {
-        check_wire_value(&value);
-        let bytes = value.to_bytes().unwrap();
-        assert!(bytes.len() <= MAX_PDU);
-    }
-}
-
-fn plaintext(data: &[u8]) {
-    roundtrip::<ClientInfo>(data);
-    roundtrip::<LicenseError>(data);
-    roundtrip::<ActivePdu>(data);
-    roundtrip::<CapabilitySet>(data);
-}
-
 fn pdu(data: &[u8]) {
-    roundtrip::<Negotiation>(data);
-    roundtrip::<DataBlock>(data);
-    roundtrip::<GccConference>(data);
-    roundtrip::<McsConnect>(data);
-    check_wire::<DataBlocks>(data);
-    if let Ok(blocks) = DataBlocks::parse(data) {
-        let bytes = blocks.to_bytes().unwrap();
-        assert!(bytes.len() <= MAX_GCC_DATA);
-    }
+    check_parsers(data);
     if let Ok(value) = <McsPdu as Wire>::parse(data) {
-        check_wire_value(&value);
-        let bytes = value.to_bytes().unwrap();
-        assert!(bytes.len() <= MAX_PDU);
         if let McsPdu::SendData { data, .. } = value {
             security(&data);
             plaintext(&data);
@@ -63,7 +38,7 @@ fn pdu(data: &[u8]) {
 }
 
 fn security(data: &[u8]) {
-    check_wire::<SecurityPayload>(data);
+    roundtrip::<SecurityPayload>(data);
     if let Ok(value) = <SecurityPayload as Wire>::parse(data) {
         if let Ok(data) = value.plaintext() {
             plaintext(data);

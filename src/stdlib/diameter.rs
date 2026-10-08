@@ -1486,8 +1486,34 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     if head.eq_ignore_ascii_case(prefix) { s.get(prefix.len()..) } else { None }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::Format;
+
+    /// AVP formats checked by the wire tests.
+    pub const FORMATS: [Format; 14] = [
+        Format::OctetString,
+        Format::Integer32,
+        Format::Integer64,
+        Format::Unsigned32,
+        Format::Unsigned64,
+        Format::Float32,
+        Format::Float64,
+        Format::Grouped,
+        Format::Address,
+        Format::Time,
+        Format::Utf8String,
+        Format::DiameterIdentity,
+        Format::DiameterUri,
+        Format::Enumerated,
+    ];
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::FORMATS;
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
@@ -2189,23 +2215,6 @@ mod tests {
         assert_eq!(messages[1], Ok(dwr()));
         contract::check_decode_with_alloc_limit(Frames::<Message>::new, &data, 2 * DEFAULT_LIMIT);
     }
-
-    const FORMATS: [Format; 14] = [
-        Format::OctetString,
-        Format::Integer32,
-        Format::Integer64,
-        Format::Unsigned32,
-        Format::Unsigned64,
-        Format::Float32,
-        Format::Float64,
-        Format::Grouped,
-        Format::Address,
-        Format::Time,
-        Format::Utf8String,
-        Format::DiameterIdentity,
-        Format::DiameterUri,
-        Format::Enumerated,
-    ];
 
     fn random_value(r: &mut Lcg, depth: u32) -> Value {
         match r.index(if depth > 2 { 13 } else { 14 }) {

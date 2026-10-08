@@ -9,9 +9,10 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::radius::{
-    Attribute, Code, DataType, Error, Evs, Extended, MAX_PACKET, MAX_VALUE, Packet,
+    Attribute, Code, Error, Evs, Extended, MAX_PACKET, MAX_VALUE, Packet,
     RESERVED_EXTENDED_TYPES, Value, Vsa,
 };
+use fictionet::stdlib::radius::harness::check_datagram;
 use libfuzzer_sys::fuzz_target;
 
 /// Takes bytes off the front of the fuzzer's input.
@@ -148,52 +149,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(|| Frames::<Packet>::with_limit(64), data, 2 * Frames::<Packet>::with_limit(64).capacity());
     contract::check_wire::<Packet>(data);
 
-    // The bytes as one datagram.
-    if let Ok(p) = Packet::parse_datagram(data) {
-        // A packet read can be written, and reads back the same.
-        let bytes = p.to_bytes().expect("a packet read can be written");
-        assert_eq!(Packet::parse(&bytes).as_ref(), Ok(&p));
-        let mut padded = bytes.clone();
-        padded.extend_from_slice(&[9, 9, 9]);
-        assert_eq!(Packet::parse_datagram(&padded).as_ref(), Ok(&p));
-        assert_eq!(
-            Packet::parse(&padded),
-            Err(Error::Trailing { remaining: 3 })
-        );
-        for a in &p.attributes {
-            // A value read as its type writes back to bytes that read the same.
-            if let Ok(v) = a.decode() {
-                let t = a.info().map_or(DataType::String, |i| i.data_type);
-                let written = v.to_attribute(a.kind).map(|a| a.value).expect("a value read can be written");
-                assert_eq!(Value::decode(t, &written), Ok(v.clone()));
-                // A value read can be put in an attribute again, with the
-                // same bytes it came in or bytes that read the same.
-                let again = Attribute::from_value(a.kind, &v).expect("a value read can be written");
-                assert_eq!(again.decode().as_ref(), Ok(&v));
-                if let Value::Vsa(vsa) = &v
-                    && let Ok(subs) = vsa.sub_attributes()
-                {
-                    assert_eq!(Vsa::from_sub_attributes(vsa.vendor, &subs).as_ref(), Some(vsa));
-                }
-            }
-            for t in [DataType::Tlv, DataType::Ipv6Prefix, DataType::Ipv4Prefix, DataType::Evs] {
-                if let Ok(v) = Value::decode(t, &a.value) {
-                    assert_eq!(Value::decode(t, &v.to_attribute(a.kind).map(|a| a.value).expect("a value read can be written")), Ok(v));
-                }
-            }
-        }
-        // The valid extended attributes, joined, split again and joined
-        // again. Reserved Extended-Types are read but not written.
-        let ext: Vec<Extended> =
-            p.extended().into_iter().flatten().filter(|e| e.ext_type < RESERVED_EXTENDED_TYPES).collect();
-        let mut q = Packet::new(p.code, p.identifier, p.authenticator);
-        for e in &ext {
-            q.push_extended(e).unwrap();
-        }
-        let again: Vec<Extended> = q.extended().into_iter().map(Result::unwrap).collect();
-        assert_eq!(again, ext);
-        let _ = p.reply(p.code).to_bytes().expect("a reply to a packet read can be written");
-    }
+    check_datagram(data);
 
     // The bytes as instructions for building packets and values.
     let _ = construct(data);

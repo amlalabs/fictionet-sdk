@@ -1801,8 +1801,26 @@ impl From<Truncated> for Error {
     fn from(_: Truncated) -> Self { Error::Truncated }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::Payload;
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks payload round trips and encoded lengths.
+    pub fn check_payload(bytes: &[u8]) {
+        contract::check_wire::<Payload>(bytes);
+        if let Ok(payload) = Payload::parse(bytes) {
+            assert!(payload.to_bytes().unwrap().len() <= bytes.len());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::check_payload;
     use super::*;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::codec::Lcg;
@@ -1826,13 +1844,6 @@ mod tests {
             };
         }
         dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)
-    }
-
-    fn check_payload(bytes: &[u8]) {
-        contract::check_wire::<Payload>(bytes);
-        if let Ok(payload) = Payload::parse(bytes) {
-            assert!(payload.to_bytes().unwrap().len() <= bytes.len());
-        }
     }
 
 

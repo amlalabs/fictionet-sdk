@@ -6,37 +6,13 @@ use fictionet::stdlib::asn1::{Oid, StringKind};
 use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::x509::{
-    AuthorityInfoAccess, AuthorityKeyIdentifier, BasicConstraints, Certificate, Crl,
-    CrlDistributionPoints, CrlNumber, CrlReason, ExtendedKeyUsage, ExtensionValue, GeneralName,
-    IssuerAltName, KeyUsage, MAX_PEM_DATA, MAX_PEM_FRAME, Name, PemBlock, PemBlocks,
-    RevokedCertificate, SubjectAltName, SubjectKeyIdentifier, TbsCertList, TbsCertificate, Value,
+    BasicConstraints, Certificate, Crl, ExtensionValue, GeneralName,
+    KeyUsage, MAX_PEM_DATA, MAX_PEM_FRAME, Name, PemBlock, PemBlocks,
+    RevokedCertificate, SubjectAltName, TbsCertList, TbsCertificate, Value,
     pem_decode,
 };
+use fictionet::stdlib::x509::harness::check_extension_value;
 use libfuzzer_sys::fuzz_target;
-
-/// A typed extension value that reads writes again, and reads back the
-/// same.
-fn round_trip<T: ExtensionValue + PartialEq + std::fmt::Debug>(data: &[u8]) {
-    contract::check_wire::<T>(data);
-    if let Ok(v) = T::parse(data) {
-        let der = v.to_bytes().unwrap();
-        assert_eq!(T::parse(&der).unwrap(), v);
-    }
-}
-
-fn extension_value(data: &[u8]) {
-    round_trip::<BasicConstraints>(data);
-    round_trip::<KeyUsage>(data);
-    round_trip::<ExtendedKeyUsage>(data);
-    round_trip::<SubjectAltName>(data);
-    round_trip::<SubjectKeyIdentifier>(data);
-    round_trip::<AuthorityKeyIdentifier>(data);
-    round_trip::<CrlDistributionPoints>(data);
-    round_trip::<AuthorityInfoAccess>(data);
-    round_trip::<IssuerAltName>(data);
-    round_trip::<CrlNumber>(data);
-    round_trip::<CrlReason>(data);
-}
 
 /// A value built from the input, not read from it: its writer either
 /// refuses it or writes bytes that read back as the same value.
@@ -106,7 +82,7 @@ fn der(data: &[u8]) {
         .unwrap();
         assert_eq!(Certificate::from_pem(&pem).unwrap(), c);
         for x in &c.tbs.extensions {
-            extension_value(&x.value);
+            check_extension_value(&x.value);
         }
         // A tbs changed after reading no longer matches the bytes.
         let mut changed = c.clone();
@@ -124,7 +100,7 @@ fn der(data: &[u8]) {
             .iter()
             .chain(c.tbs.revoked.iter().flat_map(|r| &r.extensions))
         {
-            extension_value(&x.value);
+            check_extension_value(&x.value);
         }
         if let Some(r) = c.tbs.revoked.first() {
             assert!(c.is_revoked(&r.serial));
@@ -149,7 +125,7 @@ fn der(data: &[u8]) {
         assert_eq!(Name::parse(&n.to_bytes().unwrap()).unwrap(), n);
         let _ = n.to_string();
     }
-    extension_value(data);
+    check_extension_value(data);
 }
 
 fuzz_target!(|data: &[u8]| {

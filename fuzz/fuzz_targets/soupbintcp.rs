@@ -9,30 +9,12 @@ use fictionet::stdlib::codec::{
 };
 use fictionet::stdlib::test_support::contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value};
 use fictionet::stdlib::test_support::decode_all;
-use fictionet::stdlib::soupbintcp::{Alpha, Client, Login, MAX_PACKET, Packet, Server, Timers};
+use fictionet::stdlib::soupbintcp::{Alpha, Client, MAX_PACKET, Packet, Server, Timers};
+use fictionet::stdlib::soupbintcp::harness::{check_actions, login};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;
 const SMALL_LIMIT: usize = 64;
-
-fn check_actions(actions: &[Action<Packet, fictionet::stdlib::soupbintcp::Event>]) {
-    assert!(actions.len() <= 2);
-    for action in actions {
-        if let Action::Send(packet) = action {
-            check_wire_value(packet);
-            assert!(packet.to_bytes().is_ok());
-        }
-    }
-}
-
-fn login() -> Login {
-    Login {
-        username: Alpha::right_padded("ALICE").unwrap(),
-        password: Alpha::right_padded("SECRET").unwrap(),
-        session: Alpha::blank(),
-        sequence: 1,
-    }
-}
 
 fuzz_target!(|input: &[u8]| {
     let data = input

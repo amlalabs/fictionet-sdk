@@ -8,6 +8,7 @@ use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::mysql::*;
+use fictionet::stdlib::mysql::harness::check_payload;
 use libfuzzer_sys::fuzz_target;
 
 const CAPS: [u32; 4] = [
@@ -27,43 +28,6 @@ const CAPS: [u32; 4] = [
         | capability::OPTIONAL_RESULTSET_METADATA
         | capability::LOCAL_FILES,
 ];
-
-fn payload(bytes: &[u8]) {
-    contract::check_wire::<Handshake>(bytes);
-    contract::check_wire::<HandshakeResponse>(bytes);
-    contract::check_wire::<SslRequest>(bytes);
-    contract::check_wire::<Column>(bytes);
-    contract::check_wire::<Row>(bytes);
-    contract::check_wire::<LenencInt>(bytes);
-    if let Ok(row) = parse_row(bytes, 1) {
-        contract::check_wire_value(&row);
-    }
-    contract::check_wire::<LocalInfile>(bytes);
-    for caps in CAPS {
-        if let Ok(value) = OkPacket::parse(bytes, caps) {
-            assert_eq!(OkPacket::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value.clone()));
-            if let Ok(message) = value.end_message(0, caps) {
-                assert_eq!(OkPacket::parse(&message.payload, caps), Ok(value));
-            }
-        }
-        if let Ok(value) = ErrPacket::parse(bytes, caps) {
-            assert_eq!(ErrPacket::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value));
-        }
-        if let Ok(value) = Eof::parse(bytes, caps) {
-            assert_eq!(Eof::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value));
-        }
-        if let Ok(value) = Command::parse(bytes, caps) {
-            assert_eq!(Command::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value));
-        }
-    }
-    for columns in 0..4 {
-        if let Ok(row) = parse_row(bytes, columns) {
-            assert!(row.to_bytes().is_ok(), "{row:?}");
-            contract::check_wire_value(&row);
-        }
-    }
-
-}
 
 fn values(bytes: &[u8]) {
     let Some((&first, rest)) = bytes.split_first() else { return };
@@ -132,7 +96,7 @@ fuzz_target!(|data: &[u8]| {
     for message in &messages {
         assert!(message.to_bytes().is_ok(), "{message:?}");
         contract::check_wire_value(message);
-        payload(&message.payload);
+        check_payload(&message.payload, &CAPS);
     }
     for caps in CAPS {
         let mut reader = ResultReader::new(caps);
@@ -147,6 +111,6 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    payload(data);
+    check_payload(data, &CAPS);
     values(data);
 });

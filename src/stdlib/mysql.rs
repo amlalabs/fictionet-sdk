@@ -2003,6 +2003,57 @@ impl From<Truncated> for Error {
     fn from(_: Truncated) -> Self { Error::Truncated }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Column, Command, Eof, ErrPacket, Handshake, HandshakeResponse, LenencInt,
+        LocalInfile, OkPacket, ResultReader, Row, SslRequest, parse_row};
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks payload codecs under the supplied capability sets.
+    pub fn check_payload(bytes: &[u8], capabilities: &[u32]) {
+        contract::check_wire::<Handshake>(bytes);
+        contract::check_wire::<HandshakeResponse>(bytes);
+        contract::check_wire::<SslRequest>(bytes);
+        contract::check_wire::<Column>(bytes);
+        contract::check_wire::<Row>(bytes);
+        contract::check_wire::<LenencInt>(bytes);
+        if let Ok(row) = parse_row(bytes, 1) {
+            contract::check_wire_value(&row);
+        }
+        contract::check_wire::<LocalInfile>(bytes);
+        for &caps in capabilities {
+            if let Ok(value) = OkPacket::parse(bytes, caps) {
+                let message = value.message(0, caps).unwrap();
+                assert!(message.to_bytes().is_ok(), "{message:?}");
+                contract::check_wire_value(&message);
+                assert_eq!(OkPacket::parse(&message.payload, caps), Ok(value.clone()));
+                if let Ok(message) = value.end_message(0, caps) {
+                    assert_eq!(OkPacket::parse(&message.payload, caps), Ok(value));
+                }
+            }
+            if let Ok(value) = ErrPacket::parse(bytes, caps) {
+                assert_eq!(ErrPacket::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value));
+            }
+            if let Ok(value) = Eof::parse(bytes, caps) {
+                assert_eq!(Eof::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value));
+            }
+            if let Ok(value) = Command::parse(bytes, caps) {
+                assert_eq!(Command::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value));
+            }
+            let _ = ResultReader::new(caps).push(bytes);
+        }
+        for columns in 0..4 {
+            if let Ok(row) = parse_row(bytes, columns) {
+                assert!(row.to_bytes().is_ok(), "{row:?}");
+                contract::check_wire_value(&row);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2883,35 +2934,10 @@ mod tests {
     }
 
     fn check_payload(bytes: &[u8]) {
-        contract::check_wire::<Handshake>(bytes);
-        contract::check_wire::<HandshakeResponse>(bytes);
-        contract::check_wire::<SslRequest>(bytes);
-        contract::check_wire::<Column>(bytes);
-        contract::check_wire::<Row>(bytes);
-        contract::check_wire::<LenencInt>(bytes);
+        super::harness::check_payload(bytes, &CAPS_SETS);
         for caps in CAPS_SETS {
             if let Ok(value) = OkPacket::parse(bytes, caps) {
-                let message = value.message(0, caps).unwrap();
-                assert!(message.to_bytes().is_ok(), "{message:?}");
-                contract::check_wire_value(&message);
-                assert_eq!(OkPacket::parse(&message.payload, caps), Ok(value.clone()));
                 assert_eq!(OkPacket::parse(&value.end_message(0, caps).unwrap().payload, caps), Ok(value));
-            }
-            if let Ok(value) = ErrPacket::parse(bytes, caps) {
-                assert_eq!(ErrPacket::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value));
-            }
-            if let Ok(value) = Eof::parse(bytes, caps) {
-                assert_eq!(Eof::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value));
-            }
-            if let Ok(value) = Command::parse(bytes, caps) {
-                assert_eq!(Command::parse(&value.message(0, caps).unwrap().payload, caps), Ok(value));
-            }
-            let _ = ResultReader::new(caps).push(bytes);
-        }
-        for columns in 0..4 {
-            if let Ok(row) = parse_row(bytes, columns) {
-                assert!(row.to_bytes().is_ok(), "{row:?}");
-                contract::check_wire_value(&row);
             }
         }
     }

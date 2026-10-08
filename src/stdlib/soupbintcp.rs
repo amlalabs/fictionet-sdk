@@ -1001,8 +1001,40 @@ impl Server {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Alpha, Event, Login, Packet};
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::session::Action;
+    use fictionet::stdlib::test_support::contract::check_wire_value;
+
+    /// Returns the session login fixture.
+    pub fn login() -> Login {
+        Login {
+            username: Alpha::right_padded("ALICE").unwrap(),
+            password: Alpha::right_padded("SECRET").unwrap(),
+            session: Alpha::blank(),
+            sequence: 1,
+        }
+    }
+
+    /// Checks action counts and outgoing packet writers.
+    pub fn check_actions(actions: &[Action<Packet, Event>]) {
+        assert!(actions.len() <= 2);
+        for action in actions {
+            if let Action::Send(packet) = action {
+                check_wire_value(packet);
+                assert!(packet.to_bytes().is_ok());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::{check_actions, login};
     use fictionet::stdlib::test_support::check_atomic;
     use super::*;
     use fictionet::stdlib::codec::{
@@ -1013,14 +1045,6 @@ mod tests {
 
     fn alpha<const N: usize>(text: &[u8; N]) -> Alpha<N> {
         Alpha::new(*text).unwrap()
-    }
-    fn login() -> Login {
-        Login {
-            username: Alpha::right_padded("ALICE").unwrap(),
-            password: Alpha::right_padded("SECRET").unwrap(),
-            session: Alpha::blank(),
-            sequence: 1,
-        }
     }
     fn session() -> Alpha<SESSION_LENGTH> {
         Alpha::left_padded("ABCDEFGHIJ").unwrap()
@@ -1647,7 +1671,7 @@ mod tests {
                 let before = client.next_sequence();
                 match client.receive(p, now) {
                     Ok(actions) => {
-                        assert!(actions.len() <= 2);
+                        check_actions(&actions);
                         if matches!(p, Packet::SequencedData(_))
                             && client.phase() == ClientPhase::LoggedIn
                         {
@@ -1657,7 +1681,7 @@ mod tests {
                     Err(e) => assert_eq!(e, Error::State),
                 }
                 if let Ok(actions) = server.receive(p, now) {
-                    assert!(actions.len() <= 2);
+                    check_actions(&actions);
                 }
                 for a in client
                     .tick(now)

@@ -2459,8 +2459,38 @@ fn read_mount_name(r: &mut Reader<'_>) -> Result<String, Error> {
     Ok(r.string(MAX_MOUNT_NAME)?.to_owned())
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{MountRequest, MountResponse, Request, Response};
+
+    /// Checks procedure round trips and READ and WRITE data counts.
+    pub fn check(p: u32, bytes: &[u8]) {
+        if let Ok(req) = Request::read(p, bytes) {
+            assert_eq!(req.to_args().unwrap(), bytes);
+            if let Request::Write { count, data, .. } = &req {
+                assert_eq!(*count as usize, data.len());
+            }
+        }
+        if let Ok(resp) = Response::parse(p, bytes) {
+            assert_eq!(resp.to_results().unwrap(), bytes);
+            if let Response::Read(Ok(ok)) = &resp {
+                assert_eq!(ok.count as usize, ok.data.len());
+            }
+        }
+        if let Ok(req) = MountRequest::read(p, bytes) {
+            assert_eq!(req.to_args().unwrap(), bytes);
+        }
+        if let Ok(resp) = MountResponse::parse(p, bytes) {
+            assert_eq!(resp.to_results().unwrap(), bytes);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::check;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Assembled, Wire};
@@ -3840,23 +3870,6 @@ mod tests {
         }
     }
 
-    /// Checks that `bytes` either fails to read as procedure `p`, or reads
-    /// back to exactly the same bytes, for every reader.
-    fn check_any(p: u32, bytes: &[u8]) {
-        if let Ok(req) = Request::read(p, bytes) {
-            assert_eq!(req.to_args().unwrap(), bytes);
-        }
-        if let Ok(resp) = Response::parse(p, bytes) {
-            assert_eq!(resp.to_results().unwrap(), bytes);
-        }
-        if let Ok(req) = MountRequest::read(p, bytes) {
-            assert_eq!(req.to_args().unwrap(), bytes);
-        }
-        if let Ok(resp) = MountResponse::parse(p, bytes) {
-            assert_eq!(resp.to_results().unwrap(), bytes);
-        }
-    }
-
     #[test]
     fn fuzz_loop() {
         let mut rng = Lcg::new(0x1813_1833);
@@ -3889,7 +3902,7 @@ mod tests {
             } else {
                 *p
             };
-            check_any(p, &b);
+            check(p, &b);
         }
         // Fully random bytes, for every procedure number and a few past.
         for _ in 0..5_000 {
@@ -3903,7 +3916,7 @@ mod tests {
                     }
                 })
                 .collect();
-            check_any(rng.below(24) as u32, &b);
+            check(rng.below(24) as u32, &b);
         }
         // Random values round trip.
         for _ in 0..2_000 {
@@ -3997,7 +4010,7 @@ mod tests {
                 let _ = Request::parse(&call);
                 let _ = MountRequest::parse(&call);
             }
-            check_any(rng.below(22) as u32, &record);
+            check(rng.below(22) as u32, &record);
         }
     }
 }

@@ -6,9 +6,10 @@ use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::rtsp::{
-    Error, Frames, Interleaved, Frame, MAX_BODY, MAX_HEAD, MAX_INTERLEAVED, MAX_MESSAGE, Message, Range, Session, Transport,
+    Frames, Interleaved, Frame, MAX_BODY, MAX_HEAD, MAX_INTERLEAVED, MAX_MESSAGE, Message, Range, Session, Transport,
     Transports, Version,
 };
+use fictionet::stdlib::rtsp::harness::{round_trip, text_value};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -56,47 +57,6 @@ fuzz_target!(|data: &[u8]| {
     }
     writers(data);
 });
-
-fn round_trip(item: &Frame) {
-    contract::check_wire_value(item);
-    if let Frame::Interleaved(frame) = item {
-        frame.to_bytes().unwrap();
-        return;
-    }
-    if let Err(error) = item.to_bytes() {
-        assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {item:?}");
-        return;
-    }
-    if let Frame::Message(message) = item {
-        if let Ok(value) = message.session() {
-            contract::check_wire_value(&value);
-            value.to_bytes().unwrap();
-        }
-        if let Ok(value) = message.range() {
-            contract::check_wire_value(&value);
-            value.to_bytes().unwrap();
-        }
-        if let Ok(values) = message.transports()
-            && !values.is_empty()
-        {
-            let value = Transports { values };
-            contract::check_wire_value(&value);
-            value.to_bytes().unwrap();
-        }
-        if message.method().is_some() {
-            let reply = message.reply(100, "Continue");
-            contract::check_wire_value(&reply);
-            assert!(matches!(reply.to_bytes(), Ok(_) | Err(Error::TooLong | Error::TooMany)));
-        }
-    }
-}
-
-fn text_value<T: Wire<ParseError = Error, WriteError = Error> + PartialEq + core::fmt::Debug>(value: Result<T, Error>) {
-    if let Ok(value) = value {
-        contract::check_wire_value(&value);
-        assert!(matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)), "{value:?}");
-    }
-}
 
 // Exercise message fields that parsed input has already normalized.
 fn writers(data: &[u8]) {

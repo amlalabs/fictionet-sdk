@@ -2261,29 +2261,49 @@ fn sorted(contents: &[u8], order: Order) -> Result<Vec<u8>, Error> {
     Ok(items.iter().flat_map(|e| e.raw.iter().copied()).collect())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fictionet::stdlib::codec::{
-        Fail, Lcg, Stream,
-    };
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Class, Element, Elements, Error, Frame, MAX_INPUT, Oid, Reader, Rules, StringKind, Tag, Writer,
+        check_generalized_time, check_utc_time, element_len};
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{chunks, mutate};
 
-    /// Writes `e` again with a [`Writer`], if every value in it is one the
-    /// writer has a method for. Read under DER, the copy must be the same
-    /// bytes.
-    fn copy(e: Element<'_>, w: &mut Writer) -> Option<()> {
+    /// ASN.1 string kinds.
+    const ALL_KINDS: [StringKind; 11] = [
+        StringKind::Utf8,
+        StringKind::Numeric,
+        StringKind::Printable,
+        StringKind::Teletex,
+        StringKind::Videotex,
+        StringKind::Ia5,
+        StringKind::Graphic,
+        StringKind::Visible,
+        StringKind::General,
+        StringKind::Universal,
+        StringKind::Bmp,
+    ];
+
+    fn children(e: Element<'_>) -> Option<Vec<Element<'_>>> {
+        e.reader().ok()?.collect::<Result<Vec<_>, _>>().ok()
+    }
+
+    fn copy_all(kids: Vec<Element<'_>>, w: &mut Writer) -> Option<()> {
+        kids.into_iter().try_for_each(|k| copy(k, w))
+    }
+
+    /// Copies values supported by the DER writer.
+    pub fn copy(e: Element<'_>, w: &mut Writer) -> Option<()> {
         let t = e.tag();
         let mut ok = Some(());
         if t.class != Class::Universal {
             if t.constructed {
                 let kids = children(e)?;
                 w.constructed(t, |w| ok = copy_all(kids, w));
-                return ok;
+            } else {
+                w.primitive(t, e.contents());
             }
-            w.primitive(t, e.contents());
-            return Some(());
+            return ok;
         }
         match t.number {
             1 => w.boolean(e.boolean().ok()?),
@@ -2302,13 +2322,9 @@ mod tests {
             }
             17 => {
                 let kids = children(e)?;
-                let distinct = {
-                    let mut tags: Vec<_> = kids.iter().map(|k| (k.tag.class, k.tag.number)).collect();
-                    tags.sort();
-                    tags.windows(2).all(|w| w[0] != w[1])
-                };
-                // Under DER, a set in tag order is one; under BER any set
-                // with distinct tags is put in tag order.
+                let mut tags: Vec<_> = kids.iter().map(|k| (k.tag().class, k.tag().number)).collect();
+                tags.sort();
+                let distinct = tags.windows(2).all(|p| p[0] != p[1]);
                 if distinct && e.set_reader().is_ok() {
                     w.set(|w| ok = copy_all(kids, w));
                 } else if e.set_of_reader().is_ok() {
@@ -2335,16 +2351,8 @@ mod tests {
         ok
     }
 
-    fn children(e: Element<'_>) -> Option<Vec<Element<'_>>> {
-        e.reader().ok()?.collect::<Result<Vec<_>, _>>().ok()
-    }
-
-    fn copy_all(kids: Vec<Element<'_>>, w: &mut Writer) -> Option<()> {
-        kids.into_iter().try_for_each(|k| copy(k, w))
-    }
-
-    /// Calls every value reader on `e` and its children, for panics.
-    fn walk(e: Element<'_>) {
+    /// Checks value readers on an element and its children.
+    pub fn walk(e: Element<'_>) {
         let _ = e.boolean();
         if let Ok(i) = e.integer() {
             let _ = (i.to_i64(), i.to_u64(), i.to_i128(), i.to_u128(), i.unsigned_bytes());
@@ -2357,6 +2365,7 @@ mod tests {
         }
         let _ = e.octet_string();
         if let Ok(b) = e.bit_string() {
+            let _ = b.bit(b.len().saturating_sub(1));
             for i in 0..b.len().min(64) {
                 assert!(b.bit(i).is_some());
             }
@@ -2386,22 +2395,8 @@ mod tests {
         }
     }
 
-    const ALL_KINDS: [StringKind; 11] = [
-        StringKind::Utf8,
-        StringKind::Numeric,
-        StringKind::Printable,
-        StringKind::Teletex,
-        StringKind::Videotex,
-        StringKind::Ia5,
-        StringKind::Graphic,
-        StringKind::Visible,
-        StringKind::General,
-        StringKind::Universal,
-        StringKind::Bmp,
-    ];
-
-    /// What the fuzz target checks, on one input.
-    fn check(data: &[u8]) {
+    /// Checks BER and DER framing and writer round trips.
+    pub fn check(data: &[u8]) {
         for rules in [Rules::Ber, Rules::Der] {
             contract::check_decode_with_alloc_limit(|| Elements::new(rules), data, 2 * MAX_INPUT);
         }
@@ -2451,6 +2446,16 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::harness::{check, copy};
+    use super::*;
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream,
+    };
+    use fictionet::stdlib::test_support::{chunks, mutate};
 
     fn der(f: impl FnOnce(&mut Writer)) -> Vec<u8> {
         let mut w = Writer::new();

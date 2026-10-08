@@ -48,6 +48,7 @@ use fictionet::stdlib::qpack;
 use fictionet::stdlib::qpack::SectionResult;
 
 use fictionet::stdlib::qpack::Table;
+use fictionet::stdlib::http3::harness::{check_session_budget};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 16 << 10;
@@ -217,17 +218,7 @@ fuzz_target!(|input: &[u8]| {
         }
     }
     let budget = http3::MAX_FRAME + MAX_FUZZ_INPUT;
-    let mut session = Session::new(Endpoint::Client, 5, budget);
-    for (index, chunk) in bytes.chunks(17).enumerate() {
-        let _ = session.push([0, 2, 4, 6, 10][index % 5], chunk);
-        while session.next().is_some() {}
-        assert!(session.buffered() <= budget);
-    }
-    for id in [0, 2, 4, 6, 10] {
-        session.end(id);
-    }
-    while session.next().is_some() {}
-    assert!(session.buffered() <= budget);
+    check_session_budget(bytes, budget);
     let table = Table::new(0);
     let (items, _) = decode_all(Frames::<Frame>::new, bytes);
     for frame in items.iter().flatten() {

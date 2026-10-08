@@ -4,9 +4,10 @@
 
 use std::net::Ipv4Addr;
 
-use fictionet::stdlib::igmp::{Message, RecordType};
+use fictionet::stdlib::igmp::Message;
 use fictionet::stdlib::ip::checksum;
 use fictionet::stdlib::{codec::{Wire, Collect}, test_support::contract, igmp};
+use fictionet::stdlib::igmp::harness::conforms;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -55,46 +56,4 @@ fn check(data: &[u8]) {
         assert_eq!(checksum(&bytes), 0);
         assert_eq!(Message::parse(&bytes), Ok(m));
     }
-}
-
-/// The rules of RFC 1112, RFC 2236 and RFC 3376 for a message sent.
-fn conforms(m: &Message) -> bool {
-    let multicast = |a: &Ipv4Addr| (224..=239).contains(&a.octets()[0]);
-    let zero = |a: &Ipv4Addr| a.octets() == [0; 4];
-    let unicast = |a: &Ipv4Addr| !multicast(a) && !zero(a) && a.octets() != [255; 4];
-    let len = match m {
-        Message::Query { max_resp_time: 0, group } if !zero(group) => return false,
-        Message::Query { group, .. } if !zero(group) && !multicast(group) => return false,
-        Message::ReportV1 { group } | Message::ReportV2 { group } | Message::Leave { group }
-            if !multicast(group) =>
-        {
-            return false;
-        }
-        Message::QueryV3(q) => {
-            if q.qrv > 7 || !(zero(&q.group) || multicast(&q.group)) || !q.sources.iter().all(unicast) {
-                return false;
-            }
-            if zero(&q.group) && !q.sources.is_empty() {
-                return false;
-            }
-            12 + 4 * q.sources.len()
-        }
-        Message::ReportV3 { records } => {
-            let mut len = 8;
-            for r in records {
-                if matches!(r.kind, RecordType::Other(1..=6))
-                    || !multicast(&r.group)
-                    || !r.sources.iter().all(unicast)
-                {
-                    return false;
-                }
-                len += 8 + 4 * r.sources.len();
-            }
-            len
-        }
-        _ => 8,
-    };
-    // An IPv4 packet holds 65535 bytes, 24 of them the header with Router
-    // Alert.
-    len + 24 <= 65_535
 }

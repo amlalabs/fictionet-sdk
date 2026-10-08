@@ -1579,8 +1579,79 @@ macro_rules! line_wire {
 }
 line_wire!(LsRefsArg, LsRef, ClientLine, ServerLine);
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Advertisement, Band, Bands, CapabilityAdvertisement, ClientLine, LsRef, LsRefsArg,
+        MAX_PACKET, Packet, ProtoRequest, ServerLine, ServiceHeader, Sideband, V2Request, band_packets};
+    use fictionet::stdlib::codec::{Frames, Stream, Wire};
+    use fictionet::stdlib::test_support::{contract, decode_all};
+
+    /// Checks packet, payload, and sideband contracts.
+    pub fn check(data: &[u8]) {
+        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_PACKET);
+        contract::check_decode_with_alloc_limit(|| Bands, data, 2 * MAX_PACKET);
+        contract::check_wire::<Packet>(data);
+        contract::check_wire::<ProtoRequest>(data);
+        contract::check_wire::<ServiceHeader>(data);
+        contract::check_wire::<Advertisement>(data);
+        contract::check_wire::<CapabilityAdvertisement>(data);
+        contract::check_wire::<V2Request>(data);
+        // Bytes still buffered are handed over without changes, even after a bad packet.
+        let mut stream = Stream::new(Frames::<Packet>::new());
+        let pushed = stream.push(data);
+        let mut used = 0;
+        while let Some(Ok(packet)) = stream.next() {
+            used += packet.to_bytes().unwrap().len();
+        }
+        let (buffer, _) = stream.into_parts();
+        assert_eq!(buffer.unread(), &data[used..pushed]);
+        for packet in decode_all(Frames::<Packet>::new, data).0 {
+            if let Some(bytes) = packet.data() {
+                contract::check_wire::<ClientLine>(bytes);
+                contract::check_wire::<ServerLine>(bytes);
+                contract::check_wire::<LsRef>(bytes);
+                contract::check_wire::<LsRefsArg>(bytes);
+                if let Ok(request) = ProtoRequest::from_data(bytes) {
+                    assert!(request.to_bytes().is_ok(), "{request:?}");
+                    contract::check_wire_value(&request);
+                }
+            }
+        }
+        if let Ok(V2Request::Command(command)) = V2Request::parse(data) {
+            if let Ok(args) = command.fetch_args() {
+                for arg in args {
+                    assert!(arg.to_bytes().is_ok(), "{arg:?}");
+                    contract::check_wire_value(&arg);
+                }
+            }
+            if let Ok(args) = command.ls_refs_args() {
+                for arg in args {
+                    assert!(arg.to_bytes().is_ok(), "{arg:?}");
+                    contract::check_wire_value(&arg);
+                }
+            }
+        }
+        let max = data.first().map_or(0, |b| usize::from(*b) * 300);
+        let mut bytes = Vec::new();
+        for packet in band_packets(Sideband::Pack, data, max) {
+            packet.write(&mut bytes).unwrap();
+        }
+        let (items, failure) = decode_all(|| Bands, &bytes);
+        assert_eq!(failure, None);
+        let mut back = Vec::new();
+        for item in items {
+            let Band::Data(Sideband::Pack, payload) = item else { panic!("unexpected band") };
+            back.extend(payload);
+        }
+        assert_eq!(back, data);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::check;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream,
@@ -2430,65 +2501,6 @@ mod tests {
         assert_eq!(fetch(&["deepen-not refs/x", "deepen 2"]), both);
         assert_eq!(fetch(&["deepen-since 1", "deepen-not refs/x"]), Ok(()));
         assert_eq!(fetch(&["deepen 1", "deepen-relative"]), Ok(()));
-    }
-
-    fn check(data: &[u8]) {
-        contract::check_decode_with_alloc_limit(Frames::<Packet>::new, data, 2 * MAX_PACKET);
-        contract::check_decode_with_alloc_limit(|| Bands, data, 2 * MAX_PACKET);
-        contract::check_wire::<Packet>(data);
-        contract::check_wire::<ProtoRequest>(data);
-        contract::check_wire::<ServiceHeader>(data);
-        contract::check_wire::<Advertisement>(data);
-        contract::check_wire::<CapabilityAdvertisement>(data);
-        contract::check_wire::<V2Request>(data);
-        // Bytes still buffered are handed over without changes, even after a bad packet.
-        let mut stream = Stream::new(Frames::<Packet>::new());
-        let pushed = stream.push(data);
-        let mut used = 0;
-        while let Some(Ok(packet)) = stream.next() {
-            used += packet.to_bytes().unwrap().len();
-        }
-        let (buffer, _) = stream.into_parts();
-        assert_eq!(buffer.unread(), &data[used..pushed]);
-        for packet in decode_all(Frames::<Packet>::new, data).0 {
-            if let Some(bytes) = packet.data() {
-                contract::check_wire::<ClientLine>(bytes);
-                contract::check_wire::<ServerLine>(bytes);
-                contract::check_wire::<LsRef>(bytes);
-                contract::check_wire::<LsRefsArg>(bytes);
-                if let Ok(request) = ProtoRequest::from_data(bytes) {
-                    assert!(request.to_bytes().is_ok(), "{request:?}");
-                    contract::check_wire_value(&request);
-                }
-            }
-        }
-        if let Ok(V2Request::Command(command)) = V2Request::parse(data) {
-            if let Ok(args) = command.fetch_args() {
-                for arg in args {
-                    assert!(arg.to_bytes().is_ok(), "{arg:?}");
-                    contract::check_wire_value(&arg);
-                }
-            }
-            if let Ok(args) = command.ls_refs_args() {
-                for arg in args {
-                    assert!(arg.to_bytes().is_ok(), "{arg:?}");
-                    contract::check_wire_value(&arg);
-                }
-            }
-        }
-        let max = data.first().map_or(0, |b| usize::from(*b) * 300);
-        let mut bytes = Vec::new();
-        for packet in band_packets(Sideband::Pack, data, max) {
-            packet.write(&mut bytes).unwrap();
-        }
-        let (items, failure) = decode_all(|| Bands, &bytes);
-        assert_eq!(failure, None);
-        let mut back = Vec::new();
-        for item in items {
-            let Band::Data(Sideband::Pack, payload) = item else { panic!("unexpected band") };
-            back.extend(payload);
-        }
-        assert_eq!(back, data);
     }
 
     #[test]

@@ -7,28 +7,13 @@ use fictionet::stdlib::test_support::contract::{check_decode, check_wire, check_
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::opcua::{
-    Binary, Chunk, ChunkType, DataValue, DiagnosticInfo, Error, ExpandedNodeId,
-    ExtensionObject, Limits, LocalizedText, Message, MessageType, NodeId, QualifiedName, Reader,
+    Chunk, ChunkType, DataValue, DiagnosticInfo, ExpandedNodeId,
+    ExtensionObject, Limits, LocalizedText, Message, MessageType, NodeId, QualifiedName,
     ResponseHeader, Service, Variant,
 };
 use fictionet::stdlib::opcua::Messages;
+use fictionet::stdlib::opcua::harness::check_reader;
 use libfuzzer_sys::fuzz_target;
-
-/// Checks permissive reads, including reserved Variant types that cannot be written.
-fn check_reader<T: Binary + Wire<WriteError = Error> + PartialEq + core::fmt::Debug>(
-    data: &[u8],
-) {
-    let mut reader = Reader::new(data);
-    if let Ok(value) = reader.read::<T>()
-        && reader.finish().is_ok()
-    {
-        match value.to_bytes() {
-            Ok(bytes) => assert_eq!(<T as Wire>::parse(&bytes).unwrap(), value),
-            Err(Error::VariantValue) => {}
-            Err(error) => panic!("{error}"),
-        }
-    }
-}
 
 fuzz_target!(|data: &[u8]| {
     // The first byte picks the limits, so small chunk and message limits

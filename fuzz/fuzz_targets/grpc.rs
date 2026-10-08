@@ -10,11 +10,8 @@ use fictionet::stdlib::grpc::{
     Code, ContentType, Error, HEADER_LEN, MAX_MESSAGE, Message, MethodPath, Rejection, Request, Status,
     Timeout, decode_message, encode_message,
 };
+use fictionet::stdlib::grpc::harness::strings;
 use libfuzzer_sys::fuzz_target;
-
-fn strings(h: &[(String, String)]) -> Vec<(&str, &str)> {
-    h.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect()
-}
 
 /// The request headers with the fields that make a call: POST, a path
 /// and a gRPC content-type, then whatever the input holds, so the checks

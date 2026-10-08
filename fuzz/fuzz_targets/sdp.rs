@@ -7,31 +7,10 @@ use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::sdp::{
-    Attribute, Candidate, SessionDescriptions, Fmtp, MAX_LINE_LEN, MAX_LINES, RtpMap, SessionDescription,
+    Attribute, SessionDescriptions, MAX_LINE_LEN, MAX_LINES, SessionDescription,
 };
+use fictionet::stdlib::sdp::harness::check_attribute;
 use libfuzzer_sys::fuzz_target;
-
-/// Checks the typed helpers on one attribute: what one reads, it writes,
-/// in a value that fits on a line, and reads back the same.
-fn check_attribute(a: &Attribute) {
-    let fits = |b: &Attribute| "a=:".len() + b.name.len() + b.value.as_deref().map_or(0, str::len) <= MAX_LINE_LEN;
-    if let Ok(r) = RtpMap::from_attribute(a) {
-        let back = r.to_attribute().unwrap();
-        assert!(fits(&back));
-        assert_eq!(RtpMap::from_attribute(&back), Ok(r));
-    }
-    if let Ok(f) = Fmtp::from_attribute(a) {
-        assert!(f.parameters().len() <= MAX_LINE_LEN);
-        let back = f.to_attribute().unwrap();
-        assert!(fits(&back));
-        assert_eq!(Fmtp::from_attribute(&back), Ok(f));
-    }
-    if let Ok(c) = Candidate::from_attribute(a) {
-        let back = c.to_attribute().unwrap();
-        assert!(fits(&back));
-        assert_eq!(Candidate::from_attribute(&back), Ok(c));
-    }
-}
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(SessionDescriptions::new, data, 2 * (MAX_LINE_LEN + 2));

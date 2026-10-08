@@ -1121,8 +1121,29 @@ fn asked(state: OptionState, on: bool) -> (OptionState, Option<bool>) {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::Event;
+
+    /// Merges adjacent data events.
+    pub fn merged(events: Vec<Event>) -> Vec<Event> {
+        let mut out: Vec<Event> = Vec::new();
+        for event in events {
+            if let (Event::Data(data), Some(Event::Data(last))) = (&event, out.last_mut()) {
+                last.extend_from_slice(data);
+            } else {
+                out.push(event);
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::merged;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, finish, pump,
@@ -1132,18 +1153,6 @@ mod tests {
 
     /// Adjacent data events joined, so streams split in different places
     /// compare equal.
-    fn merged(events: Vec<Event>) -> Vec<Event> {
-        let mut out: Vec<Event> = Vec::new();
-        for e in events {
-            if let (Event::Data(d), Some(Event::Data(last))) = (&e, out.last_mut()) {
-                last.extend_from_slice(d);
-                continue;
-            }
-            out.push(e);
-        }
-        out
-    }
-
     fn decode(bytes: &[u8]) -> Vec<Event> {
         let (events, failure) = decode_all(|| Events::with_limit(MAX_DATA), bytes);
         assert_eq!(failure, None);

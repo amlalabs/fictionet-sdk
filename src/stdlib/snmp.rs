@@ -1547,8 +1547,55 @@ impl Prefixed for Message {
 }
 
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Element, ErrorStatus, Message, Oid};
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks message and response round trips and lengths.
+    pub fn check_message(data: &[u8]) {
+        if let Ok(m) = Message::parse(data) {
+            let b = m.to_bytes().unwrap();
+            assert!(b.len() <= data.len());
+            assert_eq!(Message::parse(&b), Ok(m.clone()));
+            // Answers to it follow its version and are no longer than it,
+            // so they are written whole and read back the same.
+            for r in
+                [m.response(m.pdu.bindings().to_vec()), m.error_response(ErrorStatus::GenErr, 1)].into_iter().flatten()
+            {
+                assert!(m.follows_version() && r.follows_version());
+                let b = r.to_bytes().unwrap();
+                assert!(b.len() <= data.len());
+                assert_eq!(Message::parse(&b), Ok(r));
+            }
+        }
+    }
+
+    /// Checks BER elements and binary and text object identifiers.
+    pub fn check_scalars(data: &[u8]) {
+        if let Ok(e) = Element::parse(data) {
+            let b = e.to_bytes().unwrap();
+            assert_eq!(Element::parse(&b), Ok(e));
+        }
+        if let Ok(s) = std::str::from_utf8(data)
+            && let Ok(o) = s.parse::<Oid>()
+        {
+            assert_eq!(o.to_string().parse::<Oid>(), Ok(o));
+        }
+        if let Ok(o) = Oid::parse(data) {
+            assert_eq!(Oid::parse(&o.to_bytes().unwrap()), Ok(o));
+        }
+        contract::check_wire::<Element>(data);
+        contract::check_wire::<Oid>(data);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::{check_message, check_scalars};
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, pump,
@@ -2327,37 +2374,10 @@ mod tests {
     }
 
     fn check(data: &[u8]) {
-        if let Ok(m) = Message::parse(data) {
-            let b = m.to_bytes().unwrap();
-            assert!(b.len() <= data.len());
-            assert_eq!(Message::parse(&b), Ok(m.clone()));
-            // Answers to it follow its version and are no longer than it,
-            // so they are written whole and read back the same.
-            for r in
-                [m.response(m.pdu.bindings().to_vec()), m.error_response(ErrorStatus::GenErr, 1)].into_iter().flatten()
-            {
-                assert!(m.follows_version() && r.follows_version());
-                let b = r.to_bytes().unwrap();
-                assert!(b.len() <= data.len());
-                assert_eq!(Message::parse(&b), Ok(r));
-            }
-        }
-        if let Ok(e) = Element::parse(data) {
-            let b = e.to_bytes().unwrap();
-            assert_eq!(Element::parse(&b), Ok(e));
-        }
-        if let Ok(s) = std::str::from_utf8(data)
-            && let Ok(o) = s.parse::<Oid>()
-        {
-            assert_eq!(o.to_string().parse::<Oid>(), Ok(o));
-        }
-        if let Ok(o) = Oid::parse(data) {
-            assert_eq!(Oid::parse(&o.to_bytes().unwrap()), Ok(o));
-        }
+        check_message(data);
+        check_scalars(data);
         contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * MAX_MESSAGE);
         contract::check_wire::<Message>(data);
-        contract::check_wire::<Element>(data);
-        contract::check_wire::<Oid>(data);
     }
 
     #[test]

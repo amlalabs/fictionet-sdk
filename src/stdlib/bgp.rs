@@ -1951,8 +1951,29 @@ fn take_u32(r: &mut &[u8]) -> Option<u32> {
     take(r, 4).and_then(|b| be32(b, 0))
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Attribute, Context, Error, Message};
+    use fictionet::stdlib::codec::Wire;
+
+    /// Encodes a message with its negotiated context.
+    pub fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, Error> {
+        message.to_frame(context)?.to_bytes()
+    }
+
+    /// Whether an UPDATE mixes route kinds that a writer refuses.
+    pub fn mixes(m: &Message) -> bool {
+        let Message::Update(u) = m else { return false };
+        let mp = u.attributes.iter().filter(|a| matches!(a, Attribute::MpReach(_) | Attribute::MpUnreach(_))).count();
+        usize::from(!u.withdrawn.is_empty()) + usize::from(!u.nlri.is_empty()) + mp > 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::{encode, mixes};
     use fictionet::stdlib::codec::{Step, Decode};
     use super::*;
     use fictionet::stdlib::codec::{
@@ -1960,10 +1981,6 @@ mod tests {
     };
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{decode_all, mutate};
-
-    fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, Error> {
-        message.to_frame(context)?.to_bytes()
-    }
 
     const TWO: Context = Context { four_octet_as: false, enhanced_route_refresh: false };
     const FOUR: Context = Context { four_octet_as: true, enhanced_route_refresh: false };
@@ -2744,14 +2761,6 @@ mod tests {
         assert_eq!(count, 200_000);
         assert_eq!(stream.buffered(), 0);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
-    }
-
-    /// Whether an UPDATE mixes kinds of routes, which a reader takes from
-    /// older speakers but a writer refuses (RFC 7606 section 5.1).
-    fn mixes(m: &Message) -> bool {
-        let Message::Update(u) = m else { return false };
-        let mp = u.attributes.iter().filter(|a| matches!(a, Attribute::MpReach(_) | Attribute::MpUnreach(_))).count();
-        usize::from(!u.withdrawn.is_empty()) + usize::from(!u.nlri.is_empty()) + mp > 1
     }
 
     /// Checks what the fuzz target checks: a message read can be written,

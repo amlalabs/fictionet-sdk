@@ -9,24 +9,8 @@ use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::diameter::{
     Address, Avp, Format, Identity, MAX_AVP_DATA, Message, Uri, Value, base_format, check,
 };
+use fictionet::stdlib::diameter::harness::FORMATS;
 use libfuzzer_sys::fuzz_target;
-
-const FORMATS: [Format; 14] = [
-    Format::OctetString,
-    Format::Integer32,
-    Format::Integer64,
-    Format::Unsigned32,
-    Format::Unsigned64,
-    Format::Float32,
-    Format::Float64,
-    Format::Grouped,
-    Format::Address,
-    Format::Time,
-    Format::Utf8String,
-    Format::DiameterIdentity,
-    Format::DiameterUri,
-    Format::Enumerated,
-];
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Frames::<Message>::new, data, 2 * Frames::<Message>::new().capacity());

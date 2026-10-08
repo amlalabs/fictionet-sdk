@@ -2475,6 +2475,47 @@ impl From<Trailing> for Error {
     fn from(_: Trailing) -> Self { Error::Invalid("trailing bytes") }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{ActivePdu, CapabilitySet, ClientInfo, DataBlock, DataBlocks, GccConference,
+        LicenseError, MAX_GCC_DATA, MAX_PDU, McsConnect, McsPdu, Negotiation, SecurityPayload};
+    use fictionet::stdlib::codec::Wire;
+    use fictionet::stdlib::test_support::contract;
+
+    /// Checks a parsed wire value and its PDU size bound.
+    pub fn roundtrip<T: Wire + PartialEq + core::fmt::Debug>(data: &[u8]) {
+        contract::check_wire::<T>(data);
+        if let Ok(value) = T::parse(data) {
+            assert!(value.to_bytes().unwrap().len() <= MAX_PDU);
+        }
+    }
+
+    /// Checks plaintext PDU readers.
+    pub fn plaintext(data: &[u8]) {
+        roundtrip::<ClientInfo>(data);
+        roundtrip::<LicenseError>(data);
+        roundtrip::<ActivePdu>(data);
+        roundtrip::<CapabilitySet>(data);
+    }
+
+    /// Checks connection and security PDU readers.
+    pub fn check_parsers(data: &[u8]) {
+        roundtrip::<Negotiation>(data);
+        roundtrip::<DataBlock>(data);
+        roundtrip::<GccConference>(data);
+        roundtrip::<McsConnect>(data);
+        roundtrip::<McsPdu>(data);
+        roundtrip::<SecurityPayload>(data);
+        plaintext(data);
+        contract::check_wire::<DataBlocks>(data);
+        if let Ok(blocks) = DataBlocks::parse(data) {
+            assert!(blocks.to_bytes().unwrap().len() <= MAX_GCC_DATA);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -2751,28 +2792,7 @@ mod tests {
     }
 
     fn check_parsers(b: &[u8]) {
-        macro_rules! roundtrip {
-            ($t:ty) => {
-                if let Ok(v) = <$t>::parse(b) {
-                    let bytes = v.to_bytes().unwrap();
-                    assert!(bytes.len() <= MAX_PDU);
-                    assert_eq!(<$t>::parse(&bytes), Ok(v));
-                }
-            };
-        }
-        roundtrip!(Negotiation);
-        roundtrip!(DataBlock);
-        roundtrip!(GccConference);
-        roundtrip!(McsConnect);
-        roundtrip!(McsPdu);
-        roundtrip!(ClientInfo);
-        roundtrip!(SecurityPayload);
-        roundtrip!(LicenseError);
-        roundtrip!(CapabilitySet);
-        roundtrip!(ActivePdu);
-        if let Ok(blocks) = DataBlocks::parse(b) {
-            assert_eq!(DataBlocks::parse(&blocks.to_bytes().unwrap()), Ok(blocks));
-        }
+        super::harness::check_parsers(b);
         if let Ok(Some((f, n))) = Frame::parse_prefix(b) {
             assert!(n <= b.len());
             let bytes = f.to_bytes().unwrap();

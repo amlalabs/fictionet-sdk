@@ -1468,8 +1468,19 @@ fn details_code(v: &[u8]) -> Option<i32> {
     }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    /// Borrows header names and values.
+    pub fn strings(h: &[(String, String)]) -> Vec<(&str, &str)> {
+        h.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::strings;
     use fictionet::stdlib::codec::Step;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
@@ -1705,10 +1716,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    fn strings(h: &[(String, String)]) -> Vec<(&str, &str)> {
-        h.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect()
     }
 
     fn good_request() -> Vec<(&'static str, &'static str)> {

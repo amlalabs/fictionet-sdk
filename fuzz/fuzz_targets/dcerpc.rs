@@ -8,43 +8,11 @@ use fictionet::stdlib::codec::{Decode, Step, Wire};
 use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::dcerpc::{
-    AUTH_PAD_ALIGN, Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Error,
-    MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, SEC_TRAILER_LEN, SyntaxId, Uuid, flags,
+    Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Error,
+    MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, SyntaxId, Uuid, flags,
 };
+use fictionet::stdlib::dcerpc::harness::rewrite;
 use libfuzzer_sys::fuzz_target;
-
-/// A PDU read is written back and reads the same, unless the writer's
-/// padding or reserved fields make it longer than a fragment.
-fn rewrite(pdu: &Pdu) {
-    contract::check_wire_value(pdu);
-    match pdu.to_bytes() {
-        Ok(bytes) => {
-            assert!(bytes.len() <= MAX_FRAG);
-            assert_eq!(Pdu::parse(&bytes), Ok(pdu.clone()));
-        }
-        Err(e) => {
-            assert_eq!(e, Error::Unwritable);
-            let mut bare = pdu.clone();
-            let auth = bare
-                .auth
-                .take()
-                .expect("only auth padding can exceed the limit");
-            let reserved = if matches!(bare.body, Body::Auth3) {
-                bare.body = Body::Shutdown;
-                4
-            } else {
-                0
-            };
-            let length = bare.to_bytes().unwrap().len() + reserved;
-            let (alignment, padded) = pdu
-                .body
-                .stub()
-                .map_or((4, length), |stub| (AUTH_PAD_ALIGN, stub.len()));
-            let padding = (alignment - padded % alignment) % alignment;
-            assert!(length + padding + SEC_TRAILER_LEN + auth.value.len() > MAX_FRAG);
-        }
-    }
-}
 
 fn syntax(u: &mut Unstructured) -> Result<SyntaxId> {
     Ok(SyntaxId { uuid: Uuid(u.arbitrary()?), major: u.arbitrary()?, minor: u.arbitrary()? })

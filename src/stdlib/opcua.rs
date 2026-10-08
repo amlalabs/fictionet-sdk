@@ -3555,8 +3555,33 @@ impl From<Truncated> for Error {
     fn from(_: Truncated) -> Self { Error::End }
 }
 
+/// Checks shared by this module's tests and its fuzz target.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod harness {
+    use super::{Binary, Error, Reader};
+    use fictionet::stdlib::codec::Wire;
+
+    /// Checks permissive reads, including unwritable reserved Variant types.
+    pub fn check_reader<T: Binary + Wire<WriteError = Error> + PartialEq + core::fmt::Debug>(
+        data: &[u8],
+    ) {
+        let mut reader = Reader::new(data);
+        if let Ok(value) = reader.read::<T>()
+            && reader.finish().is_ok()
+        {
+            match value.to_bytes() {
+                Ok(bytes) => assert_eq!(<T as Wire>::parse(&bytes).unwrap(), value),
+                Err(Error::VariantValue) => {}
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::harness::check_reader;
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Lcg, Stream, pump,
@@ -5843,23 +5868,7 @@ mod tests {
         assert_eq!(Wire::to_bytes(&h), Err(Error::Unwritable));
     }
 
-    /// Checks permissive reads, including reserved Variant types that cannot be written.
-    fn check_reader<T: Binary + Wire<WriteError = Error> + PartialEq + core::fmt::Debug>(
-        bytes: &[u8],
-    ) {
-        let mut reader = Reader::new(bytes);
-        if let Ok(value) = reader.read::<T>()
-            && reader.finish().is_ok()
-        {
-            match value.to_bytes() {
-                Ok(bytes) => assert_eq!(<T as Wire>::parse(&bytes).unwrap(), value),
-                Err(Error::VariantValue) => {}
-                Err(error) => panic!("{error}"),
-            }
-        }
-    }
-
-    #[test]
+        #[test]
     fn fuzz_loop() {
         let mut rng = Lcg::new(0x5e_ed0f_0bca);
         let seeds = samples();

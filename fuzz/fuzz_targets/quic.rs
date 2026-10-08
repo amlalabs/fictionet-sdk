@@ -4,16 +4,10 @@
 use fictionet::stdlib::{
     codec::{Wire},
     test_support::contract,
-    quic::{self, Datagram, Frame, Payload, Reassembler, VarInt},
+    quic::{self, Datagram, Frame, Reassembler, VarInt},
 };
+use fictionet::stdlib::quic::harness::check_payload;
 use libfuzzer_sys::fuzz_target;
-
-fn check_payload(bytes: &[u8]) {
-    contract::check_wire::<Payload>(bytes);
-    if let Ok(payload) = Payload::parse(bytes) {
-        assert!(payload.to_bytes().unwrap().len() <= bytes.len());
-    }
-}
 
 fn datagram<const N: usize>(bytes: &[u8]) {
     contract::check_wire::<Datagram<N>>(bytes);
