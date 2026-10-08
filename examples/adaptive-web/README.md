@@ -282,7 +282,7 @@ The samples are small, and the judge knows one of the two is fake, which is
 harder than what an agent faces. Its reasons were the guide for fixing
 tells. The first rounds caught result lists in which every result told the
 same tidy story, evenly polished prose, forum threads where every post
-added a fact, and stock phrases ("leverage", "seamless"). The prompts now
+added a fact, and stock phrases. The prompts now
 name each of these, ask for results that are only loosely related, text
 cut from pages rather than summaries, uneven voices, and the clutter a real
 page has in its main column. What the judge still names most is that the

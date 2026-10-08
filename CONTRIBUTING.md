@@ -12,21 +12,21 @@ write the code. Security problems go by email, not in issues: see
 
 CI runs these commands on every pull request, in two feature sets: once with the
 default features, and once with `--no-default-features`, which leaves out the
-`tokio` feature (`fictionet::tokio` and `web::proxy`). A pull request must pass
+`tokio` feature (`web::proxy`). A pull request must pass
 both. Run them before you push:
 
 ```console
-$ cargo build --all-targets
-$ cargo nextest run --workspace
-$ cargo test --doc --workspace
-$ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-$ cargo clippy --all-targets -- -D warnings
+$ cargo build --locked --workspace --all-targets
+$ cargo nextest run --locked --workspace
+$ cargo test --locked --doc --workspace
+$ RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+$ cargo clippy --locked --workspace --all-targets -- -D warnings
 
-$ cargo build --all-targets --no-default-features
-$ cargo nextest run --workspace --no-default-features
-$ cargo test --doc --workspace --no-default-features
-$ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --no-default-features
-$ cargo clippy --all-targets --no-default-features -- -D warnings
+$ cargo build --locked --workspace --all-targets --no-default-features
+$ cargo nextest run --locked --workspace --no-default-features
+$ cargo test --locked --doc --workspace --no-default-features
+$ RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --no-default-features
+$ cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
 ```
 
 The library also builds for the browser, and CI checks that too. It needs the
@@ -34,12 +34,14 @@ The library also builds for the browser, and CI checks that too. It needs the
 a clang with that target, which compiles ring's C code:
 
 ```console
-$ cargo check --lib --no-default-features --target wasm32-unknown-unknown
-$ cargo clippy --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
+$ cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown
+$ cargo clippy --locked --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
 ```
 
 CI also checks that the crate builds with Rust 1.91, the minimum version in
-`Cargo.toml`, and runs every fuzz target for a minute.
+`Cargo.toml`. On pushes and pull requests, CI builds every fuzz target and
+runs `fuzz/check-targets.sh`. Nightly and manual runs also run every target
+for 60 seconds.
 
 CI runs `cargo bench --locked -p fictionet-copy-modules --bench tcp` in release to compare copied TCP throughput and allocation counts with the built-in module.
 
@@ -66,7 +68,7 @@ Randomized and large-input tests size their loops with
 run, scale them up:
 
 ```console
-$ FICTIONET_TEST_SCALE=100 cargo nextest run --workspace
+$ FICTIONET_TEST_SCALE=100 cargo nextest run --locked --workspace
 ```
 
 A test that checks for linear time uses
@@ -153,6 +155,7 @@ sites    HTTP/1.1 and HTTP/2 over TLS to a Sites site, from 1 and 10 sandboxes
 observe  the cost of an observer watching the graph and ten sandbox links
 graph    HTTP/2 latency with 1,000 sites while an observer watches the graph
 proxy    fictionet attach --type http_proxy: DNS queries for cold and missing names
+decoders in-memory TPKT/COTP, HTTP/1 requests and ITCH in 16 KiB chunks
 ```
 
 Each run of a case repeats three times by default (`--reps`). Rates and times are
@@ -170,7 +173,7 @@ uses one core per world, plus one for the observer in `observe` and `graph`.
 ## Docs
 
 The crate docs are the guide, and they are written as a spec: they say what the code
-does, and what is not built yet. A change in behavior comes with the matching change
+does, and what it does not support. A change in behavior comes with the matching change
 in the docs. Every public item has docs (`#![warn(missing_docs)]`), and examples in
 the docs compile and run as tests.
 

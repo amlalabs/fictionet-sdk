@@ -1,27 +1,36 @@
-//! Bounded byte decoders, wire values, and the driver that runs them.
-//! [`Reader`] checks byte reads and keeps its position on truncation.
+//! Bounded byte decoders, wire values, and the stream that drives them.
 //!
-//! A [`Decode`] reads a slice and returns a [`Step`]. It owns state, but
-//! never keeps unread input. [`Stream`] owns that input in one [`Buffer`].
-//! [`pump`] accepts chunks and reports the accepted count. [`finish`] marks EOF.
-//! After `End`, use [`Stream::swap`] and push the unaccepted slice to it.
-//! Buffered unread bytes are kept for the new decoder. Direct [`Stream::push`]
-//! takes and drops new bytes after EOF or completion.
-//! Errors are returned once and kept by [`Stream::failed`]. Driving a stream
-//! requires a cloneable error so both the caller and stream can own it.
+//! Every protocol module in the stdlib is built from these pieces. A
+//! [`Decode`] is a framer. It reads a slice of unread input and returns a
+//! [`Step`]: an item and how many bytes it used, a request for more bytes,
+//! or the end. A decoder may keep state, but it never keeps input.
+//! [`Stream`] keeps the unread input in one [`Buffer`] and drives a
+//! decoder over it. [`pump`] pushes a chunk of bytes and says how many it
+//! took. [`finish`] marks the end of input and delivers the items left.
+//! When a decoder ends the stream, [`Stream::swap`] hands the unread bytes
+//! to the next decoder, as when a protocol switches to TLS. A stream
+//! reports an error once and then keeps it in [`Stream::failed`], so its
+//! decoder's error type must be `Clone`.
 //!
-//! [`Wire`] reads one complete value and writes it without changing its
-//! meaning. [`Map`] interprets each item, [`Assemble`] joins fragments, and
-//! [`Pipe`] feeds selected outer payloads into an inner decoder. [`Lines`]
-//! and [`Collect`] cover lines and values that end at EOF. [`Frames<T>`]
-//! frames values through their [`Prefixed`] parser and protocol limits. [`Spans`] records
-//! bounded provenance; [`Demux`] shares a budget across keyed streams.
+//! A [`Wire`] value reads one complete message from a slice and writes it
+//! back. [`Reader`] is the byte cursor that parsers use. A read past the end
+//! fails and leaves its position where it was. [`Frames<T>`] frames a
+//! stream of values whose length a [`Prefixed`] parser can tell from their
+//! first bytes. [`Lines`] splits lines, and [`Collect`] reads one value
+//! that ends at the end of input.
 //!
-//! This module uses only `core` and `alloc`. No function here performs
-//! I/O, reads a clock, or uses global state. The driver that runs a
-//! decoder over a connection is [`serve`](super::serve), outside this
-//! module. [`Interceptor`], [`Recorder`], and [`Faults`] operate on any
-//! decoder's items and original bytes.
+//! The combinators build bigger decoders from smaller ones. [`Map`] changes
+//! each item. [`Assemble`] joins fragments into one message. [`Pipe`] feeds
+//! the payloads of an outer decoder into an inner one, and [`Spans`] maps
+//! the inner bytes back to where they came from. [`Demux`] runs one stream
+//! per key, such as one per HTTP/2 stream, under one shared budget.
+//! [`Interceptor`] lets a caller drop, replace or repeat each item's bytes.
+//! [`Recorder`] keeps each item with the bytes it came from. [`Faults`]
+//! applies a plan of byte and item faults. All three work with any decoder.
+//!
+//! The code outside tests uses only `core` and `alloc`. Nothing here does
+//! I/O, reads a clock or uses global state. [`serve`](super::serve) runs a
+//! decoder over a live connection.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Decode, Step, Stream, pump, finish};

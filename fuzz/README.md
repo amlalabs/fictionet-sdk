@@ -16,13 +16,16 @@ cargo +nightly fuzz list
 
 ## The targets
 
-`cargo +nightly fuzz list` names them. A target named for a stdlib module
-feeds that module, and the Fuzz column of the module catalog in
-[`src/stdlib/mod.rs`](../src/stdlib/mod.rs) marks every module that has
-one. The rest feed the layers under the stdlib: the relay protocol,
-packets and IP reassembly, the TCP/IP stack, `serve` and `web`, the
-observe decoders and the proxy doors. Each target's source in
-`fuzz_targets/` shows what it builds from the input.
+`cargo +nightly fuzz list` names every target. The **Fuzz** column in
+[the stdlib catalog](../src/stdlib/mod.rs) lists targets by module.
+The targets with no stdlib module are:
+
+- [`codegen_ir`](fuzz_targets/codegen_ir.rs) checks generated recursive values and stream frames.
+- [`packets`](fuzz_targets/packets.rs) checks IP protocol sorting, ICMP echo replies and DHCP messages.
+- [`proxy_http`](fuzz_targets/proxy_http.rs) checks HTTP proxy request heads, authentication and response heads.
+- [`proxy_socks5`](fuzz_targets/proxy_socks5.rs) checks SOCKS5 greetings, authentication and requests across chunk boundaries.
+- [`relay`](fuzz_targets/relay.rs) checks relay message decoding and encoding.
+- [`stack`](fuzz_targets/stack.rs) feeds IPv4 and IPv6 packets to TCP, UDP and ICMP endpoints.
 
 The proxy targets call the doors' protocol side in
 `fictionet::relay::proxy`, the same code the `fictionet` binary runs over
@@ -63,7 +66,7 @@ On a system whose default target is not `x86_64-unknown-linux-gnu`, add
 `--target x86_64-unknown-linux-gnu`: the sanitizer does not work with
 musl's static libc.
 
-To run every target in turn, as CI does, for some seconds each:
+To run every target in turn for some seconds each, as nightly and manual CI runs do:
 
 ```sh
 cargo +nightly fuzz build -O -a
@@ -72,7 +75,7 @@ fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
 
 It goes on past a target that fails and lists the failures at the end.
 Every target needs a `[[bin]]` in `fuzz/Cargo.toml` and a directory in
-`fuzz/corpus/`, even an empty one; `fuzz/check-targets.sh` checks both,
+`fuzz/corpus/`, even an empty one. `fuzz/check-targets.sh` checks both,
 and CI runs it.
 
 The `tcp` target never sleeps by default, which keeps it fast. To reach

@@ -58,8 +58,9 @@ from this repository.
 $ demos/web
 ```
 
-One command, with no root and no Docker on your machine: it needs only QEMU and
-KVM. It boots a small Debian VM, builds Fictionet inside it, and shows a sandbox
+The demo needs no root or Docker on your machine. It needs QEMU, KVM and
+[the host tools listed in vm/README.md](vm/README.md#the-fictionet-vm).
+It boots a small Debian VM, builds Fictionet inside it, and shows a sandbox
 using a world of websites with `dig`, `curl` and `ping`. The first run downloads
 and prepares the VM image, which takes a few minutes. [demos/](demos/README.md)
 has more: the proxy types, Kubernetes, and the BGP hijack from the Border eval
@@ -262,17 +263,9 @@ Start at the crate root, which explains the main ideas, then read in this order:
 
 ## Building and testing
 
-```console
-$ cargo build --all-targets
-$ cargo nextest run --workspace
-$ cargo test --doc --workspace
-$ cargo clippy --all-targets -- -D warnings
-```
-
-CI runs the same commands a second time with `--no-default-features`, which
-leaves out the `tokio` feature. The Docker tests in `tests/docker/` and the
-Kubernetes test in `tests/k8s/` each have a `run.sh` that builds, checks and
-cleans up. [CONTRIBUTING.md](CONTRIBUTING.md) lists every check.
+[CONTRIBUTING.md](CONTRIBUTING.md) lists the build, test and documentation
+checks for both default features and `--no-default-features`, as well as
+the Docker and Kubernetes tests.
 
 ## License
 

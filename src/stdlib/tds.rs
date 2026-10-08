@@ -20,7 +20,8 @@
 //! Nothing here reads a socket. A world reads packets with
 //! [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), or uses [`Messages`] in that
 //! driver to assemble packets through EOM. It reads message data as
-//! [`Prelogin`], [`Login7`], or [`SqlBatch`]. It answers with [`Prelogin`]
+//! [`Prelogin`], [`Login7`], or [`SqlBatch`]. This module does not read
+//! RPC requests. Their message data stays as bytes. It answers with [`Prelogin`]
 //! or a [`TokenStream`]. World code decides which users, databases, and
 //! tables exist and what queries return. A client can use [`TokenReader`]
 //! to follow tokens and carry column metadata across responses.

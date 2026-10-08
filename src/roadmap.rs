@@ -238,8 +238,8 @@
 //!
 //! A world is its own program (see [`running`](crate::running)). The
 //! `fictionet` binary attaches sandboxes and observes worlds, with the
-//! commands `attach`, `ready`, `observe` and `dashboard`, but does not run
-//! one. `fictionet --world` will start a world, written in Rust or Python,
+//! commands `attach`, `ready`, `wait-blocked`, `observe` and `dashboard`,
+//! but does not run one. `fictionet --world` will start a world, written in Rust or Python,
 //! and pass it its arguments:
 //!
 //! ```text

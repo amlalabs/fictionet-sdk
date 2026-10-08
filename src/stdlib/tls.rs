@@ -10,7 +10,7 @@
 //!
 //! Certificates are not Fictionet's concern. The world builds an ordinary
 //! rustls [`ServerConfig`] from whatever it likes, usually files named in its
-//! `args`. Fictionet never reads files or issues certificates.
+//! `args`. This module does not read certificate files or issue certificates.
 //!
 //! The handshake has two steps, so the world can decide how to answer after
 //! it sees what the client asked for. [`server`] reads the client's hello,

@@ -10,7 +10,7 @@ attach images instead of images built from the repository.
     inspect eval examples/web_eval.py --model mockllm/model -T backend=k8s -T agent_image=<image>
 
 On Kubernetes, the agent's image must be one the cluster can pull or
-already has, such as tests/k8s/agent.Dockerfile built and loaded into kind.
+already has, such as the agent stage of deploy/Dockerfile built and loaded into kind.
 """
 
 from pathlib import Path

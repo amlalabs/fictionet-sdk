@@ -16,7 +16,8 @@
 //! one or more fragments behind a 4-byte record mark. A client finds which
 //! port a program listens on by asking the portmapper (version 2) or
 //! rpcbind (versions 3 and 4) on port 111. This module follows RFC 4506
-//! for XDR, RFC 5531 for ONC RPC and record marking, and RFC 1833 for
+//! for XDR and RFC 5531 for ONC RPC and record marking. The
+//! [`portmap`](fictionet::stdlib::portmap) module follows RFC 1833 for
 //! portmap and rpcbind.
 //!
 //! For TCP, [`Stream<Fragments>`](fictionet::stdlib::codec::Stream) reads record

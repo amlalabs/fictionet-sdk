@@ -240,8 +240,7 @@
 //!   - a site without `tls`: served over plain HTTP on 80. A TLS handshake
 //!     for its name on 443 is rejected with `unrecognized_name`.
 //! - **HTTP/1.0, HTTP/1.1 and HTTP/2** on every connection: HTTP/1 with
-//!   [`httpd::Http1`], HTTP/2 with hyper for
-//!   now. Over TLS, the
+//!   [`httpd::Http1`], HTTP/2 with hyper. Over TLS, the
 //!   version is agreed in the handshake (ALPN): `serve` sets the ALPN list
 //!   of each config to `h2` and `http/1.1`, so a browser gets HTTP/2 and
 //!   `curl` gets what it asks for. Without TLS, the version is read from the

@@ -43,9 +43,8 @@ the segment, such as DHCPv6 spoofing with mitm6, are outside this lab.
 Fictionet is the only data path between members, so the dashboard and observers
 see the real packets, and link controls such as delay, loss and capture can be
 inserted later. A packet for an address with no member, or for another subnet,
-is dropped, and the LAN notes each drop with its reason while the dashboard
-or another observer is connected. This world adds no gateway, so the lab has
-no route to the host or the internet. A world that wants one gives the LAN a
+is dropped, and the LAN records each drop with its reason in the run's events.
+This world adds no gateway, so the lab has no route to the host or the internet. A world that wants one gives the LAN a
 gateway with `Lan::gateway` and puts a `route::router` behind it.
 
 The boundary is Ethernet-only behavior. Attach terminates ARP and does not pass
@@ -153,7 +152,5 @@ $ target/release/fictionet dashboard \
     --listen 127.0.0.1:7878
 ```
 
-The next integration milestone is a QEMU-based GOAD provisioner that produces
-the clean Windows snapshots consumed here. It belongs beside this example, but
-it should remain separate from the runtime LAN so one provisioned snapshot can
-be reset and reused for many deterministic eval runs.
+This example consumes provisioned Windows disks. It includes no QEMU-based
+GOAD provisioner.

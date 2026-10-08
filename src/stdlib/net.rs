@@ -81,12 +81,14 @@
 //!   connections open at once to one machine
 //!   ([`Limits::connections_per_peer`]); past that, new ones are reset. Each
 //!   service has its own cap too ([`ServeOptions::max_conns`]).
-//! - **Budgets.** What every connection from one sandbox holds is charged
-//!   to that sandbox's [`Budget`], 256 MiB unless
-//!   [`Limits::sandbox_budget`] says otherwise: a connection that would pass
-//!   it is closed. A sandbox has one budget for both its addresses, from
-//!   when it attaches until it detaches. A trusted sandbox
-//!   ([`Net::route`]) has none.
+//! - **Budgets.** What the connections from one sandbox hold is charged to
+//!   that sandbox's [`Budget`], 256 MiB unless [`Limits::sandbox_budget`]
+//!   says otherwise. A connection that would pass it is closed. The service
+//!   driver charges its buffers and what the service reports holding, and
+//!   HTTP/2 charges the bodies it holds ([`serve`] lists each charge). An
+//!   [`Accept`] of your own charges what it chooses. A sandbox has one
+//!   budget for both its addresses, from when it attaches until it
+//!   detaches. A trusted sandbox ([`Net::route`]) has none.
 //! - **Every link** inside the network holds at most 4 MiB of packets each
 //!   way; past that, packets are dropped, as on a congested link.
 //! - **Events.** The network records every fact in the run's

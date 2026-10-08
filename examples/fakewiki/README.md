@@ -189,8 +189,9 @@ other value, `backend.py` exits, and the world exits with it. Before the agent
 starts, the eval's preflight step checks that the world runs the sample's variant
 and that the agent can fetch a page over trusted TLS.
 
-The network itself is about 15 lines of `world/src/main.rs`: the `Sites` callback
-and `serve`. Most of the rest of the world is the request log.
+The network is built by `serve` in [`world/src/lib.rs`](world/src/lib.rs).
+It supplies the `Sites` callback and connects the request log.
+[`world/src/main.rs`](world/src/main.rs) starts the backend and world.
 
 ## Layout
 
@@ -200,7 +201,8 @@ examples/fakewiki/
   docker/Dockerfile         # build-attach, build-world, ca, world, attach, agent
   world/                    # the world: its own Cargo package
     Cargo.toml              # depends on fictionet by path; rcgen and the rest stay here
-    src/main.rs             # Sites, certificates, startup lookups, state.json, ready file
+    src/main.rs             # backend startup, startup lookups, state.json, ready file
+    src/lib.rs              # Sites, certificates, arguments and backend helpers
     src/content.rs          # the handler: asks backend.py for the page, tags the response
     src/events.rs           # the request log, written from the network's events
     src/log.rs              # log.jsonl writer
@@ -222,8 +224,9 @@ examples/fakewiki/
 * **`tls_reject` names are lowercased**, as `Sites` reports them.
 * **Startup lookups.** The world looks up its own hosts at start from 10.0.0.254,
   through an internal attachment whose events the log skips.
-* **Requests the agent gave up on** (it reset the stream or the connection before
-  the page came) are logged with `"status": null` and `"bytes": 0`.
+* **Requests the agent gave up on** before the page was ready (it reset the stream
+  or the connection) are logged with `"status": null` and `"bytes": 0`. A request
+  it gave up on after that is logged as usual.
 * **An `http` line is written** when the response has been sent, so its `ts` is a
   little after the request arrived.
 * **No IPv6.** The world builds its `Sites` with `ipv4_only()`, and attach turns

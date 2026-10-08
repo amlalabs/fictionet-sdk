@@ -92,9 +92,10 @@ pub const MAX_BLOCKED_BYTES: usize = 1 << 20;
 /// [`MAX_BLOCKED_BYTES`]. One stream may have several, such as a header and
 /// a trailer section.
 pub const MAX_BLOCKED_SECTIONS: usize = 4 * MAX_BLOCKED_STREAMS;
-/// The longest encoder stream instruction: a byte, two integers and two
-/// strings. A reader of either stream holds at most this many bytes of an
-/// unfinished instruction, plus at most this many more while it reads.
+/// The maximum encoded size of an encoder stream instruction, including
+/// its integer prefixes and strings. This is the capacity of
+/// [`Frames<EncoderInstruction>`]. The decoder keeps no input.
+/// [`Stream`](fictionet::stdlib::codec::Stream) owns the buffered bytes.
 pub const MAX_INSTRUCTION: usize = 2 * (10 + MAX_STRING);
 /// Maximum encoded prefixed integer: one prefix byte and nine continuation bytes.
 /// Every decoder-stream instruction consists of exactly one such integer.

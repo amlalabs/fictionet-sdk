@@ -16,7 +16,7 @@ cleanup
 step "Start the world"
 note "The world is the web_world example: an ordinary Rust program built on web::Sites."
 note "It serves example.test over HTTPS with a CA it makes at start, plain.test over HTTP,"
-note "and nothing else. It listens on a Unix socket; it has no network of its own."
+note "and www.example.test, shared.test, v4only.test and v6only.test. Other names fail."
 mkdir -p /run/fictionet
 chmod 700 /run/fictionet
 web_world /run/fictionet/world.sock /run/fictionet/ca.pem >/run/world.log 2>&1 &

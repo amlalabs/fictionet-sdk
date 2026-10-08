@@ -83,8 +83,10 @@ A service can also:
   as a TLS server with `ServeOptions::starttls` and calls `on_open` again
   over TLS (`driver.conn().tls` is then true): STARTTLS in SMTP, IMAP and
   LDAP, and Postgres's `SSLRequest`. `Upgrade::Decoder` goes on with a
-  fresh decoder; `Upgrade::Handoff` hands the connection and its unread
-  bytes back to whoever called `serve`.
+  fresh decoder. `Upgrade::Handoff` hands the connection and its unread
+  bytes back to whoever called `serve`. A port served with `Host::tcp`
+  or `tcp_with` closes such a connection. To go on with it, serve the port
+  with an `Accept` of your own, as `httpd::Server` does.
 - **Say what it holds.** `Service::held` reports bytes the service keeps
   for the connection, such as a request body, and `Pending::held` what
   deferred work keeps, such as a response body not yet written. They
@@ -184,8 +186,10 @@ address with no host answers "host unreachable", and a closed port a RST.
 
 Other kinds of port:
 
-- `tcp_with(port, world, make, opts)`: the same with `ServeOptions`: a
-  connection cap, an idle limit, a fault plan, a STARTTLS config.
+- `tcp_with(port, world, make, opts)`: the same, with `ServeOptions` for
+  a connection cap, an idle limit, a fault plan or a STARTTLS config.
+  Setting `opts.connection_events` to false turns the `conn.open` and
+  `conn.close` events off.
 - `udp(port, world, make)`: one service for the port, which gets every
   datagram, each decoded on its own as DNS and Modbus over UDP frame their
   messages. It can send several datagrams to anyone (`driver.send_to`) and
@@ -197,13 +201,19 @@ Other kinds of port:
 - `accept(port, accept)` and `tls_accept(port, sni, config, accept)`: an
   `Accept` of the world's own. HTTP is one: `httpd::Server`, below.
 
-Each sandbox may hold 256 connections at once to one machine, and the
-bytes its connections hold together, read or waiting to be written, are
-charged to its budget (256 MiB);
-`Net::limits` changes these and the handshake and DNS timers. Tests set
-small ones. `Net::seed` seeds every service's randomness, mixed with each
-connection's number, so a run whose connections arrive in the same order
-repeats.
+Each sandbox may hold 256 connections at once to one machine. What its
+connections hold is charged to one budget per sandbox, 256 MiB by default.
+The driver counts each connection's read buffer or its decoder's capacity,
+whichever is larger, the input its decoder has not used yet, queued
+replies, and what the service and its deferred work report holding.
+Memory outside those counts, such as hyper's own buffers, is not charged.
+`Net::limits` changes these limits and the TLS handshake and DNS timers.
+Its handshake timer also applies to STARTTLS. Tests set small ones.
+`Net::seed` seeds every service's randomness. A TCP service mixes it with
+the connection's number, and a UDP service with its port. So a run whose
+connections arrive in the same order draws the same numbers. On HTTP/2,
+the streams of one connection share its generator, so their handlers
+must also run in the same order.
 
 `Net::lan(name, prefix)` adds an IP subnet that hosts join with
 `Host::on(name)` and real virtual machines with
@@ -264,11 +274,12 @@ itself knows nothing of HTTP, so a copy of `httpd` with its own handlers
 plugs in the same way.
 
 `Http1` speaks HTTP/1.0 and 1.1 on the stdlib's `http1` decoder. HTTP/2
-runs on hyper behind the same `Handler` trait until the stdlib's own
-HTTP/2 lands; handlers will not change. Both versions share one set of
-`httpd::Limits` (body size, body and write timers, and 100 streams at
-once on an HTTP/2 connection), charge what they hold to the sandbox's
-budget, and draw a handler's randomness from the connection's seed.
+runs on hyper, behind the same `Handler` trait. The stdlib's `http2`
+module reads and writes HTTP/2 frames and tracks a session's state, but it
+does not serve. Both versions share one set of `httpd::Limits`: body size,
+body and write timers, and 100 streams at once on an HTTP/2 connection.
+Both charge the request and response bodies they hold to the sandbox's
+budget, and both draw a handler's randomness from the connection's seed.
 
 Each request is one `http.request` event. Its `sent` field counts the
 body bytes the connection took, and `complete` says whether it took all

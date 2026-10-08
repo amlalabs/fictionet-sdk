@@ -6,30 +6,27 @@ it. Regenerate only when you choose to replace those edits. The generated
 file has no dependency on the generator at runtime.
 
 The generator has a shared IR, a validator, one Rust emitter, and a
-front end per input format. Two front ends exist: `ir` reads the IR
+front end per input format. Only two front ends exist: `ir` reads the IR
 itself as JSON, and `sbe` reads FIX Simple Binary Encoding 1.0 XML
 message schemas. The IR describes ordered binary layouts: structs with
 optional byte offsets, blocks whose wire length comes from a header,
 headers of unsigned fields with roles, and unions selected by a header
-tag. Front ends for other schema languages, such as FIX, FAST, XDR,
-protobuf, ASN.1, OpenAPI and JSON Schema, are planned and not written.
-Each would parse its schema into this IR, and the IR would gain encoding
-forms for tagged fields, varints and text when the first of them needs
-them.
+tag. A new front end parses its schema into
+this IR, as described in [Library and new front ends](#library-and-new-front-ends).
 
 ## Generate and use a module
 
 From the SDK checkout:
 
 ```sh
-CARGO_BUILD_JOBS=4 cargo run -p fictionet-codegen -- --list
-CARGO_BUILD_JOBS=4 cargo run -p fictionet-codegen -- ir schema.json -o orders.rs
-CARGO_BUILD_JOBS=4 cargo run -p fictionet-codegen -- sbe templates.xml -o market.rs
+cargo run -p fictionet-codegen -- --list
+cargo run -p fictionet-codegen -- ir schema.json -o orders.rs
+cargo run -p fictionet-codegen -- sbe templates.xml -o market.rs
 ```
 
 The equivalent spelling is `--format ir schema.json -o orders.rs`.
 `ir` accepts exactly one JSON document, and `sbe` exactly one XML schema. The registry API accepts a list
-of inputs so future formats can support imports and multiple files.
+of inputs for front ends that read multiple files.
 The generator reads local files only. It uses no network, external
 formatter, build script, proc macro, or third-party library.
 
@@ -90,7 +87,9 @@ input before reserving the checked count. Zero-byte entries still use
 the node and allocation budgets. Allocation budgets refer to requested
 storage; allocator bookkeeping is outside the budget.
 Writers stage at most `MAX_MESSAGE` bytes, with vector growth bounded by
-twice that number. Frame writers also stage at most 264 header bytes.
+twice that number. Frame writers also stage at most 264 header bytes
+for the magic and length prefix. This runtime limit is separate from
+`ir::MAX_HEADER`, which bounds structured headers to 256 bytes.
 The caller owns and budgets the destination vector across multiple
 writes. Allocation failures from fallible reservations are typed errors.
 
@@ -98,7 +97,7 @@ Generator limits are fixed and exported from `fictionet_codegen::ir`:
 
 | Constant | Limit |
 | --- | ---: |
-| `MAX_INPUT` | 1 MiB per JSON input; CLI also checks the total |
+| `MAX_INPUT` | 1 MiB per JSON or XML input. The CLI also checks the total. |
 | `MAX_JSON_DEPTH` | 64 active JSON values |
 | `MAX_JSON_ELEMENTS` | 65,536 values plus object keys |
 | `MAX_TYPES` | 256 named types and 256 stream forms |
@@ -342,8 +341,9 @@ The front end refuses, with `Unsupported`, primitive arrays other than
 `char` and `uint8`, optional floats (their null is NaN), optional
 composite fields, and header or dimension composites with `numGroups` or
 `numVarDataFields`. Other schema errors are `SchemaShape`, `InvalidName`,
-`DuplicateName`, `UnknownReference`, or `InvalidSize`, with the input
-name and the element path in the location.
+`DuplicateName`, `UnknownReference`, or `InvalidSize`. `IrLimit` reports
+an IR bound exceeded during conversion. Errors include the input name
+and the element path in the location.
 
 `stdlib::cme_mdp3` is generated this way from CME's public MDP 3.0
 schema, kept at `data/cme/templates_FixBinary.xml`. The generated code is
@@ -353,7 +353,7 @@ the generator's output. To regenerate the generated part and keep the
 hand-written tail:
 
 ```sh
-CARGO_BUILD_JOBS=4 BLESS_CODEGEN=1 cargo test --test sbe_codegen module_is
+BLESS_CODEGEN=1 cargo test --test sbe_codegen module_is
 ```
 
 ## Rust identifiers
@@ -441,9 +441,7 @@ numbers, enums, fixed opaque bytes, counted arrays, and four-byte optional
 flags. `tests/codegen.rs` builds its equivalent IR, checks the emitted
 source, and compares the generated reads and writes with `onc_rpc::Reader`
 and `Writer` over sample values, Lcg-generated values, mutated bytes, and
-arbitrary bytes. A protobuf or ASN.1 front end would need the tagged
-encodings the IR does not have yet, and the same kind of comparison
-against `stdlib::protobuf` and `stdlib::asn1`.
+arbitrary bytes.
 
 Goldens live in `codegen/tests/golden`. The `blocks` example covers
 offsets, blocks, block groups, unions, ranges, constants, and enum nulls;
@@ -453,8 +451,8 @@ checks in `tests/codegen.rs`. Additional fixtures check small allocation and
 work budgets, long identifiers, and maximum-sized stream headers. To update:
 
 ```sh
-CARGO_BUILD_JOBS=4 BLESS_CODEGEN=1 cargo test -p fictionet-codegen --test golden goldens_and_determinism
-CARGO_BUILD_JOBS=4 cargo test --workspace --tests
+BLESS_CODEGEN=1 cargo test -p fictionet-codegen --test golden goldens_and_determinism
+cargo test --workspace --tests
 ```
 
 The bless command also updates the checked-in example fuzz target.
@@ -462,7 +460,7 @@ Review changes to both the schema and its golden before accepting them.
 To emit another target:
 
 ```sh
-CARGO_BUILD_JOBS=4 cargo run -p fictionet-codegen -- ir schema.json -o protocol.rs --fuzz fuzz/fuzz_targets/protocol.rs
+cargo run -p fictionet-codegen -- ir schema.json -o protocol.rs --fuzz fuzz/fuzz_targets/protocol.rs
 ```
 
 Output paths are checked against every input and each other before any

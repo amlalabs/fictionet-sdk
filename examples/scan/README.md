@@ -28,9 +28,9 @@ at its fixed address, so the scanner can reach it:
 Each simulated machine is a `Host` with a small `Service` on each open
 port (`serve::Service`): one sends a banner when a client connects, the
 other answers each HTTP request with a page. The banners are what the real
-programs send, so `nmap -sV` names them. `Net` gives every machine a
-machine of its own: a `tcp::endpoint`, a `udp::endpoint` with no ports
-open, and ping replies. Ports with no service need no code: the stdlib's
+programs send, so `nmap -sV` names them. `Net` gives every `Host` its own
+network endpoints: a `tcp::endpoint`, a `udp::endpoint` with no ports open,
+and ping replies. Ports with no service need no code: the stdlib's
 TCP answers a SYN to a closed port with a RST, as a kernel does, and an
 address with no host gets "host unreachable".
 

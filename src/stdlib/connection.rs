@@ -65,7 +65,7 @@ pub trait Datagram: Send + 'static {
 ///
 /// For libraries that expect tokio's `AsyncRead` and `AsyncWrite`, such as
 /// hyper and axum, call `conn.into_tokio(&fcx)` from the `fictionet::tokio`
-/// module (feature `tokio`).
+/// module.
 ///
 /// A connection knows nothing about addresses. To see who connected, ask
 /// the TCP connection underneath:
@@ -84,6 +84,11 @@ pub trait Connection: Send + 'static {
 
     /// Polls to write some of `data`. Returns how many bytes were taken.
     /// Pending while there is no room.
+    ///
+    /// After `Poll::Pending`, call again with the same bytes until the call
+    /// returns `Poll::Ready`. A layer may already hold those bytes while it
+    /// waits for the connection underneath. A TLS connection, for example,
+    /// has encrypted them and reports them taken once they are sent.
     ///
     /// Never returns `Ok(0)` when `data` is not empty: a connection that can
     /// take no more bytes ever returns an error instead.

@@ -808,8 +808,12 @@ pub enum Reject {
 impl Header {
     /// Reads the header of a whole packet, whose length fields fit the
     /// bytes present. `None` if it is not IPv4 or IPv6, or is cut short.
-    /// IPv6 extension headers are walked, not checked: see
-    /// [`Header::check`] for that.
+    /// Walks IPv6 Hop-by-Hop Options, Destination Options, Routing,
+    /// Fragment and Authentication headers. The walk stops after a
+    /// non-first fragment or at any other next-header value, including
+    /// ESP. It checks header lengths but not their contents. An extension
+    /// cut short leaves no upper-layer protocol. See [`Header::check`]
+    /// for validation.
     #[inline]
     pub fn parse(packet: &[u8]) -> Option<Header> {
         Header::read(packet, false)
@@ -817,7 +821,8 @@ impl Header {
 
     /// Reads a header that may be followed by fewer bytes than its length
     /// field says, as the copy of a packet inside an ICMP error is, or a
-    /// packet a world logs without trusting.
+    /// packet a world logs without trusting. Walks the same IPv6 extension
+    /// headers as [`Header::parse`], stopping at an incomplete header.
     #[inline]
     pub fn parse_truncated(packet: &[u8]) -> Option<Header> {
         Header::read(packet, true)

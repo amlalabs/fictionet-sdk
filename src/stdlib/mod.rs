@@ -154,9 +154,12 @@
 //!
 //! ## Copy and own
 //!
-//! Copy any implementation file from `src/stdlib/` into your crate, edit it,
-//! and plug it in through public traits; codec traits stay in [`codec`].
-//! The fixture in `tests/copy_and_own` compiles these files using public imports.
+//! Every file in `src/stdlib/` uses only public items. The crate root's
+//! `extern crate self as fictionet` makes `fictionet::` imports work both
+//! here and in your crate. Copy a file, edit it, and plug it back in through
+//! the public traits. `tests/copy_and_own/modules.rs` compiles the protocol,
+//! transport, service and network files as modules of a separate crate.
+//! `examples/custom_protocol` shows this with Modbus.
 //!
 //! # The catalog
 //!
@@ -174,9 +177,11 @@
 //!   `built in` means the default observe registry decodes it, with a
 //!   presenter in [`observe`](fictionet::observe). Presenters live there, not
 //!   in the protocol's module, so a copied module carries no observe code.
-//! - **Fuzz**: the module has a fuzz target in `fuzz/`, which CI runs.
-//! - **Copy**: the copy-and-own fixture compiles the file as a module of a
-//!   separate crate.
+//! - **Fuzz**: the module has a fuzz target in `fuzz/`. CI builds every
+//!   target on pushes and pull requests. Nightly and manual runs also run
+//!   each target for 60 seconds.
+//! - **Copy**: `tests/copy_and_own` compiles the file as a module of a
+//!   separate crate, as a user's copy would be.
 //!
 //! `tests/stdlib_catalog.rs` checks every column against the code, so the
 //! table cannot drift. A new module gets a row here and its own module
@@ -318,6 +323,8 @@ pub mod bacnet;
 pub mod bgp;
 pub mod cboe_boe;
 pub mod cboe_pitch;
+// These docs live here, not in cme_mdp3.rs, because regenerating that file
+// (BLESS_CODEGEN=1) rewrites its header.
 /// CME Group MDP 3.0 market data: every message of CME's public SBE
 /// schema, plus UDP packets and message framing.
 ///

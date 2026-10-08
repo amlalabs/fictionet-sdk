@@ -57,8 +57,9 @@
 //! handler sets itself is sent as it is.
 //!
 //! HTTP/2 runs on hyper, behind the same [`Handler`] trait and the
-//! same events, with the same [`Limits`], the same charges to the
-//! connection's [`Budget`] and the same seeded randomness. HTTP/2 request body
+//! same events, with the same [`Limits`] and seeded randomness. It charges
+//! the request and response bodies it holds to the connection's
+//! [`Budget`]. hyper's own buffers are not charged. HTTP/2 request body
 //! and write stall timeouts use Fictionet deadlines. Hyper runs without a
 //! timer, with keep-alive pings and adaptive windows disabled.
 //!
@@ -1650,7 +1651,7 @@ impl Website {
     }
 }
 
-/// HTTP/2 on hyper, until the stdlib's own HTTP/2 lands.
+/// Live HTTP/2 and HTTP/1 Upgrade serving on hyper.
 mod h2 {
     use super::*;
     use fictionet::stdlib::codec::Lcg;

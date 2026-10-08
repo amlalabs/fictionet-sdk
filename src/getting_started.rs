@@ -26,8 +26,8 @@
 //! To try this without `sudo` on your own machine, run `demos/web` from the
 //! repository. It boots a small Debian VM under QEMU, builds Fictionet
 //! inside it, and runs the same world and sandbox as this page there, with
-//! root inside the VM only. It needs QEMU and KVM, and no Docker or Rust.
-//! `vm/README.md` explains how it works.
+//! root inside the VM only. It needs QEMU, KVM and the host tools listed
+//! in `vm/README.md`. It needs no Docker or Rust on the host.
 //!
 //! # 1. Build
 //!
@@ -41,9 +41,8 @@
 //!
 //! This builds two programs:
 //!
-//! - `target/release/examples/web_world`, the world. It runs on a tokio
-//!   runtime, because one of its sites passes requests to a real host with
-//!   `web::proxy()`, from the crate's `tokio` feature (on by default).
+//! - `target/release/examples/web_world`, the world. It runs its local
+//!   sites on a tokio runtime and makes no upstream requests.
 //! - `target/release/fictionet`, which has the `fictionet attach` command.
 //!
 //! # 2. Make the socket's directory

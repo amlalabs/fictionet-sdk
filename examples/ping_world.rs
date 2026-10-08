@@ -5,7 +5,7 @@
 //! cargo run --example ping_world -- /run/fictionet/world.sock
 //! ```
 //!
-//! Each sandbox's cable is split by protocol with
+//! Each sandbox's interface is split by protocol with
 //! [`ip::split_protocols`](fictionet::stdlib::ip::split_protocols), which
 //! also puts fragmented pings back together. The ICMP end gets a loop that
 //! answers with [`icmp::echo_reply`](fictionet::stdlib::icmp::echo_reply).

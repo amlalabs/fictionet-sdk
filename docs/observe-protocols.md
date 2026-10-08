@@ -32,7 +32,7 @@ without binary changes. Watches already running retain their registry and
 connection state.
 
 `Observed<D>` drives ordered bytes through the same adapter directly.
-Its `Placement` follows exact `Spans` from inner bytes to packet bytes.
+Its `Placement` follows exact `stdlib::codec::Spans` from inner bytes to packet bytes.
 Record a removed outer header with `Spans::skip`, then record its unchanged
 payload with `Spans::push_exact`. Add hops from the innermost stream outward.
 Each hop must have `Spans::keep() <= 256`; at most 16 hops are accepted.
@@ -84,10 +84,10 @@ HTTP/2 uses `observe::http2::Capture` through `register_with_buffer`, with
 customize presentation; it uses only public SDK APIs. It reads frames with
 `stdlib::http2::Frames::for_observation` and header blocks with
 `stdlib::http2::HeaderBlocks::for_observation`, the same frame parser and
-header assembly that strict `Frames` and `Connection` use, which notes what
-it cannot read instead of failing. Strict `Frames` and `Connection` check
-RFC 9113 framing and directional state. `Connection::peer_settings` and
-`peer_window_update` apply control frames from the other direction. `lost`
+header assembly that strict `Frames` and `Session` use, which notes what
+it cannot read instead of failing. Strict `Frames` and `Session` check
+RFC 9113 framing and directional state. `Session::peer_settings` and
+`Session::peer_window_update` apply control frames from the other direction. `lost`
 clears state and stops decoding because a TCP gap does not identify the next
 frame boundary.
 

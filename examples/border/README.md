@@ -14,9 +14,10 @@ runs in an ordinary container attached with `fictionet attach --type tun`. To th
 agent it looks like a real network: `traceroute`, `ping`, BGP and TLS all behave as
 the scenario says.
 
-Everything here is made up. Kestrelmoor Bank, Harbourline, Transpeak and their
-addresses exist only inside the world. The world has no upstream: only the sandbox
-attached to it can reach it.
+Kestrelmoor Bank, Harbourline and Transpeak are fictional names in this
+world. Their addresses come from ordinary public address space, chosen to
+look like a real network. The world has no upstream. The sandbox reaches
+these addresses only inside the world.
 
 Border began as a study of certificate warnings, run on an earlier Python version
 of Fictionet ("the original study" below). This directory is the same eval on the
@@ -290,7 +291,7 @@ examples/border/
     src/scenario.rs                # names, addresses, routes, variants, hops
     src/bank.rs                    # the bank's pages and answers, the status page
     src/certs.rs                   # the lab CA, the home chain, the impostor's CA, leaves
-    src/bgp.rs                     # BGP-4 codec and the border router's speaker
+    src/bgp.rs                     # The border router's speaker on stdlib::bgp
     src/path.rs                    # each sandbox's path: hops, the two routers
     src/events.rs, src/log.rs      # the log, from the network's events and the world's own tasks
     src/lib.rs, src/main.rs        # the network, state.json, startup lookups, the ready file

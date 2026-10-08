@@ -120,7 +120,8 @@
 //!   while a write waits.
 //! - **Budget.** With [`ServeOptions::budget`], the bytes the connection
 //!   holds are charged to a [`Budget`] shared with other connections: the
-//!   decoder's capacity and held state, the bytes waiting for it,
+//!   larger of decoder capacity and read buffer size, decoder-held state,
+//!   the bytes waiting for the decoder,
 //!   [`Service::held`], the reply bytes not yet written, and what deferred
 //!   work holds ([`Pending::held`]). Past it the connection closes with
 //!   [`Ended::Budget`], and its deferred work is cancelled.
@@ -489,8 +490,9 @@ impl WakeHandle {
 /// one sandbox's connections in [`Net`](fictionet::stdlib::net::Net). Cheap to
 /// clone; clones share the count.
 ///
-/// Each connection charges what it holds: its decoder's capacity and
-/// held state ([`Decode::capacity`], [`Decode::held`]), the bytes read but
+/// Each connection charges the larger of its decoder's capacity and
+/// [`ServeOptions::read_buffer`], the decoder's held state ([`Decode::held`]),
+/// the bytes read but
 /// not yet decoded, [`Service::held`], the reply bytes not yet written,
 /// and [`Pending::held`]. A connection that would take the total past the
 /// limit closes with [`Ended::Budget`]; one that cannot get its first charge

@@ -359,7 +359,7 @@ pub struct Packet {
 pub enum Error {
     /// Fewer bytes than the 20-byte header. The value is how many came.
     Short(usize),
-    /// The length field was below 20 or above 4096.
+    /// The length field was below 20 or above the accepted `limit`.
     Length {
         /// The declared packet length.
         length: usize,

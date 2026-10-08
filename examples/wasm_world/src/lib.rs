@@ -92,7 +92,7 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
         });
         sites.serve(&fcx, attachments)?;
 
-        // The sandbox: an IP stack of its own on the attachment's cable.
+        // The sandbox: an IP stack of its own on the `End` returned by `Attacher::attach`.
         let cable = attacher.attach("agent")?;
         let (tcp_packets, udp_packets, _icmp, _other) = ip::split_protocols(&fcx, cable);
         let tcp = tcp::endpoint(&fcx, tcp_packets, SANDBOX.into());

@@ -744,7 +744,7 @@ impl Referral {
     /// for [`ReferralKind::ReferralServer`] as ARIN writes it.
     /// [`Referral::from_field`] reads it back as the same referral.
     /// Refuses port zero, hosts above [`MAX_HOST`], and hosts that are not
-    /// canonical lowercase IPv6 addresses or ASCII names. Name labels
+    /// lowercase IPv6 addresses or ASCII names. Name labels
     /// must have 1 to 63 letters, digits, hyphens, or underscores, with
     /// no leading hyphen. A final dot is allowed.
     pub fn to_field(&self, block: usize) -> Result<Field, Error> {

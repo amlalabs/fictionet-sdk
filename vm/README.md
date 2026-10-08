@@ -12,8 +12,9 @@ You need Linux on x86-64 with:
   in the `kvm` group);
 - `genisoimage`, `mkisofs` or `xorriso`, for the cloud-init seed, which is used
   only the first time;
-- `curl`, `ssh`, `ssh-keygen`, `tar`, `flock` and `git`, which most systems already
-  have. `vm/run sync` copies what git tracks, so it runs from a git checkout.
+- `curl`, `ssh`, `ssh-keygen`, `tar`, `flock`, `sha256sum`, `sha512sum` and `git`.
+  `vm/run sync` copies tracked and unignored files from a git checkout.
+  It excludes `fuzz/corpus`.
 - A systemd user session, for the memory cap below. Without one, the VM runs
   uncapped, and `vm/run` says so.
 
@@ -41,6 +42,7 @@ command at a time changes the VM: a second one waits for the first.
 
 | Command | What it does |
 |---|---|
+| `vm/run prepare` | Downloads and prepares the base image without leaving a VM running. |
 | `vm/run up` | Boots the VM. The first time, it downloads and prepares the image. |
 | `vm/run ssh [command]` | Opens a root shell in the VM, or runs one command there. |
 | `vm/run sync` | Copies this working tree into the VM, at `/src`. |
@@ -94,8 +96,8 @@ checked), kind, kubectl, helm and uv (each checked against its published
 SHA-256), Rust with the musl target, and curl, dig, ping, traceroute, ip and
 python3. Then it turns cloud-init off, so later boots skip it. The result is
 `.vm/images/prepared-<key>.qcow2`, an overlay on the Debian image. Its key is a
-hash of `vm/versions.sh` and `provision.sh`, so a change to either prepares a
-new image.
+hash of `vm/versions.sh`, `vm/guest/provision.sh` and the SSH public key,
+so a change to any of them prepares a new image.
 
 **Each run** boots from a fresh qcow2 overlay on the prepared image, which is
 deleted by `vm/run down`. The prepared image is never written to.

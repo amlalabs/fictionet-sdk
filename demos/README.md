@@ -4,7 +4,7 @@ Each demo is one command. It boots the Fictionet VM if it is not running
 ([vm/README.md](../vm/README.md)), builds Fictionet inside it, runs the demo, and
 cleans up. Each step says in plain words what happens next, then shows the
 commands and their real output. Nothing needs root or Docker on your machine:
-only QEMU and KVM.
+QEMU, KVM and [the other host tools](../vm/README.md#the-fictionet-vm) are required.
 
 ```console
 $ demos/web

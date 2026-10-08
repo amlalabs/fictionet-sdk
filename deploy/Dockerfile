@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Static images of `fictionet attach` and of the web_world example, for
-# Docker Compose (examples/compose), Kubernetes (charts/fictionet-sandbox)
+# Docker Compose (examples/attach/compose-*.yaml), Kubernetes (charts/fictionet-sandbox)
 # or anywhere else, and an agent image for the examples. Built from the
 # crate root:
 #

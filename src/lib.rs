@@ -258,13 +258,13 @@
 //!
 //! | Feature | What it adds | Dependencies it adds |
 //! |---|---|---|
-//! | `tokio` (default) | `fictionet::tokio`, which hands stdlib connections to tokio-based libraries such as hyper and axum, and `web::proxy()`, which passes requests through to the real site | `hyper-util`, `hyper-rustls` with `webpki-roots`, and hyper's client |
+//! | `tokio` (default) | `web::proxy()`, which passes requests through to the real site | `hyper-util`, `hyper-rustls` with `webpki-roots`, and hyper's client |
 //!
 //! The `tokio` runtime crate itself is always a dependency, because hyper
 //! and h2 run on it, and so are `rustls` (with the `ring` provider), `hyper`
 //! (server side), `h2`, `smoltcp` and `hickory-proto`. A world that needs
-//! neither `fictionet::tokio` nor `web::proxy` can leave the feature out
-//! with `default-features = false`.
+//! no `web::proxy` can leave the feature out with `default-features = false`.
+//! The [`tokio`] connection adapters are available with either feature set.
 //!
 //! # In a browser
 //!

@@ -40,7 +40,7 @@ use crate::{Cx, Result};
 /// is cancelled. The future returns the first error once all of the
 /// region's tasks have ended. A task that ends with
 /// [`Cancelled`](crate::Cancelled) has not failed (see
-/// [`Cx::spawn`](crate::Cx::spawn)). After
+/// [`Cx::spawn`]). After
 /// [`Cx::cancel`](crate::Cx::cancel), the future returns `Ok(())`, unless a
 /// task failed before the cancel.
 ///
