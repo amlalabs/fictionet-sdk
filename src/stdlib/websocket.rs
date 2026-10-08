@@ -59,6 +59,8 @@
 //! assert_eq!(Wire::to_bytes(&frame).unwrap(), [0x81, 0x05, b'H', b'e', b'l', b'l', b'o']);
 //! ```
 
+use fictionet::stdlib::codec::ascii::is_tchar;
+use fictionet::stdlib::codec::base64::{self, encode as base64_encode, Padding};
 use fictionet::stdlib::codec::{self, Step, Wire};
 
 /// The fixed string a server appends to the client's key before hashing it
@@ -974,7 +976,7 @@ impl Upgrade {
     /// HTTP response using these fields.
     pub fn response_headers(&self, protocol: Option<&str>) -> Result<Vec<(String, String)>, Error> {
         if self.key.len() != 24
-            || base64_decode(&self.key).is_none_or(|bytes| bytes.len() != KEY_LEN)
+            || base64::decode(self.key.as_bytes(), Padding::Canonical).is_none_or(|bytes| bytes.len() != KEY_LEN)
             || self.accept != accept_key(&self.key)
         {
             return Err(Error::Unwritable);
@@ -1033,7 +1035,7 @@ pub fn check_request<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result
     }
     let mut keys = fields(headers, "sec-websocket-key");
     let key = match (keys.next(), keys.next()) {
-        (Some(k), None) if k.len() == 24 && base64_decode(k).is_some_and(|b| b.len() == KEY_LEN) => k,
+        (Some(k), None) if k.len() == 24 && base64::decode((k).as_bytes(), Padding::Canonical).is_some_and(|b| b.len() == KEY_LEN) => k,
         _ => return Err(Error::Key),
     };
     let mut protocols = Vec::new();
@@ -1330,11 +1332,6 @@ fn is_token(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(is_tchar)
 }
 
-/// Whether `b` may appear in an HTTP token.
-fn is_tchar(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
-}
-
 /// SHA-1 (FIPS 180-4), with fixed storage across input slices. It is broken
 /// for signatures, but the handshake only uses it to show the server read the key.
 fn sha1(parts: &[&[u8]]) -> [u8; 20] {
@@ -1393,70 +1390,6 @@ fn sha1_block(h: &mut [u32; 5], block: &[u8]) {
     }
     for (x, y) in h.iter_mut().zip([a, b, c, d, e]) {
         *x = x.wrapping_add(y);
-    }
-}
-
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Standard base64 with padding (RFC 4648 section 4).
-fn base64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
-        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(char::from(BASE64[((n >> (18 - 6 * i)) & 0x3f) as usize]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-/// Decodes standard, padded base64. It refuses anything else, including
-/// padding bits that are not zero, so each value has one encoding.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let b = s.as_bytes();
-    if !b.len().is_multiple_of(4) {
-        return None;
-    }
-    let count = b.len() / 4;
-    let mut out = Vec::with_capacity(count * 3);
-    for (i, c) in b.as_chunks::<4>().0.iter().enumerate() {
-        let pad = match (c[2], c[3]) {
-            (b'=', b'=') => 2,
-            (_, b'=') => 1,
-            _ => 0,
-        };
-        if pad > 0 && i + 1 != count {
-            return None;
-        }
-        let mut n = 0u32;
-        for (j, &ch) in c.iter().enumerate() {
-            let v = if j >= 4 - pad { 0 } else { u32::from(base64_value(ch)?) };
-            n = (n << 6) | v;
-        }
-        let [_, x, y, z] = n.to_be_bytes();
-        match pad {
-            0 => out.extend_from_slice(&[x, y, z]),
-            1 if z == 0 => out.extend_from_slice(&[x, y]),
-            2 if y == 0 && z == 0 => out.push(x),
-            _ => return None,
-        }
-    }
-    Some(out)
-}
-
-fn base64_value(c: u8) -> Option<u8> {
-    match c {
-        b'A'..=b'Z' => Some(c - b'A'),
-        b'a'..=b'z' => Some(c - b'a' + 26),
-        b'0'..=b'9' => Some(c - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
     }
 }
 
@@ -1552,11 +1485,11 @@ mod tests {
         ];
         for (plain, coded) in cases {
             assert_eq!(base64_encode(plain.as_bytes()), coded);
-            assert_eq!(base64_decode(coded).as_deref(), Some(plain.as_bytes()));
+            assert_eq!(base64::decode((coded).as_bytes(), Padding::Canonical).as_deref(), Some(plain.as_bytes()));
         }
         assert_eq!(base64_encode(&[0xfb, 0xff]), "+/8=");
         for bad in ["Zg", "Zg=", "Zh==", "Zm9=", "Zg==Zg==", "Z===", "====", "Zm9v\n", "Zm 9", "A=B="] {
-            assert_eq!(base64_decode(bad), None, "{bad}");
+            assert_eq!(base64::decode((bad).as_bytes(), Padding::Canonical), None, "{bad}");
         }
     }
 

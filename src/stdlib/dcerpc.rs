@@ -93,6 +93,7 @@
 //! assert_eq!(reply.len(), 16 + 8 + 2 + 4 + 2 + 4 + 24);
 //! ```
 
+use fictionet::stdlib::codec::ascii::hex_value as hex;
 use fictionet::stdlib::codec::{be16, be32, le16, le32, Decode, Step, Wire, Reader, Truncated};
 
 /// The TCP port of the endpoint mapper.
@@ -340,15 +341,6 @@ impl Uuid {
             i += 2;
         }
         Some(Uuid(out))
-    }
-}
-
-fn hex(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
     }
 }
 

@@ -66,6 +66,7 @@
 
 extern crate alloc;
 
+use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::{self, Decode, Wire};
 use alloc::{
     string::{String, ToString},
@@ -1052,10 +1053,7 @@ fn text(s: &str) -> Option<String> {
 
 /// One or more decimal digits that fit in a `u64`.
 fn number(s: &str) -> Option<u64> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
+    ascii::decimal(s.as_bytes(), usize::MAX, u64::MAX)
 }
 
 /// `zero-based-integer`: `0`, or digits with no leading zero, that fit

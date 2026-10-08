@@ -91,6 +91,9 @@
 //! assert_eq!(san.0, [GeneralName::Dns("www.example.com".into())]);
 //! ```
 
+use fictionet::stdlib::codec::ascii;
+use fictionet::stdlib::codec::civil::days_in_month;
+use fictionet::stdlib::codec::base64::{self, encode as base64_encode, Padding};
 use fictionet::stdlib::asn1::{self, BitString, Class, Element, Oid, Reader, Rules, StringKind, Tag, Writer};
 use fictionet::stdlib::codec::{Decode, Step as DecodeStep, Wire};
 use std::fmt;
@@ -622,7 +625,8 @@ fn short_name(oid: &[u8]) -> Option<&'static str> {
 
 fn push_hex(out: &mut String, b: &[u8]) {
     for byte in b {
-        let _ = write!(out, "{byte:02x}");
+        out.push(char::from(ascii::hex_lower(byte >> 4)));
+        out.push(char::from(ascii::hex_lower(*byte)));
     }
 }
 
@@ -769,7 +773,7 @@ impl Time {
         };
         let (month, day) = (digits(rest, 0, 2)?, digits(rest, 2, 2)?);
         let (hour, minute, second) = (digits(rest, 4, 2)?, digits(rest, 6, 2)?, digits(rest, 8, 2)?);
-        if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        if !(1..=12).contains(&month) || day < 1 || day > i64::from(days_in_month(year, month as u8)) {
             return None;
         }
         if hour > 23 || minute > 59 || second > 59 {
@@ -795,15 +799,6 @@ impl Time {
 fn digits(b: &[u8], i: usize, n: usize) -> Option<i64> {
     let s = b.get(i..i.checked_add(n)?)?;
     s.iter().try_fold(0i64, |v, &c| c.is_ascii_digit().then(|| v * 10 + i64::from(c - b'0')))
-}
-
-fn days_in_month(y: i64, m: i64) -> i64 {
-    match m {
-        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
 }
 
 /// Days since 1970-01-01 of a date in the proleptic Gregorian calendar.
@@ -2281,7 +2276,6 @@ impl Crl {
 const PEM_BEGIN: &[u8] = b"-----BEGIN ";
 const PEM_END: &[u8] = b"-----END ";
 const PEM_DASHES: &[u8] = b"-----";
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 /// The most base64 characters one block may hold.
 const MAX_PEM_CHARS: usize = MAX_PEM_DATA.div_ceil(3) * 4;
 
@@ -2359,63 +2353,6 @@ fn begin_label(line: &[u8]) -> Option<String> {
     valid_label(label).then(|| String::from_utf8_lossy(label).into_owned())
 }
 
-fn base64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
-        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(char::from(BASE64[(n >> (18 - 6 * i) & 63) as usize]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-fn base64_value(c: u8) -> Option<u32> {
-    Some(u32::from(match c {
-        b'A'..=b'Z' => c - b'A',
-        b'a'..=b'z' => c - b'a' + 26,
-        b'0'..=b'9' => c - b'0' + 52,
-        b'+' => 62,
-        b'/' => 63,
-        _ => return None,
-    }))
-}
-
-/// Decodes base64 with its padding, whitespace already removed. Bits
-/// left over after the last byte are ignored.
-fn base64_decode(s: &[u8]) -> Result<Vec<u8>, Error> {
-    if !s.len().is_multiple_of(4) {
-        return Err(Error::Pem);
-    }
-    let pad = s.iter().rev().take_while(|&&c| c == b'=').count();
-    if pad > 2 {
-        return Err(Error::Pem);
-    }
-    let body = &s[..s.len() - pad];
-    let mut out = Vec::with_capacity(s.len() / 4 * 3);
-    for chunk in body.chunks(4) {
-        let mut n = 0u32;
-        for &c in chunk {
-            n = n << 6 | base64_value(c).ok_or(Error::Pem)?;
-        }
-        n <<= 6 * (4 - chunk.len() as u32);
-        let bytes = n.to_be_bytes();
-        let keep = match chunk.len() {
-            4 => 3,
-            3 => 2,
-            2 => 1,
-            _ => return Err(Error::Pem),
-        };
-        out.extend_from_slice(&bytes[1..1 + keep]);
-    }
-    Ok(out)
-}
-
 /// A block whose `-----BEGIN` line has been read.
 #[derive(Debug)]
 struct OpenBlock {
@@ -2466,7 +2403,7 @@ impl Scanner {
         // Anything after it on its line is text outside the block.
         if b.starts_with(&open.marker) {
             let used = open.marker.len();
-            let data = base64_decode(&open.chars)?;
+            let data = base64::decode(&open.chars, Padding::Required).ok_or(Error::Pem)?;
             // The last group of four characters may hold up to two bytes
             // past the limit, which `Wire::write` would refuse.
             if data.len() > MAX_PEM_DATA {
@@ -2488,7 +2425,7 @@ impl Scanner {
         for &c in &b[..n] {
             match c {
                 b' ' | b'\t' | 0x0b | 0x0c => {}
-                c if c == b'=' || base64_value(c).is_some() => {
+                c if c == b'=' || base64::digit(c).is_some() => {
                     if open.chars.len() >= MAX_PEM_CHARS {
                         return Err(Error::TooLong);
                     }
@@ -3120,6 +3057,15 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             subject_unique_id: None,
             extensions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn civil_epoch_and_leap_boundaries() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        assert_eq!(days_from_civil(2000, 3, 1) - days_from_civil(2000, 2, 28), 2);
+        assert_eq!(days_from_civil(1900, 3, 1) - days_from_civil(1900, 2, 28), 1);
+        assert_eq!(days_from_civil(0, 1, 1) - days_from_civil(-1, 12, 31), 1);
     }
 
     #[test]
@@ -3864,7 +3810,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             ("foobar", "Zm9vYmFy"),
         ] {
             assert_eq!(base64_encode(data.as_bytes()), b64);
-            assert_eq!(base64_decode(b64.as_bytes()).unwrap(), data.as_bytes());
+            assert_eq!(base64::decode(b64.as_bytes(), Padding::Required).unwrap(), data.as_bytes());
             let p = PemBlock { label: "X".into(), data: data.as_bytes().to_vec() };
             let text = String::from_utf8(p.to_bytes().unwrap()).unwrap();
             assert_eq!(

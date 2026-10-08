@@ -43,6 +43,7 @@
 //! `readOnly`, and `writeOnly` do not assert anything; request/response policy
 //! belongs to the caller. This module performs no I/O.
 
+use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::Lcg;
 use fictionet::stdlib::json::{Number, Value};
 use std::cmp::Ordering;
@@ -1557,18 +1558,7 @@ fn simple_anchor(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
 }
 fn decode_fragment(s: &str) -> Option<String> {
-    let mut bytes = Vec::new();
-    let mut it = s.bytes();
-    while let Some(b) = it.next() {
-        if b == b'%' {
-            let a = char::from(it.next()?).to_digit(16)?;
-            let b = char::from(it.next()?).to_digit(16)?;
-            bytes.push((a * 16 + b) as u8);
-        } else {
-            bytes.push(b);
-        }
-    }
-    String::from_utf8(bytes).ok()
+    String::from_utf8(ascii::percent_decode_strict(s.as_bytes())?).ok()
 }
 
 impl Schema {
@@ -1747,15 +1737,7 @@ fn equal(a: &Value, b: &Value, limits: &Limits, work: &mut Work) -> Result<bool,
 }
 
 fn digits(bytes: &[u8]) -> Option<u32> {
-    if bytes.is_empty() {
-        return None;
-    }
-    bytes.iter().try_fold(0u32, |n, b| {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        n.checked_mul(10)?.checked_add(u32::from(b - b'0'))
-    })
+    ascii::decimal(bytes, usize::MAX, u64::from(u32::MAX)).map(|n| n as u32)
 }
 fn date_parts(s: &str) -> Option<(u32, u32, u32)> {
     let b = s.as_bytes();
@@ -1763,7 +1745,7 @@ fn date_parts(s: &str) -> Option<(u32, u32, u32)> {
         return None;
     }
     let (year, month, day) = (digits(&b[..4])?, digits(&b[5..7])?, digits(&b[8..])?);
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let leap = fictionet::stdlib::codec::civil::is_leap_year(i64::from(year));
     let days = match month {
         2 if leap => 29,
         2 => 28,

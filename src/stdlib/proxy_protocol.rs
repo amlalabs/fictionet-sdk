@@ -59,6 +59,7 @@
 //! assert_eq!(Header::parse(&bytes), Ok(header));
 //! ```
 
+use fictionet::stdlib::codec::crc32c::{checksum as crc32c, update as crc32c_update};
 use fictionet::stdlib::codec::be16;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -1225,23 +1226,6 @@ impl V2 {
 pub fn unix_path(addr: &[u8; UNIX_ADDR_LEN]) -> &[u8] {
     let end = addr.iter().position(|&c| c == 0).unwrap_or(UNIX_ADDR_LEN);
     &addr[..end]
-}
-
-/// The CRC32C (Castagnoli) checksum of `data`, as RFC 4960 appendix B
-/// works it out. A version 2 CRC32C TLV holds this over the whole header,
-/// with the TLV's own value set to zeros.
-pub fn crc32c(data: &[u8]) -> u32 {
-    crc32c_update(!0, data) ^ !0
-}
-
-fn crc32c_update(mut crc: u32, data: &[u8]) -> u32 {
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82f6_3b78 } else { crc >> 1 };
-        }
-    }
-    crc
 }
 
 #[cfg(test)]

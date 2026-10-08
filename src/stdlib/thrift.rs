@@ -72,6 +72,7 @@
 
 extern crate alloc;
 
+use fictionet::stdlib::codec::leb128;
 use fictionet::stdlib::codec::{Decode, Step, Wire, Reader as ByteReader, Truncated};
 use alloc::{string::String, vec, vec::Vec};
 
@@ -984,15 +985,7 @@ impl<'a> Fields<'a> {
     /// A variable-length integer of at most `max_bytes` bytes, no bigger
     /// than `max`.
     fn varint(&mut self, max_bytes: usize, max: u64) -> Result<u64, Error> {
-        let mut v: u128 = 0;
-        for i in 0..max_bytes {
-            let byte = self.cursor.u8()?;
-            v |= u128::from(byte & 0x7f) << (7 * i);
-            if byte & 0x80 == 0 {
-                return if v > u128::from(max) { Err(Error::BadVarint) } else { Ok(v as u64) };
-            }
-        }
-        Err(Error::BadVarint)
+        leb128::decode_with(|| self.cursor.u8().map_err(Error::from), max_bytes, max, Error::BadVarint)
     }
 
     fn varint32(&mut self) -> Result<u32, Error> {
@@ -1033,7 +1026,7 @@ impl<'a> Fields<'a> {
 
     fn name(&mut self) -> Result<String, Error> {
         let n = self.len(MAX_BINARY_LEN)?;
-        String::from_utf8(self.cursor.take(n)?.to_vec()).map_err(|_| Error::BadUtf8)
+        core::str::from_utf8(self.cursor.take(n)?).map(str::to_owned).map_err(|_| Error::BadUtf8)
     }
 
     /// A message's header: everything before its struct. It picks the
@@ -1278,12 +1271,8 @@ impl<'o> Writer<'o> {
         self.check()
     }
 
-    fn varint(&mut self, mut v: u64) {
-        while v >= 0x80 {
-            self.byte((v as u8) | 0x80);
-            v >>= 7;
-        }
-        self.byte(v as u8);
+    fn varint(&mut self, v: u64) {
+        leb128::encode_with(v, |b| self.byte(b));
     }
 
     fn i16w(&mut self, v: i16) {

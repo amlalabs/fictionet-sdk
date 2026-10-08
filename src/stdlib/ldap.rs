@@ -60,6 +60,7 @@
 //! assert_eq!(dn.to_text().unwrap(), "uid=jdoe,dc=example,dc=com");
 //! ```
 
+use fictionet::stdlib::codec::ascii::{hex_lower, hex_value as hex_digit};
 use fictionet::stdlib::asn1::{self, Class, Element, Length, Reader, Rules, Tag};
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 use std::fmt;
@@ -1980,8 +1981,7 @@ fn escape_value(out: &mut String, v: &[u8]) -> Result<(), Error> {
 
 /// The two lowercase hex digits of `b`.
 fn hex(b: u8) -> [u8; 2] {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    [HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]]
+    [hex_lower(b >> 4), hex_lower(b)]
 }
 
 /// Appends `\` and the two hex digits of `b`.
@@ -1990,15 +1990,6 @@ fn push_hex_escape(out: &mut String, b: u8) -> Result<(), Error> {
     push_text(out, "\\")?;
     push_char(out, char::from(h))?;
     push_char(out, char::from(l))
-}
-
-fn hex_digit(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Two hex digits as a byte.

@@ -59,6 +59,7 @@
 
 extern crate alloc;
 
+use fictionet::stdlib::codec::ascii::hex_value;
 use fictionet::stdlib::codec::{self, Decode, Wire};
 use alloc::{
     boxed::Box,
@@ -1476,16 +1477,6 @@ fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 
-fn hex(c: Option<&u8>) -> Option<u8> {
-    let c = *c?;
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
 /// Splits an inline command's line into arguments, as Redis's
 /// `sdssplitargs` does. The line holds no NUL: [`inline`] ends no line
 /// after one.
@@ -1508,7 +1499,7 @@ fn split_args(text: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
                 match c {
                     None => return Err(Error::UnbalancedQuotes),
                     Some(b'\\') if text.get(i + 1) == Some(&b'x') => {
-                        if let (Some(h), Some(l)) = (hex(text.get(i + 2)), hex(text.get(i + 3))) {
+                        if let (Some(h), Some(l)) = (text.get(i + 2).copied().and_then(hex_value), text.get(i + 3).copied().and_then(hex_value)) {
                             arg.push(h << 4 | l);
                             i += 4;
                         } else {

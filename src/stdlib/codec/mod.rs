@@ -134,6 +134,11 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::error::Error;
 
+pub mod ascii;
+pub mod base64;
+pub mod civil;
+pub mod crc32c;
+pub mod leb128;
 mod buffer;
 mod combinators;
 pub mod contract;
@@ -239,6 +244,12 @@ pub trait Wire: Sized {
         self.write(&mut out)?;
         Ok(out)
     }
+}
+
+/// Rounds a byte length up to a multiple of four; `len` must be at most `usize::MAX - 3`.
+#[inline]
+pub fn pad_to_4(len: usize) -> usize {
+    (len + 3) & !3
 }
 
 #[cfg(test)]

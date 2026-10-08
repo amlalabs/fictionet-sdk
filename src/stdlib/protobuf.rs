@@ -54,6 +54,7 @@
 
 extern crate alloc;
 
+use fictionet::stdlib::codec::leb128;
 use alloc::vec::Vec;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
@@ -148,28 +149,16 @@ impl core::error::Error for Error {}
 /// bytes it took. Varints may carry extra zero groups (an overlong
 /// encoding), and those are read like any other.
 pub fn decode_varint(b: &[u8]) -> Result<(u64, usize), Error> {
-    let mut v = 0u64;
-    for i in 0..MAX_VARINT_LEN {
-        let Some(&byte) = b.get(i) else { return Err(Error::Truncated) };
-        // The tenth byte holds only bit 63.
-        if i == MAX_VARINT_LEN - 1 && byte > 1 {
-            return Err(Error::VarintOverflow);
-        }
-        v |= u64::from(byte & 0x7f) << (7 * i);
-        if byte & 0x80 == 0 {
-            return Ok((v, i + 1));
-        }
-    }
-    Err(Error::VarintOverflow)
+    let mut bytes = b.iter().copied();
+    let value = leb128::decode_with(
+        || bytes.next().ok_or(Error::Truncated), MAX_VARINT_LEN, u64::MAX, Error::VarintOverflow,
+    )?;
+    Ok((value, b.len() - bytes.len()))
 }
 
 /// Appends `v` to `out` as a varint, in the shortest form.
-fn encode_varint(mut v: u64, out: &mut Vec<u8>) {
-    while v >= 0x80 {
-        out.push((v as u8 & 0x7f) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
+fn encode_varint(v: u64, out: &mut Vec<u8>) {
+    leb128::encode_with(v, |b| out.push(b));
 }
 
 /// One unsigned base-128 integer, with no trailing bytes.

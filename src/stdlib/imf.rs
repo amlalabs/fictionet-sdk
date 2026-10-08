@@ -61,6 +61,8 @@
 //! assert_eq!(bytes, "To: John Doe <jdoe@machine.example>\r\nSubject: Re: Café hours\r\n\r\n".as_bytes());
 //! ```
 
+use fictionet::stdlib::codec::civil::days_in_month;
+use fictionet::stdlib::codec::base64::{self, encode as base64_encode, Padding};
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The longest header section, counting the blank line that ends it.
@@ -450,8 +452,8 @@ fn finish(name: &[u8], value: Vec<u8>) -> Result<Field, Error> {
         return Err(Error::FieldValue);
     }
     let start = value.iter().position(|&c| c != b' ' && c != b'\t').unwrap_or(value.len());
-    let value = String::from_utf8(value[start..].to_vec()).map_err(|_| Error::Utf8)?;
-    let name = String::from_utf8(name.to_vec()).map_err(|_| Error::FieldName)?;
+    let value = core::str::from_utf8(&value[start..]).map(str::to_owned).map_err(|_| Error::Utf8)?;
+    let name = core::str::from_utf8(name).map(str::to_owned).map_err(|_| Error::FieldName)?;
     Ok(Field { name, value })
 }
 
@@ -835,7 +837,7 @@ impl DateTime {
         (1900..=9999).contains(&self.year)
             && (1..=12).contains(&self.month)
             && self.day >= 1
-            && self.day <= days_in_month(self.year, self.month)
+            && self.day <= days_in_month(i64::from(self.year), self.month)
             && self.hour <= 23
             && self.minute <= 59
             && self.second <= 60
@@ -943,16 +945,6 @@ fn weekday(year: u16, month: u8, day: u8) -> u8 {
     ((from_sunday + 6) % 7) as u8
 }
 
-fn days_in_month(year: u16, month: u8) -> u8 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => 29,
-        2 => 28,
-        _ => 0,
-    }
-}
-
 /// Decodes one RFC 2047 encoded word, such as `=?utf-8?q?Caf=C3=A9?=`.
 /// It reads the `B` (base64) and `Q` encodings, and the character sets
 /// UTF-8, US-ASCII and ISO-8859-1, with any `*language` suffix ignored. It
@@ -971,7 +963,7 @@ pub fn decode_word(word: &str) -> Option<String> {
         return None;
     }
     let bytes = match encoding {
-        "B" | "b" => base64_decode(text.as_bytes())?,
+        "B" | "b" => base64::decode(text.as_bytes(), Padding::Optional)?,
         "Q" | "q" => q_decode(text.as_bytes())?,
         _ => return None,
     };
@@ -1194,47 +1186,6 @@ text_wire!(
     "Reads unstructured UTF-8 text and decodes recognized RFC 2047 words. Refuses invalid UTF-8, NUL, CR, LF, and text whose encoded form exceeds [`MAX_VALUE_BYTES`].",
     "Appends UTF-8 base64 words of at most [`ENCODED_WORD_LEN`] bytes, separated by spaces. Empty text writes no bytes. Refuses NUL, CR, LF, and output over [`MAX_VALUE_BYTES`]. Returns [`Error::Unwritable`] and leaves `out` unchanged on refusal."
 );
-
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn base64_encode(b: &[u8]) -> String {
-    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
-    for c in b.chunks(3) {
-        let n =
-            (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
-        for k in 0..4 {
-            if k <= c.len() {
-                out.push(char::from(BASE64[(n >> (18 - 6 * k) & 63) as usize]));
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-/// Base64 to bytes. Padding may be left off, but padding that is there
-/// must fill the last group of four, and a lone final character is
-/// refused.
-fn base64_decode(s: &[u8]) -> Option<Vec<u8>> {
-    let padded = s.len();
-    let s = s.strip_suffix(b"==").or_else(|| s.strip_suffix(b"=")).unwrap_or(s);
-    if s.len() % 4 == 1 || (padded != s.len() && (s.is_empty() || !padded.is_multiple_of(4))) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 2);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for &c in s {
-        let v = BASE64.iter().position(|&x| x == c)? as u32;
-        acc = (acc << 6 | v) & 0xff_ffff;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
-}
 
 /// RFC 2047's Q encoding to bytes: `_` is a space and `=XX` a byte in hex.
 fn q_decode(s: &[u8]) -> Option<Vec<u8>> {
@@ -1897,9 +1848,9 @@ mod tests {
         }
         for n in 0..10 {
             let s = "xyz".repeat(n);
-            assert_eq!(base64_decode(base64_encode(s.as_bytes()).as_bytes()).unwrap(), s.as_bytes());
+            assert_eq!(base64::decode(base64_encode(s.as_bytes()).as_bytes(), Padding::Optional).unwrap(), s.as_bytes());
         }
-        assert_eq!(base64_decode(b"QUI"), Some(b"AB".to_vec()));
+        assert_eq!(base64::decode(b"QUI", Padding::Optional), Some(b"AB".to_vec()));
     }
 
     #[test]

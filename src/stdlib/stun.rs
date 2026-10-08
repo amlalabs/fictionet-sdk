@@ -54,6 +54,7 @@
 
 extern crate alloc;
 
+use fictionet::stdlib::codec::pad_to_4 as padded;
 use fictionet::stdlib::codec::{be16, be32};
 use alloc::{
     string::{String, ToString},
@@ -1141,10 +1142,6 @@ enum Integrity {
     None,
     Sha1,
     Sha256,
-}
-
-fn padded(len: usize) -> usize {
-    len.div_ceil(4) * 4
 }
 
 #[cfg(test)]

@@ -73,6 +73,7 @@
 //! assert_eq!(Message::parse(&bytes).unwrap().status(), Some(200));
 //! ```
 
+use fictionet::stdlib::codec::ascii::{trim_ows_str as trim_ws, trim_ows as trim_frame_ws};
 use fictionet::stdlib::codec::{Decode, Ending, LineError, Lines, Step, Wire};
 
 /// The port SIP servers listen on, for UDP and TCP.
@@ -850,16 +851,6 @@ fn message_size(message: &Message) -> Result<usize, Error> {
         return Err(Error::Unwritable);
     }
     Ok(total)
-}
-
-fn trim_frame_ws(mut bytes: &[u8]) -> &[u8] {
-    while let Some((b' ' | b'\t', rest)) = bytes.split_first() {
-        bytes = rest;
-    }
-    while let Some((b' ' | b'\t', rest)) = bytes.split_last() {
-        bytes = rest;
-    }
-    bytes
 }
 
 /// A SIP URI's scheme.
@@ -2004,10 +1995,6 @@ fn valid_field(s: &str) -> bool {
         i += 1;
     }
     true
-}
-
-fn trim_ws(s: &str) -> &str {
-    s.trim_matches([' ', '\t'])
 }
 
 fn skip_ws(b: &[u8], mut i: usize) -> usize {

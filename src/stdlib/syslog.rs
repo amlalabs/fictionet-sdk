@@ -75,6 +75,7 @@
 //! assert_eq!(bsd.content, b"Accepted publickey");
 //! ```
 
+use fictionet::stdlib::codec::civil::days_in_month;
 use std::borrow::Cow;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -440,7 +441,7 @@ impl Timestamp {
         if i != t.len() {
             return None;
         }
-        if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        if !(1..=12).contains(&month) || day == 0 || day > days_in_month(i64::from(year), month) {
             return None;
         }
         if hour > 23 || minute > 59 || second > 59 {
@@ -467,7 +468,7 @@ impl Wire for Timestamp {
         if self.year > 9999
             || !(1..=12).contains(&self.month)
             || self.day == 0
-            || self.day > days_in_month(self.year, self.month)
+            || self.day > days_in_month(i64::from(self.year), self.month)
             || self.hour > 23
             || self.minute > 59
             || self.second > 59
@@ -1553,15 +1554,6 @@ fn num(t: &[u8], i: usize, n: usize) -> Option<u32> {
 
 fn expect(t: &[u8], i: usize, c: u8) -> Option<()> {
     (t.get(i) == Some(&c)).then_some(())
-}
-
-fn days_in_month(year: u16, month: u8) -> u8 {
-    match month {
-        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
 }
 
 #[cfg(test)]

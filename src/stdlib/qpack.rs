@@ -49,6 +49,7 @@
 //! encoder.apply_instruction(ack.unwrap()).unwrap();
 //! ```
 
+use fictionet::stdlib::quic::MAX_VARINT;
 use fictionet::stdlib::codec::{Reader, Truncated};
 
 use std::collections::VecDeque;
@@ -56,9 +57,6 @@ use std::collections::VecDeque;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 use fictionet::stdlib::{huffman, prefix_int};
 
-/// The largest integer a reader accepts, 2^62 - 1, the largest QUIC stream
-/// ID. Larger values cannot be written.
-pub const MAX_INTEGER: u64 = (1 << 62) - 1;
 /// The longest string before or after Huffman decoding.
 pub const MAX_STRING: usize = huffman::MAX_STRING;
 /// The largest dynamic table capacity. A larger maximum given to
@@ -232,7 +230,7 @@ pub fn static_find_name(name: &[u8]) -> Option<u64> {
 pub enum Error {
     /// A field section ended in the middle of its prefix or a field line.
     Truncated,
-    /// An integer was above [`MAX_INTEGER`], or had too many bytes.
+    /// An integer was above [`MAX_VARINT`], or had too many bytes.
     IntegerOverflow,
     /// A string was longer than [`MAX_STRING`].
     StringTooLong,
@@ -334,7 +332,7 @@ impl<'a> ReadFields<'a> for Reader<'a> {
             prefix_int::Error::Truncated if bytes.len() < MAX_INTEGER_BYTES => Stop::More,
             _ => Stop::Bad(Error::IntegerOverflow),
         })?;
-        if value > MAX_INTEGER {
+        if value > MAX_VARINT {
             return Err(Error::IntegerOverflow.into());
         }
         self.skip(used)?;
@@ -576,7 +574,7 @@ impl Table {
             return Err(Error::EntryTooLarge);
         }
         let index = self.inserted;
-        self.inserted = index.checked_add(1).filter(|n| *n <= MAX_INTEGER).ok_or(Error::IntegerOverflow)?;
+        self.inserted = index.checked_add(1).filter(|n| *n <= MAX_VARINT).ok_or(Error::IntegerOverflow)?;
         self.evict_to(self.capacity - size);
         self.size += size;
         name.shrink_to_fit();
@@ -824,19 +822,19 @@ impl SectionPrefix {
     }
 
     /// The wire prefix for a decoder with `max_entries`. A nonzero
-    /// count with `max_entries` 0, or a Base more than [`MAX_INTEGER`] from
+    /// count with `max_entries` 0, or a Base more than [`MAX_VARINT`] from
     /// the count, is an error. The prefix reads back the same only if the
     /// decoder's insert count is within `max_entries` of the required one,
     /// as it is when the section's entries are in its table.
     pub fn encoded(&self, max_entries: u64) -> Result<EncodedPrefix, Error> {
         let required = self.required_insert_count;
         let encoded = encode_insert_count(required, max_entries).ok_or(Error::Unwritable)?;
-        if encoded > MAX_INTEGER {
+        if encoded > MAX_VARINT {
             return Err(Error::Unwritable);
         }
         let negative = self.base < required;
         let delta_base = if negative { required - self.base - 1 } else { self.base - required };
-        if delta_base > MAX_INTEGER {
+        if delta_base > MAX_VARINT {
             return Err(Error::Unwritable);
         }
         Ok(EncodedPrefix { encoded_insert_count: encoded, negative, delta_base })
@@ -873,9 +871,9 @@ impl Wire for EncodedPrefix {
         exact(Self::parse_prefix(bytes), bytes.len())
     }
 
-    /// Writes one prefix. Refuses integers above [`MAX_INTEGER`].
+    /// Writes one prefix. Refuses integers above [`MAX_VARINT`].
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        if self.encoded_insert_count > MAX_INTEGER || self.delta_base > MAX_INTEGER {
+        if self.encoded_insert_count > MAX_VARINT || self.delta_base > MAX_VARINT {
             return Err(Error::Unwritable);
         }
         put_integer(out, 8, 0, self.encoded_insert_count)?;
@@ -1212,10 +1210,10 @@ impl Encoder {
     /// literal. A section past the peer's field section size limit is
     /// [`Error::FieldSectionTooLarge`], one with more than [`MAX_FIELDS`]
     /// fields [`Error::TooManyFields`], and a name or value longer than
-    /// [`MAX_STRING`] [`Error::StringTooLong`]. A stream above [`MAX_INTEGER`]
+    /// [`MAX_STRING`] [`Error::StringTooLong`]. A stream above [`MAX_VARINT`]
     /// is refused with [`Error::Unwritable`].
     pub fn section(&mut self, stream: u64, fields: &[Field]) -> Result<FieldSection, Error> {
-        if stream > MAX_INTEGER {
+        if stream > MAX_VARINT {
             return Err(Error::Unwritable);
         }
         if fields.len() > MAX_FIELDS {
@@ -1382,9 +1380,9 @@ fn encoder_instruction_len(input: &[u8]) -> Result<Option<usize>, Error> {
 fn check_encoder_instruction(ins: &EncoderInstruction) -> Result<(), Error> {
     match ins {
         EncoderInstruction::SetCapacity(n) if *n > MAX_TABLE_CAPACITY => Err(Error::Capacity(*n)),
-        EncoderInstruction::Duplicate(n) if *n > MAX_INTEGER => Err(Error::IntegerOverflow),
+        EncoderInstruction::Duplicate(n) if *n > MAX_VARINT => Err(Error::IntegerOverflow),
         EncoderInstruction::InsertWithNameRef { static_table, index, value } => {
-            if *index > MAX_INTEGER {
+            if *index > MAX_VARINT {
                 return Err(Error::IntegerOverflow);
             }
             if *static_table && static_entry(*index).is_none() {
@@ -1499,7 +1497,7 @@ fn check_decoder_instruction(instruction: &DecoderInstruction) -> Result<(), Err
         DecoderInstruction::InsertCountIncrement(0) => return Err(Error::ZeroIncrement),
         DecoderInstruction::InsertCountIncrement(n) => *n,
     };
-    if n > MAX_INTEGER {
+    if n > MAX_VARINT {
         return Err(Error::IntegerOverflow);
     }
     Ok(())
@@ -1518,7 +1516,7 @@ impl Wire for DecoderInstruction {
         exact(parsed, bytes.len())?
     }
 
-    /// Writes one instruction. Refuses integers above MAX_INTEGER and zero increments.
+    /// Writes one instruction. Refuses integers above MAX_VARINT and zero increments.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         check_decoder_instruction(self).map_err(|_| Error::Unwritable)?;
         match self {
@@ -1545,7 +1543,7 @@ impl Wire for Representation {
     }
 
     /// Writes one field line, using Huffman strings when shorter. Refuses integers above
-    /// MAX_INTEGER and strings longer than MAX_STRING.
+    /// MAX_VARINT and strings longer than MAX_STRING.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let (index, name, value): (u64, &[u8], &[u8]) = match self {
             Self::Indexed { index, .. } | Self::IndexedPostBase(index) => (*index, &[], &[]),
@@ -1554,7 +1552,7 @@ impl Wire for Representation {
             }
             Self::LiteralName { name, value, .. } => (0, name, value),
         };
-        if index > MAX_INTEGER {
+        if index > MAX_VARINT {
             return Err(Error::Unwritable);
         }
         check_strings(name, value).map_err(|_| Error::Unwritable)?;
@@ -1690,7 +1688,7 @@ pub fn decode_section_with_limit(
     bytes: &[u8],
     field_limit: u64,
 ) -> Result<SectionResult, Error> {
-    if stream > MAX_INTEGER {
+    if stream > MAX_VARINT {
         return Err(Error::IntegerOverflow);
     }
     if bytes.len() > MAX_SECTION_BYTES {
@@ -1834,13 +1832,13 @@ mod tests {
     fn integer_limits() {
         fn check<const P: u8>() {
             for value in
-                [0, 1, 30, 31, 127, 128, 255, 256, 1 << 40, MAX_INTEGER - 1, MAX_INTEGER, MAX_INTEGER + 1, u64::MAX]
+                [0, 1, 30, 31, 127, 128, 255, 256, 1 << 40, MAX_VARINT - 1, MAX_VARINT, MAX_VARINT + 1, u64::MAX]
             {
                 let unit = Integer::<P> { flags: 0, value };
                 contract::check_wire_value(&unit);
                 let bytes = unit.to_bytes().unwrap();
                 let mut c = Reader::new(&bytes);
-                if value > MAX_INTEGER {
+                if value > MAX_VARINT {
                     assert!(matches!(c.int(P), Err(Stop::Bad(Error::IntegerOverflow))));
                     assert_eq!(
                         DecoderInstruction::SectionAck(value).to_bytes(),
@@ -1865,8 +1863,8 @@ mod tests {
             Err(prefix_int::Error::Prefix)
         );
         assert_eq!(Integer::<9>::parse(&[0]), Err(prefix_int::Error::Prefix));
-        assert_eq!(Integer::<8>::parse(&hex("ff 80feffffffffffff3f")), Ok(Integer { flags: 0, value: MAX_INTEGER }));
-        // MAX_INTEGER + 1 with an eight-bit prefix.
+        assert_eq!(Integer::<8>::parse(&hex("ff 80feffffffffffff3f")), Ok(Integer { flags: 0, value: MAX_VARINT }));
+        // MAX_VARINT + 1 with an eight-bit prefix.
         for bytes in [vec![0xff; 30], hex("ff 81feffffffffffff3f")] {
             let mut c = Reader::new(&bytes);
             assert!(matches!(c.int(8), Err(Stop::Bad(Error::IntegerOverflow))));
@@ -2040,7 +2038,7 @@ mod tests {
             EncoderInstruction::InsertWithLiteralName { name: b"custom-key".to_vec(), value: b"custom-value".to_vec() },
             EncoderInstruction::InsertWithLiteralName { name: vec![1; 100], value: vec![2; 100] },
             EncoderInstruction::Duplicate(0),
-            EncoderInstruction::Duplicate(MAX_INTEGER),
+            EncoderInstruction::Duplicate(MAX_VARINT),
         ];
         for ins in &enc {
             contract::check_wire_value(ins);
@@ -2154,7 +2152,7 @@ mod tests {
         e.set_capacity(100).unwrap();
         assert_eq!(e.insert(b"x-a", b"1").map(|v| v.0), Ok(0));
         assert_eq!(e.apply_instruction(DecoderInstruction::InsertCountIncrement(1)), Ok(()));
-        assert_eq!(e.section(MAX_INTEGER + 1, &[Field::new("x-a", "1")]), Err(Error::Unwritable));
+        assert_eq!(e.section(MAX_VARINT + 1, &[Field::new("x-a", "1")]), Err(Error::Unwritable));
         assert!(e.outstanding.is_empty());
         assert_eq!(e.table().insert_count(), 1);
         let section = e.section(4, &[Field::new("x-a", "1")]).unwrap();

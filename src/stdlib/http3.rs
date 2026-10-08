@@ -40,6 +40,7 @@
 //! # Ok::<(), fictionet::stdlib::http3::Error>(())
 //! ```
 
+use fictionet::stdlib::codec::ascii::{self, trim_ows, is_tchar as token};
 use fictionet::stdlib::{
     codec::{self, Decode, Step, Wire},
     qpack, quic,
@@ -833,35 +834,11 @@ fn normalize_length(fields: &mut Vec<qpack::Field>, length: Option<u64>) {
         false
     });
 }
-fn token(b: u8) -> bool {
-    b.is_ascii_alphanumeric()
-        || matches!(
-            b,
-            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
-        )
-}
 fn nonempty_token(b: &[u8]) -> bool {
     !b.is_empty() && b.iter().all(|c| token(*c))
 }
 fn decimal(b: &[u8]) -> Option<u64> {
-    if b.is_empty() {
-        return None;
-    }
-    b.iter().try_fold(0u64, |v, c| {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        v.checked_mul(10)?.checked_add(u64::from(c - b'0'))
-    })
-}
-fn trim_ows(mut b: &[u8]) -> &[u8] {
-    while matches!(b.first(), Some(b' ' | b'\t')) {
-        b = b.get(1..).unwrap_or_default();
-    }
-    while matches!(b.last(), Some(b' ' | b'\t')) {
-        b = b.get(..b.len().saturating_sub(1)).unwrap_or_default();
-    }
-    b
+    ascii::decimal(b, usize::MAX, u64::MAX)
 }
 fn reg_name_char(b: u8) -> bool {
     b.is_ascii_alphanumeric()

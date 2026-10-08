@@ -510,9 +510,9 @@ fn request_field_errors_preserve_qpack_acknowledgments() {
 fn decoder_instruction_capacity_is_one_bounded_integer() {
     assert_eq!(qpack::DecoderInstructions.capacity(), qpack::MAX_INTEGER_BYTES);
     for ins in [
-        DI::SectionAck(qpack::MAX_INTEGER),
-        DI::StreamCancel(qpack::MAX_INTEGER),
-        DI::InsertCountIncrement(qpack::MAX_INTEGER),
+        DI::SectionAck(fictionet::stdlib::quic::MAX_VARINT),
+        DI::StreamCancel(fictionet::stdlib::quic::MAX_VARINT),
+        DI::InsertCountIncrement(fictionet::stdlib::quic::MAX_VARINT),
     ] {
         let bytes = wire(&ins);
         assert_eq!(bytes.len(), qpack::MAX_INTEGER_BYTES);
@@ -961,10 +961,10 @@ fn qpack_instruction_failures_and_eof() {
 fn qpack_strict_writers() {
     for invalid in [
         EI::SetCapacity(qpack::MAX_TABLE_CAPACITY + 1),
-        EI::SetCapacity(qpack::MAX_INTEGER + 1),
-        EI::Duplicate(qpack::MAX_INTEGER + 1),
+        EI::SetCapacity(fictionet::stdlib::quic::MAX_VARINT + 1),
+        EI::Duplicate(fictionet::stdlib::quic::MAX_VARINT + 1),
         EI::InsertWithNameRef { static_table: true, index: 99, value: vec![] },
-        EI::InsertWithNameRef { static_table: false, index: qpack::MAX_INTEGER + 1, value: vec![] },
+        EI::InsertWithNameRef { static_table: false, index: fictionet::stdlib::quic::MAX_VARINT + 1, value: vec![] },
         EI::InsertWithNameRef { static_table: true, index: 0, value: vec![0; qpack::MAX_STRING + 1] },
         EI::InsertWithLiteralName { name: vec![b'a'; qpack::MAX_STRING + 1], value: vec![] },
         EI::InsertWithLiteralName { name: b"x-fuzz".to_vec(), value: vec![0; qpack::MAX_STRING + 1] },
@@ -976,7 +976,7 @@ fn qpack_strict_writers() {
     }
     for invalid in [
         DI::InsertCountIncrement(0),
-        DI::InsertCountIncrement(qpack::MAX_INTEGER + 1),
+        DI::InsertCountIncrement(fictionet::stdlib::quic::MAX_VARINT + 1),
         DI::SectionAck(u64::MAX),
         DI::StreamCancel(u64::MAX),
     ] {
@@ -984,8 +984,8 @@ fn qpack_strict_writers() {
         assert_eq!(invalid.to_bytes(), Err(qpack::Error::Unwritable));
     }
     for invalid in [
-        Rep::Indexed { static_table: true, index: qpack::MAX_INTEGER + 1 },
-        Rep::IndexedPostBase(qpack::MAX_INTEGER + 1),
+        Rep::Indexed { static_table: true, index: fictionet::stdlib::quic::MAX_VARINT + 1 },
+        Rep::IndexedPostBase(fictionet::stdlib::quic::MAX_VARINT + 1),
         Rep::LiteralNameRef { never_index: false, static_table: false, index: u64::MAX, value: vec![] },
         Rep::LiteralPostBaseNameRef { never_index: true, index: u64::MAX, value: vec![] },
         Rep::LiteralName { never_index: true, name: b"x-fuzz".to_vec(), value: vec![0; qpack::MAX_STRING + 1] },

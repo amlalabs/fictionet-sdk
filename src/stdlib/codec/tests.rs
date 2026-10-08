@@ -2163,3 +2163,10 @@ fn regression_pipe_spans_cover_assembled_message() {
     assert_eq!(spans.locate(0..1), None);
     assert_eq!(spans.locate(0..4), Some(0..8));
 }
+
+#[test]
+fn pad_to_four_edges() {
+    for (n, want) in [(0, 0), (1, 4), (3, 4), (4, 4), (5, 8), (usize::MAX - 3, usize::MAX - 3)] {
+        assert_eq!(super::pad_to_4(n), want);
+    }
+}

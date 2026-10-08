@@ -69,6 +69,7 @@
 
 extern crate alloc;
 
+use fictionet::stdlib::codec::leb128;
 use fictionet::stdlib::codec::{Decode, Step, Wire, Reader, Truncated, Trailing};
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 
@@ -332,18 +333,7 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     /// bit set on every byte but the last. It takes at most 5 bytes, and
     /// the fifth may hold only the top 4 bits of a u32.
     fn uvarint(&mut self) -> Result<u32, Error> {
-        let mut value = 0u32;
-        for i in 0..5 {
-            let b = self.u8()?;
-            if i == 4 && b > 0x0f {
-                return Err(Error::Varint);
-            }
-            value |= u32::from(b & 0x7f) << (7 * i);
-            if b & 0x80 == 0 {
-                return Ok(value);
-            }
-        }
-        Err(Error::Varint)
+        leb128::decode_with(|| self.u8().map_err(Error::from), 5, u64::from(u32::MAX), Error::Varint).map(|v| v as u32)
     }
 
     /// A VARINT: a zigzag-encoded i32 in an unsigned varint, so small
@@ -356,18 +346,8 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     /// A VARLONG: a zigzag-encoded i64 in at most 10 bytes, the tenth
     /// holding only the top bit.
     fn varlong(&mut self) -> Result<i64, Error> {
-        let mut value = 0u64;
-        for i in 0..10 {
-            let b = self.u8()?;
-            if i == 9 && b > 0x01 {
-                return Err(Error::Varint);
-            }
-            value |= u64::from(b & 0x7f) << (7 * i);
-            if b & 0x80 == 0 {
-                return Ok((value >> 1) as i64 ^ -((value & 1) as i64));
-            }
-        }
-        Err(Error::Varint)
+        let value = leb128::decode_with(|| self.u8().map_err(Error::from), 10, u64::MAX, Error::Varint)?;
+        Ok((value >> 1) as i64 ^ -((value & 1) as i64))
     }
 
     fn utf8(&mut self, n: usize) -> Result<String, Error> {
@@ -859,12 +839,8 @@ impl Writer {
     }
 
     /// An UNSIGNED_VARINT, in the fewest bytes.
-    fn uvarint(&mut self, mut v: u32) {
-        while v >= 0x80 {
-            self.u8((v as u8 & 0x7f) | 0x80);
-            v >>= 7;
-        }
-        self.u8(v as u8);
+    fn uvarint(&mut self, v: u32) {
+        leb128::encode_with(u64::from(v), |b| self.u8(b));
     }
 
     /// A VARINT.
@@ -874,12 +850,7 @@ impl Writer {
 
     /// A VARLONG.
     fn varlong(&mut self, v: i64) {
-        let mut u = ((v << 1) ^ (v >> 63)) as u64;
-        while u >= 0x80 {
-            self.u8((u as u8 & 0x7f) | 0x80);
-            u >>= 7;
-        }
-        self.u8(u as u8);
+        leb128::encode_with(((v << 1) ^ (v >> 63)) as u64, |b| self.u8(b));
     }
 
     /// A STRING.

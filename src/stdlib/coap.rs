@@ -53,6 +53,7 @@
 //! assert_eq!(reply.to_bytes().unwrap(), [0x61, 0x45, 0x12, 0x34, 0x77, 0xc0, 0xff, b'2', b'1', b'.', b'5']);
 //! ```
 
+use fictionet::stdlib::codec::ascii::{self, hex_upper};
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The UDP and TCP port CoAP servers listen on.
@@ -643,8 +644,8 @@ impl Options {
                     path.push(char::from(b));
                 } else {
                     path.push('%');
-                    path.push(char::from(HEX[usize::from(b >> 4)]));
-                    path.push(char::from(HEX[usize::from(b & 0x0f)]));
+                    path.push(char::from(hex_upper(b >> 4)));
+                    path.push(char::from(hex_upper(b)));
                 }
             }
         }
@@ -1423,36 +1424,10 @@ fn is_dot_segment(s: &[u8]) -> bool {
     s == b"." || s == b".."
 }
 
-/// The digits of a percent-encoding.
-const HEX: &[u8; 16] = b"0123456789ABCDEF";
-
-/// The value of hex digit `b`.
-fn hex_value(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
 /// `s` with each `%` and two hex digits turned into the byte they spell.
 fn percent_decode(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
-    let mut i = 0;
-    while let Some(&b) = s.get(i) {
-        let pair = s.get(i + 1).and_then(|&h| hex_value(h)).zip(s.get(i + 2).and_then(|&l| hex_value(l)));
-        match (b, pair) {
-            (b'%', Some((h, l))) => {
-                out.push(h << 4 | l);
-                i += 3;
-            }
-            _ => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
+    ascii::percent_decode_into(s, false, &mut out, usize::MAX);
     out
 }
 

@@ -80,6 +80,8 @@
 //! assert_eq!(basic.data.responses[0].cert_id.serial_number, [0x12, 0x34]);
 //! ```
 
+use fictionet::stdlib::codec::ascii;
+use fictionet::stdlib::codec::base64::{self, Padding};
 use fictionet::stdlib::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, Tag, Writer};
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
@@ -858,22 +860,12 @@ pub fn encode_get_path(der: &[u8]) -> Result<String, Error> {
         return Err(Error::TooLong);
     }
     let mut out = String::with_capacity(der.len().div_ceil(3) * 4 * 3);
-    for chunk in der.chunks(3) {
-        let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
-        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                let c = BASE64[(n >> (18 - 6 * i) & 0x3f) as usize];
-                match c {
-                    b'+' => out.push_str("%2B"),
-                    b'/' => out.push_str("%2F"),
-                    c => out.push(char::from(c)),
-                }
-            } else {
-                out.push_str("%3D");
-            }
-        }
-    }
+    base64::encode_with(der, |c| match c {
+        b'+' => out.push_str("%2B"),
+        b'/' => out.push_str("%2F"),
+        b'=' => out.push_str("%3D"),
+        c => out.push(char::from(c)),
+    });
     Ok(out)
 }
 
@@ -886,59 +878,12 @@ pub fn decode_get_path(segment: &str) -> Result<Vec<u8>, Error> {
     if s.len() > MAX_GET_PATH {
         return Err(Error::TooLong);
     }
-    let mut text = Vec::with_capacity(s.len());
-    let mut i = 0;
-    while i < s.len() {
-        if s[i] == b'%' {
-            let hex = s.get(i + 1..i + 3).ok_or(Error::GetPath)?;
-            let (hi, lo) = (hex_digit(hex[0])?, hex_digit(hex[1])?);
-            text.push(hi << 4 | lo);
-            i += 3;
-        } else {
-            text.push(s[i]);
-            i += 1;
-        }
-    }
-    let pad = text.iter().rev().take_while(|&&c| c == b'=').count();
-    let body = &text[..text.len() - pad];
-    if pad > 2 || (pad > 0 && text.len() % 4 != 0) || body.len() % 4 == 1 {
-        return Err(Error::GetPath);
-    }
-    let mut out = Vec::with_capacity(body.len() / 4 * 3 + 2);
-    for chunk in body.chunks(4) {
-        let mut n: u32 = 0;
-        for (j, &c) in chunk.iter().enumerate() {
-            n |= u32::from(base64_value(c)?) << (18 - 6 * j);
-        }
-        let bytes = n.to_be_bytes();
-        out.extend_from_slice(&bytes[1..chunk.len()]);
-    }
+    let text = ascii::percent_decode_strict(s).ok_or(Error::GetPath)?;
+    let out = base64::decode(&text, Padding::Optional).ok_or(Error::GetPath)?;
     if out.len() > MAX_MESSAGE {
         return Err(Error::TooLong);
     }
     Ok(out)
-}
-
-const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn base64_value(c: u8) -> Result<u8, Error> {
-    match c {
-        b'A'..=b'Z' => Ok(c - b'A'),
-        b'a'..=b'z' => Ok(c - b'a' + 26),
-        b'0'..=b'9' => Ok(c - b'0' + 52),
-        b'+' => Ok(62),
-        b'/' => Ok(63),
-        _ => Err(Error::GetPath),
-    }
-}
-
-fn hex_digit(c: u8) -> Result<u8, Error> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err(Error::GetPath),
-    }
 }
 
 impl Wire for Request {

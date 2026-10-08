@@ -48,6 +48,7 @@
 
 extern crate alloc;
 
+use fictionet::stdlib::codec::ascii::{self, hex_upper};
 use alloc::{string::String, vec::Vec};
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
@@ -136,7 +137,7 @@ pub fn decode_component(bytes: &[u8]) -> Result<String, Error> {
 /// [`decode_component`] for input already within [`MAX_INPUT`].
 fn decode_text(bytes: &[u8]) -> String {
     let mut out = Vec::with_capacity(bytes.len());
-    decode_into(bytes, true, &mut out);
+    ascii::percent_decode_into(bytes, true, &mut out, usize::MAX);
     match String::from_utf8(out) {
         Ok(s) => s,
         Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
@@ -152,35 +153,8 @@ pub fn percent_decode(bytes: &[u8]) -> Result<Vec<u8>, Error> {
         return Err(Error::TooLong);
     }
     let mut out = Vec::with_capacity(bytes.len());
-    decode_into(bytes, false, &mut out);
+    ascii::percent_decode_into(bytes, false, &mut out, usize::MAX);
     Ok(out)
-}
-
-/// Appends the percent-decoded `bytes` to `out`, reading `+` as a space
-/// when `plus` is set.
-fn decode_into(bytes: &[u8], plus: bool, out: &mut Vec<u8>) {
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'%'
-            && let (Some(h), Some(l)) = (bytes.get(i + 1).and_then(|&c| hex(c)), bytes.get(i + 2).and_then(|&c| hex(c))) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        out.push(if plus && b == b'+' { b' ' } else { b });
-        i += 1;
-    }
-}
-
-/// The value of one hex digit, either case.
-fn hex(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// The percent-encode sets of the WHATWG URL Standard. Each names the
@@ -275,14 +249,13 @@ fn encoded_len(bytes: &[u8], set: EncodeSet, space_as_plus: bool) -> usize {
 
 /// Appends `bytes` to `out`, percent-encoded with `set`.
 fn encode_into(bytes: &[u8], set: EncodeSet, space_as_plus: bool, out: &mut String) {
-    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
     for &b in bytes {
         if space_as_plus && b == b' ' {
             out.push('+');
         } else if set.contains(b) {
             out.push('%');
-            out.push(char::from(DIGITS[usize::from(b >> 4)]));
-            out.push(char::from(DIGITS[usize::from(b & 0x0f)]));
+            out.push(char::from(hex_upper(b >> 4)));
+            out.push(char::from(hex_upper(b)));
         } else {
             // Not in any set, so ASCII.
             out.push(char::from(b));

@@ -40,6 +40,7 @@
 //! # Ok::<(), fictionet::stdlib::fix::Error>(())
 //! ```
 
+use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 use std::convert::Infallible;
 use std::fmt;
@@ -243,17 +244,7 @@ fn data_tag(tag: u32) -> Option<u32> {
     LENGTH_DATA_PAIRS.iter().find(|p| p.0 == tag).map(|p| p.1)
 }
 fn decimal(b: &[u8]) -> Result<u32, Error> {
-    if b.is_empty() || b.len() > 10 {
-        return Err(Error::Field);
-    }
-    b.iter().try_fold(0u32, |n, b| {
-        if !b.is_ascii_digit() {
-            return Err(Error::Field);
-        }
-        n.checked_mul(10)
-            .and_then(|n| n.checked_add(u32::from(*b - b'0')))
-            .ok_or(Error::Field)
-    })
+    ascii::decimal(b, 10, u64::from(u32::MAX)).map(|n| n as u32).ok_or(Error::Field)
 }
 fn digits(n: usize) -> usize {
     if n == 0 { 1 } else { n.ilog10() as usize + 1 }

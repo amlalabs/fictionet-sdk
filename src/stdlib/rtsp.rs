@@ -80,6 +80,7 @@
 //! assert_eq!(stream.next(), None);
 //! ```
 
+use fictionet::stdlib::codec::ascii::{self, trim_ows_str as trim_ws, trim_ows as trim_frame_ws, is_tchar as is_token_byte};
 use fictionet::stdlib::codec::{Decode, Ending, LineError, Lines, Step, Wire};
 
 /// The TCP port RTSP servers listen on.
@@ -861,16 +862,6 @@ fn message_size(message: &Message) -> Result<usize, Error> {
         return Err(Error::Unwritable);
     }
     Ok(total)
-}
-
-fn trim_frame_ws(mut bytes: &[u8]) -> &[u8] {
-    while let Some((b' ' | b'\t', rest)) = bytes.split_first() {
-        bytes = rest;
-    }
-    while let Some((b' ' | b'\t', rest)) = bytes.split_last() {
-        bytes = rest;
-    }
-    bytes
 }
 
 impl Wire for Interleaved {
@@ -2043,25 +2034,11 @@ fn parse_content_length(v: &str) -> Result<usize, Error> {
 
 /// Reads decimal digits, with no sign or spaces, failing on overflow.
 fn parse_u64(s: &str) -> Option<u64> {
-    if s.is_empty() {
-        return None;
-    }
-    let mut n = 0u64;
-    for d in s.bytes() {
-        if !d.is_ascii_digit() {
-            return None;
-        }
-        n = n.checked_mul(10)?.checked_add(u64::from(d - b'0'))?;
-    }
-    Some(n)
+    ascii::decimal(s.as_bytes(), usize::MAX, u64::MAX)
 }
 
 fn is_ctl(b: u8) -> bool {
     b < 0x20 || b == 0x7f
-}
-
-fn is_token_byte(b: u8) -> bool {
-    b.is_ascii_graphic() && !b"()<>@,;:\\\"/[]?={}".contains(&b)
 }
 
 fn is_token(s: &str) -> bool {
@@ -2081,10 +2058,6 @@ fn valid_uri(s: &str) -> bool {
 
 fn valid_value(s: &str) -> bool {
     !s.bytes().any(|b| is_ctl(b) && b != b'\t')
-}
-
-fn trim_ws(s: &str) -> &str {
-    s.trim_matches([' ', '\t'])
 }
 
 /// A Transport header's ordered, nonempty list of specifications.

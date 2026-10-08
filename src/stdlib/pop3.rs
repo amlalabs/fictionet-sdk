@@ -45,6 +45,7 @@
 
 extern crate alloc;
 
+use fictionet::stdlib::codec::ascii::{self, hex_value as hex};
 use self::alloc::{collections::VecDeque, string::String, vec::Vec};
 use fictionet::stdlib::codec::{self, Decode, Wire};
 use std::num::NonZeroU32;
@@ -586,13 +587,7 @@ fn message(s: &str) -> Result<NonZeroU32, Error> {
 /// Decimal digits only, no sign, fitting in a `u64`. Leading zeros are
 /// allowed, however many there are.
 fn decimal(s: &str) -> Option<u64> {
-    if s.is_empty() {
-        return None;
-    }
-    s.bytes().try_fold(0u64, |n, c| {
-        let d = c.checked_sub(b'0').filter(|&d| d < 10)?;
-        n.checked_mul(10)?.checked_add(u64::from(d))
-    })
+    ascii::decimal(s.as_bytes(), usize::MAX, u64::MAX)
 }
 
 /// The decimal digits `s` starts with, one or more, read as by `decimal`.
@@ -614,12 +609,6 @@ fn parse_digest(s: &str) -> Result<[u8; 16], Error> {
         *o = hi << 4 | lo;
     }
     Ok(out)
-}
-
-fn hex(c: u8) -> Option<u8> {
-    char::from(c)
-        .to_digit(16)
-        .and_then(|d| u8::try_from(d).ok())
 }
 
 /// Splits a response code off the start of status text: the code without

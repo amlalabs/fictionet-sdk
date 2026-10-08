@@ -72,6 +72,7 @@
 //! assert_eq!(features[1].params.as_deref(), Some("size*;modify*;"));
 //! ```
 
+use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::{self, Decode, Step, Wire};
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
@@ -734,10 +735,7 @@ fn scan_host_port(s: &str) -> Option<(SocketAddrV4, usize)> {
 /// A string of one to `max` ASCII digits, read as a number. Leading zeros
 /// are allowed. Signs and spaces are not.
 fn decimal(s: &str, max: usize) -> Option<u32> {
-    if s.is_empty() || s.len() > max || !s.bytes().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    s.bytes().try_fold(0u32, |n, c| n.checked_mul(10)?.checked_add(u32::from(c - b'0')))
+    ascii::decimal(s.as_bytes(), max, u64::from(u32::MAX)).map(|n| n as u32)
 }
 
 /// Reply codes from RFC 959, section 4.2.2, and RFC 2428, and the

@@ -59,6 +59,9 @@
 //! assert_eq!(trailers[1], ("grpc-message".to_string(), "no user 'x'".to_string()));
 //! ```
 
+use fictionet::stdlib::codec::leb128;
+use fictionet::stdlib::codec::ascii::{self, hex_upper, trim_ows as trim, is_tchar as is_token, hex_value as hex};
+use fictionet::stdlib::codec::base64::{self, Padding};
 use std::fmt;
 use std::time::Duration;
 
@@ -775,7 +778,6 @@ pub fn response_headers(content_type: &ContentType) -> Vec<(String, String)> {
 /// UTF-8 becomes `%` and two capital hex digits. Text longer than
 /// [`MAX_STATUS_MESSAGE`] bytes returns an error.
 pub fn encode_message(text: &str) -> Result<String, Error> {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     if text.len() > MAX_STATUS_MESSAGE {
         return Err(Error::Value("grpc-message".into()));
     }
@@ -785,8 +787,8 @@ pub fn encode_message(text: &str) -> Result<String, Error> {
             out.push(char::from(b));
         } else {
             out.push('%');
-            out.push(char::from(HEX[usize::from(b >> 4)]));
-            out.push(char::from(HEX[usize::from(b & 15)]));
+            out.push(char::from(hex_upper(b >> 4)));
+            out.push(char::from(hex_upper(b)));
         }
     }
     Ok(out)
@@ -801,19 +803,7 @@ pub fn decode_message(value: &[u8]) -> String {
     // lands where it would on the whole text.
     let cap = MAX_STATUS_MESSAGE + 4;
     let mut bytes = Vec::with_capacity(value.len().min(cap));
-    let mut i = 0;
-    while i < value.len() && bytes.len() < cap {
-        let b = value[i];
-        let hi = value.get(i + 1).and_then(|&c| hex(c));
-        let lo = value.get(i + 2).and_then(|&c| hex(c));
-        if let (b'%', Some(hi), Some(lo)) = (b, hi, lo) {
-            bytes.push((hi << 4) | lo);
-            i += 3;
-            continue;
-        }
-        bytes.push(b);
-        i += 1;
-    }
+    ascii::percent_decode_into(value, false, &mut bytes, cap);
     let text = String::from_utf8_lossy(&bytes);
     clip_text(&text, MAX_STATUS_MESSAGE).to_string()
 }
@@ -1354,7 +1344,7 @@ impl Request {
                 return Err(Error::Name(name.clone()));
             }
             let ok = if name.ends_with("-bin") {
-                value.split(|&c| c == b',').all(is_base64)
+                value.split(|&c| c == b',').all(|v| base64::is_valid(v, Padding::Optional))
             } else {
                 value.iter().all(|c| (0x20..=0x7e).contains(c))
                     && value.first() != Some(&b' ')
@@ -1397,30 +1387,7 @@ fn clip_text(s: &str, max: usize) -> &str {
 
 /// A decimal number of 1 to 10 digits that fits in a u32.
 fn parse_decimal(b: &[u8]) -> Option<u32> {
-    if b.is_empty() || b.len() > 10 {
-        return None;
-    }
-    let mut n: u32 = 0;
-    for &c in b {
-        if !c.is_ascii_digit() {
-            return None;
-        }
-        n = n.checked_mul(10)?.checked_add(u32::from(c - b'0'))?;
-    }
-    Some(n)
-}
-
-fn hex(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn is_token(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
+    ascii::decimal(b, 10, u64::from(u32::MAX)).map(|n| n as u32)
 }
 
 /// Whether `e` can be a content-coding: one or more token characters.
@@ -1473,64 +1440,10 @@ fn is_metadata_name(name: &str) -> bool {
             .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || b"_-.".contains(&c))
 }
 
-fn base64_digit(c: u8) -> Option<u8> {
-    match c {
-        b'A'..=b'Z' => Some(c - b'A'),
-        b'a'..=b'z' => Some(c - b'a' + 26),
-        b'0'..=b'9' => Some(c - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
-}
-
-/// Whether `v` is base64 (RFC 4648, section 4), padded or not.
-fn is_base64(v: &[u8]) -> bool {
-    let body = v
-        .strip_suffix(b"==")
-        .or_else(|| v.strip_suffix(b"="))
-        .unwrap_or(v);
-    let padded = body.len() != v.len();
-    body.iter().all(|&c| base64_digit(c).is_some())
-        && body.len() % 4 != 1
-        && (!padded || v.len().is_multiple_of(4))
-}
-
-/// The bytes base64 text decodes to, one at a time, with no buffer. The
-/// text must have passed [`is_base64`].
-struct Base64<'a> {
-    text: &'a [u8],
-    bits: u32,
-    nbits: u32,
-}
-
-impl Iterator for Base64<'_> {
-    type Item = u8;
-
-    fn next(&mut self) -> Option<u8> {
-        while self.nbits < 8 {
-            let (&c, rest) = self.text.split_first()?;
-            self.text = rest;
-            self.bits = ((self.bits << 6) | u32::from(base64_digit(c)?)) & 0xfff;
-            self.nbits += 6;
-        }
-        self.nbits -= 8;
-        Some((self.bits >> self.nbits) as u8)
-    }
-}
-
 /// Reads a protobuf varint. `Err` means the bytes ran out inside it, or it
-/// had more than 10 bytes.
+/// overflowed a u64.
 fn varint(b: &mut impl Iterator<Item = u8>) -> Result<u64, ()> {
-    let mut n: u64 = 0;
-    for i in 0..10 {
-        let c = b.next().ok_or(())?;
-        n |= u64::from(c & 0x7f) << (7 * i);
-        if c & 0x80 == 0 {
-            return Ok(n);
-        }
-    }
-    Err(())
+    leb128::decode_with(|| b.next().ok_or(()), 10, u64::MAX, ())
 }
 
 /// The status code in a `grpc-status-details-bin` value: the `code` field
@@ -1539,19 +1452,7 @@ fn varint(b: &mut impl Iterator<Item = u8>) -> Result<u64, ()> {
 /// is not base64 of a protobuf message. It reads the value once, holding
 /// nothing.
 fn details_code(v: &[u8]) -> Option<i32> {
-    if !is_base64(v) {
-        return None;
-    }
-    let body = v
-        .strip_suffix(b"==")
-        .or_else(|| v.strip_suffix(b"="))
-        .unwrap_or(v);
-    let mut b = Base64 {
-        text: body,
-        bits: 0,
-        nbits: 0,
-    }
-    .peekable();
+    let mut b = base64::decoded(v, Padding::Optional)?.peekable();
     let mut code = None;
     loop {
         if b.peek().is_none() {
@@ -1581,21 +1482,21 @@ fn details_code(v: &[u8]) -> Option<i32> {
     }
 }
 
-fn trim(mut b: &[u8]) -> &[u8] {
-    while let [b' ' | b'\t', rest @ ..] = b {
-        b = rest;
-    }
-    while let [rest @ .., b' ' | b'\t'] = b {
-        b = rest;
-    }
-    b
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Decode, Fail, Stream, contract, finish, pump, test_support};
+
+    #[test]
+    fn status_details_refuse_varint_overflow() {
+        for bytes in [vec![0x80; 11], [vec![0x80; 9], vec![2]].concat()] {
+            assert_eq!(varint(&mut bytes.iter().copied()), Err(()));
+            let mut message = vec![8];
+            message.extend_from_slice(&bytes);
+            assert_eq!(details_code(base64::encode(&message).as_bytes()), None);
+        }
+    }
 
     #[test]
     fn messages_limits_and_header_refusals() {

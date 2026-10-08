@@ -74,6 +74,7 @@
 //! assert_eq!(m.body.get("ok"), Some(&Bson::Double(1.0)));
 //! ```
 
+use fictionet::stdlib::codec::crc32c::checksum as crc32c;
 use fictionet::stdlib::codec::Reader;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -947,32 +948,6 @@ fn write_cstring(s: &str, out: &mut Vec<u8>) -> Result<(), Error> {
     out.push(0);
     Ok(())
 }
-
-/// CRC-32C (Castagnoli) of `bytes`, the checksum OP_MSG uses.
-pub fn crc32c(bytes: &[u8]) -> u32 {
-    let mut c = !0u32;
-    for &b in bytes {
-        c = CRC32C_TABLE[((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8);
-    }
-    !c
-}
-
-/// The reflected polynomial 0x1EDC6F41, one entry per byte value.
-const CRC32C_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut c = i as u32;
-        let mut k = 0;
-        while k < 8 {
-            c = if c & 1 != 0 { (c >> 1) ^ 0x82f6_3b78 } else { c >> 1 };
-            k += 1;
-        }
-        table[i] = c;
-        i += 1;
-    }
-    table
-};
 
 /// A message header's four fields, as they are on the wire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

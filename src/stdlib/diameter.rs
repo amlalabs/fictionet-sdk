@@ -67,6 +67,7 @@
 //! assert_eq!(back.avp(avp::RESULT_CODE).and_then(Avp::as_u32), Some(result::SUCCESS));
 //! ```
 
+use fictionet::stdlib::codec::pad_to_4 as padded;
 use fictionet::stdlib::codec::{be24, be32};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -1492,12 +1493,6 @@ impl std::fmt::Display for Uri {
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     let head = s.get(..prefix.len())?;
     if head.eq_ignore_ascii_case(prefix) { s.get(prefix.len()..) } else { None }
-}
-
-/// `len` rounded up to a multiple of 4. `len` is below 2^24 wherever it
-/// is called, so this cannot overflow.
-fn padded(len: usize) -> usize {
-    (len + 3) & !3
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@
 //! chunk extensions are refused. Requests ignore Upgrade offers and continue
 //! as HTTP; 101 responses end HTTP for handoff without handling Upgrade.
 
+use fictionet::stdlib::codec::ascii::{self, trim_ows as trim};
 use fictionet::stdlib::codec::{
     Buffer, Decode, Ending, Fail, LineError, Lines, PumpError, Step, Stream, Wire, finish, try_pump,
 };
@@ -1304,19 +1305,10 @@ fn chunk_framing(
 fn token(b: &[u8]) -> bool {
     !b.is_empty()
         && b.iter()
-            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b))
+            .all(|&b| ascii::is_tchar(b))
 }
 fn field_byte(b: u8) -> bool {
     b == b'\t' || (b >= b' ' && b != 127)
-}
-fn trim(mut b: &[u8]) -> &[u8] {
-    while b.first().is_some_and(|b| matches!(b, b' ' | b'\t')) {
-        b = &b[1..];
-    }
-    while b.last().is_some_and(|b| matches!(b, b' ' | b'\t')) {
-        b = &b[..b.len().saturating_sub(1)];
-    }
-    b
 }
 fn named<'a>(headers: &'a [Header], name: &'a str) -> impl Iterator<Item = &'a [u8]> {
     headers
@@ -1337,6 +1329,9 @@ fn version(b: &[u8]) -> Result<Version, Error> {
     }
 }
 fn number(b: &[u8], radix: u32, error: Error) -> Result<u64, Error> {
+    if radix == 10 {
+        return ascii::decimal(b, usize::MAX, u64::MAX).ok_or(error);
+    }
     if b.is_empty() {
         return Err(error);
     }
@@ -1474,7 +1469,7 @@ fn header_line(line: &[u8], lenient: bool) -> Result<Header, Error> {
         return Err(Error::Header);
     }
     Ok(Header {
-        name: String::from_utf8(name.to_vec()).map_err(|_| Error::Header)?,
+        name: core::str::from_utf8(name).map(str::to_owned).map_err(|_| Error::Header)?,
         value: value.to_vec(),
     })
 }
@@ -1618,8 +1613,8 @@ fn request_line(line: &[u8], lenient: bool) -> Result<(String, String, Version),
         return Err(Error::StartLine);
     }
     Ok((
-        String::from_utf8(method.to_vec()).map_err(|_| Error::StartLine)?,
-        String::from_utf8(target.to_vec()).map_err(|_| Error::StartLine)?,
+        core::str::from_utf8(method).map(str::to_owned).map_err(|_| Error::StartLine)?,
+        core::str::from_utf8(target).map(str::to_owned).map_err(|_| Error::StartLine)?,
         version,
     ))
 }
