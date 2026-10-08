@@ -62,6 +62,7 @@ extern crate alloc;
 use fictionet::stdlib::codec::ascii::hex_value;
 use fictionet::stdlib::codec::{self, Decode, Wire};
 use alloc::{
+    borrow::ToOwned,
     boxed::Box,
     format,
     string::{String, ToString},
@@ -532,7 +533,7 @@ impl Values {
     fn read<T>(
         &mut self,
         input: &[u8],
-        scan: fn(&mut Scan, &[u8], &Limits) -> Option<usize>,
+        mode: Mode,
         parse: fn(&[u8], &Limits) -> Step<T>,
     ) -> Result<codec::Step<T>, Error> {
         if input.is_empty() {
@@ -542,7 +543,7 @@ impl Values {
         if bytes.len() < self.need {
             return Ok(codec::Step::Need);
         }
-        if let Some(need) = scan(&mut self.scan, bytes, &self.limits)
+        if let Some(need) = scan(&mut self.scan, bytes, &self.limits, mode)
             && need <= self.limits.frame
         {
             self.need = need;
@@ -581,7 +582,7 @@ impl Decode for Values {
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<codec::Step<Value>, Error> {
-        self.read(input, scan_value, value_top)
+        self.read(input, Mode::Value, value_top)
     }
 }
 
@@ -625,7 +626,7 @@ impl Decode for Commands {
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<codec::Step<Command>, Error> {
-        Ok(match self.values.read(input, scan_command, command_top)? {
+        Ok(match self.values.read(input, Mode::Command, command_top)? {
             codec::Step::Item(command, used) if command.args.is_empty() => codec::Step::Skip(used),
             step => step,
         })
@@ -673,46 +674,41 @@ enum Open {
     Chunks(usize),
 }
 
-/// Whether the scan has found a whole frame: one element has ended and
-/// no aggregate is open.
-enum Scanned {
-    More,
-    Whole,
+// The grammar emits borrowed fields. Scanning discards them; parsing owns them.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Value,
+    Resp2,
+    Command,
+}
+
+enum Event<'a> {
+    Scalar(Value),
+    Bytes(u8, &'a [u8]),
+    Start(u8, usize),
+    Chunk(&'a [u8]),
+    Inline(&'a [u8]),
+    End,
 }
 
 impl Scan {
-    /// One element has ended at `pos`: count it in the aggregate around
-    /// it, and close each aggregate that it fills.
-    fn ended(&mut self, pos: usize) -> Scanned {
+    /// Complete one child without closing its parent. The next event closes it.
+    #[inline]
+    fn ended(&mut self, pos: usize) {
         self.pos = pos;
-        loop {
-            let Some(slot) = self.open.last_mut() else {
-                return Scanned::Whole;
+        if let Some(slot) = self.open.last_mut() {
+            *slot = match *slot {
+                Open::Left(n) | Open::Push(n) => Open::Left(n.saturating_sub(1)),
+                Open::Attr(n) => Open::Attr(n.saturating_sub(1)),
+                Open::Streamed { pairs, seen } => Open::Streamed { pairs, seen: seen.saturating_add(1) },
+                Open::Chunks(n) => Open::Chunks(n),
             };
-            let left = match *slot {
-                Open::Left(n) | Open::Push(n) => {
-                    *slot = Open::Left(n.saturating_sub(1));
-                    n.saturating_sub(1)
-                }
-                Open::Attr(n) => {
-                    *slot = Open::Attr(n.saturating_sub(1));
-                    n.saturating_sub(1)
-                }
-                Open::Streamed { pairs, seen } => {
-                    *slot = Open::Streamed { pairs, seen: seen.saturating_add(1) };
-                    return Scanned::More;
-                }
-                Open::Chunks(_) => return Scanned::More,
-            };
-            if left > 0 {
-                return Scanned::More;
-            }
-            self.open.pop();
         }
     }
 
     /// Whether the value about to start is at the top level, perhaps
     /// after attributes, where a push may be.
+    #[inline]
     fn top(&self) -> bool {
         self.open.iter().all(|o| matches!(o, Open::Attr(1)))
     }
@@ -748,19 +744,20 @@ impl Scan {
     }
 }
 
-/// Goes on checking a value from where `s` stopped. It returns how many
-/// bytes the value needs at least, or `None` when the value is whole or
-/// faulty, and the full reader should read it. It follows [`value`] step
-/// by step, so the two agree on what needs more bytes.
-fn scan_value(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
+/// Resume the same reader used by exact parsing, without owning its fields.
+fn scan(s: &mut Scan, b: &[u8], lim: &Limits, mode: Mode) -> Option<usize> {
+    if mode == Mode::Command && b.first() != Some(&marker::ARRAY) {
+        return scan_inline(s, b, lim);
+    }
     loop {
         let start = s.pos.saturating_add(1);
         if s.line_waits(b, start, lim.line) {
             return Some(b.len().saturating_add(1));
         }
-        match scan_step(s, b, lim) {
-            Ok(Scanned::More) => {}
-            Ok(Scanned::Whole) | Err(Fail::Bad(_)) => return None,
+        match read_event(s, b, lim, mode) {
+            Ok(_) if s.open.is_empty() => return None,
+            Ok(_) => {}
+            Err(Fail::Bad(_)) => return None,
             Err(Fail::Need(n)) => {
                 s.note_line(b, start, n, lim.line);
                 return Some(n);
@@ -769,13 +766,16 @@ fn scan_value(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
     }
 }
 
-/// Checks one element, or one chunk of a streamed string, at `s.pos`.
-/// It changes `s` only when the element is whole.
-fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
+/// Read one grammar event. Only complete events advance the reader.
+fn read_event<'a>(s: &mut Scan, b: &'a [u8], lim: &Limits, mode: Mode) -> Result<Event<'a>, Fail> {
     let pos = s.pos;
     match s.open.last().copied() {
+        Some(Open::Left(0) | Open::Attr(0)) => {
+            s.open.pop();
+            s.ended(pos);
+            return Ok(Event::End);
+        }
         Some(Open::Chunks(len)) => {
-            // As streamed_string reads one chunk.
             match b.get(pos) {
                 None => return Err(Fail::Need(pos.saturating_add(1))),
                 Some(&marker::CHUNK) => {}
@@ -785,23 +785,22 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
             let n = digits(l).ok_or(Error::BadLength)?;
             if n == 0 {
                 s.open.pop();
-                return Ok(s.ended(e));
+                s.ended(e);
+                return Ok(Event::End);
             }
             if n > lim.bulk.saturating_sub(len) {
                 return Err(Error::BulkTooLong.into());
             }
-            let (_, e) = data(b, e, n, lim)?;
-            s.open.pop();
-            s.open.push(Open::Chunks(len + n));
+            let (d, e) = data(b, e, n, lim)?;
+            *s.open.last_mut().unwrap() = Open::Chunks(len + n);
             s.pos = e;
-            return Ok(Scanned::More);
+            return Ok(Event::Chunk(d));
         }
         Some(Open::Streamed { pairs, seen }) if !pairs || seen % 2 == 0 => {
-            // As streamed_list and streamed_pairs check before an element
-            // or a key.
             if let Some(e) = stream_end(b, pos, lim)? {
                 s.open.pop();
-                return Ok(s.ended(e));
+                s.ended(e);
+                return Ok(Event::End);
             }
             if (if pairs { seen / 2 } else { seen }) >= lim.elements {
                 return Err(Error::TooManyElements.into());
@@ -812,125 +811,134 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
     let Some(&t) = b.get(pos) else {
         return Err(Fail::Need(pos.saturating_add(1)));
     };
-    let depth = s.open.len();
-    // As list checks a push's first element.
+    if mode == Mode::Command {
+        if pos == 0 {
+            if t != marker::ARRAY {
+                let (text, e) = inline_text(b, lim)?;
+                s.ended(e);
+                return Ok(Event::Inline(text));
+            }
+            let (l, e) = line(b, 1, lim)?;
+            let n = redis_ll(l).ok_or(Error::TooManyElements)?;
+            let n = usize::try_from(n).unwrap_or(0);
+            if n > lim.elements {
+                return Err(Error::TooManyElements.into());
+            }
+            s.open.push(Open::Left(n));
+            s.pos = e;
+            return Ok(Event::Start(t, n));
+        }
+        if t != marker::BULK {
+            return Err(Error::ExpectedBulk(t).into());
+        }
+        let (l, e) = line(b, pos + 1, lim)?;
+        let n = bulk_len(l).ok_or(Error::BulkTooLong)?;
+        let (d, e) = data(b, e, n, lim)?;
+        s.ended(e);
+        return Ok(Event::Bytes(t, d));
+    }
+    if mode == Mode::Resp2 && !matches!(t, marker::SIMPLE | marker::ERROR | marker::INTEGER | marker::BULK | marker::ARRAY) {
+        return Err(Error::UnknownType(t).into());
+    }
     let push_first = matches!(s.open.last(), Some(Open::Push(_)));
     if push_first && !is_string_marker(t) {
         return Err(Error::Malformed(marker::PUSH).into());
     }
-    match t {
+    let p = pos + 1;
+    let (event, end) = match t {
+        marker::SIMPLE | marker::ERROR | marker::BIG_NUMBER => {
+            let (l, e) = line(b, p, lim)?;
+            if t == marker::BIG_NUMBER && !big_ok(l) {
+                return Err(Error::Malformed(t).into());
+            }
+            (Event::Bytes(t, l), e)
+        }
+        marker::INTEGER => {
+            let (l, e) = line(b, p, lim)?;
+            (Event::Scalar(Value::Integer(int(l).ok_or(Error::Malformed(t))?)), e)
+        }
+        marker::NULL => {
+            let (l, e) = line(b, p, lim)?;
+            if !l.is_empty() {
+                return Err(Error::Malformed(t).into());
+            }
+            (Event::Scalar(Value::Null), e)
+        }
+        marker::BOOLEAN => {
+            let (l, e) = line(b, p, lim)?;
+            let v = match l {
+                b"t" => true,
+                b"f" => false,
+                _ => return Err(Error::Malformed(t).into()),
+            };
+            (Event::Scalar(Value::Boolean(v)), e)
+        }
+        marker::DOUBLE => {
+            let (l, e) = line(b, p, lim)?;
+            (Event::Scalar(Value::Double(double(l).ok_or(Error::Malformed(t))?)), e)
+        }
+        marker::BULK | marker::BULK_ERROR | marker::VERBATIM => {
+            let (l, e) = line(b, p, lim)?;
+            match length(l)? {
+                Len::Null if t == marker::BULK => (Event::Scalar(Value::Null), e),
+                Len::Streamed if t == marker::BULK && mode != Mode::Resp2 => {
+                    s.open.push(Open::Chunks(0));
+                    s.pos = e;
+                    return Ok(Event::Start(t, 0));
+                }
+                Len::N(n) => {
+                    let (d, e) = data(b, e, n, lim)?;
+                    if t == marker::VERBATIM && (d.len() < 4 || d[3] != b':') {
+                        return Err(Error::Malformed(t).into());
+                    }
+                    (Event::Bytes(t, d), e)
+                }
+                _ => return Err(Error::BadLength.into()),
+            }
+        }
         marker::ARRAY | marker::SET | marker::PUSH | marker::MAP | marker::ATTRIBUTE => {
-            let (l, e) = line(b, pos + 1, lim)?;
+            let (l, e) = line(b, p, lim)?;
             let len = length(l)?;
-            if matches!(len, Len::Null) && t == marker::ARRAY {
-                return Ok(s.ended(e));
+            if mode == Mode::Resp2 && matches!(len, Len::Streamed) {
+                return Err(Error::BadLength.into());
+            }
+            if matches!(len, Len::Null) && matches!(t, marker::ARRAY | marker::SET | marker::PUSH) {
+                if t != marker::ARRAY {
+                    return Err(Error::BadLength.into());
+                }
+                s.ended(e);
+                return Ok(Event::Scalar(Value::NullArray));
             }
             if t == marker::PUSH && (!s.top() || matches!(len, Len::N(0))) {
-                return Err(Error::Malformed(marker::PUSH).into());
+                return Err(Error::Malformed(t).into());
             }
-            if depth >= depth_limit(lim) {
+            if s.open.len() >= depth_limit(lim) {
                 return Err(Error::TooDeep.into());
             }
             let pairs = matches!(t, marker::MAP | marker::ATTRIBUTE);
-            let open = match len {
+            let (open, count) = match len {
                 Len::N(n) if n > lim.elements => return Err(Error::TooManyElements.into()),
-                // An attribute's entries, then the value they describe.
-                Len::N(n) if t == marker::ATTRIBUTE => Open::Attr(n.saturating_mul(2).saturating_add(1)),
-                Len::N(n) if pairs => Open::Left(n.saturating_mul(2)),
-                Len::N(n) if t == marker::PUSH => Open::Push(n),
-                Len::N(n) => Open::Left(n),
-                Len::Streamed if t != marker::PUSH && t != marker::ATTRIBUTE => Open::Streamed { pairs, seen: 0 },
+                Len::N(n) if t == marker::ATTRIBUTE => (Open::Attr(n.saturating_mul(2).saturating_add(1)), n),
+                Len::N(n) if pairs => (Open::Left(n.saturating_mul(2)), n),
+                Len::N(n) if t == marker::PUSH => (Open::Push(n), n),
+                Len::N(n) => (Open::Left(n), n),
+                Len::Streamed if t != marker::PUSH && t != marker::ATTRIBUTE => (Open::Streamed { pairs, seen: 0 }, 0),
                 _ => return Err(Error::BadLength.into()),
             };
-            if matches!(open, Open::Left(0)) {
-                return Ok(s.ended(e));
-            }
             s.open.push(open);
             s.pos = e;
-            Ok(Scanned::More)
+            return Ok(Event::Start(t, count));
         }
-        marker::BULK if b.get(pos + 1) == Some(&b'?') => {
-            let (l, e) = line(b, pos + 1, lim)?;
-            if l != b"?" {
-                return Err(Error::BadLength.into());
-            }
-            s.open.push(Open::Chunks(0));
-            s.pos = e;
-            Ok(Scanned::More)
-        }
-        // Every other type holds no values, and value reads it whole.
-        _ => {
-            let (v, e) = value(b, pos, depth, false, lim)?;
-            if push_first && v == Value::Null {
-                return Err(Error::Malformed(marker::PUSH).into());
-            }
-            Ok(s.ended(e))
-        }
-    }
-}
-
-/// Goes on checking a command from where `s` stopped, as [`scan_value`]
-/// does a value. Only an array of bulk strings is scanned. An inline
-/// command is one line, which [`inline`] reads.
-fn scan_command(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
-    match b.first() {
-        None => return Some(1),
-        Some(&marker::ARRAY) => {}
-        Some(_) => return scan_inline(s, b, lim),
-    }
-    loop {
-        let start = s.pos.saturating_add(1);
-        if s.line_waits(b, start, lim.line) {
-            return Some(b.len().saturating_add(1));
-        }
-        match command_step(s, b, lim) {
-            Ok(true) => {}
-            Ok(false) | Err(Fail::Bad(_)) => return None,
-            Err(Fail::Need(n)) => {
-                s.note_line(b, start, n, lim.line);
-                return Some(n);
-            }
-        }
-    }
-}
-
-/// Checks a command array's count, or one argument, at `s.pos`. It
-/// returns whether there is more to check, and changes `s` only when the
-/// part is whole.
-fn command_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<bool, Fail> {
-    let Some(&Open::Left(left)) = s.open.last() else {
-        // The count, as multibulk reads it.
-        let (l, e) = line(b, 1, lim)?;
-        return match redis_ll(l).and_then(|n| usize::try_from(n).ok()) {
-            Some(n) if n > 0 && n <= lim.elements => {
-                s.open.push(Open::Left(n));
-                s.pos = e;
-                Ok(true)
-            }
-            _ => Ok(false),
-        };
+        _ => return Err(Error::UnknownType(t).into()),
     };
-    if left == 0 {
-        return Ok(false);
+    if push_first && matches!(event, Event::Scalar(Value::Null)) {
+        return Err(Error::Malformed(marker::PUSH).into());
     }
-    // One argument, as multibulk reads it.
-    let pos = s.pos;
-    match b.get(pos) {
-        None => return Err(Fail::Need(pos.saturating_add(1))),
-        Some(&marker::BULK) => {}
-        Some(_) => return Ok(false),
-    }
-    let (l, e) = line(b, pos + 1, lim)?;
-    let n = bulk_len(l).ok_or(Error::BulkTooLong)?;
-    let (_, e) = data(b, e, n, lim)?;
-    if let Some(slot) = s.open.last_mut() {
-        *slot = Open::Left(left - 1);
-    }
-    s.pos = e;
-    Ok(true)
+    s.ended(end);
+    Ok(event)
 }
 
-/// Goes on checking an inline command, as [`inline`] reads it, searching
+/// Goes on checking an inline command, as [`inline_text`] reads it, searching
 /// only the bytes that came since the last attempt for the line's end.
 fn scan_inline(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
     if let Some(q) = s.quiet
@@ -945,7 +953,7 @@ fn scan_inline(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
             return Some(b.len().saturating_add(1));
         }
     }
-    match inline(b, lim) {
+    match inline_text(b, lim) {
         Err(Fail::Need(n)) => {
             // Needing more, a line no longer than the limit holds no LF,
             // or a NUL before it.
@@ -977,11 +985,11 @@ fn bounded<T>(r: Step<T>, lim: &Limits) -> Step<T> {
 }
 
 fn value_top(b: &[u8], lim: &Limits) -> Step<Value> {
-    bounded(value(frame(b, lim), 0, 0, true, lim), lim)
+    bounded(read_value(frame(b, lim), lim, Mode::Value), lim)
 }
 
 fn command_top(b: &[u8], lim: &Limits) -> Step<Command> {
-    bounded(command(frame(b, lim), lim), lim)
+    bounded(read_command(frame(b, lim), lim), lim)
 }
 
 /// The line starting at `pos`, ended by CR LF, and where the next one
@@ -1171,119 +1179,102 @@ fn big_ok(l: &[u8]) -> bool {
     !ds.is_empty() && ds.iter().all(u8::is_ascii_digit)
 }
 
-/// The value at `pos`, nested `depth` deep. `top` says whether it is at
-/// the top level, perhaps after attributes, where a push may be.
-fn value(b: &[u8], pos: usize, depth: usize, top: bool, lim: &Limits) -> Step<Value> {
-    let Some(&t) = b.get(pos) else {
-        return Err(Fail::Need(pos.saturating_add(1)));
-    };
-    let p = pos + 1;
-    match t {
-        marker::SIMPLE | marker::ERROR => {
-            let (l, e) = line(b, p, lim)?;
-            let v = if t == marker::SIMPLE { Value::Simple(l.to_vec()) } else { Value::Error(l.to_vec()) };
-            Ok((v, e))
-        }
-        marker::INTEGER => {
-            let (l, e) = line(b, p, lim)?;
-            Ok((Value::Integer(int(l).ok_or(Error::Malformed(t))?), e))
-        }
-        marker::NULL => {
-            let (l, e) = line(b, p, lim)?;
-            if !l.is_empty() {
-                return Err(Error::Malformed(t).into());
-            }
-            Ok((Value::Null, e))
-        }
-        marker::BOOLEAN => {
-            let (l, e) = line(b, p, lim)?;
-            let v = match l {
-                b"t" => true,
-                b"f" => false,
-                _ => return Err(Error::Malformed(t).into()),
-            };
-            Ok((Value::Boolean(v), e))
-        }
-        marker::DOUBLE => {
-            let (l, e) = line(b, p, lim)?;
-            Ok((Value::Double(double(l).ok_or(Error::Malformed(t))?), e))
-        }
-        marker::BIG_NUMBER => {
-            let (l, e) = line(b, p, lim)?;
-            if !big_ok(l) {
-                return Err(Error::Malformed(t).into());
-            }
-            Ok((Value::BigNumber(l.iter().map(|&c| char::from(c)).collect()), e))
-        }
-        marker::BULK => {
-            let (l, e) = line(b, p, lim)?;
-            match length(l)? {
-                Len::Null => Ok((Value::Null, e)),
-                Len::Streamed => streamed_string(b, e, lim),
-                Len::N(n) => {
-                    let (d, e) = data(b, e, n, lim)?;
-                    Ok((Value::Bulk(d.to_vec()), e))
+/// Own the fields of a complete frame. The grammar stays in `read_event`.
+fn read_value(b: &[u8], lim: &Limits, mode: Mode) -> Step<Value> {
+    let mut s = Scan::default();
+    let event = read_event(&mut s, b, lim, mode)?;
+    let value = own_value(event, &mut s, b, lim, mode)?;
+    Ok((value, s.pos))
+}
+
+fn own_value(event: Event<'_>, s: &mut Scan, b: &[u8], lim: &Limits, mode: Mode) -> Result<Value, Fail> {
+    Ok(match event {
+        Event::Scalar(value) => value,
+        Event::Bytes(t, d) => match t {
+            marker::SIMPLE => Value::Simple(d.to_vec()),
+            marker::ERROR => Value::Error(d.to_vec()),
+            marker::BULK => Value::Bulk(d.to_vec()),
+            marker::BULK_ERROR => Value::BulkError(d.to_vec()),
+            marker::BIG_NUMBER => Value::BigNumber(core::str::from_utf8(d).unwrap().to_owned()),
+            marker::VERBATIM => Value::Verbatim { format: [d[0], d[1], d[2]], text: d[4..].to_vec() },
+            _ => unreachable!(),
+        },
+        Event::Start(marker::BULK, _) => {
+            let mut out = Vec::new();
+            loop {
+                match read_event(s, b, lim, mode)? {
+                    Event::Chunk(d) => out.extend_from_slice(d),
+                    Event::End => break,
+                    _ => unreachable!(),
                 }
             }
+            Value::Bulk(out)
         }
-        marker::BULK_ERROR | marker::VERBATIM => {
-            let (l, e) = line(b, p, lim)?;
-            let Len::N(n) = length(l)? else {
-                return Err(Error::BadLength.into());
-            };
-            let (d, e) = data(b, e, n, lim)?;
-            if t == marker::BULK_ERROR {
-                return Ok((Value::BulkError(d.to_vec()), e));
+        Event::Start(t, n) if matches!(t, marker::MAP | marker::ATTRIBUTE) => {
+            let mut entries = Vec::with_capacity(capacity(b, s.pos, n, 6));
+            loop {
+                let event = read_event(s, b, lim, mode)?;
+                if matches!(event, Event::End) {
+                    return Ok(Value::Map(entries));
+                }
+                let key = own_value(event, s, b, lim, mode)?;
+                if t == marker::ATTRIBUTE && entries.len() == n {
+                    assert!(matches!(read_event(s, b, lim, mode)?, Event::End));
+                    return Ok(Value::Attribute { attributes: entries, value: Box::new(key) });
+                }
+                let event = read_event(s, b, lim, mode)?;
+                let value = own_value(event, s, b, lim, mode)?;
+                entries.push((key, value));
             }
-            if d.len() < 4 || d[3] != b':' {
-                return Err(Error::Malformed(t).into());
-            }
-            Ok((Value::Verbatim { format: [d[0], d[1], d[2]], text: d[4..].to_vec() }, e))
         }
-        marker::ARRAY | marker::SET | marker::PUSH => {
-            let (l, e) = line(b, p, lim)?;
-            let len = length(l)?;
-            if matches!(len, Len::Null) {
-                return if t == marker::ARRAY { Ok((Value::NullArray, e)) } else { Err(Error::BadLength.into()) };
+        Event::Start(t, n) => {
+            let mut items = Vec::with_capacity(capacity(b, s.pos, n, 3));
+            loop {
+                let event = read_event(s, b, lim, mode)?;
+                if matches!(event, Event::End) {
+                    break;
+                }
+                items.push(own_value(event, s, b, lim, mode)?);
             }
-            // A push comes only at the top level, and starts with a string.
-            if t == marker::PUSH && (!top || matches!(len, Len::N(0))) {
-                return Err(Error::Malformed(t).into());
-            }
-            if depth >= depth_limit(lim) {
-                return Err(Error::TooDeep.into());
-            }
-            let (items, e) = match len {
-                Len::N(n) => list(b, e, n, depth, t == marker::PUSH, lim)?,
-                Len::Streamed if t != marker::PUSH => streamed_list(b, e, depth, lim)?,
-                _ => return Err(Error::BadLength.into()),
-            };
-            let v = match t {
+            match t {
                 marker::ARRAY => Value::Array(items),
                 marker::SET => Value::Set(items),
-                _ => Value::Push(items),
-            };
-            Ok((v, e))
-        }
-        marker::MAP | marker::ATTRIBUTE => {
-            let (l, e) = line(b, p, lim)?;
-            let len = length(l)?;
-            if depth >= depth_limit(lim) {
-                return Err(Error::TooDeep.into());
+                marker::PUSH => Value::Push(items),
+                _ => unreachable!(),
             }
-            let (entries, e) = match len {
-                Len::N(n) => pairs(b, e, n, depth, lim)?,
-                Len::Streamed if t == marker::MAP => streamed_pairs(b, e, depth, lim)?,
-                _ => return Err(Error::BadLength.into()),
-            };
-            if t == marker::MAP {
-                return Ok((Value::Map(entries), e));
-            }
-            let (v, e) = value(b, e, depth + 1, top, lim)?;
-            Ok((Value::Attribute { attributes: entries, value: Box::new(v) }, e))
         }
-        _ => Err(Error::UnknownType(t).into()),
-    }
+        _ => unreachable!(),
+    })
+}
+
+fn read_command(b: &[u8], lim: &Limits) -> Step<Command> {
+    let mut s = Scan::default();
+    let event = read_event(&mut s, b, lim, Mode::Command)?;
+    let args = match event {
+        Event::Inline(text) => {
+            let args = split_args(text)?;
+            if args.len() > lim.elements {
+                return Err(Error::TooManyElements.into());
+            }
+            if args.iter().any(|a| a.len() > lim.bulk) {
+                return Err(Error::BulkTooLong.into());
+            }
+            args
+        }
+        Event::Start(_, n) => {
+            let mut args = Vec::with_capacity(capacity(b, s.pos, n, 6));
+            loop {
+                match read_event(&mut s, b, lim, Mode::Command)? {
+                    Event::Bytes(_, d) => args.push(d.to_vec()),
+                    Event::End => break,
+                    _ => unreachable!(),
+                }
+            }
+            args
+        }
+        _ => unreachable!(),
+    };
+    Ok((Command { args }, s.pos))
 }
 
 /// A capacity for `n` items of at least `min` bytes each, no more than
@@ -1297,47 +1288,6 @@ fn capacity(b: &[u8], pos: usize, n: usize, min: usize) -> usize {
 /// How deep the readers let aggregates nest under `lim`.
 fn depth_limit(lim: &Limits) -> usize {
     lim.depth.min(DEPTH_CEILING)
-}
-
-/// `n` elements from `pos`. With `push`, the first must be a string.
-fn list(b: &[u8], mut pos: usize, n: usize, depth: usize, push: bool, lim: &Limits) -> Step<Vec<Value>> {
-    if n > lim.elements {
-        return Err(Error::TooManyElements.into());
-    }
-    let mut items = Vec::with_capacity(capacity(b, pos, n, 3));
-    for i in 0..n {
-        let first = push && i == 0;
-        if first {
-            match b.get(pos) {
-                None => return Err(Fail::Need(pos.saturating_add(1))),
-                Some(&t) if !is_string_marker(t) => {
-                    return Err(Error::Malformed(marker::PUSH).into());
-                }
-                Some(_) => {}
-            }
-        }
-        let (v, e) = value(b, pos, depth + 1, false, lim)?;
-        if first && v == Value::Null {
-            return Err(Error::Malformed(marker::PUSH).into());
-        }
-        items.push(v);
-        pos = e;
-    }
-    Ok((items, pos))
-}
-
-fn pairs(b: &[u8], mut pos: usize, n: usize, depth: usize, lim: &Limits) -> Step<Vec<(Value, Value)>> {
-    if n > lim.elements {
-        return Err(Error::TooManyElements.into());
-    }
-    let mut entries = Vec::with_capacity(capacity(b, pos, n, 6));
-    for _ in 0..n {
-        let (k, e) = value(b, pos, depth + 1, false, lim)?;
-        let (v, e) = value(b, e, depth + 1, false, lim)?;
-        entries.push((k, v));
-        pos = e;
-    }
-    Ok((entries, pos))
 }
 
 /// Whether a streamed aggregate ends at `pos`, and where the next value
@@ -1356,94 +1306,7 @@ fn stream_end(b: &[u8], pos: usize, lim: &Limits) -> Result<Option<usize>, Fail>
     }
 }
 
-fn streamed_list(b: &[u8], mut pos: usize, depth: usize, lim: &Limits) -> Step<Vec<Value>> {
-    let mut items = Vec::new();
-    loop {
-        if let Some(e) = stream_end(b, pos, lim)? {
-            return Ok((items, e));
-        }
-        if items.len() >= lim.elements {
-            return Err(Error::TooManyElements.into());
-        }
-        let (v, e) = value(b, pos, depth + 1, false, lim)?;
-        items.push(v);
-        pos = e;
-    }
-}
-
-fn streamed_pairs(b: &[u8], mut pos: usize, depth: usize, lim: &Limits) -> Step<Vec<(Value, Value)>> {
-    let mut entries = Vec::new();
-    loop {
-        if let Some(e) = stream_end(b, pos, lim)? {
-            return Ok((entries, e));
-        }
-        if entries.len() >= lim.elements {
-            return Err(Error::TooManyElements.into());
-        }
-        let (k, e) = value(b, pos, depth + 1, false, lim)?;
-        let (v, e) = value(b, e, depth + 1, false, lim)?;
-        entries.push((k, v));
-        pos = e;
-    }
-}
-
-fn streamed_string(b: &[u8], mut pos: usize, lim: &Limits) -> Step<Value> {
-    let mut out = Vec::new();
-    loop {
-        match b.get(pos) {
-            None => return Err(Fail::Need(pos.saturating_add(1))),
-            Some(&marker::CHUNK) => {}
-            Some(_) => return Err(Error::Malformed(marker::BULK).into()),
-        }
-        let (l, e) = line(b, pos + 1, lim)?;
-        let n = digits(l).ok_or(Error::BadLength)?;
-        if n == 0 {
-            return Ok((Value::Bulk(out), e));
-        }
-        if n > lim.bulk.saturating_sub(out.len()) {
-            return Err(Error::BulkTooLong.into());
-        }
-        let (d, e) = data(b, e, n, lim)?;
-        out.extend_from_slice(d);
-        pos = e;
-    }
-}
-
-fn command(b: &[u8], lim: &Limits) -> Step<Command> {
-    match b.first() {
-        None => Err(Fail::Need(1)),
-        Some(&marker::ARRAY) => multibulk(b, lim),
-        Some(_) => inline(b, lim),
-    }
-}
-
-fn multibulk(b: &[u8], lim: &Limits) -> Step<Command> {
-    let (l, mut pos) = line(b, 1, lim)?;
-    let n = redis_ll(l).ok_or(Error::TooManyElements)?;
-    // Redis ignores an array of zero or fewer elements.
-    let Ok(n) = usize::try_from(n) else {
-        return Ok((Command::default(), pos));
-    };
-    if n > lim.elements {
-        return Err(Error::TooManyElements.into());
-    }
-    let mut args = Vec::with_capacity(capacity(b, pos, n, 6));
-    for _ in 0..n {
-        match b.get(pos) {
-            None => return Err(Fail::Need(pos.saturating_add(1))),
-            Some(&marker::BULK) => {}
-            Some(&c) => return Err(Error::ExpectedBulk(c).into()),
-        }
-        let (l, e) = line(b, pos + 1, lim)?;
-        let n = bulk_len(l).ok_or(Error::BulkTooLong)?;
-        let (d, e) = data(b, e, n, lim)?;
-        args.push(d.to_vec());
-        pos = e;
-    }
-    Ok((Command { args }, pos))
-}
-
-fn inline(b: &[u8], lim: &Limits) -> Step<Command> {
+fn inline_text<'a>(b: &'a [u8], lim: &Limits) -> Step<&'a [u8]> {
     // The text may be line bytes, then CR LF.
     let window = &b[..b.len().min(lim.line.saturating_add(2))];
     // Redis finds the LF with strchr, which stops at a NUL, so after a
@@ -1462,14 +1325,7 @@ fn inline(b: &[u8], lim: &Limits) -> Step<Command> {
     if text.len() > lim.line {
         return Err(Error::LineTooLong.into());
     }
-    let args = split_args(text)?;
-    if args.len() > lim.elements {
-        return Err(Error::TooManyElements.into());
-    }
-    if args.iter().any(|a| a.len() > lim.bulk) {
-        return Err(Error::BulkTooLong.into());
-    }
-    Ok((Command { args }, i + 1))
+    Ok((text, i + 1))
 }
 
 /// Whether `c` is a space as C's `isspace` says.
@@ -1478,7 +1334,7 @@ fn is_space(c: u8) -> bool {
 }
 
 /// Splits an inline command's line into arguments, as Redis's
-/// `sdssplitargs` does. The line holds no NUL: [`inline`] ends no line
+/// `sdssplitargs` does. The line holds no NUL: [`inline_text`] ends no line
 /// after one.
 fn split_args(text: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let after_quote_ok = |i: usize| text.get(i + 1).is_none_or(|&c| is_space(c));
@@ -1632,7 +1488,7 @@ impl Wire for Resp2 {
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let limits = &Limits::DEFAULT;
         exact(
-            bounded(resp2_value(frame(bytes, limits), 0, 0), limits),
+            bounded(read_value(frame(bytes, limits), limits, Mode::Resp2), limits),
             bytes.len(),
         )
         .map(Self)
@@ -1645,52 +1501,6 @@ impl Wire for Resp2 {
     /// An error leaves `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         transactional(out, |out, limit| strict_resp2(out, &self.0, 0, limit))
-    }
-}
-
-// Share line scalars with RESP3, but reject streamed lengths at every level.
-fn resp2_value(bytes: &[u8], pos: usize, depth: usize) -> Step<Value> {
-    let limits = &Limits::DEFAULT;
-    let Some(&kind) = bytes.get(pos) else {
-        return Err(Fail::Need(pos.saturating_add(1)));
-    };
-    match kind {
-        marker::SIMPLE | marker::ERROR | marker::INTEGER => value(bytes, pos, depth, false, limits),
-        marker::BULK | marker::ARRAY => {
-            let (text, mut end) = line(bytes, pos + 1, limits)?;
-            let count = match length(text)? {
-                Len::Streamed => return Err(Error::BadLength.into()),
-                Len::Null => {
-                    return Ok((
-                        if kind == marker::BULK {
-                            Value::Null
-                        } else {
-                            Value::NullArray
-                        },
-                        end,
-                    ));
-                }
-                Len::N(count) => count,
-            };
-            if kind == marker::BULK {
-                let (body, end) = data(bytes, end, count, limits)?;
-                return Ok((Value::Bulk(body.to_vec()), end));
-            }
-            if depth >= MAX_DEPTH {
-                return Err(Error::TooDeep.into());
-            }
-            if count > MAX_ELEMENTS {
-                return Err(Error::TooManyElements.into());
-            }
-            let mut items = Vec::with_capacity(capacity(bytes, end, count, 3));
-            for _ in 0..count {
-                let (item, next) = resp2_value(bytes, end, depth + 1)?;
-                items.push(item);
-                end = next;
-            }
-            Ok((Value::Array(items), end))
-        }
-        _ => Err(Error::UnknownType(kind).into()),
     }
 }
 
@@ -1997,6 +1807,46 @@ mod tests {
         b"~?\r\n.\r\n",
         b"%?\r\n+a\r\n:1\r\n+b\r\n:2\r\n.\r\n",
     ];
+
+    #[test]
+    fn readers_share_the_corpus() {
+        fn split<D: Decode<Error = Error>>(decoder: D, b: &[u8], cut: usize) -> (Vec<D::Item>, Option<codec::Fail<Error>>, u64) {
+            let mut stream = Stream::new(decoder);
+            let mut items = Vec::new();
+            let result = codec::pump(&mut stream, &b[..cut], |v| items.push(v))
+                .and_then(|_| codec::pump(&mut stream, &b[cut..], |v| items.push(v)))
+                .and_then(|_| codec::finish(&mut stream, |v| items.push(v)));
+            (items, result.err(), stream.offset())
+        }
+        let small = Limits { bulk: 6, elements: 3, depth: 2, line: 6, frame: 40 };
+        for &b in VALID.iter().chain(MALFORMED) {
+            for lim in [Limits::DEFAULT, small] {
+                check_one_shot(b, lim);
+                let values = split(Values::with_limits(lim).map(|v| format!("{v:?}")), b, b.len());
+                let commands = split(Commands::with_limits(lim), b, b.len());
+                for cut in 0..=b.len() {
+                    assert_eq!(split(Values::with_limits(lim).map(|v| format!("{v:?}")), b, cut), values);
+                    assert_eq!(split(Commands::with_limits(lim), b, cut), commands);
+                }
+            }
+            for end in 0..=b.len() {
+                let b = &b[..end];
+                let parsed = exact(value_top(b, &Limits::DEFAULT), b.len());
+                assert_eq!(format!("{:?}", Value::parse(b)), format!("{parsed:?}"));
+                assert_eq!(Command::parse(b), exact(command_top(b, &Limits::DEFAULT), b.len()));
+            }
+        }
+        // RESP2 and RESP3 agree throughout their common grammar, including errors.
+        let bad: &[&[u8]] = &[
+            b"+a\n", b":x\r\n", b"$-2\r\n", b"$2\r\nabXY", b"*1\r\n:x\r\n",
+            b"*x\r\n", b"*2\r\n+OK\r\n$-1\r\ntrailing",
+        ];
+        for &b in VALID[..17].iter().chain(bad) {
+            for end in 0..=b.len() {
+                assert_eq!(Resp2::parse(&b[..end]).map(|v| v.0), Value::parse(&b[..end]));
+            }
+        }
+    }
 
     #[test]
     fn review_scalar_and_inline_writability() {
@@ -2764,37 +2614,38 @@ mod tests {
             (vec![], Some(codec::Fail::Protocol(Error::FrameTooLarge))));
     }
 
+    const MALFORMED: &[&[u8]] = &[
+        b"%?\r\n+a\r\n.\r\n",
+        b"%?\r\n+a\r\n:1\r\n+b\r\n:2\r\n+c\r\n:3\r\n+d\r\n:4\r\n.\r\n",
+        b"*?\r\n:1\r\n:2\r\n:3\r\n:4\r\n.\r\n",
+        b"$?\r\n;3\r\nabc\r\n;4\r\ndefg\r\n;0\r\n",
+        b"$?\r\n;3\r\nabc\r\n+x\r\n",
+        b"|1\r\n+k\r\n*1\r\n*1\r\n:1\r\n:2\r\n",
+        b"|0\r\n|0\r\n|0\r\n:1\r\n",
+        b"~1\r\n*?\r\n.x\r\n",
+        b">?\r\n:1\r\n",
+        b"*1\r\n$1\r\nab\r\n",
+        b"*2\r\n$1\r\na\r\n+b\r\n",
+        b"*4\r\n$1\r\na\r\n",
+        b"\"a b\" 'c\r\n",
+        b"*1\r\n>1\r\n+a\r\n",
+        b">1\r\n$-1\r\n",
+        b">2\r\n$?\r\n;1\r\na\r\n;0\r\n:1\r\n",
+        b"|1\r\n+k\r\n+v\r\n>1\r\n+a\r\n",
+        b"|1\r\n>1\r\n+a\r\n+v\r\n:1\r\n",
+        b"GE\0b\nPI\n",
+        b"*01\r\n$1\r\na\r\n",
+        b"*1\r\n$01\r\na\r\n",
+        b"+abcdef\r\n",
+        b"+abcdefg\r\n",
+        b"*1\r\n$1234567\r\n",
+    ];
+
     /// Malformed and truncated inputs keep their results across chunk schedules.
     #[test]
     fn contracts_cover_malformed_prefixes() {
         let lim = Limits { bulk: 6, elements: 3, depth: 2, line: 6, frame: 40 };
-        let inputs: &[&[u8]] = &[
-            b"%?\r\n+a\r\n.\r\n",
-            b"%?\r\n+a\r\n:1\r\n+b\r\n:2\r\n+c\r\n:3\r\n+d\r\n:4\r\n.\r\n",
-            b"*?\r\n:1\r\n:2\r\n:3\r\n:4\r\n.\r\n",
-            b"$?\r\n;3\r\nabc\r\n;4\r\ndefg\r\n;0\r\n",
-            b"$?\r\n;3\r\nabc\r\n+x\r\n",
-            b"|1\r\n+k\r\n*1\r\n*1\r\n:1\r\n:2\r\n",
-            b"|0\r\n|0\r\n|0\r\n:1\r\n",
-            b"~1\r\n*?\r\n.x\r\n",
-            b">?\r\n:1\r\n",
-            b"*1\r\n$1\r\nab\r\n",
-            b"*2\r\n$1\r\na\r\n+b\r\n",
-            b"*4\r\n$1\r\na\r\n",
-            b"\"a b\" 'c\r\n",
-            b"*1\r\n>1\r\n+a\r\n",
-            b">1\r\n$-1\r\n",
-            b">2\r\n$?\r\n;1\r\na\r\n;0\r\n:1\r\n",
-            b"|1\r\n+k\r\n+v\r\n>1\r\n+a\r\n",
-            b"|1\r\n>1\r\n+a\r\n+v\r\n:1\r\n",
-            b"GE\0b\nPI\n",
-            b"*01\r\n$1\r\na\r\n",
-            b"*1\r\n$01\r\na\r\n",
-            b"+abcdef\r\n",
-            b"+abcdefg\r\n",
-            b"*1\r\n$1234567\r\n",
-        ];
-        for b in inputs {
+        for b in MALFORMED {
             for end in 0..=b.len() {
                 for limits in [Limits::DEFAULT, lim] {
                     check_values(&b[..end], limits);
