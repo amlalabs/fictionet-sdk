@@ -80,7 +80,7 @@
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::field;
 use fictionet::stdlib::session::Action;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::str::FromStr;
 
@@ -1392,7 +1392,7 @@ struct Execution {
 #[derive(Clone, Debug)]
 pub struct Exchange {
     config: ExchangeConfig,
-    orders: HashMap<Token, Order>,
+    orders: BTreeMap<Token, Order>,
     /// Pending replaces by replacement token.
     replaces: HashMap<Token, PendingReplace>,
     /// The replacement token of each original with a pending replace.
@@ -1416,7 +1416,7 @@ impl Exchange {
         }
         Ok(Self {
             config,
-            orders: HashMap::new(),
+            orders: BTreeMap::new(),
             replaces: HashMap::new(),
             replacing: HashMap::new(),
             last: HashMap::new(),
@@ -1431,7 +1431,8 @@ impl Exchange {
     pub fn order(&self, token: Token) -> Option<&Order> {
         self.orders.get(&token)
     }
-    /// Every tracked order, in no particular order.
+    /// Every tracked order, in ascending UserRefIdx order, then ascending
+    /// UserRefNum order within each channel.
     pub fn orders(&self) -> impl Iterator<Item = &Order> {
         self.orders.values()
     }
@@ -2709,6 +2710,23 @@ mod tests {
             user_ref_idx: 0,
             user_ref,
         }
+    }
+
+    #[test]
+    fn orders_follow_channel_and_reference_order() {
+        let mut x = Exchange::new(ExchangeConfig::default()).unwrap();
+        let inputs = [(3, 7), (1, 2), (3, 9), (0, 300), (1, 256)];
+        for (channel, reference) in inputs {
+            let options = Options::of(Opt::UserRefIdx(channel));
+            x.receive(&enter(reference, 100, options).into(), 0)
+                .unwrap();
+        }
+        let expected =
+            [(0, 300), (1, 2), (1, 256), (3, 7), (3, 9)].map(|(user_ref_idx, user_ref)| Token {
+                user_ref_idx,
+                user_ref,
+            });
+        assert_eq!(x.orders().map(|o| o.token).collect::<Vec<_>>(), expected);
     }
 
     #[test]

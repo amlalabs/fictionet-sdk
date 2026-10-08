@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -338,7 +338,8 @@ fn helper(
 ) {
     let epoll = shared.epoll.as_raw_fd();
     let mut listener = Some(listener);
-    let mut handshakes: HashMap<u64, Handshake> = HashMap::new();
+    // Expiry and shutdown close handshake sockets in token order.
+    let mut handshakes: BTreeMap<u64, Handshake> = BTreeMap::new();
     let mut next_token: u64 = 2;
     let mut buf = vec![0u8; relay::MAX_MESSAGE + 1];
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
@@ -443,7 +444,7 @@ const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 fn accept_all(
     listener: RawFd,
     epoll: RawFd,
-    handshakes: &mut HashMap<u64, Handshake>,
+    handshakes: &mut BTreeMap<u64, Handshake>,
     next_token: &mut u64,
 ) -> io::Result<()> {
     loop {

@@ -109,7 +109,7 @@
 //! documents in detail, which runs on this.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -272,7 +272,8 @@ pub trait Accept: Any + Send + Sync {
     /// accept. Returns whether this accept serves that host too, as
     /// virtual hosts share an HTTP port; if not, `other` serves the port
     /// alone, which on a plain port is an error. The default takes only
-    /// itself.
+    /// itself. On a TLS port, subsequent hosts are offered to the first
+    /// installed accept, even if it declined an earlier host.
     fn share(&self, names: &[String], other: &Arc<dyn Accept>) -> bool {
         let _ = names;
         std::ptr::addr_eq(self as *const Self, Arc::as_ptr(other))
@@ -840,11 +841,6 @@ impl Net {
             lans,
         });
         start_gateway(&shared)?;
-        for seg in shared.lans.values() {
-            let (lan_side, side) = link();
-            seg.lan.add(seg.dns, Box::new(lan_side), None)?;
-            start_dns(&shared, &shared.fcx.group("lan gateway"), side, seg.dns)?;
-        }
         {
             let mut world = lock(&shared.world);
             for host in self.hosts {
@@ -1092,7 +1088,8 @@ struct World {
     max_unknown: usize,
     resolved: usize,
     max_hosts: usize,
-    machines: HashMap<IpAddr, Arc<Machine>>,
+    /// Machines in address order for aborting a detached peer.
+    machines: BTreeMap<IpAddr, Arc<Machine>>,
     next_auto: u32,
     next_auto6: u128,
     auto_full: bool,
@@ -1106,7 +1103,7 @@ impl World {
             max_unknown: MAX_UNKNOWN_NAMES,
             resolved: 0,
             max_hosts,
-            machines: HashMap::new(),
+            machines: BTreeMap::new(),
             next_auto: 1,
             next_auto6: 1,
             auto_full: false,
@@ -1184,7 +1181,7 @@ struct Shared {
     limits: Limits,
     seed: u64,
     /// The LANs, by name.
-    lans: HashMap<String, LanSeg>,
+    lans: BTreeMap<String, LanSeg>,
 }
 
 /// One LAN of the network ([`Net::lan`]).
@@ -1227,7 +1224,7 @@ fn make_lans(
     subnet6: Option<&Subnet6>,
     lans: Vec<(String, Prefix)>,
     members: &[(String, String, IpAddr)],
-) -> Result<HashMap<String, LanSeg>, Error> {
+) -> Result<BTreeMap<String, LanSeg>, Error> {
     let sandboxes4 = Prefix {
         addr: IpAddr::V4(Ipv4Addr::from(subnet.net)),
         len: subnet.mask.count_ones() as u8,
@@ -1236,7 +1233,7 @@ fn make_lans(
         addr: IpAddr::V6(Ipv6Addr::from(s.net)),
         len: s.mask.count_ones() as u8,
     });
-    let mut made: HashMap<String, LanSeg> = HashMap::new();
+    let mut made: BTreeMap<String, LanSeg> = BTreeMap::new();
     for (name, prefix) in lans {
         let max = if prefix.addr.is_ipv4() { 30 } else { 126 };
         if prefix.len > max {
@@ -1650,7 +1647,14 @@ impl TlsName {
 struct Port {
     plain: RwLock<Option<Arc<dyn Accept>>>,
     /// TLS by SNI; the empty name is "any name".
-    tls: RwLock<HashMap<String, Arc<TlsName>>>,
+    tls: RwLock<TlsNames>,
+}
+
+/// TLS names and the first installed handler offered subsequent services.
+#[derive(Default)]
+struct TlsNames {
+    by_name: HashMap<String, Arc<TlsName>>,
+    first: Option<Arc<dyn Accept>>,
 }
 
 /// One address with its services.
@@ -1747,6 +1751,7 @@ impl Machine {
                         .tls
                         .read()
                         .unwrap_or_else(|e| e.into_inner())
+                        .by_name
                         .is_empty()
                     {
                         return Err(format!(
@@ -1795,7 +1800,7 @@ impl Machine {
                         Sni::Names => host.names.clone(),
                     };
                     let mut tls = port.tls.write().unwrap_or_else(|e| e.into_inner());
-                    if let Some(taken) = names.iter().find(|n| tls.contains_key(*n)) {
+                    if let Some(taken) = names.iter().find(|n| tls.by_name.contains_key(*n)) {
                         let name = if taken.is_empty() {
                             "any name"
                         } else {
@@ -1803,7 +1808,7 @@ impl Machine {
                         };
                         return Err(format!("TLS port {number} at {addr} already serves {name}"));
                     }
-                    let front = tls.values().next().map(|t| t.accept.clone());
+                    let front = tls.first.clone();
                     let served_by = match front {
                         Some(front) if front.share(&host.names, accept) => front,
                         _ => {
@@ -1811,6 +1816,7 @@ impl Machine {
                             accept.clone()
                         }
                     };
+                    tls.first.get_or_insert_with(|| served_by.clone());
                     for name in names {
                         let alpn = served_by.alpn();
                         let entry = TlsName {
@@ -1819,7 +1825,7 @@ impl Machine {
                             alpn,
                             last: Mutex::new(None),
                         };
-                        tls.insert(name, Arc::new(entry));
+                        tls.by_name.insert(name, Arc::new(entry));
                     }
                 }
             }
@@ -1931,6 +1937,7 @@ async fn connection(
         .tls
         .read()
         .unwrap_or_else(|e| e.into_inner())
+        .by_name
         .is_empty();
     if !has_tls {
         let plain = port.plain.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -1947,8 +1954,8 @@ async fn connection(
     let select: TlsSelect = Arc::new(move |sni, fcx| {
         let tls = names.tls.read().unwrap_or_else(|e| e.into_inner());
         let name = sni
-            .and_then(|n| tls.get(n))
-            .or_else(|| tls.get(""))?
+            .and_then(|n| tls.by_name.get(n))
+            .or_else(|| tls.by_name.get(""))?
             .clone();
         let config = name.config(fcx);
         *lock(&pick) = Some(name);
@@ -1985,7 +1992,8 @@ async fn pings(fcx: Cx, mut icmp: End, addr: IpAddr) -> fictionet::Result {
 
 /// The gateway, at its IPv4 address and, with IPv6, at its IPv6 address:
 /// DNS over UDP and TCP on port 53, and ping replies. DHCP is answered in
-/// each sandbox's filter, which knows which sandbox asked.
+/// each sandbox's filter, which knows which sandbox asked. LAN DNS
+/// services start after these gateways, in ascending LAN name order.
 fn start_gateway(shared: &Arc<Shared>) -> Result<(), Error> {
     let gateways = std::iter::once(IpAddr::V4(shared.subnet.gateway))
         .chain(shared.subnet6.map(|s| IpAddr::V6(s.gateway)));
@@ -1996,6 +2004,11 @@ fn start_gateway(shared: &Arc<Shared>) -> Result<(), Error> {
             .router
             .add(host_prefix(gateway), Box::new(router_side));
         start_dns(shared, fcx, side, gateway)?;
+    }
+    for seg in shared.lans.values() {
+        let (lan_side, side) = link();
+        seg.lan.add(seg.dns, Box::new(lan_side), None)?;
+        start_dns(shared, &shared.fcx.group("lan gateway"), side, seg.dns)?;
     }
     Ok(())
 }
@@ -3011,6 +3024,102 @@ fn answered_closed(p: &[u8], open: impl Fn(u8, u16) -> bool) -> bool {
 mod tests {
     use super::*;
     use fictionet::stdlib::test_support::{assert_linear, rounds};
+
+    #[test]
+    fn lan_dns_endpoints_start_in_name_order() {
+        fictionet::block_on(fictionet::run(|fcx| async move {
+            let subnet = Subnet::new("198.18.0.0/16".parse().unwrap()).unwrap();
+            let router = route::router::<Box<dyn Interface>>(&fcx, Vec::new());
+            let hooks = Arc::new(Hooks {
+                by_addr: Mutex::default(),
+                conns: AtomicU64::new(0),
+                attached: Mutex::default(),
+            });
+            let lans = make_lans(
+                &fcx,
+                &router,
+                &hooks,
+                &subnet,
+                None,
+                [
+                    ("z", "10.0.1.0/24"),
+                    ("a", "10.0.3.0/24"),
+                    ("m", "10.0.2.0/24"),
+                ]
+                .map(|(name, prefix)| (name.to_owned(), prefix.parse().unwrap()))
+                .into(),
+                &[],
+            )?;
+            let shared = Arc::new(Shared {
+                fcx: fcx.clone(),
+                resolver: None,
+                subnet,
+                subnet6: None,
+                router,
+                world: Mutex::new(World::new(MAX_HOSTS)),
+                leases: Mutex::default(),
+                gateway_tcp: Mutex::default(),
+                hooks,
+                fixed: Vec::new(),
+                limits: Limits::default(),
+                seed: 0,
+                lans,
+            });
+            start_gateway(&shared)?;
+            let addresses: Vec<_> = lock(&shared.gateway_tcp)
+                .iter()
+                .map(tcp::Endpoint::addr)
+                .collect();
+            assert_eq!(
+                addresses,
+                ["198.18.0.1", "10.0.3.1", "10.0.2.1", "10.0.1.1"]
+                    .map(|s| s.parse::<IpAddr>().unwrap())
+            );
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn tls_sharing_uses_the_first_installed_accept() {
+        struct Offers(&'static str, Arc<Mutex<Vec<&'static str>>>);
+        impl Accept for Offers {
+            fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+            fn share(&self, _: &[String], _: &Arc<dyn Accept>) -> bool {
+                lock(&self.1).push(self.0);
+                false
+            }
+        }
+        fictionet::block_on(fictionet::run(|fcx| async move {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut net = Net::new().ipv4_only();
+            for name in ["z.test", "a.test", "m.test", "b.test", "y.test"] {
+                net = net.host(name, |h| {
+                    h.at(Ipv4Addr::new(203, 0, 113, 8)).tls_accept(
+                        443,
+                        name,
+                        |_| panic!("no handshake"),
+                        Offers(name, log.clone()),
+                    )
+                });
+            }
+            let (_attacher, attachments) = fictionet::attachments();
+            net.serve(&fcx, attachments)?;
+            assert_eq!(
+                *lock(&log),
+                [
+                    "z.test", "z.test", "a.test", "z.test", "m.test", "z.test", "b.test", "z.test",
+                    "y.test"
+                ]
+            );
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
 
     #[test]
     fn a_full_automatic_range_is_not_scanned_again() {

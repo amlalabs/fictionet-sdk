@@ -38,7 +38,7 @@
 //! # }
 //! ```
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -229,7 +229,7 @@ pub fn endpoint_with(fcx: &Cx, inner: impl Interface, addr: IpAddr, options: Opt
         state: Mutex::new(State {
             iface,
             sockets: SocketSet::new(Vec::new()),
-            handles: HashMap::new(),
+            handles: BTreeMap::new(),
             next_id: 0,
             slots: 0,
             pages: HashMap::new(),
@@ -237,8 +237,8 @@ pub fn endpoint_with(fcx: &Cx, inner: impl Interface, addr: IpAddr, options: Opt
             next_release: None,
             next_tidy: None,
             dev,
-            listeners: HashMap::new(),
-            conns: HashMap::new(),
+            listeners: BTreeMap::new(),
+            conns: BTreeMap::new(),
             by_tuple: HashMap::new(),
             ports: HashMap::new(),
             next_port: EPHEMERAL + (fcx.random_u64() % (65536 - EPHEMERAL as u64)) as u16,
@@ -318,7 +318,7 @@ struct Shared {
 
 /// A socket's name inside [`State`]. smoltcp's handles are slot numbers
 /// that change when the socket set is compacted; these never change.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 struct Id(u64);
 
 /// Compact the socket set when at least this many slots exist and at most
@@ -329,8 +329,8 @@ const COMPACT_SLOTS: usize = 256;
 struct State {
     iface: Iface,
     sockets: SocketSet<'static>,
-    /// Each socket's slot in `sockets`.
-    handles: HashMap<Id, SocketHandle>,
+    /// Each socket's slot in `sockets`, ordered by SDK ID for compaction.
+    handles: BTreeMap<Id, SocketHandle>,
     next_id: u64,
     /// Slots in `sockets`, empty ones included: the most sockets it held
     /// at once since it was made.
@@ -346,9 +346,10 @@ struct State {
     /// that still owed an ACK.
     next_tidy: Option<smoltcp::time::Instant>,
     dev: Dev,
-    listeners: HashMap<u16, Listen>,
-    /// Every socket that is or was a connection, by handle.
-    conns: HashMap<Id, Conn>,
+    /// Listener maintenance and shutdown wake in ascending port order.
+    listeners: BTreeMap<u16, Listen>,
+    /// Every socket that is or was a connection, in SDK ID order for aborts.
+    conns: BTreeMap<Id, Conn>,
     /// Connections by (local, remote), to note RSTs and FINs.
     by_tuple: HashMap<(SocketAddr, SocketAddr), Id>,
     /// Local ports in use by listeners (counted once) and connections.
@@ -665,7 +666,7 @@ impl State {
 
     /// Moves every socket into a new set without empty slots, once most
     /// slots are empty. Sockets keep their [`Id`], their state and their
-    /// buffers.
+    /// buffers. The new set scans sockets in ascending SDK socket ID order.
     fn compact(&mut self) {
         if self.slots < COMPACT_SLOTS || self.handles.len() * 4 > self.slots {
             return;
@@ -1745,6 +1746,101 @@ mod tests {
     use fictionet::stdlib::ConnectionExt;
     use fictionet::stdlib::test_support::rounds;
     use fictionet::{InterfaceExt, block_on, pair, run};
+
+    struct WakeLog(u16, Arc<Mutex<Vec<u16>>>);
+    impl std::task::Wake for WakeLog {
+        fn wake(self: Arc<Self>) {
+            self.1.lock().unwrap().push(self.0);
+        }
+    }
+
+    #[test]
+    fn stop_wakes_listeners_in_port_order() {
+        block_on(run(|fcx| async move {
+            let (_raw, side) = pair();
+            let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut listeners = Vec::new();
+            for port in [9000, 80, 443, 22, 8080] {
+                listeners.push(ep.listen(port)?);
+                ep.shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .listeners
+                    .get_mut(&port)
+                    .unwrap()
+                    .waker = Some(Waker::from(Arc::new(WakeLog(port, log.clone()))));
+            }
+            ep.shared.stop();
+            assert_eq!(*log.lock().unwrap(), [22, 80, 443, 8080, 9000]);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn abort_peer_wakes_connections_in_socket_order() {
+        block_on(run(|fcx| async move {
+            let (_raw, side) = pair();
+            let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
+            let log = Arc::new(Mutex::new(Vec::new()));
+            {
+                let mut st = ep.shared.state.lock().unwrap();
+                for port in [9000, 80, 443, 22, 8080] {
+                    let id = st.add_socket(new_socket(MIN_BUFFER));
+                    let mut conn = Conn::new(
+                        "10.0.0.1:80".parse().unwrap(),
+                        SocketAddr::new("10.0.0.2".parse().unwrap(), port),
+                        false,
+                    );
+                    conn.gone
+                        .push(Waker::from(Arc::new(WakeLog(port, log.clone()))));
+                    st.conns.insert(id, conn);
+                }
+            }
+            ep.abort_peer("10.0.0.2".parse().unwrap());
+            assert_eq!(*log.lock().unwrap(), [9000, 80, 443, 22, 8080]);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn compaction_keeps_socket_id_scan_order() {
+        block_on(run(|fcx| async move {
+            let (_raw, side) = pair();
+            let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
+            let mut st = ep.shared.state.lock().unwrap();
+            let mut ids = Vec::new();
+            for _ in 0..COMPACT_SLOTS {
+                ids.push(st.add_socket(new_socket(MIN_BUFFER)));
+            }
+            let kept = [ids[3], ids[17], ids[93], ids[201]];
+            for id in ids {
+                if !kept.contains(&id) {
+                    st.remove_socket(id);
+                }
+            }
+            // Reuse a low storage slot with a newer SDK ID.
+            let newest = st.add_socket(new_socket(MIN_BUFFER));
+            assert!(st.slots >= COMPACT_SLOTS);
+            st.compact();
+            assert_eq!(st.slots, 5);
+            let scan: Vec<_> = st
+                .sockets
+                .iter()
+                .map(|(slot, _)| *st.handles.iter().find(|(_, h)| **h == slot).unwrap().0)
+                .collect();
+            assert_eq!(scan, [kept[0], kept[1], kept[2], kept[3], newest]);
+            drop(st);
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+    }
 
     /// Resident pages of every socket's buffers on `e`.
     fn resident(e: &Endpoint) -> usize {

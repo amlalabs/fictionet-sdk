@@ -12,7 +12,7 @@
 //! about it, reach this layer.
 //! The [`ip`] page shows a whole machine.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -58,7 +58,7 @@ pub fn endpoint(fcx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
         addr,
         inner: Mutex::new(Box::new(inner)),
         state: Mutex::new(State {
-            sockets: HashMap::new(),
+            sockets: BTreeMap::new(),
             stopped: false,
             ip_id: fcx.random_u64() as u16,
             groups: Vec::new(),
@@ -94,7 +94,7 @@ struct Shared {
 }
 
 struct State {
-    sockets: HashMap<u16, Queue>,
+    sockets: BTreeMap<u16, Queue>,
     /// Multicast groups joined.
     groups: Vec<IpAddr>,
     stopped: bool,
@@ -389,6 +389,39 @@ fn port_unreachable(packet: &[u8], addr: IpAddr) -> Option<Packet> {
 mod tests {
     use super::*;
     use fictionet::{block_on, pair, run};
+
+    #[test]
+    fn shutdown_wakes_readers_in_port_order() {
+        struct WakeLog(u16, Arc<Mutex<Vec<u16>>>);
+        impl std::task::Wake for WakeLog {
+            fn wake(self: Arc<Self>) {
+                self.1.lock().unwrap().push(self.0);
+            }
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let inside = log.clone();
+        let sockets = Arc::new(Mutex::new(Vec::new()));
+        let keep = sockets.clone();
+        block_on(run(|fcx| async move {
+            let (_raw, side) = pair();
+            let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
+            for port in [9000, 53, 443, 22, 8080] {
+                keep.lock().unwrap().push(ep.bind(port)?);
+                ep.shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .sockets
+                    .get_mut(&port)
+                    .unwrap()
+                    .waker = Some(Waker::from(Arc::new(WakeLog(port, inside.clone()))));
+            }
+            fcx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+        assert_eq!(*log.lock().unwrap(), [22, 53, 443, 8080, 9000]);
+    }
 
     /// A UDP datagram from 10.0.0.2 to port 53 of 10.0.0.1, with a good
     /// checksum.

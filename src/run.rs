@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::panic::Location;
 use std::pin::Pin;
@@ -118,7 +118,7 @@ where
     let mut state = RunState {
         shared: shared.clone(),
         root: root.clone(),
-        slots: HashMap::new(),
+        slots: BTreeMap::new(),
         turn: VecDeque::new(),
         incoming: Vec::new(),
     };
@@ -292,7 +292,8 @@ impl Drop for CurrentGuard {
 struct RunState {
     shared: Arc<RunShared>,
     root: Arc<Region>,
-    slots: HashMap<u64, Slot>,
+    /// Live tasks in spawn order, including when their futures are dropped.
+    slots: BTreeMap<u64, Slot>,
     /// The tasks being polled in this turn. Swapped with the queue's
     /// `ready` at the start of each turn, so neither allocates again once
     /// both have grown to what the run needs.
@@ -334,9 +335,7 @@ impl RunState {
                 q.ready.push_back(new.id);
             }
             if std::mem::take(&mut q.wake_all) {
-                let mut ids: Vec<u64> = self.slots.keys().copied().collect();
-                ids.sort_unstable();
-                for id in ids {
+                for &id in self.slots.keys() {
                     if !self.slots[&id]
                         .task_waker
                         .queued
@@ -434,7 +433,10 @@ impl Drop for RunState {
             .chain(self.slots.values().map(|s| s.join.clone()))
             .collect();
         drop(incoming);
-        drop(std::mem::take(&mut self.slots));
+        // Task destructors run in ascending task ID order.
+        for slot in std::mem::take(&mut self.slots).into_values() {
+            drop(slot);
+        }
         // Work spawned while the slots were dropped.
         let late = std::mem::take(&mut self.shared.queue.lock().unwrap().incoming);
         drop(late);

@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::panic::Location;
 use std::pin::Pin;
@@ -770,8 +770,9 @@ pub(crate) struct Region {
 #[derive(Default)]
 struct RegionState {
     children: Vec<Weak<Region>>,
-    /// Wakers outside this run to wake on cancel, by [`CancelWait`] key.
-    foreign: HashMap<u64, Waker>,
+    /// Wakers outside this run to wake on cancel, in [`CancelWait`]
+    /// registration order.
+    foreign: BTreeMap<u64, Waker>,
     next_key: u64,
     /// The first error of the region.
     error: Option<crate::Error>,
@@ -1063,6 +1064,23 @@ mod tests {
     use crate::time::ms;
     use crate::{block_on, run};
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn cancellation_wakes_in_registration_order() {
+        struct WakeLog(usize, Arc<Mutex<Vec<usize>>>);
+        impl std::task::Wake for WakeLog {
+            fn wake(self: Arc<Self>) {
+                self.1.lock().unwrap().push(self.0);
+            }
+        }
+        let region = Region::root(Weak::new());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        for id in [8, 3, 12, 1, 9] {
+            region.add_foreign(&Waker::from(Arc::new(WakeLog(id, log.clone()))));
+        }
+        region.cancel();
+        assert_eq!(*log.lock().unwrap(), [8, 3, 12, 1, 9]);
+    }
 
     #[test]
     fn a_timer_fires_at_its_latest_deadline() {

@@ -958,3 +958,32 @@ fn a_joiner_outside_the_run_gets_the_message_of_a_failed_task() {
     assert_eq!(out.unwrap_err().to_string(), "the worker failed");
     assert_eq!(joined.as_deref(), Some("the worker failed"));
 }
+
+#[test]
+fn dropping_the_run_drops_tasks_in_spawn_order() {
+    struct RecordDrop(usize, Arc<Mutex<Vec<usize>>>);
+    impl Drop for RecordDrop {
+        fn drop(&mut self) {
+            self.1.lock().unwrap().push(self.0);
+        }
+    }
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let inside = log.clone();
+    let mut future = Box::pin(run(move |fcx| async move {
+        for id in [8, 3, 12, 1, 9] {
+            let guard = RecordDrop(id, inside.clone());
+            fcx.spawn(move |_fcx| async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+                Ok(())
+            });
+        }
+        Ok(())
+    }));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(future.as_mut().poll(&mut cx).is_pending());
+    assert!(future.as_mut().poll(&mut cx).is_pending());
+    assert!(log.lock().unwrap().is_empty());
+    drop(future);
+    assert_eq!(*log.lock().unwrap(), [8, 3, 12, 1, 9]);
+}

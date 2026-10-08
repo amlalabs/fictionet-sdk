@@ -127,7 +127,7 @@ use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::field;
 use fictionet::stdlib::session::Action;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::str::FromStr;
@@ -2798,7 +2798,7 @@ struct Context<'a> {
 pub struct Exchange {
     config: ExchangeConfig,
     returns: BTreeMap<u8, Vec<u8>>,
-    orders: HashMap<ClOrdId, Order>,
+    orders: BTreeMap<ClOrdId, Order>,
     /// Remembered executions by ExecID. ExecIDs only grow, so the first
     /// entry is the oldest.
     executions: BTreeMap<u64, Execution>,
@@ -2821,7 +2821,7 @@ impl Exchange {
         Ok(Self {
             config,
             returns,
-            orders: HashMap::new(),
+            orders: BTreeMap::new(),
             executions: BTreeMap::new(),
             next_order_id: config.first_order_id,
             next_exec_id: config.first_exec_id,
@@ -2831,7 +2831,7 @@ impl Exchange {
     pub fn order(&self, cl_ord_id: ClOrdId) -> Option<&Order> {
         self.orders.get(&cl_ord_id)
     }
-    /// Every tracked order, in no particular order.
+    /// Every tracked order, in ascending ClOrdId byte order.
     pub fn orders(&self) -> impl Iterator<Item = &Order> {
         self.orders.values()
     }
@@ -4608,6 +4608,22 @@ mod tests {
             Some(Action::Send(m)) => m,
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn orders_follow_client_order_id_order() {
+        let mut x = exchange();
+        for id in ["Z9", "A2", "M3", "A10", "B1"] {
+            assert_eq!(
+                x.receive(&good(id, 100), 0),
+                [Action::Event(OrderEvent::NewOrderRequested(text(id)))]
+            );
+        }
+        x.accept(text("M3"), 2, 0).unwrap();
+        assert_eq!(
+            x.orders().map(|o| o.cl_ord_id).collect::<Vec<_>>(),
+            ["A10", "A2", "B1", "M3", "Z9"].map(text)
+        );
     }
 
     #[test]
