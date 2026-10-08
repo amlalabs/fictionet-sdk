@@ -31,9 +31,10 @@
 //! decides what to accept, execute and cancel.
 //!
 //! ```
+//! use fictionet::stdlib::session::Action;
 //! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::ouch::{
-//!     Action, Alpha, EnterOrder, Event, Exchange, ExchangeConfig, Inbound, Options, Outbound, Side, Token,
+//!     Alpha, EnterOrder, Event, Exchange, ExchangeConfig, Inbound, Options, Outbound, Side, Token,
 //! };
 //! use fictionet::stdlib::soupbintcp::Packet;
 //!
@@ -71,6 +72,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use fictionet::stdlib::session::Action;
 use fictionet::stdlib::codec::field;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
@@ -1342,15 +1344,6 @@ pub enum Event {
     Ignored(Ignored),
 }
 
-/// An exchange's output, in order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Action {
-    /// A message to send in a SoupBinTCP sequenced data packet.
-    Send(Outbound),
-    /// A notification for the world.
-    Event(Event),
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingReplace {
     original: Token,
@@ -1450,7 +1443,7 @@ impl Exchange {
 
     /// Handles one inbound message. Refuses a time before the last one
     /// used.
-    pub fn receive(&mut self, message: &Inbound, now: u64) -> Result<Vec<Action>, Error> {
+    pub fn receive(&mut self, message: &Inbound, now: u64) -> Result<Vec<Action<Outbound, Event>>, Error> {
         self.check_time(now)?;
         self.now = now;
         Ok(match message {
@@ -1761,7 +1754,7 @@ impl Exchange {
             .unwrap_or(self.config.default_firm)
     }
 
-    fn enter(&mut self, m: &EnterOrder, now: u64) -> Vec<Action> {
+    fn enter(&mut self, m: &EnterOrder, now: u64) -> Vec<Action<Outbound, Event>> {
         let token = Token {
             user_ref_idx: m.options.user_ref_idx(),
             user_ref: m.user_ref,
@@ -1808,7 +1801,7 @@ impl Exchange {
         vec![Action::Event(Event::EnterRequested(token))]
     }
 
-    fn replace(&mut self, m: &ReplaceOrder, now: u64) -> Vec<Action> {
+    fn replace(&mut self, m: &ReplaceOrder, now: u64) -> Vec<Action<Outbound, Event>> {
         let idx = m.options.user_ref_idx();
         let original = Token {
             user_ref_idx: idx,
@@ -1867,7 +1860,7 @@ impl Exchange {
         })]
     }
 
-    fn cancel_request(&mut self, token: Token, quantity: u32, now: u64) -> Vec<Action> {
+    fn cancel_request(&mut self, token: Token, quantity: u32, now: u64) -> Vec<Action<Outbound, Event>> {
         let Ok(order) = self.open(token) else {
             return vec![Action::Event(Event::Ignored(Ignored::UnknownOrder(token)))];
         };
@@ -1884,7 +1877,7 @@ impl Exchange {
         ))]
     }
 
-    fn modify(&mut self, m: &ModifyOrder, now: u64) -> Vec<Action> {
+    fn modify(&mut self, m: &ModifyOrder, now: u64) -> Vec<Action<Outbound, Event>> {
         let idx = m.options.as_ref().map_or(0, Options::user_ref_idx);
         let token = Token {
             user_ref_idx: idx,
@@ -1924,7 +1917,7 @@ impl Exchange {
         )]
     }
 
-    fn mass_cancel(&mut self, m: &MassCancel, now: u64) -> Vec<Action> {
+    fn mass_cancel(&mut self, m: &MassCancel, now: u64) -> Vec<Action<Outbound, Event>> {
         let token = Token {
             user_ref_idx: m.options.user_ref_idx(),
             user_ref: m.user_ref,
@@ -1983,7 +1976,7 @@ impl Exchange {
         options: &Options,
         enable: bool,
         now: u64,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<Outbound, Event>> {
         let token = Token {
             user_ref_idx: options.user_ref_idx(),
             user_ref,
@@ -2695,7 +2688,7 @@ mod tests {
         }
     }
 
-    fn sends(actions: Vec<Action>) -> Vec<Outbound> {
+    fn sends(actions: Vec<Action<Outbound, Event>>) -> Vec<Outbound> {
         actions
             .into_iter()
             .filter_map(|a| match a {
@@ -3168,7 +3161,6 @@ mod tests {
     #[test]
     fn exchange_runs_over_soupbintcp() {
         use fictionet::stdlib::codec::{Stream, pump};
-        use fictionet::stdlib::soupbintcp::Action as SAction;
         use fictionet::stdlib::soupbintcp::Alpha as SAlpha;
         use fictionet::stdlib::soupbintcp::Client;
         use fictionet::stdlib::soupbintcp::Event as SEvent;
@@ -3181,12 +3173,12 @@ mod tests {
         };
         let mut client = Client::new(login, Timers::default(), 0).unwrap();
         let mut server = Server::new(Timers::default(), 0).unwrap();
-        let packets = |actions: Vec<SAction>| -> Vec<Packet> {
+        let packets = |actions: Vec<Action<Packet, SEvent>>| -> Vec<Packet> {
             actions
                 .into_iter()
                 .filter_map(|a| match a {
-                    SAction::Send(p) => Some(p),
-                    SAction::Event(_) => None,
+                    Action::Send(p) => Some(p),
+                    Action::Event(_) => None,
                 })
                 .collect()
         };
@@ -3215,7 +3207,7 @@ mod tests {
         };
         assert_eq!(
             server.receive(&inbound[0].clone().unwrap(), 1).unwrap(),
-            [SAction::Event(SEvent::Unsequenced)]
+            [Action::Event(SEvent::Unsequenced)]
         );
         let actions = exchange
             .receive(&Inbound::parse(payload).unwrap(), 1)
@@ -3225,7 +3217,7 @@ mod tests {
         let accepted = exchange.accept(token(1), 2).unwrap();
         let packet = server.send(&accepted.to_bytes().unwrap(), 2).unwrap();
         let events = client.receive(&packet, 2).unwrap();
-        assert_eq!(events, [SAction::Event(SEvent::Sequenced { sequence: 1 })]);
+        assert_eq!(events, [Action::Event(SEvent::Sequenced { sequence: 1 })]);
         let Packet::SequencedData(payload) = packet else {
             panic!()
         };

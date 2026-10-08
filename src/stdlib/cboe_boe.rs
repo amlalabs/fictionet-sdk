@@ -40,8 +40,9 @@
 //! canceling to the world.
 //!
 //! ```
+//! use fictionet::stdlib::session::Action;
 //! use fictionet::stdlib::cboe_boe::{
-//!     Action, Client, ClientConfig, Event, Exchange, ExchangeConfig, FieldId, Inbound, NewOrder,
+//!     Client, ClientConfig, Event, Exchange, ExchangeConfig, FieldId, Inbound, NewOrder,
 //!     Opt, Optional, OrderEvent, Outbound, Server, Text, Timers, UnitSequence,
 //! };
 //! use fictionet::stdlib::codec::Wire;
@@ -120,6 +121,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use fictionet::stdlib::session::Action;
 use fictionet::stdlib::codec::field;
 use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
@@ -1904,15 +1906,6 @@ pub enum Event {
     Disconnected(CloseReason),
 }
 
-/// A session's or exchange's output, in order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Action<M, E = Event> {
-    /// A message to write to the connection.
-    Send(M),
-    /// A notification for the caller.
-    Event(E),
-}
-
 /// Where a [`Client`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientPhase {
@@ -2005,7 +1998,7 @@ impl Client {
         self.next
     }
     /// Sends the Login Request.
-    pub fn start(&mut self, now_ms: u64) -> Result<Vec<Action<Inbound>>, Error> {
+    pub fn start(&mut self, now_ms: u64) -> Result<Vec<Action<Inbound, Event>>, Error> {
         if self.phase != ClientPhase::Connected {
             return Err(Error::State);
         }
@@ -2042,7 +2035,7 @@ impl Client {
         &mut self,
         message: &Outbound,
         now_ms: u64,
-    ) -> Result<Vec<Action<Inbound>>, Error> {
+    ) -> Result<Vec<Action<Inbound, Event>>, Error> {
         // Both refusals come before any change, so nothing is staged: a
         // copy of the client (its configuration and unit map) per message
         // would cost more than the message.
@@ -2058,7 +2051,7 @@ impl Client {
         &mut self,
         frame: &Result<Outbound, Error>,
         now_ms: u64,
-    ) -> Result<Vec<Action<Inbound>>, Error> {
+    ) -> Result<Vec<Action<Inbound, Event>>, Error> {
         match frame {
             Ok(m) => self.receive(m, now_ms),
             Err(_) => {
@@ -2070,7 +2063,7 @@ impl Client {
             }
         }
     }
-    fn receive_inner(&mut self, message: &Outbound) -> Vec<Action<Inbound>> {
+    fn receive_inner(&mut self, message: &Outbound) -> Vec<Action<Inbound, Event>> {
         use ClientPhase as S;
         self.clock.received = self.clock.now;
         let in_session = matches!(self.phase, S::Replaying | S::LoggedIn | S::LoggingOut);
@@ -2156,7 +2149,7 @@ impl Client {
         Ok(message)
     }
     /// Sends a Logout Request. Cboe answers with a Logout and closes.
-    pub fn logout(&mut self, now_ms: u64) -> Result<Vec<Action<Inbound>>, Error> {
+    pub fn logout(&mut self, now_ms: u64) -> Result<Vec<Action<Inbound, Event>>, Error> {
         if !matches!(self.phase, ClientPhase::Replaying | ClientPhase::LoggedIn) {
             return Err(Error::State);
         }
@@ -2167,7 +2160,7 @@ impl Client {
     }
     /// Runs the timers: the login timeout, the idle timeout, and a Client
     /// Heartbeat after [`Timers::heartbeat_ms`] of sending nothing.
-    pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action<Inbound>>, Error> {
+    pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action<Inbound, Event>>, Error> {
         use ClientPhase as S;
         self.clock.advance(now_ms)?;
         Ok(match self.phase {
@@ -2182,7 +2175,7 @@ impl Client {
             _ => Vec::new(),
         })
     }
-    fn close(&mut self, reason: CloseReason) -> Vec<Action<Inbound>> {
+    fn close(&mut self, reason: CloseReason) -> Vec<Action<Inbound, Event>> {
         self.phase = ClientPhase::Closed;
         vec![Action::Event(Event::Disconnected(reason))]
     }
@@ -2263,7 +2256,7 @@ impl Server {
         &mut self,
         message: &Inbound,
         now_ms: u64,
-    ) -> Result<Vec<Action<Outbound>>, Error> {
+    ) -> Result<Vec<Action<Outbound, Event>>, Error> {
         use ServerPhase as S;
         if self.phase == S::Closed {
             return Err(Error::State);
@@ -2309,7 +2302,7 @@ impl Server {
         &mut self,
         frame: &Result<Inbound, Error>,
         now_ms: u64,
-    ) -> Result<Vec<Action<Outbound>>, Error> {
+    ) -> Result<Vec<Action<Outbound, Event>>, Error> {
         match frame {
             Ok(m) => self.receive(m, now_ms),
             Err(_) => {
@@ -2392,7 +2385,7 @@ impl Server {
         last_inbound: u32,
         available: &[UnitSequence],
         now_ms: u64,
-    ) -> Result<Vec<Action<Outbound>>, Error> {
+    ) -> Result<Vec<Action<Outbound, Event>>, Error> {
         if self.phase != ServerPhase::LoginPending {
             return Err(Error::State);
         }
@@ -2495,7 +2488,7 @@ impl Server {
         status: u8,
         text: &str,
         now_ms: u64,
-    ) -> Result<Vec<Action<Outbound>>, Error> {
+    ) -> Result<Vec<Action<Outbound, Event>>, Error> {
         if self.phase != ServerPhase::LoginPending || status == codes::login_status::ACCEPTED {
             return Err(Error::State);
         }
@@ -2503,7 +2496,7 @@ impl Server {
         self.clock.advance(now_ms)?;
         Ok(self.refuse(status, text))
     }
-    fn refuse(&mut self, status: u8, text: &str) -> Vec<Action<Outbound>> {
+    fn refuse(&mut self, status: u8, text: &str) -> Vec<Action<Outbound, Event>> {
         let request = self.request.take().unwrap_or_default();
         let no_unspecified = request
             .params
@@ -2550,7 +2543,7 @@ impl Server {
         Ok(message.clone())
     }
     /// Ends the replay with Replay Complete.
-    pub fn replay_complete(&mut self, now_ms: u64) -> Result<Vec<Action<Outbound>>, Error> {
+    pub fn replay_complete(&mut self, now_ms: u64) -> Result<Vec<Action<Outbound, Event>>, Error> {
         if self.phase != ServerPhase::Replaying {
             return Err(Error::State);
         }
@@ -2596,7 +2589,7 @@ impl Server {
         reason: u8,
         text: &str,
         now_ms: u64,
-    ) -> Result<Vec<Action<Outbound>>, Error> {
+    ) -> Result<Vec<Action<Outbound, Event>>, Error> {
         if !matches!(self.phase, ServerPhase::Replaying | ServerPhase::LoggedIn) {
             return Err(Error::State);
         }
@@ -2604,7 +2597,7 @@ impl Server {
         self.clock.advance(now_ms)?;
         Ok(self.logout_now(reason, text, CloseReason::Logout))
     }
-    fn logout_now(&mut self, reason: u8, text: &str, close: CloseReason) -> Vec<Action<Outbound>> {
+    fn logout_now(&mut self, reason: u8, text: &str, close: CloseReason) -> Vec<Action<Outbound, Event>> {
         let logout = Logout {
             header: Header::default(),
             reason,
@@ -2617,7 +2610,7 @@ impl Server {
         actions.extend(self.close(close));
         actions
     }
-    fn violation(&mut self, text: &str) -> Vec<Action<Outbound>> {
+    fn violation(&mut self, text: &str) -> Vec<Action<Outbound, Event>> {
         self.logout_now(
             codes::logout_reason::PROTOCOL_VIOLATION,
             text,
@@ -2627,7 +2620,7 @@ impl Server {
     /// Runs the timers: the login timeout, the idle timeout (a Logout with
     /// reason "!"), and a Server Heartbeat after [`Timers::heartbeat_ms`]
     /// of sending nothing.
-    pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action<Outbound>>, Error> {
+    pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action<Outbound, Event>>, Error> {
         use ServerPhase as S;
         self.clock.advance(now_ms)?;
         Ok(match self.phase {
@@ -2648,7 +2641,7 @@ impl Server {
             _ => Vec::new(),
         })
     }
-    fn close(&mut self, reason: CloseReason) -> Vec<Action<Outbound>> {
+    fn close(&mut self, reason: CloseReason) -> Vec<Action<Outbound, Event>> {
         self.phase = ServerPhase::Closed;
         vec![Action::Event(Event::Disconnected(reason))]
     }
@@ -4217,7 +4210,7 @@ mod tests {
     /// Delivers every Send through bytes; returns the events.
     fn deliver_to_client(
         client: &mut Client,
-        actions: Vec<Action<Outbound>>,
+        actions: Vec<Action<Outbound, Event>>,
         now: u64,
     ) -> Vec<Event> {
         let mut events = Vec::new();

@@ -238,7 +238,7 @@ fn wire_decode_and_service_columns_match_the_impls() {
     let modules = modules_on_disk();
     for row in catalog() {
         let code = code(&modules[&row.module]);
-        assert_eq!(row.wire, code.contains("Wire for"), "{}: the Wire column", row.module);
+        assert_eq!(row.wire, code.contains("Wire for") || code.contains("codec::layout!"), "{}: the Wire column", row.module);
         assert_eq!(row.decode, (code.contains("Decode for") || code.contains("Prefixed for")), "{}: the Decode column", row.module);
         let services: BTreeSet<String> = idents_after(&code, "Service for ").into_iter().map(str::to_owned).collect();
         let listed: BTreeSet<String> = row.service.iter().cloned().collect();

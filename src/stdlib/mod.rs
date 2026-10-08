@@ -282,6 +282,7 @@
 //! | [`sbe`] | FIX Simple Binary Encoding 1.0 at run time: load a schema's XML, then read and write its messages. | yes | yes |  |  |  | yes | yes |
 //! | [`sdp`] | SDP session descriptions, with ICE candidates and RTP maps. | yes | yes |  |  |  | yes | yes |
 //! | [`serve`] | Services: the `Service` trait, the driver that runs one over a connection or a UDP socket, `listen`, a test harness, transcripts and fault plans. |  |  |  |  |  | yes | yes |
+//! | [`session`] | Passive mechanics shared by caller-driven protocol sessions. |  |  |  |  |  |  | yes |
 //! | [`sftp`] | SFTP version 3 packets, requests and responses. | yes | yes |  |  |  | yes | yes |
 //! | [`sip`] | SIP messages, URIs and the headers a proxy reads. | yes | yes |  |  |  | yes | yes |
 //! | [`smb2`] | SMB2 and SMB3 messages, compound chains and their bodies. | yes | yes |  |  |  | yes | yes |
@@ -449,6 +450,7 @@ pub mod rtsp;
 pub mod sbe;
 pub mod sdp;
 pub mod serve;
+pub mod session;
 pub mod sftp;
 pub mod sip;
 pub mod smb2;

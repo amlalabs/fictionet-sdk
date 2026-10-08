@@ -2,12 +2,13 @@
 //! entry state machine driven by whatever inbound messages parse.
 #![no_main]
 
+use fictionet::stdlib::session::Action;
 use fictionet::stdlib::codec::{
     Wire,
     contract::{check_wire, check_wire_value},
 };
 use fictionet::stdlib::ouch::{
-    Action, EnterOrder, Event, Exchange, ExchangeConfig, Inbound, Outbound, Price,
+    EnterOrder, Event, Exchange, ExchangeConfig, Inbound, Outbound, Price,
 };
 use libfuzzer_sys::fuzz_target;
 

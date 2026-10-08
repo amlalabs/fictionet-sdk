@@ -28,9 +28,10 @@
 //! write, then events.
 //!
 //! ```
+//! use fictionet::stdlib::session::Action;
 //! use fictionet::stdlib::codec::Frames;
 //! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::soupbintcp::{Action, Alpha, Client, Event, Login, Packet, Server, Timers};
+//! use fictionet::stdlib::soupbintcp::{Alpha, Client, Event, Login, Packet, Server, Timers};
 //!
 //! let login = Login {
 //!     username: Alpha::right_padded("ALICE")?,
@@ -71,6 +72,7 @@
 //! # Ok::<(), fictionet::stdlib::soupbintcp::Error>(())
 //! ```
 
+use fictionet::stdlib::session::Action;
 use fictionet::stdlib::codec::Prefixed;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
@@ -509,7 +511,6 @@ impl Prefixed for Packet {
     }
 }
 
-
 /// The timers a session runs on. [`Timers::default`] is the
 /// specification's: heartbeats after one second, an idle timeout of 15
 /// seconds (1.3), and 30 seconds to log in (2.3.1).
@@ -587,15 +588,6 @@ pub enum Event {
     Disconnected(CloseReason),
 }
 
-/// A session's output, in order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Action {
-    /// A packet to write to the connection, ready for [`Wire::write`].
-    Send(Packet),
-    /// A notification for the caller.
-    Event(Event),
-}
-
 /// The common part of a session: state, the time of the last packet each
 /// way, and the monotonic time guard.
 #[derive(Clone, Copy, Debug)]
@@ -643,7 +635,7 @@ macro_rules! session_receive_frame {
             &mut self,
             frame: &Result<Packet, Error>,
             now_ms: u64,
-        ) -> Result<Vec<Action>, Error> {
+        ) -> Result<Vec<Action<Packet, Event>>, Error> {
             match frame {
                 Ok(packet) => self.receive(packet, now_ms),
                 Err(_) => {
@@ -679,7 +671,7 @@ macro_rules! session_debug {
 macro_rules! session_tick {
     ($phase:ident, $login:pat, $heartbeat:expr) => {
         /// Runs login, idle and heartbeat timers. Closed sessions return no actions.
-        pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
+        pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action<Packet, Event>>, Error> {
             self.clock.advance(now_ms)?;
             Ok(match self.phase {
                 $login if self.clock.login_expired() => self.close(CloseReason::LoginTimeout),
@@ -753,7 +745,7 @@ impl Client {
         self.next
     }
     /// Sends the login request (2.3.1).
-    pub fn start(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
+    pub fn start(&mut self, now_ms: u64) -> Result<Vec<Action<Packet, Event>>, Error> {
         let mut s = *self;
         s.clock.advance(now_ms)?;
         if s.phase != ClientPhase::Connected {
@@ -768,7 +760,7 @@ impl Client {
     /// Handles one packet from the server. A packet a server may not send,
     /// or one out of turn, closes the session with
     /// [`CloseReason::Protocol`]. Refuses a closed session.
-    pub fn receive(&mut self, packet: &Packet, now_ms: u64) -> Result<Vec<Action>, Error> {
+    pub fn receive(&mut self, packet: &Packet, now_ms: u64) -> Result<Vec<Action<Packet, Event>>, Error> {
         let mut s = *self;
         s.clock.advance(now_ms)?;
         let actions = s.receive_inner(packet)?;
@@ -776,7 +768,7 @@ impl Client {
         Ok(actions)
     }
     session_receive_frame!(ClientPhase);
-    fn receive_inner(&mut self, packet: &Packet) -> Result<Vec<Action>, Error> {
+    fn receive_inner(&mut self, packet: &Packet) -> Result<Vec<Action<Packet, Event>>, Error> {
         if self.phase == ClientPhase::Closed {
             return Err(Error::State);
         }
@@ -840,7 +832,7 @@ impl Client {
         Ok(make(message))
     }
     /// Sends a Logout Request and closes (2.3.4). Only once logged in.
-    pub fn logout(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
+    pub fn logout(&mut self, now_ms: u64) -> Result<Vec<Action<Packet, Event>>, Error> {
         if self.phase != ClientPhase::LoggedIn {
             return Err(Error::State);
         }
@@ -851,7 +843,7 @@ impl Client {
         Ok(actions)
     }
     session_tick!(ClientPhase, ClientPhase::LoginSent, Packet::ClientHeartbeat);
-    fn close(&mut self, reason: CloseReason) -> Vec<Action> {
+    fn close(&mut self, reason: CloseReason) -> Vec<Action<Packet, Event>> {
         self.phase = ClientPhase::Closed;
         vec![Action::Event(Event::Disconnected(reason))]
     }
@@ -911,7 +903,7 @@ impl Server {
     /// Handles one packet from the client. A packet a client may not send,
     /// or one out of turn, closes the session with
     /// [`CloseReason::Protocol`]. Refuses a closed session.
-    pub fn receive(&mut self, packet: &Packet, now_ms: u64) -> Result<Vec<Action>, Error> {
+    pub fn receive(&mut self, packet: &Packet, now_ms: u64) -> Result<Vec<Action<Packet, Event>>, Error> {
         let mut s = *self;
         s.clock.advance(now_ms)?;
         if s.phase == ServerPhase::Closed {
@@ -944,7 +936,7 @@ impl Server {
         session: Alpha<SESSION_LENGTH>,
         sequence: u64,
         now_ms: u64,
-    ) -> Result<Vec<Action>, Error> {
+    ) -> Result<Vec<Action<Packet, Event>>, Error> {
         if self.phase != ServerPhase::LoginPending {
             return Err(Error::State);
         }
@@ -964,7 +956,7 @@ impl Server {
         })])
     }
     /// Refuses the pending login and closes (2.2.2).
-    pub fn reject(&mut self, reason: RejectReason, now_ms: u64) -> Result<Vec<Action>, Error> {
+    pub fn reject(&mut self, reason: RejectReason, now_ms: u64) -> Result<Vec<Action<Packet, Event>>, Error> {
         if self.phase != ServerPhase::LoginPending {
             return Err(Error::State);
         }
@@ -992,7 +984,7 @@ impl Server {
     }
     session_debug!(ServerPhase);
     /// Sends End of Session and closes (2.2.5). Only once logged in.
-    pub fn end_session(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
+    pub fn end_session(&mut self, now_ms: u64) -> Result<Vec<Action<Packet, Event>>, Error> {
         if self.phase != ServerPhase::LoggedIn {
             return Err(Error::State);
         }
@@ -1003,7 +995,7 @@ impl Server {
         Ok(actions)
     }
     session_tick!(ServerPhase, ServerPhase::AwaitingLogin | ServerPhase::LoginPending, Packet::ServerHeartbeat);
-    fn close(&mut self, reason: CloseReason) -> Vec<Action> {
+    fn close(&mut self, reason: CloseReason) -> Vec<Action<Packet, Event>> {
         self.phase = ServerPhase::Closed;
         vec![Action::Event(Event::Disconnected(reason))]
     }
@@ -1275,7 +1267,7 @@ mod tests {
         }
     }
 
-    fn sends(actions: &[Action]) -> Vec<Packet> {
+    fn sends(actions: &[Action<Packet, Event>]) -> Vec<Packet> {
         actions
             .iter()
             .filter_map(|a| match a {

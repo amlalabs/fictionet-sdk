@@ -2,19 +2,20 @@
 //! client and server sessions driven by whatever frames come out.
 #![no_main]
 
+use fictionet::stdlib::session::Action;
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{
     Wire,
     contract::{check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value},
     test_support::decode_all,
 };
-use fictionet::stdlib::soupbintcp::{Action, Alpha, Client, Login, MAX_PACKET, Packet, Server, Timers};
+use fictionet::stdlib::soupbintcp::{Alpha, Client, Login, MAX_PACKET, Packet, Server, Timers};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 4096;
 const SMALL_LIMIT: usize = 64;
 
-fn check_actions(actions: &[Action]) {
+fn check_actions(actions: &[Action<Packet, fictionet::stdlib::soupbintcp::Event>]) {
     assert!(actions.len() <= 2);
     for action in actions {
         if let Action::Send(packet) = action {

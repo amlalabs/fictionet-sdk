@@ -40,6 +40,7 @@
 //! # Ok::<(), fictionet::stdlib::fix::Error>(())
 //! ```
 
+use fictionet::stdlib::session::Action;
 use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 use std::convert::Infallible;
@@ -1408,15 +1409,7 @@ pub enum Event {
     /// The caller should close the transport after sending any preceding actions.
     Disconnected(CloseReason),
 }
-/// A session's ordered output. Send outbound messages before acting on later events.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Action {
-    /// A complete outbound FIX message, ready for [`Wire::write`].
-    Send(Message),
-    /// A notification for the caller.
-    Event(Event),
-}
-fn action(actions: &mut Vec<Action>, value: Action) -> Result<(), Error> {
+fn action(actions: &mut Vec<Action<Message, Event>>, value: Action<Message, Event>) -> Result<(), Error> {
     if actions.len() >= MAX_ACTIONS {
         return Err(Error::Limit);
     }
@@ -1523,7 +1516,7 @@ impl Session {
         id: &[u8],
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, Error> {
+    ) -> Result<Vec<Action<Message, Event>>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             if s.phase != Phase::Established || s.test.is_some() {
                 return Err(Error::State);
@@ -1544,7 +1537,7 @@ impl Session {
         now_ms: u64,
         sending_time: &[u8],
         reset: bool,
-    ) -> Result<Vec<Action>, Error> {
+    ) -> Result<Vec<Action<Message, Event>>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             if s.config.role != Role::Initiator || s.phase != Phase::AwaitingLogon {
                 return Err(Error::State);
@@ -1577,7 +1570,7 @@ impl Session {
         message: &Message,
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, Error> {
+    ) -> Result<Vec<Action<Message, Event>>, Error> {
         message.validate()?;
         self.transaction(now_ms, sending_time, |s, actions| {
             s.receive_inner(message, None, now_ms, sending_time, actions)
@@ -1594,7 +1587,7 @@ impl Session {
         frame: &Result<Message, FieldFault>,
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, Error> {
+    ) -> Result<Vec<Action<Message, Event>>, Error> {
         match frame {
             Ok(message) => self.receive(message, now_ms, sending_time),
             Err(fault) => self.transaction(now_ms, sending_time, |s, actions| {
@@ -1605,7 +1598,7 @@ impl Session {
     /// Advances timers. Sends Heartbeat after outgoing silence, TestRequest
     /// after inbound silence plus grace, and disconnects on expired probes.
     /// Any non-garbled inbound message satisfies a probe (Vol 2 state row 14).
-    pub fn tick(&mut self, now_ms: u64, sending_time: &[u8]) -> Result<Vec<Action>, Error> {
+    pub fn tick(&mut self, now_ms: u64, sending_time: &[u8]) -> Result<Vec<Action<Message, Event>>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             match s.phase {
                 Phase::Closed => return Ok(()),
@@ -1661,7 +1654,7 @@ impl Session {
         body: &Message,
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, Error> {
+    ) -> Result<Vec<Action<Message, Event>>, Error> {
         body.validate()?;
         self.transaction(now_ms, sending_time, |s, actions| {
             if s.phase != Phase::Established {
@@ -1696,7 +1689,7 @@ impl Session {
         text: &[u8],
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, Error> {
+    ) -> Result<Vec<Action<Message, Event>>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             if s.phase != Phase::Established {
                 return Err(Error::State);
@@ -1727,7 +1720,7 @@ impl Session {
         reason: u32,
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, Error> {
+    ) -> Result<Vec<Action<Message, Event>>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             if s.phase != Phase::Established {
                 return Err(Error::State);
@@ -1752,7 +1745,7 @@ impl Session {
         original: &Message,
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, Error> {
+    ) -> Result<Vec<Action<Message, Event>>, Error> {
         original.validate()?;
         self.transaction(now_ms, sending_time, |s, actions| {
             s.recovery_state()?;
@@ -1806,7 +1799,7 @@ impl Session {
         original_time: &[u8],
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, Error> {
+    ) -> Result<Vec<Action<Message, Event>>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             s.recovery_state()?;
             seq(begin)?;
@@ -1835,7 +1828,7 @@ impl Session {
         next: u32,
         now_ms: u64,
         sending_time: &[u8],
-    ) -> Result<Vec<Action>, Error> {
+    ) -> Result<Vec<Action<Message, Event>>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             if s.phase != Phase::Established {
                 return Err(Error::State);
@@ -1859,8 +1852,8 @@ impl Session {
         &mut self,
         now: u64,
         time: &[u8],
-        operation: impl FnOnce(&mut Self, &mut Vec<Action>) -> Result<(), Error>,
-    ) -> Result<Vec<Action>, Error> {
+        operation: impl FnOnce(&mut Self, &mut Vec<Action<Message, Event>>) -> Result<(), Error>,
+    ) -> Result<Vec<Action<Message, Event>>, Error> {
         if now < self.last_now {
             return Err(Error::Time);
         }
@@ -1920,7 +1913,7 @@ impl Session {
         &mut self,
         message: Message,
         now: u64,
-        actions: &mut Vec<Action>,
+        actions: &mut Vec<Action<Message, Event>>,
     ) -> Result<(), Error> {
         message.validate()?;
         let next = self.outgoing.checked_add(1).ok_or(Error::Sequence)?;
@@ -1936,7 +1929,7 @@ impl Session {
         fields: &[(u32, &[u8])],
         now: u64,
         time: &[u8],
-        actions: &mut Vec<Action>,
+        actions: &mut Vec<Action<Message, Event>>,
     ) -> Result<(), Error> {
         let mut message = self.header(kind, self.outgoing, time)?;
         for (tag, value) in fields {
@@ -1949,7 +1942,7 @@ impl Session {
         now: u64,
         time: &[u8],
         reset: bool,
-        actions: &mut Vec<Action>,
+        actions: &mut Vec<Action<Message, Event>>,
     ) -> Result<(), Error> {
         let mut message = self.header(b"A", self.outgoing, time)?;
         message
@@ -1963,7 +1956,7 @@ impl Session {
         }
         self.send_fresh(message, now, actions)
     }
-    fn close(&mut self, reason: CloseReason, actions: &mut Vec<Action>) -> Result<(), Error> {
+    fn close(&mut self, reason: CloseReason, actions: &mut Vec<Action<Message, Event>>) -> Result<(), Error> {
         self.phase = Phase::Closed;
         self.test = None;
         action(actions, Action::Event(Event::Disconnected(reason)))
@@ -1974,7 +1967,7 @@ impl Session {
         text: &[u8],
         now: u64,
         time: &[u8],
-        actions: &mut Vec<Action>,
+        actions: &mut Vec<Action<Message, Event>>,
     ) -> Result<(), Error> {
         self.emit(b"5", &[(58, text)], now, time, actions)?;
         self.close(reason, actions)
@@ -1986,7 +1979,7 @@ impl Session {
         reason: u32,
         now: u64,
         time: &[u8],
-        actions: &mut Vec<Action>,
+        actions: &mut Vec<Action<Message, Event>>,
     ) -> Result<(), Error> {
         let (sequence, kind) = reference;
         let mut message = self.header(b"3", self.outgoing, time)?;
@@ -2014,7 +2007,7 @@ impl Session {
         &mut self,
         now: u64,
         time: &[u8],
-        actions: &mut Vec<Action>,
+        actions: &mut Vec<Action<Message, Event>>,
     ) -> Result<(), Error> {
         if let Some(high) = self.gap_high {
             if self.incoming > high {
@@ -2059,7 +2052,7 @@ impl Session {
         &mut self,
         now: u64,
         time: &[u8],
-        actions: &mut Vec<Action>,
+        actions: &mut Vec<Action<Message, Event>>,
     ) -> Result<(), Error> {
         self.emit(b"5", &[], now, time, actions)?;
         self.pending_logout = None;
@@ -2079,7 +2072,7 @@ impl Session {
         fault: Option<&FieldFault>,
         now: u64,
         time: &[u8],
-        actions: &mut Vec<Action>,
+        actions: &mut Vec<Action<Message, Event>>,
     ) -> Result<(), Error> {
         if self.phase == Phase::Closed {
             return Err(Error::State);
@@ -2479,7 +2472,7 @@ impl Session {
         reason: u32,
         now: u64,
         time: &[u8],
-        actions: &mut Vec<Action>,
+        actions: &mut Vec<Action<Message, Event>>,
     ) -> Result<(), Error> {
         let (n, _) = reference;
         if self.initial() {
@@ -2500,7 +2493,7 @@ impl Session {
         n: u32,
         now: u64,
         time: &[u8],
-        actions: &mut Vec<Action>,
+        actions: &mut Vec<Action<Message, Event>>,
     ) -> Result<(), Error> {
         let begin = number(message, 7)?;
         let requested_end = number(message, 16)?;
@@ -2694,7 +2687,7 @@ mod tests {
     const TIME: &[u8] = b"20261006-12:00:00";
     const LATER: &[u8] = b"20261006-12:00:01.000";
 
-    fn checked(actions: &[Action]) {
+    fn checked(actions: &[Action<Message, Event>]) {
         assert!(actions.len() <= MAX_ACTIONS);
         for action in actions {
             if let Action::Send(m) = action {
@@ -2703,7 +2696,7 @@ mod tests {
             }
         }
     }
-    fn sends(actions: &[Action]) -> Vec<Message> {
+    fn sends(actions: &[Action<Message, Event>]) -> Vec<Message> {
         checked(actions);
         actions
             .iter()
@@ -2716,7 +2709,7 @@ mod tests {
             })
             .collect()
     }
-    fn has_event(actions: &[Action], event: Event) -> bool {
+    fn has_event(actions: &[Action<Message, Event>], event: Event) -> bool {
         actions.contains(&Action::Event(event))
     }
     fn inbound(version: Version, kind: &[u8], n: u32, fields: &[(u32, &[u8])]) -> Message {
@@ -2765,7 +2758,7 @@ mod tests {
     }
 
     // Constructed exact-byte fixtures for the cited public session test cases.
-    fn received_bytes(session: &mut Session, bytes: &[u8], now: u64) -> Vec<Action> {
+    fn received_bytes(session: &mut Session, bytes: &[u8], now: u64) -> Vec<Action<Message, Event>> {
         check_wire::<Message>(bytes);
         let message = Message::parse(bytes).unwrap();
         let actions = session.receive(&message, now, TIME).unwrap();

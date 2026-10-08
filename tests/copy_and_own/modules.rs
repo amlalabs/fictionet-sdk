@@ -219,6 +219,8 @@ macro_rules! protocols {
         pub mod sdp;
         #[path = "../../src/stdlib/serve.rs"]
         pub mod serve;
+        #[path = "../../src/stdlib/session.rs"]
+        pub mod session;
         #[path = "../../src/stdlib/sftp.rs"]
         pub mod sftp;
         #[path = "../../src/stdlib/sip.rs"]

@@ -28,9 +28,10 @@
 //! messages that fit.
 //!
 //! ```
+//! use fictionet::stdlib::session::Action;
 //! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::moldudp64::{
-//!     Action, Downstream, Event, Receiver, ReceiverConfig, Retransmitter, Session, StoreConfig,
+//!     Downstream, Event, Receiver, ReceiverConfig, Retransmitter, Session, StoreConfig,
 //! };
 //!
 //! let session = Session::left_padded("20261006")?;
@@ -56,6 +57,7 @@
 //! # Ok::<(), fictionet::stdlib::moldudp64::Error>(())
 //! ```
 
+use fictionet::stdlib::session::Action;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 use std::collections::VecDeque;
 use std::fmt;
@@ -446,15 +448,6 @@ pub enum Event {
     },
 }
 
-/// A receiver's output, in order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action {
-    /// A request to send to the re-request server.
-    Send(Request),
-    /// A notification for the caller.
-    Event(Event),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Pending {
     request: Request,
@@ -527,7 +520,7 @@ impl Receiver {
         self.pending.map(|p| p.request)
     }
     /// Handles one downstream packet.
-    pub fn receive(&mut self, packet: &Downstream, now_ms: u64) -> Result<Vec<Action>, Error> {
+    pub fn receive(&mut self, packet: &Downstream, now_ms: u64) -> Result<Vec<Action<Request, Event>>, Error> {
         let mut s = *self;
         s.advance(now_ms)?;
         let session = *s.session.get_or_insert(packet.session);
@@ -565,7 +558,7 @@ impl Receiver {
         Ok(actions)
     }
     /// Runs the retry timer.
-    pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action>, Error> {
+    pub fn tick(&mut self, now_ms: u64) -> Result<Vec<Action<Request, Event>>, Error> {
         let mut s = *self;
         s.advance(now_ms)?;
         let mut actions = Vec::new();
@@ -580,7 +573,7 @@ impl Receiver {
         self.now = now;
         Ok(())
     }
-    fn recover(&mut self, actions: &mut Vec<Action>) {
+    fn recover(&mut self, actions: &mut Vec<Action<Request, Event>>) {
         let (Some(session), Some(expected)) = (self.session, self.expected) else {
             return;
         };
@@ -627,7 +620,7 @@ impl Receiver {
             actions.push(Action::Event(Event::EndOfSession { next: end }));
         }
     }
-    fn request(&mut self, session: Session, from: u64, actions: &mut Vec<Action>) {
+    fn request(&mut self, session: Session, from: u64, actions: &mut Vec<Action<Request, Event>>) {
         let missing = self.high.saturating_sub(from);
         let count = u16::try_from(missing)
             .unwrap_or(u16::MAX)
@@ -974,7 +967,7 @@ mod tests {
         }
     }
 
-    fn sends(actions: &[Action]) -> Vec<Request> {
+    fn sends(actions: &[Action<Request, Event>]) -> Vec<Request> {
         actions
             .iter()
             .filter_map(|a| match a {
@@ -1316,7 +1309,7 @@ mod tests {
             .unwrap();
             let mut got = Vec::new();
             let mut now = 0;
-            let deliver = |p: &Downstream, actions: &[Action], got: &mut Vec<Vec<u8>>| {
+            let deliver = |p: &Downstream, actions: &[Action<Request, Event>], got: &mut Vec<Vec<u8>>| {
                 for a in actions {
                     if let Action::Event(Event::Deliver { skip, count, .. }) = a {
                         got.extend_from_slice(&p.messages()[*skip..*skip + *count]);

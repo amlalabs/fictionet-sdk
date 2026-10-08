@@ -2,9 +2,10 @@
 //! server and exchange driven by whatever inbound messages parse.
 #![no_main]
 
+use fictionet::stdlib::session::Action;
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::cboe_boe::{
-    Action, ClientHeartbeat, Event, Exchange, ExchangeConfig, Inbound, LoginRequest,
+    ClientHeartbeat, Event, Exchange, ExchangeConfig, Inbound, LoginRequest,
     NewOrder, OrderEvent, Outbound, Price, Server, Timers, UnitSequence,
 };
 use fictionet::stdlib::codec::{

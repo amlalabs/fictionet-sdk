@@ -227,7 +227,7 @@ fn copied_fix_passes_field_failures_to_the_session() {
     let frame = stream.next().unwrap().unwrap();
     assert_eq!(frame.as_ref().unwrap_err().reason(), 4);
     let actions = session.receive_frame(&frame, 1, time).unwrap();
-    let fix::Action::Send(reject) = &actions[0] else {
+    let fictionet::stdlib::session::Action::Send(reject) = &actions[0] else {
         panic!("expected Reject")
     };
     assert_eq!(reject.get(371), Some(b"58".as_slice()));
@@ -300,7 +300,7 @@ fn copied_soupbintcp_frames_through_the_public_driver() {
     finish(&mut stream, |_| unreachable!()).unwrap();
     assert_eq!(
         events.last(),
-        Some(&soupbintcp::Action::Event(soupbintcp::Event::Sequenced {
+        Some(&fictionet::stdlib::session::Action::Event(soupbintcp::Event::Sequenced {
             sequence: 7
         }))
     );
@@ -320,7 +320,7 @@ fn copied_moldudp64_recovers_a_gap() {
     let bytes = server.packet(3, 1).unwrap().to_bytes().unwrap();
     let live = <moldudp64::Downstream as Wire>::parse(&bytes).unwrap();
     let actions = receiver.receive(&live, 1).unwrap();
-    let Some(moldudp64::Action::Send(request)) = actions.last() else {
+    let Some(fictionet::stdlib::session::Action::Send(request)) = actions.last() else {
         panic!("expected a request")
     };
     let wire = request.to_bytes().unwrap();
@@ -403,7 +403,7 @@ fn copied_ouch_exchange_accepts_through_wire() {
     };
     assert_eq!(
         exchange.receive(&inbound, 0).unwrap(),
-        [ouch::Action::Event(ouch::Event::EnterRequested(token))]
+        [fictionet::stdlib::session::Action::Event(ouch::Event::EnterRequested(token))]
     );
     let accepted = exchange.accept(token, 1).unwrap().to_bytes().unwrap();
     assert!(matches!(
@@ -457,7 +457,8 @@ fn copied_cboe_pitch_frames_units_and_builds_a_book() {
 
 #[test]
 fn copied_cboe_boe_logs_in_and_acknowledges() {
-    use cboe_boe::{Action, Event, OrderEvent, Text};
+    use fictionet::stdlib::session::Action;
+    use cboe_boe::{Event, OrderEvent, Text};
     let config = cboe_boe::ClientConfig {
         session_sub_id: Text::new("0001").unwrap(),
         username: Text::new("TEST").unwrap(),
