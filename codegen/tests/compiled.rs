@@ -9,8 +9,6 @@ mod float_nulls;
 mod long_names;
 #[path = "golden/one_field.rs"]
 mod one_field;
-#[path = "../../tests/codegen.rs"]
-mod sdk;
 #[path = "golden/short_names.rs"]
 mod short_names;
 

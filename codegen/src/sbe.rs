@@ -164,7 +164,7 @@ impl Prim {
         match (self, v) {
             (Self::F32 | Self::F64, Val::Float(_)) => true,
             (Self::Char, Val::Int(n)) => (0..=255).contains(&n),
-            (p, Val::Int(n)) if !p.float() => fits_int(n, p.ir()),
+            (p, Val::Int(n)) if !p.float() => crate::validate::fits(&Number::Integer(n), p.ir()),
             _ => false,
         }
     }
@@ -194,16 +194,6 @@ impl Prim {
         Ok(v)
     }
 }
-fn fits_int(n: i128, p: Primitive) -> bool {
-    let bits = p.bytes() * 8;
-    if p.is_signed() {
-        let edge = 1i128 << (bits - 1);
-        (-edge..edge).contains(&n)
-    } else {
-        (0..(1i128 << bits)).contains(&n)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Val {
     Int(i128),
@@ -1290,23 +1280,17 @@ impl<'a> Compiler<'a> {
                     let item = format!("{name}_{member}");
                     let since = self.effective_since(c).max(inherited);
                     self.block(child, &item, &member_path, depth + 1, since)?;
-                    let count = header
-                        .fields
-                        .iter()
-                        .find(|f| f.role == Role::Count)
-                        .map(|f| f.max.unwrap_or(f.width.max()))
-                        .ok_or_else(|| shape(&member_path, "dimension needs numInGroup"))?;
+                    if !header.fields.iter().any(|f| f.role == Role::Count) {
+                        return Err(shape(&member_path, "dimension needs numInGroup"));
+                    }
                     if !header.fields.iter().any(|f| f.role == Role::Length) {
                         return Err(shape(&member_path, "dimension needs blockLength"));
                     }
-                    let limit = usize::try_from(count)
-                        .unwrap_or(usize::MAX)
-                        .min(self.defaults.max_collection);
                     (
                         Type::BlockGroup {
                             item,
                             header,
-                            limit: Some(limit),
+                            limit: None,
                         },
                         None,
                     )

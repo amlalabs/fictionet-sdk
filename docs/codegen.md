@@ -447,10 +447,9 @@ against `stdlib::protobuf` and `stdlib::asn1`.
 Goldens live in `codegen/tests/golden`. The `blocks` example covers
 offsets, blocks, block groups, unions, ranges, constants, and enum nulls;
 `sbe_sample` is the golden for the `sbe` front end. The codegen test target compiles
-them and runs their emitted tests. It also runs the root integration checks
-in `tests/codegen.rs`. Additional
-fixtures check small allocation and work budgets, long identifiers, and
-maximum-sized stream headers. To update:
+them and runs their emitted tests. The SDK test target runs the integration
+checks in `tests/codegen.rs`. Additional fixtures check small allocation and
+work budgets, long identifiers, and maximum-sized stream headers. To update:
 
 ```sh
 CARGO_BUILD_JOBS=4 BLESS_CODEGEN=1 cargo test -p fictionet-codegen --test golden goldens_and_determinism

@@ -463,6 +463,13 @@ fn validate_inner(schema: &mut Schema, limits: Limits) -> Result<Validated, Erro
                 continue;
             }
             if let Some(offset) = f.offset {
+                if size.is_none() && matches!(t.definition, Definition::Block { .. }) {
+                    return Err(err(
+                        ErrorKind::InvalidSize,
+                        &path,
+                        "variable-size block fields cannot have an offset",
+                    ));
+                }
                 match position {
                     Some(p) if offset >= p && offset <= limits.max_message => {
                         if offset > p {
@@ -884,7 +891,11 @@ fn normalize(
             if let Presence::Null(null) = presence {
                 let valid = match item.as_ref() {
                     Type::Scalar(p) => fits(null, *p),
-                    Type::Range { item: p, .. } => fits(null, *p),
+                    Type::Range { item: p, min, max } => {
+                        // Check representability before comparing as floats.
+                        fits(null, *p) && fits(min, *p) && fits(max, *p)
+                            && !(number_le(min, null, *p) && number_le(null, max, *p))
+                    }
                     Type::Ref(name) => match (kinds.get(name), &*null) {
                         (Some(Kind::Enum(repr, variants)), Number::Integer(n)) => {
                             fits(null, *repr) && variants.iter().all(|(_, v)| v != n)
@@ -897,7 +908,7 @@ fn normalize(
                     return Err(err(
                         ErrorKind::InvalidValue,
                         path,
-                        "null requires a scalar, range, or enum item and an exactly representable value that is not a variant",
+                        "null requires a scalar, range, or enum item and an exactly representable value that is not a variant and lies outside the range",
                     ));
                 }
             }

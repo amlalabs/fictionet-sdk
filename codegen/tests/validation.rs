@@ -138,6 +138,30 @@ fn scalar_widths_nulls_enums_and_sets() {
             ErrorKind::InvalidValue
         );
     }
+    for (repr, min, max, null, valid) in [
+        ("i64", "1", "3", "1", false),
+        ("i64", "1", "3", "3", false),
+        ("i64", "1", "3", "2", false),
+        ("i64", "1", "3", "0", true),
+        ("f64", "1.0", "3.0", "1", false),
+        ("f64", "1", "3", "3.0", false),
+        ("f64", "1", "3.0", "1.5", false),
+        ("f64", "1.0", "3", "0.5", true),
+        ("u64", "9007199254740993", "9007199254740995", "9007199254740992", true),
+        ("i64", "-9007199254740995", "-9007199254740993", "-9007199254740992", true),
+        ("f64", "9007199254740992", "9007199254740994.0", "9007199254740994", false),
+        ("f64", "9007199254740992.0", "9007199254740994", "9007199254740996", true),
+        ("f64", "1", "3", "170141183460469231731687303715884105727", false),
+    ] {
+        let json = format!(
+            r#"{{"types":[{{"name":"A","kind":"struct","fields":[{{"name":"x","type":{{"kind":"optional","null":{null},"item":{{"kind":"range","item":"{repr}","min":{min},"max":{max}}}}}}}]}}]}}"#
+        );
+        if valid {
+            checked(&json).unwrap();
+        } else {
+            fail(&json, ErrorKind::InvalidValue);
+        }
+    }
     fail(
         r#"{"types":[{"name":"A","kind":"struct","fields":[{"name":"x","type":{"kind":"optional","item":{"kind":"bytes","size":1},"null":0}}]}]}"#,
         ErrorKind::InvalidValue,
@@ -645,6 +669,19 @@ fn offsets_and_block_layouts() {
         r#"{"types":[{"name":"B","kind":"block","length":2000000,"fields":[]}]}"#,
     ] {
         fail(json, ErrorKind::InvalidSize);
+    }
+    for offset in [0, 4, 8] {
+        let fields = format!(
+            r#"[{{"name":"data","type":{{"kind":"bytes","prefix":"u8"}},"offset":{offset}}}]"#
+        );
+        let json = format!(
+            r#"{{"types":[{{"name":"B","kind":"block","length":4,"fields":{fields}}}]}}"#
+        );
+        fail(&json, ErrorKind::InvalidSize);
+        assert_eq!(checked(&json).unwrap_err().location, "types.B.data");
+        checked(&format!(
+            r#"{{"types":[{{"name":"S","kind":"struct","fields":{fields}}}]}}"#
+        )).unwrap();
     }
     let blocks = checked(
         r#"{"types":[{"name":"B","kind":"block","length":8,"fields":[{"name":"a","type":"u16"}]},

@@ -117,7 +117,7 @@ fn maps_scalars_nulls_constants_and_layouts() {
     else {
         panic!("{:?}", f[7].ty)
     };
-    assert_eq!((item.as_str(), *limit), ("M_g", Some(4096)));
+    assert_eq!((item.as_str(), *limit), ("M_g", None));
     assert_eq!(header.size, 4);
     assert_eq!(
         f[8].ty,
@@ -148,7 +148,11 @@ fn maps_scalars_nulls_constants_and_layouts() {
         }));
     // Unused composites are left out; enums are kept.
     assert!(schema.types.iter().all(|t| t.name != "varData"));
-    validate(schema, Limits::default()).unwrap();
+    let checked = validate(schema, Limits::default()).unwrap();
+    assert!(matches!(
+        fields(checked.schema(), "M")[7].ty,
+        Type::BlockGroup { limit: Some(4096), .. }
+    ));
 }
 
 #[test]
