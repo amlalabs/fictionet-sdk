@@ -12,7 +12,7 @@ fn main() {
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let mut modules = String::new();
     for seed in 0..schemas::SEEDS {
-        let source = fictionet_codegen::emit(&schemas::random_schema(seed), &[]).unwrap();
+        let source = fictionet_codegen::emit("ir", &schemas::random_schema(seed), &[]).unwrap();
         let path = out.join(format!("seed_{seed}.rs"));
         std::fs::write(&path, source).unwrap();
         writeln!(

@@ -32,7 +32,7 @@ pub static FORMATS: &[&dyn FrontEnd] = &[&IrFrontEnd, &crate::SbeFrontEnd];
 /// Generated source and the validated schema used to emit it.
 #[derive(Clone, Debug)]
 pub struct Generated {
-    /// Copy-and-own Rust module.
+    /// Generated Rust module.
     pub source: String,
     /// Schema available for optional fuzz target emission.
     pub schema: crate::ValidatedSchema,
@@ -49,6 +49,7 @@ pub fn generate(format: &str, inputs: &[Input], defaults: Limits) -> Result<Gene
     })?;
     let checked = crate::validate(frontend.parse(inputs, defaults)?, defaults)?;
     let source = crate::emit(
+        format,
         &checked,
         &inputs.iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
     )?;

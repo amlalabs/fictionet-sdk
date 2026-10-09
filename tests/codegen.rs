@@ -302,6 +302,7 @@ fn differential_fixture_matches_programmatic_ir() {
         ..Schema::default()
     };
     let source = emit(
+        "ir",
         &validate(schema, Limits::default()).unwrap(),
         &["xdr.json".into()],
     )

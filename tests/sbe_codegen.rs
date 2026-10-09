@@ -43,22 +43,39 @@ fn ir(xml: &str) -> ValidatedSchema {
 }
 
 /// The hand-written part starts at this line. `BLESS_CODEGEN=1` replaces
-/// everything before it with fresh generator output.
+/// the generated body before it, preserving the header and hand-written part.
 const MARKER: &str = "\n// Hand-written below this line";
+
+fn body(source: &str) -> &str {
+    let offset = source
+        .split_inclusive('\n')
+        .take_while(|line| line.starts_with("//"))
+        .map(str::len)
+        .sum::<usize>();
+    &source[offset..]
+}
 
 #[test]
 fn module_is_generator_output_plus_hand_written_framing() {
     let generated = generate("sbe", &[input()], Limits::default())
         .unwrap()
         .source;
+    let generated = body(&generated);
     let tail = &MODULE[MODULE.find(MARKER).expect("marker")..];
     if std::env::var_os("BLESS_CODEGEN").is_some() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/stdlib/cme_mdp3.rs");
-        std::fs::write(path, format!("{generated}{tail}")).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "{}{generated}{tail}",
+                &MODULE[..MODULE.len() - body(MODULE).len()]
+            ),
+        )
+        .unwrap();
         return;
     }
     assert_eq!(
-        &MODULE[..MODULE.len() - tail.len()],
+        body(&MODULE[..MODULE.len() - tail.len()]),
         generated,
         "src/stdlib/cme_mdp3.rs differs from the generator; set BLESS_CODEGEN=1 to update"
     );

@@ -519,7 +519,12 @@ fn minimum_depth_and_message_size_must_fit() {
 
 #[test]
 fn public_fields_show_types_and_only_inline_cycles_need_boxes() {
-    let groups = emit(&checked(include_str!("schemas/groups.json")).unwrap(), &[]).unwrap();
+    let groups = emit(
+        "ir",
+        &checked(include_str!("schemas/groups.json")).unwrap(),
+        &[],
+    )
+    .unwrap();
     for declaration in [
         "pub status: Status,",
         "pub flags: Flags,",
@@ -530,6 +535,7 @@ fn public_fields_show_types_and_only_inline_cycles_need_boxes() {
         assert!(groups.contains(declaration), "missing {declaration}");
     }
     let recursive = emit(
+        "ir",
         &checked(include_str!("schemas/recursive.json")).unwrap(),
         &[],
     )
@@ -537,7 +543,7 @@ fn public_fields_show_types_and_only_inline_cycles_need_boxes() {
     assert!(recursive.contains("pub children: Vec<Node>,"));
     assert!(recursive.contains("pub next: Option<Box<Node>>,"));
     let mutual = checked(r#"{"types":[{"name":"A","kind":"struct","fields":[{"name":"b","type":{"kind":"ref","name":"B"}}]},{"name":"B","kind":"struct","fields":[{"name":"a","type":{"kind":"optional","flag":"u8","item":{"kind":"ref","name":"A"}}}]},{"name":"C","kind":"struct","fields":[{"name":"a","type":{"kind":"ref","name":"A"}},{"name":"c","type":{"kind":"optional","flag":"u8","item":{"kind":"ref","name":"C"}}}]}]}"#).unwrap();
-    let source = emit(&mutual, &[]).unwrap();
+    let source = emit("ir", &mutual, &[]).unwrap();
     assert!(source.contains("pub b: Box<B>,"));
     assert!(source.contains("pub a: Option<Box<A>>,"));
     assert!(source.contains("pub a: A,"));
@@ -546,7 +552,7 @@ fn public_fields_show_types_and_only_inline_cycles_need_boxes() {
         vector_cycle.recursive_types().collect::<Vec<_>>(),
         ["A", "B"]
     );
-    let source = emit(&vector_cycle, &[]).unwrap();
+    let source = emit("ir", &vector_cycle, &[]).unwrap();
     assert!(source.contains("pub b: B,"));
     assert!(source.contains("pub a: Vec<A>,"));
 }
@@ -582,7 +588,7 @@ fn float_null_decimals_round_trip_at_their_width() {
         item: Box::new(Type::Scalar(Primitive::F32)),
         presence: Presence::Null(Number::Float(f64::from(f32::MAX))),
     });
-    let source = emit(&validate(s, Limits::default()).unwrap(), &[]).unwrap();
+    let source = emit("ir", &validate(s, Limits::default()).unwrap(), &[]).unwrap();
     assert!(source.contains("3.4028235e38f32"));
     assert!(!source.contains("3.4028234663852886"));
 }
@@ -590,6 +596,7 @@ fn float_null_decimals_round_trip_at_their_width() {
 #[test]
 fn wire_docs_name_only_applicable_value_refusals() {
     let source = emit(
+        "ir",
         &checked(include_str!("schemas/short_names.json")).unwrap(),
         &[],
     )
@@ -612,7 +619,12 @@ fn wire_docs_name_only_applicable_value_refusals() {
     ] {
         assert!(!wire.contains(irrelevant), "{irrelevant}");
     }
-    let source = emit(&checked(include_str!("schemas/groups.json")).unwrap(), &[]).unwrap();
+    let source = emit(
+        "ir",
+        &checked(include_str!("schemas/groups.json")).unwrap(),
+        &[],
+    )
+    .unwrap();
     let entry = source
         .split("impl fictionet::stdlib::codec::Wire for Entry {")
         .nth(1)

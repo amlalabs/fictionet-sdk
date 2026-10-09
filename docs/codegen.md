@@ -1,9 +1,9 @@
 # Fictionet code generation
 
 `fictionet-codegen` turns a structured schema into a Fictionet protocol
-module. Generate the file once. Copy it into your crate, edit it, and own
-it. Regenerate only when you choose to replace those edits. The generated
-file has no dependency on the generator at runtime.
+module. The output is an ordinary stdlib-style module; see
+[Changing a protocol by copying it](../src/stdlib/mod.rs). It has no
+dependency on the generator at runtime.
 
 The generator has a shared IR, a validator, one Rust emitter, and a
 front end per input format. Only two front ends exist: `ir` reads the IR
@@ -383,7 +383,7 @@ The crate exports `Schema`, `NamedType`, `Definition`, `Field`, `Type`,
 `Header`, `HeaderField`, `Role`, `Case`, `Constant`, and `Limits`, and the
 front ends `IrFrontEnd` and `SbeFrontEnd`. Construct them directly or use `FrontEnd::parse`. Call
 `validate(schema, limits)` to obtain a `ValidatedSchema`, then
-`emit(&validated, &input_names)` to get Rust source. `generate` combines
+`emit(format, &validated, &input_names)` to get Rust source. `generate` combines
 registry lookup, parsing, validation, and emission. It returns `Generated`,
 with `source: String` and `schema: ValidatedSchema`. The CLI uses this same
 pipeline and uses the returned schema for an optional fuzz target.
@@ -405,7 +405,7 @@ script is needed.
 
 Generated modules use public `fictionet::stdlib::codec` APIs and their own
 file-local support code. The same file compiles in SDK integration tests
-and in the external copy-and-own fixture. Parsing is exact. Writing is
+and in the `tests/copy_and_own` fixture. Parsing is exact. Writing is
 strict and transactional. Count and range arithmetic is checked; reads
 use checked slicing. Resource and depth checks precede allocation and
 recursive descent. Work is linear in visited fields, bytes, and entries,

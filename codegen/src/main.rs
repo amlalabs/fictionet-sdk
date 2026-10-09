@@ -11,7 +11,7 @@ const HELP: &str = "fictionet-codegen <format> <input...> -o <file.rs> [options]
 fictionet-codegen --format <format> <input...> -o <file.rs>
 fictionet-codegen --list
 
-Generate once, then copy and edit the file. Regenerate only by choice.
+Generate a Rust module from a protocol schema.
 
 Options:
   --max-message <bytes>     Maximum encoded value (default 1048576)
@@ -322,7 +322,14 @@ fn run() -> Result<(), Error> {
     let names = inputs.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
     let fuzz_source = fuzz
         .as_ref()
-        .map(|p| emit_fuzz(&generated.schema, &relative_module(&output, p)?, &names))
+        .map(|p| {
+            emit_fuzz(
+                &format,
+                &generated.schema,
+                &relative_module(&output, p)?,
+                &names,
+            )
+        })
         .transpose()?;
     let module = StagedFile::new(&output, &generated.source)?;
     let target = fuzz

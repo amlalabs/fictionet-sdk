@@ -16,12 +16,12 @@ fn all_name_lengths_are_rustfmt_clean() {
     for n in 1..=MAX_NAME {
         let checked = validate(layout_schema(n), Limits::default()).unwrap();
         let path = scratch.0.join(format!("length_{n}.rs"));
-        std::fs::write(&path, emit(&checked, &[]).unwrap()).unwrap();
+        std::fs::write(&path, emit("ir", &checked, &[]).unwrap()).unwrap();
         files.push(path);
         let path = scratch.0.join(format!("fuzz_{n}.rs"));
         std::fs::write(
             &path,
-            emit_fuzz(&checked, &format!("length_{n}.rs"), &[]).unwrap(),
+            emit_fuzz("ir", &checked, &format!("length_{n}.rs"), &[]).unwrap(),
         )
         .unwrap();
         files.push(path);
@@ -34,10 +34,10 @@ fn random_valid_schemas_are_deterministic_and_rustfmt_clean() {
     let mut files = Vec::new();
     for seed in 0..SEEDS {
         let checked = random_schema(seed);
-        let source = emit(&checked, &[]).unwrap();
+        let source = emit("ir", &checked, &[]).unwrap();
         assert_eq!(
             source,
-            emit(&random_schema(seed), &[]).unwrap(),
+            emit("ir", &random_schema(seed), &[]).unwrap(),
             "seed {seed}"
         );
         let path = scratch.0.join(format!("seed_{seed}.rs"));

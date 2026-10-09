@@ -68,6 +68,7 @@ fn goldens_and_determinism() {
             let checked = validate(IrFrontEnd.parse(&[input], limits).unwrap(), limits).unwrap();
             assert_eq!(checked.recursive_types().collect::<Vec<_>>(), ["Node"]);
             let target = emit_fuzz(
+                "ir",
                 &checked,
                 "../../codegen/tests/golden/recursive.rs",
                 &["recursive.json".into()],
@@ -103,6 +104,6 @@ fn goldens_are_rustfmt_clean_when_available() {
 #[test]
 fn header_quotes_untrusted_filenames() {
     let checked = validate(Default::default(), Limits::default()).unwrap();
-    let source = emit(&checked, &["file\n#[bad].json".into()]).unwrap();
-    assert!(source.contains(r#"// Input: "file\n#[bad].json""#));
+    let source = emit("ir", &checked, &["file\n#[bad].json".into()]).unwrap();
+    assert!(source.contains(r#"// Schema: "file\n#[bad].json""#));
 }
