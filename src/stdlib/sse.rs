@@ -922,9 +922,13 @@ mod tests {
     #[test]
     fn bom_at_start_only_and_malformed_utf8() {
         fictionet::assert_cases!(|input| events(input);
-            initial_bom: "\u{feff}data:one\n\n\u{feff}data:ignored\ndata:\u{feff}two\n\n".as_bytes() => [Event::new("one"), Event::new("\u{feff}two")],
-            repeated_bom: "\u{feff}\u{feff}data:ignored\ndata:x\n\n".as_bytes() => [Event::new("x")],
-            invalid_utf8: b"data:\xff\xc3\n\ndata:\xf0\x90\x80\n\n" => [Event::new("\u{fffd}\u{fffd}"), Event::new("\u{fffd}")],
+            initial_bom:
+                "\u{feff}data:one\n\n\u{feff}data:ignored\ndata:\u{feff}two\n\n".as_bytes() =>
+                [Event::new("one"), Event::new("\u{feff}two")],
+            repeated_bom: "\u{feff}\u{feff}data:ignored\ndata:x\n\n".as_bytes() =>
+                [Event::new("x")],
+            invalid_utf8: b"data:\xff\xc3\n\ndata:\xf0\x90\x80\n\n" =>
+                [Event::new("\u{fffd}\u{fffd}"), Event::new("\u{fffd}")],
         );
         assert!(events(b"\xef\xbb\xbf").is_empty());
         assert!(events(b"\xef\xbb").is_empty());
@@ -1017,10 +1021,15 @@ mod tests {
             (vec![value], None)
         );
         fictionet::assert_cases!(|make, input| decode_all(make, input).1;
-            (|| Events::with_limits(Limits { event: limits.event - 1, ..limits }), &bytes) => Some(Fail::Protocol(Error::EventTooLong { limit: limits.event - 1 })),
+            (|| Events::with_limits(Limits { event: limits.event - 1, ..limits }), &bytes) =>
+                Some(Fail::Protocol(Error::EventTooLong { limit: limits.event - 1 })),
             // Each input block fits; repeating the inherited ID in the second
             // event's independent encoding does not.
-            (|| Events::with_limits(Limits { line: 32, event: 20 }), b"id:1234567890\n\ndata:123456\n\n") => Some(Fail::Protocol(Error::EventTooLong { limit: 20 })),
+            (
+                || Events::with_limits(Limits { line: 32, event: 20 }),
+                b"id:1234567890\n\ndata:123456\n\n",
+            ) =>
+                Some(Fail::Protocol(Error::EventTooLong { limit: 20 })),
         );
     }
 

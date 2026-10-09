@@ -2961,7 +2961,8 @@ mod tests {
         }
         fictionet::assert_cases!(|input| Message::read_datagram(input);
             short_body: b"OPTIONS sip:a@b SIP/2.0\r\nl: 3\r\n\r\nab" => Err(Error::Incomplete),
-            duplicate_length: b"OPTIONS sip:a@b SIP/2.0\r\nl: 0\r\nContent-Length: 0\r\n\r\n" => Err(Error::ContentLength),
+            duplicate_length: b"OPTIONS sip:a@b SIP/2.0\r\nl: 0\r\nContent-Length: 0\r\n\r\n" =>
+                Err(Error::ContentLength),
             bare_newlines: b"OPTIONS sip:a@b SIP/2.0\n\n" => Err(Error::LineEnding),
         );
     }
@@ -2996,7 +2997,8 @@ mod tests {
         assert!(Message::parse(enough.as_bytes()).is_ok());
         fictionet::assert_cases!(|input| e(input);
             bare_newline: b"OPTIONS sip:a@b SIP/2.0\nX: 1\r\nl: 0\r\n\r\n" => Error::LineEnding,
-            embedded_return: b"OPTIONS sip:a@b SIP/2.0\r\nX: 1\r2\r\nl: 0\r\n\r\n" => Error::LineEnding,
+            embedded_return: b"OPTIONS sip:a@b SIP/2.0\r\nX: 1\r2\r\nl: 0\r\n\r\n" =>
+                Error::LineEnding,
             extra_return: b"OPTIONS sip:a@b SIP/2.0\r\n\r\r\nl: 0\r\n\r\n" => Error::LineEnding,
             invalid_utf8: b"OPTIONS sip:a@b SIP/2.0\r\nX: \xff\r\nl: 0\r\n\r\n" => Error::Utf8,
             // The stream skips an empty keep-alive line, then needs a start line.
@@ -3034,14 +3036,20 @@ mod tests {
         fictionet::assert_cases!(|input| e(input);
             response_version: b"SIP/3.0 200 OK\r\nl: 0\r\n\r\n" => Error::Version,
             request_version: b"OPTIONS sip:a@b SIP/1.0\r\nl: 0\r\n\r\n" => Error::Version,
-            folded_header: b"OPTIONS sip:a@b SIP/2.0\r\n folded\r\nl: 0\r\n\r\n" => Error::HeaderLine,
-            missing_colon: b"OPTIONS sip:a@b SIP/2.0\r\nNo colon\r\nl: 0\r\n\r\n" => Error::HeaderLine,
-            name_space: b"OPTIONS sip:a@b SIP/2.0\r\nBad Name: 1\r\nl: 0\r\n\r\n" => Error::HeaderLine,
+            folded_header: b"OPTIONS sip:a@b SIP/2.0\r\n folded\r\nl: 0\r\n\r\n" =>
+                Error::HeaderLine,
+            missing_colon: b"OPTIONS sip:a@b SIP/2.0\r\nNo colon\r\nl: 0\r\n\r\n" =>
+                Error::HeaderLine,
+            name_space: b"OPTIONS sip:a@b SIP/2.0\r\nBad Name: 1\r\nl: 0\r\n\r\n" =>
+                Error::HeaderLine,
             empty_name: b"OPTIONS sip:a@b SIP/2.0\r\n: 1\r\nl: 0\r\n\r\n" => Error::HeaderLine,
-            nul_value: b"OPTIONS sip:a@b SIP/2.0\r\nX: a\x00b\r\nl: 0\r\n\r\n" => Error::HeaderValue,
+            nul_value: b"OPTIONS sip:a@b SIP/2.0\r\nX: a\x00b\r\nl: 0\r\n\r\n" =>
+                Error::HeaderValue,
             nonnumeric_length: b"OPTIONS sip:a@b SIP/2.0\r\nl: x\r\n\r\n" => Error::ContentLength,
             empty_length: b"OPTIONS sip:a@b SIP/2.0\r\nl: \r\n\r\n" => Error::ContentLength,
-            conflicting_lengths: b"OPTIONS sip:a@b SIP/2.0\r\nl: 1\r\nContent-Length: 2\r\n\r\nab" => Error::ContentLength,
+            conflicting_lengths:
+                b"OPTIONS sip:a@b SIP/2.0\r\nl: 1\r\nContent-Length: 2\r\n\r\nab" =>
+                Error::ContentLength,
         );
         // Exact stream messages refuse bytes past the body.
         assert_eq!(
@@ -3780,7 +3788,8 @@ mod tests {
         fictionet::assert_cases!(|input| Contacts::parse(input);
             wildcard_commas: ",*,".as_bytes() => Err(Error::HeaderSyntax("Contact")),
             trailing_commas: "<sip:a@b>,,".as_bytes() => Err(Error::HeaderSyntax("Contact")),
-            two_addresses: "<sip:a@b>, <sip:c@d>".as_bytes() => Ok(Contacts::List(vec![ NameAddr::new("sip:a@b"), NameAddr::new("sip:c@d") ])),
+            two_addresses: "<sip:a@b>, <sip:c@d>".as_bytes() =>
+                Ok(Contacts::List(vec![ NameAddr::new("sip:a@b"), NameAddr::new("sip:c@d") ])),
         );
         let m =
             Message::parse(b"OPTIONS sip:a@b SIP/2.0\r\nm: ,*\r\nVia:\r\nl: 0\r\n\r\n").unwrap();

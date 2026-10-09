@@ -1807,7 +1807,11 @@ mod tests {
                 orders: 1
             })
         );
-        fictionet::assert_cases!(|locate, side, count| book.depth(locate, side, count).iter().map(|l| l.price.0).collect::<Vec<_>>();
+        fictionet::assert_cases!(
+            |locate, side, count| book.depth(locate, side, count)
+                .iter()
+                .map(|l| l.price.0)
+                .collect::<Vec<_>>();
             (1, Side::Buy, 5) => [100, 99],
             (1, Side::Sell, 1) => [101],
         );
@@ -2006,8 +2010,10 @@ mod tests {
         assert_eq!(book.apply(&samples()[1]), Err(Error::TooManyStocks));
         assert_eq!(book.stock_count(), 1);
         fictionet::assert_cases!(|config| Book::new(config).err();
-            zero_orders: BookConfig { max_orders: 0, ..BookConfig::default() } => Some(Error::Config),
-            excess_stocks: BookConfig { max_stocks: MAX_STOCKS + 1, ..BookConfig::default() } => Some(Error::Config),
+            zero_orders: BookConfig { max_orders: 0, ..BookConfig::default() } =>
+                Some(Error::Config),
+            excess_stocks: BookConfig { max_stocks: MAX_STOCKS + 1, ..BookConfig::default() } =>
+                Some(Error::Config),
         );
     }
 

@@ -2654,9 +2654,14 @@ mod tests {
         );
         assert_eq!((s.phase(), c.phase()), (Phase::Closed, Phase::Closed));
         fictionet::assert_cases!(server_bytes;
-            (&ServerMessage::SecurityFailed(vec![]), Dialect::V3_7, &PixelFormat::TRUE_COLOR_32) => Ok(vec![0, 0, 0, 1]),
+            (&ServerMessage::SecurityFailed(vec![]), Dialect::V3_7, &PixelFormat::TRUE_COLOR_32) =>
+                Ok(vec![0, 0, 0, 1]),
             // A reason the wire cannot carry is refused, not dropped.
-            (&ServerMessage::SecurityFailed(b"x".to_vec()), Dialect::V3_7, &PixelFormat::TRUE_COLOR_32) => Err(Error::Unwritable),
+            (
+                &ServerMessage::SecurityFailed(b"x".to_vec()),
+                Dialect::V3_7,
+                &PixelFormat::TRUE_COLOR_32,
+            ) => Err(Error::Unwritable),
         );
     }
 
@@ -3196,12 +3201,16 @@ mod tests {
     fn client_message_examples() {
         // RFC 6143, sections 7.5.3 to 7.5.6.
         fictionet::assert_cases!(|input| ClientMessage::parse(input);
-            update_request: &[3, 1, 0, 0, 0, 0, 0x04, 0x00, 0x03, 0x00] => Ok(update_request(true, 0, 0, 1024, 768)),
+            update_request: &[3, 1, 0, 0, 0, 0, 0x04, 0x00, 0x03, 0x00] =>
+                Ok(update_request(true, 0, 0, 1024, 768)),
             // Return, pressed: keysym 0xff0d.
-            key_event: &[4, 1, 0, 0, 0, 0, 0xff, 0x0d] => Ok(ClientMessage::KeyEvent { down: true, key: 0xff0d }),
+            key_event: &[4, 1, 0, 0, 0, 0, 0xff, 0x0d] =>
+                Ok(ClientMessage::KeyEvent { down: true, key: 0xff0d }),
             pointer_event: &[5, 1, 0, 10, 0, 20] => Ok(pointer(1, 10, 20)),
-            encodings: &[2, 0, 0, 2, 0, 0, 0, 1, 0xff, 0xff, 0xff, 0x21] => Ok(ClientMessage::SetEncodings(vec![1, -223])),
-            cut_text: &[6, 0, 0, 0, 0, 0, 0, 2, b'h', b'i'] => Ok(ClientMessage::ClientCutText(b"hi".to_vec())),
+            encodings: &[2, 0, 0, 2, 0, 0, 0, 1, 0xff, 0xff, 0xff, 0x21] =>
+                Ok(ClientMessage::SetEncodings(vec![1, -223])),
+            cut_text: &[6, 0, 0, 0, 0, 0, 0, 2, b'h', b'i'] =>
+                Ok(ClientMessage::ClientCutText(b"hi".to_vec())),
         );
     }
 
@@ -3386,7 +3395,14 @@ mod tests {
             |contents| ServerMessage::FramebufferUpdate(vec![rectangle(0, 0, 2, 2, contents)]);
         fictionet::assert_cases!(server_bytes;
             (&rect(Contents::Raw(vec![0; 15])), Dialect::V3_8, &f) => Err(Error::Unwritable),
-            (&rect(Contents::Cursor { pixels: vec![0; 16], mask: vec![0; 3] }), Dialect::V3_8, &f) => Err(Error::Unwritable),
+            (
+                &rect(Contents::Cursor {
+                    pixels: vec![0; 16],
+                    mask: vec![0; 3],
+                }),
+                Dialect::V3_8,
+                &f,
+            ) => Err(Error::Unwritable),
         );
         let mut bad = f;
         bad.bits_per_pixel = 12;

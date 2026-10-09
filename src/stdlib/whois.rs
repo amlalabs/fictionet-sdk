@@ -1475,8 +1475,14 @@ mod tests {
         }
         fictionet::assert_cases!(|fields| Response::from_fields(fields);
             initial_indent: &[Field::new(1, "k", "v")] => Err(Error::Unwritable),
-            skipped_indent: &[Field::new(0, "k", "v"), Field::new(2, "k", "v")] => Err(Error::Unwritable),
-            repeated_parent: &[ Field::new(0, "k", "v"), Field::new(1, "k", "v"), Field::new(0, "k", "v") ] => Err(Error::Unwritable),
+            skipped_indent: &[Field::new(0, "k", "v"), Field::new(2, "k", "v")] =>
+                Err(Error::Unwritable),
+            repeated_parent: &[
+                Field::new(0, "k", "v"),
+                Field::new(1, "k", "v"),
+                Field::new(0, "k", "v"),
+            ] =>
+                Err(Error::Unwritable),
         );
         let big = "v".repeat(MAX_RESPONSE);
         assert_eq!(one("k", &big), Err(Error::ResponseTooLong));

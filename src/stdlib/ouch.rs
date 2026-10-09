@@ -2757,11 +2757,17 @@ mod tests {
         };
         // Case 1: an unknown original or a used UserRefNum is ignored.
         fictionet::assert_cases!(|message, time| x.receive(message, time).unwrap();
-            (&replace(99, 11, 500).into(), 3) => [Action::Event(Event::Ignored(Ignored::UnknownOrder(token( 99 ))))],
-            (&replace(10, 10, 500).into(), 3) => [Action::Event(Event::Ignored(Ignored::Retransmission( token(10) )))],
+            (&replace(99, 11, 500).into(), 3) =>
+                [Action::Event(Event::Ignored(Ignored::UnknownOrder(token( 99 ))))],
+            (&replace(10, 10, 500).into(), 3) =>
+                [Action::Event(Event::Ignored(Ignored::Retransmission( token(10) )))],
             // Case 4: replaced. Shares are liable over the chain: 500 less the
             // 100 executed leaves 400 (2.2, 3.3).
-            (&replace(10, 11, 500).into(), 4) => [Action::Event(Event::ReplaceRequested { original: token(10), replacement: token(11) })],
+            (&replace(10, 11, 500).into(), 4) =>
+                [Action::Event(Event::ReplaceRequested {
+                    original: token(10),
+                    replacement: token(11),
+                })],
         );
         let Outbound::OrderReplaced(r) = x.accept(token(11), 5).unwrap() else {
             panic!()
@@ -3187,7 +3193,8 @@ mod tests {
             .unwrap();
         let capture = |x: &Exchange| format!("{x:?}");
         fictionet::assert_cases!(|operation| check_atomic(&mut x, operation, capture);
-            receive: |x: &mut Exchange| x.receive(&enter(2, 100, Options::default()).into(), 4) => Err(Error::Time),
+            receive: |x: &mut Exchange| x.receive(&enter(2, 100, Options::default()).into(), 4) =>
+                Err(Error::Time),
             accept: |x: &mut Exchange| x.accept(token(1), 4) => Err(Error::Time),
             reject: |x: &mut Exchange| x.reject(token(1), 1, 4) => Err(Error::Time),
             system_event: |x: &mut Exchange| x.system_event(b'S', 4) => Err(Error::Time),

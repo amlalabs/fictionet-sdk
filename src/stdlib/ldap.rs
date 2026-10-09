@@ -2836,8 +2836,15 @@ mod tests {
         }
         fictionet::assert_cases!(|input| Filter::parse_text(input);
             equality: "(cn=Babs Jensen)" => Ok(eq("cn", "Babs Jensen")),
-            substrings: "(o=univ*of*mich*)" => Ok(substrings( "o".into(), Some(b"univ".to_vec()), vec![b"of".to_vec(), b"mich".to_vec()], None )),
-            extensible: "(:DN:2.4.6.8.10:=Dino)" => Ok(extensible( Some("2.4.6.8.10".into()), None, b"Dino".to_vec(), true )),
+            substrings: "(o=univ*of*mich*)" =>
+                Ok(substrings(
+                    "o".into(),
+                    Some(b"univ".to_vec()),
+                    vec![b"of".to_vec(), b"mich".to_vec()],
+                    None,
+                )),
+            extensible: "(:DN:2.4.6.8.10:=Dino)" =>
+                Ok(extensible( Some("2.4.6.8.10".into()), None, b"Dino".to_vec(), true )),
             binary: r"(bin=\00\00\00\04)" => Ok(equal("bin".into(), vec![0, 0, 0, 4])),
         );
         fictionet::assert_cases!(|input| Filter::parse_text(input).unwrap().to_text().unwrap();
@@ -3173,19 +3180,29 @@ mod tests {
         fictionet::assert_cases!(|input| Message::parse(input);
             indefinite: &indefinite => Err(Error::Ber(asn1::Error::Indefinite)),
             // A message ID over maxInt, or negative.
-            negative_long_id: &[0x30, 0x08, 0x02, 0x04, 0x80, 0, 0, 0, 0x42, 0x00] => Err(Error::Range("messageID")),
-            negative_id: &[0x30, 0x05, 0x02, 0x01, 0xff, 0x42, 0x00] => Err(Error::Range("messageID")),
-            oversized_id: &[0x30, 0x09, 0x02, 0x05, 0x00, 0x80, 0, 0, 0, 0x42, 0x00] => Err(Error::Range("messageID")),
+            negative_long_id: &[0x30, 0x08, 0x02, 0x04, 0x80, 0, 0, 0, 0x42, 0x00] =>
+                Err(Error::Range("messageID")),
+            negative_id: &[0x30, 0x05, 0x02, 0x01, 0xff, 0x42, 0x00] =>
+                Err(Error::Range("messageID")),
+            oversized_id: &[0x30, 0x09, 0x02, 0x05, 0x00, 0x80, 0, 0, 0, 0x42, 0x00] =>
+                Err(Error::Range("messageID")),
             // An unknown operation, and a known one in the wrong form.
-            unknown_operation: &[0x30, 0x05, 0x02, 0x01, 0x01, 0x5e, 0x00] => Err(Error::Operation(Tag::application(30))),
-            constructed_unbind: &[0x30, 0x05, 0x02, 0x01, 0x01, 0x62, 0x00] => Err(Error::Operation(Tag::application(2).as_constructed())),
-            unexpected_tag: &[0x30, 0x05, 0x02, 0x01, 0x01, 0x04, 0x00] => Err(Error::Operation(Tag::OCTET_STRING)),
+            unknown_operation: &[0x30, 0x05, 0x02, 0x01, 0x01, 0x5e, 0x00] =>
+                Err(Error::Operation(Tag::application(30))),
+            constructed_unbind: &[0x30, 0x05, 0x02, 0x01, 0x01, 0x62, 0x00] =>
+                Err(Error::Operation(Tag::application(2).as_constructed())),
+            unexpected_tag: &[0x30, 0x05, 0x02, 0x01, 0x01, 0x04, 0x00] =>
+                Err(Error::Operation(Tag::OCTET_STRING)),
             // An unbind with contents.
-            nonempty_unbind: &[0x30, 0x06, 0x02, 0x01, 0x01, 0x42, 0x01, 0x00] => Err(Error::Ber(asn1::Error::Null)),
+            nonempty_unbind: &[0x30, 0x06, 0x02, 0x01, 0x01, 0x42, 0x01, 0x00] =>
+                Err(Error::Ber(asn1::Error::Null)),
             // A DN that is not UTF-8.
             invalid_utf8: &[0x30, 0x06, 0x02, 0x01, 0x01, 0x4a, 0x01, 0xff] => Err(Error::Utf8),
             // A constructed string, as a delete's DN and as a bind's name.
-            constructed_delete: &[ 0x30, 0x09, 0x02, 0x01, 0x01, 0x6a, 0x04, 0x04, 0x02, b'c', b'n' ] => Err(Error::Operation(Tag::application(10).as_constructed())),
+            constructed_delete: &[
+                0x30, 0x09, 0x02, 0x01, 0x01, 0x6a, 0x04, 0x04, 0x02, b'c', b'n',
+            ] =>
+                Err(Error::Operation(Tag::application(10).as_constructed())),
         );
         assert!(matches!(
             Message::parse(&[
@@ -3294,20 +3311,35 @@ mod tests {
         };
         fictionet::assert_cases!(|input| parse(input);
             empty_substrings: &subs(&[]) => Err(Error::Filter("substring filter with no parts")),
-            late_initial: &subs(&[0x81, 0x00, 0x80, 0x00]) => Err(Error::Filter("initial substring not first")),
-            after_final: &subs(&[0x82, 0x00, 0x81, 0x00]) => Err(Error::Filter("substring after the final part")),
-            repeated_final: &subs(&[0x82, 0x00, 0x82, 0x00]) => Err(Error::Filter("substring after the final part")),
+            late_initial: &subs(&[0x81, 0x00, 0x80, 0x00]) =>
+                Err(Error::Filter("initial substring not first")),
+            after_final: &subs(&[0x82, 0x00, 0x81, 0x00]) =>
+                Err(Error::Filter("substring after the final part")),
+            repeated_final: &subs(&[0x82, 0x00, 0x82, 0x00]) =>
+                Err(Error::Filter("substring after the final part")),
         );
         assert!(matches!(parse(&subs(&[0x83, 0x00])), Err(Error::Ber(_))));
         fictionet::assert_cases!(|input| parse(input);
-            empty_middle: &subs(&[0x80, 0x01, b'a', 0x81, 0x00, 0x82, 0x01, b'z']) => Ok(substrings( "c".into(), Some(b"a".to_vec()), vec![vec![]], Some(b"z".to_vec()) )),
+            empty_middle: &subs(&[0x80, 0x01, b'a', 0x81, 0x00, 0x82, 0x01, b'z']) =>
+                Ok(substrings(
+                    "c".into(),
+                    Some(b"a".to_vec()),
+                    vec![vec![]],
+                    Some(b"z".to_vec()),
+                )),
             // Extensible with neither rule nor type; with both and dnAttributes.
-            missing_type_and_rule: &[0xa9, 0x02, 0x83, 0x00] => Err(Error::Filter("extensible match with neither type nor rule")),
-            type_and_rule: &[ 0xa9, 0x0b, 0x81, 0x01, b'r', 0x82, 0x01, b't', 0x83, 0x00, 0x84, 0x01, 0xff ] => Ok(extensible(Some("r".into()), Some("t".into()), vec![], true)),
+            missing_type_and_rule: &[0xa9, 0x02, 0x83, 0x00] =>
+                Err(Error::Filter("extensible match with neither type nor rule")),
+            type_and_rule: &[
+                0xa9, 0x0b, 0x81, 0x01, b'r', 0x82, 0x01, b't', 0x83, 0x00, 0x84, 0x01, 0xff,
+            ] =>
+                Ok(extensible(Some("r".into()), Some("t".into()), vec![], true)),
             // An explicit FALSE for dnAttributes reads, and is left out on writing.
-            explicit_false: &[0xa9, 0x07, 0x82, 0x00, 0x83, 0x00, 0x84, 0x01, 0x00] => Ok(extensible(None, Some(String::new()), vec![], false)),
+            explicit_false: &[0xa9, 0x07, 0x82, 0x00, 0x83, 0x00, 0x84, 0x01, 0x00] =>
+                Ok(extensible(None, Some(String::new()), vec![], false)),
             // Not with two filters, and with none.
-            multiple_filters: &[0xa2, 0x04, 0x87, 0x00, 0x87, 0x00] => Err(Error::Ber(asn1::Error::Trailing)),
+            multiple_filters: &[0xa2, 0x04, 0x87, 0x00, 0x87, 0x00] =>
+                Err(Error::Ber(asn1::Error::Trailing)),
             empty_filter: &[0xa2, 0x00] => Err(Error::Ber(asn1::Error::Empty)),
         );
         // An extension choice, kept as it is, and written in the same form.

@@ -1589,7 +1589,8 @@ mod tests {
             assert_eq!(sha1(&[&data[..cut], &data[cut..]]), sha1(&[&data]));
         }
         fictionet::assert_cases!(|input| hex(&sha1(&[input]));
-            long_vector: b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" => "84983e441c3bd26ebaae4aa1f95129e5e54670f1",
+            long_vector: b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" =>
+                "84983e441c3bd26ebaae4aa1f95129e5e54670f1",
             million_bytes: &[b'a'; 1_000_000] => "34aa973cd4c4daa4f61eeb2bdbad27316534016f",
             // Lengths around the padding boundary.
             before_padding_boundary: &[b'a'; 55] => "c1c8bbdc22796e28c0e15163d20899b65621d65a",
@@ -1925,9 +1926,11 @@ mod tests {
         fictionet::assert_cases!(|input| Header::parse(input);
             short_extended_length: &[0x82, 126, 0, 125] => Err(Error::NonMinimalLength),
             zero_extended_length: &[0x82, 126, 0, 0] => Err(Error::NonMinimalLength),
-            short_wide_length: &[0x82, 127, 0, 0, 0, 0, 0, 0, 0xff, 0xff] => Err(Error::NonMinimalLength),
+            short_wide_length: &[0x82, 127, 0, 0, 0, 0, 0, 0, 0xff, 0xff] =>
+                Err(Error::NonMinimalLength),
             high_bit: &[0x82, 127, 0x80, 0, 0, 0, 0, 0, 0, 0] => Err(Error::LengthHighBit),
-            excessive_payload: &[0x82, 127, 0, 0, 0, 0, 1, 0, 0, 1] => Err(Error::PayloadTooLarge((1 << 24) + 1)),
+            excessive_payload: &[0x82, 127, 0, 0, 0, 0, 1, 0, 0, 1] =>
+                Err(Error::PayloadTooLarge((1 << 24) + 1)),
         );
         assert!(
             Header::parse(&[0x82, 127, 0, 0, 0, 0, 1, 0, 0, 0])
