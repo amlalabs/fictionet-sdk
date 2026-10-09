@@ -107,3 +107,19 @@ fn header_quotes_untrusted_filenames() {
     let source = emit("ir", &checked, &["file\n#[bad].json".into()]).unwrap();
     assert!(source.contains(r#"// Schema: "file\n#[bad].json""#));
 }
+
+#[test]
+fn output_limit_counts_emitted_bytes() {
+    let checked = validate(Default::default(), Limits::default()).unwrap();
+    let base = emit("x", &checked, &[]).unwrap();
+    // The format appears twice in the generated header.
+    let extra = fictionet_codegen::MAX_OUTPUT - base.len();
+    let mut format = "x".repeat(1 + extra / 2);
+    let source = emit(&format, &checked, &[]).unwrap();
+    assert_eq!(source.len(), fictionet_codegen::MAX_OUTPUT - extra % 2);
+    format.push('x');
+    let error = emit(&format, &checked, &[]).unwrap_err();
+    assert_eq!(error.kind, fictionet_codegen::ErrorKind::InputLimit);
+    assert_eq!(error.location, "output");
+    assert_eq!(error.message, "MAX_OUTPUT exceeded");
+}

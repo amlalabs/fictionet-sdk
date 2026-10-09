@@ -403,10 +403,12 @@ script is needed.
 
 ## Guarantees and checks
 
-Generated modules use public `fictionet::stdlib::codec` APIs and their own
-file-local support code. The same file compiles in SDK integration tests
-and in the `tests/copy_and_own` fixture. Parsing is exact. Writing is
-strict and transactional. Count and range arithmetic is checked; reads
+Generated modules use public `fictionet::stdlib::codec` APIs. Each file
+invokes `fictionet::stdlib::codec::generated_runtime!` with its own names
+and limits to define its error type and file-local support code. The same
+file compiles in SDK integration tests and in the `tests/copy_and_own`
+fixture. Parsing is exact. Writing is strict and transactional. Count and
+range arithmetic is checked; reads
 use checked slicing. Resource and depth checks precede allocation and
 recursive descent. Work is linear in visited fields, bytes, and entries,
 under the node budget. There is no speculative parsing of partial stream

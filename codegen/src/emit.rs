@@ -16,23 +16,16 @@ impl From<std::fmt::Error> for Error {
     }
 }
 #[derive(Default)]
-struct Output(String, usize);
-impl Output {
-    // Charge the former expanded size to preserve accepted schema limits.
-    fn write_charged(&mut self, text: &str, bytes: usize) -> std::fmt::Result {
-        let size = self
-            .1
-            .checked_add(bytes)
+struct Output(String);
+impl Write for Output {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0
+            .len()
+            .checked_add(text.len())
             .filter(|&n| n <= MAX_OUTPUT)
             .ok_or(std::fmt::Error)?;
         self.0.push_str(text);
-        self.1 = size;
         Ok(())
-    }
-}
-impl Write for Output {
-    fn write_str(&mut self, text: &str) -> std::fmt::Result {
-        self.write_charged(text, text.len())
     }
 }
 // Prefer the first layout that fits. The final choice is the fallback for
@@ -681,9 +674,8 @@ pub fn emit(format: &str, checked: &ValidatedSchema, inputs: &[String]) -> Resul
         writeln!(out, "/// {doc}\npub const {name}: usize = {value};")?;
     }
     writeln!(out)?;
-    out.write_charged(
+    out.write_str(
         "fictionet::stdlib::codec::generated_runtime!(\n    Error,\n    __wire,\n    MAX_MESSAGE,\n    MAX_DEPTH,\n    MAX_ALLOCATION,\n    MAX_NODES\n);\n",
-        27_249,
     )?;
     let mut nodes = Vec::new();
     let mut indices = BTreeMap::new();
@@ -1530,17 +1522,10 @@ fn wire_docs(
             _ => {}
         }
     }
-    let preamble = if write {
-        "Appends one value. Errors leave out unchanged."
-    } else if checked.minimum.get(&t.name).is_some_and(|m| m.size == 0) {
-        "Reads one exact value. Refuses trailing bytes."
-    } else {
-        "Reads one exact value. Refuses truncation and trailing bytes."
-    };
     let method = if write { "write" } else { "parse" };
-    out.write_charged(
-        &format!("    /// Follows the [`Wire::{method}`](fictionet::stdlib::codec::Wire::{method}) contract.\n"),
-        "    /// ".len() + preamble.len() + "\n    /// Refuses values above the declared resource limits.\n".len(),
+    writeln!(
+        out,
+        "    /// Follows the [`Wire::{method}`](fictionet::stdlib::codec::Wire::{method}) contract."
     )?;
     for refusal in refusals {
         writeln!(out, "    /// Refuses {refusal}.")?;
@@ -1673,24 +1658,4 @@ pub fn emit_fuzz(
     }
     writeln!(out, "}});")?;
     Ok(out.0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shared_source_keeps_the_expanded_output_boundary() {
-        let mut out = Output(String::new(), MAX_OUTPUT - 27_249);
-        out.write_charged("runtime!();", 27_249).unwrap();
-        assert_eq!(out.0, "runtime!();");
-        assert!(out.write_str("x").is_err());
-        assert_eq!(out.0, "runtime!();");
-
-        let mut out = Output(String::new(), MAX_OUTPUT - 27_248);
-        assert!(out.write_charged("runtime!();", 27_249).is_err());
-        assert!(out.0.is_empty());
-        out.write_str("x").unwrap();
-        assert_eq!(out.1, MAX_OUTPUT - 27_247);
-    }
 }

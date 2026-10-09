@@ -30,8 +30,7 @@ pub const MAX_NESTING: usize = 16;
 pub const MAX_NAME: usize = 128;
 /// Maximum documentation length in UTF-8 bytes per item.
 pub const MAX_DOC: usize = 4096;
-/// Maximum generated source budget in bytes, counting shared runtime and
-/// contract documentation at their expanded sizes.
+/// Maximum generated source size in bytes per emitted file.
 pub const MAX_OUTPUT: usize = 32 << 20;
 /// Maximum size of a [`Header`] in bytes.
 pub const MAX_HEADER: usize = 256;
