@@ -19,7 +19,7 @@ pub enum RunMode {
 pub(crate) struct Clock {
     origin: Option<crate::sys::Instant>,
     state: Mutex<State>,
-    wake: Weak<Clock>,
+    wake: Option<Waker>,
 }
 
 #[derive(Default)]
@@ -36,7 +36,7 @@ impl Clock {
         Arc::new_cyclic(|wake| Self {
             origin: (mode == RunMode::Real).then(crate::sys::Instant::now),
             state: Mutex::new(State::default()),
-            wake: wake.clone(),
+            wake: (mode == RunMode::Real).then(|| Waker::from(Arc::new(HostWake(wake.clone())))),
         })
     }
 
@@ -114,10 +114,10 @@ impl Clock {
         let next = s.entries.first_key_value().map(|((at, _), _)| *at);
         if let Some(at) = next {
             let deadline = origin.checked_add(at.since_start()).expect("finite timer");
-            let waker = Waker::from(Arc::new(HostWake(self.wake.clone())));
+            let waker = self.wake.as_ref().expect("real clock waker");
             match s.host {
-                Some(id) => crate::timer::timers().reset(id, deadline, &waker),
-                None => s.host = Some(crate::timer::timers().add(deadline, waker)),
+                Some(id) => crate::timer::timers().reset(id, deadline, waker),
+                None => s.host = Some(crate::timer::timers().add(deadline, waker.clone())),
             }
         } else if let Some(id) = s.host.take() {
             crate::timer::timers().remove(id);

@@ -112,13 +112,12 @@ pub fn start(
     let site_for = move |host: &str| {
         let i = NAMES.iter().position(|(name, _)| *name == host)?;
         let site = [Site::Artifactory, Site::Pypi, Site::Files][i];
-        let config = configs[i].clone();
         let s = web::Site::handler(RepositoryHandler {
             contents: contents.clone(),
             site,
         })
         .at(NAMES[i].1)
-        .tls(move |_| config.clone());
+        .tls(configs[i].clone());
         Some(if i == 0 { s.default_host() } else { s })
     };
     let mut net = web::Sites::new(|_| None).into_net().ipv4_only();

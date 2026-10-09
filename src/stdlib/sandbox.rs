@@ -110,6 +110,7 @@ pub struct TlsClient<C> {
     /// The TLS session.
     pub tls: ClientConnection,
     out: Vec<u8>,
+    out_pos: usize,
     inbuf: Box<[u8]>,
     /// Bytes read from `conn` that rustls could not take yet, because its
     /// plaintext buffer was full.
@@ -138,6 +139,7 @@ impl<C: Connection + Unpin> TlsClient<C> {
             conn,
             tls,
             out: Vec::new(),
+            out_pos: 0,
             inbuf: vec![0; 4096].into_boxed_slice(),
             pending: Vec::new(),
         }
@@ -145,7 +147,9 @@ impl<C: Connection + Unpin> TlsClient<C> {
 
     fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
         loop {
-            if self.out.is_empty() {
+            if self.out_pos == self.out.len() {
+                self.out.clear();
+                self.out_pos = 0;
                 if !self.tls.wants_write() {
                     return Poll::Ready(Ok(()));
                 }
@@ -153,10 +157,10 @@ impl<C: Connection + Unpin> TlsClient<C> {
                     .write_tls(&mut self.out)
                     .map_err(|_| ConnError::Broken)?;
             }
-            match self.conn.poll_write(fcx, cx, &self.out) {
+            match self.conn.poll_write(fcx, cx, &self.out[self.out_pos..]) {
                 Poll::Ready(Ok(0)) => return Poll::Ready(Err(ConnError::Closed)),
                 Poll::Ready(Ok(n)) => {
-                    self.out.drain(..n);
+                    self.out_pos += n;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -392,5 +396,104 @@ impl ServerCertVerifier for AcceptAll {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Writes {
+        bytes: Vec<u8>,
+        max: usize,
+        pause: bool,
+        terminal: Option<Result<usize, ConnError>>,
+    }
+
+    impl Connection for Writes {
+        fn poll_read(
+            &mut self,
+            _: &Cx,
+            _: &mut Context<'_>,
+            _: &mut [u8],
+        ) -> Poll<Result<usize, ConnError>> {
+            Poll::Pending
+        }
+        fn poll_write(
+            &mut self,
+            _: &Cx,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<Result<usize, ConnError>> {
+            if let Some(result) = self.terminal.take() {
+                return Poll::Ready(result);
+            }
+            let pause = self.pause;
+            self.pause = !pause;
+            if self.max != usize::MAX && pause {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let n = data.len().min(self.max);
+            self.bytes.extend_from_slice(&data[..n]);
+            Poll::Ready(Ok(n))
+        }
+        fn poll_shutdown(&mut self, _: &Cx, _: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn flight(max: usize) -> Vec<u8> {
+        let result = Arc::new(fictionet::sync::Mutex::new(Vec::new()));
+        let out = result.clone();
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(7),
+            move |fcx| async move {
+                let conn = Writes {
+                    bytes: Vec::new(),
+                    max,
+                    pause: false,
+                    terminal: None,
+                };
+                let mut client = TlsClient::new(
+                    &fcx,
+                    conn,
+                    &Arc::new(RootCertStore::empty()),
+                    "site.test",
+                    &[b"http/1.1"],
+                    SystemTime::UNIX_EPOCH,
+                )?;
+                poll_fn(|cx| client.poll_flush(&fcx, cx)).await?;
+                {
+                    let mut cx = Context::from_waker(std::task::Waker::noop());
+                    client.out.extend_from_slice(b"next flight");
+                    client.conn.terminal = Some(Ok(0));
+                    assert_eq!(
+                        client.poll_flush(&fcx, &mut cx),
+                        Poll::Ready(Err(ConnError::Closed))
+                    );
+                    client.conn.terminal = Some(Err(ConnError::Broken));
+                    assert_eq!(
+                        client.poll_flush(&fcx, &mut cx),
+                        Poll::Ready(Err(ConnError::Broken))
+                    );
+                }
+                poll_fn(|cx| client.poll_flush(&fcx, cx)).await?;
+                assert!(client.out.is_empty());
+                *out.lock() = client.conn.bytes;
+                Ok(())
+            },
+        ))
+        .unwrap();
+        std::mem::take(&mut *result.lock())
+    }
+
+    #[test]
+    fn tls_short_writes_and_pending_preserve_the_flight() {
+        let full = flight(usize::MAX);
+        assert!(full.len() > b"next flight".len());
+        assert!(full.ends_with(b"next flight"));
+        assert_eq!(flight(1), full);
+        assert_eq!(flight(7), full);
     }
 }

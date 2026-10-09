@@ -117,10 +117,11 @@ impl World {
                     web::Sites::new(move |host: &str| match host {
                         "plain.test" => Some(web::Site::new(app.clone())),
                         "ws.test" => Some(web::Site::new(ws.clone())),
-                        "secure.test" => Some(web::Site::new(secure.clone()).at(SECURE).tls({
-                            let c = config.clone();
-                            move |_| c.clone()
-                        })),
+                        "secure.test" => Some(
+                            web::Site::new(secure.clone())
+                                .at(SECURE)
+                                .tls(config.clone()),
+                        ),
                         _ => None,
                     })
                     .start(&fcx, attachments)?;

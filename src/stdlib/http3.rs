@@ -1699,7 +1699,7 @@ impl Wire for Frame {
     /// Encoded QPACK bytes remain opaque. Integers use their shortest form.
     fn write(&self, destination: &mut Vec<u8>) -> Result<(), Error> {
         let t = self.frame_type();
-        let payload = match self {
+        let payload: std::borrow::Cow<'_, [u8]> = match self {
             Self::Data(b) | Self::Unknown { payload: b, .. } => {
                 if matches!(self, Self::Unknown { .. }) && known_frame(t) {
                     return Err(Error::Unwritable);
@@ -1710,17 +1710,17 @@ impl Wire for Frame {
                 if b.len() > MAX_FRAME_PAYLOAD {
                     return Err(Error::Unwritable);
                 }
-                b.clone()
+                std::borrow::Cow::Borrowed(b)
             }
             Self::Headers(b) => {
                 field_bytes(b).map_err(|_| Error::Unwritable)?;
-                b.clone()
+                std::borrow::Cow::Borrowed(b)
             }
-            Self::Settings(s) => s.to_bytes()?,
+            Self::Settings(s) => s.to_bytes()?.into(),
             Self::CancelPush(id) | Self::Goaway(id) | Self::MaxPushId(id) => {
                 let mut out = Vec::with_capacity(MAX_STREAM_HEADER);
                 put_varint(*id, &mut out)?;
-                out
+                out.into()
             }
             Self::PushPromise {
                 push_id,
@@ -1730,7 +1730,7 @@ impl Wire for Frame {
                 let mut out = Vec::with_capacity(MAX_SECTION_BYTES + 8);
                 put_varint(*push_id, &mut out)?;
                 out.extend_from_slice(field_section);
-                out
+                out.into()
             }
             Self::PriorityUpdate { element, value } => {
                 priority_bytes(value).map_err(|_| Error::Unwritable)?;
@@ -1741,19 +1741,13 @@ impl Wire for Frame {
                 let mut out = Vec::with_capacity(MAX_PRIORITY_BYTES + 8);
                 put_varint(id, &mut out)?;
                 out.extend_from_slice(value);
-                out
+                out.into()
             }
         };
-        let mut out = Vec::with_capacity(
-            payload
-                .len()
-                .checked_add(MAX_FRAME_HEADER)
-                .ok_or(Error::Unwritable)?,
-        );
-        put_varint(t, &mut out)?;
-        put_varint(payload.len() as u64, &mut out)?;
-        out.extend_from_slice(&payload);
-        destination.extend_from_slice(&out);
+        // The type and payload length are validated and fit in QUIC varints.
+        put_varint(t, destination)?;
+        put_varint(payload.len() as u64, destination)?;
+        destination.extend_from_slice(&payload);
         Ok(())
     }
 }
@@ -2034,18 +2028,6 @@ impl StreamItems {
     }
 }
 
-fn stream_step<T>(
-    step: Step<T>,
-    wrap: impl FnOnce(T) -> Result<StreamItem, Error>,
-) -> Step<Result<StreamItem, Error>> {
-    match step {
-        Step::Item(item, used) => Step::Item(wrap(item), used),
-        Step::Need => Step::Need,
-        Step::End => Step::End,
-        Step::Skip(n) => Step::Skip(n),
-    }
-}
-
 impl Decode for StreamItems {
     type Item = Result<StreamItem, Error>;
     type Error = Error;
@@ -2071,17 +2053,15 @@ impl Decode for StreamItems {
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
         Ok(match &mut self.kind {
-            StreamKind::Header(decoder) => stream_step(decoder.decode(input, eof)?, |header| {
-                Ok(StreamItem::Header(header))
-            }),
-            StreamKind::Frames => {
-                stream_step(Frames::<Frame>::new().decode(input, eof)?, |frame| {
-                    Ok(StreamItem::Frame(frame?))
-                })
-            }
-            StreamKind::Control(decoder) => stream_step(decoder.decode(input, eof)?, |frame| {
-                Ok(StreamItem::Frame(frame?))
-            }),
+            StreamKind::Header(decoder) => decoder
+                .decode(input, eof)?
+                .map(|header| Ok(StreamItem::Header(header))),
+            StreamKind::Frames => Frames::<Frame>::new()
+                .decode(input, eof)?
+                .map(|frame| Ok(StreamItem::Frame(frame?))),
+            StreamKind::Control(decoder) => decoder
+                .decode(input, eof)?
+                .map(|frame| Ok(StreamItem::Frame(frame?))),
             StreamKind::Encoder => {
                 if eof && input.is_empty() {
                     return Err(Error::ClosedCriticalStream);
@@ -2092,7 +2072,7 @@ impl Decode for StreamItems {
                 if eof && matches!(step, Step::Need) {
                     return Err(Error::ClosedCriticalStream);
                 }
-                stream_step(step, |item| {
+                step.map(|item| {
                     item.map(StreamItem::EncoderInstruction)
                         .map_err(Error::QpackEncoderStream)
                 })
@@ -2107,7 +2087,7 @@ impl Decode for StreamItems {
                 if eof && matches!(step, Step::Need) {
                     return Err(Error::ClosedCriticalStream);
                 }
-                stream_step(step, |item| {
+                step.map(|item| {
                     item.map(StreamItem::DecoderInstruction)
                         .map_err(Error::QpackDecoderStream)
                 })

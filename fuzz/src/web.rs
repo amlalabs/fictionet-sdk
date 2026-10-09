@@ -112,13 +112,8 @@ pub fn serve(fcx: &Cx) -> Attacher {
         let c = config.clone();
         match host {
             "plain.test" => Some(web::Site::new(Echo)),
-            "tls.test" => Some(web::Site::new(Echo).at(SITE_ADDR).tls(move |_| c.clone())),
-            "both.test" => Some(
-                web::Site::new(Echo)
-                    .at(SITE_ADDR)
-                    .tls(move |_| c.clone())
-                    .plain_http(),
-            ),
+            "tls.test" => Some(web::Site::new(Echo).at(SITE_ADDR).tls(c)),
+            "both.test" => Some(web::Site::new(Echo).at(SITE_ADDR).tls(c).plain_http()),
             "broken.test" => Some(web::Site::new(Broken).at(SITE_ADDR)),
             "default.test" => Some(web::Site::new(Echo).at(DEFAULT_ADDR).default_host()),
             "other.test" => Some(web::Site::new(Echo).at(DEFAULT_ADDR)),

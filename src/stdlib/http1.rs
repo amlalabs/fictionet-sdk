@@ -625,10 +625,10 @@ impl Decode for Requests {
         self.message.capacity()
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Request>, Error> {
-        Ok(map_message(
-            self.message.decode(&mut self.inner, input, eof)?,
-            |head, body| Request { head, body },
-        ))
+        Ok(self
+            .message
+            .decode(&mut self.inner, input, eof)?
+            .map(|(head, body)| Request { head, body }))
     }
 }
 
@@ -684,10 +684,10 @@ impl Decode for Responses {
         self.inner.held()
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Response>, Error> {
-        Ok(map_message(
-            self.message.decode(&mut self.inner, input, eof)?,
-            |head, body| Response { head, body },
-        ))
+        Ok(self
+            .message
+            .decode(&mut self.inner, input, eof)?
+            .map(|(head, body)| Response { head, body }))
     }
 }
 
@@ -859,15 +859,6 @@ fn collect_body(
             return Err(Error::State);
         }
         at = at.checked_add(n).ok_or(Error::State)?;
-    }
-}
-
-fn map_message<H, T>(step: Step<(H, Vec<u8>)>, f: impl FnOnce(H, Vec<u8>) -> T) -> Step<T> {
-    match step {
-        Step::Item((head, body), n) => Step::Item(f(head, body), n),
-        Step::Skip(n) => Step::Skip(n),
-        Step::Need => Step::Need,
-        Step::End => Step::End,
     }
 }
 

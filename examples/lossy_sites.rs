@@ -12,11 +12,8 @@ fn main() -> fictionet::Result {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/run/fictionet/world.sock".into());
-    let (attacher, attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(
-        fictionet::WorldSocket::UnixSocket(path.clone().into()),
-        attacher,
-    )?;
+    let (_listening, attachments) =
+        fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}");
 
     fictionet::block_on(fictionet::run(

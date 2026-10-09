@@ -57,40 +57,14 @@
 //!
 //! # Running the recipes
 //!
-//! Each recipe runs like the world in
-//! [`getting_started`](crate::getting_started), on one Linux machine, with
-//! a network namespace named `agent` as the sandbox. Make the socket's
-//! directory and the namespace once. The last two lines give the
-//! namespace its own `nsswitch.conf`, which a host with `systemd-resolved`
-//! needs, as [`getting_started`](crate::getting_started) explains:
-//!
-//! ```text
-//! $ sudo mkdir -p /run/fictionet
-//! $ sudo chown "$USER" /run/fictionet
-//! $ sudo ip netns add agent
-//! $ sudo ip -n agent link set lo up
-//! $ sudo mkdir -p /etc/netns/agent
-//! $ echo "hosts: files dns" | sudo tee /etc/netns/agent/nsswitch.conf
-//! hosts: files dns
-//! ```
-//!
-//! Start the recipe's world in one terminal, with the command the recipe
-//! gives. Then attach the sandbox in a second terminal:
-//!
-//! ```text
-//! $ cargo build --release --bin fictionet
-//! $ sudo target/release/fictionet attach --world unix:/run/fictionet/world.sock --name agent --type tun \
-//!     --netns /run/netns/agent \
-//!     --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
-//!     --ip-addr-v6 2001:db8::2/64 --gateway-v6 2001:db8::1 --dns-v6 2001:db8::1
-//! fictionet attach: agent attached as tun0
-//! ```
-//!
-//! Run the recipe's commands in a third terminal. To move on to the next
-//! recipe, stop attach and the world with Ctrl-C. When you are done,
-//! remove the namespace with `sudo ip netns del agent && sudo rm -r
-//! /etc/netns/agent`. The sites in these
-//! worlds serve plain HTTP, so the commands need no certificates.
+//! Follow [getting started](crate::getting_started): build the CLI, then
+//! [make the socket directory](crate::getting_started#2-make-the-sockets-directory).
+//! Substitute the recipe's world command for step 3, then
+//! [create and attach the sandbox](crate::getting_started#4-make-a-sandbox-and-attach-it),
+//! including its `nsswitch.conf`. Run the recipe's requests in a third terminal.
+//! Stop attach and the world between recipes. When finished, follow
+//! [step 7](crate::getting_started#7-stop) to remove the namespace and its files.
+//! These worlds serve plain HTTP, so the requests need no certificates.
 //!
 //! # A delayed website
 //!

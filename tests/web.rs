@@ -219,10 +219,11 @@ fn sites(fcx: &Cx) -> TestSites {
     let sites = web::Sites::new(move |host| {
         calls.fetch_add(1, Ordering::SeqCst);
         match host {
-            "secure.test" => Some(web::Site::new(secure.clone()).at(SECURE_ADDR).tls({
-                let c = config.clone();
-                move |_| c.clone()
-            })),
+            "secure.test" => Some(
+                web::Site::new(secure.clone())
+                    .at(SECURE_ADDR)
+                    .tls(config.clone()),
+            ),
             "shared.test" => Some(web::Site::new(Plain("shared")).at(SECURE_ADDR)),
             "plain.test" => Some(web::Site::new(Plain("plain"))),
             "inside.test" => Some(web::Site::new(Plain("inside")).at(Ipv4Addr::new(10, 0, 0, 50))),
@@ -233,23 +234,18 @@ fn sites(fcx: &Cx) -> TestSites {
                 web::Site::new(secure.clone())
                     .at(DUAL_ADDR)
                     .at(DUAL_ADDR6)
-                    .tls({
-                        let c = config.clone();
-                        move |_| c.clone()
-                    }),
+                    .tls(config.clone()),
             ),
-            "v4only.test" => Some(web::Site::new(secure.clone()).ipv4_only().tls({
-                let c = config.clone();
-                move |_| c.clone()
-            })),
+            "v4only.test" => Some(
+                web::Site::new(secure.clone())
+                    .ipv4_only()
+                    .tls(config.clone()),
+            ),
             "v6only.test" => Some(
                 web::Site::new(secure.clone())
                     .ipv6_only()
                     .at(V6ONLY_ADDR6)
-                    .tls({
-                        let c = config.clone();
-                        move |_| c.clone()
-                    }),
+                    .tls(config.clone()),
             ),
             "broken.test" => Some(web::Site::new(Broken)),
             h if h.ends_with(".wild.test") => Some(web::Site::new(Plain("wild"))),
@@ -257,18 +253,12 @@ fn sites(fcx: &Cx) -> TestSites {
             "events.test" => Some(
                 web::Site::new(events_site(handler_waiting.clone()))
                     .at(EVENTS_ADDR)
-                    .tls({
-                        let c = config.clone();
-                        move |_| c.clone()
-                    }),
+                    .tls(config.clone()),
             ),
             "both.test" => Some(
                 web::Site::new(secure.clone())
                     .at(BOTH_ADDR)
-                    .tls({
-                        let c = config.clone();
-                        move |_| c.clone()
-                    })
+                    .tls(config.clone())
                     .plain_http(),
             ),
             "default.test" => Some(
@@ -280,10 +270,7 @@ fn sites(fcx: &Cx) -> TestSites {
             "tls-default.test" => Some(
                 web::Site::new(secure.clone())
                     .at(TLS_DEFAULT_ADDR)
-                    .tls({
-                        let c = config.clone();
-                        move |_| c.clone()
-                    })
+                    .tls(config.clone())
                     .default_host(),
             ),
             _ => None,

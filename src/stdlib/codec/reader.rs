@@ -101,6 +101,22 @@ pub struct Reader<'a> {
     position: usize,
 }
 
+macro_rules! numbers {
+    ($($ty:ty, $be:ident, $le:ident;)*) => {$ (
+        #[doc = concat!("Consumes a ", stringify!($ty), " in big-endian order.")]
+        #[inline]
+        pub fn $be(&mut self) -> Result<$ty, Truncated> {
+            self.array().map(<$ty>::from_be_bytes)
+        }
+
+        #[doc = concat!("Consumes a ", stringify!($ty), " in little-endian order.")]
+        #[inline]
+        pub fn $le(&mut self) -> Result<$ty, Truncated> {
+            self.array().map(<$ty>::from_le_bytes)
+        }
+    )*};
+}
+
 impl<'a> Reader<'a> {
     /// Starts at the first byte of `bytes`.
     #[inline]
@@ -163,88 +179,14 @@ impl<'a> Reader<'a> {
         Ok(self.take(1)?[0])
     }
 
-    /// Consumes a u16 in big-endian order.
-    #[inline]
-    pub fn u16_be(&mut self) -> Result<u16, Truncated> {
-        self.array().map(u16::from_be_bytes)
-    }
-
-    /// Consumes a u16 in little-endian order.
-    #[inline]
-    pub fn u16_le(&mut self) -> Result<u16, Truncated> {
-        self.array().map(u16::from_le_bytes)
-    }
-
-    /// Consumes a u32 in big-endian order.
-    #[inline]
-    pub fn u32_be(&mut self) -> Result<u32, Truncated> {
-        self.array().map(u32::from_be_bytes)
-    }
-
-    /// Consumes a u32 in little-endian order.
-    #[inline]
-    pub fn u32_le(&mut self) -> Result<u32, Truncated> {
-        self.array().map(u32::from_le_bytes)
-    }
-
-    /// Consumes a u64 in big-endian order.
-    #[inline]
-    pub fn u64_be(&mut self) -> Result<u64, Truncated> {
-        self.array().map(u64::from_be_bytes)
-    }
-
-    /// Consumes a u64 in little-endian order.
-    #[inline]
-    pub fn u64_le(&mut self) -> Result<u64, Truncated> {
-        self.array().map(u64::from_le_bytes)
-    }
-
-    /// Consumes a i16 in big-endian order.
-    #[inline]
-    pub fn i16_be(&mut self) -> Result<i16, Truncated> {
-        self.array().map(i16::from_be_bytes)
-    }
-
-    /// Consumes a i16 in little-endian order.
-    #[inline]
-    pub fn i16_le(&mut self) -> Result<i16, Truncated> {
-        self.array().map(i16::from_le_bytes)
-    }
-
-    /// Consumes a i32 in big-endian order.
-    #[inline]
-    pub fn i32_be(&mut self) -> Result<i32, Truncated> {
-        self.array().map(i32::from_be_bytes)
-    }
-
-    /// Consumes a i32 in little-endian order.
-    #[inline]
-    pub fn i32_le(&mut self) -> Result<i32, Truncated> {
-        self.array().map(i32::from_le_bytes)
-    }
-
-    /// Consumes a i64 in big-endian order.
-    #[inline]
-    pub fn i64_be(&mut self) -> Result<i64, Truncated> {
-        self.array().map(i64::from_be_bytes)
-    }
-
-    /// Consumes a i64 in little-endian order.
-    #[inline]
-    pub fn i64_le(&mut self) -> Result<i64, Truncated> {
-        self.array().map(i64::from_le_bytes)
-    }
-
-    /// Consumes a f64 in big-endian order.
-    #[inline]
-    pub fn f64_be(&mut self) -> Result<f64, Truncated> {
-        self.array().map(f64::from_be_bytes)
-    }
-
-    /// Consumes a f64 in little-endian order.
-    #[inline]
-    pub fn f64_le(&mut self) -> Result<f64, Truncated> {
-        self.array().map(f64::from_le_bytes)
+    numbers! {
+        u16, u16_be, u16_le;
+        u32, u32_be, u32_le;
+        u64, u64_be, u64_le;
+        i16, i16_be, i16_le;
+        i32, i32_be, i32_le;
+        i64, i64_be, i64_le;
+        f64, f64_be, f64_le;
     }
 
     /// Consumes a signed byte.

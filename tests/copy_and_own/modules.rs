@@ -470,3 +470,20 @@ fn copied_mutex() {
     let mut guard: fictionet::sync::MutexGuard<'_, i32> = value.lock();
     *guard += 1;
 }
+
+fn copied_step_and_buffer() {
+    let _: fictionet::stdlib::codec::Step<u64> =
+        fictionet::stdlib::codec::Step::Item(1u8, 1).map(u64::from);
+    let mut buffer = fictionet::stdlib::codec::Buffer::new(16 * 1024);
+    buffer.spare()[0] = 42;
+    buffer.commit(1);
+    assert_eq!(buffer.unread(), &[42]);
+    buffer.consume(1);
+}
+
+fictionet::cfg_observe! {
+fn copied_previews() {
+    assert_eq!(fictionet::observe::hex(&[0, 255]), "00ff");
+    assert_eq!(fictionet::observe::protocols::body_preview(b"hello"), Some("hello".into()));
+}
+}

@@ -293,20 +293,8 @@ conditions.</p>",
 /// Percent-decodes `data` into bytes, as Python's `unquote_to_bytes`: a
 /// `%` not followed by two hex digits stays as it is.
 pub fn unquote_to_bytes(data: &[u8]) -> Vec<u8> {
-    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
     let mut out = Vec::with_capacity(data.len());
-    let mut i = 0;
-    while i < data.len() {
-        if data[i] == b'%' && i + 2 < data.len() {
-            if let (Some(h), Some(l)) = (hex(data[i + 1]), hex(data[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(data[i]);
-        i += 1;
-    }
+    fictionet::stdlib::codec::ascii::percent_decode_into(data, false, &mut out, usize::MAX);
     out
 }
 

@@ -1184,7 +1184,7 @@ fn nth(p: &Prefix, n: u128) -> Option<IpAddr> {
 
 /// Whether `a` and `b` share any address.
 fn overlap(a: &Prefix, b: &Prefix) -> bool {
-    prefix_contains(a, b.addr) || prefix_contains(b, a.addr)
+    a.contains(b.addr) || b.contains(a.addr)
 }
 
 /// Starts the network's LANs: each wired to the router through its
@@ -1288,7 +1288,7 @@ fn make_lans(
             ))),
             IpAddr::V6(_) => None,
         };
-        if !prefix_contains(&seg.prefix, *addr)
+        if !seg.prefix.contains(*addr)
             || *addr == seg.prefix.addr
             || *addr == seg.dns
             || Some(*addr) == broadcast
@@ -1304,28 +1304,6 @@ fn make_lans(
         }
     }
     Ok(made)
-}
-
-fn prefix_contains(p: &Prefix, a: IpAddr) -> bool {
-    match (p.addr, a) {
-        (IpAddr::V4(n), IpAddr::V4(a)) => {
-            let mask = if p.len == 0 {
-                0
-            } else {
-                u32::MAX << (32 - u32::from(p.len.min(32)))
-            };
-            u32::from(n) & mask == u32::from(a) & mask
-        }
-        (IpAddr::V6(n), IpAddr::V6(a)) => {
-            let mask = if p.len == 0 {
-                0
-            } else {
-                u128::MAX << (128 - u32::from(p.len.min(128)))
-            };
-            u128::from(n) & mask == u128::from(a) & mask
-        }
-        _ => false,
-    }
 }
 
 impl Shared {
@@ -1384,11 +1362,7 @@ impl Shared {
             .into_iter()
             .chain(host.at_v6.map(IpAddr::V6))
         {
-            if let Some((name, _)) = self
-                .lans
-                .iter()
-                .find(|(_, l)| prefix_contains(&l.prefix, a))
-            {
+            if let Some((name, _)) = self.lans.iter().find(|(_, l)| l.prefix.contains(a)) {
                 return Err(format!(
                     "{a} is on LAN {name}: place the host there with Host::on"
                 ));
@@ -1459,7 +1433,7 @@ impl Shared {
         let free = |a: IpAddr| a != seg.dns && !seg.members.contains(&a);
         let addr = match given {
             Some(a)
-                if prefix_contains(&seg.prefix, a)
+                if seg.prefix.contains(a)
                     && a != seg.prefix.addr
                     && free(a)
                     && !a.is_multicast() =>
@@ -1469,7 +1443,7 @@ impl Shared {
             Some(a) => return Err(format!("{a} is not a free address on LAN {name}")),
             None => (2..1u128 << 16)
                 .map_while(|n| nth(&seg.prefix, n))
-                .filter(|a| prefix_contains(&seg.prefix, *a))
+                .filter(|a| seg.prefix.contains(*a))
                 .find(|a| free(*a) && !world.machines.contains_key(a))
                 .ok_or_else(|| format!("LAN {name} has no free address left"))?,
         };
@@ -3032,7 +3006,7 @@ impl Shared {
                 .fixed
                 .iter()
                 .chain(self.lans.values().map(|l| &l.prefix))
-                .any(|p| prefix_contains(p, dst)) =>
+                .any(|p| p.contains(dst)) =>
             {
                 None
             }
@@ -3322,11 +3296,11 @@ mod tests {
     #[test]
     fn prefixes_contain_their_addresses() {
         let p: Prefix = "10.0.0.50/32".parse().unwrap();
-        assert!(prefix_contains(&p, "10.0.0.50".parse().unwrap()));
-        assert!(!prefix_contains(&p, "10.0.0.51".parse().unwrap()));
+        assert!(p.contains("10.0.0.50".parse().unwrap()));
+        assert!(!p.contains("10.0.0.51".parse().unwrap()));
         let p: Prefix = "10.0.9.0/24".parse().unwrap();
-        assert!(prefix_contains(&p, "10.0.9.200".parse().unwrap()));
-        assert!(!prefix_contains(&p, "2001:db8::1".parse().unwrap()));
+        assert!(p.contains("10.0.9.200".parse().unwrap()));
+        assert!(!p.contains("2001:db8::1".parse().unwrap()));
     }
 }
 

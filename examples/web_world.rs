@@ -72,11 +72,8 @@ pub fn run(
         .cloned()
         .unwrap_or_else(|| "/run/fictionet/ca.pem".into());
 
-    let (attacher, attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(
-        fictionet::WorldSocket::UnixSocket(path.clone().into()),
-        attacher,
-    )?;
+    let (_listening, attachments) =
+        fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}, CA in {ca_path}");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -164,20 +161,14 @@ pub fn sites(
     Ok(move |host: &str| {
         println!("lookup {host}");
         match host {
-            "example.test" | "www.example.test" => {
-                Some(web::Site::new(app.clone()).at(SHARED).at(SHARED6).tls({
-                    let c = config.clone();
-                    move |_| c.clone()
-                }))
-            }
-            "v4only.test" => Some(web::Site::new(app.clone()).ipv4_only().tls({
-                let c = config.clone();
-                move |_| c.clone()
-            })),
-            "v6only.test" => Some(web::Site::new(app.clone()).ipv6_only().tls({
-                let c = config.clone();
-                move |_| c.clone()
-            })),
+            "example.test" | "www.example.test" => Some(
+                web::Site::new(app.clone())
+                    .at(SHARED)
+                    .at(SHARED6)
+                    .tls(config.clone()),
+            ),
+            "v4only.test" => Some(web::Site::new(app.clone()).ipv4_only().tls(config.clone())),
+            "v6only.test" => Some(web::Site::new(app.clone()).ipv6_only().tls(config.clone())),
             "shared.test" => Some(web::Site::new(plain.clone()).at(SHARED).at(SHARED6)),
             "plain.test" => Some(web::Site::new(plain.clone())),
             _ => None,

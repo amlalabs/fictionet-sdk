@@ -24,7 +24,7 @@
 //! On a [`Net`](fictionet::stdlib::net::Net), a [`Server`] is the
 //! [`PortServer`] that serves HTTP on a host's
 //! port: sites of several hosts at one address share the port as virtual
-//! hosts. [`Website`] puts a site on ports 80 and 443 the way websites
+//! hosts. [`Server::served_by`] puts a site on ports 80 and 443 the way websites
 //! are served. `Net` knows nothing of HTTP, so a copy of this file with
 //! its own handlers plugs in the same way.
 //!
@@ -52,8 +52,7 @@
 //!
 //! The world owns its dates. A response carries a `Date` header only when
 //! the world gave the date it was at the start of the run, with
-//! [`Http1::date`], [`HttpOptions::date`], [`Server::date`] or
-//! [`Website::date`]: the header is then that date plus the run's clock.
+//! [`Http1::date`], [`HttpOptions::date`] or [`Server::date`]: the header is then that date plus the run's clock.
 //! Without one, responses have no `Date` header (RFC 9110 lets a server
 //! with no clock leave it out). The host's clock is never used, so a world
 //! set in 2019 never sends a date from the year it runs in. A `Date` the
@@ -125,18 +124,18 @@ use http::uri::{Authority, Scheme};
 use http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode, Version};
 use http_body::{Body as _, Frame, SizeHint};
 
+use fictionet::RaceError;
 use fictionet::events::{ConnInfo, Event, Fields, Level, float, opt};
+use fictionet::stdlib::ConnectionExt;
 use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
 use fictionet::stdlib::json::Value;
 use fictionet::stdlib::net::{Arrival, ConfigFor, Host, PortServer, Sni};
+use fictionet::stdlib::serve::Prefixed;
 use fictionet::stdlib::serve::{
     self, Budget, Driver, Ended, Flow, Pending, PendingDriver, ServeOptions, Timer,
 };
 use fictionet::stdlib::tls::ServerConfig;
 use fictionet::stdlib::{ConnError, Connection};
-use fictionet::stdlib::ConnectionExt;
-use fictionet::stdlib::serve::Prefixed;
-use fictionet::RaceError;
 use fictionet::time::Instant;
 use fictionet::{Cancelled, Cx, Error};
 
@@ -475,7 +474,9 @@ impl Router {
         let mut path_known = false;
         for (m, pattern, route) in &self.routes {
             let matches = match pattern.strip_suffix("/*") {
-                Some(prefix) => path == prefix || path.starts_with(&format!("{prefix}/")),
+                Some(prefix) => path
+                    .strip_prefix(prefix)
+                    .is_some_and(|tail| tail.is_empty() || tail.starts_with('/')),
                 None => path == pattern,
             };
             if !matches {
@@ -947,7 +948,8 @@ const BODY: Timer = "body";
 #[derive(Clone)]
 pub struct UpgradeHandler(Arc<Mutex<Option<UpgradeWork>>>);
 
-type UpgradeWork = Box<dyn FnOnce(Cx, Box<dyn Connection>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+type UpgradeWork =
+    Box<dyn FnOnce(Cx, Box<dyn Connection>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
 impl UpgradeHandler {
     /// Calls `work` after the response is sent.
@@ -956,7 +958,9 @@ impl UpgradeHandler {
         F: FnOnce(Cx, Box<dyn Connection>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        Self(Arc::new(Mutex::new(Some(Box::new(move |fcx, conn| Box::pin(work(fcx, conn)))))))
+        Self(Arc::new(Mutex::new(Some(Box::new(move |fcx, conn| {
+            Box::pin(work(fcx, conn))
+        })))))
     }
 
     async fn run(self, fcx: Cx, conn: Box<dyn Connection>) {
@@ -1744,12 +1748,10 @@ pub async fn serve_connection<C: Connection + Unpin>(
         // wait for one byte to enforce the first-byte timeout.
         let preface = async {
             let mut buf = [0u8; 24];
-            while fictionet::cfg_tokio!({ first.len() < PREFACE.len() && PREFACE.starts_with(&first) } else { first.is_empty() }) {
+            while fictionet::cfg_tokio!({ first.len() < PREFACE.len() && PREFACE.starts_with(&first) } else { first.is_empty() })
+            {
                 let room = fictionet::cfg_tokio!({ PREFACE.len() - first.len() } else { 1 });
-                match conn
-                    .read(fcx, &mut buf[..room])
-                    .await
-                {
+                match conn.read(fcx, &mut buf[..room]).await {
                     Ok(0) | Err(_) => return false,
                     Ok(n) => first.extend_from_slice(&buf[..n]),
                 }
@@ -1798,7 +1800,11 @@ pub async fn serve_connection<C: Connection + Unpin>(
         Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) => {
             if let Some(upgrade) = service.upgrade.take() {
                 upgrade.run(fcx.clone(), Box::new(rest)).await;
-                return if fcx.is_cancelled() { Err(Cancelled) } else { Ok(()) };
+                return if fcx.is_cancelled() {
+                    Err(Cancelled)
+                } else {
+                    Ok(())
+                };
             }
             fictionet::cfg_tokio! {
                 // Hyper reads the request again and carries out its upgrade.
@@ -1841,6 +1847,7 @@ pub struct Server {
     limits: Limits,
     date: Option<SystemTime>,
     vhosts: VirtualHosts,
+    tls: Option<ConfigFor>,
 }
 
 impl Server {
@@ -1861,12 +1868,16 @@ impl Server {
             limits: Limits::default(),
             date: None,
             vhosts: VirtualHosts::new(),
+            tls: None,
         }
     }
 
     /// The site is served over HTTPS: on a TLS port it answers, and on a
     /// plain port its requests get a `301` to https, unless
     /// [`plain_http`](Self::plain_http).
+    /// This sets routing policy without installing TLS.
+    /// Use [`tls`](Self::tls) to select a config and
+    /// [`served_by`](Self::served_by) to install ports 80 and 443.
     pub fn https(mut self) -> Server {
         self.vhost.https = true;
         self
@@ -1898,6 +1909,38 @@ impl Server {
     pub fn date(mut self, start: SystemTime) -> Server {
         self.date = Some(start);
         self
+    }
+
+    /// Serves HTTPS on 443 with a config selected for each handshake.
+    /// Port 80 redirects to HTTPS unless [`plain_http`](Self::plain_http) was selected.
+    pub fn tls(
+        mut self,
+        config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
+    ) -> Server {
+        self.vhost.https = true;
+        self.tls = Some(Arc::new(config_for));
+        self
+    }
+
+    /// Installs this site on ports 80 and, with TLS, 443.
+    /// TLS uses the host's names for SNI; without TLS only port 80 opens.
+    /// Each installed port has a fresh virtual-host table, including
+    /// when this builder was cloned.
+    pub fn served_by(mut self, host: Host) -> Host {
+        self.vhosts = VirtualHosts::new();
+        let secure = self.tls.take().map(|config| {
+            let mut server = self.clone();
+            server.vhosts = VirtualHosts::new();
+            server.vhost.plain_http = false;
+            (config, server)
+        });
+        let host = host.port_server(80, self);
+        match secure {
+            None => host,
+            Some((config, server)) => {
+                host.tls_accept(443, Sni::Names, move |fcx| config(fcx), server)
+            }
+        }
     }
 }
 
@@ -1936,93 +1979,6 @@ impl PortServer for Server {
             self.vhosts.set_default(site.vhost.clone());
         }
         true
-    }
-}
-
-/// A website on ports 80 and 443, as [`web::Sites`](fictionet::stdlib::web::Sites)
-/// serves one: with TLS, HTTPS on 443 for each of the host's names and a
-/// redirect to it on 80 (unless [`plain_http`](Self::plain_http));
-/// without, plain HTTP on 80. [`served_by`](Self::served_by) puts it on a host.
-#[derive(Clone)]
-pub struct Website {
-    handler: Arc<dyn Handler>,
-    tls: Option<ConfigFor>,
-    plain_http: bool,
-    default_host: bool,
-    date: Option<SystemTime>,
-}
-
-impl Website {
-    /// A website served by `handler`, over plain HTTP only.
-    pub fn new(handler: impl Handler) -> Website {
-        Website::shared(Arc::new(handler))
-    }
-
-    /// The same, from a shared handler.
-    pub fn shared(handler: Arc<dyn Handler>) -> Website {
-        Website {
-            handler,
-            tls: None,
-            plain_http: false,
-            default_host: false,
-            date: None,
-        }
-    }
-
-    /// Serves it over HTTPS on port 443, with the config `config_for`
-    /// returns for each handshake. Port 80 then redirects to https.
-    pub fn tls(
-        self,
-        config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
-    ) -> Website {
-        Website {
-            tls: Some(Arc::new(config_for)),
-            ..self
-        }
-    }
-
-    /// With TLS, answers plain HTTP on port 80 too, with no redirect.
-    pub fn plain_http(self) -> Website {
-        Website {
-            plain_http: true,
-            ..self
-        }
-    }
-
-    /// Answers requests at its address whose host names no site there.
-    pub fn default_host(self) -> Website {
-        Website {
-            default_host: true,
-            ..self
-        }
-    }
-
-    /// Sends `Date` headers: `start` is the world's date and time at the
-    /// start of the run. See [Dates](self#dates).
-    pub fn date(self, start: SystemTime) -> Website {
-        Website {
-            date: Some(start),
-            ..self
-        }
-    }
-
-    /// `host`, serving this website.
-    pub fn served_by(self, host: Host) -> Host {
-        let mut plain = Server::shared(self.handler.clone());
-        plain.vhost.https = self.tls.is_some();
-        plain.vhost.plain_http = self.plain_http;
-        plain.default_host = self.default_host;
-        plain.date = self.date;
-        let host = host.port_server(80, plain);
-        match self.tls {
-            None => host,
-            Some(config) => {
-                let mut secure = Server::shared(self.handler).https();
-                secure.default_host = self.default_host;
-                secure.date = self.date;
-                host.tls_accept(443, Sni::Names, move |fcx| config(fcx), secure)
-            }
-        }
     }
 }
 
@@ -2641,13 +2597,7 @@ mod h2 {
         }
 
         fn at(&self, deadline: fictionet::time::Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
-            let fcx = self.fcx.clone();
-            Box::pin(CxSleep(Box::pin(async move {
-                // Hyper cannot represent cancellation; the connection ends it.
-                if fcx.sleep_until(deadline).await.is_err() {
-                    std::future::pending::<()>().await;
-                }
-            })))
+            Box::pin(CxSleep(fictionet::Timer::new(&self.fcx), deadline))
         }
     }
 
@@ -2673,19 +2623,18 @@ mod h2 {
         }
     }
 
-    /// A sleep for hyper, which wants it `Sync`.
-    struct CxSleep(Pin<Box<dyn Future<Output = ()> + Send>>);
-
-    // SAFETY: `CxSleep` gives no access to its future through `&self`: the
-    // only way in is `poll`, which takes `Pin<&mut Self>`. So sharing a
-    // `&CxSleep` between threads cannot touch the future at all.
-    unsafe impl Sync for CxSleep {}
+    /// A sleep for hyper, which cannot represent cancellation.
+    struct CxSleep(fictionet::Timer, fictionet::time::Instant);
 
     impl Future for CxSleep {
         type Output = ();
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            self.get_mut().0.as_mut().poll(cx)
+            let this = self.get_mut();
+            match this.0.poll_until(cx, this.1) {
+                Poll::Ready(Ok(())) => Poll::Ready(()),
+                _ => Poll::Pending,
+            }
         }
     }
 
@@ -2863,4 +2812,23 @@ mod h2 {
     }
 }
 
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_prefixes_keep_slash_boundaries_and_method_precedence() {
+        let router = Router::new().get("/files/*", |_, _| Response::new(Bytes::new()));
+        assert!(router.find(&Method::GET, "/files").is_ok());
+        assert!(router.find(&Method::GET, "/files/").is_ok());
+        assert!(router.find(&Method::GET, "/files/a/b").is_ok());
+        assert!(matches!(router.find(&Method::GET, "/filesx"), Err(false)));
+        assert!(matches!(router.find(&Method::POST, "/files/a"), Err(true)));
+        let root = Router::new().get("/*", |_, _| Response::new(Bytes::new()));
+        assert!(root.find(&Method::GET, "").is_ok());
+        assert!(root.find(&Method::GET, "/a").is_ok());
+        assert!(matches!(root.find(&Method::GET, "a"), Err(false)));
+    }
 }

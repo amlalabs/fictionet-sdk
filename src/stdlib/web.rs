@@ -7,7 +7,7 @@
 //! address, TLS, and HTTP. You write only the sites.
 //!
 //! `Sites` is a preset on [`net::Net`](fictionet::stdlib::net::Net): each site
-//! is a [`fictionet::stdlib::net::Host`] with a DNS name per site and a [`fictionet::stdlib::httpd::Website`] on ports 80
+//! is a [`fictionet::stdlib::net::Host`] with a DNS name per site and a [`fictionet::stdlib::httpd::Server`] on ports 80
 //! and 443, made when its name is first looked up. HTTP is [`fictionet::stdlib::httpd`], a
 //! service like any other. A world that needs other services next to its
 //! websites builds on `Net` directly.
@@ -41,18 +41,18 @@
 //!             web::Site::new(wiki.clone())
 //!                 .at(Ipv4Addr::new(185, 15, 59, 224))
 //!                 .at("2a02:ec80:300:ed1a::1".parse::<Ipv6Addr>().unwrap())
-//!                 .tls({ let c = certs.wikipedia.clone(); move |_| c.clone() }),
+//!                 .tls(certs.wikipedia.clone()),
 //!         ),
 //!         "api.stripe.com" => Some(
 //!             web::Site::new(fake_stripe.clone()) // an axum::Router
-//!                 .tls({
+//!                 .tls_with({
 //!                     let (real, fake) = (certs.stripe.clone(), certs.bad.clone());
 //!                     move |fcx| if fcx.random_f64() < 0.1 { fake.clone() } else { real.clone() }
 //!                 }),
 //!         ),
 //!         h if h == "github.com" || h.ends_with(".github.com") => Some(
 //!             web::Site::new(upstream.clone()) // the real site, over the world's own network
-//!                 .tls({ let c = certs.github.clone(); move |_| c.clone() }), // github.com and *.github.com
+//!                 .tls(certs.github.clone()), // github.com and *.github.com
 //!         ),
 //!         _ => None, // NXDOMAIN: the world stays closed
 //!     })
@@ -459,7 +459,7 @@
 //!   DNS-over-TCP connection is closed after 10 seconds with no query.
 //! - **Lengths.** A response body whose length is known, such as a `String`
 //!   or an `http_body_util::Full`, is sent with `content-length`, as real
-//!   servers send it. A body of unknown length is sent chunked on HTTP/1.1.
+//!   websites send it. A body of unknown length is sent chunked on HTTP/1.1.
 //! - **HEAD.** The answer to a `HEAD` request has the headers a `GET` would
 //!   get and no body, on HTTP/1.1 and HTTP/2. A body of known length keeps
 //!   its length as `content-length`. Handlers need not handle `HEAD`
@@ -518,7 +518,7 @@ use std::sync::Arc;
 
 use http::{Request, Response};
 
-use fictionet::stdlib::httpd::{self, Handler, Website};
+use fictionet::stdlib::httpd::{self, Handler, Server};
 pub use fictionet::stdlib::httpd::{Body, Target};
 use fictionet::stdlib::net::{Host, Net};
 use fictionet::stdlib::route::Prefix;
@@ -529,10 +529,7 @@ use fictionet::{Attachments, Cx, Error};
 /// [module docs](fictionet::stdlib::web).
 pub struct Sites {
     site_for: Arc<SiteFor>,
-    subnet: Prefix,
-    subnet_v6: Prefix,
-    ipv6: bool,
-    max_sites: usize,
+    net: Net,
     date: Option<std::time::SystemTime>,
 }
 
@@ -554,16 +551,7 @@ impl Sites {
     {
         Sites {
             site_for: Arc::new(site_for),
-            subnet: Prefix {
-                addr: Ipv4Addr::new(10, 0, 0, 0).into(),
-                len: 24,
-            },
-            subnet_v6: Prefix {
-                addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).into(),
-                len: 64,
-            },
-            ipv6: true,
-            max_sites: fictionet::stdlib::net::MAX_HOSTS,
+            net: Net::new().group("web::Sites"),
             date: None,
         }
     }
@@ -579,38 +567,16 @@ impl Sites {
         }
     }
 
-    /// Sets the sandboxes' IPv4 or IPv6 subnet, whichever `subnet` is. The
-    /// gateway and DNS server take the address after the subnet's own
-    /// address, such as `10.0.0.1` in `10.0.0.0/24` or `2001:db8::1` in
-    /// `2001:db8::/64`. The IPv4 subnet defaults to `10.0.0.0/24`, and the
-    /// IPv6 subnet to `2001:db8::/64`.
-    /// To set both, call it twice.
-    ///
-    /// An IPv4 subnet must have a length from 8 to 30. An IPv6 subnet must
-    /// have a length from 8 to 126, and lie inside the global unicast
-    /// range `2000::/3` or the unique local range `fc00::/7`. Otherwise
-    /// [`start`](Sites::start) fails.
-    pub fn subnet(self, subnet: Prefix) -> Sites {
-        match subnet.addr {
-            IpAddr::V4(_) => Sites { subnet, ..self },
-            IpAddr::V6(_) => Sites {
-                subnet_v6: subnet,
-                ..self
-            },
-        }
+    /// Sets the sandbox subnet of this address family. See [`Net::subnet`].
+    pub fn subnet(mut self, subnet: Prefix) -> Sites {
+        self.net = self.net.subnet(subnet);
+        self
     }
 
-    /// Turns IPv6 off for the whole network. Sites then have only IPv4
-    /// addresses, DNS answers AAAA queries with NODATA, and every IPv6
-    /// packet from a sandbox is dropped, with a `net.blocked` event whose
-    /// `why` is `Ipv6`.
-    ///
-    /// Without this, the network is dual-stack: see [IPv6](fictionet::stdlib::web#ipv6).
-    pub fn ipv4_only(self) -> Sites {
-        Sites {
-            ipv6: false,
-            ..self
-        }
+    /// Turns IPv6 off for the network. See [`Net::ipv4_only`].
+    pub fn ipv4_only(mut self) -> Sites {
+        self.net = self.net.ipv4_only();
+        self
     }
 
     /// Sets how many names may have a site. The default is 20,000.
@@ -621,8 +587,9 @@ impl Sites {
     /// machine, DNS answers SERVFAIL, and the `dns.query` event says
     /// `error` with `rcode` 2. The name is not kept, so looking it up again
     /// runs the callback again.
-    pub fn max_sites(self, max_sites: usize) -> Sites {
-        Sites { max_sites, ..self }
+    pub fn max_sites(mut self, max_sites: usize) -> Sites {
+        self.net = self.net.max_hosts(max_sites);
+        self
     }
 
     /// The network these sites run on, before it starts: to add hosts
@@ -630,23 +597,14 @@ impl Sites {
     pub fn into_net(self) -> Net {
         let site_for = self.site_for;
         let date = self.date;
-        let mut net = Net::new()
-            .group("web::Sites")
-            .subnet(self.subnet)
-            .subnet(self.subnet_v6)
-            .max_hosts(self.max_sites)
-            .resolve(move |name| {
-                site_for(name).map(|mut site| {
-                    if let Some(date) = date {
-                        site = site.date(date);
-                    }
-                    site.into_host(name)
-                })
-            });
-        if !self.ipv6 {
-            net = net.ipv4_only();
-        }
-        net
+        self.net.resolve(move |name| {
+            site_for(name).map(|mut site| {
+                if let Some(date) = date {
+                    site = site.date(date);
+                }
+                site.into_host(name)
+            })
+        })
     }
 
     /// Builds the network and starts it. Every sandbox in `attachments`,
@@ -664,7 +622,7 @@ impl Sites {
 
 /// One website: a handler, and optionally an address and TLS.
 pub struct Site {
-    website: Website,
+    server: Server,
     at: Option<Ipv4Addr>,
     at_v6: Option<Ipv6Addr>,
     family: Family,
@@ -696,7 +654,7 @@ impl Site {
     /// [`httpd::Router`].
     pub fn handler(handler: impl Handler) -> Site {
         Site {
-            website: Website::new(handler),
+            server: Server::new(handler),
             at: None,
             at_v6: None,
             family: Family::Both,
@@ -707,7 +665,7 @@ impl Site {
     /// date plus elapsed run time in their `Date` header.
     pub fn date(self, start: std::time::SystemTime) -> Site {
         Site {
-            website: self.website.date(start),
+            server: self.server.date(start),
             ..self
         }
     }
@@ -772,19 +730,23 @@ impl Site {
         }
     }
 
+    /// Serves HTTPS with the same configuration on every handshake.
+    pub fn tls(self, config: Arc<ServerConfig>) -> Site {
+        self.tls_with(move |_| config.clone())
+    }
+
     /// Serves the site over HTTPS. `config_for` runs on every handshake and
     /// returns the TLS config to use, so it can choose differently each time,
-    /// with randomness from `fcx`. To use one config every time, return a
-    /// clone of it.
+    /// with randomness from `fcx`. For one config, use [`tls`](Self::tls).
     ///
     /// `start` replaces the ALPN list with `http/1.1` and, when the
     /// `tokio` feature is enabled, `h2`, so the config does not need one.
-    pub fn tls<F>(self, config_for: F) -> Site
+    pub fn tls_with<F>(self, config_for: F) -> Site
     where
         F: Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
     {
         Site {
-            website: self.website.tls(config_for),
+            server: self.server.tls(config_for),
             ..self
         }
     }
@@ -799,7 +761,7 @@ impl Site {
     /// apart by [`Target::scheme`].
     pub fn plain_http(self) -> Site {
         Site {
-            website: self.website.plain_http(),
+            server: self.server.plain_http(),
             ..self
         }
     }
@@ -819,14 +781,14 @@ impl Site {
     /// The first default site that appears at an address keeps the role.
     pub fn default_host(self) -> Site {
         Site {
-            website: self.website.default_host(),
+            server: self.server.default_host(),
             ..self
         }
     }
 
     /// The site as a host of a [`fictionet::stdlib::net::Net`], named `name`.
     pub fn into_host(self, name: &str) -> Host {
-        let mut host = self.website.served_by(Host::new(name).dns_name(name));
+        let mut host = self.server.served_by(Host::new(name).dns_name(name));
         if let Some(a) = self.at {
             host = host.at(a);
         }

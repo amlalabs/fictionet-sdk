@@ -355,7 +355,7 @@ pub fn serve(
             web::Site::new(backend.clone())
                 .date(start)
                 .at(addr)
-                .tls(move |fcx| {
+                .tls_with(move |fcx| {
                     config
                         .get_or_init(|| {
                             let (config, not_before, not_after) = ca

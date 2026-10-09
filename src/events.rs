@@ -786,7 +786,7 @@ struct State {
 }
 
 impl State {
-    /// Numbers `event` and keeps it, in `out` too.
+    /// Numbers and keeps `event`, adding it to `out` for subscribers.
     fn keep(&mut self, mut event: Event, repeat: bool, out: &mut Vec<Arc<Event>>) {
         self.last += 1;
         event.seq = self.last;
@@ -798,7 +798,9 @@ impl State {
             &mut self.events
         };
         self.dropped += part.push(event.clone(), size);
-        out.push(event);
+        if !self.subscribers.is_empty() {
+            out.push(event);
+        }
     }
 
     /// Moves the clock to `at`, recording the counts that are due by then.
@@ -842,7 +844,7 @@ impl Store {
 
     /// Numbers `event`, keeps it, and calls the subscribers.
     pub(crate) fn push(&self, event: Event) {
-        let mut out = Vec::with_capacity(1);
+        let mut out = Vec::new();
         let mut s = self.state.lock();
         s.advance(event.at, &mut out);
         s.keep(event, false, &mut out);

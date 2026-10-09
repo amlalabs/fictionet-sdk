@@ -662,25 +662,9 @@ impl SocketLink {
         let mut registered = false;
         loop {
             match unix::recv(fd, &mut self.buf, true) {
-                Ok(0) => {
-                    self.close();
-                    return Poll::Ready(Err(RecvError::Closed));
-                }
-                Ok(n) if n > relay::MAX_MESSAGE => {
-                    // Longer than the protocol allows, and cut short by the
-                    // buffer: never hand it on as a packet.
-                    self.close();
-                    return Poll::Ready(Err(RecvError::Closed));
-                }
-                Ok(n) if self.buf[0] == relay::PACKET => {
+                Ok(n) if (1..=relay::MAX_MESSAGE).contains(&n) && self.buf[0] == relay::PACKET => {
                     self.budget -= 1;
                     return Poll::Ready(Ok(Packet(self.buf[1..n].to_vec())));
-                }
-                Ok(_) => {
-                    // Any other message after the handshake closes the
-                    // connection.
-                    self.close();
-                    return Poll::Ready(Err(RecvError::Closed));
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if registered {
@@ -696,7 +680,8 @@ impl SocketLink {
                         return Poll::Ready(Err(RecvError::Cancelled));
                     }
                 }
-                Err(_) => {
+                _ => {
+                    // EOF, oversized datagrams, wrong kinds, and terminal errors close.
                     self.close();
                     return Poll::Ready(Err(RecvError::Closed));
                 }
@@ -781,6 +766,17 @@ pub struct Listening {
 
 /// How long dropping a [`Listening`] waits for observers of an ended run.
 const OBSERVERS_LINGER: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl Listening {
+    /// Binds a socket with a new attachment channel.
+    /// Keep the returned guard alive while accepting attachments.
+    /// Existing attachments survive when the guard is dropped.
+    pub fn bind(socket: WorldSocket) -> std::io::Result<(Self, crate::Attachments)> {
+        let (attacher, attachments) = crate::attachments();
+        let listening = listen(socket, attacher)?;
+        Ok((listening, attachments))
+    }
+}
 
 impl Drop for Listening {
     fn drop(&mut self) {

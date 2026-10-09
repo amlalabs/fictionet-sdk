@@ -48,11 +48,8 @@ fn main() -> fictionet::Result {
         .next()
         .unwrap_or_else(|| "/run/fictionet/world.sock".into());
     let after: u64 = args.next().map(|s| s.parse()).transpose()?.unwrap_or(20);
-    let (attacher, mut attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(
-        fictionet::WorldSocket::UnixSocket(path.clone().into()),
-        attacher,
-    )?;
+    let (_listening, mut attachments) =
+        fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}");
 
     fictionet::block_on(fictionet::run(

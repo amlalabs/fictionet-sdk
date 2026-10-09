@@ -481,6 +481,8 @@ pub mod protocols;
 pub mod tls;
 
 pub use conversation::Conversation;
+#[cfg(feature = "observe")]
+pub use packets::hex;
 mod present;
 mod registry;
 

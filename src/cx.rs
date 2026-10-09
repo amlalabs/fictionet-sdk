@@ -3,7 +3,6 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::panic::Location;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Waker};
@@ -135,21 +134,8 @@ impl Cx {
     /// Returns immediately if `deadline` has already passed. Returns early
     /// with [`Cancelled`] if this `Cx`'s [region](Cx#regions) is cancelled.
     pub async fn sleep_until(&self, deadline: Instant) -> Result<(), Cancelled> {
-        // A deadline past what the clock can hold never comes: the sleep
-        // waits until it is cancelled.
-        let deadline = self
-            .run
-            .environment
-            .clock
-            .finite(deadline)
-            .then_some(deadline);
-        Sleep {
-            fcx: self,
-            deadline,
-            timer: None,
-            wait: CancelWait::default(),
-        }
-        .await
+        let mut timer = Timer::new(self);
+        poll_fn(|cx| timer.poll_until(cx, deadline)).await
     }
 
     /// Waits for `d` to pass.
@@ -157,18 +143,12 @@ impl Cx {
     /// Returns early with [`Cancelled`] if this `Cx`'s [region](Cx#regions)
     /// is cancelled.
     pub async fn sleep(&self, d: Duration) -> Result<(), Cancelled> {
-        match self.now().since_start().checked_add(d) {
-            Some(deadline) => self.sleep_until(Instant::from_since_start(deadline)).await,
-            None => {
-                Sleep {
-                    fcx: self,
-                    deadline: None,
-                    timer: None,
-                    wait: CancelWait::default(),
-                }
-                .await
-            }
-        }
+        let deadline = self
+            .now()
+            .since_start()
+            .checked_add(d)
+            .unwrap_or(Duration::MAX);
+        self.sleep_until(Instant::from_since_start(deadline)).await
     }
 
     /// Fills `out` with random bytes from the run's stream.
@@ -951,55 +931,6 @@ impl Region {
 
     pub(crate) fn take_error(&self) -> Option<crate::Error> {
         self.state.lock().error.take()
-    }
-}
-
-/// The future behind [`Cx::sleep_until`].
-struct Sleep<'a> {
-    fcx: &'a Cx,
-    /// `None` is a deadline too far away to represent: it never comes.
-    deadline: Option<Instant>,
-    timer: Option<u64>,
-    wait: CancelWait,
-}
-
-impl Future for Sleep<'_> {
-    type Output = Result<(), Cancelled>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        if this.fcx.is_cancelled() {
-            return Poll::Ready(Err(Cancelled));
-        }
-        if let Some(deadline) = this.deadline {
-            if this.fcx.now() >= deadline {
-                return Poll::Ready(Ok(()));
-            }
-            match this.timer {
-                None => {
-                    this.timer = Some(
-                        this.fcx
-                            .run
-                            .environment
-                            .clock
-                            .add(deadline, cx.waker().clone()),
-                    )
-                }
-                Some(id) => this.fcx.run.environment.clock.update(id, cx.waker()),
-            }
-        }
-        if this.fcx.register_cancel(cx.waker(), &mut this.wait) {
-            return Poll::Ready(Err(Cancelled));
-        }
-        Poll::Pending
-    }
-}
-
-impl Drop for Sleep<'_> {
-    fn drop(&mut self) {
-        if let Some(id) = self.timer {
-            self.fcx.run.environment.clock.remove(id);
-        }
     }
 }
 

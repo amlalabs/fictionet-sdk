@@ -1323,10 +1323,8 @@ fn http_run(case: HttpCase) -> HttpRun {
                     .with_single_cert(chain, key)?,
             );
             let page = Page(Bytes::from(vec![b'x'; case.body]));
-            let sites = web::Sites::new(move |_| {
-                let config = config.clone();
-                Some(web::Site::new(page.clone()).tls(move |_| config.clone()))
-            });
+            let sites =
+                web::Sites::new(move |_| Some(web::Site::new(page.clone()).tls(config.clone())));
             if case.hooks {
                 fcx.events().subscribe(|_| {});
             }

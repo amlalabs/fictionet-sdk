@@ -24,11 +24,8 @@ fn main() -> fictionet::Result {
     let pcap = args
         .next()
         .unwrap_or_else(|| "/run/fictionet/agent.pcap".into());
-    let (attacher, attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(
-        fictionet::WorldSocket::UnixSocket(path.clone().into()),
-        attacher,
-    )?;
+    let (_listening, attachments) =
+        fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(path.clone().into()))?;
     println!("listening on {path}, writing packets to {pcap}");
 
     // The file is written on a thread of its own. A world's tasks share

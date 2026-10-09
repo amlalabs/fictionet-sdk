@@ -648,7 +648,7 @@ const WRITE_CHUNK: usize = 64 * 1024;
 struct Io<C> {
     conn: C,
     /// Bytes read from `conn` that rustls has not taken yet.
-    inbuf: Vec<u8>,
+    inbuf: fictionet::stdlib::codec::Buffer,
     /// Encrypted bytes for `conn` that it has not taken yet, from `out_pos`.
     out: Vec<u8>,
     out_pos: usize,
@@ -660,7 +660,7 @@ impl<C: Connection> Io<C> {
     fn new(conn: C) -> Self {
         Io {
             conn,
-            inbuf: Vec::new(),
+            inbuf: fictionet::stdlib::codec::Buffer::new(READ_CHUNK),
             out: Vec::new(),
             out_pos: 0,
             eof: false,
@@ -684,14 +684,16 @@ impl<C: Connection> Io<C> {
 
     /// Reads more bytes from `conn` into `inbuf`, or sets `eof`.
     fn poll_fill(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        let old = self.inbuf.len();
-        self.inbuf.resize(old + READ_CHUNK, 0);
-        let result = self.conn.poll_read(fcx, cx, &mut self.inbuf[old..]);
+        let spare = self.inbuf.spare();
+        if spare.is_empty() {
+            std::alloc::handle_alloc_error(std::alloc::Layout::array::<u8>(READ_CHUNK).unwrap());
+        }
+        let result = self.conn.poll_read(fcx, cx, spare);
         let n = match &result {
             Poll::Ready(Ok(n)) => *n,
             _ => 0,
         };
-        self.inbuf.truncate(old + n);
+        self.inbuf.commit(n);
         match result {
             Poll::Ready(Ok(0)) => {
                 self.eof = true;
@@ -723,12 +725,12 @@ impl<C: Connection> Io<C> {
             }
         } else {
             let n = tls
-                .read_tls(&mut &self.inbuf[..])
+                .read_tls(&mut self.inbuf.unread())
                 .map_err(|e| HandshakeError::Failed(e.to_string()))?;
             if n == 0 {
                 return Err(HandshakeError::Failed("rustls took no bytes".into()));
             }
-            self.inbuf.drain(..n);
+            self.inbuf.consume(n);
         }
         let result = with_context(fcx, || tls.process_new_packets().map(|_| ()));
         if let Err(e) = result {
@@ -853,9 +855,9 @@ pub async fn server_detailed<C: Connection>(
         loop {
             if !io.inbuf.is_empty() {
                 let n = acceptor
-                    .read_tls(&mut &io.inbuf[..])
+                    .read_tls(&mut io.inbuf.unread())
                     .map_err(|e| HandshakeError::Failed(e.to_string()))?;
-                io.inbuf.drain(..n);
+                io.inbuf.consume(n);
                 match acceptor.accept() {
                     Ok(Some(accepted)) => return Poll::Ready(Ok(accepted)),
                     Ok(None) if n == 0 => {
@@ -898,7 +900,7 @@ pub async fn server_detailed<C: Connection>(
 pub struct ClientHello<C> {
     conn: C,
     /// Bytes the client sent after its hello, not yet read by rustls.
-    inbuf: Vec<u8>,
+    inbuf: fictionet::stdlib::codec::Buffer,
     accepted: rustls::server::Accepted,
     server_name: Option<String>,
     alpn: Vec<Vec<u8>>,

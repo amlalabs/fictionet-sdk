@@ -233,6 +233,18 @@ pub enum Step<T> {
     End,
 }
 
+impl<T> Step<T> {
+    /// Maps an item, preserving its consumed byte count and every other step.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Step<U> {
+        match self {
+            Self::Item(item, n) => Step::Item(f(item), n),
+            Self::Skip(n) => Step::Skip(n),
+            Self::Need => Step::Need,
+            Self::End => Step::End,
+        }
+    }
+}
+
 /// A decoder that borrows all unread input for each call.
 ///
 /// Counts must not exceed the input length. `Need` must not grow held

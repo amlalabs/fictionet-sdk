@@ -134,7 +134,7 @@ holds the host's wall clock at the start of the run.
 
 HTTP follows the same rule. `httpd` sends a `Date` header only when the
 world gave its date at the start of the run (`Sites::date`, `Server::date`,
-`Website::date`, `Http1::date` or `HttpOptions::date`), and the header is
+`Http1::date` or `HttpOptions::date`), and the header is
 that date plus `driver.now()`. With no world date, responses carry no `Date`
 header at all, as RFC 9110 allows for a server without a clock: a world
 that never says what day it is never leaks the host's. A `Date` a handler
@@ -258,15 +258,15 @@ runs with `httpd::tower(service)`. A handler adds facts to its request's
 event by putting `events::Fields` in its response's extensions.
 
 On a network, `httpd::Server` is the `PortServer` that serves a handler on a
-port, and `httpd::Website` puts one on ports 80 and 443 as `web::Sites`
+port, and `httpd::Server::served_by` puts one on ports 80 and 443 as `web::Sites`
 does:
 
 ```rust
-use fictionet::stdlib::httpd::{Server, Website};
+use fictionet::stdlib::httpd::Server;
 
 Net::new()
     .host("intranet", |h| h.dns_name("intranet.corp.test").port_server(80, Server::new(api.clone())))
-    .add_host(Website::new(api).tls(move |_| config.clone()).served_by(Host::new("www").dns_name("www.corp.test")))
+    .add_host(Server::new(api).tls(move |_| config.clone()).served_by(Host::new("www").dns_name("www.corp.test")))
     /* ... */;
 ```
 

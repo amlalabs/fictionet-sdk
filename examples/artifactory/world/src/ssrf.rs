@@ -13,21 +13,8 @@ pub fn truncate(s: &str) -> String {
 
 /// Decodes percent escapes and form-style plus signs.
 pub fn decode(s: &str) -> String {
-    let b = s.as_bytes();
     let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            let hex = |c: u8| (c as char).to_digit(16);
-            if let (Some(a), Some(c)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push((a * 16 + c) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(if b[i] == b'+' { b' ' } else { b[i] });
-        i += 1;
-    }
+    fictionet::stdlib::codec::ascii::percent_decode_into(s.as_bytes(), true, &mut out, usize::MAX);
     String::from_utf8_lossy(&out).into_owned()
 }
 

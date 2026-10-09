@@ -84,22 +84,20 @@ pub fn start(
     let hijacked = scenario.hijacked();
     let site_for = move |host: &str| {
         if BANK_NAMES.contains(&host) {
-            let config = bank_config.clone();
             // The bank's server is the default one at its address, so a
             // request that names the address, or any other host, reaches it.
             let site = web::Site::new(bank.clone())
                 .at(BANK_ADDR)
-                .tls(move |_| config.clone())
+                .tls(bank_config.clone())
                 .default_host();
             // The impostor answers plain HTTP itself, as an attacker that
             // strips TLS would. The genuine bank redirects to https.
             Some(if hijacked { site.plain_http() } else { site })
         } else if host == STATUS_HOST {
-            let config = status_config.clone();
             Some(
                 web::Site::new(Status)
                     .at(STATUS_ADDR)
-                    .tls(move |_| config.clone()),
+                    .tls(status_config.clone()),
             )
         } else {
             None

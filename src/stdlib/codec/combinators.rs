@@ -30,12 +30,7 @@ impl<D: Decode, U, F: FnMut(D::Item) -> U> Decode for Map<D, F> {
         self.inner.held()
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<U>, D::Error> {
-        Ok(match self.inner.decode(input, eof)? {
-            Step::Item(item, n) => Step::Item((self.f)(item), n),
-            Step::Skip(n) => Step::Skip(n),
-            Step::Need => Step::Need,
-            Step::End => Step::End,
-        })
+        Ok(self.inner.decode(input, eof)?.map(&mut self.f))
     }
 }
 

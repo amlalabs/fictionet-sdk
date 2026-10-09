@@ -409,21 +409,6 @@ impl Drop for Capture {
         self.clear_calls();
     }
 }
-fn preview(b: &[u8]) -> Option<String> {
-    let cut = b.get(..b.len().min(160))?;
-    let text = std::str::from_utf8(cut).ok()?;
-    if !text
-        .chars()
-        .all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
-    {
-        return None;
-    }
-    let mut text = text.replace("\r\n", "\\r\\n").replace('\n', "\\n");
-    if b.len() > cut.len() {
-        text.push('…');
-    }
-    Some(text)
-}
 fn display_error(code: u32) -> String {
     ErrorCode::name(code).map_or_else(|| format!("error {code}"), str::to_owned)
 }
@@ -651,7 +636,7 @@ impl Decode for Capture {
                 let len = if oversized { h.length } else { data.len() };
                 item.layer
                     .field("Data", format!("{len} bytes"), (9, 9 + body.len()));
-                if let Some(text) = preview(data) {
+                if let Some(text) = fictionet::observe::protocols::body_preview(data) {
                     item.layer.note("Text", text);
                 }
                 let _ = write!(item.info, " {len} bytes");

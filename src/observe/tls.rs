@@ -566,7 +566,11 @@ impl Tls {
                 1 if m.len() >= 34 && !decrypted => {
                     self.client_random = Some(m[2..34].to_vec());
                     self.client = Some(i);
-                    l.field("Random", hex(&m[2..34]), (base + at + 6, base + at + 38));
+                    l.field(
+                        "Random",
+                        fictionet::observe::hex(&m[2..34]),
+                        (base + at + 6, base + at + 38),
+                    );
                     for (ext, data) in extensions(m, true) {
                         match ext {
                             0 if data.len() > 5 => {
@@ -682,15 +686,6 @@ fn extensions_at(m: &[u8], mut i: usize) -> Vec<(u16, &[u8])> {
         i += 4 + n;
     }
     out
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut text = String::new();
-    for byte in bytes {
-        let _ = write!(text, "{byte:02x}");
-    }
-    text
 }
 
 #[cfg(test)]

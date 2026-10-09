@@ -71,11 +71,8 @@ fn main() -> Result {
         })
         .collect();
 
-    let (attacher, mut attachments) = fictionet::attachments();
-    let _listening = fictionet::listen(
-        fictionet::WorldSocket::UnixSocket(socket.clone().into()),
-        attacher,
-    )?;
+    let (_listening, mut attachments) =
+        fictionet::Listening::bind(fictionet::WorldSocket::UnixSocket(socket.clone().into()))?;
     println!("GOAD LAN {}/24 listening on {socket}", subnet.addr);
     for &(name, _) in MEMBERS {
         let addr = members[name];

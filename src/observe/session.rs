@@ -176,16 +176,9 @@ impl Session {
             } else if end {
                 flags |= relay::END;
             }
-            unix::send(
-                self.fd.as_raw_fd(),
-                &Message::Reply {
-                    id,
-                    flags,
-                    body: chunk,
-                }
-                .encode(),
-                false,
-            )?;
+            let mut header = [relay::REPLY, 0, 0, 0, 0, flags];
+            header[1..5].copy_from_slice(&id.to_be_bytes());
+            unix::send_parts(self.fd.as_raw_fd(), &[&header, chunk], false)?;
         }
         Ok(())
     }

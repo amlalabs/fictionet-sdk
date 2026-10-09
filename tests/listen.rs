@@ -86,8 +86,8 @@ impl Client {
 #[test]
 fn attach_echo_and_detach() {
     let path = socket_path("echo");
-    let (attacher, mut attachments) = attachments();
-    let listening = listen(WorldSocket::UnixSocket(path.clone().into()), attacher).unwrap();
+    let (listening, mut attachments) =
+        fictionet::Listening::bind(WorldSocket::UnixSocket(path.clone().into())).unwrap();
 
     let (done_tx, done_rx) = mpsc::channel();
     let echoed = std::sync::Arc::new(AtomicU32::new(0));

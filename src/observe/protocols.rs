@@ -985,8 +985,9 @@ fn read_head(head: &[u8], methods: &mut Methods) -> Option<(String, &'static str
     }
 }
 
-/// Text for a preview of bytes: the start, if it reads as text.
-fn preview(b: &[u8]) -> Option<String> {
+/// Previews the first 160 bytes as UTF-8, escaping CRLF and LF.
+/// Rejects other controls except CR and TAB, and appends an ellipsis if truncated.
+pub fn body_preview(b: &[u8]) -> Option<String> {
     let cut = &b[..b.len().min(160)];
     let text = std::str::from_utf8(cut).ok()?;
     if text
@@ -1006,7 +1007,7 @@ fn preview(b: &[u8]) -> Option<String> {
 fn body_layer(d: &mut Decoded, total: u64, seen: &[u8]) {
     let mut l = Layer::new("HTTP body", 0, (0, 0));
     l.summary = format!("{total} bytes");
-    if let Some(text) = preview(seen) {
+    if let Some(text) = body_preview(seen) {
         l.note("Text", text);
     }
     d.push(l);
@@ -1014,6 +1015,24 @@ fn body_layer(d: &mut Decoded, total: u64, seen: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn body_previews_keep_byte_boundaries_and_text_policy() {
+        assert_eq!(super::body_preview(b""), Some(String::new()));
+        assert_eq!(
+            super::body_preview(b"a\r\nb\n\t\r"),
+            Some("a\\r\\nb\\n\t\r".into())
+        );
+        assert_eq!(super::body_preview(b"a\0"), None);
+        assert_eq!(
+            super::body_preview(&[b'x'; 161]),
+            Some(format!("{}…", "x".repeat(160)))
+        );
+        assert_eq!(
+            super::body_preview(format!("{}é", "x".repeat(159)).as_bytes()),
+            None
+        );
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::contract::check_decode;

@@ -1506,12 +1506,10 @@ impl Decode for Commands {
         self.lines.partial.len()
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, FrameError> {
-        Ok(match self.lines.decode(input, eof)? {
-            Step::Item(line, n) => Step::Item(line.and_then(|line| Command::parse_line(&line)), n),
-            Step::Skip(n) => Step::Skip(n),
-            Step::Need => Step::Need,
-            Step::End => Step::End,
-        })
+        Ok(self
+            .lines
+            .decode(input, eof)?
+            .map(|line| line.and_then(|line| Command::parse_line(&line))))
     }
 }
 

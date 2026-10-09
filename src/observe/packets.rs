@@ -268,11 +268,7 @@ impl LinkWatch {
     /// Packet list lines after row `after`, at most `max`.
     pub(crate) fn rows_after(&self, after: u64, max: usize) -> Vec<(u64, String)> {
         let inner = self.inner.lock();
-        let skip = inner
-            .rows
-            .iter()
-            .position(|r| r.seq > after)
-            .unwrap_or(inner.rows.len());
+        let skip = inner.rows.partition_point(|r| r.seq <= after);
         inner
             .rows
             .iter()
@@ -310,15 +306,16 @@ pub(crate) fn keylog(graph: &Graph) -> String {
     for k in &s.keys {
         out.push_str(&k.label);
         out.push(' ');
-        out.push_str(&hex(&k.client_random));
+        super::json::push_hex(&mut out, &k.client_random);
         out.push(' ');
-        out.push_str(&hex(&k.secret));
+        super::json::push_hex(&mut out, &k.secret);
         out.push('\n');
     }
     out
 }
 
-pub(crate) fn hex(b: &[u8]) -> String {
+/// Renders bytes as lowercase hexadecimal, with two digits per byte.
+pub fn hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     super::json::push_hex(&mut s, b);
     s

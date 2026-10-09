@@ -1852,31 +1852,14 @@
 //!
 //! # Checking that it works
 //!
-//! Run these commands inside the sandbox: with `ip netns exec agent` or
-//! `examples/attach/netns.sh` on a host, or with
-//! `docker compose -f examples/attach/compose-tun.yaml exec agent` in the
-//! Compose setup. The outputs are from
-//! [`getting_started`](crate::getting_started), with the `web_world`
-//! example as the world.
-//!
-//! 1. **The device and its addresses.** `ip addr show tun0` shows
-//!    `inet 10.0.0.2/24` and `inet6 2001:db8::2/64`. `ip route` shows
-//!    `default via 10.0.0.1 dev tun0`, and `ip -6 route` shows
-//!    `default via 2001:db8::1 dev tun0`.
-//! 2. **DNS.** `cat /etc/resolv.conf` shows `nameserver 10.0.0.1` and
-//!    `nameserver 2001:db8::1`. `dig +short example.test` prints
-//!    `203.0.113.10`, and `dig +short AAAA example.test` prints
-//!    `2001:db8:113::10`: answers from the world.
-//! 3. **The gateway.** `ping -c 1 10.0.0.1` and `ping -6 -c 1 2001:db8::1`
-//!    get replies from the world.
-//! 4. **HTTPS.** `curl -sS --cacert <the world's CA> https://example.test/`
-//!    prints `hello from https example.test 443 over HTTP/2.0`. Without
-//!    `--cacert`, it fails with curl's error 60, because the sandbox does
-//!    not trust the world's CA.
-//!
-//! If step 1 fails, read attach's messages. If step 1 works but step 2
-//! fails, the sandbox reads a different `resolv.conf`: see
-//! [DNS and `resolv.conf`](#dns-and-resolvconf).
+//! Follow getting started's [network checks](crate::getting_started#5-look-around-inside-the-sandbox)
+//! and [HTTPS check](crate::getting_started#6-trust-the-worlds-ca-and-make-an-https-request)
+//! with `web_world` running. Run them inside the sandbox with
+//! `ip netns exec agent` or `examples/attach/netns.sh` on a host, or
+//! `docker compose -f examples/attach/compose-tun.yaml exec agent` in Compose.
+//! If the device or routes are missing, read attach's messages. If those work
+//! but DNS fails, check which resolver file the sandbox reads:
+//! see [DNS and `resolv.conf`](#dns-and-resolvconf).
 //!
 //! # Every flag
 //!

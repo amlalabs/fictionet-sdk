@@ -79,10 +79,7 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
             NAME => Some(
                 web::Site::new(Hello)
                     .at(SITE)
-                    .tls({
-                        let server = server.clone();
-                        move |_| server.clone()
-                    })
+                    .tls(server.clone())
                     .plain_http(),
             ),
             _ => None,

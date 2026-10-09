@@ -102,11 +102,10 @@ pub fn serve(
     names.sort();
     for host in names {
         let addr = hosts[host];
-        let config = configs[host].clone();
         net = net.add_host(
             web::Site::new(content.clone())
                 .at(addr)
-                .tls(move |_| config.clone())
+                .tls(configs[host].clone())
                 .into_host(host),
         )
     }

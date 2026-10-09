@@ -1,13 +1,12 @@
 //! The graph as the browser sees it, and the messages that keep a browser
 //! up to date: a snapshot first, then only what changed.
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use super::json::{self, Object};
 use std::sync::Arc;
 
-use crate::watch::{Graph, GraphState, Group, short_name};
+use crate::watch::{Graph, GraphState, Group, TaskInfo, short_name};
 
 /// What one browser has been told.
 #[derive(Default)]
@@ -76,17 +75,6 @@ fn add_group(view: &mut View, group: &Arc<Group>) -> String {
     group_id(group.id)
 }
 
-/// One task, copied out of the graph.
-struct TaskRow {
-    id: u64,
-    parent: u64,
-    group: Option<Arc<Group>>,
-    name: Cow<'static, str>,
-    file: &'static str,
-    line: u32,
-    started: std::time::Duration,
-}
-
 /// One link that is drawn, copied out of the graph: its ends are tasks
 /// that live, or a sandbox.
 struct LinkRow {
@@ -109,25 +97,13 @@ enum End {
 /// dropped.
 struct Copy {
     ended: bool,
-    tasks: Vec<TaskRow>,
+    tasks: Vec<(u64, TaskInfo)>,
     links: Vec<LinkRow>,
 }
 
 fn copy(s: &mut GraphState) -> Copy {
     s.links.retain(|_, l| l.meter.strong_count() > 0);
-    let tasks = s
-        .tasks
-        .iter()
-        .map(|(id, t)| TaskRow {
-            id: *id,
-            parent: t.parent,
-            group: t.group.clone(),
-            name: t.name.clone(),
-            file: t.file,
-            line: t.line,
-            started: t.started,
-        })
-        .collect();
+    let tasks = s.tasks.iter().map(|(&id, t)| (id, t.clone())).collect();
     let live = |task: u64| (task != 0 && s.tasks.contains_key(&task)).then_some(task);
     let mut links = Vec::with_capacity(s.links.len());
     for (id, link) in &s.links {
@@ -167,8 +143,8 @@ fn build(mut c: Copy) -> View {
         ended: c.ended,
         ..View::default()
     };
-    c.tasks.sort_unstable_by_key(|t| t.id);
-    for t in &c.tasks {
+    c.tasks.sort_unstable_by_key(|(id, _)| *id);
+    for (id, t) in &c.tasks {
         let kind = if t.name == "world" && t.parent == 0 {
             "world"
         } else {
@@ -177,7 +153,7 @@ fn build(mut c: Copy) -> View {
         let parent = (t.parent != 0).then(|| task_id(t.parent));
         let group = t.group.as_ref().map(|g| add_group(&mut view, g));
         let node = Object::new()
-            .str("id", &task_id(t.id))
+            .str("id", &task_id(*id))
             .str("kind", kind)
             .str("name", &short_name(&t.name))
             .str("file", t.file)
@@ -186,7 +162,7 @@ fn build(mut c: Copy) -> View {
             .opt_str("group", group.as_deref())
             .secs("started", t.started)
             .done();
-        view.nodes.insert(task_id(t.id), node);
+        view.nodes.insert(task_id(*id), node);
     }
     c.links.sort_unstable_by_key(|l| l.id);
     for link in &c.links {
@@ -222,10 +198,14 @@ fn build(mut c: Copy) -> View {
 /// The `counters` reply: every link's counts now.
 pub(crate) fn counters(graph: &Graph) -> String {
     let c = copy(&mut graph.state());
-    let view = build(c);
+    let counters: BTreeMap<_, _> = c
+        .links
+        .iter()
+        .map(|link| (edge_id(link.id), link.meter.totals()))
+        .collect();
     Object::new()
         .secs("t", graph.since_start())
-        .raw("edges", &counters_json(view.counters.iter()))
+        .raw("edges", &counters_json(counters.iter()))
         .done()
 }
 
@@ -505,6 +485,9 @@ mod tests {
         let m = changes(&graph, &mut view);
         assert_eq!(names(&m), ["node", "edge", "counters"]);
         assert!(m[1].1.contains(r#""a":"t1","b":"t2""#), "{}", m[1].1);
+
+        let expected = counters_json(view.counters.iter());
+        assert!(counters(&graph).contains(&format!("\"edges\":{expected}")));
 
         // The pair closes and the task ends: the edge goes before the node.
         drop(meter);

@@ -1881,27 +1881,15 @@ where
         }
     }
 
-    fn pending_ctx<'a>(
-        fcx: Option<&'a Cx>,
-        events: &'a mut Vec<Event>,
-        written: u64,
-        conn: &'a ConnInfo,
-    ) -> PendingDriver<'a> {
-        PendingDriver {
-            fcx,
-            events,
-            written,
-            conn,
-            close: false,
-        }
-    }
-
     fn cancel_work(&mut self, mut work: Work) {
-        let mut events = Vec::new();
-        let mut driver =
-            Self::pending_ctx(self.fcx.as_ref(), &mut events, work.written, &self.info);
+        let mut driver = PendingDriver {
+            fcx: self.fcx.as_ref(),
+            events: &mut self.s.events,
+            written: work.written,
+            conn: &self.info,
+            close: false,
+        };
         work.pending.cancel(&mut driver);
-        self.s.events.append(&mut events);
     }
 
     fn cancel_all(&mut self, ordered: bool) {
@@ -2276,11 +2264,10 @@ where
     ) -> bool {
         let mut progress = false;
         if let Some(work) = self.ordered.front_mut() {
-            let mut events = Vec::new();
             let (polled, close) = {
                 let mut driver = PendingDriver {
                     fcx: self.fcx.as_ref(),
-                    events: &mut events,
+                    events: &mut self.s.events,
                     written: work.written,
                     conn: &self.info,
                     close: false,
@@ -2289,7 +2276,6 @@ where
             };
             work.close |= close;
             let (id, close) = (work.id, work.close);
-            self.s.events.append(&mut events);
             match polled {
                 Poll::Pending => {}
                 Poll::Ready(Some(Ok(bytes))) => {
@@ -2316,12 +2302,11 @@ where
         }
         let mut i = 0;
         while i < self.keyed.len() && self.state == State::Running {
-            let mut events = Vec::new();
             let (polled, close) = {
                 let (_, work) = &mut self.keyed[i];
                 let mut driver = PendingDriver {
                     fcx: self.fcx.as_ref(),
-                    events: &mut events,
+                    events: &mut self.s.events,
                     written: work.written,
                     conn: &self.info,
                     close: false,
@@ -2329,7 +2314,6 @@ where
                 (work.pending.poll_next(&mut driver, cx), driver.close)
             };
             self.keyed[i].1.close |= close;
-            self.s.events.append(&mut events);
             let done = match polled {
                 Poll::Pending => {
                     i += 1;
