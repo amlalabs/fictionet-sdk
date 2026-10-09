@@ -175,11 +175,7 @@ fn echo_request(seq: u16) -> Vec<u8> {
 #[test]
 fn packets_cross_both_ways_and_refuse_and_world_close_end_attach() {
     if !userns_works() {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "required host capability is missing in CI"
-        );
-        eprintln!("skipped: unshare -rnm is not allowed here");
+        requirements::skip("unshare -rnm is not allowed here");
         return;
     }
     let dir = temp_dir();
@@ -314,11 +310,7 @@ fn futures_poll_once(
 #[test]
 fn resolv_conf_flag_picks_the_file_and_a_failed_write_names_it() {
     if !userns_works() {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "required host capability is missing in CI"
-        );
-        eprintln!("skipped: unshare -rnm is not allowed here");
+        requirements::skip("unshare -rnm is not allowed here");
         return;
     }
     let dir = temp_dir();
@@ -426,11 +418,7 @@ fn hold_until(attachments: fictionet::Attachments, name: &'static str, done: std
 #[test]
 fn down_link_clears_a_pods_eth0_before_tun0_takes_the_default_route() {
     if !userns_works() {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "required host capability is missing in CI"
-        );
-        eprintln!("skipped: unshare -rnm is not allowed here");
+        requirements::skip("unshare -rnm is not allowed here");
         return;
     }
     let dir = temp_dir();
@@ -508,11 +496,7 @@ fn down_link_clears_a_pods_eth0_before_tun0_takes_the_default_route() {
 #[test]
 fn down_link_with_no_such_link_fails() {
     if !userns_works() {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "required host capability is missing in CI"
-        );
-        eprintln!("skipped: unshare -rnm is not allowed here");
+        requirements::skip("unshare -rnm is not allowed here");
         return;
     }
     let script = format!(
@@ -529,11 +513,7 @@ fn down_link_with_no_such_link_fails() {
 #[test]
 fn world_wait_waits_for_a_late_world() {
     if !userns_works() {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "required host capability is missing in CI"
-        );
-        eprintln!("skipped: unshare -rnm is not allowed here");
+        requirements::skip("unshare -rnm is not allowed here");
         return;
     }
     let dir = temp_dir();
@@ -588,15 +568,11 @@ fn world_wait_waits_for_a_late_world() {
 #[test]
 fn a_missing_tun_node_that_cannot_be_made_says_why() {
     if !userns_works() {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "required host capability is missing in CI"
-        );
-        eprintln!("skipped: unshare -rnm is not allowed here");
+        requirements::skip("unshare -rnm is not allowed here");
         return;
     }
     let script = format!(
-        "mount -t tmpfs tmpfs /dev && mkdir /dev/net && exec {BIN} attach --world unix:/nowhere --name a --type tun {V4_ONLY}"
+        "mount -t tmpfs tmpfs /dev/net && exec {BIN} attach --world unix:/nowhere --name a --type tun {V4_ONLY}"
     );
     let out = unshare("-rnm", &script).wait_with_output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
@@ -690,7 +666,10 @@ mod requirements;
 
 #[test]
 fn missing_userns_fails_in_ci() {
-    requirements::fails_in_ci("packets_cross_both_ways_and_refuse_and_world_close_end_attach");
+    requirements::fails_in_ci(
+        "packets_cross_both_ways_and_refuse_and_world_close_end_attach",
+        "unshare -rnm is not allowed here",
+    );
 }
 
 #[test]

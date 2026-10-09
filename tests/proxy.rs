@@ -489,11 +489,7 @@ fn http_door_connects_and_forwards() {
 #[test]
 fn https_through_both_doors_with_curl() {
     if !curl() {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "required host capability is missing in CI"
-        );
-        eprintln!("skipped: no curl");
+        requirements::skip("no curl");
         return;
     }
     let world = World::start();
@@ -1086,5 +1082,5 @@ mod requirements;
 
 #[test]
 fn missing_curl_fails_in_ci() {
-    requirements::fails_in_ci("https_through_both_doors_with_curl");
+    requirements::fails_in_ci("https_through_both_doors_with_curl", "no curl");
 }

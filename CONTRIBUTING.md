@@ -105,8 +105,9 @@ targets for `linux/amd64` and `linux/arm64`. The image tags include the `v`,
 for example `ghcr.io/amlalabs/fictionet-attach:v0.1.0`.
 
 Check that both published images contain both architectures and smoke-test
-them before updating the Inspect package's image pins in a separate change. Creating a local release commit
-does not publish images; pushing a version tag does.
+them before updating the Inspect package's image pins in a separate change.
+Creating a local release commit does not publish images; pushing a version
+tag does.
 
 ## Adding a protocol module
 

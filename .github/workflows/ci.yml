@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   schedule:
     - cron: '17 3 * * *'
@@ -131,8 +132,6 @@ jobs:
         working-directory: examples/artifactory
         run: uv run --locked pytest
       - name: The Inspect package
-        env:
-          INSPECT_FICTIONET_DOCKER: "1"
         working-directory: python/inspect_fictionet
         run: uv run --locked --extra k8s pytest
       # From the crate root, so rust-toolchain.toml there, not fuzz/'s

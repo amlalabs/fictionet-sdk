@@ -14,11 +14,7 @@ fn dashboard_js() {
     {
         Ok(out) => out,
         Err(e) => {
-            assert!(
-                std::env::var_os("CI").is_none(),
-                "node is required under CI: {e}"
-            );
-            eprintln!("skipped: node is not installed ({e})");
+            requirements::skip(&format!("node is not installed ({e})"));
             return;
         }
     };
@@ -39,5 +35,5 @@ mod requirements;
 
 #[test]
 fn missing_node_fails_in_ci() {
-    requirements::fails_in_ci("dashboard_js");
+    requirements::fails_in_ci("dashboard_js", "node is not installed");
 }

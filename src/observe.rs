@@ -78,7 +78,7 @@
 //!
 //! ```text
 //! $ fictionet observe --world unix:/run/fictionet/world.sock world
-//! {"observe":1,"fictionet":"0.0.0","running":true,"ended":false,"started":1790989827708,"t":123.285394}
+//! {"observe":1,"fictionet":"0.1.0","running":true,"ended":false,"started":1790989827708,"t":123.285394}
 //! $ fictionet observe --world unix:/run/fictionet/world.sock watch
 //! {"event":"snapshot","data":{"t":123.288818,"started":1790989827708,"ended":false,"nodes":[{"id":"s7","kind":"sandbox","name":"agent"},...
 //! {"event":"counters","data":{"t":123.538718,"edges":{"e2":[1642,110577,1642,117625],...}}}
@@ -317,7 +317,7 @@
 //!
 //! | `op` | Fields | Reply |
 //! |---|---|---|
-//! | `world` | | `{"observe":1,"fictionet":"0.0.0","running":true,"ended":false,"started":1790989827708,"t":123.28}` |
+//! | `world` | | `{"observe":1,"fictionet":"0.1.0","running":true,"ended":false,"started":1790989827708,"t":123.28}` |
 //! | `graph` | | the [graph](#the-graph) as it is now |
 //! | `watch` | `after`: an event number, optional | a stream: the graph, then [what changes](#changes) |
 //! | `counters` | | `{"t":..,"edges":{"e7":[p,b,p,b],..}}` for every link |
