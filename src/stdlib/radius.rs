@@ -1740,8 +1740,8 @@ pub const DICTIONARY: &[AttributeInfo] = {
         info(ACCT_SESSION_ID, "Acct-Session-Id", Text),
         info(ACCT_AUTHENTIC, "Acct-Authentic", Enum),
         info(ACCT_SESSION_TIME, "Acct-Session-Time", Integer),
-        info(ACCT_INPUT_PACKETS, "Acct-Input-Frames::<Packet>", Integer),
-        info(ACCT_OUTPUT_PACKETS, "Acct-Output-Frames::<Packet>", Integer),
+        info(ACCT_INPUT_PACKETS, "Acct-Input-Packets", Integer),
+        info(ACCT_OUTPUT_PACKETS, "Acct-Output-Packets", Integer),
         info(ACCT_TERMINATE_CAUSE, "Acct-Terminate-Cause", Enum),
         info(ACCT_MULTI_SESSION_ID, "Acct-Multi-Session-Id", Text),
         info(ACCT_LINK_COUNT, "Acct-Link-Count", Integer),
@@ -1780,7 +1780,7 @@ pub const DICTIONARY: &[AttributeInfo] = {
         info(ACCT_INTERIM_INTERVAL, "Acct-Interim-Interval", Integer),
         info(
             ACCT_TUNNEL_PACKETS_LOST,
-            "Acct-Tunnel-Frames::<Packet>-Lost",
+            "Acct-Tunnel-Packets-Lost",
             Integer,
         ),
         info(NAS_PORT_ID, "NAS-Port-Id", Text),
@@ -3139,6 +3139,18 @@ mod tests {
 
     #[test]
     fn dictionary_matches_the_iana_registry() {
+        assert_eq!(
+            lookup_name("Acct-Input-Packets"),
+            lookup(attr::ACCT_INPUT_PACKETS)
+        );
+        assert_eq!(
+            lookup_name("Acct-Output-Packets"),
+            lookup(attr::ACCT_OUTPUT_PACKETS)
+        );
+        assert_eq!(
+            lookup_name("Acct-Tunnel-Packets-Lost"),
+            lookup(attr::ACCT_TUNNEL_PACKETS_LOST)
+        );
         // Data types and names the IANA RADIUS Attribute Types registry
         // gives.
         let cases = [
@@ -3166,7 +3178,7 @@ mod tests {
             ),
             (
                 attr::ACCT_TUNNEL_PACKETS_LOST,
-                "Acct-Tunnel-Frames::<Packet>-Lost",
+                "Acct-Tunnel-Packets-Lost",
                 DataType::Integer,
             ),
             (attr::CUI, "CUI", DataType::String),

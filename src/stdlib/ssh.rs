@@ -65,7 +65,7 @@
 //! let server = ["ecdh-sha2-nistp256".to_string(), "curve25519-sha256".to_string()];
 //! assert_eq!(KexInit::choose(&theirs.kex_algorithms, &server), Some("curve25519-sha256"));
 //!
-//! // Frames::<Packet> are padded to a multiple of 8 bytes.
+//! // Packets are padded to a multiple of 8 bytes.
 //! assert_eq!(Packet::new(vec![21]).to_bytes().unwrap().len(), 16);
 //! ```
 

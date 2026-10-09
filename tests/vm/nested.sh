@@ -47,7 +47,7 @@ trap cleanup EXIT
 
 # Two read-only disks for L1: the large files, cached between runs, and
 # this run's binaries and scripts.
-assets_iso="$vmdir/assets/assets-$release.iso"
+assets_iso="$vmdir/assets/assets-$release-$fc_version-$ch_version-$kernel.iso"
 if [ ! -f "$assets_iso" ]; then
     echo "making $assets_iso"
     genisoimage -quiet -output "$assets_iso.part" -volid FNASSETS -rock -graft-points \

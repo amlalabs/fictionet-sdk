@@ -1919,9 +1919,9 @@ mod tests {
             Err(Error::Duplicate { id: 1 })
         );
         assert_eq!(s.open(), 1);
-        // fictionet::stdlib::codec::Frames::<Record> for a failed request are ignored.
+        // Records for a failed request are ignored.
         assert_eq!(s.receive(&Record::new(kind::PARAMS, 1, b"x")), Ok(None));
-        // fictionet::stdlib::codec::Frames::<Record> for requests that are not open are ignored.
+        // Records for requests that are not open are ignored.
         assert_eq!(s.receive(&Record::new(kind::STDIN, 9, b"x")), Ok(None));
         // A stream record after its end.
         s.receive(&begin(2, Role::Responder)).unwrap();
@@ -2055,7 +2055,7 @@ mod tests {
                 kind: kind::STDOUT
             })
         );
-        // fictionet::stdlib::codec::Frames::<Record> a web server does not read are ignored.
+        // Records a web server does not read are ignored.
         assert_eq!(c.receive(&Record::new(kind::STDIN, 3, b"x")), Ok(None));
         assert_eq!(c.receive(&Record::new(kind::GET_VALUES, 0, &[])), Ok(None));
     }

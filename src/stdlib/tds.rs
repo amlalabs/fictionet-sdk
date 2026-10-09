@@ -416,7 +416,7 @@ pub mod data_type {
 }
 
 // ---------------------------------------------------------------------
-// fictionet::stdlib::codec::Frames::<Packet> and messages.
+// Packets and messages.
 // ---------------------------------------------------------------------
 
 /// One packet: its header's fields and the data it carries. The length is

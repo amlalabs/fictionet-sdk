@@ -269,8 +269,22 @@ impl Parser<'_> {
                         b'u' => {
                             let hex = std::str::from_utf8(self.b.get(self.i..self.i + 4)?).ok()?;
                             self.i += 4;
-                            let ch = char::from_u32(u32::from_str_radix(hex, 16).ok()?)
-                                .unwrap_or('\u{fffd}');
+                            let mut code = u32::from_str_radix(hex, 16).ok()?;
+                            if (0xd800..=0xdbff).contains(&code)
+                                && self.b[self.i..].starts_with(b"\\u")
+                            {
+                                let low = self
+                                    .b
+                                    .get(self.i + 2..self.i + 6)
+                                    .and_then(|hex| std::str::from_utf8(hex).ok())
+                                    .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                                    .filter(|low| (0xdc00..=0xdfff).contains(low));
+                                if let Some(low) = low {
+                                    code = 0x10000 + ((code - 0xd800) << 10) + low - 0xdc00;
+                                    self.i += 6;
+                                }
+                            }
+                            let ch = char::from_u32(code).unwrap_or('\u{fffd}');
                             let mut buf = [0; 4];
                             out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                         }
@@ -286,6 +300,19 @@ impl Parser<'_> {
 #[cfg(all(test, feature = "observe"))]
 mod parse_tests {
     use super::*;
+
+    #[test]
+    fn escaped_surrogates() {
+        let o = parse_flat(r#"{"pair":"\uD83D\uDE00","high":"\uD83D","low":"\uDE00","text":"\uD83Dx","bmp":"\uD83D\u0041","twice":"\uD83D\uD83D\uDE00"}"#).unwrap();
+        assert_eq!(o["pair"].as_str(), Some("😀"));
+        assert_eq!(o["high"].as_str(), Some("�"));
+        assert_eq!(o["low"].as_str(), Some("�"));
+        assert_eq!(o["text"].as_str(), Some("�x"));
+        assert_eq!(o["bmp"].as_str(), Some("�A"));
+        assert_eq!(o["twice"].as_str(), Some("�😀"));
+        assert!(parse_flat(r#"{"s":"\uD83D\uZZZZ"}"#).is_none());
+        assert!(parse_flat(r#"{"s":"\uD83D\uDE"}"#).is_none());
+    }
 
     #[test]
     fn flat_objects_parse() {

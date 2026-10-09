@@ -10,11 +10,11 @@ use std::sync::Arc;
 /// runtime polling the world.
 ///
 /// It needs no arguments: it forwards to the [`Target`] that [`Sites`](fictionet::stdlib::web::Sites) puts
-/// on every request, so the scheme, host and port come from the connection
-/// the agent made, not from headers. The path and query come from the
-/// request. The world process makes a new, separate request there through
-/// its operating system's network, resolving the name with its own DNS, and
-/// returns the answer to the agent.
+/// on every request. The scheme and port come from the connection the
+/// agent made; the host comes from the request's authority or `Host` header.
+/// The path and query come from the request. The world process makes a new,
+/// separate request there through its operating system's network, resolving
+/// the name with its own DNS, and returns the answer to the agent.
 ///
 /// The agent never touches the real internet: its connection ends at the
 /// world. Over HTTPS the agent sees the world's certificate, from

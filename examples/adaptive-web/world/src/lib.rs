@@ -256,8 +256,9 @@ pub fn world_start(date: &str) -> fictionet::Result<SystemTime> {
         return Err(bad("it does not have three parts".into()));
     };
     let number = |p: &str| p.parse::<u16>().map_err(|e| bad(e.to_string()));
-    let month = time::Month::try_from(number(m)? as u8).map_err(|e| bad(e.to_string()))?;
-    let day = time::Date::from_calendar_date(number(y)? as i32, month, number(d)? as u8)
+    let byte = |p: &str| u8::try_from(number(p)?).map_err(|e| bad(e.to_string()));
+    let month = time::Month::try_from(byte(m)?).map_err(|e| bad(e.to_string()))?;
+    let day = time::Date::from_calendar_date(number(y)? as i32, month, byte(d)?)
         .map_err(|e| bad(e.to_string()))?;
     let now = time::OffsetDateTime::now_utc();
     Ok(day.with_time(now.time()).assume_utc().into())
@@ -491,6 +492,8 @@ mod tests {
             (2026, 3, 14)
         );
         assert!(world_start("2026-02-30").is_err());
+        assert!(world_start("2026-257-01").is_err());
+        assert!(world_start("2026-01-257").is_err());
         assert!(
             world_start("14/03/2026")
                 .unwrap_err()
