@@ -553,23 +553,26 @@ impl Cx {
     /// Makes sure `waker` is woken when this region is cancelled. Returns
     /// whether it already is cancelled.
     ///
-    /// Tasks in this region are already registered by the run. Any other
-    /// waker, including a task waiting on another region's `Cx`, is kept
-    /// in `wait`'s slot. Dropping the token takes that waker out of the
-    /// region. Cancelling a region wakes its tasks and registered waits.
+    /// Work polled by this run needs no registration: cancelling a region
+    /// wakes every task of the run. Any other waker, such as a tokio task
+    /// that holds an interface and a clone of this `Cx`, is kept in the
+    /// region in `wait`'s slot. Each wait keeps one `CancelWait` for as long
+    /// as it lives, and dropping it takes the waker out of the region, so a
+    /// region holds one waker per wait outside the run, no more.
     /// Create the token with [`CancelWait::default`] and keep it for one
     /// region. Call this method on each poll to update its waker.
     pub fn register_cancel(&self, waker: &Waker, wait: &mut CancelWait) -> bool {
-        if crate::run::is_region_task(&self.region, waker) {
-            *wait = CancelWait::default();
+        if crate::run::is_current_task(&self.run, waker) {
+            wait.0 = None;
             return self.is_cancelled();
         }
         match &wait.0 {
             Some((region, key)) if Arc::ptr_eq(region, &self.region) => {
-                self.region.update_waiter(*key, waker)
+                self.region.update_foreign(*key, waker)
             }
             _ => {
-                *wait = self.region.register(waker);
+                let key = self.region.add_foreign(waker);
+                wait.0 = Some((self.region.clone(), key));
             }
         }
         // Checked after adding, so a cancel in between is not missed.
@@ -762,8 +765,8 @@ impl JoinState {
     }
 }
 
-/// One wait's place for its waker in a region. See [`Cx::register_cancel`].
-/// Dropping it takes the waker out.
+/// One wait's place for its waker in a region, for waits polled outside the
+/// run. See [`Cx::register_cancel`]. Dropping it takes the waker out.
 /// Create an empty token with [`Default::default`] and use it with one region.
 #[derive(Default)]
 pub struct CancelWait(Option<(Arc<Region>, u64)>);
@@ -771,7 +774,7 @@ pub struct CancelWait(Option<(Arc<Region>, u64)>);
 impl Drop for CancelWait {
     fn drop(&mut self) {
         if let Some((region, key)) = self.0.take() {
-            let removed = region.state.lock().unwrap().waiters.remove(&key);
+            let removed = region.state.lock().unwrap().foreign.remove(&key);
             drop(removed);
         }
     }
@@ -779,6 +782,7 @@ impl Drop for CancelWait {
 
 /// A region: a group of work that is cancelled together and ends together.
 pub(crate) struct Region {
+    run: Weak<RunShared>,
     cancelled: AtomicBool,
     /// Cancelled by [`Cx::cancel`]: errors from then on are not kept.
     stopped: AtomicBool,
@@ -788,8 +792,9 @@ pub(crate) struct Region {
 #[derive(Default)]
 struct RegionState {
     children: Vec<Weak<Region>>,
-    /// Task and wait wakers to wake on cancel, in registration order.
-    waiters: BTreeMap<u64, Waker>,
+    /// Wakers outside this run to wake on cancel, in [`CancelWait`]
+    /// registration order.
+    foreign: BTreeMap<u64, Waker>,
     next_key: u64,
     /// The first error of the region.
     error: Option<crate::Error>,
@@ -802,8 +807,9 @@ struct RegionState {
 }
 
 impl Region {
-    pub(crate) fn root() -> Arc<Region> {
+    pub(crate) fn root(run: Weak<RunShared>) -> Arc<Region> {
         Arc::new(Region {
+            run,
             cancelled: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             state: Mutex::default(),
@@ -812,6 +818,7 @@ impl Region {
 
     fn child(self: &Arc<Self>) -> Arc<Region> {
         let child = Arc::new(Region {
+            run: self.run.clone(),
             cancelled: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             state: Mutex::default(),
@@ -838,18 +845,21 @@ impl Region {
         if self.cancelled.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (waiters, children) = {
+        let (foreign, children) = {
             let mut state = self.state.lock().unwrap();
             (
-                std::mem::take(&mut state.waiters),
+                std::mem::take(&mut state.foreign),
                 std::mem::take(&mut state.children),
             )
         };
-        for w in waiters.into_values() {
+        for w in foreign.into_values() {
             w.wake();
         }
         for child in children.iter().filter_map(Weak::upgrade) {
             child.cancel();
+        }
+        if let Some(run) = self.run.upgrade() {
+            run.wake_all();
         }
     }
 
@@ -859,27 +869,23 @@ impl Region {
         self.cancel();
     }
 
-    pub(crate) fn register(self: &Arc<Self>, waker: &Waker) -> CancelWait {
-        CancelWait(Some((self.clone(), self.add_waiter(waker))))
-    }
-
-    fn add_waiter(&self, waker: &Waker) -> u64 {
+    fn add_foreign(&self, waker: &Waker) -> u64 {
         let mut state = self.state.lock().unwrap();
         let key = state.next_key;
         state.next_key += 1;
-        state.waiters.insert(key, waker.clone());
+        state.foreign.insert(key, waker.clone());
         key
     }
 
-    fn update_waiter(&self, key: u64, waker: &Waker) {
+    fn update_foreign(&self, key: u64, waker: &Waker) {
         let mut state = self.state.lock().unwrap();
-        if let Some(w) = state.waiters.get(&key)
+        if let Some(w) = state.foreign.get(&key)
             && w.will_wake(waker)
         {
             return;
         }
         // A key a cancel took is put back: the caller sees the cancel next.
-        let old = state.waiters.insert(key, waker.clone());
+        let old = state.foreign.insert(key, waker.clone());
         drop(state);
         // Dropped outside the lock: dropping a waker can run any code.
         drop(old);
@@ -1110,57 +1116,36 @@ mod tests {
                 self.1.lock().unwrap().push(self.0);
             }
         }
-        let region = Region::root();
+        let region = Region::root(Weak::new());
         let log = Arc::new(Mutex::new(Vec::new()));
         for id in [8, 3, 12, 1, 9] {
-            region.add_waiter(&Waker::from(Arc::new(WakeLog(id, log.clone()))));
+            region.add_foreign(&Waker::from(Arc::new(WakeLog(id, log.clone()))));
         }
         region.cancel();
         assert_eq!(*log.lock().unwrap(), [8, 3, 12, 1, 9]);
     }
 
     #[test]
-    fn cancelling_a_child_wakes_its_waiters_without_polling_unrelated_tasks() {
+    fn cancelling_a_child_wakes_a_parent_task_waiting_on_it() {
         block_on(crate::lab(crate::Seed::from_u64(0), |fcx| async move {
-            let polls = Arc::new(AtomicUsize::new(0));
-            let counted = polls.clone();
-            fcx.spawn(move |task| async move {
+            fcx.region(|child| async move {
+                child.spawn(|task| async move {
+                    task.sleep(ms(1)).await?;
+                    task.cancel();
+                    Ok(())
+                });
+                // The region's owner is polled in the parent's task.
                 poll_fn(|_| {
-                    counted.fetch_add(1, Ordering::Relaxed);
-                    if task.is_cancelled() {
-                        Poll::Ready(Ok(()))
+                    if child.is_cancelled() {
+                        Poll::Ready(())
                     } else {
                         Poll::Pending
                     }
                 })
-                .await
-            });
-            let ended = Arc::new(AtomicBool::new(false));
-            fcx.region(|child| {
-                let parent = fcx.clone();
-                let ended = ended.clone();
-                async move {
-                    // This task belongs to the parent but waits on the child.
-                    let waiting = child.clone();
-                    let finished = ended.clone();
-                    parent.spawn(move |_| async move {
-                        waiting.cancelled().await;
-                        finished.store(true, Ordering::Relaxed);
-                        Ok(())
-                    });
-                    parent.sleep(ms(1)).await?;
-                    let before = polls.load(Ordering::Relaxed);
-                    assert_eq!(before, 1);
-                    child.cancel();
-                    parent.sleep(ms(1)).await?;
-                    assert!(ended.load(Ordering::Relaxed));
-                    assert_eq!(polls.load(Ordering::Relaxed), before);
-                    Ok(())
-                }
+                .await;
+                Ok(())
             })
-            .await?;
-            fcx.cancel();
-            Ok(())
+            .await
         }))
         .unwrap();
     }

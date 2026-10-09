@@ -2477,14 +2477,29 @@ where
     <S::Decoder as Decode>::Error: Clone + Send,
 {
     let mut result = None;
-    let slot = &mut result;
-    let _ = fcx
-        .region(|child| async move {
+    {
+        let slot = &mut result;
+        let finished = std::sync::Mutex::new(None);
+        let finished_ref = &finished;
+        let mut region = std::pin::pin!(fcx.region(|child| async move {
             *slot = Some(serve_in_region(&child, conn, info, service, state, opts).await);
-            child.cancel();
+            *finished_ref.lock().unwrap() = Some(child);
             Ok(())
+        }));
+        let _ = std::future::poll_fn(|cx| {
+            let polled = region.as_mut().poll(cx);
+            if polled.is_pending() {
+                // The connection has ended but its spawned work is still running.
+                // A region with no remaining work ends without a run-wide wake.
+                let child = finished.lock().unwrap().take();
+                if let Some(child) = child {
+                    child.cancel();
+                }
+            }
+            polled
         })
         .await;
+    }
     result.expect("the connection region completed")
 }
 

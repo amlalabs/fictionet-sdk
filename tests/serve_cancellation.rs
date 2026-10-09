@@ -92,3 +92,77 @@ fn cancelling_deferred_end_work_keeps_the_world_running() {
         .expect("lab finishes")
         .expect("the world survives connection cancellation");
 }
+
+struct SpawnWork(Arc<std::sync::atomic::AtomicBool>);
+impl Pending for SpawnWork {
+    fn poll_next(
+        &mut self,
+        driver: &mut PendingDriver<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Vec<u8>, fictionet::Error>>> {
+        let stopped = self.0.clone();
+        driver.fcx().unwrap().spawn(move |fcx| async move {
+            fcx.cancelled().await;
+            stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        Poll::Ready(None)
+    }
+}
+
+struct SpawningSvc(Arc<std::sync::atomic::AtomicBool>);
+impl Service for SpawningSvc {
+    type Decoder = Lines;
+    type State = ();
+    type Error = std::convert::Infallible;
+
+    fn decoder(&self) -> Lines {
+        Lines::new(64, Ending::LfOrCrlf)
+    }
+
+    fn on_item(
+        &mut self,
+        _: Result<Vec<u8>, LineError>,
+        _: &(),
+        driver: &mut Driver<'_>,
+    ) -> Result<Flow, Self::Error> {
+        driver.defer(SpawnWork(self.0.clone()));
+        Ok(Flow::Close)
+    }
+}
+
+#[test]
+fn finishing_a_connection_cancels_and_joins_its_spawned_work() {
+    fictionet::block_on(fictionet::lab(
+        fictionet::Seed::from_u64(2),
+        |fcx| async move {
+            let (a, b) = fictionet::pair();
+            let client = tcp::endpoint(&fcx, a, "10.0.0.2".parse()?);
+            let server = tcp::endpoint(&fcx, b, "10.0.0.1".parse()?);
+            let mut listener = server.listen(7)?;
+            fcx.spawn(move |fcx| async move {
+                let mut conn = client.connect(&fcx, "10.0.0.1:7".parse()?).await?;
+                conn.write_all(&fcx, b"bye\n").await?;
+                fcx.cancelled().await;
+                Ok(())
+            });
+            let conn = listener.accept(&fcx).await?;
+            let info = fictionet::events::ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
+            let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            serve::serve(
+                &fcx,
+                conn,
+                info,
+                &mut SpawningSvc(stopped.clone()),
+                &(),
+                &serve::ServeOptions::default(),
+            )
+            .await?;
+            assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(!fcx.is_cancelled());
+            fcx.cancel();
+            Ok(())
+        },
+    ))
+    .unwrap();
+}
