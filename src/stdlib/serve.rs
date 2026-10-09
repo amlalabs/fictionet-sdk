@@ -1493,6 +1493,8 @@ where
             if pushed == 0 && !progressed {
                 if matches!(self.pending.front(), Some(Segment::Wait(_))) {
                     queue.push_back(self.pending.pop_front().unwrap());
+                } else if matches!(self.pending.front(), Some(Segment::Bytes(_, _))) {
+                    self.stop("stuck", queue);
                 }
                 return;
             }

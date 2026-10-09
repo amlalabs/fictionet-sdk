@@ -200,6 +200,59 @@ fn decoder_upgrade_stops_faults_before_buffered_items() {
 }
 
 #[test]
+fn stuck_item_fault_decoder_passes_the_partial_item_through() {
+    use fictionet::stdlib::codec::{Ending, ItemFault, LineError, Lines, Rewrite, Rule, Trigger};
+
+    struct LargeLine {
+        seen: Vec<Vec<u8>>,
+    }
+    impl Service for LargeLine {
+        type Decoder = Lines;
+        type State = ();
+        type Error = LineError;
+        fn decoder(&self) -> Lines {
+            Lines::new(8 << 20, Ending::LfOrCrlf)
+        }
+        fn on_item(
+            &mut self,
+            item: Result<Vec<u8>, LineError>,
+            _: &(),
+            _: &mut Driver<'_, Lines>,
+        ) -> Result<Flow, LineError> {
+            self.seen.push(item?);
+            Ok(Flow::Continue)
+        }
+    }
+    let opts = ServeOptions::default().faults(FaultPlan::new(Plan {
+        items: vec![Rule {
+            when: Trigger::At(1),
+            fault: ItemFault::Action {
+                delay: None,
+                rewrite: Rewrite::Drop,
+            },
+        }],
+        ..Plan::default()
+    }));
+    let mut harness =
+        Harness::with_options(Seed::from_u64(1), LargeLine { seen: vec![] }, (), opts);
+    let bytes = vec![b'x'; (4 << 20) + 1];
+    harness.push(&bytes).unwrap();
+    assert!(harness.service().seen.is_empty());
+    harness.push(b"\n").unwrap();
+    assert_eq!(harness.service().seen.len(), 1);
+    assert_eq!(harness.service().seen[0], bytes);
+    assert_eq!(
+        harness
+            .events()
+            .iter()
+            .filter(|event| event.is("conn", "faults")
+                && event.get("stopped").and_then(|v| v.as_str()) == Some("stuck"))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn datagram_decoder_access_uses_the_current_datagram() {
     use std::{
         collections::VecDeque,
