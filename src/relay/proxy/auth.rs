@@ -1,5 +1,5 @@
-//! The sandbox's token, and checking what a client gives against it. The
-//! binary reads it from `--token-file`.
+//! Access tokens for attach proxies and the dashboard. Both commands
+//! read a token from `--token-file` and check what a client supplies.
 //!
 //! One attach serves one sandbox, so it has one token. The HTTP door takes
 //! it in `Proxy-Authorization` (Basic, with the token as the password, or
@@ -10,7 +10,7 @@
 /// The longest token: SOCKS5 carries a password in at most 255 bytes.
 pub const MAX_TOKEN: usize = 255;
 
-/// The sandbox's token.
+/// A token for an attach proxy or dashboard.
 #[derive(Clone)]
 pub struct Token(Vec<u8>);
 
@@ -21,6 +21,13 @@ impl std::fmt::Debug for Token {
 }
 
 impl Token {
+    /// Reads a token file and checks its text.
+    pub fn from_file(path: &std::path::Path) -> Result<Token, String> {
+        let text = std::fs::read(path)
+            .map_err(|e| format!("reading the token file {}: {e}", path.display()))?;
+        Self::new(&text).map_err(|e| format!("the token file {}: {e}", path.display()))
+    }
+
     /// The token in `text`, without the spaces and line ends around it.
     pub fn new(text: &[u8]) -> Result<Token, String> {
         let token = text.trim_ascii();

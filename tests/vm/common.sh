@@ -45,7 +45,11 @@ target_dir() {
 
 qemu_base=(qemu-system-x86_64 -enable-kvm -cpu host -display none -no-reboot)
 
-skip() { echo "SKIP: $*"; exit 0; }
+skip() {
+    if [ "${CI+x}" = x ]; then echo "FAIL: $* (required in CI)"; exit 1; fi
+    echo "SKIP: $*"
+    exit 0
+}
 
 # Downloads $1 to $2 and checks its SHA-512 ($3) or SHA-256 ($4).
 download() {

@@ -5,7 +5,7 @@ resolver = "3"
 
 [package]
 name = "fictionet"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 description = "A simulated internet for AI agent evals and RL environments."

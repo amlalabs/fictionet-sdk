@@ -17,6 +17,10 @@
 #      entry in `containers`, so Inspect runs its commands there. It
 #      starts once attach's startup probe passes and wait-blocked exits.
 
+# All containers share loopback. The agent can reach listeners on 127.0.0.1.
+# Keep dashboard tokens out of the agent container and authenticate other
+# services on loopback; the pod NetworkPolicy does not separate containers.
+
 # Set by Inspect on every install (`annotations.inspectTaskName`,
 # `labels.inspectSampleUUID`). Put on the StatefulSets and pods.
 annotations: {}

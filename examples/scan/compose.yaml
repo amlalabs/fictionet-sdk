@@ -85,8 +85,9 @@ services:
         condition: service_healthy
 
   dashboard:
+    secrets: [dashboard-token]
     image: fictionet-scan:dev
-    command: [fictionet, dashboard, --world, unix:/run/fictionet/sock/world.sock, --listen, "0.0.0.0:7878"]
+    command: [fictionet, dashboard, --world, unix:/run/fictionet/sock/world.sock, --listen, "0.0.0.0:7878", --token-file, /run/secrets/dashboard-token]
     ports:
       - "127.0.0.1:${SCAN_DASHBOARD_PORT:-7880}:7878"
     volumes:
@@ -97,3 +98,7 @@ services:
 
 volumes:
   sock:
+
+secrets:
+  dashboard-token:
+    file: ${SCAN_DASHBOARD_TOKEN_FILE:?Set SCAN_DASHBOARD_TOKEN_FILE to a private token file}

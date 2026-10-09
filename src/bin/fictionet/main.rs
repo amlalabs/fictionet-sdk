@@ -30,10 +30,11 @@ mod world;
 
 const USAGE: &str = "\
 usage: fictionet attach --world unix:<path> --name <name> --type tun|tap|http_proxy|socks5 [flags]
+       fictionet --version
        fictionet ready <path>
        fictionet wait-blocked [--api-server] [--timeout <seconds>] [<ip:port>...]
        fictionet observe --world unix:<path> [<request>]
-       fictionet dashboard --world unix:<path> [--listen <address:port>]
+       fictionet dashboard --world unix:<path> --token-file <path> [--listen <address:port>]
 
 Run `fictionet attach --help` for the flags, and `fictionet observe --help`
 for the requests an observer can make.
@@ -217,6 +218,7 @@ fn main() {
         Some("wait-blocked") => std::process::exit(blocked::main(&argv[1..])),
         Some("observe") => std::process::exit(observe::main(&argv[1..])),
         Some("dashboard") => std::process::exit(dashboard::main(&argv[1..])),
+        Some("--version") if argv.len() == 1 => println!("fictionet {}", env!("CARGO_PKG_VERSION")),
         Some("-h" | "--help") => println!("{USAGE}"),
         _ => {
             eprintln!("{USAGE}");

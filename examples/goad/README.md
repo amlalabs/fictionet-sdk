@@ -147,10 +147,14 @@ $ sudo ip netns exec goad-attacker nmap -Pn -sV \
 Run the dashboard against the same world socket to watch the real exchange:
 
 ```console
-$ target/release/fictionet dashboard \
+$ (umask 077; openssl rand -hex 32 > /tmp/goad-dashboard-token)
+$ target/release/fictionet dashboard --token-file /tmp/goad-dashboard-token \
     --world unix:/run/user/$(id -u)/fictionet-goad/world.sock \
     --listen 127.0.0.1:7878
 ```
+
+Open `http://127.0.0.1:7878/login?token=<token>` once, replacing `<token>`
+with the token file’s contents. Keep the file outside the attacker sandbox.
 
 This example consumes provisioned Windows disks. It includes no QEMU-based
 GOAD provisioner.

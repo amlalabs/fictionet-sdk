@@ -33,3 +33,11 @@ fn dashboard_js() {
         "{text}"
     );
 }
+
+#[path = "common/requirements.rs"]
+mod requirements;
+
+#[test]
+fn missing_node_fails_in_ci() {
+    requirements::fails_in_ci("dashboard_js");
+}

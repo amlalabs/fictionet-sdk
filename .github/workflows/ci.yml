@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
   schedule:
     - cron: '17 3 * * *'
@@ -48,6 +47,8 @@ jobs:
           tool: cargo-nextest
       - name: Build
         run: cargo build --locked --workspace --all-targets ${{ matrix.features }}
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Test
         run: cargo nextest run --locked --workspace ${{ matrix.features }}
       - name: Doctests
@@ -130,6 +131,8 @@ jobs:
         working-directory: examples/artifactory
         run: uv run --locked pytest
       - name: The Inspect package
+        env:
+          INSPECT_FICTIONET_DOCKER: "1"
         working-directory: python/inspect_fictionet
         run: uv run --locked --extra k8s pytest
       # From the crate root, so rust-toolchain.toml there, not fuzz/'s
@@ -254,3 +257,15 @@ jobs:
             docker buildx build -f "${{ matrix.dockerfile }}" "${target[@]}" .
             echo "::endgroup::"
           done
+
+  docker-test:
+    name: docker test (${{ matrix.test }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [tcpudp, web, ping]
+    steps:
+      - uses: actions/checkout@v4
+      - run: tests/docker/${{ matrix.test }}/run.sh

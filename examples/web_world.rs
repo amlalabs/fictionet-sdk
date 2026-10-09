@@ -26,7 +26,7 @@
 //!
 //! The sites record every DNS query, TLS handshake and HTTP request as an
 //! event (`dns.query`, `tls.handshake`, `http.request`). Watch them, and the
-//! whole world, with `fictionet dashboard --world unix:<socket>`: see
+//! whole world, with `fictionet dashboard --world unix:<socket> --token-file <path>`: see
 //! [`fictionet::observe`].
 //!
 //! The web test adds bulk transfers and a proxy in `tests/web_fixture`.

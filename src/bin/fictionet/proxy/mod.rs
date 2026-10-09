@@ -44,19 +44,11 @@ pub(crate) fn log(line: &str) {
     eprintln!("fictionet attach: {line}");
 }
 
-/// Reads the sandbox's token from `path`: the file's text, without the
-/// spaces and line ends around it.
-fn read_token(path: &std::path::Path) -> Result<Token, Failure> {
-    let text = std::fs::read(path)
-        .map_err(|e| Failure::Error(format!("reading the token file {}: {e}", path.display())))?;
-    Token::new(&text).map_err(|e| Failure::Error(format!("the token file {}: {e}", path.display())))
-}
-
 /// Runs a proxy type to the end. `Ok` means the world closed the
 /// connection.
 pub(crate) fn run(args: ProxyArgs) -> Result<(), Failure> {
     world::clear_ready_file(args.ready_file.as_deref());
-    let token = read_token(&args.token_file)?;
+    let token = Token::from_file(&args.token_file).map_err(Failure::Error)?;
     // Client connections run on two worker threads, and the stack (inside
     // fictionet::run) on this one. With one thread for all of it, 50
     // downloads of 16 MiB at once took 2.8 to 3.1 s; with two workers,

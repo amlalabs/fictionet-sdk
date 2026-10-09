@@ -85,6 +85,29 @@ A change to `fictionet attach` or to how a world is reached should also pass the
 Docker tests (`tests/docker/*/run.sh`), and for the Helm chart, the Kubernetes test
 (`tests/k8s/run.sh`). Each script builds what it needs, checks, and cleans up.
 
+CI runs the TCP/UDP, web and ping Docker scripts on every push and pull
+request. The nightly integration workflow runs the Docker proxy, both kind
+tests and the QEMU VM test, with its prepared image cached. Nested VM and
+gVisor tests remain manual. Missing host capabilities fail when `CI` is set.
+
+## Releases
+
+Set the package version in `Cargo.toml` and refresh the lockfiles with Cargo.
+Run the checks above, check `fictionet --version`, and check the observer's
+`world` reply. Both report the package version.
+
+Give this repository Actions write access to the `fictionet-attach` and
+`fictionet-web-world` packages in GHCR before the first release. After the
+release commit passes CI, a maintainer creates and pushes the matching tag,
+such as `v0.1.0`. The release workflow checks the tag against `Cargo.toml`,
+logs into GHCR with `GITHUB_TOKEN`, and publishes both `deploy/Dockerfile`
+targets for `linux/amd64` and `linux/arm64`. The image tags include the `v`,
+for example `ghcr.io/amlalabs/fictionet-attach:v0.1.0`.
+
+Check that both published images contain both architectures and smoke-test
+them before updating the Inspect package's image pins in a separate change. Creating a local release commit
+does not publish images; pushing a version tag does.
+
 ## Adding a protocol module
 
 A protocol is one file in `src/stdlib/`, declared with `pub mod` in

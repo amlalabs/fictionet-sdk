@@ -110,6 +110,9 @@
 //! 8. It moves packets until the world closes the connection, and then
 //!    exits with status 0. SIGTERM, SIGINT or SIGHUP also stop it. Either
 //!    way, the device goes away and the world sees the sandbox detach.
+//!    Attach does not reconnect. In Compose, the agent loses its network
+//!    until the harness restarts the setup. Restarting the world also
+//!    loses its in-memory state.
 //!
 //! **`tun0` is the only way out when nothing else is.** Attach adds the
 //! default routes through `tun0` and takes down the links named with
@@ -394,7 +397,10 @@
 //! a custom chart, and any other harness can install it with `helm`. Each
 //! entry under `services` becomes one pod with three containers. All the
 //! containers of a pod share one network namespace, so attach makes `tun0`
-//! in the agent's namespace without `--netns`.
+//! in the agent's namespace without `--netns`. The agent can also reach
+//! every listener on the pod's loopback. Keep dashboard tokens outside
+//! the agent container and authenticate other loopback services; the pod's
+//! NetworkPolicy does not separate its containers.
 //!
 //! - **The agent's container** is the first entry in `containers`, so
 //!   Inspect runs its commands there. Every capability is dropped,

@@ -15,15 +15,24 @@ here=$(cd "$(dirname "$0")" && pwd)
 out=$(realpath -m "${1:-$here/recording}")
 project=${SCAN_PROJECT:-fn-scan-demo}
 export SCAN_DASHBOARD_PORT=${SCAN_DASHBOARD_PORT:-7880}
+token_dir=$(mktemp -d)
+export SCAN_DASHBOARD_TOKEN_FILE="$token_dir/token"
+umask 077
+od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$SCAN_DASHBOARD_TOKEN_FILE"
 compose=(docker compose -p "$project" -f "$here/compose.yaml")
 
-cleanup() { [ "${KEEP:-}" = 1 ] || "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true; }
+cleanup() {
+    if [ "${KEEP:-}" != 1 ]; then
+        "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+        rm -rf "$token_dir"
+    fi
+}
 trap cleanup EXIT
 
 "${compose[@]}" build
 "${compose[@]}" up -d --wait
 url="http://127.0.0.1:$SCAN_DASHBOARD_PORT/"
-for _ in $(seq 50); do curl -fs "$url" >/dev/null && break; sleep 0.2; done
+for _ in $(seq 50); do curl -fs -H "Authorization: Bearer $(cat "$SCAN_DASHBOARD_TOKEN_FILE")" "$url" >/dev/null && break; sleep 0.2; done
 
 mkdir -p "$out"
 uv run -q --with playwright python "$here/record.py" "$url" "$out" "${compose[@]}"

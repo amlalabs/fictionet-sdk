@@ -14,6 +14,7 @@ import asyncio
 import os
 import shutil
 import sys
+import urllib.parse
 from pathlib import Path
 
 from playwright.async_api import async_playwright
@@ -201,6 +202,8 @@ async def main():
         )
         page = await context.new_page()
         page.on("pageerror", lambda e: print("page error:", e, file=sys.stderr))
+        token = Path(os.environ["SCAN_DASHBOARD_TOKEN_FILE"]).read_text().strip()
+        await page.goto(URL + "login?token=" + urllib.parse.quote(token, safe=""))
         await page.goto(URL + "?theme=light")
         # A fresh layout: no places or open groups from an earlier visit.
         await page.evaluate("() => localStorage.clear()")

@@ -39,11 +39,14 @@ step "Start the dashboard"
 note "fictionet dashboard connects to the world's socket as an observer: the world needs no"
 note "flag of its own. In the VM it listens on port 7878, which vm/run forwards to"
 note "127.0.0.1:$host_port on your machine, and nowhere else."
-fictionet dashboard --world unix:/run/fictionet/world.sock --listen 0.0.0.0:7878 >/run/dashboard.log 2>&1 &
+umask 077
+token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+printf '%s\n' "$token" > /run/fictionet/dashboard-token
+fictionet dashboard --token-file /run/fictionet/dashboard-token --world unix:/run/fictionet/world.sock --listen 0.0.0.0:7878 >/run/dashboard.log 2>&1 &
 dash_pid=$!
 for _ in $(seq 50); do grep -q serving /run/dashboard.log && break; sleep 0.1; done
 sed 's/^/    /' /run/dashboard.log
-vm "curl -sS -H 'Host: 127.0.0.1:$host_port' http://127.0.0.1:7878/ | grep -o '<title>[^<]*'"
+vm "curl -sS -H 'Authorization: Bearer $token' -H 'Host: 127.0.0.1:$host_port' http://127.0.0.1:7878/ | grep -o '<title>[^<]*'"
 
 step "Some traffic from the sandbox"
 note "A loop in the sandbox looks up names and fetches pages every second, so the graph has"
@@ -65,7 +68,7 @@ note "or not anyone watches. The watch request shows the latest, then each new o
 vm "{ timeout 4 fictionet observe --world unix:/run/fictionet/world.sock watch || true; } | jq -c 'select(.event == \"event\") | .data | {source, kind, summary}' | sed -n 1,4p"
 
 step "Open the dashboard"
-printf '\n    %shttp://127.0.0.1:%s/%s\n\n' "$bold" "$host_port" "$reset"
+printf '\n    %shttp://127.0.0.1:%s/login?token=%s%s\n\n' "$bold" "$host_port" "$token" "$reset"
 if [[ -z $seconds && -t 0 ]]; then
     note "The sandbox keeps making requests while you look. Press Enter to stop."
     read -r _

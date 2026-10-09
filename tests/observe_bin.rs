@@ -58,7 +58,7 @@ fn get(port: u16, path: &str) -> (String, String) {
     let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
     write!(
         conn,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer dashboard-test-token\r\n\r\n"
     )
     .unwrap();
     let mut all = String::new();
@@ -80,6 +80,11 @@ fn observe_prints_json_lines() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(
         text.starts_with(r#"{"observe":1,"#) && text.ends_with("}\n"),
+        "{text}"
+    );
+
+    assert!(
+        text.contains(&format!("\"fictionet\":\"{}\"", env!("CARGO_PKG_VERSION"))),
         "{text}"
     );
 
@@ -142,8 +147,18 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
     let path = temp_socket();
     let _listening = start_world(&path);
     let world = format!("unix:{path}");
+    let token_file = format!("{path}.token");
+    std::fs::write(&token_file, "dashboard-test-token\n").unwrap();
     let mut child = Command::new(BIN)
-        .args(["dashboard", "--world", &world, "--listen", "127.0.0.1:0"])
+        .args([
+            "dashboard",
+            "--world",
+            &world,
+            "--listen",
+            "127.0.0.1:0",
+            "--token-file",
+            &token_file,
+        ])
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -159,6 +174,41 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
         .parse()
         .unwrap();
 
+    std::fs::remove_file(&token_file).unwrap();
+    for route in ["/", "/api/keylog", "/api/graph", "/api/watch", "/api/pcap"] {
+        assert!(raw_get(port, route, "").starts_with("HTTP/1.1 401"));
+        assert!(
+            raw_get(port, route, "Authorization: Bearer wrong\r\n").starts_with("HTTP/1.1 401")
+        );
+    }
+    assert!(raw_get(port, "/login?token=wrong", "").starts_with("HTTP/1.1 401"));
+    let login = raw_get(port, "/login?token=dashboard-test-token", "");
+    assert!(login.starts_with("HTTP/1.1 303"), "{login}");
+    assert!(login.contains("HttpOnly; SameSite=Strict"));
+    assert!(login.contains("Location: /\r\n"));
+    let cookie = login
+        .lines()
+        .find_map(|line| line.strip_prefix("Set-Cookie: "))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    assert!(
+        raw_get(port, "/api/keylog", &format!("Cookie: {cookie}\r\n")).starts_with("HTTP/1.1 200")
+    );
+    assert!(raw_get(port, "/login?token=dashboard-test-token", "").starts_with("HTTP/1.1 401"));
+    assert!(
+        raw_get(port, "/api/keylog", "Cookie: fictionet_token=wrong\r\n")
+            .starts_with("HTTP/1.1 401")
+    );
+    assert!(
+        raw_get(
+            port,
+            "/api/keylog",
+            "Authorization: Bearer dashboard-test-token\r\nOrigin: http://other.example\r\n"
+        )
+        .starts_with("HTTP/1.1 403")
+    );
     let (status, body) = get(port, "/");
     assert_eq!(status, "HTTP/1.1 200 OK");
     assert!(body.contains("app.js"));
@@ -176,7 +226,7 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
     let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    write!(conn, "GET /api/watch HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    write!(conn, "GET /api/watch HTTP/1.1\r\nHost: localhost\r\nCookie: fictionet_token=dashboard-test-token\r\n\r\n").unwrap();
     let mut events = BufReader::new(conn);
     let mut seen = Vec::new();
     while seen.len() < 4 {
@@ -257,6 +307,8 @@ fn start_two_links(path: &str) -> fictionet::Listening {
 #[test]
 fn the_dashboard_merges_the_packets_of_several_links() {
     let path = temp_socket();
+    let token_file = format!("{path}.token");
+    std::fs::write(&token_file, "dashboard-test-token\n").unwrap();
     let _listening = start_two_links(&path);
     let world = format!("unix:{path}");
     /// Stops the dashboard however the test ends.
@@ -269,7 +321,15 @@ fn the_dashboard_merges_the_packets_of_several_links() {
     }
     let mut child = Stop(
         Command::new(BIN)
-            .args(["dashboard", "--world", &world, "--listen", "127.0.0.1:0"])
+            .args([
+                "dashboard",
+                "--world",
+                &world,
+                "--listen",
+                "127.0.0.1:0",
+                "--token-file",
+                &token_file,
+            ])
             .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
@@ -285,6 +345,7 @@ fn the_dashboard_merges_the_packets_of_several_links() {
         .trim_end_matches('/')
         .parse()
         .unwrap();
+    std::fs::remove_file(&token_file).unwrap();
     assert_eq!(get(port, "/groups.js").0, "HTTP/1.1 200 OK");
 
     // The two links, and the group their echo tasks are in.
@@ -307,7 +368,7 @@ fn the_dashboard_merges_the_packets_of_several_links() {
         .unwrap();
     write!(
         conn,
-        "GET /api/packets?link={both} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        "GET /api/packets?link={both} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer dashboard-test-token\r\n\r\n"
     )
     .unwrap();
     let mut events = BufReader::new(conn);
@@ -341,7 +402,7 @@ fn the_dashboard_merges_the_packets_of_several_links() {
     let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
     write!(
         conn,
-        "GET /api/pcap?link={both} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        "GET /api/pcap?link={both} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer dashboard-test-token\r\n\r\n"
     )
     .unwrap();
     let mut all = Vec::new();
@@ -423,4 +484,58 @@ fn a_watch_exits_0_when_the_world_ends() {
             .ends_with(r#"{"event":"end","data":{"reason":"the world ended"}}"#),
         "{out}"
     );
+}
+
+fn raw_get(port: u16, path: &str, headers: &str) -> String {
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        conn,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    conn.read_to_string(&mut response).unwrap();
+    response
+}
+
+#[test]
+fn version_reports_the_package_version() {
+    let out = Command::new(BIN).arg("--version").output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("fictionet {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn dashboard_requires_a_readable_valid_token_file() {
+    let path = format!("{}.token", temp_socket());
+    for invalid in [b"\n".as_slice(), b"two words", &[b'x'; 256]] {
+        std::fs::write(&path, invalid).unwrap();
+        let out = Command::new(BIN)
+            .args([
+                "dashboard",
+                "--world",
+                "unix:/nonexistent-world",
+                "--token-file",
+                &path,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("the token file"));
+    }
+    std::fs::remove_file(path).unwrap();
+    for extra in [vec![], vec!["--token-file", "/nonexistent-fictionet-token"]] {
+        let out = Command::new(BIN)
+            .args(["dashboard", "--world", "unix:/nonexistent-world"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("token"));
+    }
 }

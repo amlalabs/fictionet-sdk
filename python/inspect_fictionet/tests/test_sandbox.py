@@ -195,7 +195,7 @@ def test_missing_dockerfile(tmp_path):
 
 
 def test_k8s_values(tmp_path):
-    pytest.importorskip("k8s_sandbox")
+    require_k8s()
     spec = fictionet_sandbox(WEB_WORLD_IMAGE, backend="k8s", agent_image="agent:1", agent_user="1000:1000",
                              image_pull_policy="Never", cache_dir=tmp_path, **WEB)  # fmt: skip
     assert spec.type == "k8s"
@@ -226,13 +226,13 @@ def test_k8s_values(tmp_path):
 
 
 def test_k8s_refuses_builds(tmp_path):
-    pytest.importorskip("k8s_sandbox")
+    require_k8s()
     with pytest.raises(ValueError, match="images only"):
         fictionet_sandbox(CargoExample("web_world", crate=REPO), backend="k8s", cache_dir=tmp_path)
 
 
 def test_k8s_proxy(tmp_path):
-    pytest.importorskip("k8s_sandbox")
+    require_k8s()
     spec = fictionet_sandbox(WEB_WORLD_IMAGE, backend="k8s", attach="socks5", attach_image=BRANCH_ATTACH,
                              proxy_port=1081, cache_dir=tmp_path)  # fmt: skip
     a = yaml.safe_load(spec.config.values.read_text())["attach"]
@@ -240,11 +240,14 @@ def test_k8s_proxy(tmp_path):
     assert "ipAddrV6" not in a
 
 
-@pytest.mark.skipif(not (REPO / "charts" / "fictionet-sandbox").is_dir(), reason="not in the repository")
 def test_the_wheel_holds_the_chart(tmp_path):
     """A wheel built from the sdist, as `uv build` makes it, holds every
     file of charts/fictionet-sandbox, unchanged."""
+    if not (REPO / "charts" / "fictionet-sandbox").is_dir():
+        assert "CI" not in os.environ, "repository chart is required in CI"
+        pytest.skip("not in the repository")
     if shutil.which("uv") is None:
+        assert "CI" not in os.environ, "uv is required in CI"
         pytest.skip("needs uv")
     package = Path(__file__).resolve().parents[1]
     subprocess.run(["uv", "build", "--quiet", "--out-dir", str(tmp_path), str(package)], check=True)
@@ -265,7 +268,7 @@ def test_cache_dir_default(monkeypatch, tmp_path):
 
 
 def test_k8s_values_merge(tmp_path):
-    pytest.importorskip("k8s_sandbox")
+    require_k8s()
     spec = fictionet_sandbox(WEB_WORLD_IMAGE, backend="k8s", cache_dir=tmp_path,
                              k8s_values={"attach": {"runAsUser": 0}, "networkPolicy": {"enabled": True},
                                          "services": {"default": {"world": {"securityContext": {}}}}})  # fmt: skip
@@ -323,7 +326,7 @@ def test_limits_are_configurable(tmp_path):
 
 
 def test_k8s_limits(tmp_path):
-    pytest.importorskip("k8s_sandbox")
+    require_k8s()
     spec = fictionet_sandbox(WEB_WORLD_IMAGE, backend="k8s", cache_dir=tmp_path,
                              agent_limits=Limits(memory="128m", cpus=0.05), world_limits=Limits())  # fmt: skip
     svc = yaml.safe_load(spec.config.values.read_text())["services"]["default"]
@@ -413,14 +416,14 @@ def test_ca_dir_follows_posix_rules_on_any_host(monkeypatch):
 
 
 def test_k8s_tiny_cpu_limit(tmp_path):
-    pytest.importorskip("k8s_sandbox")
+    require_k8s()
     spec = fictionet_sandbox(WEB_WORLD_IMAGE, backend="k8s", cache_dir=tmp_path, agent_limits=Limits(cpus=0.0014))
     res = yaml.safe_load(spec.config.values.read_text())["services"]["default"]["resources"]
     assert res == {"requests": {"cpu": "1m"}, "limits": {"cpu": "1m"}}
 
 
 @pytest.mark.skipif(
-    os.environ.get("INSPECT_FICTIONET_DOCKER") != "1",
+    os.environ.get("INSPECT_FICTIONET_DOCKER") != "1" and "CI" not in os.environ,
     reason="builds images with Docker; set INSPECT_FICTIONET_DOCKER=1",
 )
 def test_edited_source_is_rebuilt(tmp_path):
@@ -454,3 +457,26 @@ def test_edited_source_is_rebuilt(tmp_path):
         assert build_and_read() == "two\n"
     finally:
         subprocess.run(["docker", "rmi", "-f", image], capture_output=True)
+
+
+def require_k8s():
+    if "CI" in os.environ:
+        __import__("k8s_sandbox")
+    else:
+        pytest.importorskip("k8s_sandbox")
+
+
+def test_missing_k8s_dependency_fails_in_ci(monkeypatch):
+    import builtins
+
+    original = builtins.__import__
+
+    def missing(name, *args, **kwargs):
+        if name == "k8s_sandbox":
+            raise ModuleNotFoundError("No module named 'k8s_sandbox'")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setenv("CI", "")
+    monkeypatch.setattr(builtins, "__import__", missing)
+    with pytest.raises(ModuleNotFoundError, match="k8s_sandbox"):
+        require_k8s()

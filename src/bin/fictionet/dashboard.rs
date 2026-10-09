@@ -18,23 +18,27 @@
 use std::io::{self, BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fictionet::relay::observer::Client;
+use fictionet::relay::proxy::auth::Token;
 
 use crate::observe::{take_world, world_path};
 
 pub(crate) const USAGE: &str = "\
-usage: fictionet dashboard --world unix:<path> [--listen <address:port>]
+usage: fictionet dashboard --world unix:<path> --token-file <path> [--listen <address:port>]
 
 Serves the dashboard, a live view of the world on <path>, at
 http://127.0.0.1:7878/ (or --listen). It connects to the world socket as an
 observer, so the world needs no flag of its own.
 
 The dashboard shows everything the world carries, decrypted TLS included.
-Anyone who can open its address can see it, so keep it on 127.0.0.1 unless
-the network it listens on is yours alone.";
+The token file is required. Open /login?token=<URL-encoded-token> once to
+set an HttpOnly session cookie, or send Authorization: Bearer <token>.
+Restart the dashboard to use the login URL again. Keep the token outside
+the sandbox. Use loopback or a trusted TLS tunnel; HTTP carries the token
+in plaintext. Containers in one Kubernetes pod share loopback.";
 
 const INDEX_HTML: &str = include_str!("../../../dashboard/index.html");
 const APP_JS: &str = include_str!("../../../dashboard/app.js");
@@ -56,15 +60,30 @@ pub(crate) fn main(args: &[String]) -> i32 {
     }
     let parsed = take_world(args).and_then(|(world, rest)| {
         let path = world_path(&world)?;
-        let listen = match rest.as_slice() {
-            [] => "127.0.0.1:7878".to_owned(),
-            [flag, addr] if flag == "--listen" => addr.clone(),
-            [flag] if flag.starts_with("--listen=") => flag["--listen=".len()..].to_owned(),
-            _ => return Err(format!("unexpected arguments: {}", rest.join(" "))),
-        };
-        Ok((path, listen))
+        let mut listen = "127.0.0.1:7878".to_owned();
+        let mut token_file = None;
+        let mut args = rest.iter();
+        while let Some(arg) = args.next() {
+            let (flag, value) = match arg.split_once('=') {
+                Some(pair) => pair,
+                None => (
+                    arg.as_str(),
+                    args.next()
+                        .ok_or_else(|| format!("{arg} needs a value"))?
+                        .as_str(),
+                ),
+            };
+            match flag {
+                "--listen" => listen = value.to_owned(),
+                "--token-file" if token_file.is_none() => token_file = Some(value.to_owned()),
+                _ => return Err(format!("unexpected argument: {flag}")),
+            }
+        }
+        let token_file = token_file.ok_or("--token-file is required")?;
+        let token = Token::from_file(std::path::Path::new(&token_file))?;
+        Ok((path, listen, token))
     });
-    let (path, listen) = match parsed {
+    let (path, listen, token) = match parsed {
         Ok(p) => p,
         Err(msg) => {
             eprintln!("fictionet dashboard: {msg}");
@@ -91,6 +110,10 @@ pub(crate) fn main(args: &[String]) -> i32 {
         .expect("a bound listener has an address");
     println!("fictionet dashboard: serving the world at {path} on http://{bound}/");
     let path: Arc<str> = path.into();
+    let auth = Arc::new(Auth {
+        token,
+        login_used: AtomicBool::new(false),
+    });
     let connections = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
@@ -98,9 +121,9 @@ pub(crate) fn main(args: &[String]) -> i32 {
             connections.fetch_sub(1, Ordering::SeqCst);
             continue;
         }
-        let (path, connections) = (path.clone(), connections.clone());
+        let (path, connections, auth) = (path.clone(), connections.clone(), auth.clone());
         std::thread::spawn(move || {
-            let _ = serve(&path, bound, conn);
+            let _ = serve(&path, bound, conn, &auth);
             connections.fetch_sub(1, Ordering::SeqCst);
         });
     }
@@ -117,6 +140,8 @@ pub(crate) struct Request {
     /// site a request comes from.
     pub(crate) fetch_site: Option<String>,
     pub(crate) origin: Option<String>,
+    authorization: Option<String>,
+    cookie: Option<String>,
 }
 
 pub(crate) fn parse_request(buf: &[u8]) -> Option<Request> {
@@ -135,12 +160,15 @@ pub(crate) fn parse_request(buf: &[u8]) -> Option<Request> {
         })
         .collect();
     let (mut host, mut fetch_site, mut origin) = (None, None, None);
+    let (mut authorization, mut cookie) = (None, None);
     for line in lines {
         let Some((k, v)) = line.split_once(':') else {
             continue;
         };
         let v = Some(v.trim().to_owned());
         match k.trim().to_ascii_lowercase().as_str() {
+            "authorization" => authorization = v,
+            "cookie" => cookie = v,
             "host" => host = v,
             "sec-fetch-site" => fetch_site = v,
             "origin" => origin = v,
@@ -154,6 +182,8 @@ pub(crate) fn parse_request(buf: &[u8]) -> Option<Request> {
         host,
         fetch_site,
         origin,
+        authorization,
+        cookie,
     })
 }
 
@@ -269,7 +299,44 @@ fn respond(
     conn.flush()
 }
 
-fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream) -> io::Result<()> {
+struct Auth {
+    token: Token,
+    login_used: AtomicBool,
+}
+
+impl Auth {
+    fn login(&self, req: &Request) -> Option<String> {
+        let [(key, value)] = req.query.as_slice() else {
+            return None;
+        };
+        if key != "token"
+            || !self.token.matches(value.as_bytes())
+            || self.login_used.swap(true, Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some(value.bytes().map(|b| format!("%{b:02X}")).collect())
+    }
+
+    fn allows(&self, req: &Request) -> bool {
+        let bearer = req.authorization.as_deref().is_some_and(|value| {
+            value.split_once(' ').is_some_and(|(scheme, token)| {
+                scheme.eq_ignore_ascii_case("Bearer") && self.token.matches(token.trim().as_bytes())
+            })
+        });
+        let cookie = req.cookie.as_deref().is_some_and(|cookies| {
+            cookies.split(';').any(|cookie| {
+                cookie
+                    .trim()
+                    .strip_prefix("fictionet_token=")
+                    .is_some_and(|value| self.token.matches(unescape(value).as_bytes()))
+            })
+        });
+        bearer || cookie
+    }
+}
+
+fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io::Result<()> {
     conn.set_read_timeout(Some(Duration::from_secs(10)))?;
     // A browser that stops reading is given up on.
     conn.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -300,6 +367,44 @@ fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream) -> io::Result<()> 
             text,
             b"GET only\n",
             "Allow: GET\r\n",
+        );
+    }
+    if !same_site(&req) {
+        return respond(
+            &mut conn,
+            "403 Forbidden",
+            text,
+            b"cross-site request\n",
+            "",
+        );
+    }
+    if req.path == "/login" {
+        if let Some(cookie) = auth.login(&req) {
+            return respond(
+                &mut conn,
+                "303 See Other",
+                text,
+                b"",
+                &format!(
+                    "Location: /\r\nSet-Cookie: fictionet_token={cookie}; Path=/; HttpOnly; SameSite=Strict\r\n"
+                ),
+            );
+        }
+        return respond(
+            &mut conn,
+            "401 Unauthorized",
+            text,
+            b"invalid or used login URL\n",
+            "",
+        );
+    }
+    if !auth.allows(&req) {
+        return respond(
+            &mut conn,
+            "401 Unauthorized",
+            text,
+            b"dashboard token required\n",
+            "WWW-Authenticate: Bearer\r\n",
         );
     }
     match req.path.as_str() {
@@ -339,13 +444,6 @@ fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream) -> io::Result<()> 
             "",
         ),
         path => match path.strip_prefix("/api/") {
-            Some(_) if !same_site(&req) => respond(
-                &mut conn,
-                "403 Forbidden",
-                text,
-                b"cross-site request\n",
-                "",
-            ),
             Some(op)
                 if !op.is_empty() && op.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
             {
@@ -713,5 +811,64 @@ mod tests {
         let any: SocketAddr = "0.0.0.0:7878".parse().unwrap();
         assert!(host_allowed(Some("10.0.0.5:7878"), any));
         assert!(!host_allowed(Some("evil.example"), any));
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    fn auth() -> Auth {
+        Auth {
+            token: Token::new(b"secret+;/token").unwrap(),
+            login_used: AtomicBool::new(false),
+        }
+    }
+
+    fn request(target: &str, headers: &str) -> Request {
+        parse_request(
+            format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n").as_bytes(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn loopback_keylog_needs_a_token() {
+        let auth = auth();
+        let req = request("/api/keylog", "");
+        assert!(host_allowed(
+            req.host.as_deref(),
+            "127.0.0.1:7878".parse().unwrap()
+        ));
+        assert!(same_site(&req));
+        assert!(!auth.allows(&req));
+        assert!(!auth.allows(&request("/api/keylog", "Authorization: Bearer wrong\r\n")));
+        assert!(!auth.allows(&request("/api/keylog", "Cookie: fictionet_token=wrong\r\n")));
+        assert!(auth.allows(&request(
+            "/api/keylog",
+            "Authorization: Bearer secret+;/token\r\n"
+        )));
+    }
+
+    #[test]
+    fn login_is_consumed_once_and_its_cookie_authenticates_streams() {
+        let auth = auth();
+        assert!(auth.login(&request("/login?token=wrong", "")).is_none());
+        assert!(
+            auth.login(&request(
+                "/login?token=secret%2B%3B%2Ftoken&token=wrong",
+                ""
+            ))
+            .is_none()
+        );
+        let req = request("/login?token=secret%2B%3B%2Ftoken", "");
+        let cookie = auth.login(&req).unwrap();
+        assert!(!cookie.contains(';'));
+        assert!(auth.login(&req).is_none());
+        let headers = format!("Cookie: theme=light; fictionet_token={cookie}\r\n");
+        assert!(auth.allows(&request("/api/watch", &headers)));
+        assert!(auth.allows(&request("/api/packets?link=e1", &headers)));
+        assert!(auth.allows(&request("/api/pcap?link=e1", &headers)));
+        assert!(!auth.allows(&request("/api/keylog?token=secret%2B%3B%2Ftoken", "")));
     }
 }

@@ -25,8 +25,9 @@ COPY benches benches
 COPY codegen codegen
 COPY tests/copy_and_own tests/copy_and_own
 COPY examples examples
+ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target,id=fictionet-musl-target \
+    --mount=type=cache,target=/src/target,id=fictionet-musl-target-${TARGETARCH} \
     # Copied files may keep old times, and cargo would then take the
     # cached build for current. Touch them so it compares contents anew.
     find src examples -type f -exec touch {} + \

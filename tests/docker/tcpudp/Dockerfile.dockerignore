@@ -7,5 +7,6 @@
 !benches
 !codegen
 !tests/copy_and_own
+!tests/common
 !tests/tun_linux.rs
 !examples

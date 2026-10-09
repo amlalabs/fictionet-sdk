@@ -10,12 +10,21 @@
 //! # The dashboard
 //!
 //! With a world running on `/run/fictionet/world.sock`, start the dashboard
-//! next to it and open the address it prints:
+//! next to it with a private token file:
 //!
 //! ```text
-//! $ fictionet dashboard --world unix:/run/fictionet/world.sock
+//! $ (umask 077; openssl rand -hex 32 > /run/fictionet/dashboard-token)
+//! $ fictionet dashboard --world unix:/run/fictionet/world.sock --token-file /run/fictionet/dashboard-token
 //! fictionet dashboard: serving the world at /run/fictionet/world.sock on http://127.0.0.1:7878/
 //! ```
+//!
+//! Open `http://127.0.0.1:7878/login?token=<token>` with the file's token.
+//! Percent-encode the token if it contains URL punctuation. This URL works
+//! once per dashboard process and sets an HttpOnly, SameSite=Strict cookie.
+//! The browser then uses that cookie for the app, streams and downloads.
+//! Restart the dashboard to sign in again. Scripts can send
+//! `Authorization: Bearer <token>` instead. All requests, including
+//! `/api/keylog` from loopback, require authentication.
 //!
 //! This is the `web_world` example with one sandbox, `agent`, fetching
 //! pages with `curl`:
@@ -53,7 +62,10 @@
 //! The dashboard shows everything the world carries, including the
 //! decrypted contents of HTTPS. It listens on 127.0.0.1, where only
 //! programs on the same machine can reach it. `--listen <ip:port>` picks
-//! another address. Give it one on a network you trust.
+//! another address. HTTP carries the token in plaintext, so use loopback
+//! or a trusted TLS tunnel. Keep the token and the world socket outside
+//! the sandbox. Containers in one Kubernetes pod share loopback; binding
+//! there does not keep the agent out.
 //!
 //! # From a shell
 //!

@@ -59,11 +59,18 @@ group too.
   scans and pings, and the compose file grants it. The scanner does not
   see the world socket.
 - `dashboard` runs `fictionet dashboard` on the socket, published on
-  `127.0.0.1:7880` only (`SCAN_DASHBOARD_PORT` picks another port).
+  `127.0.0.1:7880` only (`SCAN_DASHBOARD_PORT` picks another port). Its
+  token file is mounted only in the dashboard container.
+
+Open `http://127.0.0.1:7880/login?token=<token>` once, using the token
+from the file below. It sets a session cookie for the dashboard. Restart
+the dashboard to sign in again. Keep the token outside the sandboxes.
 
 From this folder:
 
 ```text
+$ export SCAN_DASHBOARD_TOKEN_FILE=$(mktemp)
+$ (umask 077; openssl rand -hex 32 > "$SCAN_DASHBOARD_TOKEN_FILE")
 $ docker compose up -d --build --wait
 $ docker compose exec scanner nmap -sn -n 10.0.0.0/24
 Starting Nmap 7.93 ( https://nmap.org ) at 2026-10-03 04:07 UTC
