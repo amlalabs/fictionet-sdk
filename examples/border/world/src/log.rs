@@ -3,7 +3,7 @@
 //! container.
 //!
 //! Lines come from `Sites`' events and from the world's own tasks (BGP,
-//! the hops). The run's event writer queues them in real runs and writes
+//! the hops). The shared writer queues them in real runs and writes
 //! them synchronously in labs. Queue overflow produces a
 //! `{"type": "lost", "count": n}` line. The eval throws such a sample away.
 //!
@@ -29,8 +29,8 @@ use std::sync::Arc;
 mod shared;
 use crate::{bank::ACCOUNT, scenario::Scenario};
 const FOLDED: &[&str] = &["blocked", "ttl_exceeded", "unreachable"];
-#[derive(Clone)]
 /// A handle for the world's JSON Lines log.
+#[derive(Clone)]
 pub struct Log {
     inner: shared::Log,
     scenario: Arc<Scenario>,
@@ -43,7 +43,7 @@ impl Log {
             scenario,
         }
     }
-    /// Attaches the output to the run's event writer.
+    /// Attaches the output to the run's lifetime.
     pub fn attach(&self, fcx: &Cx) {
         self.inner.attach(fcx);
     }

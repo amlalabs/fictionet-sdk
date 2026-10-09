@@ -314,7 +314,7 @@
 //! | [`tcp_reassembly`] | TCP capture reassembly for observers: ordered bytes, gaps and end signals. |  |  |  |  |  | yes | yes |
 //! | [`tds`] | TDS, the SQL Server protocol: packets, logins, SQL batches and response tokens. | yes | yes | `TokenReader` |  |  | yes | yes |
 //! | [`telnet`] | Telnet data and commands, option negotiation, terminal type and window size. | yes | yes | `Negotiation` |  |  | yes | yes |
-//! | [`test_support`] | Shared test data, timing and contract checks. |  | yes |  |  |  |  | yes |
+//! | [`test_support`] | Shared test data, timing and contract checks. |  |  |  |  |  |  | yes |
 //! | [`tftp`] | TFTP packets, option negotiation, and one read transfer served. | yes | yes | `ReadTransfer` |  |  | yes | yes |
 //! | [`thrift`] | Apache Thrift messages and values in the binary and compact protocols, and the framed transport. | yes | yes |  |  |  | yes | yes |
 //! | [`tls`] | The server side of a TLS connection, played by the world with rustls. The world picks the certificate after the client hello. |  |  |  |  | built in | yes | yes |

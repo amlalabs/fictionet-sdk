@@ -15,7 +15,7 @@ impl Log {
             |s| s,
         )))
     }
-    /// Attaches the output to the run's event writer.
+    /// Attaches the output to the run's lifetime.
     pub fn attach(&self, fcx: &fictionet::Cx) {
         self.0.attach(fcx);
     }

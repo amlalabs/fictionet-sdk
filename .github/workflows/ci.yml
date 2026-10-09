@@ -119,6 +119,8 @@ jobs:
         run: cargo test --locked --manifest-path examples/artifactory/world/Cargo.toml
       - name: The adaptive web's world
         run: cargo test --locked --manifest-path examples/adaptive-web/world/Cargo.toml
+      - name: Example log readers
+        run: python3 -m unittest discover -s examples/common -p test_logs.py
       - name: The adaptive web's backend
         working-directory: examples/adaptive-web/world/backend
         run: python3 -m unittest discover tests

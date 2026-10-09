@@ -6,8 +6,8 @@
 //!
 //! - the module list against the files in `src/stdlib/`;
 //! - **Wire**, **Decode** (including `Prefixed`) and **Service** against the `impl` blocks in the
-//!   module's file (doc comments and other comments are skipped first, so a
-//!   doctest's example impl does not count);
+//!   module's file, excluding private types (comments are skipped first,
+//!   so a doctest's example impl does not count);
 //! - **State** against the `pub struct` and `pub enum` declarations;
 //! - **Observe** against the built-ins the default registry gets in
 //!   `src/observe/app.rs`; no module implements `Present`, which belongs
@@ -189,6 +189,24 @@ fn declares(code: &str, name: &str) -> bool {
         .any(|kw| idents_after(code, kw).contains(name))
 }
 
+// Macro-generated types are checked by their modules' compile tests. Exclude
+// explicit private declarations while retaining those generated impls.
+fn catalog_type(code: &str, name: &str) -> bool {
+    declares(code, name)
+        || !["struct ", "enum "]
+            .iter()
+            .any(|keyword| idents_after(code, keyword).contains(name))
+}
+
+#[test]
+fn private_helpers_do_not_count_as_catalog_types() {
+    let source = "struct DnsQueries; struct Dns; pub struct Public; pub(crate) struct Internal;";
+    assert!(!catalog_type(source, "DnsQueries"));
+    assert!(!catalog_type(source, "Dns"));
+    assert!(!catalog_type(source, "Internal"));
+    assert!(catalog_type(source, "Public"));
+}
+
 fn hidden_modules() -> BTreeSet<&'static str> {
     let lines: Vec<&str> = MOD_RS.lines().collect();
     lines
@@ -304,18 +322,28 @@ fn wire_decode_and_service_columns_match_the_impls() {
         let code = code(&modules[&row.module]);
         assert_eq!(
             row.wire,
-            code.contains("Wire for") || code.contains("codec::layout!"),
+            idents_after(&code, "Wire for ")
+                .iter()
+                .any(|name| catalog_type(&code, name))
+                || code.contains("Wire for $")
+                || code.contains("codec::layout!"),
             "{}: the Wire column",
             row.module
         );
         assert_eq!(
             row.decode,
-            (code.contains("Decode for") || code.contains("Prefixed for")),
+            ["Decode for ", "Prefixed for "].iter().any(|needle| {
+                code.contains(&format!("{needle}$"))
+                    || idents_after(&code, needle)
+                        .iter()
+                        .any(|name| catalog_type(&code, name))
+            }),
             "{}: the Decode column",
             row.module
         );
         let services: BTreeSet<String> = idents_after(&code, "Service for ")
             .into_iter()
+            .filter(|name| catalog_type(&code, name))
             .map(str::to_owned)
             .collect();
         let listed: BTreeSet<String> = row.service.iter().cloned().collect();

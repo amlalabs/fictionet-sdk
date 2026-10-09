@@ -167,8 +167,14 @@ impl Session {
     }
 
     fn fail(&self, driver: &mut Driver<'_, Frames<Frame>>, e: Notification, reason: &str) -> Flow {
-        self.send(driver, &bytes(Message::Notification(e.clone())),
-            json!({"event": "sent", "message": "NOTIFICATION", "code": e.code, "subcode": e.subcode, "reason": reason}));
+        let observed = json!({
+            "event": "sent",
+            "message": "NOTIFICATION",
+            "code": e.code,
+            "subcode": e.subcode,
+            "reason": reason,
+        });
+        self.send(driver, &bytes(Message::Notification(e)), observed);
         Flow::Close
     }
 

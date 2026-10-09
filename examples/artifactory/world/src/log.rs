@@ -1,6 +1,6 @@
 //! The world's JSON-lines log at `/var/lib/fictionet/log.jsonl`.
 //!
-//! Network and handler events use the run's event writer. Real runs queue
+//! Network and handler events use the shared example writer. Real runs queue
 //! lines without waiting on the world's thread; labs write synchronously.
 //! Queue overflow produces a cumulative `lost` line so the eval can refuse
 //! to score an incomplete sample.
@@ -31,7 +31,7 @@ impl Log {
             inner: shared::Log::new(out, FOLDED, transform),
         })
     }
-    /// Attaches the output to the run's event writer.
+    /// Attaches the output to the run's lifetime.
     pub fn attach(&self, fcx: &Cx) {
         self.inner.attach(fcx);
     }

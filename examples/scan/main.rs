@@ -184,7 +184,6 @@ impl httpd::Handler for Page {
             http::Response::builder()
                 .header("server", self.server)
                 .header("content-type", "text/html; charset=utf-8")
-                .header("connection", "close")
                 .body(httpd::Body::from(body))
                 .expect("valid page headers"),
         )
@@ -209,14 +208,27 @@ impl Service for Banner {
     ) -> std::result::Result<Flow, Infallible> {
         let out = driver.reply();
         match self.0 {
-            Kind::Smtp => smtp::Reply::new(220, "mail.corp.test ESMTP Postfix (Debian/GNU)").write(out).expect("valid SMTP greeting"),
-            Kind::Pop3 => pop3::Reply::ok("Dovecot ready.").write(out).expect("valid POP3 greeting"),
-            Kind::Imap => imap::Response::Status {
-                tag: None, status: imap::Status::Ok,
-                code: Some("CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ STARTTLS AUTH=PLAIN".into()),
-                text: "Dovecot ready.".into(),
-            }.write(out).expect("valid IMAP greeting"),
-            Kind::Ftp => ftp::Reply::new(ftp::ReplyCode::new(220).unwrap(), "(vsFTPd 3.0.3)").write(out).expect("valid FTP greeting"),
+            Kind::Smtp => {
+                let greeting = smtp::Reply::new(220, "mail.corp.test ESMTP Postfix (Debian/GNU)");
+                greeting.write(out).expect("valid SMTP greeting");
+            }
+            Kind::Pop3 => {
+                let greeting = pop3::Reply::ok("Dovecot ready.");
+                greeting.write(out).expect("valid POP3 greeting");
+            }
+            Kind::Imap => {
+                let greeting = imap::Response::Status {
+                    tag: None,
+                    status: imap::Status::Ok,
+                    code: Some("CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ STARTTLS AUTH=PLAIN".into()),
+                    text: "Dovecot ready.".into(),
+                };
+                greeting.write(out).expect("valid IMAP greeting");
+            }
+            Kind::Ftp => {
+                let greeting = ftp::Reply::new(ftp::ReplyCode::new(220).unwrap(), "(vsFTPd 3.0.3)");
+                greeting.write(out).expect("valid FTP greeting");
+            }
             _ => unreachable!("a mail or FTP banner"),
         }
         Ok(Flow::Continue)
