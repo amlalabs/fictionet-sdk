@@ -84,7 +84,7 @@ fn registry() -> Registry {
     registry
 }
 
-async fn world(fcx: Cx) -> fictionet::Result {
+async fn read_planted_register(fcx: Cx) -> fictionet::Result {
     fcx.observe_protocols(registry());
     let (attacher, attachments) = fictionet::attachments();
     let address = Ipv4Addr::new(10, 30, 0, 3);
@@ -153,5 +153,5 @@ async fn world(fcx: Cx) -> fictionet::Result {
     Ok(())
 }
 fn main() -> fictionet::Result {
-    block_on(lab(Seed::from_u64(7), world))
+    block_on(lab(Seed::from_u64(7), read_planted_register))
 }
