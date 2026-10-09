@@ -1041,6 +1041,14 @@ mod tests {
     use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
+    fn flag<'a>(name: &'a str, argument: Option<&'a str>) -> Flag<'a> {
+        Flag { name, argument }
+    }
+
+    fn referral(kind: ReferralKind, host: String, port: u16) -> Referral {
+        Referral { kind, host, port }
+    }
+
     /// An answer in the layout Verisign uses for .com, cut short.
     const VERISIGN: &str = concat!(
         "   Domain Name: EXAMPLE.COM\r\n",
@@ -1131,42 +1139,15 @@ mod tests {
     #[test]
     fn registry_flags() {
         let q = Query::new("-B -T inetnum 193.0.0.1").unwrap();
-        assert_eq!(
-            q.flags(),
-            [
-                Flag {
-                    name: "-B",
-                    argument: None
-                },
-                Flag {
-                    name: "-T",
-                    argument: Some("inetnum")
-                }
-            ]
-        );
+        assert_eq!(q.flags(), [flag("-B", None), flag("-T", Some("inetnum"))]);
         assert_eq!(q.terms(), "193.0.0.1");
         let q = Query::new("-T dn,ace example.de").unwrap();
-        assert_eq!(
-            q.flags(),
-            [Flag {
-                name: "-T",
-                argument: Some("dn,ace")
-            }]
-        );
+        assert_eq!(q.flags(), [flag("-T", Some("dn,ace"))]);
         assert_eq!(q.terms(), "example.de");
         let q = Query::new("  --sources\tRIPE  -r   AS3333  ").unwrap();
         assert_eq!(
             q.flags(),
-            [
-                Flag {
-                    name: "--sources",
-                    argument: Some("RIPE")
-                },
-                Flag {
-                    name: "-r",
-                    argument: None
-                }
-            ]
+            [flag("--sources", Some("RIPE")), flag("-r", None)]
         );
         assert_eq!(q.terms(), "AS3333");
         // ARIN and Verisign keywords stay in the terms.
@@ -1180,13 +1161,7 @@ mod tests {
         assert_eq!(Query::new("=example.com").unwrap().terms(), "=example.com");
         // A flag that wants an argument at the end has none.
         let q = Query::new("-i").unwrap();
-        assert_eq!(
-            q.flags(),
-            [Flag {
-                name: "-i",
-                argument: None
-            }]
-        );
+        assert_eq!(q.flags(), [flag("-i", None)]);
         assert_eq!(q.terms(), "");
         // A dash alone is a term.
         assert_eq!(Query::new("- x").unwrap().terms(), "- x");
@@ -1201,16 +1176,7 @@ mod tests {
         let q = Query::new("-T dn,ace -C UTF-8 example.de").unwrap();
         assert_eq!(
             q.flags(),
-            [
-                Flag {
-                    name: "-T",
-                    argument: Some("dn,ace")
-                },
-                Flag {
-                    name: "-C",
-                    argument: Some("UTF-8")
-                }
-            ]
+            [flag("-T", Some("dn,ace")), flag("-C", Some("UTF-8"))]
         );
         assert_eq!(q.terms(), "example.de");
     }
@@ -1316,11 +1282,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             r,
-            Referral {
-                kind: ReferralKind::RegistrarWhoisServer,
-                host: "whois.iana.org".into(),
-                port: 43
-            }
+            referral(
+                ReferralKind::RegistrarWhoisServer,
+                "whois.iana.org".into(),
+                43
+            )
         );
     }
 
@@ -1354,20 +1320,16 @@ mod tests {
         assert_eq!(fields.len(), 6);
         assert_eq!(
             find_referral(&fields),
-            Some(Referral {
-                kind: ReferralKind::Refer,
-                host: "whois.verisign-grs.com".into(),
-                port: 43
-            })
+            Some(referral(
+                ReferralKind::Refer,
+                "whois.verisign-grs.com".into(),
+                43
+            ))
         );
         let r = Response::new(ARIN.as_bytes()).unwrap().referral().unwrap();
         assert_eq!(
             r,
-            Referral {
-                kind: ReferralKind::ReferralServer,
-                host: "whois.ripe.net".into(),
-                port: 43
-            }
+            referral(ReferralKind::ReferralServer, "whois.ripe.net".into(), 43)
         );
     }
 
@@ -1414,11 +1376,7 @@ mod tests {
             ReferralKind::ReferralServer,
         ] {
             for port in [43, 1, 4343, 65535] {
-                let r = Referral {
-                    kind,
-                    host: "whois.example-1.net".into(),
-                    port,
-                };
+                let r = referral(kind, "whois.example-1.net".into(), port);
                 let f = r.to_field(2).unwrap();
                 assert_eq!(f.block, 2);
                 assert_eq!(Referral::from_field(&f), Some(r.clone()));
@@ -1430,20 +1388,9 @@ mod tests {
                 assert_eq!(resp.referral(), Some(r));
             }
         }
-        let r = Referral {
-            kind: ReferralKind::ReferralServer,
-            host: "h".into(),
-            port: 4343,
-        };
+        let r = referral(ReferralKind::ReferralServer, "h".into(), 4343);
         assert_eq!(r.to_field(0).unwrap().value, "whois://h:4343");
-        let bad = |host: &str, port| {
-            Referral {
-                kind: ReferralKind::Refer,
-                host: host.into(),
-                port,
-            }
-            .to_field(0)
-        };
+        let bad = |host: &str, port| referral(ReferralKind::Refer, host.into(), port).to_field(0);
         assert_eq!(bad("Upper.example", 43), Err(Error::Unwritable));
         assert_eq!(bad("", 43), Err(Error::Unwritable));
         assert_eq!(bad(".x", 43), Err(Error::Unwritable));
@@ -1526,21 +1473,10 @@ mod tests {
         for value in [" v", "v ", "v\r", "a\n b", "\nb", "a\u{1}"] {
             assert_eq!(one("k", value), Err(Error::Unwritable), "{value:?}");
         }
-        assert_eq!(
-            Response::from_fields(&[Field::new(1, "k", "v")]),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            Response::from_fields(&[Field::new(0, "k", "v"), Field::new(2, "k", "v")]),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            Response::from_fields(&[
-                Field::new(0, "k", "v"),
-                Field::new(1, "k", "v"),
-                Field::new(0, "k", "v")
-            ]),
-            Err(Error::Unwritable)
+        fictionet::assert_cases!(|fields| Response::from_fields(fields);
+            initial_indent: &[Field::new(1, "k", "v")] => Err(Error::Unwritable),
+            skipped_indent: &[Field::new(0, "k", "v"), Field::new(2, "k", "v")] => Err(Error::Unwritable),
+            repeated_parent: &[ Field::new(0, "k", "v"), Field::new(1, "k", "v"), Field::new(0, "k", "v") ] => Err(Error::Unwritable),
         );
         let big = "v".repeat(MAX_RESPONSE);
         assert_eq!(one("k", &big), Err(Error::ResponseTooLong));
@@ -1744,13 +1680,7 @@ mod tests {
         // RIPE's `-C` (`--no-irt`) takes no argument, so the address is the
         // term. DENIC's `-C` takes a character set name.
         let q = Query::new("-C 193.0.0.1").unwrap();
-        assert_eq!(
-            q.flags(),
-            [Flag {
-                name: "-C",
-                argument: None
-            }]
-        );
+        assert_eq!(q.flags(), [flag("-C", None)]);
         assert_eq!(q.terms(), "193.0.0.1");
         assert_eq!(Query::new("-C AS3333 x").unwrap().terms(), "AS3333 x");
         assert_eq!(
@@ -1763,13 +1693,7 @@ mod tests {
         );
         // `-Z` (`--charset`) and `-S` (`--resources`) take an argument.
         let q = Query::new("-Z UTF-8 AS3333").unwrap();
-        assert_eq!(
-            q.flags(),
-            [Flag {
-                name: "-Z",
-                argument: Some("UTF-8")
-            }]
-        );
+        assert_eq!(q.flags(), [flag("-Z", Some("UTF-8"))]);
         assert_eq!(q.terms(), "AS3333");
         assert_eq!(
             Query::new("-S ARIN-GRS 193.201.1.1").unwrap().terms(),
@@ -1782,22 +1706,10 @@ mod tests {
         // Short flags grouped in one word: the last one may take the
         // next word, and one inside the group takes the rest of the word.
         let q = Query::new("-Bi tech-c DW-RIPE").unwrap();
-        assert_eq!(
-            q.flags(),
-            [Flag {
-                name: "-Bi",
-                argument: Some("tech-c")
-            }]
-        );
+        assert_eq!(q.flags(), [flag("-Bi", Some("tech-c"))]);
         assert_eq!(q.terms(), "DW-RIPE");
         let q = Query::new("-Tas-set AS-FOO").unwrap();
-        assert_eq!(
-            q.flags(),
-            [Flag {
-                name: "-Tas-set",
-                argument: None
-            }]
-        );
+        assert_eq!(q.flags(), [flag("-Tas-set", None)]);
         assert_eq!(q.terms(), "AS-FOO");
         assert_eq!(Query::new("-rB AS3333").unwrap().terms(), "AS3333");
         assert_eq!(
@@ -1810,24 +1722,14 @@ mod tests {
     #[test]
     fn rpsl_values_right_after_the_colon() {
         // RFC 2622, section 2: the name, a colon, then the value.
-        assert_eq!(
-            parse_fields("origin:AS3333\n").unwrap(),
-            [Field::new(0, "origin", "AS3333")]
-        );
-        assert_eq!(
-            parse_fields("remarks:a: b\n").unwrap(),
-            [Field::new(0, "remarks", "a: b")]
-        );
-        assert_eq!(
-            parse_fields("descr: a: b\n").unwrap(),
-            [Field::new(0, "descr", "a: b")]
-        );
-        // A key is never read with a colon in it.
-        assert_eq!(parse_fields("time 12:30: x\n").unwrap(), []);
-        // Free text that is not an RPSL name, or a URL, is not a field.
-        assert_eq!(
-            parse_fields("see https://icann.org/epp\nhttp://x\nab-:c\n1a:b\n").unwrap(),
-            []
+        fictionet::assert_cases!(|input| parse_fields(input).unwrap();
+            origin: "origin:AS3333\n" => [Field::new(0, "origin", "AS3333")],
+            remarks_colon: "remarks:a: b\n" => [Field::new(0, "remarks", "a: b")],
+            description_colon: "descr: a: b\n" => [Field::new(0, "descr", "a: b")],
+            // A key is never read with a colon in it.
+            invalid_key: "time 12:30: x\n" => [],
+            // Free text that is not an RPSL name, or a URL, is not a field.
+            free_text: "see https://icann.org/epp\nhttp://x\nab-:c\n1a:b\n" => [],
         );
     }
 
@@ -1850,26 +1752,14 @@ mod tests {
             ReferralKind::ReferralServer,
         ] {
             for port in [43, 4343] {
-                let r = Referral {
-                    kind,
-                    host: "2001:db8::1".into(),
-                    port,
-                };
+                let r = referral(kind, "2001:db8::1".into(), port);
                 let f = r.to_field(0).unwrap();
                 assert_eq!(Referral::from_field(&f), Some(r));
             }
         }
-        let r = Referral {
-            kind: ReferralKind::Refer,
-            host: "2001:db8::1".into(),
-            port: 4343,
-        };
+        let r = referral(ReferralKind::Refer, "2001:db8::1".into(), 4343);
         assert_eq!(r.to_field(0).unwrap().value, "[2001:db8::1]:4343");
-        let bad = Referral {
-            kind: ReferralKind::Refer,
-            host: "2001:DB8::1".into(),
-            port: 43,
-        };
+        let bad = referral(ReferralKind::Refer, "2001:DB8::1".into(), 43);
         assert_eq!(bad.to_field(0), Err(Error::Unwritable));
     }
 
@@ -1892,11 +1782,7 @@ mod tests {
         assert_eq!(longest.len(), MAX_HOST);
         assert!(read(&longest).is_some());
         assert_eq!(read(&format!("{longest}e")), None);
-        let bad = Referral {
-            kind: ReferralKind::Refer,
-            host: "a..b".into(),
-            port: 43,
-        };
+        let bad = referral(ReferralKind::Refer, "a..b".into(), 43);
         assert_eq!(bad.to_field(0), Err(Error::Unwritable));
     }
 

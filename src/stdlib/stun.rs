@@ -1121,6 +1121,14 @@ mod tests {
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{assert_linear, rounds};
 
+    fn other_attribute(typ: u16, value: Vec<u8>) -> Attribute {
+        Attribute::Other { typ, value }
+    }
+
+    fn error_code(code: u16, reason: String) -> Attribute {
+        Attribute::ErrorCode { code, reason }
+    }
+
     const TID: [u8; 12] = [
         0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
     ];
@@ -1304,10 +1312,7 @@ mod tests {
         let resp = Message::new(method::BINDING, Class::SuccessResponse, [0; 12]);
         assert_eq!(answer_binding(&resp, src), None);
         let mut unknown = Message::binding_request([5; 12]);
-        unknown.attributes.push(Attribute::Other {
-            typ: 0x7fff,
-            value: vec![],
-        });
+        unknown.attributes.push(other_attribute(0x7fff, vec![]));
         let reply = answer_binding(&unknown, src).unwrap();
         assert_eq!(
             (reply.method, reply.transaction),
@@ -1323,10 +1328,7 @@ mod tests {
         let mut m = Message::new(method::BINDING, Class::ErrorResponse, [9; 12]);
         m.attributes
             .push(Attribute::MappedAddress("1.2.3.4:5".parse().unwrap()));
-        m.attributes.push(Attribute::ErrorCode {
-            code: 438,
-            reason: "Stale Nonce".into(),
-        });
+        m.attributes.push(error_code(438, "Stale Nonce".into()));
         m.attributes
             .push(Attribute::AlternateServer("[::1]:3478".parse().unwrap()));
         m.attributes.push(Attribute::Realm("example.org".into()));
@@ -1383,70 +1385,34 @@ mod tests {
     fn attribute_errors() {
         let p = |body: &[u8]| Message::parse(&with_body(body));
         // A value running past the end.
-        assert_eq!(
-            p(&[0x80, 0x22, 0x00, 0x08, 0, 0, 0, 0]),
-            Err(Error::AttributeTruncated { typ: 0x8022 })
-        );
-        // Address: too short, wrong length, bad family.
-        assert_eq!(
-            p(&[0, 1, 0, 0]),
-            Err(Error::AttributeValue { typ: 1, len: 0 })
-        );
-        assert_eq!(
-            p(&[0, 1, 0, 4, 0, 1, 0, 0]),
-            Err(Error::AttributeValue { typ: 1, len: 4 })
-        );
-        assert_eq!(
-            p(&[0, 1, 0, 8, 0, 2, 0, 0, 1, 2, 3, 4]),
-            Err(Error::AttributeValue { typ: 1, len: 8 })
+        fictionet::assert_cases!(|input| p(input);
+            truncated_attribute: &[0x80, 0x22, 0x00, 0x08, 0, 0, 0, 0] => Err(Error::AttributeTruncated { typ: 0x8022 }),
+            // Address: too short, wrong length, bad family.
+            empty_address: &[0, 1, 0, 0] => Err(Error::AttributeValue { typ: 1, len: 0 }),
+            short_address: &[0, 1, 0, 4, 0, 1, 0, 0] => Err(Error::AttributeValue { typ: 1, len: 4 }),
+            wrong_family: &[0, 1, 0, 8, 0, 2, 0, 0, 1, 2, 3, 4] => Err(Error::AttributeValue { typ: 1, len: 8 }),
         );
         assert_eq!(
             Attribute::parse(0x20, &[0, 3, 0, 0, 1, 2, 3, 4], &[0; 12]),
             Err(Error::AddressFamily(3))
         );
         // Error code: too short, class 7, number 100.
-        assert_eq!(
-            p(&[0, 9, 0, 0]),
-            Err(Error::AttributeValue { typ: 9, len: 0 })
-        );
-        assert_eq!(
-            p(&[0, 9, 0, 4, 0, 0, 7, 0]),
-            Err(Error::ErrorCode {
-                class: 7,
-                number: 0
-            })
-        );
-        assert_eq!(
-            p(&[0, 9, 0, 4, 0, 0, 4, 100]),
-            Err(Error::ErrorCode {
-                class: 4,
-                number: 100
-            })
-        );
-        // Bad UTF-8, and text that is too long.
-        assert_eq!(
-            p(&[0x80, 0x22, 0, 1, 0xff, 0, 0, 0]),
-            Err(Error::Text { typ: 0x8022 })
+        fictionet::assert_cases!(|input| p(input);
+            empty_error: &[0, 9, 0, 0] => Err(Error::AttributeValue { typ: 9, len: 0 }),
+            invalid_class: &[0, 9, 0, 4, 0, 0, 7, 0] => Err(Error::ErrorCode { class: 7, number: 0 }),
+            invalid_number: &[0, 9, 0, 4, 0, 0, 4, 100] => Err(Error::ErrorCode { class: 4, number: 100 }),
+            // Bad UTF-8, and text that is too long.
+            invalid_utf8: &[0x80, 0x22, 0, 1, 0xff, 0, 0, 0] => Err(Error::Text { typ: 0x8022 }),
         );
         let mut long = vec![0x80, 0x22, 0x02, 0xfc];
         long.resize(4 + 764, b'a');
-        assert_eq!(p(&long), Err(Error::Text { typ: 0x8022 }));
-        // An odd unknown-attribute list.
-        assert_eq!(
-            p(&[0, 0x0a, 0, 3, 0, 1, 0, 0]),
-            Err(Error::AttributeValue { typ: 0x0a, len: 3 })
-        );
-        // FINGERPRINT: not last, wrong length, wrong value.
-        assert_eq!(
-            p(&[0x80, 0x28, 0, 4, 0, 0, 0, 0, 0x80, 0x22, 0, 0]),
-            Err(Error::FingerprintNotLast)
-        );
-        assert_eq!(
-            p(&[0x80, 0x28, 0, 0]),
-            Err(Error::AttributeValue {
-                typ: 0x8028,
-                len: 0
-            })
+        fictionet::assert_cases!(|input| p(input);
+            long_text: &long => Err(Error::Text { typ: 0x8022 }),
+            // An odd unknown-attribute list.
+            odd_unknown_attributes: &[0, 0x0a, 0, 3, 0, 1, 0, 0] => Err(Error::AttributeValue { typ: 0x0a, len: 3 }),
+            // FINGERPRINT: not last, wrong length, wrong value.
+            fingerprint_not_last: &[0x80, 0x28, 0, 4, 0, 0, 0, 0, 0x80, 0x22, 0, 0] => Err(Error::FingerprintNotLast),
+            empty_fingerprint: &[0x80, 0x28, 0, 0] => Err(Error::AttributeValue { typ: 0x8028, len: 0 }),
         );
         let mut b = SAMPLE_IPV4_RESPONSE;
         b[79] ^= 1;
@@ -1552,40 +1518,19 @@ mod tests {
         for attribute in [
             Attribute::Software("é".repeat(500)),
             Attribute::Username("x".repeat(1000)),
-            Attribute::ErrorCode {
-                code: 99,
-                reason: String::new(),
-            },
-            Attribute::ErrorCode {
-                code: 1000,
-                reason: String::new(),
-            },
-            Attribute::Other {
-                typ: attr::FINGERPRINT,
-                value: vec![0; 4],
-            },
-            Attribute::Other {
-                typ: attr::SOFTWARE,
-                value: vec![0xff],
-            },
+            error_code(99, String::new()),
+            error_code(1000, String::new()),
+            other_attribute(attr::FINGERPRINT, vec![0; 4]),
+            other_attribute(attr::SOFTWARE, vec![0xff]),
             Attribute::UnknownAttributes(vec![0x1234; 40000]),
-            Attribute::Other {
-                typ: 0x8099,
-                value: vec![1; 70000],
-            },
+            other_attribute(0x8099, vec![1; 70000]),
         ] {
             let typ = attribute.typ();
             message.attributes = vec![attribute];
             assert_write_error(&message, Error::Unwritable { typ });
         }
         message.fingerprint = true;
-        message.attributes = vec![
-            Attribute::Other {
-                typ: 0x8099,
-                value: vec![]
-            };
-            MAX_ATTRIBUTES + 10
-        ];
+        message.attributes = vec![other_attribute(0x8099, vec![]); MAX_ATTRIBUTES + 10];
         assert_write_error(&message, Error::TooManyAttributes);
     }
 
@@ -1614,10 +1559,7 @@ mod tests {
             Attribute::Software("é".repeat(200)),
             Attribute::Realm("r".repeat(300)),
             Attribute::Nonce("n".repeat(128)),
-            Attribute::ErrorCode {
-                code: 400,
-                reason: "w".repeat(200),
-            },
+            error_code(400, "w".repeat(200)),
             Attribute::Username("x".repeat(MAX_TEXT)),
         ];
         contract::check_wire_value(&message);
@@ -1636,10 +1578,7 @@ mod tests {
                     Attribute::Realm(text.clone()),
                     Attribute::Nonce(text.clone()),
                     Attribute::Software(text.clone()),
-                    Attribute::ErrorCode {
-                        code: 400,
-                        reason: text.clone(),
-                    },
+                    error_code(400, text.clone()),
                 ] {
                     message.attributes = vec![Attribute::Username("u".into()), attribute];
                     let before = message.clone();
@@ -1675,10 +1614,7 @@ mod tests {
         let src: SocketAddr = "10.0.0.1:1".parse().unwrap();
         let mut other = Message::new(0x003, Class::Request, [0; 12]);
         assert_eq!(answer_binding(&other, src), None);
-        other.attributes.push(Attribute::Other {
-            typ: 0x0024,
-            value: vec![0; 4],
-        });
+        other.attributes.push(other_attribute(0x0024, vec![0; 4]));
         assert_eq!(answer_binding(&other, src), None);
     }
 
@@ -1733,10 +1669,7 @@ mod tests {
         assert_eq!(m.attributes.len(), 1);
         // A writer refuses attributes the reader would ignore.
         let mut w = Message::binding_request([0; 12]);
-        w.attributes.push(Attribute::Other {
-            typ: 0x0008,
-            value: vec![0; 20],
-        });
+        w.attributes.push(other_attribute(0x0008, vec![0; 20]));
         w.attributes.push(Attribute::Software("late".into()));
         w.fingerprint = true;
         assert_eq!(
@@ -1764,14 +1697,8 @@ mod tests {
         assert!(p(&b).is_ok());
         // A writer refuses an integrity value of the wrong length.
         let mut w = Message::binding_request([0; 12]);
-        w.attributes.push(Attribute::Other {
-            typ: 0x0008,
-            value: vec![0; 4],
-        });
-        w.attributes.push(Attribute::Other {
-            typ: 0x001c,
-            value: vec![0; 12],
-        });
+        w.attributes.push(other_attribute(0x0008, vec![0; 4]));
+        w.attributes.push(other_attribute(0x001c, vec![0; 12]));
         assert_eq!(
             w.to_bytes(),
             Err(Error::Unwritable {
@@ -1802,19 +1729,10 @@ mod tests {
             m.attributes.iter().map(Attribute::typ).collect::<Vec<_>>(),
             [0x0008, 0x001c]
         );
-        assert_eq!(
-            m.attributes[1],
-            Attribute::Other {
-                typ: 0x001c,
-                value: vec![0xbb; 16]
-            }
-        );
+        assert_eq!(m.attributes[1], other_attribute(0x001c, vec![0xbb; 16]));
         // The writer refuses a second SHA256 attribute.
         let mut w = m.clone();
-        w.attributes.push(Attribute::Other {
-            typ: 0x001c,
-            value: vec![0xcc; 16],
-        });
+        w.attributes.push(other_attribute(0x001c, vec![0xcc; 16]));
         assert_eq!(
             w.to_bytes(),
             Err(Error::Unwritable {
@@ -2099,10 +2017,9 @@ mod tests {
             contract::check_wire::<Message>(sample);
         }
         let mut message = Message::binding_request([1; 12]);
-        message.attributes.push(Attribute::Other {
-            typ: 0x8099,
-            value: vec![0x5a; MAX_VALUE],
-        });
+        message
+            .attributes
+            .push(other_attribute(0x8099, vec![0x5a; MAX_VALUE]));
         let bytes = Wire::to_bytes(&message).unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
         assert_eq!(Frames::<Frame>::new().capacity(), MAX_MESSAGE);
@@ -2136,10 +2053,7 @@ mod tests {
             Attribute::Realm(text.clone()),
             Attribute::Nonce(text.clone()),
             Attribute::Software(text.clone()),
-            Attribute::ErrorCode {
-                code: 699,
-                reason: text,
-            },
+            error_code(699, text),
         ];
         message.fingerprint = true;
         let bytes = Wire::to_bytes(&message).unwrap();
@@ -2178,31 +2092,13 @@ mod tests {
             Attribute::Realm(long.clone()),
             Attribute::Nonce(long.clone()),
             Attribute::Software(long.clone()),
-            Attribute::ErrorCode {
-                code: 400,
-                reason: long,
-            },
-            Attribute::ErrorCode {
-                code: 299,
-                reason: String::new(),
-            },
-            Attribute::ErrorCode {
-                code: 700,
-                reason: String::new(),
-            },
+            error_code(400, long),
+            error_code(299, String::new()),
+            error_code(700, String::new()),
             Attribute::UnknownAttributes(vec![1; MAX_VALUE / 2 + 1]),
-            Attribute::Other {
-                typ: 0x8099,
-                value: vec![0; MAX_VALUE + 1],
-            },
-            Attribute::Other {
-                typ: attr::MESSAGE_INTEGRITY,
-                value: vec![0; 19],
-            },
-            Attribute::Other {
-                typ: attr::MESSAGE_INTEGRITY_SHA256,
-                value: vec![0; 18],
-            },
+            other_attribute(0x8099, vec![0; MAX_VALUE + 1]),
+            other_attribute(attr::MESSAGE_INTEGRITY, vec![0; 19]),
+            other_attribute(attr::MESSAGE_INTEGRITY_SHA256, vec![0; 18]),
             Attribute::MappedAddress(scoped),
             Attribute::XorMappedAddress(flow),
             Attribute::AlternateServer(scoped),
@@ -2219,7 +2115,7 @@ mod tests {
             attr::UNKNOWN_ATTRIBUTES,
             attr::FINGERPRINT,
         ] {
-            attributes.push(Attribute::Other { typ, value: vec![] });
+            attributes.push(other_attribute(typ, vec![]));
         }
         for attribute in attributes {
             let error = Error::Unwritable {
@@ -2237,14 +2133,8 @@ mod tests {
 
     #[test]
     fn strict_writer_checks_integrity_order() {
-        let sha1 = Attribute::Other {
-            typ: attr::MESSAGE_INTEGRITY,
-            value: vec![1; 20],
-        };
-        let sha256 = Attribute::Other {
-            typ: attr::MESSAGE_INTEGRITY_SHA256,
-            value: vec![2; 16],
-        };
+        let sha1 = other_attribute(attr::MESSAGE_INTEGRITY, vec![1; 20]);
+        let sha256 = other_attribute(attr::MESSAGE_INTEGRITY_SHA256, vec![2; 16]);
         let mut message = Message::binding_request([0; 12]);
         message.fingerprint = true;
         message.attributes = vec![
@@ -2269,38 +2159,23 @@ mod tests {
     #[test]
     fn strict_writer_checks_body_and_attribute_limits() {
         let mut message = Message::binding_request([0; 12]);
-        message.attributes = vec![
-            Attribute::Other {
-                typ: 0x8099,
-                value: vec![]
-            };
-            MAX_ATTRIBUTES
-        ];
+        message.attributes = vec![other_attribute(0x8099, vec![]); MAX_ATTRIBUTES];
         contract::check_wire::<Message>(&Wire::to_bytes(&message).unwrap());
         message.fingerprint = true;
         assert_write_error(&message, Error::TooManyAttributes);
         message.attributes.pop();
         contract::check_wire::<Message>(&Wire::to_bytes(&message).unwrap());
         message.fingerprint = false;
-        message.attributes = vec![Attribute::Other {
-            typ: 0x8099,
-            value: vec![0; MAX_VALUE],
-        }];
+        message.attributes = vec![other_attribute(0x8099, vec![0; MAX_VALUE])];
         assert_eq!(Wire::to_bytes(&message).unwrap().len(), MAX_MESSAGE);
         message.fingerprint = true;
         assert_write_error(&message, Error::BodyTooLong);
-        message.attributes = vec![Attribute::Other {
-            typ: 0x8099,
-            value: vec![0; MAX_VALUE - 8],
-        }];
+        message.attributes = vec![other_attribute(0x8099, vec![0; MAX_VALUE - 8])];
         let bytes = Wire::to_bytes(&message).unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
         contract::check_wire::<Message>(&bytes);
         message.fingerprint = false;
-        message.attributes.push(Attribute::Other {
-            typ: 0x8099,
-            value: vec![0; 5],
-        });
+        message.attributes.push(other_attribute(0x8099, vec![0; 5]));
         assert_write_error(&message, Error::BodyTooLong);
     }
 

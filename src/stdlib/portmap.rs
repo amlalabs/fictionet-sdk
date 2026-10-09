@@ -1142,6 +1142,14 @@ mod tests {
     use fictionet::stdlib::test_support;
     use fictionet::stdlib::test_support::contract;
 
+    fn rpcb_request(version: u32, request: RpcbRequest) -> Request {
+        Request::Rpcb { version, request }
+    }
+
+    fn netbuf(maxlen: u32, buf: Vec<u8>) -> Netbuf {
+        Netbuf { maxlen, buf }
+    }
+
     fn rpcb(rng: &mut Lcg) -> Rpcb {
         Rpcb {
             program: rng.next() as u32,
@@ -1220,10 +1228,7 @@ mod tests {
             7 => RpcbRequest::Uaddr2Taddr(rng.text(30)),
             8 => {
                 let buf = rng.bytes(19);
-                RpcbRequest::Taddr2Uaddr(Netbuf {
-                    maxlen: buf.len() as u32 + (rng.below(100) as u32),
-                    buf,
-                })
+                RpcbRequest::Taddr2Uaddr(netbuf(buf.len() as u32 + (rng.below(100) as u32), buf))
             }
             9 => RpcbRequest::GetVersAddr(rpcb(rng)),
             10 => RpcbRequest::Indirect(call_args(rng)),
@@ -1235,7 +1240,7 @@ mod tests {
         } else {
             3 + (rng.below(2) as u32)
         };
-        Request::Rpcb { version, request }
+        rpcb_request(version, request)
     }
     fn pmap_result(rng: &mut Lcg) -> PmapResult {
         match rng.below(5) {
@@ -1262,10 +1267,7 @@ mod tests {
             5 => RpcbResult::Time(rng.next() as u32),
             6 => {
                 let buf = rng.bytes(19);
-                RpcbResult::Netbuf(Netbuf {
-                    maxlen: buf.len() as u32 + (rng.below(100) as u32),
-                    buf,
-                })
+                RpcbResult::Netbuf(netbuf(buf.len() as u32 + (rng.below(100) as u32), buf))
             }
             7 => RpcbResult::AddrList(
                 (0..rng.below(4))
@@ -1508,19 +1510,12 @@ mod tests {
         // A string over the limit.
         let mut b = vec![0, 0, 1, 0];
         b.extend_from_slice(&[b'a'; 256]);
-        assert_eq!(
-            RpcbResult::parse(3, &b),
-            Err(Error::Xdr(onc_rpc::Error::TooLong(256)))
-        );
-        // Not UTF-8.
-        assert_eq!(
-            RpcbResult::parse(3, &[0, 0, 0, 1, 0xff, 0, 0, 0]),
-            Err(Error::Xdr(onc_rpc::Error::Utf8))
-        );
-        // Nonzero padding.
-        assert_eq!(
-            RpcbResult::parse(3, &[0, 0, 0, 1, b'a', 1, 0, 0]),
-            Err(Error::Xdr(onc_rpc::Error::Padding))
+        fictionet::assert_cases!(RpcbResult::parse;
+            (3, &b) => Err(Error::Xdr(onc_rpc::Error::TooLong(256))),
+            // Not UTF-8.
+            (3, &[0, 0, 0, 1, 0xff, 0, 0, 0]) => Err(Error::Xdr(onc_rpc::Error::Utf8)),
+            // Nonzero padding.
+            (3, &[0, 0, 0, 1, b'a', 1, 0, 0]) => Err(Error::Xdr(onc_rpc::Error::Padding)),
         );
         // Call data over the limit.
         let mut b = vec![0, 0, 0, 0];
@@ -1597,10 +1592,7 @@ mod tests {
             args: vec![0; MAX_CALL_DATA + 1],
         };
         assert_eq!(PmapRequest::CallIt(c).to_args(), Err(Error::TooLong));
-        let n = Netbuf {
-            maxlen: u32::MAX,
-            buf: vec![0; MAX_NETBUF + 1],
-        };
+        let n = netbuf(u32::MAX, vec![0; MAX_NETBUF + 1]);
         assert_eq!(
             RpcbRequest::Taddr2Uaddr(n.clone()).to_args(),
             Err(Error::TooLong)
@@ -1636,20 +1628,11 @@ mod tests {
         };
         let stats = Box::new([RpcbStat::default(), RpcbStat::default(), s]);
         assert_eq!(RpcbResult::Stat(stats).to_bytes(), Err(Error::TooMany));
-        let r = Request::Rpcb {
-            version: 3,
-            request: RpcbRequest::GetStat,
-        };
+        let r = rpcb_request(3, RpcbRequest::GetStat);
         assert_eq!(r.call(1), Err(Error::RequestVersion(3)));
-        let r = Request::Rpcb {
-            version: 2,
-            request: RpcbRequest::Null,
-        };
+        let r = rpcb_request(2, RpcbRequest::Null);
         assert_eq!(r.to_call(), Err(Error::RequestVersion(2)));
-        let r = Request::Rpcb {
-            version: 5,
-            request: RpcbRequest::Null,
-        };
+        let r = rpcb_request(5, RpcbRequest::Null);
         assert_eq!(r.to_call(), Err(Error::RequestVersion(5)));
         for e in [Error::TooLong, Error::TooMany, Error::RequestVersion(3)] {
             assert!(!e.to_string().is_empty());
@@ -1661,10 +1644,7 @@ mod tests {
     /// reader and the writer alike.
     #[test]
     fn netbuf_len_within_maxlen() {
-        let fits = Netbuf {
-            maxlen: 4,
-            buf: vec![1, 2, 3, 4],
-        };
+        let fits = netbuf(4, vec![1, 2, 3, 4]);
         let bytes = RpcbResult::Netbuf(fits.clone()).to_bytes().unwrap();
         assert_eq!(bytes, [0, 0, 0, 4, 0, 0, 0, 4, 1, 2, 3, 4]);
         assert_eq!(
@@ -1680,10 +1660,7 @@ mod tests {
             RpcbRequest::parse(3, procedure::TADDR2UADDR, &over),
             Err(Error::Xdr(onc_rpc::Error::TooLong(4)))
         );
-        let n = Netbuf {
-            maxlen: 3,
-            buf: vec![1, 2, 3, 4],
-        };
+        let n = netbuf(3, vec![1, 2, 3, 4]);
         assert_eq!(
             RpcbRequest::Taddr2Uaddr(n.clone()).to_args(),
             Err(Error::TooLong)
@@ -1719,15 +1696,9 @@ mod tests {
     /// even with no bytes, so neither side here reads or writes one.
     #[test]
     fn netbuf_maxlen_within_tirpc_limit() {
-        let ok = Netbuf {
-            maxlen: MAX_NETBUF_MAXLEN,
-            buf: vec![],
-        };
+        let ok = netbuf(MAX_NETBUF_MAXLEN, vec![]);
         check_rpcb_result(&RpcbResult::Netbuf(ok));
-        let over = Netbuf {
-            maxlen: MAX_NETBUF_MAXLEN + 1,
-            buf: vec![],
-        };
+        let over = netbuf(MAX_NETBUF_MAXLEN + 1, vec![]);
         assert_eq!(
             RpcbResult::Netbuf(over.clone()).to_bytes(),
             Err(Error::TooLong)
@@ -1890,12 +1861,7 @@ mod tests {
         let res = RpcbResult::Stat(Box::new([s.clone(), s.clone(), s]));
         let results = res.to_bytes().unwrap();
         assert_eq!(results.len(), 1_745_100);
-        let call = Request::Rpcb {
-            version: 4,
-            request: RpcbRequest::GetStat,
-        }
-        .call(5)
-        .unwrap();
+        let call = rpcb_request(4, RpcbRequest::GetStat).call(5).unwrap();
         let msg = call.reply(Reply::success(results)).to_bytes().unwrap();
         for stream in [
             Record(msg.to_vec()).to_bytes().unwrap(),
@@ -1936,28 +1902,16 @@ mod tests {
         let c = CallArgs::default();
         let silent = [
             Request::Pmap(PmapRequest::CallIt(c.clone())),
-            Request::Rpcb {
-                version: 3,
-                request: RpcbRequest::CallIt(c.clone()),
-            },
-            Request::Rpcb {
-                version: 4,
-                request: RpcbRequest::CallIt(c.clone()),
-            },
+            rpcb_request(3, RpcbRequest::CallIt(c.clone())),
+            rpcb_request(4, RpcbRequest::CallIt(c.clone())),
         ];
         for r in &silent {
             assert!(silent_on_failure(&r.to_call().unwrap()), "{r:?}");
         }
         let loud = [
             Request::Pmap(PmapRequest::Dump),
-            Request::Rpcb {
-                version: 4,
-                request: RpcbRequest::Indirect(c),
-            },
-            Request::Rpcb {
-                version: 3,
-                request: RpcbRequest::GetTime,
-            },
+            rpcb_request(4, RpcbRequest::Indirect(c)),
+            rpcb_request(3, RpcbRequest::GetTime),
         ];
         for r in &loud {
             assert!(!silent_on_failure(&r.to_call().unwrap()), "{r:?}");
@@ -1968,10 +1922,10 @@ mod tests {
     #[test]
     fn defaults_round_trip() {
         check_request(&Request::Pmap(PmapRequest::CallIt(CallArgs::default())));
-        check_request(&Request::Rpcb {
-            version: 3,
-            request: RpcbRequest::Taddr2Uaddr(Netbuf::default()),
-        });
+        check_request(&rpcb_request(
+            3,
+            RpcbRequest::Taddr2Uaddr(Netbuf::default()),
+        ));
         check_pmap_result(&PmapResult::CallIt(CallResult::default()));
         check_rpcb_result(&RpcbResult::CallIt(RmtCallResult::default()));
         check_rpcb_result(&RpcbResult::AddrList(vec![RpcbEntry::default()]));
@@ -2003,28 +1957,12 @@ mod tests {
 
     #[test]
     fn arguments_keep_version_and_procedure_errors() {
-        assert_eq!(
-            Request::read(1, procedure::NULL, &[]),
-            Err(Error::Version(1))
-        );
-        assert_eq!(
-            Request::read(3, procedure::GETSTAT, &[]),
-            Err(Error::Procedure(procedure::GETSTAT))
-        );
-        assert_eq!(
-            Request::read(2, procedure::GETTIME, &[]),
-            Err(Error::Procedure(procedure::GETTIME))
-        );
-        assert_eq!(
-            Request::read(4, procedure::GETSTAT, &[]),
-            Ok(Request::Rpcb {
-                version: 4,
-                request: RpcbRequest::GetStat
-            })
-        );
-        assert_eq!(
-            Request::read(2, procedure::NULL, &[1]),
-            Err(Error::Xdr(onc_rpc::Error::Trailing(1)))
+        fictionet::assert_cases!(Request::read;
+            (1, procedure::NULL, &[]) => Err(Error::Version(1)),
+            (3, procedure::GETSTAT, &[]) => Err(Error::Procedure(procedure::GETSTAT)),
+            (2, procedure::GETTIME, &[]) => Err(Error::Procedure(procedure::GETTIME)),
+            (4, procedure::GETSTAT, &[]) => Ok(rpcb_request(4, RpcbRequest::GetStat)),
+            (2, procedure::NULL, &[1]) => Err(Error::Xdr(onc_rpc::Error::Trailing(1))),
         );
     }
 

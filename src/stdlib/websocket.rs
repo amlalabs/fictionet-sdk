@@ -1588,28 +1588,13 @@ mod tests {
             let data = [b'a'; 129];
             assert_eq!(sha1(&[&data[..cut], &data[cut..]]), sha1(&[&data]));
         }
-        assert_eq!(
-            hex(&sha1(&[
-                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
-            ])),
-            "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
-        );
-        assert_eq!(
-            hex(&sha1(&[&[b'a'; 1_000_000]])),
-            "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
-        );
-        // Lengths around the padding boundary.
-        assert_eq!(
-            hex(&sha1(&[&[b'a'; 55]])),
-            "c1c8bbdc22796e28c0e15163d20899b65621d65a"
-        );
-        assert_eq!(
-            hex(&sha1(&[&[b'a'; 56]])),
-            "c2db330f6083854c99d4b5bfb6e8f29f201be699"
-        );
-        assert_eq!(
-            hex(&sha1(&[&[b'a'; 64]])),
-            "0098ba824b5c16427bd7a1122a5a442a25ec644d"
+        fictionet::assert_cases!(|input| hex(&sha1(&[input]));
+            long_vector: b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" => "84983e441c3bd26ebaae4aa1f95129e5e54670f1",
+            million_bytes: &[b'a'; 1_000_000] => "34aa973cd4c4daa4f61eeb2bdbad27316534016f",
+            // Lengths around the padding boundary.
+            before_padding_boundary: &[b'a'; 55] => "c1c8bbdc22796e28c0e15163d20899b65621d65a",
+            padding_boundary: &[b'a'; 56] => "c2db330f6083854c99d4b5bfb6e8f29f201be699",
+            full_block: &[b'a'; 64] => "0098ba824b5c16427bd7a1122a5a442a25ec644d",
         );
     }
 
@@ -1700,41 +1685,19 @@ mod tests {
 
     #[test]
     fn handshake_request_errors() {
-        assert_eq!(check_request(&without("Host")), Err(Error::MissingHost));
-        assert_eq!(check_request(&without("Upgrade")), Err(Error::Upgrade));
-        assert_eq!(check_request(&with("Upgrade", "h2c")), Err(Error::Upgrade));
-        assert_eq!(
-            check_request(&without("Connection")),
-            Err(Error::Connection)
-        );
-        assert_eq!(
-            check_request(&with("Connection", "keep-alive")),
-            Err(Error::Connection)
-        );
-        assert_eq!(
-            check_request(&without("Sec-WebSocket-Version")),
-            Err(Error::MissingVersion)
-        );
-        assert_eq!(
-            check_request(&with("Sec-WebSocket-Version", "8")),
-            Err(Error::Version)
-        );
-        assert_eq!(
-            check_request(&without("Sec-WebSocket-Key")),
-            Err(Error::Key)
-        );
-        assert_eq!(
-            check_request(&with("Sec-WebSocket-Key", "not base64!")),
-            Err(Error::Key)
-        );
-        // Fifteen bytes, then seventeen.
-        assert_eq!(
-            check_request(&with("Sec-WebSocket-Key", "AAAAAAAAAAAAAAAAAAAA")),
-            Err(Error::Key)
-        );
-        assert_eq!(
-            check_request(&with("Sec-WebSocket-Key", "AAAAAAAAAAAAAAAAAAAAAAA=")),
-            Err(Error::Key)
+        fictionet::assert_cases!(|request| check_request(request);
+            missing_host: &without("Host") => Err(Error::MissingHost),
+            missing_upgrade: &without("Upgrade") => Err(Error::Upgrade),
+            wrong_upgrade: &with("Upgrade", "h2c") => Err(Error::Upgrade),
+            missing_connection: &without("Connection") => Err(Error::Connection),
+            wrong_connection: &with("Connection", "keep-alive") => Err(Error::Connection),
+            missing_version: &without("Sec-WebSocket-Version") => Err(Error::MissingVersion),
+            wrong_version: &with("Sec-WebSocket-Version", "8") => Err(Error::Version),
+            missing_key: &without("Sec-WebSocket-Key") => Err(Error::Key),
+            invalid_base64: &with("Sec-WebSocket-Key", "not base64!") => Err(Error::Key),
+            // Fifteen bytes, then seventeen.
+            short_key: &with("Sec-WebSocket-Key", "AAAAAAAAAAAAAAAAAAAA") => Err(Error::Key),
+            long_key: &with("Sec-WebSocket-Key", "AAAAAAAAAAAAAAAAAAAAAAA=") => Err(Error::Key),
         );
         let mut twice = rfc_request();
         twice.push(("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="));
@@ -1959,25 +1922,12 @@ mod tests {
                 assert_eq!(Frame::parse(&bytes).unwrap(), f);
             }
         }
-        assert_eq!(
-            Header::parse(&[0x82, 126, 0, 125]),
-            Err(Error::NonMinimalLength)
-        );
-        assert_eq!(
-            Header::parse(&[0x82, 126, 0, 0]),
-            Err(Error::NonMinimalLength)
-        );
-        assert_eq!(
-            Header::parse(&[0x82, 127, 0, 0, 0, 0, 0, 0, 0xff, 0xff]),
-            Err(Error::NonMinimalLength)
-        );
-        assert_eq!(
-            Header::parse(&[0x82, 127, 0x80, 0, 0, 0, 0, 0, 0, 0]),
-            Err(Error::LengthHighBit)
-        );
-        assert_eq!(
-            Header::parse(&[0x82, 127, 0, 0, 0, 0, 1, 0, 0, 1]),
-            Err(Error::PayloadTooLarge((1 << 24) + 1))
+        fictionet::assert_cases!(|input| Header::parse(input);
+            short_extended_length: &[0x82, 126, 0, 125] => Err(Error::NonMinimalLength),
+            zero_extended_length: &[0x82, 126, 0, 0] => Err(Error::NonMinimalLength),
+            short_wide_length: &[0x82, 127, 0, 0, 0, 0, 0, 0, 0xff, 0xff] => Err(Error::NonMinimalLength),
+            high_bit: &[0x82, 127, 0x80, 0, 0, 0, 0, 0, 0, 0] => Err(Error::LengthHighBit),
+            excessive_payload: &[0x82, 127, 0, 0, 0, 0, 1, 0, 0, 1] => Err(Error::PayloadTooLarge((1 << 24) + 1)),
         );
         assert!(
             Header::parse(&[0x82, 127, 0, 0, 0, 0, 1, 0, 0, 0])
@@ -2142,34 +2092,15 @@ mod tests {
 
     #[test]
     fn decoder_errors() {
-        assert_eq!(decode(Side::Server, &HELLO).1, failure(Error::Unmasked));
-        assert_eq!(
-            decode(Side::Client, &HELLO_MASKED).1,
-            failure(Error::Masked)
-        );
-        assert_eq!(
-            decode(Side::Client, &LO).1,
-            failure(Error::UnexpectedContinuation)
-        );
-        assert_eq!(
-            decode(Side::Client, &[&HEL[..], &HELLO].concat()).1,
-            failure(Error::ExpectedContinuation)
-        );
-        assert_eq!(
-            decode(Side::Client, &[0xc1, 0]).1,
-            failure(Error::ReservedBits(4))
-        );
-        assert_eq!(
-            decode(Side::Client, &[0x88, 0x01, 0x03]).1,
-            failure(Error::CloseShort)
-        );
-        assert_eq!(
-            decode(Side::Client, &[0x88, 0x02, 0x03, 0xed]).1,
-            failure(Error::CloseCode(1005))
-        );
-        assert_eq!(
-            decode(Side::Client, &[0x88, 0x03, 0x03, 0xe8, 0xff]).1,
-            failure(Error::CloseUtf8)
+        fictionet::assert_cases!(|side, input| decode(side, input).1;
+            (Side::Server, &HELLO) => failure(Error::Unmasked),
+            (Side::Client, &HELLO_MASKED) => failure(Error::Masked),
+            (Side::Client, &LO) => failure(Error::UnexpectedContinuation),
+            (Side::Client, &[&HEL[..], &HELLO].concat()) => failure(Error::ExpectedContinuation),
+            (Side::Client, &[0xc1, 0]) => failure(Error::ReservedBits(4)),
+            (Side::Client, &[0x88, 0x01, 0x03]) => failure(Error::CloseShort),
+            (Side::Client, &[0x88, 0x02, 0x03, 0xed]) => failure(Error::CloseCode(1005)),
+            (Side::Client, &[0x88, 0x03, 0x03, 0xe8, 0xff]) => failure(Error::CloseUtf8),
         );
         // A broken stream reports its error once and keeps unread bytes for handoff.
         let mut d = Stream::new(Messages::new(Side::Server));

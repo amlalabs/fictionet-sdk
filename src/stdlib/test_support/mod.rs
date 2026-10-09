@@ -7,6 +7,7 @@
 //! `cargo test` stays fast and a deep run is one environment variable away.
 //! [`assert_linear`] checks that work grows linearly with input size by
 //! comparing two sizes, instead of holding a test to a wall-clock limit.
+//! [`assert_cases!`] checks named inputs in order with one shared operation.
 
 extern crate alloc;
 

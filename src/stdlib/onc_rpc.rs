@@ -1457,6 +1457,24 @@ mod tests {
     use fictionet::stdlib::test_support::rounds;
     use std::net::SocketAddr;
 
+    fn auth_sys(stamp: u32, machine_name: String, uid: u32, gid: u32, gids: Vec<u32>) -> AuthSys {
+        AuthSys {
+            stamp,
+            machine_name,
+            uid,
+            gid,
+            gids,
+        }
+    }
+
+    fn other_auth(flavor: u32, body: Vec<u8>) -> Auth {
+        Auth::Other { flavor, body }
+    }
+
+    fn message(xid: u32, body: Body) -> Message {
+        Message { xid, body }
+    }
+
     #[test]
     fn codec_fragments_and_records() {
         let payload = b"fragmented RPC payload";
@@ -1628,35 +1646,23 @@ mod tests {
         for code in 0..=15 {
             messages.push(call.reply(Reply::Denied(Reject::AuthError(AuthStat::from_code(code)))));
         }
-        let max_auth = Auth::Sys(AuthSys {
-            stamp: 1,
-            machine_name: "a".repeat(MAX_MACHINE_NAME),
-            uid: 2,
-            gid: 3,
-            gids: vec![4; MAX_GIDS],
-        });
+        let max_auth = Auth::Sys(auth_sys(
+            1,
+            "a".repeat(MAX_MACHINE_NAME),
+            2,
+            3,
+            vec![4; MAX_GIDS],
+        ));
         for auth in [
             max_auth,
-            Auth::Other {
-                flavor: 99,
-                body: vec![5; MAX_AUTH_BODY],
-            },
-            Auth::Other {
-                flavor: flavor::NONE,
-                body: vec![1],
-            },
-            Auth::Other {
-                flavor: flavor::SYS,
-                body: vec![1],
-            },
+            other_auth(99, vec![5; MAX_AUTH_BODY]),
+            other_auth(flavor::NONE, vec![1]),
+            other_auth(flavor::SYS, vec![1]),
         ] {
             let mut c = Call::new(1, 2, 3, vec![4]);
             c.cred = auth.clone();
             c.verf = auth.clone();
-            messages.push(Message {
-                xid: 7,
-                body: Body::Call(c),
-            });
+            messages.push(message(7, Body::Call(c)));
             messages.push(call.reply(Reply::Accepted {
                 verf: auth,
                 status: Accept::Success(vec![9]),
@@ -1673,13 +1679,7 @@ mod tests {
 
     #[test]
     fn codec_message_writer_refuses_loss_and_rolls_back() {
-        let sys = AuthSys {
-            stamp: 1,
-            machine_name: "host".into(),
-            uid: 2,
-            gid: 3,
-            gids: vec![],
-        };
+        let sys = auth_sys(1, "host".into(), 2, 3, vec![]);
         let mut long_name = sys.clone();
         long_name.machine_name = "x".repeat(MAX_MACHINE_NAME + 1);
         let mut long_groups = sys.clone();
@@ -1696,51 +1696,36 @@ mod tests {
                 Error::FieldTooLong { limit: MAX_GIDS },
             ),
             (
-                Auth::Other {
-                    flavor: 99,
-                    body: vec![0; MAX_AUTH_BODY + 1],
-                },
+                other_auth(99, vec![0; MAX_AUTH_BODY + 1]),
                 Error::FieldTooLong {
                     limit: MAX_AUTH_BODY,
                 },
             ),
+            (other_auth(flavor::NONE, vec![]), Error::Unwritable),
             (
-                Auth::Other {
-                    flavor: flavor::NONE,
-                    body: vec![],
-                },
-                Error::Unwritable,
-            ),
-            (
-                Auth::Other {
-                    flavor: flavor::SYS,
-                    body: sys.to_bytes().unwrap(),
-                },
+                other_auth(flavor::SYS, sys.to_bytes().unwrap()),
                 Error::Unwritable,
             ),
         ] {
             let mut call = Call::new(1, 2, 3, Vec::new());
             call.cred = auth.clone();
             for message in [
-                Message {
-                    xid: 1,
-                    body: Body::Call(call.clone()),
-                },
-                Message {
-                    xid: 1,
-                    body: Body::Call(Call {
+                message(1, Body::Call(call.clone())),
+                message(
+                    1,
+                    Body::Call(Call {
                         cred: Auth::None,
                         verf: auth.clone(),
                         ..call
                     }),
-                },
-                Message {
-                    xid: 1,
-                    body: Body::Reply(Reply::Accepted {
+                ),
+                message(
+                    1,
+                    Body::Reply(Reply::Accepted {
                         verf: auth,
                         status: Accept::ProgUnavail,
                     }),
-                },
+                ),
             ] {
                 let mut out = vec![1, 2, 3];
                 assert_eq!(message.write(&mut out), Err(error));
@@ -1749,10 +1734,10 @@ mod tests {
                 assert_eq!(message.to_bytes(), Err(error));
             }
         }
-        let alias = Message {
-            xid: 1,
-            body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(0)))),
-        };
+        let alias = message(
+            1,
+            Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(0)))),
+        );
         assert_eq!(alias.write(&mut Vec::new()), Err(Error::Unwritable));
         contract::check_wire_value(&alias);
     }
@@ -1760,14 +1745,8 @@ mod tests {
     #[test]
     fn codec_message_size_includes_the_header() {
         for message in [
-            Message {
-                xid: 1,
-                body: Body::Call(Call::new(1, 2, 3, vec![0; MAX_RECORD - 40])),
-            },
-            Message {
-                xid: 2,
-                body: Body::Reply(Reply::success(vec![0; MAX_RECORD - 24])),
-            },
+            message(1, Body::Call(Call::new(1, 2, 3, vec![0; MAX_RECORD - 40]))),
+            message(2, Body::Reply(Reply::success(vec![0; MAX_RECORD - 24]))),
         ] {
             assert_eq!(
                 <Message as Wire>::to_bytes(&message).unwrap().len(),
@@ -1965,13 +1944,7 @@ mod tests {
     fn call_with_auth_sys() {
         let bytes = nfs_call_bytes();
         let m = Message::parse(&bytes).unwrap();
-        let sys = AuthSys {
-            stamp: 9,
-            machine_name: "host1".into(),
-            uid: 1000,
-            gid: 100,
-            gids: vec![10],
-        };
+        let sys = auth_sys(9, "host1".into(), 1000, 100, vec![10]);
         let call = Call {
             rpc_version: 2,
             program: 100_003,
@@ -1981,13 +1954,7 @@ mod tests {
             verf: Auth::None,
             args: vec![0, 0, 0, 4, 0xaa, 0xbb, 0xcc, 0xdd],
         };
-        assert_eq!(
-            m,
-            Message {
-                xid: 0x1234_5678,
-                body: Body::Call(call)
-            }
-        );
+        assert_eq!(m, message(0x1234_5678, Body::Call(call)));
         assert_eq!(m.to_bytes().unwrap(), bytes);
         // Every truncated prefix up to the arguments fails, and none panics.
         for n in 0..bytes.len() {
@@ -2005,37 +1972,13 @@ mod tests {
         // AUTH_NONE with a body, and AUTH_SYS with a short body, stay as
         // they are.
         let mut w = Writer::new();
-        Auth::Other {
-            flavor: 0,
-            body: vec![1, 2, 3, 4],
-        }
-        .write(&mut w);
-        Auth::Other {
-            flavor: 1,
-            body: vec![0, 0, 0, 1],
-        }
-        .write(&mut w);
-        Auth::Other {
-            flavor: flavor::RPCSEC_GSS,
-            body: vec![9; 12],
-        }
-        .write(&mut w);
+        other_auth(0, vec![1, 2, 3, 4]).write(&mut w);
+        other_auth(1, vec![0, 0, 0, 1]).write(&mut w);
+        other_auth(flavor::RPCSEC_GSS, vec![9; 12]).write(&mut w);
         let bytes = w.finish().unwrap();
         let mut r = Reader::new(&bytes);
-        assert_eq!(
-            Auth::read(&mut r),
-            Ok(Auth::Other {
-                flavor: 0,
-                body: vec![1, 2, 3, 4]
-            })
-        );
-        assert_eq!(
-            Auth::read(&mut r),
-            Ok(Auth::Other {
-                flavor: 1,
-                body: vec![0, 0, 0, 1]
-            })
-        );
+        assert_eq!(Auth::read(&mut r), Ok(other_auth(0, vec![1, 2, 3, 4])));
+        assert_eq!(Auth::read(&mut r), Ok(other_auth(1, vec![0, 0, 0, 1])));
         assert_eq!(Auth::read(&mut r).unwrap().flavor(), 6);
         // A body over 400 bytes.
         let mut w = Writer::new();
@@ -2059,10 +2002,7 @@ mod tests {
         ];
         let stats = (0..=15).map(|n| Reply::Denied(Reject::AuthError(AuthStat::from_code(n))));
         for reply in replies.into_iter().chain(stats) {
-            let m = Message {
-                xid: 42,
-                body: Body::Reply(reply),
-            };
+            let m = message(42, Body::Reply(reply));
             let bytes = m.to_bytes().unwrap();
             assert_eq!(Message::parse(&bytes), Ok(m.clone()));
             for n in 0..bytes.len() {
@@ -2080,10 +2020,10 @@ mod tests {
             }
         }
         // Spot check one layout: denied, AUTH_ERROR, AUTH_TOOWEAK.
-        let m = Message {
-            xid: 1,
-            body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::TooWeak))),
-        };
+        let m = message(
+            1,
+            Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::TooWeak))),
+        );
         assert_eq!(
             m.to_bytes().unwrap(),
             [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 5]
@@ -2185,36 +2125,21 @@ mod tests {
 
     #[test]
     fn noncanonical_authentication_is_refused() {
-        let sys = AuthSys {
-            stamp: 1,
-            machine_name: "m".into(),
-            uid: 2,
-            gid: 3,
-            gids: vec![4],
-        };
+        let sys = auth_sys(1, "m".into(), 2, 3, vec![4]);
         for auth in [
-            Auth::Other {
-                flavor: 0,
-                body: vec![],
-            },
-            Auth::Other {
-                flavor: 1,
-                body: sys.to_bytes().unwrap(),
-            },
+            other_auth(0, vec![]),
+            other_auth(1, sys.to_bytes().unwrap()),
         ] {
             let mut call = Call::new(1, 2, 3, vec![]);
             call.cred = auth;
-            let message = Message {
-                xid: 1,
-                body: Body::Call(call),
-            };
+            let message = message(1, Body::Call(call));
             assert_eq!(message.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&message);
         }
-        let message = Message {
-            xid: 1,
-            body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(5)))),
-        };
+        let message = message(
+            1,
+            Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(5)))),
+        );
         assert_eq!(message.to_bytes(), Err(Error::Unwritable));
         assert_eq!(AuthSys::parse(&sys.to_bytes().unwrap()), Ok(sys));
     }
@@ -2580,28 +2505,16 @@ mod tests {
 
     #[test]
     fn writers_refuse_excess_fields() {
-        let sys = AuthSys {
-            stamp: 0,
-            machine_name: "é".repeat(200),
-            uid: 0,
-            gid: 0,
-            gids: vec![1; 40],
-        };
+        let sys = auth_sys(0, "é".repeat(200), 0, 0, vec![1; 40]);
         assert!(sys.to_bytes().is_err());
         let call = Call {
             cred: Auth::Sys(sys),
             ..Call::new(1, 1, 1, vec![])
         };
-        let message = Message {
-            xid: 0,
-            body: Body::Call(call),
-        };
+        let message = message(0, Body::Call(call));
         assert!(message.to_bytes().is_err());
         contract::check_wire_value(&message);
-        let other = Auth::Other {
-            flavor: 9,
-            body: vec![1; 1000],
-        };
+        let other = other_auth(9, vec![1; 1000]);
         let mut writer = Writer::new();
         other.write(&mut writer);
         assert!(writer.finish().is_err());
@@ -2631,17 +2544,14 @@ mod tests {
     fn random_auth(rng: &mut Lcg) -> Auth {
         match rng.below(4) {
             0 => Auth::None,
-            1 => Auth::Sys(AuthSys {
-                stamp: (rng.next() as u32),
-                machine_name: rng.text(7),
-                uid: (rng.below(2000) as u32),
-                gid: (rng.below(200) as u32),
-                gids: (0..rng.below(4)).map(|_| rng.below(100) as u32).collect(),
-            }),
-            _ => Auth::Other {
-                flavor: (rng.below(8) as u32),
-                body: rng.bytes(11),
-            },
+            1 => Auth::Sys(auth_sys(
+                rng.next() as u32,
+                rng.text(7),
+                rng.below(2000) as u32,
+                rng.below(200) as u32,
+                (0..rng.below(4)).map(|_| rng.below(100) as u32).collect(),
+            )),
+            _ => other_auth(rng.below(8) as u32, rng.bytes(11)),
         }
     }
 
@@ -2662,10 +2572,10 @@ mod tests {
         let body = match rng.below(4) {
             0 => {
                 let map = Mapping {
-                    program: (rng.below(3) as u32),
-                    version: (rng.below(4) as u32),
+                    program: rng.below(3) as u32,
+                    version: rng.below(4) as u32,
                     protocol: 6,
-                    port: (rng.below(3) as u32),
+                    port: rng.below(3) as u32,
                 };
                 let req = match rng.below(5) {
                     0 => PmapRequest::Null,
@@ -2676,7 +2586,7 @@ mod tests {
                 };
                 let mut call = Call::new(
                     PMAP_PROGRAM,
-                    2 + (rng.below(3) as u32),
+                    2 + rng.below(3) as u32,
                     req.procedure(),
                     req.to_args().unwrap(),
                 );
@@ -2685,7 +2595,7 @@ mod tests {
             }
             1 => {
                 let mut call = Call::new(
-                    (rng.below(3) as u32) + 100_000,
+                    rng.below(3) as u32 + 100_000,
                     rng.below(5) as u32,
                     rng.below(6) as u32,
                     words(rng),
@@ -2699,8 +2609,8 @@ mod tests {
                     0 => Accept::Success(words(rng)),
                     1 => Accept::ProgUnavail,
                     2 => Accept::ProgMismatch {
-                        low: (rng.below(4) as u32),
-                        high: (rng.below(4) as u32),
+                        low: rng.below(4) as u32,
+                        high: rng.below(4) as u32,
                     },
                     3 => Accept::ProcUnavail,
                     4 => Accept::GarbageArgs,
@@ -2713,17 +2623,14 @@ mod tests {
             }
             _ => Body::Reply(Reply::Denied(if !rng.coin() {
                 Reject::RpcMismatch {
-                    low: (rng.below(4) as u32),
-                    high: (rng.below(4) as u32),
+                    low: rng.below(4) as u32,
+                    high: rng.below(4) as u32,
                 }
             } else {
                 Reject::AuthError(AuthStat::from_code(rng.below(20) as u32))
             })),
         };
-        Message {
-            xid: (rng.next() as u32),
-            body,
-        }
+        message(rng.next() as u32, body)
     }
 
     /// The bytes of a random message, often changed: a byte flipped, cut

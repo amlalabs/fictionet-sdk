@@ -2369,6 +2369,39 @@ mod tests {
     use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
+    fn server_init(width: u16, height: u16, format: PixelFormat, name: Vec<u8>) -> ServerInit {
+        ServerInit {
+            width,
+            height,
+            format,
+            name,
+        }
+    }
+
+    fn update_request(incremental: bool, x: u16, y: u16, width: u16, height: u16) -> ClientMessage {
+        ClientMessage::FramebufferUpdateRequest {
+            incremental,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn pointer(buttons: u8, x: u16, y: u16) -> ClientMessage {
+        ClientMessage::PointerEvent { buttons, x, y }
+    }
+
+    fn rectangle(x: u16, y: u16, width: u16, height: u16, contents: Contents) -> Rectangle {
+        Rectangle {
+            x,
+            y,
+            width,
+            height,
+            contents,
+        }
+    }
+
     /// Runs a server and a client session against each other, passing
     /// every message through bytes, and checks each side reads what the
     /// other sent.
@@ -2406,12 +2439,7 @@ mod tests {
         assert_eq!(s.phase(), c.phase());
         if s.phase() == Phase::ClientInit {
             to_server(&mut s, &mut c, ClientMessage::ClientInit { shared: false });
-            let init = ServerInit {
-                width: 1024,
-                height: 768,
-                format: PixelFormat::TRUE_COLOR_32,
-                name: b"desk".to_vec(),
-            };
+            let init = server_init(1024, 768, PixelFormat::TRUE_COLOR_32, b"desk".to_vec());
             to_client(&mut s, &mut c, ServerMessage::ServerInit(init));
             assert_eq!(s.phase(), Phase::Normal);
             assert_eq!(c.phase(), Phase::Normal);
@@ -2441,13 +2469,7 @@ mod tests {
                 encoding::DESKTOP_SIZE,
             ]),
             ClientMessage::SetEncodings(vec![]),
-            ClientMessage::FramebufferUpdateRequest {
-                incremental: true,
-                x: 1,
-                y: 2,
-                width: 300,
-                height: 400,
-            },
+            update_request(true, 1, 2, 300, 400),
             ClientMessage::KeyEvent {
                 down: true,
                 key: 0xff0d,
@@ -2456,11 +2478,7 @@ mod tests {
                 down: false,
                 key: 0x61,
             },
-            ClientMessage::PointerEvent {
-                buttons: 0b101,
-                x: 0x1234,
-                y: 7,
-            },
+            pointer(0b101, 0x1234, 7),
             ClientMessage::ClientCutText(b"hello".to_vec()),
             ClientMessage::ClientCutText(vec![]),
         ]
@@ -2469,44 +2487,20 @@ mod tests {
     fn sample_server_messages() -> Vec<ServerMessage> {
         vec![
             ServerMessage::FramebufferUpdate(vec![
-                Rectangle {
-                    x: 0,
-                    y: 0,
-                    width: 2,
-                    height: 1,
-                    contents: Contents::Raw(vec![1, 2, 3, 4, 5, 6, 7, 8]),
-                },
-                Rectangle {
-                    x: 5,
-                    y: 6,
-                    width: 10,
-                    height: 10,
-                    contents: Contents::CopyRect { src_x: 1, src_y: 2 },
-                },
-                Rectangle {
-                    x: 1,
-                    y: 1,
-                    width: 9,
-                    height: 1,
-                    contents: Contents::Cursor {
+                rectangle(0, 0, 2, 1, Contents::Raw(vec![1, 2, 3, 4, 5, 6, 7, 8])),
+                rectangle(5, 6, 10, 10, Contents::CopyRect { src_x: 1, src_y: 2 }),
+                rectangle(
+                    1,
+                    1,
+                    9,
+                    1,
+                    Contents::Cursor {
                         pixels: vec![0xaa; 36],
                         mask: vec![0xff, 0x80],
                     },
-                },
-                Rectangle {
-                    x: 0,
-                    y: 0,
-                    width: 0,
-                    height: 0,
-                    contents: Contents::Raw(vec![]),
-                },
-                Rectangle {
-                    x: 0,
-                    y: 0,
-                    width: 800,
-                    height: 600,
-                    contents: Contents::DesktopSize,
-                },
+                ),
+                rectangle(0, 0, 0, 0, Contents::Raw(vec![])),
+                rectangle(0, 0, 800, 600, Contents::DesktopSize),
             ]),
             ServerMessage::FramebufferUpdate(vec![]),
             ServerMessage::SetColorMapEntries {
@@ -2659,22 +2653,10 @@ mod tests {
             Some(ServerMessage::SecurityFailed(vec![])),
         );
         assert_eq!((s.phase(), c.phase()), (Phase::Closed, Phase::Closed));
-        assert_eq!(
-            server_bytes(
-                &ServerMessage::SecurityFailed(vec![]),
-                Dialect::V3_7,
-                &PixelFormat::TRUE_COLOR_32
-            ),
-            Ok(vec![0, 0, 0, 1])
-        );
-        // A reason the wire cannot carry is refused, not dropped.
-        assert_eq!(
-            server_bytes(
-                &ServerMessage::SecurityFailed(b"x".to_vec()),
-                Dialect::V3_7,
-                &PixelFormat::TRUE_COLOR_32
-            ),
-            Err(Error::Unwritable)
+        fictionet::assert_cases!(server_bytes;
+            (&ServerMessage::SecurityFailed(vec![]), Dialect::V3_7, &PixelFormat::TRUE_COLOR_32) => Ok(vec![0, 0, 0, 1]),
+            // A reason the wire cannot carry is refused, not dropped.
+            (&ServerMessage::SecurityFailed(b"x".to_vec()), Dialect::V3_7, &PixelFormat::TRUE_COLOR_32) => Err(Error::Unwritable),
         );
     }
 
@@ -2799,17 +2781,10 @@ mod tests {
         let _ = s.push(b"RFB 003.008\n");
         s.next().unwrap().unwrap().unwrap();
         // A 3.8 server offers a list; a single type is 3.3's.
-        assert_eq!(
-            s.send(&ServerMessage::SecurityType(1)),
-            Err(Error::Phase(Phase::SecurityOffer))
-        );
-        assert_eq!(
-            s.send(&ServerMessage::SecurityTypes(vec![])),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            s.send(&ServerMessage::SecurityTypes(vec![1; 256])),
-            Err(Error::Unwritable)
+        fictionet::assert_cases!(|message| s.send(message);
+            wrong_phase: &ServerMessage::SecurityType(1) => Err(Error::Phase(Phase::SecurityOffer)),
+            empty_types: &ServerMessage::SecurityTypes(vec![]) => Err(Error::Unwritable),
+            excess_types: &ServerMessage::SecurityTypes(vec![1; 256]) => Err(Error::Unwritable),
         );
         assert_eq!(s.phase(), Phase::SecurityOffer);
         let mut c = Client::new();
@@ -2870,21 +2845,11 @@ mod tests {
         // A 3.3 type sent to a 3.8 client would read as a refusal, and a
         // list sent to a 3.3 client as a type number.
         let f = PixelFormat::TRUE_COLOR_32;
-        assert_eq!(
-            server_bytes(&ServerMessage::SecurityType(1), Dialect::V3_8, &f),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            server_bytes(&ServerMessage::SecurityType(1), Dialect::V3_7, &f),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            server_bytes(&ServerMessage::SecurityTypes(vec![1]), Dialect::V3_3, &f),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            server_bytes(&ServerMessage::SecurityTypes(vec![1]), Dialect::V3_7, &f),
-            Ok(vec![1, 1])
+        fictionet::assert_cases!(server_bytes;
+            (&ServerMessage::SecurityType(1), Dialect::V3_8, &f) => Err(Error::Unwritable),
+            (&ServerMessage::SecurityType(1), Dialect::V3_7, &f) => Err(Error::Unwritable),
+            (&ServerMessage::SecurityTypes(vec![1]), Dialect::V3_3, &f) => Err(Error::Unwritable),
+            (&ServerMessage::SecurityTypes(vec![1]), Dialect::V3_7, &f) => Ok(vec![1, 1]),
         );
     }
 
@@ -2950,12 +2915,7 @@ mod tests {
             green_shift: 5,
             blue_shift: 0,
         };
-        let init = ServerInit {
-            width: 1024,
-            height: 768,
-            format,
-            name: b"abc".to_vec(),
-        };
+        let init = server_init(1024, 768, format, b"abc".to_vec());
         assert_eq!(
             c.next(),
             Some(Ok(Ok(ServerMessage::ServerInit(init.clone()))))
@@ -3013,12 +2973,7 @@ mod tests {
             ServerMessage::SecurityTypes(vec![1, 2]),
             ServerMessage::VncChallenge([3; 16]),
             ServerMessage::SecurityOk,
-            ServerMessage::ServerInit(ServerInit {
-                width: 1,
-                height: 1,
-                format,
-                name: b"n".to_vec(),
-            }),
+            ServerMessage::ServerInit(server_init(1, 1, format, b"n".to_vec())),
             ServerMessage::Bell,
         ] {
             message
@@ -3052,14 +3007,9 @@ mod tests {
             [&b"RFB 003.007\n"[..], &[2], &[0; 16], &[0]].concat(),
             [&b"RFB 003.003\n"[..], &[0; 16], &[1]].concat(),
         ];
-        let init = ServerInit {
-            width: 2,
-            height: 2,
-            format: PixelFormat::TRUE_COLOR_32,
-            name: vec![],
-        }
-        .to_bytes()
-        .unwrap();
+        let init = server_init(2, 2, PixelFormat::TRUE_COLOR_32, vec![])
+            .to_bytes()
+            .unwrap();
         let to_client = [
             vec![],
             b"RFB 003.008\n".to_vec(),
@@ -3072,13 +3022,7 @@ mod tests {
         for _ in 0..4000 {
             let vnc = rng.coin();
             let mut data = to_server[rng.index(to_server.len())].clone();
-            ClientMessage::PointerEvent {
-                buttons: rng.next() as u8,
-                x: 1,
-                y: 1,
-            }
-            .write(&mut data)
-            .unwrap();
+            pointer(rng.next() as u8, 1, 1).write(&mut data).unwrap();
             data.extend(rng.bytes(80));
             let whole = harness::as_server(vnc, [&data[..]]);
             assert_eq!(whole, harness::as_server(vnc, chunks(&data, &[1])));
@@ -3117,16 +3061,7 @@ mod tests {
     #[test]
     fn session_messages_byte_at_a_time_are_bounded() {
         let check = |size| {
-            let rectangles = vec![
-                Rectangle {
-                    x: 0,
-                    y: 0,
-                    width: 1,
-                    height: 1,
-                    contents: Contents::Raw(vec![1, 2, 3, 4])
-                };
-                size
-            ];
+            let rectangles = vec![rectangle(0, 0, 1, 1, Contents::Raw(vec![1, 2, 3, 4])); size];
             let update = ServerMessage::FramebufferUpdate(rectangles);
             let bytes = server_bytes(&update, Dialect::V3_8, &PixelFormat::TRUE_COLOR_32).unwrap();
             let (mut server, mut client) = normal_pair();
@@ -3139,11 +3074,7 @@ mod tests {
             }
             assert_eq!(client.next(), Some(Ok(Ok(update))));
             assert_eq!(client.buffered(), 0);
-            let message = ClientMessage::PointerEvent {
-                buttons: 0,
-                x: 1,
-                y: 1,
-            };
+            let message = pointer(0, 1, 1);
             let bytes = message.to_bytes().unwrap();
             for _ in 0..size * 2 {
                 for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
@@ -3264,39 +3195,13 @@ mod tests {
     #[test]
     fn client_message_examples() {
         // RFC 6143, sections 7.5.3 to 7.5.6.
-        assert_eq!(
-            ClientMessage::parse(&[3, 1, 0, 0, 0, 0, 0x04, 0x00, 0x03, 0x00]),
-            Ok(ClientMessage::FramebufferUpdateRequest {
-                incremental: true,
-                x: 0,
-                y: 0,
-                width: 1024,
-                height: 768
-            })
-        );
-        // Return, pressed: keysym 0xff0d.
-        assert_eq!(
-            ClientMessage::parse(&[4, 1, 0, 0, 0, 0, 0xff, 0x0d]),
-            Ok(ClientMessage::KeyEvent {
-                down: true,
-                key: 0xff0d
-            })
-        );
-        assert_eq!(
-            ClientMessage::parse(&[5, 1, 0, 10, 0, 20]),
-            Ok(ClientMessage::PointerEvent {
-                buttons: 1,
-                x: 10,
-                y: 20
-            })
-        );
-        assert_eq!(
-            ClientMessage::parse(&[2, 0, 0, 2, 0, 0, 0, 1, 0xff, 0xff, 0xff, 0x21]),
-            Ok(ClientMessage::SetEncodings(vec![1, -223]))
-        );
-        assert_eq!(
-            ClientMessage::parse(&[6, 0, 0, 0, 0, 0, 0, 2, b'h', b'i']),
-            Ok(ClientMessage::ClientCutText(b"hi".to_vec()))
+        fictionet::assert_cases!(|input| ClientMessage::parse(input);
+            update_request: &[3, 1, 0, 0, 0, 0, 0x04, 0x00, 0x03, 0x00] => Ok(update_request(true, 0, 0, 1024, 768)),
+            // Return, pressed: keysym 0xff0d.
+            key_event: &[4, 1, 0, 0, 0, 0, 0xff, 0x0d] => Ok(ClientMessage::KeyEvent { down: true, key: 0xff0d }),
+            pointer_event: &[5, 1, 0, 10, 0, 20] => Ok(pointer(1, 10, 20)),
+            encodings: &[2, 0, 0, 2, 0, 0, 0, 1, 0xff, 0xff, 0xff, 0x21] => Ok(ClientMessage::SetEncodings(vec![1, -223])),
+            cut_text: &[6, 0, 0, 0, 0, 0, 0, 2, b'h', b'i'] => Ok(ClientMessage::ClientCutText(b"hi".to_vec())),
         );
     }
 
@@ -3379,20 +3284,8 @@ mod tests {
             0, 4, 0, 4, 0, 2, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0,
         ];
         let want = ServerMessage::FramebufferUpdate(vec![
-            Rectangle {
-                x: 2,
-                y: 3,
-                width: 1,
-                height: 1,
-                contents: Contents::Raw(vec![0x11, 0x22, 0x33, 0]),
-            },
-            Rectangle {
-                x: 4,
-                y: 4,
-                width: 2,
-                height: 2,
-                contents: Contents::CopyRect { src_x: 0, src_y: 0 },
-            },
+            rectangle(2, 3, 1, 1, Contents::Raw(vec![0x11, 0x22, 0x33, 0])),
+            rectangle(4, 4, 2, 2, Contents::CopyRect { src_x: 0, src_y: 0 }),
         ]);
         assert_eq!(
             ServerMessage::parse(&bytes, &PixelFormat::TRUE_COLOR_32),
@@ -3423,17 +3316,10 @@ mod tests {
         // Raw pixels need a valid format.
         let mut bad = f;
         bad.bits_per_pixel = 24;
-        assert_eq!(
-            ServerMessage::parse(&rect(encoding::RAW), &bad),
-            Err(Error::BitsPerPixel(24))
-        );
-        assert_eq!(
-            ServerMessage::parse(&rect(encoding::CURSOR), &bad),
-            Err(Error::BitsPerPixel(24))
-        );
-        assert_eq!(
-            ServerMessage::parse(&rect(encoding::COPY_RECT), &bad),
-            Err(Error::Truncated)
+        fictionet::assert_cases!(ServerMessage::parse;
+            (&rect(encoding::RAW), &bad) => Err(Error::BitsPerPixel(24)),
+            (&rect(encoding::CURSOR), &bad) => Err(Error::BitsPerPixel(24)),
+            (&rect(encoding::COPY_RECT), &bad) => Err(Error::Truncated),
         );
         // Text and messages past the limits.
         assert_eq!(
@@ -3496,29 +3382,11 @@ mod tests {
     #[test]
     fn writers_refuse_changes() {
         let f = PixelFormat::TRUE_COLOR_32;
-        let rect = |contents| {
-            ServerMessage::FramebufferUpdate(vec![Rectangle {
-                x: 0,
-                y: 0,
-                width: 2,
-                height: 2,
-                contents,
-            }])
-        };
-        assert_eq!(
-            server_bytes(&rect(Contents::Raw(vec![0; 15])), Dialect::V3_8, &f),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            server_bytes(
-                &rect(Contents::Cursor {
-                    pixels: vec![0; 16],
-                    mask: vec![0; 3]
-                }),
-                Dialect::V3_8,
-                &f
-            ),
-            Err(Error::Unwritable)
+        let rect =
+            |contents| ServerMessage::FramebufferUpdate(vec![rectangle(0, 0, 2, 2, contents)]);
+        fictionet::assert_cases!(server_bytes;
+            (&rect(Contents::Raw(vec![0; 15])), Dialect::V3_8, &f) => Err(Error::Unwritable),
+            (&rect(Contents::Cursor { pixels: vec![0; 16], mask: vec![0; 3] }), Dialect::V3_8, &f) => Err(Error::Unwritable),
         );
         let mut bad = f;
         bad.bits_per_pixel = 12;
@@ -3526,28 +3394,23 @@ mod tests {
             server_bytes(&rect(Contents::Raw(vec![])), Dialect::V3_8, &bad),
             Err(Error::BitsPerPixel(12))
         );
-        let many = ServerMessage::FramebufferUpdate(vec![
-            Rectangle {
-                x: 0,
-                y: 0,
-                width: 0,
-                height: 0,
-                contents: Contents::DesktopSize
-            };
-            MAX_ITEMS + 1
-        ]);
+        let many =
+            ServerMessage::FramebufferUpdate(vec![
+                rectangle(0, 0, 0, 0, Contents::DesktopSize);
+                MAX_ITEMS + 1
+            ]);
         assert_eq!(
             server_bytes(&many, Dialect::V3_8, &f),
             Err(Error::Unwritable)
         );
         // Two rectangles that are each under the limit but not together.
-        let half = Rectangle {
-            x: 0,
-            y: 0,
-            width: 4096,
-            height: 4096,
-            contents: Contents::Raw(vec![0; 4096 * 4096 * 4 / 2]),
-        };
+        let half = rectangle(
+            0,
+            0,
+            4096,
+            4096,
+            Contents::Raw(vec![0; 4096 * 4096 * 4 / 2]),
+        );
         let mut bad = f;
         bad.bits_per_pixel = 16;
         let both = ServerMessage::FramebufferUpdate(vec![half.clone(), half]);
@@ -3588,12 +3451,7 @@ mod tests {
         );
         let b = server_bytes(&colors(MAX_ITEMS), Dialect::V3_8, &f).unwrap();
         assert_eq!(ServerMessage::parse(&b, &f), Ok(colors(MAX_ITEMS)));
-        let name = ServerMessage::ServerInit(ServerInit {
-            width: 1,
-            height: 1,
-            format: f,
-            name: vec![0; MAX_TEXT + 1],
-        });
+        let name = ServerMessage::ServerInit(server_init(1, 1, f, vec![0; MAX_TEXT + 1]));
         assert_eq!(server_bytes(&name, Dialect::V3_8, &f), Err(Error::TooLong));
         for long in [
             ServerMessage::ServerCutText(vec![0; MAX_TEXT + 1]),
@@ -3632,16 +3490,7 @@ mod tests {
         let check = |size| {
             // A client that sends pointer events while an update comes in does
             // not read the update's rectangles over again.
-            let rects = vec![
-                Rectangle {
-                    x: 0,
-                    y: 0,
-                    width: 1,
-                    height: 1,
-                    contents: Contents::Raw(vec![1, 2, 3, 4])
-                };
-                size
-            ];
+            let rects = vec![rectangle(0, 0, 1, 1, Contents::Raw(vec![1, 2, 3, 4])); size];
             let bytes = server_bytes(
                 &ServerMessage::FramebufferUpdate(rects),
                 Dialect::V3_8,
@@ -3659,12 +3508,7 @@ mod tests {
                         got += 1;
                     }
                     None => {
-                        c.send(&ClientMessage::PointerEvent {
-                            buttons: 0,
-                            x: 1,
-                            y: 1,
-                        })
-                        .unwrap();
+                        c.send(&pointer(0, 1, 1)).unwrap();
                     }
                 }
             }
@@ -3724,14 +3568,7 @@ mod tests {
         );
         // An outstanding request waits for its update.
         let (_, mut c) = normal_pair();
-        c.send(&ClientMessage::FramebufferUpdateRequest {
-            incremental: true,
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-        })
-        .unwrap();
+        c.send(&update_request(true, 0, 0, 1, 1)).unwrap();
         assert_eq!(
             c.send(&ClientMessage::SetPixelFormat(f8)),
             Err(Error::Outstanding)
@@ -3785,12 +3622,7 @@ mod tests {
             bits_per_pixel: 24,
             ..PixelFormat::TRUE_COLOR_32
         };
-        let init = ServerMessage::ServerInit(ServerInit {
-            width: 1,
-            height: 1,
-            format: f24,
-            name: vec![],
-        });
+        let init = ServerMessage::ServerInit(server_init(1, 1, f24, vec![]));
         assert_eq!(
             server_bytes(&init, Dialect::V3_3, &f24),
             Err(Error::PixelFormat)
@@ -3814,20 +3646,8 @@ mod tests {
             ClientMessage::SetEncodings(vec![encoding::COPY_RECT, encoding::DESKTOP_SIZE]),
         );
         let update = |rects| ServerMessage::FramebufferUpdate(rects);
-        let rect = |x, y, width, height, contents| Rectangle {
-            x,
-            y,
-            width,
-            height,
-            contents,
-        };
-        let request = ClientMessage::FramebufferUpdateRequest {
-            incremental: true,
-            x: 0,
-            y: 0,
-            width: 1024,
-            height: 768,
-        };
+        let rect = |x, y, width, height, contents| rectangle(x, y, width, height, contents);
+        let request = update_request(true, 0, 0, 1024, 768);
         client_says(&mut s, &mut c, request.clone());
         for bad in [
             update(vec![rect(1024, 0, 1, 1, Contents::Raw(vec![0; 4]))]),
@@ -3873,17 +3693,7 @@ mod tests {
         ]);
         let _ = c.push(&s.send(&shrink).unwrap());
         assert_eq!(c.next(), Some(Ok(Ok(shrink))));
-        client_says(
-            &mut s,
-            &mut c,
-            ClientMessage::FramebufferUpdateRequest {
-                incremental: true,
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            },
-        );
+        client_says(&mut s, &mut c, update_request(true, 0, 0, 1, 1));
         let past = update(vec![rect(640, 0, 1, 1, Contents::Raw(vec![0; 4]))]);
         assert_eq!(s.send(&past), Err(Error::Rectangle));
         let _ = c.push(&server_bytes(&past, Dialect::V3_8, &f).unwrap());
@@ -3895,20 +3705,8 @@ mod tests {
         // RFC 6143, section 7.8.2.
         let f = PixelFormat::TRUE_COLOR_32;
         let early = vec![
-            Rectangle {
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 600,
-                contents: Contents::DesktopSize,
-            },
-            Rectangle {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-                contents: Contents::Raw(vec![0; 4]),
-            },
+            rectangle(0, 0, 800, 600, Contents::DesktopSize),
+            rectangle(0, 0, 1, 1, Contents::Raw(vec![0; 4])),
         ];
         assert_eq!(
             server_bytes(
@@ -3941,57 +3739,45 @@ mod tests {
         // RFC 6143, sections 7.5.2, 7.6.1 and 7.6.2, and The RFB Protocol,
         // section 7.5.3, on CopyRect.
         let (mut s, mut c) = normal_pair();
-        let raw = ServerMessage::FramebufferUpdate(vec![Rectangle {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-            contents: Contents::Raw(vec![0; 4]),
-        }]);
-        let copy = ServerMessage::FramebufferUpdate(vec![Rectangle {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-            contents: Contents::CopyRect { src_x: 1, src_y: 1 },
-        }]);
-        let cursor = ServerMessage::FramebufferUpdate(vec![Rectangle {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-            contents: Contents::Cursor {
+        let raw = ServerMessage::FramebufferUpdate(vec![rectangle(
+            0,
+            0,
+            1,
+            1,
+            Contents::Raw(vec![0; 4]),
+        )]);
+        let copy = ServerMessage::FramebufferUpdate(vec![rectangle(
+            0,
+            0,
+            1,
+            1,
+            Contents::CopyRect { src_x: 1, src_y: 1 },
+        )]);
+        let cursor = ServerMessage::FramebufferUpdate(vec![rectangle(
+            0,
+            0,
+            1,
+            1,
+            Contents::Cursor {
                 pixels: vec![0; 4],
                 mask: vec![0x80],
             },
-        }]);
-        let resize = ServerMessage::FramebufferUpdate(vec![Rectangle {
-            x: 0,
-            y: 0,
-            width: 640,
-            height: 480,
-            contents: Contents::DesktopSize,
-        }]);
+        )]);
+        let resize = ServerMessage::FramebufferUpdate(vec![rectangle(
+            0,
+            0,
+            640,
+            480,
+            Contents::DesktopSize,
+        )]);
         // No request yet.
         assert_eq!(s.send(&raw), Err(Error::NotRequested));
         assert_eq!(
             s.send(&ServerMessage::FramebufferUpdate(vec![])),
             Err(Error::NotRequested)
         );
-        let full = ClientMessage::FramebufferUpdateRequest {
-            incremental: false,
-            x: 0,
-            y: 0,
-            width: 1024,
-            height: 768,
-        };
-        let incremental = ClientMessage::FramebufferUpdateRequest {
-            incremental: true,
-            x: 0,
-            y: 0,
-            width: 1024,
-            height: 768,
-        };
+        let full = update_request(false, 0, 0, 1024, 768);
+        let incremental = update_request(true, 0, 0, 1024, 768);
         client_says(&mut s, &mut c, full.clone());
         // Encodings the client did not list.
         for m in [&copy, &cursor, &resize] {
@@ -4112,13 +3898,7 @@ mod tests {
                 (vec![Ok(message)], None)
             );
         }
-        let rect = Rectangle {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-            contents: Contents::Raw(vec![1, 2, 3, 4]),
-        };
+        let rect = rectangle(0, 0, 1, 1, Contents::Raw(vec![1, 2, 3, 4]));
         let f = PixelFormat::TRUE_COLOR_32;
         let bytes = server_bytes(
             &ServerMessage::FramebufferUpdate(vec![rect; MAX_ITEMS]),
@@ -4127,14 +3907,7 @@ mod tests {
         )
         .unwrap();
         contract::check_decode_with_alloc_limit(|| normal_server(f), &bytes, 2 * MAX_MESSAGE);
-        let bytes = ClientMessage::PointerEvent {
-            buttons: 0,
-            x: 1,
-            y: 1,
-        }
-        .to_bytes()
-        .unwrap()
-        .repeat(rounds(20_000));
+        let bytes = pointer(0, 1, 1).to_bytes().unwrap().repeat(rounds(20_000));
         contract::check_decode_with_alloc_limit(normal_client, &bytes, 2 * MAX_CLIENT_MESSAGE);
     }
 
@@ -4183,19 +3956,15 @@ mod tests {
                     down: rng.coin(),
                     key: rng.next() as u32,
                 },
-                2 => ClientMessage::PointerEvent {
-                    buttons: rng.next() as u8,
-                    x: rng.next() as u16,
-                    y: rng.next() as u16,
-                },
+                2 => pointer(rng.next() as u8, rng.next() as u16, rng.next() as u16),
                 3 => ClientMessage::ClientCutText(rng.bytes(50)),
-                _ => ClientMessage::FramebufferUpdateRequest {
-                    incremental: rng.coin(),
-                    x: rng.next() as u16,
-                    y: rng.next() as u16,
-                    width: rng.next() as u16,
-                    height: rng.next() as u16,
-                },
+                _ => update_request(
+                    rng.coin(),
+                    rng.next() as u16,
+                    rng.next() as u16,
+                    rng.next() as u16,
+                    rng.next() as u16,
+                ),
             };
             contract::check_wire_value(&message);
             let format = PixelFormat {
@@ -4240,13 +4009,13 @@ mod tests {
                     }
                     _ => Contents::DesktopSize,
                 };
-                rects.push(Rectangle {
-                    x: rng.next() as u16,
-                    y: rng.next() as u16,
+                rects.push(rectangle(
+                    rng.next() as u16,
+                    rng.next() as u16,
                     width,
                     height,
                     contents,
-                });
+                ));
             }
             let message = ServerMessage::FramebufferUpdate(rects);
             let mut bytes = vec![7, 8];

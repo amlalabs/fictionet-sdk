@@ -1956,6 +1956,14 @@ mod tests {
     use fictionet::stdlib::test_support::contract::{check_wire, check_wire_value};
     use fictionet::stdlib::test_support::mutate;
 
+    fn cancel_order(user_ref: u32, quantity: u32, options: Option<Options>) -> CancelOrder {
+        CancelOrder {
+            user_ref,
+            quantity,
+            options,
+        }
+    }
+
     fn alpha<const N: usize>(s: &str) -> Alpha<N> {
         Alpha::right_padded(s).unwrap()
     }
@@ -2005,11 +2013,7 @@ mod tests {
     // 2.3: Cancel Order, with and without the optional appendage.
     #[test]
     fn cancel_order_bytes() {
-        let bare = CancelOrder {
-            user_ref: 9,
-            quantity: 0,
-            options: None,
-        };
+        let bare = cancel_order(9, 0, None);
         assert_eq!(bare.to_bytes().unwrap(), [b'X', 0, 0, 0, 9, 0, 0, 0, 0]);
         let empty = CancelOrder {
             options: Some(Options::default()),
@@ -2187,11 +2191,7 @@ mod tests {
 
     #[test]
     fn refuses_bad_appendages() {
-        let base = CancelOrder {
-            user_ref: 1,
-            quantity: 0,
-            options: Some(Options::default()),
-        };
+        let base = cancel_order(1, 0, Some(Options::default()));
         let with = |opts: &[u8]| {
             let mut b = base.to_bytes().unwrap();
             b.truncate(9);
@@ -2268,12 +2268,7 @@ mod tests {
                 options: Options::of(Opt::Side(Side::Sell)),
             }
             .into(),
-            CancelOrder {
-                user_ref: 2,
-                quantity: 0,
-                options: idx.clone(),
-            }
-            .into(),
+            cancel_order(2, 0, idx.clone()).into(),
             ModifyOrder {
                 user_ref: 2,
                 side: Side::SellShort,
@@ -2649,18 +2644,7 @@ mod tests {
             x.execute(token(1), 401, Price(1), b'A', 4),
             Err(Error::Shares)
         );
-        let out = sends(
-            x.receive(
-                &CancelOrder {
-                    user_ref: 1,
-                    quantity: 100,
-                    options: None,
-                }
-                .into(),
-                5,
-            )
-            .unwrap(),
-        );
+        let out = sends(x.receive(&cancel_order(1, 100, None).into(), 5).unwrap());
         assert_eq!(
             out,
             [OrderCanceled {
@@ -2675,16 +2659,7 @@ mod tests {
         assert_eq!(x.order(token(1)).unwrap().quantity, 100);
         // A cancel that would not reduce is ignored (2.3).
         assert_eq!(
-            x.receive(
-                &CancelOrder {
-                    user_ref: 1,
-                    quantity: 100,
-                    options: None
-                }
-                .into(),
-                6
-            )
-            .unwrap(),
+            x.receive(&cancel_order(1, 100, None).into(), 6).unwrap(),
             [Action::Event(Event::Ignored(Ignored::NoReduction(token(
                 1
             ))))]
@@ -2781,26 +2756,12 @@ mod tests {
             options: Options::default(),
         };
         // Case 1: an unknown original or a used UserRefNum is ignored.
-        assert_eq!(
-            x.receive(&replace(99, 11, 500).into(), 3).unwrap(),
-            [Action::Event(Event::Ignored(Ignored::UnknownOrder(token(
-                99
-            ))))]
-        );
-        assert_eq!(
-            x.receive(&replace(10, 10, 500).into(), 3).unwrap(),
-            [Action::Event(Event::Ignored(Ignored::Retransmission(
-                token(10)
-            )))]
-        );
-        // Case 4: replaced. Shares are liable over the chain: 500 less the
-        // 100 executed leaves 400 (2.2, 3.3).
-        assert_eq!(
-            x.receive(&replace(10, 11, 500).into(), 4).unwrap(),
-            [Action::Event(Event::ReplaceRequested {
-                original: token(10),
-                replacement: token(11)
-            })]
+        fictionet::assert_cases!(|message, time| x.receive(message, time).unwrap();
+            (&replace(99, 11, 500).into(), 3) => [Action::Event(Event::Ignored(Ignored::UnknownOrder(token( 99 ))))],
+            (&replace(10, 10, 500).into(), 3) => [Action::Event(Event::Ignored(Ignored::Retransmission( token(10) )))],
+            // Case 4: replaced. Shares are liable over the chain: 500 less the
+            // 100 executed leaves 400 (2.2, 3.3).
+            (&replace(10, 11, 500).into(), 4) => [Action::Event(Event::ReplaceRequested { original: token(10), replacement: token(11) })],
         );
         let Outbound::OrderReplaced(r) = x.accept(token(11), 5).unwrap() else {
             panic!()
@@ -3225,25 +3186,11 @@ mod tests {
         x.receive(&enter(1, 100, Options::default()).into(), 5)
             .unwrap();
         let capture = |x: &Exchange| format!("{x:?}");
-        assert_eq!(
-            check_atomic(
-                &mut x,
-                |x| x.receive(&enter(2, 100, Options::default()).into(), 4),
-                capture
-            ),
-            Err(Error::Time)
-        );
-        assert_eq!(
-            check_atomic(&mut x, |x| x.accept(token(1), 4), capture),
-            Err(Error::Time)
-        );
-        assert_eq!(
-            check_atomic(&mut x, |x| x.reject(token(1), 1, 4), capture),
-            Err(Error::Time)
-        );
-        assert_eq!(
-            check_atomic(&mut x, |x| x.system_event(b'S', 4), capture),
-            Err(Error::Time)
+        fictionet::assert_cases!(|operation| check_atomic(&mut x, operation, capture);
+            receive: |x: &mut Exchange| x.receive(&enter(2, 100, Options::default()).into(), 4) => Err(Error::Time),
+            accept: |x: &mut Exchange| x.accept(token(1), 4) => Err(Error::Time),
+            reject: |x: &mut Exchange| x.reject(token(1), 1, 4) => Err(Error::Time),
+            system_event: |x: &mut Exchange| x.system_event(b'S', 4) => Err(Error::Time),
         );
         x.accept(token(1), 6).unwrap();
         assert_eq!(x.execute(token(1), 1, Price(1), b'A', 5), Err(Error::Time));

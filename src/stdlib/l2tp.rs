@@ -1286,24 +1286,14 @@ mod tests {
     #[test]
     fn message_errors() {
         // The first AVP is not a message type.
-        assert_eq!(
-            ControlMessage::parse(&[0x80, 8, 0, 0, 0, 9, 0, 1]),
-            Err(Error::MessageType)
-        );
-        // A hidden message type.
-        assert_eq!(
-            ControlMessage::parse(&[0xc0, 8, 0, 0, 0, 0, 0, 1]),
-            Err(Error::MessageType)
-        );
-        // A message type with a 3-byte value.
-        assert_eq!(
-            ControlMessage::parse(&[0x80, 9, 0, 0, 0, 0, 0, 1, 0]),
-            Err(Error::MessageType)
-        );
-        // An AVP that runs past the body, and a bad AVP length.
-        assert_eq!(
-            ControlMessage::parse(&[0x80, 8, 0, 0, 0, 0, 0, 6, 0x80, 9]),
-            Err(Error::Truncated)
+        fictionet::assert_cases!(|input| ControlMessage::parse(input);
+            wrong_vendor: &[0x80, 8, 0, 0, 0, 9, 0, 1] => Err(Error::MessageType),
+            // A hidden message type.
+            hidden_type: &[0xc0, 8, 0, 0, 0, 0, 0, 1] => Err(Error::MessageType),
+            // A message type with a 3-byte value.
+            long_type: &[0x80, 9, 0, 0, 0, 0, 0, 1, 0] => Err(Error::MessageType),
+            // An AVP that runs past the body, and a bad AVP length.
+            truncated_avp: &[0x80, 8, 0, 0, 0, 0, 0, 6, 0x80, 9] => Err(Error::Truncated),
         );
         let bad = [0x80, 8, 0, 0, 0, 0, 0, 6, 0x80, 2, 0, 0, 0, 0];
         assert_eq!(ControlMessage::parse(&bad), Err(Error::AvpLength(2)));
@@ -1360,19 +1350,12 @@ mod tests {
         ];
         let m = ControlMessage::parse(&body).unwrap();
         assert_eq!(m.avps.len(), 2);
-        assert_eq!(ControlMessage::reserved_bits(&body), Ok(vec![0, 9, 0]));
-        assert_eq!(
-            ControlMessage::reserved_bits(&m.to_bytes().unwrap()),
-            Ok(vec![0, 0, 0])
-        );
-        assert_eq!(ControlMessage::reserved_bits(&[]), Ok(vec![]));
-        assert_eq!(
-            ControlMessage::reserved_bits(&body[..20]),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            ControlMessage::reserved_bits(&body[8..]),
-            Err(Error::MessageType)
+        fictionet::assert_cases!(|input| ControlMessage::reserved_bits(input);
+            reserved_bits: &body => Ok(vec![0, 9, 0]),
+            encoded_message: &m.to_bytes().unwrap() => Ok(vec![0, 0, 0]),
+            empty: &[] => Ok(vec![]),
+            truncated: &body[..20] => Err(Error::Truncated),
+            missing_type: &body[8..] => Err(Error::MessageType),
         );
     }
 

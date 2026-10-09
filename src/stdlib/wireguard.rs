@@ -680,6 +680,14 @@ mod tests {
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
 
+    fn transport_data(receiver: u32, counter: u64, encrypted: Vec<u8>) -> Data {
+        Data {
+            receiver,
+            counter,
+            encrypted,
+        }
+    }
+
     fn init() -> Initiation {
         Initiation {
             sender: 0x0403_0201,
@@ -711,11 +719,7 @@ mod tests {
     }
 
     fn data() -> Data {
-        Data {
-            receiver: 0xdead_beef,
-            counter: 0x0102_0304_0506_0708,
-            encrypted: vec![0xbb; 48],
-        }
+        transport_data(0xdead_beef, 0x0102_0304_0506_0708, vec![0xbb; 48])
     }
 
     fn all() -> Vec<Message> {
@@ -785,11 +789,7 @@ mod tests {
         assert_eq!(b[8..16], [8, 7, 6, 5, 4, 3, 2, 1]);
         assert_eq!(b[16..], [0xbb; 48]);
         assert!(!data().is_keepalive());
-        let k = Data {
-            receiver: 1,
-            counter: 0,
-            encrypted: vec![0; 16],
-        };
+        let k = transport_data(1, 0, vec![0; 16]);
         assert!(k.is_keepalive());
         assert_eq!(k.to_bytes().unwrap().len(), 32);
     }
@@ -998,11 +998,7 @@ mod tests {
             };
             let mut encrypted = vec![0; n];
             s.fill(&mut encrypted);
-            let d = Data {
-                receiver: s.next() as u32,
-                counter: s.next() << 20,
-                encrypted,
-            };
+            let d = transport_data(s.next() as u32, s.next() << 20, encrypted);
             match d.to_bytes() {
                 Ok(b) => {
                     assert!((TAG_LEN..=MAX_ENCRYPTED).contains(&n), "{n}");
@@ -1023,29 +1019,17 @@ mod tests {
     fn data_writer_never_changes_the_ciphertext() {
         // A short or long encrypted part is refused, not padded or cut.
         for n in [0, 1, 3, 15, MAX_ENCRYPTED + 1, MAX_MESSAGE * 2] {
-            let d = Data {
-                receiver: 1,
-                counter: 2,
-                encrypted: vec![7; n],
-            };
+            let d = transport_data(1, 2, vec![7; n]);
             assert_eq!(d.to_bytes(), Err(Error::Unwritable), "{n}");
         }
         // An empty encrypted part is not a keepalive, and does not become one.
-        let empty = Data {
-            receiver: 0,
-            counter: 0,
-            encrypted: Vec::new(),
-        };
+        let empty = transport_data(0, 0, Vec::new());
         assert!(!empty.is_keepalive());
         assert!(empty.to_bytes().is_err());
         // The longest one is written whole, its last byte (the tag's) kept.
         let mut long = vec![7; MAX_ENCRYPTED];
         long[MAX_ENCRYPTED - 1] = 0xee;
-        let d = Data {
-            receiver: 1,
-            counter: 2,
-            encrypted: long,
-        };
+        let d = transport_data(1, 2, long);
         let b = d.to_bytes().unwrap();
         assert_eq!(b.len(), MAX_MESSAGE);
         assert_eq!(Data::parse(&b), Ok(d));
@@ -1134,11 +1118,7 @@ mod tests {
                     assert_eq!(out.len(), len + n);
                     assert_eq!(out[..len], p[..]);
                     assert!(out[len..].iter().all(|&x| x == 0));
-                    let d = Data {
-                        receiver: 1,
-                        counter: 0,
-                        encrypted: vec![0; out.len() + TAG_LEN],
-                    };
+                    let d = transport_data(1, 0, vec![0; out.len() + TAG_LEN]);
                     assert!(d.to_bytes().is_ok(), "{len} {mtu}");
                 }
                 Err(e) => {
@@ -1272,11 +1252,11 @@ mod tests {
                 }),
                 _ => {
                     let n = 16 + usize::from(bytes(1)[0]);
-                    Message::Data(Data {
-                        receiver: u32::from_le_bytes(bytes(4).try_into().unwrap()),
-                        counter: u64::from_le_bytes(bytes(8).try_into().unwrap()),
-                        encrypted: bytes(n),
-                    })
+                    Message::Data(transport_data(
+                        u32::from_le_bytes(bytes(4).try_into().unwrap()),
+                        u64::from_le_bytes(bytes(8).try_into().unwrap()),
+                        bytes(n),
+                    ))
                 }
             };
             let b = m.to_bytes().unwrap();

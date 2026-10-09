@@ -2249,6 +2249,10 @@ mod tests {
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
+    fn cseq_value(seq: u32, method: String) -> CSeq {
+        CSeq { seq, method }
+    }
+
     fn wire_text<T: Wire<WriteError = Error>>(value: &T) -> Result<String, Error> {
         String::from_utf8(value.to_bytes()?).map_err(|_| Error::Utf8)
     }
@@ -2325,13 +2329,7 @@ mod tests {
         assert_eq!(to.tag(), None);
         assert_eq!(to.sip_uri().unwrap().user.as_deref(), Some("bob"));
         assert_eq!(m.call_id(), Ok("a84b4c76e66710@pc33.atlanta.com"));
-        assert_eq!(
-            m.cseq().unwrap(),
-            CSeq {
-                seq: 314159,
-                method: "INVITE".into()
-            }
-        );
+        assert_eq!(m.cseq().unwrap(), cseq_value(314159, "INVITE".into()));
         let Contacts::List(c) = m.contacts().unwrap() else {
             panic!()
         };
@@ -2610,18 +2608,11 @@ mod tests {
     fn contacts() {
         assert_eq!(Contacts::parse("*".as_bytes()), Ok(Contacts::All));
         assert_eq!(wire_text(&Contacts::All).unwrap(), "*");
-        assert_eq!(
-            Contacts::parse("*, <sip:a@b>".as_bytes()),
-            Err(Error::HeaderSyntax("Contact"))
-        );
-        // RFC 3261 section 25.1: a Contact holds `*` or at least one address.
-        assert_eq!(
-            Contacts::parse("".as_bytes()),
-            Err(Error::HeaderSyntax("Contact"))
-        );
-        assert_eq!(
-            Contacts::parse(" , ".as_bytes()),
-            Err(Error::HeaderSyntax("Contact"))
+        fictionet::assert_cases!(|input| Contacts::parse(input);
+            wildcard_with_address: "*, <sip:a@b>".as_bytes() => Err(Error::HeaderSyntax("Contact")),
+            // RFC 3261 section 25.1: a Contact holds `*` or at least one address.
+            empty: "".as_bytes() => Err(Error::HeaderSyntax("Contact")),
+            whitespace: " , ".as_bytes() => Err(Error::HeaderSyntax("Contact")),
         );
         assert_eq!(
             wire_text(&Contacts::List(vec![])),
@@ -2701,10 +2692,7 @@ mod tests {
 
         assert_eq!(
             CSeq::parse("4711 INVITE".as_bytes()).unwrap(),
-            CSeq {
-                seq: 4711,
-                method: "INVITE".into()
-            }
+            cseq_value(4711, "INVITE".into())
         );
         assert_eq!(
             CSeq::parse(b" 4294967295\t ACK "),
@@ -2727,21 +2715,8 @@ mod tests {
                 "{bad:?}"
             );
         }
-        assert!(
-            wire_text(&CSeq {
-                seq: 1,
-                method: "A B".into()
-            })
-            .is_err()
-        );
-        assert_eq!(
-            wire_text(&CSeq {
-                seq: 7,
-                method: "BYE".into()
-            })
-            .unwrap(),
-            "7 BYE"
-        );
+        assert!(wire_text(&cseq_value(1, "A B".into())).is_err());
+        assert_eq!(wire_text(&cseq_value(7, "BYE".into())).unwrap(), "7 BYE");
     }
 
     #[test]
@@ -2749,13 +2724,7 @@ mod tests {
         let mut message = Message::request("ACK", "sip:a@b");
         // The received number may use all 32 bits. The writer limit is lower.
         message.push_header("CSeq", " 4294967295\t ACK ");
-        assert_eq!(
-            message.cseq(),
-            Ok(CSeq {
-                seq: u32::MAX,
-                method: "ACK".into()
-            })
-        );
+        assert_eq!(message.cseq(), Ok(cseq_value(u32::MAX, "ACK".into())));
         message.set_header("CSeq", "4294967296 INVITE");
         assert_eq!(message.cseq(), Err(Error::HeaderSyntax("CSeq")));
     }
@@ -2763,17 +2732,11 @@ mod tests {
     #[test]
     fn header_values_append_only_after_a_valid_write() {
         let mut message = Message::request("INVITE", "sip:a@b");
-        let cseq = CSeq {
-            seq: 1,
-            method: "INVITE".into(),
-        };
+        let cseq = cseq_value(1, "INVITE".into());
         message.push_value("CSeq", &cseq).unwrap();
         assert_eq!(message.cseq(), Ok(cseq));
         let before = message.clone();
-        let invalid = CSeq {
-            seq: 1 << 31,
-            method: "INVITE".into(),
-        };
+        let invalid = cseq_value(1 << 31, "INVITE".into());
         assert_eq!(
             message.push_value("CSeq", &invalid),
             Err(Error::HeaderSyntax("CSeq"))
@@ -2996,17 +2959,10 @@ mod tests {
             message.push_header("Content-Length", &n.to_string());
             round_trip(&message);
         }
-        assert_eq!(
-            Message::read_datagram(b"OPTIONS sip:a@b SIP/2.0\r\nl: 3\r\n\r\nab"),
-            Err(Error::Incomplete)
-        );
-        assert_eq!(
-            Message::read_datagram(b"OPTIONS sip:a@b SIP/2.0\r\nl: 0\r\nContent-Length: 0\r\n\r\n"),
-            Err(Error::ContentLength)
-        );
-        assert_eq!(
-            Message::read_datagram(b"OPTIONS sip:a@b SIP/2.0\n\n"),
-            Err(Error::LineEnding)
+        fictionet::assert_cases!(|input| Message::read_datagram(input);
+            short_body: b"OPTIONS sip:a@b SIP/2.0\r\nl: 3\r\n\r\nab" => Err(Error::Incomplete),
+            duplicate_length: b"OPTIONS sip:a@b SIP/2.0\r\nl: 0\r\nContent-Length: 0\r\n\r\n" => Err(Error::ContentLength),
+            bare_newlines: b"OPTIONS sip:a@b SIP/2.0\n\n" => Err(Error::LineEnding),
         );
     }
 
@@ -3038,25 +2994,15 @@ mod tests {
             "X: 1\r\n".repeat(MAX_HEADERS - 1)
         );
         assert!(Message::parse(enough.as_bytes()).is_ok());
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/2.0\nX: 1\r\nl: 0\r\n\r\n"),
-            Error::LineEnding
+        fictionet::assert_cases!(|input| e(input);
+            bare_newline: b"OPTIONS sip:a@b SIP/2.0\nX: 1\r\nl: 0\r\n\r\n" => Error::LineEnding,
+            embedded_return: b"OPTIONS sip:a@b SIP/2.0\r\nX: 1\r2\r\nl: 0\r\n\r\n" => Error::LineEnding,
+            extra_return: b"OPTIONS sip:a@b SIP/2.0\r\n\r\r\nl: 0\r\n\r\n" => Error::LineEnding,
+            invalid_utf8: b"OPTIONS sip:a@b SIP/2.0\r\nX: \xff\r\nl: 0\r\n\r\n" => Error::Utf8,
+            // The stream skips an empty keep-alive line, then needs a start line.
+            missing_length: b"\r\nl: 0\r\n\r\n" => Error::MissingContentLength,
+            missing_start_line: b"\r\nX: 1\r\nl: 0\r\n\r\n" => Error::StartLine,
         );
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/2.0\r\nX: 1\r2\r\nl: 0\r\n\r\n"),
-            Error::LineEnding
-        );
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/2.0\r\n\r\r\nl: 0\r\n\r\n"),
-            Error::LineEnding
-        );
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/2.0\r\nX: \xff\r\nl: 0\r\n\r\n"),
-            Error::Utf8
-        );
-        // The stream skips an empty keep-alive line, then needs a start line.
-        assert_eq!(e(b"\r\nl: 0\r\n\r\n"), Error::MissingContentLength);
-        assert_eq!(e(b"\r\nX: 1\r\nl: 0\r\n\r\n"), Error::StartLine);
         assert_eq!(
             Message::read_datagram(b"\r\nl: 0\r\n\r\n"),
             Err(Error::StartLine)
@@ -3085,42 +3031,17 @@ mod tests {
             let msg = format!("{line}\r\nl: 0\r\n\r\n");
             assert_eq!(e(msg.as_bytes()), Error::StartLine, "{line:?}");
         }
-        assert_eq!(e(b"SIP/3.0 200 OK\r\nl: 0\r\n\r\n"), Error::Version);
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/1.0\r\nl: 0\r\n\r\n"),
-            Error::Version
-        );
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/2.0\r\n folded\r\nl: 0\r\n\r\n"),
-            Error::HeaderLine
-        );
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/2.0\r\nNo colon\r\nl: 0\r\n\r\n"),
-            Error::HeaderLine
-        );
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/2.0\r\nBad Name: 1\r\nl: 0\r\n\r\n"),
-            Error::HeaderLine
-        );
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/2.0\r\n: 1\r\nl: 0\r\n\r\n"),
-            Error::HeaderLine
-        );
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/2.0\r\nX: a\x00b\r\nl: 0\r\n\r\n"),
-            Error::HeaderValue
-        );
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/2.0\r\nl: x\r\n\r\n"),
-            Error::ContentLength
-        );
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/2.0\r\nl: \r\n\r\n"),
-            Error::ContentLength
-        );
-        assert_eq!(
-            e(b"OPTIONS sip:a@b SIP/2.0\r\nl: 1\r\nContent-Length: 2\r\n\r\nab"),
-            Error::ContentLength
+        fictionet::assert_cases!(|input| e(input);
+            response_version: b"SIP/3.0 200 OK\r\nl: 0\r\n\r\n" => Error::Version,
+            request_version: b"OPTIONS sip:a@b SIP/1.0\r\nl: 0\r\n\r\n" => Error::Version,
+            folded_header: b"OPTIONS sip:a@b SIP/2.0\r\n folded\r\nl: 0\r\n\r\n" => Error::HeaderLine,
+            missing_colon: b"OPTIONS sip:a@b SIP/2.0\r\nNo colon\r\nl: 0\r\n\r\n" => Error::HeaderLine,
+            name_space: b"OPTIONS sip:a@b SIP/2.0\r\nBad Name: 1\r\nl: 0\r\n\r\n" => Error::HeaderLine,
+            empty_name: b"OPTIONS sip:a@b SIP/2.0\r\n: 1\r\nl: 0\r\n\r\n" => Error::HeaderLine,
+            nul_value: b"OPTIONS sip:a@b SIP/2.0\r\nX: a\x00b\r\nl: 0\r\n\r\n" => Error::HeaderValue,
+            nonnumeric_length: b"OPTIONS sip:a@b SIP/2.0\r\nl: x\r\n\r\n" => Error::ContentLength,
+            empty_length: b"OPTIONS sip:a@b SIP/2.0\r\nl: \r\n\r\n" => Error::ContentLength,
+            conflicting_lengths: b"OPTIONS sip:a@b SIP/2.0\r\nl: 1\r\nContent-Length: 2\r\n\r\nab" => Error::ContentLength,
         );
         // Exact stream messages refuse bytes past the body.
         assert_eq!(
@@ -3520,10 +3441,7 @@ mod tests {
                 assert_eq!(Via::parse(text.as_bytes()).unwrap(), v, "{text}");
                 written += 1;
             }
-            let c = CSeq {
-                seq: rng.next() as u32,
-                method: text(&mut rng, 5),
-            };
+            let c = cseq_value(rng.next() as u32, text(&mut rng, 5));
             contract::check_wire_value(&c);
             if let Ok(text) = wire_text(&c) {
                 assert_eq!(CSeq::parse(text.as_bytes()).unwrap(), c);
@@ -3612,13 +3530,7 @@ mod tests {
         assert_eq!(wire_text(&a), Err(Error::TooLong));
         assert_eq!(wire_text(&Contacts::List(vec![a])), Err(Error::TooLong));
         assert_eq!(wire_text(&Via::new("UDP", &long)), Err(Error::TooLong));
-        assert_eq!(
-            wire_text(&CSeq {
-                seq: 1,
-                method: long.clone()
-            }),
-            Err(Error::TooLong)
-        );
+        assert_eq!(wire_text(&cseq_value(1, long.clone())), Err(Error::TooLong));
         // Display-name words are joined without a list of them.
         let a = NameAddr::parse("  Mr.   Watson\t <sip:w@h>".as_bytes()).unwrap();
         assert_eq!(a.display.as_deref(), Some("Mr. Watson"));
@@ -3846,18 +3758,11 @@ mod tests {
     fn cseq_writer_keeps_below_2_pow_31() {
         // RFC 3261 section 8.1.1.5.
         assert_eq!(
-            wire_text(&CSeq {
-                seq: (1 << 31) - 1,
-                method: "INVITE".into()
-            })
-            .unwrap(),
+            wire_text(&cseq_value((1 << 31) - 1, "INVITE".into())).unwrap(),
             "2147483647 INVITE"
         );
         assert_eq!(
-            wire_text(&CSeq {
-                seq: 1 << 31,
-                method: "INVITE".into()
-            }),
+            wire_text(&cseq_value(1 << 31, "INVITE".into())),
             Err(Error::HeaderSyntax("CSeq"))
         );
         assert_eq!(
@@ -3872,20 +3777,10 @@ mod tests {
     #[test]
     fn empty_list_elements_are_refused() {
         // RFC 3261 section 25.1: Contact and Via lists have no empty items.
-        assert_eq!(
-            Contacts::parse(",*,".as_bytes()),
-            Err(Error::HeaderSyntax("Contact"))
-        );
-        assert_eq!(
-            Contacts::parse("<sip:a@b>,,".as_bytes()),
-            Err(Error::HeaderSyntax("Contact"))
-        );
-        assert_eq!(
-            Contacts::parse("<sip:a@b>, <sip:c@d>".as_bytes()),
-            Ok(Contacts::List(vec![
-                NameAddr::new("sip:a@b"),
-                NameAddr::new("sip:c@d")
-            ]))
+        fictionet::assert_cases!(|input| Contacts::parse(input);
+            wildcard_commas: ",*,".as_bytes() => Err(Error::HeaderSyntax("Contact")),
+            trailing_commas: "<sip:a@b>,,".as_bytes() => Err(Error::HeaderSyntax("Contact")),
+            two_addresses: "<sip:a@b>, <sip:c@d>".as_bytes() => Ok(Contacts::List(vec![ NameAddr::new("sip:a@b"), NameAddr::new("sip:c@d") ])),
         );
         let m =
             Message::parse(b"OPTIONS sip:a@b SIP/2.0\r\nm: ,*\r\nVia:\r\nl: 0\r\n\r\n").unwrap();

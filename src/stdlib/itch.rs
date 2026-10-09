@@ -1180,6 +1180,34 @@ mod tests {
     };
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
+    fn replace_order(
+        header: Header,
+        original_ref: u64,
+        new_ref: u64,
+        shares: u32,
+        price: Price4,
+    ) -> OrderReplace {
+        OrderReplace {
+            header,
+            original_ref,
+            new_ref,
+            shares,
+            price,
+        }
+    }
+
+    fn cancel_order(header: Header, order_ref: u64, cancelled_shares: u32) -> OrderCancel {
+        OrderCancel {
+            header,
+            order_ref,
+            cancelled_shares,
+        }
+    }
+
+    fn delete_order(header: Header, order_ref: u64) -> OrderDelete {
+        OrderDelete { header, order_ref }
+    }
+
     fn ts(n: u64) -> Timestamp {
         Timestamp::new(n).unwrap()
     }
@@ -1310,13 +1338,7 @@ mod tests {
     // 1.4.5: U, original ref 11, new ref 19, shares 27, price 31.
     #[test]
     fn replace_bytes() {
-        let m = OrderReplace {
-            header: header(1),
-            original_ref: 1,
-            new_ref: 2,
-            shares: 3,
-            price: Price4(4),
-        };
+        let m = replace_order(header(1), 1, 2, 3, Price4(4));
         let mut b = head(b'U', 1);
         b.extend_from_slice(&1u64.to_be_bytes());
         b.extend_from_slice(&2u64.to_be_bytes());
@@ -1584,25 +1606,9 @@ mod tests {
                 execution_price: Price4(9),
             }
             .into(),
-            OrderCancel {
-                header: h,
-                order_ref: 2,
-                cancelled_shares: 50,
-            }
-            .into(),
-            OrderDelete {
-                header: h,
-                order_ref: 2,
-            }
-            .into(),
-            OrderReplace {
-                header: h,
-                original_ref: 1,
-                new_ref: 3,
-                shares: 70,
-                price: Price4(12),
-            }
-            .into(),
+            cancel_order(h, 2, 50).into(),
+            delete_order(h, 2).into(),
+            replace_order(h, 1, 3, 70, Price4(12)).into(),
             Trade {
                 header: h,
                 order_ref: 0,
@@ -1778,25 +1784,12 @@ mod tests {
     fn book_applies_the_order_life_cycle() {
         let mut book = Book::new(BookConfig::default()).unwrap();
         let changed = |side| Ok(Applied::Changed { locate: 1, side });
-        assert_eq!(
-            book.apply(&add(1, 1, Side::Buy, 100, 300)),
-            changed(Side::Buy)
-        );
-        assert_eq!(
-            book.apply(&add(2, 1, Side::Buy, 100, 200)),
-            changed(Side::Buy)
-        );
-        assert_eq!(
-            book.apply(&add(3, 1, Side::Buy, 99, 50)),
-            changed(Side::Buy)
-        );
-        assert_eq!(
-            book.apply(&add(4, 1, Side::Sell, 101, 10)),
-            changed(Side::Sell)
-        );
-        assert_eq!(
-            book.apply(&add(5, 1, Side::Sell, 102, 20)),
-            changed(Side::Sell)
+        fictionet::assert_cases!(|message| book.apply(message);
+            first_bid: &add(1, 1, Side::Buy, 100, 300) => changed(Side::Buy),
+            second_bid: &add(2, 1, Side::Buy, 100, 200) => changed(Side::Buy),
+            lower_bid: &add(3, 1, Side::Buy, 99, 50) => changed(Side::Buy),
+            first_ask: &add(4, 1, Side::Sell, 101, 10) => changed(Side::Sell),
+            higher_ask: &add(5, 1, Side::Sell, 102, 20) => changed(Side::Sell),
         );
         assert_eq!(
             book.best_bid(1),
@@ -1814,19 +1807,9 @@ mod tests {
                 orders: 1
             })
         );
-        assert_eq!(
-            book.depth(1, Side::Buy, 5)
-                .iter()
-                .map(|l| l.price.0)
-                .collect::<Vec<_>>(),
-            [100, 99]
-        );
-        assert_eq!(
-            book.depth(1, Side::Sell, 1)
-                .iter()
-                .map(|l| l.price.0)
-                .collect::<Vec<_>>(),
-            [101]
+        fictionet::assert_cases!(|locate, side, count| book.depth(locate, side, count).iter().map(|l| l.price.0).collect::<Vec<_>>();
+            (1, Side::Buy, 5) => [100, 99],
+            (1, Side::Sell, 1) => [101],
         );
         assert_eq!(book.level_count(), 4);
 
@@ -1859,37 +1842,13 @@ mod tests {
         assert_eq!(book.order(4), None);
         assert_eq!(book.best_ask(1).unwrap().price, Price4(102));
         // Cancel part of 2, delete 3.
-        book.apply(
-            &OrderCancel {
-                header: h,
-                order_ref: 2,
-                cancelled_shares: 150,
-            }
-            .into(),
-        )
-        .unwrap();
+        book.apply(&cancel_order(h, 2, 150).into()).unwrap();
         assert_eq!(book.best_bid(1).unwrap().shares, 250);
-        book.apply(
-            &OrderDelete {
-                header: h,
-                order_ref: 3,
-            }
-            .into(),
-        )
-        .unwrap();
+        book.apply(&delete_order(h, 3).into()).unwrap();
         assert_eq!(book.depth(1, Side::Buy, 9).len(), 1);
         // Replace 1 to a new price: side and stock carry over.
-        book.apply(
-            &OrderReplace {
-                header: h,
-                original_ref: 1,
-                new_ref: 6,
-                shares: 75,
-                price: Price4(103),
-            }
-            .into(),
-        )
-        .unwrap();
+        book.apply(&replace_order(h, 1, 6, 75, Price4(103)).into())
+            .unwrap();
         assert_eq!(book.order(1), None);
         assert_eq!(
             book.order(6),
@@ -1937,38 +1896,19 @@ mod tests {
                 executed_shares: 0,
                 match_number: 1,
             }),
-            OrderCancel {
-                header: h,
-                order_ref: 1,
-                cancelled_shares: 0,
-            }
-            .into(),
+            cancel_order(h, 1, 0).into(),
         ] {
             assert_eq!(book.apply(&zero), Ok(Applied::Ignored));
         }
         assert_eq!(format!("{book:?}"), before);
         // Zero shares of an order not on the book is still refused.
         assert_eq!(
-            book.apply(
-                &OrderCancel {
-                    header: h,
-                    order_ref: 9,
-                    cancelled_shares: 0,
-                }
-                .into()
-            ),
+            book.apply(&cancel_order(h, 9, 0).into()),
             Err(Error::UnknownOrder(9))
         );
         // Once its last order goes, a stock without a directory entry is
         // forgotten and its slot is free for another.
-        book.apply(
-            &OrderDelete {
-                header: h,
-                order_ref: 1,
-            }
-            .into(),
-        )
-        .unwrap();
+        book.apply(&delete_order(h, 1).into()).unwrap();
         assert_eq!(book.stock_count(), 0);
         book.apply(&add(2, 2, Side::Sell, 100, 10)).unwrap();
         assert_eq!(book.stock_count(), 1);
@@ -1976,14 +1916,7 @@ mod tests {
         let mut book = Book::new(BookConfig::default()).unwrap();
         book.apply(&samples()[1]).unwrap();
         book.apply(&add(1, 42, Side::Buy, 100, 10)).unwrap();
-        book.apply(
-            &OrderDelete {
-                header: header(42),
-                order_ref: 1,
-            }
-            .into(),
-        )
-        .unwrap();
+        book.apply(&delete_order(header(42), 1).into()).unwrap();
         assert_eq!(book.symbol(42), Some(stock("ZVZZT")));
         assert_eq!(book.stock_count(), 1);
     }
@@ -2002,51 +1935,15 @@ mod tests {
         let refused: [(Message, Error); 8] = [
             (add(1, 1, Side::Buy, 100, 10), Error::DuplicateOrder(1)),
             (add(2, 1, Side::Buy, 100, 0), Error::Shares(2)),
+            (delete_order(h, 9).into(), Error::UnknownOrder(9)),
+            (cancel_order(h, 1, 11).into(), Error::Shares(1)),
+            (delete_order(header(2), 1).into(), Error::Locate(1)),
             (
-                OrderDelete {
-                    header: h,
-                    order_ref: 9,
-                }
-                .into(),
-                Error::UnknownOrder(9),
-            ),
-            (
-                OrderCancel {
-                    header: h,
-                    order_ref: 1,
-                    cancelled_shares: 11,
-                }
-                .into(),
+                replace_order(h, 1, 1, 0, Price4(1)).into(),
                 Error::Shares(1),
             ),
             (
-                OrderDelete {
-                    header: header(2),
-                    order_ref: 1,
-                }
-                .into(),
-                Error::Locate(1),
-            ),
-            (
-                OrderReplace {
-                    header: h,
-                    original_ref: 1,
-                    new_ref: 1,
-                    shares: 0,
-                    price: Price4(1),
-                }
-                .into(),
-                Error::Shares(1),
-            ),
-            (
-                OrderReplace {
-                    header: h,
-                    original_ref: 9,
-                    new_ref: 1,
-                    shares: 1,
-                    price: Price4(1),
-                }
-                .into(),
+                replace_order(h, 9, 1, 1, Price4(1)).into(),
                 Error::UnknownOrder(9),
             ),
             (
@@ -2077,41 +1974,14 @@ mod tests {
             Err(Error::TooManyOrders)
         );
         // A replace that empties its level may open another.
-        book.apply(
-            &OrderReplace {
-                header: h,
-                original_ref: 1,
-                new_ref: 1,
-                shares: 5,
-                price: Price4(90),
-            }
-            .into(),
-        )
-        .unwrap();
-        book.apply(
-            &OrderReplace {
-                header: h,
-                original_ref: 1,
-                new_ref: 7,
-                shares: 5,
-                price: Price4(80),
-            }
-            .into(),
-        )
-        .unwrap();
+        book.apply(&replace_order(h, 1, 1, 5, Price4(90)).into())
+            .unwrap();
+        book.apply(&replace_order(h, 1, 7, 5, Price4(80)).into())
+            .unwrap();
         assert_eq!(book.best_bid(1).unwrap().price, Price4(80));
         // But not one that leaves its level behind.
         assert_eq!(
-            book.apply(
-                &OrderReplace {
-                    header: h,
-                    original_ref: 2,
-                    new_ref: 8,
-                    shares: 5,
-                    price: Price4(70)
-                }
-                .into()
-            ),
+            book.apply(&replace_order(h, 2, 8, 5, Price4(70)).into()),
             Err(Error::TooManyLevels)
         );
         // Stocks: one allowed, directory entries included.
@@ -2135,21 +2005,9 @@ mod tests {
         );
         assert_eq!(book.apply(&samples()[1]), Err(Error::TooManyStocks));
         assert_eq!(book.stock_count(), 1);
-        assert_eq!(
-            Book::new(BookConfig {
-                max_orders: 0,
-                ..BookConfig::default()
-            })
-            .err(),
-            Some(Error::Config)
-        );
-        assert_eq!(
-            Book::new(BookConfig {
-                max_stocks: MAX_STOCKS + 1,
-                ..BookConfig::default()
-            })
-            .err(),
-            Some(Error::Config)
+        fictionet::assert_cases!(|config| Book::new(config).err();
+            zero_orders: BookConfig { max_orders: 0, ..BookConfig::default() } => Some(Error::Config),
+            excess_stocks: BookConfig { max_stocks: MAX_STOCKS + 1, ..BookConfig::default() } => Some(Error::Config),
         );
     }
 
@@ -2180,25 +2038,9 @@ mod tests {
                     match_number: 0,
                 }
                 .into(),
-                3 => OrderCancel {
-                    header: h,
-                    order_ref,
-                    cancelled_shares: shares,
-                }
-                .into(),
-                4 => OrderDelete {
-                    header: h,
-                    order_ref,
-                }
-                .into(),
-                _ => OrderReplace {
-                    header: h,
-                    original_ref: order_ref,
-                    new_ref: rng.below(60),
-                    shares,
-                    price,
-                }
-                .into(),
+                3 => cancel_order(h, order_ref, shares).into(),
+                4 => delete_order(h, order_ref).into(),
+                _ => replace_order(h, order_ref, rng.below(60), shares, price).into(),
             };
             let before = format!("{book:?}");
             if book.apply(&m).is_err() {

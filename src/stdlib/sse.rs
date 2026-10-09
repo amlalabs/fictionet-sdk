@@ -712,6 +712,10 @@ mod tests {
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::decode_all;
 
+    fn ignored(name: String, value: String) -> Line {
+        Line::Ignored { name, value }
+    }
+
     fn events(bytes: &[u8]) -> Vec<Event> {
         let (events, error) = decode_all(Events::default, bytes);
         assert_eq!(error, None);
@@ -877,18 +881,9 @@ mod tests {
                 Line::Comment(" leading".into()),
                 Line::Comment("".into()),
                 Line::Retry("01".into()),
-                Line::Ignored {
-                    name: "retry".into(),
-                    value: "bad".into()
-                },
-                Line::Ignored {
-                    name: "id".into(),
-                    value: "a\0b".into()
-                },
-                Line::Ignored {
-                    name: "X".into(),
-                    value: "".into()
-                },
+                ignored("retry".into(), "bad".into()),
+                ignored("id".into(), "a\0b".into()),
+                ignored("X".into(), "".into()),
                 Line::Data("".into()),
                 Line::Event("".into()),
                 Line::Id("".into()),
@@ -926,17 +921,10 @@ mod tests {
 
     #[test]
     fn bom_at_start_only_and_malformed_utf8() {
-        assert_eq!(
-            events("\u{feff}data:one\n\n\u{feff}data:ignored\ndata:\u{feff}two\n\n".as_bytes()),
-            [Event::new("one"), Event::new("\u{feff}two")]
-        );
-        assert_eq!(
-            events("\u{feff}\u{feff}data:ignored\ndata:x\n\n".as_bytes()),
-            [Event::new("x")]
-        );
-        assert_eq!(
-            events(b"data:\xff\xc3\n\ndata:\xf0\x90\x80\n\n"),
-            [Event::new("\u{fffd}\u{fffd}"), Event::new("\u{fffd}")]
+        fictionet::assert_cases!(|input| events(input);
+            initial_bom: "\u{feff}data:one\n\n\u{feff}data:ignored\ndata:\u{feff}two\n\n".as_bytes() => [Event::new("one"), Event::new("\u{feff}two")],
+            repeated_bom: "\u{feff}\u{feff}data:ignored\ndata:x\n\n".as_bytes() => [Event::new("x")],
+            invalid_utf8: b"data:\xff\xc3\n\ndata:\xf0\x90\x80\n\n" => [Event::new("\u{fffd}\u{fffd}"), Event::new("\u{fffd}")],
         );
         assert!(events(b"\xef\xbb\xbf").is_empty());
         assert!(events(b"\xef\xbb").is_empty());
@@ -1028,31 +1016,11 @@ mod tests {
             decode_all(|| Events::with_limits(limits), &bytes),
             (vec![value], None)
         );
-        assert_eq!(
-            decode_all(
-                || Events::with_limits(Limits {
-                    event: limits.event - 1,
-                    ..limits
-                }),
-                &bytes
-            )
-            .1,
-            Some(Fail::Protocol(Error::EventTooLong {
-                limit: limits.event - 1
-            }))
-        );
-        // Each input block fits; repeating the inherited ID in the second
-        // event's independent encoding does not.
-        assert_eq!(
-            decode_all(
-                || Events::with_limits(Limits {
-                    line: 32,
-                    event: 20
-                }),
-                b"id:1234567890\n\ndata:123456\n\n"
-            )
-            .1,
-            Some(Fail::Protocol(Error::EventTooLong { limit: 20 }))
+        fictionet::assert_cases!(|make, input| decode_all(make, input).1;
+            (|| Events::with_limits(Limits { event: limits.event - 1, ..limits }), &bytes) => Some(Fail::Protocol(Error::EventTooLong { limit: limits.event - 1 })),
+            // Each input block fits; repeating the inherited ID in the second
+            // event's independent encoding does not.
+            (|| Events::with_limits(Limits { line: 32, event: 20 }), b"id:1234567890\n\ndata:123456\n\n") => Some(Fail::Protocol(Error::EventTooLong { limit: 20 })),
         );
     }
 
@@ -1073,14 +1041,8 @@ mod tests {
             Line::Data("  value".into()),
             Line::Event("".into()),
             Line::Id("".into()),
-            Line::Ignored {
-                name: "id".into(),
-                value: "bad\0".into(),
-            },
-            Line::Ignored {
-                name: "unknown".into(),
-                value: " :value".into(),
-            },
+            ignored("id".into(), "bad\0".into()),
+            ignored("unknown".into(), " :value".into()),
         ] {
             let bytes = line.to_bytes().unwrap();
             assert_eq!(Line::parse(&bytes), Ok(line.clone()));
@@ -1122,34 +1084,13 @@ mod tests {
             Line::Retry("１２".into()),
             Line::Retry("+1".into()),
             Line::Comment("x".repeat(MAX_LINE)),
-            Line::Ignored {
-                name: "".into(),
-                value: "x".into(),
-            },
-            Line::Ignored {
-                name: "a:b".into(),
-                value: "x".into(),
-            },
-            Line::Ignored {
-                name: "a\nb".into(),
-                value: "x".into(),
-            },
-            Line::Ignored {
-                name: "\u{feff}unknown".into(),
-                value: "x".into(),
-            },
-            Line::Ignored {
-                name: "data".into(),
-                value: "x".into(),
-            },
-            Line::Ignored {
-                name: "retry".into(),
-                value: "10".into(),
-            },
-            Line::Ignored {
-                name: "id".into(),
-                value: "ok".into(),
-            },
+            ignored("".into(), "x".into()),
+            ignored("a:b".into(), "x".into()),
+            ignored("a\nb".into(), "x".into()),
+            ignored("\u{feff}unknown".into(), "x".into()),
+            ignored("data".into(), "x".into()),
+            ignored("retry".into(), "10".into()),
+            ignored("id".into(), "ok".into()),
         ] {
             contract::check_refused(&line);
         }

@@ -2548,6 +2548,45 @@ mod tests {
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::{self, decode_all};
 
+    fn other_block(kind: u16, data: Vec<u8>) -> DataBlock {
+        DataBlock::Other { kind, data }
+    }
+
+    fn fast_path(header: u8, payload: Vec<u8>) -> Frame {
+        Frame::FastPath { header, payload }
+    }
+
+    fn capability(kind: CapabilityType, data: Vec<u8>) -> CapabilitySet {
+        CapabilitySet { kind, data }
+    }
+
+    fn gcc_response(node_id: u32, tag: i32, result: u8, blocks: DataBlocks) -> GccConference {
+        GccConference::Response {
+            node_id,
+            tag,
+            result,
+            blocks,
+        }
+    }
+
+    fn send_data(
+        indication: bool,
+        initiator: u32,
+        channel_id: u16,
+        priority: u8,
+        segmentation: u8,
+        data: Vec<u8>,
+    ) -> McsPdu {
+        McsPdu::SendData {
+            indication,
+            initiator,
+            channel_id,
+            priority,
+            segmentation,
+            data,
+        }
+    }
+
     // MS-RDPBCGR 4.1.3, complete 416-byte Connect Initial dump.
     fn initial_example() -> Vec<u8> {
         hex("03 00 01 a0 02 f0 80 7f 65 82 01 94 04 01 01 04
@@ -2658,10 +2697,7 @@ mod tests {
             }]),
             DataBlock::ClientMessageChannel,
             DataBlock::ClientMultitransport(3),
-            DataBlock::Other {
-                kind: 0xc008,
-                data: vec![0; 12],
-            },
+            other_block(0xc008, vec![0; 12]),
         ]
     }
     fn server_blocks() -> Vec<DataBlock> {
@@ -2713,12 +2749,7 @@ mod tests {
             result: 0,
             called_connect_id: 0,
             parameters: params(),
-            conference: GccConference::Response {
-                node_id: 1002,
-                tag: 1,
-                result: 0,
-                blocks: DataBlocks(server_blocks()),
-            },
+            conference: gcc_response(1002, 1, 0, DataBlocks(server_blocks())),
         }
     }
     fn info() -> ClientInfo {
@@ -2740,14 +2771,8 @@ mod tests {
             share_id: 0x10000,
             source_descriptor: b"RDP\0".to_vec(),
             capabilities: vec![
-                CapabilitySet {
-                    kind: CapabilityType::GENERAL,
-                    data: vec![0; 20],
-                },
-                CapabilitySet {
-                    kind: CapabilityType(0xffff),
-                    data: vec![7, 8, 9],
-                },
+                capability(CapabilityType::GENERAL, vec![0; 20]),
+                capability(CapabilityType(0xffff), vec![7, 8, 9]),
             ],
             padding: 0x1234,
         }
@@ -2783,22 +2808,8 @@ mod tests {
                 requested: 1003,
                 channel_id: None,
             },
-            McsPdu::SendData {
-                indication: false,
-                initiator: 1007,
-                channel_id: 1003,
-                priority: 1,
-                segmentation: 3,
-                data: vec![1, 2, 3],
-            },
-            McsPdu::SendData {
-                indication: true,
-                initiator: 1002,
-                channel_id: 1003,
-                priority: 1,
-                segmentation: 3,
-                data: vec![],
-            },
+            send_data(false, 1007, 1003, 1, 3, vec![1, 2, 3]),
+            send_data(true, 1002, 1003, 1, 3, vec![]),
         ]
     }
 
@@ -3076,12 +3087,7 @@ mod tests {
                 i32::MAX,
             ] {
                 for result in 0..=4 {
-                    let c = GccConference::Response {
-                        node_id: n,
-                        tag,
-                        result,
-                        blocks: DataBlocks(server_blocks()),
-                    };
+                    let c = gcc_response(n, tag, result, DataBlocks(server_blocks()));
                     assert_eq!(GccConference::parse(&c.to_bytes().unwrap()), Ok(c));
                 }
             }
@@ -3090,12 +3096,7 @@ mod tests {
 
     #[test]
     fn gcc_response_ignored_length_and_request_checked_length() {
-        let response = GccConference::Response {
-            node_id: 1001,
-            tag: 1,
-            result: 0,
-            blocks: DataBlocks(server_blocks()),
-        };
+        let response = gcc_response(1001, 1, 0, DataBlocks(server_blocks()));
         let mut b = response.to_bytes().unwrap();
         b[7] = 1;
         assert_eq!(GccConference::parse(&b), Ok(response));
@@ -3120,31 +3121,21 @@ mod tests {
         );
         for node_id in [0, 1000, 65537, u32::MAX] {
             assert!(
-                GccConference::Response {
-                    node_id,
-                    tag: 1,
-                    result: 0,
-                    blocks: DataBlocks(vec![])
-                }
-                .to_bytes()
-                .is_err()
+                gcc_response(node_id, 1, 0, DataBlocks(vec![]))
+                    .to_bytes()
+                    .is_err()
             );
         }
         assert!(
-            GccConference::Response {
-                node_id: 1001,
-                tag: 1,
-                result: 5,
-                blocks: DataBlocks(vec![])
-            }
-            .to_bytes()
-            .is_err()
+            gcc_response(1001, 1, 5, DataBlocks(vec![]))
+                .to_bytes()
+                .is_err()
         );
         assert!(
-            GccConference::Request(DataBlocks(vec![DataBlock::Other {
-                kind: 0xf001,
-                data: vec![0; MAX_GCC_REQUEST]
-            }]))
+            GccConference::Request(DataBlocks(vec![other_block(
+                0xf001,
+                vec![0; MAX_GCC_REQUEST]
+            )]))
             .to_bytes()
             .is_err()
         );
@@ -3343,18 +3334,12 @@ mod tests {
             assert!(DataBlock::parse(&b).is_err());
         }
         for data in [vec![0; 4], Vec::new()] {
-            assert_eq!(
-                DataBlock::Other { kind: 0xc006, data }.to_bytes(),
-                Err(Error::Unwritable)
-            );
+            assert_eq!(other_block(0xc006, data).to_bytes(), Err(Error::Unwritable));
         }
         assert!(
-            DataBlock::Other {
-                kind: 0xffff,
-                data: vec![0; MAX_GCC_DATA]
-            }
-            .to_bytes()
-            .is_err()
+            other_block(0xffff, vec![0; MAX_GCC_DATA])
+                .to_bytes()
+                .is_err()
         );
         assert!(
             DataBlock::ClientNetwork(vec![
@@ -3385,14 +3370,8 @@ mod tests {
         assert!(DataBlocks::parse(&vec![0; MAX_GCC_DATA + 1]).is_err());
         assert!(
             Wire::to_bytes(&DataBlocks(vec![
-                DataBlock::Other {
-                    kind: 0xff00,
-                    data: vec![0; MAX_GCC_DATA / 2]
-                },
-                DataBlock::Other {
-                    kind: 0xff01,
-                    data: vec![0; MAX_GCC_DATA / 2]
-                }
+                other_block(0xff00, vec![0; MAX_GCC_DATA / 2]),
+                other_block(0xff01, vec![0; MAX_GCC_DATA / 2])
             ]))
             .is_err()
         );
@@ -3534,16 +3513,9 @@ mod tests {
         );
         for (priority, segmentation, n) in [(4, 3, 0), (1, 4, 0), (1, 3, MAX_PER_LENGTH + 1)] {
             assert!(
-                McsPdu::SendData {
-                    indication: false,
-                    initiator: 1001,
-                    channel_id: 1003,
-                    priority,
-                    segmentation,
-                    data: vec![0; n]
-                }
-                .to_bytes()
-                .is_err()
+                send_data(false, 1001, 1003, priority, segmentation, vec![0; n])
+                    .to_bytes()
+                    .is_err()
             );
         }
     }
@@ -3567,14 +3539,7 @@ mod tests {
     #[test]
     fn mcs_per_length_boundaries() {
         for n in [0, 1, 127, 128, 255, 256, MAX_PER_LENGTH] {
-            let p = McsPdu::SendData {
-                indication: true,
-                initiator: 65535,
-                channel_id: 65535,
-                priority: 3,
-                segmentation: 3,
-                data: vec![0x5a; n],
-            };
+            let p = send_data(true, 65535, 65535, 3, 3, vec![0x5a; n]);
             let b = p.to_bytes().unwrap();
             assert_eq!(McsPdu::parse(&b), Ok(p));
         }
@@ -3784,10 +3749,7 @@ mod tests {
         let mut p = active(ActiveKind::Demand { session_id: 7 });
         p.source_descriptor = b"RDP\0".to_vec();
         p.padding = 0;
-        p.capabilities = vec![CapabilitySet {
-            kind: CapabilityType::GENERAL,
-            data: vec![1, 2],
-        }];
+        p.capabilities = vec![capability(CapabilityType::GENERAL, vec![1, 2])];
         let bytes = hex("20 00 11 00 ea 03 00 00 01 00 04 00 0a 00
                          52 44 50 00 01 00 00 00 01 00 06 00 01 02 07 00 00 00");
         assert_eq!(p.to_bytes().unwrap(), bytes);
@@ -3838,32 +3800,17 @@ mod tests {
         }
         assert!(CapabilitySet::parse(&[1, 0, 3, 0]).is_err());
         assert!(
-            CapabilitySet {
-                kind: CapabilityType::GENERAL,
-                data: vec![0; MAX_CAPABILITY + 1]
-            }
-            .to_bytes()
-            .is_err()
+            capability(CapabilityType::GENERAL, vec![0; MAX_CAPABILITY + 1])
+                .to_bytes()
+                .is_err()
         );
         let mut p = p;
         p.source_descriptor = vec![0; MAX_DESCRIPTOR + 1];
         assert!(p.to_bytes().is_err());
         p.source_descriptor.clear();
-        p.capabilities = vec![
-            CapabilitySet {
-                kind: CapabilityType(1),
-                data: vec![]
-            };
-            MAX_CAPABILITIES + 1
-        ];
+        p.capabilities = vec![capability(CapabilityType(1), vec![]); MAX_CAPABILITIES + 1];
         assert!(p.to_bytes().is_err());
-        p.capabilities = vec![
-            CapabilitySet {
-                kind: CapabilityType(1),
-                data: vec![0; MAX_CAPABILITY]
-            };
-            4
-        ];
+        p.capabilities = vec![capability(CapabilityType(1), vec![0; MAX_CAPABILITY]); 4];
         assert!(p.to_bytes().is_err());
     }
 
@@ -3871,10 +3818,7 @@ mod tests {
     fn fast_path_lengths_and_detection() {
         for n in [0, 1, 125, 126, 127, 128, 255, 256, MAX_FAST_PATH - 3] {
             for header in [0, 4, 0x3c, 0x80, 0xc0] {
-                let f = Frame::FastPath {
-                    header,
-                    payload: vec![0xab; n],
-                };
+                let f = fast_path(header, vec![0xab; n]);
                 let b = f.to_bytes().unwrap();
                 assert_eq!(b.len(), n + if n <= 125 { 2 } else { 3 });
                 assert_eq!(Frame::parse_prefix(&b), Ok(Some((f, b.len()))));
@@ -3882,35 +3826,15 @@ mod tests {
         }
         assert_eq!(
             Frame::parse_prefix(&[0, 0x80, 3]),
-            Ok(Some((
-                Frame::FastPath {
-                    header: 0,
-                    payload: vec![]
-                },
-                3
-            )))
+            Ok(Some((fast_path(0, vec![]), 3)))
         );
         assert!(Frame::parse_prefix(&[1]).is_err());
         assert!(Frame::parse_prefix(&[2]).is_err());
         assert!(Frame::parse_prefix(&[0, 1]).is_err());
         assert!(Frame::parse_prefix(&[0, 0x80, 2]).is_err());
         assert!(Frame::parse_prefix(&[3, 0, 0, 6]).is_err());
-        assert!(
-            Frame::FastPath {
-                header: 3,
-                payload: vec![]
-            }
-            .to_bytes()
-            .is_err()
-        );
-        assert!(
-            Frame::FastPath {
-                header: 0,
-                payload: vec![0; MAX_FAST_PATH - 2]
-            }
-            .to_bytes()
-            .is_err()
-        );
+        assert!(fast_path(3, vec![]).to_bytes().is_err());
+        assert!(fast_path(0, vec![0; MAX_FAST_PATH - 2]).to_bytes().is_err());
     }
 
     #[test]
@@ -3941,12 +3865,7 @@ mod tests {
             connection().to_packet().unwrap().to_bytes().unwrap(),
             initial_example(),
             response_example(),
-            Frame::FastPath {
-                header: 0x80,
-                payload: vec![0xab; 128],
-            }
-            .to_bytes()
-            .unwrap(),
+            fast_path(0x80, vec![0xab; 128]).to_bytes().unwrap(),
         ];
         for b in samples {
             contract::check_decode(Frames::<Frame>::new, &b);
@@ -3998,10 +3917,7 @@ mod tests {
         );
         prefixes!(
             CapabilitySet,
-            CapabilitySet {
-                kind: CapabilityType::BITMAP,
-                data: vec![0; 24]
-            }
+            capability(CapabilityType::BITMAP, vec![0; 24])
         );
         // SecurityPayload and opaque Info suffixes need an external boundary.
         for n in 0..4 {
@@ -4042,14 +3958,7 @@ mod tests {
         assert!(failure.is_none());
         assert_eq!(frames, [f]);
         let mut b = connection().to_packet().unwrap().to_bytes().unwrap();
-        b.extend_from_slice(
-            &Frame::FastPath {
-                header: 0xc0,
-                payload: vec![1; 130],
-            }
-            .to_bytes()
-            .unwrap(),
-        );
+        b.extend_from_slice(&fast_path(0xc0, vec![1; 130]).to_bytes().unwrap());
         b.extend_from_slice(&write_data(&[0x28]).unwrap().to_bytes().unwrap());
         contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_FRAME);
         let (frames, failure) = decode_all(Frames::<Frame>::new, &b);
@@ -4151,28 +4060,20 @@ mod tests {
 
     #[test]
     fn exact_gcc_aggregate_limits() {
-        let p = GccConference::Request(DataBlocks(vec![DataBlock::Other {
-            kind: 0xf001,
-            data: vec![0; MAX_GCC_REQUEST - 27],
-        }]));
+        let p = GccConference::Request(DataBlocks(vec![other_block(
+            0xf001,
+            vec![0; MAX_GCC_REQUEST - 27],
+        )]));
         let b = p.to_bytes().unwrap();
         assert_eq!(b.len(), MAX_GCC_REQUEST);
         assert_eq!(GccConference::parse(&b), Ok(p));
-        let p = GccConference::Request(DataBlocks(vec![DataBlock::Other {
-            kind: 0xf001,
-            data: vec![0; MAX_GCC_REQUEST - 26],
-        }]));
+        let p = GccConference::Request(DataBlocks(vec![other_block(
+            0xf001,
+            vec![0; MAX_GCC_REQUEST - 26],
+        )]));
         assert!(p.to_bytes().is_err());
-        let block = DataBlock::Other {
-            kind: 0xf001,
-            data: vec![0; MAX_GCC_DATA - 4],
-        };
-        let p = GccConference::Response {
-            node_id: 65536,
-            tag: i32::MAX,
-            result: 4,
-            blocks: DataBlocks(vec![block]),
-        };
+        let block = other_block(0xf001, vec![0; MAX_GCC_DATA - 4]);
+        let p = gcc_response(65536, i32::MAX, 4, DataBlocks(vec![block]));
         let b = p.to_bytes().unwrap();
         assert!(b.len() <= MAX_GCC_RESPONSE);
         assert_eq!(GccConference::parse(&b), Ok(p));
@@ -4180,14 +4081,9 @@ mod tests {
 
     #[test]
     fn malformed_nested_gcc_and_ber_fields() {
-        let good = GccConference::Response {
-            node_id: 1001,
-            tag: 1,
-            result: 0,
-            blocks: DataBlocks(vec![]),
-        }
-        .to_bytes()
-        .unwrap();
+        let good = gcc_response(1001, 1, 0, DataBlocks(vec![]))
+            .to_bytes()
+            .unwrap();
         for (offset, value) in [
             (0, 1),
             (8, 0xff),

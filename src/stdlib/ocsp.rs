@@ -1513,6 +1513,17 @@ mod tests {
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{chunks, mutate};
 
+    fn single_request(cert_id: CertId, extensions: Vec<Extension>) -> SingleRequest {
+        SingleRequest {
+            cert_id,
+            extensions,
+        }
+    }
+
+    fn response(status: ResponseStatus, bytes: Option<ResponseBytes>) -> Response {
+        Response { status, bytes }
+    }
+
     fn cert_id(serial: &[u8]) -> CertId {
         CertId {
             hash_algorithm: AlgorithmIdentifier::sha1(),
@@ -1539,23 +1550,20 @@ mod tests {
 
     fn full_request() -> Request {
         let mut req = Request::new(vec![
-            SingleRequest {
-                cert_id: cert_id(&[0x01]),
-                extensions: vec![],
-            },
-            SingleRequest {
-                cert_id: CertId {
+            single_request(cert_id(&[0x01]), vec![]),
+            single_request(
+                CertId {
                     hash_algorithm: AlgorithmIdentifier::sha256(),
                     issuer_name_hash: vec![0x33; 32],
                     issuer_key_hash: vec![0x44; 32],
                     ..cert_id(&[0x00, 0x80, 0x01])
                 },
-                extensions: vec![Extension {
+                vec![Extension {
                     id: "1.2.3.4".parse().unwrap(),
                     critical: true,
                     value: vec![5, 0],
                 }],
-            },
+            ),
         ]);
         req.version = 0;
         // A GeneralName: directoryName [4] holding an empty Name.
@@ -1628,10 +1636,7 @@ mod tests {
         let req = Request::parse(&der).unwrap();
         assert_eq!(
             req,
-            Request::new(vec![SingleRequest {
-                cert_id: cert_id(&[1]),
-                extensions: vec![]
-            }])
+            Request::new(vec![single_request(cert_id(&[1]), vec![])])
         );
         assert_eq!(req.nonce(), None);
         assert_eq!(req.to_bytes().unwrap(), der);
@@ -1727,22 +1732,22 @@ mod tests {
 
     #[test]
     fn other_response_types_are_kept() {
-        let r = Response {
-            status: ResponseStatus::Successful,
-            bytes: Some(ResponseBytes::Other {
+        let r = response(
+            ResponseStatus::Successful,
+            Some(ResponseBytes::Other {
                 response_type: "1.2.3.4".parse().unwrap(),
                 response: vec![1, 2, 3],
             }),
-        };
+        );
         assert_eq!(Response::parse(&r.to_bytes().unwrap()).unwrap(), r);
         // With the basic type's identifier the bytes must be a basic response.
-        let bad = Response {
-            status: ResponseStatus::Successful,
-            bytes: Some(ResponseBytes::Other {
+        let bad = response(
+            ResponseStatus::Successful,
+            Some(ResponseBytes::Other {
                 response_type: known_oid(oid::BASIC),
                 response: vec![1, 2, 3],
             }),
-        };
+        );
         assert_eq!(bad.to_bytes(), Err(Error::ResponseBytes));
         // Even when they are one: it would read back as Basic, not as it was.
         let basic = full_response()
@@ -1750,22 +1755,22 @@ mod tests {
             .unwrap()
             .to_bytes()
             .unwrap();
-        let as_other = Response {
-            status: ResponseStatus::Successful,
-            bytes: Some(ResponseBytes::Other {
+        let as_other = response(
+            ResponseStatus::Successful,
+            Some(ResponseBytes::Other {
                 response_type: known_oid(oid::BASIC),
                 response: basic,
             }),
-        };
+        );
         assert_eq!(as_other.to_bytes(), Err(Error::ResponseBytes));
         // Bytes over a message are refused before they are copied.
-        let huge = Response {
-            status: ResponseStatus::Successful,
-            bytes: Some(ResponseBytes::Other {
+        let huge = response(
+            ResponseStatus::Successful,
+            Some(ResponseBytes::Other {
                 response_type: "1.2.3.4".parse().unwrap(),
                 response: vec![0; MAX_MESSAGE + 1],
             }),
-        };
+        );
         assert_eq!(huge.to_bytes(), Err(Error::TooLong));
     }
 
@@ -1971,13 +1976,7 @@ mod tests {
     #[test]
     fn writer_errors() {
         let mut r = full_request();
-        r.requests = vec![
-            SingleRequest {
-                cert_id: cert_id(&[1]),
-                extensions: vec![]
-            };
-            MAX_REQUESTS + 1
-        ];
+        r.requests = vec![single_request(cert_id(&[1]), vec![]); MAX_REQUESTS + 1];
         assert_eq!(r.to_bytes(), Err(Error::TooMany));
         let mut r = full_request();
         r.extensions = vec![Extension::nonce(b"x").unwrap(); MAX_EXTENSIONS + 1];
@@ -2386,10 +2385,7 @@ mod tests {
             Some(&[1; MAX_NONCE][..])
         );
         // A request with an empty nonce reads, but carries no nonce.
-        let mut r = Request::new(vec![SingleRequest {
-            cert_id: cert_id(&[1]),
-            extensions: vec![],
-        }]);
+        let mut r = Request::new(vec![single_request(cert_id(&[1]), vec![])]);
         r.extensions.push(ext(vec![0x04, 0x00]));
         assert_eq!(
             Request::parse(&r.to_bytes().unwrap()).unwrap().nonce(),
@@ -2401,12 +2397,7 @@ mod tests {
     fn hashes_have_their_lengths() {
         // RFC 6960 4.1.1: the CertID hashes are hashAlgorithm's; 4.2.1:
         // KeyHash is a SHA-1 hash.
-        let one = |c: CertId| {
-            Request::new(vec![SingleRequest {
-                cert_id: c,
-                extensions: vec![],
-            }])
-        };
+        let one = |c: CertId| Request::new(vec![single_request(c, vec![])]);
         let mut c = cert_id(&[1]);
         c.issuer_name_hash.clear();
         assert_eq!(one(c).to_bytes(), Err(Error::HashLength));
@@ -2459,12 +2450,7 @@ mod tests {
     fn serial_numbers_write_as_they_read() {
         // A serial number in a longer form than DER's would read back
         // shorter, so a writer refuses it.
-        let one = |serial: &[u8]| {
-            Request::new(vec![SingleRequest {
-                cert_id: cert_id(serial),
-                extensions: vec![],
-            }])
-        };
+        let one = |serial: &[u8]| Request::new(vec![single_request(cert_id(serial), vec![])]);
         for bad in [&[][..], &[0x00, 0x01], &[0xff, 0x80]] {
             assert_eq!(
                 one(bad).to_bytes(),
@@ -2642,10 +2628,7 @@ mod tests {
     #[test]
     fn module_example() {
         let id = cert_id(&[0x12, 0x34]);
-        let mut request = Request::new(vec![SingleRequest {
-            cert_id: id,
-            extensions: vec![],
-        }]);
+        let mut request = Request::new(vec![single_request(id, vec![])]);
         request
             .extensions
             .push(Extension::nonce(b"0123456789abcdef").unwrap());

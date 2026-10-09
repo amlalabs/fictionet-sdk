@@ -1479,6 +1479,10 @@ mod tests {
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
 
+    fn other_data(rr_type: u16, data: Vec<u8>) -> RData {
+        RData::Other { rr_type, data }
+    }
+
     const FRED: &[u8; 32] = b"EGFCEFEECACACACACACACACACACACACA";
 
     fn owner(last: u8) -> NbEntry {
@@ -1648,13 +1652,7 @@ mod tests {
         assert_eq!(bytes[12 + 34..], [0, 0x0a, 0, 1, 0, 0, 0, 0, 0, 0]);
         let back = Packet::parse(&bytes).unwrap();
         assert_eq!(back.rcode, rcode::NAM_ERR);
-        assert_eq!(
-            back.answers[0].data,
-            RData::Other {
-                rr_type: rr_type::NULL,
-                data: vec![]
-            }
-        );
+        assert_eq!(back.answers[0].data, other_data(rr_type::NULL, vec![]));
     }
 
     #[test]
@@ -1781,10 +1779,7 @@ mod tests {
         let back = Packet::parse(&b).unwrap();
         assert_eq!(
             back.answers[0].data,
-            RData::Other {
-                rr_type: rr_type::NB,
-                data: vec![0x29, 0x10]
-            }
+            other_data(rr_type::NB, vec![0x29, 0x10])
         );
         assert_eq!(back, w);
     }
@@ -1945,10 +1940,7 @@ mod tests {
             name: Name::new("FRED", 0x20).into(),
             class: CLASS_IN,
             ttl: 0,
-            data: RData::Other {
-                rr_type: rr_type::NB,
-                data: vec![0, 0, 10, 0, 0, 1],
-            },
+            data: other_data(rr_type::NB, vec![0, 0, 10, 0, 0, 1]),
         });
         p.opcode = Opcode::Other(5);
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
@@ -2122,10 +2114,7 @@ mod tests {
                 statistics: vec![7; 70_000],
             }),
             RData::Nb(vec![owner(1); 20_000]),
-            RData::Other {
-                rr_type: 0x99,
-                data: vec![1; 70_000],
-            },
+            other_data(0x99, vec![1; 70_000]),
         ] {
             let mut packet = Packet::name_query(1, name.clone(), false);
             packet.answers.push(Record {
@@ -2307,10 +2296,7 @@ mod tests {
         assert_eq!(p.additional[0].name, RrName::Domain(ns));
         assert_eq!(
             p.additional[0].data,
-            RData::Other {
-                rr_type: rr_type::A,
-                data: vec![10, 0, 0, 1]
-            }
+            other_data(rr_type::A, vec![10, 0, 0, 1])
         );
         assert!(p.authority[0].name.netbios().is_none());
         let back = Packet::parse(&p.to_bytes().unwrap()).unwrap();
@@ -2345,17 +2331,11 @@ mod tests {
         assert_eq!(back, p);
         // Opaque NS data with a pointer is refused.
         let mut built = p.clone();
-        built.authority[0].data = RData::Other {
-            rr_type: rr_type::NS,
-            data: vec![0xc0, 0x5f],
-        };
+        built.authority[0].data = other_data(rr_type::NS, vec![0xc0, 0x5f]);
         assert_eq!(built.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&built);
         // Opaque NS data that would read as Ns is also refused.
-        built.authority[0].data = RData::Other {
-            rr_type: rr_type::NS,
-            data: b"\x03COM\x00".to_vec(),
-        };
+        built.authority[0].data = other_data(rr_type::NS, b"\x03COM\x00".to_vec());
         assert_eq!(built.to_bytes(), Err(Error::Unwritable));
         built.authority[0].data = RData::Ns(vec![b"COM".to_vec()]);
         contract::check_wire_value(&built);

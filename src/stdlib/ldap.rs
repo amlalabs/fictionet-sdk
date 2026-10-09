@@ -2523,6 +2523,66 @@ mod tests {
     use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
 
+    fn equal(attribute: String, value: Vec<u8>) -> Filter {
+        Filter::Equal { attribute, value }
+    }
+
+    fn attribute(name: String, values: Vec<Vec<u8>>) -> Attribute {
+        Attribute { name, values }
+    }
+
+    fn other_filter(number: u32, constructed: bool, contents: Vec<u8>) -> Filter {
+        Filter::Other {
+            number,
+            constructed,
+            contents,
+        }
+    }
+
+    fn entry(dn: String, attributes: Vec<Attribute>) -> SearchResultEntry {
+        SearchResultEntry { dn, attributes }
+    }
+
+    fn change(op: ModifyOperation, attribute: Attribute) -> Change {
+        Change { op, attribute }
+    }
+
+    fn substrings(
+        attribute: String,
+        initial: Option<Vec<u8>>,
+        any: Vec<Vec<u8>>,
+        last: Option<Vec<u8>>,
+    ) -> Filter {
+        Filter::Substrings {
+            attribute,
+            initial,
+            any,
+            last,
+        }
+    }
+
+    fn extensible(
+        rule: Option<String>,
+        attribute: Option<String>,
+        value: Vec<u8>,
+        dn_attributes: bool,
+    ) -> Filter {
+        Filter::Extensible {
+            rule,
+            attribute,
+            value,
+            dn_attributes,
+        }
+    }
+
+    fn bind_request(version: u8, name: String, auth: Authentication) -> BindRequest {
+        BindRequest {
+            version,
+            name,
+            auth,
+        }
+    }
+
     fn msg(id: u32, op: Op) -> Message {
         Message {
             id,
@@ -2537,10 +2597,7 @@ mod tests {
     }
 
     fn eq(attribute: &str, value: &str) -> Filter {
-        Filter::Equal {
-            attribute: attribute.into(),
-            value: value.into(),
-        }
+        equal(attribute.into(), value.into())
     }
 
     #[test]
@@ -2583,11 +2640,11 @@ mod tests {
             m,
             msg(
                 1,
-                Op::BindRequest(BindRequest {
-                    version: 3,
-                    name: String::new(),
-                    auth: Authentication::Simple(vec![])
-                })
+                Op::BindRequest(bind_request(
+                    3,
+                    String::new(),
+                    Authentication::Simple(vec![])
+                ))
             )
         );
         assert_eq!(m.to_bytes().unwrap(), bind);
@@ -2630,36 +2687,33 @@ mod tests {
             message: "try elsewhere".into(),
             referral: vec!["ldap://other/".into()],
         };
-        let attr = Attribute {
-            name: "cn".into(),
-            values: vec![b"b".to_vec(), b"a".to_vec()],
-        };
+        let attr = attribute("cn".into(), vec![b"b".to_vec(), b"a".to_vec()]);
         let ops = vec![
-            Op::BindRequest(BindRequest {
-                version: 3,
-                name: "cn=admin".into(),
-                auth: Authentication::Sasl {
+            Op::BindRequest(bind_request(
+                3,
+                "cn=admin".into(),
+                Authentication::Sasl {
                     mechanism: "PLAIN".into(),
                     credentials: Some(b"\0u\0p".to_vec()),
                 },
-            }),
-            Op::BindRequest(BindRequest {
-                version: 2,
-                name: String::new(),
-                auth: Authentication::Sasl {
+            )),
+            Op::BindRequest(bind_request(
+                2,
+                String::new(),
+                Authentication::Sasl {
                     mechanism: "EXTERNAL".into(),
                     credentials: None,
                 },
-            }),
-            Op::BindRequest(BindRequest {
-                version: 127,
-                name: String::new(),
-                auth: Authentication::Other {
+            )),
+            Op::BindRequest(bind_request(
+                127,
+                String::new(),
+                Authentication::Other {
                     number: 9,
                     constructed: false,
                     contents: vec![1, 2, 3],
                 },
-            }),
+            )),
             Op::BindResponse(BindResponse {
                 result: result.clone(),
                 server_sasl_creds: Some(vec![9]),
@@ -2678,26 +2732,14 @@ mod tests {
                 .unwrap(),
                 attributes: vec!["cn".into(), "*".into()],
             }),
-            Op::SearchResultEntry(SearchResultEntry {
-                dn: "cn=x".into(),
-                attributes: vec![attr.clone()],
-            }),
+            Op::SearchResultEntry(entry("cn=x".into(), vec![attr.clone()])),
             Op::SearchResultDone(LdapResult::new(ResultCode::SUCCESS)),
             Op::SearchResultReference(vec!["ldap://a/".into(), "ldap://b/".into()]),
             Op::ModifyRequest(ModifyRequest {
                 dn: "cn=x".into(),
                 changes: vec![
-                    Change {
-                        op: ModifyOperation::Add,
-                        attribute: attr.clone(),
-                    },
-                    Change {
-                        op: ModifyOperation::Other(3),
-                        attribute: Attribute {
-                            name: "n".into(),
-                            values: vec![],
-                        },
-                    },
+                    change(ModifyOperation::Add, attr.clone()),
+                    change(ModifyOperation::Other(3), attribute("n".into(), vec![])),
                 ],
             }),
             Op::ModifyResponse(result.clone()),
@@ -2792,59 +2834,21 @@ mod tests {
             let m = msg(1, Op::SearchRequest(search(f)));
             contract::check_written(&m);
         }
-        assert_eq!(
-            Filter::parse_text("(cn=Babs Jensen)"),
-            Ok(eq("cn", "Babs Jensen"))
+        fictionet::assert_cases!(|input| Filter::parse_text(input);
+            equality: "(cn=Babs Jensen)" => Ok(eq("cn", "Babs Jensen")),
+            substrings: "(o=univ*of*mich*)" => Ok(substrings( "o".into(), Some(b"univ".to_vec()), vec![b"of".to_vec(), b"mich".to_vec()], None )),
+            extensible: "(:DN:2.4.6.8.10:=Dino)" => Ok(extensible( Some("2.4.6.8.10".into()), None, b"Dino".to_vec(), true )),
+            binary: r"(bin=\00\00\00\04)" => Ok(equal("bin".into(), vec![0, 0, 0, 4])),
         );
-        assert_eq!(
-            Filter::parse_text("(o=univ*of*mich*)"),
-            Ok(Filter::Substrings {
-                attribute: "o".into(),
-                initial: Some(b"univ".to_vec()),
-                any: vec![b"of".to_vec(), b"mich".to_vec()],
-                last: None,
-            })
-        );
-        assert_eq!(
-            Filter::parse_text("(:DN:2.4.6.8.10:=Dino)"),
-            Ok(Filter::Extensible {
-                rule: Some("2.4.6.8.10".into()),
-                attribute: None,
-                value: b"Dino".to_vec(),
-                dn_attributes: true,
-            })
-        );
-        assert_eq!(
-            Filter::parse_text(r"(bin=\00\00\00\04)"),
-            Ok(Filter::Equal {
-                attribute: "bin".into(),
-                value: vec![0, 0, 0, 4]
-            })
-        );
-        assert_eq!(
-            Filter::parse_text(r"(sn=Lu\c4\8di\c4\87)")
-                .unwrap()
-                .to_text()
-                .unwrap(),
-            "(sn=Lučić)"
-        );
-        assert_eq!(
-            Filter::parse_text(r"(cn=*\2A*)")
-                .unwrap()
-                .to_text()
-                .unwrap(),
-            r"(cn=*\2a*)"
+        fictionet::assert_cases!(|input| Filter::parse_text(input).unwrap().to_text().unwrap();
+            unicode: r"(sn=Lu\c4\8di\c4\87)" => "(sn=Lučić)",
+            escaped_star: r"(cn=*\2A*)" => r"(cn=*\2a*)",
         );
         assert_eq!(Filter::parse_text("(&)"), Ok(Filter::And(vec![])));
         assert_eq!(Filter::parse_text("(|)"), Ok(Filter::Or(vec![])));
         assert_eq!(
             Filter::parse_text("(cn=**)"),
-            Ok(Filter::Substrings {
-                attribute: "cn".into(),
-                initial: None,
-                any: vec![vec![]],
-                last: None
-            })
+            Ok(substrings("cn".into(), None, vec![vec![]], None))
         );
         assert_eq!(
             Filter::parse_text("(cn;lang-en>=b)")
@@ -2911,12 +2915,7 @@ mod tests {
 
     #[test]
     fn filter_writers_refuse() {
-        let no_parts = Filter::Substrings {
-            attribute: "cn".into(),
-            initial: None,
-            any: vec![],
-            last: None,
-        };
+        let no_parts = substrings("cn".into(), None, vec![], None);
         assert_eq!(
             no_parts.to_text(),
             Err(Error::Filter("substring filter with no parts"))
@@ -2925,12 +2924,7 @@ mod tests {
             msg(1, Op::SearchRequest(search(no_parts))).to_bytes(),
             Err(Error::Filter("substring filter with no parts"))
         );
-        let neither = Filter::Extensible {
-            rule: None,
-            attribute: None,
-            value: vec![],
-            dn_attributes: true,
-        };
+        let neither = extensible(None, None, vec![], true);
         assert!(matches!(neither.to_text(), Err(Error::Filter(_))));
         assert!(matches!(
             msg(1, Op::SearchRequest(search(neither))).to_bytes(),
@@ -2941,32 +2935,14 @@ mod tests {
             Err(Error::Unwritable(_))
         ));
         assert!(matches!(eq("", "x").to_text(), Err(Error::Unwritable(_))));
-        let bad_rule = Filter::Extensible {
-            rule: Some("1..2".into()),
-            attribute: Some("cn".into()),
-            value: vec![],
-            dn_attributes: false,
-        };
+        let bad_rule = extensible(Some("1..2".into()), Some("cn".into()), vec![], false);
         assert!(matches!(bad_rule.to_text(), Err(Error::Unwritable(_))));
-        let dn_rule = Filter::Extensible {
-            rule: Some("dn".into()),
-            attribute: Some("cn".into()),
-            value: vec![],
-            dn_attributes: false,
-        };
+        let dn_rule = extensible(Some("dn".into()), Some("cn".into()), vec![], false);
         assert!(matches!(dn_rule.to_text(), Err(Error::Unwritable(_))));
-        let other = Filter::Other {
-            number: 12,
-            constructed: false,
-            contents: vec![1],
-        };
+        let other = other_filter(12, false, vec![1]);
         assert!(matches!(other.to_text(), Err(Error::Unwritable(_))));
         contract::check_written(&msg(1, Op::SearchRequest(search(other))));
-        let other_low = Filter::Other {
-            number: 7,
-            constructed: false,
-            contents: vec![],
-        };
+        let other_low = other_filter(7, false, vec![]);
         assert!(matches!(
             msg(1, Op::SearchRequest(search(other_low))).to_bytes(),
             Err(Error::Unwritable(_))
@@ -2982,10 +2958,7 @@ mod tests {
         );
         // Values with every byte are escaped so they read back.
         let all: Vec<u8> = (0..=255).collect();
-        let f = Filter::Equal {
-            attribute: "x".into(),
-            value: all,
-        };
+        let f = equal("x".into(), all);
         assert_eq!(Filter::parse_text(&f.to_text().unwrap()), Ok(f));
         let long = eq("cn", &"x".repeat(MAX_TEXT));
         assert_eq!(long.to_text(), Err(Error::TextTooLong));
@@ -3001,12 +2974,7 @@ mod tests {
             (Some(vec![]), vec![b"x".to_vec()], None),
             (None, vec![b"x".to_vec()], Some(vec![])),
         ] {
-            let f = Filter::Substrings {
-                attribute: "cn".into(),
-                initial,
-                any,
-                last,
-            };
+            let f = substrings("cn".into(), initial, any, last);
             assert!(matches!(f.to_text(), Err(Error::Unwritable(_))), "{f:?}");
             // The BER form still holds it.
             contract::check_written(&msg(1, Op::SearchRequest(search(f))));
@@ -3020,24 +2988,15 @@ mod tests {
         // asn1::MAX_DEPTH, so the writer never writes what the reader
         // refuses.
         let leaves = [
-            Filter::Substrings {
-                attribute: "cn".into(),
-                initial: Some(b"a".to_vec()),
-                any: vec![b"b".to_vec()],
-                last: Some(b"c".to_vec()),
-            },
-            Filter::Extensible {
-                rule: Some("1.2".into()),
-                attribute: Some("cn".into()),
-                value: b"v".to_vec(),
-                dn_attributes: true,
-            },
+            substrings(
+                "cn".into(),
+                Some(b"a".to_vec()),
+                vec![b"b".to_vec()],
+                Some(b"c".to_vec()),
+            ),
+            extensible(Some("1.2".into()), Some("cn".into()), b"v".to_vec(), true),
             Filter::And(vec![]),
-            Filter::Other {
-                number: 40,
-                constructed: true,
-                contents: vec![],
-            },
+            other_filter(40, true, vec![]),
         ];
         for leaf in leaves {
             let mut f = leaf;
@@ -3113,17 +3072,10 @@ mod tests {
         assert_eq!(dn.to_text().unwrap(), "1.3.6.1.4.1.1466.0=#04024869");
         let dn: Dn = r"CN=Lu\C4\8Di\C4\87".parse().unwrap();
         assert_eq!(dn.0[0].0[0].value, AttributeValue::Text("Lučić".into()));
-        assert_eq!(
-            Dn::parse(r"cn=\ a\ ").unwrap().0[0].0[0].value,
-            AttributeValue::Text(" a ".into())
-        );
-        assert_eq!(
-            Dn::parse("cn=").unwrap().0[0].0[0].value,
-            AttributeValue::Text(String::new())
-        );
-        assert_eq!(
-            Dn::parse("cn=a=b#c").unwrap().0[0].0[0].value,
-            AttributeValue::Text("a=b#c".into())
+        fictionet::assert_cases!(|input| Dn::parse(input).unwrap().0[0].0[0].value;
+            escaped_spaces: r"cn=\ a\ " => AttributeValue::Text(" a ".into()),
+            empty: "cn=" => AttributeValue::Text(String::new()),
+            embedded_delimiters: "cn=a=b#c" => AttributeValue::Text("a=b#c".into()),
         );
     }
 
@@ -3218,52 +3170,22 @@ mod tests {
         let mut indefinite = vec![0x30, 0x80];
         indefinite.extend_from_slice(&ok[2..]);
         indefinite.extend_from_slice(&[0, 0]);
-        assert_eq!(
-            Message::parse(&indefinite),
-            Err(Error::Ber(asn1::Error::Indefinite))
-        );
-        // A message ID over maxInt, or negative.
-        assert_eq!(
-            Message::parse(&[0x30, 0x08, 0x02, 0x04, 0x80, 0, 0, 0, 0x42, 0x00]),
-            Err(Error::Range("messageID"))
-        );
-        assert_eq!(
-            Message::parse(&[0x30, 0x05, 0x02, 0x01, 0xff, 0x42, 0x00]),
-            Err(Error::Range("messageID"))
-        );
-        assert_eq!(
-            Message::parse(&[0x30, 0x09, 0x02, 0x05, 0x00, 0x80, 0, 0, 0, 0x42, 0x00]),
-            Err(Error::Range("messageID"))
-        );
-        // An unknown operation, and a known one in the wrong form.
-        assert_eq!(
-            Message::parse(&[0x30, 0x05, 0x02, 0x01, 0x01, 0x5e, 0x00]),
-            Err(Error::Operation(Tag::application(30)))
-        );
-        assert_eq!(
-            Message::parse(&[0x30, 0x05, 0x02, 0x01, 0x01, 0x62, 0x00]),
-            Err(Error::Operation(Tag::application(2).as_constructed()))
-        );
-        assert_eq!(
-            Message::parse(&[0x30, 0x05, 0x02, 0x01, 0x01, 0x04, 0x00]),
-            Err(Error::Operation(Tag::OCTET_STRING))
-        );
-        // An unbind with contents.
-        assert_eq!(
-            Message::parse(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x42, 0x01, 0x00]),
-            Err(Error::Ber(asn1::Error::Null))
-        );
-        // A DN that is not UTF-8.
-        assert_eq!(
-            Message::parse(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x4a, 0x01, 0xff]),
-            Err(Error::Utf8)
-        );
-        // A constructed string, as a delete's DN and as a bind's name.
-        assert_eq!(
-            Message::parse(&[
-                0x30, 0x09, 0x02, 0x01, 0x01, 0x6a, 0x04, 0x04, 0x02, b'c', b'n'
-            ]),
-            Err(Error::Operation(Tag::application(10).as_constructed()))
+        fictionet::assert_cases!(|input| Message::parse(input);
+            indefinite: &indefinite => Err(Error::Ber(asn1::Error::Indefinite)),
+            // A message ID over maxInt, or negative.
+            negative_long_id: &[0x30, 0x08, 0x02, 0x04, 0x80, 0, 0, 0, 0x42, 0x00] => Err(Error::Range("messageID")),
+            negative_id: &[0x30, 0x05, 0x02, 0x01, 0xff, 0x42, 0x00] => Err(Error::Range("messageID")),
+            oversized_id: &[0x30, 0x09, 0x02, 0x05, 0x00, 0x80, 0, 0, 0, 0x42, 0x00] => Err(Error::Range("messageID")),
+            // An unknown operation, and a known one in the wrong form.
+            unknown_operation: &[0x30, 0x05, 0x02, 0x01, 0x01, 0x5e, 0x00] => Err(Error::Operation(Tag::application(30))),
+            constructed_unbind: &[0x30, 0x05, 0x02, 0x01, 0x01, 0x62, 0x00] => Err(Error::Operation(Tag::application(2).as_constructed())),
+            unexpected_tag: &[0x30, 0x05, 0x02, 0x01, 0x01, 0x04, 0x00] => Err(Error::Operation(Tag::OCTET_STRING)),
+            // An unbind with contents.
+            nonempty_unbind: &[0x30, 0x06, 0x02, 0x01, 0x01, 0x42, 0x01, 0x00] => Err(Error::Ber(asn1::Error::Null)),
+            // A DN that is not UTF-8.
+            invalid_utf8: &[0x30, 0x06, 0x02, 0x01, 0x01, 0x4a, 0x01, 0xff] => Err(Error::Utf8),
+            // A constructed string, as a delete's DN and as a bind's name.
+            constructed_delete: &[ 0x30, 0x09, 0x02, 0x01, 0x01, 0x6a, 0x04, 0x04, 0x02, b'c', b'n' ] => Err(Error::Operation(Tag::application(10).as_constructed())),
         );
         assert!(matches!(
             Message::parse(&[
@@ -3370,64 +3292,24 @@ mod tests {
             v.extend_from_slice(parts);
             v
         };
-        assert_eq!(
-            parse(&subs(&[])),
-            Err(Error::Filter("substring filter with no parts"))
-        );
-        assert_eq!(
-            parse(&subs(&[0x81, 0x00, 0x80, 0x00])),
-            Err(Error::Filter("initial substring not first"))
-        );
-        assert_eq!(
-            parse(&subs(&[0x82, 0x00, 0x81, 0x00])),
-            Err(Error::Filter("substring after the final part"))
-        );
-        assert_eq!(
-            parse(&subs(&[0x82, 0x00, 0x82, 0x00])),
-            Err(Error::Filter("substring after the final part"))
+        fictionet::assert_cases!(|input| parse(input);
+            empty_substrings: &subs(&[]) => Err(Error::Filter("substring filter with no parts")),
+            late_initial: &subs(&[0x81, 0x00, 0x80, 0x00]) => Err(Error::Filter("initial substring not first")),
+            after_final: &subs(&[0x82, 0x00, 0x81, 0x00]) => Err(Error::Filter("substring after the final part")),
+            repeated_final: &subs(&[0x82, 0x00, 0x82, 0x00]) => Err(Error::Filter("substring after the final part")),
         );
         assert!(matches!(parse(&subs(&[0x83, 0x00])), Err(Error::Ber(_))));
-        assert_eq!(
-            parse(&subs(&[0x80, 0x01, b'a', 0x81, 0x00, 0x82, 0x01, b'z'])),
-            Ok(Filter::Substrings {
-                attribute: "c".into(),
-                initial: Some(b"a".to_vec()),
-                any: vec![vec![]],
-                last: Some(b"z".to_vec())
-            })
+        fictionet::assert_cases!(|input| parse(input);
+            empty_middle: &subs(&[0x80, 0x01, b'a', 0x81, 0x00, 0x82, 0x01, b'z']) => Ok(substrings( "c".into(), Some(b"a".to_vec()), vec![vec![]], Some(b"z".to_vec()) )),
+            // Extensible with neither rule nor type; with both and dnAttributes.
+            missing_type_and_rule: &[0xa9, 0x02, 0x83, 0x00] => Err(Error::Filter("extensible match with neither type nor rule")),
+            type_and_rule: &[ 0xa9, 0x0b, 0x81, 0x01, b'r', 0x82, 0x01, b't', 0x83, 0x00, 0x84, 0x01, 0xff ] => Ok(extensible(Some("r".into()), Some("t".into()), vec![], true)),
+            // An explicit FALSE for dnAttributes reads, and is left out on writing.
+            explicit_false: &[0xa9, 0x07, 0x82, 0x00, 0x83, 0x00, 0x84, 0x01, 0x00] => Ok(extensible(None, Some(String::new()), vec![], false)),
+            // Not with two filters, and with none.
+            multiple_filters: &[0xa2, 0x04, 0x87, 0x00, 0x87, 0x00] => Err(Error::Ber(asn1::Error::Trailing)),
+            empty_filter: &[0xa2, 0x00] => Err(Error::Ber(asn1::Error::Empty)),
         );
-        // Extensible with neither rule nor type; with both and dnAttributes.
-        assert_eq!(
-            parse(&[0xa9, 0x02, 0x83, 0x00]),
-            Err(Error::Filter("extensible match with neither type nor rule"))
-        );
-        assert_eq!(
-            parse(&[
-                0xa9, 0x0b, 0x81, 0x01, b'r', 0x82, 0x01, b't', 0x83, 0x00, 0x84, 0x01, 0xff
-            ]),
-            Ok(Filter::Extensible {
-                rule: Some("r".into()),
-                attribute: Some("t".into()),
-                value: vec![],
-                dn_attributes: true
-            })
-        );
-        // An explicit FALSE for dnAttributes reads, and is left out on writing.
-        assert_eq!(
-            parse(&[0xa9, 0x07, 0x82, 0x00, 0x83, 0x00, 0x84, 0x01, 0x00]),
-            Ok(Filter::Extensible {
-                rule: None,
-                attribute: Some(String::new()),
-                value: vec![],
-                dn_attributes: false
-            })
-        );
-        // Not with two filters, and with none.
-        assert_eq!(
-            parse(&[0xa2, 0x04, 0x87, 0x00, 0x87, 0x00]),
-            Err(Error::Ber(asn1::Error::Trailing))
-        );
-        assert_eq!(parse(&[0xa2, 0x00]), Err(Error::Ber(asn1::Error::Empty)));
         // An extension choice, kept as it is, and written in the same form.
         for form in [0x8a, 0xaa] {
             let b = search_with_filter_bytes(&[form, 0x02, 0x05, 0x00]);
@@ -3435,14 +3317,7 @@ mod tests {
             let Op::SearchRequest(s) = &m.op else {
                 unreachable!()
             };
-            assert_eq!(
-                s.filter,
-                Filter::Other {
-                    number: 10,
-                    constructed: form == 0xaa,
-                    contents: vec![0x05, 0x00]
-                }
-            );
+            assert_eq!(s.filter, other_filter(10, form == 0xaa, vec![0x05, 0x00]));
             assert_eq!(m.to_bytes().unwrap(), b);
         }
         // Too deep.
@@ -3467,11 +3342,11 @@ mod tests {
             Err(Error::Range("messageID"))
         );
         let bind = |version| {
-            Op::BindRequest(BindRequest {
+            Op::BindRequest(bind_request(
                 version,
-                name: String::new(),
-                auth: Authentication::Simple(vec![]),
-            })
+                String::new(),
+                Authentication::Simple(vec![]),
+            ))
         };
         assert_eq!(msg(1, bind(0)).to_bytes(), Err(Error::Range("version")));
         assert_eq!(msg(1, bind(128)).to_bytes(), Err(Error::Range("version")));
@@ -3488,15 +3363,15 @@ mod tests {
             Err(Error::Range("timeLimit"))
         );
         let other = |number| {
-            Op::BindRequest(BindRequest {
-                version: 3,
-                name: String::new(),
-                auth: Authentication::Other {
+            Op::BindRequest(bind_request(
+                3,
+                String::new(),
+                Authentication::Other {
                     number,
                     constructed: false,
                     contents: vec![],
                 },
-            })
+            ))
         };
         assert!(matches!(
             msg(1, other(0)).to_bytes(),
@@ -3700,13 +3575,10 @@ mod tests {
     fn datagram_with_several_messages() {
         let entry = msg(
             3,
-            Op::SearchResultEntry(SearchResultEntry {
-                dn: String::new(),
-                attributes: vec![Attribute {
-                    name: "netlogon".into(),
-                    values: vec![vec![0x17, 0x00]],
-                }],
-            }),
+            Op::SearchResultEntry(entry(
+                String::new(),
+                vec![attribute("netlogon".into(), vec![vec![0x17, 0x00]])],
+            )),
         );
         let done = msg(
             3,
@@ -3797,10 +3669,7 @@ mod tests {
             1,
             Op::AddRequest(AddRequest {
                 dn: "cn=x".into(),
-                attributes: vec![Attribute {
-                    name: "cn".into(),
-                    values: vec![],
-                }],
+                attributes: vec![attribute("cn".into(), vec![])],
             }),
         );
         assert!(matches!(add.to_bytes(), Err(Error::Unwritable(_))));
@@ -3824,13 +3693,7 @@ mod tests {
         // A search result entry's attribute may have none.
         contract::check_written(&msg(
             1,
-            Op::SearchResultEntry(SearchResultEntry {
-                dn: "cn=x".into(),
-                attributes: vec![Attribute {
-                    name: "cn".into(),
-                    values: vec![],
-                }],
-            }),
+            Op::SearchResultEntry(entry("cn=x".into(), vec![attribute("cn".into(), vec![])])),
         ));
     }
 
@@ -3847,13 +3710,10 @@ mod tests {
                 1,
                 Op::ModifyRequest(ModifyRequest {
                     dn: String::new(),
-                    changes: vec![Change {
-                        op: ModifyOperation::Other(n),
-                        attribute: Attribute {
-                            name: "a".into(),
-                            values: vec![],
-                        },
-                    }],
+                    changes: vec![change(
+                        ModifyOperation::Other(n),
+                        attribute("a".into(), vec![]),
+                    )],
                 }),
             );
             assert!(matches!(m.to_bytes(), Err(Error::Unwritable(_))));
@@ -3865,21 +3725,11 @@ mod tests {
     #[test]
     fn a_rule_named_dn_with_no_type() {
         // RFC 4515: with no type, `:dn` before `:=` can only be the rule.
-        let f = Filter::Extensible {
-            rule: Some("dn".into()),
-            attribute: None,
-            value: b"x".to_vec(),
-            dn_attributes: false,
-        };
+        let f = extensible(Some("dn".into()), None, b"x".to_vec(), false);
         assert_eq!(Filter::parse_text("(:dn:=x)"), Ok(f.clone()));
         assert_eq!(f.to_text().unwrap(), "(:dn:=x)");
         // With a type, `(cn:dn:=x)` is the flag, so that form is refused.
-        let typed = Filter::Extensible {
-            rule: Some("dn".into()),
-            attribute: Some("cn".into()),
-            value: b"x".to_vec(),
-            dn_attributes: false,
-        };
+        let typed = extensible(Some("dn".into()), Some("cn".into()), b"x".to_vec(), false);
         assert!(matches!(typed.to_text(), Err(Error::Unwritable(_))));
     }
 
@@ -3889,16 +3739,13 @@ mod tests {
         // before its text passes MAX_TEXT, not after.
         let nul = vec![0u8; MAX_TEXT];
         for f in [
-            Filter::Equal {
-                attribute: "cn".into(),
-                value: nul.clone(),
-            },
-            Filter::Substrings {
-                attribute: "cn".into(),
-                initial: None,
-                any: vec![nul[..MAX_TEXT / 4].to_vec(); 8],
-                last: None,
-            },
+            equal("cn".into(), nul.clone()),
+            substrings(
+                "cn".into(),
+                None,
+                vec![nul[..MAX_TEXT / 4].to_vec(); 8],
+                None,
+            ),
         ] {
             let mut out = String::new();
             assert_eq!(f.write_text(&mut out, 1), Err(Error::TextTooLong));
@@ -3974,10 +3821,7 @@ mod tests {
             if let Ok(text) = std::str::from_utf8(&value) {
                 filter_chars.push_str(text);
             }
-            let filter = Filter::Equal {
-                attribute: "cn".into(),
-                value,
-            };
+            let filter = equal("cn".into(), value);
             assert_eq!(Filter::parse_text(&filter.to_text().unwrap()), Ok(filter));
         }
         for ch in [
@@ -3997,10 +3841,7 @@ mod tests {
             0 => Filter::And((0..g.below(4)).map(|_| make_filter(g, depth + 1)).collect()),
             1 => Filter::Or((0..g.below(4)).map(|_| make_filter(g, depth + 1)).collect()),
             2 => Filter::Not(Box::new(make_filter(g, depth + 1))),
-            3 => Filter::Equal {
-                attribute: attribute_name(g),
-                value: filter_value(g, 6),
-            },
+            3 => equal(attribute_name(g), filter_value(g, 6)),
             4 => {
                 let initial = if g.coin() {
                     Some(nonempty_bytes(g, 4))
@@ -4017,12 +3858,12 @@ mod tests {
                 } else {
                     g.below(3)
                 };
-                Filter::Substrings {
-                    attribute: attribute_name(g),
+                substrings(
+                    attribute_name(g),
                     initial,
-                    any: (0..n).map(|_| filter_value(g, 3)).collect(),
+                    (0..n).map(|_| filter_value(g, 3)).collect(),
                     last,
-                }
+                )
             }
             5 => Filter::GreaterOrEqual {
                 attribute: attribute_name(g),
@@ -4048,21 +3889,16 @@ mod tests {
                 } else {
                     None
                 };
-                Filter::Extensible {
-                    rule,
-                    attribute,
-                    value: filter_value(g, 6),
-                    dn_attributes: g.coin(),
-                }
+                extensible(rule, attribute, filter_value(g, 6), g.coin())
             }
         }
     }
 
     fn make_attribute(g: &mut Lcg) -> Attribute {
-        Attribute {
-            name: value_text(g, 5),
-            values: (0..g.below(3)).map(|_| g.bytes(5)).collect(),
-        }
+        attribute(
+            value_text(g, 5),
+            (0..g.below(3)).map(|_| g.bytes(5)).collect(),
+        )
     }
 
     fn make_result(g: &mut Lcg) -> LdapResult {
@@ -4076,10 +3912,10 @@ mod tests {
 
     fn make_message(g: &mut Lcg) -> Message {
         let op = match g.below(21) {
-            0 => Op::BindRequest(BindRequest {
-                version: 1 + g.below(127) as u8,
-                name: value_text(g, 6),
-                auth: match g.below(3) {
+            0 => Op::BindRequest(bind_request(
+                1 + g.below(127) as u8,
+                value_text(g, 6),
+                match g.below(3) {
                     0 => Authentication::Simple(g.bytes(6)),
                     1 => Authentication::Sasl {
                         mechanism: value_text(g, 5),
@@ -4091,7 +3927,7 @@ mod tests {
                         contents: g.bytes(4),
                     },
                 },
-            }),
+            )),
             1 => Op::BindResponse(BindResponse {
                 result: make_result(g),
                 server_sasl_creds: g.coin().then(|| g.bytes(6)),
@@ -4105,28 +3941,26 @@ mod tests {
                 time_limit: g.below(1000) as u32,
                 types_only: g.coin(),
                 filter: if g.below(8) == 0 {
-                    Filter::Other {
-                        number: 10 + g.below(50) as u32,
-                        constructed: g.coin(),
-                        contents: g.bytes(3),
-                    }
+                    other_filter(10 + g.below(50) as u32, g.coin(), g.bytes(3))
                 } else {
                     make_filter(g, 1)
                 },
                 attributes: (0..g.below(3)).map(|_| attribute_name(g)).collect(),
             }),
-            4 => Op::SearchResultEntry(SearchResultEntry {
-                dn: value_text(g, 6),
-                attributes: (0..g.below(3)).map(|_| make_attribute(g)).collect(),
-            }),
+            4 => Op::SearchResultEntry(entry(
+                value_text(g, 6),
+                (0..g.below(3)).map(|_| make_attribute(g)).collect(),
+            )),
             5 => Op::SearchResultDone(make_result(g)),
             6 => Op::SearchResultReference((0..1 + g.below(3)).map(|_| value_text(g, 6)).collect()),
             7 => Op::ModifyRequest(ModifyRequest {
                 dn: value_text(g, 6),
                 changes: (0..g.below(3))
-                    .map(|_| Change {
-                        op: ModifyOperation::from_code(g.below(5) as u32),
-                        attribute: make_attribute(g),
+                    .map(|_| {
+                        change(
+                            ModifyOperation::from_code(g.below(5) as u32),
+                            make_attribute(g),
+                        )
                     })
                     .collect(),
             }),
