@@ -7,24 +7,28 @@
 //! counts cost two relaxed atomic additions per packet. The tap costs one
 //! relaxed atomic load per packet while nothing watches.
 //!
-//! Every [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) also has a [`Graph`]: its tasks, where each
+//! Every [`run`](crate::run) also has a [`Graph`]: its tasks, where each
 //! was spawned, which task uses which end of each link, and the run's
 //! [events](crate::events).
-
-#![cfg_attr(not(feature = "observe"), allow(dead_code))]
 
 use fictionet::sync::{Mutex, MutexGuard};
 
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
+use std::collections::VecDeque;
 use std::panic::Location;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 use std::time::Duration;
 
 use crate::Packet;
 use crate::sys::SystemTime;
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 use crate::time::Instant;
 
 thread_local! {
@@ -95,19 +99,24 @@ static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct Meter {
     pub(crate) id: u64,
     /// What end `s` sent, for an attachment.
+    #[cfg(feature = "std")]
     counts: [Count; 2],
     /// What holds the counts of a pair.
     counted: OnceLock<Weak<dyn Counted>>,
     /// The task that made the link, or 0.
+    #[cfg(feature = "observe")]
     creator: u64,
     /// For an attachment: the sandbox's name. Side 1 is the sandbox.
     sandbox: OnceLock<Arc<str>>,
     /// Set while a viewer watches: `send` then copies packets into `tap`.
+    #[cfg(any(feature = "observe", all(test, feature = "std")))]
     tapped: AtomicBool,
+    #[cfg(any(feature = "observe", all(test, feature = "std")))]
     tap: Mutex<Option<Arc<Tap>>>,
 }
 
 #[derive(Default)]
+#[cfg(feature = "std")]
 struct Count {
     packets: AtomicU64,
     bytes: AtomicU64,
@@ -117,11 +126,15 @@ impl Meter {
     pub(crate) fn new() -> Arc<Meter> {
         Arc::new(Meter {
             id: NEXT_LINK.fetch_add(1, Ordering::Relaxed),
+            #[cfg(feature = "std")]
             counts: Default::default(),
             counted: OnceLock::new(),
+            #[cfg(feature = "observe")]
             creator: current_task(),
             sandbox: OnceLock::new(),
+            #[cfg(any(feature = "observe", all(test, feature = "std")))]
             tapped: AtomicBool::new(false),
+            #[cfg(any(feature = "observe", all(test, feature = "std")))]
             tap: Mutex::new(None),
         })
     }
@@ -138,6 +151,7 @@ impl Meter {
 
     /// Counts a packet that end `side` sent, and copies it if watched.
     #[inline]
+    #[cfg(feature = "std")]
     pub(crate) fn sent(&self, side: usize, packet: &Packet) {
         let c = &self.counts[side];
         c.packets.fetch_add(1, Ordering::Relaxed);
@@ -148,12 +162,16 @@ impl Meter {
     /// Copies a packet that end `side` sent, if a viewer watches.
     #[inline]
     pub(crate) fn copy(&self, side: usize, packet: &Packet) {
+        #[cfg(not(any(feature = "observe", all(test, feature = "std"))))]
+        let _ = (side, packet);
+        #[cfg(any(feature = "observe", all(test, feature = "std")))]
         if self.tapped.load(Ordering::Relaxed) {
             self.capture(side, packet);
         }
     }
 
     #[cold]
+    #[cfg(any(feature = "observe", all(test, feature = "std")))]
     fn capture(&self, side: usize, packet: &Packet) {
         let tap = self.tap.lock().clone();
         if let Some(tap) = tap {
@@ -163,6 +181,7 @@ impl Meter {
 
     /// Packets and bytes each side has sent: `[packets 0, bytes 0, packets
     /// 1, bytes 1]`.
+    #[cfg(any(feature = "observe", all(test, feature = "std")))]
     pub(crate) fn totals(&self) -> [u64; 4] {
         if let Some(counted) = self.counted.get() {
             return counted.upgrade().map_or([0; 4], |c| c.totals());
@@ -176,6 +195,7 @@ impl Meter {
     }
 
     /// Starts copying packets, or joins the viewers already watching.
+    #[cfg(any(feature = "observe", all(test, feature = "std")))]
     pub(crate) fn watch(
         self: &Arc<Self>,
         environment: &Arc<crate::entropy::RunEnvironment>,
@@ -196,16 +216,19 @@ impl Meter {
 /// Whatever counts a link's packets itself.
 pub(crate) trait Counted: Send + Sync {
     /// `[packets 0, bytes 0, packets 1, bytes 1]`, by the side that sent.
+    #[cfg(any(feature = "observe", all(test, feature = "std")))]
     fn totals(&self) -> [u64; 4];
 }
 
 /// One viewer of a link's packets. Dropping the last one stops the copies.
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 pub(crate) struct TapGuard {
     /// Weak, so that a watched link still closes when its ends are gone.
     meter: Weak<Meter>,
     pub(crate) tap: Arc<Tap>,
 }
 
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 impl Drop for TapGuard {
     fn drop(&mut self) {
         let Some(meter) = self.meter.upgrade() else {
@@ -223,15 +246,20 @@ impl Drop for TapGuard {
 // The tap
 
 /// Packets kept in full in each 100 ms window before sampling starts.
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 pub(crate) const FULL_PER_WINDOW: u64 = 64;
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 const WINDOW: Duration = Duration::from_millis(100);
 /// How many bytes of copies a tap keeps. Older copies are dropped first.
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 const TAP_BYTES: usize = 8 << 20;
 /// How many copies a tap keeps.
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 const TAP_PACKETS: usize = 4096;
 
 /// A copied packet.
 #[derive(Clone)]
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 pub(crate) struct Copy {
     /// Numbers every copy of a tap, from 1, with no gaps.
     pub(crate) seq: u64,
@@ -249,12 +277,14 @@ pub(crate) struct Copy {
 /// copied. Past that, one in every `n` is, where `n` doubles every
 /// `FULL_PER_WINDOW` packets, so a flood costs at most about 130 copies a
 /// window, not one per packet.
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 pub(crate) struct Tap {
     environment: Arc<crate::entropy::RunEnvironment>,
     viewers: AtomicUsize,
     state: Mutex<TapState>,
 }
 
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 struct TapState {
     copies: VecDeque<Copy>,
     bytes: usize,
@@ -264,6 +294,7 @@ struct TapState {
     skipped: u64,
 }
 
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 impl Tap {
     fn new(environment: Arc<crate::entropy::RunEnvironment>) -> Tap {
         Tap {
@@ -326,6 +357,7 @@ impl Tap {
 }
 
 /// Whether the `k`th packet of a window (from 0) is copied.
+#[cfg(any(feature = "observe", all(test, feature = "std")))]
 pub(crate) fn keep(k: u64) -> bool {
     if k < FULL_PER_WINDOW {
         return true;
@@ -343,18 +375,31 @@ pub(crate) fn keep(k: u64) -> bool {
 #[derive(Debug)]
 pub(crate) struct Group {
     /// Unique in its run, from 1.
+    #[cfg(feature = "observe")]
     pub(crate) id: u64,
+    #[cfg(feature = "observe")]
     pub(crate) name: String,
     /// The group this one is inside.
+    #[cfg(feature = "observe")]
     pub(crate) parent: Option<Arc<Group>>,
 }
 
 impl Group {
     pub(crate) fn new(id: u64, name: String, parent: Option<Arc<Group>>) -> Arc<Group> {
-        Arc::new(Group { id, name, parent })
+        #[cfg(not(feature = "observe"))]
+        let _ = (id, name, parent);
+        Arc::new(Group {
+            #[cfg(feature = "observe")]
+            id,
+            #[cfg(feature = "observe")]
+            name,
+            #[cfg(feature = "observe")]
+            parent,
+        })
     }
 
     /// This group and the groups it is inside, innermost first.
+    #[cfg(feature = "observe")]
     pub(crate) fn chain(self: &Arc<Self>) -> impl Iterator<Item = &Arc<Group>> {
         std::iter::successors(Some(self), |g| g.parent.as_ref())
     }
@@ -365,12 +410,14 @@ impl Group {
 pub(crate) struct TaskInfo {
     pub(crate) parent: u64,
     /// The group the task belongs to, if any.
+    #[cfg(feature = "observe")]
     pub(crate) group: Option<Arc<Group>>,
     /// The stdlib function's name, or the full type name of the task's
     /// future, shortened by [`short_name`] only when an observer asks.
     pub(crate) name: Cow<'static, str>,
     pub(crate) file: &'static str,
     pub(crate) line: u32,
+    #[cfg(feature = "observe")]
     pub(crate) started: Duration,
 }
 
@@ -379,6 +426,7 @@ pub(crate) struct LinkInfo {
     pub(crate) meter: Weak<Meter>,
     /// The task using each end, or 0 if none has been seen.
     pub(crate) owners: [u64; 2],
+    #[cfg(feature = "observe")]
     pub(crate) creator: u64,
     pub(crate) sandbox: Option<Arc<str>>,
     pub(crate) label: Option<Arc<str>>,
@@ -398,6 +446,7 @@ pub struct KeyLine {
 
 /// How many TLS secrets a world keeps, about 4,000 sessions. Past that,
 /// the oldest are forgotten.
+#[cfg(feature = "observe")]
 pub(crate) const MAX_KEYS: usize = 20_000;
 
 /// What a run records about itself for observers.
@@ -418,6 +467,7 @@ pub(crate) struct Graph {
     /// Application decoders for links watched from now on.
     pub(crate) protocols: Mutex<crate::observe::Registry>,
     /// Watched links, so observers of one link share one decoded copy.
+    #[cfg(feature = "observe")]
     pub(crate) watches: Mutex<std::collections::HashMap<u64, Arc<crate::observe::LinkWatch>>>,
 }
 
@@ -427,9 +477,11 @@ pub(crate) struct GraphState {
     pub(crate) links: HashMap<u64, LinkInfo, Ids>,
     /// The link count at which dead links are next swept out.
     sweep_at: usize,
+    #[cfg(feature = "observe")]
     pub(crate) keys: VecDeque<KeyLine>,
     /// How many keys have ever been added, so watches can take new ones
     /// after old ones are forgotten.
+    #[cfg(feature = "observe")]
     pub(crate) keys_added: u64,
     /// The run has ended.
     pub(crate) ended: bool,
@@ -451,6 +503,7 @@ impl Graph {
                 ..GraphState::default()
             }),
             events: crate::events::Store::new(mode),
+            #[cfg(feature = "observe")]
             watches: Mutex::default(),
             protocols: Mutex::default(),
         })
@@ -466,6 +519,7 @@ impl Graph {
         self.viewers.load(Ordering::Relaxed) > 0
     }
 
+    #[cfg(any(feature = "observe", all(test, feature = "std")))]
     pub(crate) fn since_start(&self) -> Duration {
         self.environment.clock.now().since_start()
     }
@@ -482,12 +536,16 @@ impl Graph {
         location: &'static Location<'static>,
         group: Option<Arc<Group>>,
     ) {
+        #[cfg(not(feature = "observe"))]
+        let _ = group;
         let info = TaskInfo {
             parent: current_task(),
+            #[cfg(feature = "observe")]
             group,
             name,
             file: location.file(),
             line: location.line(),
+            #[cfg(feature = "observe")]
             started: self.since_start(),
         };
         self.state().tasks.insert(id, info);
@@ -505,8 +563,8 @@ impl Graph {
         // Nothing more is recorded: let callbacks and file writers go.
         self.events.close();
         // Nothing more crosses the world's links: stop watching them.
-        let watches = std::mem::take(&mut *self.watches.lock());
-        drop(watches);
+        #[cfg(feature = "observe")]
+        self.watches.lock().clear();
     }
 
     fn link<'a>(s: &'a mut GraphState, meter: &Arc<Meter>) -> &'a mut LinkInfo {
@@ -519,6 +577,7 @@ impl Graph {
         s.links.entry(meter.id).or_insert_with(|| LinkInfo {
             meter: Arc::downgrade(meter),
             owners: [0, 0],
+            #[cfg(feature = "observe")]
             creator: meter.creator,
             sandbox: meter.sandbox.get().cloned(),
             label: None,
@@ -558,6 +617,7 @@ impl Graph {
         })
     }
 
+    #[cfg(feature = "observe")]
     pub(crate) fn key(&self, line: KeyLine) {
         let mut s = self.state();
         if s.keys.len() >= MAX_KEYS {

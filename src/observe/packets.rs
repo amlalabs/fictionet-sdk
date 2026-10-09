@@ -320,16 +320,6 @@ pub(crate) fn keylog(graph: &Graph) -> String {
 
 pub(crate) fn hex(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
-    push_hex(&mut s, b);
+    super::json::push_hex(&mut s, b);
     s
-}
-
-/// Appends `b` in lowercase hex, two digits a byte.
-pub(crate) fn push_hex(out: &mut String, b: &[u8]) {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    out.reserve(b.len() * 2);
-    for &x in b {
-        out.push(DIGITS[(x >> 4) as usize] as char);
-        out.push(DIGITS[(x & 15) as usize] as char);
-    }
 }

@@ -51,11 +51,11 @@ pub fn parts(source: &str) -> (String, String) {
 }
 
 #[test]
-fn conditional_examples_are_documentation_not_implementations() {
+fn examples_are_documentation_not_implementations() {
     let source = r####"/// Request handler.
-#[doc = fictionet::cfg_std!(doc r##"```rust
-impl Service for Example {}
-```"##)]
+/// ```rust
+/// impl Service for Example {}
+/// ```
 impl Service for Actual {}
 "####;
     let (code, docs) = parts(source);

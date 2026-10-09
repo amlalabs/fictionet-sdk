@@ -24,6 +24,7 @@ pub(crate) fn string(out: &mut String, s: &str) {
 }
 
 /// `s` as a JSON string.
+#[cfg(feature = "observe")]
 pub(crate) fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     string(&mut out, s);
@@ -31,11 +32,13 @@ pub(crate) fn quote(s: &str) -> String {
 }
 
 /// An object written field by field.
+#[cfg(feature = "observe")]
 pub(crate) struct Object {
     out: String,
     first: bool,
 }
 
+#[cfg(feature = "observe")]
 impl Object {
     pub(crate) fn new() -> Object {
         Object {
@@ -95,6 +98,7 @@ impl Object {
 }
 
 /// An array of values that are JSON already.
+#[cfg(feature = "observe")]
 pub(crate) fn array<I: IntoIterator<Item = S>, S: AsRef<str>>(items: I) -> String {
     let mut out = String::from("[");
     for (i, item) in items.into_iter().enumerate() {
@@ -134,6 +138,7 @@ mod tests {
 
 /// A value of a flat JSON object: requests hold nothing deeper.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg(feature = "observe")]
 pub(crate) enum Scalar {
     Str(String),
     Num(f64),
@@ -141,6 +146,7 @@ pub(crate) enum Scalar {
     Null,
 }
 
+#[cfg(feature = "observe")]
 impl Scalar {
     pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
@@ -160,6 +166,7 @@ impl Scalar {
 
 /// Parses a JSON object whose values are strings, numbers, booleans or
 /// null. `None` for anything else.
+#[cfg(feature = "observe")]
 pub(crate) fn parse_flat(text: &str) -> Option<std::collections::HashMap<String, Scalar>> {
     let mut p = Parser {
         b: text.as_bytes(),
@@ -201,11 +208,13 @@ pub(crate) fn parse_flat(text: &str) -> Option<std::collections::HashMap<String,
     (p.i == p.b.len()).then_some(out)
 }
 
+#[cfg(feature = "observe")]
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
 }
 
+#[cfg(feature = "observe")]
 impl Parser<'_> {
     fn peek(&self) -> Option<u8> {
         self.b.get(self.i).copied()
@@ -292,5 +301,15 @@ mod parse_tests {
         assert!(parse_flat(r#"{"a":[1]}"#).is_none());
         assert!(parse_flat(r#"{"a":1"#).is_none());
         assert!(parse_flat(r#"{"a":1} x"#).is_none());
+    }
+}
+
+/// Appends `b` in lowercase hex, two digits a byte.
+pub(crate) fn push_hex(out: &mut String, b: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    out.reserve(b.len() * 2);
+    for &x in b {
+        out.push(DIGITS[(x >> 4) as usize] as char);
+        out.push(DIGITS[(x & 15) as usize] as char);
     }
 }

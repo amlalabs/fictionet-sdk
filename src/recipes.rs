@@ -8,7 +8,7 @@
 //!
 //! # Putting something in front of every sandbox
 //!
-//! [`web::Sites::start`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html#method.start) takes the
+//! [`web::Sites::start`](crate::stdlib::web::Sites::start) takes the
 //! world's [`Attachments`](crate::Attachments): every sandbox that attaches,
 //! now or later. To slow down, limit or watch a sandbox's traffic, put a
 //! piece of the network between each sandbox and `Sites`.
@@ -17,17 +17,18 @@
 //! sandbox from the new one, `map` calls the function with that sandbox,
 //! and hands the world what the function returned:
 //!
-#![doc = fictionet::cfg_std!(doc r####"
-```
-# use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
-# fn site_for(_host: &str) -> Option<web::Site> { None }
-# async fn world(fcx: Cx, attachments: Attachments) -> Result {
-let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
-web::Sites::new(site_for).start(&fcx, far)?;
-# Ok(())
-# }
-```
-"####)]
+//! ```
+//! # #[cfg(feature = "std")]
+//! # {
+//! # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
+//! # fn site_for(_host: &str) -> Option<web::Site> { None }
+//! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
+//! let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
+//! web::Sites::new(site_for).start(&fcx, far)?;
+//! # Ok(())
+//! # }
+//! # }
+//! ```
 //!
 //! `Sites` then sees each sandbox through its delay. It does not know the
 //! delay is there: each sandbox keeps its name, and `Sites` binds its
@@ -96,7 +97,7 @@ web::Sites::new(site_for).start(&fcx, far)?;
 //! This world puts a 200 ms delay in front of every sandbox, each way, so
 //! every round trip takes 400 ms longer:
 //!
-#![doc = concat!("```rust,no_run\n", include_str!("../examples/delayed_sites.rs"), "```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../examples/delayed_sites.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! Start it:
 //!
@@ -143,7 +144,7 @@ web::Sites::new(site_for).start(&fcx, far)?;
 //! side and never came out of the other was dropped by the queue. Once the
 //! packets have stopped for a second, the world prints the counts:
 //!
-#![doc = concat!("```rust,no_run\n", include_str!("../examples/bottleneck_sites.rs"), "```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../examples/bottleneck_sites.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! Start it:
 //!
@@ -186,7 +187,7 @@ web::Sites::new(site_for).start(&fcx, far)?;
 //! [`filter`](crate::stdlib::filter) decides for each packet with
 //! [`Cx::random_f64`](crate::Cx::random_f64):
 //!
-#![doc = concat!("```rust,no_run\n", include_str!("../examples/lossy_sites.rs"), "```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../examples/lossy_sites.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! Start it:
 //!
@@ -239,7 +240,7 @@ web::Sites::new(site_for).start(&fcx, far)?;
 //! the channel, waits for the writer thread to finish, and prints the final
 //! count.
 //!
-#![doc = concat!("```rust,no_run\n", include_str!("../examples/capture_sites.rs"), "```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../examples/capture_sites.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! Start it, and make a request:
 //!
@@ -299,14 +300,14 @@ web::Sites::new(site_for).start(&fcx, far)?;
 //! for each machine, one router, and the
 //! [`Router`](crate::stdlib::route::Router) handle that adds the route
 //! later. The two machines are TCP endpoints that answer every HTTP
-//! request with one line through an [`httpd::Router`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/struct.Router.html).
+//! request with one line through an [`httpd::Router`](crate::stdlib::httpd::Router).
 //! [`serve::listen`](crate::stdlib::serve::listen) runs the HTTP service on
 //! each machine. [`ServeOptions::max_conns`](crate::stdlib::serve::ServeOptions::max_conns)
 //! allows at most 64 connections at once and resets any past the cap.
 //! [`ServeOptions::idle`](crate::stdlib::serve::ServeOptions::idle) closes
 //! connections after 10 seconds without input while the service waits:
 //!
-//! #![doc = concat!("```rust,no_run\n", include_str!("../examples/route_change.rs"), "```")]
+#![doc = concat!("```rust,no_run\n# #[cfg(feature = \"std\")]\n# mod example {\n", include_str!("../examples/route_change.rs"), "# }\n# fn main() {}\n```")]
 //!
 //! The world has IPv4 only, so attach the sandbox with `--no-ip-addr-v6
 //! --no-gateway-v6 --no-dns-v6` in place of the three IPv6 flags (see

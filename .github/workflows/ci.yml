@@ -28,7 +28,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Exercise host integration, sealed labs, and optional clients.
+        # Build host integration with observation; the simulated core alone;
+        # all features including outbound web proxying; and tokio without observation.
         include:
           - name: default features
             features: ""

@@ -5,7 +5,7 @@
 //! [`Net`] builds the whole network around the [`Host`]s a world declares.
 //! Each host has addresses, DNS names, and services on its ports: any
 //! [`Service`] over TCP or UDP, the same over TLS chosen by SNI, and any
-//! [`PortServer`] of the world's own, such as [`httpd::Server`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/struct.Server.html) for HTTP with
+//! [`PortServer`] of the world's own, such as [`httpd::Server`] for HTTP with
 //! name-based virtual hosting. Every sandbox that attaches is put on the
 //! sandboxes' subnet, given an address by DHCP or by its first packet, and
 //! kept from reaching the other sandboxes. A world then writes only its
@@ -14,35 +14,35 @@
 //! An office: a domain controller that answers LDAP and Kerberos, a web
 //! server, and a PLC, with DNS names for each:
 //!
-#![doc = fictionet::cfg_std!(doc r####"
-```
-# use std::sync::Arc;
-# use fictionet::{Attachments, Cx, Result};
-# use fictionet::stdlib::{httpd, net::{Host, Net}, serve};
-# struct Ldap; struct Plc; struct Directory; struct Plant;
-# macro_rules! svc { ($t:ty, $w:ty) => {
-# impl serve::Service for $t {
-#     type Decoder = fictionet::stdlib::codec::Lines; type State = $w; type Error = std::convert::Infallible;
-#     fn decoder(&self) -> Self::Decoder { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
-#     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &$w, _: &mut serve::Driver<'_, Self::Decoder>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
-# } } }
-# svc!(Ldap, Directory); svc!(Plc, Plant);
-# async fn world(fcx: Cx, attachments: Attachments) -> Result {
-let directory = Arc::new(Directory);
-let plant = Arc::new(Plant);
-let intranet = httpd::Router::new().get("/", |_, _| http::Response::new("intranet\n".into()));
-fcx.events().to_file("/tmp/office-events.jsonl")?;
-Net::new()
-    .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp(389, directory.clone(), || Ldap))
-    .host("www", |h| h.dns_name("intranet.corp.test").port_server(80, httpd::Server::new(intranet)))
-    .host("plc1", |h| h.at("10.30.0.5".parse::<std::net::Ipv4Addr>().unwrap()).tcp(502, plant, || Plc))
-    .start(&fcx, attachments)?;
-# Ok(())
-# }
-```
-"####)]
+//! ```
+//! # fictionet::cfg_std! {
+//! # use std::sync::Arc;
+//! # use fictionet::{Attachments, Cx, Result};
+//! # use fictionet::stdlib::{httpd, net::{Host, Net}, serve};
+//! # struct Ldap; struct Plc; struct Directory; struct Plant;
+//! # macro_rules! svc { ($t:ty, $w:ty) => {
+//! # impl serve::Service for $t {
+//! #     type Decoder = fictionet::stdlib::codec::Lines; type State = $w; type Error = std::convert::Infallible;
+//! #     fn decoder(&self) -> Self::Decoder { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
+//! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &$w, _: &mut serve::Driver<'_, Self::Decoder>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
+//! # } } }
+//! # svc!(Ldap, Directory); svc!(Plc, Plant);
+//! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
+//! let directory = Arc::new(Directory);
+//! let plant = Arc::new(Plant);
+//! let intranet = httpd::Router::new().get("/", |_, _| http::Response::new("intranet\n".into()));
+//! fcx.events().to_file("/tmp/office-events.jsonl")?;
+//! Net::new()
+//!     .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp(389, directory.clone(), || Ldap))
+//!     .host("www", |h| h.dns_name("intranet.corp.test").port_server(80, httpd::Server::new(intranet)))
+//!     .host("plc1", |h| h.at("10.30.0.5".parse::<std::net::Ipv4Addr>().unwrap()).tcp(502, plant, || Plc))
+//!     .start(&fcx, attachments)?;
+//! # Ok(())
+//! # }
+//! # }
+//! ```
 //!
-//! [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) is a preset on `Net` for a
+//! [`web::Sites`](fictionet::stdlib::web::Sites) is a preset on `Net` for a
 //! world of websites, whose hosts appear as their names are looked up
 //! ([`Net::resolve`]).
 //!
@@ -107,7 +107,7 @@ Net::new()
 //!   TLS and one without count as two), or a port
 //!   that cannot be listened on, makes [`Net::start`] fail.
 //!
-//! The limits and rules are those [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html)
+//! The limits and rules are those [`web::Sites`](fictionet::stdlib::web::Sites)
 //! documents in detail, which runs on this.
 
 use fictionet::sync::Mutex;
@@ -251,7 +251,7 @@ pub struct Arrival {
 }
 
 /// Serves connections on one port of a host. [`Host::tcp`] and
-/// [`Host::tls`] make one for a [`Service`]; [`httpd::Server`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/struct.Server.html) is HTTP's.
+/// [`Host::tls`] make one for a [`Service`]; [`httpd::Server`] is HTTP's.
 /// A world writes its own for anything else.
 pub trait PortServer: Any + Send + Sync {
     /// Serves one connection.

@@ -9,15 +9,15 @@ use std::task::{Context, Poll, Wake, Waker};
 ///
 /// Use it for a world that needs no other executor. The thread sleeps while
 /// `future` waits, and wakes when the helper threads behind
-/// [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) and the timers wake it. A world on tokio awaits
-/// [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) inside the tokio runtime instead.
+/// [`listen`](crate::listen) and the timers wake it. A world on tokio awaits
+/// [`run`](crate::run) inside the tokio runtime instead.
 ///
 /// Without `std`, this spins instead of sleeping. In a browser
 /// (wasm32-unknown-unknown) a thread cannot sleep, and only
 /// the run's own timers can wake the future. There `block_on` fires the
 /// timers itself and spins while it waits for the next one, which holds
 /// the page's thread for as long as the world runs. It suits a test, a Web
-/// Worker or Node.js. A page hands [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) to its event loop
+/// Worker or Node.js. A page hands [`run`](crate::run) to its event loop
 /// instead, for example with `wasm_bindgen_futures::spawn_local`, and the
 /// timers fire from `setTimeout`.
 ///
@@ -25,18 +25,21 @@ use std::task::{Context, Poll, Wake, Waker};
 /// `web::proxy` or a tokio-based database client,
 /// fails under `block_on`. Such a world runs on tokio.
 ///
-#[doc = fictionet::cfg_std!(doc r####"
-```no_run
-# use fictionet::{Attachments, Cx, Result};
-# async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-fn main() -> fictionet::Result {
-    let (attacher, attachments) = fictionet::attachments();
-    let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
-    let _listening = fictionet::listen(socket, attacher)?;
-    fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
-}
-```
-"####)]
+/// ```no_run
+/// # #[cfg(feature = "std")]
+/// # use fictionet::{Attachments, Cx, Result};
+/// # #[cfg(feature = "std")]
+/// # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
+/// # #[cfg(feature = "std")]
+/// fn main() -> fictionet::Result {
+///     let (attacher, attachments) = fictionet::attachments();
+///     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
+///     let _listening = fictionet::listen(socket, attacher)?;
+///     fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
+/// }
+/// # #[cfg(not(feature = "std"))]
+/// # fn main() {}
+/// ```
 pub fn block_on<F: Future>(future: F) -> F::Output {
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     return park_on(future);

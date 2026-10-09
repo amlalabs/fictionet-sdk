@@ -8,10 +8,6 @@
 //! sandbox something to talk to. [The catalog](#the-catalog) at the end
 //! lists every protocol module and what each can do.
 //!
-//! [`httpd`]: https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/index.html
-//!
-//! [`web`]: https://docs.rs/fictionet/latest/fictionet/stdlib/web/index.html
-//!
 //! # What you build with it
 //!
 //! A world is a network of small pieces joined by interfaces. The pieces
@@ -34,11 +30,11 @@
 //! - **Services.** A [`serve::Service`] is the server side of one protocol
 //!   for one connection, written with no I/O. [`serve::connection`] and
 //!   [`serve::listen`] run it over a connection or a listener. HTTP is one
-//!   ([`httpd`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/index.html)). Every service records what it sees as
+//!   ([`httpd`]). Every service records what it sees as
 //!   [events](fictionet::events) in the run's one log.
 //! - **Networks.** [`net::Net`] builds all of the above for you: the
 //!   sandboxes' subnet, DNS, addresses, a router, one machine per address,
-//!   and each host's services. [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) is a preset on it for a world
+//!   and each host's services. [`web::Sites`] is a preset on it for a world
 //!   of websites. Start there.
 //!
 //! Every piece is ordinary code built from the same public items, so you
@@ -71,7 +67,7 @@
 //! - [`tcp::endpoint`] and [`udp::endpoint`] stop when their interface
 //!   closes.
 //!
-//! [`net::Net::start`] and [`web::Sites::start`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html#method.start) start many tasks: one for
+//! [`net::Net::start`] and [`web::Sites::start`] start many tasks: one for
 //! each part of the network they build. Each task yields after at most 64
 //! packets in a row, so a busy interface cannot starve the rest of the run
 //! (see [`Cx::yield_now`](fictionet::Cx::yield_now)).
@@ -88,7 +84,7 @@
 //! | [`tcp::endpoint`] | TCP packets and an address | listeners and connections |
 //! | [`udp::endpoint`] | UDP packets and an address | sockets |
 //! | [`net::Net::start`] | the attachments, and the hosts with their services | nothing: it builds DNS, routing, machines and every service |
-//! | [`web::Sites::start`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html#method.start) | the attachments, and a callback that gives the site for a hostname | nothing: it builds DNS, routing, machines, TLS and HTTP |
+//! | [`web::Sites::start`] | the attachments, and a callback that gives the site for a hostname | nothing: it builds DNS, routing, machines, TLS and HTTP |
 //! | [`serve::listen`] | a listener, and a function that makes a service | the accepting task |
 //!
 //! **Functions you await.** These are `async`. They take `&Cx`, as every
@@ -238,7 +234,7 @@
 //! | [`http1`] | HTTP/1.0 and 1.1 wire messages and stream framing, with no non-empty trailers, chunk extensions, or Upgrade negotiation. | yes | yes |  |  | built in | yes | yes |
 //! | [`http2`] | HTTP/2 frames, directional state and capture decoding. Live serving uses hyper in `httpd`. | yes | yes | `Session` |  | built in | yes | yes |
 //! | [`http3`] | HTTP/3 frames, field sections and caller-driven stream state, with no QUIC transport or HTTP service. | yes | yes | `Session` |  |  | yes | yes |
-//! | [`httpd`] | HTTP serving: the `Http1` service, hyper for HTTP/2 and Upgrade, handlers, tower integration, and virtual hosts. |  |  |  | `Http1` |  |  | yes |
+//! | [`httpd`] | HTTP serving: `Http1`, upgrade continuations, hyper for HTTP/2 and axum upgrades, handlers, tower integration, and virtual hosts. |  |  |  | `Http1` |  |  | yes |
 //! | [`huffman`] | The RFC 7541 Huffman code that HPACK and QPACK share. | yes |  |  |  |  | yes | yes |
 //! | [`icmp`] | ICMP echo replies and error messages, for machines built by hand. |  |  |  |  |  |  | yes |
 //! | [`iec104`] | IEC 60870-5-104 APDUs and ASDU headers. | yes | yes |  |  |  | yes | yes |

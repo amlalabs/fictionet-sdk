@@ -48,7 +48,7 @@
 //! # 2. Make the socket's directory
 //!
 //! The world listens on a Unix socket, `/run/fictionet/world.sock`.
-//! [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) makes the socket, but not its directory, so
+//! [`listen`](crate::listen) makes the socket, but not its directory, so
 //! make the directory and give it to your user:
 //!
 //! ```text
@@ -186,7 +186,7 @@
 //! ```
 //!
 //! All of these answers came from world code: the DNS server and the
-//! gateway of [`Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html).
+//! gateway of [`Sites`](crate::stdlib::web::Sites).
 //!
 //! # 6. Trust the world's CA, and make an HTTPS request
 //!
@@ -317,9 +317,9 @@
 //! | `fictionet attach: configuring tun1: adding the IPv4 default route: another link already has one (File exists (os error 17)). Give --down-link <ifname> for that link ...` | `sudo ip netns exec agent ip route` shows a default route on another link: a second attach in the same namespace, or a container's own `eth0`. | Attach once per namespace. For a container's link, give `--down-link eth0`, as the message says: attach then removes that link's routes and addresses and sets it down before it adds its own (see [How `tun` works](crate::attaching#how-tun-works)). |
 //! | `dig` answers, but `curl` says `Could not resolve host: example.test` | Ask for the name the way most programs do, through the C library: `getent hosts example.test` inside the sandbox. Then `cat /etc/resolv.conf` and `grep '^hosts' /etc/nsswitch.conf` inside the sandbox. | See [When `dig` works but programs cannot resolve names](#when-dig-works-but-programs-cannot-resolve-names) below. |
 //! | `curl: (60) SSL certificate OpenSSL verify result: unable to get local issuer certificate (20)` | The client does not trust the world's CA. | Give it the CA: `curl --cacert /run/fictionet/ca.pem`, `SSL_CERT_FILE` for programs that read it, `NODE_EXTRA_CA_CERTS` for Node, or install the CA in the sandbox's image (see [step 6](#6-trust-the-worlds-ca-and-make-an-https-request)). |
-//! | `curl: (35) TLS connect error: error:0A000458:SSL routines::tlsv1 unrecognized name` | The world has no HTTPS site under that name. Here, `https://shared.test/` (a plain HTTP site) and `https://203.0.113.10/` (an address, so curl sends no name) both fail this way. | Use a name that has an HTTPS site. [`Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) picks the certificate by the name the client sends, and refuses the handshake for a name with no TLS. A certificate that does not cover the name, from a world's own TLS setup, fails differently: `openssl s_client` reports `Verification error: hostname mismatch`. Add the name to the certificate. |
+//! | `curl: (35) TLS connect error: error:0A000458:SSL routines::tlsv1 unrecognized name` | The world has no HTTPS site under that name. Here, `https://shared.test/` (a plain HTTP site) and `https://203.0.113.10/` (an address, so curl sends no name) both fail this way. | Use a name that has an HTTPS site. [`Sites`](crate::stdlib::web::Sites) picks the certificate by the name the client sends, and refuses the handshake for a name with no TLS. A certificate that does not cover the name, from a world's own TLS setup, fails differently: `openssl s_client` reports `Verification error: hostname mismatch`. Add the name to the certificate. |
 //! | `curl: (6) Could not resolve host: nope.test` | `sudo ip netns exec agent dig nope.test` shows `status: NXDOMAIN` from `SERVER: 10.0.0.1#53`: the world has no site with that name. | Fix the name, or add a site for it to the world. |
-//! | `curl: (7) Failed to connect to plain.test:443 after 3 ms: Could not connect to server` | `dig +short plain.test` answers an address, such as `198.18.0.1`, and `curl http://plain.test/` works. The site exists, but has no TLS, so port 443 is closed. | Use `http://`, or give the site a certificate with [`Site::tls`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Site.html#method.tls). |
+//! | `curl: (7) Failed to connect to plain.test:443 after 3 ms: Could not connect to server` | `dig +short plain.test` answers an address, such as `198.18.0.1`, and `curl http://plain.test/` works. The site exists, but has no TLS, so port 443 is closed. | Use `http://`, or give the site a certificate with [`Site::tls`](crate::stdlib::web::Site::tls). |
 //! | With the [HTTP proxy type](crate::attaching#behind-a-proxy-http_proxy-and-socks5) (`--type http_proxy`), curl says `Could not resolve host: example.test`, or Node says `getaddrinfo ENOTFOUND example.test` | The client did not use the proxy, and looked the name up on the host. `curl -sv https://example.test/ 2>&1 \| grep -E 'proxy tunnel\|NO_PROXY'` prints `Establishing HTTP proxy tunnel to example.test:443` when curl uses it. | Set `https_proxy` (and `http_proxy`) to `http://relay:<token>@<host>:<port>`, with the host and port that attach listens on (`--listen`): `attach:8080` in the [Compose setup](crate::attaching#the-proxy-in-docker-compose), `127.0.0.1:8080` in a [pod](crate::attaching#the-proxy-on-kubernetes). Take the world's names out of `NO_PROXY`. Node's built-in `fetch` ignores these variables unless `NODE_USE_ENV_PROXY=1` is set. |
 //! | The ready file exists, but requests fail or time out | The ready file does not mean the world serves requests yet. Make one end-to-end request. | See [Readiness](#readiness) below. |
 //!
@@ -429,5 +429,5 @@
 //!   [host namespace section](crate::attaching#on-a-host-with-ip-netns) has
 //!   a script that attaches a namespace, starts the agent in it and cleans
 //!   up afterwards, the way a test harness would.
-//! - [`stdlib::web`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/index.html): how `web_world` builds its
+//! - [`stdlib::web`](crate::stdlib::web): how `web_world` builds its
 //!   websites.

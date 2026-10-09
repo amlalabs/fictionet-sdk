@@ -3,8 +3,8 @@
 //! virtual hosting, all on [`serve`].
 //!
 //! `Http1` is a caller-driven `Service` on the `http1` decoder.
-//! `serve_connection` runs it over a live connection. HTTP/2 and HTTP/1 Upgrade
-//! handling require the `tokio` feature and use hyper. TLS comes from
+//! `serve_connection` runs it over a live connection. HTTP/2 and hyper upgrades
+//! require the `tokio` feature. TLS comes from
 //! `fictionet::stdlib::tls`. This module supplies no HTTP client.
 //!
 //! A [`Handler`] answers one request. Three kinds come ready:
@@ -19,7 +19,7 @@
 //!   `axum::Router`, run as deferred work of the connection.
 //! - [`VirtualHosts`]: picks a handler by the request's host, as a web server
 //!   with several sites at one address does, with the redirect to https and
-//!   the `421 Misdirected Request` of [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html).
+//!   the `421 Misdirected Request` of [`web::Sites`](fictionet::stdlib::web::Sites).
 //!
 //! On a [`Net`](fictionet::stdlib::net::Net), a [`Server`] is the
 //! [`PortServer`] that serves HTTP on a host's
@@ -35,7 +35,7 @@
 //! request's head and on its body. [`serve_connection`] picks the version for a
 //! connection: HTTP/2 by ALPN or by the client's preface, else HTTP/1.
 //!
-//! A request that asks to switch protocols (`Connection: upgrade` with an
+//! With `tokio`, a request that asks to switch protocols (`Connection: upgrade` with an
 //! `Upgrade` field, as a WebSocket handshake does) makes [`Http1`] hand
 //! the connection back ([`Upgrade::Handoff`](serve::Upgrade::Handoff)),
 //! and [`serve_connection`] serves the rest of it on hyper's HTTP/1, which
@@ -43,7 +43,10 @@
 //! request's extensions, so an axum `WebSocketUpgrade` handler, or one that
 //! calls `hyper::upgrade::on`, works on a [`Server`] as it does on hyper.
 //! axum runs the socket in a tokio task, so that world needs a tokio
-//! runtime.
+//! runtime. Without `tokio`, upgrade requests reach the ordinary handler.
+//! A synchronous handler can return a `101` response with an [`UpgradeHandler`]
+//! in its extensions to serve WebSocket messages on the connection. This
+//! continuation also works with `tokio`.
 //!
 //! # Dates
 //!
@@ -68,24 +71,22 @@
 //! can behave differently between lab runs. Hyper does not let a server
 //! change that setting, and h2 exposes no clock injection for it.
 //!
-#![doc = fictionet::cfg_std!(doc r####"
-```
-use bytes::Bytes;
-use fictionet::stdlib::httpd::{Http1, Router};
-use fictionet::stdlib::serve::Harness;
-
-let router = Router::new()
-    .get("/hello", |_, _| http::Response::new(Bytes::from("hi\n")))
-    .post("/echo", |_, request: http::Request<Bytes>| http::Response::new(request.into_body()));
-let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
-let reply = h.push(b"GET /hello HTTP/1.1\r\nHost: a.test\r\n\r\n")?;
-assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
-assert!(reply.ends_with(b"\r\n\r\nhi\n"));
-let reply = h.push(b"POST /echo HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nok")?;
-assert!(reply.ends_with(b"\r\n\r\nok"));
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-"####)]
+//! ```
+//! use bytes::Bytes;
+//! use fictionet::stdlib::httpd::{Http1, Router};
+//! use fictionet::stdlib::serve::Harness;
+//!
+//! let router = Router::new()
+//!     .get("/hello", |_, _| http::Response::new(Bytes::from("hi\n")))
+//!     .post("/echo", |_, request: http::Request<Bytes>| http::Response::new(request.into_body()));
+//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+//! let reply = h.push(b"GET /hello HTTP/1.1\r\nHost: a.test\r\n\r\n")?;
+//! assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
+//! assert!(reply.ends_with(b"\r\n\r\nhi\n"));
+//! let reply = h.push(b"POST /echo HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nok")?;
+//! assert!(reply.ends_with(b"\r\n\r\nok"));
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 //!
 //! # Events
 //!
@@ -129,12 +130,15 @@ use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
 use fictionet::stdlib::json::Value;
 use fictionet::stdlib::net::{Arrival, ConfigFor, Host, PortServer, Sni};
 use fictionet::stdlib::serve::{
-    self, Budget, Driver, Ended, Flow, Pending, PendingDriver, Prefixed, ServeOptions, Timer,
+    self, Budget, Driver, Ended, Flow, Pending, PendingDriver, ServeOptions, Timer,
 };
 use fictionet::stdlib::tls::ServerConfig;
-use fictionet::stdlib::{ConnError, Connection, ConnectionExt};
+use fictionet::stdlib::{ConnError, Connection};
+use fictionet::stdlib::ConnectionExt;
+use fictionet::stdlib::serve::Prefixed;
+use fictionet::RaceError;
 use fictionet::time::Instant;
-use fictionet::{Cancelled, Cx, Error, RaceError};
+use fictionet::{Cancelled, Cx, Error};
 
 // ---------------------------------------------------------------------------
 // Bodies
@@ -935,6 +939,34 @@ const HEAD: Timer = "head";
 /// [`Http1`]'s timer for a request's body.
 const BODY: Timer = "body";
 
+/// Runs a protocol after an HTTP/1 switching-protocols response is written.
+///
+/// Insert this in the extensions of a `101 Switching Protocols` response
+/// returned as [`Reply::Now`]. [`serve_connection`] calls it with the
+/// connection and its unread bytes. It runs once, even if the response is cloned.
+#[derive(Clone)]
+pub struct UpgradeHandler(Arc<Mutex<Option<UpgradeWork>>>);
+
+type UpgradeWork = Box<dyn FnOnce(Cx, Box<dyn Connection>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+impl UpgradeHandler {
+    /// Calls `work` after the response is sent.
+    pub fn new<F, Fut>(work: F) -> Self
+    where
+        F: FnOnce(Cx, Box<dyn Connection>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        Self(Arc::new(Mutex::new(Some(Box::new(move |fcx, conn| Box::pin(work(fcx, conn)))))))
+    }
+
+    async fn run(self, fcx: Cx, conn: Box<dyn Connection>) {
+        let work = self.0.lock().take();
+        if let Some(work) = work {
+            work(fcx, conn).await;
+        }
+    }
+}
+
 /// HTTP/1.0 and 1.1 for one connection, answering with a [`Handler`].
 pub struct Http1 {
     handler: Arc<dyn Handler>,
@@ -944,6 +976,7 @@ pub struct Http1 {
     /// The head of a request that asked for a protocol upgrade, as bytes,
     /// once the connection is handed over for it.
     handoff: Option<Vec<u8>>,
+    upgrade: Option<UpgradeHandler>,
     head: Option<RequestHead>,
     body: Vec<u8>,
     too_big: bool,
@@ -963,6 +996,7 @@ impl Http1 {
             opts,
             date: None,
             handoff: None,
+            upgrade: None,
             head: None,
             body: Vec::new(),
             too_big: false,
@@ -1030,7 +1064,13 @@ impl Http1 {
             self.handler
                 .call(request, &mut Exchange::new(now, driver.entropy(), &conn))
         };
-        let close = !keep_alive;
+        if let Reply::Now(response) = &reply
+            && response.status() == StatusCode::SWITCHING_PROTOCOLS
+            && let Some(upgrade) = response.extensions().get::<UpgradeHandler>()
+        {
+            self.upgrade = Some(upgrade.clone());
+        }
+        let close = !keep_alive && self.upgrade.is_none();
         // Every answer goes out as deferred work, so its event is made
         // once its bytes are written.
         let (work, response) = match reply {
@@ -1041,7 +1081,12 @@ impl Http1 {
             Streaming::new(work, response, version, head_only, close, tracker)
                 .dated(self.date, now),
         );
-        self.after(driver, close)
+        if self.upgrade.is_some() {
+            driver.cancel_timer(BODY);
+            Flow::Upgrade(serve::Upgrade::Handoff)
+        } else {
+            self.after(driver, close)
+        }
     }
 
     fn after(&mut self, driver: &mut Driver<'_, http1::RequestEvents>, close: bool) -> Flow {
@@ -1054,6 +1099,7 @@ impl Http1 {
     }
 }
 
+fictionet::cfg_tokio! {
 /// Whether an HTTP/1.1 request asks to switch protocols (RFC 9110 section
 /// 7.8): it has an `Upgrade` field and names `upgrade` in `Connection`.
 fn asks_upgrade(head: &RequestHead) -> bool {
@@ -1072,6 +1118,7 @@ fn asks_upgrade(head: &RequestHead) -> bool {
         && head.method != "CONNECT"
         && has("upgrade")
         && connection_upgrade
+}
 }
 
 /// The head at the start of `unread`, read with an empty Host field added
@@ -1191,7 +1238,9 @@ fn encode(
             None => out.extend_from_slice(b"transfer-encoding: chunked\r\n"),
         }
     }
-    if close && !v10 {
+    if status == StatusCode::SWITCHING_PROTOCOLS {
+        out.extend_from_slice(b"connection: upgrade\r\n");
+    } else if close && !v10 {
         out.extend_from_slice(b"connection: close\r\n");
     } else if !close && v10 {
         out.extend_from_slice(b"connection: keep-alive\r\n");
@@ -1231,15 +1280,13 @@ pub fn date_header(start: Option<SystemTime>, now: Instant) -> Option<HeaderValu
 /// An IMF-fixdate (RFC 9110 section 5.6.7), such as
 /// `Sun, 06 Nov 1994 08:49:37 GMT`, for `secs` since the Unix epoch.
 ///
-#[doc = fictionet::cfg_std!(doc r####"
-```
-use fictionet::stdlib::httpd::http_date;
-assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
-assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
-assert_eq!(http_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
-assert_eq!(http_date(1_559_347_200), "Sat, 01 Jun 2019 00:00:00 GMT");
-```
-"####)]
+/// ```
+/// use fictionet::stdlib::httpd::http_date;
+/// assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+/// assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+/// assert_eq!(http_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
+/// assert_eq!(http_date(1_559_347_200), "Sat, 01 Jun 2019 00:00:00 GMT");
+/// ```
 pub fn http_date(secs: u64) -> String {
     const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: [&str; 12] = [
@@ -1294,12 +1341,14 @@ impl serve::Service for Http1 {
         match item {
             H1::Head(head) => {
                 driver.cancel_timer(HEAD);
+                fictionet::cfg_tokio! {
                 if asks_upgrade(&head) {
                     let mut bytes = Vec::new();
                     if fictionet::stdlib::codec::Wire::write(&head, &mut bytes).is_ok() {
                         self.handoff = Some(bytes);
                         return Ok(Flow::Upgrade(serve::Upgrade::Handoff));
                     }
+                }
                 }
                 driver.set_timer(BODY, self.opts.body_timeout);
                 if head.expects_continue() {
@@ -1665,8 +1714,10 @@ pub struct HttpOptions {
     pub date: Option<SystemTime>,
 }
 
+fictionet::cfg_tokio! {
 /// What an HTTP/2 client sends first, with no TLS ("prior knowledge").
 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+}
 
 /// Serves one connection with `handler`: HTTP/2 when TLS agreed on `h2`, or
 /// when a client without TLS starts with HTTP/2's preface; HTTP/1
@@ -1687,14 +1738,16 @@ pub async fn serve_connection<C: Connection + Unpin>(
     let mut conn = conn;
     let mut first = Vec::new();
     let h2 = if info.tls {
-        info.alpn.as_deref() == Some(b"h2".as_slice())
+        fictionet::cfg_tokio!({ info.alpn.as_deref() == Some(b"h2".as_slice()) } else { false })
     } else {
-        // Read until the bytes cannot be the preface, or are all of it.
+        // With HTTP/2, read enough to identify its preface. Otherwise,
+        // wait for one byte to enforce the first-byte timeout.
         let preface = async {
             let mut buf = [0u8; 24];
-            while first.len() < PREFACE.len() && PREFACE.starts_with(&first) {
+            while fictionet::cfg_tokio!({ first.len() < PREFACE.len() && PREFACE.starts_with(&first) } else { first.is_empty() }) {
+                let room = fictionet::cfg_tokio!({ PREFACE.len() - first.len() } else { 1 });
                 match conn
-                    .read(fcx, &mut buf[..PREFACE.len() - first.len()])
+                    .read(fcx, &mut buf[..room])
                     .await
                 {
                     Ok(0) | Err(_) => return false,
@@ -1724,16 +1777,14 @@ pub async fn serve_connection<C: Connection + Unpin>(
                 return Ok(());
             }
         }
-        first == PREFACE
+        fictionet::cfg_tokio!({ first == PREFACE } else { false })
     };
     let conn = Prefixed::new(first, conn);
-    if h2 {
-        fictionet::cfg_tokio!({
+    fictionet::cfg_tokio!({
+        if h2 {
             return h2::serve(fcx, conn, handler, info, opts).await;
-        } else {
-            return Ok(());
-        });
-    }
+        }
+    } else { let _ = h2; });
     let serve_opts = ServeOptions {
         idle: None,
         write_timeout: Some(opts.limits.write_timeout),
@@ -1745,19 +1796,19 @@ pub async fn serve_connection<C: Connection + Unpin>(
     service.date = opts.date;
     match serve::connection(fcx, conn, info.clone(), &mut service, &(), &serve_opts).await {
         Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) => {
-            match service.take_handoff() {
-                // A request that asks for an upgrade: hyper's HTTP/1 reads it
-                // again and carries the upgrade out.
-                Some(head) => {
-                    fictionet::cfg_tokio!({
-                        h2::serve_upgrade(fcx, Prefixed::new(head, rest), handler, info, opts).await
-                    } else {
-                        let _ = (head, rest);
-                        Ok(())
-                    })
-                }
-                None => Ok(()),
+            if let Some(upgrade) = service.upgrade.take() {
+                upgrade.run(fcx.clone(), Box::new(rest)).await;
+                return if fcx.is_cancelled() { Err(Cancelled) } else { Ok(()) };
             }
+            fictionet::cfg_tokio! {
+                // Hyper reads the request again and carries out its upgrade.
+                if let Some(head) = service.take_handoff() {
+                    return h2::serve_upgrade(
+                        fcx, Prefixed::new(head, rest), handler, info, opts,
+                    ).await;
+                }
+            }
+            Ok(())
         }
         Err(serve::ServeError::Cancelled) => Err(Cancelled),
         // The driver recorded the failure as a `conn.error` event.
@@ -1774,16 +1825,15 @@ pub async fn serve_connection<C: Connection + Unpin>(
 /// Every host at one address that serves HTTP on a port shares that port:
 /// the first host's `Server` takes in the others' sites as
 /// [`VirtualHosts`], and each request goes to the site its host names.
-/// Over TLS, ALPN offers `h2` and `http/1.1`.
+/// Over TLS, ALPN offers `h2` and `http/1.1` with `tokio`, or only
+/// `http/1.1` without it.
 ///
-#[doc = fictionet::cfg_std!(doc r####"
-```
-# use fictionet::stdlib::{httpd, net::Host};
-let page = httpd::Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
-let host = Host::new("www").dns_name("www.corp.test").port_server(80, httpd::Server::new(page));
-# drop(host);
-```
-"####)]
+/// ```
+/// # use fictionet::stdlib::{httpd, net::Host};
+/// let page = httpd::Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
+/// let host = Host::new("www").dns_name("www.corp.test").port_server(80, httpd::Server::new(page));
+/// # drop(host);
+/// ```
 #[derive(Clone)]
 pub struct Server {
     vhost: VHost,
@@ -1889,7 +1939,7 @@ impl PortServer for Server {
     }
 }
 
-/// A website on ports 80 and 443, as [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html)
+/// A website on ports 80 and 443, as [`web::Sites`](fictionet::stdlib::web::Sites)
 /// serves one: with TLS, HTTPS on 443 for each of the host's names and a
 /// redirect to it on 80 (unless [`plain_http`](Self::plain_http));
 /// without, plain HTTP on 80. [`served_by`](Self::served_by) puts it on a host.
@@ -2023,7 +2073,12 @@ mod h2 {
         opts: &HttpOptions,
     ) -> Result<(), Cancelled> {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let io = Io::new(fcx, conn, broke.clone(), opts.limits.write_timeout);
+        let io = Io::new(
+            fcx,
+            Box::new(conn) as Box<dyn Connection>,
+            broke.clone(),
+            opts.limits.write_timeout,
+        );
         let route = Route::new(fcx, handler, &info, opts);
         let mut builder = hyper::server::conn::http1::Builder::new();
         // Hyper still refreshes its internal date cache using SystemTime,
@@ -2206,6 +2261,10 @@ mod h2 {
         type Future = Answer;
 
         fn call(&self, request: Request<Incoming>) -> Answer {
+            let on_upgrade = request
+                .extensions()
+                .get::<hyper::upgrade::OnUpgrade>()
+                .cloned();
             let route = self.clone();
             let track = Track {
                 tracker: Tracker::new(&request, &route.info, route.fcx.now()),
@@ -2243,6 +2302,20 @@ mod h2 {
                         }
                     }
                 };
+                if response.status() == StatusCode::SWITCHING_PROTOCOLS
+                    && let Some(upgrade) = response.extensions().get::<UpgradeHandler>().cloned()
+                    && let Some(on_upgrade) = on_upgrade
+                {
+                    route.fcx.spawn(move |fcx| async move {
+                        if let Ok(upgraded) = on_upgrade.await
+                            && let Ok(parts) = upgraded.downcast::<Io<Box<dyn Connection>>>()
+                        {
+                            let conn = Prefixed::new(parts.read_buf.to_vec(), parts.io.conn);
+                            upgrade.run(fcx, Box::new(conn)).await;
+                        }
+                        Ok(())
+                    });
+                }
                 let (parts, body) = response.into_parts();
                 let fits = charge.as_mut().is_none_or(|c| c.set(body.full_len()));
                 let (mut parts, body) = if fits {

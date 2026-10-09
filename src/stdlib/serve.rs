@@ -77,7 +77,7 @@
 //! ```
 //!
 //! [`net::Net`](fictionet::stdlib::net::Net) does this for every host and
-//! port of a network, and [`httpd`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/index.html) is HTTP as a
+//! port of a network, and [`httpd`](fictionet::stdlib::httpd) is HTTP as a
 //! service.
 //!
 //! # What the driver promises
@@ -848,7 +848,7 @@ fn due(timers: &[(Timer, Instant)], now: Instant) -> Option<usize> {
 /// it ends the run. The panic's own message says where in the code it
 /// happened; a `PanicNote` alive while it unwinds adds which service and
 /// connection, on standard error. [`connection`], [`datagram`] and
-/// HTTP/2 in [`httpd`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/index.html) keep one while they call
+/// HTTP/2 in [`httpd`](fictionet::stdlib::httpd) keep one while they call
 /// world code.
 pub struct PanicNote {
     service: &'static str,

@@ -9,21 +9,22 @@
 //! packet, a [router] that loses a route, a LAN) all record events, and so
 //! can world code:
 //!
-#![doc = fictionet::cfg_std!(doc r####"
-```
-use fictionet::events::{Event, Level};
-# fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
-fcx.record(Event::new("modbus", "write_register")
-    .summary("register 40001 = 900")
-    .level(Level::Alarm)
-    .field("register", 40001u32)
-    .field("value", 900u32));
-let events = fcx.events().of("modbus", "write_register");
-assert_eq!(events[0].u64("value"), Some(900));
-# Ok(()) }))?;
-# Ok::<(), fictionet::Error>(())
-```
-"####)]
+//! ```
+//! # #[cfg(feature = "std")]
+//! # {
+//! use fictionet::events::{Event, Level};
+//! # fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
+//! fcx.record(Event::new("modbus", "write_register")
+//!     .summary("register 40001 = 900")
+//!     .level(Level::Alarm)
+//!     .field("register", 40001u32)
+//!     .field("value", 900u32));
+//! let events = fcx.events().of("modbus", "write_register");
+//! assert_eq!(events[0].u64("value"), Some(900));
+//! # Ok(()) }))?;
+//! # }
+//! # Ok::<(), fictionet::Error>(())
+//! ```
 //!
 //! # The event log
 //!
@@ -74,7 +75,7 @@ assert_eq!(events[0].u64("value"), Some(900));
 //!   watch`, which see what the log still holds when they connect, then
 //!   every new event as it comes (see [`observe`](crate::observe#events));
 //! - a JSON Lines file, one event per line, for a grader that reads it
-//!   after the run ([`EventLog::to_file`](https://docs.rs/fictionet/latest/fictionet/events/struct.EventLog.html#method.to_file));
+//!   after the run ([`EventLog::to_file`]);
 //! - callbacks in the same process ([`EventLog::subscribe`]);
 //! - a grader or a test in the same process, which reads the log itself,
 //!   during the run or after it ([`EventLog::all`] and [`EventLog::wait`]).
@@ -224,7 +225,7 @@ impl Level {
 /// under one name as a JSON object or array of pairs.
 ///
 /// An HTTP handler adds fields to its request's event by putting `Fields`
-/// in its response's extensions (see [`httpd`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/index.html)).
+/// in its response's extensions (see [`httpd`](crate::stdlib::httpd)).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Fields(Vec<(&'static str, Value)>);
 

@@ -6,7 +6,7 @@
 //! Fictionet has no global time functions: the clock belongs to the run,
 //! and world code reaches it only through its [`Cx`](crate::Cx).
 //!
-//! Under [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) the clock measures real elapsed time. Under
+//! Under [`run`](crate::run) the clock measures real elapsed time. Under
 //! [`lab`](crate::lab) it starts at zero and jumps to the earliest deadline
 //! when every task is waiting. World code is the same either way.
 //!

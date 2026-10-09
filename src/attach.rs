@@ -54,7 +54,7 @@ type Wrap = Box<dyn FnOnce(Attachment) -> Attachment + Send>;
 enum Link {
     /// An interface from [`Attacher::attach`].
     Cable(End),
-    /// A connection from attach, accepted by [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html).
+    /// A connection from attach, accepted by [`listen`](crate::listen).
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     Socket(SocketLink),
     /// What [`Attachments::map`] made from another attachment, and a check
@@ -181,27 +181,30 @@ impl Interface for Attachment {
 ///
 /// It returns two halves. The world gets the [`Attachments`] and takes
 /// sandboxes out of it. Whatever adds sandboxes keeps the [`Attacher`]: in
-/// a real run, that is [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html), which adds each sandbox
+/// a real run, that is [`listen`](crate::listen), which adds each sandbox
 /// that `fictionet attach` connects. In a test, the test keeps the
 /// `Attacher` and attaches sandboxes itself.
 ///
 /// This test attaches a sandbox called `agent` and holds the sandbox's end
 /// of its link, so it can play the sandbox:
 ///
-#[doc = fictionet::cfg_std!(doc r####"
-```
-# use fictionet::{Attachments, Cx, Result};
-# async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-# fn main() -> Result {
-let (attacher, attachments) = fictionet::attachments();
-let agent = attacher.attach("agent")?; // the test holds the sandbox's end
-let world = fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments));
-// send packets on `agent` and check what comes back while `world` runs
-# drop(agent);
-# fictionet::block_on(world)
-# }
-```
-"####)]
+/// ```
+/// # #[cfg(feature = "std")]
+/// # use fictionet::{Attachments, Cx, Result};
+/// # #[cfg(feature = "std")]
+/// # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
+/// # #[cfg(feature = "std")]
+/// # fn main() -> Result {
+/// let (attacher, attachments) = fictionet::attachments();
+/// let agent = attacher.attach("agent")?; // the test holds the sandbox's end
+/// let world = fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments));
+/// // send packets on `agent` and check what comes back while `world` runs
+/// # drop(agent);
+/// # fictionet::block_on(world)
+/// # }
+/// # #[cfg(not(feature = "std"))]
+/// # fn main() {}
+/// ```
 pub fn attachments() -> (Attacher, Attachments) {
     let hub = Arc::new(Hub::default());
     (Attacher { hub: hub.clone() }, Attachments { hub })
@@ -265,7 +268,7 @@ impl Drop for NameGuard {
 ///
 /// Each sandbox has a name, and two sandboxes cannot be attached under the
 /// same name at the same time. Clones of an `Attacher` share one set of
-/// names, so a test and a [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) socket can add
+/// names, so a test and a [`listen`](crate::listen) socket can add
 /// sandboxes to the same world without clashing.
 #[derive(Clone)]
 pub struct Attacher {
@@ -280,7 +283,7 @@ impl Attacher {
     /// attached, and with [`AttachError::BadName`] if the name is empty or
     /// longer than 255 bytes. The name stays taken until either end is
     /// dropped. Every attach goes through this check, including those from
-    /// [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html): when it fails, `fictionet attach` gets a
+    /// [`listen`](crate::listen): when it fails, `fictionet attach` gets a
     /// `refuse` message (see [`proto`](crate::proto)).
     pub fn attach(&self, name: &str) -> Result<End, AttachError> {
         let guard = self.reserve(name)?;
@@ -400,7 +403,7 @@ impl std::error::Error for AttachError {}
 /// Each attachment is handed out once: either by [`get`](Attachments::get),
 /// which waits for a given name, or by [`next`](Attachments::next), which
 /// takes them in arrival order. Both take a `&Cx`, like every other wait.
-/// If a real [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) socket feeds the hub, `get`, `next`,
+/// If a real [`listen`](crate::listen) socket feeds the hub, `get`, `next`,
 /// and `map` fail a lab region with an error before handing out an
 /// attachment. `get` and `next` return [`Cancelled`] in that case.
 /// A world that serves every sandbox the same way loops over `next`:
@@ -454,19 +457,20 @@ impl Attachments {
     ///
     /// Use it to put something between every sandbox and the code that
     /// serves it, such as a [`delay`](crate::stdlib::delay) in front of
-    /// [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html):
+    /// [`web::Sites`](crate::stdlib::web::Sites):
     ///
-    #[doc = fictionet::cfg_std!(doc r####"
-```
-# use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
-# fn site_for(_host: &str) -> Option<web::Site> { None }
-# async fn world(fcx: Cx, attachments: Attachments) -> Result {
-let slow = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
-web::Sites::new(site_for).start(&fcx, slow)?;
-# Ok(())
-# }
-```
-"####)]
+    /// ```
+    /// # #[cfg(feature = "std")]
+    /// # {
+    /// # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
+    /// # fn site_for(_host: &str) -> Option<web::Site> { None }
+    /// # async fn world(fcx: Cx, attachments: Attachments) -> Result {
+    /// let slow = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
+    /// web::Sites::new(site_for).start(&fcx, slow)?;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
     ///
     /// `map` returns immediately. It starts a background task in `fcx`'s
     /// [region](Cx#regions) that takes each sandbox as it attaches and

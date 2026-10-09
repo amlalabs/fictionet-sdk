@@ -19,7 +19,7 @@ use crate::watch::Group;
 /// starts background tasks. Fictionet has no global clock and no global
 /// executor, so all four go through a `Cx`. That is why every stdlib
 /// function that waits or starts a task takes `&Cx` as its first argument, and why the core works under
-/// any async runtime. [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) gives the world function its
+/// any async runtime. [`run`](crate::run) gives the world function its
 /// first `Cx`. In signatures and examples it is called `fcx`; `cx` is the
 /// std task context, as in tokio and futures.
 ///
@@ -30,11 +30,11 @@ use crate::watch::Group;
 /// task in the caller's region and gives it a `Cx` of its own in that same
 /// region. A clone of a `Cx` belongs to the same region too.
 ///
-/// [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) makes the outermost region, and the world function
+/// [`run`](crate::run) makes the outermost region, and the world function
 /// is its first task. So the tasks the world starts, and the tasks those
 /// tasks start, all share the world's region. Some stdlib code makes a
 /// region inside the caller's for work that may fail on its own: for
-/// example, [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) gives each HTTP
+/// example, [`web::Sites`](crate::stdlib::web::Sites) gives each HTTP
 /// connection its own region, and runs its HTTP/2 streams in it. Cancelling
 /// a region also cancels every region inside it.
 ///
@@ -111,7 +111,7 @@ pub struct Cx {
 impl Cx {
     /// The current time on the run's clock: how long ago the run started.
     ///
-    /// Under [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) this is real time, read from the system's
+    /// Under [`run`](crate::run) this is real time, read from the system's
     /// monotonic clock. Under [`lab`](crate::lab), it starts at zero and
     /// advances only when the executor has no runnable work.
     pub fn now(&self) -> Instant {
@@ -234,7 +234,7 @@ impl Cx {
     /// **If `work` returns an error, its region fails.** The region is
     /// cancelled, so its other tasks stop, and the error goes to whoever
     /// owns the region. For the world's region, that means the error comes
-    /// out of [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html). A failure deep inside a world therefore
+    /// out of [`run`](crate::run). A failure deep inside a world therefore
     /// reaches the harness instead of disappearing. Work that is allowed to
     /// fail, such as serving one connection, handles its own errors and
     /// returns `Ok(())`.
@@ -409,17 +409,18 @@ impl Cx {
     /// To race more than one thing, join them into `fut` with
     /// [`std::future::poll_fn`]: the first one ready gives the output.
     ///
-    #[doc = fictionet::cfg_std!(doc r####"
-```
-# fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
-use fictionet::RaceError;
-let late = fcx.race(Some(fcx.now() + std::time::Duration::from_millis(5)), std::future::pending::<()>()).await;
-assert_eq!(late, Err(RaceError::Deadline));
-assert_eq!(fcx.race(None, async { 7 }).await, Ok(7));
-# Ok(()) }))?;
-# Ok::<(), fictionet::Error>(())
-```
-"####)]
+    /// ```
+    /// # #[cfg(feature = "std")]
+    /// # {
+    /// # fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
+    /// use fictionet::RaceError;
+    /// let late = fcx.race(Some(fcx.now() + std::time::Duration::from_millis(5)), std::future::pending::<()>()).await;
+    /// assert_eq!(late, Err(RaceError::Deadline));
+    /// assert_eq!(fcx.race(None, async { 7 }).await, Ok(7));
+    /// # Ok(()) }))?;
+    /// # }
+    /// # Ok::<(), fictionet::Error>(())
+    /// ```
     pub async fn race<T>(
         &self,
         deadline: Option<Instant>,
@@ -463,10 +464,10 @@ assert_eq!(fcx.race(None, async { 7 }).await, Ok(7));
     ///
     /// The world function and every task it spawns share the world's
     /// region, so calling this on any of their `Cx`s stops the whole world,
-    /// and [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) returns `Ok(())` once every task has ended.
+    /// and [`run`](crate::run) returns `Ok(())` once every task has ended.
     /// Some stdlib code runs work in a region of its own inside the world's,
     /// and hands that region's `Cx` to callbacks: for example,
-    /// [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) runs each HTTP connection,
+    /// [`web::Sites`](crate::stdlib::web::Sites) runs each HTTP connection,
     /// and the event callback for it, in the connection's own region.
     /// Calling `cancel` on such a `Cx` stops only that connection. To stop
     /// the world from there, keep a clone of the world's `Cx` and cancel
@@ -486,7 +487,7 @@ assert_eq!(fcx.race(None, async { 7 }).await, Ok(7));
     /// `f` runs inside the task that awaits this. Its work is cancelled when
     /// this region is. For work that is allowed to fail as a whole, such as
     /// serving one connection with its HTTP/2 streams. Once all of the new
-    /// region's work has ended, this returns, as [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) does:
+    /// region's work has ended, this returns, as [`run`](crate::run) does:
     ///
     /// - `Ok(())` when every task, and `f`, returned `Ok`, or when the new
     ///   region was stopped with [`Cx::cancel`].

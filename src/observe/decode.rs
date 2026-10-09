@@ -208,7 +208,7 @@ impl Decoded {
             out.push_str("{\"name\":");
             json::string(out, name);
             out.push_str(",\"hex\":\"");
-            super::packets::push_hex(out, bytes);
+            json::push_hex(out, bytes);
             out.push_str("\"}");
         }
         out.push(']');

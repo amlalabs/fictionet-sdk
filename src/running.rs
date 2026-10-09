@@ -13,27 +13,30 @@
 //! ordinary Rust program, and that program makes four calls. This is all of
 //! `main`:
 //!
-#![doc = fictionet::cfg_std!(doc r####"
-```no_run
-# use fictionet::{Attachments, Cx, Result};
-# async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-fn main() -> fictionet::Result {
-    // 1. A channel for sandboxes.
-    let (attacher, attachments) = fictionet::attachments();
-
-    // 2. The world socket. Each `fictionet attach` that connects to it
-    //    arrives through `attacher`.
-    let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
-    let _listening = fictionet::listen(socket, attacher)?;
-
-    // 3. The world, as one future. Nothing runs yet.
-    let world = fictionet::run(fictionet::Seed::random(), move |fcx| world(fcx, attachments));
-
-    // 4. Poll that future on this thread until the world ends.
-    fictionet::block_on(world)
-}
-```
-"####)]
+//! ```no_run
+//! # #[cfg(feature = "std")]
+//! # use fictionet::{Attachments, Cx, Result};
+//! # #[cfg(feature = "std")]
+//! # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
+//! # #[cfg(feature = "std")]
+//! fn main() -> fictionet::Result {
+//!     // 1. A channel for sandboxes.
+//!     let (attacher, attachments) = fictionet::attachments();
+//!
+//!     // 2. The world socket. Each `fictionet attach` that connects to it
+//!     //    arrives through `attacher`.
+//!     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
+//!     let _listening = fictionet::listen(socket, attacher)?;
+//!
+//!     // 3. The world, as one future. Nothing runs yet.
+//!     let world = fictionet::run(fictionet::Seed::random(), move |fcx| world(fcx, attachments));
+//!
+//!     // 4. Poll that future on this thread until the world ends.
+//!     fictionet::block_on(world)
+//! }
+//! # #[cfg(not(feature = "std"))]
+//! # fn main() {}
+//! ```
 //!
 #![doc = include_str!("../docs/diagrams/running.svg")]
 //!
@@ -43,9 +46,9 @@ fn main() -> fictionet::Result {
 //!    halves. The [`Attacher`](crate::Attacher) adds sandboxes, and the
 //!    [`Attachments`](crate::Attachments) hands them to the world, by name
 //!    or in the order they arrive. Nothing is connected yet.
-//! 2. **[`listen(socket, attacher)`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html)** makes the Unix socket
+//! 2. **[`listen(socket, attacher)`](crate::listen)** makes the Unix socket
 //!    that `socket` names and starts one helper thread. A
-//!    [`WorldSocket`](https://docs.rs/fictionet/latest/fictionet/enum.WorldSocket.html) is a world socket's address, such
+//!    [`WorldSocket`](crate::WorldSocket) is a world socket's address, such
 //!    as `unix:/run/fictionet/world.sock`, the same form attach's `--world`
 //!    flag takes. `listen` returns immediately, and the helper thread does
 //!    the rest in the background. Each `fictionet attach` that connects
@@ -53,13 +56,13 @@ fn main() -> fictionet::Result {
 //!    if that name is already attached ([the relay protocol](crate::proto)
 //!    has the messages). Each accepted sandbox goes into the channel as an
 //!    [`Attachment`](crate::Attachment). Keep the returned
-//!    [`Listening`](https://docs.rs/fictionet/latest/fictionet/struct.Listening.html) in a named variable. Dropping it
+//!    [`Listening`](crate::Listening) in a named variable. Dropping it
 //!    closes the socket, and `let _ = listen(...)` drops it on the spot.
-//! 3. **[`run(seed, f)`](https://docs.rs/fictionet/latest/fictionet/fn.run.html)** returns a future and does nothing else.
+//! 3. **[`run(seed, f)`](crate::run)** returns a future and does nothing else.
 //!    When the future is first polled, it makes the world's
 //!    [`Cx`](crate::Cx) and starts `f(fcx)` as the first task. Every random
 //!    number the world draws comes from `seed`;
-//!    [`Seed::random`](https://docs.rs/fictionet/latest/fictionet/struct.Seed.html#method.random) picks a fresh one, and the run
+//!    [`Seed::random`](crate::Seed::random) picks a fresh one, and the run
 //!    records it in its start event (see [Repeatable runs](#repeatable-runs)). Every task the
 //!    world starts with [`Cx::spawn`](crate::Cx::spawn), and every stdlib
 //!    task, is polled inside this same future.
@@ -208,17 +211,20 @@ fn main() -> fictionet::Result {
 //! such as a database client, polls `run` on a tokio runtime instead. Steps
 //! 1 to 3 stay the same. The `web_world` example does this:
 //!
-#![doc = fictionet::cfg_std!(doc r####"
-```no_run
-# use fictionet::{Attachments, Cx, Result};
-# async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-# fn main() -> Result {
-# let (_attacher, attachments) = fictionet::attachments();
-let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-runtime.block_on(fictionet::run(fictionet::Seed::random(), move |fcx| world(fcx, attachments)))
-# }
-```
-"####)]
+//! ```no_run
+//! # #[cfg(feature = "std")]
+//! # use fictionet::{Attachments, Cx, Result};
+//! # #[cfg(feature = "std")]
+//! # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
+//! # #[cfg(feature = "std")]
+//! # fn main() -> Result {
+//! # let (_attacher, attachments) = fictionet::attachments();
+//! let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+//! runtime.block_on(fictionet::run(fictionet::Seed::random(), move |fcx| world(fcx, attachments)))
+//! # }
+//! # #[cfg(not(feature = "std"))]
+//! # fn main() {}
+//! ```
 //!
 //! # In a test
 //!
@@ -308,7 +314,7 @@ runtime.block_on(fictionet::run(fictionet::Seed::random(), move |fcx| world(fcx,
 //! - **Randomness comes from the seed,** as in `run`.
 //! - **A lab run is closed.** The test plays the sandboxes through
 //!   [`attachments`](crate::attachments), as above, and fakes play other
-//!   services. Attachments that a [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) socket feeds,
+//!   services. Attachments that a [`listen`](crate::listen) socket feeds,
 //!   observer sessions and `web::proxy` refuse to work in a lab. Fictionet
 //!   cannot stop world code from using `std::net`, tokio timers or other
 //!   real I/O, so keeping the rest of a lab world closed is up to its author.
@@ -324,7 +330,7 @@ runtime.block_on(fictionet::run(fictionet::Seed::random(), move |fcx| world(fcx,
 //! [`tls`](crate::stdlib::tls) provider, whose key exchange and signatures
 //! draw from the run's seed. One thing inside the SDK's dependencies still
 //! reads the system clock: h2 forgets an HTTP/2 stream the world reset after
-//! one second of real time (see [`httpd`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/index.html)).
+//! one second of real time (see [`httpd`](crate::stdlib::httpd)).
 //!
 //! A real run with the same seed makes the same random choices for the
 //! same inputs in the same order. But real sandboxes decide when packets

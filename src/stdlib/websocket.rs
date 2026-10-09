@@ -35,40 +35,40 @@
 //! [`Error`], and [`Error::close_code`] says which close code a real server
 //! sends before it drops the connection.
 //!
-#![doc = fictionet::cfg_std!(doc r####"
-```
-use fictionet::stdlib::codec::{Side, Stream, Wire};
-use fictionet::stdlib::websocket::{check_request, Frame, Message, Messages, Opcode};
-
-// The client's opening request, from RFC 6455 section 1.3.
-let headers = [
-    ("Host", "server.example.com"),
-    ("Upgrade", "websocket"),
-    ("Connection", "Upgrade"),
-    ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
-    ("Origin", "http://example.com"),
-    ("Sec-WebSocket-Protocol", "chat, superchat"),
-    ("Sec-WebSocket-Version", "13"),
-];
-let upgrade = check_request(&headers).unwrap();
-assert_eq!(upgrade.accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
-assert_eq!(upgrade.protocols, ["chat", "superchat"]);
-// The world answers "101 Switching Protocols" with these fields.
-let reply = upgrade.response_headers(Some("chat")).unwrap();
-assert!(reply.contains(&("Sec-WebSocket-Accept".to_string(), upgrade.accept.clone())));
-
-// A masked text frame from the client, from section 5.7.
-let mut stream = Stream::new(Messages::new(Side::Server));
-let bytes = [0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58];
-assert_eq!(stream.push(&bytes), bytes.len());
-let message = stream.next().unwrap().unwrap();
-assert_eq!(message, Message::Text("Hello".to_string()));
-assert!(stream.next().is_none());
-// A server sends its frames unmasked.
-let frame = Frame::new(Opcode::Text, b"Hello".to_vec());
-assert_eq!(Wire::to_bytes(&frame).unwrap(), [0x81, 0x05, b'H', b'e', b'l', b'l', b'o']);
-```
-"####)]
+//! ```
+//! # fictionet::cfg_std! {
+//! use fictionet::stdlib::codec::{Side, Stream, Wire};
+//! use fictionet::stdlib::websocket::{check_request, Frame, Message, Messages, Opcode};
+//!
+//! // The client's opening request, from RFC 6455 section 1.3.
+//! let headers = [
+//!     ("Host", "server.example.com"),
+//!     ("Upgrade", "websocket"),
+//!     ("Connection", "Upgrade"),
+//!     ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+//!     ("Origin", "http://example.com"),
+//!     ("Sec-WebSocket-Protocol", "chat, superchat"),
+//!     ("Sec-WebSocket-Version", "13"),
+//! ];
+//! let upgrade = check_request(&headers).unwrap();
+//! assert_eq!(upgrade.accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+//! assert_eq!(upgrade.protocols, ["chat", "superchat"]);
+//! // The world answers "101 Switching Protocols" with these fields.
+//! let reply = upgrade.response_headers(Some("chat")).unwrap();
+//! assert!(reply.contains(&("Sec-WebSocket-Accept".to_string(), upgrade.accept.clone())));
+//!
+//! // A masked text frame from the client, from section 5.7.
+//! let mut stream = Stream::new(Messages::new(Side::Server));
+//! let bytes = [0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58];
+//! assert_eq!(stream.push(&bytes), bytes.len());
+//! let message = stream.next().unwrap().unwrap();
+//! assert_eq!(message, Message::Text("Hello".to_string()));
+//! assert!(stream.next().is_none());
+//! // A server sends its frames unmasked.
+//! let frame = Frame::new(Opcode::Text, b"Hello".to_vec());
+//! assert_eq!(Wire::to_bytes(&frame).unwrap(), [0x81, 0x05, b'H', b'e', b'l', b'l', b'o']);
+//! # }
+//! ```
 
 use fictionet::stdlib::codec::ascii::is_tchar;
 use fictionet::stdlib::codec::base64::{self, Padding, encode as base64_encode};

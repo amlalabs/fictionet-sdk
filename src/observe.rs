@@ -146,7 +146,7 @@
 //! # }
 //! ```
 //!
-//! [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) groups its own parts. One
+//! [`web::Sites`](crate::stdlib::web::Sites) groups its own parts. One
 //! group, `web::Sites`, holds its router and the rest. Inside it, the
 //! gateway with its DNS server is a group, and so is each machine, named
 //! after the first site placed at its address. Each sandbox's filter stays
@@ -223,7 +223,7 @@
 //! Each copy is decoded the way Wireshark decodes it. Packets on a link are
 //! IPv4 or IPv6 with no Ethernet header. The decoder reads IP, TCP, UDP and
 //! ICMP, then DNS, DHCP, HTTP/1.1, and HTTP/2 with its headers. HTTP/2 uses
-//! [`http2::Capture`](https://docs.rs/fictionet/latest/fictionet/observe/http2/struct.Capture.html) through the public registry.
+//! [`http2::Capture`] through the public registry.
 //! Recognized gRPC calls add message layers from DATA under a shared budget. TCP
 //! connections are followed in order, so a message spread over several
 //! packets is shown whole on the packet that completes it. An HTTP/2 header
@@ -469,8 +469,6 @@
 //! ignores them, as clients should ignore what they do not know, draws
 //! every task on its own.
 
-#![cfg_attr(not(feature = "observe"), allow(dead_code))]
-
 mod conversation;
 /// Copyable HTTP/2 and gRPC presentation.
 #[cfg(feature = "observe")]
@@ -496,23 +494,31 @@ mod app;
 mod decode;
 mod json;
 mod keys;
+#[cfg(feature = "observe")]
 mod packets;
+#[cfg(feature = "observe")]
 mod pcap;
 #[cfg(all(feature = "observe", not(target_arch = "wasm32")))]
 mod session;
+#[cfg(feature = "observe")]
 mod view;
 
+#[cfg(feature = "observe")]
 use fictionet::sync::Mutex;
 use std::sync::Arc;
+#[cfg(feature = "observe")]
 use std::time::Duration;
 
 use crate::Cx;
+#[cfg(feature = "observe")]
 use crate::watch::Graph;
 pub use keys::observed_config;
+#[cfg(feature = "observe")]
 pub(crate) use packets::LinkWatch;
 
 /// How long a link's decoded packets are kept after the last observer
 /// stopped asking for them.
+#[cfg(feature = "observe")]
 const WATCH_LINGER: Duration = if cfg!(test) {
     Duration::from_millis(200)
 } else {
@@ -534,6 +540,7 @@ pub(crate) fn serve_session(attacher: crate::Attacher, fd: std::os::fd::OwnedFd)
 }
 
 /// Forgets the watches that have had no subscriber for a minute.
+#[cfg(feature = "observe")]
 pub(crate) fn reap(graph: &Graph) {
     graph
         .watches
@@ -547,11 +554,13 @@ pub(crate) fn reap(graph: &Graph) {
 /// Locks are taken in this order: this, then a graph's `watches`, then a
 /// watch's own. So nothing calls [`reap_later`] while it holds either of
 /// the others.
+#[cfg(feature = "observe")]
 static REAPER: Mutex<(Vec<std::sync::Weak<Graph>>, bool)> = Mutex::new((Vec::new(), false));
 
 /// Makes sure `graph`'s watches are forgotten once idle for a minute, even
 /// if no observer asks anything more. Called when the last subscriber of a
 /// watch leaves.
+#[cfg(feature = "observe")]
 pub(crate) fn reap_later(graph: &Arc<Graph>) -> std::io::Result<()> {
     graph.environment.require_real_io()?;
     let mut reaper = REAPER.lock();
@@ -596,7 +605,7 @@ fn start_reaper() -> bool {
 
 /// A browser has no thread for the reaper. Idle watches there are
 /// forgotten when the next watch starts.
-#[cfg(any(not(feature = "observe"), target_arch = "wasm32"))]
+#[cfg(all(feature = "observe", target_arch = "wasm32"))]
 fn start_reaper() -> bool {
     false
 }
@@ -604,6 +613,7 @@ fn start_reaper() -> bool {
 /// The watch of link `id` in `graph`, made if needed, and a subscription
 /// to it. Both are taken under the lock the reaper takes, so the reaper
 /// cannot forget the watch between them.
+#[cfg(feature = "observe")]
 pub(crate) fn watch(
     graph: &Arc<Graph>,
     id: u64,
@@ -623,6 +633,7 @@ pub(crate) fn watch(
 }
 
 /// The watch of link `id`, if one is kept.
+#[cfg(feature = "observe")]
 pub(crate) fn existing_watch(graph: &Graph, id: u64) -> Option<Arc<LinkWatch>> {
     graph.watches.lock().get(&id).cloned()
 }

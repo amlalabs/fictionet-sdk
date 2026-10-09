@@ -92,8 +92,10 @@ macro_rules! protocols {
         pub mod http2;
         #[path = "../../src/stdlib/http3.rs"]
         pub mod http3;
+        fictionet::cfg_std! {
         #[path = "../../src/stdlib/httpd.rs"]
         pub mod httpd;
+        }
         #[path = "../../src/stdlib/huffman.rs"]
         pub mod huffman;
         #[path = "../../src/stdlib/icmp.rs"]
@@ -311,12 +313,8 @@ macro_rules! protocols {
         #[path = "../../src/stdlib/wake_on_lan.rs"]
         pub mod wake_on_lan;
         fictionet::cfg_std! {
-        #[path = "../../src/stdlib/web/sites.rs"]
+        #[path = "../../src/stdlib/web.rs"]
         pub mod web;
-        }
-        fictionet::cfg_web_proxy! {
-        #[path = "../../src/stdlib/web/proxy.rs"]
-        pub mod web_proxy;
         }
         #[path = "../../src/stdlib/websocket.rs"]
         pub mod websocket;
@@ -412,9 +410,12 @@ fn copied_router<I: fictionet::Interface>(fcx: &fictionet::Cx, interface: I) {
 fn copied_entropy(fcx: &fictionet::Cx) {
     let seed = fictionet::Seed::from_u64(7);
     let source = fictionet::SeededEntropy::new(seed);
+    fictionet::cfg_std! {
     let conn = fictionet::events::ConnInfo::default();
     let mut exchange = httpd::Exchange::new(fcx.now(), &source, &conn);
     let _ = exchange.random_u64();
+    let _ = httpd::UpgradeHandler::new(|_fcx, _conn| async {});
+    }
     let mut faults = faults::Faults::new(64, 0);
     let plan = [faults::Rule {
         when: faults::Trigger::Always,

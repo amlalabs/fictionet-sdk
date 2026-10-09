@@ -10,26 +10,24 @@
 //!
 //! A library that spawns tasks or sets timers on tokio needs the world to
 //! run on a tokio runtime: [`block_on`](crate::block_on) is not one. Await
-//! [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) inside `#[tokio::main]` instead.
+//! [`run`](crate::run) inside `#[tokio::main]` instead.
 //!
 //! Here a TLS connection is finished and written to with tokio's
 //! `AsyncWriteExt`:
 //!
-#![doc = fictionet::cfg_tokio!(doc r####"
-```
-use fictionet::prelude::*;
-use tokio::io::AsyncWriteExt;
-# use std::sync::Arc;
-# use fictionet::{Cx, Result, stdlib::{tcp, tls}};
-# async fn serve(fcx: Cx, hello: tls::ClientHello<tcp::TcpConnection>, config: Arc<rustls::ServerConfig>) -> Result {
-
-let conn = hello.finish(&fcx, config).await?;
-let mut io = conn.into_tokio(&fcx);
-io.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await?;
-# Ok(())
-# }
-```
-"####)]
+//! ```
+//! use fictionet::prelude::*;
+//! use tokio::io::AsyncWriteExt;
+//! # use std::sync::Arc;
+//! # use fictionet::{Cx, Result, stdlib::{tcp, tls}};
+//! # async fn serve(fcx: Cx, hello: tls::ClientHello<tcp::TcpConnection>, config: Arc<rustls::ServerConfig>) -> Result {
+//!
+//! let conn = hello.finish(&fcx, config).await?;
+//! let mut io = conn.into_tokio(&fcx);
+//! io.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await?;
+//! # Ok(())
+//! # }
+//! ```
 
 use std::pin::Pin;
 use std::task::{Context, Poll};

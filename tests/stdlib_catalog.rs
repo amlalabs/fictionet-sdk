@@ -415,11 +415,9 @@ fn copy_column_matches_the_copy_and_own_fixture() {
             .join("src/stdlib")
             .join(&row.module)
             .is_dir();
-        let copied = if dir {
-            COPY_MODULES.contains(&format!("src/stdlib/{}/", row.module))
-        } else {
-            COPY_MODULES.contains(&format!("\"../../src/stdlib/{}.rs\"", row.module))
-        };
+        let direct = COPY_MODULES.contains(&format!("\"../../src/stdlib/{}.rs\"", row.module));
+        let copied =
+            direct || (dir && COPY_MODULES.contains(&format!("src/stdlib/{}/", row.module)));
         assert_eq!(row.copy, copied, "{}: the Copy column", row.module);
     }
 }
@@ -440,17 +438,21 @@ fn every_implementation_file_is_copied() {
             {
                 let relative = path.strip_prefix(root).unwrap().to_str().unwrap();
                 let direct = COPY_MODULES.contains(&format!("\"../../{relative}\""));
-                let parent = path.with_file_name("mod.rs");
-                let parent_relative = parent.strip_prefix(root).unwrap().to_str().unwrap();
-                let nested = if COPY_MODULES.contains(&format!("\"../../{parent_relative}\"")) {
+                let parents = [
+                    path.with_file_name("mod.rs"),
+                    path.parent().unwrap().with_extension("rs"),
+                ];
+                let nested = parents.iter().any(|parent| {
+                    let parent_relative = parent.strip_prefix(root).unwrap().to_str().unwrap();
+                    if !COPY_MODULES.contains(&format!("\"../../{parent_relative}\"")) {
+                        return false;
+                    }
                     let name = path.file_stem().unwrap().to_str().unwrap();
-                    fs::read_to_string(&parent).unwrap().lines().any(|line| {
+                    fs::read_to_string(parent).unwrap().lines().any(|line| {
                         let line = line.trim();
                         line == format!("pub mod {name};") || line == format!("mod {name};")
                     })
-                } else {
-                    false
-                };
+                });
                 assert!(
                     direct || nested,
                     "{relative}: missing from the copy fixture"

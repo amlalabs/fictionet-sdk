@@ -13,7 +13,7 @@
 //! on Windows networks.
 //!
 //! To build a whole network of websites, routes and all, use
-//! [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) instead.
+//! [`web::Sites`](fictionet::stdlib::web::Sites) instead.
 
 use fictionet::sync::Mutex;
 use std::collections::{BTreeMap, HashMap};

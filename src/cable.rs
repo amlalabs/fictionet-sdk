@@ -234,6 +234,7 @@ impl End {
 }
 
 impl Counted for Cable {
+    #[cfg(any(feature = "observe", all(test, feature = "std")))]
     fn totals(&self) -> [u64; 4] {
         // End `s` sends into `dirs[1 - s]`.
         let (p1, b1) = {

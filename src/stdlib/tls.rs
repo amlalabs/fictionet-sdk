@@ -2,7 +2,7 @@
 //!
 //! Use this module when a machine in the world serves HTTPS, or any other
 //! protocol over TLS, by hand. If the world is a set of websites,
-//! [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) does TLS for you.
+//! [`web::Sites`](fictionet::stdlib::web::Sites) does TLS for you.
 //!
 //! TLS here is middleware. It takes a [`Connection`], usually a
 //! [`TcpConnection`](fictionet::stdlib::tcp::TcpConnection), and gives back a
