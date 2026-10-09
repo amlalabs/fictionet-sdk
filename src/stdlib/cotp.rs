@@ -43,8 +43,7 @@
 //! assert_eq!(cotp::over_tpkt::write_message(b"ok", 1024).unwrap(), [3, 0, 0, 9, 2, 0xf0, 0x80, b'o', b'k']);
 //! ```
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A TPDU this module cannot read gives a [`Error`] that
+//! A TPDU this module cannot read gives a [`Error`] that
 //! [`ErrorTpdu::rejecting`] turns into the error TPDU a real stack sends.
 //!
 //! ```

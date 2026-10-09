@@ -1296,31 +1296,25 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Version => f.write_str("not an RFB protocol version line"),
-            Error::MessageType(t) => write!(f, "unknown message type {t}"),
-            Error::Encoding(e) => write!(f, "rectangle encoding {e} is not read"),
-            Error::BitsPerPixel(b) => write!(f, "{b} bits per pixel, not 8, 16 or 32"),
-            Error::TooLong => f.write_str("text or message too long"),
-            Error::Truncated => f.write_str("incomplete RFB value"),
-            Error::Trailing => f.write_str("bytes after the RFB value"),
-            Error::PartialUnit => f.write_str("mode change inside a partial RFB unit"),
-            Error::NotOffered(t) => write!(f, "security type {t} was not offered"),
-            Error::PixelFormat => f.write_str("pixel format not allowed"),
-            Error::Rectangle => f.write_str("rectangle outside the framebuffer or out of order"),
-            Error::NotRequested => f.write_str("server message the client did not ask for"),
-            Error::Outstanding => {
-                f.write_str("pixel format changed while an update is outstanding")
-            }
-            Error::Phase(p) => write!(f, "message does not belong in phase {p:?}"),
-            Error::Unwritable => f.write_str("RFB value cannot be written unchanged"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Version => f.write_str("not an RFB protocol version line"),
+    Error::MessageType(t) => write!(f, "unknown message type {t}"),
+    Error::Encoding(e) => write!(f, "rectangle encoding {e} is not read"),
+    Error::BitsPerPixel(b) => write!(f, "{b} bits per pixel, not 8, 16 or 32"),
+    Error::TooLong => f.write_str("text or message too long"),
+    Error::Truncated => f.write_str("incomplete RFB value"),
+    Error::Trailing => f.write_str("bytes after the RFB value"),
+    Error::PartialUnit => f.write_str("mode change inside a partial RFB unit"),
+    Error::NotOffered(t) => write!(f, "security type {t} was not offered"),
+    Error::PixelFormat => f.write_str("pixel format not allowed"),
+    Error::Rectangle => f.write_str("rectangle outside the framebuffer or out of order"),
+    Error::NotRequested => f.write_str("server message the client did not ask for"),
+    Error::Outstanding => {
+        f.write_str("pixel format changed while an update is outstanding")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Phase(p) => write!(f, "message does not belong in phase {p:?}"),
+    Error::Unwritable => f.write_str("RFB value cannot be written unchanged"),
+});
 
 /// Why [`ClientMessages`] or [`ServerMessages`] cannot find the next
 /// unit. It ends the stream.
@@ -1344,21 +1338,15 @@ pub enum FrameError {
     Phase(Phase),
 }
 
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FrameError::Version => f.write_str("not an RFB protocol version line"),
-            FrameError::MessageType(t) => write!(f, "unknown message type {t}"),
-            FrameError::Encoding(e) => write!(f, "rectangle encoding {e} is not read"),
-            FrameError::BitsPerPixel(b) => write!(f, "{b} bits per pixel, not 8, 16 or 32"),
-            FrameError::TooLong => f.write_str("text or message too long"),
-            FrameError::OutOfTurn => f.write_str("too many bytes sent before the peer's turn"),
-            FrameError::Phase(p) => write!(f, "message does not belong in phase {p:?}"),
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
+fictionet::error_display!(FrameError, f, {
+    FrameError::Version => f.write_str("not an RFB protocol version line"),
+    FrameError::MessageType(t) => write!(f, "unknown message type {t}"),
+    FrameError::Encoding(e) => write!(f, "rectangle encoding {e} is not read"),
+    FrameError::BitsPerPixel(b) => write!(f, "{b} bits per pixel, not 8, 16 or 32"),
+    FrameError::TooLong => f.write_str("text or message too long"),
+    FrameError::OutOfTurn => f.write_str("too many bytes sent before the peer's turn"),
+    FrameError::Phase(p) => write!(f, "message does not belong in phase {p:?}"),
+});
 
 /// A protocol version, as in `RFB 003.008\n`. Each part has three digits
 /// on the wire, so a message that carries a part past 999 cannot be

@@ -328,28 +328,22 @@ pub enum Error {
     Attribute,
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::TooLong => write!(f, "description longer than {MAX_LEN} bytes"),
-            Error::TooManyLines => write!(f, "description has more than {MAX_LINES} lines"),
-            Error::LineTooLong { line } => {
-                write!(f, "line {line} is longer than {MAX_LINE_LEN} bytes")
-            }
-            Error::FieldLine { line } => {
-                write!(f, "line {line} is not a type letter, '=' and a value")
-            }
-            Error::UnknownType { line, kind } => write!(f, "line {line} has unknown type '{kind}'"),
-            Error::Encoding { line } => write!(f, "line {line} is not UTF-8"),
-            Error::Syntax { line, kind } => write!(f, "line {line} is a malformed '{kind}=' line"),
-            Error::Order { line, kind } => write!(f, "line {line}: '{kind}=' is not allowed here"),
-            Error::Missing(kind) => write!(f, "required '{kind}=' line missing"),
-            Error::Attribute => f.write_str("malformed SDP attribute"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::TooLong => write!(f, "description longer than {MAX_LEN} bytes"),
+    Error::TooManyLines => write!(f, "description has more than {MAX_LINES} lines"),
+    Error::LineTooLong { line } => {
+        write!(f, "line {line} is longer than {MAX_LINE_LEN} bytes")
     }
-}
-
-impl core::error::Error for Error {}
+    Error::FieldLine { line } => {
+        write!(f, "line {line} is not a type letter, '=' and a value")
+    }
+    Error::UnknownType { line, kind } => write!(f, "line {line} has unknown type '{kind}'"),
+    Error::Encoding { line } => write!(f, "line {line} is not UTF-8"),
+    Error::Syntax { line, kind } => write!(f, "line {line} is a malformed '{kind}=' line"),
+    Error::Order { line, kind } => write!(f, "line {line}: '{kind}=' is not allowed here"),
+    Error::Missing(kind) => write!(f, "required '{kind}=' line missing"),
+    Error::Attribute => f.write_str("malformed SDP attribute"),
+});
 
 // The order of lines. A stage is the rank of the last line read; a line
 // may follow if its rank is higher, or the same and its type repeats.

@@ -27,8 +27,7 @@
 //! Read netascii DATA bodies with [`Stream<NetasciiBytes>`](fictionet::stdlib::codec::Stream)
 //! to retain a CR split across packets.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Strings, option lists and packets all have limits, given below
+//! Strings, option lists and packets all have limits, given below
 //! as constants, and the writers refuse values above those limits.
 //! A request may name each option only once (RFC 2347), so the readers
 //! and writers both refuse repeated option names.
@@ -195,31 +194,40 @@ pub struct Request {
     pub options: Vec<TftpOption>,
 }
 
-/// The error codes of an ERROR packet. Two codes are equal when their
-/// numbers are, so `Other(1)` equals `FileNotFound`.
-#[derive(Clone, Copy, Debug)]
-pub enum ErrorCode {
-    /// Not defined; the message says what went wrong.
-    NotDefined,
-    /// File not found.
-    FileNotFound,
-    /// Access violation.
-    AccessViolation,
-    /// Disk full or allocation exceeded.
-    DiskFull,
-    /// Illegal TFTP operation.
-    IllegalOperation,
-    /// Unknown transfer ID: a packet came from the wrong port.
-    UnknownTransferId,
-    /// File already exists.
-    FileExists,
-    /// No such user.
-    NoSuchUser,
-    /// The options could not be agreed (RFC 2347).
-    OptionNegotiation,
-    /// Any other code. [`ErrorCode::from_code`] gives it only for codes
-    /// above 8.
-    Other(u16),
+fictionet::open_enum! {
+    /// The error codes of an ERROR packet. Two codes are equal when their
+    /// numbers are, so `Other(1)` equals `FileNotFound`.
+    #[derive(Clone, Copy, Debug)]
+    pub enum ErrorCode: u16 {
+        /// Not defined; the message says what went wrong.
+        NotDefined = 0,
+        /// File not found.
+        FileNotFound = 1,
+        /// Access violation.
+        AccessViolation = 2,
+        /// Disk full or allocation exceeded.
+        DiskFull = 3,
+        /// Illegal TFTP operation.
+        IllegalOperation = 4,
+        /// Unknown transfer ID: a packet came from the wrong port.
+        UnknownTransferId = 5,
+        /// File already exists.
+        FileExists = 6,
+        /// No such user.
+        NoSuchUser = 7,
+        /// The options could not be agreed (RFC 2347).
+        OptionNegotiation = 8,
+        ;
+        /// Any other code. [`ErrorCode::from_code`] gives it only for codes
+        /// above 8.
+        Other,
+    }
+    [
+        /// The code's number.
+    ] [
+        /// The code a number stands for. Every number has one, and
+        /// `from_code(c).code() == c`.
+    ]
 }
 
 impl PartialEq for ErrorCode {
@@ -231,39 +239,6 @@ impl PartialEq for ErrorCode {
 impl Eq for ErrorCode {}
 
 impl ErrorCode {
-    /// The code's number.
-    pub fn code(self) -> u16 {
-        match self {
-            ErrorCode::NotDefined => 0,
-            ErrorCode::FileNotFound => 1,
-            ErrorCode::AccessViolation => 2,
-            ErrorCode::DiskFull => 3,
-            ErrorCode::IllegalOperation => 4,
-            ErrorCode::UnknownTransferId => 5,
-            ErrorCode::FileExists => 6,
-            ErrorCode::NoSuchUser => 7,
-            ErrorCode::OptionNegotiation => 8,
-            ErrorCode::Other(c) => c,
-        }
-    }
-
-    /// The code a number stands for. Every number has one, and
-    /// `from_code(c).code() == c`.
-    pub fn from_code(code: u16) -> ErrorCode {
-        match code {
-            0 => ErrorCode::NotDefined,
-            1 => ErrorCode::FileNotFound,
-            2 => ErrorCode::AccessViolation,
-            3 => ErrorCode::DiskFull,
-            4 => ErrorCode::IllegalOperation,
-            5 => ErrorCode::UnknownTransferId,
-            6 => ErrorCode::FileExists,
-            7 => ErrorCode::NoSuchUser,
-            8 => ErrorCode::OptionNegotiation,
-            c => ErrorCode::Other(c),
-        }
-    }
-
     /// The message RFC 1350 and RFC 2347 give for the code, for an ERROR
     /// packet that has nothing more specific to say.
     pub fn message(self) -> &'static str {
@@ -350,29 +325,23 @@ pub enum Error {
     TrailingBytes,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Short => write!(f, "packet ends before its fixed fields"),
-            Error::TooLong(n) => write!(f, "packet of {n} bytes, longer than {MAX_PACKET}"),
-            Error::RequestTooLong(n) => {
-                write!(f, "request of {n} bytes, longer than {MAX_REQUEST}")
-            }
-            Error::UnknownOpcode(op) => write!(f, "unknown opcode {op}"),
-            Error::Unterminated => write!(f, "string with no closing NUL"),
-            Error::StringTooLong => write!(f, "string longer than {MAX_STRING} bytes"),
-            Error::NotUtf8 => write!(f, "string is not UTF-8"),
-            Error::UnknownMode => write!(f, "mode is not netascii, octet or mail"),
-            Error::TooManyOptions => write!(f, "more than {MAX_OPTIONS} options"),
-            Error::MissingValue => write!(f, "option name with no value"),
-            Error::DuplicateOption => write!(f, "option named twice"),
-            Error::TrailingBytes => write!(f, "bytes after the packet's last field"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Short => write!(f, "packet ends before its fixed fields"),
+    Error::TooLong(n) => write!(f, "packet of {n} bytes, longer than {MAX_PACKET}"),
+    Error::RequestTooLong(n) => {
+        write!(f, "request of {n} bytes, longer than {MAX_REQUEST}")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::UnknownOpcode(op) => write!(f, "unknown opcode {op}"),
+    Error::Unterminated => write!(f, "string with no closing NUL"),
+    Error::StringTooLong => write!(f, "string longer than {MAX_STRING} bytes"),
+    Error::NotUtf8 => write!(f, "string is not UTF-8"),
+    Error::UnknownMode => write!(f, "mode is not netascii, octet or mail"),
+    Error::TooManyOptions => write!(f, "more than {MAX_OPTIONS} options"),
+    Error::MissingValue => write!(f, "option name with no value"),
+    Error::DuplicateOption => write!(f, "option named twice"),
+    Error::TrailingBytes => write!(f, "bytes after the packet's last field"),
+});
 
 impl Packet {
     /// An ERROR packet with the code's standard message.

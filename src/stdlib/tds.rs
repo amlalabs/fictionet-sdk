@@ -75,7 +75,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{
     Decode, Reader, Step, Trailing, Truncated, Wire, be16, le16, le32, le64,
 };
@@ -499,33 +498,19 @@ impl Wire for Packet {
     }
 }
 
-/// Reads individual TDS packets without holding input bytes.
-///
-/// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
-/// by [`limit`](fictionet::stdlib::codec::Frames::limit), including the header. Oversized packets are
-/// refused from the first four bytes. Partial packets return [`Step::Need`],
-/// including at EOF, so the stream reports truncation. Message assembly
-/// and status handling remain in [`Messages`].
-impl Prefixed for Packet {
-    type Item = Packet;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "TDS";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_PACKET
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.clamp(HEADER_LEN, MAX_PACKET)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        *limit
-    }
+fictionet::prefixed! {
+    /// Reads individual TDS packets without holding input bytes.
+    ///
+    /// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
+    /// by [`limit`](fictionet::stdlib::codec::Frames::limit), including the header. Oversized packets are
+    /// refused from the first four bytes. Partial packets return [`Step::Need`],
+    /// including at EOF, so the stream reports truncation. Message assembly
+    /// and status handling remain in [`Messages`].
+    Packet => (Packet, Error, usize);
+    name = "TDS";
+    default { MAX_PACKET }
+    normalize(limit) { limit.clamp(HEADER_LEN, MAX_PACKET) }
+    capacity(limit) { *limit }
 
     #[inline]
     fn parse_prefix(
@@ -800,34 +785,28 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Truncated => write!(
-                f,
-                "data ends before a complete packet or in the middle of a field"
-            ),
-            Error::Trailing => f.write_str("bytes follow the TDS packet"),
-            Error::Length(n) => write!(f, "packet length {n}, below the 8-byte header"),
-            Error::TypeChanged { expected, got } => {
-                write!(
-                    f,
-                    "packet type {got:#04x} in the middle of a {expected:#04x} message"
-                )
-            }
-            Error::TooLong(n) => write!(f, "message of {n} bytes, over the limit"),
-            Error::Incomplete => f.write_str("message ended without EOM"),
-            Error::Invalid(what) => write!(f, "invalid {what}"),
-            Error::Limit(what) => write!(f, "too long or too many: {what}"),
-            Error::UnknownToken(t) => write!(f, "unknown token {t:#04x}"),
-            Error::UnsupportedType(t) => write!(f, "unsupported data type {t:#04x}"),
-            Error::NoColumns => write!(f, "row before any column metadata"),
-            Error::Unwritable => write!(f, "value cannot be written without changing it"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Truncated => write!(
+        f,
+        "data ends before a complete packet or in the middle of a field"
+    ),
+    Error::Trailing => f.write_str("bytes follow the TDS packet"),
+    Error::Length(n) => write!(f, "packet length {n}, below the 8-byte header"),
+    Error::TypeChanged { expected, got } => {
+        write!(
+            f,
+            "packet type {got:#04x} in the middle of a {expected:#04x} message"
+        )
     }
-}
-
-impl std::error::Error for Error {}
+    Error::TooLong(n) => write!(f, "message of {n} bytes, over the limit"),
+    Error::Incomplete => f.write_str("message ended without EOM"),
+    Error::Invalid(what) => write!(f, "invalid {what}"),
+    Error::Limit(what) => write!(f, "too long or too many: {what}"),
+    Error::UnknownToken(t) => write!(f, "unknown token {t:#04x}"),
+    Error::UnsupportedType(t) => write!(f, "unsupported data type {t:#04x}"),
+    Error::NoColumns => write!(f, "row before any column metadata"),
+    Error::Unwritable => write!(f, "value cannot be written without changing it"),
+});
 
 // ---------------------------------------------------------------------
 // PRELOGIN.
@@ -3280,13 +3259,10 @@ impl<'a> ReadFields<'a> for Reader<'a> {
 
 /// UTF-16LE bytes as a string. A last odd byte is ignored.
 fn utf16_string(b: &[u8]) -> String {
-    let units: Vec<u16> = b
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    String::from_utf16_lossy(&units)
+    let units = b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c));
+    char::decode_utf16(units)
+        .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
 }
 
 fn utf16_units(s: &str, max: usize) -> Result<Vec<u16>, Error> {
@@ -3332,19 +3308,11 @@ fn le_uint(b: &[u8]) -> u64 {
         .fold(0u64, |acc, &x| (acc << 8) | u64::from(x))
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
-impl From<Trailing> for Error {
-    #[inline]
-    fn from(_: Trailing) -> Self {
-        Error::Invalid("bytes after the token's fields")
-    }
-}
+fictionet::codec_from!(Error, Trailing, |_| Error::Invalid(
+    "bytes after the token's fields"
+));
 
 #[cfg(test)]
 mod tests {
@@ -3419,6 +3387,13 @@ mod tests {
             (vec![message.clone()], None)
         );
         message
+    }
+
+    #[test]
+    fn lossy_utf16_preserves_pairs_replacements_and_odd_tail() {
+        assert_eq!(utf16_string(&[0x3d, 0xd8, 0, 0xde]), "😀");
+        assert_eq!(utf16_string(&[0, 0xd8, 65, 0, 0, 0xdc, 0xff]), "�A�");
+        assert_eq!(utf16_string(&[0xff]), "");
     }
 
     #[test]

@@ -1005,22 +1005,14 @@ impl Wire for Frame {
     }
 }
 
-/// Frames one OCSP message and yields its uninterpreted bytes.
-/// Partial input needs more bytes, including at EOF. The stream reports truncation.
-impl Prefixed for Frame {
-    type Item = Vec<u8>;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "OCSP";
-    fn default_limit() -> Self::Limit {
-        MAX_MESSAGE
-    }
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_MESSAGE)
-    }
-    fn capacity(limit: &Self::Limit) -> usize {
-        (*limit).max(asn1::HEADER_ROOM)
-    }
+fictionet::prefixed! {
+    /// Frames one OCSP message and yields its uninterpreted bytes.
+    /// Partial input needs more bytes, including at EOF. The stream reports truncation.
+    Frame => (Vec<u8>, Error, usize);
+    name = "OCSP";
+    default { MAX_MESSAGE }
+    normalize(limit) { limit.min(MAX_MESSAGE) }
+    capacity(limit) { (*limit).max(asn1::HEADER_ROOM) }
     fn parse_prefix(
         input: &[u8],
         limit: &Self::Limit,

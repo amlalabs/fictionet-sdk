@@ -701,19 +701,9 @@ impl Encoder {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
-impl From<Trailing> for Error {
-    #[inline]
-    fn from(_: Trailing) -> Self {
-        Error::Trailing
-    }
-}
+fictionet::codec_from!(Error, Trailing, |_| Error::Trailing);
 
 #[cfg(test)]
 mod tests {

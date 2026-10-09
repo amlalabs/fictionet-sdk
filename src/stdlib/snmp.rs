@@ -65,7 +65,6 @@
 use fictionet::stdlib::asn1;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use std::fmt;
 use std::str::FromStr;
 
@@ -188,29 +187,23 @@ pub enum Error {
     OidText,
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Truncated => f.write_str("the bytes end inside an element"),
-            Error::TrailingBytes => f.write_str("bytes follow the last element"),
-            Error::UnexpectedTag(t) => write!(f, "unexpected tag 0x{t:02x}"),
-            Error::Length => f.write_str("indefinite or reserved length"),
-            Error::TooLong(n) => write!(f, "length {n}, over the limit of {MAX_MESSAGE}"),
-            Error::TooDeep => write!(f, "elements nest deeper than {MAX_DEPTH}"),
-            Error::Integer => f.write_str("integer empty or out of range"),
-            Error::Oid => f.write_str("malformed object identifier"),
-            Error::Value(t) => write!(f, "wrong size for a value of tag 0x{t:02x}"),
-            Error::Unsupported(v) => write!(f, "SNMP version field {v}, not 0 (v1) or 1 (v2c)"),
-            Error::TooFewArcs => f.write_str("an object identifier needs at least 2 arcs"),
-            Error::TooManyArcs => write!(f, "more than {MAX_OID_ARCS} arcs"),
-            Error::FirstArcs => f.write_str("first two arcs out of range"),
-            Error::OidText => f.write_str("not dotted decimal numbers"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Truncated => f.write_str("the bytes end inside an element"),
+    Error::TrailingBytes => f.write_str("bytes follow the last element"),
+    Error::UnexpectedTag(t) => write!(f, "unexpected tag 0x{t:02x}"),
+    Error::Length => f.write_str("indefinite or reserved length"),
+    Error::TooLong(n) => write!(f, "length {n}, over the limit of {MAX_MESSAGE}"),
+    Error::TooDeep => write!(f, "elements nest deeper than {MAX_DEPTH}"),
+    Error::Integer => f.write_str("integer empty or out of range"),
+    Error::Oid => f.write_str("malformed object identifier"),
+    Error::Value(t) => write!(f, "wrong size for a value of tag 0x{t:02x}"),
+    Error::Unsupported(v) => write!(f, "SNMP version field {v}, not 0 (v1) or 1 (v2c)"),
+    Error::TooFewArcs => f.write_str("an object identifier needs at least 2 arcs"),
+    Error::TooManyArcs => write!(f, "more than {MAX_OID_ARCS} arcs"),
+    Error::FirstArcs => f.write_str("first two arcs out of range"),
+    Error::OidText => f.write_str("not dotted decimal numbers"),
+});
 
 // ---------------------------------------------------------------------------
 // BER framing.
@@ -1641,38 +1634,24 @@ impl Wire for Message {
 // RFC 3417 permits nonminimal definite lengths; 0xff is reserved.
 const MAX_BER_HEADER: usize = 128;
 
-/// Reads SNMP messages from BER TLV envelopes over TCP (RFC 3430).
-///
-/// This decoder owns no input. Malformed message bodies are `Err` items;
-/// a bad outer tag, invalid length, or oversized envelope ends framing.
-/// The whole message limit includes the BER header. Capacity is at least
-/// 128 bytes to read the longest permitted definite-length header, even
-/// when the configured limit is smaller. The header suffices to refuse
-/// an oversized message before its body arrives. Partial messages return
-/// [`fictionet::stdlib::codec::Step::Need`], including at EOF, so [`fictionet::stdlib::codec::Stream`] reports
-/// truncation. Redundant long-form BER lengths are accepted. Message bodies
-/// must use SNMP v1 or v2c.
-impl Prefixed for Message {
-    type Item = Result<Message, Error>;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "SNMP/TCP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_MESSAGE
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_MESSAGE)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        limit.max(MAX_BER_HEADER)
-    }
+fictionet::prefixed! {
+    /// Reads SNMP messages from BER TLV envelopes over TCP (RFC 3430).
+    ///
+    /// This decoder owns no input. Malformed message bodies are `Err` items;
+    /// a bad outer tag, invalid length, or oversized envelope ends framing.
+    /// The whole message limit includes the BER header. Capacity is at least
+    /// 128 bytes to read the longest permitted definite-length header, even
+    /// when the configured limit is smaller. The header suffices to refuse
+    /// an oversized message before its body arrives. Partial messages return
+    /// [`fictionet::stdlib::codec::Step::Need`], including at EOF, so [`fictionet::stdlib::codec::Stream`] reports
+    /// truncation. Redundant long-form BER lengths are accepted. Message bodies
+    /// must use SNMP v1 or v2c.
+    Message => (Result<Message, Error>, Error, usize);
+    name = "SNMP/TCP";
+    default { MAX_MESSAGE }
+    normalize(limit) { limit.min(MAX_MESSAGE) }
+    capacity(limit) { let limit = *limit;
+        limit.max(MAX_BER_HEADER) }
 
     #[inline]
     fn parse_prefix(

@@ -219,66 +219,33 @@ pub enum Error {
     /// Exchange text too long or not printable.
     Text,
 }
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Start => f.write_str("BOE message does not start with BA BA"),
-            Error::Length => f.write_str("BOE message length is wrong"),
-            Error::Type(t) => write!(f, "unexpected BOE message type {t:#04x}"),
-            Error::Field => f.write_str("BOE text field is invalid"),
-            Error::Bitfield { byte, bit } => {
-                write!(f, "BOE bitfield {byte} bit {bit} names no known field")
-            }
-            Error::Unsupported(id) => write!(f, "BOE message cannot carry {id:?}"),
-            Error::Group(t) => write!(f, "invalid BOE parameter group {t:#04x}"),
-            Error::Count => f.write_str("BOE list is too long"),
-            Error::Price => f.write_str("BOE price is invalid"),
-            Error::TooLong => f.write_str("BOE message is too long"),
-            Error::Config => f.write_str("BOE configuration is out of range"),
-            Error::State => f.write_str("BOE operation not allowed now"),
-            Error::Time => f.write_str("BOE time went backwards"),
-            Error::Sequence => f.write_str("BOE sequence number is invalid"),
-            Error::ExchangeConfig => f.write_str("BOE exchange configuration is out of range"),
-            Error::UnknownOrder(c) => write!(f, "no BOE order {c:?}"),
-            Error::Shares => f.write_str("BOE share count is invalid"),
-            Error::UnknownExecution(e) => write!(f, "no BOE execution {e}"),
-            Error::Exhausted => f.write_str("BOE numbering is exhausted"),
-            Error::Text => f.write_str("BOE text is invalid"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Start => f.write_str("BOE message does not start with BA BA"),
+    Error::Length => f.write_str("BOE message length is wrong"),
+    Error::Type(t) => write!(f, "unexpected BOE message type {t:#04x}"),
+    Error::Field => f.write_str("BOE text field is invalid"),
+    Error::Bitfield { byte, bit } => {
+        write!(f, "BOE bitfield {byte} bit {bit} names no known field")
     }
-}
-impl std::error::Error for Error {}
+    Error::Unsupported(id) => write!(f, "BOE message cannot carry {id:?}"),
+    Error::Group(t) => write!(f, "invalid BOE parameter group {t:#04x}"),
+    Error::Count => f.write_str("BOE list is too long"),
+    Error::Price => f.write_str("BOE price is invalid"),
+    Error::TooLong => f.write_str("BOE message is too long"),
+    Error::Config => f.write_str("BOE configuration is out of range"),
+    Error::State => f.write_str("BOE operation not allowed now"),
+    Error::Time => f.write_str("BOE time went backwards"),
+    Error::Sequence => f.write_str("BOE sequence number is invalid"),
+    Error::ExchangeConfig => f.write_str("BOE exchange configuration is out of range"),
+    Error::UnknownOrder(c) => write!(f, "no BOE order {c:?}"),
+    Error::Shares => f.write_str("BOE share count is invalid"),
+    Error::UnknownExecution(e) => write!(f, "no BOE execution {e}"),
+    Error::Exhausted => f.write_str("BOE numbering is exhausted"),
+    Error::Text => f.write_str("BOE text is invalid"),
+});
 
-/// One fixed-width field: its size, and how it reads and writes.
-trait Field: Sized {
-    const LEN: usize;
-    /// Reads exactly `LEN` bytes.
-    fn get(b: &[u8]) -> Result<Self, Error>;
-    fn put(&self, out: &mut Vec<u8>);
-}
-/// Reads the next field from `b` and moves past it.
-fn take<T: Field>(b: &mut &[u8]) -> Result<T, Error> {
-    let (head, rest) = b.split_at_checked(T::LEN).ok_or(Error::Length)?;
-    *b = rest;
-    T::get(head)
-}
-fn array<const N: usize>(b: &[u8]) -> Result<[u8; N], Error> {
-    b.try_into().map_err(|_| Error::Length)
-}
-macro_rules! int_field {
-    ($($t:ty),*) => {$(
-        impl Field for $t {
-            const LEN: usize = size_of::<$t>();
-            fn get(b: &[u8]) -> Result<Self, Error> {
-                Ok(<$t>::from_le_bytes(array(b)?))
-            }
-            fn put(&self, out: &mut Vec<u8>) {
-                out.extend_from_slice(&self.to_le_bytes());
-            }
-        }
-    )*};
-}
-int_field!(u8, u16, u32, u64, i16);
+fictionet::fixed_fields!(Field, take, array; Error, Error::Length;
+    from_le_bytes, to_le_bytes; u8, u16, u32, u64, i16);
 
 /// A Binary Price: eight signed bytes with four implied decimal places.
 /// The raw value 123400 is $12.34 ("Data Types").

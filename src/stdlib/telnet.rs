@@ -344,52 +344,46 @@ pub enum Error {
     Allocation,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::UnknownCommand(b) => write!(f, "IAC followed by {b}, which is no command"),
-            Error::StraySubnegotiationEnd => f.write_str("IAC SE with no subnegotiation open"),
-            Error::SubnegotiationTooLong { option } => {
-                write!(
-                    f,
-                    "subnegotiation for option {option} longer than {MAX_SUBNEGOTIATION} bytes"
-                )
-            }
-            Error::SubnegotiationInterrupted { option } => {
-                write!(
-                    f,
-                    "subnegotiation for option {option} cut off by another command"
-                )
-            }
-            Error::Truncated => f.write_str("stream ended inside a command"),
-            Error::Empty => f.write_str("terminal type subnegotiation with no data"),
-            Error::UnknownCode(c) => write!(f, "terminal type code {c}, not IS or SEND"),
-            Error::TrailingAfterSend => f.write_str("bytes after terminal type SEND"),
-            Error::NameLength(n) => {
-                write!(
-                    f,
-                    "terminal type name of {n} bytes, outside 1..={MAX_TERMINAL_TYPE}"
-                )
-            }
-            Error::NameByte(b) => write!(f, "byte {b} in a terminal type name"),
-            Error::WindowSizeLength(n) => write!(f, "window size of {n} bytes, not 4"),
-            Error::DataTooLong(n) => {
-                write!(
-                    f,
-                    "subnegotiation data of {n} bytes, more than {MAX_SUBNEGOTIATION}"
-                )
-            }
-            Error::Incomplete => f.write_str("incomplete Telnet event"),
-            Error::Trailing => f.write_str("bytes after Telnet event"),
-            Error::TooLong => f.write_str("Telnet event exceeds its wire limit"),
-            Error::UnexpectedEvent => f.write_str("expected a Telnet subnegotiation"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Allocation => f.write_str("Telnet output allocation failed"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::UnknownCommand(b) => write!(f, "IAC followed by {b}, which is no command"),
+    Error::StraySubnegotiationEnd => f.write_str("IAC SE with no subnegotiation open"),
+    Error::SubnegotiationTooLong { option } => {
+        write!(
+            f,
+            "subnegotiation for option {option} longer than {MAX_SUBNEGOTIATION} bytes"
+        )
     }
-}
-
-impl std::error::Error for Error {}
+    Error::SubnegotiationInterrupted { option } => {
+        write!(
+            f,
+            "subnegotiation for option {option} cut off by another command"
+        )
+    }
+    Error::Truncated => f.write_str("stream ended inside a command"),
+    Error::Empty => f.write_str("terminal type subnegotiation with no data"),
+    Error::UnknownCode(c) => write!(f, "terminal type code {c}, not IS or SEND"),
+    Error::TrailingAfterSend => f.write_str("bytes after terminal type SEND"),
+    Error::NameLength(n) => {
+        write!(
+            f,
+            "terminal type name of {n} bytes, outside 1..={MAX_TERMINAL_TYPE}"
+        )
+    }
+    Error::NameByte(b) => write!(f, "byte {b} in a terminal type name"),
+    Error::WindowSizeLength(n) => write!(f, "window size of {n} bytes, not 4"),
+    Error::DataTooLong(n) => {
+        write!(
+            f,
+            "subnegotiation data of {n} bytes, more than {MAX_SUBNEGOTIATION}"
+        )
+    }
+    Error::Incomplete => f.write_str("incomplete Telnet event"),
+    Error::Trailing => f.write_str("bytes after Telnet event"),
+    Error::TooLong => f.write_str("Telnet event exceeds its wire limit"),
+    Error::UnexpectedEvent => f.write_str("expected a Telnet subnegotiation"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Allocation => f.write_str("Telnet output allocation failed"),
+});
 
 /// A subnegotiation this module reads and writes.
 #[derive(Clone, Debug, PartialEq, Eq)]

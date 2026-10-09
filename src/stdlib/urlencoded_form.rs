@@ -80,20 +80,14 @@ pub enum Error {
     Trailing,
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::TooLong => write!(f, "form is longer than {MAX_INPUT} bytes"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::TooManyPairs => write!(f, "form has more than {MAX_PAIRS} pairs"),
-            Error::NonAscii => f.write_str("encoded component contains non-ASCII bytes"),
-            Error::Empty => f.write_str("no form field"),
-            Error::Trailing => f.write_str("separator in an exact form field"),
-        }
-    }
-}
-
-impl core::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::TooLong => write!(f, "form is longer than {MAX_INPUT} bytes"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::TooManyPairs => write!(f, "form has more than {MAX_PAIRS} pairs"),
+    Error::NonAscii => f.write_str("encoded component contains non-ASCII bytes"),
+    Error::Empty => f.write_str("no form field"),
+    Error::Trailing => f.write_str("separator in an exact form field"),
+});
 
 fn parse(input: &[u8]) -> Result<Vec<(String, String)>, Error> {
     if input.len() > MAX_INPUT {

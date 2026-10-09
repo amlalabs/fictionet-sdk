@@ -80,7 +80,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{Decode, Reader, Step, Truncated, Wire};
 
 /// The TCP port MySQL servers listen on.
@@ -468,34 +467,20 @@ impl Wire for Packet {
     }
 }
 
-/// Reads individual MySQL packets without holding input bytes.
-///
-/// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
-/// by [`HEADER_LEN`] plus [`limit`](fictionet::stdlib::codec::Frames::limit). Oversized payloads are
-/// refused from the header. Partial packets return [`Step::Need`], including
-/// at EOF, so the stream reports truncation. Sequence IDs are preserved;
-/// message assembly and sequence checks remain in [`Messages`].
-impl Prefixed for Packet {
-    type Item = Packet;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "MySQL";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_PACKET_PAYLOAD
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_PACKET_PAYLOAD)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        HEADER_LEN.saturating_add(limit)
-    }
+fictionet::prefixed! {
+    /// Reads individual MySQL packets without holding input bytes.
+    ///
+    /// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
+    /// by [`HEADER_LEN`] plus [`limit`](fictionet::stdlib::codec::Frames::limit). Oversized payloads are
+    /// refused from the header. Partial packets return [`Step::Need`], including
+    /// at EOF, so the stream reports truncation. Sequence IDs are preserved;
+    /// message assembly and sequence checks remain in [`Messages`].
+    Packet => (Packet, Error, usize);
+    name = "MySQL";
+    default { MAX_PACKET_PAYLOAD }
+    normalize(limit) { limit.min(MAX_PACKET_PAYLOAD) }
+    capacity(limit) { let limit = *limit;
+        HEADER_LEN.saturating_add(limit) }
 
     #[inline]
     fn parse_prefix(
@@ -567,33 +552,27 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Truncated => {
-                f.write_str("input ended before a complete packet, or inside a field")
-            }
-            Error::Incomplete => f.write_str("incomplete split MySQL message"),
-            Error::Sequence { expected, got } => {
-                write!(f, "sequence ID {got}, expected {expected}")
-            }
-            Error::TooLong(n) => write!(f, "message of at least {n} bytes is over the limit"),
-            Error::Header(b) => write!(f, "unexpected first byte {b:#04x}"),
-            Error::LengthPrefix(b) => write!(f, "{b:#04x} does not start a length here"),
-            Error::Version(v) => write!(f, "handshake protocol version {v}, not 10"),
-            Error::FixedFields(n) => write!(f, "column fixed fields length {n}, not 12"),
-            Error::TooMany => f.write_str("too many columns or attributes"),
-            Error::Unsupported => f.write_str("packet layout not supported"),
-            Error::Trailing => f.write_str("bytes after the last field or packet"),
-            Error::Finished => f.write_str("packet after the last result ended"),
-            Error::Length(n) => write!(f, "length {n} does not fit the field"),
-            Error::Value(v) => write!(f, "value {v} is not allowed in this field"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Truncated => {
+        f.write_str("input ended before a complete packet, or inside a field")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Incomplete => f.write_str("incomplete split MySQL message"),
+    Error::Sequence { expected, got } => {
+        write!(f, "sequence ID {got}, expected {expected}")
+    }
+    Error::TooLong(n) => write!(f, "message of at least {n} bytes is over the limit"),
+    Error::Header(b) => write!(f, "unexpected first byte {b:#04x}"),
+    Error::LengthPrefix(b) => write!(f, "{b:#04x} does not start a length here"),
+    Error::Version(v) => write!(f, "handshake protocol version {v}, not 10"),
+    Error::FixedFields(n) => write!(f, "column fixed fields length {n}, not 12"),
+    Error::TooMany => f.write_str("too many columns or attributes"),
+    Error::Unsupported => f.write_str("packet layout not supported"),
+    Error::Trailing => f.write_str("bytes after the last field or packet"),
+    Error::Finished => f.write_str("packet after the last result ended"),
+    Error::Length(n) => write!(f, "length {n} does not fit the field"),
+    Error::Value(v) => write!(f, "value {v} is not allowed in this field"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+});
 
 /// One message: the payload of a packet, or of several packets put back
 /// together, and the sequence ID of its first packet.
@@ -2299,12 +2278,7 @@ impl OkPacket {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]

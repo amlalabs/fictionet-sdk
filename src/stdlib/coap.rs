@@ -20,8 +20,7 @@
 //! [`Frame`]s back. Which resources exist, and what they hold, is up to
 //! world code.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A datagram that breaks the message format is an [`Error`]; a
+//! A datagram that breaks the message format is an [`Error`]; a
 //! real device answers a confirmable one with a Reset (see
 //! [`peek_header`]) and drops the rest. Options are read as bytes and
 //! checked against the registry only when asked, with
@@ -59,7 +58,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::ascii::{self, hex_upper};
 
@@ -951,37 +949,31 @@ impl Error {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Truncated => f.write_str("message ends early"),
-            Error::Version(v) => write!(f, "version {v}, not 1"),
-            Error::TokenLength(n) => write!(f, "token length {n}, over 8"),
-            Error::EmptyWithContent => {
-                f.write_str("empty message (0.00) with a token or more bytes")
-            }
-            Error::TypeAndCode(t, c) => write!(f, "a {t:?} message may not carry code {c}"),
-            Error::ReservedNibble => f.write_str("option delta or length 15"),
-            Error::OptionNumber => f.write_str("option number past 65535"),
-            Error::OptionTooLong(n) => {
-                write!(f, "option value of {n} bytes, over {MAX_OPTION_VALUE}")
-            }
-            Error::TooManyOptions => write!(f, "more than {MAX_OPTIONS} options"),
-            Error::EmptyPayload => f.write_str("payload marker with no payload"),
-            Error::TooLong(n) => write!(f, "{n} bytes, over the limit"),
-            Error::Trailing => f.write_str("bytes after the CoAP frame"),
-            Error::Unwritable => f.write_str("CoAP value cannot be written without changing it"),
-            Error::OutOfOrder { expected, got } => {
-                write!(f, "block at offset {got}, expected {expected}")
-            }
-            Error::BlockSize => f.write_str("block payload is the wrong size"),
-            Error::BodyTooLarge => f.write_str("body too large"),
-            Error::AfterLastBlock => f.write_str("the last block has already come"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Truncated => f.write_str("message ends early"),
+    Error::Version(v) => write!(f, "version {v}, not 1"),
+    Error::TokenLength(n) => write!(f, "token length {n}, over 8"),
+    Error::EmptyWithContent => {
+        f.write_str("empty message (0.00) with a token or more bytes")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::TypeAndCode(t, c) => write!(f, "a {t:?} message may not carry code {c}"),
+    Error::ReservedNibble => f.write_str("option delta or length 15"),
+    Error::OptionNumber => f.write_str("option number past 65535"),
+    Error::OptionTooLong(n) => {
+        write!(f, "option value of {n} bytes, over {MAX_OPTION_VALUE}")
+    }
+    Error::TooManyOptions => write!(f, "more than {MAX_OPTIONS} options"),
+    Error::EmptyPayload => f.write_str("payload marker with no payload"),
+    Error::TooLong(n) => write!(f, "{n} bytes, over the limit"),
+    Error::Trailing => f.write_str("bytes after the CoAP frame"),
+    Error::Unwritable => f.write_str("CoAP value cannot be written without changing it"),
+    Error::OutOfOrder { expected, got } => {
+        write!(f, "block at offset {got}, expected {expected}")
+    }
+    Error::BlockSize => f.write_str("block payload is the wrong size"),
+    Error::BodyTooLarge => f.write_str("body too large"),
+    Error::AfterLastBlock => f.write_str("the last block has already come"),
+});
 
 /// One CoAP message over UDP.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1317,40 +1309,33 @@ impl Wire for Frame {
     }
 }
 
-/// Reads CoAP over TCP frames without retaining input bytes.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`] for at most [`MAX_BUFFERED`] unread
-/// bytes. Header and body errors end the stream.
-/// Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The driver
-/// reports truncation. UDP datagrams use [`Wire`] on [`Message`] directly.
-///
-/// ```
-/// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::coap::Frame;
-/// use fictionet::stdlib::codec::{Stream, Wire};
-///
-/// let frame = Frame::csm(4096, true);
-/// let bytes = Wire::to_bytes(&frame)?;
-/// let mut stream = Stream::new(Frames::<Frame>::new());
-/// assert_eq!(stream.push(&bytes), bytes.len());
-/// assert_eq!(stream.next(), Some(Ok(frame)));
-/// stream.end();
-/// assert_eq!(stream.next(), None);
-/// # Ok::<(), fictionet::stdlib::coap::Error>(())
-/// ```
-impl Prefixed for Frame {
-    type Item = Frame;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "CoAP over TCP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_BUFFERED
-    }
+fictionet::prefixed! {
+    /// Reads CoAP over TCP frames without retaining input bytes.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`] for at most [`MAX_BUFFERED`] unread
+    /// bytes. Header and body errors end the stream.
+    /// Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The driver
+    /// reports truncation. UDP datagrams use [`Wire`] on [`Message`] directly.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::Frames;
+    /// use fictionet::stdlib::coap::Frame;
+    /// use fictionet::stdlib::codec::{Stream, Wire};
+    ///
+    /// let frame = Frame::csm(4096, true);
+    /// let bytes = Wire::to_bytes(&frame)?;
+    /// let mut stream = Stream::new(Frames::<Frame>::new());
+    /// assert_eq!(stream.push(&bytes), bytes.len());
+    /// assert_eq!(stream.next(), Some(Ok(frame)));
+    /// stream.end();
+    /// assert_eq!(stream.next(), None);
+    /// # Ok::<(), fictionet::stdlib::coap::Error>(())
+    /// ```
+    Frame => (Frame, Error, ());
+    name = "CoAP over TCP";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_BUFFERED }
 
     #[inline]
     fn parse_prefix(
@@ -1622,13 +1607,13 @@ fn read_ext(b: &[u8], i: &mut usize, nibble: u8) -> Result<u32, Error> {
 }
 
 /// The 4-bit field and extended bytes for an option delta or length.
-fn ext(v: usize) -> (u8, Vec<u8>) {
+fn ext(v: usize) -> (u8, [u8; 2], usize) {
     if v < 13 {
-        (v as u8, Vec::new())
+        (v as u8, [0; 2], 0)
     } else if v < 269 {
-        (13, vec![(v - 13) as u8])
+        (13, [(v - 13) as u8, 0], 1)
     } else {
-        (14, ((v - 269) as u16).to_be_bytes().to_vec())
+        (14, ((v - 269) as u16).to_be_bytes(), 2)
     }
 }
 
@@ -1648,16 +1633,16 @@ fn write_body(
             return Err(Error::Unwritable);
         }
         let delta = o.number.checked_sub(prev).ok_or(Error::Unwritable)?;
-        let (dn, dx) = ext(usize::from(delta));
-        let (ln, lx) = ext(o.value.len());
-        let size = 1 + dx.len() + lx.len() + o.value.len();
+        let (dn, dx, dx_len) = ext(usize::from(delta));
+        let (ln, lx, lx_len) = ext(o.value.len());
+        let size = 1 + dx_len + lx_len + o.value.len();
         used = used
             .checked_add(size)
             .filter(|&n| n <= budget)
             .ok_or(Error::Unwritable)?;
         out.push(dn << 4 | ln);
-        out.extend_from_slice(&dx);
-        out.extend_from_slice(&lx);
+        out.extend_from_slice(&dx[..dx_len]);
+        out.extend_from_slice(&lx[..lx_len]);
         out.extend_from_slice(&o.value);
         prev = o.number;
     }

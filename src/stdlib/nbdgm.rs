@@ -36,8 +36,7 @@
 //! The service runs over UDP, one packet per datagram, so there is no
 //! stream decoder.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Writers refuse oversized or invalid values without changing the destination.
+//! Writers refuse oversized or invalid values without changing the destination.
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
@@ -73,9 +72,7 @@
 //! ```
 
 use fictionet::stdlib::codec::{Wire, be16};
-use fictionet::stdlib::nbns::{
-    ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level, encode_first_level,
-};
+use fictionet::stdlib::nbns::{ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level};
 
 use std::net::Ipv4Addr;
 
@@ -475,26 +472,20 @@ pub enum Error {
     Trailing(usize),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Truncated => f.write_str("packet ends early"),
-            Error::TooLong(n) => write!(f, "packet of {n} bytes, over {MAX_PACKET}"),
-            Error::MsgType(t) => write!(f, "unknown message type {t:#04x}"),
-            Error::Length { field, actual } => {
-                write!(
-                    f,
-                    "length field {field}, but {actual} bytes follow the offset"
-                )
-            }
-            Error::Name => f.write_str("malformed NetBIOS name"),
-            Error::Trailing(n) => write!(f, "{n} bytes after the end of the packet"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Truncated => f.write_str("packet ends early"),
+    Error::TooLong(n) => write!(f, "packet of {n} bytes, over {MAX_PACKET}"),
+    Error::MsgType(t) => write!(f, "unknown message type {t:#04x}"),
+    Error::Length { field, actual } => {
+        write!(
+            f,
+            "length field {field}, but {actual} bytes follow the offset"
+        )
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Name => f.write_str("malformed NetBIOS name"),
+    Error::Trailing(n) => write!(f, "{n} bytes after the end of the packet"),
+});
 
 impl Packet {
     /// A datagram sent whole, from a B node.
@@ -745,27 +736,8 @@ impl Wire for Name {
     /// Appends the uncompressed name. Refuses empty or oversized scope labels and
     /// names above [`MAX_NAME_LEN`]. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        let mut out = Vec::with_capacity(ENCODED_LEN + 2);
-        out.push(ENCODED_LEN as u8);
-        out.extend_from_slice(&encode_first_level(&self.bytes));
-        for label in &self.scope {
-            if label.len() > MAX_LABEL {
-                return Err(Error::Unwritable);
-            }
-            if label.is_empty() {
-                return Err(Error::Unwritable);
-            }
-            // The label, its length byte, and the final zero must fit.
-            if out.len() + 1 + label.len() + 1 > MAX_NAME_LEN {
-                return Err(Error::Unwritable);
-            }
-            out.push(label.len() as u8);
-            out.extend_from_slice(label);
-        }
-        out.push(0);
-
-        dst.extend_from_slice(&out);
-        Ok(())
+        fictionet::stdlib::nbns::write_name(dst, &self.bytes, &self.scope)
+            .map_err(|_| Error::Unwritable)
     }
 }
 

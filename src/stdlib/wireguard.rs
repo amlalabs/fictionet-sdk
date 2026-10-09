@@ -234,24 +234,18 @@ pub enum Error {
     },
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Short(n) => write!(f, "{n} bytes, too short for a message type"),
-            Error::Type(t) => write!(f, "message type {t}, not 1 to 4"),
-            Error::Unexpected { want, found } => {
-                write!(f, "message type {found}, not the type {want} wanted here")
-            }
-            Error::Reserved(r) => write!(f, "reserved bytes {r:?}, not all 0"),
-            Error::Length { kind, len } => {
-                write!(f, "{len} bytes, the wrong length for message type {kind}")
-            }
-        }
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Short(n) => write!(f, "{n} bytes, too short for a message type"),
+    Error::Type(t) => write!(f, "message type {t}, not 1 to 4"),
+    Error::Unexpected { want, found } => {
+        write!(f, "message type {found}, not the type {want} wanted here")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Reserved(r) => write!(f, "reserved bytes {r:?}, not all 0"),
+    Error::Length { kind, len } => {
+        write!(f, "{len} bytes, the wrong length for message type {kind}")
+    }
+});
 
 impl Message {
     /// The message's type byte.

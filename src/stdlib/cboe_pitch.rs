@@ -86,7 +86,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::field;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -161,59 +160,26 @@ pub enum Error {
     /// The book holds orders for [`BookConfig::max_symbols`] symbols.
     TooManySymbols,
 }
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Length => f.write_str("PITCH length is wrong"),
-            Error::Type(t) => write!(f, "unexpected PITCH message type {t:#04x}"),
-            Error::Field => f.write_str("PITCH alphanumeric field is invalid"),
-            Error::Side(s) => write!(f, "invalid PITCH side indicator {s:#04x}"),
-            Error::Count => f.write_str("PITCH message count is wrong"),
-            Error::Price => f.write_str("PITCH price is invalid"),
-            Error::TooLong => f.write_str("PITCH unit is too long"),
-            Error::Config => f.write_str("PITCH book configuration is out of range"),
-            Error::UnknownOrder(id) => write!(f, "PITCH order {id} is not on the book"),
-            Error::DuplicateOrder(id) => write!(f, "PITCH order {id} is already on the book"),
-            Error::Shares(id) => write!(f, "PITCH order {id} share count is invalid"),
-            Error::Unit(id) => write!(f, "PITCH order {id} belongs to another unit"),
-            Error::TooManyOrders => f.write_str("PITCH book order limit reached"),
-            Error::TooManyLevels => f.write_str("PITCH book price level limit reached"),
-            Error::TooManySymbols => f.write_str("PITCH book symbol limit reached"),
-        }
-    }
-}
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Length => f.write_str("PITCH length is wrong"),
+    Error::Type(t) => write!(f, "unexpected PITCH message type {t:#04x}"),
+    Error::Field => f.write_str("PITCH alphanumeric field is invalid"),
+    Error::Side(s) => write!(f, "invalid PITCH side indicator {s:#04x}"),
+    Error::Count => f.write_str("PITCH message count is wrong"),
+    Error::Price => f.write_str("PITCH price is invalid"),
+    Error::TooLong => f.write_str("PITCH unit is too long"),
+    Error::Config => f.write_str("PITCH book configuration is out of range"),
+    Error::UnknownOrder(id) => write!(f, "PITCH order {id} is not on the book"),
+    Error::DuplicateOrder(id) => write!(f, "PITCH order {id} is already on the book"),
+    Error::Shares(id) => write!(f, "PITCH order {id} share count is invalid"),
+    Error::Unit(id) => write!(f, "PITCH order {id} belongs to another unit"),
+    Error::TooManyOrders => f.write_str("PITCH book order limit reached"),
+    Error::TooManyLevels => f.write_str("PITCH book price level limit reached"),
+    Error::TooManySymbols => f.write_str("PITCH book symbol limit reached"),
+});
 
-/// One fixed-width field: its size, and how it reads and writes.
-trait Field: Sized {
-    const LEN: usize;
-    /// Reads exactly `LEN` bytes.
-    fn get(b: &[u8]) -> Result<Self, Error>;
-    fn put(&self, out: &mut Vec<u8>);
-}
-/// Reads the next field from `b` and moves past it.
-fn take<T: Field>(b: &mut &[u8]) -> Result<T, Error> {
-    let (head, rest) = b.split_at_checked(T::LEN).ok_or(Error::Length)?;
-    *b = rest;
-    T::get(head)
-}
-fn array<const N: usize>(b: &[u8]) -> Result<[u8; N], Error> {
-    b.try_into().map_err(|_| Error::Length)
-}
-macro_rules! int_field {
-    ($($t:ty),*) => {$(
-        impl Field for $t {
-            const LEN: usize = size_of::<$t>();
-            fn get(b: &[u8]) -> Result<Self, Error> {
-                Ok(<$t>::from_le_bytes(array(b)?))
-            }
-            fn put(&self, out: &mut Vec<u8>) {
-                out.extend_from_slice(&self.to_le_bytes());
-            }
-        }
-    )*};
-}
-int_field!(u8, u16, u32, u64);
+fictionet::fixed_fields!(Field, take, array; Error, Error::Length;
+    from_le_bytes, to_le_bytes; u8, u16, u32, u64);
 
 /// A Binary Long Price: eight bytes with four implied decimal places. The
 /// raw value 9050 is $0.9050 ("Data Types").
@@ -1238,48 +1204,34 @@ pub fn sequence_distance(from: u32, to: u32) -> u32 {
     u32::try_from(d).unwrap_or(0)
 }
 
-/// Reads units from a GRP or Spin Server TCP connection, where blocks may
-/// cross segments ("Message Format"). Each item is one unit, parsed: `Err`
-/// for a block that frames by its Hdr Length but does not parse. A Hdr
-/// Length below the header or over the limit ends the stream, read from
-/// the header alone.
-///
-/// ```
-/// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::cboe_pitch::{Control, LoginResponse, Unit};
-/// use fictionet::stdlib::codec::{finish, pump, Stream, Wire};
-///
-/// let response = Control::from(LoginResponse { status: b'A', extra: Vec::new() });
-/// let bytes = Unit::control(&response)?.to_bytes()?;
-/// let mut stream = Stream::new(Frames::<Unit>::default());
-/// let mut units = Vec::new();
-/// pump(&mut stream, &bytes[..5], |u| units.push(u))?;
-/// pump(&mut stream, &bytes[5..], |u| units.push(u))?;
-/// finish(&mut stream, |u| units.push(u))?;
-/// let unit = units.remove(0)?;
-/// assert_eq!(Control::parse(&unit.messages[0])?, response);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-impl Prefixed for Unit {
-    type Item = Result<Unit, Error>;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "PITCH";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_UNIT_LENGTH
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.clamp(HEADER_LENGTH, MAX_UNIT_LENGTH)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        *limit
-    }
+fictionet::prefixed! {
+    /// Reads units from a GRP or Spin Server TCP connection, where blocks may
+    /// cross segments ("Message Format"). Each item is one unit, parsed: `Err`
+    /// for a block that frames by its Hdr Length but does not parse. A Hdr
+    /// Length below the header or over the limit ends the stream, read from
+    /// the header alone.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::Frames;
+    /// use fictionet::stdlib::cboe_pitch::{Control, LoginResponse, Unit};
+    /// use fictionet::stdlib::codec::{finish, pump, Stream, Wire};
+    ///
+    /// let response = Control::from(LoginResponse { status: b'A', extra: Vec::new() });
+    /// let bytes = Unit::control(&response)?.to_bytes()?;
+    /// let mut stream = Stream::new(Frames::<Unit>::default());
+    /// let mut units = Vec::new();
+    /// pump(&mut stream, &bytes[..5], |u| units.push(u))?;
+    /// pump(&mut stream, &bytes[5..], |u| units.push(u))?;
+    /// finish(&mut stream, |u| units.push(u))?;
+    /// let unit = units.remove(0)?;
+    /// assert_eq!(Control::parse(&unit.messages[0])?, response);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    Unit => (Result<Unit, Error>, Error, usize);
+    name = "PITCH";
+    default { MAX_UNIT_LENGTH }
+    normalize(limit) { limit.clamp(HEADER_LENGTH, MAX_UNIT_LENGTH) }
+    capacity(limit) { *limit }
 
     #[inline]
     fn parse_prefix(

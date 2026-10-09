@@ -28,8 +28,7 @@
 //! [`Stream<MagicPackets>`](fictionet::stdlib::codec::Stream) for a payload ending at EOF,
 //! and writes packets with [`MagicPacket::write`].
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A payload longer than [`MAX_PAYLOAD`] is refused. What the
+//! A payload longer than [`MAX_PAYLOAD`] is refused. What the
 //! writer produces, the reader reads back the same.
 //!
 //! ```
@@ -149,18 +148,12 @@ pub enum Error {
     SyncOrAddress,
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::TooLong => write!(f, "payload longer than {MAX_PAYLOAD} bytes"),
-            Error::NotFound => write!(f, "no magic packet in the payload"),
-            Error::Length => f.write_str("magic packet length must be 102, 106, or 108 bytes"),
-            Error::SyncOrAddress => f.write_str("invalid magic packet sync or address repeats"),
-        }
-    }
-}
-
-impl core::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::TooLong => write!(f, "payload longer than {MAX_PAYLOAD} bytes"),
+    Error::NotFound => write!(f, "no magic packet in the payload"),
+    Error::Length => f.write_str("magic packet length must be 102, 106, or 108 bytes"),
+    Error::SyncOrAddress => f.write_str("invalid magic packet sync or address repeats"),
+});
 
 /// The address of the magic packet that starts at `bytes[0]`, if one does.
 /// The packet must be whole: `bytes` holds at least [`PACKET_LEN`] bytes.

@@ -358,29 +358,23 @@ pub enum Error {
     Unwritable,
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::UnknownType(c) => write!(f, "unknown type byte '{}'", c.escape_ascii()),
-            Error::BadLineEnd => f.write_str("a line ends with a lone CR or LF"),
-            Error::LineTooLong => f.write_str("too big inline request"),
-            Error::BadLength => f.write_str("invalid length"),
-            Error::BulkTooLong => f.write_str("invalid bulk length"),
-            Error::TooManyElements => f.write_str("invalid multibulk length"),
-            Error::TooDeep => f.write_str("values nested too deep"),
-            Error::MissingCrlf => f.write_str("bulk data not followed by CRLF"),
-            Error::ValueSyntax(c) => write!(f, "malformed value of type '{}'", c.escape_ascii()),
-            Error::ExpectedBulk(c) => write!(f, "expected '$', got '{}'", c.escape_ascii()),
-            Error::UnbalancedQuotes => f.write_str("unbalanced quotes in request"),
-            Error::FrameTooLarge => f.write_str("value too large"),
-            Error::Incomplete => f.write_str("incomplete RESP frame"),
-            Error::Trailing => f.write_str("bytes follow the RESP frame"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-        }
-    }
-}
-
-impl core::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::UnknownType(c) => write!(f, "unknown type byte '{}'", c.escape_ascii()),
+    Error::BadLineEnd => f.write_str("a line ends with a lone CR or LF"),
+    Error::LineTooLong => f.write_str("too big inline request"),
+    Error::BadLength => f.write_str("invalid length"),
+    Error::BulkTooLong => f.write_str("invalid bulk length"),
+    Error::TooManyElements => f.write_str("invalid multibulk length"),
+    Error::TooDeep => f.write_str("values nested too deep"),
+    Error::MissingCrlf => f.write_str("bulk data not followed by CRLF"),
+    Error::ValueSyntax(c) => write!(f, "malformed value of type '{}'", c.escape_ascii()),
+    Error::ExpectedBulk(c) => write!(f, "expected '$', got '{}'", c.escape_ascii()),
+    Error::UnbalancedQuotes => f.write_str("unbalanced quotes in request"),
+    Error::FrameTooLarge => f.write_str("value too large"),
+    Error::Incomplete => f.write_str("incomplete RESP frame"),
+    Error::Trailing => f.write_str("bytes follow the RESP frame"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+});
 
 impl Error {
     /// The error reply a Redis server sends before it closes the

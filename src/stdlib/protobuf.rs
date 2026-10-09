@@ -55,7 +55,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 extern crate alloc;
 
 use alloc::vec::Vec;
@@ -127,27 +126,21 @@ pub enum Error {
     },
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::Truncated => write!(f, "protobuf: the bytes end inside a field"),
-            Error::VarintOverflow => write!(f, "protobuf: a varint is longer than 64 bits"),
-            Error::FieldNumber(n) => write!(f, "protobuf: field number {n} is out of range"),
-            Error::WireType(t) => write!(f, "protobuf: wire type {t} does not exist"),
-            Error::EndGroup(n) => write!(f, "protobuf: end of group {n}, which is not open"),
-            Error::UnclosedGroup(n) => write!(f, "protobuf: group {n} is never closed"),
-            Error::TooLong => write!(f, "protobuf: longer than {MAX_MESSAGE} bytes"),
-            Error::TooManyFields => write!(f, "protobuf: more than {MAX_FIELDS} fields"),
-            Error::TooDeep => write!(f, "protobuf: groups nest deeper than {MAX_DEPTH}"),
-            Error::Utf8 => write!(f, "protobuf: a string is not UTF-8"),
-            Error::Trailing { remaining } => {
-                write!(f, "protobuf: trailing bytes after the value: {remaining}")
-            }
-        }
+fictionet::error_display!(Error, f, {
+    Error::Truncated => write!(f, "protobuf: the bytes end inside a field"),
+    Error::VarintOverflow => write!(f, "protobuf: a varint is longer than 64 bits"),
+    Error::FieldNumber(n) => write!(f, "protobuf: field number {n} is out of range"),
+    Error::WireType(t) => write!(f, "protobuf: wire type {t} does not exist"),
+    Error::EndGroup(n) => write!(f, "protobuf: end of group {n}, which is not open"),
+    Error::UnclosedGroup(n) => write!(f, "protobuf: group {n} is never closed"),
+    Error::TooLong => write!(f, "protobuf: longer than {MAX_MESSAGE} bytes"),
+    Error::TooManyFields => write!(f, "protobuf: more than {MAX_FIELDS} fields"),
+    Error::TooDeep => write!(f, "protobuf: groups nest deeper than {MAX_DEPTH}"),
+    Error::Utf8 => write!(f, "protobuf: a string is not UTF-8"),
+    Error::Trailing { remaining } => {
+        write!(f, "protobuf: trailing bytes after the value: {remaining}")
     }
-}
-
-impl core::error::Error for Error {}
+});
 
 /// Reads the varint at the start of `b`. It returns the value and how many
 /// bytes it took. Varints may carry extra zero groups (an overlong
@@ -287,7 +280,7 @@ impl Message {
     }
 
     /// Every value with field number `number`, in order.
-    pub fn all(&self, number: u32) -> impl Iterator<Item = &Value> {
+    pub fn all(&self, number: u32) -> impl DoubleEndedIterator<Item = &Value> {
         self.fields
             .iter()
             .filter(move |f| f.number == number)
@@ -307,15 +300,10 @@ impl Message {
     /// The last varint with field number `number`, as a `uint64`. Values
     /// of other wire types are skipped.
     pub fn uint64(&self, number: u32) -> Option<u64> {
-        self.all(number)
-            .filter_map(|v| {
-                if let Value::Varint(x) = v {
-                    Some(*x)
-                } else {
-                    None
-                }
-            })
-            .last()
+        self.all(number).rev().find_map(|v| match v {
+            Value::Varint(x) => Some(*x),
+            _ => None,
+        })
     }
 
     /// The field as an `int64`.
@@ -350,15 +338,10 @@ impl Message {
 
     /// The last four-byte value with field number `number`, as a `fixed32`.
     pub fn fixed32(&self, number: u32) -> Option<u32> {
-        self.all(number)
-            .filter_map(|v| {
-                if let Value::Fixed32(x) = v {
-                    Some(*x)
-                } else {
-                    None
-                }
-            })
-            .last()
+        self.all(number).rev().find_map(|v| match v {
+            Value::Fixed32(x) => Some(*x),
+            _ => None,
+        })
     }
 
     /// The field as a `sfixed32`.
@@ -374,15 +357,10 @@ impl Message {
     /// The last eight-byte value with field number `number`, as a
     /// `fixed64`.
     pub fn fixed64(&self, number: u32) -> Option<u64> {
-        self.all(number)
-            .filter_map(|v| {
-                if let Value::Fixed64(x) = v {
-                    Some(*x)
-                } else {
-                    None
-                }
-            })
-            .last()
+        self.all(number).rev().find_map(|v| match v {
+            Value::Fixed64(x) => Some(*x),
+            _ => None,
+        })
     }
 
     /// The field as a `sfixed64`.
@@ -398,15 +376,10 @@ impl Message {
     /// The last length-delimited value with field number `number`, as
     /// `bytes`.
     pub fn bytes(&self, number: u32) -> Option<&[u8]> {
-        self.all(number)
-            .filter_map(|v| {
-                if let Value::Bytes(b) = v {
-                    Some(&b[..])
-                } else {
-                    None
-                }
-            })
-            .last()
+        self.all(number).rev().find_map(|v| match v {
+            Value::Bytes(b) => Some(&b[..]),
+            _ => None,
+        })
     }
 
     /// The field as a `string`: the last occurrence wins. It fails if the
@@ -943,38 +916,31 @@ impl Wire for Message {
     }
 }
 
-/// Reads varint-delimited frames without retaining input bytes.
-///
-/// Malformed lengths and bodies over [`MAX_MESSAGE`] end the stream.
-/// Incomplete frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
-/// Map items through [`Message::parse`] to handle payload errors per item.
-/// Drive this decoder with [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream).
-///
-/// ```
-/// use fictionet::stdlib::codec::{Frames, Stream, finish, pump};
-/// use fictionet::stdlib::protobuf::Frame;
-///
-/// let mut stream = Stream::new(Frames::<Frame>::new());
-/// let mut frames = Vec::new();
-/// pump(&mut stream, &[2, 0x08], |frame| frames.push(frame))?;
-/// pump(&mut stream, &[1], |frame| frames.push(frame))?;
-/// finish(&mut stream, |frame| frames.push(frame))?;
-/// assert_eq!(frames, vec![Frame { data: vec![0x08, 1] }]);
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protobuf::Error>>(())
-/// ```
-impl Prefixed for Frame {
-    type Item = Frame;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "Protobuf";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_VARINT_LEN.saturating_add(MAX_MESSAGE)
-    }
+fictionet::prefixed! {
+    /// Reads varint-delimited frames without retaining input bytes.
+    ///
+    /// Malformed lengths and bodies over [`MAX_MESSAGE`] end the stream.
+    /// Incomplete frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
+    /// Map items through [`Message::parse`] to handle payload errors per item.
+    /// Drive this decoder with [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream).
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::{Frames, Stream, finish, pump};
+    /// use fictionet::stdlib::protobuf::Frame;
+    ///
+    /// let mut stream = Stream::new(Frames::<Frame>::new());
+    /// let mut frames = Vec::new();
+    /// pump(&mut stream, &[2, 0x08], |frame| frames.push(frame))?;
+    /// pump(&mut stream, &[1], |frame| frames.push(frame))?;
+    /// finish(&mut stream, |frame| frames.push(frame))?;
+    /// assert_eq!(frames, vec![Frame { data: vec![0x08, 1] }]);
+    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protobuf::Error>>(())
+    /// ```
+    Frame => (Frame, Error, ());
+    name = "Protobuf";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_VARINT_LEN.saturating_add(MAX_MESSAGE) }
 
     #[inline]
     fn parse_prefix(

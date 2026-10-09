@@ -184,26 +184,20 @@ pub enum Error {
     },
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Short => f.write_str("XDR ended early"),
-            Error::Padding => f.write_str("XDR padding byte not zero"),
-            Error::Bool(n) => write!(f, "XDR boolean {n}, not 0 or 1"),
-            Error::Discriminant(n) => write!(f, "XDR discriminant {n} not known"),
-            Error::TooLong(n) => write!(f, "XDR length or count {n} over the limit"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Utf8 => f.write_str("XDR string not UTF-8"),
-            Error::Trailing(n) => write!(f, "{n} bytes after the XDR value or RPC record"),
-            Error::FieldTooLong { limit } => write!(f, "RPC message field exceeds {limit}"),
-            Error::RecordTooLong(limit) => write!(f, "RPC record over the limit of {limit} bytes"),
-            Error::Allocation => f.write_str("RPC record allocation failed"),
-            Error::Incomplete { held } => write!(f, "incomplete RPC record of {held} bytes"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Short => f.write_str("XDR ended early"),
+    Error::Padding => f.write_str("XDR padding byte not zero"),
+    Error::Bool(n) => write!(f, "XDR boolean {n}, not 0 or 1"),
+    Error::Discriminant(n) => write!(f, "XDR discriminant {n} not known"),
+    Error::TooLong(n) => write!(f, "XDR length or count {n} over the limit"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Utf8 => f.write_str("XDR string not UTF-8"),
+    Error::Trailing(n) => write!(f, "{n} bytes after the XDR value or RPC record"),
+    Error::FieldTooLong { limit } => write!(f, "RPC message field exceeds {limit}"),
+    Error::RecordTooLong(limit) => write!(f, "RPC record over the limit of {limit} bytes"),
+    Error::Allocation => f.write_str("RPC record allocation failed"),
+    Error::Incomplete { held } => write!(f, "incomplete RPC record of {held} bytes"),
+});
 
 /// Reads XDR values from bytes, in order. Each method reads one value and
 /// moves past it. After an error the reader's position is unspecified, so
@@ -1447,12 +1441,7 @@ pub fn encode_fragments(record: &[u8], fragment_len: usize) -> Result<Vec<u8>, E
     Ok(out)
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Short
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Short);
 
 #[cfg(test)]
 mod tests {

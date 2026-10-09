@@ -250,7 +250,7 @@ impl Version {
     }
 }
 
-use fictionet::stdlib::ip::Endpoints;
+use fictionet::stdlib::ip::{self, Endpoints};
 
 /// OSPFv2 authentication, from the header's type and 8-byte field.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -797,53 +797,29 @@ pub enum Error {
     Lls,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Truncated => f.write_str("OSPF packet or LSA cut short"),
-            Error::Trailing { remaining } => {
-                write!(f, "{remaining} bytes after the OSPF packet")
-            }
-            Error::Version(v) => write!(f, "OSPF version {v}, not 2 or 3"),
-            Error::Family => f.write_str("OSPF version does not match the IP family"),
-            Error::Type(t) => write!(f, "OSPF packet type {t}, not 1 to 5"),
-            Error::Length(n) => write!(f, "OSPF packet length {n}, shorter than the header"),
-            Error::Checksum => f.write_str("wrong OSPF packet checksum"),
-            Error::BodyLength => f.write_str("OSPF packet body does not fit its type"),
-            Error::LsaLength(n) => write!(f, "LSA length {n} does not fit"),
-            Error::LsaChecksum => f.write_str("wrong LSA checksum"),
-            Error::LsaCount => f.write_str("LSA count does not match the LSAs sent"),
-            Error::LsaBody => f.write_str("LSA body does not fit its type"),
-            Error::PrefixLength(n) => write!(f, "prefix length {n}, over 128"),
-            Error::TooLong => f.write_str("too long for its length field"),
-            Error::Field => f.write_str("field out of range"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Lls => f.write_str("bad link-local signaling block"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Truncated => f.write_str("OSPF packet or LSA cut short"),
+    Error::Trailing { remaining } => {
+        write!(f, "{remaining} bytes after the OSPF packet")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Version(v) => write!(f, "OSPF version {v}, not 2 or 3"),
+    Error::Family => f.write_str("OSPF version does not match the IP family"),
+    Error::Type(t) => write!(f, "OSPF packet type {t}, not 1 to 5"),
+    Error::Length(n) => write!(f, "OSPF packet length {n}, shorter than the header"),
+    Error::Checksum => f.write_str("wrong OSPF packet checksum"),
+    Error::BodyLength => f.write_str("OSPF packet body does not fit its type"),
+    Error::LsaLength(n) => write!(f, "LSA length {n} does not fit"),
+    Error::LsaChecksum => f.write_str("wrong LSA checksum"),
+    Error::LsaCount => f.write_str("LSA count does not match the LSAs sent"),
+    Error::LsaBody => f.write_str("LSA body does not fit its type"),
+    Error::PrefixLength(n) => write!(f, "prefix length {n}, over 128"),
+    Error::TooLong => f.write_str("too long for its length field"),
+    Error::Field => f.write_str("field out of range"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Lls => f.write_str("bad link-local signaling block"),
+});
 
 // Checksums.
-
-fn sum_words(mut sum: u64, b: &[u8]) -> u64 {
-    let (chunks, rest) = b.as_chunks::<2>();
-    for c in chunks {
-        sum += u64::from(u16::from_be_bytes([c[0], c[1]]));
-    }
-    if let [last] = rest {
-        sum += u64::from(*last) << 8;
-    }
-    sum
-}
-
-fn fold(mut sum: u64) -> u16 {
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    sum as u16
-}
 
 /// The packet checksum the OSPF payload in `b` should carry, worked out
 /// with its checksum field (bytes 12 and 13) taken as zero, over the bytes
@@ -862,25 +838,25 @@ pub fn checksum(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
     if len < hl || len > b.len() {
         return None;
     }
-    let mut sum = sum_words(0, &b[..12]);
+    let mut sum = ip::sum(0, &b[..12]);
     match endpoints {
         Endpoints::V4 { .. } => {
-            sum = sum_words(sum, &b[14..16]);
-            sum = sum_words(sum, &b[HEADER_LEN_V2..len]);
+            sum = ip::sum(sum, &b[14..16]);
+            sum = ip::sum(sum, &b[HEADER_LEN_V2..len]);
         }
         Endpoints::V6 {
             source,
             destination,
         } => {
-            sum = sum_words(sum, &b[14..len]);
-            sum = sum_words(sum, &source.octets());
-            sum = sum_words(sum, &destination.octets());
+            sum = ip::sum(sum, &b[14..len]);
+            sum = ip::sum(sum, &source.octets());
+            sum = ip::sum(sum, &destination.octets());
             // At most MAX_PACKET, so it fits in 32 bits.
-            sum = sum_words(sum, &(len as u32).to_be_bytes());
-            sum = sum_words(sum, &[0, 0, 0, PROTOCOL]);
+            sum = ip::sum(sum, &(len as u32).to_be_bytes());
+            sum = ip::sum(sum, &[0, 0, 0, PROTOCOL]);
         }
     }
-    Some(!fold(sum))
+    Some(ip::fold(sum))
 }
 
 /// Whether two ones' complement checksums are equal: 0x0000 and 0xffff
@@ -1703,7 +1679,7 @@ struct Layout {
 /// The ones' complement checksum of a link-local signaling block, with
 /// its checksum field taken as zero.
 fn lls_checksum(block: &[u8]) -> u16 {
-    !fold(sum_words(0, &block[2..]))
+    ip::fold(ip::sum(0, &block[2..]))
 }
 
 /// Checks a complete payload's header and returns its declared end,
@@ -2264,37 +2240,12 @@ fn ip_version(endpoints: &Endpoints) -> Version {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg};
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::mutate;
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Packet, Error> {
-        use fictionet::stdlib::codec::Decode;
-        let make = || Collect::bytes(MAX_MESSAGE).map(|d| Packet::parse(&d, e));
-        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
-        assert_eq!(
-            fictionet::stdlib::test_support::decode_all(|| Collect::bytes(MAX_MESSAGE), b),
-            if b.len() <= MAX_MESSAGE {
-                (vec![b.to_vec()], None)
-            } else {
-                (
-                    vec![],
-                    Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE })),
-                )
-            }
-        );
-        let parsed = Packet::parse(b, e);
-        let (items, failure) = decode_all(make, b);
-        if b.len() <= MAX_MESSAGE {
-            assert_eq!(failure, None);
-            assert_eq!(items, vec![parsed.clone()]);
-        } else {
-            assert_eq!(
-                failure,
-                Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE }))
-            );
-        }
-        parsed
+        contract::check_collect_with(b, MAX_MESSAGE, |b| Packet::parse(b, e))
     }
 
     fn ip4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {

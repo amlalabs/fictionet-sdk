@@ -78,7 +78,6 @@
 use core::convert::Infallible;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{Wire, le16, le32};
 
 /// The TCP port EtherNet/IP devices listen on.
@@ -298,40 +297,32 @@ impl Wire for Packet {
         if Command::from_code(code) != self.command {
             return Err(Error::Unwritable);
         }
-        let mut out = Vec::with_capacity(HEADER_LEN + self.data.len());
-        out.extend_from_slice(&code.to_le_bytes());
-        out.extend_from_slice(&(self.data.len() as u16).to_le_bytes());
-        out.extend_from_slice(&self.session_handle.to_le_bytes());
-        out.extend_from_slice(&self.status.to_le_bytes());
-        out.extend_from_slice(&self.sender_context);
-        out.extend_from_slice(&self.options.to_le_bytes());
-        out.extend_from_slice(&self.data);
-        dst.extend_from_slice(&out);
+        dst.reserve(HEADER_LEN + self.data.len());
+        dst.extend_from_slice(&code.to_le_bytes());
+        dst.extend_from_slice(&(self.data.len() as u16).to_le_bytes());
+        dst.extend_from_slice(&self.session_handle.to_le_bytes());
+        dst.extend_from_slice(&self.status.to_le_bytes());
+        dst.extend_from_slice(&self.sender_context);
+        dst.extend_from_slice(&self.options.to_le_bytes());
+        dst.extend_from_slice(&self.data);
         Ok(())
     }
 }
 
-/// Reads encapsulation packets without holding input bytes.
-///
-/// Framing accepts every command, option word, and 16-bit data length.
-/// Use [`Packet::check`] to decide whether to act on each packet.
-/// [`Stream::new`](fictionet::stdlib::codec::Stream::new) holds at most [`PACKETS_CAPACITY`]
-/// bytes (65559), including room for lengths above [`MAX_DATA`].
-/// Partial packets return [`fictionet::stdlib::codec::Step::Need`], including at EOF, when the stream
-/// reports truncation.
-impl Prefixed for Packet {
-    type Item = Packet;
-    type Error = Infallible;
-    type Limit = ();
-    const NAME: &'static str = "EtherNet/IP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        PACKETS_CAPACITY
-    }
+fictionet::prefixed! {
+    /// Reads encapsulation packets without holding input bytes.
+    ///
+    /// Framing accepts every command, option word, and 16-bit data length.
+    /// Use [`Packet::check`] to decide whether to act on each packet.
+    /// [`Stream::new`](fictionet::stdlib::codec::Stream::new) holds at most [`PACKETS_CAPACITY`]
+    /// bytes (65559), including room for lengths above [`MAX_DATA`].
+    /// Partial packets return [`fictionet::stdlib::codec::Step::Need`], including at EOF, when the stream
+    /// reports truncation.
+    Packet => (Packet, Infallible, ());
+    name = "EtherNet/IP";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { PACKETS_CAPACITY }
 
     /// Reads a packet prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.
     /// Accepts all header fields and never returns an error. Use
@@ -378,24 +369,18 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Truncated => f.write_str("ran out of bytes"),
-            Error::TooLong => f.write_str("a count or length is past a limit"),
-            Error::Trailing => f.write_str("bytes left over"),
-            Error::UnknownSegment(t) => write!(f, "EPATH segment type {t:#04x} not read"),
-            Error::BadSegment => f.write_str("malformed EPATH segment"),
-            Error::ReplyFlag => f.write_str("service reply bit does not match the message"),
-            Error::Options => f.write_str("encapsulation options are not zero"),
-            Error::Items => f.write_str("send-data items are not an address item and a data item"),
-            Error::OddLength => f.write_str("word-counted bytes are an odd number"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Truncated => f.write_str("ran out of bytes"),
+    Error::TooLong => f.write_str("a count or length is past a limit"),
+    Error::Trailing => f.write_str("bytes left over"),
+    Error::UnknownSegment(t) => write!(f, "EPATH segment type {t:#04x} not read"),
+    Error::BadSegment => f.write_str("malformed EPATH segment"),
+    Error::ReplyFlag => f.write_str("service reply bit does not match the message"),
+    Error::Options => f.write_str("encapsulation options are not zero"),
+    Error::Items => f.write_str("send-data items are not an address item and a data item"),
+    Error::OddLength => f.write_str("word-counted bytes are an odd number"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+});
 
 /// The data of a [`RegisterSession`](Command::RegisterSession) request or
 /// reply.
@@ -1183,33 +1168,21 @@ impl Wire for Cpf {
         if b.len() > MAX_DATA {
             return Err(Error::TooLong);
         }
-        if b.len() < 2 {
-            return Err(Error::Truncated);
-        }
-        let count = usize::from(le16(b, 0).ok_or(Error::Truncated)?);
+        let mut reader = fictionet::stdlib::codec::Reader::new(b);
+        let count = usize::from(reader.u16_le().map_err(|_| Error::Truncated)?);
         if count > MAX_CPF_ITEMS {
             return Err(Error::TooLong);
         }
         let mut items = Vec::with_capacity(count);
-        let mut i = 2;
         for _ in 0..count {
-            if i + 4 > b.len() {
-                return Err(Error::Truncated);
-            }
-            let type_id = le16(b, i).ok_or(Error::Truncated)?;
-            let len = usize::from(le16(b, i + 2).ok_or(Error::Truncated)?);
-            let start = i + 4;
-            let end = start.checked_add(len).ok_or(Error::TooLong)?;
-            if end > b.len() {
-                return Err(Error::Truncated);
-            }
+            let type_id = reader.u16_le().map_err(|_| Error::Truncated)?;
+            let len = usize::from(reader.u16_le().map_err(|_| Error::Truncated)?);
             items.push(CpfItem {
                 type_id,
-                data: b[start..end].to_vec(),
+                data: reader.take(len).map_err(|_| Error::Truncated)?.to_vec(),
             });
-            i = end;
         }
-        if i != b.len() {
+        if !reader.is_empty() {
             return Err(Error::Trailing);
         }
         Ok(Cpf { items })
@@ -1352,11 +1325,10 @@ impl Wire for SendData {
         if cpf.len() > MAX_DATA - 6 {
             return Err(Error::TooLong);
         }
-        let mut out = Vec::with_capacity(6 + cpf.len());
-        out.extend_from_slice(&self.interface_handle.to_le_bytes());
-        out.extend_from_slice(&self.timeout.to_le_bytes());
-        out.extend_from_slice(&cpf);
-        dst.extend_from_slice(&out);
+        dst.reserve(6 + cpf.len());
+        dst.extend_from_slice(&self.interface_handle.to_le_bytes());
+        dst.extend_from_slice(&self.timeout.to_le_bytes());
+        dst.extend_from_slice(&cpf);
         Ok(())
     }
 }

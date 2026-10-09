@@ -39,8 +39,7 @@
 //! numbers, the retransmissions and what the frames carry are up to
 //! world code.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Reserved header bits are written as zero. A reader ignores those
+//! Reserved header bits are written as zero. A reader ignores those
 //! bits. [`ControlMessage::reserved_bits`] reports each received AVP's
 //! reserved bits, and [`Avp::reserved_bits`] those of one AVP, so an
 //! L2TPv2 peer can treat the AVP as unknown (RFC 2661 section 4.1).
@@ -253,31 +252,25 @@ pub enum Error {
     MessageType,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Trailing => f.write_str("bytes after the unit"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Truncated => f.write_str("the bytes end before the header, field or AVP does"),
-            Error::TooLong(n) => write!(
-                f,
-                "{n} bytes, longer than an L2TP datagram or message can be"
-            ),
-            Error::Version(v) => write!(f, "L2TP version {v}, not the one expected"),
-            Error::ControlBits => f.write_str("a control message without L and S, or with O or P"),
-            Error::NotControl => f.write_str("a data message where a control message was expected"),
-            Error::NotData => f.write_str("a control message where a data message was expected"),
-            Error::Length(n) => write!(f, "length field {n}, shorter than the header"),
-            Error::Offset(n) => write!(f, "offset size {n}, past the end of the message"),
-            Error::Cookie(n) => write!(f, "cookie length {n}, not 0, 4 or 8"),
-            Error::AvpLength(n) => write!(f, "AVP length {n}, shorter than the AVP header"),
-            Error::TooManyAvps => write!(f, "more than {MAX_AVPS} AVPs in one message"),
-            Error::MessageType => f.write_str("the first AVP is not a message type AVP"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Trailing => f.write_str("bytes after the unit"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Truncated => f.write_str("the bytes end before the header, field or AVP does"),
+    Error::TooLong(n) => write!(
+        f,
+        "{n} bytes, longer than an L2TP datagram or message can be"
+    ),
+    Error::Version(v) => write!(f, "L2TP version {v}, not the one expected"),
+    Error::ControlBits => f.write_str("a control message without L and S, or with O or P"),
+    Error::NotControl => f.write_str("a data message where a control message was expected"),
+    Error::NotData => f.write_str("a control message where a data message was expected"),
+    Error::Length(n) => write!(f, "length field {n}, shorter than the header"),
+    Error::Offset(n) => write!(f, "offset size {n}, past the end of the message"),
+    Error::Cookie(n) => write!(f, "cookie length {n}, not 0, 4 or 8"),
+    Error::AvpLength(n) => write!(f, "AVP length {n}, shorter than the AVP header"),
+    Error::TooManyAvps => write!(f, "more than {MAX_AVPS} AVPs in one message"),
+    Error::MessageType => f.write_str("the first AVP is not a message type AVP"),
+});
 
 /// A control message's type: the value of its first AVP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

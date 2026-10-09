@@ -191,8 +191,8 @@ pub mod xr {
     pub const VOIP_METRICS: u8 = 7;
 }
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Step, Wire, be16, be32};
-use fictionet::stdlib::codec::{Frames, Prefixed};
 
 /// One RTCP packet: what it carries, and how many bytes of padding follow.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -718,39 +718,33 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Empty => f.write_str("an empty RTCP datagram"),
-            Error::TooLong(n) => write!(f, "a {n}-byte datagram or packet, longer than UDP holds"),
-            Error::Truncated => f.write_str("an RTCP packet runs past the end of the datagram"),
-            Error::Version(v) => write!(f, "RTP version {v}, not 2"),
-            Error::Padding => f.write_str("a padding count of 0 or more than the packet holds"),
-            Error::PacketContents(t) => write!(f, "contents that do not fit RTCP packet type {t}"),
-            Error::NoPackets => f.write_str("not a valid compound packet: no packets"),
-            Error::FirstNotReport(t) => {
-                write!(
-                    f,
-                    "not a valid compound packet: the first packet is type {t}, not SR or RR"
-                )
-            }
-            Error::NoCname => f.write_str("not a valid compound packet: no SDES CNAME item"),
-            Error::EarlyPadding => {
-                f.write_str("not a valid compound packet: padding on a packet other than the last")
-            }
-            Error::FeedbackOrder => f.write_str(
-                "not a valid compound packet: a feedback packet before a report or SDES packet",
-            ),
-            Error::Trailing => f.write_str("bytes follow the RTCP packet or RFC 4571 envelope"),
-            Error::OverLimit { length, limit } => {
-                write!(f, "RFC 4571 payload of {length} bytes, over {limit}")
-            }
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Empty => f.write_str("an empty RTCP datagram"),
+    Error::TooLong(n) => write!(f, "a {n}-byte datagram or packet, longer than UDP holds"),
+    Error::Truncated => f.write_str("an RTCP packet runs past the end of the datagram"),
+    Error::Version(v) => write!(f, "RTP version {v}, not 2"),
+    Error::Padding => f.write_str("a padding count of 0 or more than the packet holds"),
+    Error::PacketContents(t) => write!(f, "contents that do not fit RTCP packet type {t}"),
+    Error::NoPackets => f.write_str("not a valid compound packet: no packets"),
+    Error::FirstNotReport(t) => {
+        write!(
+            f,
+            "not a valid compound packet: the first packet is type {t}, not SR or RR"
+        )
     }
-}
-
-impl std::error::Error for Error {}
+    Error::NoCname => f.write_str("not a valid compound packet: no SDES CNAME item"),
+    Error::EarlyPadding => {
+        f.write_str("not a valid compound packet: padding on a packet other than the last")
+    }
+    Error::FeedbackOrder => f.write_str(
+        "not a valid compound packet: a feedback packet before a report or SDES packet",
+    ),
+    Error::Trailing => f.write_str("bytes follow the RTCP packet or RFC 4571 envelope"),
+    Error::OverLimit { length, limit } => {
+        write!(f, "RFC 4571 payload of {length} bytes, over {limit}")
+    }
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+});
 
 impl Body {
     /// The packet type this body is written with.
@@ -1599,34 +1593,20 @@ impl Wire for Frame {
     }
 }
 
-/// Reads RFC 4571 envelopes for RTP or RTCP without retaining input.
-///
-/// Each item is one opaque datagram, including empty null frames. Capacity
-/// is two bytes plus the payload limit. A length over that limit is refused
-/// from the prefix. Partial frames return [`Step::Need`], including at EOF,
-/// so [`fictionet::stdlib::codec::Stream`] reports truncation. RTCP body errors belong
-/// in a mapping through [`Datagram::parse`], where they do not end framing.
-impl Prefixed for Frame {
-    type Item = Frame;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "RTP/RTCP RFC 4571";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_FRAME
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_FRAME)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        2usize.saturating_add(limit)
-    }
+fictionet::prefixed! {
+    /// Reads RFC 4571 envelopes for RTP or RTCP without retaining input.
+    ///
+    /// Each item is one opaque datagram, including empty null frames. Capacity
+    /// is two bytes plus the payload limit. A length over that limit is refused
+    /// from the prefix. Partial frames return [`Step::Need`], including at EOF,
+    /// so [`fictionet::stdlib::codec::Stream`] reports truncation. RTCP body errors belong
+    /// in a mapping through [`Datagram::parse`], where they do not end framing.
+    Frame => (Frame, Error, usize);
+    name = "RTP/RTCP RFC 4571";
+    default { MAX_FRAME }
+    normalize(limit) { limit.min(MAX_FRAME) }
+    capacity(limit) { let limit = *limit;
+        2usize.saturating_add(limit) }
 
     #[inline]
     fn parse_prefix(

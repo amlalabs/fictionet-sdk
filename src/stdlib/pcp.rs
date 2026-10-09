@@ -30,8 +30,7 @@
 //! [`Request::write`], and reads the answer with [`Response::parse`] or
 //! [`unsupported_version`].
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. No message is longer than [`MAX_MESSAGE`], and the writers refuse
+//! No message is longer than [`MAX_MESSAGE`], and the writers refuse
 //! values above that limit without changing the destination.
 //! PCP addresses are 16 bytes. An IPv4 address is carried as an
 //! IPv4-mapped IPv6 address (`::ffff:a.b.c.d`), as RFC 6887 section 5
@@ -448,32 +447,26 @@ impl Error {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Short(n) => write!(f, "{n} bytes, too short for a PCP message"),
-            Error::WrongDirection => f.write_str("R bit says the message goes the other way"),
-            Error::Version(v) => write!(f, "version {v}, not 2 (PCP)"),
-            Error::TooLong(n) => write!(f, "{n} bytes, longer than {MAX_MESSAGE}"),
-            Error::Unaligned(n) => write!(f, "{n} bytes, not a multiple of 4"),
-            Error::OpcodeData { opcode, len } => {
-                write!(f, "{len} bytes of data, too short for opcode {opcode}")
-            }
-            Error::MalformedOption => f.write_str("malformed option"),
-            Error::DuplicateOption(c) => write!(f, "option {c} repeated"),
-            Error::NatPmpTrailing => f.write_str("bytes after the message"),
-            Error::NatPmpShort(n) => write!(f, "{n} bytes, too short for the NAT-PMP opcode"),
-            Error::NatPmpTooLong(n) => write!(f, "{n} bytes, longer than {MAX_MESSAGE} (NAT-PMP)"),
-            Error::NatPmpVersion(v) => write!(f, "version {v}, not 0 (NAT-PMP)"),
-            Error::NatPmpWrongDirection => {
-                f.write_str("opcode says the message goes the other way")
-            }
-        }
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Short(n) => write!(f, "{n} bytes, too short for a PCP message"),
+    Error::WrongDirection => f.write_str("R bit says the message goes the other way"),
+    Error::Version(v) => write!(f, "version {v}, not 2 (PCP)"),
+    Error::TooLong(n) => write!(f, "{n} bytes, longer than {MAX_MESSAGE}"),
+    Error::Unaligned(n) => write!(f, "{n} bytes, not a multiple of 4"),
+    Error::OpcodeData { opcode, len } => {
+        write!(f, "{len} bytes of data, too short for opcode {opcode}")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::MalformedOption => f.write_str("malformed option"),
+    Error::DuplicateOption(c) => write!(f, "option {c} repeated"),
+    Error::NatPmpTrailing => f.write_str("bytes after the message"),
+    Error::NatPmpShort(n) => write!(f, "{n} bytes, too short for the NAT-PMP opcode"),
+    Error::NatPmpTooLong(n) => write!(f, "{n} bytes, longer than {MAX_MESSAGE} (NAT-PMP)"),
+    Error::NatPmpVersion(v) => write!(f, "version {v}, not 0 (NAT-PMP)"),
+    Error::NatPmpWrongDirection => {
+        f.write_str("opcode says the message goes the other way")
+    }
+});
 
 /// A PCP request (RFC 6887 section 7.1).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

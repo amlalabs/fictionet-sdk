@@ -388,13 +388,9 @@
 //!
 #![doc = include_str!("../../docs/diagrams/sites-request.svg")]
 //!
-//! Callbacks set with [`EventLog::subscribe`](fictionet::events::EventLog::subscribe)
-//! run inside the task that recorded the event. Every task of a world runs
-//! on one thread, so a slow callback slows the whole world. Hand the event
-//! to a channel that never waits, and do the work elsewhere, or write the
-//! events to a file with
-//! [`EventLog::to_file`](fictionet::events::EventLog::to_file), which does that
-//! for you:
+//! [`EventLog::subscribe`](fictionet::events::EventLog::subscribe) documents callback delivery.
+//! Callbacks must not block the world's thread. For file output, use
+//! [`EventLog::to_file`](fictionet::events::EventLog::to_file):
 //!
 //! ```
 //! # use fictionet::{Attachments, Cx, Result, stdlib::web};

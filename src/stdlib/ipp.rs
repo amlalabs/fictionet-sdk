@@ -23,8 +23,7 @@
 //! operations the printer supports, which attributes it has, and what it
 //! does with a document are up to world code.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Each length field is checked before it is used, the attribute
+//! Each length field is checked before it is used, the attribute
 //! section may be at most [`MAX_HEAD`] bytes, and collections may nest at
 //! most [`MAX_DEPTH`] deep. A group that names one attribute twice is
 //! refused, as RFC 8011 recommends. Names, and values with a fixed size,

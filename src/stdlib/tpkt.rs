@@ -20,8 +20,7 @@
 //! A world may set a size limit lower than the 65535 bytes the header allows, as
 //! real stacks often do.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A stream that breaks the format gives a [`Error`], and a
+//! A stream that breaks the format gives a [`Error`], and a
 //! real server closes the connection. Writers return an [`Error`]
 //! rather than write a packet a reader would refuse.
 //!
@@ -48,7 +47,6 @@
 use fictionet::stdlib::codec::Decode;
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::Wire;
 
 /// The TCP port ISO transport servers listen on.
@@ -111,25 +109,19 @@ pub enum Error {
     PayloadTooLong(usize),
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::Version(v) => write!(f, "TPKT version {v}, not {VERSION}"),
-            Error::Length(n) => write!(f, "TPKT length {n}, below {MIN_PACKET}"),
-            Error::OverLimit { length, limit } => {
-                write!(f, "TPKT length {length}, above the limit of {limit}")
-            }
-            Error::Incomplete => f.write_str("incomplete TPKT packet"),
-            Error::Trailing { remaining } => write!(f, "{remaining} bytes after TPKT packet"),
-            Error::PayloadTooShort(n) => {
-                write!(f, "TPKT payload of {n} bytes, below {MIN_PAYLOAD}")
-            }
-            Error::PayloadTooLong(n) => write!(f, "{n} bytes, more than TPKT may carry"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Version(v) => write!(f, "TPKT version {v}, not {VERSION}"),
+    Error::Length(n) => write!(f, "TPKT length {n}, below {MIN_PACKET}"),
+    Error::OverLimit { length, limit } => {
+        write!(f, "TPKT length {length}, above the limit of {limit}")
     }
-}
-
-impl core::error::Error for Error {}
+    Error::Incomplete => f.write_str("incomplete TPKT packet"),
+    Error::Trailing { remaining } => write!(f, "{remaining} bytes after TPKT packet"),
+    Error::PayloadTooShort(n) => {
+        write!(f, "TPKT payload of {n} bytes, below {MIN_PAYLOAD}")
+    }
+    Error::PayloadTooLong(n) => write!(f, "{n} bytes, more than TPKT may carry"),
+});
 
 /// The fields of a TPKT header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,31 +287,17 @@ impl Wire for Packet {
     }
 }
 
-/// Splits a TPKT byte stream into packets.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`] for bounded input buffering. A partial
-/// packet returns [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
-/// truncation at EOF and reports framing errors once. No input is retained.
-impl Prefixed for Packet {
-    type Item = Packet;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "TPKT";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_PACKET
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        clamp_limit(limit)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        *limit
-    }
+fictionet::prefixed! {
+    /// Splits a TPKT byte stream into packets.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`] for bounded input buffering. A partial
+    /// packet returns [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
+    /// truncation at EOF and reports framing errors once. No input is retained.
+    Packet => (Packet, Error, usize);
+    name = "TPKT";
+    default { MAX_PACKET }
+    normalize(limit) { clamp_limit(limit) }
+    capacity(limit) { *limit }
 
     /// Reads one packet. Returns [`Error::Version`] for a version other
     /// than 3, [`Error::Length`] below [`MIN_PACKET`], or

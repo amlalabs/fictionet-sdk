@@ -79,7 +79,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{self, Decode, Step, Wire, be16, be32, be64};
 
 /// The port memcached listens on, for both TCP and UDP.
@@ -216,47 +215,41 @@ impl Error {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::LineTooLong => write!(f, "line longer than {MAX_LINE} bytes"),
-            Error::UnknownCommand => f.write_str("unknown command"),
-            Error::Format => f.write_str("bad command line format"),
-            Error::Delta => f.write_str("delta not a number from 0 to 2^64 - 1"),
-            Error::Exptime => f.write_str("expiration time not a 32-bit signed number"),
-            Error::Key => write!(
-                f,
-                "key empty, over {MAX_KEY} bytes, or holding a space or control byte"
-            ),
-            Error::TooLarge(n) => write!(f, "data block of {n} bytes exceeds the configured limit"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::BadDataChunk => f.write_str("data block not ended by CR LF"),
-            Error::Incomplete => f.write_str("incomplete memcache unit"),
-            Error::Trailing => f.write_str("bytes after memcache unit"),
-            Error::Magic(m) => write!(f, "magic byte {m:#04x}, not 0x80 or 0x81"),
-            Error::KeyLength(n) => write!(f, "key of {n} bytes, over {MAX_KEY}"),
-            Error::ExtrasLength(n) => write!(f, "extras of {n} bytes, over 255"),
-            Error::BodyLength(n) => write!(
-                f,
-                "body length {n}, over {MAX_BODY} or short of extras and key"
-            ),
-            Error::Extras { expected, actual } => {
-                write!(f, "extras require {expected} bytes, got {actual}")
-            }
-            Error::Short(n) => write!(
-                f,
-                "datagram of {n} bytes, shorter than the {UDP_HEADER_LEN}-byte header"
-            ),
-            Error::Reserved(r) => write!(f, "reserved field {r}, not 0"),
-            Error::Sequence { sequence, total } => {
-                write!(f, "sequence {sequence} of {total} datagrams")
-            }
-            Error::PayloadTooLong(n) => write!(f, "{n} bytes, too many for UDP"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::LineTooLong => write!(f, "line longer than {MAX_LINE} bytes"),
+    Error::UnknownCommand => f.write_str("unknown command"),
+    Error::Format => f.write_str("bad command line format"),
+    Error::Delta => f.write_str("delta not a number from 0 to 2^64 - 1"),
+    Error::Exptime => f.write_str("expiration time not a 32-bit signed number"),
+    Error::Key => write!(
+        f,
+        "key empty, over {MAX_KEY} bytes, or holding a space or control byte"
+    ),
+    Error::TooLarge(n) => write!(f, "data block of {n} bytes exceeds the configured limit"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::BadDataChunk => f.write_str("data block not ended by CR LF"),
+    Error::Incomplete => f.write_str("incomplete memcache unit"),
+    Error::Trailing => f.write_str("bytes after memcache unit"),
+    Error::Magic(m) => write!(f, "magic byte {m:#04x}, not 0x80 or 0x81"),
+    Error::KeyLength(n) => write!(f, "key of {n} bytes, over {MAX_KEY}"),
+    Error::ExtrasLength(n) => write!(f, "extras of {n} bytes, over 255"),
+    Error::BodyLength(n) => write!(
+        f,
+        "body length {n}, over {MAX_BODY} or short of extras and key"
+    ),
+    Error::Extras { expected, actual } => {
+        write!(f, "extras require {expected} bytes, got {actual}")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Short(n) => write!(
+        f,
+        "datagram of {n} bytes, shorter than the {UDP_HEADER_LEN}-byte header"
+    ),
+    Error::Reserved(r) => write!(f, "reserved field {r}, not 0"),
+    Error::Sequence { sequence, total } => {
+        write!(f, "sequence {sequence} of {total} datagrams")
+    }
+    Error::PayloadTooLong(n) => write!(f, "{n} bytes, too many for UDP"),
+});
 
 /// The storage commands that differ only in when they store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2411,33 +2404,19 @@ impl Wire for Response {
     }
 }
 
-/// Reads binary packets without retaining input.
-///
-/// Capacity is [`BINARY_HEADER_LEN`] plus the body limit. A declared body
-/// exceeding that limit is refused from the 24-byte header. All header
-/// errors are terminal. Partial packets return
-/// [`Step::Need`], so [`codec::Stream`] reports truncation at EOF.
-impl Prefixed for Packet {
-    type Item = Packet;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "memcache binary";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_BODY
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_BODY)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        BINARY_HEADER_LEN.saturating_add(limit)
-    }
+fictionet::prefixed! {
+    /// Reads binary packets without retaining input.
+    ///
+    /// Capacity is [`BINARY_HEADER_LEN`] plus the body limit. A declared body
+    /// exceeding that limit is refused from the 24-byte header. All header
+    /// errors are terminal. Partial packets return
+    /// [`Step::Need`], so [`codec::Stream`] reports truncation at EOF.
+    Packet => (Packet, Error, usize);
+    name = "memcache binary";
+    default { MAX_BODY }
+    normalize(limit) { limit.min(MAX_BODY) }
+    capacity(limit) { let limit = *limit;
+        BINARY_HEADER_LEN.saturating_add(limit) }
 
     #[inline]
     fn parse_prefix(

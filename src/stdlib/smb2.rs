@@ -79,8 +79,8 @@
 //! assert_eq!(out[..8], [0, 0, 0, 129, 0xfe, b'S', b'M', b'B']);
 //! ```
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Step, Wire, le16, le32, le64};
-use fictionet::stdlib::codec::{Frames, Prefixed};
 
 /// The TCP port SMB servers listen on for direct TCP.
 pub const PORT: u16 = 445;
@@ -416,50 +416,44 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::FrameType(kind) => write!(f, "SMB direct TCP frame type {kind}, not zero"),
-            Error::Length { length, limit } => {
-                write!(f, "frame length {length}, more than {limit}")
-            }
-            Error::Incomplete => f.write_str("incomplete SMB direct TCP frame"),
-            Error::Trailing { remaining } => {
-                write!(f, "{remaining} bytes after SMB direct TCP frame")
-            }
-            Error::Unwritable => f.write_str("SMB value cannot be written without changing it"),
-            Error::Truncated => f.write_str("the bytes end inside a fixed part"),
-            Error::Protocol(p) => write!(f, "protocol ID {p:02x?} is not SMB2"),
-            Error::TooLong => write!(f, "a payload longer than {MAX_MESSAGE} bytes"),
-            Error::HeaderSize(n) => write!(f, "header StructureSize {n}, not 64"),
-            Error::StructureSize(n) => {
-                write!(f, "body StructureSize {n} does not match the command")
-            }
-            Error::NextCommand(n) => write!(f, "NextCommand {n} is not a valid offset"),
-            Error::TooMany => write!(f, "a compound chain of more than {MAX_CHAIN} messages"),
-            Error::Buffer => {
-                f.write_str("an offset and length outside the message or inside a fixed part")
-            }
-            Error::Overlap => f.write_str("two buffers of one body overlap or are out of order"),
-            Error::Align(n) => write!(f, "offset {n} is not 8-byte aligned"),
-            Error::OddString => f.write_str("a UTF-16 string of an odd number of bytes"),
-            Error::NoLocks => f.write_str("a LOCK request with no locks"),
-            Error::NoDialects => f.write_str("a NEGOTIATE request with no dialects"),
-            Error::CompressionFlags(x) => {
-                write!(f, "compression flags {x:#06x} are not allowed here")
-            }
-            Error::CompressionAlgorithm => {
-                f.write_str("an unchained compression header with algorithm NONE")
-            }
-            Error::TransformFlags(x) => write!(f, "transform header flags {x:#06x}, not 0x0001"),
-            Error::NegotiateContexts => {
-                f.write_str("an SMB 3.1.1 NEGOTIATE response with missing or repeated contexts")
-            }
-        }
+fictionet::error_display!(Error, f, {
+    Error::FrameType(kind) => write!(f, "SMB direct TCP frame type {kind}, not zero"),
+    Error::Length { length, limit } => {
+        write!(f, "frame length {length}, more than {limit}")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Incomplete => f.write_str("incomplete SMB direct TCP frame"),
+    Error::Trailing { remaining } => {
+        write!(f, "{remaining} bytes after SMB direct TCP frame")
+    }
+    Error::Unwritable => f.write_str("SMB value cannot be written without changing it"),
+    Error::Truncated => f.write_str("the bytes end inside a fixed part"),
+    Error::Protocol(p) => write!(f, "protocol ID {p:02x?} is not SMB2"),
+    Error::TooLong => write!(f, "a payload longer than {MAX_MESSAGE} bytes"),
+    Error::HeaderSize(n) => write!(f, "header StructureSize {n}, not 64"),
+    Error::StructureSize(n) => {
+        write!(f, "body StructureSize {n} does not match the command")
+    }
+    Error::NextCommand(n) => write!(f, "NextCommand {n} is not a valid offset"),
+    Error::TooMany => write!(f, "a compound chain of more than {MAX_CHAIN} messages"),
+    Error::Buffer => {
+        f.write_str("an offset and length outside the message or inside a fixed part")
+    }
+    Error::Overlap => f.write_str("two buffers of one body overlap or are out of order"),
+    Error::Align(n) => write!(f, "offset {n} is not 8-byte aligned"),
+    Error::OddString => f.write_str("a UTF-16 string of an odd number of bytes"),
+    Error::NoLocks => f.write_str("a LOCK request with no locks"),
+    Error::NoDialects => f.write_str("a NEGOTIATE request with no dialects"),
+    Error::CompressionFlags(x) => {
+        write!(f, "compression flags {x:#06x} are not allowed here")
+    }
+    Error::CompressionAlgorithm => {
+        f.write_str("an unchained compression header with algorithm NONE")
+    }
+    Error::TransformFlags(x) => write!(f, "transform header flags {x:#06x}, not 0x0001"),
+    Error::NegotiateContexts => {
+        f.write_str("an SMB 3.1.1 NEGOTIATE response with missing or repeated contexts")
+    }
+});
 
 // ---------------------------------------------------------------------
 // Framing
@@ -514,45 +508,31 @@ impl Wire for Frame {
     }
 }
 
-/// Reads direct TCP frames without retaining input.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`] for a buffer bounded by the four-byte
-/// header plus [`limit`](fictionet::stdlib::codec::Frames::limit), at most [`MAX_FRAME`]. The header
-/// suffices to refuse a payload above the configured limit.
-/// Partial frames return [`Step::Need`], including at EOF, so the driver
-/// reports truncation. An invalid type or excessive length ends the stream.
-/// Map items through [`Packet::parse`] to receive payload errors as items.
-///
-/// ```
-/// use fictionet::stdlib::codec::{Frames, Decode, Stream, Wire};
-/// use fictionet::stdlib::smb2::{Frame, Packet};
-/// let bytes = Wire::to_bytes(&Frame { payload: b"\xffSMBhello".to_vec() })?;
-/// let mut stream = Stream::new(Frames::<Frame>::new().map(|f| Packet::parse(&f.payload)));
-/// assert_eq!(stream.push(&bytes), bytes.len());
-/// assert!(matches!(stream.next(), Some(Ok(Ok(Packet::Smb1(_))))));
-/// # Ok::<(), fictionet::stdlib::smb2::Error>(())
-/// ```
-impl Prefixed for Frame {
-    type Item = Frame;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "SMB direct TCP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_MESSAGE
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_MESSAGE)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        FRAME_HEADER_LEN.saturating_add(limit)
-    }
+fictionet::prefixed! {
+    /// Reads direct TCP frames without retaining input.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`] for a buffer bounded by the four-byte
+    /// header plus [`limit`](fictionet::stdlib::codec::Frames::limit), at most [`MAX_FRAME`]. The header
+    /// suffices to refuse a payload above the configured limit.
+    /// Partial frames return [`Step::Need`], including at EOF, so the driver
+    /// reports truncation. An invalid type or excessive length ends the stream.
+    /// Map items through [`Packet::parse`] to receive payload errors as items.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::{Frames, Decode, Stream, Wire};
+    /// use fictionet::stdlib::smb2::{Frame, Packet};
+    /// let bytes = Wire::to_bytes(&Frame { payload: b"\xffSMBhello".to_vec() })?;
+    /// let mut stream = Stream::new(Frames::<Frame>::new().map(|f| Packet::parse(&f.payload)));
+    /// assert_eq!(stream.push(&bytes), bytes.len());
+    /// assert!(matches!(stream.next(), Some(Ok(Ok(Packet::Smb1(_))))));
+    /// # Ok::<(), fictionet::stdlib::smb2::Error>(())
+    /// ```
+    Frame => (Frame, Error, usize);
+    name = "SMB direct TCP";
+    default { MAX_MESSAGE }
+    normalize(limit) { limit.min(MAX_MESSAGE) }
+    capacity(limit) { let limit = *limit;
+        FRAME_HEADER_LEN.saturating_add(limit) }
 
     #[inline]
     fn parse_prefix(

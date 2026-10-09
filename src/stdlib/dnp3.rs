@@ -36,7 +36,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{Wire, le16};
 
 /// The usual TCP and UDP port.
@@ -80,30 +79,24 @@ pub enum Error {
     Indications,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Start => f.write_str("DNP3 frame does not start with 05 64"),
-            Self::FrameLength => f.write_str("DNP3 frame length is outside its range"),
-            Self::Crc(at) => write!(f, "DNP3 CRC failed at byte {at}"),
-            Self::Truncated => f.write_str("incomplete DNP3 frame"),
-            Self::Trailing => f.write_str("bytes follow the DNP3 frame"),
-            Self::NotData => f.write_str("DNP3 link frame does not carry user data"),
-            Self::SegmentLength => f.write_str("DNP3 transport segment length is outside 2..=250"),
-            Self::Sequence => f.write_str("DNP3 transport sequence is invalid"),
-            Self::MissingFirst => f.write_str("DNP3 transport continuation has no first segment"),
-            Self::FragmentTooLong => {
-                f.write_str("DNP3 application fragment exceeds the local limit")
-            }
-            Self::FragmentLength => {
-                f.write_str("DNP3 application fragment length is outside its range")
-            }
-            Self::Indications => f.write_str("DNP3 internal indications do not match the function"),
-        }
+fictionet::error_display!(Error, f, {
+    Self::Start => f.write_str("DNP3 frame does not start with 05 64"),
+    Self::FrameLength => f.write_str("DNP3 frame length is outside its range"),
+    Self::Crc(at) => write!(f, "DNP3 CRC failed at byte {at}"),
+    Self::Truncated => f.write_str("incomplete DNP3 frame"),
+    Self::Trailing => f.write_str("bytes follow the DNP3 frame"),
+    Self::NotData => f.write_str("DNP3 link frame does not carry user data"),
+    Self::SegmentLength => f.write_str("DNP3 transport segment length is outside 2..=250"),
+    Self::Sequence => f.write_str("DNP3 transport sequence is invalid"),
+    Self::MissingFirst => f.write_str("DNP3 transport continuation has no first segment"),
+    Self::FragmentTooLong => {
+        f.write_str("DNP3 application fragment exceeds the local limit")
     }
-}
-
-impl std::error::Error for Error {}
+    Self::FragmentLength => {
+        f.write_str("DNP3 application fragment length is outside its range")
+    }
+    Self::Indications => f.write_str("DNP3 internal indications do not match the function"),
+});
 
 /// CRC-16/DNP: reflected polynomial `0xa6bc`, initial value zero, complemented
 /// result. A frame sends the result least significant byte first.
@@ -224,38 +217,31 @@ impl Wire for Frame {
         if self.data.len() > MAX_DATA {
             return Err(Error::FrameLength);
         }
-        let mut out = Vec::with_capacity(MAX_FRAME);
-        out.extend_from_slice(&[5, 0x64, (self.data.len() + 5) as u8, self.control]);
-        out.extend_from_slice(&self.destination.to_le_bytes());
-        out.extend_from_slice(&self.source.to_le_bytes());
-        out.extend_from_slice(&crc(&out).to_le_bytes());
+        let start = dst.len();
+        dst.reserve(MAX_FRAME);
+        dst.extend_from_slice(&[5, 0x64, (self.data.len() + 5) as u8, self.control]);
+        dst.extend_from_slice(&self.destination.to_le_bytes());
+        dst.extend_from_slice(&self.source.to_le_bytes());
+        dst.extend_from_slice(&crc(&dst[start..]).to_le_bytes());
         for block in self.data.chunks(16) {
-            out.extend_from_slice(block);
-            out.extend_from_slice(&crc(block).to_le_bytes());
+            dst.extend_from_slice(block);
+            dst.extend_from_slice(&crc(block).to_le_bytes());
         }
-        dst.extend_from_slice(&out);
         Ok(())
     }
 }
 
-/// Reads DNP3 frames without holding input bytes.
-///
-/// Use with [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) for a buffer limited to
-/// [`MAX_FRAME`]. Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
-/// The stream reports truncation at EOF and framing errors once.
-impl Prefixed for Frame {
-    type Item = Frame;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "DNP3";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_FRAME
-    }
+fictionet::prefixed! {
+    /// Reads DNP3 frames without holding input bytes.
+    ///
+    /// Use with [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) for a buffer limited to
+    /// [`MAX_FRAME`]. Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
+    /// The stream reports truncation at EOF and framing errors once.
+    Frame => (Frame, Error, ());
+    name = "DNP3";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_FRAME }
 
     /// Reads a frame prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.
     /// Returns [`Error::Start`], [`Error::FrameLength`] or
@@ -394,13 +380,12 @@ impl Wire for Segment {
     /// [`Error::SegmentLength`] unless data has 1 through 249 bytes.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         self.validate()?;
-        let mut out = vec![
+        dst.push(
             self.sequence
                 | if self.first { 0x40 } else { 0 }
                 | if self.final_segment { 0x80 } else { 0 },
-        ];
-        out.extend_from_slice(&self.data);
-        dst.extend_from_slice(&out);
+        );
+        dst.extend_from_slice(&self.data);
         Ok(())
     }
 }
@@ -445,12 +430,11 @@ impl Wire for Fragment {
         if self.objects.len() > MAX_FRAGMENT - header {
             return Err(Error::FragmentLength);
         }
-        let mut out = vec![self.control, self.function];
+        dst.extend_from_slice(&[self.control, self.function]);
         if let Some(iin) = self.indications {
-            out.extend_from_slice(&iin.to_le_bytes());
+            dst.extend_from_slice(&iin.to_le_bytes());
         }
-        out.extend_from_slice(&self.objects);
-        dst.extend_from_slice(&out);
+        dst.extend_from_slice(&self.objects);
         Ok(())
     }
 }

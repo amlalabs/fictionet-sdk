@@ -678,37 +678,31 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::TooLong(n) => write!(
-                f,
-                "message of {n} bytes, over the limit of {MAX_MESSAGE_LEN}"
-            ),
-            Error::Priority => f.write_str("missing or malformed priority"),
-            Error::Version => f.write_str("malformed version"),
-            Error::Truncated => f.write_str("message ends inside its header"),
-            Error::Timestamp => f.write_str("malformed timestamp"),
-            Error::Hostname => f.write_str("malformed host name"),
-            Error::AppName => f.write_str("malformed application name"),
-            Error::ProcId => f.write_str("malformed process ID"),
-            Error::MsgId => f.write_str("malformed message ID"),
-            Error::StructuredData => f.write_str("malformed structured data"),
-            Error::DuplicateSdId => f.write_str("structured data element ID used twice"),
-            Error::Utf8 => f.write_str("text marked as UTF-8 is not UTF-8"),
-            Error::Length(c) => write!(f, "octet count followed by byte {c:#04x}, not a space"),
-            Error::CountTooLarge => f.write_str("octet count too large"),
-            Error::Incomplete { remaining } => {
-                write!(f, "syslog message needs {remaining} more bytes")
-            }
-            Error::Trailing => f.write_str("bytes after the syslog frame"),
-            Error::FrameTooLong => f.write_str("syslog frame exceeds its wire limit"),
-            Error::Unwritable => f.write_str("syslog value cannot be written without changing it"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::TooLong(n) => write!(
+        f,
+        "message of {n} bytes, over the limit of {MAX_MESSAGE_LEN}"
+    ),
+    Error::Priority => f.write_str("missing or malformed priority"),
+    Error::Version => f.write_str("malformed version"),
+    Error::Truncated => f.write_str("message ends inside its header"),
+    Error::Timestamp => f.write_str("malformed timestamp"),
+    Error::Hostname => f.write_str("malformed host name"),
+    Error::AppName => f.write_str("malformed application name"),
+    Error::ProcId => f.write_str("malformed process ID"),
+    Error::MsgId => f.write_str("malformed message ID"),
+    Error::StructuredData => f.write_str("malformed structured data"),
+    Error::DuplicateSdId => f.write_str("structured data element ID used twice"),
+    Error::Utf8 => f.write_str("text marked as UTF-8 is not UTF-8"),
+    Error::Length(c) => write!(f, "octet count followed by byte {c:#04x}, not a space"),
+    Error::CountTooLarge => f.write_str("octet count too large"),
+    Error::Incomplete { remaining } => {
+        write!(f, "syslog message needs {remaining} more bytes")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Trailing => f.write_str("bytes after the syslog frame"),
+    Error::FrameTooLong => f.write_str("syslog frame exceeds its wire limit"),
+    Error::Unwritable => f.write_str("syslog value cannot be written without changing it"),
+});
 
 impl Message {
     /// A version 1 message with this priority, every header field nil, no

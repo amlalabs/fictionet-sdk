@@ -1144,21 +1144,15 @@ impl Wire for Response {
     /// Refuses trailing bytes, invalid grammar, non-synchronizing literals,
     /// and text, literal, message, or nesting overflow. A section literal
     /// must fit its canonical quoted form.
-    fn parse(mut bytes: &[u8]) -> Result<Self, Error> {
-        let mut responses = Responses::new();
-        loop {
-            match responses.decode(bytes, true).map_err(Error::Framing)? {
-                codec::Step::Item(response, used) => {
-                    let response = response?;
-                    if used != bytes.len() {
-                        return Err(Error::Trailing);
-                    }
-                    return Ok(response);
-                }
-                codec::Step::Skip(used) => bytes = bytes.get(used..).ok_or(Error::Incomplete)?,
-                _ => return Err(Error::Incomplete),
-            }
-        }
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        fictionet::stdlib::codec::decode_exact(
+            Responses::new(),
+            bytes,
+            |e| e,
+            Error::Framing,
+            Error::Incomplete,
+            Error::Trailing,
+        )
     }
 
     /// Appends one response. Refuses invalid tags, codes, text, values,

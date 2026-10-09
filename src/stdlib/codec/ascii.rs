@@ -102,6 +102,26 @@ pub fn percent_decode_strict(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Whether a byte is an unreserved character or sub-delimiter in an RFC 3986 name.
+pub fn is_uri_reg_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&b)
+}
+
+/// Whether `s` is the inside of an RFC 3986 IP literal: an IPv6 address,
+/// or `v`, hex digits, `.` and more characters for a future version.
+pub fn is_uri_ip_literal(s: &str) -> bool {
+    if let Some(rest) = s.strip_prefix(['v', 'V']) {
+        let Some((version, body)) = rest.split_once('.') else {
+            return false;
+        };
+        return !version.is_empty()
+            && version.bytes().all(|b| b.is_ascii_hexdigit())
+            && !body.is_empty()
+            && body.bytes().all(|b| is_uri_reg_name_char(b) || b == b':');
+    }
+    s.parse::<std::net::Ipv6Addr>().is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

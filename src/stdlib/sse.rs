@@ -60,7 +60,6 @@
 //! [WHATWG event stream rules]: https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream
 
 use fictionet::stdlib::codec::{Buffer, Decode, Ending, LineError, Lines, Step, Wire};
-use std::fmt;
 
 /// Default maximum UTF-8 bytes in a line, excluding its terminator and BOM.
 /// Replacement characters from malformed UTF-8 count toward this limit.
@@ -126,19 +125,14 @@ pub enum Error {
         reason: &'static str,
     },
 }
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::LineTooLong { limit } => write!(f, "SSE line exceeds {limit} bytes"),
-            Self::EventTooLong { limit } => write!(f, "SSE event exceeds {limit} bytes"),
-            Self::ExpectedLine => f.write_str("expected one complete SSE line"),
-            Self::ExpectedEvent => f.write_str("expected one complete SSE event"),
-            Self::Allocation => f.write_str("SSE allocation failed"),
-            Self::Unwritable { reason } => write!(f, "unwritable SSE value: {reason}"),
-        }
-    }
-}
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Self::LineTooLong { limit } => write!(f, "SSE line exceeds {limit} bytes"),
+    Self::EventTooLong { limit } => write!(f, "SSE event exceeds {limit} bytes"),
+    Self::ExpectedLine => f.write_str("expected one complete SSE line"),
+    Self::ExpectedEvent => f.write_str("expected one complete SSE event"),
+    Self::Allocation => f.write_str("SSE allocation failed"),
+    Self::Unwritable { reason } => write!(f, "unwritable SSE value: {reason}"),
+});
 
 /// One interpreted line. Values retain all spaces after the one optional
 /// space following the colon. Comments retain everything after the colon.

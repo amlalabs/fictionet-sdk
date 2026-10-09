@@ -32,8 +32,7 @@
 //! preserves the truncation flag. Names, owners, and referrals belong to
 //! world code.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A query line longer than [`MAX_QUERY`] is an error, and the
+//! A query line longer than [`MAX_QUERY`] is an error, and the
 //! decoder skips it and goes on to the next line. A response is held to
 //! [`MAX_RESPONSE`] bytes, and bytes past that are dropped. Writers return
 //! an [`Error`] rather than write bytes a reader
@@ -198,25 +197,19 @@ pub enum Error {
     TooManyFields,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::QueryTooLong => write!(f, "a query line longer than {MAX_QUERY} bytes"),
-            Error::NotUtf8 => f.write_str("a query line that is not UTF-8"),
-            Error::Control(c) => {
-                write!(f, "control character {:#x} in a query line", u32::from(*c))
-            }
-            Error::Flags => f.write_str("query flags and terms that would not read back as given"),
-            Error::Incomplete => f.write_str("incomplete WHOIS query"),
-            Error::Trailing => f.write_str("bytes after WHOIS query"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::ResponseTooLong => f.write_str("more than one WHOIS response may hold"),
-            Error::TooManyFields => write!(f, "more than {MAX_FIELDS} fields"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::QueryTooLong => write!(f, "a query line longer than {MAX_QUERY} bytes"),
+    Error::NotUtf8 => f.write_str("a query line that is not UTF-8"),
+    Error::Control(c) => {
+        write!(f, "control character {:#x} in a query line", u32::from(*c))
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Flags => f.write_str("query flags and terms that would not read back as given"),
+    Error::Incomplete => f.write_str("incomplete WHOIS query"),
+    Error::Trailing => f.write_str("bytes after WHOIS query"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::ResponseTooLong => f.write_str("more than one WHOIS response may hold"),
+    Error::TooManyFields => write!(f, "more than {MAX_FIELDS} fields"),
+});
 
 /// One query: the text of the line a client sends, without its CR LF. It
 /// is at most [`MAX_QUERY`] bytes and holds no control characters but

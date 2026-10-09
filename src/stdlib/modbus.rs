@@ -70,7 +70,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{Wire, be16};
 
 /// The TCP port Modbus/TCP servers listen on.
@@ -157,24 +156,18 @@ pub enum Error {
     BadResponse,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::EmptyPdu => f.write_str("a frame needs a PDU of at least a function code"),
-            Error::TooLong => f.write_str("more than one Modbus PDU may carry"),
-            Error::Quantity => f.write_str("a quantity outside what the function allows"),
-            Error::Address => f.write_str("a range of addresses past 65535"),
-            Error::Function(c) => write!(f, "function code {c} does not go with this value"),
-            Error::Protocol(p) => write!(f, "protocol identifier {p}, not 0 (Modbus)"),
-            Error::Length(n) => write!(f, "length field {n}, outside 2..=254"),
-            Error::Truncated => f.write_str("input ended before a complete Modbus frame"),
-            Error::Trailing => f.write_str("bytes follow the Modbus frame"),
-            Error::BadResponse => f.write_str("not a well-formed Modbus response"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::EmptyPdu => f.write_str("a frame needs a PDU of at least a function code"),
+    Error::TooLong => f.write_str("more than one Modbus PDU may carry"),
+    Error::Quantity => f.write_str("a quantity outside what the function allows"),
+    Error::Address => f.write_str("a range of addresses past 65535"),
+    Error::Function(c) => write!(f, "function code {c} does not go with this value"),
+    Error::Protocol(p) => write!(f, "protocol identifier {p}, not 0 (Modbus)"),
+    Error::Length(n) => write!(f, "length field {n}, outside 2..=254"),
+    Error::Truncated => f.write_str("input ended before a complete Modbus frame"),
+    Error::Trailing => f.write_str("bytes follow the Modbus frame"),
+    Error::BadResponse => f.write_str("not a well-formed Modbus response"),
+});
 
 impl Frame {
     /// Reads the frame at the start of `b`. It returns `Ok(None)` if `b`
@@ -264,42 +257,35 @@ impl Wire for Frame {
     }
 }
 
-/// Reads Modbus/TCP frames without holding input bytes.
-///
-/// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer limited
-/// to [`MAX_FRAME`]. Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at
-/// EOF. The stream reports truncation at EOF and framing errors once.
-/// Each item's PDU is bounded by [`MAX_PDU`].
-///
-/// ```
-/// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::codec::{Decode, Stream, finish, pump};
-/// use fictionet::stdlib::modbus::Request;
-///
-/// let mut requests = Stream::new(Frames::<fictionet::stdlib::modbus::Frame>::new().map(|frame| Request::parse(&frame.pdu)));
-/// let bytes = [0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1];
-/// let mut count = 0;
-/// pump(&mut requests, &bytes, |request| {
-///     assert_eq!(request, Ok(Request::ReadHoldingRegisters { address: 2, quantity: 1 }));
-///     count += 1;
-/// })?;
-/// finish(&mut requests, |_| unreachable!())?;
-/// assert_eq!(count, 1);
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::modbus::Error>>(())
-/// ```
-impl Prefixed for Frame {
-    type Item = Frame;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "Modbus/TCP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_FRAME
-    }
+fictionet::prefixed! {
+    /// Reads Modbus/TCP frames without holding input bytes.
+    ///
+    /// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer limited
+    /// to [`MAX_FRAME`]. Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at
+    /// EOF. The stream reports truncation at EOF and framing errors once.
+    /// Each item's PDU is bounded by [`MAX_PDU`].
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::Frames;
+    /// use fictionet::stdlib::codec::{Decode, Stream, finish, pump};
+    /// use fictionet::stdlib::modbus::Request;
+    ///
+    /// let mut requests = Stream::new(Frames::<fictionet::stdlib::modbus::Frame>::new().map(|frame| Request::parse(&frame.pdu)));
+    /// let bytes = [0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1];
+    /// let mut count = 0;
+    /// pump(&mut requests, &bytes, |request| {
+    ///     assert_eq!(request, Ok(Request::ReadHoldingRegisters { address: 2, quantity: 1 }));
+    ///     count += 1;
+    /// })?;
+    /// finish(&mut requests, |_| unreachable!())?;
+    /// assert_eq!(count, 1);
+    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::modbus::Error>>(())
+    /// ```
+    Frame => (Frame, Error, ());
+    name = "Modbus/TCP";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_FRAME }
 
     /// Reads one frame. A nonzero protocol ID returns [`Error::Protocol`].
     /// A length outside 2..=254 returns [`Error::Length`]. Partial input

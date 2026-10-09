@@ -30,8 +30,7 @@
 //! [`Message::to_frames`]. Answering pings and deciding when to close
 //! belong to world code.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A frame or message that breaks the specification becomes an
+//! A frame or message that breaks the specification becomes an
 //! [`Error`], and [`Error::close_code`] says which close code a real server
 //! sends before it drops the connection.
 //!
@@ -316,56 +315,50 @@ impl Error {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::ReservedBits(b) => {
-                write!(f, "reserved bits {b:#05b} set with no extension agreed")
-            }
-            Error::ReservedOpcode(o) => write!(f, "reserved opcode {o:#x}"),
-            Error::FragmentedControl => write!(f, "control frame without the final bit"),
-            Error::ControlTooLong => {
-                write!(f, "control frame payload over {MAX_CONTROL_PAYLOAD} bytes")
-            }
-            Error::NonMinimalLength => write!(f, "payload length not in its shortest form"),
-            Error::LengthHighBit => write!(f, "64-bit payload length with its top bit set"),
-            Error::PayloadTooLarge(n) => write!(
-                f,
-                "payload of {n} bytes is over the {MAX_PAYLOAD}-byte limit"
-            ),
-            Error::CloseShort => write!(f, "close payload shorter than 2 bytes"),
-            Error::CloseTooLong => write!(f, "close payload over {MAX_CONTROL_PAYLOAD} bytes"),
-            Error::CloseCode(c) => write!(f, "close code {c} may not be sent"),
-            Error::CloseUtf8 => write!(f, "close reason is not UTF-8"),
-            Error::Unmasked => write!(f, "client frame not masked"),
-            Error::Masked => write!(f, "server frame masked"),
-            Error::UnexpectedContinuation => {
-                write!(f, "continuation frame with no message in progress")
-            }
-            Error::ExpectedContinuation => write!(f, "new message before the last one ended"),
-            Error::InvalidUtf8 => write!(f, "text message is not UTF-8"),
-            Error::TooBig => write!(f, "message over the decoder's size limit"),
-            Error::Truncated => f.write_str("incomplete WebSocket frame"),
-            Error::Trailing => f.write_str("bytes after WebSocket frame"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Allocation => f.write_str("WebSocket output allocation failed"),
-            Error::TooManyHeaders => f.write_str("too many header fields"),
-            Error::FieldTooLong => f.write_str("header field value too long"),
-            Error::MissingHost => f.write_str("no single, valid Host field"),
-            Error::Origin => f.write_str("more than one Origin field"),
-            Error::Upgrade => f.write_str("Upgrade does not list websocket"),
-            Error::Connection => f.write_str("Connection does not list Upgrade"),
-            Error::Version => f.write_str("Sec-WebSocket-Version is not 13"),
-            Error::MissingVersion => f.write_str("no single Sec-WebSocket-Version field"),
-            Error::Key => f.write_str("Sec-WebSocket-Key is missing or not 16 bytes of base64"),
-            Error::Accept => f.write_str("Sec-WebSocket-Accept does not match the key"),
-            Error::Protocol => f.write_str("bad Sec-WebSocket-Protocol"),
-            Error::Extension => f.write_str("bad Sec-WebSocket-Extensions"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::ReservedBits(b) => {
+        write!(f, "reserved bits {b:#05b} set with no extension agreed")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::ReservedOpcode(o) => write!(f, "reserved opcode {o:#x}"),
+    Error::FragmentedControl => write!(f, "control frame without the final bit"),
+    Error::ControlTooLong => {
+        write!(f, "control frame payload over {MAX_CONTROL_PAYLOAD} bytes")
+    }
+    Error::NonMinimalLength => write!(f, "payload length not in its shortest form"),
+    Error::LengthHighBit => write!(f, "64-bit payload length with its top bit set"),
+    Error::PayloadTooLarge(n) => write!(
+        f,
+        "payload of {n} bytes is over the {MAX_PAYLOAD}-byte limit"
+    ),
+    Error::CloseShort => write!(f, "close payload shorter than 2 bytes"),
+    Error::CloseTooLong => write!(f, "close payload over {MAX_CONTROL_PAYLOAD} bytes"),
+    Error::CloseCode(c) => write!(f, "close code {c} may not be sent"),
+    Error::CloseUtf8 => write!(f, "close reason is not UTF-8"),
+    Error::Unmasked => write!(f, "client frame not masked"),
+    Error::Masked => write!(f, "server frame masked"),
+    Error::UnexpectedContinuation => {
+        write!(f, "continuation frame with no message in progress")
+    }
+    Error::ExpectedContinuation => write!(f, "new message before the last one ended"),
+    Error::InvalidUtf8 => write!(f, "text message is not UTF-8"),
+    Error::TooBig => write!(f, "message over the decoder's size limit"),
+    Error::Truncated => f.write_str("incomplete WebSocket frame"),
+    Error::Trailing => f.write_str("bytes after WebSocket frame"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Allocation => f.write_str("WebSocket output allocation failed"),
+    Error::TooManyHeaders => f.write_str("too many header fields"),
+    Error::FieldTooLong => f.write_str("header field value too long"),
+    Error::MissingHost => f.write_str("no single, valid Host field"),
+    Error::Origin => f.write_str("more than one Origin field"),
+    Error::Upgrade => f.write_str("Upgrade does not list websocket"),
+    Error::Connection => f.write_str("Connection does not list Upgrade"),
+    Error::Version => f.write_str("Sec-WebSocket-Version is not 13"),
+    Error::MissingVersion => f.write_str("no single Sec-WebSocket-Version field"),
+    Error::Key => f.write_str("Sec-WebSocket-Key is missing or not 16 bytes of base64"),
+    Error::Accept => f.write_str("Sec-WebSocket-Accept does not match the key"),
+    Error::Protocol => f.write_str("bad Sec-WebSocket-Protocol"),
+    Error::Extension => f.write_str("bad Sec-WebSocket-Extensions"),
+});
 
 /// A frame header: everything before the payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1383,7 +1376,10 @@ fn is_quoted_token(s: &str) -> bool {
 fn is_authority(s: &str) -> bool {
     let (host_ok, port) = match s.strip_prefix('[') {
         Some(rest) => match rest.split_once(']') {
-            Some((literal, after)) => (is_ip_literal(literal), after),
+            Some((literal, after)) => (
+                fictionet::stdlib::codec::ascii::is_uri_ip_literal(literal),
+                after,
+            ),
             None => return false,
         },
         None => {
@@ -1398,23 +1394,6 @@ fn is_authority(s: &str) -> bool {
                 .is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit())))
 }
 
-/// Whether `s` is the inside of an RFC 3986 IP literal: an IPv6 address,
-/// or `v`, hex digits, `.` and more characters for a future version.
-fn is_ip_literal(s: &str) -> bool {
-    if let Some(rest) = s.strip_prefix(['v', 'V']) {
-        let Some((version, body)) = rest.split_once('.') else {
-            return false;
-        };
-        return !version.is_empty()
-            && version.bytes().all(|b| b.is_ascii_hexdigit())
-            && !body.is_empty()
-            && body
-                .bytes()
-                .all(|b| is_unreserved(b) || is_sub_delim(b) || b == b':');
-    }
-    s.parse::<std::net::Ipv6Addr>().is_ok()
-}
-
 /// Whether `s` is an RFC 3986 registered name: unreserved characters,
 /// sub-delimiters and `%` with two hex digits.
 fn is_reg_name(s: &str) -> bool {
@@ -1426,21 +1405,13 @@ fn is_reg_name(s: &str) -> bool {
                 Some([x, y]) if x.is_ascii_hexdigit() && y.is_ascii_hexdigit() => i += 3,
                 _ => return false,
             }
-        } else if is_unreserved(c) || is_sub_delim(c) {
+        } else if fictionet::stdlib::codec::ascii::is_uri_reg_name_char(c) {
             i += 1;
         } else {
             return false;
         }
     }
     true
-}
-
-fn is_unreserved(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b"-._~".contains(&b)
-}
-
-fn is_sub_delim(b: u8) -> bool {
-    b"!$&'()*+,;=".contains(&b)
 }
 
 /// Whether `s` is an HTTP token: one or more of the characters RFC 9110

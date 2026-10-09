@@ -3253,12 +3253,7 @@ impl Encoder {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
 #[cfg(test)]
 mod tests {

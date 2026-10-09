@@ -74,7 +74,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::session::Action;
 use std::fmt;
@@ -130,23 +129,18 @@ pub enum Error {
     /// A timer is zero or longer than [`MAX_TIMER_MS`].
     Config,
 }
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Length => f.write_str("SoupBinTCP packet length is wrong"),
-            Error::TooLong => f.write_str("SoupBinTCP payload is too long"),
-            Error::Type(t) => write!(f, "unknown SoupBinTCP packet type {t:#04x}"),
-            Error::Field => f.write_str("SoupBinTCP alphanumeric field is invalid"),
-            Error::Number => f.write_str("SoupBinTCP numeric field is invalid"),
-            Error::Reason(r) => write!(f, "unknown SoupBinTCP reject code {r:#04x}"),
-            Error::State => f.write_str("SoupBinTCP session state does not allow this"),
-            Error::Time => f.write_str("time went backwards"),
-            Error::Sequence => f.write_str("SoupBinTCP sequence number is exhausted"),
-            Error::Config => f.write_str("SoupBinTCP timer is out of range"),
-        }
-    }
-}
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Length => f.write_str("SoupBinTCP packet length is wrong"),
+    Error::TooLong => f.write_str("SoupBinTCP payload is too long"),
+    Error::Type(t) => write!(f, "unknown SoupBinTCP packet type {t:#04x}"),
+    Error::Field => f.write_str("SoupBinTCP alphanumeric field is invalid"),
+    Error::Number => f.write_str("SoupBinTCP numeric field is invalid"),
+    Error::Reason(r) => write!(f, "unknown SoupBinTCP reject code {r:#04x}"),
+    Error::State => f.write_str("SoupBinTCP session state does not allow this"),
+    Error::Time => f.write_str("time went backwards"),
+    Error::Sequence => f.write_str("SoupBinTCP sequence number is exhausted"),
+    Error::Config => f.write_str("SoupBinTCP timer is out of range"),
+});
 
 /// A fixed-width alphanumeric field: `N` bytes of printable ASCII,
 /// spaces included. Padding is part of the value, so fields round-trip
@@ -382,26 +376,12 @@ impl Packet {
 /// Reads a numeric ASCII field: optional spaces, digits, optional spaces.
 /// An all-blank field reads as 0.
 fn read_number(b: &[u8]) -> Result<u64, Error> {
-    let digits = b
-        .iter()
-        .position(|c| *c != b' ')
-        .map_or(&[][..], |start| b.get(start..).unwrap_or_default());
-    let end = digits
-        .iter()
-        .position(|c| *c == b' ')
-        .unwrap_or(digits.len());
-    let (digits, pad) = digits.split_at(end);
-    if pad.iter().any(|c| *c != b' ') {
-        return Err(Error::Number);
+    let text = std::str::from_utf8(b).map_err(|_| Error::Number)?;
+    let digits = text.trim_matches(' ').as_bytes();
+    if digits.is_empty() {
+        return Ok(0);
     }
-    digits.iter().try_fold(0u64, |n, c| {
-        if !c.is_ascii_digit() {
-            return Err(Error::Number);
-        }
-        n.checked_mul(10)
-            .and_then(|n| n.checked_add(u64::from(c - b'0')))
-            .ok_or(Error::Number)
-    })
+    fictionet::stdlib::codec::ascii::decimal(digits, digits.len(), u64::MAX).ok_or(Error::Number)
 }
 fn write_number(n: u64, out: &mut Vec<u8>) {
     // u64::MAX has 20 digits, so this always fills the field exactly.
@@ -454,49 +434,35 @@ impl Wire for Packet {
     }
 }
 
-/// Reads packets from a byte stream without holding input.
-///
-/// Each item is one length-prefixed packet, parsed: `Err` for a packet
-/// that frames but does not parse (an unknown type, a wrong fixed length,
-/// a bad field), so the session can decide what to do. A length prefix
-/// over the limit ends the stream with [`Error::TooLong`], read from the
-/// prefix alone. A zero length prefix is an item, `Err(Error::Length)`.
-///
-/// ```
-/// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::codec::{finish, pump, Stream};
-/// use fictionet::stdlib::soupbintcp::Packet;
-///
-/// let mut stream = Stream::new(Frames::<Packet>::default());
-/// let mut packets = Vec::new();
-/// // A server heartbeat, then sequenced data "hi", split across reads.
-/// pump(&mut stream, &[0, 1, b'H', 0, 3], |p| packets.push(p))?;
-/// pump(&mut stream, &[b'S', b'h', b'i'], |p| packets.push(p))?;
-/// finish(&mut stream, |p| packets.push(p))?;
-/// assert_eq!(packets, [Ok(Packet::ServerHeartbeat), Ok(Packet::SequencedData(b"hi".to_vec()))]);
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::soupbintcp::Error>>(())
-/// ```
-impl Prefixed for Packet {
-    type Item = Result<Packet, Error>;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "SoupBinTCP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_PAYLOAD
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_PAYLOAD)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        LENGTH_PREFIX + 1 + limit
-    }
+fictionet::prefixed! {
+    /// Reads packets from a byte stream without holding input.
+    ///
+    /// Each item is one length-prefixed packet, parsed: `Err` for a packet
+    /// that frames but does not parse (an unknown type, a wrong fixed length,
+    /// a bad field), so the session can decide what to do. A length prefix
+    /// over the limit ends the stream with [`Error::TooLong`], read from the
+    /// prefix alone. A zero length prefix is an item, `Err(Error::Length)`.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::Frames;
+    /// use fictionet::stdlib::codec::{finish, pump, Stream};
+    /// use fictionet::stdlib::soupbintcp::Packet;
+    ///
+    /// let mut stream = Stream::new(Frames::<Packet>::default());
+    /// let mut packets = Vec::new();
+    /// // A server heartbeat, then sequenced data "hi", split across reads.
+    /// pump(&mut stream, &[0, 1, b'H', 0, 3], |p| packets.push(p))?;
+    /// pump(&mut stream, &[b'S', b'h', b'i'], |p| packets.push(p))?;
+    /// finish(&mut stream, |p| packets.push(p))?;
+    /// assert_eq!(packets, [Ok(Packet::ServerHeartbeat), Ok(Packet::SequencedData(b"hi".to_vec()))]);
+    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::soupbintcp::Error>>(())
+    /// ```
+    Packet => (Result<Packet, Error>, Error, usize);
+    name = "SoupBinTCP";
+    default { MAX_PAYLOAD }
+    normalize(limit) { limit.min(MAX_PAYLOAD) }
+    capacity(limit) { let limit = *limit;
+        LENGTH_PREFIX + 1 + limit }
 
     #[inline]
     fn parse_prefix(

@@ -1245,8 +1245,11 @@ pub fn parameter_problem(packet: &[u8], reject: Reject) -> Option<Packet> {
 /// Adds `data` to a one's-complement sum, as 16-bit big-endian words. Four
 /// bytes at a time: since 2^16 is 1 modulo 2^16 - 1, a 32-bit word adds
 /// the same as its two halves once the sum is folded.
+/// Each slice starts on a word boundary and independently pads an odd last
+/// byte with zero. The caller must leave room in `acc` for at most
+/// `ceil(data.len() / 4) * u32::MAX`; accumulation must fit in `u64`.
 #[inline]
-fn sum(mut acc: u64, data: &[u8]) -> u64 {
+pub fn sum(mut acc: u64, data: &[u8]) -> u64 {
     let (words, rest) = data.as_chunks::<4>();
     for w in words {
         acc += u32::from_be_bytes(*w) as u64;
@@ -1263,7 +1266,7 @@ fn sum(mut acc: u64, data: &[u8]) -> u64 {
 
 /// Folds a one's-complement sum to 16 bits and complements it.
 #[inline]
-fn fold(mut acc: u64) -> u16 {
+pub fn fold(mut acc: u64) -> u16 {
     while acc >> 16 != 0 {
         acc = (acc & 0xffff) + (acc >> 16);
     }
@@ -2234,6 +2237,9 @@ mod tests {
                 reference_checksum(&data[..len]),
                 "{len} bytes"
             );
+        }
+        for split in (0..data.len()).step_by(2) {
+            assert_eq!(fold(sum(sum(0, &data[..split]), &data[split..1999])), checksum(&data[..1999]));
         }
         assert_eq!(
             checksum(&[0xff; 65_536]),

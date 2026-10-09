@@ -283,12 +283,8 @@ body and write timers, and 100 streams at once on an HTTP/2 connection.
 Both charge the request and response bodies they hold to the sandbox's
 budget, and both draw a handler's randomness from the run's stream.
 
-Each request is one `http.request` event. Its `sent` field counts the
-body bytes the connection took, and `complete` says whether it took all
-of them. Over HTTP/1 a byte counts once it is written to the connection,
-and the event is made after the last one is: a client that stops reading
-or resets the connection mid-body leaves `complete: false` and the bytes
-it got. Over HTTP/2 a byte counts once hyper takes it for the stream.
+See [`httpd`'s event contract](../src/stdlib/httpd.rs) for `sent` and
+`complete`, including when HTTP/1 and HTTP/2 count bytes.
 
 ## 5. Events
 
@@ -319,31 +315,12 @@ little-endian integers and the high 53 bits for fractions. Field
 names are fixed by the code that records; names that come from the wire,
 such as LDAP attributes, go under one field as an object.
 
-Events that come once per packet, such as `net.blocked` for a packet the
-network refused and `drop` from a LAN, a router or a bottleneck, are
-repeats (`fcx.record_repeat`). An agent decides how many of them there
-are, so the log counts them: the first of a run of alike repeats is
-recorded with `count` 1, and the rest of the next second are counted
-into one more event with their `count`, and with `[low, high]` for each
-number that changed, such as `dst_port`. The sum of `count` is how many
-packets there were. A port scan of 65,535 ports to one machine costs a
-couple of events a second.
+The [event log](../src/events.rs) documents retention, repeat aggregation,
+late subscribers and dropped-event reporting. Sum `count` when grading
+packet repeats; a 65,535-port scan remains a few events per second.
 
-The log holds the latest 50,000 events, up to 16 MiB of them
-(`events::MAX_EVENTS`, `events::MAX_EVENT_BYTES`), and drops the oldest
-past that. Repeats have bounds of their own beside those: the latest
-5,000, up to 2 MiB (`events::MAX_REPEATS`, `events::MAX_REPEAT_BYTES`).
-A flood of repeats pushes out only older repeats, never a service's
-event, an HTTP request, a DNS query, a TLS handshake or a connection's
-open and close.
-
-A file or a callback set halfway through a run first gets what the log
-still holds, then every event that follows, so it misses nothing unless
-the log had already dropped some. Where a reader missed events, an
-`events.dropped` event counts them. The run's end records the counts
-still open and waits for file writers to write every line. A line a
-file's writer could not keep up with, or could not write, is counted in
-`events.lost()`; a grader throws such a sample away.
+The run waits for file writers at shutdown. Discard a sample if
+[`EventLog::lost`](../src/events.rs) is nonzero.
 
 ## 6. The dashboard
 

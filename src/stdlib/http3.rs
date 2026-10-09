@@ -44,8 +44,8 @@
 //! # Ok::<(), fictionet::stdlib::http3::Error>(())
 //! ```
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::ascii::{self, is_tchar as token, trim_ows};
-use fictionet::stdlib::codec::{Frames, Prefixed};
 use fictionet::stdlib::{
     codec::{self, Decode, Step, Wire},
     qpack, quic,
@@ -917,26 +917,6 @@ fn nonempty_token(b: &[u8]) -> bool {
 fn decimal(b: &[u8]) -> Option<u64> {
     ascii::decimal(b, usize::MAX, u64::MAX)
 }
-fn reg_name_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric()
-        || matches!(
-            b,
-            b'-' | b'.'
-                | b'_'
-                | b'~'
-                | b'!'
-                | b'$'
-                | b'&'
-                | b'\''
-                | b'('
-                | b')'
-                | b'*'
-                | b'+'
-                | b','
-                | b';'
-                | b'='
-        )
-}
 fn authority(value: &[u8], port_required: bool) -> bool {
     if value.is_empty()
         || value
@@ -955,18 +935,7 @@ fn authority(value: &[u8], port_required: bool) -> bool {
         let Ok(ip) = std::str::from_utf8(value.get(1..end).unwrap_or_default()) else {
             return false;
         };
-        let future = ip
-            .strip_prefix('v')
-            .or_else(|| ip.strip_prefix('V'))
-            .is_some_and(|v| {
-                v.split_once('.').is_some_and(|(version, address)| {
-                    !version.is_empty()
-                        && version.bytes().all(|b| b.is_ascii_hexdigit())
-                        && !address.is_empty()
-                        && address.bytes().all(|b| reg_name_char(b) || b == b':')
-                })
-            });
-        if ip.parse::<std::net::Ipv6Addr>().is_err() && !future {
+        if !ascii::is_uri_ip_literal(ip) {
             return false;
         }
         value.get(end + 1..).unwrap_or_default()
@@ -974,7 +943,9 @@ fn authority(value: &[u8], port_required: bool) -> bool {
         let end = value.iter().position(|b| *b == b':').unwrap_or(value.len());
         let host = value.get(..end).unwrap_or_default();
         if host.is_empty()
-            || !host.iter().all(|b| reg_name_char(*b) || *b == b'%')
+            || !host
+                .iter()
+                .all(|b| ascii::is_uri_reg_name_char(*b) || *b == b'%')
             || !uri_path(host)
         {
             return false;
@@ -1001,29 +972,7 @@ fn uri_path(path: &[u8]) -> bool {
             }
             pos += 3;
         } else {
-            if !(b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'-' | b'.'
-                        | b'_'
-                        | b'~'
-                        | b'!'
-                        | b'$'
-                        | b'&'
-                        | b'\''
-                        | b'('
-                        | b')'
-                        | b'*'
-                        | b'+'
-                        | b','
-                        | b';'
-                        | b'='
-                        | b':'
-                        | b'@'
-                        | b'/'
-                        | b'?'
-                ))
-            {
+            if !(ascii::is_uri_reg_name_char(b) || b":@/?".contains(&b)) {
                 return false;
             }
             pos += 1;
@@ -1883,28 +1832,21 @@ impl Wire for StreamHeader {
     }
 }
 
-/// Reads one complete frame per call without holding input.
-///
-/// Declared payloads above [`MAX_FRAME_PAYLOAD`] or the smaller per-type
-/// limits, forbidden frame types, and invalid single-varint lengths end
-/// framing as soon as the header is known. Other complete-frame
-/// failures are error items, preserving the next boundary. Applications
-/// enforce the associated HTTP/3 connection or stream error policy.
-/// Partial frames return [`Step::Need`], including at EOF, so [`codec::Stream`]
-/// reports truncation. Allocation grows only when the driver receives bytes.
-impl Prefixed for Frame {
-    type Item = Result<Frame, Error>;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "HTTP/3 frames";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_FRAME
-    }
+fictionet::prefixed! {
+    /// Reads one complete frame per call without holding input.
+    ///
+    /// Declared payloads above [`MAX_FRAME_PAYLOAD`] or the smaller per-type
+    /// limits, forbidden frame types, and invalid single-varint lengths end
+    /// framing as soon as the header is known. Other complete-frame
+    /// failures are error items, preserving the next boundary. Applications
+    /// enforce the associated HTTP/3 connection or stream error policy.
+    /// Partial frames return [`Step::Need`], including at EOF, so [`codec::Stream`]
+    /// reports truncation. Allocation grows only when the driver receives bytes.
+    Frame => (Result<Frame, Error>, Error, ());
+    name = "HTTP/3 frames";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_FRAME }
 
     #[inline]
     fn parse_prefix(

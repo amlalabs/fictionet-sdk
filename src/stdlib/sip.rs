@@ -203,33 +203,27 @@ pub enum Error {
     Uri,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Incomplete => f.write_str("incomplete wire unit"),
-            Error::Trailing => f.write_str("bytes after wire unit"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::TooLong => write!(
-                f,
-                "head or header value over {MAX_HEAD} bytes or body over {MAX_BODY} bytes"
-            ),
-            Error::TooMany => write!(f, "over {MAX_HEADERS} headers or {MAX_VALUES} values"),
-            Error::LineEnding => f.write_str("CR or LF outside a CRLF pair"),
-            Error::Utf8 => f.write_str("head or header value is not UTF-8"),
-            Error::StartLine => f.write_str("malformed request or status line"),
-            Error::Version => f.write_str("version is not SIP/2.0"),
-            Error::HeaderLine => f.write_str("malformed header line"),
-            Error::HeaderValue => f.write_str("control character in a header value"),
-            Error::ContentLength => f.write_str("bad Content-Length"),
-            Error::MissingContentLength => f.write_str("no Content-Length"),
-            Error::Missing(name) => write!(f, "no {name} header"),
-            Error::HeaderSyntax(name) => write!(f, "malformed {name}"),
-            Error::Uri => f.write_str("malformed SIP URI"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Incomplete => f.write_str("incomplete wire unit"),
+    Error::Trailing => f.write_str("bytes after wire unit"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::TooLong => write!(
+        f,
+        "head or header value over {MAX_HEAD} bytes or body over {MAX_BODY} bytes"
+    ),
+    Error::TooMany => write!(f, "over {MAX_HEADERS} headers or {MAX_VALUES} values"),
+    Error::LineEnding => f.write_str("CR or LF outside a CRLF pair"),
+    Error::Utf8 => f.write_str("head or header value is not UTF-8"),
+    Error::StartLine => f.write_str("malformed request or status line"),
+    Error::Version => f.write_str("version is not SIP/2.0"),
+    Error::HeaderLine => f.write_str("malformed header line"),
+    Error::HeaderValue => f.write_str("control character in a header value"),
+    Error::ContentLength => f.write_str("bad Content-Length"),
+    Error::MissingContentLength => f.write_str("no Content-Length"),
+    Error::Missing(name) => write!(f, "no {name} header"),
+    Error::HeaderSyntax(name) => write!(f, "malformed {name}"),
+    Error::Uri => f.write_str("malformed SIP URI"),
+});
 
 /// The first line of a message: a request line or a status line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -633,21 +627,14 @@ fn read_wire(bytes: &[u8]) -> Result<Message, Error> {
     if bytes.len() > MAX_MESSAGE {
         return Err(Error::TooLong);
     }
-    let mut frames = Messages::new();
-    let mut rest = bytes;
-    loop {
-        match frames.decode(rest, true)? {
-            Step::Item(item, used) => {
-                let item = item?;
-                if used != rest.len() {
-                    return Err(Error::Trailing);
-                }
-                return Ok(item);
-            }
-            Step::Skip(used) => rest = rest.get(used..).ok_or(Error::Incomplete)?,
-            _ => return Err(Error::Incomplete),
-        }
-    }
+    fictionet::stdlib::codec::decode_exact(
+        Messages::new(),
+        bytes,
+        |e| e,
+        |e| e,
+        Error::Incomplete,
+        Error::Trailing,
+    )
 }
 
 impl Wire for Message {
@@ -1541,17 +1528,9 @@ fn parse_content_length(v: &str) -> Result<usize, Error> {
     if v.is_empty() || !v.bytes().all(|d| d.is_ascii_digit()) {
         return Err(Error::ContentLength);
     }
-    let mut n = 0usize;
-    for d in v.bytes() {
-        n = n
-            .checked_mul(10)
-            .and_then(|n| n.checked_add(usize::from(d - b'0')))
-            .ok_or(Error::TooLong)?;
-        if n > MAX_BODY {
-            return Err(Error::TooLong);
-        }
-    }
-    Ok(n)
+    fictionet::stdlib::codec::ascii::decimal(v.as_bytes(), usize::MAX, MAX_BODY as u64)
+        .map(|n| n as usize)
+        .ok_or(Error::TooLong)
 }
 
 /// Adds the items of a list header's value to `out`, trimmed. An empty
@@ -2091,44 +2070,8 @@ fn token_end(b: &[u8], mut i: usize) -> usize {
 }
 
 // Header values share UTF-8, size, round-trip, and transactional checks.
-macro_rules! wire_value {
-    ($ty:ty, $(#[$parse:meta])* parse, $(#[$write:meta])* write) => {
-        impl Wire for $ty {
-            type ParseError = Error;
-            type WriteError = Error;
 
-            $(#[$parse])*
-            /// Refuses input over [`MAX_HEAD`], invalid UTF-8, and values
-            /// whose canonical form exceeds that limit or changes a field.
-            fn parse(bytes: &[u8]) -> Result<Self, Error> {
-                if bytes.len() > MAX_HEAD {
-                    return Err(Error::TooLong);
-                }
-                let text = core::str::from_utf8(bytes).map_err(|_| Error::Utf8)?;
-                let value = Self::read_value(text)?;
-                value.write(&mut Vec::new())?;
-                Ok(value)
-            }
-
-            $(#[$write])*
-            /// Refuses values that would read back differently. Leaves `out`
-            /// unchanged on error. Output is bounded by [`MAX_HEAD`].
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                let text = self.format_value()?;
-                if text.len() > MAX_HEAD {
-                    return Err(Error::TooLong);
-                }
-                if Self::read_value(&text)? != *self {
-                    return Err(Error::Unwritable);
-                }
-                out.extend_from_slice(text.as_bytes());
-                Ok(())
-            }
-        }
-    };
-}
-
-wire_value!(
+fictionet::text_wire!(Error, MAX_HEAD,
     Uri,
     /// Reads a SIP or SIPS URI. The scheme may be in any case. Other
     /// schemes, such as `tel:`, are [`Error::Uri`], and so is a parameter
@@ -2142,7 +2085,7 @@ wire_value!(
     write
 );
 
-wire_value!(
+fictionet::text_wire!(Error, MAX_HEAD,
     NameAddr,
     /// Reads a name-addr (`Name <uri>;params`) or an addr-spec
     /// (`uri;params`). In the second form, everything after the first `;`
@@ -2160,7 +2103,7 @@ wire_value!(
     write
 );
 
-wire_value!(
+fictionet::text_wire!(Error, MAX_HEAD,
     Contacts,
     /// Reads a Contact header's value: `*` or at least one address, with
     /// no empty items. A value over [`MAX_HEAD`] bytes is
@@ -2175,7 +2118,7 @@ wire_value!(
     write
 );
 
-wire_value!(
+fictionet::text_wire!(Error, MAX_HEAD,
     Via,
     /// Reads one Via value. Spaces around the slashes and around the colon
     /// before the port are allowed, as RFC 3261 allows them. A parameter
@@ -2189,7 +2132,7 @@ wire_value!(
     write
 );
 
-wire_value!(
+fictionet::text_wire!(Error, MAX_HEAD,
     CSeq,
     /// Reads a CSeq value. Refuses sequence numbers of 2^31 or more;
     /// [`Message::cseq`] can inspect any 32-bit received number.

@@ -23,8 +23,7 @@
 //! message is up to world code. After the header item, the body stays
 //! unread for `Stream::swap` into a bounded collector or multipart decoder.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A header section is at most [`MAX_HEADER_BYTES`] long and holds
+//! A header section is at most [`MAX_HEADER_BYTES`] long and holds
 //! at most [`MAX_FIELDS`] fields. Comments nest at most
 //! [`MAX_COMMENT_DEPTH`] deep. Every writer checks what it is given and
 //! returns an [`Error`] rather than write something the readers here would

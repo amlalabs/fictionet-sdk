@@ -297,15 +297,10 @@ pub enum TlsError {
     Tls(rustls::Error),
 }
 
-impl std::fmt::Display for TlsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Conn(e) => e.fmt(f),
-            Self::Tls(e) => e.fmt(f),
-        }
-    }
-}
-impl std::error::Error for TlsError {}
+fictionet::error_display!(TlsError, f, {
+    Self::Conn(e) => e.fmt(f),
+    Self::Tls(e) => e.fmt(f),
+});
 
 /// The client's TLS: verify against `roots`, or not at all.
 pub fn client_config(

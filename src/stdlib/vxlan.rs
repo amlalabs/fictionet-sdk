@@ -30,8 +30,7 @@
 //! [`GpePacket::parse`], and sends the bytes of what it answers. Which
 //! networks exist, and what is on them, is up to world code.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Reserved bits are ignored on receipt and written as zero, as both
+//! Reserved bits are ignored on receipt and written as zero, as both
 //! specifications say, so a packet read and written again may differ from
 //! the bytes it came from only in those bits. Writers return an error,
 //! rather than change the packet, when a field does not fit: a VNI wider
@@ -230,8 +229,8 @@ fn split(b: &[u8]) -> Result<(u8, u32, &[u8]), Error> {
 
 /// Writes a header with the given flags byte, next-protocol field and
 /// VNI, then the payload. Checks the VNI and the payload's length before
-/// it allocates.
-fn write(first: u8, next: u8, vni: u32, payload: &[u8]) -> Result<Vec<u8>, Error> {
+/// it appends to the destination.
+fn write(first: u8, next: u8, vni: u32, payload: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
     if vni > MAX_VNI {
         return Err(Error::Unwritable);
     }
@@ -239,10 +238,10 @@ fn write(first: u8, next: u8, vni: u32, payload: &[u8]) -> Result<Vec<u8>, Error
         return Err(Error::Unwritable);
     }
     let v = vni.to_be_bytes();
-    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
+    out.reserve(HEADER_LEN + payload.len());
     out.extend_from_slice(&[first, 0, 0, next, v[1], v[2], v[3], 0]);
     out.extend_from_slice(payload);
-    Ok(out)
+    Ok(())
 }
 
 impl Wire for Packet {
@@ -266,10 +265,7 @@ impl Wire for Packet {
     /// Appends the VXLAN header and Ethernet frame. Refuses VNIs wider than 24 bits
     /// and frames above [`MAX_PAYLOAD`]. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        let out = write(flags::I, 0, self.vni, &self.frame)?;
-
-        dst.extend_from_slice(&out);
-        Ok(())
+        write(flags::I, 0, self.vni, &self.frame, dst)
     }
 }
 
@@ -327,15 +323,13 @@ impl Wire for GpePacket {
         if self.oam {
             first |= flags::O;
         }
-        let out = write(
+        write(
             first,
             self.next_protocol.unwrap_or(0),
             self.vni,
             &self.payload,
-        )?;
-
-        dst.extend_from_slice(&out);
-        Ok(())
+            dst,
+        )
     }
 }
 

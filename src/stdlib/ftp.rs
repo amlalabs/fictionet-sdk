@@ -21,8 +21,7 @@
 //! [`Stream<Replies>`](fictionet::stdlib::codec::Stream). Both accept CRLF and bare LF.
 //! Which files exist, who may log in, and what commands do belong to world code.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A line longer than [`MAX_LINE`] is an error, and a server's
+//! A line longer than [`MAX_LINE`] is an error, and a server's
 //! decoder skips it and goes on to the next line, as real servers do. The
 //! error says which reply a server sends: a bad line (an error item from
 //! [`Commands`]) is answered with [`code::SYNTAX_ERROR`] (500), and a bad
@@ -182,30 +181,24 @@ pub enum Error {
     Trailing,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::LineTooLong => f.write_str("line too long"),
-            Error::Empty => f.write_str("empty command line"),
-            Error::Verb => f.write_str("command verb is not one to four letters"),
-            Error::Text => f.write_str("line is not UTF-8 text without a bare CR or NUL"),
-            Error::Syntax => f.write_str("reply does not start with a code from 100 to 599"),
-            Error::TooManyLines => f.write_str("reply has too many lines"),
-            Error::MissingArgument => f.write_str("missing argument"),
-            Error::UnexpectedArgument => f.write_str("unexpected argument"),
-            Error::InvalidArgument => f.write_str("invalid argument"),
-            Error::Address => f.write_str("malformed address"),
-            Error::Family => f.write_str("address family is not 1 (IPv4) or 2 (IPv6)"),
-            Error::Code(c) => write!(f, "reply code {c} does not carry what was asked of it"),
-            Error::Feature => f.write_str("malformed feature line"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Incomplete => f.write_str("incomplete FTP command or reply"),
-            Error::Trailing => f.write_str("bytes after FTP command or reply"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::LineTooLong => f.write_str("line too long"),
+    Error::Empty => f.write_str("empty command line"),
+    Error::Verb => f.write_str("command verb is not one to four letters"),
+    Error::Text => f.write_str("line is not UTF-8 text without a bare CR or NUL"),
+    Error::Syntax => f.write_str("reply does not start with a code from 100 to 599"),
+    Error::TooManyLines => f.write_str("reply has too many lines"),
+    Error::MissingArgument => f.write_str("missing argument"),
+    Error::UnexpectedArgument => f.write_str("unexpected argument"),
+    Error::InvalidArgument => f.write_str("invalid argument"),
+    Error::Address => f.write_str("malformed address"),
+    Error::Family => f.write_str("address family is not 1 (IPv4) or 2 (IPv6)"),
+    Error::Code(c) => write!(f, "reply code {c} does not carry what was asked of it"),
+    Error::Feature => f.write_str("malformed feature line"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Incomplete => f.write_str("incomplete FTP command or reply"),
+    Error::Trailing => f.write_str("bytes after FTP command or reply"),
+});
 
 impl Command {
     /// A command with `verb` and `arg`.
@@ -1595,32 +1588,6 @@ impl Decode for Replies {
     }
 }
 
-/// Reads one unit, preserving item errors before checking trailing bytes.
-fn exact<D, T, E, P>(
-    mut decoder: D,
-    mut bytes: &[u8],
-    item_error: impl Fn(E) -> P,
-    framing_error: impl Fn(D::Error) -> P,
-    incomplete: P,
-    trailing: P,
-) -> Result<T, P>
-where
-    D: Decode<Item = Result<T, E>>,
-{
-    loop {
-        match decoder.decode(bytes, true).map_err(&framing_error)? {
-            Step::Item(Err(e), _) => return Err(item_error(e)),
-            Step::Item(Ok(item), used) if used == bytes.len() => return Ok(item),
-            Step::Item(_, _) => return Err(trailing),
-            Step::Skip(used) => match bytes.get(used..) {
-                Some(rest) => bytes = rest,
-                None => return Err(incomplete),
-            },
-            Step::Need | Step::End => return Err(incomplete),
-        }
-    }
-}
-
 impl Wire for Command {
     type ParseError = Error;
     type WriteError = Error;
@@ -1630,7 +1597,7 @@ impl Wire for Command {
     /// verbs, UTF-8, Telnet sequences, or argument text, incomplete lines,
     /// and trailing bytes. Checks [`MAX_LINE`] before trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        exact(
+        fictionet::stdlib::codec::decode_exact(
             Commands::new(),
             bytes,
             |e| e,
@@ -1730,7 +1697,7 @@ impl Wire for Reply {
     /// invalid codes or UTF-8, CR or NUL in text, lines above [`MAX_LINE`],
     /// more than [`MAX_REPLY_LINES`], incomplete input, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        exact(
+        fictionet::stdlib::codec::decode_exact(
             Replies::new(),
             bytes,
             |e| e,

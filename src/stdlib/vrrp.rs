@@ -150,7 +150,7 @@ pub mod auth {
     pub const IP_AH: u8 = 2;
 }
 
-use fictionet::stdlib::ip::Endpoints;
+use fictionet::stdlib::ip::{self, Endpoints};
 
 /// A version 2 advertisement (RFC 3768). It is always carried over IPv4.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -317,52 +317,26 @@ impl From<AdvertisementV3> for Advertisement {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::TooLong => write!(f, "VRRP payload exceeds {MAX_MESSAGE} bytes"),
-            Error::Truncated => write!(f, "the advertisement is cut short"),
-            Error::Trailing { remaining } => {
-                write!(f, "{remaining} bytes after the VRRP advertisement")
-            }
-            Error::Version(v) => write!(f, "version {v}, not 2 or 3"),
-            Error::Type(t) => write!(f, "type {t}, not 1 (advertisement)"),
-            Error::Vrid => write!(f, "VRID 0, outside 1..=255"),
-            Error::NoAddresses => write!(f, "an advertisement with no addresses"),
-            Error::AuthType(t) => write!(f, "authentication type {t}, not 0, 1 or 2"),
-            Error::LinkLocal => write!(f, "an IPv6 source or first address that is not link-local"),
-            Error::TooManyAddresses(n) => write!(f, "{n} addresses, more than {MAX_ADDRESSES}"),
-            Error::Interval(i) => write!(f, "interval {i}, above {MAX_INTERVAL_V3}"),
-            Error::Family => write!(
-                f,
-                "the addresses and the IP packet are of different families"
-            ),
-            Error::Checksum => write!(f, "the checksum is wrong"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::TooLong => write!(f, "VRRP payload exceeds {MAX_MESSAGE} bytes"),
+    Error::Truncated => write!(f, "the advertisement is cut short"),
+    Error::Trailing { remaining } => {
+        write!(f, "{remaining} bytes after the VRRP advertisement")
     }
-}
-
-impl std::error::Error for Error {}
-
-/// Adds `b` to a ones' complement sum, as 16-bit words with a zero byte
-/// added to an odd length.
-fn sum_words(mut sum: u64, b: &[u8]) -> u64 {
-    let (words, rest) = b.as_chunks::<2>();
-    for w in words {
-        sum += u64::from(u16::from_be_bytes([w[0], w[1]]));
-    }
-    if let [last] = rest {
-        sum += u64::from(*last) << 8;
-    }
-    sum
-}
-
-fn fold(mut sum: u64) -> u16 {
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    sum as u16
-}
+    Error::Version(v) => write!(f, "version {v}, not 2 or 3"),
+    Error::Type(t) => write!(f, "type {t}, not 1 (advertisement)"),
+    Error::Vrid => write!(f, "VRID 0, outside 1..=255"),
+    Error::NoAddresses => write!(f, "an advertisement with no addresses"),
+    Error::AuthType(t) => write!(f, "authentication type {t}, not 0, 1 or 2"),
+    Error::LinkLocal => write!(f, "an IPv6 source or first address that is not link-local"),
+    Error::TooManyAddresses(n) => write!(f, "{n} addresses, more than {MAX_ADDRESSES}"),
+    Error::Interval(i) => write!(f, "interval {i}, above {MAX_INTERVAL_V3}"),
+    Error::Family => write!(
+        f,
+        "the addresses and the IP packet are of different families"
+    ),
+    Error::Checksum => write!(f, "the checksum is wrong"),
+});
 
 /// The checksum the advertisement in `b` should carry (RFC 9568 section
 /// 5.2.8), worked out with its checksum field (bytes 6 and 7) taken as
@@ -395,8 +369,8 @@ fn sum_with(b: &[u8], endpoints: &Endpoints, v4_pseudo_header: bool) -> Option<u
     if b.len() < HEADER_LEN || b.len() > MAX_MESSAGE {
         return None;
     }
-    let mut sum = sum_words(0, &b[..6]);
-    sum = sum_words(sum, &b[HEADER_LEN..]);
+    let mut sum = ip::sum(0, &b[..6]);
+    sum = ip::sum(sum, &b[HEADER_LEN..]);
     if b[0] >> 4 == 3 {
         // MAX_MESSAGE fits in 16 bits, so the length does too.
         let len = b.len() as u16;
@@ -406,24 +380,24 @@ fn sum_with(b: &[u8], endpoints: &Endpoints, v4_pseudo_header: bool) -> Option<u
                 destination,
             } => {
                 if v4_pseudo_header {
-                    sum = sum_words(sum, &source.octets());
-                    sum = sum_words(sum, &destination.octets());
-                    sum = sum_words(sum, &[0, PROTOCOL]);
-                    sum = sum_words(sum, &len.to_be_bytes());
+                    sum = ip::sum(sum, &source.octets());
+                    sum = ip::sum(sum, &destination.octets());
+                    sum = ip::sum(sum, &[0, PROTOCOL]);
+                    sum = ip::sum(sum, &len.to_be_bytes());
                 }
             }
             Endpoints::V6 {
                 source,
                 destination,
             } => {
-                sum = sum_words(sum, &source.octets());
-                sum = sum_words(sum, &destination.octets());
-                sum = sum_words(sum, &u32::from(len).to_be_bytes());
-                sum = sum_words(sum, &[0, 0, 0, PROTOCOL]);
+                sum = ip::sum(sum, &source.octets());
+                sum = ip::sum(sum, &destination.octets());
+                sum = ip::sum(sum, &u32::from(len).to_be_bytes());
+                sum = ip::sum(sum, &[0, 0, 0, PROTOCOL]);
             }
         }
     }
-    Some(!fold(sum))
+    Some(ip::fold(sum))
 }
 
 /// Whether the checksum field `got` matches `want`. In ones' complement
@@ -713,38 +687,13 @@ fn v4_addresses(b: &[u8]) -> Vec<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg};
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Advertisement, Error> {
-        use fictionet::stdlib::codec::Decode;
-        let make = || Collect::bytes(MAX_MESSAGE).map(|d| Advertisement::parse(&d, e));
-        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
-        assert_eq!(
-            fictionet::stdlib::test_support::decode_all(|| Collect::bytes(MAX_MESSAGE), b),
-            if b.len() <= MAX_MESSAGE {
-                (vec![b.to_vec()], None)
-            } else {
-                (
-                    vec![],
-                    Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE })),
-                )
-            }
-        );
-        let parsed = Advertisement::parse(b, e);
-        let (items, failure) = decode_all(make, b);
-        if b.len() <= MAX_MESSAGE {
-            assert_eq!(failure, None);
-            assert_eq!(items, vec![parsed.clone()]);
-        } else {
-            assert_eq!(
-                failure,
-                Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE }))
-            );
-        }
-        parsed
+        contract::check_collect_with(b, MAX_MESSAGE, |b| Advertisement::parse(b, e))
     }
 
     fn ip4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
@@ -878,7 +827,7 @@ mod tests {
         ph.extend_from_slice(&(b.len() as u32).to_be_bytes());
         ph.extend_from_slice(&[0, 0, 0, 112]);
         ph.extend_from_slice(&b);
-        assert_eq!(fold(sum_words(0, &ph)), 0xffff);
+        assert_eq!(!ip::fold(ip::sum(0, &ph)), 0xffff);
         // Another source makes the checksum wrong.
         let moved = Endpoints::V6 {
             source: "fe80::3".parse().unwrap(),

@@ -371,46 +371,40 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Truncated => write!(f, "message cut short"),
-            Error::Command(c) => write!(f, "command {c}, not 1 or 2"),
-            Error::Version(v) => write!(f, "unknown version {v}"),
-            Error::MustBeZero { offset } => {
-                write!(f, "must-be-zero field at offset {offset} is not zero")
-            }
-            Error::Family { entry, family } => {
-                write!(f, "entry {entry} has address family {family}")
-            }
-            Error::AuthPlace { entry } => {
-                write!(f, "authentication entry {entry} is not the first")
-            }
-            Error::WholeTable { entry } => {
-                write!(f, "entry {entry} is a malformed whole-table request")
-            }
-            Error::Metric { entry, metric } => write!(f, "entry {entry} has metric {metric}"),
-            Error::Mask { entry } => write!(f, "entry {entry} has a mask that is not contiguous"),
-            Error::PrefixLength { entry, len } => {
-                write!(f, "entry {entry} has prefix length {len}")
-            }
-            Error::PacketLength(n) => write!(f, "authentication packet length {n} is not valid"),
-            Error::Trailer => write!(f, "authentication trailer header is not 0xffff 0x0001"),
-            Error::AuthDataTooLong => write!(f, "authentication trailer is too long"),
-            Error::AuthDataLen { declared, actual } => {
-                write!(
-                    f,
-                    "authentication data is {actual} bytes, entry says {declared}"
-                )
-            }
-            Error::NoEntries => write!(f, "message has no entries"),
-            Error::TooManyEntries => write!(f, "message has too many entries"),
-            Error::Unwritable => write!(f, "value cannot be written without changing it"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Truncated => write!(f, "message cut short"),
+    Error::Command(c) => write!(f, "command {c}, not 1 or 2"),
+    Error::Version(v) => write!(f, "unknown version {v}"),
+    Error::MustBeZero { offset } => {
+        write!(f, "must-be-zero field at offset {offset} is not zero")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Family { entry, family } => {
+        write!(f, "entry {entry} has address family {family}")
+    }
+    Error::AuthPlace { entry } => {
+        write!(f, "authentication entry {entry} is not the first")
+    }
+    Error::WholeTable { entry } => {
+        write!(f, "entry {entry} is a malformed whole-table request")
+    }
+    Error::Metric { entry, metric } => write!(f, "entry {entry} has metric {metric}"),
+    Error::Mask { entry } => write!(f, "entry {entry} has a mask that is not contiguous"),
+    Error::PrefixLength { entry, len } => {
+        write!(f, "entry {entry} has prefix length {len}")
+    }
+    Error::PacketLength(n) => write!(f, "authentication packet length {n} is not valid"),
+    Error::Trailer => write!(f, "authentication trailer header is not 0xffff 0x0001"),
+    Error::AuthDataTooLong => write!(f, "authentication trailer is too long"),
+    Error::AuthDataLen { declared, actual } => {
+        write!(
+            f,
+            "authentication data is {actual} bytes, entry says {declared}"
+        )
+    }
+    Error::NoEntries => write!(f, "message has no entries"),
+    Error::TooManyEntries => write!(f, "message has too many entries"),
+    Error::Unwritable => write!(f, "value cannot be written without changing it"),
+});
 
 impl Message {
     /// Whether the message fits the [`MAX_DATAGRAM`] sending limit,
@@ -994,33 +988,13 @@ impl Wire for NgMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg, Stream};
+    use fictionet::stdlib::codec::{Collect, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn collect(b: &[u8]) -> Result<Message, Error> {
-        let make = || Collect::<Message>::new(MAX_MESSAGE);
-        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
-        contract::check_wire::<Message>(b);
-        let parsed = Message::parse(b);
-        let (items, failure) = decode_all(make, b);
-        if b.len() <= MAX_MESSAGE {
-            assert_eq!(
-                failure,
-                parsed
-                    .clone()
-                    .err()
-                    .map(|e| Fail::Protocol(CollectError::Parse(e)))
-            );
-            assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
-        } else {
-            assert_eq!(
-                failure,
-                Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE }))
-            );
-        }
-        parsed
+        contract::check_collect::<Message>(b, MAX_MESSAGE)
     }
 
     fn ip4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
@@ -1076,30 +1050,7 @@ mod tests {
     }
 
     fn ng_collect(b: &[u8]) -> Result<NgMessage, Error> {
-        let make = || Collect::<NgMessage>::new(MAX_NG_MESSAGE);
-        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_NG_MESSAGE + 1));
-        contract::check_wire::<NgMessage>(b);
-        let parsed = NgMessage::parse(b);
-        let (items, failure) = decode_all(make, b);
-        if b.len() <= MAX_NG_MESSAGE {
-            assert_eq!(
-                failure,
-                parsed
-                    .clone()
-                    .err()
-                    .map(|e| Fail::Protocol(CollectError::Parse(e)))
-            );
-            assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
-        } else {
-            assert!(items.is_empty());
-            assert_eq!(
-                failure,
-                Some(Fail::Protocol(CollectError::TooLong {
-                    limit: MAX_NG_MESSAGE
-                }))
-            );
-        }
-        parsed
+        contract::check_collect::<NgMessage>(b, MAX_NG_MESSAGE)
     }
 
     fn check(b: &[u8]) -> Result<Message, Error> {

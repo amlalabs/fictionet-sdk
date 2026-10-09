@@ -503,50 +503,44 @@ impl Error {
     }
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::Truncated => f.write_str("message cut short"),
-            Error::TrailingBytes(n) => write!(f, "{n} bytes after the message"),
-            Error::TopBits(b) => {
-                write!(f, "first byte {b:#04x} has its top bits set, not STUN")
-            }
-            Error::Length(n) => write!(f, "message length {n} is not a multiple of 4"),
-            Error::MagicCookie(c) => write!(f, "magic cookie {c:#010x}, not 0x2112a442"),
-            Error::AttributeTruncated { typ } => {
-                write!(f, "attribute {typ:#06x} runs past the message")
-            }
-            Error::TooManyAttributes => write!(f, "more than {MAX_ATTRIBUTES} attributes"),
-            Error::AttributeValue { typ, len } => {
-                write!(f, "attribute {typ:#06x} has a bad length {len}")
-            }
-            Error::AddressFamily(fam) => write!(f, "address family {fam}, not 1 or 2"),
-            Error::Text { typ } => {
-                write!(f, "attribute {typ:#06x} is not UTF-8 or is too long")
-            }
-            Error::ErrorCode { class, number } => {
-                write!(f, "error code class {class} number {number}")
-            }
-            Error::FingerprintNotLast => f.write_str("FINGERPRINT is not the last attribute"),
-            Error::Fingerprint { expected, found } => {
-                write!(
-                    f,
-                    "FINGERPRINT {found:#010x}, the message gives {expected:#010x}"
-                )
-            }
-            Error::Method(method) => write!(f, "method {method:#06x} exceeds 12 bits"),
-            Error::BodyTooLong => write!(f, "message body exceeds {MAX_BODY} bytes"),
-            Error::Unwritable { typ } => {
-                write!(
-                    f,
-                    "value cannot be written without changing it: attribute {typ:#06x}"
-                )
-            }
-        }
+fictionet::error_display!(Error, f, {
+    Error::Truncated => f.write_str("message cut short"),
+    Error::TrailingBytes(n) => write!(f, "{n} bytes after the message"),
+    Error::TopBits(b) => {
+        write!(f, "first byte {b:#04x} has its top bits set, not STUN")
     }
-}
-
-impl core::error::Error for Error {}
+    Error::Length(n) => write!(f, "message length {n} is not a multiple of 4"),
+    Error::MagicCookie(c) => write!(f, "magic cookie {c:#010x}, not 0x2112a442"),
+    Error::AttributeTruncated { typ } => {
+        write!(f, "attribute {typ:#06x} runs past the message")
+    }
+    Error::TooManyAttributes => write!(f, "more than {MAX_ATTRIBUTES} attributes"),
+    Error::AttributeValue { typ, len } => {
+        write!(f, "attribute {typ:#06x} has a bad length {len}")
+    }
+    Error::AddressFamily(fam) => write!(f, "address family {fam}, not 1 or 2"),
+    Error::Text { typ } => {
+        write!(f, "attribute {typ:#06x} is not UTF-8 or is too long")
+    }
+    Error::ErrorCode { class, number } => {
+        write!(f, "error code class {class} number {number}")
+    }
+    Error::FingerprintNotLast => f.write_str("FINGERPRINT is not the last attribute"),
+    Error::Fingerprint { expected, found } => {
+        write!(
+            f,
+            "FINGERPRINT {found:#010x}, the message gives {expected:#010x}"
+        )
+    }
+    Error::Method(method) => write!(f, "method {method:#06x} exceeds 12 bits"),
+    Error::BodyTooLong => write!(f, "message body exceeds {MAX_BODY} bytes"),
+    Error::Unwritable { typ } => {
+        write!(
+            f,
+            "value cannot be written without changing it: attribute {typ:#06x}"
+        )
+    }
+});
 
 impl Message {
     /// A message with no attributes and no FINGERPRINT.
@@ -912,20 +906,14 @@ impl Wire for Frame {
     }
 }
 
-/// Frames one STUN message and yields its uninterpreted bytes.
-/// Partial input needs more bytes, including at EOF. The stream reports truncation.
-impl Prefixed for Frame {
-    type Item = Vec<u8>;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "STUN";
-    fn default_limit() -> Self::Limit {}
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit
-    }
-    fn capacity(_: &Self::Limit) -> usize {
-        MAX_MESSAGE
-    }
+fictionet::prefixed! {
+    /// Frames one STUN message and yields its uninterpreted bytes.
+    /// Partial input needs more bytes, including at EOF. The stream reports truncation.
+    Frame => (Vec<u8>, Error, ());
+    name = "STUN";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_) { MAX_MESSAGE }
     fn parse_prefix(input: &[u8], _: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Error> {
         Ok(header(input)?.map(|total| (input[..total].to_vec(), total)))
     }

@@ -33,8 +33,7 @@
 //! values stay as the bytes on the wire. The docs of [`Packet::reply`]
 //! say which bytes each authenticator is taken over.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A packet whose attributes do not fit its length is refused
+//! A packet whose attributes do not fit its length is refused
 //! whole, as RFC 2865 asks. A single attribute whose value does not fit
 //! its type is only an error when that value is read, so a world can
 //! skip attributes it does not use, as RFC 6929 asks. Every writer
@@ -71,7 +70,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::codec::Wire;
@@ -427,36 +425,30 @@ pub enum Error {
     Range,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Short(n) => write!(f, "{n} bytes, fewer than the 20-byte RADIUS header"),
-            Error::Length { length, limit } => {
-                write!(f, "length field {length}, outside {HEADER_LEN}..={limit}")
-            }
-            Error::Trailing { remaining } => write!(f, "{remaining} bytes after RADIUS packet"),
-            Error::Unwritable => f.write_str("RADIUS value cannot be written without changing it"),
-            Error::Truncated { length, got } => {
-                write!(f, "length field {length}, but only {got} bytes came")
-            }
-            Error::Attribute(at) => {
-                write!(f, "the attribute at offset {at} does not fit the packet")
-            }
-            Error::ValueLength(n) => {
-                write!(f, "a value of {n} bytes, a length its type does not allow")
-            }
-            Error::Text => f.write_str("text that is not UTF-8"),
-            Error::Prefix => f.write_str("a malformed address prefix"),
-            Error::Nested => {
-                f.write_str("a TLV or vendor sub-attribute that does not fit its value")
-            }
-            Error::Fragment => f.write_str("long extended attribute fragments that do not join"),
-            Error::Range => f.write_str("a number outside the range its attribute allows"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Short(n) => write!(f, "{n} bytes, fewer than the 20-byte RADIUS header"),
+    Error::Length { length, limit } => {
+        write!(f, "length field {length}, outside {HEADER_LEN}..={limit}")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Trailing { remaining } => write!(f, "{remaining} bytes after RADIUS packet"),
+    Error::Unwritable => f.write_str("RADIUS value cannot be written without changing it"),
+    Error::Truncated { length, got } => {
+        write!(f, "length field {length}, but only {got} bytes came")
+    }
+    Error::Attribute(at) => {
+        write!(f, "the attribute at offset {at} does not fit the packet")
+    }
+    Error::ValueLength(n) => {
+        write!(f, "a value of {n} bytes, a length its type does not allow")
+    }
+    Error::Text => f.write_str("text that is not UTF-8"),
+    Error::Prefix => f.write_str("a malformed address prefix"),
+    Error::Nested => {
+        f.write_str("a TLV or vendor sub-attribute that does not fit its value")
+    }
+    Error::Fragment => f.write_str("long extended attribute fragments that do not join"),
+    Error::Range => f.write_str("a number outside the range its attribute allows"),
+});
 
 impl Wire for Attribute {
     type ParseError = Error;
@@ -765,50 +757,36 @@ impl Wire for Packet {
     }
 }
 
-/// Reads RADIUS over TCP or TLS packets without retaining input.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`] for a buffer bounded by [`limit`](fictionet::stdlib::codec::Frames::limit).
-/// The first four bytes suffice to refuse an invalid or excessive length. Partial packets
-/// return [`fictionet::stdlib::codec::Step::Need`], including at EOF, so the driver reports truncation.
-/// An invalid length or malformed attributes ends the stream.
-/// [RFC 6613 §2.6.4] requires closing the connection on malformed attributes.
-///
-/// [RFC 6613 §2.6.4]: https://www.rfc-editor.org/rfc/rfc6613.html#section-2.6.4
-///
-/// ```
-/// use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
-/// use fictionet::stdlib::radius::{Code, Packet};
-/// let packet = Packet::new(Code::AccessRequest, 7, [0; 16]);
-/// let bytes = Wire::to_bytes(&packet)?;
-/// let mut stream = Stream::new(Frames::<Packet>::with_limit(1024));
-/// let mut packets = Vec::new();
-/// for chunk in bytes.chunks(3) {
-///     pump(&mut stream, chunk, |item| packets.push(item))?;
-/// }
-/// finish(&mut stream, |item| packets.push(item))?;
-/// assert_eq!(packets, vec![packet]);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-impl Prefixed for Packet {
-    type Item = Packet;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "RADIUS";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_PACKET
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.clamp(HEADER_LEN, MAX_PACKET)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        *limit
-    }
+fictionet::prefixed! {
+    /// Reads RADIUS over TCP or TLS packets without retaining input.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`] for a buffer bounded by [`limit`](fictionet::stdlib::codec::Frames::limit).
+    /// The first four bytes suffice to refuse an invalid or excessive length. Partial packets
+    /// return [`fictionet::stdlib::codec::Step::Need`], including at EOF, so the driver reports truncation.
+    /// An invalid length or malformed attributes ends the stream.
+    /// [RFC 6613 §2.6.4] requires closing the connection on malformed attributes.
+    ///
+    /// [RFC 6613 §2.6.4]: https://www.rfc-editor.org/rfc/rfc6613.html#section-2.6.4
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
+    /// use fictionet::stdlib::radius::{Code, Packet};
+    /// let packet = Packet::new(Code::AccessRequest, 7, [0; 16]);
+    /// let bytes = Wire::to_bytes(&packet)?;
+    /// let mut stream = Stream::new(Frames::<Packet>::with_limit(1024));
+    /// let mut packets = Vec::new();
+    /// for chunk in bytes.chunks(3) {
+    ///     pump(&mut stream, chunk, |item| packets.push(item))?;
+    /// }
+    /// finish(&mut stream, |item| packets.push(item))?;
+    /// assert_eq!(packets, vec![packet]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    Packet => (Packet, Error, usize);
+    name = "RADIUS";
+    default { MAX_PACKET }
+    normalize(limit) { limit.clamp(HEADER_LEN, MAX_PACKET) }
+    capacity(limit) { *limit }
 
     #[inline]
     fn parse_prefix(
@@ -1449,217 +1427,133 @@ impl Extended {
     }
 }
 
-/// Attribute type numbers: every standard type from 1 to 101 in the IANA
-/// registry, and the extended types of RFC 6929. Each is in the
-/// [`DICTIONARY`] under its RFC name, such as User-Name for
-/// [`attr::USER_NAME`].
-pub mod attr {
-    /// The USER-NAME attribute type.
-    pub const USER_NAME: u8 = 1;
-    /// The USER-PASSWORD attribute type.
-    pub const USER_PASSWORD: u8 = 2;
-    /// The CHAP-PASSWORD attribute type.
-    pub const CHAP_PASSWORD: u8 = 3;
-    /// The NAS-IP-ADDRESS attribute type.
-    pub const NAS_IP_ADDRESS: u8 = 4;
-    /// The NAS-PORT attribute type.
-    pub const NAS_PORT: u8 = 5;
-    /// The SERVICE-TYPE attribute type.
-    pub const SERVICE_TYPE: u8 = 6;
-    /// The FRAMED-PROTOCOL attribute type.
-    pub const FRAMED_PROTOCOL: u8 = 7;
-    /// The FRAMED-IP-ADDRESS attribute type.
-    pub const FRAMED_IP_ADDRESS: u8 = 8;
-    /// The FRAMED-IP-NETMASK attribute type.
-    pub const FRAMED_IP_NETMASK: u8 = 9;
-    /// The FRAMED-ROUTING attribute type.
-    pub const FRAMED_ROUTING: u8 = 10;
-    /// The FILTER-ID attribute type.
-    pub const FILTER_ID: u8 = 11;
-    /// The FRAMED-MTU attribute type.
-    pub const FRAMED_MTU: u8 = 12;
-    /// The FRAMED-COMPRESSION attribute type.
-    pub const FRAMED_COMPRESSION: u8 = 13;
-    /// The LOGIN-IP-HOST attribute type.
-    pub const LOGIN_IP_HOST: u8 = 14;
-    /// The LOGIN-SERVICE attribute type.
-    pub const LOGIN_SERVICE: u8 = 15;
-    /// The LOGIN-TCP-PORT attribute type.
-    pub const LOGIN_TCP_PORT: u8 = 16;
-    /// The REPLY-MESSAGE attribute type.
-    pub const REPLY_MESSAGE: u8 = 18;
-    /// The CALLBACK-NUMBER attribute type.
-    pub const CALLBACK_NUMBER: u8 = 19;
-    /// The CALLBACK-ID attribute type.
-    pub const CALLBACK_ID: u8 = 20;
-    /// The FRAMED-ROUTE attribute type.
-    pub const FRAMED_ROUTE: u8 = 22;
-    /// The FRAMED-IPX-NETWORK attribute type.
-    pub const FRAMED_IPX_NETWORK: u8 = 23;
-    /// The STATE attribute type.
-    pub const STATE: u8 = 24;
-    /// The CLASS attribute type.
-    pub const CLASS: u8 = 25;
-    /// The VENDOR-SPECIFIC attribute type.
-    pub const VENDOR_SPECIFIC: u8 = 26;
-    /// The SESSION-TIMEOUT attribute type.
-    pub const SESSION_TIMEOUT: u8 = 27;
-    /// The IDLE-TIMEOUT attribute type.
-    pub const IDLE_TIMEOUT: u8 = 28;
-    /// The TERMINATION-ACTION attribute type.
-    pub const TERMINATION_ACTION: u8 = 29;
-    /// The CALLED-STATION-ID attribute type.
-    pub const CALLED_STATION_ID: u8 = 30;
-    /// The CALLING-STATION-ID attribute type.
-    pub const CALLING_STATION_ID: u8 = 31;
-    /// The NAS-IDENTIFIER attribute type.
-    pub const NAS_IDENTIFIER: u8 = 32;
-    /// The PROXY-STATE attribute type.
-    pub const PROXY_STATE: u8 = 33;
-    /// The LOGIN-LAT-SERVICE attribute type.
-    pub const LOGIN_LAT_SERVICE: u8 = 34;
-    /// The LOGIN-LAT-NODE attribute type.
-    pub const LOGIN_LAT_NODE: u8 = 35;
-    /// The LOGIN-LAT-GROUP attribute type.
-    pub const LOGIN_LAT_GROUP: u8 = 36;
-    /// The FRAMED-APPLETALK-LINK attribute type.
-    pub const FRAMED_APPLETALK_LINK: u8 = 37;
-    /// The FRAMED-APPLETALK-NETWORK attribute type.
-    pub const FRAMED_APPLETALK_NETWORK: u8 = 38;
-    /// The FRAMED-APPLETALK-ZONE attribute type.
-    pub const FRAMED_APPLETALK_ZONE: u8 = 39;
-    /// The ACCT-STATUS-TYPE attribute type.
-    pub const ACCT_STATUS_TYPE: u8 = 40;
-    /// The ACCT-DELAY-TIME attribute type.
-    pub const ACCT_DELAY_TIME: u8 = 41;
-    /// The ACCT-INPUT-OCTETS attribute type.
-    pub const ACCT_INPUT_OCTETS: u8 = 42;
-    /// The ACCT-OUTPUT-OCTETS attribute type.
-    pub const ACCT_OUTPUT_OCTETS: u8 = 43;
-    /// The ACCT-SESSION-ID attribute type.
-    pub const ACCT_SESSION_ID: u8 = 44;
-    /// The ACCT-AUTHENTIC attribute type.
-    pub const ACCT_AUTHENTIC: u8 = 45;
-    /// The ACCT-SESSION-TIME attribute type.
-    pub const ACCT_SESSION_TIME: u8 = 46;
-    /// The ACCT-INPUT-PACKETS attribute type.
-    pub const ACCT_INPUT_PACKETS: u8 = 47;
-    /// The ACCT-OUTPUT-PACKETS attribute type.
-    pub const ACCT_OUTPUT_PACKETS: u8 = 48;
-    /// The ACCT-TERMINATE-CAUSE attribute type.
-    pub const ACCT_TERMINATE_CAUSE: u8 = 49;
-    /// The ACCT-MULTI-SESSION-ID attribute type.
-    pub const ACCT_MULTI_SESSION_ID: u8 = 50;
-    /// The ACCT-LINK-COUNT attribute type.
-    pub const ACCT_LINK_COUNT: u8 = 51;
-    /// The ACCT-INPUT-GIGAWORDS attribute type.
-    pub const ACCT_INPUT_GIGAWORDS: u8 = 52;
-    /// The ACCT-OUTPUT-GIGAWORDS attribute type.
-    pub const ACCT_OUTPUT_GIGAWORDS: u8 = 53;
-    /// The EVENT-TIMESTAMP attribute type.
-    pub const EVENT_TIMESTAMP: u8 = 55;
-    /// The EGRESS-VLANID attribute type.
-    pub const EGRESS_VLANID: u8 = 56;
-    /// The INGRESS-FILTERS attribute type.
-    pub const INGRESS_FILTERS: u8 = 57;
-    /// The EGRESS-VLAN-NAME attribute type.
-    pub const EGRESS_VLAN_NAME: u8 = 58;
-    /// The USER-PRIORITY-TABLE attribute type.
-    pub const USER_PRIORITY_TABLE: u8 = 59;
-    /// The CHAP-CHALLENGE attribute type.
-    pub const CHAP_CHALLENGE: u8 = 60;
-    /// The NAS-PORT-TYPE attribute type.
-    pub const NAS_PORT_TYPE: u8 = 61;
-    /// The PORT-LIMIT attribute type.
-    pub const PORT_LIMIT: u8 = 62;
-    /// The LOGIN-LAT-PORT attribute type.
-    pub const LOGIN_LAT_PORT: u8 = 63;
-    /// The TUNNEL-TYPE attribute type.
-    pub const TUNNEL_TYPE: u8 = 64;
-    /// The TUNNEL-MEDIUM-TYPE attribute type.
-    pub const TUNNEL_MEDIUM_TYPE: u8 = 65;
-    /// The TUNNEL-CLIENT-ENDPOINT attribute type.
-    pub const TUNNEL_CLIENT_ENDPOINT: u8 = 66;
-    /// The TUNNEL-SERVER-ENDPOINT attribute type.
-    pub const TUNNEL_SERVER_ENDPOINT: u8 = 67;
-    /// The ACCT-TUNNEL-CONNECTION attribute type.
-    pub const ACCT_TUNNEL_CONNECTION: u8 = 68;
-    /// The TUNNEL-PASSWORD attribute type.
-    pub const TUNNEL_PASSWORD: u8 = 69;
-    /// The ARAP-PASSWORD attribute type.
-    pub const ARAP_PASSWORD: u8 = 70;
-    /// The ARAP-FEATURES attribute type.
-    pub const ARAP_FEATURES: u8 = 71;
-    /// The ARAP-ZONE-ACCESS attribute type.
-    pub const ARAP_ZONE_ACCESS: u8 = 72;
-    /// The ARAP-SECURITY attribute type.
-    pub const ARAP_SECURITY: u8 = 73;
-    /// The ARAP-SECURITY-DATA attribute type.
-    pub const ARAP_SECURITY_DATA: u8 = 74;
-    /// The PASSWORD-RETRY attribute type.
-    pub const PASSWORD_RETRY: u8 = 75;
-    /// The PROMPT attribute type.
-    pub const PROMPT: u8 = 76;
-    /// The CONNECT-INFO attribute type.
-    pub const CONNECT_INFO: u8 = 77;
-    /// The CONFIGURATION-TOKEN attribute type.
-    pub const CONFIGURATION_TOKEN: u8 = 78;
-    /// The EAP-MESSAGE attribute type.
-    pub const EAP_MESSAGE: u8 = 79;
-    /// The MESSAGE-AUTHENTICATOR attribute type.
-    pub const MESSAGE_AUTHENTICATOR: u8 = 80;
-    /// The TUNNEL-PRIVATE-GROUP-ID attribute type.
-    pub const TUNNEL_PRIVATE_GROUP_ID: u8 = 81;
-    /// The TUNNEL-ASSIGNMENT-ID attribute type.
-    pub const TUNNEL_ASSIGNMENT_ID: u8 = 82;
-    /// The TUNNEL-PREFERENCE attribute type.
-    pub const TUNNEL_PREFERENCE: u8 = 83;
-    /// The ARAP-CHALLENGE-RESPONSE attribute type.
-    pub const ARAP_CHALLENGE_RESPONSE: u8 = 84;
-    /// The ACCT-INTERIM-INTERVAL attribute type.
-    pub const ACCT_INTERIM_INTERVAL: u8 = 85;
-    /// The ACCT-TUNNEL-PACKETS-LOST attribute type.
-    pub const ACCT_TUNNEL_PACKETS_LOST: u8 = 86;
-    /// The NAS-PORT-ID attribute type.
-    pub const NAS_PORT_ID: u8 = 87;
-    /// The FRAMED-POOL attribute type.
-    pub const FRAMED_POOL: u8 = 88;
-    /// The CUI attribute type.
-    pub const CUI: u8 = 89;
-    /// The TUNNEL-CLIENT-AUTH-ID attribute type.
-    pub const TUNNEL_CLIENT_AUTH_ID: u8 = 90;
-    /// The TUNNEL-SERVER-AUTH-ID attribute type.
-    pub const TUNNEL_SERVER_AUTH_ID: u8 = 91;
-    /// The NAS-FILTER-RULE attribute type.
-    pub const NAS_FILTER_RULE: u8 = 92;
-    /// The ORIGINATING-LINE-INFO attribute type.
-    pub const ORIGINATING_LINE_INFO: u8 = 94;
-    /// The NAS-IPV6-ADDRESS attribute type.
-    pub const NAS_IPV6_ADDRESS: u8 = 95;
-    /// The FRAMED-INTERFACE-ID attribute type.
-    pub const FRAMED_INTERFACE_ID: u8 = 96;
-    /// The FRAMED-IPV6-PREFIX attribute type.
-    pub const FRAMED_IPV6_PREFIX: u8 = 97;
-    /// The LOGIN-IPV6-HOST attribute type.
-    pub const LOGIN_IPV6_HOST: u8 = 98;
-    /// The FRAMED-IPV6-ROUTE attribute type.
-    pub const FRAMED_IPV6_ROUTE: u8 = 99;
-    /// The FRAMED-IPV6-POOL attribute type.
-    pub const FRAMED_IPV6_POOL: u8 = 100;
-    /// The ERROR-CAUSE attribute type.
-    pub const ERROR_CAUSE: u8 = 101;
-    /// The EXTENDED-TYPE-1 attribute type.
-    pub const EXTENDED_TYPE_1: u8 = 241;
-    /// The EXTENDED-TYPE-2 attribute type.
-    pub const EXTENDED_TYPE_2: u8 = 242;
-    /// The EXTENDED-TYPE-3 attribute type.
-    pub const EXTENDED_TYPE_3: u8 = 243;
-    /// The EXTENDED-TYPE-4 attribute type.
-    pub const EXTENDED_TYPE_4: u8 = 244;
-    /// The LONG-EXTENDED-TYPE-1 attribute type.
-    pub const LONG_EXTENDED_TYPE_1: u8 = 245;
-    /// The LONG-EXTENDED-TYPE-2 attribute type.
-    pub const LONG_EXTENDED_TYPE_2: u8 = 246;
+macro_rules! attributes {
+    ($($id:ident = $number:literal, $name:literal, $kind:ident;)*) => {
+        /// Attribute type numbers: every standard type from 1 to 101 in the IANA
+        /// registry, and the extended types of RFC 6929. Each is in the
+        /// [`DICTIONARY`] under its RFC name, such as User-Name for
+        /// [`attr::USER_NAME`].
+        pub mod attr {
+            $(#[doc = concat!("The `", stringify!($id), "` attribute type.")]
+            pub const $id: u8 = $number;)*
+        }
+        /// The standard attributes, by type number, with the data types the IANA
+        /// registry gives them. They come from RFC 2865, RFC 2866, RFC 2867, RFC
+        /// 2868, RFC 2869, RFC 3162, RFC 4372, RFC 4675, RFC 4849, RFC 5176, RFC
+        /// 6929 and RFC 7155. User-Password, CHAP-Password, ARAP-Password and
+        /// Tunnel-Password are strings, since their values are hidden or hashed
+        /// with the shared secret. The RFC 2868 tunnel attributes are strings
+        /// too: their values start with a tag byte, which the caller reads.
+        pub const DICTIONARY: &[AttributeInfo] = &[
+            $(AttributeInfo { kind: attr::$id, name: $name, data_type: DataType::$kind },)*
+        ];
+    };
+}
+
+attributes! {
+    USER_NAME = 1, "User-Name", Text;
+    USER_PASSWORD = 2, "User-Password", String;
+    CHAP_PASSWORD = 3, "CHAP-Password", String;
+    NAS_IP_ADDRESS = 4, "NAS-IP-Address", Address;
+    NAS_PORT = 5, "NAS-Port", Integer;
+    SERVICE_TYPE = 6, "Service-Type", Enum;
+    FRAMED_PROTOCOL = 7, "Framed-Protocol", Enum;
+    FRAMED_IP_ADDRESS = 8, "Framed-IP-Address", Address;
+    FRAMED_IP_NETMASK = 9, "Framed-IP-Netmask", Address;
+    FRAMED_ROUTING = 10, "Framed-Routing", Enum;
+    FILTER_ID = 11, "Filter-Id", Text;
+    FRAMED_MTU = 12, "Framed-MTU", Integer;
+    FRAMED_COMPRESSION = 13, "Framed-Compression", Enum;
+    LOGIN_IP_HOST = 14, "Login-IP-Host", Address;
+    LOGIN_SERVICE = 15, "Login-Service", Enum;
+    LOGIN_TCP_PORT = 16, "Login-TCP-Port", Integer;
+    REPLY_MESSAGE = 18, "Reply-Message", Text;
+    CALLBACK_NUMBER = 19, "Callback-Number", Text;
+    CALLBACK_ID = 20, "Callback-Id", Text;
+    FRAMED_ROUTE = 22, "Framed-Route", Text;
+    FRAMED_IPX_NETWORK = 23, "Framed-IPX-Network", Address;
+    STATE = 24, "State", String;
+    CLASS = 25, "Class", String;
+    VENDOR_SPECIFIC = 26, "Vendor-Specific", Vsa;
+    SESSION_TIMEOUT = 27, "Session-Timeout", Integer;
+    IDLE_TIMEOUT = 28, "Idle-Timeout", Integer;
+    TERMINATION_ACTION = 29, "Termination-Action", Enum;
+    CALLED_STATION_ID = 30, "Called-Station-Id", Text;
+    CALLING_STATION_ID = 31, "Calling-Station-Id", Text;
+    NAS_IDENTIFIER = 32, "NAS-Identifier", Text;
+    PROXY_STATE = 33, "Proxy-State", String;
+    LOGIN_LAT_SERVICE = 34, "Login-LAT-Service", Text;
+    LOGIN_LAT_NODE = 35, "Login-LAT-Node", Text;
+    LOGIN_LAT_GROUP = 36, "Login-LAT-Group", String;
+    FRAMED_APPLETALK_LINK = 37, "Framed-AppleTalk-Link", Integer;
+    FRAMED_APPLETALK_NETWORK = 38, "Framed-AppleTalk-Network", Integer;
+    FRAMED_APPLETALK_ZONE = 39, "Framed-AppleTalk-Zone", Text;
+    ACCT_STATUS_TYPE = 40, "Acct-Status-Type", Enum;
+    ACCT_DELAY_TIME = 41, "Acct-Delay-Time", Integer;
+    ACCT_INPUT_OCTETS = 42, "Acct-Input-Octets", Integer;
+    ACCT_OUTPUT_OCTETS = 43, "Acct-Output-Octets", Integer;
+    ACCT_SESSION_ID = 44, "Acct-Session-Id", Text;
+    ACCT_AUTHENTIC = 45, "Acct-Authentic", Enum;
+    ACCT_SESSION_TIME = 46, "Acct-Session-Time", Integer;
+    ACCT_INPUT_PACKETS = 47, "Acct-Input-Packets", Integer;
+    ACCT_OUTPUT_PACKETS = 48, "Acct-Output-Packets", Integer;
+    ACCT_TERMINATE_CAUSE = 49, "Acct-Terminate-Cause", Enum;
+    ACCT_MULTI_SESSION_ID = 50, "Acct-Multi-Session-Id", Text;
+    ACCT_LINK_COUNT = 51, "Acct-Link-Count", Integer;
+    ACCT_INPUT_GIGAWORDS = 52, "Acct-Input-Gigawords", Integer;
+    ACCT_OUTPUT_GIGAWORDS = 53, "Acct-Output-Gigawords", Integer;
+    EVENT_TIMESTAMP = 55, "Event-Timestamp", Time;
+    EGRESS_VLANID = 56, "Egress-VLANID", Integer;
+    INGRESS_FILTERS = 57, "Ingress-Filters", Enum;
+    EGRESS_VLAN_NAME = 58, "Egress-VLAN-Name", Text;
+    USER_PRIORITY_TABLE = 59, "User-Priority-Table", String;
+    CHAP_CHALLENGE = 60, "CHAP-Challenge", String;
+    NAS_PORT_TYPE = 61, "NAS-Port-Type", Enum;
+    PORT_LIMIT = 62, "Port-Limit", Integer;
+    LOGIN_LAT_PORT = 63, "Login-LAT-Port", Text;
+    TUNNEL_TYPE = 64, "Tunnel-Type", String;
+    TUNNEL_MEDIUM_TYPE = 65, "Tunnel-Medium-Type", String;
+    TUNNEL_CLIENT_ENDPOINT = 66, "Tunnel-Client-Endpoint", String;
+    TUNNEL_SERVER_ENDPOINT = 67, "Tunnel-Server-Endpoint", String;
+    ACCT_TUNNEL_CONNECTION = 68, "Acct-Tunnel-Connection", Text;
+    TUNNEL_PASSWORD = 69, "Tunnel-Password", String;
+    ARAP_PASSWORD = 70, "ARAP-Password", String;
+    ARAP_FEATURES = 71, "ARAP-Features", String;
+    ARAP_ZONE_ACCESS = 72, "ARAP-Zone-Access", Enum;
+    ARAP_SECURITY = 73, "ARAP-Security", Integer;
+    ARAP_SECURITY_DATA = 74, "ARAP-Security-Data", Text;
+    PASSWORD_RETRY = 75, "Password-Retry", Integer;
+    PROMPT = 76, "Prompt", Enum;
+    CONNECT_INFO = 77, "Connect-Info", Text;
+    CONFIGURATION_TOKEN = 78, "Configuration-Token", Text;
+    EAP_MESSAGE = 79, "EAP-Message", Concat;
+    MESSAGE_AUTHENTICATOR = 80, "Message-Authenticator", String;
+    TUNNEL_PRIVATE_GROUP_ID = 81, "Tunnel-Private-Group-ID", String;
+    TUNNEL_ASSIGNMENT_ID = 82, "Tunnel-Assignment-ID", String;
+    TUNNEL_PREFERENCE = 83, "Tunnel-Preference", String;
+    ARAP_CHALLENGE_RESPONSE = 84, "ARAP-Challenge-Response", String;
+    ACCT_INTERIM_INTERVAL = 85, "Acct-Interim-Interval", Integer;
+    ACCT_TUNNEL_PACKETS_LOST = 86, "Acct-Tunnel-Packets-Lost", Integer;
+    NAS_PORT_ID = 87, "NAS-Port-Id", Text;
+    FRAMED_POOL = 88, "Framed-Pool", Text;
+    CUI = 89, "CUI", String;
+    TUNNEL_CLIENT_AUTH_ID = 90, "Tunnel-Client-Auth-ID", String;
+    TUNNEL_SERVER_AUTH_ID = 91, "Tunnel-Server-Auth-ID", String;
+    NAS_FILTER_RULE = 92, "NAS-Filter-Rule", Text;
+    ORIGINATING_LINE_INFO = 94, "Originating-Line-Info", String;
+    NAS_IPV6_ADDRESS = 95, "NAS-IPv6-Address", Ipv6Address;
+    FRAMED_INTERFACE_ID = 96, "Framed-Interface-Id", InterfaceId;
+    FRAMED_IPV6_PREFIX = 97, "Framed-IPv6-Prefix", Ipv6Prefix;
+    LOGIN_IPV6_HOST = 98, "Login-IPv6-Host", Ipv6Address;
+    FRAMED_IPV6_ROUTE = 99, "Framed-IPv6-Route", Text;
+    FRAMED_IPV6_POOL = 100, "Framed-IPv6-Pool", Text;
+    ERROR_CAUSE = 101, "Error-Cause", Enum;
+    EXTENDED_TYPE_1 = 241, "Extended-Type-1", Extended;
+    EXTENDED_TYPE_2 = 242, "Extended-Type-2", Extended;
+    EXTENDED_TYPE_3 = 243, "Extended-Type-3", Extended;
+    EXTENDED_TYPE_4 = 244, "Extended-Type-4", Extended;
+    LONG_EXTENDED_TYPE_1 = 245, "Long-Extended-Type-1", LongExtended;
+    LONG_EXTENDED_TYPE_2 = 246, "Long-Extended-Type-2", LongExtended;
 }
 
 /// What the dictionary knows about one attribute type.
@@ -1672,139 +1566,6 @@ pub struct AttributeInfo {
     /// How its value is read.
     pub data_type: DataType,
 }
-
-const fn info(kind: u8, name: &'static str, data_type: DataType) -> AttributeInfo {
-    AttributeInfo {
-        kind,
-        name,
-        data_type,
-    }
-}
-
-/// The standard attributes, by type number, with the data types the IANA
-/// registry gives them. They come from RFC 2865, RFC 2866, RFC 2867, RFC
-/// 2868, RFC 2869, RFC 3162, RFC 4372, RFC 4675, RFC 4849, RFC 5176, RFC
-/// 6929 and RFC 7155. User-Password, CHAP-Password, ARAP-Password and
-/// Tunnel-Password are strings, since their values are hidden or hashed
-/// with the shared secret. The RFC 2868 tunnel attributes are strings
-/// too: their values start with a tag byte, which the caller reads.
-pub const DICTIONARY: &[AttributeInfo] = {
-    use DataType::*;
-    use attr::*;
-    &[
-        info(USER_NAME, "User-Name", Text),
-        info(USER_PASSWORD, "User-Password", String),
-        info(CHAP_PASSWORD, "CHAP-Password", String),
-        info(NAS_IP_ADDRESS, "NAS-IP-Address", Address),
-        info(NAS_PORT, "NAS-Port", Integer),
-        info(SERVICE_TYPE, "Service-Type", Enum),
-        info(FRAMED_PROTOCOL, "Framed-Protocol", Enum),
-        info(FRAMED_IP_ADDRESS, "Framed-IP-Address", Address),
-        info(FRAMED_IP_NETMASK, "Framed-IP-Netmask", Address),
-        info(FRAMED_ROUTING, "Framed-Routing", Enum),
-        info(FILTER_ID, "Filter-Id", Text),
-        info(FRAMED_MTU, "Framed-MTU", Integer),
-        info(FRAMED_COMPRESSION, "Framed-Compression", Enum),
-        info(LOGIN_IP_HOST, "Login-IP-Host", Address),
-        info(LOGIN_SERVICE, "Login-Service", Enum),
-        info(LOGIN_TCP_PORT, "Login-TCP-Port", Integer),
-        info(REPLY_MESSAGE, "Reply-Message", Text),
-        info(CALLBACK_NUMBER, "Callback-Number", Text),
-        info(CALLBACK_ID, "Callback-Id", Text),
-        info(FRAMED_ROUTE, "Framed-Route", Text),
-        info(FRAMED_IPX_NETWORK, "Framed-IPX-Network", Address),
-        info(STATE, "State", String),
-        info(CLASS, "Class", String),
-        info(VENDOR_SPECIFIC, "Vendor-Specific", Vsa),
-        info(SESSION_TIMEOUT, "Session-Timeout", Integer),
-        info(IDLE_TIMEOUT, "Idle-Timeout", Integer),
-        info(TERMINATION_ACTION, "Termination-Action", Enum),
-        info(CALLED_STATION_ID, "Called-Station-Id", Text),
-        info(CALLING_STATION_ID, "Calling-Station-Id", Text),
-        info(NAS_IDENTIFIER, "NAS-Identifier", Text),
-        info(PROXY_STATE, "Proxy-State", String),
-        info(LOGIN_LAT_SERVICE, "Login-LAT-Service", Text),
-        info(LOGIN_LAT_NODE, "Login-LAT-Node", Text),
-        info(LOGIN_LAT_GROUP, "Login-LAT-Group", String),
-        info(FRAMED_APPLETALK_LINK, "Framed-AppleTalk-Link", Integer),
-        info(
-            FRAMED_APPLETALK_NETWORK,
-            "Framed-AppleTalk-Network",
-            Integer,
-        ),
-        info(FRAMED_APPLETALK_ZONE, "Framed-AppleTalk-Zone", Text),
-        info(ACCT_STATUS_TYPE, "Acct-Status-Type", Enum),
-        info(ACCT_DELAY_TIME, "Acct-Delay-Time", Integer),
-        info(ACCT_INPUT_OCTETS, "Acct-Input-Octets", Integer),
-        info(ACCT_OUTPUT_OCTETS, "Acct-Output-Octets", Integer),
-        info(ACCT_SESSION_ID, "Acct-Session-Id", Text),
-        info(ACCT_AUTHENTIC, "Acct-Authentic", Enum),
-        info(ACCT_SESSION_TIME, "Acct-Session-Time", Integer),
-        info(ACCT_INPUT_PACKETS, "Acct-Input-Packets", Integer),
-        info(ACCT_OUTPUT_PACKETS, "Acct-Output-Packets", Integer),
-        info(ACCT_TERMINATE_CAUSE, "Acct-Terminate-Cause", Enum),
-        info(ACCT_MULTI_SESSION_ID, "Acct-Multi-Session-Id", Text),
-        info(ACCT_LINK_COUNT, "Acct-Link-Count", Integer),
-        info(ACCT_INPUT_GIGAWORDS, "Acct-Input-Gigawords", Integer),
-        info(ACCT_OUTPUT_GIGAWORDS, "Acct-Output-Gigawords", Integer),
-        info(EVENT_TIMESTAMP, "Event-Timestamp", Time),
-        info(EGRESS_VLANID, "Egress-VLANID", Integer),
-        info(INGRESS_FILTERS, "Ingress-Filters", Enum),
-        info(EGRESS_VLAN_NAME, "Egress-VLAN-Name", Text),
-        info(USER_PRIORITY_TABLE, "User-Priority-Table", String),
-        info(CHAP_CHALLENGE, "CHAP-Challenge", String),
-        info(NAS_PORT_TYPE, "NAS-Port-Type", Enum),
-        info(PORT_LIMIT, "Port-Limit", Integer),
-        info(LOGIN_LAT_PORT, "Login-LAT-Port", Text),
-        info(TUNNEL_TYPE, "Tunnel-Type", String),
-        info(TUNNEL_MEDIUM_TYPE, "Tunnel-Medium-Type", String),
-        info(TUNNEL_CLIENT_ENDPOINT, "Tunnel-Client-Endpoint", String),
-        info(TUNNEL_SERVER_ENDPOINT, "Tunnel-Server-Endpoint", String),
-        info(ACCT_TUNNEL_CONNECTION, "Acct-Tunnel-Connection", Text),
-        info(TUNNEL_PASSWORD, "Tunnel-Password", String),
-        info(ARAP_PASSWORD, "ARAP-Password", String),
-        info(ARAP_FEATURES, "ARAP-Features", String),
-        info(ARAP_ZONE_ACCESS, "ARAP-Zone-Access", Enum),
-        info(ARAP_SECURITY, "ARAP-Security", Integer),
-        info(ARAP_SECURITY_DATA, "ARAP-Security-Data", Text),
-        info(PASSWORD_RETRY, "Password-Retry", Integer),
-        info(PROMPT, "Prompt", Enum),
-        info(CONNECT_INFO, "Connect-Info", Text),
-        info(CONFIGURATION_TOKEN, "Configuration-Token", Text),
-        info(EAP_MESSAGE, "EAP-Message", Concat),
-        info(MESSAGE_AUTHENTICATOR, "Message-Authenticator", String),
-        info(TUNNEL_PRIVATE_GROUP_ID, "Tunnel-Private-Group-ID", String),
-        info(TUNNEL_ASSIGNMENT_ID, "Tunnel-Assignment-ID", String),
-        info(TUNNEL_PREFERENCE, "Tunnel-Preference", String),
-        info(ARAP_CHALLENGE_RESPONSE, "ARAP-Challenge-Response", String),
-        info(ACCT_INTERIM_INTERVAL, "Acct-Interim-Interval", Integer),
-        info(
-            ACCT_TUNNEL_PACKETS_LOST,
-            "Acct-Tunnel-Packets-Lost",
-            Integer,
-        ),
-        info(NAS_PORT_ID, "NAS-Port-Id", Text),
-        info(FRAMED_POOL, "Framed-Pool", Text),
-        info(CUI, "CUI", String),
-        info(TUNNEL_CLIENT_AUTH_ID, "Tunnel-Client-Auth-ID", String),
-        info(TUNNEL_SERVER_AUTH_ID, "Tunnel-Server-Auth-ID", String),
-        info(NAS_FILTER_RULE, "NAS-Filter-Rule", Text),
-        info(ORIGINATING_LINE_INFO, "Originating-Line-Info", String),
-        info(NAS_IPV6_ADDRESS, "NAS-IPv6-Address", Ipv6Address),
-        info(FRAMED_INTERFACE_ID, "Framed-Interface-Id", InterfaceId),
-        info(FRAMED_IPV6_PREFIX, "Framed-IPv6-Prefix", Ipv6Prefix),
-        info(LOGIN_IPV6_HOST, "Login-IPv6-Host", Ipv6Address),
-        info(FRAMED_IPV6_ROUTE, "Framed-IPv6-Route", Text),
-        info(FRAMED_IPV6_POOL, "Framed-IPv6-Pool", Text),
-        info(ERROR_CAUSE, "Error-Cause", Enum),
-        info(EXTENDED_TYPE_1, "Extended-Type-1", Extended),
-        info(EXTENDED_TYPE_2, "Extended-Type-2", Extended),
-        info(EXTENDED_TYPE_3, "Extended-Type-3", Extended),
-        info(EXTENDED_TYPE_4, "Extended-Type-4", Extended),
-        info(LONG_EXTENDED_TYPE_1, "Long-Extended-Type-1", LongExtended),
-        info(LONG_EXTENDED_TYPE_2, "Long-Extended-Type-2", LongExtended),
-    ]
-};
 
 /// The dictionary's entry for type `kind`, if it has one.
 pub fn lookup(kind: u8) -> Option<&'static AttributeInfo> {

@@ -284,41 +284,35 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unicode => f.write_str("invalid UTF-16LE name"),
-            Error::Trailing => f.write_str("bytes after the payload"),
-            Error::TooLong => write!(
-                f,
-                "longer than {MAX_MESSAGE} bytes, or a response longer than {MAX_FIELD}"
-            ),
-            Error::Truncated => f.write_str("too short for its fixed fields"),
-            Error::Signature => f.write_str("does not start with NTLMSSP\\0"),
-            Error::MessageType(t) => write!(f, "message type {t} where another was expected"),
-            Error::Field(name) => write!(f, "the {name} field lies outside the message payload"),
-            Error::AvPairs => {
-                f.write_str("an AV pair list that runs past its end or has no end marker")
-            }
-            Error::AvEolLength(n) => write!(f, "an AV pair end marker of length {n}, not 0"),
-            Error::TooManyAvPairs => write!(f, "more than {MAX_AV_PAIRS} AV pairs"),
-            Error::ResponseLength(n) => write!(f, "a response of {n} bytes, which no layout has"),
-            Error::AvValue(id) => write!(
-                f,
-                "an AV pair with ID {id} whose value has the wrong length"
-            ),
-            Error::OddUnicode(name) => {
-                write!(f, "the Unicode {name} field has an odd offset or length")
-            }
-            Error::ResponseVersion(a, b) => {
-                write!(f, "an NTLMv2 response of versions {a} and {b}, not 1 and 1")
-            }
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Unicode => f.write_str("invalid UTF-16LE name"),
+    Error::Trailing => f.write_str("bytes after the payload"),
+    Error::TooLong => write!(
+        f,
+        "longer than {MAX_MESSAGE} bytes, or a response longer than {MAX_FIELD}"
+    ),
+    Error::Truncated => f.write_str("too short for its fixed fields"),
+    Error::Signature => f.write_str("does not start with NTLMSSP\\0"),
+    Error::MessageType(t) => write!(f, "message type {t} where another was expected"),
+    Error::Field(name) => write!(f, "the {name} field lies outside the message payload"),
+    Error::AvPairs => {
+        f.write_str("an AV pair list that runs past its end or has no end marker")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::AvEolLength(n) => write!(f, "an AV pair end marker of length {n}, not 0"),
+    Error::TooManyAvPairs => write!(f, "more than {MAX_AV_PAIRS} AV pairs"),
+    Error::ResponseLength(n) => write!(f, "a response of {n} bytes, which no layout has"),
+    Error::AvValue(id) => write!(
+        f,
+        "an AV pair with ID {id} whose value has the wrong length"
+    ),
+    Error::OddUnicode(name) => {
+        write!(f, "the Unicode {name} field has an odd offset or length")
+    }
+    Error::ResponseVersion(a, b) => {
+        write!(f, "an NTLMv2 response of versions {a} and {b}, not 1 and 1")
+    }
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+});
 
 /// One attribute-value pair of a target info list.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

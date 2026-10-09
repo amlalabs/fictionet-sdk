@@ -61,7 +61,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire};
 
 /// The TCP port MQTT brokers listen on, without TLS.
@@ -426,46 +425,40 @@ pub enum Error {
     SubscribeOptions(u8),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("MQTT value cannot be written without changing it"),
-            Error::ReservedType(t) => write!(f, "reserved packet type {t}"),
-            Error::Flags { packet_type, flags } => {
-                write!(
-                    f,
-                    "flags {flags:#06b} not allowed on packet type {packet_type}"
-                )
-            }
-            Error::RemainingLength => f.write_str("remaining length longer than four bytes"),
-            Error::TooLarge { size, max } => {
-                write!(f, "packet of {size} bytes, over the limit of {max}")
-            }
-            Error::Truncated => f.write_str("a field runs past the end of the packet"),
-            Error::TrailingBytes => f.write_str("bytes left after the packet's last field"),
-            Error::Utf8 => f.write_str("string is not well-formed UTF-8"),
-            Error::NullChar => f.write_str("string holds U+0000"),
-            Error::TooLong(n) => write!(f, "field of {n} bytes, over the limit of {MAX_STRING}"),
-            Error::ProtocolName => f.write_str("protocol name is not MQTT"),
-            Error::UnsupportedVersion(v) => {
-                write!(
-                    f,
-                    "protocol version not supported (level {v}); only MQTT 3.1.1, level 4 named MQTT, is read"
-                )
-            }
-            Error::ConnectFlags(b) => write!(f, "CONNECT flags {b:#010b} break the rules"),
-            Error::ConnAckFlags(b) => write!(f, "CONNACK flags {b:#010b} break the rules"),
-            Error::ReturnCode(c) => write!(f, "reserved return code {c:#04x}"),
-            Error::PacketIdZero => f.write_str("packet identifier 0"),
-            Error::TopicName => f.write_str("topic name is empty or has a wildcard"),
-            Error::TopicFilter => f.write_str("topic filter is empty or misuses a wildcard"),
-            Error::EmptySubscription => f.write_str("no topic filters or return codes"),
-            Error::SubscribeOptions(b) => write!(f, "requested QoS byte {b:#04x} is not 0, 1 or 2"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("MQTT value cannot be written without changing it"),
+    Error::ReservedType(t) => write!(f, "reserved packet type {t}"),
+    Error::Flags { packet_type, flags } => {
+        write!(
+            f,
+            "flags {flags:#06b} not allowed on packet type {packet_type}"
+        )
     }
-}
-
-impl std::error::Error for Error {}
+    Error::RemainingLength => f.write_str("remaining length longer than four bytes"),
+    Error::TooLarge { size, max } => {
+        write!(f, "packet of {size} bytes, over the limit of {max}")
+    }
+    Error::Truncated => f.write_str("a field runs past the end of the packet"),
+    Error::TrailingBytes => f.write_str("bytes left after the packet's last field"),
+    Error::Utf8 => f.write_str("string is not well-formed UTF-8"),
+    Error::NullChar => f.write_str("string holds U+0000"),
+    Error::TooLong(n) => write!(f, "field of {n} bytes, over the limit of {MAX_STRING}"),
+    Error::ProtocolName => f.write_str("protocol name is not MQTT"),
+    Error::UnsupportedVersion(v) => {
+        write!(
+            f,
+            "protocol version not supported (level {v}); only MQTT 3.1.1, level 4 named MQTT, is read"
+        )
+    }
+    Error::ConnectFlags(b) => write!(f, "CONNECT flags {b:#010b} break the rules"),
+    Error::ConnAckFlags(b) => write!(f, "CONNACK flags {b:#010b} break the rules"),
+    Error::ReturnCode(c) => write!(f, "reserved return code {c:#04x}"),
+    Error::PacketIdZero => f.write_str("packet identifier 0"),
+    Error::TopicName => f.write_str("topic name is empty or has a wildcard"),
+    Error::TopicFilter => f.write_str("topic filter is empty or misuses a wildcard"),
+    Error::EmptySubscription => f.write_str("no topic filters or return codes"),
+    Error::SubscribeOptions(b) => write!(f, "requested QoS byte {b:#04x} is not 0, 1 or 2"),
+});
 
 /// Reads the remaining length at the start of `b`. It returns `Ok(None)` if
 /// `b` holds only part of it, and otherwise the length and how many bytes
@@ -1077,47 +1070,33 @@ impl Wire for Packet {
     }
 }
 
-/// Reads MQTT packets without retaining input bytes.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`] for bounded input and one-time errors.
-/// Header and body errors end the stream.
-/// Partial packets return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The driver
-/// reports truncation.
-///
-/// ```
-/// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::mqtt::Packet;
-/// use fictionet::stdlib::codec::{Stream, Wire};
-///
-/// let bytes = Wire::to_bytes(&Packet::PingReq)?;
-/// let mut stream = Stream::new(Frames::<Packet>::new());
-/// assert_eq!(stream.push(&bytes), bytes.len());
-/// assert_eq!(stream.next(), Some(Ok(Packet::PingReq)));
-/// stream.end();
-/// assert_eq!(stream.next(), None);
-/// # Ok::<(), fictionet::stdlib::mqtt::Error>(())
-/// ```
-impl Prefixed for Packet {
-    type Item = Packet;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "MQTT 3.1.1";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        DEFAULT_MAX_PACKET
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.clamp(2, MAX_PACKET)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        limit.max(1 + MAX_REMAINING_LENGTH_BYTES)
-    }
+fictionet::prefixed! {
+    /// Reads MQTT packets without retaining input bytes.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`] for bounded input and one-time errors.
+    /// Header and body errors end the stream.
+    /// Partial packets return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The driver
+    /// reports truncation.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::Frames;
+    /// use fictionet::stdlib::mqtt::Packet;
+    /// use fictionet::stdlib::codec::{Stream, Wire};
+    ///
+    /// let bytes = Wire::to_bytes(&Packet::PingReq)?;
+    /// let mut stream = Stream::new(Frames::<Packet>::new());
+    /// assert_eq!(stream.push(&bytes), bytes.len());
+    /// assert_eq!(stream.next(), Some(Ok(Packet::PingReq)));
+    /// stream.end();
+    /// assert_eq!(stream.next(), None);
+    /// # Ok::<(), fictionet::stdlib::mqtt::Error>(())
+    /// ```
+    Packet => (Packet, Error, usize);
+    name = "MQTT 3.1.1";
+    default { DEFAULT_MAX_PACKET }
+    normalize(limit) { limit.clamp(2, MAX_PACKET) }
+    capacity(limit) { let limit = *limit;
+        limit.max(1 + MAX_REMAINING_LENGTH_BYTES) }
 
     #[inline]
     fn parse_prefix(
@@ -1134,19 +1113,9 @@ impl Prefixed for Packet {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
-impl From<Trailing> for Error {
-    #[inline]
-    fn from(_: Trailing) -> Self {
-        Error::TrailingBytes
-    }
-}
+fictionet::codec_from!(Error, Trailing, |_| Error::TrailingBytes);
 
 #[cfg(test)]
 mod tests {

@@ -89,23 +89,18 @@ pub enum Error {
     Tree,
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Limit(name) => write!(f, "SBE limit exceeded: {name}"),
-            Self::Xml(at) => write!(f, "unsupported or malformed XML at byte {at}"),
-            Self::Schema(reason) => write!(f, "invalid SBE schema: {reason}"),
-            Self::Truncated => f.write_str("truncated SBE message"),
-            Self::Trailing => f.write_str("bytes after SBE message"),
-            Self::Header => f.write_str("unknown SBE schema or template"),
-            Self::BlockLength => f.write_str("short SBE fixed block"),
-            Self::Layout => f.write_str("unknown SBE variable layout"),
-            Self::Value => f.write_str("invalid SBE field value"),
-            Self::Tree => f.write_str("SBE value tree does not match schema"),
-        }
-    }
-}
-impl core::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Self::Limit(name) => write!(f, "SBE limit exceeded: {name}"),
+    Self::Xml(at) => write!(f, "unsupported or malformed XML at byte {at}"),
+    Self::Schema(reason) => write!(f, "invalid SBE schema: {reason}"),
+    Self::Truncated => f.write_str("truncated SBE message"),
+    Self::Trailing => f.write_str("bytes after SBE message"),
+    Self::Header => f.write_str("unknown SBE schema or template"),
+    Self::BlockLength => f.write_str("short SBE fixed block"),
+    Self::Layout => f.write_str("unknown SBE variable layout"),
+    Self::Value => f.write_str("invalid SBE field value"),
+    Self::Tree => f.write_str("SBE value tree does not match schema"),
+});
 
 /// Schema-wide byte order (sections 2.3 and 4.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

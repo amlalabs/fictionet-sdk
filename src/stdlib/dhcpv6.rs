@@ -75,7 +75,7 @@
 //! ```
 
 use core::convert::Infallible;
-use fictionet::stdlib::codec::{Frames, Prefixed, be32};
+use fictionet::stdlib::codec::{Frames, be32};
 use std::net::Ipv6Addr;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -620,22 +620,16 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Short => f.write_str("shorter than a DHCPv6 header"),
-            Error::TooLong(n) => write!(f, "{n} bytes, longer than a DHCPv6 message may be"),
-            Error::Truncated => {
-                f.write_str("an option or TCP message runs past the end of its bytes")
-            }
-            Error::BadOption(c) => write!(f, "option {c} is malformed"),
-            Error::Trailing => f.write_str("bytes after the DHCPv6 TCP message"),
-            Error::Unwritable => f.write_str("DHCPv6 value cannot be written without changing it"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Short => f.write_str("shorter than a DHCPv6 header"),
+    Error::TooLong(n) => write!(f, "{n} bytes, longer than a DHCPv6 message may be"),
+    Error::Truncated => {
+        f.write_str("an option or TCP message runs past the end of its bytes")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::BadOption(c) => write!(f, "option {c} is malformed"),
+    Error::Trailing => f.write_str("bytes after the DHCPv6 TCP message"),
+    Error::Unwritable => f.write_str("DHCPv6 value cannot be written without changing it"),
+});
 
 /// One DHCPv6 message. Client and server messages use `transaction`;
 /// relay messages ([`msg::RELAY_FORW`] and [`msg::RELAY_REPL`]) use
@@ -919,6 +913,9 @@ impl Wire for Message {
         out.extend_from_slice(&self.write_within(MAX_MESSAGE)?);
         Ok(())
     }
+    fn to_bytes(&self) -> Result<Vec<u8>, Self::WriteError> {
+        self.write_within(MAX_MESSAGE)
+    }
 }
 
 /// One DHCPv6 TCP message with its two-byte length prefix.
@@ -960,41 +957,34 @@ impl Wire for Frame {
     }
 }
 
-/// Reads DHCPv6 TCP messages without retaining input bytes.
-///
-/// Use with [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream) for at most [`MAX_BUFFERED`] unread bytes. Each
-/// two-byte length delimits one item. Malformed messages are error items,
-/// so the next message can still be read. Framing has no protocol errors.
-/// Partial prefixes and bodies return [`Step::Need`], including at EOF;
-/// the driver reports [`Fail::Truncated`](fictionet::stdlib::codec::Fail::Truncated). UDP uses [`Wire`] on [`Message`].
-///
-/// ```
-/// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::dhcpv6::{Frame, Message, msg};
-/// use fictionet::stdlib::codec::{Stream, Wire};
-///
-/// let message = Message::new(msg::SOLICIT, 7);
-/// let bytes = Wire::to_bytes(&Frame(message.clone()))?;
-/// let mut stream = Stream::new(Frames::<Message>::new());
-/// assert_eq!(stream.push(&bytes), bytes.len());
-/// assert_eq!(stream.next(), Some(Ok(Ok(message))));
-/// stream.end();
-/// assert_eq!(stream.next(), None);
-/// # Ok::<(), fictionet::stdlib::dhcpv6::Error>(())
-/// ```
-impl Prefixed for Message {
-    type Item = Result<Message, Error>;
-    type Error = Infallible;
-    type Limit = ();
-    const NAME: &'static str = "DHCPv6 over TCP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_BUFFERED
-    }
+fictionet::prefixed! {
+    /// Reads DHCPv6 TCP messages without retaining input bytes.
+    ///
+    /// Use with [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream) for at most [`MAX_BUFFERED`] unread bytes. Each
+    /// two-byte length delimits one item. Malformed messages are error items,
+    /// so the next message can still be read. Framing has no protocol errors.
+    /// Partial prefixes and bodies return [`Step::Need`], including at EOF;
+    /// the driver reports [`Fail::Truncated`](fictionet::stdlib::codec::Fail::Truncated). UDP uses [`Wire`] on [`Message`].
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::Frames;
+    /// use fictionet::stdlib::dhcpv6::{Frame, Message, msg};
+    /// use fictionet::stdlib::codec::{Stream, Wire};
+    ///
+    /// let message = Message::new(msg::SOLICIT, 7);
+    /// let bytes = Wire::to_bytes(&Frame(message.clone()))?;
+    /// let mut stream = Stream::new(Frames::<Message>::new());
+    /// assert_eq!(stream.push(&bytes), bytes.len());
+    /// assert_eq!(stream.next(), Some(Ok(Ok(message))));
+    /// stream.end();
+    /// assert_eq!(stream.next(), None);
+    /// # Ok::<(), fictionet::stdlib::dhcpv6::Error>(())
+    /// ```
+    Message => (Result<Message, Error>, Infallible, ());
+    name = "DHCPv6 over TCP";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_BUFFERED }
 
     #[inline]
     fn parse_prefix(
@@ -1342,29 +1332,23 @@ fn encode_name(name: &str) -> Option<Vec<u8>> {
 fn encode_options(options: &[DhcpOption], depth: usize, budget: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     for o in options {
-        let bytes = encode_option(o, depth, budget.checked_sub(out.len())?)?;
-        out.extend_from_slice(&bytes);
+        let max = budget
+            .checked_sub(out.len())?
+            .checked_sub(4)?
+            .min(usize::from(u16::MAX));
+        let body = encode_body(o, depth, max)?;
+        if body.len() > max {
+            return None;
+        }
+        let code = o.code();
+        // A last check, so nothing written fails to read.
+        if parse_option(code, &body, depth).ok().as_ref() != Some(o) {
+            return None;
+        }
+        out.extend_from_slice(&code.to_be_bytes());
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(&body);
     }
-    Some(out)
-}
-
-/// One option, header and body, in at most `budget` bytes, or `None` if it
-/// does not fit or would not read back.
-fn encode_option(o: &DhcpOption, depth: usize, budget: usize) -> Option<Vec<u8>> {
-    let max = budget.checked_sub(4)?.min(usize::from(u16::MAX));
-    let body = encode_body(o, depth, max)?;
-    if body.len() > max {
-        return None;
-    }
-    let code = o.code();
-    // A last check, so nothing written fails to read.
-    if parse_option(code, &body, depth).ok().as_ref() != Some(o) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(4 + body.len());
-    out.extend_from_slice(&code.to_be_bytes());
-    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-    out.extend_from_slice(&body);
     Some(out)
 }
 

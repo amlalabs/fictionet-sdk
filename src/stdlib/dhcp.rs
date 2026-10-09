@@ -174,21 +174,15 @@ pub enum Error {
     Duplicate(u8),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Short => f.write_str("shorter than a DHCP message"),
-            Error::TooLong(n) => write!(f, "{n} bytes, longer than a DHCP message may be"),
-            Error::Magic => f.write_str("no DHCP magic cookie"),
-            Error::Truncated => f.write_str("an option runs past the end of the message"),
-            Error::Trailing(at) => write!(f, "byte {at} follows the end option and is not padding"),
-            Error::Reserved(c) => write!(f, "option code {c} is padding or the end, not an option"),
-            Error::Duplicate(c) => write!(f, "option {c} appears twice"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Short => f.write_str("shorter than a DHCP message"),
+    Error::TooLong(n) => write!(f, "{n} bytes, longer than a DHCP message may be"),
+    Error::Magic => f.write_str("no DHCP magic cookie"),
+    Error::Truncated => f.write_str("an option runs past the end of the message"),
+    Error::Trailing(at) => write!(f, "byte {at} follows the end option and is not padding"),
+    Error::Reserved(c) => write!(f, "option code {c} is padding or the end, not an option"),
+    Error::Duplicate(c) => write!(f, "option {c} appears twice"),
+});
 
 impl Wire for Message {
     type ParseError = Error;

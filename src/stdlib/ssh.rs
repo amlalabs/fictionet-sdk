@@ -71,7 +71,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{Decode, Reader as ByteReader, Step, Truncated, Wire};
 
 /// The TCP port SSH servers listen on.
@@ -184,29 +183,23 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::LineTooLong => f.write_str("line too long"),
-            Error::Nul => f.write_str("NUL byte in a line"),
-            Error::BadVersion => f.write_str("malformed SSH version line"),
-            Error::TooManyLines => f.write_str("too many lines before the version line"),
-            Error::PacketLength(n) => write!(f, "packet length {n} not allowed"),
-            Error::Padding(n) => write!(f, "padding length {n} not allowed"),
-            Error::PayloadTooLong(n) => write!(f, "payload of {n} bytes, over {MAX_PAYLOAD}"),
-            Error::Truncated => f.write_str("SSH line, packet or field cut short"),
-            Error::Trailing => f.write_str("bytes follow the SSH line, packet or last field"),
-            Error::Empty => f.write_str("empty payload"),
-            Error::FieldTooLong => f.write_str("field too long"),
-            Error::Utf8 => f.write_str("text is not UTF-8"),
-            Error::Name => f.write_str("malformed name-list"),
-            Error::Mpint => f.write_str("mpint not in its shortest form"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::LineTooLong => f.write_str("line too long"),
+    Error::Nul => f.write_str("NUL byte in a line"),
+    Error::BadVersion => f.write_str("malformed SSH version line"),
+    Error::TooManyLines => f.write_str("too many lines before the version line"),
+    Error::PacketLength(n) => write!(f, "packet length {n} not allowed"),
+    Error::Padding(n) => write!(f, "padding length {n} not allowed"),
+    Error::PayloadTooLong(n) => write!(f, "payload of {n} bytes, over {MAX_PAYLOAD}"),
+    Error::Truncated => f.write_str("SSH line, packet or field cut short"),
+    Error::Trailing => f.write_str("bytes follow the SSH line, packet or last field"),
+    Error::Empty => f.write_str("empty payload"),
+    Error::FieldTooLong => f.write_str("field too long"),
+    Error::Utf8 => f.write_str("text is not UTF-8"),
+    Error::Name => f.write_str("malformed name-list"),
+    Error::Mpint => f.write_str("mpint not in its shortest form"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+});
 
 /// The version line: `SSH-protoversion-softwareversion`, then optionally
 /// a space and comments. Both versions are printable US-ASCII with no
@@ -611,35 +604,21 @@ impl Wire for Packet {
     }
 }
 
-/// Reads cleartext binary packets after the SSH version exchange.
-///
-/// This decoder owns no input. Its capacity is the configured packet
-/// limit, including the length field. Oversized packets are refused from
-/// their four-byte length. Partial packets return [`Step::Need`], including
-/// at EOF, so [`fictionet::stdlib::codec::Stream`] reports truncation.
-/// Use [`Lines`] or [`Events`] for the bounded version exchange.
-/// Stop using this framer when keys take effect. It performs no encryption
-/// or MAC processing. Payload messages are parsed separately by [`Message::parse`].
-impl Prefixed for Packet {
-    type Item = Packet;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "SSH cleartext packets";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_PACKET
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.clamp(MIN_PACKET, MAX_PACKET)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        *limit
-    }
+fictionet::prefixed! {
+    /// Reads cleartext binary packets after the SSH version exchange.
+    ///
+    /// This decoder owns no input. Its capacity is the configured packet
+    /// limit, including the length field. Oversized packets are refused from
+    /// their four-byte length. Partial packets return [`Step::Need`], including
+    /// at EOF, so [`fictionet::stdlib::codec::Stream`] reports truncation.
+    /// Use [`Lines`] or [`Events`] for the bounded version exchange.
+    /// Stop using this framer when keys take effect. It performs no encryption
+    /// or MAC processing. Payload messages are parsed separately by [`Message::parse`].
+    Packet => (Packet, Error, usize);
+    name = "SSH cleartext packets";
+    default { MAX_PACKET }
+    normalize(limit) { limit.clamp(MIN_PACKET, MAX_PACKET) }
+    capacity(limit) { *limit }
 
     #[inline]
     fn parse_prefix(
@@ -1117,85 +1096,49 @@ impl Wire for NameList {
     }
 }
 
-/// The reason codes a DISCONNECT gives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DisconnectReason {
-    /// The host is not allowed to connect.
-    HostNotAllowedToConnect,
-    /// The peer violated the SSH protocol.
-    ProtocolError,
-    /// The key exchange failed.
-    KeyExchangeFailed,
-    /// A message authentication code did not match.
-    MacError,
-    /// Packet decompression failed.
-    CompressionError,
-    /// The requested service is unavailable.
-    ServiceNotAvailable,
-    /// The peer's protocol version is unsupported.
-    ProtocolVersionNotSupported,
-    /// The host key could not be verified.
-    HostKeyNotVerifiable,
-    /// The connection was lost.
-    ConnectionLost,
-    /// The application ended the connection.
-    ByApplication,
-    /// The server has too many connections.
-    TooManyConnections,
-    /// The user canceled authentication.
-    AuthCancelledByUser,
-    /// No authentication methods remain.
-    NoMoreAuthMethodsAvailable,
-    /// The user name is not allowed.
-    IllegalUserName,
-    /// Any other code, including 4, which RFC 4253 reserves.
-    /// [`DisconnectReason::from_code`] never gives this for a code that has
-    /// a name above. Writers refuse aliases such as `Other(2)`.
-    Other(u32),
-}
-
-impl DisconnectReason {
-    /// The reason code's number.
-    pub fn code(self) -> u32 {
-        match self {
-            DisconnectReason::HostNotAllowedToConnect => 1,
-            DisconnectReason::ProtocolError => 2,
-            DisconnectReason::KeyExchangeFailed => 3,
-            DisconnectReason::MacError => 5,
-            DisconnectReason::CompressionError => 6,
-            DisconnectReason::ServiceNotAvailable => 7,
-            DisconnectReason::ProtocolVersionNotSupported => 8,
-            DisconnectReason::HostKeyNotVerifiable => 9,
-            DisconnectReason::ConnectionLost => 10,
-            DisconnectReason::ByApplication => 11,
-            DisconnectReason::TooManyConnections => 12,
-            DisconnectReason::AuthCancelledByUser => 13,
-            DisconnectReason::NoMoreAuthMethodsAvailable => 14,
-            DisconnectReason::IllegalUserName => 15,
-            DisconnectReason::Other(c) => c,
-        }
+fictionet::open_enum! {
+    /// The reason codes a DISCONNECT gives.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum DisconnectReason: u32 {
+        /// The host is not allowed to connect.
+        HostNotAllowedToConnect = 1,
+        /// The peer violated the SSH protocol.
+        ProtocolError = 2,
+        /// The key exchange failed.
+        KeyExchangeFailed = 3,
+        /// A message authentication code did not match.
+        MacError = 5,
+        /// Packet decompression failed.
+        CompressionError = 6,
+        /// The requested service is unavailable.
+        ServiceNotAvailable = 7,
+        /// The peer's protocol version is unsupported.
+        ProtocolVersionNotSupported = 8,
+        /// The host key could not be verified.
+        HostKeyNotVerifiable = 9,
+        /// The connection was lost.
+        ConnectionLost = 10,
+        /// The application ended the connection.
+        ByApplication = 11,
+        /// The server has too many connections.
+        TooManyConnections = 12,
+        /// The user canceled authentication.
+        AuthCancelledByUser = 13,
+        /// No authentication methods remain.
+        NoMoreAuthMethodsAvailable = 14,
+        /// The user name is not allowed.
+        IllegalUserName = 15,
+        ;
+        /// Any other code, including 4, which RFC 4253 reserves.
+        /// [`DisconnectReason::from_code`] never gives this for a code that has
+        /// a name above. Writers refuse aliases such as `Other(2)`.
+        Other,
     }
-
-    /// The reason for code `c`.
-    pub fn from_code(c: u32) -> DisconnectReason {
-        match c {
-            1 => DisconnectReason::HostNotAllowedToConnect,
-            2 => DisconnectReason::ProtocolError,
-            3 => DisconnectReason::KeyExchangeFailed,
-            5 => DisconnectReason::MacError,
-            6 => DisconnectReason::CompressionError,
-            7 => DisconnectReason::ServiceNotAvailable,
-            8 => DisconnectReason::ProtocolVersionNotSupported,
-            9 => DisconnectReason::HostKeyNotVerifiable,
-            10 => DisconnectReason::ConnectionLost,
-            11 => DisconnectReason::ByApplication,
-            12 => DisconnectReason::TooManyConnections,
-            13 => DisconnectReason::AuthCancelledByUser,
-            14 => DisconnectReason::NoMoreAuthMethodsAvailable,
-            15 => DisconnectReason::IllegalUserName,
-            c => DisconnectReason::Other(c),
-        }
-    }
+    [
+        /// The reason code's number.
+    ] [
+        /// The reason for code `c`.
+    ]
 }
 
 /// A KEXINIT message: the algorithms one side supports, each list in order
@@ -1506,12 +1449,7 @@ fn is_known(n: u8) -> bool {
     matches!(n, 1..=6 | 20 | 21)
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
 #[cfg(test)]
 mod tests {

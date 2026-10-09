@@ -26,8 +26,7 @@
 //! only its kind, so world code reads the rest with whatever JSON reader it
 //! likes.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A decoder takes a size limit and refuses a packet whose data
+//! A decoder takes a size limit and refuses a packet whose data
 //! would pass it, before the data comes.
 //!
 //! ```
@@ -60,7 +59,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 extern crate alloc;
 
 use alloc::{
@@ -147,31 +145,25 @@ pub enum Error {
     TooLong,
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Magic => f.write_str("packet does not start with ZBXD"),
-            Error::Flags(b) => write!(f, "flags byte {b:#04x} is not a Zabbix protocol packet"),
-            Error::TooLarge { len, limit } => {
-                write!(f, "data length {len} is over the limit of {limit}")
-            }
-            Error::ReservedTooLarge { len, limit } => {
-                write!(f, "reserved length {len} is over the limit of {limit}")
-            }
-            Error::Truncated => f.write_str("input ended before a complete Zabbix packet"),
-            Error::Trailing => f.write_str("bytes follow the Zabbix packet"),
-            Error::Utf8 => f.write_str("message is not UTF-8"),
-            Error::Syntax(at) => write!(f, "malformed JSON at byte {at}"),
-            Error::TooDeep => write!(f, "JSON nests deeper than {MAX_DEPTH}"),
-            Error::NotObject => f.write_str("JSON is not an object"),
-            Error::NoKind => f.write_str("JSON object has no request or response member"),
-            Error::TooLong => write!(f, "JSON is longer than {MAX_DATA} bytes"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Magic => f.write_str("packet does not start with ZBXD"),
+    Error::Flags(b) => write!(f, "flags byte {b:#04x} is not a Zabbix protocol packet"),
+    Error::TooLarge { len, limit } => {
+        write!(f, "data length {len} is over the limit of {limit}")
     }
-}
-
-impl core::error::Error for Error {}
+    Error::ReservedTooLarge { len, limit } => {
+        write!(f, "reserved length {len} is over the limit of {limit}")
+    }
+    Error::Truncated => f.write_str("input ended before a complete Zabbix packet"),
+    Error::Trailing => f.write_str("bytes follow the Zabbix packet"),
+    Error::Utf8 => f.write_str("message is not UTF-8"),
+    Error::Syntax(at) => write!(f, "malformed JSON at byte {at}"),
+    Error::TooDeep => write!(f, "JSON nests deeper than {MAX_DEPTH}"),
+    Error::NotObject => f.write_str("JSON is not an object"),
+    Error::NoKind => f.write_str("JSON object has no request or response member"),
+    Error::TooLong => write!(f, "JSON is longer than {MAX_DATA} bytes"),
+});
 
 /// A packet header: the flags and the two lengths that follow `ZBXD`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -383,51 +375,37 @@ impl Wire for Packet {
     }
 }
 
-/// Reads Zabbix packets without holding input bytes.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`LARGE_HEADER_LEN`]
-/// plus [`Frames::limit`](fictionet::stdlib::codec::Frames::limit). Partial packets return [`fictionet::stdlib::codec::Step::Need`], including at
-/// EOF. The stream reports truncation at EOF and framing errors once.
-/// Compressed payloads remain bytes. Body parsing stays separate.
-/// [`Wire`] accepts data up to [`MAX_DATA`], but [`codec::Frames<Packet>::new`](fictionet::stdlib::codec::Frames::new) refuses data
-/// over [`DEFAULT_LIMIT`]; use [`codec::Frames<Packet>::with_limit`](fictionet::stdlib::codec::Frames::with_limit) for larger packets.
-///
-/// ```
-/// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-/// use fictionet::stdlib::zabbix::Packet;
-///
-/// let packet = Packet::new(b"hello".to_vec());
-/// let bytes = Wire::to_bytes(&packet)?;
-/// let mut stream = Stream::new(Frames::<Packet>::with_limit(16));
-/// let mut packets = Vec::new();
-/// pump(&mut stream, &bytes[..3], |packet| packets.push(packet))?;
-/// pump(&mut stream, &bytes[3..], |packet| packets.push(packet))?;
-/// finish(&mut stream, |packet| packets.push(packet))?;
-/// assert_eq!(packets, [packet]);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-impl Prefixed for Packet {
-    type Item = Packet;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "Zabbix";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        DEFAULT_LIMIT
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_DATA)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        LARGE_HEADER_LEN.saturating_add(limit)
-    }
+fictionet::prefixed! {
+    /// Reads Zabbix packets without holding input bytes.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`LARGE_HEADER_LEN`]
+    /// plus [`Frames::limit`](fictionet::stdlib::codec::Frames::limit). Partial packets return [`fictionet::stdlib::codec::Step::Need`], including at
+    /// EOF. The stream reports truncation at EOF and framing errors once.
+    /// Compressed payloads remain bytes. Body parsing stays separate.
+    /// [`Wire`] accepts data up to [`MAX_DATA`], but [`codec::Frames<Packet>::new`](fictionet::stdlib::codec::Frames::new) refuses data
+    /// over [`DEFAULT_LIMIT`]; use [`codec::Frames<Packet>::with_limit`](fictionet::stdlib::codec::Frames::with_limit) for larger packets.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::Frames;
+    /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+    /// use fictionet::stdlib::zabbix::Packet;
+    ///
+    /// let packet = Packet::new(b"hello".to_vec());
+    /// let bytes = Wire::to_bytes(&packet)?;
+    /// let mut stream = Stream::new(Frames::<Packet>::with_limit(16));
+    /// let mut packets = Vec::new();
+    /// pump(&mut stream, &bytes[..3], |packet| packets.push(packet))?;
+    /// pump(&mut stream, &bytes[3..], |packet| packets.push(packet))?;
+    /// finish(&mut stream, |packet| packets.push(packet))?;
+    /// assert_eq!(packets, [packet]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    Packet => (Packet, Error, usize);
+    name = "Zabbix";
+    default { DEFAULT_LIMIT }
+    normalize(limit) { limit.min(MAX_DATA) }
+    capacity(limit) { let limit = *limit;
+        LARGE_HEADER_LEN.saturating_add(limit) }
 
     #[inline]
     fn parse_prefix(

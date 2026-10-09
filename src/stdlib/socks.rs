@@ -767,24 +767,18 @@ impl Error {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Version(v) => write!(f, "version byte {v} is not the one this message takes"),
-            Error::Command(c) => write!(f, "unknown command {c}"),
-            Error::AddressType(t) => write!(f, "unknown address type {t}"),
-            Error::Reserved(r) => write!(f, "reserved field is {r}, not 0"),
-            Error::FieldTooLong => f.write_str("SOCKS4 field has no zero byte within its limit"),
-            Error::Method(m) => write!(f, "method {m} was not offered"),
-            Error::Truncated => f.write_str("incomplete SOCKS unit"),
-            Error::Trailing => f.write_str("bytes after the SOCKS unit"),
-            Error::TooLong => f.write_str("SOCKS datagram exceeds MAX_DATAGRAM"),
-            Error::Unwritable => f.write_str("SOCKS value cannot be written unchanged"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Version(v) => write!(f, "version byte {v} is not the one this message takes"),
+    Error::Command(c) => write!(f, "unknown command {c}"),
+    Error::AddressType(t) => write!(f, "unknown address type {t}"),
+    Error::Reserved(r) => write!(f, "reserved field is {r}, not 0"),
+    Error::FieldTooLong => f.write_str("SOCKS4 field has no zero byte within its limit"),
+    Error::Method(m) => write!(f, "method {m} was not offered"),
+    Error::Truncated => f.write_str("incomplete SOCKS unit"),
+    Error::Trailing => f.write_str("bytes after the SOCKS unit"),
+    Error::TooLong => f.write_str("SOCKS datagram exceeds MAX_DATAGRAM"),
+    Error::Unwritable => f.write_str("SOCKS value cannot be written unchanged"),
+});
 
 /// Why a SOCKS stream cannot find its next unit. It ends the stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -802,33 +796,36 @@ pub enum FrameError {
     DecisionRequired(ServerPhase),
 }
 
-impl core::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Version(v) => write!(f, "version byte {v} is not the one this message takes"),
-            Self::AddressType(t) => write!(f, "unknown address type {t}"),
-            Self::FieldTooLong => f.write_str("SOCKS4 field has no zero byte within its limit"),
-            Self::TooLong => f.write_str("SOCKS unit exceeds its limit"),
-            Self::DecisionRequired(s) => write!(f, "SOCKS decision required in {s:?}"),
-        }
-    }
-}
-impl core::error::Error for FrameError {}
+fictionet::error_display!(FrameError, f, {
+    Self::Version(v) => write!(f, "version byte {v} is not the one this message takes"),
+    Self::AddressType(t) => write!(f, "unknown address type {t}"),
+    Self::FieldTooLong => f.write_str("SOCKS4 field has no zero byte within its limit"),
+    Self::TooLong => f.write_str("SOCKS unit exceeds its limit"),
+    Self::DecisionRequired(s) => write!(f, "SOCKS decision required in {s:?}"),
+});
 
-/// A login method a SOCKS5 client offers and a proxy chooses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Method {
-    /// 0x00: no login.
-    NoAuth,
-    /// 0x01: GSS-API (RFC 1961). This module does not read its messages.
-    Gssapi,
-    /// 0x02: username and password (RFC 1929).
-    UsernamePassword,
-    /// 0xFF: the proxy takes none of the methods offered.
-    NoAcceptable,
-    /// Any other code. An `Other` that holds one of the codes above is
-    /// refused by writers. Readers return the named method.
-    Other(u8),
+fictionet::open_enum! {
+    /// A login method a SOCKS5 client offers and a proxy chooses.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Method: u8 {
+        /// 0x00: no login.
+        NoAuth = 0x00,
+        /// 0x01: GSS-API (RFC 1961). This module does not read its messages.
+        Gssapi = 0x01,
+        /// 0x02: username and password (RFC 1929).
+        UsernamePassword = 0x02,
+        /// 0xFF: the proxy takes none of the methods offered.
+        NoAcceptable = 0xff,
+        ;
+        /// Any other code. An `Other` that holds one of the codes above is
+        /// refused by writers. Readers return the named method.
+        Other,
+    }
+    [
+        /// The method's code.
+    ] [
+        /// The method for code `c`.
+    ]
 }
 
 /// A set of method codes, such as the methods a greeting offered.
@@ -852,30 +849,6 @@ impl MethodSet {
     fn allows(&self, m: Method) -> bool {
         let c = m.code();
         c == Method::NoAcceptable.code() || self.0[usize::from(c / 64)] & (1 << (c % 64)) != 0
-    }
-}
-
-impl Method {
-    /// The method's code.
-    pub fn code(self) -> u8 {
-        match self {
-            Method::NoAuth => 0x00,
-            Method::Gssapi => 0x01,
-            Method::UsernamePassword => 0x02,
-            Method::NoAcceptable => 0xff,
-            Method::Other(c) => c,
-        }
-    }
-
-    /// The method for code `c`.
-    pub fn from_code(c: u8) -> Method {
-        match c {
-            0x00 => Method::NoAuth,
-            0x01 => Method::Gssapi,
-            0x02 => Method::UsernamePassword,
-            0xff => Method::NoAcceptable,
-            c => Method::Other(c),
-        }
     }
 }
 
@@ -1130,64 +1103,38 @@ impl Request {
     }
 }
 
-/// The reply codes of a SOCKS5 reply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplyCode {
-    /// 0x00: done.
-    Succeeded,
-    /// 0x01: the proxy failed.
-    GeneralFailure,
-    /// 0x02: the proxy's rules do not allow the connection.
-    NotAllowed,
-    /// 0x03: the network is unreachable.
-    NetworkUnreachable,
-    /// 0x04: the host is unreachable.
-    HostUnreachable,
-    /// 0x05: the host refused the connection.
-    ConnectionRefused,
-    /// 0x06: the TTL expired.
-    TtlExpired,
-    /// 0x07: the proxy does not support the command.
-    CommandNotSupported,
-    /// 0x08: the proxy does not support the address type.
-    AddressTypeNotSupported,
-    /// Any other code. An `Other` that holds one of the codes above is
-    /// refused by writers. Readers return the named variant.
-    Other(u8),
-}
-
-impl ReplyCode {
-    /// The reply code's number.
-    pub fn code(self) -> u8 {
-        match self {
-            ReplyCode::Succeeded => 0,
-            ReplyCode::GeneralFailure => 1,
-            ReplyCode::NotAllowed => 2,
-            ReplyCode::NetworkUnreachable => 3,
-            ReplyCode::HostUnreachable => 4,
-            ReplyCode::ConnectionRefused => 5,
-            ReplyCode::TtlExpired => 6,
-            ReplyCode::CommandNotSupported => 7,
-            ReplyCode::AddressTypeNotSupported => 8,
-            ReplyCode::Other(c) => c,
-        }
+fictionet::open_enum! {
+    /// The reply codes of a SOCKS5 reply.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ReplyCode: u8 {
+        /// 0x00: done.
+        Succeeded = 0,
+        /// 0x01: the proxy failed.
+        GeneralFailure = 1,
+        /// 0x02: the proxy's rules do not allow the connection.
+        NotAllowed = 2,
+        /// 0x03: the network is unreachable.
+        NetworkUnreachable = 3,
+        /// 0x04: the host is unreachable.
+        HostUnreachable = 4,
+        /// 0x05: the host refused the connection.
+        ConnectionRefused = 5,
+        /// 0x06: the TTL expired.
+        TtlExpired = 6,
+        /// 0x07: the proxy does not support the command.
+        CommandNotSupported = 7,
+        /// 0x08: the proxy does not support the address type.
+        AddressTypeNotSupported = 8,
+        ;
+        /// Any other code. An `Other` that holds one of the codes above is
+        /// refused by writers. Readers return the named variant.
+        Other,
     }
-
-    /// The reply code for number `c`.
-    pub fn from_code(c: u8) -> ReplyCode {
-        match c {
-            0 => ReplyCode::Succeeded,
-            1 => ReplyCode::GeneralFailure,
-            2 => ReplyCode::NotAllowed,
-            3 => ReplyCode::NetworkUnreachable,
-            4 => ReplyCode::HostUnreachable,
-            5 => ReplyCode::ConnectionRefused,
-            6 => ReplyCode::TtlExpired,
-            7 => ReplyCode::CommandNotSupported,
-            8 => ReplyCode::AddressTypeNotSupported,
-            c => ReplyCode::Other(c),
-        }
-    }
+    [
+        /// The reply code's number.
+    ] [
+        /// The reply code for number `c`.
+    ]
 }
 
 /// A SOCKS5 reply: the proxy's answer to a request. A BIND gets two: one
@@ -1442,44 +1389,28 @@ impl Socks4Request {
     }
 }
 
-/// The result codes of a SOCKS4 reply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Socks4Code {
-    /// 90: request granted.
-    Granted,
-    /// 91: request rejected or failed.
-    Rejected,
-    /// 92: rejected because the proxy cannot reach identd on the client.
-    NoIdentd,
-    /// 93: rejected because identd reports a different user ID.
-    IdentdMismatch,
-    /// Any other code. An `Other` that holds one of the codes above is
-    /// refused by writers. Readers return the named variant.
-    Other(u8),
-}
-
-impl Socks4Code {
-    /// The code's number.
-    pub fn code(self) -> u8 {
-        match self {
-            Socks4Code::Granted => 90,
-            Socks4Code::Rejected => 91,
-            Socks4Code::NoIdentd => 92,
-            Socks4Code::IdentdMismatch => 93,
-            Socks4Code::Other(c) => c,
-        }
+fictionet::open_enum! {
+    /// The result codes of a SOCKS4 reply.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Socks4Code: u8 {
+        /// 90: request granted.
+        Granted = 90,
+        /// 91: request rejected or failed.
+        Rejected = 91,
+        /// 92: rejected because the proxy cannot reach identd on the client.
+        NoIdentd = 92,
+        /// 93: rejected because identd reports a different user ID.
+        IdentdMismatch = 93,
+        ;
+        /// Any other code. An `Other` that holds one of the codes above is
+        /// refused by writers. Readers return the named variant.
+        Other,
     }
-
-    /// The code for number `c`.
-    pub fn from_code(c: u8) -> Socks4Code {
-        match c {
-            90 => Socks4Code::Granted,
-            91 => Socks4Code::Rejected,
-            92 => Socks4Code::NoIdentd,
-            93 => Socks4Code::IdentdMismatch,
-            c => Socks4Code::Other(c),
-        }
-    }
+    [
+        /// The code's number.
+    ] [
+        /// The code for number `c`.
+    ]
 }
 
 /// A SOCKS4 reply. A BIND gets two, as in SOCKS5.

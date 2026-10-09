@@ -25,8 +25,7 @@
 //! name, and the packfile's bytes are up to world code. This module keeps
 //! packfiles as bytes and never looks inside them.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Strings are UTF-8. Every name, path and value is at most
+//! Strings are UTF-8. Every name, path and value is at most
 //! [`MAX_TEXT`] bytes, and every list has a named limit. Writers refuse
 //! invalid fields and values beyond these limits.
 //!
@@ -66,7 +65,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::ascii::hex_value as hex_digit;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
@@ -163,32 +161,25 @@ impl Wire for Packet {
     }
 }
 
-/// Reads Git pkt-lines without holding input bytes.
-///
-/// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer limited
-/// to [`MAX_PACKET`]. Oversized packets are refused from the header.
-/// Partial packets return [`Step::Need`], including at EOF, so the stream
-/// reports truncation. Flush, delimiter, response-end, and empty data
-/// packets are separate items. Control packets do not end the stream.
-///
-/// After the flush that ends a receive-pack command list, raw PACK bytes
-/// may follow. Before reading another item, the world must hand off with
-/// [`Stream::into_parts`](fictionet::stdlib::codec::Stream::into_parts), or
-/// [`Stream::swap`](fictionet::stdlib::codec::Stream::swap) to a pack decoder. Both
-/// preserve unread bytes; [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames) cannot parse raw PACK data.
-impl Prefixed for Packet {
-    type Item = Packet;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "Git pkt-line";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_PACKET
-    }
+fictionet::prefixed! {
+    /// Reads Git pkt-lines without holding input bytes.
+    ///
+    /// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer limited
+    /// to [`MAX_PACKET`]. Oversized packets are refused from the header.
+    /// Partial packets return [`Step::Need`], including at EOF, so the stream
+    /// reports truncation. Flush, delimiter, response-end, and empty data
+    /// packets are separate items. Control packets do not end the stream.
+    ///
+    /// After the flush that ends a receive-pack command list, raw PACK bytes
+    /// may follow. Before reading another item, the world must hand off with
+    /// [`Stream::into_parts`](fictionet::stdlib::codec::Stream::into_parts), or
+    /// [`Stream::swap`](fictionet::stdlib::codec::Stream::swap) to a pack decoder. Both
+    /// preserve unread bytes; [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames) cannot parse raw PACK data.
+    Packet => (Packet, Error, ());
+    name = "Git pkt-line";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_PACKET }
 
     #[inline]
     fn parse_prefix(
@@ -286,26 +277,20 @@ pub enum Error {
     Remote(String),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Header => write!(f, "pkt-line length is not four hex digits"),
-            Error::Reserved => write!(f, "pkt-line length 0003 is reserved"),
-            Error::PacketTooLong(n) => write!(f, "pkt-line length {n} is above {MAX_PACKET}"),
-            Error::Truncated => f.write_str("incomplete Git protocol unit"),
-            Error::Trailing => f.write_str("bytes after Git protocol unit"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Text => write!(f, "a line is not UTF-8 text on one line"),
-            Error::ObjectId => write!(f, "an object id is not 40 or 64 hex digits"),
-            Error::Syntax(what) => write!(f, "expected {what}"),
-            Error::TooLong => write!(f, "a field or line is too long"),
-            Error::TooMany => write!(f, "a list is too long"),
-            Error::Remote(m) => write!(f, "the other side reported an error: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Header => write!(f, "pkt-line length is not four hex digits"),
+    Error::Reserved => write!(f, "pkt-line length 0003 is reserved"),
+    Error::PacketTooLong(n) => write!(f, "pkt-line length {n} is above {MAX_PACKET}"),
+    Error::Truncated => f.write_str("incomplete Git protocol unit"),
+    Error::Trailing => f.write_str("bytes after Git protocol unit"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Text => write!(f, "a line is not UTF-8 text on one line"),
+    Error::ObjectId => write!(f, "an object id is not 40 or 64 hex digits"),
+    Error::Syntax(what) => write!(f, "expected {what}"),
+    Error::TooLong => write!(f, "a field or line is too long"),
+    Error::TooMany => write!(f, "a list is too long"),
+    Error::Remote(m) => write!(f, "the other side reported an error: {m}"),
+});
 
 /// An object id: 40 hex digits for SHA-1 or 64 for SHA-256, kept in lower
 /// case. A value of this type always holds a valid one.

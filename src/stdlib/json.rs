@@ -913,6 +913,9 @@ impl Wire for Value {
         out.extend_from_slice(self.render(&Limits::default())?.as_bytes());
         Ok(())
     }
+    fn to_bytes(&self) -> Result<Vec<u8>, Self::WriteError> {
+        self.render(&Limits::default()).map(String::into_bytes)
+    }
 }
 
 /// Reads consecutive JSON values without holding input bytes.

@@ -32,7 +32,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{Wire, le16, le24};
 
 /// The TCP port IEC 104 servers normally listen on.
@@ -266,24 +265,17 @@ impl Wire for Frame {
     }
 }
 
-/// Reads IEC 104 frames without holding input bytes.
-///
-/// Use with [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) for a buffer limited to
-/// [`MAX_FRAME`]. Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
-/// The stream reports truncation at EOF and framing errors once.
-impl Prefixed for Frame {
-    type Item = Frame;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "IEC 104";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_FRAME
-    }
+fictionet::prefixed! {
+    /// Reads IEC 104 frames without holding input bytes.
+    ///
+    /// Use with [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) for a buffer limited to
+    /// [`MAX_FRAME`]. Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
+    /// The stream reports truncation at EOF and framing errors once.
+    Frame => (Frame, Error, ());
+    name = "IEC 104";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_FRAME }
 
     /// Reads an APDU prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.
     /// Invalid start bytes, lengths, control fields or ASDU lengths return

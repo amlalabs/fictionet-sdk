@@ -54,7 +54,7 @@
 //! encoder.apply_instruction(ack.unwrap()).unwrap();
 //! ```
 
-use fictionet::stdlib::codec::{Frames, Prefixed};
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Reader, Truncated};
 use fictionet::stdlib::quic::MAX_VARINT;
 
@@ -300,33 +300,27 @@ pub enum Error {
     Trailing,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Truncated => f.write_str("field section cut short"),
-            Error::IntegerOverflow => f.write_str("integer too large"),
-            Error::StringTooLong => f.write_str("string too long"),
-            Error::Huffman => f.write_str("bad Huffman code"),
-            Error::StaticIndex(i) => write!(f, "no static entry {i}"),
-            Error::DynamicIndex(i) => write!(f, "no dynamic entry at index {i}"),
-            Error::InsertCount => f.write_str("bad Required Insert Count"),
-            Error::Base => f.write_str("negative Base"),
-            Error::Capacity(c) => write!(f, "table capacity {c} above the maximum"),
-            Error::EntryTooLarge => f.write_str("entry larger than the table capacity"),
-            Error::ZeroIncrement => f.write_str("Insert Count Increment of 0"),
-            Error::Increment => f.write_str("Insert Count Increment past the inserts"),
-            Error::UnknownStream(s) => write!(f, "no section waiting on stream {s}"),
-            Error::FieldSectionTooLarge => f.write_str("field section too large"),
-            Error::TooManyFields => f.write_str("too many fields"),
-            Error::Referenced => f.write_str("would evict an entry still in use"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Incomplete => f.write_str("input ended before a complete QPACK value"),
-            Error::Trailing => f.write_str("bytes follow the QPACK value"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Truncated => f.write_str("field section cut short"),
+    Error::IntegerOverflow => f.write_str("integer too large"),
+    Error::StringTooLong => f.write_str("string too long"),
+    Error::Huffman => f.write_str("bad Huffman code"),
+    Error::StaticIndex(i) => write!(f, "no static entry {i}"),
+    Error::DynamicIndex(i) => write!(f, "no dynamic entry at index {i}"),
+    Error::InsertCount => f.write_str("bad Required Insert Count"),
+    Error::Base => f.write_str("negative Base"),
+    Error::Capacity(c) => write!(f, "table capacity {c} above the maximum"),
+    Error::EntryTooLarge => f.write_str("entry larger than the table capacity"),
+    Error::ZeroIncrement => f.write_str("Insert Count Increment of 0"),
+    Error::Increment => f.write_str("Insert Count Increment past the inserts"),
+    Error::UnknownStream(s) => write!(f, "no section waiting on stream {s}"),
+    Error::FieldSectionTooLarge => f.write_str("field section too large"),
+    Error::TooManyFields => f.write_str("too many fields"),
+    Error::Referenced => f.write_str("would evict an entry still in use"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Incomplete => f.write_str("input ended before a complete QPACK value"),
+    Error::Trailing => f.write_str("bytes follow the QPACK value"),
+});
 
 // ---------------------------------------------------------------------
 // Integers and strings (RFC 7541 sections 5.1 and 5.2).
@@ -1536,25 +1530,18 @@ impl Encoder {
 // ---------------------------------------------------------------------
 // Slice decoders and caller-owned session state.
 
-/// Reads one encoder instruction per call without owning input.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`]. Integer overflow and excessive string
-/// lengths end framing. A complete instruction with invalid contents is an
-/// error item. Apply successful items with [`Table::apply`] between calls.
-/// Partial instructions return [`Step::Need`], including at EOF.
-impl Prefixed for EncoderInstruction {
-    type Item = Result<EncoderInstruction, Error>;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "QPACK encoder stream";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_INSTRUCTION
-    }
+fictionet::prefixed! {
+    /// Reads one encoder instruction per call without owning input.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`]. Integer overflow and excessive string
+    /// lengths end framing. A complete instruction with invalid contents is an
+    /// error item. Apply successful items with [`Table::apply`] between calls.
+    /// Partial instructions return [`Step::Need`], including at EOF.
+    EncoderInstruction => (Result<EncoderInstruction, Error>, Error, ());
+    name = "QPACK encoder stream";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_INSTRUCTION }
 
     #[inline]
     fn parse_prefix(
@@ -1628,26 +1615,19 @@ fn check_strings(name: &[u8], value: &[u8]) -> Result<(), Error> {
     }
 }
 
-/// Reads one decoder instruction per call without owning input.
-///
-/// Zero increments are error items. Integer overflow ends framing. Partial
-/// integers return [`Step::Need`], so [`fictionet::stdlib::codec::Stream`] reports EOF
-/// truncation. Stream acknowledgments need the caller's section metadata;
-/// call [`Encoder::apply_instruction`] between items. This decoder has no
-/// table or pending output queue.
-impl Prefixed for DecoderInstruction {
-    type Item = Result<DecoderInstruction, Error>;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "QPACK decoder stream";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_INTEGER_BYTES
-    }
+fictionet::prefixed! {
+    /// Reads one decoder instruction per call without owning input.
+    ///
+    /// Zero increments are error items. Integer overflow ends framing. Partial
+    /// integers return [`Step::Need`], so [`fictionet::stdlib::codec::Stream`] reports EOF
+    /// truncation. Stream acknowledgments need the caller's section metadata;
+    /// call [`Encoder::apply_instruction`] between items. This decoder has no
+    /// table or pending output queue.
+    DecoderInstruction => (Result<DecoderInstruction, Error>, Error, ());
+    name = "QPACK decoder stream";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_INTEGER_BYTES }
 
     #[inline]
     fn parse_prefix(
@@ -2018,12 +1998,7 @@ impl BlockedSections {
     }
 }
 
-impl From<Truncated> for Stop {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Stop::More
-    }
-}
+fictionet::codec_from!(Stop, Truncated, |_| Stop::More);
 
 #[cfg(test)]
 mod tests {

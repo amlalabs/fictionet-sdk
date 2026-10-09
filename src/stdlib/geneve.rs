@@ -23,8 +23,7 @@
 //! [`Stream<Collect<Packet>>`](fictionet::stdlib::codec::Stream)
 //! and a collection limit of [`MAX_DATAGRAM`]. Call `end` at the datagram boundary.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A header whose version is not 0, whose options run past the
+//! A header whose version is not 0, whose options run past the
 //! header's option length, or whose C bit does not match its options is
 //! refused. The reserved bits are ignored when read and written as zero,
 //! as the RFC asks. Writers check the same rules, so bytes they return
@@ -185,36 +184,30 @@ pub enum Error {
     OptionsLength(usize),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Trailing { remaining } => {
-                write!(f, "{remaining} bytes after the Geneve header")
-            }
-            Error::Truncated => f.write_str("bytes end inside the Geneve header"),
-            Error::Version(v) => write!(f, "Geneve version {v}, not 0"),
-            Error::OptionOverrun(at) => {
-                write!(f, "option at offset {at} runs past the option length")
-            }
-            Error::CriticalBit(true) => f.write_str("C bit set, but no option is critical"),
-            Error::CriticalBit(false) => f.write_str("a critical option, but the C bit is clear"),
-            Error::TooLong => write!(f, "datagram longer than {MAX_DATAGRAM} bytes"),
-            Error::Vni(v) => write!(f, "VNI {v} does not fit in 24 bits"),
-            Error::OptionType(t) => write!(f, "option type {t} does not fit in 7 bits"),
-            Error::OptionData(n) => {
-                write!(
-                    f,
-                    "option data of {n} bytes, not a multiple of 4 up to {MAX_OPTION_DATA}"
-                )
-            }
-            Error::OptionsLength(n) => {
-                write!(f, "options of {n} bytes, more than {MAX_OPTIONS_LEN}")
-            }
-        }
+fictionet::error_display!(Error, f, {
+    Error::Trailing { remaining } => {
+        write!(f, "{remaining} bytes after the Geneve header")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Truncated => f.write_str("bytes end inside the Geneve header"),
+    Error::Version(v) => write!(f, "Geneve version {v}, not 0"),
+    Error::OptionOverrun(at) => {
+        write!(f, "option at offset {at} runs past the option length")
+    }
+    Error::CriticalBit(true) => f.write_str("C bit set, but no option is critical"),
+    Error::CriticalBit(false) => f.write_str("a critical option, but the C bit is clear"),
+    Error::TooLong => write!(f, "datagram longer than {MAX_DATAGRAM} bytes"),
+    Error::Vni(v) => write!(f, "VNI {v} does not fit in 24 bits"),
+    Error::OptionType(t) => write!(f, "option type {t} does not fit in 7 bits"),
+    Error::OptionData(n) => {
+        write!(
+            f,
+            "option data of {n} bytes, not a multiple of 4 up to {MAX_OPTION_DATA}"
+        )
+    }
+    Error::OptionsLength(n) => {
+        write!(f, "options of {n} bytes, more than {MAX_OPTIONS_LEN}")
+    }
+});
 
 impl Header {
     /// Reads the header at the start of `b`. It returns `Ok(None)` if `b`
@@ -452,35 +445,13 @@ impl Wire for Header {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg};
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn collect(b: &[u8]) -> Result<Packet, Error> {
-        let make = || Collect::<Packet>::new(MAX_DATAGRAM);
-        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_DATAGRAM + 1));
-        contract::check_wire::<Packet>(b);
-        let parsed = Packet::parse(b);
-        let (items, failure) = decode_all(make, b);
-        if b.len() <= MAX_DATAGRAM {
-            assert_eq!(
-                failure,
-                parsed
-                    .clone()
-                    .err()
-                    .map(|e| Fail::Protocol(CollectError::Parse(e)))
-            );
-            assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
-        } else {
-            assert_eq!(
-                failure,
-                Some(Fail::Protocol(CollectError::TooLong {
-                    limit: MAX_DATAGRAM
-                }))
-            );
-        }
-        parsed
+        contract::check_collect::<Packet>(b, MAX_DATAGRAM)
     }
 
     fn opt(class: u16, kind: u8, critical: bool, data: &[u8]) -> GeneveOption {

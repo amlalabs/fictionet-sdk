@@ -65,7 +65,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::field;
 use std::collections::{BTreeMap, HashMap};
@@ -136,45 +135,26 @@ pub enum Error {
     /// The book tracks [`BookConfig::max_stocks`] stocks.
     TooManyStocks,
 }
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Length => f.write_str("ITCH message length is wrong"),
-            Error::Type(t) => write!(f, "unexpected ITCH message type {t:#04x}"),
-            Error::Field => f.write_str("ITCH alpha field is invalid"),
-            Error::Side(s) => write!(f, "invalid ITCH buy/sell indicator {s:#04x}"),
-            Error::Timestamp => f.write_str("ITCH timestamp does not fit six bytes"),
-            Error::Price => f.write_str("ITCH price is invalid"),
-            Error::TooLong => f.write_str("ITCH frame is too long"),
-            Error::Config => f.write_str("ITCH book configuration is out of range"),
-            Error::UnknownOrder(r) => write!(f, "ITCH order {r} is not on the book"),
-            Error::DuplicateOrder(r) => write!(f, "ITCH order {r} is already on the book"),
-            Error::Shares(r) => write!(f, "ITCH order {r} share count is invalid"),
-            Error::Locate(r) => write!(f, "ITCH order {r} belongs to another locate"),
-            Error::TooManyOrders => f.write_str("ITCH book order limit reached"),
-            Error::TooManyLevels => f.write_str("ITCH book price level limit reached"),
-            Error::TooManyStocks => f.write_str("ITCH book stock limit reached"),
-        }
-    }
-}
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Length => f.write_str("ITCH message length is wrong"),
+    Error::Type(t) => write!(f, "unexpected ITCH message type {t:#04x}"),
+    Error::Field => f.write_str("ITCH alpha field is invalid"),
+    Error::Side(s) => write!(f, "invalid ITCH buy/sell indicator {s:#04x}"),
+    Error::Timestamp => f.write_str("ITCH timestamp does not fit six bytes"),
+    Error::Price => f.write_str("ITCH price is invalid"),
+    Error::TooLong => f.write_str("ITCH frame is too long"),
+    Error::Config => f.write_str("ITCH book configuration is out of range"),
+    Error::UnknownOrder(r) => write!(f, "ITCH order {r} is not on the book"),
+    Error::DuplicateOrder(r) => write!(f, "ITCH order {r} is already on the book"),
+    Error::Shares(r) => write!(f, "ITCH order {r} share count is invalid"),
+    Error::Locate(r) => write!(f, "ITCH order {r} belongs to another locate"),
+    Error::TooManyOrders => f.write_str("ITCH book order limit reached"),
+    Error::TooManyLevels => f.write_str("ITCH book price level limit reached"),
+    Error::TooManyStocks => f.write_str("ITCH book stock limit reached"),
+});
 
-/// One fixed-width field: its size, and how it reads and writes.
-trait Field: Sized {
-    const LEN: usize;
-    /// Reads exactly `LEN` bytes.
-    fn get(b: &[u8]) -> Result<Self, Error>;
-    fn put(&self, out: &mut Vec<u8>);
-}
-/// Reads the next field from `b` and moves past it.
-fn take<T: Field>(b: &mut &[u8]) -> Result<T, Error> {
-    let (head, rest) = b.split_at_checked(T::LEN).ok_or(Error::Length)?;
-    *b = rest;
-    T::get(head)
-}
-fn array<const N: usize>(b: &[u8]) -> Result<[u8; N], Error> {
-    b.try_into().map_err(|_| Error::Length)
-}
+fictionet::fixed_fields!(Field, take, array; Error, Error::Length;
+    from_be_bytes, to_be_bytes; u16, u32, u64);
 impl Field for u8 {
     const LEN: usize = 1;
     fn get(b: &[u8]) -> Result<Self, Error> {
@@ -182,33 +162,6 @@ impl Field for u8 {
     }
     fn put(&self, out: &mut Vec<u8>) {
         out.push(*self);
-    }
-}
-impl Field for u16 {
-    const LEN: usize = 2;
-    fn get(b: &[u8]) -> Result<Self, Error> {
-        Ok(u16::from_be_bytes(array(b)?))
-    }
-    fn put(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.to_be_bytes());
-    }
-}
-impl Field for u32 {
-    const LEN: usize = 4;
-    fn get(b: &[u8]) -> Result<Self, Error> {
-        Ok(u32::from_be_bytes(array(b)?))
-    }
-    fn put(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.to_be_bytes());
-    }
-}
-impl Field for u64 {
-    const LEN: usize = 8;
-    fn get(b: &[u8]) -> Result<Self, Error> {
-        Ok(u64::from_be_bytes(array(b)?))
-    }
-    fn put(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.to_be_bytes());
     }
 }
 
@@ -808,52 +761,38 @@ pub mod codes {
     }
 }
 
-/// Reads length-prefixed messages (a two-byte big-endian length, then the
-/// message) from a byte stream, without holding input. This is the layout
-/// of Nasdaq's binary ITCH files, and of MoldUDP64 message blocks.
-///
-/// Each item is one message, parsed: `Err` for a frame that does not
-/// parse (an unknown type, a length that does not match the type), so
-/// the caller decides whether to skip it. A length prefix over the limit
-/// ends the stream with [`Error::TooLong`], read from the prefix alone.
-///
-/// ```
-/// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::codec::{finish, pump, Stream, Wire};
-/// use fictionet::stdlib::itch::{Header, Message, MwcbStatus};
-///
-/// let status = MwcbStatus { header: Header::default(), breached_level: b'1' };
-/// let mut file = vec![0, 12];
-/// status.write(&mut file)?;
-/// let mut stream = Stream::new(Frames::<Message>::default());
-/// let mut messages = Vec::new();
-/// pump(&mut stream, &file[..5], |m| messages.push(m))?;
-/// pump(&mut stream, &file[5..], |m| messages.push(m))?;
-/// finish(&mut stream, |m| messages.push(m))?;
-/// assert_eq!(messages, [Ok(Message::MwcbStatus(status))]);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-impl Prefixed for Message {
-    type Item = Result<Message, Error>;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "ITCH";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_FRAME
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_FRAME)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        LENGTH_PREFIX + limit
-    }
+fictionet::prefixed! {
+    /// Reads length-prefixed messages (a two-byte big-endian length, then the
+    /// message) from a byte stream, without holding input. This is the layout
+    /// of Nasdaq's binary ITCH files, and of MoldUDP64 message blocks.
+    ///
+    /// Each item is one message, parsed: `Err` for a frame that does not
+    /// parse (an unknown type, a length that does not match the type), so
+    /// the caller decides whether to skip it. A length prefix over the limit
+    /// ends the stream with [`Error::TooLong`], read from the prefix alone.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::Frames;
+    /// use fictionet::stdlib::codec::{finish, pump, Stream, Wire};
+    /// use fictionet::stdlib::itch::{Header, Message, MwcbStatus};
+    ///
+    /// let status = MwcbStatus { header: Header::default(), breached_level: b'1' };
+    /// let mut file = vec![0, 12];
+    /// status.write(&mut file)?;
+    /// let mut stream = Stream::new(Frames::<Message>::default());
+    /// let mut messages = Vec::new();
+    /// pump(&mut stream, &file[..5], |m| messages.push(m))?;
+    /// pump(&mut stream, &file[5..], |m| messages.push(m))?;
+    /// finish(&mut stream, |m| messages.push(m))?;
+    /// assert_eq!(messages, [Ok(Message::MwcbStatus(status))]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    Message => (Result<Message, Error>, Error, usize);
+    name = "ITCH";
+    default { MAX_FRAME }
+    normalize(limit) { limit.min(MAX_FRAME) }
+    capacity(limit) { let limit = *limit;
+        LENGTH_PREFIX + limit }
 
     #[inline]
     fn parse_prefix(

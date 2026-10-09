@@ -49,7 +49,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{Reader, Trailing, Truncated};
 
 use fictionet::stdlib::{codec::Wire, cotp, tpkt};
@@ -499,25 +498,18 @@ impl Wire for Frame {
     }
 }
 
-/// Reads RDP slow-path and fast-path frames without holding input bytes.
-///
-/// Use with [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) for a buffer limited to
-/// [`MAX_FRAME`]. Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
-/// The stream reports truncation at EOF and framing errors once.
-/// Slow-path framing uses the shared [`tpkt`] parser.
-impl Prefixed for Frame {
-    type Item = Frame;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "RDP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_FRAME
-    }
+fictionet::prefixed! {
+    /// Reads RDP slow-path and fast-path frames without holding input bytes.
+    ///
+    /// Use with [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) for a buffer limited to
+    /// [`MAX_FRAME`]. Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
+    /// The stream reports truncation at EOF and framing errors once.
+    /// Slow-path framing uses the shared [`tpkt`] parser.
+    Frame => (Frame, Error, ());
+    name = "RDP";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_FRAME }
 
     /// Reads a frame prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.
     /// Returns [`Error::Invalid`] for bad fast-path action bits or lengths,
@@ -2486,19 +2478,9 @@ impl Wire for ActivePdu {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
-impl From<Trailing> for Error {
-    #[inline]
-    fn from(_: Trailing) -> Self {
-        Error::Invalid("trailing bytes")
-    }
-}
+fictionet::codec_from!(Error, Trailing, |_| Error::Invalid("trailing bytes"));
 
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]

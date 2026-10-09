@@ -29,8 +29,7 @@
 //! and writes each answer's bytes to the connection. Which applications,
 //! subscribers and sessions exist is up to world code.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Each [`Error`] names the Result-Code a real server answers it
+//! Each [`Error`] names the Result-Code a real server answers it
 //! with.
 //!
 //! ```
@@ -75,7 +74,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::pad_to_4 as padded;
 use fictionet::stdlib::codec::{be24, be32};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -387,19 +385,13 @@ impl FrameError {
     }
 }
 
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FrameError::Version(v) => write!(f, "Diameter version {v}, not 1"),
-            FrameError::MessageLength(n) => {
-                write!(f, "message length {n}, below 20 or not a multiple of 4")
-            }
-            FrameError::TooBig(n) => write!(f, "message length {n}, above the limit"),
-        }
+fictionet::error_display!(FrameError, f, {
+    FrameError::Version(v) => write!(f, "Diameter version {v}, not 1"),
+    FrameError::MessageLength(n) => {
+        write!(f, "message length {n}, below 20 or not a multiple of 4")
     }
-}
-
-impl std::error::Error for FrameError {}
+    FrameError::TooBig(n) => write!(f, "message length {n}, above the limit"),
+});
 
 /// Why bytes are not a Diameter message, or an AVP is not what its
 /// dictionary says: the module's error, and the reason inside an
@@ -471,34 +463,28 @@ impl Error {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Incomplete => f.write_str("incomplete Diameter message"),
-            Error::Trailing { remaining } => write!(f, "{remaining} bytes after Diameter value"),
-            Error::Unwritable => {
-                f.write_str("Diameter value cannot be written without changing it")
-            }
-            Error::Frame(e) => e.fmt(f),
-            Error::AvpLength { code, length } => {
-                write!(f, "AVP {code} has length {length}, which does not fit")
-            }
-            Error::TooManyAvps => write!(f, "more than {MAX_AVPS} AVPs in one list"),
-            Error::TooDeep(code) => {
-                write!(f, "grouped AVP {code} nests deeper than {MAX_DEPTH} levels")
-            }
-            Error::Value { code, format } => {
-                write!(f, "AVP {code} is not a valid {}", format.name())
-            }
-            Error::HeaderBits(flags) => {
-                write!(f, "header flags {flags:#04x} are a forbidden combination")
-            }
-            Error::AvpBits { code } => write!(f, "AVP {code} has the vendor flag with vendor ID 0"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Incomplete => f.write_str("incomplete Diameter message"),
+    Error::Trailing { remaining } => write!(f, "{remaining} bytes after Diameter value"),
+    Error::Unwritable => {
+        f.write_str("Diameter value cannot be written without changing it")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Frame(e) => e.fmt(f),
+    Error::AvpLength { code, length } => {
+        write!(f, "AVP {code} has length {length}, which does not fit")
+    }
+    Error::TooManyAvps => write!(f, "more than {MAX_AVPS} AVPs in one list"),
+    Error::TooDeep(code) => {
+        write!(f, "grouped AVP {code} nests deeper than {MAX_DEPTH} levels")
+    }
+    Error::Value { code, format } => {
+        write!(f, "AVP {code} is not a valid {}", format.name())
+    }
+    Error::HeaderBits(flags) => {
+        write!(f, "header flags {flags:#04x} are a forbidden combination")
+    }
+    Error::AvpBits { code } => write!(f, "AVP {code} has the vendor flag with vendor ID 0"),
+});
 
 impl From<FrameError> for Error {
     fn from(e: FrameError) -> Error {
@@ -736,50 +722,36 @@ impl core::error::Error for AvpFault {
     }
 }
 
-/// Reads Diameter messages without retaining input.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`] for bounded buffering. The first four
-/// bytes suffice to refuse a message above [`limit`](fictionet::stdlib::codec::Frames::limit). Partial
-/// messages return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The driver reports
-/// truncation and reports header errors once. Only a [`FrameError`] ends
-/// the stream. AVP errors
-/// yield [`AvpFault`] items with the header and no AVPs, then decoding
-/// continues at the next message. Use that header to construct an answer.
-///
-/// ```
-/// use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
-/// use fictionet::stdlib::diameter::{command, Message};
-/// let message = Message::request(command::DEVICE_WATCHDOG, 0, 7, 9);
-/// let bytes = Wire::to_bytes(&message)?;
-/// let mut stream = Stream::new(Frames::<Message>::new());
-/// let mut messages = Vec::new();
-/// for chunk in bytes.chunks(3) {
-///     pump(&mut stream, chunk, |item| messages.push(item))?;
-/// }
-/// finish(&mut stream, |item| messages.push(item))?;
-/// assert_eq!(messages, vec![Ok(message)]);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-impl Prefixed for Message {
-    type Item = Result<Message, AvpFault>;
-    type Error = FrameError;
-    type Limit = usize;
-    const NAME: &'static str = "Diameter";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        DEFAULT_LIMIT
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.clamp(HEADER_LEN, MAX_MESSAGE)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        *limit
-    }
+fictionet::prefixed! {
+    /// Reads Diameter messages without retaining input.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`] for bounded buffering. The first four
+    /// bytes suffice to refuse a message above [`limit`](fictionet::stdlib::codec::Frames::limit). Partial
+    /// messages return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The driver reports
+    /// truncation and reports header errors once. Only a [`FrameError`] ends
+    /// the stream. AVP errors
+    /// yield [`AvpFault`] items with the header and no AVPs, then decoding
+    /// continues at the next message. Use that header to construct an answer.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
+    /// use fictionet::stdlib::diameter::{command, Message};
+    /// let message = Message::request(command::DEVICE_WATCHDOG, 0, 7, 9);
+    /// let bytes = Wire::to_bytes(&message)?;
+    /// let mut stream = Stream::new(Frames::<Message>::new());
+    /// let mut messages = Vec::new();
+    /// for chunk in bytes.chunks(3) {
+    ///     pump(&mut stream, chunk, |item| messages.push(item))?;
+    /// }
+    /// finish(&mut stream, |item| messages.push(item))?;
+    /// assert_eq!(messages, vec![Ok(message)]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    Message => (Result<Message, AvpFault>, FrameError, usize);
+    name = "Diameter";
+    default { DEFAULT_LIMIT }
+    normalize(limit) { limit.clamp(HEADER_LEN, MAX_MESSAGE) }
+    capacity(limit) { *limit }
 
     #[inline]
     fn parse_prefix(

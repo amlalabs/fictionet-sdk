@@ -440,33 +440,27 @@ pub enum Error {
     ReplyVersion(u8),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::FieldLength { want, got } => write!(f, "{got} bytes, expected {want}"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Short(n) => write!(
-                f,
-                "{n} bytes, shorter than the {HEADER_LEN}-byte NTP header"
-            ),
-            Error::Long(n) => write!(
-                f,
-                "{n} bytes, longer than the {MAX_PACKET} an NTP packet may have here"
-            ),
-            Error::Version(v) => write!(f, "NTP version {v}, not 1 to 7"),
-            Error::Mode(m) => write!(f, "NTP mode {m}, not 1 to 5"),
-            Error::Trailer(n) => write!(f, "{n} bytes after the NTP header, not a multiple of 4"),
-            Error::NotClient(m) => write!(
-                f,
-                "NTP mode {} packet, not a request (mode 3 or 1)",
-                m.bits()
-            ),
-            Error::ReplyVersion(v) => write!(f, "NTP version {v} request, not 1 to 4"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::FieldLength { want, got } => write!(f, "{got} bytes, expected {want}"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Short(n) => write!(
+        f,
+        "{n} bytes, shorter than the {HEADER_LEN}-byte NTP header"
+    ),
+    Error::Long(n) => write!(
+        f,
+        "{n} bytes, longer than the {MAX_PACKET} an NTP packet may have here"
+    ),
+    Error::Version(v) => write!(f, "NTP version {v}, not 1 to 7"),
+    Error::Mode(m) => write!(f, "NTP mode {m}, not 1 to 5"),
+    Error::Trailer(n) => write!(f, "{n} bytes after the NTP header, not a multiple of 4"),
+    Error::NotClient(m) => write!(
+        f,
+        "NTP mode {} packet, not a request (mode 3 or 1)",
+        m.bits()
+    ),
+    Error::ReplyVersion(v) => write!(f, "NTP version {v} request, not 1 to 4"),
+});
 
 impl Packet {
     /// A version 4 client request sent at `transmit`, by the client's own

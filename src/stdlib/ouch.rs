@@ -142,57 +142,24 @@ pub enum Error {
     /// A time earlier than one already used.
     Time,
 }
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Length => f.write_str("OUCH message length is wrong"),
-            Error::Type(t) => write!(f, "unexpected OUCH message type {t:#04x}"),
-            Error::Field => f.write_str("OUCH alpha field is invalid"),
-            Error::Side(s) => write!(f, "invalid OUCH side {s:#04x}"),
-            Error::Option(t) => write!(f, "invalid OUCH option, tag {t}"),
-            Error::TooLong => f.write_str("OUCH appendage is too long"),
-            Error::Price => f.write_str("OUCH price is invalid"),
-            Error::Config => f.write_str("OUCH exchange configuration is out of range"),
-            Error::UnknownToken(t) => write!(f, "no OUCH order {t:?}"),
-            Error::Shares => f.write_str("OUCH share count is invalid"),
-            Error::UnknownMatch(m) => write!(f, "no OUCH execution {m}"),
-            Error::Exhausted => f.write_str("OUCH numbering is exhausted"),
-            Error::Time => f.write_str("OUCH exchange time went backwards"),
-        }
-    }
-}
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Length => f.write_str("OUCH message length is wrong"),
+    Error::Type(t) => write!(f, "unexpected OUCH message type {t:#04x}"),
+    Error::Field => f.write_str("OUCH alpha field is invalid"),
+    Error::Side(s) => write!(f, "invalid OUCH side {s:#04x}"),
+    Error::Option(t) => write!(f, "invalid OUCH option, tag {t}"),
+    Error::TooLong => f.write_str("OUCH appendage is too long"),
+    Error::Price => f.write_str("OUCH price is invalid"),
+    Error::Config => f.write_str("OUCH exchange configuration is out of range"),
+    Error::UnknownToken(t) => write!(f, "no OUCH order {t:?}"),
+    Error::Shares => f.write_str("OUCH share count is invalid"),
+    Error::UnknownMatch(m) => write!(f, "no OUCH execution {m}"),
+    Error::Exhausted => f.write_str("OUCH numbering is exhausted"),
+    Error::Time => f.write_str("OUCH exchange time went backwards"),
+});
 
-/// One fixed-width field: its size, and how it reads and writes.
-trait Field: Sized {
-    const LEN: usize;
-    /// Reads exactly `LEN` bytes.
-    fn get(b: &[u8]) -> Result<Self, Error>;
-    fn put(&self, out: &mut Vec<u8>);
-}
-/// Reads the next field from `b` and moves past it.
-fn take<T: Field>(b: &mut &[u8]) -> Result<T, Error> {
-    let (head, rest) = b.split_at_checked(T::LEN).ok_or(Error::Length)?;
-    *b = rest;
-    T::get(head)
-}
-fn array<const N: usize>(b: &[u8]) -> Result<[u8; N], Error> {
-    b.try_into().map_err(|_| Error::Length)
-}
-macro_rules! int_field {
-    ($($t:ty),*) => {$(
-        impl Field for $t {
-            const LEN: usize = std::mem::size_of::<$t>();
-            fn get(b: &[u8]) -> Result<Self, Error> {
-                Ok(<$t>::from_be_bytes(array(b)?))
-            }
-            fn put(&self, out: &mut Vec<u8>) {
-                out.extend_from_slice(&self.to_be_bytes());
-            }
-        }
-    )*};
-}
-int_field!(u8, u16, u32, u64, i32);
+fictionet::fixed_fields!(Field, take, array; Error, Error::Length;
+    from_be_bytes, to_be_bytes; u8, u16, u32, u64, i32);
 
 /// A price: eight bytes with four implied decimal places. The raw value
 /// 102500 is $10.2500 (1.2).
@@ -333,193 +300,103 @@ impl Field for Side {
     }
 }
 
-/// One optional field of an appendage, by its OptionTag (Appendix A).
-/// Sizes are the value's, without the TagValue length and tag.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Opt {
-    /// Tag 1, 8 bytes: the reference number on the market data feeds.
-    SecondaryOrdRefNum(u64),
-    /// Tag 2, 4 bytes: the entering firm.
-    Firm(Firm),
-    /// Tag 3, 4 bytes: minimum quantity.
-    MinQty(u32),
-    /// Tag 4, 1 byte: "R" retail designated, "N" not.
-    CustomerType(u8),
-    /// Tag 5, 4 bytes: the displayed portion.
-    MaxFloor(u32),
-    /// Tag 6, 1 byte: "L" limit, "P" market peg, "M" midpoint peg, "R"
-    /// primary peg, "Q" market maker peg, "m" midpoint.
-    PriceType(u8),
-    /// Tag 7, 4 bytes: signed peg offset, four decimal places.
-    PegOffset(i32),
-    /// Tag 9, 8 bytes: discretion price.
-    DiscretionPrice(Price),
-    /// Tag 10, 1 byte: discretion price type, as [`Opt::PriceType`].
-    DiscretionPriceType(u8),
-    /// Tag 11, 4 bytes: signed discretion peg offset.
-    DiscretionPegOffset(i32),
-    /// Tag 12, 1 byte: "P" post only, "N" no.
-    PostOnly(u8),
-    /// Tag 13, 4 bytes: shares for random reserves.
-    RandomReserves(u32),
-    /// Tag 14, 4 bytes: route.
-    Route(Alpha<4>),
-    /// Tag 15, 4 bytes: seconds to live, under 86400.
-    ExpireTime(u32),
-    /// Tag 16, 1 byte: "Y" or "N".
-    TradeNow(u8),
-    /// Tag 17, 1 byte: handling instructions.
-    HandleInst(u8),
-    /// Tag 18, 1 byte: BBO weight indicator.
-    BboWeightIndicator(u8),
-    /// Tag 22, 4 bytes: a restated displayed quantity.
-    DisplayQuantity(u32),
-    /// Tag 23, 8 bytes: a restated displayed price.
-    DisplayPrice(Price),
-    /// Tag 24, 2 bytes: customer group ID.
-    GroupId(u16),
-    /// Tag 25, 1 byte: "Y" shares located for a short sale, "N" not.
-    SharesLocated(u8),
-    /// Tag 26, 4 bytes: the broker the locate came from.
-    LocateBroker(Alpha<4>),
-    /// Tag 27, 1 byte: side.
-    Side(Side),
-    /// Tag 28, 1 byte: the order flow channel within the port.
-    UserRefIdx(u8),
-    /// Tag 29, 1 byte: self match prevention strategy.
-    AiqStrategy(u8),
-    /// Tag 30, 2 bytes: self match prevention group.
-    AiqGroupId(Alpha<2>),
-    /// A tag Appendix A does not define, kept as bytes. Writing refuses a
-    /// defined tag here.
-    Other {
-        /// The OptionTag.
-        tag: u8,
-        /// The value, up to [`MAX_OPTION_VALUE`] bytes.
-        value: Vec<u8>,
-    },
-}
-impl Opt {
-    /// The OptionTag.
-    pub fn tag(&self) -> u8 {
-        match self {
-            Opt::SecondaryOrdRefNum(_) => 1,
-            Opt::Firm(_) => 2,
-            Opt::MinQty(_) => 3,
-            Opt::CustomerType(_) => 4,
-            Opt::MaxFloor(_) => 5,
-            Opt::PriceType(_) => 6,
-            Opt::PegOffset(_) => 7,
-            Opt::DiscretionPrice(_) => 9,
-            Opt::DiscretionPriceType(_) => 10,
-            Opt::DiscretionPegOffset(_) => 11,
-            Opt::PostOnly(_) => 12,
-            Opt::RandomReserves(_) => 13,
-            Opt::Route(_) => 14,
-            Opt::ExpireTime(_) => 15,
-            Opt::TradeNow(_) => 16,
-            Opt::HandleInst(_) => 17,
-            Opt::BboWeightIndicator(_) => 18,
-            Opt::DisplayQuantity(_) => 22,
-            Opt::DisplayPrice(_) => 23,
-            Opt::GroupId(_) => 24,
-            Opt::SharesLocated(_) => 25,
-            Opt::LocateBroker(_) => 26,
-            Opt::Side(_) => 27,
-            Opt::UserRefIdx(_) => 28,
-            Opt::AiqStrategy(_) => 29,
-            Opt::AiqGroupId(_) => 30,
-            Opt::Other { tag, .. } => *tag,
-        }
-    }
-    /// Whether Appendix A defines `tag`.
-    pub fn is_defined(tag: u8) -> bool {
-        matches!(tag, 1..=7 | 9..=18 | 22..=30)
-    }
-    /// Bytes of the value.
-    pub fn value_len(&self) -> usize {
-        match self {
-            Opt::SecondaryOrdRefNum(_) | Opt::DiscretionPrice(_) | Opt::DisplayPrice(_) => 8,
-            Opt::Firm(_)
-            | Opt::MinQty(_)
-            | Opt::MaxFloor(_)
-            | Opt::PegOffset(_)
-            | Opt::DiscretionPegOffset(_)
-            | Opt::RandomReserves(_)
-            | Opt::Route(_)
-            | Opt::ExpireTime(_)
-            | Opt::DisplayQuantity(_)
-            | Opt::LocateBroker(_) => 4,
-            Opt::GroupId(_) | Opt::AiqGroupId(_) => 2,
-            Opt::Other { value, .. } => value.len(),
-            _ => 1,
-        }
-    }
-    fn read(tag: u8, v: &[u8]) -> Result<Self, Error> {
-        let f = |e: Error| match e {
-            Error::Length => Error::Option(tag),
-            other => other,
-        };
-        let one = || u8::get(v).map_err(f);
-        Ok(match tag {
-            1 => Opt::SecondaryOrdRefNum(u64::get(v).map_err(f)?),
-            2 => Opt::Firm(Alpha::get(v).map_err(f)?),
-            3 => Opt::MinQty(u32::get(v).map_err(f)?),
-            4 => Opt::CustomerType(one()?),
-            5 => Opt::MaxFloor(u32::get(v).map_err(f)?),
-            6 => Opt::PriceType(one()?),
-            7 => Opt::PegOffset(i32::get(v).map_err(f)?),
-            9 => Opt::DiscretionPrice(Price::get(v).map_err(f)?),
-            10 => Opt::DiscretionPriceType(one()?),
-            11 => Opt::DiscretionPegOffset(i32::get(v).map_err(f)?),
-            12 => Opt::PostOnly(one()?),
-            13 => Opt::RandomReserves(u32::get(v).map_err(f)?),
-            14 => Opt::Route(Alpha::get(v).map_err(f)?),
-            15 => Opt::ExpireTime(u32::get(v).map_err(f)?),
-            16 => Opt::TradeNow(one()?),
-            17 => Opt::HandleInst(one()?),
-            18 => Opt::BboWeightIndicator(one()?),
-            22 => Opt::DisplayQuantity(u32::get(v).map_err(f)?),
-            23 => Opt::DisplayPrice(Price::get(v).map_err(f)?),
-            24 => Opt::GroupId(u16::get(v).map_err(f)?),
-            25 => Opt::SharesLocated(one()?),
-            26 => Opt::LocateBroker(Alpha::get(v).map_err(f)?),
-            27 => Opt::Side(Side::get(v).map_err(f)?),
-            28 => Opt::UserRefIdx(one()?),
-            29 => Opt::AiqStrategy(one()?),
-            30 => Opt::AiqGroupId(Alpha::get(v).map_err(f)?),
-            _ => Opt::Other {
-                tag,
-                value: v.to_vec(),
+macro_rules! options {
+    ($(#[$doc:meta])* $name:ident { $($(#[$vd:meta])* $variant:ident($ty:ty) = $tag:literal,)* }) => {
+        $(#[$doc])*
+        pub enum $name {
+            $($(#[$vd])* $variant($ty),)*
+            /// A tag Appendix A does not define, kept as bytes. Writing refuses a
+            /// defined tag here.
+            Other {
+                /// The OptionTag.
+                tag: u8,
+                /// The value, up to [`MAX_OPTION_VALUE`] bytes.
+                value: Vec<u8>,
             },
-        })
-    }
-    fn put_value(&self, out: &mut Vec<u8>) {
-        match self {
-            Opt::SecondaryOrdRefNum(v) => v.put(out),
-            Opt::Firm(v) | Opt::Route(v) | Opt::LocateBroker(v) => v.put(out),
-            Opt::MinQty(v)
-            | Opt::MaxFloor(v)
-            | Opt::RandomReserves(v)
-            | Opt::ExpireTime(v)
-            | Opt::DisplayQuantity(v) => v.put(out),
-            Opt::CustomerType(v)
-            | Opt::PriceType(v)
-            | Opt::DiscretionPriceType(v)
-            | Opt::PostOnly(v)
-            | Opt::TradeNow(v)
-            | Opt::HandleInst(v)
-            | Opt::BboWeightIndicator(v)
-            | Opt::SharesLocated(v)
-            | Opt::UserRefIdx(v)
-            | Opt::AiqStrategy(v) => v.put(out),
-            Opt::PegOffset(v) | Opt::DiscretionPegOffset(v) => v.put(out),
-            Opt::DiscretionPrice(v) | Opt::DisplayPrice(v) => v.put(out),
-            Opt::GroupId(v) => v.put(out),
-            Opt::Side(v) => v.put(out),
-            Opt::AiqGroupId(v) => v.put(out),
-            Opt::Other { value, .. } => out.extend_from_slice(value),
         }
+        impl $name {
+            /// The OptionTag.
+            pub fn tag(&self) -> u8 {
+                match self { $(Self::$variant(_) => $tag,)* Self::Other { tag, .. } => *tag }
+            }
+            /// Whether Appendix A defines `tag`.
+            pub fn is_defined(tag: u8) -> bool { matches!(tag, $($tag)|*) }
+            /// Bytes of the value.
+            pub fn value_len(&self) -> usize {
+                match self { $(Self::$variant(_) => <$ty as Field>::LEN,)* Self::Other { value, .. } => value.len() }
+            }
+            fn read(tag: u8, v: &[u8]) -> Result<Self, Error> {
+                let f = |e| match e { Error::Length => Error::Option(tag), other => other };
+                Ok(match tag {
+                    $($tag => Self::$variant(<$ty as Field>::get(v).map_err(f)?),)*
+                    _ => Self::Other { tag, value: v.to_vec() },
+                })
+            }
+            fn put_value(&self, out: &mut Vec<u8>) {
+                match self { $(Self::$variant(v) => v.put(out),)* Self::Other { value, .. } => out.extend_from_slice(value) }
+            }
+        }
+    };
+}
+
+options! {
+    /// One optional field of an appendage, by its OptionTag (Appendix A).
+    /// Sizes are the value's, without the TagValue length and tag.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    Opt {
+        /// Tag 1, 8 bytes: the reference number on the market data feeds.
+        SecondaryOrdRefNum(u64) = 1,
+        /// Tag 2, 4 bytes: the entering firm.
+        Firm(Firm) = 2,
+        /// Tag 3, 4 bytes: minimum quantity.
+        MinQty(u32) = 3,
+        /// Tag 4, 1 byte: "R" retail designated, "N" not.
+        CustomerType(u8) = 4,
+        /// Tag 5, 4 bytes: the displayed portion.
+        MaxFloor(u32) = 5,
+        /// Tag 6, 1 byte: "L" limit, "P" market peg, "M" midpoint peg, "R"
+        /// primary peg, "Q" market maker peg, "m" midpoint.
+        PriceType(u8) = 6,
+        /// Tag 7, 4 bytes: signed peg offset, four decimal places.
+        PegOffset(i32) = 7,
+        /// Tag 9, 8 bytes: discretion price.
+        DiscretionPrice(Price) = 9,
+        /// Tag 10, 1 byte: discretion price type, as [`Opt::PriceType`].
+        DiscretionPriceType(u8) = 10,
+        /// Tag 11, 4 bytes: signed discretion peg offset.
+        DiscretionPegOffset(i32) = 11,
+        /// Tag 12, 1 byte: "P" post only, "N" no.
+        PostOnly(u8) = 12,
+        /// Tag 13, 4 bytes: shares for random reserves.
+        RandomReserves(u32) = 13,
+        /// Tag 14, 4 bytes: route.
+        Route(Alpha<4>) = 14,
+        /// Tag 15, 4 bytes: seconds to live, under 86400.
+        ExpireTime(u32) = 15,
+        /// Tag 16, 1 byte: "Y" or "N".
+        TradeNow(u8) = 16,
+        /// Tag 17, 1 byte: handling instructions.
+        HandleInst(u8) = 17,
+        /// Tag 18, 1 byte: BBO weight indicator.
+        BboWeightIndicator(u8) = 18,
+        /// Tag 22, 4 bytes: a restated displayed quantity.
+        DisplayQuantity(u32) = 22,
+        /// Tag 23, 8 bytes: a restated displayed price.
+        DisplayPrice(Price) = 23,
+        /// Tag 24, 2 bytes: customer group ID.
+        GroupId(u16) = 24,
+        /// Tag 25, 1 byte: "Y" shares located for a short sale, "N" not.
+        SharesLocated(u8) = 25,
+        /// Tag 26, 4 bytes: the broker the locate came from.
+        LocateBroker(Alpha<4>) = 26,
+        /// Tag 27, 1 byte: side.
+        Side(Side) = 27,
+        /// Tag 28, 1 byte: the order flow channel within the port.
+        UserRefIdx(u8) = 28,
+        /// Tag 29, 1 byte: self match prevention strategy.
+        AiqStrategy(u8) = 29,
+        /// Tag 30, 2 bytes: self match prevention group.
+        AiqGroupId(Alpha<2>) = 30,
     }
 }
 

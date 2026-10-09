@@ -352,25 +352,19 @@ pub enum Error {
     Limit(&'static str),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Short => f.write_str("message cut short"),
-            Error::Version(v) => write!(f, "version byte {v:#04x}, not IKEv2"),
-            Error::MessageLength(n) => write!(
-                f,
-                "message length {n}, outside {HEADER_LEN}..={MAX_MESSAGE}"
-            ),
-            Error::Trailing => f.write_str("bytes left after the last payload"),
-            Error::PayloadLength(k) => write!(f, "payload type {k} has a bad length"),
-            Error::Body { kind, reason } => write!(f, "payload type {kind}: {reason}"),
-            Error::Limit(what) => write!(f, "too many {what}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Short => f.write_str("message cut short"),
+    Error::Version(v) => write!(f, "version byte {v:#04x}, not IKEv2"),
+    Error::MessageLength(n) => write!(
+        f,
+        "message length {n}, outside {HEADER_LEN}..={MAX_MESSAGE}"
+    ),
+    Error::Trailing => f.write_str("bytes left after the last payload"),
+    Error::PayloadLength(k) => write!(f, "payload type {k} has a bad length"),
+    Error::Body { kind, reason } => write!(f, "payload type {kind}: {reason}"),
+    Error::Limit(what) => write!(f, "too many {what}"),
+});
 
 /// The IKE header as it is on the wire, read without checking the version
 /// or length. A gateway reads it to answer a message it cannot parse, for
@@ -1532,12 +1526,7 @@ impl Wire for NatT {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Short
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Short);
 
 #[cfg(test)]
 mod tests {

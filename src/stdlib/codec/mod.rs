@@ -1,5 +1,6 @@
 //! Bounded byte decoders, wire values, and the stream that drives them.
 //!
+//! Readers check lengths because an agent can send arbitrary bytes.
 //! Every protocol module in the stdlib is built from these pieces. A
 //! [`Decode`] is a framer. It reads a slice of unread input and returns a
 //! [`Step`]: an item and how many bytes it used, a request for more bytes,
@@ -151,7 +152,9 @@ mod buffer;
 pub mod civil;
 mod combinators;
 pub mod crc32c;
+mod declarations;
 mod demux;
+pub use fictionet::{codec_from, error_display, fixed_fields, open_enum, prefixed, text_wire};
 mod faults;
 pub mod field;
 mod frames;
@@ -299,6 +302,35 @@ pub trait Wire: Sized {
 #[inline]
 pub fn pad_to_4(len: usize) -> usize {
     (len + 3) & !3
+}
+
+/// Reads one unit at EOF, preserving item errors before checking trailing bytes.
+/// Maps framing and item errors separately. Skips advance through the input;
+/// an out-of-range skip, a request for more bytes, or an end without an item
+/// returns `incomplete`. A successful item with bytes left returns `trailing`.
+pub fn decode_exact<D, T, E, P>(
+    mut decoder: D,
+    mut bytes: &[u8],
+    item_error: impl Fn(E) -> P,
+    framing_error: impl Fn(D::Error) -> P,
+    incomplete: P,
+    trailing: P,
+) -> Result<T, P>
+where
+    D: Decode<Item = Result<T, E>>,
+{
+    loop {
+        match decoder.decode(bytes, true).map_err(&framing_error)? {
+            Step::Item(Err(e), _) => return Err(item_error(e)),
+            Step::Item(Ok(item), used) if used == bytes.len() => return Ok(item),
+            Step::Item(_, _) => return Err(trailing),
+            Step::Skip(used) => match bytes.get(used..) {
+                Some(rest) => bytes = rest,
+                None => return Err(incomplete),
+            },
+            Step::Need | Step::End => return Err(incomplete),
+        }
+    }
 }
 
 #[cfg(test)]

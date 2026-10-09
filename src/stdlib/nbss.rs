@@ -29,8 +29,7 @@
 //! The encoded name is a 32-byte label, which may be followed by the
 //! labels of a scope.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A packet that breaks the specification is an [`Error`], and the
+//! A packet that breaks the specification is an [`Error`], and the
 //! stream cannot be read past it. A stream holds at most one packet's
 //! bytes. Writers return an [`Error::Unwritable`] rather than write bytes a
 //! reader would refuse or read back as a different value.
@@ -77,11 +76,8 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::Wire;
-use fictionet::stdlib::nbns::{
-    ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level, encode_first_level,
-};
+use fictionet::stdlib::nbns::{ENCODED_LEN, MAX_LABEL, MAX_NAME_LEN, NAME_LEN, decode_first_level};
 
 /// The TCP port the session service listens on.
 pub const PORT: u16 = 139;
@@ -219,23 +215,8 @@ impl Wire for Name {
     /// scope labels, labels over 63 bytes, and names over 255 bytes.
     /// Leaves the destination unchanged on error.
     fn write(&self, destination: &mut Vec<u8>) -> Result<(), Error> {
-        let mut out = Vec::with_capacity(ENCODED_LEN + 2);
-        out.push(ENCODED_LEN as u8);
-        out.extend_from_slice(&encode_first_level(&self.bytes));
-        for label in &self.scope {
-            // The label, its length byte, and the zero byte at the end.
-            if label.is_empty()
-                || label.len() > MAX_LABEL
-                || out.len() + 1 + label.len() + 1 > MAX_NAME_LEN
-            {
-                return Err(Error::Unwritable);
-            }
-            out.push(label.len() as u8);
-            out.extend_from_slice(label);
-        }
-        out.push(0);
-        destination.extend_from_slice(&out);
-        Ok(())
+        fictionet::stdlib::nbns::write_name(destination, &self.bytes, &self.scope)
+            .map_err(|_| Error::Unwritable)
     }
 }
 
@@ -346,22 +327,16 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Name => f.write_str("invalid NBSS name"),
-            Error::Incomplete => f.write_str("incomplete NBSS packet"),
-            Error::Trailing { remaining } => write!(f, "{remaining} bytes after NBSS value"),
-            Error::Unwritable => f.write_str("NBSS value cannot be written without changing it"),
-            Error::Type(t) => write!(f, "packet type {t:#04x} is not a session packet"),
-            Error::Flags(b) => write!(f, "flags byte {b:#04x} sets reserved bits"),
-            Error::TooLong(n) => write!(f, "body length {n} is past the limit"),
-            Error::Body(t) => write!(f, "body is not well formed for packet type {t:#04x}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Name => f.write_str("invalid NBSS name"),
+    Error::Incomplete => f.write_str("incomplete NBSS packet"),
+    Error::Trailing { remaining } => write!(f, "{remaining} bytes after NBSS value"),
+    Error::Unwritable => f.write_str("NBSS value cannot be written without changing it"),
+    Error::Type(t) => write!(f, "packet type {t:#04x} is not a session packet"),
+    Error::Flags(b) => write!(f, "flags byte {b:#04x} sets reserved bits"),
+    Error::TooLong(n) => write!(f, "body length {n} is past the limit"),
+    Error::Body(t) => write!(f, "body is not well formed for packet type {t:#04x}"),
+});
 
 impl Packet {
     /// The packet's type, one of the values in [`kind`].
@@ -439,48 +414,34 @@ impl Wire for Packet {
     }
 }
 
-/// Reads session packets without retaining input.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`] for bounded buffering. The header
-/// suffices to refuse a body above [`limit`](fictionet::stdlib::codec::Frames::limit). Partial packets
-/// return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The driver reports truncation
-/// and reports errors once. All packet errors end this decoder.
-///
-/// ```
-/// use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
-/// use fictionet::stdlib::nbss::Packet;
-/// let packet = Packet::Message(b"hello".to_vec());
-/// let bytes = Wire::to_bytes(&packet)?;
-/// let mut stream = Stream::new(Frames::<Packet>::with_limit(1024));
-/// let mut packets = Vec::new();
-/// for chunk in bytes.chunks(3) {
-///     pump(&mut stream, chunk, |item| packets.push(item))?;
-/// }
-/// finish(&mut stream, |item| packets.push(item))?;
-/// assert_eq!(packets, vec![packet]);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-impl Prefixed for Packet {
-    type Item = Packet;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "NBSS";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_LENGTH
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_LENGTH)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        HEADER_LEN.saturating_add(limit)
-    }
+fictionet::prefixed! {
+    /// Reads session packets without retaining input.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`] for bounded buffering. The header
+    /// suffices to refuse a body above [`limit`](fictionet::stdlib::codec::Frames::limit). Partial packets
+    /// return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The driver reports truncation
+    /// and reports errors once. All packet errors end this decoder.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
+    /// use fictionet::stdlib::nbss::Packet;
+    /// let packet = Packet::Message(b"hello".to_vec());
+    /// let bytes = Wire::to_bytes(&packet)?;
+    /// let mut stream = Stream::new(Frames::<Packet>::with_limit(1024));
+    /// let mut packets = Vec::new();
+    /// for chunk in bytes.chunks(3) {
+    ///     pump(&mut stream, chunk, |item| packets.push(item))?;
+    /// }
+    /// finish(&mut stream, |item| packets.push(item))?;
+    /// assert_eq!(packets, vec![packet]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    Packet => (Packet, Error, usize);
+    name = "NBSS";
+    default { MAX_LENGTH }
+    normalize(limit) { limit.min(MAX_LENGTH) }
+    capacity(limit) { let limit = *limit;
+        HEADER_LEN.saturating_add(limit) }
 
     #[inline]
     fn parse_prefix(

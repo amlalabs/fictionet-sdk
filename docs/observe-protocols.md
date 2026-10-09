@@ -7,16 +7,10 @@ describes one item. `Present::fields` adds fields to a `Layer`, with ranges
 relative to the item's raw bytes. `Layer::note` adds text without a range.
 The `Present` rustdoc includes a complete decoder and registration example.
 
-Start with `Registry::default()` to keep the built-ins, or `Registry::new()`
-for an empty registry. `register` takes a name, a matcher, and a factory for
-the two direction decoders. Match `Selection::ports`, `Selection::first`,
-`Selection::transport`, and `Selection::alpn` for decrypted TLS. Return
-`Match::More` to wait for more TCP prefix bytes. A matcher still returning
-`More` at 64 bytes rejects the conversation; lower-priority matchers do not
-run. UDP treats `More` as `No`. Later registrations take precedence.
-`choose(transport, name)` selects a registration explicitly for that
-transport. `automatic(transport)` restores its matchers. Built-ins
-use these same methods.
+Use [`Registry`](../src/observe/registry.rs) to register a name, a matcher,
+and a factory for the two direction decoders. Its contract covers defaults,
+selection precedence, TCP prefix limits, UDP handling and explicit choice.
+Built-ins use the same registration methods.
 
 For a pcap reader or live capture, create `Dissector::with_registry(registry)`
 and call `decode(packet, keys)` in capture order. `packet` is a raw IPv4 or
@@ -31,21 +25,14 @@ start watching links. New watches use that registry. The existing
 without binary changes. Watches already running retain their registry and
 connection state.
 
-`Observed<D>` drives ordered bytes through the same adapter directly.
-Its `Placement` follows exact `stdlib::codec::Spans` from inner bytes to packet bytes.
-Record a removed outer header with `Spans::skip`, then record its unchanged
-payload with `Spans::push_exact`. Add hops from the innermost stream outward.
-Each hop must have `Spans::keep() <= 256`; at most 16 hops are accepted.
-Update a live hop with `Placement::hop_mut`. Record the current payload
-before the first `data` call. `Observed::reset` keeps the hops and starts at
-the innermost hop's next byte offset; reset before recording new payloads.
-A coarse span, an expired mapping, a gap, or a message crossing packets
-creates a separate byte buffer. Fields always index the bytes shown.
+`Observed<D>` drives ordered bytes directly. Its [placement contract](../src/observe/present.rs)
+covers exact spans, hop limits, live updates, resets and reassembly buffers.
+For a removed outer header, record `Spans::skip`, then record its unchanged
+payload with `Spans::push_exact`. Follow the documented order when recording
+payload spans and calling `data` or `reset`.
 
-`Conversation::with_registry` supplies the same prefix selection and flush
-logic used by TCP streams. Call `data`, `lost`, and `waiting` for ordered
-bytes, gaps, and partial-message status. `with_alpn` supplies a negotiated
-ALPN to matchers before bytes arrive. Undecided prefixes are not waiting.
+[`Conversation`](../src/observe/conversation.rs) supplies the TCP selection
+and flush driver, including ordered input, gaps, waiting status and ALPN.
 
 TLS and Modbus sessions use `Registry::register_protocol` when
 shared state requires the `Protocol` interface. The session factory receives

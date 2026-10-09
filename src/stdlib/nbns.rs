@@ -24,8 +24,7 @@
 //! Which names exist, and who owns them, is up to world code. NBNS runs
 //! over UDP, one packet per datagram, so there is no stream decoder.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Writers refuse oversized or invalid values without changing the destination.
+//! Writers refuse oversized or invalid values without changing the destination.
 //! Query and node-status reply constructors cut their owner or name lists
 //! to fit [`MAX_DATAGRAM`] and set TC when they cut a list, as RFC 1002 asks.
 //! Writers preserve the chosen records and TC flag, up to [`MAX_PACKET`].
@@ -805,28 +804,22 @@ pub enum Error {
     Unsupported(Opcode),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Trailing(n) => write!(f, "{n} bytes after the unit"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Truncated => f.write_str("packet ends early"),
-            Error::ExpansionTooLong => write!(f, "expanded packet exceeds {MAX_PACKET} bytes"),
-            Error::TooLong(n) => write!(f, "datagram of {n} bytes, over {MAX_PACKET}"),
-            Error::TooManyRecords(n) => write!(f, "section of {n} entries, over {MAX_RECORDS}"),
-            Error::BadLabel(b) => write!(f, "label length byte {b:#04x}"),
-            Error::BadPointer(p) => write!(f, "pointer to offset {p} goes forward or loops"),
-            Error::BadFirstLevel => f.write_str("first label is not a first-level encoded name"),
-            Error::NameTooLong => write!(f, "name longer than {MAX_NAME_LEN} bytes"),
-            Error::BadNsData => f.write_str("NS record data is not one name"),
-            Error::NotRequest => f.write_str("packet is a response"),
-            Error::BadRequest => f.write_str("request lacks its question or NB record"),
-            Error::Unsupported(o) => write!(f, "opcode {} is not supported", o.bits()),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Trailing(n) => write!(f, "{n} bytes after the unit"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Truncated => f.write_str("packet ends early"),
+    Error::ExpansionTooLong => write!(f, "expanded packet exceeds {MAX_PACKET} bytes"),
+    Error::TooLong(n) => write!(f, "datagram of {n} bytes, over {MAX_PACKET}"),
+    Error::TooManyRecords(n) => write!(f, "section of {n} entries, over {MAX_RECORDS}"),
+    Error::BadLabel(b) => write!(f, "label length byte {b:#04x}"),
+    Error::BadPointer(p) => write!(f, "pointer to offset {p} goes forward or loops"),
+    Error::BadFirstLevel => f.write_str("first label is not a first-level encoded name"),
+    Error::NameTooLong => write!(f, "name longer than {MAX_NAME_LEN} bytes"),
+    Error::BadNsData => f.write_str("NS record data is not one name"),
+    Error::NotRequest => f.write_str("packet is a response"),
+    Error::BadRequest => f.write_str("request lacks its question or NB record"),
+    Error::Unsupported(o) => write!(f, "opcode {} is not supported", o.bits()),
+});
 
 /// One NBNS packet.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1264,6 +1257,22 @@ fn read_labels(msg: &[u8], start: usize) -> Result<(Vec<Vec<u8>>, usize), Error>
     Ok((labels, after.unwrap_or(pos + 1)))
 }
 
+/// Appends an uncompressed NetBIOS name and scope.
+/// Refuses empty or oversized labels and names above [`MAX_NAME_LEN`].
+/// Errors leave the destination unchanged.
+pub fn write_name(
+    dst: &mut Vec<u8>,
+    bytes: &[u8; NAME_LEN],
+    scope: &[Vec<u8>],
+) -> Result<(), Error> {
+    let mut out = Vec::with_capacity(ENCODED_LEN + 2);
+    out.push(ENCODED_LEN as u8);
+    out.extend_from_slice(&encode_first_level(bytes));
+    put_labels(&mut out, scope.iter().map(Vec::as_slice))?;
+    dst.extend_from_slice(&out);
+    Ok(())
+}
+
 impl Wire for Name {
     type ParseError = Error;
     type WriteError = Error;
@@ -1280,12 +1289,7 @@ impl Wire for Name {
     /// Appends the uncompressed name. Refuses empty or oversized scope labels and
     /// names above [`MAX_NAME_LEN`]. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        let mut out = Vec::with_capacity(ENCODED_LEN + 2);
-        out.push(ENCODED_LEN as u8);
-        out.extend_from_slice(&encode_first_level(&self.bytes));
-        put_labels(&mut out, self.scope.iter().map(Vec::as_slice))?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        write_name(dst, &self.bytes, &self.scope)
     }
 }
 

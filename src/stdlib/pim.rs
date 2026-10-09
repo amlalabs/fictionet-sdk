@@ -161,7 +161,7 @@ pub mod family {
     pub const IPV6: u8 = 2;
 }
 
-use fictionet::stdlib::ip::Endpoints;
+use fictionet::stdlib::ip::{self, Endpoints};
 
 /// An Encoded-Group address: a multicast group or range of groups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -518,54 +518,48 @@ fn max_message(endpoints: &Endpoints) -> usize {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Truncated => write!(f, "the message is cut short"),
-            Error::Trailing { remaining } => {
-                write!(f, "{remaining} bytes after the PIM message")
-            }
-            Error::TooLong => write!(f, "the message is longer than its IP packet can carry"),
-            Error::Version(v) => write!(f, "version {v}, not 2"),
-            Error::Checksum => write!(f, "the checksum is wrong"),
-            Error::Family(a) => write!(f, "address family {a}, not 1 (IPv4) or 2 (IPv6)"),
-            Error::Encoding(e) => write!(f, "address encoding type {e}, not 0"),
-            Error::FamilyMismatch(a) => {
-                write!(f, "address family {a}, not the family of the packet")
-            }
-            Error::MaskLen(m) => write!(f, "mask length {m} does not fit the address"),
-            Error::SourceFlags => write!(f, "a source with the W bit but not the R bit"),
-            Error::JoinPruneGroup => {
-                write!(f, "a Join/Prune group that is not one multicast group")
-            }
-            Error::SourceList => {
-                write!(
-                    f,
-                    "a Join/Prune group with two (*,G) entries or a source joined and pruned"
-                )
-            }
-            Error::Inner => write!(
-                f,
-                "a Register packet without an IP header of the packet's family"
-            ),
-            Error::Zone => write!(
-                f,
-                "an admin scope zone bit or scoped range that breaks RFC 5059"
-            ),
-            Error::OptionLength { kind, len } => {
-                write!(f, "Hello option {kind} with a {len}-byte value")
-            }
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Count => write!(
-                f,
-                "a list is longer than its count allows, or empty where it must not be"
-            ),
-            Error::Value => write!(f, "a field is above its largest value"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Truncated => write!(f, "the message is cut short"),
+    Error::Trailing { remaining } => {
+        write!(f, "{remaining} bytes after the PIM message")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::TooLong => write!(f, "the message is longer than its IP packet can carry"),
+    Error::Version(v) => write!(f, "version {v}, not 2"),
+    Error::Checksum => write!(f, "the checksum is wrong"),
+    Error::Family(a) => write!(f, "address family {a}, not 1 (IPv4) or 2 (IPv6)"),
+    Error::Encoding(e) => write!(f, "address encoding type {e}, not 0"),
+    Error::FamilyMismatch(a) => {
+        write!(f, "address family {a}, not the family of the packet")
+    }
+    Error::MaskLen(m) => write!(f, "mask length {m} does not fit the address"),
+    Error::SourceFlags => write!(f, "a source with the W bit but not the R bit"),
+    Error::JoinPruneGroup => {
+        write!(f, "a Join/Prune group that is not one multicast group")
+    }
+    Error::SourceList => {
+        write!(
+            f,
+            "a Join/Prune group with two (*,G) entries or a source joined and pruned"
+        )
+    }
+    Error::Inner => write!(
+        f,
+        "a Register packet without an IP header of the packet's family"
+    ),
+    Error::Zone => write!(
+        f,
+        "an admin scope zone bit or scoped range that breaks RFC 5059"
+    ),
+    Error::OptionLength { kind, len } => {
+        write!(f, "Hello option {kind} with a {len}-byte value")
+    }
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Count => write!(
+        f,
+        "a list is longer than its count allows, or empty where it must not be"
+    ),
+    Error::Value => write!(f, "a field is above its largest value"),
+});
 
 fn full_mask(a: IpAddr) -> u8 {
     match a {
@@ -574,32 +568,12 @@ fn full_mask(a: IpAddr) -> u8 {
     }
 }
 
-/// Adds `b` to a ones' complement sum, as 16-bit words with a zero byte
-/// added to an odd length.
-fn sum_words(mut sum: u64, b: &[u8]) -> u64 {
-    let (words, rest) = b.as_chunks::<2>();
-    for w in words {
-        sum += u64::from(u16::from_be_bytes([w[0], w[1]]));
-    }
-    if let [last] = rest {
-        sum += u64::from(*last) << 8;
-    }
-    sum
-}
-
-fn fold(mut sum: u64) -> u16 {
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    sum as u16
-}
-
 /// The checksum of `covered`, with bytes 2 and 3 taken as zero, plus the
 /// IPv6 pseudo-header for a length of `len`. `covered` is at least
 /// [`HEADER_LEN`] and at most [`MAX_MESSAGE`] bytes, and so is `len`.
 fn checksum_over(covered: &[u8], len: usize, endpoints: &Endpoints) -> u16 {
-    let mut sum = sum_words(0, &covered[..2]);
-    sum = sum_words(sum, &covered[HEADER_LEN..]);
+    let mut sum = ip::sum(0, &covered[..2]);
+    sum = ip::sum(sum, &covered[HEADER_LEN..]);
     if let Endpoints::V6 {
         source,
         destination,
@@ -607,12 +581,12 @@ fn checksum_over(covered: &[u8], len: usize, endpoints: &Endpoints) -> u16 {
     {
         // At most MAX_MESSAGE, so it fits in 32 bits.
         let len = len as u32;
-        sum = sum_words(sum, &source.octets());
-        sum = sum_words(sum, &destination.octets());
-        sum = sum_words(sum, &len.to_be_bytes());
-        sum = sum_words(sum, &[0, 0, 0, PROTOCOL]);
+        sum = ip::sum(sum, &source.octets());
+        sum = ip::sum(sum, &destination.octets());
+        sum = ip::sum(sum, &len.to_be_bytes());
+        sum = ip::sum(sum, &[0, 0, 0, PROTOCOL]);
     }
-    !fold(sum)
+    ip::fold(sum)
 }
 
 /// The checksum the message in `b` should carry, worked out with its
@@ -1496,55 +1470,22 @@ fn put_source(out: &mut Vec<u8>, s: &Source) {
     put_address(out, s.address);
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
-impl From<Trailing> for Error {
-    #[inline]
-    fn from(error: Trailing) -> Self {
-        Error::Trailing { remaining: error.0 }
-    }
-}
+fictionet::codec_from!(Error, Trailing, |error| Error::Trailing {
+    remaining: error.0
+});
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg};
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::mutate;
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Message, Error> {
-        use fictionet::stdlib::codec::Decode;
-        let make = || Collect::bytes(MAX_MESSAGE).map(|d| Message::parse(&d, e));
-        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
-        assert_eq!(
-            fictionet::stdlib::test_support::decode_all(|| Collect::bytes(MAX_MESSAGE), b),
-            if b.len() <= MAX_MESSAGE {
-                (vec![b.to_vec()], None)
-            } else {
-                (
-                    vec![],
-                    Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE })),
-                )
-            }
-        );
-        let parsed = Message::parse(b, e);
-        let (items, failure) = decode_all(make, b);
-        if b.len() <= MAX_MESSAGE {
-            assert_eq!(failure, None);
-            assert_eq!(items, vec![parsed.clone()]);
-        } else {
-            assert_eq!(
-                failure,
-                Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE }))
-            );
-        }
-        parsed
+        contract::check_collect_with(b, MAX_MESSAGE, |b| Message::parse(b, e))
     }
 
     fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {

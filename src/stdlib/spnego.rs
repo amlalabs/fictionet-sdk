@@ -123,26 +123,20 @@ pub enum Error {
     HintAddress,
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Asn1(e) => write!(f, "ASN.1: {e}"),
-            Error::TooLong => write!(f, "token longer than {MAX_TOKEN} bytes"),
-            Error::TooManyMechs => write!(f, "more than {MAX_MECHS} mechanisms"),
-            Error::NotToken => f.write_str("not a GSS-API or SPNEGO token"),
-            Error::Indefinite => f.write_str("indefinite length on a token"),
-            Error::WrongMech => f.write_str("GSS-API wrapper for a mechanism other than SPNEGO"),
-            Error::Field => f.write_str("field out of order, repeated or not context-specific"),
-            Error::WrappedResp => f.write_str("negTokenResp inside a GSS-API wrapper"),
-            Error::MissingMechTypes => f.write_str("NegTokenInit without mechTypes"),
-            Error::NegState(v) => write!(f, "negState {v}, outside 0..=3"),
-            Error::HintAddress => f.write_str("hintAddress, which a sender must leave out"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Asn1(e) => write!(f, "ASN.1: {e}"),
+    Error::TooLong => write!(f, "token longer than {MAX_TOKEN} bytes"),
+    Error::TooManyMechs => write!(f, "more than {MAX_MECHS} mechanisms"),
+    Error::NotToken => f.write_str("not a GSS-API or SPNEGO token"),
+    Error::Indefinite => f.write_str("indefinite length on a token"),
+    Error::WrongMech => f.write_str("GSS-API wrapper for a mechanism other than SPNEGO"),
+    Error::Field => f.write_str("field out of order, repeated or not context-specific"),
+    Error::WrappedResp => f.write_str("negTokenResp inside a GSS-API wrapper"),
+    Error::MissingMechTypes => f.write_str("NegTokenInit without mechTypes"),
+    Error::NegState(v) => write!(f, "negState {v}, outside 0..=3"),
+    Error::HintAddress => f.write_str("hintAddress, which a sender must leave out"),
+});
 
 impl From<asn1::Error> for Error {
     fn from(e: asn1::Error) -> Error {
@@ -276,7 +270,7 @@ impl Mech {
         let c = self.contents();
         let mut out = Vec::with_capacity(c.len() + 3);
         out.push(0x06);
-        push_length(&mut out, c.len());
+        asn1::encode_length(c.len(), &mut out);
         out.extend_from_slice(c);
         out
     }
@@ -294,18 +288,6 @@ impl fmt::Display for Mech {
                     .map_or("", |(_, _, s)| *s),
             ),
         }
-    }
-}
-
-/// Appends a definite length in its shortest form.
-fn push_length(out: &mut Vec<u8>, n: usize) {
-    if n < 0x80 {
-        out.push(n as u8);
-    } else {
-        let bytes = (n as u64).to_be_bytes();
-        let skip = bytes.iter().take_while(|&&b| b == 0).count();
-        out.push(0x80 | (8 - skip) as u8);
-        out.extend_from_slice(&bytes[skip..]);
     }
 }
 
@@ -374,7 +356,7 @@ impl InitialContextToken {
         }
         let mut out = Vec::with_capacity(body + 4);
         out.push(GSS_TAG);
-        push_length(&mut out, body);
+        asn1::encode_length(body, &mut out);
         out.extend_from_slice(&oid);
         out.extend_from_slice(&self.inner);
         if out.len() > MAX_TOKEN {
@@ -858,6 +840,9 @@ impl Wire for InitialContextToken {
         out.extend_from_slice(&bytes);
         Ok(())
     }
+    fn to_bytes(&self) -> Result<Vec<u8>, Self::WriteError> {
+        self.encode()
+    }
 }
 
 impl Wire for NegotiationToken {
@@ -888,6 +873,9 @@ impl Wire for NegotiationToken {
         out.extend_from_slice(&bytes);
         Ok(())
     }
+    fn to_bytes(&self) -> Result<Vec<u8>, Self::WriteError> {
+        self.encode()
+    }
 }
 
 /// One bounded message's bytes, with only its framing checked.
@@ -905,28 +893,24 @@ impl Wire for Frame {
         }
     }
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        Self::parse(&self.0)?;
+        match token_len_limited(&self.0, MAX_TOKEN)? {
+            Some(n) if n == self.0.len() => {}
+            Some(_) => return Err(asn1::Error::Trailing.into()),
+            None => return Err(asn1::Error::Truncated.into()),
+        }
         out.extend_from_slice(&self.0);
         Ok(())
     }
 }
 
-/// Frames one SPNEGO message and yields its uninterpreted bytes.
-/// Partial input needs more bytes, including at EOF. The stream reports truncation.
-impl Prefixed for Frame {
-    type Item = Vec<u8>;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "SPNEGO";
-    fn default_limit() -> Self::Limit {
-        MAX_TOKEN
-    }
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_TOKEN)
-    }
-    fn capacity(limit: &Self::Limit) -> usize {
-        (*limit).max(asn1::HEADER_ROOM)
-    }
+fictionet::prefixed! {
+    /// Frames one SPNEGO message and yields its uninterpreted bytes.
+    /// Partial input needs more bytes, including at EOF. The stream reports truncation.
+    Frame => (Vec<u8>, Error, usize);
+    name = "SPNEGO";
+    default { MAX_TOKEN }
+    normalize(limit) { limit.min(MAX_TOKEN) }
+    capacity(limit) { (*limit).max(asn1::HEADER_ROOM) }
     fn parse_prefix(
         input: &[u8],
         limit: &Self::Limit,

@@ -31,8 +31,7 @@
 //! AGGREGATOR take four bytes instead of two. A [`Context`] says which,
 //! and [`Context::negotiated`] works it out from the two OPEN messages.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A message that breaks the specification gives an [`Error`]
+//! A message that breaks the specification gives an [`Error`]
 //! whose [`Error::notification`] is the NOTIFICATION RFC 4271 sends before
 //! it closes the connection. RFC 7606 closes the connection for fewer
 //! UPDATE errors: most of them withdraw the UPDATE's routes or drop one
@@ -96,7 +95,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 extern crate alloc;
 
 use alloc::{vec, vec::Vec};
@@ -484,54 +482,48 @@ impl Error {
     }
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::ConnectionNotSynchronized => f.write_str("marker is not all ones"),
-            Error::BadMessageLength(n) => write!(f, "bad message length {n}"),
-            Error::BadMessageType(t) => write!(f, "bad message type {t}"),
-            Error::MalformedOpen => f.write_str("malformed OPEN optional parameters"),
-            Error::UnsupportedVersion(v) => write!(f, "unsupported BGP version {v}"),
-            Error::BadPeerAs => f.write_str("peer AS is 0"),
-            Error::BadBgpIdentifier => f.write_str("BGP identifier is 0"),
-            Error::UnacceptableHoldTime => f.write_str("hold time of 1 or 2 seconds"),
-            Error::MalformedAttributeList => f.write_str("malformed attribute list"),
-            Error::UnrecognizedWellKnownAttribute(a) => {
-                write!(
-                    f,
-                    "unrecognized well-known attribute {}",
-                    a.get(1).copied().unwrap_or(0)
-                )
-            }
-            Error::MissingWellKnownAttribute(t) => write!(f, "missing well-known attribute {t}"),
-            Error::AttributeFlags(a) => write!(
-                f,
-                "bad flags on attribute {}",
-                a.get(1).copied().unwrap_or(0)
-            ),
-            Error::AttributeLength(a) => write!(
-                f,
-                "bad length of attribute {}",
-                a.get(1).copied().unwrap_or(0)
-            ),
-            Error::InvalidOrigin(_) => f.write_str("invalid ORIGIN"),
-            Error::InvalidNextHop(_) => f.write_str("NEXT_HOP is not a host address"),
-            Error::OptionalAttribute(a) => write!(
-                f,
-                "cannot read attribute {}",
-                a.get(1).copied().unwrap_or(0)
-            ),
-            Error::InvalidNetworkField => f.write_str("invalid prefix"),
-            Error::MalformedAsPath => f.write_str("malformed AS_PATH"),
-            Error::RouteRefreshLength(_) => f.write_str("ROUTE-REFRESH of the wrong length"),
-            Error::Truncated => f.write_str("input ended before a complete BGP frame"),
-            Error::Trailing => f.write_str("bytes follow the BGP frame"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::ConnectionNotSynchronized => f.write_str("marker is not all ones"),
+    Error::BadMessageLength(n) => write!(f, "bad message length {n}"),
+    Error::BadMessageType(t) => write!(f, "bad message type {t}"),
+    Error::MalformedOpen => f.write_str("malformed OPEN optional parameters"),
+    Error::UnsupportedVersion(v) => write!(f, "unsupported BGP version {v}"),
+    Error::BadPeerAs => f.write_str("peer AS is 0"),
+    Error::BadBgpIdentifier => f.write_str("BGP identifier is 0"),
+    Error::UnacceptableHoldTime => f.write_str("hold time of 1 or 2 seconds"),
+    Error::MalformedAttributeList => f.write_str("malformed attribute list"),
+    Error::UnrecognizedWellKnownAttribute(a) => {
+        write!(
+            f,
+            "unrecognized well-known attribute {}",
+            a.get(1).copied().unwrap_or(0)
+        )
     }
-}
-
-impl core::error::Error for Error {}
+    Error::MissingWellKnownAttribute(t) => write!(f, "missing well-known attribute {t}"),
+    Error::AttributeFlags(a) => write!(
+        f,
+        "bad flags on attribute {}",
+        a.get(1).copied().unwrap_or(0)
+    ),
+    Error::AttributeLength(a) => write!(
+        f,
+        "bad length of attribute {}",
+        a.get(1).copied().unwrap_or(0)
+    ),
+    Error::InvalidOrigin(_) => f.write_str("invalid ORIGIN"),
+    Error::InvalidNextHop(_) => f.write_str("NEXT_HOP is not a host address"),
+    Error::OptionalAttribute(a) => write!(
+        f,
+        "cannot read attribute {}",
+        a.get(1).copied().unwrap_or(0)
+    ),
+    Error::InvalidNetworkField => f.write_str("invalid prefix"),
+    Error::MalformedAsPath => f.write_str("malformed AS_PATH"),
+    Error::RouteRefreshLength(_) => f.write_str("ROUTE-REFRESH of the wrong length"),
+    Error::Truncated => f.write_str("input ended before a complete BGP frame"),
+    Error::Trailing => f.write_str("bytes follow the BGP frame"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+});
 
 /// One BGP message as the header splits it: its type and the bytes after
 /// the header. The marker is always all ones and the length is worked out
@@ -606,40 +598,33 @@ impl Wire for Frame {
     }
 }
 
-/// Reads BGP frames without holding input bytes.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`MAX_MESSAGE_LEN`].
-/// Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
-/// truncation at EOF and framing errors once. Map frames through
-/// [`Message::decode`] with the session's [`Context`] to read their bodies.
-///
-/// ```
-/// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
-/// use fictionet::stdlib::bgp::{Context, Message};
-///
-/// let context = Context::default();
-/// let bytes = Message::Keepalive.to_frame(&context).and_then(|frame| frame.to_bytes())?;
-/// let mut stream = Stream::new(Frames::<fictionet::stdlib::bgp::Frame>::new().map(|frame| Message::decode(&frame, &context)));
-/// let mut messages = Vec::new();
-/// pump(&mut stream, &bytes, |message| messages.push(message))?;
-/// finish(&mut stream, |message| messages.push(message))?;
-/// assert_eq!(messages, [Ok(Message::Keepalive)]);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-impl Prefixed for Frame {
-    type Item = Frame;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "BGP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_MESSAGE_LEN
-    }
+fictionet::prefixed! {
+    /// Reads BGP frames without holding input bytes.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`MAX_MESSAGE_LEN`].
+    /// Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
+    /// truncation at EOF and framing errors once. Map frames through
+    /// [`Message::decode`] with the session's [`Context`] to read their bodies.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::Frames;
+    /// use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
+    /// use fictionet::stdlib::bgp::{Context, Message};
+    ///
+    /// let context = Context::default();
+    /// let bytes = Message::Keepalive.to_frame(&context).and_then(|frame| frame.to_bytes())?;
+    /// let mut stream = Stream::new(Frames::<fictionet::stdlib::bgp::Frame>::new().map(|frame| Message::decode(&frame, &context)));
+    /// let mut messages = Vec::new();
+    /// pump(&mut stream, &bytes, |message| messages.push(message))?;
+    /// finish(&mut stream, |message| messages.push(message))?;
+    /// assert_eq!(messages, [Ok(Message::Keepalive)]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    Frame => (Frame, Error, ());
+    name = "BGP";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_MESSAGE_LEN }
 
     #[inline]
     fn parse_prefix(

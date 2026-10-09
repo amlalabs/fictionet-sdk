@@ -1293,22 +1293,14 @@ impl Wire for Frame {
     }
 }
 
-/// Frames one Kerberos TCP message and yields its uninterpreted bytes.
-/// Partial input needs more bytes, including at EOF. The stream reports truncation.
-impl Prefixed for Frame {
-    type Item = Vec<u8>;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "Kerberos TCP";
-    fn default_limit() -> Self::Limit {
-        MAX_MESSAGE
-    }
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_MESSAGE)
-    }
-    fn capacity(limit: &Self::Limit) -> usize {
-        TCP_HEADER_LEN.saturating_add(*limit)
-    }
+fictionet::prefixed! {
+    /// Frames one Kerberos TCP message and yields its uninterpreted bytes.
+    /// Partial input needs more bytes, including at EOF. The stream reports truncation.
+    Frame => (Vec<u8>, Error, usize);
+    name = "Kerberos TCP";
+    default { MAX_MESSAGE }
+    normalize(limit) { limit.min(MAX_MESSAGE) }
+    capacity(limit) { TCP_HEADER_LEN.saturating_add(*limit) }
     fn parse_prefix(
         input: &[u8],
         limit: &Self::Limit,

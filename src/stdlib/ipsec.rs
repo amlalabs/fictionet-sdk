@@ -35,8 +35,7 @@
 //! `Collect<AhPacket>`, or `Collect<Datagram>`. Set the limit to [`MAX_PACKET`]
 //! for IP payloads or [`MAX_DATAGRAM`] for UDP. Call `end` at that boundary.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. An SPI of zero is refused, since RFC 4303 and RFC 4302 forbid
+//! An SPI of zero is refused, since RFC 4303 and RFC 4302 forbid
 //! it on the wire. So is an AH payload length too short for the fixed
 //! fields, and a pad length longer than the plaintext. The AH reserved
 //! field is kept as read, since RFC 4302 has it count in the ICV, and is
@@ -175,28 +174,22 @@ pub enum Error {
     BlockSize(usize),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Trailing { remaining } => {
-                write!(f, "{remaining} bytes after the AH header")
-            }
-            Error::Truncated => f.write_str("bytes end inside the IPsec packet"),
-            Error::TooLong => write!(f, "IPsec packet longer than {MAX_PACKET} bytes"),
-            Error::ZeroSpi => f.write_str("SPI of zero"),
-            Error::AhLength(n) => write!(f, "AH payload length {n}, below 1"),
-            Error::IcvLength(n) => write!(
-                f,
-                "AH ICV of {n} bytes, not a multiple of 4 up to {MAX_ICV}"
-            ),
-            Error::PadLength(n) => write!(f, "ESP pad length {n}, longer than the plaintext"),
-            Error::Padding(n) => write!(f, "{n} ESP padding bytes, above {MAX_PADDING}"),
-            Error::BlockSize(n) => write!(f, "block size {n}, outside 1..={MAX_BLOCK_SIZE}"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Trailing { remaining } => {
+        write!(f, "{remaining} bytes after the AH header")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Truncated => f.write_str("bytes end inside the IPsec packet"),
+    Error::TooLong => write!(f, "IPsec packet longer than {MAX_PACKET} bytes"),
+    Error::ZeroSpi => f.write_str("SPI of zero"),
+    Error::AhLength(n) => write!(f, "AH payload length {n}, below 1"),
+    Error::IcvLength(n) => write!(
+        f,
+        "AH ICV of {n} bytes, not a multiple of 4 up to {MAX_ICV}"
+    ),
+    Error::PadLength(n) => write!(f, "ESP pad length {n}, longer than the plaintext"),
+    Error::Padding(n) => write!(f, "{n} ESP padding bytes, above {MAX_PADDING}"),
+    Error::BlockSize(n) => write!(f, "block size {n}, outside 1..={MAX_BLOCK_SIZE}"),
+});
 
 /// One ESP packet: the header's fields and the bytes after them. The
 /// payload holds whatever the algorithm puts there: an IV if it uses one,
@@ -697,35 +690,15 @@ impl Wire for AhHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg};
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::mutate;
 
     fn check<M>(limit: usize, b: &[u8]) -> Result<M, Error>
     where
         M: Wire<ParseError = Error, WriteError = Error> + Clone + std::fmt::Debug + PartialEq,
     {
-        let make = || Collect::<M>::new(limit);
-        contract::check_decode_with_alloc_limit(make, b, 2 * (limit + 1));
-        contract::check_wire::<M>(b);
-        let parsed = M::parse(b);
-        let (items, failure) = decode_all(make, b);
-        if b.len() <= limit {
-            assert_eq!(
-                failure,
-                parsed
-                    .clone()
-                    .err()
-                    .map(|e| Fail::Protocol(CollectError::Parse(e)))
-            );
-            assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
-        } else {
-            assert!(items.is_empty());
-            assert_eq!(
-                failure,
-                Some(Fail::Protocol(CollectError::TooLong { limit }))
-            );
-        }
+        let parsed = contract::check_collect::<M>(b, limit);
         if let Ok(p) = &parsed {
             assert_eq!(p.to_bytes().unwrap(), b);
         }

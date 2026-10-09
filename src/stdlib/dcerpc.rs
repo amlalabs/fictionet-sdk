@@ -26,8 +26,7 @@
 //! exist, and what each operation does, is up to world code. Stub data,
 //! the NDR-encoded arguments and results, stays as bytes.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A header that cannot be read breaks the stream, since the next
+//! A header that cannot be read breaks the stream, since the next
 //! PDU cannot be found. A body that cannot be read is an [`Error`] for
 //! that PDU alone, and the stream goes on. A bad header is the same
 //! [`Error`] that [`Pdu::frame_length`] and [`Pdu`]'s `parse` report, so the
@@ -98,7 +97,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::ascii::hex_value as hex;
 use fictionet::stdlib::codec::{Reader, Truncated, Wire, be16, be32, le16, le32};
 
@@ -811,45 +809,39 @@ pub enum Error {
     },
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::TooLong { length, limit } => {
-                write!(f, "DCE/RPC fragment of {length} bytes exceeds {limit}")
-            }
-            Error::Incomplete => f.write_str("incomplete DCE/RPC fragment"),
-            Error::Trailing { remaining } => write!(f, "{remaining} bytes after DCE/RPC fragment"),
-            Error::Unwritable => f.write_str("DCE/RPC value cannot be written without changing it"),
-            Error::Version { major, minor } => {
-                write!(f, "DCE/RPC version {major}.{minor}, not 5.0 or 5.1")
-            }
-            Error::IntegerRep(r) => write!(f, "integer representation {r}, not 0 or 1"),
-            Error::FragLength(n) => write!(f, "fragment length {n}, shorter than the header"),
-            Error::Type(t) => write!(f, "packet type {t} is not a connection-oriented PDU"),
-            Error::AuthLength(n) => write!(
-                f,
-                "auth length {n} does not fit in the fragment or the packet type"
-            ),
-            Error::AuthPad(n) => write!(
-                f,
-                "auth padding of {n} bytes runs into the header or misaligns the trailer"
-            ),
-            Error::Truncated => f.write_str("the PDU body is shorter than its fields"),
-            Error::Address => f.write_str("the secondary address does not end with a zero byte"),
-            Error::Interleaved { call_id } => {
-                write!(f, "call {call_id} started inside another call")
-            }
-            Error::UnexpectedFragment { call_id } => {
-                write!(f, "a fragment of call {call_id} came out of order")
-            }
-            Error::StubTooLong { call_id } => {
-                write!(f, "call {call_id} has more stub data than allowed")
-            }
-        }
+fictionet::error_display!(Error, f, {
+    Error::TooLong { length, limit } => {
+        write!(f, "DCE/RPC fragment of {length} bytes exceeds {limit}")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Incomplete => f.write_str("incomplete DCE/RPC fragment"),
+    Error::Trailing { remaining } => write!(f, "{remaining} bytes after DCE/RPC fragment"),
+    Error::Unwritable => f.write_str("DCE/RPC value cannot be written without changing it"),
+    Error::Version { major, minor } => {
+        write!(f, "DCE/RPC version {major}.{minor}, not 5.0 or 5.1")
+    }
+    Error::IntegerRep(r) => write!(f, "integer representation {r}, not 0 or 1"),
+    Error::FragLength(n) => write!(f, "fragment length {n}, shorter than the header"),
+    Error::Type(t) => write!(f, "packet type {t} is not a connection-oriented PDU"),
+    Error::AuthLength(n) => write!(
+        f,
+        "auth length {n} does not fit in the fragment or the packet type"
+    ),
+    Error::AuthPad(n) => write!(
+        f,
+        "auth padding of {n} bytes runs into the header or misaligns the trailer"
+    ),
+    Error::Truncated => f.write_str("the PDU body is shorter than its fields"),
+    Error::Address => f.write_str("the secondary address does not end with a zero byte"),
+    Error::Interleaved { call_id } => {
+        write!(f, "call {call_id} started inside another call")
+    }
+    Error::UnexpectedFragment { call_id } => {
+        write!(f, "a fragment of call {call_id} came out of order")
+    }
+    Error::StubTooLong { call_id } => {
+        write!(f, "call {call_id} has more stub data than allowed")
+    }
+});
 
 impl Pdu {
     /// A whole PDU (first and last fragment) with little-endian integers,
@@ -1179,48 +1171,34 @@ impl Wire for Pdu {
     }
 }
 
-/// Reads DCE/RPC fragments without retaining input.
-///
-/// Items are `Result<Pdu, Error>`: body errors are recoverable items.
-/// Only a framing error ends the stream, for invalid headers or fragments above
-/// [`limit`](fictionet::stdlib::codec::Frames::limit). Lengths are checked as soon as their first ten
-/// header bytes arrive, before any body is needed.
-/// Partial fragments return [`fictionet::stdlib::codec::Step::Need`], including at EOF, so
-/// [`fictionet::stdlib::codec::Stream`] reports truncation. [`fictionet::stdlib::codec::Stream::with_next`] gives
-/// the original fragment bytes for authentication, including discarded padding.
-/// Proxies should forward those bytes: a received PDU can fit the limit while
-/// canonical padding or reserved fields would make [`Wire::write`] refuse it.
-///
-/// ```
-/// use fictionet::stdlib::codec::{Frames, Stream, Wire};
-/// use fictionet::stdlib::dcerpc::{Body, Pdu};
-/// let pdu = Pdu::new(7, Body::Shutdown);
-/// let bytes = Wire::to_bytes(&pdu)?;
-/// let mut stream = Stream::new(Frames::<Pdu>::new());
-/// assert_eq!(stream.push(&bytes), bytes.len());
-/// assert_eq!(stream.next(), Some(Ok(Ok(pdu))));
-/// # Ok::<(), fictionet::stdlib::dcerpc::Error>(())
-/// ```
-impl Prefixed for Pdu {
-    type Item = Result<Pdu, Error>;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "DCE/RPC";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_FRAG
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.clamp(HEADER_LEN, MAX_FRAG)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        *limit
-    }
+fictionet::prefixed! {
+    /// Reads DCE/RPC fragments without retaining input.
+    ///
+    /// Items are `Result<Pdu, Error>`: body errors are recoverable items.
+    /// Only a framing error ends the stream, for invalid headers or fragments above
+    /// [`limit`](fictionet::stdlib::codec::Frames::limit). Lengths are checked as soon as their first ten
+    /// header bytes arrive, before any body is needed.
+    /// Partial fragments return [`fictionet::stdlib::codec::Step::Need`], including at EOF, so
+    /// [`fictionet::stdlib::codec::Stream`] reports truncation. [`fictionet::stdlib::codec::Stream::with_next`] gives
+    /// the original fragment bytes for authentication, including discarded padding.
+    /// Proxies should forward those bytes: a received PDU can fit the limit while
+    /// canonical padding or reserved fields would make [`Wire::write`] refuse it.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::{Frames, Stream, Wire};
+    /// use fictionet::stdlib::dcerpc::{Body, Pdu};
+    /// let pdu = Pdu::new(7, Body::Shutdown);
+    /// let bytes = Wire::to_bytes(&pdu)?;
+    /// let mut stream = Stream::new(Frames::<Pdu>::new());
+    /// assert_eq!(stream.push(&bytes), bytes.len());
+    /// assert_eq!(stream.next(), Some(Ok(Ok(pdu))));
+    /// # Ok::<(), fictionet::stdlib::dcerpc::Error>(())
+    /// ```
+    Pdu => (Result<Pdu, Error>, Error, usize);
+    name = "DCE/RPC";
+    default { MAX_FRAG }
+    normalize(limit) { limit.clamp(HEADER_LEN, MAX_FRAG) }
+    capacity(limit) { *limit }
 
     #[inline]
     fn parse_prefix(
@@ -1707,12 +1685,7 @@ impl Reassembler {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]

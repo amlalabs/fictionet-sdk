@@ -23,8 +23,7 @@
 //! a [`Response`] back to the channel. Which files exist, what they hold
 //! and who may touch them is up to world code.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Each field has a limit (see [`MAX_PATH`], [`MAX_DATA`] and the
+//! Each field has a limit (see [`MAX_PATH`], [`MAX_DATA`] and the
 //! others), and readers and writers refuse fields over their limits.
 //! Writers leave the destination unchanged when a value cannot be written.
 //!
@@ -77,7 +76,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire};
 
 /// The SSH subsystem name a client asks for to start SFTP.
@@ -278,34 +276,20 @@ impl Wire for Packet {
     }
 }
 
-/// Reads SFTP packets without holding input bytes.
-///
-/// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
-/// by [`LENGTH_LEN`] plus [`limit`](fictionet::stdlib::codec::Frames::limit). Oversized packets are
-/// refused from the length field. Partial packets return [`fictionet::stdlib::codec::Step::Need`],
-/// including at EOF, so the stream reports truncation. Packet bodies
-/// remain bytes for [`Request::from_packet`] or [`Response::from_packet`].
-impl Prefixed for Packet {
-    type Item = Packet;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "SFTP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_PACKET
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_PACKET)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        LENGTH_LEN.saturating_add(limit)
-    }
+fictionet::prefixed! {
+    /// Reads SFTP packets without holding input bytes.
+    ///
+    /// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
+    /// by [`LENGTH_LEN`] plus [`limit`](fictionet::stdlib::codec::Frames::limit). Oversized packets are
+    /// refused from the length field. Partial packets return [`fictionet::stdlib::codec::Step::Need`],
+    /// including at EOF, so the stream reports truncation. Packet bodies
+    /// remain bytes for [`Request::from_packet`] or [`Response::from_packet`].
+    Packet => (Packet, Error, usize);
+    name = "SFTP";
+    default { MAX_PACKET }
+    normalize(limit) { limit.min(MAX_PACKET) }
+    capacity(limit) { let limit = *limit;
+        LENGTH_LEN.saturating_add(limit) }
 
     #[inline]
     fn parse_prefix(
@@ -365,84 +349,52 @@ impl Error {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Empty => f.write_str("packet length 0, with no type byte"),
-            Error::PacketTooLong(n) => write!(f, "packet length {n}, over the limit"),
-            Error::PacketTruncated => f.write_str("input ended before a complete SFTP packet"),
-            Error::PacketTrailing => f.write_str("bytes follow the SFTP packet"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::UnknownType(t) => write!(f, "packet type {t} is not known here"),
-            Error::Truncated => f.write_str("the packet ended inside a field"),
-            Error::Trailing => f.write_str("bytes after the last field"),
-            Error::TooLong => f.write_str("a field or the body over its limit"),
-            Error::TooMany => f.write_str("a count over its limit"),
-            Error::AttrFlags(x) => write!(f, "attribute flags {x:#x} are not defined in version 3"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Empty => f.write_str("packet length 0, with no type byte"),
+    Error::PacketTooLong(n) => write!(f, "packet length {n}, over the limit"),
+    Error::PacketTruncated => f.write_str("input ended before a complete SFTP packet"),
+    Error::PacketTrailing => f.write_str("bytes follow the SFTP packet"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::UnknownType(t) => write!(f, "packet type {t} is not known here"),
+    Error::Truncated => f.write_str("the packet ended inside a field"),
+    Error::Trailing => f.write_str("bytes after the last field"),
+    Error::TooLong => f.write_str("a field or the body over its limit"),
+    Error::TooMany => f.write_str("a count over its limit"),
+    Error::AttrFlags(x) => write!(f, "attribute flags {x:#x} are not defined in version 3"),
+});
+
+fictionet::open_enum! {
+    /// The status codes a STATUS response carries.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Status: u32 {
+        /// The request succeeded.
+        Ok = 0,
+        /// A read or READDIR reached the end: there is no more data or no
+        /// more names.
+        Eof = 1,
+        /// The file or directory does not exist.
+        NoSuchFile = 2,
+        /// The user may not do this.
+        PermissionDenied = 3,
+        /// The request failed for a reason no other code covers.
+        Failure = 4,
+        /// The packet was badly formed.
+        BadMessage = 5,
+        /// There is no connection to the server. Only a client makes this up.
+        NoConnection = 6,
+        /// The connection to the server was lost. Only a client makes this up.
+        ConnectionLost = 7,
+        /// The server does not support the operation.
+        OpUnsupported = 8,
+        ;
+        /// Any code above 8. Writers refuse codes named by another variant.
+        Other,
     }
-}
-
-impl std::error::Error for Error {}
-
-/// The status codes a STATUS response carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
-    /// The request succeeded.
-    Ok,
-    /// A read or READDIR reached the end: there is no more data or no
-    /// more names.
-    Eof,
-    /// The file or directory does not exist.
-    NoSuchFile,
-    /// The user may not do this.
-    PermissionDenied,
-    /// The request failed for a reason no other code covers.
-    Failure,
-    /// The packet was badly formed.
-    BadMessage,
-    /// There is no connection to the server. Only a client makes this up.
-    NoConnection,
-    /// The connection to the server was lost. Only a client makes this up.
-    ConnectionLost,
-    /// The server does not support the operation.
-    OpUnsupported,
-    /// Any code above 8. Writers refuse codes named by another variant.
-    Other(u32),
-}
-
-impl Status {
-    /// The status code's number.
-    pub fn code(self) -> u32 {
-        match self {
-            Status::Ok => 0,
-            Status::Eof => 1,
-            Status::NoSuchFile => 2,
-            Status::PermissionDenied => 3,
-            Status::Failure => 4,
-            Status::BadMessage => 5,
-            Status::NoConnection => 6,
-            Status::ConnectionLost => 7,
-            Status::OpUnsupported => 8,
-            Status::Other(c) => c,
-        }
-    }
-
-    /// The status for code `c`.
-    pub fn from_code(c: u32) -> Status {
-        match c {
-            0 => Status::Ok,
-            1 => Status::Eof,
-            2 => Status::NoSuchFile,
-            3 => Status::PermissionDenied,
-            4 => Status::Failure,
-            5 => Status::BadMessage,
-            6 => Status::NoConnection,
-            7 => Status::ConnectionLost,
-            8 => Status::OpUnsupported,
-            c => Status::Other(c),
-        }
-    }
+    [
+        /// The status code's number.
+    ] [
+        /// The status for code `c`.
+    ]
 }
 
 impl std::fmt::Display for Status {
@@ -1324,19 +1276,9 @@ impl Wire for Attrs {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
-impl From<Trailing> for Error {
-    #[inline]
-    fn from(_: Trailing) -> Self {
-        Error::Trailing
-    }
-}
+fictionet::codec_from!(Error, Trailing, |_| Error::Trailing);
 
 fn packet_reader(packet: &Packet) -> Result<Reader<'_>, Error> {
     if packet.body.len() >= MAX_PACKET {

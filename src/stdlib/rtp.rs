@@ -473,12 +473,7 @@ fn has_early_padding(datagram: &rtcp::Datagram) -> bool {
         .is_some_and(|(_, earlier)| earlier.iter().any(|packet| packet.padding != 0))
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
 #[cfg(test)]
 mod tests {

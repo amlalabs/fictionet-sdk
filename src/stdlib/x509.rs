@@ -2855,167 +2855,41 @@ impl Decode for PemBlocks {
     }
 }
 
-fictionet::der_wire!(asn1, impl Wire for CrlReason, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for CrlReason, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for CrlNumber, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for CrlNumber, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for IssuerAltName, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for IssuerAltName, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for AuthorityInfoAccess, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for AuthorityInfoAccess, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for CrlDistributionPoints, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for CrlDistributionPoints, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for AuthorityKeyIdentifier, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for AuthorityKeyIdentifier, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for SubjectKeyIdentifier, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for SubjectKeyIdentifier, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for SubjectAltName, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for SubjectAltName, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for ExtendedKeyUsage, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for ExtendedKeyUsage, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for KeyUsage, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for KeyUsage, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for BasicConstraints, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for BasicConstraints, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for Value, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for Value, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for Name, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for Name, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for PublicKeyInfo, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for PublicKeyInfo, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for TbsCertificate, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for TbsCertificate, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for Certificate, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for Certificate, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for TbsCertList, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for TbsCertList, Error, Error::Unwritable);
 
-fictionet::der_wire!(asn1, impl Wire for Crl, Error, Error::Unwritable, [
-    /// Reads one complete DER value. Refuses malformed fields,
-    /// trailing bytes, and exceeded limits. See this type's docs.
-], [
-    /// Appends DER. Refuses invalid fields, exceeded limits, and
-    /// values that change when encoded. See this type's docs.
-    /// Leaves the destination unchanged on error.
-]);
+fictionet::der_wire!(asn1, impl Wire for Crl, Error, Error::Unwritable);
 
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]
@@ -3362,68 +3236,22 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(Certificate::from_pem(CERT_PEM.as_bytes()).unwrap(), cert);
         // Each typed extension writes the bytes OpenSSL wrote.
         let tbs = &cert.tbs;
-        let same =
-            |o: &[u8], der: Vec<u8>| assert_eq!(tbs.extension(o).unwrap().value, der, "{o:02x?}");
-        same(
-            oid::BASIC_CONSTRAINTS,
-            tbs.get::<BasicConstraints>()
-                .unwrap()
-                .unwrap()
-                .to_bytes()
-                .unwrap(),
-        );
-        same(
-            oid::KEY_USAGE,
-            tbs.get::<KeyUsage>().unwrap().unwrap().to_bytes().unwrap(),
-        );
-        same(
-            oid::EXTENDED_KEY_USAGE,
-            tbs.get::<ExtendedKeyUsage>()
-                .unwrap()
-                .unwrap()
-                .to_bytes()
-                .unwrap(),
-        );
-        same(
-            oid::SUBJECT_ALT_NAME,
-            tbs.get::<SubjectAltName>()
-                .unwrap()
-                .unwrap()
-                .to_bytes()
-                .unwrap(),
-        );
-        same(
-            oid::SUBJECT_KEY_IDENTIFIER,
-            tbs.get::<SubjectKeyIdentifier>()
-                .unwrap()
-                .unwrap()
-                .to_bytes()
-                .unwrap(),
-        );
-        same(
-            oid::AUTHORITY_KEY_IDENTIFIER,
-            tbs.get::<AuthorityKeyIdentifier>()
-                .unwrap()
-                .unwrap()
-                .to_bytes()
-                .unwrap(),
-        );
-        same(
-            oid::CRL_DISTRIBUTION_POINTS,
-            tbs.get::<CrlDistributionPoints>()
-                .unwrap()
-                .unwrap()
-                .to_bytes()
-                .unwrap(),
-        );
-        same(
-            oid::AUTHORITY_INFO_ACCESS,
-            tbs.get::<AuthorityInfoAccess>()
-                .unwrap()
-                .unwrap()
-                .to_bytes()
-                .unwrap(),
-        );
+        fn same<T: ExtensionValue>(tbs: &TbsCertificate, expected_oid: &[u8]) {
+            let der = tbs.get::<T>().unwrap().unwrap().to_bytes().unwrap();
+            assert_eq!(
+                tbs.extension(expected_oid).unwrap().value,
+                der,
+                "{expected_oid:02x?}"
+            );
+        }
+        same::<BasicConstraints>(tbs, oid::BASIC_CONSTRAINTS);
+        same::<KeyUsage>(tbs, oid::KEY_USAGE);
+        same::<ExtendedKeyUsage>(tbs, oid::EXTENDED_KEY_USAGE);
+        same::<SubjectAltName>(tbs, oid::SUBJECT_ALT_NAME);
+        same::<SubjectKeyIdentifier>(tbs, oid::SUBJECT_KEY_IDENTIFIER);
+        same::<AuthorityKeyIdentifier>(tbs, oid::AUTHORITY_KEY_IDENTIFIER);
+        same::<CrlDistributionPoints>(tbs, oid::CRL_DISTRIBUTION_POINTS);
+        same::<AuthorityInfoAccess>(tbs, oid::AUTHORITY_INFO_ACCESS);
         let ext = tbs
             .get::<KeyUsage>()
             .unwrap()
@@ -4072,6 +3900,9 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
 
     #[test]
     fn extension_values_round_trip() {
+        fn round_trip<T: Wire + PartialEq + std::fmt::Debug>(value: &T) {
+            assert_eq!(&T::parse(&value.to_bytes().unwrap()).unwrap(), value);
+        }
         let dir = {
             let mut n = Name::default();
             n.push(oid(oid::COMMON_NAME), text(StringKind::Utf8, "dir"));
@@ -4092,19 +3923,13 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             GeneralName::RegisteredId(oid(oid::OCSP)),
         ];
         let san = SubjectAltName(names.clone());
-        assert_eq!(
-            SubjectAltName::parse(&san.to_bytes().unwrap()).unwrap(),
-            san
-        );
+        round_trip(&san);
         let aki = AuthorityKeyIdentifier {
             key_id: Some(vec![1, 2]),
             issuer: Some(names.clone()),
             serial: Some(vec![0x00, 0xff]),
         };
-        assert_eq!(
-            AuthorityKeyIdentifier::parse(&aki.to_bytes().unwrap()).unwrap(),
-            aki
-        );
+        round_trip(&aki);
         assert_eq!(
             AuthorityKeyIdentifier::parse(&[0x30, 0x00]).unwrap(),
             AuthorityKeyIdentifier::default()
@@ -4127,18 +3952,12 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
                 crl_issuer: None,
             },
         ]);
-        assert_eq!(
-            CrlDistributionPoints::parse(&dps.to_bytes().unwrap()).unwrap(),
-            dps
-        );
+        round_trip(&dps);
         let aia = AuthorityInfoAccess(vec![AccessDescription {
             method: oid(oid::CA_ISSUERS),
             location: GeneralName::Directory(dir),
         }]);
-        assert_eq!(
-            AuthorityInfoAccess::parse(&aia.to_bytes().unwrap()).unwrap(),
-            aia
-        );
+        round_trip(&aia);
         for bits in [1u16, 0x80, 0x100, 0x1ff, 0x8000, 0xffff] {
             let ku = KeyUsage(bits);
             let der = ku.to_bytes().unwrap();
@@ -4164,25 +3983,16 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             ca: true,
             path_len: Some(u64::MAX),
         };
-        assert_eq!(
-            BasicConstraints::parse(&bc.to_bytes().unwrap()).unwrap(),
-            bc
-        );
+        round_trip(&bc);
         // An explicit cA FALSE is read.
         assert_eq!(
             BasicConstraints::parse(&[0x30, 0x03, 0x01, 0x01, 0x00]).unwrap(),
             BasicConstraints::default()
         );
         let eku = ExtendedKeyUsage(vec![oid(oid::TIME_STAMPING)]);
-        assert_eq!(
-            ExtendedKeyUsage::parse(&eku.to_bytes().unwrap()).unwrap(),
-            eku
-        );
+        round_trip(&eku);
         let ski = SubjectKeyIdentifier(vec![]);
-        assert_eq!(
-            SubjectKeyIdentifier::parse(&ski.to_bytes().unwrap()).unwrap(),
-            ski
-        );
+        round_trip(&ski);
     }
 
     #[test]

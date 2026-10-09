@@ -42,6 +42,8 @@ macro_rules! protocols {
         pub mod crc32c;
         #[path = "../../src/stdlib/dcerpc.rs"]
         pub mod dcerpc;
+        #[path = "../../src/stdlib/codec/declarations.rs"]
+        pub mod declarations;
         #[path = "../../src/stdlib/codec/demux.rs"]
         pub mod demux;
         #[path = "../../src/stdlib/dhcp.rs"]

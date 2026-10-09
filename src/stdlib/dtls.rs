@@ -449,46 +449,40 @@ pub enum Error {
     ReassemblyMemory,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::RecordTrailing => f.write_str("bytes after the record"),
-            Error::Empty => write!(f, "no bytes"),
-            Error::ContentType(t) => write!(f, "first byte {t} starts no DTLS record"),
-            Error::RecordTruncated => write!(f, "the bytes end inside a record"),
-            Error::Length(n) => write!(f, "record length {n} is over the limit"),
-            Error::TooManyRecords => write!(
-                f,
-                "more than {MAX_RECORDS_PER_DATAGRAM} records in a datagram"
-            ),
-            Error::FieldTruncated => write!(f, "the bytes end inside a field"),
-            Error::TooLong(n) => write!(f, "message length {n} is over {MAX_MESSAGE_LEN}"),
-            Error::FragmentRange => write!(f, "the fragment runs past the end of its message"),
-            Error::TooManyFragments => write!(
-                f,
-                "more than {MAX_FRAGMENTS_PER_RECORD} fragments in a record"
-            ),
-            Error::BodyTrailing => write!(f, "bytes left after the body"),
-            Error::SessionId(n) => write!(f, "session ID of {n} bytes, over {MAX_SESSION_ID}"),
-            Error::CipherSuites => write!(f, "cipher suite list empty or of an odd length"),
-            Error::CompressionMethods => write!(f, "compression method list empty"),
-            Error::Extensions => write!(f, "an extension runs past the extension block"),
-            Error::DuplicateExtension(t) => write!(f, "two extensions of type {t}"),
-            Error::FragmentInvalid => write!(f, "the fragment's fields disagree"),
-            Error::FragmentConflict => {
-                write!(f, "the fragment disagrees with earlier ones of its message")
-            }
-            Error::OutsideWindow(s) => write!(f, "message sequence {s} is too far ahead"),
-            Error::TooManyRanges => {
-                write!(f, "more than {MAX_FRAGMENT_RANGES} pieces of one message")
-            }
-            Error::ReassemblyMemory => write!(f, "more than {MAX_REASSEMBLY_BYTES} bytes held"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::RecordTrailing => f.write_str("bytes after the record"),
+    Error::Empty => write!(f, "no bytes"),
+    Error::ContentType(t) => write!(f, "first byte {t} starts no DTLS record"),
+    Error::RecordTruncated => write!(f, "the bytes end inside a record"),
+    Error::Length(n) => write!(f, "record length {n} is over the limit"),
+    Error::TooManyRecords => write!(
+        f,
+        "more than {MAX_RECORDS_PER_DATAGRAM} records in a datagram"
+    ),
+    Error::FieldTruncated => write!(f, "the bytes end inside a field"),
+    Error::TooLong(n) => write!(f, "message length {n} is over {MAX_MESSAGE_LEN}"),
+    Error::FragmentRange => write!(f, "the fragment runs past the end of its message"),
+    Error::TooManyFragments => write!(
+        f,
+        "more than {MAX_FRAGMENTS_PER_RECORD} fragments in a record"
+    ),
+    Error::BodyTrailing => write!(f, "bytes left after the body"),
+    Error::SessionId(n) => write!(f, "session ID of {n} bytes, over {MAX_SESSION_ID}"),
+    Error::CipherSuites => write!(f, "cipher suite list empty or of an odd length"),
+    Error::CompressionMethods => write!(f, "compression method list empty"),
+    Error::Extensions => write!(f, "an extension runs past the extension block"),
+    Error::DuplicateExtension(t) => write!(f, "two extensions of type {t}"),
+    Error::FragmentInvalid => write!(f, "the fragment's fields disagree"),
+    Error::FragmentConflict => {
+        write!(f, "the fragment disagrees with earlier ones of its message")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::OutsideWindow(s) => write!(f, "message sequence {s} is too far ahead"),
+    Error::TooManyRanges => {
+        write!(f, "more than {MAX_FRAGMENT_RANGES} pieces of one message")
+    }
+    Error::ReassemblyMemory => write!(f, "more than {MAX_REASSEMBLY_BYTES} bytes held"),
+});
 
 impl Record {
     /// Reads the record at the start of `b` and says how many bytes it
@@ -1205,11 +1199,7 @@ fn put_vec8(out: &mut Vec<u8>, b: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-impl From<Truncated> for Error {
-    fn from(_: Truncated) -> Error {
-        Error::FieldTruncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::FieldTruncated);
 
 trait ReadFields<'a> {
     fn u48(&mut self) -> Result<u64, Truncated>;

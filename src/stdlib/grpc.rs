@@ -67,7 +67,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::ascii::{
     self, hex_upper, hex_value as hex, is_tchar as is_token, trim_ows as trim,
 };
@@ -202,34 +201,28 @@ impl Error {
     }
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Flag(b) => write!(f, "compressed flag {b}, not 0 or 1"),
-            Error::TooLarge { length, limit } => {
-                write!(f, "message of {length} bytes, over the limit of {limit}")
-            }
-            Error::Truncated { unread } => write!(f, "message ended after {unread} bytes"),
-            Error::Trailing { remaining } => {
-                write!(f, "trailing bytes after the message: {remaining}")
-            }
-            Error::MissingStatus => f.write_str("no grpc-status"),
-            Error::BadStatus => f.write_str("malformed grpc-status"),
-            Error::HttpStatus(s) => write!(f, "HTTP status {s}, not 200"),
-            Error::ContentType => f.write_str("content-type is not gRPC"),
-            Error::BadDetails => f.write_str("grpc-status-details-bin contradicts grpc-status"),
-            Error::TimeoutValue => f.write_str("grpc-timeout value is not 1 to 8 digits"),
-            Error::TimeoutUnit => f.write_str("grpc-timeout unit is not one of HMSmun"),
-            Error::Name(n) => write!(f, "header name {n:?} is not allowed in gRPC metadata"),
-            Error::Value(n) => write!(f, "value of header {n:?} is not allowed"),
-            Error::HeadersTooLarge(n) => {
-                write!(f, "request headers of {n} bytes, over {MAX_HEADER_LIST}")
-            }
-        }
+fictionet::error_display!(Error, f, {
+    Error::Flag(b) => write!(f, "compressed flag {b}, not 0 or 1"),
+    Error::TooLarge { length, limit } => {
+        write!(f, "message of {length} bytes, over the limit of {limit}")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Truncated { unread } => write!(f, "message ended after {unread} bytes"),
+    Error::Trailing { remaining } => {
+        write!(f, "trailing bytes after the message: {remaining}")
+    }
+    Error::MissingStatus => f.write_str("no grpc-status"),
+    Error::BadStatus => f.write_str("malformed grpc-status"),
+    Error::HttpStatus(s) => write!(f, "HTTP status {s}, not 200"),
+    Error::ContentType => f.write_str("content-type is not gRPC"),
+    Error::BadDetails => f.write_str("grpc-status-details-bin contradicts grpc-status"),
+    Error::TimeoutValue => f.write_str("grpc-timeout value is not 1 to 8 digits"),
+    Error::TimeoutUnit => f.write_str("grpc-timeout unit is not one of HMSmun"),
+    Error::Name(n) => write!(f, "header name {n:?} is not allowed in gRPC metadata"),
+    Error::Value(n) => write!(f, "value of header {n:?} is not allowed"),
+    Error::HeadersTooLarge(n) => {
+        write!(f, "request headers of {n} bytes, over {MAX_HEADER_LIST}")
+    }
+});
 
 /// The status a server sends when a message stream fails.
 /// Protocol failures use [`Error::to_status`]. A truncated message,
@@ -307,48 +300,34 @@ impl Wire for Message {
     }
 }
 
-/// Decodes a call's continuous HTTP/2 DATA payload bytes into messages.
-///
-/// This decoder owns no input. [`codec::Stream::new`] holds at most
-/// [`HEADER_LEN`] plus [`limit`](fictionet::stdlib::codec::Frames::limit) unread bytes. The five-byte
-/// header suffices to refuse an oversized body. Partial messages return
-/// [`fictionet::stdlib::codec::Step::Need`], including at EOF, so the driver reports
-/// [`codec::Fail::Truncated`]. Compressed bodies remain flagged bytes.
-///
-/// ```
-/// use fictionet::stdlib::codec::{Frames, Stream, finish, pump};
-///
-/// let mut stream = Stream::new(Frames::<fictionet::stdlib::grpc::Message>::with_limit(16));
-/// let mut messages = Vec::new();
-/// // Two DATA payloads split the message header.
-/// pump(&mut stream, &[0, 0], |m| messages.push(m))?;
-/// pump(&mut stream, &[0, 0, 2, 7, 8], |m| messages.push(m))?;
-/// finish(&mut stream, |m| messages.push(m))?;
-/// assert_eq!(messages.len(), 1);
-/// assert_eq!(messages.first().map(|m| m.data.as_slice()), Some(&[7, 8][..]));
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::grpc::Error>>(())
-/// ```
-impl Prefixed for Message {
-    type Item = Message;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "gRPC";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        DEFAULT_MAX_MESSAGE
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_MESSAGE)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        HEADER_LEN.saturating_add(limit)
-    }
+fictionet::prefixed! {
+    /// Decodes a call's continuous HTTP/2 DATA payload bytes into messages.
+    ///
+    /// This decoder owns no input. [`codec::Stream::new`] holds at most
+    /// [`HEADER_LEN`] plus [`limit`](fictionet::stdlib::codec::Frames::limit) unread bytes. The five-byte
+    /// header suffices to refuse an oversized body. Partial messages return
+    /// [`fictionet::stdlib::codec::Step::Need`], including at EOF, so the driver reports
+    /// [`codec::Fail::Truncated`]. Compressed bodies remain flagged bytes.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::{Frames, Stream, finish, pump};
+    ///
+    /// let mut stream = Stream::new(Frames::<fictionet::stdlib::grpc::Message>::with_limit(16));
+    /// let mut messages = Vec::new();
+    /// // Two DATA payloads split the message header.
+    /// pump(&mut stream, &[0, 0], |m| messages.push(m))?;
+    /// pump(&mut stream, &[0, 0, 2, 7, 8], |m| messages.push(m))?;
+    /// finish(&mut stream, |m| messages.push(m))?;
+    /// assert_eq!(messages.len(), 1);
+    /// assert_eq!(messages.first().map(|m| m.data.as_slice()), Some(&[7, 8][..]));
+    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::grpc::Error>>(())
+    /// ```
+    Message => (Message, Error, usize);
+    name = "gRPC";
+    default { DEFAULT_MAX_MESSAGE }
+    normalize(limit) { limit.min(MAX_MESSAGE) }
+    capacity(limit) { let limit = *limit;
+        HEADER_LEN.saturating_add(limit) }
 
     /// Reads one message or waits for more bytes. A flag other than 0 or 1
     /// returns [`Error::Flag`]; a declared body above the configured
@@ -1146,16 +1125,10 @@ impl Rejection {
     }
 }
 
-impl fmt::Display for Rejection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Rejection::Http(s) => write!(f, "HTTP status {s}"),
-            Rejection::Status(s) => write!(f, "{s}"),
-        }
-    }
-}
-
-impl std::error::Error for Rejection {}
+fictionet::error_display!(Rejection, f, {
+    Rejection::Http(s) => write!(f, "HTTP status {s}"),
+    Rejection::Status(s) => write!(f, "{s}"),
+});
 
 impl Request {
     /// A request for `path` with this content-type, scheme `http`,

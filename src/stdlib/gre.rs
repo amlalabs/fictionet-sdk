@@ -22,8 +22,7 @@
 //! [`Stream<Collect<Packet>>`](fictionet::stdlib::codec::Stream)
 //! and a collection limit of [`MAX_PACKET`]. Call `end` at the packet boundary.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A header with an unknown version, with the routing bits or the
+//! A header with an unknown version, with the routing bits or the
 //! top recursion bit set, or with a checksum that does not match is
 //! refused. A PPTP header must also clear the C bit, all of the recursion
 //! control and the flags bits 9 to 12, and carry the K bit. It carries a
@@ -190,25 +189,19 @@ pub enum Error {
     },
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Trailing { remaining } => write!(f, "{remaining} bytes after the GRE packet"),
-            Error::Truncated => f.write_str("bytes end inside the GRE packet"),
-            Error::Version(v) => write!(f, "GRE version {v}, not 0 or 1"),
-            Error::Reserved(bits) => write!(f, "GRE flag bits {bits:#06x} must be zero"),
-            Error::MissingKey => f.write_str("PPTP GRE header without the K bit"),
-            Error::PptpProtocol(p) => write!(f, "PPTP GRE protocol type {p:#06x}, not 0x880b"),
-            Error::PptpSequence => {
-                f.write_str("PPTP GRE sequence number without a payload, or payload without one")
-            }
-            Error::Checksum => f.write_str("GRE checksum does not match"),
-            Error::TooLong => write!(f, "GRE packet longer than {MAX_PACKET} bytes"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Trailing { remaining } => write!(f, "{remaining} bytes after the GRE packet"),
+    Error::Truncated => f.write_str("bytes end inside the GRE packet"),
+    Error::Version(v) => write!(f, "GRE version {v}, not 0 or 1"),
+    Error::Reserved(bits) => write!(f, "GRE flag bits {bits:#06x} must be zero"),
+    Error::MissingKey => f.write_str("PPTP GRE header without the K bit"),
+    Error::PptpProtocol(p) => write!(f, "PPTP GRE protocol type {p:#06x}, not 0x880b"),
+    Error::PptpSequence => {
+        f.write_str("PPTP GRE sequence number without a payload, or payload without one")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Checksum => f.write_str("GRE checksum does not match"),
+    Error::TooLong => write!(f, "GRE packet longer than {MAX_PACKET} bytes"),
+});
 
 impl Header {
     /// The version the header is written with: [`VERSION_GRE`] or
@@ -488,32 +481,12 @@ impl Wire for Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg};
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::mutate;
 
     fn collect(b: &[u8]) -> Result<Packet, Error> {
-        let make = || Collect::<Packet>::new(MAX_PACKET);
-        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_PACKET + 1));
-        contract::check_wire::<Packet>(b);
-        let parsed = Packet::parse(b);
-        let (items, failure) = decode_all(make, b);
-        if b.len() <= MAX_PACKET {
-            assert_eq!(
-                failure,
-                parsed
-                    .clone()
-                    .err()
-                    .map(|e| Fail::Protocol(CollectError::Parse(e)))
-            );
-            assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
-        } else {
-            assert_eq!(
-                failure,
-                Some(Fail::Protocol(CollectError::TooLong { limit: MAX_PACKET }))
-            );
-        }
-        parsed
+        contract::check_collect::<Packet>(b, MAX_PACKET)
     }
 
     fn gre(protocol: u16, checksum: bool, key: Option<u32>, sequence: Option<u32>) -> Header {

@@ -131,7 +131,9 @@ pub fn encoded_len(s: &[u8]) -> Result<usize, Error> {
 /// Appends encoded bytes with EOS prefix padding. Refuses input above
 /// [`MAX_STRING`] and leaves `out` unchanged on error.
 pub fn encode(s: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
-    encoded_len(s)?;
+    if s.len() > MAX_STRING {
+        return Err(Error::Unwritable);
+    }
     let (mut acc, mut bits) = (0u64, 0u32);
     for &b in s {
         let len = u32::from(HUFFMAN_LENGTHS[usize::from(b)]);

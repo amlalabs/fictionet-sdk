@@ -44,8 +44,7 @@
 //! assert!(stream.next().is_none());
 //! ```
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Strings, opaque data and lists have limits, given below as
+//! Strings, opaque data and lists have limits, given below as
 //! constants. Lists are read in a loop, never by recursion. Writers return
 //! an [`Error`] rather than write bytes a reader would refuse.
 //!

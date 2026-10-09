@@ -78,7 +78,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 extern crate alloc;
 
 use alloc::{string::String, vec, vec::Vec};
@@ -654,31 +653,25 @@ pub enum Error {
     Unwritable,
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::Trailing => f.write_str("bytes follow the wire value"),
-            Error::Truncated => write!(f, "the bytes end inside a message or value"),
-            Error::BadProtocol(b) => write!(f, "first byte {b:#04x} is not a Thrift message"),
-            Error::BadVersion(v) => write!(f, "version {v:#x}, not 1"),
-            Error::BadMessageType(t) => write!(f, "message type {t}, not 1 to 4"),
-            Error::BadUtf8 => write!(f, "the message name is not UTF-8"),
-            Error::BadType(t) => write!(f, "type code {t} is not a type"),
-            Error::BadBool(b) => write!(f, "boolean byte {b} is not true or false"),
-            Error::BadVarint => write!(f, "a variable-length integer is too long or too big"),
-            Error::Length(n) => write!(f, "length {n} is negative or over its limit"),
-            Error::TooDeep => write!(f, "values nested deeper than {MAX_DEPTH}"),
-            Error::TooMany => write!(f, "more than {MAX_VALUES} values"),
-            Error::TooLong => f.write_str("message or value exceeds its size limit"),
-            Error::FrameLength(n) => write!(f, "frame length {n} is negative or over the limit"),
-            Error::FrameTruncated => f.write_str("input ended before a complete Thrift frame"),
-            Error::FrameTrailing => f.write_str("bytes follow the Thrift frame"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-        }
-    }
-}
-
-impl core::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Trailing => f.write_str("bytes follow the wire value"),
+    Error::Truncated => write!(f, "the bytes end inside a message or value"),
+    Error::BadProtocol(b) => write!(f, "first byte {b:#04x} is not a Thrift message"),
+    Error::BadVersion(v) => write!(f, "version {v:#x}, not 1"),
+    Error::BadMessageType(t) => write!(f, "message type {t}, not 1 to 4"),
+    Error::BadUtf8 => write!(f, "the message name is not UTF-8"),
+    Error::BadType(t) => write!(f, "type code {t} is not a type"),
+    Error::BadBool(b) => write!(f, "boolean byte {b} is not true or false"),
+    Error::BadVarint => write!(f, "a variable-length integer is too long or too big"),
+    Error::Length(n) => write!(f, "length {n} is negative or over its limit"),
+    Error::TooDeep => write!(f, "values nested deeper than {MAX_DEPTH}"),
+    Error::TooMany => write!(f, "more than {MAX_VALUES} values"),
+    Error::TooLong => f.write_str("message or value exceeds its size limit"),
+    Error::FrameLength(n) => write!(f, "frame length {n} is negative or over the limit"),
+    Error::FrameTruncated => f.write_str("input ended before a complete Thrift frame"),
+    Error::FrameTrailing => f.write_str("bytes follow the Thrift frame"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+});
 
 fn parse_frame_limited(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>, Error> {
     let Some(header) = b.get(..FRAME_HEADER_LEN) else {
@@ -731,48 +724,34 @@ impl Wire for Frame {
     }
 }
 
-/// Reads framed Thrift payloads without holding input bytes.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`FRAME_HEADER_LEN`]
-/// plus [`Frames::limit`](fictionet::stdlib::codec::Frames::limit). Partial frames return [`Step::Need`], including at EOF.
-/// The stream reports truncation at EOF and framing errors once. Map frames
-/// through [`EncodedMessage::parse`] to receive body errors as items.
-/// This reads framed transport; [`EncodedMessages`] reads unframed transport.
-///
-/// ```
-/// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-/// use fictionet::stdlib::thrift::Frame;
-///
-/// let mut stream = Stream::new(Frames::<Frame>::with_limit(16));
-/// let mut frames = Vec::new();
-/// pump(&mut stream, &[0, 0], |frame| frames.push(frame))?;
-/// pump(&mut stream, &[0, 2, 7, 8], |frame| frames.push(frame))?;
-/// finish(&mut stream, |frame| frames.push(frame))?;
-/// assert_eq!(frames, [Frame(vec![7, 8])]);
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::thrift::Error>>(())
-/// ```
-impl Prefixed for Frame {
-    type Item = Frame;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "Thrift framed transport";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_FRAME
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_FRAME)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        FRAME_HEADER_LEN.saturating_add(limit)
-    }
+fictionet::prefixed! {
+    /// Reads framed Thrift payloads without holding input bytes.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`FRAME_HEADER_LEN`]
+    /// plus [`Frames::limit`](fictionet::stdlib::codec::Frames::limit). Partial frames return [`Step::Need`], including at EOF.
+    /// The stream reports truncation at EOF and framing errors once. Map frames
+    /// through [`EncodedMessage::parse`] to receive body errors as items.
+    /// This reads framed transport; [`EncodedMessages`] reads unframed transport.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::Frames;
+    /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+    /// use fictionet::stdlib::thrift::Frame;
+    ///
+    /// let mut stream = Stream::new(Frames::<Frame>::with_limit(16));
+    /// let mut frames = Vec::new();
+    /// pump(&mut stream, &[0, 0], |frame| frames.push(frame))?;
+    /// pump(&mut stream, &[0, 2, 7, 8], |frame| frames.push(frame))?;
+    /// finish(&mut stream, |frame| frames.push(frame))?;
+    /// assert_eq!(frames, [Frame(vec![7, 8])]);
+    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::thrift::Error>>(())
+    /// ```
+    Frame => (Frame, Error, usize);
+    name = "Thrift framed transport";
+    default { MAX_FRAME }
+    normalize(limit) { limit.min(MAX_FRAME) }
+    capacity(limit) { let limit = *limit;
+        FRAME_HEADER_LEN.saturating_add(limit) }
 
     #[inline]
     fn parse_prefix(
@@ -1602,12 +1581,7 @@ impl<'o> Writer<'o> {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
 #[cfg(test)]
 mod tests {

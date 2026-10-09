@@ -125,7 +125,6 @@
 //! assert_eq!(&bytes[8..12], &7u32.to_le_bytes());
 //! ```
 
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{Decode, Reader as ByteReader, Step, Truncated, Wire};
 
 /// The TCP port OPC UA servers listen on.
@@ -2128,30 +2127,21 @@ impl Wire for Chunk {
     }
 }
 
-/// Reads OPC UA TCP chunks without holding input bytes or joining messages.
-///
-/// Capacity is the larger of [`Limits::chunk_limit`] and
-/// [`MAX_HANDSHAKE_SIZE`]. Oversized chunks fail from their header.
-/// Partial chunks return [`Step::Need`], including at EOF, when
-/// [`Stream`](fictionet::stdlib::codec::Stream) reports truncation.
-/// Message bodies, chunk counts, and sequence numbers are not checked here.
-/// Use [`Messages`] for message assembly and connection checks.
-impl Prefixed for Chunk {
-    type Item = Chunk;
-    type Error = Error;
-    type Limit = Limits;
-    const NAME: &'static str = "OPC UA TCP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        Limits::default()
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        limit.chunk_limit().max(MAX_HANDSHAKE_SIZE) as usize
-    }
+fictionet::prefixed! {
+    /// Reads OPC UA TCP chunks without holding input bytes or joining messages.
+    ///
+    /// Capacity is the larger of [`Limits::chunk_limit`] and
+    /// [`MAX_HANDSHAKE_SIZE`]. Oversized chunks fail from their header.
+    /// Partial chunks return [`Step::Need`], including at EOF, when
+    /// [`Stream`](fictionet::stdlib::codec::Stream) reports truncation.
+    /// Message bodies, chunk counts, and sequence numbers are not checked here.
+    /// Use [`Messages`] for message assembly and connection checks.
+    Chunk => (Chunk, Error, Limits);
+    name = "OPC UA TCP";
+    default { Limits::default() }
+    normalize(limit) { limit }
+    capacity(limit) { let limit = *limit;
+        limit.chunk_limit().max(MAX_HANDSHAKE_SIZE) as usize }
 
     /// Reads a chunk prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.
     /// Returns [`Error::MessageType`] or [`Error::ChunkType`] for
@@ -3545,12 +3535,7 @@ impl Wire for Service {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::End
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::End);
 
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]

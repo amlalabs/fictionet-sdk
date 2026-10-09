@@ -39,8 +39,7 @@
 //! the reply's bytes back. What the TLS session says, and what the tunnel
 //! carries, is up to world code.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A tls-crypt packet must have room in its ciphertext for the
+//! A tls-crypt packet must have room in its ciphertext for the
 //! fields encrypted there, and a tls-crypt-v2 packet must end with a
 //! wrapped client key whose length field fits. The readers check layout
 //! only. OpenVPN also drops a packet whose session ID is all zeros, and a
@@ -86,8 +85,8 @@
 //! assert_eq!(Packet::parse_with(&wire[2..], Wrapping::None), Ok(reply));
 //! ```
 
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Reader, Step, Truncated, Wire};
-use fictionet::stdlib::codec::{Frames, Prefixed};
 
 /// The port OpenVPN servers listen on, over UDP and over TCP.
 pub const PORT: u16 = 1194;
@@ -447,46 +446,27 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Empty => write!(f, "empty packet"),
-            Error::TooLong(n) => write!(f, "packet of {n} bytes, over {MAX_PACKET}"),
-            Error::Opcode(op) => write!(f, "unknown opcode {op}"),
-            Error::Truncated => write!(f, "packet ends inside a field"),
-            Error::TooManyAcks(n) => write!(f, "{n} acknowledgements, over {MAX_ACKS}"),
-            Error::HmacLen(n) => write!(f, "tls-auth HMAC of {n} bytes, over {MAX_HMAC_LEN}"),
-            Error::NeedsTlsCrypt(kind) => write!(f, "{kind:?} needs tls-crypt-v2"),
-            Error::WrappedKeyLen(n) => {
-                write!(
-                    f,
-                    "wrapped client key of {n} bytes, outside {MIN_WRAPPED_KEY_LEN} to {MAX_WRAPPED_KEY_LEN}"
-                )
-            }
-            Error::ZeroLength => f.write_str("OpenVPN TCP frame has zero length"),
-            Error::OverLimit { length, limit } => {
-                write!(f, "OpenVPN packet of {length} bytes, over {limit}")
-            }
-            Error::Trailing => f.write_str("bytes follow the OpenVPN TCP envelope"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Empty => write!(f, "empty packet"),
+    Error::TooLong(n) => write!(f, "packet of {n} bytes, over {MAX_PACKET}"),
+    Error::Opcode(op) => write!(f, "unknown opcode {op}"),
+    Error::Truncated => write!(f, "packet ends inside a field"),
+    Error::TooManyAcks(n) => write!(f, "{n} acknowledgements, over {MAX_ACKS}"),
+    Error::HmacLen(n) => write!(f, "tls-auth HMAC of {n} bytes, over {MAX_HMAC_LEN}"),
+    Error::NeedsTlsCrypt(kind) => write!(f, "{kind:?} needs tls-crypt-v2"),
+    Error::WrappedKeyLen(n) => {
+        write!(
+            f,
+            "wrapped client key of {n} bytes, outside {MIN_WRAPPED_KEY_LEN} to {MAX_WRAPPED_KEY_LEN}"
+        )
     }
-}
-
-impl std::error::Error for Error {}
-
-trait ReadFields<'a> {
-    fn session_id(&mut self) -> Result<SessionId, Error>;
-}
-
-impl<'a> ReadFields<'a> for Reader<'a> {
-    fn session_id(&mut self) -> Result<SessionId, Error> {
-        let b = self.take(SESSION_ID_LEN)?;
-        let mut id = [0; SESSION_ID_LEN];
-        id.copy_from_slice(b);
-        Ok(id)
+    Error::ZeroLength => f.write_str("OpenVPN TCP frame has zero length"),
+    Error::OverLimit { length, limit } => {
+        write!(f, "OpenVPN packet of {length} bytes, over {limit}")
     }
-}
+    Error::Trailing => f.write_str("bytes follow the OpenVPN TCP envelope"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+});
 
 /// The opcode and key ID packed in a packet's first byte.
 pub fn split_first_byte(b: u8) -> (u8, u8) {
@@ -536,7 +516,7 @@ impl Packet {
         if kind.carries_wrapped_key() && wrapping != Wrapping::TlsCrypt {
             return Err(Error::NeedsTlsCrypt(kind));
         }
-        let session_id = r.session_id()?;
+        let session_id = r.array::<SESSION_ID_LEN>()?;
         let tls_auth = match wrapping {
             Wrapping::None => None,
             Wrapping::TlsAuth { hmac_len } => {
@@ -581,7 +561,7 @@ impl Packet {
             }
             Some(Ack {
                 ids,
-                remote_session_id: r.session_id()?,
+                remote_session_id: r.array::<SESSION_ID_LEN>()?,
             })
         };
         // OpenVPN reads no message ID from P_ACK_V1 and ignores the rest.
@@ -866,34 +846,20 @@ impl Frame {
     }
 }
 
-/// Reads OpenVPN TCP envelopes without retaining input.
-///
-/// Capacity is the payload limit plus [`LENGTH_PREFIX_LEN`]. An oversized
-/// packet is refused from its prefix. Partial envelopes return [`Step::Need`],
-/// including at EOF, so [`fictionet::stdlib::codec::Stream`] reports truncation.
-/// Map each frame through [`Packet::parse_with`] with the connection's wrapping
-/// to receive packet errors as items while framing continues.
-impl Prefixed for Frame {
-    type Item = Frame;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "OpenVPN/TCP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_PACKET
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_PACKET)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        LENGTH_PREFIX_LEN.saturating_add(limit)
-    }
+fictionet::prefixed! {
+    /// Reads OpenVPN TCP envelopes without retaining input.
+    ///
+    /// Capacity is the payload limit plus [`LENGTH_PREFIX_LEN`]. An oversized
+    /// packet is refused from its prefix. Partial envelopes return [`Step::Need`],
+    /// including at EOF, so [`fictionet::stdlib::codec::Stream`] reports truncation.
+    /// Map each frame through [`Packet::parse_with`] with the connection's wrapping
+    /// to receive packet errors as items while framing continues.
+    Frame => (Frame, Error, usize);
+    name = "OpenVPN/TCP";
+    default { MAX_PACKET }
+    normalize(limit) { limit.min(MAX_PACKET) }
+    capacity(limit) { let limit = *limit;
+        LENGTH_PREFIX_LEN.saturating_add(limit) }
 
     #[inline]
     fn parse_prefix(
@@ -911,12 +877,7 @@ impl Prefixed for Frame {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
 #[cfg(test)]
 mod tests {

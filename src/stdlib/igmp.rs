@@ -324,24 +324,18 @@ pub enum Error {
     Unwritable,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Trailing { remaining } => write!(f, "{remaining} bytes after the IGMP message"),
-            Error::Truncated => write!(f, "the message is cut short"),
-            Error::TooLong => write!(f, "the message is longer than {MAX_MESSAGE} bytes"),
-            Error::Checksum => write!(f, "the checksum is wrong"),
-            Error::UnknownType(t) => write!(f, "unknown message type {t:#04x}"),
-            Error::QueryLength(n) => write!(f, "a query of {n} bytes, neither 8 nor at least 12"),
-            Error::Qrv(q) => write!(f, "QRV {q}, above {MAX_QRV}"),
-            Error::Address(a) => write!(f, "address {a} cannot be used in that field"),
-            Error::GeneralQuerySources(n) => write!(f, "a general query that lists {n} sources"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
+fictionet::error_display!(Error, f, {
+    Error::Trailing { remaining } => write!(f, "{remaining} bytes after the IGMP message"),
+    Error::Truncated => write!(f, "the message is cut short"),
+    Error::TooLong => write!(f, "the message is longer than {MAX_MESSAGE} bytes"),
+    Error::Checksum => write!(f, "the checksum is wrong"),
+    Error::UnknownType(t) => write!(f, "unknown message type {t:#04x}"),
+    Error::QueryLength(n) => write!(f, "a query of {n} bytes, neither 8 nor at least 12"),
+    Error::Qrv(q) => write!(f, "QRV {q}, above {MAX_QRV}"),
+    Error::Address(a) => write!(f, "address {a} cannot be used in that field"),
+    Error::GeneralQuerySources(n) => write!(f, "a general query that lists {n} sources"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+});
 
 /// The value a maximum response code or QQIC stands for. Codes below 128
 /// are the value itself. A code of 128 or more is a float: 1, a 3-bit
@@ -786,32 +780,12 @@ pub mod harness {
 mod tests {
     use super::harness::conforms;
     use super::*;
-    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg};
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
-    use fictionet::stdlib::test_support::{decode_all, mutate};
+    use fictionet::stdlib::test_support::mutate;
 
     fn collect(b: &[u8]) -> Result<Message, Error> {
-        let make = || Collect::<Message>::new(MAX_MESSAGE);
-        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
-        contract::check_wire::<Message>(b);
-        let parsed = Message::parse(b);
-        let (items, failure) = decode_all(make, b);
-        if b.len() <= MAX_MESSAGE {
-            assert_eq!(
-                failure,
-                parsed
-                    .clone()
-                    .err()
-                    .map(|e| Fail::Protocol(CollectError::Parse(e)))
-            );
-            assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
-        } else {
-            assert_eq!(
-                failure,
-                Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE }))
-            );
-        }
-        parsed
+        contract::check_collect::<Message>(b, MAX_MESSAGE)
     }
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {

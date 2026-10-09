@@ -66,7 +66,6 @@
 use fictionet::stdlib::asn1::{self, Class, Element, Length, Reader, Rules, Tag};
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::codec::ascii::{hex_lower, hex_value as hex_digit};
 use std::fmt;
@@ -1472,7 +1471,7 @@ impl W {
     fn put(&mut self, tag: Tag, contents: &[u8]) -> Result<(), Error> {
         let mut head = Vec::with_capacity(16);
         tag.encode(&mut head);
-        push_len(&mut head, contents.len());
+        asn1::encode_length(contents.len(), &mut head);
         let total = self
             .out
             .len()
@@ -1517,17 +1516,6 @@ impl W {
 fn context(number: u32, constructed: bool) -> Tag {
     let t = Tag::context(number);
     if constructed { t.as_constructed() } else { t }
-}
-
-fn push_len(out: &mut Vec<u8>, n: usize) {
-    if n < 0x80 {
-        out.push(n as u8);
-    } else {
-        let bytes = (n as u64).to_be_bytes();
-        let skip = bytes.iter().take_while(|&&b| b == 0).count();
-        out.push(0x80 | (8 - skip) as u8);
-        out.extend_from_slice(&bytes[skip..]);
-    }
 }
 
 fn write_result(w: &mut W, r: &LdapResult) -> Result<(), Error> {
@@ -2461,37 +2449,23 @@ impl Wire for Message {
     }
 }
 
-/// Reads LDAP messages without holding input bytes.
-///
-/// Use with [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream) for bounded input. Partial messages
-/// return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
-/// truncation at EOF and errors once. A malformed message ends the stream.
-/// This includes a well-framed message that [`Message::parse`] rejects:
-/// [RFC 4511 section 4.1.1](https://www.rfc-editor.org/rfc/rfc4511.html#section-4.1.1)
-/// requires termination for malformed envelopes and encodings. For parsing
-/// failures as individual items, use
-/// `asn1::Elements::new(Rules::Ber).map(|bytes| Message::parse(&bytes))`.
-impl Prefixed for Message {
-    type Item = Message;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "LDAP";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_MESSAGE
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_MESSAGE)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        limit.max(asn1::HEADER_ROOM)
-    }
+fictionet::prefixed! {
+    /// Reads LDAP messages without holding input bytes.
+    ///
+    /// Use with [`Stream<codec::Frames<Message>>`](fictionet::stdlib::codec::Stream) for bounded input. Partial messages
+    /// return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
+    /// truncation at EOF and errors once. A malformed message ends the stream.
+    /// This includes a well-framed message that [`Message::parse`] rejects:
+    /// [RFC 4511 section 4.1.1](https://www.rfc-editor.org/rfc/rfc4511.html#section-4.1.1)
+    /// requires termination for malformed envelopes and encodings. For parsing
+    /// failures as individual items, use
+    /// `asn1::Elements::new(Rules::Ber).map(|bytes| Message::parse(&bytes))`.
+    Message => (Message, Error, usize);
+    name = "LDAP";
+    default { MAX_MESSAGE }
+    normalize(limit) { limit.min(MAX_MESSAGE) }
+    capacity(limit) { let limit = *limit;
+        limit.max(asn1::HEADER_ROOM) }
 
     #[inline]
     fn parse_prefix(

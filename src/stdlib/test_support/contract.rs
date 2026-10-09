@@ -485,6 +485,78 @@ pub fn check_wire<M: Wire + PartialEq + Debug>(data: &[u8]) {
     }
 }
 
+/// Checks collection against exact wire parsing, including limits and writer contracts.
+pub fn check_collect<M>(data: &[u8], limit: usize) -> Result<M, M::ParseError>
+where
+    M: Wire + Clone + PartialEq + Debug,
+    M::ParseError: Clone + PartialEq + Debug,
+{
+    use fictionet::stdlib::codec::{Collect, CollectError};
+    use fictionet::stdlib::test_support::decode_all;
+    let make = || Collect::<M>::new(limit);
+    check_decode_with_alloc_limit(make, data, 2 * (limit + 1));
+    check_wire::<M>(data);
+    let parsed = M::parse(data);
+    let (items, failure) = decode_all(make, data);
+    if data.len() <= limit {
+        assert_eq!(
+            failure,
+            parsed
+                .clone()
+                .err()
+                .map(|e| Fail::Protocol(CollectError::Parse(e)))
+        );
+        assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
+    } else {
+        assert!(items.is_empty());
+        assert_eq!(
+            failure,
+            Some(Fail::Protocol(CollectError::TooLong { limit }))
+        );
+    }
+    parsed
+}
+
+/// Checks raw collection and a contextual parser whose errors remain items.
+pub fn check_collect_with<T, E>(
+    data: &[u8],
+    limit: usize,
+    parse: impl Fn(&[u8]) -> Result<T, E>,
+) -> Result<T, E>
+where
+    T: Clone + PartialEq + Debug,
+    E: Clone + PartialEq + Debug,
+{
+    use fictionet::stdlib::codec::{Collect, CollectError};
+    use fictionet::stdlib::test_support::decode_all;
+    let make = || Collect::bytes(limit).map(|d| parse(&d));
+    check_decode_with_alloc_limit(make, data, 2 * (limit + 1));
+    assert_eq!(
+        decode_all(|| Collect::bytes(limit), data),
+        if data.len() <= limit {
+            (vec![data.to_vec()], None)
+        } else {
+            (
+                vec![],
+                Some(Fail::Protocol(CollectError::TooLong { limit })),
+            )
+        }
+    );
+    let parsed = parse(data);
+    let (items, failure) = decode_all(make, data);
+    if data.len() <= limit {
+        assert_eq!(failure, None);
+        assert_eq!(items, vec![parsed.clone()]);
+    } else {
+        assert!(items.is_empty());
+        assert_eq!(
+            failure,
+            Some(Fail::Protocol(CollectError::TooLong { limit }))
+        );
+    }
+    parsed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

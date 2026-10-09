@@ -27,8 +27,7 @@
 //! attacks, and it refuses parameter entity references. It reads UTF-8
 //! only.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Depth, name length, attribute count, namespace bindings and the
+//! Depth, name length, attribute count, namespace bindings and the
 //! size of the whole document are capped by the `MAX_` constants, and a
 //! document past a cap is an [`Error`], not a crash or a long stall. A
 //! [`Builder`] checks the same grammar as [`Events`]. Attribute defaults supplied

@@ -81,7 +81,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::Reader;
 use fictionet::stdlib::codec::crc32c::checksum as crc32c;
 
@@ -545,58 +544,52 @@ pub enum Error {
     TooManySequences,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::BsonTrailing => f.write_str("bytes after BSON document"),
-            Error::BsonTruncated => f.write_str("BSON runs past the end of its bytes"),
-            Error::BsonLength(n) => write!(f, "BSON length field {n} out of range"),
-            Error::Terminator => f.write_str("BSON document, string or name not terminated"),
-            Error::Type(t) => write!(f, "unknown BSON element type 0x{t:02x}"),
-            Error::Utf8 => f.write_str("BSON string is not UTF-8"),
-            Error::Bool(b) => write!(f, "BSON boolean byte {b}, not 0 or 1"),
-            Error::Depth => write!(f, "BSON nests deeper than {MAX_DEPTH}"),
-            Error::TooManyElements => write!(f, "more than {MAX_ELEMENTS} BSON elements"),
-            Error::ArrayKey => f.write_str("BSON array keys are not 0, 1, 2 and so on"),
-            Error::OldBinary => {
-                f.write_str("BSON binary subtype 2 length does not match its bytes")
-            }
-            Error::RegexOptions => f.write_str("BSON regex options are not in alphabetical order"),
-            Error::Length(n) => write!(f, "message length {n} out of range"),
-            Error::Truncated => f.write_str("a field runs past the end of the message"),
-            Error::Trailing => f.write_str("bytes left at the end of the message"),
-            Error::Flags(b) => write!(f, "unknown required OP_MSG flag bits in 0x{b:08x}"),
-            Error::SectionKind(k) => write!(f, "unknown OP_MSG section kind {k}"),
-            Error::BodyCount(n) => write!(f, "{n} OP_MSG body sections, not 1"),
-            Error::SequenceLength(n) => write!(f, "OP_MSG document sequence size {n} out of range"),
-            Error::Checksum { expected, found } => {
-                write!(
-                    f,
-                    "OP_MSG checksum 0x{found:08x}, expected 0x{expected:08x}"
-                )
-            }
-            Error::NumberReturned(n) => {
-                write!(f, "OP_REPLY says {n} documents, which does not match")
-            }
-            Error::TooManyDocuments => {
-                write!(f, "more than {MAX_DOCUMENTS} documents in one message")
-            }
-            Error::DuplicateIdentifier => {
-                f.write_str("two OP_MSG document sequences share an identifier")
-            }
-            Error::TooManySequences => {
-                write!(f, "more than {MAX_SEQUENCES} OP_MSG document sequences")
-            }
-            Error::DuplicateField => f.write_str("an OP_MSG body field is given twice"),
-            Error::UncompressedSize(n) => {
-                write!(f, "OP_COMPRESSED uncompressed size {n} out of range")
-            }
-        }
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::BsonTrailing => f.write_str("bytes after BSON document"),
+    Error::BsonTruncated => f.write_str("BSON runs past the end of its bytes"),
+    Error::BsonLength(n) => write!(f, "BSON length field {n} out of range"),
+    Error::Terminator => f.write_str("BSON document, string or name not terminated"),
+    Error::Type(t) => write!(f, "unknown BSON element type 0x{t:02x}"),
+    Error::Utf8 => f.write_str("BSON string is not UTF-8"),
+    Error::Bool(b) => write!(f, "BSON boolean byte {b}, not 0 or 1"),
+    Error::Depth => write!(f, "BSON nests deeper than {MAX_DEPTH}"),
+    Error::TooManyElements => write!(f, "more than {MAX_ELEMENTS} BSON elements"),
+    Error::ArrayKey => f.write_str("BSON array keys are not 0, 1, 2 and so on"),
+    Error::OldBinary => {
+        f.write_str("BSON binary subtype 2 length does not match its bytes")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::RegexOptions => f.write_str("BSON regex options are not in alphabetical order"),
+    Error::Length(n) => write!(f, "message length {n} out of range"),
+    Error::Truncated => f.write_str("a field runs past the end of the message"),
+    Error::Trailing => f.write_str("bytes left at the end of the message"),
+    Error::Flags(b) => write!(f, "unknown required OP_MSG flag bits in 0x{b:08x}"),
+    Error::SectionKind(k) => write!(f, "unknown OP_MSG section kind {k}"),
+    Error::BodyCount(n) => write!(f, "{n} OP_MSG body sections, not 1"),
+    Error::SequenceLength(n) => write!(f, "OP_MSG document sequence size {n} out of range"),
+    Error::Checksum { expected, found } => {
+        write!(
+            f,
+            "OP_MSG checksum 0x{found:08x}, expected 0x{expected:08x}"
+        )
+    }
+    Error::NumberReturned(n) => {
+        write!(f, "OP_REPLY says {n} documents, which does not match")
+    }
+    Error::TooManyDocuments => {
+        write!(f, "more than {MAX_DOCUMENTS} documents in one message")
+    }
+    Error::DuplicateIdentifier => {
+        f.write_str("two OP_MSG document sequences share an identifier")
+    }
+    Error::TooManySequences => {
+        write!(f, "more than {MAX_SEQUENCES} OP_MSG document sequences")
+    }
+    Error::DuplicateField => f.write_str("an OP_MSG body field is given twice"),
+    Error::UncompressedSize(n) => {
+        write!(f, "OP_COMPRESSED uncompressed size {n} out of range")
+    }
+});
 
 impl Document {
     /// An empty document.
@@ -1435,37 +1428,23 @@ impl Wire for Message {
     }
 }
 
-/// Reads MongoDB messages without holding input bytes.
-///
-/// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
-/// by [`limit`](fictionet::stdlib::codec::Frames::limit), including the header. Oversized messages
-/// are refused from the first four bytes. Partial messages return
-/// [`fictionet::stdlib::codec::Step::Need`], including at EOF, so the stream reports truncation.
-///
-/// Items are `Result<Message, Error>`. A body error consumes its
-/// frame and is returned as an error item, so the next message can still
-/// be read. Only [`Error::Length`] from the length field and
-/// [`Error::SectionKind`] end the stream.
-impl Prefixed for Message {
-    type Item = Result<Message, Error>;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "MongoDB";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_MESSAGE_SIZE
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.clamp(HEADER_LEN, MAX_MESSAGE_SIZE)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        *limit
-    }
+fictionet::prefixed! {
+    /// Reads MongoDB messages without holding input bytes.
+    ///
+    /// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
+    /// by [`limit`](fictionet::stdlib::codec::Frames::limit), including the header. Oversized messages
+    /// are refused from the first four bytes. Partial messages return
+    /// [`fictionet::stdlib::codec::Step::Need`], including at EOF, so the stream reports truncation.
+    ///
+    /// Items are `Result<Message, Error>`. A body error consumes its
+    /// frame and is returned as an error item, so the next message can still
+    /// be read. Only [`Error::Length`] from the length field and
+    /// [`Error::SectionKind`] end the stream.
+    Message => (Result<Message, Error>, Error, usize);
+    name = "MongoDB";
+    default { MAX_MESSAGE_SIZE }
+    normalize(limit) { limit.clamp(HEADER_LEN, MAX_MESSAGE_SIZE) }
+    capacity(limit) { *limit }
 
     #[inline]
     fn parse_prefix(

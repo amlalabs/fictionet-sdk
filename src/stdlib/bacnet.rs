@@ -41,8 +41,7 @@
 //! world code. BACnet/IP runs over UDP, one message per datagram, so there
 //! is no transport stream to assemble.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Writers refuse values that exceed limits or would change when read.
+//! Writers refuse values that exceed limits or would change when read.
 //! The destination stays unchanged on error.
 //!
 //! ```
@@ -83,7 +82,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire, be16};
 
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -281,39 +279,33 @@ pub enum Error {
     TooLong,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Truncated => f.write_str("message ends early"),
-            Error::TrailingBytes => f.write_str("bytes left over after the message"),
-            Error::NotBacnetIp(t) => write!(f, "BVLC type {t:#04x}, not 0x81 (BACnet/IP)"),
-            Error::Length(n) => write!(f, "BVLC length {n} does not match the datagram"),
-            Error::Function(c) => write!(f, "unknown BVLC function {c:#04x}"),
-            Error::FunctionData(c) => write!(f, "wrong data length for BVLC function {c:#04x}"),
-            Error::Version(v) => write!(f, "NPDU version {v}, not 1"),
-            Error::SourceAddress => f.write_str("NPDU source address of length 0"),
-            Error::PduType(t) => write!(f, "reserved APDU type {t}"),
-            Error::ReservedTag(t) => write!(f, "reserved tag number {t}"),
-            Error::ApplicationOpenClose => {
-                f.write_str("application tag with an opening or closing length code")
-            }
-            Error::ContextTag(t) => {
-                write!(f, "context tag {t} where an application value was expected")
-            }
-            Error::ValueLength { tag, len } => {
-                write!(f, "length {len} does not fit application tag {tag}")
-            }
-            Error::BitString(u) => write!(f, "bit string with {u} unused bits"),
-            Error::ServiceBody => f.write_str("service body does not match its definition"),
-            Error::OutOfRange => f.write_str("value out of range"),
-            Error::Network(n) => write!(f, "network number {n} not allowed here"),
-            Error::TooLong => f.write_str("input longer than any datagram"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Truncated => f.write_str("message ends early"),
+    Error::TrailingBytes => f.write_str("bytes left over after the message"),
+    Error::NotBacnetIp(t) => write!(f, "BVLC type {t:#04x}, not 0x81 (BACnet/IP)"),
+    Error::Length(n) => write!(f, "BVLC length {n} does not match the datagram"),
+    Error::Function(c) => write!(f, "unknown BVLC function {c:#04x}"),
+    Error::FunctionData(c) => write!(f, "wrong data length for BVLC function {c:#04x}"),
+    Error::Version(v) => write!(f, "NPDU version {v}, not 1"),
+    Error::SourceAddress => f.write_str("NPDU source address of length 0"),
+    Error::PduType(t) => write!(f, "reserved APDU type {t}"),
+    Error::ReservedTag(t) => write!(f, "reserved tag number {t}"),
+    Error::ApplicationOpenClose => {
+        f.write_str("application tag with an opening or closing length code")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::ContextTag(t) => {
+        write!(f, "context tag {t} where an application value was expected")
+    }
+    Error::ValueLength { tag, len } => {
+        write!(f, "length {len} does not fit application tag {tag}")
+    }
+    Error::BitString(u) => write!(f, "bit string with {u} unused bits"),
+    Error::ServiceBody => f.write_str("service body does not match its definition"),
+    Error::OutOfRange => f.write_str("value out of range"),
+    Error::Network(n) => write!(f, "network number {n} not allowed here"),
+    Error::TooLong => f.write_str("input longer than any datagram"),
+});
 
 /// One entry of a BBMD's broadcast distribution table: a peer BBMD and the
 /// mask it broadcasts with.
@@ -2038,21 +2030,14 @@ impl<const TYPE: u8> ContextValue<TYPE> {
     }
 }
 
-/// A stateless reader of tag headers, including opening and closing tags.
-/// It consumes only the header. Read its contents using the service schema.
-impl Prefixed for Tag {
-    type Item = Tag;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "BACnet tag";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        7
-    }
+fictionet::prefixed! {
+    /// A stateless reader of tag headers, including opening and closing tags.
+    /// It consumes only the header. Read its contents using the service schema.
+    Tag => (Tag, Error, ());
+    name = "BACnet tag";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { 7 }
 
     /// Reads one header. Refuses reserved tag numbers and application
     /// opening or closing tags. An incomplete header needs more bytes.
@@ -2069,21 +2054,14 @@ impl Prefixed for Tag {
     }
 }
 
-/// A stateless reader of application-tagged primitive values.
-/// Context fields use [`ContextValue::read`]; constructed tags use [`codec::Frames<Tag>`](fictionet::stdlib::codec::Frames).
-impl Prefixed for Value {
-    type Item = Value;
-    type Error = Error;
-    type Limit = ();
-    const NAME: &'static str = "BACnet primitive";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {}
-
-    #[inline]
-    fn capacity(_limit: &Self::Limit) -> usize {
-        MAX_VALUE_LEN + 7
-    }
+fictionet::prefixed! {
+    /// A stateless reader of application-tagged primitive values.
+    /// Context fields use [`ContextValue::read`]; constructed tags use [`codec::Frames<Tag>`](fictionet::stdlib::codec::Frames).
+    Value => (Value, Error, ());
+    name = "BACnet primitive";
+    default {  }
+    normalize(limit) { limit }
+    capacity(_limit) { MAX_VALUE_LEN + 7 }
 
     /// Reads one primitive. Refuses context tags, reserved types and invalid
     /// or oversized values. An incomplete value needs more bytes.
@@ -2179,19 +2157,9 @@ impl Wire for ValueList {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
-impl From<Trailing> for Error {
-    #[inline]
-    fn from(_: Trailing) -> Self {
-        Error::TrailingBytes
-    }
-}
+fictionet::codec_from!(Error, Trailing, |_| Error::TrailingBytes);
 
 #[cfg(test)]
 mod tests {

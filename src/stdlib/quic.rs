@@ -313,37 +313,31 @@ impl Error {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Trailing => f.write_str("bytes follow the QUIC value"),
-            Error::Truncated => f.write_str("the bytes end before the packet or frame does"),
-            Error::TooLong(n) => write!(f, "{n} bytes, more than a datagram holds"),
-            Error::FixedBit => f.write_str("the fixed bit is 0"),
-            Error::ReservedBits => f.write_str("the reserved bits are not 0"),
-            Error::ConnectionIdLength(n) => write!(f, "a {n}-byte connection ID is too long"),
-            Error::Length(n) => write!(f, "Length field {n} cannot hold the packet number"),
-            Error::VersionList(n) => {
-                write!(f, "a {n}-byte version list is empty or not whole versions")
-            }
-            Error::EmptyToken => f.write_str("a Retry packet with no token"),
-            Error::Empty => f.write_str("no frames or packets"),
-            Error::UnknownFrame(t) => write!(f, "unknown frame type {t:#x}"),
-            Error::FrameEncoding(t) => write!(f, "frame of type {t:#x} breaks its rules"),
-            Error::LongFrameType(t) => write!(f, "frame type {t:#x} is not in its shortest form"),
-            Error::TooManyFrames => write!(f, "more than {MAX_FRAMES} frames"),
-            Error::TooManyAckRanges(_) => write!(f, "more than {MAX_ACK_RANGES} ACK ranges"),
-            Error::TooManyPackets => write!(f, "more than {MAX_COALESCED} packets in a datagram"),
-            Error::MixedConnectionIds => {
-                f.write_str("packets in one datagram have different connection IDs")
-            }
-            Error::Window(end) => write!(f, "data ending at offset {end} is past what may be held"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Trailing => f.write_str("bytes follow the QUIC value"),
+    Error::Truncated => f.write_str("the bytes end before the packet or frame does"),
+    Error::TooLong(n) => write!(f, "{n} bytes, more than a datagram holds"),
+    Error::FixedBit => f.write_str("the fixed bit is 0"),
+    Error::ReservedBits => f.write_str("the reserved bits are not 0"),
+    Error::ConnectionIdLength(n) => write!(f, "a {n}-byte connection ID is too long"),
+    Error::Length(n) => write!(f, "Length field {n} cannot hold the packet number"),
+    Error::VersionList(n) => {
+        write!(f, "a {n}-byte version list is empty or not whole versions")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::EmptyToken => f.write_str("a Retry packet with no token"),
+    Error::Empty => f.write_str("no frames or packets"),
+    Error::UnknownFrame(t) => write!(f, "unknown frame type {t:#x}"),
+    Error::FrameEncoding(t) => write!(f, "frame of type {t:#x} breaks its rules"),
+    Error::LongFrameType(t) => write!(f, "frame type {t:#x} is not in its shortest form"),
+    Error::TooManyFrames => write!(f, "more than {MAX_FRAMES} frames"),
+    Error::TooManyAckRanges(_) => write!(f, "more than {MAX_ACK_RANGES} ACK ranges"),
+    Error::TooManyPackets => write!(f, "more than {MAX_COALESCED} packets in a datagram"),
+    Error::MixedConnectionIds => {
+        f.write_str("packets in one datagram have different connection IDs")
+    }
+    Error::Window(end) => write!(f, "data ending at offset {end} is past what may be held"),
+});
 
 // Variable-length integers (RFC 9000, section 16).
 
@@ -2061,12 +2055,7 @@ impl<'a> ReadFields<'a> for Reader<'a> {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
 /// Checks shared by this module's tests and its fuzz target.
 #[cfg(any(test, fuzzing))]

@@ -523,35 +523,29 @@ pub enum Error {
     WrongVersion,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Unwritable => f.write_str("PROXY value cannot be written unchanged"),
-            Error::NotProxy => f.write_str("not a PROXY protocol header"),
-            Error::V1TooLong => write!(f, "PROXY v1 line longer than {V1_MAX_LEN} bytes"),
-            Error::V1Syntax => f.write_str("malformed PROXY v1 line"),
-            Error::V1Address => f.write_str("bad address in PROXY v1 line"),
-            Error::V1Port => f.write_str("bad port in PROXY v1 line"),
-            Error::Version(v) => write!(f, "PROXY header version {v}, not 2"),
-            Error::Command(c) => write!(f, "PROXY v2 command {c}, not LOCAL or PROXY"),
-            Error::Family(b) => {
-                write!(f, "PROXY v2 family and transport byte {b:#04x} not allowed")
-            }
-            Error::Length(n) => write!(f, "PROXY v2 length {n} too short for the address block"),
-            Error::TlvTruncated => f.write_str("PROXY v2 TLV runs past its end"),
-            Error::TlvLength(k) => write!(
-                f,
-                "PROXY v2 TLV type {k:#04x} has a value of the wrong length"
-            ),
-            Error::Checksum => f.write_str("PROXY v2 CRC32C checksum does not match"),
-            Error::Truncated => f.write_str("incomplete PROXY header"),
-            Error::Trailing => f.write_str("bytes after the PROXY header"),
-            Error::WrongVersion => f.write_str("PROXY header has the wrong version"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Unwritable => f.write_str("PROXY value cannot be written unchanged"),
+    Error::NotProxy => f.write_str("not a PROXY protocol header"),
+    Error::V1TooLong => write!(f, "PROXY v1 line longer than {V1_MAX_LEN} bytes"),
+    Error::V1Syntax => f.write_str("malformed PROXY v1 line"),
+    Error::V1Address => f.write_str("bad address in PROXY v1 line"),
+    Error::V1Port => f.write_str("bad port in PROXY v1 line"),
+    Error::Version(v) => write!(f, "PROXY header version {v}, not 2"),
+    Error::Command(c) => write!(f, "PROXY v2 command {c}, not LOCAL or PROXY"),
+    Error::Family(b) => {
+        write!(f, "PROXY v2 family and transport byte {b:#04x} not allowed")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Length(n) => write!(f, "PROXY v2 length {n} too short for the address block"),
+    Error::TlvTruncated => f.write_str("PROXY v2 TLV runs past its end"),
+    Error::TlvLength(k) => write!(
+        f,
+        "PROXY v2 TLV type {k:#04x} has a value of the wrong length"
+    ),
+    Error::Checksum => f.write_str("PROXY v2 CRC32C checksum does not match"),
+    Error::Truncated => f.write_str("incomplete PROXY header"),
+    Error::Trailing => f.write_str("bytes after the PROXY header"),
+    Error::WrongVersion => f.write_str("PROXY header has the wrong version"),
+});
 
 /// What the start of a connection looks like, from its first bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -68,10 +68,21 @@ use fictionet::stdlib::codec::{Decode, Step, Wire};
 /// Implements DER [`Wire`] parsing and checked writing for a protocol item.
 ///
 /// Pass the local ASN.1 module path, item and error types, the refusal value,
-/// and docs for each method. The item supplies `encode` and `decode` methods.
+/// and optional docs for each method. Omitting docs uses the standard DER
+/// refusals. The item supplies `encode` and `decode` methods.
 /// The module path keeps copied protocol modules independent of this crate.
 #[macro_export]
 macro_rules! der_wire {
+    ($asn1:ident, impl Wire for $item:ty, $error:ty, $unwritable:expr) => {
+        fictionet::der_wire!($asn1, impl Wire for $item, $error, $unwritable, [
+            /// Reads one complete DER value. Refuses malformed fields,
+            /// trailing bytes, and exceeded limits. See this type's docs.
+        ], [
+            /// Appends DER. Refuses invalid fields, exceeded limits, and
+            /// values that change when encoded. See this type's docs.
+            /// Leaves the destination unchanged on error.
+        ]);
+    };
     ($asn1:ident, impl Wire for $item:ty, $error:ty, $unwritable:expr,
      [$(#[$parse:meta])*], [$(#[$write:meta])*]) => {
         impl fictionet::stdlib::codec::Wire for $item {
@@ -218,42 +229,36 @@ pub enum Error {
     Implicit,
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Truncated => f.write_str("input ends inside an element"),
-            Error::TooLong => write!(f, "element longer than {MAX_INPUT} bytes"),
-            Error::TooDeep => write!(f, "values nested deeper than {MAX_DEPTH}"),
-            Error::Tag => f.write_str("malformed tag"),
-            Error::Length => f.write_str("malformed length"),
-            Error::NonMinimalLength => f.write_str("length not in its shortest form (DER)"),
-            Error::Indefinite => f.write_str("indefinite length not allowed here"),
-            Error::Eoc => f.write_str("misplaced or malformed end-of-contents"),
-            Error::Unexpected { expected, found } => {
-                write!(f, "expected {expected}, found {found}")
-            }
-            Error::Empty => f.write_str("no more elements"),
-            Error::Trailing => f.write_str("bytes after the last element"),
-            Error::Primitive => {
-                f.write_str("primitive element where a constructed one was expected")
-            }
-            Error::Constructed => {
-                f.write_str("constructed element where a primitive one was expected")
-            }
-            Error::Boolean => f.write_str("malformed boolean"),
-            Error::Integer => f.write_str("malformed or out-of-range integer"),
-            Error::Null => f.write_str("null with contents"),
-            Error::BitString => f.write_str("malformed bit string"),
-            Error::Oid => f.write_str("malformed object identifier"),
-            Error::Charset => f.write_str("characters outside the string type's set"),
-            Error::Time => f.write_str("malformed time"),
-            Error::SetOrder => f.write_str("set elements out of order or repeated"),
-            Error::Implicit => f.write_str("a tag needs exactly one element under it"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Truncated => f.write_str("input ends inside an element"),
+    Error::TooLong => write!(f, "element longer than {MAX_INPUT} bytes"),
+    Error::TooDeep => write!(f, "values nested deeper than {MAX_DEPTH}"),
+    Error::Tag => f.write_str("malformed tag"),
+    Error::Length => f.write_str("malformed length"),
+    Error::NonMinimalLength => f.write_str("length not in its shortest form (DER)"),
+    Error::Indefinite => f.write_str("indefinite length not allowed here"),
+    Error::Eoc => f.write_str("misplaced or malformed end-of-contents"),
+    Error::Unexpected { expected, found } => {
+        write!(f, "expected {expected}, found {found}")
     }
-}
-
-impl std::error::Error for Error {}
+    Error::Empty => f.write_str("no more elements"),
+    Error::Trailing => f.write_str("bytes after the last element"),
+    Error::Primitive => {
+        f.write_str("primitive element where a constructed one was expected")
+    }
+    Error::Constructed => {
+        f.write_str("constructed element where a primitive one was expected")
+    }
+    Error::Boolean => f.write_str("malformed boolean"),
+    Error::Integer => f.write_str("malformed or out-of-range integer"),
+    Error::Null => f.write_str("null with contents"),
+    Error::BitString => f.write_str("malformed bit string"),
+    Error::Oid => f.write_str("malformed object identifier"),
+    Error::Charset => f.write_str("characters outside the string type's set"),
+    Error::Time => f.write_str("malformed time"),
+    Error::SetOrder => f.write_str("set elements out of order or repeated"),
+    Error::Implicit => f.write_str("a tag needs exactly one element under it"),
+});
 
 /// A tag's class: who defined its number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

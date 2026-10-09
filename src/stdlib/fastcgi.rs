@@ -27,8 +27,7 @@
 //! plays a web server does the reverse with [`Request::to_bytes`] and a
 //! [`Client`].
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Each stream a request carries has a size limit, and so do the
+//! Each stream a request carries has a size limit, and so do the
 //! bytes a decoder holds, the stream bytes held across all open requests,
 //! and the number of requests open at once.
 //!
@@ -75,7 +74,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 extern crate alloc;
 
 use alloc::{collections::BTreeMap, vec::Vec};
@@ -298,47 +296,41 @@ impl Error {
     }
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::Version(v) => write!(f, "FastCGI version {v}, not 1"),
-            Error::RecordTruncated => f.write_str("input ended before a complete FastCGI record"),
-            Error::Trailing => f.write_str("bytes follow the FastCGI record"),
-            Error::RecordTooLong { length, limit } => {
-                write!(f, "record length {length} exceeds {limit}")
-            }
-            Error::BodyLength => f.write_str("record body is not 8 bytes"),
-            Error::PairTruncated => f.write_str("name and value pair runs past the end"),
-            Error::TooManyPairs => write!(f, "more than {MAX_PAIRS} name and value pairs"),
-            Error::PairsTooLong => write!(f, "pairs exceed {MAX_PARAMS} bytes"),
-            Error::SequenceTruncated => f.write_str("input ends before completion"),
-            Error::Unexpected => f.write_str("unexpected record in sequence"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Body { id, kind } => {
-                write!(f, "request {id}: malformed body in record type {kind}")
-            }
-            Error::UnknownRole { id, role } => write!(f, "request {id}: unknown role {role}"),
-            Error::TooManyRequests { id } => {
-                write!(f, "request {id}: more than {MAX_REQUESTS} open")
-            }
-            Error::TooLarge { id, kind } => {
-                write!(f, "request {id}: stream of record type {kind} too large")
-            }
-            Error::Duplicate { id } => write!(f, "request {id}: begun twice"),
-            Error::AfterEnd { id, kind } => {
-                write!(f, "request {id}: record type {kind} after its stream ended")
-            }
-            Error::OutOfOrder { id, kind } => {
-                write!(
-                    f,
-                    "request {id}: record type {kind} before the streams ahead of it ended"
-                )
-            }
-        }
+fictionet::error_display!(Error, f, {
+    Error::Version(v) => write!(f, "FastCGI version {v}, not 1"),
+    Error::RecordTruncated => f.write_str("input ended before a complete FastCGI record"),
+    Error::Trailing => f.write_str("bytes follow the FastCGI record"),
+    Error::RecordTooLong { length, limit } => {
+        write!(f, "record length {length} exceeds {limit}")
     }
-}
-
-impl core::error::Error for Error {}
+    Error::BodyLength => f.write_str("record body is not 8 bytes"),
+    Error::PairTruncated => f.write_str("name and value pair runs past the end"),
+    Error::TooManyPairs => write!(f, "more than {MAX_PAIRS} name and value pairs"),
+    Error::PairsTooLong => write!(f, "pairs exceed {MAX_PARAMS} bytes"),
+    Error::SequenceTruncated => f.write_str("input ends before completion"),
+    Error::Unexpected => f.write_str("unexpected record in sequence"),
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Body { id, kind } => {
+        write!(f, "request {id}: malformed body in record type {kind}")
+    }
+    Error::UnknownRole { id, role } => write!(f, "request {id}: unknown role {role}"),
+    Error::TooManyRequests { id } => {
+        write!(f, "request {id}: more than {MAX_REQUESTS} open")
+    }
+    Error::TooLarge { id, kind } => {
+        write!(f, "request {id}: stream of record type {kind} too large")
+    }
+    Error::Duplicate { id } => write!(f, "request {id}: begun twice"),
+    Error::AfterEnd { id, kind } => {
+        write!(f, "request {id}: record type {kind} after its stream ended")
+    }
+    Error::OutOfOrder { id, kind } => {
+        write!(
+            f,
+            "request {id}: record type {kind} before the streams ahead of it ended"
+        )
+    }
+});
 
 impl Record {
     /// A record carrying `content`, padded to a multiple of 8 bytes as the
@@ -356,30 +348,28 @@ impl Record {
     /// Reads the record at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the record and how many bytes
     /// of `b` it took, padding included.
-    fn parse_prefix(b: &[u8]) -> Result<Option<(Record, usize)>, Error> {
+    fn parse_prefix(b: &[u8], limit: usize) -> Result<Option<(Record, usize)>, Error> {
         // A bad version is known from the first byte.
         match b.first() {
             None => return Ok(None),
             Some(&v) if v != VERSION => return Err(Error::Version(v)),
             Some(_) => {}
         }
-        if b.len() < HEADER_LEN {
-            return Ok(None);
-        }
-        let Some(content_len) = be16(b, 4).map(usize::from) else {
+        let Some(&[_, kind, id_hi, id_lo, hi, lo, padding, _]) = b.get(..HEADER_LEN) else {
             return Ok(None);
         };
-        let Some(request_id) = be16(b, 2) else {
-            return Ok(None);
-        };
-        let padding = b[6];
+        let content_len = usize::from(u16::from_be_bytes([hi, lo]));
+        let request_id = u16::from_be_bytes([id_hi, id_lo]);
         let content_end = HEADER_LEN + content_len;
         let end = content_end + usize::from(padding);
+        if end > limit {
+            return Err(Error::RecordTooLong { length: end, limit });
+        }
         if b.len() < end {
             return Ok(None);
         }
         let record = Record {
-            kind: b[1],
+            kind,
             request_id,
             content: b[HEADER_LEN..content_end].to_vec(),
             padding,
@@ -453,7 +443,7 @@ impl Wire for Record {
     /// Reads exactly one record, including padding. Refuses a version other
     /// than 1, incomplete input, and trailing bytes. Padding bytes may hold anything.
     fn parse(b: &[u8]) -> Result<Self, Error> {
-        match Self::parse_prefix(b)? {
+        match Self::parse_prefix(b, MAX_RECORD)? {
             Some((record, used)) if used == b.len() => Ok(record),
             Some(_) => Err(Error::Trailing),
             None => Err(Error::RecordTruncated),
@@ -480,66 +470,33 @@ impl Wire for Record {
     }
 }
 
-fn parse_record_limited(b: &[u8], limit: usize) -> Result<Option<(Record, usize)>, Error> {
-    // Preserve Record::parse error ordering: Version comes before TooLong.
-    if let Some(&version) = b.first()
-        && version != VERSION
-    {
-        return Err(Error::Version(version));
-    }
-    if let Some(&[_, _, _, _, hi, lo, padding, _]) = b.get(..HEADER_LEN) {
-        // The two length fields bound this sum by MAX_RECORD.
-        let length = HEADER_LEN
-            .saturating_add(usize::from(u16::from_be_bytes([hi, lo])))
-            .saturating_add(usize::from(padding));
-        if length > limit {
-            return Err(Error::RecordTooLong { length, limit });
-        }
-    }
-    Record::parse_prefix(b)
-}
-
-/// Reads FastCGI records without holding input bytes.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`Frames::limit`](fictionet::stdlib::codec::Frames::limit).
-/// Partial records return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
-/// truncation at EOF and framing errors once. Body parsing stays separate.
-///
-/// ```
-/// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-/// use fictionet::stdlib::fastcgi::{Record, kind};
-///
-/// let record = Record { kind: kind::STDIN, request_id: 1, content: vec![7, 8], padding: 0 };
-/// let bytes = Wire::to_bytes(&record)?;
-/// let mut stream = Stream::new(Frames::<Record>::new());
-/// let mut records = Vec::new();
-/// pump(&mut stream, &bytes[..3], |record| records.push(record))?;
-/// pump(&mut stream, &bytes[3..], |record| records.push(record))?;
-/// finish(&mut stream, |record| records.push(record))?;
-/// assert_eq!(records, [record]);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-impl Prefixed for Record {
-    type Item = Record;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "FastCGI";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_RECORD
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.clamp(HEADER_LEN, MAX_RECORD)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        *limit
-    }
+fictionet::prefixed! {
+    /// Reads FastCGI records without holding input bytes.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`Frames::limit`](fictionet::stdlib::codec::Frames::limit).
+    /// Partial records return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
+    /// truncation at EOF and framing errors once. Body parsing stays separate.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::Frames;
+    /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+    /// use fictionet::stdlib::fastcgi::{Record, kind};
+    ///
+    /// let record = Record { kind: kind::STDIN, request_id: 1, content: vec![7, 8], padding: 0 };
+    /// let bytes = Wire::to_bytes(&record)?;
+    /// let mut stream = Stream::new(Frames::<Record>::new());
+    /// let mut records = Vec::new();
+    /// pump(&mut stream, &bytes[..3], |record| records.push(record))?;
+    /// pump(&mut stream, &bytes[3..], |record| records.push(record))?;
+    /// finish(&mut stream, |record| records.push(record))?;
+    /// assert_eq!(records, [record]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    Record => (Record, Error, usize);
+    name = "FastCGI";
+    default { MAX_RECORD }
+    normalize(limit) { limit.clamp(HEADER_LEN, MAX_RECORD) }
+    capacity(limit) { *limit }
 
     #[inline]
     fn parse_prefix(
@@ -547,7 +504,7 @@ impl Prefixed for Record {
         limit: &Self::Limit,
     ) -> Result<Option<(Self::Item, usize)>, Self::Error> {
         let limit = *limit;
-        parse_record_limited(input, limit)
+        Record::parse_prefix(input, limit)
     }
 }
 
@@ -948,7 +905,8 @@ fn read_sequence<T>(
 ) -> Result<T, Error> {
     let mut id = None;
     while !bytes.is_empty() {
-        let (record, used) = Record::parse_prefix(bytes)?.ok_or(Error::SequenceTruncated)?;
+        let (record, used) =
+            Record::parse_prefix(bytes, MAX_RECORD)?.ok_or(Error::SequenceTruncated)?;
         if id.is_some_and(|id| id != record.request_id) {
             return Err(Error::Unexpected);
         }

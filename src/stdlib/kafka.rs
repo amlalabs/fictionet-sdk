@@ -31,8 +31,7 @@
 //! have full bodies. Every other API, and any other version, keeps its
 //! body as bytes.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Lengths, counts and frame sizes are bounded by the limits below,
+//! Lengths, counts and frame sizes are bounded by the limits below,
 //! and by the bytes that are there. A parsed body can take a few dozen
 //! times its size in memory, since each field of a few bytes becomes a
 //! struct. A world that wants less sets a lower frame limit with
@@ -74,7 +73,6 @@
 
 #[cfg(test)]
 use fictionet::stdlib::codec::Frames;
-use fictionet::stdlib::codec::Prefixed;
 extern crate alloc;
 
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
@@ -268,32 +266,26 @@ pub enum Error {
     Invalid(&'static str),
 }
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::Truncated => f.write_str("bytes end in the middle of a field"),
-            Error::FrameSize(n) => write!(f, "frame size {n} is negative or over the limit"),
-            Error::TooLarge(n) => write!(f, "input of {n} bytes is over its size limit"),
-            Error::Varint => f.write_str("varint is too long"),
-            Error::Length(n) => write!(f, "length {n} is out of range"),
-            Error::Utf8 => f.write_str("string is not UTF-8"),
-            Error::Null => f.write_str("null where this version does not allow one"),
-            Error::TagOrder(t) => write!(f, "tagged field {t} is out of order"),
-            Error::HeaderVersion(v) => write!(f, "header version {v} is not one this module reads"),
-            Error::UnsupportedVersion {
-                api_key,
-                api_version,
-            } => {
-                write!(f, "no full body for API {api_key} version {api_version}")
-            }
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Trailing(n) => write!(f, "{n} bytes left after the last field"),
-            Error::Invalid(what) => write!(f, "not allowed: {what}"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::Truncated => f.write_str("bytes end in the middle of a field"),
+    Error::FrameSize(n) => write!(f, "frame size {n} is negative or over the limit"),
+    Error::TooLarge(n) => write!(f, "input of {n} bytes is over its size limit"),
+    Error::Varint => f.write_str("varint is too long"),
+    Error::Length(n) => write!(f, "length {n} is out of range"),
+    Error::Utf8 => f.write_str("string is not UTF-8"),
+    Error::Null => f.write_str("null where this version does not allow one"),
+    Error::TagOrder(t) => write!(f, "tagged field {t} is out of order"),
+    Error::HeaderVersion(v) => write!(f, "header version {v} is not one this module reads"),
+    Error::UnsupportedVersion {
+        api_key,
+        api_version,
+    } => {
+        write!(f, "no full body for API {api_key} version {api_version}")
     }
-}
-
-impl core::error::Error for Error {}
+    Error::Unwritable => f.write_str("value cannot be written without changing it"),
+    Error::Trailing(n) => write!(f, "{n} bytes left after the last field"),
+    Error::Invalid(what) => write!(f, "not allowed: {what}"),
+});
 
 /// One tagged field: a tag number and its value's bytes, unread. Flexible
 /// versions end each structure with a list of these, so new fields can be
@@ -895,49 +887,35 @@ impl Wire for Frame {
     }
 }
 
-/// Reads Kafka frames without holding input bytes.
-///
-/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`SIZE_LEN`] plus
-/// [`Frames::limit`](fictionet::stdlib::codec::Frames::limit). Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
-/// The stream reports truncation at EOF and framing errors once. Map frames
-/// through [`Request::parse`] to receive body errors as items.
-///
-/// ```
-/// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
-/// use fictionet::stdlib::kafka::Request;
-///
-/// let bytes = [0, 0, 0, 11, 0, 18, 0, 0, 0, 0, 0, 1, 0, 1, b'x'];
-/// let mut stream = Stream::new(Frames::<fictionet::stdlib::kafka::Frame>::new().map(|frame| Request::parse(&frame.0)));
-/// let mut requests = Vec::new();
-/// pump(&mut stream, &bytes[..2], |request| requests.push(request))?;
-/// pump(&mut stream, &bytes[2..], |request| requests.push(request))?;
-/// finish(&mut stream, |request| requests.push(request))?;
-/// assert_eq!(requests.len(), 1);
-/// assert_eq!(requests[0].as_ref().unwrap().header.client_id.as_deref(), Some("x"));
-/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::kafka::Error>>(())
-/// ```
-impl Prefixed for Frame {
-    type Item = Frame;
-    type Error = Error;
-    type Limit = usize;
-    const NAME: &'static str = "Kafka";
-
-    #[inline]
-    fn default_limit() -> Self::Limit {
-        MAX_FRAME
-    }
-
-    #[inline]
-    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
-        limit.min(MAX_FRAME)
-    }
-
-    #[inline]
-    fn capacity(limit: &Self::Limit) -> usize {
-        let limit = *limit;
-        SIZE_LEN.saturating_add(limit)
-    }
+fictionet::prefixed! {
+    /// Reads Kafka frames without holding input bytes.
+    ///
+    /// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`SIZE_LEN`] plus
+    /// [`Frames::limit`](fictionet::stdlib::codec::Frames::limit). Partial frames return [`fictionet::stdlib::codec::Step::Need`], including at EOF.
+    /// The stream reports truncation at EOF and framing errors once. Map frames
+    /// through [`Request::parse`] to receive body errors as items.
+    ///
+    /// ```
+    /// use fictionet::stdlib::codec::Frames;
+    /// use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
+    /// use fictionet::stdlib::kafka::Request;
+    ///
+    /// let bytes = [0, 0, 0, 11, 0, 18, 0, 0, 0, 0, 0, 1, 0, 1, b'x'];
+    /// let mut stream = Stream::new(Frames::<fictionet::stdlib::kafka::Frame>::new().map(|frame| Request::parse(&frame.0)));
+    /// let mut requests = Vec::new();
+    /// pump(&mut stream, &bytes[..2], |request| requests.push(request))?;
+    /// pump(&mut stream, &bytes[2..], |request| requests.push(request))?;
+    /// finish(&mut stream, |request| requests.push(request))?;
+    /// assert_eq!(requests.len(), 1);
+    /// assert_eq!(requests[0].as_ref().unwrap().header.client_id.as_deref(), Some("x"));
+    /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::kafka::Error>>(())
+    /// ```
+    Frame => (Frame, Error, usize);
+    name = "Kafka";
+    default { MAX_FRAME }
+    normalize(limit) { limit.min(MAX_FRAME) }
+    capacity(limit) { let limit = *limit;
+        SIZE_LEN.saturating_add(limit) }
 
     #[inline]
     fn parse_prefix(
@@ -1963,19 +1941,9 @@ impl Response {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
-impl From<Trailing> for Error {
-    #[inline]
-    fn from(error: Trailing) -> Self {
-        Error::Trailing(error.0)
-    }
-}
+fictionet::codec_from!(Error, Trailing, |error| Error::Trailing(error.0));
 
 #[cfg(test)]
 mod tests {

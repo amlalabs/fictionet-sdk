@@ -23,8 +23,7 @@
 //! to the connection. Which exchanges and queues exist, and where a message
 //! goes, is up to world code.
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. A frame the stream cannot hold breaks the stream with a
+//! A frame the stream cannot hold breaks the stream with a
 //! [`Error`]. A payload that breaks the specification gives a
 //! [`Error`], whose [`Error::reply_code`] is the code a broker
 //! closes the connection with. Writers return an [`Error`] rather
@@ -341,58 +340,52 @@ impl Error {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::ProtocolHeader(b) => write!(f, "protocol header {b:02x?}, not AMQP 0-9-1"),
-            Error::Type(t) => write!(f, "frame type {t}, not one AMQP 0-9-1 defines"),
-            Error::Heartbeat { channel, size } => {
-                write!(
-                    f,
-                    "heartbeat frame on channel {channel} with {size} bytes; it must be on 0 and empty"
-                )
-            }
-            Error::FrameTooLarge { size, frame_max } => {
-                write!(
-                    f,
-                    "frame payload of {size} bytes is over the frame-max of {frame_max}"
-                )
-            }
-            Error::FrameEnd(b) => write!(f, "frame ends with 0x{b:02x}, not 0xce"),
-            Error::ChannelZero(k) => write!(
-                f,
-                "{k:?} frame on channel 0, which is for the connection alone"
-            ),
-            Error::NotChannelZero { channel } => {
-                write!(f, "connection method on channel {channel}; it must be on 0")
-            }
-            Error::Truncated => f.write_str("AMQP frame or payload ends early"),
-            Error::Trailing => f.write_str("bytes left after the AMQP frame or the last field"),
-            Error::UnknownMethod {
-                class_id,
-                method_id,
-            } => {
-                write!(f, "unknown method {class_id}.{method_id}")
-            }
-            Error::Utf8 => f.write_str("short string is not UTF-8"),
-            Error::FieldType(t) => write!(f, "unknown field value type 0x{t:02x}"),
-            Error::TooDeep => write!(f, "field tables nested deeper than {MAX_DEPTH}"),
-            Error::ContentClass(c) => write!(f, "content header for class {c}, not basic (60)"),
-            Error::PropertyFlags(p) => {
-                write!(f, "property flags 0x{p:04x} set bits basic does not define")
-            }
-            Error::PayloadTooLarge(n) => {
-                write!(f, "payload of {n} bytes is more than a frame holds")
-            }
-            Error::ZeroByte => f.write_str("short string holds a zero byte"),
-            Error::DuplicateField => f.write_str("field table names a field twice"),
-            Error::Weight(w) => write!(f, "content header weight {w}, not 0"),
-            Error::Unwritable => f.write_str("AMQP value cannot be written without changing it"),
-        }
+fictionet::error_display!(Error, f, {
+    Error::ProtocolHeader(b) => write!(f, "protocol header {b:02x?}, not AMQP 0-9-1"),
+    Error::Type(t) => write!(f, "frame type {t}, not one AMQP 0-9-1 defines"),
+    Error::Heartbeat { channel, size } => {
+        write!(
+            f,
+            "heartbeat frame on channel {channel} with {size} bytes; it must be on 0 and empty"
+        )
     }
-}
-
-impl std::error::Error for Error {}
+    Error::FrameTooLarge { size, frame_max } => {
+        write!(
+            f,
+            "frame payload of {size} bytes is over the frame-max of {frame_max}"
+        )
+    }
+    Error::FrameEnd(b) => write!(f, "frame ends with 0x{b:02x}, not 0xce"),
+    Error::ChannelZero(k) => write!(
+        f,
+        "{k:?} frame on channel 0, which is for the connection alone"
+    ),
+    Error::NotChannelZero { channel } => {
+        write!(f, "connection method on channel {channel}; it must be on 0")
+    }
+    Error::Truncated => f.write_str("AMQP frame or payload ends early"),
+    Error::Trailing => f.write_str("bytes left after the AMQP frame or the last field"),
+    Error::UnknownMethod {
+        class_id,
+        method_id,
+    } => {
+        write!(f, "unknown method {class_id}.{method_id}")
+    }
+    Error::Utf8 => f.write_str("short string is not UTF-8"),
+    Error::FieldType(t) => write!(f, "unknown field value type 0x{t:02x}"),
+    Error::TooDeep => write!(f, "field tables nested deeper than {MAX_DEPTH}"),
+    Error::ContentClass(c) => write!(f, "content header for class {c}, not basic (60)"),
+    Error::PropertyFlags(p) => {
+        write!(f, "property flags 0x{p:04x} set bits basic does not define")
+    }
+    Error::PayloadTooLarge(n) => {
+        write!(f, "payload of {n} bytes is more than a frame holds")
+    }
+    Error::ZeroByte => f.write_str("short string holds a zero byte"),
+    Error::DuplicateField => f.write_str("field table names a field twice"),
+    Error::Weight(w) => write!(f, "content header weight {w}, not 0"),
+    Error::Unwritable => f.write_str("AMQP value cannot be written without changing it"),
+});
 
 impl Frame {
     /// Reads the frame at the start of `b`, allowing frames up to
@@ -512,13 +505,12 @@ impl Wire for Frame {
             return Err(Error::Unwritable);
         }
         channel_rules(self.kind, self.channel, &self.payload).map_err(|_| Error::Unwritable)?;
-        let mut bytes = Vec::with_capacity(FRAME_HEADER_LEN + self.payload.len() + 1);
-        bytes.push(self.kind.code());
-        bytes.extend_from_slice(&self.channel.to_be_bytes());
-        bytes.extend_from_slice(&size.to_be_bytes());
-        bytes.extend_from_slice(&self.payload);
-        bytes.push(FRAME_END);
-        out.extend_from_slice(&bytes);
+        out.reserve(FRAME_HEADER_LEN + self.payload.len() + 1);
+        out.push(self.kind.code());
+        out.extend_from_slice(&self.channel.to_be_bytes());
+        out.extend_from_slice(&size.to_be_bytes());
+        out.extend_from_slice(&self.payload);
+        out.push(FRAME_END);
         Ok(())
     }
 }
@@ -2470,12 +2462,7 @@ impl Writer {
     }
 }
 
-impl From<Truncated> for Error {
-    #[inline]
-    fn from(_: Truncated) -> Self {
-        Error::Truncated
-    }
-}
+fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
 #[cfg(test)]
 mod tests {

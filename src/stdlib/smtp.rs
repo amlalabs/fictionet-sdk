@@ -647,22 +647,15 @@ impl Wire for Reply {
     /// Reads one complete reply. Refuses trailing bytes, missing CRLF,
     /// invalid codes or text, mismatched continuation codes, and limits
     /// above [`MAX_LINE`], [`MAX_REPLY_LINES`], or [`MAX_REPLY_TEXT`].
-    fn parse(mut bytes: &[u8]) -> Result<Self, Error> {
-        let mut replies = Replies::new();
-        loop {
-            let step = replies.decode(bytes, true);
-            match step.map_err(|e| e.reply_line().unwrap_or(Error::Framing(e)))? {
-                codec::Step::Item(reply, used) => {
-                    let reply = reply?;
-                    if used != bytes.len() {
-                        return Err(Error::Trailing);
-                    }
-                    return Ok(reply);
-                }
-                codec::Step::Skip(used) => bytes = bytes.get(used..).ok_or(Error::Incomplete)?,
-                _ => return Err(Error::Incomplete),
-            }
-        }
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        fictionet::stdlib::codec::decode_exact(
+            Replies::new(),
+            bytes,
+            |e| e,
+            |e| e.reply_line().unwrap_or(Error::Framing(e)),
+            Error::Incomplete,
+            Error::Trailing,
+        )
     }
 
     /// Appends the reply with CRLF. Refuses invalid codes, empty or
