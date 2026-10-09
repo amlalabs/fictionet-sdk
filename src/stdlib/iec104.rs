@@ -273,8 +273,7 @@ fictionet::prefixed! {
     /// The stream reports truncation at EOF and framing errors once.
     Frame => (Frame, Error, ());
     name = "IEC 104";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_FRAME }
 
     /// Reads an APDU prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.

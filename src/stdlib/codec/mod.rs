@@ -1,6 +1,5 @@
 //! Bounded byte decoders, wire values, and the stream that drives them.
 //!
-//! Readers check lengths because an agent can send arbitrary bytes.
 //! Every protocol module in the stdlib is built from these pieces. A
 //! [`Decode`] is a framer. It reads a slice of unread input and returns a
 //! [`Step`]: an item and how many bytes it used, a request for more bytes,
@@ -276,6 +275,7 @@ pub trait Decode {
 
 /// A complete wire value with an exact parser and a strict writer.
 ///
+/// Readers check lengths because an agent can send arbitrary bytes.
 /// Implementations must bound values by named limits. Successful writes
 /// must parse as the same value. An unsuccessful write must leave the
 /// destination unchanged. Context-dependent formats use ordinary functions.

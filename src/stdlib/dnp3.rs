@@ -239,8 +239,7 @@ fictionet::prefixed! {
     /// The stream reports truncation at EOF and framing errors once.
     Frame => (Frame, Error, ());
     name = "DNP3";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_FRAME }
 
     /// Reads a frame prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.

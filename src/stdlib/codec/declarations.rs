@@ -28,12 +28,13 @@ macro_rules! codec_from {
 
 /// Implements prefix framing with local limits, capacity, and parser items.
 /// Metadata bodies retain their protocol's payload or whole-frame limit rules.
+/// Omitting `normalize` keeps the supplied limit unchanged.
 #[macro_export]
 macro_rules! prefixed {
     ($(#[$attr:meta])* $ty:ty => ($item:ty, $error:ty, $limit:ty);
      name = $name:expr;
      default $default:block
-     normalize($n:pat_param) $normalize:block
+     $(normalize($n:pat_param) $normalize:block)?
      capacity($c:pat_param) $capacity:block
      $($parser:item)*) => {
         $(#[$attr])*
@@ -44,8 +45,8 @@ macro_rules! prefixed {
             const NAME: &'static str = $name;
             #[inline]
             fn default_limit() -> Self::Limit { $default }
-            #[inline]
-            fn normalize_limit($n: Self::Limit) -> Self::Limit { $normalize }
+            $(#[inline]
+            fn normalize_limit($n: Self::Limit) -> Self::Limit { $normalize })?
             #[inline]
             fn capacity($c: &Self::Limit) -> usize { $capacity }
             $($parser)*

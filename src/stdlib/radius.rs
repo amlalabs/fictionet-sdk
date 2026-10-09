@@ -1434,7 +1434,7 @@ macro_rules! attributes {
         /// [`DICTIONARY`] under its RFC name, such as User-Name for
         /// [`attr::USER_NAME`].
         pub mod attr {
-            $(#[doc = concat!("The `", stringify!($id), "` attribute type.")]
+            $(#[doc = concat!("The ", $name, " attribute type.")]
             pub const $id: u8 = $number;)*
         }
         /// The standard attributes, by type number, with the data types the IANA

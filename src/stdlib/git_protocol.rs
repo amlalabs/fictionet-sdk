@@ -177,8 +177,7 @@ fictionet::prefixed! {
     /// preserve unread bytes; [`codec::Frames<Packet>`](fictionet::stdlib::codec::Frames) cannot parse raw PACK data.
     Packet => (Packet, Error, ());
     name = "Git pkt-line";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_PACKET }
 
     #[inline]

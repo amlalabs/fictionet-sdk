@@ -1539,8 +1539,7 @@ fictionet::prefixed! {
     /// Partial instructions return [`Step::Need`], including at EOF.
     EncoderInstruction => (Result<EncoderInstruction, Error>, Error, ());
     name = "QPACK encoder stream";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_INSTRUCTION }
 
     #[inline]
@@ -1625,8 +1624,7 @@ fictionet::prefixed! {
     /// table or pending output queue.
     DecoderInstruction => (Result<DecoderInstruction, Error>, Error, ());
     name = "QPACK decoder stream";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_INTEGER_BYTES }
 
     #[inline]

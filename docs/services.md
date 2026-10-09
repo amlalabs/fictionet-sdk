@@ -317,7 +317,8 @@ such as LDAP attributes, go under one field as an object.
 
 The [event log](../src/events.rs) documents retention, repeat aggregation,
 late subscribers and dropped-event reporting. Sum `count` when grading
-packet repeats; a 65,535-port scan remains a few events per second.
+packet repeats; a port scan of 65,535 ports to one machine costs a couple of
+events a second.
 
 The run waits for file writers at shutdown. Discard a sample if
 [`EventLog::lost`](../src/events.rs) is nonzero.

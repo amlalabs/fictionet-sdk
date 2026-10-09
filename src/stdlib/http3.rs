@@ -1844,8 +1844,7 @@ fictionet::prefixed! {
     /// reports truncation. Allocation grows only when the driver receives bytes.
     Frame => (Result<Frame, Error>, Error, ());
     name = "HTTP/3 frames";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_FRAME }
 
     #[inline]

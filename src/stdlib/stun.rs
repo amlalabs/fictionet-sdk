@@ -911,8 +911,7 @@ fictionet::prefixed! {
     /// Partial input needs more bytes, including at EOF. The stream reports truncation.
     Frame => (Vec<u8>, Error, ());
     name = "STUN";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_) { MAX_MESSAGE }
     fn parse_prefix(input: &[u8], _: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Error> {
         Ok(header(input)?.map(|total| (input[..total].to_vec(), total)))

@@ -320,8 +320,7 @@ fictionet::prefixed! {
     /// reports truncation.
     Packet => (Packet, Infallible, ());
     name = "EtherNet/IP";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { PACKETS_CAPACITY }
 
     /// Reads a packet prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.

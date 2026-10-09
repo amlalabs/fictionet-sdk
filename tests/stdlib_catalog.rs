@@ -5,8 +5,8 @@
 //! source of truth:
 //!
 //! - the module list against the files in `src/stdlib/`;
-//! - **Wire**, **Decode** (including `Prefixed`) and **Service** against the `impl` blocks in the
-//!   module's file, excluding private types (comments are skipped first,
+//! - **Wire**, **Decode** (including `Prefixed`) and **Service** against declarations
+//!   in the module's file, excluding private types (comments are skipped first,
 //!   so a doctest's example impl does not count);
 //! - **State** against the `pub struct` and `pub enum` declarations;
 //! - **Observe** against the built-ins the default registry gets in
@@ -162,31 +162,45 @@ fn modules_on_disk() -> BTreeMap<String, Vec<PathBuf>> {
 /// A module's source with every comment line taken out, so that doc
 /// examples do not count as implementations.
 fn code(files: &[PathBuf]) -> String {
-    let mut out = String::new();
-    for file in files {
-        out.push_str(&rust_docs::parts(&fs::read_to_string(file).unwrap()).0);
-    }
-    out
+    files
+        .iter()
+        .map(|file| rust_docs::parts(&fs::read_to_string(file).unwrap()).0)
+        .collect()
 }
 
 /// The identifier right after each occurrence of `needle`.
-fn idents_after<'a>(code: &'a str, needle: &str) -> BTreeSet<&'a str> {
-    code.match_indices(needle)
-        .map(|(i, _)| {
-            let rest = &code[i + needle.len()..];
-            let end = rest
-                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .unwrap_or(rest.len());
-            &rest[..end]
+fn idents_after<'a>(code: &'a str, needle: &'a str) -> impl Iterator<Item = &'a str> {
+    code.split(needle)
+        .skip(1)
+        .filter_map(|rest| {
+            rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()
         })
         .filter(|s| !s.is_empty())
-        .collect()
+}
+
+fn catalog_impl(code: &str, trait_name: &str) -> bool {
+    let needle = format!("{trait_name} for ");
+    let (declaration, type_index, separator) = match trait_name {
+        "Wire" => ("text_wire!(", 2, ","),
+        "Prefixed" => ("prefixed! {", 0, "=> ("),
+        _ => ("", 0, ""),
+    };
+    let declared = code
+        .split(declaration)
+        .skip(1)
+        .take_while(|_| !declaration.is_empty())
+        .filter_map(|call| call.split(separator).nth(type_index));
+    code.contains(&format!("{needle}$"))
+        || idents_after(code, &needle)
+            .chain(declared)
+            .any(|name| catalog_type(code, name.trim()))
 }
 
 fn declares(code: &str, name: &str) -> bool {
     ["pub struct ", "pub enum "]
         .iter()
-        .any(|kw| idents_after(code, kw).contains(name))
+        .any(|kw| idents_after(code, kw).any(|n| n == name))
 }
 
 // Macro-generated types are checked by their modules' compile tests. Exclude
@@ -195,7 +209,7 @@ fn catalog_type(code: &str, name: &str) -> bool {
     declares(code, name)
         || !["struct ", "enum "]
             .iter()
-            .any(|keyword| idents_after(code, keyword).contains(name))
+            .any(|keyword| idents_after(code, keyword).any(|n| n == name))
 }
 
 #[test]
@@ -205,6 +219,16 @@ fn private_helpers_do_not_count_as_catalog_types() {
     assert!(!catalog_type(source, "Dns"));
     assert!(!catalog_type(source, "Internal"));
     assert!(catalog_type(source, "Public"));
+    for (name, declaration) in [
+        ("Prefixed", "fictionet::prefixed! { A => (A, E, ()); }"),
+        ("Wire", "fictionet::text_wire!(E, LIMIT, A, parse, write);"),
+        ("Wire", "der_wire!(asn1, impl Wire for A, E, E::Bad);"),
+        ("Decode", "impl Decode for A {}"),
+    ] {
+        assert!(!catalog_impl("pub struct A;", name));
+        assert!(catalog_impl(&format!("pub struct A; {declaration}"), name));
+        assert!(!catalog_impl(&format!("struct A; {declaration}"), name));
+    }
 }
 
 fn hidden_modules() -> BTreeSet<&'static str> {
@@ -322,27 +346,17 @@ fn wire_decode_and_service_columns_match_the_impls() {
         let code = code(&modules[&row.module]);
         assert_eq!(
             row.wire,
-            idents_after(&code, "Wire for ")
-                .iter()
-                .any(|name| catalog_type(&code, name))
-                || code.contains("Wire for $")
-                || code.contains("codec::layout!"),
+            catalog_impl(&code, "Wire") || code.contains("codec::layout!"),
             "{}: the Wire column",
             row.module
         );
         assert_eq!(
             row.decode,
-            ["Decode for ", "Prefixed for "].iter().any(|needle| {
-                code.contains(&format!("{needle}$"))
-                    || idents_after(&code, needle)
-                        .iter()
-                        .any(|name| catalog_type(&code, name))
-            }),
+            catalog_impl(&code, "Decode") || catalog_impl(&code, "Prefixed"),
             "{}: the Decode column",
             row.module
         );
         let services: BTreeSet<String> = idents_after(&code, "Service for ")
-            .into_iter()
             .filter(|name| catalog_type(&code, name))
             .map(str::to_owned)
             .collect();

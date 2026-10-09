@@ -507,8 +507,7 @@ fictionet::prefixed! {
     /// Slow-path framing uses the shared [`tpkt`] parser.
     Frame => (Frame, Error, ());
     name = "RDP";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_FRAME }
 
     /// Reads a frame prefix, returning [`fictionet::stdlib::codec::Step::Need`] while incomplete.

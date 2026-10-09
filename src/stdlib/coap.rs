@@ -1333,8 +1333,7 @@ fictionet::prefixed! {
     /// ```
     Frame => (Frame, Error, ());
     name = "CoAP over TCP";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_BUFFERED }
 
     #[inline]

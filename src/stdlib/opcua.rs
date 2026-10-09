@@ -2139,7 +2139,6 @@ fictionet::prefixed! {
     Chunk => (Chunk, Error, Limits);
     name = "OPC UA TCP";
     default { Limits::default() }
-    normalize(limit) { limit }
     capacity(limit) { let limit = *limit;
         limit.chunk_limit().max(MAX_HANDSHAKE_SIZE) as usize }
 

@@ -938,8 +938,7 @@ fictionet::prefixed! {
     /// ```
     Frame => (Frame, Error, ());
     name = "Protobuf";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_VARINT_LEN.saturating_add(MAX_MESSAGE) }
 
     #[inline]

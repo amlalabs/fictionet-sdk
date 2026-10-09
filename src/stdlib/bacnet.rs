@@ -2035,8 +2035,7 @@ fictionet::prefixed! {
     /// It consumes only the header. Read its contents using the service schema.
     Tag => (Tag, Error, ());
     name = "BACnet tag";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { 7 }
 
     /// Reads one header. Refuses reserved tag numbers and application
@@ -2059,8 +2058,7 @@ fictionet::prefixed! {
     /// Context fields use [`ContextValue::read`]; constructed tags use [`codec::Frames<Tag>`](fictionet::stdlib::codec::Frames).
     Value => (Value, Error, ());
     name = "BACnet primitive";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_VALUE_LEN + 7 }
 
     /// Reads one primitive. Refuses context tags, reserved types and invalid

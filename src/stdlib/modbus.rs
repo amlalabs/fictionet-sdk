@@ -283,8 +283,7 @@ fictionet::prefixed! {
     /// ```
     Frame => (Frame, Error, ());
     name = "Modbus/TCP";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_FRAME }
 
     /// Reads one frame. A nonzero protocol ID returns [`Error::Protocol`].

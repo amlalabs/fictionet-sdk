@@ -982,8 +982,7 @@ fictionet::prefixed! {
     /// ```
     Message => (Result<Message, Error>, Infallible, ());
     name = "DHCPv6 over TCP";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_BUFFERED }
 
     #[inline]

@@ -622,8 +622,7 @@ fictionet::prefixed! {
     /// ```
     Frame => (Frame, Error, ());
     name = "BGP";
-    default {  }
-    normalize(limit) { limit }
+    default {}
     capacity(_limit) { MAX_MESSAGE_LEN }
 
     #[inline]
