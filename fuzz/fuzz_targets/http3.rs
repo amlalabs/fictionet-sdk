@@ -11,7 +11,7 @@ use fictionet::stdlib::test_support::decode_all;
 
 use fictionet::stdlib::http3;
 
-use fictionet::stdlib::http3::Endpoint;
+use fictionet::stdlib::codec::Side;
 
 use fictionet::stdlib::http3::Event;
 
@@ -138,9 +138,9 @@ fn shared_qpack(bytes: &[u8], side: MessageSide) {
     let (encoder, requests) = rest.split_at(rest.len() * usize::from(*split) / 256);
     let (first, second) = requests.split_at(requests.len() / 2);
     let (sender, encoder_id) = if side == MessageSide::Request {
-        (Endpoint::Client, 2)
+        (Side::Client, 2)
     } else {
-        (Endpoint::Server, 3)
+        (Side::Server, 3)
     };
     let mut session = Session::new(sender, 3, http3::MAX_FRAME * 2);
     assert_eq!(
@@ -253,7 +253,7 @@ fuzz_target!(|input: &[u8]| {
         bytes,
         2 * StreamItems::unidirectional().capacity(),
     );
-    for sender in [Endpoint::Client, Endpoint::Server] {
+    for sender in [Side::Client, Side::Server] {
         contract::check_decode_with_alloc_limit(
             || http3::ControlFrames::new(sender),
             bytes,

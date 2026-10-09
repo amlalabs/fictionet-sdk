@@ -9,12 +9,12 @@
 //! file to change it. It has the shape of a FIX session: items in, bytes
 //! and events and timers out.
 //!
-//! [`serve`] is the one driver that joins a service to a
+//! [`connection`] is the one driver that joins a service to a
 //! [`Connection`]: it reads, decodes, calls the
 //! service, writes its reply, honors its timers, and closes. [`listen`]
-//! runs `serve` for every connection an [`Accept`] listener accepts, with a
+//! runs [`connection`] for every connection an [`Accept`] listener accepts, with a
 //! cap on how many are open, and TLS first when the options ask for it.
-//! [`serve_datagram`] does the same for a UDP socket. The driver and the
+//! [`datagram`] does the same for a UDP socket. The driver and the
 //! [`Harness`] share one state machine, so a service that passes its
 //! harness tests behaves the same over a real connection.
 //!
@@ -37,7 +37,7 @@
 //!     type State = ();
 //!     type Error = std::convert::Infallible;
 //!     fn decoder(&self) -> Lines { Lines::new(1024, Ending::LfOrCrlf) }
-//!     fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Self::Error> {
+//!     fn on_item(&mut self, line: Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_, Self::Decoder>) -> Result<Flow, Self::Error> {
 //!         let line = line.unwrap_or_default();
 //!         if line == b"quit" {
 //!             return Ok(Flow::Close);
@@ -66,9 +66,9 @@
 //! # impl serve::Service for Echo {
 //! #     type Decoder = fictionet::stdlib::codec::Lines; type State = (); type Error = std::convert::Infallible;
 //! #     fn decoder(&self) -> Self::Decoder { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
-//! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &(), _: &mut serve::Driver<'_>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
+//! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &(), _: &mut serve::Driver<'_, Self::Decoder>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
 //! # }
-//! # fn world(fcx: &Cx, side: fictionet::End) -> Result {
+//! # fn start(fcx: &Cx, side: fictionet::End) -> Result {
 //! let (tcp, _udp, _icmp, _other) = ip::split_protocols(fcx, side);
 //! let machine = tcp::endpoint(fcx, tcp, "10.0.0.10".parse()?);
 //! serve::listen(fcx, machine.listen(7)?, Arc::new(()), || Echo, serve::ServeOptions::default());
@@ -130,7 +130,7 @@
 //!   client half-closed ([`Ended::Eof`]), the service closed, the service's
 //!   decoder failed, the connection sat idle or went over its budget.
 //! - **Stops.** When the world stops, the service hears [`Ended::Cancelled`]
-//!   and [`serve`] returns [`ServeError::Cancelled`], also when the stop
+//!   and [`connection`] returns [`ServeError::Cancelled`], also when the stop
 //!   comes during a TLS handshake. A stop is never a closed or broken
 //!   connection.
 //! - **Upgrades.** A call that returns [`Flow::Upgrade`] says what comes
@@ -155,11 +155,11 @@ use std::time::Duration;
 
 use fictionet::events::{ConnInfo, Event, Level, Sandbox, Transport, opt};
 use fictionet::stdlib::codec::{
-    Buffer, ByteFault, Decode, Direction, Fail, FaultDelay, Faults, ItemFault, Record, Recorder,
-    RewriteError, Rule, Stream, StreamEvent,
+    Buffer, ByteFault, Decode, Fail, FaultDelay, Faults, ItemFault, Record, Recorder, RewriteError,
+    Rule, Side, Stream, StreamEvent,
 };
 use fictionet::stdlib::tls::{self, HandshakeError, ServerConfig, TlsConnection};
-use fictionet::stdlib::{Accept, Accepted, Datagram};
+use fictionet::stdlib::{Accept, Accepted, DatagramSocket};
 use fictionet::stdlib::{ConnError, Connection, ConnectionExt};
 use fictionet::time::Instant;
 use fictionet::{Cancelled, Cx, ErrorChain, RaceError, RecvError, Task};
@@ -199,7 +199,7 @@ pub trait Service: Send + 'static {
     fn on_open(
         &mut self,
         _state: &Self::State,
-        _ctx: &mut Driver<'_>,
+        _ctx: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Self::Error> {
         Ok(Flow::Continue)
     }
@@ -209,7 +209,7 @@ pub trait Service: Send + 'static {
         &mut self,
         item: <Self::Decoder as Decode>::Item,
         state: &Self::State,
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Self::Error>;
 
     /// The timer named `timer`, set with [`Driver::set_timer`], went off.
@@ -217,7 +217,7 @@ pub trait Service: Send + 'static {
         &mut self,
         _timer: Timer,
         _state: &Self::State,
-        _ctx: &mut Driver<'_>,
+        _ctx: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Self::Error> {
         Ok(Flow::Continue)
     }
@@ -227,7 +227,7 @@ pub trait Service: Send + 'static {
     fn on_wake(
         &mut self,
         _state: &Self::State,
-        _ctx: &mut Driver<'_>,
+        _ctx: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Self::Error> {
         Ok(Flow::Continue)
     }
@@ -239,7 +239,7 @@ pub trait Service: Send + 'static {
         _key: u64,
         _done: Done,
         _state: &Self::State,
-        _ctx: &mut Driver<'_>,
+        _ctx: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Self::Error> {
         Ok(Flow::Continue)
     }
@@ -250,7 +250,7 @@ pub trait Service: Send + 'static {
         &mut self,
         _error: &Fail<<Self::Decoder as Decode>::Error>,
         _state: &Self::State,
-        _ctx: &mut Driver<'_>,
+        _ctx: &mut Driver<'_, Self::Decoder>,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -262,7 +262,7 @@ pub trait Service: Send + 'static {
     fn on_decoder_end(
         &mut self,
         _state: &Self::State,
-        _ctx: &mut Driver<'_>,
+        _ctx: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Self::Error> {
         Ok(Flow::Upgrade(Upgrade::Handoff))
     }
@@ -272,7 +272,7 @@ pub trait Service: Send + 'static {
         &mut self,
         _end: Ended,
         _state: &Self::State,
-        _ctx: &mut Driver<'_>,
+        _ctx: &mut Driver<'_, Self::Decoder>,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -313,7 +313,7 @@ pub enum Upgrade {
     /// protocol whose framing changes after a handshake.
     Decoder,
     /// Hand the connection and its unread bytes back to whoever called
-    /// [`serve`] ([`Served::Upgraded`]): a CONNECT tunnel, or a protocol
+    /// [`connection`] ([`Served::Upgraded`]): a CONNECT tunnel, or a protocol
     /// served by other code.
     Handoff,
 }
@@ -347,7 +347,7 @@ pub enum Ended {
     /// broke ([`ConnError::Broken`]).
     Conn(ConnError),
     /// The world is stopping: the region was cancelled. A notification
-    /// for [`Service::on_end`]; [`serve`] itself then returns
+    /// for [`Service::on_end`]; [`connection`] itself then returns
     /// [`ServeError::Cancelled`].
     Cancelled,
 }
@@ -666,14 +666,23 @@ impl Drop for Charge {
 /// The service's side of the driver, for one call: the reply, the clock
 /// reading the driver took, seeded randomness, the events to record, and
 /// what the call asked for. Every [`Service`] method takes it as `driver`.
-pub struct Driver<'a> {
+pub struct Driver<'a, D> {
+    decoder: &'a mut D,
     s: &'a mut Scratch,
     now: Instant,
     conn: &'a ConnInfo,
     timers: &'a [(Timer, Instant)],
 }
 
-impl Driver<'_> {
+impl<D> Driver<'_, D> {
+    /// The active decoder. Access stops item faults for this connection.
+    /// Over UDP, item and failure calls access the current datagram's decoder.
+    /// Other calls use a separate decoder whose changes do not affect datagrams.
+    pub fn decoder(&mut self) -> &mut D {
+        self.s.decoder_touched = true;
+        self.decoder
+    }
+
     /// Bytes to send, after anything already there. Over UDP, they go to
     /// the sender of the datagram being handled, as one datagram.
     pub fn reply(&mut self) -> &mut Vec<u8> {
@@ -769,7 +778,7 @@ impl Driver<'_> {
     }
 
     /// Sends `bytes` as one datagram to `to`. For datagram services
-    /// ([`serve_datagram`]): several per call, to anyone, at any time, such
+    /// ([`datagram`]): several per call, to anyone, at any time, such
     /// as a retransmission in packets that fit the path, or a heartbeat
     /// from [`Service::on_timer`]. A connection's driver drops them.
     pub fn send_to(&mut self, to: SocketAddr, bytes: Vec<u8>) {
@@ -779,6 +788,7 @@ impl Driver<'_> {
 
 /// What the per-connection state looks like to a call.
 struct Scratch {
+    decoder_touched: bool,
     reply: Vec<u8>,
     events: Vec<Event>,
     datagrams: Vec<(SocketAddr, Vec<u8>)>,
@@ -794,6 +804,7 @@ struct Scratch {
 impl Scratch {
     fn new(entropy: Arc<dyn Entropy>) -> Scratch {
         Scratch {
+            decoder_touched: false,
             reply: Vec::new(),
             events: Vec::new(),
             datagrams: Vec::new(),
@@ -842,7 +853,7 @@ fn due(timers: &[(Timer, Instant)], now: Instant) -> Option<usize> {
 /// A panic in world code is the world's bug. Fictionet does not catch it:
 /// it ends the run. The panic's own message says where in the code it
 /// happened; a `PanicNote` alive while it unwinds adds which service and
-/// connection, on standard error. [`serve`], [`serve_datagram`] and
+/// connection, on standard error. [`connection`], [`datagram`] and
 /// HTTP/2 in [`httpd`](fictionet::stdlib::httpd) keep one while they call
 /// world code.
 pub struct PanicNote {
@@ -900,8 +911,8 @@ impl Drop for PanicNote {
 /// The bytes both ways of every connection a driver served, bounded.
 ///
 /// Records items and skipped bytes from the client as the service's
-/// decoder read them ([`Direction::ClientToServer`]), and each write to the
-/// client as one skipped run ([`Direction::ServerToClient`]). Items are
+/// decoder read them ([`Side::Client`]), and each write to the
+/// client as one skipped run ([`Side::Server`]). Items are
 /// kept as their exact bytes only, so one transcript serves any protocol;
 /// failures keep their message. The tag is the connection number.
 #[derive(Clone)]
@@ -935,7 +946,7 @@ impl Transcript {
     fn observe<T, E: core::fmt::Display>(
         &self,
         tag: u64,
-        direction: Direction,
+        direction: Side,
         event: StreamEvent<'_, T, E>,
     ) {
         let mut recorder = self.lock();
@@ -1051,7 +1062,7 @@ pub type SandboxOf = Arc<dyn Fn(std::net::IpAddr) -> Option<Sandbox> + Send + Sy
 /// rejects the handshake with `unrecognized_name`.
 pub type TlsSelect = Arc<dyn Fn(Option<&str>, &Cx) -> Option<Arc<ServerConfig>> + Send + Sync>;
 
-/// How [`listen`] and [`serve`] run.
+/// How [`listen`] and [`connection`] run.
 #[derive(Clone)]
 pub struct ServeOptions {
     /// Connections served at once; past this, a new one is reset as soon
@@ -1208,7 +1219,7 @@ impl ServeOptions {
 // ---------------------------------------------------------------------------
 // Handing back
 
-/// Why [`serve`] stopped early. The connection was closed. For a failure,
+/// Why [`connection`] stopped early. The connection was closed. For a failure,
 /// the run's events have a `conn.error` event that says why.
 #[derive(Debug)]
 pub enum ServeError<E> {
@@ -1249,14 +1260,14 @@ impl<E> From<fictionet::Cancelled> for ServeError<E> {
     }
 }
 
-/// How [`serve`] ended, when it was not cancelled.
+/// How [`connection`] ended, when it was not cancelled.
 #[derive(Debug)]
 pub enum Served<C> {
     /// The connection is closed, or broken. Never [`Ended::Cancelled`]: a
     /// cancel is [`ServeError::Cancelled`].
     Closed(Ended),
     /// The service asked for an upgrade the caller performs: the
-    /// connection with its unread bytes. [`serve`] performs
+    /// connection with its unread bytes. [`connection`] performs
     /// [`Upgrade::Tls`] itself and returns only [`Upgrade::Handoff`].
     Upgraded(Upgrade, Prefixed<C>),
 }
@@ -1352,6 +1363,8 @@ enum Segment {
 /// The fault state of one connection.
 struct ConnFaults<D: Decode> {
     plan: FaultPlan,
+    pending: VecDeque<Segment>,
+    eof: bool,
     inbound: Faults,
     outbound: Faults,
     /// The second decoder item rules run on. Gone once it fails or ends.
@@ -1384,6 +1397,8 @@ where
     fn new(plan: &FaultPlan, decoder: D) -> ConnFaults<D> {
         ConnFaults {
             plan: plan.clone(),
+            pending: VecDeque::new(),
+            eof: false,
             inbound: Faults::new(FAULT_OUTPUT, FAULT_HELD),
             outbound: Faults::new(FAULT_OUTPUT, FAULT_HELD),
             front: Some(Stream::new(decoder)),
@@ -1419,97 +1434,82 @@ where
                 Err(_) => pieces.push(Segment::Bytes(chunk.to_vec(), 0)),
             }
         }
-        for piece in pieces {
-            match piece {
-                Segment::Bytes(bytes, _) => self.items(entropy, &plan, &bytes, false, queue),
-                wait => queue.push_back(wait),
-            }
-        }
-        if eof {
-            self.items(entropy, &plan, &[], true, queue);
+        self.pending.extend(pieces);
+        self.eof |= eof;
+        // Framing waits until the service asks for its next item.
+        if self.front.is_none() {
+            queue.append(&mut self.pending);
         }
     }
 
-    /// Runs the item rules over `bytes` through the front decoder.
-    fn items(
-        &mut self,
-        entropy: &dyn Entropy,
-        plan: &Plan,
-        bytes: &[u8],
-        eof: bool,
-        queue: &mut VecDeque<Segment>,
-    ) {
-        let Some(front) = self.front.as_mut() else {
-            if !bytes.is_empty() {
-                queue.push_back(Segment::Bytes(bytes.to_vec(), 0));
-            }
-            return;
-        };
-        let mut rest = bytes;
-        let mut out = Vec::new();
+    fn pump(&mut self, entropy: &dyn Entropy, queue: &mut VecDeque<Segment>) {
+        let plan = self.plan.get();
         loop {
-            let room = self.inbound.room(front, &out);
-            let n = front.push(&rest[..rest.len().min(room)]);
-            rest = &rest[n..];
-            if eof && rest.is_empty() {
-                front.end();
-            }
-            let mut moved = n > 0;
-            while let Some(result) =
-                self.inbound
-                    .next_with(entropy, front, &mut out, &plan.items, write_raw)
-            {
-                moved = true;
-                match result {
-                    Ok(Some(FaultDelay { at, duration })) => {
-                        let at = at.min(out.len());
-                        let tail = out.split_off(at);
-                        queue.push_back(Segment::Bytes(std::mem::take(&mut out), 0));
-                        queue.push_back(Segment::Wait(duration));
-                        out = tail;
-                    }
-                    Ok(None) => {}
-                    Err(_) => break,
+            let Some(front) = self.front.as_mut() else {
+                queue.append(&mut self.pending);
+                return;
+            };
+            let mut out = Vec::new();
+            let mut pushed = 0;
+            if let Some(Segment::Bytes(bytes, at)) = self.pending.front_mut() {
+                let room = self.inbound.room(front, &out);
+                let end = bytes.len().min(at.saturating_add(room));
+                pushed = front.push(&bytes[*at..end]);
+                *at += pushed;
+                if *at == bytes.len() {
+                    self.pending.pop_front();
                 }
             }
-            if !out.is_empty() {
-                queue.push_back(Segment::Bytes(std::mem::take(&mut out), 0));
+            if self.eof && self.pending.is_empty() {
+                front.end();
             }
-            if front.is_done() {
-                // Failed or ended: the rest goes through unchanged, and so
-                // does everything after it.
-                let mut left = front.unread().to_vec();
-                left.extend_from_slice(rest);
-                let _ = self.inbound.flush(&mut out);
+            let result = self
+                .inbound
+                .next_with(entropy, front, &mut out, &plan.items, write_raw);
+            let progressed = result.is_some();
+            if let Some(Ok(Some(FaultDelay { at, duration }))) = result {
+                let tail = out.split_off(at.min(out.len()));
                 if !out.is_empty() {
                     queue.push_back(Segment::Bytes(std::mem::take(&mut out), 0));
                 }
-                if !left.is_empty() {
-                    queue.push_back(Segment::Bytes(left, 0));
-                }
-                self.stopped = Some(if front.failed().is_some() {
+                queue.push_back(Segment::Wait(duration));
+                out = tail;
+            }
+            if !out.is_empty() {
+                queue.push_back(Segment::Bytes(out, 0));
+            }
+            if front.is_done() {
+                let why = if front.failed().is_some() {
                     "failed"
                 } else {
                     "ended"
-                });
-                self.front = None;
+                };
+                self.stop(why, queue);
                 return;
             }
-            if rest.is_empty() || !moved {
-                if eof {
-                    let _ = self.inbound.flush(&mut out);
-                    if !out.is_empty() {
-                        queue.push_back(Segment::Bytes(out, 0));
-                    }
-                }
-                if !rest.is_empty() {
-                    queue.push_back(Segment::Bytes(rest.to_vec(), 0));
-                    self.stopped = Some("stuck");
-                    self.front = None;
+            if !queue.is_empty() {
+                return;
+            }
+            if pushed == 0 && !progressed {
+                if matches!(self.pending.front(), Some(Segment::Wait(_))) {
+                    queue.push_back(self.pending.pop_front().unwrap());
                 }
                 return;
             }
         }
+    }
+
+    fn stop(&mut self, why: &'static str, queue: &mut VecDeque<Segment>) {
+        if let Some(front) = self.front.take() {
+            let mut bytes = Vec::new();
+            let _ = self.inbound.flush(&mut bytes);
+            bytes.extend_from_slice(front.unread());
+            if !bytes.is_empty() {
+                queue.push_back(Segment::Bytes(bytes, 0));
+            }
+            self.stopped = Some(why);
+        }
+        queue.append(&mut self.pending);
     }
 
     /// The `conn.faults` event for item rules that stopped since the last
@@ -1517,6 +1517,8 @@ where
     fn stopped(&mut self) -> Option<Event> {
         let why = self.stopped.take()?;
         let summary = match why {
+            "decoder" => "item faults stopped: the service accessed its decoder",
+            "upgrade" => "item faults stopped: the service upgraded the connection",
             "failed" => "item faults stopped: the client's bytes did not decode",
             "ended" => "item faults stopped: the decoder ended",
             _ => "item faults stopped: the decoder could take no more",
@@ -1615,7 +1617,7 @@ enum Next {
 
 /// One connection's state, with no I/O: the decoder and the bytes waiting
 /// for it, the service's timers and deferred work, and what is to be
-/// written. [`serve`] and [`Harness`] both run it.
+/// written. [`connection`] and [`Harness`] both run it.
 struct Core<S: Service> {
     fcx: Option<Cx>,
     stream: Stream<S::Decoder>,
@@ -1735,6 +1737,16 @@ where
             .max(self.read_buffer)
             .saturating_add(self.stream.held())
             .saturating_add(queued)
+            .saturating_add(self.faults.as_ref().map_or(0, |f| {
+                f.pending
+                    .iter()
+                    .map(|s| match s {
+                        Segment::Bytes(bytes, _) => bytes.len(),
+                        Segment::Wait(_) => 0,
+                    })
+                    .sum::<usize>()
+                    .saturating_add(f.front.as_ref().map_or(0, |front| front.unread().len()))
+            }))
             .saturating_add(service.held())
             .saturating_add(out)
             .saturating_add(work)
@@ -1903,7 +1915,17 @@ where
     }
 
     /// Takes what the last call asked for: its reply, its deferred work.
+    fn stop_item_faults(&mut self, why: &'static str) {
+        if let Some(faults) = &mut self.faults {
+            faults.stop(why, &mut self.queue);
+            self.s.events.extend(faults.stopped());
+        }
+    }
+
     fn collect(&mut self) {
+        if std::mem::take(&mut self.s.decoder_touched) {
+            self.stop_item_faults("decoder");
+        }
         let reply = std::mem::take(&mut self.s.reply);
         self.push_out(reply, None);
         self.s.datagrams.clear();
@@ -1933,9 +1955,14 @@ where
 
     /// Calls the service with a context for this call, then takes what it
     /// asked for.
-    fn call(&mut self, now: Instant, f: impl FnOnce(&mut Driver<'_>) -> Result<Flow, S::Error>) {
+    fn call(
+        &mut self,
+        now: Instant,
+        f: impl FnOnce(&mut Driver<'_, S::Decoder>) -> Result<Flow, S::Error>,
+    ) {
         let result = {
             let mut driver = Driver {
+                decoder: self.stream.decoder(),
                 s: &mut self.s,
                 now,
                 conn: &self.info,
@@ -1974,6 +2001,9 @@ where
     }
 
     fn apply(&mut self, flow: Flow, service: &S) {
+        if matches!(flow, Flow::Upgrade(_)) {
+            self.stop_item_faults("upgrade");
+        }
         match flow {
             Flow::Continue => {}
             Flow::Close => self.finish(Ended::Closed),
@@ -2003,6 +2033,7 @@ where
         self.s.unread = self.stream.unread().to_vec();
         let result = {
             let mut driver = Driver {
+                decoder: self.stream.decoder(),
                 s: &mut self.s,
                 now,
                 conn: &self.info,
@@ -2022,6 +2053,12 @@ where
     /// Moves bytes from the queue into the decoder, up to a fault delay.
     /// Returns how many it took.
     fn feed(&mut self) -> usize {
+        if self.queue.is_empty()
+            && let Some(faults) = &mut self.faults
+        {
+            faults.pump(self.s.entropy.as_ref(), &mut self.queue);
+            self.s.events.extend(faults.stopped());
+        }
         let mut pushed = 0;
         while let Some(Segment::Bytes(bytes, at)) = self.queue.front_mut() {
             let n = self.stream.push(&bytes[*at..]);
@@ -2043,7 +2080,7 @@ where
             |item, _, _| item,
             |event| {
                 if let Some(t) = record {
-                    t.observe(tag, Direction::ClientToServer, event);
+                    t.observe(tag, Side::Client, event);
                 }
             },
         )
@@ -2103,7 +2140,13 @@ where
         }
         loop {
             let pushed = self.feed();
-            if self.eof && self.queue.is_empty() {
+            if self.eof
+                && self.queue.is_empty()
+                && self
+                    .faults
+                    .as_ref()
+                    .is_none_or(|f| f.front.is_none() && f.pending.is_empty())
+            {
                 self.stream.end();
             }
             match self.next_item() {
@@ -2191,6 +2234,7 @@ where
         self.state = State::Ending { end, called: true };
         let result = {
             let mut driver = Driver {
+                decoder: self.stream.decoder(),
                 s: &mut self.s,
                 now,
                 conn: &self.info,
@@ -2198,6 +2242,9 @@ where
             };
             service.on_end(end, state, &mut driver)
         };
+        if std::mem::take(&mut self.s.decoder_touched) {
+            self.stop_item_faults("decoder");
+        }
         if let Err(e) = result {
             self.failure.get_or_insert(Failure::Service(e));
         }
@@ -2403,7 +2450,7 @@ async fn write_all<C: Connection>(
 /// `info` names the connection in events; [`listen`] fills it in. The
 /// connection ends as soon as the client resets it, even while deferred
 /// work runs and nothing reads ([`Connection::poll_gone`]).
-pub async fn serve<S, C>(
+pub async fn connection<S, C>(
     fcx: &Cx,
     conn: C,
     info: ConnInfo,
@@ -2468,7 +2515,7 @@ where
     }
 }
 
-/// How [`serve`] ends when its TLS handshake fails: cancelled if the
+/// How [`connection`] ends when its TLS handshake fails: cancelled if the
 /// handshake was, else with the connection closed as broken.
 fn tls_failed<E>(e: HandshakeError) -> Result<Served<Box<dyn Connection>>, ServeError<E>> {
     match e {
@@ -2535,7 +2582,7 @@ where
                         let end = out_offset.saturating_add(bytes.len() as u64);
                         t.observe::<(), String>(
                             tag,
-                            Direction::ServerToClient,
+                            Side::Server,
                             StreamEvent::Skipped {
                                 bytes: &bytes,
                                 range: out_offset..end,
@@ -2871,25 +2918,29 @@ where
                 Err(ConnError::Cancelled | ConnError::Closed) => return Ok(()),
                 Err(_) => continue,
             };
-            let Some(guard) = Counted::enter(&open, opts.max_conns) else {
+            let mut info = ConnInfo::new(ids + 1, conn.local_addr(), conn.peer_addr());
+            info.sandbox = info
+                .peer
+                .and_then(|peer| opts.sandbox.as_ref().and_then(|f| f(peer.ip())));
+            let Some(guard) =
+                fictionet::stdlib::net::connection_limit(&fcx, &info, &open, opts.max_conns)
+            else {
                 conn.reset();
                 continue;
             };
             conn.hold_until_gone(guard);
             ids += 1;
-            let info = ConnInfo::new(ids, conn.local_addr(), conn.peer_addr());
             let (state, make, opts) = (state.clone(), make.clone(), opts.clone());
             fcx.spawn(move |fcx| async move {
                 let mut service = make();
-                let _ = serve(&fcx, conn, info, &mut service, &state, &opts).await;
+                let _ = connection(&fcx, conn, info, &mut service, &state, &opts).await;
                 Ok(())
             });
         }
     })
 }
 
-/// Counts one open connection until dropped. Public so a copied network
-/// can use the same count.
+/// Counts one open connection until dropped.
 pub struct Counted(Arc<AtomicUsize>);
 
 impl Counted {
@@ -2915,6 +2966,9 @@ impl Drop for Counted {
 // ---------------------------------------------------------------------------
 // Datagrams
 
+type DatagramCall<'a, S> =
+    dyn FnMut(&mut Driver<'_, <S as Service>::Decoder>) -> Result<Flow, <S as Service>::Error> + 'a;
+
 /// Serves every datagram on `socket` with one `service`, until the socket
 /// closes or the region is cancelled.
 ///
@@ -2933,7 +2987,7 @@ impl Drop for Counted {
 ///
 /// Returns `Ok(())` once the socket closes, and [`Cancelled`] if `fcx`'s
 /// [region](fictionet::Cx#regions) is cancelled.
-pub async fn serve_datagram<S, D: Datagram>(
+pub async fn datagram<S, D: DatagramSocket>(
     fcx: &Cx,
     mut socket: D,
     local: SocketAddr,
@@ -2956,14 +3010,17 @@ where
     let wake = s.wake.clone();
     // One call, then its datagrams and events. The reply stays for the
     // caller to send, or drop.
-    let called = |s: &mut Scratch,
+    let mut lifecycle_decoder = service.decoder();
+    let called = |decoder: &mut S::Decoder,
+                  s: &mut Scratch,
                   timers: &[(Timer, Instant)],
                   socket: &mut D,
                   info: &ConnInfo,
-                  f: &mut dyn FnMut(&mut Driver<'_>) -> Result<Flow, S::Error>|
+                  f: &mut DatagramCall<'_, S>|
      -> Flow {
         let result = {
             let mut driver = Driver {
+                decoder,
                 s: &mut *s,
                 now: fcx.now(),
                 conn: info,
@@ -2994,9 +3051,14 @@ where
         s.keyed.clear();
         flow
     };
-    called(&mut s, &timers, &mut socket, &base, &mut |driver| {
-        service.on_open(state, driver)
-    });
+    called(
+        &mut lifecycle_decoder,
+        &mut s,
+        &timers,
+        &mut socket,
+        &base,
+        &mut |driver| service.on_open(state, driver),
+    );
     s.reply.clear();
     let mut run = 0u32;
     let ended = loop {
@@ -3004,16 +3066,26 @@ where
         arm(&mut timers, &mut s.timers, now);
         if let Some(i) = due(&timers, now) {
             let (name, _) = timers.remove(i);
-            called(&mut s, &timers, &mut socket, &base, &mut |driver| {
-                service.on_timer(name, state, driver)
-            });
+            called(
+                &mut lifecycle_decoder,
+                &mut s,
+                &timers,
+                &mut socket,
+                &base,
+                &mut |driver| service.on_timer(name, state, driver),
+            );
             s.reply.clear();
             continue;
         }
         if wake.take() {
-            called(&mut s, &timers, &mut socket, &base, &mut |driver| {
-                service.on_wake(state, driver)
-            });
+            called(
+                &mut lifecycle_decoder,
+                &mut s,
+                &timers,
+                &mut socket,
+                &base,
+                &mut |driver| service.on_wake(state, driver),
+            );
             s.reply.clear();
             continue;
         }
@@ -3059,6 +3131,7 @@ where
                 Some(Ok(item)) => {
                     let mut item = Some(item);
                     called(
+                        stream.decoder(),
                         &mut s,
                         &timers,
                         &mut socket,
@@ -3071,9 +3144,14 @@ where
                 }
                 Some(Err(fail)) => {
                     s.unread = stream.unread().to_vec();
-                    let flow = called(&mut s, &timers, &mut socket, &info, &mut |driver| {
-                        service.on_fail(&fail, state, driver).map(|()| Flow::Close)
-                    });
+                    let flow = called(
+                        stream.decoder(),
+                        &mut s,
+                        &timers,
+                        &mut socket,
+                        &info,
+                        &mut |driver| service.on_fail(&fail, state, driver).map(|()| Flow::Close),
+                    );
                     s.unread = Vec::new();
                     flow
                 }
@@ -3085,9 +3163,16 @@ where
                             limit: stream.limit(),
                         };
                         s.unread = datagram.clone();
-                        let flow = called(&mut s, &timers, &mut socket, &info, &mut |driver| {
-                            service.on_fail(&fail, state, driver).map(|()| Flow::Close)
-                        });
+                        let flow = called(
+                            stream.decoder(),
+                            &mut s,
+                            &timers,
+                            &mut socket,
+                            &info,
+                            &mut |driver| {
+                                service.on_fail(&fail, state, driver).map(|()| Flow::Close)
+                            },
+                        );
                         s.unread = Vec::new();
                         flow
                     } else {
@@ -3175,7 +3260,7 @@ impl Wake for Flag {
 
 /// Runs a service with no I/O and no runtime: push the client's bytes,
 /// get the reply. For unit tests, fuzz targets and contract checks. It
-/// runs the same state machine as [`serve`], so timers, wakes, deferred
+/// runs the same state machine as [`connection`], so timers, wakes, deferred
 /// work, upgrades and ends behave as they do over a connection. The clock
 /// stands still until [`advance`](Self::advance) moves it, unless bound
 /// to a `Cx`, whose clock it reads instead; inbound fault delays take no time.
@@ -3419,7 +3504,7 @@ where
         self.run()
     }
 
-    /// After [`HarnessError::Upgraded`]: goes on as [`serve`] does once the
+    /// After [`HarnessError::Upgraded`]: goes on as [`connection`] does once the
     /// upgrade is done, as the connection `conn` (for TLS, with `tls` set).
     /// The service gets a fresh decoder that reads the unread bytes, and
     /// [`Service::on_open`] again. Returns what it sends.

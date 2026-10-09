@@ -132,7 +132,7 @@ pub fn serve(fcx: &Cx) -> Attacher {
         let _ = fictionet::stdlib::codec::Wire::to_bytes(&e.to_json());
     });
     let (attacher, attachments) = attachments();
-    sites.serve(fcx, attachments).unwrap();
+    sites.start(fcx, attachments).unwrap();
     attacher
 }
 

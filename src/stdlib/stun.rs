@@ -1,7 +1,7 @@
 //! STUN: reading and writing Session Traversal Utilities for NAT messages,
 //! with no I/O.
 //!
-//! `Message` implements `Wire`, `Frames` decodes stream messages, and
+//! `Message` implements `Wire`, `codec::Frames<Frame>` decodes stream messages, and
 //! `answer_binding` builds a stateless Binding reply. There is no ICE or TURN
 //! session, `Service`, live transport, or HMAC computation or verification.
 //!
@@ -23,7 +23,7 @@
 //! Nothing here reads a socket. A world that plays a STUN server takes each
 //! UDP datagram it receives, reads it with [`Message::parse`], passes it and
 //! the datagram's source address to [`answer_binding`], and sends the
-//! reply's bytes back. Over TCP, [`Stream<Frames>`](fictionet::stdlib::codec::Stream)
+//! reply's bytes back. Over TCP, [`Stream<Frames<Frame>>`](fictionet::stdlib::codec::Stream)
 //! splits the byte stream into messages. Use [`codec::Stream::with_next`] for each
 //! frame's exact bytes. Integrity values stay as raw bytes. World code
 //! computes HMACs over those original bytes, including their padding.
@@ -64,10 +64,14 @@ use alloc::{
     vec::Vec,
 };
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::pad_to_4 as padded;
-use fictionet::stdlib::codec::{be16, be32};
+use fictionet::stdlib::codec::{Prefixed, Wire, be16, be32};
 
-use fictionet::stdlib::codec::{self, Decode, Step};
+use fictionet::stdlib::codec;
+#[cfg(test)]
+use fictionet::stdlib::codec::Decode;
 
 /// The UDP and TCP port STUN servers listen on.
 pub const PORT: u16 = 3478;
@@ -756,7 +760,7 @@ impl Message {
     /// and the ERROR-CODE reason must be shorter than 128 characters.
     /// See RFC 8489 sections 14.3, 14.8, 14.9, 14.10, and 14.14.
     /// This checks only text lengths. It does not check text preparation,
-    /// grammar, or whether [`Wire::write`](codec::Wire::write) will succeed.
+    /// grammar, or whether [`Wire::write`] will succeed.
     /// The writer preserves the parser's larger [`MAX_TEXT`] limit.
     pub fn within_sending_limits(&self) -> bool {
         self.attributes.iter().all(|attribute| match attribute {
@@ -887,64 +891,43 @@ pub fn answer_binding(request: &Message, source: SocketAddr) -> Option<Message> 
     Some(request.success_response(source))
 }
 
-/// Reads complete STUN frames from a byte slice.
-///
-/// Only headers are checked. Invalid top bits, lengths, or magic cookies
-/// return a stream error. Map frames through [`Message::parse`] to receive
-/// attribute errors as items and continue with the next message.
-///
-/// This decoder owns no input. Its capacity is [`MAX_MESSAGE`]. An
-/// incomplete frame returns [`Step::Need`], including at EOF, so
-/// [`codec::Stream`] reports truncation. [`codec::Stream::with_next`] gives
-/// access to each item's exact bytes, including padding.
-///
-/// ```
-/// use fictionet::stdlib::{codec::{Decode, Stream, Wire}, stun::{Frames, Message}};
-///
-/// let message = Message::binding_request([7; 12]);
-/// let bytes = Wire::to_bytes(&message)?;
-/// let mut stream = Stream::new(Frames::new().map(|frame| Message::parse(&frame)));
-/// assert_eq!(stream.push(&bytes), bytes.len());
-/// let item = stream.with_next(|item, raw, span| {
-///     assert_eq!(raw, bytes);
-///     assert_eq!(span, 0..bytes.len() as u64);
-///     item
-/// });
-/// assert_eq!(item, Some(Ok(Ok(message))));
-/// stream.end();
-/// assert_eq!(stream.next(), None);
-/// # Ok::<(), fictionet::stdlib::stun::Error>(())
-/// ```
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
+/// One bounded message's bytes, with only its framing checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame(pub Vec<u8>);
 
-impl Frames {
-    /// Creates a frame decoder with no retained state.
-    pub fn new() -> Self {
-        Self
+impl Wire for Frame {
+    type ParseError = Error;
+    type WriteError = Error;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        match Self::parse_prefix(bytes, &Self::default_limit())? {
+            Some((data, used)) if used == bytes.len() => Ok(Self(data)),
+            Some((_, used)) => Err(Error::TrailingBytes(bytes.len() - used)),
+            None => Err(Error::Truncated),
+        }
+    }
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        Self::parse(&self.0)?;
+        out.extend_from_slice(&self.0);
+        Ok(())
     }
 }
 
-impl Decode for Frames {
+/// Frames one STUN message and yields its uninterpreted bytes.
+/// Partial input needs more bytes, including at EOF. The stream reports truncation.
+impl Prefixed for Frame {
     type Item = Vec<u8>;
     type Error = Error;
-
+    type Limit = ();
     const NAME: &'static str = "STUN";
-
-    fn capacity(&self) -> usize {
+    fn default_limit() -> Self::Limit {}
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit
+    }
+    fn capacity(_: &Self::Limit) -> usize {
         MAX_MESSAGE
     }
-
-    /// Reads one frame. Invalid header bits, body alignment, or cookie
-    /// return [`Error::TopBits`], [`Error::Length`], or
-    /// [`Error::MagicCookie`]. Partial input returns [`Step::Need`],
-    /// including at EOF. Attribute validation belongs to [`Message::parse`].
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Self::Error> {
-        let Some(total) = header(input)? else {
-            return Ok(Step::Need);
-        };
-        let frame = input.get(..total).ok_or(Error::Truncated)?;
-        Ok(Step::Item(frame.to_vec(), total))
+    fn parse_prefix(input: &[u8], _: &Self::Limit) -> Result<Option<(Self::Item, usize)>, Error> {
+        Ok(header(input)?.map(|total| (input[..total].to_vec(), total)))
     }
 }
 
@@ -1513,7 +1496,7 @@ mod tests {
         for s in samples() {
             for n in 0..s.len() {
                 assert_eq!(Message::parse(&s[..n]), Err(Error::Truncated), "{n} bytes");
-                let mut d = Stream::new(Frames);
+                let mut d = Stream::new(Frames::<Frame>::new());
                 put(&mut d, &s[..n]);
                 assert_eq!(
                     d.next().map(|r| r.map(|frame| Message::parse(&frame))),
@@ -1532,7 +1515,7 @@ mod tests {
         // A message with a bad attribute in the middle is skipped.
         stream.extend_from_slice(&with_body(&[0, 1, 0, 0]));
         stream.extend_from_slice(&SAMPLE_IPV4_RESPONSE);
-        let mut d = Stream::new(Frames);
+        let mut d = Stream::new(Frames::<Frame>::new());
         let mut got = Vec::new();
         for byte in test_support::chunks(&stream, &[1]) {
             put(&mut d, byte);
@@ -1864,7 +1847,7 @@ mod tests {
             for _ in 0..n {
                 stream.extend_from_slice(&one);
             }
-            let mut d = Stream::new(Frames);
+            let mut d = Stream::new(Frames::<Frame>::new());
             let mut count = 0;
             let mut rest = &stream[..];
             while !rest.is_empty() {
@@ -1915,8 +1898,8 @@ mod tests {
         let one = Message::binding_request([1; 12]).to_bytes().unwrap();
         let n = rounds(100_000);
         let bytes = one.repeat(n);
-        contract::check_decode_with_alloc_limit(|| Frames, &bytes, 2 * MAX_MESSAGE);
-        let mut stream = Stream::new(Frames);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_MESSAGE);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         let took = stream.push(&bytes);
         assert_eq!(took, MAX_MESSAGE);
         assert_eq!(stream.push(&bytes[took..]), 0);
@@ -1929,7 +1912,7 @@ mod tests {
 
     #[test]
     fn framing_error_ends_the_drain_loop() {
-        let mut stream = Stream::new(Frames);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&[0xc0]), 1);
         let error = codec::Fail::Protocol(Error::TopBits(0xc0));
         assert_eq!(stream.next(), Some(Err(error.clone())));
@@ -1964,7 +1947,7 @@ mod tests {
         for s in samples() {
             stream.extend_from_slice(s);
         }
-        let mut d = Stream::new(Frames);
+        let mut d = Stream::new(Frames::<Frame>::new());
         put(&mut d, &stream);
         for s in samples() {
             let frame = d.next().unwrap().unwrap();
@@ -2026,7 +2009,8 @@ mod tests {
         ];
         let source = "192.0.2.1:32853".parse().unwrap();
         for pattern in [&[][..], &[1], &[3, 1, 17]] {
-            let mut stream = Stream::new(Frames::new().map(|frame| Message::parse(&frame)));
+            let mut stream =
+                Stream::new(Frames::<Frame>::new().map(|frame| Message::parse(&frame)));
             let mut results = Vec::new();
             let mut replies = Vec::new();
             let mut expected_replies = Vec::new();
@@ -2060,7 +2044,7 @@ mod tests {
             assert_eq!(stream.next(), None);
 
             let mut response_stream =
-                Stream::new(Frames::new().map(|frame| Message::parse(&frame)));
+                Stream::new(Frames::<Frame>::new().map(|frame| Message::parse(&frame)));
             let mut responses = Vec::new();
             for byte in &replies {
                 assert_eq!(
@@ -2077,14 +2061,17 @@ mod tests {
         }
 
         // Mixed attribute and header errors obey the decoder contract.
-        contract::check_decode(|| Frames::new().map(|frame| Message::parse(&frame)), &bytes);
+        contract::check_decode(
+            || Frames::<Frame>::new().map(|frame| Message::parse(&frame)),
+            &bytes,
+        );
     }
 
     #[test]
     fn codec_eof_and_early_header_errors() {
         for sample in samples() {
             for cut in 0..sample.len() {
-                let mut stream = Stream::new(Frames::new());
+                let mut stream = Stream::new(Frames::<Frame>::new());
                 assert_eq!(stream.push(sample.get(..cut).unwrap()), cut);
                 assert_eq!(stream.next(), None);
                 stream.end();
@@ -2106,7 +2093,7 @@ mod tests {
                 Error::MagicCookie(0x0102_0304),
             ),
         ] {
-            let mut stream = Stream::new(Frames::new());
+            let mut stream = Stream::new(Frames::<Frame>::new());
             assert_eq!(stream.push(bytes), bytes.len());
             assert_eq!(stream.next(), Some(Err(Fail::Protocol(error))));
             assert_eq!(stream.failed(), Some(&Fail::Protocol(error)));
@@ -2117,8 +2104,11 @@ mod tests {
     #[test]
     fn codec_contracts_and_capacity() {
         for sample in samples() {
-            contract::check_decode(Frames::new, sample);
-            contract::check_decode(|| Frames::new().map(|frame| Message::parse(&frame)), sample);
+            contract::check_decode(Frames::<Frame>::new, sample);
+            contract::check_decode(
+                || Frames::<Frame>::new().map(|frame| Message::parse(&frame)),
+                sample,
+            );
             contract::check_wire::<Message>(sample);
         }
         let mut message = Message::binding_request([1; 12]);
@@ -2128,13 +2118,16 @@ mod tests {
         });
         let bytes = Wire::to_bytes(&message).unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
-        assert_eq!(Frames::new().capacity(), MAX_MESSAGE);
-        assert_eq!(Frames::new().held(), 0);
-        contract::check_decode(Frames::new, &bytes);
-        contract::check_decode(|| Frames::new().map(|frame| Message::parse(&frame)), &bytes);
+        assert_eq!(Frames::<Frame>::new().capacity(), MAX_MESSAGE);
+        assert_eq!(Frames::<Frame>::new().held(), 0);
+        contract::check_decode(Frames::<Frame>::new, &bytes);
+        contract::check_decode(
+            || Frames::<Frame>::new().map(|frame| Message::parse(&frame)),
+            &bytes,
+        );
         contract::check_wire::<Message>(&bytes);
 
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&bytes), MAX_MESSAGE);
         assert_eq!(stream.push(&bytes), 0);
         assert_eq!(stream.next(), Some(Ok(bytes.clone())));
@@ -2337,13 +2330,16 @@ mod tests {
         }
     }
 
-    fn put(stream: &mut Stream<Frames>, bytes: &[u8]) {
+    fn put(stream: &mut Stream<Frames<Frame>>, bytes: &[u8]) {
         assert_eq!(stream.push(bytes), bytes.len());
     }
 
     fn check_stream(bytes: &[u8]) -> usize {
-        contract::check_decode(|| Frames.map(|frame| Message::parse(&frame)), bytes);
-        let (frames, _) = test_support::decode_all(|| Frames, bytes);
+        contract::check_decode(
+            || Frames::<Frame>::new().map(|frame| Message::parse(&frame)),
+            bytes,
+        );
+        let (frames, _) = test_support::decode_all(Frames::<Frame>::new, bytes);
         frames
             .iter()
             .filter_map(|frame| Message::parse(frame).ok())

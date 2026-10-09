@@ -51,6 +51,11 @@
 //! Header-count errors are items. The driver reports truncated input at
 //! EOF. Bodies remain bytes; SDP belongs to [`fictionet::stdlib::sdp`].
 //!
+//! A [`Service`](fictionet::stdlib::serve::Service) can use this decoder through
+//! [`serve::connection`](fictionet::stdlib::serve::connection). Change its mode
+//! between items with [`Driver::decoder`](fictionet::stdlib::serve::Driver::decoder).
+//! See `docs/services.md` for an SMTP DATA service.
+//!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
 //! use fictionet::stdlib::rtsp::{Frame, Frames, Interleaved, TransportParam};
@@ -211,7 +216,7 @@ pub enum Error {
     Missing(&'static str),
     /// A header's value does not follow its grammar, or a header that may
     /// appear once appears twice. It names the header.
-    Malformed(&'static str),
+    HeaderSyntax(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -241,7 +246,7 @@ impl std::fmt::Display for Error {
             Error::ContentLength => f.write_str("bad Content-Length"),
             Error::Marker => f.write_str("interleaved frame does not start with $"),
             Error::Missing(name) => write!(f, "no {name} header"),
-            Error::Malformed(name) => write!(f, "malformed {name}"),
+            Error::HeaderSyntax(name) => write!(f, "malformed {name}"),
         }
     }
 }
@@ -419,14 +424,14 @@ impl Message {
     /// The CSeq: the request's sequence number, which its response copies.
     /// In RTSP 2.0 it is 1 to 9 digits, as RFC 7826 section 20.2.3 says.
     /// RTSP 1.0 sets no limit; a value over `u32::MAX` is
-    /// [`Error::Malformed`].
+    /// [`Error::HeaderSyntax`].
     pub fn cseq(&self) -> Result<u32, Error> {
         let v = self.single("CSeq")?;
         if self.version() == Version::Rtsp20 && v.len() > 9 {
-            return Err(Error::Malformed("CSeq"));
+            return Err(Error::HeaderSyntax("CSeq"));
         }
-        let n = parse_u64(v).ok_or(Error::Malformed("CSeq"))?;
-        u32::try_from(n).map_err(|_| Error::Malformed("CSeq"))
+        let n = parse_u64(v).ok_or(Error::HeaderSyntax("CSeq"))?;
+        u32::try_from(n).map_err(|_| Error::HeaderSyntax("CSeq"))
     }
 
     /// The Session header: which session a request belongs to.
@@ -451,11 +456,11 @@ impl Message {
 
     /// The Range header: which part of a stream to play. RTSP 2.0 has no
     /// `time` parameter, so in an RTSP 2.0 message one is
-    /// [`Error::Malformed`].
+    /// [`Error::HeaderSyntax`].
     pub fn range(&self) -> Result<Range, Error> {
         let range = Range::read_value(self.single("Range")?)?;
         if self.version() == Version::Rtsp20 && range.time.is_some() {
-            return Err(Error::Malformed("Range"));
+            return Err(Error::HeaderSyntax("Range"));
         }
         Ok(range)
     }
@@ -497,7 +502,7 @@ impl Message {
         let mut found = self.headers_named(name);
         let h = found.next().ok_or(Error::Missing(name))?;
         if found.next().is_some() {
-            return Err(Error::Malformed(name));
+            return Err(Error::HeaderSyntax(name));
         }
         Ok(&h.value)
     }
@@ -926,7 +931,7 @@ impl Session {
         if v.len() > MAX_HEAD {
             return Err(Error::TooLong);
         }
-        const BAD: Error = Error::Malformed("Session");
+        const BAD: Error = Error::HeaderSyntax("Session");
         let mut parts = v.split(';');
         let id = trim_ws(parts.next().unwrap_or(""));
         if !valid_session_id(id) {
@@ -952,7 +957,7 @@ impl Session {
 
     fn format_value(&self) -> Result<String, Error> {
         if !valid_session_id(&self.id) || self.timeout.is_some_and(|t| t > MAX_SECONDS) {
-            return Err(Error::Malformed("Session"));
+            return Err(Error::HeaderSyntax("Session"));
         }
         Ok(match self.timeout {
             Some(t) => format!("{};timeout={t}", self.id),
@@ -1087,7 +1092,7 @@ impl Transport {
         if spec.len() > MAX_HEAD {
             return Err(Error::TooLong);
         }
-        const BAD: Error = Error::Malformed("Transport");
+        const BAD: Error = Error::HeaderSyntax("Transport");
         let parts = split_unquoted(spec, b';', MAX_PARAMS + 1, "Transport")?;
         let mut parts = parts.into_iter();
         let id = trim_ws(parts.next().unwrap_or(""));
@@ -1136,7 +1141,7 @@ impl Transport {
     }
 
     fn format_value(&self) -> Result<String, Error> {
-        const BAD: Error = Error::Malformed("Transport");
+        const BAD: Error = Error::HeaderSyntax("Transport");
         let profile_ok =
             is_token(&self.profile) || (self.profile.is_empty() && self.lower.is_none());
         if !is_token(&self.protocol) || !profile_ok {
@@ -1367,7 +1372,7 @@ impl Range {
         if v.len() > MAX_HEAD {
             return Err(Error::TooLong);
         }
-        const BAD: Error = Error::Malformed("Range");
+        const BAD: Error = Error::HeaderSyntax("Range");
         let mut parts = v.split(';');
         let spec = trim_ws(parts.next().unwrap_or(""));
         let mut time = None;
@@ -1427,9 +1432,9 @@ impl Range {
 
     fn format_value(&self) -> Result<String, Error> {
         if self.time.as_ref().is_some_and(|time| time.len() > 26) {
-            return Err(Error::Malformed("Range"));
+            return Err(Error::HeaderSyntax("Range"));
         }
-        const BAD: Error = Error::Malformed("Range");
+        const BAD: Error = Error::HeaderSyntax("Range");
         let (unit, start, end) = match &self.span {
             Span::Npt { start, end } => (
                 "npt",
@@ -1751,7 +1756,7 @@ fn parse_param(p: &str) -> Option<TransportParam> {
 /// Writes one transport parameter, checking it reads back.
 fn write_param(out: &mut String, p: &TransportParam) -> Result<(), Error> {
     use TransportParam as P;
-    const BAD: Error = Error::Malformed("Transport");
+    const BAD: Error = Error::HeaderSyntax("Transport");
     let list_ok = |n: usize| {
         if n == 0 {
             Err(BAD)
@@ -1956,7 +1961,7 @@ fn quoted_end(b: &[u8], i: usize) -> Option<usize> {
 
 /// `s` split at each `sep` outside quoted strings. More than `max` parts
 /// is [`Error::TooMany`], and an empty or unclosed part is
-/// [`Error::Malformed`]. A part may be empty only when `sep` is `;`.
+/// [`Error::HeaderSyntax`]. A part may be empty only when `sep` is `;`.
 fn split_unquoted<'a>(
     s: &'a str,
     sep: u8,
@@ -1967,7 +1972,7 @@ fn split_unquoted<'a>(
     let mut out = Vec::new();
     let mut push = |part: &'a str| {
         if sep != b';' && trim_ws(part).is_empty() {
-            return Err(Error::Malformed(name));
+            return Err(Error::HeaderSyntax(name));
         }
         if out.len() >= max {
             return Err(Error::TooMany);
@@ -1978,7 +1983,7 @@ fn split_unquoted<'a>(
     let (mut start, mut i) = (0, 0);
     while i < b.len() {
         if b[i] == b'"' {
-            i = quoted_end(b, i).ok_or(Error::Malformed(name))?;
+            i = quoted_end(b, i).ok_or(Error::HeaderSyntax(name))?;
             continue;
         }
         if b[i] == sep {
@@ -2211,7 +2216,7 @@ impl Transports {
 
     fn format_value(&self) -> Result<String, Error> {
         if self.values.is_empty() {
-            return Err(Error::Malformed("Transport"));
+            return Err(Error::HeaderSyntax("Transport"));
         }
         if self.values.len() > MAX_TRANSPORTS {
             return Err(Error::TooMany);
@@ -2278,10 +2283,10 @@ wire_value!(
     Session,
     /// Reads a Session header's value, such as `47112344;timeout=60`.
     /// Parameters other than `timeout`, and a timeout over 19 digits, are
-    /// [`Error::Malformed`].
+    /// [`Error::HeaderSyntax`].
     parse,
     /// The header value. A bad identifier, or a timeout over 19 digits,
-    /// is [`Error::Malformed`].
+    /// is [`Error::HeaderSyntax`].
     write
 );
 
@@ -2292,7 +2297,7 @@ wire_value!(
     /// allows other transport names with one token or more than three:
     /// one token leaves the profile empty, and the parts past the third
     /// go into [`Lower::Other`]. A specification naming both `unicast`
-    /// and `multicast` is [`Error::Malformed`], since both RFCs make them
+    /// and `multicast` is [`Error::HeaderSyntax`], since both RFCs make them
     /// exclusive.
     parse,
     /// The specification as text. A protocol or profile that is not a
@@ -2308,7 +2313,7 @@ wire_value!(
     /// Reads a Range header's value with one span, such as `npt=0-`,
     /// `clock=19961108T142300Z-;time=19970123T153600Z`, or a format alone,
     /// such as `npt`. A list of spans, which RFC 2326 allows and RFC 7826
-    /// does not, is [`Error::Malformed`]. So are SMPTE subframes with no
+    /// does not, is [`Error::HeaderSyntax`]. So are SMPTE subframes with no
     /// frames, which RFC 2326 allows and RFC 7826 does not. Times must
     /// exist: SMPTE minutes and seconds below 60 and frames below the
     /// rate, a real UTC date and time with at most 9 fraction digits, and
@@ -2316,7 +2321,7 @@ wire_value!(
     parse,
     /// The header value. A span with neither end is written as the format
     /// alone. A value out of range or a malformed UTC time is
-    /// [`Error::Malformed`].
+    /// [`Error::HeaderSyntax`].
     write
 );
 
@@ -2547,7 +2552,7 @@ mod tests {
         ] {
             assert_eq!(
                 Session::parse(bad.as_bytes()),
-                Err(Error::Malformed("Session")),
+                Err(Error::HeaderSyntax("Session")),
                 "{bad}"
             );
         }
@@ -2679,7 +2684,7 @@ mod tests {
 
     #[test]
     fn bad_transports() {
-        let bad = Error::Malformed("Transport");
+        let bad = Error::HeaderSyntax("Transport");
         for t in [
             "",
             "RTP/",
@@ -2877,7 +2882,7 @@ mod tests {
         ] {
             assert_eq!(
                 Range::parse(bad.as_bytes()),
-                Err(Error::Malformed("Range")),
+                Err(Error::HeaderSyntax("Range")),
                 "{bad}"
             );
         }
@@ -2921,11 +2926,11 @@ mod tests {
     #[test]
     fn spec_review() {
         use TransportParam as P;
-        let bad = Error::Malformed("Transport");
+        let bad = Error::HeaderSyntax("Transport");
         // RFC 2326 section 3.4 and RFC 7826 section 20.2.3: safe is `$ - _ . +`.
         assert_eq!(
             Session::parse("a~b".as_bytes()),
-            Err(Error::Malformed("Session"))
+            Err(Error::HeaderSyntax("Session"))
         );
         assert!(
             wire_text(&Session {
@@ -3021,7 +3026,7 @@ mod tests {
         for v in ["npt=", "npt=-", " = 1-"] {
             assert_eq!(
                 Range::parse(v.as_bytes()),
-                Err(Error::Malformed("Range")),
+                Err(Error::HeaderSyntax("Range")),
                 "{v}"
             );
         }
@@ -3064,7 +3069,7 @@ mod tests {
     #[test]
     fn transport_review_fixes() {
         use TransportParam as P;
-        let bad = Error::Malformed("Transport");
+        let bad = Error::HeaderSyntax("Transport");
         // RFC 2326 section 12.39, RFC 7826 section 18.54: mutually exclusive.
         assert_eq!(
             Transport::parse("RTP/AVP;unicast;multicast".as_bytes()),
@@ -3155,7 +3160,7 @@ mod tests {
 
     #[test]
     fn value_review_fixes() {
-        let bad = Error::Malformed("Range");
+        let bad = Error::HeaderSyntax("Range");
         let mut m = Message::request(Version::Rtsp20, "PLAY", "rtsp://h/a");
         // RFC 7826 section 4.4.1: frames below the rate, minutes and
         // seconds below 60.
@@ -3260,7 +3265,7 @@ mod tests {
         };
         assert!(wire_text(&s).is_err());
         m.set_header("Session", "a;timeout=10000000000000000000");
-        assert_eq!(m.session(), Err(Error::Malformed("Session")));
+        assert_eq!(m.session(), Err(Error::HeaderSyntax("Session")));
         m.set_header("Session", "a;timeout=9999999999999999999");
         assert_eq!(
             m.session(),
@@ -3289,10 +3294,10 @@ mod tests {
         m.push_header("CSeq", "1000000000");
         assert_eq!(m.cseq(), Ok(1_000_000_000));
         m.set_header("CSeq", "4294967296");
-        assert_eq!(m.cseq(), Err(Error::Malformed("CSeq")));
+        assert_eq!(m.cseq(), Err(Error::HeaderSyntax("CSeq")));
         let mut m = Message::request(Version::Rtsp20, "OPTIONS", "*");
         m.push_header("CSeq", "1000000000");
-        assert_eq!(m.cseq(), Err(Error::Malformed("CSeq")));
+        assert_eq!(m.cseq(), Err(Error::HeaderSyntax("CSeq")));
         // RFC 2326 section 12.38: the response echoes the Timestamp.
         let m = msg(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nTimestamp: 123.5\r\n\r\n");
         assert_eq!(m.reply(200, "OK").header("Timestamp"), Some("123.5"));
@@ -3437,9 +3442,9 @@ mod tests {
         // Header reads.
         let m =
             msg(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nCSeq: 2\r\nSession: a b\r\nRange: x\r\n\r\n");
-        assert_eq!(m.cseq(), Err(Error::Malformed("CSeq")));
-        assert_eq!(m.session(), Err(Error::Malformed("Session")));
-        assert_eq!(m.range(), Err(Error::Malformed("Range")));
+        assert_eq!(m.cseq(), Err(Error::HeaderSyntax("CSeq")));
+        assert_eq!(m.session(), Err(Error::HeaderSyntax("Session")));
+        assert_eq!(m.range(), Err(Error::HeaderSyntax("Range")));
         let m = msg(b"OPTIONS * RTSP/1.0\r\n\r\n");
         assert_eq!(m.cseq(), Err(Error::Missing("CSeq")));
         assert_eq!(m.session(), Err(Error::Missing("Session")));
@@ -3448,7 +3453,7 @@ mod tests {
         for bad in ["", "x", "-1", "+1", "1234567890", "1 2"] {
             let mut m = Message::request(Version::Rtsp20, "OPTIONS", "*");
             m.push_header("CSeq", bad);
-            assert_eq!(m.cseq(), Err(Error::Malformed("CSeq")), "{bad}");
+            assert_eq!(m.cseq(), Err(Error::HeaderSyntax("CSeq")), "{bad}");
         }
         let mut m = Message::request(Version::Rtsp10, "OPTIONS", "*");
         m.push_header("CSeq", "999999999");
@@ -3559,7 +3564,7 @@ mod tests {
         };
         assert_eq!(
             message.push_value("Session", &invalid),
-            Err(Error::Malformed("Session"))
+            Err(Error::HeaderSyntax("Session"))
         );
         assert_eq!(message, before);
         let binary = Interleaved {

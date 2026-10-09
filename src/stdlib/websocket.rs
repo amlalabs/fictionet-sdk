@@ -32,9 +32,14 @@
 //! [`Error`], and [`Error::close_code`] says which close code a real server
 //! sends before it drops the connection.
 //!
+//! A [`Service`](fictionet::stdlib::serve::Service) can use this decoder through
+//! [`serve::connection`](fictionet::stdlib::serve::connection). Change its mode
+//! between items with [`Driver::decoder`](fictionet::stdlib::serve::Driver::decoder).
+//! See `docs/services.md` for an SMTP DATA service.
+//!
 //! ```
-//! use fictionet::stdlib::codec::{Stream, Wire};
-//! use fictionet::stdlib::websocket::{check_request, Frame, Message, Messages, Opcode, Role};
+//! use fictionet::stdlib::codec::{Side, Stream, Wire};
+//! use fictionet::stdlib::websocket::{check_request, Frame, Message, Messages, Opcode};
 //!
 //! // The client's opening request, from RFC 6455 section 1.3.
 //! let headers = [
@@ -54,7 +59,7 @@
 //! assert!(reply.contains(&("Sec-WebSocket-Accept".to_string(), upgrade.accept.clone())));
 //!
 //! // A masked text frame from the client, from section 5.7.
-//! let mut stream = Stream::new(Messages::new(Role::Server));
+//! let mut stream = Stream::new(Messages::new(Side::Server));
 //! let bytes = [0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58];
 //! assert_eq!(stream.push(&bytes), bytes.len());
 //! let message = stream.next().unwrap().unwrap();
@@ -694,14 +699,7 @@ impl Message {
     }
 }
 
-/// Which side of the connection [`Frames`] reads for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Role {
-    /// The server, reading a client's frames, which must all be masked.
-    Server,
-    /// The client, reading a server's frames, which must not be masked.
-    Client,
-}
+use fictionet::stdlib::codec::Side;
 
 /// A text or binary message whose last frame has not come yet.
 #[derive(Clone, Debug)]
@@ -778,7 +776,7 @@ impl Wire for Frame {
 
 /// Reads one frame per call without retaining input bytes.
 ///
-/// Headers and mask direction follow [`Role`]. Data payloads are bounded
+/// The side is the reader: servers require masked frames, and clients require unmasked frames. Data payloads are bounded
 /// by [`Self::limit`]; control payloads may still use all 125 bytes.
 /// Lengths are refused from the header. Partial frames return [`Step::Need`],
 /// including at EOF, so [`codec::Stream`] reports truncation.
@@ -788,14 +786,14 @@ impl Wire for Frame {
 /// Use [`Messages`] for continuation order and text validation.
 #[derive(Clone, Debug)]
 pub struct Frames {
-    role: Role,
+    role: Side,
     limit: usize,
     closed: bool,
 }
 
 impl Frames {
     /// Reads frames for `role` with data payloads up to [`MAX_PAYLOAD`].
-    pub fn new(role: Role) -> Self {
+    pub fn new(role: Side) -> Self {
         Self {
             role,
             limit: MAX_PAYLOAD,
@@ -818,7 +816,7 @@ impl Frames {
     }
 
     /// The endpoint receiving these frames.
-    pub fn role(&self) -> Role {
+    pub fn role(&self) -> Side {
         self.role
     }
 
@@ -827,8 +825,8 @@ impl Frames {
             return Ok(None);
         };
         match (self.role, h.mask.is_some()) {
-            (Role::Server, false) => return Err(Error::Unmasked),
-            (Role::Client, true) => return Err(Error::Masked),
+            (Side::Server, false) => return Err(Error::Unmasked),
+            (Side::Client, true) => return Err(Error::Masked),
             _ => {}
         }
         if !h.opcode.is_control() && h.len > self.limit {
@@ -884,8 +882,8 @@ impl codec::Decode for Frames {
 /// handshake and write variants are not returned by this decoder.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire}, websocket::{Messages, Frame, Opcode, Role}};
-/// let mut stream = Stream::new(Messages::new(Role::Server));
+/// use fictionet::stdlib::{codec::{Side, Stream, Wire}, websocket::{Messages, Frame, Opcode}};
+/// let mut stream = Stream::new(Messages::new(Side::Server));
 /// let frame = Frame { fin: true, opcode: Opcode::Close, mask: Some([1; 4]), payload: vec![] };
 /// let mut bytes = Wire::to_bytes(&frame)?;
 /// bytes.extend_from_slice(b"next protocol");
@@ -905,7 +903,7 @@ pub struct Messages {
 
 impl Messages {
     /// Reads messages up to [`MAX_MESSAGE`] for the receiving `role`.
-    pub fn new(role: Role) -> Self {
+    pub fn new(role: Side) -> Self {
         Self::from_frames(Frames::new(role).with_limit(MAX_MESSAGE), MAX_MESSAGE)
     }
 
@@ -1596,7 +1594,7 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
-    fn decode(role: Role, bytes: &[u8]) -> (Vec<Message>, Option<Fail<AssembleError<Error>>>) {
+    fn decode(role: Side, bytes: &[u8]) -> (Vec<Message>, Option<Fail<AssembleError<Error>>>) {
         decode_all(|| Messages::new(role), bytes)
     }
 
@@ -2092,7 +2090,7 @@ mod tests {
         // The decoder too, for a masked stream.
         let stream: Vec<u8> = [&HELLO_MASKED[..], &long, &close].concat();
         for n in 0..stream.len() {
-            let mut d = Stream::new(Messages::new(Role::Server));
+            let mut d = Stream::new(Messages::new(Side::Server));
             push(&mut d, &stream[..n]);
             while let Some(m) = d.next() {
                 assert!(m.is_ok(), "{n} bytes");
@@ -2109,15 +2107,15 @@ mod tests {
             Message::Text("Hello".into()),
             Message::Text("Hello".into()),
         ];
-        assert_eq!(decode(Role::Client, &stream), (want.clone(), None));
+        assert_eq!(decode(Side::Client, &stream), (want.clone(), None));
         contract::check_decode_with_alloc_limit(
-            || Messages::new(Role::Client),
+            || Messages::new(Side::Client),
             &stream,
             2 * (MAX_HEADER_LEN + MAX_PAYLOAD),
         );
         // Server side.
         let stream: Vec<u8> = [&HELLO_MASKED[..], &PONG_MASKED].concat();
-        let (got, err) = decode(Role::Server, &stream);
+        let (got, err) = decode(Side::Server, &stream);
         assert_eq!(
             got,
             [
@@ -2128,7 +2126,7 @@ mod tests {
         assert_eq!(err, None);
         // Empty frames and messages.
         let stream = [0x02, 0x00, 0x00, 0x00, 0x80, 0x00, 0x81, 0x00];
-        let (got, _) = decode(Role::Client, &stream);
+        let (got, _) = decode(Side::Client, &stream);
         assert_eq!(got, [Message::Binary(vec![]), Message::Text(String::new())]);
     }
 
@@ -2137,16 +2135,16 @@ mod tests {
         // "é" is c3 a9, split between two frames.
         let stream = [0x01, 0x01, 0xc3, 0x80, 0x01, 0xa9];
         assert_eq!(
-            decode(Role::Client, &stream),
+            decode(Side::Client, &stream),
             (vec![Message::Text("é".into())], None)
         );
         // Bad text in one frame.
         assert_eq!(
-            decode(Role::Client, &[0x81, 0x02, 0xc3, 0x28]).1,
+            decode(Side::Client, &[0x81, 0x02, 0xc3, 0x28]).1,
             failure(Error::InvalidUtf8)
         );
         // A bad byte fails at once, before the last frame.
-        let mut d = Stream::new(Messages::new(Role::Client));
+        let mut d = Stream::new(Messages::new(Side::Client));
         push(&mut d, &[0x01, 0x02, 0x61, 0xff]);
         assert_eq!(
             d.next(),
@@ -2156,54 +2154,54 @@ mod tests {
         );
         // A character cut off at the end of the message.
         assert_eq!(
-            decode(Role::Client, &[0x01, 0x01, 0x61, 0x80, 0x01, 0xc3]).1,
+            decode(Side::Client, &[0x01, 0x01, 0x61, 0x80, 0x01, 0xc3]).1,
             failure(Error::InvalidUtf8)
         );
         // Binary messages are not checked.
         assert_eq!(
-            decode(Role::Client, &[0x82, 0x01, 0xff]).0,
+            decode(Side::Client, &[0x82, 0x01, 0xff]).0,
             [Message::Binary(vec![0xff])]
         );
         // Surrogates encoded in UTF-8 are invalid.
         assert_eq!(
-            decode(Role::Client, &[0x81, 0x03, 0xed, 0xa0, 0x80]).1,
+            decode(Side::Client, &[0x81, 0x03, 0xed, 0xa0, 0x80]).1,
             failure(Error::InvalidUtf8)
         );
     }
 
     #[test]
     fn decoder_errors() {
-        assert_eq!(decode(Role::Server, &HELLO).1, failure(Error::Unmasked));
+        assert_eq!(decode(Side::Server, &HELLO).1, failure(Error::Unmasked));
         assert_eq!(
-            decode(Role::Client, &HELLO_MASKED).1,
+            decode(Side::Client, &HELLO_MASKED).1,
             failure(Error::Masked)
         );
         assert_eq!(
-            decode(Role::Client, &LO).1,
+            decode(Side::Client, &LO).1,
             failure(Error::UnexpectedContinuation)
         );
         assert_eq!(
-            decode(Role::Client, &[&HEL[..], &HELLO].concat()).1,
+            decode(Side::Client, &[&HEL[..], &HELLO].concat()).1,
             failure(Error::ExpectedContinuation)
         );
         assert_eq!(
-            decode(Role::Client, &[0xc1, 0]).1,
+            decode(Side::Client, &[0xc1, 0]).1,
             failure(Error::ReservedBits(4))
         );
         assert_eq!(
-            decode(Role::Client, &[0x88, 0x01, 0x03]).1,
+            decode(Side::Client, &[0x88, 0x01, 0x03]).1,
             failure(Error::CloseShort)
         );
         assert_eq!(
-            decode(Role::Client, &[0x88, 0x02, 0x03, 0xed]).1,
+            decode(Side::Client, &[0x88, 0x02, 0x03, 0xed]).1,
             failure(Error::CloseCode(1005))
         );
         assert_eq!(
-            decode(Role::Client, &[0x88, 0x03, 0x03, 0xe8, 0xff]).1,
+            decode(Side::Client, &[0x88, 0x03, 0x03, 0xe8, 0xff]).1,
             failure(Error::CloseUtf8)
         );
         // A broken stream reports its error once and keeps unread bytes for handoff.
-        let mut d = Stream::new(Messages::new(Role::Server));
+        let mut d = Stream::new(Messages::new(Side::Server));
         push(&mut d, &HELLO);
         assert_eq!(
             d.next(),
@@ -2234,14 +2232,14 @@ mod tests {
     #[test]
     fn decoder_bounds_message_size() {
         // A frame over the limit is refused from its header alone.
-        let mut d = Stream::new(Messages::new(Role::Client).with_limit(10));
+        let mut d = Stream::new(Messages::new(Side::Client).with_limit(10));
         push(&mut d, &[0x82, 11]);
         assert_eq!(
             d.next(),
             Some(Err(Fail::Protocol(AssembleError::Inner(Error::TooBig))))
         );
         // Fragments that add up to more than the limit.
-        let mut d = Stream::new(Messages::new(Role::Client).with_limit(10));
+        let mut d = Stream::new(Messages::new(Side::Client).with_limit(10));
         push(&mut d, &[0x02, 6, 0, 0, 0, 0, 0, 0]);
         assert_eq!(d.next(), None);
         push(&mut d, &[0x80, 5]);
@@ -2250,13 +2248,13 @@ mod tests {
             Some(Err(Fail::Protocol(AssembleError::Inner(Error::TooBig))))
         );
         // Exactly the limit is fine, and control frames do not count.
-        let mut d = Stream::new(Messages::new(Role::Client).with_limit(3));
+        let mut d = Stream::new(Messages::new(Side::Client).with_limit(3));
         push(&mut d, &[0x02, 2, 1, 2, 0x89, 5, 1, 2, 3, 4, 5, 0x80, 1, 3]);
         assert_eq!(d.next(), Some(Ok(Message::Ping(vec![1, 2, 3, 4, 5]))));
         assert_eq!(d.next(), Some(Ok(Message::Binary(vec![1, 2, 3]))));
         // The limit is clamped.
         assert_eq!(
-            Messages::new(Role::Client).with_limit(usize::MAX).limit(),
+            Messages::new(Side::Client).with_limit(usize::MAX).limit(),
             MAX_MESSAGE
         );
     }
@@ -2269,7 +2267,7 @@ mod tests {
             |size| {
                 let n = size;
                 let stream: Vec<u8> = [0x8a, 0x00].repeat(n);
-                let mut d = Stream::new(Messages::new(Role::Client));
+                let mut d = Stream::new(Messages::new(Side::Client));
                 push(&mut d, &stream);
                 let mut count = 0;
                 while let Some(m) = d.next() {
@@ -2279,7 +2277,7 @@ mod tests {
                 assert_eq!(count, n);
                 assert_eq!(d.buffered(), 0);
                 // Pushing after some frames are taken out keeps the order.
-                let mut d = Stream::new(Messages::new(Role::Client));
+                let mut d = Stream::new(Messages::new(Side::Client));
                 push(&mut d, &[&PING[..], &HEL, &PING].concat());
                 assert_eq!(d.next(), Some(Ok(Message::Ping(b"Hello".to_vec()))));
                 assert_eq!(d.buffered(), HEL.len() + PING.len());
@@ -2296,9 +2294,9 @@ mod tests {
 
     #[test]
     fn decoder_has_accessors_and_clones() {
-        let frames = Frames::new(Role::Server).with_limit(100);
-        assert_eq!((frames.role(), frames.limit()), (Role::Server, 100));
-        let mut messages = Messages::new(Role::Client).with_limit(100);
+        let frames = Frames::new(Side::Server).with_limit(100);
+        assert_eq!((frames.role(), frames.limit()), (Side::Server, 100));
+        let mut messages = Messages::new(Side::Client).with_limit(100);
         assert_eq!(
             messages.decode(&HEL, false),
             Ok(codec::Step::Skip(HEL.len()))
@@ -2357,7 +2355,7 @@ mod tests {
 
     #[test]
     fn decoder_stops_after_close() {
-        let mut d = Stream::new(Messages::new(Role::Client));
+        let mut d = Stream::new(Messages::new(Side::Client));
         push(&mut d, &[0x88, 0x02, 0x03, 0xe8]);
         push(&mut d, &HELLO);
         assert_eq!(d.next(), Some(Ok(Message::Close(Some(Close::new(1000))))));
@@ -2367,7 +2365,7 @@ mod tests {
         assert_eq!(d.next(), None);
         assert_eq!(d.unread(), HELLO);
         assert_eq!(
-            decode(Role::Client, &[0x88, 0x00]).0,
+            decode(Side::Client, &[0x88, 0x00]).0,
             [Message::Close(None)]
         );
     }
@@ -2491,9 +2489,9 @@ mod tests {
                     stream.extend(f.to_bytes().unwrap());
                 }
             }
-            assert_eq!(decode(Role::Server, &stream), (messages.to_vec(), None));
+            assert_eq!(decode(Side::Server, &stream), (messages.to_vec(), None));
             contract::check_decode_with_alloc_limit(
-                || Messages::new(Role::Server),
+                || Messages::new(Side::Server),
                 &stream,
                 2 * (MAX_HEADER_LEN + MAX_PAYLOAD),
             );
@@ -2558,11 +2556,11 @@ mod tests {
 
     /// What the fuzz target checks, for one buffer.
     fn check_buffer(data: &[u8]) {
-        for role in [Role::Server, Role::Client] {
+        for role in [Side::Server, Side::Client] {
             bounded(|| Frames::new(role), data);
             bounded(|| Messages::new(role), data);
             contract::check_decode_with_held_limit(|| Messages::new(role), data, MAX_MESSAGE);
-            let mask = if role == Role::Server {
+            let mask = if role == Side::Server {
                 Some([5, 6, 7, 8])
             } else {
                 None
@@ -2607,7 +2605,7 @@ mod tests {
                     }
                     sent.push(message);
                 }
-                let role = if masked { Role::Server } else { Role::Client };
+                let role = if masked { Side::Server } else { Side::Client };
                 let ends = sent
                     .iter()
                     .position(|m| matches!(m, Message::Close(_)))
@@ -2686,7 +2684,7 @@ mod tests {
     #[test]
     fn review_push_is_bounded() {
         // One large push with a tiny limit holds at most one control frame.
-        let mut d = Stream::new(Messages::new(Role::Client).with_limit(1));
+        let mut d = Stream::new(Messages::new(Side::Client).with_limit(1));
         let _ = d.push(&vec![0x82; 1 << 20]);
         assert!(
             d.buffered() <= MAX_HEADER_LEN + MAX_CONTROL_PAYLOAD,
@@ -2694,7 +2692,7 @@ mod tests {
             d.buffered()
         );
         // Repeated pushes without taking messages out stop growing.
-        let mut d = Stream::new(Messages::new(Role::Client));
+        let mut d = Stream::new(Messages::new(Side::Client));
         let chunk = [0x8a, 0x00].repeat(rounds(1 << 22));
         for _ in 0..3 {
             let _ = d.push(&chunk);
@@ -2883,7 +2881,7 @@ mod tests {
         for frame in frames {
             frame.write(&mut stream).unwrap();
         }
-        assert_eq!(decode(Role::Server, &stream), (vec![m], None));
+        assert_eq!(decode(Side::Server, &stream), (vec![m], None));
         let close = Message::Close(None).to_masked_frames(1, || [9; 4]).unwrap();
         assert_eq!(
             close,
@@ -2898,7 +2896,7 @@ mod tests {
 
     #[test]
     fn review_push_takes_what_fits_and_loops_end() {
-        let mut d = Stream::new(Messages::new(Role::Client).with_limit(3));
+        let mut d = Stream::new(Messages::new(Side::Client).with_limit(3));
         assert_eq!(d.decoder().capacity(), MAX_HEADER_LEN + MAX_CONTROL_PAYLOAD);
         let stream = [0x8a, 0x00].repeat(200);
         let took = d.push(&stream);
@@ -2908,7 +2906,7 @@ mod tests {
         assert_eq!(d.push(&stream[took..]), 2);
         // A frame over the limit fails from its header, so a full decoder
         // never waits for more.
-        let mut d = Stream::new(Messages::new(Role::Client).with_limit(3));
+        let mut d = Stream::new(Messages::new(Side::Client).with_limit(3));
         let big = [&[0x82, 126, 0x01, 0x00][..], &[0; 256]].concat();
         let took = d.push(&big);
         assert_eq!(took, d.decoder().capacity());
@@ -2919,7 +2917,7 @@ mod tests {
         assert_eq!(d.push(&big[took..]), big.len() - took);
         assert_eq!(d.buffered(), took);
         // After a close, bytes are taken and dropped.
-        let mut d = Stream::new(Messages::new(Role::Client));
+        let mut d = Stream::new(Messages::new(Side::Client));
         push(&mut d, &[0x88, 0x00]);
         assert_eq!(d.next(), Some(Ok(Message::Close(None))));
         assert_eq!(d.next(), None);

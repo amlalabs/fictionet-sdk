@@ -118,7 +118,7 @@ pub fn serve(
     // The agent's sandbox has IPv6 off, and the sites keep their real
     // IPv4 addresses only.
     .ipv4_only()
-    .serve(fcx, attachments)?;
+    .start(fcx, attachments)?;
     Ok(())
 }
 

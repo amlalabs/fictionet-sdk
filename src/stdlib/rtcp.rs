@@ -691,7 +691,7 @@ pub enum Error {
     /// packet holds.
     Padding,
     /// A packet's contents do not fit its type; holds the packet type.
-    Malformed(u8),
+    PacketContents(u8),
     /// A compound packet has no packets.
     NoPackets,
     /// The first packet of a compound packet is not a sender or receiver
@@ -726,7 +726,7 @@ impl std::fmt::Display for Error {
             Error::Truncated => f.write_str("an RTCP packet runs past the end of the datagram"),
             Error::Version(v) => write!(f, "RTP version {v}, not 2"),
             Error::Padding => f.write_str("a padding count of 0 or more than the packet holds"),
-            Error::Malformed(t) => write!(f, "contents that do not fit RTCP packet type {t}"),
+            Error::PacketContents(t) => write!(f, "contents that do not fit RTCP packet type {t}"),
             Error::NoPackets => f.write_str("not a valid compound packet: no packets"),
             Error::FirstNotReport(t) => {
                 write!(
@@ -782,7 +782,7 @@ impl Body {
     /// Reads contents `c`, padding left out, of a packet of type `pt` with
     /// count field `count`.
     fn parse(pt: u8, count: u8, c: &[u8]) -> Result<Body, Error> {
-        let bad = Error::Malformed(pt);
+        let bad = Error::PacketContents(pt);
         let typed = (packet_type::SR..=packet_type::XR).contains(&pt);
         if typed && !c.len().is_multiple_of(4) {
             return Err(bad);
@@ -1307,7 +1307,7 @@ impl Packet {
         let content = &body[..body.len() - usize::from(padding)];
         let body = Body::parse(pt, count, content)?;
         if padding != 0 && body.is_remb() {
-            return Err(Error::Malformed(pt));
+            return Err(Error::PacketContents(pt));
         }
         Ok((Packet { body, padding }, len))
     }
@@ -2018,10 +2018,10 @@ mod tests {
         // A non-zero byte in the padding, and a chunk left over.
         let mut bad = b.clone();
         bad[15] = 1;
-        assert_eq!(Packet::parse(&bad), Err(Error::Malformed(202)));
+        assert_eq!(Packet::parse(&bad), Err(Error::PacketContents(202)));
         let mut bad = b.clone();
         bad[0] = 0x81;
-        assert_eq!(Packet::parse(&bad), Err(Error::Malformed(202)));
+        assert_eq!(Packet::parse(&bad), Err(Error::PacketContents(202)));
     }
 
     // RFC 3550 section 6.6.
@@ -2051,20 +2051,20 @@ mod tests {
         // A reason longer than the packet, and junk after it.
         assert_eq!(
             Packet::parse(&[0x80, 203, 0, 1, 9, 0, 0, 0]),
-            Err(Error::Malformed(203))
+            Err(Error::PacketContents(203))
         );
         assert_eq!(
             Packet::parse(&[0x80, 203, 0, 1, 0, 0, 1, 0]),
-            Err(Error::Malformed(203))
+            Err(Error::PacketContents(203))
         );
         assert_eq!(
             Packet::parse(&[0x80, 203, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(Error::Malformed(203))
+            Err(Error::PacketContents(203))
         );
         // A count past the contents.
         assert_eq!(
             Packet::parse(&[0x82, 203, 0, 1, 0, 0, 0, 7]),
-            Err(Error::Malformed(203))
+            Err(Error::PacketContents(203))
         );
     }
 
@@ -2083,7 +2083,7 @@ mod tests {
         );
         assert_eq!(
             Packet::parse(&[0x80, 204, 0, 1, 0, 0, 0, 1]),
-            Err(Error::Malformed(204))
+            Err(Error::PacketContents(204))
         );
     }
 
@@ -2114,7 +2114,7 @@ mod tests {
         // A NACK with no entries.
         assert_eq!(
             Packet::parse(&[0x81, 205, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]),
-            Err(Error::Malformed(205))
+            Err(Error::PacketContents(205))
         );
     }
 
@@ -2143,11 +2143,11 @@ mod tests {
         // A TMMBR with no entries, and one with half an entry.
         assert_eq!(
             Packet::parse(&[0x83, 205, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0]),
-            Err(Error::Malformed(205))
+            Err(Error::PacketContents(205))
         );
         assert_eq!(
             Packet::parse(&[0x84, 205, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(Error::Malformed(205))
+            Err(Error::PacketContents(205))
         );
         assert_eq!(
             Tmmb {
@@ -2216,7 +2216,11 @@ mod tests {
             with(0x83, 3, &[17, 96, 0, 0]),
             with(0x83, 2, &[]),
         ] {
-            assert_eq!(Packet::parse(&bad), Err(Error::Malformed(206)), "{bad:?}");
+            assert_eq!(
+                Packet::parse(&bad),
+                Err(Error::PacketContents(206)),
+                "{bad:?}"
+            );
         }
     }
 
@@ -2247,7 +2251,7 @@ mod tests {
         // A count that does not match is a bad REMB.
         let mut afb = bytes;
         afb[16] = 2;
-        assert_eq!(Packet::parse(&afb), Err(Error::Malformed(206)));
+        assert_eq!(Packet::parse(&afb), Err(Error::PacketContents(206)));
     }
 
     // RFC 3611 sections 4.4 and 4.5.
@@ -2285,11 +2289,11 @@ mod tests {
         // A block whose length runs past the packet, and a cut-off header.
         assert_eq!(
             Packet::parse(&[0x80, 207, 0, 2, 0, 0, 0, 7, 4, 0, 0, 2]),
-            Err(Error::Malformed(207))
+            Err(Error::PacketContents(207))
         );
         assert_eq!(
             Packet::parse(&[0x80, 207, 0, 0]),
-            Err(Error::Malformed(207))
+            Err(Error::PacketContents(207))
         );
     }
 
@@ -2419,32 +2423,32 @@ mod tests {
         );
         assert_eq!(
             Datagram::parse(&[0x80, 200, 0, 1, 0, 0, 0, 0]).map(|p| p.0),
-            Err(Error::Malformed(200))
+            Err(Error::PacketContents(200))
         );
         assert_eq!(
             Datagram::parse(&[0x81, 201, 0, 1, 0, 0, 0, 0]).map(|p| p.0),
-            Err(Error::Malformed(201))
+            Err(Error::PacketContents(201))
         );
         assert_eq!(
             Datagram::parse(&[0x80, 201, 0, 0]).map(|p| p.0),
-            Err(Error::Malformed(201))
+            Err(Error::PacketContents(201))
         );
         assert_eq!(
             Datagram::parse(&[0x81, 202, 0, 0]).map(|p| p.0),
-            Err(Error::Malformed(202))
+            Err(Error::PacketContents(202))
         );
         assert_eq!(
             Datagram::parse(&[0x80, 205, 0, 1, 0, 0, 0, 0]).map(|p| p.0),
-            Err(Error::Malformed(205))
+            Err(Error::PacketContents(205))
         );
         assert_eq!(
             Datagram::parse(&[0x81, 206, 0, 1, 0, 0, 0, 0]).map(|p| p.0),
-            Err(Error::Malformed(206))
+            Err(Error::PacketContents(206))
         );
         // A typed packet whose contents are not whole words.
         assert_eq!(
             Datagram::parse(&[0x80, 204, 0, 1, 0, 0, 0, 1]).map(|p| p.0),
-            Err(Error::Malformed(204))
+            Err(Error::PacketContents(204))
         );
         for e in [Error::Empty, Error::NoCname, Error::Version(0)] {
             assert!(!e.to_string().is_empty());
@@ -3106,7 +3110,11 @@ mod tests {
                     &vec![0; n],
                 ]
                 .concat();
-                assert_eq!(Packet::parse(&b), Err(Error::Malformed(207)), "{t} {n}");
+                assert_eq!(
+                    Packet::parse(&b),
+                    Err(Error::PacketContents(207)),
+                    "{t} {n}"
+                );
             }
         }
         for t in [xr::RECEIVER_REFERENCE_TIME, xr::DLRR, xr::VOIP_METRICS] {
@@ -3147,7 +3155,11 @@ mod tests {
         let head = [0x83, 206, 0, 3, 0, 0, 0, 1, 0, 0, 0, 2];
         for bad in [[4, 96, 0, 0x0f], [32, 96, 0, 0]] {
             let b = [&head[..], &bad].concat();
-            assert_eq!(Packet::parse(&b), Err(Error::Malformed(206)), "{bad:?}");
+            assert_eq!(
+                Packet::parse(&b),
+                Err(Error::PacketContents(206)),
+                "{bad:?}"
+            );
         }
     }
 
@@ -3173,7 +3185,7 @@ mod tests {
         let b = [
             0xaf, 206, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0, b'R', b'E', b'M', b'B', 1, 0, 0, 0, 0, 0, 0, 4,
         ];
-        assert_eq!(Packet::parse(&b), Err(Error::Malformed(206)));
+        assert_eq!(Packet::parse(&b), Err(Error::PacketContents(206)));
         assert_eq!(psfb(0, remb(vec![])).to_bytes(), Err(Error::Unwritable));
         // `REMB` with a count that does not match, or no SSRCs, is a bad
         // REMB, not other application layer feedback.
@@ -3183,12 +3195,16 @@ mod tests {
             [b'R', b'E', b'M', b'B', 0, 0, 0, 0],
         ] {
             let b = [&head[..], &fci].concat();
-            assert_eq!(Packet::parse(&b), Err(Error::Malformed(206)), "{fci:?}");
+            assert_eq!(
+                Packet::parse(&b),
+                Err(Error::PacketContents(206)),
+                "{fci:?}"
+            );
         }
         let b = [
             0x8f, 206, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, b'R', b'E', b'M', b'B',
         ];
-        assert_eq!(Packet::parse(&b), Err(Error::Malformed(206)));
+        assert_eq!(Packet::parse(&b), Err(Error::PacketContents(206)));
         assert_eq!(
             psfb(0, PayloadMessage::Afb(b"REMB".to_vec())).to_bytes(),
             Err(Error::Unwritable)
@@ -3219,7 +3235,11 @@ mod tests {
         assert_eq!(sd(b"").to_bytes(), Err(Error::Unwritable));
         for item in [[8, 2, 3, b'a'], [8, 0, 0, 0]] {
             let b = [&[0x81, 202, 0, 3, 0, 0, 0, 1][..], &item, &[0, 0, 0, 0]].concat();
-            assert_eq!(Packet::parse(&b), Err(Error::Malformed(202)), "{item:?}");
+            assert_eq!(
+                Packet::parse(&b),
+                Err(Error::PacketContents(202)),
+                "{item:?}"
+            );
         }
     }
 

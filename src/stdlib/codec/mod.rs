@@ -180,7 +180,7 @@ pub use interceptor::{
 pub use lcg::Lcg;
 pub use pipe::{Carry, DEFAULT_SPANS, Layered, Pipe, PipeError, Span, Spans};
 pub use reader::{Reader, Trailing, Truncated, be16, be24, be32, be64, le16, le24, le32, le64};
-pub use recorder::{Direction, Record, RecordKind, Recorder};
+pub use recorder::{Record, RecordKind, Recorder, Side};
 pub use stream::{Fail, PumpError, Stream, StreamEvent, finish, pump, try_pump};
 pub use work::Work;
 

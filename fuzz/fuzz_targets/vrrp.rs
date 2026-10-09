@@ -6,15 +6,16 @@
 //! built straight from the fuzz bytes, not only from what the parser
 //! accepts, so the writer sees values the parser never makes.
 #![no_main]
+use fictionet::stdlib::ip::Endpoints;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::vrrp::{
-    Addresses, Advertisement, AdvertisementV2, AdvertisementV3, Endpoints, Error, GROUP_V4,
-    GROUP_V6, MAX_ADDRESSES, checksum, checksum_rfc5798,
+    Addresses, Advertisement, AdvertisementV2, AdvertisementV3, Error, GROUP_V4, GROUP_V6,
+    MAX_ADDRESSES, checksum, checksum_rfc5798,
 };
 use fictionet::stdlib::{
-    codec::{Collect, Decode, Wire},
+    codec::{Collect, Decode},
     test_support::contract,
     vrrp,
 };
@@ -150,22 +151,20 @@ fn endpoints_from(data: &[u8]) -> Endpoints {
 
 fn check(data: &[u8], e: &Endpoints) {
     contract::check_decode_with_alloc_limit(
-        || Collect::<vrrp::Datagram>::new(vrrp::MAX_MESSAGE),
+        || Collect::bytes(vrrp::MAX_MESSAGE),
         data,
         2 * (vrrp::MAX_MESSAGE + 1),
     );
     contract::check_decode_with_alloc_limit(
-        || {
-            Collect::<vrrp::Datagram>::new(vrrp::MAX_MESSAGE)
-                .map(|datagram| Advertisement::parse(&datagram.0, e))
-        },
+        || Collect::bytes(vrrp::MAX_MESSAGE).map(|datagram| Advertisement::parse(&datagram, e)),
         data,
         2 * (vrrp::MAX_MESSAGE + 1),
     );
-    contract::check_wire::<vrrp::Datagram>(data);
-    contract::check_wire_value(&vrrp::Datagram(
-        data.iter().take(vrrp::MAX_MESSAGE + 1).copied().collect(),
-    ));
+    let raw = data[..data.len().min(vrrp::MAX_MESSAGE)].to_vec();
+    assert_eq!(
+        fictionet::stdlib::test_support::decode_all(|| Collect::bytes(vrrp::MAX_MESSAGE), &raw),
+        (vec![raw], None)
+    );
 
     let parsed = Advertisement::parse(data, e);
 
@@ -178,7 +177,7 @@ fn check(data: &[u8], e: &Endpoints) {
 
     if let Ok(a) = &parsed {
         // An advertisement read can be written, and reads back the same.
-        let bytes = a.frame(e).and_then(|frame| frame.to_bytes()).unwrap();
+        let bytes = a.frame(e).unwrap();
         assert_eq!(bytes.len(), data.len());
         written(a, &bytes, e);
     }
@@ -250,7 +249,7 @@ fn write(data: &[u8], e: &Endpoints) {
             addresses,
         })
     };
-    match ad.frame(e).and_then(|frame| frame.to_bytes()) {
+    match ad.frame(e) {
         Ok(bytes) => {
             assert_eq!(Ok(bytes.len()), ad.encoded_len(e));
             written(&ad, &bytes, e);

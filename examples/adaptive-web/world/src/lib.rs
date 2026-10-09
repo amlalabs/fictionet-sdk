@@ -390,7 +390,7 @@ pub fn serve(
     .date(start)
     // The agent's sandbox has IPv6 off.
     .ipv4_only()
-    .serve(fcx, attachments)?;
+    .start(fcx, attachments)?;
     Ok(())
 }
 

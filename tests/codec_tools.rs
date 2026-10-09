@@ -2,9 +2,9 @@ use core::{convert::Infallible, time::Duration};
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::{
     codec::{
-        Buffer, ByteFault, Carry, Decode, Demux, Direction, Ending, Fail, Faults, InterceptError,
-        Interceptor, ItemFault, Layered, Lines, RecordKind, Recorder, Rewrite, RewriteError, Rule,
-        Stream, Trigger, Wire, write_bounded,
+        Buffer, ByteFault, Carry, Decode, Demux, Ending, Fail, Faults, InterceptError, Interceptor,
+        ItemFault, Layered, Lines, RecordKind, Recorder, Rewrite, RewriteError, Rule, Side, Stream,
+        Trigger, Wire, write_bounded,
     },
     json, modbus, test_support,
     test_support::contract,
@@ -77,7 +77,7 @@ fn modbus_two_direction_proxy_records_input_and_faults_output() {
             &mut sent,
             &rules,
             write_bounded,
-            log.observer(0, Direction::ClientToServer),
+            log.observer(0, Side::Client),
         ) {
             if let Some(marker) = r.unwrap() {
                 markers.push((marker.at, marker.duration));
@@ -93,7 +93,7 @@ fn modbus_two_direction_proxy_records_input_and_faults_output() {
                 &mut sent,
                 &rules,
                 write_bounded,
-                log.observer(0, Direction::ClientToServer),
+                log.observer(0, Side::Client),
             )
             .is_none()
     );
@@ -116,7 +116,7 @@ fn modbus_two_direction_proxy_records_input_and_faults_output() {
             &mut server,
             &mut received,
             |_, _, _| Rewrite::Forward,
-            log.observer(0, Direction::ServerToClient),
+            log.observer(0, Side::Server),
         )
         .unwrap()
         .unwrap();
@@ -127,7 +127,7 @@ fn modbus_two_direction_proxy_records_input_and_faults_output() {
     assert_eq!(entries[3].range, 36..48);
     assert_eq!(entries[4].kind, RecordKind::Ended);
     assert_eq!(entries[5].range, 0..11);
-    assert_eq!(entries[5].direction, Direction::ServerToClient);
+    assert_eq!(entries[5].sender, Side::Server);
     assert_eq!(log.dropped(), 0);
 }
 
@@ -198,7 +198,7 @@ fn json_line_calls_are_logged_dropped_duplicated_and_results_rewritten() {
                 {
                     call_count += 1;
                 }
-                log.observe_tagged(0, Direction::ClientToServer, event);
+                log.observe_tagged(0, Side::Client, event);
             },
         ) {
             r.unwrap();
@@ -217,7 +217,7 @@ fn json_line_calls_are_logged_dropped_duplicated_and_results_rewritten() {
                 Rewrite::Replace(vec![replacement.clone()])
             },
             write_line,
-            log.observer(0, Direction::ServerToClient),
+            log.observer(0, Side::Server),
         )
         .unwrap()
         .unwrap();
@@ -252,7 +252,7 @@ fn byte_faults_run_before_modbus_and_line_decoding() {
     assert_eq!(stream.push(&damaged), 7);
     stream.end();
     assert_eq!(
-        stream.with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer)),
+        stream.with_next_observed(|_, _, _| (), log.observer(0, Side::Client)),
         Some(Err(Fail::Truncated { unread: 7 }))
     );
     assert_eq!(log.iter().next().unwrap().bytes, damaged);
@@ -353,7 +353,7 @@ fn pipe_inner_items_require_explicit_outer_framing() {
                     assert!(raw.is_empty());
                     assert_eq!(*range, bytes.len() as u64..bytes.len() as u64);
                 }
-                log.observe_tagged(0, Direction::ClientToServer, event);
+                log.observe_tagged(0, Side::Client, event);
             },
         )
         .unwrap()
@@ -394,7 +394,7 @@ fn demux_stream_access_composes_with_all_tools_and_shared_budget() {
             &mut out[usize::from(key)],
             &plan,
             write_bounded,
-            log.observer(u64::from(key), Direction::ClientToServer),
+            log.observer(u64::from(key), Side::Client),
         ) {
             r.unwrap();
         }
@@ -473,7 +473,7 @@ fn recorded_end_leaves_handoff_bytes_and_is_not_repeated() {
                 Rewrite::Forward
             },
             write_bounded::<modbus::Frame>,
-            log.observer(0, Direction::ClientToServer),
+            log.observer(0, Side::Client),
         )
         .unwrap()
         .unwrap();
@@ -485,7 +485,7 @@ fn recorded_end_leaves_handoff_bytes_and_is_not_repeated() {
                     &mut out,
                     |_, _, _| Rewrite::Forward,
                     write_bounded::<modbus::Frame>,
-                    log.observer(0, Direction::ClientToServer)
+                    log.observer(0, Side::Client)
                 )
                 .is_none()
         );
@@ -648,7 +648,7 @@ fn recorder_preserves_oversized_failure_ranges_with_truncation() {
         assert_eq!(stream.push(&[0, 0, 0, 1, 0, 2, 1, 3]), 8);
         assert!(
             stream
-                .with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
+                .with_next_observed(|_, _, _| (), log.observer(0, Side::Client))
                 .unwrap()
                 .is_err()
         );
@@ -670,7 +670,7 @@ fn recorder_preserves_oversized_failure_ranges_with_truncation() {
     stream.end();
     assert!(
         stream
-            .with_next_observed(|_, _, _| (), log.observer(0, Direction::ClientToServer))
+            .with_next_observed(|_, _, _| (), log.observer(0, Side::Client))
             .unwrap()
             .is_err()
     );
@@ -923,7 +923,7 @@ where
             &mut out,
             &[],
             write_bounded::<modbus::Frame>,
-            log.observer(0, Direction::ClientToServer),
+            log.observer(0, Side::Client),
         ) {
             result.unwrap();
         }
@@ -1015,7 +1015,7 @@ fn holds_and_delays_share_recording_and_forwarded_skips() {
         &mut out,
         &plan,
         write_bounded,
-        log.observer(9, Direction::ServerToClient),
+        log.observer(9, Side::Server),
     ) {
         if let Some(marker) = result.unwrap() {
             markers.push(marker);
@@ -1033,10 +1033,7 @@ fn holds_and_delays_share_recording_and_forwarded_skips() {
             .collect::<Vec<_>>(),
         input
     );
-    assert!(
-        log.iter()
-            .all(|r| r.tag == 9 && r.direction == Direction::ServerToClient)
-    );
+    assert!(log.iter().all(|r| r.tag == 9 && r.sender == Side::Server));
     assert_eq!(
         log.iter()
             .filter(|r| matches!(r.kind, RecordKind::Item(_)))

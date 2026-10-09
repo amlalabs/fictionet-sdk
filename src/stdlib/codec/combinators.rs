@@ -40,13 +40,14 @@ impl<D: Decode, U, F: FnMut(D::Item) -> U> Decode for Map<D, F> {
 }
 
 /// Collects one complete [`Wire`] value at EOF, including empty values.
+/// [`Collect::bytes`] yields the raw bytes without parsing.
 /// Input stays in the driver's buffer.
-pub struct Collect<M> {
+pub struct Collect<M, const RAW: bool = false> {
     limit: usize,
     taken: bool,
     marker: PhantomData<M>,
 }
-impl<M> Collect<M> {
+impl<M, const RAW: bool> Collect<M, RAW> {
     /// Accepts at most `limit` bytes. Clamps to [`Buffer::MAX_LIMIT`] minus
     /// one so a byte beyond the limit can be refused before EOF.
     pub fn new(limit: usize) -> Self {
@@ -55,6 +56,12 @@ impl<M> Collect<M> {
             taken: false,
             marker: PhantomData,
         }
+    }
+}
+impl Collect<Vec<u8>, true> {
+    /// Collects one raw byte vector at EOF, bounded by `limit`.
+    pub fn bytes(limit: usize) -> Self {
+        Self::new(limit)
     }
 }
 /// Why collection failed.
@@ -92,6 +99,29 @@ impl<M: Wire> Decode for Collect<M> {
         self.limit.saturating_add(1)
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<M>, Self::Error> {
+        self.collect(input, eof, M::parse)
+    }
+}
+
+impl Decode for Collect<Vec<u8>, true> {
+    type Item = Vec<u8>;
+    type Error = CollectError<core::convert::Infallible>;
+    const NAME: &'static str = "bytes";
+    fn capacity(&self) -> usize {
+        self.limit.saturating_add(1)
+    }
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Self::Error> {
+        self.collect(input, eof, |bytes| Ok(bytes.to_vec()))
+    }
+}
+
+impl<M, const RAW: bool> Collect<M, RAW> {
+    fn collect<T, E>(
+        &mut self,
+        input: &[u8],
+        eof: bool,
+        parse: impl FnOnce(&[u8]) -> Result<T, E>,
+    ) -> Result<Step<T>, CollectError<E>> {
         if self.taken {
             return Ok(Step::End);
         }
@@ -101,7 +131,7 @@ impl<M: Wire> Decode for Collect<M> {
         if !eof {
             return Ok(Step::Need);
         }
-        let item = M::parse(input).map_err(CollectError::Parse)?;
+        let item = parse(input).map_err(CollectError::Parse)?;
         self.taken = true;
         Ok(Step::Item(item, input.len()))
     }

@@ -305,41 +305,51 @@ fn rip_and_ripng_messages() {
 }
 
 // Context stays in a closure, as in the RPC/NFS reference stack.
-fn context_round_trip<D, M, E>(bytes: &[u8], limit: usize, parse: impl Fn(&[u8]) -> Result<M, E>)
-where
-    D: Wire + Clone + Debug + PartialEq,
-    D::ParseError: Clone + Debug + PartialEq,
-    D::WriteError: Debug,
-    M: Debug + PartialEq,
-    E: Debug + PartialEq,
-{
-    let raw = D::parse(bytes).unwrap();
-    assert_eq!(round_trip(&raw, limit), bytes);
-    let make =
-        || Collect::<D>::new(limit).map(|datagram| parse(&Wire::to_bytes(&datagram).unwrap()));
+fn context_round_trip<M: Debug + PartialEq, E: Debug + PartialEq>(
+    bytes: &[u8],
+    limit: usize,
+    parse: impl Fn(&[u8]) -> Result<M, E>,
+) {
+    let raw =
+        contract::check_decode_with_alloc_limit(|| Collect::bytes(limit), bytes, 2 * (limit + 1));
+    assert_eq!(raw, (vec![bytes.to_vec()], None));
+    let make = || Collect::bytes(limit).map(|datagram| parse(&datagram));
     let (items, failure) = contract::check_decode_with_alloc_limit(make, bytes, 2 * (limit + 1));
     assert_eq!(items, vec![parse(bytes)]);
     assert_eq!(failure, None);
 }
 
+fn raw_too_long(limit: usize) {
+    let bytes = vec![0; limit + 1];
+    let (items, failure) =
+        contract::check_decode_with_alloc_limit(|| Collect::bytes(limit), &bytes, 2 * (limit + 1));
+    assert!(items.is_empty());
+    assert_eq!(
+        failure,
+        Some(fictionet::stdlib::codec::Fail::Protocol(
+            fictionet::stdlib::codec::CollectError::TooLong { limit }
+        ))
+    );
+}
+
 #[test]
 fn ospf_context_stays_in_the_mapping() {
     let endpoints = [
-        ospf::Endpoints::V4 {
+        fictionet::stdlib::ip::Endpoints::V4 {
             source: Ipv4Addr::new(192, 0, 2, 1),
             destination: ospf::ALL_SPF_ROUTERS_V4,
         },
-        ospf::Endpoints::V6 {
+        fictionet::stdlib::ip::Endpoints::V6 {
             source: "fe80::1".parse().unwrap(),
             destination: ospf::ALL_SPF_ROUTERS_V6,
         },
     ];
     for endpoints in endpoints {
         let header = match endpoints {
-            ospf::Endpoints::V4 { .. } => ospf::Header::V2 {
+            fictionet::stdlib::ip::Endpoints::V4 { .. } => ospf::Header::V2 {
                 auth: ospf::Auth::Null,
             },
-            ospf::Endpoints::V6 { .. } => ospf::Header::V3 { instance_id: 1 },
+            fictionet::stdlib::ip::Endpoints::V6 { .. } => ospf::Header::V3 { instance_id: 1 },
         };
         let packet = ospf::Packet {
             router_id: Ipv4Addr::new(192, 0, 2, 1),
@@ -352,12 +362,9 @@ fn ospf_context_stays_in_the_mapping() {
                 advertising_router: Ipv4Addr::new(192, 0, 2, 3),
             }]),
         };
-        let mut bytes = packet
-            .frame(&endpoints)
-            .and_then(|frame| frame.to_bytes())
-            .unwrap();
+        let mut bytes = packet.frame(&endpoints).unwrap();
         assert_eq!(ospf::Packet::parse(&bytes, &endpoints), Ok(packet));
-        context_round_trip::<ospf::Datagram, _, _>(&bytes, ospf::MAX_MESSAGE, |b| {
+        context_round_trip(&bytes, ospf::MAX_MESSAGE, |b| {
             ospf::Packet::parse(b, &endpoints)
         });
         *bytes.get_mut(12).unwrap() ^= 1;
@@ -365,38 +372,34 @@ fn ospf_context_stays_in_the_mapping() {
             ospf::Packet::parse(&bytes, &endpoints),
             Err(ospf::Error::Checksum)
         );
-        context_round_trip::<ospf::Datagram, _, _>(&bytes, ospf::MAX_MESSAGE, |b| {
+        context_round_trip(&bytes, ospf::MAX_MESSAGE, |b| {
             ospf::Packet::parse(b, &endpoints)
         });
         bytes.pop();
-        context_round_trip::<ospf::Datagram, _, _>(&bytes, ospf::MAX_MESSAGE, |b| {
+        context_round_trip(&bytes, ospf::MAX_MESSAGE, |b| {
             ospf::Packet::parse(b, &endpoints)
         });
     }
-    contract::check_refused(&ospf::Datagram(vec![0; ospf::MAX_MESSAGE + 1]));
-    parse_failure::<ospf::Datagram>(&vec![0; ospf::MAX_MESSAGE + 1], ospf::MAX_MESSAGE + 1);
+    raw_too_long(ospf::MAX_MESSAGE);
 }
 
 #[test]
 fn pim_context_stays_in_the_mapping() {
     let endpoints = [
-        pim::Endpoints::V4 {
+        fictionet::stdlib::ip::Endpoints::V4 {
             source: Ipv4Addr::new(192, 0, 2, 1),
             destination: pim::ALL_PIM_ROUTERS_V4,
         },
-        pim::Endpoints::V6 {
+        fictionet::stdlib::ip::Endpoints::V6 {
             source: "fe80::1".parse().unwrap(),
             destination: pim::ALL_PIM_ROUTERS_V6,
         },
     ];
     for endpoints in endpoints {
         let message = pim::Message::Hello(vec![pim::HelloOption::Holdtime(105)]);
-        let mut bytes = message
-            .frame(&endpoints)
-            .and_then(|frame| frame.to_bytes())
-            .unwrap();
+        let mut bytes = message.frame(&endpoints).unwrap();
         assert_eq!(pim::Message::parse(&bytes, &endpoints), Ok(message));
-        context_round_trip::<pim::Datagram, _, _>(&bytes, pim::MAX_MESSAGE, |b| {
+        context_round_trip(&bytes, pim::MAX_MESSAGE, |b| {
             pim::Message::parse(b, &endpoints)
         });
         *bytes.get_mut(2).unwrap() ^= 1;
@@ -404,24 +407,23 @@ fn pim_context_stays_in_the_mapping() {
             pim::Message::parse(&bytes, &endpoints),
             Err(pim::Error::Checksum)
         );
-        context_round_trip::<pim::Datagram, _, _>(&bytes, pim::MAX_MESSAGE, |b| {
+        context_round_trip(&bytes, pim::MAX_MESSAGE, |b| {
             pim::Message::parse(b, &endpoints)
         });
-        context_round_trip::<pim::Datagram, _, _>(&[], pim::MAX_MESSAGE, |b| {
+        context_round_trip(&[], pim::MAX_MESSAGE, |b| {
             pim::Message::parse(b, &endpoints)
         });
     }
-    contract::check_refused(&pim::Datagram(vec![0; pim::MAX_MESSAGE + 1]));
-    parse_failure::<pim::Datagram>(&vec![0; pim::MAX_MESSAGE + 1], pim::MAX_MESSAGE + 1);
+    raw_too_long(pim::MAX_MESSAGE);
 }
 
 #[test]
 fn vrrp_context_stays_in_the_mapping() {
-    let v4 = vrrp::Endpoints::V4 {
+    let v4 = fictionet::stdlib::ip::Endpoints::V4 {
         source: Ipv4Addr::new(192, 0, 2, 1),
         destination: vrrp::GROUP_V4,
     };
-    let v6 = vrrp::Endpoints::V6 {
+    let v6 = fictionet::stdlib::ip::Endpoints::V6 {
         source: "fe80::1".parse().unwrap(),
         destination: vrrp::GROUP_V6,
     };
@@ -457,15 +459,12 @@ fn vrrp_context_stays_in_the_mapping() {
         ),
     ];
     for (endpoints, advertisement) in cases {
-        let mut bytes = advertisement
-            .frame(&endpoints)
-            .and_then(|frame| frame.to_bytes())
-            .unwrap();
+        let mut bytes = advertisement.frame(&endpoints).unwrap();
         assert_eq!(
             vrrp::Advertisement::parse(&bytes, &endpoints),
             Ok(advertisement)
         );
-        context_round_trip::<vrrp::Datagram, _, _>(&bytes, vrrp::MAX_MESSAGE, |b| {
+        context_round_trip(&bytes, vrrp::MAX_MESSAGE, |b| {
             vrrp::Advertisement::parse(b, &endpoints)
         });
         *bytes.get_mut(6).unwrap() ^= 1;
@@ -473,7 +472,7 @@ fn vrrp_context_stays_in_the_mapping() {
             vrrp::Advertisement::parse(&bytes, &endpoints),
             Err(vrrp::Error::Checksum)
         );
-        context_round_trip::<vrrp::Datagram, _, _>(&bytes, vrrp::MAX_MESSAGE, |b| {
+        context_round_trip(&bytes, vrrp::MAX_MESSAGE, |b| {
             vrrp::Advertisement::parse(b, &endpoints)
         });
         bytes.push(0);
@@ -481,12 +480,11 @@ fn vrrp_context_stays_in_the_mapping() {
             vrrp::Advertisement::parse(&bytes, &endpoints),
             Err(vrrp::Error::Trailing { remaining: 1 })
         );
-        context_round_trip::<vrrp::Datagram, _, _>(&bytes, vrrp::MAX_MESSAGE, |b| {
+        context_round_trip(&bytes, vrrp::MAX_MESSAGE, |b| {
             vrrp::Advertisement::parse(b, &endpoints)
         });
     }
-    contract::check_refused(&vrrp::Datagram(vec![0; vrrp::MAX_MESSAGE + 1]));
-    parse_failure::<vrrp::Datagram>(&vec![0; vrrp::MAX_MESSAGE + 1], vrrp::MAX_MESSAGE + 1);
+    raw_too_long(vrrp::MAX_MESSAGE);
 }
 
 #[test]

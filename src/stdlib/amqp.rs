@@ -16,8 +16,9 @@
 //! reference for it, including RabbitMQ's field value types and its
 //! extensions to the connection and basic classes.
 //!
-//! Nothing here reads a socket. A world that plays a broker pushes the bytes
-//! it reads from a TCP connection to a [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Frame`]s back,
+//! A broker [`Service`](fictionet::stdlib::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Frames`] to receive [`Frame`]s.
+//! In `on_item`, call `driver.decoder().set_frame_max()` after negotiation. It
 //! reads each method frame's [`Method`], and writes the reply's bytes back
 //! to the connection. Which exchanges and queues exist, and where a message
 //! goes, is up to world code.

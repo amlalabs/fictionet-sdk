@@ -104,7 +104,7 @@ fn main() -> fictionet::Result {
                 "example.test" => Some(web::Site::new(app.clone())),
                 _ => None,
             })
-            .serve(&fcx, slow)?;
+            .start(&fcx, slow)?;
             Ok(())
         },
     ))

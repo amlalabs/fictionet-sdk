@@ -8,7 +8,7 @@
 //!
 //! # Putting something in front of every sandbox
 //!
-//! [`web::Sites::serve`](crate::stdlib::web::Sites::serve) takes the
+//! [`web::Sites::start`](crate::stdlib::web::Sites::start) takes the
 //! world's [`Attachments`](crate::Attachments): every sandbox that attaches,
 //! now or later. To slow down, limit or watch a sandbox's traffic, put a
 //! piece of the network between each sandbox and `Sites`.
@@ -20,9 +20,9 @@
 //! ```
 //! # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
 //! # fn site_for(_host: &str) -> Option<web::Site> { None }
-//! # fn world(fcx: Cx, attachments: Attachments) -> Result {
+//! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
 //! let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
-//! web::Sites::new(site_for).serve(&fcx, far)?;
+//! web::Sites::new(site_for).start(&fcx, far)?;
 //! # Ok(())
 //! # }
 //! ```

@@ -15,10 +15,10 @@
 //! 1929 (the username and password login), the SOCKS4 protocol document,
 //! and its SOCKS4a extension, which lets the client send a domain name.
 //!
-//! A world that plays a proxy pushes client bytes into
-//! [`Stream<ClientMessages>`](fictionet::stdlib::codec::Stream). It answers each
-//! [`ClientMessage`] and chooses the next phase with [`ClientMessages::select`]
-//! or [`ClientMessages::verified`]. A client uses
+//! A proxy [`Service`](fictionet::stdlib::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`ClientMessages`]. In `on_item`, it
+//! answers each [`ClientMessage`] and chooses the next phase with
+//! `driver.decoder().select()` or `driver.decoder().verified()`. A client uses
 //! [`Stream<ServerMessages>`](fictionet::stdlib::codec::Stream). After the last handshake
 //! item, `swap` or `into_parts` hands unread bytes to the tunnel protocol.
 //! While a decision is pending, input stays buffered up to the unit limit.

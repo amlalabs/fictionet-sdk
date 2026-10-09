@@ -25,8 +25,9 @@
 //! answers with [`ServerMessage`]s. A client uses [`Client`]. Each session
 //! tracks both directions, since the next peer unit depends on what was
 //! sent. The byte layers are [`Stream<ClientMessages>`](fictionet::stdlib::codec::Stream)
-//! and [`Stream<ServerMessages>`](fictionet::stdlib::codec::Stream). Change modes between
-//! items. Unsupported security and closed sessions preserve the unread
+//! and [`Stream<ServerMessages>`](fictionet::stdlib::codec::Stream). A [`Service`](fictionet::stdlib::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::serve::connection) can instead use [`ClientMessages`] directly,
+//! calling `driver.decoder().set_phase()` in `on_item` as the handshake advances. Unsupported security and closed sessions preserve the unread
 //! suffix for `into_parts` or `swap`.
 //!
 //! The module carries the VNC Authentication challenge and response but

@@ -53,12 +53,12 @@ pub const SHARED: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
 const SHARED6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x113, 0, 0, 0, 0, 0x10);
 
 fn main() -> Result {
-    run(world)
+    run(start)
 }
 
 /// Starts a world on the socket and writes its CA certificate.
 pub fn run(
-    world: fn(
+    start: fn(
         &fictionet::Cx,
         Vec<rustls::pki_types::CertificateDer<'static>>,
         PrivateKeyDer<'static>,
@@ -113,19 +113,19 @@ pub fn run(
         .build()?;
     runtime.block_on(fictionet::run(
         fictionet::Seed::random(),
-        move |fcx| async move { world(&fcx, chain, key, attachments) },
+        move |fcx| async move { start(&fcx, chain, key, attachments) },
     ))
 }
 
 /// Builds the world's sites on `attachments`, with `chain` and `key` for
 /// every HTTPS name.
-fn world(
+fn start(
     fcx: &fictionet::Cx,
     chain: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     attachments: fictionet::Attachments,
 ) -> Result {
-    web::Sites::new(sites(fcx, chain, key, app(), plain())?).serve(fcx, attachments)
+    web::Sites::new(sites(fcx, chain, key, app(), plain())?).start(fcx, attachments)
 }
 
 /// The HTTPS app, shared by all four HTTPS names.

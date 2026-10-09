@@ -5,7 +5,7 @@
 //! [`Net`] builds the whole network around the [`Host`]s a world declares.
 //! Each host has addresses, DNS names, and services on its ports: any
 //! [`Service`] over TCP or UDP, the same over TLS chosen by SNI, and any
-//! [`Accept`] of the world's own, such as [`httpd::Server`] for HTTP with
+//! [`PortServer`] of the world's own, such as [`httpd::Server`] for HTTP with
 //! name-based virtual hosting. Every sandbox that attaches is put on the
 //! sandboxes' subnet, given an address by DHCP or by its first packet, and
 //! kept from reaching the other sandboxes. A world then writes only its
@@ -23,19 +23,19 @@
 //! # impl serve::Service for $t {
 //! #     type Decoder = fictionet::stdlib::codec::Lines; type State = $w; type Error = std::convert::Infallible;
 //! #     fn decoder(&self) -> Self::Decoder { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
-//! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &$w, _: &mut serve::Driver<'_>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
+//! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &$w, _: &mut serve::Driver<'_, Self::Decoder>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
 //! # } } }
 //! # svc!(Ldap, Directory); svc!(Plc, Plant);
-//! # fn world(fcx: Cx, attachments: Attachments) -> Result {
+//! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
 //! let directory = Arc::new(Directory);
 //! let plant = Arc::new(Plant);
 //! let intranet = httpd::Router::new().get("/", |_, _| http::Response::new("intranet\n".into()));
 //! fcx.events().to_file("/tmp/office-events.jsonl")?;
 //! Net::new()
 //!     .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp(389, directory.clone(), || Ldap))
-//!     .host("www", |h| h.dns_name("intranet.corp.test").accept(80, httpd::Server::new(intranet)))
+//!     .host("www", |h| h.dns_name("intranet.corp.test").port_server(80, httpd::Server::new(intranet)))
 //!     .host("plc1", |h| h.at("10.30.0.5".parse::<std::net::Ipv4Addr>().unwrap()).tcp(502, plant, || Plc))
-//!     .serve(&fcx, attachments)?;
+//!     .start(&fcx, attachments)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -44,7 +44,7 @@
 //! world of websites, whose hosts appear as their names are looked up
 //! ([`Net::resolve`]).
 //!
-//! # What `serve` builds
+//! # What `start` builds
 //!
 //! - **The sandboxes' side.** Every sandbox that attaches, now or later,
 //!   joins two subnets: `10.0.0.0/24` for IPv4, with the gateway and the DNS
@@ -85,8 +85,8 @@
 //!   that sandbox's [`Budget`], 256 MiB unless [`Limits::sandbox_budget`]
 //!   says otherwise. A connection that would pass it is closed. The service
 //!   driver charges its buffers and what the service reports holding, and
-//!   HTTP/2 charges the bodies it holds ([`serve`] lists each charge). An
-//!   [`Accept`] of your own charges what it chooses. A sandbox has one
+//!   HTTP/2 charges the bodies it holds ([`serve`] lists each charge). A
+//!   [`PortServer`] of your own charges what it chooses. A sandbox has one
 //!   budget for both its addresses, from when it attaches until it
 //!   detaches. A trusted sandbox ([`Net::route`]) has none.
 //! - **Every link** inside the network holds at most 4 MiB of packets each
@@ -103,7 +103,7 @@
 //! - **Errors.** A host that cannot be served as declared, such as one at
 //!   an address a host cannot have, two services on one port (one with
 //!   TLS and one without count as two), or a port
-//!   that cannot be listened on, makes [`Net::serve`] fail.
+//!   that cannot be listened on, makes [`Net::start`] fail.
 //!
 //! The limits and rules are those [`web::Sites`](fictionet::stdlib::web::Sites)
 //! documents in detail, which runs on this.
@@ -233,7 +233,7 @@ enum Family {
 /// Picks the TLS config for one handshake, with randomness from the `Cx`.
 pub type ConfigFor = Arc<dyn Fn(&Cx) -> Arc<ServerConfig> + Send + Sync>;
 
-/// One connection, accepted on a port of a machine, as an [`Accept`] gets
+/// One connection, accepted on a port of a machine, as a [`PortServer`] gets
 /// it.
 pub struct Arrival {
     /// The connection: after the TLS handshake, on a TLS port.
@@ -254,7 +254,7 @@ pub struct Arrival {
 /// Serves connections on one port of a host. [`Host::tcp`] and
 /// [`Host::tls`] make one for a [`Service`]; [`httpd::Server`] is HTTP's.
 /// A world writes its own for anything else.
-pub trait Accept: Any + Send + Sync {
+pub trait PortServer: Any + Send + Sync {
     /// Serves one connection.
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -272,7 +272,7 @@ pub trait Accept: Any + Send + Sync {
     /// alone, which on a plain port is an error. The default takes only
     /// itself. On a TLS port, subsequent hosts are offered to the first
     /// installed accept, even if it declined an earlier host.
-    fn share(&self, names: &[String], other: &Arc<dyn Accept>) -> bool {
+    fn share(&self, names: &[String], other: &Arc<dyn PortServer>) -> bool {
         let _ = names;
         std::ptr::addr_eq(self as *const Self, Arc::as_ptr(other))
     }
@@ -297,26 +297,15 @@ impl<S: Service, M> ServiceAccept<S, M> {
     }
 }
 
-impl<S, M> Accept for ServiceAccept<S, M>
+impl<S, M> PortServer for ServiceAccept<S, M>
 where
     S: Service,
     M: Fn() -> S + Send + Sync + 'static,
     <S::Decoder as Decode>::Error: Clone + Send,
 {
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let Some(guard) = Counted::enter(&self.open, self.opts.max_conns) else {
-            let (src, dst) = (arrival.info.peer, arrival.info.local);
-            let event = blocked_event(
-                BlockedWhy::TooManyConnections,
-                Some(PROTO_TCP),
-                src.map(|a| a.ip()),
-                dst.map(|a| a.ip()),
-            );
-            let conn = ConnInfo {
-                sandbox: arrival.info.sandbox.clone(),
-                ..ConnInfo::default()
-            };
-            fcx.record_repeat(event.conn(&conn), port_detail(dst.map(|a| a.port())));
+        let Some(guard) = connection_limit(&fcx, &arrival.info, &self.open, self.opts.max_conns)
+        else {
             arrival.socket.reset();
             return Box::pin(async {});
         };
@@ -330,7 +319,7 @@ where
         opts.handshake = arrival.handshake;
         let (conn, info) = (arrival.conn, arrival.info);
         Box::pin(async move {
-            let _ = serve::serve(&fcx, conn, info, &mut service, &state, &opts).await;
+            let _ = serve::connection(&fcx, conn, info, &mut service, &state, &opts).await;
         })
     }
 }
@@ -360,11 +349,11 @@ impl From<&str> for Sni {
 /// What a host serves on one port.
 #[derive(Clone)]
 enum PortSpec {
-    Tcp(Arc<dyn Accept>),
+    Tcp(Arc<dyn PortServer>),
     Tls {
         sni: Sni,
         config: ConfigFor,
-        accept: Arc<dyn Accept>,
+        accept: Arc<dyn PortServer>,
     },
     Udp(UdpStart),
 }
@@ -402,7 +391,7 @@ impl Host {
     ///
     /// The address must be one a host can have, outside the sandboxes'
     /// subnet: not unspecified, broadcast, multicast or loopback, and for
-    /// IPv6 not link-local or IPv4-mapped. If it is not, [`Net::serve`]
+    /// IPv6 not link-local or IPv4-mapped. If it is not, [`Net::start`]
     /// fails; a host made by [`Net::resolve`] is not served, and its name
     /// gets NXDOMAIN.
     pub fn at(self, addr: impl Into<IpAddr>) -> Host {
@@ -482,7 +471,7 @@ impl Host {
         M: Fn() -> S + Send + Sync + 'static,
         <S::Decoder as Decode>::Error: Clone + Send,
     {
-        self.accept(port, ServiceAccept::new(state, make, opts))
+        self.port_server(port, ServiceAccept::new(state, make, opts))
     }
 
     /// Serves TCP `port` with TLS for the names `sni` gives, then a
@@ -507,7 +496,7 @@ impl Host {
     }
 
     /// Serves TCP `port` with `accept`.
-    pub fn accept(mut self, port: u16, accept: impl Accept) -> Host {
+    pub fn port_server(mut self, port: u16, accept: impl PortServer) -> Host {
         self.ports.push((port, PortSpec::Tcp(Arc::new(accept))));
         self
     }
@@ -519,7 +508,7 @@ impl Host {
         port: u16,
         sni: impl Into<Sni>,
         config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
-        accept: impl Accept,
+        accept: impl PortServer,
     ) -> Host {
         let spec = PortSpec::Tls {
             sni: sni.into(),
@@ -531,7 +520,7 @@ impl Host {
     }
 
     /// Serves UDP `port` with one [`Service`] made by `make`, which gets
-    /// every datagram ([`serve::serve_datagram`]).
+    /// every datagram ([`serve::datagram`]).
     pub fn udp<S, M>(self, port: u16, state: Arc<S::State>, make: M) -> Host
     where
         S: Service,
@@ -563,7 +552,7 @@ impl Host {
                 opts.sandbox = sandbox;
             }
             fcx.spawn(move |fcx| async move {
-                Ok(serve::serve_datagram(&fcx, socket, local, &mut service, &state, &opts).await?)
+                Ok(serve::datagram(&fcx, socket, local, &mut service, &state, &opts).await?)
             });
         });
         self.ports.push((port, PortSpec::Udp(start)));
@@ -631,7 +620,7 @@ impl Net {
     /// gateway and DNS server take the address after the subnet's own. An
     /// IPv4 subnet must have a length from 8 to 30; an IPv6 one from 8 to
     /// 126, inside `2000::/3` or `fc00::/7`. Otherwise
-    /// [`serve`](Net::serve) fails.
+    /// [`start`](Net::start) fails.
     pub fn subnet(self, subnet: Prefix) -> Net {
         match subnet.addr {
             IpAddr::V4(_) => Net { subnet, ..self },
@@ -710,7 +699,7 @@ impl Net {
     /// `lan.drop` [repeats](fictionet::events#repeats), with the reason in `why`
     /// and the LAN name in `lan`.
     ///
-    /// [`serve`](Net::serve) fails if `prefix` overlaps the sandboxes'
+    /// [`start`](Net::start) fails if `prefix` overlaps the sandboxes'
     /// subnets or another LAN, or leaves no room for members.
     pub fn lan(mut self, name: &str, prefix: Prefix) -> Net {
         self.lans.push((name.to_owned(), prefix.canonical()));
@@ -720,7 +709,7 @@ impl Net {
     /// Attaches the sandbox called `name` to the LAN `lan` at `addr`, with
     /// no filter, no address binding and no DHCP: a trusted member, such
     /// as a GOAD virtual machine attached with `fictionet attach --type
-    /// tap`. Events name it as a sandbox. [`serve`](Net::serve)
+    /// tap`. Events name it as a sandbox. [`start`](Net::start)
     /// fails if there is no such LAN, `addr` is not a member address of it,
     /// or another member has it.
     pub fn member(mut self, name: &str, lan: &str, addr: IpAddr) -> Net {
@@ -756,7 +745,7 @@ impl Net {
     /// Returns once every host is placed. The network runs in background
     /// tasks in `fcx`'s region until that region is cancelled. Fails if a
     /// subnet cannot be used, or a host cannot be served as declared.
-    pub fn serve(self, fcx: &Cx, mut attachments: Attachments) -> Result<(), Error> {
+    pub fn start(self, fcx: &Cx, mut attachments: Attachments) -> Result<(), Error> {
         let subnet = Subnet::new(self.subnet)?;
         let subnet6 = if self.ipv6 {
             Some(Subnet6::new(self.subnet_v6)?)
@@ -1601,7 +1590,7 @@ impl Drop for PeerGuard {
 /// (cached), and the accept that serves it.
 struct TlsName {
     config: ConfigFor,
-    accept: Arc<dyn Accept>,
+    accept: Arc<dyn PortServer>,
     alpn: Vec<Vec<u8>>,
     last: Mutex<Option<(Arc<ServerConfig>, Arc<ServerConfig>)>>,
 }
@@ -1629,7 +1618,7 @@ impl TlsName {
 /// What one TCP port of a machine serves.
 #[derive(Default)]
 struct Port {
-    plain: RwLock<Option<Arc<dyn Accept>>>,
+    plain: RwLock<Option<Arc<dyn PortServer>>>,
     /// TLS by SNI; the empty name is "any name".
     tls: RwLock<TlsNames>,
 }
@@ -1638,7 +1627,7 @@ struct Port {
 #[derive(Default)]
 struct TlsNames {
     by_name: HashMap<String, Arc<TlsName>>,
-    first: Option<Arc<dyn Accept>>,
+    first: Option<Arc<dyn PortServer>>,
 }
 
 /// One address with its services.
@@ -2717,6 +2706,31 @@ impl BlockedWhy {
     }
 }
 
+/// Counts an accepted connection or records why the connection limit refused it.
+pub fn connection_limit(
+    fcx: &Cx,
+    info: &ConnInfo,
+    open: &Arc<AtomicUsize>,
+    max: usize,
+) -> Option<Counted> {
+    let guard = Counted::enter(open, max);
+    if guard.is_none() {
+        let (src, dst) = (info.peer, info.local);
+        let event = blocked_event(
+            BlockedWhy::TooManyConnections,
+            Some(PROTO_TCP),
+            src.map(|a| a.ip()),
+            dst.map(|a| a.ip()),
+        );
+        let conn = ConnInfo {
+            sandbox: info.sandbox.clone(),
+            ..ConnInfo::default()
+        };
+        fcx.record_repeat(event.conn(&conn), port_detail(dst.map(|a| a.port())));
+    }
+    guard
+}
+
 /// A `net.blocked` event. The destination port goes in its detail
 /// ([`port_detail`]), since a scan changes it with every packet.
 fn blocked_event(
@@ -3067,11 +3081,11 @@ mod tests {
     #[test]
     fn tls_sharing_uses_the_first_installed_accept() {
         struct Offers(&'static str, Arc<Mutex<Vec<&'static str>>>);
-        impl Accept for Offers {
+        impl PortServer for Offers {
             fn serve(&self, _: Cx, _: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
                 Box::pin(async {})
             }
-            fn share(&self, _: &[String], _: &Arc<dyn Accept>) -> bool {
+            fn share(&self, _: &[String], _: &Arc<dyn PortServer>) -> bool {
                 lock(&self.1).push(self.0);
                 false
             }
@@ -3092,7 +3106,7 @@ mod tests {
                     });
                 }
                 let (_attacher, attachments) = fictionet::attachments();
-                net.serve(&fcx, attachments)?;
+                net.start(&fcx, attachments)?;
                 assert_eq!(
                     *lock(&log),
                     [

@@ -120,7 +120,7 @@ impl Service for Loud {
         &mut self,
         _: Result<Vec<u8>, LineError>,
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         driver.reply().resize(self.size, b'x');
         Ok(Flow::Continue)

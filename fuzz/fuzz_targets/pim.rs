@@ -1,14 +1,15 @@
 //! PIM version 2 messages, as a world playing a multicast router reads
 //! them.
 #![no_main]
+use fictionet::stdlib::ip::Endpoints;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::pim::{
-    ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, CandidateRp, Endpoints, Error, Message, checksum,
+    ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, CandidateRp, Error, Message, checksum,
 };
 use fictionet::stdlib::{
-    codec::{Collect, Decode, Wire},
+    codec::{Collect, Decode},
     pim,
     test_support::contract,
 };
@@ -39,27 +40,31 @@ fuzz_target!(|data: &[u8]| {
 
 fn check(data: &[u8], e: &Endpoints) {
     contract::check_decode_with_alloc_limit(
-        || Collect::<pim::Datagram>::new(pim::MAX_MESSAGE),
+        || Collect::bytes(pim::MAX_MESSAGE),
         data,
         2 * (pim::MAX_MESSAGE + 1),
     );
     contract::check_decode_with_alloc_limit(
-        || {
-            Collect::<pim::Datagram>::new(pim::MAX_MESSAGE)
-                .map(|datagram| Message::parse(&datagram.0, e))
-        },
+        || Collect::bytes(pim::MAX_MESSAGE).map(|datagram| Message::parse(&datagram, e)),
         data,
         2 * (pim::MAX_MESSAGE + 1),
     );
-    contract::check_wire::<pim::Datagram>(data);
-    contract::check_wire_value(&pim::Datagram(
-        data.iter().take(pim::MAX_MESSAGE + 1).copied().collect(),
-    ));
+    let raw = data[..data.len().min(pim::MAX_MESSAGE)].to_vec();
+    assert_eq!(
+        fictionet::stdlib::test_support::decode_all(|| Collect::bytes(pim::MAX_MESSAGE), &raw),
+        (vec![raw], None)
+    );
 
     let parsed = Message::parse(data, e);
 
     if let Ok(m) = &parsed {
-        assert!(data.len() <= e.max_message());
+        assert!(
+            data.len()
+                <= match e {
+                    Endpoints::V4 { .. } => pim::MAX_MESSAGE_V4,
+                    Endpoints::V6 { .. } => pim::MAX_MESSAGE,
+                }
+        );
         // Checked against the input bytes, not the parsed value: a
         // Bootstrap keeps its No-Forward bit.
         if let Message::Bootstrap(b) = m {
@@ -70,14 +75,11 @@ fn check(data: &[u8], e: &Endpoints) {
         if let Message::CandidateRp(CandidateRp { groups, .. }) = m
             && groups.is_empty()
         {
-            assert_eq!(
-                m.frame(e).and_then(|frame| frame.to_bytes()),
-                Err(Error::Count)
-            );
+            assert_eq!(m.frame(e), Err(Error::Count));
             return;
         }
         // Any other message read can be written, and reads back the same.
-        let bytes = m.frame(e).and_then(|frame| frame.to_bytes()).unwrap();
+        let bytes = m.frame(e).unwrap();
         assert_eq!(bytes.len(), data.len());
         assert_eq!(m.encoded_len(), Ok(bytes.len()));
         assert_eq!(

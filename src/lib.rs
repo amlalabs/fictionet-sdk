@@ -192,7 +192,7 @@
 //!     fn decoder(&self) -> Lines {
 //!         Lines::new(1024, Ending::LfOrCrlf)
 //!     }
-//!     fn on_item(&mut self, line: std::result::Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_>) -> std::result::Result<Flow, Self::Error> {
+//!     fn on_item(&mut self, line: std::result::Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_, Self::Decoder>) -> std::result::Result<Flow, Self::Error> {
 //!         let line = line.unwrap_or_default();
 //!         driver.record(Event::new("echo", "line").field("bytes", line.len() as u64));
 //!         driver.reply().extend_from_slice(&line);
@@ -201,13 +201,13 @@
 //!     }
 //! }
 //!
-//! fn world(fcx: &Cx, attachments: Attachments) -> Result {
+//! async fn world(fcx: Cx, attachments: Attachments) -> Result {
 //!     let site = Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
 //!     fcx.events().to_file(std::env::temp_dir().join("events.jsonl"))?;
 //!     Net::new()
-//!         .host("www", |h| h.dns_name("www.example.test").accept(80, Server::new(site)))
+//!         .host("www", |h| h.dns_name("www.example.test").port_server(80, Server::new(site)))
 //!         .host("echo", |h| h.dns_name("echo.example.test").tcp(7, Arc::new(()), || Echo))
-//!         .serve(fcx, attachments)
+//!         .start(&fcx, attachments)
 //! }
 //! ```
 //!

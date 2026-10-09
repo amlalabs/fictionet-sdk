@@ -38,7 +38,7 @@ fn main() -> fictionet::Result {
                 "example.test" => Some(web::Site::new(app.clone())),
                 _ => None,
             })
-            .serve(&fcx, lossy)?;
+            .start(&fcx, lossy)?;
             Ok(())
         },
     ))

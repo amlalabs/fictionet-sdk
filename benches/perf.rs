@@ -1348,7 +1348,7 @@ fn http_run(case: HttpCase) -> HttpRun {
             if case.hooks {
                 fcx.events().subscribe(|_| {});
             }
-            sites.serve(&fcx, attachments)?;
+            sites.start(&fcx, attachments)?;
             let machines: Vec<Machine> = (0..case.sandboxes)
                 .map(|i| {
                     machine(
@@ -1895,7 +1895,7 @@ fn proxy_run(burst: usize, sequential: usize) -> ((u64, f64), (u64, f64)) {
                     web::Sites::new(move |host: &str| {
                         (host == "plain.test").then(|| web::Site::new(page.clone()).plain_http())
                     })
-                    .serve(&fcx, attachments)?;
+                    .start(&fcx, attachments)?;
                     while !stop.load(Ordering::Acquire) {
                         fcx.sleep(fictionet::time::ms(10)).await?;
                     }

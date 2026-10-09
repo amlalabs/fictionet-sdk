@@ -7,7 +7,7 @@ use fictionet::stdlib::test_support::contract;
 use fictionet::stdlib::test_support::decode_all;
 use fictionet::stdlib::websocket::harness::bounded;
 use fictionet::stdlib::websocket::{
-    Close, Error, Frame, Frames, Header, MAX_HEADERS, MAX_MESSAGE, Message, Messages, Opcode, Role,
+    Close, Error, Frame, Frames, Header, MAX_HEADERS, MAX_MESSAGE, Message, Messages, Opcode,
     check_request, check_response, request_headers,
 };
 use libfuzzer_sys::fuzz_target;
@@ -47,14 +47,17 @@ fuzz_target!(|data: &[u8]| {
             usize::from(b)
         }
     });
-    for role in [Role::Server, Role::Client] {
+    for role in [
+        fictionet::stdlib::codec::Side::Server,
+        fictionet::stdlib::codec::Side::Client,
+    ] {
         let frames = || Frames::new(role).with_limit(limit);
         let messages = || Messages::new(role).with_limit(limit);
         bounded(frames, data);
         bounded(messages, data);
         contract::check_decode_with_held_limit(messages, data, limit);
         check_clone(messages(), data);
-        let mask = if role == Role::Server {
+        let mask = if role == fictionet::stdlib::codec::Side::Server {
             Some([1, 2, 3, 4])
         } else {
             None
@@ -68,14 +71,14 @@ fuzz_target!(|data: &[u8]| {
             );
             let size = data.first().map_or(1, |&b| usize::from(b).max(1));
             let frames = match role {
-                Role::Server => {
+                fictionet::stdlib::codec::Side::Server => {
                     let mut key = 0u8;
                     message.to_masked_frames(size, || {
                         key = key.wrapping_add(1);
                         [key; 4]
                     })
                 }
-                Role::Client => message.to_frames(size, None),
+                fictionet::stdlib::codec::Side::Client => message.to_frames(size, None),
             }
             .unwrap();
             let mut bytes = Vec::new();
@@ -131,7 +134,10 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(frame) = message.to_frame(Some([7; 4])) {
             contract::check_wire_value(&frame);
             assert_eq!(
-                decode_all(|| Messages::new(Role::Server), &frame.to_bytes().unwrap()),
+                decode_all(
+                    || Messages::new(fictionet::stdlib::codec::Side::Server),
+                    &frame.to_bytes().unwrap()
+                ),
                 (vec![message], None)
             );
         }

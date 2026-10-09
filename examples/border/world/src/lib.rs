@@ -129,7 +129,7 @@ pub fn start(
         .subnet(scenario.subnet)
         // The scenarios are IPv4 networks, and the agent has IPv6 off.
         .ipv4_only()
-        .serve(fcx, inner_attachments)?;
+        .start(fcx, inner_attachments)?;
 
     // Each sandbox reaches `Sites` through its path.
     let shared = Arc::new(path::Shared {

@@ -101,7 +101,7 @@ fn main() -> fictionet::Result {
                 "example.test" => Some(web::Site::new(app.clone())),
                 _ => None,
             })
-            .serve(&fcx, watched)?;
+            .start(&fcx, watched)?;
             Ok(())
         },
     ))

@@ -1,7 +1,7 @@
 //! VRRP: reading and writing virtual router advertisements, with no I/O.
 //!
-//! Advertisement readers and writers handle complete values, with `Datagram` as
-//! the `Wire` carrier. There is no protocol stream decoder, master/backup state
+//! Advertisement readers and writers handle complete values, with `Vec<u8>` as
+//! the byte representation. There is no protocol stream decoder, master/backup state
 //! machine, election timer, router `Service`, or live transport.
 //!
 //! VRRP (the Virtual Router Redundancy Protocol, IP protocol 112) lets
@@ -28,10 +28,10 @@
 //! Nothing here reads a socket. A world that plays a router hands each
 //! VRRP payload (the bytes after the IP header) to [`Advertisement::parse`]
 //! with the packet's [`Endpoints`], looks at the [`Advertisement`], and
-//! prepares an [`Advertisement::frame`] to write with [`Wire::write`].
+//! prepares the bytes with [`Advertisement::frame`].
 //! Use protocol [`PROTOCOL`] and a TTL or hop limit of [`HOP_LIMIT`], to the
 //! address [`Advertisement::destination`] gives. For pieces of one payload,
-//! use [`Stream<Collect<Datagram>>`](fictionet::stdlib::codec::Stream)
+//! use [`codec::Collect::bytes`](fictionet::stdlib::codec::Collect::bytes) in a stream
 //! and a limit of [`MAX_MESSAGE`]. Map through [`Advertisement::parse`]
 //! and call `end` at the IP boundary. Which virtual routers exist, their
 //! priorities, and the timers that decide when a backup takes over are
@@ -47,10 +47,10 @@
 //! read back.
 //!
 //! ```
-//! use fictionet::stdlib::codec::Wire;
+//! use fictionet::stdlib::ip::Endpoints;
 //! use std::net::{IpAddr, Ipv4Addr};
 //! use fictionet::stdlib::vrrp::{
-//!     Addresses, Advertisement, AdvertisementV3, Endpoints, GROUP_V4, PRIORITY_STOP,
+//!     Addresses, Advertisement, AdvertisementV3, GROUP_V4, PRIORITY_STOP,
 //! };
 //!
 //! /// What a backup router does with its Master_Down_Timer when it hears
@@ -100,10 +100,8 @@
 //! assert_eq!(on_advertisement(1, 110, false, &ad), Timer::Restart);
 //! assert_eq!(on_advertisement(2, 90, true, &ad), Timer::Keep);
 //! // Written back, the advertisement is the same bytes.
-//! assert_eq!(ad.frame(&master).and_then(|frame| frame.to_bytes()).unwrap(), bytes);
+//! assert_eq!(ad.frame(&master).unwrap(), bytes);
 //! ```
-
-use fictionet::stdlib::codec::Wire;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -152,69 +150,7 @@ pub mod auth {
     pub const IP_AH: u8 = 2;
 }
 
-/// The IP source and destination of the packet that carries an
-/// advertisement. Version 3 checksums over IPv6 cover them, and they say
-/// whether a version 3 advertisement's addresses are IPv4 or IPv6.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Endpoints {
-    /// An IPv4 packet.
-    V4 {
-        /// The sending router's own address on the link.
-        source: Ipv4Addr,
-        /// Usually [`GROUP_V4`].
-        destination: Ipv4Addr,
-    },
-    /// An IPv6 packet.
-    V6 {
-        /// The sending router's link-local address.
-        source: Ipv6Addr,
-        /// Usually [`GROUP_V6`].
-        destination: Ipv6Addr,
-    },
-}
-
-impl Endpoints {
-    /// The length of one address in an advertisement this packet carries:
-    /// 4 for IPv4 and 16 for IPv6.
-    pub fn address_len(&self) -> usize {
-        match self {
-            Endpoints::V4 { .. } => 4,
-            Endpoints::V6 { .. } => 16,
-        }
-    }
-
-    /// The endpoints of a packet from `source` to `destination`, or `None`
-    /// if the two are of different families.
-    pub fn new(source: IpAddr, destination: IpAddr) -> Option<Endpoints> {
-        match (source, destination) {
-            (IpAddr::V4(source), IpAddr::V4(destination)) => Some(Endpoints::V4 {
-                source,
-                destination,
-            }),
-            (IpAddr::V6(source), IpAddr::V6(destination)) => Some(Endpoints::V6 {
-                source,
-                destination,
-            }),
-            _ => None,
-        }
-    }
-
-    /// The packet's source address.
-    pub fn source(&self) -> IpAddr {
-        match self {
-            Endpoints::V4 { source, .. } => IpAddr::V4(*source),
-            Endpoints::V6 { source, .. } => IpAddr::V6(*source),
-        }
-    }
-
-    /// The packet's destination address.
-    pub fn destination(&self) -> IpAddr {
-        match self {
-            Endpoints::V4 { destination, .. } => IpAddr::V4(*destination),
-            Endpoints::V6 { destination, .. } => IpAddr::V6(*destination),
-        }
-    }
-}
+use fictionet::stdlib::ip::Endpoints;
 
 /// A version 2 advertisement (RFC 3768). It is always carried over IPv4.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -449,8 +385,7 @@ pub fn checksum(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
 ///
 /// [`Advertisement::parse`] takes either checksum on a version 3
 /// advertisement over IPv4. To send to a router that wants this one,
-/// prepare an [`Advertisement::frame`], serialize it with
-/// [`Wire::write`], and put this checksum
+/// prepare the bytes with [`Advertisement::frame`] and put this checksum
 /// in bytes 6 and 7.
 pub fn checksum_rfc5798(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
     sum_with(b, endpoints, true)
@@ -728,7 +663,7 @@ impl Advertisement {
     /// above [`MAX_INTERVAL_V3`], the addresses are not of the packet's
     /// family, or over IPv6 the source or first address is not link-local.
     /// Nothing is allocated before those checks pass.
-    pub fn frame(&self, endpoints: &Endpoints) -> Result<Datagram, Error> {
+    pub fn frame(&self, endpoints: &Endpoints) -> Result<Vec<u8>, Error> {
         let len = self.encoded_len(endpoints)?;
         let mut out = Vec::with_capacity(len);
         match self {
@@ -763,7 +698,7 @@ impl Advertisement {
         // The length was checked above, so the checksum is always there.
         let c = checksum(&out, endpoints).unwrap_or(0);
         out[6..8].copy_from_slice(&c.to_be_bytes());
-        Ok(Datagram(out))
+        Ok(out)
     }
 }
 
@@ -775,69 +710,29 @@ fn v4_addresses(b: &[u8]) -> Vec<Ipv4Addr> {
         .collect()
 }
 
-/// One bounded IP payload, with every received byte preserved.
-///
-/// [`Wire`] reads the entire payload and checks only
-/// [`MAX_MESSAGE`]. It does not validate a VRRP message or its checksum.
-/// Use [`Advertisement::parse`] with the packet's [`Endpoints`] for that check.
-/// The endpoints are not encoded in this payload.
-///
-/// ```
-/// use fictionet::stdlib::{codec::{Collect, Decode, Stream}, vrrp};
-/// # let endpoints = vrrp::Endpoints::V4 {
-/// #     source: "192.0.2.1".parse().unwrap(),
-/// #     destination: "224.0.0.1".parse().unwrap(),
-/// # };
-/// let messages = Collect::<vrrp::Datagram>::new(vrrp::MAX_MESSAGE)
-///     .map(move |datagram| vrrp::Advertisement::parse(&datagram.0, &endpoints));
-/// let mut stream = Stream::new(messages);
-/// // Push chunks of one IP payload, then call stream.end().
-/// # stream.end();
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Datagram(
-    /// Complete payload bytes, including the received checksum.
-    /// Parsing and writing refuse more than [`MAX_MESSAGE`] bytes.
-    pub Vec<u8>,
-);
-
-impl Wire for Datagram {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    /// Copies a complete payload. Refuses more than [`MAX_MESSAGE`] bytes.
-    /// Protocol and checksum checks require the contextual parser.
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() > MAX_MESSAGE {
-            return Err(Error::TooLong);
-        }
-        Ok(Self(bytes.to_vec()))
-    }
-
-    /// Appends the payload unchanged. Refuses more than [`MAX_MESSAGE`] bytes.
-    /// Leaves `out` unchanged on error. Does not compute or check a checksum.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        if self.0.len() > MAX_MESSAGE {
-            return Err(Error::TooLong);
-        }
-        out.extend_from_slice(&self.0);
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg, Wire};
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, Lcg};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Advertisement, Error> {
         use fictionet::stdlib::codec::Decode;
-        let make = || Collect::<Datagram>::new(MAX_MESSAGE).map(|d| Advertisement::parse(&d.0, e));
+        let make = || Collect::bytes(MAX_MESSAGE).map(|d| Advertisement::parse(&d, e));
         contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
-        contract::check_wire::<Datagram>(b);
+        assert_eq!(
+            fictionet::stdlib::test_support::decode_all(|| Collect::bytes(MAX_MESSAGE), b),
+            if b.len() <= MAX_MESSAGE {
+                (vec![b.to_vec()], None)
+            } else {
+                (
+                    vec![],
+                    Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE })),
+                )
+            }
+        );
         let parsed = Advertisement::parse(b, e);
         let (items, failure) = decode_all(make, b);
         if b.len() <= MAX_MESSAGE {
@@ -879,7 +774,7 @@ mod tests {
     }
 
     fn round_trip(a: &Advertisement, e: &Endpoints) -> Vec<u8> {
-        let b = a.frame(e).and_then(|frame| frame.to_bytes()).unwrap();
+        let b = a.frame(e).unwrap();
         assert_eq!(b.len(), a.encoded_len(e).unwrap());
         assert_eq!(Advertisement::parse(&b, e).as_ref(), Ok(a));
         b
@@ -900,12 +795,7 @@ mod tests {
             addresses: Addresses::V4(vec![ip4(192, 168, 1, 1)]),
         });
         assert_eq!(ad, want);
-        assert_eq!(
-            ad.frame(&v4_ends())
-                .and_then(|frame| frame.to_bytes())
-                .unwrap(),
-            bytes
-        );
+        assert_eq!(ad.frame(&v4_ends()).unwrap(), bytes);
         assert_eq!(ad.destination(), IpAddr::V4(GROUP_V4));
         assert_eq!(ad.interval_centiseconds(), 100);
     }
@@ -930,12 +820,7 @@ mod tests {
             auth_data: [0; 8],
         });
         assert_eq!(ad, want);
-        assert_eq!(
-            ad.frame(&v4_ends())
-                .and_then(|frame| frame.to_bytes())
-                .unwrap(),
-            b
-        );
+        assert_eq!(ad.frame(&v4_ends()).unwrap(), b);
         // Version 2 has no pseudo-header: any IPv4 endpoints read it.
         let other = Endpoints::V4 {
             source: ip4(10, 0, 0, 9),
@@ -1015,12 +900,7 @@ mod tests {
         let Advertisement::V3(a) = &ad else { panic!() };
         assert_eq!(a.interval, 100);
         // Written back with the bits clear.
-        assert_eq!(
-            ad.frame(&v4_ends())
-                .and_then(|frame| frame.to_bytes())
-                .unwrap()[4],
-            0
-        );
+        assert_eq!(ad.frame(&v4_ends()).unwrap()[4], 0);
     }
 
     #[test]
@@ -1073,34 +953,18 @@ mod tests {
             })
         };
         let one = Addresses::V4(vec![ip4(1, 2, 3, 4)]);
+        assert_eq!(v3(0, 1, one.clone()).frame(&e), Err(Error::Vrid));
         assert_eq!(
-            v3(0, 1, one.clone())
-                .frame(&e)
-                .and_then(|frame| frame.to_bytes()),
-            Err(Error::Vrid)
-        );
-        assert_eq!(
-            v3(1, 0x1000, one.clone())
-                .frame(&e)
-                .and_then(|frame| frame.to_bytes()),
+            v3(1, 0x1000, one.clone()).frame(&e),
             Err(Error::Interval(0x1000))
         );
         assert_eq!(
-            v3(1, 1, Addresses::V4(vec![]))
-                .frame(&e)
-                .and_then(|frame| frame.to_bytes()),
+            v3(1, 1, Addresses::V4(vec![])).frame(&e),
             Err(Error::NoAddresses)
         );
+        assert_eq!(v3(1, 1, one.clone()).frame(&v6_ends()), Err(Error::Family));
         assert_eq!(
-            v3(1, 1, one.clone())
-                .frame(&v6_ends())
-                .and_then(|frame| frame.to_bytes()),
-            Err(Error::Family)
-        );
-        assert_eq!(
-            v3(1, 1, Addresses::V4(vec![ip4(1, 1, 1, 1); 256]))
-                .frame(&e)
-                .and_then(|frame| frame.to_bytes()),
+            v3(1, 1, Addresses::V4(vec![ip4(1, 1, 1, 1); 256])).frame(&e),
             Err(Error::TooManyAddresses(256))
         );
         assert!(
@@ -1110,7 +974,6 @@ mod tests {
                 Addresses::V4(vec![ip4(1, 1, 1, 1); 255])
             )
             .frame(&e)
-            .and_then(|frame| frame.to_bytes())
             .is_ok()
         );
         let mut most = vec![Ipv6Addr::LOCALHOST; MAX_ADDRESSES];
@@ -1127,26 +990,12 @@ mod tests {
                 auth_data: [0; 8],
             })
         };
-        assert_eq!(
-            v2(0, 1).frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(Error::Vrid)
-        );
-        assert_eq!(
-            v2(1, 256).frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(Error::TooManyAddresses(256))
-        );
-        assert_eq!(
-            v2(1, 1)
-                .frame(&v6_ends())
-                .and_then(|frame| frame.to_bytes()),
-            Err(Error::Family)
-        );
+        assert_eq!(v2(0, 1).frame(&e), Err(Error::Vrid));
+        assert_eq!(v2(1, 256).frame(&e), Err(Error::TooManyAddresses(256)));
+        assert_eq!(v2(1, 1).frame(&v6_ends()), Err(Error::Family));
         // A version 2 advertisement needs an address too (RFC 3768
         // section 5.3.9).
-        assert_eq!(
-            v2(1, 0).frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(Error::NoAddresses)
-        );
+        assert_eq!(v2(1, 0).frame(&e), Err(Error::NoAddresses));
         // Every error has a message.
         for err in [
             Error::Truncated,
@@ -1173,10 +1022,7 @@ mod tests {
         assert_eq!(Advertisement::parse(&b, &e), Ok(ad.clone()));
         assert_eq!(collect(&b, &e), Ok(ad.clone()));
         // The writer always sends 0x0000.
-        assert_eq!(
-            &ad.frame(&e).and_then(|frame| frame.to_bytes()).unwrap()[6..8],
-            &[0, 0]
-        );
+        assert_eq!(&ad.frame(&e).unwrap()[6..8], &[0, 0]);
         // 0xffff is not taken for any other checksum.
         let good = fix(vec![0x31, 1, 100, 1, 0, 100, 0, 0, 192, 168, 1, 1], &e);
         let mut bad = good.clone();
@@ -1230,7 +1076,7 @@ mod tests {
     #[test]
     fn every_truncated_prefix_fails() {
         for (a, e) in samples() {
-            let b = a.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
+            let b = a.frame(&e).unwrap();
             for n in 0..b.len() {
                 let p = &b[..n];
                 assert_eq!(
@@ -1250,7 +1096,7 @@ mod tests {
     #[test]
     fn collection_matches_parse() {
         for (a, e) in samples() {
-            let mut b = a.frame(&e).unwrap().to_bytes().unwrap();
+            let mut b = a.frame(&e).unwrap();
             assert_eq!(collect(&b, &e), Ok(a));
             b.push(0);
             assert_eq!(collect(&b, &e), Err(Error::Trailing { remaining: 1 }));
@@ -1277,7 +1123,7 @@ mod tests {
         for (a, e) in samples() {
             assert_eq!(a.address_count(), a.addresses().len());
             assert_eq!(a.address_count(), a.addresses().count());
-            let b = a.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
+            let b = a.frame(&e).unwrap();
             assert_eq!(usize::from(b[3]), a.address_count());
         }
         let v3 = AdvertisementV3 {
@@ -1351,10 +1197,7 @@ mod tests {
             destination: ip4(10, 0, 0, 255),
         };
         assert_eq!(Advertisement::parse(&bytes, &other), Ok(ad.clone()));
-        assert_eq!(
-            ad.frame(&other).and_then(|frame| frame.to_bytes()).unwrap(),
-            bytes
-        );
+        assert_eq!(ad.frame(&other).unwrap(), bytes);
     }
 
     #[test]
@@ -1369,10 +1212,7 @@ mod tests {
         let ad = Advertisement::parse(&rfc5798, &e).unwrap();
         assert_eq!(collect(&rfc5798, &e), Ok(ad.clone()));
         // Written, it carries the RFC 9568 checksum.
-        assert_eq!(
-            &ad.frame(&e).and_then(|frame| frame.to_bytes()).unwrap()[6..8],
-            &[0xa8, 0xef]
-        );
+        assert_eq!(&ad.frame(&e).unwrap()[6..8], &[0xa8, 0xef]);
         // The RFC 5798 sum depends on the endpoints.
         let other = Endpoints::V4 {
             source: ip4(10, 0, 0, 9),
@@ -1384,11 +1224,7 @@ mod tests {
         let mut v2 = vec![0x21, 1, 100, 1, 0, 1, 0, 0, 192, 168, 0, 1];
         v2.extend_from_slice(&[0; 8]);
         assert_eq!(checksum_rfc5798(&v2, &e), checksum(&v2, &e));
-        let v6 = samples()[2]
-            .0
-            .frame(&v6_ends())
-            .and_then(|frame| frame.to_bytes())
-            .unwrap();
+        let v6 = samples()[2].0.frame(&v6_ends()).unwrap();
         assert_eq!(checksum_rfc5798(&v6, &v6_ends()), checksum(&v6, &v6_ends()));
     }
 
@@ -1423,26 +1259,11 @@ mod tests {
             destination: GROUP_V6,
         };
         // The writer checks the first address and the source.
-        assert_eq!(
-            ad("2001:db8::1")
-                .frame(&v6_ends())
-                .and_then(|frame| frame.to_bytes()),
-            Err(Error::LinkLocal)
-        );
-        assert_eq!(
-            ad("fe80::1")
-                .frame(&global)
-                .and_then(|frame| frame.to_bytes()),
-            Err(Error::LinkLocal)
-        );
+        assert_eq!(ad("2001:db8::1").frame(&v6_ends()), Err(Error::LinkLocal));
+        assert_eq!(ad("fe80::1").frame(&global), Err(Error::LinkLocal));
         // Later addresses may be global; fe80::/10 runs to febf.
         round_trip(&ad("febf::1"), &v6_ends());
-        assert_eq!(
-            ad("fec0::1")
-                .frame(&v6_ends())
-                .and_then(|frame| frame.to_bytes()),
-            Err(Error::LinkLocal)
-        );
+        assert_eq!(ad("fec0::1").frame(&v6_ends()), Err(Error::LinkLocal));
         // The reader checks both too, with a right checksum.
         let mut b = vec![0x31, 1, 100, 1, 0, 100, 0, 0];
         b.extend_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
@@ -1454,10 +1275,7 @@ mod tests {
             collect(&fix(b, &v6_ends()), &v6_ends()),
             Err(Error::LinkLocal)
         );
-        let good = ad("fe80::1")
-            .frame(&v6_ends())
-            .and_then(|frame| frame.to_bytes())
-            .unwrap();
+        let good = ad("fe80::1").frame(&v6_ends()).unwrap();
         assert_eq!(
             Advertisement::parse(&fix(good.clone(), &global), &global),
             Err(Error::LinkLocal)
@@ -1487,10 +1305,7 @@ mod tests {
                 auth_data: [0; 8],
             })
         };
-        assert_eq!(
-            ad(3).frame(&v4_ends()).and_then(|frame| frame.to_bytes()),
-            Err(Error::AuthType(3))
-        );
+        assert_eq!(ad(3).frame(&v4_ends()), Err(Error::AuthType(3)));
         for t in [auth::NONE, auth::SIMPLE_TEXT, auth::IP_AH] {
             round_trip(&ad(t), &v4_ends());
         }
@@ -1583,7 +1398,7 @@ mod tests {
         let parsed = Advertisement::parse(data, e);
         if let Ok(a) = &parsed {
             // An advertisement read can be written, and reads back the same.
-            let out = a.frame(e).and_then(|frame| frame.to_bytes()).unwrap();
+            let out = a.frame(e).unwrap();
             assert_eq!(out.len(), data.len());
             assert_eq!(Advertisement::parse(&out, e).as_ref(), Ok(a));
         }

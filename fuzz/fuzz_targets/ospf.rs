@@ -1,17 +1,18 @@
 //! OSPFv2 and OSPFv3 packets and LSAs, as a world playing a router reads
 //! them, and values a world builds, as it writes them.
 #![no_main]
+use fictionet::stdlib::ip::Endpoints;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::ospf::{
     ALL_SPF_ROUTERS_V4, ALL_SPF_ROUTERS_V6, AsExternalLsa, AsExternalLsaV3, Auth, Body,
-    DatabaseDescription, Endpoints, Error, ExternalRoute, Header, HelloV2, HelloV3,
-    InterAreaPrefixLsa, InterAreaRouterLsa, IntraAreaPrefixLsa, LSA_HEADER_LEN, LinkLsa, Lsa,
-    LsaBody, LsaHeader, LsaKey, MAX_LSA, MAX_MESSAGE, MAX_PACKET, NetworkLsa, NetworkLsaV3,
-    OPTION_L_V2, OPTION_L_V3, Packet, Prefix, RouterInterface, RouterLink, RouterLsa, RouterLsaV3,
-    SummaryLsa, TosMetric, Version, checksum, lsa_checksum, lsa_type_v2, lsa_type_v3,
+    DatabaseDescription, Error, ExternalRoute, Header, HelloV2, HelloV3, InterAreaPrefixLsa,
+    InterAreaRouterLsa, IntraAreaPrefixLsa, LSA_HEADER_LEN, LinkLsa, Lsa, LsaBody, LsaHeader,
+    LsaKey, MAX_LSA, MAX_MESSAGE, MAX_PACKET, NetworkLsa, NetworkLsaV3, OPTION_L_V2, OPTION_L_V3,
+    Packet, Prefix, RouterInterface, RouterLink, RouterLsa, RouterLsaV3, SummaryLsa, TosMetric,
+    Version, checksum, lsa_checksum, lsa_type_v2, lsa_type_v3,
 };
 use fictionet::stdlib::{
     codec::{Collect, Decode, Wire},
@@ -35,22 +36,20 @@ fn ends() -> [Endpoints; 2] {
 
 fn check(data: &[u8], e: &Endpoints) {
     contract::check_decode_with_alloc_limit(
-        || Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE),
+        || Collect::bytes(ospf::MAX_MESSAGE),
         data,
         2 * (ospf::MAX_MESSAGE + 1),
     );
     contract::check_decode_with_alloc_limit(
-        || {
-            Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE)
-                .map(|datagram| Packet::parse(&datagram.0, e))
-        },
+        || Collect::bytes(ospf::MAX_MESSAGE).map(|datagram| Packet::parse(&datagram, e)),
         data,
         2 * (ospf::MAX_MESSAGE + 1),
     );
-    contract::check_wire::<ospf::Datagram>(data);
-    contract::check_wire_value(&ospf::Datagram(
-        data.iter().take(ospf::MAX_MESSAGE + 1).copied().collect(),
-    ));
+    let raw = data[..data.len().min(ospf::MAX_MESSAGE)].to_vec();
+    assert_eq!(
+        fictionet::stdlib::test_support::decode_all(|| Collect::bytes(ospf::MAX_MESSAGE), &raw),
+        (vec![raw], None)
+    );
 
     let parsed = Packet::parse(data, e);
 
@@ -58,7 +57,7 @@ fn check(data: &[u8], e: &Endpoints) {
         // A packet read can be written, and reads back the same. LSAs an
         // update drops and a signaling block with a wrong checksum make it
         // shorter.
-        let bytes = p.frame(e).and_then(|frame| frame.to_bytes()).unwrap();
+        let bytes = p.frame(e).unwrap();
         assert!(bytes.len() <= data.len());
         assert_eq!(Packet::parse(&bytes, e).as_ref(), Ok(p));
     }
@@ -399,18 +398,42 @@ fn built(data: &[u8]) -> Result<()> {
         let v = if u.ratio(1, 8)? {
             Version::V2
         } else {
-            e.version()
+            match e {
+                Endpoints::V4 { .. } => Version::V2,
+                Endpoints::V6 { .. } => Version::V3,
+            }
         };
         let p = packet(&mut u, v)?;
-        if let Ok(bytes) = p.frame(e).and_then(|frame| frame.to_bytes()) {
+        if let Ok(bytes) = p.frame(e) {
             assert!(bytes.len() <= MAX_MESSAGE);
             assert!(usize::from(u16::from_be_bytes([bytes[2], bytes[3]])) <= MAX_PACKET);
             assert_eq!(Packet::parse(&bytes, e).as_ref(), Ok(&p));
         }
-        let l = lsa(&mut u, e.version())?;
-        if let Ok(bytes) = l.frame(e.version()).and_then(|frame| frame.to_bytes()) {
+        let l = lsa(
+            &mut u,
+            match e {
+                Endpoints::V4 { .. } => Version::V2,
+                Endpoints::V6 { .. } => Version::V3,
+            },
+        )?;
+        if let Ok(bytes) = l
+            .frame(match e {
+                Endpoints::V4 { .. } => Version::V2,
+                Endpoints::V6 { .. } => Version::V3,
+            })
+            .and_then(|frame| frame.to_bytes())
+        {
             let n = bytes.len();
-            assert_eq!(Lsa::parse(&bytes, e.version()), Ok((l, n)));
+            assert_eq!(
+                Lsa::parse(
+                    &bytes,
+                    match e {
+                        Endpoints::V4 { .. } => Version::V2,
+                        Endpoints::V6 { .. } => Version::V3,
+                    }
+                ),
+                Ok((l, n))
+            );
         }
     }
     Ok(())

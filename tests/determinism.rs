@@ -63,7 +63,7 @@ impl Service for Echo {
         &mut self,
         line: Result<Vec<u8>, LineError>,
         _: &(),
-        d: &mut Driver<'_>,
+        d: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         let line = line.unwrap();
         d.record(Event::new("echo", "line").field("bytes", line.len() as u64));
@@ -197,7 +197,7 @@ async fn episode(
                 httpd::Server::new(Http).https().date(date),
             )
         })
-        .serve(&cx, attachments)?;
+        .start(&cx, attachments)?;
     let agent = attacher.attach("agent")?;
     // Capture next to the agent, before the loss and delay filters.
     let agent = filter(&cx, agent, move |_, direction, p| {

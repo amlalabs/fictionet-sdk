@@ -172,7 +172,7 @@ async fn world(fcx: Cx, attachments: Attachments) -> Result {
             len: 32,
         },
     )
-    .serve(&fcx, delayed)?;
+    .start(&fcx, delayed)?;
     Ok(())
 }
 
@@ -233,7 +233,7 @@ impl Service for Port {
     fn on_open(
         &mut self,
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> std::result::Result<Flow, Infallible> {
         if let Kind::Banner(line) = self.kind {
             driver.reply().extend_from_slice(line.as_bytes());
@@ -245,7 +245,7 @@ impl Service for Port {
         &mut self,
         _: (),
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> std::result::Result<Flow, Infallible> {
         let Kind::Http {
             status,

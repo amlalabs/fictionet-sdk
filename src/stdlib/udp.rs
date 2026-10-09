@@ -266,7 +266,7 @@ pub struct Socket {
     wait: CancelWait,
 }
 
-impl fictionet::stdlib::Datagram for Socket {
+impl fictionet::stdlib::DatagramSocket for Socket {
     async fn recv(&mut self, fcx: &Cx) -> Result<(Vec<u8>, SocketAddr), RecvError> {
         Socket::recv(self, fcx).await
     }

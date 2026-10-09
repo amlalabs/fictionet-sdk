@@ -1,13 +1,13 @@
 //! HTTP/2 frames and directional state (RFC 9113).
 //!
-//! `Frame` implements `Wire`, `Frames` decodes the stream, and `Session` tracks
+//! `Frame` implements `Wire`, `Inputs` decodes the stream, and `Session` tracks
 //! one direction rather than a whole client or server. This module has no
 //! `Service` or live transport. HTTP/2 serving uses hyper through
 //! `fictionet::stdlib::httpd`. The observe presenter uses this frame layer
 //! independently of that server.
 //!
 //! Use [`Session`] for strict decoding. A capture reads frames with
-//! [`Frames::for_observation`] and header blocks with
+//! [`Inputs::for_observation`] and header blocks with
 //! [`HeaderBlocks::for_observation`], which report what they cannot read
 //! instead of failing; observe's HTTP/2 presenter is built on them.
 //! Route SETTINGS and WINDOW_UPDATE to the opposite direction's
@@ -18,8 +18,13 @@
 //! For GOAWAY, the caller identifies abandoned streams above `last_stream`,
 //! closes both halves with `peer_reset`, and retires their DATA decoders.
 //! Idle-stream checks and stream ownership belong to the caller.
-//! SETTINGS reductions take effect when the sending direction reads its ACK.
+//! SETTINGS reductions take effect when the sending direction reads its ACK.//! A [`Service`](fictionet::stdlib::serve::Service) can use this decoder through
+//! [`serve::connection`](fictionet::stdlib::serve::connection). Change its mode
+//! between items with [`Driver::decoder`](fictionet::stdlib::serve::Driver::decoder).
+//! See `docs/services.md` for an SMTP DATA service.
+//!
 
+use fictionet::stdlib::codec::Side;
 use fictionet::stdlib::{
     codec::{Decode, Fail, Step, Stream, Wire},
     hpack,
@@ -739,10 +744,10 @@ frame_wire!(
     Unknown => |v: &Unknown| v.payload.len(),
 );
 
-/// A frame or preface read by [`Frames`]. Refused capture frames are items,
+/// A frame or preface read by [`Inputs`]. Refused capture frames are items,
 /// so a capture can continue after malformed or oversized payloads.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FrameItem {
+pub enum Input {
     /// The client's complete connection preface.
     Preface,
     /// A complete valid frame.
@@ -761,18 +766,18 @@ pub enum FrameItem {
 /// Strict mode is partition invariant and refuses oversized frames from
 /// their header. Capture mode can accept a complete larger frame when
 /// the caller supplies bounded read-ahead, as observe's HTTP/2 presenter does.
-pub struct Frames {
+pub struct Inputs {
     limit: usize,
     preface: u8,
     capture: bool,
     skip: usize,
 }
-impl Default for Frames {
+impl Default for Inputs {
     fn default() -> Self {
         Self::with_limit(DEFAULT_FRAME_SIZE)
     }
 }
-impl Frames {
+impl Inputs {
     /// Reads frames without a preface, bounded by `limit` payload bytes.
     /// Limits above the 24-bit wire maximum are clamped.
     pub fn with_limit(limit: usize) -> Self {
@@ -810,8 +815,8 @@ impl Frames {
         self.skip != 0
     }
 }
-impl Decode for Frames {
-    type Item = FrameItem;
+impl Decode for Inputs {
+    type Item = Input;
     type Error = Error;
     const NAME: &'static str = "HTTP/2";
     /// The most unread frame bytes needed for a decoding step.
@@ -819,7 +824,7 @@ impl Decode for Frames {
         (HEADER_LEN + self.limit).max(PREFACE.len())
     }
     /// Reads one frame or display item, or skips a refused payload.
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<FrameItem>, Error> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Input>, Error> {
         if self.skip != 0 {
             let n = input.len().min(self.skip);
             if n == 0 {
@@ -838,7 +843,7 @@ impl Decode for Frames {
             }
             if input.starts_with(PREFACE) {
                 self.preface = 0;
-                return Ok(Step::Item(FrameItem::Preface, PREFACE.len()));
+                return Ok(Step::Item(Input::Preface, PREFACE.len()));
             }
             if self.preface == 1 {
                 return Err(protocol("invalid client preface"));
@@ -858,7 +863,7 @@ impl Decode for Frames {
             self.skip = header.length;
             self.preface = 0;
             return Ok(Step::Item(
-                FrameItem::Refused {
+                Input::Refused {
                     header,
                     error,
                     oversized: true,
@@ -873,8 +878,8 @@ impl Decode for Frames {
             return Ok(Step::Need);
         };
         let item = match Frame::parse(bytes) {
-            Ok(frame) => FrameItem::Frame(frame),
-            Err(error) if self.capture => FrameItem::Refused {
+            Ok(frame) => Input::Frame(frame),
+            Err(error) if self.capture => Input::Refused {
                 header,
                 error,
                 oversized: false,
@@ -1129,7 +1134,7 @@ impl HeaderBlocks {
     pub fn set_list_limit(&mut self, bytes: usize) {
         self.decoded = bytes;
     }
-    /// Reads one frame's part of a header block. Frames other than
+    /// Reads one frame's part of a header block. Inputs other than
     /// HEADERS, PUSH_PROMISE and CONTINUATION only check that no block is
     /// open. `payload` is `None` for a frame whose payload a capture could
     /// not keep: that block is then not decoded, and HPACK is forgotten,
@@ -1288,7 +1293,7 @@ struct SettingsUpdate {
     frame_max: u32,
 }
 
-/// One sending direction of an HTTP/2 connection, with a [`Stream<Frames>`]
+/// One sending direction of an HTTP/2 connection, with a [`Stream<Inputs>`]
 /// inside. `client_side` reads client-to-server bytes, including the preface;
 /// `server_side` reads server-to-client bytes. A nonempty direction requires
 /// initial SETTINGS. An empty direction can end cleanly.
@@ -1307,7 +1312,7 @@ struct SettingsUpdate {
 /// passes to the caller; route it to a [`fictionet::stdlib::codec::Demux`]
 /// of [`fictionet::stdlib::codec::Frames<grpc::Message>`] for gRPC under one shared budget.
 pub struct Session {
-    frames: Stream<Frames>,
+    frames: Stream<Inputs>,
     blocks: HeaderBlocks,
     limits: Limits,
     settings: SettingsState,
@@ -1317,7 +1322,7 @@ pub struct Session {
     reset_before: [u32; 2],
     window: i64,
     first: bool,
-    client: bool,
+    side: Side,
     stopped: bool,
     failed: Option<Error>,
     settings_updates: std::collections::VecDeque<SettingsUpdate>,
@@ -1327,20 +1332,20 @@ pub struct Session {
 impl Session {
     /// Starts a client-to-server direction requiring the client preface.
     pub fn client_side(limits: Limits) -> Self {
-        Self::new(limits, true)
+        Self::new(limits, Side::Client)
     }
     /// Starts a server-to-client direction, beginning with SETTINGS.
     pub fn server_side(limits: Limits) -> Self {
-        Self::new(limits, false)
+        Self::new(limits, Side::Server)
     }
-    fn new(limits: Limits, client: bool) -> Self {
+    fn new(limits: Limits, side: Side) -> Self {
         let limits = limits.bounded();
         let limit = limits.frame.min(DEFAULT_FRAME_SIZE);
         Self {
-            frames: Stream::new(if client {
-                Frames::client_side(limit)
+            frames: Stream::new(if side == Side::Client {
+                Inputs::client_side(limit)
             } else {
-                Frames::with_limit(limit)
+                Inputs::with_limit(limit)
             }),
             blocks: HeaderBlocks::new(limits, false),
             limits,
@@ -1351,7 +1356,7 @@ impl Session {
             reset_before: [0; 2],
             window: 65_535,
             first: true,
-            client,
+            side,
             stopped: false,
             failed: None,
             settings_updates: std::collections::VecDeque::new(),
@@ -1378,7 +1383,7 @@ impl Session {
     /// stops this direction. A gap has no trustworthy frame boundary.
     /// Construct a new direction only at a known new connection boundary.
     pub fn lost(&mut self) {
-        self.frames = Stream::new(Frames::with_limit(
+        self.frames = Stream::new(Inputs::with_limit(
             self.limits.frame.min(DEFAULT_FRAME_SIZE),
         ));
         self.blocks.forget();
@@ -1660,11 +1665,11 @@ impl Session {
             }
         }
     }
-    fn step(&mut self, item: FrameItem, bytes: &[u8]) -> Result<Option<Event>, Error> {
+    fn step(&mut self, item: Input, bytes: &[u8]) -> Result<Option<Event>, Error> {
         let frame = match item {
-            FrameItem::Preface => return Ok(Some(Event::Preface)),
-            FrameItem::Frame(f) => f,
-            FrameItem::Refused { error, .. } => return Err(error),
+            Input::Preface => return Ok(Some(Event::Preface)),
+            Input::Frame(f) => f,
+            Input::Refused { error, .. } => return Err(error),
         };
         if self.first {
             if !matches!(&frame, Frame::Settings(s) if s.flags & 1 == 0) {
@@ -1702,7 +1707,7 @@ impl Session {
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
             if let Some(promised) = block.promised {
-                if self.client {
+                if self.side == Side::Client {
                     return Err(protocol("client sent PUSH_PROMISE"));
                 }
                 return Ok(Some(Event::PushPromise {
@@ -1889,7 +1894,7 @@ mod tests {
             let mut trailing = bytes.clone();
             trailing.push(0);
             assert!(Frame::parse(&trailing).is_err());
-            contract::check_decode(|| Frames::with_limit(128), bytes);
+            contract::check_decode(|| Inputs::with_limit(128), bytes);
         }
         macro_rules! wire { ($($ty:ty => $i:expr),+) => { $(contract::check_wire::<$ty>(&frames[$i]);)+ }; }
         wire!(Data => 0, Headers => 1, Priority => 2, Reset => 3, Settings => 4, PushPromise => 5,
@@ -1989,7 +1994,7 @@ mod tests {
         ] {
             assert!(Frame::parse(&bytes).is_err());
         }
-        let mut s = Stream::new(Frames::with_limit(2));
+        let mut s = Stream::new(Inputs::with_limit(2));
         assert_eq!(s.push(&raw(0, 0, 1, b"abc")), 12);
         assert!(s.next().unwrap().is_err());
         assert!(s.next().is_none());
@@ -2022,7 +2027,7 @@ mod tests {
         assert!(
             matches!(&expected[4], Ok(Event::Trailers { fields, .. }) if fields[0].name == b"grpc-status")
         );
-        contract::check_decode(|| Frames::client_side(DEFAULT_FRAME_SIZE), &bytes);
+        contract::check_decode(|| Inputs::client_side(DEFAULT_FRAME_SIZE), &bytes);
     }
     #[test]
     fn continuation_failures_and_eof_are_reported_once() {
@@ -2434,7 +2439,7 @@ mod tests {
             let bytes = rng.bytes(128);
             contract::check_wire::<Frame>(&bytes);
             contract::check_wire::<FrameHeader>(&bytes);
-            contract::check_decode(|| Frames::with_limit(128), &bytes);
+            contract::check_decode(|| Inputs::with_limit(128), &bytes);
         }
     }
 }

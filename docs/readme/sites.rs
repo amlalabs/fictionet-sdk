@@ -11,4 +11,4 @@ web::Sites::new(move |host: &str| match host {
     ),
     _ => None, // NXDOMAIN: the world stays closed
 })
-.serve(&fcx, attachments)?;
+.start(&fcx, attachments)?;

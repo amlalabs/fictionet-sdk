@@ -19,9 +19,9 @@
 //! packets. A world that needs to go further plays its part up to NEWKEYS
 //! and then decides what to do, for example send DISCONNECT.
 //!
-//! Nothing here reads a socket. A world pushes TCP bytes through
-//! [`Stream<Events>`](fictionet::stdlib::codec::Stream) for the version exchange and
-//! numbered packets, or [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream) after it.
+//! A [`Service`](fictionet::stdlib::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Events`] for the version exchange and
+//! numbered packets, or `codec::Frames<Packet>` after the version exchange.
 //! It reads payloads with [`Message::parse`] and builds replies with
 //! [`Identification::new`] and [`Packet::from_message`]. Which
 //! algorithms the world offers, and what its software line says, is up to

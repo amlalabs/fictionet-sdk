@@ -2,21 +2,21 @@
 //! datagrams and TCP streams.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Stream, Wire};
-use fictionet::stdlib::stun::{Attribute, Frames, MAX_VALUE, Message, answer_binding};
+use fictionet::stdlib::codec::{Decode, Frames, Stream, Wire};
+use fictionet::stdlib::stun::{Attribute, Frame, MAX_VALUE, Message, answer_binding};
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
+    contract::check_decode(Frames::<Frame>::new, data);
     contract::check_decode(
-        || Frames::new().map(|frame| <Message as Wire>::parse(&frame)),
+        || Frames::<Frame>::new().map(|frame| <Message as Wire>::parse(&frame)),
         data,
     );
     contract::check_wire::<Message>(data);
 
     // MESSAGE-INTEGRITY uses each frame's original bytes at its stream offset.
-    let mut stream = Stream::new(Frames::new());
+    let mut stream = Stream::new(Frames::<Frame>::new());
     let mut remaining = data;
     loop {
         let taken = stream.push(remaining);

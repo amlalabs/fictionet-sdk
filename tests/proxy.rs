@@ -126,7 +126,7 @@ impl World {
                         })),
                         _ => None,
                     })
-                    .serve(&fcx, attachments)?;
+                    .start(&fcx, attachments)?;
                     while !stop2.load(Ordering::SeqCst) {
                         fcx.sleep(fictionet::time::ms(20)).await?;
                     }
@@ -547,7 +547,7 @@ fn https_through_both_doors_with_curl() {
 #[test]
 fn websockets_pass_through_the_http_door() {
     use fictionet::stdlib::codec::{Stream, Wire};
-    use fictionet::stdlib::websocket::{Message, Messages, Role};
+    use fictionet::stdlib::websocket::{Message, Messages};
     let world = World::start();
     let a = Attach::start(&world, "http_proxy", "ws1", "10.0.0.2");
     let mut s = a.connect();
@@ -569,7 +569,7 @@ fn websockets_pass_through_the_http_door() {
         .unwrap();
     s.write_all(&frame.to_bytes().unwrap()).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut stream = Stream::new(Messages::new(Role::Client));
+    let mut stream = Stream::new(Messages::new(fictionet::stdlib::codec::Side::Client));
     let mut buf = [0u8; 1024];
     let reply = loop {
         if let Some(m) = stream.next() {

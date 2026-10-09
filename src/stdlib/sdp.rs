@@ -284,7 +284,7 @@ pub enum Error {
     },
     /// A line does not start with a lowercase letter and `=`. An empty
     /// line is one.
-    Malformed {
+    FieldLine {
         /// The line's number.
         line: usize,
     },
@@ -336,7 +336,7 @@ impl core::fmt::Display for Error {
             Error::LineTooLong { line } => {
                 write!(f, "line {line} is longer than {MAX_LINE_LEN} bytes")
             }
-            Error::Malformed { line } => {
+            Error::FieldLine { line } => {
                 write!(f, "line {line} is not a type letter, '=' and a value")
             }
             Error::UnknownType { line, kind } => write!(f, "line {line} has unknown type '{kind}'"),
@@ -568,9 +568,9 @@ impl Description {
     }
 
     fn read_line(&mut self, line: &[u8], n: usize) -> Result<(), Error> {
-        let (&kind, rest) = line.split_first().ok_or(Error::Malformed { line: n })?;
+        let (&kind, rest) = line.split_first().ok_or(Error::FieldLine { line: n })?;
         if !kind.is_ascii_lowercase() || rest.first() != Some(&b'=') {
-            return Err(Error::Malformed { line: n });
+            return Err(Error::FieldLine { line: n });
         }
         let k = char::from(kind);
         if !b"vosiuepcbtrzkam".contains(&kind) {
@@ -2380,11 +2380,11 @@ mod tests {
 
     #[test]
     fn malformed_and_unknown_lines() {
-        assert_eq!(err(b"v=0\r\n\r\n"), Error::Malformed { line: 2 });
-        assert_eq!(err(b"V=0\r\n"), Error::Malformed { line: 1 });
-        assert_eq!(err(b"v 0\r\n"), Error::Malformed { line: 1 });
-        assert_eq!(err(b"v"), Error::Malformed { line: 1 });
-        assert_eq!(err(b"=0"), Error::Malformed { line: 1 });
+        assert_eq!(err(b"v=0\r\n\r\n"), Error::FieldLine { line: 2 });
+        assert_eq!(err(b"V=0\r\n"), Error::FieldLine { line: 1 });
+        assert_eq!(err(b"v 0\r\n"), Error::FieldLine { line: 1 });
+        assert_eq!(err(b"v"), Error::FieldLine { line: 1 });
+        assert_eq!(err(b"=0"), Error::FieldLine { line: 1 });
         assert_eq!(
             err(&with("t=0 0\r\nx=1\r\n")),
             Error::UnknownType { line: 5, kind: 'x' }
@@ -2981,7 +2981,7 @@ mod tests {
                     Err(e) => assert!(
                         matches!(
                             e,
-                            Error::Missing(_) | Error::Syntax { .. } | Error::Malformed { .. }
+                            Error::Missing(_) | Error::Syntax { .. } | Error::FieldLine { .. }
                         ),
                         "{n}: {e}"
                     ),
@@ -3306,7 +3306,7 @@ mod tests {
             Error::TooLong,
             Error::TooManyLines,
             Error::LineTooLong { line: 1 },
-            Error::Malformed { line: 1 },
+            Error::FieldLine { line: 1 },
             Error::UnknownType { line: 1, kind: 'x' },
             Error::Encoding { line: 1 },
             Error::Syntax { line: 1, kind: 'o' },

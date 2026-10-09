@@ -36,8 +36,7 @@ use fictionet::events::{ConnInfo, Event, Fields, Level};
 use fictionet::observe::{Dissector, Registry};
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::{
-    ByteFault, Direction as Dir, Ending, ItemFault, LineError, Lines, RecordKind, Rewrite, Rule,
-    Trigger, Wire,
+    ByteFault, Ending, ItemFault, LineError, Lines, RecordKind, Rewrite, Rule, Side, Trigger, Wire,
 };
 use fictionet::stdlib::dns::op::{Message, Query};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
@@ -46,7 +45,7 @@ use fictionet::stdlib::json;
 use fictionet::stdlib::modbus::{
     self, Exception, Frame, Request as MbRequest, Response as MbResponse,
 };
-use fictionet::stdlib::net::{Accept, Arrival, Net, Sni};
+use fictionet::stdlib::net::{Arrival, Net, PortServer, Sni};
 use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::serve::{
     self, Budget, Driver, Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingDriver,
@@ -105,7 +104,11 @@ impl Service for Echo {
         Lines::new(64, Ending::LfOrCrlf)
     }
 
-    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+    fn on_open(
+        &mut self,
+        _: &(),
+        driver: &mut Driver<'_, Self::Decoder>,
+    ) -> Result<Flow, Infallible> {
         driver.reply().extend_from_slice(b"hello\n");
         Ok(Flow::Continue)
     }
@@ -114,7 +117,7 @@ impl Service for Echo {
         &mut self,
         line: Result<Vec<u8>, LineError>,
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         let Ok(line) = line else {
             driver.reply().extend_from_slice(b"too long\n");
@@ -143,7 +146,12 @@ impl Service for Echo {
         }
     }
 
-    fn on_end(&mut self, end: Ended, _: &(), driver: &mut Driver<'_>) -> Result<(), Infallible> {
+    fn on_end(
+        &mut self,
+        end: Ended,
+        _: &(),
+        driver: &mut Driver<'_, Self::Decoder>,
+    ) -> Result<(), Infallible> {
         if end == Ended::Eof {
             driver.reply().extend_from_slice(b"eof\n");
         }
@@ -194,7 +202,11 @@ impl Service for Ticker {
         Lines::new(64, Ending::LfOrCrlf)
     }
 
-    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+    fn on_open(
+        &mut self,
+        _: &(),
+        driver: &mut Driver<'_, Self::Decoder>,
+    ) -> Result<Flow, Infallible> {
         driver.set_timer("tick", Duration::from_millis(30));
         Ok(Flow::Continue)
     }
@@ -203,12 +215,17 @@ impl Service for Ticker {
         &mut self,
         _: Result<Vec<u8>, LineError>,
         _: &(),
-        _: &mut Driver<'_>,
+        _: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         Ok(Flow::Continue)
     }
 
-    fn on_timer(&mut self, _: Timer, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+    fn on_timer(
+        &mut self,
+        _: Timer,
+        _: &(),
+        driver: &mut Driver<'_, Self::Decoder>,
+    ) -> Result<Flow, Infallible> {
         self.ticks += 1;
         driver.reply().extend_from_slice(b"tick\n");
         if self.ticks == 3 {
@@ -243,7 +260,7 @@ impl Service for Plc {
         &mut self,
         frame: Frame,
         plant: &Plant,
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         let mut registers = plant.registers.lock().unwrap();
         let pdu = match MbRequest::parse(&frame.pdu) {
@@ -355,14 +372,19 @@ fn a_decoder_failure_is_handed_to_the_service_with_what_it_could_not_read() {
         fn decoder(&self) -> fictionet::stdlib::codec::Frames<modbus::Frame> {
             fictionet::stdlib::codec::Frames::<modbus::Frame>::new()
         }
-        fn on_item(&mut self, _: Frame, _: &(), _: &mut Driver<'_>) -> Result<Flow, Infallible> {
+        fn on_item(
+            &mut self,
+            _: Frame,
+            _: &(),
+            _: &mut Driver<'_, Self::Decoder>,
+        ) -> Result<Flow, Infallible> {
             Ok(Flow::Continue)
         }
         fn on_fail(
             &mut self,
             _: &fictionet::stdlib::codec::Fail<modbus::Error>,
             _: &(),
-            driver: &mut Driver<'_>,
+            driver: &mut Driver<'_, Self::Decoder>,
         ) -> Result<(), Infallible> {
             self.unread = driver.unread().to_vec();
             driver.reply().extend_from_slice(b"no");
@@ -731,12 +753,12 @@ fn listen_serves_each_connection_and_records_it() {
         let records = transcript.records();
         let from_client: Vec<u8> = records
             .iter()
-            .filter(|r| r.direction == Dir::ClientToServer)
+            .filter(|r| r.sender == Side::Client)
             .flat_map(|r| r.bytes.clone())
             .collect();
         let to_client: Vec<u8> = records
             .iter()
-            .filter(|r| r.direction == Dir::ServerToClient)
+            .filter(|r| r.sender == Side::Server)
             .flat_map(|r| r.bytes.clone())
             .collect();
         assert_eq!(from_client, b"one\nlater\ntwo\nquit\n");
@@ -744,7 +766,7 @@ fn listen_serves_each_connection_and_records_it() {
         assert!(
             records
                 .iter()
-                .filter(|r| r.direction == Dir::ClientToServer)
+                .filter(|r| r.sender == Side::Client)
                 .all(|r| matches!(r.kind, RecordKind::Item(())))
         );
         Ok(())
@@ -794,7 +816,7 @@ fn a_handoff_returns_the_connection_with_its_unread_bytes() {
         let (tx, rx) = mpsc::channel();
         fcx.spawn(move |fcx| async move {
             let conn = listener.accept(&fcx).await?;
-            let served = serve::serve(
+            let served = serve::connection(
                 &fcx,
                 conn,
                 ConnInfo::default(),
@@ -874,6 +896,7 @@ fn fault_plans_change_bytes_and_items_both_ways() {
 #[test]
 fn a_connection_cap_resets_connections_past_it() {
     world(Duration::from_secs(60), |fcx| async move {
+        let events = fcx.events();
         let (server, _su, client, _cu) = two_machines(&fcx);
         serve::listen(
             &fcx,
@@ -893,12 +916,17 @@ fn a_connection_cap_resets_connections_past_it() {
             .await
             .expect("an answer");
         assert!(matches!(r, Err(ConnError::Reset) | Ok(0)), "{r:?}");
+        let blocked = events
+            .wait(&fcx, 1, Duration::from_secs(2), |e| e.is("net", "blocked"))
+            .await?;
+        assert_eq!(blocked[0].str("why"), Some("TooManyConnections"));
+        assert_eq!(blocked[0].str("dst"), Some("10.9.0.1"));
         Ok(())
     });
 }
 
 #[test]
-fn serve_datagram_answers_each_datagram() {
+fn datagram_answers_each_datagram() {
     /// Answers a datagram of lines with their count.
     struct Count;
     impl Service for Count {
@@ -912,7 +940,7 @@ fn serve_datagram_answers_each_datagram() {
             &mut self,
             _: Result<Vec<u8>, LineError>,
             n: &AtomicUsize,
-            driver: &mut Driver<'_>,
+            driver: &mut Driver<'_, Self::Decoder>,
         ) -> Result<Flow, Infallible> {
             let total = n.fetch_add(1, Ordering::SeqCst) + 1;
             driver
@@ -926,7 +954,7 @@ fn serve_datagram_answers_each_datagram() {
         let socket = server.bind(9)?;
         fcx.spawn(move |fcx| async move {
             let local = SocketAddr::new(SERVER.into(), 9);
-            let _ = serve::serve_datagram(
+            let _ = serve::datagram(
                 &fcx,
                 socket,
                 local,
@@ -1070,9 +1098,9 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
             })
             .host("hmi", |h| {
                 h.dns_name("hmi.plant.test")
-                    .accept(80, httpd::Server::new(hmi))
+                    .port_server(80, httpd::Server::new(hmi))
             })
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
 
         let s = sandbox(&fcx, attacher.attach("operator")?, ME);
         assert_eq!(lookup(&fcx, &s, "plc1.plant.test").await, Some(PLC_ADDR));
@@ -1216,7 +1244,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
                 &mut self,
                 _: Result<Vec<u8>, LineError>,
                 n: &AtomicUsize,
-                driver: &mut Driver<'_>,
+                driver: &mut Driver<'_, Self::Decoder>,
             ) -> Result<Flow, Infallible> {
                 driver.record(Event::new("udp", "datagram"));
                 driver.reply().extend_from_slice(
@@ -1240,7 +1268,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
                     len: 32,
                 },
             )
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
         let s = sandbox(&fcx, attacher.attach("agent")?, ME);
         let mut conn = s
             .tcp
@@ -1397,7 +1425,7 @@ fn a_cancel_during_the_tls_handshake_is_a_cancel() {
                         Ok(())
                     });
                     let opts = ServeOptions::default().tls(config);
-                    let served = serve::serve(
+                    let served = serve::connection(
                         &region_fcx,
                         conn,
                         ConnInfo::default(),
@@ -1455,7 +1483,7 @@ fn net_routes_tls_by_name_to_each_service() {
             &mut self,
             line: Result<Vec<u8>, LineError>,
             _: &(),
-            driver: &mut Driver<'_>,
+            driver: &mut Driver<'_, Self::Decoder>,
         ) -> Result<Flow, Infallible> {
             driver
                 .reply()
@@ -1483,7 +1511,7 @@ fn net_routes_tls_by_name_to_each_service() {
                     .tls(6514, "a.test", move |_| ca.clone(), Arc::new(()), || Echo)
                     .tls(6514, "b.test", move |_| cb.clone(), Arc::new(()), || Upper),
             )
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
         let s = sandbox(&fcx, attacher.attach("agent")?, ME);
         let connect = |name: &'static str| {
             let roots = roots.clone();
@@ -1626,7 +1654,7 @@ fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
             &mut self,
             line: Result<Vec<u8>, LineError>,
             _: &(),
-            driver: &mut Driver<'_>,
+            driver: &mut Driver<'_, Self::Decoder>,
         ) -> Result<Flow, Infallible> {
             match line {
                 Ok(line) => driver
@@ -1698,7 +1726,11 @@ impl Service for Mail {
     fn decoder(&self) -> Lines {
         Lines::new(512, Ending::LfOrCrlf)
     }
-    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+    fn on_open(
+        &mut self,
+        _: &(),
+        driver: &mut Driver<'_, Self::Decoder>,
+    ) -> Result<Flow, Infallible> {
         // After STARTTLS the client speaks first.
         self.tls = driver.conn().tls;
         if !self.tls {
@@ -1710,7 +1742,7 @@ impl Service for Mail {
         &mut self,
         line: Result<Vec<u8>, LineError>,
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         let line = line.unwrap_or_default();
         match line.as_slice() {
@@ -1779,7 +1811,7 @@ fn net_performs_starttls_for_a_service_that_asks() {
                     opts,
                 )
             })
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
         let s = sandbox(&fcx, attacher.attach("agent")?, ME);
         let mut tcp = s
             .tcp
@@ -1844,7 +1876,7 @@ impl Service for Trader {
         &mut self,
         line: Result<Vec<u8>, LineError>,
         book: &Book,
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         let line = String::from_utf8(line.unwrap_or_default()).unwrap_or_default();
         if line == "sub" {
@@ -1864,7 +1896,11 @@ impl Service for Trader {
         }
         Ok(Flow::Continue)
     }
-    fn on_wake(&mut self, _: &Book, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+    fn on_wake(
+        &mut self,
+        _: &Book,
+        driver: &mut Driver<'_, Self::Decoder>,
+    ) -> Result<Flow, Infallible> {
         for fill in self.inbox.lock().unwrap().drain(..) {
             driver
                 .reply()
@@ -1927,7 +1963,11 @@ impl Service for Session {
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+    fn on_open(
+        &mut self,
+        _: &(),
+        driver: &mut Driver<'_, Self::Decoder>,
+    ) -> Result<Flow, Infallible> {
         driver.set_timer("heartbeat", Duration::from_millis(10));
         driver.set_timer("logon", Duration::from_millis(25));
         Ok(Flow::Continue)
@@ -1936,7 +1976,7 @@ impl Service for Session {
         &mut self,
         line: Result<Vec<u8>, LineError>,
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         self.lines += 1;
         if line.as_deref() == Ok(b"slow") {
@@ -1962,7 +2002,7 @@ impl Service for Session {
         &mut self,
         timer: Timer,
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         match timer {
             "heartbeat" => {
@@ -2134,7 +2174,7 @@ impl Service for Mux {
         &mut self,
         line: Result<Vec<u8>, LineError>,
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         match line.as_deref() {
             Ok(b"get") => {
@@ -2158,7 +2198,7 @@ impl Service for Mux {
         key: u64,
         done: serve::Done,
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         assert!(matches!(done, serve::Done::Finished), "{done:?}");
         driver
@@ -2232,7 +2272,11 @@ fn datagram_services_send_several_datagrams_and_tick() {
         fn decoder(&self) -> Lines {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        fn on_open(&mut self, _: &SocketAddr, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+        fn on_open(
+            &mut self,
+            _: &SocketAddr,
+            driver: &mut Driver<'_, Self::Decoder>,
+        ) -> Result<Flow, Infallible> {
             driver.set_timer("heartbeat", Duration::from_millis(20));
             Ok(Flow::Continue)
         }
@@ -2240,7 +2284,7 @@ fn datagram_services_send_several_datagrams_and_tick() {
             &mut self,
             line: Result<Vec<u8>, LineError>,
             _: &SocketAddr,
-            driver: &mut Driver<'_>,
+            driver: &mut Driver<'_, Self::Decoder>,
         ) -> Result<Flow, Infallible> {
             let line = String::from_utf8(line.unwrap_or_default()).unwrap_or_default();
             let n: u32 = line
@@ -2260,7 +2304,7 @@ fn datagram_services_send_several_datagrams_and_tick() {
             &mut self,
             _: Timer,
             subscriber: &SocketAddr,
-            driver: &mut Driver<'_>,
+            driver: &mut Driver<'_, Self::Decoder>,
         ) -> Result<Flow, Infallible> {
             driver.send_to(*subscriber, b"heartbeat".to_vec());
             driver.set_timer("heartbeat", Duration::from_millis(20));
@@ -2274,7 +2318,7 @@ fn datagram_services_send_several_datagrams_and_tick() {
         let mut feed = client.bind(4001)?;
         fcx.spawn(move |fcx| async move {
             let local = SocketAddr::new(SERVER.into(), 9);
-            let _ = serve::serve_datagram(
+            let _ = serve::datagram(
                 &fcx,
                 socket,
                 local,
@@ -2313,7 +2357,7 @@ impl Service for Fragile {
         &mut self,
         line: Result<Vec<u8>, LineError>,
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, std::io::Error> {
         match line.as_deref() {
             Ok(b"boom") => panic!("the service fell over"),
@@ -2343,7 +2387,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
         Net::new()
             .ipv4_only()
             .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
         let s = sandbox(&fcx, attacher.attach("agent")?, ME);
         let mut b = s.tcp.connect(&fcx, to).await?;
         b.write_all(&fcx, b"hi\nfail\n").await?;
@@ -2362,7 +2406,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
             Net::new()
                 .ipv4_only()
                 .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
-                .serve(&fcx, attachments)?;
+                .start(&fcx, attachments)?;
             let s = sandbox(&fcx, attacher.attach("agent")?, ME);
             let mut a = s.tcp.connect(&fcx, to).await?;
             a.write_all(&fcx, b"boom\n").await?;
@@ -2386,7 +2430,11 @@ impl Service for Wide {
     fn decoder(&self) -> Lines {
         Lines::new(40 << 10, Ending::LfOrCrlf)
     }
-    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+    fn on_open(
+        &mut self,
+        _: &(),
+        driver: &mut Driver<'_, Self::Decoder>,
+    ) -> Result<Flow, Infallible> {
         driver.reply().extend_from_slice(b"hello\n");
         Ok(Flow::Continue)
     }
@@ -2394,7 +2442,7 @@ impl Service for Wide {
         &mut self,
         _: Result<Vec<u8>, LineError>,
         _: &(),
-        _: &mut Driver<'_>,
+        _: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         Ok(Flow::Continue)
     }
@@ -2425,7 +2473,7 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
                     .tcp_with(7, Arc::new(()), || Echo, capped)
                     .tcp_with(8, Arc::new(()), || Wide, wide)
             })
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
         let s = sandbox(&fcx, attacher.attach("agent")?, ME);
         let mut a = s.tcp.connect(&fcx, SocketAddr::new(addr.into(), 7)).await?;
         assert_eq!(read_some(&fcx, &mut a, 6).await, b"hello\n");
@@ -2464,7 +2512,7 @@ fn net_refuses_a_host_it_cannot_serve() {
         let fail = |net: Net| {
             let (_attacher, attachments) = fictionet::attachments();
             net.ipv4_only()
-                .serve(&fcx, attachments)
+                .start(&fcx, attachments)
                 .err()
                 .map(|e| e.to_string())
         };
@@ -2573,7 +2621,11 @@ impl Service for Dice {
     fn decoder(&self) -> Lines {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+    fn on_open(
+        &mut self,
+        _: &(),
+        driver: &mut Driver<'_, Self::Decoder>,
+    ) -> Result<Flow, Infallible> {
         let n = driver.random_u64();
         driver
             .reply()
@@ -2584,7 +2636,7 @@ impl Service for Dice {
         &mut self,
         _: Result<Vec<u8>, LineError>,
         _: &(),
-        _: &mut Driver<'_>,
+        _: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Infallible> {
         Ok(Flow::Continue)
     }
@@ -2639,7 +2691,7 @@ fn a_net_starts_its_events_with_a_wall_clock_anchor() {
             let kept = fcx.events();
             let (_attacher, attachments) = fictionet::attachments();
             let date = Fields::new().with("world_date", "2026-10-06");
-            Net::new().start_fields(date).serve(&fcx, attachments)?;
+            Net::new().start_fields(date).start(&fcx, attachments)?;
             let first = &kept.all()[0];
             assert!(first.is("run", "start"));
             assert_eq!(first.at, fictionet::time::Instant::ZERO);
@@ -2717,7 +2769,11 @@ fn hosts_and_members_share_a_lan_on_the_net() {
         fn decoder(&self) -> Lines {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        fn on_open(&mut self, _: &SocketAddr, driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+        fn on_open(
+            &mut self,
+            _: &SocketAddr,
+            driver: &mut Driver<'_, Self::Decoder>,
+        ) -> Result<Flow, Infallible> {
             driver.set_timer("tick", Duration::from_millis(20));
             Ok(Flow::Continue)
         }
@@ -2725,7 +2781,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
             &mut self,
             _: Result<Vec<u8>, LineError>,
             _: &SocketAddr,
-            _: &mut Driver<'_>,
+            _: &mut Driver<'_, Self::Decoder>,
         ) -> Result<Flow, Infallible> {
             Ok(Flow::Continue)
         }
@@ -2733,7 +2789,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
             &mut self,
             _: Timer,
             group: &SocketAddr,
-            driver: &mut Driver<'_>,
+            driver: &mut Driver<'_, Self::Decoder>,
         ) -> Result<Flow, Infallible> {
             driver.send_to(*group, b"tick".to_vec());
             driver.set_timer("tick", Duration::from_millis(20));
@@ -2762,7 +2818,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
                     .udp(30000, Arc::new(group), || Feed)
             })
             .member("ws01", "corp", ws.into())
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
 
         // The VM: its own stack at its LAN address, no DHCP.
         let vm = sandbox(&fcx, attacher.attach("ws01")?, ws);
@@ -2877,7 +2933,7 @@ fn net_refuses_lans_that_overlap() {
         let fail = |net: Net| {
             let (_attacher, attachments) = fictionet::attachments();
             net.ipv4_only()
-                .serve(&fcx, attachments)
+                .start(&fcx, attachments)
                 .err()
                 .map(|e| e.to_string())
         };
@@ -2917,7 +2973,7 @@ fn net_refuses_lans_that_overlap() {
 #[derive(Default)]
 struct Spy(Arc<Mutex<Vec<Option<Budget>>>>);
 
-impl Accept for Spy {
+impl PortServer for Spy {
     fn serve(&self, _: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         self.0.lock().unwrap().push(arrival.budget);
         Box::pin(async {})
@@ -2957,9 +3013,9 @@ fn net_keeps_one_budget_per_attachment() {
                 h.at(addr)
                     .at(addr6)
                     .tcp(8, Arc::new(()), || Wide)
-                    .accept(9, spy)
+                    .port_server(9, spy)
             })
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
 
         // One sandbox on both families: a connection over IPv4 is charged
         // to the budget a connection over IPv6 gets.
@@ -3037,7 +3093,7 @@ fn a_lan_member_detaches_like_any_sandbox() {
                 h.on("corp").at(dc).tcp(389, Arc::new(()), || Echo)
             })
             .member("ws01", "corp", ws.into())
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
 
         let to = SocketAddr::new(dc.into(), 389);
         let first_attacher = &attacher;
@@ -3090,7 +3146,7 @@ fn net_records_connections_on_a_tcp_port() {
         Net::new()
             .ipv4_only()
             .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Echo))
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
         let s = sandbox(&fcx, attacher.attach("agent")?, ME);
         let mut conn = s.tcp.connect(&fcx, SocketAddr::new(addr.into(), 7)).await?;
         conn.write_all(&fcx, b"quit\n").await?;
@@ -3126,7 +3182,7 @@ fn net_limits_a_starttls_handshake() {
                 h.at(addr)
                     .tcp_with(25, Arc::new(()), || Mail { tls: false }, opts)
             })
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
         let s = sandbox(&fcx, attacher.attach("agent")?, ME);
         let mut conn = s
             .tcp
@@ -3172,7 +3228,7 @@ where
 }
 
 /// Every wait of the serving stack reports a cancel the one way: an
-/// accept, `serve`, `serve_datagram`, `httpd::serve_connection`, and a
+/// accept, `serve`, `datagram`, `httpd::serve_connection`, and a
 /// connection read through tokio's traits.
 #[test]
 fn every_serving_wait_reports_a_cancel() {
@@ -3194,7 +3250,7 @@ fn every_serving_wait_reports_a_cancel() {
             .await?;
         let conn = listener.accept(&fcx).await?;
         let got = after_a_cancel(&fcx, |region_fcx| async move {
-            serve::serve(
+            serve::connection(
                 &region_fcx,
                 conn,
                 ConnInfo::default(),
@@ -3229,11 +3285,11 @@ fn every_serving_wait_reports_a_cancel() {
         .await;
         assert_eq!(got, "Err(Cancelled)");
 
-        // A socket nobody sends to, served by `serve_datagram`.
+        // A socket that receives no datagrams, served by `datagram`.
         let socket = server_udp.bind(9)?;
         let local = SocketAddr::new(SERVER.into(), 9);
         let got = after_a_cancel(&fcx, |region_fcx| async move {
-            serve::serve_datagram(
+            serve::datagram(
                 &region_fcx,
                 socket,
                 local,

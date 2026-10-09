@@ -2276,3 +2276,65 @@ mod tests {
         assert!(!udp_checksum_ok(v4a, v4b, &u));
     }
 }
+
+/// The source and destination addresses in an IP pseudo-header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Endpoints {
+    /// An IPv4 packet.
+    V4 {
+        /// The source address.
+        source: Ipv4Addr,
+        /// The destination address.
+        destination: Ipv4Addr,
+    },
+    /// An IPv6 packet.
+    V6 {
+        /// The source address.
+        source: Ipv6Addr,
+        /// The destination address.
+        destination: Ipv6Addr,
+    },
+}
+
+impl Endpoints {
+    /// The length of one address in this IP family:
+    /// 4 for IPv4 and 16 for IPv6.
+    pub fn address_len(&self) -> usize {
+        match self {
+            Endpoints::V4 { .. } => 4,
+            Endpoints::V6 { .. } => 16,
+        }
+    }
+
+    /// The endpoints of a packet from `source` to `destination`, or `None`
+    /// if the two are of different families.
+    pub fn new(source: IpAddr, destination: IpAddr) -> Option<Endpoints> {
+        match (source, destination) {
+            (IpAddr::V4(source), IpAddr::V4(destination)) => Some(Endpoints::V4 {
+                source,
+                destination,
+            }),
+            (IpAddr::V6(source), IpAddr::V6(destination)) => Some(Endpoints::V6 {
+                source,
+                destination,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The packet's source address.
+    pub fn source(&self) -> IpAddr {
+        match self {
+            Endpoints::V4 { source, .. } => IpAddr::V4(*source),
+            Endpoints::V6 { source, .. } => IpAddr::V6(*source),
+        }
+    }
+
+    /// The packet's destination address.
+    pub fn destination(&self) -> IpAddr {
+        match self {
+            Endpoints::V4 { destination, .. } => IpAddr::V4(*destination),
+            Endpoints::V6 { destination, .. } => IpAddr::V6(*destination),
+        }
+    }
+}

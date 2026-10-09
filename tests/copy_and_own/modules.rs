@@ -326,6 +326,10 @@ fn copied_frames() {
     {
     }
     check(Frames::<modbus::Frame>::new());
+    check(Frames::<kerberos::Frame>::new());
+    check(Frames::<stun::Frame>::new());
+    check(Frames::<ocsp::Frame>::new());
+    check(Frames::<spnego::Frame>::new());
     check(Frames::<diameter::Message>::with_limit(1024));
     check(Frames::<opcua::Chunk>::with_limit(opcua::Limits::default()));
     check(Frames::<cboe_boe::Inbound>::new());
@@ -345,11 +349,11 @@ fn copied_transports<S, M>(
     M: Fn() -> S + Send + Sync + 'static,
     <S::Decoder as fictionet::stdlib::codec::Decode>::Error: Clone + Send,
 {
-    use fictionet::stdlib::serve::{ServeOptions, listen, serve_datagram};
+    use fictionet::stdlib::serve::{ServeOptions, datagram, listen};
     let opts = ServeOptions::default();
     listen(fcx, listener, state.clone(), make, opts.clone());
     fn send_future(_: impl std::future::Future + Send) {}
-    send_future(serve_datagram(fcx, socket, local, service, &state, &opts));
+    send_future(datagram(fcx, socket, local, service, &state, &opts));
 }
 
 // A copied TCP connection also enters the connection and TLS drivers directly.
@@ -363,8 +367,8 @@ fn copied_connection<S>(
     S: fictionet::stdlib::serve::Service,
     <S::Decoder as fictionet::stdlib::codec::Decode>::Error: Clone + Send,
 {
-    use fictionet::stdlib::serve::{ServeOptions, serve};
-    drop(serve(
+    use fictionet::stdlib::serve::{ServeOptions, connection};
+    drop(connection(
         fcx,
         conn,
         info,
@@ -416,4 +420,10 @@ fn copied_clock(fcx: &fictionet::Cx, cx: &mut std::task::Context<'_>) {
     timer.clear();
     let _ = fcx.mode();
     let _ = fcx.require_real_io();
+}
+
+#[allow(dead_code)]
+fn copied_connection_limit(fcx: &fictionet::Cx, info: &fictionet::events::ConnInfo) {
+    let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _guard = net::connection_limit(fcx, info, &open, 1);
 }

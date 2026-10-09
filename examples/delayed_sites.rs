@@ -32,7 +32,7 @@ fn main() -> fictionet::Result {
                 "example.test" => Some(web::Site::new(app.clone())),
                 _ => None,
             })
-            .serve(&fcx, far)?;
+            .start(&fcx, far)?;
             Ok(())
         },
     ))

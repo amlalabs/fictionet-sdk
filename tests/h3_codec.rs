@@ -3,7 +3,7 @@
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::{
     codec::{self, Decode, Fail, Stream, Wire, finish, pump},
-    http3::{self, Endpoint, Frame, Session, StreamHeader, StreamItem},
+    http3::{self, Frame, Session, StreamHeader, StreamItem},
     qpack::{
         self, DecoderInstruction as DI, EncoderInstruction as EI, Field, Representation as Rep,
         SectionResult, Table,
@@ -49,7 +49,7 @@ fn blocked_stream_keeps_frames_in_connection_budget_until_unpaused() {
     let mut table = Table::new(4096);
     table.apply(EI::SetCapacity(4096)).unwrap();
     let mut state = http3::RequestStream::new(0, http3::MessageSide::Response, false).unwrap();
-    let mut session = Session::new(Endpoint::Server, 4, http3::MAX_FRAME);
+    let mut session = Session::new(fictionet::stdlib::codec::Side::Server, 4, http3::MAX_FRAME);
     let data = Frame::Data(vec![7; 10]);
     let mut bytes = contract::check_written(&Frame::Headers(vec![2, 0, 0x80]));
     for _ in 0..50 {
@@ -110,7 +110,8 @@ fn blocked_stream_keeps_frames_in_connection_budget_until_unpaused() {
 fn paused_stream_defers_eof_and_preserves_offsets() {
     for end_before_pause in [false, true] {
         for partial in [false, true] {
-            let mut session = Session::new(Endpoint::Client, 1, http3::MAX_FRAME);
+            let mut session =
+                Session::new(fictionet::stdlib::codec::Side::Client, 1, http3::MAX_FRAME);
             let frame = Frame::Data(vec![7; 10]);
             let mut bytes = contract::check_written(&frame);
             if partial {
@@ -168,7 +169,7 @@ fn paused_stream_defers_eof_and_preserves_offsets() {
 
 #[test]
 fn paused_stream_at_capacity_resumes_without_stuck() {
-    let mut session = Session::new(Endpoint::Client, 1, http3::MAX_FRAME);
+    let mut session = Session::new(fictionet::stdlib::codec::Side::Client, 1, http3::MAX_FRAME);
     session.pause(4);
     session.unpause(4);
     assert!(session.is_empty());
@@ -434,7 +435,11 @@ fn two_request_states_resume_in_qpack_release_order() {
         RequestStream::new(0, MessageSide::Request, false).unwrap(),
         RequestStream::new(4, MessageSide::Request, false).unwrap(),
     ];
-    let mut session = Session::new(Endpoint::Client, 2, 2 * http3::MAX_FRAME);
+    let mut session = Session::new(
+        fictionet::stdlib::codec::Side::Client,
+        2,
+        2 * http3::MAX_FRAME,
+    );
     for (id, required) in [(0, 2), (4, 1)] {
         let mut reps: Vec<_> = received_request(&[])
             .into_iter()
@@ -850,7 +855,10 @@ fn http3_stream_errors_keep_role_specific_application_codes() {
             http3::error_code::QPACK_DECODER_STREAM_ERROR,
         ),
     ] {
-        let mut input = Stream::new(http3::StreamItems::after_header(header, Endpoint::Client));
+        let mut input = Stream::new(http3::StreamItems::after_header(
+            header,
+            fictionet::stdlib::codec::Side::Client,
+        ));
         assert_eq!(input.push(&bytes), bytes.len());
         assert_eq!(input.next(), Some(Ok(Err(expected))));
         assert_eq!(expected.application_code(), Some(code));
@@ -953,7 +961,9 @@ fn increments_without_blocked_streams_and_after_section_acks() {
 
 #[test]
 fn partial_critical_fin_is_closed_critical_stream() {
-    let mut control = Stream::new(http3::ControlFrames::new(Endpoint::Client));
+    let mut control = Stream::new(http3::ControlFrames::new(
+        fictionet::stdlib::codec::Side::Client,
+    ));
     assert_eq!(control.push(&[0x04, 0x02, 0x01]), 3);
     control.end();
     assert_eq!(
@@ -965,7 +975,7 @@ fn partial_critical_fin_is_closed_critical_stream() {
 #[test]
 fn connection_partial_critical_fin_survives_handoff() {
     for bytes in [&[0, 0x04, 0x02, 0x01][..], &[2, 0x3f], &[3, 0xff]] {
-        let mut session = Session::new(Endpoint::Client, 4, http3::MAX_FRAME);
+        let mut session = Session::new(fictionet::stdlib::codec::Side::Client, 4, http3::MAX_FRAME);
         assert_eq!(session.push(2, bytes), bytes.len());
         session.end(2);
         assert!(matches!(
@@ -1569,7 +1579,7 @@ fn drain(session: &mut Session, items: &mut SessionItems, table: &mut Table) {
 
 fn interleaved_connection(chunk_size: usize) {
     const BUDGET: usize = 512;
-    let mut session = Session::new(Endpoint::Client, 5, BUDGET);
+    let mut session = Session::new(fictionet::stdlib::codec::Side::Client, 5, BUDGET);
     let mut table = Table::new(4096);
     let mut items = SessionItems::new();
     let mut control = contract::check_written(&StreamHeader::Control);
@@ -1699,7 +1709,7 @@ fn http3_connection_interleaves_control_qpack_and_two_requests() {
 #[test]
 fn http3_aggregate_demux_budget_refuses_across_streams() {
     // Every stream's frame limit exceeds this total session budget.
-    let mut session = Session::new(Endpoint::Client, 4, 9);
+    let mut session = Session::new(fictionet::stdlib::codec::Side::Client, 4, 9);
     assert_eq!(session.push(0, &[0, 100, 1]), 3);
     assert_eq!(session.push(4, &[0, 100, 2]), 3);
     assert_eq!(session.push(2, &[0, 4, 100, 3, 4]), 3);
@@ -1724,7 +1734,11 @@ fn http3_aggregate_demux_budget_refuses_across_streams() {
 fn http3_many_small_streams_allocate_in_proportion_to_input() {
     const COUNT: usize = 512;
     const FIRST: &[u8] = &[0, 100, 7];
-    let mut session = Session::new(Endpoint::Client, COUNT, COUNT * FIRST.len());
+    let mut session = Session::new(
+        fictionet::stdlib::codec::Side::Client,
+        COUNT,
+        COUNT * FIRST.len(),
+    );
     for index in 0..COUNT {
         let id = index as u64 * 4;
         assert_eq!(session.push(id, FIRST), FIRST.len());
@@ -1807,11 +1821,13 @@ fn http3_control_and_selected_stream_contracts() {
     Wire::write(&Frame::Goaway(8), &mut control).unwrap();
     Wire::write(&Frame::Goaway(4), &mut control).unwrap();
     contract::check_decode_with_alloc_limit(
-        || http3::ControlFrames::new(Endpoint::Server),
+        || http3::ControlFrames::new(fictionet::stdlib::codec::Side::Server),
         &control,
-        2 * http3::ControlFrames::new(Endpoint::Server).capacity(),
+        2 * http3::ControlFrames::new(fictionet::stdlib::codec::Side::Server).capacity(),
     );
-    let mut stream = Stream::new(http3::ControlFrames::new(Endpoint::Server));
+    let mut stream = Stream::new(http3::ControlFrames::new(
+        fictionet::stdlib::codec::Side::Server,
+    ));
     let mut frames = Vec::new();
     pump(&mut stream, &control, |item| frames.push(item.unwrap())).unwrap();
     assert_eq!(frames, [settings(), Frame::Goaway(8), Frame::Goaway(4)]);
@@ -1822,21 +1838,38 @@ fn http3_control_and_selected_stream_contracts() {
     let header = StreamHeader::QpackEncoder;
     let bytes = contract::check_written(&EI::SetCapacity(4096));
     contract::check_decode_with_alloc_limit(
-        || http3::StreamItems::after_header(header, Endpoint::Client),
+        || http3::StreamItems::after_header(header, fictionet::stdlib::codec::Side::Client),
         &bytes,
-        2 * http3::StreamItems::after_header(header, Endpoint::Client).capacity(),
+        2 * http3::StreamItems::after_header(header, fictionet::stdlib::codec::Side::Client)
+            .capacity(),
     );
     contract::check_decode_with_alloc_limit(
-        || http3::StreamItems::after_header(StreamHeader::QpackDecoder, Endpoint::Client),
+        || {
+            http3::StreamItems::after_header(
+                StreamHeader::QpackDecoder,
+                fictionet::stdlib::codec::Side::Client,
+            )
+        },
         &[1],
-        2 * http3::StreamItems::after_header(StreamHeader::QpackDecoder, Endpoint::Client)
-            .capacity(),
+        2 * http3::StreamItems::after_header(
+            StreamHeader::QpackDecoder,
+            fictionet::stdlib::codec::Side::Client,
+        )
+        .capacity(),
     );
     contract::check_decode_with_alloc_limit(
-        || http3::StreamItems::after_header(StreamHeader::Unknown(64), Endpoint::Client),
+        || {
+            http3::StreamItems::after_header(
+                StreamHeader::Unknown(64),
+                fictionet::stdlib::codec::Side::Client,
+            )
+        },
         &[0xff; 128],
-        2 * http3::StreamItems::after_header(StreamHeader::Unknown(64), Endpoint::Client)
-            .capacity(),
+        2 * http3::StreamItems::after_header(
+            StreamHeader::Unknown(64),
+            fictionet::stdlib::codec::Side::Client,
+        )
+        .capacity(),
     );
     contract::check_decode_with_alloc_limit(
         http3::StreamItems::request,
@@ -1852,7 +1885,7 @@ fn http3_control_and_selected_stream_contracts() {
 
 #[test]
 fn http3_connection_eof_survives_handoff_and_unknown_streams_are_skipped() {
-    let mut session = Session::new(Endpoint::Server, 3, 64);
+    let mut session = Session::new(fictionet::stdlib::codec::Side::Server, 3, 64);
     // Push ID is part of the header; the entire DATA frame is already buffered.
     let mut bytes = contract::check_written(&StreamHeader::Push(65));
     Wire::write(&Frame::Data(b"hello".to_vec()), &mut bytes).unwrap();

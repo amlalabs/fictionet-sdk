@@ -134,7 +134,7 @@ pub fn start(
         Some(if i == 0 { s.default_host() } else { s })
     })
     .ipv4_only()
-    .serve(fcx, attachments)
+    .start(fcx, attachments)
 }
 /// Resolves the three names before listening, so direct IP connections work.
 pub async fn look_up_all(fcx: &Cx, attacher: &Attacher) -> Result {

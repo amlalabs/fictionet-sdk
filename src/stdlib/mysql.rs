@@ -18,9 +18,9 @@
 //! protocol chapter of the MySQL source documentation.
 //!
 //! Nothing here reads a socket. A world that plays a database server
-//! sends a [`Handshake`] inside a [`Message`]. It reads packets with
-//! [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), or uses [`Messages`] in that
-//! driver to join split packets and check their sequence IDs. It reads
+//! sends a [`Handshake`] inside a [`Message`]. A [`Service`](fictionet::stdlib::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::serve::connection) uses `codec::Frames<Packet>` for packets
+//! or [`Messages`] to join split packets and check their sequence IDs. It reads
 //! each payload as a [`HandshakeResponse`] or [`Command`], then builds
 //! reply messages from [`OkPacket`], [`ErrPacket`], or [`ResultSet`].
 //! World code decides which users, databases, and tables exist and what

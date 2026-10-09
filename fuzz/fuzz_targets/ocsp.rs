@@ -3,11 +3,11 @@
 //! bytes, as a world playing a client or responder writes them.
 #![no_main]
 
-use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
 use fictionet::stdlib::ocsp::{
-    AlgorithmIdentifier, BasicResponse, CertId, CertStatus, CrlReason, Extension, Frames,
-    MAX_NONCE, Request, ResponderId, Response, ResponseBytes, ResponseData, ResponseStatus,
-    SingleRequest, SingleResponse, decode_get_path, encode_get_path, find_nonce,
+    AlgorithmIdentifier, BasicResponse, CertId, CertStatus, CrlReason, Extension, Frame, MAX_NONCE,
+    Request, ResponderId, Response, ResponseBytes, ResponseData, ResponseStatus, SingleRequest,
+    SingleResponse, decode_get_path, encode_get_path, find_nonce,
 };
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
@@ -122,12 +122,12 @@ fn written(mut data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
+    contract::check_decode(Frames::<Frame>::new, data);
     contract::check_wire::<Request>(data);
     contract::check_wire::<Response>(data);
     contract::check_wire::<BasicResponse>(data);
 
-    let mut stream = Stream::new(Frames::new());
+    let mut stream = Stream::new(Frames::<Frame>::new());
     let mut messages = Vec::new();
     let _ = pump(&mut stream, data, |m| messages.push(m));
     let _ = finish(&mut stream, |m| messages.push(m));

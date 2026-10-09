@@ -14,9 +14,9 @@
 //! type. This module follows the OASIS MQTT Version 3.1.1 standard
 //! (Plus Errata 01).
 //!
-//! Nothing here reads a socket. A world that plays a broker pushes the bytes
-//! it reads from a TCP connection to a [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
-//! and writes the bytes of its replies, from [`Packet::to_bytes`], back to
+//! A broker [`Service`](fictionet::stdlib::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::serve::connection) uses `codec::Frames<Packet>` to receive
+//! [`Packet`]s and writes the bytes of its replies, from [`Packet::to_bytes`], back to
 //! the connection. Which clients may connect, which topics exist, and who
 //! receives what is up to world code. [`topic_matches`] says whether a
 //! subscription's filter matches a topic name, as the standard defines it.

@@ -203,7 +203,7 @@ pub enum ErrorMode {
 
 /// A reason compilation failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CompileErrorKind {
+pub enum CompileKind {
     /// A keyword has the wrong JSON shape or value.
     InvalidKeyword,
     /// An object repeats a name.
@@ -222,18 +222,35 @@ pub enum CompileErrorKind {
     Limit(&'static str),
 }
 
+impl std::fmt::Display for CompileKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidKeyword => f.write_str("invalid keyword value"),
+            Self::DuplicateKey => f.write_str("duplicate object name"),
+            Self::UnsupportedPattern => {
+                f.write_str("regex assertions require an annotation-only policy")
+            }
+            Self::UnsupportedKeyword(name) => write!(f, "unsupported assertion keyword {name}"),
+            Self::ExternalReference => f.write_str("reference to another document"),
+            Self::InvalidReference => f.write_str("invalid or missing reference target"),
+            Self::InvalidAnchor => f.write_str("invalid or duplicate anchor"),
+            Self::Limit(name) => write!(f, "compilation exceeded the {name} limit"),
+        }
+    }
+}
+
 /// A compile failure at a JSON Pointer in the source document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompileError {
     /// Pointer to the invalid keyword or value. An empty pointer names the root.
     pub schema_path: String,
     /// The reason compilation stopped.
-    pub kind: CompileErrorKind,
+    pub kind: CompileKind,
 }
 impl std::fmt::Display for CompileError {
     /// Formats the reason and source pointer.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?} at schema {}", self.kind, self.schema_path)
+        write!(f, "{} at schema {}", self.kind, self.schema_path)
     }
 }
 impl std::error::Error for CompileError {}
@@ -255,6 +272,19 @@ pub enum ValidationKind {
     Limit(&'static str),
 }
 
+impl std::fmt::Display for ValidationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FalseSchema => f.write_str("the false schema rejects this instance"),
+            Self::Assertion(name) => write!(f, "assertion {name} failed"),
+            Self::Missing(name) => write!(f, "required property {name} is missing"),
+            Self::DuplicateKey => f.write_str("duplicate object name"),
+            Self::ReferenceCycle => f.write_str("reference cycle without instance descent"),
+            Self::Limit(name) => write!(f, "validation exceeded the {name} limit"),
+        }
+    }
+}
+
 /// A validation failure, with JSON Pointer locations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationError {
@@ -270,7 +300,7 @@ impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:?} at instance {} (schema {})",
+            "{} at instance {} (schema {})",
             self.kind, self.instance_path, self.schema_path
         )
     }
@@ -379,10 +409,24 @@ pub enum GenerationError {
 impl std::fmt::Display for GenerationError {
     /// Formats the generation failure.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "example generation: {self:?}")
+        match self {
+            Self::UnsupportedPattern => {
+                f.write_str("example generation cannot enforce ignored regex keywords")
+            }
+            Self::Limit(name) => write!(f, "example generation exceeded the {name} limit"),
+            Self::NoCandidate => f.write_str("example generation found no acceptable candidate"),
+            Self::Validation(_) => f.write_str("example generation could not validate a candidate"),
+        }
     }
 }
-impl std::error::Error for GenerationError {}
+impl std::error::Error for GenerationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Validation(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// An owned, checked schema arena. Compilation does not expand references.
 ///
@@ -973,7 +1017,7 @@ struct Compiler<'a> {
     work: Work,
 }
 impl<'a> Compiler<'a> {
-    fn error(&self, path: usize, kind: CompileErrorKind) -> CompileError {
+    fn error(&self, path: usize, kind: CompileKind) -> CompileError {
         CompileError {
             schema_path: self.paths.render(path),
             kind,
@@ -991,7 +1035,7 @@ impl<'a> Compiler<'a> {
         let id = self
             .paths
             .child(parent, token, self.options.limits.pointer_bytes)
-            .map_err(|s| self.error(parent, CompileErrorKind::Limit(s)))?;
+            .map_err(|s| self.error(parent, CompileKind::Limit(s)))?;
         self.locations.insert(value, id);
         Ok(id)
     }
@@ -1001,7 +1045,7 @@ impl<'a> Compiler<'a> {
     fn spend(&mut self, amount: usize, path: usize) -> Result<(), CompileError> {
         self.work
             .spend(amount)
-            .map_err(|s| self.error(path, CompileErrorKind::Limit(s)))
+            .map_err(|s| self.error(path, CompileKind::Limit(s)))
     }
     fn inspect(&mut self, value: &'a Value, path: usize) -> Result<(), CompileError> {
         let mut stack = vec![(value, path, 0usize, SourceKind::Schema)];
@@ -1014,10 +1058,10 @@ impl<'a> Compiler<'a> {
             }
             let l = self.options.limits;
             if depth > l.depth {
-                return Err(self.error(p, CompileErrorKind::Limit("depth")));
+                return Err(self.error(p, CompileKind::Limit("depth")));
             }
             if self.checked.len() > l.schema_nodes {
-                return Err(self.error(p, CompileErrorKind::Limit("schema_nodes")));
+                return Err(self.error(p, CompileKind::Limit("schema_nodes")));
             }
             let text_bytes = match v {
                 Value::String(s) => s.len(),
@@ -1026,15 +1070,15 @@ impl<'a> Compiler<'a> {
             };
             let bytes = text_bytes
                 .checked_add(1)
-                .ok_or_else(|| self.error(p, CompileErrorKind::Limit("bytes")))?;
+                .ok_or_else(|| self.error(p, CompileKind::Limit("bytes")))?;
             self.size = self
                 .size
                 .checked_add(bytes)
                 .filter(|&n| n <= l.bytes)
-                .ok_or_else(|| self.error(p, CompileErrorKind::Limit("bytes")))?;
+                .ok_or_else(|| self.error(p, CompileKind::Limit("bytes")))?;
             self.spend(bytes, p)?;
             if let Value::Number(n) = v {
-                Decimal::new(n, &l).map_err(|s| self.error(p, CompileErrorKind::Limit(s)))?;
+                Decimal::new(n, &l).map_err(|s| self.error(p, CompileKind::Limit(s)))?;
             }
             let children = match v {
                 Value::Array(a) => a.len(),
@@ -1056,7 +1100,7 @@ impl<'a> Compiler<'a> {
                     .saturating_sub(self.checked.len())
                     .saturating_sub(stack.len())
             {
-                return Err(self.error(p, CompileErrorKind::Limit("schema_nodes")));
+                return Err(self.error(p, CompileKind::Limit("schema_nodes")));
             }
             match v {
                 Value::Array(a) => {
@@ -1078,11 +1122,11 @@ impl<'a> Compiler<'a> {
                             .size
                             .checked_add(key.len())
                             .filter(|&n| n <= l.bytes)
-                            .ok_or_else(|| self.error(p, CompileErrorKind::Limit("bytes")))?;
+                            .ok_or_else(|| self.error(p, CompileKind::Limit("bytes")))?;
                         self.spend(key.len().saturating_add(1), p)?;
                         let at = self.location(child, p, key)?;
                         if !names.insert(key) {
-                            return Err(self.error(at, CompileErrorKind::DuplicateKey));
+                            return Err(self.error(at, CompileKind::DuplicateKey));
                         }
                         let child_kind = kind.child(key);
                         if !matches!(child_kind, SourceKind::Definitions) {
@@ -1106,8 +1150,8 @@ impl<'a> Compiler<'a> {
         self.queue.push((value, path));
         Ok(id)
     }
-    fn resolve(&mut self, pointer: &str) -> Result<(&'a Value, usize), CompileErrorKind> {
-        use CompileErrorKind::{InvalidReference, Limit};
+    fn resolve(&mut self, pointer: &str) -> Result<(&'a Value, usize), CompileKind> {
+        use CompileKind::{InvalidReference, Limit};
         if pointer.len() > self.options.limits.pointer_bytes {
             return Err(Limit("pointer_bytes"));
         }
@@ -1146,7 +1190,7 @@ impl<'a> Compiler<'a> {
                             .map_err(Limit)?;
                         if key == &token {
                             if found.is_some() {
-                                return Err(CompileErrorKind::DuplicateKey);
+                                return Err(CompileKind::DuplicateKey);
                             }
                             found = Some(v);
                         }
@@ -1173,8 +1217,8 @@ impl<'a> Compiler<'a> {
     // The search follows schema positions only, from the document root and from
     // the compile_at entry, so `$anchor` inside keyword data such as `examples`,
     // `const`, or extensions is never a target.
-    fn anchor_pointer(&mut self, anchor: &str) -> Result<String, CompileErrorKind> {
-        use CompileErrorKind::{InvalidAnchor, InvalidReference, Limit};
+    fn anchor_pointer(&mut self, anchor: &str) -> Result<String, CompileKind> {
+        use CompileKind::{InvalidAnchor, InvalidReference, Limit};
         let max = self.options.limits.pointer_bytes;
         let mut found: Option<(*const Value, String)> = None;
         let mut starts = vec![(self.root, String::new())];
@@ -1250,7 +1294,7 @@ impl<'a> Compiler<'a> {
         found.map(|(_, p)| p).ok_or(InvalidReference)
     }
     fn names(&self, v: &Value, p: usize) -> Result<Vec<String>, CompileError> {
-        let invalid = || self.error(p, CompileErrorKind::InvalidKeyword);
+        let invalid = || self.error(p, CompileKind::InvalidKeyword);
         let a = v.as_array().ok_or_else(invalid)?;
         let mut seen = BTreeSet::new();
         let mut names = Vec::new();
@@ -1270,22 +1314,22 @@ impl<'a> Compiler<'a> {
         positive: bool,
         exclusive: bool,
     ) -> Result<Option<Decimal>, CompileError> {
-        let invalid = || self.error(p, CompileErrorKind::InvalidKeyword);
+        let invalid = || self.error(p, CompileKind::InvalidKeyword);
         if exclusive && self.options.dialect == Dialect::OpenApi30 {
             v.as_bool().ok_or_else(invalid)?;
             return Ok(None);
         }
         let n = Decimal::new(v.as_number().ok_or_else(invalid)?, &self.options.limits)
-            .map_err(|s| self.error(p, CompileErrorKind::Limit(s)))?;
+            .map_err(|s| self.error(p, CompileKind::Limit(s)))?;
         if positive && (n.negative || n.digits.is_empty()) {
             return Err(invalid());
         }
         Ok(Some(n))
     }
     fn count(&self, v: &Value, p: usize) -> Result<Decimal, CompileError> {
-        let invalid = || self.error(p, CompileErrorKind::InvalidKeyword);
+        let invalid = || self.error(p, CompileKind::InvalidKeyword);
         let n = Decimal::new(v.as_number().ok_or_else(invalid)?, &self.options.limits)
-            .map_err(|s| self.error(p, CompileErrorKind::Limit(s)))?;
+            .map_err(|s| self.error(p, CompileKind::Limit(s)))?;
         if n.negative || !n.integer() {
             return Err(invalid());
         }
@@ -1295,7 +1339,7 @@ impl<'a> Compiler<'a> {
         let a = v
             .as_array()
             .filter(|a| !a.is_empty())
-            .ok_or_else(|| self.error(p, CompileErrorKind::InvalidKeyword))?;
+            .ok_or_else(|| self.error(p, CompileKind::InvalidKeyword))?;
         a.iter().map(|v| self.enqueue(v, self.at(v))).collect()
     }
     fn node(&mut self, id: usize) -> Result<Node, CompileError> {
@@ -1310,7 +1354,7 @@ impl<'a> Compiler<'a> {
         }
         let object = value
             .as_object()
-            .ok_or_else(|| self.error(path, CompileErrorKind::InvalidKeyword))?;
+            .ok_or_else(|| self.error(path, CompileKind::InvalidKeyword))?;
         // OAS 3.0 Reference Objects have no effective siblings.
         let ref_only = self.options.dialect == Dialect::OpenApi30 && value.get("$ref").is_some();
         for (key, v) in object {
@@ -1320,10 +1364,10 @@ impl<'a> Compiler<'a> {
             let p = self.location(v, path, key)?;
             self.work
                 .spend(key.len().saturating_add(1))
-                .map_err(|s| self.error(p, CompileErrorKind::Limit(s)))?;
+                .map_err(|s| self.error(p, CompileKind::Limit(s)))?;
             let invalid = || CompileError {
                 schema_path: self.paths.render(p),
-                kind: CompileErrorKind::InvalidKeyword,
+                kind: CompileKind::InvalidKeyword,
             };
             match key.as_str() {
                 "type" => {
@@ -1387,7 +1431,7 @@ impl<'a> Compiler<'a> {
                     let entries = v.as_object().ok_or_else(invalid)?;
                     if key == "patternProperties" {
                         if self.options.patterns == PatternPolicy::Reject {
-                            return Err(self.error(p, CompileErrorKind::UnsupportedPattern));
+                            return Err(self.error(p, CompileKind::UnsupportedPattern));
                         }
                         self.annotations.push(StoredAnnotation {
                             path: p,
@@ -1427,7 +1471,7 @@ impl<'a> Compiler<'a> {
                         "format"
                     };
                     if k == "pattern" && self.options.patterns == PatternPolicy::Reject {
-                        return Err(self.error(p, CompileErrorKind::UnsupportedPattern));
+                        return Err(self.error(p, CompileKind::UnsupportedPattern));
                     }
                     self.annotations.push(StoredAnnotation {
                         path: p,
@@ -1438,13 +1482,13 @@ impl<'a> Compiler<'a> {
                 "$anchor" => {
                     let s = v.as_str().ok_or_else(invalid)?;
                     if !simple_anchor(s) || self.anchors.insert(s.into(), id).is_some() {
-                        return Err(self.error(p, CompileErrorKind::InvalidAnchor));
+                        return Err(self.error(p, CompileKind::InvalidAnchor));
                     }
                 }
                 "$ref" => {
                     let s = v.as_str().ok_or_else(invalid)?;
                     if !s.starts_with('#') {
-                        return Err(self.error(p, CompileErrorKind::ExternalReference));
+                        return Err(self.error(p, CompileKind::ExternalReference));
                     }
                     self.refs.push((id, s.into()));
                 }
@@ -1453,9 +1497,7 @@ impl<'a> Compiler<'a> {
                 "$id" if self.options.dialect == Dialect::Draft202012 => {
                     v.as_str().ok_or_else(invalid)?;
                     if path != 0 {
-                        return Err(
-                            self.error(p, CompileErrorKind::UnsupportedKeyword(key.clone()))
-                        );
+                        return Err(self.error(p, CompileKind::UnsupportedKeyword(key.clone())));
                     }
                 }
                 "default" | "example" => node.hints.push(v.clone()),
@@ -1472,7 +1514,7 @@ impl<'a> Compiler<'a> {
                 | "$dynamicAnchor"
                 | "$recursiveRef"
                 | "contentSchema" => {
-                    return Err(self.error(p, CompileErrorKind::UnsupportedKeyword(key.clone())));
+                    return Err(self.error(p, CompileKind::UnsupportedKeyword(key.clone())));
                 }
                 _ => {}
             }
@@ -1525,7 +1567,7 @@ impl<'a> Compiler<'a> {
                     .map_or(self.nodes[id].path, |v| self.at(v));
                 self.spend(reference.len(), p)?;
                 let fragment = decode_fragment(&reference[1..])
-                    .ok_or_else(|| self.error(p, CompileErrorKind::InvalidReference))?;
+                    .ok_or_else(|| self.error(p, CompileKind::InvalidReference))?;
                 let pointer = if fragment.is_empty() || fragment.starts_with('/') {
                     fragment
                 } else {
@@ -3536,6 +3578,42 @@ fn multiply_small(d: &Decimal, n: i64) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn schema_errors_describe_the_failure_and_chain_validation() {
+        use fictionet::stdlib::json_schema::{
+            CompileError, CompileKind, GenerationError, ValidationError, ValidationKind,
+        };
+        use std::error::Error;
+        let compile = CompileError {
+            schema_path: "/type".into(),
+            kind: CompileKind::InvalidKeyword,
+        };
+        assert_eq!(compile.to_string(), "invalid keyword value at schema /type");
+        let validation = ValidationError {
+            instance_path: "/user".into(),
+            schema_path: "/required".into(),
+            kind: ValidationKind::Missing("name".into()),
+        };
+        assert_eq!(
+            validation.to_string(),
+            "required property name is missing at instance /user (schema /required)"
+        );
+        let error = GenerationError::Validation(validation.clone());
+        assert_eq!(
+            error.to_string(),
+            "example generation could not validate a candidate"
+        );
+        assert_eq!(
+            error.source().unwrap().downcast_ref::<ValidationError>(),
+            Some(&validation)
+        );
+        assert!(GenerationError::NoCandidate.source().is_none());
+        assert_eq!(
+            GenerationError::Limit("work").to_string(),
+            "example generation exceeded the work limit"
+        );
+    }
+
     use super::*;
     use fictionet::stdlib::json;
     use fictionet::stdlib::test_support;
@@ -3775,7 +3853,7 @@ mod tests {
         ] {
             assert_eq!(
                 Schema::compile(&value(s)).unwrap_err().kind,
-                CompileErrorKind::InvalidAnchor
+                CompileKind::InvalidAnchor
             );
         }
     }
@@ -3788,7 +3866,7 @@ mod tests {
         ] {
             assert_eq!(
                 Schema::compile(&value(text)).unwrap_err().kind,
-                CompileErrorKind::UnsupportedPattern
+                CompileKind::UnsupportedPattern
             );
             let s = Schema::compile_with(
                 &value(text),
@@ -3894,7 +3972,7 @@ mod tests {
             Schema::compile(&value(r#"{"type":"string","type":"number"}"#))
                 .unwrap_err()
                 .kind,
-            CompileErrorKind::DuplicateKey
+            CompileKind::DuplicateKey
         );
         let s = schema("true");
         assert_eq!(
@@ -3942,7 +4020,7 @@ mod tests {
             Schema::compile(&Value::Object(vec![("minimum".into(), huge.clone())]))
                 .unwrap_err()
                 .kind,
-            CompileErrorKind::Limit("number_exponent")
+            CompileKind::Limit("number_exponent")
         ));
         assert_eq!(
             schema("true").validate(&huge).errors[0].kind,
@@ -3954,7 +4032,7 @@ mod tests {
         )]);
         assert_eq!(
             Schema::compile(&source).unwrap_err().kind,
-            CompileErrorKind::Limit("schema_nodes")
+            CompileKind::Limit("schema_nodes")
         );
         let mut deep = Value::Null;
         for _ in 0..200 {
@@ -3962,7 +4040,7 @@ mod tests {
         }
         assert!(matches!(
             Schema::compile(&deep).unwrap_err().kind,
-            CompileErrorKind::Limit("depth")
+            CompileKind::Limit("depth")
         ));
         assert_eq!(
             schema("true").validate(&deep).errors[0].kind,
@@ -4268,7 +4346,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(e.kind, CompileErrorKind::Limit("work"));
+        assert_eq!(e.kind, CompileKind::Limit("work"));
     }
     #[test]
     fn review_unique_items_scales_and_normalizes() {
@@ -4308,7 +4386,7 @@ mod tests {
             let source = Value::Object(vec![(key.into(), v)]);
             assert_eq!(
                 Schema::compile(&source).unwrap_err().kind,
-                CompileErrorKind::UnsupportedKeyword(key.into())
+                CompileKind::UnsupportedKeyword(key.into())
             );
         }
     }
@@ -4559,7 +4637,7 @@ mod tests {
                 Schema::compile_at(&source, pointer, Options::default())
                     .unwrap_err()
                     .kind,
-                CompileErrorKind::InvalidReference
+                CompileKind::InvalidReference
             );
         }
         let a = Schema::compile(source.get("target").unwrap()).unwrap();
@@ -4691,7 +4769,7 @@ mod tests {
         ] {
             assert_eq!(
                 Schema::compile(&value(source)).unwrap_err().kind,
-                CompileErrorKind::InvalidReference,
+                CompileKind::InvalidReference,
                 "{source}"
             );
         }
@@ -4715,7 +4793,7 @@ mod tests {
         };
         assert_eq!(
             Schema::compile_with(&oas, options).unwrap_err().kind,
-            CompileErrorKind::InvalidReference
+            CompileKind::InvalidReference
         );
         // compile_at searches the entry schema even when the document root is not a schema.
         let document = value(
@@ -4735,14 +4813,14 @@ mod tests {
             Schema::compile(&value(nested)).unwrap_err(),
             CompileError {
                 schema_path: "/$defs/a/$id".into(),
-                kind: CompileErrorKind::UnsupportedKeyword("$id".into()),
+                kind: CompileKind::UnsupportedKeyword("$id".into()),
             }
         );
         // Anchors inside an embedded resource belong to it, not to the root.
         let anchored = r##"{"$defs":{"a":{"$id":"https://example.test/a","$defs":{"b":{"$anchor":"x"}}}},"$ref":"#x"}"##;
         assert_eq!(
             Schema::compile(&value(anchored)).unwrap_err().kind,
-            CompileErrorKind::InvalidReference
+            CompileKind::InvalidReference
         );
         cases(
             r##"{"$id":"https://example.test/root","$defs":{"i":{"type":"integer"}},"$ref":"#/$defs/i"}"##,
@@ -4751,7 +4829,7 @@ mod tests {
         );
         assert_eq!(
             Schema::compile(&value(r#"{"$id":7}"#)).unwrap_err().kind,
-            CompileErrorKind::InvalidKeyword
+            CompileKind::InvalidKeyword
         );
         let document = value(r#"{"components":{"schemas":{"Pet":{"$id":"pet"}}}}"#);
         assert!(

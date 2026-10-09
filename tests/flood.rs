@@ -203,7 +203,7 @@ fn one_sandbox_flooding_everything_stays_bounded_and_others_are_served() {
             })
             .max_sites(1_000);
             let (attacher, attachments) = fictionet::attachments();
-            sites.serve(&fcx, attachments)?;
+            sites.start(&fcx, attachments)?;
             let mut raw = attacher.attach("agent").unwrap();
             let other = machine(&fcx, &attacher, "other", OTHER);
             let plain = other.lookup(&fcx, "plain.test").await;
@@ -392,7 +392,7 @@ fn sandboxes_sending_as_fast_as_they_can_do_not_grow_the_world() {
         let result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
             let sites =
                 web::Sites::new(|host| (host == "plain.test").then(|| web::Site::new(Hello)));
-            sites.serve(&fcx, attachments)?;
+            sites.start(&fcx, attachments)?;
             let other = machine(&fcx, &attacher, "other", Ipv4Addr::new(10, 0, 0, 100));
             let plain = other.lookup(&fcx, "plain.test").await;
             // Four sandboxes, each a thread with a socket: UDP to the

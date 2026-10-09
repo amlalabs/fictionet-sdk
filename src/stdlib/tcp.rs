@@ -38,6 +38,7 @@
 //! # }
 //! ```
 
+use fictionet::stdlib::codec::Side;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
@@ -405,7 +406,7 @@ struct Conn {
     /// This side called shutdown.
     shut: bool,
     /// This side connected, so it holds its local port.
-    client: bool,
+    side: Side,
     /// The peer's initial sequence number, from its SYN.
     irs: Option<u32>,
     /// Bytes the application has read, modulo 2^32.
@@ -430,7 +431,7 @@ impl Drop for Conn {
 }
 
 impl Conn {
-    fn new(local: SocketAddr, remote: SocketAddr, client: bool) -> Conn {
+    fn new(local: SocketAddr, remote: SocketAddr, side: Side) -> Conn {
         Conn {
             local,
             remote,
@@ -438,7 +439,7 @@ impl Conn {
             fin: false,
             fin_at: None,
             shut: false,
-            client,
+            side,
             irs: None,
             read: 0,
             last_fed: None,
@@ -697,7 +698,7 @@ impl State {
     fn remove_conn(&mut self, h: Id) {
         if let Some(c) = self.conns.remove(&h) {
             self.by_tuple.remove(&(c.local, c.remote));
-            if c.client {
+            if c.side == Side::Client {
                 self.free_port(c.local.port());
             }
         }
@@ -882,7 +883,7 @@ impl State {
                 let local = s.local_endpoint().map(SocketAddr::from).unwrap_or(dst);
                 let remote = s.remote_endpoint().map(SocketAddr::from).unwrap_or(src);
                 *l.per_peer.entry(remote.ip()).or_default() += 1;
-                let mut c = Conn::new(local, remote, false);
+                let mut c = Conn::new(local, remote, Side::Server);
                 c.irs = Some(seq);
                 self.conns.insert(h, c);
                 self.by_tuple.insert((local, remote), h);
@@ -1357,7 +1358,7 @@ impl Endpoint {
                 return Err(ConnError::Refused);
             }
             let h = st.add_socket(s);
-            st.conns.insert(h, Conn::new(local, to, true));
+            st.conns.insert(h, Conn::new(local, to, Side::Client));
             st.by_tuple.insert((local, to), h);
             st.take_port(port);
             st.kick();
@@ -1794,7 +1795,7 @@ mod tests {
                     let mut conn = Conn::new(
                         "10.0.0.1:80".parse().unwrap(),
                         SocketAddr::new("10.0.0.2".parse().unwrap(), port),
-                        false,
+                        Side::Server,
                     );
                     conn.gone
                         .push(Waker::from(Arc::new(WakeLog(port, log.clone()))));
@@ -1899,7 +1900,7 @@ mod tests {
             stcp::SocketBuffer::new(vec![0; MIN_BUFFER]),
         );
         for (old, win, expected) in [(123, 0u16, 0), (0, 123, 123), (123, 456, 123)] {
-            let mut c = Conn::new(local, peer, false);
+            let mut c = Conn::new(local, peer, Side::Server);
             c.irs = Some(7);
             c.last_fed = Some((100, old));
             let mut p = segment(peer, local, 8, 100, 0x10).0;
@@ -1924,7 +1925,7 @@ mod tests {
             let local: SocketAddr = local.parse().unwrap();
             let peer: SocketAddr = peer.parse().unwrap();
             let s = new_socket(MIN_BUFFER).0;
-            let mut c = Conn::new(local, peer, false);
+            let mut c = Conn::new(local, peer, Side::Server);
             c.irs = Some(u32::MAX - MIN_BUFFER as u32);
             c.read = 19;
             let edge = c

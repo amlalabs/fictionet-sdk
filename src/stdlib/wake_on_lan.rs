@@ -146,7 +146,7 @@ pub enum Error {
     /// The length of an exact packet is not 102, 106, or 108 bytes.
     Length,
     /// The sync bytes or repeated addresses of an exact packet do not match.
-    Malformed,
+    SyncOrAddress,
 }
 
 impl core::fmt::Display for Error {
@@ -155,7 +155,7 @@ impl core::fmt::Display for Error {
             Error::TooLong => write!(f, "payload longer than {MAX_PAYLOAD} bytes"),
             Error::NotFound => write!(f, "no magic packet in the payload"),
             Error::Length => f.write_str("magic packet length must be 102, 106, or 108 bytes"),
-            Error::Malformed => f.write_str("invalid magic packet sync or address repeats"),
+            Error::SyncOrAddress => f.write_str("invalid magic packet sync or address repeats"),
         }
     }
 }
@@ -255,7 +255,7 @@ impl Wire for MagicPacket {
         } else {
             Some(Password::from_bytes(tail).ok_or(Error::Length)?)
         };
-        let mac = packet_at(bytes).ok_or(Error::Malformed)?;
+        let mac = packet_at(bytes).ok_or(Error::SyncOrAddress)?;
         Ok(Self { mac, password })
     }
 

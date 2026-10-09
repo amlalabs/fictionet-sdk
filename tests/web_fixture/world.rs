@@ -47,7 +47,7 @@ fn world(
             sites(host)
         }
     })
-    .serve(fcx, attachments)
+    .start(fcx, attachments)
 }
 
 /// Reads a request body to its end and answers with its length, for

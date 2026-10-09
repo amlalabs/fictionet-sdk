@@ -4,8 +4,8 @@ use core::time::Duration;
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::{
     codec::{
-        ByteFault, Carry, Decode, Direction, Ending, Faults, Interceptor, ItemFault, Lines, Pipe,
-        PumpError, Recorder, Rewrite, Rule, Stream, StreamEvent, Trigger, Wire, write_bounded,
+        ByteFault, Carry, Decode, Ending, Faults, Interceptor, ItemFault, Lines, Pipe, PumpError,
+        Recorder, Rewrite, Rule, Side, Stream, StreamEvent, Trigger, Wire, write_bounded,
     },
     json, modbus, test_support,
 };
@@ -40,7 +40,7 @@ where
                         }
                         _ => {}
                     }
-                    recorder.observe_tagged(7, Direction::ClientToServer, event);
+                    recorder.observe_tagged(7, Side::Client, event);
                 };
                 let result = if empty_plan {
                     faults
@@ -230,7 +230,7 @@ where
                         &mut output,
                         &item_plan,
                         write_bounded,
-                        recorder.observer(3, Direction::ServerToClient),
+                        recorder.observer(3, Side::Server),
                     );
                     assert!(output.len() <= 65536);
                     assert!(faults.held_count() <= 8);

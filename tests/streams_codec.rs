@@ -395,7 +395,7 @@ fn rtcp_body_error_keeps_stream_and_limit_error_ends_it() {
         ),
         (
             vec![
-                Err(rtcp::Error::Malformed(rtcp::packet_type::RR)),
+                Err(rtcp::Error::PacketContents(rtcp::packet_type::RR)),
                 Ok(vec![packet]),
             ],
             None,

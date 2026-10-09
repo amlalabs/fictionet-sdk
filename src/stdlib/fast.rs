@@ -18,6 +18,11 @@
 //! state, so its writer is [`Encoder::write`]. Reportable encoding errors,
 //! including nonminimal encodings, are refused. Block sizes may be overlong (§10).
 //!
+//! A [`Service`](fictionet::stdlib::serve::Service) can use this decoder through
+//! [`serve::connection`](fictionet::stdlib::serve::connection). Change its mode
+//! between items with [`Driver::decoder`](fictionet::stdlib::serve::Driver::decoder).
+//! See `docs/services.md` for an SMTP DATA service.
+//!
 //! ```
 //! use fictionet::stdlib::{codec::{Stream, Wire}, fast::*};
 //! let templates = Templates::from_xml(br#"

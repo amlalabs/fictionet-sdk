@@ -99,56 +99,56 @@ fn rtcp_errors() {
         Datagram::parse(&b)
     };
     // Reports shorter than their fixed part or their count.
-    assert_eq!(body(200, 0, &[0; 20]), Err(Error::Malformed(200)));
-    assert_eq!(body(200, 1, &[0; 24]), Err(Error::Malformed(200)));
-    assert_eq!(body(201, 0, &[]), Err(Error::Malformed(201)));
-    assert_eq!(body(201, 2, &[0; 28]), Err(Error::Malformed(201)));
+    assert_eq!(body(200, 0, &[0; 20]), Err(Error::PacketContents(200)));
+    assert_eq!(body(200, 1, &[0; 24]), Err(Error::PacketContents(200)));
+    assert_eq!(body(201, 0, &[]), Err(Error::PacketContents(201)));
+    assert_eq!(body(201, 2, &[0; 28]), Err(Error::PacketContents(201)));
     assert!(body(201, 1, &[0; 28]).is_ok());
     // SDES: a chunk with no end, an item past the end, an extra word,
     // and a missing chunk.
     assert_eq!(
         body(202, 1, &[0, 0, 0, 1, 1, 2, b'a', b'b']),
-        Err(Error::Malformed(202))
+        Err(Error::PacketContents(202))
     );
     assert_eq!(
         body(202, 1, &[0, 0, 0, 1, 1, 9, b'a', b'b']),
-        Err(Error::Malformed(202))
+        Err(Error::PacketContents(202))
     );
     assert_eq!(
         body(202, 1, &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
-        Err(Error::Malformed(202))
+        Err(Error::PacketContents(202))
     );
     assert_eq!(
         body(202, 2, &[0, 0, 0, 1, 0, 0, 0, 0]),
-        Err(Error::Malformed(202))
+        Err(Error::PacketContents(202))
     );
-    assert_eq!(body(202, 1, &[0, 0, 0, 1]), Err(Error::Malformed(202)));
+    assert_eq!(body(202, 1, &[0, 0, 0, 1]), Err(Error::PacketContents(202)));
     // BYE: too few sources, a reason past the end, too much after it.
-    assert_eq!(body(203, 2, &[0, 0, 0, 1]), Err(Error::Malformed(203)));
+    assert_eq!(body(203, 2, &[0, 0, 0, 1]), Err(Error::PacketContents(203)));
     assert_eq!(
         body(203, 0, &[9, b'a', b'b', b'c']),
-        Err(Error::Malformed(203))
+        Err(Error::PacketContents(203))
     );
     assert_eq!(
         body(203, 0, &[1, b'a', 0, 0, 0, 0, 0, 0]),
-        Err(Error::Malformed(203))
+        Err(Error::PacketContents(203))
     );
     // APP and feedback shorter than their SSRCs and name.
-    assert_eq!(body(204, 0, &[0, 0, 0, 1]), Err(Error::Malformed(204)));
-    assert_eq!(body(205, 1, &[0, 0, 0, 1]), Err(Error::Malformed(205)));
-    assert_eq!(body(206, 1, &[0, 0, 0, 1]), Err(Error::Malformed(206)));
+    assert_eq!(body(204, 0, &[0, 0, 0, 1]), Err(Error::PacketContents(204)));
+    assert_eq!(body(205, 1, &[0, 0, 0, 1]), Err(Error::PacketContents(205)));
+    assert_eq!(body(206, 1, &[0, 0, 0, 1]), Err(Error::PacketContents(206)));
     // A PLI with FCI, an RPSI with none, an RPSI with too many padding bits.
     assert_eq!(
         body(206, 1, &[0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0]),
-        Err(Error::Malformed(206))
+        Err(Error::PacketContents(206))
     );
     assert_eq!(
         body(206, 3, &[0, 0, 0, 1, 0, 0, 0, 2]),
-        Err(Error::Malformed(206))
+        Err(Error::PacketContents(206))
     );
     assert_eq!(
         body(206, 3, &[0, 0, 0, 1, 0, 0, 0, 2, 17, 96, 0, 0]),
-        Err(Error::Malformed(206))
+        Err(Error::PacketContents(206))
     );
     assert!(body(206, 3, &[0, 0, 0, 1, 0, 0, 0, 2, 16, 96, 0, 0]).is_ok());
 }
@@ -169,7 +169,7 @@ fn rtp_demux_checks_typed_feedback_and_xr_layouts() {
         bytes.extend_from_slice(&body);
         assert_eq!(
             rtp::Demux::parse(&bytes),
-            Err(rtp::Error::Rtcp(Error::Malformed(pt)))
+            Err(rtp::Error::Rtcp(Error::PacketContents(pt)))
         );
     }
     for padding_bits in [31, 32, 48] {
@@ -194,7 +194,7 @@ fn rtp_demux_checks_typed_feedback_and_xr_layouts() {
     remb.extend([0, 0, 0, 4]);
     assert_eq!(
         rtp::Demux::parse(&remb),
-        Err(rtp::Error::Rtcp(Error::Malformed(206)))
+        Err(rtp::Error::Rtcp(Error::PacketContents(206)))
     );
 }
 
@@ -482,7 +482,7 @@ fn padding_on_the_last_packet() {
     assert_eq!(Datagram::parse(&[0xa0, 203, 0, 0]), Err(Error::Padding));
     assert_eq!(
         Datagram::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 4]),
-        Err(Error::Malformed(201))
+        Err(Error::PacketContents(201))
     );
     assert_eq!(
         Datagram::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 0]),
@@ -708,7 +708,7 @@ fn empty_nack_and_sli_are_rejected() {
         let fmt = if pt == 205 { 1 } else { 2 };
         assert_eq!(
             Datagram::parse(&[0x80 | fmt, pt, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]),
-            Err(Error::Malformed(pt))
+            Err(Error::PacketContents(pt))
         );
     }
     assert_eq!(
@@ -734,7 +734,7 @@ fn sdes_and_bye_padding_must_be_null() {
         (202, vec![0x81, 202, 0, 2, 0, 0, 0, 1, 0, 0, 1, 0]),
         (203, vec![0x81, 203, 0, 2, 0, 0, 0, 1, 1, b'a', 1, 0]),
     ] {
-        assert_eq!(Datagram::parse(&bytes), Err(Error::Malformed(pt)));
+        assert_eq!(Datagram::parse(&bytes), Err(Error::PacketContents(pt)));
     }
 }
 
@@ -796,7 +796,7 @@ fn priv_prefix_length_is_checked() {
         vec![0x81, 202, 0, 2, 0, 0, 0, 1, 8, 1, 255, 0],
         vec![0x81, 202, 0, 2, 0, 0, 0, 1, 8, 0, 0, 0],
     ] {
-        assert_eq!(Datagram::parse(&bytes), Err(Error::Malformed(202)));
+        assert_eq!(Datagram::parse(&bytes), Err(Error::PacketContents(202)));
     }
     for bytes in [
         vec![0x81, 202, 0, 3, 0, 0, 0, 1, 8, 4, 2, b'a', b'b', b'x', 0, 0],

@@ -3,7 +3,7 @@
 
 use fictionet::stdlib::json::{self, Value};
 use fictionet::stdlib::json_schema::{
-    CompileErrorKind, Dialect, ErrorMode, FormatPolicy, GenerationLimits, Limits, Options,
+    CompileKind, Dialect, ErrorMode, FormatPolicy, GenerationLimits, Limits, Options,
     PatternPolicy, Schema,
 };
 use fictionet::stdlib::test_support::contract;
@@ -141,9 +141,9 @@ fuzz_target!(|input: &[u8]| {
         if let Err(error) = Schema::compile_with(&source, options) {
             assert!(matches!(
                 error.kind,
-                CompileErrorKind::UnsupportedKeyword(_)
-                    | CompileErrorKind::Limit(_)
-                    | CompileErrorKind::DuplicateKey
+                CompileKind::UnsupportedKeyword(_)
+                    | CompileKind::Limit(_)
+                    | CompileKind::DuplicateKey
             ));
         } else {
             panic!("unsupported keyword compiled: {keyword}");

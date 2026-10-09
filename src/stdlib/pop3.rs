@@ -16,9 +16,10 @@
 //! `[IN-USE]`), RFC 2595 (`STLS`) and RFC 3206 (the `SYS` and `AUTH`
 //! response codes).
 //!
-//! Run a server's connection bytes through
-//! [`Stream<Inputs>`](fictionet::stdlib::codec::Stream), interpret each [`Request`],
-//! and write a [`Reply`]. Clients use [`Stream<Outputs>`](fictionet::stdlib::codec::Stream)
+//! A mail [`Service`](fictionet::stdlib::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Inputs`] to interpret each [`Request`]
+//! and write a [`Reply`]; in `on_item`, call `driver.decoder().expect_line()`
+//! to read an AUTH answer. Clients use [`Stream<Outputs>`](fictionet::stdlib::codec::Stream)
 //! and queue whether each reply has a body with [`Outputs::expect`]. CRLF is
 //! required. Bad or overlong commands are error items. Overlong command
 //! remainders are skipped through LF, including at EOF. Short partial lines

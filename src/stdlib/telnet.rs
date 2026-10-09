@@ -15,9 +15,10 @@
 //! (terminal type) and RFC 1073 (window size), and negotiates options with
 //! the Q method of RFC 1143, which never loops.
 //!
-//! A world pushes connection bytes to [`Stream<Events>`](fictionet::stdlib::codec::Stream),
-//! reads one [`Event`] at a time, and hands negotiations to [`Negotiation`].
-//! It writes each returned reply event and changes binary mode between items.
+//! A terminal [`Service`](fictionet::stdlib::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Events`] and hands each negotiation
+//! to [`Negotiation`]. In `on_item`, it writes each returned reply event and
+//! calls `driver.decoder().set_binary()` when binary mode changes.
 //! The default delivers each data byte immediately. Batch readers can use
 //! [`Events::with_limit`] to wait for larger runs. [`Event`] uses NVT
 //! encoding; [`BinaryEvent`] carries an event in binary mode.

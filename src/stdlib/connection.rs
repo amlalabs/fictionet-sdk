@@ -32,7 +32,7 @@ pub trait Accepted: Connection {
 }
 
 /// A datagram socket for the serving driver.
-pub trait Datagram: Send + 'static {
+pub trait DatagramSocket: Send + 'static {
     /// Waits for bytes and their sender. Drains queued datagrams before
     /// returning [`fictionet::RecvError::Closed`]. Cancellation ends the wait.
     fn recv(

@@ -452,9 +452,9 @@ impl Attachments {
     /// ```
     /// # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
     /// # fn site_for(_host: &str) -> Option<web::Site> { None }
-    /// # fn world(fcx: Cx, attachments: Attachments) -> Result {
+    /// # async fn world(fcx: Cx, attachments: Attachments) -> Result {
     /// let slow = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
-    /// web::Sites::new(site_for).serve(&fcx, slow)?;
+    /// web::Sites::new(site_for).start(&fcx, slow)?;
     /// # Ok(())
     /// # }
     /// ```

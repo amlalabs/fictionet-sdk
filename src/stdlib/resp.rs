@@ -341,7 +341,7 @@ pub enum Error {
     MissingCrlf,
     /// A value of the type with this marker had text that type does not
     /// allow, such as `:12a` or `#x`.
-    Malformed(u8),
+    ValueSyntax(u8),
     /// An element of a command array did not start with `$`, but with
     /// this byte.
     ExpectedBulk(u8),
@@ -369,7 +369,7 @@ impl core::fmt::Display for Error {
             Error::TooManyElements => f.write_str("invalid multibulk length"),
             Error::TooDeep => f.write_str("values nested too deep"),
             Error::MissingCrlf => f.write_str("bulk data not followed by CRLF"),
-            Error::Malformed(c) => write!(f, "malformed value of type '{}'", c.escape_ascii()),
+            Error::ValueSyntax(c) => write!(f, "malformed value of type '{}'", c.escape_ascii()),
             Error::ExpectedBulk(c) => write!(f, "expected '$', got '{}'", c.escape_ascii()),
             Error::UnbalancedQuotes => f.write_str("unbalanced quotes in request"),
             Error::FrameTooLarge => f.write_str("value too large"),
@@ -813,7 +813,7 @@ fn read_event<'a>(s: &mut Scan, b: &'a [u8], lim: &Limits, mode: Mode) -> Result
             match b.get(pos) {
                 None => return Err(Fail::Need(pos.saturating_add(1))),
                 Some(&marker::CHUNK) => {}
-                Some(_) => return Err(Error::Malformed(marker::BULK).into()),
+                Some(_) => return Err(Error::ValueSyntax(marker::BULK).into()),
             }
             let (l, e) = line(b, pos + 1, lim)?;
             let n = digits(l).ok_or(Error::BadLength)?;
@@ -881,28 +881,28 @@ fn read_event<'a>(s: &mut Scan, b: &'a [u8], lim: &Limits, mode: Mode) -> Result
     }
     let push_first = matches!(s.open.last(), Some(Open::Push(_)));
     if push_first && !is_string_marker(t) {
-        return Err(Error::Malformed(marker::PUSH).into());
+        return Err(Error::ValueSyntax(marker::PUSH).into());
     }
     let p = pos + 1;
     let (event, end) = match t {
         marker::SIMPLE | marker::ERROR | marker::BIG_NUMBER => {
             let (l, e) = line(b, p, lim)?;
             if t == marker::BIG_NUMBER && !big_ok(l) {
-                return Err(Error::Malformed(t).into());
+                return Err(Error::ValueSyntax(t).into());
             }
             (Event::Bytes(t, l), e)
         }
         marker::INTEGER => {
             let (l, e) = line(b, p, lim)?;
             (
-                Event::Scalar(Value::Integer(int(l).ok_or(Error::Malformed(t))?)),
+                Event::Scalar(Value::Integer(int(l).ok_or(Error::ValueSyntax(t))?)),
                 e,
             )
         }
         marker::NULL => {
             let (l, e) = line(b, p, lim)?;
             if !l.is_empty() {
-                return Err(Error::Malformed(t).into());
+                return Err(Error::ValueSyntax(t).into());
             }
             (Event::Scalar(Value::Null), e)
         }
@@ -911,14 +911,14 @@ fn read_event<'a>(s: &mut Scan, b: &'a [u8], lim: &Limits, mode: Mode) -> Result
             let v = match l {
                 b"t" => true,
                 b"f" => false,
-                _ => return Err(Error::Malformed(t).into()),
+                _ => return Err(Error::ValueSyntax(t).into()),
             };
             (Event::Scalar(Value::Boolean(v)), e)
         }
         marker::DOUBLE => {
             let (l, e) = line(b, p, lim)?;
             (
-                Event::Scalar(Value::Double(double(l).ok_or(Error::Malformed(t))?)),
+                Event::Scalar(Value::Double(double(l).ok_or(Error::ValueSyntax(t))?)),
                 e,
             )
         }
@@ -934,7 +934,7 @@ fn read_event<'a>(s: &mut Scan, b: &'a [u8], lim: &Limits, mode: Mode) -> Result
                 Len::N(n) => {
                     let (d, e) = data(b, e, n, lim)?;
                     if t == marker::VERBATIM && (d.len() < 4 || d[3] != b':') {
-                        return Err(Error::Malformed(t).into());
+                        return Err(Error::ValueSyntax(t).into());
                     }
                     (Event::Bytes(t, d), e)
                 }
@@ -955,7 +955,7 @@ fn read_event<'a>(s: &mut Scan, b: &'a [u8], lim: &Limits, mode: Mode) -> Result
                 return Ok(Event::Scalar(Value::NullArray));
             }
             if t == marker::PUSH && (!s.top() || matches!(len, Len::N(0))) {
-                return Err(Error::Malformed(t).into());
+                return Err(Error::ValueSyntax(t).into());
             }
             if s.open.len() >= depth_limit(lim) {
                 return Err(Error::TooDeep.into());
@@ -981,7 +981,7 @@ fn read_event<'a>(s: &mut Scan, b: &'a [u8], lim: &Limits, mode: Mode) -> Result
         _ => return Err(Error::UnknownType(t).into()),
     };
     if push_first && matches!(event, Event::Scalar(Value::Null)) {
-        return Err(Error::Malformed(marker::PUSH).into());
+        return Err(Error::ValueSyntax(marker::PUSH).into());
     }
     s.ended(end);
     Ok(event)
@@ -1371,7 +1371,7 @@ fn stream_end(b: &[u8], pos: usize, lim: &Limits) -> Result<Option<usize>, Fail>
         Some(&marker::END) => {
             let (l, e) = line(b, pos + 1, lim)?;
             if !l.is_empty() {
-                return Err(Error::Malformed(marker::END).into());
+                return Err(Error::ValueSyntax(marker::END).into());
             }
             Ok(Some(e))
         }
@@ -2296,7 +2296,7 @@ mod tests {
         }
         assert_eq!(Resp2::parse(b"$-1\r\n+OK\r\n"), Err(Error::Trailing));
         assert_eq!(Resp2::parse(b"+a\n"), Err(Error::BadLineEnd));
-        assert_eq!(Resp2::parse(b":x\r\n"), Err(Error::Malformed(b':')));
+        assert_eq!(Resp2::parse(b":x\r\n"), Err(Error::ValueSyntax(b':')));
         let mut deep = b"*1\r\n".repeat(MAX_DEPTH);
         deep.extend_from_slice(b"$-1\r\n");
         contract::check_wire::<Resp2>(&deep);
@@ -2479,7 +2479,7 @@ mod tests {
         assert_eq!(bad(b"$9\r\n"), Error::BulkTooLong);
         assert_eq!(bad(b"$?\r\n;5\r\nabcde\r\n;5\r\n"), Error::BulkTooLong);
         assert_eq!(bad(b"$?\r\n;x\r\n"), Error::BadLength);
-        assert_eq!(bad(b"$?\r\n+"), Error::Malformed(b'$'));
+        assert_eq!(bad(b"$?\r\n+"), Error::ValueSyntax(b'$'));
         assert_eq!(bad(b"*4\r\n"), Error::TooManyElements);
         assert_eq!(bad(b"%4\r\n"), Error::TooManyElements);
         assert_eq!(bad(b"*?\r\n_\r\n_\r\n_\r\n_\r\n"), Error::TooManyElements);
@@ -2511,16 +2511,16 @@ mod tests {
             (b"=4\r\ntxt;\r\n", b'='),
             (b"*?\r\n.x\r\n", b'.'),
         ] {
-            assert_eq!(bad(b), Error::Malformed(t), "{}", b.escape_ascii());
+            assert_eq!(bad(b), Error::ValueSyntax(t), "{}", b.escape_ascii());
         }
         // One past the largest 64-bit integer.
         assert_eq!(
             Value::parse(b":9223372036854775808\r\n"),
-            Err(Error::Malformed(b':'))
+            Err(Error::ValueSyntax(b':'))
         );
         assert_eq!(
             Value::parse(b":-9223372036854775809\r\n"),
-            Err(Error::Malformed(b':'))
+            Err(Error::ValueSyntax(b':'))
         );
         let frame = Limits {
             frame: 10,
@@ -2984,7 +2984,7 @@ mod tests {
         ] {
             assert_eq!(
                 Value::parse(b),
-                Err(Error::Malformed(b',')),
+                Err(Error::ValueSyntax(b',')),
                 "{}",
                 b.escape_ascii()
             );
@@ -3352,14 +3352,17 @@ mod tests {
         ] {
             assert_eq!(
                 Value::parse(b),
-                Err(Error::Malformed(b'>')),
+                Err(Error::ValueSyntax(b'>')),
                 "{}",
                 b.escape_ascii()
             );
             check_values(b, Limits::DEFAULT);
             assert_eq!(
                 decode_all(Values::new, b),
-                (vec![], Some(codec::Fail::Protocol(Error::Malformed(b'>'))))
+                (
+                    vec![],
+                    Some(codec::Fail::Protocol(Error::ValueSyntax(b'>')))
+                )
             );
         }
         for b in [

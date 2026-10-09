@@ -162,7 +162,7 @@ web::Sites::new(move |host: &str| match host {
     ),
     _ => None, // NXDOMAIN: the world stays closed
 })
-.serve(&fcx, attachments)?;
+.start(&fcx, attachments)?;
 ```
 
 A longer version, which the docs compile as a test, is at the top of

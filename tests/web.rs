@@ -107,7 +107,7 @@ struct TestSites {
 
 impl TestSites {
     fn serve_with(self, fcx: &Cx, attachments: fictionet::Attachments) -> fictionet::Result<Env> {
-        self.sites.serve(fcx, attachments)?;
+        self.sites.start(fcx, attachments)?;
         Ok(self.env)
     }
 }
@@ -725,7 +725,7 @@ fn dates_come_from_the_world() {
                 if let Some(date) = date {
                     sites = sites.date(date);
                 }
-                sites.serve(&fcx, attachments)?;
+                sites.start(&fcx, attachments)?;
                 let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
                 let addr = lookup(&fcx, &m, "dated.test").await;
                 for h2 in [false, true] {
@@ -1475,14 +1475,14 @@ fn a_subnet_that_cannot_work_is_an_error() {
                 let (_attacher, attachments) = fictionet::attachments();
                 let r = web::Sites::new(|_| None)
                     .subnet(bad.parse()?)
-                    .serve(&fcx, attachments);
+                    .start(&fcx, attachments);
                 assert!(r.is_err(), "{bad}");
             }
             // Another subnet works, with its gateway at .1.
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(|_| None)
                 .subnet("172.16.5.0/24".parse()?)
-                .serve(&fcx, attachments)?;
+                .start(&fcx, attachments)?;
             let mut a = attacher.attach("a").unwrap();
             let gw = Ipv4Addr::new(172, 16, 5, 1);
             a.send(ping(Ipv4Addr::new(172, 16, 5, 9), gw, 1));
@@ -1507,7 +1507,7 @@ fn the_sites_keep_running_after_the_world_returns() {
     std::thread::spawn(move || {
         let r = block_on(run(fictionet::Seed::random(), move |fcx| async move {
             web::Sites::new(|h| (h == "plain.test").then(|| web::Site::new(Plain("plain"))))
-                .serve(&fcx, attachments)?;
+                .start(&fcx, attachments)?;
             let _ = tx.send(fcx.clone());
             Ok(())
         }));
@@ -1569,7 +1569,7 @@ async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
             web::Sites::new(move |h| {
                 (h == "nowhere.invalid").then(|| web::Site::new(upstream.clone()))
             })
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
             let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
             let addr = lookup(&fcx, &m, "nowhere.invalid").await;
             let conn = m
@@ -1619,7 +1619,7 @@ async fn websocket_echo<C: Connection>(
     text: &str,
 ) -> fictionet::stdlib::websocket::Message {
     use fictionet::stdlib::codec::{Stream, Wire};
-    use fictionet::stdlib::websocket::{Message as Ws, Messages, Role};
+    use fictionet::stdlib::websocket::{Message as Ws, Messages};
     let request = format!(
         "GET /echo HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
@@ -1651,7 +1651,7 @@ async fn websocket_echo<C: Connection>(
     conn.write_all(fcx, &frame.to_bytes().unwrap())
         .await
         .unwrap();
-    let mut stream = Stream::new(Messages::new(Role::Client));
+    let mut stream = Stream::new(Messages::new(fictionet::stdlib::codec::Side::Client));
     assert_eq!(stream.push(&got[head_end..]), got.len() - head_end);
     loop {
         if let Some(m) = stream.next() {
@@ -1673,7 +1673,7 @@ async fn websockets_work_through_sites() {
         run(fictionet::Seed::random(), |fcx| async move {
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(|h| (h == "ws.test").then(|| web::Site::new(echo_socket())))
-                .serve(&fcx, attachments)?;
+                .start(&fcx, attachments)?;
             let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
             let addr = lookup(&fcx, &m, "ws.test").await;
             let mut conn = m
@@ -1999,7 +1999,7 @@ fn connections_that_send_nothing_are_closed() {
                 dns_tcp_idle: Duration::from_secs(1),
                 ..Default::default()
             })
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
         let plain = Ipv4Addr::new(198, 18, 0, 1);
@@ -2542,7 +2542,7 @@ where
                 .then(|| web::Site::new(Plain("auto")))
         })
         .subnet(subnet)
-        .serve(&fcx, attachments)?;
+        .start(&fcx, attachments)?;
         f(fcx, attacher).await?;
         Ok(())
     });
@@ -3776,7 +3776,7 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
                 }),
             );
             web::Sites::new(move |host| (host == "hang.test").then(|| web::Site::new(app.clone())))
-                .serve(&fcx, attachments)?;
+                .start(&fcx, attachments)?;
 
             let me = Ipv4Addr::new(10, 0, 0, 2);
             let mut raw = attacher.attach("a").unwrap();
@@ -3942,7 +3942,7 @@ fn events_for_clients_that_send_nothing() {
                 dns_tcp_idle: Duration::from_secs(1),
                 ..Default::default()
             })
-            .serve(&fcx, attachments)?;
+            .start(&fcx, attachments)?;
         let log = Log::new(&fcx);
         let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
@@ -4896,7 +4896,7 @@ where
 {
     run_world::world(Duration::from_secs(60), move |fcx| async move {
         let (attacher, attachments) = fictionet::attachments();
-        make().serve(&fcx, attachments)?;
+        make().start(&fcx, attachments)?;
         let log = Log::new(&fcx);
         f(fcx, attacher, log).await?;
         Ok(())

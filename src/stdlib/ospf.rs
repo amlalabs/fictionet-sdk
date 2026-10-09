@@ -1,8 +1,8 @@
 //! OSPF: reading and writing OSPFv2 and OSPFv3 packets and LSAs, with no
 //! I/O.
 //!
-//! Packet and LSA readers and writers handle complete values. `Datagram`
-//! carries packet bytes through `Wire`. There is no protocol stream decoder,
+//! Packet and LSA readers and writers handle complete values. `Vec<u8>`
+//! carries complete packet bytes. There is no protocol stream decoder,
 //! neighbor state machine, routing database, route calculation, or `Service`.
 //!
 //! OSPF (Open Shortest Path First, IP protocol 89) is a link-state routing
@@ -26,9 +26,9 @@
 //! Nothing here reads a socket. A world that plays a router hands each
 //! OSPF payload (the bytes after the IP header) to [`Packet::parse`] with
 //! the packet's [`Endpoints`], and prepares a reply with [`Packet::frame`].
-//! Write that frame with [`Wire::write`] in an IP packet with protocol
+//! Place those bytes in an IP packet with protocol
 //! [`PROTOCOL`], usually to [`ALL_SPF_ROUTERS_V4`] or [`ALL_SPF_ROUTERS_V6`].
-//! For pieces of one payload, use [`Stream<Collect<Datagram>>`](fictionet::stdlib::codec::Stream)
+//! For pieces of one payload, use [`codec::Collect::bytes`](fictionet::stdlib::codec::Collect::bytes) in a stream
 //! with a limit of [`MAX_MESSAGE`].
 //! Map the payload through [`Packet::parse`], and call `end` at the IP
 //! packet boundary. Which routers and links exist, when Hellos go out,
@@ -51,8 +51,9 @@
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
+//! use fictionet::stdlib::ip::Endpoints;
 //! use std::net::Ipv4Addr;
-//! use fictionet::stdlib::ospf::{ALL_SPF_ROUTERS_V4, Auth, Body, Endpoints, Header, HelloV2, Packet};
+//! use fictionet::stdlib::ospf::{ALL_SPF_ROUTERS_V4, Auth, Body, Header, HelloV2, Packet};
 //!
 //! /// A Hello from router `me` on a /24 link, listing the routers it has
 //! /// heard on the link.
@@ -84,12 +85,12 @@
 //! ];
 //! let packet = Packet::parse(&bytes, &link).unwrap();
 //! assert_eq!(packet, hello(Ipv4Addr::new(1, 1, 1, 1), vec![]));
-//! assert_eq!(packet.frame(&link).and_then(|frame| frame.to_bytes()).unwrap(), bytes);
+//! assert_eq!(packet.frame(&link).unwrap(), bytes);
 //!
 //! // The world's router, 2.2.2.2, answers. Listing 1.1.1.1 tells the
 //! // agent's router that the two can hear each other.
 //! let reply = hello(Ipv4Addr::new(2, 2, 2, 2), vec![packet.router_id]);
-//! let sent = reply.frame(&link).and_then(|frame| frame.to_bytes()).unwrap();
+//! let sent = reply.frame(&link).unwrap();
 //! assert_eq!(sent.len(), 48);
 //! assert_eq!(Packet::parse(&sent, &link), Ok(reply));
 //!
@@ -249,36 +250,7 @@ impl Version {
     }
 }
 
-/// The IP source and destination of the packet that carries an OSPF
-/// payload. An IPv4 packet carries OSPFv2 and an IPv6 packet carries
-/// OSPFv3. OSPFv3 checksums cover the IPv6 addresses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Endpoints {
-    /// An IPv4 packet.
-    V4 {
-        /// The sending router's address on the link.
-        source: Ipv4Addr,
-        /// A neighbor or one of the OSPF groups.
-        destination: Ipv4Addr,
-    },
-    /// An IPv6 packet.
-    V6 {
-        /// The sending router's link-local address.
-        source: Ipv6Addr,
-        /// A neighbor or one of the OSPF groups.
-        destination: Ipv6Addr,
-    },
-}
-
-impl Endpoints {
-    /// The OSPF version this IP family carries.
-    pub fn version(&self) -> Version {
-        match self {
-            Endpoints::V4 { .. } => Version::V2,
-            Endpoints::V6 { .. } => Version::V3,
-        }
-    }
-}
+use fictionet::stdlib::ip::Endpoints;
 
 /// OSPFv2 authentication, from the header's type and 8-byte field.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -882,7 +854,7 @@ fn fold(mut sum: u64) -> u16 {
 /// header or longer than `b`. A packet with cryptographic authentication
 /// carries zero instead.
 pub fn checksum(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
-    let hl = endpoints.version().header_len();
+    let hl = ip_version(endpoints).header_len();
     if b.len() < hl {
         return None;
     }
@@ -1738,7 +1710,7 @@ fn lls_checksum(block: &[u8]) -> u16 {
 /// including any digest and link-local signaling block.
 fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Layout, Error> {
     let base = check_base(b, endpoints)?;
-    let v = endpoints.version();
+    let v = ip_version(endpoints);
     let len = usize::from(be16(b, 2).ok_or(Error::Truncated)?);
     // Where the options byte holding the L bit sits, and the bit.
     let l_at = match (v, b[1]) {
@@ -1777,7 +1749,7 @@ fn check_base(b: &[u8], endpoints: &Endpoints) -> Result<usize, Error> {
     if version != 2 && version != 3 {
         return Err(Error::Version(version));
     }
-    let v = endpoints.version();
+    let v = ip_version(endpoints);
     if version != v.number() {
         return Err(Error::Family);
     }
@@ -1825,7 +1797,7 @@ impl Packet {
                 remaining: b.len() - end,
             });
         }
-        let v = endpoints.version();
+        let v = ip_version(endpoints);
         let len = usize::from(be16(b, 2).ok_or(Error::Truncated)?);
         let auth_kind = if v == Version::V2 {
             be16(b, 14).ok_or(Error::Truncated)?
@@ -1897,9 +1869,9 @@ impl Packet {
     /// the digest and signaling block), and [`Error::Lls`] if `lls` is
     /// set on a packet other than a Hello or Database Description whose
     /// options set the L bit, or is not a multiple of 4 bytes.
-    pub fn frame(&self, endpoints: &Endpoints) -> Result<Datagram, Error> {
+    pub fn frame(&self, endpoints: &Endpoints) -> Result<Vec<u8>, Error> {
         let v = self.version();
-        if v != endpoints.version() {
+        if v != ip_version(endpoints) {
             return Err(Error::Family);
         }
         let mut out = vec![0u8; v.header_len()];
@@ -1985,7 +1957,7 @@ impl Packet {
                 out[start..start + 2].copy_from_slice(&c.to_be_bytes());
             }
         }
-        Ok(Datagram(out))
+        Ok(out)
     }
 }
 
@@ -2257,34 +2229,6 @@ macro_rules! bounded_datagram_wire {
     };
 }
 
-/// One bounded IP payload, with every received byte preserved.
-///
-/// [`Wire`] reads the entire payload and checks only
-/// [`MAX_MESSAGE`]. It does not validate an OSPF message or its checksum.
-/// Use [`Packet::parse`] with the packet's [`Endpoints`] for that check.
-/// The endpoints are not encoded in this payload.
-///
-/// ```
-/// use fictionet::stdlib::{codec::{Collect, Decode, Stream}, ospf};
-/// # let endpoints = ospf::Endpoints::V4 {
-/// #     source: "192.0.2.1".parse().unwrap(),
-/// #     destination: "224.0.0.1".parse().unwrap(),
-/// # };
-/// let messages = Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE)
-///     .map(move |datagram| ospf::Packet::parse(&datagram.0, &endpoints));
-/// let mut stream = Stream::new(messages);
-/// // Push chunks of one IP payload, then call stream.end().
-/// # stream.end();
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Datagram(
-    /// Complete payload bytes, including the received checksum.
-    /// Parsing and writing refuse more than [`MAX_MESSAGE`] bytes.
-    pub Vec<u8>,
-);
-
-bounded_datagram_wire!(Datagram, Error, Error::TooLong, MAX_MESSAGE);
-
 /// An LSA's bytes, interpreted with a separate [`Version`].
 /// Construct with [`Lsa::frame`] or copy a bounded payload with [`Wire::parse`].
 /// Use [`Lsa::parse`] to validate its fields and Fletcher checksum.
@@ -2310,6 +2254,13 @@ bounded_datagram_wire!(
     MAX_LSA - LSA_HEADER_LEN
 );
 
+fn ip_version(endpoints: &Endpoints) -> Version {
+    match endpoints {
+        Endpoints::V4 { .. } => Version::V2,
+        Endpoints::V6 { .. } => Version::V3,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2319,9 +2270,19 @@ mod tests {
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Packet, Error> {
         use fictionet::stdlib::codec::Decode;
-        let make = || Collect::<Datagram>::new(MAX_MESSAGE).map(|d| Packet::parse(&d.0, e));
+        let make = || Collect::bytes(MAX_MESSAGE).map(|d| Packet::parse(&d, e));
         contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
-        contract::check_wire::<Datagram>(b);
+        assert_eq!(
+            fictionet::stdlib::test_support::decode_all(|| Collect::bytes(MAX_MESSAGE), b),
+            if b.len() <= MAX_MESSAGE {
+                (vec![b.to_vec()], None)
+            } else {
+                (
+                    vec![],
+                    Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE })),
+                )
+            }
+        );
         let parsed = Packet::parse(b, e);
         let (items, failure) = decode_all(make, b);
         if b.len() <= MAX_MESSAGE {
@@ -2398,18 +2359,9 @@ mod tests {
         ];
         let packet = Packet::parse(&bytes, &link).unwrap();
         assert_eq!(packet, hello_v2(ip4(1, 1, 1, 1), vec![]));
-        assert_eq!(
-            packet
-                .frame(&link)
-                .and_then(|frame| frame.to_bytes())
-                .unwrap(),
-            bytes
-        );
+        assert_eq!(packet.frame(&link).unwrap(), bytes);
         let reply = hello_v2(ip4(2, 2, 2, 2), vec![packet.router_id]);
-        let sent = reply
-            .frame(&link)
-            .and_then(|frame| frame.to_bytes())
-            .unwrap();
+        let sent = reply.frame(&link).unwrap();
         assert_eq!(sent.len(), 48);
         assert_eq!(Packet::parse(&sent, &link), Ok(reply));
         let mut bad = bytes;
@@ -2440,10 +2392,7 @@ mod tests {
                 neighbors: vec![ip4(2, 2, 2, 2), ip4(3, 3, 3, 3)],
             }),
         };
-        let b = p
-            .frame(&v4_ends())
-            .and_then(|frame| frame.to_bytes())
-            .unwrap();
+        let b = p.frame(&v4_ends()).unwrap();
         assert_eq!(&b[..4], &[2, 1, 0, 52]);
         assert_eq!(&b[14..24], b"\0\x01secret\0\0");
         assert_eq!(&b[12..14], &[0x9d, 0x8c]);
@@ -2482,12 +2431,7 @@ mod tests {
                 }),
             }
         );
-        assert_eq!(
-            p.frame(&v6_ends())
-                .and_then(|frame| frame.to_bytes())
-                .unwrap(),
-            bytes
-        );
+        assert_eq!(p.frame(&v6_ends()).unwrap(), bytes);
         // Another source address changes the pseudo-header.
         let elsewhere = Endpoints::V6 {
             source: "fe80::2".parse().unwrap(),
@@ -2856,17 +2800,10 @@ mod tests {
     #[test]
     fn round_trips() {
         for (p, e) in samples() {
-            let b = p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
+            let b = p.frame(&e).unwrap();
             assert_eq!(Packet::parse(&b, &e).as_ref(), Ok(&p), "{p:?}");
             assert_eq!(collect(&b, &e).as_ref(), Ok(&p));
-            assert_eq!(
-                Packet::parse(&b, &e)
-                    .unwrap()
-                    .frame(&e)
-                    .and_then(|frame| frame.to_bytes())
-                    .unwrap(),
-                b
-            );
+            assert_eq!(Packet::parse(&b, &e).unwrap().frame(&e).unwrap(), b);
         }
         for (lsas, v) in [(v2_lsas(), Version::V2), (v3_lsas(), Version::V3)] {
             for l in lsas {
@@ -2983,10 +2920,7 @@ mod tests {
     fn header_errors() {
         let e4 = v4_ends();
         let e6 = v6_ends();
-        let good = hello_v2(ip4(1, 1, 1, 1), vec![])
-            .frame(&e4)
-            .and_then(|frame| frame.to_bytes())
-            .unwrap();
+        let good = hello_v2(ip4(1, 1, 1, 1), vec![]).frame(&e4).unwrap();
         assert_eq!(Packet::parse(&[], &e4), Err(Error::Truncated));
         let mut b = good.clone();
         b[0] = 4;
@@ -3029,7 +2963,7 @@ mod tests {
                 router_id: Ipv4Addr::from(id),
                 ..hello_v2(ip4(0, 0, 0, 0), vec![])
             };
-            let mut b = p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
+            let mut b = p.frame(&e).unwrap();
             let c = be16(&b, 12).unwrap();
             if c == 0 || c == 0xffff {
                 b[12..14].copy_from_slice(&(!c).to_be_bytes());
@@ -3053,7 +2987,7 @@ mod tests {
                 digest: vec![9; 16],
             },
         };
-        let b = p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
+        let b = p.frame(&e).unwrap();
         assert_eq!(b.len(), 44 + 16);
         assert_eq!(&b[12..24], &[0, 0, 0, 2, 0, 0, 3, 16, 0, 0, 0, 77]);
         assert_eq!(Packet::parse(&b, &e), Ok(p.clone()));
@@ -3073,10 +3007,7 @@ mod tests {
                 digest: vec![9; 256],
             },
         };
-        assert_eq!(
-            p.frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(Error::Field)
-        );
+        assert_eq!(p.frame(&e), Err(Error::Field));
     }
 
     #[test]
@@ -3281,40 +3212,28 @@ mod tests {
         let e4 = v4_ends();
         let e6 = v6_ends();
         let mut p = hello_v2(ip4(1, 1, 1, 1), vec![]);
-        assert_eq!(
-            p.frame(&e6).and_then(|frame| frame.to_bytes()),
-            Err(Error::Family)
-        );
+        assert_eq!(p.frame(&e6), Err(Error::Family));
         p.header = Header::V3 { instance_id: 0 };
-        assert_eq!(
-            p.frame(&e6).and_then(|frame| frame.to_bytes()),
-            Err(Error::Unwritable)
-        );
+        assert_eq!(p.frame(&e6), Err(Error::Unwritable));
         p.header = Header::V2 {
             auth: Auth::Other {
                 kind: 1,
                 data: [0; 8],
             },
         };
-        assert_eq!(
-            p.frame(&e4).and_then(|frame| frame.to_bytes()),
-            Err(Error::Unwritable)
-        );
+        assert_eq!(p.frame(&e4), Err(Error::Unwritable));
         // Too many neighbors for a 16-bit length.
         p.header = Header::V2 { auth: Auth::Null };
         let Body::HelloV2(h) = &mut p.body else {
             panic!()
         };
         h.neighbors = vec![ip4(1, 2, 3, 4); 20_000];
-        assert_eq!(
-            p.frame(&e4).and_then(|frame| frame.to_bytes()),
-            Err(Error::TooLong)
-        );
+        assert_eq!(p.frame(&e4), Err(Error::TooLong));
         let Body::HelloV2(h) = &mut p.body else {
             panic!()
         };
         h.neighbors = vec![ip4(1, 2, 3, 4); (MAX_PACKET - 44) / 4];
-        let b = p.frame(&e4).and_then(|frame| frame.to_bytes()).unwrap();
+        let b = p.frame(&e4).unwrap();
         assert_eq!(Packet::parse(&b, &e4), Ok(p));
         // Out-of-range fields.
         let mut q = packets(Version::V3).remove(0);
@@ -3322,10 +3241,7 @@ mod tests {
             panic!()
         };
         h.options = 0x0100_0000;
-        assert_eq!(
-            q.frame(&e6).and_then(|frame| frame.to_bytes()),
-            Err(Error::Field)
-        );
+        assert_eq!(q.frame(&e6), Err(Error::Field));
         let dd = |options: u32, headers: Vec<LsaHeader>| Packet {
             router_id: ip4(1, 1, 1, 1),
             area_id: ip4(0, 0, 0, 0),
@@ -3339,18 +3255,10 @@ mod tests {
                 headers,
             }),
         };
-        assert_eq!(
-            dd(0x100, vec![])
-                .frame(&e4)
-                .and_then(|frame| frame.to_bytes()),
-            Err(Error::Field)
-        );
+        assert_eq!(dd(0x100, vec![]).frame(&e4), Err(Error::Field));
         let mut h = header_of(&v2_lsas()[0], Version::V2);
         h.ls_type = 0x100;
-        assert_eq!(
-            dd(0, vec![h]).frame(&e4).and_then(|frame| frame.to_bytes()),
-            Err(Error::Field)
-        );
+        assert_eq!(dd(0, vec![h]).frame(&e4), Err(Error::Field));
         let req = Packet {
             router_id: ip4(1, 1, 1, 1),
             area_id: ip4(0, 0, 0, 0),
@@ -3362,10 +3270,7 @@ mod tests {
                 advertising_router: ip4(0, 0, 0, 0),
             }]),
         };
-        assert_eq!(
-            req.frame(&e6).and_then(|frame| frame.to_bytes()),
-            Err(Error::Field)
-        );
+        assert_eq!(req.frame(&e6), Err(Error::Field));
         // LSAs: a body for another type, a v2 type over 255, v3 options.
         let mut l = v2_lsas().remove(0);
         l.ls_type = 2;
@@ -3512,7 +3417,7 @@ mod tests {
         let e = v4_ends();
         let (b, p) = hello_with_lls();
         assert_eq!(Packet::parse(&b, &e).as_ref(), Ok(&p));
-        assert_eq!(p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap(), b);
+        assert_eq!(p.frame(&e).unwrap(), b);
         assert_eq!(collect(&b, &e).as_ref(), Ok(&p));
         // Cut inside the block, or with bytes past it.
         assert_eq!(Packet::parse(&b[..50], &e), Err(Error::Truncated));
@@ -3528,10 +3433,7 @@ mod tests {
         let mut alone = p.clone();
         alone.lls = None;
         assert_eq!(Packet::parse(&b[..44], &e), Ok(alone.clone()));
-        assert_eq!(
-            alone.frame(&e).and_then(|frame| frame.to_bytes()).unwrap(),
-            b[..44]
-        );
+        assert_eq!(alone.frame(&e).unwrap(), b[..44]);
         // A wrong block checksum drops the block and keeps the packet.
         let mut bad = b.clone();
         bad[44] ^= 1;
@@ -3558,28 +3460,16 @@ mod tests {
             panic!()
         };
         h.options = 0x02;
-        assert_eq!(
-            q.frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(Error::Lls)
-        );
+        assert_eq!(q.frame(&e), Err(Error::Lls));
         let mut q = p.clone();
         q.lls = Some(vec![1, 2, 3]);
-        assert_eq!(
-            q.frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(Error::Lls)
-        );
+        assert_eq!(q.frame(&e), Err(Error::Lls));
         let mut q = p.clone();
         q.lls = Some(vec![0; MAX_MESSAGE & !3]);
-        assert_eq!(
-            q.frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(Error::TooLong)
-        );
+        assert_eq!(q.frame(&e), Err(Error::TooLong));
         let mut q = packets(Version::V2).remove(5);
         q.lls = Some(vec![]);
-        assert_eq!(
-            q.frame(&e).and_then(|frame| frame.to_bytes()),
-            Err(Error::Lls)
-        );
+        assert_eq!(q.frame(&e), Err(Error::Lls));
         // After a digest, with its checksum zero and not checked.
         let mut q = p.clone();
         q.header = Header::V2 {
@@ -3589,7 +3479,7 @@ mod tests {
                 digest: vec![7; 16],
             },
         };
-        let c = q.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
+        let c = q.frame(&e).unwrap();
         assert_eq!(c.len(), 44 + 16 + 12);
         assert_eq!(&c[60..64], &[0, 0, 0, 3]);
         assert_eq!(Packet::parse(&c, &e), Ok(q));
@@ -3604,7 +3494,7 @@ mod tests {
         };
         h.options |= OPTION_L_V3;
         hello.lls = Some(vec![0, 1, 0, 4, 0, 0, 0, 1]);
-        let b = hello.frame(&e6).and_then(|frame| frame.to_bytes()).unwrap();
+        let b = hello.frame(&e6).unwrap();
         assert_eq!(usize::from(be16(&b, 2).unwrap()), b.len() - 12);
         assert_eq!(Packet::parse(&b, &e6), Ok(hello.clone()));
         for (v, e, l) in [
@@ -3617,7 +3507,7 @@ mod tests {
             };
             d.options |= l;
             dd.lls = Some(vec![9; 16]);
-            let b = dd.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
+            let b = dd.frame(&e).unwrap();
             assert_eq!(Packet::parse(&b, &e), Ok(dd.clone()));
             assert_eq!(collect(&b, &e), Ok(dd));
         }
@@ -3795,10 +3685,7 @@ mod tests {
             lls: None,
             body: Body::LinkStateAck(vec![h]),
         };
-        let b = ack(good)
-            .frame(&e)
-            .and_then(|frame| frame.to_bytes())
-            .unwrap();
+        let b = ack(good).frame(&e).unwrap();
         assert_eq!(Packet::parse(&b, &e), Ok(ack(good)));
         let cases = [
             (LsaHeader { length: 0, ..good }, Error::LsaLength(0)),
@@ -3840,11 +3727,7 @@ mod tests {
             ),
         ];
         for (h, err) in cases {
-            assert_eq!(
-                ack(h).frame(&e).and_then(|frame| frame.to_bytes()),
-                Err(err),
-                "{h:?}"
-            );
+            assert_eq!(ack(h).frame(&e), Err(err), "{h:?}");
             // The same header read from bytes.
             let mut raw = b.clone();
             let mut hb = Vec::new();
@@ -3858,7 +3741,6 @@ mod tests {
                 ..good
             })
             .frame(&e)
-            .and_then(|frame| frame.to_bytes())
             .is_ok()
         );
         // Whole LSAs follow the same age and sequence rules.
@@ -4054,7 +3936,7 @@ mod tests {
     #[test]
     fn every_truncated_prefix_fails() {
         for (p, e) in samples() {
-            let b = p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
+            let b = p.frame(&e).unwrap();
             for n in 0..b.len() {
                 assert!(Packet::parse(&b[..n], &e).is_err(), "{n} of {p:?}");
                 assert!(collect(&b[..n], &e).is_err());
@@ -4073,18 +3955,11 @@ mod tests {
     #[test]
     fn collection_matches_parse() {
         for (p, e) in samples() {
-            assert_eq!(
-                collect(&p.frame(&e).and_then(|f| f.to_bytes()).unwrap(), &e),
-                Ok(p)
-            );
+            assert_eq!(collect(&p.frame(&e).unwrap(), &e), Ok(p));
         }
         assert_eq!(collect(&[2, 9], &v4_ends()), Err(Error::Type(9)));
         assert_eq!(collect(&[2], &v6_ends()), Err(Error::Family));
-        let mut b = hello_v2(ip4(1, 1, 1, 1), vec![])
-            .frame(&v4_ends())
-            .unwrap()
-            .to_bytes()
-            .unwrap();
+        let mut b = hello_v2(ip4(1, 1, 1, 1), vec![]).frame(&v4_ends()).unwrap();
         b.push(0);
         assert_eq!(
             collect(&b, &v4_ends()),
@@ -4479,7 +4354,7 @@ mod tests {
         assert_eq!(collect(data, e), parsed);
         if let Ok(p) = &parsed {
             // Dropped LSAs and signaling blocks make it shorter.
-            let b = p.frame(e).and_then(|frame| frame.to_bytes()).unwrap();
+            let b = p.frame(e).unwrap();
             assert!(b.len() <= data.len());
             assert_eq!(Packet::parse(&b, e).as_ref(), Ok(p));
         }
@@ -4607,7 +4482,7 @@ mod tests {
         let mut written = 0;
         for round in 0..6000 {
             let e = ends[round % 2];
-            let v = e.version();
+            let v = ip_version(&e);
             let mut p = random_packet(&mut rng, v);
             match &mut p.body {
                 Body::LinkStateUpdate(lsas) => {
@@ -4667,7 +4542,7 @@ mod tests {
             } else {
                 e
             };
-            if let Ok(b) = p.frame(&end).and_then(|frame| frame.to_bytes()) {
+            if let Ok(b) = p.frame(&end) {
                 assert_eq!(Packet::parse(&b, &end).as_ref(), Ok(&p), "round {round}");
                 written += 1;
             }
@@ -4687,8 +4562,8 @@ mod tests {
         let ends = [v4_ends(), v6_ends()];
         for round in 0..6000 {
             let e = ends[round % 2];
-            let p = random_packet(&mut rng, e.version());
-            let good = p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
+            let p = random_packet(&mut rng, ip_version(&e));
+            let good = p.frame(&e).unwrap();
             assert_eq!(Packet::parse(&good, &e).as_ref(), Ok(&p), "round {round}");
             check_bytes(&good, &e);
             // Mutations, with the checksums fixed again so the parser
@@ -4700,9 +4575,9 @@ mod tests {
             check_bytes(&bad, &e);
             check_bytes(&fix(bad.clone(), &e), &e);
             // An LSA, with its checksum set right after mutating it.
-            let l = random_lsa(&mut rng, e.version());
+            let l = random_lsa(&mut rng, ip_version(&e));
             let mut lb = l
-                .frame(e.version())
+                .frame(ip_version(&e))
                 .and_then(|frame| frame.to_bytes())
                 .unwrap();
             for _ in 0..1 + rng.index(4) {
@@ -4712,7 +4587,7 @@ mod tests {
             // Random bytes behind a plausible header.
             let mut raw = rng.bytes(80);
             if raw.len() >= 4 {
-                raw[0] = e.version().number();
+                raw[0] = ip_version(&e).number();
                 raw[1] = 1 + rng.index(5) as u8;
                 let len = raw.len() as u16;
                 raw[2..4].copy_from_slice(&len.to_be_bytes());

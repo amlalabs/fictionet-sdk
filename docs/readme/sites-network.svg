@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 560" role="img" aria-labelledby="fn-sites-t fn-sites-d" width="700" height="560">
 <style>svg{color:#1f2328}@media (prefers-color-scheme:dark){svg{color:#e6edf3}}</style>
-<title id="fn-sites-t">The network that Sites::serve builds</title>
+<title id="fn-sites-t">The network that Sites::start builds</title>
 <desc id="fn-sites-d">Each attached sandbox gets its own filter task, which answers DHCP, binds one IPv4 and one IPv6 address, and drops spoofed sources and packets for other sandboxes. Each filter connects to one router through a /32 or /128 route for each bound address, such as 10.0.0.2/32. The router has three kinds of routes. First, the gateway at 10.0.0.1 and 2001:db8::1, with DNS on UDP and TCP port 53 and ping replies. Second, one machine per site address, such as 198.18.0.1 or 2001:2::1, with HTTP on TCP port 80, TLS then HTTP on TCP port 443, ICMP port unreachable for UDP, and ping replies. Third, the default routes 0.0.0.0/0 and ::/0, which answer every other address with ICMP host unreachable, or ICMPv6 address unreachable, from the gateway.</desc>
 <g fill="none" stroke="currentColor" stroke-width="1.25">
 <rect x="30" y="14" width="160" height="40" rx="6" stroke-dasharray="5 4"/>

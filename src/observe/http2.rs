@@ -1,7 +1,7 @@
 //! HTTP/2 and gRPC in a capture: [`Capture`](fictionet::observe::http2::Capture) presents each
 //! direction's frames, header blocks and gRPC messages, on
 //! [`stdlib::http2`](fictionet::stdlib::http2)'s observation readers
-//! ([`Frames::for_observation`](fictionet::stdlib::http2::Frames::for_observation)
+//! ([`Inputs::for_observation`](fictionet::stdlib::http2::Inputs::for_observation)
 //! and [`HeaderBlocks::for_observation`](fictionet::stdlib::http2::HeaderBlocks::for_observation))
 //! and [`codec::Frames<grpc::Message>`](fictionet::stdlib::codec::Frames<grpc::Message>).
 //!
@@ -11,7 +11,7 @@
 use fictionet::observe::{Decoded, Layer, Placement, Present};
 use fictionet::stdlib::codec::{Decode, Demux, Fail, Spans, Step, Wire};
 use fictionet::stdlib::http2::{
-    Error, ErrorCode, Frame, FrameHeader, FrameItem, Frames, HEADER_LEN, HeaderBlocks, MAX_WINDOW,
+    Error, ErrorCode, Frame, FrameHeader, HEADER_LEN, HeaderBlocks, Input, Inputs, MAX_WINDOW,
     PREFACE, Setting,
 };
 use fictionet::stdlib::{grpc, hpack};
@@ -249,7 +249,7 @@ impl core::error::Error for CaptureError {}
 ///     http2::CAPTURE_READ_AHEAD, move |_| http2::Capture::pair_in(&budget));
 /// ```
 pub struct Capture {
-    frames: Frames,
+    frames: Inputs,
     blocks: HeaderBlocks,
     calls: Arc<Mutex<CaptureCalls>>,
     reverse: bool,
@@ -271,7 +271,7 @@ impl Capture {
     }
     fn in_budget(budget: &CaptureBudget) -> Self {
         Self {
-            frames: Frames::for_observation(CAPTURE_FRAME_LIMIT),
+            frames: Inputs::for_observation(CAPTURE_FRAME_LIMIT),
             blocks: HeaderBlocks::for_observation(),
             calls: Arc::new(Mutex::new(CaptureCalls::new(budget.clone()))),
             reverse: false,
@@ -578,7 +578,7 @@ impl Decode for Capture {
         };
         let start = self.offset;
         self.offset = self.offset.saturating_add(n as u64);
-        if frame == FrameItem::Preface {
+        if frame == Input::Preface {
             if let Ok(mut calls) = self.calls.lock() {
                 calls.client = Some(self.reverse);
             }
@@ -604,14 +604,14 @@ impl Decode for Capture {
         )?;
         let oversized = matches!(
             frame,
-            FrameItem::Refused {
+            Input::Refused {
                 oversized: true,
                 ..
             }
         );
         let mut item = capture_layer(h, raw);
         item.offset = start;
-        if let FrameItem::Refused {
+        if let Input::Refused {
             oversized: false,
             error,
             ..
@@ -718,7 +718,7 @@ impl Decode for Capture {
             }
             3 if body.len() >= 4 => {
                 let code = match &frame {
-                    FrameItem::Frame(Frame::Reset(reset)) => reset.code,
+                    Input::Frame(Frame::Reset(reset)) => reset.code,
                     _ => u32_at(body, 0)?,
                 };
                 let e = display_error(code);
@@ -732,7 +732,7 @@ impl Decode for Capture {
             4 => {
                 let partial;
                 let entries = match &frame {
-                    FrameItem::Frame(Frame::Settings(settings)) => &settings.entries,
+                    Input::Frame(Frame::Settings(settings)) => &settings.entries,
                     _ => {
                         partial = body
                             .as_chunks::<6>()
@@ -776,7 +776,7 @@ impl Decode for Capture {
             6 => item.info = if h.flags & 1 != 0 { "PING ack" } else { "PING" }.into(),
             7 if body.len() >= 8 => {
                 let (last_stream, code) = match &frame {
-                    FrameItem::Frame(Frame::GoAway(goaway)) => (goaway.last_stream, goaway.code),
+                    Input::Frame(Frame::GoAway(goaway)) => (goaway.last_stream, goaway.code),
                     _ => (u32_at(body, 0)? & MAX_WINDOW, u32_at(body, 4)?),
                 };
                 let e = display_error(code);
@@ -795,7 +795,7 @@ impl Decode for Capture {
             }
             8 if body.len() >= 4 => {
                 let inc = match &frame {
-                    FrameItem::Frame(Frame::WindowUpdate(update)) => update.increment,
+                    Input::Frame(Frame::WindowUpdate(update)) => update.increment,
                     _ => u32_at(body, 0)? & MAX_WINDOW,
                 };
                 item.layer
@@ -883,7 +883,7 @@ impl Present for Capture {
     fn reset(&mut self) {
         self.blocks.forget();
         self.clear_calls();
-        self.frames = Frames::for_observation(CAPTURE_FRAME_LIMIT);
+        self.frames = Inputs::for_observation(CAPTURE_FRAME_LIMIT);
         self.stopped = true;
     }
 }

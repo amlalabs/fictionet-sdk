@@ -21,8 +21,10 @@
 //! it sends the bytes. For a non-synchronizing one, `{n+}`, it does not
 //! wait. A binary literal, `~{n}`, may also hold NUL bytes.
 //!
-//! Run a server's connection bytes through
-//! [`Stream<Inputs>`](fictionet::stdlib::codec::Stream). Each item is a [`Command`],
+//! A mailbox [`Service`](fictionet::stdlib::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Inputs`]; in `on_item`, call
+//! `driver.decoder().refuse_literal()` to refuse a pending literal or
+//! `driver.decoder().expect_line()` for AUTHENTICATE and IDLE. Each item is a [`Command`],
 //! a literal continuation, or a syntax error. Send a [`Response`] for each
 //! command. Clients read [`Stream<Responses>`](fictionet::stdlib::codec::Stream).
 //! Mailboxes, messages, and command execution belong to world code.
@@ -55,6 +57,7 @@
 extern crate alloc;
 
 use self::alloc::{string::String, sync::Arc, vec::Vec};
+use fictionet::stdlib::codec::Side;
 use fictionet::stdlib::codec::{self, Decode, Wire};
 
 /// The TCP port IMAP servers listen on.
@@ -1114,7 +1117,7 @@ impl Wire for Command {
     /// Errors leave `out` unchanged. Use [`Self::continuation_offsets`] on
     /// the encoded bytes to wait before synchronizing literal payloads.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let mut writer = Writer::new(false);
+        let mut writer = Writer::new(Side::Client);
         writer.token(&self.tag, tag_char)?;
         writer.text(b" ")?;
         writer.token(&self.name, atom_char)?;
@@ -1162,7 +1165,7 @@ impl Wire for Response {
     /// tagged BYE or PREAUTH, non-synchronizing literals, normalization,
     /// and all size or nesting overflows. Errors leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let mut writer = Writer::new(true);
+        let mut writer = Writer::new(Side::Server);
         match self {
             Self::Continue { text } => {
                 writer.text(b"+ ")?;
@@ -1222,15 +1225,15 @@ impl Wire for Response {
 struct Writer {
     out: Vec<u8>,
     text: usize,
-    server: bool,
+    side: Side,
 }
 
 impl Writer {
-    fn new(server: bool) -> Self {
+    fn new(side: Side) -> Self {
         Self {
             out: Vec::new(),
             text: 0,
-            server,
+            side,
         }
     }
 
@@ -1328,7 +1331,7 @@ impl Writer {
             match iter.next() {
                 Some(item) => {
                     let open = matches!(item, Value::List(_));
-                    let space = !(*first || (self.server && *run && open));
+                    let space = !(*first || (self.side == Side::Server && *run && open));
                     *first = false;
                     *run &= open;
                     next = Some(item);
@@ -1346,7 +1349,7 @@ impl Writer {
 
     fn literal(&mut self, data: &[u8], non_sync: bool, binary: bool) -> Result<(), Error> {
         if data.len() > MAX_LITERAL
-            || (non_sync && (self.server || data.len() > MAX_NON_SYNC))
+            || (non_sync && (self.side == Side::Server || data.len() > MAX_NON_SYNC))
             || (!binary && data.contains(&0))
         {
             return Err(Error::Unwritable);

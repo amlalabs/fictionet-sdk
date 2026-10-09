@@ -22,7 +22,7 @@
 //!   the `421 Misdirected Request` of [`web::Sites`](fictionet::stdlib::web::Sites).
 //!
 //! On a [`Net`](fictionet::stdlib::net::Net), a [`Server`] is the
-//! [`Accept`] that serves HTTP on a host's
+//! [`PortServer`] that serves HTTP on a host's
 //! port: sites of several hosts at one address share the port as virtual
 //! hosts. [`Website`] puts a site on ports 80 and 443 the way websites
 //! are served. `Net` knows nothing of HTTP, so a copy of this file with
@@ -124,7 +124,7 @@ use http_body::{Body as _, Frame, SizeHint};
 use fictionet::events::{ConnInfo, Event, Fields, Level, float, opt};
 use fictionet::stdlib::http1::{self, Event as H1, RequestHead};
 use fictionet::stdlib::json::Value;
-use fictionet::stdlib::net::{Accept, Arrival, ConfigFor, Host, Sni};
+use fictionet::stdlib::net::{Arrival, ConfigFor, Host, PortServer, Sni};
 use fictionet::stdlib::serve::{
     self, Budget, Driver, Ended, Flow, Pending, PendingDriver, Prefixed, ServeOptions, Timer,
 };
@@ -985,7 +985,7 @@ impl Http1 {
         self
     }
 
-    fn respond(&mut self, driver: &mut Driver<'_>) -> Flow {
+    fn respond(&mut self, driver: &mut Driver<'_, http1::RequestEvents>) -> Flow {
         let body = Body::from(std::mem::take(&mut self.body));
         let body = if self.too_big {
             partial(
@@ -1001,7 +1001,12 @@ impl Http1 {
 
     /// Calls the handler for the request whose head is pending, with
     /// `body`. `close` closes the connection after the answer.
-    fn dispatch(&mut self, driver: &mut Driver<'_>, body: Body, close: bool) -> Flow {
+    fn dispatch(
+        &mut self,
+        driver: &mut Driver<'_, http1::RequestEvents>,
+        body: Body,
+        close: bool,
+    ) -> Flow {
         let Some(head) = self.head.take() else {
             return Flow::Close;
         };
@@ -1041,7 +1046,7 @@ impl Http1 {
         self.after(driver, close)
     }
 
-    fn after(&mut self, driver: &mut Driver<'_>, close: bool) -> Flow {
+    fn after(&mut self, driver: &mut Driver<'_, http1::RequestEvents>, close: bool) -> Flow {
         driver.cancel_timer(BODY);
         if close {
             return Flow::Close;
@@ -1271,7 +1276,11 @@ impl serve::Service for Http1 {
         http1::RequestEvents::with_limits(self.opts.head)
     }
 
-    fn on_open(&mut self, _: &(), driver: &mut Driver<'_>) -> Result<Flow, Infallible> {
+    fn on_open(
+        &mut self,
+        _: &(),
+        driver: &mut Driver<'_, http1::RequestEvents>,
+    ) -> Result<Flow, Infallible> {
         driver.set_timer(HEAD, self.opts.header_timeout);
         Ok(Flow::Continue)
     }
@@ -1280,7 +1289,7 @@ impl serve::Service for Http1 {
         &mut self,
         item: H1<RequestHead>,
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, http1::RequestEvents>,
     ) -> Result<Flow, Infallible> {
         match item {
             H1::Head(head) => {
@@ -1315,7 +1324,12 @@ impl serve::Service for Http1 {
         Ok(Flow::Continue)
     }
 
-    fn on_timer(&mut self, _: Timer, _: &(), _ctx: &mut Driver<'_>) -> Result<Flow, Infallible> {
+    fn on_timer(
+        &mut self,
+        _: Timer,
+        _: &(),
+        _ctx: &mut Driver<'_, http1::RequestEvents>,
+    ) -> Result<Flow, Infallible> {
         Ok(Flow::Close)
     }
 
@@ -1327,7 +1341,7 @@ impl serve::Service for Http1 {
         &mut self,
         error: &serve_fail::Fail,
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, http1::RequestEvents>,
     ) -> Result<(), Infallible> {
         if self.head.is_some() {
             // The body was cut off: the handler still sees what came, as a
@@ -1366,7 +1380,12 @@ impl serve::Service for Http1 {
         Ok(())
     }
 
-    fn on_end(&mut self, end: Ended, _: &(), driver: &mut Driver<'_>) -> Result<(), Infallible> {
+    fn on_end(
+        &mut self,
+        end: Ended,
+        _: &(),
+        driver: &mut Driver<'_, http1::RequestEvents>,
+    ) -> Result<(), Infallible> {
         if end == Ended::Conn(ConnError::Broken) {
             let e = error_event(
                 driver.conn(),
@@ -1709,7 +1728,7 @@ pub async fn serve_connection<C: Connection + Unpin>(
     };
     let mut service = Http1::with(handler.clone(), opts.limits);
     service.date = opts.date;
-    match serve::serve(fcx, conn, info.clone(), &mut service, &(), &serve_opts).await {
+    match serve::connection(fcx, conn, info.clone(), &mut service, &(), &serve_opts).await {
         Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) => {
             match service.take_handoff() {
                 // A request that asks for an upgrade: hyper's HTTP/1 reads it
@@ -1730,7 +1749,7 @@ pub async fn serve_connection<C: Connection + Unpin>(
 // HTTP on a network
 
 /// HTTP on one port of a [`Net`](fictionet::stdlib::net::Net) host: an
-/// [`Accept`] that serves the host's site for each of its DNS names.
+/// [`PortServer`] that serves the host's site for each of its DNS names.
 ///
 /// Every host at one address that serves HTTP on a port shares that port:
 /// the first host's `Server` takes in the others' sites as
@@ -1740,7 +1759,7 @@ pub async fn serve_connection<C: Connection + Unpin>(
 /// ```
 /// # use fictionet::stdlib::{httpd, net::Host};
 /// let page = httpd::Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
-/// let host = Host::new("www").dns_name("www.corp.test").accept(80, httpd::Server::new(page));
+/// let host = Host::new("www").dns_name("www.corp.test").port_server(80, httpd::Server::new(page));
 /// # drop(host);
 /// ```
 #[derive(Clone)]
@@ -1810,7 +1829,7 @@ impl Server {
     }
 }
 
-impl Accept for Server {
+impl PortServer for Server {
     fn serve(&self, fcx: Cx, arrival: Arrival) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let handler: Arc<dyn Handler> = Arc::new(self.vhosts.clone());
         let opts = HttpOptions {
@@ -1829,7 +1848,7 @@ impl Accept for Server {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     }
 
-    fn share(&self, names: &[String], other: &Arc<dyn Accept>) -> bool {
+    fn share(&self, names: &[String], other: &Arc<dyn PortServer>) -> bool {
         let other: &dyn Any = &**other;
         let Some(site) = other.downcast_ref::<Server>() else {
             return false;
@@ -1918,7 +1937,7 @@ impl Website {
         plain.vhost.plain_http = self.plain_http;
         plain.default_host = self.default_host;
         plain.date = self.date;
-        let host = host.accept(80, plain);
+        let host = host.port_server(80, plain);
         match self.tls {
             None => host,
             Some(config) => {

@@ -1,7 +1,7 @@
 //! SPNEGO: reading and writing the GSS-API negotiation tokens that HTTP
 //! Negotiate, SMB and LDAP carry, with no I/O.
 //!
-//! `NegotiationToken` implements `Wire`, and `Frames` decodes successive
+//! `NegotiationToken` implements `Wire`, and `codec::Frames<Frame>` decodes successive
 //! tokens. There is no negotiation session or `Service`, mechanism
 //! authentication, cryptography, or live transport. Inner tokens remain bytes.
 //!
@@ -26,7 +26,7 @@
 //! mechanism tokens (a Kerberos AP-REQ, an NTLM message) are kept as bytes.
 //! What they mean, and whether to accept them, is up to world code. HTTP,
 //! SMB and LDAP each give a token's length, so most worlds never need the
-//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), which splits tokens sent back to back.
+//! [`Stream<Frames<Frame>>`](fictionet::stdlib::codec::Stream), which splits tokens sent back to back.
 //!
 //! Every reader checks lengths and nesting, because the agent can send any
 //! bytes it likes. Tokens are read as BER and written as DER. A token is at
@@ -67,7 +67,9 @@
 use fictionet::stdlib::asn1::{
     self, Class, Element, Header, Length, Oid, Reader, Rules, StringKind, Tag, Writer,
 };
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Prefixed, Wire};
 use std::fmt;
 
 /// The longest token, wrapper included, a reader accepts and a writer
@@ -100,7 +102,7 @@ pub enum Error {
     /// The first element is not a GSS-API wrapper, a negTokenInit or a
     /// negTokenResp.
     NotToken,
-    /// A GSS-API wrapper, or a token given to the [`Stream<Frames>`](fictionet::stdlib::codec::Stream), has an
+    /// A GSS-API wrapper, or a token given to the [`Stream<Frames<Frame>>`](fictionet::stdlib::codec::Stream), has an
     /// indefinite length. RFC 2743 requires a definite one.
     Indefinite,
     /// A GSS-API wrapper names a mechanism other than SPNEGO.
@@ -888,60 +890,48 @@ impl Wire for NegotiationToken {
     }
 }
 
-/// Reads complete tokens without holding input bytes.
-///
-/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for a buffer bounded by the configured
-/// token limit, with at least [`asn1::HEADER_ROOM`] bytes to read or refuse any ASN.1 header.
-/// Only outer headers are checked. Map items through [`NegotiationToken::parse`]
-/// or [`InitialContextToken::parse`] to interpret them. Partial tokens return
-/// [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream reports
-/// truncation at EOF and framing errors once.
-#[derive(Clone, Copy, Debug)]
-pub struct Frames {
-    limit: usize,
-}
+/// One bounded message's bytes, with only its framing checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame(pub Vec<u8>);
 
-impl Frames {
-    /// Creates a decoder accepting tokens up to [`MAX_TOKEN`] bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_TOKEN)
-    }
-
-    /// Sets the whole-token limit, clamped to [`MAX_TOKEN`].
-    /// Zero refuses every token. Oversized tokens are refused from
-    /// their headers, before their contents arrive.
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_TOKEN),
+impl Wire for Frame {
+    type ParseError = Error;
+    type WriteError = Error;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        match Self::parse_prefix(bytes, &Self::default_limit())? {
+            Some((data, used)) if used == bytes.len() => Ok(Self(data)),
+            Some(_) => Err(asn1::Error::Trailing.into()),
+            None => Err(asn1::Error::Truncated.into()),
         }
     }
-
-    /// The maximum token size, including its ASN.1 header.
-    pub fn limit(&self) -> usize {
-        self.limit
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        Self::parse(&self.0)?;
+        out.extend_from_slice(&self.0);
+        Ok(())
     }
 }
 
-impl Default for Frames {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Frames {
+/// Frames one SPNEGO message and yields its uninterpreted bytes.
+/// Partial input needs more bytes, including at EOF. The stream reports truncation.
+impl Prefixed for Frame {
     type Item = Vec<u8>;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "SPNEGO";
-
-    fn capacity(&self) -> usize {
-        self.limit.max(asn1::HEADER_ROOM)
+    fn default_limit() -> Self::Limit {
+        MAX_TOKEN
     }
-
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Error> {
-        Ok(match token_len_limited(input, self.limit)? {
-            Some(n) => Step::Item(input.get(..n).ok_or(asn1::Error::Truncated)?.to_vec(), n),
-            None => Step::Need,
-        })
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_TOKEN)
+    }
+    fn capacity(limit: &Self::Limit) -> usize {
+        (*limit).max(asn1::HEADER_ROOM)
+    }
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Error> {
+        Ok(token_len_limited(input, *limit)?.map(|n| (input[..n].to_vec(), n)))
     }
 }
 
@@ -1657,7 +1647,7 @@ mod tests {
         let mut stream = a.clone();
         stream.extend_from_slice(&b);
         stream.extend_from_slice(&a);
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         for (i, byte) in chunks(&stream, &[1]).enumerate() {
             assert_eq!(d.push(byte), 1);
             match i + 1 {
@@ -1678,14 +1668,14 @@ mod tests {
     #[test]
     fn decoder_holds_at_most_max_token() {
         // Pushed again and again without taking tokens out.
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         for _ in 0..rounds(40_000) {
             let _ = d.push(&ACCEPT_COMPLETED);
             assert!(d.buffered() <= MAX_TOKEN);
         }
         assert!(d.into_parts().0.allocated() <= 2 * MAX_TOKEN);
         // One push far longer than a token.
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         let _ = d.push(&vec![0xa1; 4 * MAX_TOKEN]);
         assert!(d.buffered() <= MAX_TOKEN);
         assert!(d.into_parts().0.allocated() <= 2 * MAX_TOKEN);
@@ -1697,7 +1687,7 @@ mod tests {
         while stream.len() < 3 * MAX_TOKEN {
             stream.extend_from_slice(&ACCEPT_COMPLETED);
         }
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         let mut rest = &stream[..];
         let mut got = 0;
         while !rest.is_empty() {
@@ -1862,7 +1852,7 @@ mod tests {
             0x04, 0x00,
         ];
         assert_eq!(NegotiationToken::parse(&b), Err(Error::HintAddress));
-        contract::check_decode_with_alloc_limit(Frames::new, &b, 2 * MAX_TOKEN);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &b, 2 * MAX_TOKEN);
     }
 
     #[test]
@@ -1991,8 +1981,8 @@ mod tests {
             if !rng.coin() {
                 stream.extend_from_slice(&m);
             }
-            contract::check_decode_with_alloc_limit(Frames::new, &stream, 2 * MAX_TOKEN);
-            for token in decode_all(Frames::new, &stream).0 {
+            contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &stream, 2 * MAX_TOKEN);
+            for token in decode_all(Frames::<Frame>::new, &stream).0 {
                 check(&token);
             }
         }
@@ -2000,12 +1990,12 @@ mod tests {
 
     #[test]
     fn codec_frames_bound_headers_and_report_once() {
-        use fictionet::stdlib::codec::{Decode, Fail, Stream};
+        use fictionet::stdlib::codec::{Fail, Stream};
         use fictionet::stdlib::test_support::contract;
-        assert_eq!(Frames::new().capacity(), MAX_TOKEN);
-        let mut stream = Stream::new(Frames::new());
+        assert_eq!(Frames::<Frame>::new().capacity(), MAX_TOKEN);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         let bytes = [GSS_TAG, 0x83, 1, 0, 0];
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_TOKEN);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_TOKEN);
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong))));
         assert_eq!(stream.next(), None);

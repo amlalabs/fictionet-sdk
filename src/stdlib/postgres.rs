@@ -18,10 +18,10 @@
 //! reads protocols 3.0 and 3.2, which differ only in the length of the
 //! cancel key.
 //!
-//! Nothing here reads a socket. A world that plays a database server
-//! reads connection bytes through
-//! [`Stream<FrontendMessages>`](fictionet::stdlib::codec::Stream) and takes each
-//! [`FrontendMessage`] out. It answers with a [`BackendMessage`] for each
+//! A database [`Service`](fictionet::stdlib::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`FrontendMessages`] to receive each
+//! [`FrontendMessage`]. In `on_item`, call `driver.decoder().refuse_encryption()`
+//! after answering an encryption request with N. It answers with a [`BackendMessage`] for each
 //! reply, written by [`Wire::write`].
 //! Which users exist, which passwords they have, and what a query returns
 //! are up to world code. A world that plays a client does the reverse,

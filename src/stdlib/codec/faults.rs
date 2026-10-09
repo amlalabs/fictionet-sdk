@@ -187,7 +187,7 @@ impl PartialOrd for Held {
 /// for inner replacements. Honor returned delay offsets when sending output.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Direction, Faults, ItemFault, Recorder, Rule, Stream, Trigger, write_bounded}, json};
+/// use fictionet::stdlib::{codec::{Side, Faults, ItemFault, Recorder, Rule, Stream, Trigger, write_bounded}, json};
 /// let entropy = fictionet::SeededEntropy::new(fictionet::Seed::from_u64(7));
 /// let mut faults = Faults::new(1024, 8);
 /// let mut log = Recorder::new(16, 1024);
@@ -198,7 +198,7 @@ impl PartialOrd for Held {
 /// stream.end();
 /// let mut output = Vec::new();
 /// while let Some(result) = faults.next_with_observed(&entropy, &mut stream, &mut output, &plan,
-///     write_bounded, log.observer(0, Direction::ClientToServer)) {
+///     write_bounded, log.observer(0, Side::Client)) {
 ///     result?;
 /// }
 /// faults.flush(&mut output)?;

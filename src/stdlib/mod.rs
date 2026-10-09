@@ -28,7 +28,7 @@
 //!   for its messages and a framer for its byte stream, built on the tools
 //!   in [`codec`]. [Protocols](#protocols) explains the shape they share.
 //! - **Services.** A [`serve::Service`] is the server side of one protocol
-//!   for one connection, written with no I/O. [`serve::serve`] and
+//!   for one connection, written with no I/O. [`serve::connection`] and
 //!   [`serve::listen`] run it over a connection or a listener. HTTP is one
 //!   ([`httpd`]). Every service records what it sees as
 //!   [events](fictionet::events) in the run's one log.
@@ -67,7 +67,7 @@
 //! - [`tcp::endpoint`] and [`udp::endpoint`] stop when their interface
 //!   closes.
 //!
-//! [`net::Net::serve`] and [`web::Sites::serve`] start many tasks: one for
+//! [`net::Net::start`] and [`web::Sites::start`] start many tasks: one for
 //! each part of the network they build. Each task yields after at most 64
 //! packets in a row, so a busy interface cannot starve the rest of the run
 //! (see [`Cx::yield_now`](fictionet::Cx::yield_now)).
@@ -83,8 +83,8 @@
 //! | [`route::lan`] | one IP subnet | a handle for adding members and a gateway; it forwards unicast and floods broadcast and multicast |
 //! | [`tcp::endpoint`] | TCP packets and an address | listeners and connections |
 //! | [`udp::endpoint`] | UDP packets and an address | sockets |
-//! | [`net::Net::serve`] | the attachments, and the hosts with their services | nothing: it builds DNS, routing, machines and every service |
-//! | [`web::Sites::serve`] | the attachments, and a callback that gives the site for a hostname | nothing: it builds DNS, routing, machines, TLS and HTTP |
+//! | [`net::Net::start`] | the attachments, and the hosts with their services | nothing: it builds DNS, routing, machines and every service |
+//! | [`web::Sites::start`] | the attachments, and a callback that gives the site for a hostname | nothing: it builds DNS, routing, machines, TLS and HTTP |
 //! | [`serve::listen`] | a listener, and a function that makes a service | the accepting task |
 //!
 //! **Functions you await.** These are `async`. They take `&Cx`, as every
@@ -145,21 +145,32 @@
 //!
 //! Three layers put a protocol on the network. A [`serve::Service`] joins
 //! a framer to a server's replies and the facts it records, and
-//! [`serve::serve`] runs it over a connection. A [`net::Host`] puts the
+//! [`serve::connection`] runs it over a connection. A [`net::Host`] puts the
 //! service on a port of a machine with a name and an address. To show a
 //! protocol's items in the dashboard and in captures, implement
 //! [`Present`](fictionet::observe::Present) for its framer and add it to the
 //! observe [`Registry`](fictionet::observe::Registry). The guide
 //! `docs/observe-protocols.md` in the repository walks through it.
 //!
-//! ## Copy and own
+//! ## Changing a protocol by copying it
 //!
-//! Every file in `src/stdlib/` uses only public items. The crate root's
-//! `extern crate self as fictionet` makes `fictionet::` imports work both
-//! here and in your crate. Copy a file, edit it, and plug it back in through
-//! the public traits. `tests/copy_and_own/modules.rs` compiles the protocol,
-//! transport, service and network files as modules of a separate crate.
-//! `examples/custom_protocol` shows this with Modbus.
+//! Every file in `src/stdlib/` uses only public `fictionet::` items. The crate
+//! root's `extern crate self as fictionet` makes those imports work here and
+//! in your crate. Copy a file, edit it, and use it through the public traits.
+//! `tests/copy_and_own` compiles the files in a separate crate.
+//!
+//! For a Modbus gateway that accepts a nonzero protocol identifier, copy
+//! `src/stdlib/modbus.rs` into your crate and remove the two protocol-identifier
+//! checks in `Frame::parse_prefix`. Implement a [`serve::Service`] whose decoder
+//! is `codec::Frames<modbus::Frame>` from that copy, and install it with
+//! [`net::Host::tcp`]. Fault plans and transcripts use the same service driver.
+//! Register a presenter using the copied parser in the dashboard's
+//! [`Registry`](fictionet::observe::Registry), then call
+//! [`Cx::observe_protocols`](fictionet::Cx::observe_protocols) before observing.
+//! `examples/custom_protocol` runs this gateway on a [`net::Net`] and reads a
+//! register using a request with a nonzero protocol identifier.
+//!
+//! A module can also be generated from a schema; see `docs/codegen.md`.
 //!
 //! # The catalog
 //!
@@ -259,7 +270,7 @@
 //! | [`ospf`] | OSPFv2 and OSPFv3 packets and LSAs. | yes |  |  |  |  | yes | yes |
 //! | [`ouch`] | Nasdaq OUCH 5.0 order entry messages and an exchange-side state machine that tracks open orders. | yes |  | `Exchange` |  |  | yes | yes |
 //! | [`pcp`] | PCP and NAT-PMP port mapping requests and responses, and the version negotiation between them. | yes |  |  |  |  | yes | yes |
-//! | [`pim`] | PIM version 2 multicast routing messages. | yes |  |  |  |  | yes | yes |
+//! | [`pim`] | PIM version 2 multicast routing messages. |  |  |  |  |  | yes | yes |
 //! | [`pop3`] | POP3 commands and replies. | yes | yes |  |  |  | yes | yes |
 //! | [`portmap`] | Portmapper version 2 and rpcbind versions 3 and 4 requests and results, and universal addresses. |  |  |  |  |  | yes | yes |
 //! | [`ports`] | Ready-slot polling for packet interfaces. |  |  |  |  |  |  | yes |
@@ -305,7 +316,7 @@
 //! | [`tpkt`] | TPKT packets, the carrier of ISO transport on TCP. | yes | yes |  |  |  | yes | yes |
 //! | [`udp`] | UDP sockets for a machine on the simulated network. |  |  |  |  |  |  | yes |
 //! | [`urlencoded_form`] | application/x-www-form-urlencoded form bodies and query strings. | yes | yes |  |  |  | yes | yes |
-//! | [`vrrp`] | VRRP virtual router advertisements, versions 2 and 3. | yes |  |  |  |  | yes | yes |
+//! | [`vrrp`] | VRRP virtual router advertisements, versions 2 and 3. |  |  |  |  |  | yes | yes |
 //! | [`vxlan`] | VXLAN and VXLAN-GPE headers. | yes |  |  |  |  | yes | yes |
 //! | [`wake_on_lan`] | Wake-on-LAN magic packets. | yes | yes |  |  |  | yes | yes |
 //! | [`web`] | Websites by hostname: `Sites`, a preset on `Net` that builds DNS, addresses, TLS and HTTP around one callback. |  |  |  |  |  | yes | yes |
@@ -337,7 +348,7 @@ mod connection;
 /// 13. Constants, such as a price's exponent, are associated constants.
 ///
 /// There is no feed session, recovery engine, order book, `Service` or
-/// live transport. The file is editable without running the generator.
+/// live transport. The generated part is checked against the generator in CI. A copy in your crate has no such check.
 ///
 /// The packet layer is written by hand at the end of the file.
 /// [`Packet`](cme_mdp3::Packet) is one UDP datagram: the binary packet
@@ -480,7 +491,7 @@ pub mod x509;
 pub mod xml;
 pub mod zabbix;
 
-pub use connection::{Accept, Accepted, ConnError, Connection, ConnectionExt, Datagram};
+pub use connection::{Accept, Accepted, ConnError, Connection, ConnectionExt, DatagramSocket};
 
 mod link;
 pub use link::{Direction, bottleneck, delay, filter};

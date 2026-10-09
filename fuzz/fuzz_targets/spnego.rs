@@ -2,15 +2,15 @@
 //! them from the agent and writes them back.
 #![no_main]
 
-use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
 use fictionet::stdlib::spnego::{
-    Error, Frames, InitialContextToken, MAX_TOKEN, Mech, NegotiationToken, token_len,
+    Error, Frame, InitialContextToken, MAX_TOKEN, Mech, NegotiationToken, token_len,
 };
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
+    contract::check_decode(Frames::<Frame>::new, data);
     contract::check_wire::<InitialContextToken>(data);
     contract::check_wire::<NegotiationToken>(data);
     contract::check_wire_value(&InitialContextToken {
@@ -18,7 +18,7 @@ fuzz_target!(|data: &[u8]| {
         inner: data.get(..MAX_TOKEN + 1).unwrap_or(data).to_vec(),
     });
 
-    let mut stream = Stream::new(Frames::new());
+    let mut stream = Stream::new(Frames::<Frame>::new());
     let mut tokens = Vec::new();
     let _ = pump(&mut stream, data, |token| tokens.push(token));
     let _ = finish(&mut stream, |token| tokens.push(token));

@@ -96,7 +96,7 @@ fn resp_limits_and_terminal_errors() {
             Some(if bytes.ends_with(b"abc") {
                 Fail::Truncated { unread: 7 }
             } else {
-                Fail::Protocol(resp::Error::Malformed(b':'))
+                Fail::Protocol(resp::Error::ValueSyntax(b':'))
             })
         );
     }

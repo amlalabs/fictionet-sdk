@@ -103,7 +103,10 @@ fn ocsp_requests_and_responses_round_trip() -> Result<(), Box<dyn core::error::E
     }]);
     let bytes = request.to_bytes()?;
     round_trip(
-        || ocsp::Frames::new().map(|b| <ocsp::Request as Wire>::parse(&b)),
+        || {
+            fictionet::stdlib::codec::Frames::<ocsp::Frame>::new()
+                .map(|b| <ocsp::Request as Wire>::parse(&b))
+        },
         &bytes,
         &[Ok(request)],
     );
@@ -112,13 +115,19 @@ fn ocsp_requests_and_responses_round_trip() -> Result<(), Box<dyn core::error::E
     let mut both = reply.clone();
     response.write(&mut both)?;
     round_trip(
-        || ocsp::Frames::new().map(|b| <ocsp::Response as Wire>::parse(&b)),
+        || {
+            fictionet::stdlib::codec::Frames::<ocsp::Frame>::new()
+                .map(|b| <ocsp::Response as Wire>::parse(&b))
+        },
         &both,
         &[Ok(response.clone()), Ok(response)],
     );
-    contract::check_truncated(ocsp::Frames::new, &bytes);
+    contract::check_truncated(fictionet::stdlib::codec::Frames::<ocsp::Frame>::new, &bytes);
     assert_eq!(
-        contract::check_decode(ocsp::Frames::new, &[0x30, 0x83, 1, 0, 0]),
+        contract::check_decode(
+            fictionet::stdlib::codec::Frames::<ocsp::Frame>::new,
+            &[0x30, 0x83, 1, 0, 0]
+        ),
         (vec![], Some(Fail::Protocol(ocsp::Error::TooLong)))
     );
     Ok(())
@@ -145,13 +154,22 @@ fn spnego_tokens_round_trip() -> Result<(), Box<dyn core::error::Error>> {
     });
     response.write(&mut bytes)?;
     round_trip(
-        || spnego::Frames::new().map(|b| <spnego::NegotiationToken as Wire>::parse(&b)),
+        || {
+            fictionet::stdlib::codec::Frames::<spnego::Frame>::new()
+                .map(|b| <spnego::NegotiationToken as Wire>::parse(&b))
+        },
         &bytes,
         &[Ok(init), Ok(response)],
     );
-    contract::check_truncated(spnego::Frames::new, &bytes[..first_len]);
+    contract::check_truncated(
+        fictionet::stdlib::codec::Frames::<spnego::Frame>::new,
+        &bytes[..first_len],
+    );
     assert_eq!(
-        contract::check_decode(spnego::Frames::new, &[0x60, 0x83, 1, 0, 0]),
+        contract::check_decode(
+            fictionet::stdlib::codec::Frames::<spnego::Frame>::new,
+            &[0x60, 0x83, 1, 0, 0]
+        ),
         (vec![], Some(Fail::Protocol(spnego::Error::TooLong)))
     );
     Ok(())
@@ -288,59 +306,100 @@ fn x509_pem_text_lines_have_their_own_limit() -> Result<(), Box<dyn core::error:
 fn frame_limits_refuse_lengths_before_bodies() {
     for limit in [0, 1, 2, 15, 16, 32] {
         assert_eq!(
-            contract::check_decode(|| ocsp::Frames::with_limit(limit), &[0x30, 0x81, 0x80]),
+            contract::check_decode(
+                || fictionet::stdlib::codec::Frames::<ocsp::Frame>::with_limit(limit),
+                &[0x30, 0x81, 0x80]
+            ),
             (vec![], Some(Fail::Protocol(ocsp::Error::TooLong)))
         );
         assert_eq!(
-            contract::check_decode(|| spnego::Frames::with_limit(limit), &[0xa1, 0x81, 0x80]),
+            contract::check_decode(
+                || fictionet::stdlib::codec::Frames::<spnego::Frame>::with_limit(limit),
+                &[0xa1, 0x81, 0x80]
+            ),
             (vec![], Some(Fail::Protocol(spnego::Error::TooLong)))
         );
         assert_eq!(
-            contract::check_decode(|| kerberos::Frames::with_limit(limit), &[0, 0, 0, 128]),
+            contract::check_decode(
+                || fictionet::stdlib::codec::Frames::<kerberos::Frame>::with_limit(limit),
+                &[0, 0, 0, 128]
+            ),
             (
                 vec![],
                 Some(Fail::Protocol(kerberos::Error::LengthTooLong(128)))
             )
         );
-        assert_eq!(ocsp::Frames::with_limit(limit).capacity(), limit.max(16));
-        assert_eq!(spnego::Frames::with_limit(limit).capacity(), limit.max(16));
-        assert_eq!(kerberos::Frames::with_limit(limit).capacity(), limit + 4);
+        assert_eq!(
+            fictionet::stdlib::codec::Frames::<ocsp::Frame>::with_limit(limit).capacity(),
+            limit.max(16)
+        );
+        assert_eq!(
+            fictionet::stdlib::codec::Frames::<spnego::Frame>::with_limit(limit).capacity(),
+            limit.max(16)
+        );
+        assert_eq!(
+            fictionet::stdlib::codec::Frames::<kerberos::Frame>::with_limit(limit).capacity(),
+            limit + 4
+        );
     }
     assert_eq!(
-        contract::check_decode(|| ocsp::Frames::with_limit(0), &[0x30, 0]),
+        contract::check_decode(
+            || fictionet::stdlib::codec::Frames::<ocsp::Frame>::with_limit(0),
+            &[0x30, 0]
+        ),
         (vec![], Some(Fail::Protocol(ocsp::Error::TooLong)))
     );
     assert_eq!(
-        contract::check_decode(|| spnego::Frames::with_limit(0), &[0xa1, 0]),
+        contract::check_decode(
+            || fictionet::stdlib::codec::Frames::<spnego::Frame>::with_limit(0),
+            &[0xa1, 0]
+        ),
         (vec![], Some(Fail::Protocol(spnego::Error::TooLong)))
     );
-    round_trip(|| ocsp::Frames::with_limit(2), &[0x30, 0], &[vec![0x30, 0]]);
     round_trip(
-        || spnego::Frames::with_limit(2),
+        || fictionet::stdlib::codec::Frames::<ocsp::Frame>::with_limit(2),
+        &[0x30, 0],
+        &[vec![0x30, 0]],
+    );
+    round_trip(
+        || fictionet::stdlib::codec::Frames::<spnego::Frame>::with_limit(2),
         &[0xa1, 0],
         &[vec![0xa1, 0]],
     );
-    round_trip(|| kerberos::Frames::with_limit(0), &[0, 0, 0, 0], &[vec![]]);
     round_trip(
-        || kerberos::Frames::with_limit(1),
+        || fictionet::stdlib::codec::Frames::<kerberos::Frame>::with_limit(0),
+        &[0, 0, 0, 0],
+        &[vec![]],
+    );
+    round_trip(
+        || fictionet::stdlib::codec::Frames::<kerberos::Frame>::with_limit(1),
         &[0, 0, 0, 1, 42],
         &[vec![42]],
     );
     assert_eq!(
-        ocsp::Frames::with_limit(usize::MAX).limit(),
+        fictionet::stdlib::codec::Frames::<ocsp::Frame>::with_limit(usize::MAX).limit(),
         ocsp::MAX_MESSAGE
     );
     assert_eq!(
-        spnego::Frames::with_limit(usize::MAX).limit(),
+        fictionet::stdlib::codec::Frames::<spnego::Frame>::with_limit(usize::MAX).limit(),
         spnego::MAX_TOKEN
     );
     assert_eq!(
-        kerberos::Frames::with_limit(usize::MAX).limit(),
+        fictionet::stdlib::codec::Frames::<kerberos::Frame>::with_limit(usize::MAX).limit(),
         kerberos::MAX_MESSAGE
     );
-    assert_eq!(ocsp::Frames::default().limit(), ocsp::MAX_MESSAGE);
-    assert_eq!(spnego::Frames::default().limit(), spnego::MAX_TOKEN);
-    assert_eq!(kerberos::Frames::default().limit(), kerberos::MAX_MESSAGE);
+    assert_eq!(
+        fictionet::stdlib::codec::Frames::<ocsp::Frame>::default().limit(),
+        ocsp::MAX_MESSAGE
+    );
+    assert_eq!(
+        fictionet::stdlib::codec::Frames::<spnego::Frame>::default().limit(),
+        spnego::MAX_TOKEN
+    );
+    assert_eq!(
+        fictionet::stdlib::codec::Frames::<kerberos::Frame>::default().limit(),
+        kerberos::MAX_MESSAGE
+    );
 }
 
 #[test]
@@ -358,14 +417,23 @@ fn kerberos_tcp_messages_round_trip() -> Result<(), Box<dyn core::error::Error>>
     let mut both = bytes.clone();
     frame.write(&mut both)?;
     round_trip(
-        || kerberos::Frames::new().map(|b| <kerberos::Message as Wire>::parse(&b)),
+        || {
+            fictionet::stdlib::codec::Frames::<kerberos::Frame>::new()
+                .map(|b| <kerberos::Message as Wire>::parse(&b))
+        },
         &both,
         &[Ok(message.clone()), Ok(message)],
     );
-    contract::check_truncated(kerberos::Frames::new, &bytes);
+    contract::check_truncated(
+        fictionet::stdlib::codec::Frames::<kerberos::Frame>::new,
+        &bytes,
+    );
     let length = kerberos::MAX_MESSAGE as u32 + 1;
     assert_eq!(
-        contract::check_decode(kerberos::Frames::new, &length.to_be_bytes()),
+        contract::check_decode(
+            fictionet::stdlib::codec::Frames::<kerberos::Frame>::new,
+            &length.to_be_bytes()
+        ),
         (
             vec![],
             Some(Fail::Protocol(kerberos::Error::LengthTooLong(length)))

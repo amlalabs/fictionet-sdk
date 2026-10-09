@@ -8,7 +8,7 @@ the one log each run keeps.
 
 | Module | What it gives |
 |---|---|
-| `serve` | The `Service` trait, the driver that runs a service over a connection (`serve`, `listen`, `serve_datagram`), a `Harness` for tests, transcripts and fault plans |
+| `serve` | The `Service` trait, the driver that runs a service over a connection (`connection`, `listen`, `datagram`), a `Harness` for tests, transcripts and fault plans |
 | `fictionet::events` | Not in the stdlib: the run's log of `Event`s, in one shape, kept whether or not anyone reads it, and read as a file, by callbacks, by a grader in the same process, and by the dashboard |
 | `net` | `Net`: the sandboxes' subnet, DNS, routing, one machine per address, and each `Host`'s services |
 | `httpd` | HTTP as a service: `Router`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
@@ -38,12 +38,12 @@ impl Service for Prompt {
         Lines::new(256, Ending::LfOrCrlf)
     }
 
-    fn on_open(&mut self, _: &String, driver: &mut Driver<'_>) -> Result<Flow, Self::Error> {
+    fn on_open(&mut self, _: &String, driver: &mut Driver<'_, Self::Decoder>) -> Result<Flow, Self::Error> {
         driver.reply().extend_from_slice(b"password: ");
         Ok(Flow::Continue)
     }
 
-    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, password: &String, driver: &mut Driver<'_>) -> Result<Flow, Self::Error> {
+    fn on_item(&mut self, line: Result<Vec<u8>, LineError>, password: &String, driver: &mut Driver<'_, Self::Decoder>) -> Result<Flow, Self::Error> {
         let line = line.unwrap_or_default();
         let right = line == password.as_bytes();
         driver.record(
@@ -84,9 +84,9 @@ A service can also:
   over TLS (`driver.conn().tls` is then true): STARTTLS in SMTP, IMAP and
   LDAP, and Postgres's `SSLRequest`. `Upgrade::Decoder` goes on with a
   fresh decoder. `Upgrade::Handoff` hands the connection and its unread
-  bytes back to whoever called `serve`. A port served with `Host::tcp`
+  bytes back to whoever called `serve::connection`. A port served with `Host::tcp`
   or `tcp_with` closes such a connection. To go on with it, serve the port
-  with an `Accept` of your own, as `httpd::Server` does.
+  with a `PortServer` of your own, as `httpd::Server` does.
 - **Say what it holds.** `Service::held` reports bytes the service keeps
   for the connection, such as a request body, and `Pending::held` what
   deferred work keeps, such as a response body not yet written. They
@@ -99,9 +99,9 @@ it: it ends the run, wherever in the world it happens. As it unwinds,
 the driver names the service and the connection on standard error after
 the panic's own message, so the failed run says where to look.
 
-When the world stops, `on_end` hears `Ended::Cancelled`, and `serve`
+When the world stops, `on_end` hears `Ended::Cancelled`, and `serve::connection`
 returns `Err(ServeError::Cancelled)`, also when the stop comes during the
-TLS handshake, before the service started. `serve_datagram` returns
+TLS handshake, before the service started. `datagram` returns
 `Err(Cancelled)`. A stop is never reported as a closed or broken
 connection. `listen` and `Net` serve each connection in a task of its
 own; a connection's failure is that connection's, recorded as
@@ -176,10 +176,10 @@ let password = Arc::new("hunter2".to_owned());
 let at: std::net::Ipv4Addr = "10.20.0.5".parse()?;
 Net::new()
     .host("vault", |h| h.at(at).dns_name("vault.corp.test").tcp(2323, password.clone(), || Prompt))
-    .serve(&fcx, attachments)?;
+    .start(&fcx, attachments)?;
 ```
 
-`serve` fails if a host cannot be served as declared: an address a host
+`start` fails if a host cannot be served as declared: an address a host
 cannot have, two services on one port, or a port that cannot be opened.
 
 Every sandbox that attaches joins `10.0.0.0/24` (and `2001:db8::/64`),
@@ -201,8 +201,8 @@ Other kinds of port:
 - `tls(port, sni, config, world, make)`: TLS first, picked by the name the
   client sends (`Sni::Any`, `Sni::Names` for the host's DNS names, or one
   name); several calls on one port route by SNI.
-- `accept(port, accept)` and `tls_accept(port, sni, config, accept)`: an
-  `Accept` of the world's own. HTTP is one: `httpd::Server`, below.
+- `port_server(port, server)` and `tls_accept(port, sni, config, server)`: a
+  `PortServer` of the world's own. HTTP is one: `httpd::Server`, below.
 
 Each sandbox may hold 256 connections at once to one machine. What its
 connections hold is charged to one budget per sandbox, 256 MiB by default.
@@ -231,7 +231,7 @@ Net::new()
     .lan("corp", "192.168.56.0/24".parse()?)
     .host("dc01", |h| h.on("corp").at(dc01).dns_name("dc01.corp.test").tcp(389, directory, || Ldap))
     .member("ws01", "corp", "192.168.56.31".parse()?)
-    .serve(&fcx, attachments)?;
+    .start(&fcx, attachments)?;
 ```
 
 `Net::route(name, prefix)` wires a trusted sandbox, such as a real
@@ -257,7 +257,7 @@ An axum `Router`, or any tower service over `http::Request<web::Body>`,
 runs with `httpd::tower(service)`. A handler adds facts to its request's
 event by putting `events::Fields` in its response's extensions.
 
-On a network, `httpd::Server` is the `Accept` that serves a handler on a
+On a network, `httpd::Server` is the `PortServer` that serves a handler on a
 port, and `httpd::Website` puts one on ports 80 and 443 as `web::Sites`
 does:
 
@@ -265,7 +265,7 @@ does:
 use fictionet::stdlib::httpd::{Server, Website};
 
 Net::new()
-    .host("intranet", |h| h.dns_name("intranet.corp.test").accept(80, Server::new(api.clone())))
+    .host("intranet", |h| h.dns_name("intranet.corp.test").port_server(80, Server::new(api.clone())))
     .add_host(Website::new(api).tls(move |_| config.clone()).served_by(Host::new("www").dns_name("www.corp.test")))
     /* ... */;
 ```
@@ -303,7 +303,7 @@ the run's clock:
 ```rust
 let events = fcx.events();
 events.to_file("/var/lib/fictionet/events.jsonl")?; // for a grader after the run
-Net::new() /* ... */.serve(&fcx, attachments)?;
+Net::new() /* ... */.start(&fcx, attachments)?;
 // For a grader in the same process, during the run or after it:
 let logins = events.of("prompt", "login");
 ```
@@ -351,3 +351,50 @@ The dashboard lists the events under **Events**, from what the log held
 when it connected. To decode a service's packets there, register its decoder as a `Present`
 in an `observe::Registry`, and give the registry to `Net::observe`. The
 built-in registry already decodes DNS, HTTP, TLS, Modbus and many more.
+
+## Changing framing between items
+
+A service can use a protocol module's decoder directly. `Driver::decoder()` returns the active decoder, so a mode change applies before the next item, including bytes already buffered from the same read. For SMTP, accept `DATA`, send `354`, and call `start_data()`:
+
+```rust
+use fictionet::stdlib::{smtp, serve::{Driver, Flow, Service}};
+
+#[derive(Default)]
+struct Mailbox {
+    messages: Vec<Vec<u8>>,
+}
+
+impl Service for Mailbox {
+    type Decoder = smtp::Inputs;
+    type State = ();
+    type Error = smtp::Error;
+
+    fn decoder(&self) -> Self::Decoder {
+        smtp::Inputs::new()
+    }
+
+    fn on_item(
+        &mut self,
+        item: Result<smtp::Input, smtp::Error>,
+        _: &(),
+        driver: &mut Driver<'_, Self::Decoder>,
+    ) -> Result<Flow, Self::Error> {
+        match item? {
+            smtp::Input::Command(command) if command.verb == "DATA" => {
+                driver.decoder().start_data().map_err(smtp::Error::Framing)?;
+                driver.reply().extend_from_slice(b"354 Send data\r\n");
+            }
+            smtp::Input::Message(bytes) => {
+                self.messages.push(bytes);
+                driver.reply().extend_from_slice(b"250 Queued\r\n");
+            }
+            _ => driver.reply().extend_from_slice(b"250 OK\r\n"),
+        }
+        Ok(Flow::Continue)
+    }
+}
+```
+
+Install it with `host.tcp(smtp::PORT, Arc::new(()), Mailbox::default)`. The SMTP decoder removes transparency dots and returns to commands after the DATA terminator. The same access lets an IMAP service refuse a literal or a Postgres service resume startup after replying `N` to an SSL request.
+
+Accessing the decoder or upgrading the connection stops item faults and emits the `conn.faults` event with a `stopped` field. Byte faults continue. Over UDP, decoder access applies to the current datagram; each new datagram starts with a fresh decoder.

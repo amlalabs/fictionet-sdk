@@ -90,7 +90,7 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
             ),
             _ => None,
         });
-        sites.serve(&fcx, attachments)?;
+        sites.start(&fcx, attachments)?;
 
         // The sandbox: an IP stack of its own on the `End` returned by `Attacher::attach`.
         let cable = attacher.attach("agent")?;

@@ -1,7 +1,7 @@
 //! OCSP: reading and writing certificate status requests and responses,
 //! with no I/O.
 //!
-//! DER request and response types implement `Wire`, and `Frames` decodes
+//! DER request and response types implement `Wire`, and `codec::Frames<Frame>` decodes
 //! successive DER values. There is no responder `Service`, HTTP transport,
 //! signature generation, or signature verification.
 //!
@@ -87,9 +87,11 @@
 use fictionet::stdlib::asn1::{
     self, Class, Element, Header, Length, Oid, Reader, Rules, Tag, Writer,
 };
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::ascii;
 use fictionet::stdlib::codec::base64::{self, Padding};
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Prefixed, Wire};
 
 /// The TCP port OCSP responders usually listen on, since OCSP runs over
 /// plain HTTP.
@@ -982,72 +984,60 @@ fictionet::der_wire!(asn1, impl Wire for BasicResponse, Error, Error::Unwritable
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
 ]);
 
-/// Reads whole DER messages without holding input bytes.
-///
-/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for a buffer bounded by the configured
-/// message limit, with at least 16 bytes to read or refuse any ASN.1 header.
-/// Only headers are checked. Map each item through [`Request::parse`]
-/// or [`Response::parse`] to interpret it. Partial messages return
-/// [`fictionet::stdlib::codec::Step::Need`], including at EOF, so the stream reports
-/// truncation. Framing errors are reported once.
-#[derive(Clone, Copy, Debug)]
-pub struct Frames {
-    limit: usize,
-}
+/// One bounded message's bytes, with only its framing checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame(pub Vec<u8>);
 
-impl Frames {
-    /// Creates a decoder accepting messages up to [`MAX_MESSAGE`] bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_MESSAGE)
-    }
-
-    /// Sets the whole-message limit, clamped to [`MAX_MESSAGE`].
-    /// Zero refuses every message. Oversized messages are refused from
-    /// their headers, before their contents arrive.
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_MESSAGE),
+impl Wire for Frame {
+    type ParseError = Error;
+    type WriteError = Error;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        match Self::parse_prefix(bytes, &Self::default_limit())? {
+            Some((data, used)) if used == bytes.len() => Ok(Self(data)),
+            Some(_) => Err(asn1::Error::Trailing.into()),
+            None => Err(asn1::Error::Truncated.into()),
         }
     }
-
-    /// The maximum message size, including its ASN.1 header.
-    pub fn limit(&self) -> usize {
-        self.limit
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        Self::parse(&self.0)?;
+        out.extend_from_slice(&self.0);
+        Ok(())
     }
 }
 
-impl Default for Frames {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Frames {
+/// Frames one OCSP message and yields its uninterpreted bytes.
+/// Partial input needs more bytes, including at EOF. The stream reports truncation.
+impl Prefixed for Frame {
     type Item = Vec<u8>;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "OCSP";
-
-    fn capacity(&self) -> usize {
-        self.limit.max(asn1::HEADER_ROOM)
+    fn default_limit() -> Self::Limit {
+        MAX_MESSAGE
     }
-
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Error> {
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_MESSAGE)
+    }
+    fn capacity(limit: &Self::Limit) -> usize {
+        (*limit).max(asn1::HEADER_ROOM)
+    }
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Error> {
         let header = match Header::parse(input, Rules::Der) {
             Ok(header) => header,
-            Err(asn1::Error::Truncated) => return Ok(Step::Need),
-            Err(e) => return Err(e.into()),
+            Err(asn1::Error::Truncated) => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
         let Length::Definite(n) = header.length else {
             return Err(asn1::Error::Indefinite.into());
         };
         let total = header.len.checked_add(n).ok_or(Error::TooLong)?;
-        if total > self.limit {
+        if total > *limit {
             return Err(Error::TooLong);
         }
-        Ok(match input.get(..total) {
-            Some(bytes) => Step::Item(bytes.to_vec(), total),
-            None => Step::Need,
-        })
+        Ok(input.get(..total).map(|bytes| (bytes.to_vec(), total)))
     }
 }
 
@@ -2127,7 +2117,7 @@ mod tests {
         for der in [minimal_request_der(), full_request().to_bytes().unwrap()] {
             for n in 0..der.len() {
                 assert!(Request::parse(&der[..n]).is_err(), "{n}");
-                let mut d = Stream::new(Frames::new());
+                let mut d = Stream::new(Frames::<Frame>::new());
                 let fed = &der[..n];
                 assert_eq!(d.push(fed), fed.len());
                 assert_eq!(d.next(), None, "{n}");
@@ -2153,7 +2143,7 @@ mod tests {
         let a = minimal_request_der();
         let b = full_response().to_bytes().unwrap();
         let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         let mut got = Vec::new();
         for byte in chunks(&stream, &[1]) {
             let fed = byte;
@@ -2175,7 +2165,7 @@ mod tests {
         assert_eq!(d.failed(), Some(&Fail::Protocol(Error::TooLong)));
         assert_eq!(d.buffered(), held);
         // Indefinite lengths are not DER.
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         let fed = &[0x30, 0x80];
         assert_eq!(d.push(fed), fed.len());
         assert!(matches!(
@@ -2183,7 +2173,7 @@ mod tests {
             Some(Err(Fail::Protocol(Error::Asn1(_))))
         ));
         // A message just at the limit is fine.
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         let fed = &[0x04, 0x82, 0xff, 0xfc];
         assert_eq!(d.push(fed), fed.len());
         let fed = &vec![0; MAX_MESSAGE - 4];
@@ -2318,7 +2308,7 @@ mod tests {
         // One large push takes only what fits, and the rest waits.
         let mut big = vec![0; 1 << 20];
         big[..5].copy_from_slice(&[0x04, 0x83, 0x0f, 0xff, 0xfb]);
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         assert_eq!(d.push(&big), MAX_MESSAGE);
         assert_eq!(d.buffered(), MAX_MESSAGE);
         assert_eq!(d.push(&big), 0);
@@ -2327,7 +2317,7 @@ mod tests {
         // A stream of many messages goes through in pieces of any size.
         let a = minimal_request_der();
         let stream: Vec<u8> = (0..3000).flat_map(|_| a.iter().copied()).collect();
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         let (mut rest, mut got) = (&stream[..], 0);
         while !rest.is_empty() {
             let n = d.push(rest);
@@ -2615,7 +2605,7 @@ mod tests {
             ok += 1;
         }
         let _ = decode_get_path(&String::from_utf8_lossy(b));
-        contract::check_decode_with_alloc_limit(Frames::new, b, 2 * MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, b, 2 * MAX_MESSAGE);
         contract::check_wire::<Request>(b);
         contract::check_wire::<Response>(b);
         contract::check_wire::<BasicResponse>(b);
@@ -2706,12 +2696,12 @@ mod tests {
 
     #[test]
     fn codec_frames_bound_headers_and_report_once() {
-        use fictionet::stdlib::codec::{Decode, Fail, Stream};
+        use fictionet::stdlib::codec::{Fail, Stream};
         use fictionet::stdlib::test_support::contract;
-        assert_eq!(Frames::new().capacity(), MAX_MESSAGE);
-        let mut stream = Stream::new(Frames::new());
+        assert_eq!(Frames::<Frame>::new().capacity(), MAX_MESSAGE);
+        let mut stream = Stream::new(Frames::<Frame>::new());
         let bytes = [0x30, 0x83, 1, 0, 0];
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(Frames::<Frame>::new, &bytes, 2 * MAX_MESSAGE);
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong))));
         assert_eq!(stream.next(), None);

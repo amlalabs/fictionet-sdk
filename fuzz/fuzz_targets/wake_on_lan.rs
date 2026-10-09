@@ -102,7 +102,7 @@ fuzz_target!(|data: &[u8]| {
         }
         Err(Error::TooLong) => assert!(data.len() > MAX_PAYLOAD),
         Err(Error::NotFound) => {}
-        Err(error @ (Error::Length | Error::Malformed)) => panic!("find returned {error}"),
+        Err(error @ (Error::Length | Error::SyncOrAddress)) => panic!("find returned {error}"),
     }
     let _ = built(data);
     // A card set from the first bytes, reading the whole payload.

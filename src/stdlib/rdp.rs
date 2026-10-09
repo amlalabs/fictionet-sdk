@@ -1,7 +1,8 @@
 //! RDP connection messages from MS-RDPBCGR, with no I/O.
 //!
-//! [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream) separates TPKT slow-path
-//! packets from fast-path packets.
+//! A [`Service`](fictionet::stdlib::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::serve::connection) uses `codec::Frames<Frame>` to separate
+//! TPKT slow-path packets from fast-path packets.
 //! [`Connection`] reads X.224 connection requests and confirms, including
 //! cookies, routing tokens and security negotiation. [`McsConnect`] reads
 //! the BER connection exchange and its PER GCC data. [`McsPdu`] reads the

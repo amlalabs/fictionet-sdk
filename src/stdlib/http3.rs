@@ -1276,24 +1276,17 @@ impl HeaderList {
     }
 }
 
-/// The endpoint that sent a control stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Endpoint {
-    /// A client.
-    Client,
-    /// A server.
-    Server,
-}
+use fictionet::stdlib::codec::Side;
 
 #[derive(Clone, Debug)]
 struct ControlState {
-    sender: Endpoint,
+    sender: Side,
     settings: bool,
     goaway: Option<u64>,
     max_push: Option<u64>,
 }
 impl ControlState {
-    fn new(sender: Endpoint) -> Self {
+    fn new(sender: Side) -> Self {
         Self {
             sender,
             settings: false,
@@ -1315,7 +1308,7 @@ impl ControlState {
                 Err(unexpected)
             }
             Frame::MaxPushId(id) => {
-                if self.sender != Endpoint::Client {
+                if self.sender != Side::Client {
                     return Err(unexpected);
                 }
                 if self.max_push.is_some_and(|old| *id < old) {
@@ -1325,7 +1318,7 @@ impl ControlState {
                 Ok(())
             }
             Frame::Goaway(id) => {
-                if self.sender == Endpoint::Server && id % 4 != 0 {
+                if self.sender == Side::Server && id % 4 != 0 {
                     return Err(Error::Id);
                 }
                 if self.goaway.is_some_and(|old| *id > old) {
@@ -1334,7 +1327,7 @@ impl ControlState {
                 self.goaway = Some(*id);
                 Ok(())
             }
-            Frame::PriorityUpdate { .. } if self.sender != Endpoint::Client => Err(unexpected),
+            Frame::PriorityUpdate { .. } if self.sender != Side::Client => Err(unexpected),
             _ => Ok(()),
         }
     }
@@ -1423,7 +1416,7 @@ pub enum RequestResult {
 ///
 /// ```
 /// use fictionet::stdlib::codec::Frames;
-/// use fictionet::stdlib::{codec::{Stream, Wire}, http3::{self, Frame, MessageSide}, qpack};
+/// use fictionet::stdlib::{codec::{Side, Stream, Wire}, http3::{self, Frame, MessageSide}, qpack};
 /// let headers = http3::HeaderList { fields: vec![
 ///     qpack::Field::new(":status", "200"), qpack::Field::new("content-length", "0"),
 /// ] };
@@ -1993,7 +1986,7 @@ pub struct ControlFrames {
 
 impl ControlFrames {
     /// Creates a control decoder for the endpoint sending this stream.
-    pub fn new(sender: Endpoint) -> Self {
+    pub fn new(sender: Side) -> Self {
         Self {
             state: ControlState::new(sender),
         }
@@ -2084,7 +2077,7 @@ impl StreamItems {
     }
     /// Selects the decoder for bytes after a complete stream header.
     /// Use [`codec::Stream::swap`] so unread bytes and EOF are preserved.
-    pub fn after_header(header: StreamHeader, sender: Endpoint) -> Self {
+    pub fn after_header(header: StreamHeader, sender: Side) -> Self {
         let kind = match header {
             StreamHeader::Control => StreamKind::Control(ControlFrames::new(sender)),
             StreamHeader::Push(_) => StreamKind::Frames,
@@ -2213,7 +2206,7 @@ type StreamFactory = Box<dyn FnMut(&u64) -> StreamItems + Send>;
 pub struct Session {
     streams: codec::Demux<u64, StreamItems, StreamFactory>,
     paused: std::collections::BTreeMap<u64, codec::Stream<StreamItems>>,
-    sender: Endpoint,
+    sender: Side,
 }
 
 impl Session {
@@ -2225,15 +2218,15 @@ impl Session {
     /// Even with that minimum, multiple partial frames can exhaust the budget:
     /// if push returns zero and nothing can be drained, reset/remove a stream
     /// to release input before retrying. The budget is not raised automatically.
-    pub fn new(sender: Endpoint, max_streams: usize, max_bytes: usize) -> Self {
+    pub fn new(sender: Side, max_streams: usize, max_bytes: usize) -> Self {
         Self {
             streams: codec::Demux::new(
                 max_streams,
                 max_bytes,
                 Box::new(move |id: &u64| {
                     let uni_sender = match sender {
-                        Endpoint::Client => 2,
-                        Endpoint::Server => 3,
+                        Side::Client => 2,
+                        Side::Server => 3,
                     };
                     if *id > MAX_VARINT || (!(*id).is_multiple_of(4) && *id % 4 != uni_sender) {
                         StreamItems {
@@ -2350,11 +2343,11 @@ impl Session {
 #[cfg(any(test, fuzzing))]
 #[doc(hidden)]
 pub mod harness {
-    use super::{Endpoint, Session};
+    use super::{Session, Side};
 
     /// Checks session buffering across pushes and stream ends.
     pub fn check_session_budget(bytes: &[u8], budget: usize) {
-        let mut session = Session::new(Endpoint::Client, 5, budget);
+        let mut session = Session::new(Side::Client, 5, budget);
         for (index, chunk) in bytes.chunks(17).enumerate() {
             let _ = session.push([0, 2, 4, 6, 10][index % 5], chunk);
             while session.next().is_some() {}
@@ -2460,7 +2453,7 @@ mod tests {
         }
         (events, state.finish())
     }
-    fn control(sender: Endpoint, frames: &[Frame]) -> Result<(), Error> {
+    fn control(sender: Side, frames: &[Frame]) -> Result<(), Error> {
         let (items, failure) = decode_all(|| ControlFrames::new(sender), &join(frames));
         for item in items {
             item?;
@@ -2887,13 +2880,10 @@ mod tests {
                 payload: vec![],
             },
         ] {
-            assert_eq!(
-                control(Endpoint::Client, &[frame]),
-                Err(Error::MissingSettings)
-            );
+            assert_eq!(control(Side::Client, &[frame]), Err(Error::MissingSettings));
         }
         assert_eq!(
-            control(Endpoint::Client, &[settings(), settings()]),
+            control(Side::Client, &[settings(), settings()]),
             Err(Error::UnexpectedFrame(4))
         );
         for frame in [
@@ -2906,11 +2896,11 @@ mod tests {
         ] {
             let t = frame.frame_type();
             assert_eq!(
-                control(Endpoint::Client, &[settings(), frame]),
+                control(Side::Client, &[settings(), frame]),
                 Err(Error::UnexpectedFrame(t))
             );
         }
-        for sender in [Endpoint::Client, Endpoint::Server] {
+        for sender in [Side::Client, Side::Server] {
             let mut stream = Stream::new(ControlFrames::new(sender));
             stream.end();
             assert_eq!(
@@ -2935,21 +2925,21 @@ mod tests {
             },
         ] {
             assert_eq!(
-                control(Endpoint::Server, &[settings(), frame.clone()]),
+                control(Side::Server, &[settings(), frame.clone()]),
                 Err(Error::UnexpectedFrame(frame.frame_type()))
             );
-            assert_eq!(control(Endpoint::Client, &[settings(), frame]), Ok(()));
+            assert_eq!(control(Side::Client, &[settings(), frame]), Ok(()));
         }
         assert_eq!(
             control(
-                Endpoint::Client,
+                Side::Client,
                 &[settings(), Frame::MaxPushId(2), Frame::MaxPushId(1)]
             ),
             Err(Error::Id)
         );
         assert_eq!(
             control(
-                Endpoint::Client,
+                Side::Client,
                 &[
                     settings(),
                     Frame::MaxPushId(2),
@@ -2959,7 +2949,7 @@ mod tests {
             ),
             Ok(())
         );
-        for sender in [Endpoint::Client, Endpoint::Server] {
+        for sender in [Side::Client, Side::Server] {
             assert_eq!(
                 control(
                     sender,
@@ -2979,11 +2969,11 @@ mod tests {
             assert_eq!(control(sender, &[settings(), Frame::CancelPush(0)]), Ok(()));
         }
         assert_eq!(
-            control(Endpoint::Server, &[settings(), Frame::Goaway(1)]),
+            control(Side::Server, &[settings(), Frame::Goaway(1)]),
             Err(Error::Id)
         );
         assert_eq!(
-            control(Endpoint::Client, &[settings(), Frame::Goaway(1)]),
+            control(Side::Client, &[settings(), Frame::Goaway(1)]),
             Ok(())
         );
     }
@@ -3000,11 +2990,11 @@ mod tests {
         ];
         let bytes = join(&frames);
         contract::check_decode_with_alloc_limit(
-            || ControlFrames::new(Endpoint::Client),
+            || ControlFrames::new(Side::Client),
             &bytes,
             2 * MAX_FRAME,
         );
-        let (items, error) = decode_all(|| ControlFrames::new(Endpoint::Client), &bytes);
+        let (items, error) = decode_all(|| ControlFrames::new(Side::Client), &bytes);
         assert_eq!(items, frames.into_iter().map(Ok).collect::<Vec<_>>());
         assert_eq!(error, Some(Fail::Protocol(Error::ClosedCriticalStream)));
     }
@@ -3680,7 +3670,7 @@ mod tests {
         let wire = join(&[Frame::headers(&section).unwrap(), Frame::Data(vec![42])]);
         let mut table = qpack::Table::new(4096);
         let mut state = RequestStream::new(0, MessageSide::Request, false).unwrap();
-        let mut session = Session::new(Endpoint::Client, 4, MAX_FRAME);
+        let mut session = Session::new(Side::Client, 4, MAX_FRAME);
         assert_eq!(session.push(0, &wire), wire.len());
         let (_, Ok(Ok(StreamItem::Frame(frame)))) = session.next().unwrap() else {
             panic!()

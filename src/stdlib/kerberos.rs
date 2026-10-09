@@ -13,7 +13,7 @@
 //!
 //! Nothing here reads a socket or touches a key. A world that plays a KDC
 //! pushes the bytes it reads from a [`tcp`](fictionet::stdlib::tcp) connection
-//! to a [`Stream<Frames>`](fictionet::stdlib::codec::Stream), or takes a UDP datagram as it is, and reads each
+//! to a [`Stream<Frames<Frame>>`](fictionet::stdlib::codec::Stream), or takes a UDP datagram as it is, and reads each
 //! message with [`Message::parse`]. It writes the reply with
 //! [`Wire::write`], with a [`Frame`] around its DER for TCP. The parts
 //! that are encrypted (the ticket's secrets, the reply's session key, the
@@ -28,9 +28,9 @@
 //! [`Message::parse`] reads back.
 //!
 //! ```
-//! use fictionet::stdlib::codec::{Stream, Wire, pump, finish};
+//! use fictionet::stdlib::codec::{Frames, Stream, Wire, pump, finish};
 //! use fictionet::stdlib::kerberos::{
-//!     error_code, msg_type, name_type, padata_type, Frame, Frames, KdcReq, KdcReqBody, KerberosTime, KrbError, Message,
+//!     error_code, msg_type, name_type, padata_type, Frame, KdcReq, KdcReqBody, KerberosTime, KrbError, Message,
 //!     MethodData, PaData, PrincipalName,
 //! };
 //!
@@ -56,7 +56,7 @@
 //! let wire = Frame(request.to_bytes().unwrap()).to_bytes().unwrap();
 //!
 //! // The KDC reads it from its TCP connection, a few bytes at a time.
-//! let mut decoder = Stream::new(Frames::new());
+//! let mut decoder = Stream::new(Frames::<Frame>::new());
 //! let mut got = Vec::new();
 //! for chunk in wire.chunks(5) {
 //!     pump(&mut decoder, chunk, |m| got.push(m)).unwrap();
@@ -91,7 +91,9 @@
 //! ```
 
 use fictionet::stdlib::asn1::{self, Reader, Rules, StringKind, Tag, Writer};
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+#[cfg(test)]
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::{Prefixed, Wire};
 use std::fmt;
 
 /// The port KDCs listen on, over UDP and TCP.
@@ -1267,9 +1269,9 @@ impl Wire for Frame {
     /// Reads one TCP record. Refuses a reserved length bit, payloads over
     /// [`MAX_MESSAGE`], incomplete records, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        match Frames::new().decode(bytes, true)? {
-            Step::Item(data, n) if n == bytes.len() => Ok(Self(data)),
-            Step::Item(_, _) => Err(Error::Trailing),
+        match Self::parse_prefix(bytes, &MAX_MESSAGE)? {
+            Some((data, n)) if n == bytes.len() => Ok(Self(data)),
+            Some(_) => Err(Error::Trailing),
             _ => Err(Error::Truncated),
         }
     }
@@ -1287,70 +1289,40 @@ impl Wire for Frame {
     }
 }
 
-/// Reads Kerberos TCP records without holding input bytes.
-///
-/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for a buffer limited to
-/// [`TCP_HEADER_LEN`] plus the configured message limit. The four-byte prefix
-/// suffices to refuse reserved bits and oversized messages. Map each
-/// payload through [`Message::parse`] to interpret it. Partial records
-/// return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream
-/// reports truncation at EOF and framing errors once.
-#[derive(Clone, Copy, Debug)]
-pub struct Frames {
-    limit: usize,
-}
-
-impl Frames {
-    /// Creates a decoder accepting messages up to [`MAX_MESSAGE`] bytes.
-    pub fn new() -> Self {
-        Self::with_limit(MAX_MESSAGE)
-    }
-
-    /// Sets the message limit, excluding the TCP header, clamped to
-    /// [`MAX_MESSAGE`]. Zero accepts only empty records.
-    pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_MESSAGE),
-        }
-    }
-
-    /// The maximum message size, excluding its TCP header.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-impl Default for Frames {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decode for Frames {
+/// Frames one Kerberos TCP message and yields its uninterpreted bytes.
+/// Partial input needs more bytes, including at EOF. The stream reports truncation.
+impl Prefixed for Frame {
     type Item = Vec<u8>;
     type Error = Error;
+    type Limit = usize;
     const NAME: &'static str = "Kerberos TCP";
-
-    fn capacity(&self) -> usize {
-        TCP_HEADER_LEN.saturating_add(self.limit)
+    fn default_limit() -> Self::Limit {
+        MAX_MESSAGE
     }
-
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Error> {
+    fn normalize_limit(limit: Self::Limit) -> Self::Limit {
+        limit.min(MAX_MESSAGE)
+    }
+    fn capacity(limit: &Self::Limit) -> usize {
+        TCP_HEADER_LEN.saturating_add(*limit)
+    }
+    fn parse_prefix(
+        input: &[u8],
+        limit: &Self::Limit,
+    ) -> Result<Option<(Self::Item, usize)>, Error> {
         let Some(&[a, b, c, d]) = input.get(..TCP_HEADER_LEN) else {
-            return Ok(Step::Need);
+            return Ok(None);
         };
         let length = u32::from_be_bytes([a, b, c, d]);
         let n = frame_len(length)?;
-        if n > self.limit {
+        if n > *limit {
             return Err(Error::LengthTooLong(length));
         }
         let total = TCP_HEADER_LEN
             .checked_add(n)
             .ok_or(Error::LengthTooLong(length))?;
-        Ok(match input.get(TCP_HEADER_LEN..total) {
-            Some(bytes) => Step::Item(bytes.to_vec(), total),
-            None => Step::Need,
-        })
+        Ok(input
+            .get(TCP_HEADER_LEN..total)
+            .map(|bytes| (bytes.to_vec(), total)))
     }
 }
 
@@ -2293,7 +2265,7 @@ mod tests {
             }
             let tcp = Frame(m.to_bytes().unwrap()).to_bytes().unwrap();
             for n in 0..tcp.len() {
-                let mut d = Stream::new(Frames::new());
+                let mut d = Stream::new(Frames::<Frame>::new());
                 assert_eq!(d.push(&tcp[..n]), n);
                 assert_eq!(d.next(), None);
                 assert_eq!(d.buffered(), n);
@@ -2330,7 +2302,7 @@ mod tests {
             .iter()
             .flat_map(|m| Frame(m.to_bytes().unwrap()).to_bytes().unwrap())
             .collect();
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         let mut got = Vec::new();
         for b in chunks(&stream, &[1]) {
             assert_eq!(d.push(b), (b).len());
@@ -2356,7 +2328,7 @@ mod tests {
             Some(&Fail::Protocol(Error::ReservedLength(0x8000_0001)))
         );
         // So does a length over the limit, known before the body comes.
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         let over = (MAX_MESSAGE as u32 + 1).to_be_bytes();
         assert_eq!(d.push(&over), over.len());
         assert_eq!(
@@ -2386,7 +2358,7 @@ mod tests {
             .cycle()
             .take(one.len() * count)
             .collect();
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         let mut n = 0;
         pump(&mut d, &stream, |_| n += 1).unwrap();
         finish_stream(&mut d, |_| n += 1).unwrap();
@@ -2409,11 +2381,11 @@ mod tests {
         bytes.extend_from_slice(&(MAX_MESSAGE as u32 + 1).to_be_bytes());
         bytes.extend_from_slice(&[0; 1000]);
         contract::check_decode_with_alloc_limit(
-            Frames::new,
+            Frames::<Frame>::new,
             &bytes,
             2 * (TCP_HEADER_LEN + MAX_MESSAGE),
         );
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Frames::<Frame>::new());
         let mut got = Vec::new();
         assert_eq!(
             pump(&mut stream, &bytes, |m| got.push(m)),
@@ -2424,7 +2396,7 @@ mod tests {
         assert_eq!(stream.push(&one), one.len());
         assert_eq!(stream.buffered(), held);
         assert_eq!(stream.next(), None);
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&[0x80, 0]), 2);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(&[0, 5]), 2);
@@ -2445,7 +2417,7 @@ mod tests {
         )
         .to_bytes()
         .unwrap();
-        let mut d = Stream::new(Frames::new());
+        let mut d = Stream::new(Frames::<Frame>::new());
         let mut count = 0;
         pump(&mut d, &big, |_| count += 1).unwrap();
         pump(&mut d, &big, |_| count += 1).unwrap();
@@ -2686,7 +2658,7 @@ mod tests {
         contract::check_wire::<KdcReqBody>(data);
         contract::check_wire::<MethodData>(data);
         contract::check_decode_with_alloc_limit(
-            Frames::new,
+            Frames::<Frame>::new,
             data,
             2 * (TCP_HEADER_LEN + MAX_MESSAGE),
         );
@@ -2723,7 +2695,7 @@ mod tests {
             read += check_any(&data);
             if let Ok(f) = Frame(data.clone()).to_bytes() {
                 check_any(&f);
-                assert_eq!(decode_all(Frames::new, &f), (vec![data], None));
+                assert_eq!(decode_all(Frames::<Frame>::new, &f), (vec![data], None));
             }
         }
         // Some changed messages still read, so the round trip is tested.
@@ -2732,17 +2704,20 @@ mod tests {
 
     #[test]
     fn codec_frames_bound_input_and_keep_empty_records() {
-        use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire};
+        use fictionet::stdlib::codec::{Fail, Stream, Wire};
         use fictionet::stdlib::test_support::contract;
-        assert_eq!(Frames::new().capacity(), TCP_HEADER_LEN + MAX_MESSAGE);
+        assert_eq!(
+            Frames::<Frame>::new().capacity(),
+            TCP_HEADER_LEN + MAX_MESSAGE
+        );
         let frame = Frame(vec![9; MAX_MESSAGE]);
         let bytes = <Frame as Wire>::to_bytes(&frame).unwrap();
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Frames::<Frame>::new());
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.push(&[0]), 0);
         assert_eq!(stream.next(), Some(Ok(frame.0)));
         contract::check_decode_with_alloc_limit(
-            Frames::new,
+            Frames::<Frame>::new,
             &[0, 0, 0, 0, 0x80, 0, 0, 0],
             2 * (TCP_HEADER_LEN + MAX_MESSAGE),
         );

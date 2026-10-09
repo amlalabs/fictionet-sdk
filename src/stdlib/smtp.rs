@@ -9,8 +9,10 @@
 //! Command lines use the base 512-byte limit; extension-specific increases
 //! and BDAT binary chunk framing are not implemented.
 //!
-//! Run connection bytes through [`Stream<Inputs>`](fictionet::stdlib::codec::Stream).
-//! After accepting DATA and sending a 354 reply, call [`Inputs::start_data`].
+//! A mail [`Service`](fictionet::stdlib::serve::Service) served by
+//! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Inputs`]. After accepting DATA and
+//! sending a 354 reply in `on_item`, call `driver.decoder().start_data()`.
+//! See the SMTP DATA section in `docs/services.md` for a service example.
 //! The next item is the complete unstuffed message. Its terminating dot
 //! returns the reader to commands. Use [`Stream<Replies>`](fictionet::stdlib::codec::Stream)
 //! on the client. Bad commands are error items; overlong lines are skipped.

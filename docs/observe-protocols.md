@@ -82,7 +82,7 @@ can retain a terminal error while reporting it once.
 HTTP/2 uses `observe::http2::Capture` through `register_with_buffer`, with
 `observe::http2::CAPTURE_READ_AHEAD`. Copy `src/observe/http2.rs` to
 customize presentation; it uses only public SDK APIs. It reads frames with
-`stdlib::http2::Frames::for_observation` and header blocks with
+`stdlib::http2::Inputs::for_observation` and header blocks with
 `stdlib::http2::HeaderBlocks::for_observation`, the same frame parser and
 header assembly that strict `Frames` and `Session` use, which notes what
 it cannot read instead of failing. Strict `Frames` and `Session` check

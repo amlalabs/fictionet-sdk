@@ -57,7 +57,7 @@
 //!         ),
 //!         _ => None, // NXDOMAIN: the world stays closed
 //!     })
-//!     .serve(&fcx, attachments)?;
+//!     .start(&fcx, attachments)?;
 //!     Ok(()) // the sites keep running after the world returns
 //! }
 //! ```
@@ -156,7 +156,7 @@
 //! the answer it got. If the real site cannot be reached, the agent gets
 //! `502 Bad Gateway`.
 //!
-//! # What `serve` builds
+//! # What `start` builds
 //!
 #![doc = include_str!("../../docs/diagrams/sites-network.svg")]
 //!
@@ -243,7 +243,7 @@
 //!     for its name on 443 is rejected with `unrecognized_name`.
 //! - **HTTP/1.0, HTTP/1.1 and HTTP/2** on every connection: HTTP/1 with
 //!   [`httpd::Http1`], HTTP/2 with hyper. Over TLS, the
-//!   version is agreed in the handshake (ALPN): `serve` sets the ALPN list
+//!   version is agreed in the handshake (ALPN): `start` sets the ALPN list
 //!   of each config to `h2` and `http/1.1`, so a browser gets HTTP/2 and
 //!   `curl` gets what it asks for. Without TLS, the version is read from the
 //!   first bytes the client sends. HTTP/2 streams run as tasks in the
@@ -253,7 +253,7 @@
 //!   absolute URI in HTTP/1.1), else its `Host` header. A host with no site
 //!   at the address gets `421 Misdirected Request`, unless a site there is
 //!   the [`default_host`](Site::default_host).
-//! - **A [`Target`] on every request.** Before calling a handler, `serve`
+//! - **A [`Target`] on every request.** Before calling a handler, `start`
 //!   puts a `Target` in the request's extensions. Its scheme and port come
 //!   from the connection, not from headers: TLS or not, and the port the
 //!   connection arrived on. Its host comes from the request, the same
@@ -398,10 +398,10 @@
 //! ```
 //! # use fictionet::{Attachments, Cx, Result, stdlib::web};
 //! # fn site_for(_host: &str) -> Option<web::Site> { None }
-//! # fn world(fcx: Cx, attachments: Attachments) -> Result {
+//! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
 //! let events = fcx.events();
 //! events.to_file("/var/lib/fictionet/events.jsonl")?;
-//! web::Sites::new(site_for).serve(&fcx, attachments)?;
+//! web::Sites::new(site_for).start(&fcx, attachments)?;
 //! // At the end of the sample: events.lost() must be zero.
 //! # Ok(())
 //! # }
@@ -487,18 +487,18 @@
 //!
 //! # Changing the network around the sites
 //!
-//! `serve` takes the world's [`Attachments`], so it serves every sandbox
+//! `start` takes the world's [`Attachments`], so it serves every sandbox
 //! that attaches. To change the path between the sandboxes and the sites,
-//! wrap each sandbox before `serve` sees it, with
+//! wrap each sandbox before `start` sees it, with
 //! [`Attachments::map`](fictionet::Attachments::map). Here every sandbox gets a
 //! 200 ms delay each way, in front of everything `Sites` builds:
 //!
 //! ```
 //! # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
 //! # fn site_for(_host: &str) -> Option<web::Site> { None }
-//! # fn world(fcx: Cx, attachments: Attachments) -> Result {
+//! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
 //! let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
-//! web::Sites::new(site_for).serve(&fcx, far)?;
+//! web::Sites::new(site_for).start(&fcx, far)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -597,7 +597,7 @@ impl Sites {
     /// An IPv4 subnet must have a length from 8 to 30. An IPv6 subnet must
     /// have a length from 8 to 126, and lie inside the global unicast
     /// range `2000::/3` or the unique local range `fc00::/7`. Otherwise
-    /// [`serve`](Sites::serve) fails.
+    /// [`start`](Sites::start) fails.
     pub fn subnet(self, subnet: Prefix) -> Sites {
         match subnet.addr {
             IpAddr::V4(_) => Sites { subnet, ..self },
@@ -665,8 +665,8 @@ impl Sites {
     /// returns, until that region is cancelled.
     ///
     /// Fails only if a [`subnet`](Sites::subnet) is not one it can use.
-    pub fn serve(self, fcx: &Cx, attachments: Attachments) -> Result<(), Error> {
-        self.into_net().serve(fcx, attachments)
+    pub fn start(self, fcx: &Cx, attachments: Attachments) -> Result<(), Error> {
+        self.into_net().start(fcx, attachments)
     }
 }
 
@@ -776,7 +776,7 @@ impl Site {
     /// with randomness from `fcx`. To use one config every time, return a
     /// clone of it.
     ///
-    /// `serve` replaces the ALPN list of the returned config with `h2` and
+    /// `start` replaces the ALPN list of the returned config with `h2` and
     /// `http/1.1`, so the config does not need one.
     pub fn tls<F>(self, config_for: F) -> Site
     where

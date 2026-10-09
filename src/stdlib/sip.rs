@@ -198,7 +198,7 @@ pub enum Error {
     Missing(&'static str),
     /// A header's value does not follow its grammar, or a header that may
     /// appear once appears twice. It names the header.
-    Malformed(&'static str),
+    HeaderSyntax(&'static str),
     /// A SIP URI is malformed.
     Uri,
 }
@@ -223,7 +223,7 @@ impl std::fmt::Display for Error {
             Error::ContentLength => f.write_str("bad Content-Length"),
             Error::MissingContentLength => f.write_str("no Content-Length"),
             Error::Missing(name) => write!(f, "no {name} header"),
-            Error::Malformed(name) => write!(f, "malformed {name}"),
+            Error::HeaderSyntax(name) => write!(f, "malformed {name}"),
             Error::Uri => f.write_str("malformed SIP URI"),
         }
     }
@@ -365,7 +365,7 @@ impl Message {
     /// trimmed. Commas inside quoted strings and angle brackets do not
     /// split. RFC 3261 section 7.3.1 makes several headers with one name
     /// the same as one header listing their values. An unclosed quote or
-    /// bracket is [`Error::Malformed`].
+    /// bracket is [`Error::HeaderSyntax`].
     pub fn values(&self, name: &str) -> Result<Vec<&str>, Error> {
         let mut out = Vec::new();
         for h in self.headers_named(name) {
@@ -423,7 +423,7 @@ impl Message {
 
     /// The Via headers' values, top one first. Each says where a request
     /// has been, and where its response goes back. A Via header with no
-    /// value, or with an empty item in its list, is [`Error::Malformed`].
+    /// value, or with an empty item in its list, is [`Error::HeaderSyntax`].
     pub fn vias(&self) -> Result<Vec<Via>, Error> {
         let mut parts = Vec::new();
         for h in self.headers_named("Via") {
@@ -434,12 +434,12 @@ impl Message {
 
     /// The From header: who sent the request.
     pub fn from(&self) -> Result<NameAddr, Error> {
-        NameAddr::read_value(self.single("From")?).map_err(|_| Error::Malformed("From"))
+        NameAddr::read_value(self.single("From")?).map_err(|_| Error::HeaderSyntax("From"))
     }
 
     /// The To header: whom the request is for.
     pub fn to(&self) -> Result<NameAddr, Error> {
-        NameAddr::read_value(self.single("To")?).map_err(|_| Error::Malformed("To"))
+        NameAddr::read_value(self.single("To")?).map_err(|_| Error::HeaderSyntax("To"))
     }
 
     /// The Call-ID, the same in every message of a call: a word, or two
@@ -451,7 +451,7 @@ impl Message {
         let first = words.next().unwrap_or("");
         let second = words.next();
         if !is_word(first) || second.is_some_and(|w| !is_word(w)) || words.next().is_some() {
-            return Err(Error::Malformed("Call-ID"));
+            return Err(Error::HeaderSyntax("Call-ID"));
         }
         Ok(v)
     }
@@ -463,7 +463,7 @@ impl Message {
 
     /// The Contact headers' addresses, or [`Contacts::All`] for `*`. With
     /// no Contact header, the list is empty. A Contact header with no
-    /// value, or with an empty item in its list, is [`Error::Malformed`],
+    /// value, or with an empty item in its list, is [`Error::HeaderSyntax`],
     /// since RFC 3261 gives it at least one and no empty ones.
     pub fn contacts(&self) -> Result<Contacts, Error> {
         let mut parts = Vec::new();
@@ -508,7 +508,7 @@ impl Message {
         let mut found = self.headers_named(name);
         let h = found.next().ok_or(Error::Missing(name))?;
         if found.next().is_some() {
-            return Err(Error::Malformed(name));
+            return Err(Error::HeaderSyntax(name));
         }
         Ok(&h.value)
     }
@@ -1051,7 +1051,7 @@ impl NameAddr {
         if s.len() > MAX_HEAD {
             return Err(Error::TooLong);
         }
-        Self::parse_inner(s).ok_or(Error::Malformed("address"))
+        Self::parse_inner(s).ok_or(Error::HeaderSyntax("address"))
     }
 
     fn parse_inner(s: &str) -> Option<NameAddr> {
@@ -1098,7 +1098,7 @@ impl NameAddr {
     }
 
     fn format_value(&self) -> Result<String, Error> {
-        let bad = Error::Malformed("address");
+        let bad = Error::HeaderSyntax("address");
         if !fits([self.raw_len()]) {
             return Err(Error::TooLong);
         }
@@ -1172,7 +1172,7 @@ pub enum Contacts {
 
 impl Contacts {
     fn from_values(parts: &[&str]) -> Result<Contacts, Error> {
-        let bad = Error::Malformed("Contact");
+        let bad = Error::HeaderSyntax("Contact");
         if parts.contains(&"*") {
             return if parts.len() == 1 {
                 Ok(Contacts::All)
@@ -1202,7 +1202,7 @@ impl Contacts {
     }
 
     fn format_value(&self) -> Result<String, Error> {
-        let bad = Error::Malformed("Contact");
+        let bad = Error::HeaderSyntax("Contact");
         match self {
             Contacts::All => Ok("*".to_string()),
             Contacts::List(list) => {
@@ -1266,7 +1266,7 @@ impl Via {
         if s.len() > MAX_HEAD {
             return Err(Error::TooLong);
         }
-        Self::parse_inner(s).ok_or(Error::Malformed("Via"))
+        Self::parse_inner(s).ok_or(Error::HeaderSyntax("Via"))
     }
 
     fn parse_inner(s: &str) -> Option<Via> {
@@ -1332,7 +1332,7 @@ impl Via {
     }
 
     fn format_value(&self) -> Result<String, Error> {
-        let bad = Error::Malformed("Via");
+        let bad = Error::HeaderSyntax("Via");
         let params = self.params.iter().map(|p| {
             p.name
                 .len()
@@ -1389,7 +1389,7 @@ impl CSeq {
         if s.len() > MAX_HEAD {
             return Err(Error::TooLong);
         }
-        let bad = Error::Malformed("CSeq");
+        let bad = Error::HeaderSyntax("CSeq");
         let s = trim_ws(s);
         let split = s.find([' ', '\t']).ok_or(bad)?;
         let (digits, method) = (&s[..split], trim_ws(&s[split..]));
@@ -1410,7 +1410,7 @@ impl CSeq {
             return Err(Error::TooLong);
         }
         if !is_token(&self.method) || self.seq >= 1 << 31 {
-            return Err(Error::Malformed("CSeq"));
+            return Err(Error::HeaderSyntax("CSeq"));
         }
         let out = format!("{} {}", self.seq, self.method);
         if out.len() > MAX_HEAD {
@@ -1555,12 +1555,12 @@ fn parse_content_length(v: &str) -> Result<usize, Error> {
 }
 
 /// Adds the items of a list header's value to `out`, trimmed. An empty
-/// value or an empty item is [`Error::Malformed`].
+/// value or an empty item is [`Error::HeaderSyntax`].
 fn split_list<'a>(s: &'a str, out: &mut Vec<&'a str>, name: &'static str) -> Result<(), Error> {
     let before = out.len();
     split(s, out, name, true)?;
     if out[before..].iter().any(|i| i.is_empty()) {
-        return Err(Error::Malformed(name));
+        return Err(Error::HeaderSyntax(name));
     }
     Ok(())
 }
@@ -1595,11 +1595,11 @@ fn split<'a>(
     while i < b.len() {
         match b[i] {
             b'"' => {
-                i = quoted_end(b, i).ok_or(Error::Malformed(name))?;
+                i = quoted_end(b, i).ok_or(Error::HeaderSyntax(name))?;
                 continue;
             }
             b'<' => {
-                i += s[i..].find('>').ok_or(Error::Malformed(name))? + 1;
+                i += s[i..].find('>').ok_or(Error::HeaderSyntax(name))? + 1;
                 continue;
             }
             b',' => {
@@ -2148,14 +2148,14 @@ wire_value!(
     /// (`uri;params`). In the second form, everything after the first `;`
     /// is a header parameter, as RFC 3261 section 20 says. A parameter
     /// name given twice, or a `tag` that is not a token, is
-    /// [`Error::Malformed`]. Text over [`MAX_HEAD`] bytes is
+    /// [`Error::HeaderSyntax`]. Text over [`MAX_HEAD`] bytes is
     /// [`Error::TooLong`].
     parse,
     /// The address as a header value: the display name quoted, the URI in
     /// angle brackets, then the parameters. In the display name, quotes,
     /// backslashes and control characters other than tab are escaped with
     /// a backslash. A CR or LF in the display name, a URI that does not
-    /// follow its grammar, or a bad parameter is [`Error::Malformed`].
+    /// follow its grammar, or a bad parameter is [`Error::HeaderSyntax`].
     /// Text over [`MAX_HEAD`] bytes is [`Error::TooLong`].
     write
 );
@@ -2167,7 +2167,7 @@ wire_value!(
     /// [`Error::TooLong`].
     parse,
     /// The value as a Contact header's value, the addresses separated by
-    /// commas. An empty list is [`Error::Malformed`], since it would not
+    /// commas. An empty list is [`Error::HeaderSyntax`], since it would not
     /// read back; leave the header out instead. So is a bad address, or a
     /// `q` or `expires` that does not follow its grammar. More than
     /// [`MAX_VALUES`] addresses is [`Error::TooMany`], and text over
@@ -2180,11 +2180,11 @@ wire_value!(
     /// Reads one Via value. Spaces around the slashes and around the colon
     /// before the port are allowed, as RFC 3261 allows them. A parameter
     /// name given twice, or a `branch`, `ttl`, `maddr`, `received` or
-    /// `rport` that does not follow its grammar, is [`Error::Malformed`].
+    /// `rport` that does not follow its grammar, is [`Error::HeaderSyntax`].
     /// Text over [`MAX_HEAD`] bytes is [`Error::TooLong`].
     parse,
     /// The value as text. A transport that is not a token, a bad host or
-    /// a bad parameter is [`Error::Malformed`]. Text over [`MAX_HEAD`]
+    /// a bad parameter is [`Error::HeaderSyntax`]. Text over [`MAX_HEAD`]
     /// bytes is [`Error::TooLong`].
     write
 );
@@ -2196,7 +2196,7 @@ wire_value!(
     /// Text over [`MAX_HEAD`] bytes is [`Error::TooLong`].
     parse,
     /// The value as text. A method that is not a token, or a sequence
-    /// number of 2^31 or more, is [`Error::Malformed`]. Text over
+    /// number of 2^31 or more, is [`Error::HeaderSyntax`]. Text over
     /// [`MAX_HEAD`] bytes is [`Error::TooLong`].
     write
 );
@@ -2644,7 +2644,7 @@ mod tests {
         ] {
             assert_eq!(
                 NameAddr::parse(bad.as_bytes()),
-                Err(Error::Malformed("address")),
+                Err(Error::HeaderSyntax("address")),
                 "{bad:?}"
             );
         }
@@ -2669,32 +2669,32 @@ mod tests {
         assert_eq!(wire_text(&Contacts::All).unwrap(), "*");
         assert_eq!(
             Contacts::parse("*, <sip:a@b>".as_bytes()),
-            Err(Error::Malformed("Contact"))
+            Err(Error::HeaderSyntax("Contact"))
         );
         // RFC 3261 section 25.1: a Contact holds `*` or at least one address.
         assert_eq!(
             Contacts::parse("".as_bytes()),
-            Err(Error::Malformed("Contact"))
+            Err(Error::HeaderSyntax("Contact"))
         );
         assert_eq!(
             Contacts::parse(" , ".as_bytes()),
-            Err(Error::Malformed("Contact"))
+            Err(Error::HeaderSyntax("Contact"))
         );
         assert_eq!(
             wire_text(&Contacts::List(vec![])),
-            Err(Error::Malformed("Contact"))
+            Err(Error::HeaderSyntax("Contact"))
         );
         let m =
             Message::parse(b"OPTIONS sip:a@b SIP/2.0\r\nm: <sip:a@b>\r\nContact:\r\nl: 0\r\n\r\n")
                 .unwrap();
-        assert_eq!(m.contacts(), Err(Error::Malformed("Contact")));
+        assert_eq!(m.contacts(), Err(Error::HeaderSyntax("Contact")));
         assert_eq!(
             Contacts::parse("<sip:a@b>, junk junk".as_bytes()),
-            Err(Error::Malformed("Contact"))
+            Err(Error::HeaderSyntax("Contact"))
         );
         assert_eq!(
             Contacts::parse("<sip:a@b".as_bytes()),
-            Err(Error::Malformed("Contact"))
+            Err(Error::HeaderSyntax("Contact"))
         );
         let list = Contacts::parse("<sip:a@b>;expires=60, \"C\" <sip:c@d>".as_bytes()).unwrap();
         assert_eq!(
@@ -2738,7 +2738,7 @@ mod tests {
         ] {
             assert_eq!(
                 Via::parse(bad.as_bytes()),
-                Err(Error::Malformed("Via")),
+                Err(Error::HeaderSyntax("Via")),
                 "{bad:?}"
             );
         }
@@ -2765,7 +2765,7 @@ mod tests {
         );
         assert_eq!(
             CSeq::parse(b" 4294967295\t ACK "),
-            Err(Error::Malformed("CSeq"))
+            Err(Error::HeaderSyntax("CSeq"))
         );
         for bad in [
             "",
@@ -2780,7 +2780,7 @@ mod tests {
         ] {
             assert_eq!(
                 CSeq::parse(bad.as_bytes()),
-                Err(Error::Malformed("CSeq")),
+                Err(Error::HeaderSyntax("CSeq")),
                 "{bad:?}"
             );
         }
@@ -2814,7 +2814,7 @@ mod tests {
             })
         );
         message.set_header("CSeq", "4294967296 INVITE");
-        assert_eq!(message.cseq(), Err(Error::Malformed("CSeq")));
+        assert_eq!(message.cseq(), Err(Error::HeaderSyntax("CSeq")));
     }
 
     #[test]
@@ -2833,7 +2833,7 @@ mod tests {
         };
         assert_eq!(
             message.push_value("CSeq", &invalid),
-            Err(Error::Malformed("CSeq"))
+            Err(Error::HeaderSyntax("CSeq"))
         );
         assert_eq!(message, before);
         let mut binary = Message::response(200, "OK");
@@ -2881,7 +2881,7 @@ mod tests {
             assert_eq!(read(good).as_deref(), Ok(good), "{good:?}");
         }
         for bad in ["a,b", "a;b", "a=b", "a@b@c", "x@", "@x", "a#b", "a b"] {
-            assert_eq!(read(bad), Err(Error::Malformed("Call-ID")), "{bad:?}");
+            assert_eq!(read(bad), Err(Error::HeaderSyntax("Call-ID")), "{bad:?}");
         }
     }
 
@@ -3020,15 +3020,15 @@ mod tests {
               CSeq: x\r\nVia: SIP/2.0/UDP h, junk\r\nContact: <sip:a\r\nX: \"\r\nl: 0\r\n\r\n",
         )
         .unwrap();
-        assert_eq!(m.from(), Err(Error::Malformed("From")));
-        assert_eq!(m.to(), Err(Error::Malformed("To")));
-        assert_eq!(m.call_id(), Err(Error::Malformed("Call-ID")));
-        assert_eq!(m.cseq(), Err(Error::Malformed("CSeq")));
-        assert_eq!(m.vias(), Err(Error::Malformed("Via")));
-        assert_eq!(m.contacts(), Err(Error::Malformed("Contact")));
+        assert_eq!(m.from(), Err(Error::HeaderSyntax("From")));
+        assert_eq!(m.to(), Err(Error::HeaderSyntax("To")));
+        assert_eq!(m.call_id(), Err(Error::HeaderSyntax("Call-ID")));
+        assert_eq!(m.cseq(), Err(Error::HeaderSyntax("CSeq")));
+        assert_eq!(m.vias(), Err(Error::HeaderSyntax("Via")));
+        assert_eq!(m.contacts(), Err(Error::HeaderSyntax("Contact")));
         assert_eq!(
             m.values("X"),
-            Err(Error::Malformed("comma-separated value"))
+            Err(Error::HeaderSyntax("comma-separated value"))
         );
         assert_eq!(m.values("absent"), Ok(vec![]));
     }
@@ -3789,7 +3789,7 @@ mod tests {
         ] {
             assert_eq!(
                 Contacts::parse(format!("<sip:a@b>;{bad}").as_bytes()),
-                Err(Error::Malformed("Contact")),
+                Err(Error::HeaderSyntax("Contact")),
                 "{bad:?}"
             );
         }
@@ -3818,7 +3818,7 @@ mod tests {
         c.params.push(Param::new("q", Some("2.0")));
         assert_eq!(
             wire_text(&Contacts::List(vec![c])),
-            Err(Error::Malformed("Contact"))
+            Err(Error::HeaderSyntax("Contact"))
         );
         let mut v = Via::new("UDP", "h");
         v.params.push(Param::new("received", Some("garbage")));
@@ -3915,11 +3915,11 @@ mod tests {
                 seq: 1 << 31,
                 method: "INVITE".into()
             }),
-            Err(Error::Malformed("CSeq"))
+            Err(Error::HeaderSyntax("CSeq"))
         );
         assert_eq!(
             CSeq::parse(b"2147483648 INVITE"),
-            Err(Error::Malformed("CSeq"))
+            Err(Error::HeaderSyntax("CSeq"))
         );
         let mut message = Message::request("INVITE", "sip:a@b");
         message.push_header("CSeq", "2147483648 INVITE");
@@ -3931,11 +3931,11 @@ mod tests {
         // RFC 3261 section 25.1: Contact and Via lists have no empty items.
         assert_eq!(
             Contacts::parse(",*,".as_bytes()),
-            Err(Error::Malformed("Contact"))
+            Err(Error::HeaderSyntax("Contact"))
         );
         assert_eq!(
             Contacts::parse("<sip:a@b>,,".as_bytes()),
-            Err(Error::Malformed("Contact"))
+            Err(Error::HeaderSyntax("Contact"))
         );
         assert_eq!(
             Contacts::parse("<sip:a@b>, <sip:c@d>".as_bytes()),
@@ -3946,13 +3946,13 @@ mod tests {
         );
         let m =
             Message::parse(b"OPTIONS sip:a@b SIP/2.0\r\nm: ,*\r\nVia:\r\nl: 0\r\n\r\n").unwrap();
-        assert_eq!(m.contacts(), Err(Error::Malformed("Contact")));
-        assert_eq!(m.vias(), Err(Error::Malformed("Via")));
+        assert_eq!(m.contacts(), Err(Error::HeaderSyntax("Contact")));
+        assert_eq!(m.vias(), Err(Error::HeaderSyntax("Via")));
         let m = Message::parse(
             b"OPTIONS sip:a@b SIP/2.0\r\nVia: SIP/2.0/UDP a,,SIP/2.0/UDP b\r\nl: 0\r\n\r\n",
         )
         .unwrap();
-        assert_eq!(m.vias(), Err(Error::Malformed("Via")));
+        assert_eq!(m.vias(), Err(Error::HeaderSyntax("Via")));
     }
 
     #[test]

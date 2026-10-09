@@ -3,9 +3,9 @@
 #![no_main]
 
 use fictionet::stdlib::asn1::Rules;
-use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+use fictionet::stdlib::codec::{Frames, Stream, Wire, finish, pump};
 use fictionet::stdlib::kerberos::{
-    EncryptedData, Error, Frame, Frames, KdcReqBody, MAX_MESSAGE, Message, MethodData, Ticket,
+    EncryptedData, Error, Frame, KdcReqBody, MAX_MESSAGE, Message, MethodData, Ticket,
 };
 use fictionet::stdlib::test_support::contract;
 use libfuzzer_sys::fuzz_target;
@@ -39,12 +39,12 @@ fn round_trip(b: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
+    contract::check_decode(Frames::<Frame>::new, data);
     contract::check_wire::<Message>(data);
     contract::check_wire::<Frame>(data);
     contract::check_wire_value(&Frame(data.get(..MAX_MESSAGE + 1).unwrap_or(data).to_vec()));
 
-    let mut stream = Stream::new(Frames::new());
+    let mut stream = Stream::new(Frames::<Frame>::new());
     let _ = pump(&mut stream, data, |record| round_trip(&record));
     let _ = finish(&mut stream, |record| round_trip(&record));
     contract::check_wire::<Ticket>(data);
@@ -57,7 +57,7 @@ fuzz_target!(|data: &[u8]| {
 
     let frame = Frame(data.to_vec());
     if let Ok(bytes) = frame.to_bytes() {
-        contract::check_decode(Frames::new, &bytes);
+        contract::check_decode(Frames::<Frame>::new, &bytes);
         assert_eq!(Frame::parse(&bytes), Ok(frame));
     }
 });
