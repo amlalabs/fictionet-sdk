@@ -124,7 +124,7 @@ impl Service for SpawningSvc {
         &mut self,
         _: Result<Vec<u8>, LineError>,
         _: &(),
-        driver: &mut Driver<'_>,
+        driver: &mut Driver<'_, Self::Decoder>,
     ) -> Result<Flow, Self::Error> {
         driver.defer(SpawnWork(self.0.clone()));
         Ok(Flow::Close)
@@ -149,7 +149,7 @@ fn finishing_a_connection_cancels_and_joins_its_spawned_work() {
             let conn = listener.accept(&fcx).await?;
             let info = fictionet::events::ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
             let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            serve::serve(
+            serve::connection(
                 &fcx,
                 conn,
                 info,
