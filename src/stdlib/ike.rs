@@ -1530,6 +1530,10 @@ fictionet::codec_from!(Error, Truncated, |_| Error::Short);
 
 #[cfg(test)]
 mod tests {
+    fn fixture_body_other(kind: u8, data: Vec<u8>) -> Body {
+        Body::Other { kind, data }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
@@ -1692,29 +1696,17 @@ mod tests {
     #[test]
     fn payload_chain_errors() {
         // The header names a payload, and there is none.
-        assert_eq!(
-            Message::parse(&raw(payload::NONCE, &[])),
-            Err(Error::PayloadLength(payload::NONCE))
-        );
-        // A payload length below 4, and past the end.
-        assert_eq!(
-            Message::parse(&raw(payload::NONCE, &[0, 0, 0, 3])),
-            Err(Error::PayloadLength(payload::NONCE))
-        );
-        assert_eq!(
-            Message::parse(&raw(payload::NONCE, &[0, 0, 0, 9, 1])),
-            Err(Error::PayloadLength(payload::NONCE))
-        );
-        // Bytes after the last payload.
-        assert_eq!(
-            Message::parse(&raw(payload::NONCE, &[0, 0, 0, 5, 1, 9])),
-            Err(Error::Trailing)
-        );
-        // Bytes after an SK payload, whose next field names what is inside.
-        assert_eq!(
-            Message::parse(&raw(payload::SK, &[payload::IDI, 0, 0, 5, 1, 9])),
-            Err(Error::Trailing)
-        );
+        fictionet::assert_cases! {
+            Message::parse;
+            (&raw(payload::NONCE, &[])) => Err(Error::PayloadLength(payload::NONCE)),
+            // A payload length below 4, and past the end.
+            (&raw(payload::NONCE, &[0, 0, 0, 3])) => Err(Error::PayloadLength(payload::NONCE)),
+            (&raw(payload::NONCE, &[0, 0, 0, 9, 1])) => Err(Error::PayloadLength(payload::NONCE)),
+            // Bytes after the last payload.
+            (&raw(payload::NONCE, &[0, 0, 0, 5, 1, 9])) => Err(Error::Trailing),
+            // Bytes after an SK payload, whose next field names what is inside.
+            (&raw(payload::SK, &[payload::IDI, 0, 0, 5, 1, 9])) => Err(Error::Trailing),
+        }
         // Too many payloads.
         let chain: Vec<u8> = (0..=MAX_PAYLOADS)
             .flat_map(|_| [payload::VENDOR_ID, 0, 0, 4])
@@ -1987,15 +1979,9 @@ mod tests {
             ])),
             Payload {
                 critical: true,
-                body: Body::Other {
-                    kind: 200,
-                    data: vec![7],
-                },
+                body: fixture_body_other(200, vec![7]),
             },
-            Payload::new(Body::Other {
-                kind: payload::AUTH,
-                data: vec![2, 0, 0, 0, 0xaa],
-            }),
+            Payload::new(fixture_body_other(payload::AUTH, vec![2, 0, 0, 0, 0xaa])),
             Payload::new(Body::Encrypted(Encrypted {
                 first_payload: payload::IDI,
                 data: vec![0x55; 40],
@@ -2114,14 +2100,8 @@ mod tests {
     #[test]
     fn writers_refuse_invalid_values() {
         let m = message(vec![
-            Payload::new(Body::Other {
-                kind: payload::SA,
-                data: vec![1],
-            }),
-            Payload::new(Body::Other {
-                kind: 0,
-                data: vec![1],
-            }),
+            Payload::new(fixture_body_other(payload::SA, vec![1])),
+            Payload::new(fixture_body_other(0, vec![1])),
             Payload::new(Body::Nonce(vec![1; 16])),
             Payload::new(Body::Encrypted(Encrypted {
                 first_payload: 0,
@@ -2357,18 +2337,12 @@ mod tests {
         // A known type marked critical is not unsupported.
         let m = message(vec![Payload {
             critical: true,
-            body: Body::Other {
-                kind: payload::CP,
-                data: vec![],
-            },
+            body: fixture_body_other(payload::CP, vec![]),
         }]);
         assert_eq!(m.unsupported_critical(), None);
         let m = message(vec![Payload {
             critical: false,
-            body: Body::Other {
-                kind: 100,
-                data: vec![],
-            },
+            body: fixture_body_other(100, vec![]),
         }]);
         assert_eq!(m.unsupported_critical(), None);
     }

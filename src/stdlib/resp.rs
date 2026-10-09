@@ -1829,6 +1829,10 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_value_verbatim(format: [u8; 3], text: Vec<u8>) -> Value {
+        Value::Verbatim { format, text }
+    }
+
     use super::harness::wire_same;
     use super::*;
     use codec::{Lcg, Step as Decoded, Stream};
@@ -2138,10 +2142,7 @@ mod tests {
             one(VALID[27]),
             Value::BulkError(b"SYNTAX invalid syntax".to_vec())
         );
-        let verbatim = Value::Verbatim {
-            format: *b"txt",
-            text: b"Some string".to_vec(),
-        };
+        let verbatim = fixture_value_verbatim(*b"txt", b"Some string".to_vec());
         assert_eq!(one(VALID[28]), verbatim);
         assert_eq!(
             one(VALID[29]),
@@ -2232,10 +2233,7 @@ mod tests {
                 VALID[27],
             ),
             (
-                Value::Verbatim {
-                    format: *b"txt",
-                    text: b"Some string".to_vec(),
-                },
+                fixture_value_verbatim(*b"txt", b"Some string".to_vec()),
                 b"$11\r\nSome string\r\n",
                 VALID[28],
             ),
@@ -2312,10 +2310,7 @@ mod tests {
             Value::Double(1.23),
             Value::BigNumber("12".into()),
             Value::BulkError(b"ERR example".to_vec()),
-            Value::Verbatim {
-                format: *b"txt",
-                text: b"example".to_vec(),
-            },
+            fixture_value_verbatim(*b"txt", b"example".to_vec()),
             Value::Map(vec![(s("a"), Value::Integer(1))]),
             Value::Set(vec![Value::Integer(1)]),
             Value::Push(vec![s("a")]),
@@ -2358,10 +2353,7 @@ mod tests {
             Value::BulkError(vec![b'x'; MAX_LINE_LEN + 1]),
             Value::error("x\ry"),
             Value::BigNumber("1".repeat(MAX_BULK_LEN + 1)),
-            Value::Verbatim {
-                format: *b"txt",
-                text: vec![0; MAX_BULK_LEN + 1],
-            },
+            fixture_value_verbatim(*b"txt", vec![0; MAX_BULK_LEN + 1]),
             deep,
             Value::Map(vec![(Value::Null, Value::Null); MAX_ELEMENTS / 2 + 1]),
             Value::Push(vec![Value::Null; MAX_ELEMENTS + 1]),
@@ -2683,10 +2675,7 @@ mod tests {
             deep,
             Value::Bulk(vec![0; MAX_BULK_LEN + 1]),
             Value::BulkError(vec![0; MAX_BULK_LEN + 1]),
-            Value::Verbatim {
-                format: *b"txt",
-                text: vec![0; MAX_BULK_LEN - 3],
-            },
+            fixture_value_verbatim(*b"txt", vec![0; MAX_BULK_LEN - 3]),
             Value::Array(vec![Value::Null; MAX_ELEMENTS + 1]),
             Value::Set(vec![Value::Null; MAX_ELEMENTS + 1]),
             Value::Map(vec![(Value::Null, Value::Null); MAX_ELEMENTS + 1]),
@@ -2741,10 +2730,7 @@ mod tests {
             6 => Value::Double([0.0, -1.5, 1e300, 1e-300, f64::INFINITY, 0.1][r.index(6)]),
             7 => Value::BigNumber(format!("{}{}", ["", "-", "+"][r.index(3)], r.next())),
             8 => Value::BulkError(r.bytes(12)),
-            9 => Value::Verbatim {
-                format: *b"mkd",
-                text: r.bytes(12),
-            },
+            9 => fixture_value_verbatim(*b"mkd", r.bytes(12)),
             10 => Value::Array(
                 (0..r.index(4))
                     .map(|_| random(r, depth + 1, resp2))
@@ -2993,22 +2979,16 @@ mod tests {
             line: 10,
             ..Limits::DEFAULT
         };
-        assert_eq!(
-            command_step(b"0123456789\n", lim),
-            Ok(Decoded::Item(Command::new(["0123456789"]), 11))
-        );
-        assert_eq!(
-            command_step(b"0123456789\r\n", lim),
-            Ok(Decoded::Item(Command::new(["0123456789"]), 12))
-        );
-        assert_eq!(command_step(b"0123456789\r", lim), Ok(Decoded::Need));
-        assert_eq!(command_step(b"01234567890", lim), Err(Error::LineTooLong));
-        assert_eq!(command_step(b"0123456789x", lim), Err(Error::LineTooLong));
-        assert_eq!(command_step(b"01234567890\n", lim), Err(Error::LineTooLong));
-        assert_eq!(
-            command_step(b"01234567890\r\n", lim),
-            Err(Error::LineTooLong)
-        );
+        fictionet::assert_cases! {
+            command_step;
+            (b"0123456789\n", lim) => Ok(Decoded::Item(Command::new(["0123456789"]), 11)),
+            (b"0123456789\r\n", lim) => Ok(Decoded::Item(Command::new(["0123456789"]), 12)),
+            (b"0123456789\r", lim) => Ok(Decoded::Need),
+            (b"01234567890", lim) => Err(Error::LineTooLong),
+            (b"0123456789x", lim) => Err(Error::LineTooLong),
+            (b"01234567890\n", lim) => Err(Error::LineTooLong),
+            (b"01234567890\r\n", lim) => Err(Error::LineTooLong),
+        }
     }
 
     /// An inline argument is held to the bulk limit, like an argument in

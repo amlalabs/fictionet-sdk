@@ -2702,6 +2702,16 @@ fn show_tag(t: u8) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_frontend_message_cancel_request(
+        process_id: u32,
+        secret_key: Vec<u8>,
+    ) -> FrontendMessage {
+        FrontendMessage::CancelRequest {
+            process_id,
+            secret_key,
+        }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
@@ -2824,17 +2834,11 @@ mod tests {
         let cancel = [
             0, 0, 0, 16, 0x04, 0xd2, 0x16, 0x2e, 0, 0, 0x10, 0x92, 1, 2, 3, 4,
         ];
-        let m = FrontendMessage::CancelRequest {
-            process_id: 4242,
-            secret_key: vec![1, 2, 3, 4],
-        };
+        let m = fixture_frontend_message_cancel_request(4242, vec![1, 2, 3, 4]);
         assert_eq!(FrontendMessage::parse(&cancel), Ok(m.clone()));
         assert_eq!(m.to_bytes().unwrap(), cancel);
         // A protocol 3.2 key of 32 bytes.
-        let long = FrontendMessage::CancelRequest {
-            process_id: 1,
-            secret_key: vec![9; 32],
-        };
+        let long = fixture_frontend_message_cancel_request(1, vec![9; 32]);
         assert_eq!(
             FrontendMessage::parse(&long.to_bytes().unwrap()).unwrap(),
             long
@@ -3088,19 +3092,16 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(Password::parse(&body), Ok(Password("md5abc".into())));
-        assert_eq!(
-            Password::parse(b"pw"),
-            Err(Error::UnterminatedString {
-                tag: frontend_tag::AUTH_RESPONSE
-            })
-        );
-        assert_eq!(
-            Password::parse(b"pw\0x"),
-            Err(Error::TrailingBytes {
-                tag: frontend_tag::AUTH_RESPONSE
-            })
-        );
+        fictionet::assert_cases! {
+            Password::parse;
+            (&body) => Ok(Password("md5abc".into())),
+            (b"pw") => Err(Error::UnterminatedString {
+                tag: frontend_tag::AUTH_RESPONSE,
+            }),
+            (b"pw\0x") => Err(Error::TrailingBytes {
+                tag: frontend_tag::AUTH_RESPONSE,
+            }),
+        }
         for data in [None, Some(vec![]), Some(b"n,,n=,r=abc".to_vec())] {
             let sasl = SaslInitialResponse {
                 mechanism: "SCRAM-SHA-256".into(),
@@ -3186,47 +3187,24 @@ mod tests {
             FrontendMessages::new().decode(&[0x16], false),
             Err(FrameError::DirectTls)
         );
-        assert_eq!(
-            FrontendMessage::parse(&[0, 0, 0, 7]),
-            Err(Error::BadLength(7))
-        );
-        assert_eq!(
-            FrontendMessage::parse(&[0, 0, 0x27, 0x15]),
-            Err(Error::TooLong {
+        fictionet::assert_cases! {
+            FrontendMessage::parse;
+            (&[0, 0, 0, 7]) => Err(Error::BadLength(7)),
+            (&[0, 0, 0x27, 0x15]) => Err(Error::TooLong {
                 length: 10_005,
-                max: MAX_STARTUP + 4
-            })
-        );
-        assert_eq!(
-            FrontendMessage::parse(&[0, 0, 0x27, 0x14]),
-            Err(Error::Incomplete)
-        );
-        // Protocol 2.0, refused as soon as its version arrives.
-        assert_eq!(
-            FrontendMessage::parse(&[0, 0, 0, 9, 0, 2, 0, 0]),
-            Err(Error::UnsupportedProtocol(0x2_0000))
-        );
-        assert_eq!(
-            FrontendMessage::parse(&startup_with(0x04d2_0000, b"\0")),
-            Err(Error::UnsupportedProtocol(0x04d2_0000))
-        );
-        // Requests with bytes they should not have.
-        assert_eq!(
-            FrontendMessage::parse(&startup_with(SSL_REQUEST_CODE, b"x")),
-            Err(Error::TrailingBytes { tag: 0 })
-        );
-        assert_eq!(
-            FrontendMessage::parse(&startup_with(GSSENC_REQUEST_CODE, b"x")),
-            Err(Error::TrailingBytes { tag: 0 })
-        );
-        assert_eq!(
-            FrontendMessage::parse(&startup_with(CANCEL_REQUEST_CODE, b"\0\0")),
-            Err(Error::Truncated { tag: 0 })
-        );
-        assert_eq!(
-            FrontendMessage::parse(&startup_with(CANCEL_REQUEST_CODE, &[0, 0, 0, 1])),
-            Err(Error::BadKeyLength { tag: 0, length: 0 })
-        );
+                max: MAX_STARTUP + 4,
+            }),
+            (&[0, 0, 0x27, 0x14]) => Err(Error::Incomplete),
+            // Protocol 2.0, refused as soon as its version arrives.
+            (&[0, 0, 0, 9, 0, 2, 0, 0]) => Err(Error::UnsupportedProtocol(0x2_0000)),
+            (&startup_with(0x04d2_0000, b"\0")) => Err(Error::UnsupportedProtocol(0x04d2_0000)),
+            // Requests with bytes they should not have.
+            (&startup_with(SSL_REQUEST_CODE, b"x")) => Err(Error::TrailingBytes { tag: 0 }),
+            (&startup_with(GSSENC_REQUEST_CODE, b"x")) => Err(Error::TrailingBytes { tag: 0 }),
+            (&startup_with(CANCEL_REQUEST_CODE, b"\0\0")) => Err(Error::Truncated { tag: 0 }),
+            (&startup_with(CANCEL_REQUEST_CODE, &[0, 0, 0, 1])) =>
+                Err(Error::BadKeyLength { tag: 0, length: 0 }),
+        }
         let mut long = vec![0, 0, 0, 1];
         long.extend_from_slice(&[5; 257]);
         assert_eq!(
@@ -3239,26 +3217,14 @@ mod tests {
         // Parameters with no terminator, no value, bytes after it, or bad
         // text.
         let v3 = PROTOCOL_3_0;
-        assert_eq!(
-            FrontendMessage::parse(&startup_with(v3, b"")),
-            Err(Error::UnterminatedString { tag: 0 })
-        );
-        assert_eq!(
-            FrontendMessage::parse(&startup_with(v3, b"user\0")),
-            Err(Error::UnterminatedString { tag: 0 })
-        );
-        assert_eq!(
-            FrontendMessage::parse(&startup_with(v3, b"user\0a\0")),
-            Err(Error::UnterminatedString { tag: 0 })
-        );
-        assert_eq!(
-            FrontendMessage::parse(&startup_with(v3, b"user\0a\0\0x")),
-            Err(Error::TrailingBytes { tag: 0 })
-        );
-        assert_eq!(
-            FrontendMessage::parse(&startup_with(v3, b"user\0\xff\0\0")),
-            Err(Error::NotUtf8 { tag: 0 })
-        );
+        fictionet::assert_cases! {
+            FrontendMessage::parse;
+            (&startup_with(v3, b"")) => Err(Error::UnterminatedString { tag: 0 }),
+            (&startup_with(v3, b"user\0")) => Err(Error::UnterminatedString { tag: 0 }),
+            (&startup_with(v3, b"user\0a\0")) => Err(Error::UnterminatedString { tag: 0 }),
+            (&startup_with(v3, b"user\0a\0\0x")) => Err(Error::TrailingBytes { tag: 0 }),
+            (&startup_with(v3, b"user\0\xff\0\0")) => Err(Error::NotUtf8 { tag: 0 }),
+        }
         assert!(FrontendMessage::parse(&startup_with(v3, b"user\0a\0\0")).is_ok());
     }
 
@@ -3279,27 +3245,21 @@ mod tests {
             Err(Error::BadLength(0))
         );
         // Small messages are capped at 10000, as PostgreSQL does.
-        assert_eq!(
-            FrontendMessage::parse(b"S\0\0\x27\x11"),
-            Err(Error::TooLong {
+        fictionet::assert_cases! {
+            FrontendMessage::parse;
+            (b"S\0\0\x27\x11") => Err(Error::TooLong {
                 length: 10_001,
-                max: SMALL_MESSAGE
-            })
-        );
-        assert_eq!(
-            FrontendMessage::parse(b"p\0\x01\0\0"),
-            Err(Error::TooLong {
+                max: SMALL_MESSAGE,
+            }),
+            (b"p\0\x01\0\0") => Err(Error::TooLong {
                 length: 65_536,
-                max: MAX_AUTH_MESSAGE
-            })
-        );
-        assert_eq!(
-            FrontendMessage::parse(b"Q\x40\0\0\0"),
-            Err(Error::TooLong {
+                max: MAX_AUTH_MESSAGE,
+            }),
+            (b"Q\x40\0\0\0") => Err(Error::TooLong {
                 length: 0x4000_0000,
-                max: MAX_MESSAGE
-            })
-        );
+                max: MAX_MESSAGE,
+            }),
+        }
         assert_eq!(
             BackendMessage::parse(b"D\xff\xff\xff\xff"),
             Err(Error::TooLong {
@@ -3313,119 +3273,68 @@ mod tests {
         );
 
         let f = |tag, body: &[u8]| FrontendMessage::parse(&typed(tag, body));
-        assert_eq!(
-            f(b'Q', b"abc"),
-            Err(Error::UnterminatedString { tag: b'Q' })
-        );
-        assert_eq!(f(b'Q', b"a\0b"), Err(Error::TrailingBytes { tag: b'Q' }));
-        assert_eq!(f(b'Q', b"\xc3\0"), Err(Error::NotUtf8 { tag: b'Q' }));
-        assert_eq!(f(b'S', b"x"), Err(Error::TrailingBytes { tag: b'S' }));
-        assert_eq!(
-            f(b'C', b"X\0"),
-            Err(Error::BadTarget {
+        fictionet::assert_cases! {
+            f;
+            (b'Q', b"abc") => Err(Error::UnterminatedString { tag: b'Q' }),
+            (b'Q', b"a\0b") => Err(Error::TrailingBytes { tag: b'Q' }),
+            (b'Q', b"\xc3\0") => Err(Error::NotUtf8 { tag: b'Q' }),
+            (b'S', b"x") => Err(Error::TrailingBytes { tag: b'S' }),
+            (b'C', b"X\0") => Err(Error::BadTarget {
                 tag: b'C',
-                target: b'X'
-            })
-        );
-        assert_eq!(f(b'D', b""), Err(Error::Truncated { tag: b'D' }));
-        assert_eq!(f(b'E', b"\0\0\0"), Err(Error::Truncated { tag: b'E' }));
-        assert_eq!(
-            f(b'P', b"\0q\0\0\x02\0\0\0\x17"),
-            Err(Error::Truncated { tag: b'P' })
-        );
-        // Bind: a format code of 2, a length of -2, and two formats for
-        // three values.
-        assert_eq!(
-            f(b'B', b"\0\0\0\x01\0\x02\0\0\0\0"),
-            Err(Error::BadFormat { tag: b'B', code: 2 })
-        );
-        assert_eq!(
-            f(b'B', b"\0\0\0\0\0\x01\xff\xff\xff\xfe\0\0"),
-            Err(Error::BadValueLength {
+                target: b'X',
+            }),
+            (b'D', b"") => Err(Error::Truncated { tag: b'D' }),
+            (b'E', b"\0\0\0") => Err(Error::Truncated { tag: b'E' }),
+            (b'P', b"\0q\0\0\x02\0\0\0\x17") => Err(Error::Truncated { tag: b'P' }),
+            // Bind: a format code of 2, a length of -2, and two formats for
+            // three values.
+            (b'B', b"\0\0\0\x01\0\x02\0\0\0\0") => Err(Error::BadFormat { tag: b'B', code: 2 }),
+            (b'B', b"\0\0\0\0\0\x01\xff\xff\xff\xfe\0\0") => Err(Error::BadValueLength {
                 tag: b'B',
-                length: -2
-            })
-        );
+                length: -2,
+            }),
+        }
         let mut three = b"\0\0\0\x02\0\0\0\x01\0\x03".to_vec();
         three.extend_from_slice(&[0xff; 12]);
         three.extend_from_slice(&[0, 0]);
-        assert_eq!(f(b'B', &three), Err(Error::FormatCount { tag: b'B' }));
-        assert_eq!(
-            f(b'B', b"\0\0\0\0\0\x01\0\0\0\x05ab\0\0"),
-            Err(Error::Truncated { tag: b'B' })
-        );
-        assert_eq!(
-            f(b'F', b"\0\0\0\x01\0\x02\0\0\0\0\0\0\0\0"),
-            Err(Error::FormatCount { tag: b'F' })
-        );
-        assert_eq!(
-            f(b'F', b"\0\0\0\x01\0\0\0\0\0\x07"),
-            Err(Error::BadFormat { tag: b'F', code: 7 })
-        );
+        fictionet::assert_cases! {
+            f;
+            (b'B', &three) => Err(Error::FormatCount { tag: b'B' }),
+            (b'B', b"\0\0\0\0\0\x01\0\0\0\x05ab\0\0") => Err(Error::Truncated { tag: b'B' }),
+            (b'F', b"\0\0\0\x01\0\x02\0\0\0\0\0\0\0\0") => Err(Error::FormatCount { tag: b'F' }),
+            (b'F', b"\0\0\0\x01\0\0\0\0\0\x07") => Err(Error::BadFormat { tag: b'F', code: 7 }),
+        }
 
         let g = |tag, body: &[u8]| BackendMessage::parse(&typed(tag, body));
-        assert_eq!(
-            g(b'R', b"\0\0\0\x06"),
-            Err(Error::BadAuth { tag: b'R', code: 6 })
-        );
-        assert_eq!(
-            g(b'R', b"\0\0\0\x05ab"),
-            Err(Error::Truncated { tag: b'R' })
-        );
-        assert_eq!(
-            g(b'R', b"\0\0\0\x0aSCRAM\0"),
-            Err(Error::UnterminatedString { tag: b'R' })
-        );
-        assert_eq!(
-            g(b'R', b"\0\0\0\0x"),
-            Err(Error::TrailingBytes { tag: b'R' })
-        );
-        assert_eq!(
-            g(b'K', b"\0\0\0\x01"),
-            Err(Error::BadKeyLength {
+        fictionet::assert_cases! {
+            g;
+            (b'R', b"\0\0\0\x06") => Err(Error::BadAuth { tag: b'R', code: 6 }),
+            (b'R', b"\0\0\0\x05ab") => Err(Error::Truncated { tag: b'R' }),
+            (b'R', b"\0\0\0\x0aSCRAM\0") => Err(Error::UnterminatedString { tag: b'R' }),
+            (b'R', b"\0\0\0\0x") => Err(Error::TrailingBytes { tag: b'R' }),
+            (b'K', b"\0\0\0\x01") => Err(Error::BadKeyLength {
                 tag: b'K',
-                length: 0
-            })
-        );
-        assert_eq!(
-            g(b'K', &[0; 261]),
-            Err(Error::BadKeyLength {
+                length: 0,
+            }),
+            (b'K', &[0; 261]) => Err(Error::BadKeyLength {
                 tag: b'K',
-                length: 257
-            })
-        );
-        assert_eq!(g(b'Z', b""), Err(Error::Truncated { tag: b'Z' }));
-        assert_eq!(
-            g(b'G', b"\x02\0\0"),
-            Err(Error::BadFormat { tag: b'G', code: 2 })
-        );
-        assert_eq!(
-            g(
+                length: 257,
+            }),
+            (b'Z', b"") => Err(Error::Truncated { tag: b'Z' }),
+            (b'G', b"\x02\0\0") => Err(Error::BadFormat { tag: b'G', code: 2 }),
+            (
                 b'T',
-                b"\0\x01a\0\0\0\0\0\0\0\0\0\0\x17\0\x04\xff\xff\xff\xff\0\x05"
-            ),
-            Err(Error::BadFormat { tag: b'T', code: 5 })
-        );
-        assert_eq!(g(b'E', b"SERROR\0"), Err(Error::Truncated { tag: b'E' }));
-        assert_eq!(
-            g(b'D', b"\0\x01\xff\xff\xff\xf0"),
-            Err(Error::BadValueLength {
+                b"\0\x01a\0\0\0\0\0\0\0\0\0\0\x17\0\x04\xff\xff\xff\xff\0\x05",
+            ) => Err(Error::BadFormat { tag: b'T', code: 5 }),
+            (b'E', b"SERROR\0") => Err(Error::Truncated { tag: b'E' }),
+            (b'D', b"\0\x01\xff\xff\xff\xf0") => Err(Error::BadValueLength {
                 tag: b'D',
-                length: -16
-            })
-        );
-        assert_eq!(
-            g(b'v', b"\0\0\0\0\0\0\0\x01"),
-            Err(Error::UnterminatedString { tag: b'v' })
-        );
-        assert_eq!(
-            g(b'v', b"\0\0\0\0\xff\xff\xff\xff"),
-            Err(Error::TooManyItems { tag: b'v' })
-        );
-        assert_eq!(
-            g(b't', b"\0\x02\0\0\0\x17"),
-            Err(Error::Truncated { tag: b't' })
-        );
+                length: -16,
+            }),
+            (b'v', b"\0\0\0\0\0\0\0\x01") => Err(Error::UnterminatedString { tag: b'v' }),
+            (b'v', b"\0\0\0\0\xff\xff\xff\xff") => Err(Error::TooManyItems { tag: b'v' }),
+            (b't', b"\0\x02\0\0\0\x17") => Err(Error::Truncated { tag: b't' }),
+        }
     }
 
     #[test]
@@ -3760,10 +3669,7 @@ mod tests {
         assert_eq!(stream.decoder().phase(), Phase::Closed);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.unread(), b"Q\0\0\0\x05\0");
-        let cancel = FrontendMessage::CancelRequest {
-            process_id: 1,
-            secret_key: vec![1; 4],
-        };
+        let cancel = fixture_frontend_message_cancel_request(1, vec![1; 4]);
         let mut input = cancel.to_bytes().unwrap();
         input.extend_from_slice(b"junk");
         let mut stream = Stream::new(FrontendMessages::default());
@@ -4030,14 +3936,8 @@ mod tests {
                     .map(|i| (format!("p{i}"), "v".repeat(10)))
                     .collect(),
             }),
-            FrontendMessage::CancelRequest {
-                process_id: 0,
-                secret_key: vec![],
-            },
-            FrontendMessage::CancelRequest {
-                process_id: 0,
-                secret_key: vec![1; 300],
-            },
+            fixture_frontend_message_cancel_request(0, vec![]),
+            fixture_frontend_message_cancel_request(0, vec![1; 300]),
             FrontendMessage::Bind(Bind {
                 param_formats: vec![Format::Binary, Format::Text],
                 params: vec![None; 3],
@@ -4203,10 +4103,7 @@ mod tests {
             FrontendMessage::Startup(Startup::new("u", "d")),
             FrontendMessage::SslRequest,
             FrontendMessage::GssEncRequest,
-            FrontendMessage::CancelRequest {
-                process_id: 9,
-                secret_key: vec![1; 32],
-            },
+            fixture_frontend_message_cancel_request(9, vec![1; 32]),
             FrontendMessage::Close {
                 target: Target::Portal,
                 name: "p".into(),
@@ -4438,10 +4335,7 @@ mod tests {
             }),
             1 => FrontendMessage::SslRequest,
             2 => FrontendMessage::GssEncRequest,
-            3 => FrontendMessage::CancelRequest {
-                process_id: rng.next() as u32,
-                secret_key: rng.bytes(300),
-            },
+            3 => fixture_frontend_message_cancel_request(rng.next() as u32, rng.bytes(300)),
             4 => {
                 let params = list(rng, random_value);
                 let param_formats = match rng.index(3) {

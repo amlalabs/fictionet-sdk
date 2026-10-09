@@ -1481,6 +1481,10 @@ fn addr(b: &[u8], i: usize) -> Ipv6Addr {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_dhcp_option_other(code: u16, data: Vec<u8>) -> DhcpOption {
+        DhcpOption::Other { code, data }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
@@ -1736,10 +1740,7 @@ mod tests {
             DhcpOption::InformationRefreshTime(86400),
             DhcpOption::SolMaxRt(3600),
             DhcpOption::InfMaxRt(3600),
-            DhcpOption::Other {
-                code: 39,
-                data: vec![0, 4, b'h', b'o', b's', b't'],
-            },
+            fixture_dhcp_option_other(39, vec![0, 4, b'h', b'o', b's', b't']),
         ];
         let mut m = Message::new(msg::REPLY, 0xffffff);
         m.options = options;
@@ -2174,14 +2175,8 @@ mod tests {
                 prefix: Ipv6Addr::UNSPECIFIED,
                 options: vec![],
             }),
-            DhcpOption::Other {
-                code: opt::PREFERENCE,
-                data: vec![1, 2, 3],
-            },
-            DhcpOption::Other {
-                code: opt::ELAPSED_TIME,
-                data: vec![0, 5],
-            },
+            fixture_dhcp_option_other(opt::PREFERENCE, vec![1, 2, 3]),
+            fixture_dhcp_option_other(opt::ELAPSED_TIME, vec![0, 5]),
             DhcpOption::DomainList(vec![
                 "ok.example".into(),
                 "bad..name".into(),
@@ -2189,10 +2184,7 @@ mod tests {
                 "a.".into(),
             ]),
             DhcpOption::UserClass(vec![vec![0; 70000], b"kept".to_vec()]),
-            DhcpOption::Other {
-                code: 1000,
-                data: vec![0; 70000],
-            },
+            fixture_dhcp_option_other(1000, vec![0; 70000]),
             DhcpOption::RelayMessage(vec![0; MAX_MESSAGE]),
         ];
         assert!(m.to_bytes().is_err());
@@ -2240,10 +2232,8 @@ mod tests {
 
         // A relay whose inner message does not fit is refused.
         let mut huge = Message::new(msg::SOLICIT, 0);
-        huge.options.push(DhcpOption::Other {
-            code: 1000,
-            data: vec![0; MAX_MESSAGE - 8],
-        });
+        huge.options
+            .push(fixture_dhcp_option_other(1000, vec![0; MAX_MESSAGE - 8]));
         assert_eq!(huge.to_bytes().unwrap().len(), MAX_MESSAGE);
         let forw =
             Message::relay_forward(&huge, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED).unwrap();
@@ -2339,10 +2329,7 @@ mod tests {
             24 => DhcpOption::SolMaxRt(r.next() as u32),
             25 => DhcpOption::InfMaxRt(r.next() as u32),
             // Other options, some with known codes and any body.
-            _ => DhcpOption::Other {
-                code: r.index(30) as u16,
-                data: r.bytes(30),
-            },
+            _ => fixture_dhcp_option_other(r.index(30) as u16, r.bytes(30)),
         }
     }
 
@@ -2463,10 +2450,10 @@ mod tests {
         let m = Message::parse(&bytes).unwrap();
         assert_eq!(
             m.options,
-            [DhcpOption::Other {
-                code: opt::DOMAIN_LIST,
-                data: vec![1, b'.', 0]
-            }]
+            [fixture_dhcp_option_other(
+                opt::DOMAIN_LIST,
+                vec![1, b'.', 0]
+            )]
         );
         assert_eq!(m.to_bytes().unwrap(), bytes);
     }
@@ -2548,10 +2535,8 @@ mod tests {
     #[test]
     fn writer_refuses_relays_that_do_not_fit() {
         let mut huge = Message::new(msg::SOLICIT, 0);
-        huge.options.push(DhcpOption::Other {
-            code: 1000,
-            data: vec![0; MAX_MESSAGE - 8],
-        });
+        huge.options
+            .push(fixture_dhcp_option_other(1000, vec![0; MAX_MESSAGE - 8]));
         assert!(huge.to_bytes().is_ok());
         let forw =
             Message::relay_forward(&huge, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED).unwrap();

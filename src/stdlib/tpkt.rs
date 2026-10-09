@@ -423,6 +423,10 @@ mod codec_tests {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_header(reserved: u8, length: u16) -> Header {
+        Header { reserved, length }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream};
@@ -438,21 +442,12 @@ mod tests {
         let packet = Packet::new(vec![2, 0xf0, 0x80]);
         assert_eq!(Packet::parse_prefix(&bytes), Ok(Some((packet.clone(), 7))));
         assert_eq!(packet.to_bytes().unwrap(), bytes);
-        assert_eq!(
-            packet.header(),
-            Ok(Header {
-                reserved: 0,
-                length: 7
-            })
-        );
+        assert_eq!(packet.header(), Ok(fixture_header(0, 7)));
     }
 
     #[test]
     fn header_fields() {
-        let h = Header {
-            reserved: 9,
-            length: 0x1234,
-        };
+        let h = fixture_header(9, 0x1234);
         assert_eq!(h.to_bytes(), Ok(vec![3, 9, 0x12, 0x34]));
         assert_eq!(
             Header::parse(&h.to_bytes().unwrap(), MAX_PACKET),
@@ -467,22 +462,12 @@ mod tests {
             };
             assert_eq!(h.to_bytes(), Err(Error::PayloadTooShort(h.payload_len())));
         }
-        let h = Header {
-            reserved: 0,
-            length: MIN_PACKET as u16,
-        };
+        let h = fixture_header(0, MIN_PACKET as u16);
         assert_eq!(
             Header::parse(&h.to_bytes().unwrap(), MAX_PACKET),
             Ok(Some(h))
         );
-        assert_eq!(
-            Header {
-                reserved: 0,
-                length: 2
-            }
-            .payload_len(),
-            0
-        );
+        assert_eq!(fixture_header(0, 2).payload_len(), 0);
         // The reserved byte is kept, not checked.
         let (p, _) = Packet::parse_prefix(&[3, 0xff, 0, 7, 1, 2, 3])
             .unwrap()
@@ -661,10 +646,7 @@ mod tests {
                 );
             }
             // Any header a writer takes reads back the same.
-            let h = Header {
-                reserved: rng.next() as u8,
-                length: rng.next() as u16,
-            };
+            let h = fixture_header(rng.next() as u8, rng.next() as u16);
             match h.to_bytes() {
                 Ok(b) => assert_eq!(Header::parse(&b, MAX_PACKET), Ok(Some(h))),
                 Err(e) => {

@@ -1730,6 +1730,42 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_context(
+        id: u16,
+        abstract_syntax: SyntaxId,
+        transfer_syntaxes: Vec<SyntaxId>,
+    ) -> Context {
+        Context {
+            id,
+            abstract_syntax,
+            transfer_syntaxes,
+        }
+    }
+    fn fixture_body_response(
+        alloc_hint: u32,
+        context_id: u16,
+        cancel_count: u8,
+        stub: Vec<u8>,
+    ) -> Body {
+        Body::Response {
+            alloc_hint,
+            context_id,
+            cancel_count,
+            stub,
+        }
+    }
+    fn fixture_bind_nak(reason: u16, versions: Vec<(u8, u8)>) -> BindNak {
+        BindNak { reason, versions }
+    }
+    fn fixture_auth(kind: u8, level: u8, context_id: u32, value: Vec<u8>) -> Auth {
+        Auth {
+            kind,
+            level,
+            context_id,
+            value,
+        }
+    }
+
     use super::harness::rewrite;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
@@ -1758,11 +1794,7 @@ mod tests {
                 max_xmit_frag: 5840,
                 max_recv_frag: 5840,
                 assoc_group: 0,
-                contexts: vec![Context {
-                    id: 0,
-                    abstract_syntax: EPMAPPER,
-                    transfer_syntaxes: vec![NDR],
-                }],
+                contexts: vec![fixture_context(0, EPMAPPER, vec![NDR])],
             }),
         )
     }
@@ -1808,15 +1840,7 @@ mod tests {
                     stub: vec![9; 5],
                 },
             ),
-            Pdu::new(
-                9,
-                Body::Response {
-                    alloc_hint: 4,
-                    context_id: 1,
-                    cancel_count: 0,
-                    stub: vec![0, 0, 0, 0],
-                },
-            ),
+            Pdu::new(9, fixture_body_response(4, 1, 0, vec![0, 0, 0, 0])),
             Pdu::new(
                 10,
                 Body::Fault {
@@ -1840,25 +1864,19 @@ mod tests {
             ),
             Pdu::new(
                 1,
-                Body::BindNak(BindNak {
-                    reason: reject::PROTOCOL_VERSION_NOT_SUPPORTED,
-                    versions: vec![(5, 0)],
-                }),
+                Body::BindNak(fixture_bind_nak(
+                    reject::PROTOCOL_VERSION_NOT_SUPPORTED,
+                    vec![(5, 0)],
+                )),
             ),
-            Pdu::new(
-                1,
-                Body::BindNak(BindNak {
-                    reason: 0,
-                    versions: vec![],
-                }),
-            ),
+            Pdu::new(1, Body::BindNak(fixture_bind_nak(0, vec![]))),
             Pdu {
-                auth: Some(Auth {
-                    kind: auth_type::WINNT,
-                    level: auth_level::CONNECT,
-                    context_id: 0,
-                    value: vec![1; 9],
-                }),
+                auth: Some(fixture_auth(
+                    auth_type::WINNT,
+                    auth_level::CONNECT,
+                    0,
+                    vec![1; 9],
+                )),
                 ..Pdu::new(1, Body::Auth3)
             },
             Pdu::new(1, Body::Shutdown),
@@ -1925,12 +1943,12 @@ mod tests {
                     continue;
                 }
                 let mut authenticated = pdu.clone();
-                authenticated.auth = Some(Auth {
-                    kind: auth_type::WINNT,
-                    level: auth_level::PKT_PRIVACY,
-                    context_id: 3,
-                    value: vec![0xaa; 16],
-                });
+                authenticated.auth = Some(fixture_auth(
+                    auth_type::WINNT,
+                    auth_level::PKT_PRIVACY,
+                    3,
+                    vec![0xaa; 16],
+                ));
                 let bytes = Wire::to_bytes(&authenticated).unwrap();
                 assert!(bytes.len() <= MAX_FRAG);
                 contract::check_wire::<Pdu>(&bytes);
@@ -1952,12 +1970,12 @@ mod tests {
             if matches!(p.body, Body::BindNak(_) | Body::Shutdown) {
                 continue;
             }
-            p.auth = Some(Auth {
-                kind: auth_type::WINNT,
-                level: auth_level::PKT_PRIVACY,
-                context_id: 3,
-                value: vec![0xaa; 16],
-            });
+            p.auth = Some(fixture_auth(
+                auth_type::WINNT,
+                auth_level::PKT_PRIVACY,
+                3,
+                vec![0xaa; 16],
+            ));
             let bytes = contract::check_written(&p);
             for n in 0..bytes.len() {
                 assert_eq!(Pdu::parse(&bytes[..n]), Err(Error::Incomplete));
@@ -1974,11 +1992,7 @@ mod tests {
             major: 3,
             minor: 1,
         };
-        let context = |s| Context {
-            id: 0,
-            abstract_syntax: s,
-            transfer_syntaxes: vec![],
-        };
+        let context = |s| fixture_context(0, s, vec![]);
         let mut p = Pdu::new(
             1,
             Body::Bind(Bind {
@@ -2088,12 +2102,12 @@ mod tests {
     #[test]
     fn auth_trailer_and_padding() {
         let mut p = request(vec![1, 2, 3]);
-        p.auth = Some(Auth {
-            kind: auth_type::GSS_NEGOTIATE,
-            level: auth_level::PKT_INTEGRITY,
-            context_id: 0,
-            value: vec![7; 16],
-        });
+        p.auth = Some(fixture_auth(
+            auth_type::GSS_NEGOTIATE,
+            auth_level::PKT_INTEGRITY,
+            0,
+            vec![7; 16],
+        ));
         let b = contract::check_written(&p);
         // Stub of 3 padded to 16, then the trailer and the 16-byte token.
         assert_eq!(b.len(), 24 + 16 + 8 + 16);
@@ -2101,47 +2115,33 @@ mod tests {
         assert_eq!(b[40..44], [9, 5, 13, 0]);
         // A bind's trailer is aligned to 4 from the PDU's start.
         let mut p = bind();
-        p.auth = Some(Auth {
-            kind: auth_type::WINNT,
-            level: auth_level::CONNECT,
-            context_id: 0,
-            value: vec![1; 40],
-        });
+        p.auth = Some(fixture_auth(
+            auth_type::WINNT,
+            auth_level::CONNECT,
+            0,
+            vec![1; 40],
+        ));
         let b = contract::check_written(&p);
         assert_eq!(b.len(), 72 + 8 + 40);
         assert_eq!(b[74], 0);
         // Auth3 carries 4 bytes of padding before the trailer.
         let mut p = Pdu::new(3, Body::Auth3);
-        p.auth = Some(Auth {
-            kind: 0x0a,
-            level: 2,
-            context_id: 0,
-            value: vec![1, 2],
-        });
+        p.auth = Some(fixture_auth(0x0a, 2, 0, vec![1, 2]));
         let b = contract::check_written(&p);
         assert_eq!(b.len(), 20 + 8 + 2);
     }
 
     #[test]
     fn header_errors_break_the_stream() {
-        assert_eq!(
-            Pdu::parse(&[4, 0]),
-            Err(Error::Version { major: 4, minor: 0 })
-        );
-        assert_eq!(
-            Pdu::parse(&[5, 2]),
-            Err(Error::Version { major: 5, minor: 2 })
-        );
-        assert_eq!(Pdu::parse(&[5]), Err(Error::Incomplete));
-        assert_eq!(Pdu::parse(&[5, 0, 0, 3, 0x20]), Err(Error::IntegerRep(2)));
-        assert_eq!(
-            Pdu::parse(&[5, 0, 0, 3, 0x10, 0, 0, 0, 15, 0]),
-            Err(Error::FragLength(15))
-        );
-        assert_eq!(
-            Pdu::parse(&[5, 0, 0, 3, 0x00, 0, 0, 0, 0, 15]),
-            Err(Error::FragLength(15))
-        );
+        fictionet::assert_cases! {
+            Pdu::parse;
+            (&[4, 0]) => Err(Error::Version { major: 4, minor: 0 }),
+            (&[5, 2]) => Err(Error::Version { major: 5, minor: 2 }),
+            (&[5]) => Err(Error::Incomplete),
+            (&[5, 0, 0, 3, 0x20]) => Err(Error::IntegerRep(2)),
+            (&[5, 0, 0, 3, 0x10, 0, 0, 0, 15, 0]) => Err(Error::FragLength(15)),
+            (&[5, 0, 0, 3, 0x00, 0, 0, 0, 0, 15]) => Err(Error::FragLength(15)),
+        }
         for e in [
             Error::Version { major: 4, minor: 0 },
             Error::IntegerRep(2),
@@ -2202,10 +2202,7 @@ mod tests {
         // A bind_nak that stops after its reason.
         assert_eq!(
             Pdu::parse(&header(13, 18, 0)).unwrap().body,
-            Body::BindNak(BindNak {
-                reason: 0,
-                versions: vec![]
-            })
+            Body::BindNak(fixture_bind_nak(0, vec![]))
         );
         for e in [
             Error::Type(1),
@@ -2230,20 +2227,10 @@ mod tests {
         p.flags |= flags::OBJECT_UUID;
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let mut p = request(vec![]);
-        p.auth = Some(Auth {
-            kind: 9,
-            level: 6,
-            context_id: 0,
-            value: vec![],
-        });
+        p.auth = Some(fixture_auth(9, 6, 0, vec![]));
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let mut p = request(vec![]);
-        p.auth = Some(Auth {
-            kind: 9,
-            level: 6,
-            context_id: 0,
-            value: vec![0; 65536],
-        });
+        p.auth = Some(fixture_auth(9, 6, 0, vec![0; 65536]));
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         assert_eq!(
             request(vec![0; MAX_FRAG]).to_bytes(),
@@ -2264,34 +2251,17 @@ mod tests {
             Pdu::new(1, Body::Bind(b.clone())).to_bytes(),
             Err(Error::Unwritable)
         );
-        b.contexts = vec![
-            Context {
-                id: 0,
-                abstract_syntax: NDR,
-                transfer_syntaxes: vec![]
-            };
-            256
-        ];
+        b.contexts = vec![fixture_context(0, NDR, vec![]); 256];
         assert_eq!(
             Pdu::new(1, Body::Bind(b.clone())).to_bytes(),
             Err(Error::Unwritable)
         );
-        b.contexts = vec![
-            Context {
-                id: 0,
-                abstract_syntax: NDR,
-                transfer_syntaxes: vec![NDR; 255]
-            };
-            255
-        ];
+        b.contexts = vec![fixture_context(0, NDR, vec![NDR; 255]); 255];
         assert_eq!(
             Pdu::new(1, Body::Bind(b)).to_bytes(),
             Err(Error::Unwritable)
         );
-        let nak = BindNak {
-            reason: 0,
-            versions: vec![(5, 0); 256],
-        };
+        let nak = fixture_bind_nak(0, vec![(5, 0); 256]);
         assert_eq!(
             Pdu::new(1, Body::BindNak(nak)).to_bytes(),
             Err(Error::Unwritable)
@@ -2346,23 +2316,10 @@ mod tests {
         // Too small for the header, and a PDU with a verifier.
         assert_eq!(request(vec![1]).fragments(24), Err(Error::Unwritable));
         let mut p = request(vec![1]);
-        p.auth = Some(Auth {
-            kind: 9,
-            level: 6,
-            context_id: 0,
-            value: vec![1],
-        });
+        p.auth = Some(fixture_auth(9, 6, 0, vec![1]));
         assert_eq!(p.fragments(1000), Err(Error::Unwritable));
         // Responses with an object-less header split too.
-        let resp = Pdu::new(
-            4,
-            Body::Response {
-                alloc_hint: 9,
-                context_id: 1,
-                cancel_count: 0,
-                stub: vec![5; 9],
-            },
-        );
+        let resp = Pdu::new(4, fixture_body_response(9, 1, 0, vec![5; 9]));
         let parts = resp.fragments(28).unwrap();
         assert_eq!(parts.len(), 3);
         let mut r = Reassembler::new(100);
@@ -2428,15 +2385,7 @@ mod tests {
         assert_eq!(r.push(parts[0].clone()), Ok(None));
         let resp = Pdu {
             flags: 0,
-            ..Pdu::new(
-                7,
-                Body::Response {
-                    alloc_hint: 0,
-                    context_id: 0,
-                    cancel_count: 0,
-                    stub: vec![],
-                },
-            )
+            ..Pdu::new(7, fixture_body_response(0, 0, 0, vec![]))
         };
         assert_eq!(r.push(resp), Err(Error::UnexpectedFragment { call_id: 7 }));
         // Over the limit, at the first fragment and later.
@@ -2597,15 +2546,7 @@ mod tests {
 
     #[test]
     fn reassembly_keeps_a_later_cancel() {
-        let resp = Pdu::new(
-            4,
-            Body::Response {
-                alloc_hint: 0,
-                context_id: 1,
-                cancel_count: 0,
-                stub: vec![5; 9],
-            },
-        );
+        let resp = Pdu::new(4, fixture_body_response(0, 1, 0, vec![5; 9]));
         let mut parts = resp.fragments(28).unwrap();
         assert_eq!(parts.len(), 3);
         parts[2].flags |= flags::PENDING_CANCEL;
@@ -2653,13 +2594,7 @@ mod tests {
         b[10] = 1;
         assert_eq!(Pdu::parse(&b), Err(Error::Truncated));
         // C706 12.6.4.5 and 12.6.4.11: a bind_nak or shutdown has none.
-        for body in [
-            Body::Shutdown,
-            Body::BindNak(BindNak {
-                reason: 0,
-                versions: vec![],
-            }),
-        ] {
+        for body in [Body::Shutdown, Body::BindNak(fixture_bind_nak(0, vec![]))] {
             let mut p = Pdu::new(1, body);
             let plain = p.to_bytes().unwrap();
             p.auth = Some(auth(0));
@@ -2828,12 +2763,7 @@ mod tests {
             if matches!(p.body, Body::BindNak(_) | Body::Shutdown) {
                 continue;
             }
-            p.auth = Some(Auth {
-                kind: 9,
-                level: 6,
-                context_id: 1,
-                value: vec![1, 2, 3],
-            });
+            p.auth = Some(fixture_auth(9, 6, 1, vec![1, 2, 3]));
             samples.push(p.to_bytes().unwrap());
             p.drep = DataRep::BIG_ENDIAN;
             samples.push(p.to_bytes().unwrap());

@@ -2344,6 +2344,10 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_message(seq: u8, payload: Vec<u8>) -> Message {
+        Message { seq, payload }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
@@ -2744,19 +2748,13 @@ mod tests {
         );
         assert_eq!(ok.message(0, 0), Err(Error::Unwritable));
         let without_status = OkPacket { status: 0, ..ok };
-        assert_eq!(
-            OkPacket::parse(&without_status.message(0, 0).unwrap().payload, 0),
-            Ok(without_status)
-        );
-        // Errors.
-        assert_eq!(
-            OkPacket::parse(&[0x01, 0, 0], CAPS41),
-            Err(Error::Header(1))
-        );
-        assert_eq!(
-            OkPacket::parse(&[0x00, 0xfb, 0], CAPS41),
-            Err(Error::LengthPrefix(0xfb))
-        );
+        fictionet::assert_cases! {
+            OkPacket::parse;
+            (&without_status.message(0, 0).unwrap().payload, 0) => Ok(without_status),
+            // Errors.
+            (&[0x01, 0, 0], CAPS41) => Err(Error::Header(1)),
+            (&[0x00, 0xfb, 0], CAPS41) => Err(Error::LengthPrefix(0xfb)),
+        }
         // Long info is written whole.
         let big = OkPacket {
             info: vec![b'x'; 0x1_0010],
@@ -2839,12 +2837,9 @@ mod tests {
             Command::Query(b"select @@version_comment limit 1".to_vec())
         );
         assert_eq!(
-            Message {
-                seq: 0,
-                payload: c.message(0, CAPS41).unwrap().payload
-            }
-            .to_bytes()
-            .unwrap(),
+            fixture_message(0, c.message(0, CAPS41).unwrap().payload)
+                .to_bytes()
+                .unwrap(),
             bytes
         );
         // With query attributes and none sent.
@@ -2893,20 +2888,14 @@ mod tests {
             assert_eq!(Command::parse(&p, CAPS41), Ok(c.clone()));
             prefixes(&p, |b| Command::parse(b, CAPS41));
         }
-        assert_eq!(Command::parse(&[], CAPS41), Err(Error::Truncated));
-        assert_eq!(
-            Command::parse(&[command::STMT_CLOSE, 1, 2], CAPS41),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            Command::parse(&[command::FIELD_LIST, b't'], CAPS41),
-            Err(Error::Truncated)
-        );
-        // Bytes after fixed fields are ignored.
-        assert_eq!(
-            Command::parse(&[command::PING, 9, 9], CAPS41),
-            Ok(Command::Ping)
-        );
+        fictionet::assert_cases! {
+            Command::parse;
+            (&[], CAPS41) => Err(Error::Truncated),
+            (&[command::STMT_CLOSE, 1, 2], CAPS41) => Err(Error::Truncated),
+            (&[command::FIELD_LIST, b't'], CAPS41) => Err(Error::Truncated),
+            // Bytes after fixed fields are ignored.
+            (&[command::PING, 9, 9], CAPS41) => Ok(Command::Ping),
+        }
     }
 
     #[test]
@@ -3207,13 +3196,7 @@ mod tests {
         assert_eq!(stream.push(&[1, 0, 0, 0]), 4);
         assert_eq!(stream.next(), None);
         assert_eq!(stream.push(b"x"), 1);
-        assert_eq!(
-            stream.next(),
-            Some(Ok(Message {
-                seq: 0,
-                payload: b"x".to_vec()
-            }))
-        );
+        assert_eq!(stream.next(), Some(Ok(fixture_message(0, b"x".to_vec()))));
     }
 
     #[test]
@@ -3232,10 +3215,7 @@ mod tests {
 
     #[test]
     fn split_packets() {
-        let message = Message {
-            seq: 254,
-            payload: (0..MAX_PACKET_PAYLOAD + 1).map(|i| i as u8).collect(),
-        };
+        let message = fixture_message(254, (0..MAX_PACKET_PAYLOAD + 1).map(|i| i as u8).collect());
         assert_eq!(message.packets(), 2);
         assert_eq!(message.next_seq(), 0);
         let bytes = message.to_bytes().unwrap();
@@ -3247,10 +3227,7 @@ mod tests {
         );
         assert_eq!(Message::parse(&bytes), Ok(message.clone()));
         assert_eq!(decode_all(Messages::new, &bytes), (vec![message], None));
-        let full = Message {
-            seq: 3,
-            payload: vec![9; MAX_PACKET_PAYLOAD],
-        };
+        let full = fixture_message(3, vec![9; MAX_PACKET_PAYLOAD]);
         let bytes = full.to_bytes().unwrap();
         assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 4]);
         assert_eq!(full.next_seq(), 5);
@@ -3292,14 +3269,8 @@ mod tests {
         );
         assert_eq!(Messages::with_limit(usize::MAX).limit(), MAX_MESSAGE);
         let messages = vec![
-            Message {
-                seq: 0,
-                payload: vec![],
-            },
-            Message {
-                seq: 1,
-                payload: b"abc".to_vec(),
-            },
+            fixture_message(0, vec![]),
+            fixture_message(1, b"abc".to_vec()),
         ];
         let mut bytes = Vec::new();
         for message in &messages {
@@ -3357,10 +3328,7 @@ mod tests {
             &bytes,
             2 * (16 + HEADER_LEN),
         );
-        let message = Message {
-            seq: 0,
-            payload: vec![7; MAX_PACKET_PAYLOAD + 10],
-        };
+        let message = fixture_message(0, vec![7; MAX_PACKET_PAYLOAD + 10]);
         assert_eq!(
             decode_all(
                 || Messages::with_limit(MAX_PACKET_PAYLOAD + 10),
@@ -3372,10 +3340,7 @@ mod tests {
 
     #[test]
     fn writers_refuse_messages_over_the_limit() {
-        let message = Message {
-            seq: 0,
-            payload: vec![0; MAX_MESSAGE + 1],
-        };
+        let message = fixture_message(0, vec![0; MAX_MESSAGE + 1]);
         assert_eq!(message.to_bytes(), Err(Error::Unwritable));
         assert_eq!(
             message.packets(),
@@ -3439,18 +3404,12 @@ mod tests {
         // Ending after the warnings is allowed, as libmysql allows it.
         let ok = OkPacket::parse(&hex("00 00 00 00 40 00 00"), caps).unwrap();
         assert_eq!(ok.status, status::SESSION_STATE_CHANGED);
-        assert_eq!(
-            OkPacket::parse(&ok.message(0, caps).unwrap().payload, caps),
-            Ok(ok)
-        );
-        assert_eq!(
-            OkPacket::parse(&hex("00 00 00 00 40 00 00 00 00 aa"), caps),
-            Err(Error::Trailing)
-        );
-        assert_eq!(
-            OkPacket::parse(&hex("00 00 00 02 00 00 00 00 aa"), caps),
-            Err(Error::Trailing)
-        );
+        fictionet::assert_cases! {
+            OkPacket::parse;
+            (&ok.message(0, caps).unwrap().payload, caps) => Ok(ok),
+            (&hex("00 00 00 00 40 00 00 00 00 aa"), caps) => Err(Error::Trailing),
+            (&hex("00 00 00 02 00 00 00 00 aa"), caps) => Err(Error::Trailing),
+        }
     }
 
     #[test]
@@ -3556,18 +3515,12 @@ mod tests {
     #[test]
     fn query_parameter_set_count_must_be_one() {
         let caps = CAPS41 | capability::QUERY_ATTRIBUTES;
-        assert_eq!(
-            Command::parse(&hex("03 00 00 53 45 4c 45 43 54 20 31"), caps),
-            Err(Error::Value(0))
-        );
-        assert_eq!(
-            Command::parse(&hex("03 00 02 53"), caps),
-            Err(Error::Value(2))
-        );
-        assert_eq!(
-            Command::parse(&hex("03 00 01 53"), caps),
-            Ok(Command::Query(b"S".to_vec()))
-        );
+        fictionet::assert_cases! {
+            Command::parse;
+            (&hex("03 00 00 53 45 4c 45 43 54 20 31"), caps) => Err(Error::Value(0)),
+            (&hex("03 00 02 53"), caps) => Err(Error::Value(2)),
+            (&hex("03 00 01 53"), caps) => Ok(Command::Query(b"S".to_vec())),
+        }
     }
 
     #[test]

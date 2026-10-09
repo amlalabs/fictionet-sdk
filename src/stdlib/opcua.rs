@@ -3562,6 +3562,38 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_node_id(namespace: u16, identifier: Identifier) -> NodeId {
+        NodeId {
+            namespace,
+            identifier,
+        }
+    }
+    fn fixture_qualified_name(namespace: u16, name: String) -> QualifiedName {
+        QualifiedName { namespace, name }
+    }
+    fn fixture_variant_array(
+        type_id: u8,
+        values: Vec<Value>,
+        dimensions: Option<Vec<i32>>,
+    ) -> Variant {
+        Variant::Array {
+            type_id,
+            values,
+            dimensions,
+        }
+    }
+    fn fixture_limits(
+        receive_buffer_size: u32,
+        max_message_size: u32,
+        max_chunk_count: u32,
+    ) -> Limits {
+        Limits {
+            receive_buffer_size,
+            max_message_size,
+            max_chunk_count,
+        }
+    }
+
     use super::harness::check_reader;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
@@ -3703,15 +3735,9 @@ mod tests {
             Ok(NodeId::numeric(0, 72))
         );
         // Guid and opaque forms.
-        let g = NodeId {
-            namespace: 2,
-            identifier: Identifier::Guid(Guid::default()),
-        };
+        let g = fixture_node_id(2, Identifier::Guid(Guid::default()));
         assert_eq!(<NodeId as Wire>::parse(&Wire::to_bytes(&g).unwrap()), Ok(g));
-        let o = NodeId {
-            namespace: 2,
-            identifier: Identifier::Opaque(vec![1, 2, 3]),
-        };
+        let o = fixture_node_id(2, Identifier::Opaque(vec![1, 2, 3]));
         assert_eq!(<NodeId as Wire>::parse(&Wire::to_bytes(&o).unwrap()), Ok(o));
         // A null string identifier reads as empty.
         assert_eq!(
@@ -3763,10 +3789,7 @@ mod tests {
 
     #[test]
     fn names_and_texts() {
-        let q = QualifiedName {
-            namespace: 2,
-            name: "Pump".into(),
-        };
+        let q = fixture_qualified_name(2, "Pump".into());
         assert_eq!(
             Wire::to_bytes(&q).unwrap(),
             [2, 0, 4, 0, 0, 0, b'P', b'u', b'm', b'p']
@@ -3829,11 +3852,11 @@ mod tests {
         );
         assert_eq!(Wire::to_bytes(&Variant::Null).unwrap(), [0]);
         // A 2 by 2 array of Bytes.
-        let a = Variant::Array {
-            type_id: type_id::BYTE,
-            values: (1..=4).map(Value::Byte).collect(),
-            dimensions: Some(vec![2, 2]),
-        };
+        let a = fixture_variant_array(
+            type_id::BYTE,
+            (1..=4).map(Value::Byte).collect(),
+            Some(vec![2, 2]),
+        );
         let bytes = Wire::to_bytes(&a).unwrap();
         assert_eq!(
             bytes,
@@ -3843,24 +3866,20 @@ mod tests {
         );
         assert_eq!(<Variant as Wire>::parse(&bytes), Ok(a));
         // A null array reads as empty.
-        let empty = Variant::Array {
-            type_id: type_id::STRING,
-            values: vec![],
-            dimensions: None,
-        };
+        let empty = fixture_variant_array(type_id::STRING, vec![], None);
         assert_eq!(
             <Variant as Wire>::parse(&[0x8c, 0xff, 0xff, 0xff, 0xff]),
             Ok(empty)
         );
         // An array of Variants, and every other type, round trip.
-        let every = Variant::Array {
-            type_id: type_id::VARIANT,
-            values: sample_values()
+        let every = fixture_variant_array(
+            type_id::VARIANT,
+            sample_values()
                 .into_iter()
                 .map(|v| Value::Variant(Box::new(Variant::Scalar(v))))
                 .collect(),
-            dimensions: None,
-        };
+            None,
+        );
         let bytes = Wire::to_bytes(&every).unwrap();
         let back: Variant = Wire::parse(&bytes).unwrap();
         assert_eq!(Wire::to_bytes(&back).unwrap(), bytes);
@@ -3967,34 +3986,18 @@ mod tests {
         // Writers refuse what readers refuse.
         let nested = Variant::Scalar(Value::Variant(Box::new(Variant::Null)));
         assert_eq!(Wire::to_bytes(&nested), Err(Error::VariantValue));
-        let mixed = Variant::Array {
-            type_id: 3,
-            values: vec![Value::Byte(1), Value::SByte(1)],
-            dimensions: None,
-        };
+        let mixed = fixture_variant_array(3, vec![Value::Byte(1), Value::SByte(1)], None);
         assert_eq!(Wire::to_bytes(&mixed), Err(Error::VariantValue));
-        let null = Variant::Array {
-            type_id: 0,
-            values: vec![],
-            dimensions: None,
-        };
+        let null = fixture_variant_array(0, vec![], None);
         assert_eq!(Wire::to_bytes(&null), Err(Error::VariantValue));
-        let dims = Variant::Array {
-            type_id: 3,
-            values: vec![Value::Byte(1)],
-            dimensions: Some(vec![2]),
-        };
+        let dims = fixture_variant_array(3, vec![Value::Byte(1)], Some(vec![2]));
         assert_eq!(Wire::to_bytes(&dims), Err(Error::Dimensions));
         let reserved = Variant::Scalar(Value::Reserved {
             type_id: 5,
             bytes: None,
         });
         assert_eq!(Wire::to_bytes(&reserved), Err(Error::VariantValue));
-        let long = Variant::Array {
-            type_id: 3,
-            values: vec![Value::Byte(0); MAX_ARRAY_LEN + 1],
-            dimensions: None,
-        };
+        let long = fixture_variant_array(3, vec![Value::Byte(0); MAX_ARRAY_LEN + 1], None);
         assert_eq!(Wire::to_bytes(&long), Err(Error::TooLong));
     }
 
@@ -4002,11 +4005,7 @@ mod tests {
     fn nest(levels: usize) -> Variant {
         let mut v = Variant::Scalar(Value::Int32(1));
         for _ in 1..levels {
-            v = Variant::Array {
-                type_id: type_id::VARIANT,
-                values: vec![Value::Variant(Box::new(v))],
-                dimensions: None,
-            };
+            v = fixture_variant_array(type_id::VARIANT, vec![Value::Variant(Box::new(v))], None);
         }
         v
     }
@@ -4097,11 +4096,7 @@ mod tests {
                 .unwrap(),
             bytes
         );
-        let ours = Limits {
-            receive_buffer_size: 32768,
-            max_message_size: 1 << 20,
-            max_chunk_count: 64,
-        };
+        let ours = fixture_limits(32768, 1 << 20, 64);
         let ack = h.acknowledge(&ours);
         assert_eq!(
             ack,
@@ -4257,43 +4252,25 @@ mod tests {
     #[test]
     fn chunk_header_errors() {
         let l = Limits::default();
-        assert_eq!(
-            Chunk::parse_prefix(b"GET", &l),
-            Err(Error::MessageType(*b"GET"))
-        );
-        assert_eq!(Chunk::parse_prefix(b"HE", &l), Ok(None));
-        // The fourth byte of a HEL, ACK, ERR or RHE is reserved and ignored.
-        assert_eq!(Chunk::parse_prefix(b"HELC", &l), Ok(None));
-        assert_eq!(
-            Chunk::parse_prefix(b"OPNC", &l),
-            Err(Error::ChunkType(MessageType::Open, b'C'))
-        );
-        assert_eq!(
-            Chunk::parse_prefix(b"CLOA", &l),
-            Err(Error::ChunkType(MessageType::Close, b'A'))
-        );
-        assert_eq!(
-            Chunk::parse_prefix(b"MSGX", &l),
-            Err(Error::ChunkType(MessageType::Message, b'X'))
-        );
-        assert_eq!(
-            Chunk::parse_prefix(b"MSGC\x07\0\0\0", &l),
-            Err(Error::TooSmall(7))
-        );
-        assert_eq!(
-            Chunk::parse_prefix(b"MSGF\x01\x20\0\0", &l),
-            Err(Error::TooLarge {
+        fictionet::assert_cases! {
+            Chunk::parse_prefix;
+            (b"GET", &l) => Err(Error::MessageType(*b"GET")),
+            (b"HE", &l) => Ok(None),
+            // The fourth byte of a HEL, ACK, ERR or RHE is reserved and ignored.
+            (b"HELC", &l) => Ok(None),
+            (b"OPNC", &l) => Err(Error::ChunkType(MessageType::Open, b'C')),
+            (b"CLOA", &l) => Err(Error::ChunkType(MessageType::Close, b'A')),
+            (b"MSGX", &l) => Err(Error::ChunkType(MessageType::Message, b'X')),
+            (b"MSGC\x07\0\0\0", &l) => Err(Error::TooSmall(7)),
+            (b"MSGF\x01\x20\0\0", &l) => Err(Error::TooLarge {
                 size: 8193,
-                limit: MIN_BUFFER_SIZE
-            })
-        );
-        assert_eq!(
-            Chunk::parse_prefix(b"HELF\xff\xff\0\0", &l),
-            Err(Error::TooLarge {
+                limit: MIN_BUFFER_SIZE,
+            }),
+            (b"HELF\xff\xff\0\0", &l) => Err(Error::TooLarge {
                 size: 65535,
-                limit: MAX_HANDSHAKE_SIZE
-            })
-        );
+                limit: MAX_HANDSHAKE_SIZE,
+            }),
+        }
         let big = Limits {
             receive_buffer_size: 65536,
             ..l
@@ -4677,11 +4654,7 @@ mod tests {
 
     #[test]
     fn writers_respect_limits() {
-        let peer = Limits {
-            receive_buffer_size: 8192,
-            max_message_size: 20_000,
-            max_chunk_count: 2,
-        };
+        let peer = fixture_limits(8192, 20_000, 2);
         assert_eq!(
             msg(1, 0, 0, vec![0; 20_001]).chunks(&peer).map(wire_chunks),
             Err(Error::TooLong)
@@ -4697,19 +4670,11 @@ mod tests {
         assert_eq!(d.push(&bytes), bytes.len());
         assert_eq!(d.next(), Some(Ok(ok)));
         // The module's caps apply over what a peer says.
-        let huge = Limits {
-            receive_buffer_size: u32::MAX,
-            max_message_size: u32::MAX,
-            max_chunk_count: u32::MAX,
-        };
+        let huge = fixture_limits(u32::MAX, u32::MAX, u32::MAX);
         assert_eq!(huge.chunk_limit(), MAX_BUFFER_SIZE);
         assert_eq!(huge.message_limit(), MAX_MESSAGE_SIZE);
         assert_eq!(huge.chunk_count_limit(), MAX_CHUNK_COUNT);
-        let tiny = Limits {
-            receive_buffer_size: 1,
-            max_message_size: 0,
-            max_chunk_count: 0,
-        };
+        let tiny = fixture_limits(1, 0, 0);
         assert_eq!(tiny.chunk_limit(), MIN_BUFFER_SIZE);
         let mut w = Writer::new();
         assert_eq!(w.array_len(MAX_ARRAY_LEN + 1), Err(Error::TooLong));
@@ -4731,11 +4696,7 @@ mod tests {
         let ack = hello.acknowledge(&Limits::default());
         assert_eq!(ack.max_message_size, MAX_MESSAGE_SIZE);
         assert_eq!(ack.max_chunk_count, MAX_CHUNK_COUNT);
-        let ours = Limits {
-            receive_buffer_size: 8192,
-            max_message_size: 100,
-            max_chunk_count: 2,
-        };
+        let ours = fixture_limits(8192, 100, 2);
         let ack = hello.acknowledge(&ours);
         assert_eq!((ack.max_message_size, ack.max_chunk_count), (100, 2));
         let mut d = Stream::new(Messages::with_limits(ack.limits()));
@@ -4850,11 +4811,7 @@ mod tests {
     #[test]
     fn array_dimensions_need_two_or_more() {
         // Part 6: ArrayDimensions are only present for 2 or more dimensions.
-        let one = Variant::Array {
-            type_id: 3,
-            values: vec![Value::Byte(1), Value::Byte(2)],
-            dimensions: Some(vec![2]),
-        };
+        let one = fixture_variant_array(3, vec![Value::Byte(1), Value::Byte(2)], Some(vec![2]));
         assert_eq!(Wire::to_bytes(&one), Err(Error::Dimensions));
         let bytes = [0xc3u8, 2, 0, 0, 0, 1, 2, 1, 0, 0, 0, 2, 0, 0, 0];
         assert_eq!(<Variant as Wire>::parse(&bytes), Err(Error::Dimensions));
@@ -4865,15 +4822,13 @@ mod tests {
         // Arrays of 65536 Bytes, inside an array of Variants: each array
         // is within MAX_ARRAY_LEN, but together they pass MAX_VALUES. The
         // outer array's elements and each inner Variant count too.
-        let inner = Variant::Array {
-            type_id: 3,
-            values: vec![Value::Byte(0); MAX_ARRAY_LEN],
-            dimensions: None,
-        };
-        let outer = |n: usize| Variant::Array {
-            type_id: type_id::VARIANT,
-            values: vec![Value::Variant(Box::new(inner.clone())); n],
-            dimensions: None,
+        let inner = fixture_variant_array(3, vec![Value::Byte(0); MAX_ARRAY_LEN], None);
+        let outer = |n: usize| {
+            fixture_variant_array(
+                type_id::VARIANT,
+                vec![Value::Variant(Box::new(inner.clone())); n],
+                None,
+            )
         };
         let n = MAX_VALUES / MAX_ARRAY_LEN;
         let fits = Wire::to_bytes(&outer(n - 1)).unwrap();
@@ -5036,10 +4991,7 @@ mod tests {
                 ..Default::default()
             }),
             Value::StatusCode(StatusCode::BAD_UNEXPECTED_ERROR),
-            Value::QualifiedName(QualifiedName {
-                namespace: 1,
-                name: "q".into(),
-            }),
+            Value::QualifiedName(fixture_qualified_name(1, "q".into())),
             Value::LocalizedText(LocalizedText {
                 locale: None,
                 text: Some("t".into()),
@@ -5056,14 +5008,14 @@ mod tests {
     }
 
     fn every_variant() -> Variant {
-        Variant::Array {
-            type_id: type_id::VARIANT,
-            values: sample_values()
+        fixture_variant_array(
+            type_id::VARIANT,
+            sample_values()
                 .into_iter()
                 .map(|v| Value::Variant(Box::new(Variant::Scalar(v))))
                 .collect(),
-            dimensions: Some(vec![2, 12]),
-        }
+            Some(vec![2, 12]),
+        )
     }
 
     #[test]
@@ -5457,13 +5409,13 @@ mod tests {
             ..Default::default()
         };
         let outer = DataValue {
-            value: Some(Variant::Array {
-                type_id: type_id::VARIANT,
-                values: vec![Value::Variant(Box::new(Variant::Scalar(Value::DataValue(
+            value: Some(fixture_variant_array(
+                type_id::VARIANT,
+                vec![Value::Variant(Box::new(Variant::Scalar(Value::DataValue(
                     Box::new(inner.clone()),
                 ))))],
-                dimensions: None,
-            }),
+                None,
+            )),
             ..Default::default()
         };
         assert_eq!(Wire::to_bytes(&outer), Err(Error::VariantValue));
@@ -5485,11 +5437,7 @@ mod tests {
             })),
             Err(Error::VariantValue)
         );
-        let empty = Variant::Array {
-            type_id: 27,
-            values: vec![],
-            dimensions: None,
-        };
+        let empty = fixture_variant_array(27, vec![], None);
         assert_eq!(Wire::to_bytes(&empty), Err(Error::VariantValue));
         // Binary readers accept reserved type ids.
         assert!(Reader::new(&[0x9b, 0, 0, 0, 0]).read::<Variant>().is_ok());
@@ -5536,10 +5484,7 @@ mod tests {
             <NodeId as Wire>::parse(&long),
             Err(Error::Length(MAX_NODE_ID_LEN as i32 + 1))
         );
-        let opaque = NodeId {
-            namespace: 1,
-            identifier: Identifier::Opaque(vec![0; MAX_NODE_ID_LEN + 1]),
-        };
+        let opaque = fixture_node_id(1, Identifier::Opaque(vec![0; MAX_NODE_ID_LEN + 1]));
         assert_eq!(Wire::to_bytes(&opaque), Err(Error::TooLong));
         assert_eq!(
             Wire::to_bytes(&NodeId::string(1, "a\nb")),
@@ -5553,10 +5498,7 @@ mod tests {
             <NodeId as Wire>::parse(&[0x03, 1, 0, 3, 0, 0, 0, b'a', b'\n', b'b']),
             Err(Error::ControlChar)
         );
-        let q = QualifiedName {
-            namespace: 0,
-            name: "q".repeat(MAX_QUALIFIED_NAME_LEN + 1),
-        };
+        let q = fixture_qualified_name(0, "q".repeat(MAX_QUALIFIED_NAME_LEN + 1));
         assert_eq!(Wire::to_bytes(&q), Err(Error::TooLong));
         let mut qb = vec![0, 0];
         qb.extend_from_slice(&le32(MAX_QUALIFIED_NAME_LEN as u32 + 1));
@@ -5565,19 +5507,13 @@ mod tests {
             <QualifiedName as Wire>::parse(&qb),
             Err(Error::Length(MAX_QUALIFIED_NAME_LEN as i32 + 1))
         );
-        let ok = QualifiedName {
-            namespace: 0,
-            name: "q".repeat(MAX_QUALIFIED_NAME_LEN),
-        };
+        let ok = fixture_qualified_name(0, "q".repeat(MAX_QUALIFIED_NAME_LEN));
         assert_eq!(
             <QualifiedName as Wire>::parse(&Wire::to_bytes(&ok).unwrap()),
             Ok(ok)
         );
         assert_eq!(
-            Wire::to_bytes(&QualifiedName {
-                namespace: 0,
-                name: "\t".into()
-            }),
+            Wire::to_bytes(&fixture_qualified_name(0, "\t".into())),
             Err(Error::ControlChar)
         );
     }
@@ -5586,20 +5522,8 @@ mod tests {
     fn every_null_node_id_is_null() {
         // Part 3, 8.2.4, Table 24.
         assert!(NodeId::string(0, "").is_null());
-        assert!(
-            NodeId {
-                namespace: 0,
-                identifier: Identifier::Guid(Guid::default())
-            }
-            .is_null()
-        );
-        assert!(
-            NodeId {
-                namespace: 0,
-                identifier: Identifier::Opaque(vec![])
-            }
-            .is_null()
-        );
+        assert!(fixture_node_id(0, Identifier::Guid(Guid::default())).is_null());
+        assert!(fixture_node_id(0, Identifier::Opaque(vec![])).is_null());
         assert!(!NodeId::string(1, "").is_null());
         assert!(!NodeId::numeric(0, 1).is_null());
     }
@@ -5818,11 +5742,7 @@ mod tests {
     fn fuzz_loop() {
         let mut rng = Lcg::new(0x5e_ed0f_0bca);
         let seeds = samples();
-        let small = Limits {
-            receive_buffer_size: 8192,
-            max_message_size: 1 << 16,
-            max_chunk_count: 8,
-        };
+        let small = fixture_limits(8192, 1 << 16, 8);
         for round in 0..4000 {
             // Half random bytes, half a valid sample with a few bytes changed.
             let mut b: Vec<u8> = if round % 2 == 0 {

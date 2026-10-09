@@ -1425,6 +1425,10 @@ pub fn unix_path(addr: &[u8; UNIX_ADDR_LEN]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_tlv_other(kind: u8, value: Vec<u8>) -> Tlv {
+        Tlv::Other { kind, value }
+    }
+
     use super::*;
     use codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::assert_linear;
@@ -1641,10 +1645,7 @@ mod tests {
             Tlv::UniqueId(vec![7; 16]),
             Tlv::Ssl(ssl.clone()),
             Tlv::NetNs(b"blue".to_vec()),
-            Tlv::Other {
-                kind: 0xea,
-                value: vec![1, 2],
-            },
+            fixture_tlv_other(0xea, vec![1, 2]),
         ];
         let v2 = v2.with_checksum().unwrap();
         assert!(matches!(v2.tlvs[2], Tlv::Crc32c(c) if c != 0));
@@ -1697,20 +1698,14 @@ mod tests {
             b.extend_from_slice(tlvs);
             Header::parse(&b)
         };
-        assert_eq!(body(&[0x01, 0x00]), Err(Error::TlvTruncated));
-        assert_eq!(body(&[0x01, 0x00, 0x02, b'h']), Err(Error::TlvTruncated));
-        assert_eq!(
-            body(&[0x03, 0x00, 0x02, 0, 0]),
-            Err(Error::TlvLength(tlv_type::CRC32C))
-        );
-        assert_eq!(
-            body(&[0x20, 0x00, 0x04, 1, 0, 0, 0]),
-            Err(Error::TlvLength(tlv_type::SSL))
-        );
-        assert_eq!(
-            body(&[0x20, 0x00, 0x07, 1, 0, 0, 0, 0, 0x21, 0]),
-            Err(Error::TlvTruncated)
-        );
+        fictionet::assert_cases! {
+            body;
+            (&[0x01, 0x00]) => Err(Error::TlvTruncated),
+            (&[0x01, 0x00, 0x02, b'h']) => Err(Error::TlvTruncated),
+            (&[0x03, 0x00, 0x02, 0, 0]) => Err(Error::TlvLength(tlv_type::CRC32C)),
+            (&[0x20, 0x00, 0x04, 1, 0, 0, 0]) => Err(Error::TlvLength(tlv_type::SSL)),
+            (&[0x20, 0x00, 0x07, 1, 0, 0, 0, 0, 0x21, 0]) => Err(Error::TlvTruncated),
+        }
         let mut uid = vec![0x05, 0x00, 129];
         uid.extend_from_slice(&[0; 129]);
         assert_eq!(body(&uid), Err(Error::TlvLength(tlv_type::UNIQUE_ID)));
@@ -1804,18 +1799,12 @@ mod tests {
         }
         assert_eq!(ssl.len(), 65_537);
         assert_eq!(Ssl::parse(&ssl), Err(Error::TlvLength(tlv_type::SSL)));
-        assert_eq!(
-            Tlv::from_raw(tlv_type::SSL, &ssl),
-            Err(Error::TlvLength(tlv_type::SSL))
-        );
-        assert_eq!(
-            Tlv::from_raw(tlv_type::NOOP, &[0; MAX_TLV_VALUE + 1]),
-            Err(Error::TlvLength(tlv_type::NOOP))
-        );
-        assert_eq!(
-            Tlv::from_raw(0xe0, &[0; MAX_TLV_VALUE + 1]),
-            Err(Error::TlvLength(0xe0))
-        );
+        fictionet::assert_cases! {
+            Tlv::from_raw;
+            (tlv_type::SSL, &ssl) => Err(Error::TlvLength(tlv_type::SSL)),
+            (tlv_type::NOOP, &[0; MAX_TLV_VALUE + 1]) => Err(Error::TlvLength(tlv_type::NOOP)),
+            (0xe0, &[0; MAX_TLV_VALUE + 1]) => Err(Error::TlvLength(0xe0)),
+        }
         assert_eq!(
             SslTlv::from_raw(0xe0, &[0; MAX_TLV_VALUE - SSL_FIXED_LEN - 2]),
             Err(Error::TlvLength(0xe0))
@@ -1976,18 +1965,9 @@ mod tests {
         for tlv in [
             Tlv::UniqueId(vec![5; MAX_UNIQUE_ID + 1]),
             Tlv::Noop(vec![0; MAX_TLV_VALUE + 1]),
-            Tlv::Other {
-                kind: tlv_type::CRC32C,
-                value: vec![1, 2, 3],
-            },
-            Tlv::Other {
-                kind: tlv_type::ALPN,
-                value: b"h2".to_vec(),
-            },
-            Tlv::Other {
-                kind: tlv_type::SSL,
-                value: vec![],
-            },
+            fixture_tlv_other(tlv_type::CRC32C, vec![1, 2, 3]),
+            fixture_tlv_other(tlv_type::ALPN, b"h2".to_vec()),
+            fixture_tlv_other(tlv_type::SSL, vec![]),
             Tlv::Ssl(Ssl {
                 client: 0,
                 verify: 1,
@@ -2101,10 +2081,7 @@ mod tests {
             vec![Tlv::Crc32c(0); 2],
             vec![Tlv::Noop(vec![0; MAX_TLV_VALUE])],
             vec![Tlv::UniqueId(vec![0; MAX_UNIQUE_ID + 1])],
-            vec![Tlv::Other {
-                kind: tlv_type::ALPN,
-                value: vec![],
-            }],
+            vec![fixture_tlv_other(tlv_type::ALPN, vec![])],
             vec![Tlv::Ssl(Ssl {
                 client: 0,
                 verify: 0,
@@ -2263,10 +2240,7 @@ mod tests {
             contract::check_wire::<Ssl>(&bytes);
             contract::check_wire::<SslTlv>(&bytes);
             contract::check_wire_value(&Header::V1(V1::Unknown(rng.text(120).into_bytes())));
-            contract::check_wire_value(&Tlv::Other {
-                kind: rng.next() as u8,
-                value: rng.bytes(40),
-            });
+            contract::check_wire_value(&fixture_tlv_other(rng.next() as u8, rng.bytes(40)));
             let header = random_v2(&mut rng);
             contract::check_wire_value(&header);
             if let Ok(header) = header.with_checksum() {

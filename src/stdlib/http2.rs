@@ -1813,6 +1813,14 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_window_update(stream: u32, flags: u8, increment: u32) -> WindowUpdate {
+        WindowUpdate {
+            stream,
+            flags,
+            increment,
+        }
+    }
+
     use super::*;
     use fictionet::stdlib::test_support::contract;
 
@@ -1904,11 +1912,7 @@ mod tests {
         };
         assert!(invalid.write(&mut out).is_err());
         assert_eq!(out, [7, 8]);
-        let invalid = WindowUpdate {
-            stream: 0,
-            flags: 0,
-            increment: 0,
-        };
+        let invalid = fixture_window_update(0, 0, 0);
         assert!(invalid.write(&mut out).is_err());
         assert_eq!(out, [7, 8]);
         let h = FrameHeader {
@@ -2060,11 +2064,7 @@ mod tests {
     fn peer_credit_before_response_headers_and_after_retirement_is_allowed() {
         let mut c = Session::server_side(Limits::default());
         accept(&mut c, &settings());
-        let update = WindowUpdate {
-            stream: 1,
-            flags: 0,
-            increment: 1 << 20,
-        };
+        let update = fixture_window_update(1, 0, 1 << 20);
         // The caller has observed the request HEADERS in the other direction.
         c.peer_window_update(&update).unwrap();
         accept(&mut c, &raw(1, 4, 1, &[0x88]));
@@ -2284,12 +2284,8 @@ mod tests {
         assert_eq!(c.stream_window(1), Some(65_531));
         assert_eq!(c.peer().max_frame_size, 32_768);
         assert_eq!(c.settings().max_frame_size, 16_384);
-        c.peer_window_update(&WindowUpdate {
-            stream: 1,
-            flags: 0,
-            increment: 10,
-        })
-        .unwrap();
+        c.peer_window_update(&fixture_window_update(1, 0, 10))
+            .unwrap();
         assert_eq!(c.stream_window(1), Some(65_541));
         accept(&mut c, &raw(4, 1, 0, &[]));
         assert_eq!(c.stream_window(1), Some(8));
@@ -2300,11 +2296,7 @@ mod tests {
         assert!(c.retire(3));
         assert!(!c.retire(1));
         let overflow = c
-            .peer_window_update(&WindowUpdate {
-                stream: 0,
-                flags: 0,
-                increment: MAX_WINDOW,
-            })
+            .peer_window_update(&fixture_window_update(0, 0, MAX_WINDOW))
             .unwrap_err();
         assert_eq!(overflow.code, ErrorCode::FlowControlError);
         assert!(c.next().is_none());
@@ -2413,12 +2405,8 @@ mod tests {
             accept(&mut c, &raw(4, 1, 0, &[]));
             assert_eq!(c.stream_window(1), Some(expected));
         }
-        c.peer_window_update(&WindowUpdate {
-            stream: 1,
-            flags: 0,
-            increment: MAX_WINDOW - 20,
-        })
-        .unwrap();
+        c.peer_window_update(&fixture_window_update(1, 0, MAX_WINDOW - 20))
+            .unwrap();
         let error = c
             .peer_settings(&Settings {
                 flags: 0,

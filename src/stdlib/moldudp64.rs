@@ -798,6 +798,21 @@ impl Retransmitter {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_request(session: Session, sequence: u64, count: u16) -> Request {
+        Request {
+            session,
+            sequence,
+            count,
+        }
+    }
+    fn fixture_event_deliver(sequence: u64, skip: usize, count: usize) -> Event {
+        Event::Deliver {
+            sequence,
+            skip,
+            count,
+        }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg};
     use fictionet::stdlib::test_support::check_atomic;
@@ -851,11 +866,7 @@ mod tests {
         assert_eq!(end.to_bytes().unwrap(), eos);
         assert_eq!(Downstream::parse(&eos).unwrap(), end);
 
-        let request = Request {
-            session: session(),
-            sequence: 9,
-            count: 3,
-        };
+        let request = fixture_request(session(), 9, 3);
         let mut rq = b"  SESSION1".to_vec();
         rq.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 9, 0, 3]);
         assert_eq!(request.to_bytes().unwrap(), rq);
@@ -923,11 +934,7 @@ mod tests {
             check_wire_value(&p);
             check_wire::<Downstream>(&p.to_bytes().unwrap());
         }
-        check_wire_value(&Request {
-            session: session(),
-            sequence: u64::MAX,
-            count: u16::MAX,
-        });
+        check_wire_value(&fixture_request(session(), u64::MAX, u16::MAX));
     }
 
     #[test]
@@ -987,22 +994,14 @@ mod tests {
         let mut r = Receiver::new(ReceiverConfig::default()).unwrap();
         assert_eq!(
             r.receive(&packet(10, &[b"a", b"b"]), 0).unwrap(),
-            [Action::Event(Event::Deliver {
-                sequence: 10,
-                skip: 0,
-                count: 2
-            })]
+            [Action::Event(fixture_event_deliver(10, 0, 2))]
         );
         assert_eq!(r.session(), Some(session()));
         assert_eq!(r.expected(), Some(12));
         // Overlap: only the new message is delivered.
         assert_eq!(
             r.receive(&packet(11, &[b"b", b"c"]), 1).unwrap(),
-            [Action::Event(Event::Deliver {
-                sequence: 12,
-                skip: 1,
-                count: 1
-            })]
+            [Action::Event(fixture_event_deliver(12, 1, 1))]
         );
         // A whole duplicate and a current heartbeat do nothing.
         assert!(r.receive(&packet(10, &[b"a"]), 2).unwrap().is_empty());
@@ -1026,11 +1025,7 @@ mod tests {
                     expected: 1,
                     received: 4
                 }),
-                Action::Send(Request {
-                    session: session(),
-                    sequence: 1,
-                    count: 5
-                })
+                Action::Send(fixture_request(session(), 1, 5))
             ]
         );
         // More live packets ahead do not send another request.
@@ -1041,29 +1036,14 @@ mod tests {
         assert_eq!(
             actions,
             [
-                Action::Event(Event::Deliver {
-                    sequence: 1,
-                    skip: 0,
-                    count: 2
-                }),
-                Action::Send(Request {
-                    session: session(),
-                    sequence: 3,
-                    count: 4
-                })
+                Action::Event(fixture_event_deliver(1, 0, 2)),
+                Action::Send(fixture_request(session(), 3, 4))
             ]
         );
         let actions = r
             .receive(&packet(3, &[b"c", b"d", b"e", b"f"]), 30)
             .unwrap();
-        assert_eq!(
-            actions,
-            [Action::Event(Event::Deliver {
-                sequence: 3,
-                skip: 0,
-                count: 4
-            })]
-        );
+        assert_eq!(actions, [Action::Event(fixture_event_deliver(3, 0, 4))]);
         assert_eq!(r.pending(), None);
         assert_eq!(r.expected(), Some(7));
     }
@@ -1077,14 +1057,7 @@ mod tests {
         .unwrap();
         let _ = r.receive(&packet(1, &[b"a"]), 0).unwrap();
         let actions = r.receive(&heartbeat(1_000_000), 1).unwrap();
-        assert_eq!(
-            sends(&actions),
-            [Request {
-                session: session(),
-                sequence: 2,
-                count: 100
-            }]
-        );
+        assert_eq!(sends(&actions), [fixture_request(session(), 2, 100)]);
     }
 
     #[test]
@@ -1110,11 +1083,7 @@ mod tests {
                     sequence: 1,
                     count: 2
                 }),
-                Action::Send(Request {
-                    session: session(),
-                    sequence: 3,
-                    count: 2
-                })
+                Action::Send(fixture_request(session(), 3, 2))
             ]
         );
         assert_eq!(r.expected(), Some(3));
@@ -1244,11 +1213,7 @@ mod tests {
         assert_eq!(s.first_sequence(), 3);
         assert_eq!(s.next_sequence(), 7);
         assert_eq!(s.held(), 16);
-        let request = Request {
-            session: session(),
-            sequence: 3,
-            count: 10,
-        };
+        let request = fixture_request(session(), 3, 10);
         let answer = s.answer(&request).unwrap();
         // Only three blocks fit.
         assert_eq!(answer.sequence, 3);

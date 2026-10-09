@@ -2488,6 +2488,29 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_time(seconds: u32, nseconds: u32) -> Time {
+        Time { seconds, nseconds }
+    }
+    fn fixture_request_mknod(location: DirOp, what: MknodData) -> Request {
+        Request::Mknod { location, what }
+    }
+    fn fixture_entry(fileid: u64, name: Vec<u8>, cookie: u64) -> Entry {
+        Entry {
+            fileid,
+            name,
+            cookie,
+        }
+    }
+    fn fixture_mount_entry(hostname: String, directory: Vec<u8>) -> MountEntry {
+        MountEntry {
+            hostname,
+            directory,
+        }
+    }
+    fn fixture_export_entry(directory: Vec<u8>, groups: Vec<String>) -> ExportEntry {
+        ExportEntry { directory, groups }
+    }
+
     use super::harness::check;
     use super::*;
     use fictionet::stdlib::codec::Lcg;
@@ -2520,18 +2543,9 @@ mod tests {
             rdev: SpecData::default(),
             fsid: 7,
             fileid: 42,
-            atime: Time {
-                seconds: 1,
-                nseconds: 2,
-            },
-            mtime: Time {
-                seconds: 3,
-                nseconds: 4,
-            },
-            ctime: Time {
-                seconds: 5,
-                nseconds: 6,
-            },
+            atime: fixture_time(1, 2),
+            mtime: fixture_time(3, 4),
+            ctime: fixture_time(5, 6),
         }
     }
 
@@ -2540,10 +2554,7 @@ mod tests {
             before: Some(WccAttr {
                 size: 1,
                 mtime: Time::default(),
-                ctime: Time {
-                    seconds: 9,
-                    nseconds: 0,
-                },
+                ctime: fixture_time(9, 0),
             }),
             after: Some(attrs()),
         }
@@ -2556,10 +2567,7 @@ mod tests {
             gid: Some(5),
             size: Some(0),
             atime: SetTime::ServerTime,
-            mtime: SetTime::ClientTime(Time {
-                seconds: 10,
-                nseconds: 11,
-            }),
+            mtime: SetTime::ClientTime(fixture_time(10, 11)),
         }
     }
 
@@ -2571,10 +2579,7 @@ mod tests {
             Request::SetAttr {
                 object: fh(&[1]),
                 attributes: sattr(),
-                guard: Some(Time {
-                    seconds: 5,
-                    nseconds: 6,
-                }),
+                guard: Some(fixture_time(5, 6)),
             },
             Request::SetAttr {
                 object: fh(&[1]),
@@ -2627,40 +2632,25 @@ mod tests {
                 attributes: Sattr::default(),
                 target: "/etc/passwd".into(),
             },
-            Request::Mknod {
-                location: op(&[1], "tty"),
-                what: MknodData::Character {
+            fixture_request_mknod(
+                op(&[1], "tty"),
+                MknodData::Character {
                     attributes: sattr(),
                     spec: SpecData { major: 4, minor: 1 },
                 },
-            },
-            Request::Mknod {
-                location: op(&[1], "sda"),
-                what: MknodData::Block {
+            ),
+            fixture_request_mknod(
+                op(&[1], "sda"),
+                MknodData::Block {
                     attributes: Sattr::default(),
                     spec: SpecData { major: 8, minor: 0 },
                 },
-            },
-            Request::Mknod {
-                location: op(&[1], "sock"),
-                what: MknodData::Socket(sattr()),
-            },
-            Request::Mknod {
-                location: op(&[1], "pipe"),
-                what: MknodData::Fifo(Sattr::default()),
-            },
-            Request::Mknod {
-                location: op(&[1], "f"),
-                what: MknodData::Regular,
-            },
-            Request::Mknod {
-                location: op(&[1], "d"),
-                what: MknodData::Directory,
-            },
-            Request::Mknod {
-                location: op(&[1], "l"),
-                what: MknodData::Symlink,
-            },
+            ),
+            fixture_request_mknod(op(&[1], "sock"), MknodData::Socket(sattr())),
+            fixture_request_mknod(op(&[1], "pipe"), MknodData::Fifo(Sattr::default())),
+            fixture_request_mknod(op(&[1], "f"), MknodData::Regular),
+            fixture_request_mknod(op(&[1], "d"), MknodData::Directory),
+            fixture_request_mknod(op(&[1], "l"), MknodData::Symlink),
             Request::Remove(op(&[1], "a")),
             Request::Rmdir(op(&[1], "dir")),
             Request::Rename {
@@ -2769,16 +2759,8 @@ mod tests {
                 attributes: None,
                 cookieverf: [1; 8],
                 entries: vec![
-                    Entry {
-                        fileid: 1,
-                        name: ".".into(),
-                        cookie: 1,
-                    },
-                    Entry {
-                        fileid: 2,
-                        name: "notes.txt".into(),
-                        cookie: 2,
-                    },
+                    fixture_entry(1, ".".into(), 1),
+                    fixture_entry(2, "notes.txt".into(), 2),
                 ],
                 eof: true,
             })),
@@ -2832,10 +2814,7 @@ mod tests {
                 wtmult: 4096,
                 dtpref: 8192,
                 maxfilesize: u64::MAX,
-                time_delta: Time {
-                    seconds: 0,
-                    nseconds: 1,
-                },
+                time_delta: fixture_time(0, 1),
                 properties: fsf::LINK | fsf::SYMLINK | fsf::HOMOGENEOUS | fsf::CANSETTIME,
             })),
             Response::FsInfo(Err((Status::ServerFault, None))),
@@ -2878,27 +2857,15 @@ mod tests {
             MountResponse::Mnt(Err(MountStatus::Acces)),
             MountResponse::Dump(vec![]),
             MountResponse::Dump(vec![
-                MountEntry {
-                    hostname: "client1".into(),
-                    directory: "/export".into(),
-                },
-                MountEntry {
-                    hostname: "client2".into(),
-                    directory: "/export/home".into(),
-                },
+                fixture_mount_entry("client1".into(), "/export".into()),
+                fixture_mount_entry("client2".into(), "/export/home".into()),
             ]),
             MountResponse::Umnt,
             MountResponse::UmntAll,
             MountResponse::Export(vec![]),
             MountResponse::Export(vec![
-                ExportEntry {
-                    directory: "/export".into(),
-                    groups: vec![],
-                },
-                ExportEntry {
-                    directory: "/data".into(),
-                    groups: vec!["10.0.0.0/8".into(), "lab".into()],
-                },
+                fixture_export_entry("/export".into(), vec![]),
+                fixture_export_entry("/data".into(), vec!["10.0.0.0/8".into(), "lab".into()]),
             ]),
         ]
     }
@@ -2976,11 +2943,7 @@ mod tests {
         let resp = Response::ReadDir(Ok(ReadDirOk {
             attributes: None,
             cookieverf: [0; 8],
-            entries: vec![Entry {
-                fileid: 5,
-                name: "x".into(),
-                cookie: 6,
-            }],
+            entries: vec![fixture_entry(5, "x".into(), 6)],
             eof: true,
         }));
         let b = resp.to_results().unwrap();
@@ -3015,10 +2978,7 @@ mod tests {
             r.to_results().unwrap(),
             [0, 0, 0, 0, 0, 0, 0, 1, 7, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1]
         );
-        let e = MountResponse::Export(vec![ExportEntry {
-            directory: "/".into(),
-            groups: vec!["g".into()],
-        }]);
+        let e = MountResponse::Export(vec![fixture_export_entry("/".into(), vec!["g".into()])]);
         assert_eq!(
             e.to_results().unwrap(),
             [
@@ -3475,11 +3435,7 @@ mod tests {
     #[test]
     fn list_writers_refuse_invalid_entries() {
         let response = Response::ReadDir(Ok(ReadDirOk {
-            entries: vec![Entry {
-                fileid: 2,
-                name: vec![b'n'; MAX_NAME + 1],
-                cookie: 2,
-            }],
+            entries: vec![fixture_entry(2, vec![b'n'; MAX_NAME + 1], 2)],
             eof: true,
             ..ReadDirOk::default()
         }));
@@ -3504,33 +3460,18 @@ mod tests {
             );
         }
         for entry in [
-            ExportEntry {
-                directory: vec![b'd'; MAX_PATH + 1],
-                groups: vec![],
-            },
-            ExportEntry {
-                directory: b"/x".to_vec(),
-                groups: vec!["g".repeat(MAX_MOUNT_NAME + 1)],
-            },
+            fixture_export_entry(vec![b'd'; MAX_PATH + 1], vec![]),
+            fixture_export_entry(b"/x".to_vec(), vec!["g".repeat(MAX_MOUNT_NAME + 1)]),
         ] {
             assert!(MountResponse::Export(vec![entry]).to_results().is_err());
         }
         for entry in [
-            MountEntry {
-                hostname: "h".repeat(MAX_MOUNT_NAME + 1),
-                directory: b"/".to_vec(),
-            },
-            MountEntry {
-                hostname: "h".into(),
-                directory: vec![b'd'; MAX_PATH + 1],
-            },
+            fixture_mount_entry("h".repeat(MAX_MOUNT_NAME + 1), b"/".to_vec()),
+            fixture_mount_entry("h".into(), vec![b'd'; MAX_PATH + 1]),
         ] {
             assert!(MountResponse::Dump(vec![entry]).to_results().is_err());
         }
-        let entry = MountEntry {
-            hostname: "h".into(),
-            directory: b"/".to_vec(),
-        };
+        let entry = fixture_mount_entry("h".into(), b"/".to_vec());
         assert!(
             MountResponse::Dump(vec![entry; MAX_MOUNTS + 1])
                 .to_results()
@@ -3633,11 +3574,13 @@ mod tests {
         // 16 exports, each with 256 groups of 255 bytes: about 1.08 MB,
         // past MAX_EXPORT_BYTES. Both the reader and writer refuse it.
         let exports: Vec<ExportEntry> = (0..16)
-            .map(|i| ExportEntry {
-                directory: format!("/e{i:02}").into_bytes(),
-                groups: (0..MAX_GROUPS)
-                    .map(|g| format!("{g:03}{}", "g".repeat(252)))
-                    .collect(),
+            .map(|i| {
+                fixture_export_entry(
+                    format!("/e{i:02}").into_bytes(),
+                    (0..MAX_GROUPS)
+                        .map(|g| format!("{g:03}{}", "g".repeat(252)))
+                        .collect(),
+                )
             })
             .collect();
         let mut w = Writer::new();
@@ -3664,10 +3607,7 @@ mod tests {
         );
         assert!(
             MountResponse::Export(vec![
-                ExportEntry {
-                    directory: b"/".to_vec(),
-                    groups: vec![]
-                };
+                fixture_export_entry(b"/".to_vec(), vec![]);
                 MAX_EXPORTS + 5
             ])
             .to_results()
@@ -3679,11 +3619,7 @@ mod tests {
     fn directory_lists_follow_a_byte_limit() {
         // A READDIR asked with count 65536 may carry 1025 short entries.
         let entries: Vec<Entry> = (0..1025)
-            .map(|i| Entry {
-                fileid: i,
-                name: format!("{i:04}").into_bytes(),
-                cookie: i + 1,
-            })
+            .map(|i| fixture_entry(i, format!("{i:04}").into_bytes(), i + 1))
             .collect();
         let resp = Response::ReadDir(Ok(ReadDirOk {
             entries,
@@ -3694,11 +3630,7 @@ mod tests {
         assert!(b.len() < 65536);
         assert_eq!(Response::parse(procedure::READDIR, &b), Ok(resp));
         let entries = (0..MAX_DIR_BYTES as u64 / 28 + 1)
-            .map(|i| Entry {
-                fileid: i,
-                name: b"e".to_vec(),
-                cookie: i + 1,
-            })
+            .map(|i| fixture_entry(i, b"e".to_vec(), i + 1))
             .collect();
         let response = Response::ReadDir(Ok(ReadDirOk {
             entries,
@@ -3757,10 +3689,10 @@ mod tests {
             .reply()
             .unwrap(),
             MountResponse::Export(vec![
-                ExportEntry {
-                    directory: path.clone(),
-                    groups: vec![group; MAX_GROUPS]
-                };
+                fixture_export_entry(
+                    path.clone(),
+                    vec![group; MAX_GROUPS]
+                );
                 MAX_EXPORT_BYTES
                     / (MAX_PATH
                         + 12
@@ -3769,10 +3701,7 @@ mod tests {
             .reply()
             .unwrap(),
             MountResponse::Dump(vec![
-                MountEntry {
-                    hostname: "h".repeat(MAX_MOUNT_NAME),
-                    directory: path
-                };
+                fixture_mount_entry("h".repeat(MAX_MOUNT_NAME), path);
                 MAX_MOUNTS
             ])
             .reply()
@@ -3851,18 +3780,9 @@ mod tests {
             },
             fsid: (rng.next() << 32 | rng.next()),
             fileid: (rng.next() << 32 | rng.next()),
-            atime: Time {
-                seconds: (rng.next() as u32),
-                nseconds: (rng.next() as u32),
-            },
-            mtime: Time {
-                seconds: (rng.next() as u32),
-                nseconds: (rng.next() as u32),
-            },
-            ctime: Time {
-                seconds: (rng.next() as u32),
-                nseconds: (rng.next() as u32),
-            },
+            atime: fixture_time(rng.next() as u32, rng.next() as u32),
+            mtime: fixture_time(rng.next() as u32, rng.next() as u32),
+            ctime: fixture_time(rng.next() as u32, rng.next() as u32),
         }
     }
 

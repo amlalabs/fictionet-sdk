@@ -1557,6 +1557,17 @@ impl Wire for Fragments {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_handshake(msg_type: u8, message_seq: u16, body: Vec<u8>) -> Handshake {
+        Handshake {
+            msg_type,
+            message_seq,
+            body,
+        }
+    }
+    fn fixture_extension(typ: u16, data: Vec<u8>) -> Extension {
+        Extension { typ, data }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
@@ -1840,13 +1851,7 @@ mod tests {
         b.extend_from_slice(&[0; 8]);
         assert_eq!(Fragment::parse(&b), Err(Error::TooLong(n)));
         // Several fragments in one record, and too many.
-        let empty = Handshake {
-            msg_type: 14,
-            message_seq: 1,
-            body: vec![],
-        }
-        .to_bytes()
-        .unwrap();
+        let empty = fixture_handshake(14, 1, vec![]).to_bytes().unwrap();
         assert_eq!(empty, [14, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
         let many: Vec<u8> = empty
             .iter()
@@ -1868,11 +1873,7 @@ mod tests {
 
     #[test]
     fn splitting_messages() {
-        let m = Handshake {
-            msg_type: 11,
-            message_seq: 2,
-            body: (0..100).collect(),
-        };
+        let m = fixture_handshake(11, 2, (0..100).collect());
         let parts = m.fragments(30).unwrap();
         assert_eq!(parts.len(), 4);
         assert_eq!(
@@ -1883,11 +1884,7 @@ mod tests {
         assert!(m.to_fragment().unwrap().is_whole());
         assert_eq!(m.fragments(0).unwrap().len(), 100);
         assert_eq!(m.fragments(1000).unwrap(), [m.to_fragment().unwrap()]);
-        let empty = Handshake {
-            msg_type: 14,
-            message_seq: 0,
-            body: vec![],
-        };
+        let empty = fixture_handshake(14, 0, vec![]);
         assert_eq!(empty.fragments(10).unwrap(), [empty.to_fragment().unwrap()]);
     }
 
@@ -1965,22 +1962,22 @@ mod tests {
         assert_eq!(ClientHello::parse(&bad), Err(Error::Extensions));
         // A malformed supported_versions list.
         let mut ch = ClientHello::parse(&b).unwrap();
-        ch.extensions = Some(vec![Extension {
-            typ: extension_type::SUPPORTED_VERSIONS,
-            data: vec![3, 0xfe, 0xfc, 0],
-        }]);
+        ch.extensions = Some(vec![fixture_extension(
+            extension_type::SUPPORTED_VERSIONS,
+            vec![3, 0xfe, 0xfc, 0],
+        )]);
         assert_eq!(ch.supported_versions(), None);
         // RFC 8446, section 4.2.1: versions<2..254>, so an empty list is
         // malformed.
-        ch.extensions = Some(vec![Extension {
-            typ: extension_type::SUPPORTED_VERSIONS,
-            data: vec![0],
-        }]);
+        ch.extensions = Some(vec![fixture_extension(
+            extension_type::SUPPORTED_VERSIONS,
+            vec![0],
+        )]);
         assert_eq!(ch.supported_versions(), None);
-        ch.extensions = Some(vec![Extension {
-            typ: extension_type::SUPPORTED_VERSIONS,
-            data: vec![2, 0xfe, 0xfc],
-        }]);
+        ch.extensions = Some(vec![fixture_extension(
+            extension_type::SUPPORTED_VERSIONS,
+            vec![2, 0xfe, 0xfc],
+        )]);
         assert_eq!(ch.supported_versions(), Some(vec![version::DTLS_1_3]));
     }
 
@@ -2021,19 +2018,11 @@ mod tests {
         };
         assert_eq!(r.add(&empty), Ok(Added::Repeat));
         assert_eq!(r.buffered(), 0);
-        let real = Handshake {
-            msg_type: 2,
-            message_seq: 0,
-            body: vec![7; 3],
-        };
+        let real = fixture_handshake(2, 0, vec![7; 3]);
         assert_eq!(r.add(&real.to_fragment().unwrap()), Ok(Added::New));
         assert_eq!(r.next_message(), Some(real));
         // An empty message is still given out.
-        let none = Handshake {
-            msg_type: 14,
-            message_seq: 1,
-            body: vec![],
-        };
+        let none = fixture_handshake(14, 1, vec![]);
         assert_eq!(r.add(&none.to_fragment().unwrap()), Ok(Added::New));
         assert_eq!(r.next_message(), Some(none));
     }
@@ -2043,11 +2032,7 @@ mod tests {
         // A reassembler can be cloned, so a world can try a fragment on a
         // copy first.
         let mut r = Reassembler::new();
-        let m = Handshake {
-            msg_type: 1,
-            message_seq: 0,
-            body: vec![1, 2, 3, 4],
-        };
+        let m = fixture_handshake(1, 0, vec![1, 2, 3, 4]);
         let parts = m.fragments(2).unwrap();
         r.add(&parts[0]).unwrap();
         let mut copy = r.clone();
@@ -2111,26 +2096,14 @@ mod tests {
             HelloVerifyRequest::parse(&[0xfe, 0xff, 0, 0]),
             Err(Error::BodyTrailing)
         );
-        let m = Handshake {
-            msg_type: handshake_type::HELLO_VERIFY_REQUEST,
-            message_seq: 0,
-            body: b.to_vec(),
-        };
+        let m = fixture_handshake(handshake_type::HELLO_VERIFY_REQUEST, 0, b.to_vec());
         assert_eq!(m.parse_body(), Ok(Body::HelloVerifyRequest(h)));
-        let other = Handshake {
-            msg_type: handshake_type::FINISHED,
-            message_seq: 4,
-            body: vec![1, 2],
-        };
+        let other = fixture_handshake(handshake_type::FINISHED, 4, vec![1, 2]);
         assert_eq!(
             other.parse_body(),
             Ok(Body::Other(handshake_type::FINISHED))
         );
-        let bad = Handshake {
-            msg_type: handshake_type::SERVER_HELLO,
-            message_seq: 1,
-            body: vec![1],
-        };
+        let bad = fixture_handshake(handshake_type::SERVER_HELLO, 1, vec![1]);
         assert_eq!(bad.parse_body(), Err(Error::FieldTruncated));
     }
 
@@ -2139,20 +2112,11 @@ mod tests {
         let base = ClientHello::parse(&client_hello_bytes()).unwrap();
         assert_eq!(base.to_bytes().unwrap(), client_hello_bytes());
         let mut ext_block = base.clone();
-        ext_block.extensions = Some(vec![Extension {
-            typ: 1,
-            data: vec![0; MAX_EXTENSIONS_LEN - 3],
-        }]);
+        ext_block.extensions = Some(vec![fixture_extension(1, vec![0; MAX_EXTENSIONS_LEN - 3])]);
         let mut ext_sum = base.clone();
         ext_sum.extensions = Some(vec![
-            Extension {
-                typ: 1,
-                data: vec![0; 40000],
-            },
-            Extension {
-                typ: 2,
-                data: vec![0; 30000],
-            },
+            fixture_extension(1, vec![0; 40000]),
+            fixture_extension(2, vec![0; 30000]),
         ]);
         let with = |change: fn(&mut ClientHello)| {
             let mut c = base.clone();
@@ -2304,34 +2268,18 @@ mod tests {
             cipher_suites: vec![0x1301; 40000],
             compression_methods: vec![0; 300],
             extensions: Some(vec![
-                Extension {
-                    typ: 1,
-                    data: vec![0; 40000],
-                },
-                Extension {
-                    typ: 2,
-                    data: vec![0; 30000],
-                },
-                Extension {
-                    typ: 3,
-                    data: vec![0; 20000],
-                },
+                fixture_extension(1, vec![0; 40000]),
+                fixture_extension(2, vec![0; 30000]),
+                fixture_extension(3, vec![0; 20000]),
             ]),
         };
         contract::check_wire_value(&ch);
         assert_eq!(ch.to_bytes(), Err(Error::Unwritable));
         let mut ch = ClientHello::parse(&client_hello_bytes()).unwrap();
-        ch.extensions = Some(vec![Extension {
-            typ: 1,
-            data: vec![0; 20000],
-        }]);
+        ch.extensions = Some(vec![fixture_extension(1, vec![0; 20000])]);
         // The body is too big for one record, but splits into fragments
         // that reassemble.
-        let m = Handshake {
-            msg_type: 1,
-            message_seq: 0,
-            body: ch.to_bytes().unwrap(),
-        };
+        let m = fixture_handshake(1, 0, ch.to_bytes().unwrap());
         let mut r = Reassembler::new();
         for f in m.fragments(MAX_PLAINTEXT - HANDSHAKE_HEADER_LEN).unwrap() {
             let rec = Record::Plain(PlainRecord {
@@ -2406,11 +2354,7 @@ mod tests {
         };
         contract::check_wire_value(&f);
         assert_eq!(f.to_bytes(), Err(Error::Unwritable));
-        let big = Handshake {
-            msg_type: 1,
-            message_seq: 0,
-            body: vec![0; MAX_MESSAGE_LEN + 10],
-        };
+        let big = fixture_handshake(1, 0, vec![0; MAX_MESSAGE_LEN + 10]);
         assert_eq!(big.to_fragment(), Err(Error::Unwritable));
         assert_eq!(big.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&big);
@@ -2418,11 +2362,7 @@ mod tests {
 
     #[test]
     fn reassembly_in_any_order() {
-        let m = Handshake {
-            msg_type: 11,
-            message_seq: 0,
-            body: (0..=255).collect(),
-        };
+        let m = fixture_handshake(11, 0, (0..=255).collect());
         let mut parts = m.fragments(40).unwrap();
         parts.reverse();
         let mut r = Reassembler::new();
@@ -2438,11 +2378,7 @@ mod tests {
         assert_eq!(r.add(&parts[0]), Ok(Added::Repeat));
 
         // Overlapping pieces, and bytes already held.
-        let m = Handshake {
-            msg_type: 2,
-            message_seq: 1,
-            body: (0..50).collect(),
-        };
+        let m = fixture_handshake(2, 1, (0..50).collect());
         let piece = |a: usize, b: usize| Fragment {
             msg_type: 2,
             length: 50,
@@ -2459,16 +2395,8 @@ mod tests {
         assert_eq!(r.next_message(), Some(m));
 
         // A later message waits for an earlier one.
-        let a = Handshake {
-            msg_type: 14,
-            message_seq: 2,
-            body: vec![],
-        };
-        let b = Handshake {
-            msg_type: 16,
-            message_seq: 3,
-            body: vec![5; 3],
-        };
+        let a = fixture_handshake(14, 2, vec![]);
+        let b = fixture_handshake(16, 3, vec![5; 3]);
         assert_eq!(r.add(&b.to_fragment().unwrap()), Ok(Added::New));
         assert_eq!(r.next_message(), None);
         assert_eq!(r.add(&a.to_fragment().unwrap()), Ok(Added::New));
@@ -2479,11 +2407,7 @@ mod tests {
 
     #[test]
     fn reassembly_one_byte_at_a_time() {
-        let m = Handshake {
-            msg_type: 1,
-            message_seq: 0,
-            body: client_hello_bytes(),
-        };
+        let m = fixture_handshake(1, 0, client_hello_bytes());
         let mut r = Reassembler::new();
         for f in m.fragments(1).unwrap() {
             let bytes = f.to_bytes().unwrap();
@@ -2695,21 +2619,13 @@ mod tests {
             };
             assert_eq!(r.add(&f), Ok(Added::New));
         }
-        let first = Handshake {
-            msg_type: 1,
-            message_seq: 0,
-            body: vec![7],
-        };
+        let first = fixture_handshake(1, 0, vec![7]);
         assert_eq!(r.add(&first.to_fragment().unwrap()), Ok(Added::New));
         assert!(r.buffered() <= MAX_REASSEMBLY_BYTES);
         assert_eq!(r.next_message(), Some(first));
         // The furthest message made way; the nearer ones stay.
         assert_eq!(r.buffered(), 3 * quarter as usize);
-        let second = Handshake {
-            msg_type: 1,
-            message_seq: 1,
-            body: vec![1; quarter as usize],
-        };
+        let second = fixture_handshake(1, 1, vec![1; quarter as usize]);
         assert_eq!(r.add(&second.to_fragment().unwrap()), Ok(Added::New));
         assert_eq!(r.next_message(), Some(second));
         // A message for the next place always fits, whatever is held.
@@ -2724,11 +2640,7 @@ mod tests {
             };
             r.add(&f).unwrap();
         }
-        let big = Handshake {
-            msg_type: 1,
-            message_seq: 0,
-            body: vec![5; MAX_MESSAGE_LEN],
-        };
+        let big = fixture_handshake(1, 0, vec![5; MAX_MESSAGE_LEN]);
         assert_eq!(r.add(&big.to_fragment().unwrap()), Ok(Added::New));
         assert!(r.buffered() <= MAX_REASSEMBLY_BYTES);
         assert_eq!(r.next_message(), Some(big));
@@ -2779,18 +2691,8 @@ mod tests {
             Err(Error::DuplicateExtension(43))
         );
         // Writers refuse duplicate types.
-        let svs = |v: u8| Extension {
-            typ: extension_type::SUPPORTED_VERSIONS,
-            data: vec![0xfe, v],
-        };
-        sh.extensions = Some(vec![
-            svs(0xfc),
-            Extension {
-                typ: 1,
-                data: vec![],
-            },
-            svs(0xfd),
-        ]);
+        let svs = |v: u8| fixture_extension(extension_type::SUPPORTED_VERSIONS, vec![0xfe, v]);
+        sh.extensions = Some(vec![svs(0xfc), fixture_extension(1, vec![]), svs(0xfd)]);
         contract::check_wire_value(&sh);
         assert_eq!(sh.to_bytes(), Err(Error::Unwritable));
     }
@@ -2826,11 +2728,7 @@ mod tests {
                 }
             }
             // The next message expected still goes in.
-            let next = Handshake {
-                msg_type: 1,
-                message_seq: r.next_seq(),
-                body: b.to_vec(),
-            };
+            let next = fixture_handshake(1, r.next_seq(), b.to_vec());
             match r.add(&next.to_fragment().unwrap()) {
                 Ok(_) => assert!(r.next_message().is_some()),
                 Err(e) => assert_eq!(e, Error::FragmentConflict),
@@ -2904,11 +2802,7 @@ mod tests {
 
             // Random messages, split into random fragments, passed in a random
             // order with repeats, and one byte at a time, come back whole.
-            let m = Handshake {
-                msg_type: rng.next() as u8,
-                message_seq: 0,
-                body: b.clone(),
-            };
+            let m = fixture_handshake(rng.next() as u8, 0, b.clone());
             // Few enough pieces that the gaps stay under the range limit.
             let step = (1 + rng.index(16)).max(b.len().div_ceil(MAX_FRAGMENT_RANGES));
             let mut parts = m.fragments(step).unwrap();

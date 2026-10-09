@@ -521,6 +521,10 @@ fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Erro
 
 #[cfg(test)]
 mod tests {
+    fn fixture_packet_request(called: Name, calling: Name) -> Packet {
+        Packet::Request { called, calling }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
@@ -627,10 +631,7 @@ mod tests {
         assert_eq!(over.to_bytes(), Err(Error::Unwritable));
         // Two of the longest names make the longest request.
         let full = Name::parse(&bytes).unwrap();
-        let req = Packet::Request {
-            called: full.clone(),
-            calling: full,
-        };
+        let req = fixture_packet_request(full.clone(), full);
         let wire = req.to_bytes().unwrap();
         assert_eq!(wire.len(), HEADER_LEN + 2 * MAX_NAME_LEN);
         assert_eq!(Packet::parse(&wire), Ok(req));
@@ -751,15 +752,9 @@ mod tests {
         for scope in bad {
             let name = Name { scope, ..fred() };
             assert_eq!(name.to_bytes(), Err(Error::Unwritable));
-            let req = Packet::Request {
-                called: name.clone(),
-                calling: fred(),
-            };
+            let req = fixture_packet_request(name.clone(), fred());
             assert_eq!(req.to_bytes(), Err(Error::Unwritable));
-            let req = Packet::Request {
-                called: fred(),
-                calling: name,
-            };
+            let req = fixture_packet_request(fred(), name);
             assert_eq!(req.to_bytes(), Err(Error::Unwritable));
         }
         // The longest label is fine.
@@ -773,10 +768,7 @@ mod tests {
     }
 
     fn request() -> Packet {
-        Packet::Request {
-            called: Name::new("FILESERVER", 0x20),
-            calling: Name::new("LAPTOP", 0),
-        }
+        fixture_packet_request(Name::new("FILESERVER", 0x20), Name::new("LAPTOP", 0))
     }
 
     #[test]
@@ -838,19 +830,13 @@ mod tests {
         for c in 0..=255u8 {
             assert_eq!(NegativeCode::from_code(c).code(), c);
         }
-        assert_eq!(NegativeCode::from_code(0x8f), NegativeCode::Unspecified);
-        assert_eq!(
-            NegativeCode::from_code(0x80),
-            NegativeCode::NotListeningOnCalledName
-        );
-        assert_eq!(
-            NegativeCode::from_code(0x81),
-            NegativeCode::NotListeningForCallingName
-        );
-        assert_eq!(
-            NegativeCode::from_code(0x83),
-            NegativeCode::InsufficientResources
-        );
+        fictionet::assert_cases! {
+            NegativeCode::from_code;
+            (0x8f) => NegativeCode::Unspecified,
+            (0x80) => NegativeCode::NotListeningOnCalledName,
+            (0x81) => NegativeCode::NotListeningForCallingName,
+            (0x83) => NegativeCode::InsufficientResources,
+        }
     }
 
     #[test]
@@ -1033,10 +1019,7 @@ mod tests {
                     <= MAX_NAME_LEN;
             assert_eq!(name.to_bytes().is_ok(), fits);
             contract::check_wire_value(&name);
-            contract::check_wire_value(&Packet::Request {
-                called: name,
-                calling: fred(),
-            });
+            contract::check_wire_value(&fixture_packet_request(name, fred()));
             contract::check_wire_value(&Packet::Negative(NegativeCode::Other(rng.next() as u8)));
         }
     }

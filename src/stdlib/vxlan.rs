@@ -337,6 +337,10 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
+    fn fixture_packet(vni: u32, frame: Vec<u8>) -> Packet {
+        Packet { vni, frame }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
@@ -360,26 +364,14 @@ mod tests {
         assert_eq!(p.to_bytes(), Ok(d));
         // The largest VNI.
         let p = Packet::parse(&[0x08, 0, 0, 0, 0xff, 0xff, 0xff, 0]).unwrap();
-        assert_eq!(
-            p,
-            Packet {
-                vni: MAX_VNI,
-                frame: vec![]
-            }
-        );
+        assert_eq!(p, fixture_packet(MAX_VNI, vec![]));
     }
 
     #[test]
     fn reserved_bits_are_ignored_and_written_as_zero() {
         let d = [0xf7 | flags::I, 0xaa, 0xbb, 0xcc, 0, 0, 7, 0xdd, 1, 2];
         let p = Packet::parse(&d).unwrap();
-        assert_eq!(
-            p,
-            Packet {
-                vni: 7,
-                frame: vec![1, 2]
-            }
-        );
+        assert_eq!(p, fixture_packet(7, vec![1, 2]));
         assert_eq!(p.to_bytes().unwrap(), [0x08, 0, 0, 0, 0, 0, 7, 0, 1, 2]);
         // In VXLAN-GPE: the two high bits, the 16 reserved bits and the
         // last byte.
@@ -426,22 +418,13 @@ mod tests {
         assert_eq!(Packet::parse(&[]), Err(Error::Truncated(0)));
         assert_eq!(GpePacket::parse(&[0x08; 7]), Err(Error::Truncated(7)));
         assert_eq!(Packet::parse(&[0, 0, 0, 0, 0, 0, 1, 0]), Err(Error::NoVni));
-        assert_eq!(
-            GpePacket::parse(&[0x04, 0, 0, 1, 0, 0, 1, 0]),
-            Err(Error::NoVni)
-        );
-        assert_eq!(
-            GpePacket::parse(&[0x18, 0, 0, 0, 0, 0, 1, 0]),
-            Err(Error::Version(1))
-        );
-        assert_eq!(
-            GpePacket::parse(&[0x38, 0, 0, 0, 0, 0, 1, 0]),
-            Err(Error::Version(3))
-        );
-        assert_eq!(
-            GpePacket::parse(&[0x08, 0, 0, 3, 0, 0, 1, 0]),
-            Err(Error::NextProtocolWithoutP(3))
-        );
+        fictionet::assert_cases! {
+            GpePacket::parse;
+            (&[0x04, 0, 0, 1, 0, 0, 1, 0]) => Err(Error::NoVni),
+            (&[0x18, 0, 0, 0, 0, 0, 1, 0]) => Err(Error::Version(1)),
+            (&[0x38, 0, 0, 0, 0, 0, 1, 0]) => Err(Error::Version(3)),
+            (&[0x08, 0, 0, 3, 0, 0, 1, 0]) => Err(Error::NextProtocolWithoutP(3)),
+        }
         let mut big = vec![0x08, 0, 0, 0, 0, 0, 1, 0];
         big.resize(MAX_DATAGRAM, 0);
         assert!(Packet::parse(&big).is_ok());
@@ -487,30 +470,21 @@ mod tests {
     fn writers_reject_a_vni_wider_than_24_bits() {
         // RFC 7348 section 5: the VNI is 24 bits. Masking would send the
         // frame to another network, so the writer refuses.
-        let p = Packet {
-            vni: 0x0100_0001,
-            frame: vec![0; 60],
-        };
+        let p = fixture_packet(0x0100_0001, vec![0; 60]);
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let g = GpePacket {
             vni: 0xab00_0001,
             ..GpePacket::default()
         };
         assert_eq!(g.to_bytes(), Err(Error::Unwritable));
-        let p = Packet {
-            vni: MAX_VNI,
-            frame: vec![],
-        };
+        let p = fixture_packet(MAX_VNI, vec![]);
         assert_eq!(p.to_bytes(), Ok(vec![0x08, 0, 0, 0, 0xff, 0xff, 0xff, 0]));
     }
 
     #[test]
     fn writers_reject_a_payload_too_long_for_a_datagram() {
         // The longest payload fits, at exactly the longest datagram.
-        let p = Packet {
-            vni: 1,
-            frame: vec![1; MAX_PAYLOAD],
-        };
+        let p = fixture_packet(1, vec![1; MAX_PAYLOAD]);
         let bytes = p.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_DATAGRAM);
         assert_eq!(Packet::parse(&bytes), Ok(p));
@@ -523,10 +497,7 @@ mod tests {
         assert_eq!(bytes.len(), MAX_DATAGRAM);
         assert_eq!(GpePacket::parse(&bytes), Ok(g));
         // One byte more is an error, not a cut frame.
-        let p = Packet {
-            vni: 1,
-            frame: vec![1; MAX_PAYLOAD + 1],
-        };
+        let p = fixture_packet(1, vec![1; MAX_PAYLOAD + 1]);
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let g = GpePacket {
             vni: 2,

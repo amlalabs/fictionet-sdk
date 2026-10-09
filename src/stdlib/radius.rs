@@ -1806,6 +1806,43 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_attribute(kind: u8, value: Vec<u8>) -> Attribute {
+        Attribute { kind, value }
+    }
+    fn fixture_value_ipv6_prefix(length: u8, prefix: Ipv6Addr) -> Value {
+        Value::Ipv6Prefix { length, prefix }
+    }
+    fn fixture_value_ipv4_prefix(length: u8, prefix: Ipv4Addr) -> Value {
+        Value::Ipv4Prefix { length, prefix }
+    }
+    fn fixture_vsa(vendor: u32, data: Vec<u8>) -> Vsa {
+        Vsa { vendor, data }
+    }
+    fn fixture_evs(vendor: u32, evs_type: u8, data: Vec<u8>) -> Evs {
+        Evs {
+            vendor,
+            evs_type,
+            data,
+        }
+    }
+    fn fixture_value_extended(ext_type: u8, data: Vec<u8>) -> Value {
+        Value::Extended { ext_type, data }
+    }
+    fn fixture_value_long_extended(ext_type: u8, more: bool, data: Vec<u8>) -> Value {
+        Value::LongExtended {
+            ext_type,
+            more,
+            data,
+        }
+    }
+    fn fixture_extended(kind: u8, ext_type: u8, data: Vec<u8>) -> Extended {
+        Extended {
+            kind,
+            ext_type,
+            data,
+        }
+    }
+
     use super::harness::check_datagram;
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
@@ -1851,10 +1888,7 @@ mod tests {
         for data_type in [DataType::String, DataType::Concat] {
             assert_eq!(
                 Attribute::from_value_as(1, data_type, &short),
-                Some(Attribute {
-                    kind: 1,
-                    value: vec![1]
-                })
+                Some(fixture_attribute(1, vec![1]))
             );
         }
     }
@@ -2021,13 +2055,7 @@ mod tests {
         let p = Packet::parse(&b[..22]).unwrap();
         // Bytes past the length are padding.
         assert_eq!(Packet::parse_datagram(&b), Ok(p.clone()));
-        assert_eq!(
-            p.attributes,
-            [Attribute {
-                kind: 1,
-                value: vec![]
-            }]
-        );
+        assert_eq!(p.attributes, [fixture_attribute(1, vec![])]);
         assert_eq!(p.to_bytes().unwrap(), b[..22]);
         // Padding is outside the packet length limit too.
         b.resize(MAX_PACKET + 1, 9);
@@ -2065,21 +2093,12 @@ mod tests {
         // A Disconnect-Request for one session, which the NAS refuses with
         // Error-Cause 503, Session Context Not Found (RFC 5176).
         let mut req = Packet::new(Code::DisconnectRequest, 9, [0; 16]);
-        req.push(Attribute {
-            kind: attr::ACCT_SESSION_ID,
-            value: b"s-1".to_vec(),
-        })
-        .unwrap();
-        req.push(Attribute {
-            kind: attr::PROXY_STATE,
-            value: vec![1, 2],
-        })
-        .unwrap();
-        req.push(Attribute {
-            kind: attr::PROXY_STATE,
-            value: vec![3],
-        })
-        .unwrap();
+        req.push(fixture_attribute(attr::ACCT_SESSION_ID, b"s-1".to_vec()))
+            .unwrap();
+        req.push(fixture_attribute(attr::PROXY_STATE, vec![1, 2]))
+            .unwrap();
+        req.push(fixture_attribute(attr::PROXY_STATE, vec![3]))
+            .unwrap();
         let req = Packet::parse(&req.to_bytes().unwrap()).unwrap();
         let mut nak = req.reply(Code::DisconnectNak);
         assert_eq!(nak.attributes.len(), 2);
@@ -2154,99 +2173,48 @@ mod tests {
             ),
             (
                 DataType::Ipv6Prefix,
-                Value::Ipv6Prefix {
-                    length: 64,
-                    prefix: "2001:db8:1:2::".parse().unwrap(),
-                },
+                fixture_value_ipv6_prefix(64, "2001:db8:1:2::".parse().unwrap()),
             ),
             (
                 DataType::Ipv6Prefix,
-                Value::Ipv6Prefix {
-                    length: 0,
-                    prefix: Ipv6Addr::UNSPECIFIED,
-                },
+                fixture_value_ipv6_prefix(0, Ipv6Addr::UNSPECIFIED),
             ),
             (
                 DataType::Ipv6Prefix,
-                Value::Ipv6Prefix {
-                    length: 128,
-                    prefix: "::1".parse().unwrap(),
-                },
+                fixture_value_ipv6_prefix(128, "::1".parse().unwrap()),
             ),
             (
                 DataType::Ipv6Prefix,
-                Value::Ipv6Prefix {
-                    length: 3,
-                    prefix: "e000::".parse().unwrap(),
-                },
+                fixture_value_ipv6_prefix(3, "e000::".parse().unwrap()),
             ),
             (
                 DataType::Ipv4Prefix,
-                Value::Ipv4Prefix {
-                    length: 24,
-                    prefix: Ipv4Addr::new(10, 1, 2, 0),
-                },
+                fixture_value_ipv4_prefix(24, Ipv4Addr::new(10, 1, 2, 0)),
             ),
             (
                 DataType::InterfaceId,
                 Value::InterfaceId([1, 2, 3, 4, 5, 6, 7, 8]),
             ),
-            (
-                DataType::Vsa,
-                Value::Vsa(Vsa {
-                    vendor: 9,
-                    data: vec![1, 3, b'x'],
-                }),
-            ),
+            (DataType::Vsa, Value::Vsa(fixture_vsa(9, vec![1, 3, b'x']))),
             (
                 DataType::Ipv4Prefix,
-                Value::Ipv4Prefix {
-                    length: 32,
-                    prefix: Ipv4Addr::UNSPECIFIED,
-                },
+                fixture_value_ipv4_prefix(32, Ipv4Addr::UNSPECIFIED),
             ),
+            (DataType::Evs, Value::Evs(fixture_evs(9, 4, vec![1]))),
+            (DataType::Extended, fixture_value_extended(1, vec![5])),
             (
-                DataType::Evs,
-                Value::Evs(Evs {
-                    vendor: 9,
-                    evs_type: 4,
-                    data: vec![1],
-                }),
-            ),
-            (
-                DataType::Extended,
-                Value::Extended {
-                    ext_type: 1,
-                    data: vec![5],
-                },
+                DataType::LongExtended,
+                fixture_value_long_extended(26, true, vec![5; MAX_LONG_FRAGMENT]),
             ),
             (
                 DataType::LongExtended,
-                Value::LongExtended {
-                    ext_type: 26,
-                    more: true,
-                    data: vec![5; MAX_LONG_FRAGMENT],
-                },
-            ),
-            (
-                DataType::LongExtended,
-                Value::LongExtended {
-                    ext_type: 1,
-                    more: false,
-                    data: vec![1],
-                },
+                fixture_value_long_extended(1, false, vec![1]),
             ),
             (
                 DataType::Tlv,
                 Value::Tlv(vec![
-                    Attribute {
-                        kind: 1,
-                        value: vec![1, 2],
-                    },
-                    Attribute {
-                        kind: 2,
-                        value: vec![3],
-                    },
+                    fixture_attribute(1, vec![1, 2]),
+                    fixture_attribute(2, vec![3]),
                 ]),
             ),
         ];
@@ -2271,32 +2239,20 @@ mod tests {
         }
         assert_eq!(Value::String(vec![]).data_type(), DataType::String);
         // Wire forms.
-        let p = Value::Ipv6Prefix {
-            length: 64,
-            prefix: "2001:db8:1:2::".parse().unwrap(),
-        };
+        let p = fixture_value_ipv6_prefix(64, "2001:db8:1:2::".parse().unwrap());
         assert_eq!(
             p.to_attribute(1).map(|a| a.value).unwrap(),
             hex("00 40 20 01 0d b8 00 01 00 02")
         );
-        let p = Value::Ipv4Prefix {
-            length: 24,
-            prefix: Ipv4Addr::new(10, 1, 2, 0),
-        };
+        let p = fixture_value_ipv4_prefix(24, Ipv4Addr::new(10, 1, 2, 0));
         assert_eq!(
             p.to_attribute(1).map(|a| a.value).unwrap(),
             [0, 24, 10, 1, 2, 0]
         );
         // Prefixes with stray bits or excessive lengths are refused.
-        let p = Value::Ipv4Prefix {
-            length: 40,
-            prefix: Ipv4Addr::new(1, 2, 3, 4),
-        };
+        let p = fixture_value_ipv4_prefix(40, Ipv4Addr::new(1, 2, 3, 4));
         assert_eq!(p.to_attribute(1), None);
-        let p = Value::Ipv6Prefix {
-            length: 4,
-            prefix: "ffff::".parse().unwrap(),
-        };
+        let p = fixture_value_ipv6_prefix(4, "ffff::".parse().unwrap());
         assert_eq!(p.to_attribute(1), None);
         // A full-length IPv6 prefix field is also read, and the reserved
         // byte is ignored.
@@ -2328,61 +2284,28 @@ mod tests {
                 Err(Error::ValueLength(n - 1))
             );
         }
-        assert_eq!(
-            Value::decode(T::Ipv6Address, &[0; 15]),
-            Err(Error::ValueLength(15))
-        );
-        assert_eq!(
-            Value::decode(T::InterfaceId, &[0; 7]),
-            Err(Error::ValueLength(7))
-        );
-        assert_eq!(
-            Value::decode(T::Ipv4Prefix, &[0; 5]),
-            Err(Error::ValueLength(5))
-        );
-        assert_eq!(
-            Value::decode(T::Ipv6Prefix, &[0]),
-            Err(Error::ValueLength(1))
-        );
-        assert_eq!(
-            Value::decode(T::Ipv6Prefix, &[0; 19]),
-            Err(Error::ValueLength(19))
-        );
-        // Prefix length past the address, too few bytes, bits past the
-        // length.
-        assert_eq!(Value::decode(T::Ipv6Prefix, &[0, 129]), Err(Error::Prefix));
-        assert_eq!(
-            Value::decode(T::Ipv6Prefix, &[0, 17, 1, 2]),
-            Err(Error::Prefix)
-        );
-        assert_eq!(
-            Value::decode(T::Ipv6Prefix, &[0, 4, 0xf8]),
-            Err(Error::Prefix)
-        );
-        assert_eq!(
-            Value::decode(T::Ipv4Prefix, &[0, 33, 0, 0, 0, 0]),
-            Err(Error::Prefix)
-        );
-        assert_eq!(
-            Value::decode(T::Ipv4Prefix, &[0, 8, 1, 1, 0, 0]),
-            Err(Error::Prefix)
-        );
-        assert_eq!(
-            Value::decode(T::Vsa, &[0, 0, 1]),
-            Err(Error::ValueLength(3))
-        );
-        assert_eq!(
-            Value::decode(T::Evs, &[0, 0, 0, 1]),
-            Err(Error::ValueLength(4))
-        );
-        assert_eq!(Value::decode(T::Extended, &[]), Err(Error::ValueLength(0)));
-        assert_eq!(
-            Value::decode(T::LongExtended, &[1]),
-            Err(Error::ValueLength(1))
-        );
-        assert_eq!(Value::decode(T::Tlv, &[1, 1]), Err(Error::Nested));
-        assert_eq!(Value::decode(T::Tlv, &[1, 4, 0]), Err(Error::Nested));
-        assert_eq!(Value::decode(T::Tlv, &[1]), Err(Error::Nested));
+        fictionet::assert_cases! {
+            Value::decode;
+            (T::Ipv6Address, &[0; 15]) => Err(Error::ValueLength(15)),
+            (T::InterfaceId, &[0; 7]) => Err(Error::ValueLength(7)),
+            (T::Ipv4Prefix, &[0; 5]) => Err(Error::ValueLength(5)),
+            (T::Ipv6Prefix, &[0]) => Err(Error::ValueLength(1)),
+            (T::Ipv6Prefix, &[0; 19]) => Err(Error::ValueLength(19)),
+            // Prefix length past the address, too few bytes, bits past the
+            // length.
+            (T::Ipv6Prefix, &[0, 129]) => Err(Error::Prefix),
+            (T::Ipv6Prefix, &[0, 17, 1, 2]) => Err(Error::Prefix),
+            (T::Ipv6Prefix, &[0, 4, 0xf8]) => Err(Error::Prefix),
+            (T::Ipv4Prefix, &[0, 33, 0, 0, 0, 0]) => Err(Error::Prefix),
+            (T::Ipv4Prefix, &[0, 8, 1, 1, 0, 0]) => Err(Error::Prefix),
+            (T::Vsa, &[0, 0, 1]) => Err(Error::ValueLength(3)),
+            (T::Evs, &[0, 0, 0, 1]) => Err(Error::ValueLength(4)),
+            (T::Extended, &[]) => Err(Error::ValueLength(0)),
+            (T::LongExtended, &[1]) => Err(Error::ValueLength(1)),
+            (T::Tlv, &[1, 1]) => Err(Error::Nested),
+            (T::Tlv, &[1, 4, 0]) => Err(Error::Nested),
+            (T::Tlv, &[1]) => Err(Error::Nested),
+        }
         for e in [
             Error::ValueLength(1),
             Error::Text,
@@ -2395,11 +2318,7 @@ mod tests {
         assert!(!Error::Unwritable.to_string().is_empty());
         // An attribute the dictionary does not know reads as bytes.
         assert_eq!(
-            Attribute {
-                kind: 200,
-                value: vec![1]
-            }
-            .decode(),
+            fixture_attribute(200, vec![1]).decode(),
             Ok(Value::String(vec![1]))
         );
     }
@@ -2407,14 +2326,7 @@ mod tests {
     #[test]
     fn vendor_specific() {
         // Vendor 311 (Microsoft), sub-attribute 1 holding "ab".
-        let vsa = Vsa::from_sub_attributes(
-            311,
-            &[Attribute {
-                kind: 1,
-                value: b"ab".to_vec(),
-            }],
-        )
-        .unwrap();
+        let vsa = Vsa::from_sub_attributes(311, &[fixture_attribute(1, b"ab".to_vec())]).unwrap();
         let a = Attribute::from_value(attr::VENDOR_SPECIFIC, &Value::Vsa(vsa.clone())).unwrap();
         assert_eq!(a.value, [0, 0, 1, 0x37, 1, 4, b'a', b'b']);
         let Ok(Value::Vsa(back)) = a.decode() else {
@@ -2423,54 +2335,24 @@ mod tests {
         assert_eq!(back, vsa);
         assert_eq!(
             back.sub_attributes().unwrap(),
-            [Attribute {
-                kind: 1,
-                value: b"ab".to_vec()
-            }]
+            [fixture_attribute(1, b"ab".to_vec())]
         );
         // Bytes that are not sub-attributes.
-        let odd = Vsa {
-            vendor: 1,
-            data: vec![1, 9],
-        };
+        let odd = fixture_vsa(1, vec![1, 9]);
         assert_eq!(odd.sub_attributes(), Err(Error::Nested));
         // Sub-attributes that do not fit in one attribute, or none at all,
         // are refused rather than cut.
         assert_eq!(
-            Vsa::from_sub_attributes(
-                1,
-                &[Attribute {
-                    kind: 1,
-                    value: vec![0; 300]
-                }]
-            ),
+            Vsa::from_sub_attributes(1, &[fixture_attribute(1, vec![0; 300])]),
             None
         );
         assert_eq!(
-            Vsa::from_sub_attributes(
-                1,
-                &[Attribute {
-                    kind: 1,
-                    value: vec![0; 248]
-                }]
-            ),
+            Vsa::from_sub_attributes(1, &[fixture_attribute(1, vec![0; 248])]),
             None
         );
-        assert!(
-            Vsa::from_sub_attributes(
-                1,
-                &[Attribute {
-                    kind: 1,
-                    value: vec![0; 247]
-                }]
-            )
-            .is_some()
-        );
+        assert!(Vsa::from_sub_attributes(1, &[fixture_attribute(1, vec![0; 247])]).is_some());
         assert_eq!(Vsa::from_sub_attributes(1, &[]), None);
-        let big = Vsa {
-            vendor: 1,
-            data: vec![0; 250],
-        };
+        let big = fixture_vsa(1, vec![0; 250]);
         assert_eq!(big.to_bytes(), Err(Error::Unwritable));
         assert!(Attribute::from_value(attr::VENDOR_SPECIFIC, &Value::Vsa(big)).is_none());
     }
@@ -2489,27 +2371,16 @@ mod tests {
     #[test]
     fn extended_attributes() {
         let mut p = Packet::new(Code::AccessRequest, 1, [0; 16]);
-        let short = Extended {
-            kind: attr::EXTENDED_TYPE_1,
-            ext_type: 3,
-            data: vec![1, 2, 3],
-        };
-        let evs = Evs {
-            vendor: 9,
-            evs_type: 1,
-            data: vec![7; 600],
-        };
-        let long = Extended {
-            kind: attr::LONG_EXTENDED_TYPE_1,
-            ext_type: EXTENDED_VENDOR_SPECIFIC,
-            data: evs.to_bytes().unwrap(),
-        };
+        let short = fixture_extended(attr::EXTENDED_TYPE_1, 3, vec![1, 2, 3]);
+        let evs = fixture_evs(9, 1, vec![7; 600]);
+        let long = fixture_extended(
+            attr::LONG_EXTENDED_TYPE_1,
+            EXTENDED_VENDOR_SPECIFIC,
+            evs.to_bytes().unwrap(),
+        );
         p.push_extended(&short).unwrap();
-        p.push(Attribute {
-            kind: attr::USER_NAME,
-            value: b"u".to_vec(),
-        })
-        .unwrap();
+        p.push(fixture_attribute(attr::USER_NAME, b"u".to_vec()))
+            .unwrap();
         p.push_extended(&long).unwrap();
         // 605 bytes take three fragments: 251, 251 and 103.
         let frags: Vec<_> = p.all(attr::LONG_EXTENDED_TYPE_1).collect();
@@ -2519,11 +2390,7 @@ mod tests {
         assert_eq!(frags[2].value[1], 0);
         assert_eq!(
             frags[0].decode().unwrap(),
-            Value::LongExtended {
-                ext_type: 26,
-                more: true,
-                data: frags[0].value[2..].to_vec()
-            }
+            fixture_value_long_extended(26, true, frags[0].value[2..].to_vec())
         );
         let back = Packet::parse(&p.to_bytes().unwrap()).unwrap();
         let ext: Vec<Extended> = back.extended().into_iter().map(Result::unwrap).collect();
@@ -2533,10 +2400,7 @@ mod tests {
         assert_eq!(ext[0].evs(), None);
         assert_eq!(
             back.get(attr::EXTENDED_TYPE_1).unwrap().decode(),
-            Ok(Value::Extended {
-                ext_type: 3,
-                data: vec![1, 2, 3]
-            })
+            Ok(fixture_value_extended(3, vec![1, 2, 3]))
         );
 
         // RFC 6929, section 2.2: the attribute right after a fragment with
@@ -2563,10 +2427,7 @@ mod tests {
         );
         q.attributes = vec![
             f(1, true, 251),
-            Attribute {
-                kind: 1,
-                value: b"u".to_vec(),
-            },
+            fixture_attribute(1, b"u".to_vec()),
             f(1, false, 2),
         ];
         assert_eq!(
@@ -2581,106 +2442,41 @@ mod tests {
         q.attributes = vec![f(1, true, 10), f(1, false, 1)];
         assert_eq!(
             q.extended(),
-            [
-                Err(Error::Fragment),
-                Ok(Extended {
-                    kind: 246,
-                    ext_type: 1,
-                    data: vec![1]
-                })
-            ]
+            [Err(Error::Fragment), Ok(fixture_extended(246, 1, vec![1]))]
         );
         q.attributes = vec![f(1, true, 251)];
         assert_eq!(q.extended(), [Err(Error::Fragment)]);
-        q.attributes = vec![Attribute {
-            kind: 246,
-            value: vec![1],
-        }];
+        q.attributes = vec![fixture_attribute(246, vec![1])];
         assert_eq!(q.extended(), [Err(Error::ValueLength(1))]);
         q.attributes = vec![f(1, false, 0)];
         assert_eq!(q.extended(), [Err(Error::ValueLength(2))]);
         q.attributes = vec![
-            Attribute {
-                kind: 241,
-                value: vec![],
-            },
-            Attribute {
-                kind: 242,
-                value: vec![7],
-            },
+            fixture_attribute(241, vec![]),
+            fixture_attribute(242, vec![7]),
         ];
         assert_eq!(
             q.extended(),
             [Err(Error::ValueLength(0)), Err(Error::ValueLength(1))]
         );
         assert_eq!(
-            Extended {
-                kind: 241,
-                ext_type: 26,
-                data: vec![1]
-            }
-            .evs(),
+            fixture_extended(241, 26, vec![1]).evs(),
             Some(Err(Error::ValueLength(1)))
         );
 
         // Values that cannot be written: wrong type, empty, too long.
-        assert_eq!(
-            Extended {
-                kind: 1,
-                ext_type: 1,
-                data: vec![1]
-            }
-            .to_attributes(),
-            None
-        );
-        assert_eq!(
-            Extended {
-                kind: 241,
-                ext_type: 1,
-                data: vec![]
-            }
-            .to_attributes(),
-            None
-        );
-        assert_eq!(
-            Extended {
-                kind: 246,
-                ext_type: 1,
-                data: vec![]
-            }
-            .to_attributes(),
-            None
-        );
-        assert_eq!(
-            Extended {
-                kind: 241,
-                ext_type: 1,
-                data: vec![0; 253]
-            }
-            .to_attributes(),
-            None
-        );
+        assert_eq!(fixture_extended(1, 1, vec![1]).to_attributes(), None);
+        assert_eq!(fixture_extended(241, 1, vec![]).to_attributes(), None);
+        assert_eq!(fixture_extended(246, 1, vec![]).to_attributes(), None);
+        assert_eq!(fixture_extended(241, 1, vec![0; 253]).to_attributes(), None);
         assert!(
-            Extended {
-                kind: 241,
-                ext_type: 1,
-                data: vec![0; 252]
-            }
-            .to_attributes()
-            .is_some()
+            fixture_extended(241, 1, vec![0; 252])
+                .to_attributes()
+                .is_some()
         );
-        let huge = Extended {
-            kind: 245,
-            ext_type: 1,
-            data: vec![0; MAX_LONG_EXTENDED_VALUE + 1],
-        };
+        let huge = fixture_extended(245, 1, vec![0; MAX_LONG_EXTENDED_VALUE + 1]);
         assert_eq!(huge.to_attributes(), None);
         // The largest long value fills a packet exactly as far as it can.
-        let most = Extended {
-            kind: 245,
-            ext_type: 1,
-            data: vec![0; MAX_LONG_EXTENDED_VALUE],
-        };
+        let most = fixture_extended(245, 1, vec![0; MAX_LONG_EXTENDED_VALUE]);
         let mut r = Packet::new(Code::AccessAccept, 1, [0; 16]);
         r.push_extended(&most).unwrap();
         assert_eq!(r.encoded_len(), MAX_PACKET);
@@ -2702,10 +2498,7 @@ mod tests {
         assert_eq!(Value::decode(T::Extended, &[1]), Err(Error::ValueLength(1)));
         assert_eq!(
             Value::decode(T::Extended, &[1, 0]),
-            Ok(Value::Extended {
-                ext_type: 1,
-                data: vec![0]
-            })
+            Ok(fixture_value_extended(1, vec![0]))
         );
         // Long extended: Length 5 or more.
         assert_eq!(
@@ -2714,30 +2507,21 @@ mod tests {
         );
         assert!(Value::decode(T::LongExtended, &[1, 0x7f, 0]).is_ok());
         // The More flag only on a full-length fragment.
-        assert_eq!(
-            Value::decode(T::LongExtended, &[1, MORE_FLAG, 9]),
-            Err(Error::Fragment)
-        );
-        // TLV: each TLV-Length 3 or more, and the value one or more bytes.
-        assert_eq!(Value::decode(T::Tlv, &[1, 2]), Err(Error::Nested));
-        assert_eq!(Value::decode(T::Tlv, &[1, 3, 0, 2, 2]), Err(Error::Nested));
-        assert_eq!(Value::decode(T::Tlv, &[]), Err(Error::ValueLength(0)));
-        // EVS: one or more bytes of EVS-Value.
-        assert_eq!(
-            Value::decode(T::Evs, &[0, 0, 0, 9, 1]),
-            Err(Error::ValueLength(5))
-        );
-        // Vendor-Specific: Length 7 or more (RFC 2865).
-        assert_eq!(
-            Value::decode(T::Vsa, &[0, 0, 0, 9]),
-            Err(Error::ValueLength(4))
-        );
+        fictionet::assert_cases! {
+            Value::decode;
+            (T::LongExtended, &[1, MORE_FLAG, 9]) => Err(Error::Fragment),
+            // TLV: each TLV-Length 3 or more, and the value one or more bytes.
+            (T::Tlv, &[1, 2]) => Err(Error::Nested),
+            (T::Tlv, &[1, 3, 0, 2, 2]) => Err(Error::Nested),
+            (T::Tlv, &[]) => Err(Error::ValueLength(0)),
+            // EVS: one or more bytes of EVS-Value.
+            (T::Evs, &[0, 0, 0, 9, 1]) => Err(Error::ValueLength(5)),
+            // Vendor-Specific: Length 7 or more (RFC 2865).
+            (T::Vsa, &[0, 0, 0, 9]) => Err(Error::ValueLength(4)),
+        }
         assert!(Value::decode(T::Vsa, &[0, 0, 0, 9, 1]).is_ok());
         // Writers refuse what readers refuse.
-        let empty_tlv = Value::Tlv(vec![Attribute {
-            kind: 1,
-            value: vec![],
-        }]);
+        let empty_tlv = Value::Tlv(vec![fixture_attribute(1, vec![])]);
         assert_eq!(Attribute::from_value_as(1, T::Tlv, &empty_tlv), None);
         assert_eq!(
             Attribute::from_value_as(1, T::Tlv, &Value::Tlv(vec![])),
@@ -2745,65 +2529,32 @@ mod tests {
         );
         assert_eq!(Value::Tlv(vec![]).to_attribute(1).map(|a| a.value), None);
         assert_eq!(Vsa::from_sub_attributes(9, &[]), None);
+        assert_eq!(fixture_vsa(9, vec![]).to_bytes(), Err(Error::Unwritable));
         assert_eq!(
-            Vsa {
-                vendor: 9,
-                data: vec![]
-            }
-            .to_bytes(),
-            Err(Error::Unwritable)
+            Value::Vsa(fixture_vsa(9, vec![]))
+                .to_attribute(1)
+                .map(|a| a.value),
+            None
         );
+        assert_eq!(fixture_evs(9, 1, vec![]).to_bytes(), Err(Error::Unwritable));
         assert_eq!(
-            Value::Vsa(Vsa {
-                vendor: 9,
-                data: vec![]
-            })
-            .to_attribute(1)
-            .map(|a| a.value),
+            Value::Evs(fixture_evs(9, 1, vec![]))
+                .to_attribute(1)
+                .map(|a| a.value),
             None
         );
         assert_eq!(
-            Evs {
-                vendor: 9,
-                evs_type: 1,
-                data: vec![]
-            }
-            .to_bytes(),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            Value::Evs(Evs {
-                vendor: 9,
-                evs_type: 1,
-                data: vec![]
-            })
-            .to_attribute(1)
-            .map(|a| a.value),
+            fixture_value_extended(1, vec![])
+                .to_attribute(1)
+                .map(|a| a.value),
             None
         );
-        assert_eq!(
-            Value::Extended {
-                ext_type: 1,
-                data: vec![]
-            }
-            .to_attribute(1)
-            .map(|a| a.value),
-            None
-        );
-        let short_more = Value::LongExtended {
-            ext_type: 1,
-            more: true,
-            data: vec![1],
-        };
+        let short_more = fixture_value_long_extended(1, true, vec![1]);
         assert_eq!(short_more.to_attribute(1).map(|a| a.value), None);
         assert_eq!(Attribute::from_value(245, &short_more), None);
         let mut p = Packet::new(Code::AccessRequest, 1, [0; 16]);
         assert_eq!(
-            p.push_extended(&Extended {
-                kind: 241,
-                ext_type: 1,
-                data: vec![]
-            }),
+            p.push_extended(&fixture_extended(241, 1, vec![])),
             Err(Error::Unwritable)
         );
     }
@@ -2826,13 +2577,7 @@ mod tests {
             [Err(Error::Fragment), one(vec![2], 2), one(vec![1, 1], 1)]
         );
         // A broken fragment ends the value it would continue.
-        q.attributes = vec![
-            f(1, true, 251),
-            Attribute {
-                kind: 246,
-                value: vec![1],
-            },
-        ];
+        q.attributes = vec![f(1, true, 251), fixture_attribute(246, vec![1])];
         assert_eq!(
             q.extended(),
             [Err(Error::Fragment), Err(Error::ValueLength(1))]
@@ -2847,35 +2592,18 @@ mod tests {
         // RFC 6929, section 2.8.
         let mut q = Packet::new(Code::AccessAccept, 1, [0; 16]);
         q.attributes = vec![
-            Attribute {
-                kind: 241,
-                value: vec![5, 1],
-            },
-            Attribute {
-                kind: 241,
-                value: vec![],
-            },
+            fixture_attribute(241, vec![5, 1]),
+            fixture_attribute(241, vec![]),
             f(3, true, 251),
-            Attribute {
-                kind: 242,
-                value: vec![6, 2],
-            },
+            fixture_attribute(242, vec![6, 2]),
         ];
         assert_eq!(
             q.extended(),
             [
-                Ok(Extended {
-                    kind: 241,
-                    ext_type: 5,
-                    data: vec![1]
-                }),
+                Ok(fixture_extended(241, 5, vec![1])),
                 Err(Error::ValueLength(0)),
                 Err(Error::Fragment),
-                Ok(Extended {
-                    kind: 242,
-                    ext_type: 6,
-                    data: vec![2]
-                }),
+                Ok(fixture_extended(242, 6, vec![2])),
             ]
         );
     }
@@ -2891,10 +2619,7 @@ mod tests {
             Value::decode(DataType::Ipv4Prefix, &[0, 0, 0, 0, 0, 0]),
             Err(Error::Prefix)
         );
-        let zero = Value::Ipv4Prefix {
-            length: 0,
-            prefix: Ipv4Addr::new(10, 0, 0, 0),
-        };
+        let zero = fixture_value_ipv4_prefix(0, Ipv4Addr::new(10, 0, 0, 0));
         assert_eq!(zero.to_attribute(1), None);
     }
 
@@ -2977,10 +2702,7 @@ mod tests {
         assert_eq!(enum_name(attr::INGRESS_FILTERS, 2), Some("Disabled"));
         // The IPX network reads as an address: RFC 2865's example
         // 0xFFFFFFFE.
-        let a = Attribute {
-            kind: attr::FRAMED_IPX_NETWORK,
-            value: vec![255, 255, 255, 254],
-        };
+        let a = fixture_attribute(attr::FRAMED_IPX_NETWORK, vec![255, 255, 255, 254]);
         assert_eq!(
             a.decode(),
             Ok(Value::Address(Ipv4Addr::new(255, 255, 255, 254)))
@@ -3019,13 +2741,7 @@ mod tests {
             assert_eq!(lookup_name(a.name), Some(a));
         }
         assert_eq!(
-            Attribute {
-                kind: 1,
-                value: vec![]
-            }
-            .info()
-            .unwrap()
-            .data_type,
+            fixture_attribute(1, vec![]).info().unwrap().data_type,
             DataType::Text
         );
     }
@@ -3035,10 +2751,10 @@ mod tests {
         // A value past MAX_VALUE is refused, not cut: cutting
         // "é".repeat(127) would leave text that is not UTF-8.
         let mut p = Packet::new(Code::AccessAccept, 1, [0; 16]);
-        p.attributes.push(Attribute {
-            kind: attr::USER_NAME,
-            value: "é".repeat(127).into_bytes(),
-        });
+        p.attributes.push(fixture_attribute(
+            attr::USER_NAME,
+            "é".repeat(127).into_bytes(),
+        ));
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         assert!(Attribute::from_value(attr::CLASS, &Value::String(vec![0; 254])).is_none());
         assert_eq!(
@@ -3046,10 +2762,7 @@ mod tests {
             None
         );
         assert_eq!(
-            p.push(Attribute {
-                kind: 1,
-                value: vec![0; 254]
-            }),
+            p.push(fixture_attribute(1, vec![0; 254])),
             Err(Error::Unwritable)
         );
         // A packet past MAX_PACKET is refused, not cut: the Session-Timeout
@@ -3057,15 +2770,11 @@ mod tests {
         // left out.
         let mut p = Packet::new(Code::AccessAccept, 1, [0; 16]);
         for _ in 0..15 {
-            p.attributes.push(Attribute {
-                kind: attr::CLASS,
-                value: vec![2; MAX_VALUE],
-            });
+            p.attributes
+                .push(fixture_attribute(attr::CLASS, vec![2; MAX_VALUE]));
         }
-        p.attributes.push(Attribute {
-            kind: attr::CLASS,
-            value: vec![2; 249],
-        });
+        p.attributes
+            .push(fixture_attribute(attr::CLASS, vec![2; 249]));
         assert_eq!(p.to_bytes().unwrap().len(), MAX_PACKET);
         p.attributes
             .push(Attribute::from_value(attr::SESSION_TIMEOUT, &Value::Integer(60)).unwrap());
@@ -3075,55 +2784,28 @@ mod tests {
         // got so.
         let mut p = Packet::new(Code::AccessAccept, 1, [0; 16]);
         for _ in 0..16 {
-            p.attributes.push(Attribute {
-                kind: attr::CLASS,
-                value: vec![1; MAX_VALUE],
-            });
+            p.attributes
+                .push(fixture_attribute(attr::CLASS, vec![1; MAX_VALUE]));
         }
         assert_eq!(p.encoded_len(), 4100);
         assert_eq!(
-            p.push(Attribute {
-                kind: attr::CLASS,
-                value: vec![1]
-            }),
+            p.push(fixture_attribute(attr::CLASS, vec![1])),
             Err(Error::Unwritable)
         );
-        let e = Extended {
-            kind: 241,
-            ext_type: 1,
-            data: vec![1],
-        };
+        let e = fixture_extended(241, 1, vec![1]);
         assert_eq!(p.push_extended(&e), Err(Error::Unwritable));
         assert_eq!(p.attributes.len(), 16);
         // push stops at the limit.
         let mut p = Packet::new(Code::AccessAccept, 1, [0; 16]);
-        while p
-            .push(Attribute {
-                kind: 1,
-                value: vec![],
-            })
-            .is_ok()
-        {}
+        while p.push(fixture_attribute(1, vec![])).is_ok() {}
         assert_eq!(p.attributes.len(), MAX_ATTRIBUTES);
         assert_eq!(p.to_bytes().unwrap().len(), MAX_PACKET);
         // TLVs past MAX_VALUE are refused, not cut.
-        let t = Value::Tlv(vec![Attribute {
-            kind: 1,
-            value: vec![0; 300],
-        }]);
+        let t = Value::Tlv(vec![fixture_attribute(1, vec![0; 300])]);
         assert_eq!(t.to_attribute(1).map(|a| a.value), None);
-        let t = Value::Tlv(vec![
-            Attribute {
-                kind: 1,
-                value: vec![0; 100]
-            };
-            3
-        ]);
+        let t = Value::Tlv(vec![fixture_attribute(1, vec![0; 100]); 3]);
         assert_eq!(t.to_attribute(1).map(|a| a.value), None);
-        let t = Value::Tlv(vec![Attribute {
-            kind: 1,
-            value: vec![0; 251],
-        }]);
+        let t = Value::Tlv(vec![fixture_attribute(1, vec![0; 251])]);
         assert_eq!(t.to_attribute(1).map(|a| a.value).unwrap().len(), MAX_VALUE);
         // Values too long for an attribute are refused before they are
         // copied.
@@ -3134,62 +2816,38 @@ mod tests {
             None
         );
         assert_eq!(
-            Value::Extended {
-                ext_type: 1,
-                data: vec![0; 253]
-            }
-            .to_attribute(1)
-            .map(|a| a.value),
+            fixture_value_extended(1, vec![0; 253])
+                .to_attribute(1)
+                .map(|a| a.value),
             None
         );
         assert_eq!(
-            Value::LongExtended {
-                ext_type: 1,
-                more: false,
-                data: vec![0; 252]
-            }
-            .to_attribute(1)
-            .map(|a| a.value),
+            fixture_value_long_extended(1, false, vec![0; 252])
+                .to_attribute(1)
+                .map(|a| a.value),
             None
         );
         assert_eq!(
-            Value::Evs(Evs {
-                vendor: 1,
-                evs_type: 1,
-                data: vec![0; 249]
-            })
-            .to_attribute(1)
-            .map(|a| a.value),
+            Value::Evs(fixture_evs(1, 1, vec![0; 249]))
+                .to_attribute(1)
+                .map(|a| a.value),
             None
         );
         assert!(
-            Value::Evs(Evs {
-                vendor: 1,
-                evs_type: 1,
-                data: vec![0; 248]
-            })
-            .to_attribute(1)
-            .map(|a| a.value)
-            .is_some()
+            Value::Evs(fixture_evs(1, 1, vec![0; 248]))
+                .to_attribute(1)
+                .map(|a| a.value)
+                .is_some()
         );
         // An extended vendor-specific value can be as long as a long
         // extended attribute carries.
         assert!(
-            Evs {
-                vendor: 1,
-                evs_type: 1,
-                data: vec![0; MAX_LONG_EXTENDED_VALUE - 5]
-            }
-            .to_bytes()
-            .is_ok()
+            fixture_evs(1, 1, vec![0; MAX_LONG_EXTENDED_VALUE - 5])
+                .to_bytes()
+                .is_ok()
         );
         assert_eq!(
-            Evs {
-                vendor: 1,
-                evs_type: 1,
-                data: vec![0; MAX_LONG_EXTENDED_VALUE - 4]
-            }
-            .to_bytes(),
+            fixture_evs(1, 1, vec![0; MAX_LONG_EXTENDED_VALUE - 4]).to_bytes(),
             Err(Error::Unwritable)
         );
     }
@@ -3236,18 +2894,12 @@ mod tests {
         // A packet of the longest length fills the decoder, and is read.
         let mut big = Packet::new(Code::AccessAccept, 2, [0; 16]);
         while big
-            .push(Attribute {
-                kind: attr::CLASS,
-                value: vec![1; MAX_VALUE],
-            })
+            .push(fixture_attribute(attr::CLASS, vec![1; MAX_VALUE]))
             .is_ok()
         {}
         let room = MAX_PACKET - big.encoded_len() - 2;
-        big.push(Attribute {
-            kind: attr::CLASS,
-            value: vec![2; room],
-        })
-        .unwrap();
+        big.push(fixture_attribute(attr::CLASS, vec![2; room]))
+            .unwrap();
         let bytes = big.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_PACKET);
         let mut d = Stream::new(Frames::<Packet>::new());
@@ -3275,52 +2927,31 @@ mod tests {
     #[test]
     fn from_value_refuses_values_that_read_back_changed() {
         // 0.0.0.0/0 would be written as 0.0.0.0/32, a different route.
-        let default_route = Value::Ipv4Prefix {
-            length: 0,
-            prefix: Ipv4Addr::UNSPECIFIED,
-        };
+        let default_route = fixture_value_ipv4_prefix(0, Ipv4Addr::UNSPECIFIED);
         assert_eq!(
             Attribute::from_value_as(1, DataType::Ipv4Prefix, &default_route),
             None
         );
         // Bits past the length, or a length past the address.
-        let stray = Value::Ipv4Prefix {
-            length: 8,
-            prefix: Ipv4Addr::new(10, 1, 0, 0),
-        };
+        let stray = fixture_value_ipv4_prefix(8, Ipv4Addr::new(10, 1, 0, 0));
         assert_eq!(
             Attribute::from_value_as(1, DataType::Ipv4Prefix, &stray),
             None
         );
-        let past = Value::Ipv4Prefix {
-            length: 40,
-            prefix: Ipv4Addr::new(1, 2, 3, 4),
-        };
+        let past = fixture_value_ipv4_prefix(40, Ipv4Addr::new(1, 2, 3, 4));
         assert_eq!(
             Attribute::from_value_as(1, DataType::Ipv4Prefix, &past),
             None
         );
-        let stray = Value::Ipv6Prefix {
-            length: 4,
-            prefix: "ffff::".parse().unwrap(),
-        };
+        let stray = fixture_value_ipv6_prefix(4, "ffff::".parse().unwrap());
         assert_eq!(Attribute::from_value(97, &stray), None);
-        let past = Value::Ipv6Prefix {
-            length: 200,
-            prefix: Ipv6Addr::UNSPECIFIED,
-        };
+        let past = fixture_value_ipv6_prefix(200, Ipv6Addr::UNSPECIFIED);
         assert_eq!(Attribute::from_value(97, &past), None);
         // A TLV value past MAX_VALUE.
-        let cut = Value::Tlv(vec![Attribute {
-            kind: 1,
-            value: vec![0; 260],
-        }]);
+        let cut = Value::Tlv(vec![fixture_attribute(1, vec![0; 260])]);
         assert_eq!(Attribute::from_value_as(1, DataType::Tlv, &cut), None);
         // The same values, written cleanly, are taken.
-        let clean = Value::Ipv4Prefix {
-            length: 8,
-            prefix: Ipv4Addr::new(10, 0, 0, 0),
-        };
+        let clean = fixture_value_ipv4_prefix(8, Ipv4Addr::new(10, 0, 0, 0));
         assert_eq!(
             Attribute::from_value_as(1, DataType::Ipv4Prefix, &clean)
                 .unwrap()
@@ -3409,13 +3040,8 @@ mod tests {
         );
         assert!(!sized(attr::CHAP_CHALLENGE, 4) && sized(attr::CHAP_CHALLENGE, 5));
         // RFC 2865, section 5.16: a TCP port.
-        let port = |p: u32| {
-            Attribute {
-                kind: attr::LOGIN_TCP_PORT,
-                value: p.to_be_bytes().to_vec(),
-            }
-            .decode()
-        };
+        let port =
+            |p: u32| fixture_attribute(attr::LOGIN_TCP_PORT, p.to_be_bytes().to_vec()).decode();
         assert_eq!(port(65535), Ok(Value::Integer(65535)));
         assert_eq!(port(65536), Err(Error::Range));
         assert_eq!(
@@ -3428,14 +3054,8 @@ mod tests {
     #[test]
     fn concat_values_are_consecutive() {
         // RFC 3579, section 3.1, and RFC 8044, section 3.6.
-        let eap = |v: u8| Attribute {
-            kind: attr::EAP_MESSAGE,
-            value: vec![v],
-        };
-        let user = Attribute {
-            kind: attr::USER_NAME,
-            value: b"u".to_vec(),
-        };
+        let eap = |v: u8| fixture_attribute(attr::EAP_MESSAGE, vec![v]);
+        let user = fixture_attribute(attr::USER_NAME, b"u".to_vec());
         let mut p = Packet::new(Code::AccessRequest, 1, [0; 16]);
         p.attributes = vec![user.clone(), eap(1), eap(2), user.clone()];
         assert_eq!(
@@ -3490,28 +3110,14 @@ mod tests {
             }
         }
         assert!(
-            Extended {
-                kind: 241,
-                ext_type: 240,
-                data: vec![1]
-            }
-            .to_attributes()
-            .is_some()
+            fixture_extended(241, 240, vec![1])
+                .to_attributes()
+                .is_some()
         );
         // Reading one still works, so a world sees what came.
         let mut p = Packet::new(Code::AccessRequest, 1, [0; 16]);
-        p.attributes = vec![Attribute {
-            kind: 241,
-            value: vec![255, 1],
-        }];
-        assert_eq!(
-            p.extended(),
-            [Ok(Extended {
-                kind: 241,
-                ext_type: 255,
-                data: vec![1]
-            })]
-        );
+        p.attributes = vec![fixture_attribute(241, vec![255, 1])];
+        assert_eq!(p.extended(), [Ok(fixture_extended(241, 255, vec![1]))]);
     }
 
     #[test]

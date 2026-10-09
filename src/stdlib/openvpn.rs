@@ -881,6 +881,30 @@ fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 
 #[cfg(test)]
 mod tests {
+    fn fixture_ack(ids: Vec<u32>, remote_session_id: SessionId) -> Ack {
+        Ack {
+            ids,
+            remote_session_id,
+        }
+    }
+    fn fixture_packet_data_v1(key_id: u8, payload: Vec<u8>) -> Packet {
+        Packet::DataV1 { key_id, payload }
+    }
+    fn fixture_packet_data_v2(key_id: u8, peer_id: u32, payload: Vec<u8>) -> Packet {
+        Packet::DataV2 {
+            key_id,
+            peer_id,
+            payload,
+        }
+    }
+    fn fixture_tls_auth(hmac: Vec<u8>, packet_id: u32, net_time: u32) -> TlsAuth {
+        TlsAuth {
+            hmac,
+            packet_id,
+            net_time,
+        }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
@@ -981,13 +1005,7 @@ mod tests {
         }) else {
             panic!()
         };
-        assert_eq!(
-            c.ack,
-            Some(Ack {
-                ids: vec![0],
-                remote_session_id: CLIENT_SID
-            })
-        );
+        assert_eq!(c.ack, Some(fixture_ack(vec![0], CLIENT_SID)));
         assert_eq!(c.session_id, SERVER_SID);
         assert_eq!(wire(&p).unwrap(), bytes);
     }
@@ -997,10 +1015,7 @@ mod tests {
         let c = Control {
             session_id: CLIENT_SID,
             tls_auth: None,
-            ack: Some(Ack {
-                ids: vec![1, 2],
-                remote_session_id: SERVER_SID,
-            }),
+            ack: Some(fixture_ack(vec![1, 2], SERVER_SID)),
             message_id: 3,
             payload: vec![0x16, 0x03, 0x01],
         };
@@ -1054,29 +1069,12 @@ mod tests {
     #[test]
     fn data_packets() {
         let p = Packet::parse_with(&[0x30, 1, 2, 3], Wrapping::None).unwrap();
-        assert_eq!(
-            p,
-            Packet::DataV1 {
-                key_id: 0,
-                payload: vec![1, 2, 3]
-            }
-        );
+        assert_eq!(p, fixture_packet_data_v1(0, vec![1, 2, 3]));
         let p =
             Packet::parse_with(&[0x49, 0x00, 0x00, 0x05, 0xde, 0xad], Wrapping::TlsCrypt).unwrap();
-        assert_eq!(
-            p,
-            Packet::DataV2 {
-                key_id: 1,
-                peer_id: 5,
-                payload: vec![0xde, 0xad]
-            }
-        );
+        assert_eq!(p, fixture_packet_data_v2(1, 5, vec![0xde, 0xad]));
         assert_eq!(wire(&p).unwrap(), [0x49, 0, 0, 5, 0xde, 0xad]);
-        let p = Packet::DataV2 {
-            key_id: 1,
-            peer_id: NO_PEER_ID,
-            payload: vec![],
-        };
+        let p = fixture_packet_data_v2(1, NO_PEER_ID, vec![]);
         assert_eq!(wire(&p).unwrap(), [0x49, 0xff, 0xff, 0xff]);
         assert_eq!(
             Packet::parse_with(&wire(&p).unwrap(), Wrapping::None),
@@ -1101,33 +1099,23 @@ mod tests {
         };
         assert_eq!(
             c.tls_auth,
-            Some(TlsAuth {
-                hmac: vec![0xee; 20],
-                packet_id: 1,
-                net_time: 0x5f00_0000
-            })
+            Some(fixture_tls_auth(vec![0xee; 20], 1, 0x5f00_0000))
         );
         assert_eq!(p.wrapping(), Wrapping::TlsAuth { hmac_len: 20 });
         assert_eq!(wire(&p).unwrap(), bytes);
-        assert_eq!(
-            Packet::parse_with(&bytes, Wrapping::TlsAuth { hmac_len: 65 }),
-            Err(Error::HmacLen(65))
-        );
-        // An HMAC length too long is refused before the bytes are read, so
-        // even a packet cut short says so.
-        assert_eq!(
-            Packet::parse_with(&bytes[..3], Wrapping::TlsAuth { hmac_len: 65 }),
-            Err(Error::HmacLen(65))
-        );
-        assert_eq!(
-            Packet::parse_with(
+        fictionet::assert_cases! {
+            Packet::parse_with;
+            (&bytes, Wrapping::TlsAuth { hmac_len: 65 }) => Err(Error::HmacLen(65)),
+            // An HMAC length too long is refused before the bytes are read, so
+            // even a packet cut short says so.
+            (&bytes[..3], Wrapping::TlsAuth { hmac_len: 65 }) => Err(Error::HmacLen(65)),
+            (
                 &bytes,
                 Wrapping::TlsAuth {
-                    hmac_len: usize::MAX
-                }
-            ),
-            Err(Error::HmacLen(usize::MAX))
-        );
+                    hmac_len: usize::MAX,
+                },
+            ) => Err(Error::HmacLen(usize::MAX)),
+        }
         // Data packets ignore the wrapping, whatever it says.
         assert!(
             Packet::parse_with(
@@ -1139,14 +1127,7 @@ mod tests {
             .is_ok()
         );
         assert_eq!(p.session_id(), Some(CLIENT_SID));
-        assert_eq!(
-            Packet::DataV1 {
-                key_id: 0,
-                payload: vec![]
-            }
-            .session_id(),
-            None
-        );
+        assert_eq!(fixture_packet_data_v1(0, vec![]).session_id(), None);
     }
 
     /// A wrapped client key of `len` bytes, ending with its length.
@@ -1334,27 +1315,15 @@ mod tests {
 
     #[test]
     fn errors() {
-        assert_eq!(Packet::parse_with(&[], Wrapping::None), Err(Error::Empty));
-        assert_eq!(
-            Packet::parse_with(&[0x00], Wrapping::None),
-            Err(Error::Opcode(0))
-        );
-        assert_eq!(
-            Packet::parse_with(&[12 << 3], Wrapping::None),
-            Err(Error::Opcode(12))
-        );
-        assert_eq!(
-            Packet::parse_with(&[0xff], Wrapping::None),
-            Err(Error::Opcode(31))
-        );
-        assert_eq!(
-            Packet::parse_with(&[0x38, 1, 2], Wrapping::None),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            Packet::parse_with(&[0x48, 1, 2], Wrapping::None),
-            Err(Error::Truncated)
-        );
+        fictionet::assert_cases! {
+            Packet::parse_with;
+            (&[], Wrapping::None) => Err(Error::Empty),
+            (&[0x00], Wrapping::None) => Err(Error::Opcode(0)),
+            (&[12 << 3], Wrapping::None) => Err(Error::Opcode(12)),
+            (&[0xff], Wrapping::None) => Err(Error::Opcode(31)),
+            (&[0x38, 1, 2], Wrapping::None) => Err(Error::Truncated),
+            (&[0x48, 1, 2], Wrapping::None) => Err(Error::Truncated),
+        }
         let mut many = vec![0x20];
         many.extend_from_slice(&CLIENT_SID);
         many.push(9);
@@ -1389,25 +1358,11 @@ mod tests {
 
     /// Every packet the tests build, with the wrapping that reads it.
     fn samples() -> Vec<Packet> {
-        let ack = Some(Ack {
-            ids: vec![4, 5, 6],
-            remote_session_id: SERVER_SID,
-        });
-        let tls_auth = Some(TlsAuth {
-            hmac: vec![3; 20],
-            packet_id: 7,
-            net_time: 8,
-        });
+        let ack = Some(fixture_ack(vec![4, 5, 6], SERVER_SID));
+        let tls_auth = Some(fixture_tls_auth(vec![3; 20], 7, 8));
         let mut out = vec![
-            Packet::DataV1 {
-                key_id: 3,
-                payload: vec![1, 2, 3],
-            },
-            Packet::DataV2 {
-                key_id: 1,
-                peer_id: 77,
-                payload: vec![4, 5],
-            },
+            fixture_packet_data_v1(3, vec![1, 2, 3]),
+            fixture_packet_data_v2(1, 77, vec![4, 5]),
         ];
         for kind in ControlKind::ALL {
             if kind.carries_wrapped_key() {
@@ -1529,19 +1484,13 @@ mod tests {
     fn writers_refuse_what_the_reader_would_not_give_back() {
         // The longest packet is written whole, and one byte more is refused
         // rather than cut.
-        let p = Packet::DataV1 {
-            key_id: 0,
-            payload: vec![7; MAX_PACKET - 1],
-        };
+        let p = fixture_packet_data_v1(0, vec![7; MAX_PACKET - 1]);
         assert_eq!(
             Packet::parse_with(&wire(&p).unwrap(), Wrapping::None),
             Ok(p.clone())
         );
         assert_eq!(envelope(&p).unwrap().len(), MAX_TCP_FRAME);
-        let p = Packet::DataV1 {
-            key_id: 0,
-            payload: vec![0; MAX_PACKET],
-        };
+        let p = fixture_packet_data_v1(0, vec![0; MAX_PACKET]);
         assert_eq!(wire(&p), Err(Error::Unwritable));
         assert_eq!(envelope(&p), Err(Error::Unwritable));
         // A tls-crypt ciphertext is never cut, which would leave its tag
@@ -1560,17 +1509,9 @@ mod tests {
         };
         assert_eq!(wire(&p), Err(Error::Unwritable));
         // Key IDs and peer IDs too large for their bits.
-        let p = Packet::DataV2 {
-            key_id: 9,
-            peer_id: 5,
-            payload: vec![],
-        };
+        let p = fixture_packet_data_v2(9, 5, vec![]);
         assert_eq!(wire(&p), Err(Error::Unwritable));
-        let p = Packet::DataV2 {
-            key_id: 1,
-            peer_id: 0x0100_0005,
-            payload: vec![],
-        };
+        let p = fixture_packet_data_v2(1, 0x0100_0005, vec![]);
         assert_eq!(wire(&p), Err(Error::Unwritable));
         let control = |tls_auth, ack| Control {
             session_id: CLIENT_SID,
@@ -1589,11 +1530,7 @@ mod tests {
         let p = plain(
             ControlKind::ControlV1,
             control(
-                Some(TlsAuth {
-                    hmac: vec![1; MAX_HMAC_LEN + 1],
-                    packet_id: 0,
-                    net_time: 0,
-                }),
+                Some(fixture_tls_auth(vec![1; MAX_HMAC_LEN + 1], 0, 0)),
                 None,
             ),
         );
@@ -1606,14 +1543,7 @@ mod tests {
         assert_eq!(wire(&p), Err(Error::Unwritable));
         let p = plain(
             ControlKind::ControlV1,
-            control(
-                Some(TlsAuth {
-                    hmac: vec![1; MAX_HMAC_LEN],
-                    packet_id: 0,
-                    net_time: 0,
-                }),
-                None,
-            ),
+            control(Some(fixture_tls_auth(vec![1; MAX_HMAC_LEN], 0, 0)), None),
         );
         assert_eq!(Packet::parse_with(&wire(&p).unwrap(), p.wrapping()), Ok(p));
         for (n, want) in [
@@ -1621,10 +1551,7 @@ mod tests {
             (MAX_ACKS + 1, Some(Error::Unwritable)),
             (300, Some(Error::Unwritable)),
         ] {
-            let ack = Ack {
-                ids: (0..n as u32).collect(),
-                remote_session_id: SERVER_SID,
-            };
+            let ack = fixture_ack((0..n as u32).collect(), SERVER_SID);
             let p = plain(ControlKind::ControlV1, control(None, Some(ack)));
             match want {
                 None => assert_eq!(
@@ -1636,13 +1563,7 @@ mod tests {
         }
         let p = plain(
             ControlKind::ControlV1,
-            control(
-                None,
-                Some(Ack {
-                    ids: vec![],
-                    remote_session_id: SERVER_SID,
-                }),
-            ),
+            control(None, Some(fixture_ack(vec![], SERVER_SID))),
         );
         assert_eq!(wire(&p), Err(Error::Unwritable));
         assert_eq!(Frame(vec![]).to_bytes(), Err(Error::Unwritable));
@@ -1702,11 +1623,7 @@ mod tests {
                 ControlKind::ControlV1,
                 Control {
                     session_id: CLIENT_SID,
-                    tls_auth: Some(TlsAuth {
-                        hmac: vec![0x5a; hmac_len],
-                        packet_id: 1,
-                        net_time: 2,
-                    }),
+                    tls_auth: Some(fixture_tls_auth(vec![0x5a; hmac_len], 1, 2)),
                     ack: None,
                     message_id: 3,
                     payload: vec![4],
@@ -1779,14 +1696,16 @@ mod tests {
             let message_id = if rng.coin() { 0 } else { rng.next() as u32 };
             let c = Control {
                 session_id: [rng.next() as u8; 8],
-                tls_auth: rng.coin().then(|| TlsAuth {
-                    hmac: {
-                        let mut hmac = vec![0; hmac_len];
-                        rng.fill(&mut hmac);
-                        hmac
-                    },
-                    packet_id: 1,
-                    net_time: 2,
+                tls_auth: rng.coin().then(|| {
+                    fixture_tls_auth(
+                        {
+                            let mut hmac = vec![0; hmac_len];
+                            rng.fill(&mut hmac);
+                            hmac
+                        },
+                        1,
+                        2,
+                    )
                 }),
                 ack: rng.coin().then_some(Ack {
                     ids,

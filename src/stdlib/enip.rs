@@ -1633,6 +1633,13 @@ impl Wire for ForwardCloseResponse {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_cpf_item(type_id: u16, data: Vec<u8>) -> CpfItem {
+        CpfItem { type_id, data }
+    }
+    fn fixture_path_segment_network(segment_type: u8, data: Vec<u8>) -> PathSegment {
+        PathSegment::Network { segment_type, data }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
@@ -1757,10 +1764,7 @@ mod tests {
         let cpf = Cpf {
             items: vec![
                 CpfItem::null_address(),
-                CpfItem {
-                    type_id: item::UNCONNECTED_DATA,
-                    data: vec![0x0e, 0x01, 0x20, 0x01],
-                },
+                fixture_cpf_item(item::UNCONNECTED_DATA, vec![0x0e, 0x01, 0x20, 0x01]),
             ],
         };
         let bytes = cpf.to_bytes().unwrap();
@@ -1788,10 +1792,7 @@ mod tests {
             cpf: Cpf {
                 items: vec![
                     CpfItem::null_address(),
-                    CpfItem {
-                        type_id: item::UNCONNECTED_DATA,
-                        data: vec![1, 2, 3],
-                    },
+                    fixture_cpf_item(item::UNCONNECTED_DATA, vec![1, 2, 3]),
                 ],
             },
         };
@@ -2159,20 +2160,14 @@ mod tests {
         // A data item as long as an item may be no longer fits the envelope.
         let send = send_data(vec![
             CpfItem::null_address(),
-            CpfItem {
-                type_id: item::UNCONNECTED_DATA,
-                data: vec![0; u16::MAX as usize],
-            },
+            fixture_cpf_item(item::UNCONNECTED_DATA, vec![0; u16::MAX as usize]),
         ]);
         assert_eq!(send.to_bytes(), Err(Error::TooLong));
         // The longest that fits writes a packet whose every layer reads.
         let room = MAX_DATA - 6 - 2 - 4 - 4;
         let send = send_data(vec![
             CpfItem::null_address(),
-            CpfItem {
-                type_id: item::UNCONNECTED_DATA,
-                data: vec![0; room],
-            },
+            fixture_cpf_item(item::UNCONNECTED_DATA, vec![0; room]),
         ]);
         let p = packet(Command::SendRRData, 0, send.to_bytes().unwrap());
         let (back, _) = Packet::parse_prefix(&p.to_bytes().unwrap()).unwrap();
@@ -2180,29 +2175,23 @@ mod tests {
         assert_eq!(SendData::parse(&back.data), Ok(send));
         let send = send_data(vec![
             CpfItem::null_address(),
-            CpfItem {
-                type_id: item::UNCONNECTED_DATA,
-                data: vec![0; room + 1],
-            },
+            fixture_cpf_item(item::UNCONNECTED_DATA, vec![0; room + 1]),
         ]);
         assert_eq!(send.to_bytes(), Err(Error::TooLong));
         // Item headers count toward the limit too.
         let edge = Cpf {
             items: vec![
-                CpfItem {
-                    type_id: item::UNCONNECTED_DATA,
-                    data: vec![0; MAX_DATA - 7],
-                },
+                fixture_cpf_item(item::UNCONNECTED_DATA, vec![0; MAX_DATA - 7]),
                 CpfItem::null_address(),
                 CpfItem::null_address(),
             ],
         };
         assert_eq!(edge.to_bytes(), Err(Error::TooLong));
         let fits = Cpf {
-            items: vec![CpfItem {
-                type_id: item::UNCONNECTED_DATA,
-                data: vec![0; MAX_DATA - 6],
-            }],
+            items: vec![fixture_cpf_item(
+                item::UNCONNECTED_DATA,
+                vec![0; MAX_DATA - 6],
+            )],
         };
         assert_eq!(fits.to_bytes().unwrap().len(), MAX_DATA);
         // Too many items, and a packet with too much data.
@@ -2274,14 +2263,8 @@ mod tests {
         // microseconds (0x51, two words).
         let inhibit = [0x43, 0x0a, 0x51, 0x02, 0x10, 0x27, 0x00, 0x00];
         let want = vec![
-            PathSegment::Network {
-                segment_type: 0x43,
-                data: vec![0x0a],
-            },
-            PathSegment::Network {
-                segment_type: 0x51,
-                data: vec![0x10, 0x27, 0x00, 0x00],
-            },
+            fixture_path_segment_network(0x43, vec![0x0a]),
+            fixture_path_segment_network(0x51, vec![0x10, 0x27, 0x00, 0x00]),
         ];
         assert_eq!(parse_path(&inhibit), Ok(want.clone()));
         assert_eq!(write_path(&want).unwrap(), inhibit);
@@ -2293,18 +2276,9 @@ mod tests {
         // Fields that do not form the segment are refused.
         let bad = [
             PathSegment::Data(vec![1]),
-            PathSegment::Network {
-                segment_type: 0x43,
-                data: vec![],
-            },
-            PathSegment::Network {
-                segment_type: 0x51,
-                data: vec![1],
-            },
-            PathSegment::Network {
-                segment_type: 0x20,
-                data: vec![1],
-            },
+            fixture_path_segment_network(0x43, vec![]),
+            fixture_path_segment_network(0x51, vec![1]),
+            fixture_path_segment_network(0x20, vec![1]),
         ];
         let want = [
             Error::OddLength,
@@ -2323,23 +2297,15 @@ mod tests {
 
     #[test]
     fn class_and_attribute_have_no_32_bit_form() {
-        assert_eq!(
-            parse_path(&[0x22, 0x00, 0x00, 0x00, 0x01, 0x00]),
-            Err(Error::BadSegment)
-        );
-        assert_eq!(
-            parse_path(&[0x32, 0x00, 0x01, 0x00, 0x00, 0x00]),
-            Err(Error::BadSegment)
-        );
-        // Instance, member and connection point do.
-        assert_eq!(
-            parse_path(&[0x26, 0x00, 0x00, 0x00, 0x01, 0x00]),
-            Ok(vec![PathSegment::Instance(0x1_0000)])
-        );
-        assert_eq!(
-            parse_path(&[0x2e, 0x00, 0x00, 0x00, 0x01, 0x00]),
-            Ok(vec![PathSegment::ConnectionPoint(0x1_0000)])
-        );
+        fictionet::assert_cases! {
+            parse_path;
+            (&[0x22, 0x00, 0x00, 0x00, 0x01, 0x00]) => Err(Error::BadSegment),
+            (&[0x32, 0x00, 0x01, 0x00, 0x00, 0x00]) => Err(Error::BadSegment),
+            // Instance, member and connection point do.
+            (&[0x26, 0x00, 0x00, 0x00, 0x01, 0x00]) => Ok(vec![PathSegment::Instance(0x1_0000)]),
+            (&[0x2e, 0x00, 0x00, 0x00, 0x01, 0x00]) =>
+                Ok(vec![PathSegment::ConnectionPoint(0x1_0000)]),
+        }
         // The widest class and attribute are 16 bits.
         let wide = vec![
             PathSegment::Class(u16::MAX),
@@ -2375,10 +2341,7 @@ mod tests {
         // A null address item carries no bytes.
         let mut bytes = send_data(vec![
             CpfItem::null_address(),
-            CpfItem {
-                type_id: item::UNCONNECTED_DATA,
-                data: vec![1, 2],
-            },
+            fixture_cpf_item(item::UNCONNECTED_DATA, vec![1, 2]),
         ])
         .to_bytes()
         .unwrap();
@@ -2386,34 +2349,19 @@ mod tests {
         bytes.insert(12, 0xff);
         assert_eq!(SendData::parse(&bytes), Err(Error::Items));
         let bad = send_data(vec![
-            CpfItem {
-                type_id: item::NULL_ADDRESS,
-                data: vec![0xff],
-            },
-            CpfItem {
-                type_id: item::UNCONNECTED_DATA,
-                data: vec![1, 2],
-            },
+            fixture_cpf_item(item::NULL_ADDRESS, vec![0xff]),
+            fixture_cpf_item(item::UNCONNECTED_DATA, vec![1, 2]),
         ]);
         assert_eq!(bad.to_bytes(), Err(Error::Items));
         // Data item first is refused; a connected pair reads.
         let swapped = send_data(vec![
-            CpfItem {
-                type_id: item::UNCONNECTED_DATA,
-                data: vec![1, 2],
-            },
+            fixture_cpf_item(item::UNCONNECTED_DATA, vec![1, 2]),
             CpfItem::null_address(),
         ]);
         assert_eq!(swapped.to_bytes(), Err(Error::Items));
         let connected = send_data(vec![
-            CpfItem {
-                type_id: item::CONNECTED_ADDRESS,
-                data: vec![1, 0, 0, 0],
-            },
-            CpfItem {
-                type_id: item::CONNECTED_DATA,
-                data: vec![1, 0, 0x0e, 0x00],
-            },
+            fixture_cpf_item(item::CONNECTED_ADDRESS, vec![1, 0, 0, 0]),
+            fixture_cpf_item(item::CONNECTED_DATA, vec![1, 0, 0x0e, 0x00]),
         ]);
         assert_eq!(
             SendData::parse(&connected.to_bytes().unwrap()),
@@ -2719,10 +2667,7 @@ mod tests {
                 cpf: Cpf {
                     items: vec![
                         CpfItem::null_address(),
-                        CpfItem {
-                            type_id: item::UNCONNECTED_DATA,
-                            data: read.to_bytes().unwrap(),
-                        },
+                        fixture_cpf_item(item::UNCONNECTED_DATA, read.to_bytes().unwrap()),
                     ],
                 },
             }
@@ -2777,10 +2722,7 @@ mod tests {
                 cpf: Cpf {
                     items: vec![
                         CpfItem::null_address(),
-                        CpfItem {
-                            type_id: item::UNCONNECTED_DATA,
-                            data: forward_open.to_bytes().unwrap(),
-                        },
+                        fixture_cpf_item(item::UNCONNECTED_DATA, forward_open.to_bytes().unwrap()),
                     ],
                 },
             }
@@ -2831,10 +2773,7 @@ mod tests {
             Command::SendRRData,
             vec![
                 CpfItem::null_address(),
-                CpfItem {
-                    type_id: item::UNCONNECTED_DATA,
-                    data: tag_read.to_bytes().unwrap(),
-                },
+                fixture_cpf_item(item::UNCONNECTED_DATA, tag_read.to_bytes().unwrap()),
             ],
         );
         let identity_packet = Packet {
@@ -2844,10 +2783,10 @@ mod tests {
             sender_context: [0; 8],
             options: 0,
             data: Cpf {
-                items: vec![CpfItem {
-                    type_id: item::LIST_IDENTITY_RESPONSE,
-                    data: identity.to_bytes().unwrap(),
-                }],
+                items: vec![fixture_cpf_item(
+                    item::LIST_IDENTITY_RESPONSE,
+                    identity.to_bytes().unwrap(),
+                )],
             }
             .to_bytes()
             .unwrap(),

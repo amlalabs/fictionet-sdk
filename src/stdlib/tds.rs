@@ -3316,6 +3316,13 @@ fictionet::codec_from!(Error, Trailing, |_| Error::Invalid(
 
 #[cfg(test)]
 mod tests {
+    fn fixture_feature(id: u8, data: Vec<u8>) -> Feature {
+        Feature { id, data }
+    }
+    fn fixture_token_other(token: u8, data: Vec<u8>) -> Token {
+        Token::Other { token, data }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
@@ -3501,14 +3508,8 @@ mod tests {
         l.option_flags3 = option_flags3::USER_INSTANCE | option_flags3::EXTENSION;
         l.option_flags3 |= option_flags3::EXTENSION;
         l.features = Some(vec![
-            Feature {
-                id: 0x04,
-                data: vec![1, 2, 3],
-            },
-            Feature {
-                id: 0x0a,
-                data: vec![],
-            },
+            fixture_feature(0x04, vec![1, 2, 3]),
+            fixture_feature(0x0a, vec![]),
         ]);
         let bytes = l.to_bytes().unwrap();
         assert_eq!(Login7::parse(&bytes).unwrap(), l);
@@ -3536,10 +3537,7 @@ mod tests {
             sspi: vec![1; MAX_SSPI],
             features: Some(
                 (0..MAX_FEATURES)
-                    .map(|i| Feature {
-                        id: i as u8,
-                        data: vec![],
-                    })
+                    .map(|i| fixture_feature(i as u8, vec![]))
                     .collect(),
             ),
             option_flags3: option_flags3::EXTENSION,
@@ -3560,24 +3558,18 @@ mod tests {
         l.sspi.push(1);
         bad.push(l);
         let mut l = fits.clone();
-        l.features.as_mut().unwrap().push(Feature {
-            id: 1,
-            data: vec![],
-        });
+        l.features
+            .as_mut()
+            .unwrap()
+            .push(fixture_feature(1, vec![]));
         bad.push(l);
         let mut l = fits.clone();
         l.option_flags3 |= option_flags3::EXTENSION;
-        l.features = Some(vec![Feature {
-            id: 0xff,
-            data: vec![],
-        }]);
+        l.features = Some(vec![fixture_feature(0xff, vec![])]);
         bad.push(l);
         let mut l = fits.clone();
         l.option_flags3 |= option_flags3::EXTENSION;
-        l.features = Some(vec![Feature {
-            id: 1,
-            data: vec![0; MAX_LOGIN7],
-        }]);
+        l.features = Some(vec![fixture_feature(1, vec![0; MAX_LOGIN7])]);
         bad.push(l);
         for l in bad {
             assert_eq!(l.to_bytes(), Err(Error::Unwritable));
@@ -3626,10 +3618,7 @@ mod tests {
         // A feature block without its terminator, and one pointing away.
         let mut l = Login7::new();
         l.option_flags3 |= option_flags3::EXTENSION;
-        l.features = Some(vec![Feature {
-            id: 1,
-            data: vec![9],
-        }]);
+        l.features = Some(vec![fixture_feature(1, vec![9])]);
         let b = l.to_bytes().unwrap();
         let cut = b.len() - 1;
         let mut short = b[..cut].to_vec();
@@ -3684,29 +3673,17 @@ mod tests {
 
     #[test]
     fn batch_errors() {
-        assert_eq!(SqlBatch::parse(&[1, 0], true), Err(Error::Truncated));
-        assert_eq!(
-            SqlBatch::parse(&[2, 0, 0, 0], true),
-            Err(Error::Invalid("ALL_HEADERS length"))
-        );
-        assert_eq!(
-            SqlBatch::parse(&[9, 0, 0, 0, 0], true),
-            Err(Error::Truncated)
-        );
-        // A header shorter than its own length and type.
-        assert_eq!(
-            SqlBatch::parse(&[8, 0, 0, 0, 5, 0, 0, 0], true),
-            Err(Error::Invalid("header length"))
-        );
-        // A header running past the block.
-        assert_eq!(
-            SqlBatch::parse(&[10, 0, 0, 0, 7, 0, 0, 0, 2, 0], true),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            SqlBatch::parse(&[b'a', 0, b'b'], false),
-            Err(Error::Invalid("UTF-16 text of odd length"))
-        );
+        fictionet::assert_cases! {
+            SqlBatch::parse;
+            (&[1, 0], true) => Err(Error::Truncated),
+            (&[2, 0, 0, 0], true) => Err(Error::Invalid("ALL_HEADERS length")),
+            (&[9, 0, 0, 0, 0], true) => Err(Error::Truncated),
+            // A header shorter than its own length and type.
+            (&[8, 0, 0, 0, 5, 0, 0, 0], true) => Err(Error::Invalid("header length")),
+            // A header running past the block.
+            (&[10, 0, 0, 0, 7, 0, 0, 0, 2, 0], true) => Err(Error::Truncated),
+            (&[b'a', 0, b'b'], false) => Err(Error::Invalid("UTF-16 text of odd length")),
+        }
         let many = SqlBatch {
             headers: Some(
                 (0..=MAX_HEADERS as u16)
@@ -4147,22 +4124,10 @@ mod tests {
                 procedure: "".into(),
                 line: 1,
             }),
-            Token::FeatureExtAck(vec![Feature {
-                id: 1,
-                data: vec![1],
-            }]),
-            Token::Other {
-                token: token::ORDER,
-                data: vec![1, 0],
-            },
-            Token::Other {
-                token: token::SESSIONSTATE,
-                data: vec![0; 9],
-            },
-            Token::Other {
-                token: token::OFFSET,
-                data: vec![1, 2, 3, 4],
-            },
+            Token::FeatureExtAck(vec![fixture_feature(1, vec![1])]),
+            fixture_token_other(token::ORDER, vec![1, 0]),
+            fixture_token_other(token::SESSIONSTATE, vec![0; 9]),
+            fixture_token_other(token::OFFSET, vec![1, 2, 3, 4]),
         ];
         let mut w = TokenStream::default();
         for t in &tokens {
@@ -4196,18 +4161,9 @@ mod tests {
             Token::Row(vec![Value::Null]),
             Token::Row(vec![Value::BigInt(1)]),
             Token::Row(vec![Value::Text("x".into())]),
-            Token::Other {
-                token: token::DONE,
-                data: vec![],
-            },
-            Token::Other {
-                token: token::OFFSET,
-                data: vec![1],
-            },
-            Token::Other {
-                token: 0x01,
-                data: vec![],
-            },
+            fixture_token_other(token::DONE, vec![]),
+            fixture_token_other(token::OFFSET, vec![1]),
+            fixture_token_other(0x01, vec![]),
             Token::EnvChange(EnvChange::Text {
                 kind: env_type::COLLATION,
                 new: "x".into(),
@@ -4241,10 +4197,7 @@ mod tests {
                 Column::new("x", TypeInfo::fixed(data_type::INT4));
                 MAX_COLUMNS + 1
             ])),
-            Token::FeatureExtAck(vec![Feature {
-                id: 0xff,
-                data: vec![],
-            }]),
+            Token::FeatureExtAck(vec![fixture_feature(0xff, vec![])]),
         ] {
             w.0.push(bad);
             assert_eq!(w.write(&mut out), Err(Error::Unwritable), "{w:?}");
@@ -4327,37 +4280,22 @@ mod tests {
             b.extend_from_slice(row);
             TokenReader::new(&b).nth(1).unwrap()
         };
-        assert_eq!(
-            one(TypeInfo::nullable(data_type::INTN, 4), &[3, 0, 0, 0]),
-            Err(Error::Invalid("value length"))
-        );
-        assert_eq!(
-            one(TypeInfo::decimal(5, 0), &[3, 1, 0]),
-            Err(Error::Invalid("decimal length"))
-        );
-        assert_eq!(
-            one(TypeInfo::decimal(5, 0), &[5, 2, 0, 0, 0, 0]),
-            Err(Error::Invalid("decimal sign"))
-        );
-        assert_eq!(
-            one(TypeInfo::fixed(data_type::DATEN), &[2, 0, 0]),
-            Err(Error::Invalid("date length"))
-        );
-        assert_eq!(
-            one(TypeInfo::scaled(data_type::TIMEN, 7), &[3, 0, 0, 0]),
-            Err(Error::Invalid("time length"))
-        );
-        assert_eq!(
-            one(TypeInfo::string(data_type::NVARCHAR, 10), &[1, 0, 0]),
-            Err(Error::Invalid("UTF-16 text of odd length"))
-        );
-        assert_eq!(
-            one(
+        fictionet::assert_cases! {
+            one;
+            (TypeInfo::nullable(data_type::INTN, 4), &[3, 0, 0, 0]) =>
+                Err(Error::Invalid("value length")),
+            (TypeInfo::decimal(5, 0), &[3, 1, 0]) => Err(Error::Invalid("decimal length")),
+            (TypeInfo::decimal(5, 0), &[5, 2, 0, 0, 0, 0]) => Err(Error::Invalid("decimal sign")),
+            (TypeInfo::fixed(data_type::DATEN), &[2, 0, 0]) => Err(Error::Invalid("date length")),
+            (TypeInfo::scaled(data_type::TIMEN, 7), &[3, 0, 0, 0]) =>
+                Err(Error::Invalid("time length")),
+            (TypeInfo::string(data_type::NVARCHAR, 10), &[1, 0, 0]) =>
+                Err(Error::Invalid("UTF-16 text of odd length")),
+            (
                 TypeInfo::binary(data_type::BIGVARBINARY, 0xffff),
-                &[5, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 9, 0, 0, 0, 0]
-            ),
-            Err(Error::Invalid("PLP length"))
-        );
+                &[5, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 9, 0, 0, 0, 0],
+            ) => Err(Error::Invalid("PLP length")),
+        }
         // A PLP of unknown length, in two chunks.
         let v = one(
             TypeInfo::binary(data_type::BIGVARBINARY, 0xffff),
@@ -4430,10 +4368,7 @@ mod tests {
         );
         let mut l = Login7::new();
         l.option_flags3 |= option_flags3::EXTENSION;
-        l.features = Some(vec![Feature {
-            id: 1,
-            data: vec![],
-        }]);
+        l.features = Some(vec![fixture_feature(1, vec![])]);
         let b = l.to_bytes().unwrap();
         let mut long = b.clone();
         long[58..60].copy_from_slice(&256u16.to_le_bytes());
@@ -4453,18 +4388,9 @@ mod tests {
         l.sspi = vec![1; MAX_SSPI];
         l.option_flags3 |= option_flags3::EXTENSION;
         l.features = Some(vec![
-            Feature {
-                id: 1,
-                data: vec![2; 50_000],
-            },
-            Feature {
-                id: 2,
-                data: vec![3; 50_000],
-            },
-            Feature {
-                id: 3,
-                data: vec![4; 10],
-            },
+            fixture_feature(1, vec![2; 50_000]),
+            fixture_feature(2, vec![3; 50_000]),
+            fixture_feature(3, vec![4; 10]),
         ]);
         assert_eq!(l.to_bytes(), Err(Error::Unwritable));
         l.features.as_mut().unwrap().remove(1);
@@ -4479,18 +4405,12 @@ mod tests {
     #[test]
     fn prelogin_version_first() {
         // ENCRYPTION alone.
-        assert_eq!(
-            Prelogin::parse(&[1, 0, 6, 0, 1, 0xff, 2]),
-            Err(Error::Invalid("PRELOGIN VERSION not first"))
-        );
-        assert_eq!(
-            Prelogin::parse(&[0xff]),
-            Err(Error::Invalid("PRELOGIN VERSION not first"))
-        );
-        assert_eq!(
-            Prelogin::parse(&[0, 0, 6, 0, 2, 0xff, 9, 0]),
-            Err(Error::Invalid("PRELOGIN VERSION length"))
-        );
+        fictionet::assert_cases! {
+            Prelogin::parse;
+            (&[1, 0, 6, 0, 1, 0xff, 2]) => Err(Error::Invalid("PRELOGIN VERSION not first")),
+            (&[0xff]) => Err(Error::Invalid("PRELOGIN VERSION not first")),
+            (&[0, 0, 6, 0, 2, 0xff, 9, 0]) => Err(Error::Invalid("PRELOGIN VERSION length")),
+        }
         let mut p = Prelogin::default();
         p.set(prelogin_option::ENCRYPTION, vec![encryption::OFF]);
         p.set(prelogin_option::VERSION, vec![1, 2, 3]);
@@ -4582,26 +4502,17 @@ mod tests {
         };
         let td: &[u8] = &[0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
         assert!(block(&[(2, td)]).is_ok());
-        assert_eq!(
-            block(&[]),
-            Err(Error::Invalid(
-                "ALL_HEADERS without a transaction descriptor"
-            ))
-        );
-        assert_eq!(
-            block(&[(1, &[0, 0, 0, 0])]),
-            Err(Error::Invalid(
-                "ALL_HEADERS without a transaction descriptor"
-            ))
-        );
-        assert_eq!(
-            block(&[(2, &td[..8])]),
-            Err(Error::Invalid("transaction descriptor length"))
-        );
-        assert_eq!(
-            block(&[(2, td), (2, td)]),
-            Err(Error::Invalid("header type repeated"))
-        );
+        fictionet::assert_cases! {
+            block;
+            (&[]) => Err(Error::Invalid(
+                "ALL_HEADERS without a transaction descriptor",
+            )),
+            (&[(1, &[0, 0, 0, 0])]) => Err(Error::Invalid(
+                "ALL_HEADERS without a transaction descriptor",
+            )),
+            (&[(2, &td[..8])]) => Err(Error::Invalid("transaction descriptor length")),
+            (&[(2, td), (2, td)]) => Err(Error::Invalid("header type repeated")),
+        }
         // Missing, duplicate, and malformed descriptors are refused.
         let b = SqlBatch {
             headers: Some(vec![
@@ -5245,10 +5156,7 @@ mod tests {
         l.password = "pw".into();
         l.sspi = vec![1, 2, 3];
         l.option_flags3 |= option_flags3::EXTENSION;
-        l.features = Some(vec![Feature {
-            id: 4,
-            data: vec![1],
-        }]);
+        l.features = Some(vec![fixture_feature(4, vec![1])]);
         s.push(l.to_bytes().unwrap());
         let mut w = TokenStream::default();
         w.0.push(Token::ColMetadata(Some(all_types())));

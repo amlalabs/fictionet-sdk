@@ -2502,38 +2502,17 @@ mod tests {
             assert_eq!(apply(&mut table.clone(), &bytes), Err(error));
         }
         // Field section errors.
-        assert_eq!(
-            decode_section_with_limit(&table, 0, &[], 200),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            decode_section_with_limit(&table, 0, &[0x00], 200),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            decode_section_with_limit(&table, 0, &[0x00, 0x00, 0x51], 200),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            decode_section_with_limit(&table, 0, &[0x00, 0x00, 0xff, 0x24], 200),
-            Err(Error::StaticIndex(99))
-        );
-        assert_eq!(
-            decode_section_with_limit(&table, 0, &[0x00, 0x00, 0x80], 200),
-            Err(Error::DynamicIndex(0))
-        );
-        assert_eq!(
-            decode_section_with_limit(&table, 0, &[0x00, 0x00, 0x10], 200),
-            Err(Error::DynamicIndex(0))
-        );
-        assert_eq!(
-            decode_section_with_limit(&table, 0, &[0x0e, 0x00], 200),
-            Err(Error::InsertCount)
-        );
-        assert_eq!(
-            decode_section_with_limit(&table, 0, &[0x00, 0x80], 200),
-            Err(Error::Base)
-        );
+        fictionet::assert_cases! {
+            decode_section_with_limit;
+            (&table, 0, &[], 200) => Err(Error::Truncated),
+            (&table, 0, &[0x00], 200) => Err(Error::Truncated),
+            (&table, 0, &[0x00, 0x00, 0x51], 200) => Err(Error::Truncated),
+            (&table, 0, &[0x00, 0x00, 0xff, 0x24], 200) => Err(Error::StaticIndex(99)),
+            (&table, 0, &[0x00, 0x00, 0x80], 200) => Err(Error::DynamicIndex(0)),
+            (&table, 0, &[0x00, 0x00, 0x10], 200) => Err(Error::DynamicIndex(0)),
+            (&table, 0, &[0x0e, 0x00], 200) => Err(Error::InsertCount),
+            (&table, 0, &[0x00, 0x80], 200) => Err(Error::Base),
+        }
         let mut big = vec![0x00, 0x00];
         for _ in 0..10 {
             big.push(0xc0 | 31); // static 31: 64 bytes counted
@@ -3057,18 +3036,12 @@ mod tests {
         );
         held.push(blocked(&table, 4, &[4, 0, 0x80])).unwrap();
         apply(&mut table, &[0x41, b'c', 1, b'3']).unwrap();
-        assert_eq!(
-            fields(decode_section(&table, 8, &[0, 0, 0xd1]).unwrap()),
-            [Field::new(":method", "GET")]
-        );
-        assert_eq!(
-            fields(held.next_ready(&table).unwrap().1.unwrap()),
-            [Field::new("c", "3")]
-        );
-        assert_eq!(
-            fields(decode_section(&table, 4, &[0, 0, 0xd1]).unwrap()),
-            [Field::new(":method", "GET")]
-        );
+        fictionet::assert_cases! {
+            fields;
+            (decode_section(&table, 8, &[0, 0, 0xd1]).unwrap()) => [Field::new(":method", "GET")],
+            (held.next_ready(&table).unwrap().1.unwrap()) => [Field::new("c", "3")],
+            (decode_section(&table, 4, &[0, 0, 0xd1]).unwrap()) => [Field::new(":method", "GET")],
+        }
     }
 
     #[test]

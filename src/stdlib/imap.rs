@@ -1770,6 +1770,16 @@ impl Decode for Responses {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_value_literal(data: Vec<u8>, non_sync: bool) -> Value {
+        Value::Literal { data, non_sync }
+    }
+    fn fixture_input_continue(tag: Option<Arc<str>>, size: usize) -> Input {
+        Input::Continue { tag, size }
+    }
+    fn fixture_value_binary(data: Vec<u8>, non_sync: bool) -> Value {
+        Value::Binary { data, non_sync }
+    }
+
     use super::*;
     use codec::{Fail, Lcg, Step, Stream};
     use fictionet::stdlib::test_support::contract;
@@ -1841,20 +1851,14 @@ mod tests {
             vec![
                 Value::atom("saved-messages"),
                 Value::List(atoms(&["\\Seen"])),
-                Value::Literal {
-                    data: b"Hello Joe!\r\n".to_vec(),
-                    non_sync: false
-                },
+                fixture_value_literal(b"Hello Joe!\r\n".to_vec(), false),
             ]
         );
         let c = cmd(b"a LOGIN {5+}\r\nalice \"p\\\"w\\\\\"\r\n");
         assert_eq!(
             c.args,
             vec![
-                Value::Literal {
-                    data: b"alice".to_vec(),
-                    non_sync: true
-                },
+                fixture_value_literal(b"alice".to_vec(), true),
                 Value::Quoted(b"p\"w\\".to_vec())
             ]
         );
@@ -1925,10 +1929,7 @@ mod tests {
                     Value::atom("FLAGS"),
                     Value::List(atoms(&["\\Seen"])),
                     Value::atom("BODY[HEADER]"),
-                    Value::Literal {
-                        data: b"Subject: hi\r\n".to_vec(),
-                        non_sync: false
-                    },
+                    fixture_value_literal(b"Subject: hi\r\n".to_vec(), false),
                 ]
             )
         );
@@ -2123,13 +2124,7 @@ mod tests {
         // header-fld-name is an astring, so it may be quoted or a literal.
         let b: &[u8] = b"a FETCH 1 BODY.PEEK[HEADER.FIELDS ({4}\r\nFrom \"a]b\")]\r\n";
         let ev = events(b);
-        assert_eq!(
-            ev[0],
-            Ok(Input::Continue {
-                tag: Some("a".into()),
-                size: 4
-            })
-        );
+        assert_eq!(ev[0], Ok(fixture_input_continue(Some("a".into()), 4)));
         let want = Command::new(
             "a",
             "FETCH",
@@ -2158,10 +2153,7 @@ mod tests {
         // in FETCH BINARY responses and in APPEND.
         let b: &[u8] = b"* 1 FETCH (BINARY[1] ~{3}\r\na\0b)\r\n";
         let r = Response::parse(b).unwrap();
-        let bin = Value::Binary {
-            data: b"a\0b".to_vec(),
-            non_sync: false,
-        };
+        let bin = fixture_value_binary(b"a\0b".to_vec(), false);
         assert_eq!(
             r,
             Response::fetch(1, vec![Value::atom("BINARY[1]"), bin.clone()])
@@ -2170,13 +2162,7 @@ mod tests {
         assert_eq!(responses(b), vec![Ok(r)]);
         let b: &[u8] = b"a APPEND INBOX ~{3+}\r\na\0b\r\n";
         let c = cmd(b);
-        assert_eq!(
-            c.args[1],
-            Value::Binary {
-                data: b"a\0b".to_vec(),
-                non_sync: true
-            }
-        );
+        assert_eq!(c.args[1], fixture_value_binary(b"a\0b".to_vec(), true));
         assert_eq!(c.to_bytes().unwrap(), b);
         let ev = events(b"a APPEND INBOX ~{3}\r\na\0b\r\n");
         assert!(matches!(ev[0], Ok(Input::Continue { size: 3, .. })));
@@ -2184,13 +2170,7 @@ mod tests {
         // Servers never write ~{n+}.
         let r = Response::fetch(
             1,
-            vec![
-                Value::atom("BINARY[]"),
-                Value::Binary {
-                    data: vec![0],
-                    non_sync: true,
-                },
-            ],
+            vec![Value::atom("BINARY[]"), fixture_value_binary(vec![0], true)],
         );
         assert_eq!(contract::check_refused(&r), Error::Unwritable);
         // A plain literal still may not hold NUL, and ~ alone is a word.
@@ -2298,10 +2278,7 @@ mod tests {
             1,
             vec![
                 Value::atom("BODY[]"),
-                Value::Literal {
-                    data: b"a\r\nb".to_vec(),
-                    non_sync: false,
-                },
+                fixture_value_literal(b"a\r\nb".to_vec(), false),
             ],
         );
         assert_eq!(
@@ -2313,10 +2290,7 @@ mod tests {
             "append",
             vec![
                 Value::atom("INBOX"),
-                Value::Literal {
-                    data: b"hi".to_vec(),
-                    non_sync: true,
-                },
+                fixture_value_literal(b"hi".to_vec(), true),
             ],
         );
         assert_eq!(
@@ -2518,22 +2492,13 @@ mod tests {
         let wire = b"a1 NOOP\r\na2 LOGIN {5}\r\nalice {3+}\r\npwd\r\na3 X\r\n";
         let expected = vec![
             Ok(Input::Command(Command::new("a1", "NOOP", vec![]))),
-            Ok(Input::Continue {
-                tag: Some("a2".into()),
-                size: 5,
-            }),
+            Ok(fixture_input_continue(Some("a2".into()), 5)),
             Ok(Input::Command(Command::new(
                 "a2",
                 "LOGIN",
                 vec![
-                    Value::Literal {
-                        data: b"alice".to_vec(),
-                        non_sync: false,
-                    },
-                    Value::Literal {
-                        data: b"pwd".to_vec(),
-                        non_sync: true,
-                    },
+                    fixture_value_literal(b"alice".to_vec(), false),
+                    fixture_value_literal(b"pwd".to_vec(), true),
                 ],
             ))),
             Ok(Input::Command(Command::new("a3", "X", vec![]))),
@@ -2623,10 +2588,7 @@ mod tests {
                 1,
                 vec![
                     Value::atom("BODY[]"),
-                    Value::Literal {
-                        data: b"abc".to_vec(),
-                        non_sync: false,
-                    },
+                    fixture_value_literal(b"abc".to_vec(), false),
                 ],
             )),
             Ok(Response::continue_req("go")),
@@ -2652,53 +2614,28 @@ mod tests {
 
     #[test]
     fn writers_refuse_size_and_nesting_overflow() {
-        assert_eq!(
-            contract::check_refused(&Command::new(
+        fictionet::assert_cases! {
+            contract::check_refused;
+            (&Command::new(
                 "a",
                 "APPEND",
-                vec![Value::Literal {
-                    data: vec![b'x'; MAX_LITERAL + 10],
-                    non_sync: true,
-                }],
-            )),
-            Error::Unwritable
-        );
-        assert_eq!(
-            contract::check_refused(&Response::Data(vec![
-                Value::Literal {
-                    data: vec![b'y'; MAX_LITERAL],
-                    non_sync: false
-                };
+                vec![fixture_value_literal(vec![b'x'; MAX_LITERAL + 10], true)],
+            )) => Error::Unwritable,
+            (&Response::Data(vec![
+                fixture_value_literal(vec![b'y'; MAX_LITERAL], false);
                 6
-            ])),
-            Error::Unwritable
-        );
-        assert_eq!(
-            contract::check_refused(&Command::new(
-                "a",
-                "X",
-                vec![Value::atom(&"z".repeat(1000)); 100],
-            )),
-            Error::Unwritable
-        );
-        assert_eq!(
-            contract::check_refused(
-                &Response::greeting(&"é".repeat(MAX_TEXT)).with_code(&"c".repeat(MAX_TEXT))
-            ),
-            Error::Unwritable
-        );
-        assert_eq!(
-            contract::check_refused(&Response::continue_req(&"é".repeat(MAX_TEXT))),
-            Error::Unwritable
-        );
-        assert_eq!(
-            contract::check_refused(&Command::new(
+            ])) => Error::Unwritable,
+            (&Command::new("a", "X", vec![Value::atom(&"z".repeat(1000)); 100])) =>
+                Error::Unwritable,
+            (&Response::greeting(&"é".repeat(MAX_TEXT)).with_code(&"c".repeat(MAX_TEXT))) =>
+                Error::Unwritable,
+            (&Response::continue_req(&"é".repeat(MAX_TEXT))) => Error::Unwritable,
+            (&Command::new(
                 &"t".repeat(MAX_TEXT * 2),
                 &"n".repeat(MAX_TEXT),
                 vec![Value::nil()],
-            )),
-            Error::Unwritable
-        );
+            )) => Error::Unwritable,
+        }
         let mut value = Value::nil();
         for _ in 0..MAX_DEPTH + 5 {
             value = Value::List(vec![value]);
@@ -2739,10 +2676,7 @@ mod tests {
                 "X",
                 vec![
                     Value::string(b"a\0b"),
-                    Value::Literal {
-                        data: b"\0c\0".to_vec(),
-                        non_sync: true,
-                    },
+                    fixture_value_literal(b"\0c\0".to_vec(), true),
                 ],
             )),
             Error::Unwritable
@@ -2786,14 +2720,7 @@ mod tests {
             ])),
             Error::Unwritable
         );
-        let command = Command::new(
-            "a",
-            "X",
-            vec![Value::Literal {
-                data: vec![0xff],
-                non_sync: true,
-            }],
-        );
+        let command = Command::new("a", "X", vec![fixture_value_literal(vec![0xff], true)]);
         assert_eq!(cmd(&command.to_bytes().unwrap()), command);
     }
 
@@ -2870,10 +2797,7 @@ mod tests {
     #[test]
     fn writers_stop_at_their_limits() {
         let value = Value::List(vec![
-            Value::Literal {
-                data: vec![b'z'; MAX_LITERAL],
-                non_sync: false
-            };
+            fixture_value_literal(vec![b'z'; MAX_LITERAL], false);
             100
         ]);
         assert_eq!(
@@ -2891,51 +2815,29 @@ mod tests {
     #[test]
     fn client_literals_and_continuations() {
         let long = vec![b'\n'; MAX_NON_SYNC + 1];
-        let command = Command::new(
-            "a",
-            "X",
-            vec![Value::Literal {
-                data: long.clone(),
-                non_sync: false,
-            }],
-        );
+        let command = Command::new("a", "X", vec![fixture_value_literal(long.clone(), false)]);
         assert!(command.to_bytes().unwrap().starts_with(b"a X {4097}\r\n"));
         assert_eq!(
             contract::check_refused(&Command::new(
                 "a",
                 "X",
-                vec![Value::Literal {
-                    data: long,
-                    non_sync: true,
-                }],
+                vec![fixture_value_literal(long, true)],
             )),
             Error::Unwritable
         );
         let command = Command::new(
             "a",
             "X",
-            vec![Value::Literal {
-                data: vec![b'\n'; MAX_NON_SYNC],
-                non_sync: true,
-            }],
+            vec![fixture_value_literal(vec![b'\n'; MAX_NON_SYNC], true)],
         );
         assert!(command.to_bytes().unwrap().starts_with(b"a X {4096+}\r\n"));
         let command = Command::new(
             "a",
             "LOGIN",
             vec![
-                Value::Literal {
-                    data: b"alice".to_vec(),
-                    non_sync: false,
-                },
-                Value::Literal {
-                    data: b"x".to_vec(),
-                    non_sync: true,
-                },
-                Value::Binary {
-                    data: b"p\0w".to_vec(),
-                    non_sync: false,
-                },
+                fixture_value_literal(b"alice".to_vec(), false),
+                fixture_value_literal(b"x".to_vec(), true),
+                fixture_value_binary(b"p\0w".to_vec(), false),
             ],
         );
         let bytes = command.to_bytes().unwrap();
@@ -2948,10 +2850,7 @@ mod tests {
             Command::continuation_offsets(b"a NOOP\r\n").unwrap(),
             vec![]
         );
-        let big = Value::Literal {
-            data: vec![b'y'; MAX_LITERAL],
-            non_sync: false,
-        };
+        let big = fixture_value_literal(vec![b'y'; MAX_LITERAL], false);
         assert_eq!(
             contract::check_refused(&Command::new("a", "X", vec![big; 6])),
             Error::Unwritable
@@ -2985,10 +2884,7 @@ mod tests {
         assert_eq!(stream.push(b"b X {0}\r\n"), 9);
         assert_eq!(
             stream.next(),
-            Some(Ok(Ok(Input::Continue {
-                tag: Some("b".into()),
-                size: 0
-            })))
+            Some(Ok(Ok(fixture_input_continue(Some("b".into()), 0))))
         );
     }
 
@@ -3034,13 +2930,7 @@ mod tests {
         let bytes = b"a APPEND X {3}\r\nabc\r\nb NOOP\r\n";
         let (items, failure) = decode_all(make, bytes);
         assert_eq!(failure, None);
-        assert_eq!(
-            items[0],
-            Ok(Input::Continue {
-                tag: Some("a".into()),
-                size: 3
-            })
-        );
+        assert_eq!(items[0], Ok(fixture_input_continue(Some("a".into()), 3)));
         assert!(matches!(items[1], Err(Error::Syntax { .. })));
         assert_eq!(
             items[2],
@@ -3182,14 +3072,8 @@ mod tests {
                 let mut value = match rng.index(5) {
                     0 => Value::atom(word),
                     1 => Value::string(word.as_bytes()),
-                    2 => Value::Literal {
-                        data: word.as_bytes().to_vec(),
-                        non_sync: rng.coin(),
-                    },
-                    3 => Value::Binary {
-                        data: rng.bytes(32),
-                        non_sync: rng.coin(),
-                    },
+                    2 => fixture_value_literal(word.as_bytes().to_vec(), rng.coin()),
+                    3 => fixture_value_binary(rng.bytes(32), rng.coin()),
                     _ => Value::List(vec![Value::atom(word), Value::string(word.as_bytes())]),
                 };
                 for _ in 0..rng.index(3) {

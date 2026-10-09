@@ -1723,6 +1723,17 @@ pub mod harness {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_message(version: Version, community: Vec<u8>, pdu: Pdu) -> Message {
+        Message {
+            version,
+            community,
+            pdu,
+        }
+    }
+    fn fixture_element_primitive(tag: u8, content: Vec<u8>) -> Element {
+        Element::Primitive { tag, content }
+    }
+
     use super::harness::{check_message, check_scalars};
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
@@ -1790,30 +1801,22 @@ mod tests {
             .collect();
         vec![
             Message::parse(&GET_SYS_DESCR).unwrap(),
-            Message {
-                version: Version::V1,
-                community: b"private".to_vec(),
-                pdu: Pdu::Get(BasicPdu::new(1, vec![])),
-            },
-            Message {
-                version: Version::V2c,
-                community: vec![],
-                pdu: Pdu::GetNext(basic.clone()),
-            },
-            Message {
-                version: Version::V2c,
-                community: b"c".to_vec(),
-                pdu: Pdu::Response(basic.clone()),
-            },
-            Message {
-                version: Version::V1,
-                community: b"c".to_vec(),
-                pdu: Pdu::Set(BasicPdu::new(i32::MAX, v1binds.clone())),
-            },
-            Message {
-                version: Version::V1,
-                community: b"public".to_vec(),
-                pdu: Pdu::TrapV1(TrapV1Pdu {
+            fixture_message(
+                Version::V1,
+                b"private".to_vec(),
+                Pdu::Get(BasicPdu::new(1, vec![])),
+            ),
+            fixture_message(Version::V2c, vec![], Pdu::GetNext(basic.clone())),
+            fixture_message(Version::V2c, b"c".to_vec(), Pdu::Response(basic.clone())),
+            fixture_message(
+                Version::V1,
+                b"c".to_vec(),
+                Pdu::Set(BasicPdu::new(i32::MAX, v1binds.clone())),
+            ),
+            fixture_message(
+                Version::V1,
+                b"public".to_vec(),
+                Pdu::TrapV1(TrapV1Pdu {
                     enterprise: oid("1.3.6.1.4.1.9"),
                     agent_addr: [10, 0, 0, 1],
                     generic_trap: GenericTrap::LinkDown,
@@ -1821,22 +1824,18 @@ mod tests {
                     time_stamp: 4242,
                     bindings: v1binds,
                 }),
-            },
-            Message {
-                version: Version::V2c,
-                community: b"public".to_vec(),
-                pdu: Pdu::GetBulk(BulkPdu {
+            ),
+            fixture_message(
+                Version::V2c,
+                b"public".to_vec(),
+                Pdu::GetBulk(BulkPdu {
                     request_id: 9,
                     non_repeaters: 1,
                     max_repetitions: 10,
                     bindings: binds.clone(),
                 }),
-            },
-            Message {
-                version: Version::V2c,
-                community: b"x".to_vec(),
-                pdu: Pdu::Inform(basic.clone()),
-            },
+            ),
+            fixture_message(Version::V2c, b"x".to_vec(), Pdu::Inform(basic.clone())),
             Message::trap_v2(
                 b"public",
                 77,
@@ -1845,11 +1844,7 @@ mod tests {
                 vec![],
                 false,
             ),
-            Message {
-                version: Version::V2c,
-                community: b"x".to_vec(),
-                pdu: Pdu::Report(basic),
-            },
+            fixture_message(Version::V2c, b"x".to_vec(), Pdu::Report(basic)),
         ]
     }
 
@@ -1989,36 +1984,18 @@ mod tests {
             assert_eq!(Value::from_ber(h.tag, &b[h.header_len..]), Ok(v));
         }
         // Wrong sizes and ranges.
-        assert_eq!(
-            Value::from_ber(tag::NULL, &[0]),
-            Err(Error::Value(tag::NULL))
-        );
-        assert_eq!(
-            Value::from_ber(tag::END_OF_MIB_VIEW, &[0]),
-            Err(Error::Value(tag::END_OF_MIB_VIEW))
-        );
-        assert_eq!(
-            Value::from_ber(tag::IP_ADDRESS, &[1, 2, 3]),
-            Err(Error::Value(tag::IP_ADDRESS))
-        );
-        assert_eq!(
-            Value::from_ber(tag::COUNTER32, &[0xff]),
-            Err(Error::Integer)
-        );
-        assert_eq!(
-            Value::from_ber(tag::GAUGE32, &[1, 0, 0, 0, 0]),
-            Err(Error::Integer)
-        );
-        assert_eq!(
-            Value::from_ber(tag::INTEGER, &[0, 0x80, 0, 0, 0]),
-            Err(Error::Integer)
-        );
-        assert_eq!(
-            Value::from_ber(tag::COUNTER64, &[1, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(Error::Integer)
-        );
-        assert_eq!(Value::from_ber(0x45, &[]), Err(Error::UnexpectedTag(0x45)));
-        assert_eq!(Value::from_ber(0x24, &[]), Err(Error::UnexpectedTag(0x24)));
+        fictionet::assert_cases! {
+            Value::from_ber;
+            (tag::NULL, &[0]) => Err(Error::Value(tag::NULL)),
+            (tag::END_OF_MIB_VIEW, &[0]) => Err(Error::Value(tag::END_OF_MIB_VIEW)),
+            (tag::IP_ADDRESS, &[1, 2, 3]) => Err(Error::Value(tag::IP_ADDRESS)),
+            (tag::COUNTER32, &[0xff]) => Err(Error::Integer),
+            (tag::GAUGE32, &[1, 0, 0, 0, 0]) => Err(Error::Integer),
+            (tag::INTEGER, &[0, 0x80, 0, 0, 0]) => Err(Error::Integer),
+            (tag::COUNTER64, &[1, 0, 0, 0, 0, 0, 0, 0, 0]) => Err(Error::Integer),
+            (0x45, &[]) => Err(Error::UnexpectedTag(0x45)),
+            (0x24, &[]) => Err(Error::UnexpectedTag(0x24)),
+        }
     }
 
     #[test]
@@ -2054,11 +2031,7 @@ mod tests {
         };
         let (non, rep, m) = req.split();
         assert_eq!((non.len(), rep.len(), m), (1, 2, 2));
-        let msg = Message {
-            version: Version::V2c,
-            community: b"public".to_vec(),
-            pdu: Pdu::GetBulk(req.clone()),
-        };
+        let msg = fixture_message(Version::V2c, b"public".to_vec(), Pdu::GetBulk(req.clone()));
         assert_eq!(Message::parse(&msg.to_bytes().unwrap()), Ok(msg.clone()));
         assert!(msg.follows_version());
         assert_eq!(msg.to_bytes().unwrap()[13], tag::GET_BULK_REQUEST);
@@ -2229,21 +2202,15 @@ mod tests {
         assert_eq!(p(&[0x3f, 0x00]), Err(Error::UnexpectedTag(0x3f)));
         assert_eq!(Header::parse(&[0x1f]), Err(Error::UnexpectedTag(0x1f)));
         // Lengths.
-        assert_eq!(p(&[0x30, 0x80, 0x00, 0x00]), Err(Error::Length));
-        assert_eq!(p(&[0x30, 0xff, 0, 0]), Err(Error::Length));
-        assert_eq!(p(&[0x30, 0x85, 0, 0, 0, 0, 1]), Err(Error::Truncated));
-        assert_eq!(
-            p(&[0x30, 0x89, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(Error::TooLong(usize::MAX))
-        );
-        assert_eq!(
-            p(&[0x30, 0x83, 0x01, 0x00, 0x00]),
-            Err(Error::TooLong(0x10000))
-        );
-        assert_eq!(
-            p(&[0x30, 0x82, 0xff, 0xff]),
-            Err(Error::TooLong(MAX_MESSAGE + 4))
-        );
+        fictionet::assert_cases! {
+            p;
+            (&[0x30, 0x80, 0x00, 0x00]) => Err(Error::Length),
+            (&[0x30, 0xff, 0, 0]) => Err(Error::Length),
+            (&[0x30, 0x85, 0, 0, 0, 0, 1]) => Err(Error::Truncated),
+            (&[0x30, 0x89, 1, 0, 0, 0, 0, 0, 0, 0, 0]) => Err(Error::TooLong(usize::MAX)),
+            (&[0x30, 0x83, 0x01, 0x00, 0x00]) => Err(Error::TooLong(0x10000)),
+            (&[0x30, 0x82, 0xff, 0xff]) => Err(Error::TooLong(MAX_MESSAGE + 4)),
+        }
         assert_eq!(
             Header::parse(&[0x04, 0x84, 0, 0, 0xff, 0xff]),
             Ok(Some(Header {
@@ -2324,10 +2291,7 @@ mod tests {
         assert_eq!(Element::parse(&deep), Err(Error::TooDeep));
         assert!(Element::parse(&deep[2..]).is_ok());
         // Writers refuse what the reader would.
-        let mut e = Element::Primitive {
-            tag: 0x04,
-            content: vec![],
-        };
+        let mut e = fixture_element_primitive(0x04, vec![]);
         for _ in 0..=MAX_DEPTH {
             e = Element::Constructed {
                 tag: 0x30,
@@ -2341,11 +2305,7 @@ mod tests {
         let ok = children[0].to_bytes().unwrap();
         assert_eq!(Element::parse(&ok), Ok(children[0].clone()));
         assert_eq!(
-            Element::Primitive {
-                tag: 0x30,
-                content: vec![]
-            }
-            .to_bytes(),
+            fixture_element_primitive(0x30, vec![]).to_bytes(),
             Err(Error::Unwritable)
         );
         assert_eq!(
@@ -2357,33 +2317,17 @@ mod tests {
             Err(Error::Unwritable)
         );
         assert_eq!(
-            Element::Primitive {
-                tag: 0x1f,
-                content: vec![]
-            }
-            .to_bytes(),
+            fixture_element_primitive(0x1f, vec![]).to_bytes(),
             Err(Error::Unwritable)
         );
-        let huge = Element::Primitive {
-            tag: 0x04,
-            content: vec![0; MAX_MESSAGE + 1],
-        };
+        let huge = fixture_element_primitive(0x04, vec![0; MAX_MESSAGE + 1]);
         assert_eq!(huge.to_bytes(), Err(Error::Unwritable));
         let wide = Element::Constructed {
             tag: 0x30,
-            children: vec![
-                Element::Primitive {
-                    tag: 0x04,
-                    content: vec![0; 40_000]
-                };
-                2
-            ],
+            children: vec![fixture_element_primitive(0x04, vec![0; 40_000]); 2],
         };
         assert!(matches!(wide.to_bytes(), Err(Error::Unwritable)));
-        let fits = Element::Primitive {
-            tag: 0x04,
-            content: vec![7; MAX_MESSAGE],
-        };
+        let fits = fixture_element_primitive(0x04, vec![7; MAX_MESSAGE]);
         let b = fits.to_bytes().unwrap();
         assert_eq!(Element::parse(&b), Ok(fits));
     }
@@ -2545,11 +2489,11 @@ mod tests {
                 )
             })
             .collect();
-        let set = Message {
-            version: Version::V2c,
-            community: b"private".to_vec(),
-            pdu: Pdu::Set(BasicPdu::new(1, binds)),
-        };
+        let set = fixture_message(
+            Version::V2c,
+            b"private".to_vec(),
+            Pdu::Set(BasicPdu::new(1, binds)),
+        );
         let len = set.encoded_len();
         assert!(len > MAX_MESSAGE);
         assert_eq!(set.to_bytes(), Err(Error::Unwritable));
@@ -2609,17 +2553,17 @@ mod tests {
         assert_eq!(m.community, [b'a'; 300]);
         assert_eq!(m.to_bytes().unwrap(), c);
         // Written whole, never cut, and refused only when the message is too long.
-        let m = Message {
-            version: Version::V2c,
-            community: vec![b'b'; 60_000],
-            pdu: Pdu::Get(BasicPdu::new(1, vec![])),
-        };
+        let m = fixture_message(
+            Version::V2c,
+            vec![b'b'; 60_000],
+            Pdu::Get(BasicPdu::new(1, vec![])),
+        );
         assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m));
-        let m = Message {
-            version: Version::V2c,
-            community: vec![b'b'; MAX_MESSAGE],
-            pdu: Pdu::Get(BasicPdu::new(1, vec![])),
-        };
+        let m = fixture_message(
+            Version::V2c,
+            vec![b'b'; MAX_MESSAGE],
+            Pdu::Get(BasicPdu::new(1, vec![])),
+        );
         assert!(matches!(m.to_bytes(), Err(Error::Unwritable)));
     }
 

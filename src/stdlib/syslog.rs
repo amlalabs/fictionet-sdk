@@ -1706,6 +1706,10 @@ fn expect(t: &[u8], i: usize, c: u8) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_fraction(value: u32, digits: u8) -> Fraction {
+        Fraction { value, digits }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
@@ -1744,13 +1748,7 @@ mod tests {
             (t.year, t.month, t.day, t.hour, t.minute, t.second),
             (2003, 10, 11, 22, 14, 15)
         );
-        assert_eq!(
-            t.fraction,
-            Some(Fraction {
-                value: 3,
-                digits: 3
-            })
-        );
+        assert_eq!(t.fraction, Some(fixture_fraction(3, 3)));
         assert_eq!(t.fraction.unwrap().micros(), 3000);
         assert_eq!(t.offset, Offset::Utc);
         assert_eq!(m.hostname.as_deref(), Some("mymachine.example.com"));
@@ -1771,13 +1769,7 @@ mod tests {
             Priority::new(Facility::Local4, Severity::Notice)
         );
         let t = m.timestamp.unwrap();
-        assert_eq!(
-            t.fraction,
-            Some(Fraction {
-                value: 3,
-                digits: 6
-            })
-        );
+        assert_eq!(t.fraction, Some(fixture_fraction(3, 6)));
         assert_eq!(t.offset, Offset::Minutes(-7 * 60));
         assert_eq!(m.hostname.as_deref(), Some("192.0.2.1"));
         assert_eq!(m.proc_id.as_deref(), Some("8710"));
@@ -1957,18 +1949,12 @@ mod tests {
             Err(Error::Timestamp)
         );
         assert_eq!(BsdTimestamp::parse(b"Feb 29 01:02:03").unwrap().day, 29);
-        assert_eq!(
-            BsdTimestamp::parse(b"Oct  0 01:02:03"),
-            Err(Error::Timestamp)
-        );
-        assert_eq!(
-            BsdTimestamp::parse(b"oct  1 01:02:03"),
-            Err(Error::Timestamp)
-        );
-        assert_eq!(
-            BsdTimestamp::parse(b"Oct  1 24:02:03"),
-            Err(Error::Timestamp)
-        );
+        fictionet::assert_cases! {
+            BsdTimestamp::parse;
+            (b"Oct  0 01:02:03") => Err(Error::Timestamp),
+            (b"oct  1 01:02:03") => Err(Error::Timestamp),
+            (b"Oct  1 24:02:03") => Err(Error::Timestamp),
+        }
     }
 
     #[test]
@@ -2243,24 +2229,15 @@ mod tests {
             Timestamp { minute: 99, ..t },
             Timestamp { second: 60, ..t },
             Timestamp {
-                fraction: Some(Fraction {
-                    value: 12345678,
-                    digits: 9,
-                }),
+                fraction: Some(fixture_fraction(12345678, 9)),
                 ..t
             },
             Timestamp {
-                fraction: Some(Fraction {
-                    value: 10,
-                    digits: 1,
-                }),
+                fraction: Some(fixture_fraction(10, 1)),
                 ..t
             },
             Timestamp {
-                fraction: Some(Fraction {
-                    value: 0,
-                    digits: 0,
-                }),
+                fraction: Some(fixture_fraction(0, 0)),
                 ..t
             },
             Timestamp {
@@ -2925,10 +2902,7 @@ mod tests {
                     fraction: if rng.coin() {
                         None
                     } else {
-                        Some(Fraction {
-                            value: rng.next() as u32,
-                            digits: rng.index(9) as u8,
-                        })
+                        Some(fixture_fraction(rng.next() as u32, rng.index(9) as u8))
                     },
                     offset: if rng.coin() {
                         Offset::Utc

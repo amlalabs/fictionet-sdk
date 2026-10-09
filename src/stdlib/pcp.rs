@@ -1638,6 +1638,16 @@ impl Wire for Reply {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_pcp_option_other(code: u8, data: Vec<u8>) -> PcpOption {
+        PcpOption::Other { code, data }
+    }
+    fn fixture_operation_other(opcode: u8, data: Vec<u8>) -> Operation {
+        Operation::Other { opcode, data }
+    }
+    fn fixture_unsupported_version(version: u8, lifetime: Option<u32>) -> UnsupportedVersion {
+        UnsupportedVersion { version, lifetime }
+    }
+
     use super::*;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
@@ -1781,13 +1791,7 @@ mod tests {
         assert_eq!(&a[..4], &[2, 0x80, 0, 0]);
         assert_eq!(Response::parse(&a), Ok(Response::announce(0)));
         // Options may follow ANNOUNCE in future, so they are read.
-        let r = with(
-            r,
-            vec![PcpOption::Other {
-                code: 200,
-                data: vec![1, 2, 3],
-            }],
-        );
+        let r = with(r, vec![fixture_pcp_option_other(200, vec![1, 2, 3])]);
         assert_eq!(Request::parse(&r.to_bytes().unwrap()), Ok(r));
     }
 
@@ -1805,10 +1809,7 @@ mod tests {
         // An odd-length option is padded, and its length is the real one.
         let r = with(
             map_request(),
-            vec![PcpOption::Other {
-                code: 130,
-                data: vec![7; 5],
-            }],
+            vec![fixture_pcp_option_other(130, vec![7; 5])],
         );
         let b = r.to_bytes().unwrap();
         assert_eq!(
@@ -1914,10 +1915,7 @@ mod tests {
         let r = Response::parse(&good[..32]).unwrap();
         assert_eq!(
             r.operation,
-            Operation::Other {
-                opcode: 1,
-                data: good[24..32].to_vec()
-            }
+            fixture_operation_other(1, good[24..32].to_vec())
         );
         assert_eq!(Response::parse(&r.to_bytes().unwrap()), Ok(r));
         // A known option with a wrong length becomes Other, and repeats stay.
@@ -1927,10 +1925,7 @@ mod tests {
         assert_eq!(
             r.options,
             [
-                PcpOption::Other {
-                    code: 2,
-                    data: vec![9; 4]
-                },
+                fixture_pcp_option_other(2, vec![9; 4]),
                 PcpOption::PreferFailure,
                 PcpOption::PreferFailure
             ]
@@ -2029,18 +2024,12 @@ mod tests {
         };
         assert_eq!(ok(&announce), Err(ResultCode::MalformedOption));
         // Unknown options: mandatory ones refuse, optional ones do not.
-        let mandatory = PcpOption::Other {
-            code: 4,
-            data: vec![],
-        };
+        let mandatory = fixture_pcp_option_other(4, vec![]);
         assert_eq!(
             ok(&with(map_request(), vec![mandatory])),
             Err(ResultCode::UnsuppOption)
         );
-        let optional = PcpOption::Other {
-            code: 129,
-            data: vec![],
-        };
+        let optional = fixture_pcp_option_other(129, vec![]);
         assert!(optional.is_optional());
         assert_eq!(ok(&with(map_request(), vec![optional])), Ok(()));
     }
@@ -2075,10 +2064,7 @@ mod tests {
         let r = Request {
             lifetime: 5,
             client: LAPTOP.to_ipv6_mapped(),
-            operation: Operation::Other {
-                opcode: 99,
-                data: vec![],
-            },
+            operation: fixture_operation_other(99, vec![]),
             options: vec![],
         };
         assert_eq!(r.check(laptop()), Err(ResultCode::UnsuppOpcode));
@@ -2117,19 +2103,13 @@ mod tests {
     // none.
     #[test]
     fn nat_pmp_client_offered_unknown_version_gives_up() {
-        let u = UnsupportedVersion {
-            version: 5,
-            lifetime: Some(60),
-        };
+        let u = fixture_unsupported_version(5, Some(60));
         assert_eq!(
             u.next_step(NAT_PMP_VERSION),
             VersionChoice::GiveUp { retry_after: 60 }
         );
         assert_eq!(u.next_step(3), VersionChoice::Pcp);
-        let u = UnsupportedVersion {
-            version: VERSION,
-            lifetime: Some(60),
-        };
+        let u = fixture_unsupported_version(VERSION, Some(60));
         assert_eq!(u.next_step(NAT_PMP_VERSION), VersionChoice::Pcp);
     }
 
@@ -2231,10 +2211,7 @@ mod tests {
         let r = Request {
             lifetime: 5,
             client: LAPTOP.to_ipv6_mapped(),
-            operation: Operation::Other {
-                opcode: 99,
-                data: vec![1, 2, 3, 4],
-            },
+            operation: fixture_operation_other(99, vec![1, 2, 3, 4]),
             options: vec![],
         };
         let Incoming::Reply(reply) = receive(&r.to_bytes().unwrap(), Speaks::Both, laptop(), 9)
@@ -2246,13 +2223,7 @@ mod tests {
         assert_eq!(resp.result, ResultCode::UnsuppOpcode);
         assert_eq!(resp.operation, r.operation);
         // A failed check.
-        let r = with(
-            map_request(),
-            vec![PcpOption::Other {
-                code: 50,
-                data: vec![],
-            }],
-        );
+        let r = with(map_request(), vec![fixture_pcp_option_other(50, vec![])]);
         let Incoming::Reply(reply) = receive(&r.to_bytes().unwrap(), Speaks::Both, laptop(), 9)
         else {
             panic!()
@@ -2315,22 +2286,13 @@ mod tests {
             [0, 128, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0]
         );
         // Through the server.
-        assert_eq!(
-            receive(&req, Speaks::Both, laptop(), 0),
-            Incoming::NatPmp(map.clone())
-        );
-        assert_eq!(
-            receive(&req, Speaks::NatPmp, laptop(), 0),
-            Incoming::NatPmp(map)
-        );
-        assert_eq!(
-            receive(&[0, 128, 0, 0], Speaks::NatPmp, laptop(), 0),
-            Incoming::Ignore
-        );
-        assert_eq!(
-            receive(&[0, 1, 0, 0], Speaks::Both, laptop(), 0),
-            Incoming::Ignore
-        );
+        fictionet::assert_cases! {
+            receive;
+            (&req, Speaks::Both, laptop(), 0) => Incoming::NatPmp(map.clone()),
+            (&req, Speaks::NatPmp, laptop(), 0) => Incoming::NatPmp(map),
+            (&[0, 128, 0, 0], Speaks::NatPmp, laptop(), 0) => Incoming::Ignore,
+            (&[0, 1, 0, 0], Speaks::Both, laptop(), 0) => Incoming::Ignore,
+        }
         // Unsupported opcode: the request comes back, top bit set, result 5.
         let Incoming::Reply(reply) = receive(&[0, 9, 0xaa, 0xbb, 1, 2], Speaks::Both, laptop(), 0)
         else {
@@ -2382,52 +2344,25 @@ mod tests {
 
     #[test]
     fn nat_pmp_errors() {
-        assert_eq!(NatPmpRequest::parse(&[0]), Err(Error::NatPmpShort(1)));
-        assert_eq!(NatPmpRequest::parse(&[2, 1]), Err(Error::NatPmpVersion(2)));
-        assert_eq!(
-            NatPmpRequest::parse(&[0, 128]),
-            Err(Error::NatPmpWrongDirection)
-        );
-        assert_eq!(
-            NatPmpRequest::parse(&[0, 1, 0, 0]),
-            Err(Error::NatPmpShort(4))
-        );
-        assert_eq!(
-            NatPmpRequest::parse(&[0; 1101]),
-            Err(Error::NatPmpTooLong(1101))
-        );
-        assert_eq!(
-            NatPmpResponse::parse(&[0, 128, 0]),
-            Err(Error::NatPmpShort(3))
-        );
-        assert_eq!(
-            NatPmpResponse::parse(&[0; 1101]),
-            Err(Error::NatPmpTooLong(1101))
-        );
-        assert_eq!(
-            NatPmpResponse::parse(&[2, 128, 0, 0]),
-            Err(Error::NatPmpVersion(2))
-        );
-        assert_eq!(
-            NatPmpResponse::parse(&[0, 1, 0, 0]),
-            Err(Error::NatPmpWrongDirection)
-        );
-        assert_eq!(
-            NatPmpResponse::parse(&[0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(Error::NatPmpWrongDirection)
-        );
-        assert_eq!(
-            NatPmpResponse::parse(&[0, 0, 0, 1, 0, 0]),
-            Err(Error::NatPmpShort(6))
-        );
-        assert_eq!(
-            NatPmpResponse::parse(&[0, 128, 0, 0, 0, 0, 0, 0]),
-            Err(Error::NatPmpShort(8))
-        );
-        assert_eq!(
-            NatPmpResponse::parse(&[0, 129, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(Error::NatPmpShort(12))
-        );
+        fictionet::assert_cases! {
+            NatPmpRequest::parse;
+            (&[0]) => Err(Error::NatPmpShort(1)),
+            (&[2, 1]) => Err(Error::NatPmpVersion(2)),
+            (&[0, 128]) => Err(Error::NatPmpWrongDirection),
+            (&[0, 1, 0, 0]) => Err(Error::NatPmpShort(4)),
+            (&[0; 1101]) => Err(Error::NatPmpTooLong(1101)),
+        }
+        fictionet::assert_cases! {
+            NatPmpResponse::parse;
+            (&[0, 128, 0]) => Err(Error::NatPmpShort(3)),
+            (&[0; 1101]) => Err(Error::NatPmpTooLong(1101)),
+            (&[2, 128, 0, 0]) => Err(Error::NatPmpVersion(2)),
+            (&[0, 1, 0, 0]) => Err(Error::NatPmpWrongDirection),
+            (&[0, 0, 0, 0, 0, 0, 0, 0]) => Err(Error::NatPmpWrongDirection),
+            (&[0, 0, 0, 1, 0, 0]) => Err(Error::NatPmpShort(6)),
+            (&[0, 128, 0, 0, 0, 0, 0, 0]) => Err(Error::NatPmpShort(8)),
+            (&[0, 129, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) => Err(Error::NatPmpShort(12)),
+        }
         for e in [
             Error::NatPmpShort(1),
             Error::NatPmpTooLong(2),
@@ -2448,13 +2383,7 @@ mod tests {
         };
         let reply = reply.to_bytes().unwrap();
         let u = unsupported_version(&reply).unwrap();
-        assert_eq!(
-            u,
-            UnsupportedVersion {
-                version: 2,
-                lifetime: Some(1800)
-            }
-        );
+        assert_eq!(u, fixture_unsupported_version(2, Some(1800)));
         assert_eq!(u.next_step(3), VersionChoice::Pcp);
         // A NAT-PMP server answers a PCP client, which falls back.
         let Incoming::Reply(reply) = receive(
@@ -2467,13 +2396,7 @@ mod tests {
         };
         let reply = reply.to_bytes().unwrap();
         let u = unsupported_version(&reply).unwrap();
-        assert_eq!(
-            u,
-            UnsupportedVersion {
-                version: 0,
-                lifetime: None
-            }
-        );
+        assert_eq!(u, fixture_unsupported_version(0, None));
         assert_eq!(u.next_step(VERSION), VersionChoice::NatPmp);
         // The form some gateways send: 128 plus the opcode.
         assert_eq!(
@@ -2492,26 +2415,17 @@ mod tests {
             VersionChoice::Pcp
         );
         // A server offering a version the client cannot use: give up.
-        let u = UnsupportedVersion {
-            version: 5,
-            lifetime: Some(60),
-        };
+        let u = fixture_unsupported_version(5, Some(60));
         assert_eq!(
             u.next_step(VERSION),
             VersionChoice::GiveUp { retry_after: 60 }
         );
-        let u = UnsupportedVersion {
-            version: 5,
-            lifetime: Some(99999),
-        };
+        let u = fixture_unsupported_version(5, Some(99999));
         assert_eq!(
             u.next_step(VERSION),
             VersionChoice::GiveUp { retry_after: 1800 }
         );
-        let u = UnsupportedVersion {
-            version: 0,
-            lifetime: None,
-        };
+        let u = fixture_unsupported_version(0, None);
         assert_eq!(
             u.next_step(NAT_PMP_VERSION),
             VersionChoice::GiveUp { retry_after: 1800 }
@@ -2523,10 +2437,7 @@ mod tests {
         assert_eq!(unsupported_version(&[2, 0x81, 0, 2]), None);
         assert_eq!(
             unsupported_version(&[2, 0x81, 0, 1]),
-            Some(UnsupportedVersion {
-                version: 2,
-                lifetime: None
-            })
+            Some(fixture_unsupported_version(2, None))
         );
         assert_eq!(unsupported_version(&[0u8, 0, 0, 1].repeat(300)), None);
     }
@@ -2611,13 +2522,7 @@ mod tests {
     #[test]
     fn writers_refuse_values_that_would_change() {
         // Too many options are refused.
-        let many = vec![
-            PcpOption::Other {
-                code: 200,
-                data: vec![1; 40]
-            };
-            100
-        ];
+        let many = vec![fixture_pcp_option_other(200, vec![1; 40]); 100];
         let r = with(map_request(), many.clone());
         assert_eq!(r.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&r);
@@ -2630,13 +2535,7 @@ mod tests {
         // An oversized option refuses the whole value.
         let r = with(
             map_request(),
-            vec![
-                PcpOption::Other {
-                    code: 200,
-                    data: vec![0; 70000],
-                },
-                filter(0),
-            ],
+            vec![fixture_pcp_option_other(200, vec![0; 70000]), filter(0)],
         );
         assert_eq!(r.to_bytes(), Err(Error::Unwritable));
         // Repeated singleton options and opaque known options are refused.
@@ -2647,10 +2546,7 @@ mod tests {
                 PcpOption::PreferFailure,
                 PcpOption::ThirdParty(Ipv6Addr::LOCALHOST),
                 PcpOption::ThirdParty(Ipv6Addr::LOCALHOST),
-                PcpOption::Other {
-                    code: 3,
-                    data: vec![1],
-                },
+                fixture_pcp_option_other(3, vec![1]),
             ],
         );
         assert_eq!(r.to_bytes(), Err(Error::Unwritable));
@@ -2658,19 +2554,13 @@ mod tests {
         let r = Request {
             lifetime: 0,
             client: Ipv6Addr::LOCALHOST,
-            operation: Operation::Other {
-                opcode: 0x81,
-                data: vec![0; 5000],
-            },
+            operation: fixture_operation_other(0x81, vec![0; 5000]),
             options: vec![],
         };
         assert_eq!(r.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&r);
         let resp = Response {
-            operation: Operation::Other {
-                opcode: 1,
-                data: vec![],
-            },
+            operation: fixture_operation_other(1, vec![]),
             ..Response::announce(0)
         };
         contract::check_wire_value(&resp);
@@ -2847,10 +2737,10 @@ mod tests {
                     remote_port: rng.next() as u16,
                     remote_address: addr(&mut rng),
                 }),
-                _ => Operation::Other {
-                    opcode: rng.next() as u8,
-                    data: bytes(&mut rng, &[0, 1, 3, 36, 56, 2000]),
-                },
+                _ => fixture_operation_other(
+                    rng.next() as u8,
+                    bytes(&mut rng, &[0, 1, 3, 36, 56, 2000]),
+                ),
             };
             let count = [0, 1, 3, 60, 300][rng.index(5)];
             let options = (0..count)
@@ -2862,10 +2752,10 @@ mod tests {
                         remote_port: rng.next() as u16,
                         remote_address: addr(&mut rng),
                     },
-                    _ => PcpOption::Other {
-                        code: rng.next() as u8,
-                        data: bytes(&mut rng, &[0, 1, 5, 16, 20, 1200]),
-                    },
+                    _ => fixture_pcp_option_other(
+                        rng.next() as u8,
+                        bytes(&mut rng, &[0, 1, 5, 16, 20, 1200]),
+                    ),
                 })
                 .collect::<Vec<_>>();
             let r = Request {

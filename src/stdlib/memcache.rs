@@ -2492,6 +2492,32 @@ impl Wire for Packet {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_command_get(keys: Vec<Vec<u8>>, cas: bool) -> Command {
+        Command::Get { keys, cas }
+    }
+    fn fixture_command_gat(exptime: i32, keys: Vec<Vec<u8>>, cas: bool) -> Command {
+        Command::Gat { exptime, keys, cas }
+    }
+    fn fixture_command_delete(key: Vec<u8>, noreply: bool) -> Command {
+        Command::Delete { key, noreply }
+    }
+    fn fixture_command_touch(key: Vec<u8>, exptime: i32, noreply: bool) -> Command {
+        Command::Touch {
+            key,
+            exptime,
+            noreply,
+        }
+    }
+    fn fixture_command_flush_all(delay: Option<i32>, noreply: bool) -> Command {
+        Command::FlushAll { delay, noreply }
+    }
+    fn fixture_response_stat(name: Vec<u8>, value: Vec<u8>) -> Response {
+        Response::Stat { name, value }
+    }
+    fn fixture_response_meta(status: MetaStatus, flags: Vec<MetaFlag>) -> Response {
+        Response::Meta { status, flags }
+    }
+
     use super::*;
 
     use codec::{Lcg, Stream};
@@ -2568,32 +2594,12 @@ mod tests {
                 data: b"v".to_vec(),
                 noreply: false,
             },
-            Command::Get {
-                keys: vec![key("a"), key("b")],
-                cas: false,
-            },
-            Command::Get {
-                keys: vec![key("noreply")],
-                cas: true,
-            },
-            Command::Gat {
-                exptime: 10,
-                keys: vec![key("a")],
-                cas: false,
-            },
-            Command::Gat {
-                exptime: i32::MIN,
-                keys: vec![key("a")],
-                cas: true,
-            },
-            Command::Delete {
-                key: key("noreply"),
-                noreply: false,
-            },
-            Command::Delete {
-                key: key("noreply"),
-                noreply: true,
-            },
+            fixture_command_get(vec![key("a"), key("b")], false),
+            fixture_command_get(vec![key("noreply")], true),
+            fixture_command_gat(10, vec![key("a")], false),
+            fixture_command_gat(i32::MIN, vec![key("a")], true),
+            fixture_command_delete(key("noreply"), false),
+            fixture_command_delete(key("noreply"), true),
             Command::Incr {
                 key: key("n"),
                 delta: 5,
@@ -2604,11 +2610,7 @@ mod tests {
                 delta: u64::MAX,
                 noreply: true,
             },
-            Command::Touch {
-                key: key("t"),
-                exptime: 30,
-                noreply: false,
-            },
+            fixture_command_touch(key("t"), 30, false),
             Command::Stats { args: vec![] },
             Command::Stats {
                 args: vec![key("cachedump"), key("1"), key("2")],
@@ -2618,14 +2620,8 @@ mod tests {
                 level: 1,
                 noreply: true,
             },
-            Command::FlushAll {
-                delay: None,
-                noreply: false,
-            },
-            Command::FlushAll {
-                delay: Some(5),
-                noreply: true,
-            },
+            fixture_command_flush_all(None, false),
+            fixture_command_flush_all(Some(5), true),
             Command::Quit,
             Command::MetaGet {
                 key: key("foo"),
@@ -2678,41 +2674,17 @@ mod tests {
                 cas: Some(77),
                 data: vec![],
             },
-            Response::Stat {
-                name: key("pid"),
-                value: key("1234"),
-            },
-            Response::Stat {
-                name: key("version"),
-                value: key("1.6 beta"),
-            },
+            fixture_response_stat(key("pid"), key("1234")),
+            fixture_response_stat(key("version"), key("1.6 beta")),
             Response::Version(b"1.6.21".to_vec()),
             Response::Number(0),
             Response::Number(u64::MAX),
-            Response::Meta {
-                status: MetaStatus::Header,
-                flags: vec![MetaFlag::new(b'O', b"123")],
-            },
-            Response::Meta {
-                status: MetaStatus::Miss,
-                flags: vec![],
-            },
-            Response::Meta {
-                status: MetaStatus::NotStored,
-                flags: vec![],
-            },
-            Response::Meta {
-                status: MetaStatus::Exists,
-                flags: vec![],
-            },
-            Response::Meta {
-                status: MetaStatus::NotFound,
-                flags: vec![],
-            },
-            Response::Meta {
-                status: MetaStatus::Noop,
-                flags: vec![],
-            },
+            fixture_response_meta(MetaStatus::Header, vec![MetaFlag::new(b'O', b"123")]),
+            fixture_response_meta(MetaStatus::Miss, vec![]),
+            fixture_response_meta(MetaStatus::NotStored, vec![]),
+            fixture_response_meta(MetaStatus::Exists, vec![]),
+            fixture_response_meta(MetaStatus::NotFound, vec![]),
+            fixture_response_meta(MetaStatus::Noop, vec![]),
             Response::MetaValue {
                 flags: vec![MetaFlag::new(b't', b"-1")],
                 data: b"hi".to_vec(),
@@ -2778,18 +2750,11 @@ mod tests {
     fn retrieval_example() {
         assert_eq!(
             one(b"get a b c\r\n"),
-            Command::Get {
-                keys: vec![key("a"), key("b"), key("c")],
-                cas: false
-            }
+            fixture_command_get(vec![key("a"), key("b"), key("c")], false)
         );
         assert_eq!(
             one(b"gats 100 a\r\n"),
-            Command::Gat {
-                exptime: 100,
-                keys: vec![key("a")],
-                cas: true
-            }
+            fixture_command_gat(100, vec![key("a")], true)
         );
         let got = responses(b"VALUE a 0 5 99\r\nhello\r\nVALUE c 2 0\r\n\r\nEND\r\n");
         assert_eq!(
@@ -2814,159 +2779,68 @@ mod tests {
 
     #[test]
     fn other_commands_example() {
-        assert_eq!(
-            one(b"delete k\r\n"),
-            Command::Delete {
-                key: key("k"),
-                noreply: false
-            }
-        );
-        assert_eq!(
-            one(b"delete k 0 noreply\r\n"),
-            Command::Delete {
-                key: key("k"),
-                noreply: true
-            }
-        );
-        assert_eq!(
-            one(b"incr n 10\r\n"),
-            Command::Incr {
+        fictionet::assert_cases! {
+            one;
+            (b"delete k\r\n") => fixture_command_delete(key("k"), false),
+            (b"delete k 0 noreply\r\n") => fixture_command_delete(key("k"), true),
+            (b"incr n 10\r\n") => Command::Incr {
                 key: key("n"),
                 delta: 10,
-                noreply: false
-            }
-        );
-        assert_eq!(
-            one(b"decr n 3 noreply\r\n"),
-            Command::Decr {
+                noreply: false,
+            },
+            (b"decr n 3 noreply\r\n") => Command::Decr {
                 key: key("n"),
                 delta: 3,
-                noreply: true
-            }
-        );
-        assert_eq!(
-            one(b"touch k -1\r\n"),
-            Command::Touch {
-                key: key("k"),
-                exptime: -1,
-                noreply: false
-            }
-        );
-        assert_eq!(
-            one(b"stats slabs\r\n"),
-            Command::Stats {
-                args: vec![key("slabs")]
-            }
-        );
-        assert_eq!(one(b"version\n"), Command::Version);
-        assert_eq!(
-            one(b"verbosity 1\r\n"),
-            Command::Verbosity {
+                noreply: true,
+            },
+            (b"touch k -1\r\n") => fixture_command_touch(key("k"), -1, false),
+            (b"stats slabs\r\n") => Command::Stats {
+                args: vec![key("slabs")],
+            },
+            (b"version\n") => Command::Version,
+            (b"verbosity 1\r\n") => Command::Verbosity {
                 level: 1,
-                noreply: false
-            }
-        );
-        assert_eq!(
-            one(b"flush_all noreply\r\n"),
-            Command::FlushAll {
-                delay: None,
-                noreply: true
-            }
-        );
-        assert_eq!(
-            one(b"flush_all 10\r\n"),
-            Command::FlushAll {
-                delay: Some(10),
-                noreply: false
-            }
-        );
-        assert_eq!(one(b"quit\r\n"), Command::Quit);
-        // Extra spaces count as one.
-        assert_eq!(
-            one(b"get  a   b \r\n"),
-            Command::Get {
-                keys: vec![key("a"), key("b")],
-                cas: false
-            }
-        );
-        // A key named noreply is a key when the command needs one.
-        assert_eq!(
-            one(b"delete noreply\r\n"),
-            Command::Delete {
-                key: key("noreply"),
-                noreply: false
-            }
-        );
-        // memcached ignores a word other than noreply after the last one
-        // a command needs, and any words after version, quit and mn.
-        assert_eq!(
-            one(b"set k 0 0 1 x\r\nv\r\n"),
-            Command::Store {
+                noreply: false,
+            },
+            (b"flush_all noreply\r\n") => fixture_command_flush_all(None, true),
+            (b"flush_all 10\r\n") => fixture_command_flush_all(Some(10), false),
+            (b"quit\r\n") => Command::Quit,
+            // Extra spaces count as one.
+            (b"get  a   b \r\n") => fixture_command_get(vec![key("a"), key("b")], false),
+            // A key named noreply is a key when the command needs one.
+            (b"delete noreply\r\n") => fixture_command_delete(key("noreply"), false),
+            // memcached ignores a word other than noreply after the last one
+            // a command needs, and any words after version, quit and mn.
+            (b"set k 0 0 1 x\r\nv\r\n") => Command::Store {
                 verb: StoreVerb::Set,
                 key: key("k"),
                 flags: 0,
                 exptime: 0,
                 data: b"v".to_vec(),
-                noreply: false
-            }
-        );
-        assert_eq!(
-            one(b"incr n 1 x\r\n"),
-            Command::Incr {
+                noreply: false,
+            },
+            (b"incr n 1 x\r\n") => Command::Incr {
                 key: key("n"),
                 delta: 1,
-                noreply: false
-            }
-        );
-        assert_eq!(
-            one(b"touch k 1 noreply\r\n"),
-            Command::Touch {
-                key: key("k"),
-                exptime: 1,
-                noreply: true
-            }
-        );
-        assert_eq!(
-            one(b"flush_all 1 2\r\n"),
-            Command::FlushAll {
-                delay: Some(1),
-                noreply: false
-            }
-        );
-        assert_eq!(one(b"version now\r\n"), Command::Version);
-        assert_eq!(one(b"quit 1\r\n"), Command::Quit);
-        assert_eq!(one(b"mn x\r\n"), Command::MetaNoop);
-        // Expiration times are 32-bit signed numbers.
-        assert_eq!(
-            one(b"gat -2147483648 k\r\n"),
-            Command::Gat {
-                exptime: i32::MIN,
-                keys: vec![key("k")],
-                cas: false
-            }
-        );
-        assert_eq!(
-            one(b"touch k 2147483647\r\n"),
-            Command::Touch {
-                key: key("k"),
-                exptime: i32::MAX,
-                noreply: false
-            }
-        );
+                noreply: false,
+            },
+            (b"touch k 1 noreply\r\n") => fixture_command_touch(key("k"), 1, true),
+            (b"flush_all 1 2\r\n") => fixture_command_flush_all(Some(1), false),
+            (b"version now\r\n") => Command::Version,
+            (b"quit 1\r\n") => Command::Quit,
+            (b"mn x\r\n") => Command::MetaNoop,
+            // Expiration times are 32-bit signed numbers.
+            (b"gat -2147483648 k\r\n") => fixture_command_gat(i32::MIN, vec![key("k")], false),
+            (b"touch k 2147483647\r\n") => fixture_command_touch(key("k"), i32::MAX, false),
+        }
         let got = responses(
             b"STAT pid 2233\r\nSTAT uptime 45\r\nEND\r\n42\r\nVERSION 1.6.21\r\nTOUCHED\r\n",
         );
         assert_eq!(
             got,
             [
-                Ok(Response::Stat {
-                    name: key("pid"),
-                    value: key("2233")
-                }),
-                Ok(Response::Stat {
-                    name: key("uptime"),
-                    value: key("45")
-                }),
+                Ok(fixture_response_stat(key("pid"), key("2233"))),
+                Ok(fixture_response_stat(key("uptime"), key("45"))),
                 Ok(Response::End),
                 Ok(Response::Number(42)),
                 Ok(Response::Version(key("1.6.21"))),
@@ -3002,18 +2876,12 @@ mod tests {
                     flags: vec![MetaFlag::new(b't', b"-1")],
                     data: b"hi".to_vec()
                 }),
-                Ok(Response::Meta {
-                    status: MetaStatus::Miss,
-                    flags: vec![]
-                }),
-                Ok(Response::Meta {
-                    status: MetaStatus::Header,
-                    flags: vec![MetaFlag::new(b'O', b"123"), MetaFlag::new(b'k', b"")]
-                }),
-                Ok(Response::Meta {
-                    status: MetaStatus::Noop,
-                    flags: vec![]
-                }),
+                Ok(fixture_response_meta(MetaStatus::Miss, vec![])),
+                Ok(fixture_response_meta(
+                    MetaStatus::Header,
+                    vec![MetaFlag::new(b'O', b"123"), MetaFlag::new(b'k', b"")]
+                )),
+                Ok(fixture_response_meta(MetaStatus::Noop, vec![])),
                 Ok(Response::MetaDebug {
                     key: key("foo"),
                     info: b"exp=-1 la=3".to_vec()
@@ -3333,60 +3201,36 @@ mod tests {
                 String::from_utf8_lossy(line)
             );
         }
-        assert_eq!(responses(b"VALUE \x01 0 1\r\n"), [Err(Error::Key)]);
-        assert_eq!(
-            responses(b"BOGUS\r\nhd\r\n\r\n"),
-            [const { Err(Error::UnknownCommand) }; 3]
-        );
-        assert_eq!(
-            responses(b"VA 1\r\nxy\r\nEND\r\n"),
-            [
+        fictionet::assert_cases! {
+            responses;
+            (b"VALUE \x01 0 1\r\n") => [Err(Error::Key)],
+            (b"BOGUS\r\nhd\r\n\r\n") => [const { Err(Error::UnknownCommand) }; 3],
+            (b"VA 1\r\nxy\r\nEND\r\n") => [
                 Err(Error::BadDataChunk),
                 Err(Error::UnknownCommand),
-                Ok(Response::End)
-            ]
-        );
-        // Message text may be empty, and may hold spaces.
-        assert_eq!(
-            responses(b"SERVER_ERROR\r\n"),
-            [Ok(Response::ServerError(vec![]))]
-        );
-        assert_eq!(
-            responses(b"CLIENT_ERROR  two  spaces\r\n"),
-            [Ok(Response::ClientError(b" two  spaces".to_vec()))]
-        );
+                Ok(Response::End),
+            ],
+            // Message text may be empty, and may hold spaces.
+            (b"SERVER_ERROR\r\n") => [Ok(Response::ServerError(vec![]))],
+            (b"CLIENT_ERROR  two  spaces\r\n") =>
+                [Ok(Response::ClientError(b" two  spaces".to_vec()))],
+        }
     }
 
     #[test]
     fn writers_refuse_what_readers_refuse() {
-        let bad_key = Command::Get {
-            keys: vec![key("a b")],
-            cas: false,
-        };
+        let bad_key = fixture_command_get(vec![key("a b")], false);
         assert_eq!(bad_key.to_bytes(), Err(Error::Key));
         assert_eq!(
-            Command::Delete {
-                key: vec![],
-                noreply: false
-            }
-            .to_bytes(),
+            fixture_command_delete(vec![], false).to_bytes(),
             Err(Error::Key)
         );
         assert_eq!(
-            Command::Touch {
-                key: vec![b'k'; MAX_KEY + 1],
-                exptime: 0,
-                noreply: false
-            }
-            .to_bytes(),
+            fixture_command_touch(vec![b'k'; MAX_KEY + 1], 0, false).to_bytes(),
             Err(Error::Key)
         );
         assert_eq!(
-            Command::Get {
-                keys: vec![],
-                cas: false
-            }
-            .to_bytes(),
+            fixture_command_get(vec![], false).to_bytes(),
             Err(Error::Format)
         );
         assert_eq!(
@@ -3463,11 +3307,7 @@ mod tests {
             Err(Error::Format)
         );
         assert_eq!(
-            Response::Stat {
-                name: key("a b"),
-                value: vec![]
-            }
-            .to_bytes(),
+            fixture_response_stat(key("a b"), vec![]).to_bytes(),
             Err(Error::Format)
         );
         assert_eq!(
@@ -3636,24 +3476,18 @@ mod tests {
         for n in 0..UDP_HEADER_LEN {
             assert_eq!(UdpFrame::parse(&[0; 8][..n]), Err(Error::Short(n)));
         }
-        assert_eq!(
-            UdpFrame::parse(&[0, 0, 0, 0, 0, 1, 0, 1]),
-            Err(Error::Reserved(1))
-        );
-        assert_eq!(
-            UdpFrame::parse(&[0, 0, 0, 1, 0, 1, 0, 0]),
-            Err(Error::Sequence {
+        fictionet::assert_cases! {
+            UdpFrame::parse;
+            (&[0, 0, 0, 0, 0, 1, 0, 1]) => Err(Error::Reserved(1)),
+            (&[0, 0, 0, 1, 0, 1, 0, 0]) => Err(Error::Sequence {
                 sequence: 1,
-                total: 1
-            })
-        );
-        assert_eq!(
-            UdpFrame::parse(&[0; 8]),
-            Err(Error::Sequence {
+                total: 1,
+            }),
+            (&[0; 8]) => Err(Error::Sequence {
                 sequence: 0,
-                total: 0
-            })
-        );
+                total: 0,
+            }),
+        }
         let mut long = vec![0, 0, 0, 0, 0, 1, 0, 0];
         long.extend(vec![0; MAX_UDP_PAYLOAD + 1]);
         assert_eq!(
@@ -3909,11 +3743,7 @@ mod tests {
             Err(Error::LineTooLong)
         );
         assert_eq!(
-            Response::Stat {
-                name: key("a"),
-                value: big.clone()
-            }
-            .to_bytes(),
+            fixture_response_stat(key("a"), big.clone()).to_bytes(),
             Err(Error::LineTooLong)
         );
         let flags = vec![MetaFlag::new(b'O', &big)];
@@ -4093,23 +3923,14 @@ mod tests {
             errors(b"cas k 0 0 1 1 noreply\r\nxy\r\n")[0],
             Err((Error::BadDataChunk, true))
         );
-        assert_eq!(
-            errors(b"set k x 0 1 noreply\r\n"),
-            [Err((Error::Format, true))]
-        );
-        assert_eq!(errors(b"incr k x noreply\r\n"), [Err((Error::Delta, true))]);
-        assert_eq!(
-            errors(b"touch k x noreply\r\n"),
-            [Err((Error::Exptime, true))]
-        );
-        assert_eq!(
-            errors(b"delete k 5 noreply\r\n"),
-            [Err((Error::Format, true))]
-        );
-        assert_eq!(
-            errors(b"flush_all x noreply\r\n"),
-            [Err((Error::Format, true))]
-        );
+        fictionet::assert_cases! {
+            errors;
+            (b"set k x 0 1 noreply\r\n") => [Err((Error::Format, true))],
+            (b"incr k x noreply\r\n") => [Err((Error::Delta, true))],
+            (b"touch k x noreply\r\n") => [Err((Error::Exptime, true))],
+            (b"delete k 5 noreply\r\n") => [Err((Error::Format, true))],
+            (b"flush_all x noreply\r\n") => [Err((Error::Format, true))],
+        }
         // Without noreply, a word count memcached answers with ERROR, a
         // word other than noreply, and every meta error are not quiet.
         assert_eq!(
@@ -4141,22 +3962,14 @@ mod tests {
 
     #[test]
     fn a_bad_value_line_drops_its_block() {
-        assert_eq!(
-            responses(b"VALUE k 0 8 nope\r\nSTORED\r\n\r\nEND\r\n"),
-            [Err(Error::Format), Ok(Response::End)]
-        );
-        assert_eq!(
-            responses(b"VALUE k x 3\r\nEND\r\nEND\r\n"),
-            [Err(Error::Format), Ok(Response::End)]
-        );
-        assert_eq!(
-            responses(b"VALUE \x01 0 3\r\nEND\r\nEND\r\n"),
-            [Err(Error::Key), Ok(Response::End)]
-        );
-        assert_eq!(
-            responses(b"VA 3 \x01\r\nEND\r\nEND\r\n"),
-            [Err(Error::Format), Ok(Response::End)]
-        );
+        fictionet::assert_cases! {
+            responses;
+            (b"VALUE k 0 8 nope\r\nSTORED\r\n\r\nEND\r\n") =>
+                [Err(Error::Format), Ok(Response::End)],
+            (b"VALUE k x 3\r\nEND\r\nEND\r\n") => [Err(Error::Format), Ok(Response::End)],
+            (b"VALUE \x01 0 3\r\nEND\r\nEND\r\n") => [Err(Error::Key), Ok(Response::End)],
+            (b"VA 3 \x01\r\nEND\r\nEND\r\n") => [Err(Error::Format), Ok(Response::End)],
+        }
         contract::check_decode_with_alloc_limit(
             Responses::new,
             b"VALUE k 0 8 nope\r\nSTORED\r\n\r\nEND\r\n",
@@ -4191,10 +4004,7 @@ mod tests {
     fn long_multigets_are_taken() {
         // 33 keys of the longest length: over MAX_LINE.
         let keys: Vec<Vec<u8>> = (0..33u8).map(|i| vec![b'a' + i % 26; MAX_KEY]).collect();
-        let get = Command::Get {
-            keys: keys.clone(),
-            cas: false,
-        };
+        let get = fixture_command_get(keys.clone(), false);
         let bytes = get.to_bytes().unwrap();
         assert!(bytes.len() > MAX_LINE);
         assert_eq!(one(&bytes), get);
@@ -4220,11 +4030,7 @@ mod tests {
         );
         let huge = vec![vec![b'k'; MAX_KEY]; MAX_GET_LINE / MAX_KEY];
         assert_eq!(
-            Command::Get {
-                keys: huge.clone(),
-                cas: false
-            }
-            .to_bytes(),
+            fixture_command_get(huge.clone(), false).to_bytes(),
             Err(Error::LineTooLong)
         );
         let mut line = b"get".to_vec();

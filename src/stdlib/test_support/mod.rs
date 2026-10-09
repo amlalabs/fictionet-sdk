@@ -15,6 +15,32 @@ use fictionet::stdlib::codec::{Decode, Fail, Lcg, Stream, finish, pump};
 
 pub mod contract;
 
+/// Checks each argument tuple against its expected result, in order.
+/// Each row evaluates the callable, arguments, and expected value once.
+/// A failed assertion names the callable and argument expressions.
+///
+/// ```
+/// fictionet::assert_cases! {
+///     str::len;
+///     ("a") => 1,
+///     ("longer") => 6,
+/// }
+/// ```
+#[macro_export]
+macro_rules! assert_cases {
+    ($call:expr; $(($($arg:expr),+ $(,)?) => $expected:expr),+ $(,)?) => {
+        $(
+            assert_eq!(
+                ($call)($($arg),+),
+                $expected,
+                "case {}({})",
+                stringify!($call),
+                stringify!($($arg),+)
+            );
+        )+
+    };
+}
+
 /// Parses pairs of hex digits for tests, skipping ASCII whitespace.
 ///
 /// Panics on an odd digit count or a non-hex character.
@@ -362,6 +388,35 @@ pub fn check_atomic<T, R, E, S: PartialEq + core::fmt::Debug>(
 mod tests {
     use super::assert_linear;
     use core::hint::black_box;
+
+    #[test]
+    fn cases_evaluate_once_in_order() {
+        let steps = core::cell::RefCell::new(Vec::new());
+        let mark = |n| {
+            steps.borrow_mut().push(n);
+            n
+        };
+        fictionet::assert_cases! {
+            { mark(0); |a, b| { mark(3); a + b } };
+            (mark(1), mark(2)) => mark(4) - 1,
+            (mark(5), mark(6)) => mark(7) + 4,
+        }
+        assert_eq!(*steps.borrow(), [0, 1, 2, 3, 4, 0, 5, 6, 3, 7]);
+    }
+
+    #[test]
+    #[should_panic(expected = "case str::len(\"wrong\")")]
+    fn cases_name_the_failed_input() {
+        fn later() -> &'static str {
+            panic!("continued after failure")
+        }
+        fictionet::assert_cases! {
+            str::len;
+            ("a") => 1,
+            ("wrong") => 0,
+            (later()) => 0,
+        }
+    }
 
     #[test]
     fn hex_pairs_ignore_ascii_whitespace() {

@@ -445,6 +445,11 @@ fn copied_clock(fcx: &fictionet::Cx, cx: &mut std::task::Context<'_>) {
     let _ = fcx.require_real_io();
     copied_client_config(fcx, std::time::SystemTime::UNIX_EPOCH);
     copied_mutex();
+    copied_step_and_buffer();
+    fictionet::cfg_observe! {
+    copied_previews();
+    }
+    copied_assert_cases();
 }
 
 #[allow(dead_code)]
@@ -488,4 +493,12 @@ fn copied_previews() {
     assert_eq!(fictionet::observe::hex(&[0, 255]), "00ff");
     assert_eq!(fictionet::observe::protocols::body_preview(b"hello"), Some("hello".into()));
 }
+}
+
+fn copied_assert_cases() {
+    fictionet::assert_cases! {
+        <vxlan::Packet as fictionet::stdlib::codec::Wire>::parse;
+        (&[]) => Err(vxlan::Error::Truncated(0)),
+        (&[0; 7]) => Err(vxlan::Error::Truncated(7)),
+    }
 }
