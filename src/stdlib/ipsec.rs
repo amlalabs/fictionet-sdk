@@ -1104,7 +1104,9 @@ mod tests {
         assert!(Datagram::Ike(vec![0; MAX_DATAGRAM - 4]).to_bytes().is_ok());
 
         assert_eq!(ah(4, 0, 1, &[]).to_bytes(), Err(Error::ZeroSpi));
-        fictionet::assert_cases!(|(input_0, input_1, input_2)| ah(4, input_0, 1, input_1).for_icv(input_2).and_then(|header| header.to_bytes());
+        fictionet::assert_cases!(|(input_0, input_1, input_2)| ah(4, input_0, 1, input_1)
+            .for_icv(input_2)
+            .and_then(|header| header.to_bytes());
             ((0, &[], 0)) => Err(Error::ZeroSpi),
             ((1, &[0; 12], 16)) => Err(Error::Truncated),
             ((1, &[0; 12], usize::MAX)) => Err(Error::Truncated),

@@ -2050,11 +2050,9 @@ mod tests {
         fictionet::assert_cases!(Document::parse;
             (&big) => Err(E::BsonLength(big_i32())),
             (&[5, 0, 0, 0, 1]) => Err(E::Terminator),
-            (&[6, 0, 0, 0, 0, 0]) => Err(E::Terminator),
-            // ends early
+            (&[6, 0, 0, 0, 0, 0]) => Err(E::Terminator), // ends early
             (&raw(&[0x20, b'a', 0])) => Err(E::Type(0x20)),
-            (&raw(&[0x0a, b'a'])) => Err(E::Terminator),
-            // key with no zero
+            (&raw(&[0x0a, b'a'])) => Err(E::Terminator), // key with no zero
             (&raw(&[0x0a, 0xff, 0])) => Err(E::Utf8),
             (&raw(&[0x08, b'a', 0, 2])) => Err(E::Bool(2)),
             (&raw(&[0x10, b'a', 0, 1, 2])) => Err(E::BsonTruncated),

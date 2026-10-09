@@ -645,7 +645,8 @@ mod tests {
             (&[0x81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0]) => Err(Error::Truncated),
             // An extension header with no extension, and one cut short.
             (&[0x90, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0xbe]) => Err(Error::Truncated),
-            (&[ 0x90, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0xbe, 0xde, 0, 1, 0x10 ]) => Err(Error::Truncated),
+            (&[0x90, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0xbe, 0xde, 0, 1, 0x10]) =>
+                Err(Error::Truncated),
             // Padding count 0, and one that runs into the header.
             (&[0xa0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0]) => Err(Error::Padding),
             (&[0xa0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 7, 3]) => Err(Error::Padding),

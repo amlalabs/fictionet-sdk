@@ -1548,9 +1548,11 @@ mod tests {
             (Request::ReadInputRegisters { address: 0, quantity: 126 }) => Err(Error::Quantity),
             (Request::ReadCoils { address: 0, quantity: 2001 }) => Err(Error::Quantity),
             (Request::ReadHoldingRegisters { address: 65535, quantity: 2 }) => Err(Error::Address),
-            (Request::WriteMultipleRegisters { address: 0, values: vec![] }) => Err(Error::Quantity),
+            (Request::WriteMultipleRegisters { address: 0, values: vec![] }) =>
+                Err(Error::Quantity),
             (Request::WriteMultipleCoils { address: 0, values: vec![] }) => Err(Error::Quantity),
-            (Request::WriteMultipleCoils { address: 65535, values: vec![true; 2] }) => Err(Error::Address),
+            (Request::WriteMultipleCoils { address: 65535, values: vec![true; 2] }) =>
+                Err(Error::Address),
         );
         let last = Request::ReadDiscreteInputs {
             address: 65535,

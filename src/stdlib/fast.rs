@@ -3936,7 +3936,7 @@ mod tests {
         // A whole message, then the start of one that ends in the next block.
         let tail = [0x83, 0xc0, 0x81, 0xc0, 0x81, 0x81];
         fictionet::assert_cases!(|input| decode_all(make, input);
-            (&tail) => ( vec![empty.clone()], Some(Fail::Protocol(Error::BlockBoundary)) ),
+            (&tail) => (vec![empty.clone()], Some(Fail::Protocol(Error::BlockBoundary))),
             // A block that ends inside a message at end of input.
             (&[0x81, 0xc0]) => (Vec::new(), Some(Fail::Protocol(Error::BlockBoundary))),
             // A partial block at end of input is truncated, not misframed.

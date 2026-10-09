@@ -2745,11 +2745,13 @@ mod tests {
             // The same attribute twice.
             (&[0, 0, 0, 8, 0x40, 1, 1, 0, 0x40, 1, 1, 0]) => Err(Error::MalformedAttributeList),
             // An unknown attribute without the optional bit.
-            (&[0, 0, 0, 4, 0x40, 99, 1, 7]) => Err(Error::UnrecognizedWellKnownAttribute(vec![0x40, 99, 1, 7])),
+            (&[0, 0, 0, 4, 0x40, 99, 1, 7]) =>
+                Err(Error::UnrecognizedWellKnownAttribute(vec![0x40, 99, 1, 7])),
             // Flags that do not match the type.
             (&[0, 0, 0, 4, 0xc0, 1, 1, 0]) => Err(Error::AttributeFlags(vec![0xc0, 1, 1, 0])),
             (&[0, 0, 0, 4, 0x60, 1, 1, 0]) => Err(Error::AttributeFlags(vec![0x60, 1, 1, 0])),
-            (&[0, 0, 0, 7, 0xa0, 4, 4, 0, 0, 0, 1]) => Err(Error::AttributeFlags(vec![0xa0, 4, 4, 0, 0, 0, 1])),
+            (&[0, 0, 0, 7, 0xa0, 4, 4, 0, 0, 0, 1]) =>
+                Err(Error::AttributeFlags(vec![0xa0, 4, 4, 0, 0, 0, 1])),
             (&[0, 0, 0, 3, 0x80, 8, 0]) => Err(Error::AttributeFlags(vec![0x80, 8, 0])),
         );
         // Lengths that do not match the type.
@@ -2816,7 +2818,8 @@ mod tests {
         // Routes without the attributes they need.
         fictionet::assert_cases!(e;
             (&[0, 0, 0, 0, 8, 10]) => Err(Error::MissingWellKnownAttribute(attr::ORIGIN)),
-            (&[0, 0, 0, 4, 0x40, 1, 1, 0, 8, 10]) => Err(Error::MissingWellKnownAttribute(attr::AS_PATH)),
+            (&[0, 0, 0, 4, 0x40, 1, 1, 0, 8, 10]) =>
+                Err(Error::MissingWellKnownAttribute(attr::AS_PATH)),
             (&[0, 0, 0, 7, 0x40, 1, 1, 0, 0x40, 2, 0, 8, 10]) =>
                 Err(Error::MissingWellKnownAttribute(attr::NEXT_HOP)),
         );
@@ -3037,11 +3040,15 @@ mod tests {
         let invalid =
             |m: Message, negotiated: &Context| matches!(bad(m, negotiated), Error::Unwritable);
         fictionet::assert_cases!(|(input_0, input_1)| bad(input_0, input_1);
-            ((Message::Open(Open { hold_time: 2, ..Open::new(1, 0, id, vec![]) }), &TWO)) => Error::Unwritable,
-            ((Message::Open(Open::new(1, 0, Ipv4Addr::UNSPECIFIED, vec![])), &TWO)) => Error::Unwritable,
+            ((Message::Open(Open { hold_time: 2, ..Open::new(1, 0, id, vec![]) }), &TWO)) =>
+                Error::Unwritable,
+            ((Message::Open(Open::new(1, 0, Ipv4Addr::UNSPECIFIED, vec![])), &TWO)) =>
+                Error::Unwritable,
             ((open(vec![Parameter::Other { kind: 2, value: vec![] }]), &TWO)) => Error::Unwritable,
-            ((open(vec![Parameter::Other { kind: 255, value: vec![] }]), &TWO)) => Error::Unwritable,
-            ((Message::Open(Open { my_as: 0, ..Open::new(1, 0, id, vec![]) }), &TWO)) => Error::Unwritable,
+            ((open(vec![Parameter::Other { kind: 255, value: vec![] }]), &TWO)) =>
+                Error::Unwritable,
+            ((Message::Open(Open { my_as: 0, ..Open::new(1, 0, id, vec![]) }), &TWO)) =>
+                Error::Unwritable,
             ((Message::Open(Open::new(0, 0, id, vec![])), &TWO)) => Error::Unwritable,
         );
         assert_eq!(
@@ -3056,8 +3063,10 @@ mod tests {
         );
         let caps = |c: Vec<Capability>| open(vec![Parameter::Capabilities(c)]);
         fictionet::assert_cases!(|(input_0, input_1)| bad(input_0, input_1);
-            ((caps(vec![Capability::Other { code: 65, value: vec![0; 4] }]), &TWO)) => Error::Unwritable,
-            ((caps(vec![Capability::Other { code: 9, value: vec![0; 256] }]), &TWO)) => Error::Unwritable,
+            ((caps(vec![Capability::Other { code: 65, value: vec![0; 4] }]), &TWO)) =>
+                Error::Unwritable,
+            ((caps(vec![Capability::Other { code: 9, value: vec![0; 256] }]), &TWO)) =>
+                Error::Unwritable,
         );
         // More than 255 bytes of capabilities take the extended format.
         assert!(encode(&caps(vec![Capability::RouteRefresh; 128]), &TWO).is_ok());
@@ -3174,7 +3183,8 @@ mod tests {
             ((reach(vec![0; 256], 2, Nlri::Prefixes(vec![])), &TWO)) => Error::Unwritable,
             ((reach(vec![0; 16], 2, Nlri::Raw(vec![])), &TWO)) => Error::Unwritable,
             ((reach(vec![0; 16], 9, Nlri::Prefixes(vec![])), &TWO)) => Error::Unwritable,
-            ((reach(vec![0; 4], 2, Nlri::Prefixes(vec![v4(1, 0, 0, 0, 8)])), &TWO)) => Error::Unwritable,
+            ((reach(vec![0; 4], 2, Nlri::Prefixes(vec![v4(1, 0, 0, 0, 8)])), &TWO)) =>
+                Error::Unwritable,
         );
         assert!(encode(&reach(vec![0; 4], 9, Nlri::Raw(vec![1, 2, 3])), &TWO).is_ok());
         // Too much for one message.

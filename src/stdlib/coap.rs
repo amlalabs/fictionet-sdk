@@ -2471,7 +2471,7 @@ mod tests {
         fictionet::assert_cases!(|(input_0, input_1, input_2)| Block::take(input_0, input_1, input_2);
             ((&body, 1, 6)) => None,
             ((&body, 0, 7)) => None,
-            ((&[], 0, 2)) => Some(( Block { num: 0, more: false, szx: 2 }, &[][..] )),
+            ((&[], 0, 2)) => Some((Block { num: 0, more: false, szx: 2 }, &[][..])),
             ((&[0; 32], 2, 0)) => None,
         );
         assert!(!Block::take(&[0; 32], 1, 0).unwrap().0.more);

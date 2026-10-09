@@ -1825,7 +1825,8 @@ mod tests {
         let b = [0, big[0], big[1], big[2], big[3]];
         fictionet::assert_cases!(Message::parse_prefix;
             (&b) => Err(Error::TooLarge { length: MAX_MESSAGE as u32 + 1, limit: MAX_MESSAGE }),
-            (&[0, 0xff, 0xff, 0xff, 0xff]) => Err(Error::TooLarge { length: u32::MAX, limit: MAX_MESSAGE }),
+            (&[0, 0xff, 0xff, 0xff, 0xff]) =>
+                Err(Error::TooLarge { length: u32::MAX, limit: MAX_MESSAGE }),
         );
         // Exactly the limit is allowed, and waits for its bytes.
         let at = (MAX_MESSAGE as u32).to_be_bytes();

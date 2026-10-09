@@ -1786,7 +1786,8 @@ mod tests {
             ("XPWD") => Ok(Request::Pwd),
             ("XMKD new") => Ok(Request::Mkd("new".into())),
             ("SITE CHMOD 755 x") => Ok(Request::Site("CHMOD 755 x".into())),
-            ("AUTH TLS") => Ok(Request::Other(Command { verb: "AUTH".into(), arg: Some("TLS".into()) })),
+            ("AUTH TLS") =>
+                Ok(Request::Other(Command { verb: "AUTH".into(), arg: Some("TLS".into()) })),
         );
     }
 

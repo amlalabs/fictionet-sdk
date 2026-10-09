@@ -2374,7 +2374,8 @@ mod tests {
         fictionet::assert_cases!(Tag::parse;
             (&[0xf9, 0xff, 0x00]) => Err(Error::ReservedTag(255)),
             (&[0xfe, 0xff]) => Err(Error::ReservedTag(255)),
-            (&[0xf9, 0xfe]) => Ok(Tag { number: 254, class: Class::Context, content: TagContent::Length(1) }),
+            (&[0xf9, 0xfe]) =>
+                Ok(Tag { number: 254, class: Class::Context, content: TagContent::Length(1) }),
         );
         // The writer never writes the reserved number.
         let mut out = Vec::new();
