@@ -92,8 +92,6 @@ macro_rules! text_wire {
             type WriteError = $error;
 
             $(#[$parse])*
-            #[doc = concat!("Refuses input over [`", stringify!($limit), "`], invalid UTF-8, and values")]
-            /// whose canonical form exceeds that limit or changes a field.
             fn parse(bytes: &[u8]) -> Result<Self, $error> {
                 if bytes.len() > $limit {
                     return Err($error::TooLong);
@@ -105,8 +103,6 @@ macro_rules! text_wire {
             }
 
             $(#[$write])*
-            /// Refuses values that would read back differently. Leaves `out`
-            #[doc = concat!("unchanged on error. Output is bounded by [`", stringify!($limit), "`].")]
             fn write(&self, out: &mut Vec<u8>) -> Result<(), $error> {
                 let text = self.format_value()?;
                 if text.len() > $limit {
