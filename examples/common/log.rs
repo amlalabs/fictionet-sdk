@@ -319,6 +319,53 @@ impl Drop for Writer {
 mod tests {
     use super::*;
 
+    struct SlowWriter {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Write for SlowWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recording_returns_while_the_writer_is_blocked() {
+        let (entered, writing) = mpsc::channel();
+        let (release, waiting) = mpsc::channel();
+        let (recorded, returned) = mpsc::channel();
+        let callback = std::thread::spawn(move || {
+            fictionet::block_on(fictionet::run(
+                fictionet::Seed::from_u64(1),
+                move |fcx| async move {
+                    let log = Log::new(
+                        Box::new(SlowWriter {
+                            entered,
+                            release: waiting,
+                        }),
+                        &[],
+                        |s| s,
+                    );
+                    log.attach(&fcx);
+                    log.write(serde_json::json!({"type": "http"}));
+                    recorded.send(()).unwrap();
+                    Ok(())
+                },
+            ))
+            .unwrap();
+        });
+        writing.recv_timeout(Duration::from_secs(2)).unwrap();
+        let completed = returned.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        callback.join().unwrap();
+        completed.expect("recording returns before the disk write finishes");
+    }
+
     #[derive(Clone)]
     struct Output(Arc<Mutex<Vec<u8>>>);
     impl Write for Output {

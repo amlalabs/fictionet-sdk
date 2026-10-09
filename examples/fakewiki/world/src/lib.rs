@@ -20,6 +20,7 @@
 
 pub mod content;
 pub mod events;
+#[path = "../../../common/log.rs"]
 pub mod log;
 
 use std::collections::HashMap;

@@ -40,7 +40,11 @@ fn real_main() -> fictionet::Result {
 
     // 2. Ground truth files.
     std::fs::create_dir_all(&args.state_dir)?;
-    let log = Arc::new(Log::create(&args.state_dir.join("log.jsonl"))?);
+    let log = Arc::new(Log::new(
+        Box::new(std::fs::File::create(args.state_dir.join("log.jsonl"))?),
+        &[],
+        |s| s,
+    ));
 
     // 3. Addresses and certificates.
     let fixed = fixed_addresses(&hello)?;

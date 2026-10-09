@@ -54,10 +54,12 @@ async fn h2_head(
     let stream = tls(fcx, m, addr, host, std::sync::Arc::new(config))
         .await
         .unwrap();
-    let (mut send, conn) =
-        hyper::client::conn::http2::handshake(Spawn, hyper_util::rt::TokioIo::new(stream))
-            .await
-            .unwrap();
+    let (mut send, conn) = hyper::client::conn::http2::handshake(
+        Spawn,
+        hyper_util::rt::TokioIo::new(stream.into_tokio(fcx)),
+    )
+    .await
+    .unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -100,7 +102,7 @@ fn normal(mut line: Value) -> String {
 }
 
 fn script(variant: Variant) {
-    world(variant, Task::Login, move |fcx, attacher, env| async move {
+    run_variant(variant, Task::Login, move |fcx, attacher, env| async move {
         let agent = Ipv4Addr::new(10, 0, 0, 2);
         let m = machine(&fcx, &attacher, "agent", agent);
         // DNS: the bank's names, the status host, a name out of the world.

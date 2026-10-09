@@ -29,7 +29,8 @@ jobs:
       fail-fast: false
       matrix:
         # Build host integration with observation; the simulated core alone;
-        # all features including outbound web proxying; and tokio without observation.
+        # all features including outbound web proxying; tokio without observation;
+        # and HTTP/1 and WebSocket serving with observation, without tokio.
         include:
           - name: default features
             features: ""
@@ -37,6 +38,8 @@ jobs:
             features: "--no-default-features"
           - name: all features
             features: "--all-features"
+          - name: std and observation without tokio
+            features: "--no-default-features --features std,observe"
           - name: tokio without observation
             features: "--no-default-features --features tokio"
     steps:

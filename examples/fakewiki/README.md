@@ -196,6 +196,7 @@ It supplies the `Sites` callback and connects the request log.
 ## Layout
 
 ```
+examples/common/log.rs      # shared log.jsonl writer
 examples/fakewiki/
   compose.yaml              # fictionet (the world), attach, default (the agent)
   docker/Dockerfile         # build-attach, build-world, ca, world, attach, agent
@@ -205,7 +206,6 @@ examples/fakewiki/
     src/lib.rs              # Sites, certificates, arguments and backend helpers
     src/content.rs          # the handler: asks backend.py for the page, tags the response
     src/events.rs           # the request log, written from the network's events
-    src/log.rs              # log.jsonl writer
     backend/backend.py      # FakeWiki's pages over HTTP on 127.0.0.1
     backend/fictionet_world/sites.py   # every host and page, from fixtures/corpus.json
   fixtures/corpus.json      # the three topics, each source's accurate and altered text

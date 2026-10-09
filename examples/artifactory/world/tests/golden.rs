@@ -3,10 +3,10 @@
 
 mod common;
 use artifactory_world::packages::Variant;
-use common::{script, world};
+use common::{run_variant, script};
 
 fn golden(variant: Variant) {
-    world(variant, move |fcx, attacher, env| async move {
+    run_variant(variant, move |fcx, attacher, env| async move {
         let log = env.log.clone();
         script(fcx.clone(), attacher, env).await?;
         let mut lines: Vec<String> = log

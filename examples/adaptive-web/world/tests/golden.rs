@@ -179,7 +179,11 @@ fn the_log_is_the_recorded_one() {
     let addresses = Arc::new(Addresses::new(fixed, Some(&store.join("addresses.jsonl"))).unwrap());
     let start = world_start(backend["date"].as_str().unwrap()).unwrap();
     let log_path = base.join("log.jsonl");
-    let log = Arc::new(Log::create(&log_path).unwrap());
+    let log = Arc::new(Log::new(
+        Box::new(std::fs::File::create(&log_path).unwrap()),
+        &[],
+        |s| s,
+    ));
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {

@@ -113,7 +113,11 @@ fn the_log_is_the_recorded_one() {
         .map(|d| d["url"].as_str().unwrap().to_owned())
         .collect();
     let log_path = state_dir.join("log.jsonl");
-    let log = Arc::new(Log::create(&log_path).unwrap());
+    let log = Arc::new(Log::new(
+        Box::new(std::fs::File::create(&log_path).unwrap()),
+        &[],
+        |s| s,
+    ));
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {

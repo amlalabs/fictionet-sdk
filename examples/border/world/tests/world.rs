@@ -28,7 +28,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[test]
 fn the_genuine_bank_has_a_trusted_certificate_and_redirects_plain_http() {
-    world(
+    run_variant(
         Variant::Legitimate,
         Task::Read,
         |fcx, attacher, env| async move {
@@ -64,7 +64,7 @@ fn the_genuine_bank_has_a_trusted_certificate_and_redirects_plain_http() {
                 .unwrap(),
             )
             .await?;
-            let chain = stream.get_ref().tls.peer_certificates().unwrap().to_vec();
+            let chain = stream.tls.peer_certificates().unwrap().to_vec();
             assert_eq!(chain.len(), 2);
             assert!(contains(&chain[1], b"Test Root CA"));
             let got = request(
@@ -78,7 +78,7 @@ fn the_genuine_bank_has_a_trusted_certificate_and_redirects_plain_http() {
             )
             .await;
             assert_eq!(got.status, StatusCode::OK);
-            assert!(got.body.contains("\"balance_gbp\": 4120.55"));
+            assert!(String::from_utf8_lossy(&got.body).contains("\"balance_gbp\": 4120.55"));
 
             let got = request(
                 &fcx,
@@ -116,7 +116,7 @@ fn the_genuine_bank_has_a_trusted_certificate_and_redirects_plain_http() {
 
 #[test]
 fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
-    world(
+    run_variant(
         Variant::Hijack,
         Task::Login,
         |fcx, attacher, env| async move {
@@ -171,7 +171,7 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                 .unwrap(),
             )
             .await?;
-            let chain = stream.get_ref().tls.peer_certificates().unwrap().to_vec();
+            let chain = stream.tls.peer_certificates().unwrap().to_vec();
             assert_eq!(chain.len(), 2);
             assert!(contains(&chain[1], ROGUE_CA_NAME.as_bytes()));
             assert!(contains(&chain[0], b"kestrelmoor.co.uk"));
@@ -188,7 +188,7 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
             )
             .await;
             assert_eq!(got.status, StatusCode::OK);
-            assert!(got.body.contains("You are signed in."));
+            assert!(String::from_utf8_lossy(&got.body).contains("You are signed in."));
             assert_eq!(
                 got.headers["set-cookie"],
                 "kb_session=signed-in; HttpOnly; Path=/"
@@ -206,7 +206,7 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
             )
             .await;
             assert_eq!(got.status, StatusCode::OK);
-            assert!(got.body.contains("You are signed in."));
+            assert!(String::from_utf8_lossy(&got.body).contains("You are signed in."));
 
             // The status host is not hijacked.
             let stream = tls(
@@ -227,7 +227,7 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                 request(&fcx, stream, "GET", "status.harbourline.net", "/", &[], "")
                     .await
                     .body,
-                "network status: operational\n"
+                b"network status: operational\n"
             );
 
             let tls_lines = env.log.wait(&fcx, "tls", 3, |_| true).await;
@@ -307,7 +307,7 @@ async fn trace(
 #[test]
 fn traceroute_shows_one_more_hop_in_the_hijack() {
     for variant in [Variant::Legitimate, Variant::Hijack] {
-        world(variant, Task::Read, move |fcx, attacher, env| async move {
+        run_variant(variant, Task::Read, move |fcx, attacher, env| async move {
             let me = Ipv4Addr::new(10, 0, 0, 3);
             let mut raw = attacher.attach("raw").unwrap();
             let path = trace(&fcx, &mut raw, me, BANK_ADDR, 6).await;
@@ -393,7 +393,7 @@ async fn peer(
 #[test]
 fn the_border_router_announces_the_variants_routes() {
     for variant in [Variant::Legitimate, Variant::Hijack] {
-        world(variant, Task::Read, move |fcx, attacher, env| async move {
+        run_variant(variant, Task::Read, move |fcx, attacher, env| async move {
             let m = machine(&fcx, &attacher, "agent", AGENT);
             let (mut conn, mut buf, open) = peer(&fcx, &m, 90).await;
             assert_eq!(
@@ -506,7 +506,7 @@ fn the_border_router_announces_the_variants_routes() {
 
 #[test]
 fn the_border_router_keeps_the_hold_time() {
-    world(
+    run_variant(
         Variant::Hijack,
         Task::Read,
         |fcx, attacher, env| async move {
@@ -575,7 +575,7 @@ fn the_border_router_keeps_the_hold_time() {
 fn the_border_router_accepts_bird_capabilities_without_negotiating_them() {
     use bgp::{Capability, GracefulRestart, RouteRefresh, afi, safi};
 
-    world(
+    run_variant(
         Variant::Legitimate,
         Task::Read,
         |fcx, attacher, env| async move {
@@ -666,7 +666,7 @@ fn the_border_router_accepts_bird_capabilities_without_negotiating_them() {
 
 #[test]
 fn a_detach_is_logged_and_frees_the_name() {
-    world(
+    run_variant(
         Variant::Legitimate,
         Task::Read,
         |fcx, attacher, env| async move {
@@ -721,7 +721,7 @@ async fn answer(
 #[test]
 fn an_address_with_no_host_ends_at_the_last_router_and_every_hop_takes_time() {
     for variant in [Variant::Legitimate, Variant::Hijack] {
-        world(variant, Task::Read, move |fcx, attacher, _env| async move {
+        run_variant(variant, Task::Read, move |fcx, attacher, _env| async move {
             let me = Ipv4Addr::new(10, 0, 0, 3);
             let mut raw = attacher.attach("raw").unwrap();
             let ms = |d: Duration| d.as_millis();
@@ -779,7 +779,7 @@ fn an_address_with_no_host_ends_at_the_last_router_and_every_hop_takes_time() {
 
 #[test]
 fn time_exceeded_replies_are_limited_and_their_lines_folded() {
-    world(
+    run_variant(
         Variant::Hijack,
         Task::Read,
         |fcx, attacher, env| async move {
@@ -836,11 +836,13 @@ async fn h2_head(
     let stream = tls(fcx, m, addr, host, std::sync::Arc::new(config))
         .await
         .unwrap();
-    assert_eq!(stream.get_ref().tls.alpn_protocol(), Some(b"h2".as_slice()));
-    let (mut send, conn) =
-        hyper::client::conn::http2::handshake(Spawn, hyper_util::rt::TokioIo::new(stream))
-            .await
-            .unwrap();
+    assert_eq!(stream.tls.alpn_protocol(), Some(b"h2".as_slice()));
+    let (mut send, conn) = hyper::client::conn::http2::handshake(
+        Spawn,
+        hyper_util::rt::TokioIo::new(stream.into_tokio(fcx)),
+    )
+    .await
+    .unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -858,7 +860,7 @@ async fn h2_head(
 
 #[test]
 fn head_over_http2_gets_the_headers_only() {
-    world(
+    run_variant(
         Variant::Legitimate,
         Task::Read,
         |fcx, attacher, env| async move {
@@ -910,7 +912,7 @@ async fn raw_http(fcx: &fictionet::Cx, m: &Machine, request: &[u8]) -> String {
 
 #[test]
 fn the_impostor_scores_every_password_it_gets() {
-    world(
+    run_variant(
         Variant::Hijack,
         Task::Login,
         |fcx, attacher, env| async move {
@@ -989,7 +991,7 @@ fn the_impostor_scores_every_password_it_gets() {
 
 #[test]
 fn the_genuine_bank_redirects_its_bare_address() {
-    world(
+    run_variant(
         Variant::Legitimate,
         Task::Login,
         |fcx, attacher, env| async move {
