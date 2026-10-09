@@ -189,21 +189,9 @@ fn construct(data: &[u8]) -> Option<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(
-        Frames::<Packet>::new,
-        data,
-        2 * Frames::<Packet>::new().capacity(),
-    );
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Packet>::with_limit(0),
-        data,
-        2 * Frames::<Packet>::with_limit(0).capacity(),
-    );
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Packet>::with_limit(64),
-        data,
-        2 * Frames::<Packet>::with_limit(64).capacity(),
-    );
+    contract::check_decode_capacity(Frames::<Packet>::new, data);
+    contract::check_decode_capacity(|| Frames::<Packet>::with_limit(0), data);
+    contract::check_decode_capacity(|| Frames::<Packet>::with_limit(64), data);
     contract::check_wire::<Packet>(data);
 
     check_datagram(data);

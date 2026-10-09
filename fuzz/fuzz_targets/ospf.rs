@@ -1,6 +1,10 @@
 //! OSPFv2 and OSPFv3 packets and LSAs, as a world playing a router reads
 //! them, and values a world builds, as it writes them.
 #![no_main]
+#[path = "../common/input.rs"]
+mod input;
+use input::list;
+
 use fictionet::stdlib::ip::Endpoints;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -102,16 +106,6 @@ fn ip4(u: &mut Unstructured) -> Result<Ipv4Addr> {
 
 fn ip6(u: &mut Unstructured) -> Result<Ipv6Addr> {
     Ok(Ipv6Addr::from(u.arbitrary::<u128>()?))
-}
-
-/// A list of up to `max` items made by `f`.
-fn list<T>(
-    u: &mut Unstructured,
-    max: usize,
-    mut f: impl FnMut(&mut Unstructured) -> Result<T>,
-) -> Result<Vec<T>> {
-    let n = u.int_in_range(0..=max)?;
-    (0..n).map(|_| f(u)).collect()
 }
 
 /// A prefix built with `Prefix::new` or directly, so its address may have

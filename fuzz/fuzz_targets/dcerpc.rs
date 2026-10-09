@@ -2,6 +2,10 @@
 //! reads them, and values a world builds, as it writes them.
 #![no_main]
 
+#[path = "../common/input.rs"]
+mod input;
+use input::{bytes, list};
+
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -20,20 +24,6 @@ fn syntax(u: &mut Unstructured) -> Result<SyntaxId> {
         major: u.arbitrary()?,
         minor: u.arbitrary()?,
     })
-}
-
-fn list<T>(
-    u: &mut Unstructured,
-    max: usize,
-    f: impl Fn(&mut Unstructured) -> Result<T>,
-) -> Result<Vec<T>> {
-    let n = u.int_in_range(0..=max)?;
-    (0..n).map(|_| f(u)).collect()
-}
-
-fn bytes(u: &mut Unstructured, max: usize) -> Result<Vec<u8>> {
-    let n = u.int_in_range(0..=max)?;
-    Ok(u.bytes(n)?.to_vec())
 }
 
 fn bind(u: &mut Unstructured) -> Result<Bind> {
@@ -249,22 +239,10 @@ fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<(
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(
-        Frames::<Pdu>::new,
-        data,
-        2 * Frames::<Pdu>::new().capacity(),
-    );
+    contract::check_decode_capacity(Frames::<Pdu>::new, data);
     contract::check_wire::<Pdu>(data);
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Pdu>::with_limit(0),
-        data,
-        2 * Frames::<Pdu>::with_limit(0).capacity(),
-    );
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Pdu>::with_limit(64),
-        data,
-        2 * Frames::<Pdu>::with_limit(64).capacity(),
-    );
+    contract::check_decode_capacity(|| Frames::<Pdu>::with_limit(0), data);
+    contract::check_decode_capacity(|| Frames::<Pdu>::with_limit(64), data);
 
     let (results, _) = decode_all(Frames::<Pdu>::new, data);
     let mut rest = data;

@@ -15,13 +15,8 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 compose=(docker compose -f "$here/compose.yaml")
-failures=0
 
-cleanup() { "${compose[@]}" down -v --remove-orphans --timeout 2 >/dev/null 2>&1 || true; }
-trap cleanup EXIT
-
-pass() { echo "PASS: $*"; }
-fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
+source "$here/../common.sh"
 
 # Waits up to 10 s for the world's log to contain a line.
 world_says() {
@@ -104,4 +99,4 @@ echo "--- world log"
 echo "--- attach log"
 "${compose[@]}" logs --no-log-prefix attach
 
-if [[ $failures == 0 ]]; then echo "ALL PASSED"; else echo "$failures FAILED"; exit 1; fi
+finish

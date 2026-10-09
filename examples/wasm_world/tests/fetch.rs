@@ -1,7 +1,7 @@
 //! One request through the world, on the host and in a JavaScript engine.
 //!
-//! A JavaScript engine runs all four tests. The host runs the three that
-//! use `block_on`. The README says which requests a world cannot serve in
+//! Both targets run four synchronous cases; JavaScript also runs an
+//! event-loop case. The README says which requests a world cannot serve in
 //! a JavaScript engine.
 
 use http::Version;
@@ -17,15 +17,22 @@ fn check(fetched: Fetched, version: Version) {
     );
 }
 
-/// HTTP/2 with prior knowledge, with `block_on` driving the world. In a
-/// JavaScript engine it fires the timers itself.
+/// Plain HTTP and HTTPS with both HTTP versions, driven by `block_on`.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
-fn http2_with_block_on() {
-    check(
-        fictionet::block_on(fetch(false, Version::HTTP_2)).unwrap(),
-        Version::HTTP_2,
-    );
+fn requests_with_block_on() {
+    for (https, version) in [
+        (false, Version::HTTP_2),
+        (true, Version::HTTP_2),
+        (false, Version::HTTP_11),
+        (true, Version::HTTP_11),
+    ] {
+        check(
+            fictionet::block_on(fetch(https, version))
+                .unwrap_or_else(|e| panic!("https={https}, version={version:?}: {e}")),
+            version,
+        );
+    }
 }
 
 /// HTTPS with HTTP/2, with the JavaScript event loop driving the world, as
@@ -34,28 +41,4 @@ fn http2_with_block_on() {
 #[wasm_bindgen_test::wasm_bindgen_test]
 async fn https_on_the_event_loop() {
     check(fetch(true, Version::HTTP_2).await.unwrap(), Version::HTTP_2);
-}
-
-/// HTTPS with HTTP/2, with `block_on` driving the world.
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-fn https_with_block_on() {
-    check(
-        fictionet::block_on(fetch(true, Version::HTTP_2)).unwrap(),
-        Version::HTTP_2,
-    );
-}
-
-/// HTTP/1.1, plain and over TLS.
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-fn http1_with_block_on() {
-    check(
-        fictionet::block_on(fetch(false, Version::HTTP_11)).unwrap(),
-        Version::HTTP_11,
-    );
-    check(
-        fictionet::block_on(fetch(true, Version::HTTP_11)).unwrap(),
-        Version::HTTP_11,
-    );
 }

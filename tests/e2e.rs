@@ -15,7 +15,6 @@ mod world;
 use certs::certs;
 use world::real_world as world;
 
-use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -23,138 +22,23 @@ use std::time::{Duration, SystemTime};
 
 use fictionet::prelude::*;
 use fictionet::stdlib::tls::{self, ServerConfig};
-use fictionet::stdlib::{ConnError, Connection, delay, ip, route, tcp};
+use fictionet::stdlib::{delay, ip, route, tcp};
 use fictionet::{Cx, Interface, Packet, RecvError, pair};
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection};
+use rustls::ClientConfig;
 
 // ---------------------------------------------------------------------------
 // A rustls client over any Connection.
 
-#[derive(Debug)]
-#[allow(dead_code)] // The fields show in failure messages.
-enum ClientError {
-    Conn(ConnError),
-    Tls(rustls::Error),
-    Truncated,
-}
-
-impl From<ConnError> for ClientError {
-    fn from(e: ConnError) -> Self {
-        ClientError::Conn(e)
-    }
-}
-
-impl std::fmt::Display for ClientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-impl std::error::Error for ClientError {}
-
-struct Client<C> {
-    conn: C,
-    tls: ClientConnection,
-}
-
-impl<C: Connection> Client<C> {
-    async fn connect(
-        fcx: &Cx,
-        conn: C,
-        config: Arc<ClientConfig>,
-        name: &str,
-    ) -> Result<Self, ClientError> {
-        let name = ServerName::try_from(name.to_owned()).unwrap();
-        let tls = ClientConnection::new(config, name).unwrap();
-        let mut c = Client { conn, tls };
-        while c.tls.is_handshaking() {
-            c.flush(fcx).await?;
-            if !c.tls.is_handshaking() {
-                break;
-            }
-            c.read_more(fcx).await?;
-        }
-        c.flush(fcx).await?;
-        Ok(c)
-    }
-
-    async fn flush(&mut self, fcx: &Cx) -> Result<(), ClientError> {
-        while self.tls.wants_write() {
-            let mut out = Vec::new();
-            self.tls.write_tls(&mut out).unwrap();
-            self.conn.write_all(fcx, &out).await?;
-        }
-        Ok(())
-    }
-
-    async fn read_more(&mut self, fcx: &Cx) -> Result<(), ClientError> {
-        let mut buf = vec![0; 16 * 1024];
-        let n = self.conn.read(fcx, &mut buf).await?;
-        if n == 0 && self.tls.is_handshaking() {
-            return Err(ClientError::Truncated);
-        }
-        let mut data = &buf[..n];
-        loop {
-            self.tls.read_tls(&mut data).unwrap();
-            let r = self.tls.process_new_packets();
-            let _ = self.flush(fcx).await;
-            r.map_err(ClientError::Tls)?;
-            if data.is_empty() {
-                return Ok(());
-            }
-        }
-    }
-
-    /// Reads application data. `Ok(0)` is the server's close_notify.
-    async fn read(&mut self, fcx: &Cx, buf: &mut [u8]) -> Result<usize, ClientError> {
-        loop {
-            match self.tls.reader().read(buf) {
-                Ok(n) => return Ok(n),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => self.read_more(fcx).await?,
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                    return Err(ClientError::Truncated);
-                }
-                Err(e) => panic!("{e}"),
-            }
-        }
-    }
-
-    async fn write_all(&mut self, fcx: &Cx, mut data: &[u8]) -> Result<(), ClientError> {
-        while !data.is_empty() {
-            let n = self
-                .tls
-                .writer()
-                .write(&data[..data.len().min(16 * 1024)])
-                .unwrap();
-            data = &data[n..];
-            self.flush(fcx).await?;
-        }
-        Ok(())
-    }
-
-    /// Sends close_notify and a FIN. Reading still works.
-    async fn close(&mut self, fcx: &Cx) -> Result<(), ClientError> {
-        self.tls.send_close_notify();
-        self.flush(fcx).await?;
-        self.conn.shutdown(fcx).await?;
-        Ok(())
-    }
-}
+#[path = "common/rustls_client.rs"]
+mod rustls_client;
+type Client<C> = rustls_client::Client<C, false>;
 
 // ---------------------------------------------------------------------------
 // Certificates: a world CA and a leaf for the server.
 
-fn pattern(len: usize, seed: u64) -> Vec<u8> {
-    let mut x = seed | 1;
-    (0..len)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect()
-}
+#[path = "common/pattern.rs"]
+mod payload;
+use payload::pattern;
 
 // ---------------------------------------------------------------------------
 // The test.

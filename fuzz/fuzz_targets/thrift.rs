@@ -21,17 +21,9 @@ fuzz_target!(|data: &[u8]| {
         data,
         EncodedMessages::new().held(),
     );
-    contract::check_decode_with_alloc_limit(
-        Frames::<Frame>::new,
-        data,
-        2 * Frames::<Frame>::new().capacity(),
-    );
+    contract::check_decode_capacity(Frames::<Frame>::new, data);
     let limit = usize::from(data.first().copied().unwrap_or(0));
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Frame>::with_limit(limit),
-        data,
-        2 * Frames::<Frame>::with_limit(limit).capacity(),
-    );
+    contract::check_decode_capacity(|| Frames::<Frame>::with_limit(limit), data);
     contract::check_wire::<Frame>(data);
     contract::check_wire::<EncodedMessage>(data);
     contract::check_decode_with_alloc_limit(

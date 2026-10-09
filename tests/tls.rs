@@ -6,7 +6,6 @@ mod common;
 use common::within;
 
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Read, Write};
 use std::sync::{Arc, Mutex, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,8 +15,8 @@ use fictionet::stdlib::ca::Ca;
 use fictionet::stdlib::tls::{self, ServerConfig};
 use fictionet::stdlib::{ConnError, Connection};
 use fictionet::{Cx, Seed, block_on, lab};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{AlertDescription, ClientConfig, ClientConnection, RootCertStore};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
+use rustls::{AlertDescription, ClientConfig, RootCertStore};
 
 // ---------------------------------------------------------------------------
 // An in-memory connection pair.
@@ -139,110 +138,10 @@ impl Drop for MemConn {
 // ---------------------------------------------------------------------------
 // A rustls client over a connection.
 
-struct Client {
-    conn: MemConn,
-    tls: ClientConnection,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)] // The fields show in failure messages.
-enum ClientError {
-    Conn(ConnError),
-    Tls(rustls::Error),
-    /// The connection ended without close_notify.
-    Truncated,
-}
-
-impl From<ConnError> for ClientError {
-    fn from(e: ConnError) -> Self {
-        ClientError::Conn(e)
-    }
-}
-
-impl Client {
-    async fn connect(
-        fcx: &Cx,
-        conn: MemConn,
-        config: Arc<ClientConfig>,
-        name: &str,
-    ) -> Result<Client, ClientError> {
-        let name = ServerName::try_from(name.to_owned()).unwrap();
-        let tls = tls::with_context(fcx, || ClientConnection::new(config, name)).unwrap();
-        let mut c = Client { conn, tls };
-        while c.tls.is_handshaking() {
-            c.flush(fcx).await?;
-            if !c.tls.is_handshaking() {
-                break;
-            }
-            c.read_more(fcx).await?;
-        }
-        c.flush(fcx).await?;
-        Ok(c)
-    }
-
-    async fn flush(&mut self, fcx: &Cx) -> Result<(), ClientError> {
-        while self.tls.wants_write() {
-            let mut out = Vec::new();
-            self.tls.write_tls(&mut out).unwrap();
-            self.conn.write_all(fcx, &out).await?;
-        }
-        Ok(())
-    }
-
-    /// Reads one chunk from the connection and processes it.
-    async fn read_more(&mut self, fcx: &Cx) -> Result<(), ClientError> {
-        let mut buf = vec![0; 16 * 1024];
-        let n = self.conn.read(fcx, &mut buf).await?;
-        if n == 0 && self.tls.is_handshaking() {
-            return Err(ClientError::Truncated);
-        }
-        let mut data = &buf[..n];
-        loop {
-            self.tls.read_tls(&mut data).unwrap();
-            let r = tls::with_context(fcx, || self.tls.process_new_packets());
-            // Send any alert or reply before reporting.
-            let _ = self.flush(fcx).await;
-            r.map_err(ClientError::Tls)?;
-            if data.is_empty() {
-                return Ok(());
-            }
-        }
-    }
-
-    /// Reads application data. `Ok(0)` is the server's close_notify.
-    async fn read(&mut self, fcx: &Cx, buf: &mut [u8]) -> Result<usize, ClientError> {
-        loop {
-            match self.tls.reader().read(buf) {
-                Ok(n) => return Ok(n),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => self.read_more(fcx).await?,
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                    return Err(ClientError::Truncated);
-                }
-                Err(e) => panic!("{e}"),
-            }
-        }
-    }
-
-    async fn write_all(&mut self, fcx: &Cx, mut data: &[u8]) -> Result<(), ClientError> {
-        while !data.is_empty() {
-            let n = self
-                .tls
-                .writer()
-                .write(&data[..data.len().min(16 * 1024)])
-                .unwrap();
-            data = &data[n..];
-            self.flush(fcx).await?;
-        }
-        Ok(())
-    }
-
-    async fn close(&mut self, fcx: &Cx) -> Result<(), ClientError> {
-        self.tls.send_close_notify();
-        self.flush(fcx).await?;
-        self.conn.shutdown(fcx).await?;
-        Ok(())
-    }
-}
+#[path = "common/rustls_client.rs"]
+mod rustls_client;
+use rustls_client::ClientError;
+type Client = rustls_client::Client<MemConn, true>;
 
 // ---------------------------------------------------------------------------
 // Certificates.

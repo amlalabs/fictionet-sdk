@@ -13,22 +13,10 @@ use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(
-        Frames::<Message>::new,
-        data,
-        2 * Frames::<Message>::new().capacity(),
-    );
+    contract::check_decode_capacity(Frames::<Message>::new, data);
     contract::check_wire::<Message>(data);
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Message>::with_limit(0),
-        data,
-        2 * Frames::<Message>::with_limit(0).capacity(),
-    );
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Message>::with_limit(64),
-        data,
-        2 * Frames::<Message>::with_limit(64).capacity(),
-    );
+    contract::check_decode_capacity(|| Frames::<Message>::with_limit(0), data);
+    contract::check_decode_capacity(|| Frames::<Message>::with_limit(64), data);
     let mut built = Message::request(u32::from(data.first().copied().unwrap_or(0)) << 20, 0, 1, 2);
     built.error = true;
     built.avps.push(Avp {

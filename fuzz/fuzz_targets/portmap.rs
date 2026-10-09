@@ -2,6 +2,10 @@
 //! portmapper reads them, and values a world builds, as it writes them.
 #![no_main]
 
+#[path = "../common/input.rs"]
+mod input;
+use input::bytes;
+
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::onc_rpc::{Body, Call, Message, PMAP_PROGRAM};
 use fictionet::stdlib::portmap::{
@@ -56,11 +60,6 @@ fn text(u: &mut Unstructured) -> Result<String> {
     Ok((0..n)
         .map(|_| u.int_in_range(b'a'..=b'z').map(char::from))
         .collect::<Result<_>>()?)
-}
-
-fn bytes(u: &mut Unstructured, max: usize) -> Result<Vec<u8>> {
-    let n = u.int_in_range(0..=max)?;
-    Ok(u.bytes(n)?.to_vec())
 }
 
 fn mapping(u: &mut Unstructured) -> Result<Mapping> {

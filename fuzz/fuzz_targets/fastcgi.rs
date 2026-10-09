@@ -14,18 +14,10 @@ use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(
-        Frames::<Record>::new,
-        data,
-        2 * Frames::<Record>::new().capacity(),
-    );
+    contract::check_decode_capacity(Frames::<Record>::new, data);
     contract::check_wire::<Record>(data);
     let limit = usize::from(data.first().copied().unwrap_or(0));
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Record>::with_limit(limit),
-        data,
-        2 * Frames::<Record>::with_limit(limit).capacity(),
-    );
+    contract::check_decode_capacity(|| Frames::<Record>::with_limit(limit), data);
     contract::check_decode_with_alloc_limit(
         || Frames::<Record>::new().map(|record| BeginRequest::parse(&record.content)),
         data,

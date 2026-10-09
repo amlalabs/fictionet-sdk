@@ -1,6 +1,11 @@
 //! Feature-specific runtime contracts.
 
 #[cfg(feature = "std")]
+#[macro_use]
+#[path = "common/service_fixture.rs"]
+mod service_fixture;
+
+#[cfg(feature = "std")]
 #[test]
 fn http_alpn_matches_transport_features() {
     use fictionet::stdlib::{httpd, net::PortServer};
@@ -118,19 +123,12 @@ mod http {
             websocket::{self, Message, Messages},
         };
         struct Echo;
-        impl serve::Service for Echo {
-            type Decoder = Messages;
-            type State = ();
-            type Error = websocket::Error;
-            fn decoder(&self) -> Messages {
+        service_fixture! {
+            Echo => (Messages, (), websocket::Error);
+            decoder(self) {
                 Messages::new(Side::Server)
             }
-            fn on_item(
-                &mut self,
-                message: Message,
-                _: &(),
-                driver: &mut serve::Driver<'_, Messages>,
-            ) -> Result<serve::Flow, Self::Error> {
+            on_item(self, message: Message; _, driver) -> serve::Flow {
                 message.to_frame(None)?.write(driver.reply())?;
                 Ok(serve::Flow::Continue)
             }

@@ -316,6 +316,20 @@ where
         },
     )
 }
+/// Checks decoding with an input allocation bound of twice the initial
+/// capacity. The decoder's capacity must stay fixed.
+pub fn check_decode_capacity<D: Decode>(
+    make: impl Fn() -> D,
+    data: &[u8],
+) -> (Vec<D::Item>, Option<Fail<D::Error>>)
+where
+    D::Item: PartialEq + Debug,
+    D::Error: Clone + PartialEq + Debug,
+{
+    let limit = 2 * make().capacity();
+    check_decode_with_alloc_limit(make, data, limit)
+}
+
 fn check_limits<D: Decode>(
     make: impl Fn() -> D,
     data: &[u8],

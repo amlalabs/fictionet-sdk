@@ -24,27 +24,11 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 compose=(docker compose -f "$here/compose.yaml")
-failures=0
 # One token for this run. The sandbox gets it in its proxy URLs.
 RELAY_TOKEN="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
 export RELAY_TOKEN
 
-cleanup() { "${compose[@]}" down -v --remove-orphans --timeout 2 >/dev/null 2>&1 || true; }
-trap cleanup EXIT
-
-pass() { echo "PASS: $*"; }
-fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
-agent() { "${compose[@]}" exec -T agent "$@"; }
-
-# Runs a check: name, then the expected text (a grep -E pattern), then the
-# command. The command's stdout and stderr are matched, as one line.
-check() {
-    local name="$1" want="$2"
-    shift 2
-    local out
-    out="$("$@" 2>&1 | tr '\n' ' ')" || true
-    if grep -qE -- "$want" <<<"$out"; then pass "$name"; else fail "$name: wanted /$want/, got: $out"; fi
-}
+source "$here/../common.sh"
 
 cleanup
 "${compose[@]}" build --quiet
@@ -183,4 +167,4 @@ check "attach says why" 'the world closed the connection; the proxy is closed' "
 check "and the sandbox has no way out at all" "Could not resolve proxy|Failed to connect|Couldn't connect" \
     agent curl -sS -m 5 https://example.test/
 
-if [[ $failures == 0 ]]; then echo "ALL PASSED"; else echo "$failures FAILED"; exit 1; fi
+finish

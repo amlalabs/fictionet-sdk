@@ -57,7 +57,7 @@ fn transform(text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shared::{Writer, fold_key};
+    use shared::fold_key;
 
     /// The network's own counted `blocked` lines are written as they come,
     /// not counted again.
@@ -77,50 +77,6 @@ mod tests {
 
     #[test]
     fn repeated_lines_fold_into_a_count() {
-        let blocked = |port: u16| {
-            json!({
-                "type": "blocked", "sandbox": {"id": 1, "name": "a"},
-                "why": "Refused", "protocol": 6,
-                   "src": "10.0.0.2", "dst": "84.21.44.10", "dst_port": port})
-        };
-        let mut lines = vec![json!({"type": "dns", "name": "x"})];
-        lines.extend((1..=1000).map(blocked));
-        let mut other = blocked(22);
-        other["dst"] = json!("84.21.60.20");
-        lines.push(other);
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        struct Out(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl Write for Out {
-            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(data);
-                Ok(data.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut w = Writer::new(Box::new(Out(buf.clone())), FOLDED, transform);
-        for (i, line) in lines.into_iter().enumerate() {
-            w.line(i as f64, line).unwrap();
-        }
-        w.close_folds().unwrap();
-        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        let got: Vec<Value> = text
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
-        assert_eq!(got.len(), 4, "{text}");
-        assert_eq!(got[0]["type"], "dns");
-        assert_eq!(
-            (got[1]["dst_port"].as_u64(), got[1].get("count")),
-            (Some(1), None)
-        );
-        assert_eq!(got[2]["dst"], "84.21.60.20");
-        assert_eq!(
-            (got[3]["count"].as_u64(), got[3]["ports"].clone()),
-            (Some(999), json!([2, 1000]))
-        );
-        assert_eq!(got[3]["dst"], "84.21.44.10");
+        shared::assert_repeated_lines_fold(FOLDED, transform);
     }
 }

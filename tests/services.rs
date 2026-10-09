@@ -4,6 +4,10 @@
 //! that speaks Modbus/TCP and a web server, on one `Net`, with the
 //! dashboard's decoder reading both from the packets.
 
+#[macro_use]
+#[path = "common/service_fixture.rs"]
+mod service_fixture;
+
 mod common;
 #[path = "common/done.rs"]
 mod done;
@@ -46,8 +50,8 @@ use fictionet::stdlib::modbus::{
 use fictionet::stdlib::net::{Arrival, Net, PortServer, Sni};
 use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::serve::{
-    self, Budget, Driver, Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingDriver,
-    Plan, ServeOptions, Served, Service, Timer, Transcript, Upgrade,
+    self, Budget, Ended, FaultPlan, Flow, Harness, HarnessError, Pending, PendingDriver, Plan,
+    ServeOptions, Served, Timer, Transcript, Upgrade,
 };
 use fictionet::stdlib::{ConnError, Connection, ip, tcp, udp};
 use fictionet::{Cx, block_on, pair, run};
@@ -93,30 +97,19 @@ async fn read_some<C: Connection>(fcx: &Cx, conn: &mut C, want: usize) -> Vec<u8
 /// `later` answers through deferred work.
 struct Echo;
 
-impl Service for Echo {
-    type Decoder = Lines;
-    type State = ();
-    type Error = Infallible;
+service_fixture! {
+    Echo => (Lines, (), Infallible);
 
-    fn decoder(&self) -> Lines {
+    decoder(self) {
         Lines::new(64, Ending::LfOrCrlf)
     }
 
-    fn on_open(
-        &mut self,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_open(self; _, driver) -> Flow {
         driver.reply().extend_from_slice(b"hello\n");
         Ok(Flow::Continue)
     }
 
-    fn on_item(
-        &mut self,
-        line: Result<Vec<u8>, LineError>,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
         let Ok(line) = line else {
             driver.reply().extend_from_slice(b"too long\n");
             return Ok(Flow::Continue);
@@ -144,12 +137,7 @@ impl Service for Echo {
         }
     }
 
-    fn on_end(
-        &mut self,
-        end: Ended,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<(), Infallible> {
+    on_end(self, end: Ended; _, driver) -> () {
         if end == Ended::Eof {
             driver.reply().extend_from_slice(b"eof\n");
         }
@@ -191,39 +179,23 @@ struct Ticker {
     ticks: u32,
 }
 
-impl Service for Ticker {
-    type Decoder = Lines;
-    type State = ();
-    type Error = Infallible;
+service_fixture! {
+    Ticker => (Lines, (), Infallible);
 
-    fn decoder(&self) -> Lines {
+    decoder(self) {
         Lines::new(64, Ending::LfOrCrlf)
     }
 
-    fn on_open(
-        &mut self,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_open(self; _, driver) -> Flow {
         driver.set_timer("tick", Duration::from_millis(30));
         Ok(Flow::Continue)
     }
 
-    fn on_item(
-        &mut self,
-        _: Result<Vec<u8>, LineError>,
-        _: &(),
-        _: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> Flow {
         Ok(Flow::Continue)
     }
 
-    fn on_timer(
-        &mut self,
-        _: Timer,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_timer(self, _: Timer; _, driver) -> Flow {
         self.ticks += 1;
         driver.reply().extend_from_slice(b"tick\n");
         if self.ticks == 3 {
@@ -245,21 +217,14 @@ struct Plant {
 /// A Modbus/TCP PLC, built from `stdlib::modbus`.
 struct Plc;
 
-impl Service for Plc {
-    type Decoder = fictionet::stdlib::codec::Frames<modbus::Frame>;
-    type State = Plant;
-    type Error = Infallible;
+service_fixture! {
+    Plc => (fictionet::stdlib::codec::Frames<modbus::Frame>, Plant, Infallible);
 
-    fn decoder(&self) -> fictionet::stdlib::codec::Frames<modbus::Frame> {
+    decoder(self) {
         fictionet::stdlib::codec::Frames::<modbus::Frame>::new()
     }
 
-    fn on_item(
-        &mut self,
-        frame: Frame,
-        plant: &Plant,
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_item(self, frame: Frame; plant, driver) -> Flow {
         let mut registers = plant.registers.lock().unwrap();
         let pdu = match MbRequest::parse(&frame.pdu) {
             Ok(MbRequest::ReadHoldingRegisters { address, quantity }) => {
@@ -363,27 +328,15 @@ fn a_decoder_failure_is_handed_to_the_service_with_what_it_could_not_read() {
     struct Strict {
         unread: Vec<u8>,
     }
-    impl Service for Strict {
-        type Decoder = fictionet::stdlib::codec::Frames<modbus::Frame>;
-        type State = ();
-        type Error = Infallible;
-        fn decoder(&self) -> fictionet::stdlib::codec::Frames<modbus::Frame> {
+    service_fixture! {
+        Strict => (fictionet::stdlib::codec::Frames<modbus::Frame>, (), Infallible);
+        decoder(self) {
             fictionet::stdlib::codec::Frames::<modbus::Frame>::new()
         }
-        fn on_item(
-            &mut self,
-            _: Frame,
-            _: &(),
-            _: &mut Driver<'_, Self::Decoder>,
-        ) -> Result<Flow, Infallible> {
+        on_item(self, _: Frame; _, _) -> Flow {
             Ok(Flow::Continue)
         }
-        fn on_fail(
-            &mut self,
-            _: &fictionet::stdlib::codec::Fail<modbus::Error>,
-            _: &(),
-            driver: &mut Driver<'_, Self::Decoder>,
-        ) -> Result<(), Infallible> {
+        on_fail(self, _: &fictionet::stdlib::codec::Fail<modbus::Error>; _, driver) -> () {
             self.unread = driver.unread().to_vec();
             driver.reply().extend_from_slice(b"no");
             Ok(())
@@ -927,19 +880,12 @@ fn a_connection_cap_resets_connections_past_it() {
 fn datagram_answers_each_datagram() {
     /// Answers a datagram of lines with their count.
     struct Count;
-    impl Service for Count {
-        type Decoder = Lines;
-        type State = AtomicUsize;
-        type Error = Infallible;
-        fn decoder(&self) -> Lines {
+    service_fixture! {
+        Count => (Lines, AtomicUsize, Infallible);
+        decoder(self) {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        fn on_item(
-            &mut self,
-            _: Result<Vec<u8>, LineError>,
-            n: &AtomicUsize,
-            driver: &mut Driver<'_, Self::Decoder>,
-        ) -> Result<Flow, Infallible> {
+        on_item(self, _: Result<Vec<u8>, LineError>; n, driver) -> Flow {
             let total = n.fetch_add(1, Ordering::SeqCst) + 1;
             driver
                 .reply()
@@ -1231,19 +1177,12 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         let counter = Arc::new(AtomicUsize::new(0));
         /// Counts datagrams.
         struct Udp;
-        impl Service for Udp {
-            type Decoder = Lines;
-            type State = AtomicUsize;
-            type Error = Infallible;
-            fn decoder(&self) -> Lines {
+        service_fixture! {
+            Udp => (Lines, AtomicUsize, Infallible);
+            decoder(self) {
                 Lines::new(64, Ending::LfOrCrlf)
             }
-            fn on_item(
-                &mut self,
-                _: Result<Vec<u8>, LineError>,
-                n: &AtomicUsize,
-                driver: &mut Driver<'_, Self::Decoder>,
-            ) -> Result<Flow, Infallible> {
+            on_item(self, _: Result<Vec<u8>, LineError>; n, driver) -> Flow {
                 driver.record(Event::new("udp", "datagram"));
                 driver.reply().extend_from_slice(
                     format!("{}\n", n.fetch_add(1, Ordering::SeqCst) + 1).as_bytes(),
@@ -1465,19 +1404,12 @@ fn a_cancel_during_the_tls_handshake_is_a_cancel() {
 fn net_routes_tls_by_name_to_each_service() {
     /// Answers each line in upper case.
     struct Upper;
-    impl Service for Upper {
-        type Decoder = Lines;
-        type State = ();
-        type Error = Infallible;
-        fn decoder(&self) -> Lines {
+    service_fixture! {
+        Upper => (Lines, (), Infallible);
+        decoder(self) {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        fn on_item(
-            &mut self,
-            line: Result<Vec<u8>, LineError>,
-            _: &(),
-            driver: &mut Driver<'_, Self::Decoder>,
-        ) -> Result<Flow, Infallible> {
+        on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
             driver
                 .reply()
                 .extend_from_slice(&line.unwrap_or_default().to_ascii_uppercase());
@@ -1636,19 +1568,12 @@ fn http1_survives_mixed_and_random_input() {
 fn a_decoder_that_skips_a_long_line_keeps_the_connection_open() {
     /// Echo on 16-byte lines.
     struct Short;
-    impl Service for Short {
-        type Decoder = Lines;
-        type State = ();
-        type Error = Infallible;
-        fn decoder(&self) -> Lines {
+    service_fixture! {
+        Short => (Lines, (), Infallible);
+        decoder(self) {
             Lines::new(16, Ending::LfOrCrlf)
         }
-        fn on_item(
-            &mut self,
-            line: Result<Vec<u8>, LineError>,
-            _: &(),
-            driver: &mut Driver<'_, Self::Decoder>,
-        ) -> Result<Flow, Infallible> {
+        on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
             match line {
                 Ok(line) => driver
                     .reply()
@@ -1712,18 +1637,12 @@ struct Mail {
     tls: bool,
 }
 
-impl Service for Mail {
-    type Decoder = Lines;
-    type State = ();
-    type Error = Infallible;
-    fn decoder(&self) -> Lines {
+service_fixture! {
+    Mail => (Lines, (), Infallible);
+    decoder(self) {
         Lines::new(512, Ending::LfOrCrlf)
     }
-    fn on_open(
-        &mut self,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_open(self; _, driver) -> Flow {
         // After STARTTLS the client speaks first.
         self.tls = driver.conn().tls;
         if !self.tls {
@@ -1731,12 +1650,7 @@ impl Service for Mail {
         }
         Ok(Flow::Continue)
     }
-    fn on_item(
-        &mut self,
-        line: Result<Vec<u8>, LineError>,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
         let line = line.unwrap_or_default();
         match line.as_slice() {
             b"STARTTLS" if !self.tls => {
@@ -1858,19 +1772,12 @@ struct Trader {
     inbox: Inbox,
 }
 
-impl Service for Trader {
-    type Decoder = Lines;
-    type State = Book;
-    type Error = Infallible;
-    fn decoder(&self) -> Lines {
+service_fixture! {
+    Trader => (Lines, Book, Infallible);
+    decoder(self) {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_item(
-        &mut self,
-        line: Result<Vec<u8>, LineError>,
-        book: &Book,
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_item(self, line: Result<Vec<u8>, LineError>; book, driver) -> Flow {
         let line = String::from_utf8(line.unwrap_or_default()).unwrap_or_default();
         if line == "sub" {
             book.subscribers
@@ -1889,11 +1796,7 @@ impl Service for Trader {
         }
         Ok(Flow::Continue)
     }
-    fn on_wake(
-        &mut self,
-        _: &Book,
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_wake(self; _, driver) -> Flow {
         for fill in self.inbox.lock().unwrap().drain(..) {
             driver
                 .reply()
@@ -1949,28 +1852,17 @@ struct Session {
     beats: u64,
 }
 
-impl Service for Session {
-    type Decoder = Lines;
-    type State = ();
-    type Error = Infallible;
-    fn decoder(&self) -> Lines {
+service_fixture! {
+    Session => (Lines, (), Infallible);
+    decoder(self) {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_open(
-        &mut self,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_open(self; _, driver) -> Flow {
         driver.set_timer("heartbeat", Duration::from_millis(10));
         driver.set_timer("logon", Duration::from_millis(25));
         Ok(Flow::Continue)
     }
-    fn on_item(
-        &mut self,
-        line: Result<Vec<u8>, LineError>,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
         self.lines += 1;
         if line.as_deref() == Ok(b"slow") {
             // Work that takes a while, so the client's bytes pile up.
@@ -1991,12 +1883,7 @@ impl Service for Session {
         }
         Ok(Flow::Continue)
     }
-    fn on_timer(
-        &mut self,
-        timer: Timer,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_timer(self, timer: Timer; _, driver) -> Flow {
         match timer {
             "heartbeat" => {
                 self.beats += 1;
@@ -2156,19 +2043,12 @@ struct Mux {
     baton: Arc<Mutex<Baton>>,
 }
 
-impl Service for Mux {
-    type Decoder = Lines;
-    type State = ();
-    type Error = Infallible;
-    fn decoder(&self) -> Lines {
+service_fixture! {
+    Mux => (Lines, (), Infallible);
+    decoder(self) {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_item(
-        &mut self,
-        line: Result<Vec<u8>, LineError>,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
         match line.as_deref() {
             Ok(b"get") => {
                 let work = Frames {
@@ -2186,13 +2066,7 @@ impl Service for Mux {
         }
         Ok(Flow::Continue)
     }
-    fn on_done(
-        &mut self,
-        key: u64,
-        done: serve::Done,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_done(self, key: u64, done: serve::Done; _, driver) -> Flow {
         assert!(matches!(done, serve::Done::Finished), "{done:?}");
         driver
             .reply()
@@ -2258,27 +2132,16 @@ fn datagram_services_send_several_datagrams_and_tick() {
     /// MoldUDP64 in miniature: `req N` is answered with N datagrams, and a
     /// heartbeat goes to the world's subscriber every 20 ms.
     struct Mold;
-    impl Service for Mold {
-        type Decoder = Lines;
-        type State = SocketAddr;
-        type Error = Infallible;
-        fn decoder(&self) -> Lines {
+    service_fixture! {
+        Mold => (Lines, SocketAddr, Infallible);
+        decoder(self) {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        fn on_open(
-            &mut self,
-            _: &SocketAddr,
-            driver: &mut Driver<'_, Self::Decoder>,
-        ) -> Result<Flow, Infallible> {
+        on_open(self; _, driver) -> Flow {
             driver.set_timer("heartbeat", Duration::from_millis(20));
             Ok(Flow::Continue)
         }
-        fn on_item(
-            &mut self,
-            line: Result<Vec<u8>, LineError>,
-            _: &SocketAddr,
-            driver: &mut Driver<'_, Self::Decoder>,
-        ) -> Result<Flow, Infallible> {
+        on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
             let line = String::from_utf8(line.unwrap_or_default()).unwrap_or_default();
             let n: u32 = line
                 .strip_prefix("req ")
@@ -2293,12 +2156,7 @@ fn datagram_services_send_several_datagrams_and_tick() {
             }
             Ok(Flow::Continue)
         }
-        fn on_timer(
-            &mut self,
-            _: Timer,
-            subscriber: &SocketAddr,
-            driver: &mut Driver<'_, Self::Decoder>,
-        ) -> Result<Flow, Infallible> {
+        on_timer(self, _: Timer; subscriber, driver) -> Flow {
             driver.send_to(*subscriber, b"heartbeat".to_vec());
             driver.set_timer("heartbeat", Duration::from_millis(20));
             Ok(Flow::Continue)
@@ -2339,19 +2197,12 @@ fn datagram_services_send_several_datagrams_and_tick() {
 /// Panics on `boom`.
 struct Fragile;
 
-impl Service for Fragile {
-    type Decoder = Lines;
-    type State = ();
-    type Error = std::io::Error;
-    fn decoder(&self) -> Lines {
+service_fixture! {
+    Fragile => (Lines, (), std::io::Error);
+    decoder(self) {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_item(
-        &mut self,
-        line: Result<Vec<u8>, LineError>,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, std::io::Error> {
+    on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
         match line.as_deref() {
             Ok(b"boom") => panic!("the service fell over"),
             Ok(b"fail") => Err(std::io::Error::other("the service gave up")),
@@ -2416,27 +2267,16 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
 /// that much, charged to the connection's budget.
 struct Wide;
 
-impl Service for Wide {
-    type Decoder = Lines;
-    type State = ();
-    type Error = Infallible;
-    fn decoder(&self) -> Lines {
+service_fixture! {
+    Wide => (Lines, (), Infallible);
+    decoder(self) {
         Lines::new(40 << 10, Ending::LfOrCrlf)
     }
-    fn on_open(
-        &mut self,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_open(self; _, driver) -> Flow {
         driver.reply().extend_from_slice(b"hello\n");
         Ok(Flow::Continue)
     }
-    fn on_item(
-        &mut self,
-        _: Result<Vec<u8>, LineError>,
-        _: &(),
-        _: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> Flow {
         Ok(Flow::Continue)
     }
 }
@@ -2607,30 +2447,19 @@ fn a_reader_added_mid_connection_sees_its_events() {
 /// Draws one number per connection.
 struct Dice;
 
-impl Service for Dice {
-    type Decoder = Lines;
-    type State = ();
-    type Error = Infallible;
-    fn decoder(&self) -> Lines {
+service_fixture! {
+    Dice => (Lines, (), Infallible);
+    decoder(self) {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_open(
-        &mut self,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_open(self; _, driver) -> Flow {
         let n = driver.random_u64();
         driver
             .reply()
             .extend_from_slice(format!("{n}\n").as_bytes());
         Ok(Flow::Close)
     }
-    fn on_item(
-        &mut self,
-        _: Result<Vec<u8>, LineError>,
-        _: &(),
-        _: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> Flow {
         Ok(Flow::Continue)
     }
 }
@@ -2755,35 +2584,19 @@ fn a_connection_counts_until_its_socket_is_gone() {
 fn hosts_and_members_share_a_lan_on_the_net() {
     /// Sends `tick` to a multicast group every 20 ms.
     struct Feed;
-    impl Service for Feed {
-        type Decoder = Lines;
-        type State = SocketAddr;
-        type Error = Infallible;
-        fn decoder(&self) -> Lines {
+    service_fixture! {
+        Feed => (Lines, SocketAddr, Infallible);
+        decoder(self) {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        fn on_open(
-            &mut self,
-            _: &SocketAddr,
-            driver: &mut Driver<'_, Self::Decoder>,
-        ) -> Result<Flow, Infallible> {
+        on_open(self; _, driver) -> Flow {
             driver.set_timer("tick", Duration::from_millis(20));
             Ok(Flow::Continue)
         }
-        fn on_item(
-            &mut self,
-            _: Result<Vec<u8>, LineError>,
-            _: &SocketAddr,
-            _: &mut Driver<'_, Self::Decoder>,
-        ) -> Result<Flow, Infallible> {
+        on_item(self, _: Result<Vec<u8>, LineError>; _, _) -> Flow {
             Ok(Flow::Continue)
         }
-        fn on_timer(
-            &mut self,
-            _: Timer,
-            group: &SocketAddr,
-            driver: &mut Driver<'_, Self::Decoder>,
-        ) -> Result<Flow, Infallible> {
+        on_timer(self, _: Timer; group, driver) -> Flow {
             driver.send_to(*group, b"tick".to_vec());
             driver.set_timer("tick", Duration::from_millis(20));
             Ok(Flow::Continue)

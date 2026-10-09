@@ -17,14 +17,17 @@
 //! commits by running the same groups on each, one after the other, and
 //! look at the counts first.
 
+#[path = "../tests/common/hyper.rs"]
+mod hyper_io;
+use hyper_io::{Exec, Io};
+
 use fictionet::stdlib::codec::Frames;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::convert::Infallible;
-use std::future::{Future, poll_fn};
+use std::future::poll_fn;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -1529,65 +1532,6 @@ fn sandbox_links(graph: &str) -> Vec<String> {
 }
 
 // A hyper client over a `Connection`.
-
-struct Io<C> {
-    fcx: Cx,
-    conn: C,
-}
-
-impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        mut buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let mut tmp = [0u8; 16 * 1024];
-        let tmp = &mut tmp[..buf.remaining().min(16 * 1024)];
-        match this.conn.poll_read(&this.fcx, cx, tmp) {
-            Poll::Ready(Ok(n)) => {
-                buf.put_slice(&tmp[..n]);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(e))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        this.conn
-            .poll_write(&this.fcx, cx, data)
-            .map_err(std::io::Error::other)
-    }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        this.conn
-            .poll_shutdown(&this.fcx, cx)
-            .map_err(std::io::Error::other)
-    }
-}
-
-#[derive(Clone)]
-struct Exec(Cx);
-
-impl<F: Future<Output = ()> + Send + 'static> hyper::rt::Executor<F> for Exec {
-    fn execute(&self, fut: F) {
-        self.0.spawn(move |_| async move {
-            fut.await;
-            Ok(())
-        });
-    }
-}
 
 enum Client {
     H1(hyper::client::conn::http1::SendRequest<Empty<Bytes>>),

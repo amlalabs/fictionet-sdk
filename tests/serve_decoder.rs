@@ -1,25 +1,22 @@
 //! Services change protocol framing between items through the driver.
 use fictionet::Seed;
-use fictionet::stdlib::serve::{Driver, FaultPlan, Flow, Harness, Plan, ServeOptions, Service};
+use fictionet::stdlib::serve::{FaultPlan, Flow, Harness, Plan, ServeOptions};
 use fictionet::stdlib::{codec::Wire, imap, postgres, smtp};
+
+#[macro_use]
+#[path = "common/service_fixture.rs"]
+mod service_fixture;
 
 #[derive(Default)]
 struct Mail {
     messages: Vec<Vec<u8>>,
 }
-impl Service for Mail {
-    type Decoder = smtp::Inputs;
-    type State = ();
-    type Error = smtp::Error;
-    fn decoder(&self) -> Self::Decoder {
+service_fixture! {
+    Mail => (smtp::Inputs, (), smtp::Error);
+    decoder(self) {
         smtp::Inputs::new()
     }
-    fn on_item(
-        &mut self,
-        item: Result<smtp::Input, smtp::Error>,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Self::Error> {
+    on_item(self, item: Result<smtp::Input, smtp::Error>; _, driver) -> Flow {
         match item? {
             smtp::Input::Command(command) if command.verb == "DATA" => {
                 driver.decoder().start_data().unwrap();
@@ -56,19 +53,12 @@ fn smtp_data_changes_the_active_decoder_and_stops_item_faults() {
 struct Imap {
     commands: Vec<String>,
 }
-impl Service for Imap {
-    type Decoder = imap::Inputs;
-    type State = ();
-    type Error = imap::Error;
-    fn decoder(&self) -> Self::Decoder {
+service_fixture! {
+    Imap => (imap::Inputs, (), imap::Error);
+    decoder(self) {
         imap::Inputs::new()
     }
-    fn on_item(
-        &mut self,
-        item: Result<imap::Input, imap::Error>,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Self::Error> {
+    on_item(self, item: Result<imap::Input, imap::Error>; _, driver) -> Flow {
         match item? {
             imap::Input::Continue { .. } => {
                 assert!(driver.decoder().refuse_literal());
@@ -93,19 +83,12 @@ fn imap_refused_literal_leaves_the_next_command_readable() {
 struct Postgres {
     startups: usize,
 }
-impl Service for Postgres {
-    type Decoder = postgres::FrontendMessages;
-    type State = ();
-    type Error = postgres::Error;
-    fn decoder(&self) -> Self::Decoder {
+service_fixture! {
+    Postgres => (postgres::FrontendMessages, (), postgres::Error);
+    decoder(self) {
         postgres::FrontendMessages::new()
     }
-    fn on_item(
-        &mut self,
-        item: Result<postgres::FrontendMessage, postgres::Error>,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Self::Error> {
+    on_item(self, item: Result<postgres::FrontendMessage, postgres::Error>; _, driver) -> Flow {
         match item? {
             postgres::FrontendMessage::SslRequest => {
                 driver.reply().push(b'N');
@@ -155,19 +138,12 @@ fn decoder_upgrade_stops_faults_before_buffered_items() {
     struct Switch {
         seen: Vec<Vec<u8>>,
     }
-    impl Service for Switch {
-        type Decoder = Lines;
-        type State = ();
-        type Error = LineError;
-        fn decoder(&self) -> Lines {
+    service_fixture! {
+        Switch => (Lines, (), LineError);
+        decoder(self) {
             Lines::new(64, Ending::LfOrCrlf)
         }
-        fn on_item(
-            &mut self,
-            item: Result<Vec<u8>, LineError>,
-            _: &(),
-            _: &mut Driver<'_, Lines>,
-        ) -> Result<Flow, LineError> {
+        on_item(self, item: Result<Vec<u8>, LineError>; _, _) -> Flow {
             self.seen.push(item?);
             Ok(if self.seen.len() == 1 {
                 Flow::Upgrade(Upgrade::Decoder)
@@ -206,19 +182,12 @@ fn stuck_item_fault_decoder_passes_the_partial_item_through() {
     struct LargeLine {
         seen: Vec<Vec<u8>>,
     }
-    impl Service for LargeLine {
-        type Decoder = Lines;
-        type State = ();
-        type Error = LineError;
-        fn decoder(&self) -> Lines {
+    service_fixture! {
+        LargeLine => (Lines, (), LineError);
+        decoder(self) {
             Lines::new(8 << 20, Ending::LfOrCrlf)
         }
-        fn on_item(
-            &mut self,
-            item: Result<Vec<u8>, LineError>,
-            _: &(),
-            _: &mut Driver<'_, Lines>,
-        ) -> Result<Flow, LineError> {
+        on_item(self, item: Result<Vec<u8>, LineError>; _, _) -> Flow {
             self.seen.push(item?);
             Ok(Flow::Continue)
         }

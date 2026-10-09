@@ -3,16 +3,23 @@
 //! same limits, budget and seed as HTTP/1, and request events that say
 //! what the connection took.
 
+#[macro_use]
+#[path = "common/service_fixture.rs"]
+mod service_fixture;
+
 mod common;
 #[path = "common/done.rs"]
 mod done;
 #[path = "common/world.rs"]
 mod world;
 
+#[path = "common/hyper.rs"]
+mod hyper_io;
+use hyper_io::{Exec, Io};
+
 use world::world;
 
 use std::convert::Infallible;
-use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,9 +33,7 @@ use fictionet::stdlib::httpd::{
     self, Body, Exchange, Handler, Http1, HttpOptions, Limits, Reply, Router,
 };
 use fictionet::stdlib::json;
-use fictionet::stdlib::serve::{
-    self, Budget, Driver, Ended, FaultPlan, Flow, Harness, Plan, ServeOptions, Service,
-};
+use fictionet::stdlib::serve::{self, Budget, Ended, FaultPlan, Flow, Harness, Plan, ServeOptions};
 use fictionet::stdlib::{Connection, ConnectionExt, ip, tcp};
 use fictionet::{Cx, pair};
 use http_body::Frame;
@@ -109,19 +114,12 @@ struct Loud {
     size: usize,
 }
 
-impl Service for Loud {
-    type Decoder = Lines;
-    type State = ();
-    type Error = Infallible;
-    fn decoder(&self) -> Lines {
+service_fixture! {
+    Loud => (Lines, (), Infallible);
+    decoder(self) {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_item(
-        &mut self,
-        _: Result<Vec<u8>, LineError>,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_item(self, _: Result<Vec<u8>, LineError>; _, driver) -> Flow {
         driver.reply().resize(self.size, b'x');
         Ok(Flow::Continue)
     }
@@ -499,61 +497,3 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
 
 // ---------------------------------------------------------------------------
 // A hyper client over a Connection
-
-struct Io<C> {
-    fcx: Cx,
-    conn: C,
-}
-
-impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        mut buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let mut tmp = vec![0u8; buf.remaining().min(16 * 1024)];
-        match this.conn.poll_read(&this.fcx, cx, &mut tmp) {
-            Poll::Ready(Ok(n)) => {
-                buf.put_slice(&tmp[..n]);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(e))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        this.conn
-            .poll_write(&this.fcx, cx, data)
-            .map_err(std::io::Error::other)
-    }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        this.conn
-            .poll_shutdown(&this.fcx, cx)
-            .map_err(std::io::Error::other)
-    }
-}
-
-#[derive(Clone)]
-struct Exec(Cx);
-
-impl<F: Future<Output = ()> + Send + 'static> hyper::rt::Executor<F> for Exec {
-    fn execute(&self, fut: F) {
-        self.0.spawn(move |_| async move {
-            fut.await;
-            Ok(())
-        });
-    }
-}

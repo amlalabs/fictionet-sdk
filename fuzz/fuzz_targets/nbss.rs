@@ -11,22 +11,10 @@ use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(
-        Frames::<Packet>::new,
-        data,
-        2 * Frames::<Packet>::new().capacity(),
-    );
+    contract::check_decode_capacity(Frames::<Packet>::new, data);
     contract::check_wire::<Packet>(data);
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Packet>::with_limit(0),
-        data,
-        2 * Frames::<Packet>::with_limit(0).capacity(),
-    );
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Packet>::with_limit(64),
-        data,
-        2 * Frames::<Packet>::with_limit(64).capacity(),
-    );
+    contract::check_decode_capacity(|| Frames::<Packet>::with_limit(0), data);
+    contract::check_decode_capacity(|| Frames::<Packet>::with_limit(64), data);
 
     let (packets, _) = decode_all(Frames::<Packet>::new, data);
 

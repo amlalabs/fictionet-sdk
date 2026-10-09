@@ -35,7 +35,7 @@ fn real_main() -> fictionet::Result {
     //    addresses.
     let started = SystemTime::now();
     let (hello, child) = start_backend(&args)?;
-    watch_backend(child);
+    watch_backend(child, "adaptive-web-world");
     let store = PathBuf::from(hello["store"].as_str().unwrap_or("/var/lib/adaptive-web"));
 
     // 2. Ground truth files.

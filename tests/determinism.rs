@@ -1,5 +1,9 @@
 //! The same closed world repeats its event bytes and every agent packet.
 
+#[macro_use]
+#[path = "common/service_fixture.rs"]
+mod service_fixture;
+
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -17,7 +21,7 @@ use fictionet::stdlib::dns::op::{Message, MessageType, OpCode, Query};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::net::Net;
 use fictionet::stdlib::sandbox::TlsClient;
-use fictionet::stdlib::serve::{Driver, FaultPlan, Flow, Plan, ServeOptions, Service};
+use fictionet::stdlib::serve::{FaultPlan, Flow, Plan, ServeOptions};
 use fictionet::stdlib::{Connection, delay, filter, httpd, tls};
 use fictionet::{Cx, Seed, block_on, lab};
 use http::{Request, Response};
@@ -48,19 +52,12 @@ struct Trace {
 }
 
 struct Echo;
-impl Service for Echo {
-    type Decoder = Lines;
-    type State = ();
-    type Error = Infallible;
-    fn decoder(&self) -> Lines {
+service_fixture! {
+    Echo => (Lines, (), Infallible);
+    decoder(self) {
         Lines::new(4096, Ending::LfOrCrlf)
     }
-    fn on_item(
-        &mut self,
-        line: Result<Vec<u8>, LineError>,
-        _: &(),
-        d: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Infallible> {
+    on_item(self, line: Result<Vec<u8>, LineError>; _, d) -> Flow {
         let line = line.unwrap();
         d.record(Event::new("echo", "line").field("bytes", line.len() as u64));
         d.reply().extend_from_slice(&line);

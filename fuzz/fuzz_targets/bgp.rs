@@ -140,11 +140,7 @@ fn update_from(data: &[u8]) -> Update {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(
-        Frames::<Frame>::new,
-        data,
-        2 * Frames::<Frame>::new().capacity(),
-    );
+    contract::check_decode_capacity(Frames::<Frame>::new, data);
     contract::check_wire::<Frame>(data);
     contract::check_wire::<Open>(data);
     contract::check_decode_with_alloc_limit(

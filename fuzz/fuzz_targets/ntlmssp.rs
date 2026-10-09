@@ -2,6 +2,10 @@
 //! server reads them, and values a world builds, as it writes them.
 #![no_main]
 
+#[path = "../common/input.rs"]
+mod input;
+use input::bytes;
+
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::ntlmssp::{
@@ -125,12 +129,6 @@ fn version(u: &mut Unstructured) -> Result<Option<Version>> {
     } else {
         None
     })
-}
-
-/// Bytes of up to `max` from fuzz bytes.
-fn bytes(u: &mut Unstructured, max: usize) -> Result<Vec<u8>> {
-    let n = u.int_in_range(0..=max)?;
-    Ok(u.bytes(n)?.to_vec())
 }
 
 /// AV pairs built from fuzz bytes, valid or not. Some lists are long

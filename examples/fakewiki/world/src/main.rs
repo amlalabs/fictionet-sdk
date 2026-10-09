@@ -33,7 +33,7 @@ fn real_main() -> fictionet::Result {
     //    carries the variant, the hosts and the documents for state.json.
     let started = SystemTime::now();
     let (backend, child) = start_backend(&args)?;
-    watch_backend(child);
+    watch_backend(child, "fakewiki-world");
     let variant = backend["variant"].as_str().unwrap_or_default().to_owned();
     let mut hosts = HashMap::new();
     for (name, ip) in backend["hosts"]

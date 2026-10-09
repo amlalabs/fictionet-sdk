@@ -301,8 +301,9 @@ impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
         mut buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        let mut chunk = vec![0u8; buf.remaining().min(16 * 1024)];
-        match this.conn.poll_read(&this.fcx, cx, &mut chunk) {
+        let mut chunk = [0u8; 16 * 1024];
+        let n = buf.remaining().min(chunk.len());
+        match this.conn.poll_read(&this.fcx, cx, &mut chunk[..n]) {
             Poll::Ready(Ok(n)) => {
                 buf.put_slice(&chunk[..n]);
                 Poll::Ready(Ok(()))

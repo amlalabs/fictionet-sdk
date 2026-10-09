@@ -2,6 +2,10 @@
 //! reads them, and packets a world builds, as it writes them.
 #![no_main]
 
+#[path = "../common/input.rs"]
+mod input;
+use input::{bytes, list};
+
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Wire};
@@ -29,12 +33,6 @@ fn datagram(data: &[u8]) {
     }
 }
 
-/// Up to `max` fuzz bytes.
-fn bytes(u: &mut Unstructured, max: usize) -> Result<Vec<u8>> {
-    let n = u.int_in_range(0..=max)?;
-    Ok(u.bytes(n)?.to_vec())
-}
-
 /// Payload bytes: usually up to 40 fuzz bytes, sometimes one byte repeated
 /// up to past the longest packet, to test the writers' size limits.
 fn data(u: &mut Unstructured) -> Result<Vec<u8>> {
@@ -50,16 +48,6 @@ fn data(u: &mut Unstructured) -> Result<Vec<u8>> {
 /// A media SSRC: 0 half the time, as TMMBR, TMMBN, FIR and REMB need.
 fn media_ssrc(u: &mut Unstructured) -> Result<u32> {
     if u.arbitrary()? { Ok(0) } else { u.arbitrary() }
-}
-
-/// Up to `max` values built by `f`.
-fn list<T>(
-    u: &mut Unstructured,
-    max: usize,
-    mut f: impl FnMut(&mut Unstructured) -> Result<T>,
-) -> Result<Vec<T>> {
-    let n = u.int_in_range(0..=max)?;
-    (0..n).map(|_| f(u)).collect()
 }
 
 fn report_block(u: &mut Unstructured) -> Result<ReportBlock> {

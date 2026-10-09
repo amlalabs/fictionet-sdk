@@ -49,6 +49,21 @@ fn copied_modbus_uses_the_public_driver_and_map() {
     assert!(stream.is_done());
 }
 
+#[test]
+fn copied_contract_checks_fixed_capacity_and_returns_decoded_items() {
+    use fictionet::stdlib::codec::{Ending, Lines};
+    for data in [
+        b"one\ntwo\n".as_slice(),
+        b"unfinished",
+        b"too long for this limit\n",
+    ] {
+        let make = || Lines::new(16, Ending::LfOrCrlf);
+        let expected = test_support::contract::check_decode_with_alloc_limit(make, data, 36);
+        let got = test_support::contract::check_decode_capacity(make, data);
+        assert_eq!(got, expected);
+    }
+}
+
 #[cfg(feature = "observe")]
 #[test]
 fn copied_presenters_plug_into_observe_and_construct_display_items() {

@@ -10,18 +10,10 @@ use fictionet::stdlib::zabbix::{Header, Message, Packet, SenderValue};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(
-        Frames::<Packet>::new,
-        data,
-        2 * Frames::<Packet>::new().capacity(),
-    );
+    contract::check_decode_capacity(Frames::<Packet>::new, data);
     contract::check_wire::<Packet>(data);
     let limit = usize::from(data.first().copied().unwrap_or(0));
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Packet>::with_limit(limit),
-        data,
-        2 * Frames::<Packet>::with_limit(limit).capacity(),
-    );
+    contract::check_decode_capacity(|| Frames::<Packet>::with_limit(limit), data);
     contract::check_decode_with_alloc_limit(
         || Frames::<Packet>::new().map(|packet| Message::parse(&packet.data)),
         data,
@@ -46,11 +38,7 @@ fuzz_target!(|data: &[u8]| {
     };
     contract::check_wire_value(&built);
 
-    contract::check_decode_with_alloc_limit(
-        || Frames::<Packet>::with_limit(4096),
-        data,
-        2 * Frames::<Packet>::with_limit(4096).capacity(),
-    );
+    contract::check_decode_capacity(|| Frames::<Packet>::with_limit(4096), data);
     contract::check_wire::<Header>(data);
     contract::check_wire::<Message>(data);
     for p in decode_all(|| Frames::<Packet>::with_limit(4096), data).0 {

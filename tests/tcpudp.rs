@@ -104,17 +104,9 @@ async fn duplex(fcx: &Cx, conn: &mut impl Connection, data: &[u8]) -> Result<Vec
     .await
 }
 
-fn pattern(len: usize, seed: u64) -> Vec<u8> {
-    let mut x = seed | 1;
-    (0..len)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect()
-}
+#[path = "common/pattern.rs"]
+mod payload;
+use payload::pattern;
 
 #[test]
 fn connect_accept_echo_and_addresses() {

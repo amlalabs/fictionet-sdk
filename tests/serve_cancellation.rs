@@ -2,9 +2,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+#[macro_use]
+#[path = "common/service_fixture.rs"]
+mod service_fixture;
+
 use fictionet::prelude::*;
 use fictionet::stdlib::codec::{Ending, LineError, Lines};
-use fictionet::stdlib::serve::{self, Driver, Flow, Pending, PendingDriver, Service};
+use fictionet::stdlib::serve::{self, Flow, Pending, PendingDriver};
 use fictionet::stdlib::tcp;
 use fictionet::time::ms;
 
@@ -29,27 +33,15 @@ impl Pending for Forever {
 }
 
 struct Svc;
-impl Service for Svc {
-    type Decoder = Lines;
-    type State = ();
-    type Error = std::convert::Infallible;
-    fn decoder(&self) -> Lines {
+service_fixture! {
+    Svc => (Lines, (), std::convert::Infallible);
+    decoder(self) {
         Lines::new(64, Ending::LfOrCrlf)
     }
-    fn on_item(
-        &mut self,
-        _line: Result<Vec<u8>, LineError>,
-        _: &(),
-        _driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Self::Error> {
+    on_item(self, _line: Result<Vec<u8>, LineError>; _, _driver) -> Flow {
         Ok(Flow::Close)
     }
-    fn on_end(
-        &mut self,
-        _end: serve::Ended,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<(), Self::Error> {
+    on_end(self, _end: serve::Ended; _, driver) -> () {
         // A goodbye written by deferred work: Ending, with ordered work.
         driver.defer(Forever(true));
         Ok(())
@@ -111,21 +103,14 @@ impl Pending for SpawnWork {
 }
 
 struct SpawningSvc(Arc<std::sync::atomic::AtomicBool>);
-impl Service for SpawningSvc {
-    type Decoder = Lines;
-    type State = ();
-    type Error = std::convert::Infallible;
+service_fixture! {
+    SpawningSvc => (Lines, (), std::convert::Infallible);
 
-    fn decoder(&self) -> Lines {
+    decoder(self) {
         Lines::new(64, Ending::LfOrCrlf)
     }
 
-    fn on_item(
-        &mut self,
-        _: Result<Vec<u8>, LineError>,
-        _: &(),
-        driver: &mut Driver<'_, Self::Decoder>,
-    ) -> Result<Flow, Self::Error> {
+    on_item(self, _: Result<Vec<u8>, LineError>; _, driver) -> Flow {
         driver.defer(SpawnWork(self.0.clone()));
         Ok(Flow::Close)
     }

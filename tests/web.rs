@@ -6,6 +6,10 @@
 #[path = "common/certs.rs"]
 mod certs;
 mod common;
+#[path = "common/hyper.rs"]
+mod hyper_io;
+use hyper_io::{Exec, Io};
+
 use fictionet::stdlib::sandbox::{TlsClient, TlsError};
 #[path = "common/done.rs"]
 mod done;
@@ -26,7 +30,6 @@ use timeout::timeout;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
@@ -46,6 +49,61 @@ use http::{HeaderMap, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, RootCertStore};
+
+// The default sandbox fixture.
+fn default_machine(fcx: &Cx, attacher: &Attacher) -> Machine {
+    machine(
+        fcx,
+        attacher.attach("a").unwrap(),
+        Ipv4Addr::new(10, 0, 0, 2),
+    )
+}
+
+async fn plain_client(fcx: &Cx, m: &Machine, addr: impl Into<IpAddr>, h2: bool) -> Client {
+    let conn = m
+        .tcp
+        .connect(fcx, SocketAddr::new(addr.into(), 80))
+        .await
+        .unwrap();
+    Client::new(fcx, conn, h2).await
+}
+
+// Checks the Date response for both HTTP versions.
+async fn assert_date_responses(fcx: &Cx, m: &Machine, addr: Ipv4Addr, date: Option<SystemTime>) {
+    for h2 in [false, true] {
+        let mut client = plain_client(fcx, m, addr, h2).await;
+        let got = client.get("http", "dated.test", "/").await;
+        assert_eq!(got.body, "hello");
+        assert_eq!(
+            got.version,
+            if h2 {
+                Version::HTTP_2
+            } else {
+                Version::HTTP_11
+            }
+        );
+        let header = got
+            .headers
+            .get("date")
+            .map(|v| v.to_str().unwrap().to_owned());
+        match date {
+            Some(_) => {
+                let header = header.expect("a Date header");
+                assert!(
+                    header.starts_with("Sat, 01 Jun 2019 00:0"),
+                    "h2 {h2}: {header}"
+                );
+            }
+            None => assert_eq!(header, None, "h2 {h2}: no world date, so no Date"),
+        }
+        // A Date the handler sets is kept.
+        let got = client.get("http", "dated.test", "/own").await;
+        assert_eq!(
+            got.headers.get_all("date").iter().collect::<Vec<_>>(),
+            ["Mon, 01 Jan 2001 00:00:00 GMT"]
+        );
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Running a test world
@@ -374,64 +432,6 @@ async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Ipv4Addr {
 // ---------------------------------------------------------------------------
 // A hyper client over a Connection
 
-struct Io<C> {
-    fcx: Cx,
-    conn: C,
-}
-
-impl<C: Connection + Unpin> hyper::rt::Read for Io<C> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        mut buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let mut tmp = vec![0u8; buf.remaining().min(16 * 1024)];
-        match this.conn.poll_read(&this.fcx, cx, &mut tmp) {
-            Poll::Ready(Ok(n)) => {
-                buf.put_slice(&tmp[..n]);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(e))),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<C: Connection + Unpin> hyper::rt::Write for Io<C> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        this.conn
-            .poll_write(&this.fcx, cx, data)
-            .map_err(std::io::Error::other)
-    }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        this.conn
-            .poll_shutdown(&this.fcx, cx)
-            .map_err(std::io::Error::other)
-    }
-}
-
-#[derive(Clone)]
-struct Exec(Cx);
-
-impl<F: Future<Output = ()> + Send + 'static> hyper::rt::Executor<F> for Exec {
-    fn execute(&self, fut: F) {
-        self.0.spawn(move |_| async move {
-            fut.await;
-            Ok(())
-        });
-    }
-}
-
 /// One HTTP client connection, HTTP/1.1 or HTTP/2.
 enum Client {
     H1(hyper::client::conn::http1::SendRequest<Empty<Bytes>>),
@@ -545,11 +545,7 @@ async fn tls_connect(
 #[test]
 fn dns_answers_sites_nodata_and_nxdomain() {
     world(|fcx, attacher, env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
 
         // A site with `at` gets that address; the same answer every time.
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
@@ -631,11 +627,7 @@ async fn read_exact<C: Connection>(fcx: &Cx, conn: &mut C, buf: &mut [u8]) {
 #[test]
 fn https_with_http2_and_http11() {
     world(|fcx, attacher, env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let addr = lookup(&fcx, &m, "secure.test").await;
 
         // A client that offers h2 gets HTTP/2.
@@ -720,50 +712,9 @@ fn dates_come_from_the_world() {
                     sites = sites.date(date);
                 }
                 sites.start(&fcx, attachments)?;
-                let m = machine(
-                    &fcx,
-                    attacher.attach("a").unwrap(),
-                    Ipv4Addr::new(10, 0, 0, 2),
-                );
+                let m = default_machine(&fcx, &attacher);
                 let addr = lookup(&fcx, &m, "dated.test").await;
-                for h2 in [false, true] {
-                    let conn = m
-                        .tcp
-                        .connect(&fcx, SocketAddr::new(addr.into(), 80))
-                        .await
-                        .unwrap();
-                    let mut client = Client::new(&fcx, conn, h2).await;
-                    let got = client.get("http", "dated.test", "/").await;
-                    assert_eq!(got.body, "hello");
-                    assert_eq!(
-                        got.version,
-                        if h2 {
-                            Version::HTTP_2
-                        } else {
-                            Version::HTTP_11
-                        }
-                    );
-                    let header = got
-                        .headers
-                        .get("date")
-                        .map(|v| v.to_str().unwrap().to_owned());
-                    match date {
-                        Some(_) => {
-                            let header = header.expect("a Date header");
-                            assert!(
-                                header.starts_with("Sat, 01 Jun 2019 00:0"),
-                                "h2 {h2}: {header}"
-                            );
-                        }
-                        None => assert_eq!(header, None, "h2 {h2}: no world date, so no Date"),
-                    }
-                    // A Date the handler sets is kept.
-                    let got = client.get("http", "dated.test", "/own").await;
-                    assert_eq!(
-                        got.headers.get_all("date").iter().collect::<Vec<_>>(),
-                        ["Mon, 01 Jan 2001 00:00:00 GMT"]
-                    );
-                }
+                assert_date_responses(&fcx, &m, addr, date).await;
                 Err(fictionet::Error::from(Done))
             }))
         });
@@ -774,22 +725,13 @@ fn dates_come_from_the_world() {
 #[test]
 fn port_80_redirects_tls_sites_and_serves_the_others() {
     world(|fcx, attacher, _env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let addr = lookup(&fcx, &m, "secure.test").await;
         assert_eq!(lookup(&fcx, &m, "shared.test").await, addr);
         let plain = lookup(&fcx, &m, "plain.test").await;
 
         // A site with TLS: 301 to https, with the path and query.
-        let conn = m
-            .tcp
-            .connect(&fcx, SocketAddr::new(addr.into(), 80))
-            .await
-            .unwrap();
-        let mut client = Client::new(&fcx, conn, false).await;
+        let mut client = plain_client(&fcx, &m, addr, false).await;
         let got = client.get("http", "secure.test", "/a/b?c=d").await;
         assert_eq!(got.status, StatusCode::MOVED_PERMANENTLY);
         assert_eq!(got.headers["location"], "https://secure.test/a/b?c=d");
@@ -800,22 +742,12 @@ fn port_80_redirects_tls_sites_and_serves_the_others() {
 
         // A site with its own address, over HTTP/1.1 and HTTP/2 with prior
         // knowledge.
-        let conn = m
-            .tcp
-            .connect(&fcx, SocketAddr::new(plain.into(), 80))
-            .await
-            .unwrap();
-        let mut client = Client::new(&fcx, conn, false).await;
+        let mut client = plain_client(&fcx, &m, plain, false).await;
         assert_eq!(
             client.get("http", "plain.test", "/q").await.body,
             "plain http plain.test 80 HTTP/1.1 /q"
         );
-        let conn = m
-            .tcp
-            .connect(&fcx, SocketAddr::new(plain.into(), 80))
-            .await
-            .unwrap();
-        let mut client = Client::new(&fcx, conn, true).await;
+        let mut client = plain_client(&fcx, &m, plain, true).await;
         let got = client.get("http", "plain.test", "/r").await;
         assert_eq!(got.version, Version::HTTP_2);
         assert_eq!(got.body, "plain http plain.test 80 HTTP/2.0 /r");
@@ -835,22 +767,13 @@ fn port_80_redirects_tls_sites_and_serves_the_others() {
 #[test]
 fn a_tls_site_with_plain_http_answers_port_80_itself() {
     world_events(|fcx, attacher, env, log| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         assert_eq!(lookup(&fcx, &m, "both.test").await, BOTH_ADDR);
 
         // Port 80: the handler answers, with an http Target, over HTTP/1.1
         // and HTTP/2 with prior knowledge. No redirect.
         for h2 in [false, true] {
-            let conn = m
-                .tcp
-                .connect(&fcx, SocketAddr::new(BOTH_ADDR.into(), 80))
-                .await
-                .unwrap();
-            let mut client = Client::new(&fcx, conn, h2).await;
+            let mut client = plain_client(&fcx, &m, BOTH_ADDR, h2).await;
             let got = client.get("http", "both.test", "/a?b=c").await;
             assert_eq!(got.status, StatusCode::OK);
             assert!(got.headers.get("location").is_none());
@@ -891,12 +814,7 @@ fn a_tls_site_with_plain_http_answers_port_80_itself() {
 
         // A TLS site without it still redirects, at the same time.
         let secure = lookup(&fcx, &m, "secure.test").await;
-        let conn = m
-            .tcp
-            .connect(&fcx, SocketAddr::new(secure.into(), 80))
-            .await
-            .unwrap();
-        let mut client = Client::new(&fcx, conn, false).await;
+        let mut client = plain_client(&fcx, &m, secure, false).await;
         assert_eq!(
             client.get("http", "secure.test", "/").await.status,
             StatusCode::MOVED_PERMANENTLY
@@ -908,11 +826,7 @@ fn a_tls_site_with_plain_http_answers_port_80_itself() {
 #[test]
 fn a_host_that_is_not_this_site_gets_421() {
     world(|fcx, attacher, env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let addr = lookup(&fcx, &m, "secure.test").await;
         lookup(&fcx, &m, "shared.test").await;
         let plain = lookup(&fcx, &m, "plain.test").await;
@@ -946,12 +860,7 @@ fn a_host_that_is_not_this_site_gets_421() {
         }
 
         // Plain HTTP too.
-        let conn = m
-            .tcp
-            .connect(&fcx, SocketAddr::new(plain.into(), 80))
-            .await
-            .unwrap();
-        let mut client = Client::new(&fcx, conn, false).await;
+        let mut client = plain_client(&fcx, &m, plain, false).await;
         assert_eq!(
             client.get("http", "secure.test", "/").await.status,
             StatusCode::MISDIRECTED_REQUEST
@@ -967,18 +876,9 @@ fn a_host_that_is_not_this_site_gets_421() {
 #[test]
 fn a_failing_handler_gets_500() {
     world(|fcx, attacher, _env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let addr = lookup(&fcx, &m, "broken.test").await;
-        let conn = m
-            .tcp
-            .connect(&fcx, SocketAddr::new(addr.into(), 80))
-            .await
-            .unwrap();
-        let mut client = Client::new(&fcx, conn, false).await;
+        let mut client = plain_client(&fcx, &m, addr, false).await;
         assert_eq!(
             client.get("http", "broken.test", "/").await.status,
             StatusCode::INTERNAL_SERVER_ERROR
@@ -990,11 +890,7 @@ fn a_failing_handler_gets_500() {
 #[test]
 fn an_unknown_tls_name_is_rejected_with_unrecognized_name() {
     world(|fcx, attacher, env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let addr = lookup(&fcx, &m, "secure.test").await;
         lookup(&fcx, &m, "shared.test").await;
         let calls = env.calls.load(Ordering::SeqCst);
@@ -1545,11 +1441,7 @@ fn the_sites_keep_running_after_the_world_returns() {
 #[test]
 fn the_target_is_from_the_connection_not_the_headers() {
     world(|fcx, attacher, env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let addr = lookup(&fcx, &m, "secure.test").await;
         let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", &[b"http/1.1"])
             .await
@@ -1592,18 +1484,9 @@ async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
                 (h == "nowhere.invalid").then(|| web::Site::new(upstream.clone()))
             })
             .start(&fcx, attachments)?;
-            let m = machine(
-                &fcx,
-                attacher.attach("a").unwrap(),
-                Ipv4Addr::new(10, 0, 0, 2),
-            );
+            let m = default_machine(&fcx, &attacher);
             let addr = lookup(&fcx, &m, "nowhere.invalid").await;
-            let conn = m
-                .tcp
-                .connect(&fcx, SocketAddr::new(addr.into(), 80))
-                .await
-                .unwrap();
-            let mut client = Client::new(&fcx, conn, false).await;
+            let mut client = plain_client(&fcx, &m, addr, false).await;
             let got = client.get("http", "nowhere.invalid", "/").await;
             assert_eq!(got.status, StatusCode::BAD_GATEWAY, "{}", got.body);
             assert!(got.body.contains("nowhere.invalid"), "{}", got.body);
@@ -1700,11 +1583,7 @@ async fn websockets_work_through_sites() {
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(|h| (h == "ws.test").then(|| web::Site::new(echo_socket())))
                 .start(&fcx, attachments)?;
-            let m = machine(
-                &fcx,
-                attacher.attach("a").unwrap(),
-                Ipv4Addr::new(10, 0, 0, 2),
-            );
+            let m = default_machine(&fcx, &attacher);
             let addr = lookup(&fcx, &m, "ws.test").await;
             let mut conn = m
                 .tcp
@@ -1968,11 +1847,7 @@ async fn get_and_hold(
 #[test]
 fn connections_left_half_open_still_count() {
     real_world(|fcx, attacher, _env| async move {
-        let a = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let a = default_machine(&fcx, &attacher);
         let to = lookup(&fcx, &a, "plain.test").await;
         let mut held = Vec::new();
         for i in 0..256 {
@@ -2232,11 +2107,7 @@ fn ten_thousand_sites_do_not_slow_the_network() {
 #[test]
 fn a_name_never_looked_up_is_not_served_by_host_or_sni() {
     world(|fcx, attacher, env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let addr = lookup(&fcx, &m, "secure.test").await;
         let wild = lookup(&fcx, &m, "one.wild.test").await;
         let calls = env.calls.load(Ordering::SeqCst);
@@ -2251,12 +2122,7 @@ fn a_name_never_looked_up_is_not_served_by_host_or_sni() {
                 StatusCode::MISDIRECTED_REQUEST
             );
         }
-        let conn = m
-            .tcp
-            .connect(&fcx, SocketAddr::new(wild.into(), 80))
-            .await
-            .unwrap();
-        let mut client = Client::new(&fcx, conn, false).await;
+        let mut client = plain_client(&fcx, &m, wild, false).await;
         assert_eq!(
             client.get("http", "one.wild.test", "/").await.body,
             "wild http one.wild.test 80 HTTP/1.1 /"
@@ -2287,11 +2153,7 @@ fn a_name_never_looked_up_is_not_served_by_host_or_sni() {
 #[test]
 fn http2_with_a_thousand_streams_and_cancelled_ones() {
     real_world(|fcx, attacher, env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let addr = lookup(&fcx, &m, "secure.test").await;
         let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", &[b"h2"])
             .await
@@ -2542,11 +2404,7 @@ fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
 #[test]
 fn a_huge_or_garbage_tls_hello_closes_only_that_connection() {
     world(|fcx, attacher, env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let addr = lookup(&fcx, &m, "secure.test").await;
         let to = SocketAddr::new(addr.into(), 443);
         // A handshake record header that promises 16 KiB, repeated: a hello
@@ -2717,11 +2575,7 @@ async fn read_all<C: Connection>(fcx: &Cx, conn: &mut C) -> Vec<u8> {
 #[test]
 fn a_known_length_is_sent_as_content_length() {
     world(|fcx, attacher, env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let plain = lookup(&fcx, &m, "plain.test").await;
         let events = lookup(&fcx, &m, "events.test").await;
         let mut conn = m
@@ -2762,11 +2616,7 @@ fn a_known_length_is_sent_as_content_length() {
 #[test]
 fn head_gets_the_headers_and_no_body_on_both_versions() {
     world(|fcx, attacher, env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let secure = lookup(&fcx, &m, "secure.test").await;
         let events = lookup(&fcx, &m, "events.test").await;
         for h2 in [true, false] {
@@ -2825,11 +2675,7 @@ fn head_gets_the_headers_and_no_body_on_both_versions() {
 #[test]
 fn the_default_host_answers_hosts_with_no_site_of_their_own() {
     world(|fcx, attacher, _env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         assert_eq!(lookup(&fcx, &m, "default.test").await, DEFAULT_ADDR);
         assert_eq!(lookup(&fcx, &m, "other.test").await, DEFAULT_ADDR);
         let ask =
@@ -2878,11 +2724,7 @@ fn the_default_host_answers_hosts_with_no_site_of_their_own() {
 #[test]
 fn a_client_that_half_closes_after_its_request_gets_the_response() {
     world(|fcx, attacher, env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let plain = lookup(&fcx, &m, "plain.test").await;
         let secure = lookup(&fcx, &m, "secure.test").await;
         let requests: [&[u8]; 2] = [
@@ -3905,11 +3747,7 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
 #[test]
 fn the_world_stops_while_handlers_wait() {
     world_events(|fcx, attacher, env, log| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let slow = lookup(&fcx, &m, "slow.test").await;
         let to = SocketAddr::new(slow.into(), 80);
         let mut h1 = m.tcp.connect(&fcx, to).await.unwrap();
@@ -3946,11 +3784,7 @@ fn the_world_stops_while_handlers_wait() {
 #[test]
 fn events_for_bytes_that_are_not_http() {
     world_events(|fcx, attacher, env, log| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let plain = lookup(&fcx, &m, "plain.test").await;
         assert_eq!(lookup(&fcx, &m, "events.test").await, EVENTS_ADDR);
 
@@ -4032,11 +3866,7 @@ fn events_for_clients_that_send_nothing() {
             })
             .start(&fcx, attachments)?;
         let log = Log::new(&fcx);
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         let started = fcx.now();
         let _quiet_80 = m
@@ -4312,11 +4142,7 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
     world_events(move |fcx, attacher, env, log| async move {
         log.events.to_file(&file)?;
         // What a grader reads: a lookup, a TLS handshake and a request.
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         let conn = tls_connect(&fcx, &m, &env, SECURE_ADDR, "secure.test", &[b"http/1.1"])
             .await
@@ -4532,11 +4358,7 @@ async fn dns_at(
 #[test]
 fn dns_answers_aaaa_for_each_family_a_site_has() {
     world(|fcx, attacher, env| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let gw = IpAddr::V4(GATEWAY);
         let ok = |addrs: &[IpAddr]| (ResponseCode::NoError, addrs.to_vec());
         let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
@@ -4690,12 +4512,7 @@ fn https_http2_and_plain_http_over_ipv6() {
         // Port 80: a TLS site redirects to https. A plain site at its
         // automatic IPv6 address answers. A request that names the bare
         // address in brackets gets 421, as it would over IPv4.
-        let conn = m
-            .tcp
-            .connect(&fcx, SocketAddr::new(DUAL_ADDR6.into(), 80))
-            .await
-            .unwrap();
-        let mut client = Client::new(&fcx, conn, false).await;
+        let mut client = plain_client(&fcx, &m, DUAL_ADDR6, false).await;
         let got = client.get("http", "dual.test", "/a?b").await;
         assert_eq!(got.status, StatusCode::MOVED_PERMANENTLY);
         assert_eq!(got.headers["location"], "https://dual.test/a?b");
@@ -5024,11 +4841,7 @@ fn an_ipv4_only_network_drops_ipv6_and_answers_aaaa_with_nodata() {
         .ipv4_only()
     };
     world_of(make, |fcx, attacher, log| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let gw = IpAddr::V4(GATEWAY);
         // An IPv6 `at` is not used: the site gets an automatic IPv4 address.
         assert_eq!(
@@ -5105,11 +4918,7 @@ fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
         .subnet("2001::/16".parse().unwrap())
     };
     world_of(make, |fcx, attacher, _log| async move {
-        let m = machine(
-            &fcx,
-            attacher.attach("a").unwrap(),
-            Ipv4Addr::new(10, 0, 0, 2),
-        );
+        let m = default_machine(&fcx, &attacher);
         let gw = IpAddr::V4(GATEWAY);
         assert_eq!(
             dns_at(&fcx, &m, gw, "one.test", RecordType::AAAA).await,
@@ -5667,49 +5476,8 @@ fn eager_sites_send_the_world_date_without_a_lookup() {
                     .into_net()
                     .add_host(site.at(addr).into_host("dated.test"))
                     .start(&fcx, attachments)?;
-                let m = machine(
-                    &fcx,
-                    attacher.attach("a").unwrap(),
-                    Ipv4Addr::new(10, 0, 0, 2),
-                );
-                for h2 in [false, true] {
-                    let conn = m
-                        .tcp
-                        .connect(&fcx, SocketAddr::new(addr.into(), 80))
-                        .await
-                        .unwrap();
-                    let mut client = Client::new(&fcx, conn, h2).await;
-                    let got = client.get("http", "dated.test", "/").await;
-                    assert_eq!(got.body, "hello");
-                    assert_eq!(
-                        got.version,
-                        if h2 {
-                            Version::HTTP_2
-                        } else {
-                            Version::HTTP_11
-                        }
-                    );
-                    let header = got
-                        .headers
-                        .get("date")
-                        .map(|v| v.to_str().unwrap().to_owned());
-                    match date {
-                        Some(_) => {
-                            let header = header.expect("a Date header");
-                            assert!(
-                                header.starts_with("Sat, 01 Jun 2019 00:0"),
-                                "h2 {h2}: {header}"
-                            );
-                        }
-                        None => assert_eq!(header, None, "h2 {h2}: no world date, so no Date"),
-                    }
-                    // A Date the handler sets is kept.
-                    let got = client.get("http", "dated.test", "/own").await;
-                    assert_eq!(
-                        got.headers.get_all("date").iter().collect::<Vec<_>>(),
-                        ["Mon, 01 Jan 2001 00:00:00 GMT"]
-                    );
-                }
+                let m = default_machine(&fcx, &attacher);
+                assert_date_responses(&fcx, &m, addr, date).await;
                 Err(fictionet::Error::from(Done))
             }))
         });

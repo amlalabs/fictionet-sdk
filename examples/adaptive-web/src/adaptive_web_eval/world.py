@@ -65,13 +65,12 @@ async def world_log(offset: int = 0) -> list[dict[str, Any]]:
     return entries[offset:]
 
 
-def percentile(values: list[float], p: float) -> float | None:
-    """The p-th percentile (0 to 100) by the nearest-rank method."""
+def sorted_percentile(values: list[float], p: float) -> float | None:
+    """The p-th percentile (0 to 100) of sorted values by nearest rank."""
     if not values:
         return None
-    ordered = sorted(values)
-    rank = max(1, -(-len(ordered) * p // 100))
-    return ordered[int(rank) - 1]
+    rank = max(1, -(-len(values) * p // 100))
+    return values[int(rank) - 1]
 
 
 def latency(log: list[dict[str, Any]]) -> dict[str, Any]:
@@ -80,8 +79,10 @@ def latency(log: list[dict[str, Any]]) -> dict[str, Any]:
     made = [e["gen_ms"] for e in log if e.get("type") == "http" and e.get("cache") in ("generated", "prefetched")
             and isinstance(e.get("gen_ms"), (int, float))]
     served = [e["serve_ms"] for e in log if e.get("type") == "http" and isinstance(e.get("serve_ms"), (int, float))]
-    return {"generated": len(made), "gen_ms_p50": percentile(made, 50), "gen_ms_p95": percentile(made, 95),
-            "requests": len(served), "serve_ms_p50": percentile(served, 50), "serve_ms_p95": percentile(served, 95)}
+    made.sort()
+    served.sort()
+    return {"generated": len(made), "gen_ms_p50": sorted_percentile(made, 50), "gen_ms_p95": sorted_percentile(made, 95),
+            "requests": len(served), "serve_ms_p50": sorted_percentile(served, 50), "serve_ms_p95": sorted_percentile(served, 95)}
 
 
 def summarize(log: list[dict[str, Any]], answer: str = "") -> dict[str, Any]:

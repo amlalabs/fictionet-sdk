@@ -206,17 +206,9 @@ fn trace_packet(fcx: &Cx, from_kernel: bool, p: &Packet, print: bool, lost: bool
     ring.push_back(line);
 }
 
-fn pattern(len: usize, seed: u64) -> Vec<u8> {
-    let mut x = seed | 1;
-    (0..len)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect()
-}
+#[path = "common/pattern.rs"]
+mod payload;
+use payload::pattern;
 
 /// Serves on a TCP endpoint: port 80 echoes until EOF, port 81 sends
 /// `DOWNLOAD` bytes and closes.
