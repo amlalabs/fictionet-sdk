@@ -1774,35 +1774,19 @@ mod tests {
             Request::Port(to).to_bytes().unwrap(),
             b"PORT 132,235,1,2,24,131\r\n"
         );
-        assert_eq!(
-            request("TYPE A N"),
-            Ok(Request::Type(DataType::Ascii(Some(Format::NonPrint))))
-        );
-        assert_eq!(request("TYPE i"), Ok(Request::Type(DataType::Image)));
-        assert_eq!(
-            request("TYPE L 8"),
-            Ok(Request::Type(DataType::Local(NonZeroU8::new(8).unwrap())))
-        );
-        assert_eq!(request("STRU R"), Ok(Request::Stru(Structure::Record)));
-        assert_eq!(request("MODE B"), Ok(Request::Mode(TransferMode::Block)));
-        assert_eq!(
-            request("RETR dir/file name.txt"),
-            Ok(Request::Retr("dir/file name.txt".into()))
-        );
-        assert_eq!(request("LIST"), Ok(Request::List(None)));
-        assert_eq!(request("LIST -la"), Ok(Request::List(Some("-la".into()))));
-        assert_eq!(request("XPWD"), Ok(Request::Pwd));
-        assert_eq!(request("XMKD new"), Ok(Request::Mkd("new".into())));
-        assert_eq!(
-            request("SITE CHMOD 755 x"),
-            Ok(Request::Site("CHMOD 755 x".into()))
-        );
-        assert_eq!(
-            request("AUTH TLS"),
-            Ok(Request::Other(Command {
-                verb: "AUTH".into(),
-                arg: Some("TLS".into())
-            }))
+        fictionet::assert_cases!(request;
+            ("TYPE A N") => Ok(Request::Type(DataType::Ascii(Some(Format::NonPrint)))),
+            ("TYPE i") => Ok(Request::Type(DataType::Image)),
+            ("TYPE L 8") => Ok(Request::Type(DataType::Local(NonZeroU8::new(8).unwrap()))),
+            ("STRU R") => Ok(Request::Stru(Structure::Record)),
+            ("MODE B") => Ok(Request::Mode(TransferMode::Block)),
+            ("RETR dir/file name.txt") => Ok(Request::Retr("dir/file name.txt".into())),
+            ("LIST") => Ok(Request::List(None)),
+            ("LIST -la") => Ok(Request::List(Some("-la".into()))),
+            ("XPWD") => Ok(Request::Pwd),
+            ("XMKD new") => Ok(Request::Mkd("new".into())),
+            ("SITE CHMOD 755 x") => Ok(Request::Site("CHMOD 755 x".into())),
+            ("AUTH TLS") => Ok(Request::Other(Command { verb: "AUTH".into(), arg: Some("TLS".into()) })),
         );
     }
 
@@ -1869,25 +1853,12 @@ mod tests {
         assert_eq!(r.passive_address(), Ok(addr));
         assert_eq!(Reply::passive(addr), r);
         // Other wordings, as RFC 1123 warns.
-        assert_eq!(
-            reply_of(b"227 =192,168,1,2,19,137\n").passive_address(),
-            Ok(addr)
-        );
-        assert_eq!(
-            reply_of(b"227 Passive 192,168,1,2,19,137 ok\r\n").passive_address(),
-            Ok(addr)
-        );
-        assert_eq!(
-            reply_of(b"227 Passive\r\n").passive_address(),
-            Err(Error::Address)
-        );
-        assert_eq!(
-            reply_of(b"227 (1,2,3)\r\n").passive_address(),
-            Err(Error::Address)
-        );
-        assert_eq!(
-            reply_of(b"200 (1,2,3,4,5,6)\r\n").passive_address(),
-            Err(Error::Code(code::OK))
+        fictionet::assert_cases!(|input| reply_of(input).passive_address();
+            (b"227 =192,168,1,2,19,137\n") => Ok(addr),
+            (b"227 Passive 192,168,1,2,19,137 ok\r\n") => Ok(addr),
+            (b"227 Passive\r\n") => Err(Error::Address),
+            (b"227 (1,2,3)\r\n") => Err(Error::Address),
+            (b"200 (1,2,3,4,5,6)\r\n") => Err(Error::Code(code::OK)),
         );
     }
 
@@ -1938,21 +1909,11 @@ mod tests {
             b"211 No features.\r\n"
         );
         // Errors.
-        assert_eq!(
-            reply_of(b"500 no\r\n").features(),
-            Err(Error::Code(code::SYNTAX_ERROR))
-        );
-        assert_eq!(
-            reply_of(b"211-x\r\nSIZE\r\n211 e\r\n").features(),
-            Err(Error::Feature)
-        );
-        assert_eq!(
-            reply_of(b"211-x\r\n  SIZE\r\n211 e\r\n").features(),
-            Err(Error::Feature)
-        );
-        assert_eq!(
-            reply_of(b"211-x\r\n \x01\r\n211 e\r\n").features(),
-            Err(Error::Feature)
+        fictionet::assert_cases!(|input| reply_of(input).features();
+            (b"500 no\r\n") => Err(Error::Code(code::SYNTAX_ERROR)),
+            (b"211-x\r\nSIZE\r\n211 e\r\n") => Err(Error::Feature),
+            (b"211-x\r\n  SIZE\r\n211 e\r\n") => Err(Error::Feature),
+            (b"211-x\r\n \x01\r\n211 e\r\n") => Err(Error::Feature),
         );
         // Names keep their case, and a space with nothing after it is no
         // parameters.
@@ -2151,23 +2112,13 @@ mod tests {
                 "{bad:?}"
             );
         }
-        assert_eq!(
-            EprtAddress::parse("|0|1.2.3.4|5|".as_bytes()).map(|token| token.address),
-            Err(Family)
-        );
-        assert_eq!(
-            EprtAddress::parse("|99999|1.2.3.4|5|".as_bytes()).map(|token| token.address),
-            Err(Family)
-        );
-        // RFC 2428, section 2: an unknown family gets 522, whatever its
-        // address and port look like.
-        assert_eq!(
-            EprtAddress::parse("|123456|1.2.3.4|5|".as_bytes()).map(|token| token.address),
-            Err(Family)
-        );
-        assert_eq!(
-            EprtAddress::parse("|3|zone:4|x|".as_bytes()).map(|token| token.address),
-            Err(Family)
+        fictionet::assert_cases!(|input| EprtAddress::parse(input).map(|token| token.address);
+            ("|0|1.2.3.4|5|".as_bytes()) => Err(Family),
+            ("|99999|1.2.3.4|5|".as_bytes()) => Err(Family),
+            // RFC 2428, section 2: an unknown family gets 522, whatever its
+            // address and port look like.
+            ("|123456|1.2.3.4|5|".as_bytes()) => Err(Family),
+            ("|3|zone:4|x|".as_bytes()) => Err(Family),
         );
         for bad in [
             "229 none",

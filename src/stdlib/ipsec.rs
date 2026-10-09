@@ -1049,22 +1049,12 @@ mod tests {
         long.truncate(MAX_PACKET);
         assert!(check::<EspPacket>(MAX_PACKET, &long).is_ok());
         // AH.
-        assert_eq!(check::<AhPacket>(MAX_PACKET, &[4]), Err(Error::Truncated));
-        assert_eq!(
-            check::<AhPacket>(MAX_PACKET, &[4, 0, 0, 0, 0, 0, 0, 1]),
-            Err(Error::AhLength(0))
-        );
-        assert_eq!(
-            check::<AhPacket>(MAX_PACKET, &[4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
-            Err(Error::ZeroSpi)
-        );
-        // A payload length of 3 says 20 bytes; 16 are there.
-        assert_eq!(
-            check::<AhPacket>(
-                MAX_PACKET,
-                &[4, 3, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0]
-            ),
-            Err(Error::Truncated)
+        fictionet::assert_cases!(|input| check::<AhPacket>(MAX_PACKET, input);
+            (&[4]) => Err(Error::Truncated),
+            (&[4, 0, 0, 0, 0, 0, 0, 1]) => Err(Error::AhLength(0)),
+            (&[4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]) => Err(Error::ZeroSpi),
+            // A payload length of 3 says 20 bytes; 16 are there.
+            (&[4, 3, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0]) => Err(Error::Truncated),
         );
         let mut long = vec![4, 1, 0, 0, 0, 0, 0, 1];
         long.resize(MAX_PACKET + 1, 0);
@@ -1114,39 +1104,20 @@ mod tests {
         assert!(Datagram::Ike(vec![0; MAX_DATAGRAM - 4]).to_bytes().is_ok());
 
         assert_eq!(ah(4, 0, 1, &[]).to_bytes(), Err(Error::ZeroSpi));
-        assert_eq!(
-            ah(4, 0, 1, &[])
-                .for_icv(0)
-                .and_then(|header| header.to_bytes()),
-            Err(Error::ZeroSpi)
-        );
-        assert_eq!(
-            ah(4, 1, 1, &[0; 12])
-                .for_icv(16)
-                .and_then(|header| header.to_bytes()),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            ah(4, 1, 1, &[0; 12])
-                .for_icv(usize::MAX)
-                .and_then(|header| header.to_bytes()),
-            Err(Error::Truncated)
+        fictionet::assert_cases!(|(input_0, input_1, input_2)| ah(4, input_0, 1, input_1).for_icv(input_2).and_then(|header| header.to_bytes());
+            ((0, &[], 0)) => Err(Error::ZeroSpi),
+            ((1, &[0; 12], 16)) => Err(Error::Truncated),
+            ((1, &[0; 12], usize::MAX)) => Err(Error::Truncated),
         );
         assert_eq!(ah(4, 1, 1, &[0; 3]).to_bytes(), Err(Error::IcvLength(3)));
         assert_eq!(
             ah(4, 1, 1, &[0; MAX_ICV + 4]).to_bytes(),
             Err(Error::IcvLength(MAX_ICV + 4))
         );
-        let p = AhPacket {
-            header: ah(4, 1, 1, &[0; 3]),
-            payload: vec![],
-        };
-        assert_eq!(p.to_bytes(), Err(Error::IcvLength(3)));
-        let p = AhPacket {
-            header: ah(4, 1, 1, &[0; 12]),
-            payload: vec![0; MAX_PACKET - 23],
-        };
-        assert_eq!(p.to_bytes(), Err(Error::TooLong));
+        fictionet::assert_cases!(|(input_0, input_1)| AhPacket { header: input_0, payload: input_1 }.to_bytes();
+            ((ah(4, 1, 1, &[0; 3]), vec![])) => Err(Error::IcvLength(3)),
+            ((ah(4, 1, 1, &[0; 12]), vec![0; MAX_PACKET - 23])) => Err(Error::TooLong),
+        );
         let p = AhPacket {
             header: ah(4, 1, 1, &[0; 12]),
             payload: vec![0; MAX_PACKET - 24],
@@ -1161,35 +1132,17 @@ mod tests {
             Err(Error::ZeroSpi)
         );
 
-        let p = Plaintext {
-            data: vec![],
-            padding: vec![0; 256],
-            next_header: 4,
-        };
-        assert_eq!(p.to_bytes(), Err(Error::Padding(256)));
-        let p = Plaintext {
-            data: vec![0; MAX_PACKET - 1],
-            padding: vec![],
-            next_header: 4,
-        };
-        assert_eq!(p.to_bytes(), Err(Error::TooLong));
-        assert_eq!(Plaintext::padded(vec![], 4, 0), Err(Error::BlockSize(0)));
-        assert_eq!(
-            Plaintext::padded(vec![], 4, 257),
-            Err(Error::BlockSize(257))
+        fictionet::assert_cases!(|(input_0, input_1)| Plaintext { data: input_0, padding: input_1, next_header: 4 }.to_bytes();
+            ((vec![], vec![0; 256])) => Err(Error::Padding(256)),
+            ((vec![0; MAX_PACKET - 1], vec![])) => Err(Error::TooLong),
         );
-        assert_eq!(
-            Plaintext::padded(vec![0; MAX_PACKET - 1], 4, 1),
-            Err(Error::TooLong)
-        );
-        assert_eq!(
-            Plaintext::padded(vec![0; MAX_PACKET + 1], 4, 1),
-            Err(Error::TooLong)
-        );
-        // 65535 is not a multiple of 4, so padding to it overflows.
-        assert_eq!(
-            Plaintext::padded(vec![0; MAX_PACKET - 2], 4, 1),
-            Err(Error::TooLong)
+        fictionet::assert_cases!(|(input_0, input_1, input_2)| Plaintext::padded(input_0, input_1, input_2);
+            ((vec![], 4, 0)) => Err(Error::BlockSize(0)),
+            ((vec![], 4, 257)) => Err(Error::BlockSize(257)),
+            ((vec![0; MAX_PACKET - 1], 4, 1)) => Err(Error::TooLong),
+            ((vec![0; MAX_PACKET + 1], 4, 1)) => Err(Error::TooLong),
+            // 65535 is not a multiple of 4, so padding to it overflows.
+            ((vec![0; MAX_PACKET - 2], 4, 1)) => Err(Error::TooLong),
         );
         assert_eq!(
             Plaintext::padded(vec![0; MAX_PACKET - 5], 4, 1)

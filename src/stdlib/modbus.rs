@@ -974,60 +974,28 @@ mod tests {
 
     #[test]
     fn bad_requests_get_the_right_exception() {
-        assert_eq!(Request::parse(&[]), Err(Exception::IllegalFunction));
-        assert_eq!(
-            Request::parse(&[0x83, 0, 0, 0, 1]),
-            Err(Exception::IllegalFunction)
-        );
-        // Quantity 0 and quantity over the limit.
-        assert_eq!(
-            Request::parse(&[0x03, 0, 0, 0, 0]),
-            Err(Exception::IllegalDataValue)
-        );
-        assert_eq!(
-            Request::parse(&[0x03, 0, 0, 0, 126]),
-            Err(Exception::IllegalDataValue)
-        );
-        assert_eq!(
-            Request::parse(&[0x01, 0, 0, 0x07, 0xd1]),
-            Err(Exception::IllegalDataValue)
-        );
-        // A range past address 65535.
-        assert_eq!(
-            Request::parse(&[0x03, 0xff, 0xff, 0, 2]),
-            Err(Exception::IllegalDataAddress)
+        fictionet::assert_cases!(Request::parse;
+            (&[]) => Err(Exception::IllegalFunction),
+            (&[0x83, 0, 0, 0, 1]) => Err(Exception::IllegalFunction),
+            // Quantity 0 and quantity over the limit.
+            (&[0x03, 0, 0, 0, 0]) => Err(Exception::IllegalDataValue),
+            (&[0x03, 0, 0, 0, 126]) => Err(Exception::IllegalDataValue),
+            (&[0x01, 0, 0, 0x07, 0xd1]) => Err(Exception::IllegalDataValue),
+            // A range past address 65535.
+            (&[0x03, 0xff, 0xff, 0, 2]) => Err(Exception::IllegalDataAddress),
         );
         assert!(Request::parse(&[0x03, 0xff, 0xff, 0, 1]).is_ok());
         // Wrong lengths.
-        assert_eq!(
-            Request::parse(&[0x03, 0, 0, 0]),
-            Err(Exception::IllegalDataValue)
-        );
-        assert_eq!(
-            Request::parse(&[0x06, 0, 0, 0, 0, 0]),
-            Err(Exception::IllegalDataValue)
-        );
-        // A byte count that does not match the quantity.
-        assert_eq!(
-            Request::parse(&[0x10, 0, 1, 0, 2, 3, 0, 0, 0]),
-            Err(Exception::IllegalDataValue)
-        );
-        assert_eq!(
-            Request::parse(&[0x0f, 0, 0, 0, 9, 1, 0xff]),
-            Err(Exception::IllegalDataValue)
-        );
-        // Missing bytes after a correct count.
-        assert_eq!(
-            Request::parse(&[0x10, 0, 1, 0, 2, 4, 0, 0, 0]),
-            Err(Exception::IllegalDataValue)
-        );
-        // Functions this module does not read stay as they are.
-        assert_eq!(
-            Request::parse(&[0x2b, 0x0e, 1, 0]),
-            Ok(Request::Other {
-                function: 0x2b,
-                data: vec![0x0e, 1, 0]
-            })
+        fictionet::assert_cases!(Request::parse;
+            (&[0x03, 0, 0, 0]) => Err(Exception::IllegalDataValue),
+            (&[0x06, 0, 0, 0, 0, 0]) => Err(Exception::IllegalDataValue),
+            // A byte count that does not match the quantity.
+            (&[0x10, 0, 1, 0, 2, 3, 0, 0, 0]) => Err(Exception::IllegalDataValue),
+            (&[0x0f, 0, 0, 0, 9, 1, 0xff]) => Err(Exception::IllegalDataValue),
+            // Missing bytes after a correct count.
+            (&[0x10, 0, 1, 0, 2, 4, 0, 0, 0]) => Err(Exception::IllegalDataValue),
+            // Functions this module does not read stay as they are.
+            (&[0x2b, 0x0e, 1, 0]) => Ok(Request::Other { function: 0x2b, data: vec![0x0e, 1, 0] }),
         );
     }
 
@@ -1575,61 +1543,14 @@ mod tests {
 
     #[test]
     fn review_request_writers_check_quantity_and_range() {
-        assert_eq!(
-            Request::ReadHoldingRegisters {
-                address: 0,
-                quantity: 0
-            }
-            .to_pdu(),
-            Err(Error::Quantity)
-        );
-        assert_eq!(
-            Request::ReadInputRegisters {
-                address: 0,
-                quantity: 126
-            }
-            .to_pdu(),
-            Err(Error::Quantity)
-        );
-        assert_eq!(
-            Request::ReadCoils {
-                address: 0,
-                quantity: 2001
-            }
-            .to_pdu(),
-            Err(Error::Quantity)
-        );
-        assert_eq!(
-            Request::ReadHoldingRegisters {
-                address: 65535,
-                quantity: 2
-            }
-            .to_pdu(),
-            Err(Error::Address)
-        );
-        assert_eq!(
-            Request::WriteMultipleRegisters {
-                address: 0,
-                values: vec![]
-            }
-            .to_pdu(),
-            Err(Error::Quantity)
-        );
-        assert_eq!(
-            Request::WriteMultipleCoils {
-                address: 0,
-                values: vec![]
-            }
-            .to_pdu(),
-            Err(Error::Quantity)
-        );
-        assert_eq!(
-            Request::WriteMultipleCoils {
-                address: 65535,
-                values: vec![true; 2]
-            }
-            .to_pdu(),
-            Err(Error::Address)
+        fictionet::assert_cases!(|input: Request| input.to_pdu();
+            (Request::ReadHoldingRegisters { address: 0, quantity: 0 }) => Err(Error::Quantity),
+            (Request::ReadInputRegisters { address: 0, quantity: 126 }) => Err(Error::Quantity),
+            (Request::ReadCoils { address: 0, quantity: 2001 }) => Err(Error::Quantity),
+            (Request::ReadHoldingRegisters { address: 65535, quantity: 2 }) => Err(Error::Address),
+            (Request::WriteMultipleRegisters { address: 0, values: vec![] }) => Err(Error::Quantity),
+            (Request::WriteMultipleCoils { address: 0, values: vec![] }) => Err(Error::Quantity),
+            (Request::WriteMultipleCoils { address: 65535, values: vec![true; 2] }) => Err(Error::Address),
         );
         let last = Request::ReadDiscreteInputs {
             address: 65535,
@@ -1714,23 +1635,13 @@ mod tests {
         assert_eq!(Response::parse(&bits), Err(Error::BadResponse));
         let mut regs = vec![0x03, 252];
         regs.resize(254, 0);
-        assert_eq!(Response::parse(&regs), Err(Error::BadResponse));
-        // Write acknowledgements of 0, too many, or past address 65535.
-        assert_eq!(
-            Response::parse(&[0x10, 0, 0, 0, 0]),
-            Err(Error::BadResponse)
-        );
-        assert_eq!(
-            Response::parse(&[0x10, 0, 0, 0, 124]),
-            Err(Error::BadResponse)
-        );
-        assert_eq!(
-            Response::parse(&[0x0f, 0, 0, 0x07, 0xb1]),
-            Err(Error::BadResponse)
-        );
-        assert_eq!(
-            Response::parse(&[0x10, 0xff, 0xff, 0, 2]),
-            Err(Error::BadResponse)
+        fictionet::assert_cases!(Response::parse;
+            (&regs) => Err(Error::BadResponse),
+            // Write acknowledgements of 0, too many, or past address 65535.
+            (&[0x10, 0, 0, 0, 0]) => Err(Error::BadResponse),
+            (&[0x10, 0, 0, 0, 124]) => Err(Error::BadResponse),
+            (&[0x0f, 0, 0, 0x07, 0xb1]) => Err(Error::BadResponse),
+            (&[0x10, 0xff, 0xff, 0, 2]) => Err(Error::BadResponse),
         );
         assert!(Response::parse(&[0x0f, 0, 0, 0x07, 0xb0]).is_ok());
         // Function code 0.

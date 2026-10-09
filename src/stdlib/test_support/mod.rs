@@ -475,6 +475,22 @@ mod tests {
     }
 
     #[test]
+    fn cases_evaluate_once_in_order_and_borrow() {
+        let order = core::cell::RefCell::new(Vec::new());
+        fictionet::assert_cases!(|input| { order.borrow_mut().push(2); AsRef::<[i32]>::as_ref(&input) };
+            one_element: { order.borrow_mut().push(1); [1] } => { order.borrow_mut().push(3); [1] },
+            two_elements: { order.borrow_mut().push(4); [2, 3] } => { order.borrow_mut().push(5); [2, 3] },
+        );
+        assert_eq!(*order.borrow(), [1, 2, 3, 4, 2, 5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "case |input: [u8; 3]| input.len()([1, 2, 3])")]
+    fn cases_name_the_failing_input() {
+        fictionet::assert_cases!(|input: [u8; 3]| input.len(); ([1, 2, 3]) => 0);
+    }
+
+    #[test]
     fn hex_pairs_ignore_ascii_whitespace() {
         assert_eq!(super::hex(" 0 a B\tc\n01\r\x0c"), [10, 188, 1]);
         assert!(super::hex(" \t\n").is_empty());

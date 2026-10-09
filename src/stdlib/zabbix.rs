@@ -1029,29 +1029,13 @@ mod tests {
 
     #[test]
     fn packet_errors() {
-        assert_eq!(
-            Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXE", false),
-            Err(Error::Magic)
-        );
-        assert_eq!(
-            Frames::<Packet>::with_limit(MAX_DATA).decode(b"X", false),
-            Err(Error::Magic)
-        );
-        assert_eq!(
-            Frames::<Packet>::with_limit(MAX_DATA).decode(b"HTTP/1.1", false),
-            Err(Error::Magic)
-        );
-        assert_eq!(
-            Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXD\x00", false),
-            Err(Error::Flags(0))
-        );
-        assert_eq!(
-            Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXD\x02", false),
-            Err(Error::Flags(2))
-        );
-        assert_eq!(
-            Frames::<Packet>::with_limit(MAX_DATA).decode(b"ZBXD\x09", false),
-            Err(Error::Flags(9))
+        fictionet::assert_cases!(|(input_0, input_1)| Frames::<Packet>::with_limit(MAX_DATA).decode(input_0, input_1);
+            ((b"ZBXE", false)) => Err(Error::Magic),
+            ((b"X", false)) => Err(Error::Magic),
+            ((b"HTTP/1.1", false)) => Err(Error::Magic),
+            ((b"ZBXD\x00", false)) => Err(Error::Flags(0)),
+            ((b"ZBXD\x02", false)) => Err(Error::Flags(2)),
+            ((b"ZBXD\x09", false)) => Err(Error::Flags(9)),
         );
         let bytes = packet_bytes(1, b"hello", 0);
         assert_eq!(

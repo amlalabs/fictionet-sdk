@@ -2730,52 +2730,27 @@ mod tests {
     fn update_errors() {
         let e = |b: &[u8]| update_body(b, &TWO);
         // Lengths that run past the body.
-        assert_eq!(e(&[0, 5, 0, 0]), Err(Error::MalformedAttributeList));
-        assert_eq!(e(&[0, 0, 0, 5]), Err(Error::MalformedAttributeList));
-        assert_eq!(e(&[0, 1, 8, 0]), Err(Error::MalformedAttributeList));
-        // Bad withdrawn prefixes and NLRI.
-        assert_eq!(e(&[0, 1, 33, 0, 0]), Err(Error::InvalidNetworkField));
-        assert_eq!(e(&[0, 1, 9, 0, 0]), Err(Error::InvalidNetworkField));
-        assert_eq!(e(&[0, 0, 0, 0, 24, 1, 2]), Err(Error::InvalidNetworkField));
-        // An attribute cut short: header, extended length, value.
-        assert_eq!(
-            e(&[0, 0, 0, 2, 0x40, 1]),
-            Err(Error::MalformedAttributeList)
-        );
-        assert_eq!(
-            e(&[0, 0, 0, 3, 0x50, 1, 0]),
-            Err(Error::MalformedAttributeList)
-        );
-        assert_eq!(
-            e(&[0, 0, 0, 3, 0x40, 1, 1]),
-            Err(Error::MalformedAttributeList)
-        );
-        // The same attribute twice.
-        assert_eq!(
-            e(&[0, 0, 0, 8, 0x40, 1, 1, 0, 0x40, 1, 1, 0]),
-            Err(Error::MalformedAttributeList)
-        );
-        // An unknown attribute without the optional bit.
-        assert_eq!(
-            e(&[0, 0, 0, 4, 0x40, 99, 1, 7]),
-            Err(Error::UnrecognizedWellKnownAttribute(vec![0x40, 99, 1, 7]))
-        );
-        // Flags that do not match the type.
-        assert_eq!(
-            e(&[0, 0, 0, 4, 0xc0, 1, 1, 0]),
-            Err(Error::AttributeFlags(vec![0xc0, 1, 1, 0]))
-        );
-        assert_eq!(
-            e(&[0, 0, 0, 4, 0x60, 1, 1, 0]),
-            Err(Error::AttributeFlags(vec![0x60, 1, 1, 0]))
-        );
-        assert_eq!(
-            e(&[0, 0, 0, 7, 0xa0, 4, 4, 0, 0, 0, 1]),
-            Err(Error::AttributeFlags(vec![0xa0, 4, 4, 0, 0, 0, 1]))
-        );
-        assert_eq!(
-            e(&[0, 0, 0, 3, 0x80, 8, 0]),
-            Err(Error::AttributeFlags(vec![0x80, 8, 0]))
+        fictionet::assert_cases!(e;
+            (&[0, 5, 0, 0]) => Err(Error::MalformedAttributeList),
+            (&[0, 0, 0, 5]) => Err(Error::MalformedAttributeList),
+            (&[0, 1, 8, 0]) => Err(Error::MalformedAttributeList),
+            // Bad withdrawn prefixes and NLRI.
+            (&[0, 1, 33, 0, 0]) => Err(Error::InvalidNetworkField),
+            (&[0, 1, 9, 0, 0]) => Err(Error::InvalidNetworkField),
+            (&[0, 0, 0, 0, 24, 1, 2]) => Err(Error::InvalidNetworkField),
+            // An attribute cut short: header, extended length, value.
+            (&[0, 0, 0, 2, 0x40, 1]) => Err(Error::MalformedAttributeList),
+            (&[0, 0, 0, 3, 0x50, 1, 0]) => Err(Error::MalformedAttributeList),
+            (&[0, 0, 0, 3, 0x40, 1, 1]) => Err(Error::MalformedAttributeList),
+            // The same attribute twice.
+            (&[0, 0, 0, 8, 0x40, 1, 1, 0, 0x40, 1, 1, 0]) => Err(Error::MalformedAttributeList),
+            // An unknown attribute without the optional bit.
+            (&[0, 0, 0, 4, 0x40, 99, 1, 7]) => Err(Error::UnrecognizedWellKnownAttribute(vec![0x40, 99, 1, 7])),
+            // Flags that do not match the type.
+            (&[0, 0, 0, 4, 0xc0, 1, 1, 0]) => Err(Error::AttributeFlags(vec![0xc0, 1, 1, 0])),
+            (&[0, 0, 0, 4, 0x60, 1, 1, 0]) => Err(Error::AttributeFlags(vec![0x60, 1, 1, 0])),
+            (&[0, 0, 0, 7, 0xa0, 4, 4, 0, 0, 0, 1]) => Err(Error::AttributeFlags(vec![0xa0, 4, 4, 0, 0, 0, 1])),
+            (&[0, 0, 0, 3, 0x80, 8, 0]) => Err(Error::AttributeFlags(vec![0x80, 8, 0])),
         );
         // Lengths that do not match the type.
         let len_err = |raw: &[u8]| {
@@ -2839,17 +2814,11 @@ mod tests {
             assert_eq!(e(&b), Err(Error::OptionalAttribute(raw)), "{v:?}");
         }
         // Routes without the attributes they need.
-        assert_eq!(
-            e(&[0, 0, 0, 0, 8, 10]),
-            Err(Error::MissingWellKnownAttribute(attr::ORIGIN))
-        );
-        assert_eq!(
-            e(&[0, 0, 0, 4, 0x40, 1, 1, 0, 8, 10]),
-            Err(Error::MissingWellKnownAttribute(attr::AS_PATH))
-        );
-        assert_eq!(
-            e(&[0, 0, 0, 7, 0x40, 1, 1, 0, 0x40, 2, 0, 8, 10]),
-            Err(Error::MissingWellKnownAttribute(attr::NEXT_HOP))
+        fictionet::assert_cases!(e;
+            (&[0, 0, 0, 0, 8, 10]) => Err(Error::MissingWellKnownAttribute(attr::ORIGIN)),
+            (&[0, 0, 0, 4, 0x40, 1, 1, 0, 8, 10]) => Err(Error::MissingWellKnownAttribute(attr::AS_PATH)),
+            (&[0, 0, 0, 7, 0x40, 1, 1, 0, 0x40, 2, 0, 8, 10]) =>
+                Err(Error::MissingWellKnownAttribute(attr::NEXT_HOP)),
         );
         // Unknown optional attributes are kept, with the extended length
         // bit and the low bits dropped from their flags.
@@ -3067,39 +3036,14 @@ mod tests {
         let bad = |m: Message, negotiated: &Context| encode(&m, negotiated).unwrap_err();
         let invalid =
             |m: Message, negotiated: &Context| matches!(bad(m, negotiated), Error::Unwritable);
-        assert!(invalid(
-            Message::Open(Open {
-                hold_time: 2,
-                ..Open::new(1, 0, id, vec![])
-            }),
-            &TWO
-        ));
-        assert!(invalid(
-            Message::Open(Open::new(1, 0, Ipv4Addr::UNSPECIFIED, vec![])),
-            &TWO
-        ));
-        assert!(invalid(
-            open(vec![Parameter::Other {
-                kind: 2,
-                value: vec![]
-            }]),
-            &TWO
-        ));
-        assert!(invalid(
-            open(vec![Parameter::Other {
-                kind: 255,
-                value: vec![]
-            }]),
-            &TWO
-        ));
-        assert!(invalid(
-            Message::Open(Open {
-                my_as: 0,
-                ..Open::new(1, 0, id, vec![])
-            }),
-            &TWO
-        ));
-        assert!(invalid(Message::Open(Open::new(0, 0, id, vec![])), &TWO));
+        fictionet::assert_cases!(|(input_0, input_1)| bad(input_0, input_1);
+            ((Message::Open(Open { hold_time: 2, ..Open::new(1, 0, id, vec![]) }), &TWO)) => Error::Unwritable,
+            ((Message::Open(Open::new(1, 0, Ipv4Addr::UNSPECIFIED, vec![])), &TWO)) => Error::Unwritable,
+            ((open(vec![Parameter::Other { kind: 2, value: vec![] }]), &TWO)) => Error::Unwritable,
+            ((open(vec![Parameter::Other { kind: 255, value: vec![] }]), &TWO)) => Error::Unwritable,
+            ((Message::Open(Open { my_as: 0, ..Open::new(1, 0, id, vec![]) }), &TWO)) => Error::Unwritable,
+            ((Message::Open(Open::new(0, 0, id, vec![])), &TWO)) => Error::Unwritable,
+        );
         assert_eq!(
             bad(
                 open(vec![Parameter::Other {
@@ -3111,20 +3055,10 @@ mod tests {
             Error::Unwritable
         );
         let caps = |c: Vec<Capability>| open(vec![Parameter::Capabilities(c)]);
-        assert!(invalid(
-            caps(vec![Capability::Other {
-                code: 65,
-                value: vec![0; 4]
-            }]),
-            &TWO
-        ));
-        assert!(invalid(
-            caps(vec![Capability::Other {
-                code: 9,
-                value: vec![0; 256]
-            }]),
-            &TWO
-        ));
+        fictionet::assert_cases!(|(input_0, input_1)| bad(input_0, input_1);
+            ((caps(vec![Capability::Other { code: 65, value: vec![0; 4] }]), &TWO)) => Error::Unwritable,
+            ((caps(vec![Capability::Other { code: 9, value: vec![0; 256] }]), &TWO)) => Error::Unwritable,
+        );
         // More than 255 bytes of capabilities take the extended format.
         assert!(encode(&caps(vec![Capability::RouteRefresh; 128]), &TWO).is_ok());
         let gr = |flags, time, n| {
@@ -3141,9 +3075,11 @@ mod tests {
                 ],
             })])
         };
-        assert!(invalid(gr(16, 0, 0), &TWO));
-        assert!(invalid(gr(0, 4096, 0), &TWO));
-        assert!(invalid(gr(0, 0, 64), &TWO));
+        fictionet::assert_cases!(|(input_0, input_1)| bad(input_0, input_1);
+            ((gr(16, 0, 0), &TWO)) => Error::Unwritable,
+            ((gr(0, 4096, 0), &TWO)) => Error::Unwritable,
+            ((gr(0, 0, 64), &TWO)) => Error::Unwritable,
+        );
         assert!(encode(&gr(15, 4095, 60), &TWO).is_ok());
 
         let path = |asns: Vec<u32>| {
@@ -3179,9 +3115,11 @@ mod tests {
             v[1] = a;
             route(v)
         };
-        assert!(invalid(with(path(vec![])), &TWO));
-        assert!(invalid(with(path(vec![1; 256])), &TWO));
-        assert!(invalid(with(path(vec![70000])), &TWO));
+        fictionet::assert_cases!(|(input_0, input_1)| bad(input_0, input_1);
+            ((with(path(vec![])), &TWO)) => Error::Unwritable,
+            ((with(path(vec![1; 256])), &TWO)) => Error::Unwritable,
+            ((with(path(vec![70000])), &TWO)) => Error::Unwritable,
+        );
         assert!(encode(&with(path(vec![70000])), &FOUR).is_ok());
         let mut agg = well_known();
         agg.push(Attribute::Aggregator {
@@ -3192,20 +3130,15 @@ mod tests {
         assert!(invalid(route(agg.clone()), &TWO));
         assert!(encode(&route(agg), &FOUR).is_ok());
         // Unknown attributes that would read as something else.
-        let mut u = well_known();
-        u.push(Attribute::Unknown {
-            flags: 0xc0,
-            kind: 8,
-            value: vec![],
-        });
-        assert!(invalid(route(u), &TWO));
-        let mut u = well_known();
-        u.push(Attribute::Unknown {
-            flags: 0x40,
-            kind: 99,
-            value: vec![],
-        });
-        assert!(invalid(route(u), &TWO));
+        for (flags, kind) in [(0xc0, 8), (0x40, 99)] {
+            let mut u = well_known();
+            u.push(Attribute::Unknown {
+                flags,
+                kind,
+                value: vec![],
+            });
+            assert!(invalid(route(u), &TWO), "{flags}, {kind}");
+        }
         // Prefixes of the wrong family or length.
         let mut m = Update {
             attributes: well_known(),
@@ -3237,16 +3170,12 @@ mod tests {
                 ..Update::default()
             })
         };
-        assert!(invalid(
-            reach(vec![0; 256], 2, Nlri::Prefixes(vec![])),
-            &TWO
-        ));
-        assert!(invalid(reach(vec![0; 16], 2, Nlri::Raw(vec![])), &TWO));
-        assert!(invalid(reach(vec![0; 16], 9, Nlri::Prefixes(vec![])), &TWO));
-        assert!(invalid(
-            reach(vec![0; 4], 2, Nlri::Prefixes(vec![v4(1, 0, 0, 0, 8)])),
-            &TWO
-        ));
+        fictionet::assert_cases!(|(input_0, input_1)| bad(input_0, input_1);
+            ((reach(vec![0; 256], 2, Nlri::Prefixes(vec![])), &TWO)) => Error::Unwritable,
+            ((reach(vec![0; 16], 2, Nlri::Raw(vec![])), &TWO)) => Error::Unwritable,
+            ((reach(vec![0; 16], 9, Nlri::Prefixes(vec![])), &TWO)) => Error::Unwritable,
+            ((reach(vec![0; 4], 2, Nlri::Prefixes(vec![v4(1, 0, 0, 0, 8)])), &TWO)) => Error::Unwritable,
+        );
         assert!(encode(&reach(vec![0; 4], 9, Nlri::Raw(vec![1, 2, 3])), &TWO).is_ok());
         // Too much for one message.
         let mut many = well_known();

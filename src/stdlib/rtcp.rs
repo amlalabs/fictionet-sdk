@@ -2029,22 +2029,12 @@ mod tests {
         })));
         assert_eq!(empty, [0x80, 203, 0, 1, 0, 0, 0, 0]);
         // A reason longer than the packet, and junk after it.
-        assert_eq!(
-            Packet::parse(&[0x80, 203, 0, 1, 9, 0, 0, 0]),
-            Err(Error::PacketContents(203))
-        );
-        assert_eq!(
-            Packet::parse(&[0x80, 203, 0, 1, 0, 0, 1, 0]),
-            Err(Error::PacketContents(203))
-        );
-        assert_eq!(
-            Packet::parse(&[0x80, 203, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(Error::PacketContents(203))
-        );
-        // A count past the contents.
-        assert_eq!(
-            Packet::parse(&[0x82, 203, 0, 1, 0, 0, 0, 7]),
-            Err(Error::PacketContents(203))
+        fictionet::assert_cases!(Packet::parse;
+            (&[0x80, 203, 0, 1, 9, 0, 0, 0]) => Err(Error::PacketContents(203)),
+            (&[0x80, 203, 0, 1, 0, 0, 1, 0]) => Err(Error::PacketContents(203)),
+            (&[0x80, 203, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]) => Err(Error::PacketContents(203)),
+            // A count past the contents.
+            (&[0x82, 203, 0, 1, 0, 0, 0, 7]) => Err(Error::PacketContents(203)),
         );
     }
 
@@ -2366,69 +2356,31 @@ mod tests {
             Err(Error::Unwritable)
         );
         // A count of 0, and one past the packet.
-        assert_eq!(
-            Packet::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 0]),
-            Err(Error::Padding)
-        );
-        assert_eq!(
-            Packet::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 5]),
-            Err(Error::Padding)
-        );
-        assert_eq!(Packet::parse(&[0xa0, 210, 0, 0]), Err(Error::Padding));
-        // A count that is not a multiple of four.
-        assert_eq!(
-            Packet::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 3]),
-            Err(Error::Padding)
+        fictionet::assert_cases!(Packet::parse;
+            (&[0xa0, 201, 0, 1, 0, 0, 0, 0]) => Err(Error::Padding),
+            (&[0xa0, 201, 0, 1, 0, 0, 0, 5]) => Err(Error::Padding),
+            (&[0xa0, 210, 0, 0]) => Err(Error::Padding),
+            // A count that is not a multiple of four.
+            (&[0xa0, 201, 0, 1, 0, 0, 0, 3]) => Err(Error::Padding),
         );
     }
 
     #[test]
     fn parse_errors() {
-        assert_eq!(Datagram::parse(&[]).map(|p| p.0), Err(Error::Empty));
-        assert_eq!(
-            Datagram::parse(&vec![0x80; MAX_DATAGRAM + 1]).map(|p| p.0),
-            Err(Error::TooLong(MAX_DATAGRAM + 1))
-        );
-        assert_eq!(
-            Datagram::parse(&[0x80, 201, 0]).map(|p| p.0),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            Datagram::parse(&[0x80, 201, 0, 1, 0, 0]).map(|p| p.0),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            Datagram::parse(&[0x40, 201, 0, 0]).map(|p| p.0),
-            Err(Error::Version(1))
-        );
-        assert_eq!(
-            Datagram::parse(&[0x80, 200, 0, 1, 0, 0, 0, 0]).map(|p| p.0),
-            Err(Error::PacketContents(200))
-        );
-        assert_eq!(
-            Datagram::parse(&[0x81, 201, 0, 1, 0, 0, 0, 0]).map(|p| p.0),
-            Err(Error::PacketContents(201))
-        );
-        assert_eq!(
-            Datagram::parse(&[0x80, 201, 0, 0]).map(|p| p.0),
-            Err(Error::PacketContents(201))
-        );
-        assert_eq!(
-            Datagram::parse(&[0x81, 202, 0, 0]).map(|p| p.0),
-            Err(Error::PacketContents(202))
-        );
-        assert_eq!(
-            Datagram::parse(&[0x80, 205, 0, 1, 0, 0, 0, 0]).map(|p| p.0),
-            Err(Error::PacketContents(205))
-        );
-        assert_eq!(
-            Datagram::parse(&[0x81, 206, 0, 1, 0, 0, 0, 0]).map(|p| p.0),
-            Err(Error::PacketContents(206))
-        );
-        // A typed packet whose contents are not whole words.
-        assert_eq!(
-            Datagram::parse(&[0x80, 204, 0, 1, 0, 0, 0, 1]).map(|p| p.0),
-            Err(Error::PacketContents(204))
+        fictionet::assert_cases!(|input| Datagram::parse(input).map(|p| p.0);
+            (&[]) => Err(Error::Empty),
+            (&vec![0x80; MAX_DATAGRAM + 1]) => Err(Error::TooLong(MAX_DATAGRAM + 1)),
+            (&[0x80, 201, 0]) => Err(Error::Truncated),
+            (&[0x80, 201, 0, 1, 0, 0]) => Err(Error::Truncated),
+            (&[0x40, 201, 0, 0]) => Err(Error::Version(1)),
+            (&[0x80, 200, 0, 1, 0, 0, 0, 0]) => Err(Error::PacketContents(200)),
+            (&[0x81, 201, 0, 1, 0, 0, 0, 0]) => Err(Error::PacketContents(201)),
+            (&[0x80, 201, 0, 0]) => Err(Error::PacketContents(201)),
+            (&[0x81, 202, 0, 0]) => Err(Error::PacketContents(202)),
+            (&[0x80, 205, 0, 1, 0, 0, 0, 0]) => Err(Error::PacketContents(205)),
+            (&[0x81, 206, 0, 1, 0, 0, 0, 0]) => Err(Error::PacketContents(206)),
+            // A typed packet whose contents are not whole words.
+            (&[0x80, 204, 0, 1, 0, 0, 0, 1]) => Err(Error::PacketContents(204)),
         );
         for e in [Error::Empty, Error::NoCname, Error::Version(0)] {
             assert!(!e.to_string().is_empty());
@@ -2537,17 +2489,10 @@ mod tests {
             media_ssrc: 2,
             message: TransportMessage::Nack(vec![Nack { pid: 1, blp: 0 }]),
         }));
-        assert_eq!(
-            check_compound(&[rr(1), cname(1, b"x"), pli.clone(), nack.clone()]),
-            Ok(())
-        );
-        assert_eq!(
-            check_compound(&[rr(1), pli.clone(), cname(1, b"x")]),
-            Err(Error::FeedbackOrder)
-        );
-        assert_eq!(
-            check_compound(&[rr(1), nack.clone(), rr(2), cname(1, b"x")]),
-            Err(Error::FeedbackOrder)
+        fictionet::assert_cases!(check_compound;
+            (&[rr(1), cname(1, b"x"), pli.clone(), nack.clone()]) => Ok(()),
+            (&[rr(1), pli.clone(), cname(1, b"x")]) => Err(Error::FeedbackOrder),
+            (&[rr(1), nack.clone(), rr(2), cname(1, b"x")]) => Err(Error::FeedbackOrder),
         );
         let bytes = Datagram([rr(1), pli.clone(), cname(1, b"x")].to_vec())
             .to_bytes()
@@ -2640,18 +2585,11 @@ mod tests {
                 extension,
             }))
         };
-        assert_eq!(
-            rrb(vec![block(1); 32], vec![]).to_bytes(),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            rrb(vec![too_lost], vec![]).to_bytes(),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(rrb(vec![], vec![0; 3]).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(
-            rrb(vec![], vec![0; MAX_PACKET]).to_bytes(),
-            Err(Error::Unwritable)
+        fictionet::assert_cases!(|(input_0, input_1)| rrb(input_0, input_1).to_bytes();
+            ((vec![block(1); 32], vec![])) => Err(Error::Unwritable),
+            ((vec![too_lost], vec![])) => Err(Error::Unwritable),
+            ((vec![], vec![0; 3])) => Err(Error::Unwritable),
+            ((vec![], vec![0; MAX_PACKET])) => Err(Error::Unwritable),
         );
         let sd = |chunks| Packet::from(Body::SourceDescription(chunks));
         assert_eq!(
@@ -2674,14 +2612,15 @@ mod tests {
                 }],
             }]
         };
-        assert_eq!(sd(item(0, 1)).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(sd(item(1, 256)).to_bytes(), Err(Error::Unwritable));
+        fictionet::assert_cases!(|input| sd(input).to_bytes();
+            (item(0, 1)) => Err(Error::Unwritable),
+            (item(1, 256)) => Err(Error::Unwritable),
+        );
         round_trip(&sd(item(1, 255)));
         let bye = |sources: Vec<u32>, reason| Packet::from(Body::Bye(Bye { sources, reason }));
-        assert_eq!(bye(vec![0; 32], None).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(
-            bye(vec![], Some(vec![0; 256])).to_bytes(),
-            Err(Error::Unwritable)
+        fictionet::assert_cases!(|(input_0, input_1)| bye(input_0, input_1).to_bytes();
+            ((vec![0; 32], None)) => Err(Error::Unwritable),
+            ((vec![], Some(vec![0; 256]))) => Err(Error::Unwritable),
         );
         let app = |subtype, n| {
             Packet::from(Body::App(App {
@@ -2691,8 +2630,10 @@ mod tests {
                 data: vec![0; n],
             }))
         };
-        assert_eq!(app(32, 0).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(app(0, 2).to_bytes(), Err(Error::Unwritable));
+        fictionet::assert_cases!(|(input_0, input_1)| app(input_0, input_1).to_bytes();
+            ((32, 0)) => Err(Error::Unwritable),
+            ((0, 2)) => Err(Error::Unwritable),
+        );
         let tf = |message| {
             Packet::from(Body::TransportFeedback(TransportFeedback {
                 sender_ssrc: 0,
@@ -2700,42 +2641,23 @@ mod tests {
                 message,
             }))
         };
-        assert_eq!(
-            tf(TransportMessage::Nack(vec![])).to_bytes(),
-            Err(Error::Unwritable)
+        fictionet::assert_cases!(|input| tf(input).to_bytes();
+            (TransportMessage::Nack(vec![])) => Err(Error::Unwritable),
+            (TransportMessage::Tmmbr(vec![])) => Err(Error::Unwritable),
         );
-        assert_eq!(
-            tf(TransportMessage::Tmmbr(vec![])).to_bytes(),
-            Err(Error::Unwritable)
-        );
-        let t = Tmmb {
-            ssrc: 0,
-            exponent: 64,
-            mantissa: 0,
-            overhead: 0,
-        };
-        assert_eq!(
-            tf(TransportMessage::Tmmbn(vec![t])).to_bytes(),
-            Err(Error::Unwritable)
-        );
-        let t = Tmmb {
-            exponent: 0,
-            mantissa: 1 << 17,
-            ..t
-        };
-        assert_eq!(
-            tf(TransportMessage::Tmmbn(vec![t])).to_bytes(),
-            Err(Error::Unwritable)
-        );
-        let t = Tmmb {
-            mantissa: 0,
-            overhead: 512,
-            ..t
-        };
-        assert_eq!(
-            tf(TransportMessage::Tmmbn(vec![t])).to_bytes(),
-            Err(Error::Unwritable)
-        );
+        for (exponent, mantissa, overhead) in [(64, 0, 0), (0, 1 << 17, 0), (0, 0, 512)] {
+            let t = Tmmb {
+                ssrc: 0,
+                exponent,
+                mantissa,
+                overhead,
+            };
+            assert_eq!(
+                tf(TransportMessage::Tmmbn(vec![t])).to_bytes(),
+                Err(Error::Unwritable),
+                "{exponent}, {mantissa}, {overhead}"
+            );
+        }
         assert_eq!(
             tf(TransportMessage::Other {
                 fmt: 2,
@@ -2756,34 +2678,20 @@ mod tests {
                 message,
             }))
         };
-        assert_eq!(
-            pf(PayloadMessage::Sli(vec![])).to_bytes(),
-            Err(Error::Unwritable)
+        fictionet::assert_cases!(|input| pf(input).to_bytes();
+            (PayloadMessage::Sli(vec![])) => Err(Error::Unwritable),
+            (PayloadMessage::Fir(vec![])) => Err(Error::Unwritable),
         );
-        assert_eq!(
-            pf(PayloadMessage::Fir(vec![])).to_bytes(),
-            Err(Error::Unwritable)
-        );
-        for s in [
-            Sli {
-                first: 8192,
-                number: 0,
-                picture_id: 0,
-            },
-            Sli {
-                first: 0,
-                number: 8192,
-                picture_id: 0,
-            },
-            Sli {
-                first: 0,
-                number: 0,
-                picture_id: 64,
-            },
-        ] {
+        for (first, number, picture_id) in [(8192, 0, 0), (0, 8192, 0), (0, 0, 64)] {
+            let s = Sli {
+                first,
+                number,
+                picture_id,
+            };
             assert_eq!(
                 pf(PayloadMessage::Sli(vec![s])).to_bytes(),
-                Err(Error::Unwritable)
+                Err(Error::Unwritable),
+                "{first}, {number}, {picture_id}"
             );
         }
         let rp = |payload_type, padding_bits, n| {
@@ -2793,9 +2701,11 @@ mod tests {
                 data: vec![0; n],
             })
         };
-        assert_eq!(pf(rp(128, 0, 2)).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(pf(rp(0, 17, 2)).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(pf(rp(0, 0, 3)).to_bytes(), Err(Error::Unwritable));
+        fictionet::assert_cases!(|input| pf(input).to_bytes();
+            (rp(128, 0, 2)) => Err(Error::Unwritable),
+            (rp(0, 17, 2)) => Err(Error::Unwritable),
+            (rp(0, 0, 3)) => Err(Error::Unwritable),
+        );
         let remb = |exponent, mantissa, n| {
             PayloadMessage::Remb(Remb {
                 exponent,
@@ -2803,20 +2713,12 @@ mod tests {
                 ssrcs: vec![0; n],
             })
         };
-        assert_eq!(pf(remb(64, 0, 1)).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(pf(remb(0, 1 << 18, 1)).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(pf(remb(0, 0, 256)).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(
-            pf(PayloadMessage::Afb(vec![0; 5])).to_bytes(),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            pf(PayloadMessage::Other {
-                fmt: 32,
-                fci: vec![]
-            })
-            .to_bytes(),
-            Err(Error::Unwritable)
+        fictionet::assert_cases!(|input| pf(input).to_bytes();
+            (remb(64, 0, 1)) => Err(Error::Unwritable),
+            (remb(0, 1 << 18, 1)) => Err(Error::Unwritable),
+            (remb(0, 0, 256)) => Err(Error::Unwritable),
+            (PayloadMessage::Afb(vec![0; 5])) => Err(Error::Unwritable),
+            (PayloadMessage::Other { fmt: 32, fci: vec![] }) => Err(Error::Unwritable),
         );
         let x = |data| {
             Packet::from(Body::ExtendedReport(ExtendedReport {
@@ -2828,9 +2730,11 @@ mod tests {
                 }],
             }))
         };
-        assert_eq!(x(vec![0; 2]).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(x(vec![0; 4 * 65536]).to_bytes(), Err(Error::Unwritable));
-        assert_eq!(x(vec![0; MAX_PACKET]).to_bytes(), Err(Error::Unwritable));
+        fictionet::assert_cases!(|input| x(input).to_bytes();
+            (vec![0; 2]) => Err(Error::Unwritable),
+            (vec![0; 4 * 65536]) => Err(Error::Unwritable),
+            (vec![0; MAX_PACKET]) => Err(Error::Unwritable),
+        );
         let o = |count| {
             Packet::from(Body::Other {
                 packet_type: 0,

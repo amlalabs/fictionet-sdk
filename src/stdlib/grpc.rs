@@ -1823,19 +1823,9 @@ mod tests {
         assert_eq!(Message::parse_prefix(&[0xff, 0, 0]), Err(Error::Flag(0xff)));
         let big = (MAX_MESSAGE as u32 + 1).to_be_bytes();
         let b = [0, big[0], big[1], big[2], big[3]];
-        assert_eq!(
-            Message::parse_prefix(&b),
-            Err(Error::TooLarge {
-                length: MAX_MESSAGE as u32 + 1,
-                limit: MAX_MESSAGE
-            })
-        );
-        assert_eq!(
-            Message::parse_prefix(&[0, 0xff, 0xff, 0xff, 0xff]),
-            Err(Error::TooLarge {
-                length: u32::MAX,
-                limit: MAX_MESSAGE
-            })
+        fictionet::assert_cases!(Message::parse_prefix;
+            (&b) => Err(Error::TooLarge { length: MAX_MESSAGE as u32 + 1, limit: MAX_MESSAGE }),
+            (&[0, 0xff, 0xff, 0xff, 0xff]) => Err(Error::TooLarge { length: u32::MAX, limit: MAX_MESSAGE }),
         );
         // Exactly the limit is allowed, and waits for its bytes.
         let at = (MAX_MESSAGE as u32).to_be_bytes();
@@ -2100,23 +2090,13 @@ mod tests {
 
     #[test]
     fn timeouts_from_durations() {
-        assert_eq!(Timeout::from_duration(Duration::ZERO).to_header(), "0n");
-        assert_eq!(
-            Timeout::from_duration(Duration::from_nanos(99_999_999)).to_header(),
-            "99999999n"
-        );
-        assert_eq!(
-            Timeout::from_duration(Duration::from_nanos(100_000_000)).to_header(),
-            "100000u"
-        );
-        // Rounded up, never down.
-        assert_eq!(
-            Timeout::from_duration(Duration::new(100_000, 1)).to_header(),
-            "100001S"
-        );
-        assert_eq!(
-            Timeout::from_duration(Duration::MAX).to_header(),
-            "99999999H"
+        fictionet::assert_cases!(|input| Timeout::from_duration(input).to_header();
+            (Duration::ZERO) => "0n",
+            (Duration::from_nanos(99_999_999)) => "99999999n",
+            (Duration::from_nanos(100_000_000)) => "100000u",
+            // Rounded up, never down.
+            (Duration::new(100_000, 1)) => "100001S",
+            (Duration::MAX) => "99999999H",
         );
         for d in [
             Duration::from_millis(1500),
@@ -2135,17 +2115,9 @@ mod tests {
             ContentType::parse(b"application/grpc"),
             Some(ContentType::plain())
         );
-        assert_eq!(
-            ContentType::parse(b"Application/GRPC+Proto")
-                .unwrap()
-                .subtype(),
-            Some("proto")
-        );
-        assert_eq!(
-            ContentType::parse(b"application/grpc+json; charset=utf-8")
-                .unwrap()
-                .subtype(),
-            Some("json")
+        fictionet::assert_cases!(|input| ContentType::parse(input).unwrap().subtype();
+            mixed_case: b"Application/GRPC+Proto" => Some("proto"),
+            parameters: b"application/grpc+json; charset=utf-8" => Some("json"),
         );
         assert_eq!(
             ContentType::parse(b"application/grpc;x=y"),
@@ -2251,33 +2223,14 @@ mod tests {
 
     #[test]
     fn trailer_errors_and_synthesis() {
-        assert_eq!(
-            Status::parse_trailers([("x", "y")]),
-            Err(Error::MissingStatus)
-        );
-        assert_eq!(
-            Status::parse_trailers([("grpc-status", "")]),
-            Err(Error::BadStatus)
-        );
-        assert_eq!(
-            Status::parse_trailers([("grpc-status", "abc")]),
-            Err(Error::BadStatus)
-        );
-        assert_eq!(
-            Status::parse_trailers([("grpc-status", "99999999999")]),
-            Err(Error::BadStatus)
-        );
-        assert_eq!(
-            Status::parse_trailers([("grpc-status", "1"), ("grpc-status", "1")]),
-            Err(Error::BadStatus)
-        );
-        assert_eq!(
-            Status::parse_trailers([(":status", "503")]),
-            Err(Error::HttpStatus(503))
-        );
-        assert_eq!(
-            Status::parse_trailers([(":status", "x"), ("grpc-status", "0")]),
-            Err(Error::HttpStatus(0))
+        fictionet::assert_cases!(Status::parse_trailers;
+            ([("x", "y")]) => Err(Error::MissingStatus),
+            ([("grpc-status", "")]) => Err(Error::BadStatus),
+            ([("grpc-status", "abc")]) => Err(Error::BadStatus),
+            ([("grpc-status", "99999999999")]) => Err(Error::BadStatus),
+            ([("grpc-status", "1"), ("grpc-status", "1")]) => Err(Error::BadStatus),
+            ([(":status", "503")]) => Err(Error::HttpStatus(503)),
+            ([(":status", "x"), ("grpc-status", "0")]) => Err(Error::HttpStatus(0)),
         );
         // Unknown numbers read as UNKNOWN; names match any case.
         assert_eq!(
@@ -2295,18 +2248,11 @@ mod tests {
         .unwrap();
         assert_eq!(s, Status::new(Code::InvalidArgument, "bad arg"));
         assert_eq!(s.to_string(), "INVALID_ARGUMENT: bad arg");
-        assert_eq!(
-            Status::from_trailers([(":status", "503")]).code,
-            Code::Unavailable
-        );
-        assert_eq!(
-            Status::from_trailers([(":status", "404")]).code,
-            Code::Unimplemented
-        );
-        assert_eq!(Status::from_trailers([("a", "b")]).code, Code::Unknown);
-        assert_eq!(
-            Status::from_trailers([("grpc-status", "5")]).code,
-            Code::NotFound
+        fictionet::assert_cases!(|input| Status::from_trailers(input).code;
+            ([(":status", "503")]) => Code::Unavailable,
+            ([(":status", "404")]) => Code::Unimplemented,
+            ([("a", "b")]) => Code::Unknown,
+            ([("grpc-status", "5")]) => Code::NotFound,
         );
         assert!(Error::HttpStatus(1).to_string().contains('1'));
         assert!(Error::BadDetails.to_string().contains("details"));
@@ -2341,18 +2287,11 @@ mod tests {
         ]);
         assert_eq!(s, Status::new(Code::NotFound, "gone"));
         // A response that is not gRPC maps its HTTP status, whatever it says.
-        assert_eq!(
-            Status::from_trailers([(":status", "503"), ("grpc-status", "5")]).code,
-            Code::Unavailable
-        );
-        assert_eq!(
-            Status::from_trailers([(":status", "503"), ("grpc-status", "x")]).code,
-            Code::Unavailable
-        );
-        // A 200 with no grpc-status is UNKNOWN.
-        assert_eq!(
-            Status::from_trailers([(":status", "200")]).code,
-            Code::Unknown
+        fictionet::assert_cases!(|input| Status::from_trailers(input).code;
+            ([(":status", "503"), ("grpc-status", "5")]) => Code::Unavailable,
+            ([(":status", "503"), ("grpc-status", "x")]) => Code::Unavailable,
+            // A 200 with no grpc-status is UNKNOWN.
+            ([(":status", "200")]) => Code::Unknown,
         );
     }
 

@@ -1062,24 +1062,14 @@ mod tests {
 
     #[test]
     fn error_paths() {
-        assert_eq!(Message::parse(&[]), Err(Error::Truncated));
-        assert_eq!(Message::parse(&[0x11]), Err(Error::Truncated));
-        assert_eq!(
-            Message::parse(&[0x11, 0, 0, 0, 0, 0, 0]),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            Message::parse(&[0x13, 0, 0, 0, 0, 0, 0, 0]),
-            Err(Error::UnknownType(0x13))
-        );
-        assert_eq!(Message::parse(&[0x00]), Err(Error::UnknownType(0)));
-        assert_eq!(
-            Message::parse(&vec![0x22; MAX_MESSAGE + 1]),
-            Err(Error::TooLong)
-        );
-        assert_eq!(
-            Message::parse(&[0x16, 0, 0, 0, 239, 1, 2, 3]),
-            Err(Error::Checksum)
+        fictionet::assert_cases!(Message::parse;
+            (&[]) => Err(Error::Truncated),
+            (&[0x11]) => Err(Error::Truncated),
+            (&[0x11, 0, 0, 0, 0, 0, 0]) => Err(Error::Truncated),
+            (&[0x13, 0, 0, 0, 0, 0, 0, 0]) => Err(Error::UnknownType(0x13)),
+            (&[0x00]) => Err(Error::UnknownType(0)),
+            (&vec![0x22; MAX_MESSAGE + 1]) => Err(Error::TooLong),
+            (&[0x16, 0, 0, 0, 239, 1, 2, 3]) => Err(Error::Checksum),
         );
         for n in 9..12 {
             let b = fix(vec![0x11; n]);

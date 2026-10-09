@@ -3587,17 +3587,10 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(Time::from_unix(-631_152_001), Err(Error::Value));
         // The last second of 2049 is a UTCTime, and the next a
         // GeneralizedTime (RFC 5280 4.1.2.5).
-        assert_eq!(
-            Time::from_unix(2_524_607_999).unwrap(),
-            Time::Utc("491231235959Z".into())
-        );
-        assert_eq!(
-            Time::from_unix(2_524_608_000).unwrap(),
-            Time::Generalized("20500101000000Z".into())
-        );
-        assert_eq!(
-            Time::from_unix(253_402_300_799).unwrap(),
-            Time::Generalized("99991231235959Z".into())
+        fictionet::assert_cases!(|input| Time::from_unix(input).unwrap();
+            (2_524_607_999) => Time::Utc("491231235959Z".into()),
+            (2_524_608_000) => Time::Generalized("20500101000000Z".into()),
+            (253_402_300_799) => Time::Generalized("99991231235959Z".into()),
         );
         assert_eq!(Time::from_unix(253_402_300_800), Err(Error::Value));
         assert_eq!(Time::from_unix(i64::MIN), Err(Error::Value));
@@ -4059,25 +4052,12 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             Err(Error::Value)
         );
         // General names: unknown tags, universal tags, wrong forms.
-        assert_eq!(
-            SubjectAltName::parse(&[0x30, 0x02, 0x89, 0x00]),
-            Err(Error::Value)
-        );
-        assert_eq!(
-            SubjectAltName::parse(&[0x30, 0x02, 0x04, 0x00]),
-            Err(Error::Value)
-        );
-        assert_eq!(
-            SubjectAltName::parse(&[0x30, 0x02, 0x83, 0x00]),
-            Err(Error::Asn1(asn1::Error::Primitive))
-        );
-        assert_eq!(
-            SubjectAltName::parse(&[0x30, 0x02, 0xa2, 0x00]),
-            Err(Error::Asn1(asn1::Error::Constructed))
-        );
-        assert_eq!(
-            SubjectAltName::parse(&[0x30, 0x03, 0x82, 0x01, 0x80]),
-            Err(Error::Asn1(asn1::Error::Charset))
+        fictionet::assert_cases!(SubjectAltName::parse;
+            (&[0x30, 0x02, 0x89, 0x00]) => Err(Error::Value),
+            (&[0x30, 0x02, 0x04, 0x00]) => Err(Error::Value),
+            (&[0x30, 0x02, 0x83, 0x00]) => Err(Error::Asn1(asn1::Error::Primitive)),
+            (&[0x30, 0x02, 0xa2, 0x00]) => Err(Error::Asn1(asn1::Error::Constructed)),
+            (&[0x30, 0x03, 0x82, 0x01, 0x80]) => Err(Error::Asn1(asn1::Error::Charset)),
         );
         assert_eq!(
             SubjectAltName(vec![GeneralName::Dns("\u{e9}".into())]).to_bytes(),
@@ -4976,25 +4956,12 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             );
         }
         // The same names, as DER.
-        assert_eq!(
-            SubjectAltName::parse(&[0x30, 0x02, 0x82, 0x00]),
-            Err(Error::Value)
-        );
-        assert_eq!(
-            SubjectAltName::parse(&[0x30, 0x03, 0x82, 0x01, b' ']),
-            Err(Error::Value)
-        );
-        assert_eq!(
-            SubjectAltName::parse(&[0x30, 0x04, 0x86, 0x02, b'a', b'b']),
-            Err(Error::Value)
-        );
-        assert_eq!(
-            SubjectAltName::parse(&[0x30, 0x04, 0x87, 0x02, 1, 2]),
-            Err(Error::Value)
-        );
-        assert_eq!(
-            SubjectAltName::parse(&[0x30, 0x04, 0xa4, 0x02, 0x30, 0x00]),
-            Err(Error::Value)
+        fictionet::assert_cases!(SubjectAltName::parse;
+            (&[0x30, 0x02, 0x82, 0x00]) => Err(Error::Value),
+            (&[0x30, 0x03, 0x82, 0x01, b' ']) => Err(Error::Value),
+            (&[0x30, 0x04, 0x86, 0x02, b'a', b'b']) => Err(Error::Value),
+            (&[0x30, 0x04, 0x87, 0x02, 1, 2]) => Err(Error::Value),
+            (&[0x30, 0x04, 0xa4, 0x02, 0x30, 0x00]) => Err(Error::Value),
         );
         let ok = SubjectAltName(vec![
             uri("urn:x"),

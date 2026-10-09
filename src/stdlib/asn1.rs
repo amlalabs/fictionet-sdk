@@ -3145,21 +3145,11 @@ mod tests {
             w.text(kind, text);
             assert_eq!(w.finish(), Err(Error::Charset), "{kind:?}");
         }
-        assert_eq!(
-            Reader::new(&[0x0c, 0x01, 0xff], Rules::Ber).read_text(),
-            Err(Error::Charset)
-        );
-        assert_eq!(
-            Reader::new(&[0x1e, 0x02, 0xd8, 0x00], Rules::Ber).read_text(),
-            Err(Error::Charset)
-        );
-        assert_eq!(
-            Reader::new(&[0x1e, 0x01, 0x41], Rules::Ber).read_text(),
-            Err(Error::Charset)
-        );
-        assert_eq!(
-            Reader::new(&[0x1c, 0x04, 0, 0x11, 0, 0], Rules::Ber).read_text(),
-            Err(Error::Charset)
+        fictionet::assert_cases!(|input| Reader::new(input, Rules::Ber).read_text();
+            (&[0x0c, 0x01, 0xff]) => Err(Error::Charset),
+            (&[0x1e, 0x02, 0xd8, 0x00]) => Err(Error::Charset),
+            (&[0x1e, 0x01, 0x41]) => Err(Error::Charset),
+            (&[0x1c, 0x04, 0, 0x11, 0, 0]) => Err(Error::Charset),
         );
         // Teletex is kept as bytes.
         let t = der(|w| w.string_bytes(StringKind::Teletex, &[0xc2, 0x61]));
@@ -3368,17 +3358,10 @@ mod tests {
             Err(Error::Integer)
         );
         assert_eq!(ber(&[0x05, 0x01, 0x00]).unwrap().null(), Err(Error::Null));
-        assert_eq!(
-            ber(&[0x03, 0x00]).unwrap().bit_string(),
-            Err(Error::BitString)
-        );
-        assert_eq!(
-            ber(&[0x03, 0x01, 0x01]).unwrap().bit_string(),
-            Err(Error::BitString)
-        );
-        assert_eq!(
-            ber(&[0x03, 0x02, 0x08, 0x00]).unwrap().bit_string(),
-            Err(Error::BitString)
+        fictionet::assert_cases!(|input| ber(input).unwrap().bit_string();
+            (&[0x03, 0x00]) => Err(Error::BitString),
+            (&[0x03, 0x01, 0x01]) => Err(Error::BitString),
+            (&[0x03, 0x02, 0x08, 0x00]) => Err(Error::BitString),
         );
         assert_eq!(
             derr(&[0x03, 0x02, 0x01, 0x01]).unwrap().bit_string(),

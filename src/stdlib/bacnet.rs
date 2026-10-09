@@ -2371,18 +2371,10 @@ mod tests {
     fn extended_tag_number_255_is_reserved() {
         // Clause 20.2.1.2: the extended tag number octet runs 15 to 254;
         // B'11111111' is reserved by ASHRAE.
-        assert_eq!(
-            Tag::parse(&[0xf9, 0xff, 0x00]),
-            Err(Error::ReservedTag(255))
-        );
-        assert_eq!(Tag::parse(&[0xfe, 0xff]), Err(Error::ReservedTag(255)));
-        assert_eq!(
-            Tag::parse(&[0xf9, 0xfe]),
-            Ok(Tag {
-                number: 254,
-                class: Class::Context,
-                content: TagContent::Length(1)
-            })
+        fictionet::assert_cases!(Tag::parse;
+            (&[0xf9, 0xff, 0x00]) => Err(Error::ReservedTag(255)),
+            (&[0xfe, 0xff]) => Err(Error::ReservedTag(255)),
+            (&[0xf9, 0xfe]) => Ok(Tag { number: 254, class: Class::Context, content: TagContent::Length(1) }),
         );
         // The writer never writes the reserved number.
         let mut out = Vec::new();
@@ -2400,63 +2392,29 @@ mod tests {
 
     #[test]
     fn bad_values() {
-        assert_eq!(Value::parse(&[]), Err(Error::Truncated));
-        assert_eq!(Value::parse(&[0x09, 0]), Err(Error::ContextTag(0)));
-        assert_eq!(Value::parse(&[0x3e]), Err(Error::ContextTag(3)));
-        assert_eq!(Value::parse(&[0xd0]), Err(Error::ReservedTag(13)));
-        assert_eq!(Value::parse(&[0xf0, 40]), Err(Error::ReservedTag(40)));
-        assert_eq!(
-            Value::parse(&[0x12]),
-            Err(Error::ValueLength { tag: 1, len: 2 })
+        fictionet::assert_cases!(Value::parse;
+            (&[]) => Err(Error::Truncated),
+            (&[0x09, 0]) => Err(Error::ContextTag(0)),
+            (&[0x3e]) => Err(Error::ContextTag(3)),
+            (&[0xd0]) => Err(Error::ReservedTag(13)),
+            (&[0xf0, 40]) => Err(Error::ReservedTag(40)),
+            (&[0x12]) => Err(Error::ValueLength { tag: 1, len: 2 }),
+            (&[0x01, 0]) => Err(Error::ValueLength { tag: 0, len: 1 }),
+            (&[0x20]) => Err(Error::ValueLength { tag: 2, len: 0 }),
+            (&hex("25 09 000000000000000001")) => Err(Error::ValueLength { tag: 2, len: 9 }),
+            (&hex("95 05 0000000001")) => Err(Error::ValueLength { tag: 9, len: 5 }),
+            (&hex("43 000000")) => Err(Error::ValueLength { tag: 4, len: 3 }),
+            (&hex("54 00000000")) => Err(Error::ValueLength { tag: 5, len: 4 }),
+            (&hex("A3 000000")) => Err(Error::ValueLength { tag: 10, len: 3 }),
+            (&[0x70]) => Err(Error::ValueLength { tag: 7, len: 0 }),
+            (&[0x80]) => Err(Error::ValueLength { tag: 8, len: 0 }),
+            (&[0x82, 8, 0]) => Err(Error::BitString(8)),
+            (&[0x81, 1]) => Err(Error::BitString(1)),
+            (&[0x81, 0]) => Ok(Value::BitString(vec![])),
+            // A length past the limit, and one past the bytes.
+            (&hex("65 FF FFFFFFFF")) => Err(Error::ValueLength { tag: 6, len: u32::MAX }),
+            (&hex("63 0102")) => Err(Error::Truncated),
         );
-        assert_eq!(
-            Value::parse(&[0x01, 0]),
-            Err(Error::ValueLength { tag: 0, len: 1 })
-        );
-        assert_eq!(
-            Value::parse(&[0x20]),
-            Err(Error::ValueLength { tag: 2, len: 0 })
-        );
-        assert_eq!(
-            Value::parse(&hex("25 09 000000000000000001")),
-            Err(Error::ValueLength { tag: 2, len: 9 })
-        );
-        assert_eq!(
-            Value::parse(&hex("95 05 0000000001")),
-            Err(Error::ValueLength { tag: 9, len: 5 })
-        );
-        assert_eq!(
-            Value::parse(&hex("43 000000")),
-            Err(Error::ValueLength { tag: 4, len: 3 })
-        );
-        assert_eq!(
-            Value::parse(&hex("54 00000000")),
-            Err(Error::ValueLength { tag: 5, len: 4 })
-        );
-        assert_eq!(
-            Value::parse(&hex("A3 000000")),
-            Err(Error::ValueLength { tag: 10, len: 3 })
-        );
-        assert_eq!(
-            Value::parse(&[0x70]),
-            Err(Error::ValueLength { tag: 7, len: 0 })
-        );
-        assert_eq!(
-            Value::parse(&[0x80]),
-            Err(Error::ValueLength { tag: 8, len: 0 })
-        );
-        assert_eq!(Value::parse(&[0x82, 8, 0]), Err(Error::BitString(8)));
-        assert_eq!(Value::parse(&[0x81, 1]), Err(Error::BitString(1)));
-        assert_eq!(Value::parse(&[0x81, 0]), Ok(Value::BitString(vec![])));
-        // A length past the limit, and one past the bytes.
-        assert_eq!(
-            Value::parse(&hex("65 FF FFFFFFFF")),
-            Err(Error::ValueLength {
-                tag: 6,
-                len: u32::MAX
-            })
-        );
-        assert_eq!(Value::parse(&hex("63 0102")), Err(Error::Truncated));
         assert_eq!(
             ValueList::parse(&hex("21 01 21")).map(|values| values.0),
             Err(Error::Truncated)
@@ -2550,23 +2508,13 @@ mod tests {
         }
         let mut extra = bytes.clone();
         extra.push(0);
-        assert_eq!(IAm::parse(&extra), Err(Error::TrailingBytes));
-        // Fields of the wrong type or out of range.
-        assert_eq!(
-            IAm::parse(&hex("21 01 22 05C4 91 00 21 0F")),
-            Err(Error::ServiceBody)
-        );
-        assert_eq!(
-            IAm::parse(&hex("C4 02000001 22 05C4 91 04 21 0F")),
-            Err(Error::OutOfRange)
-        );
-        assert_eq!(
-            IAm::parse(&hex("C4 02000001 22 05C4 91 00 23 010000")),
-            Err(Error::OutOfRange)
-        );
-        assert_eq!(
-            IAm::parse(&hex("C4 02000001 25 05 0100000000 91 00 21 0F")),
-            Err(Error::OutOfRange)
+        fictionet::assert_cases!(IAm::parse;
+            (&extra) => Err(Error::TrailingBytes),
+            // Fields of the wrong type or out of range.
+            (&hex("21 01 22 05C4 91 00 21 0F")) => Err(Error::ServiceBody),
+            (&hex("C4 02000001 22 05C4 91 04 21 0F")) => Err(Error::OutOfRange),
+            (&hex("C4 02000001 22 05C4 91 00 23 010000")) => Err(Error::OutOfRange),
+            (&hex("C4 02000001 25 05 0100000000 91 00 21 0F")) => Err(Error::OutOfRange),
         );
         for s in [
             Segmentation::Both,
@@ -3044,38 +2992,19 @@ mod tests {
 
     #[test]
     fn bad_bvlc() {
-        assert_eq!(Bvlc::parse(&[0x81, 0x0b, 0]), Err(Error::Truncated));
-        assert_eq!(
-            Bvlc::parse(&hex("82 0B 0004")),
-            Err(Error::NotBacnetIp(0x82))
-        );
-        assert_eq!(Bvlc::parse(&hex("81 0B 0005")), Err(Error::Length(5)));
-        assert_eq!(Bvlc::parse(&hex("81 0B 0003 00")), Err(Error::Length(3)));
-        assert_eq!(Bvlc::parse(&hex("81 0B 0004 00")), Err(Error::Length(4)));
-        assert_eq!(Bvlc::parse(&hex("81 0D 0004")), Err(Error::Function(0x0d)));
-        assert_eq!(
-            Bvlc::parse(&hex("81 00 0005 00")),
-            Err(Error::FunctionData(0))
-        );
-        assert_eq!(
-            Bvlc::parse(&hex("81 01 0005 00")),
-            Err(Error::FunctionData(1))
-        );
-        assert_eq!(
-            Bvlc::parse(&hex("81 02 0005 00")),
-            Err(Error::FunctionData(2))
-        );
-        assert_eq!(
-            Bvlc::parse(&hex("81 04 0009 0A00000 1BA")),
-            Err(Error::FunctionData(4))
-        );
-        assert_eq!(
-            Bvlc::parse(&hex("81 07 0005 00")),
-            Err(Error::FunctionData(7))
-        );
-        assert_eq!(
-            Bvlc::parse(&hex("81 08 0005 00")),
-            Err(Error::FunctionData(8))
+        fictionet::assert_cases!(Bvlc::parse;
+            (&[0x81, 0x0b, 0]) => Err(Error::Truncated),
+            (&hex("82 0B 0004")) => Err(Error::NotBacnetIp(0x82)),
+            (&hex("81 0B 0005")) => Err(Error::Length(5)),
+            (&hex("81 0B 0003 00")) => Err(Error::Length(3)),
+            (&hex("81 0B 0004 00")) => Err(Error::Length(4)),
+            (&hex("81 0D 0004")) => Err(Error::Function(0x0d)),
+            (&hex("81 00 0005 00")) => Err(Error::FunctionData(0)),
+            (&hex("81 01 0005 00")) => Err(Error::FunctionData(1)),
+            (&hex("81 02 0005 00")) => Err(Error::FunctionData(2)),
+            (&hex("81 04 0009 0A00000 1BA")) => Err(Error::FunctionData(4)),
+            (&hex("81 07 0005 00")) => Err(Error::FunctionData(7)),
+            (&hex("81 08 0005 00")) => Err(Error::FunctionData(8)),
         );
         let mut long = hex("81 0A FFFF");
         long.resize(0xffff, 0);
@@ -3369,17 +3298,10 @@ mod tests {
     #[test]
     fn network_numbers_follow_clause_6_2_2_1() {
         // DNET 1 to 65535, SNET 1 to 65534.
-        assert_eq!(
-            Npdu::parse(&hex("01 20 0000 00 FF 10 08")),
-            Err(Error::Network(0))
-        );
-        assert_eq!(
-            Npdu::parse(&hex("01 08 FFFF 01 01 10 08")),
-            Err(Error::Network(0xffff))
-        );
-        assert_eq!(
-            Npdu::parse(&hex("01 08 0000 01 01 10 08")),
-            Err(Error::Network(0))
+        fictionet::assert_cases!(Npdu::parse;
+            (&hex("01 20 0000 00 FF 10 08")) => Err(Error::Network(0)),
+            (&hex("01 08 FFFF 01 01 10 08")) => Err(Error::Network(0xffff)),
+            (&hex("01 08 0000 01 01 10 08")) => Err(Error::Network(0)),
         );
         assert!(Npdu::parse(&hex("01 08 FFFE 01 01 10 08")).is_ok());
         assert!(Npdu::parse(&hex("01 20 FFFF 00 FF 10 08")).is_ok());
@@ -3454,21 +3376,11 @@ mod tests {
         assert_eq!(Tag::parse(&hex("F9 0E 00")), Err(Error::ReservedTag(14)));
         assert!(Tag::parse(&hex("F9 0F")).is_ok());
         // Clause 20.2.3: an application Boolean is its length field alone.
-        assert_eq!(
-            Value::parse(&hex("15 00")),
-            Err(Error::ValueLength {
-                tag: tag::BOOLEAN,
-                len: 0
-            })
+        fictionet::assert_cases!(Value::parse;
+            (&hex("15 00")) => Err(Error::ValueLength { tag: tag::BOOLEAN, len: 0 }),
+            (&hex("15 01")) => Err(Error::ValueLength { tag: tag::BOOLEAN, len: 1 }),
+            (&hex("10")) => Ok(Value::Boolean(false)),
         );
-        assert_eq!(
-            Value::parse(&hex("15 01")),
-            Err(Error::ValueLength {
-                tag: tag::BOOLEAN,
-                len: 1
-            })
-        );
-        assert_eq!(Value::parse(&hex("10")), Ok(Value::Boolean(false)));
     }
 
     // Random input.

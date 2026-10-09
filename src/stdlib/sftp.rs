@@ -1733,16 +1733,9 @@ mod tests {
             Frames::<Packet>::with_limit(usize::MAX).decode(&[0, 4, 0, 1], false),
             Err(Error::PacketTooLong(0x40001))
         );
-        assert_eq!(
-            Packet::parse(&[0, 0, 0, 1, 7, 9]),
-            Err(Error::PacketTrailing)
-        );
-        assert_eq!(
-            Packet::parse(&[0, 0, 0, 1, 7]),
-            Ok(Packet {
-                kind: 7,
-                body: vec![]
-            })
+        fictionet::assert_cases!(Packet::parse;
+            (&[0, 0, 0, 1, 7, 9]) => Err(Error::PacketTrailing),
+            (&[0, 0, 0, 1, 7]) => Ok(Packet { kind: 7, body: vec![] }),
         );
         assert!(Error::Empty.to_string().contains('0'));
     }
@@ -1769,19 +1762,12 @@ mod tests {
             Err(Error::UnknownType(100))
         );
         // Truncated: no id, a short path, a path length past the end.
-        assert_eq!(Request::from_packet(&p(t, &[0, 0])), Err(Error::Truncated));
-        assert_eq!(
-            Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0])),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0, 0, 2, b'/'])),
-            Err(Error::Truncated)
-        );
-        // Trailing bytes.
-        assert_eq!(
-            Request::from_packet(&p(t, &[0, 0, 0, 1, 0, 0, 0, 1, b'/', 0])),
-            Err(Error::Trailing)
+        fictionet::assert_cases!(Request::from_packet;
+            (&p(t, &[0, 0])) => Err(Error::Truncated),
+            (&p(t, &[0, 0, 0, 1, 0, 0])) => Err(Error::Truncated),
+            (&p(t, &[0, 0, 0, 1, 0, 0, 0, 2, b'/'])) => Err(Error::Truncated),
+            // Trailing bytes.
+            (&p(t, &[0, 0, 0, 1, 0, 0, 0, 1, b'/', 0])) => Err(Error::Trailing),
         );
         assert_eq!(
             Response::from_packet(&p(packet_type::HANDLE, &[0, 0, 0, 1, 0, 0, 0, 0, 1])),

@@ -641,33 +641,15 @@ mod tests {
         long.pop();
         assert!(Packet::parse(&long).is_ok());
         // A CSRC count with no CSRCs.
-        assert_eq!(
-            Packet::parse(&[0x81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0]),
-            Err(Error::Truncated)
-        );
-        // An extension header with no extension, and one cut short.
-        assert_eq!(
-            Packet::parse(&[0x90, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0xbe]),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            Packet::parse(&[
-                0x90, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0xbe, 0xde, 0, 1, 0x10
-            ]),
-            Err(Error::Truncated)
-        );
-        // Padding count 0, and one that runs into the header.
-        assert_eq!(
-            Packet::parse(&[0xa0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0]),
-            Err(Error::Padding)
-        );
-        assert_eq!(
-            Packet::parse(&[0xa0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 7, 3]),
-            Err(Error::Padding)
-        );
-        assert_eq!(
-            Packet::parse(&[0xa0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]),
-            Err(Error::Padding)
+        fictionet::assert_cases!(Packet::parse;
+            (&[0x81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0]) => Err(Error::Truncated),
+            // An extension header with no extension, and one cut short.
+            (&[0x90, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0xbe]) => Err(Error::Truncated),
+            (&[ 0x90, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0xbe, 0xde, 0, 1, 0x10 ]) => Err(Error::Truncated),
+            // Padding count 0, and one that runs into the header.
+            (&[0xa0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0]) => Err(Error::Padding),
+            (&[0xa0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 7, 3]) => Err(Error::Padding),
+            (&[0xa0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1]) => Err(Error::Padding),
         );
         // Elements past the extension's end, in both forms.
         let one = [
@@ -820,26 +802,14 @@ mod tests {
         p.csrcs = vec![0; 16];
         assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         p.csrcs = vec![0; 15];
-        for e in [
-            Element {
-                id: 0,
-                data: vec![1],
-            },
-            Element {
-                id: 15,
-                data: vec![1],
-            },
-            Element {
-                id: 1,
-                data: vec![],
-            },
-            Element {
-                id: 2,
-                data: vec![0; 17],
-            },
+        for (name, id, data) in [
+            ("zero id", 0, vec![1]),
+            ("reserved id", 15, vec![1]),
+            ("empty data", 1, vec![]),
+            ("long data", 2, vec![0; 17]),
         ] {
-            p.extension = Some(HeaderExtension::OneByte(vec![e]));
-            assert_eq!(p.to_bytes(), Err(Error::Unwritable));
+            p.extension = Some(HeaderExtension::OneByte(vec![Element { id, data }]));
+            assert_eq!(p.to_bytes(), Err(Error::Unwritable), "{name}");
         }
         p.extension = Some(HeaderExtension::OneByte(vec![Element {
             id: 14,
@@ -847,34 +817,16 @@ mod tests {
         }]));
         assert!(p.to_bytes().is_ok());
         contract::check_wire_value(&p);
-        for (app_bits, element) in [
-            (
-                16,
-                Element {
-                    id: 1,
-                    data: vec![],
-                },
-            ),
-            (
-                0,
-                Element {
-                    id: 0,
-                    data: vec![],
-                },
-            ),
-            (
-                0,
-                Element {
-                    id: 9,
-                    data: vec![0; 256],
-                },
-            ),
+        for (name, app_bits, id, data) in [
+            ("large app bits", 16, 1, vec![]),
+            ("zero id", 0, 0, vec![]),
+            ("long data", 0, 9, vec![0; 256]),
         ] {
             p.extension = Some(HeaderExtension::TwoByte {
                 app_bits,
-                elements: vec![element],
+                elements: vec![Element { id, data }],
             });
-            assert_eq!(p.to_bytes(), Err(Error::Unwritable));
+            assert_eq!(p.to_bytes(), Err(Error::Unwritable), "{name}");
         }
         p.extension = Some(HeaderExtension::TwoByte {
             app_bits: 0,

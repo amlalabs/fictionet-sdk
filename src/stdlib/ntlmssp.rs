@@ -1543,26 +1543,10 @@ mod tests {
         );
         // The payload starts right after the version, so there is no MIC.
         assert_eq!(a.mic, None);
-        assert_eq!(
-            UnicodeName::parse(&a.domain)
-                .ok()
-                .map(|name| name.0)
-                .as_deref(),
-            Some("Domain")
-        );
-        assert_eq!(
-            UnicodeName::parse(&a.user)
-                .ok()
-                .map(|name| name.0)
-                .as_deref(),
-            Some("User")
-        );
-        assert_eq!(
-            UnicodeName::parse(&a.workstation)
-                .ok()
-                .map(|name| name.0)
-                .as_deref(),
-            Some("COMPUTER")
+        fictionet::assert_cases!(|input| UnicodeName::parse(input).ok().map(|name| name.0).as_deref();
+            domain: &a.domain => Some("Domain"),
+            user: &a.user => Some("User"),
+            workstation: &a.workstation => Some("COMPUTER"),
         );
         assert_eq!(a.session_key, SPEC_AUTHENTICATE[0xd8..].to_vec());
         let lm = LmV2Response::parse(&a.lm_response).unwrap();
@@ -1787,8 +1771,7 @@ mod tests {
         let n = Negotiate {
             flags: flags::NEGOTIATE_OEM_DOMAIN_SUPPLIED | flags::NEGOTIATE_OEM_WORKSTATION_SUPPLIED,
             domain: b"AB".to_vec(),
-            workstation: Vec::new(),
-            version: None,
+            ..Negotiate::default()
         };
         let good = n.to_bytes().unwrap();
         assert_eq!(
@@ -1840,9 +1823,7 @@ mod tests {
     fn encode_errors() {
         let n = Negotiate {
             flags: flags::NEGOTIATE_VERSION,
-            domain: Vec::new(),
-            workstation: Vec::new(),
-            version: None,
+            ..Negotiate::default()
         };
         assert_eq!(n.to_bytes(), Err(Error::Unwritable));
         let v = Version {
@@ -1858,22 +1839,13 @@ mod tests {
         };
         assert_eq!(n.to_bytes(), Err(Error::Unwritable));
         let n = Negotiate {
-            flags: 0,
-            version: None,
             domain: vec![0; MAX_FIELD + 1],
-            workstation: Vec::new(),
+            ..Negotiate::default()
         };
         assert_eq!(n.to_bytes(), Err(Error::Unwritable));
         let a = Authenticate {
-            flags: 0,
-            lm_response: Vec::new(),
-            nt_response: Vec::new(),
-            domain: Vec::new(),
-            user: Vec::new(),
-            workstation: Vec::new(),
-            session_key: Vec::new(),
-            version: None,
             mic: Some([0; 16]),
+            ..Authenticate::default()
         };
         // A MIC with no version: 8 zero bytes stand in for the version.
         let b = a.to_bytes().unwrap();
@@ -1881,10 +1853,9 @@ mod tests {
         assert_eq!(Authenticate::parse(&b), Ok(a.clone()));
         // The padding byte that keeps a field at an even offset counts.
         let n = Negotiate {
-            flags: 0,
-            version: None,
             domain: vec![1],
             workstation: vec![2; MAX_MESSAGE - 33],
+            ..Negotiate::default()
         };
         assert_eq!(n.to_bytes(), Err(Error::Unwritable));
         let n = Negotiate {
@@ -1900,11 +1871,8 @@ mod tests {
         };
         assert_eq!(a.to_bytes(), Err(Error::Unwritable));
         let c = Challenge {
-            flags: 0,
-            target_name: Vec::new(),
-            server_challenge: [0; 8],
             target_info: vec![0; MAX_FIELD + 1],
-            version: None,
+            ..Challenge::default()
         };
         assert_eq!(c.to_bytes(), Err(Error::Unwritable));
         let big = NtResponse::V2(NtlmV2Response {
@@ -1972,13 +1940,9 @@ mod tests {
         let a = Authenticate {
             flags: flags::NEGOTIATE_UNICODE | flags::ANONYMOUS,
             lm_response: vec![0],
-            nt_response: Vec::new(),
             domain: UnicodeName("D".into()).to_bytes().unwrap(),
-            user: Vec::new(),
             workstation: UnicodeName("W".into()).to_bytes().unwrap(),
-            session_key: Vec::new(),
-            version: None,
-            mic: None,
+            ..Authenticate::default()
         };
         let b = a.to_bytes().unwrap();
         for at in [28, 44] {

@@ -3935,22 +3935,12 @@ mod tests {
         );
         // A whole message, then the start of one that ends in the next block.
         let tail = [0x83, 0xc0, 0x81, 0xc0, 0x81, 0x81];
-        assert_eq!(
-            decode_all(make, &tail),
-            (
-                vec![empty.clone()],
-                Some(Fail::Protocol(Error::BlockBoundary))
-            )
-        );
-        // A block that ends inside a message at end of input.
-        assert_eq!(
-            decode_all(make, &[0x81, 0xc0]),
-            (Vec::new(), Some(Fail::Protocol(Error::BlockBoundary)))
-        );
-        // A partial block at end of input is truncated, not misframed.
-        assert_eq!(
-            decode_all(make, &[0x82, 0xc0]),
-            (Vec::new(), Some(Fail::Truncated { unread: 1 }))
+        fictionet::assert_cases!(|input| decode_all(make, input);
+            (&tail) => ( vec![empty.clone()], Some(Fail::Protocol(Error::BlockBoundary)) ),
+            // A block that ends inside a message at end of input.
+            (&[0x81, 0xc0]) => (Vec::new(), Some(Fail::Protocol(Error::BlockBoundary))),
+            // A partial block at end of input is truncated, not misframed.
+            (&[0x82, 0xc0]) => (Vec::new(), Some(Fail::Truncated { unread: 1 })),
         );
         // Two messages in one block, one in the next.
         let ok = [0x84, 0xc0, 0x81, 0xc0, 0x81, 0x82, 0xc0, 0x81];

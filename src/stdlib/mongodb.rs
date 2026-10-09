@@ -2047,48 +2047,28 @@ mod tests {
             Err(E::BsonLength(-1))
         );
         let big = (MAX_DOCUMENT_SIZE as i32 + 1).to_le_bytes();
-        assert_eq!(Document::parse(&big), Err(E::BsonLength(big_i32())));
-        assert_eq!(Document::parse(&[5, 0, 0, 0, 1]), Err(E::Terminator));
-        assert_eq!(Document::parse(&[6, 0, 0, 0, 0, 0]), Err(E::Terminator)); // ends early
-        assert_eq!(Document::parse(&raw(&[0x20, b'a', 0])), Err(E::Type(0x20)));
-        assert_eq!(Document::parse(&raw(&[0x0a, b'a'])), Err(E::Terminator)); // key with no zero
-        assert_eq!(Document::parse(&raw(&[0x0a, 0xff, 0])), Err(E::Utf8));
-        assert_eq!(Document::parse(&raw(&[0x08, b'a', 0, 2])), Err(E::Bool(2)));
-        assert_eq!(
-            Document::parse(&raw(&[0x10, b'a', 0, 1, 2])),
-            Err(E::BsonTruncated)
-        );
-        // Strings: length 0, a missing zero, bad UTF-8, running past the end.
-        assert_eq!(
-            Document::parse(&raw(&[2, b'a', 0, 0, 0, 0, 0])),
-            Err(E::BsonLength(0))
-        );
-        assert_eq!(
-            Document::parse(&raw(&[2, b'a', 0, 1, 0, 0, 0, b'x'])),
-            Err(E::Terminator)
-        );
-        assert_eq!(
-            Document::parse(&raw(&[2, b'a', 0, 2, 0, 0, 0, 0xc3, 0])),
-            Err(E::Utf8)
-        );
-        assert_eq!(
-            Document::parse(&raw(&[2, b'a', 0, 9, 0, 0, 0, b'x', 0])),
-            Err(E::BsonTruncated)
-        );
-        // Binary with a negative length.
-        assert_eq!(
-            Document::parse(&raw(&[5, b'a', 0, 0xff, 0xff, 0xff, 0xff, 0])),
-            Err(E::BsonLength(-1))
-        );
-        // An embedded document longer than its parent.
-        assert_eq!(
-            Document::parse(&raw(&[3, b'a', 0, 9, 0, 0, 0, 0])),
-            Err(E::BsonTruncated)
-        );
-        // JavaScript with scope: too short, and a length that does not match.
-        assert_eq!(
-            Document::parse(&raw(&[0x0f, b'a', 0, 13, 0, 0, 0])),
-            Err(E::BsonLength(13))
+        fictionet::assert_cases!(Document::parse;
+            (&big) => Err(E::BsonLength(big_i32())),
+            (&[5, 0, 0, 0, 1]) => Err(E::Terminator),
+            (&[6, 0, 0, 0, 0, 0]) => Err(E::Terminator),
+            // ends early
+            (&raw(&[0x20, b'a', 0])) => Err(E::Type(0x20)),
+            (&raw(&[0x0a, b'a'])) => Err(E::Terminator),
+            // key with no zero
+            (&raw(&[0x0a, 0xff, 0])) => Err(E::Utf8),
+            (&raw(&[0x08, b'a', 0, 2])) => Err(E::Bool(2)),
+            (&raw(&[0x10, b'a', 0, 1, 2])) => Err(E::BsonTruncated),
+            // Strings: length 0, a missing zero, bad UTF-8, running past the end.
+            (&raw(&[2, b'a', 0, 0, 0, 0, 0])) => Err(E::BsonLength(0)),
+            (&raw(&[2, b'a', 0, 1, 0, 0, 0, b'x'])) => Err(E::Terminator),
+            (&raw(&[2, b'a', 0, 2, 0, 0, 0, 0xc3, 0])) => Err(E::Utf8),
+            (&raw(&[2, b'a', 0, 9, 0, 0, 0, b'x', 0])) => Err(E::BsonTruncated),
+            // Binary with a negative length.
+            (&raw(&[5, b'a', 0, 0xff, 0xff, 0xff, 0xff, 0])) => Err(E::BsonLength(-1)),
+            // An embedded document longer than its parent.
+            (&raw(&[3, b'a', 0, 9, 0, 0, 0, 0])) => Err(E::BsonTruncated),
+            // JavaScript with scope: too short, and a length that does not match.
+            (&raw(&[0x0f, b'a', 0, 13, 0, 0, 0])) => Err(E::BsonLength(13)),
         );
         let mut jsws = vec![0x0f, b'a', 0, 15, 0, 0, 0, 1, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0];
         assert_eq!(Document::parse(&raw(&jsws)), Err(E::BsonLength(15)));
@@ -2488,42 +2468,20 @@ mod tests {
             })
         ));
         // Section kinds and body counts.
-        assert_eq!(Message::parse(&with(0, &[2])), Err(E::SectionKind(2)));
-        assert_eq!(Message::parse(&with(0, &[])), Err(E::BodyCount(0)));
-        assert_eq!(
-            Message::parse(&with(0, &[sec0.clone(), sec0.clone()].concat())),
-            Err(E::BodyCount(2))
-        );
-        assert_eq!(
-            Message::parse(&with(0, &[0, 5, 0, 0])),
-            Err(E::BsonTruncated)
-        );
-        // Sequence sizes.
-        assert_eq!(
-            Message::parse(&with(0, &[1, 4, 0, 0, 0])),
-            Err(E::SequenceLength(4))
-        );
-        assert_eq!(
-            Message::parse(&with(0, &[1, 9, 0, 0, 0, b'a', 0])),
-            Err(E::SequenceLength(9))
-        );
-        assert_eq!(Message::parse(&with(0, &[1, 6, 0])), Err(E::Truncated));
-        assert_eq!(
-            Message::parse(&with(0, &[1, 6, 0, 0, 0, b'a', b'b'])),
-            Err(E::Terminator)
-        );
-        assert_eq!(
-            Message::parse(&with(0, &[1, 8, 0, 0, 0, b'a', 0, 5, 0])),
-            Err(E::BsonTruncated)
-        );
-        // Query: truncated, and bytes after the fields document.
-        assert_eq!(
-            Message::parse(&frame(op_code::QUERY, &[0, 0, 0, 0, b'a', 0, 0])),
-            Err(E::Truncated)
-        );
-        assert_eq!(
-            Message::parse(&frame(op_code::QUERY, &[0, 0, 0, 0, b'a'])),
-            Err(E::Terminator)
+        fictionet::assert_cases!(Message::parse;
+            (&with(0, &[2])) => Err(E::SectionKind(2)),
+            (&with(0, &[])) => Err(E::BodyCount(0)),
+            (&with(0, &[sec0.clone(), sec0.clone()].concat())) => Err(E::BodyCount(2)),
+            (&with(0, &[0, 5, 0, 0])) => Err(E::BsonTruncated),
+            // Sequence sizes.
+            (&with(0, &[1, 4, 0, 0, 0])) => Err(E::SequenceLength(4)),
+            (&with(0, &[1, 9, 0, 0, 0, b'a', 0])) => Err(E::SequenceLength(9)),
+            (&with(0, &[1, 6, 0])) => Err(E::Truncated),
+            (&with(0, &[1, 6, 0, 0, 0, b'a', b'b'])) => Err(E::Terminator),
+            (&with(0, &[1, 8, 0, 0, 0, b'a', 0, 5, 0])) => Err(E::BsonTruncated),
+            // Query: truncated, and bytes after the fields document.
+            (&frame(op_code::QUERY, &[0, 0, 0, 0, b'a', 0, 0])) => Err(E::Truncated),
+            (&frame(op_code::QUERY, &[0, 0, 0, 0, b'a'])) => Err(E::Terminator),
         );
         let mut q = vec![0, 0, 0, 0, b'a', 0, 0, 0, 0, 0, 0, 0, 0, 0];
         q.extend_from_slice(&body);

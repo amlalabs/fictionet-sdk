@@ -2225,21 +2225,11 @@ mod tests {
             Err(Error::Length(MAX_ARRAY as i64 + 1))
         );
         // Tagged fields out of order, repeated, too many, or cut short.
-        assert_eq!(
-            Reader::new(&[2, 3, 0, 1, 0]).tagged_fields(),
-            Err(Error::TagOrder(1))
-        );
-        assert_eq!(
-            Reader::new(&[2, 3, 0, 3, 0]).tagged_fields(),
-            Err(Error::TagOrder(3))
-        );
-        assert_eq!(
-            Reader::new(&[3, 3, 0]).tagged_fields(),
-            Err(Error::Length(3))
-        );
-        assert_eq!(
-            Reader::new(&[1, 3, 4, 1]).tagged_fields(),
-            Err(Error::Truncated)
+        fictionet::assert_cases!(|input| Reader::new(input).tagged_fields();
+            (&[2, 3, 0, 1, 0]) => Err(Error::TagOrder(1)),
+            (&[2, 3, 0, 3, 0]) => Err(Error::TagOrder(3)),
+            (&[3, 3, 0]) => Err(Error::Length(3)),
+            (&[1, 3, 4, 1]) => Err(Error::Truncated),
         );
         let mut many = encoded(|w| w.uvarint(MAX_TAGGED_FIELDS as u32 + 1));
         many.resize(5000, 0);
@@ -2520,17 +2510,10 @@ mod tests {
             }
         }
         assert_eq!(body_bytes(&req, 6), Err(Error::Unwritable));
-        assert_eq!(
-            ApiVersionsResponse::parse(&[], -1),
-            Err(Error::UnsupportedVersion {
-                api_key: 18,
-                api_version: -1
-            })
-        );
-        // A null array of keys.
-        assert_eq!(
-            ApiVersionsResponse::parse(&[0, 0, 0xff, 0xff, 0xff, 0xff], 0),
-            Err(Error::Null)
+        fictionet::assert_cases!(|(input_0, input_1)| ApiVersionsResponse::parse(input_0, input_1);
+            ((&[], -1)) => Err(Error::UnsupportedVersion { api_key: 18, api_version: -1 }),
+            // A null array of keys.
+            ((&[0, 0, 0xff, 0xff, 0xff, 0xff], 0)) => Err(Error::Null),
         );
         // A version 0 request with a body.
         assert_eq!(ApiVersionsRequest::parse(&[1], 0), Err(Error::Trailing(1)));

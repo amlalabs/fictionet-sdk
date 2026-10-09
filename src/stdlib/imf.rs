@@ -1907,48 +1907,23 @@ mod tests {
     #[test]
     fn encoded_words_from_the_rfc() {
         // RFC 2047, section 8.
-        assert_eq!(
-            one("=?US-ASCII?Q?Keith_Moore?= <moore@cs.utk.edu>")
-                .name
-                .as_deref(),
-            Some("Keith Moore")
+        fictionet::assert_cases!(|input| one(input).name.as_deref();
+            ascii: "=?US-ASCII?Q?Keith_Moore?= <moore@cs.utk.edu>" => Some("Keith Moore"),
+            latin1: "=?ISO-8859-1?Q?Keld_J=F8rn_Simonsen?= <keld@dkuug.dk>" => Some("Keld Jørn Simonsen"),
+            split_name: "=?ISO-8859-1?Q?Andr=E9?= Pirard <PIRARD@vm1.ulg.ac.be>" => Some("André Pirard"),
         );
-        assert_eq!(
-            one("=?ISO-8859-1?Q?Keld_J=F8rn_Simonsen?= <keld@dkuug.dk>")
-                .name
-                .as_deref(),
-            Some("Keld Jørn Simonsen")
-        );
-        assert_eq!(
-            one("=?ISO-8859-1?Q?Andr=E9?= Pirard <PIRARD@vm1.ulg.ac.be>")
-                .name
-                .as_deref(),
-            Some("André Pirard")
-        );
-        assert_eq!(
-            decode_text(
-                "=?ISO-8859-1?B?SWYgeW91IGNhbiByZWFkIHRoaXMgeW8=?= =?ISO-8859-1?B?dSB1bmRlcnN0YW5kIHRoZSBleGFtcGxlLg==?="
-            ),
-            "If you can read this you understand the example."
-        );
-        // ISO-8859-2 is not read, so that word stays as it is.
-        assert_eq!(
-            decode_text(
-                "=?ISO-8859-1?B?SWYgeW91IGNhbiByZWFkIHRoaXMgeW8=?= =?ISO-8859-2?B?dSB1bmRlcnN0YW5kIHRoZSBleGFtcGxlLg==?="
-            ),
-            "If you can read this yo =?ISO-8859-2?B?dSB1bmRlcnN0YW5kIHRoZSBleGFtcGxlLg==?="
-        );
-        assert_eq!(decode_text("=?ISO-8859-1?Q?a?="), "a");
-        assert_eq!(decode_text("=?ISO-8859-1?Q?a?= b"), "a b");
-        assert_eq!(decode_text("=?ISO-8859-1?Q?a?= =?ISO-8859-1?Q?b?="), "ab");
-        assert_eq!(
-            decode_text("=?ISO-8859-1?Q?a?=  \t =?ISO-8859-1?Q?b?="),
-            "ab"
-        );
-        assert_eq!(decode_text("=?ISO-8859-1?Q?a_b?="), "a b");
-        assert_eq!(
-            decode_text("=?ISO-8859-1?Q?a?= =?ISO-8859-2?Q?_b?="),
-            "a =?ISO-8859-2?Q?_b?="
+        fictionet::assert_cases!(decode_text;
+            ("=?ISO-8859-1?B?SWYgeW91IGNhbiByZWFkIHRoaXMgeW8=?= =?ISO-8859-1?B?dSB1bmRlcnN0YW5kIHRoZSBleGFtcGxlLg==?=") =>
+                "If you can read this you understand the example.",
+            // ISO-8859-2 is not read, so that word stays as it is.
+            ("=?ISO-8859-1?B?SWYgeW91IGNhbiByZWFkIHRoaXMgeW8=?= =?ISO-8859-2?B?dSB1bmRlcnN0YW5kIHRoZSBleGFtcGxlLg==?=") =>
+                "If you can read this yo =?ISO-8859-2?B?dSB1bmRlcnN0YW5kIHRoZSBleGFtcGxlLg==?=",
+            ("=?ISO-8859-1?Q?a?=") => "a",
+            ("=?ISO-8859-1?Q?a?= b") => "a b",
+            ("=?ISO-8859-1?Q?a?= =?ISO-8859-1?Q?b?=") => "ab",
+            ("=?ISO-8859-1?Q?a?=  \t =?ISO-8859-1?Q?b?=") => "ab",
+            ("=?ISO-8859-1?Q?a_b?=") => "a b",
+            ("=?ISO-8859-1?Q?a?= =?ISO-8859-2?Q?_b?=") => "a =?ISO-8859-2?Q?_b?=",
         );
         // A language suffix (RFC 2231) is ignored.
         assert_eq!(decode_word("=?utf-8*en?q?hi?="), Some("hi".into()));
@@ -2041,29 +2016,13 @@ mod tests {
         // A.6.2: obsolete two-digit years and zone names.
         let d = DateTime::parse("21 Nov 97 09:55:06 GMT".as_bytes()).unwrap();
         assert_eq!((d.weekday, d.year, d.zone), (None, 1997, Some(0)));
-        assert_eq!(
-            DateTime::parse("1 Jan 07 00:00 EDT".as_bytes())
-                .unwrap()
-                .year,
-            2007
+        fictionet::assert_cases!(|input| DateTime::parse(input).unwrap().year;
+            ("1 Jan 07 00:00 EDT".as_bytes()) => 2007,
+            ("1 jan 107 00:00 pst".as_bytes()) => 2007,
         );
-        assert_eq!(
-            DateTime::parse("1 jan 107 00:00 pst".as_bytes())
-                .unwrap()
-                .year,
-            2007
-        );
-        assert_eq!(
-            DateTime::parse("29 Feb 2000 00:00 Z".as_bytes())
-                .unwrap()
-                .zone,
-            None
-        );
-        assert_eq!(
-            DateTime::parse("fri , 31 Dec 9999 23:59:60 +9959".as_bytes())
-                .unwrap()
-                .zone,
-            Some(5999)
+        fictionet::assert_cases!(|input| DateTime::parse(input).unwrap().zone;
+            ("29 Feb 2000 00:00 Z".as_bytes()) => None,
+            ("fri , 31 Dec 9999 23:59:60 +9959".as_bytes()) => Some(5999),
         );
     }
 
@@ -2733,23 +2692,10 @@ mod tests {
             DateTime::parse("Mon, 21 Nov 1997 09:55:06 -0600".as_bytes()),
             Err(Error::Date)
         );
-        assert_eq!(
-            DateTime::parse("Sat, 1 Jan 2000 00:00 +0000".as_bytes())
-                .unwrap()
-                .weekday,
-            Some(5)
-        );
-        assert_eq!(
-            DateTime::parse("Fri, 31 Dec 9999 23:59 +0000".as_bytes())
-                .unwrap()
-                .weekday,
-            Some(4)
-        );
-        assert_eq!(
-            DateTime::parse("Mon, 1 Jan 1900 00:00 +0000".as_bytes())
-                .unwrap()
-                .weekday,
-            Some(0)
+        fictionet::assert_cases!(|input| DateTime::parse(input).unwrap().weekday;
+            ("Sat, 1 Jan 2000 00:00 +0000".as_bytes()) => Some(5),
+            ("Fri, 31 Dec 9999 23:59 +0000".as_bytes()) => Some(4),
+            ("Mon, 1 Jan 1900 00:00 +0000".as_bytes()) => Some(0),
         );
         let d = DateTime {
             weekday: Some(0),
@@ -3052,17 +2998,9 @@ mod tests {
     #[test]
     fn astra_long_years() {
         // RFC 5322 section 3.3: a year is four or more digits.
-        assert_eq!(
-            DateTime::parse("1 Jan 02024 00:00 +0000".as_bytes())
-                .unwrap()
-                .year,
-            2024
-        );
-        assert_eq!(
-            DateTime::parse("1 Jan 0000000002024 00:00 +0000".as_bytes())
-                .unwrap()
-                .year,
-            2024
+        fictionet::assert_cases!(|input| DateTime::parse(input).unwrap().year;
+            ("1 Jan 02024 00:00 +0000".as_bytes()) => 2024,
+            ("1 Jan 0000000002024 00:00 +0000".as_bytes()) => 2024,
         );
         assert_eq!(
             DateTime::parse("1 Jan 00097 00:00 +0000".as_bytes()),

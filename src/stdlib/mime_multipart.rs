@@ -2107,36 +2107,14 @@ Content-Type: text/plain
             Err(Error::Boundary)
         );
         assert!(with("A", "").clone().with_boundary("b").to_bytes().is_ok());
-        assert_eq!(
-            with("", "v").clone().with_boundary("b").to_bytes(),
-            Err(Error::HeaderName)
-        );
-        assert_eq!(
-            with("A B", "v").clone().with_boundary("b").to_bytes(),
-            Err(Error::HeaderName)
-        );
-        assert_eq!(
-            with("A:", "v").clone().with_boundary("b").to_bytes(),
-            Err(Error::HeaderName)
-        );
-        assert_eq!(
-            with("A", "v\r\nX: y").clone().with_boundary("b").to_bytes(),
-            Err(Error::HeaderValue)
-        );
-        assert_eq!(
-            with("A", " v").clone().with_boundary("b").to_bytes(),
-            Err(Error::HeaderValue)
-        );
-        assert_eq!(
-            with("A", "v\t").clone().with_boundary("b").to_bytes(),
-            Err(Error::HeaderValue)
-        );
-        assert_eq!(
-            with("A", &"v".repeat(MAX_HEADER_BYTES))
-                .clone()
-                .with_boundary("b")
-                .to_bytes(),
-            Err(Error::HeaderTooLong)
+        fictionet::assert_cases!(|(input_0, input_1)| with(input_0, input_1).with_boundary("b").to_bytes();
+            (("", "v")) => Err(Error::HeaderName),
+            (("A B", "v")) => Err(Error::HeaderName),
+            (("A:", "v")) => Err(Error::HeaderName),
+            (("A", "v\r\nX: y")) => Err(Error::HeaderValue),
+            (("A", " v")) => Err(Error::HeaderValue),
+            (("A", "v\t")) => Err(Error::HeaderValue),
+            (("A", &"v".repeat(MAX_HEADER_BYTES))) => Err(Error::HeaderTooLong),
         );
         let fits = with("A", &"v".repeat(MAX_HEADER_BYTES - 7));
         assert_eq!(
@@ -2354,17 +2332,10 @@ Content-Type: text/plain
     // Finding: comments and spaces in Content-Type hid the boundary.
     #[test]
     fn content_type_comments() {
-        assert_eq!(
-            boundary("multipart/mixed; boundary=b (comment)").as_deref(),
-            Some("b")
-        );
-        assert_eq!(
-            boundary("multipart / mixed; boundary=b").as_deref(),
-            Some("b")
-        );
-        assert_eq!(
-            boundary("(a (nested) \\) one) multipart/mixed (x); boundary=\"(q)\"").as_deref(),
-            Some("(q)")
+        fictionet::assert_cases!(|input| boundary(input).as_deref();
+            trailing_comment: "multipart/mixed; boundary=b (comment)" => Some("b"),
+            spaces: "multipart / mixed; boundary=b" => Some("b"),
+            nested_comments: "(a (nested) \\) one) multipart/mixed (x); boundary=\"(q)\"" => Some("(q)"),
         );
         assert_eq!(boundary("multipart/mixed; boundary=b (open"), None);
         assert_eq!(boundary("multi(x)part/mixed; boundary=b"), None);

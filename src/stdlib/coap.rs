@@ -2194,21 +2194,11 @@ mod tests {
     fn types_and_codes_go_together() {
         // RFC 7252 section 4.2: an ACK carries a response or is empty, and
         // a Reset is empty. Section 4.3: a NON is never empty.
-        assert_eq!(
-            Message::parse(&[0x60, 0x01, 0, 1]),
-            Err(Error::TypeAndCode(Type::Acknowledgement, Code::GET))
-        );
-        assert_eq!(
-            Message::parse(&[0x60, 0xe1, 0, 1]),
-            Err(Error::TypeAndCode(Type::Acknowledgement, Code::CSM))
-        );
-        assert_eq!(
-            Message::parse(&[0x70, 0x45, 0, 1]),
-            Err(Error::TypeAndCode(Type::Reset, Code::CONTENT))
-        );
-        assert_eq!(
-            Message::parse(&[0x50, 0x00, 0, 1]),
-            Err(Error::TypeAndCode(Type::NonConfirmable, Code::EMPTY))
+        fictionet::assert_cases!(Message::parse;
+            (&[0x60, 0x01, 0, 1]) => Err(Error::TypeAndCode(Type::Acknowledgement, Code::GET)),
+            (&[0x60, 0xe1, 0, 1]) => Err(Error::TypeAndCode(Type::Acknowledgement, Code::CSM)),
+            (&[0x70, 0x45, 0, 1]) => Err(Error::TypeAndCode(Type::Reset, Code::CONTENT)),
+            (&[0x50, 0x00, 0, 1]) => Err(Error::TypeAndCode(Type::NonConfirmable, Code::EMPTY)),
         );
         assert_eq!(
             peek_header(&[0x50, 0x00, 0, 1]),
@@ -2478,20 +2468,12 @@ mod tests {
                 Err(Error::AfterLastBlock)
             );
         }
-        assert_eq!(Block::take(&body, 1, 6), None);
-        assert_eq!(Block::take(&body, 0, 7), None);
-        assert_eq!(
-            Block::take(&[], 0, 2),
-            Some((
-                Block {
-                    num: 0,
-                    more: false,
-                    szx: 2
-                },
-                &[][..]
-            ))
+        fictionet::assert_cases!(|(input_0, input_1, input_2)| Block::take(input_0, input_1, input_2);
+            ((&body, 1, 6)) => None,
+            ((&body, 0, 7)) => None,
+            ((&[], 0, 2)) => Some(( Block { num: 0, more: false, szx: 2 }, &[][..] )),
+            ((&[0; 32], 2, 0)) => None,
         );
-        assert_eq!(Block::take(&[0; 32], 2, 0), None);
         assert!(!Block::take(&[0; 32], 1, 0).unwrap().0.more);
         assert_eq!(Block::take(&body, Block::MAX_NUM + 1, 0), None);
     }
@@ -2691,24 +2673,17 @@ mod tests {
 
     #[test]
     fn tcp_errors() {
-        assert_eq!(Frame::parse(&[0x09]), Err(Error::TokenLength(9)));
-        assert_eq!(Frame::parse(&[0xf0, 0, 0x10]), Err(Error::Truncated));
-        assert_eq!(
-            Frame::parse(&[0xf0, 0, 0x10, 0, 0]),
-            Err(Error::TooLong(65_805 + 0x10_0000))
+        fictionet::assert_cases!(Frame::parse;
+            (&[0x09]) => Err(Error::TokenLength(9)),
+            (&[0xf0, 0, 0x10]) => Err(Error::Truncated),
+            (&[0xf0, 0, 0x10, 0, 0]) => Err(Error::TooLong(65_805 + 0x10_0000)),
+            (&[0xf0, 0xff, 0xff, 0xff, 0xff]) => Err(Error::TooLong(65_805 + 0xffff_ffff)),
+            (&[0x10, 0x45, 0xff]) => Err(Error::EmptyPayload),
+            (&[0x10, 0x45, 0xf1]) => Err(Error::ReservedNibble),
+            (&[0x10, 0x45, 0x01]) => Err(Error::Truncated),
+            // An empty frame is allowed over TCP.
+            (&[0x00, 0x00]) => Ok(Frame::new(Code::EMPTY)),
         );
-        assert_eq!(
-            Frame::parse(&[0xf0, 0xff, 0xff, 0xff, 0xff]),
-            Err(Error::TooLong(65_805 + 0xffff_ffff))
-        );
-        assert_eq!(Frame::parse(&[0x10, 0x45, 0xff]), Err(Error::EmptyPayload));
-        assert_eq!(
-            Frame::parse(&[0x10, 0x45, 0xf1]),
-            Err(Error::ReservedNibble)
-        );
-        assert_eq!(Frame::parse(&[0x10, 0x45, 0x01]), Err(Error::Truncated));
-        // An empty frame is allowed over TCP.
-        assert_eq!(Frame::parse(&[0x00, 0x00]), Ok(Frame::new(Code::EMPTY)));
         let mut largest = Frame {
             code: Code::CONTENT,
             token: Vec::new(),

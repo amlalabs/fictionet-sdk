@@ -2449,22 +2449,12 @@ mod tests {
         for &(rest, line, kind) in bad {
             assert_eq!(err(&with(rest)), Error::Syntax { line, kind }, "{rest:?}");
         }
-        assert_eq!(err(b"v=1\r\n"), Error::Syntax { line: 1, kind: 'v' });
-        assert_eq!(
-            err(b"v=0\r\no=- 1 1 IN IP4\r\n"),
-            Error::Syntax { line: 2, kind: 'o' }
-        );
-        assert_eq!(
-            err(b"v=0\r\no=- 1 1 IN IP4 a b\r\n"),
-            Error::Syntax { line: 2, kind: 'o' }
-        );
-        assert_eq!(
-            err(b"v=0\r\no=- x 1 IN IP4 192.0.2.9\r\n"),
-            Error::Syntax { line: 2, kind: 'o' }
-        );
-        assert_eq!(
-            err(b"v=0\r\no=- 1 1 IN IP4 192.0.2.9\r\ns=\r\n"),
-            Error::Syntax { line: 3, kind: 's' }
+        fictionet::assert_cases!(err;
+            (b"v=1\r\n") => Error::Syntax { line: 1, kind: 'v' },
+            (b"v=0\r\no=- 1 1 IN IP4\r\n") => Error::Syntax { line: 2, kind: 'o' },
+            (b"v=0\r\no=- 1 1 IN IP4 a b\r\n") => Error::Syntax { line: 2, kind: 'o' },
+            (b"v=0\r\no=- x 1 IN IP4 192.0.2.9\r\n") => Error::Syntax { line: 2, kind: 'o' },
+            (b"v=0\r\no=- 1 1 IN IP4 192.0.2.9\r\ns=\r\n") => Error::Syntax { line: 3, kind: 's' },
         );
     }
 
@@ -2559,140 +2549,56 @@ mod tests {
         SessionDescription::parse(EVERY_LINE).unwrap()
     }
 
+    // Each row starts from EVERY_LINE; its mutation is the diagnostic name.
+    macro_rules! syntax_edits {
+        ($($line:literal, $kind:literal, |$d:ident| $edit:expr;)+) => {
+            $(
+                {
+                    let mut $d = sample();
+                    $edit;
+                    assert_eq!(
+                        $d.to_bytes(),
+                        Err(Error::Syntax { line: $line, kind: $kind }),
+                        "{}", stringify!($edit)
+                    );
+                }
+            )+
+        };
+    }
+
     #[test]
     fn writer_errors() {
-        let check = |d: &SessionDescription, want: Error| {
-            assert_eq!(d.to_bytes(), Err(want));
-        };
         let mut d = sample();
         d.times.clear();
-        check(&d, Error::Missing('t'));
+        assert_eq!(d.to_bytes(), Err(Error::Missing('t')));
         let mut d = sample();
         d.connection = None;
         d.media[1].connections.clear();
-        check(&d, Error::Missing('c'));
-        let mut d = sample();
-        d.origin.username = "a b".into();
-        check(&d, Error::Syntax { line: 2, kind: 'o' });
-        let mut d = sample();
-        d.origin.net_type = String::new();
-        check(&d, Error::Syntax { line: 2, kind: 'o' });
-        let mut d = sample();
-        d.name = String::new();
-        check(&d, Error::Syntax { line: 3, kind: 's' });
-        let mut d = sample();
-        d.information = Some("a\nb".into());
-        check(&d, Error::Syntax { line: 4, kind: 'i' });
-        let mut d = sample();
-        d.uri = Some("\r".into());
-        check(&d, Error::Syntax { line: 5, kind: 'u' });
-        let mut d = sample();
-        d.emails[1] = "\0".into();
-        check(&d, Error::Syntax { line: 7, kind: 'e' });
-        let mut d = sample();
-        d.phones[0] = String::new();
-        check(&d, Error::Syntax { line: 8, kind: 'p' });
-        let mut d = sample();
-        d.connection.as_mut().unwrap().address = "a b".into();
-        check(&d, Error::Syntax { line: 9, kind: 'c' });
-        let mut d = sample();
-        d.bandwidths[0].kind = "A:S".into();
-        check(
-            &d,
-            Error::Syntax {
-                line: 10,
-                kind: 'b',
-            },
-        );
-        let mut d = sample();
-        d.times[0].repeats[0].interval = 0;
-        check(
-            &d,
-            Error::Syntax {
-                line: 13,
-                kind: 'r',
-            },
-        );
-        let mut d = sample();
-        d.times[0].repeats[1].offsets.clear();
-        check(
-            &d,
-            Error::Syntax {
-                line: 14,
-                kind: 'r',
-            },
-        );
-        let mut d = sample();
-        d.attributes[1].name = "to ol".into();
-        check(
-            &d,
-            Error::Syntax {
-                line: 18,
-                kind: 'a',
-            },
-        );
-        let mut d = sample();
-        d.attributes[1].value = Some(String::new());
-        check(
-            &d,
-            Error::Syntax {
-                line: 18,
-                kind: 'a',
-            },
-        );
-        for f in [
-            |m: &mut Media| m.kind = String::new(),
-            |m: &mut Media| m.port_count = Some(0),
-            |m: &mut Media| m.proto = "RTP/".into(),
-            |m: &mut Media| m.formats.clear(),
-            |m: &mut Media| m.formats[0] = "0 1".into(),
-        ] {
-            let mut d = sample();
-            f(&mut d.media[0]);
-            check(
-                &d,
-                Error::Syntax {
-                    line: 19,
-                    kind: 'm',
-                },
-            );
+        assert_eq!(d.to_bytes(), Err(Error::Missing('c')));
+        syntax_edits! {
+            2, 'o', |d| d.origin.username = "a b".into();
+            2, 'o', |d| d.origin.net_type = String::new();
+            3, 's', |d| d.name = String::new();
+            4, 'i', |d| d.information = Some("a\nb".into());
+            5, 'u', |d| d.uri = Some("\r".into());
+            7, 'e', |d| d.emails[1] = "\0".into();
+            8, 'p', |d| d.phones[0] = String::new();
+            9, 'c', |d| d.connection.as_mut().unwrap().address = "a b".into();
+            10, 'b', |d| d.bandwidths[0].kind = "A:S".into();
+            13, 'r', |d| d.times[0].repeats[0].interval = 0;
+            14, 'r', |d| d.times[0].repeats[1].offsets.clear();
+            18, 'a', |d| d.attributes[1].name = "to ol".into();
+            18, 'a', |d| d.attributes[1].value = Some(String::new());
+            19, 'm', |d| d.media[0].kind = String::new();
+            19, 'm', |d| d.media[0].port_count = Some(0);
+            19, 'm', |d| d.media[0].proto = "RTP/".into();
+            19, 'm', |d| d.media[0].formats.clear();
+            19, 'm', |d| d.media[0].formats[0] = "0 1".into();
+            20, 'i', |d| d.media[0].information = Some(String::new());
+            22, 'c', |d| d.media[0].connections[1].addr_type = "I P4".into();
+            23, 'b', |d| d.media[0].bandwidths[0].kind = String::new();
+            24, 'a', |d| d.media[0].attributes[0].name = "rtp:map".into();
         }
-        let mut d = sample();
-        d.media[0].information = Some(String::new());
-        check(
-            &d,
-            Error::Syntax {
-                line: 20,
-                kind: 'i',
-            },
-        );
-        let mut d = sample();
-        d.media[0].connections[1].addr_type = "I P4".into();
-        check(
-            &d,
-            Error::Syntax {
-                line: 22,
-                kind: 'c',
-            },
-        );
-        let mut d = sample();
-        d.media[0].bandwidths[0].kind = String::new();
-        check(
-            &d,
-            Error::Syntax {
-                line: 23,
-                kind: 'b',
-            },
-        );
-        let mut d = sample();
-        d.media[0].attributes[0].name = "rtp:map".into();
-        check(
-            &d,
-            Error::Syntax {
-                line: 24,
-                kind: 'a',
-            },
-        );
     }
 
     #[test]
@@ -2859,22 +2765,17 @@ mod tests {
                 "{bad}"
             );
         }
-        assert_eq!(
-            Fmtp {
-                format: "97".into(),
-                params: String::new()
-            }
-            .to_attribute(),
-            Err(Error::Attribute)
-        );
-        assert_eq!(
-            Fmtp {
-                format: "9 7".into(),
-                params: "x".into()
-            }
-            .to_attribute(),
-            Err(Error::Attribute)
-        );
+        for (format, params) in [("97", ""), ("9 7", "x")] {
+            let value = Fmtp {
+                format: format.into(),
+                params: params.into(),
+            };
+            assert_eq!(
+                value.to_attribute(),
+                Err(Error::Attribute),
+                "{format:?}/{params:?}"
+            );
+        }
     }
 
     #[test]
@@ -3521,21 +3422,11 @@ mod tests {
             );
         }
         // The writer refuses the same.
-        let mut d = sample();
-        d.connection.as_mut().unwrap().address = "224.2.17.12/127/2".into();
-        assert_eq!(d.to_bytes(), Err(Error::Syntax { line: 9, kind: 'c' }));
-        let mut d = sample();
-        d.origin.addr_type = "IP4".into();
-        assert_eq!(d.to_bytes(), Err(Error::Syntax { line: 2, kind: 'o' }));
-        let mut d = sample();
-        d.media[0].connections[1].address = "192.0.2.8".into();
-        assert_eq!(
-            d.to_bytes(),
-            Err(Error::Syntax {
-                line: 22,
-                kind: 'c'
-            })
-        );
+        syntax_edits! {
+            9, 'c', |d| d.connection.as_mut().unwrap().address = "224.2.17.12/127/2".into();
+            2, 'o', |d| d.origin.addr_type = "IP4".into();
+            22, 'c', |d| d.media[0].connections[1].address = "192.0.2.8".into();
+        }
     }
 
     #[test]
@@ -3717,15 +3608,9 @@ mod tests {
                 "{m}"
             );
         }
-        let mut d = sample();
-        d.media[0].formats.push("banana".into());
-        assert_eq!(
-            d.to_bytes(),
-            Err(Error::Syntax {
-                line: 19,
-                kind: 'm'
-            })
-        );
+        syntax_edits! {
+            19, 'm', |d| d.media[0].formats.push("banana".into());
+        }
     }
 
     #[test]
@@ -3770,24 +3655,10 @@ mod tests {
             SessionDescription::parse(&with("t=1000000000 0\r\nr=1 1 0\r\nz=1000000000 0\r\n"))
                 .is_ok()
         );
-        let mut d = sample();
-        d.times[1].start = 1;
-        assert_eq!(
-            d.to_bytes(),
-            Err(Error::Syntax {
-                line: 16,
-                kind: 't'
-            })
-        );
-        let mut d = sample();
-        d.times[0].zones[0].time = MIN_TIME - 1;
-        assert_eq!(
-            d.to_bytes(),
-            Err(Error::Syntax {
-                line: 15,
-                kind: 'z'
-            })
-        );
+        syntax_edits! {
+            16, 't', |d| d.times[1].start = 1;
+            15, 'z', |d| d.times[0].zones[0].time = MIN_TIME - 1;
+        }
     }
 
     #[test]
@@ -3837,14 +3708,10 @@ mod tests {
                 "{l}"
             );
         }
-        let mut d = sample();
-        d.uri = Some("not a uri".into());
-        assert_eq!(d.to_bytes(), Err(Error::Syntax { line: 5, kind: 'u' }));
-        let mut d = sample();
-        d.emails[0] = "not-an-email".into();
-        assert_eq!(d.to_bytes(), Err(Error::Syntax { line: 6, kind: 'e' }));
-        let mut d = sample();
-        d.phones[0] = "abc".into();
-        assert_eq!(d.to_bytes(), Err(Error::Syntax { line: 8, kind: 'p' }));
+        syntax_edits! {
+            5, 'u', |d| d.uri = Some("not a uri".into());
+            6, 'e', |d| d.emails[0] = "not-an-email".into();
+            8, 'p', |d| d.phones[0] = "abc".into();
+        }
     }
 }
