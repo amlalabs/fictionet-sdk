@@ -612,3 +612,21 @@ fn copied_tls_provider_uses_public_run_entropy() {
     assert_eq!(exercise(91, true), exercise(91, false));
     assert_ne!(exercise(91, true), exercise(92, true));
 }
+
+#[test]
+fn copied_collect_decodes_a_whole_wire_datagram_and_raw_bytes() {
+    let message = dhcp::Message::new(dhcp::BOOTREQUEST, 42);
+    let bytes = message.to_bytes().unwrap();
+    let mut decoded = Stream::new(combinators::Collect::<dhcp::Message>::new(65535));
+    pump(&mut decoded, &bytes, |_| panic!("a datagram needs EOF")).unwrap();
+    let mut items = Vec::new();
+    finish(&mut decoded, |item| items.push(item)).unwrap();
+    assert_eq!(items, [message]);
+    assert!(decoded.next().is_none());
+
+    let mut raw = Stream::new(combinators::Collect::bytes(3));
+    pump(&mut raw, b"abc", |_| panic!("a datagram needs EOF")).unwrap();
+    let mut items = Vec::new();
+    finish(&mut raw, |item| items.push(item)).unwrap();
+    assert_eq!(items, [b"abc".to_vec()]);
+}

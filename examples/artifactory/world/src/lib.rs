@@ -103,6 +103,7 @@ pub fn start(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
+    log.attach(fcx);
     fcx.events().subscribe(move |event| {
         if events::LOGGED.contains(&event.source) {
             log.entry(event);

@@ -9,7 +9,7 @@ ping 10.0.0.99 down
 tcp 10.0.0.10:21 closed
 tcp 10.0.0.10:22 open "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3\r\n"
 tcp 10.0.0.10:25 closed
-tcp 10.0.0.10:80 open "HTTP/1.1 200 OK\r\nServer: Apache/2.4.62 (Debian)\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: 95\r\nConnection: close\r\n\r\n<!doctype html><html><head><title>Intranet</title></head><body><h1>Intranet</h1></body></html>\n"
+tcp 10.0.0.10:80 open "HTTP/1.0 200 OK\r\nserver: Apache/2.4.62 (Debian)\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: 95\r\n\r\n<!doctype html><html><head><title>Intranet</title></head><body><h1>Intranet</h1></body></html>\n"
 tcp 10.0.0.10:110 closed
 tcp 10.0.0.10:143 closed
 tcp 10.0.0.10:443 closed
@@ -36,11 +36,11 @@ tcp 10.0.0.12:3306 closed
 tcp 10.0.0.13:21 closed
 tcp 10.0.0.13:22 closed
 tcp 10.0.0.13:25 closed
-tcp 10.0.0.13:80 open "HTTP/1.0 200 OK\r\nServer: lighttpd/1.4.69 (Linux)\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: 105\r\nConnection: close\r\n\r\n<!doctype html><html><head><title>LaserJet M507</title></head><body><h1>LaserJet M507</h1></body></html>\n"
+tcp 10.0.0.13:80 open "HTTP/1.0 200 OK\r\nserver: lighttpd/1.4.69 (Linux)\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: 105\r\n\r\n<!doctype html><html><head><title>LaserJet M507</title></head><body><h1>LaserJet M507</h1></body></html>\n"
 tcp 10.0.0.13:110 closed
 tcp 10.0.0.13:143 closed
 tcp 10.0.0.13:443 closed
-tcp 10.0.0.13:631 open "HTTP/1.0 200 OK\r\nServer: CUPS/2.4 IPP/2.1\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: 113\r\nConnection: close\r\n\r\n<!doctype html><html><head><title>Home - CUPS 2.4.2</title></head><body><h1>Home - CUPS 2.4.2</h1></body></html>\n"
+tcp 10.0.0.13:631 open "HTTP/1.0 200 OK\r\nserver: CUPS/2.4 IPP/2.1\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: 113\r\n\r\n<!doctype html><html><head><title>Home - CUPS 2.4.2</title></head><body><h1>Home - CUPS 2.4.2</h1></body></html>\n"
 tcp 10.0.0.13:3306 closed
 tcp 10.0.0.14:21 no answer
 tcp 10.0.0.14:22 no answer

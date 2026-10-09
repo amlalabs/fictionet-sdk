@@ -41,6 +41,7 @@ COPY codegen codegen
 COPY tests/copy_and_own tests/copy_and_own
 COPY examples/*.rs examples/
 COPY examples/artifactory/world/Cargo.toml examples/artifactory/world/Cargo.lock examples/artifactory/world/
+COPY examples/common examples/common
 COPY examples/artifactory/world/src examples/artifactory/world/src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/examples/artifactory/world/target,id=fictionet-artifactory-world-target \

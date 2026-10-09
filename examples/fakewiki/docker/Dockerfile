@@ -45,6 +45,7 @@ COPY codegen codegen
 COPY tests/copy_and_own tests/copy_and_own
 COPY examples/*.rs examples/
 COPY examples/fakewiki/world/Cargo.toml examples/fakewiki/world/Cargo.lock examples/fakewiki/world/
+COPY examples/common examples/common
 COPY examples/fakewiki/world/src examples/fakewiki/world/src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/examples/fakewiki/world/target,id=fictionet-fakewiki-world-target \

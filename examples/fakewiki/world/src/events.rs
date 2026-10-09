@@ -47,6 +47,7 @@ impl Page {
 
 /// Writes the request log from `fcx`'s run's events.
 pub fn log_to(fcx: &Cx, hosts: HashMap<String, Ipv4Addr>, log: Arc<Log>) {
+    log.attach(fcx);
     fcx.events().subscribe(move |event| {
         if let Some(line) = line(&hosts, event) {
             log.write(line);

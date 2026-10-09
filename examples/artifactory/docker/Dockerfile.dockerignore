@@ -12,3 +12,4 @@
 !examples/artifactory/world/Cargo.lock
 !examples/artifactory/world/src
 !examples/artifactory/docker/agent
+!examples/common

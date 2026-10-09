@@ -42,6 +42,10 @@ impl<D: Decode, U, F: FnMut(D::Item) -> U> Decode for Map<D, F> {
 /// Collects one complete [`Wire`] value at EOF, including empty values.
 /// [`Collect::bytes`] yields the raw bytes without parsing.
 /// Input stays in the driver's buffer.
+///
+/// With [`serve::datagram`](fictionet::stdlib::serve::datagram), each datagram
+/// gets a fresh collector and EOF, so `Collect<T>` yields one `T: Wire` per
+/// datagram. A parse error rejects that datagram without ending the socket.
 pub struct Collect<M, const RAW: bool = false> {
     limit: usize,
     taken: bool,

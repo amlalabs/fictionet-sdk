@@ -122,7 +122,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use fictionet::events::{ConnInfo, Event, Fields, Level, Sandbox, opt as jopt};
-use fictionet::stdlib::codec::{Decode, Wire};
+use fictionet::stdlib::codec::{Collect, CollectError, Decode, Step, Wire};
 use fictionet::stdlib::dhcp::{self, opt};
 use fictionet::stdlib::dns::op::{Edns, Message, MessageType, OpCode, ResponseCode};
 use fictionet::stdlib::dns::rr::{DNSClass, RData, Record, RecordType, rdata::A, rdata::AAAA};
@@ -131,7 +131,7 @@ use fictionet::stdlib::route::{self, Prefix, Router};
 use fictionet::stdlib::serve::{self, Budget, Counted, ServeOptions, Service, TlsSelect};
 use fictionet::stdlib::tls::ServerConfig;
 use fictionet::stdlib::{
-    ConnError, Connection, ConnectionExt, icmp, ip,
+    ConnError, Connection, icmp, ip,
     ports::{self, Ports},
     tcp, udp,
 };
@@ -2166,26 +2166,103 @@ fn answer(shared: &Arc<Shared>, bytes: &[u8]) -> Answered {
     }
 }
 
-/// DNS over UDP on the gateway's port 53.
-async fn dns_udp(fcx: Cx, mut socket: udp::Socket, shared: Arc<Shared>) -> fictionet::Result {
-    let mut run = 0;
-    let hooks = shared.hooks.clone();
-    while let Ok((query, from)) = socket.recv(&fcx).await {
-        let answered = answer(&shared, &query);
-        let info = ConnInfo {
-            sandbox: Some(hooks.sandbox_at(from.ip())),
-            peer: Some(from),
-            ..ConnInfo::default()
-        };
-        hooks.record(&fcx, &info, answered.event(false));
-        if let Some(reply) = answered.reply {
-            socket.send_to(&reply, from);
+/// Framing for a DNS query over UDP or TCP.
+struct DnsQueries {
+    tcp: bool,
+    datagram: Collect<Vec<u8>, true>,
+}
+
+impl Decode for DnsQueries {
+    type Item = Vec<u8>;
+    type Error = CollectError<core::convert::Infallible>;
+    const NAME: &'static str = "DNS query";
+
+    fn capacity(&self) -> usize {
+        65537
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Vec<u8>>, Self::Error> {
+        if !self.tcp {
+            return self.datagram.decode(input, eof);
         }
-        run = (run + 1) % 64;
-        if run == 0 && fcx.yield_now().await.is_err() {
-            break;
+        let Some(prefix) = input.get(..2) else {
+            return Ok(Step::Need);
+        };
+        let end = 2 + usize::from(u16::from_be_bytes([prefix[0], prefix[1]]));
+        Ok(match input.get(2..end) {
+            Some(query) => Step::Item(query.to_vec(), end),
+            None => Step::Need,
+        })
+    }
+}
+
+struct Dns {
+    tcp: bool,
+}
+
+impl Service for Dns {
+    type Decoder = DnsQueries;
+    type State = Arc<Shared>;
+    type Error = core::convert::Infallible;
+
+    fn decoder(&self) -> DnsQueries {
+        DnsQueries {
+            tcp: self.tcp,
+            datagram: Collect::bytes(65535),
         }
     }
+
+    fn on_open(
+        &mut self,
+        shared: &Arc<Shared>,
+        driver: &mut serve::Driver<'_, DnsQueries>,
+    ) -> Result<serve::Flow, Self::Error> {
+        if self.tcp {
+            driver.set_timer("query", shared.limits.dns_tcp_idle);
+        }
+        Ok(serve::Flow::Continue)
+    }
+
+    fn on_item(
+        &mut self,
+        query: Vec<u8>,
+        shared: &Arc<Shared>,
+        driver: &mut serve::Driver<'_, DnsQueries>,
+    ) -> Result<serve::Flow, Self::Error> {
+        let answered = answer(shared, &query);
+        driver.record(answered.event(self.tcp));
+        if let Some(reply) = answered.reply {
+            if self.tcp {
+                if let Ok(n) = u16::try_from(reply.len()) {
+                    driver.reply().extend_from_slice(&n.to_be_bytes());
+                    driver.reply().extend_from_slice(&reply);
+                }
+            } else {
+                driver.reply().extend_from_slice(&reply);
+            }
+        }
+        self.on_open(shared, driver)
+    }
+
+    fn on_timer(
+        &mut self,
+        _: serve::Timer,
+        _: &Arc<Shared>,
+        _: &mut serve::Driver<'_, DnsQueries>,
+    ) -> Result<serve::Flow, Self::Error> {
+        Ok(serve::Flow::Close)
+    }
+}
+
+/// DNS over UDP on the gateway's port 53.
+async fn dns_udp(fcx: Cx, socket: udp::Socket, shared: Arc<Shared>) -> fictionet::Result {
+    let local = socket.local_addr();
+    let hooks = shared.hooks.clone();
+    let opts = ServeOptions {
+        sandbox: Some(Arc::new(move |addr| Some(hooks.sandbox_at(addr)))),
+        ..ServeOptions::default()
+    };
+    let _ = serve::datagram(&fcx, socket, local, &mut Dns { tcp: false }, &shared, &opts).await;
     Ok(())
 }
 
@@ -2215,63 +2292,18 @@ async fn dns_tcp(fcx: Cx, mut listener: tcp::Listener, shared: Arc<Shared>) -> f
 
 async fn dns_conn(
     fcx: &Cx,
-    mut conn: tcp::TcpConnection,
+    conn: tcp::TcpConnection,
     shared: &Arc<Shared>,
 ) -> Result<(), ConnError> {
-    let hooks = shared.hooks.clone();
     let info = ConnInfo {
-        sandbox: Some(hooks.sandbox_at(conn.peer_addr().ip())),
+        sandbox: Some(shared.hooks.sandbox_at(conn.peer_addr().ip())),
         peer: Some(conn.peer_addr()),
         local: Some(conn.local_addr()),
         ..ConnInfo::default()
     };
-    loop {
-        let read = async {
-            let mut len = [0u8; 2];
-            if !read_exact(fcx, &mut conn, &mut len).await? {
-                return Ok::<_, ConnError>(None);
-            }
-            let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
-            if !read_exact(fcx, &mut conn, &mut query).await? {
-                return Ok(None);
-            }
-            Ok(Some(query))
-        };
-        let Ok(read) = fcx
-            .race(Some(fcx.now() + shared.limits.dns_tcp_idle), read)
-            .await
-        else {
-            return Ok(());
-        };
-        let Some(query) = read? else { return Ok(()) };
-        let answered = answer(shared, &query);
-        hooks.record(fcx, &info, answered.event(true));
-        let Some(reply) = answered.reply else {
-            continue;
-        };
-        let Ok(n) = u16::try_from(reply.len()) else {
-            continue;
-        };
-        let mut framed = n.to_be_bytes().to_vec();
-        framed.extend_from_slice(&reply);
-        conn.write_all(fcx, &framed).await?;
-    }
-}
-
-async fn read_exact<C: Connection>(
-    fcx: &Cx,
-    conn: &mut C,
-    buf: &mut [u8],
-) -> Result<bool, ConnError> {
-    let mut at = 0;
-    while at < buf.len() {
-        let n = conn.read(fcx, &mut buf[at..]).await?;
-        if n == 0 {
-            return Ok(false);
-        }
-        at += n;
-    }
-    Ok(true)
+    let opts = ServeOptions::default().idle(None).connection_events(false);
+    let _ = serve::connection(fcx, conn, info, &mut Dns { tcp: true }, shared, &opts).await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

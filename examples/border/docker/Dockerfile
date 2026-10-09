@@ -45,6 +45,7 @@ COPY codegen codegen
 COPY tests/copy_and_own tests/copy_and_own
 COPY examples/*.rs examples/
 COPY examples/border/world/Cargo.toml examples/border/world/Cargo.lock examples/border/world/
+COPY examples/common examples/common
 COPY examples/border/world/src examples/border/world/src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/examples/border/world/target,id=fictionet-border-world-target \

@@ -20,6 +20,7 @@ use crate::log::Log;
 
 /// Writes the request log from `fcx`'s run's events.
 pub fn log_to(fcx: &Cx, log: Arc<Log>) {
+    log.attach(fcx);
     fcx.events().subscribe(move |event| {
         if let Some(line) = line(event) {
             log.write(line);

@@ -23,6 +23,7 @@ COPY codegen codegen
 COPY tests/copy_and_own tests/copy_and_own
 COPY examples/*.rs examples/
 COPY examples/adaptive-web/world/Cargo.toml examples/adaptive-web/world/Cargo.lock examples/adaptive-web/world/
+COPY examples/common examples/common
 COPY examples/adaptive-web/world/src examples/adaptive-web/world/src
 # At most 8 jobs, so the build fits next to other work on the machine.
 ARG CARGO_BUILD_JOBS=8

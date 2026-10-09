@@ -109,11 +109,11 @@ pub fn start(
     for name in BANK_NAMES.into_iter().chain([STATUS_HOST]) {
         net = net.add_host(site_for(name).unwrap().into_host(name));
     }
+    log.attach(fcx);
     let hook = log.clone();
     let (inner, inner_attachments) = fictionet::attachments();
     // The events of everything the network does: the ones the log keeps
-    // become log lines ([`events::line`]). Only those sources go to the log's
-    // thread, so a flood of other events cannot crowd them out of its queue.
+    // become log lines ([`events::line`]).
     fcx.events().subscribe(move |event| {
         if events::LOGGED.contains(&event.source) {
             hook.entry(event);

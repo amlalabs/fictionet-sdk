@@ -12,3 +12,4 @@
 !examples/border/world/Cargo.lock
 !examples/border/world/src
 !examples/border/docker/bird.conf
+!examples/common

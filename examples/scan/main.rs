@@ -27,10 +27,11 @@ use std::convert::Infallible;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use fictionet::stdlib::codec::{Decode, Step};
+use fictionet::stdlib::codec::{Collect, Wire};
 use fictionet::stdlib::net::{Host, Net};
 use fictionet::stdlib::route::Prefix;
 use fictionet::stdlib::serve::{Driver, Flow, Service};
+use fictionet::stdlib::{ftp, httpd, imap, pop3, smtp, ssh};
 use fictionet::time::{Duration, ms};
 use fictionet::{Attachments, Cx, Result};
 
@@ -38,12 +39,13 @@ use fictionet::{Attachments, Cx, Result};
 #[derive(Clone, Copy)]
 enum Kind {
     /// Sends this line when a client connects, then waits for it to leave.
-    Banner(&'static str),
-    /// Answers every HTTP request with a small page. `status` is the start
-    /// of the response, such as `HTTP/1.1 200 OK`, and `server` the server
-    /// it names.
+    Ssh,
+    Smtp,
+    Pop3,
+    Imap,
+    Ftp,
+    /// Answers each HTTP request with a page and a server name.
     Http {
-        status: &'static str,
         server: &'static str,
         title: &'static str,
     },
@@ -56,7 +58,7 @@ struct Machine {
     ports: &'static [(u16, Kind)],
 }
 
-const OPENSSH: Kind = Kind::Banner("SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3\r\n");
+const OPENSSH: Kind = Kind::Ssh;
 
 const MACHINES: &[Machine] = &[
     Machine {
@@ -67,7 +69,6 @@ const MACHINES: &[Machine] = &[
             (
                 80,
                 Kind::Http {
-                    status: "HTTP/1.1 200 OK",
                     server: "Apache/2.4.62 (Debian)",
                     title: "Intranet",
                 },
@@ -77,24 +78,12 @@ const MACHINES: &[Machine] = &[
     Machine {
         name: "mail",
         host: 11,
-        ports: &[
-            (
-                25,
-                Kind::Banner("220 mail.corp.test ESMTP Postfix (Debian/GNU)\r\n"),
-            ),
-            (110, Kind::Banner("+OK Dovecot ready.\r\n")),
-            (
-                143,
-                Kind::Banner(
-                    "* OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ STARTTLS AUTH=PLAIN] Dovecot ready.\r\n",
-                ),
-            ),
-        ],
+        ports: &[(25, Kind::Smtp), (110, Kind::Pop3), (143, Kind::Imap)],
     },
     Machine {
         name: "files",
         host: 12,
-        ports: &[(21, Kind::Banner("220 (vsFTPd 3.0.3)\r\n")), (22, OPENSSH)],
+        ports: &[(21, Kind::Ftp), (22, OPENSSH)],
     },
     Machine {
         name: "printer",
@@ -103,7 +92,6 @@ const MACHINES: &[Machine] = &[
             (
                 80,
                 Kind::Http {
-                    status: "HTTP/1.0 200 OK",
                     server: "lighttpd/1.4.69 (Linux)",
                     title: "LaserJet M507",
                 },
@@ -111,7 +99,6 @@ const MACHINES: &[Machine] = &[
             (
                 631,
                 Kind::Http {
-                    status: "HTTP/1.0 200 OK",
                     server: "CUPS/2.4 IPP/2.1",
                     title: "Home - CUPS 2.4.2",
                 },
@@ -150,7 +137,13 @@ async fn world(fcx: Cx, attachments: Attachments) -> Result {
     for m in MACHINES {
         let mut host = Host::new(m.name).at(Ipv4Addr::new(SUBNET[0], SUBNET[1], SUBNET[2], m.host));
         for &(port, kind) in m.ports {
-            host = host.tcp(port, Arc::new(()), move || Port { kind, request: 0 });
+            host = match kind {
+                Kind::Http { server, title } => host.tcp(port, Arc::new(()), move || {
+                    httpd::Http1::new(Page { server, title })
+                }),
+                Kind::Ssh => host.tcp(port, Arc::new(()), || Ssh),
+                _ => host.tcp(port, Arc::new(()), move || Banner(kind)),
+            };
         }
         net = net.add_host(host);
     }
@@ -176,58 +169,37 @@ async fn world(fcx: Cx, attachments: Attachments) -> Result {
     Ok(())
 }
 
-/// One open port: a banner, or a page for each request.
-struct Port {
-    kind: Kind,
-    /// Bytes of the request so far, for an HTTP port.
-    request: usize,
+struct Page {
+    server: &'static str,
+    title: &'static str,
 }
 
-/// The most of a request a page port reads before it answers anyway.
-const REQUEST_LIMIT: usize = 16 << 10;
-
-/// Reads a request up to the end of its head, or [`REQUEST_LIMIT`] bytes,
-/// whichever comes first; and for a banner port, takes and ignores
-/// everything.
-struct Head {
-    ignore: bool,
-}
-
-impl Decode for Head {
-    type Item = ();
-    type Error = Infallible;
-    const NAME: &'static str = "scan request";
-
-    fn capacity(&self) -> usize {
-        REQUEST_LIMIT + 4
-    }
-
-    fn decode(&mut self, input: &[u8], _eof: bool) -> std::result::Result<Step<()>, Infallible> {
-        if input.is_empty() {
-            return Ok(Step::Need);
-        }
-        if self.ignore {
-            return Ok(Step::Skip(input.len()));
-        }
-        if let Some(at) = input.windows(4).position(|w| w == b"\r\n\r\n") {
-            return Ok(Step::Item((), at + 4));
-        }
-        if input.len() > REQUEST_LIMIT {
-            return Ok(Step::Item((), input.len()));
-        }
-        Ok(Step::Need)
+impl httpd::Handler for Page {
+    fn call(&self, _: http::Request<httpd::Body>, _: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        let title = self.title;
+        let body = format!(
+            "<!doctype html><html><head><title>{title}</title></head><body><h1>{title}</h1></body></html>\n"
+        );
+        httpd::Reply::Now(
+            http::Response::builder()
+                .header("server", self.server)
+                .header("content-type", "text/html; charset=utf-8")
+                .header("connection", "close")
+                .body(httpd::Body::from(body))
+                .expect("valid page headers"),
+        )
     }
 }
 
-impl Service for Port {
-    type Decoder = Head;
+struct Banner(Kind);
+
+impl Service for Banner {
+    type Decoder = Collect<Vec<u8>, true>;
     type State = ();
     type Error = Infallible;
 
-    fn decoder(&self) -> Head {
-        Head {
-            ignore: matches!(self.kind, Kind::Banner(_)),
-        }
+    fn decoder(&self) -> Self::Decoder {
+        Collect::bytes(16 << 10)
     }
 
     fn on_open(
@@ -235,37 +207,92 @@ impl Service for Port {
         _: &(),
         driver: &mut Driver<'_, Self::Decoder>,
     ) -> std::result::Result<Flow, Infallible> {
-        if let Kind::Banner(line) = self.kind {
-            driver.reply().extend_from_slice(line.as_bytes());
+        let out = driver.reply();
+        match self.0 {
+            Kind::Smtp => smtp::Reply::new(220, "mail.corp.test ESMTP Postfix (Debian/GNU)").write(out).expect("valid SMTP greeting"),
+            Kind::Pop3 => pop3::Reply::ok("Dovecot ready.").write(out).expect("valid POP3 greeting"),
+            Kind::Imap => imap::Response::Status {
+                tag: None, status: imap::Status::Ok,
+                code: Some("CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ STARTTLS AUTH=PLAIN".into()),
+                text: "Dovecot ready.".into(),
+            }.write(out).expect("valid IMAP greeting"),
+            Kind::Ftp => ftp::Reply::new(ftp::ReplyCode::new(220).unwrap(), "(vsFTPd 3.0.3)").write(out).expect("valid FTP greeting"),
+            _ => unreachable!("a mail or FTP banner"),
         }
         Ok(Flow::Continue)
     }
 
     fn on_item(
         &mut self,
-        _: (),
+        _: Vec<u8>,
+        _: &(),
+        _: &mut Driver<'_, Self::Decoder>,
+    ) -> std::result::Result<Flow, Infallible> {
+        Ok(Flow::Close)
+    }
+}
+
+struct Ssh;
+
+impl Service for Ssh {
+    type Decoder = ssh::Events;
+    type State = ();
+    type Error = ssh::Error;
+
+    fn decoder(&self) -> Self::Decoder {
+        ssh::Events::new()
+    }
+
+    fn on_open(
+        &mut self,
         _: &(),
         driver: &mut Driver<'_, Self::Decoder>,
-    ) -> std::result::Result<Flow, Infallible> {
-        let Kind::Http {
-            status,
-            server,
-            title,
-        } = self.kind
-        else {
-            return Ok(Flow::Continue);
-        };
-        self.request += 1;
-        let body = format!(
-            "<!doctype html><html><head><title>{title}</title></head><body><h1>{title}</h1></body></html>\n"
-        );
-        let head = format!(
-            "{status}\r\nServer: {server}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        driver.reply().extend_from_slice(head.as_bytes());
-        driver.reply().extend_from_slice(body.as_bytes());
-        Ok(Flow::Close)
+    ) -> std::result::Result<Flow, ssh::Error> {
+        ssh::Identification::new("2.0", "OpenSSH_9.2p1", Some("Debian-2+deb12u3"))?
+            .write(driver.reply())?;
+        Ok(Flow::Continue)
+    }
+
+    fn on_item(
+        &mut self,
+        item: ssh::Event,
+        _: &(),
+        driver: &mut Driver<'_, Self::Decoder>,
+    ) -> std::result::Result<Flow, ssh::Error> {
+        match item {
+            ssh::Event::Version(_) => {
+                let mut cookie = [0; 16];
+                cookie[..8].copy_from_slice(&driver.random_u64().to_be_bytes());
+                cookie[8..].copy_from_slice(&driver.random_u64().to_be_bytes());
+                let kex = ssh::Message::KexInit(ssh::KexInit {
+                    cookie,
+                    kex_algorithms: vec!["curve25519-sha256".into()],
+                    server_host_key_algorithms: vec!["ssh-ed25519".into()],
+                    encryption_client_to_server: vec!["aes128-ctr".into()],
+                    encryption_server_to_client: vec!["aes128-ctr".into()],
+                    mac_client_to_server: vec!["hmac-sha2-256".into()],
+                    mac_server_to_client: vec!["hmac-sha2-256".into()],
+                    compression_client_to_server: vec!["none".into()],
+                    compression_server_to_client: vec!["none".into()],
+                    languages_client_to_server: vec![],
+                    languages_server_to_client: vec![],
+                    first_kex_packet_follows: false,
+                    reserved: 0,
+                });
+                ssh::Packet::from_message(&kex)?.write(driver.reply())?;
+            }
+            ssh::Event::Packet { .. } => {
+                ssh::Packet::from_message(&ssh::Message::Disconnect {
+                    reason: ssh::DisconnectReason::KeyExchangeFailed,
+                    description: "Key exchange is unavailable".into(),
+                    language: String::new(),
+                })?
+                .write(driver.reply())?;
+                return Ok(Flow::Close);
+            }
+            _ => {}
+        }
+        Ok(Flow::Continue)
     }
 }
 
@@ -407,6 +434,37 @@ mod tests {
             }
         }
         lines
+    }
+
+    #[test]
+    fn ssh_identification_is_followed_by_kexinit_and_disconnect() {
+        use fictionet::stdlib::{codec::Wire, serve::Harness, ssh};
+        let mut h = Harness::new(fictionet::Seed::from_u64(42), super::Ssh, ());
+        assert_eq!(
+            h.open().unwrap(),
+            b"SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3\r\n"
+        );
+        let reply = h.push(b"SSH-2.0-test_client\r\n").unwrap();
+        let packet = ssh::Packet::parse(&reply).unwrap();
+        let ssh::Message::KexInit(kex) = ssh::Message::parse(&packet.payload).unwrap() else {
+            panic!("expected KEXINIT");
+        };
+        assert_eq!(kex.kex_algorithms, ["curve25519-sha256"]);
+        assert_ne!(kex.cookie, [0; 16]);
+        let client = ssh::Packet::from_message(&ssh::Message::KexInit(kex))
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let reply = h.push(&client).unwrap();
+        let packet = ssh::Packet::parse(&reply).unwrap();
+        assert!(matches!(
+            ssh::Message::parse(&packet.payload).unwrap(),
+            ssh::Message::Disconnect {
+                reason: ssh::DisconnectReason::KeyExchangeFailed,
+                ..
+            }
+        ));
+        assert!(h.push(&client).is_err());
     }
 
     #[test]

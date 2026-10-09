@@ -1,9 +1,9 @@
 //! The world's JSON-lines log at `/var/lib/fictionet/log.jsonl`.
 //!
-//! Network and handler events enter a bounded channel without waiting on the
-//! world's thread. A writer thread serializes them and flushes when caught up.
-//! A full channel loses lines. The writer reports the cumulative loss with a
-//! `lost` line so the eval can refuse to score an incomplete sample.
+//! Network and handler events use the run's event writer. Real runs queue
+//! lines without waiting on the world's thread; labs write synchronously.
+//! Queue overflow produces a cumulative `lost` line so the eval can refuse
+//! to score an incomplete sample.
 //!
 //! Repeated `blocked` lines are folded to keep a flood from writing one line
 //! per packet. The first line for a sandbox, protocol, source, destination and
@@ -12,281 +12,52 @@
 //! The network also folds packets. Its already-counted lines pass through
 //! without further folding. Open folds are bounded and flushed early if full.
 
-use std::collections::HashMap;
-use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-use fictionet::events::Event as Entry;
-use serde_json::{Map, Value, json};
-
 use crate::events;
-
-/// Lines that may wait for the writer.
-const QUEUE: usize = 200_000;
-
-/// How long a fold collects repeats before it writes their count.
-const FOLD_WINDOW: Duration = Duration::from_secs(1);
-
-/// The most folds open at once. Past this the writer writes them out early.
-const MAX_FOLDS: usize = 10_000;
-
-enum Record {
-    Entry(Box<Entry>),
-    Line(Value),
-}
-
-/// A handle that sends lines to the log. Cheap to clone.
+use fictionet::{Cx, events::Event as Entry};
+use serde_json::{Value, json};
+use std::io::Write;
+#[path = "../../../common/log.rs"]
+mod shared;
+const FOLDED: &[&str] = &["blocked"];
 #[derive(Clone)]
+/// A handle for the world's JSON Lines log.
 pub struct Log {
-    tx: SyncSender<(f64, Record)>,
-    lost: Arc<AtomicU64>,
+    inner: shared::Log,
 }
-
-fn now() -> f64 {
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    ms as f64 / 1000.0
-}
-
 impl Log {
-    /// Starts the writer thread, which writes every line to `out` and
-    /// flushes whenever it has caught up. It ends when every `Log` handle is
-    /// gone.
-    pub fn start(out: Box<dyn Write + Send>) -> std::io::Result<Log> {
-        let (tx, rx) = sync_channel(QUEUE);
-        let lost = Arc::new(AtomicU64::new(0));
-        let counter = lost.clone();
-        std::thread::Builder::new()
-            .name("artifactory-log".into())
-            .spawn(move || write_all(rx, out, &counter))?;
-        Ok(Log { tx, lost })
+    /// Prepares the output. Call `attach` before writing.
+    pub fn start(out: Box<dyn Write + Send>) -> std::io::Result<Self> {
+        Ok(Self {
+            inner: shared::Log::new(out, FOLDED, transform),
+        })
     }
-
-    fn send(&self, record: Record) {
-        if self.tx.try_send((now(), record)).is_err() {
-            self.lost.fetch_add(1, Ordering::Relaxed);
-        }
+    /// Attaches the output to the run's event writer.
+    pub fn attach(&self, fcx: &Cx) {
+        self.inner.attach(fcx);
     }
-
-    /// Logs an event. Called from the event log's callback: it never
-    /// waits.
+    /// Converts a network event to a log line when it is relevant.
     pub fn entry(&self, entry: &Entry) {
-        self.send(Record::Entry(Box::new(entry.clone())));
+        if let Some(line) = events::line(entry) {
+            self.line(line);
+        }
     }
-
-    /// Logs a line the world made itself. It must be a JSON object.
+    /// Logs a JSON object with its timestamp.
     pub fn line(&self, line: Value) {
-        self.send(Record::Line(line));
+        self.inner.write(line);
     }
 }
-
-/// The kinds of line that are folded.
-const FOLDED: [&str; 1] = ["blocked"];
-
-/// The key lines of one fold share: their kind, sandbox, source and
-/// destination, and what they are about. `None` for a line that is never
-/// folded.
-fn fold_key(line: &Map<String, Value>) -> Option<String> {
-    let kind = line.get("type")?.as_str()?;
-    // A line with a count is a fold already: the network's own.
-    if !FOLDED.contains(&kind) || line.contains_key("count") {
-        return None;
-    }
-    let sandbox = match line.get("sandbox") {
-        Some(Value::Object(s)) => s.get("id").cloned().unwrap_or(Value::Null),
-        Some(other) => other.clone(),
-        None => Value::Null,
-    };
-    let field = |name: &str| line.get(name).cloned().unwrap_or(Value::Null);
-    Some(
-        json!([
-            kind,
-            sandbox,
-            field("why"),
-            field("protocol"),
-            field("src"),
-            field("dst"),
-            field("hop"),
-            field("from")
-        ])
-        .to_string(),
-    )
+fn transform(text: String) -> String {
+    let mut line: Value = serde_json::from_str(&text).expect("a JSON line");
+    line.as_object_mut()
+        .unwrap()
+        .entry("sandbox")
+        .or_insert_with(|| json!({"id":0,"name":"","addr":null}));
+    line.to_string()
 }
-
-/// The repeats of one line, counted in the current window.
-struct Fold {
-    /// The first line, to copy the fields from.
-    line: Map<String, Value>,
-    count: u64,
-    ports: Option<(u64, u64)>,
-}
-
-impl Fold {
-    fn add(&mut self, line: &Map<String, Value>) {
-        self.count += 1;
-        if let Some(port) = line.get("dst_port").and_then(Value::as_u64) {
-            self.ports = Some(match self.ports {
-                Some((lo, hi)) => (lo.min(port), hi.max(port)),
-                None => (port, port),
-            });
-        }
-    }
-
-    /// The line that stands for the repeats.
-    fn summary(mut self) -> Map<String, Value> {
-        self.line.remove("ts");
-        self.line.remove("dst_port");
-        self.line.insert("count".into(), json!(self.count));
-        if let Some((lo, hi)) = self.ports {
-            self.line.insert("ports".into(), json!([lo, hi]));
-        }
-        self.line
-    }
-}
-
-struct Writer<'a> {
-    out: Box<dyn Write + Send>,
-    folds: HashMap<String, Fold>,
-    /// When the current fold window began.
-    window: Option<Instant>,
-    lost: &'a AtomicU64,
-    reported: u64,
-}
-
-impl Writer<'_> {
-    fn write(&mut self, ts: f64, fields: Map<String, Value>) {
-        let mut line = Map::new();
-        line.insert("ts".into(), json!(ts));
-        line.extend(fields);
-        line.entry("sandbox")
-            .or_insert_with(|| json!({"id":0,"name":"","addr":null}));
-        let mut text = Value::Object(line).to_string();
-        text.push('\n');
-        if let Err(e) = self.out.write_all(text.as_bytes()) {
-            eprintln!("artifactory-world: cannot write the log: {e}");
-        }
-    }
-
-    /// Writes `value`, or counts it in its fold.
-    fn line(&mut self, ts: f64, value: Value) {
-        let Value::Object(fields) = value else { return };
-        let Some(key) = fold_key(&fields) else {
-            self.write(ts, fields);
-            return;
-        };
-        if let Some(fold) = self.folds.get_mut(&key) {
-            fold.add(&fields);
-            return;
-        }
-        if self.folds.len() >= MAX_FOLDS {
-            self.close_folds();
-        }
-        self.window.get_or_insert_with(Instant::now);
-        self.folds.insert(
-            key,
-            Fold {
-                line: fields.clone(),
-                count: 0,
-                ports: None,
-            },
-        );
-        self.write(ts, fields);
-    }
-
-    /// Writes the count of every fold that had repeats, and starts a new
-    /// window.
-    fn close_folds(&mut self) {
-        let mut folds: Vec<Fold> = self
-            .folds
-            .drain()
-            .map(|(_, f)| f)
-            .filter(|f| f.count > 0)
-            .collect();
-        folds.sort_by(|a, b| {
-            let t = |f: &Fold| f.line.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
-            t(a).total_cmp(&t(b))
-        });
-        for fold in folds {
-            self.write(now(), fold.summary());
-        }
-        self.window = None;
-    }
-
-    fn report_lost(&mut self) {
-        let n = self.lost.load(Ordering::Relaxed);
-        if n != self.reported {
-            self.reported = n;
-            self.write(
-                now(),
-                json!({"type": "lost", "count": n})
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-        }
-    }
-}
-
-fn write_all(rx: Receiver<(f64, Record)>, out: Box<dyn Write + Send>, lost: &AtomicU64) {
-    let mut w = Writer {
-        out,
-        folds: HashMap::new(),
-        window: None,
-        lost,
-        reported: 0,
-    };
-    let handle = |w: &mut Writer, (ts, record): (f64, Record)| {
-        let value = match record {
-            Record::Entry(entry) => events::line(&entry),
-            Record::Line(value) => Some(value),
-        };
-        if let Some(value) = value {
-            w.line(ts, value);
-        }
-        if w.window.is_some_and(|start| start.elapsed() >= FOLD_WINDOW) {
-            w.close_folds();
-        }
-    };
-    loop {
-        if w.window.is_some_and(|start| start.elapsed() >= FOLD_WINDOW) {
-            w.close_folds();
-        }
-        // Wait without a limit when no fold is open. Otherwise until it closes.
-        let next = match w.window {
-            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            Some(start) => rx.recv_timeout(FOLD_WINDOW.saturating_sub(start.elapsed())),
-        };
-        match next {
-            Ok(first) => {
-                handle(&mut w, first);
-                // Everything already waiting, then one flush.
-                while let Ok(more) = rx.try_recv() {
-                    handle(&mut w, more);
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-        w.report_lost();
-        if let Err(e) = w.out.flush() {
-            eprintln!("artifactory-world: cannot flush the log: {e}");
-        }
-    }
-    w.close_folds();
-    w.report_lost();
-    if let Err(e) = w.out.flush() {
-        eprintln!("artifactory-world: cannot flush the log: {e}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared::{Writer, fold_key};
 
     /// The network's own counted `blocked` lines are written as they come,
     /// not counted again.
@@ -300,8 +71,8 @@ mod tests {
             "type": "blocked", "sandbox": {"id": 1}, "why": "ClosedPort",
             "src": "10.0.0.2", "dst": "84.21.44.10", "count": 999, "ports": [2, 1000],
         });
-        assert!(fold_key(first.as_object().unwrap()).is_some());
-        assert_eq!(fold_key(counted.as_object().unwrap()), None);
+        assert!(fold_key(first.as_object().unwrap(), FOLDED).is_some());
+        assert_eq!(fold_key(counted.as_object().unwrap(), FOLDED), None);
     }
 
     #[test]
@@ -329,18 +100,11 @@ mod tests {
                 Ok(())
             }
         }
-        let lost = AtomicU64::new(0);
-        let mut w = Writer {
-            out: Box::new(Out(buf.clone())),
-            folds: HashMap::new(),
-            window: None,
-            lost: &lost,
-            reported: 0,
-        };
+        let mut w = Writer::new(Box::new(Out(buf.clone())), FOLDED, transform);
         for (i, line) in lines.into_iter().enumerate() {
-            w.line(i as f64, line);
+            w.line(i as f64, line).unwrap();
         }
-        w.close_folds();
+        w.close_folds().unwrap();
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         let got: Vec<Value> = text
             .lines()

@@ -37,7 +37,10 @@ async def world_log(offset: int = 0) -> list[dict[str, Any]]:
     if not r.success:
         raise RuntimeError(f"cannot read world log: {r.stderr}")
     lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
-    return [json.loads(ln) for ln in lines[offset:]]
+    entries = [json.loads(ln) for ln in lines]
+    if any(entry.get("type") == "lost" for entry in entries):
+        raise RuntimeError("the world lost log lines; this sample cannot be scored")
+    return entries[offset:]
 
 
 def summarize(log: list[dict[str, Any]], topic: str, answer: str = "") -> dict[str, Any]:
