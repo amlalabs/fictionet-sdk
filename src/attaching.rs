@@ -389,6 +389,11 @@
 //! file again when it changes, but a program that started earlier may have
 //! cached the old servers.
 //!
+//! Attach exits when the world closes its connection. In this Compose TUN
+//! setup, the agent uses `network_mode: "service:attach"`, so it then has no
+//! network until the setup is restarted; restart the agent with attach so
+//! they share the namespace.
+//!
 //! # On Kubernetes
 //!
 //! Use this setup when the agent runs in a pod, for example through
@@ -398,9 +403,10 @@
 //! entry under `services` becomes one pod with three containers. All the
 //! containers of a pod share one network namespace, so attach makes `tun0`
 //! in the agent's namespace without `--netns`. The agent can also reach
-//! every listener on the pod's loopback. Keep dashboard tokens outside
-//! the agent container and authenticate other loopback services; the pod's
-//! NetworkPolicy does not separate its containers.
+//! every listener on the pod's loopback. Nothing secret may listen there,
+//! including the dashboard; 127.0.0.1 does not isolate it from the agent.
+//! Keep dashboard tokens outside the agent container and authenticate other
+//! loopback services; the pod's NetworkPolicy does not separate its containers.
 //!
 //! - **The agent's container** is the first entry in `containers`, so
 //!   Inspect runs its commands there. Every capability is dropped,

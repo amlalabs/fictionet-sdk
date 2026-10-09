@@ -71,13 +71,13 @@
 //! # A world in code
 //!
 //! A world is an async function. It receives a context ([`Cx`], described
-//! below), the sandboxes that attach to it ([`Attachments`]), and its
-//! command-line arguments. Here is the start of one:
+//! below) and the sandboxes that attach to it ([`Attachments`]). Here is
+//! the start of one:
 //!
 //! ```
 //! use fictionet::{Attachments, Cx, Result, stdlib, time::ms};
 //!
-//! async fn world(fcx: Cx, mut attachments: Attachments, args: Vec<String>) -> Result {
+//! async fn world(fcx: Cx, mut attachments: Attachments) -> Result {
 //!     let agent = attachments.get(&fcx, "agent").await?;
 //!     let link = stdlib::delay(&fcx, ms(50), agent);
 //!     let (v4, v6, _) = stdlib::ip::split_versions(&fcx, link);
@@ -131,13 +131,12 @@
 //!
 //! ```no_run
 //! # use fictionet::{Attachments, Cx, Result};
-//! # async fn world(_fcx: Cx, _attachments: Attachments, _args: Vec<String>) -> Result { Ok(()) }
+//! # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
 //! fn main() -> fictionet::Result {
 //!     let (attacher, attachments) = fictionet::attachments();
 //!     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 //!     let _listening = fictionet::listen(socket, attacher)?;
-//!     let args = std::env::args().skip(1).collect();
-//!     fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments, args)))
+//!     fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
 //! }
 //! ```
 //!
@@ -217,16 +216,16 @@
 //!
 //! # Protocols
 //!
-//! Every protocol in the stdlib is written with no I/O. Its messages are
-//! types that parse from bytes and write themselves back
-//! ([`Wire`](stdlib::codec::Wire)). Its framer cuts items out of a byte
-//! stream ([`Decode`](stdlib::codec::Decode)) and does no reading itself.
-//! So the same code runs as a service on a connection, in a unit test, in
-//! a fuzz target, and in the dashboard's packet decoder. To change a
-//! protocol, copy its file into your crate and edit it: the copy compiles
-//! against the public API as it is. The [catalog](stdlib#the-catalog)
-//! lists every protocol module and what each can do, from DNS, TLS and
-//! HTTP to industrial, financial, mail and directory protocols.
+//! The stdlib provides codecs (no I/O) for about a hundred protocols and
+//! data formats, listed in the [catalog](stdlib#the-catalog). Their message
+//! types parse and write bytes ([`Wire`](stdlib::codec::Wire)), and their
+//! decoders cut items out of input ([`Decode`](stdlib::codec::Decode)).
+//! HTTP has a ready server, [`stdlib::net::Net`] serves DNS and DHCP, and
+//! TLS is built in. For other protocols, a world writes a
+//! [`Service`](stdlib::serve::Service) around the module's decoder.
+//! The codecs also work in unit tests, fuzz targets and dashboard presenters;
+//! the catalog shows which presenters are built in.
+//! See [Changing a protocol by copying it](stdlib#changing-a-protocol-by-copying-it).
 //!
 //! # Watching a world
 //!
@@ -538,7 +537,11 @@ impl std::error::Error for RecvError {
     "# use fictionet::{Attachments, Cx, Result, stdlib::web};\n",
     "# use rustls::ServerConfig;\n",
     "# struct Certs { wikipedia: Arc<ServerConfig>, stripe: Arc<ServerConfig> }\n",
-    "# async fn world(fcx: Cx, attachments: Attachments, wiki: axum::Router, fake_stripe: axum::Router, certs: Certs) -> Result {\n",
+    "# async fn world(fcx: Cx, attachments: Attachments) -> Result {\n",
+    "# let wiki = axum::Router::new();\n",
+    "# let fake_stripe = axum::Router::new();\n",
+    "# fn certificates() -> Certs { unimplemented!() }\n",
+    "# let certs = certificates();\n",
     include_str!("../docs/readme/sites.rs"),
     "# Ok(())\n",
     "# }\n",

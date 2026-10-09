@@ -1,6 +1,10 @@
 //! SFTP version 3: reading and writing packets, requests and responses,
 //! with no I/O.
 //!
+//! A real client such as OpenSSH's sftp stops at SSH key exchange before it
+//! can send SFTP requests, unless the world supplies an SSH transport and
+//! channel from elsewhere.
+//!
 //! `Packet` implements `Wire` and supports `codec::Frames<Packet>`. Request and
 //! response helpers interpret its payload. There is no file-transfer session,
 //! filesystem `Service`, SSH channel implementation, or encrypted transport.
@@ -12,7 +16,8 @@
 //! draft-ietf-secsh-filexfer-02, which describes version 3, the version
 //! OpenSSH and almost every other implementation speak.
 //!
-//! A world that plays a file server passes bytes from the SSH channel
+//! The stdlib provides no SSH channel; a world with an external SSH
+//! transport passes bytes from its channel
 //! to [`Stream<codec::Frames<Packet>>`](fictionet::stdlib::codec::Stream), gets
 //! [`Packet`]s back, reads each one's [`Request`], and writes the bytes of
 //! a [`Response`] back to the channel. Which files exist, what they hold

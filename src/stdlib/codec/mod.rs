@@ -89,7 +89,7 @@
 //! # Errors and names in a codec module
 //!
 //! Every protocol module in [`stdlib`](super) follows these rules, and a
-//! copy you own reads best if it keeps them.
+//! copy reads best if it keeps them. The E rules apply to protocol modules.
 //!
 //! - **E1.** A module has one `pub enum Error`. It is the `ParseError` and
 //!   `WriteError` of each [`Wire`] type, the [`Decode::Error`] of each
@@ -98,7 +98,9 @@
 //!   [`Infallible`](core::convert::Infallible). An item fault that must
 //!   carry more than the reason, such as the header a reply needs, is a
 //!   struct named for the fault that holds the module's `Error`
-//!   (`fix::FieldFault`, `diameter::AvpFault`).
+//!   (`fix::FieldFault`, `diameter::AvpFault`). `Unwritable` is the one variant
+//!   every module may have: a value the writer refuses because it would not
+//!   read back the same. Prefer a variant named for the clause when there is one.
 //! - **E2.** A decoder that yields `Result<Unit, Error>`, so a bad unit
 //!   does not end the stream, reports the fault that does end it as
 //!   `FrameError`, its `Decode::Error`. A module without that split has
@@ -107,8 +109,7 @@
 //!   protocol's word: `modbus::Exception`, `grpc::Status`,
 //!   `kerberos::KrbError`. E1 does not count it.
 //! - **E4.** No `DecodeError`, `EncodeError`, `ParseError`, `WireError`,
-//!   `<Unit>ParseError`, `<Unit>Error`, `<Module>Error`, `Malformed` or
-//!   `Unwritable`.
+//!   `<Unit>ParseError`, `<Unit>Error`, `<Module>Error` or `Malformed`.
 //! - **E5.** The wrappers are this module's: [`Fail`], [`PumpError`],
 //!   [`CollectError`], [`AssembleError`], [`PipeError`], [`LineError`],
 //!   [`InterceptError`], [`RewriteError`] and [`FaultError`]. A protocol

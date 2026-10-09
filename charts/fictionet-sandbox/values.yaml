@@ -98,6 +98,8 @@ attach:
   gatewayV6: ""
   dnsV6: ""
   mtu: 1500
+  # The agent shares the pod's loopback. Nothing secret may listen on
+  # loopback in this pod, including the dashboard: the agent can reach it.
   # Proxy types: the port attach listens on, at 127.0.0.1 in the pod. 0:
   # 8080 for http_proxy, 1080 for socks5.
   port: 0

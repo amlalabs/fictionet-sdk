@@ -280,6 +280,26 @@ fn hidden_modules_are_not_linked() {
 }
 
 #[test]
+fn front_pages_describe_about_a_hundred_protocol_and_format_codecs() {
+    assert!(include_str!("../README.md").contains("codecs (no I/O) for about a hundred"));
+    assert!(include_str!("../src/lib.rs").contains("codecs (no I/O) for about a hundred"));
+    let count = catalog()
+        .iter()
+        .filter(|row| row.wire || row.decode)
+        .filter(|row| {
+            !matches!(
+                row.module.as_str(),
+                "codec" | "test_support" | "huffman" | "prefix_int"
+            )
+        })
+        .count();
+    assert!(
+        (90..=110).contains(&count),
+        "front-page codec count needs updating: {count}"
+    );
+}
+
+#[test]
 fn wire_decode_and_service_columns_match_the_impls() {
     let modules = modules_on_disk();
     for row in catalog() {

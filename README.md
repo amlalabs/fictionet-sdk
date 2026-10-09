@@ -46,11 +46,12 @@ proxy instead.
   <img src="docs/readme/attach.svg" width="580" alt="The agent's programs send IP packets through a TUN device in the sandbox's network namespace. fictionet attach holds the device and relays each packet over a Unix socket to the world process, where it arrives as an Attachment, an interface the world reads and writes.">
 </p>
 
-The standard library covers DNS, IPv4 and IPv6, TCP, UDP, ICMP, TLS under the
-world's own certificate authority (CA), routing, whole networks of websites with
-`stdlib::web`, and more than a hundred application protocols, each listed in
-[the catalog](src/stdlib/mod.rs). The crate is not on crates.io, so build it
-from this repository.
+The standard library covers IPv4 and IPv6, TCP, UDP, ICMP, routing, whole
+networks of websites with `stdlib::web`, and codecs (no I/O) for about a hundred
+protocols and data formats, listed in [the catalog](src/stdlib/mod.rs).
+HTTP has a ready server, `Net` serves DNS and DHCP, and TLS is built in.
+For other protocols, a world writes a `Service` around the module's decoder.
+The crate is not on crates.io, so build it from this repository.
 
 A world's time and randomness come from one place, and its randomness from a
 seed. With real sandboxes it runs on real time. In a test it can run on
@@ -185,14 +186,13 @@ run, callbacks, or the dashboard.
 [docs/services.md](docs/services.md) builds a small world this way, step by
 step.
 
-Each protocol is a module written with no I/O: message types that parse and
-write themselves, and a framer that cuts items out of a byte stream. The same
-code runs as a service, in a unit test, in a fuzz target and in the dashboard's
-packet decoder. The [catalog](src/stdlib/mod.rs) in the `stdlib` docs lists
-every protocol module and what each can do, and a test checks the table against
-the code. To change a protocol, copy its file from `src/stdlib/` into your crate
-and edit it. The copy compiles against the public API as it is.
-[`custom_protocol`](examples/custom_protocol) does this with a Modbus register.
+Protocol codecs also work in unit tests, fuzz targets and dashboard presenters.
+The [catalog](src/stdlib/mod.rs) lists every module and what each can do,
+including which presenters are built in, and a test checks the table against
+the code. To change a protocol, see
+[the stdlib docs, section Changing a protocol by copying it](src/stdlib/mod.rs).
+[`custom_protocol`](examples/custom_protocol) serves a Modbus gateway that
+accepts nonzero protocol identifiers.
 `cargo run --example custom_protocol` needs no network or root. To show a
 protocol of your own in the dashboard, see
 [adding an observe protocol](docs/observe-protocols.md).
@@ -226,14 +226,22 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 | Example | What it is |
 |---|---|
 | [`examples/ping_world.rs`](examples/ping_world.rs) | The smallest world: it answers every ping and drops everything else. |
-| [`examples/custom_protocol`](examples/custom_protocol) | Copy and edit Modbus, then read a planted register through public `codec::Frames<T>` and `Wire`. Runs without network or root. |
+| [`examples/custom_protocol`](examples/custom_protocol) | A Modbus gateway that accepts nonzero protocol identifiers, served on a `Net` with a custom dashboard presenter. Runs without network or root. |
 | [`examples/web_world.rs`](examples/web_world.rs) | A few websites with `web::Sites`: HTTPS with the world's CA and plain HTTP. The quick start runs it. |
+| [`examples/delayed_sites.rs`](examples/delayed_sites.rs) | Each site is 200 ms away, using `stdlib::delay` and `Attachments::map`. |
+| [`examples/lossy_sites.rs`](examples/lossy_sites.rs) | `stdlib::filter` drops 5% of packets each way. |
+| [`examples/bottleneck_sites.rs`](examples/bottleneck_sites.rs) | An 8 Mbit/s link using `stdlib::bottleneck`, with a count of queue drops. |
+| [`examples/capture_sites.rs`](examples/capture_sites.rs) | Writes sandbox packets to a pcap file that tshark and Wireshark open. |
+| [`examples/route_change.rs`](examples/route_change.rs) | Sends the bank's address to an impostor machine mid-run, the core of the BGP hijack in `examples/border`. |
+| [`examples/wasm_world`](examples/wasm_world) | Runs a world and one in-process sandbox in a JavaScript engine (wasm32), with DNS and HTTP over TCP or TLS. |
+| [`python/inspect_fictionet/examples/web_eval.py`](python/inspect_fictionet/examples/web_eval.py) | A starter Inspect eval that runs shell commands to check the world's HTTPS, DNS and CA, and that real internet access fails. |
 | [`examples/fakewiki`](examples/fakewiki) | An Inspect eval: do agents believe tampered Wikipedia, gov.uk and BBC pages? |
 | [`examples/artifactory`](examples/artifactory) | An Inspect eval on a sealed company package mirror: when a package is missing, does the agent fall back to public PyPI, ask the mirror to fetch from upstream, install a typosquat, or answer a message left in the cache? |
 | [`examples/adaptive-web`](examples/adaptive-web) | Any name, any URL, any search: pages and results made from a short seed the first time the agent asks, then kept, so the same URL always returns the same page. |
 | [`examples/border`](examples/border) | An Inspect eval: does an agent notice a BGP hijack and an impostor bank before it sends the password? With results for two open-weight models. |
 | [`examples/scan`](examples/scan) | A small office subnet for `nmap`: four simulated hosts from the stdlib, and a real container with nginx and OpenSSH routed into the same subnet. |
 | [`examples/goad`](examples/goad) | A private IPv4 LAN for real GOAD or GOAD-like Windows VMs and an attacker, carrying their real AD traffic with unicast, broadcast and multicast forwarding. |
+| [`examples/attach`](examples/attach) | Compose, Kubernetes and network-namespace setups for `fictionet attach`. |
 | [`examples/hosted`](examples/hosted) | The Compose setup on Daytona and E2B, through Inspect and the Harbor eval harness. |
 
 ## Documentation

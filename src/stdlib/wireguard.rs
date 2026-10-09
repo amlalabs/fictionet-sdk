@@ -1,6 +1,10 @@
 //! WireGuard: reading and writing the four message types, with no I/O and
 //! no cryptography.
 //!
+//! A real client can send a handshake initiation whose fields this module
+//! reads, but cannot establish a tunnel because the module cannot
+//! authenticate or encrypt the handshake response.
+//!
 //! WireGuard is a VPN that sends everything over UDP, usually on port
 //! 51820. Peers trade a handshake initiation and a handshake response to
 //! agree on keys. A peer under load may answer with a cookie reply instead.

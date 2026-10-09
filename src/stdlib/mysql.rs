@@ -1,6 +1,8 @@
 //! MySQL: reading and writing the client/server protocol's packets, with
 //! no I/O.
 //!
+//! AuthMoreData, prepare-OK responses and binary rows are unsupported.
+//!
 //! `Packet` and `Message` implement `Wire`. Stream decoders join packets and
 //! `ResultReader` tracks result-set parsing. That state is not a login or query
 //! session. Authentication, SQL execution, a database `Service`, and TLS

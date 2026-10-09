@@ -114,9 +114,12 @@ tag does.
 A protocol is one file in `src/stdlib/`, declared with `pub mod` in
 `src/stdlib/mod.rs`. It is written with no I/O, on the tools in
 `stdlib::codec`: its message types implement `Wire`, and its framer implements
-`Decode`. It uses only public `fictionet::` items, so that a world can copy the
-file and edit it. The module's own docs explain the protocol and show how to use
-it, with examples that run as doctests.
+`Decode`. It uses only public `fictionet::` items; see
+[the stdlib docs, section Changing a protocol by copying it](src/stdlib/mod.rs).
+The module's own docs explain the protocol and show how to use it, with examples
+that run as doctests.
+
+For modules generated from schemas, see [code generation](docs/codegen.md).
 
 A new module is registered in three places, and a test holds each to the code:
 
@@ -135,12 +138,12 @@ per protocol.
 ## Names
 
 A protocol module follows these rules. The `stdlib::codec` module docs give
-each with examples.
+each with examples. The E rules apply to protocol modules.
 
-- **E1.** One `pub enum Error` per module, for every `Wire` and `Decode` impl in it. An item fault that carries more than the reason is a struct named for the fault (`fix::FieldFault`).
+- **E1.** One `pub enum Error` per module, for every `Wire` and `Decode` impl in it. An item fault that carries more than the reason is a struct named for the fault (`fix::FieldFault`). `Unwritable` is the one variant every module may have: a value the writer refuses because it would not read back the same. Prefer a variant named for the clause when there is one.
 - **E2.** `FrameError` only where a decoder yields `Result<Unit, Error>`: it is the fault that ends the stream.
 - **E3.** An error the peer sends keeps the protocol's word (`modbus::Exception`, `grpc::Status`).
-- **E4.** No `DecodeError`, `EncodeError`, `ParseError`, `WireError`, `<Unit>ParseError`, `<Unit>Error`, `<Module>Error`.
+- **E4.** No `DecodeError`, `EncodeError`, `ParseError`, `WireError`, `<Unit>ParseError`, `<Unit>Error`, `<Module>Error` or `Malformed`.
 - **E5.** The only wrappers are the codec's (`Fail`, `PipeError`, ...). A wrapper returns its inner error from `source()`, and its `Display` says only its own context. `fictionet::ErrorChain` prints the whole chain.
 - **N1.** A decoder that only frames a `Wire` value is `codec::Frames<T>`,
   with `Prefixed` implemented on `T`. Other `Decode` types are the plural of

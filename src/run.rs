@@ -88,14 +88,17 @@ use crate::{Cx, Result};
 /// #         pub async fn connect(_: &str) -> fictionet::Result<PgPool> { Ok(PgPool) }
 /// #     }
 /// # }
-/// # async fn world(_fcx: fictionet::Cx, _a: fictionet::Attachments, _db: sqlx::PgPool) -> fictionet::Result { Ok(()) }
 /// #[tokio::main]
 /// async fn main() -> fictionet::Result {
 ///     let db = sqlx::PgPool::connect("postgres://...").await?;
 ///     let (attacher, attachments) = fictionet::attachments();
 ///     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
 ///     let _listening = fictionet::listen(socket, attacher)?;
-///     fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments, db)).await
+///     fictionet::run(fictionet::Seed::random(), |fcx| async move {
+///         // Build the world with `fcx`, `attachments` and `db`.
+/// #       let _ = (fcx, attachments, db);
+///         Ok(())
+///     }).await
 /// }
 /// ```
 pub async fn run<F, Fut>(seed: crate::Seed, world: F) -> Result

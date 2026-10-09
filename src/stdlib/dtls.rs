@@ -1,6 +1,10 @@
 //! DTLS: reading and writing Datagram TLS records and handshake messages,
 //! with no I/O and no cryptography.
 //!
+//! A real client can exchange a plaintext ClientHello and DTLS 1.2 cookies
+//! with world code, but this module cannot complete key exchange or protect
+//! later records.
+//!
 //! DTLS is TLS for datagrams. It secures CoAP on UDP port 5684, WebRTC
 //! data channels, and VPNs that run over UDP port 443. Each UDP datagram
 //! holds one or more records. This module follows RFC 6347 (DTLS 1.2) and

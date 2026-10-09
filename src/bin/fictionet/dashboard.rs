@@ -38,7 +38,8 @@ The token file is required. Open /login?token=<URL-encoded-token> once to
 set an HttpOnly session cookie, or send Authorization: Bearer <token>.
 Restart the dashboard to use the login URL again. Keep the token outside
 the sandbox. Use loopback or a trusted TLS tunnel; HTTP carries the token
-in plaintext. Containers in one Kubernetes pod share loopback.";
+in plaintext. Every container in a Kubernetes pod shares loopback, so
+127.0.0.1 does not keep an agent in that pod away from the dashboard.";
 
 const INDEX_HTML: &str = include_str!("../../../dashboard/index.html");
 const APP_JS: &str = include_str!("../../../dashboard/app.js");

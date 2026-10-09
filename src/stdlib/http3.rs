@@ -1,5 +1,9 @@
 //! HTTP/3 frames, streams and field sections, with no I/O.
 //!
+//! A real client cannot reach HTTP/3 requests with these codecs alone,
+//! because the stdlib has no QUIC transport that completes the protected
+//! handshake.
+//!
 //! Callers supply ordered QUIC stream bytes. This module follows
 //! [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114), uses the sibling
 //! [`qpack`] implementation of RFC 9204, and reads priorities from RFC 9218.

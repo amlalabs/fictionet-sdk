@@ -1,6 +1,9 @@
 //! QUIC: reading and writing packets and frames, with no I/O and no
 //! cryptography.
 //!
+//! A real client sends a protected Initial packet, but this module cannot
+//! decrypt its ClientHello or complete a QUIC connection.
+//!
 //! QUIC carries HTTP/3 and other protocols over UDP, usually on port 443.
 //! Each UDP datagram holds one or more QUIC packets. A packet has a long
 //! header while a connection is being set up (Initial, 0-RTT, Handshake

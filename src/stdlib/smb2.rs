@@ -1,6 +1,10 @@
 //! SMB2 and SMB3: reading and writing messages, compound chains and their
 //! bodies, with no I/O.
 //!
+//! A real client can negotiate with world code, but authenticated sessions
+//! and signed traffic require verification and signing that this module does
+//! not provide.
+//!
 //! `Packet` and message envelopes implement `Wire`, and `codec::Frames<Frame>`
 //! decodes TCP framing. These are wire messages only, with no client or server
 //! session or file-server `Service`. Signing, encryption, decompression,

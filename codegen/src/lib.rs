@@ -1,5 +1,8 @@
 //! Generate Rust protocol modules from bounded schemas.
 //!
+//! To change a generated module, see
+//! [the stdlib docs, section Changing a protocol by copying it](https://github.com/amlalabs/fictionet-sdk/blob/main/src/stdlib/mod.rs).
+//!
 //! Front ends parse bounded inputs into [`Schema`]. [`validate`] resolves
 //! names and limits. [`emit`] accepts only a [`ValidatedSchema`]. The crate
 //! uses only the standard library and performs no network access.

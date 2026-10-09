@@ -15,7 +15,7 @@
 //!
 //! ```no_run
 //! # use fictionet::{Attachments, Cx, Result};
-//! # async fn world(_fcx: Cx, _attachments: Attachments, _args: Vec<String>) -> Result { Ok(()) }
+//! # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
 //! fn main() -> fictionet::Result {
 //!     // 1. A channel for sandboxes.
 //!     let (attacher, attachments) = fictionet::attachments();
@@ -26,8 +26,7 @@
 //!     let _listening = fictionet::listen(socket, attacher)?;
 //!
 //!     // 3. The world, as one future. Nothing runs yet.
-//!     let args: Vec<String> = std::env::args().skip(1).collect();
-//!     let world = fictionet::run(fictionet::Seed::random(), move |fcx| world(fcx, attachments, args));
+//!     let world = fictionet::run(fictionet::Seed::random(), move |fcx| world(fcx, attachments));
 //!
 //!     // 4. Poll that future on this thread until the world ends.
 //!     fictionet::block_on(world)

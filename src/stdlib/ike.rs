@@ -1,6 +1,10 @@
 //! IKEv2: reading and writing message structure, with no I/O and no
 //! cryptography.
 //!
+//! A real client can receive an IKE_SA_INIT response from world code, but
+//! this module cannot produce the keys or protected IKE_AUTH exchange needed
+//! to establish a tunnel.
+//!
 //! IKEv2 is how two IPsec peers agree on keys and on what traffic to
 //! protect. Peers send it over UDP, on port 500, or on port 4500 once
 //! they have found a NAT between them. Each exchange is a request and a

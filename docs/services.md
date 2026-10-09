@@ -350,7 +350,8 @@ file's writer could not keep up with, or could not write, is counted in
 The dashboard lists the events under **Events**, from what the log held
 when it connected. To decode a service's packets there, register its decoder as a `Present`
 in an `observe::Registry`, and give the registry to `Net::observe`. The
-built-in registry already decodes DNS, HTTP, TLS, Modbus and many more.
+built-in registry has six decoders: `http1`, `http2`, `tls`, `modbus`, `dhcp`
+and `dns`.
 
 ## Changing framing between items
 

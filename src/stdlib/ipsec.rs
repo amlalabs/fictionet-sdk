@@ -1,5 +1,9 @@
 //! IPsec: reading and writing ESP and AH headers, with no I/O.
 //!
+//! A real client can send ESP or AH packets whose headers this module reads,
+//! but cannot exchange protected tunnel traffic unless the world supplies
+//! keys and cryptographic processing.
+//!
 //! `EspPacket`, `AhPacket`, and NAT traversal datagrams implement `Wire`.
 //! `Plaintext` reads and writes decrypted ESP payloads. There is no
 //! cryptography, security association state machine, protocol stream decoder,

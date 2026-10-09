@@ -1,6 +1,9 @@
 //! NTLMSSP: reading and writing the NEGOTIATE, CHALLENGE and AUTHENTICATE
 //! messages of NTLM authentication, with no I/O.
 //!
+//! A real client can answer a world's CHALLENGE with AUTHENTICATE, but this
+//! module cannot verify that response or establish signing and sealing keys.
+//!
 //! The message and response types read and write complete values through
 //! `Wire`. There is no stream decoder, authentication state machine, or
 //! `Service`. Hashes, response verification, signing, and sealing belong to the

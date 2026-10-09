@@ -1,6 +1,10 @@
 //! The SSH transport layer before encryption: reading and writing the
 //! version exchange, binary packets and the first messages, with no I/O.
 //!
+//! A real client such as OpenSSH can receive the world's version line and
+//! KEXINIT, but the world can only disconnect at key exchange because this
+//! module cannot complete it.
+//!
 //! SSH runs over TCP, usually on port 22. Each side first sends a line that
 //! names its protocol version and software, such as
 //! `SSH-2.0-OpenSSH_9.6`. A server may send other lines before it. After
@@ -16,8 +20,8 @@
 //! name-list), and the messages DISCONNECT, IGNORE, UNIMPLEMENTED, DEBUG,
 //! SERVICE_REQUEST, SERVICE_ACCEPT, KEXINIT and NEWKEYS. It does no
 //! cryptography, so it cannot run a key exchange or read encrypted
-//! packets. A world that needs to go further plays its part up to NEWKEYS
-//! and then decides what to do, for example send DISCONNECT.
+//! packets. A world can send DISCONNECT when the client requests a key
+//! exchange.
 //!
 //! A [`Service`](fictionet::stdlib::serve::Service) served by
 //! [`serve::connection`](fictionet::stdlib::serve::connection) uses [`Events`] for the version exchange and

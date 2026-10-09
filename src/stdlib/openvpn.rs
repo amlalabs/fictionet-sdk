@@ -1,5 +1,9 @@
 //! OpenVPN: reading and writing packets, over UDP and TCP, with no I/O.
 //!
+//! A real client can exchange unwrapped control packets with world code, but
+//! cannot establish a VPN because this module provides neither the TLS
+//! control session nor packet authentication and encryption.
+//!
 //! Packet readers and writers handle control and data envelopes, and
 //! `codec::Frames<Frame>` decodes TCP framing. There is no cryptography, TLS
 //! session, reliable control-channel state machine, VPN `Service`, or live

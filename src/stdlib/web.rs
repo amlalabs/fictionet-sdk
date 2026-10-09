@@ -17,8 +17,8 @@
 //! internet. `api.stripe.com` serves a bad certificate one time in ten.
 //! `github.com` and every name under it pass through to the real GitHub.
 //! Every other name does not exist. The certificates come from the world's
-//! own certificate authority (CA), loaded from the world's arguments. The
-//! world function gets its context ([`Cx`]) and its sandboxes
+//! own certificate authority (CA). The world function gets its context
+//! ([`Cx`]) and its sandboxes
 //! ([`Attachments`]), as [A world in code](crate#a-world-in-code) explains:
 //!
 //! ```
@@ -27,12 +27,12 @@
 //! # use fictionet::{Attachments, Cx, Result, stdlib::web};
 //! # use rustls::ServerConfig;
 //! # struct Certs { wikipedia: Arc<ServerConfig>, stripe: Arc<ServerConfig>, bad: Arc<ServerConfig>, github: Arc<ServerConfig> }
-//! # fn my_certs(_args: &[String]) -> Result<Certs> { unimplemented!() }
-//! async fn world(fcx: Cx, attachments: Attachments, args: Vec<String>) -> Result {
+//! # fn my_certs() -> Result<Certs> { unimplemented!() }
+//! async fn world(fcx: Cx, attachments: Attachments) -> Result {
 //! #   let wiki: axum::Router = axum::Router::new();
 //! #   let fake_stripe: axum::Router = axum::Router::new();
 //!     // Yours: an Arc<ServerConfig> per certificate, each issued by the world's CA.
-//!     let certs = my_certs(&args)?;
+//!     let certs = my_certs()?;
 //!
 //! #   #[cfg(feature = "tokio")]
 //!     let upstream = web::proxy(&fcx)?;
@@ -510,16 +510,11 @@
 //! [recipes](fictionet::recipes) run each of these, with a route that changes
 //! mid-run, and show what the sandbox sees.
 //!
-//! Every part of `Sites` is built from public stdlib items, so a world can
-//! also write any part itself. [`Sites::into_net`] gives the
-//! [`Net`] before it starts, to add hosts with
-//! other services next to the websites. To change how `Sites` turns a site
-//! into a host, copy this file into your crate and edit
-//! [`Site::into_host`]. The copy compiles there as it is, with the same
-//! `fictionet::` imports, and the fixture in `tests/copy_and_own` checks
-//! that it does. What the network does around the hosts, such as how
-//! addresses are bound or how DNS answers, is
-//! [`net`](fictionet::stdlib::net)'s, and a copy of that file changes it.
+//! [`Sites::into_net`] gives the [`Net`] before it starts, to add hosts with
+//! other services next to the websites. [`Site::into_host`] turns a site into
+//! a host; [`net`](fictionet::stdlib::net) binds addresses and answers DNS.
+//! To change those parts, see
+//! [Changing a protocol by copying it](fictionet::stdlib#changing-a-protocol-by-copying-it).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;

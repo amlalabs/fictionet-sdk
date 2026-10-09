@@ -1,6 +1,10 @@
 //! Kerberos V5: reading and writing the messages a client, a KDC and a
 //! service trade, with no I/O and no cryptography.
 //!
+//! A real client such as kinit can read KRB-ERROR replies from world code,
+//! but cannot obtain usable tickets unless the world supplies the missing
+//! encryption.
+//!
 //! Kerberos is how Active Directory and most Unix sites log users in. A
 //! client asks the key distribution center (KDC) for a ticket-granting
 //! ticket with an AS-REQ and gets an AS-REP. It trades that ticket for a

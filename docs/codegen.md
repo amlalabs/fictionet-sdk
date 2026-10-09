@@ -2,7 +2,7 @@
 
 `fictionet-codegen` turns a structured schema into a Fictionet protocol
 module. The output is an ordinary stdlib-style module; see
-[Changing a protocol by copying it](../src/stdlib/mod.rs). It has no
+[the stdlib docs, section Changing a protocol by copying it](../src/stdlib/mod.rs). It has no
 dependency on the generator at runtime.
 
 The generator has a shared IR, a validator, one Rust emitter, and a

@@ -170,7 +170,8 @@
 //! `examples/custom_protocol` runs this gateway on a [`net::Net`] and reads a
 //! register using a request with a nonzero protocol identifier.
 //!
-//! A module can also be generated from a schema; see `docs/codegen.md`.
+//! A module can also be generated from a schema; see
+//! [code generation](https://github.com/amlalabs/fictionet-sdk/blob/main/docs/codegen.md).
 //!
 //! # The catalog
 //!
@@ -348,7 +349,10 @@ mod connection;
 /// 13. Constants, such as a price's exponent, are associated constants.
 ///
 /// There is no feed session, recovery engine, order book, `Service` or
-/// live transport. The generated part is checked against the generator in CI. A copy in your crate has no such check.
+/// live transport. The generated part is checked against the generator in CI.
+/// A copy in your crate has no such check. See
+/// [code generation](https://github.com/amlalabs/fictionet-sdk/blob/main/docs/codegen.md)
+/// for the generation and checking steps.
 ///
 /// The packet layer is written by hand at the end of the file.
 /// [`Packet`](cme_mdp3::Packet) is one UDP datagram: the binary packet

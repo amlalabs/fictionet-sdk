@@ -1,6 +1,9 @@
 //! TDS (SQL Server): reading and writing packets, logins, SQL batches and
 //! response tokens, with no I/O.
 //!
+//! TEXT, NTEXT, IMAGE and XML column types are unsupported and return
+//! `Error::UnsupportedType`.
+//!
 //! `Packet`, `Message`, and `TokenStream` implement `Wire`. Stream decoders
 //! assemble packets, and `TokenReader` retains column metadata. There is no
 //! login or query session, database `Service`, SQL engine, authentication, or
