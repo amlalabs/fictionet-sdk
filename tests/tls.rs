@@ -335,17 +335,14 @@ impl rustls::time_provider::TimeProvider for FixedTime {
     }
 }
 
-fn client_config(ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
-    let mut config = ClientConfig::builder_with_details(
-        Arc::new(provider()),
-        Arc::new(FixedTime(date(2030, 1, 1))),
+fn client_config(fcx: &Cx, ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
+    fictionet::stdlib::sandbox::client_config(
+        fcx,
+        date(2030, 1, 1),
+        Some(&Arc::new(roots(ca))),
+        alpn,
     )
-    .with_safe_default_protocol_versions()
     .unwrap()
-    .with_root_certificates(roots(ca))
-    .with_no_client_auth();
-    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Arc::new(config)
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +354,7 @@ fn handshake_with_sni_and_alpn() {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[b"h2", b"http/1.1"]);
-            let client_config = client_config(&ca, &[b"h2", b"http/1.1"]);
+            let client_config = client_config(&fcx, &ca, &[b"h2", b"http/1.1"]);
             let (server_side, client_side) = mem_pair();
 
             let server = fcx.spawn(move |fcx| async move {
@@ -401,7 +398,7 @@ fn the_world_picks_a_config_per_handshake() {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let a = server_config(&fcx, &ca, "a.test", &[]);
             let b = server_config(&fcx, &ca, "b.test", &[]);
-            let client_config = client_config(&ca, &[]);
+            let client_config = client_config(&fcx, &ca, &[]);
 
             for name in ["a.test", "b.test", "a.test"] {
                 let (server_side, client_side) = mem_pair();
@@ -460,7 +457,7 @@ fn reject_sends_unrecognized_name() {
     within(Duration::from_secs(20), || {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
-            let client_config = client_config(&ca, &[]);
+            let client_config = client_config(&fcx, &ca, &[]);
             let (server_side, client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
                 let hello = tls::server(&fcx, server_side).await?;
@@ -492,7 +489,7 @@ fn a_dropped_hello_closes_with_no_alert() {
     within(Duration::from_secs(20), || {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
-            let client_config = client_config(&ca, &[]);
+            let client_config = client_config(&fcx, &ca, &[]);
             let (server_side, client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
                 drop(tls::server(&fcx, server_side).await?);
@@ -650,7 +647,7 @@ fn close_notify_both_ways() {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[]);
-            let client_config = client_config(&ca, &[]);
+            let client_config = client_config(&fcx, &ca, &[]);
             let (server_side, client_side) = mem_pair();
 
             let server = fcx.spawn(move |fcx| async move {
@@ -712,7 +709,7 @@ fn five_megabytes_each_way() {
             |fcx| async move {
                 let ca = Ca::new(&fcx, "Test CA").unwrap();
                 let config = server_config(&fcx, &ca, "example.test", &[]);
-                let client_config = client_config(&ca, &[]);
+                let client_config = client_config(&fcx, &ca, &[]);
                 let (server_side, client_side) = mem_pair();
                 let data: Arc<Vec<u8>> = Arc::new((0..SIZE).map(pattern).collect());
 
@@ -829,7 +826,7 @@ fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
             let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[]);
-            let client_config = client_config(&ca, &[]);
+            let client_config = client_config(&fcx, &ca, &[]);
             let (server_side, client_side) = mem_pair();
             let (tx, rx) = mpsc::channel();
             let server = fcx.spawn(move |fcx| async move {
@@ -882,5 +879,24 @@ fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
             .await
         }))
     })
+    .unwrap();
+}
+
+#[test]
+fn sandbox_client_returns_invalid_server_name() {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let (_, conn) = mem_pair();
+        let roots = Arc::new(RootCertStore::empty());
+        let result = fictionet::stdlib::sandbox::TlsClient::new(
+            &fcx,
+            conn,
+            &roots,
+            "invalid name",
+            &[],
+            date(2030, 1, 1),
+        );
+        assert!(result.is_err());
+        Ok(())
+    }))
     .unwrap();
 }

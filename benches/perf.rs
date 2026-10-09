@@ -33,16 +33,17 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use fictionet::prelude::*;
 use fictionet::relay::{self, Hello, Message as RelayMessage, unix};
-use fictionet::stdlib::dns::op::{Message, MessageType, Query, ResponseCode};
-use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::{self, ConnError, Connection, ip, tcp, tls, udp, web};
+use fictionet::stdlib::dns::op::{MessageType, ResponseCode};
+use fictionet::stdlib::dns::rr::{RData, RecordType};
+use fictionet::stdlib::sandbox::{self, Machine, TlsClient};
+use fictionet::stdlib::{self, Connection, ip, tcp, tls, web};
 use fictionet::{
     Attacher, Cx, End, Interface, Packet, RecvError, WorldSocket, block_on, listen, pair, run,
 };
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use rustls::RootCertStore;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 // ---------------------------------------------------------------------------
 // Counting allocations
@@ -1244,31 +1245,15 @@ fn http_row(t: &mut Table, reps: usize, case: HttpCase) {
 
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
-struct Machine {
-    tcp: tcp::Endpoint,
-    udp: udp::Endpoint,
-    _icmp: End,
-}
-
 fn machine(fcx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Machine {
-    let end = attacher.attach(name).unwrap();
-    let (tcp, udp, icmp, _other) = ip::split_protocols(fcx, end);
-    Machine {
-        tcp: tcp::endpoint(fcx, tcp, addr.into()),
-        udp: udp::endpoint(fcx, udp, addr.into()),
-        _icmp: icmp,
-    }
+    sandbox::machine(fcx, attacher.attach(name).unwrap(), addr)
 }
 
 async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Ipv4Addr {
-    let mut socket = m.udp.bind(0).unwrap();
-    let mut q = Message::query();
-    q.metadata.id = fcx.random_u64() as u16;
-    q.metadata.recursion_desired = true;
-    q.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
-    socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(GATEWAY.into(), 53));
-    let (bytes, _) = socket.recv(fcx).await.unwrap();
-    let r = Message::from_vec(&bytes).unwrap();
+    let r = m
+        .lookup(fcx, GATEWAY.into(), name, RecordType::A)
+        .await
+        .unwrap();
     assert_eq!(r.metadata.message_type, MessageType::Response);
     assert_eq!(r.metadata.response_code, ResponseCode::NoError, "{name}");
     r.answers
@@ -1367,7 +1352,15 @@ fn http_run(case: HttpCase) -> HttpRun {
                     .connect(&fcx, SocketAddr::new(addr.into(), 443))
                     .await?;
                 let alpn: &[u8] = if case.h2 { b"h2" } else { b"http/1.1" };
-                let mut t = TlsClient::new(conn, &roots, "bench.test", alpn);
+                let mut t = TlsClient::new(
+                    &fcx,
+                    conn,
+                    &roots,
+                    "bench.test",
+                    &[alpn],
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1_893_456_000),
+                )
+                .unwrap();
                 t.handshake(&fcx)
                     .await
                     .map_err(|e| fictionet::Error::msg(format!("{e:?}")))?;
@@ -1535,164 +1528,6 @@ fn sandbox_links(graph: &str) -> Vec<String> {
         })
         .filter_map(|o| field(o, "id"))
         .collect()
-}
-
-// A rustls client as a `Connection`.
-
-struct TlsClient<C> {
-    conn: C,
-    tls: ClientConnection,
-    out: Vec<u8>,
-    inbuf: Box<[u8]>,
-    pending: Vec<u8>,
-}
-
-impl<C: Connection + Unpin> TlsClient<C> {
-    fn new(conn: C, roots: &Arc<RootCertStore>, name: &str, alpn: &[u8]) -> Self {
-        let mut config =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_root_certificates(roots.clone())
-                .with_no_client_auth();
-        config.alpn_protocols = vec![alpn.to_vec()];
-        let tls = ClientConnection::new(
-            Arc::new(config),
-            ServerName::try_from(name.to_owned()).unwrap(),
-        )
-        .unwrap();
-        TlsClient {
-            conn,
-            tls,
-            out: Vec::new(),
-            inbuf: vec![0; 16384].into_boxed_slice(),
-            pending: Vec::new(),
-        }
-    }
-
-    fn poll_flush(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        loop {
-            if self.out.is_empty() {
-                if !self.tls.wants_write() {
-                    return Poll::Ready(Ok(()));
-                }
-                self.tls.write_tls(&mut self.out).unwrap();
-            }
-            match self.conn.poll_write(fcx, cx, &self.out) {
-                Poll::Ready(Ok(n)) => {
-                    self.out.drain(..n);
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-
-    /// Reads from the connection into rustls once. `Ok(false)` at the end
-    /// of the stream.
-    fn poll_fill(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<bool, ConnError>> {
-        let fresh;
-        let mut data: &[u8] = if !self.pending.is_empty() {
-            fresh = std::mem::take(&mut self.pending);
-            &fresh
-        } else {
-            let n = match self.conn.poll_read(fcx, cx, &mut self.inbuf) {
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            };
-            if n == 0 {
-                let _ = self.tls.read_tls(&mut &[][..]);
-            }
-            &self.inbuf[..n]
-        };
-        let n = data.len();
-        loop {
-            if !data.is_empty() && self.tls.read_tls(&mut data).is_err() {
-                self.pending = data.to_vec();
-                return Poll::Ready(Ok(true));
-            }
-            if self.tls.process_new_packets().is_err() {
-                return Poll::Ready(Err(ConnError::Broken));
-            }
-            if data.is_empty() {
-                return Poll::Ready(Ok(n > 0));
-            }
-        }
-    }
-
-    async fn handshake(&mut self, fcx: &Cx) -> Result<(), ConnError> {
-        poll_fn(|cx| {
-            loop {
-                match self.poll_flush(fcx, cx) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-                if !self.tls.is_handshaking() {
-                    return Poll::Ready(Ok(()));
-                }
-                match self.poll_fill(fcx, cx) {
-                    Poll::Ready(Ok(true)) => {}
-                    Poll::Ready(Ok(false)) => return Poll::Ready(Err(ConnError::Closed)),
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-        })
-        .await
-    }
-}
-
-impl<C: Connection + Unpin> Connection for TlsClient<C> {
-    fn poll_read(
-        &mut self,
-        fcx: &Cx,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<Result<usize, ConnError>> {
-        loop {
-            match self.tls.reader().read(buf) {
-                Ok(n) => return Poll::Ready(Ok(n)),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Poll::Ready(Ok(0)),
-                Err(_) => return Poll::Ready(Err(ConnError::Broken)),
-            }
-            if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
-                return Poll::Ready(Err(e));
-            }
-            match self.poll_fill(fcx, cx) {
-                Poll::Ready(Ok(true)) => {}
-                Poll::Ready(Ok(false)) => {
-                    return Poll::Ready(Ok(self.tls.reader().read(buf).unwrap_or(0)));
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-
-    fn poll_write(
-        &mut self,
-        fcx: &Cx,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<Result<usize, ConnError>> {
-        if let Poll::Ready(Err(e)) = self.poll_flush(fcx, cx) {
-            return Poll::Ready(Err(e));
-        }
-        let n = self.tls.writer().write(data).unwrap();
-        let _ = self.poll_flush(fcx, cx);
-        Poll::Ready(Ok(n))
-    }
-
-    fn poll_shutdown(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        self.tls.send_close_notify();
-        match self.poll_flush(fcx, cx) {
-            Poll::Ready(Ok(())) => self.conn.poll_shutdown(fcx, cx),
-            other => other,
-        }
-    }
 }
 
 // A hyper client over a `Connection`.

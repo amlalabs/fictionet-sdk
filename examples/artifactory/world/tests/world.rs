@@ -39,7 +39,8 @@ fn an_oversized_upload_stays_in_the_log() {
                 std::time::SystemTime::now(),
                 Some(&env.roots),
                 &[b"http/1.1"],
-            ),
+            )
+            .unwrap(),
         )
         .await?;
         let size = (64 << 20) + 1;
@@ -83,7 +84,8 @@ fn http2_size_refusal_keeps_the_method_and_targets() {
             std::time::SystemTime::now(),
             Some(&env.roots),
             &[b"http/1.1"],
-        ))
+        )
+        .unwrap())
         .clone();
         config.alpn_protocols = vec![b"h2".to_vec()];
         let io = tls(&fcx, &m, NAMES[0].1, NAMES[0].0, Arc::new(config)).await?;

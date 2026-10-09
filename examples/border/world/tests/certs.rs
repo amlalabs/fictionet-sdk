@@ -119,6 +119,18 @@ fn the_home_chain_goes_through_the_intermediate_to_the_root() {
                 &intermediate,
                 "DigiCert Global G3 TLS ECC SHA384 2020 CA1"
             ));
+            use fictionet::stdlib::{codec::Wire, x509};
+            let root_cert = x509::Certificate::parse(&root).unwrap();
+            let intermediate_cert = x509::Certificate::parse(&intermediate).unwrap();
+            assert_eq!(root_cert.tbs.subject, root_cert.tbs.issuer);
+            assert_eq!(intermediate_cert.tbs.issuer, root_cert.tbs.subject);
+            for cert in [&root_cert, &intermediate_cert] {
+                assert_eq!(cert.tbs.public_key.key.bytes().len(), 97);
+                assert_eq!(
+                    cert.signature_algorithm.oid.as_bytes(),
+                    &[0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3, 3]
+                );
+            }
             let ca = certs::load(&dir).unwrap();
             let leaf = certs::leaf(
                 &fcx,

@@ -136,10 +136,10 @@ fn tcp_of(p: &Packet) -> Option<&[u8]> {
 }
 
 async fn lookup(machine: &Machine, fcx: &Cx, name: &str) -> Ipv4Addr {
-    let mut socket = machine.udp.bind(5353).unwrap();
-    socket.send_to(&query(name, 1), SocketAddr::new(GATEWAY.into(), 53));
-    let (reply, _) = socket.recv(fcx).await.unwrap();
-    let reply = Message::from_vec(&reply).unwrap();
+    let reply = machine
+        .lookup(fcx, GATEWAY.into(), name, RecordType::A)
+        .await
+        .unwrap();
     reply
         .answers
         .iter()

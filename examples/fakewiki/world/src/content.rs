@@ -81,7 +81,6 @@ impl Content {
                 return Ok(response);
             }
         };
-
         let mut take = |name: &str| {
             parts
                 .headers

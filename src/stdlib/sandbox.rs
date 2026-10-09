@@ -3,11 +3,22 @@
 //! [`machine`] splits a cable into TCP, UDP, and ICMP. DNS queries and
 //! TLS handshakes use the run's clock and randomness.
 
+use fictionet::stdlib::codec::{Stream, Wire};
 use fictionet::stdlib::dns::op::{Message, Query};
 use fictionet::stdlib::dns::rr::{Name, RecordType};
-use fictionet::stdlib::{dns, ip, tcp, udp};
-use fictionet::{End, Error, Interface};
+use fictionet::stdlib::{ConnError, Connection, ConnectionExt, dns, http1, ip, tcp, tls, udp};
+use fictionet::{Cx, End, Error, Interface};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+};
+use std::future::poll_fn;
+use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::SystemTime;
 
 /// TCP, UDP, and ICMP on one sandbox cable.
 pub struct Machine {
@@ -60,33 +71,38 @@ impl Machine {
             }
         }
     }
-}
 
-use fictionet::{
-    Cx,
-    stdlib::{ConnError, Connection, tls},
-};
-use rustls::pki_types::{ServerName, UnixTime};
-use rustls::{ClientConfig, ClientConnection, RootCertStore};
-use std::future::poll_fn;
-use std::io::{ErrorKind, Read, Write};
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::SystemTime;
+    /// Connects with TLS. With no roots, the client accepts any certificate.
+    /// `start` supplies the world's date for certificate verification.
+    pub async fn tls(
+        &self,
+        fcx: &Cx,
+        to: SocketAddr,
+        name: &str,
+        roots: Option<&Arc<RootCertStore>>,
+        start: SystemTime,
+    ) -> Result<TlsClient<tcp::TcpConnection>, Error> {
+        let config = client_config(fcx, start, roots, &[b"http/1.1"])?;
+        self.tls_with_config(fcx, to, name, config).await
+    }
 
-struct Clock(Cx, std::time::SystemTime);
-impl std::fmt::Debug for Clock {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Clock")
+    /// Connects with a client configuration, including its ALPN preferences.
+    pub async fn tls_with_config(
+        &self,
+        fcx: &Cx,
+        to: SocketAddr,
+        name: &str,
+        config: Arc<ClientConfig>,
+    ) -> Result<TlsClient<tcp::TcpConnection>, Error> {
+        let conn = self.tcp.connect(fcx, to).await?;
+        let name = ServerName::try_from(name.to_owned())?;
+        let session = tls::with_context(fcx, || ClientConnection::new(config, name))?;
+        let mut client = TlsClient::with(conn, session);
+        client.handshake(fcx).await?;
+        Ok(client)
     }
 }
-impl rustls::time_provider::TimeProvider for Clock {
-    fn current_time(&self) -> Option<UnixTime> {
-        Some(UnixTime::since_unix_epoch(
-            self.1.duration_since(std::time::UNIX_EPOCH).ok()? + self.0.now().since_start(),
-        ))
-    }
-}
+
 /// A rustls client carried by a simulated connection.
 pub struct TlsClient<C> {
     /// The underlying connection.
@@ -100,15 +116,6 @@ pub struct TlsClient<C> {
     pending: Vec<u8>,
 }
 
-#[derive(Debug)]
-/// A TLS handshake failure.
-pub enum TlsError {
-    /// The underlying connection failed.
-    Conn(ConnError),
-    /// TLS verification or framing failed.
-    Tls(rustls::Error),
-}
-
 impl<C: Connection + Unpin> TlsClient<C> {
     /// Creates a client with trusted roots and the world's starting date.
     pub fn new(
@@ -118,13 +125,11 @@ impl<C: Connection + Unpin> TlsClient<C> {
         name: &str,
         alpn: &[&[u8]],
         start: SystemTime,
-    ) -> Self {
-        let config = client_config(fcx, start, Some(roots), alpn);
-        let tls = tls::with_context(fcx, || {
-            ClientConnection::new(config, ServerName::try_from(name.to_owned()).unwrap())
-        })
-        .unwrap();
-        TlsClient::with(conn, tls)
+    ) -> Result<Self, Error> {
+        let config = client_config(fcx, start, Some(roots), alpn)?;
+        let name = ServerName::try_from(name.to_owned())?;
+        let tls = tls::with_context(fcx, || ClientConnection::new(config, name))?;
+        Ok(TlsClient::with(conn, tls))
     }
 
     /// Wraps an existing TLS session.
@@ -144,7 +149,9 @@ impl<C: Connection + Unpin> TlsClient<C> {
                 if !self.tls.wants_write() {
                     return Poll::Ready(Ok(()));
                 }
-                self.tls.write_tls(&mut self.out).unwrap();
+                self.tls
+                    .write_tls(&mut self.out)
+                    .map_err(|_| ConnError::Broken)?;
             }
             match self.conn.poll_write(fcx, cx, &self.out) {
                 Poll::Ready(Ok(0)) => return Poll::Ready(Err(ConnError::Closed)),
@@ -263,7 +270,11 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
         }
-        let n = self.tls.writer().write(data).unwrap();
+        let n = self
+            .tls
+            .writer()
+            .write(data)
+            .map_err(|_| ConnError::Broken)?;
         let _ = self.poll_flush(fcx, cx);
         Poll::Ready(Ok(n))
     }
@@ -277,6 +288,15 @@ impl<C: Connection + Unpin> Connection for TlsClient<C> {
     }
 }
 
+/// A TLS handshake failure.
+#[derive(Debug)]
+pub enum TlsError {
+    /// The underlying connection failed.
+    Conn(ConnError),
+    /// TLS verification or framing failed.
+    Tls(rustls::Error),
+}
+
 impl std::fmt::Display for TlsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -287,9 +307,58 @@ impl std::fmt::Display for TlsError {
 }
 impl std::error::Error for TlsError {}
 
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::CertificateDer;
-use rustls::{DigitallySignedStruct, SignatureScheme};
+/// The client's TLS: verify against `roots`, or not at all.
+pub fn client_config(
+    fcx: &Cx,
+    start: SystemTime,
+    roots: Option<&Arc<RootCertStore>>,
+    alpn: &[&[u8]],
+) -> Result<Arc<ClientConfig>, Error> {
+    let builder = tls::client_config_builder(fcx, start).with_safe_default_protocol_versions()?;
+    let mut config = match roots {
+        Some(roots) => builder
+            .with_root_certificates(roots.clone())
+            .with_no_client_auth(),
+        None => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAll))
+            .with_no_client_auth(),
+    };
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Ok(Arc::new(config))
+}
+
+/// Sends one HTTP/1.1 request and reads its final response.
+/// The decoder bounds the response with the HTTP module's default limits.
+pub async fn request(
+    fcx: &Cx,
+    conn: &mut impl Connection,
+    request: &fictionet::stdlib::http1::Request,
+) -> Result<fictionet::stdlib::http1::Response, Error> {
+    let mut decoder = http1::Responses::new();
+    decoder.expect_method(&request.head.method)?;
+    let mut stream = Stream::new(decoder);
+    conn.write_all(fcx, &request.to_bytes()?).await?;
+    let mut buf = [0; 4096];
+    loop {
+        while let Some(response) = stream.next() {
+            let response = response.map_err(|e| Error::msg(format!("HTTP response: {e:?}")))?;
+            if response.head.status >= 200 || response.head.status == 101 {
+                return Ok(response);
+            }
+        }
+        if stream.is_done() {
+            return Err(Error::msg("connection ended before an HTTP response"));
+        }
+        let n = conn.read(fcx, &mut buf).await?;
+        if n == 0 {
+            stream.end();
+        } else if stream.push(&buf[..n]) != n {
+            return Err(Error::msg("HTTP response exceeds the buffer limit"));
+        }
+    }
+}
+
 /// Accepts any certificate: an agent that runs `curl -k`.
 #[derive(Debug)]
 struct AcceptAll;
@@ -328,96 +397,5 @@ impl ServerCertVerifier for AcceptAll {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
-    }
-}
-
-/// The client's TLS: verify against `roots`, or not at all.
-pub fn client_config(
-    fcx: &Cx,
-    start: SystemTime,
-    roots: Option<&Arc<RootCertStore>>,
-    alpn: &[&[u8]],
-) -> Arc<ClientConfig> {
-    let builder = ClientConfig::builder_with_details(
-        Arc::new(tls::crypto_provider()),
-        Arc::new(Clock(fcx.clone(), start)),
-    )
-    .with_safe_default_protocol_versions()
-    .unwrap();
-    let mut config = match roots {
-        Some(roots) => builder
-            .with_root_certificates(roots.clone())
-            .with_no_client_auth(),
-        None => builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAll))
-            .with_no_client_auth(),
-    };
-    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Arc::new(config)
-}
-
-impl Machine {
-    /// Connects with TLS. With no roots, the client accepts any certificate.
-    /// `start` supplies the world's date for certificate verification.
-    pub async fn tls(
-        &self,
-        fcx: &Cx,
-        to: SocketAddr,
-        name: &str,
-        roots: Option<&Arc<RootCertStore>>,
-        start: SystemTime,
-    ) -> Result<TlsClient<tcp::TcpConnection>, Error> {
-        let config = client_config(fcx, start, roots, &[b"http/1.1"]);
-        self.tls_with_config(fcx, to, name, config).await
-    }
-
-    /// Connects with a client configuration, including its ALPN preferences.
-    pub async fn tls_with_config(
-        &self,
-        fcx: &Cx,
-        to: SocketAddr,
-        name: &str,
-        config: Arc<ClientConfig>,
-    ) -> Result<TlsClient<tcp::TcpConnection>, Error> {
-        let conn = self.tcp.connect(fcx, to).await?;
-        let name = ServerName::try_from(name.to_owned())?;
-        let session = tls::with_context(fcx, || ClientConnection::new(config, name))?;
-        let mut client = TlsClient::with(conn, session);
-        client.handshake(fcx).await?;
-        Ok(client)
-    }
-}
-
-/// Sends one HTTP/1.1 request and reads its final response.
-/// The decoder bounds the response with the HTTP module's default limits.
-pub async fn request(
-    fcx: &Cx,
-    conn: &mut impl Connection,
-    request: &fictionet::stdlib::http1::Request,
-) -> Result<fictionet::stdlib::http1::Response, Error> {
-    use fictionet::stdlib::codec::{Stream, Wire};
-    use fictionet::stdlib::{ConnectionExt, http1};
-    let mut decoder = http1::Responses::new();
-    decoder.expect_method(&request.head.method)?;
-    let mut stream = Stream::new(decoder);
-    conn.write_all(fcx, &request.to_bytes()?).await?;
-    let mut buf = [0; 4096];
-    loop {
-        while let Some(response) = stream.next() {
-            let response = response.map_err(|e| Error::msg(format!("HTTP response: {e:?}")))?;
-            if response.head.status >= 200 || response.head.status == 101 {
-                return Ok(response);
-            }
-        }
-        if stream.is_done() {
-            return Err(Error::msg("connection ended before an HTTP response"));
-        }
-        let n = conn.read(fcx, &mut buf).await?;
-        if n == 0 {
-            stream.end();
-        } else if stream.push(&buf[..n]) != n {
-            return Err(Error::msg("HTTP response exceeds the buffer limit"));
-        }
     }
 }

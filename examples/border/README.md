@@ -294,7 +294,7 @@ examples/border/
     src/bgp.rs                     # The border router's speaker on stdlib::bgp
     src/path.rs                    # each sandbox's path: hops, the two routers
     src/events.rs, src/log.rs      # the log, from the network's events and the world's own tasks
-    src/lib.rs, src/main.rs        # the network, state.json, startup lookups, the ready file
+    src/lib.rs, src/main.rs        # the network, state.json, the ready file
     tests/                         # in-process tests; tests/pages/ holds the original pages
   src/border_eval/
     tasks.py                       # the eval: prompts, agent, preflight, scorer

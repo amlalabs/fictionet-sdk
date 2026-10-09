@@ -201,7 +201,7 @@ examples/fakewiki/
   docker/Dockerfile         # build-attach, build-world, ca, world, attach, agent
   world/                    # the world: its own Cargo package
     Cargo.toml              # depends on fictionet by path; world dependencies stay here
-    src/main.rs             # backend startup, startup lookups, state.json, ready file
+    src/main.rs             # backend startup, state.json, ready file
     src/lib.rs              # Sites, certificates, arguments and backend helpers
     src/content.rs          # the handler: asks backend.py for the page, tags the response
     src/events.rs           # the request log, written from the network's events

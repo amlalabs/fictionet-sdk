@@ -262,7 +262,7 @@ async fn episode(
             "localhost",
             &[if h2 { b"h2" } else { b"http/1.1" }],
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_893_456_000),
-        );
+        )?;
         secure.handshake(&cx).await.unwrap();
         if h2 {
             let (mut sender, connection) = h2::client::handshake(secure.into_tokio(&cx)).await?;

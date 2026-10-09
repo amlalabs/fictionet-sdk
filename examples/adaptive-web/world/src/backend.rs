@@ -121,7 +121,6 @@ impl Backend {
                 return Ok(response);
             }
         };
-
         let meta: Value = parts
             .headers
             .remove(META)

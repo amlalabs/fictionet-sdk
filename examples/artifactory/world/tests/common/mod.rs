@@ -300,7 +300,8 @@ pub async fn https(
             std::time::SystemTime::now(),
             Some(&env.roots),
             &[b"http/1.1"],
-        ),
+        )
+        .unwrap(),
     )
     .await
     .unwrap();
@@ -647,6 +648,7 @@ pub async fn script(fcx: Cx, attacher: Attacher, env: Env) -> fictionet::Result 
                 Some(&env.roots),
                 &[b"http/1.1"]
             )
+            .unwrap()
         )
         .await
         .is_err()

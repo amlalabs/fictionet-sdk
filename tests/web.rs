@@ -45,7 +45,7 @@ use fictionet::{Attacher, Cx, End, Interface, Packet, Seed, block_on, lab, run};
 use http::{HeaderMap, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use rustls::{ClientConnection, RootCertStore};
 
 // ---------------------------------------------------------------------------
 // Running a test world
@@ -350,17 +350,15 @@ const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 /// Asks the gateway's DNS over UDP. Returns the response code and the A
 /// records.
 async fn dns(fcx: &Cx, m: &Machine, name: &str, kind: RecordType) -> (ResponseCode, Vec<Ipv4Addr>) {
-    let mut socket = m.udp.bind(0).unwrap();
-    let mut q = Message::new(fcx.random_u64() as u16, MessageType::Query, OpCode::Query);
-    q.metadata.recursion_desired = true;
-    q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
-    socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(GATEWAY.into(), 53));
-    let (bytes, from) = timeout(fcx, Duration::from_secs(5), socket.recv(fcx))
-        .await
-        .expect("a DNS answer")
-        .unwrap();
-    assert_eq!(from, SocketAddr::new(GATEWAY.into(), 53));
-    parse_dns(&bytes, q.metadata.id)
+    let reply = timeout(
+        fcx,
+        Duration::from_secs(5),
+        m.lookup(fcx, GATEWAY.into(), name, kind),
+    )
+    .await
+    .expect("a DNS answer")
+    .unwrap();
+    parse_dns(&reply.to_vec().unwrap(), reply.metadata.id)
 }
 
 fn parse_dns(bytes: &[u8], id: u16) -> (ResponseCode, Vec<Ipv4Addr>) {
@@ -548,7 +546,8 @@ async fn tls_connect(
         sni,
         alpn,
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_893_456_000),
-    );
+    )
+    .unwrap();
     client.handshake(fcx).await?;
     Ok(client)
 }
@@ -3392,17 +3391,6 @@ fn events_for_dns_queries() {
     });
 }
 
-/// A rustls client config that trusts `roots`.
-fn client_config(roots: &Arc<RootCertStore>, alpn: &[&[u8]]) -> Arc<ClientConfig> {
-    let mut config = ClientConfig::builder_with_provider(Arc::new(tls::crypto_provider()))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(roots.clone())
-        .with_no_client_auth();
-    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Arc::new(config)
-}
-
 #[test]
 fn events_for_tls_handshakes() {
     world_events(|fcx, attacher, env, log| async move {
@@ -3450,13 +3438,20 @@ fn events_for_tls_handshakes() {
             "secure.test",
             &[],
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_893_456_000),
-        );
+        )
+        .unwrap();
         assert!(client.handshake(&fcx).await.is_err());
         // 5. A hello split over several segments.
         let mut tcp = m.tcp.connect(&fcx, to(EVENTS_ADDR)).await.unwrap();
         let mut tls = tls::with_context(&fcx, || {
             ClientConnection::new(
-                client_config(&env.roots, &[b"http/1.1"]),
+                fictionet::stdlib::sandbox::client_config(
+                    &fcx,
+                    std::time::UNIX_EPOCH + Duration::from_secs(1_893_456_000),
+                    Some(&env.roots),
+                    &[b"http/1.1"],
+                )
+                .unwrap(),
                 ServerName::try_from("events.test".to_owned()).unwrap(),
             )
         })
@@ -4745,7 +4740,8 @@ fn https_http2_and_plain_http_over_ipv6() {
             &DUAL_ADDR6.to_string(),
             &[],
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_893_456_000),
-        );
+        )
+        .unwrap();
         assert!(bare.handshake(&fcx).await.is_err());
 
         // The events name the IPv6 addresses.

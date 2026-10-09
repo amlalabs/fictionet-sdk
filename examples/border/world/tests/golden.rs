@@ -47,7 +47,8 @@ async fn h2_head(
         std::time::SystemTime::now(),
         None,
         &[b"http/1.1"],
-    ))
+    )
+    .unwrap())
     .clone();
     config.alpn_protocols = vec![b"h2".to_vec()];
     let stream = tls(fcx, m, addr, host, std::sync::Arc::new(config))
@@ -118,7 +119,8 @@ fn script(variant: Variant) {
                 std::time::SystemTime::now(),
                 None,
                 &[b"http/1.1"],
-            ),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -147,7 +149,8 @@ fn script(variant: Variant) {
                 std::time::SystemTime::now(),
                 None,
                 &[b"http/1.1"],
-            ),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -172,7 +175,8 @@ fn script(variant: Variant) {
                 std::time::SystemTime::now(),
                 Some(&env.roots),
                 &[b"http/1.1"],
-            ),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -218,6 +222,7 @@ fn script(variant: Variant) {
                     None,
                     &[b"http/1.1"]
                 )
+                .unwrap()
             )
             .await
             .is_err()

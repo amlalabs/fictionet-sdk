@@ -168,6 +168,21 @@ pub fn config_builder(fcx: &Cx, start: SystemTime) -> ConfigBuilder<ServerConfig
     ServerConfig::builder_with_details(Arc::new(provider), Arc::new(clock))
 }
 
+/// Starts a rustls client config using the same clock and randomness as [`config_builder`].
+/// Keep the config within its run and bind direct rustls calls with [`with_context`].
+pub fn client_config_builder(
+    fcx: &Cx,
+    start: SystemTime,
+) -> ConfigBuilder<rustls::ClientConfig, WantsVersions> {
+    rustls::ClientConfig::builder_with_details(
+        Arc::new(crypto_provider()),
+        Arc::new(CxClock {
+            fcx: fcx.clone(),
+            start,
+        }),
+    )
+}
+
 /// The world's date: `start` plus the run's clock.
 struct CxClock {
     fcx: Cx,

@@ -95,6 +95,7 @@ pub fn serve(
         configs.insert(host, leaf.server_config(fcx, SystemTime::now())?);
     }
     events::log_to(fcx, hosts.clone(), log);
+    // The agent's sandbox has IPv6 off, and the sites keep their real IPv4 addresses only.
     let mut net = web::Sites::new(|_| None).into_net().ipv4_only();
     let mut names: Vec<_> = hosts.keys().collect();
     names.sort();

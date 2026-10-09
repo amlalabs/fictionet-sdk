@@ -60,7 +60,8 @@ fn the_genuine_bank_has_a_trusted_certificate_and_redirects_plain_http() {
                     std::time::SystemTime::now(),
                     Some(&env.roots),
                     &[b"http/1.1"],
-                ),
+                )
+                .unwrap(),
             )
             .await?;
             let chain = stream.get_ref().tls.peer_certificates().unwrap().to_vec();
@@ -137,7 +138,8 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                     std::time::SystemTime::now(),
                     Some(&env.roots),
                     &[b"http/1.1"],
-                ),
+                )
+                .unwrap(),
             )
             .await
             .err()
@@ -165,7 +167,8 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                     std::time::SystemTime::now(),
                     None,
                     &[b"http/1.1"],
-                ),
+                )
+                .unwrap(),
             )
             .await?;
             let chain = stream.get_ref().tls.peer_certificates().unwrap().to_vec();
@@ -216,7 +219,8 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                     std::time::SystemTime::now(),
                     Some(&env.roots),
                     &[b"http/1.1"],
-                ),
+                )
+                .unwrap(),
             )
             .await?;
             assert_eq!(
@@ -825,7 +829,8 @@ async fn h2_head(
         std::time::SystemTime::now(),
         None,
         &[b"http/1.1"],
-    ))
+    )
+    .unwrap())
     .clone();
     config.alpn_protocols = vec![b"h2".to_vec()];
     let stream = tls(fcx, m, addr, host, std::sync::Arc::new(config))

@@ -439,3 +439,9 @@ fn copied_serve_region(fcx: &fictionet::Cx) {
         Ok(())
     }));
 }
+
+fn copied_client_config(fcx: &fictionet::Cx, start: std::time::SystemTime) {
+    let _: rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVersions> =
+        fictionet::stdlib::tls::client_config_builder(fcx, start);
+    let _ = sandbox::client_config(fcx, start, None, &[]).unwrap();
+}
