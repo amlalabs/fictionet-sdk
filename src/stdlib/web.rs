@@ -459,7 +459,7 @@
 //!   DNS-over-TCP connection is closed after 10 seconds with no query.
 //! - **Lengths.** A response body whose length is known, such as a `String`
 //!   or an `http_body_util::Full`, is sent with `content-length`, as real
-//!   websites send it. A body of unknown length is sent chunked on HTTP/1.1.
+//!   servers send it. A body of unknown length is sent chunked on HTTP/1.1.
 //! - **HEAD.** The answer to a `HEAD` request has the headers a `GET` would
 //!   get and no body, on HTTP/1.1 and HTTP/2. A body of known length keeps
 //!   its length as `content-length`. Handlers need not handle `HEAD`

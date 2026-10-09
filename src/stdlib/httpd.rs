@@ -24,9 +24,9 @@
 //! On a [`Net`](fictionet::stdlib::net::Net), a [`Server`] is the
 //! [`PortServer`] that serves HTTP on a host's
 //! port: sites of several hosts at one address share the port as virtual
-//! hosts. [`Server::served_by`] puts a site on ports 80 and 443 the way websites
-//! are served. `Net` knows nothing of HTTP, so a copy of this file with
-//! its own handlers plugs in the same way.
+//! hosts. [`Server::served_by`] puts a site on ports 80 and 443 the way
+//! websites are served. `Net` knows nothing of HTTP, so a copy of this
+//! file with its own handlers plugs in the same way.
 //!
 //! [`Http1`] is the [`Service`](fictionet::stdlib::serve::Service) that speaks
 //! HTTP/1.0 and 1.1 to a client, on [`http1`]'s
@@ -52,7 +52,8 @@
 //!
 //! The world owns its dates. A response carries a `Date` header only when
 //! the world gave the date it was at the start of the run, with
-//! [`Http1::date`], [`HttpOptions::date`] or [`Server::date`]: the header is then that date plus the run's clock.
+//! [`Http1::date`], [`HttpOptions::date`] or [`Server::date`]: the header
+//! is then that date plus the run's clock.
 //! Without one, responses have no `Date` header (RFC 9110 lets a server
 //! with no clock leave it out). The host's clock is never used, so a world
 //! set in 2019 never sends a date from the year it runs in. A `Date` the

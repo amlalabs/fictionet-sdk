@@ -1015,27 +1015,27 @@ fn body_layer(d: &mut Decoded, total: u64, seen: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn body_previews_keep_byte_boundaries_and_text_policy() {
-        assert_eq!(super::body_preview(b""), Some(String::new()));
-        assert_eq!(
-            super::body_preview(b"a\r\nb\n\t\r"),
-            Some("a\\r\\nb\\n\t\r".into())
-        );
-        assert_eq!(super::body_preview(b"a\0"), None);
-        assert_eq!(
-            super::body_preview(&[b'x'; 161]),
-            Some(format!("{}…", "x".repeat(160)))
-        );
-        assert_eq!(
-            super::body_preview(format!("{}é", "x".repeat(159)).as_bytes()),
-            None
-        );
-    }
-
     use super::*;
     use fictionet::stdlib::codec::{Lcg, Stream};
     use fictionet::stdlib::test_support::contract::check_decode;
+
+    #[test]
+    fn body_previews_keep_byte_boundaries_and_text_policy() {
+        assert_eq!(body_preview(b""), Some(String::new()));
+        assert_eq!(
+            body_preview(b"a\r\nb\n\t\r"),
+            Some("a\\r\\nb\\n\t\r".into())
+        );
+        assert_eq!(body_preview(b"a\0"), None);
+        assert_eq!(
+            body_preview(&[b'x'; 161]),
+            Some(format!("{}…", "x".repeat(160)))
+        );
+        assert_eq!(
+            body_preview(format!("{}é", "x".repeat(159)).as_bytes()),
+            None
+        );
+    }
 
     #[test]
     fn long_http_methods_keep_only_bounded_framing_state() {
