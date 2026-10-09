@@ -1329,11 +1329,16 @@ impl serve::Service for Http1 {
         _: &(),
         driver: &mut Driver<'_, http1::RequestEvents>,
     ) -> Result<Flow, Infallible> {
-        driver.record(error_event(
-            driver.conn(),
-            "timeout",
-            "request timed out".into(),
-        ));
+        let detail = if self.head.is_some() {
+            Some("request body timed out")
+        } else if !driver.unread().is_empty() {
+            Some("request head timed out")
+        } else {
+            None
+        };
+        if let Some(detail) = detail {
+            driver.record(error_event(driver.conn(), "timeout", detail.into()));
+        }
         Ok(Flow::Close)
     }
 

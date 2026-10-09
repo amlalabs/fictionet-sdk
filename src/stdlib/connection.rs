@@ -93,7 +93,9 @@ pub trait Connection: Send + 'static {
     /// waits for the connection underneath. A TLS connection, for example,
     /// has encrypted them and reports them taken once they are sent. If a
     /// pending write is dropped, its bytes may still be sent. A later write
-    /// with different bytes must report only bytes from that later call.
+    /// that starts with the same bytes counts as a retry, even if it has
+    /// more bytes after them. A later write with different starting bytes
+    /// must report only bytes from that later call.
     ///
     /// Never returns `Ok(0)` when `data` is not empty: a connection that can
     /// take no more bytes ever returns an error instead.

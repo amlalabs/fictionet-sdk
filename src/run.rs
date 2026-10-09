@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::JoinError;
-use crate::cx::{JoinState, Region, is_cancel};
+use crate::cx::{CancelWait, JoinState, Region, is_cancel};
 use crate::watch::{Graph, Polling};
 use crate::{Cx, Result};
 
@@ -148,7 +148,7 @@ where
         }),
         graph,
     });
-    let root = Region::root(Arc::downgrade(&shared));
+    let root = Region::root();
     let mut state = RunState {
         shared: shared.clone(),
         root: root.clone(),
@@ -186,8 +186,6 @@ struct Queue {
     /// The run is being polled now, so it checks `ready` before it returns
     /// and wakes need not wake `outer`.
     polling: bool,
-    /// A region was cancelled: poll every task once.
-    wake_all: bool,
     /// The run was dropped.
     closed: bool,
     next_id: u64,
@@ -248,22 +246,6 @@ impl RunShared {
             w.wake();
         }
     }
-
-    /// Polls every task once more. Called when a region is cancelled, so
-    /// that every wait sees it.
-    pub(crate) fn wake_all(&self) {
-        let outer = {
-            let mut q = self.queue.lock().unwrap();
-            if q.closed {
-                return;
-            }
-            q.wake_all = true;
-            if q.polling { None } else { q.outer.clone() }
-        };
-        if let Some(w) = outer {
-            w.wake();
-        }
-    }
 }
 
 /// The waker of one task: puts the task back in the queue.
@@ -294,26 +276,26 @@ struct Slot {
     waker: Waker,
     region: Arc<Region>,
     join: Arc<JoinState>,
+    _cancel: CancelWait,
 }
 
 thread_local! {
-    /// The run and task being polled on this thread, if any: the run's
+    /// The region and task being polled on this thread, if any: the region's
     /// address and the data pointer of the task's waker.
-    static CURRENT: Cell<(*const RunShared, *const ())> =
+    static CURRENT: Cell<(*const Region, *const ())> =
         const { Cell::new((std::ptr::null(), std::ptr::null())) };
 }
 
-/// Whether `waker` is the waker of the task of `run` that is being polled
-/// on this thread right now.
-pub(crate) fn is_current_task(run: &Arc<RunShared>, waker: &Waker) -> bool {
+/// Whether `waker` belongs to a task in `region` being polled on this thread.
+pub(crate) fn is_region_task(region: &Arc<Region>, waker: &Waker) -> bool {
     CURRENT.with(|c| {
         let (r, data) = c.get();
-        r == Arc::as_ptr(run) && data == waker.data()
+        r == Arc::as_ptr(region) && data == waker.data()
     })
 }
 
 /// Restores [`CURRENT`] when a poll ends, even by a panic.
-struct CurrentGuard((*const RunShared, *const ()));
+struct CurrentGuard((*const Region, *const ()));
 
 impl Drop for CurrentGuard {
     fn drop(&mut self) {
@@ -359,6 +341,7 @@ impl RunState {
                     new.id,
                     Slot {
                         future: new.future,
+                        _cancel: new.region.register(&waker),
                         task_waker,
                         waker,
                         region: new.region,
@@ -367,28 +350,17 @@ impl RunState {
                 );
                 q.ready.push_back(new.id);
             }
-            if std::mem::take(&mut q.wake_all) {
-                for &id in self.slots.keys() {
-                    if !self.slots[&id]
-                        .task_waker
-                        .queued
-                        .swap(true, Ordering::AcqRel)
-                    {
-                        q.ready.push_back(id);
-                    }
-                }
-            }
             std::mem::swap(&mut q.ready, &mut turn);
         }
 
-        let run_ptr = Arc::as_ptr(&self.shared);
         while let Some(id) = turn.pop_front() {
             let Some(slot) = self.slots.get_mut(&id) else {
                 continue;
             };
             slot.task_waker.queued.store(false, Ordering::Release);
             let result = {
-                let previous = CURRENT.with(|c| c.replace((run_ptr, slot.waker.data())));
+                let previous =
+                    CURRENT.with(|c| c.replace((Arc::as_ptr(&slot.region), slot.waker.data())));
                 let _guard = CurrentGuard(previous);
                 let _polling = Polling::enter(id);
                 slot.future
@@ -442,7 +414,7 @@ impl RunState {
                 None => Ok(()),
             });
         }
-        let more = !q.ready.is_empty() || !q.incoming.is_empty() || q.wake_all;
+        let more = !q.ready.is_empty() || !q.incoming.is_empty();
         if !more && self.shared.environment.clock.mode() == crate::RunMode::Lab {
             // Admission and the time jump share this boundary. A spawn or
             // wake cannot slip between checking the queue and advancing.

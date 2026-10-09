@@ -747,7 +747,8 @@ impl<D> Driver<'_, D> {
 
     /// In [`Service::on_fail`], the bytes the decoder could not use: a
     /// message cut off by the end of input, or bytes that are not this
-    /// protocol. Empty in every other call.
+    /// protocol. In [`Service::on_timer`], the bytes still buffered by the
+    /// stream decoder. Empty in every other call.
     pub fn unread(&self) -> &[u8] {
         &self.s.unread
     }
@@ -2133,7 +2134,9 @@ where
         // A due timer before more input, so input cannot starve it.
         if let Some(i) = due(&self.timers, now) {
             let (name, _) = self.timers.remove(i);
+            self.s.unread = self.stream.unread().to_vec();
             self.call(now, |driver| service.on_timer(name, state, driver));
+            self.s.unread = Vec::new();
             return Next::Again;
         }
         if self.s.wake.take() {

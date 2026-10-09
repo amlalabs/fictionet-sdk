@@ -1,13 +1,14 @@
 //! The `sbe` front end: FIX Simple Binary Encoding 1.0 XML message schemas.
 //!
-//! It maps one `messageSchema` document onto the IR. Enums and sets become
-//! named enums and sets. Enums preserve unrecognized values as `Unknown(raw)`;
-//! a schema choice named `Unknown` becomes `UnknownValue`. Composites used by messages become structs, with
-//! their member offsets. Messages and repeating groups become blocks with
-//! their declared `blockLength`. Groups use their dimension composite as a
+//! It maps one `messageSchema` document onto the IR. Enums and sets
+//! become named enums and sets. Enums preserve unrecognized values as
+//! `Unknown(raw)`; a schema choice named `Unknown` becomes
+//! `UnknownValue`. Composites used by messages become structs, with their
+//! member offsets. Messages and repeating groups become blocks with their
+//! declared `blockLength`. Groups use their dimension composite as a
 //! [`Header`] with a length and a count. Variable data becomes bytes with
-//! the length prefix of its encoding. The message header composite becomes
-//! the header of one union, `Message`, with a case per template.
+//! the length prefix of its encoding. The message header composite
+//! becomes the header of one union, `Message`, with a case per template.
 //!
 //! Required scalars become ranges that exclude the null value, as section
 //! 2 requires. Optional scalars and enums use their null value. Constants

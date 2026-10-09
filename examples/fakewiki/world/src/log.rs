@@ -45,8 +45,8 @@ impl Log {
         })
     }
 
-    /// Queues one event for the writer thread. `ts` comes first, as in main.py: seconds since the
-    /// epoch, rounded to milliseconds.
+    /// Queues one event for the writer thread. `ts` comes first, as in
+    /// main.py: seconds since the epoch, rounded to milliseconds.
     pub fn write(&self, event: Value) {
         let mut line = Map::new();
         let ts = SystemTime::now()

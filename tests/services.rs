@@ -3413,11 +3413,39 @@ fn http1_header_timeout_records_an_error() {
     let _ = h.advance(Duration::from_secs(31));
     assert!(h.closed());
     assert!(
-        h.events()
-            .iter()
-            .any(|e| e.is("http", "error") && e.str("cause") == Some("timeout")),
+        h.events().iter().any(|e| e.is("http", "error")
+            && e.str("cause") == Some("timeout")
+            && e.str("detail") == Some("request head timed out")),
         "no http.error with cause timeout"
     );
+}
+
+#[test]
+fn http1_idle_keep_alive_timeout_closes_without_an_error() {
+    let router = Router::new().get("/", |_, _| http::Response::new(Bytes::from("ok")));
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+    let reply = h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").unwrap();
+    assert!(reply.starts_with(b"HTTP/1.1 200"));
+    assert!(!h.closed());
+    h.advance(Duration::from_secs(31)).unwrap();
+    assert!(h.closed());
+    assert!(!h.events().iter().any(|e| e.is("http", "error")));
+}
+
+#[test]
+fn http1_pipelined_partial_head_timeout_records_an_error() {
+    let router = Router::new().get("/", |_, _| http::Response::new(Bytes::from("ok")));
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+    let reply = h
+        .push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\nGET / HTTP/1.1\r\n")
+        .unwrap();
+    assert!(reply.starts_with(b"HTTP/1.1 200"));
+    assert!(!h.closed());
+    h.advance(Duration::from_secs(31)).unwrap();
+    assert!(h.closed());
+    assert!(h.events().iter().any(|e| e.is("http", "error")
+        && e.str("cause") == Some("timeout")
+        && e.str("detail") == Some("request head timed out")));
 }
 
 /// A known path takes precedence over the fallback.
@@ -3470,9 +3498,7 @@ fn http1_body_timeout_records_an_error() {
         .unwrap();
     h.advance(Duration::from_secs(61)).unwrap();
     assert!(h.closed());
-    assert!(
-        h.events()
-            .iter()
-            .any(|e| e.is("http", "error") && e.str("cause") == Some("timeout"))
-    );
+    assert!(h.events().iter().any(|e| e.is("http", "error")
+        && e.str("cause") == Some("timeout")
+        && e.str("detail") == Some("request body timed out")));
 }

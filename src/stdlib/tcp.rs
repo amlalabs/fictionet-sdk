@@ -844,18 +844,13 @@ impl State {
         // A listening socket in an earlier slot must not take a SYN for
         // a tuple that already belongs to a connection.
         let mut idle = Vec::new();
-        if syn && handle.is_some() {
-            let mut ids: Vec<_> = self
-                .handles
-                .iter()
-                .filter_map(|(&id, &h)| {
-                    (self.sockets.get::<stcp::Socket>(h).state() == TcpState::Listen)
-                        .then_some((id, h))
-                })
-                .collect();
-            ids.sort_unstable_by_key(|(id, _)| *id);
-            for (id, h) in ids {
-                idle.push((id, self.sockets.remove(h)));
+        if syn
+            && !ack
+            && handle.is_some()
+            && let Some(listener) = self.listeners.get(&dst.port())
+        {
+            for &id in &listener.idle {
+                idle.push((id, self.sockets.remove(self.handles[&id])));
             }
         }
         self.dev.rx = Some(packet);
