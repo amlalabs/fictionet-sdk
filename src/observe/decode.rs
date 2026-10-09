@@ -126,7 +126,15 @@ impl Decoded {
     /// Updates the packet summary at an application level: 1 for TLS,
     /// 2 for its payload or another application protocol.
     pub fn application(&mut self, level: u8, protocol: &str, text: &str) {
-        super::app::info(self, level, protocol, text);
+        if level > self.level {
+            self.level = level;
+            self.proto = protocol.into();
+            self.info = text.to_owned();
+        } else if level == self.level {
+            self.info.push_str(", ");
+            self.info.push_str(text);
+        }
+        self.cap_info();
     }
 
     /// The summary priority: 0 for transport, 1 for TLS, 2 for applications.
@@ -956,7 +964,7 @@ fn icmp_name(kind: u8, code: u8, v6: bool) -> String {
     s.to_owned()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "observe"))]
 mod tests {
     use super::*;
 

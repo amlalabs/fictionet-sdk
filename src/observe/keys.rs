@@ -10,19 +10,23 @@ use std::sync::Arc;
 use rustls::ServerConfig;
 
 use crate::Cx;
+#[cfg(feature = "observe")]
 use crate::watch::KeyLine;
 
 /// Keeps secrets with what a run tracks for observers.
+#[cfg(feature = "observe")]
 struct Recorder {
     fcx: Cx,
 }
 
+#[cfg(feature = "observe")]
 impl std::fmt::Debug for Recorder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Recorder").finish_non_exhaustive()
     }
 }
 
+#[cfg(feature = "observe")]
 impl rustls::KeyLog for Recorder {
     fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
         let graph = self.fcx.graph();
@@ -40,13 +44,21 @@ impl rustls::KeyLog for Recorder {
 /// clones it and replaces its key logger with one that records session
 /// secrets for packet decryption.
 pub fn observed_config(fcx: &Cx, config: Arc<ServerConfig>) -> Arc<ServerConfig> {
-    if !fcx.observed() {
-        return config;
+    #[cfg(feature = "observe")]
+    {
+        if !fcx.observed() {
+            return config;
+        }
+        let mut logged = (*config).clone();
+        logged.key_log = Arc::new(Recorder { fcx: fcx.clone() });
+        Arc::new(logged)
     }
-    let mut logged = (*config).clone();
-    logged.key_log = Arc::new(Recorder { fcx: fcx.clone() });
-    Arc::new(logged)
+    #[cfg(not(feature = "observe"))]
+    {
+        let _ = fcx;
+        config
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "observe"))]
 mod tests;

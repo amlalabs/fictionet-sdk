@@ -9,19 +9,21 @@
 //! packet, a [router] that loses a route, a LAN) all record events, and so
 //! can world code:
 //!
-//! ```
-//! use fictionet::events::{Event, Level};
-//! # fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
-//! fcx.record(Event::new("modbus", "write_register")
-//!     .summary("register 40001 = 900")
-//!     .level(Level::Alarm)
-//!     .field("register", 40001u32)
-//!     .field("value", 900u32));
-//! let events = fcx.events().of("modbus", "write_register");
-//! assert_eq!(events[0].u64("value"), Some(900));
-//! # Ok(()) }))?;
-//! # Ok::<(), fictionet::Error>(())
-//! ```
+#![doc = fictionet::cfg_std!(doc r####"
+```
+use fictionet::events::{Event, Level};
+# fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
+fcx.record(Event::new("modbus", "write_register")
+    .summary("register 40001 = 900")
+    .level(Level::Alarm)
+    .field("register", 40001u32)
+    .field("value", 900u32));
+let events = fcx.events().of("modbus", "write_register");
+assert_eq!(events[0].u64("value"), Some(900));
+# Ok(()) }))?;
+# Ok::<(), fictionet::Error>(())
+```
+"####)]
 //!
 //! # The event log
 //!
@@ -72,7 +74,7 @@
 //!   watch`, which see what the log still holds when they connect, then
 //!   every new event as it comes (see [`observe`](crate::observe#events));
 //! - a JSON Lines file, one event per line, for a grader that reads it
-//!   after the run ([`EventLog::to_file`]);
+//!   after the run ([`EventLog::to_file`](https://docs.rs/fictionet/latest/fictionet/events/struct.EventLog.html#method.to_file));
 //! - callbacks in the same process ([`EventLog::subscribe`]);
 //! - a grader or a test in the same process, which reads the log itself,
 //!   during the run or after it ([`EventLog::all`] and [`EventLog::wait`]).
@@ -117,17 +119,21 @@
 //! [`Cx::record_repeat`]: crate::Cx::record_repeat
 //! [`Layer::note`]: crate::observe::Layer::note
 
+use fictionet::sync::{Mutex, MutexGuard};
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(feature = "std")]
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+#[cfg(feature = "std")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "std")]
 use std::sync::mpsc::{Receiver, sync_channel};
-use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::Cx;
-use crate::lock;
 use crate::stdlib::codec::Wire;
 use crate::stdlib::json::{Number, Value};
 use crate::time::Instant;
@@ -218,7 +224,7 @@ impl Level {
 /// under one name as a JSON object or array of pairs.
 ///
 /// An HTTP handler adds fields to its request's event by putting `Fields`
-/// in its response's extensions (see [`httpd`](crate::stdlib::httpd)).
+/// in its response's extensions (see [`httpd`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/index.html)).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Fields(Vec<(&'static str, Value)>);
 
@@ -654,8 +660,10 @@ fn value_size(v: &Value) -> usize {
 type Subscriber = Arc<dyn Fn(&Event) + Send + Sync>;
 
 /// How many lines may wait for a file's writer thread.
+#[cfg(feature = "std")]
 const FILE_QUEUE: usize = 100_000;
 /// How many bytes of lines may wait for a file's writer thread.
+#[cfg(feature = "std")]
 const FILE_QUEUE_BYTES: usize = MAX_EVENT_BYTES;
 
 /// What a run's log holds.
@@ -834,7 +842,7 @@ impl Store {
     /// Numbers `event`, keeps it, and calls the subscribers.
     pub(crate) fn push(&self, event: Event) {
         let mut out = Vec::with_capacity(1);
-        let mut s = lock(&self.state);
+        let mut s = self.state.lock();
         s.advance(event.at, &mut out);
         s.keep(event, false, &mut out);
         Store::tell(s, &out);
@@ -850,7 +858,7 @@ impl Store {
             fields: std::mem::take(&mut event.fields),
         };
         let mut out = Vec::new();
-        let mut s = lock(&self.state);
+        let mut s = self.state.lock();
         s.advance(event.at, &mut out);
         if let Some(window) = s.open.get_mut(&key) {
             window.add(event.at, &detail);
@@ -881,7 +889,7 @@ impl Store {
     /// by then.
     pub(crate) fn advance(&self, at: Instant) {
         let mut out = Vec::new();
-        let mut s = lock(&self.state);
+        let mut s = self.state.lock();
         s.advance(at, &mut out);
         Store::tell(s, &out);
     }
@@ -902,7 +910,7 @@ impl Store {
 
     /// The number of the last event recorded.
     pub(crate) fn last(&self) -> u64 {
-        lock(&self.state).last
+        self.state.lock().last
     }
 
     /// Ends the log with the run: records every count of repeats still
@@ -911,7 +919,7 @@ impl Store {
     pub(crate) fn close(&self) {
         let mut out = Vec::new();
         let (subscribers, writers) = {
-            let mut s = lock(&self.state);
+            let mut s = self.state.lock();
             while !s.due.is_empty() {
                 s.close_oldest(&mut out);
             }
@@ -936,7 +944,7 @@ impl Store {
     /// The events after number `after`, at most `max`, oldest first, with
     /// an `events.dropped` event wherever some of them are gone.
     pub(crate) fn after(&self, after: u64, max: usize) -> Vec<Arc<Event>> {
-        let s = lock(&self.state);
+        let s = self.state.lock();
         after_locked(&s, after, max)
     }
 }
@@ -986,7 +994,7 @@ pub struct EventLog {
 
 impl std::fmt::Debug for EventLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = lock(&self.store.state);
+        let s = self.store.state.lock();
         let held = s.events.events.len() + s.repeats.events.len();
         f.debug_struct("EventLog")
             .field("recorded", &s.last)
@@ -1022,7 +1030,7 @@ impl EventLog {
 
     /// The events of `source`'s `kind` the log holds.
     pub fn of(&self, source: &str, kind: &str) -> Vec<Event> {
-        let s = lock(&self.store.state);
+        let s = self.store.state.lock();
         held(&s, 0)
             .filter(|e| e.is(source, kind))
             .map(|e| (**e).clone())
@@ -1036,7 +1044,7 @@ impl EventLog {
 
     /// How many events the log has dropped for its limits.
     pub fn dropped(&self) -> u64 {
-        lock(&self.store.state).dropped
+        self.store.state.lock().dropped
     }
 
     /// Calls `f` with every event the log holds now, oldest first (with
@@ -1048,7 +1056,7 @@ impl EventLog {
     pub fn subscribe(&self, f: impl Fn(&Event) + Send + Sync + 'static) {
         let f: Subscriber = Arc::new(f);
         let held = {
-            let mut s = lock(&self.store.state);
+            let mut s = self.store.state.lock();
             let held = after_locked(&s, 0, usize::MAX);
             if !s.closed {
                 let mut all: Vec<Subscriber> = s.subscribers.iter().cloned().collect();
@@ -1066,6 +1074,7 @@ impl EventLog {
     /// with the same delivery policy as [`EventLog::to_writer`]: what the
     /// log holds now, then each event as it is recorded. The file is created,
     /// or emptied.
+    #[cfg(feature = "std")]
     pub fn to_file(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let file = std::fs::File::create(path)?;
         self.to_writer(Box::new(std::io::BufWriter::new(file)));
@@ -1086,11 +1095,11 @@ impl EventLog {
     /// written since the last flush that worked, as lost. A grader throws
     /// away a sample with any line lost.
     pub fn to_writer(&self, out: Box<dyn Write + Send>) {
-        if self.store.mode == crate::RunMode::Lab {
+        if !cfg!(feature = "std") || self.store.mode == crate::RunMode::Lab {
             let writer = Mutex::new(Some(out));
             let lost = self.store.lost.clone();
             self.subscribe(move |event| {
-                let mut writer = lock(&writer);
+                let mut writer = writer.lock();
                 let failed = match writer.as_mut() {
                     Some(out) => event.to_json().to_bytes().ok().is_none_or(|mut line| {
                         line.push(b'\n');
@@ -1103,39 +1112,43 @@ impl EventLog {
                     lost.fetch_add(1, Ordering::Relaxed);
                 }
             });
+            #[cfg(feature = "std")]
             return;
         }
 
-        let (tx, rx) = sync_channel::<Vec<u8>>(FILE_QUEUE);
-        let queued = Arc::new(AtomicUsize::new(0));
-        let lost = self.store.lost.clone();
-        let writer = {
-            let (lost, queued) = (lost.clone(), queued.clone());
-            std::thread::Builder::new()
-                .name("fictionet-events".into())
-                .spawn(move || write_lines(rx, out, &lost, &queued))
-                .expect("the event writer's thread starts")
-        };
-        self.subscribe(move |event| {
-            let Ok(mut line) = event.to_json().to_bytes() else {
-                return;
+        #[cfg(feature = "std")]
+        {
+            let (tx, rx) = sync_channel::<Vec<u8>>(FILE_QUEUE);
+            let queued = Arc::new(AtomicUsize::new(0));
+            let lost = self.store.lost.clone();
+            let writer = {
+                let (lost, queued) = (lost.clone(), queued.clone());
+                std::thread::Builder::new()
+                    .name("fictionet-events".into())
+                    .spawn(move || write_lines(rx, out, &lost, &queued))
+                    .expect("the event writer's thread starts")
             };
-            line.push(b'\n');
-            let len = line.len();
-            if queued.fetch_add(len, Ordering::Relaxed) + len > FILE_QUEUE_BYTES
-                || tx.try_send(line).is_err()
-            {
-                queued.fetch_sub(len, Ordering::Relaxed);
-                lost.fetch_add(1, Ordering::Relaxed);
+            self.subscribe(move |event| {
+                let Ok(mut line) = event.to_json().to_bytes() else {
+                    return;
+                };
+                line.push(b'\n');
+                let len = line.len();
+                if queued.fetch_add(len, Ordering::Relaxed) + len > FILE_QUEUE_BYTES
+                    || tx.try_send(line).is_err()
+                {
+                    queued.fetch_sub(len, Ordering::Relaxed);
+                    lost.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            let mut s = self.store.state.lock();
+            if s.closed {
+                // The run is over: the thread has all it will get.
+                drop(s);
+                let _ = writer.join();
+            } else {
+                s.writers.push(writer);
             }
-        });
-        let mut s = lock(&self.store.state);
-        if s.closed {
-            // The run is over: the thread has all it will get.
-            drop(s);
-            let _ = writer.join();
-        } else {
-            s.writers.push(writer);
         }
     }
 
@@ -1191,7 +1204,7 @@ impl EventLog {
         loop {
             self.store.advance(fcx.now());
             let got: Vec<Event> = {
-                let s = lock(&self.store.state);
+                let s = self.store.state.lock();
                 held(&s, 0)
                     .filter(|e| pick(e))
                     .map(|e| (**e).clone())
@@ -1207,6 +1220,7 @@ impl EventLog {
 
 /// Writes the lines from `rx` to `out` until the run is over. After a
 /// failed write or flush, only counts them as lost.
+#[cfg(feature = "std")]
 fn write_lines(
     rx: Receiver<Vec<u8>>,
     mut out: Box<dyn Write + Send>,
@@ -1244,6 +1258,7 @@ fn write_lines(
 /// Writes an `events.lost` line if more were lost since the last, then
 /// flushes. Returns whether that failed, counting the unflushed lines as
 /// lost if so.
+#[cfg(feature = "std")]
 fn finish_batch(
     out: &mut Box<dyn Write + Send>,
     lost: &AtomicU64,
@@ -1263,7 +1278,7 @@ fn finish_batch(
     !ok
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 
@@ -1281,8 +1296,8 @@ mod tests {
         let total = MAX_EVENTS as u64 + 10;
         numbered(&store, total);
         let log = EventLog::new(store.clone());
-        let held = lock(&store.state).events.events.len() as u64;
-        assert!(held <= MAX_EVENTS as u64 && lock(&store.state).events.bytes <= MAX_EVENT_BYTES);
+        let held = store.state.lock().events.events.len() as u64;
+        assert!(held <= MAX_EVENTS as u64 && store.state.lock().events.bytes <= MAX_EVENT_BYTES);
         let gone = total - held;
         assert!(gone >= 10);
         assert_eq!((log.dropped(), log.recorded()), (gone, total));
@@ -1310,7 +1325,7 @@ mod tests {
         for _ in 0..40 {
             store.push(Event::new("test", "big").summary(big.clone()));
         }
-        let s = lock(&store.state);
+        let s = store.state.lock();
         assert!(s.events.bytes <= MAX_EVENT_BYTES, "{}", s.events.bytes);
         assert!(s.events.events.len() < 40 && s.dropped > 0);
     }
@@ -1323,12 +1338,12 @@ mod tests {
         let log = EventLog::new(store.clone());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s = seen.clone();
-        log.subscribe(move |e| s.lock().unwrap().push(e.seq));
+        log.subscribe(move |e| s.lock().push(e.seq));
         numbered(&store, 2);
-        assert_eq!(*seen.lock().unwrap(), [1, 2, 3, 4, 5]);
+        assert_eq!(*seen.lock(), [1, 2, 3, 4, 5]);
         store.close();
         numbered(&store, 1);
-        assert_eq!(seen.lock().unwrap().len(), 5, "a closed log calls no one");
+        assert_eq!(seen.lock().len(), 5, "a closed log calls no one");
     }
 
     fn at(ms: u64) -> Instant {
@@ -1445,7 +1460,7 @@ mod tests {
         }
         assert_eq!(log.of("http", "request").len(), 10);
         assert_eq!(log.of("dns", "query").len(), 1);
-        let s = lock(&store.state);
+        let s = store.state.lock();
         assert!(s.repeats.events.len() <= MAX_REPEATS && s.repeats.bytes <= MAX_REPEAT_BYTES);
         assert!(s.open.len() <= OPEN_WINDOWS && s.due.len() == s.open.len());
         drop(s);
@@ -1503,7 +1518,7 @@ mod tests {
 
     impl Write for Sink {
         fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            let mut bytes = self.bytes.lock().unwrap();
+            let mut bytes = self.bytes.lock();
             if self
                 .fail_after
                 .is_some_and(|n| bytes.iter().filter(|b| **b == b'\n').count() >= n)
@@ -1537,18 +1552,12 @@ mod tests {
             for i in 0..500u32 {
                 fcx.record(Event::new("test", "tick").field("i", i));
             }
-            *keep.lock().unwrap() = Some(fcx.events());
+            *keep.lock() = Some(fcx.events());
             Ok(())
         }))
         .unwrap();
-        let log = kept.lock().unwrap().take().unwrap();
-        let lines = sink
-            .bytes
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|b| **b == b'\n')
-            .count();
+        let log = kept.lock().take().unwrap();
+        let lines = sink.bytes.lock().iter().filter(|b| **b == b'\n').count();
         assert_eq!((lines, log.lost()), (500, 0));
     }
 
@@ -1567,18 +1576,12 @@ mod tests {
             for i in 0..300u32 {
                 fcx.record(Event::new("test", "tick").field("i", i));
             }
-            *keep.lock().unwrap() = Some(fcx.events());
+            *keep.lock() = Some(fcx.events());
             Ok(())
         }))
         .unwrap();
-        let log = kept.lock().unwrap().take().unwrap();
-        let lines = sink
-            .bytes
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|b| **b == b'\n')
-            .count() as u64;
+        let log = kept.lock().take().unwrap();
+        let lines = sink.bytes.lock().iter().filter(|b| **b == b'\n').count() as u64;
         // Lines written but not yet flushed when the write failed count as
         // lost too: they may not have reached the file.
         assert_eq!(lines, 100);

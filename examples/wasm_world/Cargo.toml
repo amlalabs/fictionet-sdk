@@ -15,8 +15,8 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Default features off: the `tokio` feature is for real sockets.
-fictionet = { path = "../..", default-features = false }
+# The browser serves HTTP/1.1 and HTTP/2 without observer sessions.
+fictionet = { path = "../..", default-features = false, features = ["tokio"] }
 bytes = "1"
 http = "1"
 http-body-util = "0.1"

@@ -88,7 +88,7 @@ async fn fetch<C: Connection>(
 }
 
 fn one_run(observe: bool) -> Vec<Vec<u8>> {
-    let out = Arc::new(std::sync::Mutex::new(None));
+    let out = Arc::new(fictionet::sync::Mutex::new(None));
     let o = out.clone();
     fictionet::block_on(fictionet::run(
         fictionet::Seed::from_u64(7),
@@ -141,7 +141,7 @@ fn one_run(observe: bool) -> Vec<Vec<u8>> {
             assert_eq!(events.len(), 2);
             assert!(events[0].is("test", "before_tls"));
             assert!(events[1].is("test", "after_tls"));
-            *o.lock().unwrap() = Some(
+            *o.lock() = Some(
                 events
                     .iter()
                     .map(|e| e.to_json().to_bytes().unwrap())
@@ -152,7 +152,7 @@ fn one_run(observe: bool) -> Vec<Vec<u8>> {
         },
     ))
     .unwrap();
-    out.lock().unwrap().take().expect("world finished")
+    out.lock().take().expect("world finished")
 }
 
 #[test]

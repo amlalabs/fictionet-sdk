@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn seeded_issuance_is_repeatable_and_trusted() {
         fn issue() -> Vec<u8> {
-            let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let bytes = Arc::new(fictionet::sync::Mutex::new(Vec::new()));
             let output = bytes.clone();
             fictionet::block_on(fictionet::lab(
                 fictionet::Seed::from_u64(17),
@@ -423,13 +423,13 @@ mod tests {
                     assert!(verify("203.0.113.10", 1_800_000_000).is_ok());
                     assert!(verify("other.test", 1_800_000_000).is_err());
                     assert!(verify("example.test", 2_100_000_000).is_err());
-                    *output.lock().unwrap() = leaf.chain[0].to_vec();
+                    *output.lock() = leaf.chain[0].to_vec();
                     leaf.server_config(&fcx, SystemTime::UNIX_EPOCH)?;
                     Ok(())
                 },
             ))
             .unwrap();
-            Arc::try_unwrap(bytes).unwrap().into_inner().unwrap()
+            std::mem::take(Arc::try_unwrap(bytes).unwrap().get_mut())
         }
         assert_eq!(issue(), issue());
     }

@@ -18,7 +18,7 @@
 //!
 //! A world's time and randomness come from one place, its [`Cx`], and its
 //! randomness from a seed. With real sandboxes it runs on real time
-//! ([`run`]). In a test it runs on simulated time ([`lab`]), where the same
+//! ([`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html)). In a test it runs on simulated time ([`lab`]), where the same
 //! seed and the same inputs give the same event log and the same packets,
 //! byte for byte. [`running`] shows both.
 //!
@@ -94,7 +94,7 @@
 //! task, return immediately, and hand back new interfaces for the next call
 //! to use:
 //!
-#![doc = include_str!("../docs/diagrams/world.svg")]
+//! #![doc = include_str!("../docs/diagrams/world.svg")]
 //!
 //! A few types do all the work in that example:
 //!
@@ -119,7 +119,7 @@
 //! These types, at the crate root, are the core of Fictionet. The core
 //! moves packets but never parses them. Addresses, ports, names, routing,
 //! TCP, TLS and HTTP are all in [`stdlib`], built on these types. For a
-//! whole network of websites in a few lines, see [`stdlib::web`]. The core
+//! whole network of websites in a few lines, see [`stdlib::web`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/index.html). The core
 //! also assumes no async runtime: its futures use only
 //! [`std::task::Waker`], so a world runs on tokio or on Fictionet's own
 //! [`block_on`].
@@ -129,21 +129,23 @@
 //! Fictionet does not own `main` or the executor. A world runs inside an
 //! ordinary program, and this is the whole of `main`:
 //!
-//! ```no_run
-//! # use fictionet::{Attachments, Cx, Result};
-//! # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-//! fn main() -> fictionet::Result {
-//!     let (attacher, attachments) = fictionet::attachments();
-//!     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
-//!     let _listening = fictionet::listen(socket, attacher)?;
-//!     fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
-//! }
-//! ```
+#![doc = fictionet::cfg_std!(doc r####"
+```no_run
+# use fictionet::{Attachments, Cx, Result};
+# async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
+fn main() -> fictionet::Result {
+    let (attacher, attachments) = fictionet::attachments();
+    let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
+    let _listening = fictionet::listen(socket, attacher)?;
+    fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
+}
+```
+"####)]
 //!
 //! [`attachments`] makes the channel that sandboxes arrive through.
-//! [`listen`] opens the world socket that the [`WorldSocket`] names, so
+//! [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) opens the world socket that the [`WorldSocket`](https://docs.rs/fictionet/latest/fictionet/enum.WorldSocket.html) names, so
 //! that each `fictionet attach` that connects arrives in that channel.
-//! [`run`] turns the world function into one future, and [`block_on`]
+//! [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) turns the world function into one future, and [`block_on`]
 //! polls it until the world ends. Each world is
 //! its own process, with no central daemon. It has the host's real network,
 //! so world code can also reach the internet or a database.
@@ -168,49 +170,51 @@
 //!   kept by every run, and read as a file a grader reads after the run,
 //!   callbacks, or the dashboard.
 //!
-//! HTTP is a service too ([`stdlib::httpd`]): a router whose handlers get
+//! HTTP is a service too ([`stdlib::httpd`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/index.html)): a router whose handlers get
 //! byte bodies, or any tower service such as an axum `Router`. Here a web
 //! server and a line-echo service run on two hosts, with the events on disk:
 //!
-//! ```
-//! use std::sync::Arc;
-//! use fictionet::{Attachments, Cx, Result};
-//! use fictionet::stdlib::codec::{Ending, LineError, Lines};
-//! use fictionet::stdlib::httpd::{Router, Server};
-//! use fictionet::events::Event;
-//! use fictionet::stdlib::net::Net;
-//! use fictionet::stdlib::serve::{Flow, Driver, Service};
+#![doc = fictionet::cfg_std!(doc r####"
+```
+use std::sync::Arc;
+use fictionet::{Attachments, Cx, Result};
+use fictionet::stdlib::codec::{Ending, LineError, Lines};
+use fictionet::stdlib::httpd::{Router, Server};
+use fictionet::events::Event;
+use fictionet::stdlib::net::Net;
+use fictionet::stdlib::serve::{Flow, Driver, Service};
+
+/// Echoes each line back.
+struct Echo;
+
+impl Service for Echo {
+    type Decoder = Lines;
+    type State = ();
+    type Error = std::convert::Infallible;
+    fn decoder(&self) -> Lines {
+        Lines::new(1024, Ending::LfOrCrlf)
+    }
+    fn on_item(&mut self, line: std::result::Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_, Self::Decoder>) -> std::result::Result<Flow, Self::Error> {
+        let line = line.unwrap_or_default();
+        driver.record(Event::new("echo", "line").field("bytes", line.len() as u64));
+        driver.reply().extend_from_slice(&line);
+        driver.reply().push(b'\n');
+        Ok(Flow::Continue)
+    }
+}
+
+async fn world(fcx: Cx, attachments: Attachments) -> Result {
+    let site = Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
+    fcx.events().to_file(std::env::temp_dir().join("events.jsonl"))?;
+    Net::new()
+        .host("www", |h| h.dns_name("www.example.test").port_server(80, Server::new(site)))
+        .host("echo", |h| h.dns_name("echo.example.test").tcp(7, Arc::new(()), || Echo))
+        .start(&fcx, attachments)
+}
+```
+"####)]
 //!
-//! /// Echoes each line back.
-//! struct Echo;
-//!
-//! impl Service for Echo {
-//!     type Decoder = Lines;
-//!     type State = ();
-//!     type Error = std::convert::Infallible;
-//!     fn decoder(&self) -> Lines {
-//!         Lines::new(1024, Ending::LfOrCrlf)
-//!     }
-//!     fn on_item(&mut self, line: std::result::Result<Vec<u8>, LineError>, _: &(), driver: &mut Driver<'_, Self::Decoder>) -> std::result::Result<Flow, Self::Error> {
-//!         let line = line.unwrap_or_default();
-//!         driver.record(Event::new("echo", "line").field("bytes", line.len() as u64));
-//!         driver.reply().extend_from_slice(&line);
-//!         driver.reply().push(b'\n');
-//!         Ok(Flow::Continue)
-//!     }
-//! }
-//!
-//! async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//!     let site = Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
-//!     fcx.events().to_file(std::env::temp_dir().join("events.jsonl"))?;
-//!     Net::new()
-//!         .host("www", |h| h.dns_name("www.example.test").port_server(80, Server::new(site)))
-//!         .host("echo", |h| h.dns_name("echo.example.test").tcp(7, Arc::new(()), || Echo))
-//!         .start(&fcx, attachments)
-//! }
-//! ```
-//!
-//! [`stdlib::web::Sites`] is a preset on `Net` for a world of websites. The
+//! [`stdlib::web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) is a preset on `Net` for a world of websites. The
 //! guide in `docs/services.md` walks through services, `Net`, and events
 //! step by step.
 //!
@@ -248,7 +252,7 @@
 //!    into IP packets, and what the world sees from each.
 //! 5. [`stdlib`], then [`stdlib::net`] and [`stdlib::serve`]: the
 //!    networking pieces a world is built from, and a network of hosts and
-//!    services in a few lines. [`stdlib::web`] does the same for websites.
+//!    services in a few lines. [`stdlib::web`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/index.html) does the same for websites.
 //! 6. [`recipes`]: a delayed website, a slow or lossy link, a packet
 //!    capture, and a route that changes mid-run.
 //! 7. [`observe`]: watching a running world, in the dashboard or from a
@@ -259,36 +263,36 @@
 //!
 //! # Features and dependencies
 //!
-//! The crate has one Cargo feature, and it is on by default:
+//! | Feature | What it gates | Implies | Default |
+//! |---|---|---|---|
+//! | `std` | Real clocks, OS entropy, world sockets, event files, timer threads, relay, and the HTTP stack | — | Yes |
+//! | `tokio` | Tokio adapters, HTTP/2, hyper upgrades, and proxy attach types | `std` | Yes |
+//! | `observe` | Observer sessions, TLS key capture, and built-in protocol presenters | `std` | Yes |
+//! | `web-proxy` | `web::proxy`, `web::forward`, and their upstream HTTP client | `tokio` | No |
 //!
-//! | Feature | What it adds | Dependencies it adds |
-//! |---|---|---|
-//! | `tokio` (default) | `web::proxy(&fcx)`, which passes requests through to the real site | `hyper-util`, `hyper-rustls` with `webpki-roots`, and hyper's client |
-//!
-//! The `tokio` runtime crate itself is always a dependency, because hyper
-//! and h2 run on it, and so are `rustls` (with run-aware key exchange and
-//! signing), `hyper` (server side), `h2`, `smoltcp` and `hickory-proto`.
-//! A world that needs
-//! no `web::proxy` can leave the feature out with `default-features = false`.
-//! The [`tokio`] connection adapters are available with either feature set.
+//! Disabling default features leaves the simulated-time executor, seeded
+//! randomness, packet links, and protocol codecs. The crate still links
+//! the Rust standard library; this is not a `no_std` build. Mutexes use a
+//! spin lock without the `std` feature and the standard mutex with it
+//! ([`sync::Mutex`]).
 //!
 //! # In a browser
 //!
 //! The library also builds for `wasm32-unknown-unknown`, with
-//! `default-features = false`. A world then runs inside a page: [`run`],
+//! `default-features = false, features = ["std"]`. A world then runs inside a page: [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html),
 //! [`Cx`] and its timers, [`block_on`], [`pair`], [`attachments`], the
 //! [`stdlib`] with smoltcp, DNS, `web::Sites` and TLS (rustls with the
 //! run-aware provider and ring, whose C code needs a clang with the wasm32
 //! target). The page plays the sandboxes through [`Attacher::attach`],
 //! whose [`End`] carries raw IP packets.
 //!
-//! What needs an operating system is left out of that build: [`listen`]
-//! and [`WorldSocket`], the `fictionet` command, observer sessions, and
-//! the `tokio` feature. The clocks come from `performance.now()` and
+//! What needs an operating system is left out of that build: [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html)
+//! and [`WorldSocket`](https://docs.rs/fictionet/latest/fictionet/enum.WorldSocket.html), the `fictionet` command, observer sessions, and
+//! proxy attach types. The clocks come from `performance.now()` and
 //! `Date.now()`, random bytes from `crypto.getRandomValues`, and timers
-//! from `setTimeout`. In a page, hand [`run`] to the event loop with
+//! from `setTimeout`. In a page, hand [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) to the event loop with
 //! `wasm_bindgen_futures`. [`block_on`] also works, but spins between
-//! timers. HTTP/1.1 and HTTP/2 both work. Two cases read `std`'s clock,
+//! timers. HTTP/1.1 works with `std`; HTTP/2 also needs `tokio`. Two cases read `std`'s clock,
 //! which panics on this target. An HTTP/1 Upgrade request goes to hyper's
 //! HTTP/1 server, and an HTTP/2 stream that the world's side resets goes
 //! through h2's timer. `examples/wasm_world` runs DNS, HTTP/1.1, HTTP/2
@@ -315,13 +319,13 @@ pub mod events;
 #[doc(hidden)]
 pub mod fuzzing;
 pub mod getting_started;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 mod listen;
 pub mod lowering;
 pub mod observe;
 pub mod proto;
 pub mod recipes;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 #[doc(hidden)]
 pub mod relay;
 pub mod roadmap;
@@ -329,9 +333,11 @@ pub use entropy::{Entropy, Seed, SeededEntropy};
 mod run;
 pub mod running;
 pub mod stdlib;
+pub mod sync;
 mod sys;
 pub mod time;
 mod timer;
+#[cfg(feature = "tokio")]
 pub mod tokio;
 mod watch;
 
@@ -344,6 +350,7 @@ mod watch;
 pub mod prelude {
     pub use crate::InterfaceExt;
     pub use crate::stdlib::ConnectionExt;
+    #[cfg(feature = "tokio")]
     pub use crate::tokio::ConnectionTokioExt;
 }
 
@@ -353,10 +360,13 @@ pub use cable::{End, PACKET_COST, pair, pair_with_limit};
 pub use clock::RunMode;
 pub use cx::{CancelWait, Cancelled, Cx, JoinError, RaceError, Task, Timer};
 pub use error::{Error, ErrorChain};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};
-pub use run::{lab, run};
+pub use run::lab;
+#[cfg(feature = "std")]
+pub use run::run;
 mod clock;
+#[cfg(feature = "std")]
 pub use sys::random_bytes;
 
 use std::future::Future;
@@ -448,7 +458,7 @@ pub trait Interface: Send + 'static {
     /// waits in a queue inside the world, and the queue is written out in
     /// order as attach makes room. The queue has a budget of 32 MiB. Each
     /// waiting packet counts its own length plus 64 bytes. A packet that
-    /// would take the queue past that budget is dropped. See [`listen`].
+    /// would take the queue past that budget is dropped. See [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html).
     fn send(&mut self, packet: Packet);
 
     /// The link this interface is one end of, for the
@@ -547,10 +557,97 @@ impl std::error::Error for RecvError {
     "# }\n",
     "```\n",
 )]
+#[cfg(feature = "std")]
 pub struct ReadmeExample;
 
-/// Locks `m`. A poisoned lock is used anyway: a panic elsewhere leaves
-/// what these locks hold whole.
-fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+/// Includes tokens when the SDK's `tokio` feature is enabled.
+///
+/// An optional `else` block supplies the tokens for builds without the
+/// feature. Prefix the branches with `items` to select item definitions.
+#[cfg(feature = "tokio")]
+#[macro_export]
+macro_rules! cfg_tokio {
+    (doc $text:expr) => { $text };
+    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($enabled)* };
+    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($enabled)* }};
+    ($($enabled:tt)*) => { $($enabled)* };
+}
+
+/// Includes tokens selected by the SDK's `tokio` feature.
+#[cfg(not(feature = "tokio"))]
+#[macro_export]
+macro_rules! cfg_tokio {
+    (doc $text:expr) => { "" };
+    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($disabled)* };
+    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($disabled)* }};
+    ($($enabled:tt)*) => {};
+}
+
+/// Includes tokens when the SDK's `std` feature is enabled.
+///
+/// An optional `else` block supplies the tokens for builds without the
+/// feature. Prefix the branches with `items` to select item definitions.
+#[cfg(feature = "std")]
+#[macro_export]
+macro_rules! cfg_std {
+    (doc $text:expr) => { $text };
+    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($enabled)* };
+    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($enabled)* }};
+    ($($enabled:tt)*) => { $($enabled)* };
+}
+
+/// Includes tokens selected by the SDK's `std` feature.
+#[cfg(not(feature = "std"))]
+#[macro_export]
+macro_rules! cfg_std {
+    (doc $text:expr) => { "" };
+    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($disabled)* };
+    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($disabled)* }};
+    ($($enabled:tt)*) => {};
+}
+
+/// Includes tokens when the SDK's `observe` feature is enabled.
+///
+/// An optional `else` block supplies the tokens for builds without the
+/// feature. Prefix the branches with `items` to select item definitions.
+#[cfg(feature = "observe")]
+#[macro_export]
+macro_rules! cfg_observe {
+    (doc $text:expr) => { $text };
+    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($enabled)* };
+    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($enabled)* }};
+    ($($enabled:tt)*) => { $($enabled)* };
+}
+
+/// Includes tokens selected by the SDK's `observe` feature.
+#[cfg(not(feature = "observe"))]
+#[macro_export]
+macro_rules! cfg_observe {
+    (doc $text:expr) => { "" };
+    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($disabled)* };
+    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($disabled)* }};
+    ($($enabled:tt)*) => {};
+}
+
+/// Includes tokens when the SDK's `web-proxy` feature is enabled.
+///
+/// An optional `else` block supplies the tokens for builds without the
+/// feature. Prefix the branches with `items` to select item definitions.
+#[cfg(feature = "web-proxy")]
+#[macro_export]
+macro_rules! cfg_web_proxy {
+    (doc $text:expr) => { $text };
+    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($enabled)* };
+    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($enabled)* }};
+    ($($enabled:tt)*) => { $($enabled)* };
+}
+
+/// Includes tokens selected by the SDK's `web-proxy` feature.
+#[cfg(not(feature = "web-proxy"))]
+#[macro_export]
+macro_rules! cfg_web_proxy {
+    (doc $text:expr) => { "" };
+    (items { $($enabled:tt)* } else { $($disabled:tt)* }) => { $($disabled)* };
+    ({ $($enabled:tt)* } else { $($disabled:tt)* }) => {{ $($disabled)* }};
+    ($($enabled:tt)*) => {};
 }

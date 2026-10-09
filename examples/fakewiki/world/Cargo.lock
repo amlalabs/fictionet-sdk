@@ -325,7 +325,6 @@ dependencies = [
  "hickory-proto",
  "http",
  "http-body",
- "http-body-util",
  "hyper",
  "hyper-rustls",
  "hyper-util",

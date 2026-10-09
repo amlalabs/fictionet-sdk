@@ -1514,6 +1514,7 @@ pub fn hop(packet: &mut [u8]) -> Hop {
     }
 }
 
+fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2337,4 +2338,6 @@ mod tests {
         assert!(!udp_checksum_ok(v6a, v6b, &u));
         assert!(!udp_checksum_ok(v4a, v4b, &u));
     }
+}
+
 }

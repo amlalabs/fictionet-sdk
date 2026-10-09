@@ -32,7 +32,7 @@
 //! on the Unix `SOCK_SEQPACKET` socket (`relay::unix::send_parts`
 //! in the crate's source). On the world's side, the sandbox's
 //! `Attachment` reads each datagram from the connection that
-//! [`listen`](crate::listen) accepted, and returns the packet from
+//! [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) accepted, and returns the packet from
 //! [`recv`](crate::InterfaceExt::recv). Packets from the world go back the same
 //! way, one message each. There is no other kind of message after the
 //! handshake, so DHCP, neighbor discovery and DNS travel as ordinary
@@ -61,7 +61,7 @@
 //! plus 64 bytes against their 32 MiB budget, and drop new packets past
 //! it.
 //!
-//! [`listen`](crate::listen) reads the attach type from `hello` only to
+//! [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) reads the attach type from `hello` only to
 //! tell an [observer](crate::observe), such as the dashboard, from a
 //! sandbox. World code is never told the type. It
 //! can only guess it from [`Attachment::mtu`](crate::Attachment::mtu),
@@ -233,7 +233,7 @@
 //! you give it the addresses, so that a world needs no DHCP server and the
 //! flags mean the same as for `tun`. Leave a family's flags out, and the
 //! VM's DHCP goes to the world instead.
-//! [`Sites`](crate::stdlib::web::Sites) runs a DHCP server for IPv4, but
+//! [`Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) runs a DHCP server for IPv4, but
 //! sends no router advertisements and runs no DHCPv6. With `Sites`, a VM
 //! gets an IPv6 address from attach's flags, or sets one itself.
 //!
@@ -352,7 +352,7 @@
 //! # One request, traced through each type
 //!
 //! These traces follow `curl https://example.test/` from the agent's
-//! program to [`Sites`](crate::stdlib::web::Sites) and back, once for
+//! program to [`Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) and back, once for
 //! each type. The world is the `web_world` example from
 //! [`getting_started`](crate::getting_started). The packet lists are what
 //! the world saw on the sandbox's `Attachment`, from

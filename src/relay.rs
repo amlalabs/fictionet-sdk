@@ -2,7 +2,7 @@
 //! local transport, a Unix `SOCK_SEQPACKET` socket with one message per
 //! datagram.
 //!
-//! Shared by [`listen`](crate::listen) and the `fictionet attach` binary.
+//! Shared by [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) and the `fictionet attach` binary.
 //! Not part of the public API: it is public only so that the binary can use
 //! it, and may change at any time.
 

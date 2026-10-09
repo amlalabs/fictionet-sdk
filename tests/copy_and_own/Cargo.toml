@@ -20,11 +20,6 @@ path = "stdlib.rs"
 test = false
 doc = false
 
-# web.rs keeps its pass-through proxy behind the SDK's `tokio` feature.
-# The fixture enables the same client dependencies when this feature is tested.
-[features]
-tokio = ["fictionet/tokio", "dep:hyper-util", "dep:hyper-rustls", "hyper/client"]
-
 # ip.rs checks its reassembly's bookkeeping under `cargo fuzz`, which
 # builds with `--cfg fuzzing`.
 [lints.rust]
@@ -37,10 +32,9 @@ h2 = "0.4"
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 http = "1.5.0"
 http-body = "1.1.0"
-http-body-util = "0.1"
-hyper = { version = "1.11.1", default-features = false, features = ["http1", "http2", "server"] }
-hyper-rustls = { version = "0.27", optional = true, default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
-hyper-util = { version = "0.1", optional = true, default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
+hyper = { version = "1.11.1", default-features = false, features = ["http1", "http2", "server", "client"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
 ring = "0.17"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 p256 = { version = "0.13.2", features = ["ecdh", "ecdsa"] }
@@ -54,6 +48,6 @@ tower-service = "0.3.3"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc = "0.2.189"
 
-# The doc examples of web.rs serve axum routers, as the README's does.
+# The web module's doc examples serve axum routers, as the README's does.
 [dev-dependencies]
 axum = { version = "0.8", default-features = false }

@@ -74,6 +74,15 @@ has more: the proxy types, Kubernetes, and the BGP hijack from the Border eval
 (`examples/border`). `vm/run test <name>` runs the test suites in the same VM
 ([vm/README.md](vm/README.md)).
 
+## Install
+
+Add `fictionet` to your Cargo dependencies. The default features are
+`std`, `tokio`, and `observe`. Set `default-features = false` for a closed
+simulated-time world, or enable `std` for host integration and HTTP/1.1.
+`tokio` adds HTTP/2 and runtime adapters. Enable `web-proxy` explicitly
+for upstream HTTP requests. See the [feature table](https://docs.rs/fictionet/latest/fictionet/#features-and-dependencies)
+for the feature relationships. The crate still links Rust's standard library.
+
 ## Quick start
 
 You need Linux, Rust 1.91 or later, `sudo`, `ip` (iproute2) and `curl`. These
@@ -167,7 +176,7 @@ web::Sites::new(move |host: &str| match host {
 ```
 
 A longer version, which the docs compile as a test, is at the top of
-[`stdlib::web`](src/stdlib/web.rs), and [`examples/web_world.rs`](examples/web_world.rs)
+[`stdlib::web`](src/stdlib/web/mod.rs), and [`examples/web_world.rs`](examples/web_world.rs)
 is a complete world.
 
 Underneath, a world is a set of tasks joined by packet interfaces: a delay, a
@@ -266,7 +275,7 @@ Start at the crate root, which explains the main ideas, then read in this order:
 5. [`stdlib`](src/stdlib/mod.rs): the pieces a world is built from, and the
    protocol catalog. Then [`stdlib::net`](src/stdlib/net.rs) and
    [`stdlib::serve`](src/stdlib/serve.rs) for a network of hosts and
-   services, and [`stdlib::web`](src/stdlib/web.rs) for a network of
+   services, and [`stdlib::web`](src/stdlib/web/mod.rs) for a network of
    websites.
 6. [`recipes`](src/recipes.rs): a delayed website, a slow or lossy link, a packet
    capture, and a route that changes mid-run.
@@ -279,7 +288,8 @@ Start at the crate root, which explains the main ideas, then read in this order:
 ## Building and testing
 
 [CONTRIBUTING.md](CONTRIBUTING.md) lists the build, test and documentation
-checks for both default features and `--no-default-features`, as well as
+checks for default features, `--no-default-features`, `--all-features`,
+and `--no-default-features --features tokio`, as well as
 the Docker and Kubernetes tests.
 
 ## License

@@ -8,7 +8,7 @@
 //!
 //! `Sites` is a preset on [`net::Net`](fictionet::stdlib::net::Net): each site
 //! is a [`Host`] with a DNS name per site and a [`Website`] on ports 80
-//! and 443, made when its name is first looked up. HTTP is [`httpd`], a
+//! and 443, made when its name is first looked up. HTTP is [`httpd`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/index.html), a
 //! service like any other. A world that needs other services next to its
 //! websites builds on `Net` directly.
 //!
@@ -21,46 +21,46 @@
 //! ([`Cx`]) and its sandboxes
 //! ([`Attachments`]), as [A world in code](crate#a-world-in-code) explains:
 //!
-//! ```
-//! # use std::net::{Ipv4Addr, Ipv6Addr};
-//! # use std::sync::Arc;
-//! # use fictionet::{Attachments, Cx, Result, stdlib::web};
-//! # use rustls::ServerConfig;
-//! # struct Certs { wikipedia: Arc<ServerConfig>, stripe: Arc<ServerConfig>, bad: Arc<ServerConfig>, github: Arc<ServerConfig> }
-//! # fn my_certs() -> Result<Certs> { unimplemented!() }
-//! async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//! #   let wiki: axum::Router = axum::Router::new();
-//! #   let fake_stripe: axum::Router = axum::Router::new();
-//!     // Yours: an Arc<ServerConfig> per certificate, each issued by the world's CA.
-//!     let certs = my_certs()?;
-//!
-//! #   #[cfg(feature = "tokio")]
-//!     let upstream = web::proxy(&fcx)?;
-//!     web::Sites::new(move |host: &str| match host {
-//!         "en.wikipedia.org" | "www.wikipedia.org" => Some(
-//!             web::Site::new(wiki.clone())
-//!                 .at(Ipv4Addr::new(185, 15, 59, 224))
-//!                 .at("2a02:ec80:300:ed1a::1".parse::<Ipv6Addr>().unwrap())
-//!                 .tls({ let c = certs.wikipedia.clone(); move |_| c.clone() }),
-//!         ),
-//!         "api.stripe.com" => Some(
-//!             web::Site::new(fake_stripe.clone()) // an axum::Router
-//!                 .tls({
-//!                     let (real, fake) = (certs.stripe.clone(), certs.bad.clone());
-//!                     move |fcx| if fcx.random_f64() < 0.1 { fake.clone() } else { real.clone() }
-//!                 }),
-//!         ),
-//! #       #[cfg(feature = "tokio")]
-//!         h if h == "github.com" || h.ends_with(".github.com") => Some(
-//!             web::Site::new(upstream.clone()) // the real site, over the world's own network
-//!                 .tls({ let c = certs.github.clone(); move |_| c.clone() }), // github.com and *.github.com
-//!         ),
-//!         _ => None, // NXDOMAIN: the world stays closed
-//!     })
-//!     .start(&fcx, attachments)?;
-//!     Ok(()) // the sites keep running after the world returns
-//! }
-//! ```
+#![doc = fictionet::cfg_web_proxy!(doc r####"
+```
+# use std::net::{Ipv4Addr, Ipv6Addr};
+# use std::sync::Arc;
+# use fictionet::{Attachments, Cx, Result, stdlib::web};
+# use rustls::ServerConfig;
+# struct Certs { wikipedia: Arc<ServerConfig>, stripe: Arc<ServerConfig>, bad: Arc<ServerConfig>, github: Arc<ServerConfig> }
+# fn my_certs() -> Result<Certs> { unimplemented!() }
+async fn world(fcx: Cx, attachments: Attachments) -> Result {
+#   let wiki: axum::Router = axum::Router::new();
+#   let fake_stripe: axum::Router = axum::Router::new();
+    // Yours: an Arc<ServerConfig> per certificate, each issued by the world's CA.
+    let certs = my_certs()?;
+
+    let upstream = web::proxy(&fcx)?;
+    web::Sites::new(move |host: &str| match host {
+        "en.wikipedia.org" | "www.wikipedia.org" => Some(
+            web::Site::new(wiki.clone())
+                .at(Ipv4Addr::new(185, 15, 59, 224))
+                .at("2a02:ec80:300:ed1a::1".parse::<Ipv6Addr>().unwrap())
+                .tls({ let c = certs.wikipedia.clone(); move |_| c.clone() }),
+        ),
+        "api.stripe.com" => Some(
+            web::Site::new(fake_stripe.clone()) // an axum::Router
+                .tls({
+                    let (real, fake) = (certs.stripe.clone(), certs.bad.clone());
+                    move |fcx| if fcx.random_f64() < 0.1 { fake.clone() } else { real.clone() }
+                }),
+        ),
+        h if h == "github.com" || h.ends_with(".github.com") => Some(
+            web::Site::new(upstream.clone()) // the real site, over the world's own network
+                .tls({ let c = certs.github.clone(); move |_| c.clone() }), // github.com and *.github.com
+        ),
+        _ => None, // NXDOMAIN: the world stays closed
+    })
+    .start(&fcx, attachments)?;
+    Ok(()) // the sites keep running after the world returns
+}
+```
+"####)]
 //!
 //! For HTTPS to work, the sandbox must trust the world's CA, and each site
 //! must have a certificate for its names. [`Site::tls`] gives a site its
@@ -117,10 +117,10 @@
 //! [`Site::new`] takes any [`tower_service::Service`] that takes an
 //! `http::Request<web::Body>` and returns an `http::Response`. An
 //! `axum::Router` is one. So is a plain async function wrapped in
-//! `tower::service_fn`. So is `web::proxy(&fcx)?` (feature `tokio`, on by
+//! `tower::service_fn`. So is `web::proxy(&fcx)?` (feature `web-proxy`, off by
 //! default), which forwards to the real site. [`Site::handler`] takes an
-//! [`httpd::Handler`] instead, such as an
-//! [`httpd::Router`], whose handlers get plain
+//! [`httpd::Handler`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/trait.Handler.html) instead, such as an
+//! [`httpd::Router`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/struct.Router.html), whose handlers get plain
 //! byte bodies and no runtime. A request's body is read whole before the
 //! handler is called, up to 64 MiB; past that the answer is `413`.
 //!
@@ -158,7 +158,7 @@
 //!
 //! # What `start` builds
 //!
-#![doc = include_str!("../../docs/diagrams/sites-network.svg")]
+#![doc = include_str!("../../../docs/diagrams/sites-network.svg")]
 //!
 //! - **The sandboxes' side.** Every sandbox that attaches, now or later,
 //!   joins the same two subnets: `10.0.0.0/24` for IPv4, with the gateway
@@ -242,10 +242,10 @@
 //!   - a site without `tls`: served over plain HTTP on 80. A TLS handshake
 //!     for its name on 443 is rejected with `unrecognized_name`.
 //! - **HTTP/1.0, HTTP/1.1 and HTTP/2** on every connection: HTTP/1 with
-//!   [`httpd::Http1`], HTTP/2 with hyper. Over TLS, the
+//!   [`httpd::Http1`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/struct.Http1.html), HTTP/2 with hyper and the `tokio` feature. Over TLS, the
 //!   version is agreed in the handshake (ALPN): `start` sets the ALPN list
-//!   of each config to `h2` and `http/1.1`, so a browser gets HTTP/2 and
-//!   `curl` gets what it asks for. Without TLS, the version is read from the
+//!   of each config to `http/1.1` and, with `tokio`, `h2`. Without TLS,
+//!   the version is read from the
 //!   first bytes the client sends. HTTP/2 streams run as tasks in the
 //!   connection's [region](fictionet::Cx#regions).
 //! - **Routing by host.** Each request goes to the site for its host: the
@@ -264,7 +264,7 @@
 //!
 //! How one sandbox's IPv4 address is bound, as its filter sees it:
 //!
-#![doc = include_str!("../../docs/diagrams/sites-binding.svg")]
+#![doc = include_str!("../../../docs/diagrams/sites-binding.svg")]
 //!
 //! # IPv6
 //!
@@ -367,7 +367,7 @@
 //!   `handler`, `error`, `redirect`, `misdirected`, `no_host` or
 //!   `cancelled`), its status, and how much of the body was sent, also
 //!   when the client gave up before the answer
-//!   ([`httpd`](fictionet::stdlib::httpd#events) lists the fields);
+//!   ([`httpd`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/index.html#events) lists the fields);
 //! - `http.error`: every connection on port 80 or 443 that ended in an HTTP
 //!   error (`cause`: `protocol`, `timeout` or `transport`);
 //! - `net.blocked`: the packets `Sites` itself drops or refuses, with
@@ -385,7 +385,7 @@
 //! One HTTPS request to a site with [`tls`](Site::tls), from its lookup to
 //! its events:
 //!
-#![doc = include_str!("../../docs/diagrams/sites-request.svg")]
+#![doc = include_str!("../../../docs/diagrams/sites-request.svg")]
 //!
 //! Callbacks set with [`EventLog::subscribe`](fictionet::events::EventLog::subscribe)
 //! run inside the task that recorded the event. Every task of a world runs
@@ -395,17 +395,19 @@
 //! [`EventLog::to_file`](fictionet::events::EventLog::to_file), which does that
 //! for you:
 //!
-//! ```
-//! # use fictionet::{Attachments, Cx, Result, stdlib::web};
-//! # fn site_for(_host: &str) -> Option<web::Site> { None }
-//! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//! let events = fcx.events();
-//! events.to_file("/var/lib/fictionet/events.jsonl")?;
-//! web::Sites::new(site_for).start(&fcx, attachments)?;
-//! // At the end of the sample: events.lost() must be zero.
-//! # Ok(())
-//! # }
-//! ```
+#![doc = fictionet::cfg_std!(doc r####"
+```
+# use fictionet::{Attachments, Cx, Result, stdlib::web};
+# fn site_for(_host: &str) -> Option<web::Site> { None }
+# async fn world(fcx: Cx, attachments: Attachments) -> Result {
+let events = fcx.events();
+events.to_file("/var/lib/fictionet/events.jsonl")?;
+web::Sites::new(site_for).start(&fcx, attachments)?;
+// At the end of the sample: events.lost() must be zero.
+# Ok(())
+# }
+```
+"####)]
 //!
 //! A handler can add its own fields to its request's event. It puts
 //! [`Fields`](fictionet::events::Fields) in the extensions of the
@@ -493,15 +495,17 @@
 //! [`Attachments::map`](fictionet::Attachments::map). Here every sandbox gets a
 //! 200 ms delay each way, in front of everything `Sites` builds:
 //!
-//! ```
-//! # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
-//! # fn site_for(_host: &str) -> Option<web::Site> { None }
-//! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//! let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
-//! web::Sites::new(site_for).start(&fcx, far)?;
-//! # Ok(())
-//! # }
-//! ```
+#![doc = fictionet::cfg_std!(doc r####"
+```
+# use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
+# fn site_for(_host: &str) -> Option<web::Site> { None }
+# async fn world(fcx: Cx, attachments: Attachments) -> Result {
+let far = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
+web::Sites::new(site_for).start(&fcx, far)?;
+# Ok(())
+# }
+```
+"####)]
 //!
 //! `Sites` sees each sandbox through its delay, under the same name, and
 //! binds its addresses and reports its events as usual. The same works with
@@ -516,565 +520,19 @@
 //! To change those parts, see
 //! [Changing a protocol by copying it](fictionet::stdlib#changing-a-protocol-by-copying-it).
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
-
-use http::{Request, Response};
-
-use fictionet::stdlib::httpd::{self, Handler, Website};
-pub use fictionet::stdlib::httpd::{Body, Target};
+#[allow(unused_imports)]
+use fictionet::stdlib::httpd;
+#[allow(unused_imports)]
+use fictionet::stdlib::httpd::Website;
+#[allow(unused_imports)]
 use fictionet::stdlib::net::{Host, Net};
-use fictionet::stdlib::route::Prefix;
-use fictionet::stdlib::tls::ServerConfig;
-use fictionet::{Attachments, Cx, Error};
+#[allow(unused_imports)]
+use fictionet::{Attachments, Cx};
 
-/// Websites by hostname, and the network around them. See the
-/// [module docs](self).
-pub struct Sites {
-    site_for: Arc<SiteFor>,
-    subnet: Prefix,
-    subnet_v6: Prefix,
-    ipv6: bool,
-    max_sites: usize,
-    date: Option<std::time::SystemTime>,
-}
+mod sites;
+pub use sites::*;
 
-/// The callback given to [`Sites::new`].
-type SiteFor = dyn Fn(&str) -> Option<Site> + Send + Sync;
-
-impl Sites {
-    /// Sites decided by `site_for`, which gets a hostname and returns the
-    /// site for it, or `None` if it does not exist. It runs once per name.
-    ///
-    /// The name is in lowercase, without a trailing dot: `en.wikipedia.org`.
-    ///
-    /// `site_for` must return quickly and must not block. It runs inside the
-    /// DNS task, and every sandbox's lookups wait while it runs. It decides.
-    /// It does not fetch. Slow work belongs in the site's handler.
-    pub fn new<F>(site_for: F) -> Sites
-    where
-        F: Fn(&str) -> Option<Site> + Send + Sync + 'static,
-    {
-        Sites {
-            site_for: Arc::new(site_for),
-            subnet: Prefix {
-                addr: Ipv4Addr::new(10, 0, 0, 0).into(),
-                len: 24,
-            },
-            subnet_v6: Prefix {
-                addr: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0).into(),
-                len: 64,
-            },
-            ipv6: true,
-            max_sites: fictionet::stdlib::net::MAX_HOSTS,
-            date: None,
-        }
-    }
-
-    /// Sets the world's date and time at the start of the run. Every site
-    /// then sends a `Date` header: this date plus the run's clock. Without
-    /// it, responses have no `Date` header; the host's clock is never used.
-    /// See [`httpd`'s Dates](fictionet::stdlib::httpd#dates).
-    pub fn date(self, start: std::time::SystemTime) -> Sites {
-        Sites {
-            date: Some(start),
-            ..self
-        }
-    }
-
-    /// Sets the sandboxes' IPv4 or IPv6 subnet, whichever `subnet` is. The
-    /// gateway and DNS server take the address after the subnet's own
-    /// address, such as `10.0.0.1` in `10.0.0.0/24` or `2001:db8::1` in
-    /// `2001:db8::/64`. The IPv4 subnet defaults to `10.0.0.0/24`, and the
-    /// IPv6 subnet to `2001:db8::/64`.
-    /// To set both, call it twice.
-    ///
-    /// An IPv4 subnet must have a length from 8 to 30. An IPv6 subnet must
-    /// have a length from 8 to 126, and lie inside the global unicast
-    /// range `2000::/3` or the unique local range `fc00::/7`. Otherwise
-    /// [`start`](Sites::start) fails.
-    pub fn subnet(self, subnet: Prefix) -> Sites {
-        match subnet.addr {
-            IpAddr::V4(_) => Sites { subnet, ..self },
-            IpAddr::V6(_) => Sites {
-                subnet_v6: subnet,
-                ..self
-            },
-        }
-    }
-
-    /// Turns IPv6 off for the whole network. Sites then have only IPv4
-    /// addresses, DNS answers AAAA queries with NODATA, and every IPv6
-    /// packet from a sandbox is dropped, with a `net.blocked` event whose
-    /// `why` is `Ipv6`.
-    ///
-    /// Without this, the network is dual-stack: see [IPv6](self#ipv6).
-    pub fn ipv4_only(self) -> Sites {
-        Sites {
-            ipv6: false,
-            ..self
-        }
-    }
-
-    /// Sets how many names may have a site. The default is 20,000.
-    ///
-    /// Each name the callback gives a site is kept for the whole run, with
-    /// its machines. At the limit, a new name still runs the callback. If it
-    /// returns a site, that site is dropped before it gets an address or a
-    /// machine, DNS answers SERVFAIL, and the `dns.query` event says
-    /// `error` with `rcode` 2. The name is not kept, so looking it up again
-    /// runs the callback again.
-    pub fn max_sites(self, max_sites: usize) -> Sites {
-        Sites { max_sites, ..self }
-    }
-
-    /// The network these sites run on, before it starts: to add hosts
-    /// with other services next to the websites.
-    pub fn into_net(self) -> Net {
-        let site_for = self.site_for;
-        let date = self.date;
-        let mut net = Net::new()
-            .group("web::Sites")
-            .subnet(self.subnet)
-            .subnet(self.subnet_v6)
-            .max_hosts(self.max_sites)
-            .resolve(move |name| {
-                site_for(name).map(|mut site| {
-                    if let Some(date) = date {
-                        site = site.date(date);
-                    }
-                    site.into_host(name)
-                })
-            });
-        if !self.ipv6 {
-            net = net.ipv4_only();
-        }
-        net
-    }
-
-    /// Builds the network and starts it. Every sandbox in `attachments`,
-    /// including ones that attach later, is connected to the sites.
-    ///
-    /// Returns immediately. The network runs in background tasks in `fcx`'s
-    /// [region](fictionet::Cx#regions), and keeps running after the world
-    /// returns, until that region is cancelled.
-    ///
-    /// Fails only if a [`subnet`](Sites::subnet) is not one it can use.
-    pub fn start(self, fcx: &Cx, attachments: Attachments) -> Result<(), Error> {
-        self.into_net().start(fcx, attachments)
-    }
-}
-
-/// One website: a handler, and optionally an address and TLS.
-pub struct Site {
-    website: Website,
-    at: Option<Ipv4Addr>,
-    at_v6: Option<Ipv6Addr>,
-    family: Family,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Family {
-    Both,
-    V4,
-    V6,
-}
-
-impl Site {
-    /// A site served by `service`, a tower service such as an
-    /// `axum::Router`. See [Handlers](self#handlers).
-    pub fn new<S, B>(service: S) -> Site
-    where
-        S: tower_service::Service<Request<Body>, Response = Response<B>> + Clone + Send + 'static,
-        S::Future: Send + 'static,
-        S::Error: Into<Error>,
-        B: http_body::Body + Send + 'static,
-        B::Data: Send,
-        B::Error: Into<Error>,
-    {
-        Site::handler(httpd::tower(service))
-    }
-
-    /// A site served by an [`httpd::Handler`], such as an
-    /// [`httpd::Router`].
-    pub fn handler(handler: impl Handler) -> Site {
-        Site {
-            website: Website::new(handler),
-            at: None,
-            at_v6: None,
-            family: Family::Both,
-        }
-    }
-
-    /// Sets the site's date at the start of the run. Responses send this
-    /// date plus elapsed run time in their `Date` header.
-    pub fn date(self, start: std::time::SystemTime) -> Site {
-        Site {
-            website: self.website.date(start),
-            ..self
-        }
-    }
-
-    /// Serves the site at `addr`, for example the address it has on the
-    /// real internet. `addr` may be an [`Ipv4Addr`], an [`Ipv6Addr`] or an
-    /// [`IpAddr`], and sets the site's address of that family. A site that
-    /// has both A and AAAA records on the real internet takes both
-    /// addresses, with two calls:
-    ///
-    /// ```
-    /// # use std::net::{Ipv4Addr, Ipv6Addr};
-    /// # use fictionet::stdlib::web;
-    /// # let wiki: axum::Router = axum::Router::new();
-    /// let site = web::Site::new(wiki)
-    ///     .at(Ipv4Addr::new(185, 15, 59, 224))
-    ///     .at("2a02:ec80:300:ed1a::1".parse::<Ipv6Addr>().unwrap());
-    /// # drop(site);
-    /// ```
-    ///
-    /// A family without `at` gets a free address from that family's pool:
-    /// `198.18.0.0/15` for IPv4, `2001:2::/48` for IPv6. An address given
-    /// for a family the site does not have (see
-    /// [`ipv4_only`](Site::ipv4_only)) is not used.
-    ///
-    /// The address must not be inside the sandboxes' subnet, and must be
-    /// one a host can have: not unspecified, broadcast, multicast or
-    /// loopback. An IPv6 address must also not be link-local (`fe80::/10`)
-    /// or IPv4-mapped. If it is not, the site is not served and the name
-    /// gets NXDOMAIN. IPv4 link-local addresses are allowed, so a world can
-    /// serve a site at `169.254.169.254`.
-    pub fn at(self, addr: impl Into<IpAddr>) -> Site {
-        match addr.into() {
-            IpAddr::V4(a) => Site {
-                at: Some(a),
-                ..self
-            },
-            IpAddr::V6(a) => Site {
-                at_v6: Some(a),
-                ..self
-            },
-        }
-    }
-
-    /// Gives the site only an IPv4 address. DNS answers AAAA queries for
-    /// its name with NODATA, so clients connect over IPv4.
-    pub fn ipv4_only(self) -> Site {
-        Site {
-            family: Family::V4,
-            ..self
-        }
-    }
-
-    /// Gives the site only an IPv6 address. DNS answers A queries for its
-    /// name with NODATA, so a sandbox without IPv6 cannot reach it. On a
-    /// network with IPv6 turned off ([`Sites::ipv4_only`]) the site has
-    /// no address at all, and its name gets NXDOMAIN.
-    pub fn ipv6_only(self) -> Site {
-        Site {
-            family: Family::V6,
-            ..self
-        }
-    }
-
-    /// Serves the site over HTTPS. `config_for` runs on every handshake and
-    /// returns the TLS config to use, so it can choose differently each time,
-    /// with randomness from `fcx`. To use one config every time, return a
-    /// clone of it.
-    ///
-    /// `start` replaces the ALPN list of the returned config with `h2` and
-    /// `http/1.1`, so the config does not need one.
-    pub fn tls<F>(self, config_for: F) -> Site
-    where
-        F: Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
-    {
-        Site {
-            website: self.website.tls(config_for),
-            ..self
-        }
-    }
-
-    /// Serves a site with [`tls`](Site::tls) over plain HTTP on port 80
-    /// as well. Its handler answers those requests, instead of the 301
-    /// redirect to https that a TLS site gets by default.
-    ///
-    /// This is a site that never moved to HTTPS, or a machine that answers
-    /// in plain text where the real site would redirect, as an attacker
-    /// that strips TLS does. The handler tells the two kinds of request
-    /// apart by [`Target::scheme`].
-    pub fn plain_http(self) -> Site {
-        Site {
-            website: self.website.plain_http(),
-            ..self
-        }
-    }
-
-    /// Makes the site the default one at its address: it answers requests
-    /// whose host names no site there, as a web server's default virtual
-    /// host does. A client that types the address instead of a name
-    /// (`http://203.0.113.10/`) reaches it, and so does any `Host` header.
-    /// Without this, such requests get `421 Misdirected Request`.
-    ///
-    /// The request's [`Target`] keeps the host the client named. The rest
-    /// is as for any request to the site: over plain HTTP, a site with
-    /// [`tls`](Site::tls) redirects to https (to the host the client
-    /// named) unless it has [`plain_http`](Site::plain_http). A TLS
-    /// handshake still needs an SNI that names a site at the address.
-    ///
-    /// The first default site that appears at an address keeps the role.
-    pub fn default_host(self) -> Site {
-        Site {
-            website: self.website.default_host(),
-            ..self
-        }
-    }
-
-    /// The site as a host of a [`Net`], named `name`.
-    pub fn into_host(self, name: &str) -> Host {
-        let mut host = self.website.served_by(Host::new(name).dns_name(name));
-        if let Some(a) = self.at {
-            host = host.at(a);
-        }
-        if let Some(a) = self.at_v6 {
-            host = host.at(a);
-        }
-        match self.family {
-            Family::Both => host,
-            Family::V4 => host.ipv4_only(),
-            Family::V6 => host.ipv6_only(),
-        }
-    }
-}
-
-/// A handler that forwards each request to the real site, over the world's
-/// own network. Needs the `tokio` feature (on by default), and a tokio
-/// runtime polling the world.
-///
-/// It needs no arguments: it forwards to the [`Target`] that [`Sites`] puts
-/// on every request, so the scheme, host and port come from the connection
-/// the agent made, not from headers. The path and query come from the
-/// request. The world process makes a new, separate request there through
-/// its operating system's network, resolving the name with its own DNS, and
-/// returns the answer to the agent.
-///
-/// The agent never touches the real internet: its connection ends at the
-/// world. Over HTTPS the agent sees the world's certificate, from
-/// [`Site::tls`], and the real certificate stays between the world and the
-/// real site.
-///
-/// Only names the callback hands to `proxy(&fcx)` are forwarded, so the world
-/// stays closed unless it opens a name on purpose. To change some responses
-/// and pass the rest through, wrap it in tower or axum middleware.
-///
-/// The world checks the real site's certificate against the Mozilla root
-/// store (`webpki-roots`). Hop-by-hop headers (`Connection`, `Keep-Alive`,
-/// `Transfer-Encoding` and the like) are not passed on in either direction,
-/// so it carries no protocol upgrades: a WebSocket handshake reaches the
-/// real site as a plain `GET`. A world that wants WebSockets serves them
-/// itself, with a handler on the site (see [`httpd`'s upgrades](fictionet::stdlib::httpd)).
-/// If the real site cannot be reached, the agent gets `502 Bad Gateway`.
-/// Returns an error in a lab before constructing a client.
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-pub fn proxy(fcx: &Cx) -> Result<Proxy, Error> {
-    fcx.require_real_io()?;
-    Ok(Proxy {
-        client: Arc::new(proxy_client()),
-    })
-}
-
-/// The handler made by [`proxy`].
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-#[derive(Clone)]
-pub struct Proxy {
-    client: Arc<ProxyClient>,
-}
-
-#[cfg(feature = "tokio")]
-impl tower_service::Service<Request<Body>> for Proxy {
-    type Response = Response<hyper::body::Incoming>;
-    type Error = Error;
-    type Future =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Error>> + Send>>;
-
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: Request<Body>) -> Self::Future {
-        Box::pin(send_upstream(self.client.clone(), request))
-    }
-}
-
-#[cfg(feature = "tokio")]
-type ProxyClient = hyper_util::client::legacy::Client<
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    Body,
->;
-
-#[cfg(feature = "tokio")]
-fn proxy_client() -> ProxyClient {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_provider_and_webpki_roots(provider)
-        .expect("ring supports the default TLS versions")
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-    hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .build(connector)
-}
-
-/// Headers that belong to one connection and are not passed on (RFC 9110,
-/// section 7.6.1).
-#[cfg(feature = "tokio")]
-const HOP_BY_HOP: [&str; 8] = [
-    "connection",
-    "keep-alive",
-    "proxy-connection",
-    "transfer-encoding",
-    "te",
-    "trailer",
-    "upgrade",
-    "proxy-authorization",
-];
-
-#[cfg(feature = "tokio")]
-fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
-    let named: Vec<String> = headers
-        .get_all(http::header::CONNECTION)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()))
-        .collect();
-    for name in HOP_BY_HOP
-        .iter()
-        .copied()
-        .chain(named.iter().map(String::as_str))
-    {
-        headers.remove(name);
-    }
-}
-
-/// Forwards one request to its [`Target`] over the world's own network.
-#[cfg(feature = "tokio")]
-async fn send_upstream(
-    client: Arc<ProxyClient>,
-    request: Request<Body>,
-) -> Result<Response<hyper::body::Incoming>, Error> {
-    use http::uri::Scheme;
-    let target = request
-        .extensions()
-        .get::<Target>()
-        .cloned()
-        .ok_or_else(|| {
-            fictionet::Error::msg(
-                "web::proxy(&fcx) serves only requests that web::Sites routed: there is no web::Target",
-            )
-        })?;
-    let (mut parts, body) = request.into_parts();
-    let default_port = (target.scheme == Scheme::HTTP && target.port == 80)
-        || (target.scheme == Scheme::HTTPS && target.port == 443);
-    let authority = if default_port {
-        target.host.clone()
-    } else {
-        format!("{}:{}", target.host, target.port)
-    };
-    let path = parts
-        .uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/");
-    parts.uri = format!("{}://{}{}", target.scheme, authority, path).parse()?;
-    parts.version = http::Version::HTTP_11;
-    parts.extensions = http::Extensions::new();
-    strip_hop_by_hop(&mut parts.headers);
-    parts.headers.insert(http::header::HOST, authority.parse()?);
-    let mut response = client
-        .request(Request::from_parts(parts, body))
-        .await
-        .map_err(|e| httpd::BadGateway(format!("{}: {e}", target.host)))?;
-    strip_hop_by_hop(response.headers_mut());
-    Ok(response)
-}
-
-/// Forwards requests to a fixed HTTP or HTTPS origin through the world's
-/// network. Paths, queries, bodies, and the original `Host` header are
-/// preserved. Connection-specific headers are removed in both directions.
-/// The upstream must contain a scheme and authority. Its path is ignored.
-/// This handler requires a tokio runtime and real host I/O.
-#[cfg(feature = "tokio")]
-pub fn forward(upstream: http::Uri) -> Forward {
-    Forward {
-        upstream,
-        client: Arc::new(proxy_client()),
-    }
-}
-
-/// A handler that forwards to one fixed origin.
-#[cfg(feature = "tokio")]
-#[derive(Clone)]
-pub struct Forward {
-    upstream: http::Uri,
-    client: Arc<ProxyClient>,
-}
-
-#[cfg(feature = "tokio")]
-impl Handler for Forward {
-    fn call(&self, request: Request<Body>, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
-        httpd::tower(self.clone()).call(request, ex)
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl tower_service::Service<Request<Body>> for Forward {
-    type Response = Response<hyper::body::Incoming>;
-    type Error = Error;
-    type Future =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Error>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let client = self.client.clone();
-        let upstream = self.upstream.clone();
-        Box::pin(async move {
-            let (mut parts, body) = request.into_parts();
-            parts.uri = http::Uri::builder()
-                .scheme(
-                    upstream
-                        .scheme()
-                        .cloned()
-                        .ok_or_else(|| Error::msg("upstream has no scheme"))?,
-                )
-                .authority(
-                    upstream
-                        .authority()
-                        .cloned()
-                        .ok_or_else(|| Error::msg("upstream has no authority"))?,
-                )
-                .path_and_query(
-                    parts
-                        .uri
-                        .path_and_query()
-                        .map(|p| p.as_str())
-                        .unwrap_or("/"),
-                )
-                .build()?;
-            parts.version = http::Version::HTTP_11;
-            parts.extensions = http::Extensions::new();
-            strip_hop_by_hop(&mut parts.headers);
-            let mut response = client
-                .request(Request::from_parts(parts, body))
-                .await
-                .map_err(|e| httpd::BadGateway(e.to_string()))?;
-            strip_hop_by_hop(response.headers_mut());
-            Ok(response)
-        })
-    }
+fictionet::cfg_web_proxy! {
+mod proxy;
+pub use proxy::{Forward, Proxy, forward, proxy};
 }

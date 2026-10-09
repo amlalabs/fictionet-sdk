@@ -14,8 +14,10 @@ use fictionet::relay::proxy::dns;
 use fictionet::relay::proxy::http::{
     Target, error_response, forward_head, parse_request, rewrite_response,
 };
-use fictionet::relay::proxy::socks5::handshake;
+#[path = "../../src/bin/fictionet/proxy/socks5_handshake.rs"]
+mod socks5_handshake;
 use fictionet::stdlib::http1::{RequestHead, ResponseHead};
+use socks5_handshake::handshake;
 
 /// The HTTP door: a request head, the token check, and the answer's head.
 pub fn http(data: &[u8]) {

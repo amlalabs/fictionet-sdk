@@ -77,7 +77,7 @@
 //! ```
 //!
 //! [`net::Net`](fictionet::stdlib::net::Net) does this for every host and
-//! port of a network, and [`httpd`](fictionet::stdlib::httpd) is HTTP as a
+//! port of a network, and [`httpd`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/index.html) is HTTP as a
 //! service.
 //!
 //! # What the driver promises
@@ -142,14 +142,15 @@
 //!   tunnel. A decoder that ends ([`Step::End`](fictionet::stdlib::codec::Step::End))
 //!   asks [`Service::on_decoder_end`] which.
 
+use fictionet::sync::Mutex;
 use fictionet::{Entropy, Seed, SeededEntropy};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::pin::pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
@@ -505,12 +506,7 @@ impl WakeHandle {
             return;
         }
         self.inner.woken.store(true, Ordering::Release);
-        let waker = self
-            .inner
-            .waker
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let waker = self.inner.waker.lock().take();
         if let Some(w) = waker {
             w.wake();
         }
@@ -522,7 +518,7 @@ impl WakeHandle {
     }
 
     fn poll(&self, cx: &mut Context<'_>) -> Poll<()> {
-        *self.inner.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(cx.waker().clone());
+        *self.inner.waker.lock() = Some(cx.waker().clone());
         if self.inner.woken.load(Ordering::Acquire) {
             Poll::Ready(())
         } else {
@@ -536,11 +532,7 @@ impl WakeHandle {
 
     fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
-        self.inner
-            .waker
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        self.inner.waker.lock().take();
     }
 }
 
@@ -856,7 +848,7 @@ fn due(timers: &[(Timer, Instant)], now: Instant) -> Option<usize> {
 /// it ends the run. The panic's own message says where in the code it
 /// happened; a `PanicNote` alive while it unwinds adds which service and
 /// connection, on standard error. [`connection`], [`datagram`] and
-/// HTTP/2 in [`httpd`](fictionet::stdlib::httpd) keep one while they call
+/// HTTP/2 in [`httpd`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/index.html) keep one while they call
 /// world code.
 pub struct PanicNote {
     service: &'static str,
@@ -941,8 +933,8 @@ impl Transcript {
         self.lock().dropped()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Recorder<(), String>> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> fictionet::sync::MutexGuard<'_, Recorder<(), String>> {
+        self.inner.lock()
     }
 
     fn observe<T, E: core::fmt::Display>(
@@ -1042,7 +1034,7 @@ impl FaultPlan {
 
     /// Replaces the rules.
     pub fn set(&self, plan: Plan) {
-        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(plan);
+        *self.inner.lock() = Arc::new(plan);
     }
 
     /// Removes every rule.
@@ -1052,7 +1044,7 @@ impl FaultPlan {
 
     /// The rules now.
     pub fn get(&self) -> Arc<Plan> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.inner.lock().clone()
     }
 }
 
@@ -2479,11 +2471,11 @@ where
     let mut result = None;
     {
         let slot = &mut result;
-        let finished = std::sync::Mutex::new(None);
+        let finished = fictionet::sync::Mutex::new(None);
         let finished_ref = &finished;
         let mut region = std::pin::pin!(fcx.region(|child| async move {
             *slot = Some(serve_in_region(&child, conn, info, service, state, opts).await);
-            *finished_ref.lock().unwrap() = Some(child);
+            *finished_ref.lock() = Some(child);
             Ok(())
         }));
         let _ = std::future::poll_fn(|cx| {
@@ -2491,7 +2483,7 @@ where
             if polled.is_pending() {
                 // The connection has ended but its spawned work is still running.
                 // A region with no remaining work ends without a run-wide wake.
-                let child = finished.lock().unwrap().take();
+                let child = finished.lock().take();
                 if let Some(child) = child {
                     child.cancel();
                 }

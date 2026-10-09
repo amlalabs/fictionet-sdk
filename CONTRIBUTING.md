@@ -10,10 +10,10 @@ write the code. Security problems go by email, not in issues: see
 
 ## The checks
 
-CI runs these commands on every pull request, in two feature sets: once with the
-default features, and once with `--no-default-features`, which leaves out the
-`tokio` feature (`web::proxy`). A pull request must pass
-both. Run them before you push:
+CI runs these commands on every pull request, in four feature sets:
+default features, `--no-default-features`, `--all-features`, and
+`--no-default-features --features tokio`. A pull request must pass
+each configuration. Run them before you push:
 
 ```console
 $ cargo build --locked --workspace --all-targets

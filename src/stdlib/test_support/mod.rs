@@ -248,6 +248,7 @@ pub fn assert_linear(name: &str, n: usize, mut run: impl FnMut(usize)) {
 /// Returns the CPU time used by the calling thread when available.
 /// Otherwise returns elapsed wall time since the first fallback call.
 pub fn thread_cpu_time() -> core::time::Duration {
+    fictionet::cfg_std! {
     #[cfg(unix)]
     {
         let mut t = libc::timespec {
@@ -261,6 +262,7 @@ pub fn thread_cpu_time() -> core::time::Duration {
                 u32::try_from(t.tv_nsec).unwrap_or_default(),
             );
         }
+    }
     }
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed()

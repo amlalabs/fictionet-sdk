@@ -20,6 +20,7 @@ pub(crate) use web_time::{Instant, SystemTime, UNIX_EPOCH};
 /// `Cx`. Returns the source's error if filling fails; `buf` may then be
 /// partially filled.
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "std")]
 pub fn random_bytes(mut buf: &mut [u8]) -> std::io::Result<()> {
     while !buf.is_empty() {
         // SAFETY: the pointer and length describe `buf`.
@@ -44,6 +45,7 @@ pub fn random_bytes(mut buf: &mut [u8]) -> std::io::Result<()> {
 /// `Cx`. Returns the source's error if filling fails; `buf` may then be
 /// partially filled.
 #[cfg(target_arch = "wasm32")]
+#[cfg(feature = "std")]
 pub fn random_bytes(buf: &mut [u8]) -> std::io::Result<()> {
     getrandom::fill(buf).map_err(std::io::Error::other)
 }

@@ -460,6 +460,10 @@ pub(crate) fn parse_attach(args: &[String]) -> Result<Parsed, String> {
     if name.is_empty() || name.len() > 255 {
         return Err("--name must be 1 to 255 bytes".into());
     }
+    #[cfg(not(feature = "tokio"))]
+    if matches!(kind.as_deref(), Some("http_proxy" | "socks5")) {
+        return Err("proxy attach types require the tokio feature".into());
+    }
     let proxy = match kind.as_deref() {
         Some("tun") => None,
         Some("http_proxy") => Some(ProxyKind::Http),
@@ -1112,6 +1116,20 @@ mod tests {
     const PROXY: &str = "--world unix:/run/w.sock --name m3 --type http_proxy --listen 127.0.0.1:8080 \
                          --token-file /run/token --ip-addr 10.0.0.2 --dns 10.0.0.1";
 
+    #[cfg(not(feature = "tokio"))]
+    #[test]
+    fn proxy_types_require_tokio() {
+        assert_eq!(
+            parse_attach(&args(PROXY)).unwrap_err(),
+            "proxy attach types require the tokio feature"
+        );
+        assert_eq!(
+            parse_attach(&args(&PROXY.replace("http_proxy", "socks5"))).unwrap_err(),
+            "proxy attach types require the tokio feature"
+        );
+    }
+
+    #[cfg(feature = "tokio")]
     fn parse_proxy(line: &str) -> Result<ProxyArgs, String> {
         match super::parse_attach(&args(line))? {
             Parsed::Proxy(p) => Ok(p),
@@ -1119,6 +1137,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tokio")]
     #[test]
     fn proxy_flags() {
         let p = parse_proxy(PROXY).unwrap();
@@ -1141,6 +1160,7 @@ mod tests {
         assert_eq!(p.listen, "[::]:1080".parse().unwrap());
     }
 
+    #[cfg(feature = "tokio")]
     #[test]
     fn proxy_types_refuse_tun_flags() {
         let bad = |extra: &str| parse_proxy(&format!("{PROXY} {extra}")).unwrap_err();
@@ -1165,6 +1185,7 @@ mod tests {
         assert!(e.starts_with("--type socks5 takes no --gateway"), "{e}");
     }
 
+    #[cfg(feature = "tokio")]
     #[test]
     fn proxy_types_need_their_flags() {
         let without = |flag: &str| {
@@ -1317,7 +1338,10 @@ mod tests {
         // And the other types refuse --vm.
         let e = parse_attach(&args(&format!("{FULL} --vm qemu:/x"))).unwrap_err();
         assert_eq!(e, "--vm is only for --type tap");
-        let e = parse_proxy(&format!("{PROXY} --vm qemu:/x")).unwrap_err();
-        assert!(e.starts_with("--type http_proxy takes no --vm"), "{e}");
+        #[cfg(feature = "tokio")]
+        {
+            let e = parse_proxy(&format!("{PROXY} --vm qemu:/x")).unwrap_err();
+            assert!(e.starts_with("--type http_proxy takes no --vm"), "{e}");
+        }
     }
 }

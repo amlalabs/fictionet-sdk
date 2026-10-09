@@ -1,4 +1,4 @@
-#![cfg(feature = "tokio")]
+#![cfg(feature = "web-proxy")]
 
 use fictionet::stdlib::web::{self, Body};
 use http_body_util::BodyExt;

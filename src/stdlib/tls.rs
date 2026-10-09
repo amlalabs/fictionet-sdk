@@ -2,7 +2,7 @@
 //!
 //! Use this module when a machine in the world serves HTTPS, or any other
 //! protocol over TLS, by hand. If the world is a set of websites,
-//! [`web::Sites`](fictionet::stdlib::web::Sites) does TLS for you.
+//! [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) does TLS for you.
 //!
 //! TLS here is middleware. It takes a [`Connection`], usually a
 //! [`TcpConnection`](fictionet::stdlib::tcp::TcpConnection), and gives back a
@@ -1180,7 +1180,7 @@ mod tests {
         use rustls::crypto::SecureRandom;
         let mut byte = [0; 1];
         assert!(super::CxRandom.fill(&mut byte).is_err());
-        fictionet::block_on(fictionet::run(Seed::from_u64(42), |fcx| async move {
+        fictionet::block_on(fictionet::lab(Seed::from_u64(42), |fcx| async move {
             let oracle = SeededEntropy::new(Seed::from_u64(42));
             let mut expected = [0; 1];
             oracle.fill_random(&mut expected);

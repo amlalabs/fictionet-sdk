@@ -204,7 +204,7 @@
 //! Attach will send a DHCP request or an IPv6 router
 //! solicitation into the world as ordinary packets, and the world will
 //! answer with stdlib code, like any other packets.
-//! [`Sites`](crate::stdlib::web::Sites) already answers DHCP. Attach will
+//! [`Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) already answers DHCP. Attach will
 //! wait for the answers before it writes its ready file, and renew the
 //! lease while it runs.
 //!
@@ -256,6 +256,6 @@
 //!
 //! A Python world will also run in one process. Fictionet will be embedded
 //! in Python, and asyncio's ordinary event loop will poll
-//! [`run`](crate::run), with the helper threads waking it through
+//! [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html), with the helper threads waking it through
 //! `call_soon_threadsafe`. Any asyncio library will then work inside a
 //! world.

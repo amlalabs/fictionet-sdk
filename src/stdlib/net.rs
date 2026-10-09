@@ -5,7 +5,7 @@
 //! [`Net`] builds the whole network around the [`Host`]s a world declares.
 //! Each host has addresses, DNS names, and services on its ports: any
 //! [`Service`] over TCP or UDP, the same over TLS chosen by SNI, and any
-//! [`PortServer`] of the world's own, such as [`httpd::Server`] for HTTP with
+//! [`PortServer`] of the world's own, such as [`httpd::Server`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/struct.Server.html) for HTTP with
 //! name-based virtual hosting. Every sandbox that attaches is put on the
 //! sandboxes' subnet, given an address by DHCP or by its first packet, and
 //! kept from reaching the other sandboxes. A world then writes only its
@@ -14,33 +14,35 @@
 //! An office: a domain controller that answers LDAP and Kerberos, a web
 //! server, and a PLC, with DNS names for each:
 //!
-//! ```
-//! # use std::sync::Arc;
-//! # use fictionet::{Attachments, Cx, Result};
-//! # use fictionet::stdlib::{httpd, net::{Host, Net}, serve};
-//! # struct Ldap; struct Plc; struct Directory; struct Plant;
-//! # macro_rules! svc { ($t:ty, $w:ty) => {
-//! # impl serve::Service for $t {
-//! #     type Decoder = fictionet::stdlib::codec::Lines; type State = $w; type Error = std::convert::Infallible;
-//! #     fn decoder(&self) -> Self::Decoder { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
-//! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &$w, _: &mut serve::Driver<'_, Self::Decoder>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
-//! # } } }
-//! # svc!(Ldap, Directory); svc!(Plc, Plant);
-//! # async fn world(fcx: Cx, attachments: Attachments) -> Result {
-//! let directory = Arc::new(Directory);
-//! let plant = Arc::new(Plant);
-//! let intranet = httpd::Router::new().get("/", |_, _| http::Response::new("intranet\n".into()));
-//! fcx.events().to_file("/tmp/office-events.jsonl")?;
-//! Net::new()
-//!     .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp(389, directory.clone(), || Ldap))
-//!     .host("www", |h| h.dns_name("intranet.corp.test").port_server(80, httpd::Server::new(intranet)))
-//!     .host("plc1", |h| h.at("10.30.0.5".parse::<std::net::Ipv4Addr>().unwrap()).tcp(502, plant, || Plc))
-//!     .start(&fcx, attachments)?;
-//! # Ok(())
-//! # }
-//! ```
+#![doc = fictionet::cfg_std!(doc r####"
+```
+# use std::sync::Arc;
+# use fictionet::{Attachments, Cx, Result};
+# use fictionet::stdlib::{httpd, net::{Host, Net}, serve};
+# struct Ldap; struct Plc; struct Directory; struct Plant;
+# macro_rules! svc { ($t:ty, $w:ty) => {
+# impl serve::Service for $t {
+#     type Decoder = fictionet::stdlib::codec::Lines; type State = $w; type Error = std::convert::Infallible;
+#     fn decoder(&self) -> Self::Decoder { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
+#     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &$w, _: &mut serve::Driver<'_, Self::Decoder>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
+# } } }
+# svc!(Ldap, Directory); svc!(Plc, Plant);
+# async fn world(fcx: Cx, attachments: Attachments) -> Result {
+let directory = Arc::new(Directory);
+let plant = Arc::new(Plant);
+let intranet = httpd::Router::new().get("/", |_, _| http::Response::new("intranet\n".into()));
+fcx.events().to_file("/tmp/office-events.jsonl")?;
+Net::new()
+    .host("dc01", |h| h.at("10.20.0.10".parse::<std::net::Ipv4Addr>().unwrap()).dns_name("dc01.corp.test").tcp(389, directory.clone(), || Ldap))
+    .host("www", |h| h.dns_name("intranet.corp.test").port_server(80, httpd::Server::new(intranet)))
+    .host("plc1", |h| h.at("10.30.0.5".parse::<std::net::Ipv4Addr>().unwrap()).tcp(502, plant, || Plc))
+    .start(&fcx, attachments)?;
+# Ok(())
+# }
+```
+"####)]
 //!
-//! [`web::Sites`](fictionet::stdlib::web::Sites) is a preset on `Net` for a
+//! [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) is a preset on `Net` for a
 //! world of websites, whose hosts appear as their names are looked up
 //! ([`Net::resolve`]).
 //!
@@ -105,16 +107,17 @@
 //!   TLS and one without count as two), or a port
 //!   that cannot be listened on, makes [`Net::start`] fail.
 //!
-//! The limits and rules are those [`web::Sites`](fictionet::stdlib::web::Sites)
+//! The limits and rules are those [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html)
 //! documents in detail, which runs on this.
 
+use fictionet::sync::Mutex;
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, RwLock};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -135,8 +138,10 @@ use fictionet::stdlib::{
 use fictionet::time::Instant;
 use fictionet::{Attachment, Attachments, Cx, End, Error, Interface, InterfaceExt, Packet};
 
+fictionet::cfg_std! {
 #[cfg(doc)]
 use fictionet::stdlib::httpd;
+}
 
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -172,12 +177,6 @@ const TTL: u32 = 60;
 
 fn link() -> (End, End) {
     fictionet::pair_with_limit(LINK_QUEUE)
-}
-
-/// Locks a mutex, ignoring poison: a panic elsewhere must not take the
-/// whole network down with it.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A name as hosts are kept: lowercase, without a trailing dot.
@@ -252,7 +251,7 @@ pub struct Arrival {
 }
 
 /// Serves connections on one port of a host. [`Host::tcp`] and
-/// [`Host::tls`] make one for a [`Service`]; [`httpd::Server`] is HTTP's.
+/// [`Host::tls`] make one for a [`Service`]; [`httpd::Server`](https://docs.rs/fictionet/latest/fictionet/stdlib/httpd/struct.Server.html) is HTTP's.
 /// A world writes its own for anything else.
 pub trait PortServer: Any + Send + Sync {
     /// Serves one connection.
@@ -817,7 +816,7 @@ impl Net {
         });
         start_gateway(&shared)?;
         {
-            let mut world = lock(&shared.world);
+            let mut world = shared.world.lock();
             for host in self.hosts {
                 let names = host.names.clone();
                 let label = host.label.clone();
@@ -879,7 +878,7 @@ impl Hooks {
     }
 
     fn sandbox_at(&self, addr: IpAddr) -> Sandbox {
-        if let Some(s) = lock(&self.by_addr).get(&addr) {
+        if let Some(s) = self.by_addr.lock().get(&addr) {
             return s.clone();
         }
         let (v4, v6) = match addr {
@@ -895,12 +894,12 @@ impl Hooks {
     }
 
     fn is_attached(&self, id: u64) -> bool {
-        lock(&self.attached).contains_key(&id)
+        self.attached.lock().contains_key(&id)
     }
 
     /// The budget of the sandbox with id `id`, while it is attached.
     fn budget(&self, id: u64) -> Option<Budget> {
-        lock(&self.attached).get(&id).cloned()
+        self.attached.lock().get(&id).cloned()
     }
 
     fn next_conn(&self) -> u64 {
@@ -1257,7 +1256,7 @@ fn make_lans(
                 // names the sandbox that sent it.
                 if event.conn.sandbox.is_none() {
                     let src = event.str("src").and_then(|a| a.parse::<IpAddr>().ok());
-                    event.conn.sandbox = src.and_then(|a| lock(&names.by_addr).get(&a).cloned());
+                    event.conn.sandbox = src.and_then(|a| names.by_addr.lock().get(&a).cloned());
                 }
                 event.field("lan", segment.clone())
             },
@@ -1333,7 +1332,7 @@ impl Shared {
     /// What `name` is. The first lookup of a name no host has runs the
     /// resolver and, for a host, starts its machines.
     fn lookup(self: &Arc<Self>, name: &str) -> Lookup {
-        let mut world = lock(&self.world);
+        let mut world = self.world.lock();
         if let Some(known) = world.names.get(name) {
             return match known {
                 Known::Host(p) => Lookup::Host(*p),
@@ -1531,7 +1530,7 @@ impl Shared {
                 None
             },
         };
-        lock(&hooks.by_addr).insert(addr, me.clone());
+        hooks.by_addr.lock().insert(addr, me.clone());
         let member = Member {
             sandbox,
             _attached: attached.clone(),
@@ -1571,7 +1570,7 @@ impl Peers {
     }
 
     fn enter(self: &Arc<Self>, peer: IpAddr) -> Option<PeerGuard> {
-        let mut map = lock(&self.open);
+        let mut map = self.open.lock();
         let n = map.entry(peer).or_default();
         if *n >= self.max {
             return None;
@@ -1591,7 +1590,7 @@ struct PeerGuard {
 
 impl Drop for PeerGuard {
     fn drop(&mut self) {
-        let mut map = lock(&self.peers.open);
+        let mut map = self.peers.open.lock();
         if let Some(n) = map.get_mut(&self.peer) {
             *n -= 1;
             if *n == 0 {
@@ -1616,7 +1615,7 @@ impl TlsName {
         if self.alpn.is_empty() {
             return given;
         }
-        let mut last = lock(&self.last);
+        let mut last = self.last.lock();
         if let Some((from, with_alpn)) = &*last
             && Arc::ptr_eq(from, &given)
         {
@@ -1692,7 +1691,7 @@ impl Machine {
 
     /// The port `port`, made and listened on if it is new.
     fn port(self: &Arc<Self>, port: u16) -> Result<Arc<Port>, String> {
-        let mut ports = lock(&self.ports);
+        let mut ports = self.ports.lock();
         if let Some(p) = ports.get(&port) {
             return Ok(p.clone());
         }
@@ -1717,7 +1716,7 @@ impl Machine {
         for (number, spec) in &host.ports {
             match spec {
                 PortSpec::Udp(start) => {
-                    if !lock(&self.udp_ports).insert(*number) {
+                    if !self.udp_ports.lock().insert(*number) {
                         return Err(format!("UDP port {number} at {addr} is already served"));
                     }
                     let socket = self
@@ -1821,12 +1820,12 @@ impl Machine {
 
     /// Whether TCP `port` is open here.
     fn serves_tcp(&self, port: u16) -> bool {
-        lock(&self.ports).contains_key(&port)
+        self.ports.lock().contains_key(&port)
     }
 
     /// Whether UDP `port` is open here.
     fn serves_udp(&self, port: u16) -> bool {
-        lock(&self.udp_ports).contains(&port)
+        self.udp_ports.lock().contains(&port)
     }
 }
 
@@ -1943,7 +1942,7 @@ async fn connection(
             .or_else(|| tls.by_name.get(""))?
             .clone();
         let config = name.config(fcx);
-        *lock(&pick) = Some(name);
+        *pick.lock() = Some(name);
         Some(config)
     });
     let detached = || sandbox_id.is_some_and(|id| !hooks.is_attached(id));
@@ -1952,7 +1951,7 @@ async fn connection(
     else {
         return;
     };
-    let Some(name) = lock(&chosen).take() else {
+    let Some(name) = chosen.lock().take() else {
         return;
     };
     name.accept
@@ -2005,7 +2004,7 @@ fn start_dns(shared: &Arc<Shared>, fcx: &Cx, side: End, addr: IpAddr) -> Result<
     let udp = udp::endpoint(fcx, udp, addr);
     let socket = udp.bind(53)?;
     let listener = tcp.listen(53)?;
-    lock(&shared.gateway_tcp).push(tcp);
+    shared.gateway_tcp.lock().push(tcp);
     let s = shared.clone();
     fcx.spawn(move |fcx| dns_udp(fcx, socket, s));
     let s = shared.clone();
@@ -2355,7 +2354,7 @@ enum Bind {
 
 impl Shared {
     fn offer(&self, owner: u64, requested: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
-        let mut leases = lock(&self.leases);
+        let mut leases = self.leases.lock();
         let mine = leases.of(owner);
         if let Some((a, true)) = mine {
             return Some(a);
@@ -2379,14 +2378,14 @@ impl Shared {
     }
 
     fn may_bind(&self, owner: u64, a: Ipv4Addr) -> bool {
-        let leases = lock(&self.leases);
+        let leases = self.leases.lock();
         !matches!(leases.of(owner), Some((_, true)))
             && self.subnet.is_sandbox(a)
             && leases.free_for(owner, a)
     }
 
     fn bind(&self, owner: u64, a: Ipv4Addr) -> Bind {
-        let mut leases = lock(&self.leases);
+        let mut leases = self.leases.lock();
         if let Some((b, true)) = leases.of(owner) {
             return if a == b { Bind::Already } else { Bind::Refused };
         }
@@ -2402,7 +2401,7 @@ impl Shared {
         let Some(subnet) = &self.subnet6 else {
             return Bind::Refused;
         };
-        let mut leases = lock(&self.leases);
+        let mut leases = self.leases.lock();
         if let Some(b) = leases.by_owner6.get(&owner) {
             return if a == *b {
                 Bind::Already
@@ -2558,8 +2557,12 @@ struct Attached {
 
 impl Attached {
     fn new(shared: &Arc<Shared>, fcx: &Cx, name: Arc<str>, fixed: Option<IpAddr>) -> Attached {
-        let owner = lock(&shared.leases).new_owner();
-        lock(&shared.hooks.attached).insert(owner, Budget::new(shared.limits.sandbox_budget));
+        let owner = shared.leases.lock().new_owner();
+        shared
+            .hooks
+            .attached
+            .lock()
+            .insert(owner, Budget::new(shared.limits.sandbox_budget));
         Attached {
             shared: shared.clone(),
             owner,
@@ -2573,12 +2576,12 @@ impl Attached {
 impl Drop for Attached {
     fn drop(&mut self) {
         let shared = &self.shared;
-        lock(&shared.hooks.attached).remove(&self.owner);
+        shared.hooks.attached.lock().remove(&self.owner);
         let (bound, bound6) = match self.fixed {
             Some(IpAddr::V4(a)) => (Some(a), None),
             Some(IpAddr::V6(a)) => (None, Some(a)),
             None => {
-                let leases = lock(&shared.leases);
+                let leases = shared.leases.lock();
                 let v4 = leases
                     .of(self.owner)
                     .and_then(|(a, bound)| bound.then_some(a));
@@ -2592,19 +2595,19 @@ impl Drop for Attached {
             .collect();
         if !addrs.is_empty() {
             let machines: Vec<Arc<Machine>> =
-                lock(&shared.world).machines.values().cloned().collect();
+                shared.world.lock().machines.values().cloned().collect();
             for m in machines {
                 for a in &addrs {
                     m.tcp.abort_peer(*a);
                 }
             }
-            for tcp in lock(&shared.gateway_tcp).iter() {
+            for tcp in shared.gateway_tcp.lock().iter() {
                 for a in &addrs {
                     tcp.abort_peer(*a);
                 }
             }
         }
-        lock(&shared.leases).release_all(self.owner);
+        shared.leases.lock().release_all(self.owner);
         let sandbox = Sandbox {
             id: self.owner,
             name: self.name.clone(),
@@ -2823,7 +2826,7 @@ impl Filter {
             IpAddr::V6(a) => (self.bound6, self.route6) = (Some(a), Some(port)),
         }
         let sandbox = self.me();
-        let mut by_addr = lock(&self.shared.hooks.by_addr);
+        let mut by_addr = self.shared.hooks.by_addr.lock();
         for a in self
             .bound
             .map(IpAddr::V4)
@@ -2970,7 +2973,7 @@ impl Shared {
         let Some(dst) = ip::destination(p) else {
             return false;
         };
-        self.is_gateway(dst) || lock(&self.world).machines.contains_key(&dst)
+        self.is_gateway(dst) || self.world.lock().machines.contains_key(&dst)
     }
 
     /// Why the network will refuse `p`: no machine has its address, or its
@@ -2981,7 +2984,7 @@ impl Shared {
         if self.is_gateway(dst) {
             return closed(&|_, p| p == 53).then_some(BlockedWhy::ClosedPort);
         }
-        let machine = lock(&self.world).machines.get(&dst).cloned();
+        let machine = self.world.lock().machines.get(&dst).cloned();
         match machine {
             Some(m) => closed(&|proto, p| {
                 if proto == PROTO_TCP {
@@ -3030,6 +3033,7 @@ fn answered_closed(p: &[u8], open: impl Fn(u8, u16) -> bool) -> bool {
     }
 }
 
+fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3077,7 +3081,9 @@ mod tests {
                     lans,
                 });
                 start_gateway(&shared)?;
-                let addresses: Vec<_> = lock(&shared.gateway_tcp)
+                let addresses: Vec<_> = shared
+                    .gateway_tcp
+                    .lock()
                     .iter()
                     .map(tcp::Endpoint::addr)
                     .collect();
@@ -3101,7 +3107,7 @@ mod tests {
                 Box::pin(async {})
             }
             fn share(&self, _: &[String], _: &Arc<dyn PortServer>) -> bool {
-                lock(&self.1).push(self.0);
+                self.1.lock().push(self.0);
                 false
             }
         }
@@ -3123,7 +3129,7 @@ mod tests {
                 let (_attacher, attachments) = fictionet::attachments();
                 net.start(&fcx, attachments)?;
                 assert_eq!(
-                    *lock(&log),
+                    *log.lock(),
                     [
                         "z.test", "z.test", "a.test", "z.test", "m.test", "z.test", "b.test",
                         "z.test", "y.test"
@@ -3290,4 +3296,6 @@ mod tests {
         assert!(prefix_contains(&p, "10.0.9.200".parse().unwrap()));
         assert!(!prefix_contains(&p, "2001:db8::1".parse().unwrap()));
     }
+}
+
 }

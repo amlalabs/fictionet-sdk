@@ -12,10 +12,11 @@
 //! about it, reach this layer.
 //! The [`ip`] page shows a whole machine.
 
+use fictionet::sync::Mutex;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 use fictionet::CancelWait;
@@ -71,7 +72,7 @@ pub fn endpoint(fcx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
         move |fcx| async move {
             drive(&fcx, &driver).await;
             let wakers: Vec<Waker> = {
-                let mut st = driver.state.lock().unwrap();
+                let mut st = driver.state.lock();
                 st.stopped = true;
                 st.sockets
                     .values_mut()
@@ -116,7 +117,7 @@ async fn drive(fcx: &Cx, shared: &Shared) {
         let mut n = 0;
         loop {
             let next = poll_fn(|cx| {
-                let mut inner = shared.inner.lock().unwrap();
+                let mut inner = shared.inner.lock();
                 match inner.poll_recv(fcx, cx) {
                     Poll::Ready(r) => Poll::Ready(Some(r)),
                     // Only wait when nothing came in this round; otherwise
@@ -154,7 +155,7 @@ fn deliver(shared: &Shared, packet: Packet) {
         return;
     }
     let group = ip.dst != shared.addr;
-    if group && !shared.state.lock().unwrap().groups.contains(&ip.dst) {
+    if group && !shared.state.lock().groups.contains(&ip.dst) {
         return;
     }
     let udp = ip.payload(&packet.0);
@@ -173,7 +174,7 @@ fn deliver(shared: &Shared, packet: Packet) {
     let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
     let from = SocketAddr::new(ip.src, src_port);
     let reply = {
-        let mut st = shared.state.lock().unwrap();
+        let mut st = shared.state.lock();
         match st.sockets.get_mut(&dst_port) {
             Some(q) => {
                 let cost = udp.len() - 8 + DATAGRAM_COST;
@@ -192,7 +193,7 @@ fn deliver(shared: &Shared, packet: Packet) {
         }
     };
     if let Some(reply) = reply {
-        shared.inner.lock().unwrap().send(reply);
+        shared.inner.lock().send(reply);
     }
 }
 
@@ -220,7 +221,7 @@ impl Endpoint {
                 self.shared.addr
             )));
         }
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.state.lock();
         if !st.groups.contains(&group) {
             st.groups.push(group);
         }
@@ -229,12 +230,7 @@ impl Endpoint {
 
     /// Leaves the multicast group `group`.
     pub fn leave(&self, group: IpAddr) {
-        self.shared
-            .state
-            .lock()
-            .unwrap()
-            .groups
-            .retain(|g| *g != group);
+        self.shared.state.lock().groups.retain(|g| *g != group);
     }
 
     /// Opens a socket on `port`.
@@ -243,7 +239,7 @@ impl Endpoint {
     /// that range is full or the requested port is already open. Dropping
     /// the socket frees the port.
     pub fn bind(&self, port: u16) -> Result<Socket, Error> {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.state.lock();
         let port = if port == 0 {
             let mut available = None;
             for _ in 49152..=u16::MAX {
@@ -258,7 +254,7 @@ impl Endpoint {
                     break;
                 }
             }
-            available.ok_or_else(|| Error::msg("all ephemeral UDP ports are bound"))?
+            available.ok_or_else(|| fictionet::Error::msg("all ephemeral UDP ports are bound"))?
         } else {
             port
         };
@@ -315,7 +311,7 @@ impl Socket {
                 return Poll::Ready(Err(RecvError::Cancelled));
             }
             {
-                let mut st = shared.state.lock().unwrap();
+                let mut st = shared.state.lock();
                 let stopped = st.stopped;
                 let q = st
                     .sockets
@@ -371,7 +367,7 @@ impl Socket {
         }
         udp[6..8].copy_from_slice(&sum.to_be_bytes());
         let id = {
-            let mut st = self.shared.state.lock().unwrap();
+            let mut st = self.shared.state.lock();
             if st.stopped {
                 return;
             }
@@ -388,13 +384,13 @@ impl Socket {
             },
             &udp,
         );
-        self.shared.inner.lock().unwrap().send(packet);
+        self.shared.inner.lock().send(packet);
     }
 }
 
 impl Drop for Socket {
     fn drop(&mut self) {
-        let removed = self.shared.state.lock().unwrap().sockets.remove(&self.port);
+        let removed = self.shared.state.lock().sockets.remove(&self.port);
         drop(removed);
     }
 }
@@ -408,6 +404,7 @@ fn port_unreachable(packet: &[u8], addr: IpAddr) -> Option<Packet> {
     }
 }
 
+fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,7 +415,7 @@ mod tests {
         struct WakeLog(u16, Arc<Mutex<Vec<u16>>>);
         impl std::task::Wake for WakeLog {
             fn wake(self: Arc<Self>) {
-                self.1.lock().unwrap().push(self.0);
+                self.1.lock().push(self.0);
             }
         }
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -429,21 +426,15 @@ mod tests {
             let (_raw, side) = pair();
             let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             for port in [9000, 53, 443, 22, 8080] {
-                keep.lock().unwrap().push(ep.bind(port)?);
-                ep.shared
-                    .state
-                    .lock()
-                    .unwrap()
-                    .sockets
-                    .get_mut(&port)
-                    .unwrap()
-                    .waker = Some(Waker::from(Arc::new(WakeLog(port, inside.clone()))));
+                keep.lock().push(ep.bind(port)?);
+                ep.shared.state.lock().sockets.get_mut(&port).unwrap().waker =
+                    Some(Waker::from(Arc::new(WakeLog(port, inside.clone()))));
             }
             fcx.cancel();
             Ok(())
         }))
         .unwrap();
-        assert_eq!(*log.lock().unwrap(), [22, 53, 443, 8080, 9000]);
+        assert_eq!(*log.lock(), [22, 53, 443, 8080, 9000]);
     }
 
     /// A UDP datagram from 10.0.0.2 to port 53 of 10.0.0.1, with a good
@@ -486,4 +477,6 @@ mod tests {
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
+}
+
 }

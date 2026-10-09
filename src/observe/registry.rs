@@ -63,7 +63,8 @@ struct Entry {
 /// Protocol factories used by a [`Dissector`](super::Dissector) or a live
 /// world's [`Cx::observe_protocols`](crate::Cx::observe_protocols).
 ///
-/// `default()` registers the built-ins. `new()` starts empty. Later
+/// `default()` registers the built-ins with the `observe` feature and
+/// starts empty without it. `new()` always starts empty. Later
 /// registrations take precedence. A matcher returning [`Match::More`]
 /// postpones lower-priority TCP matchers. [`Conversation`](super::Conversation)
 /// rejects the conversation if that matcher still returns `More` at 64
@@ -90,9 +91,14 @@ impl std::fmt::Debug for Registry {
 
 impl Default for Registry {
     fn default() -> Self {
-        let mut registry = Self::new();
-        super::app::register(&mut registry);
-        registry
+        #[cfg(feature = "observe")]
+        {
+            let mut registry = Self::new();
+            super::app::register(&mut registry);
+            registry
+        }
+        #[cfg(not(feature = "observe"))]
+        Self::new()
     }
 }
 
@@ -245,7 +251,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "observe"))]
 mod tests {
     use super::*;
     use crate::observe::protocols::Modbus;

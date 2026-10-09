@@ -1,6 +1,6 @@
 //! The relay protocol: what `fictionet attach` and a world say to each other.
 //!
-//! Most world authors never need this page. [`listen`](crate::listen)
+//! Most world authors never need this page. [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html)
 //! speaks the protocol on the world's side, and `fictionet attach` speaks
 //! it on the sandbox's side. Read this page to write an attach of your own,
 //! or to debug a connection between the two.

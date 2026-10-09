@@ -9,40 +9,43 @@ use std::task::{Context, Poll, Wake, Waker};
 ///
 /// Use it for a world that needs no other executor. The thread sleeps while
 /// `future` waits, and wakes when the helper threads behind
-/// [`listen`](crate::listen) and the timers wake it. A world on tokio awaits
-/// [`run`](crate::run) inside the tokio runtime instead.
+/// [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) and the timers wake it. A world on tokio awaits
+/// [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) inside the tokio runtime instead.
 ///
-/// In a browser (wasm32-unknown-unknown) a thread cannot sleep, and only
+/// Without `std`, this spins instead of sleeping. In a browser
+/// (wasm32-unknown-unknown) a thread cannot sleep, and only
 /// the run's own timers can wake the future. There `block_on` fires the
 /// timers itself and spins while it waits for the next one, which holds
 /// the page's thread for as long as the world runs. It suits a test, a Web
-/// Worker or Node.js. A page hands [`run`](crate::run) to its event loop
+/// Worker or Node.js. A page hands [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) to its event loop
 /// instead, for example with `wasm_bindgen_futures::spawn_local`, and the
 /// timers fire from `setTimeout`.
 ///
 /// `block_on` is not a tokio runtime. Anything that needs one, such as
-/// everything behind the `tokio` feature or a tokio-based database client,
+/// `web::proxy` or a tokio-based database client,
 /// fails under `block_on`. Such a world runs on tokio.
 ///
-/// ```no_run
-/// # use fictionet::{Attachments, Cx, Result};
-/// # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-/// fn main() -> fictionet::Result {
-///     let (attacher, attachments) = fictionet::attachments();
-///     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
-///     let _listening = fictionet::listen(socket, attacher)?;
-///     fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
-/// }
-/// ```
+#[doc = fictionet::cfg_std!(doc r####"
+```no_run
+# use fictionet::{Attachments, Cx, Result};
+# async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
+fn main() -> fictionet::Result {
+    let (attacher, attachments) = fictionet::attachments();
+    let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
+    let _listening = fictionet::listen(socket, attacher)?;
+    fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
+}
+```
+"####)]
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     return park_on(future);
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
     return spin_on(future);
 }
 
 /// Sleeps the thread while `future` waits.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn park_on<F: Future>(future: F) -> F::Output {
     struct Unpark(std::thread::Thread);
     impl Wake for Unpark {
@@ -67,7 +70,7 @@ fn park_on<F: Future>(future: F) -> F::Output {
 }
 
 /// Fires the run's timers while `future` waits.
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
 fn spin_on<F: Future>(future: F) -> F::Output {
     use std::sync::atomic::{AtomicBool, Ordering};
 

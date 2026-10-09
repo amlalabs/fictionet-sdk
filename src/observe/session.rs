@@ -455,7 +455,7 @@ fn world(graph: Option<&Graph>) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "observe"))]
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;

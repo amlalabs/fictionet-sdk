@@ -31,7 +31,7 @@ time = { version = "0.3", features = ["macros"] }
 tower-service = "0.3"
 
 [dev-dependencies]
-fictionet = { path = "../../..", features = ["tokio"] }
+fictionet = { path = "../../.." }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 bytes = "1"
-fictionet = { path = "../../..", features = ["tokio"] }
+fictionet = { path = "../../..", features = ["web-proxy"] }
 http = "1"
 http-body-util = "0.1"
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -24,5 +24,5 @@ tower-service = "0.3"
 debug = 1
 
 [dev-dependencies]
-fictionet = { path = "../../..", features = ["tokio"] }
+fictionet = { path = "../../..", features = ["web-proxy"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }

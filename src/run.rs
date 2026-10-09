@@ -1,3 +1,4 @@
+use fictionet::sync::Mutex;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
@@ -5,7 +6,7 @@ use std::future::Future;
 use std::panic::Location;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::JoinError;
@@ -31,7 +32,7 @@ use crate::{Cx, Result};
 ///
 /// Randomness comes from `seed`: every random number the world draws
 /// through its [`Cx`] is the next part of one stream started from it. Use
-/// [`Seed::random`](crate::Seed::random) for a fresh seed, or
+/// [`Seed::random`](https://docs.rs/fictionet/latest/fictionet/struct.Seed.html#method.random) for a fresh seed, or
 /// [`Seed::from_u64`](crate::Seed::from_u64) for a fixed one. The run's
 /// start event records the seed.
 ///
@@ -81,26 +82,29 @@ use crate::{Cx, Result};
 /// This `main` connects to a database before the world starts, and hands
 /// the pool to the world. It uses tokio, because the database client does:
 ///
-/// ```no_run
-/// # mod sqlx {
-/// #     pub struct PgPool;
-/// #     impl PgPool {
-/// #         pub async fn connect(_: &str) -> fictionet::Result<PgPool> { Ok(PgPool) }
-/// #     }
-/// # }
-/// #[tokio::main]
-/// async fn main() -> fictionet::Result {
-///     let db = sqlx::PgPool::connect("postgres://...").await?;
-///     let (attacher, attachments) = fictionet::attachments();
-///     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
-///     let _listening = fictionet::listen(socket, attacher)?;
-///     fictionet::run(fictionet::Seed::random(), |fcx| async move {
-///         // Build the world with `fcx`, `attachments` and `db`.
-/// #       let _ = (fcx, attachments, db);
-///         Ok(())
-///     }).await
-/// }
-/// ```
+#[doc = fictionet::cfg_std!(doc r####"
+```no_run
+# mod sqlx {
+#     pub struct PgPool;
+#     impl PgPool {
+#         pub async fn connect(_: &str) -> fictionet::Result<PgPool> { Ok(PgPool) }
+#     }
+# }
+#[tokio::main]
+async fn main() -> fictionet::Result {
+    let db = sqlx::PgPool::connect("postgres://...").await?;
+    let (attacher, attachments) = fictionet::attachments();
+    let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
+    let _listening = fictionet::listen(socket, attacher)?;
+    fictionet::run(fictionet::Seed::random(), |fcx| async move {
+        // Build the world with `fcx`, `attachments` and `db`.
+#       let _ = (fcx, attachments, db);
+        Ok(())
+    }).await
+}
+```
+"####)]
+#[cfg(feature = "std")]
 pub async fn run<F, Fut>(seed: crate::Seed, world: F) -> Result
 where
     F: FnOnce(Cx) -> Fut + Send,
@@ -111,7 +115,7 @@ where
 
 /// Runs a closed world on simulated time, for tests.
 ///
-/// A lab runs the world on the same executor as [`run`], with randomness
+/// A lab runs the world on the same executor as [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html), with randomness
 /// from `seed` in the same way. Only the clock differs. It starts at zero,
 /// and when every task is waiting it jumps to the earliest deadline, waking
 /// timers due at the same instant in the order they were set. So the same
@@ -122,7 +126,7 @@ where
 /// The test plays the sandboxes as tasks of the lab, through
 /// [`attachments`](crate::attachments). A lab whose tasks all wait with no
 /// deadline ends with an error that says so; a wait with no deadline at all
-/// never moves the clock. Attachments fed by [`listen`](crate::listen) fail
+/// never moves the clock. Attachments fed by [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) fail
 /// the lab on their first `get`, `next` or `map`, before handing out an
 /// attachment, and `get` and `next` return [`Cancelled`](crate::Cancelled).
 /// Observer sessions and `web::proxy` refuse a lab too.
@@ -212,7 +216,7 @@ impl RunShared {
         group: Option<&Arc<crate::watch::Group>>,
     ) -> std::result::Result<(), BoxFuture> {
         let outer = {
-            let mut q = self.queue.lock().unwrap();
+            let mut q = self.queue.lock();
             if q.closed {
                 return Err(future);
             }
@@ -237,7 +241,7 @@ impl RunShared {
 
     fn schedule(&self, id: u64) {
         let outer = {
-            let mut q = self.queue.lock().unwrap();
+            let mut q = self.queue.lock();
             if q.closed {
                 return;
             }
@@ -253,7 +257,7 @@ impl RunShared {
     /// that every wait sees it.
     pub(crate) fn wake_all(&self) {
         let outer = {
-            let mut q = self.queue.lock().unwrap();
+            let mut q = self.queue.lock();
             if q.closed {
                 return;
             }
@@ -321,7 +325,7 @@ impl Drop for CurrentGuard {
     }
 }
 
-/// The state of a run that only the future returned by [`run`] touches.
+/// The state of a run that only the future returned by [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) touches.
 struct RunState {
     shared: Arc<RunShared>,
     root: Arc<Region>,
@@ -341,7 +345,7 @@ impl RunState {
         let mut turn = std::mem::take(&mut self.turn);
         debug_assert!(turn.is_empty());
         {
-            let mut q = self.shared.queue.lock().unwrap();
+            let mut q = self.shared.queue.lock();
             match &q.outer {
                 Some(w) if w.will_wake(cx.waker()) => {}
                 _ => q.outer = Some(cx.waker().clone()),
@@ -433,7 +437,7 @@ impl RunState {
 
         // Keep the emptied queue for the next turn.
         self.turn = turn;
-        let mut q = self.shared.queue.lock().unwrap();
+        let mut q = self.shared.queue.lock();
         q.polling = false;
         if self.slots.is_empty() && q.incoming.is_empty() {
             drop(q);
@@ -469,7 +473,7 @@ impl RunState {
 impl Drop for RunState {
     fn drop(&mut self) {
         let incoming = {
-            let mut q = self.shared.queue.lock().unwrap();
+            let mut q = self.shared.queue.lock();
             q.closed = true;
             q.outer = None;
             std::mem::take(&mut q.incoming)
@@ -485,7 +489,7 @@ impl Drop for RunState {
             drop(slot);
         }
         // Work spawned while the slots were dropped.
-        let late = std::mem::take(&mut self.shared.queue.lock().unwrap().incoming);
+        let late = std::mem::take(&mut self.shared.queue.lock().incoming);
         drop(late);
         // Waits outside the run end too: joins of the dropped work, and
         // every wait on a `Cx` of the run, which reads `Cancelled`.

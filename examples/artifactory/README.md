@@ -71,12 +71,11 @@ no interface except loopback. Its only packet entry point is the Unix
 socket at `/run/relay/relay.sock`. Only the world and `fictionet attach`
 share that socket volume. The socket carries the agent's IP packets.
 
-The world opens no outbound socket. It is built without Fictionet's
-`tokio` feature. `web::proxy()`, hyper's client, hyper-rustls and
-webpki-roots are not compiled into the world binary. Check the production
-dependency graph with `cargo tree -e normal` in `world/`. The `tokio`
-crate can still appear as a transitive dependency. That does not enable
-Fictionet's `tokio` feature. Tests enable that feature for their clients.
+The world opens no outbound socket. It uses Fictionet's default features
+for HTTP/1.1, HTTP/2 and observation. The optional `web-proxy` feature is
+disabled, so `web::proxy()`, hyper's client, hyper-rustls and webpki-roots
+are not compiled into the world binary. Check the production dependency
+graph with `cargo tree -e normal` in `world/`.
 
 The gateway answers every unserved name with NXDOMAIN. Other destinations
 receive host-unreachable replies. Other TCP ports are refused. The log records those
@@ -348,7 +347,7 @@ handling. The line format is documented in `world/src/events.rs`.
 ## Appendix: a pass-through mode, and why it is not built
 
 This is documentation only. A pass-through would enable Fictionet's
-`tokio` feature and run the world on a Tokio runtime. It would create one
+`web-proxy` feature and run the world on a Tokio runtime. It would create one
 `web::Site` for each exact hostname, `pypi.org` and
 `files.pythonhosted.org`. A wrapper around `web::proxy()` would allow
 only GET and HEAD with no query string. It would strip `Authorization`

@@ -254,7 +254,7 @@ impl std::error::Error for ConnError {
 
 /// A connection's error as an [`std::io::Error`], for code that reads and
 /// writes through `std::io` or tokio's traits, such as
-/// [`Compat`](fictionet::tokio::Compat). The kind is the one std uses for the
+/// [`Compat`](https://docs.rs/fictionet/latest/fictionet/tokio/struct.Compat.html). The kind is the one std uses for the
 /// same failure; the `ConnError` is the source, so
 /// `e.get_ref().and_then(|e| e.downcast_ref::<ConnError>())` gets it back.
 ///

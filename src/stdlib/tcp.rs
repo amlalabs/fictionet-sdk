@@ -39,10 +39,11 @@
 //! ```
 
 use fictionet::stdlib::codec::Side;
+use fictionet::sync::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::poll_fn;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use smoltcp::iface::{Config, Interface as Iface, SocketHandle, SocketSet};
@@ -469,6 +470,7 @@ impl Conn {
     }
 }
 
+fictionet::cfg_std! { items {
 /// A socket's two buffers, in an anonymous mapping of their own.
 ///
 /// smoltcp buffers are fixed slices. Taking them from the heap would keep
@@ -583,6 +585,28 @@ impl Pages {
     unsafe fn release(&self) {
         match *self {}
     }
+}
+
+} else {
+enum Pages {}
+
+impl Pages {
+    fn map(_buffer: usize) -> Option<Pages> {
+        None
+    }
+
+    /// SAFETY: as on a host; no `Pages` exists to call it on.
+    unsafe fn halves(&self) -> (&'static mut [u8], &'static mut [u8]) {
+        match *self {}
+    }
+
+    /// SAFETY: as on a host; no `Pages` exists to call it on.
+    unsafe fn release(&self) {
+        match *self {}
+    }
+}
+
+}
 }
 
 /// A socket with two buffers of `buffer` bytes.
@@ -1147,7 +1171,7 @@ fn fix_lengths(packet: &mut [u8], tcp_at: usize, src: IpAddr, dst: IpAddr) {
 impl Shared {
     /// The endpoint stopped: every wait ends with an error.
     fn stop(&self) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         st.stopped = true;
         let mut wakers: Vec<Waker> = st
             .listeners
@@ -1192,7 +1216,7 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
             }
         }
         let next = {
-            let mut st = shared.state.lock().unwrap();
+            let mut st = shared.state.lock();
             match &st.driver {
                 Some(w) if w.will_wake(cx.waker()) => {}
                 _ => st.driver = Some(cx.waker().clone()),
@@ -1290,7 +1314,7 @@ impl Endpoint {
     /// peer that is gone for good, whose address someone else may take
     /// next.
     pub fn abort_peer(&self, peer: IpAddr) {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.state.lock();
         let hs: Vec<Id> = st
             .conns
             .iter()
@@ -1315,7 +1339,7 @@ impl Endpoint {
     /// outgoing connection uses the port. Dropping the listener frees the
     /// port.
     pub fn listen(&self, port: u16) -> Result<Listener, Error> {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.state.lock();
         if port == 0 {
             return Err(fictionet::Error::msg("TCP port 0 cannot be listened on"));
         }
@@ -1352,7 +1376,7 @@ impl Endpoint {
             return Err(ConnError::Refused);
         }
         let conn = {
-            let mut st = self.shared.state.lock().unwrap();
+            let mut st = self.shared.state.lock();
             if st.stopped {
                 return Err(ConnError::Closed);
             }
@@ -1395,7 +1419,7 @@ impl Endpoint {
                 return Poll::Ready(Err(ConnError::Cancelled));
             }
             {
-                let mut st = conn.shared.state.lock().unwrap();
+                let mut st = conn.shared.state.lock();
                 if st.stopped {
                     return Poll::Ready(Err(ConnError::Closed));
                 }
@@ -1450,7 +1474,7 @@ impl Listener {
                 return Poll::Ready(Err(ConnError::Cancelled));
             }
             {
-                let mut st = shared.state.lock().unwrap();
+                let mut st = shared.state.lock();
                 if st.stopped {
                     return Poll::Ready(Err(ConnError::Closed));
                 }
@@ -1516,7 +1540,7 @@ impl fictionet::stdlib::Accepted for TcpConnection {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.state.lock();
         let Some(l) = st.listeners.remove(&self.port) else {
             return;
         };
@@ -1565,7 +1589,7 @@ impl TcpConnection {
     /// a peer can hold, such as one that turns connections away past a
     /// limit, resets each connection it is done with.
     pub fn reset(self) {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.state.lock();
         st.sock(self.handle).abort();
         st.kick();
     }
@@ -1607,7 +1631,7 @@ impl GoneWatch {
     /// Resets the connection, as [`TcpConnection::reset`] does, after the
     /// connection itself was handed on.
     pub fn reset(&self) {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.state.lock();
         if st.conns.contains_key(&self.handle) {
             st.sock(self.handle).abort();
             st.kick();
@@ -1618,7 +1642,7 @@ impl GoneWatch {
     /// [`TcpConnection::hold_until_gone`]. Works after the connection
     /// itself was handed on, such as boxed behind TLS.
     pub fn hold_until_gone(&self, item: Box<dyn std::any::Any + Send>) {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.state.lock();
         match st.conns.get_mut(&self.handle) {
             Some(c) => c.held.push(item),
             None => drop(item),
@@ -1628,7 +1652,7 @@ impl GoneWatch {
 
 /// Ready once the connection `handle` was reset, or is gone.
 fn poll_gone(shared: &Shared, handle: Id, cx: &mut Context<'_>) -> Poll<()> {
-    let mut st = shared.state.lock().unwrap();
+    let mut st = shared.state.lock();
     if st.stopped {
         return Poll::Ready(());
     }
@@ -1646,7 +1670,7 @@ fn poll_gone(shared: &Shared, handle: Id, cx: &mut Context<'_>) -> Poll<()> {
 
 impl Drop for TcpConnection {
     fn drop(&mut self) {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.state.lock();
         let h = self.handle;
         st.orphan(h, false);
     }
@@ -1663,7 +1687,7 @@ impl Connection for TcpConnection {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         {
-            let mut st = self.shared.state.lock().unwrap();
+            let mut st = self.shared.state.lock();
             if st.stopped {
                 return Poll::Ready(Err(ConnError::Closed));
             }
@@ -1705,7 +1729,7 @@ impl Connection for TcpConnection {
             return Poll::Ready(Err(ConnError::Cancelled));
         }
         {
-            let mut st = self.shared.state.lock().unwrap();
+            let mut st = self.shared.state.lock();
             if st.stopped {
                 return Poll::Ready(Err(ConnError::Closed));
             }
@@ -1742,7 +1766,7 @@ impl Connection for TcpConnection {
     /// written (see `close_if_drained`). Returns immediately. It never
     /// waits, so a cancel does not stop it.
     fn poll_shutdown(&mut self, _fcx: &Cx, _cx: &mut Context<'_>) -> Poll<Result<(), ConnError>> {
-        let mut st = self.shared.state.lock().unwrap();
+        let mut st = self.shared.state.lock();
         if st.stopped {
             return Poll::Ready(Err(ConnError::Closed));
         }
@@ -1760,6 +1784,7 @@ impl Connection for TcpConnection {
     }
 }
 
+fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1770,7 +1795,7 @@ mod tests {
     struct WakeLog(u16, Arc<Mutex<Vec<u16>>>);
     impl std::task::Wake for WakeLog {
         fn wake(self: Arc<Self>) {
-            self.1.lock().unwrap().push(self.0);
+            self.1.lock().push(self.0);
         }
     }
 
@@ -1786,14 +1811,13 @@ mod tests {
                 ep.shared
                     .state
                     .lock()
-                    .unwrap()
                     .listeners
                     .get_mut(&port)
                     .unwrap()
                     .waker = Some(Waker::from(Arc::new(WakeLog(port, log.clone()))));
             }
             ep.shared.stop();
-            assert_eq!(*log.lock().unwrap(), [22, 80, 443, 8080, 9000]);
+            assert_eq!(*log.lock(), [22, 80, 443, 8080, 9000]);
             fcx.cancel();
             Ok(())
         }))
@@ -1807,7 +1831,7 @@ mod tests {
             let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
             let log = Arc::new(Mutex::new(Vec::new()));
             {
-                let mut st = ep.shared.state.lock().unwrap();
+                let mut st = ep.shared.state.lock();
                 for port in [9000, 80, 443, 22, 8080] {
                     let id = st.add_socket(new_socket(MIN_BUFFER));
                     let mut conn = Conn::new(
@@ -1821,7 +1845,7 @@ mod tests {
                 }
             }
             ep.abort_peer("10.0.0.2".parse().unwrap());
-            assert_eq!(*log.lock().unwrap(), [9000, 80, 443, 22, 8080]);
+            assert_eq!(*log.lock(), [9000, 80, 443, 22, 8080]);
             fcx.cancel();
             Ok(())
         }))
@@ -1833,7 +1857,7 @@ mod tests {
         block_on(run(fictionet::Seed::random(), |fcx| async move {
             let (_raw, side) = pair();
             let ep = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
-            let mut st = ep.shared.state.lock().unwrap();
+            let mut st = ep.shared.state.lock();
             let mut ids = Vec::new();
             for _ in 0..COMPACT_SLOTS {
                 ids.push(st.add_socket(new_socket(MIN_BUFFER)));
@@ -1864,7 +1888,7 @@ mod tests {
 
     /// Resident pages of every socket's buffers on `e`.
     fn resident(e: &Endpoint) -> usize {
-        let st = e.shared.state.lock().unwrap();
+        let st = e.shared.state.lock();
         st.pages.values().map(Pages::resident).sum()
     }
 
@@ -2013,7 +2037,7 @@ mod tests {
                     syn[tcp_at + 12] = 6 << 4;
                     syn.extend_from_slice(&[1, 3, 3, 7]);
                     fix_lengths(&mut syn, tcp_at, peer.ip(), local.ip());
-                    let mut st = server.shared.state.lock().unwrap();
+                    let mut st = server.shared.state.lock();
                     st.ingress(local.ip(), now, syn);
                     let packets = egress(&mut st, now);
                     let t = Header::parse_whole(&packets[0])
@@ -2031,13 +2055,7 @@ mod tests {
                     start
                 };
                 let mut conn = listener.accept(&fcx).await?;
-                let capacity = server
-                    .shared
-                    .state
-                    .lock()
-                    .unwrap()
-                    .get(conn.handle)
-                    .recv_capacity();
+                let capacity = server.shared.state.lock().get(conn.handle).recv_capacity();
                 assert_eq!(capacity, 256 * 1024);
                 // Vary the pattern across buffer laps so overwritten bytes differ.
                 let expected: Vec<u8> = (0..(capacity + 4096).div_ceil(997))
@@ -2048,7 +2066,7 @@ mod tests {
                     let mut p = segment(peer, local, seq, start, 0x10).0;
                     p.extend_from_slice(&expected[begin..end]);
                     fix_lengths(&mut p, tcp_at, peer.ip(), local.ip());
-                    let mut st = server.shared.state.lock().unwrap();
+                    let mut st = server.shared.state.lock();
                     st.ingress(local.ip(), now, p);
                     egress(&mut st, now);
                 };
@@ -2089,7 +2107,7 @@ mod tests {
                     }
                     assert_eq!(got[..capacity], expected[..capacity]);
                     // Resend the trimmed tail once application reads make room.
-                    egress(&mut server.shared.state.lock().unwrap(), now);
+                    egress(&mut server.shared.state.lock(), now);
                     incoming(capacity, expected.len());
                     while read < expected.len() {
                         let n = conn.read(&fcx, &mut got[read..]).await?;
@@ -2119,7 +2137,7 @@ mod tests {
                 p
             };
             let start = {
-                let mut st = server.shared.state.lock().unwrap();
+                let mut st = server.shared.state.lock();
                 st.ingress(local.ip(), now, incoming(7, 0, 0x02, 8));
                 let packets = egress(&mut st, now);
                 let t = Header::parse_whole(&packets[0])
@@ -2142,7 +2160,7 @@ mod tests {
                 conn.shutdown(&fcx).await?;
                 assert_eq!(conn.write_all(&fcx, b"late").await, Err(ConnError::Closed));
             }
-            let mut st = server.shared.state.lock().unwrap();
+            let mut st = server.shared.state.lock();
             let sent = egress(&mut st, now);
             assert!(sent.iter().any(|p| {
                 let t = Header::parse_whole(p).unwrap().payload(p);
@@ -2174,7 +2192,7 @@ mod tests {
                     .all(|p| Header::parse_whole(p).unwrap().payload(p)[13] & 1 == 0)
             );
             let end = start.wrapping_add(data.len() as u32);
-            let mut st = server.shared.state.lock().unwrap();
+            let mut st = server.shared.state.lock();
             st.ingress(local.ip(), now, incoming(9, end, 0x10, 32768));
             let sent = egress(&mut st, now);
             assert!(
@@ -2274,7 +2292,7 @@ mod tests {
                 acks += 1;
             }
             fcx.sleep(Duration::from_millis(100)).await?;
-            let st = server.shared.state.lock().unwrap();
+            let st = server.shared.state.lock();
             let l = &st.listeners[&80];
             assert!(l.embryonic.is_empty() && l.ready.is_empty());
             assert!(
@@ -2307,18 +2325,18 @@ mod tests {
                 let s = listener.accept(&fcx).await?;
                 crowd.push((c, s));
             }
-            assert!(server.shared.state.lock().unwrap().slots >= 401);
+            assert!(server.shared.state.lock().slots >= 401);
             drop(crowd);
             let deadline = fcx.now() + 100 * ACK_DELAY;
             while ![&server, &client].iter().all(|e| {
-                let st = e.shared.state.lock().unwrap();
+                let st = e.shared.state.lock();
                 st.handles.len() <= 3 && st.slots < COMPACT_SLOTS
             }) {
                 assert!(fcx.now() < deadline, "closed connections kept socket slots");
                 fcx.sleep(Duration::from_millis(5)).await?;
             }
             for e in [&server, &client] {
-                let st = e.shared.state.lock().unwrap();
+                let st = e.shared.state.lock();
                 assert!(st.handles.len() <= 3, "{} sockets left", st.handles.len());
                 // Compacted on the way down: fewer than 256 slots remain,
                 // not the 401 it had.
@@ -2359,12 +2377,12 @@ mod tests {
             let s = listener.accept(&fcx).await?;
             let h = s.handle;
             assert_eq!(
-                server.shared.state.lock().unwrap().get(h).timeout(),
+                server.shared.state.lock().get(h).timeout(),
                 Some(TIMEOUT.into())
             );
             drop(s);
             fcx.sleep(Duration::from_millis(50)).await?;
-            let st = server.shared.state.lock().unwrap();
+            let st = server.shared.state.lock();
             assert_eq!(
                 st.get(h).state(),
                 TcpState::FinWait2,
@@ -2391,7 +2409,7 @@ mod tests {
                 let mut c = client.connect(&fcx, "10.0.0.1:80".parse().unwrap()).await?;
                 let mut s = listener.accept(&fcx).await?;
                 for (ep, h) in [(&server, s.handle), (&client, c.handle)] {
-                    let st = ep.shared.state.lock().unwrap();
+                    let st = ep.shared.state.lock();
                     assert_eq!(st.get(h).recv_capacity(), size);
                     assert_eq!(st.get(h).send_capacity(), size);
                 }
@@ -2444,7 +2462,7 @@ mod tests {
                         while at < got.len() {
                             at += s.read(&fcx, &mut got[at..]).await?;
                         }
-                        *slot.lock().unwrap() = Some((s, got));
+                        *slot.lock() = Some((s, got));
                         Ok(())
                     })
                 };
@@ -2459,7 +2477,7 @@ mod tests {
                 );
                 c.write_all(&fcx, &up).await?;
                 writer.join(&fcx).await?;
-                let (back, got_up) = slot.lock().unwrap().take().unwrap();
+                let (back, got_up) = slot.lock().take().unwrap();
                 s = back;
                 assert!(
                     got_up == up,
@@ -2519,7 +2537,7 @@ mod tests {
             // The peer retransmits its SYN for p2.
             raw.send(segment(p2, to, 7, 0, 0x02));
             fcx.sleep(Duration::from_millis(100)).await?;
-            let st = server.shared.state.lock().unwrap();
+            let st = server.shared.state.lock();
             let for_p2 = st.conns.values().filter(|c| c.remote == p2).count();
             drop(st);
             assert_eq!(for_p2, 1, "one socket per tuple");
@@ -2545,7 +2563,7 @@ mod tests {
             fcx.sleep(Duration::from_millis(50)).await?;
             let gone = std::future::poll_fn(|cx| Poll::Ready(conn.poll_gone(cx).is_ready())).await;
             let state = {
-                let st = server.shared.state.lock().unwrap();
+                let st = server.shared.state.lock();
                 st.get(conn.handle).state()
             };
             assert_eq!(state, TcpState::Established);
@@ -2575,7 +2593,7 @@ mod tests {
             ));
             fcx.sleep(Duration::from_millis(50)).await?;
             let (state, fin, fin_at) = {
-                let st = server.shared.state.lock().unwrap();
+                let st = server.shared.state.lock();
                 let state = st.get(conn.handle).state();
                 let c = &st.conns[&conn.handle];
                 (state, c.fin, c.fin_at)
@@ -2587,4 +2605,6 @@ mod tests {
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");
     }
+}
+
 }

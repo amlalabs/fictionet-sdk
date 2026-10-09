@@ -14,6 +14,9 @@
 //!
 //! The roadmap is left out: it shows planned flags on purpose.
 
+#[path = "common/rust_docs.rs"]
+mod rust_docs;
+
 use std::collections::BTreeSet;
 
 /// Every page a reader can land on, by its path in the repository.
@@ -31,7 +34,10 @@ const PAGES: &[(&str, &str)] = &[
     ("src/observe.rs", include_str!("../src/observe.rs")),
     ("src/proto.rs", include_str!("../src/proto.rs")),
     ("src/stdlib/mod.rs", include_str!("../src/stdlib/mod.rs")),
-    ("src/stdlib/web.rs", include_str!("../src/stdlib/web.rs")),
+    (
+        "src/stdlib/web/mod.rs",
+        include_str!("../src/stdlib/web/mod.rs"),
+    ),
     (
         "examples/attach/netns.sh",
         include_str!("../examples/attach/netns.sh"),
@@ -80,15 +86,7 @@ fn doc_text(path: &str, text: &str) -> String {
     if !path.ends_with(".rs") {
         return text.to_owned();
     }
-    text.lines()
-        .filter_map(|l| {
-            l.trim_start()
-                .strip_prefix("//!")
-                .or_else(|| l.trim_start().strip_prefix("///"))
-        })
-        .map(|l| l.strip_prefix(' ').unwrap_or(l))
-        .collect::<Vec<_>>()
-        .join("\n")
+    rust_docs::parts(text).1
 }
 
 /// Each `fictionet attach ...` command in `text`, with its `\` line

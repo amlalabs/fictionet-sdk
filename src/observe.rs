@@ -146,7 +146,7 @@
 //! # }
 //! ```
 //!
-//! [`web::Sites`](crate::stdlib::web::Sites) groups its own parts. One
+//! [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) groups its own parts. One
 //! group, `web::Sites`, holds its router and the rest. Inside it, the
 //! gateway with its DNS server is a group, and so is each machine, named
 //! after the first site placed at its address. Each sandbox's filter stays
@@ -223,7 +223,7 @@
 //! Each copy is decoded the way Wireshark decodes it. Packets on a link are
 //! IPv4 or IPv6 with no Ethernet header. The decoder reads IP, TCP, UDP and
 //! ICMP, then DNS, DHCP, HTTP/1.1, and HTTP/2 with its headers. HTTP/2 uses
-//! [`http2::Capture`] through the public registry.
+//! [`http2::Capture`](https://docs.rs/fictionet/latest/fictionet/observe/http2/struct.Capture.html) through the public registry.
 //! Recognized gRPC calls add message layers from DATA under a shared budget. TCP
 //! connections are followed in order, so a message spread over several
 //! packets is shown whole on the packet that completes it. An HTTP/2 header
@@ -469,12 +469,17 @@
 //! ignores them, as clients should ignore what they do not know, draws
 //! every task on its own.
 
+#![cfg_attr(not(feature = "observe"), allow(dead_code))]
+
 mod conversation;
 /// Copyable HTTP/2 and gRPC presentation.
+#[cfg(feature = "observe")]
 pub mod http2;
 /// Copyable capture decoders and presenters for the built-in protocols.
+#[cfg(feature = "observe")]
 pub mod protocols;
 /// Copyable TLS record presentation, handshake state, and decryption.
+#[cfg(feature = "observe")]
 pub mod tls;
 
 pub use conversation::Conversation;
@@ -486,21 +491,22 @@ pub use decode::{Decoded, Dissector, Field, Layer};
 pub use present::{Observed, Place, Placement, Present};
 pub use registry::{Match, Protocol, Registry, Selection};
 
+#[cfg(feature = "observe")]
 mod app;
 mod decode;
 mod json;
 mod keys;
 mod packets;
 mod pcap;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "observe", not(target_arch = "wasm32")))]
 mod session;
 mod view;
 
-use std::sync::{Arc, Mutex};
+use fictionet::sync::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::Cx;
-use crate::lock;
 use crate::watch::Graph;
 pub use keys::observed_config;
 pub(crate) use packets::LinkWatch;
@@ -513,7 +519,7 @@ const WATCH_LINGER: Duration = if cfg!(test) {
     Duration::from_secs(60)
 };
 /// How often the reaper looks for watches to forget.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "observe", not(target_arch = "wasm32")))]
 const REAP_EVERY: Duration = if cfg!(test) {
     Duration::from_millis(50)
 } else {
@@ -522,14 +528,17 @@ const REAP_EVERY: Duration = if cfg!(test) {
 
 /// Serves one observer session on `fd`, which has been accepted on the
 /// world socket of `attacher`.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "observe", not(target_arch = "wasm32")))]
 pub(crate) fn serve_session(attacher: crate::Attacher, fd: std::os::fd::OwnedFd) {
     session::start(attacher, fd);
 }
 
 /// Forgets the watches that have had no subscriber for a minute.
 pub(crate) fn reap(graph: &Graph) {
-    lock(&graph.watches).retain(|_, w| !w.idle_for(WATCH_LINGER));
+    graph
+        .watches
+        .lock()
+        .retain(|_, w| !w.idle_for(WATCH_LINGER));
 }
 
 /// The worlds with watches that may need forgetting, and whether the
@@ -545,7 +554,7 @@ static REAPER: Mutex<(Vec<std::sync::Weak<Graph>>, bool)> = Mutex::new((Vec::new
 /// watch leaves.
 pub(crate) fn reap_later(graph: &Arc<Graph>) -> std::io::Result<()> {
     graph.environment.require_real_io()?;
-    let mut reaper = lock(&REAPER);
+    let mut reaper = REAPER.lock();
     if !reaper
         .0
         .iter()
@@ -561,19 +570,19 @@ pub(crate) fn reap_later(graph: &Arc<Graph>) -> std::io::Result<()> {
 
 /// Starts the thread that reaps the worlds in [`REAPER`]. Returns whether
 /// it runs.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "observe", not(target_arch = "wasm32")))]
 fn start_reaper() -> bool {
     std::thread::Builder::new()
         .name("fictionet-reaper".into())
         .spawn(|| {
             loop {
                 std::thread::sleep(REAP_EVERY);
-                let mut reaper = lock(&REAPER);
+                let mut reaper = REAPER.lock();
                 // A world that ended, or has no watches left, needs no more.
                 reaper.0.retain(|g| {
                     g.upgrade().is_some_and(|g| {
                         reap(&g);
-                        !lock(&g.watches).is_empty()
+                        !g.watches.lock().is_empty()
                     })
                 });
                 if reaper.0.is_empty() {
@@ -587,7 +596,7 @@ fn start_reaper() -> bool {
 
 /// A browser has no thread for the reaper. Idle watches there are
 /// forgotten when the next watch starts.
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(not(feature = "observe"), target_arch = "wasm32"))]
 fn start_reaper() -> bool {
     false
 }
@@ -600,7 +609,7 @@ pub(crate) fn watch(
     id: u64,
 ) -> Option<(Arc<LinkWatch>, packets::Subscription)> {
     reap(graph);
-    let mut watches = lock(&graph.watches);
+    let mut watches = graph.watches.lock();
     let w = match watches.get(&id) {
         Some(w) => w.clone(),
         None => {
@@ -615,7 +624,7 @@ pub(crate) fn watch(
 
 /// The watch of link `id`, if one is kept.
 pub(crate) fn existing_watch(graph: &Graph, id: u64) -> Option<Arc<LinkWatch>> {
-    lock(&graph.watches).get(&id).cloned()
+    graph.watches.lock().get(&id).cloned()
 }
 
 /// An opaque link an [`Interface`](crate::Interface) belongs to.
@@ -641,11 +650,11 @@ impl std::fmt::Debug for LinkHandle {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "observe"))]
 mod tests {
     use super::*;
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "observe", not(target_arch = "wasm32")))]
     #[test]
     fn lab_refuses_the_observer_reaper() {
         crate::block_on(crate::lab(
@@ -658,7 +667,8 @@ mod tests {
                         .contains("lab")
                 );
                 assert!(
-                    !lock(&REAPER)
+                    !REAPER
+                        .lock()
                         .0
                         .iter()
                         .any(|g| std::ptr::eq(g.as_ptr(), Arc::as_ptr(fcx.graph())))

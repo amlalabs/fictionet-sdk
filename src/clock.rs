@@ -1,7 +1,8 @@
 //! A run's logical clock and ordered timer registrations.
 
+use fictionet::sync::Mutex;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::task::{Wake, Waker};
 
 use crate::time::{Duration, Instant};
@@ -50,7 +51,7 @@ impl Clock {
     pub(crate) fn now(&self) -> Instant {
         Instant::from_since_start(
             self.origin
-                .map_or_else(|| self.state.lock().unwrap().now, |o| o.elapsed()),
+                .map_or_else(|| self.state.lock().now, |o| o.elapsed()),
         )
     }
 
@@ -62,7 +63,7 @@ impl Clock {
     }
 
     pub(crate) fn add(&self, at: Instant, waker: Waker) -> u64 {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock();
         let id = s.next_id;
         s.next_id = s
             .next_id
@@ -75,7 +76,7 @@ impl Clock {
     }
 
     pub(crate) fn reset(&self, id: u64, at: Instant, waker: &Waker) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock();
         let old = s
             .deadlines
             .insert(id, at)
@@ -87,7 +88,7 @@ impl Clock {
     }
 
     pub(crate) fn update(&self, id: u64, waker: &Waker) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock();
         let old = s.deadlines.get(&id).copied().and_then(|at| {
             let old = s.entries.get_mut(&(at, id))?;
             (!old.will_wake(waker)).then(|| std::mem::replace(old, waker.clone()))
@@ -97,7 +98,7 @@ impl Clock {
     }
 
     pub(crate) fn remove(&self, id: u64) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock();
         let old = s
             .deadlines
             .remove(&id)
@@ -138,7 +139,7 @@ impl Clock {
     }
 
     pub(crate) fn advance(&self) -> crate::Result<Vec<Waker>> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock();
         let Some((&(at, _), _)) = s.entries.first_key_value() else {
             return Err(std::io::Error::other(
                 "lab deadlock: live tasks have no runnable work or finite deadline",
@@ -165,7 +166,7 @@ impl Wake for HostWake {
             return;
         };
         let now = clock.now();
-        let mut s = clock.state.lock().unwrap();
+        let mut s = clock.state.lock();
         let due = Clock::take_due(&mut s, now);
         clock.arm(&mut s);
         drop(s);
@@ -177,7 +178,7 @@ impl Wake for HostWake {
 
 impl Drop for Clock {
     fn drop(&mut self) {
-        if let Some(id) = self.state.get_mut().unwrap().host {
+        if let Some(id) = self.state.get_mut().host {
             crate::timer::timers().remove(id);
         }
     }

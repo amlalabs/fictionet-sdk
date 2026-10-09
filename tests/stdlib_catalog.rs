@@ -18,6 +18,9 @@
 //! A hidden module (`#[doc(hidden)]`) is listed without a link, because
 //! rustdoc would make a dead one.
 
+#[path = "common/rust_docs.rs"]
+mod rust_docs;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -161,12 +164,7 @@ fn modules_on_disk() -> BTreeMap<String, Vec<PathBuf>> {
 fn code(files: &[PathBuf]) -> String {
     let mut out = String::new();
     for file in files {
-        for line in fs::read_to_string(file).unwrap().lines() {
-            if !line.trim_start().starts_with("//") {
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
+        out.push_str(&rust_docs::parts(&fs::read_to_string(file).unwrap()).0);
     }
     out
 }

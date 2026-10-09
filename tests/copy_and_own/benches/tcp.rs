@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use fictionet::stdlib::{Connection, ConnectionExt};
-use fictionet::{Cx, block_on, pair, run};
+use fictionet::{Cx, block_on, lab, pair};
 
 // Allow 15% less throughput and 5% more allocations per MB for the copy.
 const MAX_SLOWDOWN: f64 = 0.15;
@@ -100,7 +100,7 @@ macro_rules! case {
             use $module as tcp;
             let out = Arc::new(Mutex::new(None));
             let result = out.clone();
-            let run_result = block_on(run(fictionet::Seed::random(), move |fcx| async move {
+            let run_result = block_on(lab(fictionet::Seed::from_u64(0), move |fcx| async move {
                 let (a, b) = pair();
                 let client = tcp::endpoint(&fcx, a, "10.0.0.1".parse()?);
                 let server = tcp::endpoint(&fcx, b, "10.0.0.2".parse()?);

@@ -2,10 +2,11 @@ use fictionet::observe::{Decoded, KeyLine, Layer, Observed, Place, Placement, Pr
 use fictionet::stdlib::codec::Frames;
 use fictionet::stdlib::codec::{Decode, Fail, Step};
 use fictionet::stdlib::http1;
+use fictionet::sync::Mutex;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fmt::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Bytes retained while an incomplete capture message is being framed.
 const MAX_BUFFER: usize = 32 << 10;
@@ -360,7 +361,7 @@ impl Decode for Http1 {
         if self.shared_methods {
             preview
         } else {
-            let methods = self.methods.lock().unwrap_or_else(|e| e.into_inner());
+            let methods = self.methods.lock();
             preview.saturating_add(methods.0.len())
         }
     }
@@ -376,7 +377,7 @@ impl Decode for Http1 {
             let Some(head) = input.get(..end.saturating_add(4)) else {
                 return Ok(Step::Need);
             };
-            let mut methods = self.methods.lock().unwrap_or_else(|e| e.into_inner());
+            let mut methods = self.methods.lock();
             let Some((line, kind, body)) = read_head(head, &mut methods) else {
                 return Ok(Step::Skip(head.len()));
             };

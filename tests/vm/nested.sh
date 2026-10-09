@@ -38,7 +38,7 @@ for f in "$prepared_l1" "$assets/$kernel" "$assets/$fc_bin" "$assets/$ch_bin" "$
 done
 
 echo "building fictionet and web_fixture (release)"
-(cd "$repo" && cargo build --quiet --release --features tokio --bin fictionet --example web_fixture)
+(cd "$repo" && cargo build --quiet --release --features web-proxy --bin fictionet --example web_fixture)
 target="$(target_dir)"
 
 run="$(mktemp -d "$vmdir/nested.XXXXXX")"

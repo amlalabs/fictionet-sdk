@@ -28,15 +28,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The default features (tokio) and none at all. Every step below
-        # runs once per entry, on the whole workspace. fictionet-codegen's
-        # dev-dependency on fictionet turns off its default features, so
-        # the second entry builds without tokio.
+        # Exercise host integration, sealed labs, and optional clients.
         include:
           - name: default features
             features: ""
           - name: no default features
             features: "--no-default-features"
+          - name: all features
+            features: "--all-features"
+          - name: tokio without observation
+            features: "--no-default-features --features tokio"
     steps:
       - uses: actions/checkout@v4
       # The toolchain pinned in rust-toolchain.toml, with clippy.

@@ -13,12 +13,13 @@
 //! on Windows networks.
 //!
 //! To build a whole network of websites, routes and all, use
-//! [`web::Sites`](fictionet::stdlib::web::Sites) instead.
+//! [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) instead.
 
+use fictionet::sync::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 use fictionet::events::{self, Level};
@@ -90,12 +91,6 @@ impl Prefix {
     pub fn contains(self, addr: IpAddr) -> bool {
         self.addr.is_ipv4() == addr.is_ipv4() && mask(addr, self.len) == self.canonical().addr
     }
-}
-
-/// Locks `m`. A poisoned lock is used anyway: it holds lists and flags
-/// that a panic elsewhere leaves whole.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// `addr` with every bit after the first `len` cleared.
@@ -403,7 +398,7 @@ impl<C> Changes<C> {
 impl<C> Sender<C> {
     fn send(&self, change: C) -> Result<(), C> {
         let waker = {
-            let mut s = lock(&self.0);
+            let mut s = self.0.lock();
             if s.stopped {
                 return Err(change);
             }
@@ -420,7 +415,7 @@ impl<C> Sender<C> {
 impl<C> Drop for Sender<C> {
     fn drop(&mut self) {
         let waker = {
-            let mut s = lock(&self.0);
+            let mut s = self.0.lock();
             s.closed = true;
             s.waker.take()
         };
@@ -432,12 +427,12 @@ impl<C> Drop for Sender<C> {
 
 impl<C> Receiver<C> {
     fn drain(&self) -> (Vec<C>, bool) {
-        let mut s = lock(&self.0);
+        let mut s = self.0.lock();
         (std::mem::take(&mut s.queue), s.closed)
     }
 
     fn poll(&self, cx: &mut std::task::Context<'_>, closed: bool) -> Poll<()> {
-        let mut s = lock(&self.0);
+        let mut s = self.0.lock();
         if !s.queue.is_empty() || (s.closed && !closed) {
             return Poll::Ready(());
         }
@@ -452,7 +447,7 @@ impl<C> Receiver<C> {
 impl<C> Drop for Receiver<C> {
     fn drop(&mut self) {
         let queued = {
-            let mut s = lock(&self.0);
+            let mut s = self.0.lock();
             s.stopped = true;
             std::mem::take(&mut s.queue)
         };
@@ -956,6 +951,7 @@ impl<I: Interface> Lan<I> {
     }
 }
 
+fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -968,7 +964,7 @@ mod tests {
         impl Drop for Pending {
             fn drop(&mut self) {
                 if let Some(shared) = self.0.upgrade() {
-                    assert!(shared.try_lock().is_ok());
+                    assert!(shared.try_lock().is_some());
                 }
             }
         }
@@ -977,7 +973,7 @@ mod tests {
         assert!(sender.send(pending()).is_ok());
         drop(receiver);
         assert!(sender.send(pending()).is_err());
-        assert!(lock(&sender.0).queue.is_empty());
+        assert!(sender.0.lock().queue.is_empty());
     }
 
     /// A bare IPv4 header, protocol 253 (for experiments), no payload.
@@ -1151,7 +1147,7 @@ mod tests {
             }
 
             fn send(&mut self, _: Packet) {
-                lock(&self.1).push(self.0);
+                self.1.lock().push(self.0);
             }
         }
 
@@ -1182,8 +1178,8 @@ mod tests {
                             2,
                             v4([10, 0, 0, 30], dst),
                         );
-                        assert_eq!(*lock(&sent), [10, 20, 40, 50]);
-                        lock(&sent).clear();
+                        assert_eq!(*sent.lock(), [10, 20, 40, 50]);
+                        sent.lock().clear();
                     }
                 }
                 Ok(())
@@ -1357,12 +1353,12 @@ mod tests {
                 let k = kept.clone();
                 let r = fcx
                     .region(|fcx| async move {
-                        *lock(&k) = Some(lan(&fcx, "10.0.0.0/24".parse()?, |event| event));
+                        *k.lock() = Some(lan(&fcx, "10.0.0.0/24".parse()?, |event| event));
                         Err(fictionet::Error::msg("stop"))
                     })
                     .await;
                 assert_eq!(r.unwrap_err().to_string(), "stop");
-                let lan = lock(&kept).take().unwrap();
+                let lan = kept.lock().take().unwrap();
                 let (end, mut far) = fictionet::pair();
                 assert_eq!(
                     lan.add("10.0.0.2".parse()?, Box::new(end), None)
@@ -1382,4 +1378,6 @@ mod tests {
         ))
         .unwrap();
     }
+}
+
 }

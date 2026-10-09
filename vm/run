@@ -388,7 +388,7 @@ border-world     cargo test in examples/border/world
 border-scripted  border_scripted, lab and home settings (Inspect, mockllm)
 border-probes    border_probes, lab and home settings (Inspect, mockllm)
 fakewiki-probes  fakewiki_probes and the leak checker's negative control (Inspect, mockllm)
-cargo            cargo test --features tokio, with the root-only tun test turned on
+cargo            cargo test --features web-proxy, with the root-only tun test turned on
 EOF
 }
 

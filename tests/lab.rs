@@ -251,7 +251,7 @@ fn real_io_is_refused_before_opening_resources() {
                 .to_string()
                 .contains("lab")
         );
-        #[cfg(feature = "tokio")]
+        #[cfg(feature = "web-proxy")]
         assert!(
             fictionet::stdlib::web::proxy(&cx)
                 .err()

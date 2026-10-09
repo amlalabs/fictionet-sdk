@@ -32,7 +32,7 @@ for what in "${@:-sdk}"; do
         sdk)
             echo "Building fictionet, web_world and web_fixture"
             (cd /src && CARGO_TARGET_DIR=/cache/target/sdk cargo build --release --locked --target "$target" \
-                --features tokio --bin fictionet --example web_world --example web_fixture)
+                --features web-proxy --bin fictionet --example web_world --example web_fixture)
             out=/cache/target/sdk/$target/release
             put "$out/fictionet"
             put "$out/examples/web_world"

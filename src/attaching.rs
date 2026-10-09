@@ -489,7 +489,7 @@
 //! value means the flag's `--no-` form. `ipAddrV6`, `gatewayV6` and
 //! `dnsV6` are empty by default, so pods get IPv4 only. Set them to
 //! `2001:db8::2/64`, `2001:db8::1` and `2001:db8::1` to give a pod IPv6 in
-//! a world built on [`Sites`](crate::stdlib::web::Sites). A service's own `attach` value
+//! a world built on [`Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html). A service's own `attach` value
 //! overrides them for that service. Each service starts from
 //! `serviceDefaults`, and `values.yaml` in the chart describes every value.
 //! `runtimeClassName` sets the pods' runtime class, such as `gvisor`. If it
@@ -1503,7 +1503,7 @@
 //! attachment: the world sees a detach and then a new attach under the
 //! same name. The VM keeps its address, since attach hands out the same
 //! one every time, and a world built on
-//! [`Sites`](crate::stdlib::web::Sites) binds it again from the VM's next
+//! [`Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) binds it again from the VM's next
 //! packet. For QEMU to find the new attach, give its netdev
 //! `reconnect-ms=500`: QEMU then tries the socket path again every half
 //! second. In a test, attach was stopped with SIGTERM while the VM ran,
@@ -1620,7 +1620,7 @@
 //!   the world, and drops the rest.
 //! - **All three left out:** attach passes the VM's DHCP to the world like
 //!   any other packet. A world built on
-//!   [`Sites`](crate::stdlib::web::Sites) answers it. Packets from
+//!   [`Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) answers it. Packets from
 //!   `0.0.0.0` reach the world too, since a VM sends its first DHCP
 //!   requests before it has an address.
 //! - **`--no-ip-addr`:** attach hands out nothing, and drops the VM's
@@ -1631,7 +1631,7 @@
 //! `--dns-v6`, and the same three choices. Left out, they pass the VM's
 //! router solicitations and DHCPv6 requests to the world, along with the
 //! rest of its packets from `::` and link-local addresses. But
-//! [`Sites`](crate::stdlib::web::Sites) sends no router advertisements and
+//! [`Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) sends no router advertisements and
 //! runs no DHCPv6, so with `Sites` a VM gets no IPv6 address that way.
 //! Give attach the IPv6 flags, or give it `--no-ip-addr-v6` and set the
 //! VM's IPv6 address inside the VM, or write a world that answers both.
@@ -1756,7 +1756,7 @@
 //! on the [roadmap](crate::roadmap#dhcp-and-router-advertisements-in-attach).
 //!
 //! For example, these are the flags for a world built on
-//! [`Sites`](crate::stdlib::web::Sites), whose network is dual-stack. Its
+//! [`Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html), whose network is dual-stack. Its
 //! gateway and DNS server are at `10.0.0.1` and `2001:db8::1`:
 //!
 //! ```text
@@ -1792,7 +1792,7 @@
 //! connection to an IPv6 address fails immediately with "Network is
 //! unreachable". A world that models an IPv4-only network can
 //! also turn IPv6 off on its side, with
-//! [`Sites::ipv4_only`](crate::stdlib::web::Sites::ipv4_only).
+//! [`Sites::ipv4_only`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html#method.ipv4_only).
 //!
 //! The world is never told the sandbox's addresses. It sees them in the
 //! packets. `Sites` takes a sandbox's IPv4 and IPv6 addresses from the

@@ -11,7 +11,7 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = { version = "1", features = ["derive"] }
 bytes = "1"
-fictionet = { path = "..", features = ["tokio"] }
+fictionet = { path = ".." }
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", default-features = false }

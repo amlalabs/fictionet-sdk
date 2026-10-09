@@ -1,9 +1,10 @@
+use fictionet::sync::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
@@ -15,18 +16,20 @@ use crate::{Attacher, Attachment, Cx, Packet, RecvError};
 
 /// Where a world listens for attach and observers.
 ///
-/// [`listen`] takes one. Its text form is the one `fictionet attach --world`
+/// [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) takes one. Its text form is the one `fictionet attach --world`
 /// and the other subcommands take, so a program can read it from its
 /// command line with [`str::parse`] and print it back with `Display`:
 ///
-/// ```
-/// use fictionet::WorldSocket;
-///
-/// let socket: WorldSocket = "unix:/run/fictionet/world.sock".parse().unwrap();
-/// assert_eq!(socket, WorldSocket::UnixSocket("/run/fictionet/world.sock".into()));
-/// assert_eq!(socket.to_string(), "unix:/run/fictionet/world.sock");
-/// assert!("/run/fictionet/world.sock".parse::<WorldSocket>().is_err());
-/// ```
+#[doc = fictionet::cfg_std!(doc r####"
+```
+use fictionet::WorldSocket;
+
+let socket: WorldSocket = "unix:/run/fictionet/world.sock".parse().unwrap();
+assert_eq!(socket, WorldSocket::UnixSocket("/run/fictionet/world.sock".into()));
+assert_eq!(socket.to_string(), "unix:/run/fictionet/world.sock");
+assert!("/run/fictionet/world.sock".parse::<WorldSocket>().is_err());
+```
+"####)]
 ///
 /// The enum is `#[non_exhaustive]` so that other transports, such as the
 /// [TLS transport for remote sandboxes](crate::roadmap#remote-attach-a-tls-transport),
@@ -61,7 +64,7 @@ impl std::fmt::Display for WorldSocket {
     }
 }
 
-/// The error from parsing a [`WorldSocket`]: the text was not
+/// The error from parsing a [`WorldSocket`](https://docs.rs/fictionet/latest/fictionet/enum.WorldSocket.html): the text was not
 /// `unix:<path>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseWorldSocketError {
@@ -89,7 +92,7 @@ impl std::error::Error for ParseWorldSocketError {}
 /// A socket file left behind by a world that has exited is replaced.
 ///
 /// The socket speaks the [relay protocol](crate::proto).
-/// Dropping the returned [`Listening`] closes the socket, so no more
+/// Dropping the returned [`Listening`](https://docs.rs/fictionet/latest/fictionet/struct.Listening.html) closes the socket, so no more
 /// sandboxes can attach. Sandboxes already attached stay attached, and the
 /// helper thread keeps running until the last of them detaches.
 ///
@@ -134,16 +137,18 @@ impl std::error::Error for ParseWorldSocketError {}
 /// the world. Fictionet has no reactor of its own, and needs none from the
 /// executor.
 ///
-/// ```no_run
-/// # use fictionet::{Attachments, Cx, Result};
-/// # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-/// # fn main() -> Result {
-/// let (attacher, attachments) = fictionet::attachments();
-/// let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
-/// let _listening = fictionet::listen(socket, attacher)?;
-/// fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
-/// # }
-/// ```
+#[doc = fictionet::cfg_std!(doc r####"
+```no_run
+# use fictionet::{Attachments, Cx, Result};
+# async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
+# fn main() -> Result {
+let (attacher, attachments) = fictionet::attachments();
+let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
+let _listening = fictionet::listen(socket, attacher)?;
+fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
+# }
+```
+"####)]
 pub fn listen(socket: WorldSocket, attacher: Attacher) -> std::io::Result<Listening> {
     attacher.mark_listener()?;
     let WorldSocket::UnixSocket(path) = socket;
@@ -229,14 +234,14 @@ fn bind(path: &Path) -> io::Result<OwnedFd> {
 const LISTEN_TOKEN: u64 = 0;
 const WAKE_TOKEN: u64 = 1;
 
-/// What the helper thread and the attachments of one [`listen`] share.
+/// What the helper thread and the attachments of one [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) share.
 pub(crate) struct ListenShared {
     epoll: OwnedFd,
     /// An eventfd that wakes the helper thread.
     wake_fd: OwnedFd,
     /// Accepted connections, by epoll token.
     conns: Mutex<HashMap<u64, Arc<ConnSlot>>>,
-    /// The [`Listening`] was dropped.
+    /// The [`Listening`](https://docs.rs/fictionet/latest/fictionet/struct.Listening.html) was dropped.
     closing: AtomicBool,
 }
 
@@ -267,7 +272,7 @@ struct ConnSlot {
 
 impl ConnSlot {
     fn release_name(&self) {
-        let guard = self.name.lock().unwrap().take();
+        let guard = self.name.lock().take();
         drop(guard);
     }
 
@@ -361,7 +366,7 @@ fn helper(
                 accept_paused = None;
                 let _ = closed.send(());
             }
-            if shared.conns.lock().unwrap().is_empty() {
+            if shared.conns.lock().is_empty() {
                 return;
             }
         }
@@ -415,20 +420,20 @@ fn helper(
                     }
                 }
                 token => {
-                    let slot = shared.conns.lock().unwrap().get(&token).cloned();
+                    let slot = shared.conns.lock().get(&token).cloned();
                     let Some(slot) = slot else { continue };
                     let hangup = (libc::EPOLLRDHUP | libc::EPOLLHUP | libc::EPOLLERR) as u32;
                     if flags & hangup != 0 {
                         slot.release_name();
                     }
                     if flags & libc::EPOLLOUT as u32 != 0 {
-                        let mut out = slot.out.lock().unwrap();
+                        let mut out = slot.out.lock();
                         if !out.queue.is_empty() {
                             slot.flush(&mut out, epoll);
                         }
                     }
                     if flags & (libc::EPOLLIN as u32 | hangup) != 0 {
-                        let waker = slot.waker.lock().unwrap().take();
+                        let waker = slot.waker.lock().take();
                         if let Some(w) = waker {
                             w.wake();
                         }
@@ -531,6 +536,12 @@ fn handshake_step(
         refuse(&format!("unsupported observer type {}", hello.kind));
         return None;
     }
+    #[cfg(not(feature = "observe"))]
+    if hello.kind == relay::OBSERVE {
+        refuse("observer sessions are disabled");
+        return None;
+    }
+    #[cfg(feature = "observe")]
     if hello.kind == relay::OBSERVE {
         // An observer is not a sandbox: it takes no name and never becomes
         // an Attachment. Its session runs on a thread of its own.
@@ -562,7 +573,7 @@ fn handshake_step(
         name: Mutex::new(Some(guard)),
         out: Mutex::new(OutQueue::default()),
     });
-    shared.conns.lock().unwrap().insert(token, slot.clone());
+    shared.conns.lock().insert(token, slot.clone());
     let events = (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLET) as u32;
     let _ = epoll_ctl(
         shared.epoll.as_raw_fd(),
@@ -594,7 +605,7 @@ const QUEUE_LIMIT: usize = 32 << 20;
 /// packets is bounded too.
 const QUEUE_OVERHEAD: usize = 64;
 
-/// The connection behind an [`Attachment`] made by [`listen`].
+/// The connection behind an [`Attachment`] made by [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html).
 pub(crate) struct SocketLink {
     listen: Arc<ListenShared>,
     token: u64,
@@ -611,7 +622,7 @@ pub(crate) struct SocketLink {
 impl SocketLink {
     /// Whether attach is known to have closed the connection.
     pub(crate) fn peer_gone(&self) -> bool {
-        self.closed || self.slot.name.lock().unwrap().is_none()
+        self.closed || self.slot.name.lock().is_none()
     }
 
     /// A check for [`peer_gone`](SocketLink::peer_gone) that works without
@@ -619,16 +630,13 @@ impl SocketLink {
     /// dropped, it says gone.
     pub(crate) fn peer_gone_check(&self) -> impl Fn() -> bool + Send + Sync + 'static {
         let slot = Arc::downgrade(&self.slot);
-        move || {
-            slot.upgrade()
-                .is_none_or(|s| s.name.lock().unwrap().is_none())
-        }
+        move || slot.upgrade().is_none_or(|s| s.name.lock().is_none())
     }
 
     fn close(&mut self) {
         self.closed = true;
         {
-            let mut out = self.slot.out.lock().unwrap();
+            let mut out = self.slot.out.lock();
             out.closed = true;
             out.queue.clear();
             out.queued = 0;
@@ -686,7 +694,7 @@ impl SocketLink {
                     // Hand the connection to the helper thread, then read
                     // once more: a packet may have come in before the
                     // waker was in place.
-                    *self.slot.waker.lock().unwrap() = Some(cx.waker().clone());
+                    *self.slot.waker.lock() = Some(cx.waker().clone());
                     registered = true;
                     if fcx.register_cancel(cx.waker(), &mut self.wait) {
                         return Poll::Ready(Err(RecvError::Cancelled));
@@ -705,7 +713,7 @@ impl SocketLink {
             return;
         }
         let epoll = self.listen.epoll.as_raw_fd();
-        let mut out = self.slot.out.lock().unwrap();
+        let mut out = self.slot.out.lock();
         if out.closed {
             return;
         }
@@ -748,7 +756,7 @@ impl Drop for SocketLink {
             0,
         );
         let last = {
-            let mut conns = self.listen.conns.lock().unwrap();
+            let mut conns = self.listen.conns.lock();
             conns.remove(&self.token);
             conns.is_empty()
         };
@@ -759,7 +767,7 @@ impl Drop for SocketLink {
     }
 }
 
-/// A world socket that sandboxes can attach to. Made by [`listen`].
+/// A world socket that sandboxes can attach to. Made by [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html).
 ///
 /// Dropping it closes the socket. Attachments already made keep working.
 /// When the world's run has ended, dropping it first waits, up to a
@@ -775,7 +783,7 @@ pub struct Listening {
     attacher: Attacher,
 }
 
-/// How long dropping a [`Listening`] waits for observers of an ended run.
+/// How long dropping a [`Listening`](https://docs.rs/fictionet/latest/fictionet/struct.Listening.html) waits for observers of an ended run.
 const OBSERVERS_LINGER: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Drop for Listening {

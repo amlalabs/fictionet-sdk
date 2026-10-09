@@ -15,6 +15,7 @@ mod http;
 mod link;
 mod pump;
 mod socks5;
+mod socks5_handshake;
 mod stack;
 
 use std::sync::{Arc, Mutex};

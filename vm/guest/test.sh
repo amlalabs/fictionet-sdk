@@ -79,9 +79,9 @@ case "$name" in
         ;;
     cargo)
         export CARGO_TARGET_DIR=/cache/target/test
-        cargo test --locked --features tokio
+        cargo test --locked --features web-proxy
         # Ignored elsewhere: it needs root and a tun device, which the VM has.
-        cargo test --locked --features tokio --test tun_linux -- --ignored
+        cargo test --locked --features web-proxy --test tun_linux -- --ignored
         ;;
     *)
         echo "test.sh: no suite named $name" >&2

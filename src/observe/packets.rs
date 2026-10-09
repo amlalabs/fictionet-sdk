@@ -1,14 +1,14 @@
 //! Watching one link: the copies its tap makes, decoded in order, kept for
 //! the packet list, the detail pane and the capture download.
 
+use fictionet::sync::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 use super::decode::Dissector;
 use super::json::{self, Object};
 use super::view::{edge_id, task_id};
-use crate::lock;
 use crate::sys::{Instant, UNIX_EPOCH};
 use crate::watch::{Graph, KeyLine, Meter, TapGuard};
 
@@ -79,7 +79,7 @@ pub(crate) struct Subscription(Arc<LinkWatch>);
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        let mut inner = lock(&self.0.inner);
+        let mut inner = self.0.inner.lock();
         if self.0.subscribers.fetch_sub(1, Ordering::SeqCst) == 1 {
             inner.guard = None;
             inner.released = Instant::now();
@@ -122,7 +122,7 @@ impl LinkWatch {
                 guard: None,
                 after: 0,
                 next_row: 1,
-                dissector: Dissector::with_registry(lock(&graph.protocols).clone()),
+                dissector: Dissector::with_registry(graph.protocols.lock().clone()),
                 rows: VecDeque::new(),
                 row_bytes: 0,
                 released: Instant::now(),
@@ -137,7 +137,7 @@ impl LinkWatch {
     /// Starts copying the link's packets, until the returned subscription
     /// is dropped.
     pub(crate) fn subscribe(self: &Arc<Self>) -> Subscription {
-        let mut inner = lock(&self.inner);
+        let mut inner = self.inner.lock();
         if self.subscribers.fetch_add(1, Ordering::SeqCst) == 0
             && let Some(meter) = self.meter.upgrade()
             && let Some(graph) = self.graph.upgrade()
@@ -153,7 +153,7 @@ impl LinkWatch {
     pub(crate) fn idle_for(&self, linger: std::time::Duration) -> bool {
         // Under the lock that subscribing and leaving take, so a subscriber
         // that is just arriving is counted.
-        let inner = lock(&self.inner);
+        let inner = self.inner.lock();
         self.subscribers.load(Ordering::SeqCst) == 0 && inner.released.elapsed() >= linger
     }
 
@@ -168,7 +168,7 @@ impl LinkWatch {
 
     /// The link's ends, for the start of a packet stream.
     pub(crate) fn describe(&self) -> String {
-        let inner = lock(&self.inner);
+        let inner = self.inner.lock();
         Object::new()
             .str("id", &edge_id(self.id))
             .str("a", &inner.ends[0])
@@ -182,7 +182,7 @@ impl LinkWatch {
         let Some(graph) = self.graph.upgrade() else {
             return;
         };
-        let mut inner = lock(&self.inner);
+        let mut inner = self.inner.lock();
         let mut done = 0;
         while done < PUMP_BATCH {
             let Some(guard) = &inner.guard else { return };
@@ -267,7 +267,7 @@ impl LinkWatch {
 
     /// Packet list lines after row `after`, at most `max`.
     pub(crate) fn rows_after(&self, after: u64, max: usize) -> Vec<(u64, String)> {
-        let inner = lock(&self.inner);
+        let inner = self.inner.lock();
         let skip = inner
             .rows
             .iter()
@@ -284,7 +284,7 @@ impl LinkWatch {
 
     /// The detail of row `seq`, if it is still kept.
     pub(crate) fn detail(&self, seq: u64) -> Option<String> {
-        let inner = lock(&self.inner);
+        let inner = self.inner.lock();
         inner
             .rows
             .iter()
@@ -296,7 +296,7 @@ impl LinkWatch {
     /// so Wireshark opens it decrypted.
     pub(crate) fn pcapng(&self) -> Vec<u8> {
         let keys = self.graph.upgrade().map(|g| keylog(&g)).unwrap_or_default();
-        let inner = lock(&self.inner);
+        let inner = self.inner.lock();
         let packets: Vec<(u64, &[u8])> =
             inner.rows.iter().map(|r| (r.micros, &r.data[..])).collect();
         super::pcap::pcapng(&packets, keys.as_bytes())

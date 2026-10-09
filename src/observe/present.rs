@@ -404,7 +404,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "observe"))]
 mod tests {
     use super::*;
 

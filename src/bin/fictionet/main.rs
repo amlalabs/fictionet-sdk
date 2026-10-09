@@ -23,6 +23,7 @@ mod dashboard;
 mod ether;
 mod netlink;
 mod observe;
+#[cfg(feature = "tokio")]
 mod proxy;
 mod tap;
 mod tun;
@@ -182,7 +183,17 @@ fn main() {
                 }
                 args::Parsed::Proxy(p) => {
                     exit_on_signals(p.ready_file.as_deref());
-                    proxy::run(p)
+                    #[cfg(feature = "tokio")]
+                    {
+                        proxy::run(p)
+                    }
+                    #[cfg(not(feature = "tokio"))]
+                    {
+                        let _ = p;
+                        Err(world::Failure::Error(
+                            "proxy attach types require the tokio feature".into(),
+                        ))
+                    }
                 }
                 args::Parsed::Tap(t) => {
                     // The ready file is handed to the handler later, once

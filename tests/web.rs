@@ -1593,7 +1593,7 @@ fn the_target_is_from_the_connection_not_the_headers() {
 // ---------------------------------------------------------------------------
 // The proxy (feature tokio)
 
-#[cfg(feature = "tokio")]
+#[cfg(feature = "web-proxy")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
     let result = tokio::time::timeout(

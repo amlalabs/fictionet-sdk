@@ -1,10 +1,11 @@
+use fictionet::sync::Mutex;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::panic::Location;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Waker};
 
 use crate::events::{Event, EventLog};
@@ -18,7 +19,7 @@ use crate::watch::Group;
 /// starts background tasks. Fictionet has no global clock and no global
 /// executor, so all four go through a `Cx`. That is why every stdlib
 /// function that waits or starts a task takes `&Cx` as its first argument, and why the core works under
-/// any async runtime. [`run`](crate::run) gives the world function its
+/// any async runtime. [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) gives the world function its
 /// first `Cx`. In signatures and examples it is called `fcx`; `cx` is the
 /// std task context, as in tokio and futures.
 ///
@@ -29,11 +30,11 @@ use crate::watch::Group;
 /// task in the caller's region and gives it a `Cx` of its own in that same
 /// region. A clone of a `Cx` belongs to the same region too.
 ///
-/// [`run`](crate::run) makes the outermost region, and the world function
+/// [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) makes the outermost region, and the world function
 /// is its first task. So the tasks the world starts, and the tasks those
 /// tasks start, all share the world's region. Some stdlib code makes a
 /// region inside the caller's for work that may fail on its own: for
-/// example, [`web::Sites`](crate::stdlib::web::Sites) gives each HTTP
+/// example, [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) gives each HTTP
 /// connection its own region, and runs its HTTP/2 streams in it. Cancelling
 /// a region also cancels every region inside it.
 ///
@@ -110,7 +111,7 @@ pub struct Cx {
 impl Cx {
     /// The current time on the run's clock: how long ago the run started.
     ///
-    /// Under [`run`](crate::run) this is real time, read from the system's
+    /// Under [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) this is real time, read from the system's
     /// monotonic clock. Under [`lab`](crate::lab), it starts at zero and
     /// advances only when the executor has no runnable work.
     pub fn now(&self) -> Instant {
@@ -233,7 +234,7 @@ impl Cx {
     /// **If `work` returns an error, its region fails.** The region is
     /// cancelled, so its other tasks stop, and the error goes to whoever
     /// owns the region. For the world's region, that means the error comes
-    /// out of [`run`](crate::run). A failure deep inside a world therefore
+    /// out of [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html). A failure deep inside a world therefore
     /// reaches the harness instead of disappearing. Work that is allowed to
     /// fail, such as serving one connection, handles its own errors and
     /// returns `Ok(())`.
@@ -340,12 +341,7 @@ impl Cx {
     /// before clients start observing to include custom protocols in the
     /// dashboard, JSON replies, and captured packet details.
     pub fn observe_protocols(&self, registry: crate::observe::Registry) {
-        *self
-            .run
-            .graph
-            .protocols
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = registry;
+        *self.run.graph.protocols.lock() = registry;
     }
 
     /// Records `event` in the run's [event log](crate::events), dated now
@@ -413,15 +409,17 @@ impl Cx {
     /// To race more than one thing, join them into `fut` with
     /// [`std::future::poll_fn`]: the first one ready gives the output.
     ///
-    /// ```
-    /// # fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
-    /// use fictionet::RaceError;
-    /// let late = fcx.race(Some(fcx.now() + std::time::Duration::from_millis(5)), std::future::pending::<()>()).await;
-    /// assert_eq!(late, Err(RaceError::Deadline));
-    /// assert_eq!(fcx.race(None, async { 7 }).await, Ok(7));
-    /// # Ok(()) }))?;
-    /// # Ok::<(), fictionet::Error>(())
-    /// ```
+    #[doc = fictionet::cfg_std!(doc r####"
+```
+# fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| async move {
+use fictionet::RaceError;
+let late = fcx.race(Some(fcx.now() + std::time::Duration::from_millis(5)), std::future::pending::<()>()).await;
+assert_eq!(late, Err(RaceError::Deadline));
+assert_eq!(fcx.race(None, async { 7 }).await, Ok(7));
+# Ok(()) }))?;
+# Ok::<(), fictionet::Error>(())
+```
+"####)]
     pub async fn race<T>(
         &self,
         deadline: Option<Instant>,
@@ -465,10 +463,10 @@ impl Cx {
     ///
     /// The world function and every task it spawns share the world's
     /// region, so calling this on any of their `Cx`s stops the whole world,
-    /// and [`run`](crate::run) returns `Ok(())` once every task has ended.
+    /// and [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) returns `Ok(())` once every task has ended.
     /// Some stdlib code runs work in a region of its own inside the world's,
     /// and hands that region's `Cx` to callbacks: for example,
-    /// [`web::Sites`](crate::stdlib::web::Sites) runs each HTTP connection,
+    /// [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html) runs each HTTP connection,
     /// and the event callback for it, in the connection's own region.
     /// Calling `cancel` on such a `Cx` stops only that connection. To stop
     /// the world from there, keep a clone of the world's `Cx` and cancel
@@ -488,7 +486,7 @@ impl Cx {
     /// `f` runs inside the task that awaits this. Its work is cancelled when
     /// this region is. For work that is allowed to fail as a whole, such as
     /// serving one connection with its HTTP/2 streams. Once all of the new
-    /// region's work has ended, this returns, as [`run`](crate::run) does:
+    /// region's work has ended, this returns, as [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) does:
     ///
     /// - `Ok(())` when every task, and `f`, returned `Ok`, or when the new
     ///   region was stopped with [`Cx::cancel`].
@@ -719,7 +717,7 @@ impl Task {
     pub async fn join(self, fcx: &Cx) -> Result<(), JoinError> {
         let mut wait = CancelWait::default();
         poll_fn(|cx| {
-            let mut state = self.join.state.lock().unwrap();
+            let mut state = self.join.state.lock();
             if let Some(result) = state.result.take() {
                 return Poll::Ready(result);
             }
@@ -755,7 +753,7 @@ struct JoinInner {
 impl JoinState {
     pub(crate) fn finish(&self, result: Result<(), JoinError>) {
         let waker = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             state.result = Some(result);
             state.waker.take()
         };
@@ -774,7 +772,7 @@ pub struct CancelWait(Option<(Arc<Region>, u64)>);
 impl Drop for CancelWait {
     fn drop(&mut self) {
         if let Some((region, key)) = self.0.take() {
-            let removed = region.state.lock().unwrap().foreign.remove(&key);
+            let removed = region.state.lock().foreign.remove(&key);
             drop(removed);
         }
     }
@@ -824,7 +822,7 @@ impl Region {
             state: Mutex::default(),
         });
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             if state.children.len() >= 16 && state.children.len().is_power_of_two() {
                 state.children.retain(|c| c.strong_count() > 0);
             }
@@ -846,7 +844,7 @@ impl Region {
             return;
         }
         let (foreign, children) = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             (
                 std::mem::take(&mut state.foreign),
                 std::mem::take(&mut state.children),
@@ -870,7 +868,7 @@ impl Region {
     }
 
     fn add_foreign(&self, waker: &Waker) -> u64 {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let key = state.next_key;
         state.next_key += 1;
         state.foreign.insert(key, waker.clone());
@@ -878,7 +876,7 @@ impl Region {
     }
 
     fn update_foreign(&self, key: u64, waker: &Waker) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(w) = state.foreign.get(&key)
             && w.will_wake(waker)
         {
@@ -894,7 +892,7 @@ impl Region {
     /// Notes that work in the region ended with a cancel. It is not a
     /// failure: nothing is kept and nothing is cancelled.
     pub(crate) fn ended_by_cancel(&self) {
-        self.state.lock().unwrap().cancel_ended = true;
+        self.state.lock().cancel_ended = true;
     }
 
     /// Whether the region was cancelled from outside, not stopped with
@@ -902,11 +900,11 @@ impl Region {
     fn cut_short(&self) -> bool {
         self.is_cancelled()
             && !self.stopped.load(Ordering::Acquire)
-            && self.state.lock().unwrap().cancel_ended
+            && self.state.lock().cancel_ended
     }
 
     pub(crate) fn task_started(&self) {
-        self.state.lock().unwrap().live += 1;
+        self.state.lock().live += 1;
     }
 
     /// Keeps `error` if it is the region's first and the region was not
@@ -914,7 +912,7 @@ impl Region {
     /// error is kept with this before the task is dropped, and
     /// [`task_done`](Region::task_done) cancels after.
     pub(crate) fn record_error(&self, error: crate::Error) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if state.error.is_none() && !self.stopped.load(Ordering::Acquire) {
             state.error = Some(error);
         }
@@ -924,7 +922,7 @@ impl Region {
     /// error was already kept with [`record_error`](Region::record_error).
     pub(crate) fn task_done(&self, failed: bool) {
         let done = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             state.live -= 1;
             if state.live == 0 {
                 state.done.take()
@@ -941,7 +939,7 @@ impl Region {
     }
 
     fn poll_done(&self, cx: &mut Context<'_>) -> Poll<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if state.live == 0 {
             Poll::Ready(())
         } else {
@@ -951,7 +949,7 @@ impl Region {
     }
 
     pub(crate) fn take_error(&self) -> Option<crate::Error> {
-        self.state.lock().unwrap().error.take()
+        self.state.lock().error.take()
     }
 }
 
@@ -1101,7 +1099,7 @@ impl crate::Entropy for Cx {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::time::ms;
@@ -1113,7 +1111,7 @@ mod tests {
         struct WakeLog(usize, Arc<Mutex<Vec<usize>>>);
         impl std::task::Wake for WakeLog {
             fn wake(self: Arc<Self>) {
-                self.1.lock().unwrap().push(self.0);
+                self.1.lock().push(self.0);
             }
         }
         let region = Region::root(Weak::new());
@@ -1122,7 +1120,7 @@ mod tests {
             region.add_foreign(&Waker::from(Arc::new(WakeLog(id, log.clone()))));
         }
         region.cancel();
-        assert_eq!(*log.lock().unwrap(), [8, 3, 12, 1, 9]);
+        assert_eq!(*log.lock(), [8, 3, 12, 1, 9]);
     }
 
     #[test]
@@ -1289,7 +1287,7 @@ mod tests {
             let res = fcx
                 .region(move |fcx| {
                     let wake = Waker::from(Arc::new(CancelOnWake(fcx.clone())));
-                    let mut outside = w.lock().unwrap();
+                    let mut outside = w.lock();
                     let polled = outside
                         .as_mut()
                         .unwrap()

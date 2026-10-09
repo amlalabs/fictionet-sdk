@@ -7,20 +7,23 @@
 //! counts cost two relaxed atomic additions per packet. The tap costs one
 //! relaxed atomic load per packet while nothing watches.
 //!
-//! Every [`run`](crate::run) also has a [`Graph`]: its tasks, where each
+//! Every [`run`](https://docs.rs/fictionet/latest/fictionet/fn.run.html) also has a [`Graph`]: its tasks, where each
 //! was spawned, which task uses which end of each link, and the run's
 //! [events](crate::events).
+
+#![cfg_attr(not(feature = "observe"), allow(dead_code))]
+
+use fictionet::sync::{Mutex, MutexGuard};
 
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use crate::Packet;
-use crate::lock;
 use crate::sys::SystemTime;
 use crate::time::Instant;
 
@@ -152,7 +155,7 @@ impl Meter {
 
     #[cold]
     fn capture(&self, side: usize, packet: &Packet) {
-        let tap = lock(&self.tap).clone();
+        let tap = self.tap.lock().clone();
         if let Some(tap) = tap {
             tap.push(side as u8, &packet.0);
         }
@@ -177,7 +180,7 @@ impl Meter {
         self: &Arc<Self>,
         environment: &Arc<crate::entropy::RunEnvironment>,
     ) -> TapGuard {
-        let mut slot = lock(&self.tap);
+        let mut slot = self.tap.lock();
         let tap = slot
             .get_or_insert_with(|| Arc::new(Tap::new(environment.clone())))
             .clone();
@@ -208,7 +211,7 @@ impl Drop for TapGuard {
         let Some(meter) = self.meter.upgrade() else {
             return;
         };
-        let mut slot = lock(&meter.tap);
+        let mut slot = meter.tap.lock();
         if self.tap.viewers.fetch_sub(1, Ordering::Relaxed) == 1 {
             meter.tapped.store(false, Ordering::Relaxed);
             *slot = None;
@@ -279,7 +282,7 @@ impl Tap {
 
     fn push(&self, side: u8, data: &[u8]) {
         let now = self.environment.clock.now();
-        let mut s = lock(&self.state);
+        let mut s = self.state.lock();
         if now
             .since_start()
             .saturating_sub(s.window_start.since_start())
@@ -315,7 +318,7 @@ impl Tap {
 
     /// Copies with a sequence number of `after + 1` or more, at most `max`.
     pub(crate) fn since(&self, after: u64, max: usize) -> Vec<Copy> {
-        let s = lock(&self.state);
+        let s = self.state.lock();
         let first = s.copies.front().map_or(0, |c| c.seq);
         let skip = (after + 1).saturating_sub(first) as usize;
         s.copies.iter().skip(skip).take(max).cloned().collect()
@@ -454,7 +457,7 @@ impl Graph {
     }
 
     pub(crate) fn state(&self) -> MutexGuard<'_, GraphState> {
-        lock(&self.state)
+        self.state.lock()
     }
 
     /// Whether an observer is subscribed to this world's events.
@@ -502,7 +505,7 @@ impl Graph {
         // Nothing more is recorded: let callbacks and file writers go.
         self.events.close();
         // Nothing more crosses the world's links: stop watching them.
-        let watches = std::mem::take(&mut *lock(&self.watches));
+        let watches = std::mem::take(&mut *self.watches.lock());
         drop(watches);
     }
 
@@ -594,7 +597,7 @@ pub(crate) fn short_name(full: &str) -> String {
     parts[n.saturating_sub(2)..].join("::")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 
@@ -632,12 +635,12 @@ mod tests {
                 a.send(Packet(vec![i; 100]));
                 a.recv(&fcx).await?;
             }
-            *s.lock().unwrap() = Some(snapshot(&g));
+            *s.lock() = Some(snapshot(&g));
             drop(a);
             Ok(echo.join(&fcx).await?)
         }));
         out.unwrap();
-        let (tasks, links) = seen.lock().unwrap().take().unwrap();
+        let (tasks, links) = seen.lock().take().unwrap();
         let world = &tasks
             .iter()
             .find(|(_, t)| t.name == "world")
@@ -738,7 +741,7 @@ mod tests {
         assert_eq!(meter.totals(), [2, 20, 1, 10]);
         drop(guard);
         assert!(!meter.tapped.load(Ordering::Relaxed));
-        assert!(meter.tap.lock().unwrap().is_none());
+        assert!(meter.tap.lock().is_none());
 
         // A flood within one window is sampled, and the skipped count is
         // carried by the next copy.

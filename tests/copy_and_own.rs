@@ -49,6 +49,7 @@ fn copied_modbus_uses_the_public_driver_and_map() {
     assert!(stream.is_done());
 }
 
+#[cfg(feature = "observe")]
 #[test]
 fn copied_presenters_plug_into_observe_and_construct_display_items() {
     use fictionet::events::Transport;
@@ -119,6 +120,7 @@ fn copied_presenters_plug_into_observe_and_construct_display_items() {
     assert_eq!(packet.info, "message");
 }
 
+#[cfg(feature = "observe")]
 #[test]
 fn copied_modbus_session_stops_both_directions_after_bad_framing() {
     use fictionet::observe::{Conversation, Decoded, Match, Place, Registry};
@@ -140,6 +142,7 @@ fn copied_modbus_session_stops_both_directions_after_bad_framing() {
     }
 }
 
+#[cfg(feature = "observe")]
 #[test]
 fn copied_tls_and_selection_driver_use_the_public_registry() {
     use fictionet::observe::{Decoded, Match, Place, Registry};

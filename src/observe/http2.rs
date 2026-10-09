@@ -15,9 +15,10 @@ use fictionet::stdlib::http2::{
     PREFACE, Setting,
 };
 use fictionet::stdlib::{grpc, hpack};
+use fictionet::sync::Mutex;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn protocol(reason: &'static str) -> Error {
     Error {
@@ -114,9 +115,9 @@ impl CaptureBudget {
             limit: limit.min(CAPTURE_DATA_BUDGET),
         }
     }
-    /// Bytes charged across all connections. A failed lock reports the limit.
+    /// Bytes charged across all connections.
     pub fn held(&self) -> usize {
-        self.used.lock().map_or(self.limit, |used| *used)
+        *self.used.lock()
     }
 }
 impl Default for CaptureBudget {
@@ -149,16 +150,15 @@ impl CaptureCalls {
         self.messages.total()
     }
     fn account(&mut self) {
-        if let Ok(mut used) = self.budget.used.lock() {
+        {
+            let mut used = self.budget.used.lock();
             let total = self.total();
             *used = used.saturating_sub(self.charged).saturating_add(total);
             self.charged = total;
         }
     }
     fn push(&mut self, key: &(bool, u32), bytes: &[u8]) -> usize {
-        let Ok(mut used) = self.budget.used.lock() else {
-            return 0;
-        };
+        let mut used = self.budget.used.lock();
         let before = self.total();
         *used = used.saturating_sub(self.charged).saturating_add(before);
         let room = self.budget.limit.saturating_sub(*used);
@@ -188,7 +188,8 @@ impl CaptureCalls {
 }
 impl Drop for CaptureCalls {
     fn drop(&mut self) {
-        if let Ok(mut used) = self.budget.used.lock() {
+        {
+            let mut used = self.budget.used.lock();
             *used = used.saturating_sub(self.charged);
         }
     }
@@ -255,7 +256,6 @@ pub struct Capture {
     reverse: bool,
     offset: u64,
     stopped: bool,
-    data_budget: usize,
 }
 impl Default for Capture {
     /// Creates one direction with its own DATA budget.
@@ -277,7 +277,6 @@ impl Capture {
             reverse: false,
             offset: 0,
             stopped: false,
-            data_budget: budget.limit,
         }
     }
     /// Creates both capture directions with one DATA budget for this pair.
@@ -295,17 +294,20 @@ impl Capture {
         [first, second]
     }
     fn remove_call(&mut self, stream: u32) {
-        if let Ok(mut calls) = self.calls.lock() {
+        {
+            let mut calls = self.calls.lock();
             calls.remove(&(self.reverse, stream));
         }
     }
     fn clear_calls(&mut self) {
-        if let Ok(mut calls) = self.calls.lock() {
+        {
+            let mut calls = self.calls.lock();
             calls.remove_where(|key| key.0 == self.reverse);
         }
     }
     fn open_call(&mut self, stream: u32, item: &mut CaptureItem) {
-        if let Ok(mut calls) = self.calls.lock() {
+        {
+            let mut calls = self.calls.lock();
             let key = (self.reverse, stream);
             if calls.state.contains_key(&key) {
                 return;
@@ -334,10 +336,7 @@ impl Capture {
         item: &mut CaptureItem,
     ) {
         let shared = Arc::clone(&self.calls);
-        let Ok(mut calls) = shared.lock() else {
-            item.malformed = true;
-            return;
-        };
+        let mut calls = shared.lock();
         let key = (self.reverse, stream);
         let Some(call) = calls.state.get_mut(&key) else {
             return;
@@ -522,9 +521,7 @@ impl Decode for Capture {
         self.blocks.held().saturating_add(if self.reverse {
             0
         } else {
-            self.calls
-                .lock()
-                .map_or(self.data_budget, |calls| calls.total())
+            self.calls.lock().total()
         })
     }
     /// Reads one frame or display item, or skips a refused payload.
@@ -544,9 +541,7 @@ impl Decode for Capture {
             }
             Step::Need if eof && input.is_empty() => {
                 let shared = Arc::clone(&self.calls);
-                let mut calls = shared
-                    .lock()
-                    .map_err(|_| protocol("capture DATA state unavailable"))?;
+                let mut calls = shared.lock();
                 let keys: Vec<_> = calls
                     .state
                     .keys()
@@ -579,7 +574,8 @@ impl Decode for Capture {
         let start = self.offset;
         self.offset = self.offset.saturating_add(n as u64);
         if frame == Input::Preface {
-            if let Ok(mut calls) = self.calls.lock() {
+            {
+                let mut calls = self.calls.lock();
                 calls.client = Some(self.reverse);
             }
             let mut layer = Layer::new("HyperText Transfer Protocol 2", 0, (0, PREFACE.len()));
@@ -682,10 +678,8 @@ impl Decode for Capture {
                 }
                 if let Some(b) = &block.block {
                     present_block(&mut item, b);
-                    if block.promised.is_none()
-                        && let Ok(mut calls) = self.calls.lock()
-                        && calls.client.is_none()
-                    {
+                    let mut calls = self.calls.lock();
+                    if block.promised.is_none() && calls.client.is_none() {
                         if b.headers
                             .iter()
                             .any(|f| f.name.as_deref() == Some(b":method"))
@@ -699,6 +693,7 @@ impl Decode for Capture {
                             calls.client = Some(!self.reverse);
                         }
                     }
+                    drop(calls);
                     let grpc = b.headers.iter().any(|f| {
                         f.name.as_deref() == Some(b"content-type")
                             && f.value
@@ -725,7 +720,8 @@ impl Decode for Capture {
                 item.layer.field("Error", e.clone(), (9, 13));
                 let _ = write!(item.info, " {e}");
                 item.reset = true;
-                if let Ok(mut calls) = self.calls.lock() {
+                {
+                    let mut calls = self.calls.lock();
                     calls.remove_where(|key| key.1 == h.stream);
                 }
             }
@@ -784,9 +780,8 @@ impl Decode for Capture {
                     .field("Last stream", last_stream.to_string(), (9, 13));
                 item.layer.field("Error", e.clone(), (13, 17));
                 item.info = format!("GOAWAY {e}");
-                if let Ok(mut calls) = self.calls.lock()
-                    && let Some(client) = calls.client
-                {
+                let mut calls = self.calls.lock();
+                if let Some(client) = calls.client {
                     let receiver_is_client = self.reverse != client;
                     calls.remove_where(|key| {
                         key.1 > last_stream && (key.1 % 2 == 1) == receiver_is_client
@@ -940,7 +935,7 @@ mod tests {
         .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message.data, b"x");
-        assert_eq!(b.decoder().calls.lock().unwrap().total(), 0);
+        assert_eq!(b.decoder().calls.lock().total(), 0);
     }
 
     #[test]
@@ -963,9 +958,9 @@ mod tests {
             }
         }
         pump(&mut a, &raw(7, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0]), |_| {}).unwrap();
-        assert_eq!(a.decoder().calls.lock().unwrap().total(), 4);
+        assert_eq!(a.decoder().calls.lock().total(), 4);
         pump(&mut a, &raw(1, 5, 1, &[0xff]), |_| {}).unwrap();
-        assert_eq!(a.decoder().calls.lock().unwrap().total(), 2);
+        assert_eq!(a.decoder().calls.lock().total(), 2);
     }
 
     #[test]
@@ -1009,16 +1004,16 @@ mod tests {
             pump(stream, &raw(1, 4, 1, &block), |_| {}).unwrap();
             pump(stream, &raw(0, 0, 1, &[0, 0, 0, 0]), |_| {}).unwrap();
         }
-        assert_eq!(a.decoder().calls.lock().unwrap().total(), 8);
+        assert_eq!(a.decoder().calls.lock().total(), 8);
         a.decoder().reset();
-        assert_eq!(b.decoder().calls.lock().unwrap().total(), 4);
+        assert_eq!(b.decoder().calls.lock().total(), 4);
         let mut messages = Vec::new();
         pump(&mut b, &raw(0, 1, 1, &[1, b'z']), |item| {
             messages.extend(item.messages)
         })
         .unwrap();
         assert_eq!(messages[0].message.data, b"z");
-        assert_eq!(b.decoder().calls.lock().unwrap().total(), 0);
+        assert_eq!(b.decoder().calls.lock().total(), 0);
 
         let [a, b] = Capture::pair(6);
         let mut a = Stream::new(a);
@@ -1033,7 +1028,7 @@ mod tests {
         })
         .unwrap();
         assert!(malformed);
-        assert_eq!(a.decoder().calls.lock().unwrap().total(), 4);
+        assert_eq!(a.decoder().calls.lock().total(), 4);
     }
 
     #[test]
@@ -1092,7 +1087,7 @@ mod tests {
             })
             .unwrap();
             assert_eq!(
-                capture.decoder().calls.lock().unwrap().state[&(false, 1)]
+                capture.decoder().calls.lock().state[&(false, 1)]
                     .spans
                     .len(),
                 1
@@ -1103,7 +1098,7 @@ mod tests {
             })
             .unwrap();
             assert!(
-                capture.decoder().calls.lock().unwrap().state[&(false, 1)]
+                capture.decoder().calls.lock().state[&(false, 1)]
                     .spans
                     .is_empty()
             );

@@ -57,7 +57,7 @@ pub(crate) fn pcapng(packets: &[(u64, &[u8])], keylog: &[u8]) -> Vec<u8> {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "observe"))]
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::le32;

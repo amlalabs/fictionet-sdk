@@ -1,5 +1,6 @@
+use fictionet::sync::Mutex;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Waker};
 
 use crate::cx::CancelWait;
@@ -130,7 +131,7 @@ impl Interface for End {
             fcx.graph().owns(&self.cable.meter, self.side, current);
         }
         {
-            let mut dir = self.cable.dirs[self.side].lock().unwrap();
+            let mut dir = self.cable.dirs[self.side].lock();
             if let Some(packet) = dir.queue.pop_front() {
                 dir.queued -= packet.0.len() + PACKET_COST;
                 return Poll::Ready(Ok(packet));
@@ -151,7 +152,7 @@ impl Interface for End {
 
     fn send(&mut self, packet: Packet) {
         let waker = {
-            let mut dir = self.cable.dirs[1 - self.side].lock().unwrap();
+            let mut dir = self.cable.dirs[1 - self.side].lock();
             if dir.closed {
                 return;
             }
@@ -185,7 +186,7 @@ impl Drop for End {
         // Packets still queued for this end are lost. The other end reads
         // what is queued for it, then `Closed`.
         let lost = {
-            let mut dir = self.cable.dirs[self.side].lock().unwrap();
+            let mut dir = self.cable.dirs[self.side].lock();
             dir.closed = true;
             dir.waker = None;
             dir.queued = 0;
@@ -193,28 +194,28 @@ impl Drop for End {
         };
         drop(lost);
         let waker = {
-            let mut dir = self.cable.dirs[1 - self.side].lock().unwrap();
+            let mut dir = self.cable.dirs[1 - self.side].lock();
             dir.closed = true;
             dir.waker.take()
         };
         if let Some(w) = waker {
             w.wake();
         }
-        let guard = self.cable.guard.lock().unwrap().take();
+        let guard = self.cable.guard.lock().take();
         drop(guard);
     }
 }
 
 impl End {
     /// The bytes waiting for this end to read, counted as for a limit.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "std"))]
     pub(crate) fn queued(&self) -> usize {
-        self.cable.dirs[self.side].lock().unwrap().queued
+        self.cable.dirs[self.side].lock().queued
     }
 
     /// Whether the other end is gone.
     pub(crate) fn peer_gone(&self) -> bool {
-        self.cable.dirs[self.side].lock().unwrap().closed
+        self.cable.dirs[self.side].lock().closed
     }
 
     /// A check for [`peer_gone`](End::peer_gone) that works without this
@@ -223,11 +224,7 @@ impl End {
     pub(crate) fn peer_gone_check(&self) -> impl Fn() -> bool + Send + Sync + 'static {
         let cable = Arc::downgrade(&self.cable);
         let side = self.side;
-        move || {
-            cable
-                .upgrade()
-                .is_none_or(|c| c.dirs[side].lock().unwrap().closed)
-        }
+        move || cable.upgrade().is_none_or(|c| c.dirs[side].lock().closed)
     }
 
     /// The counts and tap of this end's pair.
@@ -240,11 +237,11 @@ impl Counted for Cable {
     fn totals(&self) -> [u64; 4] {
         // End `s` sends into `dirs[1 - s]`.
         let (p1, b1) = {
-            let d = self.dirs[0].lock().unwrap();
+            let d = self.dirs[0].lock();
             (d.packets, d.bytes)
         };
         let (p0, b0) = {
-            let d = self.dirs[1].lock().unwrap();
+            let d = self.dirs[1].lock();
             (d.packets, d.bytes)
         };
         [p0, b0, p1, b1]
@@ -257,7 +254,7 @@ impl std::fmt::Debug for End {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::{InterfaceExt, block_on, run};
@@ -276,7 +273,7 @@ mod tests {
             // The ten past the limit were dropped; reading made room again.
             a.send(Packet(vec![99; 36]));
             assert_eq!(b.recv(&fcx).await?, Packet(vec![99; 36]));
-            assert_eq!(b.cable.dirs[b.side].lock().unwrap().queued, 0);
+            assert_eq!(b.cable.dirs[b.side].lock().queued, 0);
             Err::<(), crate::Error>(crate::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");

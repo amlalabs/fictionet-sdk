@@ -18,7 +18,7 @@ COPY tests/web_fixture tests/web_fixture
 # The hosted example also copies web_world out of this image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,id=fictionet-web-target \
-    cargo build --release --features tokio --bin fictionet --example web_world --example web_fixture \
+    cargo build --release --features web-proxy --bin fictionet --example web_world --example web_fixture \
     && cp target/release/fictionet target/release/examples/web_world target/release/examples/web_fixture /usr/local/bin/
 
 # The world, the real upstream, and attach.

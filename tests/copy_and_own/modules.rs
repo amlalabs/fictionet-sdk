@@ -154,14 +154,22 @@ macro_rules! protocols {
         pub mod mqtt;
         #[path = "../../src/stdlib/mysql.rs"]
         pub mod mysql;
+        fictionet::cfg_observe! {
         #[path = "../../src/observe/conversation.rs"]
         pub mod observe_conversation;
+        }
+        fictionet::cfg_observe! {
         #[path = "../../src/observe/http2.rs"]
         pub mod observe_http2;
+        }
+        fictionet::cfg_observe! {
         #[path = "../../src/observe/protocols.rs"]
         pub mod observe_protocols;
+        }
+        fictionet::cfg_observe! {
         #[path = "../../src/observe/tls.rs"]
         pub mod observe_tls;
+        }
         #[path = "../../src/stdlib/codec/pipe.rs"]
         pub mod pipe;
         #[path = "../../src/stdlib/ports.rs"]
@@ -302,8 +310,14 @@ macro_rules! protocols {
         pub mod vxlan;
         #[path = "../../src/stdlib/wake_on_lan.rs"]
         pub mod wake_on_lan;
-        #[path = "../../src/stdlib/web.rs"]
+        fictionet::cfg_std! {
+        #[path = "../../src/stdlib/web/sites.rs"]
         pub mod web;
+        }
+        fictionet::cfg_web_proxy! {
+        #[path = "../../src/stdlib/web/proxy.rs"]
+        pub mod web_proxy;
+        }
         #[path = "../../src/stdlib/websocket.rs"]
         pub mod websocket;
         #[path = "../../src/stdlib/whois.rs"]
@@ -424,6 +438,8 @@ fn copied_clock(fcx: &fictionet::Cx, cx: &mut std::task::Context<'_>) {
     timer.clear();
     let _ = fcx.mode();
     let _ = fcx.require_real_io();
+    copied_client_config(fcx, std::time::SystemTime::UNIX_EPOCH);
+    copied_mutex();
 }
 
 #[allow(dead_code)]
@@ -444,4 +460,10 @@ fn copied_client_config(fcx: &fictionet::Cx, start: std::time::SystemTime) {
     let _: rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVersions> =
         fictionet::stdlib::tls::client_config_builder(fcx, start);
     let _ = sandbox::client_config(fcx, start, None, &[]).unwrap();
+}
+
+fn copied_mutex() {
+    let value = fictionet::sync::Mutex::new(1);
+    let mut guard: fictionet::sync::MutexGuard<'_, i32> = value.lock();
+    *guard += 1;
 }

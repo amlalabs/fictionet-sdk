@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use fictionet::sync::Mutex;
 
 use rand_chacha::ChaCha20Rng;
 use rand_chacha::rand_core::{RngCore, SeedableRng};
@@ -9,6 +9,7 @@ pub struct Seed(pub [u8; 32]);
 
 impl Seed {
     /// Draws a fresh seed from the operating system.
+    #[cfg(feature = "std")]
     pub fn random() -> Self {
         let mut bytes = [0; 32];
         crate::sys::random_bytes(&mut bytes).expect("operating system entropy unavailable");
@@ -98,7 +99,7 @@ struct Stream {
 
 impl Entropy for SeededEntropy {
     fn fill_random(&self, mut out: &mut [u8]) {
-        let mut stream = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stream = self.0.lock();
         while !out.is_empty() {
             if stream.at == 64 {
                 let Stream { rng, bytes, at } = &mut *stream;
@@ -190,13 +191,13 @@ mod tests {
         struct Words(Mutex<std::collections::VecDeque<u64>>);
         impl Entropy for Words {
             fn fill_random(&self, out: &mut [u8]) {
-                out.copy_from_slice(&self.0.lock().unwrap().pop_front().unwrap().to_le_bytes());
+                out.copy_from_slice(&self.0.lock().pop_front().unwrap().to_le_bytes());
             }
         }
         let source = Words(Mutex::new([0, 5, 16, u64::MAX].into()));
         assert_eq!(source.random_below(0), 0);
         assert_eq!(source.random_below(10), 6);
         assert_eq!(source.random_below(u64::MAX), 0);
-        assert!(source.0.lock().unwrap().is_empty());
+        assert!(source.0.lock().is_empty());
     }
 }

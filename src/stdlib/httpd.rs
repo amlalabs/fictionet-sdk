@@ -4,7 +4,7 @@
 //!
 //! `Http1` is a caller-driven `Service` on the `http1` decoder.
 //! `serve_connection` runs it over a live connection. HTTP/2 and HTTP/1 Upgrade
-//! handling use hyper, not the `http2` frame layer. TLS comes from
+//! handling require the `tokio` feature and use hyper. TLS comes from
 //! `fictionet::stdlib::tls`. This module supplies no HTTP client.
 //!
 //! A [`Handler`] answers one request. Three kinds come ready:
@@ -19,7 +19,7 @@
 //!   `axum::Router`, run as deferred work of the connection.
 //! - [`VirtualHosts`]: picks a handler by the request's host, as a web server
 //!   with several sites at one address does, with the redirect to https and
-//!   the `421 Misdirected Request` of [`web::Sites`](fictionet::stdlib::web::Sites).
+//!   the `421 Misdirected Request` of [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html).
 //!
 //! On a [`Net`](fictionet::stdlib::net::Net), a [`Server`] is the
 //! [`PortServer`] that serves HTTP on a host's
@@ -68,22 +68,24 @@
 //! can behave differently between lab runs. Hyper does not let a server
 //! change that setting, and h2 exposes no clock injection for it.
 //!
-//! ```
-//! use bytes::Bytes;
-//! use fictionet::stdlib::httpd::{Http1, Router};
-//! use fictionet::stdlib::serve::Harness;
-//!
-//! let router = Router::new()
-//!     .get("/hello", |_, _| http::Response::new(Bytes::from("hi\n")))
-//!     .post("/echo", |_, request: http::Request<Bytes>| http::Response::new(request.into_body()));
-//! let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
-//! let reply = h.push(b"GET /hello HTTP/1.1\r\nHost: a.test\r\n\r\n")?;
-//! assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
-//! assert!(reply.ends_with(b"\r\n\r\nhi\n"));
-//! let reply = h.push(b"POST /echo HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nok")?;
-//! assert!(reply.ends_with(b"\r\n\r\nok"));
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
+#![doc = fictionet::cfg_std!(doc r####"
+```
+use bytes::Bytes;
+use fictionet::stdlib::httpd::{Http1, Router};
+use fictionet::stdlib::serve::Harness;
+
+let router = Router::new()
+    .get("/hello", |_, _| http::Response::new(Bytes::from("hi\n")))
+    .post("/echo", |_, request: http::Request<Bytes>| http::Response::new(request.into_body()));
+let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+let reply = h.push(b"GET /hello HTTP/1.1\r\nHost: a.test\r\n\r\n")?;
+assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
+assert!(reply.ends_with(b"\r\n\r\nhi\n"));
+let reply = h.push(b"POST /echo HTTP/1.1\r\nHost: a.test\r\nContent-Length: 2\r\n\r\nok")?;
+assert!(reply.ends_with(b"\r\n\r\nok"));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+"####)]
 //!
 //! # Events
 //!
@@ -105,13 +107,14 @@
 //! A connection that ends in an error is one `http.error` event, with
 //! `local`, `cause` (`protocol`, `timeout` or `transport`) and `detail`.
 
+use fictionet::sync::Mutex;
 use std::any::Any;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::future::{Future, poll_fn};
-use std::pin::{Pin, pin};
-use std::sync::{Arc, Mutex, RwLock};
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
@@ -565,11 +568,7 @@ where
     B::Error: Into<Error>,
 {
     fn call(&self, request: Request<Body>, _ex: &mut Exchange<'_>) -> Reply {
-        let mut service = self
-            .service
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let mut service = self.service.lock().clone();
         Reply::Later(Box::new(move |_fcx| {
             Box::pin(async move {
                 poll_fn(|cx| service.poll_ready(cx))
@@ -1232,13 +1231,15 @@ pub fn date_header(start: Option<SystemTime>, now: Instant) -> Option<HeaderValu
 /// An IMF-fixdate (RFC 9110 section 5.6.7), such as
 /// `Sun, 06 Nov 1994 08:49:37 GMT`, for `secs` since the Unix epoch.
 ///
-/// ```
-/// use fictionet::stdlib::httpd::http_date;
-/// assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
-/// assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
-/// assert_eq!(http_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
-/// assert_eq!(http_date(1_559_347_200), "Sat, 01 Jun 2019 00:00:00 GMT");
-/// ```
+#[doc = fictionet::cfg_std!(doc r####"
+```
+use fictionet::stdlib::httpd::http_date;
+assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+assert_eq!(http_date(951_782_400), "Tue, 29 Feb 2000 00:00:00 GMT");
+assert_eq!(http_date(1_559_347_200), "Sat, 01 Jun 2019 00:00:00 GMT");
+```
+"####)]
 pub fn http_date(secs: u64) -> String {
     const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: [&str; 12] = [
@@ -1669,7 +1670,8 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// Serves one connection with `handler`: HTTP/2 when TLS agreed on `h2`, or
 /// when a client without TLS starts with HTTP/2's preface; HTTP/1
-/// otherwise. `info` names the connection in events.
+/// otherwise. HTTP/2 and hyper upgrades require the `tokio` feature.
+/// `info` names the connection in events.
 ///
 /// Returns `Ok(())` when the connection ended, however it ended: a
 /// connection's failure is the connection's, and the run's events say what
@@ -1726,7 +1728,11 @@ pub async fn serve_connection<C: Connection + Unpin>(
     };
     let conn = Prefixed::new(first, conn);
     if h2 {
-        return h2::serve(fcx, conn, handler, info, opts).await;
+        fictionet::cfg_tokio!({
+            return h2::serve(fcx, conn, handler, info, opts).await;
+        } else {
+            return Ok(());
+        });
     }
     let serve_opts = ServeOptions {
         idle: None,
@@ -1743,7 +1749,12 @@ pub async fn serve_connection<C: Connection + Unpin>(
                 // A request that asks for an upgrade: hyper's HTTP/1 reads it
                 // again and carries the upgrade out.
                 Some(head) => {
-                    h2::serve_upgrade(fcx, Prefixed::new(head, rest), handler, info, opts).await
+                    fictionet::cfg_tokio!({
+                        h2::serve_upgrade(fcx, Prefixed::new(head, rest), handler, info, opts).await
+                    } else {
+                        let _ = (head, rest);
+                        Ok(())
+                    })
                 }
                 None => Ok(()),
             }
@@ -1765,12 +1776,14 @@ pub async fn serve_connection<C: Connection + Unpin>(
 /// [`VirtualHosts`], and each request goes to the site its host names.
 /// Over TLS, ALPN offers `h2` and `http/1.1`.
 ///
-/// ```
-/// # use fictionet::stdlib::{httpd, net::Host};
-/// let page = httpd::Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
-/// let host = Host::new("www").dns_name("www.corp.test").port_server(80, httpd::Server::new(page));
-/// # drop(host);
-/// ```
+#[doc = fictionet::cfg_std!(doc r####"
+```
+# use fictionet::stdlib::{httpd, net::Host};
+let page = httpd::Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
+let host = Host::new("www").dns_name("www.corp.test").port_server(80, httpd::Server::new(page));
+# drop(host);
+```
+"####)]
 #[derive(Clone)]
 pub struct Server {
     vhost: VHost,
@@ -1854,7 +1867,11 @@ impl PortServer for Server {
     }
 
     fn alpn(&self) -> Vec<Vec<u8>> {
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        fictionet::cfg_tokio!({
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        } else {
+            vec![b"http/1.1".to_vec()]
+        })
     }
 
     fn share(&self, names: &[String], other: &Arc<dyn PortServer>) -> bool {
@@ -1872,7 +1889,7 @@ impl PortServer for Server {
     }
 }
 
-/// A website on ports 80 and 443, as [`web::Sites`](fictionet::stdlib::web::Sites)
+/// A website on ports 80 and 443, as [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html)
 /// serves one: with TLS, HTTPS on 443 for each of the host's names and a
 /// redirect to it on 80 (unless [`plain_http`](Self::plain_http));
 /// without, plain HTTP on 80. [`served_by`](Self::served_by) puts it on a host.
@@ -1959,9 +1976,11 @@ impl Website {
     }
 }
 
+fictionet::cfg_tokio! {
 /// Live HTTP/2 and HTTP/1 Upgrade serving on hyper.
 mod h2 {
     use super::*;
+    use std::pin::pin;
     use fictionet::stdlib::serve::{Charge, PanicNote};
     use hyper::body::Incoming;
 
@@ -2746,12 +2765,12 @@ mod h2 {
                     let s = slot.clone();
                     let _ = fcx
                         .region(|inner| async move {
-                            *s.lock().unwrap() = Some(inner.clone());
+                            *s.lock() = Some(inner.clone());
                             inner.cancel();
                             Ok(())
                         })
                         .await;
-                    let inner = slot.lock().unwrap().take().unwrap();
+                    let inner = slot.lock().take().unwrap();
                     assert!(inner.is_cancelled());
                     let mut sleep = CxTimer::new(inner).sleep(Duration::from_secs(5));
                     let pending = |sleep: &mut Pin<Box<dyn hyper::rt::Sleep>>| {
@@ -2769,4 +2788,6 @@ mod h2 {
             .unwrap();
         }
     }
+}
+
 }

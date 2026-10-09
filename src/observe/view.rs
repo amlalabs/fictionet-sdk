@@ -370,7 +370,7 @@ pub(crate) fn changes(graph: &Graph, old: &mut View) -> Vec<Message> {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::watch::Meter;
@@ -394,7 +394,7 @@ mod tests {
         let g = graph.clone();
         let (attacher, mut attachments) = crate::attachments();
         let _sandbox = attacher.attach("agent").unwrap();
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::new(fictionet::sync::Mutex::new(Vec::new()));
         let s = seen.clone();
         crate::block_on(crate::run::run_with(graph.clone(), move |fcx| async move {
             let lan = fcx.group("office LAN");
@@ -421,12 +421,12 @@ mod tests {
             });
             fcx.sleep(ms(30)).await?;
             let (_, (_, data)) = snapshot(&g, None);
-            s.lock().unwrap().push(data);
+            s.lock().push(data);
             fcx.cancel();
             Ok(())
         }))
         .unwrap();
-        let data = seen.lock().unwrap().pop().unwrap();
+        let data = seen.lock().pop().unwrap();
         let groups: Vec<&str> = data
             .split(r#"{"id":"g"#)
             .skip(1)

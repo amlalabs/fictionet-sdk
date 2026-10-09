@@ -10,7 +10,6 @@
 pub mod auth;
 pub mod dns;
 pub mod http;
-pub mod socks5;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 

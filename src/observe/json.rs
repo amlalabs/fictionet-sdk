@@ -107,7 +107,7 @@ pub(crate) fn array<I: IntoIterator<Item = S>, S: AsRef<str>>(items: I) -> Strin
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "observe"))]
 mod tests {
     use super::*;
 
@@ -274,7 +274,7 @@ impl Parser<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "observe"))]
 mod parse_tests {
     use super::*;
 

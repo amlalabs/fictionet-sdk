@@ -1,7 +1,7 @@
 //! A small world of websites, written with `web::Sites`.
 //!
 //! ```text
-//! cargo run --features tokio --example web_world -- /run/fictionet/world.sock /run/fictionet/ca.pem
+//! cargo run --example web_world -- /run/fictionet/world.sock /run/fictionet/ca.pem
 //! ```
 //!
 //! It makes a certificate authority for the world when it starts and

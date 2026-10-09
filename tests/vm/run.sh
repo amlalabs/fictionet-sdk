@@ -40,7 +40,7 @@ command -v genisoimage >/dev/null || skip "genisoimage is missing"
 [ -f "$prepared" ] || skip "no VM image at $prepared; run tests/vm/run.sh --fetch once to make it"
 
 echo "building fictionet, web_fixture and ping_world"
-(cd "$repo" && cargo build --quiet --features tokio --bin fictionet --example web_fixture --example ping_world)
+(cd "$repo" && cargo build --quiet --features web-proxy --bin fictionet --example web_fixture --example ping_world)
 target="$(target_dir)"
 bin="$target/debug/fictionet"
 examples="$target/debug/examples"

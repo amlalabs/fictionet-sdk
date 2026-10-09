@@ -5,10 +5,11 @@
 //! protocol values or implement sessions or services. Packet processing belongs
 //! to the task that calls it.
 
+use fictionet::sync::{Mutex, MutexGuard};
 use std::collections::{BTreeSet, VecDeque};
 use std::future::{Future, poll_fn};
 use std::pin::pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use fictionet::CancelWait;
@@ -102,7 +103,7 @@ impl Wake for SlotWaker {
 
     fn wake_by_ref(self: &Arc<Self>) {
         let task = {
-            let mut r = self.ready.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut r = self.ready.inner.lock();
             r.push(self.slot);
             r.task.take()
         };
@@ -131,7 +132,7 @@ impl<I: Interface> Ports<I> {
     }
 
     fn lock_ready(&self) -> MutexGuard<'_, ReadyInner> {
-        self.ready.inner.lock().unwrap_or_else(|e| e.into_inner())
+        self.ready.inner.lock()
     }
 
     /// How many ports are still open.
@@ -288,6 +289,7 @@ impl<I: Interface> Ports<I> {
     }
 }
 
+fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,4 +319,6 @@ mod tests {
             Ok(())
         })).unwrap();
     }
+}
+
 }

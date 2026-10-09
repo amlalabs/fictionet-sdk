@@ -319,6 +319,7 @@ where
     outer
 }
 
+fictionet::cfg_std! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,4 +477,6 @@ mod tests {
         }))
         .unwrap();
     }
+}
+
 }

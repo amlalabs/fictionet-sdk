@@ -17,11 +17,10 @@ path = "src/lib.rs"
 name = "artifactory-world"
 path = "src/main.rs"
 
-# fictionet without its default `tokio` feature: web::proxy() and hyper's
-# client are not compiled into this world.
+# The default features serve HTTP/2 without the optional web-proxy client.
 [dependencies]
 bytes = "1"
-fictionet = { path = "../../..", default-features = false }
+fictionet = { path = "../../.." }
 http = "1"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
@@ -31,7 +30,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 debug = 1
 
 [dev-dependencies]
-fictionet = { path = "../../..", features = ["tokio"] }
+fictionet = { path = "../../.." }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }

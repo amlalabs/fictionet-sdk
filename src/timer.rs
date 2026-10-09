@@ -6,18 +6,19 @@
 //! armed for the earliest deadline instead, and [`block_on`](crate::block_on)
 //! fires the timers itself while it waits.
 
+use fictionet::sync::Mutex;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use std::sync::Condvar;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::task::Waker;
 
 use crate::sys::Instant;
 
 pub(crate) struct Timers {
     state: Mutex<State>,
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     changed: Condvar,
 }
 
@@ -39,10 +40,10 @@ pub(crate) fn timers() -> &'static Timers {
                 entries: HashMap::new(),
                 next_id: 0,
             }),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             changed: Condvar::new(),
         }));
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         std::thread::Builder::new()
             .name("fictionet-timers".into())
             .spawn(move || timers.thread())
@@ -52,9 +53,12 @@ pub(crate) fn timers() -> &'static Timers {
 }
 
 impl Timers {
+    #[cfg(all(not(feature = "std"), not(target_arch = "wasm32")))]
+    fn earlier(&self, _deadline: Instant) {}
+
     /// Wakes `waker` at `deadline`. Returns an id for `update` and `remove`.
     pub(crate) fn add(&self, deadline: Instant, waker: Waker) -> u64 {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let id = state.next_id;
         state.next_id += 1;
         let earliest = state.heap.peek().map(|Reverse((d, _))| *d);
@@ -78,7 +82,7 @@ impl Timers {
     /// Moves timer `id` to `deadline`, with `waker`. A timer that has
     /// fired already is added again, under the same id.
     pub(crate) fn reset(&self, id: u64, deadline: Instant, waker: &Waker) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let earliest = state.heap.peek().map(|Reverse((d, _))| *d);
         let old = match state.entries.get_mut(&id) {
             Some((d, w)) => {
@@ -108,12 +112,12 @@ impl Timers {
     }
 
     pub(crate) fn remove(&self, id: u64) {
-        let removed = self.state.lock().unwrap().entries.remove(&id);
+        let removed = self.state.lock().entries.remove(&id);
         drop(removed);
     }
 
     /// Moves the wakeup earlier, to `deadline`.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     fn earlier(&self, _deadline: Instant) {
         self.changed.notify_one();
     }
@@ -126,15 +130,11 @@ impl Timers {
 
     /// Wakes every timer that is due now. Returns the next deadline, if
     /// any timer is left.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
     pub(crate) fn fire(&self) -> Option<Instant> {
         loop {
             let mut due = Vec::new();
-            let next = self
-                .state
-                .lock()
-                .unwrap()
-                .take_due(Instant::now(), &mut due);
+            let next = self.state.lock().take_due(Instant::now(), &mut due);
             if due.is_empty() {
                 return next;
             }
@@ -145,9 +145,9 @@ impl Timers {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     fn thread(&self) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         loop {
             let now = Instant::now();
             let mut due = Vec::new();
@@ -157,15 +157,18 @@ impl Timers {
                 for waker in due {
                     waker.wake();
                 }
-                state = self.state.lock().unwrap();
+                state = self.state.lock();
                 continue;
             }
             state = match next {
                 Some(deadline) => {
                     let wait = deadline.saturating_duration_since(now);
-                    self.changed.wait_timeout(state, wait).unwrap().0
+                    self.changed
+                        .wait_timeout(state, wait)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0
                 }
-                None => self.changed.wait(state).unwrap(),
+                None => self.changed.wait(state).unwrap_or_else(|e| e.into_inner()),
             };
         }
     }

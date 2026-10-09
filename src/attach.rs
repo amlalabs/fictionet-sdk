@@ -1,11 +1,12 @@
+use fictionet::sync::Mutex;
 use std::collections::{HashSet, VecDeque};
 use std::future::poll_fn;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll, Waker};
 
 use crate::cable::pair_with_guard;
 use crate::cx::CancelWait;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use crate::listen::SocketLink;
 use crate::watch::{Graph, Meter};
 use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
@@ -39,6 +40,7 @@ pub struct Attachment {
     /// Counts for the dashboard. Side 0 is the world, side 1 the sandbox.
     meter: Arc<Meter>,
     /// The last task seen polling this attachment.
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     seen: u64,
     /// The wraps of [`Attachments::map`] still to run, closest to the
     /// sandbox first. They run when the world takes the attachment.
@@ -52,8 +54,8 @@ type Wrap = Box<dyn FnOnce(Attachment) -> Attachment + Send>;
 enum Link {
     /// An interface from [`Attacher::attach`].
     Cable(End),
-    /// A connection from attach, accepted by [`listen`](crate::listen).
-    #[cfg(not(target_arch = "wasm32"))]
+    /// A connection from attach, accepted by [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html).
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     Socket(SocketLink),
     /// What [`Attachments::map`] made from another attachment, and a check
     /// for whether that attachment's sandbox has detached.
@@ -83,7 +85,7 @@ impl Attachment {
     fn detached(&self) -> bool {
         match &self.link {
             Link::Cable(end) => end.peer_gone(),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             Link::Socket(link) => link.peer_gone(),
             Link::Mapped { gone, .. } => gone(),
         }
@@ -94,13 +96,13 @@ impl Attachment {
     fn detached_check(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
         match &self.link {
             Link::Cable(end) => Arc::new(end.peer_gone_check()),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             Link::Socket(link) => Arc::new(link.peer_gone_check()),
             Link::Mapped { gone, .. } => gone.clone(),
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     pub(crate) fn from_socket(name: String, mtu: u16, link: SocketLink) -> Attachment {
         let meter = Meter::new();
         meter.set_sandbox(&name);
@@ -109,6 +111,7 @@ impl Attachment {
             mtu,
             link: Link::Socket(link),
             meter,
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             seen: 0,
             wraps: Vec::new(),
         }
@@ -137,7 +140,7 @@ impl Interface for Attachment {
     fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
         match &mut self.link {
             Link::Cable(end) => end.poll_recv(fcx, cx),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             Link::Socket(link) => {
                 let current = crate::watch::current_task();
                 if current != self.seen && current != 0 {
@@ -157,7 +160,7 @@ impl Interface for Attachment {
     fn send(&mut self, packet: Packet) {
         match &mut self.link {
             Link::Cable(end) => end.send(packet),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             Link::Socket(link) => {
                 self.meter.sent(0, &packet);
                 link.send(packet)
@@ -178,25 +181,27 @@ impl Interface for Attachment {
 ///
 /// It returns two halves. The world gets the [`Attachments`] and takes
 /// sandboxes out of it. Whatever adds sandboxes keeps the [`Attacher`]: in
-/// a real run, that is [`listen`](crate::listen), which adds each sandbox
+/// a real run, that is [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html), which adds each sandbox
 /// that `fictionet attach` connects. In a test, the test keeps the
 /// `Attacher` and attaches sandboxes itself.
 ///
 /// This test attaches a sandbox called `agent` and holds the sandbox's end
 /// of its link, so it can play the sandbox:
 ///
-/// ```
-/// # use fictionet::{Attachments, Cx, Result};
-/// # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-/// # fn main() -> Result {
-/// let (attacher, attachments) = fictionet::attachments();
-/// let agent = attacher.attach("agent")?; // the test holds the sandbox's end
-/// let world = fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments));
-/// // send packets on `agent` and check what comes back while `world` runs
-/// # drop(agent);
-/// # fictionet::block_on(world)
-/// # }
-/// ```
+#[doc = fictionet::cfg_std!(doc r####"
+```
+# use fictionet::{Attachments, Cx, Result};
+# async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
+# fn main() -> Result {
+let (attacher, attachments) = fictionet::attachments();
+let agent = attacher.attach("agent")?; // the test holds the sandbox's end
+let world = fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments));
+// send packets on `agent` and check what comes back while `world` runs
+# drop(agent);
+# fictionet::block_on(world)
+# }
+```
+"####)]
 pub fn attachments() -> (Attacher, Attachments) {
     let hub = Arc::new(Hub::default());
     (Attacher { hub: hub.clone() }, Attachments { hub })
@@ -252,7 +257,7 @@ pub(crate) struct NameGuard {
 
 impl Drop for NameGuard {
     fn drop(&mut self) {
-        self.hub.state.lock().unwrap().names.remove(&self.name);
+        self.hub.state.lock().names.remove(&self.name);
     }
 }
 
@@ -260,7 +265,7 @@ impl Drop for NameGuard {
 ///
 /// Each sandbox has a name, and two sandboxes cannot be attached under the
 /// same name at the same time. Clones of an `Attacher` share one set of
-/// names, so a test and a [`listen`](crate::listen) socket can add
+/// names, so a test and a [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) socket can add
 /// sandboxes to the same world without clashing.
 #[derive(Clone)]
 pub struct Attacher {
@@ -275,7 +280,7 @@ impl Attacher {
     /// attached, and with [`AttachError::BadName`] if the name is empty or
     /// longer than 255 bytes. The name stays taken until either end is
     /// dropped. Every attach goes through this check, including those from
-    /// [`listen`](crate::listen): when it fails, `fictionet attach` gets a
+    /// [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html): when it fails, `fictionet attach` gets a
     /// `refuse` message (see [`proto`](crate::proto)).
     pub fn attach(&self, name: &str) -> Result<End, AttachError> {
         let guard = self.reserve(name)?;
@@ -287,6 +292,7 @@ impl Attacher {
             mtu: 1500,
             link: Link::Cable(world),
             meter,
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             seen: 0,
             wraps: Vec::new(),
         });
@@ -295,14 +301,15 @@ impl Attacher {
 
     /// What the run that takes these attachments tracks, once the world
     /// has asked for one.
+    #[cfg(feature = "std")]
     pub(crate) fn graph(&self) -> Option<Arc<Graph>> {
-        self.hub.state.lock().unwrap().graph.upgrade()
+        self.hub.state.lock().graph.upgrade()
     }
 
     /// Marks the hub before a real listener can feed it.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     pub(crate) fn mark_listener(&self) -> std::io::Result<()> {
-        let mut state = self.hub.state.lock().unwrap();
+        let mut state = self.hub.state.lock();
         if let Some(graph) = state.graph.upgrade() {
             graph.environment.require_real_io()?;
         }
@@ -315,7 +322,7 @@ impl Attacher {
         if name.is_empty() || name.len() > 255 {
             return Err(AttachError::BadName);
         }
-        let mut state = self.hub.state.lock().unwrap();
+        let mut state = self.hub.state.lock();
         if !state.names.insert(name.to_owned()) {
             return Err(AttachError::Taken);
         }
@@ -328,7 +335,7 @@ impl Attacher {
     /// Ready once the [`Attachments`] is dropped. Until then, `cx`'s waker is
     /// woken when it is.
     fn poll_closed(&self, cx: &mut Context<'_>) -> Poll<()> {
-        let mut state = self.hub.state.lock().unwrap();
+        let mut state = self.hub.state.lock();
         if state.closed {
             return Poll::Ready(());
         }
@@ -341,7 +348,7 @@ impl Attacher {
 
     /// Hands `attachment` to the world.
     pub(crate) fn deliver(&self, attachment: Attachment) {
-        let mut state = self.hub.state.lock().unwrap();
+        let mut state = self.hub.state.lock();
         if state.closed {
             // The world is gone. Dropping the attachment closes it, which
             // takes the lock to free its name.
@@ -393,7 +400,7 @@ impl std::error::Error for AttachError {}
 /// Each attachment is handed out once: either by [`get`](Attachments::get),
 /// which waits for a given name, or by [`next`](Attachments::next), which
 /// takes them in arrival order. Both take a `&Cx`, like every other wait.
-/// If a real [`listen`](crate::listen) socket feeds the hub, `get`, `next`,
+/// If a real [`listen`](https://docs.rs/fictionet/latest/fictionet/fn.listen.html) socket feeds the hub, `get`, `next`,
 /// and `map` fail a lab region with an error before handing out an
 /// attachment. `get` and `next` return [`Cancelled`] in that case.
 /// A world that serves every sandbox the same way loops over `next`:
@@ -447,17 +454,19 @@ impl Attachments {
     ///
     /// Use it to put something between every sandbox and the code that
     /// serves it, such as a [`delay`](crate::stdlib::delay) in front of
-    /// [`web::Sites`](crate::stdlib::web::Sites):
+    /// [`web::Sites`](https://docs.rs/fictionet/latest/fictionet/stdlib/web/struct.Sites.html):
     ///
-    /// ```
-    /// # use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
-    /// # fn site_for(_host: &str) -> Option<web::Site> { None }
-    /// # async fn world(fcx: Cx, attachments: Attachments) -> Result {
-    /// let slow = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
-    /// web::Sites::new(site_for).start(&fcx, slow)?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    #[doc = fictionet::cfg_std!(doc r####"
+```
+# use fictionet::{Attachments, Cx, Result, stdlib::{self, web}, time::ms};
+# fn site_for(_host: &str) -> Option<web::Site> { None }
+# async fn world(fcx: Cx, attachments: Attachments) -> Result {
+let slow = attachments.map(&fcx, |fcx, sandbox| stdlib::delay(fcx, ms(200), sandbox));
+web::Sites::new(site_for).start(&fcx, slow)?;
+# Ok(())
+# }
+```
+"####)]
     ///
     /// `map` returns immediately. It starts a background task in `fcx`'s
     /// [region](Cx#regions) that takes each sandbox as it attaches and
@@ -504,7 +513,7 @@ impl Attachments {
     {
         let hub = Arc::new(Hub::default());
         {
-            let mut state = self.hub.state.lock().unwrap();
+            let mut state = self.hub.state.lock();
             if !state.bind(fcx) {
                 return Attachments { hub };
             }
@@ -535,9 +544,7 @@ impl Attachments {
                 sandbox.wraps.push(Box::new(move |sandbox: Attachment| {
                     let (name, mtu, gone) =
                         (sandbox.name.clone(), sandbox.mtu, sandbox.detached_check());
-                    let interface = Box::new((wrap.lock().unwrap_or_else(|e| e.into_inner()))(
-                        &fcx, sandbox,
-                    ));
+                    let interface = Box::new((wrap.lock())(&fcx, sandbox));
                     // The wrapped interface counts its own packets, so this
                     // meter stays unused: `observe_link` hands out the
                     // interface's.
@@ -547,6 +554,7 @@ impl Attachments {
                         mtu,
                         link,
                         meter: Meter::new(),
+                        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
                         seen: 0,
                         wraps: Vec::new(),
                     }
@@ -570,7 +578,7 @@ impl Attachments {
         }
         let mut gone = VecDeque::new();
         {
-            let mut state = self.hub.state.lock().unwrap();
+            let mut state = self.hub.state.lock();
             if !state.bind(fcx) {
                 return Poll::Ready(Err(Cancelled));
             }
@@ -609,7 +617,7 @@ impl Attachments {
 impl Drop for Attachments {
     fn drop(&mut self) {
         let (pending, feeder) = {
-            let mut state = self.hub.state.lock().unwrap();
+            let mut state = self.hub.state.lock();
             state.closed = true;
             state.waker = None;
             (std::mem::take(&mut state.pending), state.feeder.take())
@@ -621,7 +629,7 @@ impl Drop for Attachments {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "std", not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 
@@ -639,7 +647,7 @@ mod tests {
                 ));
                 assert!(fcx.is_cancelled());
                 assert!(attacher.graph().is_none());
-                assert_eq!(attacher.hub.state.lock().unwrap().pending.len(), 1);
+                assert_eq!(attacher.hub.state.lock().pending.len(), 1);
                 Ok(())
             },
         ))

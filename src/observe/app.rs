@@ -13,28 +13,11 @@ use fictionet::stdlib::http2;
 
 use super::http2 as capture;
 
-use super::decode::Decoded;
-
 use super::protocols;
 use super::tls::TlsSession;
 use super::{Match, Registry};
 use crate::events::Transport;
 const MAX_BUFFER: usize = 32 << 10;
-
-/// Sets the packet's protocol and info from a message at `level`: 1 for
-/// TLS records, 2 for what they carry and for plain HTTP. A higher level
-/// replaces what lower ones said; the same level adds to it.
-pub(super) fn info(d: &mut Decoded, level: u8, proto: &str, text: &str) {
-    if level > d.level {
-        d.level = level;
-        d.proto = proto.into();
-        d.info = text.to_owned();
-    } else if level == d.level {
-        d.info.push_str(", ");
-        d.info.push_str(text);
-    }
-    d.cap_info();
-}
 
 // ---------------------------------------------------------------------------
 // TCP conversations
@@ -146,9 +129,10 @@ pub(super) fn register(registry: &mut Registry) {
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "observe"))]
 mod tests {
     use super::*;
+    use crate::observe::Decoded;
     use crate::observe::{Conversation, Observed, Place};
     use fictionet::stdlib::test_support::hex;
     use http2::PREFACE as HTTP2_PREFACE;

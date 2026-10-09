@@ -22,12 +22,16 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-# On by default. tokio itself is always a dependency (hyper and h2 run on
-# it, and fictionet::tokio adapts connections to it); this feature adds
-# hyper's client, hyper-util and hyper-rustls with webpki-roots, for
-# web::proxy(&fcx). Turn default features off to leave those out.
-default = ["tokio"]
-tokio = ["dep:hyper-util", "dep:hyper-rustls", "hyper/client"]
+default = ["std", "tokio", "observe"]
+observe = ["std"]
+std = ["dep:libc", "dep:http", "dep:http-body", "dep:tower-service"]
+tokio = ["std", "dep:tokio", "dep:hyper", "dep:h2"]
+web-proxy = ["tokio", "dep:hyper-util", "dep:hyper-rustls", "hyper/client"]
+
+[[bin]]
+name = "fictionet"
+path = "src/bin/fictionet/main.rs"
+required-features = ["std"]
 
 [lints.rust]
 # `cargo fuzz` builds with `--cfg fuzzing`, which adds `fictionet::fuzzing`.
@@ -35,12 +39,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [dependencies]
 bytes = "1"
-h2 = "0.4"
+h2 = { version = "0.4", optional = true }
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
-http = "1.5.0"
-http-body = "1.1.0"
-http-body-util = "0.1"
-hyper = { version = "1.11.1", default-features = false, features = ["http1", "http2", "server"] }
+http = { version = "1.5.0", optional = true }
+http-body = { version = "1.1.0", optional = true }
+hyper = { version = "1.11.1", optional = true, default-features = false, features = ["http1", "http2", "server"] }
 hyper-rustls = { version = "0.27", optional = true, default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
 hyper-util = { version = "0.1", optional = true, default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
 rand_chacha = "0.9.0"
@@ -51,13 +54,13 @@ p384 = { version = "0.13.1", features = ["ecdh", "ecdsa"] }
 rsa = { version = "0.9.10", features = ["sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-reno", "async"] }
-tokio = { version = "1", default-features = false, features = ["rt", "time", "io-util", "sync"] }
-tower-service = "0.3.3"
+tokio = { version = "1", optional = true, default-features = false, features = ["io-util"] }
+tower-service = { version = "0.3.3", optional = true }
 
 # The host side: real sockets, threads, the relay, the listener and the CLI.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-libc = "0.2.189"
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net"] }
+libc = { version = "0.2.189", optional = true }
+tokio = { version = "1", optional = true, default-features = false, features = ["rt-multi-thread", "net", "time", "sync"] }
 
 # The browser (wasm32-unknown-unknown): random bytes and the clocks come
 # from JavaScript through wasm-bindgen, and timers from setTimeout. ring's
@@ -73,6 +76,7 @@ wasm-bindgen = "0.2"
 web-time = "1"
 
 [dev-dependencies]
+http-body-util = "0.1"
 fictionet-codegen = { path = "codegen" }
 fictionet-copy-modules = { path = "tests/copy_and_own" }
 axum = { version = "0.8", default-features = false, features = ["ws"] }
@@ -84,30 +88,33 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # Example targets. `cargo test` also runs those marked with `test = true`.
 [[example]]
 name = "web_world"
-required-features = ["tokio"]
+required-features = ["std"]
 test = false
 
 # The web test world adds bulk transfers and a real upstream.
 [[example]]
 name = "web_fixture"
 path = "tests/web_fixture/world.rs"
-required-features = ["tokio"]
+required-features = ["web-proxy"]
 test = true
 
 [[example]]
 name = "scan"
 path = "examples/scan/main.rs"
 test = true
+required-features = ["std"]
 
 [[example]]
 name = "custom_protocol"
 path = "examples/custom_protocol/main.rs"
 test = true
+required-features = ["std"]
 
 # The performance suite: `cargo bench --bench perf`. See CONTRIBUTING.md.
 [[bench]]
 name = "perf"
 harness = false
+required-features = ["std", "tokio", "observe"]
 
 # Dependencies are built optimized once and then cached; ring, rustls and
 # tokio are much faster that way, and debug builds of the crate itself are
@@ -121,3 +128,152 @@ opt-level = 2
 [profile.test]
 debug = "line-tables-only"
 opt-level = 1
+
+[[test]]
+name = "attach_bin"
+required-features = ["std"]
+
+[[test]]
+name = "compose"
+required-features = ["std"]
+
+[[test]]
+name = "core"
+required-features = ["std"]
+
+[[test]]
+name = "determinism"
+required-features = ["std", "tokio"]
+
+[[test]]
+name = "e2e"
+required-features = ["std", "tokio"]
+
+[[test]]
+name = "entropy"
+required-features = ["std"]
+
+[[test]]
+name = "fd_limit"
+required-features = ["std"]
+
+[[test]]
+name = "flood"
+required-features = ["std"]
+
+[[test]]
+name = "http2_grpc"
+required-features = ["tokio"]
+
+[[test]]
+name = "listen"
+required-features = ["std"]
+
+[[test]]
+name = "observe"
+required-features = ["std", "tokio", "observe"]
+
+[[test]]
+name = "observe_bin"
+required-features = ["std", "tokio", "observe"]
+
+[[test]]
+name = "observe_http2"
+required-features = ["tokio", "observe"]
+
+[[test]]
+name = "observe_present"
+required-features = ["std", "observe"]
+
+[[test]]
+name = "observe_tls"
+required-features = ["std", "observe"]
+
+[[test]]
+name = "packets"
+required-features = ["std"]
+
+[[test]]
+name = "proxy"
+required-features = ["std", "tokio"]
+
+[[test]]
+name = "recipes"
+required-features = ["std"]
+
+[[test]]
+name = "serve_cancellation"
+required-features = ["std"]
+
+[[test]]
+name = "serve_limits"
+required-features = ["std", "tokio"]
+
+[[test]]
+name = "services"
+required-features = ["std", "tokio", "observe"]
+
+[[test]]
+name = "stress"
+required-features = ["std"]
+
+[[test]]
+name = "tap_bin"
+required-features = ["std"]
+
+[[test]]
+name = "tcpudp"
+required-features = ["std", "tokio"]
+
+[[test]]
+name = "tls"
+required-features = ["std", "tokio"]
+
+[[test]]
+name = "tls_determinism"
+required-features = ["std"]
+
+[[test]]
+name = "tls_write_cancellation"
+required-features = ["std"]
+
+[[test]]
+name = "tun_linux"
+required-features = ["std", "tokio"]
+
+[[test]]
+name = "web"
+required-features = ["std", "tokio"]
+
+[[example]]
+name = "bottleneck_sites"
+required-features = ["std"]
+
+[[example]]
+name = "capture_sites"
+required-features = ["std"]
+
+[[example]]
+name = "delayed_sites"
+required-features = ["std"]
+
+[[example]]
+name = "lossy_sites"
+required-features = ["std"]
+
+[[example]]
+name = "ping_world"
+required-features = ["std"]
+
+[[example]]
+name = "route_change"
+required-features = ["std"]
+
+[[example]]
+name = "goad"
+path = "examples/goad/main.rs"
+required-features = ["std"]
+
+[[test]]
+name = "sandbox"
+required-features = ["std"]
