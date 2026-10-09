@@ -6,11 +6,7 @@
 //! Content-Length, chunked bodies, connection close, Expect: 100-continue,
 //! and CONNECT handoff use the shared codec drivers. Non-empty trailers and
 //! chunk extensions are refused. Requests ignore Upgrade offers and continue
-//! as HTTP; 101 responses end HTTP for handoff without handling Upgrade.//! A [`Service`](fictionet::stdlib::serve::Service) can use this decoder through
-//! [`serve::connection`](fictionet::stdlib::serve::connection). Change its mode
-//! between items with [`Driver::decoder`](fictionet::stdlib::serve::Driver::decoder).
-//! See `docs/services.md` for an SMTP DATA service.
-//!
+//! as HTTP; 101 responses end HTTP for handoff without handling Upgrade.
 
 use fictionet::stdlib::codec::ascii::{self, trim_ows as trim};
 use fictionet::stdlib::codec::{

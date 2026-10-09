@@ -18,11 +18,7 @@
 //! For GOAWAY, the caller identifies abandoned streams above `last_stream`,
 //! closes both halves with `peer_reset`, and retires their DATA decoders.
 //! Idle-stream checks and stream ownership belong to the caller.
-//! SETTINGS reductions take effect when the sending direction reads its ACK.//! A [`Service`](fictionet::stdlib::serve::Service) can use this decoder through
-//! [`serve::connection`](fictionet::stdlib::serve::connection). Change its mode
-//! between items with [`Driver::decoder`](fictionet::stdlib::serve::Driver::decoder).
-//! See `docs/services.md` for an SMTP DATA service.
-//!
+//! SETTINGS reductions take effect when the sending direction reads its ACK.
 
 use fictionet::stdlib::codec::Side;
 use fictionet::stdlib::{

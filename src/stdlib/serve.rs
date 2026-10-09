@@ -1916,7 +1916,7 @@ where
         }
     }
 
-    /// Takes what the last call asked for: its reply, its deferred work.
+    /// Stops item rules for this connection and records the `conn.faults` event.
     fn stop_item_faults(&mut self, why: &'static str) {
         if let Some(faults) = &mut self.faults {
             faults.stop(why, &mut self.queue);
@@ -1924,6 +1924,7 @@ where
         }
     }
 
+    /// Takes what the last call asked for: its reply, its deferred work.
     fn collect(&mut self) {
         if std::mem::take(&mut self.s.decoder_touched) {
             self.stop_item_faults("decoder");

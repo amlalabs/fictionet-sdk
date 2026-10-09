@@ -20,7 +20,10 @@
 //! Nothing here reads a socket. A world that plays a camera pushes the
 //! bytes it reads into [`Stream<Frames>`](fictionet::stdlib::codec::Stream), which splits the
 //! stream into [`Frame`]s: messages, by their Content-Length, and
-//! interleaved frames, by their length. It reads the headers it needs with
+//! interleaved frames, by their length. A camera can also use [`Frames`] as
+//! the decoder of a [`Service`](fictionet::stdlib::serve::Service) run by
+//! [`serve::connection`](fictionet::stdlib::serve::connection).
+//! World code reads the headers it needs with
 //! [`Message::cseq`], [`Message::session`], [`Message::transports`] and
 //! [`Message::range`], builds its answer (often with [`Message::reply`]),
 //! and writes it with [`Wire::write`]. Bodies stay as bytes.
@@ -50,11 +53,6 @@
 //! LF also ends the stream because its CRLF boundary cannot be trusted.
 //! Header-count errors are items. The driver reports truncated input at
 //! EOF. Bodies remain bytes; SDP belongs to [`fictionet::stdlib::sdp`].
-//!
-//! A [`Service`](fictionet::stdlib::serve::Service) can use this decoder through
-//! [`serve::connection`](fictionet::stdlib::serve::connection). Change its mode
-//! between items with [`Driver::decoder`](fictionet::stdlib::serve::Driver::decoder).
-//! See `docs/services.md` for an SMTP DATA service.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};

@@ -9,11 +9,6 @@
 //! A server using this module must advertise SETTINGS_HEADER_TABLE_SIZE
 //! at most [`MAX_TABLE`].
 //!
-//! A [`Service`](fictionet::stdlib::serve::Service) can use this decoder through
-//! [`serve::connection`](fictionet::stdlib::serve::connection). Change its mode
-//! between items with [`Driver::decoder`](fictionet::stdlib::serve::Driver::decoder).
-//! See `docs/services.md` for an SMTP DATA service.
-//!
 //! ```
 //! use fictionet::stdlib::hpack::{Table, Encoder, Field, MAX_DECODED};
 //! let mut encoder = Encoder::new(4096);

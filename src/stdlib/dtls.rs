@@ -36,11 +36,6 @@
 //! bytes it likes. Writers refuse values that would change. The bytes they write
 //! always read back.
 //!
-//! A [`Service`](fictionet::stdlib::serve::Service) can use this decoder through
-//! [`serve::connection`](fictionet::stdlib::serve::connection). Change its mode
-//! between items with [`Driver::decoder`](fictionet::stdlib::serve::Driver::decoder).
-//! See `docs/services.md` for an SMTP DATA service.
-//!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::dtls::{

@@ -23,6 +23,9 @@
 //! [`Upgrade::response_headers`]. It pushes connection bytes to
 //! [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for frames or
 //! [`Stream<Messages>`](fictionet::stdlib::codec::Stream) for whole [`Message`]s.
+//! After the handshake, a [`Service`](fictionet::stdlib::serve::Service)
+//! run by [`serve::connection`](fictionet::stdlib::serve::connection) can
+//! use [`Frames`] or [`Messages`] to read the WebSocket connection.
 //! Replies become frames through [`Message::to_frame`] or
 //! [`Message::to_frames`]. Answering pings and deciding when to close
 //! belong to world code.
@@ -31,11 +34,6 @@
 //! likes. A frame or message that breaks the specification becomes an
 //! [`Error`], and [`Error::close_code`] says which close code a real server
 //! sends before it drops the connection.
-//!
-//! A [`Service`](fictionet::stdlib::serve::Service) can use this decoder through
-//! [`serve::connection`](fictionet::stdlib::serve::connection). Change its mode
-//! between items with [`Driver::decoder`](fictionet::stdlib::serve::Driver::decoder).
-//! See `docs/services.md` for an SMTP DATA service.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Side, Stream, Wire};
