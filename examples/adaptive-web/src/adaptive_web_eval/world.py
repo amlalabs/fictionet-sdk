@@ -36,26 +36,32 @@ def seed_front(name: str) -> dict[str, Any]:
 async def world_state() -> dict[str, Any]:
     r = await sandbox(WORLD).exec(["cat", STATE])
     if not r.success:
-        raise RuntimeError(f"cannot read world state: {r.stderr}")
+        msg = f"cannot read world state: {r.stderr}"
+        raise RuntimeError(msg)
     return json.loads(r.stdout)
 
 
 async def world_log(offset: int = 0) -> list[dict[str, Any]]:
-    """Read complete log lines, then apply the line offset."""
+    """Copy the log and use read_file because Inspect cuts command output to its last
+    10 MiB without an error. Check completeness before applying the line offset.
+    """
     snapshot = LOG + ".snapshot"
     r = await sandbox(WORLD).exec(
         ["sh", "-c", 'cp "$1" "$2" && wc -c < "$2"', "copy", LOG, snapshot]
     )
     if not r.success:
-        raise RuntimeError(f"cannot read world log: {r.stderr}")
+        msg = f"cannot read world log: {r.stderr}"
+        raise RuntimeError(msg)
     want = int(r.stdout)
     data = await sandbox(WORLD).read_file(snapshot, text=False)
     if len(data) != want or (data and not data.endswith(b"\n")):
-        raise RuntimeError(f"read {len(data)} of the log's {want} bytes; this sample cannot be scored")
+        msg = f"read {len(data)} of the log's {want} bytes; this sample cannot be scored"
+        raise RuntimeError(msg)
     lines = [ln for ln in data.decode().splitlines() if ln.strip()]
     entries = [json.loads(ln) for ln in lines]
     if any(entry.get("type") == "lost" for entry in entries):
-        raise RuntimeError("the world lost log lines; this sample cannot be scored")
+        msg = "the world lost log lines; this sample cannot be scored"
+        raise RuntimeError(msg)
     return entries[offset:]
 
 

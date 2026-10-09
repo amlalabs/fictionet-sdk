@@ -3662,7 +3662,7 @@ mod tests {
             let ab = apdu.to_bytes().unwrap();
             assert_eq!(Apdu::parse(&ab), Ok(apdu));
             check_prefixes(&ab);
-            // fictionet::stdlib::codec::Frames::<Value>::new(), application and context tagged, one byte at a time.
+            // Values, application and context tagged, one byte at a time.
             let i_am = IAm {
                 device: ObjectId::device(rng.index(MAX_INSTANCE as usize + 1) as u32),
                 max_apdu: u32::from(rng.next() as u8) << 4,

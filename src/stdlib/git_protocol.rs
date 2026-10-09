@@ -1722,7 +1722,7 @@ message_wire!(
 );
 message_wire!(
     Advertisement,
-    "Reads a version 0 or 1 ref advertisement through its flush. Refuses malformed refs or capabilities, object IDs inconsistent with object-format, and refs after shallow lines. An ERR line returns Error::Remote immediately, even before a flush; its text is limited to MAX_TEXT. Each parse starts at the beginning. For incremental input, collect packets with [`Stream<Frames::<Packet>>`](fictionet::stdlib::codec::Stream) and use [`Advertisement::from_packets`].",
+    "Reads a version 0 or 1 ref advertisement through its flush. Refuses malformed refs or capabilities, object IDs inconsistent with object-format, and refs after shallow lines. An ERR line returns Error::Remote immediately, even before a flush; its text is limited to MAX_TEXT. Each parse starts at the beginning. For incremental input, collect packets with [`Stream<Frames<Packet>>`](fictionet::stdlib::codec::Stream) and use [`Advertisement::from_packets`].",
     "Appends refs, capabilities, shallow lines, and a flush. Refuses invalid fields, conflicting object formats, a first ref that would become the empty-ref marker, and values beyond the reader limits. SHA-1 is the default object format."
 );
 message_wire!(

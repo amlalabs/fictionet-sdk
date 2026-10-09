@@ -1410,7 +1410,7 @@ fn parse_bindings(c: &[u8]) -> Result<Vec<VarBind>, Error> {
 }
 
 // ---------------------------------------------------------------------------
-// fictionet::stdlib::codec::Frames::<Message>::new().
+// Messages.
 
 /// One SNMP v1 or v2c message: what one UDP datagram carries.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
