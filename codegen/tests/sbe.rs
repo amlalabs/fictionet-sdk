@@ -416,3 +416,24 @@ fn refuses_amplifying_schemas_early() {
     );
     assert_eq!(parse(&schema).unwrap_err().kind, ErrorKind::IrLimit);
 }
+
+#[test]
+fn named_unknown_and_raw_unknown_have_distinct_variants() {
+    let schema = xml(
+        r#"<enum name="E" encodingType="uint8"><validValue name="Unknown">5</validValue></enum>"#,
+        r#"<field name="value" id="1" type="E"/><field name="constant" id="2" type="E" presence="constant" valueRef="E.Unknown"/>"#,
+    );
+    let generated = generate(
+        "sbe",
+        &[Input {
+            name: "enum.xml".into(),
+            bytes: schema.into_bytes(),
+        }],
+        Limits::default(),
+    )
+    .unwrap();
+    assert!(generated.source.contains("UnknownValue,"));
+    assert!(generated.source.contains("Unknown(u8)"));
+    assert!(generated.source.contains("E::UnknownValue"));
+    assert!(generated.source.contains("raw => Ok(Self::Unknown(raw))"));
+}

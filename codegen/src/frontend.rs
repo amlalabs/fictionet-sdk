@@ -312,7 +312,11 @@ fn named(v: Value, path: &str) -> Result<NamedType, Error> {
                     Ok(Variant { name, doc, value })
                 })
                 .collect::<Result<_, Error>>()?;
-            Definition::Enum { repr, variants }
+            Definition::Enum {
+                repr,
+                variants,
+                open: false,
+            }
         }
         "set" => {
             let repr = width(o.required("repr")?, path)?;

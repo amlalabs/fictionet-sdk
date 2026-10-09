@@ -18,6 +18,7 @@ COPY codegen codegen
 COPY tests/copy_and_own tests/copy_and_own
 COPY tests/common tests/common
 COPY tests/tun_linux.rs tests/tun_linux.rs
+COPY tests/common tests/common
 # Cargo.toml names web_world, and src/recipes.rs includes other examples.
 COPY examples examples
 ARG PROFILE=release

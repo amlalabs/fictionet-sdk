@@ -483,7 +483,11 @@ impl Router {
                 return Ok(route);
             }
         }
-        self.fallback.as_ref().ok_or(path_known)
+        if path_known {
+            Err(true)
+        } else {
+            self.fallback.as_ref().ok_or(false)
+        }
     }
 }
 
@@ -987,14 +991,6 @@ impl Http1 {
 
     fn respond(&mut self, driver: &mut Driver<'_, http1::RequestEvents>) -> Flow {
         let body = Body::from(std::mem::take(&mut self.body));
-        let body = if self.too_big {
-            partial(
-                body.bytes().unwrap_or_default(),
-                "the request body is too large",
-            )
-        } else {
-            body
-        };
         let close = self.too_big;
         self.dispatch(driver, body, close)
     }
@@ -1029,9 +1025,12 @@ impl Http1 {
         let tracker = Tracker::new(&request, driver.conn(), self.started);
         let now = driver.now();
         let conn = driver.conn().clone();
-        let reply = self
-            .handler
-            .call(request, &mut Exchange::new(now, driver.entropy(), &conn));
+        let reply = if self.too_big {
+            Reply::Now(status_only(StatusCode::PAYLOAD_TOO_LARGE))
+        } else {
+            self.handler
+                .call(request, &mut Exchange::new(now, driver.entropy(), &conn))
+        };
         let close = !keep_alive;
         // Every answer goes out as deferred work, so its event is made
         // once its bytes are written.
@@ -1328,8 +1327,13 @@ impl serve::Service for Http1 {
         &mut self,
         _: Timer,
         _: &(),
-        _ctx: &mut Driver<'_, http1::RequestEvents>,
+        driver: &mut Driver<'_, http1::RequestEvents>,
     ) -> Result<Flow, Infallible> {
+        driver.record(error_event(
+            driver.conn(),
+            "timeout",
+            "request timed out".into(),
+        ));
         Ok(Flow::Close)
     }
 

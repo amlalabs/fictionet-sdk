@@ -427,3 +427,11 @@ fn copied_connection_limit(fcx: &fictionet::Cx, info: &fictionet::events::ConnIn
     let open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let _guard = net::connection_limit(fcx, info, &open, 1);
 }
+
+// The serving driver gives deferred work a child cancellation region.
+fn copied_serve_region(fcx: &fictionet::Cx) {
+    drop(fcx.region(|child| async move {
+        child.cancel();
+        Ok(())
+    }));
+}

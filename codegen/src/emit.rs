@@ -986,7 +986,11 @@ fn named_type(
         Definition::Struct(fs) | Definition::Block { fields: fs, .. } => {
             struct_definition(out, &rust, fs, ids, nodes)?;
         }
-        Definition::Enum { variants, .. } => {
+        Definition::Enum {
+            repr,
+            variants,
+            open,
+        } => {
             writeln!(
                 out,
                 "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n{}",
@@ -998,6 +1002,13 @@ fn named_type(
                     "    #[doc = {:?}]\n    {},",
                     if v.doc.is_empty() { &v.name } else { &v.doc },
                     name(&v.name)?
+                )?;
+            }
+            if *open {
+                writeln!(
+                    out,
+                    "    /// A value absent from this schema.\n    Unknown({}),",
+                    repr.rust()
                 )?;
             }
             writeln!(out, "}}")?;
@@ -1124,7 +1135,11 @@ fn named_type(
         )?;
         match &t.definition {
             Definition::Struct(fs) => layout_of(fs, None).read(out)?,
-            Definition::Enum { repr, variants } => {
+            Definition::Enum {
+                repr,
+                variants,
+                open,
+            } => {
                 writeln!(
                     out,
                     "            let v = r.scalar::<{}>(le)?;\n            match v {{",
@@ -1145,10 +1160,17 @@ fn named_type(
                     )?;
                     writeln!(out, "                    Ok(value)\n                }}")?;
                 }
-                writeln!(
-                    out,
-                    "                _ => Err(Error::Value),\n            }}"
-                )?;
+                if *open {
+                    writeln!(
+                        out,
+                        "                raw => Ok(Self::Unknown(raw)),\n            }}"
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "                _ => Err(Error::Value),\n            }}"
+                    )?;
+                }
             }
             Definition::Set { repr, .. } => {
                 writeln!(
@@ -1168,7 +1190,11 @@ fn named_type(
         )?;
         match &t.definition {
             Definition::Struct(fs) => layout_of(fs, None).write(out)?,
-            Definition::Enum { repr, variants } => {
+            Definition::Enum {
+                repr,
+                variants,
+                open,
+            } => {
                 writeln!(out, "            let v: {} = match self {{", repr.rust())?;
                 for v in variants {
                     let variant = name(&v.name)?;
@@ -1178,6 +1204,9 @@ fn named_type(
                         v.value
                     );
                     writeln!(out, "{}", layout(100, &[flat.clone(), split, flat]))?;
+                }
+                if *open {
+                    writeln!(out, "                Self::Unknown(raw) => *raw,")?;
                 }
                 writeln!(out, "            }};\n            w.scalar(v, le)")?;
             }
@@ -1412,7 +1441,7 @@ fn wire_docs(
             continue;
         }
         match &t.definition {
-            Definition::Enum { .. } if !write => {
+            Definition::Enum { open: false, .. } if !write => {
                 refusals.insert("unknown enum values");
             }
             Definition::Set { repr, bits } if bits.len() < repr.bytes() * 8 => {

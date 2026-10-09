@@ -3375,3 +3375,104 @@ fn harness_service_http_and_faults_share_the_context_stream() {
         Ok(())
     });
 }
+
+// ---------------------------------------------------------------------------
+
+/// An oversized body is refused before dispatch.
+#[test]
+fn http1_oversized_body_returns_413_without_calling_handler() {
+    let seen = Arc::new(Mutex::new(None));
+    let s = seen.clone();
+    let router = Router::new().post("/up", move |_, r: http::Request<Bytes>| {
+        *s.lock().unwrap() = Some(r.body().len());
+        http::Response::new(Bytes::from("ok\n"))
+    });
+    let limits = httpd::Limits {
+        body: 10,
+        ..Default::default()
+    };
+    let mut h = Harness::new(
+        fictionet::Seed::from_u64(0),
+        Http1::with(Arc::new(router), limits),
+        (),
+    );
+    let _ = h.push(
+        b"POST /up HTTP/1.1\r\nHost: a.test\r\nContent-Length: 20\r\n\r\n01234567890123456789",
+    );
+    let out = http_text(&h);
+    assert!(out.starts_with("HTTP/1.1 413"), "expected 413, got {out:?}");
+    assert_eq!(*seen.lock().unwrap(), None);
+}
+
+/// Header timeouts close the connection and record their cause.
+#[test]
+fn http1_header_timeout_records_an_error() {
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ());
+    h.open().unwrap();
+    let _ = h.push(b"GET / HTTP/1.1\r\n");
+    let _ = h.advance(Duration::from_secs(31));
+    assert!(h.closed());
+    assert!(
+        h.events()
+            .iter()
+            .any(|e| e.is("http", "error") && e.str("cause") == Some("timeout")),
+        "no http.error with cause timeout"
+    );
+}
+
+/// A known path takes precedence over the fallback.
+#[test]
+fn router_known_path_returns_405_before_fallback() {
+    let router = Router::new()
+        .get("/a", |_, _| http::Response::new(Bytes::from("a\n")))
+        .fallback(|_, _| http::Response::new(Bytes::from("fallback\n")));
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(router), ());
+    let reply = h
+        .push(b"POST /a HTTP/1.1\r\nHost: a.test\r\nContent-Length: 0\r\n\r\n")
+        .unwrap();
+    let reply = String::from_utf8_lossy(&reply).into_owned();
+    assert!(reply.starts_with("HTTP/1.1 405"), "{reply:?}");
+}
+
+/// LANs cannot reserve addresses from the automatic pool.
+#[test]
+fn lan_cannot_overlap_the_automatic_address_pool() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let (_, attachments) = fictionet::attachments();
+        let error = Net::new()
+            .ipv4_only()
+            .lan("lab", "198.18.0.0/24".parse()?)
+            .start(&fcx, attachments)
+            .expect_err("overlapping LAN is refused");
+        assert!(error.to_string().contains("automatic address pool"));
+        Ok(())
+    });
+}
+
+#[test]
+fn ipv6_lan_cannot_overlap_the_automatic_address_pool() {
+    world(Duration::from_secs(60), |fcx| async move {
+        let (_, attachments) = fictionet::attachments();
+        let error = Net::new()
+            .lan("lab", "2001:2::/64".parse()?)
+            .start(&fcx, attachments)
+            .expect_err("overlapping LAN is refused");
+        assert!(error.to_string().contains("automatic address pool"));
+        Ok(())
+    });
+}
+
+#[test]
+fn http1_body_timeout_records_an_error() {
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Router::new()), ());
+    h.open().unwrap();
+    h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 20\r\n\r\na")
+        .unwrap();
+    h.advance(Duration::from_secs(61)).unwrap();
+    assert!(h.closed());
+    assert!(
+        h.events()
+            .iter()
+            .any(|e| e.is("http", "error") && e.str("cause") == Some("timeout"))
+    );
+}

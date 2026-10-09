@@ -780,14 +780,13 @@ impl State {
         let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
         let mut listening = false;
         if syn
+            && !self.by_tuple.contains_key(&(dst, src))
             && !ack
             && let Some(l) = self.listeners.get(&dst.port())
         {
-            let known = self.by_tuple.contains_key(&(dst, src));
-            if !known
-                && l.per_peer
-                    .get(&src.ip())
-                    .is_some_and(|&n| n >= BACKLOG_PER_PEER)
+            if l.per_peer
+                .get(&src.ip())
+                .is_some_and(|&n| n >= BACKLOG_PER_PEER)
             {
                 return false;
             }
@@ -813,13 +812,7 @@ impl State {
                 );
             }
             let t = &packet[ip.payload.clone()];
-            let fin = t[13] & 1 != 0;
             let data_len = t.len().saturating_sub(((t[12] >> 4) as usize) * 4);
-            c.rst |= rst;
-            c.fin |= fin;
-            if rst {
-                c.wake_gone();
-            }
             if data_len > 0 {
                 let end = seq.wrapping_add(data_len as u32);
                 if c.rx_end.is_none_or(|e| (end.wrapping_sub(e) as i32) > 0) {
@@ -839,20 +832,6 @@ impl State {
                     &mut packet,
                 );
             }
-            if fin {
-                // ACK a FIN immediately, as Linux does, not after the delayed-ACK
-                // wait. A handle dropped right after reading to the end
-                // leaves the socket in TIME-WAIT, and `housekeeping` removes
-                // it: an ACK it still owed would never be sent, and the peer
-                // would hold its side of the connection until it sent its
-                // FIN again, a second later. An ACK already waiting for
-                // earlier data still waits, so `housekeeping` keeps the
-                // socket for that wait too (`fin_at`).
-                c.fin_at = Some(now);
-                self.sockets
-                    .get_mut::<stcp::Socket>(self.handles[&h])
-                    .set_ack_delay(None);
-            }
         }
         if let Some((p, count)) = extra {
             for _ in 0..count {
@@ -861,11 +840,55 @@ impl State {
                     .poll_ingress_single(now, &mut self.dev, &mut self.sockets);
             }
         }
+        let before = handle.map(|h| self.get(h).state());
+        // A listening socket in an earlier slot must not take a SYN for
+        // a tuple that already belongs to a connection.
+        let mut idle = Vec::new();
+        if syn && handle.is_some() {
+            let mut ids: Vec<_> = self
+                .handles
+                .iter()
+                .filter_map(|(&id, &h)| {
+                    (self.sockets.get::<stcp::Socket>(h).state() == TcpState::Listen)
+                        .then_some((id, h))
+                })
+                .collect();
+            ids.sort_unstable_by_key(|(id, _)| *id);
+            for (id, h) in ids {
+                idle.push((id, self.sockets.remove(h)));
+            }
+        }
         self.dev.rx = Some(packet);
         self.iface
             .poll_ingress_single(now, &mut self.dev, &mut self.sockets);
         self.dev.rx = None;
+        for (id, socket) in idle {
+            self.handles.insert(id, self.sockets.add(socket));
+        }
         if let Some(h) = handle {
+            let after = self.get(h).state();
+            let c = self.conns.get_mut(&h).unwrap();
+            if rst && before != Some(after) && matches!(after, TcpState::Closed | TcpState::Listen)
+            {
+                c.rst = true;
+                c.wake_gone();
+            }
+            if flags & 1 != 0
+                && before != Some(after)
+                && matches!(
+                    after,
+                    TcpState::CloseWait | TcpState::Closing | TcpState::TimeWait
+                )
+            {
+                c.fin = true;
+                // ACK an accepted FIN immediately. Housekeeping keeps a
+                // TIME-WAIT socket until this ACK has gone out, even if
+                // the application drops its handle after reading EOF.
+                c.fin_at = Some(now);
+                self.sockets
+                    .get_mut::<stcp::Socket>(self.handles[&h])
+                    .set_ack_delay(None);
+            }
             self.close_if_drained(h);
         }
         if listening {
@@ -2466,6 +2489,105 @@ mod tests {
             }
             drop((c, s));
             // Err ends the run, and with it the endpoints' drivers.
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
+        }));
+        assert_eq!(result.unwrap_err().to_string(), "done");
+    }
+
+    async fn syn_ack_isn(raw: &mut fictionet::End, fcx: &Cx, port: u16) -> u32 {
+        loop {
+            let p = raw.recv(fcx).await.unwrap();
+            let t = Header::parse_whole(&p.0).unwrap().payload(&p.0).to_vec();
+            if t[13] == 0x12 && u16::from_be_bytes([t[2], t[3]]) == port {
+                return u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
+            }
+        }
+    }
+
+    #[test]
+    fn retransmitted_syn_reuses_the_existing_socket() {
+        let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (mut raw, side) = pair();
+            let server = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
+            let _listener = server.listen(80)?;
+            let to: SocketAddr = "10.0.0.1:80".parse().unwrap();
+            let p1: SocketAddr = "10.0.0.2:1000".parse().unwrap();
+            let p2: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+            raw.send(segment(p1, to, 7, 0, 0x02));
+            let isn1 = syn_ack_isn(&mut raw, &fcx, 1000).await;
+            raw.send(segment(p2, to, 7, 0, 0x02));
+            let _isn2 = syn_ack_isn(&mut raw, &fcx, 2000).await;
+            // Reset the first handshake: its socket goes back to LISTEN and
+            // becomes the spare.
+            raw.send(segment(p1, to, 8, isn1.wrapping_add(1), 0x04));
+            fcx.sleep(Duration::from_millis(100)).await?;
+            // The peer retransmits its SYN for p2.
+            raw.send(segment(p2, to, 7, 0, 0x02));
+            fcx.sleep(Duration::from_millis(100)).await?;
+            let st = server.shared.state.lock().unwrap();
+            let for_p2 = st.conns.values().filter(|c| c.remote == p2).count();
+            drop(st);
+            assert_eq!(for_p2, 1, "one socket per tuple");
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
+        }));
+        assert_eq!(result.unwrap_err().to_string(), "done");
+    }
+
+    #[test]
+    fn out_of_window_rst_keeps_the_connection_open() {
+        let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (mut raw, side) = pair();
+            let server = endpoint(&fcx, side, "10.0.0.1".parse().unwrap());
+            let mut listener = server.listen(80)?;
+            let to: SocketAddr = "10.0.0.1:80".parse().unwrap();
+            let peer: SocketAddr = "10.0.0.2:3000".parse().unwrap();
+            raw.send(segment(peer, to, 7, 0, 0x02));
+            let isn = syn_ack_isn(&mut raw, &fcx, 3000).await;
+            raw.send(segment(peer, to, 8, isn.wrapping_add(1), 0x10));
+            let conn = listener.accept(&fcx).await?;
+            // A RST far outside the receive window.
+            raw.send(segment(peer, to, 8u32.wrapping_add(0x4000_0000), 0, 0x04));
+            fcx.sleep(Duration::from_millis(50)).await?;
+            let gone = std::future::poll_fn(|cx| Poll::Ready(conn.poll_gone(cx).is_ready())).await;
+            let state = {
+                let st = server.shared.state.lock().unwrap();
+                st.get(conn.handle).state()
+            };
+            assert_eq!(state, TcpState::Established);
+            assert!(!gone, "an out-of-window RST was taken as a reset");
+            Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
+        }));
+        assert_eq!(result.unwrap_err().to_string(), "done");
+    }
+    #[test]
+    fn rejected_fin_does_not_mark_the_receive_side_closed() {
+        let result = block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (mut raw, side) = pair();
+            let server = endpoint(&fcx, side, "10.0.0.1".parse()?);
+            let mut listener = server.listen(80)?;
+            let to: SocketAddr = "10.0.0.1:80".parse()?;
+            let peer: SocketAddr = "10.0.0.2:3000".parse()?;
+            raw.send(segment(peer, to, 7, 0, 0x02));
+            let isn = syn_ack_isn(&mut raw, &fcx, 3000).await;
+            raw.send(segment(peer, to, 8, isn.wrapping_add(1), 0x10));
+            let conn = listener.accept(&fcx).await?;
+            raw.send(segment(
+                peer,
+                to,
+                8u32.wrapping_add(0x4000_0000),
+                isn.wrapping_add(1),
+                0x11,
+            ));
+            fcx.sleep(Duration::from_millis(50)).await?;
+            let (state, fin, fin_at) = {
+                let st = server.shared.state.lock().unwrap();
+                let state = st.get(conn.handle).state();
+                let c = &st.conns[&conn.handle];
+                (state, c.fin, c.fin_at)
+            };
+            assert_eq!(state, TcpState::Established);
+            assert!(!fin);
+            assert_eq!(fin_at, None);
             Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
         }));
         assert_eq!(result.unwrap_err().to_string(), "done");

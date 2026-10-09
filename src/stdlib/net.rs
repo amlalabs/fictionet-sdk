@@ -700,7 +700,8 @@ impl Net {
     /// and the LAN name in `lan`.
     ///
     /// [`start`](Net::start) fails if `prefix` overlaps the sandboxes'
-    /// subnets or another LAN, or leaves no room for members.
+    /// subnets, the automatic address pools (`198.18.0.0/15` and
+    /// `2001:2::/48`), or another LAN, or leaves no room for members.
     pub fn lan(mut self, name: &str, prefix: Prefix) -> Net {
         self.lans.push((name.to_owned(), prefix.canonical()));
         self
@@ -1208,6 +1209,20 @@ fn make_lans(
     });
     let mut made: BTreeMap<String, LanSeg> = BTreeMap::new();
     for (name, prefix) in lans {
+        let pool4 = Prefix {
+            addr: Ipv4Addr::from(AUTO_BASE).into(),
+            len: 15,
+        };
+        let pool6 = Prefix {
+            addr: Ipv6Addr::from(AUTO6_BASE).into(),
+            len: AUTO6_LEN,
+        };
+        if overlap(&prefix, &pool4) || overlap(&prefix, &pool6) {
+            return Err(fictionet::Error::msg(format!(
+                "LAN {name}: {}/{} overlaps the automatic address pool",
+                prefix.addr, prefix.len
+            )));
+        }
         let max = if prefix.addr.is_ipv4() { 30 } else { 126 };
         if prefix.len > max {
             return Err(fictionet::Error::msg(format!(

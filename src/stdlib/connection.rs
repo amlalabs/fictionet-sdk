@@ -91,7 +91,9 @@ pub trait Connection: Send + 'static {
     /// After `Poll::Pending`, call again with the same bytes until the call
     /// returns `Poll::Ready`. A layer may already hold those bytes while it
     /// waits for the connection underneath. A TLS connection, for example,
-    /// has encrypted them and reports them taken once they are sent.
+    /// has encrypted them and reports them taken once they are sent. If a
+    /// pending write is dropped, its bytes may still be sent. A later write
+    /// with different bytes must report only bytes from that later call.
     ///
     /// Never returns `Ok(0)` when `data` is not empty: a connection that can
     /// take no more bytes ever returns an error instead.

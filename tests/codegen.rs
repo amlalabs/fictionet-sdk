@@ -282,6 +282,7 @@ fn differential_fixture_matches_programmatic_ir() {
                 name: "Choice".into(),
                 doc: String::new(),
                 definition: Definition::Enum {
+                    open: false,
                     repr: Primitive::I32,
                     variants: [("negative", -1), ("zero", 0), ("positive", 1)]
                         .into_iter()

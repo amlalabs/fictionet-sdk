@@ -6,8 +6,8 @@
 //! one-line summary, a [`Level`], the connection it came from
 //! ([`ConnInfo`]), and named [`Fields`] whose values are JSON. Services,
 //! the network and the core's own pieces (a [bottleneck] that drops a
-//! packet, a [router] that loses a route, a LAN, the TLS server keeping
-//! session keys) all record events, and so can world code:
+//! packet, a [router] that loses a route, a LAN) all record events, and so
+//! can world code:
 //!
 //! ```
 //! use fictionet::events::{Event, Level};

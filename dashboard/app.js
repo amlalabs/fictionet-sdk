@@ -1674,7 +1674,7 @@ function linkButton(text, onClick) {
 
 function eventsList(parent, events) {
   if (!events.length) {
-    el('p', { class: 'quiet', text: 'Nothing recorded yet. Services record what they see, bottlenecks and LANs the packets they drop, routers the routes they lose, TLS its session keys, and world code its own events.' }, parent);
+    el('p', { class: 'quiet', text: 'Nothing recorded yet. Services record what they see, bottlenecks and LANs the packets they drop, routers the routes they lose, and world code its own events.' }, parent);
     return;
   }
   const ul = el('ul', { class: 'rows' }, parent);

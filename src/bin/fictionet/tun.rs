@@ -15,6 +15,7 @@ use crate::world::{self, Failure, Greeting, context, err};
 
 /// Runs attach to the end. `Ok` means the world closed the connection.
 pub(crate) fn run(args: AttachArgs) -> Result<(), Failure> {
+    let resolv_path = resolv_conf_path(&args).map_err(|e| Failure::Error(e.to_string()))?;
     world::clear_ready_file(args.ready_file.as_deref());
 
     // Enter the sandbox's namespace first, so the device is made there.
@@ -43,7 +44,7 @@ pub(crate) fn run(args: AttachArgs) -> Result<(), Failure> {
     })?;
     eprintln!("fictionet attach: {} attached as {dev}", args.name);
 
-    if let Some(path) = resolv_conf_path(&args) {
+    if let Some(path) = resolv_path {
         write_resolv_conf(&path, &args.dns_servers()).map_err(|e| {
             Failure::Error(format!(
                 "writing the DNS servers to {}: {e}. Give --resolv-conf another path, or \
@@ -300,17 +301,30 @@ fn default_route_error(e: io::Error, family: &str) -> io::Error {
 
 /// Where `--dns` goes: the `--resolv-conf` path, nowhere with
 /// `--no-resolv-conf`, and otherwise attach's own `/etc/resolv.conf`, or with
-/// `--netns`, `/etc/netns/<name>/resolv.conf`, which `ip netns exec` mounts
-/// over `/etc/resolv.conf`.
-fn resolv_conf_path(args: &AttachArgs) -> Option<PathBuf> {
-    match &args.resolv_conf {
+/// a named `--netns`, `/etc/netns/<name>/resolv.conf`, which `ip netns exec`
+/// mounts over `/etc/resolv.conf`. Other namespaces require an explicit policy.
+fn resolv_conf_path(args: &AttachArgs) -> io::Result<Option<PathBuf>> {
+    Ok(match &args.resolv_conf {
         ResolvConf::Off => None,
         ResolvConf::Path(path) => Some(path.clone()),
-        ResolvConf::Default => Some(match args.netns.as_ref().and_then(|p| p.file_name()) {
-            Some(name) => Path::new("/etc/netns").join(name).join("resolv.conf"),
+        ResolvConf::Default => Some(match &args.netns {
             None => PathBuf::from("/etc/resolv.conf"),
+            Some(path) if matches!(path.parent(), Some(p) if p == Path::new("/run/netns") || p == Path::new("/var/run/netns")) => {
+                Path::new("/etc/netns")
+                    .join(
+                        path.file_name()
+                            .ok_or_else(|| io::Error::other("missing namespace name"))?,
+                    )
+                    .join("resolv.conf")
+            }
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--netns outside /run/netns or /var/run/netns requires --resolv-conf or --no-resolv-conf",
+                ));
+            }
         }),
-    }
+    })
 }
 
 pub(crate) fn resolv_conf(servers: &[IpAddr]) -> String {
@@ -488,14 +502,21 @@ mod tests {
         let mut v: Vec<String> = line.split_whitespace().map(String::from).collect();
         let a = parse_run(&v);
         assert_eq!(
-            resolv_conf_path(&a),
+            resolv_conf_path(&a).unwrap(),
             Some(PathBuf::from("/etc/resolv.conf"))
         );
         v.extend(["--netns".into(), "/run/netns/abc".into()]);
         let a = parse_run(&v);
         assert_eq!(
-            resolv_conf_path(&a),
+            resolv_conf_path(&a).unwrap(),
             Some(PathBuf::from("/etc/netns/abc/resolv.conf"))
+        );
+
+        let mut alias = v.clone();
+        *alias.last_mut().unwrap() = "/var/run/netns/abc".into();
+        assert_eq!(
+            resolv_conf_path(&parse_run(&alias)).unwrap(),
+            Some("/etc/netns/abc/resolv.conf".into())
         );
 
         // --resolv-conf wins, with or without --netns.
@@ -503,14 +524,38 @@ mod tests {
         w.extend(["--resolv-conf".into(), "/run/agent/resolv.conf".into()]);
         let a = parse_run(&w);
         assert_eq!(
-            resolv_conf_path(&a),
+            resolv_conf_path(&a).unwrap(),
             Some(PathBuf::from("/run/agent/resolv.conf"))
         );
 
         // --no-resolv-conf: no file at all.
         v.push("--no-resolv-conf".into());
         let a = parse_run(&v);
-        assert_eq!(resolv_conf_path(&a), None);
+        assert_eq!(resolv_conf_path(&a).unwrap(), None);
+    }
+
+    #[test]
+    fn unnamed_netns_requires_explicit_resolver_policy() {
+        let line = "--world unix:/w --name a --type tun --no-ip-addr --no-gateway --no-dns \
+                    --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6 --netns /proc/1234/ns/net";
+        let v: Vec<String> = line.split_whitespace().map(String::from).collect();
+        let a = parse_run(&v);
+        let error = resolv_conf_path(&a).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("--resolv-conf or --no-resolv-conf")
+        );
+        let mut explicit = v.clone();
+        explicit.extend(["--resolv-conf".into(), "/tmp/resolv.conf".into()]);
+        assert_eq!(
+            resolv_conf_path(&parse_run(&explicit)).unwrap(),
+            Some("/tmp/resolv.conf".into())
+        );
+        let mut off = v;
+        off.push("--no-resolv-conf".into());
+        assert_eq!(resolv_conf_path(&parse_run(&off)).unwrap(), None);
     }
 
     #[test]

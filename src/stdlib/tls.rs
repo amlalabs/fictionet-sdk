@@ -951,7 +951,7 @@ impl<C: Connection> ClientHello<C> {
             out_pos: 0,
             eof: false,
         };
-        let config = fictionet::observe::observed_config(fcx, config, self.server_name.as_deref());
+        let config = fictionet::observe::observed_config(fcx, config);
         let mut tls = match with_context(fcx, || self.accepted.into_connection(config)) {
             Ok(tls) => tls,
             Err((e, mut alert)) => {
@@ -1011,7 +1011,7 @@ pub struct TlsConnection<C> {
     tls: ServerConnection,
     /// Plaintext rustls has encrypted for an earlier `poll_write` whose
     /// output `conn` has not taken yet. Reported as taken once it has.
-    taken: Option<usize>,
+    taken: Option<Vec<u8>>,
     /// `close_notify` is queued.
     closing: bool,
 }
@@ -1097,15 +1097,19 @@ impl<C: Connection> Connection for TlsConnection<C> {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<Result<usize, ConnError>> {
-        if let Some(n) = self.taken {
-            // The caller retries the same bytes; they are already encrypted.
-            return match self.io.poll_flush(fcx, cx) {
+        if let Some(previous) = self.taken.as_ref() {
+            let same = data.starts_with(previous);
+            let n = previous.len();
+            // Credit an earlier write only when these are its bytes.
+            match self.io.poll_flush(fcx, cx) {
                 Poll::Ready(Ok(())) => {
                     self.taken = None;
-                    Poll::Ready(Ok(n))
+                    if same {
+                        return Poll::Ready(Ok(n));
+                    }
                 }
-                other => other.map(|r| r.map(|()| 0)),
-            };
+                other => return other.map(|r| r.map(|()| 0)),
+            }
         }
         if self.closing {
             return Poll::Ready(Err(ConnError::Closed));
@@ -1127,7 +1131,7 @@ impl<C: Connection> Connection for TlsConnection<C> {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
-                self.taken = Some(n);
+                self.taken = Some(chunk[..n].to_vec());
                 Poll::Pending
             }
         }

@@ -268,7 +268,7 @@ fn validate_inner(schema: &mut Schema, limits: Limits) -> Result<Validated, Erro
             let kind = match &t.definition {
                 Definition::Struct(_) => Kind::Struct,
                 Definition::Block { length, .. } => Kind::Block(*length),
-                Definition::Enum { repr, variants } => Kind::Enum(
+                Definition::Enum { repr, variants, .. } => Kind::Enum(
                     *repr,
                     variants.iter().map(|v| (v.name.clone(), v.value)).collect(),
                 ),
@@ -318,13 +318,17 @@ fn validate_inner(schema: &mut Schema, limits: Limits) -> Result<Validated, Erro
                     }
                 }
             }
-            Definition::Enum { repr, variants } => {
+            Definition::Enum {
+                repr,
+                variants,
+                open,
+            } => {
                 fields += variants.len();
                 scope(
                     variants.iter().map(|v| v.name.as_str()),
                     IdentifierCase::Type,
                     &path,
-                    &[],
+                    if *open { &["Unknown"] } else { &[] },
                 )?;
                 if repr.is_float() || variants.is_empty() {
                     return Err(err(

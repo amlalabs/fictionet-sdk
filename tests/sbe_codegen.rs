@@ -292,7 +292,7 @@ impl Gen<'_> {
                 }
             }
             Type::Ref(name) => match &self.ir.get(name).definition {
-                Definition::Enum { repr, variants } => {
+                Definition::Enum { repr, variants, .. } => {
                     let v = &variants[self.rng.index(variants.len())];
                     toks.push(Tok::Ident(
                         rust_identifier(&v.name, IdentifierCase::Type).unwrap(),
@@ -435,9 +435,14 @@ fn sbe_value(ty: &Type, v: &sbe::Value, ir: &Ir<'_>, toks: &mut Vec<Tok>) {
         }
         (Type::Ref(n), Value::Enum(name)) => {
             assert!(matches!(ir.get(n).definition, Definition::Enum { .. }));
-            toks.push(Tok::Ident(
-                rust_identifier(name, IdentifierCase::Type).unwrap(),
-            ));
+            toks.push(Tok::Ident({
+                let rust = rust_identifier(name, IdentifierCase::Type).unwrap();
+                if rust == "Unknown" {
+                    "UnknownValue".into()
+                } else {
+                    rust
+                }
+            }));
         }
         (Type::Ref(_), Value::Set(bits)) => toks.push(Tok::Int(i128::from(*bits))),
         (Type::Ref(n), Value::Composite(members)) => sbe_fields(ir.get(n), members, ir, toks),
@@ -472,6 +477,7 @@ struct Stats {
     agreed: usize,
     refused: usize,
     older: usize,
+    unknown: usize,
 }
 
 fn differential<M>(xml: &str, rounds: usize) -> Stats
@@ -531,7 +537,8 @@ where
             assert_eq!(read, value, "{}", case.name);
 
             // Mutated bytes: both accept the same values or both refuse,
-            // except that only the runtime reads versions before 13.
+            // except that only the runtime reads versions before 13 and only
+            // generated enums preserve unknown values.
             for _ in 0..16 {
                 let mut bad = if rng.coin() {
                     bytes.clone()
@@ -552,6 +559,11 @@ where
                             case.name
                         );
                         stats.agreed += 1;
+                    }
+                    (Ok(g), Err(sbe::Error::Value)) if format!("{g:?}").contains("Unknown(") => {
+                        let encoded = g.to_bytes().unwrap();
+                        assert_eq!(M::parse(&encoded).unwrap(), g);
+                        stats.unknown += 1;
                     }
                     (Err(_), Err(_)) => stats.refused += 1,
                     (Err(_), Ok(m)) if m.header.version < version => stats.older += 1,

@@ -207,8 +207,6 @@
 //! - A [LAN](crate::stdlib::route::lan) records the packets it drops
 //!   (`lan.drop`) and each member replaced or gone (`lan.member_replaced`,
 //!   `lan.member_removed`).
-//! - The [TLS](crate::stdlib::tls) server records each session whose keys
-//!   it kept for observers (`tls.keys`, see below).
 //!
 //! # Packets, decoding and decryption
 //!

@@ -3874,6 +3874,8 @@ pub enum AggressorFlag {
     NotAggressor,
     #[doc = "Aggressor"]
     Aggressor,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for AggressorFlag {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -3888,7 +3890,7 @@ impl __wire::Codec for AggressorFlag {
                     let value = Self::Aggressor;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -3897,6 +3899,7 @@ impl __wire::Codec for AggressorFlag {
             let v: u8 = match self {
                 Self::NotAggressor => 0,
                 Self::Aggressor => 1,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -3924,7 +3927,6 @@ impl fictionet::stdlib::codec::Wire for AggressorFlag {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -3945,6 +3947,8 @@ pub enum AggressorSide {
     Buy,
     #[doc = "Sell"]
     Sell,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for AggressorSide {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -3963,7 +3967,7 @@ impl __wire::Codec for AggressorSide {
                     let value = Self::Sell;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -3973,6 +3977,7 @@ impl __wire::Codec for AggressorSide {
                 Self::NoAggressor => 0,
                 Self::Buy => 1,
                 Self::Sell => 2,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -4004,7 +4009,6 @@ impl fictionet::stdlib::codec::Wire for AggressorSide {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -4023,6 +4027,8 @@ pub enum EventType {
     Activation,
     #[doc = "Last Eligible Trade Date"]
     LastEligibleTradeDate,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for EventType {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -4037,7 +4043,7 @@ impl __wire::Codec for EventType {
                     let value = Self::LastEligibleTradeDate;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -4046,6 +4052,7 @@ impl __wire::Codec for EventType {
             let v: u8 = match self {
                 Self::Activation => 5,
                 Self::LastEligibleTradeDate => 7,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -4073,7 +4080,6 @@ impl fictionet::stdlib::codec::Wire for EventType {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -4099,11 +4105,13 @@ pub enum HaltReason {
     #[doc = "Instrument Expiration"]
     InstrumentExpiration,
     #[doc = "Unknown"]
-    Unknown,
+    UnknownValue,
     #[doc = "Recovery In Process"]
     RecoveryInProcess,
     #[doc = "Trade Date Roll"]
     TradeDateRoll,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for HaltReason {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -4131,7 +4139,7 @@ impl __wire::Codec for HaltReason {
                     Ok(value)
                 }
                 5 => {
-                    let value = Self::Unknown;
+                    let value = Self::UnknownValue;
                     Ok(value)
                 }
                 6 => {
@@ -4142,7 +4150,7 @@ impl __wire::Codec for HaltReason {
                     let value = Self::TradeDateRoll;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -4154,9 +4162,10 @@ impl __wire::Codec for HaltReason {
                 Self::MarketEvent => 2,
                 Self::InstrumentActivation => 3,
                 Self::InstrumentExpiration => 4,
-                Self::Unknown => 5,
+                Self::UnknownValue => 5,
                 Self::RecoveryInProcess => 6,
                 Self::TradeDateRoll => 7,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -4187,7 +4196,7 @@ impl __wire::Codec for HaltReason {
                     Ok(value)
                 }
                 5 => {
-                    let value = Self::Unknown;
+                    let value = Self::UnknownValue;
                     Ok(value)
                 }
                 6 => {
@@ -4208,7 +4217,6 @@ impl fictionet::stdlib::codec::Wire for HaltReason {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -4227,6 +4235,8 @@ pub enum LegSide {
     BuySide,
     #[doc = "Sell Side"]
     SellSide,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for LegSide {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -4241,7 +4251,7 @@ impl __wire::Codec for LegSide {
                     let value = Self::SellSide;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -4250,6 +4260,7 @@ impl __wire::Codec for LegSide {
             let v: u8 = match self {
                 Self::BuySide => 1,
                 Self::SellSide => 2,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -4277,7 +4288,6 @@ impl fictionet::stdlib::codec::Wire for LegSide {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -4332,6 +4342,8 @@ pub enum MdEntryType {
     MarketBestOffer,
     #[doc = "Market Best Bid"]
     MarketBestBid,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for MdEntryType {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -4418,7 +4430,7 @@ impl __wire::Codec for MdEntryType {
                     let value = Self::MarketBestBid;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -4445,6 +4457,7 @@ impl __wire::Codec for MdEntryType {
                 Self::ThresholdLimitsandPriceBandVariation => 103,
                 Self::MarketBestOffer => 119,
                 Self::MarketBestBid => 120,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -4544,7 +4557,6 @@ impl fictionet::stdlib::codec::Wire for MdEntryType {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -4573,6 +4585,8 @@ pub enum MdEntryTypeBook {
     MarketBestOffer,
     #[doc = "Market Best Bid"]
     MarketBestBid,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for MdEntryTypeBook {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -4607,7 +4621,7 @@ impl __wire::Codec for MdEntryTypeBook {
                     let value = Self::MarketBestBid;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -4621,6 +4635,7 @@ impl __wire::Codec for MdEntryTypeBook {
                 Self::BookReset => 74,
                 Self::MarketBestOffer => 119,
                 Self::MarketBestBid => 120,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -4668,7 +4683,6 @@ impl fictionet::stdlib::codec::Wire for MdEntryTypeBook {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -4691,6 +4705,8 @@ pub enum MdEntryTypeDailyStatistics {
     OpenInterest,
     #[doc = "Fixing Price"]
     FixingPrice,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for MdEntryTypeDailyStatistics {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -4713,7 +4729,7 @@ impl __wire::Codec for MdEntryTypeDailyStatistics {
                     let value = Self::FixingPrice;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -4724,6 +4740,7 @@ impl __wire::Codec for MdEntryTypeDailyStatistics {
                 Self::ClearedVolume => 66,
                 Self::OpenInterest => 67,
                 Self::FixingPrice => 87,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -4759,7 +4776,6 @@ impl fictionet::stdlib::codec::Wire for MdEntryTypeDailyStatistics {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -4786,6 +4802,8 @@ pub enum MdEntryTypeStatistics {
     HighestBid,
     #[doc = "Lowest Offer"]
     LowestOffer,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for MdEntryTypeStatistics {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -4816,7 +4834,7 @@ impl __wire::Codec for MdEntryTypeStatistics {
                     let value = Self::LowestOffer;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -4829,6 +4847,7 @@ impl __wire::Codec for MdEntryTypeStatistics {
                 Self::Vwap => 57,
                 Self::HighestBid => 78,
                 Self::LowestOffer => 79,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -4872,7 +4891,6 @@ impl fictionet::stdlib::codec::Wire for MdEntryTypeStatistics {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -4899,6 +4917,8 @@ pub enum MdUpdateAction {
     DeleteFrom,
     #[doc = "Overlay"]
     Overlay,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for MdUpdateAction {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -4929,7 +4949,7 @@ impl __wire::Codec for MdUpdateAction {
                     let value = Self::Overlay;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -4942,6 +4962,7 @@ impl __wire::Codec for MdUpdateAction {
                 Self::DeleteThru => 3,
                 Self::DeleteFrom => 4,
                 Self::Overlay => 5,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -4985,7 +5006,6 @@ impl fictionet::stdlib::codec::Wire for MdUpdateAction {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -5004,6 +5024,8 @@ pub enum MoneyOrPar {
     Money,
     #[doc = "Par Filled"]
     Par,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for MoneyOrPar {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -5018,7 +5040,7 @@ impl __wire::Codec for MoneyOrPar {
                     let value = Self::Par;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -5027,6 +5049,7 @@ impl __wire::Codec for MoneyOrPar {
             let v: u8 = match self {
                 Self::Money => 1,
                 Self::Par => 2,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -5054,7 +5077,6 @@ impl fictionet::stdlib::codec::Wire for MoneyOrPar {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -5081,6 +5103,8 @@ pub enum OpenCloseSettlFlag {
     RepoAverage10Am,
     #[doc = "Prev Session Repo Average 10 AM"]
     PrevSessionRepoAverage10Am,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for OpenCloseSettlFlag {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -5111,7 +5135,7 @@ impl __wire::Codec for OpenCloseSettlFlag {
                     let value = Self::PrevSessionRepoAverage10Am;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -5124,6 +5148,7 @@ impl __wire::Codec for OpenCloseSettlFlag {
                 Self::RepoAverage830Am => 101,
                 Self::RepoAverage10Am => 102,
                 Self::PrevSessionRepoAverage10Am => 103,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -5167,7 +5192,6 @@ impl fictionet::stdlib::codec::Wire for OpenCloseSettlFlag {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -5188,6 +5212,8 @@ pub enum OrderUpdateAction {
     Update,
     #[doc = "Delete"]
     Delete,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for OrderUpdateAction {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -5206,7 +5232,7 @@ impl __wire::Codec for OrderUpdateAction {
                     let value = Self::Delete;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -5216,6 +5242,7 @@ impl __wire::Codec for OrderUpdateAction {
                 Self::New => 0,
                 Self::Update => 1,
                 Self::Delete => 2,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -5247,7 +5274,6 @@ impl fictionet::stdlib::codec::Wire for OrderUpdateAction {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -5270,6 +5296,8 @@ pub enum PriceSource {
     Refinitiv,
     #[doc = "Icap Market Data Feed"]
     Icap,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for PriceSource {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -5292,7 +5320,7 @@ impl __wire::Codec for PriceSource {
                     let value = Self::Icap;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -5303,6 +5331,7 @@ impl __wire::Codec for PriceSource {
                 Self::Globex => 1,
                 Self::Refinitiv => 2,
                 Self::Icap => 3,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -5338,7 +5367,6 @@ impl fictionet::stdlib::codec::Wire for PriceSource {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -5357,6 +5385,8 @@ pub enum PutOrCall {
     Put,
     #[doc = "Call Option"]
     Call,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for PutOrCall {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -5371,7 +5401,7 @@ impl __wire::Codec for PutOrCall {
                     let value = Self::Call;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -5380,6 +5410,7 @@ impl __wire::Codec for PutOrCall {
             let v: u8 = match self {
                 Self::Put => 0,
                 Self::Call => 1,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -5407,7 +5438,6 @@ impl fictionet::stdlib::codec::Wire for PutOrCall {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -5428,6 +5458,8 @@ pub enum RepoSubType {
     Gc,
     #[doc = "General Collateral Repo on a single or basket of eligible underlyings, allocation outside of BrokerTec, such as at the clearer, tri-party agent, etc."]
     GcForDbv,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for RepoSubType {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -5446,7 +5478,7 @@ impl __wire::Codec for RepoSubType {
                     let value = Self::GcForDbv;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -5456,6 +5488,7 @@ impl __wire::Codec for RepoSubType {
                 Self::Special => 0,
                 Self::Gc => 1,
                 Self::GcForDbv => 2,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -5487,7 +5520,6 @@ impl fictionet::stdlib::codec::Wire for RepoSubType {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -5506,6 +5538,8 @@ pub enum SecurityAltIdSource {
     Cusip,
     #[doc = "ISIN (12 char)"]
     Isin,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for SecurityAltIdSource {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -5520,7 +5554,7 @@ impl __wire::Codec for SecurityAltIdSource {
                     let value = Self::Isin;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -5529,6 +5563,7 @@ impl __wire::Codec for SecurityAltIdSource {
             let v: u8 = match self {
                 Self::Cusip => 1,
                 Self::Isin => 4,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -5556,7 +5591,6 @@ impl fictionet::stdlib::codec::Wire for SecurityAltIdSource {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -5583,6 +5617,8 @@ pub enum SecurityTradingEvent {
     ImpliedMatchingOff,
     #[doc = "End Of Workup"]
     EndOfWorkup,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for SecurityTradingEvent {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -5613,7 +5649,7 @@ impl __wire::Codec for SecurityTradingEvent {
                     let value = Self::EndOfWorkup;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -5626,6 +5662,7 @@ impl __wire::Codec for SecurityTradingEvent {
                 Self::ImpliedMatchingOn => 5,
                 Self::ImpliedMatchingOff => 6,
                 Self::EndOfWorkup => 7,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -5669,7 +5706,6 @@ impl fictionet::stdlib::codec::Wire for SecurityTradingEvent {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -5710,6 +5746,8 @@ pub enum SecurityTradingStatus {
     PrivateWorkup,
     #[doc = "Public Workup"]
     PublicWorkup,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for SecurityTradingStatus {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -5768,7 +5806,7 @@ impl __wire::Codec for SecurityTradingStatus {
                     let value = Self::PublicWorkup;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -5788,6 +5826,7 @@ impl __wire::Codec for SecurityTradingStatus {
                 Self::NoChange => 103,
                 Self::PrivateWorkup => 201,
                 Self::PublicWorkup => 202,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -5859,7 +5898,6 @@ impl fictionet::stdlib::codec::Wire for SecurityTradingStatus {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -5880,6 +5918,8 @@ pub enum SecurityUpdateAction {
     Delete,
     #[doc = "Modify"]
     Modify,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for SecurityUpdateAction {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -5898,7 +5938,7 @@ impl __wire::Codec for SecurityUpdateAction {
                     let value = Self::Modify;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -5908,6 +5948,7 @@ impl __wire::Codec for SecurityUpdateAction {
                 Self::Add => 65,
                 Self::Delete => 68,
                 Self::Modify => 77,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -5939,7 +5980,6 @@ impl fictionet::stdlib::codec::Wire for SecurityUpdateAction {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -5958,6 +5998,8 @@ pub enum Side {
     Buy,
     #[doc = "Sell"]
     Sell,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for Side {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -5972,7 +6014,7 @@ impl __wire::Codec for Side {
                     let value = Self::Sell;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -5981,6 +6023,7 @@ impl __wire::Codec for Side {
             let v: u8 = match self {
                 Self::Buy => 1,
                 Self::Sell => 2,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -6008,7 +6051,6 @@ impl fictionet::stdlib::codec::Wire for Side {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -6031,6 +6073,8 @@ pub enum WorkupTradingStatus {
     PrivateWorkup,
     #[doc = "Public Workup"]
     PublicWorkup,
+    /// A value absent from this schema.
+    Unknown(u8),
 }
 impl __wire::Codec for WorkupTradingStatus {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
@@ -6053,7 +6097,7 @@ impl __wire::Codec for WorkupTradingStatus {
                     let value = Self::PublicWorkup;
                     Ok(value)
                 }
-                _ => Err(Error::Value),
+                raw => Ok(Self::Unknown(raw)),
             }
         })
     }
@@ -6064,6 +6108,7 @@ impl __wire::Codec for WorkupTradingStatus {
                 Self::NotAvailableForTrading => 18,
                 Self::PrivateWorkup => 201,
                 Self::PublicWorkup => 202,
+                Self::Unknown(raw) => *raw,
             };
             w.scalar(v, le)
         })
@@ -6099,7 +6144,6 @@ impl fictionet::stdlib::codec::Wire for WorkupTradingStatus {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
     }
@@ -6792,7 +6836,6 @@ impl fictionet::stdlib::codec::Wire for SecurityStatus30 {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -6878,7 +6921,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshVolume37 {
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -6973,7 +7015,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshVolume37NoMdEntries 
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -7258,7 +7299,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshBook46 {
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -7390,7 +7430,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshBook46NoMdEntries {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -7489,7 +7528,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshBook46NoOrderIdEntri
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -7574,7 +7612,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshOrderBook47 {
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -7690,7 +7727,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshOrderBook47NoMdEntri
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -7783,7 +7819,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshTradeSummary48 {
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -7911,7 +7946,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshTradeSummary48NoMdEn
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -8070,7 +8104,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshDailyStatistics49 {
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -8196,7 +8229,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshDailyStatistics49NoM
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -8471,7 +8503,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshSessionStatistics51 
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -8587,7 +8618,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshSessionStatistics51N
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -8745,7 +8775,6 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefresh52 {
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -8871,7 +8900,6 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefresh52NoMdEntries {
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -8989,7 +9017,6 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshOrderBook53 {
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -9089,7 +9116,6 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshOrderBook53NoMdEntrie
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -9547,7 +9573,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionFuture54 {
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -9625,7 +9650,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionFuture54NoEvents {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -10299,7 +10323,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionOption55 {
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -10377,7 +10400,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionOption55NoEvents {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -11199,7 +11221,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionSpread56 {
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -11277,7 +11298,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionSpread56NoEvents {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -11596,7 +11616,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionSpread56NoLegs {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -12110,7 +12129,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionFixedIncome57 {
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -12188,7 +12206,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionFixedIncome57NoEve
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -12878,7 +12895,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionRepo58 {
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -12956,7 +12972,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionRepo58NoEvents {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -13331,7 +13346,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionRepo58NoUnderlying
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -13602,7 +13616,6 @@ impl fictionet::stdlib::codec::Wire for SnapshotRefreshTopOrders59 {
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -13701,7 +13714,6 @@ impl fictionet::stdlib::codec::Wire for SnapshotRefreshTopOrders59NoMdEntries {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -13841,7 +13853,6 @@ impl fictionet::stdlib::codec::Wire for SecurityStatusWorkup60 {
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -13925,7 +13936,6 @@ impl fictionet::stdlib::codec::Wire for SecurityStatusWorkup60NoOrderIdEntries {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -14043,7 +14053,6 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshTcp61 {
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -14177,7 +14186,6 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshTcp61NoMdEntries {
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -14263,7 +14271,6 @@ impl fictionet::stdlib::codec::Wire for CollateralMarketValue62 {
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -14372,7 +14379,6 @@ impl fictionet::stdlib::codec::Wire for CollateralMarketValue62NoMdEntries {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -14855,7 +14861,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionFx63 {
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -14933,7 +14938,6 @@ impl fictionet::stdlib::codec::Wire for MdInstrumentDefinitionFx63NoEvents {
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -15336,7 +15340,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshBookLongQty64 {
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -15460,7 +15463,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshBookLongQty64NoMdEnt
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -15559,7 +15561,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshBookLongQty64NoOrder
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -15652,7 +15653,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshTradeSummaryLongQty6
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -15780,7 +15780,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshTradeSummaryLongQty6
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -15938,7 +15937,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshVolumeLongQty66 {
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -16033,7 +16031,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshVolumeLongQty66NoMdE
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -16117,7 +16114,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshSessionStatisticsLon
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -16233,7 +16229,6 @@ impl fictionet::stdlib::codec::Wire for MdIncrementalRefreshSessionStatisticsLon
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -16350,7 +16345,6 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshTcpLongQty68 {
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -16458,7 +16452,6 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshTcpLongQty68NoMdEntri
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -16615,7 +16608,6 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshLongQty69 {
     /// Refuses values above the declared resource limits.
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -16723,7 +16715,6 @@ impl fictionet::stdlib::codec::Wire for SnapshotFullRefreshLongQty69NoMdEntries 
 
     /// Reads one exact value. Refuses truncation and trailing bytes.
     /// Refuses values above the declared resource limits.
-    /// Refuses unknown enum values.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, true)
@@ -17375,7 +17366,6 @@ impl fictionet::stdlib::codec::Wire for Message {
     /// Refuses entry counts above their limits.
     /// Refuses mismatched header values.
     /// Refuses undeclared set bits.
-    /// Refuses unknown enum values.
     /// Refuses unknown tags.
     /// Refuses values outside declared ranges.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {

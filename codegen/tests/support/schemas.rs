@@ -37,6 +37,7 @@ pub fn layout_schema(n: usize) -> Schema {
             named(
                 e.clone(),
                 Definition::Enum {
+                    open: false,
                     repr: Primitive::I64,
                     variants: vec![
                         Variant {

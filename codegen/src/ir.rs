@@ -378,8 +378,10 @@ pub struct Bit {
 pub enum Definition {
     /// Fields in wire order.
     Struct(Vec<Field>),
-    /// A closed integer enum. Unknown discriminants are refused.
+    /// An integer enum.
     Enum {
+        /// Whether unknown discriminants are preserved as raw values.
+        open: bool,
         /// Integer storage type.
         repr: Primitive,
         /// Unique names and discriminants; must not be empty.

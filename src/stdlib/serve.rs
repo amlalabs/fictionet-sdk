@@ -346,7 +346,7 @@ pub enum Ended {
     /// Reading or writing failed: the client reset the connection, or TLS
     /// broke ([`ConnError::Broken`]).
     Conn(ConnError),
-    /// The world is stopping: the region was cancelled. A notification
+    /// The connection's region was cancelled. A notification
     /// for [`Service::on_end`]; [`connection`] itself then returns
     /// [`ServeError::Cancelled`].
     Cancelled,
@@ -431,7 +431,8 @@ pub struct PendingDriver<'a> {
 
 impl PendingDriver<'_> {
     /// The connection's context, for async work. `None` in a [`Harness`]
-    /// made without one ([`Harness::with_fcx`]).
+    /// made without one ([`Harness::with_fcx`]). During [`connection`], cancelling
+    /// this context ends only this connection and its work.
     pub fn fcx(&self) -> Option<&Cx> {
         self.fcx
     }
@@ -1227,10 +1228,10 @@ pub enum ServeError<E> {
     Service(E),
     /// Ordered deferred work failed.
     Pending(fictionet::Error),
-    /// The [region](fictionet::Cx#regions) of the `Cx` passed to the call
-    /// was cancelled: the world is stopping. The service heard
-    /// [`Ended::Cancelled`] in [`Service::on_end`], unless the cancel came
-    /// during the TLS handshake, before the service started.
+    /// The connection's [region](fictionet::Cx#regions) or its parent was
+    /// cancelled. A running service hears [`Ended::Cancelled`] in
+    /// [`Service::on_end`]. Cancellation during the TLS handshake or while
+    /// the service is already ending closes the connection immediately.
     Cancelled,
 }
 
@@ -1839,7 +1840,12 @@ where
     /// The connection broke, or the world is stopping.
     fn broken(&mut self, end: Ended) {
         self.out.clear();
-        self.finish(end);
+        if matches!(self.state, State::Ending { .. }) {
+            self.cancel_all(true);
+            self.end_now(end);
+        } else {
+            self.finish(end);
+        }
     }
 
     /// Whether the driver has async work to poll.
@@ -2452,8 +2458,34 @@ async fn write_all<C: Connection>(
 ///
 /// `info` names the connection in events; [`listen`] fills it in. The
 /// connection ends as soon as the client resets it, even while deferred
-/// work runs and nothing reads ([`Connection::poll_gone`]).
+/// work runs and nothing reads ([`Connection::poll_gone`]). Deferred work
+/// receives a child region; cancelling it closes only this connection.
 pub async fn connection<S, C>(
+    fcx: &Cx,
+    conn: C,
+    info: ConnInfo,
+    service: &mut S,
+    state: &S::State,
+    opts: &ServeOptions,
+) -> Result<Served<Box<dyn Connection>>, ServeError<S::Error>>
+where
+    S: Service,
+    C: Connection,
+    <S::Decoder as Decode>::Error: Clone + Send,
+{
+    let mut result = None;
+    let slot = &mut result;
+    let _ = fcx
+        .region(|child| async move {
+            *slot = Some(serve_in_region(&child, conn, info, service, state, opts).await);
+            child.cancel();
+            Ok(())
+        })
+        .await;
+    result.expect("the connection region completed")
+}
+
+async fn serve_in_region<S, C>(
     fcx: &Cx,
     conn: C,
     info: ConnInfo,
