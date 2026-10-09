@@ -1,6 +1,11 @@
 //! Modbus/TCP: reading and writing frames, requests and responses, with no
 //! I/O.
 //!
+//! `Frame` implements `Wire` and supports `codec::Frames<Frame>`. Request and
+//! response helpers interpret its PDU. There is no device session, `Service`,
+//! register store, or live transport. The observe presenter is separate from
+//! this wire layer.
+//!
 //! Modbus is how most industrial equipment is read and controlled: a PLC
 //! holds coils (single bits it can switch) and registers (16-bit values),
 //! and a client reads and writes them by address. Modbus/TCP carries each
@@ -11,14 +16,10 @@
 //!
 //! Nothing here reads a socket. A world that plays a PLC pushes bytes
 //! from a [`tcp`](fictionet::stdlib::tcp) connection into a
-//! [`Stream<fictionet::stdlib::codec::Frames::<Frame>>`](fictionet::stdlib::codec::Stream), gets [`Frame`]s back, reads each one's [`Request`], and
+//! [`Stream<codec::Frames<Frame>>`](fictionet::stdlib::codec::Stream), gets [`Frame`]s back, reads each one's [`Request`], and
 //! writes the reply's bytes back to the connection. Which coils and
 //! registers exist, and what they hold, is up to world code. So is whether
 //! a write succeeds.
-//!
-//! To customize this protocol, copy this file into your crate and edit it.
-//! Keep its `fictionet::stdlib::...` imports and use the copy with [`Stream`](fictionet::stdlib::codec::Stream).
-//! The `custom_protocol` example adds a server reply for one planted register.
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. A request that breaks the specification becomes an
@@ -68,8 +69,9 @@
 //! ```
 
 #[cfg(test)]
-use fictionet::stdlib::codec::{Decode, Frames, Step};
-use fictionet::stdlib::codec::{Prefixed, Wire};
+use fictionet::stdlib::codec::Frames;
+use fictionet::stdlib::codec::Prefixed;
+use fictionet::stdlib::codec::{Wire, be16};
 
 /// The TCP port Modbus/TCP servers listen on.
 pub const PORT: u16 = 502;
@@ -105,7 +107,7 @@ pub const MAX_WRITE_BITS: u16 = 1968;
 pub const MAX_WRITE_REGISTERS: u16 = 123;
 
 /// One Modbus/TCP frame: the MBAP header's fields and the PDU it carries.
-/// The header's protocol identifier is always 0 and its length is worked
+/// The writer emits protocol identifier 0 and the header's length is worked
 /// out from the PDU, so neither is kept.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
@@ -123,7 +125,7 @@ pub struct Frame {
 /// Why bytes are not a Modbus/TCP frame or a response this module can
 /// read, or why a writer refused a value: its bytes would break the
 /// specification, or a reader would read them back as something else.
-/// After an error from [`fictionet::stdlib::codec::Frames::<Frame>`] the connection holds no more frames a
+/// After an error from [`codec::Frames<Frame>`](fictionet::stdlib::codec::Frames) the connection holds no more frames a
 /// reader can find, and a real server closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -142,8 +144,6 @@ pub enum Error {
     /// or a code this module reads as a typed request or response given to
     /// an `Other` variant.
     Function(u8),
-    /// The protocol identifier was not 0, so this is not Modbus.
-    Protocol(u16),
     /// The length field was below 2 (a unit and a function code) or above
     /// what a frame may hold.
     Length(u16),
@@ -163,7 +163,6 @@ impl std::fmt::Display for Error {
             Error::Quantity => f.write_str("a quantity outside what the function allows"),
             Error::Address => f.write_str("a range of addresses past 65535"),
             Error::Function(c) => write!(f, "function code {c} does not go with this value"),
-            Error::Protocol(p) => write!(f, "protocol identifier {p}, not 0 (Modbus)"),
             Error::Length(n) => write!(f, "length field {n}, outside 2..=254"),
             Error::Truncated => f.write_str("input ended before a complete Modbus frame"),
             Error::Trailing => f.write_str("bytes follow the Modbus frame"),
@@ -180,20 +179,9 @@ impl Frame {
     /// of `b` it took.
     pub fn parse_prefix(b: &[u8]) -> Result<Option<(Frame, usize)>, Error> {
         if b.len() < HEADER_LEN {
-            // A bad protocol identifier is known before the rest comes.
-            if b.len() >= 4 {
-                let protocol = be16(b, 2);
-                if protocol != 0 {
-                    return Err(Error::Protocol(protocol));
-                }
-            }
             return Ok(None);
         }
-        let protocol = be16(b, 2);
-        if protocol != 0 {
-            return Err(Error::Protocol(protocol));
-        }
-        let length = be16(b, 4);
+        let length = be16(b, 4).ok_or(Error::Truncated)?;
         if length < 2 || usize::from(length) > MAX_PDU + 1 {
             return Err(Error::Length(length));
         }
@@ -202,7 +190,7 @@ impl Frame {
             return Ok(None);
         }
         let frame = Frame {
-            transaction: be16(b, 0),
+            transaction: be16(b, 0).ok_or(Error::Truncated)?,
             unit: b[6],
             pdu: b[HEADER_LEN..end].to_vec(),
         };
@@ -213,23 +201,6 @@ impl Frame {
     /// [`Frame::parse_prefix`] always has one.
     pub fn function(&self) -> Option<u8> {
         self.pdu.first().copied()
-    }
-
-    // CUSTOM EDIT: serve holding register 42 with the planted value 0xc0de.
-    /// Answers a read of register 42; other requests get a protocol exception.
-    pub fn planted_reply(&self) -> Result<Frame, Error> {
-        let pdu = match Request::parse(&self.pdu) {
-            Ok(Request::ReadHoldingRegisters {
-                address: 42,
-                quantity: 1,
-            }) => Response::Registers(vec![0xc0de]).to_pdu(function::READ_HOLDING_REGISTERS)?,
-            Ok(Request::ReadHoldingRegisters { .. }) => {
-                Exception::IllegalDataAddress.to_pdu(function::READ_HOLDING_REGISTERS)
-            }
-            Ok(other) => Exception::IllegalFunction.to_pdu(other.function()),
-            Err(error) => error.to_pdu(self.function().unwrap_or(0)),
-        };
-        Ok(self.reply(pdu))
     }
 
     /// A frame that answers this one with `pdu`, with the same transaction
@@ -249,8 +220,8 @@ impl Wire for Frame {
 
     /// Reads exactly one frame. Returns [`Error::Truncated`] for
     /// incomplete input and [`Error::Trailing`] for trailing bytes.
-    /// A nonzero protocol ID or length outside 2..=254 returns
-    /// [`Error::Protocol`] or [`Error::Length`].
+    /// A length outside 2..=254 returns
+    /// [`Error::Length`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         match Self::parse_prefix(b)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
@@ -316,6 +287,9 @@ impl Prefixed for Frame {
         MAX_FRAME
     }
 
+    /// Reads one frame, accepting any protocol identifier.
+    /// A length outside 2..=254 returns [`Error::Length`]. Partial input
+    /// returns [`fictionet::stdlib::codec::Step::Need`], including at EOF.
     #[inline]
     fn parse_prefix(
         input: &[u8],
@@ -465,7 +439,10 @@ impl Request {
         };
         let read = |max: u16| -> Result<(u16, u16), Exception> {
             fixed(4)?;
-            let (address, quantity) = (be16(data, 0), be16(data, 2));
+            let (address, quantity) = (
+                be16(data, 0).ok_or(Exception::IllegalDataValue)?,
+                be16(data, 2).ok_or(Exception::IllegalDataValue)?,
+            );
             if quantity == 0 || quantity > max {
                 return Err(Exception::IllegalDataValue);
             }
@@ -491,21 +468,21 @@ impl Request {
             }
             function::WRITE_SINGLE_COIL => {
                 fixed(4)?;
-                let value = match be16(data, 2) {
+                let value = match be16(data, 2).ok_or(Exception::IllegalDataValue)? {
                     0xff00 => true,
                     0x0000 => false,
                     _ => return Err(Exception::IllegalDataValue),
                 };
                 Request::WriteSingleCoil {
-                    address: be16(data, 0),
+                    address: be16(data, 0).ok_or(Exception::IllegalDataValue)?,
                     value,
                 }
             }
             function::WRITE_SINGLE_REGISTER => {
                 fixed(4)?;
                 Request::WriteSingleRegister {
-                    address: be16(data, 0),
-                    value: be16(data, 2),
+                    address: be16(data, 0).ok_or(Exception::IllegalDataValue)?,
+                    value: be16(data, 2).ok_or(Exception::IllegalDataValue)?,
                 }
             }
             function::WRITE_MULTIPLE_COILS => {
@@ -520,8 +497,8 @@ impl Request {
                 let (address, quantity, bytes) =
                     multiple(data, MAX_WRITE_REGISTERS, |q| 2 * usize::from(q))?;
                 let values = (0..usize::from(quantity))
-                    .map(|i| be16(bytes, 2 * i))
-                    .collect();
+                    .map(|i| be16(bytes, 2 * i).ok_or(Exception::IllegalDataValue))
+                    .collect::<Result<_, _>>()?;
                 Request::WriteMultipleRegisters { address, values }
             }
             _ => Request::Other {
@@ -658,7 +635,10 @@ impl Response {
         };
         let pair = || {
             if data.len() == 4 {
-                Ok((be16(data, 0), be16(data, 2)))
+                Ok((
+                    be16(data, 0).ok_or(Error::Truncated)?,
+                    be16(data, 2).ok_or(Error::Truncated)?,
+                ))
             } else {
                 Err(Error::BadResponse)
             }
@@ -840,7 +820,11 @@ fn multiple(
     if data.len() < 5 {
         return Err(Exception::IllegalDataValue);
     }
-    let (address, quantity, count) = (be16(data, 0), be16(data, 2), usize::from(data[4]));
+    let (address, quantity, count) = (
+        be16(data, 0).ok_or(Exception::IllegalDataValue)?,
+        be16(data, 2).ok_or(Exception::IllegalDataValue)?,
+        usize::from(data[4]),
+    );
     if quantity == 0 || quantity > max || count != need(quantity) || data.len() != 5 + count {
         return Err(Exception::IllegalDataValue);
     }
@@ -869,16 +853,14 @@ fn pack_bits(bits: &[bool]) -> Vec<u8> {
     out
 }
 
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::{Decode, Step};
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump, try_pump};
     use fictionet::stdlib::test_support;
     use fictionet::stdlib::test_support::contract;
+    use fictionet::stdlib::test_support::{assert_linear, rounds};
 
     // Examples from the Modbus Application Protocol Specification v1.1b3,
     // section 6.
@@ -1083,8 +1065,11 @@ mod tests {
         for n in 0..12 {
             assert_eq!(Frame::parse_prefix(&bytes[..n]), Ok(None), "{n} bytes");
         }
-        // Not Modbus, known from the first four bytes.
-        assert_eq!(Frame::parse_prefix(&[0, 1, 0, 5]), Err(Error::Protocol(5)));
+        // A nonzero identifier is accepted; this header still needs bytes.
+        assert_eq!(Frame::parse_prefix(&[0, 1, 0, 5]), Ok(None));
+        let mut gateway = bytes[..12].to_vec();
+        gateway[3] = 5;
+        assert_eq!(Frame::parse_prefix(&gateway), Ok(Some((frame.clone(), 12))));
         // Lengths out of range.
         assert_eq!(
             Frame::parse_prefix(&[0, 1, 0, 0, 0, 1, 1]),
@@ -1127,7 +1112,7 @@ mod tests {
             }
         }
         for (bytes, error) in [
-            (&[0, 1, 0, 5][..], Error::Protocol(5)),
+            (&[0, 1, 0, 5][..], Error::Truncated),
             (&[0, 1, 0, 0, 0, 1, 1][..], Error::Length(1)),
             (&[0, 1, 0, 0, 0xff, 0xff, 1][..], Error::Length(u16::MAX)),
         ] {
@@ -1254,7 +1239,7 @@ mod tests {
             Ok(Step::Item(frame, bytes.len()))
         );
         for (bad, error) in [
-            (&[0, 1, 0, 5][..], Error::Protocol(5)),
+            (&[0, 1, 0, 5, 0, 0, 1][..], Error::Length(0)),
             (&[0, 1, 0, 0, 0, 0, 1][..], Error::Length(0)),
             (&[0, 1, 0, 0, 0, 1, 1][..], Error::Length(1)),
             (&[0, 1, 0, 0, 0, 255, 1][..], Error::Length(255)),
@@ -1447,46 +1432,41 @@ mod tests {
         assert_eq!(got, [1, 2]);
         assert_eq!(d.buffered(), 0);
         // A broken stream stays broken.
-        assert_eq!(d.push(&[0, 3, 0, 9, 0, 6, 1, 3, 0, 0, 0, 1]), 12);
-        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::Protocol(9)))));
+        assert_eq!(d.push(&[0, 3, 0, 9, 0, 0, 1, 3, 0, 0, 0, 1]), 12);
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::Length(0)))));
         // Bytes after the break are taken and dropped.
         assert_eq!(d.push(&a), a.len());
         assert_eq!(d.next(), None);
-        assert_eq!(d.failed(), Some(&Fail::Protocol(Error::Protocol(9))));
+        assert_eq!(d.failed(), Some(&Fail::Protocol(Error::Length(0))));
     }
 
     #[test]
     fn stream_takes_many_small_frames_in_linear_time() {
-        let one = Frame {
-            transaction: 1,
-            unit: 1,
-            pdu: vec![3, 0, 0, 0, 1],
-        }
-        .to_bytes()
-        .unwrap();
-        let stream: Vec<u8> = one
-            .iter()
-            .copied()
-            .cycle()
-            .take(one.len() * 200_000)
-            .collect();
-        let started = std::time::Instant::now();
-        let mut d = Stream::new(Frames::<Frame>::new());
-        let mut rest = &stream[..];
-        let mut n = 0;
-        while !rest.is_empty() {
-            rest = &rest[d.push(rest)..];
-            while let Some(f) = d.next() {
-                f.unwrap();
-                n += 1;
-            }
-        }
-        assert_eq!(n, 200_000);
-        assert_eq!(d.buffered(), 0);
-        assert!(
-            started.elapsed().as_secs() < 5,
-            "took {:?}",
-            started.elapsed()
+        assert_linear(
+            "stream_takes_many_small_frames_in_linear_time",
+            rounds(50_000),
+            |size| {
+                let one = Frame {
+                    transaction: 1,
+                    unit: 1,
+                    pdu: vec![3, 0, 0, 0, 1],
+                }
+                .to_bytes()
+                .unwrap();
+                let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
+                let mut d = Stream::new(Frames::<Frame>::new());
+                let mut rest = &stream[..];
+                let mut n = 0;
+                while !rest.is_empty() {
+                    rest = &rest[d.push(rest)..];
+                    while let Some(f) = d.next() {
+                        f.unwrap();
+                        n += 1;
+                    }
+                }
+                assert_eq!(n, size);
+                assert_eq!(d.buffered(), 0);
+            },
         );
     }
 
