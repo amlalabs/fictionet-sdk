@@ -494,6 +494,3 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
         },
     );
 }
-
-// ---------------------------------------------------------------------------
-// A hyper client over a Connection

@@ -316,6 +316,7 @@ where
         },
     )
 }
+
 /// Checks decoding with an input allocation bound of twice the initial
 /// capacity. The decoder's capacity must stay fixed.
 pub fn check_decode_capacity<D: Decode>(

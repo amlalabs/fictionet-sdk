@@ -27,14 +27,11 @@ use fictionet::{Cx, Interface, Packet, RecvError, pair};
 use rustls::ClientConfig;
 
 // ---------------------------------------------------------------------------
-// A rustls client over any Connection.
+// Shared rustls client and payload pattern.
 
 #[path = "common/rustls_client.rs"]
 mod rustls_client;
 type Client<C> = rustls_client::Client<C, false>;
-
-// ---------------------------------------------------------------------------
-// Certificates: a world CA and a leaf for the server.
 
 #[path = "common/pattern.rs"]
 mod payload;
