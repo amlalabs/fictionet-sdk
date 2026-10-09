@@ -26,6 +26,21 @@ pub mod contract;
 ///     ("longer") => 6,
 /// }
 /// ```
+///
+/// Named rows bind an input pattern in a separate closure for each row.
+/// Input types are inferred independently, borrowed temporaries last through
+/// the assertion, and inputs are dropped before the next row. A failed
+/// assertion includes the row name.
+///
+/// ```
+/// fictionet::assert_cases!(|text| str::parse::<u8>(text);
+///     zero: "0" => Ok(0),
+///     maximum: "255" => Ok(255),
+/// );
+/// fictionet::assert_cases!(|(a, b)| a + b;
+///     sum: (2, 3) => 5,
+/// );
+/// ```
 #[macro_export]
 macro_rules! assert_cases {
     ($call:expr; $(($($arg:expr),+ $(,)?) => $expected:expr),+ $(,)?) => {
@@ -38,6 +53,12 @@ macro_rules! assert_cases {
                 stringify!($($arg),+)
             );
         )+
+    };
+    (|$input:pat_param| $evaluate:expr; $($name:ident: $value:expr => $expected:expr,)+) => {
+        $({
+            #[allow(clippy::redundant_closure_call)]
+            (|$input| assert_eq!($evaluate, $expected, "{}", stringify!($name)))($value);
+        })+
     };
 }
 
@@ -416,6 +437,41 @@ mod tests {
             ("wrong") => 0,
             (later()) => 0,
         }
+    }
+
+    #[test]
+    fn named_cases_keep_types_and_order() {
+        let mut visited = Vec::new();
+        fictionet::assert_cases!(|(name, value)| { visited.push(name); value };
+            byte: ("byte", 7u8) => 7u8,
+            text: ("text", "value") => "value",
+        );
+        assert_eq!(visited, ["byte", "text"]);
+    }
+
+    #[test]
+    fn named_cases_borrow_temporaries_and_infer_closures() {
+        fn apply(edit: &dyn Fn(&mut u8)) -> u8 {
+            let mut value = 0;
+            edit(&mut value);
+            value
+        }
+        fictionet::assert_cases!(|edit| apply(edit);
+            set: &|value| *value = 3 => 3,
+            increment: &|value| *value += 1 => 1,
+        );
+        fictionet::assert_cases!(|bytes| bytes;
+            borrowed_format: format!("{}", 42).as_bytes() => b"42",
+            borrowed_repeat: "x".repeat(2).as_bytes() => b"xx",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "boundary_case")]
+    fn named_cases_report_failure_name() {
+        fictionet::assert_cases!(|value| value;
+            boundary_case: 1 => 2,
+        );
     }
 
     #[test]

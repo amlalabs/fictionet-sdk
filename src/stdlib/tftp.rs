@@ -956,10 +956,23 @@ impl Wire for Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
+
+    fn data_packet(block: u16, data: Vec<u8>) -> Packet {
+        Packet::Data { block, data }
+    }
+
+    fn request_fixture(filename: String, mode: Mode, options: Vec<TftpOption>) -> Request {
+        Request {
+            filename,
+            mode,
+            options,
+        }
+    }
 
     fn rrq_example() -> Vec<u8> {
         b"\x00\x01boot.img\x00octet\x00blksize\x001024\x00tsize\x000\x00".to_vec()
@@ -971,11 +984,7 @@ mod tests {
         let p = Packet::parse(b"\x00\x01foo\x00netascii\x00").unwrap();
         assert_eq!(
             p,
-            Packet::ReadRequest(Request {
-                filename: "foo".into(),
-                mode: Mode::NetAscii,
-                options: vec![]
-            })
+            Packet::ReadRequest(request_fixture("foo".into(), Mode::NetAscii, vec![]))
         );
         assert_eq!(p.to_bytes().unwrap(), b"\x00\x01foo\x00netascii\x00");
         assert_eq!(p.opcode(), opcode::RRQ);
@@ -983,11 +992,7 @@ mod tests {
         let p = Packet::parse(b"\x00\x02bar\x00OcTeT\x00").unwrap();
         assert_eq!(
             p,
-            Packet::WriteRequest(Request {
-                filename: "bar".into(),
-                mode: Mode::Octet,
-                options: vec![]
-            })
+            Packet::WriteRequest(request_fixture("bar".into(), Mode::Octet, vec![]))
         );
         assert_eq!(p.to_bytes().unwrap(), b"\x00\x02bar\x00octet\x00");
         assert_eq!(
@@ -1035,42 +1040,27 @@ mod tests {
     #[test]
     fn data_ack_and_error() {
         let p = Packet::parse(&[0, 3, 0, 1, b'h', b'i']).unwrap();
-        assert_eq!(
-            p,
-            Packet::Data {
-                block: 1,
-                data: b"hi".to_vec()
-            }
-        );
+        assert_eq!(p, data_packet(1, b"hi".to_vec()));
         assert_eq!(p.to_bytes().unwrap(), [0, 3, 0, 1, b'h', b'i']);
-        assert_eq!(
-            Packet::parse(&[0, 3, 0xff, 0xff]),
-            Ok(Packet::Data {
-                block: 65535,
-                data: vec![]
-            })
-        );
-        assert_eq!(
-            Packet::parse(&[0, 4, 0x12, 0x34]),
-            Ok(Packet::Ack { block: 0x1234 })
+        assert_cases!(|input| Packet::parse(input);
+            maximum_data_block: &[0, 3, 0xff, 0xff] => Ok(data_packet(65535, vec![])),
+            acknowledgement: &[0, 4, 0x12, 0x34] => Ok(Packet::Ack { block: 0x1234 }),
         );
         assert_eq!(Packet::Ack { block: 7 }.to_bytes().unwrap(), [0, 4, 0, 7]);
         let e = Packet::parse(b"\x00\x05\x00\x01File not found\x00").unwrap();
         assert_eq!(e, Packet::error(ErrorCode::FileNotFound));
         assert_eq!(e.to_bytes().unwrap(), b"\x00\x05\x00\x01File not found\x00");
-        assert_eq!(
-            Packet::parse(b"\x00\x05\x00\x08\x00"),
-            Ok(Packet::Error {
-                code: ErrorCode::OptionNegotiation,
-                message: String::new()
-            })
-        );
-        assert_eq!(
-            Packet::parse(b"\x00\x05\x01\x00x\x00"),
-            Ok(Packet::Error {
-                code: ErrorCode::Other(256),
-                message: "x".into()
-            })
+        assert_cases!(|input| Packet::parse(input);
+            negotiation_error: b"\x00\x05\x00\x08\x00"
+                => Ok(Packet::Error {
+                    code: ErrorCode::OptionNegotiation,
+                    message: String::new(),
+                }),
+            unknown_error: b"\x00\x05\x01\x00x\x00"
+                => Ok(Packet::Error {
+                    code: ErrorCode::Other(256),
+                    message: "x".into(),
+                }),
         );
     }
 
@@ -1085,53 +1075,38 @@ mod tests {
 
     #[test]
     fn each_parse_error() {
-        assert_eq!(Packet::parse(&[]), Err(Error::Short));
-        assert_eq!(Packet::parse(&[0]), Err(Error::Short));
-        assert_eq!(
-            Packet::parse(&vec![0; MAX_PACKET + 1]),
-            Err(Error::TooLong(MAX_PACKET + 1))
-        );
-        assert_eq!(Packet::parse(&[0, 7]), Err(Error::UnknownOpcode(7)));
-        assert_eq!(Packet::parse(&[0, 0, 1, 2]), Err(Error::UnknownOpcode(0)));
-        assert_eq!(Packet::parse(b"\x00\x01foo"), Err(Error::Unterminated));
-        assert_eq!(
-            Packet::parse(b"\x00\x01foo\x00octet"),
-            Err(Error::Unterminated)
+        assert_cases!(|input| Packet::parse(input);
+            empty: &[] => Err(Error::Short),
+            short_opcode: &[0] => Err(Error::Short),
+            oversized: &vec![0; MAX_PACKET + 1] => Err(Error::TooLong(MAX_PACKET + 1)),
+            unknown_opcode: &[0, 7] => Err(Error::UnknownOpcode(7)),
+            zero_opcode: &[0, 0, 1, 2] => Err(Error::UnknownOpcode(0)),
+            unterminated_filename: b"\x00\x01foo" => Err(Error::Unterminated),
+            unterminated_mode: b"\x00\x01foo\x00octet" => Err(Error::Unterminated),
         );
         let mut long = b"\x00\x05\x00\x00".to_vec();
         long.extend_from_slice(&[b'a'; MAX_STRING + 1]);
         long.push(0);
-        assert_eq!(Packet::parse(&long), Err(Error::StringTooLong));
-        assert_eq!(
-            Packet::parse(b"\x00\x01\xff\x00octet\x00"),
-            Err(Error::NotUtf8)
-        );
-        assert_eq!(
-            Packet::parse(b"\x00\x01foo\x00binary\x00"),
-            Err(Error::UnknownMode)
+        assert_cases!(|input| Packet::parse(input);
+            long_string: &long => Err(Error::StringTooLong),
+            invalid_utf8: b"\x00\x01\xff\x00octet\x00" => Err(Error::NotUtf8),
+            unknown_mode: b"\x00\x01foo\x00binary\x00" => Err(Error::UnknownMode),
         );
         let mut many = b"\x00\x06".to_vec();
         for i in 0..=MAX_OPTIONS {
             many.extend_from_slice(format!("a{i}\x001\x00").as_bytes());
         }
-        assert_eq!(Packet::parse(&many), Err(Error::TooManyOptions));
-        assert_eq!(
-            Packet::parse(b"\x00\x06blksize\x00"),
-            Err(Error::MissingValue)
+        assert_cases!(|input| Packet::parse(input);
+            excess_options: &many => Err(Error::TooManyOptions),
+            missing_option_value: b"\x00\x06blksize\x00" => Err(Error::MissingValue),
+            unterminated_option_value: b"\x00\x06blksize\x0010" => Err(Error::Unterminated),
+            trailing_ack: &[0, 4, 0, 1, 0] => Err(Error::TrailingBytes),
+            trailing_error: b"\x00\x05\x00\x00hi\x00x" => Err(Error::TrailingBytes),
+            short_data: &[0, 3, 0] => Err(Error::Short),
+            short_ack: &[0, 4, 0] => Err(Error::Short),
+            unterminated_error: &[0, 5, 0, 1] => Err(Error::Unterminated),
+            short_error: &[0, 5, 0] => Err(Error::Short),
         );
-        assert_eq!(
-            Packet::parse(b"\x00\x06blksize\x0010"),
-            Err(Error::Unterminated)
-        );
-        assert_eq!(Packet::parse(&[0, 4, 0, 1, 0]), Err(Error::TrailingBytes));
-        assert_eq!(
-            Packet::parse(b"\x00\x05\x00\x00hi\x00x"),
-            Err(Error::TrailingBytes)
-        );
-        assert_eq!(Packet::parse(&[0, 3, 0]), Err(Error::Short));
-        assert_eq!(Packet::parse(&[0, 4, 0]), Err(Error::Short));
-        assert_eq!(Packet::parse(&[0, 5, 0, 1]), Err(Error::Unterminated));
-        assert_eq!(Packet::parse(&[0, 5, 0]), Err(Error::Short));
         // Every error has a message.
         for e in [
             Error::Short,
@@ -1196,16 +1171,9 @@ mod tests {
             .map(|i| TftpOption::new(&format!("{i}{long}"), "1"))
             .collect();
         for packet in [
-            Packet::ReadRequest(Request {
-                filename: format!("a\0b{long}"),
-                mode: Mode::Octet,
-                options: vec![],
-            }),
+            Packet::ReadRequest(request_fixture(format!("a\0b{long}"), Mode::Octet, vec![])),
             Packet::OptionAck { options },
-            Packet::Data {
-                block: 1,
-                data: vec![1; MAX_PACKET * 2],
-            },
+            data_packet(1, vec![1; MAX_PACKET * 2]),
             Packet::Error {
                 code: ErrorCode::NotDefined,
                 message: "x".repeat(5000),
@@ -1220,11 +1188,8 @@ mod tests {
     fn writers_refuse_strings_with_nul() {
         // Each string is short, so only the NUL rule applies. Mode is an
         // enum whose names hold no NUL.
-        let request = |filename: &str, options| Request {
-            filename: filename.to_string(),
-            mode: Mode::Octet,
-            options,
-        };
+        let request =
+            |filename: &str, options| request_fixture(filename.to_string(), Mode::Octet, options);
         for packet in [
             Packet::ReadRequest(request("a\0b", vec![])),
             Packet::WriteRequest(request("\0", vec![])),
@@ -1337,13 +1302,7 @@ mod tests {
     fn transfer_without_options() {
         let mut t = ReadTransfer::new(b"hello".to_vec());
         assert_eq!(t.blocks(), 1);
-        assert_eq!(
-            t.current(),
-            Some(Packet::Data {
-                block: 1,
-                data: b"hello".to_vec()
-            })
-        );
+        assert_eq!(t.current(), Some(data_packet(1, b"hello".to_vec())));
         // ACK 0 is the block before: a duplicate.
         assert_eq!(t.receive_ack(0), Event::Duplicate);
         assert_eq!(t.receive_ack(9), Event::Unexpected);
@@ -1362,22 +1321,10 @@ mod tests {
         let mut t = t;
         t.receive_ack(1);
         t.receive_ack(2);
-        assert_eq!(
-            t.current(),
-            Some(Packet::Data {
-                block: 3,
-                data: vec![]
-            })
-        );
+        assert_eq!(t.current(), Some(data_packet(3, vec![])));
         // An empty file is one empty block.
         let t = ReadTransfer::new(vec![]);
-        assert_eq!(
-            t.current(),
-            Some(Packet::Data {
-                block: 1,
-                data: vec![]
-            })
-        );
+        assert_eq!(t.current(), Some(data_packet(1, vec![])));
     }
 
     #[test]
@@ -1414,13 +1361,7 @@ mod tests {
         assert!(matches!(t.current(), Some(Packet::OptionAck { .. })));
         // With the OACK in flight, 65535 is not a duplicate.
         assert_eq!(t.receive_ack(65535), Event::Unexpected);
-        assert_eq!(
-            t.receive(&Packet::Data {
-                block: 1,
-                data: vec![]
-            }),
-            Event::Unexpected
-        );
+        assert_eq!(t.receive(&data_packet(1, vec![])), Event::Unexpected);
         assert!(matches!(
             t.receive(&Packet::Ack { block: 0 }),
             Event::Send(Packet::Data { block: 1, .. })
@@ -1434,13 +1375,7 @@ mod tests {
         // RFC 1350: with no options, blocks are 512 bytes.
         let t = ReadTransfer::new(vec![1; 1000]);
         assert_eq!(t.block_size(), DEFAULT_BLOCK_SIZE);
-        assert_eq!(
-            t.current(),
-            Some(Packet::Data {
-                block: 1,
-                data: vec![1; 512]
-            })
-        );
+        assert_eq!(t.current(), Some(data_packet(1, vec![1; 512])));
     }
 
     // RFC 2347: "The maximum size of a request packet is 512 octets."
@@ -1463,19 +1398,16 @@ mod tests {
             .map(|i| TftpOption::new(&format!("o{i}"), &"9".repeat(60)))
             .collect();
         for filename in [long, "a".into()] {
-            let p = Packet::WriteRequest(Request {
-                filename,
-                mode: Mode::NetAscii,
-                options: options.clone(),
-            });
+            let p =
+                Packet::WriteRequest(request_fixture(filename, Mode::NetAscii, options.clone()));
             assert_eq!(p.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&p);
         }
-        let bounded = Packet::WriteRequest(Request {
-            filename: "a".into(),
-            mode: Mode::Octet,
-            options: options[..7].to_vec(),
-        });
+        let bounded = Packet::WriteRequest(request_fixture(
+            "a".into(),
+            Mode::Octet,
+            options[..7].to_vec(),
+        ));
         assert!(bounded.to_bytes().unwrap().len() <= MAX_REQUEST);
         contract::check_wire_value(&bounded);
     }
@@ -1555,13 +1487,7 @@ mod tests {
         };
         let t = ReadTransfer::negotiated(vec![1; 1000], &quiet);
         assert_eq!(t.block_size(), DEFAULT_BLOCK_SIZE);
-        assert_eq!(
-            t.current(),
-            Some(Packet::Data {
-                block: 1,
-                data: vec![1; 512]
-            })
-        );
+        assert_eq!(t.current(), Some(data_packet(1, vec![1; 512])));
         let loud = Negotiated {
             block_size: 1024,
             timeout: None,
@@ -1583,13 +1509,7 @@ mod tests {
         let t = ReadTransfer::negotiated(vec![], &bad);
         assert_eq!(
             (t.block_size(), t.current()),
-            (
-                DEFAULT_BLOCK_SIZE,
-                Some(Packet::Data {
-                    block: 1,
-                    data: vec![]
-                })
-            )
+            (DEFAULT_BLOCK_SIZE, Some(data_packet(1, vec![])))
         );
         // A repeat is not what the client sees, so it does not count.
         let twice = Negotiated {

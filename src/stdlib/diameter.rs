@@ -1627,11 +1627,26 @@ pub mod harness {
 mod tests {
     use super::harness::FORMATS;
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Decode, Step};
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
+
+    fn address_other(family: u16, bytes: Vec<u8>) -> Address {
+        Address::Other { family, bytes }
+    }
+
+    fn avp(code: u32, vendor: Option<u32>, mandatory: bool, protected: bool, data: Vec<u8>) -> Avp {
+        Avp {
+            code,
+            vendor,
+            mandatory,
+            protected,
+            data,
+        }
+    }
 
     fn id(s: &str) -> Identity {
         Identity::new(s).unwrap()
@@ -1734,16 +1749,7 @@ mod tests {
             0xec,
         ];
         let a = Avp::parse(&b).unwrap();
-        assert_eq!(
-            a,
-            Avp {
-                code: 1032,
-                vendor: Some(10415),
-                mandatory: true,
-                protected: false,
-                data: vec![0, 0, 3, 0xec]
-            }
-        );
+        assert_eq!(a, avp(1032, Some(10415), true, false, vec![0, 0, 3, 0xec]));
         assert_eq!(a.value(Format::Enumerated), Ok(Value::Enumerated(1004)));
         assert_eq!(a.to_bytes().unwrap(), b);
         // The protected flag.
@@ -1762,13 +1768,7 @@ mod tests {
     #[test]
     fn padding() {
         for n in 0..9 {
-            let a = Avp {
-                code: 7,
-                vendor: None,
-                mandatory: false,
-                protected: false,
-                data: vec![0xaa; n],
-            };
+            let a = avp(7, None, false, false, vec![0xaa; n]);
             let b = a.to_bytes().unwrap();
             assert_eq!(b.len(), (8 + n).div_ceil(4) * 4);
             assert_eq!(u32::from_be_bytes([0, b[5], b[6], b[7]]) as usize, 8 + n);
@@ -1841,17 +1841,8 @@ mod tests {
     #[test]
     fn addresses_of_other_families() {
         assert!(Address::parse(&[0]).is_err());
-        assert_eq!(
-            Address::parse(&[0, 8, 9]),
-            Ok(Address::Other {
-                family: 8,
-                bytes: vec![9]
-            })
-        );
-        let other = Address::Other {
-            family: 1,
-            bytes: vec![10, 0, 0, 1],
-        };
+        assert_eq!(Address::parse(&[0, 8, 9]), Ok(address_other(8, vec![9])));
+        let other = address_other(1, vec![10, 0, 0, 1]);
         assert_eq!(other.to_bytes(), Err(Error::Unwritable));
     }
 
@@ -1928,13 +1919,7 @@ mod tests {
         assert!(Identity::new("").is_none());
         assert!(Identity::new("a b").is_none());
         assert!(Identity::new("a:1").is_none());
-        let a = Avp {
-            code: avp::ORIGIN_HOST,
-            vendor: None,
-            mandatory: true,
-            protected: false,
-            data: b"bad host".to_vec(),
-        };
+        let a = avp(avp::ORIGIN_HOST, None, true, false, b"bad host".to_vec());
         assert_eq!(
             a.value(Format::DiameterIdentity),
             Err(Error::Value {
@@ -1953,13 +1938,7 @@ mod tests {
 
     #[test]
     fn value_errors() {
-        let raw = |data: &[u8]| Avp {
-            code: 9,
-            vendor: None,
-            mandatory: false,
-            protected: false,
-            data: data.to_vec(),
-        };
+        let raw = |data: &[u8]| avp(9, None, false, false, data.to_vec());
         // Fixed-size formats given the wrong size: a length error.
         for (format, bad) in [
             (Format::Integer32, &[0u8; 3][..]),
@@ -1995,15 +1974,11 @@ mod tests {
             assert!(e.to_string().contains(format.name()));
         }
         // A grouped AVP whose data is not AVPs.
-        assert_eq!(
-            raw(&[0, 0, 0, 5, 0]).value(Format::Grouped),
-            Err(Error::AvpLength { code: 5, length: 5 })
+        assert_cases!(|input| raw(input).value(Format::Grouped);
+            short_grouped_header: &[0, 0, 0, 5, 0] => Err(Error::AvpLength { code: 5, length: 5 }),
+            partial_grouped_header: &[0, 0] => Err(Error::AvpLength { code: 0, length: 2 }),
+            empty_group: &[] => Ok(Value::Grouped(vec![])),
         );
-        assert_eq!(
-            raw(&[0, 0]).value(Format::Grouped),
-            Err(Error::AvpLength { code: 0, length: 2 })
-        );
-        assert_eq!(raw(&[]).value(Format::Grouped), Ok(Value::Grouped(vec![])));
         assert_eq!(raw(&[]).as_u32(), None);
         assert_eq!(raw(&[0, 0, 0, 0, 0, 0, 0, 1]).as_u64(), Some(1));
         assert_eq!(raw(&[0xff; 4]).as_i32(), Some(-1));
@@ -2017,21 +1992,11 @@ mod tests {
             b[i] = v;
             b
         };
-        assert_eq!(
-            Message::parse(&[2]),
-            Err(Error::Frame(FrameError::Version(2)))
-        );
-        assert_eq!(
-            Message::parse(&with(0, 0)),
-            Err(Error::Frame(FrameError::Version(0)))
-        );
-        assert_eq!(
-            Message::parse(&[1, 0, 0, 16]),
-            Err(Error::Frame(FrameError::MessageLength(16)))
-        );
-        assert_eq!(
-            Message::parse(&[1, 0, 0, 22]),
-            Err(Error::Frame(FrameError::MessageLength(22)))
+        assert_cases!(|input| Message::parse(input);
+            version_two: &[2] => Err(Error::Frame(FrameError::Version(2))),
+            version_zero: &with(0, 0) => Err(Error::Frame(FrameError::Version(0))),
+            undersized_message: &[1, 0, 0, 16] => Err(Error::Frame(FrameError::MessageLength(16))),
+            unaligned_message: &[1, 0, 0, 22] => Err(Error::Frame(FrameError::MessageLength(22))),
         );
         assert_eq!(
             Frames::<Message>::with_limit(64).decode(&[1, 0, 0, 0x44], false),
@@ -2053,20 +2018,10 @@ mod tests {
         let mut b = ok.clone();
         b[24] = 0xc0;
         b[27] = 11;
-        assert_eq!(
-            Message::parse(&b),
-            Err(Error::AvpLength {
-                code: 264,
-                length: 11
-            })
-        );
-        // An AVP that runs past the message.
-        assert_eq!(
-            Message::parse(&with(27, 0x30)),
-            Err(Error::AvpLength {
-                code: 264,
-                length: 0x30
-            })
+        assert_cases!(|input| Message::parse(input);
+            short_avp: &b => Err(Error::AvpLength { code: 264, length: 11 }),
+            // An AVP that runs past the message.
+            oversized_avp: &with(27, 0x30) => Err(Error::AvpLength { code: 264, length: 0x30 }),
         );
         // A message length that cuts an AVP header short.
         let mut b = ok[..24].to_vec();
@@ -2110,13 +2065,7 @@ mod tests {
 
     #[test]
     fn too_many_avps() {
-        let one = Avp {
-            code: 1,
-            vendor: None,
-            mandatory: false,
-            protected: false,
-            data: vec![],
-        };
+        let one = avp(1, None, false, false, vec![]);
         let list: Vec<u8> = one.to_bytes().unwrap().repeat(MAX_AVPS);
         assert_eq!(Avp::parse_list(&list).unwrap().len(), MAX_AVPS);
         let more: Vec<u8> = one.to_bytes().unwrap().repeat(MAX_AVPS + 1);
@@ -2164,13 +2113,7 @@ mod tests {
             })
         );
         // Unknown AVPs are skipped, whatever they hold.
-        let unknown = Avp {
-            code: 77,
-            vendor: Some(1),
-            mandatory: true,
-            protected: false,
-            data: vec![9],
-        };
+        let unknown = avp(77, Some(1), true, false, vec![9]);
         check(&[unknown], dict).unwrap();
     }
 
@@ -2185,13 +2128,7 @@ mod tests {
             );
         }
         // AVPs cut short read as errors, never as a shorter AVP.
-        let a = Avp {
-            code: 5,
-            vendor: Some(3),
-            mandatory: true,
-            protected: false,
-            data: vec![1, 2, 3, 4, 5],
-        };
+        let a = avp(5, Some(3), true, false, vec![1, 2, 3, 4, 5]);
         let b = a.to_bytes().unwrap();
         for n in 0..17 {
             assert!(Avp::parse(&b[..n]).is_err(), "{n} bytes");
@@ -2280,13 +2217,7 @@ mod tests {
 
     #[test]
     fn writers_refuse_what_does_not_fit() {
-        let huge = Avp {
-            code: 1,
-            vendor: Some(1),
-            mandatory: false,
-            protected: false,
-            data: vec![7; MAX_AVP_DATA + 100],
-        };
+        let huge = avp(1, Some(1), false, false, vec![7; MAX_AVP_DATA + 100]);
         contract::check_wire_value(&huge);
         assert_eq!(huge.to_bytes(), Err(Error::Unwritable));
         let mut message = Message::request(1, 2, 3, 4);
@@ -2298,10 +2229,7 @@ mod tests {
             Avp::new(1, &Value::Utf8String(text)),
             Err(Error::Unwritable)
         );
-        let address = Address::Other {
-            family: 9,
-            bytes: vec![0; MAX_AVP_DATA],
-        };
+        let address = address_other(9, vec![0; MAX_AVP_DATA]);
         assert_eq!(address.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&address);
         assert_eq!(
@@ -2313,13 +2241,7 @@ mod tests {
     #[test]
     fn utf8_string_refuses_code_point_zero() {
         // RFC 6733, section 4.3.1: code points 0x00000001 and up only.
-        let a = Avp {
-            code: avp::USER_NAME,
-            vendor: None,
-            mandatory: true,
-            protected: false,
-            data: b"a\0b".to_vec(),
-        };
+        let a = avp(avp::USER_NAME, None, true, false, b"a\0b".to_vec());
         assert_eq!(
             a.value(Format::Utf8String),
             Err(Error::Value {
@@ -2344,13 +2266,7 @@ mod tests {
     fn failed_avp_holds_the_bad_avp_unchecked() {
         // RFC 6733, section 7.5: Failed-AVP carries the AVP that failed,
         // even one with a bad value or a bad length.
-        let bad_value = Avp {
-            code: avp::ORIGIN_HOST,
-            vendor: None,
-            mandatory: true,
-            protected: false,
-            data: b"no good".to_vec(),
-        };
+        let bad_value = avp(avp::ORIGIN_HOST, None, true, false, b"no good".to_vec());
         let f = Avp::new(avp::FAILED_AVP, &Value::Grouped(vec![bad_value])).unwrap();
         let rc = Avp::new(
             avp::RESULT_CODE,
@@ -2389,13 +2305,7 @@ mod tests {
         assert!(Address::parse(&[0, 1, 1, 2, 3, 4, 5]).is_err());
         assert!(Address::parse(&[0, 2]).is_err());
         assert!(Address::parse(&[0, 2, 0, 0, 0, 0]).is_err());
-        let a = Avp {
-            code: avp::HOST_IP_ADDRESS,
-            vendor: None,
-            mandatory: true,
-            protected: false,
-            data: vec![0, 1, 9],
-        };
+        let a = avp(avp::HOST_IP_ADDRESS, None, true, false, vec![0, 1, 9]);
         assert_eq!(
             check(&[a], base),
             Err(Error::Value {
@@ -2404,14 +2314,8 @@ mod tests {
             })
         );
         for address in [
-            Address::Other {
-                family: 1,
-                bytes: vec![10, 0, 0],
-            },
-            Address::Other {
-                family: 2,
-                bytes: vec![0xff; 20],
-            },
+            address_other(1, vec![10, 0, 0]),
+            address_other(2, vec![0xff; 20]),
         ] {
             assert_eq!(address.to_bytes(), Err(Error::Unwritable));
             contract::check_wire_value(&address);
@@ -2522,13 +2426,7 @@ mod tests {
         // such AVP reads and writes back unchanged.
         let data = vec![0x5a; MAX_MESSAGE - HEADER_LEN - AVP_HEADER_LEN];
         let mut m = Message::request(1, 0, 0, 0);
-        m.avps.push(Avp {
-            code: 1,
-            vendor: None,
-            mandatory: false,
-            protected: false,
-            data,
-        });
+        m.avps.push(avp(1, None, false, false, data));
         let b = m.to_bytes().unwrap();
         assert_eq!(b.len(), MAX_MESSAGE);
         assert_eq!(Message::parse(&b), Ok(m));
@@ -2590,13 +2488,7 @@ mod tests {
         // RFC 6733, section 4.2: a grouped AVP's data holds its AVPs with
         // their padding. Proxy-State "x" with its 3 padding bytes left out:
         let short = [0, 0, 0, 0x21, 0x40, 0, 0, 9, b'x'];
-        let g = Avp {
-            code: avp::PROXY_INFO,
-            vendor: None,
-            mandatory: true,
-            protected: false,
-            data: short.to_vec(),
-        };
+        let g = avp(avp::PROXY_INFO, None, true, false, short.to_vec());
         let e = Error::AvpLength {
             code: avp::PROXY_STATE,
             length: 9,
@@ -2612,13 +2504,7 @@ mod tests {
     #[test]
     fn fixed_width_values_of_the_wrong_size_are_length_errors() {
         // RFC 6733, section 7.1.5: DIAMETER_INVALID_AVP_LENGTH.
-        let a = Avp {
-            code: avp::SESSION_TIMEOUT,
-            vendor: None,
-            mandatory: true,
-            protected: false,
-            data: vec![0; 3],
-        };
+        let a = avp(avp::SESSION_TIMEOUT, None, true, false, vec![0; 3]);
         let e = check(std::slice::from_ref(&a), base).unwrap_err();
         assert_eq!(
             e,
@@ -2699,13 +2585,7 @@ mod tests {
             Message::request(0x0100_0101, 0, 0, 0).to_bytes(),
             Err(Error::Unwritable)
         );
-        let one = Avp {
-            code: 1,
-            vendor: None,
-            mandatory: false,
-            protected: false,
-            data: vec![],
-        };
+        let one = avp(1, None, false, false, vec![]);
         let mut m = Message::request(1, 0, 0, 0);
         m.avps = vec![one; MAX_AVPS];
         contract::check_wire_value(&m);
@@ -2714,26 +2594,14 @@ mod tests {
         // The largest AVP fits on its own, but not with another after it.
         let big = vec![0; MAX_MESSAGE - HEADER_LEN - AVP_HEADER_LEN];
         let mut m = Message::request(1, 0, 0, 0);
-        m.avps.push(Avp {
-            code: 1,
-            vendor: None,
-            mandatory: false,
-            protected: false,
-            data: big.clone(),
-        });
+        m.avps.push(avp(1, None, false, false, big.clone()));
         assert!(m.to_bytes().is_ok());
         m.avps
             .push(Avp::new(avp::RESULT_CODE, &Value::Unsigned32(2001)).unwrap());
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         // With a vendor ID the same data is 4 bytes too long.
         let mut m = Message::request(1, 0, 0, 0);
-        m.avps.push(Avp {
-            code: 1,
-            vendor: Some(1),
-            mandatory: false,
-            protected: false,
-            data: big,
-        });
+        m.avps.push(avp(1, Some(1), false, false, big));
         assert_eq!(m.to_bytes(), Err(Error::Unwritable));
     }
 

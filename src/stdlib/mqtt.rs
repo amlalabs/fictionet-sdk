@@ -1120,6 +1120,7 @@ fictionet::codec_from!(Error, Trailing, |_| Error::TrailingBytes);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Decode, Step};
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
@@ -1320,18 +1321,11 @@ mod tests {
                 assert_eq!(RemainingLength::parse(&bytes[..k]), Err(Error::Truncated));
             }
         }
-        assert_eq!(
-            RemainingLength::parse(&[0xff, 0xff, 0xff, 0xff]),
-            Err(Error::RemainingLength)
-        );
-        assert_eq!(
-            RemainingLength::parse(&[0x80, 0x80, 0x80, 0x80, 0x01]),
-            Err(Error::RemainingLength)
-        );
-        // A longer encoding than needed is still read.
-        assert_eq!(
-            RemainingLength::parse(&[0x80, 0x00]),
-            Ok(RemainingLength(0))
+        assert_cases!(|input| RemainingLength::parse(input);
+            four_continuations: &[0xff, 0xff, 0xff, 0xff] => Err(Error::RemainingLength),
+            fifth_length_byte: &[0x80, 0x80, 0x80, 0x80, 0x01] => Err(Error::RemainingLength),
+            // A longer encoding than needed is still read.
+            nonminimal_zero: &[0x80, 0x00] => Ok(RemainingLength(0)),
         );
         assert_eq!(Packet::parse(&[0xc0, 0x80, 0x00]), Ok(Packet::PingReq));
         let mut out = Vec::new();
@@ -1431,147 +1425,65 @@ mod tests {
 
     #[test]
     fn fixed_header_errors() {
-        assert_eq!(Packet::parse(&[0x00]), Err(Error::ReservedType(0)));
-        assert_eq!(Packet::parse(&[0xf0, 0]), Err(Error::ReservedType(15)));
-        // Fixed flags on each type that has them.
-        assert_eq!(
-            Packet::parse(&[0x11]),
-            Err(Error::Flags {
-                packet_type: 1,
-                flags: 1
-            })
+        assert_cases!(|input| Packet::parse(input);
+            reserved_zero: &[0x00] => Err(Error::ReservedType(0)),
+            reserved_fifteen: &[0xf0, 0] => Err(Error::ReservedType(15)),
+            // Fixed flags on each type that has them.
+            connect_flags: &[0x11] => Err(Error::Flags { packet_type: 1, flags: 1 }),
+            pubrel_flags: &[0x60, 2, 0, 1] => Err(Error::Flags { packet_type: 6, flags: 0 }),
+            subscribe_flags: &[0x80] => Err(Error::Flags { packet_type: 8, flags: 0 }),
+            unsubscribe_flags: &[0xa3] => Err(Error::Flags { packet_type: 10, flags: 3 }),
+            disconnect_flags: &[0xe8, 0] => Err(Error::Flags { packet_type: 14, flags: 8 }),
+            // PUBLISH: QoS 3, and DUP at QoS 0.
+            publish_qos_three: &[0x36] => Err(Error::Flags { packet_type: 3, flags: 6 }),
+            publish_dup_qos_zero: &[0x38] => Err(Error::Flags { packet_type: 3, flags: 8 }),
+            publish_missing_length: &[0x3b] => Err(Error::Truncated),
         );
-        assert_eq!(
-            Packet::parse(&[0x60, 2, 0, 1]),
-            Err(Error::Flags {
-                packet_type: 6,
-                flags: 0
-            })
-        );
-        assert_eq!(
-            Packet::parse(&[0x80]),
-            Err(Error::Flags {
-                packet_type: 8,
-                flags: 0
-            })
-        );
-        assert_eq!(
-            Packet::parse(&[0xa3]),
-            Err(Error::Flags {
-                packet_type: 10,
-                flags: 3
-            })
-        );
-        assert_eq!(
-            Packet::parse(&[0xe8, 0]),
-            Err(Error::Flags {
-                packet_type: 14,
-                flags: 8
-            })
-        );
-        // PUBLISH: QoS 3, and DUP at QoS 0.
-        assert_eq!(
-            Packet::parse(&[0x36]),
-            Err(Error::Flags {
-                packet_type: 3,
-                flags: 6
-            })
-        );
-        assert_eq!(
-            Packet::parse(&[0x38]),
-            Err(Error::Flags {
-                packet_type: 3,
-                flags: 8
-            })
-        );
-        assert_eq!(Packet::parse(&[0x3b]), Err(Error::Truncated));
     }
 
     #[test]
     fn body_errors() {
         // Fields that run past the end.
-        assert_eq!(Packet::parse(&[0x40, 1, 0]), Err(Error::Truncated));
-        assert_eq!(Packet::parse(&[0x30, 2, 0, 5]), Err(Error::Truncated));
-        assert_eq!(Packet::parse(&[0x20, 1, 0]), Err(Error::Truncated));
-        // Bytes left over.
-        assert_eq!(
-            Packet::parse(&[0x40, 3, 0, 1, 0]),
-            Err(Error::TrailingBytes)
-        );
-        assert_eq!(Packet::parse(&[0xc0, 1, 0]), Err(Error::TrailingBytes));
-        assert_eq!(
-            Packet::parse(&[0x20, 3, 0, 0, 0]),
-            Err(Error::TrailingBytes)
-        );
-        // Strings: bad UTF-8, a surrogate, and U+0000.
-        assert_eq!(Packet::parse(&[0x30, 3, 0, 1, 0xff]), Err(Error::Utf8));
-        assert_eq!(
-            Packet::parse(&[0x30, 5, 0, 3, 0xed, 0xa0, 0x80]),
-            Err(Error::Utf8)
-        );
-        assert_eq!(Packet::parse(&[0x30, 3, 0, 1, 0]), Err(Error::NullChar));
-        // Topic names.
-        assert_eq!(Packet::parse(&[0x30, 2, 0, 0]), Err(Error::TopicName));
-        assert_eq!(Packet::parse(&[0x30, 3, 0, 1, b'#']), Err(Error::TopicName));
-        // Packet identifiers of 0.
-        assert_eq!(
-            Packet::parse(&[0x32, 5, 0, 1, b'a', 0, 0]),
-            Err(Error::PacketIdZero)
-        );
-        assert_eq!(Packet::parse(&[0x40, 2, 0, 0]), Err(Error::PacketIdZero));
-        assert_eq!(
-            Packet::parse(&[0x82, 6, 0, 0, 0, 1, b'a', 0]),
-            Err(Error::PacketIdZero)
-        );
-        // CONNACK.
-        assert_eq!(Packet::parse(&[0x20, 2, 0, 6]), Err(Error::ReturnCode(6)));
-        assert_eq!(Packet::parse(&[0x20, 2, 2, 0]), Err(Error::ConnAckFlags(2)));
-        assert_eq!(Packet::parse(&[0x20, 2, 1, 4]), Err(Error::ConnAckFlags(1)));
-        // SUBSCRIBE and UNSUBSCRIBE.
-        assert_eq!(
-            Packet::parse(&[0x82, 2, 0, 1]),
-            Err(Error::EmptySubscription)
-        );
-        assert_eq!(
-            Packet::parse(&[0xa2, 2, 0, 1]),
-            Err(Error::EmptySubscription)
-        );
-        assert_eq!(
-            Packet::parse(&[0x82, 6, 0, 1, 0, 1, b'a', 3]),
-            Err(Error::SubscribeOptions(3))
-        );
-        assert_eq!(
-            Packet::parse(&[0x82, 6, 0, 1, 0, 1, b'a', 0x04]),
-            Err(Error::SubscribeOptions(4))
-        );
-        assert_eq!(
-            Packet::parse(&[0x82, 7, 0, 1, 0, 2, b'a', b'#', 0]),
-            Err(Error::TopicFilter)
-        );
-        assert_eq!(
-            Packet::parse(&[0xa2, 5, 0, 1, 0, 1, b'+']),
-            Ok(Packet::Unsubscribe(Unsubscribe {
-                packet_id: 1,
-                filters: vec!["+".into()]
-            }))
-        );
-        assert_eq!(
-            Packet::parse(&[0xa2, 6, 0, 1, 0, 2, b'+', b'a']),
-            Err(Error::TopicFilter)
-        );
-        assert_eq!(
-            Packet::parse(&[0x82, 5, 0, 1, 0, 1, b'a']),
-            Err(Error::Truncated)
-        );
-        // SUBACK.
-        assert_eq!(
-            Packet::parse(&[0x90, 3, 0, 1, 3]),
-            Err(Error::ReturnCode(3))
-        );
-        // A SUBACK answers at least one filter, so it has at least one code.
-        assert_eq!(
-            Packet::parse(&[0x90, 2, 0, 1]),
-            Err(Error::EmptySubscription)
+        assert_cases!(|input| Packet::parse(input);
+            short_puback: &[0x40, 1, 0] => Err(Error::Truncated),
+            short_publish: &[0x30, 2, 0, 5] => Err(Error::Truncated),
+            short_connack: &[0x20, 1, 0] => Err(Error::Truncated),
+            // Bytes left over.
+            trailing_puback: &[0x40, 3, 0, 1, 0] => Err(Error::TrailingBytes),
+            trailing_ping: &[0xc0, 1, 0] => Err(Error::TrailingBytes),
+            trailing_connack: &[0x20, 3, 0, 0, 0] => Err(Error::TrailingBytes),
+            // Strings: bad UTF-8, a surrogate, and U+0000.
+            invalid_utf8: &[0x30, 3, 0, 1, 0xff] => Err(Error::Utf8),
+            surrogate_utf8: &[0x30, 5, 0, 3, 0xed, 0xa0, 0x80] => Err(Error::Utf8),
+            nul_topic: &[0x30, 3, 0, 1, 0] => Err(Error::NullChar),
+            // Topic names.
+            empty_topic: &[0x30, 2, 0, 0] => Err(Error::TopicName),
+            wildcard_topic: &[0x30, 3, 0, 1, b'#'] => Err(Error::TopicName),
+            // Packet identifiers of 0.
+            publish_zero_id: &[0x32, 5, 0, 1, b'a', 0, 0] => Err(Error::PacketIdZero),
+            puback_zero_id: &[0x40, 2, 0, 0] => Err(Error::PacketIdZero),
+            subscribe_zero_id: &[0x82, 6, 0, 0, 0, 1, b'a', 0] => Err(Error::PacketIdZero),
+            // CONNACK.
+            connack_return_code: &[0x20, 2, 0, 6] => Err(Error::ReturnCode(6)),
+            connack_reserved_flag: &[0x20, 2, 2, 0] => Err(Error::ConnAckFlags(2)),
+            connack_session_on_failure: &[0x20, 2, 1, 4] => Err(Error::ConnAckFlags(1)),
+            // SUBSCRIBE and UNSUBSCRIBE.
+            empty_subscribe: &[0x82, 2, 0, 1] => Err(Error::EmptySubscription),
+            empty_unsubscribe: &[0xa2, 2, 0, 1] => Err(Error::EmptySubscription),
+            subscribe_qos_three: &[0x82, 6, 0, 1, 0, 1, b'a', 3] => Err(Error::SubscribeOptions(3)),
+            subscribe_reserved_option: &[0x82, 6, 0, 1, 0, 1, b'a', 0x04] => Err(Error::SubscribeOptions(4)),
+            invalid_subscribe_filter: &[0x82, 7, 0, 1, 0, 2, b'a', b'#', 0] => Err(Error::TopicFilter),
+            wildcard_unsubscribe: &[0xa2, 5, 0, 1, 0, 1, b'+']
+                => Ok(Packet::Unsubscribe(Unsubscribe {
+                    packet_id: 1,
+                    filters: vec!["+".into()],
+                })),
+            invalid_unsubscribe_filter: &[0xa2, 6, 0, 1, 0, 2, b'+', b'a'] => Err(Error::TopicFilter),
+            missing_subscribe_options: &[0x82, 5, 0, 1, 0, 1, b'a'] => Err(Error::Truncated),
+            // SUBACK.
+            invalid_suback_code: &[0x90, 3, 0, 1, 3] => Err(Error::ReturnCode(3)),
+            // A SUBACK answers at least one filter, so it has at least one code.
+            empty_suback: &[0x90, 2, 0, 1] => Err(Error::EmptySubscription),
         );
     }
 
@@ -1591,60 +1503,25 @@ mod tests {
         let id = [0, 1, b'a'];
         assert!(Packet::parse(&connect_with(b"MQTT", 4, 0x02, &id)).is_ok());
         // MQTT 5, with its properties length, and MQTT 3.1.
-        assert_eq!(
-            Packet::parse(&connect_with(b"MQTT", 5, 0x02, &[0, 0, 1, b'a'])),
-            Err(Error::UnsupportedVersion(5))
-        );
-        assert_eq!(
-            Packet::parse(&connect_with(b"MQIsdp", 3, 0x02, &id)),
-            Err(Error::UnsupportedVersion(3))
-        );
-        assert_eq!(
-            Packet::parse(&connect_with(b"MQTT", 3, 0x02, &id)),
-            Err(Error::UnsupportedVersion(3))
-        );
-        assert_eq!(
-            Packet::parse(&connect_with(b"HTTP", 4, 0x02, &id)),
-            Err(Error::ProtocolName)
-        );
-        // The reserved bit.
-        assert_eq!(
-            Packet::parse(&connect_with(b"MQTT", 4, 0x03, &id)),
-            Err(Error::ConnectFlags(0x03))
-        );
-        // Will QoS or retain without a will.
-        assert_eq!(
-            Packet::parse(&connect_with(b"MQTT", 4, 0x0a, &id)),
-            Err(Error::ConnectFlags(0x0a))
-        );
-        assert_eq!(
-            Packet::parse(&connect_with(b"MQTT", 4, 0x22, &id)),
-            Err(Error::ConnectFlags(0x22))
-        );
-        // Will QoS 3.
-        assert_eq!(
-            Packet::parse(&connect_with(b"MQTT", 4, 0x1e, &id)),
-            Err(Error::ConnectFlags(0x1e))
-        );
-        // A password without a user name.
-        assert_eq!(
-            Packet::parse(&connect_with(b"MQTT", 4, 0x42, &id)),
-            Err(Error::ConnectFlags(0x42))
-        );
-        // A will whose topic has a wildcard.
-        assert_eq!(
-            Packet::parse(&connect_with(
-                b"MQTT",
-                4,
-                0x06,
-                &[0, 1, b'a', 0, 1, b'+', 0, 0]
-            )),
-            Err(Error::TopicName)
-        );
-        // A user name flag with no user name.
-        assert_eq!(
-            Packet::parse(&connect_with(b"MQTT", 4, 0x82, &id)),
-            Err(Error::Truncated)
+        assert_cases!(|input| Packet::parse(input);
+            mqtt_five: &connect_with(b"MQTT", 5, 0x02, &[0, 0, 1, b'a']) => Err(Error::UnsupportedVersion(5)),
+            legacy_version: &connect_with(b"MQIsdp", 3, 0x02, &id) => Err(Error::UnsupportedVersion(3)),
+            mismatched_version: &connect_with(b"MQTT", 3, 0x02, &id) => Err(Error::UnsupportedVersion(3)),
+            protocol_name: &connect_with(b"HTTP", 4, 0x02, &id) => Err(Error::ProtocolName),
+            // The reserved bit.
+            reserved_connect_bit: &connect_with(b"MQTT", 4, 0x03, &id) => Err(Error::ConnectFlags(0x03)),
+            // Will QoS or retain without a will.
+            will_qos_without_will: &connect_with(b"MQTT", 4, 0x0a, &id) => Err(Error::ConnectFlags(0x0a)),
+            will_retain_without_will: &connect_with(b"MQTT", 4, 0x22, &id) => Err(Error::ConnectFlags(0x22)),
+            // Will QoS 3.
+            will_qos_three: &connect_with(b"MQTT", 4, 0x1e, &id) => Err(Error::ConnectFlags(0x1e)),
+            // A password without a user name.
+            password_without_username: &connect_with(b"MQTT", 4, 0x42, &id) => Err(Error::ConnectFlags(0x42)),
+            // A will whose topic has a wildcard.
+            wildcard_will: &connect_with(b"MQTT", 4, 0x06, &[0, 1, b'a', 0, 1, b'+', 0, 0])
+                => Err(Error::TopicName),
+            // A user name flag with no user name.
+            missing_username: &connect_with(b"MQTT", 4, 0x82, &id) => Err(Error::Truncated),
         );
     }
 
@@ -1664,21 +1541,14 @@ mod tests {
             Packet::Publish(x).to_bytes()
         };
         assert!(p(&|_| {}).is_ok());
-        assert_eq!(p(&|x| x.packet_id = Some(1)), Err(Error::Unwritable));
-        assert_eq!(p(&|x| x.qos = QoS::AtLeastOnce), Err(Error::Unwritable));
-        assert_eq!(
-            p(&|x| {
-                x.qos = QoS::AtLeastOnce;
-                x.packet_id = Some(0)
-            }),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(p(&|x| x.dup = true), Err(Error::Unwritable));
-        assert_eq!(p(&|x| x.topic = "a/#".into()), Err(Error::Unwritable));
-        assert_eq!(p(&|x| x.topic = "a\0".into()), Err(Error::Unwritable));
-        assert_eq!(
-            p(&|x| x.topic = "a".repeat(MAX_STRING + 1)),
-            Err(Error::Unwritable)
+        assert_cases!(|input| p(input);
+            id_at_qos_zero: &|x| x.packet_id = Some(1) => Err(Error::Unwritable),
+            missing_id: &|x| x.qos = QoS::AtLeastOnce => Err(Error::Unwritable),
+            zero_id: &|x| { x.qos = QoS::AtLeastOnce; x.packet_id = Some(0) } => Err(Error::Unwritable),
+            dup_at_qos_zero: &|x| x.dup = true => Err(Error::Unwritable),
+            wildcard_publish: &|x| x.topic = "a/#".into() => Err(Error::Unwritable),
+            nul_publish: &|x| x.topic = "a\0".into() => Err(Error::Unwritable),
+            long_publish: &|x| x.topic = "a".repeat(MAX_STRING + 1) => Err(Error::Unwritable),
         );
 
         let mut c = connect();
@@ -1731,21 +1601,9 @@ mod tests {
             .to_bytes(),
             Err(Error::Unwritable)
         );
-        assert_eq!(
-            Packet::SubAck(SubAck {
-                packet_id: 0,
-                codes: vec![]
-            })
-            .to_bytes(),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            Packet::SubAck(SubAck {
-                packet_id: 1,
-                codes: vec![]
-            })
-            .to_bytes(),
-            Err(Error::Unwritable)
+        assert_cases!(|input| Packet::SubAck(input).to_bytes();
+            zero_suback_id: SubAck { packet_id: 0, codes: vec![] } => Err(Error::Unwritable),
+            empty_suback_codes: SubAck { packet_id: 1, codes: vec![] } => Err(Error::Unwritable),
         );
     }
 

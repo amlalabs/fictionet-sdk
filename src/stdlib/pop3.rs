@@ -1357,9 +1357,18 @@ impl Decode for Outputs {
 mod tests {
     use super::*;
     use codec::{Fail, Lcg, Stream};
+    use fictionet::assert_cases;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
+
+    fn request_apop(name: String, digest: [u8; 16]) -> Request {
+        Request::Apop { name, digest }
+    }
+
+    fn command_fixture(keyword: String, argument: Option<String>) -> Command {
+        Command { keyword, argument }
+    }
 
     fn scan(bytes: &[u8]) -> Option<(NonZeroU32, u64)> {
         ScanListing::parse(bytes)
@@ -1455,32 +1464,14 @@ mod tests {
         assert!(command(&long[..253]).is_ok());
         // Unknown keywords are commands still, and requests of their own.
         let auth = command(b"AUTH PLAIN").unwrap();
-        assert_eq!(
-            auth,
-            Command {
-                keyword: "AUTH".into(),
-                argument: Some("PLAIN".into())
-            }
-        );
+        assert_eq!(auth, command_fixture("AUTH".into(), Some("PLAIN".into())));
         assert_eq!(
             Request::from_command(&auth),
             Ok(Request::Other(auth.clone()))
         );
-        assert_eq!(
-            command(b"UTF8"),
-            Ok(Command {
-                keyword: "UTF8".into(),
-                argument: None
-            })
-        );
+        assert_eq!(command(b"UTF8"), Ok(command_fixture("UTF8".into(), None)));
         // A space with nothing after it is no argument.
-        assert_eq!(
-            command(b"LIST "),
-            Ok(Command {
-                keyword: "LIST".into(),
-                argument: None
-            })
-        );
+        assert_eq!(command(b"LIST "), Ok(command_fixture("LIST".into(), None)));
         // Passwords keep their spaces, and may be long.
         assert_eq!(
             request(b"PASS open sesame "),
@@ -1620,32 +1611,21 @@ mod tests {
         let none = status(b"-ERR no such message, only 2 messages in maildrop").unwrap();
         assert!(!none.ok);
 
-        assert_eq!(request(b"RETR 1"), Ok(Request::Retr(n(1))));
-        assert_eq!(request(b"DELE 1"), Ok(Request::Dele(n(1))));
-        assert_eq!(request(b"NOOP"), Ok(Request::Noop));
-        assert_eq!(request(b"RSET"), Ok(Request::Rset));
-        assert_eq!(request(b"QUIT"), Ok(Request::Quit));
-        assert_eq!(
-            request(b"TOP 1 10"),
-            Ok(Request::Top {
-                msg: n(1),
-                lines: 10
-            })
+        assert_cases!(|input| request(input);
+            retrieve: b"RETR 1" => Ok(Request::Retr(n(1))),
+            delete: b"DELE 1" => Ok(Request::Dele(n(1))),
+            noop: b"NOOP" => Ok(Request::Noop),
+            reset: b"RSET" => Ok(Request::Rset),
+            quit: b"QUIT" => Ok(Request::Quit),
+            top_ten: b"TOP 1 10" => Ok(Request::Top { msg: n(1), lines: 10 }),
+            top_zero: b"TOP 1 0" => Ok(Request::Top { msg: n(1), lines: 0 }),
+            user: b"USER mrose" => Ok(Request::User("mrose".into())),
+            password: b"PASS secret" => Ok(Request::Pass("secret".into())),
+            // Keywords are read in any case.
+            lowercase_user: b"user frated" => Ok(Request::User("frated".into())),
+            mixed_case_retrieve: b"rEtR 2" => Ok(Request::Retr(n(2))),
+            uidl: b"UIDL" => Ok(Request::Uidl(None)),
         );
-        assert_eq!(
-            request(b"TOP 1 0"),
-            Ok(Request::Top {
-                msg: n(1),
-                lines: 0
-            })
-        );
-        assert_eq!(request(b"USER mrose"), Ok(Request::User("mrose".into())));
-        assert_eq!(request(b"PASS secret"), Ok(Request::Pass("secret".into())));
-        // Keywords are read in any case.
-        assert_eq!(request(b"user frated"), Ok(Request::User("frated".into())));
-        assert_eq!(request(b"rEtR 2"), Ok(Request::Retr(n(2))));
-
-        assert_eq!(request(b"UIDL"), Ok(Request::Uidl(None)));
         let uidl =
             Reply::parse(b"+OK\r\n1 whqtswO00WBw418f9t5JxYwZ\r\n2 QhdPYR:00WBw1Ph7x7\r\n.\r\n")
                 .unwrap();
@@ -1885,10 +1865,7 @@ mod tests {
         let requests = [
             Request::User("mrose".into()),
             Request::Pass("a b c".into()),
-            Request::Apop {
-                name: "x".into(),
-                digest: [0xab; 16],
-            },
+            request_apop("x".into(), [0xab; 16]),
             Request::Stat,
             Request::List(None),
             Request::List(Some(n(3))),
@@ -1935,18 +1912,9 @@ mod tests {
             Request::Pass("p".repeat(1000)),
             Request::User(String::new()),
             Request::Pass(String::new()),
-            Request::Apop {
-                name: "a b".into(),
-                digest: [0; 16],
-            },
-            Request::Apop {
-                name: "u".repeat(216),
-                digest: [0; 16],
-            },
-            Request::Other(Command {
-                keyword: "user".into(),
-                argument: Some("x".into()),
-            }),
+            request_apop("a b".into(), [0; 16]),
+            request_apop("u".repeat(216), [0; 16]),
+            Request::Other(command_fixture("user".into(), Some("x".into()))),
         ] {
             assert_eq!(contract::check_refused(&request), Error::Unwritable);
         }
@@ -1960,10 +1928,10 @@ mod tests {
             ("NOOP", Some("a\tb")),
         ] {
             assert_eq!(
-                contract::check_refused(&Command {
-                    keyword: keyword.into(),
-                    argument: argument.map(String::from),
-                }),
+                contract::check_refused(&command_fixture(
+                    keyword.into(),
+                    argument.map(String::from)
+                )),
                 Error::Unwritable
             );
         }
@@ -1984,17 +1952,11 @@ mod tests {
     fn keywords_are_any_printable_ascii() {
         assert_eq!(
             command(b"X-AB 1"),
-            Ok(Command {
-                keyword: "X-AB".into(),
-                argument: Some("1".into())
-            })
+            Ok(command_fixture("X-AB".into(), Some("1".into())))
         );
         assert!(command(b"\xc3\xa9AB").is_err());
         assert_eq!(
-            contract::check_refused(&Command {
-                keyword: "x-ab".into(),
-                argument: None,
-            }),
+            contract::check_refused(&command_fixture("x-ab".into(), None)),
             Error::Unwritable
         );
         assert_eq!(command(b"x-ab").unwrap().to_bytes().unwrap(), b"X-AB\r\n");
@@ -2007,10 +1969,7 @@ mod tests {
         let request = Request::User(user.into());
         assert_eq!(Request::parse(&request.to_bytes().unwrap()), Ok(request));
         assert_eq!(
-            contract::check_refused(&Request::Apop {
-                name: user.repeat(10),
-                digest: [1; 16],
-            }),
+            contract::check_refused(&request_apop(user.repeat(10), [1; 16])),
             Error::Unwritable
         );
     }
@@ -2123,18 +2082,10 @@ mod tests {
     #[test]
     fn bodies_that_do_not_fit_are_refused_not_cut() {
         let line = [vec![b'b'; MAX_DATA_LINE - 2], b"\r\n".to_vec()].concat();
-        assert_eq!(
-            contract::check_refused(
-                &Reply::ok("1 message")
-                    .with_body([vec![b'a'; MAX_DATA_LINE], b"\r\n".to_vec()].concat())
-            ),
-            Error::Unwritable
-        );
-        assert_eq!(
-            contract::check_refused(
-                &Reply::ok("").with_body(line.repeat(MAX_BODY / line.len() + 1))
-            ),
-            Error::Unwritable
+        assert_cases!(|input| contract::check_refused(input);
+            long_data_line: &Reply::ok("1 message")
+                .with_body([vec![b'a'; MAX_DATA_LINE], b"\r\n".to_vec()].concat()) => Error::Unwritable,
+            long_body: &Reply::ok("").with_body(line.repeat(MAX_BODY / line.len() + 1)) => Error::Unwritable,
         );
         let dotted = [b".".as_slice(), &[b'c'; MAX_DATA_LINE - 4], b"\r\n"].concat();
         let reply = Reply::ok("").with_body([line.clone(), dotted].concat());
@@ -2153,15 +2104,9 @@ mod tests {
 
     #[test]
     fn arguments_are_counted_not_collected() {
-        let spaces = Command {
-            keyword: "USER".into(),
-            argument: Some(" ".repeat(rounds(8 << 20))),
-        };
+        let spaces = command_fixture("USER".into(), Some(" ".repeat(rounds(8 << 20))));
         assert_eq!(Request::from_command(&spaces), Err(Error::ArgumentSpacing));
-        let many = Command {
-            keyword: "LIST".into(),
-            argument: Some("1 ".repeat(1 << 20) + "1"),
-        };
+        let many = command_fixture("LIST".into(), Some("1 ".repeat(1 << 20) + "1"));
         assert_eq!(Request::from_command(&many), Err(Error::ExtraArgument));
         assert_eq!(request(b"TOP 1 2 3 "), Err(Error::ArgumentSpacing));
         assert_eq!(request(b"USER a b c d"), Err(Error::ExtraArgument));
@@ -2186,14 +2131,8 @@ mod tests {
             Request::Pass("p".repeat(248)),
             Request::Pass("open sesame ".into()),
             Request::User("é".into()),
-            Request::Apop {
-                name: "u".repeat(215),
-                digest: [7; 16],
-            },
-            Request::Other(Command {
-                keyword: "AUTH".into(),
-                argument: Some("PLAIN".into()),
-            }),
+            request_apop("u".repeat(215), [7; 16]),
+            Request::Other(command_fixture("AUTH".into(), Some("PLAIN".into()))),
             Request::Quit,
         ] {
             assert_eq!(
@@ -2381,10 +2320,7 @@ mod tests {
             contract::check_wire::<UniqueIdListing>(&data);
             let text = rng.text(530);
             let other = rng.text(530);
-            contract::check_wire_value(&Command {
-                keyword: rng.text(8),
-                argument: Some(text.clone()),
-            });
+            contract::check_wire_value(&command_fixture(rng.text(8), Some(text.clone())));
             contract::check_wire_value(&Reply {
                 ok: rng.coin(),
                 code: rng.coin().then(|| other.clone()),
@@ -2394,10 +2330,7 @@ mod tests {
             for request in [
                 Request::User(text.clone()),
                 Request::Pass(other.clone()),
-                Request::Apop {
-                    name: text,
-                    digest: [rng.next() as u8; 16],
-                },
+                request_apop(text, [rng.next() as u8; 16]),
             ] {
                 contract::check_wire_value(&request);
             }

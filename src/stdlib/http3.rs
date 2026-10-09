@@ -2290,9 +2290,35 @@ pub mod harness {
 mod tests {
     use super::harness::check_session_budget;
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{decode_all, mutate};
+
+    fn priority(urgency: Option<u8>, incremental: Option<bool>) -> Priority {
+        Priority {
+            urgency,
+            incremental,
+        }
+    }
+
+    fn unknown_fixture(frame_type: u64, payload: Vec<u8>) -> Frame {
+        Frame::Unknown {
+            frame_type,
+            payload,
+        }
+    }
+
+    fn push_promise(push_id: u64, field_section: Vec<u8>) -> Frame {
+        Frame::PushPromise {
+            push_id,
+            field_section,
+        }
+    }
+
+    fn priority_update(element: PriorityElement, value: Vec<u8>) -> Frame {
+        Frame::PriorityUpdate { element, value }
+    }
 
     fn event(
         state: &mut RequestStream,
@@ -2398,20 +2424,8 @@ mod tests {
             (Frame::Goaway(4), vec![7, 1, 4]),
             (Frame::MaxPushId(63), vec![0x0d, 1, 63]),
             (Frame::Headers(vec![0, 0, 0xd9]), vec![1, 3, 0, 0, 0xd9]),
-            (
-                Frame::PushPromise {
-                    push_id: 0,
-                    field_section: vec![0, 0, 0xd1],
-                },
-                vec![5, 4, 0, 0, 0, 0xd1],
-            ),
-            (
-                Frame::Unknown {
-                    frame_type: 0x21,
-                    payload: vec![0xaa],
-                },
-                vec![0x21, 1, 0xaa],
-            ),
+            (push_promise(0, vec![0, 0, 0xd1]), vec![5, 4, 0, 0, 0, 0xd1]),
+            (unknown_fixture(0x21, vec![0xaa]), vec![0x21, 1, 0xaa]),
         ];
         for (frame, bytes) in examples {
             assert_eq!(frame.to_bytes().unwrap(), bytes);
@@ -2477,44 +2491,20 @@ mod tests {
     #[test]
     fn rfc9218_priority_examples_exact_bytes() {
         for (bytes, expected) in [
-            (
-                b"u=0".as_slice(),
-                Priority {
-                    urgency: Some(0),
-                    incremental: None,
-                },
-            ),
-            (
-                b"u=5, i".as_slice(),
-                Priority {
-                    urgency: Some(5),
-                    incremental: Some(true),
-                },
-            ),
-            (
-                b"u=1".as_slice(),
-                Priority {
-                    urgency: Some(1),
-                    incremental: None,
-                },
-            ),
+            (b"u=0".as_slice(), priority(Some(0), None)),
+            (b"u=5, i".as_slice(), priority(Some(5), Some(true))),
+            (b"u=1".as_slice(), priority(Some(1), None)),
         ] {
             assert_eq!(Priority::parse(bytes), Ok(expected));
             assert_eq!(expected.to_bytes().unwrap(), bytes);
         }
-        let frame = Frame::PriorityUpdate {
-            element: PriorityElement::Request(0),
-            value: b"u=0, i".to_vec(),
-        };
+        let frame = priority_update(PriorityElement::Request(0), b"u=0, i".to_vec());
         assert_eq!(
             frame.to_bytes().unwrap(),
             [0x80, 0x0f, 7, 0, 7, 0, b'u', b'=', b'0', b',', b' ', b'i']
         );
         roundtrip(&frame);
-        roundtrip(&Frame::PriorityUpdate {
-            element: PriorityElement::Push(MAX_VARINT),
-            value: vec![],
-        });
+        roundtrip(&priority_update(PriorityElement::Push(MAX_VARINT), vec![]));
     }
     #[test]
     fn all_varint_widths_and_nonminimal_forms() {
@@ -2543,30 +2533,13 @@ mod tests {
                 Frame::parse(&[t]),
                 Err(Error::UnexpectedFrame(u64::from(t)))
             );
-            assert!(
-                Frame::Unknown {
-                    frame_type: u64::from(t),
-                    payload: vec![]
-                }
-                .to_bytes()
-                .is_err()
-            );
+            assert!(unknown_fixture(u64::from(t), vec![]).to_bytes().is_err());
         }
         for t in [0, 1, 3, 4, 5, 7, 0x0d, 0x0f0700, 0x0f0701] {
-            assert!(
-                Frame::Unknown {
-                    frame_type: t,
-                    payload: vec![]
-                }
-                .to_bytes()
-                .is_err()
-            );
+            assert!(unknown_fixture(t, vec![]).to_bytes().is_err());
         }
         for t in [0x21, 0x40, 0xff, MAX_VARINT] {
-            roundtrip(&Frame::Unknown {
-                frame_type: t,
-                payload: vec![],
-            });
+            roundtrip(&unknown_fixture(t, vec![]));
         }
     }
     #[test]
@@ -2589,21 +2562,13 @@ mod tests {
             b.extend_from_slice(&payload);
             assert_eq!(Frame::parse(&b), Err(Error::Id));
             assert_eq!(
-                Frame::PriorityUpdate {
-                    element: PriorityElement::Request(id),
-                    value: vec![]
-                }
-                .to_bytes(),
+                priority_update(PriorityElement::Request(id), vec![]).to_bytes(),
                 Err(Error::Unwritable)
             );
         }
         for value in [vec![0], vec![b'\r'], vec![b'\n'], vec![0x80]] {
             assert_eq!(
-                Frame::PriorityUpdate {
-                    element: PriorityElement::Push(0),
-                    value
-                }
-                .to_bytes(),
+                priority_update(PriorityElement::Push(0), value).to_bytes(),
                 Err(Error::Unwritable)
             );
         }
@@ -2663,19 +2628,12 @@ mod tests {
             Err(Error::Unwritable)
         );
         assert_eq!(
-            Frame::PushPromise {
-                push_id: 0,
-                field_section: vec![0; MAX_SECTION_BYTES + 1]
-            }
-            .to_bytes(),
+            push_promise(0, vec![0; MAX_SECTION_BYTES + 1]).to_bytes(),
             Err(Error::Unwritable)
         );
         assert_eq!(
-            Frame::PriorityUpdate {
-                element: PriorityElement::Push(0),
-                value: vec![b'a'; MAX_PRIORITY_BYTES + 1]
-            }
-            .to_bytes(),
+            priority_update(PriorityElement::Push(0), vec![b'a'; MAX_PRIORITY_BYTES + 1])
+                .to_bytes(),
             Err(Error::Unwritable)
         );
         for t in [0, 1, 4, 5, 0x0f0700] {
@@ -2703,10 +2661,7 @@ mod tests {
             Frame::Goaway(u64::MAX),
             Frame::CancelPush(MAX_VARINT + 1),
             Frame::MaxPushId(MAX_VARINT + 1),
-            Frame::Unknown {
-                frame_type: u64::MAX,
-                payload: vec![],
-            },
+            unknown_fixture(u64::MAX, vec![]),
         ] {
             assert_eq!(f.to_bytes(), Err(Error::Unwritable));
         }
@@ -2720,10 +2675,7 @@ mod tests {
             Frame::Data(vec![42; 257]),
             headers(&request()),
             Frame::CancelPush(MAX_VARINT),
-            Frame::Unknown {
-                frame_type: MAX_VARINT,
-                payload: vec![1, 2],
-            },
+            unknown_fixture(MAX_VARINT, vec![1, 2]),
         ] {
             let bytes = frame.to_bytes().unwrap();
             contract::check_wire_value(&frame);
@@ -2800,10 +2752,7 @@ mod tests {
         for frame in [
             Frame::Data(vec![]),
             Frame::Goaway(0),
-            Frame::Unknown {
-                frame_type: 0x21,
-                payload: vec![],
-            },
+            unknown_fixture(0x21, vec![]),
         ] {
             assert_eq!(control(Side::Client, &[frame]), Err(Error::MissingSettings));
         }
@@ -2814,10 +2763,7 @@ mod tests {
         for frame in [
             Frame::Data(vec![]),
             Frame::Headers(vec![]),
-            Frame::PushPromise {
-                push_id: 0,
-                field_section: vec![],
-            },
+            push_promise(0, vec![]),
         ] {
             let t = frame.frame_type();
             assert_eq!(
@@ -2840,14 +2786,8 @@ mod tests {
     fn control_sender_and_id_rules() {
         for frame in [
             Frame::MaxPushId(0),
-            Frame::PriorityUpdate {
-                element: PriorityElement::Request(0),
-                value: vec![],
-            },
-            Frame::PriorityUpdate {
-                element: PriorityElement::Push(0),
-                value: vec![],
-            },
+            priority_update(PriorityElement::Request(0), vec![]),
+            priority_update(PriorityElement::Push(0), vec![]),
         ] {
             assert_eq!(
                 control(Side::Server, &[settings(), frame.clone()]),
@@ -2855,51 +2795,40 @@ mod tests {
             );
             assert_eq!(control(Side::Client, &[settings(), frame]), Ok(()));
         }
-        assert_eq!(
-            control(
+        assert_cases!(|(sender, frames)| control(sender, frames);
+            push_id_decreases: (
                 Side::Client,
-                &[settings(), Frame::MaxPushId(2), Frame::MaxPushId(1)]
-            ),
-            Err(Error::Id)
-        );
-        assert_eq!(
-            control(
+                &[settings(), Frame::MaxPushId(2), Frame::MaxPushId(1)],
+            ) => Err(Error::Id),
+            push_id_repeats_or_increases: (
                 Side::Client,
                 &[
                     settings(),
                     Frame::MaxPushId(2),
                     Frame::MaxPushId(2),
-                    Frame::MaxPushId(3)
-                ]
-            ),
-            Ok(())
+                    Frame::MaxPushId(3),
+                ],
+            ) => Ok(()),
         );
         for sender in [Side::Client, Side::Server] {
-            assert_eq!(
-                control(
+            assert_cases!(|(sender, frames)| control(sender, frames);
+                goaway_decreases_or_repeats: (
                     sender,
                     &[
                         settings(),
                         Frame::Goaway(8),
                         Frame::Goaway(4),
-                        Frame::Goaway(4)
-                    ]
-                ),
-                Ok(())
+                        Frame::Goaway(4),
+                    ],
+                ) => Ok(()),
+                goaway_increases: (sender, &[settings(), Frame::Goaway(4), Frame::Goaway(8)])
+                    => Err(Error::Id),
+                cancel_push: (sender, &[settings(), Frame::CancelPush(0)]) => Ok(()),
             );
-            assert_eq!(
-                control(sender, &[settings(), Frame::Goaway(4), Frame::Goaway(8)]),
-                Err(Error::Id)
-            );
-            assert_eq!(control(sender, &[settings(), Frame::CancelPush(0)]), Ok(()));
         }
-        assert_eq!(
-            control(Side::Server, &[settings(), Frame::Goaway(1)]),
-            Err(Error::Id)
-        );
-        assert_eq!(
-            control(Side::Client, &[settings(), Frame::Goaway(1)]),
-            Ok(())
+        assert_cases!(|(sender, frames)| control(sender, frames);
+            server_goaway_stream_id: (Side::Server, &[settings(), Frame::Goaway(1)]) => Err(Error::Id),
+            client_goaway_push_id: (Side::Client, &[settings(), Frame::Goaway(1)]) => Ok(()),
         );
     }
     #[test]
@@ -2908,10 +2837,7 @@ mod tests {
             settings(),
             Frame::MaxPushId(400),
             Frame::Goaway(23),
-            Frame::Unknown {
-                frame_type: 0x21,
-                payload: vec![0; 20],
-            },
+            unknown_fixture(0x21, vec![0; 20]),
         ];
         let bytes = join(&frames);
         contract::check_decode_with_alloc_limit(
@@ -2989,10 +2915,7 @@ mod tests {
                 Frame::CancelPush(0),
                 Frame::Goaway(0),
                 Frame::MaxPushId(0),
-                Frame::PriorityUpdate {
-                    element: PriorityElement::Request(0),
-                    value: vec![],
-                },
+                priority_update(PriorityElement::Request(0), vec![]),
             ] {
                 assert_eq!(
                     messages(side, std::slice::from_ref(&frame)).1,
@@ -3007,10 +2930,7 @@ mod tests {
         assert_eq!(
             messages(
                 MessageSide::Request,
-                &[Frame::PushPromise {
-                    push_id: 0,
-                    field_section: encoded(&request())
-                }]
+                &[push_promise(0, encoded(&request()))]
             )
             .1,
             Err(Error::UnexpectedFrame(5))
@@ -3036,17 +2956,13 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert!(matches!(events.first(), Some(Event::Informational(_))));
         assert_eq!(events.len(), 5);
-        assert_eq!(
-            messages(
+        assert_cases!(|(side, frames)| messages(side, frames).1;
+            data_after_informational: (
                 MessageSide::Response,
-                &[headers(&response("103")), Frame::Data(vec![])]
-            )
-            .1,
-            Err(Error::UnexpectedFrame(0))
-        );
-        assert_eq!(
-            messages(MessageSide::Response, &[headers(&response("103"))]).1,
-            Err(Error::Incomplete)
+                &[headers(&response("103")), Frame::Data(vec![])],
+            ) => Err(Error::UnexpectedFrame(0)),
+            missing_final_response: (MessageSide::Response, &[headers(&response("103"))])
+                => Err(Error::Incomplete),
         );
         assert!(matches!(
             messages(
@@ -3077,14 +2993,8 @@ mod tests {
     }
     #[test]
     fn unknowns_and_promises_do_not_change_message_state() {
-        let unknown = Frame::Unknown {
-            frame_type: 0x21,
-            payload: vec![42],
-        };
-        let promise = Frame::PushPromise {
-            push_id: 7,
-            field_section: encoded(&request()),
-        };
+        let unknown = unknown_fixture(0x21, vec![42]);
+        let promise = push_promise(7, encoded(&request()));
         let trailer = headers(&fields(&[]));
         let frames = [
             unknown.clone(),
@@ -3654,10 +3564,7 @@ mod tests {
                 .to_bytes()
                 .unwrap();
             let frame = if pending == 2 {
-                Frame::PushPromise {
-                    push_id: 1,
-                    field_section: block,
-                }
+                push_promise(1, block)
             } else {
                 Frame::Headers(block)
             };
@@ -3761,10 +3668,7 @@ mod tests {
     #[test]
     fn push_stream_refuses_push_promise() {
         let table = plain_qpack();
-        let promise = Frame::PushPromise {
-            push_id: 7,
-            field_section: encoded(&request()),
-        };
+        let promise = push_promise(7, encoded(&request()));
         for started in [false, true] {
             let mut state = RequestStream::push(3).unwrap();
             if started {
@@ -3809,40 +3713,21 @@ mod tests {
         ] {
             assert_eq!(Priority::parse(value), Ok(Priority::default()));
         }
-        assert_eq!(
-            Priority::parse(b"u=1, u=5, i=?0, i"),
-            Ok(Priority {
-                urgency: Some(5),
-                incremental: Some(true)
-            })
-        );
-        assert_eq!(
-            Priority::parse(b"u=1, u=unknown, i, i=42"),
-            Ok(Priority::default())
+        assert_cases!(|input| Priority::parse(input);
+            last_priority_wins: b"u=1, u=5, i=?0, i" => Ok(priority(Some(5), Some(true))),
+            unknown_priority_resets: b"u=1, u=unknown, i, i=42" => Ok(Priority::default()),
         );
         let value = b"u=2;a=token;b=\"escaped\\\"\", other=(1;p=?0 \"x,y\" :YWI=:);v=1.2, i;z=?1";
-        assert_eq!(
-            Priority::parse(value),
-            Ok(Priority {
-                urgency: Some(2),
-                incremental: Some(true)
-            })
-        );
+        assert_eq!(Priority::parse(value), Ok(priority(Some(2), Some(true))));
         assert_eq!(Priority::default().effective_urgency(), 3);
         assert!(!Priority::default().effective_incremental());
         assert_eq!(
             Priority::parse(b"u=-0, i=?0"),
-            Ok(Priority {
-                urgency: Some(0),
-                incremental: Some(false)
-            })
+            Ok(priority(Some(0), Some(false)))
         );
         for u in 0..=7 {
             for i in [None, Some(false), Some(true)] {
-                let p = Priority {
-                    urgency: Some(u),
-                    incremental: i,
-                };
+                let p = priority(Some(u), i);
                 assert_eq!(Priority::parse(&p.to_bytes().unwrap()), Ok(p));
             }
         }
@@ -3881,25 +3766,13 @@ mod tests {
                 "{value:?}"
             );
         }
-        assert_eq!(
-            Priority {
-                urgency: Some(8),
-                incremental: None
-            }
-            .to_bytes(),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            Priority::parse(&vec![b' '; MAX_PRIORITY_BYTES + 1]),
-            Err(Error::Limit)
-        );
-        assert_eq!(
-            Priority::parse(
-                "x,".repeat(MAX_PRIORITY_MEMBERS + 1)
-                    .trim_end_matches(',')
-                    .as_bytes()
-            ),
-            Err(Error::Limit)
+        assert_eq!(priority(Some(8), None).to_bytes(), Err(Error::Unwritable));
+        assert_cases!(|input| Priority::parse(input);
+            byte_limit: &vec![b' '; MAX_PRIORITY_BYTES + 1] => Err(Error::Limit),
+            member_limit: "x,"
+                .repeat(MAX_PRIORITY_MEMBERS + 1)
+                .trim_end_matches(',')
+                .as_bytes() => Err(Error::Limit),
         );
         let value = format!("x=({})", "1 ".repeat(MAX_PRIORITY_ITEMS + 1));
         assert_eq!(Priority::parse(value.as_bytes()), Err(Error::Limit));
@@ -3909,13 +3782,7 @@ mod tests {
     #[test]
     fn priority_field_lines_are_combined_in_order() {
         let h = fields(&[("priority", "u=5"), ("x", "y"), ("priority", "i, u=1")]);
-        assert_eq!(
-            h.priority(),
-            Ok(Priority {
-                urgency: Some(1),
-                incremental: Some(true)
-            })
-        );
+        assert_eq!(h.priority(), Ok(priority(Some(1), Some(true))));
         assert_eq!(request().priority(), Ok(Priority::default()));
         let h = fields(&[("priority", "u=5,"), ("priority", "i")]);
         assert_eq!(h.priority(), Err(Error::Priority));
@@ -3927,19 +3794,13 @@ mod tests {
         }
         assert_eq!(
             Priority::parse(b"  u=1\t,\ti\t"),
-            Ok(Priority {
-                urgency: Some(1),
-                incremental: Some(true)
-            })
+            Ok(priority(Some(1), Some(true)))
         );
         for binary in ["", "YQ", "YQ=", "YQ==", "YWI", "YWI=", "YWJj", "YR=="] {
             let value = format!("x=:{binary}:, u=2");
             assert_eq!(
                 Priority::parse(value.as_bytes()),
-                Ok(Priority {
-                    urgency: Some(2),
-                    incremental: None
-                })
+                Ok(priority(Some(2), None))
             );
         }
         for binary in ["Y", "Y=", "=", "YWI==", "YWJj=", "Y Q==", "YQ\n=="] {
@@ -4052,14 +3913,8 @@ mod tests {
             let frame = match rng.index(5) {
                 0 => Frame::Data(bytes.clone()),
                 1 => Frame::Headers(bytes.clone()),
-                2 => Frame::Unknown {
-                    frame_type: 0x21,
-                    payload: bytes.clone(),
-                },
-                3 => Frame::PushPromise {
-                    push_id: rng.next(),
-                    field_section: bytes.clone(),
-                },
+                2 => unknown_fixture(0x21, bytes.clone()),
+                3 => push_promise(rng.next(), bytes.clone()),
                 _ => Frame::Goaway(rng.next()),
             };
             roundtrip(&frame);
@@ -4099,10 +3954,7 @@ mod tests {
     #[test]
     fn connect_tunnel_allows_only_data_and_extensions() {
         // RFC 9114 section 4.4: other known frames after the tunnel opens.
-        let promise = Frame::PushPromise {
-            push_id: 0,
-            field_section: encoded(&request()),
-        };
+        let promise = push_promise(0, encoded(&request()));
         for status in ["200", "204", "299"] {
             for late in [
                 headers(&fields(&[])),
@@ -4131,10 +3983,7 @@ mod tests {
             ],
         );
         assert_eq!(result, Err(Error::UnexpectedFrame(frame_type::HEADERS)));
-        let unknown = Frame::Unknown {
-            frame_type: 0x21,
-            payload: vec![1],
-        };
+        let unknown = unknown_fixture(0x21, vec![1]);
         let (events, result) = messages(
             MessageSide::ConnectResponse,
             &[headers(&response("200")), unknown.clone()],
@@ -4243,10 +4092,7 @@ mod tests {
             Err(Error::Message(_))
         ));
         assert_eq!(request().validate(HeaderKind::Promise), Ok(()));
-        let promise = Frame::PushPromise {
-            push_id: 0,
-            field_section: encoded(&host_only),
-        };
+        let promise = push_promise(0, encoded(&host_only));
         let (_, result) = messages(MessageSide::Response, &[promise]);
         assert!(matches!(result, Err(Error::Message(_))));
         let mut encoder = qpack::Encoder::new(0, MAX_FIELD_SECTION_SIZE);

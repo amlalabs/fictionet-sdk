@@ -2467,6 +2467,7 @@ fictionet::codec_from!(Error, Truncated, |_| Error::Truncated);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, pump};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{assert_linear, rounds};
@@ -2938,13 +2939,9 @@ mod tests {
         }
         // The 0-9 tag 'U' stays unknown, as in RabbitMQ, and so does a tag
         // no table uses.
-        assert_eq!(
-            Table::parse(&[0, 0, 0, 5, 1, b'a', b'U', 0, 1]),
-            Err(Error::FieldType(b'U'))
-        );
-        assert_eq!(
-            Table::parse(&[0, 0, 0, 4, 1, b'a', b'z', 0]),
-            Err(Error::FieldType(b'z'))
+        assert_cases!(|input| Table::parse(input);
+            unknown_uppercase_type: &[0, 0, 0, 5, 1, b'a', b'U', 0, 1] => Err(Error::FieldType(b'U')),
+            unknown_lowercase_type: &[0, 0, 0, 4, 1, b'a', b'z', 0] => Err(Error::FieldType(b'z')),
         );
     }
 
@@ -3000,16 +2997,10 @@ mod tests {
     fn reserved_fields_are_skipped() {
         // connection.open with capabilities "x" and insist set.
         let p = [0, 10, 0, 40, 1, b'/', 1, b'x', 1];
-        assert_eq!(
-            Method::parse(&p),
-            Ok(Method::ConnectionOpen {
-                virtual_host: s("/")
-            })
-        );
-        // channel.open-ok with a channel id; basic.publish with a ticket.
-        assert_eq!(
-            Method::parse(&[0, 20, 0, 11, 0, 0, 0, 2, 9, 9]),
-            Ok(Method::ChannelOpenOk)
+        assert_cases!(|input| Method::parse(input);
+            connection_open: &p => Ok(Method::ConnectionOpen { virtual_host: s("/") }),
+            // channel.open-ok with a channel id; basic.publish with a ticket.
+            channel_open_ok: &[0, 20, 0, 11, 0, 0, 0, 2, 9, 9] => Ok(Method::ChannelOpenOk),
         );
         let p = [0, 60, 0, 40, 0, 5, 0, 1, b'q', 0];
         let m = Method::parse(&p).unwrap();
@@ -3018,19 +3009,13 @@ mod tests {
 
     #[test]
     fn method_errors() {
-        assert_eq!(
-            Method::parse(&[0, 10, 0, 99]),
-            Err(Error::UnknownMethod {
-                class_id: 10,
-                method_id: 99
-            })
-        );
-        assert_eq!(
-            Method::parse(&[0, 30, 0, 10]),
-            Err(Error::UnknownMethod {
-                class_id: 30,
-                method_id: 10
-            })
+        assert_cases!(|input| Method::parse(input);
+            unknown_connection_method: &[0, 10, 0, 99]
+                => Err(Error::UnknownMethod {
+                    class_id: 10,
+                    method_id: 99,
+                }),
+            unknown_class: &[0, 30, 0, 10] => Err(Error::UnknownMethod { class_id: 30, method_id: 10 }),
         );
         assert_eq!(
             Error::UnknownMethod {
@@ -3233,28 +3218,24 @@ mod tests {
 
     #[test]
     fn plain_response() {
-        assert_eq!(
-            plain_credentials(b"\0guest\0secret"),
-            Some((&b"guest"[..], &b"secret"[..]))
+        assert_cases!(|input| plain_credentials(input);
+            empty_identity: b"\0guest\0secret" => Some((&b"guest"[..], &b"secret"[..])),
+            matching_identity: b"guest\0guest\0secret" => Some((&b"guest"[..], &b"secret"[..])),
+            // RFC 4616: the user and password are not empty, every part is
+            // UTF-8, and an authorization identity for another user is refused.
+            missing_password_and_wrong_identity: b"admin\0guest\0" => None,
+            empty_user_and_password: b"\0\0" => None,
+            empty_password: b"\0guest\0" => None,
+            empty_user: b"\0\0secret" => None,
+            invalid_user_utf8: b"\0\xff\0p" => None,
+            invalid_password_utf8: b"\0u\0\xff" => None,
+            invalid_identity_utf8: b"\xff\0u\0p" => None,
+            mismatched_identity: b"admin\0guest\0secret" => None,
+            empty_response: b"" => None,
+            missing_separators: b"guest" => None,
+            missing_password_separator: b"\0guest" => None,
+            extra_separator: b"\0a\0b\0c" => None,
         );
-        assert_eq!(
-            plain_credentials(b"guest\0guest\0secret"),
-            Some((&b"guest"[..], &b"secret"[..]))
-        );
-        // RFC 4616: the user and password are not empty, every part is
-        // UTF-8, and an authorization identity for another user is refused.
-        assert_eq!(plain_credentials(b"admin\0guest\0"), None);
-        assert_eq!(plain_credentials(b"\0\0"), None);
-        assert_eq!(plain_credentials(b"\0guest\0"), None);
-        assert_eq!(plain_credentials(b"\0\0secret"), None);
-        assert_eq!(plain_credentials(b"\0\xff\0p"), None);
-        assert_eq!(plain_credentials(b"\0u\0\xff"), None);
-        assert_eq!(plain_credentials(b"\xff\0u\0p"), None);
-        assert_eq!(plain_credentials(b"admin\0guest\0secret"), None);
-        assert_eq!(plain_credentials(b""), None);
-        assert_eq!(plain_credentials(b"guest"), None);
-        assert_eq!(plain_credentials(b"\0guest"), None);
-        assert_eq!(plain_credentials(b"\0a\0b\0c"), None);
     }
 
     #[test]
@@ -3295,27 +3276,14 @@ mod tests {
 
     #[test]
     fn content_header_errors() {
-        assert_eq!(
-            ContentHeader::parse(&[0, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(Error::ContentClass(50))
-        );
-        // The continuation flag and the unused bit are refused.
-        assert_eq!(
-            ContentHeader::parse(&[0, 60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
-            Err(Error::PropertyFlags(1))
-        );
-        assert_eq!(
-            ContentHeader::parse(&[0, 60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
-            Err(Error::PropertyFlags(2))
-        );
-        // A nonzero weight is refused (section 4.2.6.1).
-        assert_eq!(
-            ContentHeader::parse(&[0, 60, 0, 9, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0]),
-            Err(Error::Weight(9))
-        );
-        assert_eq!(
-            ContentHeader::parse(&[0, 60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(Error::Weight(1))
+        assert_cases!(|input| ContentHeader::parse(input);
+            wrong_content_class: &[0, 50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] => Err(Error::ContentClass(50)),
+            // The continuation flag and the unused bit are refused.
+            continuation_flag: &[0, 60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] => Err(Error::PropertyFlags(1)),
+            reserved_flag: &[0, 60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2] => Err(Error::PropertyFlags(2)),
+            // A nonzero weight is refused (section 4.2.6.1).
+            weight_nine: &[0, 60, 0, 9, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0] => Err(Error::Weight(9)),
+            weight_one: &[0, 60, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] => Err(Error::Weight(1)),
         );
         assert_eq!(Error::Weight(1).reply_code(), 505);
         // A wrong class is a frame error (section 4.2.6.1).
@@ -3636,19 +3604,17 @@ mod tests {
 
     #[test]
     fn content_needs_a_content_method_and_a_channel() {
-        assert_eq!(
-            content_frames(
+        assert_cases!(|(channel, method, properties, body, limit)|
+            content_frames(channel, method, properties, body, limit);
+            non_content_method: (
                 1,
                 &Method::TxSelect,
                 &BasicProperties::default(),
                 b"x",
-                4096
-            ),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            content_frames(0, &publish(), &BasicProperties::default(), b"x", 4096),
-            Err(Error::Unwritable)
+                4096,
+            ) => Err(Error::Unwritable),
+            zero_content_channel: (0, &publish(), &BasicProperties::default(), b"x", 4096)
+                => Err(Error::Unwritable),
         );
         assert_eq!(
             Frame::header(0, &ContentHeader::default()),
@@ -3660,13 +3626,9 @@ mod tests {
     fn channel_rules() {
         // Connection methods go on channel 0 and the rest off it (section
         // 4.2.3), in writers and readers alike.
-        assert_eq!(
-            Frame::method(1, &Method::ConnectionCloseOk),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            Frame::method(0, &Method::ChannelOpen),
-            Err(Error::Unwritable)
+        assert_cases!(|(channel, method)| Frame::method(channel, method);
+            connection_method_on_channel: (1, &Method::ConnectionCloseOk) => Err(Error::Unwritable),
+            channel_method_on_zero: (0, &Method::ChannelOpen) => Err(Error::Unwritable),
         );
         let close_ok = [1, 0, 1, 0, 0, 0, 4, 0, 10, 0, 51, 0xce];
         assert_eq!(

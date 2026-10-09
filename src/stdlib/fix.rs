@@ -2695,6 +2695,39 @@ mod tests {
     use fictionet::stdlib::test_support::decode_all;
     use fictionet::stdlib::test_support::rounds;
 
+    fn event_resend(begin: u32, end: u32) -> Event {
+        Event::Resend { begin, end }
+    }
+
+    fn event_rejected(sequence: u32, tag: Option<u32>, reason: u32) -> Event {
+        Event::Rejected {
+            sequence,
+            tag,
+            reason,
+        }
+    }
+
+    fn event_application(sequence: u32, possible_duplicate: bool) -> Event {
+        Event::Application {
+            sequence,
+            possible_duplicate,
+        }
+    }
+
+    const fn group_layout<'a>(
+        count_tag: u32,
+        delimiter_tag: u32,
+        members: &'a [u32],
+        nested: &'a [GroupLayout<'a>],
+    ) -> GroupLayout<'a> {
+        GroupLayout {
+            count_tag,
+            delimiter_tag,
+            members,
+            nested,
+        }
+    }
+
     // LOGON is the public Wikipedia Financial Information eXchange example
     // (https://en.wikipedia.org/wiki/Financial_Information_eXchange).
     // HEARTBEAT is constructed from it with sequence 178 and time +30 seconds.
@@ -3209,7 +3242,7 @@ mod tests {
                 .any(|a| matches!(a, Action::Event(Event::Disconnected(_))))
         );
         let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=61\x0135=2\x0134=3\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x017=1\x0116=0\x0110=206\x01", 2);
-        assert!(has_event(&actions, Event::Resend { begin: 1, end: 2 }));
+        assert!(has_event(&actions, event_resend(1, 2)));
         assert!(session.tick(2000, TIME).unwrap().is_empty());
         assert!(has_event(
             &session.tick(2001, TIME).unwrap(),
@@ -3254,13 +3287,7 @@ mod tests {
         let mut session = established(Version::Fix44);
         session.logout(b"bye", 0, TIME).unwrap();
         let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=52\x0135=8\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=088\x01", 1);
-        assert!(has_event(
-            &actions,
-            Event::Application {
-                sequence: 2,
-                possible_duplicate: false
-            }
-        ));
+        assert!(has_event(&actions, event_application(2, false)));
         assert_eq!(session.next_inbound(), 3);
     }
 
@@ -3285,7 +3312,7 @@ mod tests {
         ] {
             let mut session = established(version);
             let actions = received_bytes(&mut session, bytes, 1);
-            assert!(has_event(&actions, Event::Rejected { sequence: 2, tag: Some(tag), reason }), "{tag}");
+            assert!(has_event(&actions, event_rejected(2, Some(tag), reason)), "{tag}");
             assert_eq!(sends(&actions)[0].get(373), Some(reason.to_string().as_bytes()));
             assert_eq!(session.next_inbound(), 3);
             assert_eq!(session.phase(), Phase::Established);
@@ -3360,10 +3387,7 @@ mod tests {
         let mut session = established(Version::Fix44);
         assert!(has_event(
             &session.receive(&message, 1, TIME).unwrap(),
-            Event::Application {
-                sequence: 2,
-                possible_duplicate: false
-            }
+            event_application(2, false)
         ));
         for (time, accepted) in [
             (b"20270101-00:01:00.000".as_slice(), true),
@@ -3424,48 +3448,21 @@ mod tests {
         let mut session = established(Version::Fix44);
         session.outgoing = 40_001;
         let first = received_bytes(&mut session, b"8=FIX.4.4\x019=69\x0135=2\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x017=10005\x0116=40000\x0110=094\x01", 1);
-        assert!(has_event(
-            &first,
-            Event::Resend {
-                begin: 10005,
-                end: 20004
-            }
-        ));
+        assert!(has_event(&first, event_resend(10005, 20004)));
         let second = received_bytes(&mut session, b"8=FIX.4.4\x019=61\x0135=2\x0134=3\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x017=1\x0116=3\x0110=209\x01", 2);
-        assert!(has_event(
-            &second,
-            Event::Resend {
-                begin: 20005,
-                end: 30004
-            }
-        ));
+        assert!(has_event(&second, event_resend(20005, 30004)));
         assert_eq!(
             session.next_resend_range(),
-            Some(Event::Resend {
-                begin: 30005,
-                end: 40000
-            })
+            Some(event_resend(30005, 40000))
         );
-        assert_eq!(
-            session.next_resend_range(),
-            Some(Event::Resend { begin: 1, end: 3 })
-        );
+        assert_eq!(session.next_resend_range(), Some(event_resend(1, 3)));
         assert_eq!(session.next_resend_range(), None);
         session.replay_ranges.push_back((10001, 20000));
         let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=69\x0135=2\x0134=4\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x017=20001\x0116=20003\x0110=094\x01", 3);
-        assert!(has_event(
-            &actions,
-            Event::Resend {
-                begin: 10001,
-                end: 20000
-            }
-        ));
+        assert!(has_event(&actions, event_resend(10001, 20000)));
         assert_eq!(
             session.next_resend_range(),
-            Some(Event::Resend {
-                begin: 20001,
-                end: 20003
-            })
+            Some(event_resend(20001, 20003))
         );
         assert_eq!(session.next_resend_range(), None);
     }
@@ -3803,19 +3800,9 @@ mod tests {
 
     #[test]
     fn groups_follow_counts_delimiters_order_and_nesting() {
-        let nested = GroupLayout {
-            count_tag: 802,
-            delimiter_tag: 523,
-            members: &[523, 803],
-            nested: &[],
-        };
+        let nested = group_layout(802, 523, &[523, 803], &[]);
         let children = [nested];
-        let layout = GroupLayout {
-            count_tag: 453,
-            delimiter_tag: 448,
-            members: &[448, 447, 452, 802],
-            nested: &children,
-        };
+        let layout = group_layout(453, 448, &[448, 447, 452, 802], &children);
         let mut m = Message::new(Version::Fix44, b"D").unwrap();
         for (tag, value) in [
             (453, "2"),
@@ -3858,29 +3845,14 @@ mod tests {
         let mut zero = Message::new(Version::Fix44, b"D").unwrap();
         zero.push(453, b"0").unwrap();
         assert!(zero.group(2, &layout).unwrap().entries().is_empty());
-        let invalid = GroupLayout {
-            count_tag: 453,
-            delimiter_tag: 448,
-            members: &[448, 448],
-            nested: &[],
-        };
+        let invalid = group_layout(453, 448, &[448, 448], &[]);
         assert!(zero.group(2, &invalid).is_err());
     }
 
     #[test]
     fn nested_count_can_be_the_entry_delimiter_and_cycles_are_bounded() {
-        let inner = [GroupLayout {
-            count_tag: 802,
-            delimiter_tag: 523,
-            members: &[523],
-            nested: &[],
-        }];
-        let outer = GroupLayout {
-            count_tag: 453,
-            delimiter_tag: 802,
-            members: &[802],
-            nested: &inner,
-        };
+        let inner = [group_layout(802, 523, &[523], &[])];
+        let outer = group_layout(453, 802, &[802], &inner);
         let mut m = Message::new(Version::Fix44, b"D").unwrap();
         m.push(453, b"1")
             .unwrap()
@@ -3889,18 +3861,9 @@ mod tests {
             .push(523, b"a")
             .unwrap();
         assert_eq!(m.group(2, &outer).unwrap().entries().len(), 1);
-        static CYCLE: GroupLayout<'static> = GroupLayout {
-            count_tag: 1000,
-            delimiter_tag: 1001,
-            members: &[1001],
-            nested: &CYCLE_CHILD,
-        };
-        static CYCLE_CHILD: [GroupLayout<'static>; 1] = [GroupLayout {
-            count_tag: 1001,
-            delimiter_tag: 1000,
-            members: &[1000],
-            nested: &[CYCLE],
-        }];
+        static CYCLE: GroupLayout<'static> = group_layout(1000, 1001, &[1001], &CYCLE_CHILD);
+        static CYCLE_CHILD: [GroupLayout<'static>; 1] =
+            [group_layout(1001, 1000, &[1000], &[CYCLE])];
         assert_eq!(check_layout(&CYCLE, 1, &mut 0), Err(Error::Limit));
     }
 
@@ -4009,13 +3972,7 @@ mod tests {
             let app = NewOrderSingle::builder(version).unwrap().finish().unwrap();
             let out = sends(&client.send(&app, 3, TIME).unwrap()).remove(0);
             let events = server.receive(&out, 4, TIME).unwrap();
-            assert!(has_event(
-                &events,
-                Event::Application {
-                    sequence: 2,
-                    possible_duplicate: false
-                }
-            ));
+            assert!(has_event(&events, event_application(2, false)));
             let logout = sends(&client.logout(b"done", 5, TIME).unwrap()).remove(0);
             let actions = server.receive(&logout, 6, TIME).unwrap();
             assert_eq!(server.phase(), Phase::LogoutReceived);
@@ -4133,13 +4090,7 @@ mod tests {
             &[(43, b"Y"), (122, TIME), (11, b"four")],
         );
         let actions = s.receive(&replayed, 4, TIME).unwrap();
-        assert!(has_event(
-            &actions,
-            Event::Application {
-                sequence: 4,
-                possible_duplicate: true
-            }
-        ));
+        assert!(has_event(&actions, event_application(4, true)));
         assert_eq!(s.next_inbound(), 5);
         assert!(has_event(
             &s.receive(&gap, 5, TIME).unwrap(),
@@ -4159,14 +4110,7 @@ mod tests {
         assert_eq!(s.next_inbound(), 2);
         let missing = inbound(Version::Fix44, b"D", 2, &[(43, b"Y")]);
         let events = s.receive(&missing, 2, TIME).unwrap();
-        assert!(has_event(
-            &events,
-            Event::Rejected {
-                sequence: 2,
-                tag: Some(122),
-                reason: 1
-            }
-        ));
+        assert!(has_event(&events, event_rejected(2, Some(122), 1)));
         assert_eq!(s.next_inbound(), 3);
         checked(&events);
         let future = inbound(
@@ -4177,11 +4121,7 @@ mod tests {
         );
         assert!(has_event(
             &s.receive(&future, 3, TIME).unwrap(),
-            Event::Rejected {
-                sequence: 3,
-                tag: Some(122),
-                reason: 10
-            }
+            event_rejected(3, Some(122), 10)
         ));
         let low = inbound(Version::Fix44, b"0", 1, &[]);
         let events = s.receive(&low, 4, TIME).unwrap();
@@ -4209,14 +4149,7 @@ mod tests {
         let decrease = inbound(Version::Fix44, b"4", 999, &[(36, b"49")]);
         let events = s.receive(&decrease, 2, TIME).unwrap();
         checked(&events);
-        assert!(has_event(
-            &events,
-            Event::Rejected {
-                sequence: 999,
-                tag: Some(36),
-                reason: 5
-            }
-        ));
+        assert!(has_event(&events, event_rejected(999, Some(36), 5)));
         assert_eq!(s.phase(), Phase::Established);
         assert_eq!(s.next_inbound(), 50);
     }
@@ -4242,7 +4175,7 @@ mod tests {
         let request = inbound(Version::Fix44, b"2", 2, &[(7, b"1"), (16, b"0")]);
         assert!(has_event(
             &s.receive(&request, 4, LATER).unwrap(),
-            Event::Resend { begin: 1, end: 2 }
+            event_resend(1, 2)
         ));
         let rejected = inbound(Version::Fix44, b"3", 3, &[(45, b"2")]);
         assert!(has_event(
@@ -4265,13 +4198,7 @@ mod tests {
         s.outgoing = MAX_RESEND_RANGE * 3 + 2;
         let request = inbound(Version::Fix44, b"2", 2, &[(7, b"1"), (16, b"0")]);
         let events = s.receive(&request, 1, TIME).unwrap();
-        assert!(has_event(
-            &events,
-            Event::Resend {
-                begin: 1,
-                end: MAX_RESEND_RANGE
-            }
-        ));
+        assert!(has_event(&events, event_resend(1, MAX_RESEND_RANGE)));
         let mut last = MAX_RESEND_RANGE;
         while let Some(Event::Resend { begin, end }) = s.next_resend_range() {
             assert_eq!(begin, last + 1);
@@ -4364,21 +4291,13 @@ mod tests {
         let reordered = inbound(Version::Fixt11, b"D", 2, &[(1128, b"4")]);
         assert!(has_event(
             &s.receive(&reordered, 3, TIME).unwrap(),
-            Event::Application {
-                sequence: 2,
-                possible_duplicate: false
-            }
+            event_application(2, false)
         ));
     }
 
     #[test]
     fn group_validation_and_explicit_test_requests_are_transactional() {
-        let layout = GroupLayout {
-            count_tag: 384,
-            delimiter_tag: 372,
-            members: &[372, 385],
-            nested: &[],
-        };
+        let layout = group_layout(384, 372, &[372, 385], &[]);
         // FIX TagValue Encoding 4.3.6, the published two-entry example.
         let wire = wire_body(b"35=A\x01384=2\x01372=6\x01385=R\x01372=7\x01385=R\x01");
         let message = Message::parse_with_groups(&wire, &[layout]).unwrap();

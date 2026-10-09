@@ -2240,9 +2240,26 @@ fn ip_version(endpoints: &Endpoints) -> Version {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::mutate;
+
+    fn prefix_fixture(length: u8, options: u8, address: Ipv6Addr) -> Prefix {
+        Prefix {
+            length,
+            options,
+            address,
+        }
+    }
+
+    fn auth_cryptographic(key_id: u8, sequence: u32, digest: Vec<u8>) -> Auth {
+        Auth::Cryptographic {
+            key_id,
+            sequence,
+            digest,
+        }
+    }
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Packet, Error> {
         contract::check_collect_with(b, MAX_MESSAGE, |b| Packet::parse(b, e))
@@ -2465,11 +2482,7 @@ mod tests {
     }
 
     fn pfx(len: u8, a: &str) -> Prefix {
-        Prefix {
-            length: len,
-            options: 0,
-            address: a.parse().unwrap(),
-        }
+        prefix_fixture(len, 0, a.parse().unwrap())
     }
 
     fn lsa(ls_type: u16, body: LsaBody) -> Lsa {
@@ -2709,16 +2722,8 @@ mod tests {
         if v == Version::V2 {
             let mut auths = vec![
                 Auth::Simple(*b"password"),
-                Auth::Cryptographic {
-                    key_id: 1,
-                    sequence: 99,
-                    digest: vec![0xaa; 16],
-                },
-                Auth::Cryptographic {
-                    key_id: 2,
-                    sequence: 1,
-                    digest: vec![],
-                },
+                auth_cryptographic(1, 99, vec![0xaa; 16]),
+                auth_cryptographic(2, 1, vec![]),
                 Auth::Other {
                     kind: 9,
                     data: [1; 8],
@@ -2801,11 +2806,7 @@ mod tests {
             (0, "::1"),
             (33, "2001:db8:c000::"),
         ] {
-            let p = Prefix {
-                length,
-                options: 0,
-                address: a.parse().unwrap(),
-            };
+            let p = prefix_fixture(length, 0, a.parse().unwrap());
             let ia = lsa(
                 lsa_type_v3::INTER_AREA_PREFIX,
                 LsaBody::InterAreaPrefix(InterAreaPrefixLsa {
@@ -2840,14 +2841,7 @@ mod tests {
             "2001:db8:8000::".parse::<Ipv6Addr>().unwrap()
         );
         // A length past 128 is kept, for the writer to reject.
-        assert_eq!(
-            Prefix::new(200, 0, a),
-            Prefix {
-                length: 200,
-                options: 0,
-                address: a
-            }
-        );
+        assert_eq!(Prefix::new(200, 0, a), prefix_fixture(200, 0, a));
         // A prefix made with new reads back equal for every length, even
         // from an address with every bit set.
         for length in 0..=MAX_PREFIX_LEN {
@@ -2932,11 +2926,7 @@ mod tests {
         let e = v4_ends();
         let mut p = hello_v2(ip4(1, 1, 1, 1), vec![]);
         p.header = Header::V2 {
-            auth: Auth::Cryptographic {
-                key_id: 3,
-                sequence: 77,
-                digest: vec![9; 16],
-            },
+            auth: auth_cryptographic(3, 77, vec![9; 16]),
         };
         let b = p.frame(&e).unwrap();
         assert_eq!(b.len(), 44 + 16);
@@ -2952,11 +2942,7 @@ mod tests {
         );
         // A digest over 255 bytes cannot be written.
         p.header = Header::V2 {
-            auth: Auth::Cryptographic {
-                key_id: 3,
-                sequence: 77,
-                digest: vec![9; 256],
-            },
+            auth: auth_cryptographic(3, 77, vec![9; 256]),
         };
         assert_eq!(p.frame(&e), Err(Error::Field));
     }
@@ -3071,13 +3057,9 @@ mod tests {
         assert!(raw(v3, 0x2003, &[0, 0, 0, 0, 0, 0, 0, 0]).is_ok());
         // AS-External: F set without the forwarding address; a reference
         // without its ID.
-        assert_eq!(
-            raw(v3, 0x4005, &[0x02, 0, 0, 0, 0, 0, 0, 0]),
-            Err(Error::LsaBody)
-        );
-        assert_eq!(
-            raw(v3, 0x4005, &[0, 0, 0, 0, 0, 0, 0x20, 0x01]),
-            Err(Error::LsaBody)
+        assert_cases!(|(version, kind, bytes)| raw(version, kind, bytes);
+            missing_forwarding_address: (v3, 0x4005, &[0x02, 0, 0, 0, 0, 0, 0, 0]) => Err(Error::LsaBody),
+            missing_reference_id: (v3, 0x4005, &[0, 0, 0, 0, 0, 0, 0x20, 0x01]) => Err(Error::LsaBody),
         );
         // Link-LSA and Intra-Area-Prefix-LSA counts past the prefixes.
         let mut link = vec![0u8; 20];
@@ -3138,17 +3120,9 @@ mod tests {
                 }),
             )
         };
-        assert_eq!(
-            ext(vec![])
-                .frame(Version::V2)
-                .and_then(|frame| frame.to_bytes()),
-            Err(Error::Field)
-        );
-        assert_eq!(
-            ext(vec![ExternalRoute { tos: 4, ..route }])
-                .frame(Version::V2)
-                .and_then(|frame| frame.to_bytes()),
-            Err(Error::Field)
+        assert_cases!(|input| ext(input).frame(Version::V2).and_then(|frame| frame.to_bytes());
+            empty_external_routes: vec![] => Err(Error::Field),
+            nonzero_tos: vec![ExternalRoute { tos: 4, ..route }] => Err(Error::Field),
         );
         assert!(
             ext(vec![route, ExternalRoute { tos: 4, ..route }])
@@ -3424,11 +3398,7 @@ mod tests {
         // After a digest, with its checksum zero and not checked.
         let mut q = p.clone();
         q.header = Header::V2 {
-            auth: Auth::Cryptographic {
-                key_id: 1,
-                sequence: 5,
-                digest: vec![7; 16],
-            },
+            auth: auth_cryptographic(1, 5, vec![7; 16]),
         };
         let c = q.frame(&e).unwrap();
         assert_eq!(c.len(), 44 + 16 + 12);
@@ -3576,13 +3546,9 @@ mod tests {
     fn lsa_body_parse_is_capped() {
         let most = MAX_LSA - LSA_HEADER_LEN;
         assert!(LsaBody::parse(&vec![0; most], Version::V2, 10).is_ok());
-        assert_eq!(
-            LsaBody::parse(&vec![0; most + 1], Version::V2, 10),
-            Err(Error::TooLong)
-        );
-        assert_eq!(
-            LsaBody::parse(&vec![0; 1 << 20], Version::V3, lsa_type_v3::NETWORK),
-            Err(Error::TooLong)
+        assert_cases!(|(bytes, version, kind)| LsaBody::parse(bytes, version, kind);
+            v2_body_limit: (&vec![0; most + 1], Version::V2, 10) => Err(Error::TooLong),
+            v3_body_limit: (&vec![0; 1 << 20], Version::V3, lsa_type_v3::NETWORK) => Err(Error::TooLong),
         );
     }
 
@@ -4245,11 +4211,11 @@ mod tests {
                 auth: match rng.index(4) {
                     0 => Auth::Null,
                     1 => Auth::Simple([rng.next() as u8; 8]),
-                    2 => Auth::Cryptographic {
-                        key_id: rng.next() as u8,
-                        sequence: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
-                        digest: rng.bytes(32),
-                    },
+                    2 => auth_cryptographic(
+                        rng.next() as u8,
+                        u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
+                        rng.bytes(32),
+                    ),
                     _ => Auth::Other {
                         kind: 3 + rng.index(100) as u16,
                         data: [rng.next() as u8; 8],
@@ -4345,11 +4311,7 @@ mod tests {
         if !rng.coin() {
             Prefix::new(rng.next() as u8, rng.next() as u8, rng.ip6())
         } else {
-            Prefix {
-                length: rng.index(140) as u8,
-                options: rng.next() as u8,
-                address: rng.ip6(),
-            }
+            prefix_fixture(rng.index(140) as u8, rng.next() as u8, rng.ip6())
         }
     }
 

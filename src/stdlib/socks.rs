@@ -1529,9 +1529,14 @@ pub enum ClientPhase {
 mod tests {
     use super::*;
     use codec::{Decode, Fail, Lcg, Stream};
+    use fictionet::assert_cases;
     use fictionet::stdlib::test_support::assert_linear;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+
+    fn auth_request(username: Vec<u8>, password: Vec<u8>) -> AuthRequest {
+        AuthRequest { username, password }
+    }
 
     fn request() -> Request {
         Request {
@@ -1548,13 +1553,10 @@ mod tests {
         };
         assert_eq!(Greeting::parse(&[5, 2, 0, 2]), Ok(greeting.clone()));
         assert_eq!(greeting.to_bytes().unwrap(), [5, 2, 0, 2]);
-        assert_eq!(
-            Selection::parse(&[5, 2]),
-            Ok(Selection {
-                method: Method::UsernamePassword
-            })
+        assert_cases!(|input| Selection::parse(input);
+            username_password: &[5, 2] => Ok(Selection { method: Method::UsernamePassword }),
+            trailing_selection: &[5, 2, 9] => Err(Error::Trailing),
         );
-        assert_eq!(Selection::parse(&[5, 2, 9]), Err(Error::Trailing));
         assert_eq!(
             Selection {
                 method: Method::NoAcceptable
@@ -1601,18 +1603,12 @@ mod tests {
     #[test]
     fn rfc1929_login() {
         let bytes = [1, 5, b'a', b'l', b'i', b'c', b'e', 3, b'p', b'w', b'd'];
-        let auth = AuthRequest {
-            username: b"alice".to_vec(),
-            password: b"pwd".to_vec(),
-        };
+        let auth = auth_request(b"alice".to_vec(), b"pwd".to_vec());
         assert_eq!(AuthRequest::parse(&bytes), Ok(auth.clone()));
         assert_eq!(auth.to_bytes().unwrap(), bytes);
         assert_eq!(
             AuthRequest::parse(&[1, 0, 0]),
-            Ok(AuthRequest {
-                username: vec![],
-                password: vec![]
-            })
+            Ok(auth_request(vec![], vec![]))
         );
         assert_eq!(AuthReply::parse(&[1, 0]), Ok(AuthReply { status: 0 }));
         assert!(!AuthReply { status: 1 }.success());
@@ -1704,13 +1700,9 @@ mod tests {
         }
         assert_eq!(UdpHeader::parse(&bytes[..10]), Ok(header.clone()));
         assert_eq!(UdpHeader::parse(&bytes), Err(Error::Trailing));
-        assert_eq!(
-            UdpDatagram::parse(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 0]),
-            Err(Error::Reserved(1))
-        );
-        assert_eq!(
-            UdpDatagram::parse(&[0, 0, 0, 2]),
-            Err(Error::AddressType(2))
+        assert_cases!(|input| UdpDatagram::parse(input);
+            reserved_udp: &[0, 1, 0, 1, 0, 0, 0, 0, 0, 0] => Err(Error::Reserved(1)),
+            unsupported_address: &[0, 0, 0, 2] => Err(Error::AddressType(2)),
         );
         let full = header.clone().datagram(vec![7; MAX_DATAGRAM - 10]);
         let bytes = full.to_bytes().unwrap();
@@ -1757,17 +1749,10 @@ mod tests {
         }
         assert_eq!(Socks4Request::parse(bytes), Ok(req.clone()));
         assert_eq!(req.to_bytes().unwrap(), bytes);
-        assert_eq!(
-            Socks4Request::parse(&[4, 1, 0, 1, 0, 0, 0, 9, 0, b'a', 0])
-                .unwrap()
-                .destination,
-            Socks4Destination::Domain(b"a".to_vec())
-        );
-        assert_eq!(
-            Socks4Request::parse(&[4, 1, 0, 1, 0, 0, 0, 0, 0])
-                .unwrap()
-                .destination,
-            Socks4Destination::Ip(Ipv4Addr::UNSPECIFIED)
+        assert_cases!(|input| Socks4Request::parse(input).unwrap().destination;
+            domain_destination: &[4, 1, 0, 1, 0, 0, 0, 9, 0, b'a', 0]
+                => Socks4Destination::Domain(b"a".to_vec()),
+            unspecified_ip: &[4, 1, 0, 1, 0, 0, 0, 0, 0] => Socks4Destination::Ip(Ipv4Addr::UNSPECIFIED),
         );
         let reply = Socks4Reply {
             code: Socks4Code::Granted,
@@ -1863,63 +1848,31 @@ mod tests {
 
     #[test]
     fn writers_refuse_changes() {
-        assert_eq!(
-            contract::check_refused(&Greeting {
-                methods: vec![Method::NoAuth; MAX_METHODS + 1]
-            }),
-            Error::Unwritable
-        );
-        assert_eq!(
-            contract::check_refused(&Greeting {
-                methods: vec![Method::Other(0)]
-            }),
-            Error::Unwritable
-        );
-        assert_eq!(
-            contract::check_refused(&AuthRequest {
-                username: vec![0; 256],
-                password: vec![]
-            }),
-            Error::Unwritable
-        );
-        assert_eq!(
-            contract::check_refused(&AuthRequest {
-                username: vec![],
-                password: vec![0; 256]
-            }),
-            Error::Unwritable
-        );
-        assert_eq!(
-            contract::check_refused(&Request {
+        assert_cases!(|input| contract::check_refused(input);
+            excess_methods: &Greeting { methods: vec![Method::NoAuth; MAX_METHODS + 1] } => Error::Unwritable,
+            reserved_method: &Greeting { methods: vec![Method::Other(0)] } => Error::Unwritable,
+            long_username: &auth_request(vec![0; 256], vec![]) => Error::Unwritable,
+            long_password: &auth_request(vec![], vec![0; 256]) => Error::Unwritable,
+            long_request_domain: &Request {
                 address: Address::Domain(vec![0; 256]),
                 ..request()
-            }),
-            Error::Unwritable
-        );
-        assert_eq!(
-            contract::check_refused(&Reply {
+            } => Error::Unwritable,
+            long_reply_domain: &Reply {
                 address: Address::Domain(vec![0; 256]),
                 ..Reply::failure(ReplyCode::GeneralFailure)
-            }),
-            Error::Unwritable
-        );
-        assert_eq!(
-            contract::check_refused(&UdpHeader {
+            } => Error::Unwritable,
+            long_udp_domain: &UdpHeader {
                 fragment: 0,
                 address: Address::Domain(vec![0; 256]),
-                port: 0
-            }),
-            Error::Unwritable
+                port: 0,
+            } => Error::Unwritable,
         );
         let greeting = Greeting {
             methods: vec![Method::NoAuth; MAX_METHODS],
         };
         assert!(greeting.to_bytes().is_ok());
         contract::check_wire_value(&greeting);
-        let auth = AuthRequest {
-            username: vec![0; MAX_USERNAME],
-            password: vec![0; MAX_PASSWORD],
-        };
+        let auth = auth_request(vec![0; MAX_USERNAME], vec![0; MAX_PASSWORD]);
         assert!(auth.to_bytes().is_ok());
         contract::check_wire_value(&auth);
         let request = Request {
@@ -1974,10 +1927,7 @@ mod tests {
     fn client_handshake_login_and_handoff() {
         let mut stream = Stream::new(ClientMessages::new());
         assert_eq!(stream.decoder().phase(), ServerPhase::Greeting);
-        let auth = AuthRequest {
-            username: b"u".to_vec(),
-            password: b"p".to_vec(),
-        };
+        let auth = auth_request(b"u".to_vec(), b"p".to_vec());
         let mut bytes = vec![5, 1, 2];
         auth.write(&mut bytes).unwrap();
         request().write(&mut bytes).unwrap();

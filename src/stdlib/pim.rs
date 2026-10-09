@@ -1479,10 +1479,61 @@ fictionet::codec_from!(Error, Trailing, |error| Error::Trailing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::mutate;
+
+    fn register(null: bool, packet: Vec<u8>) -> Register {
+        Register { null, packet }
+    }
+
+    fn message_other(kind: u8, body: Vec<u8>) -> Message {
+        Message::Other { kind, body }
+    }
+
+    fn hello_option_other(kind: u16, value: Vec<u8>) -> HelloOption {
+        HelloOption::Other { kind, value }
+    }
+
+    fn message_register_stop(group: Group, source: IpAddr) -> Message {
+        Message::RegisterStop { group, source }
+    }
+
+    fn bootstrap_rp(address: IpAddr, holdtime: u16, priority: u8) -> BootstrapRp {
+        BootstrapRp {
+            address,
+            holdtime,
+            priority,
+        }
+    }
+
+    fn group_fixture(address: IpAddr, mask_len: u8, bidirectional: bool, zone: bool) -> Group {
+        Group {
+            address,
+            mask_len,
+            bidirectional,
+            zone,
+        }
+    }
+
+    fn candidate_rp(priority: u8, holdtime: u16, rp: IpAddr, groups: Vec<Group>) -> CandidateRp {
+        CandidateRp {
+            priority,
+            holdtime,
+            rp,
+            groups,
+        }
+    }
+
+    fn join_prune_group(group: Group, joins: Vec<Source>, prunes: Vec<Source>) -> JoinPruneGroup {
+        JoinPruneGroup {
+            group,
+            joins,
+            prunes,
+        }
+    }
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Message, Error> {
         contract::check_collect_with(b, MAX_MESSAGE, |b| Message::parse(b, e))
@@ -1553,10 +1604,7 @@ mod tests {
             HelloOption::DrPriority(1),
             HelloOption::GenerationId(0xdead_beef),
             HelloOption::AddressList(vec![v4(10, 0, 0, 9), v4(10, 0, 0, 10)]),
-            HelloOption::Other {
-                kind: 21,
-                value: vec![],
-            },
+            hello_option_other(21, vec![]),
         ]);
         let b = round_trip(&m, &v4_ends());
         // The LAN Prune Delay: type 2, length 4, T bit and 500, then 2500.
@@ -1611,11 +1659,11 @@ mod tests {
         let jp = Message::JoinPrune(JoinPrune {
             upstream: v4(10, 0, 0, 1),
             holdtime: 210,
-            groups: vec![JoinPruneGroup {
-                group: Group::single(v4(239, 1, 1, 1)),
-                joins: vec![Source::single(v6("2001:db8::1"))],
-                prunes: vec![],
-            }],
+            groups: vec![join_prune_group(
+                Group::single(v4(239, 1, 1, 1)),
+                vec![Source::single(v6("2001:db8::1"))],
+                vec![],
+            )],
         });
         assert_eq!(jp.frame(&e), Err(Error::FamilyMismatch(2)));
     }
@@ -1643,27 +1691,23 @@ mod tests {
             Message::JoinPrune(JoinPrune {
                 upstream: v4(10, 0, 0, 1),
                 holdtime: 1,
-                groups: vec![JoinPruneGroup {
-                    group: Group::single(v4(239, 1, 1, 1)),
-                    joins: vec![s],
-                    prunes: vec![],
-                }],
+                groups: vec![join_prune_group(
+                    Group::single(v4(239, 1, 1, 1)),
+                    vec![s],
+                    vec![],
+                )],
             })
             .frame(&e)
         };
-        assert_eq!(
-            write(Source {
+        assert_cases!(|input| write(input);
+            source_mask: Source {
                 mask_len: 24,
                 ..Source::single(v4(10, 1, 1, 0))
-            }),
-            Err(Error::MaskLen(24))
-        );
-        assert_eq!(
-            write(Source {
+            } => Err(Error::MaskLen(24)),
+            wildcard_source: Source {
                 wildcard: true,
                 ..Source::single(v4(10, 1, 1, 1))
-            }),
-            Err(Error::SourceFlags)
+            } => Err(Error::SourceFlags),
         );
     }
 
@@ -1672,10 +1716,7 @@ mod tests {
         let inner = vec![
             0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 239, 1, 1, 1,
         ];
-        let m = Message::Register(Register {
-            null: true,
-            packet: inner.clone(),
-        });
+        let m = Message::Register(register(true, inner.clone()));
         let b = round_trip(&m, &v4_ends());
         // Header 0x2100, flags 0x4000 0x0000: sum 0x6100, complement 0x9eff.
         assert_eq!(&b[..8], &[0x21, 0, 0x9e, 0xff, 0x40, 0, 0, 0]);
@@ -1704,10 +1745,7 @@ mod tests {
         // length of 8, as RFC 7761 section 4.9.3 says. The whole length is
         // accepted too.
         let e6 = v6_ends();
-        let m = Message::Register(Register {
-            null: true,
-            packet: inner_header(true),
-        });
+        let m = Message::Register(register(true, inner_header(true)));
         let b6 = round_trip(&m, &e6);
         for len in [REGISTER_HEADER_LEN, b6.len()] {
             let mut w = b6.clone();
@@ -1718,10 +1756,7 @@ mod tests {
 
     #[test]
     fn register_stop_bytes() {
-        let m = Message::RegisterStop {
-            group: Group::single(v4(239, 1, 2, 3)),
-            source: v4(10, 1, 1, 1),
-        };
+        let m = message_register_stop(Group::single(v4(239, 1, 2, 3)), v4(10, 1, 1, 1));
         let b = round_trip(&m, &v4_ends());
         assert_eq!(&b[4..], &[1, 0, 0, 32, 239, 1, 2, 3, 1, 0, 10, 1, 1, 1]);
         assert!(!m.is_link_local());
@@ -1734,25 +1769,25 @@ mod tests {
             upstream: v4(10, 0, 0, 1),
             holdtime: 210,
             groups: vec![
-                JoinPruneGroup {
-                    group: Group::single(v4(239, 1, 1, 1)),
-                    joins: vec![Source {
+                join_prune_group(
+                    Group::single(v4(239, 1, 1, 1)),
+                    vec![Source {
                         address: rp,
                         mask_len: 32,
                         sparse: true,
                         wildcard: true,
                         rpt: true,
                     }],
-                    prunes: vec![Source {
+                    vec![Source {
                         rpt: true,
                         ..Source::single(v4(10, 1, 1, 1))
                     }],
-                },
-                JoinPruneGroup {
-                    group: Group::single(v4(232, 1, 1, 1)),
-                    joins: vec![Source::single(v4(10, 2, 2, 2))],
-                    prunes: vec![],
-                },
+                ),
+                join_prune_group(
+                    Group::single(v4(232, 1, 1, 1)),
+                    vec![Source::single(v4(10, 2, 2, 2))],
+                    vec![],
+                ),
             ],
         });
         let b = round_trip(&m, &v4_ends());
@@ -1767,17 +1802,17 @@ mod tests {
         let m6 = Message::JoinPrune(JoinPrune {
             upstream: v6("fe80::1"),
             holdtime: 210,
-            groups: vec![JoinPruneGroup {
-                group: Group::single(v6("ff3e::1")),
-                joins: vec![Source {
+            groups: vec![join_prune_group(
+                Group::single(v6("ff3e::1")),
+                vec![Source {
                     address: v6("2001:db8::9"),
                     mask_len: 128,
                     sparse: true,
                     wildcard: true,
                     rpt: true,
                 }],
-                prunes: vec![],
-            }],
+                vec![],
+            )],
         });
         let b6 = round_trip(&m6, &v6_ends());
         assert_eq!(&b6[50..54], &[2, 0, 7, 128]);
@@ -1792,18 +1827,9 @@ mod tests {
             priority: 64,
             bsr: v4(10, 0, 0, 5),
             groups: vec![BootstrapGroup {
-                group: Group {
-                    address: v4(224, 0, 0, 0),
-                    mask_len: 4,
-                    bidirectional: false,
-                    zone: false,
-                },
+                group: group_fixture(v4(224, 0, 0, 0), 4, false, false),
                 rp_count: 2,
-                rps: vec![BootstrapRp {
-                    address: v4(10, 0, 0, 7),
-                    holdtime: 150,
-                    priority: 192,
-                }],
+                rps: vec![bootstrap_rp(v4(10, 0, 0, 7), 150, 192)],
             }],
         });
         let b = round_trip(&m, &v4_ends());
@@ -1841,17 +1867,12 @@ mod tests {
 
     #[test]
     fn candidate_rp_bytes() {
-        let m = Message::CandidateRp(CandidateRp {
-            priority: 192,
-            holdtime: 150,
-            rp: v4(10, 0, 0, 7),
-            groups: vec![Group {
-                address: v4(239, 0, 0, 0),
-                mask_len: 8,
-                bidirectional: true,
-                zone: true,
-            }],
-        });
+        let m = Message::CandidateRp(candidate_rp(
+            192,
+            150,
+            v4(10, 0, 0, 7),
+            vec![group_fixture(v4(239, 0, 0, 0), 8, true, true)],
+        ));
         let b = round_trip(&m, &v4_ends());
         assert_eq!(
             &b[4..],
@@ -1861,12 +1882,7 @@ mod tests {
         );
         // RFC 5059 section 4.2: no groups is never sent, but is read, as
         // a BSR reads one from an older router as every group.
-        let empty = Message::CandidateRp(CandidateRp {
-            priority: 0,
-            holdtime: 0,
-            rp: v4(1, 2, 3, 4),
-            groups: vec![],
-        });
+        let empty = Message::CandidateRp(candidate_rp(0, 0, v4(1, 2, 3, 4), vec![]));
         assert_eq!(empty.frame(&v4_ends()), Err(Error::Count));
         let b = fix(
             vec![0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 2, 3, 4],
@@ -1900,31 +1916,19 @@ mod tests {
             }
         );
         let g = Group::range(v4(239, 0, 0, 0), 8);
-        assert_eq!(
-            g,
-            Group {
-                address: v4(239, 0, 0, 0),
-                mask_len: 8,
-                bidirectional: false,
-                zone: false
-            }
-        );
+        assert_eq!(g, group_fixture(v4(239, 0, 0, 0), 8, false, false));
         let jp = Message::JoinPrune(JoinPrune {
             upstream: v4(10, 0, 0, 1),
             holdtime: 210,
-            groups: vec![JoinPruneGroup {
-                group: Group::single(v4(239, 0, 0, 1)),
-                joins: vec![Source::shared_tree(v4(10, 9, 9, 9))],
-                prunes: vec![],
-            }],
+            groups: vec![join_prune_group(
+                Group::single(v4(239, 0, 0, 1)),
+                vec![Source::shared_tree(v4(10, 9, 9, 9))],
+                vec![],
+            )],
         });
         round_trip(&jp, &e);
         assert_eq!(
-            Message::RegisterStop {
-                group: Group::range(v4(239, 0, 0, 0), 33),
-                source: v4(1, 1, 1, 1)
-            }
-            .frame(&e),
+            message_register_stop(Group::range(v4(239, 0, 0, 0), 33), v4(1, 1, 1, 1)).frame(&e),
             Err(Error::MaskLen(33))
         );
     }
@@ -1935,13 +1939,7 @@ mod tests {
         // message, and read back in one linear pass.
         let e = v6_ends();
         let n = (MAX_MESSAGE - HEADER_LEN) / 4;
-        let m = Message::Hello(vec![
-            HelloOption::Other {
-                kind: 9999,
-                value: vec![]
-            };
-            n
-        ]);
+        let m = Message::Hello(vec![hello_option_other(9999, vec![]); n]);
         let b = round_trip(&m, &e);
         assert_eq!(collect(&b, &e), Ok(m.clone()));
         // One more option is too long.
@@ -1957,19 +1955,19 @@ mod tests {
         let jp = Message::JoinPrune(JoinPrune {
             upstream: v6("fe80::1"),
             holdtime: 1,
-            groups: vec![JoinPruneGroup {
-                group: Group::single(v6("ff3e::1")),
+            groups: vec![join_prune_group(
+                Group::single(v6("ff3e::1")),
                 joins,
-                prunes: vec![],
-            }],
+                vec![],
+            )],
         });
         let b = round_trip(&jp, &e6);
         assert!(b.len() <= MAX_MESSAGE && b.len() + 20 > MAX_MESSAGE);
         // A largest Register over IPv6, with each checksum length.
-        let reg = Message::Register(Register {
-            null: false,
-            packet: vec![0x60; MAX_MESSAGE - REGISTER_HEADER_LEN],
-        });
+        let reg = Message::Register(register(
+            false,
+            vec![0x60; MAX_MESSAGE - REGISTER_HEADER_LEN],
+        ));
         let b = round_trip(&reg, &e6);
         let mut w = b.clone();
         w[2..4].copy_from_slice(&checksum_over(&b, b.len(), &e6).to_be_bytes());
@@ -1978,10 +1976,7 @@ mod tests {
 
     #[test]
     fn other_types_kept() {
-        let m = Message::Other {
-            kind: kind::GRAFT,
-            body: vec![1, 2, 3],
-        };
+        let m = message_other(kind::GRAFT, vec![1, 2, 3]);
         let b = round_trip(&m, &v4_ends());
         assert_eq!(b[0], 0x26);
         assert_eq!(m.kind(), 6);
@@ -1989,10 +1984,7 @@ mod tests {
 
     #[test]
     fn reserved_bits_ignored() {
-        let m = Message::RegisterStop {
-            group: Group::single(v4(239, 1, 2, 3)),
-            source: v4(10, 1, 1, 1),
-        };
+        let m = message_register_stop(Group::single(v4(239, 1, 2, 3)), v4(10, 1, 1, 1));
         let mut b = m.frame(&v4_ends()).unwrap();
         // The header's reserved byte and the group's reserved flag bits.
         b[1] = 0xff;
@@ -2020,43 +2012,27 @@ mod tests {
     #[test]
     fn parse_errors() {
         let e = v4_ends();
-        assert_eq!(Message::parse(&[], &e), Err(Error::Truncated));
-        assert_eq!(Message::parse(&[0x10], &e), Err(Error::Version(1)));
-        assert_eq!(Message::parse(&[0x20, 0, 0], &e), Err(Error::Truncated));
-        assert_eq!(Message::parse(&[0x20, 0, 0, 0], &e), Err(Error::Checksum));
-        assert_eq!(
-            Message::parse(&fix(vec![0x20, 0, 0, 0], &e), &e),
-            Ok(Message::Hello(vec![]))
-        );
-        // A Register needs its flags word.
-        assert_eq!(
-            Message::parse(&[0x21, 0, 0, 0, 0], &e),
-            Err(Error::Truncated)
+        assert_cases!(|(bytes, endpoints)| Message::parse(bytes, endpoints);
+            empty: (&[], &e) => Err(Error::Truncated),
+            wrong_version: (&[0x10], &e) => Err(Error::Version(1)),
+            short_header: (&[0x20, 0, 0], &e) => Err(Error::Truncated),
+            bad_checksum: (&[0x20, 0, 0, 0], &e) => Err(Error::Checksum),
+            empty_hello: (&fix(vec![0x20, 0, 0, 0], &e), &e) => Ok(Message::Hello(vec![])),
+            // A Register needs its flags word.
+            short_register: (&[0x21, 0, 0, 0, 0], &e) => Err(Error::Truncated),
         );
         let mut long = vec![0x26, 0, 0, 0];
         long.resize(MAX_MESSAGE + 1, 0);
         assert_eq!(Message::parse(&long, &e), Err(Error::TooLong));
         // Address family and encoding.
         let stop = |rest: &[u8]| fix([&[0x22, 0, 0, 0][..], rest].concat(), &e);
-        assert_eq!(
-            Message::parse(&stop(&[3, 0, 0, 32, 1, 1, 1, 1]), &e),
-            Err(Error::Family(3))
-        );
-        assert_eq!(
-            Message::parse(&stop(&[1, 1, 0, 32, 1, 1, 1, 1]), &e),
-            Err(Error::Encoding(1))
-        );
-        assert_eq!(
-            Message::parse(&stop(&[1, 0, 0, 33, 1, 1, 1, 1]), &e),
-            Err(Error::MaskLen(33))
-        );
-        assert_eq!(
-            Message::parse(&stop(&[1, 0, 0, 32, 1, 1, 1, 1, 1, 0, 1, 1, 1]), &e),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            Message::parse(&stop(&[1, 0, 0, 32, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 9]), &e),
-            Err(Error::Trailing { remaining: 1 })
+        assert_cases!(|(bytes, endpoints)| Message::parse(bytes, endpoints);
+            unsupported_family: (&stop(&[3, 0, 0, 32, 1, 1, 1, 1]), &e) => Err(Error::Family(3)),
+            unsupported_encoding: (&stop(&[1, 1, 0, 32, 1, 1, 1, 1]), &e) => Err(Error::Encoding(1)),
+            oversized_mask: (&stop(&[1, 0, 0, 33, 1, 1, 1, 1]), &e) => Err(Error::MaskLen(33)),
+            short_source: (&stop(&[1, 0, 0, 32, 1, 1, 1, 1, 1, 0, 1, 1, 1]), &e) => Err(Error::Truncated),
+            trailing_source: (&stop(&[1, 0, 0, 32, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 9]), &e)
+                => Err(Error::Trailing { remaining: 1 }),
         );
         // An IPv6 group may have a 128-bit mask, but no more.
         let e6 = v6_ends();
@@ -2067,26 +2043,15 @@ mod tests {
         assert_eq!(Message::parse(&stop6(&g6), &e6), Err(Error::MaskLen(129)));
         // Hello option lengths.
         let hello = |rest: &[u8]| fix([&[0x20, 0, 0, 0][..], rest].concat(), &e);
-        assert_eq!(
-            Message::parse(&hello(&[0, 1, 0, 3, 0, 0, 0]), &e),
-            Err(Error::OptionLength { kind: 1, len: 3 })
-        );
-        assert_eq!(
-            Message::parse(&hello(&[0, 19, 0, 2, 0, 0]), &e),
-            Err(Error::OptionLength { kind: 19, len: 2 })
-        );
-        assert_eq!(
-            Message::parse(&hello(&[0, 1, 0, 3, 0, 0]), &e),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            Message::parse(&hello(&[0, 1, 0]), &e),
-            Err(Error::Truncated)
-        );
-        // An address list that ends inside an address.
-        assert_eq!(
-            Message::parse(&hello(&[0, 24, 0, 3, 1, 0, 9]), &e),
-            Err(Error::Truncated)
+        assert_cases!(|(bytes, endpoints)| Message::parse(bytes, endpoints);
+            holdtime_length: (&hello(&[0, 1, 0, 3, 0, 0, 0]), &e)
+                => Err(Error::OptionLength { kind: 1, len: 3 }),
+            dr_priority_length: (&hello(&[0, 19, 0, 2, 0, 0]), &e)
+                => Err(Error::OptionLength { kind: 19, len: 2 }),
+            short_option_value: (&hello(&[0, 1, 0, 3, 0, 0]), &e) => Err(Error::Truncated),
+            short_option_header: (&hello(&[0, 1, 0]), &e) => Err(Error::Truncated),
+            // An address list that ends inside an address.
+            short_address_list: (&hello(&[0, 24, 0, 3, 1, 0, 9]), &e) => Err(Error::Truncated),
         );
         // A Join/Prune whose group count promises more than comes.
         let jp = fix(vec![0x23, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 200, 0, 10], &e);
@@ -2128,18 +2093,9 @@ mod tests {
     #[test]
     fn write_errors() {
         let e = v4_ends();
-        let bad_group = Group {
-            address: v4(239, 0, 0, 0),
-            mask_len: 33,
-            bidirectional: false,
-            zone: false,
-        };
+        let bad_group = group_fixture(v4(239, 0, 0, 0), 33, false, false);
         assert_eq!(
-            Message::RegisterStop {
-                group: bad_group,
-                source: v4(1, 1, 1, 1)
-            }
-            .frame(&e),
+            message_register_stop(bad_group, v4(1, 1, 1, 1)).frame(&e),
             Err(Error::MaskLen(33))
         );
         let bad_source = Source {
@@ -2155,41 +2111,19 @@ mod tests {
         };
         let g = Group::single(v4(239, 1, 1, 1));
         assert_eq!(
-            jp(vec![JoinPruneGroup {
-                group: g,
-                joins: vec![bad_source],
-                prunes: vec![]
-            }])
-            .frame(&e),
+            jp(vec![join_prune_group(g, vec![bad_source], vec![])]).frame(&e),
             Err(Error::MaskLen(129))
         );
-        let many = vec![
-            JoinPruneGroup {
-                group: g,
-                joins: vec![],
-                prunes: vec![]
-            };
-            256
-        ];
+        let many = vec![join_prune_group(g, vec![], vec![]); 256];
         assert_eq!(jp(many).frame(&e), Err(Error::Count));
         let lots = vec![Source::single(v4(1, 1, 1, 1)); 65536];
         assert_eq!(
-            jp(vec![JoinPruneGroup {
-                group: g,
-                joins: lots,
-                prunes: vec![]
-            }])
-            .frame(&e),
+            jp(vec![join_prune_group(g, lots, vec![])]).frame(&e),
             Err(Error::Count)
         );
         let lots = vec![Source::single(v4(1, 1, 1, 1)); 9000];
         assert_eq!(
-            jp(vec![JoinPruneGroup {
-                group: g,
-                joins: lots,
-                prunes: vec![]
-            }])
-            .frame(&e),
+            jp(vec![join_prune_group(g, lots, vec![])]).frame(&e),
             Err(Error::TooLong)
         );
         let a = Assert {
@@ -2206,44 +2140,21 @@ mod tests {
             override_interval: 0,
         };
         assert_eq!(Message::Hello(vec![lpd]).frame(&e), Err(Error::Value));
-        let other = HelloOption::Other {
-            kind: option::HOLDTIME,
-            value: vec![0, 1],
-        };
+        let other = hello_option_other(option::HOLDTIME, vec![0, 1]);
         assert_eq!(
             Message::Hello(vec![other]).frame(&e),
             Err(Error::Unwritable)
         );
-        let big = HelloOption::Other {
-            kind: 65000,
-            value: vec![0; 65536],
-        };
+        let big = hello_option_other(65000, vec![0; 65536]);
         assert_eq!(Message::Hello(vec![big]).frame(&e), Err(Error::Count));
         assert_eq!(
-            Message::Other {
-                kind: kind::ASSERT,
-                body: vec![]
-            }
-            .frame(&e),
+            message_other(kind::ASSERT, vec![]).frame(&e),
             Err(Error::Unwritable)
         );
-        assert_eq!(
-            Message::Other {
-                kind: 16,
-                body: vec![]
-            }
-            .frame(&e),
-            Err(Error::Unwritable)
-        );
-        let reg = Message::Register(Register {
-            null: false,
-            packet: vec![0x45; MAX_MESSAGE],
-        });
+        assert_eq!(message_other(16, vec![]).frame(&e), Err(Error::Unwritable));
+        let reg = Message::Register(register(false, vec![0x45; MAX_MESSAGE]));
         assert_eq!(reg.frame(&e), Err(Error::TooLong));
-        let reg = Message::Register(Register {
-            null: false,
-            packet: vec![0x45; MAX_MESSAGE_V4 - 8],
-        });
+        let reg = Message::Register(register(false, vec![0x45; MAX_MESSAGE_V4 - 8]));
         assert_eq!(reg.frame(&e).unwrap().len(), MAX_MESSAGE_V4);
         let bs = |rps| Bootstrap {
             no_forward: false,
@@ -2257,21 +2168,12 @@ mod tests {
                 rps,
             }],
         };
-        let rp = BootstrapRp {
-            address: v4(1, 1, 1, 1),
-            holdtime: 0,
-            priority: 0,
-        };
+        let rp = bootstrap_rp(v4(1, 1, 1, 1), 0, 0);
         assert_eq!(
             Message::Bootstrap(bs(vec![rp; 256])).frame(&e),
             Err(Error::Count)
         );
-        let crp = CandidateRp {
-            priority: 0,
-            holdtime: 0,
-            rp: v4(1, 1, 1, 1),
-            groups: vec![g; 256],
-        };
+        let crp = candidate_rp(0, 0, v4(1, 1, 1, 1), vec![g; 256]);
         assert_eq!(Message::CandidateRp(crp).frame(&e), Err(Error::Count));
         // Every error has a message.
         for err in [
@@ -2336,20 +2238,16 @@ mod tests {
             Message::JoinPrune(JoinPrune {
                 upstream: v4(10, 0, 0, 1),
                 holdtime: 210,
-                groups: vec![JoinPruneGroup {
+                groups: vec![join_prune_group(
                     group,
-                    joins: vec![Source::single(v4(10, 1, 1, 1))],
-                    prunes: vec![],
-                }],
+                    vec![Source::single(v4(10, 1, 1, 1))],
+                    vec![],
+                )],
             })
         };
-        assert_eq!(
-            jp(Group::range(v4(239, 0, 0, 0), 8)).frame(&e),
-            Err(Error::JoinPruneGroup)
-        );
-        assert_eq!(
-            jp(Group::single(v4(10, 0, 0, 1))).frame(&e),
-            Err(Error::JoinPruneGroup)
+        assert_cases!(|input| jp(input).frame(&e);
+            join_prune_range: Group::range(v4(239, 0, 0, 0), 8) => Err(Error::JoinPruneGroup),
+            join_prune_unicast: Group::single(v4(10, 0, 0, 1)) => Err(Error::JoinPruneGroup),
         );
         let b = round_trip(&jp(Group::single(v4(239, 0, 0, 1))), &e);
         // The unicast group 10.0.0.1, written by hand.
@@ -2364,11 +2262,11 @@ mod tests {
             Message::JoinPrune(JoinPrune {
                 upstream: v6("fe80::1"),
                 holdtime: 210,
-                groups: vec![JoinPruneGroup {
+                groups: vec![join_prune_group(
                     group,
-                    joins: vec![Source::single(v6("2001:db8::1"))],
-                    prunes: vec![],
-                }],
+                    vec![Source::single(v6("2001:db8::1"))],
+                    vec![],
+                )],
             })
         };
         assert_eq!(
@@ -2392,11 +2290,11 @@ mod tests {
             Message::JoinPrune(JoinPrune {
                 upstream: v4(10, 0, 0, 1),
                 holdtime: 210,
-                groups: vec![JoinPruneGroup {
-                    group: Group::single(v4(239, 1, 1, 1)),
+                groups: vec![join_prune_group(
+                    Group::single(v4(239, 1, 1, 1)),
                     joins,
                     prunes,
-                }],
+                )],
             })
         };
         let s = Source::single(v4(10, 1, 1, 1));
@@ -2435,12 +2333,7 @@ mod tests {
             Message::parse(&hex("21 00 de ff 00 00 00 00"), &e),
             Err(Error::Inner)
         );
-        let reg = |packet: Vec<u8>| {
-            Message::Register(Register {
-                null: false,
-                packet,
-            })
-        };
+        let reg = |packet: Vec<u8>| Message::Register(register(false, packet));
         assert_eq!(reg(vec![]).frame(&e), Err(Error::Inner));
         let v4h = inner_header(false);
         let v6h = inner_header(true);
@@ -2476,11 +2369,7 @@ mod tests {
             "24 00 f5 f7 00 01 1e 40 01 00 0a 00 00 05 01 00 00 20 ef 01 01 01 00 01 00 00 01 00 0a 00 00 07 00 96 c0 00",
         );
         assert_eq!(Message::parse(&b, &e), Err(Error::Count));
-        let rp = BootstrapRp {
-            address: v4(10, 0, 0, 7),
-            holdtime: 150,
-            priority: 192,
-        };
+        let rp = bootstrap_rp(v4(10, 0, 0, 7), 150, 192);
         let bs = |hash_mask_len: u8, bsr: IpAddr, groups: Vec<BootstrapGroup>| {
             Message::Bootstrap(Bootstrap {
                 no_forward: false,
@@ -2496,13 +2385,9 @@ mod tests {
             rp_count,
             rps,
         };
-        assert_eq!(
-            bs(30, v4(10, 0, 0, 5), vec![g(0, vec![rp])]).frame(&e),
-            Err(Error::Count)
-        );
-        assert_eq!(
-            bs(30, v4(10, 0, 0, 5), vec![g(1, vec![rp, rp])]).frame(&e),
-            Err(Error::Count)
+        assert_cases!(|(mask, address, groups)| bs(mask, address, groups).frame(&e);
+            zero_rp_count: (30, v4(10, 0, 0, 5), vec![g(0, vec![rp])]) => Err(Error::Count),
+            excess_rps: (30, v4(10, 0, 0, 5), vec![g(1, vec![rp, rp])]) => Err(Error::Count),
         );
         round_trip(
             &bs(30, v4(10, 0, 0, 5), vec![g(2, vec![rp, rp]), g(0, vec![])]),
@@ -2511,13 +2396,9 @@ mod tests {
         // RFC 5059 section 4.1 and RFC 7761 section 4.7.2: the hash mask
         // is a mask of the family, so at most 32 or 128 bits.
         round_trip(&bs(32, v4(10, 0, 0, 5), vec![]), &e);
-        assert_eq!(
-            bs(33, v4(10, 0, 0, 5), vec![]).frame(&e),
-            Err(Error::MaskLen(33))
-        );
-        assert_eq!(
-            bs(255, v4(10, 0, 0, 5), vec![]).frame(&e),
-            Err(Error::MaskLen(255))
+        assert_cases!(|(mask, address, groups)| bs(mask, address, groups).frame(&e);
+            mask_33: (33, v4(10, 0, 0, 5), vec![]) => Err(Error::MaskLen(33)),
+            mask_255: (255, v4(10, 0, 0, 5), vec![]) => Err(Error::MaskLen(255)),
         );
         let b = fix(hex("24 00 00 00 00 01 21 40 01 00 0a 00 00 05"), &e);
         assert_eq!(Message::parse(&b, &e), Err(Error::MaskLen(33)));
@@ -2536,12 +2417,7 @@ mod tests {
         // bits and the first group's scope.
         let e6 = v6_ends();
         let group = |a: &str, mask_len: u8, zone: bool| BootstrapGroup {
-            group: Group {
-                address: v6(a),
-                mask_len,
-                bidirectional: false,
-                zone,
-            },
+            group: group_fixture(v6(a), mask_len, false, zone),
             rp_count: 0,
             rps: vec![],
         };
@@ -2560,17 +2436,11 @@ mod tests {
             group("ff15:1::", 32, false),
         ]);
         let b = round_trip(&scoped, &e6);
-        assert_eq!(
-            bs(vec![group("ff05::", 8, true)]).frame(&e6),
-            Err(Error::Zone)
-        );
-        assert_eq!(
-            bs(vec![group("ff05::", 16, true), group("ff08::", 16, false)]).frame(&e6),
-            Err(Error::Zone)
-        );
-        assert_eq!(
-            bs(vec![group("ff05::", 16, true), group("ff05::", 12, false)]).frame(&e6),
-            Err(Error::Zone)
+        assert_cases!(|input| bs(input).frame(&e6);
+            short_zone: vec![group("ff05::", 8, true)] => Err(Error::Zone),
+            mixed_zones: vec![group("ff05::", 16, true), group("ff08::", 16, false)] => Err(Error::Zone),
+            overlapping_zones: vec![group("ff05::", 16, true), group("ff05::", 12, false)]
+                => Err(Error::Zone),
         );
         // Unscoped fragments have no such rule.
         round_trip(
@@ -2600,12 +2470,7 @@ mod tests {
         // 0, but one from an older router is read. Checksum worked out by
         // hand.
         let e = v4_ends();
-        let m = Message::CandidateRp(CandidateRp {
-            priority: 192,
-            holdtime: 150,
-            rp: v4(10, 0, 0, 7),
-            groups: vec![],
-        });
+        let m = Message::CandidateRp(candidate_rp(192, 150, v4(10, 0, 0, 7), vec![]));
         assert_eq!(
             Message::parse(&hex("28 00 cb a2 00 c0 00 96 01 00 0a 00 00 07"), &e),
             Ok(m.clone())
@@ -2623,15 +2488,9 @@ mod tests {
             zone: true,
             ..Group::single(v4(239, 1, 2, 3))
         };
-        let stop = Message::RegisterStop {
-            group: zoned,
-            source: v4(10, 1, 1, 1),
-        };
+        let stop = message_register_stop(zoned, v4(10, 1, 1, 1));
         assert_eq!(stop.frame(&e), Err(Error::Zone));
-        let plain = Message::RegisterStop {
-            group: Group::single(v4(239, 1, 2, 3)),
-            source: v4(10, 1, 1, 1),
-        };
+        let plain = message_register_stop(Group::single(v4(239, 1, 2, 3)), v4(10, 1, 1, 1));
         let mut b = plain.frame(&e).unwrap();
         b[6] |= 0x01;
         assert_eq!(Message::parse(&fix(b, &e), &e), Ok(plain));
@@ -2654,11 +2513,11 @@ mod tests {
             Message::JoinPrune(JoinPrune {
                 upstream: v4(10, 0, 0, 1),
                 holdtime: 210,
-                groups: vec![JoinPruneGroup {
+                groups: vec![join_prune_group(
                     group,
-                    joins: vec![Source::single(v4(10, 1, 1, 1))],
-                    prunes: vec![],
-                }],
+                    vec![Source::single(v4(10, 1, 1, 1))],
+                    vec![],
+                )],
             })
         };
         assert_eq!(jp(zoned).frame(&e), Err(Error::Zone));
@@ -2668,12 +2527,7 @@ mod tests {
         assert_eq!(Message::parse(&fix(b, &e), &e), Ok(plain));
         // A C-RP-Adv keeps it: a ZBR sets it there.
         round_trip(
-            &Message::CandidateRp(CandidateRp {
-                priority: 0,
-                holdtime: 150,
-                rp: v4(10, 0, 0, 7),
-                groups: vec![zoned],
-            }),
+            &Message::CandidateRp(candidate_rp(0, 150, v4(10, 0, 0, 7), vec![zoned])),
             &e,
         );
     }
@@ -2683,12 +2537,7 @@ mod tests {
         // RFC 791: an IPv4 packet is at most 65535 bytes with its 20-byte
         // header, so the PIM payload is at most 65515.
         let e = v4_ends();
-        let hello = |n: usize| {
-            Message::Hello(vec![HelloOption::Other {
-                kind: 9999,
-                value: vec![0; n],
-            }])
-        };
+        let hello = |n: usize| Message::Hello(vec![hello_option_other(9999, vec![0; n])]);
         assert_eq!(hello(MAX_MESSAGE - 8).encoded_len(), Ok(MAX_MESSAGE));
         assert_eq!(hello(MAX_MESSAGE - 8).frame(&e), Err(Error::TooLong));
         round_trip(&hello(MAX_MESSAGE - 8), &v6_ends());
@@ -2735,22 +2584,16 @@ mod tests {
                 HelloOption::DrPriority(7),
                 HelloOption::AddressList(vec![a(9)]),
             ]),
-            Message::Register(Register {
-                null: false,
-                packet: inner_header(six),
-            }),
-            Message::RegisterStop {
-                group: g,
-                source: a(0),
-            },
+            Message::Register(register(false, inner_header(six))),
+            message_register_stop(g, a(0)),
             Message::JoinPrune(JoinPrune {
                 upstream: a(1),
                 holdtime: 210,
-                groups: vec![JoinPruneGroup {
-                    group: g,
-                    joins: vec![Source::single(a(2))],
-                    prunes: vec![Source::single(a(3))],
-                }],
+                groups: vec![join_prune_group(
+                    g,
+                    vec![Source::single(a(2))],
+                    vec![Source::single(a(3))],
+                )],
             }),
             Message::Bootstrap(Bootstrap {
                 no_forward: false,
@@ -2761,11 +2604,7 @@ mod tests {
                 groups: vec![BootstrapGroup {
                     group: g,
                     rp_count: 1,
-                    rps: vec![BootstrapRp {
-                        address: a(7),
-                        holdtime: 150,
-                        priority: 1,
-                    }],
+                    rps: vec![bootstrap_rp(a(7), 150, 1)],
                 }],
             }),
             Message::Assert(Assert {
@@ -2775,16 +2614,8 @@ mod tests {
                 metric_preference: 1,
                 metric: 2,
             }),
-            Message::CandidateRp(CandidateRp {
-                priority: 1,
-                holdtime: 150,
-                rp: a(7),
-                groups: vec![g],
-            }),
-            Message::Other {
-                kind: 9,
-                body: vec![1, 2],
-            },
+            Message::CandidateRp(candidate_rp(1, 150, a(7), vec![g])),
+            message_other(9, vec![1, 2]),
         ]
     }
 
@@ -2855,12 +2686,7 @@ mod tests {
         fn group(&mut self, six: bool) -> Group {
             let address = self.addr(six);
             let mask_len = self.index(usize::from(full_mask(address)) + 1) as u8;
-            Group {
-                address,
-                mask_len,
-                bidirectional: self.coin(),
-                zone: self.coin(),
-            }
+            group_fixture(address, mask_len, self.coin(), self.coin())
         }
 
         /// A group with no Z bit, for messages outside the Bootstrap
@@ -2884,12 +2710,7 @@ mod tests {
                     IpAddr::V6(Ipv6Addr::from(o))
                 }
             };
-            Group {
-                address,
-                mask_len: full_mask(address),
-                bidirectional: self.coin(),
-                zone: false,
-            }
+            group_fixture(address, full_mask(address), self.coin(), false)
         }
 
         /// A Bootstrap's groups: the first may have the Z bit, and in a
@@ -2914,11 +2735,7 @@ mod tests {
                     group.mask_len = group.mask_len.max(16);
                 }
                 let rps: Vec<BootstrapRp> = (0..self.index(3))
-                    .map(|_| BootstrapRp {
-                        address: self.addr(six),
-                        holdtime: self.next() as u16,
-                        priority: self.next() as u8,
-                    })
+                    .map(|_| bootstrap_rp(self.addr(six), self.next() as u16, self.next() as u8))
                     .collect();
                 let rp_count = (rps.len() + self.index(250)) as u8;
                 groups.push(BootstrapGroup {
@@ -2960,26 +2777,19 @@ mod tests {
                         4 => HelloOption::AddressList(
                             (0..rng.index(4)).map(|_| rng.addr(six)).collect(),
                         ),
-                        _ => HelloOption::Other {
-                            kind: 100 + rng.next() as u16 % 100,
-                            value: vec![7; rng.index(9)],
-                        },
+                        _ => {
+                            hello_option_other(100 + rng.next() as u16 % 100, vec![7; rng.index(9)])
+                        }
                     })
                     .collect();
                 Message::Hello(options)
             }
-            1 => Message::Register(Register {
-                null: rng.coin(),
-                packet: {
-                    let mut p = inner_header(six);
-                    p.extend(rng.bytes(39));
-                    p
-                },
-            }),
-            2 => Message::RegisterStop {
-                group: rng.plain_group(six),
-                source: rng.addr(six),
-            },
+            1 => Message::Register(register(rng.coin(), {
+                let mut p = inner_header(six);
+                p.extend(rng.bytes(39));
+                p
+            })),
+            2 => message_register_stop(rng.plain_group(six), rng.addr(six)),
             3 => Message::JoinPrune(JoinPrune {
                 upstream: rng.addr(six),
                 holdtime: rng.next() as u16,
@@ -2996,11 +2806,7 @@ mod tests {
                             s.wildcard &= !seen;
                             seen |= s.wildcard;
                         }
-                        JoinPruneGroup {
-                            group,
-                            joins,
-                            prunes,
-                        }
+                        join_prune_group(group, joins, prunes)
                     })
                     .collect(),
             }),
@@ -3022,16 +2828,13 @@ mod tests {
                 metric_preference: (rng.next() as u32) & MAX_METRIC_PREFERENCE,
                 metric: (rng.next() as u32),
             }),
-            6 => Message::CandidateRp(CandidateRp {
-                priority: rng.next() as u8,
-                holdtime: rng.next() as u16,
-                rp: rng.addr(six),
-                groups: (0..1 + rng.index(4)).map(|_| rng.group(six)).collect(),
-            }),
-            _ => Message::Other {
-                kind: [6, 7, 9, 15][rng.index(4)],
-                body: vec![1; rng.index(10)],
-            },
+            6 => Message::CandidateRp(candidate_rp(
+                rng.next() as u8,
+                rng.next() as u16,
+                rng.addr(six),
+                (0..1 + rng.index(4)).map(|_| rng.group(six)).collect(),
+            )),
+            _ => message_other([6, 7, 9, 15][rng.index(4)], vec![1; rng.index(10)]),
         }
     }
 

@@ -975,6 +975,7 @@ pub mod harness {
 mod tests {
     use super::harness::total_fields;
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
@@ -1240,17 +1241,13 @@ mod tests {
             decode_varint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02]),
             Err(Error::VarintOverflow)
         );
-        assert_eq!(
-            Message::parse(&[
-                0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f
-            ]),
-            Err(Error::VarintOverflow)
-        );
-        // Field numbers.
-        assert_eq!(Message::parse(&[0x00, 0x01]), Err(Error::FieldNumber(0)));
-        assert_eq!(
-            Message::parse(&[0x80, 0x80, 0x80, 0x80, 0x10, 0]),
-            Err(Error::FieldNumber(1 << 29))
+        assert_cases!(|input| Message::parse(input);
+            overflowing_varint: &[
+                0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+            ] => Err(Error::VarintOverflow),
+            // Field numbers.
+            zero_field: &[0x00, 0x01] => Err(Error::FieldNumber(0)),
+            oversized_field: &[0x80, 0x80, 0x80, 0x80, 0x10, 0] => Err(Error::FieldNumber(1 << 29)),
         );
         assert!(Message::parse(&[0xf8, 0xff, 0xff, 0xff, 0x0f, 0]).is_ok());
         let mut w = Message::new();
@@ -1260,19 +1257,15 @@ mod tests {
         w.push_uint64(MAX_FIELD_NUMBER + 1, 1);
         assert_eq!(w.to_bytes(), Err(Error::FieldNumber(1 << 29)));
         // Wire types.
-        assert_eq!(Message::parse(&[0x0e]), Err(Error::WireType(6)));
-        assert_eq!(Message::parse(&[0x0f]), Err(Error::WireType(7)));
-        // Groups that do not match.
-        assert_eq!(Message::parse(&[0x0c]), Err(Error::EndGroup(1)));
-        assert_eq!(Message::parse(&[0x0b, 0x14]), Err(Error::EndGroup(2)));
-        assert_eq!(
-            Message::parse(&[0x0b, 0x08, 0x01]),
-            Err(Error::UnclosedGroup(1))
-        );
-        // Too long.
-        assert_eq!(
-            Message::parse(&vec![0; MAX_MESSAGE + 1]),
-            Err(Error::TooLong)
+        assert_cases!(|input| Message::parse(input);
+            wire_type_six: &[0x0e] => Err(Error::WireType(6)),
+            wire_type_seven: &[0x0f] => Err(Error::WireType(7)),
+            // Groups that do not match.
+            unexpected_end: &[0x0c] => Err(Error::EndGroup(1)),
+            mismatched_end: &[0x0b, 0x14] => Err(Error::EndGroup(2)),
+            unclosed_group: &[0x0b, 0x08, 0x01] => Err(Error::UnclosedGroup(1)),
+            // Too long.
+            oversized_message: &vec![0; MAX_MESSAGE + 1] => Err(Error::TooLong),
         );
         let mut w = Message::new();
         w.push_bytes(1, &vec![0; MAX_MESSAGE]);

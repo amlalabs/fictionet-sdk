@@ -1397,12 +1397,21 @@ mod codec_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, pump};
     use fictionet::stdlib::test_support;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{assert_linear, rounds};
     use tpkt::{MAX_PACKET, MAX_PAYLOAD, Packet};
+
+    fn parameter(code: u8, value: Vec<u8>) -> Parameter {
+        Parameter { code, value }
+    }
+
+    fn data_fixture(eot: bool, number: u8, data: Vec<u8>) -> Data {
+        Data { eot, number, data }
+    }
 
     // An RDP connection request (MS-RDPBCGR 4.1.1) starts with a TPKT
     // header and an X.224 connection request. Its length indicator, 14,
@@ -1433,27 +1442,17 @@ mod tests {
     // is refused rather than cut or masked into a different TPDU.
     #[test]
     fn from_tpdu_refuses_lossy_tpdus() {
-        let data = |n: usize, number: u8| {
-            Tpdu::Data(Data {
-                eot: true,
-                number,
-                data: vec![0x41; n],
-            })
-        };
+        let data = |n: usize, number: u8| Tpdu::Data(data_fixture(true, number, vec![0x41; n]));
         // The longest data a data TPDU in one packet carries: 3 header bytes.
         let fits = data(MAX_PAYLOAD - 3, 0);
         let p = over_tpkt::from_tpdu(&fits).unwrap();
         assert_eq!(p.payload.len(), MAX_PAYLOAD);
         assert_eq!(over_tpkt::tpdu(&p), Ok(fits));
-        assert_eq!(
-            over_tpkt::from_tpdu(&data(MAX_PAYLOAD - 2, 0)),
-            Err(Error::Unwritable)
+        assert_cases!(|input| over_tpkt::from_tpdu(input);
+            payload_limit: &data(MAX_PAYLOAD - 2, 0) => Err(Error::Unwritable),
+            oversized_payload: &data(65529, 0) => Err(Error::Unwritable),
+            invalid_number: &data(0, 0x80) => Err(Error::Unwritable),
         );
-        assert_eq!(
-            over_tpkt::from_tpdu(&data(65529, 0)),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(over_tpkt::from_tpdu(&data(0, 0x80)), Err(Error::Unwritable));
         let connect = |f: &dyn Fn(&mut Connect)| {
             let mut c = Connect::request(7);
             f(&mut c);
@@ -1461,24 +1460,17 @@ mod tests {
         };
         assert!(connect(&|_| ()).is_ok());
         assert!(connect(&|c| c.credit = 15).is_ok());
-        assert_eq!(connect(&|c| c.credit = 16), Err(Error::Unwritable));
-        assert_eq!(connect(&|c| c.class = 16), Err(Error::Unwritable));
-        assert_eq!(connect(&|c| c.options = 16), Err(Error::Unwritable));
-        // A parameter longer than its length byte, or more than a header holds.
-        assert_eq!(
-            connect(&|c| c.variable.set(0xc1, vec![0; 256])),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            connect(&|c| {
+        assert_cases!(|input| connect(input);
+            oversized_credit: &|c| c.credit = 16 => Err(Error::Unwritable),
+            oversized_class: &|c| c.class = 16 => Err(Error::Unwritable),
+            oversized_options: &|c| c.options = 16 => Err(Error::Unwritable),
+            // A parameter longer than its length byte, or more than a header holds.
+            long_parameter: &|c| c.variable.set(0xc1, vec![0; 256]) => Err(Error::Unwritable),
+            long_parameters: &|c| {
                 c.variable.set(0xc1, vec![0; 200]);
                 c.variable.set(0xc2, vec![0; 200]);
-            }),
-            Err(Error::Unwritable)
-        );
-        assert_eq!(
-            connect(&|c| c.variable = Variable::Raw(vec![0; 249])),
-            Err(Error::Unwritable)
+            } => Err(Error::Unwritable),
+            long_raw_variable: &|c| c.variable = Variable::Raw(vec![0; 249]) => Err(Error::Unwritable),
         );
         // Strict conversion refuses Raw bytes that read back as parameters,
         // including empty Raw. Use Variable::parse to choose the wire form.
@@ -1579,11 +1571,7 @@ mod tests {
         let packet_value = tpkt::Packet::new(packet[4..].to_vec());
         assert_eq!(
             over_tpkt::tpdu(&packet_value),
-            Ok(Tpdu::Data(Data {
-                eot: true,
-                number: 0,
-                data: vec![]
-            }))
+            Ok(Tpdu::Data(data_fixture(true, 0, vec![])))
         );
         assert_eq!(
             over_tpkt::from_tpdu(&over_tpkt::tpdu(&packet_value).unwrap()),
@@ -1606,13 +1594,9 @@ mod tests {
     #[test]
     fn tpkt_errors() {
         // Known from the first byte.
-        assert_eq!(
-            tpkt::Packet::parse_prefix(&[0x30]),
-            Err(tpkt::Error::Version(0x30))
-        );
-        assert_eq!(
-            tpkt::Packet::parse_prefix(&[2, 0, 0, 7, 2, 0xf0, 0x80]),
-            Err(tpkt::Error::Version(2))
+        assert_cases!(|input| tpkt::Packet::parse_prefix(input);
+            text_version: &[0x30] => Err(tpkt::Error::Version(0x30)),
+            old_version: &[2, 0, 0, 7, 2, 0xf0, 0x80] => Err(tpkt::Error::Version(2)),
         );
         for n in 0..tpkt::MIN_PACKET as u16 {
             let b = [3, 0, (n >> 8) as u8, n as u8];
@@ -1716,10 +1700,7 @@ mod tests {
         // A size value outside the code points is not echoed back.
         for bad in [vec![3u8], vec![14], vec![], vec![7, 0]] {
             let cr = Connect {
-                variable: Variable::Parameters(vec![Parameter {
-                    code: parameter::TPDU_SIZE,
-                    value: bad,
-                }]),
+                variable: Variable::Parameters(vec![parameter(parameter::TPDU_SIZE, bad)]),
                 ..Connect::default()
             };
             assert_eq!(
@@ -1764,24 +1745,9 @@ mod tests {
         };
         assert_eq!(back, cc);
         // Set on a list that already holds the code twice keeps one.
-        let mut v = Variable::Parameters(vec![
-            Parameter {
-                code: 1,
-                value: vec![1],
-            },
-            Parameter {
-                code: 1,
-                value: vec![2],
-            },
-        ]);
+        let mut v = Variable::Parameters(vec![parameter(1, vec![1]), parameter(1, vec![2])]);
         v.set(1, vec![3]);
-        assert_eq!(
-            v,
-            Variable::Parameters(vec![Parameter {
-                code: 1,
-                value: vec![3]
-            }])
-        );
+        assert_eq!(v, Variable::Parameters(vec![parameter(1, vec![3])]));
         // Set on raw bytes makes a list.
         let mut v = Variable::Raw(vec![1, 2, 3]);
         v.set(5, vec![]);
@@ -1819,10 +1785,7 @@ mod tests {
     fn tpdu_size_codes() {
         let size = |v: &[u8]| {
             let c = Connect {
-                variable: Variable::Parameters(vec![Parameter {
-                    code: 0xc0,
-                    value: v.to_vec(),
-                }]),
+                variable: Variable::Parameters(vec![parameter(0xc0, v.to_vec())]),
                 ..Connect::default()
             };
             c.tpdu_size()
@@ -1883,24 +1846,10 @@ mod tests {
     fn data_tpdus() {
         // X.224 13.7: LI 2, code F0, EOT and TPDU-NR.
         let t = Tpdu::parse(&[2, 0xf0, 0x80, 1, 2, 3]).unwrap();
-        assert_eq!(
-            t,
-            Tpdu::Data(Data {
-                eot: true,
-                number: 0,
-                data: vec![1, 2, 3]
-            })
-        );
+        assert_eq!(t, Tpdu::Data(data_fixture(true, 0, vec![1, 2, 3])));
         assert_eq!(t.to_bytes().unwrap(), [2, 0xf0, 0x80, 1, 2, 3]);
         let t = Tpdu::parse(&[2, 0xf0, 0x05]).unwrap();
-        assert_eq!(
-            t,
-            Tpdu::Data(Data {
-                eot: false,
-                number: 5,
-                data: vec![]
-            })
-        );
+        assert_eq!(t, Tpdu::Data(data_fixture(false, 5, vec![])));
         // Another class's data header.
         assert_eq!(
             Tpdu::parse(&[4, 0xf0, 0, 1, 0x80]),
@@ -1908,11 +1857,7 @@ mod tests {
         );
         assert_eq!(Tpdu::parse(&[1, 0xf0]), Err(Error::LengthIndicator(1)));
         // Data above the packet limit is refused.
-        let big = Tpdu::Data(Data {
-            eot: true,
-            number: 0,
-            data: vec![1; tpkt::MAX_PACKET],
-        });
+        let big = Tpdu::Data(data_fixture(true, 0, vec![1; tpkt::MAX_PACKET]));
         assert_eq!(big.to_bytes(), Err(Error::Unwritable));
         assert!(over_tpkt::from_tpdu(&big).is_err());
     }
@@ -1948,15 +1893,11 @@ mod tests {
         assert_eq!(er.invalid_tpdu(), Some(&bad[..]));
         let bytes = Tpdu::Error(er.clone()).to_bytes().unwrap();
         assert_eq!(bytes, [9, 0x70, 0, 7, 2, 0xc1, 3, 2, 0x10, 0x80]);
-        assert_eq!(Tpdu::parse(&bytes), Ok(Tpdu::Error(er)));
-        // No data may follow an error's header.
-        assert_eq!(
-            Tpdu::parse(&[4, 0x70, 0, 0, 0, 1]),
-            Err(Error::UnexpectedData)
-        );
-        assert_eq!(
-            Tpdu::parse(&[3, 0x70, 0, 0]),
-            Err(Error::LengthIndicator(3))
+        assert_cases!(|input| Tpdu::parse(input);
+            error_tpdu: &bytes => Ok(Tpdu::Error(er)),
+            // No data may follow an error's header.
+            trailing_error: &[4, 0x70, 0, 0, 0, 1] => Err(Error::UnexpectedData),
+            short_error: &[3, 0x70, 0, 0] => Err(Error::LengthIndicator(3)),
         );
         // Rejecting an empty or huge TPDU still writes a valid error.
         let er = ErrorTpdu::rejecting(0, &[], &Error::Empty);
@@ -1974,16 +1915,12 @@ mod tests {
 
     #[test]
     fn tpdu_errors() {
-        assert_eq!(Tpdu::parse(&[]), Err(Error::Empty));
-        assert_eq!(Tpdu::parse(&[255, 0xf0]), Err(Error::LengthIndicator(255)));
-        assert_eq!(Tpdu::parse(&[0]), Err(Error::Unsupported(0)));
-        assert_eq!(
-            Tpdu::parse(&[6, 0xe0, 0]),
-            Err(Error::Truncated { needed: 7, have: 3 })
-        );
-        assert_eq!(
-            Tpdu::parse(&[5, 0xe0, 0, 0, 0, 0]),
-            Err(Error::LengthIndicator(5))
+        assert_cases!(|input| Tpdu::parse(input);
+            empty: &[] => Err(Error::Empty),
+            oversized_indicator: &[255, 0xf0] => Err(Error::LengthIndicator(255)),
+            unsupported_type: &[0] => Err(Error::Unsupported(0)),
+            truncated_connect: &[6, 0xe0, 0] => Err(Error::Truncated { needed: 7, have: 3 }),
+            short_connect: &[5, 0xe0, 0, 0, 0, 0] => Err(Error::LengthIndicator(5)),
         );
         // Codes outside class 0: DC, ED, AK, EA, RJ.
         for c in [0xc0, 0x10, 0x61, 0x20, 0x51, 0x81, 0xf1, 0x71] {
@@ -2019,16 +1956,12 @@ mod tests {
             .unwrap()
             .to_bytes()
             .unwrap(),
-            Tpdu::Data(Data {
-                eot: true,
-                number: 0,
-                data: b"hello".to_vec(),
-            })
-            .to_bytes()
-            .map(tpkt::Packet::new)
-            .unwrap()
-            .to_bytes()
-            .unwrap(),
+            Tpdu::Data(data_fixture(true, 0, b"hello".to_vec()))
+                .to_bytes()
+                .map(tpkt::Packet::new)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
             Tpdu::Error(ErrorTpdu::rejecting(
                 3,
                 &[2, 0x10, 0],
@@ -2074,29 +2007,14 @@ mod tests {
 
     #[test]
     fn variable_parts() {
-        assert_eq!(Variable::parse(&[]), Variable::Parameters(vec![]));
-        assert_eq!(
-            Variable::parse(&[0xc0, 1, 7]),
-            Variable::Parameters(vec![Parameter {
-                code: 0xc0,
-                value: vec![7]
-            }])
+        assert_cases!(|input| Variable::parse(input);
+            empty_parameters: &[] => Variable::Parameters(vec![]),
+            valid_parameter: &[0xc0, 1, 7] => Variable::Parameters(vec![parameter(0xc0, vec![7])]),
+            // A length past the end, and a lone byte.
+            truncated_parameter: &[0xc0, 2, 7] => Variable::Raw(vec![0xc0, 2, 7]),
+            trailing_parameter: &[0xc0, 1, 7, 9] => Variable::Raw(vec![0xc0, 1, 7, 9]),
         );
-        // A length past the end, and a lone byte.
-        assert_eq!(
-            Variable::parse(&[0xc0, 2, 7]),
-            Variable::Raw(vec![0xc0, 2, 7])
-        );
-        assert_eq!(
-            Variable::parse(&[0xc0, 1, 7, 9]),
-            Variable::Raw(vec![0xc0, 1, 7, 9])
-        );
-        let params: Vec<Parameter> = (0..10)
-            .map(|i| Parameter {
-                code: i,
-                value: vec![i; 60],
-            })
-            .collect();
+        let params: Vec<Parameter> = (0..10).map(|i| parameter(i, vec![i; 60])).collect();
         let c = Connect {
             variable: Variable::Parameters(params),
             ..Connect::default()
@@ -2112,10 +2030,7 @@ mod tests {
             Err(Error::Unwritable)
         );
         let c = Connect {
-            variable: Variable::Parameters(vec![Parameter {
-                code: 1,
-                value: vec![0; 256],
-            }]),
+            variable: Variable::Parameters(vec![parameter(1, vec![0; 256])]),
             ..c
         };
         assert_eq!(
@@ -2141,11 +2056,7 @@ mod tests {
 
     #[test]
     fn reassembly() {
-        let seg = |eot, d: &[u8]| Data {
-            eot,
-            number: 0,
-            data: d.to_vec(),
-        };
+        let seg = |eot, d: &[u8]| data_fixture(eot, 0, d.to_vec());
         let mut r = Reassembler::new();
         assert_eq!(r.push(&seg(false, b"ab")), Ok(None));
         assert_eq!(r.pending(), 2);
@@ -2200,14 +2111,7 @@ mod tests {
             got = r.push(&back).unwrap();
         }
         assert_eq!(got, Some(msg));
-        assert_eq!(
-            segment(&[], 128),
-            vec![Data {
-                eot: true,
-                number: 0,
-                data: vec![]
-            }]
-        );
+        assert_eq!(segment(&[], 128), vec![data_fixture(true, 0, vec![])]);
         assert_eq!(segment(b"abc", 0).len(), 1);
         assert_eq!(segment(b"abc", usize::MAX).len(), 1);
     }
@@ -2215,14 +2119,10 @@ mod tests {
     #[test]
     fn stream_splits_packets() {
         let a = S7_CR.to_vec();
-        let b = over_tpkt::from_tpdu(&Tpdu::Data(Data {
-            eot: true,
-            number: 0,
-            data: b"x".to_vec(),
-        }))
-        .unwrap()
-        .to_bytes()
-        .unwrap();
+        let b = over_tpkt::from_tpdu(&Tpdu::Data(data_fixture(true, 0, b"x".to_vec())))
+            .unwrap()
+            .to_bytes()
+            .unwrap();
         let bytes: Vec<u8> = a.iter().chain(&b).copied().collect();
         contract::check_decode(Frames::<tpkt::Packet>::new, &bytes);
         let mut stream = Stream::new(Frames::<tpkt::Packet>::new());
@@ -2250,10 +2150,7 @@ mod tests {
         let cc = cr.confirm(2).unwrap();
         assert_eq!(
             cc.variable,
-            Variable::Parameters(vec![Parameter {
-                code: parameter::TPDU_SIZE,
-                value: vec![7]
-            }])
+            Variable::Parameters(vec![parameter(parameter::TPDU_SIZE, vec![7])])
         );
         let v = Variable::parse(&[0xc2, 1, 1, 0xc1, 1, 5, 0xc2, 1, 2]);
         assert_eq!(v.get(parameter::CALLED_TSAP), Some(&[2][..]));
@@ -2363,12 +2260,8 @@ mod tests {
 
     #[test]
     fn stream_bounds_a_burst_and_retains_partial_packet() {
-        let packet = over_tpkt::from_tpdu(&Tpdu::Data(Data {
-            eot: true,
-            number: 0,
-            data: vec![1; 1000],
-        }))
-        .unwrap();
+        let packet =
+            over_tpkt::from_tpdu(&Tpdu::Data(data_fixture(true, 0, vec![1; 1000]))).unwrap();
         let one = packet.to_bytes().unwrap();
         let mut bytes = one.repeat(1000);
         bytes.extend_from_slice(&one[..10]);
@@ -2394,16 +2287,12 @@ mod tests {
             "stream_takes_many_small_packets_in_linear_time",
             rounds(50_000),
             |size| {
-                let one = Tpdu::Data(Data {
-                    eot: true,
-                    number: 0,
-                    data: vec![1],
-                })
-                .to_bytes()
-                .map(tpkt::Packet::new)
-                .unwrap()
-                .to_bytes()
-                .unwrap();
+                let one = Tpdu::Data(data_fixture(true, 0, vec![1]))
+                    .to_bytes()
+                    .map(tpkt::Packet::new)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap();
                 let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * size).collect();
                 let mut d = Stream::new(Frames::<tpkt::Packet>::new());
                 let mut n = 0;
@@ -2532,11 +2421,7 @@ mod tests {
                     variable,
                     data,
                 }),
-                3 => Tpdu::Data(Data {
-                    eot: !rng.coin(),
-                    number: rng.below(128) as u8,
-                    data,
-                }),
+                3 => Tpdu::Data(data_fixture(!rng.coin(), rng.below(128) as u8, data)),
                 _ => Tpdu::Error(ErrorTpdu {
                     dst_ref: rng.next() as u16,
                     cause: rng.next() as u8,

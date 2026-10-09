@@ -1148,6 +1148,7 @@ fn is_scalar_byte(c: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
@@ -1338,13 +1339,9 @@ mod tests {
         let big = Number::from_text("1e400").unwrap();
         assert!(big.as_f64().is_infinite());
         assert_eq!(big.as_i64(), None);
-        assert_eq!(
-            Number::from_text("9223372036854775807").unwrap().as_i64(),
-            Some(i64::MAX)
-        );
-        assert_eq!(
-            Number::from_text("9223372036854775808").unwrap().as_i64(),
-            None
+        assert_cases!(|input| Number::from_text(input).unwrap().as_i64();
+            maximum_i64: "9223372036854775807" => Some(i64::MAX),
+            overflowing_i64: "9223372036854775808" => None,
         );
         assert_eq!(
             Number::from_text("9223372036854775808").unwrap().as_u64(),
@@ -1677,19 +1674,17 @@ mod tests {
             assert_eq!(stream.next(), None);
             check(text.as_bytes());
         }
-        assert_eq!(
-            decode_all(Values::new, b"{\"a\":1}\n42"),
-            (vec![Value::parse(b"{\"a\":1}").unwrap(), n("42")], None)
-        );
-        assert_eq!(
-            decode_all(Values::new, b"[x"),
-            (
-                vec![],
-                Some(Fail::Protocol(Error::at(
-                    ErrorKind::UnexpectedByte(b'x'),
-                    1
-                )))
-            )
+        assert_cases!(|(make, bytes)| decode_all(make, bytes);
+            consecutive_values: (Values::new, b"{\"a\":1}\n42")
+                => (vec![Value::parse(b"{\"a\":1}").unwrap(), n("42")], None),
+            malformed_array: (Values::new, b"[x")
+                => (
+                    vec![],
+                    Some(Fail::Protocol(Error::at(
+                        ErrorKind::UnexpectedByte(b'x'),
+                        1,
+                    ))),
+                ),
         );
         for input in [b"[x".as_slice(), b"{x", b"\"\\q", b"\"a\n"] {
             check(input);

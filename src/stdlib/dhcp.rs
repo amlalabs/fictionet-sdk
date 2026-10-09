@@ -287,6 +287,7 @@ impl Wire for Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::test_support::contract::{check_wire, check_wire_value};
 
     fn discover() -> Message {
@@ -347,15 +348,11 @@ mod tests {
         assert_eq!(Message::parse(&bytes[..239]), Err(Error::Short));
         let mut magic = bytes.clone();
         magic[236] = 0;
-        assert_eq!(Message::parse(&magic), Err(Error::Magic));
-        // An option cut short, in its length or its value.
-        assert_eq!(
-            Message::parse(&[&bytes[..MIN_MESSAGE], &[53]].concat()),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            Message::parse(&[&bytes[..MIN_MESSAGE], &[53, 2, 1]].concat()),
-            Err(Error::Truncated)
+        assert_cases!(|input| Message::parse(input);
+            wrong_magic: &magic => Err(Error::Magic),
+            // An option cut short, in its length or its value.
+            missing_option_length: &[&bytes[..MIN_MESSAGE], &[53]].concat() => Err(Error::Truncated),
+            truncated_option_value: &[&bytes[..MIN_MESSAGE], &[53, 2, 1]].concat() => Err(Error::Truncated),
         );
         // No end option is allowed; anything but padding after it is not.
         assert!(Message::parse(&[&bytes[..MIN_MESSAGE], &[53, 1, 1]].concat()).is_ok());

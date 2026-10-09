@@ -501,4 +501,8 @@ fn copied_assert_cases() {
         (&[]) => Err(vxlan::Error::Truncated(0)),
         (&[0; 7]) => Err(vxlan::Error::Truncated(7)),
     }
+    fictionet::assert_cases!(|value| value;
+        byte: 1u8 => 1u8,
+        text: "copied" => "copied",
+    );
 }

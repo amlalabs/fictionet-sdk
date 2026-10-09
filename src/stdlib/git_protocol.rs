@@ -1831,10 +1831,23 @@ pub mod harness {
 mod tests {
     use super::harness::check;
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
+
+    fn advertised_ref(id: ObjectId, name: String) -> AdvertisedRef {
+        AdvertisedRef { id, name }
+    }
+
+    fn command_fixture(name: String, capabilities: Vec<Capability>, args: Vec<String>) -> Command {
+        Command {
+            name,
+            capabilities,
+            args,
+        }
+    }
 
     const A: &str = "7217a7c7e582c46cec22a130adf4b9d7d950fba0";
     const B: &str = "1d3fcd5ced445d1abc402225c0b8a1299641f497";
@@ -1860,11 +1873,11 @@ mod tests {
     // Examples from gitprotocol-common, "pkt-line Format".
     #[test]
     fn review_writer_validation() {
-        let request = V2Request::Command(Command {
-            name: "fetch".into(),
-            capabilities: vec![],
-            args: vec!["ERR stopped".into()],
-        });
+        let request = V2Request::Command(command_fixture(
+            "fetch".into(),
+            vec![],
+            vec!["ERR stopped".into()],
+        ));
         let mut encoded = Vec::new();
         request.encode(&mut encoded).unwrap();
         assert_eq!(V2Request::parse(&encoded), Ok(request.clone()));
@@ -2083,21 +2096,12 @@ mod tests {
         assert!(syntax(b"git-upload-pack /x\0\0version=2"));
         // Each extra parameter has at least one byte, and the NUL before
         // them is followed by at least one.
-        assert_eq!(
-            ProtoRequest::from_data(b"git-upload-pack /x\0\0a\0\0"),
-            Err(Error::Syntax("an extra parameter"))
-        );
-        assert_eq!(
-            ProtoRequest::from_data(b"git-upload-pack /x\0\0\0"),
-            Err(Error::Syntax("an extra parameter"))
-        );
-        assert_eq!(
-            ProtoRequest::from_data(b"git-upload-pack /x\0host=h\0\0"),
-            Err(Error::Syntax("an extra parameter"))
-        );
-        assert_eq!(
-            ProtoRequest::from_data(b"git-upload-pack /\xff\0"),
-            Err(Error::Text)
+        assert_cases!(|input| ProtoRequest::from_data(input);
+            extra_parameter: b"git-upload-pack /x\0\0a\0\0" => Err(Error::Syntax("an extra parameter")),
+            empty_extra_parameter: b"git-upload-pack /x\0\0\0" => Err(Error::Syntax("an extra parameter")),
+            host_without_parameter: b"git-upload-pack /x\0host=h\0\0"
+                => Err(Error::Syntax("an extra parameter")),
+            invalid_path_utf8: b"git-upload-pack /\xff\0" => Err(Error::Text),
         );
         let long = format!("git-upload-pack /{}\0", "x".repeat(MAX_TEXT));
         assert_eq!(
@@ -2184,25 +2188,12 @@ mod tests {
         for n in 0..bytes.len() {
             assert_eq!(ServiceHeader::parse(&bytes[..n]), Err(Error::Truncated));
         }
-        assert_eq!(
-            ServiceHeader::parse(b"0000"),
-            Err(Error::Syntax("one service line"))
-        );
-        assert_eq!(
-            ServiceHeader::parse(&pkt(&["# x\n", "0000"])),
-            Err(Error::Syntax("# service="))
-        );
-        assert_eq!(
-            ServiceHeader::parse(&pkt(&["# service=git-x\n", "0000"])),
-            Err(Error::Syntax("a service name"))
-        );
-        assert_eq!(
-            ServiceHeader::parse(&pkt(&["0001", "0000"])),
-            Err(Error::Syntax("a data packet"))
-        );
-        assert_eq!(
-            ServiceHeader::parse(&pkt(&["ERR no\n", "0000"])),
-            Err(Error::Remote("no".into()))
+        assert_cases!(|input| ServiceHeader::parse(input);
+            missing_service: b"0000" => Err(Error::Syntax("one service line")),
+            wrong_service_prefix: &pkt(&["# x\n", "0000"]) => Err(Error::Syntax("# service=")),
+            unknown_service: &pkt(&["# service=git-x\n", "0000"]) => Err(Error::Syntax("a service name")),
+            delimiter_in_service: &pkt(&["0001", "0000"]) => Err(Error::Syntax("a data packet")),
+            remote_service_error: &pkt(&["ERR no\n", "0000"]) => Err(Error::Remote("no".into())),
         );
     }
 
@@ -2227,13 +2218,7 @@ mod tests {
         let ad = Advertisement::parse(&bytes).unwrap();
         assert!(!ad.version_1);
         assert_eq!(ad.refs.len(), 6);
-        assert_eq!(
-            ad.refs[0],
-            AdvertisedRef {
-                id: id(A),
-                name: "HEAD".into()
-            }
-        );
+        assert_eq!(ad.refs[0], advertised_ref(id(A), "HEAD".into()));
         assert_eq!(ad.refs[5].name, "refs/tags/v1.0^{}");
         assert_eq!(ad.capabilities.len(), 8);
         assert!(ad.capability("ofs-delta").is_some());
@@ -2278,14 +2263,8 @@ mod tests {
         // A leading ref named capabilities^{} with a zero id is refused.
         let odd = Advertisement {
             refs: vec![
-                AdvertisedRef {
-                    id: ObjectId::zero(false),
-                    name: "capabilities^{}".into(),
-                },
-                AdvertisedRef {
-                    id: id(B),
-                    name: "x".into(),
-                },
+                advertised_ref(ObjectId::zero(false), "capabilities^{}".into()),
+                advertised_ref(id(B), "x".into()),
             ],
             ..Advertisement::default()
         };
@@ -2304,13 +2283,7 @@ mod tests {
         ]);
         let ad = Advertisement::parse(&bytes).unwrap();
         assert_eq!(ad.refs.len(), 2);
-        assert_eq!(
-            ad.refs[0],
-            AdvertisedRef {
-                id: id(A),
-                name: "capabilities^{}".into()
-            }
-        );
+        assert_eq!(ad.refs[0], advertised_ref(id(A), "capabilities^{}".into()));
         assert_eq!(ad.to_bytes().unwrap(), bytes);
         // With a zero id, of either length, it is the no-refs line.
         for zero in [ObjectId::zero(false), ObjectId::zero(true)] {
@@ -2391,11 +2364,7 @@ mod tests {
             ClientLine::parse(&ClientLine::Other(c.clone()).to_bytes().unwrap()),
             Ok(ClientLine::Other(c))
         );
-        let ls = Command {
-            name: "ls-refs".into(),
-            capabilities: vec![],
-            args: vec!["ACK x".into()],
-        };
+        let ls = command_fixture("ls-refs".into(), vec![], vec!["ACK x".into()]);
         let Ok([LsRefsArg::Other(a)]) = <[LsRefsArg; 1]>::try_from(ls.ls_refs_args().unwrap())
         else {
             panic!()
@@ -2418,14 +2387,9 @@ mod tests {
                 .map(|_| ()),
             name
         );
-        assert_eq!(
-            CapabilityAdvertisement::parse(&pkt(&["version 2\n", "ls refs\n", "0000"])).map(|_| ()),
-            name
-        );
-        assert_eq!(
-            CapabilityAdvertisement::parse(&pkt(&["version 2\n", "fetch/x=y\n", "0000"]))
-                .map(|_| ()),
-            name
+        assert_cases!(|input| CapabilityAdvertisement::parse(input).map(|_| ());
+            capability_space: &pkt(&["version 2\n", "ls refs\n", "0000"]) => name,
+            capability_slash: &pkt(&["version 2\n", "fetch/x=y\n", "0000"]) => name,
         );
         assert_eq!(
             ClientLine::parse(format!("want {A} th!n-pack").as_bytes()).map(|_| ()),
@@ -2435,24 +2399,13 @@ mod tests {
             CapabilityAdvertisement::parse(&pkt(&["version 2\n", "Ab-9_=v w\n", "0000"])).unwrap();
         assert_eq!(ok.capabilities, [Capability::with_value("Ab-9_", "v w")]);
         let command = Err(Error::Syntax("a command name"));
-        assert_eq!(
-            V2Request::parse(&pkt(&["command=\n", "0000"])).map(|_| ()),
-            command
-        );
-        assert_eq!(
-            V2Request::parse(&pkt(&["command=ls refs\n", "0000"])).map(|_| ()),
-            command
-        );
-        assert_eq!(
-            V2Request::parse(&pkt(&["command=a=b\n", "0000"])).map(|_| ()),
-            command
+        assert_cases!(|input| V2Request::parse(input).map(|_| ());
+            empty_command: &pkt(&["command=\n", "0000"]) => command,
+            command_space: &pkt(&["command=ls refs\n", "0000"]) => command,
+            command_equals: &pkt(&["command=a=b\n", "0000"]) => command,
         );
         // A command whose name has nothing a key may hold is refused.
-        let empty = V2Request::Command(Command {
-            name: "?!".into(),
-            capabilities: vec![],
-            args: vec!["x".into()],
-        });
+        let empty = V2Request::Command(command_fixture("?!".into(), vec![], vec!["x".into()]));
         assert_eq!(empty.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&empty);
         let cap = Capability::with_value("é x", "v");
@@ -2468,56 +2421,27 @@ mod tests {
         let first = format!("{A} HEAD\0ofs-delta\n");
         let parse = |lines: &[&str]| Advertisement::parse(&pkt(lines)).map(|_| ());
         let zero = format!("{} capabilities^{{}}\0\n", "0".repeat(40));
-        assert_eq!(
-            parse(&[&zero, &format!("{A} x\n"), "0000"]),
-            Err(Error::Syntax("a shallow line"))
-        );
-        assert_eq!(
-            parse(&[
+        assert_cases!(|input| parse(input);
+            ref_after_empty_advertisement: &[&zero, &format!("{A} x\n"), "0000"]
+                => Err(Error::Syntax("a shallow line")),
+            ref_after_shallow: &[
                 &first,
                 &format!("shallow {A}\n"),
                 &format!("{A} x\n"),
-                "0000"
-            ]),
-            Err(Error::Syntax("a shallow line"))
-        );
-        assert_eq!(parse(&["nothex HEAD\0\n", "0000"]), Err(Error::ObjectId));
-        assert_eq!(
-            parse(&[&first, "shallow zz\n", "0000"]),
-            Err(Error::ObjectId)
-        );
-        assert_eq!(
-            parse(&["ERR access denied\n", "0000"]),
-            Err(Error::Remote("access denied".into()))
-        );
-        assert_eq!(
-            parse(&[&first, "ERR later\n", "0000"]),
-            Err(Error::Remote("later".into()))
-        );
-        assert_eq!(
-            parse(&[&first, "0001", "0000"]),
-            Err(Error::Syntax("a data packet"))
-        );
-        assert_eq!(
-            parse(&["0002", "0000"]),
-            Err(Error::Syntax("a data packet"))
-        );
-        assert_eq!(parse(&[A, "0000"]), Err(Error::Syntax("a ref line")));
-        assert_eq!(
-            parse(&[&format!("{A} HEAD\0=x\n"), "0000"]),
-            Err(Error::Syntax("a capability name"))
-        );
-        assert_eq!(
-            parse(&[&format!("{A} HEAD\0a\0b\n"), "0000"]),
-            Err(Error::Text)
-        );
-        assert_eq!(
-            parse(&[&first, &format!("{A} a\0b\n"), "0000"]),
-            Err(Error::Text)
-        );
-        assert_eq!(
-            parse(&[&format!("{A} HEAD\0\u{0}\n"), "0000"]),
-            Err(Error::Text)
+                "0000",
+            ] => Err(Error::Syntax("a shallow line")),
+            invalid_ref_id: &["nothex HEAD\0\n", "0000"] => Err(Error::ObjectId),
+            invalid_shallow_id: &[&first, "shallow zz\n", "0000"] => Err(Error::ObjectId),
+            remote_first: &["ERR access denied\n", "0000"] => Err(Error::Remote("access denied".into())),
+            remote_later: &[&first, "ERR later\n", "0000"] => Err(Error::Remote("later".into())),
+            delimiter_in_refs: &[&first, "0001", "0000"] => Err(Error::Syntax("a data packet")),
+            response_end_in_refs: &["0002", "0000"] => Err(Error::Syntax("a data packet")),
+            missing_ref_name: &[A, "0000"] => Err(Error::Syntax("a ref line")),
+            empty_capability: &[&format!("{A} HEAD\0=x\n"), "0000"]
+                => Err(Error::Syntax("a capability name")),
+            nul_in_capabilities: &[&format!("{A} HEAD\0a\0b\n"), "0000"] => Err(Error::Text),
+            nul_in_ref: &[&first, &format!("{A} a\0b\n"), "0000"] => Err(Error::Text),
+            nul_capability: &[&format!("{A} HEAD\0\u{0}\n"), "0000"] => Err(Error::Text),
         );
         let many = format!("{A} HEAD\0{}\n", "c ".repeat(MAX_CAPABILITIES + 1));
         assert_eq!(parse(&[&many, "0000"]), Err(Error::TooMany));
@@ -2537,14 +2461,8 @@ mod tests {
         let ad = Advertisement {
             version_1: false,
             refs: vec![
-                AdvertisedRef {
-                    id: id(A),
-                    name: "HE\0AD\n".into(),
-                },
-                AdvertisedRef {
-                    id: id(B),
-                    name: "n".repeat(MAX_TEXT * 2),
-                },
+                advertised_ref(id(A), "HE\0AD\n".into()),
+                advertised_ref(id(B), "n".repeat(MAX_TEXT * 2)),
             ],
             capabilities: vec![Capability::with_value("a b=c", "x y"); MAX_CAPABILITIES + 5]
                 .into_iter()
@@ -2595,25 +2513,14 @@ mod tests {
                 Err(Error::Truncated)
             );
         }
-        assert_eq!(
-            CapabilityAdvertisement::parse(b"0000"),
-            Err(Error::Syntax("version 2"))
-        );
-        assert_eq!(
-            CapabilityAdvertisement::parse(&pkt(&["version 1\n", "0000"])),
-            Err(Error::Syntax("version 2"))
-        );
-        assert_eq!(
-            CapabilityAdvertisement::parse(&pkt(&["ERR x\n", "0000"])),
-            Err(Error::Remote("x".into()))
-        );
-        assert_eq!(
-            CapabilityAdvertisement::parse(&pkt(&["version 2\n", "=v\n", "0000"])),
-            Err(Error::Syntax("a capability name"))
-        );
-        assert_eq!(
-            CapabilityAdvertisement::parse(&pkt(&["version 2\n", "0001", "0000"])),
-            Err(Error::Syntax("a data packet"))
+        assert_cases!(|input| CapabilityAdvertisement::parse(input);
+            missing_version: b"0000" => Err(Error::Syntax("version 2")),
+            wrong_version: &pkt(&["version 1\n", "0000"]) => Err(Error::Syntax("version 2")),
+            remote_capability_error: &pkt(&["ERR x\n", "0000"]) => Err(Error::Remote("x".into())),
+            empty_capability_name: &pkt(&["version 2\n", "=v\n", "0000"])
+                => Err(Error::Syntax("a capability name")),
+            delimiter_in_capabilities: &pkt(&["version 2\n", "0001", "0000"])
+                => Err(Error::Syntax("a data packet")),
         );
         let mut many = vec!["version 2\n"];
         many.extend(std::iter::repeat_n("c\n", MAX_CAPABILITIES + 1));
@@ -2677,22 +2584,18 @@ mod tests {
         let req = V2Request::parse(&pkt(&["command=ls-refs\n", "0000"])).unwrap();
         assert_eq!(
             req,
-            V2Request::Command(Command {
-                name: "ls-refs".into(),
-                capabilities: vec![],
-                args: vec![]
-            })
+            V2Request::Command(command_fixture("ls-refs".into(), vec![], vec![]))
         );
-        let ls = Command {
-            name: "ls-refs".into(),
-            capabilities: vec![],
-            args: vec![
+        let ls = command_fixture(
+            "ls-refs".into(),
+            vec![],
+            vec![
                 "peel".into(),
                 "unborn".into(),
                 "ref-prefix refs/tags/".into(),
                 "x-y".into(),
             ],
-        };
+        );
         let args = ls.ls_refs_args().unwrap();
         assert_eq!(
             args[..3],
@@ -2715,31 +2618,17 @@ mod tests {
     #[test]
     fn v2_request_errors() {
         let parse = |lines: &[&str]| V2Request::parse(&pkt(lines)).map(|_| ());
-        assert_eq!(
-            parse(&["ls-refs\n", "0000"]),
-            Err(Error::Syntax("command="))
+        assert_cases!(|input| parse(input);
+            missing_command_prefix: &["ls-refs\n", "0000"] => Err(Error::Syntax("command=")),
+            delimiter_before_command: &["0001", "0000"] => Err(Error::Syntax("a data packet")),
+            repeated_delimiter: &["command=x\n", "0001", "0001", "0000"]
+                => Err(Error::Syntax("a data packet")),
+            response_end_in_request: &["command=x\n", "0002", "0000"] => Err(Error::Syntax("a data packet")),
+            empty_request_capability: &["command=x\n", "=y\n", "0000"]
+                => Err(Error::Syntax("a capability name")),
+            embedded_newline: &["command=x\n", "0001", "a\nb\n", "0000"] => Err(Error::Text),
+            nul_command: &["command=\u{0}\n", "0000"] => Err(Error::Text),
         );
-        assert_eq!(
-            parse(&["0001", "0000"]),
-            Err(Error::Syntax("a data packet"))
-        );
-        assert_eq!(
-            parse(&["command=x\n", "0001", "0001", "0000"]),
-            Err(Error::Syntax("a data packet"))
-        );
-        assert_eq!(
-            parse(&["command=x\n", "0002", "0000"]),
-            Err(Error::Syntax("a data packet"))
-        );
-        assert_eq!(
-            parse(&["command=x\n", "=y\n", "0000"]),
-            Err(Error::Syntax("a capability name"))
-        );
-        assert_eq!(
-            parse(&["command=x\n", "0001", "a\nb\n", "0000"]),
-            Err(Error::Text)
-        );
-        assert_eq!(parse(&["command=\u{0}\n", "0000"]), Err(Error::Text));
         let mut many = vec!["command=x\n"];
         many.extend(std::iter::repeat_n("c\n", MAX_CAPABILITIES + 1));
         many.push("0000");
@@ -2748,30 +2637,22 @@ mod tests {
         args.extend(std::iter::repeat_n("a\n", MAX_ITEMS + 1));
         args.push("0000");
         assert_eq!(parse(&args), Err(Error::TooMany));
-        let bad = Command {
-            name: "fetch".into(),
-            capabilities: vec![],
-            args: vec!["want zz".into()],
-        };
+        let bad = command_fixture("fetch".into(), vec![], vec!["want zz".into()]);
         assert_eq!(bad.fetch_args(), Err(Error::ObjectId));
-        let bad = Command {
-            name: "ls-refs".into(),
-            capabilities: vec![],
-            args: vec!["a\nb".into()],
-        };
+        let bad = command_fixture("ls-refs".into(), vec![], vec!["a\nb".into()]);
         assert_eq!(bad.ls_refs_args(), Err(Error::Text));
-        let long = Command {
-            name: "ls-refs".into(),
-            capabilities: vec![],
-            args: vec![format!("ref-prefix {}", "p".repeat(MAX_TEXT + 1))],
-        };
+        let long = command_fixture(
+            "ls-refs".into(),
+            vec![],
+            vec![format!("ref-prefix {}", "p".repeat(MAX_TEXT + 1))],
+        );
         assert_eq!(long.ls_refs_args(), Err(Error::TooLong));
         // Writers refuse fields that would need changes.
-        let req = V2Request::Command(Command {
-            name: "a\nb".into(),
-            capabilities: vec![Capability::with_value("k=k", "v\0v")],
-            args: vec!["x\ny".into(), "z".repeat(MAX_DATA * 2)],
-        });
+        let req = V2Request::Command(command_fixture(
+            "a\nb".into(),
+            vec![Capability::with_value("k=k", "v\0v")],
+            vec!["x\ny".into(), "z".repeat(MAX_DATA * 2)],
+        ));
         assert_eq!(req.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&req);
     }
@@ -2832,36 +2713,18 @@ mod tests {
         let other = ClientLine::parse(b"want\n").unwrap();
         assert_eq!(other.to_bytes().unwrap(), b"want\n");
         // Errors.
-        assert_eq!(ClientLine::parse(b"want 123\n"), Err(Error::ObjectId));
-        assert_eq!(
-            ClientLine::parse(format!("have {}\n", &A[1..]).as_bytes()),
-            Err(Error::ObjectId)
-        );
-        assert_eq!(
-            ClientLine::parse(format!("want {A} =x").as_bytes()),
-            Err(Error::Syntax("a capability name"))
-        );
-        assert_eq!(
-            ClientLine::parse(b"deepen -1"),
-            Err(Error::Syntax("a number"))
-        );
-        assert_eq!(
-            ClientLine::parse(b"deepen "),
-            Err(Error::Syntax("a number"))
-        );
-        assert_eq!(
-            ClientLine::parse(b"deepen 99999999999"),
-            Err(Error::Syntax("a number"))
-        );
-        assert_eq!(
-            ClientLine::parse(b"deepen-since x"),
-            Err(Error::Syntax("a number"))
-        );
-        assert_eq!(ClientLine::parse(b"done\n\n"), Err(Error::Text));
-        assert_eq!(ClientLine::parse(b"\xc3"), Err(Error::Text));
-        assert_eq!(
-            ClientLine::parse(format!("filter {}", "f".repeat(MAX_TEXT + 1)).as_bytes()),
-            Err(Error::TooLong)
+        assert_cases!(|input| ClientLine::parse(input);
+            short_want_id: b"want 123\n" => Err(Error::ObjectId),
+            short_have_id: format!("have {}\n", &A[1..]).as_bytes() => Err(Error::ObjectId),
+            empty_want_capability: format!("want {A} =x").as_bytes()
+                => Err(Error::Syntax("a capability name")),
+            negative_depth: b"deepen -1" => Err(Error::Syntax("a number")),
+            empty_depth: b"deepen " => Err(Error::Syntax("a number")),
+            overflowing_depth: b"deepen 99999999999" => Err(Error::Syntax("a number")),
+            nonnumeric_since: b"deepen-since x" => Err(Error::Syntax("a number")),
+            extra_newline: b"done\n\n" => Err(Error::Text),
+            invalid_utf8: b"\xc3" => Err(Error::Text),
+            long_filter: format!("filter {}", "f".repeat(MAX_TEXT + 1)).as_bytes() => Err(Error::TooLong),
         );
     }
 
@@ -2901,20 +2764,13 @@ mod tests {
                 Ok(l)
             );
         }
-        assert_eq!(
-            ServerLine::parse(b"0008NAK\n"),
-            Ok(ServerLine::Other(Unknown::new("0008NAK")))
-        );
-        assert_eq!(ServerLine::parse(b"NAK\n"), Ok(ServerLine::Nak));
-        assert_eq!(
-            ServerLine::parse(format!("ACK {A} maybe").as_bytes()),
-            Err(Error::Syntax("an ACK status"))
-        );
-        assert_eq!(ServerLine::parse(b"ACK x"), Err(Error::ObjectId));
-        assert_eq!(ServerLine::parse(b"unshallow x"), Err(Error::ObjectId));
-        assert_eq!(
-            ServerLine::parse(format!("ERR {}", "e".repeat(MAX_TEXT + 1)).as_bytes()),
-            Err(Error::TooLong)
+        assert_cases!(|input| ServerLine::parse(input);
+            framed_nak: b"0008NAK\n" => Ok(ServerLine::Other(Unknown::new("0008NAK"))),
+            nak: b"NAK\n" => Ok(ServerLine::Nak),
+            unknown_ack_status: format!("ACK {A} maybe").as_bytes() => Err(Error::Syntax("an ACK status")),
+            invalid_ack_id: b"ACK x" => Err(Error::ObjectId),
+            invalid_unshallow_id: b"unshallow x" => Err(Error::ObjectId),
+            long_remote_error: format!("ERR {}", "e".repeat(MAX_TEXT + 1)).as_bytes() => Err(Error::TooLong),
         );
         assert_eq!(
             ServerLine::Error("a\nb".into()).to_bytes(),
@@ -2951,15 +2807,11 @@ mod tests {
             u.to_bytes().unwrap(),
             b"unborn HEAD symref-target:refs/heads/main\n"
         );
-        assert_eq!(LsRef::parse(A.as_bytes()), Err(Error::Syntax("a ref line")));
-        assert_eq!(LsRef::parse(b"zz HEAD"), Err(Error::ObjectId));
-        assert_eq!(
-            LsRef::parse(format!("{A} H peeled:q").as_bytes()),
-            Err(Error::ObjectId)
-        );
-        assert_eq!(
-            LsRef::parse(format!("{A} {}", "n".repeat(MAX_TEXT + 1)).as_bytes()),
-            Err(Error::TooLong)
+        assert_cases!(|input| LsRef::parse(input);
+            missing_ls_ref_name: A.as_bytes() => Err(Error::Syntax("a ref line")),
+            invalid_ls_ref_id: b"zz HEAD" => Err(Error::ObjectId),
+            invalid_peeled_id: format!("{A} H peeled:q").as_bytes() => Err(Error::ObjectId),
+            long_ls_ref: format!("{A} {}", "n".repeat(MAX_TEXT + 1)).as_bytes() => Err(Error::TooLong),
         );
         let odd = LsRef {
             id: None,
@@ -3135,11 +2987,7 @@ mod tests {
 
     #[test]
     fn command_args_are_bounded() {
-        let many = Command {
-            name: "fetch".into(),
-            capabilities: vec![],
-            args: vec!["done".into(); MAX_ITEMS + 1],
-        };
+        let many = command_fixture("fetch".into(), vec![], vec!["done".into(); MAX_ITEMS + 1]);
         assert_eq!(many.fetch_args(), Err(Error::TooMany));
         assert_eq!(many.ls_refs_args(), Err(Error::TooMany));
     }
@@ -3193,13 +3041,9 @@ mod tests {
             Advertisement::parse(&pkt(&[&first, "ERR later\n"])).map(|_| ()),
             remote("later")
         );
-        assert_eq!(
-            CapabilityAdvertisement::parse(&pkt(&["version 2\n", "ERR x\n"])).map(|_| ()),
-            remote("x")
-        );
-        assert_eq!(
-            CapabilityAdvertisement::parse(&pkt(&["version 2\n", "ERR x\n", "0000"])).map(|_| ()),
-            remote("x")
+        assert_cases!(|input| CapabilityAdvertisement::parse(input).map(|_| ());
+            remote_without_flush: &pkt(&["version 2\n", "ERR x\n"]) => remote("x"),
+            remote_with_flush: &pkt(&["version 2\n", "ERR x\n", "0000"]) => remote("x"),
         );
         let packets = [Packet::text("version 2"), Packet::text("ERR y")];
         assert_eq!(
@@ -3210,13 +3054,9 @@ mod tests {
             ServiceHeader::parse(&pkt(&["ERR z\n"])).map(|_| ()),
             remote("z")
         );
-        assert_eq!(
-            Advertisement::parse(&pkt(&["ERR \u{0}\n"])).map(|_| ()),
-            remote("\u{0}")
-        );
-        assert_eq!(
-            Advertisement::parse(b"0009ERR \xff").map(|_| ()),
-            remote("\u{fffd}")
+        assert_cases!(|input| Advertisement::parse(input).map(|_| ());
+            remote_nul: &pkt(&["ERR \u{0}\n"]) => remote("\u{0}"),
+            remote_lossy_utf8: b"0009ERR \xff" => remote("\u{fffd}"),
         );
         // Keep enough source bytes to finish a character at the boundary.
         for room in 0..4 {
@@ -3236,17 +3076,11 @@ mod tests {
     fn ids_follow_the_object_format() {
         let sha256 = format!("{C} HEAD\0object-format=sha256\n");
         assert!(Advertisement::parse(&pkt(&[&sha256, "0000"])).is_ok());
-        assert_eq!(
-            Advertisement::parse(&pkt(&[&sha256, &format!("shallow {B}\n"), "0000"])),
-            Err(Error::ObjectId)
-        );
-        assert_eq!(
-            Advertisement::parse(&pkt(&[&sha256, &format!("{A} refs/x\n"), "0000"])),
-            Err(Error::ObjectId)
-        );
-        assert_eq!(
-            Advertisement::parse(&pkt(&[&format!("{C} HEAD\0ofs-delta\n"), "0000"])),
-            Err(Error::ObjectId)
+        assert_cases!(|input| Advertisement::parse(input);
+            shallow_wrong_id_width: &pkt(&[&sha256, &format!("shallow {B}\n"), "0000"])
+                => Err(Error::ObjectId),
+            ref_wrong_id_width: &pkt(&[&sha256, &format!("{A} refs/x\n"), "0000"]) => Err(Error::ObjectId),
+            unadvertised_sha256: &pkt(&[&format!("{C} HEAD\0ofs-delta\n"), "0000"]) => Err(Error::ObjectId),
         );
         let sha1 = format!("{C} HEAD\0object-format=sha1\n");
         assert_eq!(
@@ -3260,14 +3094,8 @@ mod tests {
         let ad = Advertisement {
             version_1: false,
             refs: vec![
-                AdvertisedRef {
-                    id: id(A),
-                    name: "HEAD".into(),
-                },
-                AdvertisedRef {
-                    id: id(C),
-                    name: "refs/c".into(),
-                },
+                advertised_ref(id(A), "HEAD".into()),
+                advertised_ref(id(C), "refs/c".into()),
             ],
             capabilities: vec![Capability::with_value("object-format", "sha256")],
             shallow: vec![id(B), id(C)],
@@ -3289,11 +3117,11 @@ mod tests {
     #[test]
     fn fetch_deepen_combinations() {
         let fetch = |args: &[&str]| {
-            Command {
-                name: "fetch".into(),
-                capabilities: vec![],
-                args: args.iter().map(|a| a.to_string()).collect(),
-            }
+            command_fixture(
+                "fetch".into(),
+                vec![],
+                args.iter().map(|a| a.to_string()).collect(),
+            )
             .fetch_args()
             .map(|_| ())
         };

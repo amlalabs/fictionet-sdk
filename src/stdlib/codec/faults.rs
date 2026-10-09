@@ -574,6 +574,10 @@ mod tests {
     use super::*;
     use fictionet::stdlib::{modbus, test_support};
 
+    fn byte_fault_repeat(range: Option<Range<usize>>, copies: usize) -> ByteFault {
+        ByteFault::Repeat { range, copies }
+    }
+
     fn rule<T>(fault: ItemFault<T>) -> [Rule<ItemFault<T>>; 1] {
         [Rule {
             when: Trigger::Always,
@@ -695,30 +699,9 @@ mod tests {
             (ByteFault::Delay(delay), b"abc".as_slice(), Some(1)),
             (ByteFault::Drop(None), b"", None),
             (ByteFault::Drop(Some(1..2)), b"ac", None),
-            (
-                ByteFault::Repeat {
-                    range: None,
-                    copies: 2,
-                },
-                b"abcabc",
-                None,
-            ),
-            (
-                ByteFault::Repeat {
-                    range: Some(1..2),
-                    copies: 3,
-                },
-                b"abbbc",
-                None,
-            ),
-            (
-                ByteFault::Repeat {
-                    range: Some(1..2),
-                    copies: 0,
-                },
-                b"ac",
-                None,
-            ),
+            (byte_fault_repeat(None, 2), b"abcabc", None),
+            (byte_fault_repeat(Some(1..2), 3), b"abbbc", None),
+            (byte_fault_repeat(Some(1..2), 0), b"ac", None),
             (ByteFault::Split { at: 1, delay }, b"abc", Some(2)),
             (
                 ByteFault::Split {
@@ -767,10 +750,7 @@ mod tests {
         }
         let plan = [Rule {
             when: Trigger::Always,
-            fault: ByteFault::Repeat {
-                range: None,
-                copies: usize::MAX,
-            },
+            fault: byte_fault_repeat(None, usize::MAX),
         }];
         let mut out = vec![42];
         assert!(faults.bytes(&entropy, &plan, b"abc", &mut out).is_err());
@@ -781,10 +761,7 @@ mod tests {
         let mut faults = Faults::new(4, 0);
         let plan = [Rule {
             when: Trigger::Always,
-            fault: ByteFault::Repeat {
-                range: Some(0..1),
-                copies: 2,
-            },
+            fault: byte_fault_repeat(Some(0..1), 2),
         }];
         assert!(faults.bytes(&entropy, &plan, b"abc", &mut out).is_err());
         assert_eq!(out, [42]);

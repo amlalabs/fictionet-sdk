@@ -922,10 +922,22 @@ fictionet::prefixed! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+
+    fn initial_context_token(mech: Mech, inner: Vec<u8>) -> InitialContextToken {
+        InitialContextToken { mech, inner }
+    }
+
+    fn neg_hints_fixture(hint_name: Option<Vec<u8>>, hint_address: Option<Vec<u8>>) -> NegHints {
+        NegHints {
+            hint_name,
+            hint_address,
+        }
+    }
 
     /// The hint name Windows and Samba send in a NegTokenInit2.
     const HINT: &[u8] = b"not_defined_in_RFC4178@please_ignore";
@@ -976,10 +988,7 @@ mod tests {
                 ],
                 req_flags: None,
                 mech_token: None,
-                neg_hints: Some(NegHints {
-                    hint_name: Some(HINT.to_vec()),
-                    hint_address: None,
-                }),
+                neg_hints: Some(neg_hints_fixture(Some(HINT.to_vec()), None)),
                 mech_list_mic: Some(vec![7; 3]),
             }),
             NegotiationToken::Init(NegTokenInit {
@@ -1006,15 +1015,9 @@ mod tests {
             NegotiationToken::Init(NegTokenInit::default()).to_bytes(),
             Err(Error::MissingMechTypes)
         );
-        let wrapped = InitialContextToken {
-            mech: Mech::Spnego,
-            inner: vec![RESP_TAG, 0],
-        };
+        let wrapped = initial_context_token(Mech::Spnego, vec![RESP_TAG, 0]);
         assert_eq!(wrapped.to_bytes(), Err(Error::WrappedResp));
-        let huge = InitialContextToken {
-            mech: Mech::Ntlm,
-            inner: vec![0; MAX_TOKEN],
-        };
+        let huge = initial_context_token(Mech::Ntlm, vec![0; MAX_TOKEN]);
         assert_eq!(huge.to_bytes(), Err(Error::TooLong));
         let named = Mech::Other("1.3.6.1.4.1.311.2.2.10".parse().unwrap());
         let token = NegotiationToken::Resp(NegTokenResp {
@@ -1038,10 +1041,7 @@ mod tests {
         assert_eq!(t.mech_token, None);
         assert_eq!(
             t.neg_hints,
-            Some(NegHints {
-                hint_name: Some(HINT.to_vec()),
-                hint_address: None
-            })
+            Some(neg_hints_fixture(Some(HINT.to_vec()), None))
         );
         assert_eq!(t.mech_list_mic, None);
         // Written back, byte for byte.
@@ -1180,18 +1180,12 @@ mod tests {
                 assert_eq!(token_len(&wrapped), Ok(Some(wrapped.len())));
             }
         }
-        let k = InitialContextToken {
-            mech: Mech::Kerberos,
-            inner: vec![1, 0, 0x6e, 0x00],
-        };
+        let k = initial_context_token(Mech::Kerberos, vec![1, 0, 0x6e, 0x00]);
         assert_eq!(
             InitialContextToken::parse(&k.to_bytes().unwrap()).unwrap(),
             k
         );
-        let empty = InitialContextToken {
-            mech: Mech::Ntlm,
-            inner: Vec::new(),
-        };
+        let empty = initial_context_token(Mech::Ntlm, Vec::new());
         assert_eq!(
             InitialContextToken::parse(&empty.to_bytes().unwrap()).unwrap(),
             empty
@@ -1296,10 +1290,7 @@ mod tests {
                 NegotiationToken::parse(inner),
                 Ok(NegotiationToken::Resp(_))
             ));
-            let wrapper = InitialContextToken {
-                mech: Mech::Spnego,
-                inner: inner.to_vec(),
-            };
+            let wrapper = initial_context_token(Mech::Spnego, inner.to_vec());
             let mut out = vec![42];
             assert_eq!(wrapper.write(&mut out), Err(Error::WrappedResp));
             assert_eq!(out, [42]);
@@ -1324,10 +1315,7 @@ mod tests {
             contract::check_wire::<InitialContextToken>(&bytes);
 
             // Other mechanisms retain their own inner-token syntax.
-            contract::check_wire_value(&InitialContextToken {
-                mech: Mech::Ntlm,
-                inner: inner.to_vec(),
-            });
+            contract::check_wire_value(&initial_context_token(Mech::Ntlm, inner.to_vec()));
         }
     }
 
@@ -1378,62 +1366,42 @@ mod tests {
     fn error_paths() {
         use asn1::Error as A;
         let p = NegotiationToken::parse;
-        assert_eq!(p(&[]), Err(Error::Asn1(A::Empty)));
-        assert_eq!(p(&[0x30, 0x00]), Err(Error::NotToken));
-        assert_eq!(p(&[0xa2, 0x02, 0x30, 0x00]), Err(Error::NotToken));
-        assert_eq!(p(&[0x80, 0x00]), Err(Error::Asn1(A::Primitive)));
-        assert_eq!(p(&[0xa1, 0x00]), Err(Error::Asn1(A::Empty)));
-        assert_eq!(p(&[0xa1, 0x03, 0x30, 0x00]), Err(Error::Asn1(A::Truncated)));
-        assert_eq!(
-            p(&[0xa1, 0x02, 0x30, 0x00, 0x30, 0x00]),
-            Err(Error::Asn1(A::Trailing))
-        );
-        assert_eq!(
-            p(&[0xa1, 0x04, 0x30, 0x00, 0x30, 0x00]),
-            Err(Error::Asn1(A::Trailing))
-        );
-        // NegTokenInit without mechTypes.
-        assert_eq!(p(&[0xa0, 0x02, 0x30, 0x00]), Err(Error::MissingMechTypes));
-        // Fields out of order or repeated. One of another class is an
-        // extension, skipped.
-        assert_eq!(
-            p(&[
-                0xa1, 0x0a, 0x30, 0x08, 0xa2, 0x02, 0x04, 0x00, 0xa0, 0x02, 0x04, 0x00
-            ]),
-            Err(Error::Field)
-        );
-        assert_eq!(
-            p(&[
-                0xa1, 0x0a, 0x30, 0x08, 0xa2, 0x02, 0x04, 0x00, 0xa2, 0x02, 0x04, 0x00
-            ]),
-            Err(Error::Field)
-        );
-        assert_eq!(
-            p(&[0xa1, 0x04, 0x30, 0x02, 0x04, 0x00]),
-            Ok(NegotiationToken::Resp(NegTokenResp::default()))
+        assert_cases!(|input| p(input);
+            empty: &[] => Err(Error::Asn1(A::Empty)),
+            bare_sequence: &[0x30, 0x00] => Err(Error::NotToken),
+            unknown_choice: &[0xa2, 0x02, 0x30, 0x00] => Err(Error::NotToken),
+            primitive_choice: &[0x80, 0x00] => Err(Error::Asn1(A::Primitive)),
+            empty_response: &[0xa1, 0x00] => Err(Error::Asn1(A::Empty)),
+            truncated_response: &[0xa1, 0x03, 0x30, 0x00] => Err(Error::Asn1(A::Truncated)),
+            trailing_token: &[0xa1, 0x02, 0x30, 0x00, 0x30, 0x00] => Err(Error::Asn1(A::Trailing)),
+            trailing_sequence: &[0xa1, 0x04, 0x30, 0x00, 0x30, 0x00] => Err(Error::Asn1(A::Trailing)),
+            // NegTokenInit without mechTypes.
+            missing_mech_types: &[0xa0, 0x02, 0x30, 0x00] => Err(Error::MissingMechTypes),
+            // Fields out of order or repeated. One of another class is an
+            // extension, skipped.
+            reordered_fields: &[
+                0xa1, 0x0a, 0x30, 0x08, 0xa2, 0x02, 0x04, 0x00, 0xa0, 0x02, 0x04, 0x00,
+            ] => Err(Error::Field),
+            duplicate_fields: &[
+                0xa1, 0x0a, 0x30, 0x08, 0xa2, 0x02, 0x04, 0x00, 0xa2, 0x02, 0x04, 0x00,
+            ] => Err(Error::Field),
+            unknown_field: &[0xa1, 0x04, 0x30, 0x02, 0x04, 0x00]
+                => Ok(NegotiationToken::Resp(NegTokenResp::default())),
         );
         // A field holding the wrong type, or two values, or a primitive tag.
         assert!(matches!(
             p(&[0xa1, 0x06, 0x30, 0x04, 0xa2, 0x02, 0x02, 0x00]),
             Err(Error::Asn1(A::Unexpected { .. }))
         ));
-        assert_eq!(
-            p(&[0xa1, 0x08, 0x30, 0x06, 0xa2, 0x04, 0x04, 0x00, 0x04, 0x00]),
-            Err(Error::Asn1(A::Trailing))
-        );
-        assert_eq!(
-            p(&[0xa1, 0x04, 0x30, 0x02, 0x82, 0x00]),
-            Err(Error::Asn1(A::Primitive))
-        );
-        assert_eq!(p(&[0x81, 0x02, 0x30, 0x00]), Err(Error::Asn1(A::Primitive)));
-        // A negState outside 0..=3.
-        assert_eq!(
-            p(&[0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0x04]),
-            Err(Error::NegState(4))
-        );
-        assert_eq!(
-            p(&[0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0xff]),
-            Err(Error::NegState(-1))
+        assert_cases!(|input| p(input);
+            trailing_field_value: &[0xa1, 0x08, 0x30, 0x06, 0xa2, 0x04, 0x04, 0x00, 0x04, 0x00]
+                => Err(Error::Asn1(A::Trailing)),
+            primitive_field: &[0xa1, 0x04, 0x30, 0x02, 0x82, 0x00] => Err(Error::Asn1(A::Primitive)),
+            primitive_response: &[0x81, 0x02, 0x30, 0x00] => Err(Error::Asn1(A::Primitive)),
+            // A negState outside 0..=3.
+            state_four: &[0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0x04] => Err(Error::NegState(4)),
+            negative_state: &[0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0xff]
+                => Err(Error::NegState(-1)),
         );
         assert_eq!(NegState::from_value(9), Err(Error::NegState(9)));
         // A negState too large for an i64.
@@ -1504,11 +1472,7 @@ mod tests {
         assert!(bytes.len() <= MAX_TOKEN);
         assert_eq!(p(&bytes).unwrap(), near);
         assert_eq!(
-            InitialContextToken {
-                mech: Mech::Spnego,
-                inner: bytes
-            }
-            .to_bytes(),
+            initial_context_token(Mech::Spnego, bytes).to_bytes(),
             Err(Error::TooLong)
         );
         let near = NegTokenInit {
@@ -1522,46 +1486,30 @@ mod tests {
             InitialContextToken::spnego(&near).and_then(|token| token.to_bytes()),
             Err(Error::TooLong)
         );
-        let big = InitialContextToken {
-            mech: Mech::Ntlm,
-            inner: vec![0; MAX_TOKEN],
-        };
+        let big = initial_context_token(Mech::Ntlm, vec![0; MAX_TOKEN]);
         assert_eq!(big.to_bytes(), Err(Error::TooLong));
         // Wrapper errors.
         let ic = InitialContextToken::parse;
-        assert_eq!(ic(&[0x61, 0x00]), Err(Error::NotToken));
-        assert_eq!(ic(&[0x40, 0x00]), Err(Error::NotToken));
-        assert_eq!(
-            ic(&[0x60, 0x80, 0x06, 0x01, 0x2a, 0, 0]),
-            Err(Error::Indefinite)
+        assert_cases!(|input| ic(input);
+            wrong_application_tag: &[0x61, 0x00] => Err(Error::NotToken),
+            primitive_application: &[0x40, 0x00] => Err(Error::NotToken),
+            indefinite_length: &[0x60, 0x80, 0x06, 0x01, 0x2a, 0, 0] => Err(Error::Indefinite),
+            truncated_oid: &[0x60, 0x03, 0x06, 0x01] => Err(Error::Asn1(A::Truncated)),
+            trailing_context: &[0x60, 0x03, 0x06, 0x01, 0x2a, 0x00] => Err(Error::Asn1(A::Trailing)),
+            empty_context: &[0x60, 0x00] => Err(Error::Asn1(A::Empty)),
+            empty_oid: &[0x60, 0x02, 0x06, 0x00] => Err(Error::Asn1(A::Oid)),
+            missing_length: &[0x60] => Err(Error::Asn1(A::Truncated)),
+            invalid_length: &[0x60, 0xff] => Err(Error::Asn1(A::Length)),
         );
-        assert_eq!(
-            ic(&[0x60, 0x03, 0x06, 0x01]),
-            Err(Error::Asn1(A::Truncated))
-        );
-        assert_eq!(
-            ic(&[0x60, 0x03, 0x06, 0x01, 0x2a, 0x00]),
-            Err(Error::Asn1(A::Trailing))
-        );
-        assert_eq!(ic(&[0x60, 0x00]), Err(Error::Asn1(A::Empty)));
-        assert_eq!(ic(&[0x60, 0x02, 0x06, 0x00]), Err(Error::Asn1(A::Oid)));
-        assert_eq!(ic(&[0x60]), Err(Error::Asn1(A::Truncated)));
-        assert_eq!(ic(&[0x60, 0xff]), Err(Error::Asn1(A::Length)));
         // A wrapper for another mechanism.
-        let k = InitialContextToken {
-            mech: Mech::Kerberos,
-            inner: samba_init2()[10..].to_vec(),
-        }
-        .to_bytes()
-        .unwrap();
+        let k = initial_context_token(Mech::Kerberos, samba_init2()[10..].to_vec())
+            .to_bytes()
+            .unwrap();
         assert_eq!(p(&k), Err(Error::WrongMech));
         // A wrapper around nothing SPNEGO reads.
-        let w = InitialContextToken {
-            mech: Mech::Spnego,
-            inner: vec![0x30, 0x00],
-        }
-        .to_bytes()
-        .unwrap();
+        let w = initial_context_token(Mech::Spnego, vec![0x30, 0x00])
+            .to_bytes()
+            .unwrap();
         assert_eq!(p(&w), Err(Error::NotToken));
         // A hint name the writer cannot write is impossible: GeneralString
         // bytes are not checked. Every error has a message.
@@ -1584,21 +1532,17 @@ mod tests {
 
     #[test]
     fn token_len_errors() {
-        assert_eq!(token_len(&[]), Ok(None));
-        assert_eq!(token_len(&[0x30]), Err(Error::NotToken));
-        assert_eq!(token_len(&[0xa1]), Ok(None));
-        assert_eq!(token_len(&[0xa1, 0x80]), Err(Error::Indefinite));
-        assert_eq!(
-            token_len(&[0xa1, 0xff]),
-            Err(Error::Asn1(asn1::Error::Length))
+        assert_cases!(|input| token_len(input);
+            empty_prefix: &[] => Ok(None),
+            wrong_prefix: &[0x30] => Err(Error::NotToken),
+            tag_only: &[0xa1] => Ok(None),
+            indefinite_prefix: &[0xa1, 0x80] => Err(Error::Indefinite),
+            invalid_prefix_length: &[0xa1, 0xff] => Err(Error::Asn1(asn1::Error::Length)),
+            oversized_prefix: &[0xa1, 0x83, 0x01, 0x00, 0x00] => Err(Error::TooLong),
+            partial_long_length: &[0xa1, 0x82, 0xff] => Ok(None),
+            maximum_length: &[0xa1, 0x82, 0xff, 0xfc] => Ok(None),
+            oversized_length: &[0xa1, 0x82, 0xff, 0xfd] => Err(Error::TooLong),
         );
-        assert_eq!(
-            token_len(&[0xa1, 0x83, 0x01, 0x00, 0x00]),
-            Err(Error::TooLong)
-        );
-        assert_eq!(token_len(&[0xa1, 0x82, 0xff]), Ok(None));
-        assert_eq!(token_len(&[0xa1, 0x82, 0xff, 0xfc]), Ok(None));
-        assert_eq!(token_len(&[0xa1, 0x82, 0xff, 0xfd]), Err(Error::TooLong));
     }
 
     #[test]
@@ -1818,10 +1762,7 @@ mod tests {
         for addr in [Vec::new(), vec![1, 2]] {
             let t = NegotiationToken::Init(NegTokenInit {
                 mech_types: vec![Mech::Ntlm],
-                neg_hints: Some(NegHints {
-                    hint_name: Some(HINT.to_vec()),
-                    hint_address: Some(addr),
-                }),
+                neg_hints: Some(neg_hints_fixture(Some(HINT.to_vec()), Some(addr))),
                 ..NegTokenInit::default()
             });
             assert_eq!(t.to_bytes(), Err(Error::HintAddress));
@@ -1883,10 +1824,7 @@ mod tests {
             let neg_hints = if !rng.coin() {
                 None
             } else {
-                Some(NegHints {
-                    hint_name: rng.coin().then(|| rng.bytes(20)),
-                    hint_address: None,
-                })
+                Some(neg_hints_fixture(rng.coin().then(|| rng.bytes(20)), None))
             };
             let least = usize::from(neg_hints.is_none());
             NegotiationToken::Init(NegTokenInit {
@@ -1993,10 +1931,7 @@ mod tests {
         // A received hint address is outside the Wire domain.
         let bytes = [0xa0, 10, 0x30, 8, 0xa3, 6, 0x30, 4, 0xa1, 2, 4, 0];
         let token = NegotiationToken::Init(NegTokenInit {
-            neg_hints: Some(NegHints {
-                hint_name: None,
-                hint_address: Some(Vec::new()),
-            }),
+            neg_hints: Some(neg_hints_fixture(None, Some(Vec::new()))),
             ..Default::default()
         });
         assert_eq!(token.to_bytes(), Err(Error::HintAddress));
@@ -2011,10 +1946,7 @@ mod tests {
         assert_eq!(out, [42]);
         let good = NegotiationToken::Resp(NegTokenResp::default());
         contract::check_wire_value(&good);
-        let wrapper = InitialContextToken {
-            mech: Mech::Kerberos,
-            inner: vec![1, 0, 5, 0],
-        };
+        let wrapper = initial_context_token(Mech::Kerberos, vec![1, 0, 5, 0]);
         contract::check_wire_value(&wrapper);
         let mut bytes = wrapper.to_bytes().unwrap();
         bytes.push(0);

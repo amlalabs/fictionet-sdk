@@ -481,9 +481,14 @@ impl Wire for Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::mutate;
+
+    fn packet_fixture(header: Header, payload: Vec<u8>) -> Packet {
+        Packet { header, payload }
+    }
 
     fn collect(b: &[u8]) -> Result<Packet, Error> {
         contract::check_collect::<Packet>(b, MAX_PACKET)
@@ -626,10 +631,7 @@ mod tests {
 
     #[test]
     fn doc_example() {
-        let packet = Packet {
-            header: gre(protocol::IPV4, true, Some(7), None),
-            payload: vec![0x45, 0x00],
-        };
+        let packet = packet_fixture(gre(protocol::IPV4, true, Some(7), None), vec![0x45, 0x00]);
         let bytes = packet.to_bytes().unwrap();
         assert_eq!(
             bytes,
@@ -678,22 +680,15 @@ mod tests {
         // A sequence number without data:
         let b = [0x30, 0x01, 0x88, 0x0b, 0, 0, 0, 1, 0, 0, 0, 1];
         assert_eq!(check(&b), Err(Error::PptpSequence));
-        assert_eq!(
-            Header::parse_prefix(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0]),
-            Ok(None)
-        );
-        assert_eq!(
-            Header::parse_prefix(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0, 1]),
-            Err(Error::PptpSequence)
+        assert_cases!(|input| Header::parse_prefix(input);
+            short_pptp: &[0x20, 0x01, 0x88, 0x0b, 0, 1, 0] => Ok(None),
+            missing_sequence: &[0x20, 0x01, 0x88, 0x0b, 0, 1, 0, 1] => Err(Error::PptpSequence),
         );
         assert!(!Error::PptpSequence.to_string().is_empty());
 
         // Writers refuse both, and leave `out` as it was.
         for (sequence, payload) in [(None, vec![0x42]), (Some(1), vec![])] {
-            let p = Packet {
-                header: pptp(1, sequence, Some(2)),
-                payload,
-            };
+            let p = packet_fixture(pptp(1, sequence, Some(2)), payload);
             let mut out = vec![9];
             assert_eq!(p.write(&mut out), Err(Error::PptpSequence));
             assert_eq!(out, [9]);
@@ -809,17 +804,14 @@ mod tests {
 
     #[test]
     fn header_prefix_errors_and_checksum() {
-        assert_eq!(Header::parse_prefix(&[0]), Ok(None));
-        assert_eq!(Header::parse_prefix(&[0, 3]), Err(Error::Version(3)));
-        assert_eq!(Header::parse_prefix(&[0x20, 1, 0x86]), Ok(None));
-        assert_eq!(
-            Header::parse_prefix(&[0x20, 1, 0x86, 0xdd]),
-            Err(Error::PptpProtocol(0x86dd))
-        );
-        assert_eq!(Header::parse_prefix(&[0x20, 0, 8, 0, 0, 0, 0]), Ok(None));
-        assert_eq!(
-            Header::parse_prefix(&[0x20, 0, 8, 0, 0, 0, 0, 3]),
-            Ok(Some((gre(protocol::IPV4, false, Some(3), None), 8)))
+        assert_cases!(|input| Header::parse_prefix(input);
+            partial_header: &[0] => Ok(None),
+            wrong_version: &[0, 3] => Err(Error::Version(3)),
+            partial_protocol: &[0x20, 1, 0x86] => Ok(None),
+            wrong_protocol: &[0x20, 1, 0x86, 0xdd] => Err(Error::PptpProtocol(0x86dd)),
+            partial_key: &[0x20, 0, 8, 0, 0, 0, 0] => Ok(None),
+            complete_key: &[0x20, 0, 8, 0, 0, 0, 0, 3]
+                => Ok(Some((gre(protocol::IPV4, false, Some(3), None), 8))),
         );
         assert_eq!(
             collect(&[0x80, 0, 8, 0, 0x32, 0xfe, 0, 0, 0x45, 0]),
@@ -841,10 +833,7 @@ mod tests {
         assert_eq!(check(&b), Err(Error::Version(5)));
 
         // Writers refuse the same.
-        let fits = Packet {
-            header: gre(1, true, Some(1), None),
-            payload: vec![0xab; MAX_PACKET - 12],
-        };
+        let fits = packet_fixture(gre(1, true, Some(1), None), vec![0xab; MAX_PACKET - 12]);
         let bytes = fits.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_PACKET);
         assert_eq!(Packet::parse(&bytes), Ok(fits.clone()));
@@ -854,10 +843,7 @@ mod tests {
         assert_eq!(over.write(&mut out), Err(Error::TooLong));
         assert_eq!(out, [9]);
 
-        let fits = Packet {
-            header: pptp(1, Some(1), Some(2)),
-            payload: vec![0xab; MAX_PACKET - 16],
-        };
+        let fits = packet_fixture(pptp(1, Some(1), Some(2)), vec![0xab; MAX_PACKET - 16]);
         let bytes = fits.to_bytes().unwrap();
         assert_eq!(Packet::parse(&bytes), Ok(fits.clone()));
         let mut over = fits;
@@ -868,10 +854,7 @@ mod tests {
 
     #[test]
     fn write_appends() {
-        let p = Packet {
-            header: gre(protocol::IPV6, true, None, Some(3)),
-            payload: b"inner".to_vec(),
-        };
+        let p = packet_fixture(gre(protocol::IPV6, true, None, Some(3)), b"inner".to_vec());
         let mut out = b"before".to_vec();
         p.write(&mut out).unwrap();
         assert_eq!(&out[..6], b"before");
@@ -888,10 +871,7 @@ mod tests {
                 (flags & 2 != 0).then_some(0xdeadbeef),
                 (flags & 4 != 0).then_some(42),
             );
-            out.push(Packet {
-                header,
-                payload: b"abcdefg".to_vec(),
-            });
+            out.push(packet_fixture(header, b"abcdefg".to_vec()));
         }
         for flags in 0..4u8 {
             // A payload goes with a sequence number, and none without.
@@ -902,7 +882,7 @@ mod tests {
             } else {
                 Vec::new()
             };
-            out.push(Packet { header, payload });
+            out.push(packet_fixture(header, payload));
         }
         out
     }
@@ -936,10 +916,10 @@ mod tests {
 
     #[test]
     fn every_flipped_bit_in_a_checksummed_packet() {
-        let p = Packet {
-            header: gre(protocol::IPV4, true, Some(1), Some(2)),
-            payload: b"payload!".to_vec(),
-        };
+        let p = packet_fixture(
+            gre(protocol::IPV4, true, Some(1), Some(2)),
+            b"payload!".to_vec(),
+        );
         let b = p.to_bytes().unwrap();
         // Bit 0 is the C bit itself: clearing it leaves a packet with no
         // checksum to check.
@@ -970,7 +950,7 @@ mod tests {
             let payload = rng.bytes(n);
             let sequence = (!payload.is_empty()).then(|| rng.next() as u32);
             let header = pptp(rng.next() as u16, sequence, rng.maybe());
-            return Packet { header, payload };
+            return packet_fixture(header, payload);
         }
         let protocols = [
             protocol::IPV4,
@@ -981,10 +961,7 @@ mod tests {
         let proto = protocols[rng.index(protocols.len())];
         let header = gre(proto, !rng.coin(), rng.maybe(), rng.maybe());
         let n = rng.index(48);
-        Packet {
-            header,
-            payload: rng.bytes(n),
-        }
+        packet_fixture(header, rng.bytes(n))
     }
 
     #[test]

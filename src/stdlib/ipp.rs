@@ -1807,10 +1807,27 @@ fn read_members(records: &mut Records<'_>, depth: usize) -> Result<Vec<Attribute
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::{assert_linear, rounds};
     use fictionet::stdlib::test_support::{decode_all, mutate};
+
+    fn value_unknown(tag: u8, data: Vec<u8>) -> Value {
+        Value::Unknown { tag, data }
+    }
+
+    fn attribute(name: String, values: Vec<Value>) -> Attribute {
+        Attribute { name, values }
+    }
+
+    fn value_resolution(cross_feed: i32, feed: i32, units: i8) -> Value {
+        Value::Resolution {
+            cross_feed,
+            feed,
+            units,
+        }
+    }
 
     /// One record's bytes.
     fn rec(t: u8, name: &str, value: &[u8]) -> Vec<u8> {
@@ -1970,10 +1987,10 @@ mod tests {
         assert_eq!(m.to_bytes().unwrap(), bytes);
         // A member with two values: the second follows with no member name.
         let mut m = Message::request(operation::CREATE_JOB, 2);
-        let member = Attribute {
-            name: "k".into(),
-            values: vec![Value::Keyword("a".into()), Value::Keyword("b".into())],
-        };
+        let member = attribute(
+            "k".into(),
+            vec![Value::Keyword("a".into()), Value::Keyword("b".into())],
+        );
         m.add(
             tag::JOB_ATTRIBUTES,
             Attribute::new("c", Value::Collection(vec![member])),
@@ -2037,11 +2054,7 @@ mod tests {
                 utc_hours: 4,
                 utc_minutes: 0,
             }),
-            Value::Resolution {
-                cross_feed: 600,
-                feed: 300,
-                units: 3,
-            },
+            value_resolution(600, 300, 3),
             Value::Range {
                 lower: 1,
                 upper: 100,
@@ -2068,18 +2081,9 @@ mod tests {
                 tag: 0x4000_0001,
                 data: vec![9, 9],
             },
-            Value::Unknown {
-                tag: 0x20,
-                data: vec![],
-            },
-            Value::Unknown {
-                tag: 0x43,
-                data: b"x".to_vec(),
-            },
-            Value::Unknown {
-                tag: 0x99,
-                data: vec![1, 2, 3],
-            },
+            value_unknown(0x20, vec![]),
+            value_unknown(0x43, b"x".to_vec()),
+            value_unknown(0x99, vec![1, 2, 3]),
         ]
     }
 
@@ -2087,21 +2091,12 @@ mod tests {
     fn strict_head_covers_all_values_and_bounds_collection_depth() {
         use fictionet::stdlib::test_support::contract;
         let mut message = Message::request(operation::PRINT_JOB, 3);
-        message.add(
-            tag::JOB_ATTRIBUTES,
-            Attribute {
-                name: "all".into(),
-                values: every_value(),
-            },
-        );
+        message.add(tag::JOB_ATTRIBUTES, attribute("all".into(), every_value()));
         message.add(
             tag::JOB_ATTRIBUTES,
             Attribute::new(
                 "c",
-                Value::Collection(vec![Attribute {
-                    name: "m".into(),
-                    values: every_value(),
-                }]),
+                Value::Collection(vec![attribute("m".into(), every_value())]),
             ),
         );
         let head = Header::from(message);
@@ -2137,21 +2132,12 @@ mod tests {
         }
         // All of them as one attribute, and inside a collection.
         let mut m = Message::request(operation::PRINT_JOB, 3);
-        m.add(
-            tag::JOB_ATTRIBUTES,
-            Attribute {
-                name: "all".into(),
-                values: every_value(),
-            },
-        );
+        m.add(tag::JOB_ATTRIBUTES, attribute("all".into(), every_value()));
         m.add(
             tag::JOB_ATTRIBUTES,
             Attribute::new(
                 "c",
-                Value::Collection(vec![Attribute {
-                    name: "m".into(),
-                    values: every_value(),
-                }]),
+                Value::Collection(vec![attribute("m".into(), every_value())]),
             ),
         );
         m.data = vec![1, 2, 3];
@@ -2163,11 +2149,7 @@ mod tests {
         for (name, value, record) in [
             (
                 "r",
-                Value::Resolution {
-                    cross_feed: 600,
-                    feed: 600,
-                    units: 3,
-                },
+                value_resolution(600, 600, 3),
                 vec![0x32, 0, 1, b'r', 0, 9, 0, 0, 2, 0x58, 0, 0, 2, 0x58, 3],
             ),
             (
@@ -2228,131 +2210,55 @@ mod tests {
         };
         assert_eq!(Message::parse(&hdr), Err(Error::Truncated));
         assert_eq!(Message::parse(&[1, 1]), Err(Error::Truncated));
-        assert_eq!(with(vec![rec(0x44, "a", b"b")]), Err(Error::NoGroup));
-        assert_eq!(
-            with(vec![vec![1], rec(0x44, "", b"b")]),
-            Err(Error::NoAttribute)
-        );
-        // A new group forgets the last attribute.
-        assert_eq!(
-            with(vec![
-                vec![1],
-                rec(0x44, "a", b"b"),
-                vec![2],
-                rec(0x44, "", b"b")
-            ]),
-            Err(Error::NoAttribute)
-        );
-        assert_eq!(
-            with(vec![vec![1, 0x44, 0x80, 0x00]]),
-            Err(Error::Length(0x8000))
-        );
-        assert_eq!(
-            with(vec![vec![1, 0x44, 0, 1, b'a', 0xff, 0xff]]),
-            Err(Error::Length(0xffff))
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x21, "a", &[0, 0, 1])]),
-            Err(Error::BadValue(0x21))
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x23, "a", &[0, 0, 0, 0, 1])]),
-            Err(Error::BadValue(0x23))
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x22, "a", &[2])]),
-            Err(Error::BadValue(0x22))
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x22, "a", &[])]),
-            Err(Error::BadValue(0x22))
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x31, "a", &[0; 10])]),
-            Err(Error::BadValue(0x31))
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x32, "a", &[0; 8])]),
-            Err(Error::BadValue(0x32))
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x33, "a", &[0; 9])]),
-            Err(Error::BadValue(0x33))
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x35, "a", &[0, 2, b'e'])]),
-            Err(Error::BadValue(0x35))
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x35, "a", &[0, 0, 0, 0, 9])]),
-            Err(Error::BadValue(0x35))
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x36, "a", &[0, 0])]),
-            Err(Error::BadValue(0x36))
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x41, "a", &[0xff])]),
-            Err(Error::BadValue(0x41))
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x7f, "a", &[0, 0, 1])]),
-            Err(Error::BadValue(0x7f))
+        assert_cases!(|input| with(input);
+            value_without_group: vec![rec(0x44, "a", b"b")] => Err(Error::NoGroup),
+            continuation_without_attribute: vec![vec![1], rec(0x44, "", b"b")] => Err(Error::NoAttribute),
+            // A new group forgets the last attribute.
+            continuation_after_group: vec![vec![1], rec(0x44, "a", b"b"), vec![2], rec(0x44, "", b"b")]
+                => Err(Error::NoAttribute),
+            oversized_name: vec![vec![1, 0x44, 0x80, 0x00]] => Err(Error::Length(0x8000)),
+            oversized_value: vec![vec![1, 0x44, 0, 1, b'a', 0xff, 0xff]] => Err(Error::Length(0xffff)),
+            short_integer: vec![vec![1], rec(0x21, "a", &[0, 0, 1])] => Err(Error::BadValue(0x21)),
+            long_enum: vec![vec![1], rec(0x23, "a", &[0, 0, 0, 0, 1])] => Err(Error::BadValue(0x23)),
+            invalid_boolean: vec![vec![1], rec(0x22, "a", &[2])] => Err(Error::BadValue(0x22)),
+            empty_boolean: vec![vec![1], rec(0x22, "a", &[])] => Err(Error::BadValue(0x22)),
+            short_date: vec![vec![1], rec(0x31, "a", &[0; 10])] => Err(Error::BadValue(0x31)),
+            invalid_resolution_length: vec![vec![1], rec(0x32, "a", &[0; 8])] => Err(Error::BadValue(0x32)),
+            short_range: vec![vec![1], rec(0x33, "a", &[0; 9])] => Err(Error::BadValue(0x33)),
+            short_language: vec![vec![1], rec(0x35, "a", &[0, 2, b'e'])] => Err(Error::BadValue(0x35)),
+            trailing_language: vec![vec![1], rec(0x35, "a", &[0, 0, 0, 0, 9])] => Err(Error::BadValue(0x35)),
+            empty_language_value: vec![vec![1], rec(0x36, "a", &[0, 0])] => Err(Error::BadValue(0x36)),
+            invalid_text_utf8: vec![vec![1], rec(0x41, "a", &[0xff])] => Err(Error::BadValue(0x41)),
+            short_extension: vec![vec![1], rec(0x7f, "a", &[0, 0, 1])] => Err(Error::BadValue(0x7f)),
         );
         assert_eq!(
             with(vec![vec![1], rec(0x44, "a!~", b"")]).map(|_| ()),
             Ok(())
         );
-        assert_eq!(
-            with(vec![vec![1, 0x44, 0, 1, 0xc3, 0, 0]]),
-            Err(Error::BadName)
-        );
-        // Collection errors.
-        assert_eq!(
-            with(vec![vec![1], rec(0x37, "a", b"")]),
-            Err(Error::Collection)
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x4a, "a", b"m")]),
-            Err(Error::Collection)
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x34, "a", b"")]),
-            Err(Error::Collection)
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x34, "a", b""), vec![2]]),
-            Err(Error::Collection)
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x34, "a", b""), rec(0x21, "", &[0; 4])]),
-            Err(Error::Collection)
-        );
-        assert_eq!(
-            with(vec![
+        assert_cases!(|input| with(input);
+            invalid_name_utf8: vec![vec![1, 0x44, 0, 1, 0xc3, 0, 0]] => Err(Error::BadName),
+            // Collection errors.
+            end_without_collection: vec![vec![1], rec(0x37, "a", b"")] => Err(Error::Collection),
+            member_outside_collection: vec![vec![1], rec(0x4a, "a", b"m")] => Err(Error::Collection),
+            unclosed_collection: vec![vec![1], rec(0x34, "a", b"")] => Err(Error::Collection),
+            group_inside_collection: vec![vec![1], rec(0x34, "a", b""), vec![2]] => Err(Error::Collection),
+            value_without_member: vec![vec![1], rec(0x34, "a", b""), rec(0x21, "", &[0; 4])]
+                => Err(Error::Collection),
+            member_without_value: vec![
                 vec![1],
                 rec(0x34, "a", b""),
                 rec(0x4a, "", b"m"),
-                rec(0x37, "", b"")
-            ]),
-            Err(Error::Collection)
-        );
-        assert_eq!(
-            with(vec![
+                rec(0x37, "", b""),
+            ] => Err(Error::Collection),
+            repeated_member: vec![
                 vec![1],
                 rec(0x34, "a", b""),
                 rec(0x4a, "", b"m"),
-                rec(0x4a, "", b"n")
-            ]),
-            Err(Error::Collection)
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "x", b"m")]),
-            Err(Error::Collection)
-        );
-        assert_eq!(
-            with(vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "", &[0xff])]),
-            Err(Error::BadName)
+                rec(0x4a, "", b"n"),
+            ] => Err(Error::Collection),
+            named_member: vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "x", b"m")] => Err(Error::Collection),
+            invalid_member_utf8: vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "", &[0xff])]
+                => Err(Error::BadName),
         );
         // The head may not run past MAX_HEAD.
         let mut long = hdr.clone();
@@ -2403,33 +2309,29 @@ mod tests {
             rec(0x37, "", b""),
         ])
         .unwrap();
-        let member = Attribute {
-            name: "k".into(),
-            values: vec![Value::Keyword("a".into()), Value::Keyword("b".into())],
-        };
+        let member = attribute(
+            "k".into(),
+            vec![Value::Keyword("a".into()), Value::Keyword("b".into())],
+        );
         assert_eq!(
             m.groups[0].attributes,
             [Attribute::new("c", Value::Collection(vec![member]))]
         );
         assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
         // It needs a member with a value before it, and a value after it.
-        assert_eq!(
-            with(vec![
+        assert_cases!(|input| with(input);
+            empty_member: vec![
                 rec(0x34, "c", b""),
                 rec(0x4a, "", b""),
                 rec(0x44, "", b"a"),
-                rec(0x37, "", b"")
-            ]),
-            Err(Error::Collection)
-        );
-        assert_eq!(
-            with(vec![
+                rec(0x37, "", b""),
+            ] => Err(Error::Collection),
+            empty_second_member: vec![
                 rec(0x34, "c", b""),
                 rec(0x4a, "", b"k"),
                 rec(0x4a, "", b""),
-                rec(0x44, "", b"a")
-            ]),
-            Err(Error::Collection)
+                rec(0x44, "", b"a"),
+            ] => Err(Error::Collection),
         );
         for after in [rec(0x37, "", b""), rec(0x4a, "", b"n"), rec(0x4a, "", b"")] {
             assert_eq!(
@@ -2554,10 +2456,7 @@ mod tests {
         );
         m.add(
             tag::JOB_ATTRIBUTES,
-            Attribute {
-                name: "x".into(),
-                values: vec![nested(MAX_DEPTH + 5), Value::Integer(2)],
-            },
+            attribute("x".into(), vec![nested(MAX_DEPTH + 5), Value::Integer(2)]),
         );
         assert_unwritable(&m);
         // Very deep input is cut off without deep recursion.
@@ -2670,28 +2569,16 @@ mod tests {
                 tag: 1,
                 data: vec![1; 70_000],
             },
-            Value::Unknown {
-                tag: 0x99,
-                data: vec![1; 70_000],
-            },
+            value_unknown(0x99, vec![1; 70_000]),
             Value::OutOfBand(0x21),
-            Value::Unknown {
-                tag: tag::INTEGER,
-                data: vec![],
-            },
-            Value::Unknown {
-                tag: tag::END_COLLECTION,
-                data: vec![],
-            },
-            Value::Collection(vec![Attribute {
-                name: "empty".into(),
-                values: vec![],
-            }]),
+            value_unknown(tag::INTEGER, vec![]),
+            value_unknown(tag::END_COLLECTION, vec![]),
+            Value::Collection(vec![attribute("empty".into(), vec![])]),
             Value::Collection(vec![Attribute::new("", Value::Integer(1))]),
-            Value::Collection(vec![Attribute {
-                name: "x".into(),
-                values: vec![Value::OutOfBand(3), Value::Integer(5)],
-            }]),
+            Value::Collection(vec![attribute(
+                "x".into(),
+                vec![Value::OutOfBand(3), Value::Integer(5)],
+            )]),
         ] {
             let mut message = Message::request(operation::PRINT_JOB, 1);
             message.add(tag::JOB_ATTRIBUTES, Attribute::new("x", value));
@@ -2712,10 +2599,7 @@ mod tests {
             },
             Group {
                 tag: tag::JOB_ATTRIBUTES,
-                attributes: vec![Attribute {
-                    name: "none".into(),
-                    values: vec![],
-                }],
+                attributes: vec![attribute("none".into(), vec![])],
             },
         ] {
             let mut message = Message::request(operation::PRINT_JOB, 1);
@@ -2947,26 +2831,10 @@ mod tests {
         let bad = [
             Value::Enum(0),
             Value::Enum(-1),
-            Value::Resolution {
-                cross_feed: 0,
-                feed: 300,
-                units: 3,
-            },
-            Value::Resolution {
-                cross_feed: 300,
-                feed: -1,
-                units: 3,
-            },
-            Value::Resolution {
-                cross_feed: 300,
-                feed: 300,
-                units: 0,
-            },
-            Value::Resolution {
-                cross_feed: 300,
-                feed: 300,
-                units: 5,
-            },
+            value_resolution(0, 300, 3),
+            value_resolution(300, -1, 3),
+            value_resolution(300, 300, 0),
+            value_resolution(300, 300, 5),
             Value::DateTime(DateTime { month: 0, ..date }),
             Value::DateTime(DateTime { month: 13, ..date }),
             Value::DateTime(DateTime { day: 0, ..date }),
@@ -3038,10 +2906,7 @@ mod tests {
             let mut m = Message::request(operation::PRINT_JOB, 1);
             m.add(
                 tag::JOB_ATTRIBUTES,
-                Attribute {
-                    name: "x".into(),
-                    values: vec![v.clone(), Value::Integer(1)],
-                },
+                attribute("x".into(), vec![v.clone(), Value::Integer(1)]),
             );
             assert_unwritable(&m);
         }
@@ -3050,11 +2915,7 @@ mod tests {
         let values = vec![
             Value::Enum(1),
             Value::Enum(i32::MAX),
-            Value::Resolution {
-                cross_feed: 1,
-                feed: 1,
-                units: 4,
-            },
+            value_resolution(1, 1, 4),
             Value::DateTime(date),
             Value::DateTime(DateTime {
                 month: 1,
@@ -3069,13 +2930,7 @@ mod tests {
                 ..date
             }),
         ];
-        m.add(
-            tag::JOB_ATTRIBUTES,
-            Attribute {
-                name: "x".into(),
-                values,
-            },
-        );
+        m.add(tag::JOB_ATTRIBUTES, attribute("x".into(), values));
         assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
     }
 
@@ -3262,13 +3117,7 @@ mod tests {
             Message::request(2, 9).to_bytes().unwrap(),
         ];
         let mut full = Message::request(operation::PRINT_JOB, 3);
-        full.add(
-            tag::JOB_ATTRIBUTES,
-            Attribute {
-                name: "all".into(),
-                values: every_value(),
-            },
-        );
+        full.add(tag::JOB_ATTRIBUTES, attribute("all".into(), every_value()));
         let seeds = [seeds.to_vec(), vec![full.to_bytes().unwrap()]].concat();
         let mut parsed = 0;
         for i in 0..6000 {
@@ -3306,10 +3155,7 @@ mod tests {
                     let values = (0..1 + rng.index(3))
                         .map(|_| all[rng.index(all.len())].clone())
                         .collect();
-                    attributes.push(Attribute {
-                        name: format!("a{j}"),
-                        values,
-                    });
+                    attributes.push(attribute(format!("a{j}"), values));
                 }
                 m.groups.push(Group {
                     tag: [1, 2, 4, 5, 0x0b, 0x0f][rng.index(6)],

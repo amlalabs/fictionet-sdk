@@ -3462,6 +3462,14 @@ mod tests {
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::{decode_all, mutate};
 
+    fn header(unit: u8, sequence: u32) -> Header {
+        Header { unit, sequence }
+    }
+
+    fn unit_sequence(unit: u8, sequence: u32) -> UnitSequence {
+        UnitSequence { unit, sequence }
+    }
+
     fn text<const N: usize>(s: &str) -> Text<N> {
         Text::new(s).unwrap()
     }
@@ -3503,18 +3511,9 @@ mod tests {
              08 00 81 25 03 00 41 05 \
              0C 00 81 2C 07 00 41 07 00 40 00 01");
         let units = vec![
-            UnitSequence {
-                unit: 1,
-                sequence: 113_482,
-            },
-            UnitSequence {
-                unit: 2,
-                sequence: 0,
-            },
-            UnitSequence {
-                unit: 4,
-                sequence: 41_337,
-            },
+            unit_sequence(1, 113_482),
+            unit_sequence(2, 0),
+            unit_sequence(4, 41_337),
         ];
         let want = LoginRequest {
             header: Header::default(),
@@ -3598,18 +3597,9 @@ mod tests {
                 text: text("User"),
                 last_received_sequence: 154_196,
                 units: Units(vec![
-                    UnitSequence {
-                        unit: 1,
-                        sequence: 113_482,
-                    },
-                    UnitSequence {
-                        unit: 2,
-                        sequence: 0,
-                    },
-                    UnitSequence {
-                        unit: 4,
-                        sequence: 41_337,
-                    },
+                    unit_sequence(1, 113_482),
+                    unit_sequence(2, 0),
+                    unit_sequence(4, 41_337),
                 ]),
             }
             .into(),
@@ -3660,10 +3650,7 @@ mod tests {
             .with(Opt::Account(text("DEFG")))
             .unwrap();
         let want = NewOrder {
-            header: Header {
-                unit: 0,
-                sequence: 100,
-            },
+            header: header(0, 100),
             cl_ord_id: text("ABC123"),
             side: b'1',
             order_qty: 1000,
@@ -3680,10 +3667,7 @@ mod tests {
                 "BA BA 22 00 39 00 64 00 00 00 {ABC123} 01 01 54 45 53 54"
             )),
             CancelOrder {
-                header: Header {
-                    unit: 0,
-                    sequence: 100,
-                },
+                header: header(0, 100),
                 orig_cl_ord_id: text("ABC123"),
                 fields: Optional::new()
                     .with(Opt::ClearingFirm(text("TEST")))
@@ -3698,10 +3682,7 @@ mod tests {
                  01 0C E0 2E 00 00 08 E2 01 00 00 00 00 00"
             )),
             ModifyOrder {
-                header: Header {
-                    unit: 0,
-                    sequence: 100,
-                },
+                header: header(0, 100),
                 cl_ord_id: text("ABC124"),
                 orig_cl_ord_id: text("ABC123"),
                 fields: Optional::new()
@@ -3722,10 +3703,7 @@ mod tests {
         inbound(
             &bytes,
             PurgeOrders {
-                header: Header {
-                    unit: 0,
-                    sequence: 100,
-                },
+                header: header(0, 100),
                 reserved_internal: 0,
                 purge: PurgeFields {
                     fields: Optional::new()
@@ -3757,10 +3735,7 @@ mod tests {
     fn acknowledgment_examples() {
         let ack = |fields| -> Outbound {
             OrderAcknowledgment {
-                header: Header {
-                    unit: 3,
-                    sequence: 100,
-                },
+                header: header(3, 100),
                 transaction_time: T,
                 cl_ord_id: text("ABC123"),
                 order_id: OID,
@@ -3884,10 +3859,7 @@ mod tests {
                  08 E2 01 00 00 00 00 00 00 00 00 00"
             )),
             OrderModified {
-                header: Header {
-                    unit: 3,
-                    sequence: 100,
-                },
+                header: header(3, 100),
                 transaction_time: T,
                 cl_ord_id: text("ABC123"),
                 order_id: OID,
@@ -3904,10 +3876,7 @@ mod tests {
                  64 00 00 00 0A 10 1E B7 5E 39 2F 02"
             )),
             OrderRestated {
-                header: Header {
-                    unit: 3,
-                    sequence: 100,
-                },
+                header: header(3, 100),
                 transaction_time: T,
                 cl_ord_id: text("ABC123"),
                 order_id: OID,
@@ -3923,10 +3892,7 @@ mod tests {
                  54 45 53 54 31 32 33 34 41 42 43 31 32 31 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
             )),
             OrderCancelled {
-                header: Header {
-                    unit: 3,
-                    sequence: 100,
-                },
+                header: header(3, 100),
                 transaction_time: T,
                 cl_ord_id: text("ABC123"),
                 reason: b'U',
@@ -3952,10 +3918,7 @@ mod tests {
                  54 45 53 54 31 32 33 43 78 00 00 00"
             )),
             OrderExecution {
-                header: Header {
-                    unit: 3,
-                    sequence: 100,
-                },
+                header: header(3, 100),
                 transaction_time: T,
                 cl_ord_id: text("ABC123"),
                 exec_id: eid,
@@ -3982,10 +3945,7 @@ mod tests {
                  4D 53 46 54 00 00 00 00"
             )),
             TradeCancelOrCorrect {
-                header: Header {
-                    unit: 3,
-                    sequence: 100,
-                },
+                header: header(3, 100),
                 transaction_time: T,
                 cl_ord_id: text("ABC123"),
                 order_id: OID,
@@ -4207,29 +4167,12 @@ mod tests {
 
     #[test]
     fn login_replay_and_sequencing() {
-        let mut client = Client::new(
-            config(),
-            &[UnitSequence {
-                unit: 1,
-                sequence: 5,
-            }],
-            0,
-        )
-        .unwrap();
+        let mut client = Client::new(config(), &[unit_sequence(1, 5)], 0).unwrap();
         let mut server = Server::new(Timers::default(), 0).unwrap();
         let events = login(
             &mut client,
             &mut server,
-            &[
-                UnitSequence {
-                    unit: 1,
-                    sequence: 7,
-                },
-                UnitSequence {
-                    unit: 2,
-                    sequence: 3,
-                },
-            ],
+            &[unit_sequence(1, 7), unit_sequence(2, 3)],
         );
         // Unit 1 from 6, unit 2 (unspecified) from 1.
         assert_eq!(
@@ -4237,16 +4180,7 @@ mod tests {
             [
                 Event::LoggedIn {
                     last_received_sequence: 150,
-                    units: vec![
-                        UnitSequence {
-                            unit: 1,
-                            sequence: 7
-                        },
-                        UnitSequence {
-                            unit: 2,
-                            sequence: 3
-                        }
-                    ]
+                    units: vec![unit_sequence(1, 7), unit_sequence(2, 3)]
                 },
                 Event::Replay {
                     unit: 1,
@@ -4278,7 +4212,7 @@ mod tests {
         // Replay one stored message per unit, then complete.
         let stored = |unit, sequence| -> Outbound {
             OrderCancelled {
-                header: Header { unit, sequence },
+                header: header(unit, sequence),
                 ..OrderCancelled::default()
             }
             .into()
@@ -4288,21 +4222,12 @@ mod tests {
         for (u, s) in [(1, 6), (1, 7), (2, 1)] {
             let m = server.replay(&stored(u, s), 5).unwrap();
             let ev = client.receive(&m, 5).unwrap();
-            assert_eq!(
-                ev,
-                [Action::Event(Event::Sequenced(UnitSequence {
-                    unit: u,
-                    sequence: s
-                }))]
-            );
+            assert_eq!(ev, [Action::Event(Event::Sequenced(unit_sequence(u, s)))]);
         }
         // The client skips what it has.
         assert_eq!(
             client.receive(&stored(1, 6), 5).unwrap(),
-            [Action::Event(Event::Duplicate(UnitSequence {
-                unit: 1,
-                sequence: 6
-            }))]
+            [Action::Event(Event::Duplicate(unit_sequence(1, 6)))]
         );
         let done = server.replay_complete(6).unwrap();
         assert_eq!(
@@ -4317,21 +4242,9 @@ mod tests {
             [Action::Event(Event::Application)]
         );
         let a = server.send(stored(2, 0), 8).unwrap();
-        assert_eq!(
-            *a.header(),
-            Header {
-                unit: 2,
-                sequence: 4
-            }
-        );
+        assert_eq!(*a.header(), header(2, 4));
         let b = server.send(stored(1, 0), 8).unwrap();
-        assert_eq!(
-            *b.header(),
-            Header {
-                unit: 1,
-                sequence: 8
-            }
-        );
+        assert_eq!(*b.header(), header(1, 8));
         // Unit 3 starts at 1. A gap on the client is reported.
         let c = server.send(stored(3, 0), 8).unwrap();
         assert_eq!(c.header().sequence, 1);
@@ -4357,10 +4270,7 @@ mod tests {
         );
         // Forward gaps are allowed; going back is a violation.
         let mut ahead = order.clone();
-        *ahead.header_mut() = Header {
-            unit: 0,
-            sequence: 500,
-        };
+        *ahead.header_mut() = header(0, 500);
         assert_eq!(
             server.receive(&ahead, 10).unwrap(),
             [Action::Event(Event::Application)]
@@ -4386,16 +4296,7 @@ mod tests {
         assert_eq!(client.phase(), ClientPhase::Closed);
         assert_eq!(
             client.last_received(),
-            [
-                UnitSequence {
-                    unit: 1,
-                    sequence: 7
-                },
-                UnitSequence {
-                    unit: 2,
-                    sequence: 9
-                }
-            ]
+            [unit_sequence(1, 7), unit_sequence(2, 9)]
         );
     }
 
@@ -4404,21 +4305,14 @@ mod tests {
         let refuse = |last: &[UnitSequence], cfg: ClientConfig, status| {
             let mut client = Client::new(cfg, last, 0).unwrap();
             let mut server = Server::new(Timers::default(), 0).unwrap();
-            let events = login(
-                &mut client,
-                &mut server,
-                &[UnitSequence {
-                    unit: 1,
-                    sequence: 10,
-                }],
-            );
+            let events = login(&mut client, &mut server, &[unit_sequence(1, 10)]);
             assert!(
                 matches!(&events[..], [Event::Rejected { status: s, .. }, Event::Disconnected(CloseReason::Rejected), ..] if *s == status),
                 "{events:?}"
             );
             assert_eq!(server.phase(), ServerPhase::Closed);
         };
-        let one = |unit, sequence| [UnitSequence { unit, sequence }];
+        let one = |unit, sequence| [unit_sequence(unit, sequence)];
         refuse(&one(1, 11), config(), b'Q');
         refuse(&one(2, 1), config(), b'I');
         let mut bad = config();
@@ -5081,14 +4975,7 @@ mod tests {
         for _ in 0..40 {
             let mut client = Client::new(config(), &[], 0).unwrap();
             let mut server = Server::new(Timers::default(), 0).unwrap();
-            login(
-                &mut client,
-                &mut server,
-                &[UnitSequence {
-                    unit: 1,
-                    sequence: 0,
-                }],
-            );
+            login(&mut client, &mut server, &[unit_sequence(1, 0)]);
             let mut x = Exchange::new(ExchangeConfig::default(), server.returns().clone()).unwrap();
             let mut now = 3;
             for step in 0..60u32 {

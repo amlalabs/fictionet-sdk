@@ -2078,11 +2078,66 @@ pub mod harness {
 mod tests {
     use super::harness::check_payload;
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
+
+    fn short_packet(
+        spin: bool,
+        key_phase: bool,
+        dcid: Vec<u8>,
+        number: PacketNumber,
+        payload: Vec<u8>,
+    ) -> Packet {
+        Packet::Short {
+            spin,
+            key_phase,
+            dcid,
+            number,
+            payload,
+        }
+    }
+
+    fn handshake_packet(
+        version: u32,
+        dcid: Vec<u8>,
+        scid: Vec<u8>,
+        number: PacketNumber,
+        payload: Vec<u8>,
+    ) -> Packet {
+        Packet::Handshake {
+            version,
+            dcid,
+            scid,
+            number,
+            payload,
+        }
+    }
+
+    fn stream_frame(id: u64, offset: u64, data: Vec<u8>, fin: bool, length: bool) -> StreamFrame {
+        StreamFrame {
+            id,
+            offset,
+            data,
+            fin,
+            length,
+        }
+    }
+
+    fn crypto_fixture(offset: u64, data: Vec<u8>) -> Frame {
+        Frame::Crypto { offset, data }
+    }
+
+    fn connection_close(error_code: u64, frame_type: Option<u64>, reason: Vec<u8>) -> Frame {
+        Frame::ConnectionClose {
+            error_code,
+            frame_type,
+            reason,
+        }
+    }
 
     fn datagram(packets: &[Packet]) -> Result<Vec<u8>, Error> {
         let len = packets
@@ -2217,10 +2272,7 @@ mod tests {
     #[test]
     fn rfc9001_client_initial() {
         let mut b = hex("c300000001088394c8f03e5157080000449e00000002");
-        let crypto = Frame::Crypto {
-            offset: 0,
-            data: vec![0x01; 241],
-        };
+        let crypto = crypto_fixture(0, vec![0x01; 241]);
         let mut payload = crypto.to_bytes().unwrap();
         assert_eq!(payload[..4], hex("060040f1"));
         payload.resize(1182 - 4, 0);
@@ -2281,16 +2333,7 @@ mod tests {
             ranges: vec![],
             ecn: None,
         };
-        assert_eq!(
-            read,
-            [
-                Frame::Ack(ack),
-                Frame::Crypto {
-                    offset: 0,
-                    data: vec![0x02; 90]
-                }
-            ]
-        );
+        assert_eq!(read, [Frame::Ack(ack), crypto_fixture(0, vec![0x02; 90])]);
         assert_eq!(Payload((read).to_vec()).to_bytes().unwrap(), frames);
         assert_eq!(datagram(std::slice::from_ref(&p)).unwrap(), b);
     }
@@ -2340,16 +2383,7 @@ mod tests {
             value: 0xbff4,
             len: 3,
         };
-        assert_eq!(
-            p,
-            Packet::Short {
-                spin: false,
-                key_phase: false,
-                dcid: vec![],
-                number,
-                payload: vec![1]
-            }
-        );
+        assert_eq!(p, short_packet(false, false, vec![], number, vec![1]));
         assert_eq!(number.decode(Some(654_360_563)), Some(654_360_564));
         assert_eq!(
             Payload::parse(p.payload().unwrap())
@@ -2359,16 +2393,16 @@ mod tests {
         );
         assert_eq!(datagram(std::slice::from_ref(&p)).unwrap(), b);
         // The spin and key phase bits, with a connection ID.
-        let p = Packet::Short {
-            spin: true,
-            key_phase: true,
-            dcid: vec![7; 8],
-            number: PacketNumber {
+        let p = short_packet(
+            true,
+            true,
+            vec![7; 8],
+            PacketNumber {
                 value: 0x1234_5678,
                 len: 4,
             },
-            payload: vec![0x1e],
-        };
+            vec![0x1e],
+        );
         let b = datagram(std::slice::from_ref(&p)).unwrap();
         assert_eq!(b[0], 0x40 | 0x20 | 0x04 | 0x03);
         assert_eq!(Packet::parse(&b, 8).unwrap(), (p, b.len()));
@@ -2402,13 +2436,7 @@ mod tests {
                 2,
             ),
             (
-                Packet::Handshake {
-                    version: VERSION_2,
-                    dcid: d.clone(),
-                    scid: s.clone(),
-                    number,
-                    payload: vec![1],
-                },
+                handshake_packet(VERSION_2, d.clone(), s.clone(), number, vec![1]),
                 3,
             ),
             (
@@ -2422,13 +2450,7 @@ mod tests {
                 1,
             ),
             (
-                Packet::Handshake {
-                    version: VERSION_1,
-                    dcid: d.clone(),
-                    scid: s.clone(),
-                    number,
-                    payload: vec![1],
-                },
+                handshake_packet(VERSION_1, d.clone(), s.clone(), number, vec![1]),
                 2,
             ),
         ] {
@@ -2480,30 +2502,18 @@ mod tests {
             scid: vec![2; 8],
             token: vec![],
             number,
-            payload: Payload(
-                ([Frame::Crypto {
-                    offset: 0,
-                    data: vec![4; 100],
-                }])
-                .to_vec(),
-            )
-            .to_bytes()
-            .unwrap(),
+            payload: Payload(([crypto_fixture(0, vec![4; 100])]).to_vec())
+                .to_bytes()
+                .unwrap(),
         };
-        let handshake = Packet::Handshake {
-            version: VERSION_1,
-            dcid: vec![1; 8],
-            scid: vec![2; 8],
+        let handshake = handshake_packet(
+            VERSION_1,
+            vec![1; 8],
+            vec![2; 8],
             number,
-            payload: Payload(([Frame::Ping]).to_vec()).to_bytes().unwrap(),
-        };
-        let short = Packet::Short {
-            spin: false,
-            key_phase: false,
-            dcid: vec![1; 8],
-            number,
-            payload: vec![0x1e],
-        };
+            Payload(([Frame::Ping]).to_vec()).to_bytes().unwrap(),
+        );
+        let short = short_packet(false, false, vec![1; 8], number, vec![0x1e]);
         let packets = vec![initial.clone(), handshake.clone(), short.clone()];
         let b = datagram(&packets).unwrap();
         assert_eq!(split_datagram(&b, 8), (packets, None));
@@ -2561,25 +2571,10 @@ mod tests {
                 stream: 8,
                 error_code: 0,
             },
-            Frame::Crypto {
-                offset: 1 << 20,
-                data: vec![0xaa; 300],
-            },
+            crypto_fixture(1 << 20, vec![0xaa; 300]),
             Frame::NewToken(vec![1, 2, 3]),
-            Frame::Stream(StreamFrame {
-                id: 0,
-                offset: 0,
-                data: b"GET /".to_vec(),
-                fin: false,
-                length: true,
-            }),
-            Frame::Stream(StreamFrame {
-                id: 1 << 40,
-                offset: 77,
-                data: vec![],
-                fin: true,
-                length: true,
-            }),
+            Frame::Stream(stream_frame(0, 0, b"GET /".to_vec(), false, true)),
+            Frame::Stream(stream_frame(1 << 40, 77, vec![], true, true)),
             Frame::MaxData(1 << 50),
             Frame::MaxStreamData {
                 stream: 3,
@@ -2615,25 +2610,11 @@ mod tests {
             Frame::RetireConnectionId(2),
             Frame::PathChallenge(*b"12345678"),
             Frame::PathResponse(*b"87654321"),
-            Frame::ConnectionClose {
-                error_code: 0x0a,
-                frame_type: Some(0x08),
-                reason: b"bad".to_vec(),
-            },
-            Frame::ConnectionClose {
-                error_code: 0x100,
-                frame_type: None,
-                reason: vec![],
-            },
+            connection_close(0x0a, Some(0x08), b"bad".to_vec()),
+            connection_close(0x100, None, vec![]),
             Frame::HandshakeDone,
             Frame::Padding(3),
-            Frame::Stream(StreamFrame {
-                id: 5,
-                offset: 9,
-                data: b"tail".to_vec(),
-                fin: true,
-                length: false,
-            }),
+            Frame::Stream(stream_frame(5, 9, b"tail".to_vec(), true, false)),
         ]
     }
 
@@ -2657,22 +2638,12 @@ mod tests {
         assert_eq!(Frame::HandshakeDone.to_bytes().unwrap(), [0x1e]);
         assert_eq!(Frame::MaxData(15_293).to_bytes().unwrap(), hex("107bbd"));
         assert_eq!(
-            Frame::ConnectionClose {
-                error_code: 7,
-                frame_type: Some(6),
-                reason: b"x".to_vec()
-            }
-            .to_bytes()
-            .unwrap(),
+            connection_close(7, Some(6), b"x".to_vec())
+                .to_bytes()
+                .unwrap(),
             hex("1c07060178")
         );
-        let s = StreamFrame {
-            id: 4,
-            offset: 0,
-            data: b"hi".to_vec(),
-            fin: true,
-            length: false,
-        };
+        let s = stream_frame(4, 0, b"hi".to_vec(), true, false);
         assert_eq!(
             Frame::Stream(s.clone()).to_bytes().unwrap(),
             hex("09046869")
@@ -2717,27 +2688,10 @@ mod tests {
         assert!(!Frame::Padding(1).is_ack_eliciting());
         assert!(!Frame::Ack(Ack::from_ranges(&[(0, 0)], 0).unwrap()).is_ack_eliciting());
         // RFC 9000, table 3.
-        let close = Frame::ConnectionClose {
-            error_code: 0,
-            frame_type: Some(0),
-            reason: vec![],
-        };
-        let app_close = Frame::ConnectionClose {
-            error_code: 0,
-            frame_type: None,
-            reason: vec![],
-        };
-        let crypto = Frame::Crypto {
-            offset: 0,
-            data: vec![],
-        };
-        let stream = Frame::Stream(StreamFrame {
-            id: 0,
-            offset: 0,
-            data: vec![],
-            fin: false,
-            length: false,
-        });
+        let close = connection_close(0, Some(0), vec![]);
+        let app_close = connection_close(0, None, vec![]);
+        let crypto = crypto_fixture(0, vec![]);
+        let stream = Frame::Stream(stream_frame(0, 0, vec![], false, false));
         let ack = Frame::Ack(Ack::from_ranges(&[(0, 0)], 0).unwrap());
         for (f, want) in [
             (Frame::Padding(1), [true, true, true, true]),
@@ -2793,13 +2747,7 @@ mod tests {
     #[test]
     fn packet_errors() {
         let number = PacketNumber { value: 0, len: 1 };
-        let hs = |dcid: Vec<u8>| Packet::Handshake {
-            version: VERSION_1,
-            dcid,
-            scid: vec![],
-            number,
-            payload: vec![1],
-        };
+        let hs = |dcid: Vec<u8>| handshake_packet(VERSION_1, dcid, vec![], number, vec![1]);
         // Reading.
         assert_eq!(Packet::parse(&[], 0), Err(Error::Truncated));
         assert_eq!(
@@ -2835,13 +2783,7 @@ mod tests {
         assert_eq!(Packet::parse(&retry[..20], 0), Err(Error::Truncated));
         // Writing.
         assert_eq!(datagram(&[hs(vec![0; 21])]), Err(Error::Unwritable));
-        let bad = Packet::Handshake {
-            version: 7,
-            dcid: vec![],
-            scid: vec![],
-            number,
-            payload: vec![],
-        };
+        let bad = handshake_packet(7, vec![], vec![], number, vec![]);
         assert_eq!(datagram(std::slice::from_ref(&bad)), Err(Error::Unwritable));
         let bad = Packet::OtherVersion {
             bits: 0,
@@ -2864,30 +2806,12 @@ mod tests {
             PacketNumber { value: 0, len: 0 },
             PacketNumber { value: 0, len: 5 },
         ] {
-            let p = Packet::Short {
-                spin: false,
-                key_phase: false,
-                dcid: vec![],
-                number,
-                payload: vec![1],
-            };
+            let p = short_packet(false, false, vec![], number, vec![1]);
             assert_eq!(datagram(std::slice::from_ref(&p)), Err(Error::Unwritable));
         }
-        let p = Packet::Short {
-            spin: false,
-            key_phase: false,
-            dcid: vec![0; 21],
-            number,
-            payload: vec![1],
-        };
+        let p = short_packet(false, false, vec![0; 21], number, vec![1]);
         assert_eq!(datagram(std::slice::from_ref(&p)), Err(Error::Unwritable));
-        let p = Packet::Short {
-            spin: false,
-            key_phase: false,
-            dcid: vec![0; 20],
-            number,
-            payload: vec![0; MAX_DATAGRAM],
-        };
+        let p = short_packet(false, false, vec![0; 20], number, vec![0; MAX_DATAGRAM]);
         assert_eq!(datagram(std::slice::from_ref(&p)), Err(Error::Unwritable));
         let p = Packet::Retry {
             version: VERSION_2,
@@ -2926,30 +2850,14 @@ mod tests {
             Payload::parse(&[0x1f]).map(|payload| payload.0),
             Err(Error::UnknownFrame(0x1f))
         );
-        assert_eq!(
-            Payload::parse(&hex("4040")).map(|payload| payload.0),
-            Err(Error::UnknownFrame(0x40))
-        );
-        assert_eq!(
-            Payload::parse(&hex("4030")).map(|payload| payload.0),
-            Err(Error::LongFrameType(0x30))
-        );
-        assert_eq!(
-            Payload::parse(&hex("4001")).map(|payload| payload.0),
-            Err(Error::LongFrameType(t::PING))
-        );
-        // ACK ranges below 0.
-        assert_eq!(
-            Payload::parse(&hex("0205000006")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(t::ACK))
-        );
-        assert_eq!(
-            Payload::parse(&hex("02050001000400")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(t::ACK))
-        );
-        assert_eq!(
-            Payload::parse(&hex("02050001000202")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(t::ACK))
+        assert_cases!(|input| Payload::parse(input).map(|payload| payload.0);
+            unknown_type_64: &hex("4040") => Err(Error::UnknownFrame(0x40)),
+            nonminimal_datagram_type: &hex("4030") => Err(Error::LongFrameType(0x30)),
+            nonminimal_ping: &hex("4001") => Err(Error::LongFrameType(t::PING)),
+            // ACK ranges below 0.
+            ack_first_range_underflows: &hex("0205000006") => Err(Error::FrameEncoding(t::ACK)),
+            ack_gap_underflows: &hex("02050001000400") => Err(Error::FrameEncoding(t::ACK)),
+            ack_second_range_underflows: &hex("02050001000202") => Err(Error::FrameEncoding(t::ACK)),
         );
         assert_eq!(
             Payload::parse(&hex("02050001000100")).map(|payload| payload.0),
@@ -2965,37 +2873,17 @@ mod tests {
         );
         assert_eq!(Error::TooManyAckRanges(t::ACK).frame_type(), Some(t::ACK));
         // Data ending past 2^62 - 1.
-        assert_eq!(
-            Payload::parse(&hex("06ffffffffffffffff0100")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(t::CRYPTO))
-        );
-        assert_eq!(
-            Payload::parse(&hex("0c00ffffffffffffffff00")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(0x0c))
-        );
-        assert_eq!(
-            Payload::parse(&hex("0700")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(t::NEW_TOKEN))
-        );
-        assert_eq!(
-            Payload::parse(&hex("12d000000000000001")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(t::MAX_STREAMS_BIDI))
-        );
-        assert_eq!(
-            Payload::parse(&hex("17d000000000000001")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(t::STREAMS_BLOCKED_UNI))
-        );
-        assert_eq!(
-            Payload::parse(&hex("18010000")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(t::NEW_CONNECTION_ID))
-        );
-        assert_eq!(
-            Payload::parse(&hex("18010015")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(t::NEW_CONNECTION_ID))
-        );
-        assert_eq!(
-            Payload::parse(&hex("18010201")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(t::NEW_CONNECTION_ID))
+        assert_cases!(|input| Payload::parse(input).map(|payload| payload.0);
+            crypto_offset_overflow: &hex("06ffffffffffffffff0100") => Err(Error::FrameEncoding(t::CRYPTO)),
+            stream_offset_overflow: &hex("0c00ffffffffffffffff00") => Err(Error::FrameEncoding(0x0c)),
+            empty_new_token: &hex("0700") => Err(Error::FrameEncoding(t::NEW_TOKEN)),
+            max_streams_too_large: &hex("12d000000000000001")
+                => Err(Error::FrameEncoding(t::MAX_STREAMS_BIDI)),
+            blocked_streams_too_large: &hex("17d000000000000001")
+                => Err(Error::FrameEncoding(t::STREAMS_BLOCKED_UNI)),
+            empty_connection_id: &hex("18010000") => Err(Error::FrameEncoding(t::NEW_CONNECTION_ID)),
+            long_connection_id: &hex("18010015") => Err(Error::FrameEncoding(t::NEW_CONNECTION_ID)),
+            retire_after_sequence: &hex("18010201") => Err(Error::FrameEncoding(t::NEW_CONNECTION_ID)),
         );
         // Writing.
         assert_eq!(Payload(([]).to_vec()).to_bytes(), Err(Error::Unwritable));
@@ -3034,20 +2922,10 @@ mod tests {
             Err(Error::Unwritable)
         );
         assert_eq!(
-            Frame::Crypto {
-                offset: MAX_VARINT,
-                data: vec![1]
-            }
-            .to_bytes(),
+            crypto_fixture(MAX_VARINT, vec![1]).to_bytes(),
             Err(Error::Unwritable)
         );
-        let s = StreamFrame {
-            id: 0,
-            offset: MAX_VARINT,
-            data: vec![1],
-            fin: false,
-            length: false,
-        };
+        let s = stream_frame(0, MAX_VARINT, vec![1], false, false);
         assert_eq!(Frame::Stream(s).to_bytes(), Err(Error::Unwritable));
         for (id, retire) in [(vec![], 0), (vec![0; 21], 0), (vec![1], 2)] {
             let f = Frame::NewConnectionId {
@@ -3112,21 +2990,11 @@ mod tests {
         assert_eq!(Error::LongFrameType(t::PING).frame_type(), Some(t::PING));
         // Section 20.1: a frame cut short by the payload's end is badly
         // formatted, a FRAME_ENCODING_ERROR naming its type.
-        assert_eq!(
-            Payload::parse(&hex("0600")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(t::CRYPTO))
-        );
-        assert_eq!(
-            Payload::parse(&hex("1a0102")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(t::PATH_CHALLENGE))
-        );
-        assert_eq!(
-            Payload::parse(&hex("0b0005ff")).map(|payload| payload.0),
-            Err(Error::FrameEncoding(0x0b))
-        );
-        assert_eq!(
-            Payload::parse(&hex("0140")).map(|payload| payload.0),
-            Err(Error::Truncated)
+        assert_cases!(|input| Payload::parse(input).map(|payload| payload.0);
+            truncated_crypto: &hex("0600") => Err(Error::FrameEncoding(t::CRYPTO)),
+            truncated_path_challenge: &hex("1a0102") => Err(Error::FrameEncoding(t::PATH_CHALLENGE)),
+            truncated_stream: &hex("0b0005ff") => Err(Error::FrameEncoding(0x0b)),
+            truncated_type: &hex("0140") => Err(Error::Truncated),
         );
         assert_eq!(
             Error::Truncated.transport_code(),
@@ -3136,13 +3004,7 @@ mod tests {
         // connection ID. A sender must not mix them, and a receiver
         // ignores the packets after one that differs.
         let number = PacketNumber { value: 0, len: 1 };
-        let hs = |dcid: Vec<u8>| Packet::Handshake {
-            version: VERSION_1,
-            dcid,
-            scid: vec![],
-            number,
-            payload: vec![1],
-        };
+        let hs = |dcid: Vec<u8>| handshake_packet(VERSION_1, dcid, vec![], number, vec![1]);
         let (a, b) = (hs(vec![1; 8]), hs(vec![2; 8]));
         assert_eq!(datagram(&[a.clone(), b.clone()]), Err(Error::Unwritable));
         let bytes = [
@@ -3154,13 +3016,7 @@ mod tests {
             split_datagram(&bytes, 8),
             (vec![a.clone()], Some(Error::MixedConnectionIds))
         );
-        let short = Packet::Short {
-            spin: false,
-            key_phase: false,
-            dcid: vec![1; 8],
-            number,
-            payload: vec![1],
-        };
+        let short = short_packet(false, false, vec![1; 8], number, vec![1]);
         let bytes = datagram(&[a.clone(), short.clone()]).unwrap();
         assert_eq!(split_datagram(&bytes, 8), (vec![a, short], None));
     }
@@ -3280,13 +3136,13 @@ mod tests {
         // of the payload before it protects the packet.
         let mut payload = Payload(([Frame::Ping]).to_vec()).to_bytes().unwrap();
         payload.resize(payload.len() + 16, 0);
-        let hs = Packet::Handshake {
-            version: VERSION_1,
-            dcid: vec![],
-            scid: vec![],
-            number: PacketNumber { value: 0, len: 1 },
+        let hs = handshake_packet(
+            VERSION_1,
+            vec![],
+            vec![],
+            PacketNumber { value: 0, len: 1 },
             payload,
-        };
+        );
         let b = datagram(std::slice::from_ref(&hs)).unwrap();
         assert_eq!(b[7], 1 + 1 + 16);
         assert_eq!(Packet::parse(&b, 0).unwrap(), (hs, b.len()));
@@ -3351,13 +3207,7 @@ mod tests {
                 0,
             ),
             (
-                Packet::Handshake {
-                    version: VERSION_1,
-                    dcid: vec![],
-                    scid: vec![4],
-                    number,
-                    payload: payload.clone(),
-                },
+                handshake_packet(VERSION_1, vec![], vec![4], number, payload.clone()),
                 0,
             ),
             (
@@ -3371,16 +3221,7 @@ mod tests {
                 },
                 0,
             ),
-            (
-                Packet::Short {
-                    spin: true,
-                    key_phase: false,
-                    dcid: vec![5; 8],
-                    number,
-                    payload,
-                },
-                8,
-            ),
+            (short_packet(true, false, vec![5; 8], number, payload), 8),
             (
                 Packet::VersionNegotiation {
                     unused: 1,
@@ -3445,11 +3286,15 @@ mod tests {
             }
         }
         // The whole sample payload, too.
-        let b = Payload((sample_frames()).to_vec()).to_bytes().unwrap();
+        let expected = sample_frames();
+        let b = Payload(expected.clone()).to_bytes().unwrap();
         for cut in 0..b.len() {
             assert_ne!(
-                Payload::parse(&b[..cut]).map(|payload| payload.0).ok(),
-                Some(sample_frames())
+                Payload::parse(&b[..cut])
+                    .map(|payload| payload.0)
+                    .ok()
+                    .as_ref(),
+                Some(&expected)
             );
         }
     }
@@ -3502,10 +3347,7 @@ mod tests {
         let data: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
         let mut frames = Vec::new();
         for (i, b) in data.iter().enumerate().rev() {
-            frames.push(Frame::Crypto {
-                offset: i as u64,
-                data: vec![*b],
-            });
+            frames.push(crypto_fixture(i as u64, vec![*b]));
         }
         let payload = Payload((frames[..1000]).to_vec()).to_bytes().unwrap();
         let mut r = Reassembler::new();
@@ -3546,13 +3388,7 @@ mod tests {
             (Some(&[2, 3][..]), Some(VERSION_NEGOTIATION), None)
         );
         let n = PacketNumber { value: 7, len: 1 };
-        let short = Packet::Short {
-            spin: false,
-            key_phase: false,
-            dcid: vec![],
-            number: n,
-            payload: vec![1],
-        };
+        let short = short_packet(false, false, vec![], n, vec![1]);
         assert_eq!(
             (short.scid(), short.version(), short.number()),
             (None, None, Some(n))
@@ -3560,34 +3396,15 @@ mod tests {
 
         // Frame::to_bytes never writes more than Payload reads.
         let big = vec![0; MAX_PAYLOAD];
-        let crypto = Frame::Crypto {
-            offset: 0,
-            data: big.clone(),
-        };
+        let crypto = crypto_fixture(0, big.clone());
         assert_eq!(crypto.to_bytes(), Err(Error::Unwritable));
-        let stream = Frame::Stream(StreamFrame {
-            id: 0,
-            offset: 0,
-            data: big.clone(),
-            fin: false,
-            length: false,
-        });
+        let stream = Frame::Stream(stream_frame(0, 0, big.clone(), false, false));
         assert!(matches!(stream.to_bytes(), Err(Error::Unwritable)));
-        let close = Frame::ConnectionClose {
-            error_code: 0,
-            frame_type: None,
-            reason: big,
-        };
+        let close = connection_close(0, None, big);
         assert!(matches!(close.to_bytes(), Err(Error::Unwritable)));
-        let crypto = Frame::Crypto {
-            offset: 0,
-            data: vec![0; MAX_PAYLOAD + 1],
-        };
+        let crypto = crypto_fixture(0, vec![0; MAX_PAYLOAD + 1]);
         assert_eq!(crypto.to_bytes(), Err(Error::Unwritable));
-        let fits = Frame::Crypto {
-            offset: 0,
-            data: vec![0; MAX_PAYLOAD - 1 - 1 - 4],
-        };
+        let fits = crypto_fixture(0, vec![0; MAX_PAYLOAD - 1 - 1 - 4]);
         assert_eq!(
             Payload::parse(&fits.to_bytes().unwrap())
                 .map(|payload| payload.0)
@@ -3663,18 +3480,15 @@ mod tests {
                 stream: random_value(rng),
                 error_code: random_value(rng),
             },
-            5 => Frame::Crypto {
-                offset: random_value(rng),
-                data: small(rng),
-            },
+            5 => crypto_fixture(random_value(rng), small(rng)),
             6 => Frame::NewToken(small(rng)),
-            7 => Frame::Stream(StreamFrame {
-                id: random_value(rng),
-                offset: random_value(rng),
-                data: small(rng),
-                fin: rng.coin(),
-                length: rng.coin(),
-            }),
+            7 => Frame::Stream(stream_frame(
+                random_value(rng),
+                random_value(rng),
+                small(rng),
+                rng.coin(),
+                rng.coin(),
+            )),
             8 => Frame::MaxData(random_value(rng)),
             9 => Frame::MaxStreamData {
                 stream: random_value(rng),
@@ -3702,16 +3516,8 @@ mod tests {
             15 => Frame::RetireConnectionId(random_value(rng)),
             16 => Frame::PathChallenge([rng.next() as u8; 8]),
             17 => Frame::PathResponse([rng.next() as u8; 8]),
-            18 => Frame::ConnectionClose {
-                error_code: random_value(rng),
-                frame_type: Some(random_value(rng)),
-                reason: small(rng),
-            },
-            19 => Frame::ConnectionClose {
-                error_code: random_value(rng),
-                frame_type: None,
-                reason: small(rng),
-            },
+            18 => connection_close(random_value(rng), Some(random_value(rng)), small(rng)),
+            19 => connection_close(random_value(rng), None, small(rng)),
             20 => Frame::HandshakeDone,
             _ => Frame::Ping,
         }
@@ -3722,13 +3528,7 @@ mod tests {
         for payload in [
             Payload(vec![Frame::Padding(1), Frame::Padding(2)]),
             Payload(vec![
-                Frame::Stream(StreamFrame {
-                    id: 0,
-                    offset: 0,
-                    data: vec![1],
-                    fin: false,
-                    length: false,
-                }),
+                Frame::Stream(stream_frame(0, 0, vec![1], false, false)),
                 Frame::Ping,
             ]),
         ] {
@@ -3737,13 +3537,13 @@ mod tests {
             assert_eq!(out, [9, 8]);
             contract::check_wire_value(&payload);
         }
-        let packet = Packet::Short {
-            spin: false,
-            key_phase: false,
-            dcid: vec![1; 8],
-            number: PacketNumber { value: 0, len: 1 },
-            payload: vec![1],
-        };
+        let packet = short_packet(
+            false,
+            false,
+            vec![1; 8],
+            PacketNumber { value: 0, len: 1 },
+            vec![1],
+        );
         assert_eq!(
             Datagram::<0>(vec![packet.clone()]).to_bytes(),
             Err(Error::Unwritable)
@@ -3754,13 +3554,13 @@ mod tests {
     #[test]
     fn split_datagram_keeps_packets_before_a_truncated_tail() {
         let payload = Payload(vec![Frame::Ping, Frame::Padding(3)]);
-        let packet = Packet::Handshake {
-            version: VERSION_1,
-            dcid: vec![],
-            scid: vec![],
-            number: PacketNumber { value: 0, len: 1 },
-            payload: payload.to_bytes().unwrap(),
-        };
+        let packet = handshake_packet(
+            VERSION_1,
+            vec![],
+            vec![],
+            PacketNumber { value: 0, len: 1 },
+            payload.to_bytes().unwrap(),
+        );
         let prefix = Datagram::<0>(vec![packet.clone(), packet.clone()]);
         let mut bytes = prefix.to_bytes().unwrap();
         bytes.push(0xc0);
@@ -3869,13 +3669,7 @@ mod tests {
                     number,
                     payload,
                 },
-                2 => Packet::Handshake {
-                    version,
-                    dcid,
-                    scid,
-                    number,
-                    payload,
-                },
+                2 => handshake_packet(version, dcid, scid, number, payload),
                 3 => Packet::Retry {
                     version,
                     unused: rng.next() as u8,
@@ -3884,13 +3678,7 @@ mod tests {
                     token: payload,
                     tag: [1; 16],
                 },
-                4 => Packet::Short {
-                    spin: true,
-                    key_phase: rng.coin(),
-                    dcid,
-                    number,
-                    payload,
-                },
+                4 => short_packet(true, rng.coin(), dcid, number, payload),
                 5 => Packet::VersionNegotiation {
                     unused: rng.next() as u8,
                     dcid,

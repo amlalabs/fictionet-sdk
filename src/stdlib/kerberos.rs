@@ -1631,10 +1631,23 @@ impl Wire for MethodData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish as finish_stream, pump};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{chunks, decode_all, mutate};
+
+    fn ap_rep_fixture(enc_part: EncryptedData) -> ApRep {
+        ApRep { enc_part }
+    }
+
+    fn pa_data(padata_type: i32, value: Vec<u8>) -> PaData {
+        PaData { padata_type, value }
+    }
+
+    fn host_address(addr_type: i32, address: Vec<u8>) -> HostAddress {
+        HostAddress { addr_type, address }
+    }
 
     fn time(s: &str) -> KerberosTime {
         KerberosTime::new(s).unwrap()
@@ -1658,10 +1671,10 @@ mod tests {
 
     fn as_req() -> KdcReq {
         KdcReq {
-            padata: Some(vec![PaData {
-                padata_type: padata_type::ENC_TIMESTAMP,
-                value: enc(18, None, &[1, 2, 3]).to_bytes().unwrap(),
-            }]),
+            padata: Some(vec![pa_data(
+                padata_type::ENC_TIMESTAMP,
+                enc(18, None, &[1, 2, 3]).to_bytes().unwrap(),
+            )]),
             body: KdcReqBody {
                 kdc_options: kdc_options::FORWARDABLE
                     | kdc_options::RENEWABLE
@@ -1677,10 +1690,7 @@ mod tests {
                 rtime: Some(time("20261012000000Z")),
                 nonce: 0xdead_beef,
                 etypes: vec![18, 17, 23],
-                addresses: Some(vec![HostAddress {
-                    addr_type: 2,
-                    address: vec![10, 0, 0, 5],
-                }]),
+                addresses: Some(vec![host_address(2, vec![10, 0, 0, 5])]),
                 enc_authorization_data: Some(enc(18, None, b"ad")),
                 additional_tickets: Some(vec![tgt()]),
             },
@@ -1705,10 +1715,7 @@ mod tests {
 
     fn all_messages() -> Vec<Message> {
         let rep = KdcRep {
-            padata: Some(vec![PaData {
-                padata_type: padata_type::ETYPE_INFO2,
-                value: vec![0x30, 0x00],
-            }]),
+            padata: Some(vec![pa_data(padata_type::ETYPE_INFO2, vec![0x30, 0x00])]),
             crealm: "EXAMPLE.COM".into(),
             cname: PrincipalName::new(name_type::PRINCIPAL, &["alice"]),
             ticket: tgt(),
@@ -1730,9 +1737,7 @@ mod tests {
                 ticket: tgt(),
                 authenticator: enc(23, None, &[9; 20]),
             }),
-            Message::ApRep(ApRep {
-                enc_part: enc(18, None, &[7; 30]),
-            }),
+            Message::ApRep(ap_rep_fixture(enc(18, None, &[7; 30]))),
             Message::KrbError(krb_error()),
         ]
     }
@@ -1770,12 +1775,7 @@ mod tests {
             0xa2, 0x02, 0x04, 0x00,
         ];
         let m = Message::parse(&der).unwrap();
-        assert_eq!(
-            m,
-            Message::ApRep(ApRep {
-                enc_part: enc(18, None, &[])
-            })
-        );
+        assert_eq!(m, Message::ApRep(ap_rep_fixture(enc(18, None, &[]))));
         assert_eq!(m.to_bytes().unwrap(), der);
     }
 
@@ -1834,14 +1834,8 @@ mod tests {
     #[test]
     fn method_data() {
         let p = MethodData(vec![
-            PaData {
-                padata_type: padata_type::ENC_TIMESTAMP,
-                value: vec![],
-            },
-            PaData {
-                padata_type: padata_type::ETYPE_INFO2,
-                value: vec![0x30, 0x00],
-            },
+            pa_data(padata_type::ENC_TIMESTAMP, vec![]),
+            pa_data(padata_type::ETYPE_INFO2, vec![0x30, 0x00]),
         ]);
         let der = p.to_bytes().unwrap();
         assert_eq!(MethodData::parse(&der).unwrap(), p);
@@ -1862,13 +1856,10 @@ mod tests {
                 .as_str(),
             "20260228235959Z"
         );
-        assert_eq!(
-            KerberosTime::from_parts(2026, 2, 29, 0, 0, 0),
-            Err(Error::Time)
-        );
-        assert_eq!(
-            KerberosTime::from_parts(10000, 1, 1, 0, 0, 0),
-            Err(Error::Time)
+        assert_cases!(|(year, month, day, hour, minute, second)|
+            KerberosTime::from_parts(year, month, day, hour, minute, second);
+            non_leap_day: (2026, 2, 29, 0, 0, 0) => Err(Error::Time),
+            five_digit_year: (10000, 1, 1, 0, 0, 0) => Err(Error::Time),
         );
         assert_eq!(time("20261005120000Z").to_string(), "20261005120000Z");
         assert!(time("20251231235959Z") < time("20260101000000Z"));
@@ -1884,11 +1875,9 @@ mod tests {
 
     #[test]
     fn error_paths() {
-        let ap_rep = Message::ApRep(ApRep {
-            enc_part: enc(18, None, &[]),
-        })
-        .to_bytes()
-        .unwrap();
+        let ap_rep = Message::ApRep(ap_rep_fixture(enc(18, None, &[])))
+            .to_bytes()
+            .unwrap();
         // Wrong version.
         let v4 = replace(
             &ap_rep,
@@ -2025,13 +2014,7 @@ mod tests {
         r.body.etypes = vec![1; MAX_ETYPES + 1];
         assert_eq!(Message::AsReq(r).to_bytes(), Err(Error::TooMany("etype")));
         let mut r = as_req();
-        r.body.addresses = Some(vec![
-            HostAddress {
-                addr_type: 2,
-                address: vec![10, 0, 0, 1]
-            };
-            MAX_ADDRESSES + 1
-        ]);
+        r.body.addresses = Some(vec![host_address(2, vec![10, 0, 0, 1]); MAX_ADDRESSES + 1]);
         assert_eq!(
             Message::AsReq(r).to_bytes(),
             Err(Error::TooMany("addresses"))
@@ -2043,13 +2026,7 @@ mod tests {
             Err(Error::TooMany("additional-tickets"))
         );
         let mut r = as_req();
-        r.padata = Some(vec![
-            PaData {
-                padata_type: 2,
-                value: vec![]
-            };
-            MAX_PADATA + 1
-        ]);
+        r.padata = Some(vec![pa_data(2, vec![]); MAX_PADATA + 1]);
         assert_eq!(Message::AsReq(r).to_bytes(), Err(Error::TooMany("padata")));
         let mut e = krb_error();
         e.susec = MAX_MICROSECONDS + 1;
@@ -2058,9 +2035,7 @@ mod tests {
         e.cusec = Some(MAX_MICROSECONDS + 1);
         assert_eq!(Message::KrbError(e).to_bytes(), Err(Error::Range));
         // A message over the size limit.
-        let big = Message::ApRep(ApRep {
-            enc_part: enc(18, None, &vec![0; MAX_MESSAGE]),
-        });
+        let big = Message::ApRep(ap_rep_fixture(enc(18, None, &vec![0; MAX_MESSAGE])));
         assert_eq!(big.to_bytes(), Err(Error::TooLong));
         assert_eq!(
             Frame(vec![0; MAX_MESSAGE + 1]).to_bytes(),
@@ -2074,18 +2049,13 @@ mod tests {
         // Past asn1::MAX_INPUT the writer itself stops. That is still a
         // message longer than MAX_MESSAGE, and says so.
         let huge = vec![0; asn1::MAX_INPUT + 1];
-        let big = Message::ApRep(ApRep {
-            enc_part: enc(18, None, &huge),
-        });
+        let big = Message::ApRep(ap_rep_fixture(enc(18, None, &huge)));
         assert_eq!(big.to_bytes(), Err(Error::TooLong));
         assert_eq!(enc(18, None, &huge).to_bytes(), Err(Error::TooLong));
         let mut t = tgt();
         t.enc_part.cipher = huge.clone();
         assert_eq!(t.to_bytes(), Err(Error::TooLong));
-        let p = PaData {
-            padata_type: 2,
-            value: huge.clone(),
-        };
+        let p = pa_data(2, huge.clone());
         assert_eq!(MethodData(vec![p]).to_bytes(), Err(Error::TooLong));
         let mut body = as_req().body;
         body.enc_authorization_data = Some(enc(18, None, &huge));
@@ -2102,13 +2072,9 @@ mod tests {
         }
         let mut tr = der.clone();
         tr.push(0);
-        assert_eq!(
-            KdcReqBody::parse(&tr),
-            Err(Error::Asn1(asn1::Error::Trailing))
-        );
-        assert_eq!(
-            KdcReqBody::parse(&vec![0; MAX_MESSAGE + 1]),
-            Err(Error::TooLong)
+        assert_cases!(|input| KdcReqBody::parse(input);
+            trailing_body: &tr => Err(Error::Asn1(asn1::Error::Trailing)),
+            oversized_body: &vec![0; MAX_MESSAGE + 1] => Err(Error::TooLong),
         );
     }
 
@@ -2339,11 +2305,9 @@ mod tests {
     #[test]
     fn decoder_takes_many_small_messages_in_linear_time() {
         let one = Frame(
-            Message::ApRep(ApRep {
-                enc_part: enc(18, None, &[]),
-            })
-            .to_bytes()
-            .unwrap(),
+            Message::ApRep(ap_rep_fixture(enc(18, None, &[])))
+                .to_bytes()
+                .unwrap(),
         )
         .to_bytes()
         .unwrap();
@@ -2365,11 +2329,9 @@ mod tests {
     #[test]
     fn stream_stops_after_a_bad_header() {
         let one = Frame(
-            Message::ApRep(ApRep {
-                enc_part: enc(18, None, &[]),
-            })
-            .to_bytes()
-            .unwrap(),
+            Message::ApRep(ap_rep_fixture(enc(18, None, &[])))
+                .to_bytes()
+                .unwrap(),
         )
         .to_bytes()
         .unwrap();
@@ -2405,11 +2367,9 @@ mod tests {
     #[test]
     fn a_drained_decoder_lets_go_of_a_large_buffer() {
         let big = Frame(
-            Message::ApRep(ApRep {
-                enc_part: enc(18, None, &vec![0; MAX_MESSAGE - 100]),
-            })
-            .to_bytes()
-            .unwrap(),
+            Message::ApRep(ap_rep_fixture(enc(18, None, &vec![0; MAX_MESSAGE - 100])))
+                .to_bytes()
+                .unwrap(),
         )
         .to_bytes()
         .unwrap();
@@ -2472,10 +2432,7 @@ mod tests {
         // sent. Here a ticket in it holds a kvno written as a signed -1,
         // which DER writes back longer, so only the bytes as sent will do.
         let mut r = as_req();
-        r.padata = Some(vec![PaData {
-            padata_type: padata_type::TGS_REQ,
-            value: vec![1, 2, 3],
-        }]);
+        r.padata = Some(vec![pa_data(padata_type::TGS_REQ, vec![1, 2, 3])]);
         let der = Message::TgsReq(r).to_bytes().unwrap();
         let sent = replace(
             &der,
@@ -2540,57 +2497,24 @@ mod tests {
         let mut loopback = [0u8; 16];
         loopback[15] = 1;
         let good = [
-            HostAddress {
-                addr_type: HostAddress::IPV4,
-                address: vec![192, 0, 2, 1],
-            },
-            HostAddress {
-                addr_type: HostAddress::IPV6,
-                address: v6.to_vec(),
-            },
+            host_address(HostAddress::IPV4, vec![192, 0, 2, 1]),
+            host_address(HostAddress::IPV6, v6.to_vec()),
             // A NetBIOS name, and a local type, hold any bytes.
-            HostAddress {
-                addr_type: 20,
-                address: b"HOST            ".to_vec(),
-            },
-            HostAddress {
-                addr_type: -1,
-                address: vec![],
-            },
+            host_address(20, b"HOST            ".to_vec()),
+            host_address(-1, vec![]),
         ];
         for a in good {
             let m = Message::AsReq(with(a));
             assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m));
         }
         let bad = [
-            HostAddress {
-                addr_type: HostAddress::IPV4,
-                address: vec![1],
-            },
-            HostAddress {
-                addr_type: HostAddress::IPV4,
-                address: vec![1, 2, 3, 4, 5],
-            },
-            HostAddress {
-                addr_type: HostAddress::IPV6,
-                address: vec![0x20; 4],
-            },
-            HostAddress {
-                addr_type: HostAddress::IPV6,
-                address: vec![0; 16],
-            },
-            HostAddress {
-                addr_type: HostAddress::IPV6,
-                address: loopback.to_vec(),
-            },
-            HostAddress {
-                addr_type: HostAddress::IPV6,
-                address: link_local.to_vec(),
-            },
-            HostAddress {
-                addr_type: HostAddress::IPV6,
-                address: mapped.to_vec(),
-            },
+            host_address(HostAddress::IPV4, vec![1]),
+            host_address(HostAddress::IPV4, vec![1, 2, 3, 4, 5]),
+            host_address(HostAddress::IPV6, vec![0x20; 4]),
+            host_address(HostAddress::IPV6, vec![0; 16]),
+            host_address(HostAddress::IPV6, loopback.to_vec()),
+            host_address(HostAddress::IPV6, link_local.to_vec()),
+            host_address(HostAddress::IPV6, mapped.to_vec()),
         ];
         for a in bad {
             let r = with(a.clone());

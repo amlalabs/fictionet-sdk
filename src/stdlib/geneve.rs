@@ -450,6 +450,10 @@ mod tests {
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
 
+    fn packet(header: Header, payload: Vec<u8>) -> Packet {
+        Packet { header, payload }
+    }
+
     fn collect(b: &[u8]) -> Result<Packet, Error> {
         contract::check_collect::<Packet>(b, MAX_DATAGRAM)
     }
@@ -540,10 +544,7 @@ mod tests {
             opt(2, 2, true, &[8; 120]),
         ]);
         assert_eq!(h.options_len(), MAX_OPTIONS_LEN);
-        let p = Packet {
-            header: h,
-            payload: vec![9; MAX_DATAGRAM - MAX_HEADER_LEN],
-        };
+        let p = packet(h, vec![9; MAX_DATAGRAM - MAX_HEADER_LEN]);
         let b = p.to_bytes().unwrap();
         assert_eq!(b.len(), MAX_DATAGRAM);
         assert_eq!(b[0], 63);
@@ -564,10 +565,7 @@ mod tests {
 
     #[test]
     fn reply_keeps_network_and_protocol() {
-        let mut p = Packet {
-            header: header(vec![opt(1, 1, true, &[])]),
-            payload: vec![1],
-        };
+        let mut p = packet(header(vec![opt(1, 1, true, &[])]), vec![1]);
         p.header.control = true;
         let r = p.reply(vec![2, 3]);
         assert_eq!(r.header.vni, p.header.vni);
@@ -671,13 +669,13 @@ mod tests {
 
     #[test]
     fn every_truncated_prefix() {
-        let p = Packet {
-            header: header(vec![
+        let p = packet(
+            header(vec![
                 opt(0x0102, 3, false, &[1, 2, 3, 4]),
                 opt(0x0103, 4, true, &[5; 8]),
             ]),
-            payload: vec![0xaa; 3],
-        };
+            vec![0xaa; 3],
+        );
         let b = p.to_bytes().unwrap();
         let header_len = p.header.len();
         for n in 0..header_len {
@@ -697,10 +695,7 @@ mod tests {
 
     #[test]
     fn header_prefix_and_stream_boundary() {
-        let p = Packet {
-            header: header(vec![opt(9, 9, false, &[1; 4])]),
-            payload: vec![3; 100],
-        };
+        let p = packet(header(vec![opt(9, 9, false, &[1; 4])]), vec![3; 100]);
         let b = p.to_bytes().unwrap();
         assert_eq!(Header::parse_prefix(&b[..p.header.len() - 1]), Ok(None));
         assert_eq!(
@@ -735,19 +730,12 @@ mod tests {
             opt(1, 2, false, &[0; 124]),
         ]);
         assert_eq!(h.to_bytes(), Err(Error::OptionsLength(256)));
-        assert_eq!(
-            Packet {
-                header: h,
-                payload: vec![]
-            }
-            .to_bytes(),
-            Err(Error::OptionsLength(256))
-        );
+        assert_eq!(packet(h, vec![]).to_bytes(), Err(Error::OptionsLength(256)));
 
-        let p = Packet {
-            header: header(vec![opt(1, 1, false, &[0; 4])]),
-            payload: vec![0; MAX_PAYLOAD - 7],
-        };
+        let p = packet(
+            header(vec![opt(1, 1, false, &[0; 4])]),
+            vec![0; MAX_PAYLOAD - 7],
+        );
         assert_eq!(p.to_bytes(), Err(Error::TooLong));
 
         // On an error, write leaves the buffer alone.
@@ -777,14 +765,8 @@ mod tests {
     fn reply_can_keep_the_options() {
         // An AWS Gateway Load Balancer packet with its flow cookie (class
         // 0x0108, type 3), answered with every option kept.
-        let p = Packet {
-            header: header(vec![opt(0x0108, 3, false, &[1, 2, 3, 4])]),
-            payload: vec![1],
-        };
-        let r = Packet {
-            header: p.header.clone(),
-            payload: vec![2],
-        };
+        let p = packet(header(vec![opt(0x0108, 3, false, &[1, 2, 3, 4])]), vec![1]);
+        let r = packet(p.header.clone(), vec![2]);
         assert_eq!(
             Packet::parse(&r.to_bytes().unwrap())
                 .unwrap()
@@ -822,15 +804,15 @@ mod tests {
                 (rng.next() as u32) & MAX_VNI
             };
             let n = rng.index(64);
-            let p = Packet {
-                header: Header {
+            let p = packet(
+                Header {
                     control: !rng.coin(),
                     protocol: rng.next() as u16,
                     vni,
                     options,
                 },
-                payload: rng.bytes(n),
-            };
+                rng.bytes(n),
+            );
             let mut out = vec![0xee];
             match p.write(&mut out) {
                 Ok(()) => assert_eq!(Packet::parse(&out[1..]), Ok(p)),
@@ -844,27 +826,18 @@ mod tests {
 
     #[test]
     fn packet_write_appends() {
-        let p = Packet {
-            header: header(vec![opt(3, 4, true, &[1; 8])]),
-            payload: vec![5; 3],
-        };
+        let p = packet(header(vec![opt(3, 4, true, &[1; 8])]), vec![5; 3]);
         let mut out = vec![0xee];
         p.write(&mut out).unwrap();
         assert_eq!(out[0], 0xee);
         assert_eq!(&out[1..], &p.to_bytes().unwrap()[..]);
         assert_eq!(Packet::parse(&out[1..]), Ok(p));
         // On an error, the buffer is left alone.
-        let big = Packet {
-            header: header(vec![]),
-            payload: vec![0; MAX_PAYLOAD + 1],
-        };
+        let big = packet(header(vec![]), vec![0; MAX_PAYLOAD + 1]);
         let mut out = vec![1, 2];
         assert_eq!(big.write(&mut out), Err(Error::TooLong));
         assert_eq!(out, [1, 2]);
-        let bad = Packet {
-            header: header(vec![opt(1, 1, false, &[1])]),
-            payload: vec![],
-        };
+        let bad = packet(header(vec![opt(1, 1, false, &[1])]), vec![]);
         assert_eq!(bad.write(&mut out), Err(Error::OptionData(1)));
         assert_eq!(out, [1, 2]);
     }
@@ -927,15 +900,15 @@ mod tests {
             }
         }
         let n = rng.index(64);
-        Packet {
-            header: Header {
+        packet(
+            Header {
                 control: !rng.coin(),
                 protocol: rng.next() as u16,
                 vni: (rng.next() as u32) & MAX_VNI,
                 options,
             },
-            payload: rng.bytes(n),
-        }
+            rng.bytes(n),
+        )
     }
 
     fn check_bytes(data: &[u8]) {

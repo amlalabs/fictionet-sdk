@@ -1483,11 +1483,23 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Decode, Step};
     use fictionet::stdlib::codec::{Fail, Lcg, Stream, finish, pump};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::rounds;
     use fictionet::stdlib::test_support::{decode_all, mutate};
+
+    fn begin_request(role: Role, flags: u8) -> BeginRequest {
+        BeginRequest { role, flags }
+    }
+
+    fn end_request(app_status: u32, protocol_status: ProtocolStatus) -> EndRequest {
+        EndRequest {
+            app_status,
+            protocol_status,
+        }
+    }
 
     fn pair(n: &str, v: &str) -> (Vec<u8>, Vec<u8>) {
         (n.as_bytes().to_vec(), v.as_bytes().to_vec())
@@ -1542,15 +1554,9 @@ mod tests {
     // request with params and stdin, and its reply.
     #[test]
     fn spec_responder_example() {
-        let mut sent = Record::begin_request(
-            1,
-            BeginRequest {
-                role: Role::Responder,
-                flags: 0,
-            },
-        )
-        .to_bytes()
-        .unwrap();
+        let mut sent = Record::begin_request(1, begin_request(Role::Responder, 0))
+            .to_bytes()
+            .unwrap();
         // {FCGI_PARAMS, 1, "\013\002SERVER_PORT80\013\016SERVER_ADDR199.170.183.42 ... "}
         let mut params = vec![11, 2];
         params.extend_from_slice(b"SERVER_PORT80");
@@ -1655,15 +1661,15 @@ mod tests {
         );
         assert_eq!(Record::parse(&bytes), Ok(r));
         let odd = [1, 6, 0, 1, 0, 1, 2, 0, b'x', 0xaa, 0xbb, 1];
-        assert_eq!(Record::parse(&odd), Err(Error::Trailing));
-        assert_eq!(
-            Record::parse(&odd[..11]),
-            Ok(Record {
-                kind: 6,
-                request_id: 1,
-                content: b"x".to_vec(),
-                padding: 2
-            })
+        assert_cases!(|input| Record::parse(input);
+            trailing_bytes: &odd => Err(Error::Trailing),
+            padded_content: &odd[..11]
+                => Ok(Record {
+                    kind: 6,
+                    request_id: 1,
+                    content: b"x".to_vec(),
+                    padding: 2,
+                }),
         );
         for n in 0..16 {
             assert_eq!(
@@ -1747,17 +1753,11 @@ mod tests {
 
     #[test]
     fn bodies() {
-        let b = BeginRequest {
-            role: Role::Filter,
-            flags: KEEP_CONN,
-        };
+        let b = begin_request(Role::Filter, KEEP_CONN);
         assert_eq!(b.to_bytes().unwrap(), [0, 3, 1, 0, 0, 0, 0, 0]);
         assert_eq!(BeginRequest::parse(&b.to_bytes().unwrap()), Ok(b));
         assert!(b.keep_conn());
-        let e = EndRequest {
-            app_status: 0x01020304,
-            protocol_status: ProtocolStatus::Overloaded,
-        };
+        let e = end_request(0x01020304, ProtocolStatus::Overloaded);
         assert_eq!(e.to_bytes().unwrap(), [1, 2, 3, 4, 2, 0, 0, 0]);
         assert_eq!(EndRequest::parse(&e.to_bytes().unwrap()), Ok(e));
         assert_eq!(
@@ -1854,7 +1854,7 @@ mod tests {
 
     #[test]
     fn server_errors() {
-        let begin = |id, role| Record::begin_request(id, BeginRequest { role, flags: 0 });
+        let begin = |id, role| Record::begin_request(id, begin_request(role, 0));
         let mut s = Server::new();
         // A bad BEGIN_REQUEST body.
         assert_eq!(
@@ -2078,13 +2078,7 @@ mod tests {
             Ok(Some(ServerEvent::Abort(4)))
         );
         // A second BEGIN_REQUEST for it is refused, and the first stays.
-        let begin = Record::begin_request(
-            4,
-            BeginRequest {
-                role: Role::Responder,
-                flags: 0,
-            },
-        );
+        let begin = Record::begin_request(4, begin_request(Role::Responder, 0));
         assert_eq!(s.receive(&begin), Err(Error::Duplicate { id: 4 }));
         assert_eq!(s.open(), 1);
         // Stray stream records for it are ignored.
@@ -2115,13 +2109,7 @@ mod tests {
             };
         }
         let over = MAX_REQUESTS as u16 + 1;
-        let begin = Record::begin_request(
-            over,
-            BeginRequest {
-                role: Role::Responder,
-                flags: 0,
-            },
-        );
+        let begin = Record::begin_request(over, begin_request(Role::Responder, 0));
         assert_eq!(s.receive(&begin), Err(Error::TooManyRequests { id: over }));
         assert!(s.end(1));
         assert_eq!(s.receive(&begin), Ok(None));
@@ -2163,15 +2151,9 @@ mod tests {
     fn request_refuses_unknown_begin_flags() {
         for flags in [0, KEEP_CONN, 2, KEEP_CONN | 2, u8::MAX] {
             let mut bytes = Vec::new();
-            Record::begin_request(
-                1,
-                BeginRequest {
-                    role: Role::Authorizer,
-                    flags,
-                },
-            )
-            .write(&mut bytes)
-            .unwrap();
+            Record::begin_request(1, begin_request(Role::Authorizer, flags))
+                .write(&mut bytes)
+                .unwrap();
             Record::new(kind::PARAMS, 1, &[]).write(&mut bytes).unwrap();
             if flags & !KEEP_CONN == 0 {
                 assert_eq!(
@@ -2323,14 +2305,8 @@ mod tests {
         let mut s = Server::new();
         let mut failed = None;
         'outer: for id in 1..=MAX_REQUESTS as u16 {
-            s.receive(&Record::begin_request(
-                id,
-                BeginRequest {
-                    role: Role::Filter,
-                    flags: 0,
-                },
-            ))
-            .unwrap();
+            s.receive(&Record::begin_request(id, begin_request(Role::Filter, 0)))
+                .unwrap();
             s.receive(&Record::new(kind::PARAMS, id, &[])).unwrap();
             for k in [kind::STDIN, kind::DATA] {
                 for _ in 0..MAX_STREAM / MAX_CONTENT {
@@ -2375,13 +2351,7 @@ mod tests {
         assert!(c.held() <= MAX_HELD);
         // An END_REQUEST frees what its response held.
         let before = c.held();
-        let end = Record::end_request(
-            1,
-            EndRequest {
-                app_status: 0,
-                protocol_status: ProtocolStatus::RequestComplete,
-            },
-        );
+        let end = Record::end_request(1, end_request(0, ProtocolStatus::RequestComplete));
         assert!(matches!(
             c.receive(&end),
             Ok(Some(ClientEvent::Response(_)))
@@ -2460,13 +2430,10 @@ mod tests {
                 let k = rng.index(13) as u8;
                 let content = match rng.index(4) {
                     0 => Vec::new(),
-                    1 => BeginRequest {
-                        role: Role::from_code(rng.index(5) as u16),
-                        flags: rng.next() as u8,
-                    }
-                    .to_bytes()
-                    .unwrap()
-                    .to_vec(),
+                    1 => begin_request(Role::from_code(rng.index(5) as u16), rng.next() as u8)
+                        .to_bytes()
+                        .unwrap()
+                        .to_vec(),
                     2 => Pairs(vec![(rng.bytes(4), rng.bytes(140))])
                         .to_bytes()
                         .unwrap(),
@@ -2542,10 +2509,7 @@ mod tests {
         );
         assert_eq!(c.receive(&Record::new(kind::STDOUT, 1, b"b")), Ok(None));
         assert_eq!(c.receive(&Record::new(kind::STDOUT, 1, &[])), Ok(None));
-        let end = EndRequest {
-            app_status: 0,
-            protocol_status: ProtocolStatus::RequestComplete,
-        };
+        let end = end_request(0, ProtocolStatus::RequestComplete);
         assert_eq!(c.receive(&Record::end_request(1, end)), Ok(None));
         assert_eq!(c.open(), 0);
         // The ID can be used again after END_REQUEST.
@@ -2627,10 +2591,7 @@ mod tests {
         server
             .receive(&Record::begin_request(
                 1,
-                BeginRequest {
-                    role: Role::Authorizer,
-                    flags: 0,
-                },
+                begin_request(Role::Authorizer, 0),
             ))
             .unwrap();
         let pairs = RecordStream {
@@ -2655,17 +2616,11 @@ mod tests {
     // A role or status given by number is the same value as the named one.
     #[test]
     fn numbered_roles_and_statuses_equal_named_ones() {
-        let b = BeginRequest {
-            role: Role::Other(1),
-            flags: 0,
-        };
+        let b = begin_request(Role::Other(1), 0);
         assert_eq!(BeginRequest::parse(&b.to_bytes().unwrap()), Ok(b));
         assert_eq!(Role::Other(3), Role::Filter);
         assert_ne!(Role::Other(4), Role::Filter);
-        let e = EndRequest {
-            app_status: 0,
-            protocol_status: ProtocolStatus::Other(0),
-        };
+        let e = end_request(0, ProtocolStatus::Other(0));
         assert_eq!(EndRequest::parse(&e.to_bytes().unwrap()), Ok(e));
         assert_eq!(ProtocolStatus::Other(2), ProtocolStatus::Overloaded);
     }
@@ -2674,14 +2629,8 @@ mod tests {
     #[test]
     fn streams_come_in_order() {
         let mut s = Server::new();
-        s.receive(&Record::begin_request(
-            1,
-            BeginRequest {
-                role: Role::Responder,
-                flags: 0,
-            },
-        ))
-        .unwrap();
+        s.receive(&Record::begin_request(1, begin_request(Role::Responder, 0)))
+            .unwrap();
         assert_eq!(
             s.receive(&Record::new(kind::STDIN, 1, b"x")),
             Err(Error::OutOfOrder {
@@ -2692,14 +2641,8 @@ mod tests {
         assert_eq!(s.receive(&Record::new(kind::PARAMS, 1, &[])), Ok(None));
         assert_eq!(s.receive(&Record::new(kind::STDIN, 1, &[])), Ok(None));
         assert!(s.end(1));
-        s.receive(&Record::begin_request(
-            2,
-            BeginRequest {
-                role: Role::Filter,
-                flags: 0,
-            },
-        ))
-        .unwrap();
+        s.receive(&Record::begin_request(2, begin_request(Role::Filter, 0)))
+            .unwrap();
         s.receive(&Record::new(kind::PARAMS, 2, &[])).unwrap();
         assert_eq!(
             s.receive(&Record::new(kind::DATA, 2, &[])),
@@ -2720,10 +2663,7 @@ mod tests {
         for (id, flags) in [(1, 0), (2, KEEP_CONN)] {
             s.receive(&Record::begin_request(
                 id,
-                BeginRequest {
-                    role: Role::Responder,
-                    flags,
-                },
+                begin_request(Role::Responder, flags),
             ))
             .unwrap();
             assert_eq!(
@@ -2741,13 +2681,7 @@ mod tests {
     // A request whose streams failed stays active until END_REQUEST.
     #[test]
     fn failed_request_stays_active_until_ended() {
-        let begin = Record::begin_request(
-            1,
-            BeginRequest {
-                role: Role::Responder,
-                flags: 0,
-            },
-        );
+        let begin = Record::begin_request(1, begin_request(Role::Responder, 0));
         let mut s = Server::new();
         s.receive(&begin).unwrap();
         s.receive(&Record::new(kind::PARAMS, 1, &[])).unwrap();
@@ -2768,10 +2702,7 @@ mod tests {
         let mut s2 = Server::new();
         s2.receive(&Record::begin_request(
             5,
-            BeginRequest {
-                role: Role::Authorizer,
-                flags: 0,
-            },
+            begin_request(Role::Authorizer, 0),
         ))
         .unwrap();
         s2.receive(&Record::new(kind::PARAMS, 5, &[9])).unwrap();
@@ -2779,10 +2710,7 @@ mod tests {
         assert_eq!(
             s2.receive(&Record::begin_request(
                 5,
-                BeginRequest {
-                    role: Role::Authorizer,
-                    flags: 0
-                }
+                begin_request(Role::Authorizer, 0)
             )),
             Err(Error::Duplicate { id: 5 })
         );

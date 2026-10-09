@@ -1815,12 +1815,37 @@ fn level(price: Price, a: &Aggregate) -> Level {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Fail, Lcg};
     use fictionet::stdlib::test_support::contract::{
         check_decode, check_decode_with_alloc_limit, check_wire, check_wire_value,
     };
     use fictionet::stdlib::test_support::hex;
     use fictionet::stdlib::test_support::{decode_all, mutate};
+
+    fn gap_fixture(unit: u8, sequence: u32, count: u32) -> Gap {
+        Gap {
+            unit,
+            sequence,
+            count,
+        }
+    }
+
+    fn order_executed(
+        time_offset: u32,
+        order_id: u64,
+        executed_quantity: u32,
+        execution_id: u64,
+        extra: Vec<u8>,
+    ) -> OrderExecuted {
+        OrderExecuted {
+            time_offset,
+            order_id,
+            executed_quantity,
+            execution_id,
+            extra,
+        }
+    }
 
     fn sym6(s: &str) -> Symbol6 {
         Alpha::right_padded(s).unwrap()
@@ -1888,13 +1913,9 @@ mod tests {
             canceled_quantity: 737,
             extra: Vec::new(),
         };
-        assert_eq!(
-            Message::parse(&unit.messages[0]).unwrap(),
-            add.clone().into()
-        );
-        assert_eq!(
-            Message::parse(&unit.messages[1]).unwrap(),
-            reduce.clone().into()
+        assert_cases!(|input| Message::parse(input).unwrap();
+            add_order: &unit.messages[0] => add.clone().into(),
+            reduce_order: &unit.messages[1] => reduce.clone().into(),
         );
         assert_eq!(
             Unit::of(1, 1, &[add.into(), reduce.into()])
@@ -1916,23 +1937,16 @@ mod tests {
         assert_eq!(good, [8, 0, 0, 3, 7, 0, 0, 0]);
         assert!(Unit::parse(&good).unwrap().is_heartbeat());
         // Count says one message, none follows.
-        assert_eq!(Unit::parse(&[8, 0, 1, 3, 7, 0, 0, 0]), Err(Error::Count));
-        // A message of length 0 or 1 cannot hold its type.
-        assert_eq!(
-            Unit::parse(&[9, 0, 1, 3, 7, 0, 0, 0, 1]),
-            Err(Error::Length)
+        assert_cases!(|input| Unit::parse(input);
+            missing_message: &[8, 0, 1, 3, 7, 0, 0, 0] => Err(Error::Count),
+            // A message of length 0 or 1 cannot hold its type.
+            short_message: &[9, 0, 1, 3, 7, 0, 0, 0, 1] => Err(Error::Length),
+            // A message running past the unit.
+            oversized_message: &[10, 0, 1, 3, 7, 0, 0, 0, 3, 0x20] => Err(Error::Length),
+            // Two messages where the count says one.
+            extra_message: &[12, 0, 1, 3, 7, 0, 0, 0, 2, 0x86, 2, 0x86] => Err(Error::Count),
+            short_unit: &[7, 0, 0, 0, 0, 0, 0] => Err(Error::Length),
         );
-        // A message running past the unit.
-        assert_eq!(
-            Unit::parse(&[10, 0, 1, 3, 7, 0, 0, 0, 3, 0x20]),
-            Err(Error::Length)
-        );
-        // Two messages where the count says one.
-        assert_eq!(
-            Unit::parse(&[12, 0, 1, 3, 7, 0, 0, 0, 2, 0x86, 2, 0x86]),
-            Err(Error::Count)
-        );
-        assert_eq!(Unit::parse(&[7, 0, 0, 0, 0, 0, 0]), Err(Error::Length));
         let bad = Unit {
             unit: 1,
             sequence: 1,
@@ -2158,26 +2172,14 @@ mod tests {
         );
         exact(
             &hex(&format!("1A 23 {OFFSET} {ORDER_ID} 64 00 00 00 {EXEC_ID}")),
-            OrderExecuted {
-                time_offset: 447_000,
-                order_id: ORDER,
-                executed_quantity: 100,
-                execution_id: EXEC,
-                extra: Vec::new(),
-            },
+            order_executed(447_000, ORDER, 100, EXEC, Vec::new()),
         );
         // The options form carries the Trade Condition in `extra`.
         exact(
             &hex(&format!(
                 "1B 23 {OFFSET} {ORDER_ID} 64 00 00 00 {EXEC_ID} 53"
             )),
-            OrderExecuted {
-                time_offset: 447_000,
-                order_id: ORDER,
-                executed_quantity: 100,
-                execution_id: EXEC,
-                extra: vec![b'S'],
-            },
+            order_executed(447_000, ORDER, 100, EXEC, vec![b'S']),
         );
         exact(
             &hex(&format!(
@@ -2649,25 +2651,12 @@ mod tests {
         assert_eq!(d.receive(&unit(1, 11, 3)), seen(true, 1, 2, None));
         assert_eq!(d.expected(1), Some(14));
         // Ahead: 14..=16 missing.
-        let gap = Gap {
-            unit: 1,
-            sequence: 14,
-            count: 3,
-        };
+        let gap = gap_fixture(1, 14, 3);
         assert_eq!(d.receive(&unit(1, 17, 1)), seen(true, 0, 1, Some(gap)));
         // A heartbeat names the next sequence; ahead of it is a gap too.
         assert_eq!(
             d.receive(&unit(1, 20, 0)),
-            seen(
-                true,
-                0,
-                0,
-                Some(Gap {
-                    unit: 1,
-                    sequence: 18,
-                    count: 2
-                })
-            )
+            seen(true, 0, 0, Some(gap_fixture(1, 18, 2)))
         );
         // Unsequenced data leaves the unit alone.
         assert_eq!(d.receive(&unit(1, 0, 4)), seen(false, 0, 4, None));
@@ -2686,14 +2675,7 @@ mod tests {
         d.receive(&unit(1, MAX_SEQUENCE - 2, 1));
         let s = d.receive(&unit(1, 3, 1));
         let gap = s.gap.unwrap();
-        assert_eq!(
-            gap,
-            Gap {
-                unit: 1,
-                sequence: MAX_SEQUENCE - 1,
-                count: 4
-            }
-        );
+        assert_eq!(gap, gap_fixture(1, MAX_SEQUENCE - 1, 4));
         let requests = gap.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(
@@ -2705,11 +2687,7 @@ mod tests {
         d.receive(&unit(1, MAX_SEQUENCE, 3));
         assert_eq!(d.expected(1), Some(3));
         // A big gap splits into requests of at most 65535.
-        let big = Gap {
-            unit: 2,
-            sequence: MAX_SEQUENCE - 10,
-            count: 70_000,
-        };
+        let big = gap_fixture(2, MAX_SEQUENCE - 10, 70_000);
         let r = big.requests();
         assert_eq!(r.len(), 2);
         assert_eq!((r[0].sequence, r[0].count), (MAX_SEQUENCE - 10, 65_535));
@@ -2876,18 +2854,8 @@ mod tests {
             })
         );
         // Execute 100 of order 1, reduce 50 of order 2.
-        book.apply(
-            1,
-            &OrderExecuted {
-                time_offset: 0,
-                order_id: 1,
-                executed_quantity: 100,
-                execution_id: 1,
-                extra: Vec::new(),
-            }
-            .into(),
-        )
-        .unwrap();
+        book.apply(1, &order_executed(0, 1, 100, 1, Vec::new()).into())
+            .unwrap();
         book.apply(
             1,
             &ReduceSizeShort {
@@ -3069,14 +3037,7 @@ mod tests {
                     extra: Vec::new(),
                 }
                 .into(),
-                2 => OrderExecuted {
-                    time_offset: 0,
-                    order_id: id,
-                    executed_quantity: quantity,
-                    execution_id: 0,
-                    extra: Vec::new(),
-                }
-                .into(),
+                2 => order_executed(0, id, quantity, 0, Vec::new()).into(),
                 3 => modify(id, price, quantity),
                 4 => delete(id),
                 5 => OrderExecutedAtPrice {

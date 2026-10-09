@@ -466,6 +466,10 @@ mod tests {
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::decode_all;
 
+    fn object(address: u32, value: Vec<u8>) -> Object {
+        Object { address, value }
+    }
+
     const INTERROGATION: &[u8] = &[0x68, 14, 0, 0, 0, 0, 100, 1, 6, 0, 1, 0, 0, 0, 0, 20];
 
     fn interrogation() -> Asdu {
@@ -490,13 +494,7 @@ mod tests {
         assert_eq!(asdu.type_id, 100);
         assert_eq!(asdu.cause, 6);
         assert_eq!(asdu.common_address, 1);
-        assert_eq!(
-            asdu.objects(1),
-            Ok(vec![Object {
-                address: 0,
-                value: vec![20]
-            }])
-        );
+        assert_eq!(asdu.objects(1), Ok(vec![object(0, vec![20])]));
         for code in [7, 11, 19, 35, 67, 131] {
             let function = UFunction::from_code(code).unwrap();
             assert_eq!(function.code(), code);
@@ -600,16 +598,7 @@ mod tests {
 
     #[test]
     fn objects_in_both_address_layouts() {
-        let objects = vec![
-            Object {
-                address: 0x123456,
-                value: vec![1, 2],
-            },
-            Object {
-                address: 0x123457,
-                value: vec![3, 4],
-            },
-        ];
+        let objects = vec![object(0x123456, vec![1, 2]), object(0x123457, vec![3, 4])];
         let mut asdu = interrogation();
         for sequence in [false, true] {
             asdu.set_objects(&objects, sequence).unwrap();
@@ -631,57 +620,18 @@ mod tests {
         let mut asdu = interrogation();
         let original = asdu.clone();
         let bad_lists = [
-            vec![Object {
-                address: MAX_ADDRESS + 1,
-                value: vec![1],
-            }],
-            vec![Object {
-                address: 0,
-                value: vec![],
-            }],
-            vec![
-                Object {
-                    address: 0,
-                    value: vec![0; 240],
-                },
-                Object {
-                    address: 1,
-                    value: vec![0; 240],
-                },
-            ],
-            vec![
-                Object {
-                    address: 1,
-                    value: vec![0],
-                },
-                Object {
-                    address: 3,
-                    value: vec![0],
-                },
-            ],
-            vec![
-                Object {
-                    address: 0,
-                    value: vec![0]
-                };
-                128
-            ],
+            vec![object(MAX_ADDRESS + 1, vec![1])],
+            vec![object(0, vec![])],
+            vec![object(0, vec![0; 240]), object(1, vec![0; 240])],
+            vec![object(1, vec![0]), object(3, vec![0])],
+            vec![object(0, vec![0]); 128],
         ];
         for objects in bad_lists {
             assert!(asdu.set_objects(&objects, true).is_err());
             assert_eq!(asdu, original);
         }
         // Regression: a full first object's data must not underflow remaining space.
-        let objects = [
-            Object {
-                address: 0,
-                value: vec![0; 240],
-            },
-            Object {
-                address: 1,
-                value: vec![0; 240],
-            },
-        ];
+        let objects = [object(0, vec![0; 240]), object(1, vec![0; 240])];
         assert_eq!(asdu.set_objects(&objects, false), Err(Error::AsduLength));
         asdu.sequence = true;
         asdu.count = 2;

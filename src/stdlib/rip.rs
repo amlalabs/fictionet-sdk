@@ -988,10 +988,20 @@ impl Wire for NgMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::assert_cases;
     use fictionet::stdlib::codec::{Collect, Lcg, Stream};
     use fictionet::stdlib::test_support::contract;
     use fictionet::stdlib::test_support::mutate;
     use fictionet::stdlib::test_support::rounds;
+
+    fn crypto_fixture(key_id: u8, data_len: u8, sequence: u32, data: Vec<u8>) -> Crypto {
+        Crypto {
+            key_id,
+            data_len,
+            sequence,
+            data,
+        }
+    }
 
     fn collect(b: &[u8]) -> Result<Message, Error> {
         contract::check_collect::<Message>(b, MAX_MESSAGE)
@@ -1259,12 +1269,7 @@ mod tests {
         let m = check(&b).unwrap();
         assert_eq!(
             m.auth,
-            Some(Auth::Crypto(Crypto {
-                key_id: 1,
-                data_len: 16,
-                sequence: 7,
-                data: vec![0xab; 16]
-            }))
+            Some(Auth::Crypto(crypto_fixture(1, 16, 7, vec![0xab; 16])))
         );
         assert_eq!(m.to_bytes().unwrap(), b);
         // The length that counts the trailer header is read too.
@@ -1448,18 +1453,15 @@ mod tests {
         assert_eq!(check(&good[..44]), Err(Error::Truncated));
         let mut bad = good.clone();
         bad[47] = 2;
-        assert_eq!(check(&bad), Err(Error::Trailer));
-        assert_eq!(check(&good[..46]), Err(Error::Truncated));
-        assert_eq!(
-            check(&crypto_message(16, &[1; 15])),
-            Err(Error::AuthDataLen {
-                declared: 16,
-                actual: 15
-            })
-        );
-        assert_eq!(
-            check(&crypto_message(255, &[1; 256])),
-            Err(Error::AuthDataTooLong)
+        assert_cases!(|input| check(input);
+            bad_trailer: &bad => Err(Error::Trailer),
+            truncated_trailer: &good[..46] => Err(Error::Truncated),
+            short_auth_data: &crypto_message(16, &[1; 15])
+                => Err(Error::AuthDataLen {
+                    declared: 16,
+                    actual: 15,
+                }),
+            long_auth_data: &crypto_message(255, &[1; 256]) => Err(Error::AuthDataTooLong),
         );
         assert!(check(&crypto_message(255, &[1; 255])).is_ok());
         // Packet length 24 is the authentication entry alone.
@@ -1550,20 +1552,10 @@ mod tests {
         m.auth = Some(Auth::Password([0; 16]));
         assert_eq!(m.to_bytes(), Err(Error::TooManyEntries));
         let mut m = base.clone();
-        m.auth = Some(Auth::Crypto(Crypto {
-            key_id: 1,
-            data_len: 0,
-            sequence: 0,
-            data: vec![0; 256],
-        }));
+        m.auth = Some(Auth::Crypto(crypto_fixture(1, 0, 0, vec![0; 256])));
         assert_eq!(m.to_bytes(), Err(Error::AuthDataTooLong));
         let mut m = base.clone();
-        m.auth = Some(Auth::Crypto(Crypto {
-            key_id: 1,
-            data_len: 3,
-            sequence: 0,
-            data: vec![0; 16],
-        }));
+        m.auth = Some(Auth::Crypto(crypto_fixture(1, 3, 0, vec![0; 16])));
         assert_eq!(
             m.to_bytes(),
             Err(Error::AuthDataLen {
@@ -1758,12 +1750,7 @@ mod tests {
         let m = Message {
             command: Command::Request,
             version: Version::V2,
-            auth: Some(Auth::Crypto(Crypto {
-                key_id: 2,
-                data_len: 4,
-                sequence: 9,
-                data: vec![5; 4],
-            })),
+            auth: Some(Auth::Crypto(crypto_fixture(2, 4, 9, vec![5; 4]))),
             entries: Entries::WholeTable,
         };
         let b = m.to_bytes().unwrap();
@@ -1853,17 +1840,10 @@ mod tests {
         assert_eq!(r.message.entries, Entries::Routes(vec![]));
         assert_eq!(r.message.to_bytes(), Err(Error::NoEntries));
         // Rules about the message as a whole still fail it.
-        assert_eq!(
-            Message::receive(&msg(2, 2, &[a.clone(), a[..10].to_vec()])),
-            Err(Error::Truncated)
-        );
-        assert_eq!(
-            Message::receive(&msg(2, 2, &[whole_table_entry()])),
-            Err(Error::WholeTable { entry: 0 })
-        );
-        assert_eq!(
-            Message::receive(&msg(2, 1, &[route_bytes(1)])),
-            Err(Error::MustBeZero { offset: 12 })
+        assert_cases!(|input| Message::receive(input);
+            partial_route: &msg(2, 2, &[a.clone(), a[..10].to_vec()]) => Err(Error::Truncated),
+            whole_table_response: &msg(2, 2, &[whole_table_entry()]) => Err(Error::WholeTable { entry: 0 }),
+            nonzero_reserved: &msg(2, 1, &[route_bytes(1)]) => Err(Error::MustBeZero { offset: 12 }),
         );
         // RFC 2080 2.4.2: the same for RIPng.
         let doc: Ipv6Addr = "2001:db8::".parse().unwrap();
@@ -1988,12 +1968,7 @@ mod tests {
         let crypto = |n: usize| Message {
             command: Command::Response,
             version: Version::V2,
-            auth: Some(Auth::Crypto(Crypto {
-                key_id: 1,
-                data_len: 16,
-                sequence: 1,
-                data: vec![9; 16],
-            })),
+            auth: Some(Auth::Crypto(crypto_fixture(1, 16, 1, vec![9; 16]))),
             entries: Entries::Routes(vec![route; n]),
         };
         assert!(crypto(23).fits_datagram());
@@ -2025,12 +2000,12 @@ mod tests {
         for size in [MAX_DATAGRAM, MAX_DATAGRAM + 1] {
             let digest = size - 488; // Header, authentication, 23 routes, trailer header.
             let m = Message {
-                auth: Some(Auth::Crypto(Crypto {
-                    key_id: 1,
-                    data_len: digest as u8,
-                    sequence: 1,
-                    data: vec![9; digest],
-                })),
+                auth: Some(Auth::Crypto(crypto_fixture(
+                    1,
+                    digest as u8,
+                    1,
+                    vec![9; digest],
+                ))),
                 ..crypto(23)
             };
             assert_eq!(m.to_bytes().unwrap().len(), size);
@@ -2153,12 +2128,12 @@ mod tests {
                     } else {
                         n as u8
                     };
-                    Some(Auth::Crypto(Crypto {
-                        key_id: rng.next() as u8,
+                    Some(Auth::Crypto(crypto_fixture(
+                        rng.next() as u8,
                         data_len,
-                        sequence: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
-                        data: vec![rng.next() as u8; n],
-                    }))
+                        u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
+                        vec![rng.next() as u8; n],
+                    )))
                 }
                 2 => Some(Auth::Other {
                     kind: rng.index(5) as u16,
