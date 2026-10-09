@@ -98,6 +98,8 @@ macro_rules! protocols {
         #[path = "../../src/stdlib/httpd.rs"]
         pub mod httpd;
         }
+        #[path = "../../src/stdlib/codec/generated.rs"]
+        pub mod generated;
         #[path = "../../src/stdlib/huffman.rs"]
         pub mod huffman;
         #[path = "../../src/stdlib/icmp.rs"]

@@ -3,7 +3,14 @@ const MAX_ALLOCATION: usize = 32;
 const MAX_DEPTH: usize = 4;
 const MAX_MESSAGE: usize = 128;
 const MAX_NODES: usize = 8;
-include!("../src/runtime.txt");
+fictionet::stdlib::codec::generated_runtime!(
+    Error,
+    __wire,
+    MAX_MESSAGE,
+    MAX_DEPTH,
+    MAX_ALLOCATION,
+    MAX_NODES
+);
 
 #[derive(Debug, PartialEq)]
 struct Broken<const SAMPLES: bool>;

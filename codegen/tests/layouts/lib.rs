@@ -5,3 +5,33 @@
 #![deny(warnings)]
 
 include!(concat!(env!("OUT_DIR"), "/layouts.rs"));
+
+#[cfg(test)]
+mod renamed_runtime {
+    const BYTES: usize = 1;
+    const DEPTH: usize = 1;
+    const ALLOCATION: usize = 0;
+    const NODES: usize = 1;
+    fictionet::stdlib::codec::generated_runtime!(Failure, support, BYTES, DEPTH, ALLOCATION, NODES);
+
+    impl support::Codec for u8 {
+        fn read(r: &mut support::Reader<'_>, le: bool) -> Result<Self, Failure> {
+            r.scalar(le)
+        }
+        fn encode(&self, w: &mut support::Writer, le: bool) -> Result<(), Failure> {
+            w.scalar(*self, le)
+        }
+        fn sample(s: &mut support::Sampler) -> Result<Self, Failure> {
+            Ok(s.number() as u8)
+        }
+    }
+
+    #[test]
+    fn caller_names_limits_and_test_helpers() {
+        assert_eq!(support::parse::<u8>(&[7], false), Ok(7));
+        assert_eq!(support::parse::<u8>(&[7, 8], false), Err(Failure::Limit));
+        assert_eq!(support::parse::<u8>(&[], false), Err(Failure::Truncated));
+        let mut sampler = support::Sampler::seed(3);
+        assert_eq!(sampler.bytes(1, 1), Err(Failure::Limit));
+    }
+}

@@ -588,7 +588,7 @@ fn validate_inner(schema: &mut Schema, limits: Limits) -> Result<Validated, Erro
     let inline = edges(false);
     let mut recursion = Recursion::default();
     for t in &schema.types {
-        if reachable(&t.name, &all).contains(&t.name) {
+        if reachable(&t.name, &all).contains(t.name.as_str()) {
             if matches!(t.definition, Definition::Union { .. }) {
                 return Err(err(
                     ErrorKind::IrLimit,
@@ -601,10 +601,10 @@ fn validate_inner(schema: &mut Schema, limits: Limits) -> Result<Validated, Erro
         // A Vec already breaks the Rust layout cycle. Only inline paths need boxes.
         for source in reachable(&t.name, &inline) {
             if inline
-                .get(&source)
+                .get(source)
                 .is_some_and(|targets| targets.contains(&t.name))
             {
-                recursion.boxed.insert((source, t.name.clone()));
+                recursion.boxed.insert((source.to_owned(), t.name.clone()));
             }
         }
     }
@@ -634,14 +634,19 @@ fn layout_minimum(
     }
     Some(sum)
 }
-fn reachable(start: &str, edges: &BTreeMap<String, Vec<String>>) -> BTreeSet<String> {
-    let mut pending = edges.get(start).cloned().unwrap_or_default();
+fn reachable<'a>(start: &str, edges: &'a BTreeMap<String, Vec<String>>) -> BTreeSet<&'a str> {
+    let mut pending: Vec<_> = edges
+        .get(start)
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .collect();
     let mut seen = BTreeSet::new();
     while let Some(next) = pending.pop() {
-        if seen.insert(next.clone())
-            && let Some(nexts) = edges.get(&next)
+        if seen.insert(next)
+            && let Some(nexts) = edges.get(next)
         {
-            pending.extend(nexts.iter().cloned());
+            pending.extend(nexts.iter().map(String::as_str));
         }
     }
     seen

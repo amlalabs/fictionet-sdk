@@ -157,6 +157,7 @@ pub use fictionet::{codec_from, error_display, fixed_fields, open_enum, prefixed
 mod faults;
 pub mod field;
 mod frames;
+mod generated;
 pub mod head_body;
 mod interceptor;
 mod layout;
@@ -165,7 +166,7 @@ pub mod leb128;
 mod pipe;
 mod reader;
 mod work;
-pub use fictionet::layout;
+pub use fictionet::{generated_runtime, layout};
 mod recorder;
 mod stream;
 
@@ -298,7 +299,8 @@ pub trait Wire: Sized {
     /// Why a value cannot be represented on the wire. Owned, like
     /// [`Decode::Error`].
     type WriteError: core::error::Error + 'static;
-    /// Reads all bytes. Trailing bytes are an error.
+    /// Reads all bytes. Trailing bytes and incomplete encodings are errors.
+    /// A type with an empty encoding may accept an empty slice.
     fn parse(b: &[u8]) -> Result<Self, Self::ParseError>;
     /// Appends the value's bytes, leaving `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Self::WriteError>;
