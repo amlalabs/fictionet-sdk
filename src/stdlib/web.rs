@@ -746,7 +746,7 @@ impl Site {
         F: Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
     {
         Site {
-            server: self.server.tls(config_for),
+            server: self.server.tls_with(config_for),
             ..self
         }
     }

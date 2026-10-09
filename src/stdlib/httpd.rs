@@ -1877,7 +1877,7 @@ impl Server {
     /// plain port its requests get a `301` to https, unless
     /// [`plain_http`](Self::plain_http).
     /// This sets routing policy without installing TLS.
-    /// Use [`tls`](Self::tls) to select a config and
+    /// Use [`tls_with`](Self::tls_with) to select a config and
     /// [`served_by`](Self::served_by) to install ports 80 and 443.
     pub fn https(mut self) -> Server {
         self.vhost.https = true;
@@ -1914,7 +1914,7 @@ impl Server {
 
     /// Serves HTTPS on 443 with a config selected for each handshake.
     /// Port 80 redirects to HTTPS unless [`plain_http`](Self::plain_http) was selected.
-    pub fn tls(
+    pub fn tls_with(
         mut self,
         config_for: impl Fn(&Cx) -> Arc<ServerConfig> + Send + Sync + 'static,
     ) -> Server {

@@ -266,7 +266,7 @@ use fictionet::stdlib::httpd::Server;
 
 Net::new()
     .host("intranet", |h| h.dns_name("intranet.corp.test").port_server(80, Server::new(api.clone())))
-    .add_host(Server::new(api).tls(move |_| config.clone()).served_by(Host::new("www").dns_name("www.corp.test")))
+    .add_host(Server::new(api).tls_with(move |_| config.clone()).served_by(Host::new("www").dns_name("www.corp.test")))
     /* ... */;
 ```
 

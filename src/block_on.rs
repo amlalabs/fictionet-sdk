@@ -25,21 +25,8 @@ use std::task::{Context, Poll, Wake, Waker};
 /// `web::proxy` or a tokio-based database client,
 /// fails under `block_on`. Such a world runs on tokio.
 ///
-/// ```no_run
-/// # #[cfg(feature = "std")]
-/// # use fictionet::{Attachments, Cx, Result};
-/// # #[cfg(feature = "std")]
-/// # async fn world(_fcx: Cx, _attachments: Attachments) -> Result { Ok(()) }
-/// # #[cfg(feature = "std")]
-/// fn main() -> fictionet::Result {
-///     let (attacher, attachments) = fictionet::attachments();
-///     let socket = fictionet::WorldSocket::UnixSocket("/run/fictionet/world.sock".into());
-///     let _listening = fictionet::listen(socket, attacher)?;
-///     fictionet::block_on(fictionet::run(fictionet::Seed::random(), |fcx| world(fcx, attachments)))
-/// }
-/// # #[cfg(not(feature = "std"))]
-/// # fn main() {}
-/// ```
+/// The [Running a world](crate#running-a-world) example shows a complete `main`.
+/// It uses this executor to run the world.
 pub fn block_on<F: Future>(future: F) -> F::Output {
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     return park_on(future);
