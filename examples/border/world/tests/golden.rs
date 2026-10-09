@@ -9,6 +9,8 @@
 //!
 //! `BORDER_GOLDEN_WRITE=1 cargo test --test golden` records the files again.
 
+use fictionet::stdlib::sandbox::Machine;
+
 mod common;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -40,7 +42,13 @@ async fn h2_head(
             tokio::spawn(fut);
         }
     }
-    let mut config = (*client_config(None)).clone();
+    let mut config = (*fictionet::stdlib::sandbox::client_config(
+        &fcx,
+        std::time::SystemTime::now(),
+        None,
+        &[b"http/1.1"],
+    ))
+    .clone();
     config.alpn_protocols = vec![b"h2".to_vec()];
     let stream = tls(fcx, m, addr, host, std::sync::Arc::new(config))
         .await
@@ -105,11 +113,25 @@ fn script(variant: Variant) {
             &m,
             BANK_ADDR,
             "kestrelmoor.co.uk",
-            client_config(None),
+            fictionet::stdlib::sandbox::client_config(
+                &fcx,
+                std::time::SystemTime::now(),
+                None,
+                &[b"http/1.1"],
+            ),
         )
         .await
         .unwrap();
-        request(stream, "GET", "kestrelmoor.co.uk", "/balance", &[], "").await;
+        request(
+            &fcx,
+            stream,
+            "GET",
+            "kestrelmoor.co.uk",
+            "/balance",
+            &[],
+            "",
+        )
+        .await;
         let form = [
             ("content-type", "application/x-www-form-urlencoded"),
             ("user-agent", "curl/8.5.0"),
@@ -120,11 +142,17 @@ fn script(variant: Variant) {
             &m,
             BANK_ADDR,
             "www.kestrelmoor.co.uk",
-            client_config(None),
+            fictionet::stdlib::sandbox::client_config(
+                &fcx,
+                std::time::SystemTime::now(),
+                None,
+                &[b"http/1.1"],
+            ),
         )
         .await
         .unwrap();
         request(
+            &fcx,
             stream,
             "POST",
             "www.kestrelmoor.co.uk",
@@ -139,13 +167,19 @@ fn script(variant: Variant) {
             &m,
             STATUS_ADDR,
             "status.harbourline.net",
-            client_config(Some(&env.roots)),
+            fictionet::stdlib::sandbox::client_config(
+                &fcx,
+                std::time::SystemTime::now(),
+                Some(&env.roots),
+                &[b"http/1.1"],
+            ),
         )
         .await
         .unwrap();
-        request(stream, "GET", "status.harbourline.net", "/", &[], "").await;
+        request(&fcx, stream, "GET", "status.harbourline.net", "/", &[], "").await;
         // Plain HTTP, a missing host, and bytes that are not HTTP.
         request(
+            &fcx,
             plain(&fcx, &m, BANK_ADDR).await,
             "GET",
             "kestrelmoor.co.uk",
@@ -155,6 +189,7 @@ fn script(variant: Variant) {
         )
         .await;
         request(
+            &fcx,
             plain(&fcx, &m, BANK_ADDR).await,
             "GET",
             "84.21.44.10",
@@ -172,9 +207,20 @@ fn script(variant: Variant) {
         );
         // A name the bank's certificate does not have.
         assert!(
-            tls(&fcx, &m, BANK_ADDR, "example.com", client_config(None))
-                .await
-                .is_err()
+            tls(
+                &fcx,
+                &m,
+                BANK_ADDR,
+                "example.com",
+                fictionet::stdlib::sandbox::client_config(
+                    &fcx,
+                    std::time::SystemTime::now(),
+                    None,
+                    &[b"http/1.1"]
+                )
+            )
+            .await
+            .is_err()
         );
         // Blocked: another sandbox's address, and a closed port.
         let mut raw_end = attacher.attach("raw").unwrap();

@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use border_world::certs::{self, Ca};
+use border_world::certs;
 use border_world::log::Log;
 use border_world::scenario::{Prefix, Scenario, Task, Variant, parse_prefix};
 
@@ -59,11 +59,21 @@ fn main() {
         Some("make-ca") => argv
             .nth(1)
             .ok_or_else(|| fictionet::Error::msg("make-ca needs a directory"))
-            .and_then(|d| certs::make_ca(Path::new(&d))),
+            .and_then(|d| {
+                fictionet::block_on(fictionet::lab(
+                    fictionet::Seed::random(),
+                    move |fcx| async move { certs::make_ca(&fcx, Path::new(&d)) },
+                ))
+            }),
         Some("make-pki") => argv
             .nth(1)
             .ok_or_else(|| fictionet::Error::msg("make-pki needs a directory"))
-            .and_then(|d| certs::make_pki(Path::new(&d))),
+            .and_then(|d| {
+                fictionet::block_on(fictionet::lab(
+                    fictionet::Seed::random(),
+                    move |fcx| async move { certs::make_pki(&fcx, Path::new(&d)) },
+                ))
+            }),
         Some("credentials") => {
             print!("{}", border_world::bank::credentials_file());
             Ok(())
@@ -97,8 +107,7 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
     };
     let scenario = Arc::new(Scenario::new(variant, task, args.subnet));
 
-    let world_ca = Ca::load(&args.ca_dir)?;
-    let ids = border_world::identities(&scenario, &world_ca)?;
+    let world_ca = certs::load(&args.ca_dir)?;
 
     std::fs::create_dir_all(&args.state_dir)?;
     let file = std::fs::OpenOptions::new()
@@ -117,8 +126,8 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
     fictionet::block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
-            let lookups = border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
-            border_world::look_up_all(&fcx, &lookups, &scenario).await?;
+            let ids = border_world::identities(&fcx, &scenario, &world_ca)?;
+            border_world::start(&fcx, scenario.clone(), ids, log, attachments)?;
             let _listening = fictionet::listen(
                 fictionet::WorldSocket::UnixSocket(args.socket.clone().into()),
                 attacher,

@@ -46,6 +46,7 @@ services:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     volumes:
+      - ca:/app/ca
       - sock:/run/fictionet/sock
       - ${ADAPTIVE_WEB_STORE_DIR:-store}:/var/lib/adaptive-web
     healthcheck:
@@ -102,11 +103,14 @@ services:
       target: agent
     image: fictionet-adaptive-web-agent:dev
     network_mode: "service:attach"
+    volumes:
+      - ca:/app/ca:ro
     depends_on:
       attach:
         condition: service_healthy
     init: true
 
 volumes:
+  ca:
   sock:
   store:

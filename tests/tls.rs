@@ -12,13 +12,11 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fictionet::prelude::*;
+use fictionet::stdlib::ca::Ca;
 use fictionet::stdlib::tls::{self, ServerConfig};
 use fictionet::stdlib::{ConnError, Connection};
 use fictionet::{Cx, Seed, block_on, lab};
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{AlertDescription, ClientConfig, ClientConnection, RootCertStore};
 
 // ---------------------------------------------------------------------------
@@ -250,51 +248,62 @@ impl Client {
 // Certificates.
 
 fn date(y: i32, m: u8, d: u8) -> SystemTime {
-    let t = rcgen::date_time_ymd(y, m, d);
-    UNIX_EPOCH + Duration::from_secs(t.unix_timestamp() as u64)
+    let secs = fictionet::stdlib::x509::Time::Generalized(format!("{y:04}{m:02}{d:02}000000Z"))
+        .unix()
+        .unwrap();
+    UNIX_EPOCH + Duration::from_secs(secs as u64)
 }
 
-struct Ca {
-    cert: Certificate,
-    key: KeyPair,
+fn roots(ca: &Ca) -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    roots.add(ca.cert_der()).unwrap();
+    roots
 }
 
-impl Ca {
-    fn new() -> Ca {
-        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
-        params.not_after = rcgen::date_time_ymd(2100, 1, 1);
-        let key = KeyPair::generate().unwrap();
-        let cert = params.self_signed(&key).unwrap();
-        Ca { cert, key }
+fn issue(
+    fcx: &Cx,
+    ca: &Ca,
+    names: &[&str],
+    from: i32,
+    to: i32,
+    client: bool,
+) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+    use fictionet::stdlib::{
+        codec::Wire,
+        x509::{self, ExtensionValue},
+    };
+    let time = |year| {
+        x509::Time::from_unix(
+            date(year, 1, 1)
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+        )
+        .unwrap()
+    };
+    let mut leaf = ca
+        .issue(
+            fcx,
+            names,
+            x509::Validity {
+                not_before: time(from),
+                not_after: time(to),
+            },
+        )
+        .unwrap();
+    if client {
+        let mut tbs = x509::Certificate::parse(&leaf.chain[0]).unwrap().tbs;
+        tbs.extensions
+            .retain(|e| e.oid.as_bytes() != x509::oid::EXTENDED_KEY_USAGE);
+        let oid = fictionet::stdlib::asn1::Oid::from_contents(x509::oid::CLIENT_AUTH).unwrap();
+        tbs.extensions.push(
+            x509::ExtendedKeyUsage(vec![oid])
+                .to_extension(false)
+                .unwrap(),
+        );
+        leaf.chain[0] = ca.sign(tbs).unwrap().to_bytes().unwrap().into();
     }
-
-    fn roots(&self) -> RootCertStore {
-        let mut roots = RootCertStore::empty();
-        roots.add(self.cert.der().clone()).unwrap();
-        roots
-    }
-
-    /// A leaf for `names`, valid from `from` to `to` (years).
-    fn issue(
-        &self,
-        names: &[&str],
-        from: i32,
-        to: i32,
-        usage: ExtendedKeyUsagePurpose,
-    ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-        let mut params =
-            CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
-                .unwrap();
-        params.not_before = rcgen::date_time_ymd(from, 1, 1);
-        params.not_after = rcgen::date_time_ymd(to, 1, 1);
-        params.extended_key_usages = vec![usage];
-        let key = KeyPair::generate().unwrap();
-        let cert = params.signed_by(&key, &self.cert, &self.key).unwrap();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-        (vec![cert.der().clone()], key)
-    }
+    (leaf.chain, leaf.key)
 }
 
 fn provider() -> rustls::crypto::CryptoProvider {
@@ -303,7 +312,7 @@ fn provider() -> rustls::crypto::CryptoProvider {
 
 /// A server config for `name`, issued by `ca`, offering `alpn`.
 fn server_config(fcx: &Cx, ca: &Ca, name: &str, alpn: &[&[u8]]) -> Arc<ServerConfig> {
-    let (chain, key) = ca.issue(&[name], 2000, 2100, ExtendedKeyUsagePurpose::ServerAuth);
+    let (chain, key) = issue(fcx, ca, &[name], 2000, 2100, false);
     let mut config = tls::config_builder(fcx, date(2030, 1, 1))
         .with_safe_default_protocol_versions()
         .unwrap()
@@ -333,7 +342,7 @@ fn client_config(ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
     )
     .with_safe_default_protocol_versions()
     .unwrap()
-    .with_root_certificates(ca.roots())
+    .with_root_certificates(roots(ca))
     .with_no_client_auth();
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Arc::new(config)
@@ -346,7 +355,7 @@ fn client_config(ca: &Ca, alpn: &[&[u8]]) -> Arc<ClientConfig> {
 fn handshake_with_sni_and_alpn() {
     within(Duration::from_secs(20), || {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
-            let ca = Ca::new();
+            let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[b"h2", b"http/1.1"]);
             let client_config = client_config(&ca, &[b"h2", b"http/1.1"]);
             let (server_side, client_side) = mem_pair();
@@ -389,7 +398,7 @@ fn handshake_with_sni_and_alpn() {
 fn the_world_picks_a_config_per_handshake() {
     within(Duration::from_secs(20), || {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
-            let ca = Ca::new();
+            let ca = Ca::new(&fcx, "Test CA").unwrap();
             let a = server_config(&fcx, &ca, "a.test", &[]);
             let b = server_config(&fcx, &ca, "b.test", &[]);
             let client_config = client_config(&ca, &[]);
@@ -450,7 +459,7 @@ fn the_world_picks_a_config_per_handshake() {
 fn reject_sends_unrecognized_name() {
     within(Duration::from_secs(20), || {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
-            let ca = Ca::new();
+            let ca = Ca::new(&fcx, "Test CA").unwrap();
             let client_config = client_config(&ca, &[]);
             let (server_side, client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
@@ -482,7 +491,7 @@ fn reject_sends_unrecognized_name() {
 fn a_dropped_hello_closes_with_no_alert() {
     within(Duration::from_secs(20), || {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
-            let ca = Ca::new();
+            let ca = Ca::new(&fcx, "Test CA").unwrap();
             let client_config = client_config(&ca, &[]);
             let (server_side, client_side) = mem_pair();
             let server = fcx.spawn(move |fcx| async move {
@@ -547,22 +556,12 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
         let outcome = Arc::new(Mutex::new(None));
         let o = outcome.clone();
         block_on(lab(Seed::from_u64(1), move |fcx| async move {
-            let ca = Ca::new();
+            let ca = Ca::new(&fcx, "Test CA").unwrap();
             // Valid only in 2019.
-            let (client_chain, client_key) = ca.issue(
-                &["client.test"],
-                2019,
-                2020,
-                ExtendedKeyUsagePurpose::ClientAuth,
-            );
-            let (chain, key) = ca.issue(
-                &["example.test"],
-                2000,
-                2100,
-                ExtendedKeyUsagePurpose::ServerAuth,
-            );
+            let (client_chain, client_key) = issue(&fcx, &ca, &["client.test"], 2019, 2020, true);
+            let (chain, key) = issue(&fcx, &ca, &["example.test"], 2000, 2100, false);
             let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-                Arc::new(ca.roots()),
+                Arc::new(roots(&ca)),
                 Arc::new(provider()),
             )
             .build()
@@ -583,7 +582,7 @@ fn client_auth_at(start: SystemTime) -> (Result<(), ConnError>, Result<(), Strin
                 )
                 .with_safe_default_protocol_versions()
                 .unwrap()
-                .with_root_certificates(ca.roots())
+                .with_root_certificates(roots(&ca))
                 .with_client_auth_cert(client_chain, client_key)
                 .unwrap(),
             );
@@ -649,7 +648,7 @@ fn certificates_are_checked_against_the_worlds_date() {
 fn close_notify_both_ways() {
     within(Duration::from_secs(20), || {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
-            let ca = Ca::new();
+            let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[]);
             let client_config = client_config(&ca, &[]);
             let (server_side, client_side) = mem_pair();
@@ -711,7 +710,7 @@ fn five_megabytes_each_way() {
         block_on(fictionet::run(
             fictionet::Seed::random(),
             |fcx| async move {
-                let ca = Ca::new();
+                let ca = Ca::new(&fcx, "Test CA").unwrap();
                 let config = server_config(&fcx, &ca, "example.test", &[]);
                 let client_config = client_config(&ca, &[]);
                 let (server_side, client_side) = mem_pair();
@@ -770,7 +769,7 @@ fn five_megabytes_each_way() {
 fn tls12_clients_work_too() {
     within(Duration::from_secs(20), || {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
-            let ca = Ca::new();
+            let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[b"http/1.1"]);
             // The config draws random values through Fictionet, not ring.
             assert_eq!(
@@ -783,7 +782,7 @@ fn tls12_clients_work_too() {
             )
             .with_protocol_versions(&[&rustls::version::TLS12])
             .unwrap()
-            .with_root_certificates(ca.roots())
+            .with_root_certificates(roots(&ca))
             .with_no_client_auth();
             client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
             let (server_side, client_side) = mem_pair();
@@ -828,7 +827,7 @@ fn tls12_clients_work_too() {
 fn a_cancel_comes_first_and_is_never_a_broken_handshake() {
     within(Duration::from_secs(20), || {
         block_on(lab(Seed::from_u64(1), |fcx| async move {
-            let ca = Ca::new();
+            let ca = Ca::new(&fcx, "Test CA").unwrap();
             let config = server_config(&fcx, &ca, "example.test", &[]);
             let client_config = client_config(&ca, &[]);
             let (server_side, client_side) = mem_pair();

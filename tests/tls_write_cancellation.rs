@@ -10,28 +10,29 @@ use fictionet::stdlib::tls::{self, ServerConfig};
 use fictionet::stdlib::{Connection, ConnectionExt, tcp};
 use fictionet::time::ms;
 use fictionet::{Cx, Result};
-use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 fn configs(fcx: &Cx) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
-    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_key = KeyPair::generate().unwrap();
-    let ca = ca.self_signed(&ca_key).unwrap();
-    let mut leaf = CertificateParams::new(vec!["secret.test".to_owned()]).unwrap();
-    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let key = KeyPair::generate().unwrap();
-    let cert = leaf.signed_by(&key, &ca, &ca_key).unwrap();
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+    let ca = fictionet::stdlib::ca::Ca::new(fcx, "Test CA").unwrap();
+    let leaf = ca
+        .issue(
+            fcx,
+            &["secret.test"],
+            fictionet::stdlib::x509::Validity {
+                not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
+                not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
+            },
+        )
+        .unwrap();
     let server = tls::config_builder(fcx, SystemTime::now())
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
-        .with_single_cert(vec![cert.der().clone()], key)
+        .with_single_cert(leaf.chain, leaf.key)
         .unwrap();
     let mut roots = RootCertStore::empty();
-    roots.add(ca.der().clone()).unwrap();
+    roots.add(ca.cert_der()).unwrap();
     let client =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()

@@ -15,9 +15,7 @@ use std::time::SystemTime;
 
 use fakewiki_world::content::Content;
 use fakewiki_world::log::Log;
-use fakewiki_world::{
-    GATEWAY, args, issue_leaves, look_up_all, secs, serve, start_backend, watch_backend,
-};
+use fakewiki_world::{GATEWAY, args, issue_leaves, secs, serve, start_backend, watch_backend};
 use serde_json::json;
 
 fn main() {
@@ -53,11 +51,10 @@ fn real_main() -> fictionet::Result {
     std::fs::create_dir_all(&args.state_dir)?;
     let log = Arc::new(Log::create(&args.state_dir.join("log.jsonl"))?);
 
-    // 3. Certificates: one leaf per host, signed by the image's CA.
-    let leaves = issue_leaves(&args.ca_dir, hosts.keys())?;
+    // 3. Certificates are issued inside the run.
 
-    // 4. The world. Sandboxes attach through the world socket; the world's
-    //    own lookups use a clone of the same attacher.
+    // 4. The world. Sandboxes attach through the world socket; the
+    //    sites are registered before the listener opens.
     let (attacher, attachments) = fictionet::attachments();
     if let Some(dir) = Path::new(&args.socket).parent() {
         std::fs::create_dir_all(dir)?;
@@ -74,7 +71,6 @@ fn real_main() -> fictionet::Result {
     });
     let state_path = args.state_dir.join("state.json");
     let ready = args.ready.clone();
-    let host_list: Vec<String> = hosts.keys().cloned().collect();
 
     // The network itself needs no tokio; the content client does.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -84,12 +80,10 @@ fn real_main() -> fictionet::Result {
     runtime.block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
+            let leaves = issue_leaves(&fcx, &args.ca_dir, hosts.keys())?;
             serve(&fcx, &hosts, leaves, content, log, attachments)?;
 
-            // Look every host up once, so each FakeWiki address answers from
-            // the start, as in the Python world, even for an agent that
-            // connects by address without DNS.
-            look_up_all(&fcx, &attacher, &host_list).await?;
+            // Every site answers before the first sandbox can attach.
             let _listening =
                 fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
 

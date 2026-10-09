@@ -22,91 +22,23 @@ use std::time::Duration;
 
 use adaptive_web_world::backend::Backend;
 use adaptive_web_world::log::Log;
-use adaptive_web_world::{
-    Addresses, Args, Ca, fixed_addresses, look_up_all, serve, start_backend, world_start,
-};
+use adaptive_web_world::{Addresses, Args, Ca, fixed_addresses, serve, start_backend, world_start};
 use bytes::Bytes;
-use fictionet::prelude::*;
-use fictionet::stdlib::dns::op::{Message, Query};
-use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::{ip, tcp, udp};
-use fictionet::{Cx, End};
-use http_body_util::{BodyExt, Empty};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use fictionet::Cx;
+use fictionet::stdlib::dns::rr::{RData, RecordType};
 use serde_json::Value;
 
 const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
-struct Machine {
-    tcp: tcp::Endpoint,
-    udp: udp::Endpoint,
-    _icmp: End,
-}
-
-/// Accepts any certificate; the CA is checked by the Docker probes.
-#[derive(Debug)]
-struct AcceptAll;
-
-impl rustls::client::danger::ServerCertVerifier for AcceptAll {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &ServerName<'_>,
-        _: &[u8],
-        _: UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-fn client_config() -> Arc<ClientConfig> {
-    let mut config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAll))
-            .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Arc::new(config)
-}
+use fictionet::stdlib::sandbox::{Machine, machine};
 
 /// Looks `name` up; returns its A record, or `None` for NXDOMAIN.
 async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Option<Ipv4Addr> {
-    let mut socket = m
-        .udp
-        .bind(40000 + (fcx.random_u64() % 20000) as u16)
+    let answer = m
+        .lookup(fcx, GATEWAY.into(), name, RecordType::A)
+        .await
         .unwrap();
-    let mut q = Message::query();
-    q.metadata.id = fcx.random_u64() as u16;
-    q.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
-    socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(GATEWAY.into(), 53));
-    let (answer, _) = socket.recv(fcx).await.unwrap();
-    let answer = Message::from_vec(&answer).unwrap();
     answer.answers.iter().find_map(|r| match &r.data {
         RData::A(a) => Some(a.0),
         _ => None,
@@ -114,40 +46,36 @@ async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Option<Ipv4Addr> {
 }
 
 /// One HTTP/1.1 request; returns the status and the body.
-async fn get<IO>(io: IO, host: &str, path: &str) -> (u16, Bytes)
-where
-    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (status, _, body) = request(io, host, path).await;
+async fn get<C: fictionet::stdlib::Connection>(
+    fcx: &Cx,
+    io: C,
+    host: &str,
+    path: &str,
+) -> (u16, Bytes) {
+    let (status, _, body) = request(fcx, io, host, path).await;
     (status, body)
 }
 
-/// One HTTP/1.1 request; returns the status, the Date header and the body.
-async fn request<IO>(io: IO, host: &str, path: &str) -> (u16, String, Bytes)
-where
-    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
-        .await
-        .unwrap();
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    let request = http::Request::builder()
-        .uri(path)
-        .header("host", host)
-        .header("user-agent", "curl/8.5.0")
-        .body(Empty::<Bytes>::new())
-        .unwrap();
-    let response = send.send_request(request).await.unwrap();
-    let status = response.status().as_u16();
+async fn request<C: fictionet::stdlib::Connection>(
+    fcx: &Cx,
+    mut io: C,
+    host: &str,
+    path: &str,
+) -> (u16, String, Bytes) {
+    use fictionet::stdlib::{codec::Wire, http1, sandbox};
+    let request = http1::Request::parse(
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: curl/8.5.0\r\n\r\n").as_bytes(),
+    )
+    .unwrap();
+    let response = sandbox::request(fcx, &mut io, &request).await.unwrap();
     let date = response
-        .headers()
-        .get("date")
-        .map(|d| d.to_str().unwrap().to_owned())
+        .head
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("date"))
+        .map(|h| String::from_utf8_lossy(&h.value).into_owned())
         .unwrap_or_default();
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    (status, date, body)
+    (response.head.status, date, Bytes::from(response.body))
 }
 
 /// Looks `host` up and fetches `path` from it over HTTPS.
@@ -155,20 +83,17 @@ async fn fetch(fcx: &Cx, m: &Machine, host: &str, path: &str) -> (u16, Bytes) {
     let addr = lookup(fcx, m, host)
         .await
         .unwrap_or_else(|| panic!("{host} did not resolve"));
-    let conn = m
-        .tcp
-        .connect(fcx, SocketAddr::new(addr.into(), 443))
-        .await
-        .unwrap();
-    let connector = tokio_rustls::TlsConnector::from(client_config());
-    let stream = connector
-        .connect(
-            ServerName::try_from(host.to_owned()).unwrap(),
-            conn.into_tokio(fcx),
+    let stream = m
+        .tls(
+            fcx,
+            SocketAddr::new(addr.into(), 443),
+            host,
+            None,
+            std::time::SystemTime::now(),
         )
         .await
         .unwrap();
-    get(stream, host, path).await
+    get(fcx, stream, host, path).await
 }
 
 /// The result links and titles of a Google results page.
@@ -221,22 +146,6 @@ fn seeds_dated(base: &std::path::Path, date: &str) -> PathBuf {
     to
 }
 
-/// A CA in a fresh directory, as `ca.py` leaves it: `ca.pem` and `ca.key`.
-fn ca_dir(base: &std::path::Path) -> PathBuf {
-    let dir = base.join("ca");
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "Adaptive Web Test CA");
-    let key = rcgen::KeyPair::generate().unwrap();
-    let cert = params.self_signed(&key).unwrap();
-    std::fs::write(dir.join("ca.pem"), cert.pem()).unwrap();
-    std::fs::write(dir.join("ca.key"), key.serialize_pem()).unwrap();
-    dir
-}
-
 #[test]
 fn the_log_is_the_recorded_one() {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -257,7 +166,7 @@ fn the_log_is_the_recorded_one() {
     }
     let args = Args {
         socket: String::new(),
-        ca_dir: ca_dir(&base),
+        ca_dir: base.join("ca"),
         backend: here.join("backend"),
         backend_port: port,
         state_dir: base.clone(),
@@ -266,14 +175,9 @@ fn the_log_is_the_recorded_one() {
     let (backend, mut child) = start_backend(&args).unwrap();
     let store = PathBuf::from(backend["store"].as_str().unwrap());
     let fixed = fixed_addresses(&backend).unwrap();
-    let pinned: Vec<String> = {
-        let mut p: Vec<String> = fixed.keys().cloned().collect();
-        p.sort();
-        p
-    };
+
     let addresses = Arc::new(Addresses::new(fixed, Some(&store.join("addresses.jsonl"))).unwrap());
     let start = world_start(backend["date"].as_str().unwrap()).unwrap();
-    let ca = Arc::new(Ca::load(&args.ca_dir, start).unwrap());
     let log_path = base.join("log.jsonl");
     let log = Arc::new(Log::create(&log_path).unwrap());
 
@@ -287,6 +191,7 @@ fn the_log_is_the_recorded_one() {
         let result = rt.block_on(fictionet::run(
             fictionet::Seed::random(),
             move |fcx| async move {
+                let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start).unwrap());
                 let (attacher, attachments) = fictionet::attachments();
                 serve(
                     &fcx,
@@ -297,15 +202,9 @@ fn the_log_is_the_recorded_one() {
                     start,
                     attachments,
                 )?;
-                look_up_all(&fcx, &attacher, &pinned).await?;
 
                 let end = attacher.attach("agent").unwrap();
-                let (t, u, i, _other) = ip::split_protocols(&fcx, end);
-                let m = Machine {
-                    tcp: tcp::endpoint(&fcx, t, ME.into()),
-                    udp: udp::endpoint(&fcx, u, ME.into()),
-                    _icmp: i,
-                };
+                let m = machine(&fcx, end, ME);
 
                 // Names the world turns down.
                 assert_eq!(lookup(&fcx, &m, "rw-desktop").await, None);
@@ -333,7 +232,7 @@ fn the_log_is_the_recorded_one() {
                     .connect(&fcx, SocketAddr::new(addr.into(), 80))
                     .await
                     .unwrap();
-                let (_, date, _) = request(conn.into_tokio(&fcx), "www.google.com", "/").await;
+                let (_, date, _) = request(&fcx, conn, "www.google.com", "/").await;
                 assert!(date.contains("30 Sep 2026"), "Date: {date}");
                 for (url, title) in found.iter().take(4) {
                     let (host, path) = split_url(url);
@@ -367,12 +266,7 @@ fn the_log_is_the_recorded_one() {
                     .connect(&fcx, SocketAddr::new(addr.into(), 80))
                     .await
                     .unwrap();
-                assert_eq!(
-                    get(conn.into_tokio(&fcx), "totally-new-site.io", "/")
-                        .await
-                        .0,
-                    301
-                );
+                assert_eq!(get(&fcx, conn, "totally-new-site.io", "/").await.0, 301);
                 let _ = fcx.sleep(Duration::from_millis(500)).await;
                 Err::<(), fictionet::Error>(fictionet::Error::msg("done"))
             },

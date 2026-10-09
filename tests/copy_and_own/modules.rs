@@ -20,6 +20,8 @@ macro_rules! protocols {
         pub mod bgp;
         #[path = "../../src/stdlib/codec/buffer.rs"]
         pub mod buffer;
+        #[path = "../../src/stdlib/ca.rs"]
+        pub mod ca;
         #[path = "../../src/stdlib/cboe_boe.rs"]
         pub mod cboe_boe;
         #[path = "../../src/stdlib/cboe_pitch.rs"]
@@ -245,6 +247,8 @@ macro_rules! protocols {
         pub mod rtp;
         #[path = "../../src/stdlib/rtsp.rs"]
         pub mod rtsp;
+        #[path = "../../src/stdlib/sandbox.rs"]
+        pub mod sandbox;
         #[path = "../../src/stdlib/sbe.rs"]
         pub mod sbe;
         #[path = "../../src/stdlib/sdp.rs"]

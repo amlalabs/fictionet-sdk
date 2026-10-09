@@ -8,9 +8,9 @@
 //! [`TcpConnection`](fictionet::stdlib::tcp::TcpConnection), and gives back a
 //! `Connection` that carries the decrypted bytes.
 //!
-//! Certificates are not Fictionet's concern. The world builds an ordinary
-//! rustls [`ServerConfig`] from whatever it likes, usually files named in its
-//! `args`. This module does not read certificate files or issue certificates.
+//! The world supplies a rustls [`ServerConfig`], using certificate files
+//! or certificates issued by [`ca`](fictionet::stdlib::ca). This module
+//! handles the TLS connection.
 //!
 //! The handshake has two steps, so the world can decide how to answer after
 //! it sees what the client asked for. [`server`] reads the client's hello,

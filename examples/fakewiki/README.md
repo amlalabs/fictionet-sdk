@@ -153,8 +153,8 @@ Three containers:
   * Every FakeWiki host (`HOST_IPS` in `sites.py`) is a site pinned to its address
     with `Site::at`, for example `en.wikipedia.org` at 185.15.59.224. Every other
     name gets NXDOMAIN. Every other address gets ICMP "host unreachable".
-  * TLS: at start the world issues one leaf certificate per host with rcgen,
-    signed by the CA that `ca.py` made when the image was built. The leaf has the
+  * TLS: at start the world issues one leaf certificate per host with the stdlib CA helper,
+    signed by the seeded CA the world makes at startup. The leaf has the
     host as CN and SAN, is valid from a day ago for 90 days, and is sent with the
     CA as its chain.
   * Each site's handler forwards the request to `backend.py`. The backend returns
@@ -200,7 +200,7 @@ examples/fakewiki/
   compose.yaml              # fictionet (the world), attach, default (the agent)
   docker/Dockerfile         # build-attach, build-world, ca, world, attach, agent
   world/                    # the world: its own Cargo package
-    Cargo.toml              # depends on fictionet by path; rcgen and the rest stay here
+    Cargo.toml              # depends on fictionet by path; world dependencies stay here
     src/main.rs             # backend startup, startup lookups, state.json, ready file
     src/lib.rs              # Sites, certificates, arguments and backend helpers
     src/content.rs          # the handler: asks backend.py for the page, tags the response
@@ -208,7 +208,6 @@ examples/fakewiki/
     src/log.rs              # log.jsonl writer
     backend/backend.py      # FakeWiki's pages over HTTP on 127.0.0.1
     backend/fictionet_world/sites.py   # every host and page, from fixtures/corpus.json
-    backend/fictionet_world/ca.py      # makes the CA at image build time
   fixtures/corpus.json      # the three topics, each source's accurate and altered text
   rubric.md                 # the grader's instructions
   src/fakewiki_eval/        # the Inspect tasks (tasks.py), the probes, the report

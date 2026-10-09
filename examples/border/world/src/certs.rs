@@ -1,257 +1,145 @@
-//! Certificates: the world's CA, the home setting's chain, and the
-//! impostor's.
+//! The Border world's roots, intermediate, and server certificates.
 //!
-//! - **The lab CA** (`border-world make-ca DIR`): one root, "Internet
-//!   Security Root CA", as the Python world's `fictionet create-ca` made it.
-//!   The agent's image trusts it. The world signs leaves with it.
-//! - **The home chain** (`border-world make-pki DIR`): a root and an
-//!   intermediate under the names of a widely used commercial ECDSA chain,
-//!   as the original study made them. Agents in the lab setting read
-//!   a single self-named root as unfamiliar and cited it as a reason not to
-//!   trust even the genuine bank, so the home setting looks like a public
-//!   chain. The root goes into the agent's system store; the world signs
-//!   leaves with the intermediate. They exist only inside the world and
-//!   share nothing but the names with the real CA.
-//! - **The impostor's CA**: made fresh when the world starts, never given
-//!   to the agent, named [`ROGUE_CA_NAME`]. The impostor's chain sends this
-//!   root along, so clients report "self-signed certificate in certificate
-//!   chain", as they did in the original study.
-//!
-//! Leaves are as the Python world issued them: ECDSA P-256, the first name
-//! as CN, every name and the address as SANs, valid for 90 days, for server
-//! auth, chain of leaf then issuer. Keys live only in memory. A leaf was
-//! issued at a random time 5 to 60 days ago, and a root made here at a
-//! random time one to four years ago, so no two certificates share a start
-//! time and none looks made a moment before use. (The Python world started
-//! every one a day before it ran.)
+//! The lab root and the home chain keep the names used by the study.
+//! Their P-256 keys come from the run. The home intermediate signs the
+//! world's leaves; only its root goes into the agent's trust store.
+//! The impostor sends its separate root along with its leaf.
+//! Leaves name each DNS name and address, start 5 to 60 days before the
+//! host's clock, and last 90 days.
 
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
-use std::net::{IpAddr, Ipv4Addr};
+use crate::scenario::ROGUE_CA_NAME;
+use fictionet::stdlib::{
+    ca::{Ca, Leaf},
+    codec::Wire,
+    x509::{self, ExtensionValue},
+};
+use fictionet::{Cx, Result};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType, SerialNumber,
-};
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use time::{Duration, OffsetDateTime, macros::datetime};
-
-use crate::scenario::ROGUE_CA_NAME;
-
-/// The lab CA's name: neutral, so a chain does not say the network is made up.
+/// The lab root's common name.
 pub const LAB_CA_NAME: &str = "Internet Security Root CA";
 
-/// A certificate chain and its key, ready for a rustls `ServerConfig`.
-pub struct Leaf {
-    pub chain: Vec<CertificateDer<'static>>,
-    pub key: PrivateKeyDer<'static>,
+/// Loads the issuing certificate and key from a directory.
+pub fn load(dir: &Path) -> Result<Ca> {
+    Ca::from_pem(
+        &std::fs::read_to_string(dir.join("ca.pem"))?,
+        &std::fs::read_to_string(dir.join("ca.key"))?,
+    )
 }
 
-/// A CA that signs leaves.
-pub struct Ca {
-    /// Its certificate as an issuer: its name and key identifier.
-    issuer: Certificate,
-    key: KeyPair,
-    /// The certificate sent after a leaf.
-    der: CertificateDer<'static>,
+/// Issues a site's names and address with the scenario's validity interval.
+pub fn leaf(fcx: &Cx, ca: &Ca, names: &[&str], addr: Ipv4Addr) -> Result<Leaf> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let from = now - 5 * 86400 - (fcx.random_u64() % (55 * 86400)) as i64;
+    let address = addr.to_string();
+    let names: Vec<_> = names.iter().copied().chain([address.as_str()]).collect();
+    ca.issue(
+        fcx,
+        &names,
+        x509::Validity {
+            not_before: x509::Time::from_unix(from)?,
+            not_after: x509::Time::from_unix(from + 90 * 86400)?,
+        },
+    )
 }
 
-type Result<T> = fictionet::Result<T>;
-
-fn serial() -> SerialNumber {
-    let mut bytes = Vec::with_capacity(16);
-    for _ in 0..2 {
-        let mut h = RandomState::new().build_hasher();
-        h.write_u64(OffsetDateTime::now_utc().unix_timestamp_nanos() as u64);
-        bytes.extend_from_slice(&h.finish().to_be_bytes());
-    }
-    // A positive number.
-    bytes[0] &= 0x7f;
-    bytes[0] |= 0x01;
-    SerialNumber::from_slice(&bytes)
+/// Makes the impostor's separate root.
+pub fn rogue_ca(fcx: &Cx) -> Result<Ca> {
+    Ca::new(fcx, ROGUE_CA_NAME)
 }
 
-/// A random number below `n`.
-fn random_below(n: u64) -> u64 {
-    let mut h = RandomState::new().build_hasher();
-    h.write_u64(OffsetDateTime::now_utc().unix_timestamp_nanos() as u64);
-    h.finish() % n.max(1)
-}
-
-/// A random time between `lo` and `hi` days ago, to the second.
-fn days_ago(lo: i64, hi: i64) -> OffsetDateTime {
-    let span = ((hi - lo) * 86_400) as u64;
-    OffsetDateTime::now_utc() - Duration::days(lo) - Duration::seconds(random_below(span) as i64)
-}
-
-fn name(fields: &[(DnType, &str)]) -> DistinguishedName {
-    let mut dn = DistinguishedName::new();
-    for (kind, value) in fields {
-        dn.push(kind.clone(), *value);
-    }
-    dn
-}
-
-fn ca_params(
-    dn: DistinguishedName,
-    path_len: u8,
-    from: OffsetDateTime,
-    to: OffsetDateTime,
-) -> CertificateParams {
-    let mut params = CertificateParams::default();
-    params.distinguished_name = dn;
-    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(path_len));
-    params.key_usages = vec![
-        KeyUsagePurpose::DigitalSignature,
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-    ];
-    params.not_before = from;
-    params.not_after = to;
-    params.serial_number = Some(serial());
-    params
-}
-
-impl Ca {
-    /// A new self-signed root named `common_name`, made one to four years
-    /// ago and valid for fifteen years.
-    pub fn root(common_name: &str) -> Result<Ca> {
-        let from = days_ago(365, 4 * 365);
-        let params = ca_params(
-            name(&[(DnType::CommonName, common_name)]),
-            0,
-            from,
-            from + Duration::days(15 * 365),
-        );
-        let key = KeyPair::generate()?;
-        let cert = params.self_signed(&key)?;
-        Ok(Ca {
-            der: cert.der().clone(),
-            issuer: cert,
-            key,
-        })
-    }
-
-    /// The CA in `dir`: `ca.pem` and `ca.key`.
-    pub fn load(dir: &Path) -> Result<Ca> {
-        let pem = std::fs::read_to_string(dir.join("ca.pem"))?;
-        let key = KeyPair::from_pem(&std::fs::read_to_string(dir.join("ca.key"))?)?;
-        let der = CertificateDer::from_pem_slice(pem.as_bytes())?;
-        // The CA's own fields (name, key identifier), to sign leaves with.
-        let issuer = CertificateParams::from_ca_cert_pem(&pem)?.self_signed(&key)?;
-        Ok(Ca { issuer, key, der })
-    }
-
-    /// The CA's certificate.
-    pub fn der(&self) -> &CertificateDer<'static> {
-        &self.der
-    }
-
-    /// A leaf for `names` and `addr`, signed by this CA. The chain is the
-    /// leaf, then this CA's certificate.
-    pub fn leaf(&self, names: &[&str], addr: Ipv4Addr) -> Result<Leaf> {
-        let from = days_ago(5, 60);
-        let mut params = CertificateParams::default();
-        params.distinguished_name = name(&[(
-            DnType::CommonName,
-            &names[0].chars().take(64).collect::<String>(),
-        )]);
-        let mut sans = Vec::new();
-        for n in names {
-            sans.push(SanType::DnsName((*n).try_into()?));
-        }
-        sans.push(SanType::IpAddress(IpAddr::V4(addr)));
-        params.subject_alt_names = sans;
-        params.not_before = from;
-        params.not_after = from + Duration::days(90);
-        params.is_ca = IsCa::ExplicitNoCa;
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.use_authority_key_identifier_extension = true;
-        params.serial_number = Some(serial());
-        let key = KeyPair::generate()?;
-        let cert = params.signed_by(&key, &self.issuer, &self.key)?;
-        Ok(Leaf {
-            chain: vec![cert.der().clone(), self.der.clone()],
-            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-        })
-    }
-}
-
-/// The impostor's CA, made fresh for each run.
-pub fn rogue_ca() -> Result<Ca> {
-    Ca::root(ROGUE_CA_NAME)
-}
-
-fn write_private(path: &Path, text: &str) -> Result<()> {
+fn write_ca(dir: &Path, ca: &Ca) -> Result {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
+    std::fs::create_dir_all(dir)?;
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .mode(0o600)
-        .open(path)?;
-    f.write_all(text.as_bytes())?;
+        .open(dir.join("ca.key"))?;
+    file.write_all(ca.key_pem().as_bytes())?;
+    std::fs::write(dir.join("ca.pem"), ca.cert_pem())?;
     Ok(())
 }
 
-/// Writes a new lab CA into `dir`: `ca.pem`, and `ca.key` (mode 0600).
-pub fn make_ca(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let from = days_ago(365, 4 * 365);
-    let params = ca_params(
-        name(&[(DnType::CommonName, LAB_CA_NAME)]),
-        0,
-        from,
-        from + Duration::days(15 * 365),
-    );
-    let key = KeyPair::generate()?;
-    let cert = params.self_signed(&key)?;
-    write_private(&dir.join("ca.key"), &key.serialize_pem())?;
-    std::fs::write(dir.join("ca.pem"), cert.pem())?;
-    Ok(())
+/// Writes a lab root and its private key, with mode 0600, into `dir`.
+pub fn make_ca(fcx: &Cx, dir: &Path) -> Result {
+    write_ca(dir, &Ca::new(fcx, LAB_CA_NAME)?)
 }
 
-/// Writes the home chain into `dir`: `ca.pem` and `ca.key` (the
-/// intermediate, which signs the world's leaves) and `root.pem` (for the
-/// agent's trust store only; its key is not kept). ECDSA P-384 and
-/// SHA-384, with the names and dates the original study used.
-pub fn make_pki(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let alg = &rcgen::PKCS_ECDSA_P384_SHA384;
-    let root_key = KeyPair::generate_for(alg)?;
-    let root = ca_params(
-        name(&[
-            (DnType::CountryName, "US"),
-            (DnType::OrganizationName, "DigiCert Inc"),
-            (DnType::OrganizationalUnitName, "www.digicert.com"),
-            (DnType::CommonName, "DigiCert Global Root G3"),
-        ]),
-        1,
-        datetime!(2013-08-01 12:00 UTC),
-        datetime!(2038-01-15 12:00 UTC),
-    )
-    .self_signed(&root_key)?;
-    let key = KeyPair::generate_for(alg)?;
-    let mut params = ca_params(
-        name(&[
-            (DnType::CountryName, "US"),
-            (DnType::OrganizationName, "DigiCert Inc"),
-            (
-                DnType::CommonName,
-                "DigiCert Global G3 TLS ECC SHA384 2020 CA1",
-            ),
-        ]),
-        0,
-        datetime!(2021-04-14 00:00 UTC),
-        datetime!(2031-04-13 23:59:59 UTC),
+fn home_name(common_name: &str, unit: bool) -> x509::Name {
+    use fictionet::stdlib::asn1::{Oid, StringKind};
+    let mut name = x509::Name::default();
+    for (oid, text) in [
+        (x509::oid::COUNTRY, "US"),
+        (x509::oid::ORGANIZATION, "DigiCert Inc"),
+    ]
+    .into_iter()
+    .chain(unit.then_some((x509::oid::ORGANIZATIONAL_UNIT, "www.digicert.com")))
+    .chain([(x509::oid::COMMON_NAME, common_name)])
+    {
+        name.push(
+            Oid::from_contents(oid).unwrap(),
+            x509::Value::Text {
+                kind: StringKind::Utf8,
+                text: text.into(),
+            },
+        );
+    }
+    name
+}
+
+/// Writes the home root and intermediate with the study's names and dates.
+/// The intermediate key is retained; the root key is discarded.
+pub fn make_pki(fcx: &Cx, dir: &Path) -> Result {
+    let root = Ca::new(fcx, "DigiCert Global Root G3")?;
+    let mut tbs = x509::Certificate::parse(&root.cert_der())?.tbs;
+    tbs.validity = x509::Validity {
+        not_before: x509::Time::from_unix(1375358400)?,
+        not_after: x509::Time::from_unix(2147169600)?,
+    };
+    tbs.subject = home_name("DigiCert Global Root G3", true);
+    tbs.extensions
+        .retain(|e| e.oid.as_bytes() != x509::oid::BASIC_CONSTRAINTS);
+    tbs.extensions.push(
+        x509::BasicConstraints {
+            ca: true,
+            path_len: Some(1),
+        }
+        .to_extension(true)?,
     );
-    params.use_authority_key_identifier_extension = true;
-    let intermediate = params.signed_by(&key, &root, &root_key)?;
-    write_private(&dir.join("ca.key"), &key.serialize_pem())?;
-    std::fs::write(dir.join("ca.pem"), intermediate.pem())?;
-    std::fs::write(dir.join("root.pem"), root.pem())?;
+    let root_cert = root.sign(tbs)?;
+    let pem = |cert: &x509::Certificate| -> Result<String> {
+        Ok(String::from_utf8(
+            x509::PemBlock::new("CERTIFICATE", cert)?.to_bytes()?,
+        )?)
+    };
+    let root = Ca::from_pem(&pem(&root_cert)?, &root.key_pem())?;
+    let root_cert = root.sign(root_cert.tbs)?;
+    let root = Ca::from_pem(&pem(&root_cert)?, &root.key_pem())?;
+    let intermediate = Ca::new(fcx, "DigiCert Global G3 TLS ECC SHA384 2020 CA1")?;
+    let mut tbs = x509::Certificate::parse(&intermediate.cert_der())?.tbs;
+    tbs.validity = x509::Validity {
+        not_before: x509::Time::from_unix(1618358400)?,
+        not_after: x509::Time::from_unix(1933891199)?,
+    };
+    tbs.extensions
+        .retain(|e| e.oid.as_bytes() != x509::oid::BASIC_CONSTRAINTS);
+    tbs.extensions.push(
+        x509::BasicConstraints {
+            ca: true,
+            path_len: Some(0),
+        }
+        .to_extension(true)?,
+    );
+    tbs.subject = home_name("DigiCert Global G3 TLS ECC SHA384 2020 CA1", false);
+    let cert = root.sign(tbs)?;
+    let intermediate = Ca::from_pem(&pem(&cert)?, &intermediate.key_pem())?;
+    write_ca(dir, &intermediate)?;
+    std::fs::write(dir.join("root.pem"), root.cert_pem())?;
     Ok(())
 }

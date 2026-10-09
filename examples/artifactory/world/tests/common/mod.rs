@@ -16,16 +16,13 @@ use artifactory_world::repository::{Contents, GITHUB_PREFIX, JSON_V1, PEER_MESSA
 use artifactory_world::{Identity, NAMES, REPOSITORY_NAME};
 use bytes::Bytes;
 use fictionet::prelude::*;
-use fictionet::stdlib::dns::op::{Message, Query, ResponseCode};
-use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
-use fictionet::stdlib::{ip, tcp, udp};
-use fictionet::{Attacher, Cx, End, Interface};
-use http::{HeaderMap, Request, StatusCode};
-use http_body_util::{BodyExt, Full};
-use hyper_util::rt::TokioIo;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+use fictionet::stdlib::dns::op::ResponseCode;
+use fictionet::stdlib::dns::rr::{RData, RecordType};
+use fictionet::stdlib::sandbox::Machine;
+use fictionet::stdlib::{ip, tcp};
+use fictionet::{Attacher, Cx, Interface};
+use http::{HeaderMap, StatusCode};
+use rustls::{ClientConfig, RootCertStore};
 use serde_json::Value;
 
 /// The scripted agent address.
@@ -123,7 +120,7 @@ where
             fictionet::Seed::from_u64(1),
             move |fcx| async move {
                 let contents = Arc::new(Contents::new(variant, "").unwrap());
-                let identity = Identity::new()?;
+                let identity = Identity::new(&fcx)?;
                 let root = identity.ca_der.clone();
                 let mut roots = RootCertStore::empty();
                 roots.add(root)?;
@@ -131,7 +128,6 @@ where
                 let log = Log::start(Box::new(buf.clone()))?;
                 let (attacher, attachments) = fictionet::attachments();
                 artifactory_world::start(&fcx, contents.clone(), identity, log, attachments)?;
-                artifactory_world::look_up_all(&fcx, &attacher).await?;
                 f(
                     fcx,
                     attacher,
@@ -173,43 +169,21 @@ pub async fn timeout<T>(fcx: &Cx, d: Duration, fut: impl Future<Output = T>) -> 
     .await
 }
 
-/// A sandbox's machine: TCP and UDP at its address.
-pub struct Machine {
-    /// The client TCP endpoint.
-    pub tcp: tcp::Endpoint,
-    /// The client UDP endpoint.
-    pub udp: udp::Endpoint,
-    /// The raw ICMP packet interface used by tests.
-    pub icmp: End,
-}
-
-/// Attaches a named client machine and splits its packet protocols.
 pub fn machine(fcx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Machine {
-    let end = attacher.attach(name).unwrap();
-    let (tcp, udp, icmp, _other) = ip::split_protocols(fcx, end);
-    Machine {
-        tcp: tcp::endpoint(fcx, tcp, addr.into()),
-        udp: udp::endpoint(fcx, udp, addr.into()),
-        icmp,
-    }
+    fictionet::stdlib::sandbox::machine(fcx, attacher.attach(name).unwrap(), addr)
 }
 
 /// Looks `name` up at the gateway. Returns the response code and the
 /// addresses.
 pub async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> (ResponseCode, Vec<Ipv4Addr>) {
-    let mut socket = m
-        .udp
-        .bind(40000 + (fcx.random_u64() % 20000) as u16)
-        .unwrap();
-    let mut q = Message::query();
-    q.metadata.id = fcx.random_u64() as u16;
-    q.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
-    socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(GATEWAY.into(), 53));
-    let (bytes, _) = timeout(fcx, Duration::from_secs(5), socket.recv(fcx))
-        .await
-        .expect("a DNS answer")
-        .unwrap();
-    let r = Message::from_vec(&bytes).unwrap();
+    let r = timeout(
+        fcx,
+        Duration::from_secs(5),
+        m.lookup(fcx, GATEWAY.into(), name, RecordType::A),
+    )
+    .await
+    .expect("a DNS answer")
+    .unwrap();
     let addrs = r
         .answers
         .iter()
@@ -221,89 +195,21 @@ pub async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> (ResponseCode, Vec<Ipv
     (r.metadata.response_code, addrs)
 }
 
-/// Accepts any certificate: an agent that runs `curl -k`.
-#[derive(Debug)]
-struct AcceptAll;
-
-impl ServerCertVerifier for AcceptAll {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &ServerName<'_>,
-        _: &[u8],
-        _: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-/// The client's TLS: verify against `roots`, or not at all.
-pub fn client_config(roots: Option<&Arc<RootCertStore>>) -> Arc<ClientConfig> {
-    let builder =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap();
-    let mut config = match roots {
-        Some(roots) => builder
-            .with_root_certificates(roots.clone())
-            .with_no_client_auth(),
-        None => builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAll))
-            .with_no_client_auth(),
-    };
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Arc::new(config)
-}
-
-/// A client TLS connection over the simulated TCP stack.
-pub type TlsStream = tokio_rustls::client::TlsStream<fictionet::tokio::Compat<tcp::TcpConnection>>;
-
-/// Connects to `addr:443` and shakes hands for `sni`.
+/// Connects to the site's TLS port.
 pub async fn tls(
     fcx: &Cx,
     m: &Machine,
     addr: Ipv4Addr,
     sni: &str,
     config: Arc<ClientConfig>,
-) -> std::io::Result<TlsStream> {
-    let conn = m
-        .tcp
-        .connect(fcx, SocketAddr::new(addr.into(), 443))
-        .await
-        .map_err(std::io::Error::other)?;
-    let connector = tokio_rustls::TlsConnector::from(config);
-    connector
-        .connect(
-            ServerName::try_from(sni.to_owned()).unwrap(),
-            conn.into_tokio(fcx),
-        )
-        .await
+) -> fictionet::Result<
+    fictionet::tokio::Compat<fictionet::stdlib::sandbox::TlsClient<tcp::TcpConnection>>,
+> {
+    Ok(
+        m.tls_with_config(fcx, SocketAddr::new(addr.into(), 443), sni, config)
+            .await?
+            .into_tokio(fcx),
+    )
 }
 
 /// The answer to one HTTP/1.1 request.
@@ -317,41 +223,45 @@ pub struct Got {
 }
 
 /// Sends one HTTP/1.1 request over `io`.
-pub async fn request<IO>(
-    io: IO,
+#[allow(clippy::too_many_arguments)]
+pub async fn request<C: fictionet::stdlib::Connection>(
+    fcx: &Cx,
+    io: fictionet::tokio::Compat<C>,
     method: &str,
     host: &str,
     path: &str,
     headers: &[(&str, &str)],
     body: &str,
-) -> Got
-where
-    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
-        .await
-        .unwrap();
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    let mut r = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", host);
-    for (k, v) in headers {
-        r = r.header(*k, *v);
+) -> Got {
+    use fictionet::stdlib::{codec::Wire, http1, sandbox};
+    let mut bytes = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");
+    for (name, value) in headers {
+        bytes.push_str(&format!("{name}: {value}\r\n"));
     }
-    let response = send
-        .send_request(r.body(Full::new(Bytes::from(body.to_owned()))).unwrap())
+    if !body.is_empty()
+        && !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    {
+        bytes.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    bytes.push_str("\r\n");
+    bytes.push_str(body);
+    let request = http1::Request::parse(bytes.as_bytes()).unwrap();
+    let response = sandbox::request(fcx, &mut io.into_inner(), &request)
         .await
         .unwrap();
-    let status = response.status();
-    let headers = response.headers().clone();
-    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let mut headers = HeaderMap::new();
+    for header in response.head.headers {
+        headers.append(
+            http::HeaderName::from_bytes(header.name.as_bytes()).unwrap(),
+            http::HeaderValue::from_bytes(&header.value).unwrap(),
+        );
+    }
     Got {
-        status,
+        status: StatusCode::from_u16(response.head.status).unwrap(),
         headers,
-        body,
+        body: Bytes::from(response.body),
     }
 }
 
@@ -385,11 +295,16 @@ pub async fn https(
         m,
         NAMES[site].1,
         NAMES[site].0,
-        client_config(Some(&env.roots)),
+        fictionet::stdlib::sandbox::client_config(
+            &fcx,
+            std::time::SystemTime::now(),
+            Some(&env.roots),
+            &[b"http/1.1"],
+        ),
     )
     .await
     .unwrap();
-    request(io, method, NAMES[site].0, path, headers, body).await
+    request(&fcx, io, method, NAMES[site].0, path, headers, body).await
 }
 
 /// Fixed agent actions shared by the integration and golden tests.
@@ -710,6 +625,7 @@ pub async fn script(fcx: Cx, attacher: Attacher, env: Env) -> fictionet::Result 
         403
     );
     let got = request(
+        &fcx,
         plain(&fcx, &m, NAMES[0].1).await,
         "GET",
         REPOSITORY_NAME,
@@ -725,7 +641,12 @@ pub async fn script(fcx: Cx, attacher: Attacher, env: Env) -> fictionet::Result 
             &m,
             NAMES[0].1,
             "unserved.test",
-            client_config(Some(&env.roots))
+            fictionet::stdlib::sandbox::client_config(
+                &fcx,
+                std::time::SystemTime::now(),
+                Some(&env.roots),
+                &[b"http/1.1"]
+            )
         )
         .await
         .is_err()
@@ -805,11 +726,9 @@ pub async fn script(fcx: Cx, attacher: Attacher, env: Env) -> fictionet::Result 
         && l["project"] == project
         && l["complete"] == true
         && l["sent"].as_u64().unwrap() > 0));
-    assert!(
-        env.log
-            .lines()
-            .iter()
-            .all(|l| l["sandbox"]["name"] != artifactory_world::events::LOOKUPS)
-    );
+    assert!(env.log.lines().iter().all(|l| matches!(
+        l["sandbox"]["name"].as_str(),
+        None | Some("agent" | "probe")
+    )));
     Ok(())
 }

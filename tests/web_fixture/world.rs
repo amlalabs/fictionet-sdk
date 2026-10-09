@@ -117,8 +117,7 @@ mod tests {
     use fictionet::stdlib::{ip, tcp, udp};
     use fictionet::{Cx, End};
     use http_body_util::{BodyExt, Full};
-    use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
-    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use rustls::pki_types::ServerName;
 
     const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 
@@ -129,10 +128,7 @@ mod tests {
     }
 
     async fn dns(fcx: &Cx, m: &Machine, name: &str, kind: RecordType) -> String {
-        let mut socket = m
-            .udp
-            .bind(40000 + (fcx.random_u64() % 20000) as u16)
-            .unwrap();
+        let mut socket = m.udp.bind(0).unwrap();
         let mut q = Message::query();
         q.metadata.id = 7;
         q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
@@ -420,26 +416,6 @@ mod tests {
 
     #[test]
     fn the_client_report_is_the_recorded_one() {
-        let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
-        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = ca.self_signed(&ca_key).unwrap();
-        let names = [
-            "example.test",
-            "www.example.test",
-            "v4only.test",
-            "v6only.test",
-        ];
-        let mut leaf = CertificateParams::new(names.map(str::to_owned).to_vec()).unwrap();
-        leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        let leaf_key = KeyPair::generate().unwrap();
-        let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(ca.der().clone()).unwrap();
-        let roots = Arc::new(roots);
-        let chain = vec![leaf.der().clone()];
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
-
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -450,6 +426,24 @@ mod tests {
             let _ = rt.block_on(fictionet::run(
                 fictionet::Seed::random(),
                 move |fcx| async move {
+                    let ca = fictionet::stdlib::ca::Ca::new(&fcx, "Fixture CA")?;
+                    let leaf = ca.issue(
+                        &fcx,
+                        &[
+                            "example.test",
+                            "www.example.test",
+                            "v4only.test",
+                            "v6only.test",
+                        ],
+                        fictionet::stdlib::x509::Validity {
+                            not_before: fictionet::stdlib::x509::Time::from_unix(946684800)?,
+                            not_after: fictionet::stdlib::x509::Time::from_unix(4102444800)?,
+                        },
+                    )?;
+                    let mut roots = rustls::RootCertStore::empty();
+                    roots.add(ca.cert_der())?;
+                    let roots = Arc::new(roots);
+                    let (chain, key) = (leaf.chain, leaf.key);
                     let (attacher, attachments) = fictionet::attachments();
                     super::world(&fcx, chain, key, attachments)?;
                     let lines = report(&fcx, &attacher, roots).await;

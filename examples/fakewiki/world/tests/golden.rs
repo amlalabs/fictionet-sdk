@@ -14,113 +14,42 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use bytes::Bytes;
 use fakewiki_world::content::Content;
 use fakewiki_world::log::Log;
-use fakewiki_world::{Args, issue_leaves, look_up_all, serve, start_backend};
+use fakewiki_world::{Args, issue_leaves, serve, start_backend};
+use fictionet::Cx;
 use fictionet::prelude::*;
-use fictionet::stdlib::dns::op::{Message, Query};
-use fictionet::stdlib::dns::rr::{Name, RecordType};
-use fictionet::stdlib::{ip, tcp, udp};
-use fictionet::{Cx, End};
-use http_body_util::{BodyExt, Empty};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use fictionet::stdlib::dns::rr::RecordType;
 use serde_json::Value;
 
 const ME: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
-struct Machine {
-    tcp: tcp::Endpoint,
-    udp: udp::Endpoint,
-    _icmp: End,
-}
-
-/// Accepts any certificate; the CA is checked by the Docker probes.
-#[derive(Debug)]
-struct AcceptAll;
-
-impl rustls::client::danger::ServerCertVerifier for AcceptAll {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &ServerName<'_>,
-        _: &[u8],
-        _: UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-fn client_config(alpn: &[u8]) -> Arc<ClientConfig> {
-    let mut config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAll))
-            .with_no_client_auth();
-    config.alpn_protocols = vec![alpn.to_vec()];
-    Arc::new(config)
-}
+use fictionet::stdlib::sandbox::{Machine, machine};
 
 async fn lookup(fcx: &Cx, m: &Machine, name: &str, kind: RecordType) {
-    let mut socket = m
-        .udp
-        .bind(40000 + (fcx.random_u64() % 20000) as u16)
-        .unwrap();
-    let mut q = Message::query();
-    q.metadata.id = fcx.random_u64() as u16;
-    q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
-    socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(GATEWAY.into(), 53));
-    socket.recv(fcx).await.unwrap();
+    m.lookup(fcx, GATEWAY.into(), name, kind).await.unwrap();
 }
 
 /// One HTTP/1.1 request; returns the status.
-async fn get<IO>(io: IO, method: &str, host: &str, path: &str) -> u16
-where
-    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
+async fn get<C: fictionet::stdlib::Connection>(
+    fcx: &Cx,
+    io: fictionet::tokio::Compat<C>,
+    method: &str,
+    host: &str,
+    path: &str,
+) -> u16 {
+    use fictionet::stdlib::{codec::Wire, http1, sandbox};
+    let request = http1::Request::parse(
+        format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: curl/8.5.0\r\n\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    sandbox::request(fcx, &mut io.into_inner(), &request)
         .await
-        .unwrap();
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    let request = http::Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", host)
-        .header("user-agent", "curl/8.5.0")
-        .body(Empty::<Bytes>::new())
-        .unwrap();
-    let response = send.send_request(request).await.unwrap();
-    let status = response.status().as_u16();
-    let _ = response.into_body().collect().await;
-    status
+        .unwrap()
+        .head
+        .status
 }
 
 async fn tls(
@@ -128,35 +57,21 @@ async fn tls(
     m: &Machine,
     addr: Ipv4Addr,
     sni: &str,
-) -> std::io::Result<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> {
-    let conn = m
-        .tcp
-        .connect(fcx, SocketAddr::new(addr.into(), 443))
-        .await
-        .map_err(std::io::Error::other)?;
-    let connector = tokio_rustls::TlsConnector::from(client_config(b"http/1.1"));
-    connector
-        .connect(
-            ServerName::try_from(sni.to_owned()).unwrap(),
-            conn.into_tokio(fcx),
-        )
-        .await
-}
-
-/// A CA in a fresh directory, as `ca.py` leaves it: `ca.pem` and `ca.key`.
-fn ca_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("fakewiki-golden-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "FakeWiki Test CA");
-    let key = rcgen::KeyPair::generate().unwrap();
-    let cert = params.self_signed(&key).unwrap();
-    std::fs::write(dir.join("ca.pem"), cert.pem()).unwrap();
-    std::fs::write(dir.join("ca.key"), key.serialize_pem()).unwrap();
-    dir
+) -> std::io::Result<
+    fictionet::tokio::Compat<
+        fictionet::stdlib::sandbox::TlsClient<fictionet::stdlib::tcp::TcpConnection>,
+    >,
+> {
+    m.tls(
+        fcx,
+        SocketAddr::new(addr.into(), 443),
+        sni,
+        None,
+        std::time::SystemTime::now(),
+    )
+    .await
+    .map(|conn| conn.into_tokio(fcx))
+    .map_err(std::io::Error::other)
 }
 
 #[test]
@@ -177,7 +92,7 @@ fn the_log_is_the_recorded_one() {
     }
     let args = Args {
         socket: String::new(),
-        ca_dir: ca_dir(),
+        ca_dir: state_dir.join("ca"),
         backend: here.join("backend"),
         backend_port: port,
         state_dir: state_dir.clone(),
@@ -199,7 +114,6 @@ fn the_log_is_the_recorded_one() {
         .collect();
     let log_path = state_dir.join("log.jsonl");
     let log = Arc::new(Log::create(&log_path).unwrap());
-    let leaves = issue_leaves(&args.ca_dir, hosts.keys()).unwrap();
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -211,18 +125,12 @@ fn the_log_is_the_recorded_one() {
         let result = rt.block_on(fictionet::run(
             fictionet::Seed::random(),
             move |fcx| async move {
+                let leaves = issue_leaves(&fcx, &args.ca_dir, hosts.keys()).unwrap();
                 let (attacher, attachments) = fictionet::attachments();
-                let host_list: Vec<String> = hosts.keys().cloned().collect();
                 serve(&fcx, &hosts, leaves, Content::new(port), log, attachments)?;
-                look_up_all(&fcx, &attacher, &host_list).await?;
 
                 let end = attacher.attach("agent").unwrap();
-                let (t, u, i, _other) = ip::split_protocols(&fcx, end);
-                let m = Machine {
-                    tcp: tcp::endpoint(&fcx, t, ME.into()),
-                    udp: udp::endpoint(&fcx, u, ME.into()),
-                    _icmp: i,
-                };
+                let m = machine(&fcx, end, ME);
                 let wiki = hosts["en.wikipedia.org"];
                 lookup(&fcx, &m, "en.wikipedia.org", RecordType::A).await;
                 lookup(&fcx, &m, "en.wikipedia.org", RecordType::AAAA).await;
@@ -233,15 +141,19 @@ fn the_log_is_the_recorded_one() {
                     let uri: http::Uri = url.parse().unwrap();
                     let host = uri.host().unwrap().to_owned();
                     let stream = tls(&fcx, &m, hosts[&host], &host).await.unwrap();
-                    assert_eq!(get(stream, "GET", &host, uri.path()).await, 200, "{url}");
+                    assert_eq!(
+                        get(&fcx, stream, "GET", &host, uri.path()).await,
+                        200,
+                        "{url}"
+                    );
                 }
                 let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
-                get(stream, "HEAD", "en.wikipedia.org", "/wiki/Main_Page").await;
+                get(&fcx, stream, "HEAD", "en.wikipedia.org", "/wiki/Main_Page").await;
                 let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
-                get(stream, "GET", "en.wikipedia.org", "/no/such/page?q=1").await;
+                get(&fcx, stream, "GET", "en.wikipedia.org", "/no/such/page?q=1").await;
                 // A host at another address, over this connection.
                 let stream = tls(&fcx, &m, wiki, "en.wikipedia.org").await.unwrap();
-                assert_eq!(get(stream, "GET", "www.gov.uk", "/").await, 421);
+                assert_eq!(get(&fcx, stream, "GET", "www.gov.uk", "/").await, 421);
                 // Plain HTTP: a redirect.
                 let conn = m
                     .tcp
@@ -249,7 +161,14 @@ fn the_log_is_the_recorded_one() {
                     .await
                     .unwrap();
                 assert_eq!(
-                    get(conn.into_tokio(&fcx), "GET", "en.wikipedia.org", "/wiki/X").await,
+                    get(
+                        &fcx,
+                        conn.into_tokio(&fcx),
+                        "GET",
+                        "en.wikipedia.org",
+                        "/wiki/X"
+                    )
+                    .await,
                     301
                 );
                 // A name the world does not serve.

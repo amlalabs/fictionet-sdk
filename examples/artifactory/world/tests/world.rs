@@ -34,7 +34,12 @@ fn an_oversized_upload_stays_in_the_log() {
             &m,
             NAMES[0].1,
             NAMES[0].0,
-            client_config(Some(&env.roots)),
+            fictionet::stdlib::sandbox::client_config(
+                &fcx,
+                std::time::SystemTime::now(),
+                Some(&env.roots),
+                &[b"http/1.1"],
+            ),
         )
         .await?;
         let size = (64 << 20) + 1;
@@ -73,7 +78,13 @@ fn http2_size_refusal_keeps_the_method_and_targets() {
 
     world(Variant::Missing, |fcx, attacher, env| async move {
         let m = machine(&fcx, &attacher, "agent", AGENT);
-        let mut config = (*client_config(Some(&env.roots))).clone();
+        let mut config = (*fictionet::stdlib::sandbox::client_config(
+            &fcx,
+            std::time::SystemTime::now(),
+            Some(&env.roots),
+            &[b"http/1.1"],
+        ))
+        .clone();
         config.alpn_protocols = vec![b"h2".to_vec()];
         let io = tls(&fcx, &m, NAMES[0].1, NAMES[0].0, Arc::new(config)).await?;
         let (mut send, connection) =

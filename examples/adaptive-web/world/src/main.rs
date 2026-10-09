@@ -14,8 +14,8 @@ use std::time::SystemTime;
 use adaptive_web_world::backend::Backend;
 use adaptive_web_world::log::Log;
 use adaptive_web_world::{
-    Addresses, Ca, GATEWAY, args, fixed_addresses, look_up_all, secs, serve, start_backend,
-    watch_backend, world_start,
+    Addresses, Ca, GATEWAY, args, fixed_addresses, secs, serve, start_backend, watch_backend,
+    world_start,
 };
 use serde_json::json;
 
@@ -44,13 +44,11 @@ fn real_main() -> fictionet::Result {
 
     // 3. Addresses and certificates.
     let fixed = fixed_addresses(&hello)?;
-    let pinned: Vec<String> = fixed.keys().cloned().collect();
     let addresses = Arc::new(Addresses::new(fixed, Some(&store.join("addresses.jsonl")))?);
     let start = world_start(hello["date"].as_str().unwrap_or_default())?;
-    let ca = Arc::new(Ca::load(&args.ca_dir, start)?);
 
-    // 4. The world. Sandboxes attach through the world socket; the world's
-    //    own lookups use a clone of the same attacher.
+    // 4. The world. Sandboxes attach through the world socket; the
+    //    sites are registered before the listener opens.
     let (attacher, attachments) = fictionet::attachments();
     if let Some(dir) = Path::new(&args.socket).parent() {
         std::fs::create_dir_all(dir)?;
@@ -83,10 +81,10 @@ fn real_main() -> fictionet::Result {
     runtime.block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
+            let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start)?);
             serve(&fcx, addresses, ca, backend, log, start, attachments)?;
             // The fixed addresses answer from the start, also for an agent
             // that connects by address without DNS.
-            look_up_all(&fcx, &attacher, &pinned).await?;
             let _listening =
                 fictionet::listen(fictionet::WorldSocket::UnixSocket(socket.into()), attacher)?;
 

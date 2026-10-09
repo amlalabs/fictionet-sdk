@@ -17,7 +17,7 @@
 //!   the store's `addresses.jsonl`, so a later run on the same store gives
 //!   every host the same address again.
 //! - **TLS** ([`Ca`]): a host's certificate is made at its first handshake
-//!   and signed by the CA that `ca.py` made when the image was built.
+//!   and signed by a seeded CA whose public root is written at startup.
 //! - **Dates** ([`world_start`]): the world's clock starts on the seed's
 //!   date, so every response's `Date` header is in the scenario, and each
 //!   certificate was issued shortly before it.
@@ -33,23 +33,17 @@ pub mod log;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::future::{Future, poll_fn};
 use std::io::{BufRead, BufReader, Write};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::task::Poll;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use fictionet::Cx;
 use fictionet::events::Event;
 use fictionet::stdlib::tls::ServerConfig;
-use fictionet::stdlib::{ip, tls, web};
-use fictionet::{Attacher, Cx, End, Interface, Packet};
-use rcgen::{CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair};
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use fictionet::stdlib::web;
 use serde_json::{Value, json};
 
 use crate::backend::Backend;
@@ -155,6 +149,7 @@ pub fn admit(name: &str) -> Result<(), &'static str> {
 /// seed), ones recorded by an earlier run on the same store, then the next
 /// free one from the pools.
 pub struct Addresses {
+    fixed: Vec<String>,
     inner: Mutex<Inner>,
     record: Option<Mutex<File>>,
 }
@@ -180,6 +175,8 @@ impl Addresses {
         fixed: HashMap<String, (Ipv4Addr, &'static str)>,
         record: Option<&Path>,
     ) -> std::io::Result<Addresses> {
+        let mut names: Vec<_> = fixed.keys().cloned().collect();
+        names.sort();
         let mut by_host = fixed;
         if let Some(Ok(text)) = record.map(std::fs::read_to_string) {
             for line in text.lines() {
@@ -203,6 +200,7 @@ impl Addresses {
             None => None,
         };
         Ok(Addresses {
+            fixed: names,
             inner: Mutex::new(Inner {
                 by_host,
                 used,
@@ -267,27 +265,17 @@ pub fn world_start(date: &str) -> fictionet::Result<SystemTime> {
 /// The world's certificate authority, which signs a certificate for each
 /// host at its first handshake.
 pub struct Ca {
-    issuer: rcgen::Certificate,
-    key: KeyPair,
-    der: CertificateDer<'static>,
+    issuer: fictionet::stdlib::ca::Ca,
     start: SystemTime,
 }
 
 impl Ca {
-    /// Loads `ca.pem` and `ca.key` from `dir`, as `ca.py` leaves them.
-    /// `start` is the world's date at the start of the run.
-    pub fn load(dir: &Path, start: SystemTime) -> fictionet::Result<Ca> {
-        let pem = std::fs::read_to_string(dir.join("ca.pem"))?;
-        let key = KeyPair::from_pem(&std::fs::read_to_string(dir.join("ca.key"))?)?;
-        let der = CertificateDer::from_pem_slice(pem.as_bytes())?.into_owned();
-        // The CA's own fields (name, key identifier), to sign leaves with.
-        let issuer = CertificateParams::from_ca_cert_pem(&pem)?.self_signed(&key)?;
-        Ok(Ca {
-            issuer,
-            key,
-            der,
-            start,
-        })
+    /// Makes a seeded CA and writes its public certificate for the agent.
+    pub fn new(fcx: &Cx, dir: &Path, start: SystemTime) -> fictionet::Result<Ca> {
+        let issuer = fictionet::stdlib::ca::Ca::new(fcx, "Internet Security Root CA")?;
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("ca.pem"), issuer.cert_pem())?;
+        Ok(Ca { issuer, start })
     }
 
     /// A certificate for `host`: the host as CN and SAN, for server auth,
@@ -308,28 +296,19 @@ impl Ca {
         let not_before = world_now.min(host_now) - time::Duration::days(30);
         let not_after = (not_before + time::Duration::days(90))
             .max(world_now.max(host_now) + time::Duration::days(30));
-        let mut params = CertificateParams::new(vec![host.to_owned()])?;
-        params.distinguished_name = DistinguishedName::new();
-        params.distinguished_name.push(
-            DnType::CommonName,
-            host.chars().take(64).collect::<String>(),
-        );
-        params.not_before = not_before;
-        params.not_after = not_after;
-        params.is_ca = IsCa::ExplicitNoCa;
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.use_authority_key_identifier_extension = true;
-        let key = KeyPair::generate()?;
-        let cert = params.signed_by(&key, &self.issuer, &self.key)?;
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
-        let config = tls::config_builder(fcx, self.start)
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_single_cert(vec![cert.der().clone(), self.der.clone()], key)?;
+        let leaf = self.issuer.issue(
+            fcx,
+            &[host],
+            fictionet::stdlib::x509::Validity {
+                not_before: fictionet::stdlib::x509::Time::from_unix(not_before.unix_timestamp())?,
+                not_after: fictionet::stdlib::x509::Time::from_unix(not_after.unix_timestamp())?,
+            },
+        )?;
+        let config = leaf.server_config(fcx, self.start)?;
         let day = |t: time::OffsetDateTime| {
             format!("{:04}-{:02}-{:02}", t.year(), t.month() as u8, t.day())
         };
-        Ok((Arc::new(config), day(not_before), day(not_after)))
+        Ok((config, day(not_before), day(not_after)))
     }
 }
 
@@ -348,8 +327,9 @@ pub fn serve(
     attachments: fictionet::Attachments,
 ) -> fictionet::Result {
     events::log_to(fcx, log);
+    let names = addresses.fixed.clone();
     let world = fcx.clone();
-    web::Sites::new(move |host: &str| {
+    let site_for = move |host: &str| {
         if let Err(why) = admit(host) {
             world.record(
                 Event::new("adaptive", "refused")
@@ -369,28 +349,38 @@ pub fn serve(
         );
         let (ca, name) = (ca.clone(), host.to_owned());
         let config: Arc<OnceLock<Arc<ServerConfig>>> = Arc::new(OnceLock::new());
-        Some(web::Site::new(backend.clone()).at(addr).tls(move |fcx| {
-            config
-                .get_or_init(|| {
-                    let (config, not_before, not_after) = ca
-                        .config(fcx, &name)
-                        .expect("a certificate for an admitted name");
-                    fcx.record(
-                        Event::new("adaptive", "cert")
-                            .summary(format!("a certificate for {name}"))
-                            .field("host", name.as_str())
-                            .field("not_before", not_before)
-                            .field("not_after", not_after),
-                    );
+        Some(
+            web::Site::new(backend.clone())
+                .date(start)
+                .at(addr)
+                .tls(move |fcx| {
                     config
-                })
-                .clone()
-        }))
-    })
-    .date(start)
-    // The agent's sandbox has IPv6 off.
-    .ipv4_only()
-    .start(fcx, attachments)?;
+                        .get_or_init(|| {
+                            let (config, not_before, not_after) = ca
+                                .config(fcx, &name)
+                                .expect("a certificate for an admitted name");
+                            fcx.record(
+                                Event::new("adaptive", "cert")
+                                    .summary(format!("a certificate for {name}"))
+                                    .field("host", name.as_str())
+                                    .field("not_before", not_before)
+                                    .field("not_after", not_after),
+                            );
+                            config
+                        })
+                        .clone()
+                }),
+        )
+    };
+    let hosts: Vec<_> = names
+        .iter()
+        .filter_map(|name| site_for(name).map(|site| site.into_host(name)))
+        .collect();
+    let mut net = web::Sites::new(site_for).ipv4_only().into_net();
+    for host in hosts {
+        net = net.add_host(host);
+    }
+    net.start(fcx, attachments)?;
     Ok(())
 }
 
@@ -458,103 +448,6 @@ pub fn fixed_addresses(
         out.insert(host.clone(), (addr, why));
     }
     Ok(out)
-}
-
-/// The address the world's own lookups come from. It is free again once
-/// they are done.
-const LOOKUP_FROM: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 254), 40000);
-
-/// Asks the gateway's DNS for every host, as a sandbox would, and waits
-/// for every answer. This makes `Sites` run its callback for each host, so
-/// the fixed addresses answer before the first sandbox attaches, also for
-/// an agent that connects by address without DNS.
-pub async fn look_up_all(fcx: &Cx, attacher: &Attacher, hosts: &[String]) -> fictionet::Result {
-    let mut end: End = attacher
-        .attach(events::LOOKUPS)
-        .map_err(|e| fictionet::Error::msg(format!("lookups: {e}")))?;
-    let mut waiting: HashMap<u16, &str> = HashMap::new();
-    for (i, host) in hosts.iter().enumerate() {
-        let id = i as u16 + 1;
-        end.send(Packet(dns_query_packet(id, host)));
-        waiting.insert(id, host);
-    }
-    let deadline = fcx.now() + Duration::from_secs(10);
-    let mut sleep = pin!(fcx.sleep_until(deadline));
-    while !waiting.is_empty() {
-        let packet = poll_fn(|cx| {
-            if let Poll::Ready(r) = end.poll_recv(fcx, cx) {
-                return Poll::Ready(r.ok());
-            }
-            match sleep.as_mut().poll(cx) {
-                Poll::Ready(_) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            }
-        })
-        .await;
-        let Some(packet) = packet else {
-            let left: Vec<_> = waiting.values().collect();
-            return Err(fictionet::Error::msg(format!("no DNS answer for {left:?}")));
-        };
-        let p = &packet.0;
-        // IPv4 + UDP from the gateway's port 53: id, flags, then counts.
-        if p.len() < 28 + 12 || p[9] != 17 {
-            continue;
-        }
-        let ihl = (p[0] & 0x0f) as usize * 4;
-        let dns = &p[ihl + 8..];
-        let id = u16::from_be_bytes([dns[0], dns[1]]);
-        let rcode = dns[3] & 0x0f;
-        let answers = u16::from_be_bytes([dns[6], dns[7]]);
-        if let Some(host) = waiting.remove(&id)
-            && (rcode != 0 || answers != 1)
-        {
-            return Err(fictionet::Error::msg(format!(
-                "DNS for {host}: rcode {rcode}, {answers} answers"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// An IPv4/UDP packet with an A query for `name`, from [`LOOKUP_FROM`] to
-/// the gateway's port 53. The UDP checksum is left at zero, which IPv4
-/// allows.
-fn dns_query_packet(id: u16, name: &str) -> Vec<u8> {
-    let mut dns = Vec::new();
-    dns.extend_from_slice(&id.to_be_bytes());
-    dns.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
-    for label in name.split('.') {
-        dns.push(label.len() as u8);
-        dns.extend_from_slice(label.as_bytes());
-    }
-    dns.extend_from_slice(&[0, 0, 1, 0, 1]);
-
-    let udp_len = 8 + dns.len();
-    let total = 20 + udp_len;
-    let mut p = Vec::with_capacity(total);
-    p.extend_from_slice(&[
-        0x45,
-        0,
-        (total >> 8) as u8,
-        total as u8,
-        0,
-        0,
-        0x40,
-        0,
-        64,
-        17,
-        0,
-        0,
-    ]);
-    p.extend_from_slice(&LOOKUP_FROM.ip().octets());
-    p.extend_from_slice(&GATEWAY.octets());
-    ip::set_header_checksum(&mut p[..20]);
-    p.extend_from_slice(&LOOKUP_FROM.port().wrapping_add(id).to_be_bytes());
-    p.extend_from_slice(&53u16.to_be_bytes());
-    p.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    p.extend_from_slice(&[0, 0]);
-    p.extend_from_slice(&dns);
-    p
 }
 
 #[cfg(test)]

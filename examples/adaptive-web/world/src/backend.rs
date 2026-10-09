@@ -13,11 +13,8 @@ use fictionet::events::{Fields, float};
 use fictionet::stdlib::json::Value as J;
 use fictionet::stdlib::web::{self, Body};
 use http::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HOST, REFERER, USER_AGENT};
-use http::{HeaderName, Request, Response, StatusCode};
+use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
 use serde_json::Value;
 
 /// The header backend.py adds for the log.
@@ -47,20 +44,9 @@ pub const PAGE_FIELDS: [&str; 18] = [
     "bytes",
 ];
 
-/// Headers that belong to one connection, which hyper must not see in an
-/// HTTP/2 response.
-const HOP_BY_HOP: [&str; 5] = [
-    "connection",
-    "keep-alive",
-    "transfer-encoding",
-    "proxy-connection",
-    "upgrade",
-];
-
 #[derive(Clone)]
 pub struct Backend {
-    client: Client<HttpConnector, Full<Bytes>>,
-    port: u16,
+    forward: web::Forward,
 }
 
 /// A JSON value from the backend as an event field's value.
@@ -86,8 +72,9 @@ pub fn to_field(v: &Value) -> J {
 
 impl Backend {
     pub fn new(port: u16) -> Backend {
-        let client = Client::builder(TokioExecutor::new()).build_http();
-        Backend { client, port }
+        Backend {
+            forward: web::forward(format!("http://127.0.0.1:{port}").parse().unwrap()),
+        }
     }
 
     async fn serve(
@@ -100,24 +87,22 @@ impl Backend {
             .cloned()
             .ok_or_else(|| fictionet::Error::msg("request without a web::Target"))?;
         let (parts, body) = request.into_parts();
-        let path = parts
-            .uri
-            .path_and_query()
-            .map(|p| p.as_str().to_owned())
-            .unwrap_or_else(|| "/".into());
-
         let reply = async {
             let body = body.collect().await?.to_bytes();
             let mut ask = Request::builder()
                 .method(parts.method.clone())
-                .uri(format!("http://127.0.0.1:{}{}", self.port, path))
+                .uri(parts.uri)
                 .header(HOST, target.host.as_str());
             for name in [USER_AGENT, REFERER, ACCEPT, CONTENT_TYPE] {
                 if let Some(v) = parts.headers.get(&name) {
                     ask = ask.header(name, v);
                 }
             }
-            let answer = self.client.request(ask.body(Full::new(body))?).await?;
+            let answer = tower_service::Service::call(
+                &mut self.forward.clone(),
+                ask.body(Body::from(body))?,
+            )
+            .await?;
             let (parts, body) = answer.into_parts();
             let body = body.collect().await?.to_bytes();
             Ok::<_, fictionet::Error>((parts, body))
@@ -143,9 +128,7 @@ impl Backend {
             .and_then(|v| v.to_str().ok().map(percent_decode))
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or(Value::Null);
-        for name in HOP_BY_HOP {
-            parts.headers.remove(HeaderName::from_static(name));
-        }
+
         let mut fields = Fields::new();
         for name in PAGE_FIELDS {
             if let Some(v) = meta.get(name) {

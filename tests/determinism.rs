@@ -1,10 +1,5 @@
 //! The same closed world repeats its event bytes and every agent packet.
 
-#[path = "common/sandbox.rs"]
-mod sandbox;
-#[path = "common/tls_client.rs"]
-mod tls_client;
-
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -21,13 +16,14 @@ use fictionet::stdlib::codec::{Ending, LineError, Lines};
 use fictionet::stdlib::dns::op::{Message, MessageType, OpCode, Query};
 use fictionet::stdlib::dns::rr::{Name, RData, RecordType};
 use fictionet::stdlib::net::Net;
+use fictionet::stdlib::sandbox::TlsClient;
 use fictionet::stdlib::serve::{Driver, FaultPlan, Flow, Plan, ServeOptions, Service};
 use fictionet::stdlib::{Connection, delay, filter, httpd, tls};
 use fictionet::{Cx, Seed, block_on, lab};
 use http::{Request, Response};
 use http_body::Frame;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tls_client::{DATE, TlsClient};
+const DATE: u64 = 1_893_456_000;
 
 const ECHO: Ipv4Addr = Ipv4Addr::new(192, 168, 10, 10);
 const HTTPS: Ipv4Addr = Ipv4Addr::new(192, 168, 20, 10);
@@ -220,7 +216,7 @@ async fn episode(
         keep
     });
     let agent = delay(&cx, Duration::from_millis(2), agent);
-    let machine = sandbox::sandbox(&cx, agent, Ipv4Addr::new(10, 0, 0, 2));
+    let machine = fictionet::stdlib::sandbox::machine(&cx, agent, Ipv4Addr::new(10, 0, 0, 2));
     let mut dns = machine.udp.bind(40000)?;
     for (name, expected) in [("echo.test", ECHO), ("localhost", HTTPS)] {
         let mut query = Message::new(cx.random_u64() as u16, MessageType::Query, OpCode::Query);
@@ -265,6 +261,7 @@ async fn episode(
             &roots,
             "localhost",
             &[if h2 { b"h2" } else { b"http/1.1" }],
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_893_456_000),
         );
         secure.handshake(&cx).await.unwrap();
         if h2 {

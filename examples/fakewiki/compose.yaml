@@ -29,6 +29,7 @@ services:
     environment:
       FAKEWIKI_VARIANT: ${SAMPLE_METADATA_VARIANT:-unset}
     volumes:
+      - ca:/app/ca
       - sock:/run/fictionet/sock
     healthcheck:
       test: ["CMD", "test", "-f", "/run/fictionet/ready"]
@@ -84,10 +85,13 @@ services:
       target: agent
     image: fictionet-fakewiki-agent:dev
     network_mode: "service:attach"
+    volumes:
+      - ca:/app/ca:ro
     depends_on:
       attach:
         condition: service_healthy
     init: true
 
 volumes:
+  ca:
   sock:

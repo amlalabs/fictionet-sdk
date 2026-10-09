@@ -68,6 +68,11 @@ pub struct Compat<C> {
 }
 
 impl<C> Compat<C> {
+    /// Borrows the underlying simulated connection.
+    pub fn get_ref(&self) -> &C {
+        &self.inner
+    }
+
     /// Unwraps the connection inside.
     pub fn into_inner(self) -> C {
         self.inner

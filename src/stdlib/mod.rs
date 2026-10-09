@@ -205,6 +205,7 @@
 //! | [`asn1`] | ASN.1 BER and DER tags, lengths and values, the base of LDAP, SNMP, Kerberos and X.509. | yes | yes |  |  |  | yes | yes |
 //! | [`bacnet`] | BACnet/IP: BVLC messages, NPDUs, APDUs and application-tagged values. | yes | yes |  |  |  | yes | yes |
 //! | [`bgp`] | BGP-4 messages from OPEN to ROUTE-REFRESH, with path attributes and prefixes. | yes | yes |  |  |  | yes | yes |
+//! | [`ca`] | Seeded certificate authorities and server leaves for simulated TLS sites. |  |  |  |  |  |  | yes |
 //! | [`cboe_boe`] | Cboe Binary Order Entry: every session and order message, a member's and an exchange's session, and an order tracker. | yes | yes | `Client`, `Server`, `Exchange` |  |  | yes | yes |
 //! | [`cboe_pitch`] | Cboe Multicast PITCH: sequenced units, every message, a gap detector per unit and a bounded order book. | yes | yes | `GapDetector`, `Book` |  |  | yes | yes |
 //! | [`cme_mdp3`] | CME MDP 3.0 market data: generated messages for SBE schema 1 version 13 (20230411), plus packet framing. | yes | yes |  |  |  | yes | yes |
@@ -290,6 +291,7 @@
 //! | [`rtcp`] | RTCP control packets, compound packets and feedback messages. | yes | yes |  |  |  | yes | yes |
 //! | [`rtp`] | RTP media packets and their header extensions, told apart from RTCP. | yes |  |  |  |  | yes | yes |
 //! | [`rtsp`] | RTSP messages and interleaved data, with transport and range headers. | yes | yes |  |  |  | yes | yes |
+//! | [`sandbox`] | Client machines with DNS, TLS, and HTTP requests for lab tests. |  |  |  |  |  |  | yes |
 //! | [`sbe`] | FIX Simple Binary Encoding 1.0 at run time: load a schema's XML, then read and write its messages. | yes | yes |  |  |  | yes | yes |
 //! | [`sdp`] | SDP session descriptions, with ICE candidates and RTP maps. | yes | yes |  |  |  | yes | yes |
 //! | [`serve`] | Services: the `Service` trait, the driver that runs one over a connection or a UDP socket, `listen`, a test harness, transcripts and fault plans. |  |  |  |  |  | yes | yes |
@@ -332,6 +334,7 @@ pub mod amqp;
 pub mod asn1;
 pub mod bacnet;
 pub mod bgp;
+pub mod ca;
 pub mod cboe_boe;
 pub mod cboe_pitch;
 mod connection;
@@ -457,6 +460,7 @@ pub mod route;
 pub mod rtcp;
 pub mod rtp;
 pub mod rtsp;
+pub mod sandbox;
 pub mod sbe;
 pub mod sdp;
 pub mod serve;

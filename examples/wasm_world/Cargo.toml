@@ -22,7 +22,6 @@ http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
 tower-service = "0.3"
-rcgen = { version = "0.13", default-features = false, features = ["ring", "crypto"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 
 # The page's entry point, `fetchText`.

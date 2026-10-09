@@ -6,7 +6,7 @@ description = "The Border world on Fictionet: a bank, an impostor, a BGP border 
 license = "MIT OR Apache-2.0"
 publish = false
 
-# Its own workspace, so its dependencies (rcgen and the rest) stay out of the
+# Its own workspace, so its dependencies stay out of the
 # fictionet crate's lock file.
 [workspace]
 
@@ -25,7 +25,6 @@ fictionet = { path = "../../.." }
 http = "1"
 http-body-util = "0.1"
 hyper = "1"
-rcgen = { version = "0.13", features = ["x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 time = { version = "0.3", features = ["macros"] }

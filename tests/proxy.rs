@@ -17,10 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use fictionet::stdlib::{tls, web};
-use rcgen::{
-    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
-};
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::PrivateKeyDer;
 
 const BIN: &str = env!("CARGO_BIN_EXE_fictionet");
 const TOKEN: &str = "tok-3f9a2c";
@@ -65,14 +62,12 @@ impl World {
         let queries2 = queries.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
-            let (chain, key) = certs(&ca_path);
             let (attacher, attachments) = fictionet::attachments();
             let listening = fictionet::listen(
                 fictionet::WorldSocket::UnixSocket(sock2.clone().into()),
                 attacher,
             )
             .unwrap();
-            ready_tx.send(()).unwrap();
             // A tokio runtime polls the world: axum runs WebSockets in tokio
             // tasks.
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -83,6 +78,8 @@ impl World {
             let _ = rt.block_on(fictionet::run(
                 fictionet::Seed::random(),
                 move |fcx| async move {
+                    let (chain, key) = certs(&fcx, &ca_path);
+                    ready_tx.send(()).unwrap();
                     let config = Arc::new(
                         tls::config_builder(&fcx, SystemTime::now())
                             .with_safe_default_protocol_versions()?
@@ -236,28 +233,25 @@ async fn upload(body: axum::body::Body) -> String {
 
 /// A CA, written to `ca_path`, and a certificate for `secure.test`.
 fn certs(
+    fcx: &fictionet::Cx,
     ca_path: &Path,
 ) -> (
     Vec<rustls::pki_types::CertificateDer<'static>>,
     PrivateKeyDer<'static>,
 ) {
-    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    ca.distinguished_name
-        .push(rcgen::DnType::CommonName, "proxy test CA");
-    let ca_key = KeyPair::generate().unwrap();
-    let ca = ca.self_signed(&ca_key).unwrap();
-    let mut leaf = CertificateParams::new(vec!["secure.test".to_owned()]).unwrap();
-    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    leaf.use_authority_key_identifier_extension = true;
-    let leaf_key = KeyPair::generate().unwrap();
-    let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
-    std::fs::write(ca_path, ca.pem()).unwrap();
-    (
-        vec![leaf.der().clone()],
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
-    )
+    let ca = fictionet::stdlib::ca::Ca::new(fcx, "proxy test CA").unwrap();
+    let leaf = ca
+        .issue(
+            fcx,
+            &["secure.test"],
+            fictionet::stdlib::x509::Validity {
+                not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
+                not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
+            },
+        )
+        .unwrap();
+    std::fs::write(ca_path, ca.cert_pem()).unwrap();
+    (leaf.chain, leaf.key)
 }
 
 /// A running attach.

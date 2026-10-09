@@ -18,10 +18,6 @@ use serde_json::{Map, Value, json};
 use crate::backend::PAGE_FIELDS;
 use crate::log::Log;
 
-/// The attachment the world uses for its own startup lookups. Its DNS
-/// queries are not logged; the sites they make are.
-pub const LOOKUPS: &str = "adaptive-web-world-lookups";
-
 /// Writes the request log from `fcx`'s run's events.
 pub fn log_to(fcx: &Cx, log: Arc<Log>) {
     fcx.events().subscribe(move |event| {
@@ -55,13 +51,12 @@ fn get(e: &Entry, name: &str) -> Value {
 /// The log line for `e`, if it is one the log keeps.
 fn line(e: &Entry) -> Option<Value> {
     let name = e.conn.sandbox.as_ref().map(|s| s.name.clone());
-    let ours = name.as_deref() == Some(LOOKUPS);
     match (e.source, e.kind) {
-        ("net", "attached") if !ours => {
+        ("net", "attached") => {
             println!("attached {}", name.as_deref().unwrap_or(""));
             None
         }
-        ("net", "detached") if !ours => {
+        ("net", "detached") => {
             println!("detached {}", name.as_deref().unwrap_or(""));
             None
         }
@@ -74,7 +69,7 @@ fn line(e: &Entry) -> Option<Value> {
         ("adaptive", "cert") => Some(json!({
             "type": "cert", "host": get(e, "host"), "not_before": get(e, "not_before"), "not_after": get(e, "not_after"),
         })),
-        ("dns", "query") if !ours => Some(json!({
+        ("dns", "query") => Some(json!({
             "type": "dns",
             "via": if e.get("tcp").and_then(J::as_bool) == Some(true) { "tcp" } else { "udp" },
             "name": get(e, "name"),

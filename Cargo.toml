@@ -78,7 +78,6 @@ fictionet-copy-modules = { path = "tests/copy_and_own" }
 axum = { version = "0.8", default-features = false, features = ["ws"] }
 hyper = { version = "1.11.1", features = ["client"] }
 etherparse = "0.21"
-rcgen = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 

@@ -8,8 +8,6 @@
 //! sandbox's own stack. Nothing touches a real network, so the same code
 //! runs natively and on wasm32-unknown-unknown.
 
-mod tls_client;
-
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -25,11 +23,10 @@ use fictionet::{Cx, Result, run};
 use http::{Request, Response, Version};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
-use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-use crate::tls_client::TlsClient;
+use fictionet::stdlib::sandbox::TlsClient;
 
 /// The site's one name.
 pub const NAME: &str = "hello.test";
@@ -66,7 +63,7 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
     let fetched = Arc::new(Mutex::new(None));
     let out = fetched.clone();
     let ended = run(fictionet::Seed::random(), move |fcx| async move {
-        let certs = certs()?;
+        let certs = certs(&fcx)?;
         // The world's date: certificates are checked against it.
         let date = std::time::Duration::from_secs(1_767_225_600); // 2026-01-01
         let server = Arc::new(
@@ -114,7 +111,10 @@ pub async fn fetch(https: bool, version: Version) -> Result<Fetched> {
             } else {
                 b"http/1.1".to_vec()
             }];
-            let mut conn = TlsClient::new(conn, Arc::new(client), NAME)?;
+            let session = tls::with_context(&fcx, || {
+                rustls::ClientConnection::new(Arc::new(client), NAME.try_into().unwrap())
+            })?;
+            let mut conn = TlsClient::with(conn, session);
             conn.handshake(&fcx).await?;
             get(&fcx, conn, "https", version, "/from-the-browser").await?
         } else {
@@ -201,7 +201,7 @@ impl std::error::Error for Done {}
 
 /// Asks the world's DNS server for the A record of `name`.
 async fn lookup(fcx: &Cx, udp: &udp::Endpoint, name: &str) -> Result<Ipv4Addr> {
-    let mut socket = udp.bind(40000 + (fcx.random_u64() % 20000) as u16)?;
+    let mut socket = udp.bind(0)?;
     let mut query = Message::query();
     query.metadata.id = fcx.random_u64() as u16;
     query.metadata.recursion_desired = true;
@@ -233,22 +233,24 @@ struct Certs {
     key: PrivateKeyDer<'static>,
 }
 
-fn certs() -> Result<Certs> {
-    let mut ca = CertificateParams::new(Vec::<String>::new())?;
-    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_key = KeyPair::generate()?;
-    let ca = ca.self_signed(&ca_key)?;
-    let mut leaf = CertificateParams::new(vec![NAME.to_owned()])?;
-    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let leaf_key = KeyPair::generate()?;
-    let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key)?;
+fn certs(fcx: &Cx) -> Result<Certs> {
+    let ca = fictionet::stdlib::ca::Ca::new(fcx, "browser CA").unwrap();
+    let leaf = ca
+        .issue(
+            fcx,
+            &[NAME],
+            fictionet::stdlib::x509::Validity {
+                not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
+                not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
+            },
+        )
+        .unwrap();
     let mut roots = RootCertStore::empty();
-    roots.add(ca.der().clone())?;
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+    roots.add(ca.cert_der()).unwrap();
     Ok(Certs {
         roots,
-        chain: vec![leaf.der().clone()],
-        key,
+        chain: leaf.chain,
+        key: leaf.key,
     })
 }
 

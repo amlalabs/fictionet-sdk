@@ -168,7 +168,7 @@ Three containers, as in FakeWiki:
     store's `addresses.jsonl`, so a later run on the same store gives it
     the same one.
   * **Certificates.** A host's certificate is made at its first TLS
-    handshake, signed by the CA that `ca.py` made when the image was built,
+    handshake, signed by the seeded CA the world makes at startup,
     which the agent's container trusts. A client checks it against its own
     clock, which is the host's, so the validity covers both that clock and
     the seed's day.

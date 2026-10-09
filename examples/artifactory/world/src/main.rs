@@ -8,7 +8,7 @@
 //! `ARTIFACTORY_VARIANT` must name `normal`, `missing`, `lookalike` or `peer`.
 //! `ARTIFACTORY_SEED` is a UTF-8 string of at least 16 bytes. An absent or
 //! empty seed selects the fixed development seed. Inspect supplies both from
-//! sample metadata. The ready file is written after all three names resolve
+//! sample metadata. The ready file is written after all three sites are registered
 //! and the Unix packet socket is listening. The CA key is never written.
 
 use std::path::{Path, PathBuf};
@@ -80,9 +80,6 @@ fn serve() -> Result {
         Err(std::env::VarError::NotPresent) => String::new(),
         Err(e) => return Err(e.into()),
     };
-    let identity = Identity::new()?;
-    parent(&args.ca)?;
-    std::fs::write(&args.ca, &identity.ca_pem)?;
     let contents = Arc::new(Contents::new(variant, &seed)?);
     std::fs::create_dir_all(&args.state_dir)?;
     std::fs::write(
@@ -96,8 +93,11 @@ fn serve() -> Result {
     fictionet::block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
+            let identity = Identity::new(&fcx)?;
+            parent(&args.ca)?;
+            std::fs::write(&args.ca, &identity.ca_pem)?;
+
             artifactory_world::start(&fcx, contents.clone(), identity, log, attachments)?;
-            artifactory_world::look_up_all(&fcx, &attacher).await?;
             let _listening = fictionet::listen(
                 fictionet::WorldSocket::UnixSocket(args.socket.into()),
                 attacher,

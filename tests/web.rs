@@ -6,17 +6,11 @@
 #[path = "common/certs.rs"]
 mod certs;
 mod common;
-#[path = "common/tls_client.rs"]
-mod tls_client;
-use tls_client::{TlsClient, TlsError};
+use fictionet::stdlib::sandbox::{TlsClient, TlsError};
 #[path = "common/done.rs"]
 mod done;
-#[path = "common/machine.rs"]
-mod machine;
 #[path = "common/world.rs"]
 mod run_world;
-#[path = "common/sandbox.rs"]
-mod sandbox;
 #[path = "common/timeout.rs"]
 mod timeout;
 #[path = "common/wait.rs"]
@@ -25,8 +19,8 @@ mod wait;
 use certs::certs;
 use common::within;
 use done::Done;
-use machine::machine;
-use sandbox::Machine;
+use fictionet::stdlib::sandbox::Machine;
+use fictionet::stdlib::sandbox::machine;
 use timeout::timeout;
 
 use std::convert::Infallible;
@@ -50,7 +44,6 @@ use fictionet::stdlib::{ConnError, Connection, dhcp, ip, tcp, web};
 use fictionet::{Attacher, Cx, End, Interface, Packet, Seed, block_on, lab, run};
 use http::{HeaderMap, Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
@@ -178,18 +171,21 @@ fn events_site(waiting: Arc<AtomicUsize>) -> axum::Router {
 /// - `inside6.test`: asks for an address inside the sandboxes' IPv6 subnet.
 /// - everything else: NXDOMAIN.
 fn sites(fcx: &Cx) -> TestSites {
-    let certs = certs(&[
-        "secure.test",
-        "shared.test",
-        "plain.test",
-        "nope.test",
-        "events.test",
-        "both.test",
-        "tls-default.test",
-        "dual.test",
-        "v4only.test",
-        "v6only.test",
-    ]);
+    let certs = certs(
+        fcx,
+        &[
+            "secure.test",
+            "shared.test",
+            "plain.test",
+            "nope.test",
+            "events.test",
+            "both.test",
+            "tls-default.test",
+            "dual.test",
+            "v4only.test",
+            "v6only.test",
+        ],
+    );
     let config = Arc::new(
         tls::config_builder(fcx, SystemTime::now())
             .with_safe_default_protocol_versions()
@@ -354,10 +350,7 @@ const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 /// Asks the gateway's DNS over UDP. Returns the response code and the A
 /// records.
 async fn dns(fcx: &Cx, m: &Machine, name: &str, kind: RecordType) -> (ResponseCode, Vec<Ipv4Addr>) {
-    let mut socket = m
-        .udp
-        .bind(40000 + (fcx.random_u64() % 20000) as u16)
-        .unwrap();
+    let mut socket = m.udp.bind(0).unwrap();
     let mut q = Message::new(fcx.random_u64() as u16, MessageType::Query, OpCode::Query);
     q.metadata.recursion_desired = true;
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
@@ -548,7 +541,14 @@ async fn tls_connect(
         .connect(fcx, SocketAddr::new(addr.into(), 443))
         .await
         .map_err(TlsError::Conn)?;
-    let mut client = TlsClient::new(fcx, tcp, &env.roots, sni, alpn);
+    let mut client = TlsClient::new(
+        fcx,
+        tcp,
+        &env.roots,
+        sni,
+        alpn,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_893_456_000),
+    );
     client.handshake(fcx).await?;
     Ok(client)
 }
@@ -559,7 +559,11 @@ async fn tls_connect(
 #[test]
 fn dns_answers_sites_nodata_and_nxdomain() {
     world(|fcx, attacher, env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
 
         // A site with `at` gets that address; the same answer every time.
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
@@ -641,7 +645,11 @@ async fn read_exact<C: Connection>(fcx: &Cx, conn: &mut C, buf: &mut [u8]) {
 #[test]
 fn https_with_http2_and_http11() {
     world(|fcx, attacher, env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let addr = lookup(&fcx, &m, "secure.test").await;
 
         // A client that offers h2 gets HTTP/2.
@@ -726,7 +734,11 @@ fn dates_come_from_the_world() {
                     sites = sites.date(date);
                 }
                 sites.start(&fcx, attachments)?;
-                let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+                let m = machine(
+                    &fcx,
+                    attacher.attach("a").unwrap(),
+                    Ipv4Addr::new(10, 0, 0, 2),
+                );
                 let addr = lookup(&fcx, &m, "dated.test").await;
                 for h2 in [false, true] {
                     let conn = m
@@ -776,7 +788,11 @@ fn dates_come_from_the_world() {
 #[test]
 fn port_80_redirects_tls_sites_and_serves_the_others() {
     world(|fcx, attacher, _env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let addr = lookup(&fcx, &m, "secure.test").await;
         assert_eq!(lookup(&fcx, &m, "shared.test").await, addr);
         let plain = lookup(&fcx, &m, "plain.test").await;
@@ -833,7 +849,11 @@ fn port_80_redirects_tls_sites_and_serves_the_others() {
 #[test]
 fn a_tls_site_with_plain_http_answers_port_80_itself() {
     world_events(|fcx, attacher, env, log| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         assert_eq!(lookup(&fcx, &m, "both.test").await, BOTH_ADDR);
 
         // Port 80: the handler answers, with an http Target, over HTTP/1.1
@@ -902,7 +922,11 @@ fn a_tls_site_with_plain_http_answers_port_80_itself() {
 #[test]
 fn a_host_that_is_not_this_site_gets_421() {
     world(|fcx, attacher, env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let addr = lookup(&fcx, &m, "secure.test").await;
         lookup(&fcx, &m, "shared.test").await;
         let plain = lookup(&fcx, &m, "plain.test").await;
@@ -957,7 +981,11 @@ fn a_host_that_is_not_this_site_gets_421() {
 #[test]
 fn a_failing_handler_gets_500() {
     world(|fcx, attacher, _env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let addr = lookup(&fcx, &m, "broken.test").await;
         let conn = m
             .tcp
@@ -976,7 +1004,11 @@ fn a_failing_handler_gets_500() {
 #[test]
 fn an_unknown_tls_name_is_rejected_with_unrecognized_name() {
     world(|fcx, attacher, env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let addr = lookup(&fcx, &m, "secure.test").await;
         lookup(&fcx, &m, "shared.test").await;
         let calls = env.calls.load(Ordering::SeqCst);
@@ -1527,7 +1559,11 @@ fn the_sites_keep_running_after_the_world_returns() {
 #[test]
 fn the_target_is_from_the_connection_not_the_headers() {
     world(|fcx, attacher, env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let addr = lookup(&fcx, &m, "secure.test").await;
         let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", &[b"http/1.1"])
             .await
@@ -1570,7 +1606,11 @@ async fn the_proxy_answers_502_when_the_real_site_cannot_be_reached() {
                 (h == "nowhere.invalid").then(|| web::Site::new(upstream.clone()))
             })
             .start(&fcx, attachments)?;
-            let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+            let m = machine(
+                &fcx,
+                attacher.attach("a").unwrap(),
+                Ipv4Addr::new(10, 0, 0, 2),
+            );
             let addr = lookup(&fcx, &m, "nowhere.invalid").await;
             let conn = m
                 .tcp
@@ -1674,7 +1714,11 @@ async fn websockets_work_through_sites() {
             let (attacher, attachments) = fictionet::attachments();
             web::Sites::new(|h| (h == "ws.test").then(|| web::Site::new(echo_socket())))
                 .start(&fcx, attachments)?;
-            let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+            let m = machine(
+                &fcx,
+                attacher.attach("a").unwrap(),
+                Ipv4Addr::new(10, 0, 0, 2),
+            );
             let addr = lookup(&fcx, &m, "ws.test").await;
             let mut conn = m
                 .tcp
@@ -1881,7 +1925,11 @@ fn one_sandbox_cannot_hold_thousands_of_connections_open() {
     real_world(|fcx, attacher, env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
-        let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
+        let b = machine(
+            &fcx,
+            attacher.attach("b").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 3),
+        );
         assert_eq!(lookup(&fcx, &b, "secure.test").await, SECURE_ADDR);
         let (open, mut closed) = open_idle(
             &fcx,
@@ -1934,7 +1982,11 @@ async fn get_and_hold(
 #[test]
 fn connections_left_half_open_still_count() {
     real_world(|fcx, attacher, _env| async move {
-        let a = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let a = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let to = lookup(&fcx, &a, "plain.test").await;
         let mut held = Vec::new();
         for i in 0..256 {
@@ -1954,7 +2006,11 @@ fn connections_left_half_open_still_count() {
             );
         }
         // Another sandbox is served as before.
-        let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
+        let b = machine(
+            &fcx,
+            attacher.attach("b").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 3),
+        );
         assert_eq!(lookup(&fcx, &b, "plain.test").await, to);
         let (text, _conn) = get_and_hold(&fcx, &b, to)
             .await
@@ -2097,7 +2153,11 @@ fn a_syn_flood_from_one_sandbox_does_not_lock_out_the_others() {
     real_world(|fcx, attacher, env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
-        let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
+        let b = machine(
+            &fcx,
+            attacher.attach("b").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 3),
+        );
         assert_eq!(lookup(&fcx, &b, "secure.test").await, SECURE_ADDR);
         for i in 0..2000u16 {
             raw.send(tcp_seg(me, 10_000 + i, SECURE_ADDR, 443, 1000, 0, SYN, &[]));
@@ -2137,7 +2197,11 @@ fn ten_thousand_sites_do_not_slow_the_network() {
     real_world(|fcx, attacher, env| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
         let mut raw = attacher.attach("a").unwrap();
-        let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
+        let b = machine(
+            &fcx,
+            attacher.attach("b").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 3),
+        );
         assert_eq!(lookup(&fcx, &b, "secure.test").await, SECURE_ADDR);
         let before = median_get(&fcx, &b, &env).await;
         let n = 10_000u32;
@@ -2182,7 +2246,11 @@ fn ten_thousand_sites_do_not_slow_the_network() {
 #[test]
 fn a_name_never_looked_up_is_not_served_by_host_or_sni() {
     world(|fcx, attacher, env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let addr = lookup(&fcx, &m, "secure.test").await;
         let wild = lookup(&fcx, &m, "one.wild.test").await;
         let calls = env.calls.load(Ordering::SeqCst);
@@ -2233,7 +2301,11 @@ fn a_name_never_looked_up_is_not_served_by_host_or_sni() {
 #[test]
 fn http2_with_a_thousand_streams_and_cancelled_ones() {
     real_world(|fcx, attacher, env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let addr = lookup(&fcx, &m, "secure.test").await;
         let conn = tls_connect(&fcx, &m, &env, addr, "secure.test", &[b"h2"])
             .await
@@ -2374,7 +2446,11 @@ fn malformed_dns_does_not_break_the_server() {
 
         // Over TCP: a length that promises more than comes, then garbage,
         // on separate connections; then a good query on a new one.
-        let b = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 3));
+        let b = machine(
+            &fcx,
+            attacher.attach("b").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 3),
+        );
         let dns_tcp = SocketAddr::new(GATEWAY.into(), 53);
         let mut c1 = b.tcp.connect(&fcx, dns_tcp).await.unwrap();
         c1.write_all(&fcx, &[0xff, 0xff, 1, 2, 3]).await.unwrap();
@@ -2480,7 +2556,11 @@ fn a_detached_sandboxs_traffic_does_not_reach_the_next_holder_of_its_address() {
 #[test]
 fn a_huge_or_garbage_tls_hello_closes_only_that_connection() {
     world(|fcx, attacher, env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let addr = lookup(&fcx, &m, "secure.test").await;
         let to = SocketAddr::new(addr.into(), 443);
         // A handshake record header that promises 16 KiB, repeated: a hello
@@ -2651,7 +2731,11 @@ async fn read_all<C: Connection>(fcx: &Cx, conn: &mut C) -> Vec<u8> {
 #[test]
 fn a_known_length_is_sent_as_content_length() {
     world(|fcx, attacher, env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let plain = lookup(&fcx, &m, "plain.test").await;
         let events = lookup(&fcx, &m, "events.test").await;
         let mut conn = m
@@ -2692,7 +2776,11 @@ fn a_known_length_is_sent_as_content_length() {
 #[test]
 fn head_gets_the_headers_and_no_body_on_both_versions() {
     world(|fcx, attacher, env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let secure = lookup(&fcx, &m, "secure.test").await;
         let events = lookup(&fcx, &m, "events.test").await;
         for h2 in [true, false] {
@@ -2751,7 +2839,11 @@ fn head_gets_the_headers_and_no_body_on_both_versions() {
 #[test]
 fn the_default_host_answers_hosts_with_no_site_of_their_own() {
     world(|fcx, attacher, _env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         assert_eq!(lookup(&fcx, &m, "default.test").await, DEFAULT_ADDR);
         assert_eq!(lookup(&fcx, &m, "other.test").await, DEFAULT_ADDR);
         let ask =
@@ -2800,7 +2892,11 @@ fn the_default_host_answers_hosts_with_no_site_of_their_own() {
 #[test]
 fn a_client_that_half_closes_after_its_request_gets_the_response() {
     world(|fcx, attacher, env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let plain = lookup(&fcx, &m, "plain.test").await;
         let secure = lookup(&fcx, &m, "secure.test").await;
         let requests: [&[u8]; 2] = [
@@ -3198,7 +3294,7 @@ fn events_name_each_attachment_by_id() {
 fn events_for_dns_queries() {
     world_events(|fcx, attacher, env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
-        let m = machine(&fcx, &attacher, "a", me);
+        let m = machine(&fcx, attacher.attach("a").unwrap(), me);
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         assert_eq!(lookup(&fcx, &m, "Secure.Test.").await, SECURE_ADDR);
         assert_eq!(
@@ -3311,7 +3407,7 @@ fn client_config(roots: &Arc<RootCertStore>, alpn: &[&[u8]]) -> Arc<ClientConfig
 fn events_for_tls_handshakes() {
     world_events(|fcx, attacher, env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
-        let m = machine(&fcx, &attacher, "a", me);
+        let m = machine(&fcx, attacher.attach("a").unwrap(), me);
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         assert_eq!(lookup(&fcx, &m, "shared.test").await, SECURE_ADDR);
         assert_eq!(lookup(&fcx, &m, "events.test").await, EVENTS_ADDR);
@@ -3342,17 +3438,19 @@ fn events_for_tls_handshakes() {
                 .is_err()
         );
         // 4. A client that does not trust the world's CA: it sends unknown_ca.
-        let mut other_ca = CertificateParams::new(Vec::<String>::new()).unwrap();
-        other_ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        other_ca
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "Another CA");
-        let other_ca = other_ca.self_signed(&KeyPair::generate().unwrap()).unwrap();
+        let other_ca = fictionet::stdlib::ca::Ca::new(&fcx, "Another CA").unwrap();
         let mut other = RootCertStore::empty();
-        other.add(other_ca.der().clone()).unwrap();
+        other.add(other_ca.cert_der()).unwrap();
         let other = Arc::new(other);
         let tcp = m.tcp.connect(&fcx, to(SECURE_ADDR)).await.unwrap();
-        let mut client = TlsClient::new(&fcx, tcp, &other, "secure.test", &[]);
+        let mut client = TlsClient::new(
+            &fcx,
+            tcp,
+            &other,
+            "secure.test",
+            &[],
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_893_456_000),
+        );
         assert!(client.handshake(&fcx).await.is_err());
         // 5. A hello split over several segments.
         let mut tcp = m.tcp.connect(&fcx, to(EVENTS_ADDR)).await.unwrap();
@@ -3445,7 +3543,7 @@ async fn raw_http(fcx: &Cx, m: &Machine, addr: Ipv4Addr, request: &[u8]) -> Vec<
 fn events_for_http_requests() {
     world_events(|fcx, attacher, env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);
-        let m = machine(&fcx, &attacher, "a", me);
+        let m = machine(&fcx, attacher.attach("a").unwrap(), me);
         assert_eq!(lookup(&fcx, &m, "events.test").await, EVENTS_ADDR);
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         let broken = lookup(&fcx, &m, "broken.test").await;
@@ -3825,7 +3923,11 @@ fn a_reset_mid_request_drops_the_handler_without_events() {
 #[test]
 fn the_world_stops_while_handlers_wait() {
     world_events(|fcx, attacher, env, log| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let slow = lookup(&fcx, &m, "slow.test").await;
         let to = SocketAddr::new(slow.into(), 80);
         let mut h1 = m.tcp.connect(&fcx, to).await.unwrap();
@@ -3862,7 +3964,11 @@ fn the_world_stops_while_handlers_wait() {
 #[test]
 fn events_for_bytes_that_are_not_http() {
     world_events(|fcx, attacher, env, log| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let plain = lookup(&fcx, &m, "plain.test").await;
         assert_eq!(lookup(&fcx, &m, "events.test").await, EVENTS_ADDR);
 
@@ -3944,7 +4050,11 @@ fn events_for_clients_that_send_nothing() {
             })
             .start(&fcx, attachments)?;
         let log = Log::new(&fcx);
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         let started = fcx.now();
         let _quiet_80 = m
@@ -4220,7 +4330,11 @@ fn a_port_scan_cannot_push_out_the_events_a_grader_reads() {
     world_events(move |fcx, attacher, env, log| async move {
         log.events.to_file(&file)?;
         // What a grader reads: a lookup, a TLS handshake and a request.
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         assert_eq!(lookup(&fcx, &m, "secure.test").await, SECURE_ADDR);
         let conn = tls_connect(&fcx, &m, &env, SECURE_ADDR, "secure.test", &[b"http/1.1"])
             .await
@@ -4421,10 +4535,7 @@ async fn dns_at(
     name: &str,
     kind: RecordType,
 ) -> (ResponseCode, Vec<IpAddr>) {
-    let mut socket = m
-        .udp
-        .bind(40000 + (fcx.random_u64() % 20000) as u16)
-        .unwrap();
+    let mut socket = m.udp.bind(0).unwrap();
     let mut q = Message::new(fcx.random_u64() as u16, MessageType::Query, OpCode::Query);
     q.add_query(Query::query(Name::from_ascii(name).unwrap(), kind));
     socket.send_to(&q.to_vec().unwrap(), SocketAddr::new(server, 53));
@@ -4439,7 +4550,11 @@ async fn dns_at(
 #[test]
 fn dns_answers_aaaa_for_each_family_a_site_has() {
     world(|fcx, attacher, env| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let gw = IpAddr::V4(GATEWAY);
         let ok = |addrs: &[IpAddr]| (ResponseCode::NoError, addrs.to_vec());
         let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
@@ -4499,7 +4614,7 @@ fn dns_answers_aaaa_for_each_family_a_site_has() {
         assert_eq!(env.calls.load(Ordering::SeqCst), 6);
 
         // DNS also answers at the gateway's IPv6 address, over UDP and TCP.
-        let m6 = machine(&fcx, &attacher, "b", ME6);
+        let m6 = machine(&fcx, attacher.attach("b").unwrap(), ME6);
         assert_eq!(
             dns_at(&fcx, &m6, GATEWAY6.into(), "dual.test", RecordType::AAAA).await,
             ok(&[DUAL_ADDR6.into()])
@@ -4534,7 +4649,7 @@ fn dns_answers_aaaa_for_each_family_a_site_has() {
 #[test]
 fn https_http2_and_plain_http_over_ipv6() {
     world_events(|fcx, attacher, env, log| async move {
-        let m = machine(&fcx, &attacher, "a", ME6);
+        let m = machine(&fcx, attacher.attach("a").unwrap(), ME6);
         let (_, addrs) = dns_at(&fcx, &m, GATEWAY6.into(), "dual.test", RecordType::AAAA).await;
         assert_eq!(addrs, vec![IpAddr::V6(DUAL_ADDR6)]);
 
@@ -4564,7 +4679,11 @@ fn https_http2_and_plain_http_over_ipv6() {
         );
 
         // The site keeps its state across families: it is one site.
-        let m4 = machine(&fcx, &attacher, "b", Ipv4Addr::new(10, 0, 0, 2));
+        let m4 = machine(
+            &fcx,
+            attacher.attach("b").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let conn = tls_connect(&fcx, &m4, &env, DUAL_ADDR, "dual.test", &[b"h2"])
             .await
             .unwrap();
@@ -4619,7 +4738,14 @@ fn https_http2_and_plain_http_over_ipv6() {
             .connect(&fcx, SocketAddr::new(DUAL_ADDR6.into(), 443))
             .await
             .unwrap();
-        let mut bare = TlsClient::new(&fcx, tcp, &env.roots, &DUAL_ADDR6.to_string(), &[]);
+        let mut bare = TlsClient::new(
+            &fcx,
+            tcp,
+            &env.roots,
+            &DUAL_ADDR6.to_string(),
+            &[],
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_893_456_000),
+        );
         assert!(bare.handshake(&fcx).await.is_err());
 
         // The events name the IPv6 addresses.
@@ -4915,7 +5041,11 @@ fn an_ipv4_only_network_drops_ipv6_and_answers_aaaa_with_nodata() {
         .ipv4_only()
     };
     world_of(make, |fcx, attacher, log| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let gw = IpAddr::V4(GATEWAY);
         // An IPv6 `at` is not used: the site gets an automatic IPv4 address.
         assert_eq!(
@@ -4992,7 +5122,11 @@ fn automatic_ipv6_addresses_skip_the_sandboxes_subnet() {
         .subnet("2001::/16".parse().unwrap())
     };
     world_of(make, |fcx, attacher, _log| async move {
-        let m = machine(&fcx, &attacher, "a", Ipv4Addr::new(10, 0, 0, 2));
+        let m = machine(
+            &fcx,
+            attacher.attach("a").unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
         let gw = IpAddr::V4(GATEWAY);
         assert_eq!(
             dns_at(&fcx, &m, gw, "one.test", RecordType::AAAA).await,
@@ -5523,4 +5657,79 @@ fn refused_headers_to_nowhere_get_address_unreachable() {
         );
         Ok(())
     });
+}
+
+#[test]
+fn eager_sites_send_the_world_date_without_a_lookup() {
+    // 2019-06-01T00:00:00Z.
+    let june_2019 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_559_347_200);
+    for date in [Some(june_2019), None] {
+        let result = within(Duration::from_secs(60), move || {
+            block_on(lab(Seed::from_u64(1), move |fcx| async move {
+                let (attacher, attachments) = fictionet::attachments();
+                let site = axum::Router::new()
+                    .route(
+                        "/own",
+                        axum::routing::get(|| async {
+                            ([("date", "Mon, 01 Jan 2001 00:00:00 GMT")], "own")
+                        }),
+                    )
+                    .fallback(|| async { "hello" });
+                let mut site = web::Site::new(site);
+                if let Some(date) = date {
+                    site = site.date(date);
+                }
+                let addr = Ipv4Addr::new(203, 0, 113, 10);
+                web::Sites::new(|_| None)
+                    .into_net()
+                    .add_host(site.at(addr).into_host("dated.test"))
+                    .start(&fcx, attachments)?;
+                let m = machine(
+                    &fcx,
+                    attacher.attach("a").unwrap(),
+                    Ipv4Addr::new(10, 0, 0, 2),
+                );
+                for h2 in [false, true] {
+                    let conn = m
+                        .tcp
+                        .connect(&fcx, SocketAddr::new(addr.into(), 80))
+                        .await
+                        .unwrap();
+                    let mut client = Client::new(&fcx, conn, h2).await;
+                    let got = client.get("http", "dated.test", "/").await;
+                    assert_eq!(got.body, "hello");
+                    assert_eq!(
+                        got.version,
+                        if h2 {
+                            Version::HTTP_2
+                        } else {
+                            Version::HTTP_11
+                        }
+                    );
+                    let header = got
+                        .headers
+                        .get("date")
+                        .map(|v| v.to_str().unwrap().to_owned());
+                    match date {
+                        Some(_) => {
+                            let header = header.expect("a Date header");
+                            assert!(
+                                header.starts_with("Sat, 01 Jun 2019 00:0"),
+                                "h2 {h2}: {header}"
+                            );
+                        }
+                        None => assert_eq!(header, None, "h2 {h2}: no world date, so no Date"),
+                    }
+                    // A Date the handler sets is kept.
+                    let got = client.get("http", "dated.test", "/own").await;
+                    assert_eq!(
+                        got.headers.get_all("date").iter().collect::<Vec<_>>(),
+                        ["Mon, 01 Jan 2001 00:00:00 GMT"]
+                    );
+                }
+                Err(fictionet::Error::from(Done))
+            }))
+        });
+        assert!(result.is_err_and(|e| e.downcast_ref::<Done>().is_some()));
+    }
 }

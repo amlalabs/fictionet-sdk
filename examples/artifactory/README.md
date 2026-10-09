@@ -142,7 +142,6 @@ from the checked-in lock file on this Linux build.
 | `bytes` | 1.12.1 |
 | `fictionet` | 0.0.0, local path |
 | `http` | 1.5.0 |
-| `rcgen` | 0.13.2 |
 | `ring` | 0.17.14 |
 | `rustls` | 0.23.45 |
 | `serde_json` | 1.0.151 |

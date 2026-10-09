@@ -62,6 +62,7 @@ pub fn endpoint(fcx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
             stopped: false,
             ip_id: fcx.random_u64() as u16,
             groups: Vec::new(),
+            next_port: 49152,
         }),
     });
     let driver = shared.clone();
@@ -99,6 +100,7 @@ struct State {
     groups: Vec<IpAddr>,
     stopped: bool,
     ip_id: u16,
+    next_port: u16,
 }
 
 #[derive(Default)]
@@ -237,13 +239,29 @@ impl Endpoint {
 
     /// Opens a socket on `port`.
     ///
-    /// Fails if `port` is 0 or a socket is already open there. Dropping the
-    /// socket frees the port.
+    /// Port zero selects a free port from 49152 through 65535. Fails if
+    /// that range is full or the requested port is already open. Dropping
+    /// the socket frees the port.
     pub fn bind(&self, port: u16) -> Result<Socket, Error> {
-        if port == 0 {
-            return Err(fictionet::Error::msg("UDP port 0 cannot be bound"));
-        }
         let mut st = self.shared.state.lock().unwrap();
+        let port = if port == 0 {
+            let mut available = None;
+            for _ in 49152..=u16::MAX {
+                let candidate = st.next_port;
+                st.next_port = if candidate == u16::MAX {
+                    49152
+                } else {
+                    candidate + 1
+                };
+                if !st.sockets.contains_key(&candidate) {
+                    available = Some(candidate);
+                    break;
+                }
+            }
+            available.ok_or_else(|| Error::msg("all ephemeral UDP ports are bound"))?
+        } else {
+            port
+        };
         if st.sockets.contains_key(&port) {
             return Err(fictionet::Error::msg(format!(
                 "UDP port {port} is already bound on {}",
@@ -277,6 +295,11 @@ impl fictionet::stdlib::DatagramSocket for Socket {
 }
 
 impl Socket {
+    /// The address and port this socket receives on.
+    pub fn local_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.shared.addr, self.port)
+    }
+
     /// Waits for the next datagram. Returns its bytes and who sent it.
     ///
     /// Returns early with [`RecvError::Cancelled`] if `fcx`'s

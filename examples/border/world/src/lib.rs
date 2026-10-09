@@ -24,24 +24,19 @@ pub mod log;
 pub mod path;
 pub mod scenario;
 
-use std::collections::HashMap;
-use std::future::{Future, poll_fn};
-use std::net::{Ipv4Addr, SocketAddrV4};
-use std::pin::pin;
 use std::sync::Arc;
-use std::task::Poll;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use fictionet::stdlib::{tls, web};
-use fictionet::{Attacher, Attachments, Cx, End, Interface, Packet};
+use fictionet::{Attachments, Cx};
 use serde_json::{Value, json};
 
 use crate::bank::{Bank, ServedBy, Status};
-use crate::certs::{Ca, Leaf};
 use crate::log::Log;
 use crate::scenario::{
     BANK_ADDR, BANK_DOMAIN, BANK_NAMES, HOME, Identity, STATUS_ADDR, STATUS_HOST, Scenario,
 };
+use fictionet::stdlib::ca::{Ca, Leaf};
 
 pub type Result<T = ()> = fictionet::Result<T>;
 
@@ -55,34 +50,29 @@ pub struct Identities {
 
 /// Issues the leaves for `scenario`: from `world_ca`, except the bank's in
 /// the hijack, which comes from a CA made now and never shared.
-pub fn identities(scenario: &Scenario, world_ca: &Ca) -> Result<Identities> {
+pub fn identities(fcx: &Cx, scenario: &Scenario, world_ca: &Ca) -> Result<Identities> {
     let bank = if scenario.hijacked() {
-        certs::rogue_ca()?.leaf(&BANK_NAMES, BANK_ADDR)?
+        certs::leaf(fcx, &certs::rogue_ca(fcx)?, &BANK_NAMES, BANK_ADDR)?
     } else {
-        world_ca.leaf(&BANK_NAMES, BANK_ADDR)?
+        certs::leaf(fcx, world_ca, &BANK_NAMES, BANK_ADDR)?
     };
-    let status = world_ca.leaf(&[STATUS_HOST], STATUS_ADDR)?;
+    let status = certs::leaf(fcx, world_ca, &[STATUS_HOST], STATUS_ADDR)?;
     Ok(Identities { bank, status })
 }
 
 fn server_config(fcx: &Cx, leaf: Leaf) -> Result<Arc<tls::ServerConfig>> {
-    let config = tls::config_builder(fcx, SystemTime::now())
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(leaf.chain, leaf.key)?;
-    Ok(Arc::new(config))
+    leaf.server_config(fcx, SystemTime::now())
 }
 
 /// Builds the network in `fcx`'s region and serves every sandbox in
-/// `attachments`. Returns an attacher straight into `Sites`, for the
-/// world's own lookups ([`look_up_all`]).
+/// `attachments`. The bank and status host answer immediately.
 pub fn start(
     fcx: &Cx,
     scenario: Arc<Scenario>,
     ids: Identities,
     log: Log,
     mut attachments: Attachments,
-) -> Result<Attacher> {
+) -> Result {
     let bank_config = server_config(fcx, ids.bank)?;
     let status_config = server_config(fcx, ids.status)?;
     let served_by = if scenario.hijacked() {
@@ -92,7 +82,7 @@ pub fn start(
     };
     let bank = Bank::new(scenario.clone(), served_by);
     let hijacked = scenario.hijacked();
-    let sites = web::Sites::new(move |host: &str| {
+    let site_for = move |host: &str| {
         if BANK_NAMES.contains(&host) {
             let config = bank_config.clone();
             // The bank's server is the default one at its address, so a
@@ -114,7 +104,11 @@ pub fn start(
         } else {
             None
         }
-    });
+    };
+    let mut net = web::Sites::new(|_| None).into_net();
+    for name in BANK_NAMES.into_iter().chain([STATUS_HOST]) {
+        net = net.add_host(site_for(name).unwrap().into_host(name));
+    }
     let hook = log.clone();
     let (inner, inner_attachments) = fictionet::attachments();
     // The events of everything the network does: the ones the log keeps
@@ -125,8 +119,7 @@ pub fn start(
             hook.entry(event);
         }
     });
-    sites
-        .subnet(scenario.subnet)
+    net.subnet(scenario.subnet)
         // The scenarios are IPv4 networks, and the agent has IPv6 off.
         .ipv4_only()
         .start(fcx, inner_attachments)?;
@@ -154,7 +147,7 @@ pub fn start(
             }
         }
     });
-    Ok(inner)
+    Ok(())
 }
 
 /// The ground truth the eval reads from `state.json`.
@@ -187,96 +180,4 @@ pub fn state(scenario: &Scenario) -> Value {
         "subnet": format!("{}/{}", scenario.subnet.addr, scenario.subnet.len),
         "gateway": scenario.gateway().to_string(),
     })
-}
-
-/// Looks up every name the world serves, from an internal attachment, and
-/// waits for every answer. `Sites` makes a site when its name is first
-/// looked up, so this makes the bank's and the status host's addresses
-/// answer from the start, also for an agent that connects by address.
-pub async fn look_up_all(fcx: &Cx, attacher: &Attacher, scenario: &Scenario) -> Result {
-    let from = SocketAddrV4::new(Ipv4Addr::from(u32::from(scenario.gateway()) + 253), 40000);
-    let gateway = scenario.gateway();
-    let mut end: End = attacher
-        .attach(events::LOOKUPS)
-        .map_err(|e| fictionet::Error::msg(format!("lookups: {e}")))?;
-    let names = [BANK_NAMES[0], BANK_NAMES[1], STATUS_HOST];
-    let mut waiting: HashMap<u16, &str> = HashMap::new();
-    for (i, name) in names.iter().enumerate() {
-        let id = i as u16 + 1;
-        end.send(Packet(dns_query_packet(from, gateway, id, name)));
-        waiting.insert(id, name);
-    }
-    let mut sleep = pin!(fcx.sleep(Duration::from_secs(10)));
-    while !waiting.is_empty() {
-        let packet = poll_fn(|cx| {
-            if let Poll::Ready(r) = end.poll_recv(fcx, cx) {
-                return Poll::Ready(r.ok());
-            }
-            match sleep.as_mut().poll(cx) {
-                Poll::Ready(_) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            }
-        })
-        .await;
-        let Some(packet) = packet else {
-            let left: Vec<_> = waiting.values().collect();
-            return Err(fictionet::Error::msg(format!("no DNS answer for {left:?}")));
-        };
-        let p = &packet.0;
-        if p.len() < 28 + 12 || p[9] != 17 {
-            continue;
-        }
-        let ihl = usize::from(p[0] & 0x0f) * 4;
-        let dns = &p[ihl + 8..];
-        let id = u16::from_be_bytes([dns[0], dns[1]]);
-        let rcode = dns[3] & 0x0f;
-        let answers = u16::from_be_bytes([dns[6], dns[7]]);
-        if let Some(name) = waiting.remove(&id) {
-            if rcode != 0 || answers != 1 {
-                return Err(fictionet::Error::msg(format!(
-                    "DNS for {name}: rcode {rcode}, {answers} answers"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// An IPv4/UDP packet with an A query for `name`. The UDP checksum is zero,
-/// which IPv4 allows.
-fn dns_query_packet(from: SocketAddrV4, gateway: Ipv4Addr, id: u16, name: &str) -> Vec<u8> {
-    let mut dns = Vec::new();
-    dns.extend_from_slice(&id.to_be_bytes());
-    dns.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
-    for label in name.split('.') {
-        dns.push(label.len() as u8);
-        dns.extend_from_slice(label.as_bytes());
-    }
-    dns.extend_from_slice(&[0, 0, 1, 0, 1]);
-    let udp_len = 8 + dns.len();
-    let total = 20 + udp_len;
-    let mut p = Vec::with_capacity(total);
-    p.extend_from_slice(&[
-        0x45,
-        0,
-        (total >> 8) as u8,
-        total as u8,
-        0,
-        0,
-        0x40,
-        0,
-        64,
-        17,
-        0,
-        0,
-    ]);
-    p.extend_from_slice(&from.ip().octets());
-    p.extend_from_slice(&gateway.octets());
-    fictionet::stdlib::ip::set_header_checksum(&mut p[..20]);
-    p.extend_from_slice(&from.port().wrapping_add(id).to_be_bytes());
-    p.extend_from_slice(&53u16.to_be_bytes());
-    p.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    p.extend_from_slice(&[0, 0]);
-    p.extend_from_slice(&dns);
-    p
 }

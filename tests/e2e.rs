@@ -181,7 +181,7 @@ fn https_through_a_router(
     let server_prefix: route::Prefix = server_prefix.parse().unwrap();
     let client_prefix: route::Prefix = client_prefix.parse().unwrap();
     world(Duration::from_secs(60), move |fcx| async move {
-        let certs = certs(&[NAME]);
+        let certs = certs(&fcx, &[NAME]);
 
         // Two cables into the router. The client's link has 5 ms of delay
         // each way.

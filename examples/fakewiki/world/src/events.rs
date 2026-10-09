@@ -19,10 +19,6 @@ use serde_json::{Value, json};
 
 use crate::log::Log;
 
-/// The attachment the world uses for its own startup lookups. Its events
-/// are not logged, as main.py had no such lookups.
-pub const LOOKUPS: &str = "fakewiki-world-lookups";
-
 /// What the handler tells the log about one response.
 #[derive(Clone, Debug)]
 pub struct Page {
@@ -65,17 +61,16 @@ fn text(e: &Entry, name: &str) -> Option<String> {
 /// The log line for `entry`, if main.py logged such a thing.
 fn line(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Option<Value> {
     let name = e.conn.sandbox.as_ref().map(|s| s.name.clone());
-    let ours = name.as_deref() == Some(LOOKUPS);
     match (e.source, e.kind) {
-        ("net", "attached") if !ours => {
+        ("net", "attached") => {
             println!("attached {}", name.as_deref().unwrap_or(""));
             None
         }
-        ("net", "detached") if !ours => {
+        ("net", "detached") => {
             println!("detached {}", name.as_deref().unwrap_or(""));
             None
         }
-        ("dns", "query") if !ours => Some(dns(hosts, e)),
+        ("dns", "query") => Some(dns(hosts, e)),
         ("tls", "handshake") => tls(e),
         ("http", "request") => Some(http(hosts, e)),
         _ => None,

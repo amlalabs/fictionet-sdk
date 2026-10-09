@@ -25,20 +25,13 @@ pub mod packages;
 pub mod repository;
 pub mod ssrf;
 
-use std::collections::HashMap;
-use std::future::{Future, poll_fn};
-use std::net::{Ipv4Addr, SocketAddrV4};
-use std::pin::pin;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::task::Poll;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use fictionet::stdlib::{tls, web};
-use fictionet::{Attacher, Attachments, Cx, End, Interface, Packet};
-use rcgen::{
-    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
-};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use fictionet::{Attachments, Cx};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use log::Log;
 use repository::{Contents, RepositoryHandler, Site};
@@ -68,29 +61,23 @@ pub struct Identity {
 
 impl Identity {
     /// Issues a fresh CA and one certificate per site.
-    pub fn new() -> Result<Self> {
-        let mut ca = CertificateParams::new(Vec::<String>::new())?;
-        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        ca.distinguished_name
-            .push(rcgen::DnType::CommonName, "Artifactory World CA");
-        let ca_key = KeyPair::generate()?;
-        let ca = ca.self_signed(&ca_key)?;
+    pub fn new(fcx: &Cx) -> Result<Self> {
+        let ca = fictionet::stdlib::ca::Ca::new(fcx, "Artifactory World CA")?;
         let mut leaves = Vec::new();
         for (name, _) in NAMES {
-            let mut leaf = CertificateParams::new(vec![name.to_owned()])?;
-            leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-            leaf.use_authority_key_identifier_extension = true;
-            let key = KeyPair::generate()?;
-            let leaf = leaf.signed_by(&key, &ca, &ca_key)?;
-            leaves.push((
-                leaf.der().clone(),
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-            ));
+            let mut leaf = ca.issue(
+                fcx,
+                &[name],
+                fictionet::stdlib::x509::Validity {
+                    not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
+                    not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
+                },
+            )?;
+            leaves.push((leaf.chain.remove(0), leaf.key));
         }
         Ok(Self {
-            ca_pem: ca.pem(),
-            ca_der: ca.der().clone(),
+            ca_pem: ca.cert_pem(),
+            ca_der: ca.cert_der(),
             leaves,
         })
     }
@@ -121,7 +108,7 @@ pub fn start(
             log.entry(event);
         }
     });
-    web::Sites::new(move |host: &str| {
+    let site_for = move |host: &str| {
         let i = NAMES.iter().position(|(name, _)| *name == host)?;
         let site = [Site::Artifactory, Site::Pypi, Site::Files][i];
         let config = configs[i].clone();
@@ -132,136 +119,57 @@ pub fn start(
         .at(NAMES[i].1)
         .tls(move |_| config.clone());
         Some(if i == 0 { s.default_host() } else { s })
-    })
-    .ipv4_only()
-    .start(fcx, attachments)
-}
-/// Resolves the three names before listening, so direct IP connections work.
-pub async fn look_up_all(fcx: &Cx, attacher: &Attacher) -> Result {
-    let from = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 254), 40000);
-    let gateway = Ipv4Addr::new(10, 0, 0, 1);
-    let mut end: End = attacher
-        .attach(events::LOOKUPS)
-        .map_err(|e| fictionet::Error::msg(format!("lookups: {e}")))?;
-    let names = NAMES.map(|(n, _)| n);
-    let mut waiting: HashMap<u16, &str> = HashMap::new();
-    for (i, name) in names.iter().enumerate() {
-        let id = i as u16 + 1;
-        end.send(Packet(dns_query_packet(from, gateway, id, name)));
-        waiting.insert(id, name);
+    };
+    let mut net = web::Sites::new(|_| None).into_net().ipv4_only();
+    for (name, _) in NAMES {
+        net = net.add_host(site_for(name).unwrap().into_host(name));
     }
-    let mut sleep = pin!(fcx.sleep(Duration::from_secs(10)));
-    while !waiting.is_empty() {
-        let packet = poll_fn(|cx| {
-            if let Poll::Ready(r) = end.poll_recv(fcx, cx) {
-                return Poll::Ready(r.ok());
-            }
-            match sleep.as_mut().poll(cx) {
-                Poll::Ready(_) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            }
-        })
-        .await;
-        let Some(packet) = packet else {
-            let left: Vec<_> = waiting.values().collect();
-            return Err(fictionet::Error::msg(format!("no DNS answer for {left:?}")));
-        };
-        let p = &packet.0;
-        if p.len() < 28 + 12 || p[9] != 17 {
-            continue;
-        }
-        let ihl = usize::from(p[0] & 0x0f) * 4;
-        let dns = &p[ihl + 8..];
-        let id = u16::from_be_bytes([dns[0], dns[1]]);
-        let rcode = dns[3] & 0x0f;
-        let answers = u16::from_be_bytes([dns[6], dns[7]]);
-        if let Some(name) = waiting.remove(&id)
-            && (rcode != 0 || answers != 1)
-        {
-            return Err(fictionet::Error::msg(format!(
-                "DNS for {name}: rcode {rcode}, {answers} answers"
-            )));
-        }
-    }
-    Ok(())
+    net.start(fcx, attachments)
 }
-
-/// An IPv4/UDP packet with an A query for `name`. The UDP checksum is zero,
-/// which IPv4 allows.
-fn dns_query_packet(from: SocketAddrV4, gateway: Ipv4Addr, id: u16, name: &str) -> Vec<u8> {
-    let mut dns = Vec::new();
-    dns.extend_from_slice(&id.to_be_bytes());
-    dns.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
-    for label in name.split('.') {
-        dns.push(label.len() as u8);
-        dns.extend_from_slice(label.as_bytes());
-    }
-    dns.extend_from_slice(&[0, 0, 1, 0, 1]);
-    let udp_len = 8 + dns.len();
-    let total = 20 + udp_len;
-    let mut p = Vec::with_capacity(total);
-    p.extend_from_slice(&[
-        0x45,
-        0,
-        (total >> 8) as u8,
-        total as u8,
-        0,
-        0,
-        0x40,
-        0,
-        64,
-        17,
-        0,
-        0,
-    ]);
-    p.extend_from_slice(&from.ip().octets());
-    p.extend_from_slice(&gateway.octets());
-    fictionet::stdlib::ip::set_header_checksum(&mut p[..20]);
-    p.extend_from_slice(&from.port().wrapping_add(id).to_be_bytes());
-    p.extend_from_slice(&53u16.to_be_bytes());
-    p.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    p.extend_from_slice(&[0, 0]);
-    p.extend_from_slice(&dns);
-    p
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn each_leaf_names_only_its_site() {
-        let identity = Identity::new().unwrap();
-        for (i, (leaf, _)) in identity.leaves.iter().enumerate() {
-            // The full SAN extension encodes exactly one DNS name. These
-            // fixture names use only short-form DER lengths.
-            let name = NAMES[i].0.as_bytes();
-            let n = name.len() as u8;
-            let mut san = vec![
-                0x30,
-                n + 11,
-                6,
-                3,
-                0x55,
-                0x1d,
-                0x11,
-                4,
-                n + 4,
-                0x30,
-                n + 2,
-                0x82,
-                n,
-            ];
-            san.extend_from_slice(name);
-            assert!(leaf.windows(san.len()).any(|bytes| bytes == san));
-            let cert = rustls::server::ParsedCertificate::try_from(leaf).unwrap();
-            for (j, (name, _)) in NAMES.iter().enumerate() {
-                let name = rustls::pki_types::ServerName::try_from(*name).unwrap();
-                assert_eq!(
-                    rustls::client::verify_server_name(&cert, &name).is_ok(),
-                    i == j
-                );
-            }
-        }
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            |fcx| async move {
+                let identity = Identity::new(&fcx).unwrap();
+                for (i, (leaf, _)) in identity.leaves.iter().enumerate() {
+                    // The full SAN extension encodes exactly one DNS name. These
+                    // fixture names use only short-form DER lengths.
+                    let name = NAMES[i].0.as_bytes();
+                    let n = name.len() as u8;
+                    let mut san = vec![
+                        0x30,
+                        n + 11,
+                        6,
+                        3,
+                        0x55,
+                        0x1d,
+                        0x11,
+                        4,
+                        n + 4,
+                        0x30,
+                        n + 2,
+                        0x82,
+                        n,
+                    ];
+                    san.extend_from_slice(name);
+                    assert!(leaf.windows(san.len()).any(|bytes| bytes == san));
+                    let cert = rustls::server::ParsedCertificate::try_from(leaf).unwrap();
+                    for (j, (name, _)) in NAMES.iter().enumerate() {
+                        let name = rustls::pki_types::ServerName::try_from(*name).unwrap();
+                        assert_eq!(
+                            rustls::client::verify_server_name(&cert, &name).is_ok(),
+                            i == j
+                        );
+                    }
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
     }
 }

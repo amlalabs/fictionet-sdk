@@ -42,10 +42,7 @@ use fictionet::Result;
 use fictionet::stdlib::tls;
 use fictionet::stdlib::web;
 use http::Version;
-use rcgen::{
-    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
-};
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::PrivateKeyDer;
 
 /// The addresses `example.test`, `www.example.test` and `shared.test`
 /// share.
@@ -75,32 +72,6 @@ pub fn run(
         .cloned()
         .unwrap_or_else(|| "/run/fictionet/ca.pem".into());
 
-    // The world's CA and one certificate for its HTTPS names.
-    let mut ca = CertificateParams::new(Vec::<String>::new())?;
-    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    // Python 3.13 and later check certificates strictly: a CA must say
-    // what its key is for, and a leaf must name the key that signed it.
-    ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    ca.distinguished_name
-        .push(rcgen::DnType::CommonName, "web_world CA");
-    let ca_key = KeyPair::generate()?;
-    let ca = ca.self_signed(&ca_key)?;
-    let names = [
-        "example.test",
-        "www.example.test",
-        "v4only.test",
-        "v6only.test",
-    ];
-    let mut leaf = CertificateParams::new(names.map(str::to_owned).to_vec())?;
-    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    // Python 3.13 and later refuse a leaf without an authority key identifier.
-    leaf.use_authority_key_identifier_extension = true;
-    let leaf_key = KeyPair::generate()?;
-    let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key)?;
-    std::fs::write(&ca_path, ca.pem())?;
-    let chain = vec![leaf.der().clone()];
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
-
     let (attacher, attachments) = fictionet::attachments();
     let _listening = fictionet::listen(
         fictionet::WorldSocket::UnixSocket(path.clone().into()),
@@ -113,7 +84,24 @@ pub fn run(
         .build()?;
     runtime.block_on(fictionet::run(
         fictionet::Seed::random(),
-        move |fcx| async move { start(&fcx, chain, key, attachments) },
+        move |fcx| async move {
+            let ca = fictionet::stdlib::ca::Ca::new(&fcx, "web_world CA")?;
+            let leaf = ca.issue(
+                &fcx,
+                &[
+                    "example.test",
+                    "www.example.test",
+                    "v4only.test",
+                    "v6only.test",
+                ],
+                fictionet::stdlib::x509::Validity {
+                    not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
+                    not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
+                },
+            )?;
+            std::fs::write(&ca_path, ca.cert_pem())?;
+            start(&fcx, leaf.chain, leaf.key, attachments)
+        },
     ))
 }
 

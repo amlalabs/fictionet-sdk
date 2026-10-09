@@ -22,10 +22,6 @@ use serde_json::{Value, json};
 use crate::bank::{ACCOUNT, unquote_to_bytes};
 use crate::scenario::Scenario;
 
-/// The attachment the world uses for its own startup lookups. Its events
-/// are not logged.
-pub const LOOKUPS: &str = "border-world-lookups";
-
 /// The sources of the events [`line`] makes lines of.
 pub const LOGGED: [&str; 4] = ["net", "dns", "tls", "http"];
 
@@ -56,10 +52,6 @@ fn sandbox(e: &Entry) -> Value {
 
 /// The log line for `entry`, if it gets one.
 pub fn line(scenario: &Scenario, e: &Entry) -> Option<Value> {
-    let ours = e.conn.sandbox.as_ref().is_some_and(|s| &*s.name == LOOKUPS);
-    if ours {
-        return None;
-    }
     let f = |name: &str| js(e.get(name));
     let conn = e.conn.id.unwrap_or(0);
     let local = e.conn.local.map(|a| a.to_string()).unwrap_or_default();

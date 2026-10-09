@@ -4,7 +4,6 @@
 #
 #   build   - the Rust world in examples/adaptive-web/world, and the
 #             fictionet binary (fictionet attach) from the same target dir
-#   ca      - the world's root CA, made once by ca.py (cached by BuildKit)
 #   world   - compose service "fictionet": the Rust world and the Python
 #             backend that makes and keeps the pages, on 127.0.0.1
 #   attach  - compose service "attach": fictionet attach --type tun
@@ -34,17 +33,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --release --locked -p fictionet --bin fictionet \
     && cp target/release/adaptive-web-world target/release/fictionet /usr/local/bin/
 
-FROM python:3.12-slim-bookworm AS ca
-RUN pip install --no-cache-dir cryptography==46.0.3
-COPY examples/adaptive-web/world/backend/adaptive/ca.py /build/ca.py
-# ADAPTIVE_WEB_CA_EPOCH forces a fresh CA: --build-arg ADAPTIVE_WEB_CA_EPOCH=$(date +%s)
-ARG ADAPTIVE_WEB_CA_EPOCH=1
-RUN echo "ca epoch ${ADAPTIVE_WEB_CA_EPOCH}" && python /build/ca.py /ca && rm /build/ca.py
-
 FROM python:3.12-slim-bookworm AS world
 # iproute2 only so the probes can show `ss -lntup` from inside the world.
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=ca /ca /app/ca
 COPY --from=build /usr/local/bin/adaptive-web-world /usr/local/bin/
 COPY examples/adaptive-web/world/backend /app/backend
 COPY examples/adaptive-web/seeds /app/seeds
@@ -60,9 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir requests==2.32.5 beautifulsoup4==4.13.5 html2text==2025.4.15 \
       readability-lxml==0.8.4.1 lxml_html_clean==0.4.2 chardet==5.2.0
-# Trust the world's CA system-wide. Only the public certificate is copied.
-COPY --from=ca /ca/ca.pem /usr/local/share/ca-certificates/internet-security-root-ca.crt
-RUN update-ca-certificates
+# The public root is mounted when the world is ready.
 # Point library-bundled trust stores at the system store (requests/certifi,
 # Node). This is trust configuration, not proxy configuration: there is no
 # proxy. The agent's packets go through attach's tun device to the world.
@@ -70,4 +59,5 @@ ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 WORKDIR /root
+ENTRYPOINT ["sh", "-c", "cp /app/ca/ca.pem /usr/local/share/ca-certificates/internet-security-root-ca.crt && update-ca-certificates >/dev/null && exec \"$@\"", "sh"]
 CMD ["sleep", "infinity"]

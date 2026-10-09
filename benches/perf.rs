@@ -41,8 +41,7 @@ use fictionet::{
 };
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::{BodyExt, Empty, Full};
-use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
 // ---------------------------------------------------------------------------
@@ -1262,10 +1261,7 @@ fn machine(fcx: &Cx, attacher: &Attacher, name: &str, addr: Ipv4Addr) -> Machine
 }
 
 async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Ipv4Addr {
-    let mut socket = m
-        .udp
-        .bind(40000 + (fcx.random_u64() % 20000) as u16)
-        .unwrap();
+    let mut socket = m.udp.bind(0).unwrap();
     let mut q = Message::query();
     q.metadata.id = fcx.random_u64() as u16;
     q.metadata.recursion_desired = true;
@@ -1284,26 +1280,27 @@ async fn lookup(fcx: &Cx, m: &Machine, name: &str) -> Ipv4Addr {
         .expect("an A record")
 }
 
-fn certs() -> (
+fn certs(
+    fcx: &Cx,
+) -> (
     RootCertStore,
     Vec<CertificateDer<'static>>,
     PrivateKeyDer<'static>,
 ) {
-    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_key = KeyPair::generate().unwrap();
-    let ca = ca.self_signed(&ca_key).unwrap();
-    let mut leaf = CertificateParams::new(vec!["bench.test".to_string()]).unwrap();
-    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let leaf_key = KeyPair::generate().unwrap();
-    let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+    let ca = fictionet::stdlib::ca::Ca::new(fcx, "benchmark CA").unwrap();
+    let leaf = ca
+        .issue(
+            fcx,
+            &["bench.test"],
+            fictionet::stdlib::x509::Validity {
+                not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
+                not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
+            },
+        )
+        .unwrap();
     let mut roots = RootCertStore::empty();
-    roots.add(ca.der().clone()).unwrap();
-    (
-        roots,
-        vec![leaf.der().clone()],
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
-    )
+    roots.add(ca.cert_der()).unwrap();
+    (roots, leaf.chain, leaf.key)
 }
 
 /// One Sites world with `case.sandboxes` sandboxes, each holding one TLS
@@ -1332,7 +1329,7 @@ fn http_run(case: HttpCase) -> HttpRun {
     finish(block_on(run(
         fictionet::Seed::random(),
         move |fcx| async move {
-            let (roots, chain, key) = certs();
+            let (roots, chain, key) = certs(&fcx);
             let roots = Arc::new(roots);
             let config = Arc::new(
                 tls::config_builder(&fcx, SystemTime::now())

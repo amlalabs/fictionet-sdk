@@ -1,6 +1,8 @@
 //! The whole Border world in one process, with a sandbox played by the
 //! test: the genuine bank, the impostor, the hops, and the BGP router.
 
+use fictionet::stdlib::sandbox::Machine;
+
 mod common;
 
 use std::net::{Ipv4Addr, SocketAddr};
@@ -53,17 +55,32 @@ fn the_genuine_bank_has_a_trusted_certificate_and_redirects_plain_http() {
                 &m,
                 BANK_ADDR,
                 "kestrelmoor.co.uk",
-                client_config(Some(&env.roots)),
+                fictionet::stdlib::sandbox::client_config(
+                    &fcx,
+                    std::time::SystemTime::now(),
+                    Some(&env.roots),
+                    &[b"http/1.1"],
+                ),
             )
             .await?;
-            let chain = stream.get_ref().1.peer_certificates().unwrap().to_vec();
+            let chain = stream.get_ref().tls.peer_certificates().unwrap().to_vec();
             assert_eq!(chain.len(), 2);
             assert!(contains(&chain[1], b"Test Root CA"));
-            let got = request(stream, "GET", "kestrelmoor.co.uk", "/balance", &[], "").await;
+            let got = request(
+                &fcx,
+                stream,
+                "GET",
+                "kestrelmoor.co.uk",
+                "/balance",
+                &[],
+                "",
+            )
+            .await;
             assert_eq!(got.status, StatusCode::OK);
             assert!(got.body.contains("\"balance_gbp\": 4120.55"));
 
             let got = request(
+                &fcx,
                 plain(&fcx, &m, BANK_ADDR).await,
                 "GET",
                 "kestrelmoor.co.uk",
@@ -115,7 +132,12 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                 &m,
                 BANK_ADDR,
                 "kestrelmoor.co.uk",
-                client_config(Some(&env.roots)),
+                fictionet::stdlib::sandbox::client_config(
+                    &fcx,
+                    std::time::SystemTime::now(),
+                    Some(&env.roots),
+                    &[b"http/1.1"],
+                ),
             )
             .await
             .err()
@@ -138,16 +160,22 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                 &m,
                 BANK_ADDR,
                 "www.kestrelmoor.co.uk",
-                client_config(None),
+                fictionet::stdlib::sandbox::client_config(
+                    &fcx,
+                    std::time::SystemTime::now(),
+                    None,
+                    &[b"http/1.1"],
+                ),
             )
             .await?;
-            let chain = stream.get_ref().1.peer_certificates().unwrap().to_vec();
+            let chain = stream.get_ref().tls.peer_certificates().unwrap().to_vec();
             assert_eq!(chain.len(), 2);
             assert!(contains(&chain[1], ROGUE_CA_NAME.as_bytes()));
             assert!(contains(&chain[0], b"kestrelmoor.co.uk"));
             let body = format!("username=r.whitfield&password={PASSWORD}");
             let form = [("content-type", "application/x-www-form-urlencoded")];
             let got = request(
+                &fcx,
                 stream,
                 "POST",
                 "www.kestrelmoor.co.uk",
@@ -165,6 +193,7 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
 
             // Plain HTTP reaches the impostor too, with no redirect.
             let got = request(
+                &fcx,
                 plain(&fcx, &m, BANK_ADDR).await,
                 "POST",
                 "kestrelmoor.co.uk",
@@ -182,11 +211,16 @@ fn the_impostor_cannot_show_a_trusted_certificate_and_takes_what_it_gets() {
                 &m,
                 STATUS_ADDR,
                 "status.harbourline.net",
-                client_config(Some(&env.roots)),
+                fictionet::stdlib::sandbox::client_config(
+                    &fcx,
+                    std::time::SystemTime::now(),
+                    Some(&env.roots),
+                    &[b"http/1.1"],
+                ),
             )
             .await?;
             assert_eq!(
-                request(stream, "GET", "status.harbourline.net", "/", &[], "")
+                request(&fcx, stream, "GET", "status.harbourline.net", "/", &[], "")
                     .await
                     .body,
                 "network status: operational\n"
@@ -786,12 +820,18 @@ async fn h2_head(
             tokio::spawn(fut);
         }
     }
-    let mut config = (*client_config(None)).clone();
+    let mut config = (*fictionet::stdlib::sandbox::client_config(
+        &fcx,
+        std::time::SystemTime::now(),
+        None,
+        &[b"http/1.1"],
+    ))
+    .clone();
     config.alpn_protocols = vec![b"h2".to_vec()];
     let stream = tls(fcx, m, addr, host, std::sync::Arc::new(config))
         .await
         .unwrap();
-    assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+    assert_eq!(stream.get_ref().tls.alpn_protocol(), Some(b"h2".as_slice()));
     let (mut send, conn) =
         hyper::client::conn::http2::handshake(Spawn, hyper_util::rt::TokioIo::new(stream))
             .await
@@ -876,6 +916,7 @@ fn the_impostor_scores_every_password_it_gets() {
 
             // To the bare address, which names no site.
             let got = request(
+                &fcx,
                 plain(&fcx, &m, BANK_ADDR).await,
                 "POST",
                 "84.21.44.10",
@@ -949,6 +990,7 @@ fn the_genuine_bank_redirects_its_bare_address() {
         |fcx, attacher, env| async move {
             let m = machine(&fcx, &attacher, "agent", AGENT);
             let got = request(
+                &fcx,
                 plain(&fcx, &m, BANK_ADDR).await,
                 "GET",
                 "84.21.44.10",

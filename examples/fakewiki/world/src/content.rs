@@ -11,11 +11,8 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use fictionet::stdlib::web::{self, Body};
 use http::header::{CONTENT_LENGTH, HOST, USER_AGENT};
-use http::{HeaderName, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Empty, Full};
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
+use http::{Request, Response, StatusCode};
+use http_body_util::{BodyExt, Full};
 
 use crate::events::Page;
 
@@ -25,26 +22,16 @@ const TOPIC: &str = "x-fakewiki-topic";
 const SOURCE: &str = "x-fakewiki-source";
 const STANCE: &str = "x-fakewiki-stance";
 
-/// Headers that belong to one connection, which hyper must not see in an
-/// HTTP/2 response.
-const HOP_BY_HOP: [&str; 5] = [
-    "connection",
-    "keep-alive",
-    "transfer-encoding",
-    "proxy-connection",
-    "upgrade",
-];
-
 #[derive(Clone)]
 pub struct Content {
-    client: Client<HttpConnector, Empty<Bytes>>,
-    port: u16,
+    forward: web::Forward,
 }
 
 impl Content {
     pub fn new(port: u16) -> Content {
-        let client = Client::builder(TokioExecutor::new()).build_http();
-        Content { client, port }
+        Content {
+            forward: web::forward(format!("http://127.0.0.1:{port}").parse().unwrap()),
+        }
     }
 
     async fn serve(
@@ -57,22 +44,20 @@ impl Content {
             .cloned()
             .ok_or_else(|| fictionet::Error::msg("request without a web::Target"))?;
         let method = request.method().clone();
-        let path = request
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str().to_owned())
-            .unwrap_or_else(|| "/".into());
+        let uri = request.uri().clone();
         let ua = request.headers().get(USER_AGENT).cloned();
 
         let reply = async {
             let mut ask = Request::builder()
                 .method(method.clone())
-                .uri(format!("http://127.0.0.1:{}{}", self.port, path))
+                .uri(uri)
                 .header(HOST, target.host.as_str());
             if let Some(ua) = &ua {
                 ask = ask.header(USER_AGENT, ua);
             }
-            let answer = self.client.request(ask.body(Empty::new())?).await?;
+            let answer =
+                tower_service::Service::call(&mut self.forward.clone(), ask.body(Body::empty())?)
+                    .await?;
             let (parts, body) = answer.into_parts();
             let body = body.collect().await?.to_bytes();
             Ok::<_, fictionet::Error>((parts, body))
@@ -111,9 +96,7 @@ impl Content {
             bytes: 0,
             error: None,
         };
-        for name in HOP_BY_HOP {
-            parts.headers.remove(HeaderName::from_static(name));
-        }
+
         // main.py logged the length of the page, also for HEAD.
         let bytes = parts
             .headers

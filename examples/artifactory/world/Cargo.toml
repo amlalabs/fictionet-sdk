@@ -23,7 +23,6 @@ path = "src/main.rs"
 bytes = "1"
 fictionet = { path = "../../..", default-features = false }
 http = "1"
-rcgen = "0.13"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -7,8 +7,6 @@
 mod common;
 #[path = "common/done.rs"]
 mod done;
-#[path = "common/sandbox.rs"]
-mod sandbox;
 #[path = "common/timeout.rs"]
 mod timeout;
 #[path = "common/wait.rs"]
@@ -17,7 +15,7 @@ mod wait;
 mod world;
 
 use done::Done;
-use sandbox::{Machine, sandbox};
+use fictionet::stdlib::sandbox::{Machine, machine};
 use timeout::timeout;
 use world::world;
 
@@ -1044,7 +1042,7 @@ const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const PLC_ADDR: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 5);
 
 async fn lookup(fcx: &Cx, s: &Machine, name: &str) -> Option<Ipv4Addr> {
-    let mut socket = s.udp.bind(40000 + (fcx.random_u64() % 20000) as u16).ok()?;
+    let mut socket = s.udp.bind(0).ok()?;
     let mut q = Message::query();
     q.metadata.id = 5;
     q.add_query(Query::query(Name::from_ascii(name).ok()?, RecordType::A));
@@ -1102,7 +1100,7 @@ fn a_plc_and_a_web_server_on_one_net_with_observe_decoding_both() {
             })
             .start(&fcx, attachments)?;
 
-        let s = sandbox(&fcx, attacher.attach("operator")?, ME);
+        let s = machine(&fcx, attacher.attach("operator")?, ME);
         assert_eq!(lookup(&fcx, &s, "plc1.plant.test").await, Some(PLC_ADDR));
         let hmi_addr = lookup(&fcx, &s, "hmi.plant.test")
             .await
@@ -1269,7 +1267,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
                 },
             )
             .start(&fcx, attachments)?;
-        let s = sandbox(&fcx, attacher.attach("agent")?, ME);
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
         let mut conn = s
             .tcp
             .connect(&fcx, SocketAddr::new(Ipv4Addr::new(10, 40, 0, 1).into(), 7))
@@ -1300,7 +1298,7 @@ fn net_serves_udp_services_and_trusted_sandboxes() {
         );
 
         // The trusted sandbox at its fixed address, reached from the agent.
-        let boxed = sandbox(&fcx, attacher.attach("box")?, Ipv4Addr::new(10, 50, 0, 7));
+        let boxed = machine(&fcx, attacher.attach("box")?, Ipv4Addr::new(10, 50, 0, 7));
         let mut l = boxed.tcp.listen(22)?;
         fcx.spawn(move |fcx| async move {
             let mut c = l.accept(&fcx).await?;
@@ -1379,30 +1377,25 @@ fn a_tower_service_runs_as_a_handler() {
 // TLS by name
 
 /// A server config for `names`, and roots that trust it.
-fn tls_pair(names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls::RootCertStore>) {
-    let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    let ca_key = rcgen::KeyPair::generate().unwrap();
-    let ca = ca.self_signed(&ca_key).unwrap();
-    let leaf =
-        rcgen::CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
-            .unwrap();
-    let leaf_key = rcgen::KeyPair::generate().unwrap();
-    let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+fn tls_pair(fcx: &Cx, names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls::RootCertStore>) {
+    let ca = fictionet::stdlib::ca::Ca::new(fcx, "Test CA").unwrap();
+    let leaf = ca
+        .issue(
+            fcx,
+            names,
+            fictionet::stdlib::x509::Validity {
+                not_before: fictionet::stdlib::x509::Time::from_unix(946684800).unwrap(),
+                not_after: fictionet::stdlib::x509::Time::from_unix(4102444800).unwrap(),
+            },
+        )
+        .unwrap();
     let mut roots = rustls::RootCertStore::empty();
-    roots.add(ca.der().clone()).unwrap();
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
-        leaf_key.serialize_der(),
-    ));
-    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_no_client_auth()
-    .with_single_cert(vec![leaf.der().clone()], key)
-    .unwrap();
-    (Arc::new(config), Arc::new(roots))
+    roots.add(ca.cert_der()).unwrap();
+    (
+        leaf.server_config(fcx, std::time::SystemTime::now())
+            .unwrap(),
+        Arc::new(roots),
+    )
 }
 
 /// A connection whose TLS handshake is cut short by a cancel ends as
@@ -1410,7 +1403,7 @@ fn tls_pair(names: &[&str]) -> (Arc<rustls::ServerConfig>, Arc<rustls::RootCertS
 #[test]
 fn a_cancel_during_the_tls_handshake_is_a_cancel() {
     world(Duration::from_secs(60), |fcx| async move {
-        let (config, _roots) = tls_pair(&["a.test"]);
+        let (config, _roots) = tls_pair(&fcx, &["a.test"]);
         let (server, _su, client, _cu) = two_machines(&fcx);
         let mut listener = server.listen(443)?;
         let (tx, rx) = mpsc::channel();
@@ -1492,13 +1485,13 @@ fn net_routes_tls_by_name_to_each_service() {
             Ok(Flow::Continue)
         }
     }
-    let (config, roots) = tls_pair(&["a.test", "b.test"]);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
     let result = rt.block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        let (config, roots) = tls_pair(&fcx, &["a.test", "b.test"]);
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
         let (ca, cb) = (config.clone(), config.clone());
@@ -1512,7 +1505,7 @@ fn net_routes_tls_by_name_to_each_service() {
                     .tls(6514, "b.test", move |_| cb.clone(), Arc::new(()), || Upper),
             )
             .start(&fcx, attachments)?;
-        let s = sandbox(&fcx, attacher.attach("agent")?, ME);
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
         let connect = |name: &'static str| {
             let roots = roots.clone();
             let s = &s;
@@ -1790,13 +1783,13 @@ fn the_harness_resumes_after_starttls() {
 
 #[test]
 fn net_performs_starttls_for_a_service_that_asks() {
-    let (config, roots) = tls_pair(&["mail.test"]);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
     let result = rt.block_on(run(fictionet::Seed::random(), move |fcx| async move {
+        let (config, roots) = tls_pair(&fcx, &["mail.test"]);
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 25);
@@ -1812,7 +1805,7 @@ fn net_performs_starttls_for_a_service_that_asks() {
                 )
             })
             .start(&fcx, attachments)?;
-        let s = sandbox(&fcx, attacher.attach("agent")?, ME);
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
         let mut tcp = s
             .tcp
             .connect(&fcx, SocketAddr::new(addr.into(), 25))
@@ -2388,7 +2381,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
             .ipv4_only()
             .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
             .start(&fcx, attachments)?;
-        let s = sandbox(&fcx, attacher.attach("agent")?, ME);
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
         let mut b = s.tcp.connect(&fcx, to).await?;
         b.write_all(&fcx, b"hi\nfail\n").await?;
         assert_eq!(read_some(&fcx, &mut b, 10).await, b"fine\n");
@@ -2407,7 +2400,7 @@ fn an_error_closes_only_its_connection_and_a_panic_ends_the_run() {
                 .ipv4_only()
                 .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Fragile))
                 .start(&fcx, attachments)?;
-            let s = sandbox(&fcx, attacher.attach("agent")?, ME);
+            let s = machine(&fcx, attacher.attach("agent")?, ME);
             let mut a = s.tcp.connect(&fcx, to).await?;
             a.write_all(&fcx, b"boom\n").await?;
             fcx.sleep(Duration::from_secs(30)).await?;
@@ -2474,7 +2467,7 @@ fn net_caps_connections_per_service_and_bytes_per_sandbox() {
                     .tcp_with(8, Arc::new(()), || Wide, wide)
             })
             .start(&fcx, attachments)?;
-        let s = sandbox(&fcx, attacher.attach("agent")?, ME);
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
         let mut a = s.tcp.connect(&fcx, SocketAddr::new(addr.into(), 7)).await?;
         assert_eq!(read_some(&fcx, &mut a, 6).await, b"hello\n");
         let mut b = s.tcp.connect(&fcx, SocketAddr::new(addr.into(), 7)).await?;
@@ -2821,7 +2814,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
             .start(&fcx, attachments)?;
 
         // The VM: its own stack at its LAN address, no DHCP.
-        let vm = sandbox(&fcx, attacher.attach("ws01")?, ws);
+        let vm = machine(&fcx, attacher.attach("ws01")?, ws);
         // DNS at the LAN's first address.
         let mut socket = vm.udp.bind(40001)?;
         let mut q = Message::query();
@@ -2863,7 +2856,7 @@ fn hosts_and_members_share_a_lan_on_the_net() {
 
         // The agent, on the sandboxes' subnet, reaches the LAN through the
         // router.
-        let agent = sandbox(&fcx, attacher.attach("agent")?, ME);
+        let agent = machine(&fcx, attacher.attach("agent")?, ME);
         let mut conn = agent
             .tcp
             .connect(&fcx, SocketAddr::new(dc.into(), 389))
@@ -3024,7 +3017,7 @@ fn net_keeps_one_budget_per_attachment() {
         let _ = fcx
             .region(|fcx| async move {
                 let (v4, v6, _other) = ip::split_versions(&fcx, first_attacher.attach("a")?);
-                let (a4, a6) = (sandbox(&fcx, v4, ME), sandbox(&fcx, v6, me6));
+                let (a4, a6) = (machine(&fcx, v4, ME), machine(&fcx, v6, me6));
                 let mut wide = a4
                     .tcp
                     .connect(&fcx, SocketAddr::new(addr.into(), 8))
@@ -3054,7 +3047,7 @@ fn net_keeps_one_budget_per_attachment() {
         let a = budgets.lock().unwrap()[0].clone().expect("a budget");
 
         // Another sandbox at the same address: its own budget.
-        let b = sandbox(&fcx, attacher.attach("b")?, ME);
+        let b = machine(&fcx, attacher.attach("b")?, ME);
         let mut wide = b.tcp.connect(&fcx, SocketAddr::new(addr.into(), 8)).await?;
         assert_eq!(read_some(&fcx, &mut wide, 6).await, b"hello\n");
         let _spied = b.tcp.connect(&fcx, SocketAddr::new(addr.into(), 9)).await?;
@@ -3099,7 +3092,7 @@ fn a_lan_member_detaches_like_any_sandbox() {
         let first_attacher = &attacher;
         let _ = fcx
             .region(|fcx| async move {
-                let vm = sandbox(&fcx, first_attacher.attach("ws01")?, ws);
+                let vm = machine(&fcx, first_attacher.attach("ws01")?, ws);
                 let mut conn = vm.tcp.connect(&fcx, to).await?;
                 assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
                 // Leaving the region takes the VM away without a word to
@@ -3122,7 +3115,7 @@ fn a_lan_member_detaches_like_any_sandbox() {
         );
 
         // The member attaches again, as a new sandbox.
-        let vm = sandbox(&fcx, attacher.attach("ws01")?, ws);
+        let vm = machine(&fcx, attacher.attach("ws01")?, ws);
         let mut conn = vm.tcp.connect(&fcx, to).await?;
         assert_eq!(read_some(&fcx, &mut conn, 6).await, b"hello\n");
         let attached = kept.of("net", "attached");
@@ -3147,7 +3140,7 @@ fn net_records_connections_on_a_tcp_port() {
             .ipv4_only()
             .host("svc", |h| h.at(addr).tcp(7, Arc::new(()), || Echo))
             .start(&fcx, attachments)?;
-        let s = sandbox(&fcx, attacher.attach("agent")?, ME);
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
         let mut conn = s.tcp.connect(&fcx, SocketAddr::new(addr.into(), 7)).await?;
         conn.write_all(&fcx, b"quit\n").await?;
         assert_eq!(read_some(&fcx, &mut conn, 10).await, b"hello\nbye\n");
@@ -3165,8 +3158,8 @@ fn net_records_connections_on_a_tcp_port() {
 /// the service's default of 10 seconds.
 #[test]
 fn net_limits_a_starttls_handshake() {
-    let (config, _roots) = tls_pair(&["mail.test"]);
     world(Duration::from_secs(60), move |fcx| async move {
+        let (config, _roots) = tls_pair(&fcx, &["mail.test"]);
         let kept = fcx.events();
         let (attacher, attachments) = fictionet::attachments();
         let addr = Ipv4Addr::new(10, 40, 0, 25);
@@ -3183,7 +3176,7 @@ fn net_limits_a_starttls_handshake() {
                     .tcp_with(25, Arc::new(()), || Mail { tls: false }, opts)
             })
             .start(&fcx, attachments)?;
-        let s = sandbox(&fcx, attacher.attach("agent")?, ME);
+        let s = machine(&fcx, attacher.attach("agent")?, ME);
         let mut conn = s
             .tcp
             .connect(&fcx, SocketAddr::new(addr.into(), 25))
@@ -3501,4 +3494,23 @@ fn http1_body_timeout_records_an_error() {
     assert!(h.events().iter().any(|e| e.is("http", "error")
         && e.str("cause") == Some("timeout")
         && e.str("detail") == Some("request body timed out")));
+}
+
+#[test]
+fn udp_ephemeral_ports_skip_bound_ports_and_reuse_released_ports() {
+    world(Duration::from_secs(5), |fcx| async move {
+        let (_, endpoint, _, _) = two_machines(&fcx);
+        let reserved = endpoint.bind(49152)?;
+        let mut sockets = Vec::new();
+        for port in 49153..=u16::MAX {
+            let socket = endpoint.bind(0)?;
+            assert_eq!(socket.local_addr(), SocketAddr::new(SERVER.into(), port));
+            sockets.push(socket);
+        }
+        assert!(endpoint.bind(0).is_err());
+        assert!(endpoint.bind(49152).is_err());
+        drop(reserved);
+        assert_eq!(endpoint.bind(0)?.local_addr().port(), 49152);
+        Ok(())
+    });
 }

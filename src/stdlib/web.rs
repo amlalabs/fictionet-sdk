@@ -641,7 +641,7 @@ impl Sites {
             .resolve(move |name| {
                 site_for(name).map(|mut site| {
                     if let Some(date) = date {
-                        site.website = site.website.date(date);
+                        site = site.date(date);
                     }
                     site.into_host(name)
                 })
@@ -703,6 +703,15 @@ impl Site {
             at: None,
             at_v6: None,
             family: Family::Both,
+        }
+    }
+
+    /// Sets the site's date at the start of the run. Responses send this
+    /// date plus elapsed run time in their `Date` header.
+    pub fn date(self, start: std::time::SystemTime) -> Site {
+        Site {
+            website: self.website.date(start),
+            ..self
         }
     }
 
@@ -895,7 +904,7 @@ impl tower_service::Service<Request<Body>> for Proxy {
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        Box::pin(forward(self.client.clone(), request))
+        Box::pin(send_upstream(self.client.clone(), request))
     }
 }
 
@@ -952,7 +961,7 @@ fn strip_hop_by_hop(headers: &mut http::HeaderMap) {
 
 /// Forwards one request to its [`Target`] over the world's own network.
 #[cfg(feature = "tokio")]
-async fn forward(
+async fn send_upstream(
     client: Arc<ProxyClient>,
     request: Request<Body>,
 ) -> Result<Response<hyper::body::Incoming>, Error> {
@@ -990,4 +999,82 @@ async fn forward(
         .map_err(|e| httpd::BadGateway(format!("{}: {e}", target.host)))?;
     strip_hop_by_hop(response.headers_mut());
     Ok(response)
+}
+
+/// Forwards requests to a fixed HTTP or HTTPS origin through the world's
+/// network. Paths, queries, bodies, and the original `Host` header are
+/// preserved. Connection-specific headers are removed in both directions.
+/// The upstream must contain a scheme and authority. Its path is ignored.
+/// This handler requires a tokio runtime and real host I/O.
+#[cfg(feature = "tokio")]
+pub fn forward(upstream: http::Uri) -> Forward {
+    Forward {
+        upstream,
+        client: Arc::new(proxy_client()),
+    }
+}
+
+/// A handler that forwards to one fixed origin.
+#[cfg(feature = "tokio")]
+#[derive(Clone)]
+pub struct Forward {
+    upstream: http::Uri,
+    client: Arc<ProxyClient>,
+}
+
+#[cfg(feature = "tokio")]
+impl Handler for Forward {
+    fn call(&self, request: Request<Body>, ex: &mut httpd::Exchange<'_>) -> httpd::Reply {
+        httpd::tower(self.clone()).call(request, ex)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl tower_service::Service<Request<Body>> for Forward {
+    type Response = Response<hyper::body::Incoming>;
+    type Error = Error;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let client = self.client.clone();
+        let upstream = self.upstream.clone();
+        Box::pin(async move {
+            let (mut parts, body) = request.into_parts();
+            parts.uri = http::Uri::builder()
+                .scheme(
+                    upstream
+                        .scheme()
+                        .cloned()
+                        .ok_or_else(|| Error::msg("upstream has no scheme"))?,
+                )
+                .authority(
+                    upstream
+                        .authority()
+                        .cloned()
+                        .ok_or_else(|| Error::msg("upstream has no authority"))?,
+                )
+                .path_and_query(
+                    parts
+                        .uri
+                        .path_and_query()
+                        .map(|p| p.as_str())
+                        .unwrap_or("/"),
+                )
+                .build()?;
+            parts.version = http::Version::HTTP_11;
+            parts.extensions = http::Extensions::new();
+            strip_hop_by_hop(&mut parts.headers);
+            let mut response = client
+                .request(Request::from_parts(parts, body))
+                .await
+                .map_err(|e| httpd::BadGateway(e.to_string()))?;
+            strip_hop_by_hop(response.headers_mut());
+            Ok(response)
+        })
+    }
 }

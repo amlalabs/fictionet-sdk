@@ -1,6 +1,12 @@
-use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+use fictionet::{
+    Cx,
+    stdlib::{
+        ca::Ca,
+        x509::{Time, Validity},
+    },
+};
 use rustls::RootCertStore;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// A server certificate and the roots that trust it.
 pub struct Certs {
@@ -10,21 +16,23 @@ pub struct Certs {
 }
 
 /// Makes a CA and a server certificate for the names.
-pub fn certs(names: &[&str]) -> Certs {
-    let mut ca = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_key = KeyPair::generate().unwrap();
-    let ca = ca.self_signed(&ca_key).unwrap();
-    let mut leaf =
-        CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap();
-    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let leaf_key = KeyPair::generate().unwrap();
-    let leaf = leaf.signed_by(&leaf_key, &ca, &ca_key).unwrap();
+pub fn certs(fcx: &Cx, names: &[&str]) -> Certs {
+    let ca = Ca::new(fcx, "Test CA").unwrap();
+    let leaf = ca
+        .issue(
+            fcx,
+            names,
+            Validity {
+                not_before: Time::from_unix(946684800).unwrap(),
+                not_after: Time::from_unix(4102444800).unwrap(),
+            },
+        )
+        .unwrap();
     let mut roots = RootCertStore::empty();
-    roots.add(ca.der().clone()).unwrap();
+    roots.add(ca.cert_der()).unwrap();
     Certs {
         roots,
-        chain: vec![leaf.der().clone()],
-        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+        chain: leaf.chain,
+        key: leaf.key,
     }
 }
