@@ -228,8 +228,12 @@ pub mod oid {
     pub const EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
     /// 1.2.840.10045.3.1.7, the P-256 curve.
     pub const PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+    /// 1.3.132.0.34, the P-384 curve.
+    pub const SECP384R1: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
     /// 1.2.840.10045.4.3.2, an ECDSA signature over SHA-256.
     pub const ECDSA_WITH_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+    /// 1.2.840.10045.4.3.3, an ECDSA signature over SHA-384.
+    pub const ECDSA_WITH_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
     /// 1.3.101.112, an Ed25519 key or signature.
     pub const ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 }
@@ -3210,7 +3214,9 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             (oid::RSA_ENCRYPTION, "1.2.840.113549.1.1.1"),
             (oid::SHA256_WITH_RSA, "1.2.840.113549.1.1.11"),
             (oid::PRIME256V1, "1.2.840.10045.3.1.7"),
+            (oid::SECP384R1, "1.3.132.0.34"),
             (oid::ECDSA_WITH_SHA256, "1.2.840.10045.4.3.2"),
+            (oid::ECDSA_WITH_SHA384, "1.2.840.10045.4.3.3"),
         ] {
             assert_eq!(oid(bytes).to_string(), dotted);
         }

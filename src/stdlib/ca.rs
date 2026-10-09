@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use fictionet::stdlib::asn1::{BitString, Oid, StringKind};
+use fictionet::stdlib::asn1::{BitString, Oid, StringKind, Writer};
 use fictionet::stdlib::codec::Wire;
 use fictionet::stdlib::{tls, x509};
 use fictionet::{Cx, Error};
@@ -76,7 +76,7 @@ impl Key {
         x509::AlgorithmIdentifier {
             oid: id(match self {
                 Self::P256(_) => oid::ECDSA_WITH_SHA256,
-                Self::P384(_) => &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03],
+                Self::P384(_) => oid::ECDSA_WITH_SHA384,
             }),
             parameters: None,
         }
@@ -98,10 +98,12 @@ impl Key {
     }
 
     fn parameters(&self) -> Vec<u8> {
-        match self {
-            Self::P256(_) => vec![6, 8, 0x2a, 0x86, 0x48, 0xce, 0x3d, 3, 1, 7],
-            Self::P384(_) => vec![6, 5, 0x2b, 0x81, 4, 0, 0x22],
-        }
+        let mut writer = Writer::new();
+        writer.oid(&id(match self {
+            Self::P256(_) => oid::PRIME256V1,
+            Self::P384(_) => oid::SECP384R1,
+        }));
+        writer.finish().expect("a certificate curve identifier")
     }
 
     fn der(&self) -> Result<p256::pkcs8::SecretDocument, Error> {
