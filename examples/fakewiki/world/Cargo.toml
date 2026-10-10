@@ -23,5 +23,4 @@ tower-service = "0.3"
 debug = 1
 
 [dev-dependencies]
-fictionet = { path = "../../..", features = ["web-proxy"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }

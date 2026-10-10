@@ -234,14 +234,8 @@ jobs:
         include:
           - dockerfile: deploy/Dockerfile
             targets: attach web-world agent
-          - dockerfile: tests/docker/web/Dockerfile
-            targets: runtime agent
-          - dockerfile: tests/docker/ping/Dockerfile
-            targets: runtime agent
           - dockerfile: tests/docker/proxy/Dockerfile
             targets: runtime agent
-          - dockerfile: tests/docker/tcpudp/Dockerfile
-            targets: "-"
           - dockerfile: examples/scan/docker/Dockerfile
             targets: fictionet container scanner
           - dockerfile: examples/fakewiki/docker/Dockerfile

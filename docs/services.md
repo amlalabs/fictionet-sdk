@@ -271,8 +271,9 @@ Net::new()
 ```
 
 Sites of several hosts at one address share the port as virtual hosts:
-the first host's `Server` takes in the others through `Accept::share`. `Net`
-itself knows nothing of HTTP, so a copy of `httpd` with its own handlers
+the first host's `Server` takes in the others through
+[`PortServer::share`](../src/stdlib/net.rs#L274). `Net` itself knows nothing
+of HTTP, so a copy of `httpd` with its own handlers
 plugs in the same way.
 
 `Http1` speaks HTTP/1.0 and 1.1 on the stdlib's `http1` decoder. HTTP/2

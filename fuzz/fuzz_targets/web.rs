@@ -66,8 +66,9 @@ fn dst(to: u8) -> Ipv4Addr {
 }
 
 fuzz_target!(|steps: Vec<Step>| {
+    let cert = fictionet_fuzz::cert();
     world(move |fcx| async move {
-        let attacher = serve(&fcx);
+        let attacher = serve(&fcx, cert);
         let mut end = attacher.attach("agent").unwrap();
         let me = IpAddr::V4(ME);
         for step in steps {

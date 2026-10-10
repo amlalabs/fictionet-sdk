@@ -14,6 +14,35 @@ use fictionet::{Cx, block_on, run};
 pub mod doors;
 pub mod web;
 
+/// The cached certificate and key for the TLS fuzz sites.
+pub fn cert() -> &'static fictionet::stdlib::ca::Leaf {
+    static CERT: std::sync::OnceLock<fictionet::stdlib::ca::Leaf> = std::sync::OnceLock::new();
+    CERT.get_or_init(make_cert)
+}
+
+fn make_cert() -> fictionet::stdlib::ca::Leaf {
+    use fictionet::stdlib::{ca::Ca, x509};
+
+    let mut leaf = None;
+    world_seeded(0, |fcx| {
+        leaf = Some(
+            Ca::new(&fcx, "Fuzz CA")
+                .unwrap()
+                .issue(
+                    &fcx,
+                    &["tls.test", "both.test", "site.test"],
+                    x509::Validity {
+                        not_before: x509::Time::from_unix(1_700_000_000).unwrap(),
+                        not_after: x509::Time::from_unix(2_000_000_000).unwrap(),
+                    },
+                )
+                .unwrap(),
+        );
+        async {}
+    });
+    leaf.unwrap()
+}
+
 /// Runs a world for one input. `f` gets the world's `Cx`. When `f`
 /// returns, the world is cancelled, and every task in it stops.
 pub fn world<F, Fut>(f: F)
@@ -223,4 +252,54 @@ pub fn fix_checksums(p: &mut [u8]) {
         transport_checksum(src, dst, proto, t)
     };
     t[at_sum..at_sum + 2].copy_from_slice(&sum.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::client::danger::ServerCertVerifier;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn tls_fixture_is_repeatable_and_valid_for_every_site_and_clock() {
+        let cert = cert();
+        let repeated = make_cert();
+        assert_eq!(cert.chain, repeated.chain);
+        assert_eq!(cert.key.secret_der(), repeated.key.secret_der());
+        assert!(std::ptr::eq(cert, super::cert()));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.chain[1].clone()).unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        for time in [1_800_000_000, 1_900_000_000] {
+            for name in ["tls.test", "both.test", "site.test"] {
+                verifier
+                    .verify_server_cert(
+                        &cert.chain[0],
+                        &cert.chain[1..],
+                        &name.try_into().unwrap(),
+                        &[],
+                        rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(time)),
+                    )
+                    .unwrap();
+            }
+            world(move |fcx| async move {
+                fictionet::stdlib::tls::config_builder(
+                    &fcx,
+                    std::time::UNIX_EPOCH + Duration::from_secs(time),
+                )
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(cert.chain.clone(), cert.key.clone_key())
+                .unwrap();
+            });
+        }
+    }
 }

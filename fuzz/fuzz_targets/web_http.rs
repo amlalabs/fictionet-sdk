@@ -135,8 +135,9 @@ fuzz_target!(|data: &[u8]| {
     let Some(input) = Input::read(data) else {
         return;
     };
+    let cert = fictionet_fuzz::cert();
     world(move |fcx| async move {
-        let attacher = serve(&fcx);
+        let attacher = serve(&fcx, cert);
         let client = Client::new(&fcx, &attacher, "agent", Ipv4Addr::new(10, 0, 0, 2));
         let (addr, port) = if input.dns {
             (Ipv4Addr::new(10, 0, 0, 1), 53)

@@ -14,13 +14,10 @@ bytes = "1"
 fictionet = { path = ".." }
 http = "1"
 http-body-util = "0.1"
-hyper = { version = "1", default-features = false }
-libc = "0.2"
 libfuzzer-sys = "0.4"
-rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tower-service = "0.3"
-tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros"] }
+tokio = { version = "1", features = ["io-util"] }
 
 # Not part of the SDK's workspace.
 [workspace]

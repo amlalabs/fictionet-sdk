@@ -5,14 +5,14 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::{BodyExt, Full, Limited};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::CertificateDer;
 
 use fictionet::stdlib::{tls, web};
 use fictionet::{Attacher, Cx, attachments};
@@ -31,17 +31,6 @@ pub const NAMES: [&str; 8] = [
     "x.wild.test",
     "nxdomain.test",
 ];
-
-/// The certificate for the TLS sites, and its key.
-pub fn cert() -> &'static (Vec<u8>, Vec<u8>) {
-    static CERT: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
-    CERT.get_or_init(|| {
-        let c =
-            rcgen::generate_simple_self_signed(vec!["tls.test".to_owned(), "both.test".to_owned()])
-                .unwrap();
-        (c.cert.der().to_vec(), c.key_pair.serialize_der())
-    })
-}
 
 /// A site that reads the request body (up to 1 MiB) and answers with its
 /// size, the method, the path and the version.
@@ -95,17 +84,13 @@ impl tower_service::Service<Request<fictionet::stdlib::web::Body>> for Broken {
 }
 
 /// Starts the sites, with events on, and returns the attacher.
-pub fn serve(fcx: &Cx) -> Attacher {
-    let (der, key) = cert();
+pub fn serve(fcx: &Cx, cert: &fictionet::stdlib::ca::Leaf) -> Attacher {
     let config = Arc::new(
         tls::config_builder(fcx, UNIX_EPOCH + Duration::from_secs(1_800_000_000))
             .with_safe_default_protocol_versions()
             .unwrap()
             .with_no_client_auth()
-            .with_single_cert(
-                vec![CertificateDer::from(der.clone())],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.clone())),
-            )
+            .with_single_cert(cert.chain.clone(), cert.key.clone_key())
             .unwrap(),
     );
     let sites = web::Sites::new(move |host| {
