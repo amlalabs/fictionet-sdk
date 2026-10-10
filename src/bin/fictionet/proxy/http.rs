@@ -9,6 +9,7 @@ use fictionet::relay::proxy::http::{
     Answer, MAX_HEAD, Reject, Request, Target, error_response, forward_head, parse_request,
     rewrite_response,
 };
+use fictionet::stdlib::codec::ascii::is_tchar;
 use fictionet::stdlib::tcp::TcpConnection;
 use fictionet::tokio::{Compat, ConnectionTokioExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -31,7 +32,8 @@ pub(crate) fn status_for(fail: &Fail) -> u16 {
     }
 }
 
-/// Reads from `r` into `buf` until `parse` finds a whole head in it.
+/// Reads from `r` into `buf`, checking each complete line once.
+/// Calls `parse` on the start line and on the whole head at its empty line.
 /// Returns what `parse` returned. `Ok(None)`: the other side closed first.
 /// `buf` never grows past [`MAX_HEAD`], so a head that `parse` finds is at
 /// most that long; a longer one gets `too_long()`.
@@ -45,12 +47,43 @@ where
     R: AsyncRead + Unpin,
 {
     let mut chunk = [0u8; 8192];
+    let mut scanned = 0;
+    let mut line_start = 0;
+    let mut first = true;
     loop {
-        if !buf.is_empty() {
-            match parse(buf) {
-                Ok(Some(t)) => return Ok(Ok(Some(t))),
-                Ok(None) => {}
-                Err(e) => return Ok(Err(e)),
+        while scanned < buf.len() {
+            let byte = buf[scanned];
+            scanned += 1;
+            if byte != b'\n' {
+                continue;
+            }
+            let line = &buf[line_start..scanned - 1];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            line_start = scanned;
+            if first {
+                if line.is_empty() {
+                    continue;
+                }
+                // The parser checks the request or status line, without
+                // needing a second copy of either grammar here.
+                if let Err(e) = parse(&buf[..scanned]) {
+                    return Ok(Err(e));
+                }
+                first = false;
+            } else if line.is_empty() {
+                return Ok(parse(buf));
+            } else {
+                let valid = line.iter().position(|b| *b == b':').is_some_and(|colon| {
+                    colon != 0
+                        && line[..colon].iter().copied().all(is_tchar)
+                        && line[colon + 1..]
+                            .iter()
+                            .all(|&b| b == b'\t' || (b >= b' ' && b != 127))
+                });
+                if !valid {
+                    // Keep the parser's error wording for malformed fields.
+                    return Ok(parse(&buf[..scanned]));
+                }
             }
         }
         if buf.len() >= MAX_HEAD {
@@ -284,6 +317,94 @@ mod tests {
         let start = b"GET http://a/ HTTP/1.1\r\nHost: a\r\nX: ";
         let end = b"\r\n\r\n";
         [&start[..], &vec![b'y'; len - start.len() - end.len()], end].concat()
+    }
+
+    #[tokio::test]
+    async fn fragmented_heads_are_parsed_only_at_line_boundaries() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::ReadBuf;
+
+        struct Bytes<'a>(&'a [u8]);
+        impl AsyncRead for Bytes<'_> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if let Some((&byte, rest)) = self.0.split_first() {
+                    buf.put_slice(&[byte]);
+                    self.0 = rest;
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+        let input = b"\n\r\nGET http://a/ HTTP/1.1\nHost: a\r\nX: one\nY: two\r\n\nbody";
+        let mut reader = Bytes(input);
+        let mut buf = Vec::new();
+        let mut parsed_bytes = 0;
+        let found = read_head(
+            &mut reader,
+            &mut buf,
+            |bytes| {
+                parsed_bytes += bytes.len();
+                parse_request(bytes)
+            },
+            || panic!("short head"),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(found, parse_request(input).unwrap().unwrap());
+        assert_eq!(reader.0, b"body");
+        assert!(parsed_bytes <= 2 * found.1, "parsed {parsed_bytes} bytes");
+    }
+
+    #[tokio::test]
+    async fn complete_invalid_lines_fail_without_a_head_terminator() {
+        for input in [
+            &b"bad request\n"[..],
+            b"GET http://a/ HTTP/1.1\nMissing colon\n",
+            b"GET http://a/ HTTP/1.1\nBad Name: value\n",
+            b"GET http://a/ HTTP/1.1\nX: bad\0value\n",
+        ] {
+            let mut reader = input;
+            let result = read_head(&mut reader, &mut Vec::new(), parse_request, || {
+                panic!("short head")
+            })
+            .await
+            .unwrap();
+            assert_eq!(result, parse_request(input));
+            assert!(result.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_interim_and_final_answers_keep_the_body() {
+        let input = b"\r\nHTTP/1.1 100 Continue\n\nHTTP/1.1 200 OK\r\nX: \xff\r\n\r\nbody";
+        let mut buf = input.to_vec();
+        let mut reader = &b""[..];
+        let interim = read_head(&mut reader, &mut buf, rewrite_response, || {
+            panic!("short head")
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(interim.interim);
+        assert_eq!(interim.status, 100);
+        buf.drain(..interim.len);
+        let answer = read_head(&mut reader, &mut buf, rewrite_response, || {
+            panic!("short head")
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(!answer.interim);
+        assert_eq!(answer.status, 200);
+        assert_eq!(&buf[answer.len..], b"body");
     }
 
     #[test]

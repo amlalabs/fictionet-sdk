@@ -1966,7 +1966,10 @@ mod tests {
         ] {
             let local: SocketAddr = local.parse().unwrap();
             let peer: SocketAddr = peer.parse().unwrap();
-            let s = new_socket(MIN_BUFFER).0;
+            let s = stcp::Socket::new(
+                stcp::SocketBuffer::new(vec![0; MIN_BUFFER]),
+                stcp::SocketBuffer::new(vec![0; MIN_BUFFER]),
+            );
             let mut c = Conn::new(local, peer, Side::Server);
             c.irs = Some(u32::MAX - MIN_BUFFER as u32);
             c.read = 19;

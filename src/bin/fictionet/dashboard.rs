@@ -19,7 +19,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fictionet::relay::observer::Client;
 use fictionet::relay::proxy::auth::Token;
@@ -337,23 +337,42 @@ impl Auth {
     }
 }
 
-fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io::Result<()> {
-    conn.set_read_timeout(Some(Duration::from_secs(10)))?;
-    // A browser that stops reading is given up on.
-    conn.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let _ = conn.set_nodelay(true);
+/// Reads one bounded request head before its deadline.
+fn read_head(
+    deadline: Instant,
+    mut read: impl FnMut(Duration, &mut [u8]) -> io::Result<usize>,
+) -> io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
         if buf.len() > 16 << 10 {
-            return Ok(());
+            return Ok(None);
         }
-        let n = conn.read(&mut chunk)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let n = read(remaining, &mut chunk)?;
         if n == 0 {
-            return Ok(());
+            return Ok(None);
         }
         buf.extend_from_slice(&chunk[..n]);
     }
+    Ok(Some(buf))
+}
+
+fn serve(world: &str, bound: SocketAddr, mut conn: TcpStream, auth: &Auth) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    // A browser that stops reading is given up on.
+    conn.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let _ = conn.set_nodelay(true);
+    let Some(buf) = read_head(deadline, |remaining, chunk| {
+        conn.set_read_timeout(Some(remaining))?;
+        conn.read(chunk)
+    })?
+    else {
+        return Ok(());
+    };
     let text = "text/plain; charset=utf-8";
     let Some(req) = parse_request(&buf) else {
         return Ok(());
@@ -734,6 +753,22 @@ fn stream(mut client: Client, conn: TcpStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_progress_cannot_extend_the_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let mut reads = 0;
+        let result = read_head(deadline, |remaining, chunk| {
+            reads += 1;
+            assert_eq!(reads, 1, "read again after the deadline");
+            assert!(remaining <= Duration::from_millis(20));
+            std::thread::sleep(remaining + Duration::from_millis(1));
+            chunk[0] = b'G';
+            Ok(1)
+        })
+        .unwrap();
+        assert!(result.is_none());
+    }
 
     #[test]
     fn api_paths_become_observe_requests() {
