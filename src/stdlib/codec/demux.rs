@@ -12,7 +12,7 @@ struct Entry<D: Decode> {
     error: Option<Fail<D::Error>>,
 }
 
-/// Keyed streams under a shared unread-byte and held-state budget.
+/// Keyed streams under a shared budget for input allocations and decoder state.
 /// Stream count is bounded by `max_streams`. The total is bounded by
 /// `max_bytes` through this owner's operations. Decoder growth is checked
 /// after each drain. An over-budget stream is released and its key stays
@@ -49,7 +49,7 @@ impl<K: Ord + Clone, D: Decode, F: FnMut(&K) -> D> Demux<K, D, F> {
         }
     }
     fn bytes(stream: &Stream<D>) -> usize {
-        stream.buffered().saturating_add(stream.held())
+        stream.allocated().saturating_add(stream.held())
     }
     /// Opens a stream on first use and accepts what fits under both limits.
     /// Zero with nonempty input means the caller must drain, remove, or refuse.
@@ -57,14 +57,21 @@ impl<K: Ord + Clone, D: Decode, F: FnMut(&K) -> D> Demux<K, D, F> {
     /// After EOF or completion, takes and drops all new bytes like [`Stream::push`].
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, key: &K, bytes: &[u8]) -> usize {
+        self.push_with_budget(key, bytes, usize::MAX)
+    }
+    /// Accepts input while adding at most `growth` bytes to the shared charge.
+    /// Reuses allocated capacity before reserving more storage.
+    #[must_use = "bytes past the returned count were not taken"]
+    pub fn push_with_budget(&mut self, key: &K, bytes: &[u8], growth: usize) -> usize {
         let mut total = self.total();
+        let limit = self.max_bytes.min(total.saturating_add(growth));
         if !self.streams.contains_key(key) {
             if self.streams.len() >= self.max_streams {
                 return 0;
             }
             let dec = (self.make)(key);
             let held = dec.held();
-            if held > self.max_bytes.saturating_sub(total) {
+            if held > limit.saturating_sub(total) {
                 return 0;
             }
             total = total.saturating_add(held);
@@ -78,7 +85,7 @@ impl<K: Ord + Clone, D: Decode, F: FnMut(&K) -> D> Demux<K, D, F> {
             );
             self.ready.insert(key.clone());
         }
-        let room = self.max_bytes.saturating_sub(total);
+        let room = limit.saturating_sub(total);
         let Some(stream) = self
             .streams
             .get_mut(key)
@@ -88,11 +95,7 @@ impl<K: Ord + Clone, D: Decode, F: FnMut(&K) -> D> Demux<K, D, F> {
             return bytes.len();
         };
         let before = Self::bytes(stream);
-        let n = if stream.is_done() || stream.is_eof() {
-            stream.push(bytes)
-        } else {
-            stream.push(bytes.get(..room).unwrap_or(bytes))
-        };
+        let n = stream.push_with_budget(bytes, room);
         self.total.set(
             total
                 .saturating_sub(before)
@@ -141,7 +144,7 @@ impl<K: Ord + Clone, D: Decode, F: FnMut(&K) -> D> Demux<K, D, F> {
         self.ready.insert(key.clone());
         Some(stream)
     }
-    /// The cached sum of unread bytes and decoder-held state.
+    /// The cached sum of input allocations and decoder-held state.
     /// After `get_mut`, only that stream's delta is checked. Saturates on overflow.
     pub fn total(&self) -> usize {
         if let Some((key, before)) = self.dirty.take()

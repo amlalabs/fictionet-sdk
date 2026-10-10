@@ -494,3 +494,278 @@ fn http2_has_the_limits_budget_and_seed_of_http1() {
         },
     );
 }
+
+#[test]
+fn pending_http1_requests_keep_their_body_charge() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let budget = Budget::new(1 << 20);
+        let router = Router::new().route_async(None, "/", |fcx, request| async move {
+            fcx.sleep(Duration::from_secs(1)).await.unwrap();
+            assert_eq!(request.body().len(), 8192);
+            http::Response::new(Bytes::new())
+        });
+        let mut h = Harness::with_options(
+            fictionet::Seed::from_u64(0),
+            Http1::new(router),
+            (),
+            ServeOptions::default().budget(budget.clone()),
+        )
+        .with_fcx(fcx.clone());
+        h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 8192\r\n\r\n")
+            .unwrap();
+        let base = budget.used();
+        h.push(&[b'x'; 8192]).unwrap();
+        assert_eq!(h.pending(), (1, 0));
+        assert!(budget.used() >= base + 8192);
+        fcx.sleep(Duration::from_secs(1)).await?;
+        assert!(!h.poll().unwrap().is_empty());
+        assert_eq!(h.pending(), (0, 0));
+        assert_eq!(budget.used(), base);
+        drop(h);
+        assert_eq!(budget.used(), 0);
+        Ok(())
+    });
+}
+
+#[test]
+fn truncated_http1_requests_keep_their_body_charge() {
+    struct Partial;
+    impl Handler for Partial {
+        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            Reply::Later(Box::new(move |fcx| {
+                Box::pin(async move {
+                    fcx.sleep(Duration::from_secs(1)).await?;
+                    assert!(request.into_body().collect().await.is_err());
+                    Ok(http::Response::new(Body::empty()))
+                })
+            }))
+        }
+    }
+    world(Duration::from_secs(10), |fcx| async move {
+        let budget = Budget::new(1 << 20);
+        let mut h = Harness::with_options(
+            fictionet::Seed::from_u64(0),
+            Http1::new(Partial),
+            (),
+            ServeOptions::default().budget(budget.clone()),
+        )
+        .with_fcx(fcx.clone());
+        h.push(b"POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: 16384\r\n\r\n")
+            .unwrap();
+        let base = budget.used();
+        h.push(&[b'x'; 8192]).unwrap();
+        let _ = h.end();
+        assert_eq!(h.pending(), (1, 0));
+        assert!(budget.used() >= base + 8192);
+        drop(h);
+        assert_eq!(budget.used(), 0);
+        Ok(())
+    });
+}
+
+#[test]
+fn default_first_bytes_uses_the_header_deadline() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let opts = HttpOptions {
+            limits: Limits {
+                header_timeout: Duration::from_millis(100),
+                ..Limits::default()
+            },
+            ..HttpOptions::default()
+        };
+        serve_http(&fcx, &server, 80, Arc::new(page(0)), opts)?;
+        let mut conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        let start = fcx.now();
+        let result = fcx
+            .race(
+                Some(start + Duration::from_secs(1)),
+                conn.read(&fcx, &mut [0; 1]),
+            )
+            .await;
+        assert!(matches!(result, Ok(Ok(0))));
+        assert!(fcx.now().since_start() - start.since_start() < Duration::from_secs(1));
+        Ok(())
+    });
+}
+
+#[test]
+fn upgrade_keep_alive_preserves_line_limits() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let opts = HttpOptions {
+            limits: Limits {
+                head: fictionet::stdlib::http1::Limits {
+                    header_line: 32,
+                    ..Default::default()
+                },
+                ..Limits::default()
+            },
+            ..HttpOptions::default()
+        };
+        serve_http(&fcx, &server, 80, Arc::new(page(0)), opts)?;
+        let mut conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        conn.write_all(
+            &fcx,
+            b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .await?;
+        let response = read_some(&fcx, &mut conn, 1).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        conn.write_all(&fcx, b"GET / HTTP/1.1\r\nHost: a.test\r\nX-Long: abcdefghijklmnopqrstuvwxyz0123456789\r\n\r\n").await?;
+        let response = read_some(&fcx, &mut conn, 1).await;
+        assert!(!response.starts_with(b"HTTP/1.1 200"));
+        Ok(())
+    });
+}
+
+#[test]
+fn upgrade_keep_alive_preserves_header_timeout() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let opts = HttpOptions {
+            limits: Limits {
+                header_timeout: Duration::from_millis(100),
+                ..Limits::default()
+            },
+            ..HttpOptions::default()
+        };
+        serve_http(&fcx, &server, 80, Arc::new(page(0)), opts)?;
+        let mut conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        conn.write_all(
+            &fcx,
+            b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .await?;
+        assert!(
+            read_some(&fcx, &mut conn, 1)
+                .await
+                .starts_with(b"HTTP/1.1 200")
+        );
+        conn.write_all(&fcx, b"GET /").await?;
+        let result = fcx
+            .race(
+                Some(fcx.now() + Duration::from_secs(1)),
+                conn.read(&fcx, &mut [0; 1]),
+            )
+            .await;
+        assert!(matches!(result, Ok(Ok(0))));
+        Ok(())
+    });
+}
+
+#[test]
+fn peer_admission_is_shared_by_machines_and_dns() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        fictionet::stdlib::net::Net::new()
+            .ipv4_only()
+            .limits(fictionet::stdlib::net::Limits {
+                connections_per_peer: 1,
+                ..Default::default()
+            })
+            .host("one", |h| {
+                h.at(Ipv4Addr::new(198, 18, 0, 2))
+                    .tcp(7, Arc::new(()), || Loud { size: 1 })
+            })
+            .host("two", |h| {
+                h.at(Ipv4Addr::new(198, 18, 0, 3))
+                    .tcp(7, Arc::new(()), || Loud { size: 1 })
+            })
+            .start(&fcx, attachments)?;
+        let m = fictionet::stdlib::sandbox::machine(
+            &fcx,
+            attacher.attach("a")?,
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
+        let mut first = m.tcp.connect(&fcx, "198.18.0.2:7".parse()?).await?;
+        first.write_all(&fcx, b"hello\n").await?;
+        assert_eq!(read_some(&fcx, &mut first, 1).await, b"x");
+        let mut second = m.tcp.connect(&fcx, "198.18.0.3:7".parse()?).await?;
+        let result = fcx
+            .race(
+                Some(fcx.now() + Duration::from_secs(1)),
+                second.read(&fcx, &mut [0; 1]),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Ok(Err(fictionet::stdlib::ConnError::Reset))
+        ));
+        let mut dns = m.tcp.connect(&fcx, "10.0.0.1:53".parse()?).await?;
+        let result = fcx
+            .race(
+                Some(fcx.now() + Duration::from_secs(1)),
+                dns.read(&fcx, &mut [0; 1]),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Ok(Err(fictionet::stdlib::ConnError::Reset))
+        ));
+        Ok(())
+    });
+}
+
+#[test]
+fn dns_tcp_uses_the_sandbox_service_budget() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (attacher, attachments) = fictionet::attachments();
+        fictionet::stdlib::net::Net::new()
+            .ipv4_only()
+            .limits(fictionet::stdlib::net::Limits {
+                sandbox_budget: 1,
+                ..Default::default()
+            })
+            .start(&fcx, attachments)?;
+        let m = fictionet::stdlib::sandbox::machine(
+            &fcx,
+            attacher.attach("a")?,
+            Ipv4Addr::new(10, 0, 0, 2),
+        );
+        let mut conn = m.tcp.connect(&fcx, "10.0.0.1:53".parse()?).await?;
+        let result = fcx
+            .race(
+                Some(fcx.now() + Duration::from_secs(1)),
+                conn.read(&fcx, &mut [0; 1]),
+            )
+            .await;
+        assert!(matches!(result, Ok(Ok(0))));
+        Ok(())
+    });
+}
+
+#[test]
+fn protocol_detection_does_not_restart_the_first_head_deadline() {
+    world(Duration::from_secs(10), |fcx| async move {
+        let (server, client) = two_machines(&fcx);
+        let opts = HttpOptions {
+            limits: Limits {
+                header_timeout: Duration::from_millis(100),
+                ..Limits::default()
+            },
+            ..HttpOptions::default()
+        };
+        serve_http(&fcx, &server, 80, Arc::new(page(0)), opts)?;
+        let mut conn = client
+            .connect(&fcx, SocketAddr::new(SERVER.into(), 80))
+            .await?;
+        let start = fcx.now();
+        fcx.sleep(Duration::from_millis(70)).await?;
+        conn.write_all(&fcx, b"GET /").await?;
+        let result = fcx
+            .race(
+                Some(start + Duration::from_millis(120)),
+                conn.read(&fcx, &mut [0; 1]),
+            )
+            .await;
+        assert!(matches!(result, Ok(Ok(0))));
+        Ok(())
+    });
+}

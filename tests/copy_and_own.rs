@@ -645,3 +645,14 @@ fn copied_collect_decodes_a_whole_wire_datagram_and_raw_bytes() {
     finish(&mut raw, |item| items.push(item)).unwrap();
     assert_eq!(items, [b"abc".to_vec()]);
 }
+
+#[test]
+fn copied_demux_bounds_input_allocation_growth() {
+    use fictionet::stdlib::codec::{Ending, Lines};
+    let mut streams = demux::Demux::new(2, 8, |_: &u8| Lines::new(32, Ending::LfOrCrlf));
+    assert_eq!(streams.push_with_budget(&1, b"a\n", 2), 2);
+    assert!(streams.next().unwrap().1.is_ok());
+    assert_eq!(streams.total(), 2);
+    assert_eq!(streams.push_with_budget(&2, b"abcdefg", 3), 3);
+    assert_eq!(streams.total(), 5);
+}

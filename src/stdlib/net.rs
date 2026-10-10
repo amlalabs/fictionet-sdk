@@ -79,11 +79,11 @@
 //!   address answers DNS, and the packets the LAN drops are recorded
 //!   (as [repeats](fictionet::events#repeats)).
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
-//!   closed ports with "port unreachable". A sandbox may have 256
-//!   connections open at once to one machine
+//!   closed ports with "port unreachable". A peer address may have 256
+//!   connections open at once across the network
 //!   ([`Limits::connections_per_peer`]); past that, new ones are reset. Each
 //!   service has its own cap too ([`ServeOptions::max_conns`]).
-//! - **Budgets.** What the connections from one sandbox hold is charged to
+//! - **Budgets.** Service-layer holdings for one sandbox are charged to
 //!   that sandbox's [`Budget`], 256 MiB unless [`Limits::sandbox_budget`]
 //!   says otherwise. A connection that would pass it is closed. The service
 //!   driver charges its buffers and what the service reports holding, and
@@ -191,8 +191,8 @@ fn normalize(name: &str) -> String {
 /// ones so they do not wait out real-world timeouts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// How many connections one peer address may have open at one machine
-    /// (or at the gateway's DNS) at once, counted until each has finished
+    /// How many connections one peer address may have open across all machines
+    /// and gateway DNS listeners at once, counted until each has finished
     /// closing. Default 256.
     pub connections_per_peer: usize,
     /// How long a client has, from connecting, to finish its TLS handshake,
@@ -202,8 +202,9 @@ pub struct Limits {
     /// How long a DNS-over-TCP connection may sit idle between queries (RFC
     /// 7766, section 6.2.3). Default 10 seconds.
     pub dns_tcp_idle: Duration,
-    /// Bytes the connections of one sandbox may hold at once, all services
-    /// together: see [`Budget`]. Default 256 MiB.
+    /// Bytes held by the service layer for one sandbox, all services
+    /// together: see [`Budget`]. Excludes TCP buffers and TLS handshakes.
+    /// Default 256 MiB.
     pub sandbox_budget: usize,
 }
 
@@ -811,6 +812,7 @@ impl Net {
             gateway_tcp: Mutex::new(Vec::new()),
             hooks,
             fixed: routes.iter().map(|(_, p)| *p).collect(),
+            peers: Peers::new(self.limits.connections_per_peer),
             limits: self.limits,
             lans,
         });
@@ -1141,6 +1143,7 @@ impl World {
 
 /// Everything the tasks of one network share.
 struct Shared {
+    peers: Arc<Peers>,
     fcx: Cx,
     resolver: Option<Arc<Resolver>>,
     subnet: Subnet,
@@ -1658,7 +1661,7 @@ impl Machine {
             udp,
             ports: Mutex::new(HashMap::new()),
             udp_ports: Mutex::new(HashSet::new()),
-            peers: Peers::new(shared.limits.connections_per_peer),
+            peers: shared.peers.clone(),
             shared: Arc::downgrade(shared),
         }))
     }
@@ -2242,7 +2245,7 @@ async fn dns_udp(fcx: Cx, socket: udp::Socket, shared: Arc<Shared>) -> fictionet
 
 /// DNS over TCP on the gateway's port 53.
 async fn dns_tcp(fcx: Cx, mut listener: tcp::Listener, shared: Arc<Shared>) -> fictionet::Result {
-    let peers = Peers::new(shared.limits.connections_per_peer);
+    let peers = shared.peers.clone();
     loop {
         match listener.accept(&fcx).await {
             Ok(conn) => {
@@ -2275,7 +2278,15 @@ async fn dns_conn(
         local: Some(conn.local_addr()),
         ..ConnInfo::default()
     };
-    let opts = ServeOptions::default().idle(None).connection_events(false);
+    let opts = ServeOptions {
+        idle: None,
+        connection_events: false,
+        budget: info
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| shared.hooks.budget(sandbox.id)),
+        ..ServeOptions::default()
+    };
     let _ = serve::connection(fcx, conn, info, &mut Dns { tcp: true }, shared, &opts).await;
     Ok(())
 }
@@ -2708,7 +2719,7 @@ pub enum BlockedWhy {
     /// Its destination port is closed: TCP gets a RST, UDP "port
     /// unreachable".
     ClosedPort,
-    /// A new TCP connection past the sandbox's limit per machine, or past
+    /// A new TCP connection past the network's limit per peer address, or past
     /// a service's cap. Reset.
     TooManyConnections,
 }
@@ -3083,6 +3094,7 @@ mod tests {
                     gateway_tcp: Mutex::default(),
                     hooks,
                     fixed: Vec::new(),
+                    peers: Peers::new(Limits::default().connections_per_peer),
                     limits: Limits::default(),
                     lans,
                 });

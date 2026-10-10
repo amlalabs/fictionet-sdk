@@ -89,11 +89,15 @@ impl Buffer {
         }
     }
 
-    fn size(&mut self, size: usize) -> bool {
+    fn size(&mut self, size: usize, capacity: usize) -> bool {
         if size > self.buf.capacity() {
             let target = size
                 .max(self.buf.capacity().saturating_mul(2))
-                .min(self.limit.saturating_mul(2));
+                .min(self.limit.saturating_mul(2))
+                .min(capacity);
+            if target < size {
+                return false;
+            }
             if self
                 .buf
                 .try_reserve_exact(target.saturating_sub(self.buf.len()))
@@ -119,10 +123,21 @@ impl Buffer {
     /// Returns zero if allocation fails. Invalidates any prior spare offer.
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, bytes: &[u8]) -> usize {
+        self.push_with_budget(bytes, usize::MAX)
+    }
+
+    /// Appends bytes while growing allocated storage by at most `growth`.
+    /// Existing spare capacity can be reused without growth.
+    #[must_use = "bytes past the returned count were not taken"]
+    pub fn push_with_budget(&mut self, bytes: &[u8], growth: usize) -> usize {
         self.compact();
-        let n = bytes.len().min(self.room());
+        let capacity = self.allocated().saturating_add(growth);
+        let n = bytes
+            .len()
+            .min(self.room())
+            .min(capacity.saturating_sub(self.end));
         let end = self.end.saturating_add(n);
-        if !self.size(end) {
+        if !self.size(end, capacity) {
             return 0;
         }
         if let (Some(dst), Some(src)) = (self.buf.get_mut(self.end..end), bytes.get(..n)) {
@@ -143,7 +158,7 @@ impl Buffer {
         self.compact();
         let offered = self.room().min(Self::MAX_SPARE);
         let end = self.end.saturating_add(offered);
-        if !self.size(end) {
+        if !self.size(end, usize::MAX) {
             return &mut [];
         }
         self.offered = offered;

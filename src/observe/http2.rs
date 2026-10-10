@@ -108,7 +108,7 @@ pub struct CaptureBudget {
     limit: usize,
 }
 impl CaptureBudget {
-    /// Sets the total unread DATA limit across all participating connections.
+    /// Sets the total retained DATA allocation limit across participating connections.
     pub fn new(limit: usize) -> Self {
         Self {
             used: Arc::new(Mutex::new(0)),
@@ -162,9 +162,7 @@ impl CaptureCalls {
         let before = self.total();
         *used = used.saturating_sub(self.charged).saturating_add(before);
         let room = self.budget.limit.saturating_sub(*used);
-        let n = self
-            .messages
-            .push(key, bytes.get(..bytes.len().min(room)).unwrap_or_default());
+        let n = self.messages.push_with_budget(key, bytes, room);
         self.charged = self.total();
         *used = used.saturating_sub(before).saturating_add(self.charged);
         n
@@ -1017,6 +1015,26 @@ mod tests {
     }
 
     #[test]
+    fn completed_messages_retain_shared_allocation_credit() {
+        let budget = CaptureBudget::new(12);
+        let mut first = CaptureCalls::new(budget.clone());
+        let mut second = CaptureCalls::new(budget.clone());
+        assert_eq!(first.push(&(false, 1), &[0, 0, 0, 0, 1, b'x']), 6);
+        assert_eq!(first.messages.next().unwrap().1.unwrap().data, b"x");
+        first.account();
+        assert_eq!(budget.held(), 6);
+        assert_eq!(second.push(&(false, 1), &[0, 0, 0, 0, 1, b'y']), 6);
+        assert_eq!(budget.held(), 12);
+        assert_eq!(first.push(&(false, 3), &[0]), 0);
+        assert_eq!(first.push(&(false, 1), &[0, 0, 0, 0, 1, b'z']), 6);
+        assert_eq!(budget.held(), 12);
+        first.remove(&(false, 1));
+        assert_eq!(budget.held(), 6);
+        drop(second);
+        assert_eq!(budget.held(), 0);
+    }
+
+    #[test]
     fn shared_capture_budget_counts_connections_once_and_returns_credit() {
         let budget = CaptureBudget::new(4096);
         let mut connections = Vec::new();
@@ -1171,6 +1189,8 @@ mod tests {
         calls.remove(&1);
         assert_eq!(calls.push(&3, &[1, b'x']), 2);
         assert_eq!(calls.next().unwrap().1.unwrap().data, b"x");
+        assert_eq!(calls.total(), 8);
+        calls.remove(&3);
         assert_eq!(calls.total(), 0);
     }
 }

@@ -986,6 +986,7 @@ pub struct Http1 {
     body: Vec<u8>,
     too_big: bool,
     started: Instant,
+    first_head_deadline: Option<Instant>,
 }
 
 impl Http1 {
@@ -1006,6 +1007,7 @@ impl Http1 {
             body: Vec::new(),
             too_big: false,
             started: Instant::ZERO,
+            first_head_deadline: None,
         }
     }
 
@@ -1028,9 +1030,10 @@ impl Http1 {
     }
 
     fn respond(&mut self, driver: &mut Driver<'_, http1::RequestEvents>) -> Flow {
+        let held = self.body.capacity();
         let body = Body::from(std::mem::take(&mut self.body));
         let close = self.too_big;
-        self.dispatch(driver, body, close)
+        self.dispatch(driver, body, close, held)
     }
 
     /// Calls the handler for the request whose head is pending, with
@@ -1040,6 +1043,7 @@ impl Http1 {
         driver: &mut Driver<'_, http1::RequestEvents>,
         body: Body,
         close: bool,
+        held: usize,
     ) -> Flow {
         let Some(head) = self.head.take() else {
             return Flow::Close;
@@ -1084,7 +1088,8 @@ impl Http1 {
         };
         driver.defer(
             Streaming::new(work, response, version, head_only, close, tracker)
-                .dated(self.date, now),
+                .dated(self.date, now)
+                .holding_request(held),
         );
         if self.upgrade.is_some() {
             driver.cancel_timer(BODY);
@@ -1333,7 +1338,13 @@ impl serve::Service for Http1 {
         _: &(),
         driver: &mut Driver<'_, http1::RequestEvents>,
     ) -> Result<Flow, Infallible> {
-        driver.set_timer(HEAD, self.opts.header_timeout);
+        let timeout = self
+            .first_head_deadline
+            .take()
+            .map_or(self.opts.header_timeout, |at| {
+                at.since_start().saturating_sub(driver.now().since_start())
+            });
+        driver.set_timer(HEAD, timeout);
         Ok(Flow::Continue)
     }
 
@@ -1398,7 +1409,7 @@ impl serve::Service for Http1 {
     }
 
     fn held(&self) -> usize {
-        self.body.len()
+        self.body.capacity()
     }
 
     fn on_fail(
@@ -1413,8 +1424,9 @@ impl serve::Service for Http1 {
             let mut got = std::mem::take(&mut self.body);
             let room = self.opts.body.saturating_sub(got.len());
             got.extend_from_slice(&driver.unread()[..driver.unread().len().min(room)]);
+            let held = got.capacity();
             let body = partial(Bytes::from(got), "the request body was cut off");
-            self.dispatch(driver, body, true);
+            self.dispatch(driver, body, true, held);
             return Ok(());
         }
         if matches!(
@@ -1426,7 +1438,7 @@ impl serve::Service for Http1 {
             // it, as a request that names no host (`400`, `no_host`).
             self.head = Some(head);
             self.started = driver.now();
-            self.dispatch(driver, Body::empty(), true);
+            self.dispatch(driver, Body::empty(), true, 0);
             return Ok(());
         }
         driver.record(error_event(
@@ -1483,6 +1495,8 @@ struct Streaming {
     making: Option<Making>,
     body: Option<Body>,
     rest: Bytes,
+    rest_held: usize,
+    request_held: usize,
     response: Option<Response<Body>>,
     version: Version,
     head_only: bool,
@@ -1518,6 +1532,8 @@ impl Streaming {
             making: None,
             body: None,
             rest: Bytes::new(),
+            rest_held: 0,
+            request_held: 0,
             response,
             version,
             head_only,
@@ -1533,6 +1549,22 @@ impl Streaming {
             date: None,
             asked: Instant::ZERO,
         }
+    }
+
+    fn holding_request(mut self, held: usize) -> Self {
+        if self.work.is_some() {
+            self.request_held = held;
+        }
+        self
+    }
+
+    fn take_piece(&mut self) -> Bytes {
+        let piece = self.rest.split_to(self.rest.len().min(PIECE));
+        if self.rest.is_empty() {
+            self.rest = Bytes::new();
+            self.rest_held = 0;
+        }
+        piece
     }
 
     /// Dates the response from `date`, the world's date at the start of
@@ -1608,6 +1640,7 @@ impl Pending for Streaming {
                     Poll::Ready(Err(e)) => error_response(&e),
                 };
                 self.making = None;
+                self.request_held = 0;
                 self.response = Some(response);
             }
             if let Some(response) = self.response.take() {
@@ -1640,15 +1673,18 @@ impl Pending for Streaming {
                 // A body held in full goes out with the head, a piece at
                 // a time.
                 match body.0 {
-                    Inner::Full(bytes) => self.rest = bytes.unwrap_or_default(),
+                    Inner::Full(bytes) => {
+                        self.rest = bytes.unwrap_or_default();
+                        self.rest_held = self.rest.len();
+                    }
                     stream => self.body = Some(Body(stream)),
                 }
-                let piece = self.rest.split_to(self.rest.len().min(PIECE));
+                let piece = self.take_piece();
                 self.frame(&piece, &mut head);
                 return self.piece(head, piece.len());
             }
             if !self.rest.is_empty() {
-                let piece = self.rest.split_to(self.rest.len().min(PIECE));
+                let piece = self.take_piece();
                 let mut out = Vec::with_capacity(piece.len() + 12);
                 self.frame(&piece, &mut out);
                 return self.piece(out, piece.len());
@@ -1675,6 +1711,7 @@ impl Pending for Streaming {
                     if let Ok(data) = frame.into_data()
                         && !data.is_empty()
                     {
+                        self.rest_held = data.len();
                         self.rest = data;
                     }
                 }
@@ -1693,7 +1730,7 @@ impl Pending for Streaming {
     fn held(&self) -> usize {
         let response = self.response.as_ref().map_or(0, |r| r.body().full_len());
         let body = self.body.as_ref().map_or(0, Body::full_len);
-        self.rest.len() + response + body
+        self.request_held + self.rest_held + response + body
     }
 }
 
@@ -1712,7 +1749,9 @@ pub struct HttpOptions {
     pub first_bytes: Option<Duration>,
     /// What connections are charged to ([`ServeOptions::budget`]): over
     /// HTTP/1 what the service holds, over HTTP/2 each request's body and
-    /// each response body held in full.
+    /// each response frame until its last slice is dropped. Response storage
+    /// is charged by its original byte length; spare capacity and backing
+    /// storage outside a supplied slice are not exposed by `Bytes`.
     pub budget: Option<Budget>,
     /// The world's date and time at the start of the run, for `Date`
     /// headers. `None`: no `Date` header. See [Dates](self#dates).
@@ -1742,6 +1781,8 @@ pub async fn serve_connection<C: Connection + Unpin>(
 ) -> Result<(), Cancelled> {
     let mut conn = conn;
     let mut first = Vec::new();
+    let head_deadline = fcx.now() + opts.limits.header_timeout;
+    let first_timeout = opts.first_bytes.unwrap_or(opts.limits.header_timeout);
     let h2 = if info.tls {
         fictionet::cfg_tokio!({ info.alpn.as_deref() == Some(b"h2".as_slice()) } else { false })
     } else {
@@ -1759,16 +1800,13 @@ pub async fn serve_connection<C: Connection + Unpin>(
             }
             true
         };
-        match fcx
-            .race(opts.first_bytes.map(|d| fcx.now() + d), preface)
-            .await
-        {
+        match fcx.race(Some(fcx.now() + first_timeout), preface).await {
             Ok(true) => {}
             Ok(false) if fcx.is_cancelled() => return Err(Cancelled),
             Ok(false) => return Ok(()),
             Err(RaceError::Cancelled) => return Err(Cancelled),
             Err(RaceError::Deadline) => {
-                let secs = opts.first_bytes.map_or(0, |d| d.as_secs());
+                let secs = first_timeout.as_secs();
                 fcx.record(
                     error_event(
                         &info,
@@ -1797,6 +1835,9 @@ pub async fn serve_connection<C: Connection + Unpin>(
     };
     let mut service = Http1::with(handler.clone(), opts.limits);
     service.date = opts.date;
+    if !info.tls && opts.first_bytes.is_none() {
+        service.first_head_deadline = Some(head_deadline);
+    }
     match serve::connection(fcx, conn, info.clone(), &mut service, &(), &serve_opts).await {
         Ok(serve::Served::Upgraded(serve::Upgrade::Handoff, rest)) => {
             if let Some(upgrade) = service.upgrade.take() {
@@ -1987,9 +2028,11 @@ fictionet::cfg_tokio! {
 /// Live HTTP/2 and HTTP/1 Upgrade serving on hyper.
 mod h2 {
     use super::*;
-    use std::pin::pin;
+    use fictionet::stdlib::codec::{Buffer, Decode, Step};
     use fictionet::stdlib::serve::{Charge, PanicNote};
     use hyper::body::Incoming;
+    use std::pin::pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Runs hyper's HTTP/2 server on `conn`.
     pub(super) async fn serve<C: Connection + Unpin>(
@@ -2030,21 +2073,29 @@ mod h2 {
         opts: &HttpOptions,
     ) -> Result<(), Cancelled> {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let io = Io::new(
+        let mut io = Io::new(
             fcx,
             Box::new(conn) as Box<dyn Connection>,
             broke.clone(),
             opts.limits.write_timeout,
         );
-        let route = Route::new(fcx, handler, &info, opts);
+        let upgraded = Arc::new(AtomicBool::new(false));
+        io.heads = Some(HeadCheck::new(fcx, opts.limits, upgraded.clone()));
+        let mut route = Route::new(fcx, handler, &info, opts);
+        route.upgraded = Some(upgraded);
         let mut builder = hyper::server::conn::http1::Builder::new();
         // Hyper still refreshes its internal date cache using SystemTime,
         // but auto_date_header(false) prevents that value reaching the wire.
         builder.auto_date_header(false);
+        builder.max_headers(opts.limits.head.headers);
+        // Hyper requires at least 8192 bytes. HeadCheck enforces smaller limits.
+        builder.max_buf_size(opts.limits.head.head.max(8192));
         if cfg!(target_arch = "wasm32") {
+            // HeadCheck enforces the deadline without a host Instant.
             builder.header_read_timeout(None);
         } else {
             builder.timer(CxTimer::new(fcx.clone()));
+            builder.header_read_timeout(opts.limits.header_timeout);
         }
         let served = builder.serve_connection(io, route).with_upgrades();
         finish(fcx, &info, &broke, fcx.race(None, served).await)
@@ -2118,7 +2169,15 @@ mod h2 {
     fn transport(io: &std::io::Error) -> Option<&'static str> {
         let broken =
             io.get_ref().and_then(|e| e.downcast_ref::<ConnError>()) == Some(&ConnError::Broken);
-        broken.then_some("transport")
+        if broken {
+            Some("transport")
+        } else {
+            match io.kind() {
+                std::io::ErrorKind::InvalidData => Some("protocol"),
+                std::io::ErrorKind::TimedOut => Some("timeout"),
+                _ => None,
+            }
+        }
     }
 
     /// Answers each request hyper reads, with the connection's limits,
@@ -2131,6 +2190,7 @@ mod h2 {
         date: Option<SystemTime>,
         limits: Limits,
         budget: Option<Budget>,
+        upgraded: Option<Arc<AtomicBool>>,
     }
 
     impl Route {
@@ -2142,6 +2202,7 @@ mod h2 {
                 date: opts.date,
                 limits: opts.limits,
                 budget: opts.budget.clone(),
+                upgraded: None,
             }
         }
 
@@ -2260,6 +2321,11 @@ mod h2 {
                     }
                 };
                 if response.status() == StatusCode::SWITCHING_PROTOCOLS
+                    && let Some(upgraded) = &route.upgraded
+                {
+                    upgraded.store(true, Ordering::Relaxed);
+                }
+                if response.status() == StatusCode::SWITCHING_PROTOCOLS
                     && let Some(upgrade) = response.extensions().get::<UpgradeHandler>().cloned()
                     && let Some(on_upgrade) = on_upgrade
                 {
@@ -2267,7 +2333,11 @@ mod h2 {
                         if let Ok(upgraded) = on_upgrade.await
                             && let Ok(parts) = upgraded.downcast::<Io<Box<dyn Connection>>>()
                         {
-                            let conn = Prefixed::new(parts.read_buf.to_vec(), parts.io.conn);
+                            let mut first = parts.read_buf.to_vec();
+                            if let Some(heads) = parts.io.heads {
+                                first.extend_from_slice(heads.input.unread());
+                            }
+                            let conn = Prefixed::new(first, parts.io.conn);
                             upgrade.run(fcx, Box::new(conn)).await;
                         }
                         Ok(())
@@ -2313,7 +2383,9 @@ mod h2 {
                         rest: Bytes::new(),
                         track,
                         bodiless,
+                        failed: false,
                         charge,
+                        budget: route.budget.clone(),
                     },
                 ))
             })
@@ -2351,8 +2423,10 @@ mod h2 {
         rest: Bytes,
         track: Track,
         bodiless: bool,
+        failed: bool,
         /// What the body held in full still holds.
         charge: Option<Charge>,
+        budget: Option<Budget>,
     }
 
     impl http_body::Body for Counted {
@@ -2366,16 +2440,32 @@ mod h2 {
             let this = self.get_mut();
             if !this.rest.is_empty() {
                 let piece = this.rest.split_to(this.rest.len().min(PIECE));
+                if this.rest.is_empty() {
+                    this.rest = Bytes::new();
+                }
                 this.track.sent += piece.len() as u64;
-                this.recharge();
                 return Poll::Ready(Some(Ok(Frame::data(piece))));
             }
             let mut polled = Pin::new(&mut this.body).poll_frame(cx);
             if let Poll::Ready(Some(Ok(frame))) = &mut polled
                 && let Some(data) = frame.data_mut()
-                && data.len() > PIECE
             {
-                this.rest = data.split_off(PIECE);
+                let mut charge = this
+                    .charge
+                    .take()
+                    .or_else(|| this.budget.as_ref().and_then(|b| b.charge(0)));
+                if charge.as_mut().is_some_and(|c| !c.set(data.len())) {
+                    this.failed = true;
+                    this.body = Body::empty();
+                    return Poll::Ready(Some(Err(Error::msg("response body exceeds budget"))));
+                }
+                *data = Bytes::from_owner(ChargedBytes {
+                    bytes: std::mem::take(data),
+                    _charge: charge,
+                });
+                if data.len() > PIECE {
+                    this.rest = data.split_off(PIECE);
+                }
             }
             match &polled {
                 Poll::Ready(Some(Ok(frame))) => {
@@ -2383,11 +2473,13 @@ mod h2 {
                         this.track.sent += data.len() as u64;
                     }
                 }
-                Poll::Ready(Some(Err(_))) => this.track.complete = false,
+                Poll::Ready(Some(Err(_))) => {
+                    this.failed = true;
+                    this.track.complete = false;
+                }
                 Poll::Ready(None) => this.track.complete = true,
                 Poll::Pending => {}
             }
-            this.recharge();
             polled
         }
 
@@ -2407,20 +2499,128 @@ mod h2 {
         }
     }
 
-    impl Counted {
-        /// Charges what is left to send of a body held in full.
-        fn recharge(&mut self) {
-            if let Some(c) = &mut self.charge {
-                c.set(self.rest.len() + self.body.full_len());
-            }
+    struct ChargedBytes {
+        bytes: Bytes,
+        _charge: Option<Charge>,
+    }
+
+    impl AsRef<[u8]> for ChargedBytes {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
         }
     }
 
     impl Drop for Counted {
         fn drop(&mut self) {
             // hyper may stop polling once the body says it has ended.
-            if http_body::Body::is_end_stream(self) || self.bodiless {
+            if !self.failed && (http_body::Body::is_end_stream(self) || self.bodiless) {
                 self.track.complete = true;
+            }
+        }
+    }
+
+    /// Validates request framing before hyper receives it, including heads
+    /// after an Upgrade request that received an ordinary response.
+    struct HeadCheck {
+        decoder: http1::RequestEvents,
+        input: Buffer,
+        ready: usize,
+        eof: bool,
+        upgraded: Arc<AtomicBool>,
+        timer: fictionet::Timer,
+        deadline: Option<Instant>,
+        timeout: Duration,
+    }
+
+    impl HeadCheck {
+        fn new(fcx: &Cx, limits: Limits, upgraded: Arc<AtomicBool>) -> Self {
+            let decoder = http1::RequestEvents::with_limits(limits.head);
+            let input = Buffer::new(decoder.capacity());
+            Self {
+                decoder,
+                input,
+                ready: 0,
+                eof: false,
+                upgraded,
+                timer: fictionet::Timer::new(fcx),
+                deadline: Some(fcx.now() + limits.header_timeout),
+                timeout: limits.header_timeout,
+            }
+        }
+
+        fn poll_read<C: Connection + Unpin>(
+            &mut self,
+            conn: &mut C,
+            fcx: &Cx,
+            cx: &mut Context<'_>,
+            out: &mut hyper::rt::ReadBufCursor<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            loop {
+                if self.upgraded.load(Ordering::Relaxed) {
+                    self.ready = self.input.len();
+                }
+                if self.ready != 0 {
+                    let n = self.ready.min(out.remaining());
+                    out.put_slice(&self.input.unread()[..n]);
+                    self.input.consume(n);
+                    self.ready -= n;
+                    return Poll::Ready(Ok(()));
+                }
+                if !self.upgraded.load(Ordering::Relaxed) {
+                    if let Some(deadline) = self.deadline {
+                        match self.timer.poll_until(cx, deadline) {
+                            Poll::Ready(Ok(())) => {
+                                return Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
+                            }
+                            Poll::Ready(Err(_)) => {
+                                return Poll::Ready(Err(ConnError::Cancelled.into()));
+                            }
+                            Poll::Pending => {}
+                        }
+                    }
+                    match self.decoder.decode(self.input.unread(), self.eof) {
+                        Ok(Step::Item(item, n)) => {
+                            match item {
+                                H1::Head(_) => self.deadline = None,
+                                H1::Done => self.deadline = Some(fcx.now() + self.timeout),
+                                H1::Body(_) => {}
+                            }
+                            self.ready = n;
+                            continue;
+                        }
+                        Ok(Step::Skip(n)) => {
+                            self.ready = n;
+                            continue;
+                        }
+                        Ok(Step::End) => return Poll::Ready(Ok(())),
+                        Ok(Step::Need) => {}
+                        Err(e) => {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                e,
+                            )));
+                        }
+                    }
+                }
+                if self.eof {
+                    if self.upgraded.load(Ordering::Relaxed) {
+                        return Poll::Ready(Ok(()));
+                    }
+                    return Poll::Ready(Err(std::io::ErrorKind::UnexpectedEof.into()));
+                }
+                self.input.set_limit(self.decoder.capacity());
+                let spare = self.input.spare();
+                if spare.is_empty() {
+                    return Poll::Ready(Err(std::io::ErrorKind::InvalidData.into()));
+                }
+                match conn.poll_read(fcx, cx, spare) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+                    Poll::Ready(Ok(n)) => {
+                        self.input.commit(n);
+                        self.eof = n == 0;
+                    }
+                }
             }
         }
     }
@@ -2439,6 +2639,7 @@ mod h2 {
         stall: Duration,
         /// Armed while a write waits.
         stalled: Option<Stall>,
+        heads: Option<HeadCheck>,
     }
 
     impl<C: Connection + Unpin> Io<C> {
@@ -2455,6 +2656,7 @@ mod h2 {
                 buf: vec![0; 16 * 1024].into_boxed_slice(),
                 stall,
                 stalled: None,
+                heads: None,
             }
         }
 
@@ -2489,6 +2691,9 @@ mod h2 {
             mut buf: hyper::rt::ReadBufCursor<'_>,
         ) -> Poll<std::io::Result<()>> {
             let this = self.get_mut();
+            if let Some(heads) = &mut this.heads {
+                return heads.poll_read(&mut this.conn, &this.fcx, cx, &mut buf);
+            }
             let want = buf.remaining().min(this.buf.len());
             match this.conn.poll_read(&this.fcx, cx, &mut this.buf[..want]) {
                 Poll::Ready(Ok(n)) => {
@@ -2645,6 +2850,54 @@ mod h2 {
     mod tests {
         use super::*;
         use hyper::rt::Timer;
+
+        #[test]
+        fn response_frames_keep_the_charge_after_the_body_is_dropped() {
+            fictionet::block_on(fictionet::lab(
+                fictionet::Seed::from_u64(0),
+                |fcx| async move {
+                    let budget = Budget::new(3 * PIECE);
+                    let info = Arc::new(ConnInfo::default());
+                    let request = Request::new(Body::empty());
+                    let mut body = Counted {
+                        body: Body::from(vec![b'x'; 2 * PIECE]),
+                        rest: Bytes::new(),
+                        track: Track {
+                            tracker: Tracker::new(&request, &info, fcx.now()),
+                            fcx: fcx.clone(),
+                            info: info.clone(),
+                            extra: None,
+                            status: Some(StatusCode::OK),
+                            sent: 0,
+                            complete: false,
+                            _note: PanicNote::new("test response", &info),
+                        },
+                        bodiless: false,
+                        failed: false,
+                        charge: budget.charge(2 * PIECE),
+                        budget: Some(budget.clone()),
+                    };
+                    let mut cx = Context::from_waker(std::task::Waker::noop());
+                    let Poll::Ready(Some(Ok(first))) = Pin::new(&mut body).poll_frame(&mut cx)
+                    else {
+                        panic!("first frame")
+                    };
+                    assert_eq!(budget.used(), 2 * PIECE);
+                    let Poll::Ready(Some(Ok(last))) = Pin::new(&mut body).poll_frame(&mut cx)
+                    else {
+                        panic!("last frame")
+                    };
+                    drop(body);
+                    drop(first);
+                    assert_eq!(budget.used(), 2 * PIECE);
+                    assert_eq!(last.data_ref().unwrap().len(), PIECE);
+                    drop(last);
+                    assert_eq!(budget.used(), 0);
+                    Ok(())
+                },
+            ))
+            .unwrap();
+        }
 
         #[test]
         fn hyper_deadlines_use_the_clock_at_creation() {
@@ -2812,12 +3065,81 @@ mod h2 {
         }
     }
 }
-
 }
 
 #[cfg(test)]
 mod router_tests {
     use super::*;
+
+    #[test]
+    fn response_suffix_keeps_the_original_charge() {
+        use fictionet::stdlib::codec::{Ending, Lines};
+        use fictionet::stdlib::serve::{Harness, Service};
+        struct Checked {
+            inner: Streaming,
+            held: Arc<Mutex<Vec<usize>>>,
+        }
+        impl Pending for Checked {
+            fn poll_next(
+                &mut self,
+                driver: &mut PendingDriver<'_>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Vec<u8>, Error>>> {
+                let result = self.inner.poll_next(driver, cx);
+                self.held.lock().push(self.inner.held());
+                result
+            }
+        }
+        struct Start(Option<Checked>);
+        impl Service for Start {
+            type Decoder = Lines;
+            type State = ();
+            type Error = Infallible;
+            fn decoder(&self) -> Lines {
+                Lines::new(16, Ending::LfOrCrlf)
+            }
+            fn on_item(
+                &mut self,
+                _: <Lines as fictionet::stdlib::codec::Decode>::Item,
+                _: &(),
+                _: &mut Driver<'_, Lines>,
+            ) -> Result<Flow, Infallible> {
+                Ok(Flow::Close)
+            }
+            fn on_open(
+                &mut self,
+                _: &(),
+                driver: &mut Driver<'_, Lines>,
+            ) -> Result<Flow, Infallible> {
+                driver.defer(self.0.take().unwrap());
+                Ok(Flow::Close)
+            }
+        }
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let tracker = Tracker::new(
+            &Request::new(Body::empty()),
+            &ConnInfo::default(),
+            Instant::ZERO,
+        );
+        let inner = Streaming::new(
+            None,
+            Some(Response::new(Body::from(vec![b'x'; 3 * PIECE]))),
+            Version::HTTP_11,
+            false,
+            true,
+            tracker,
+        );
+        let mut harness = Harness::new(
+            fictionet::Seed::from_u64(0),
+            Start(Some(Checked {
+                inner,
+                held: held.clone(),
+            })),
+            (),
+        );
+        harness.open().unwrap();
+        assert_eq!(&held.lock()[..3], &[3 * PIECE, 3 * PIECE, 0]);
+    }
 
     #[test]
     fn wildcard_prefixes_keep_slash_boundaries_and_method_precedence() {

@@ -105,6 +105,7 @@ impl Stack {
                 if end {
                     self.calls.end(&(dir, stream));
                     self.drain_calls();
+                    self.calls.remove(&(dir, stream));
                 }
             }
             http2::Event::Data { stream, data, end } => {
@@ -118,11 +119,13 @@ impl Stack {
                 if end {
                     self.calls.end(&(dir, stream));
                     self.drain_calls();
+                    self.calls.remove(&(dir, stream));
                 }
             }
             http2::Event::Trailers { stream, fields } => {
                 self.calls.end(&(dir, stream));
                 self.drain_calls();
+                self.calls.remove(&(dir, stream));
                 self.statuses.push(grpc::Status::from_trailers(
                     fields.iter().map(|f| (&f.name, &f.value)),
                 ));

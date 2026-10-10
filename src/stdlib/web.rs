@@ -436,12 +436,10 @@
 //!   connected to a bare IPv4 or IPv6 address, is rejected with
 //!   `unrecognized_name`. Clients never send an IP address as the SNI, so
 //!   certificates for IP addresses are never used.
-//! - **Limits per sandbox.** A sandbox may have 256 connections open at
-//!   the same time to one machine (both ports together), and 256 to the gateway's
-//!   DNS over TCP at each of its addresses. A machine has one address, so
-//!   a dual-stack site is two machines, and a sandbox may have 256 open to
-//!   each. A connection counts until it has finished closing, so
-//!   one that the server closed but the sandbox never closed on its side
+//! - **Limits per sandbox.** Each sandbox address may have 256 connections
+//!   open at once across all machines and gateway DNS listeners, with both
+//!   HTTP ports counted together. A connection counts until it has finished
+//!   closing, so one that the server closed but the sandbox never closed on its side
 //!   still counts, for up to a minute. Past that, a new connection is reset
 //!   as soon as it is accepted. Every open connection costs a machine a
 //!   little on every packet, and machines are shared, so one sandbox must

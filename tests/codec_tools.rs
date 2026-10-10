@@ -401,6 +401,10 @@ fn demux_stream_access_composes_with_all_tools_and_shared_budget() {
         assert_eq!(out[usize::from(key)], input.repeat(2));
         assert!(demux.total() <= 1024);
     }
+    let allocated = demux.get_mut(&0).unwrap().allocated() + demux.get_mut(&1).unwrap().allocated();
+    assert_eq!(demux.total(), allocated);
+    demux.remove(&0);
+    demux.remove(&1);
     assert_eq!(demux.total(), 0);
     assert_eq!(log.len(), 2);
     for (key, entry) in log.iter().enumerate() {

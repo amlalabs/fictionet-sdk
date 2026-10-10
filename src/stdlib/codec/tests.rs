@@ -829,7 +829,7 @@ fn demux_limits_order_eof_remove_and_held_budget() {
     assert_eq!(d.total(), 4);
     assert_eq!(d.next(), Some((1, Ok(b"cd".to_vec()))));
     assert_eq!(d.next(), Some((2, Ok(b"ab".to_vec()))));
-    assert_eq!(d.total(), 0);
+    assert_eq!(d.total(), 4);
     d.end(&1);
     d.end(&99);
     assert!(d.next().is_none());
@@ -1549,11 +1549,11 @@ fn regression_demux_visits_only_ready_streams() {
     assert!(d.next().is_none());
     calls.store(0, Ordering::Relaxed);
     held_calls.store(0, Ordering::Relaxed);
-    for key in (0..4096).cycle().take(8192) {
+    for (visit, key) in (0..4096).cycle().take(8192).enumerate() {
         assert_eq!(d.push(&key, b"a"), 1);
         assert_eq!(d.next(), Some((key, Ok(b'a'))));
         assert!(d.next().is_none());
-        assert_eq!(d.total(), 0);
+        assert_eq!(d.total(), (visit + 1).min(4096));
     }
     assert!(
         calls.load(Ordering::Relaxed) <= 8192 * 2,
@@ -1673,8 +1673,10 @@ fn demux_mutable_access_updates_only_its_stream() {
     assert!(d.next().is_none());
     d.get_mut(&2).unwrap().end();
     assert_eq!(d.next(), Some((2, Ok(Body(b"bc".to_vec())))));
-    assert_eq!(d.total(), 1);
+    assert_eq!(d.total(), 3);
     assert_eq!(d.remove(&1).unwrap().unread(), b"a");
+    assert_eq!(d.total(), 2);
+    d.remove(&2);
     assert_eq!(d.total(), 0);
 
     let mut d = Demux::new(2, 4, |_: &u8| Collect::<Body>::new(64));
@@ -2026,6 +2028,8 @@ fn demux_push_after_end_matches_stream_with_any_budget() {
         assert_eq!(d.total(), 2);
         assert_eq!(d.next(), Some((1, Ok(Body(b"ab".to_vec())))));
         assert_eq!(d.next(), None);
+        assert_eq!(d.total(), 2);
+        d.remove(&1);
         assert_eq!(d.total(), 0);
     }
 }
@@ -2228,4 +2232,32 @@ fn whole_spans(spans: &Spans, range: core::ops::Range<u64>) -> Option<core::ops:
         }
     }
     None
+}
+
+#[test]
+fn demux_retains_credit_for_partial_and_drained_allocations() {
+    let mut d = Demux::new(2, 8, |_: &u8| Lines::new(32, Ending::LfOrCrlf));
+    assert_eq!(d.push(&1, b"a\nb"), 3);
+    assert_eq!(d.next(), Some((1, Ok(Ok(b"a".to_vec())))));
+    let capacity = d.get_mut(&1).unwrap().allocated();
+    assert_eq!(d.total(), capacity);
+    assert_eq!(d.push(&2, b"12345678"), 8 - capacity);
+    assert_eq!(d.total(), 8);
+    assert_eq!(d.push(&1, b"\n"), 1);
+    assert_eq!(d.get_mut(&1).unwrap().next(), Some(Ok(Ok(b"b".to_vec()))));
+    assert_eq!(d.total(), 8);
+    assert_eq!(d.push(&1, b"ef"), 2);
+    assert_eq!(d.total(), 8);
+    d.remove(&1);
+    assert_eq!(d.total(), 8 - capacity);
+}
+
+#[test]
+fn demux_reserves_geometric_growth_before_allocating() {
+    let mut d = Demux::new(1, 5, |_: &u8| Collect::<Body>::new(64));
+    assert_eq!(d.push(&1, b"abc"), 3);
+    assert_eq!(d.push(&1, b"def"), 2);
+    assert_eq!(d.get_mut(&1).unwrap().allocated(), 5);
+    assert_eq!(d.total(), 5);
+    assert_eq!(d.push(&1, b"f"), 0);
 }

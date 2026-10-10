@@ -129,11 +129,17 @@ impl<D: Decode> Stream<D> {
     /// Already buffered bytes remain available for handoff.
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, bytes: &[u8]) -> usize {
+        self.push_with_budget(bytes, usize::MAX)
+    }
+    /// Adds what fits while growing input storage by at most `growth` bytes.
+    /// Existing capacity is reused. After EOF or completion, drops new bytes.
+    #[must_use = "bytes past the returned count were not taken"]
+    pub fn push_with_budget(&mut self, bytes: &[u8], growth: usize) -> usize {
         if self.done || self.eof {
             return bytes.len();
         }
         self.sync_limit();
-        self.buf.push(bytes)
+        self.buf.push_with_budget(bytes, growth)
     }
     /// Offers direct read space. Empty after EOF or completion.
     pub fn spare(&mut self) -> &mut [u8] {
