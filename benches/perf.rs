@@ -17,10 +17,6 @@
 //! commits by running the same groups on each, one after the other, and
 //! look at the counts first.
 
-#[path = "support/socket_path.rs"]
-mod socket_path;
-use socket_path::socket_path;
-
 #[path = "../tests/common/hyper.rs"]
 mod hyper_io;
 use hyper_io::{Exec, Io};
@@ -998,6 +994,17 @@ fn socketpair_sends(n: usize, size: usize) -> (f64, u64) {
     let a1 = allocs() - a0;
     reader.join().unwrap();
     (start.elapsed().as_secs_f64(), a1)
+}
+
+/// Returns a world socket path in the system temporary directory.
+fn socket_path(tag: &str) -> std::path::PathBuf {
+    static SOCKETS: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join("fictionet-bench-sockets");
+    std::fs::create_dir_all(&dir).unwrap();
+    let n = SOCKETS.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{tag}-{}-{n}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path
 }
 
 /// A world that echoes every packet of the sandbox `agent`, reached through

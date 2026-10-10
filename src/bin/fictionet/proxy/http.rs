@@ -34,6 +34,7 @@ pub(crate) fn status_for(fail: &Fail) -> u16 {
 
 /// Reads from `r` into `buf`, checking each complete line once.
 /// Calls `parse` on the start line and on the whole head at its empty line.
+/// Checks at most seven bytes of an incomplete start line after each read.
 /// Returns what `parse` returned. `Ok(None)`: the other side closed first.
 /// `buf` never grows past [`MAX_HEAD`], so a head that `parse` finds is at
 /// most that long; a longer one gets `too_long()`.
@@ -82,8 +83,21 @@ where
                 });
                 if !valid {
                     // Keep the parser's error wording for malformed fields.
-                    return Ok(parse(&buf[..scanned]));
+                    match parse(&buf[..scanned]) {
+                        Ok(None) => {}
+                        result => return Ok(result),
+                    }
                 }
+            }
+        }
+        if first && line_start < buf.len() {
+            // Skip leading empty lines and bound the work before a newline.
+            // Seven bytes cover the response prefix "HTTP/1." and the start
+            // of a request's method token.
+            let end = buf.len().min(line_start + 7);
+            match parse(&buf[line_start..end]) {
+                Ok(None) => {}
+                result => return Ok(result),
             }
         }
         if buf.len() >= MAX_HEAD {
@@ -320,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fragmented_heads_are_parsed_only_at_line_boundaries() {
+    async fn fragmented_heads_have_bounded_parsing_work() {
         use std::pin::Pin;
         use std::task::{Context, Poll};
         use tokio::io::ReadBuf;
@@ -343,11 +357,17 @@ mod tests {
         let mut reader = Bytes(input);
         let mut buf = Vec::new();
         let mut parsed_bytes = 0;
+        let mut prefix_bytes = 0;
         let found = read_head(
             &mut reader,
             &mut buf,
             |bytes| {
-                parsed_bytes += bytes.len();
+                if bytes.ends_with(b"\n") {
+                    parsed_bytes += bytes.len();
+                } else {
+                    assert!(bytes.len() <= 7);
+                    prefix_bytes += bytes.len();
+                }
                 parse_request(bytes)
             },
             || panic!("short head"),
@@ -359,6 +379,43 @@ mod tests {
         assert_eq!(found, parse_request(input).unwrap().unwrap());
         assert_eq!(reader.0, b"body");
         assert!(parsed_bytes <= 2 * found.1, "parsed {parsed_bytes} bytes");
+        assert!(
+            prefix_bytes <= 7 * found.1,
+            "parsed {prefix_bytes} prefix bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_http_prefix_fails_before_the_next_read() {
+        let input = b"\x16\x03\x01\0\x01";
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(input).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_head(&mut reader, &mut Vec::new(), parse_request, || {
+                panic!("short head")
+            }),
+        )
+        .await
+        .expect("non-HTTP bytes must fail while the writer remains open")
+        .unwrap();
+        assert!(result.is_err());
+        assert_eq!(result, parse_request(input));
+    }
+
+    #[tokio::test]
+    async fn incomplete_header_fallback_keeps_reading() {
+        let mut reader = (&b"GET / HTTP/1.1\nMissing colon\n"[..]).chain(&b"\n"[..]);
+        let result = read_head(
+            &mut reader,
+            &mut Vec::new(),
+            |bytes| Ok::<_, ()>(bytes.ends_with(b"\n\n").then_some(bytes.len())),
+            || panic!("short head"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, Some(b"GET / HTTP/1.1\nMissing colon\n\n".len()));
     }
 
     #[tokio::test]
