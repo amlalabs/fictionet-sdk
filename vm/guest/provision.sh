@@ -121,6 +121,7 @@ RUSTUP_HOME=/opt/rust/rustup rustc --version
 step "Name lookups that follow each namespace's resolv.conf"
 # Stop the shared resolver daemon so namespace workloads cannot ask it
 # through local sockets. The VM uses QEMU's DNS through a plain file.
+# With plain "dns", glibc reads resolv.conf, which ip netns exec swaps per namespace.
 systemctl mask --now systemd-resolved
 rm -f /etc/resolv.conf
 printf 'nameserver 10.0.2.3\n' > /etc/resolv.conf

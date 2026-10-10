@@ -146,13 +146,13 @@ straight into images, without a second build.
   search for a data source. With the SSH key already in the image, there is
   nothing for it to do.
 
-The VM differs from a stock Debian install in one way that matters for
-Fictionet: `/etc/nsswitch.conf` looks names up with `files myhostname dns`.
-Debian's cloud image uses systemd-resolved's NSS module, which asks resolved over
-a socket. Resolved runs in the VM's own network namespace, so a program in a
-sandbox namespace would get the VM's real DNS, whatever
-`/etc/netns/agent/resolv.conf` says. The same holds on any host that uses
-`nss-resolve`.
+Provisioning changes Debian's DNS setup in two ways. First,
+`/etc/nsswitch.conf` looks names up with `files myhostname dns`. With plain
+`dns`, glibc reads `/etc/resolv.conf`, which `ip netns exec` swaps per namespace.
+Second, provisioning stops and masks systemd-resolved so sandbox workloads
+cannot ask the VM's resolver through local sockets. It writes a plain
+`/etc/resolv.conf` with `nameserver 10.0.2.3`, QEMU's user-net DNS, so the VM
+keeps DNS access.
 
 ## Troubleshooting
 
