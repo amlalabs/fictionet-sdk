@@ -204,8 +204,10 @@ Other kinds of port:
 - `port_server(port, server)` and `tls_accept(port, sni, config, server)`: a
   `PortServer` of the world's own. HTTP is one: `httpd::Server`, below.
 
-Each sandbox may hold 256 connections at once to one machine. What its
-connections hold is charged to one budget per sandbox, 256 MiB by default.
+Each peer address may hold 256 connections at once across all machines
+and gateway DNS listeners in the network. Bytes held by the service layer
+are charged to one budget per sandbox, 256 MiB by default. TCP socket
+buffers and TLS handshakes are outside this budget.
 The driver counts each connection's read buffer or its decoder's capacity,
 whichever is larger, the input its decoder has not used yet, queued
 replies, and what the service and its deferred work report holding.
