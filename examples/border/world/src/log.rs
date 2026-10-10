@@ -43,6 +43,13 @@ impl Log {
             scenario,
         }
     }
+    /// Prepares the trusted harness's shutdown request and acknowledgement.
+    pub fn finalization(
+        &self,
+        directory: &std::path::Path,
+    ) -> std::io::Result<shared::Finalization> {
+        self.inner.finalization(directory)
+    }
     /// Attaches the output to the run's lifetime.
     pub fn attach(&self, fcx: &Cx) {
         self.inner.attach(fcx);

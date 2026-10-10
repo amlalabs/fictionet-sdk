@@ -37,7 +37,18 @@ class Logs(unittest.IsolatedAsyncioTestCase):
             log = Path(directory) / "log.jsonl"
             log.write_bytes(data)
             with patch.object(module, "LOG", str(log)), patch.object(module, "sandbox", return_value=sandbox):
-                return await module.world_log(offset)
+                return await module.world_log(offset, finalize=False)
+
+    async def test_failed_finalization_prevents_log_snapshot(self):
+        from unittest.mock import AsyncMock
+        for module in self.modules():
+            world = SimpleNamespace(exec=AsyncMock(), read_file=AsyncMock())
+            finalization = AsyncMock(side_effect=RuntimeError("writer failed"))
+            with patch.object(module, "sandbox", return_value=world), patch.object(module, "finalize_world", finalization):
+                with self.assertRaisesRegex(RuntimeError, "writer failed"):
+                    await module.world_log()
+            world.exec.assert_not_awaited()
+            world.read_file.assert_not_awaited()
 
     async def test_loss_before_offset_is_rejected(self):
         for module in self.modules():
@@ -79,6 +90,42 @@ class Logs(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await self.read(module, b''), [])
                 with self.assertRaisesRegex(RuntimeError, "read failed"):
                     await self.read(module, b'', success=False)
+
+
+
+
+class Finalization(unittest.IsolatedAsyncioTestCase):
+    async def test_request_precedes_acknowledgement(self):
+        import runpy
+        from unittest.mock import AsyncMock
+        finalize = runpy.run_path(str(Path(__file__).with_name("finalize.py")))["finalize_world"]
+        world = SimpleNamespace(exec=AsyncMock(side_effect=[
+            SimpleNamespace(success=True),
+            SimpleNamespace(success=False),
+            SimpleNamespace(success=True, stdout="ok\n"),
+        ]))
+        await finalize(world, object(), "/state/log.jsonl")
+        self.assertEqual([c.args[0] for c in world.exec.await_args_list], [
+            ["touch", "/state/finalize"], ["cat", "/state/finalized"], ["cat", "/state/finalized"],
+        ])
+
+    async def test_dead_writer_or_world_cannot_acknowledge(self):
+        import runpy
+        from unittest.mock import AsyncMock
+        finalize = runpy.run_path(str(Path(__file__).with_name("finalize.py")))["finalize_world"]
+        world = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(success=False, stderr="stopped")))
+        with self.assertRaisesRegex(RuntimeError, "stopped"):
+            await finalize(world, object(), "/state/log.jsonl")
+        world.exec = AsyncMock(side_effect=lambda cmd: SimpleNamespace(success=cmd[0] == "touch"))
+        with self.assertRaisesRegex(RuntimeError, "timed out"):
+            await finalize(world, object(), "/state/log.jsonl", timeout=0.01)
+
+    async def test_agent_alias_is_refused(self):
+        import runpy
+        finalize = runpy.run_path(str(Path(__file__).with_name("finalize.py")))["finalize_world"]
+        agent = object()
+        with self.assertRaisesRegex(RuntimeError, "separate"):
+            await finalize(agent, agent, "/state/log.jsonl")
 
 
 if __name__ == "__main__":

@@ -51,9 +51,13 @@ vm "curl -sS -H 'Authorization: Bearer $token' -H 'Host: 127.0.0.1:$host_port' h
 step "Some traffic from the sandbox"
 note "A loop in the sandbox looks up names and fetches pages every second, so the graph has"
 note "something to show."
-ip netns exec agent bash -c 'while :; do
+install -m 0644 /run/fictionet/ca.pem /run/agent-ca.pem
+AGENT=(ip netns exec agent setpriv --reuid=agent --regid=agent --clear-groups
+    --inh-caps=-all --bounding-set=-all --no-new-privs
+    env -i PATH=/usr/bin:/bin HOME=/tmp)
+"${AGENT[@]}" bash -c 'while :; do
     dig +short example.test nope.test >/dev/null
-    curl -sS --cacert /run/fictionet/ca.pem https://example.test/ >/dev/null
+    curl -sS --cacert /run/agent-ca.pem https://example.test/ >/dev/null
     curl -sS http://plain.test/ >/dev/null
     sleep 1
 done' >/dev/null 2>&1 &

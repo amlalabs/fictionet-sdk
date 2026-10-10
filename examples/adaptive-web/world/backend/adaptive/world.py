@@ -90,11 +90,17 @@ def unsupported_snippets(mentions: list[dict], page_text: str) -> list[str]:
 LINK = re.compile(r"""<a\b[^>]*\bhref\s*=\s*["']([^"'#]+)[^"']*["'][^>]*>(.*?)</a>""", re.I | re.S)
 
 
+class GenerationBudgetExceeded(RuntimeError):
+    """This run has used its generation budget."""
+
+
 class World:
-    def __init__(self, seed: Seed, store: Store, generator: Model | stub.Stub | None, prefetch: int = 0):
+    def __init__(self, seed: Seed, store: Store, generator: Model | stub.Stub | None, prefetch: int = 0, generation_budget: int = 200):
         """`generator` makes new results and pages; None replays the store.
         `prefetch` is how many pages behind each new result list to make
         ahead of time."""
+        self.generation_budget = generation_budget
+        self.generation_lock = threading.Lock()
         self.seed = seed
         self.store = store
         self.generator = generator
@@ -106,10 +112,17 @@ class World:
         self.unserved: set[tuple[str, str]] = set()
         self.unserved_lock = threading.Lock()
 
+    def _reserve_generation(self) -> None:
+        with self.generation_lock:
+            if self.generation_budget <= 0:
+                raise GenerationBudgetExceeded("generation budget exhausted")
+            self.generation_budget -= 1
+
     def cast(self) -> list[dict]:
         """The people the world names, made by the generator the first time
         a page or result list needs them."""
         def make() -> dict:
+            self._reserve_generation()
             made = self.generator.cast()
             self.store.log_generation({"kind": "cast", **made.usage(), "raw": made.raw})
             return {"people": made.fields, **made.usage()}
@@ -156,7 +169,10 @@ class World:
         if record is None and self.generator is None:
             record, cache = {"query": query, "results": []}, "missing"
         elif record is None:
-            record, made = self.store.search_once(key, lambda: self._make_search(key, query))
+            try:
+                record, made = self.store.search_once(key, lambda: self._make_search(key, query))
+            except GenerationBudgetExceeded:
+                return html_response("Generation budget exhausted", {"kind": "search", "cache": "budget"}, status=503)
             if made:
                 cache = "generated"
                 for r in record["results"][:self.prefetch]:
@@ -176,6 +192,7 @@ class World:
         return known
 
     def _make_search(self, key: str, query: str) -> dict:
+        self._reserve_generation()
         made = self.generator.search(query, self._known(), self.store.recent_claims(), self.cast())
         results = []
         for rank, r in enumerate(made.fields["results"], 1):
@@ -222,7 +239,10 @@ class World:
         if record is None and self.generator is None:
             return self._not_found(host, target, "missing")
         if record is None:
-            record, made = self.store.page_once(host, target, lambda: self._make_page(host, target, prefetch))
+            try:
+                record, made = self.store.page_once(host, target, lambda: self._make_page(host, target, prefetch))
+            except GenerationBudgetExceeded:
+                return html_response("Generation budget exhausted", {"kind": "page", "cache": "budget"}, status=503)
             if made:
                 cache = "generated"
                 if record["content_type"].startswith("text/html"):
@@ -261,6 +281,7 @@ class World:
         return html_response(body, {"kind": "page", "cache": cache}, status=404, server=render.server_of(profile))
 
     def _make_page(self, host: str, target: str, prefetch: bool) -> dict:
+        self._reserve_generation()
         url = f"https://{host}{target}"
         mentions = self.store.mentions(host, target)
         ask = PageAsk(url, host, target, mentions, self.store.site(host), self.store.pages(host)[:20],

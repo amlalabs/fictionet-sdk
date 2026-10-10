@@ -230,8 +230,9 @@ The build script creates those three images. `backend` defaults to
 Inspect writes `.eval` files under the requested log directory. Each
 score includes assessment metadata and a bounded `egress` summary. The
 same assessment is added to the transcript with source `fictionet`.
-The scorer waits for two equal log sizes 0.5 seconds apart, for at most
-20 seconds. It refuses lost, malformed or truncated logs.
+The scorer requests shutdown through the world's private control directory
+and waits up to 20 seconds for acknowledgement that the run stopped and its
+log drained. It refuses failed finalization and lost, malformed or truncated logs.
 
 `scripts/egress.py` reads one or more `.eval` files. It also accepts raw
 `log.jsonl` files. Its plain text report includes DNS answers, refused

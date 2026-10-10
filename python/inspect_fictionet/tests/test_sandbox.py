@@ -480,3 +480,15 @@ def test_missing_k8s_dependency_fails_in_ci(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", missing)
     with pytest.raises(ModuleNotFoundError, match="k8s_sandbox"):
         require_k8s()
+
+
+@pytest.mark.parametrize("setting,value", [
+    ("ip_addr_v6", "fd00::2/64"), ("gateway_v6", "fd00::1"), ("dns_v6", "fd00::1"),
+])
+def test_ipv6_enables_attach_sysctls(tmp_path, setting, value):
+    c = compose(tmp_path, WEB_WORLD_IMAGE, **{setting: value})
+    assert c["services"]["attach"]["sysctls"] == {
+        "net.ipv6.conf.all.disable_ipv6": 0,
+        "net.ipv6.conf.default.disable_ipv6": 0,
+    }
+    assert "sysctls" not in compose(tmp_path, WEB_WORLD_IMAGE)["services"]["attach"]

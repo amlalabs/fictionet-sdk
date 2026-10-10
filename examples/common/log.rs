@@ -5,7 +5,8 @@
 //! The writer's timeout closes fold windows when no new line arrives. It uses
 //! wall time without spawning a run task or recording transport events, so it
 //! cannot keep a lab alive or add lines to observations and golden transcripts.
-//! Closing the run drains the queue and closes the remaining folds.
+//! Closing the run drains the queue and closes the remaining folds. Finalization
+//! checks output failures and lost lines before acknowledging the harness.
 
 use fictionet::{Cx, sync::Mutex};
 use serde_json::{Map, Value, json};
@@ -34,6 +35,7 @@ pub struct Log(Arc<Inner>);
 struct Inner {
     backend: Mutex<Backend>,
     lost: Arc<AtomicU64>,
+    failure: Arc<Mutex<Option<String>>>,
 }
 enum Backend {
     Pending(Writer),
@@ -44,11 +46,7 @@ enum Backend {
 struct Finish(Arc<Inner>);
 impl Drop for Finish {
     fn drop(&mut self) {
-        let backend = std::mem::replace(&mut *self.0.backend.lock(), Backend::Closed);
-        if let Backend::Real(sender, thread) = backend {
-            drop(sender);
-            thread.join().expect("the log writer finishes");
-        }
+        let _ = Log(self.0.clone()).finish();
     }
 }
 impl Log {
@@ -61,8 +59,58 @@ impl Log {
         Self(Arc::new(Inner {
             backend: Mutex::new(Backend::Pending(Writer::new(out, folded, transform))),
             lost: Arc::new(AtomicU64::new(0)),
+            failure: Arc::new(Mutex::new(None)),
         }))
     }
+    /// Reports output failure or lost lines, including failures during final flush.
+    pub fn health(&self) -> std::io::Result<()> {
+        if let Some(error) = &*self.0.failure.lock() {
+            return Err(std::io::Error::other(error.clone()));
+        }
+        if self.0.lost.load(Ordering::Relaxed) != 0 {
+            return Err(std::io::Error::other("the world lost log lines"));
+        }
+        Ok(())
+    }
+
+    /// Drains the output after all producers have stopped and checks its health.
+    pub fn finish(&self) -> std::io::Result<()> {
+        let backend = std::mem::replace(&mut *self.0.backend.lock(), Backend::Closed);
+        match backend {
+            Backend::Real(sender, thread) => {
+                drop(sender);
+                if thread.join().is_err() {
+                    *self.0.failure.lock() = Some("the log writer panicked".into());
+                }
+            }
+            Backend::Lab(mut writer) | Backend::Pending(mut writer) => {
+                if let Err(error) = writer.close_folds().and_then(|()| writer.flush()) {
+                    *self.0.failure.lock() = Some(error.to_string());
+                }
+            }
+            Backend::Closed => {}
+        }
+        self.health()
+    }
+
+    /// Prepares the private request and acknowledgement files for this run.
+    pub fn finalization(&self, directory: &std::path::Path) -> std::io::Result<Finalization> {
+        let request = directory.join("finalize");
+        let acknowledgement = directory.join("finalized");
+        for path in [&request, &acknowledgement] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Finalization {
+            log: self.clone(),
+            request,
+            acknowledgement,
+        })
+    }
+
     /// Starts delivery and arranges for the run's end to drain the output.
     pub fn attach(&self, fcx: &Cx) {
         let mut backend = self.0.backend.lock();
@@ -74,11 +122,12 @@ impl Log {
         } else {
             let (sender, receiver) = mpsc::sync_channel(QUEUE);
             let lost = self.0.lost.clone();
+            let failure = self.0.failure.clone();
             let thread = std::thread::Builder::new()
                 .name("example-log".into())
                 .spawn(move || {
                     if let Err(error) = write_all(receiver, writer, &lost) {
-                        eprintln!("cannot write the example log: {error}");
+                        *failure.lock() = Some(error.to_string());
                     }
                 })
                 .expect("the log writer starts");
@@ -101,8 +150,7 @@ impl Log {
         match &mut *self.0.backend.lock() {
             Backend::Lab(writer) => {
                 if let Err(error) = writer.line(now(), value).and_then(|()| writer.flush()) {
-                    writer.failed = true;
-                    eprintln!("cannot write the example log: {error}");
+                    *self.0.failure.lock() = Some(error.to_string());
                 }
             }
             Backend::Real(sender, _) => {
@@ -113,6 +161,39 @@ impl Log {
             Backend::Pending(_) => panic!("log attached to a run"),
             Backend::Closed => {}
         }
+    }
+}
+
+/// The trusted harness requests shutdown through files in the world's private directory.
+pub struct Finalization {
+    log: Log,
+    request: std::path::PathBuf,
+    acknowledgement: std::path::PathBuf,
+}
+impl Finalization {
+    /// Stops the run on a request, or fails it if logging failed.
+    pub async fn wait(&self, fcx: &Cx) -> fictionet::Result {
+        loop {
+            self.log.health()?;
+            if self.request.try_exists()? {
+                fcx.cancel();
+                return Ok(());
+            }
+            fcx.sleep(Duration::from_millis(50)).await?;
+        }
+    }
+
+    /// Acknowledges only after the run ended and its output drained successfully.
+    pub fn acknowledge(&self, result: fictionet::Result) -> fictionet::Result {
+        result?;
+        self.log.finish()?;
+        if !self.request.try_exists()? {
+            return Err(std::io::Error::other("world ended without finalization").into());
+        }
+        let temporary = self.acknowledgement.with_extension("tmp");
+        std::fs::write(&temporary, b"ok\n")?;
+        std::fs::rename(temporary, &self.acknowledgement)?;
+        Ok(())
     }
 }
 
@@ -222,7 +303,6 @@ pub struct Writer {
     window: Option<Instant>,
     folded: &'static [&'static str],
     transform: fn(String) -> String,
-    failed: bool,
 }
 impl Writer {
     /// Prepares an output with the given fold kinds and text transformation.
@@ -237,7 +317,6 @@ impl Writer {
             window: None,
             folded,
             transform,
-            failed: false,
         }
     }
     fn write_line(&mut self, ts: f64, fields: Map<String, Value>) -> std::io::Result<()> {
@@ -246,11 +325,7 @@ impl Writer {
         line.extend(fields);
         let mut text = (self.transform)(Value::Object(line).to_string());
         text.push('\n');
-        let result = self.out.write_all(text.as_bytes());
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
+        self.out.write_all(text.as_bytes())
     }
     /// Writes `value`, or counts it in its fold.
     pub fn line(&mut self, ts: f64, value: Value) -> std::io::Result<()> {
@@ -300,18 +375,7 @@ impl Writer {
         Ok(())
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        let result = self.out.flush();
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-}
-impl Drop for Writer {
-    fn drop(&mut self) {
-        if !self.failed {
-            let _ = self.close_folds().and_then(|()| self.out.flush());
-        }
+        self.out.flush()
     }
 }
 
@@ -368,6 +432,142 @@ pub fn assert_repeated_lines_fold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FailingOutput {
+        writes: usize,
+        flush_fails: bool,
+    }
+    impl Write for FailingOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if self.writes > 1 && !self.flush_fails {
+                return Err(std::io::Error::other("intentional write failure"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.flush_fails {
+                Err(std::io::Error::other("intentional flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn failing_log(flush_fails: bool) -> Log {
+        Log::new(
+            Box::new(FailingOutput {
+                writes: 0,
+                flush_fails,
+            }),
+            &[],
+            |s| s,
+        )
+    }
+
+    #[test]
+    fn real_write_failure_survives_run_teardown() {
+        let log = failing_log(false);
+        let output = log.clone();
+        fictionet::block_on(fictionet::run(
+            fictionet::Seed::from_u64(1),
+            move |fcx| async move {
+                output.attach(&fcx);
+                output.write(json!({"type": "first"}));
+                output.write(json!({"type": "second"}));
+                Ok(())
+            },
+        ))
+        .unwrap();
+        assert!(
+            log.finish()
+                .unwrap_err()
+                .to_string()
+                .contains("write failure")
+        );
+        assert!(log.health().is_err());
+    }
+
+    #[test]
+    fn writer_failure_stops_the_serving_run_without_acknowledgement() {
+        let log = failing_log(false);
+        let dir = std::env::temp_dir().join(format!("fictionet-failed-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let finalization = Arc::new(log.finalization(&dir).unwrap());
+        let shutdown = finalization.clone();
+        let result = fictionet::block_on(fictionet::run(
+            fictionet::Seed::from_u64(1),
+            move |fcx| async move {
+                log.attach(&fcx);
+                log.write(json!({"type": "first"}));
+                log.write(json!({"type": "second"}));
+                shutdown.wait(&fcx).await
+            },
+        ));
+        assert!(result.is_err());
+        assert!(finalization.acknowledge(result).is_err());
+        assert!(!finalization.acknowledgement.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lab_flush_failure_survives_run_teardown() {
+        let log = failing_log(true);
+        let output = log.clone();
+        fictionet::block_on(fictionet::lab(
+            fictionet::Seed::from_u64(1),
+            move |fcx| async move {
+                output.attach(&fcx);
+                output.write(json!({"type": "first"}));
+                Ok(())
+            },
+        ))
+        .unwrap();
+        assert!(
+            log.finish()
+                .unwrap_err()
+                .to_string()
+                .contains("flush failure")
+        );
+    }
+
+    #[test]
+    fn acknowledgement_follows_cancellation_and_fold_drain() {
+        let dir = std::env::temp_dir().join(format!("fictionet-finalize-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = Output(Arc::new(Mutex::new(Vec::new())));
+        let log = Log::new(Box::new(output.clone()), &["blocked"], |s| s);
+        let finalization = Arc::new(log.finalization(&dir).unwrap());
+        let shutdown = finalization.clone();
+        std::fs::write(&finalization.request, b"").unwrap();
+        let result = fictionet::block_on(fictionet::run(
+            fictionet::Seed::from_u64(1),
+            move |fcx| async move {
+                log.attach(&fcx);
+                log.write(json!({"type": "blocked"}));
+                fcx.spawn(move |task| async move {
+                    task.cancelled().await;
+                    log.write(json!({"type": "blocked"}));
+                    Ok(())
+                });
+                shutdown.wait(&fcx).await
+            },
+        ));
+        assert!(!finalization.acknowledgement.exists());
+        finalization.acknowledge(result).unwrap();
+        assert_eq!(lines(&output).len(), 2);
+        assert_eq!(lines(&output)[1]["count"], 1);
+        assert_eq!(
+            std::fs::read_to_string(&finalization.acknowledgement).unwrap(),
+            "ok\n"
+        );
+        let failed = failing_log(true);
+        let finalization = failed.finalization(&dir).unwrap();
+        std::fs::write(&finalization.request, b"").unwrap();
+        assert!(finalization.acknowledge(Ok(())).is_err());
+        assert!(!finalization.acknowledgement.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     struct SlowWriter {
         entered: mpsc::Sender<()>,

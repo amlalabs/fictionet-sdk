@@ -116,7 +116,7 @@ def run_probes():
     async def solve(state: TaskState, generate: Generate) -> TaskState:
         agent = sandbox()
         ev: dict = {"state": await world_state()}
-        offset = len(await world_log())
+        offset = len(await world_log(finalize=False))
 
         async def run(cmd, timeout=60):
             r = await agent.exec(cmd, timeout=timeout)

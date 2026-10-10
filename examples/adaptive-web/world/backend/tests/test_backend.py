@@ -364,5 +364,35 @@ AD: https://ad.example-shop.de/ | Buy | Now 20% off"""
             prompts.read_search("Sorry, I can't help with that.")
 
 
+
+
+class GenerationBudget(unittest.TestCase):
+    def test_budget_refuses_new_work_but_keeps_cached_pages(self):
+        with tempfile.TemporaryDirectory() as d:
+            w = World(SEED, Store(Path(d)), Stub(SEED), generation_budget=2)
+            first = w.page("example.com", "/first")
+            self.assertEqual(first.status, 200)
+            self.assertEqual(w.generation_budget, 0)  # Page and cast.
+            self.assertEqual(w.page("example.com", "/second").status, 503)
+            self.assertEqual(w.search("google", "new query").status, 503)
+            self.assertEqual(w.page("example.com", "/first").body, first.body)
+            self.assertIsNone(w.store.page("example.com", "/second"))
+
+    def test_concurrent_reservations_cannot_exceed_budget(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from adaptive.world import GenerationBudgetExceeded
+        with tempfile.TemporaryDirectory() as d:
+            w = World(SEED, Store(Path(d)), Stub(SEED), generation_budget=3)
+            def reserve(_):
+                try:
+                    w._reserve_generation()
+                    return True
+                except GenerationBudgetExceeded:
+                    return False
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                self.assertEqual(sum(pool.map(reserve, range(20))), 3)
+            self.assertEqual(w.generation_budget, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 // The packets between the sandboxes and `web::Sites`, written to a pcap
 // file that tshark and Wireshark open. The world prints a line when a
-// packet could not be written.
+// packet could not be written. Controlled shutdown drains the writer; an
+// abrupt exit can truncate the pcap.
 //
 //     cargo run --example capture_sites -- /run/fictionet/world.sock /run/fictionet/agent.pcap
 
@@ -31,7 +32,7 @@ fn main() -> fictionet::Result {
     // The file is written on a thread of its own. A world's tasks share
     // one thread, and a write can block, so the filter only hands each
     // packet to this channel, which never waits.
-    let (tx, rx) = sync_channel::<(Duration, Vec<u8>)>(100_000);
+    let (tx, rx) = sync_channel::<(Duration, Vec<u8>)>(1024);
     let lost = Arc::new(AtomicU64::new(0));
     let mut file = std::io::BufWriter::new(std::fs::File::create(&pcap)?);
     // The pcap header: version 2.4, packets up to 65,535 bytes, raw IP.
@@ -40,44 +41,15 @@ fn main() -> fictionet::Result {
     }
     file.flush()?;
     let writer_lost = lost.clone();
-    let mut writer = move || -> std::io::Result<()> {
-        let mut reported = 0;
-        loop {
-            let (at, packet) = match rx.try_recv() {
-                Ok(p) => p,
-                // Nothing waiting: write out what is buffered, then wait.
-                Err(TryRecvError::Empty) => {
-                    file.flush()?;
-                    let n = writer_lost.load(Ordering::Relaxed);
-                    if n != reported {
-                        reported = n;
-                        println!("capture: {n} packets not captured, because the channel was full");
-                    }
-                    match rx.recv() {
-                        Ok(p) => p,
-                        Err(_) => return Ok(()),
-                    }
-                }
-                Err(TryRecvError::Disconnected) => return Ok(()),
-            };
-            let len = packet.len() as u32;
-            for word in [at.as_secs() as u32, at.subsec_micros(), len, len] {
-                file.write_all(&word.to_le_bytes())?;
-            }
-            file.write_all(&packet)?;
-        }
-    };
-    let pcap_path = pcap.clone();
-    std::thread::spawn(move || {
-        if let Err(e) = writer() {
-            eprintln!(
-                "capture: writing {pcap_path} failed, so later packets are not captured: {e}"
-            );
-        }
-    });
-
     let start = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    fictionet::block_on(fictionet::run(
+    let writer = std::thread::spawn(move || {
+        let result = write_packets(file, rx, writer_lost);
+        if let Err(error) = &result {
+            eprintln!("capture: writing {pcap} failed: {error}");
+        }
+        result
+    });
+    let result = fictionet::block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
             let app = axum::Router::new()
@@ -101,5 +73,76 @@ fn main() -> fictionet::Result {
             .start(&fcx, watched)?;
             Ok(())
         },
-    ))
+    ));
+    writer
+        .join()
+        .map_err(|_| std::io::Error::other("capture writer panicked"))??;
+    result
+}
+
+fn write_packets(
+    mut file: impl Write,
+    rx: std::sync::mpsc::Receiver<(Duration, Vec<u8>)>,
+    writer_lost: Arc<AtomicU64>,
+) -> std::io::Result<()> {
+    let mut reported = 0;
+    loop {
+        let (at, packet) = match rx.try_recv() {
+            Ok(p) => p,
+            // Nothing waiting: write out what is buffered, then wait.
+            Err(TryRecvError::Empty) => {
+                file.flush()?;
+                let n = writer_lost.load(Ordering::Relaxed);
+                if n != reported {
+                    reported = n;
+                    println!("capture: {n} packets not captured, because the channel was full");
+                }
+                match rx.recv() {
+                    Ok(p) => p,
+                    Err(_) => return Ok(()),
+                }
+            }
+            Err(TryRecvError::Disconnected) => return file.flush(),
+        };
+        let len = packet.len() as u32;
+        for word in [at.as_secs() as u32, at.subsec_micros(), len, len] {
+            file.write_all(&word.to_le_bytes())?;
+        }
+        file.write_all(&packet)?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controlled_shutdown_drains_and_flushes_queued_packets() {
+        #[derive(Clone, Default)]
+        struct Output(Arc<std::sync::Mutex<(Vec<u8>, bool)>>);
+        impl Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.lock().unwrap().1 = true;
+                Ok(())
+            }
+        }
+        let output = Output::default();
+        let sink = output.clone();
+        let (tx, rx) = sync_channel(2);
+        tx.send((Duration::from_secs(1), vec![1, 2, 3])).unwrap();
+        tx.send((Duration::from_secs(2), vec![4, 5])).unwrap();
+        drop(tx);
+        let writer =
+            std::thread::spawn(move || write_packets(sink, rx, Arc::new(AtomicU64::new(0))));
+        writer.join().unwrap().unwrap();
+        let out = output.0.lock().unwrap();
+        assert_eq!(out.0.len(), 16 + 3 + 16 + 2);
+        assert_eq!(&out.0[16..19], &[1, 2, 3]);
+        assert_eq!(&out.0[35..], &[4, 5]);
+        assert!(out.1, "disconnect flushes buffered output");
+    }
 }

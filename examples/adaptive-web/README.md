@@ -418,7 +418,11 @@ examples/adaptive-web/
 
 * **The agent waits while a new page is made**, 3 to 4 s with the default
   model, unless it was made ahead of time. Clients with short timeouts can
-  give up first; the page is still stored for the next request.
+  give up first; the page is still stored for the next request. Each backend
+  run allows 200 new generator calls, including searches, pages, prefetches
+  and the cast. Failed calls use the budget too. Further generation returns
+  HTTP 503; cached and fixed pages remain available. Retained stores are
+  intended for short demos.
 * **A judge that knows to look can usually tell.** In the realism runs the
   judge found the made page in 66% to 86% of pairs, depending on the model.
   An agent is not told to look, and none of the agents in the last runs

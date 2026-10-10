@@ -420,6 +420,11 @@ def compose_config(cfg: _Config, cache: Path, token: str | None = None) -> dict[
         "cap_drop": ["ALL"],
         **_compose_limits(ATTACH_LIMITS),
     }
+    if cfg.ip_addr_v6 or cfg.gateway_v6 or cfg.dns_v6:
+        attach["sysctls"] = {
+            "net.ipv6.conf.all.disable_ipv6": 0,
+            "net.ipv6.conf.default.disable_ipv6": 0,
+        }
     if cfg.proxy:
         # No device and no NET_ADMIN. DAC_OVERRIDE lets root connect to a
         # socket that the world's user owns.

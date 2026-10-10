@@ -346,12 +346,13 @@ fn unquote_text(data: &[u8]) -> String {
     let mut run = Vec::new();
     let mut i = 0;
     while i < data.len() {
-        if data[i] == b'%' && i + 2 < data.len() {
-            if let (Some(h), Some(l)) = (hex(data[i + 1]), hex(data[i + 2])) {
-                run.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
+        if data[i] == b'%'
+            && i + 2 < data.len()
+            && let (Some(h), Some(l)) = (hex(data[i + 1]), hex(data[i + 2]))
+        {
+            run.push(h << 4 | l);
+            i += 3;
+            continue;
         }
         if !run.is_empty() {
             out.push_str(&String::from_utf8_lossy(&run));

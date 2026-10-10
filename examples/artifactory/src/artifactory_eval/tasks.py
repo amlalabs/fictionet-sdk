@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
+import runpy
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, Final
 
 from inspect_ai import Task, task
@@ -18,6 +19,8 @@ from inspect_ai.util import SandboxEnvironmentSpec, sandbox
 from inspect_fictionet import fictionet_sandbox, read_world_file
 
 from artifactory_eval.world import SCORES, WorldLogError, assess, read_lines
+
+finalize_world = runpy.run_path(str(Path(__file__).resolve().parents[3] / "common" / "finalize.py"))["finalize_world"]
 
 VARIANTS: Final = ("normal", "missing", "lookalike", "peer")
 WORLD_IMAGE: Final = "fictionet-artifactory-world:dev"
@@ -72,7 +75,7 @@ def world_sandbox(
             "ARTIFACTORY_SEED": "${SAMPLE_METADATA_SEED:-}",
         },
         world_ca="/run/ca/ca.pem",
-        world_healthcheck=["test", "-f", "/run/fictionet/ready"],
+        **({"world_healthcheck": ["test", "-f", "/run/fictionet/ready"]} if backend == "docker" else {}),
         agent_image=agent_image, attach_image=attach_image, backend=backend,
     )
 
@@ -100,31 +103,18 @@ def setup() -> Solver:
     return solve
 
 
-async def settled_log() -> list[dict[str, Any]]:
-    """Wait up to 20 seconds for two equal sizes, then read the complete log."""
+async def finalized_log() -> list[dict[str, Any]]:
+    """Stop the world and read its complete, drained log."""
     world = sandbox("world")
-    if world is sandbox():
-        raise WorldLogError("no separate world sandbox for reading the log")
-
-    async def size() -> int:
-        result = await world.exec(["stat", "-c", "%s", LOG])
-        if not result.success:
-            raise WorldLogError(f"cannot stat the world log: {result.stderr}")
-        return int(result.stdout.strip())
-
     try:
-        async with asyncio.timeout(20):
-            previous = await size()
-            while True:
-                await asyncio.sleep(0.5)
-                current = await size()
-                if current == previous:
-                    break
-                previous = current
-    except TimeoutError as error:
-        raise WorldLogError("world log did not settle within 20 seconds") from error
+        await finalize_world(world, sandbox(), LOG)
+    except RuntimeError as error:
+        raise WorldLogError(str(error)) from error
+    result = await world.exec(["stat", "-c", "%s", LOG])
+    if not result.success:
+        raise WorldLogError(f"cannot stat the world log: {result.stderr}")
     data = await read_world_file(LOG, text=False)
-    if not isinstance(data, bytes) or len(data) != current or (data and not data.endswith(b"\n")):
+    if not isinstance(data, bytes) or len(data) != int(result.stdout) or (data and not data.endswith(b"\n")):
         raise WorldLogError("world log changed or was truncated while being read")
     try:
         return read_lines(data.decode("utf-8"))
@@ -133,10 +123,10 @@ async def settled_log() -> list[dict[str, Any]]:
 
 
 async def score_episode(state: TaskState) -> Score:
-    """Read private state and the settled log, and publish the assessment."""
+    """Read private state and the finalized log, and publish the assessment."""
     truth = await world_state()
     check_state(truth, state.metadata)
-    assessment = assess(await settled_log(), truth, state.output.completion)
+    assessment = assess(await finalized_log(), truth, state.output.completion)
     transcript().info(assessment.metadata, source="fictionet")
     return Score(value=assessment.scores, answer=state.output.completion, metadata=assessment.metadata)
 

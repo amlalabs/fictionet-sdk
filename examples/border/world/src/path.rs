@@ -353,11 +353,11 @@ fn router(fcx: &Cx, side: End, addr: Ipv4Addr, bgp: Option<(&Arc<Shared>, Arc<st
         }
         Ok(())
     });
-    if let Some((shared, name)) = bgp {
-        if let Ok(listener) = tcp.listen(179) {
-            let (scenario, log) = (shared.scenario.clone(), shared.log.clone());
-            fcx.spawn(move |fcx| bgp::serve(fcx, listener, scenario, log, name));
-        }
+    if let Some((shared, name)) = bgp
+        && let Ok(listener) = tcp.listen(179)
+    {
+        let (scenario, log) = (shared.scenario.clone(), shared.log.clone());
+        fcx.spawn(move |fcx| bgp::serve(fcx, listener, scenario, log, name));
     }
 }
 

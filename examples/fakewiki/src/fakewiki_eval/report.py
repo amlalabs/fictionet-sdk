@@ -43,9 +43,14 @@ def main(argv: list[str]) -> None:
             r = rows[key]
             if s.error or not s.scores:
                 r["errors"].append(1)
+                if s.error and "grader failed after three attempts" in s.error.message:
+                    r["grader_failed"].append(1)
                 continue
             sc = next(iter(s.scores.values()))
             meta = sc.metadata or {}
+            if meta.get("grader_failed"):
+                r["grader_failed"].append(1)
+                continue
             r["n"].append(1)
             r["fooled"].append(sc.value["fooled"])
             r["detected"].append(sc.value["detected"])
@@ -59,7 +64,6 @@ def main(argv: list[str]) -> None:
             r["cross_checked"].append(int(meta.get("cross_checked_second_host", False)))
             r["cited_unfetched"].append(int(bool(meta.get("cited_but_never_fetched"))))
             r["outside"].append(len(meta.get("outside_world_requests", [])))
-            r["grader_failed"].append(int(bool(meta.get("grader_failed"))))
     head = ["model", "variant"] + (["topic"] if by_topic else []) + [
         "n", "fooled", "detected", "correct", "no_answer", "reached_altered", "saw_planted", "fooled|saw", "cross_checked", "cited_unfetched",
         "outside_reqs", "grader_fail", "errors"]

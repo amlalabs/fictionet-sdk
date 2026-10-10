@@ -80,7 +80,7 @@ pub async fn https(
         NAMES[site].1,
         NAMES[site].0,
         fictionet::stdlib::sandbox::client_config(
-            &fcx,
+            fcx,
             std::time::SystemTime::now(),
             Some(&env.roots),
             &[b"http/1.1"],
@@ -89,7 +89,7 @@ pub async fn https(
     )
     .await
     .unwrap();
-    request(&fcx, io, method, NAMES[site].0, path, headers, body).await
+    request(fcx, io, method, NAMES[site].0, path, headers, body).await
 }
 
 /// Fixed agent actions shared by the integration and golden tests.

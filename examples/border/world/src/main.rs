@@ -122,8 +122,10 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
         std::fs::create_dir_all(dir)?;
     }
 
+    let finalization = Arc::new(log.finalization(&args.state_dir)?);
+    let shutdown = finalization.clone();
     let (attacher, attachments) = fictionet::attachments();
-    fictionet::block_on(fictionet::run(
+    let result = fictionet::block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
             let ids = border_world::identities(&fcx, &scenario, &world_ca)?;
@@ -144,8 +146,12 @@ fn serve(argv: impl Iterator<Item = String>) -> fictionet::Result {
             );
             // The network serves every sandbox from here on. The listener lives
             // as long as the world.
-            std::future::pending::<()>().await;
-            Ok(())
+            shutdown.wait(&fcx).await
         },
-    ))
+    ));
+    finalization.acknowledge(result)?;
+    // Keep the container available for the harness to read the finalized files.
+    loop {
+        std::thread::park();
+    }
 }

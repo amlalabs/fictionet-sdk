@@ -34,7 +34,6 @@ use fictionet::stdlib::web;
 
 /// The gateway, where `Sites` runs DNS (its default subnet is 10.0.0.0/24).
 pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
-use serde_json::Value;
 
 use crate::content::Content;
 use crate::log::Log;

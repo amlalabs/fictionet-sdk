@@ -109,10 +109,15 @@ fn http(e: &Entry) -> Value {
             ua = Some(value.to_owned());
         }
     }
-    let answer = match e.str("answer") {
-        Some(a @ ("handler" | "error" | "redirect" | "misdirected" | "no_host" | "cancelled")) => a,
-        _ => "other",
-    };
+    let answer = e
+        .str("answer")
+        .filter(|a| {
+            matches!(
+                *a,
+                "handler" | "error" | "redirect" | "misdirected" | "no_host" | "cancelled"
+            )
+        })
+        .unwrap_or("other");
     let mut line = json!({
         "type": "http",
         "sandbox": sandbox(e),

@@ -119,11 +119,11 @@ EOF
 RUSTUP_HOME=/opt/rust/rustup rustc --version
 
 step "Name lookups that follow each namespace's resolv.conf"
-# Debian's cloud image looks names up through systemd-resolved's NSS module,
-# which asks resolved over a socket. Resolved lives in the VM's own network
-# namespace, so a program in a sandbox namespace would get the VM's real DNS
-# instead of the world's, whatever /etc/netns/<name>/resolv.conf says. With
-# plain "dns", glibc reads resolv.conf, which `ip netns exec` swaps.
+# Stop the shared resolver daemon so namespace workloads cannot ask it
+# through local sockets. The VM uses QEMU's DNS through a plain file.
+systemctl mask --now systemd-resolved
+rm -f /etc/resolv.conf
+printf 'nameserver 10.0.2.3\n' > /etc/resolv.conf
 sed -i -E 's/^hosts:.*/hosts:          files myhostname dns/' /etc/nsswitch.conf
 
 step "No new connections from the VM to your machine"

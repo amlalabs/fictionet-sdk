@@ -67,12 +67,14 @@ def test_sandbox_options_pass_through(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured == {
         "world": "w", "agent_image": "a", "attach_image": "t", "backend": "k8s",
         "world_ca": "/run/ca/ca.pem",
-        "world_healthcheck": ["test", "-f", "/run/fictionet/ready"],
         "world_env": {
             "ARTIFACTORY_VARIANT": "${SAMPLE_METADATA_VARIANT:-}",
             "ARTIFACTORY_SEED": "${SAMPLE_METADATA_SEED:-}",
         },
     }
+    captured.clear()
+    assert tasks.world_sandbox("w", "a", "t", "docker") == "sandbox"
+    assert captured["world_healthcheck"] == ["test", "-f", "/run/fictionet/ready"]
 
 
 @pytest.mark.parametrize("key", ["variant", "seed"])
@@ -94,21 +96,20 @@ def test_setup_accepts_exact_parameters(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.parametrize("data,valid", [(b'{"type":"attached"}\n', True), (b'{"type":"attached"}', False), (b'{"type":"lost","count":1}\n', False)])
-def test_settling_and_checked_log_read(data: bytes, valid: bool, monkeypatch: pytest.MonkeyPatch) -> None:
-    world = SimpleNamespace(exec=AsyncMock(side_effect=[
-        SimpleNamespace(success=True, stdout=str(n)) for n in (0, len(data), len(data))
-    ]))
+def test_finalized_and_checked_log_read(data: bytes, valid: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    world = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(success=True, stdout=str(len(data)))))
     agent = object()
     monkeypatch.setattr(tasks, "sandbox", lambda name=None: world if name == "world" else agent)
     reader = AsyncMock(return_value=data)
     monkeypatch.setattr(tasks, "read_world_file", reader)
-    monkeypatch.setattr(tasks.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(tasks, "finalize_world", AsyncMock())
     if valid:
-        assert asyncio.run(tasks.settled_log()) == [{"type": "attached"}]
+        assert asyncio.run(tasks.finalized_log()) == [{"type": "attached"}]
     else:
         with pytest.raises(WorldLogError):
-            asyncio.run(tasks.settled_log())
-    assert world.exec.await_count == 3
+            asyncio.run(tasks.finalized_log())
+    tasks.finalize_world.assert_awaited_once_with(world, agent, tasks.LOG)
+    assert world.exec.await_count == 1
     reader.assert_awaited_once_with(tasks.LOG, text=False)
 
 
@@ -116,20 +117,21 @@ def test_world_alias_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     agent = object()
     monkeypatch.setattr(tasks, "sandbox", lambda name=None: agent)
     with pytest.raises(WorldLogError, match="separate"):
-        asyncio.run(tasks.settled_log())
+        asyncio.run(tasks.finalized_log())
 
 
 def test_stat_failure_is_not_silent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tasks, "finalize_world", AsyncMock())
     world = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(success=False, stderr="denied")))
     monkeypatch.setattr(tasks, "sandbox", lambda name=None: world if name == "world" else object())
     with pytest.raises(WorldLogError, match="denied"):
-        asyncio.run(tasks.settled_log())
+        asyncio.run(tasks.finalized_log())
 
 
 def test_growth_during_read_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     world = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(success=True, stdout="0")))
     monkeypatch.setattr(tasks, "sandbox", lambda name=None: world if name == "world" else object())
-    monkeypatch.setattr(tasks.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(tasks, "finalize_world", AsyncMock())
     monkeypatch.setattr(tasks, "read_world_file", AsyncMock(return_value=b'{"type":"dns"}\n'))
     with pytest.raises(WorldLogError, match="changed"):
-        asyncio.run(tasks.settled_log())
+        asyncio.run(tasks.finalized_log())

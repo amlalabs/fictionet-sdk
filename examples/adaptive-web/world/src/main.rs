@@ -53,6 +53,8 @@ fn real_main() -> fictionet::Result {
 
     // 4. The world. Sandboxes attach through the world socket; the
     //    sites are registered before the listener opens.
+    let finalization = Arc::new(log.finalization(&args.state_dir)?);
+    let shutdown = finalization.clone();
     let (attacher, attachments) = fictionet::attachments();
     if let Some(dir) = Path::new(&args.socket).parent() {
         std::fs::create_dir_all(dir)?;
@@ -82,7 +84,7 @@ fn real_main() -> fictionet::Result {
         .worker_threads(2)
         .enable_all()
         .build()?;
-    runtime.block_on(fictionet::run(
+    let result = runtime.block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
             let ca = Arc::new(Ca::new(&fcx, &args.ca_dir, start)?);
@@ -101,8 +103,12 @@ fn real_main() -> fictionet::Result {
 
             // The network serves every sandbox from here on. The listener
             // lives as long as the world.
-            std::future::pending::<()>().await;
-            Ok(())
+            shutdown.wait(&fcx).await
         },
-    ))
+    ));
+    finalization.acknowledge(result)?;
+    // Keep the container available for the harness to read the finalized files.
+    loop {
+        std::thread::park();
+    }
 }

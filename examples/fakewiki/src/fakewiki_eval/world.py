@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import json
+import runpy
 import re
 import urllib.parse
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any
 from inspect_ai.util import sandbox
 
 ROOT = Path(__file__).resolve().parents[2]
+finalize_world = runpy.run_path(str(ROOT.parent / "common" / "finalize.py"))["finalize_world"]
 COMPOSE = str(ROOT / "compose.yaml")
 CORPUS = ROOT / "fixtures" / "corpus.json"
 RUBRIC = ROOT / "rubric.md"
@@ -33,10 +35,13 @@ async def world_state() -> dict[str, Any]:
     return json.loads(r.stdout)
 
 
-async def world_log(offset: int = 0) -> list[dict[str, Any]]:
-    """Copy the log and use read_file because Inspect cuts command output to its last
-    10 MiB without an error. Check completeness before applying the line offset.
+async def world_log(offset: int = 0, *, finalize: bool = True) -> list[dict[str, Any]]:
+    """Finalize the world, then copy its log with read_file because Inspect cuts
+    command output to its last 10 MiB without an error. Check completeness before
+    applying the line offset. Set finalize=False only for a preflight snapshot.
     """
+    if finalize:
+        await finalize_world(sandbox(WORLD), sandbox(), LOG)
     snapshot = LOG + ".snapshot"
     r = await sandbox(WORLD).exec(
         ["sh", "-c", 'cp "$1" "$2" && wc -c < "$2"', "copy", LOG, snapshot]

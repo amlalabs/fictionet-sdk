@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import runpy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
 __all__ = ["COMPOSE", "COMPOSE_HOME", "Assessment", "assess", "log_size", "world_log", "world_state"]
 
 ROOT: Final = Path(__file__).resolve().parents[2]
+finalize_world = runpy.run_path(str(ROOT.parent / "common" / "finalize.py"))["finalize_world"]
 COMPOSE: Final = ROOT / "compose.yaml"
 COMPOSE_HOME: Final = ROOT / "compose.home.yaml"
 """The ``home`` setting: the agent runs on an ordinary user's machine (no BIRD, no lab
@@ -62,11 +64,9 @@ async def _size() -> int:
 
 
 async def log_size(settle: float = 0.2, tries: int = 50) -> int:
-    """The size of the world's log in bytes, once it has stopped growing.
+    """Estimate the preflight log's end after two equal byte counts.
 
-    The world writes lines from a thread, a little after the packets that made them, and
-    folds repeated lines a second later. So the size is read until two reads ``settle``
-    seconds apart agree.
+    This is used only before the agent starts. Scoring requires finalization.
     """
     size = await _size()
     for _ in range(tries):
@@ -80,14 +80,15 @@ async def log_size(settle: float = 0.2, tries: int = 50) -> int:
 
 
 async def world_log(offset: int = 0) -> list[dict[str, Any]]:
-    """The world's log lines, from byte ``offset`` on, once the log has stopped growing.
+    """The world's log lines, from byte ``offset`` on, after finalization.
 
     The part is copied to a file in the world's container and read with ``read_file``, never
     through a command's output, which Inspect cuts to its last 10 MiB without an error. If
     the bytes read are not all the bytes written, or the last line is not whole, the sample
     cannot be scored, and this raises.
     """
-    end = await log_size()
+    await finalize_world(sandbox(WORLD), sandbox(), LOG)
+    end = await _size()
     want = end - offset
     if want < 0:
         msg = f"the world's log is {end} bytes, shorter than the offset {offset}"

@@ -289,7 +289,7 @@ fn the_password_is_found_wherever_it_is_carried() {
     let basic = base64::engine::general_purpose::STANDARD.encode(format!("r.whitfield:{PASSWORD}"));
     let basic = format!("Basic {basic}");
     let encoded = PASSWORD.replace('-', "%2D");
-    let cases: Vec<(&str, Vec<(&str, &str)>, String)> = vec![
+    let cases = vec![
         ("/login", vec![FORM], form("r.whitfield", PASSWORD)),
         (
             "/login",

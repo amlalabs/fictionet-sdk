@@ -178,23 +178,26 @@ impl Addresses {
 
     /// The address of `host`, and why it has that one: its fixed or
     /// recorded address, or the next free one from the pools (`"pool"`).
-    pub fn assign(&self, host: &str) -> (Ipv4Addr, &'static str) {
+    /// Returns `None` after one full traversal if the pools are exhausted.
+    pub fn assign(&self, host: &str) -> Option<(Ipv4Addr, &'static str)> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(found) = inner.by_host.get(host) {
-            return *found;
+            return Some(*found);
         }
-        let addr = loop {
+        let addr = (0..131_072).find_map(|_| {
             let n = inner.next;
-            inner.next += 1;
+            inner.next = (inner.next + 1) % 131_072;
             let [a, b] = POOLS[(n % 2) as usize];
             // An odd multiplier makes this a permutation of 0..65536.
             let offset = ((n / 2).wrapping_mul(40503).wrapping_add(12345)) & 0xffff;
             let (c, d) = ((offset >> 8) as u8, offset as u8);
             let addr = Ipv4Addr::new(a, b, c, d);
             if d != 0 && d != 255 && !inner.used.contains(&addr) {
-                break addr;
+                Some(addr)
+            } else {
+                None
             }
-        };
+        })?;
         inner.used.insert(addr);
         inner.by_host.insert(host.to_owned(), (addr, "pool"));
         if let Some(file) = &self.record {
@@ -204,7 +207,7 @@ impl Addresses {
                 eprintln!("cannot record the address of {host}: {e}");
             }
         }
-        (addr, "pool")
+        Some((addr, "pool"))
     }
 }
 
@@ -306,7 +309,14 @@ pub fn serve(
             );
             return None;
         }
-        let (addr, why) = addresses.assign(host);
+        let Some((addr, why)) = addresses.assign(host) else {
+            world.record(
+                Event::new("adaptive", "refused")
+                    .field("host", host)
+                    .field("why", "address pool exhausted"),
+            );
+            return None;
+        };
         world.record(
             Event::new("adaptive", "site")
                 .summary(format!("{host} at {addr} ({why})"))
@@ -425,6 +435,30 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_pool_refuses_without_allocating_or_recording() {
+        let a = Addresses::new(HashMap::new(), None).unwrap();
+        {
+            let mut inner = a.inner.lock().unwrap();
+            for [first, second] in POOLS {
+                for third in 0..=255 {
+                    for fourth in 1..=254 {
+                        inner
+                            .used
+                            .insert(Ipv4Addr::new(first, second, third, fourth));
+                    }
+                }
+            }
+        }
+        assert_eq!(a.assign("full.com"), None);
+        assert!(a.inner.lock().unwrap().by_host.is_empty());
+        let freed = Ipv4Addr::new(104, 21, 0, 1);
+        a.inner.lock().unwrap().used.remove(&freed);
+        assert_eq!(a.assign("last.com"), Some((freed, "pool")));
+        assert_eq!(a.assign("last.com"), Some((freed, "pool")));
+        assert_eq!(a.assign("full.com"), None);
+    }
+
+    #[test]
     fn pool_addresses_are_distinct_and_recorded() {
         let dir = std::env::temp_dir().join(format!("adaptive-web-addr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -437,19 +471,19 @@ mod tests {
         let a = Addresses::new(fixed.clone(), Some(&file)).unwrap();
         assert_eq!(
             a.assign("www.google.com"),
-            (Ipv4Addr::new(142, 250, 180, 4), "search engine")
+            Some((Ipv4Addr::new(142, 250, 180, 4), "search engine"))
         );
         let mut seen = HashSet::new();
         for i in 0..2000 {
-            let (addr, why) = a.assign(&format!("host{i}.com"));
+            let (addr, why) = a.assign(&format!("host{i}.com")).unwrap();
             assert_eq!(why, "pool");
             assert!(seen.insert(addr), "{addr} given twice");
         }
-        let first = a.assign("host0.com").0;
+        let first = a.assign("host0.com").unwrap().0;
         drop(a);
         let again = Addresses::new(fixed, Some(&file)).unwrap();
-        assert_eq!(again.assign("host0.com"), (first, "recorded"));
-        assert!(!seen.contains(&again.assign("new.com").0));
+        assert_eq!(again.assign("host0.com"), Some((first, "recorded")));
+        assert!(!seen.contains(&again.assign("new.com").unwrap().0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

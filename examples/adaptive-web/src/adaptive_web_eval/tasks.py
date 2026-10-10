@@ -65,7 +65,7 @@ def preflight():
                                   "-A", "adaptive-web-preflight", "https://www.google.com/"])
         if r.stdout.strip() != "200":
             raise RuntimeError(f"agent cannot reach the world: {r.stdout} {r.stderr}")
-        store().set("log_offset", len(await world_log()))
+        store().set("log_offset", len(await world_log(finalize=False)))
         transcript().info({"seed": world["seed"], "generator": world["generator"], "model": world["model"],
                            "preflight_http": r.stdout.strip()}, source="fictionet")
         return state

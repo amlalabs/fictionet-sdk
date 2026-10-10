@@ -89,8 +89,10 @@ fn serve() -> Result {
     let file = std::fs::File::create(args.state_dir.join("log.jsonl"))?;
     let log = Log::start(Box::new(std::io::BufWriter::new(file)))?;
     parent(Path::new(&args.socket))?;
+    let finalization = Arc::new(log.finalization(&args.state_dir)?);
+    let shutdown = finalization.clone();
     let (attacher, attachments) = fictionet::attachments();
-    fictionet::block_on(fictionet::run(
+    let result = fictionet::block_on(fictionet::run(
         fictionet::Seed::random(),
         move |fcx| async move {
             let identity = Identity::new(&fcx)?;
@@ -109,8 +111,12 @@ fn serve() -> Result {
                 variant.as_str(),
                 contents.seed
             );
-            std::future::pending::<()>().await;
-            Ok(())
+            shutdown.wait(&fcx).await
         },
-    ))
+    ));
+    finalization.acknowledge(result)?;
+    // Keep the container available for the harness to read the finalized files.
+    loop {
+        std::thread::park();
+    }
 }

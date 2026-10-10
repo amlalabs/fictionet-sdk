@@ -43,7 +43,7 @@ async fn h2_head(
         }
     }
     let mut config = (*fictionet::stdlib::sandbox::client_config(
-        &fcx,
+        fcx,
         std::time::SystemTime::now(),
         None,
         &[b"http/1.1"],
