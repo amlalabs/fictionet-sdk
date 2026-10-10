@@ -74,6 +74,22 @@ impl Buffer {
         self.buf.capacity()
     }
 
+    /// Compacts unread bytes and releases spare input capacity.
+    /// Preserves the offset and invalidates any outstanding spare offer.
+    pub fn shrink(&mut self) {
+        let n = self.len();
+        self.buf.copy_within(self.start..self.end, 0);
+        self.buf.truncate(n);
+        self.buf.shrink_to_fit();
+        self.start = 0;
+        self.end = n;
+        self.offered = 0;
+        #[cfg(test)]
+        {
+            self.moved = self.moved.saturating_add(n);
+        }
+    }
+
     fn compact(&mut self) {
         self.offered = 0;
         if self.start >= self.len() && self.start != 0 {

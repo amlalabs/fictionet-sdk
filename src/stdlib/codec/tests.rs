@@ -2261,3 +2261,46 @@ fn demux_reserves_geometric_growth_before_allocating() {
     assert_eq!(d.total(), 5);
     assert_eq!(d.push(&1, b"f"), 0);
 }
+
+#[test]
+fn shrinking_input_preserves_unread_offset_and_invalidates_spare() {
+    let mut buffer = Buffer::new(8);
+    assert_eq!(buffer.push(b"abcd"), 4);
+    buffer.consume(1);
+    assert_eq!(buffer.spare().len(), 5);
+    buffer.shrink();
+    assert_eq!(buffer.allocated(), 3);
+    assert_eq!(buffer.unread(), b"bcd");
+    assert_eq!(buffer.offset(), 1);
+    buffer.commit(5);
+    assert_eq!(buffer.unread(), b"bcd");
+    buffer.consume(3);
+    buffer.shrink();
+    assert_eq!(buffer.allocated(), 0);
+    assert_eq!(buffer.offset(), 4);
+}
+
+#[test]
+fn demux_shrink_reclaims_partial_and_terminal_streams() {
+    let mut demux = Demux::new(2, 8, |_: &u8| Lines::new(8, Ending::LfOrCrlf));
+    assert_eq!(demux.push(&1, b"a\nb"), 3);
+    assert_eq!(demux.push(&2, b"c\n"), 2);
+    demux.end(&2);
+    assert_eq!(demux.next(), Some((1, Ok(Ok(b"a".to_vec())))));
+    assert_eq!(demux.next(), Some((2, Ok(Ok(b"c".to_vec())))));
+    assert_eq!(demux.next(), None);
+    assert_eq!(demux.total(), 5);
+    assert_eq!(demux.buffered(), 1);
+    demux.shrink();
+    assert_eq!(demux.total(), 1);
+    assert_eq!(demux.buffered(), 1);
+    let terminal = demux.get_mut(&2).unwrap();
+    assert!(terminal.is_done());
+    assert!(terminal.is_eof());
+    assert_eq!(terminal.offset(), 2);
+    assert_eq!(terminal.allocated(), 0);
+    assert_eq!(demux.push(&1, b"\n"), 1);
+    assert_eq!(demux.next(), Some((1, Ok(Ok(b"b".to_vec())))));
+    assert_eq!(demux.get_mut(&1).unwrap().offset(), 4);
+    assert_eq!(demux.buffered(), 0);
+}

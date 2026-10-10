@@ -2106,7 +2106,7 @@ type StreamFactory = Box<dyn FnMut(&u64) -> StreamItems + Send>;
 ///
 /// This is an input owner, separate from the I/O [`fictionet::stdlib::Connection`] trait.
 /// Each stream has its own decoder inside [`codec::Demux`]. The constructor
-/// bounds both stream count and the sum of unread and decoder-held bytes.
+/// bounds both stream count and the sum of input allocations and decoder-held bytes.
 /// Buffers allocate as input arrives. Metadata and allocator overhead are
 /// separate from the byte budget and bounded by `max_streams`.
 ///
@@ -2169,7 +2169,8 @@ impl Session {
         }
     }
     /// Accepts what fits in the shared budget. Drain items and retry the
-    /// suffix after this count. A zero count means no input currently fits.
+    /// suffix after this count. Reclaims spare input capacity when needed.
+    /// A zero count means no input currently fits.
     /// If draining makes no progress, reset/remove a stream to free its budget.
     /// After EOF or a terminal result, accepts and drops bytes like `Demux`.
     /// Paused streams always return zero, including after [`Self::end`].
@@ -2178,7 +2179,20 @@ impl Session {
         if self.paused.contains_key(&stream) {
             return 0;
         }
-        self.streams.push(&stream, bytes)
+        let n = self.streams.push(&stream, bytes);
+        if n == bytes.len() {
+            return n;
+        }
+        // Reclaim consumed prefixes and spare capacity only under pressure.
+        for (id, saved) in &mut self.paused {
+            saved.shrink();
+            if let Some(idle) = self.streams.get_mut(id) {
+                idle.decoder().kind =
+                    StreamKind::Paused(saved.allocated().saturating_add(saved.held()));
+            }
+        }
+        self.streams.shrink();
+        n + self.streams.push(&stream, &bytes[n..])
     }
     /// Stops an existing stream between items, retaining all unread bytes in
     /// the shared budget. [`Self::push`] refuses its input and [`Self::next`]
@@ -2191,7 +2205,7 @@ impl Session {
         if let Some(stream) = self.streams.get_mut(&id)
             && !stream.is_done()
         {
-            let held = stream.buffered().saturating_add(stream.held());
+            let held = stream.allocated().saturating_add(stream.held());
             let idle = codec::Stream::new(StreamItems {
                 kind: StreamKind::Paused(held),
             });
@@ -2246,6 +2260,16 @@ impl Session {
     }
     /// The aggregate unread and decoder-held bytes across every stream.
     pub fn buffered(&self) -> usize {
+        self.paused
+            .values()
+            .fold(self.streams.buffered(), |total, stream| {
+                total
+                    .saturating_sub(stream.allocated())
+                    .saturating_add(stream.buffered())
+            })
+    }
+    /// The aggregate input allocations and decoder-held bytes, including paused streams.
+    pub fn total(&self) -> usize {
         self.streams.total()
     }
     /// The number of stream keys, including completed streams.
@@ -2276,13 +2300,15 @@ pub mod harness {
         for (index, chunk) in bytes.chunks(17).enumerate() {
             let _ = session.push([0, 2, 4, 6, 10][index % 5], chunk);
             while session.next().is_some() {}
-            assert!(session.buffered() <= budget);
+            assert!(session.buffered() <= session.total());
+            assert!(session.total() <= budget);
         }
         for id in [0, 2, 4, 6, 10] {
             session.end(id);
         }
         while session.next().is_some() {}
-        assert!(session.buffered() <= budget);
+        assert!(session.buffered() <= session.total());
+        assert!(session.total() <= budget);
     }
 }
 

@@ -189,7 +189,8 @@ fn route(chunk_size: usize) {
     ]);
     assert_eq!(results, expected);
     assert_eq!(calls.len(), MAX_STREAMS);
-    assert_eq!(calls.total(), HEADER_LEN + 6);
+    assert_eq!(calls.total(), if chunk_size == 1 { 48 } else { 45 });
+    assert_eq!(calls.buffered(), HEADER_LEN + 6);
     assert_eq!(calls.next(), None);
 
     for (key, items) in &results {

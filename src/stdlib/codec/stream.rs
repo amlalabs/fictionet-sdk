@@ -196,6 +196,11 @@ impl<D: Decode> Stream<D> {
     pub fn allocated(&self) -> usize {
         self.buf.allocated()
     }
+    /// Releases spare input capacity while preserving unread bytes, offset,
+    /// decoder state, EOF, and terminal status.
+    pub fn shrink(&mut self) {
+        self.buf.shrink();
+    }
     /// The retained terminal error, if one occurred.
     pub fn failed(&self) -> Option<&Fail<D::Error>> {
         self.failed.as_ref()

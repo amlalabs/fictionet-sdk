@@ -191,6 +191,35 @@ fn paused_stream_at_capacity_resumes_without_stuck() {
 }
 
 #[test]
+fn paused_stream_retains_allocation_until_pressure_reclaims_it() {
+    let mut session = Session::new(codec::Side::Client, 2, 4);
+    assert_eq!(session.push(0, &[0; 4]), 4);
+    let empty = Ok(Ok(StreamItem::Frame(Frame::Data(vec![]))));
+    assert_eq!(session.next(), Some((0, empty.clone())));
+    session.pause(0);
+    session.end(0);
+    assert_eq!(session.buffered(), 2);
+    assert_eq!(session.total(), 4);
+    assert_eq!(session.push(4, &[0; 3]), 2);
+    assert_eq!(session.total(), 4);
+    assert_eq!(session.buffered(), 4);
+    session.unpause(0);
+    assert_eq!(session.total(), 4);
+    assert_eq!(session.next(), Some((4, empty.clone())));
+    assert_eq!(session.next(), Some((0, empty)));
+    assert_eq!(session.next(), None);
+    assert_eq!(session.buffered(), 0);
+    assert_eq!(session.total(), 4);
+    let stream = session.remove(0).unwrap();
+    assert!(stream.is_done());
+    assert!(stream.is_eof());
+    assert_eq!(stream.offset(), 4);
+    assert_eq!(session.total(), 2);
+    session.remove(4);
+    assert_eq!(session.total(), 0);
+}
+
+#[test]
 fn request_field_limit_rejects_oversized_fields() {
     let mut fields = received_request(&[]);
     fields[0] = Field::new(":method", "GET");
@@ -1715,7 +1744,7 @@ fn http3_aggregate_demux_budget_refuses_across_streams() {
     assert_eq!(session.push(2, &[0, 4, 100, 3, 4]), 3);
     assert_eq!(session.buffered(), 9);
     assert_eq!(session.push(6, &[2]), 0);
-    // Type handoff consumes only the control type and releases one byte.
+    // Type handoff consumes the control type; the next push reclaims its storage.
     assert_eq!(
         session.next(),
         Some((2, Ok(Ok(StreamItem::Header(StreamHeader::Control)))))

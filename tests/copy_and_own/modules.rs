@@ -486,6 +486,15 @@ fn copied_step_and_buffer() {
     buffer.commit(1);
     assert_eq!(buffer.unread(), &[42]);
     buffer.consume(1);
+    buffer.shrink();
+    let mut demux = fictionet::stdlib::codec::Demux::new(1, 8, |_: &u8| {
+        fictionet::stdlib::http3::StreamItems::request()
+    });
+    assert_eq!(demux.push(&0, &[0, 0]), 2);
+    assert_eq!(demux.buffered(), 2);
+    demux.get_mut(&0).unwrap().shrink();
+    demux.shrink();
+    assert_eq!(demux.total(), 2);
 }
 
 fictionet::cfg_observe! {

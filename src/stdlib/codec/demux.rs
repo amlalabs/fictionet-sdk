@@ -165,6 +165,34 @@ impl<K: Ord + Clone, D: Decode, F: FnMut(&K) -> D> Demux<K, D, F> {
         }
         self.total.get()
     }
+    /// The sum of unread input and decoder-held bytes across all streams.
+    /// Retained input capacity is counted by [`Self::total`] instead.
+    /// Visits every stream and saturates on overflow.
+    pub fn buffered(&self) -> usize {
+        self.streams
+            .values()
+            .filter_map(|entry| entry.stream.as_ref())
+            .fold(0usize, |total, stream| {
+                total
+                    .saturating_add(stream.buffered())
+                    .saturating_add(stream.held())
+            })
+    }
+    /// Releases spare input capacity across all streams and updates the charge.
+    /// Preserves unread bytes, decoder state, and scheduling.
+    pub fn shrink(&mut self) {
+        self.total();
+        let mut total = 0usize;
+        for stream in self
+            .streams
+            .values_mut()
+            .filter_map(|entry| entry.stream.as_mut())
+        {
+            stream.shrink();
+            total = total.saturating_add(Self::bytes(stream));
+        }
+        self.total.set(total);
+    }
     /// The number of entries, including closed keys.
     pub fn len(&self) -> usize {
         self.streams.len()
