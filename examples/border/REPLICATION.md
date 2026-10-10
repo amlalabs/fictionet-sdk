@@ -1,6 +1,7 @@
 # Border: replicating the original study on the Rust world
 
-Run on 2 October 2026. Border began as a study of how agents handle a certificate
+This is a recorded run from 2 October 2026. For a runnable demonstration with
+no model, start with [the scripted demo](README.md#see-the-worlds-log). Border began as a study of how agents handle a certificate
 warning, run on the earlier Python version of Fictionet. That study is called "the
 original study" below. Its logs are not in this repository. The question here: do its
 numbers still hold when the same study runs on this directory's Rust world?

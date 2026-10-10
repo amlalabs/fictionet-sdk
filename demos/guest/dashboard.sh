@@ -5,35 +5,22 @@
 # a shell.
 # needs: sdk
 . "$(dirname "$0")/lib.sh"
+. "$(dirname "$0")/web_setup.sh"
 host_port="${FICTIONET_DASHBOARD_PORT:-7878}"
 seconds="${DASHBOARD_SECONDS:-}"
 
 cleanup() {
     stop_pid "${traffic_pid:-}"
     stop_pid "${dash_pid:-}"
-    stop_pid "${attach_pid:-}"
-    stop_pid "${world_pid:-}"
-    ip netns del agent 2>/dev/null || true
-    rm -rf /etc/netns/agent /run/fictionet /run/attach.ready
+    cleanup_web
 }
 trap cleanup EXIT
 cleanup
 
 step "Start the world, and attach a sandbox to it"
 note "The same web_world example and network namespace as demos/web."
-mkdir -p /run/fictionet
-chmod 700 /run/fictionet
-web_world /run/fictionet/world.sock /run/fictionet/ca.pem >/run/world.log 2>&1 &
-world_pid=$!
-wait_for /run/fictionet/world.sock 10
-ip netns add agent
-ip -n agent link set lo up
-fictionet attach --world unix:/run/fictionet/world.sock --name agent --type tun \
-    --netns /run/netns/agent --ip-addr 10.0.0.2/24 --gateway 10.0.0.1 --dns 10.0.0.1 \
-    --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6 --ready-file /run/attach.ready >/run/attach.log 2>&1 &
-attach_pid=$!
-wait_for /run/attach.ready 10
-sed 's/^/    /' /run/world.log /run/attach.log
+start_web
+attach_web
 
 step "Start the dashboard"
 note "fictionet dashboard connects to the world's socket as an observer: the world needs no"

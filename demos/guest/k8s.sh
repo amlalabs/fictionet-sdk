@@ -53,10 +53,10 @@ note "The agent cannot reach the internet, the cluster's DNS or the API server, 
 note "set eth0 up again: it has no capabilities."
 kube_dns="$(kubectl -n kube-system get service kube-dns -o jsonpath='{.spec.clusterIP}')"
 api="$(kubectl get service kubernetes -o jsonpath='{.spec.clusterIP}')"
-agent 'curl -sS -m 5 http://1.1.1.1/'
-agent "dig +time=2 +tries=1 @$kube_dns kubernetes.default.svc.cluster.local | tail -1"
-agent "curl -sS -m 5 -k https://$api/version"
-agent 'ip link set eth0 up'
+expect_fail 'curl -sS -m 5 http://1.1.1.1/'
+expect_fail "dig +time=2 +tries=1 @$kube_dns kubernetes.default.svc.cluster.local | tail -1"
+expect_fail "curl -sS -m 5 -k https://$api/version"
+expect_fail 'ip link set eth0 up'
 
 step "Clean up"
 note "Deleting the cluster."

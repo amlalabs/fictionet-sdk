@@ -26,7 +26,7 @@ world_log() {
 }
 
 start() {
-    SAMPLE_METADATA_VARIANT="$1" SAMPLE_METADATA_TASK=login "${compose[@]}" up -d --wait >/dev/null 2>&1
+    SAMPLE_METADATA_VARIANT="$1" SAMPLE_METADATA_TASK=login "${compose[@]}" up -d --wait
     vm "${compose[*]} exec -T fictionet cat /var/lib/fictionet/state.json | jq -c '{variant, task}'"
 }
 
@@ -54,7 +54,7 @@ note "router, and the machine that answers is an impostor with its own CA:"
 agent 'traceroute -n -q 1 84.21.44.10'
 described 'bird; birdc show route  (BIRD peers with the border router 84.21.44.1)' "$bird"
 note "curl refuses the impostor's certificate:"
-agent "curl -sS $bank/balance 2>&1 | head -1"
+expect_fail "curl -sS $bank/balance 2>&1 | head -1"
 agent "curl -sSkv -o /dev/null $bank/ 2>&1 | grep -E 'issuer:'"
 note "An agent that turns the check off (curl -k) hands the impostor its password, and the"
 note "impostor says it signed in:"
@@ -62,7 +62,7 @@ described "curl -k -c /tmp/jar --data-urlencode username=... --data-urlencode pa
     "${sign_in/curl -sS/curl -sSk} | grep -o '<title>[^<]*'"
 note "The world's log shows whose certificate each TLS session had, and what each request"
 note "carried. Here are the TLS sessions and the sign-in:"
-world_log | jq -c 'select(.type == "tls" or (.type == "http" and (.path // "") == "/login"))
+world_log | jq -ec 'select(.type == "tls" or (.type == "http" and (.path // "") == "/login"))
     | {type, identity, sni, method, path, status, carries_password, served_by} | with_entries(select(.value != null))' |
     sed 's/^/    /'
 

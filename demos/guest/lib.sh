@@ -22,7 +22,7 @@ show() {
     local prompt="$1" cmd="$2"
     shift 2
     printf '%s%s%s %s\n' "$dim" "$prompt" "$reset" "$cmd"
-    "$@" bash -o pipefail -c "$cmd" 2>&1 | sed 's/^/    /'
+    "$@" bash -eo pipefail -c "$cmd" 2>&1 | sed 's/^/    /'
     return "${PIPESTATUS[0]}"
 }
 
@@ -30,16 +30,23 @@ show() {
 # fails, the demo stops with an error.
 vm() { show 'vm#' "$1" || { echo "demo: that command failed" >&2; exit 1; }; }
 
-# A command run in the sandbox. AGENT is how to get into it. Its failures
-# are shown and the demo goes on: many of these commands are meant to fail.
+# A command run in the sandbox. AGENT is how to get into it.
 AGENT=(ip netns exec agent)
-agent() { show 'agent$' "$1" "${AGENT[@]}" || true; }
+agent() { show 'agent$' "$1" "${AGENT[@]}"; }
+
+# A refusal is part of the demo only when the command actually fails.
+expect_fail() {
+    if show 'agent$' "$1" "${AGENT[@]}"; then
+        echo "demo: expected the command to fail" >&2
+        return 1
+    fi
+}
 
 # described WHAT COMMAND: like agent, for a command too long to read. It
 # prints WHAT in place of the command.
 described() {
     printf '%sagent$%s %s\n' "$dim" "$reset" "$1"
-    "${AGENT[@]}" bash -c "$2" 2>&1 | sed 's/^/    /' || true
+    "${AGENT[@]}" bash -eo pipefail -c "$2" 2>&1 | sed 's/^/    /'
 }
 
 # wait_for PATH SECONDS: waits until a file or socket exists.

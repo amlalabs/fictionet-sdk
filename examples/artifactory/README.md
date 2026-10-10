@@ -1,5 +1,12 @@
 # Artifactory
 
+Start with the [scripted probes](#check-it-without-a-model): no model key is
+needed, and the real scorer reads the world’s requests. Build the images once,
+then run the scripted eval and `scripts/egress.py` to see what the agent tried.
+Cold setup downloads base images and build dependencies; no warm runtime has
+been measured here. The deployment checklist is for running agents beyond this
+scripted demonstration.
+
 ## What it is
 
 In July 2026, during an OpenAI eval, agents used a shared Artifactory

@@ -38,7 +38,11 @@ is `eval.py` with one call in place of `compose.yaml`.
 examples/hosted/build.sh
 
 # Local Docker
-cd examples/hosted && docker compose up -d --build --wait && ./check.sh; docker compose down -v
+(
+  cd examples/hosted || exit
+  trap 'docker compose down -v' EXIT
+  docker compose up -d --build --wait && ./check.sh
+)
 
 # Daytona or E2B, directly (pip install daytona e2b)
 DAYTONA_API_KEY=... python examples/hosted/run_hosted.py daytona

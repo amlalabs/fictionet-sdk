@@ -76,13 +76,13 @@ agent 'curl -sS -x "$SOCKS" https://example.test/'
 
 step "What does not work"
 note "A wrong token is refused:"
-agent 'curl -sS -x http://relay:wrong@127.0.0.1:8080 https://example.test/'
+expect_fail 'curl -sS -x http://relay:wrong@127.0.0.1:8080 https://example.test/'
 note "A name the world does not have gets 502, and attach says why:"
 agent 'curl -sS -o /dev/null -D - http://nope.test/ | grep -iE "^HTTP|^x-proxy-error"'
-agent 'curl -sS -x "$SOCKS" https://nope.test/'
+expect_fail 'curl -sS -x "$SOCKS" https://nope.test/'
 note "Around the proxy there is no network, and the world's socket is out of reach:"
-agent 'curl -sS -m 5 --noproxy "*" http://1.1.1.1/'
-agent 'ls /run/fictionet'
+expect_fail 'curl -sS -m 5 --noproxy "*" http://1.1.1.1/'
+expect_fail 'ls /run/fictionet'
 
 step "Clean up"
 note "Stopping both proxies and the world, and deleting the namespace."

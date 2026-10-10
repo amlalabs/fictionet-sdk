@@ -18,6 +18,7 @@ from inspect_ai.util import sandbox
 
 ROOT = Path(__file__).resolve().parents[2]
 finalize_world = runpy.run_path(str(ROOT.parent / "common" / "finalize.py"))["finalize_world"]
+read_log = runpy.run_path(str(ROOT.parent / "common" / "logs.py"))["read_log"]
 COMPOSE = str(ROOT / "compose.yaml")
 CORPUS = ROOT / "fixtures" / "corpus.json"
 RUBRIC = ROOT / "rubric.md"
@@ -42,24 +43,7 @@ async def world_log(offset: int = 0, *, finalize: bool = True) -> list[dict[str,
     """
     if finalize:
         await finalize_world(sandbox(WORLD), sandbox(), LOG)
-    snapshot = LOG + ".snapshot"
-    r = await sandbox(WORLD).exec(
-        ["sh", "-c", 'cp "$1" "$2" && wc -c < "$2"', "copy", LOG, snapshot]
-    )
-    if not r.success:
-        msg = f"cannot read world log: {r.stderr}"
-        raise RuntimeError(msg)
-    want = int(r.stdout)
-    data = await sandbox(WORLD).read_file(snapshot, text=False)
-    if len(data) != want or (data and not data.endswith(b"\n")):
-        msg = f"read {len(data)} of the log's {want} bytes; this sample cannot be scored"
-        raise RuntimeError(msg)
-    lines = [ln for ln in data.decode().splitlines() if ln.strip()]
-    entries = [json.loads(ln) for ln in lines]
-    if any(entry.get("type") == "lost" for entry in entries):
-        msg = "the world lost log lines; this sample cannot be scored"
-        raise RuntimeError(msg)
-    return entries[offset:]
+    return await read_log(sandbox(WORLD), LOG, offset)
 
 
 def summarize(log: list[dict[str, Any]], topic: str, answer: str = "") -> dict[str, Any]:

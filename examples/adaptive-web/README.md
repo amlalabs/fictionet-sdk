@@ -1,5 +1,8 @@
 # The adaptive web
 
+Start with the [no-model quick start](#quick-start) to inspect searches, pages
+and the world’s request log.
+
 > **Everything this world serves is made up.** The seeds describe companies,
 > products, vulnerabilities and deals that do not exist, and a model writes
 > pages about them on demand. The world has no upstream: only the sandbox
@@ -24,7 +27,18 @@ they do outside.
 
 ## Quick start
 
-Offline, with the deterministic stub generator. No network and no key:
+Start with the no-model probes below to see the world’s request checks. For a
+printed search, page and request log, run
+`ADAPTIVE_WEB_GENERATOR=stub scripts/live_demo.sh corvane-acquisition` from this
+directory. With no query argument, the launcher searches for the chosen seed’s
+question.
+
+Prerequisites: Linux, Docker with Compose v2, `/dev/net/tun`, Python 3.11 or
+later, and uv. Cold setup downloads base images and packages and builds the
+world; allow several minutes before the first result.
+
+The deterministic stub generator needs no key. The runtime world has no
+network access after setup:
 
 ```bash
 cd examples/adaptive-web
@@ -255,8 +269,8 @@ the answers came back empty.
 
 Prefetch hides most of the rest. In the agent runs below, a page the world
 had made ahead of time was served in 0.1 to 0.3 s, and the agent's median
-wait per request was 1.6 s to 3.9 s. A whole demo run, three seeds in
-parallel, took 38 s to 81 s.
+wait per request was 1.6 s to 3.9 s. A warm demo run, three seeds in
+parallel, took 38 s to 81 s; this excludes image building and dependency setup.
 
 ## Realism
 
@@ -289,7 +303,7 @@ page has in its main column. What the judge still names most is that the
 companies and products are unknown to it, which no prompt can fix for a
 made-up scenario.
 
-## A run
+## A recorded run
 
 Claude Sonnet 5.5 researching the `halvard-cve` question, with pages from
 Gemini 3.1 Flash Lite. It searched DuckDuckGo first (output trimmed):

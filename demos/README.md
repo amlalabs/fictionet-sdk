@@ -7,8 +7,12 @@ commands and their real output. Nothing needs root or Docker on your machine:
 QEMU, KVM and [the other host tools](../vm/README.md#the-fictionet-vm) are required.
 
 ```console
-$ demos/web
+$ demos/dashboard
 ```
+
+Start with the dashboard to see requests in the world’s live log, or run
+[`demos/border`](border) to see the log label a password sent to the impostor.
+Both use scripted traffic and need no model key.
 
 The first demo on a machine downloads and prepares the VM image, which takes a few
 minutes. After that a demo boots the VM in seconds. A demo that booted the VM shuts
@@ -28,19 +32,19 @@ The scripts that run inside the VM are in [`guest/`](guest). Each starts with a
 
 ## How long they take
 
-Measured on a 24-core machine with other work running, with the VM's default 4
+Historical measurements on a 24-core machine with other work running, with the VM's default 4
 vCPUs and 5 GB. "In all" is the whole command: the VM's boot, the build and the
 demo, and the shutdown.
 
-| Run | In all | Of which |
+| Cold setup or warm run | In all | Of which |
 |---|---|---|
 | The first `demos/web` on a machine | 229 s | download and check the Debian image about 10 s, prepare it 160 s, boot 7.5 s, first build 45 s, demo 3.5 s |
-| `demos/web` after that | 10 s | boot 5.2 s, build 0.2 s, demo 3.5 s |
+| Warm `demos/web` | 10 s | boot 5.2 s, build 0.2 s, demo 3.5 s |
 | `demos/proxy` | 8 s | demo 0.5 s |
 | `demos/k8s`, first | 77 s | includes pulling kind's node image |
 | `demos/k8s` after that | 55 s | the cluster's start is most of it |
 | `demos/border`, first | 175 s | builds `border-world` and Border's three images |
-| `demos/border` after that | 39 s | demo 27 s |
+| Warm `demos/border` | 39 s | demo 27 s |
 | `demos/dashboard`, with `DASHBOARD_SECONDS=5` | 20 s | |
 
 Docker's images and build cache, cargo's build output and uv's cache stay on the

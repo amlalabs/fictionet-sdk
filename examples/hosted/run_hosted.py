@@ -104,14 +104,21 @@ def wait_for_docker(run, cmd):
 
 
 def up_and_check(run, cd, sudo):
-    code, out = run(f"{cd} {sudo} docker compose up -d --build --wait 2>&1 | tail -5")
-    log("docker compose up:", out.strip().splitlines()[-1] if out.strip() else "")
-    code, out = run(f"{cd} {sudo} sh ./check.sh", timeout=300)
-    print(out.rstrip())
-    log("check.sh exit status", code)
-    run(f"{cd} {sudo} docker compose down -v", timeout=120)
-    if code != 0:
-        sys.exit(1)
+    try:
+        code, out = run(f"{cd} {sudo} docker compose up -d --build --wait")
+        print(out.rstrip())
+        if code != 0:
+            sys.exit(code)
+        code, out = run(f"{cd} {sudo} sh ./check.sh", timeout=300)
+        print(out.rstrip())
+        log("check.sh exit status", code)
+        if code != 0:
+            sys.exit(code)
+    finally:
+        cleanup_code, out = run(f"{cd} {sudo} docker compose down -v", timeout=120)
+        print(out.rstrip())
+    if cleanup_code != 0:
+        sys.exit(cleanup_code)
 
 
 if __name__ == "__main__":
