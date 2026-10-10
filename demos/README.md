@@ -10,7 +10,7 @@ QEMU, KVM and [the other host tools](../vm/README.md#the-fictionet-vm) are requi
 $ demos/dashboard
 ```
 
-Start with the dashboard to see requests in the world’s live log, or run
+Start with the dashboard to see requests in the world's live log, or run
 [`demos/border`](border) to see the log label a password sent to the impostor.
 Both use scripted traffic and need no model key.
 
@@ -32,9 +32,9 @@ The scripts that run inside the VM are in [`guest/`](guest). Each starts with a
 
 ## How long they take
 
-Historical measurements on a 24-core machine with other work running, with the VM's default 4
-vCPUs and 5 GB. "In all" is the whole command: the VM's boot, the build and the
-demo, and the shutdown.
+Historical measurements on a 24-core machine with other work running, with the
+VM's default 4 vCPUs and 5 GB. "In all" is the whole command: the VM's boot, the
+build and the demo, and the shutdown.
 
 | Cold setup or warm run | In all | Of which |
 |---|---|---|

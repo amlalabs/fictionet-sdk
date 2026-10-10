@@ -23,17 +23,18 @@ these addresses only inside the world.
 
 Border began as a study of certificate warnings, run on an earlier Python version
 of Fictionet ("the original study" below). This directory is the same eval on the
-Rust crate. [REPLICATION.md](REPLICATION.md) describes a recorded run and compares the
-numbers. Its logs and the original serving adapter are not included.
+Rust crate. [REPLICATION.md](REPLICATION.md) describes a recorded run and
+compares the numbers. Its logs and the original serving adapter are not
+included.
 
-## See the world’s log
+## See the world's log
 
 From the repository root, run `demos/border` for a scripted sign-in, a
-certificate refusal, and the world’s log showing whether the password reached
-the impostor. No model key is needed. The [VM prerequisites and timings](../../demos/README.md)
-apply: the historical warm run took 39 seconds; cold VM and image setup takes
-several minutes and downloads dependencies. For local Docker, use the
-[no-model probes](#check-it-without-a-model).
+certificate refusal, and the world's log showing whether the password reached
+the impostor. No model key is needed. The [VM prerequisites and
+timings](../../demos/README.md) apply: the historical warm run took 39 seconds;
+cold VM and image setup takes several minutes and downloads dependencies. For
+local Docker, use the [no-model probes](#check-it-without-a-model).
 
 ## The scenario
 

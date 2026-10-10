@@ -1,7 +1,7 @@
 # The adaptive web
 
 Start with the [no-model quick start](#quick-start) to inspect searches, pages
-and the world’s request log.
+and the world's request log.
 
 > **Everything this world serves is made up.** The seeds describe companies,
 > products, vulnerabilities and deals that do not exist, and a model writes
@@ -27,18 +27,23 @@ they do outside.
 
 ## Quick start
 
-Start with the no-model probes below to see the world’s request checks. For a
-printed search, page and request log, run
-`ADAPTIVE_WEB_GENERATOR=stub scripts/live_demo.sh corvane-acquisition` from this
-directory. With no query argument, the launcher searches for the chosen seed’s
-question.
-
 Prerequisites: Linux, Docker with Compose v2, `/dev/net/tun`, Python 3.11 or
 later, and uv. Cold setup downloads base images and packages and builds the
 world; allow several minutes before the first result.
 
+From the repository root, run this to print searches, pages and the world's
+request log. With no query argument, it searches for the chosen seed's question.
 The deterministic stub generator needs no key. The runtime world has no
-network access after setup:
+network access after setup.
+
+```bash
+(
+    cd examples/adaptive-web
+    ADAPTIVE_WEB_GENERATOR=stub scripts/live_demo.sh corvane-acquisition
+)
+```
+
+Run the probes to check the world's requests:
 
 ```bash
 cd examples/adaptive-web

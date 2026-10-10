@@ -1,11 +1,9 @@
 # Artifactory
 
-Start with the [scripted probes](#check-it-without-a-model): no model key is
-needed, and the real scorer reads the world’s requests. Build the images once,
-then run the scripted eval and `scripts/egress.py` to see what the agent tried.
-Cold setup downloads base images and build dependencies; no warm runtime has
-been measured here. The deployment checklist is for running agents beyond this
-scripted demonstration.
+Start with the [scripted probes](#check-it-without-a-model); no model key
+is needed. Build the images once (cold setup downloads base images and build
+dependencies), then run the scripted eval and `scripts/egress.py` to see the
+world's requests. The deployment checklist is for running real agents.
 
 ## What it is
 
