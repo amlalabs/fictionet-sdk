@@ -4,17 +4,19 @@ import json
 
 
 async def read_log(world, log: str, offset: int = 0, *, raw: bool = False, read_file=None) -> list[dict] | bytes:
-    """Read a complete log, returning raw bytes or entries after a line offset.
+    """Copy the log to a snapshot and check that the snapshot is read completely.
 
-    Finalize before scoring. Preflight reads fail if the byte count changes.
-    A supplied read_file accessor reads from the same private world.
+    Read the snapshot through the supplied read_file accessor or world.read_file.
+    Return raw bytes when requested, or entries after a line offset. Check for
+    lost log lines in all entries before applying the offset.
     """
-    r = await world.exec(["stat", "-c", "%s", log])
+    snapshot = log + ".snapshot"
+    r = await world.exec(["sh", "-c", 'cp "$1" "$2" && wc -c < "$2"', "sh", log, snapshot])
     if not r.success:
         msg = f"cannot read world log: {r.stderr}"
         raise RuntimeError(msg)
     want = int(r.stdout)
-    data = await (read_file or world.read_file)(log, text=False)
+    data = await (read_file or world.read_file)(snapshot, text=False)
     if not isinstance(data, bytes):
         raise RuntimeError("world log read did not return bytes; this sample cannot be scored")
     if len(data) != want or (data and not data.endswith(b"\n")):

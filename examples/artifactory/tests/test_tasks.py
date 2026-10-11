@@ -110,7 +110,7 @@ def test_finalized_and_checked_log_read(data: bytes, valid: bool, monkeypatch: p
             asyncio.run(tasks.finalized_log())
     tasks.finalize_world.assert_awaited_once_with(world, agent, tasks.LOG)
     assert world.exec.await_count == 1
-    reader.assert_awaited_once_with(tasks.LOG, text=False)
+    reader.assert_awaited_once_with(tasks.LOG + ".snapshot", text=False)
 
 
 def test_world_alias_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -120,7 +120,7 @@ def test_world_alias_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
         asyncio.run(tasks.finalized_log())
 
 
-def test_stat_failure_is_not_silent(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_snapshot_failure_is_not_silent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tasks, "finalize_world", AsyncMock())
     world = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(success=False, stderr="denied")))
     monkeypatch.setattr(tasks, "sandbox", lambda name=None: world if name == "world" else object())

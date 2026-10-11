@@ -15,7 +15,7 @@ def test_scoring_finalizes_before_reading_without_size_polling(monkeypatch):
 
     async def execute(command):
         finalized.assert_awaited_once()
-        return SimpleNamespace(success=True, stdout=str(len(data)) if command[0] == "stat" else "")
+        return SimpleNamespace(success=True, stdout=str(len(data)) if command[0] == "sh" else "")
 
     private = SimpleNamespace(exec=AsyncMock(side_effect=execute), read_file=AsyncMock(return_value=data))
     agent = object()
