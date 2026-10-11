@@ -658,12 +658,12 @@ fn value_size(v: &Value) -> usize {
 }
 
 /// A callback given to [`EventLog::subscribe`].
-type Subscriber = Arc<dyn Fn(&Event) + Send + Sync>;
+type Subscriber = Arc<dyn Fn(&Arc<Event>) + Send + Sync>;
 
-/// How many lines may wait for a file's writer thread.
+/// How many events may wait for a file's writer thread.
 #[cfg(feature = "std")]
 const FILE_QUEUE: usize = 100_000;
-/// How many bytes of lines may wait for a file's writer thread.
+/// How many retained event bytes may wait for a file's writer thread.
 #[cfg(feature = "std")]
 const FILE_QUEUE_BYTES: usize = MAX_EVENT_BYTES;
 
@@ -1057,7 +1057,10 @@ impl EventLog {
     /// hand the event to a channel that never waits. Once the run is over,
     /// `f` gets only what the log holds.
     pub fn subscribe(&self, f: impl Fn(&Event) + Send + Sync + 'static) {
-        let f: Subscriber = Arc::new(f);
+        self.subscribe_arc(Arc::new(move |event| f(event)));
+    }
+
+    fn subscribe_arc(&self, f: Subscriber) {
         let held = {
             let mut s = self.store.state.lock();
             let held = after_locked(&s, 0, usize::MAX);
@@ -1091,8 +1094,8 @@ impl EventLog {
     /// queue or writer thread. Successful sinks lose no lines in a lab.
     ///
     /// A line is lost, and counted ([`EventLog::lost`]), when it does not
-    /// fit in the thread's queue (100,000 lines or 16 MiB), or when `out`
-    /// fails. After a queue overflow the file gets an `events.lost` line
+    /// fit in the thread's queue (100,000 events or 16 MiB of retained
+    /// event data), or when `out` fails. After a queue overflow the file gets an `events.lost` line
     /// with the count so far. After a failed write or flush the thread
     /// writes nothing more, and counts every line after it, and each line
     /// written since the last flush that worked, as lost. A grader throws
@@ -1121,7 +1124,7 @@ impl EventLog {
 
         #[cfg(feature = "std")]
         {
-            let (tx, rx) = sync_channel::<Vec<u8>>(FILE_QUEUE);
+            let (tx, rx) = sync_channel::<Arc<Event>>(FILE_QUEUE);
             let queued = Arc::new(AtomicUsize::new(0));
             let lost = self.store.lost.clone();
             let writer = {
@@ -1131,19 +1134,15 @@ impl EventLog {
                     .spawn(move || write_lines(rx, out, &lost, &queued))
                     .expect("the event writer's thread starts")
             };
-            self.subscribe(move |event| {
-                let Ok(mut line) = event.to_json().to_bytes() else {
-                    return;
-                };
-                line.push(b'\n');
-                let len = line.len();
+            self.subscribe_arc(Arc::new(move |event| {
+                let len = event.size();
                 if queued.fetch_add(len, Ordering::Relaxed) + len > FILE_QUEUE_BYTES
-                    || tx.try_send(line).is_err()
+                    || tx.try_send(event.clone()).is_err()
                 {
                     queued.fetch_sub(len, Ordering::Relaxed);
                     lost.fetch_add(1, Ordering::Relaxed);
                 }
-            });
+            }));
             let mut s = self.store.state.lock();
             if s.closed {
                 // The run is over: the thread has all it will get.
@@ -1225,7 +1224,7 @@ impl EventLog {
 /// failed write or flush, only counts them as lost.
 #[cfg(feature = "std")]
 fn write_lines(
-    rx: Receiver<Vec<u8>>,
+    rx: Receiver<Arc<Event>>,
     mut out: Box<dyn Write + Send>,
     lost: &AtomicU64,
     queued: &AtomicUsize,
@@ -1235,14 +1234,21 @@ fn write_lines(
     let mut unflushed = 0u64;
     let mut failed = false;
     let mut batch = Vec::new();
-    while let Ok(line) = rx.recv() {
-        batch.push(line);
+    while let Ok(event) = rx.recv() {
+        batch.push(event);
         batch.extend(rx.try_iter());
-        for line in batch.drain(..) {
-            queued.fetch_sub(line.len(), Ordering::Relaxed);
+        for event in batch.drain(..) {
+            queued.fetch_sub(event.size(), Ordering::Relaxed);
             if failed {
                 lost.fetch_add(1, Ordering::Relaxed);
-            } else if out.write_all(&line).is_ok() {
+                continue;
+            }
+            let Ok(mut line) = event.to_json().to_bytes() else {
+                lost.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            line.push(b'\n');
+            if out.write_all(&line).is_ok() {
                 unflushed += 1;
             } else {
                 lost.fetch_add(unflushed + 1, Ordering::Relaxed);
@@ -1538,6 +1544,25 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn writer_queue_counts_retained_event_bytes() {
+        let sink = Sink::default();
+        let out = sink.clone();
+        crate::block_on(crate::run(fictionet::Seed::random(), |fcx| async move {
+            fcx.events().to_writer(Box::new(out));
+            let mut summary = String::with_capacity(FILE_QUEUE_BYTES + 1);
+            summary.push('x');
+            fcx.record(Event::new("test", "large_capacity").summary(summary));
+            assert_eq!(fcx.events().lost(), 1);
+            Ok(())
+        }))
+        .unwrap();
+        let bytes = sink.bytes.lock();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(!text.contains("large_capacity"));
+        assert!(text.contains("lost"));
     }
 
     /// The run's end waits for a file writer to write every line.

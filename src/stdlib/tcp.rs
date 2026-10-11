@@ -62,6 +62,9 @@ use fictionet::{Cx, Error, Interface, Packet};
 /// The MTU the endpoint assumes. Segments it sends are at most the smaller
 /// of this and what the peer's MSS option allows.
 const MTU: usize = 1500;
+/// Packets emitted before downstream tasks get a turn. Splits handle
+/// 64 packets per turn across both directions, including returning ACKs.
+const EGRESS_PACKETS: usize = 32;
 /// Receive and send buffer per connection, unless [`Options::buffer`] says
 /// otherwise. The receive buffer is the window.
 const BUFFER: usize = 256 * 1024;
@@ -298,12 +301,15 @@ impl Device for Dev {
     type TxToken<'a> = Tx<'a>;
 
     fn receive(&mut self, _: smoltcp::time::Instant) -> Option<(Rx, Tx<'_>)> {
+        if self.tx.len() >= EGRESS_PACKETS {
+            return None;
+        }
         let p = self.rx.take()?;
         Some((Rx(p), Tx(&mut self.tx)))
     }
 
     fn transmit(&mut self, _: smoltcp::time::Instant) -> Option<Tx<'_>> {
-        Some(Tx(&mut self.tx))
+        (self.tx.len() < EGRESS_PACKETS).then_some(Tx(&mut self.tx))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -1197,17 +1203,18 @@ impl Shared {
 /// The endpoint's one task: packets in, smoltcp, packets out, timers.
 async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
     let mut timer = fictionet::Timer::new(fcx);
-    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(64);
+    let mut batch: VecDeque<Vec<u8>> = VecDeque::with_capacity(64);
     let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut closed = false;
     poll_fn(|cx| {
         if fcx.is_cancelled() {
             return Poll::Ready(());
         }
         let received;
-        let mut closed = false;
-        while batch.len() < 64 {
+        let exhausted;
+        while batch.len() < 64 && !closed {
             match inner.poll_recv(fcx, cx) {
-                Poll::Ready(Ok(p)) => batch.push(p.0),
+                Poll::Ready(Ok(p)) => batch.push_back(p.0),
                 Poll::Ready(Err(_)) => {
                     closed = true;
                     break;
@@ -1225,7 +1232,10 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
             st.iface.poll_maintenance(now);
             received = batch.len();
             let st = &mut *st;
-            for p in batch.drain(..) {
+            // ACK repair can feed four copies before the original packet.
+            // Keep room for their receive tokens before consuming input.
+            while st.dev.tx.len() + 5 <= EGRESS_PACKETS {
+                let Some(p) = batch.pop_front() else { break };
                 // After a packet with data, egress immediately, so smoltcp can
                 // ACK every second segment as it means to. With one egress
                 // per batch, a whole window of data got one ACK. The
@@ -1233,15 +1243,14 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
                 // window then grew by one segment per round trip. Pure ACKs
                 // are still handled as a batch.
                 if st.ingress(shared.addr, now, p) {
-                    while st.iface.poll_egress(now, &mut st.dev, &mut st.sockets)
-                        != smoltcp::iface::PollResult::None
-                    {}
+                    st.iface.poll_egress(now, &mut st.dev, &mut st.sockets);
                 }
             }
             while st.iface.poll_egress(now, &mut st.dev, &mut st.sockets)
                 != smoltcp::iface::PollResult::None
             {}
             st.housekeeping(now);
+            exhausted = st.dev.tx.len() >= EGRESS_PACKETS || !batch.is_empty();
             std::mem::swap(&mut out, &mut st.dev.tx);
             if st.dirty.is_empty() {
                 st.next_release = None;
@@ -1265,10 +1274,10 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
         for p in out.drain(..) {
             inner.send(Packet(p));
         }
-        if closed {
+        if closed && batch.is_empty() {
             return Poll::Ready(());
         }
-        if received == 64 {
+        if received == 64 || exhausted {
             // Maybe more is waiting: give the rest of the run a turn, then
             // come back.
             cx.waker().wake_by_ref();
@@ -1791,6 +1800,24 @@ mod tests {
     use fictionet::stdlib::ConnectionExt;
     use fictionet::stdlib::test_support::rounds;
     use fictionet::{InterfaceExt, Seed, block_on, lab, pair, run};
+
+    #[test]
+    fn device_output_yields_and_preserves_waiting_input() {
+        let mut dev = Dev::default();
+        let now = smoltcp::time::Instant::from_micros(0);
+        for _ in 0..EGRESS_PACKETS {
+            dev.transmit(now).unwrap().consume(MTU, |_| {});
+        }
+        assert!(dev.transmit(now).is_none());
+        dev.rx = Some(vec![1, 2, 3]);
+        assert!(dev.receive(now).is_none());
+        assert_eq!(dev.rx.as_deref(), Some([1, 2, 3].as_slice()));
+        dev.tx.clear();
+        let (rx, tx) = dev.receive(now).unwrap();
+        rx.consume(|p| assert_eq!(p, [1, 2, 3]));
+        tx.consume(40, |_| {});
+        assert_eq!(dev.tx.len(), 1);
+    }
 
     struct WakeLog(u16, Arc<Mutex<Vec<u16>>>);
     impl std::task::Wake for WakeLog {

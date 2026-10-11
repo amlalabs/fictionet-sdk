@@ -157,6 +157,12 @@ const GROUPS: &[Group] = &[
         sites,
     ),
     (
+        "timers",
+        "logical timer changes under a fixed earliest deadline",
+        timers,
+    ),
+    ("logging", "real-mode event writer with a sink", logging),
+    (
         "observe",
         "the cost of an observer watching the graph and ten sandbox links",
         observe,
@@ -1098,6 +1104,7 @@ struct HttpCase {
     /// Whether the world subscribes a callback (one that does nothing) to
     /// its events.
     hooks: bool,
+    writer: bool,
 }
 
 #[derive(Clone)]
@@ -1131,6 +1138,7 @@ fn sites(o: &Options) {
                     sites: 1,
                     watch: Watch::None,
                     hooks: false,
+                    writer: false,
                 },
             );
         }
@@ -1146,8 +1154,56 @@ fn sites(o: &Options) {
             sites: 1,
             watch: Watch::None,
             hooks: true,
+            writer: false,
         },
     );
+    t.print();
+}
+
+fn timers(o: &Options) {
+    let mut times = Vec::new();
+    for _ in 0..o.reps {
+        let start = Instant::now();
+        finish(block_on(run(fictionet::Seed::random(), |fcx| async move {
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let mut first = fictionet::Timer::new(&fcx);
+            let at = fcx.now() + Duration::from_secs(3600);
+            assert!(first.poll_until(&mut cx, at).is_pending());
+            let mut later = fictionet::Timer::new(&fcx);
+            for i in 0..500_000 {
+                assert!(
+                    later
+                        .poll_until(&mut cx, at + Duration::from_secs(1 + i % 2))
+                        .is_pending()
+                );
+            }
+            Ok(())
+        })));
+        times.push(start.elapsed().as_secs_f64() * 1e3);
+    }
+    let mut t = Table::new(&["workload", "time, ms"]);
+    t.row(vec!["500000 later timer resets".into(), spread(&times, 2)]);
+    t.print();
+}
+
+fn logging(o: &Options) {
+    let mut t = http_table();
+    for writer in [false, true] {
+        http_row(
+            &mut t,
+            o.reps,
+            HttpCase {
+                sandboxes: 10,
+                h2: false,
+                requests: if o.quick { 5_000 } else { 100_000 },
+                body: 1024,
+                sites: 1,
+                watch: Watch::None,
+                hooks: false,
+                writer,
+            },
+        );
+    }
     t.print();
 }
 
@@ -1168,6 +1224,7 @@ fn observe(o: &Options) {
                 sites: 1,
                 watch,
                 hooks: false,
+                writer: false,
             },
         );
     }
@@ -1189,6 +1246,7 @@ fn graph(o: &Options) {
                 sites: 1000,
                 watch,
                 hooks: false,
+                writer: false,
             },
         );
     }
@@ -1220,7 +1278,9 @@ fn http_row(t: &mut Table, reps: usize, case: HttpCase) {
         } else {
             String::new()
         },
-        if case.hooks {
+        if case.writer {
+            ", event writer"
+        } else if case.hooks {
             ", events subscribed"
         } else {
             ""
@@ -1296,7 +1356,8 @@ fn http_run(case: HttpCase) -> HttpRun {
     // The observer reaches the world through a real world socket, as the
     // dashboard does.
     let path = socket_path("sites");
-    let listening = listen(WorldSocket::UnixSocket(path.clone()), attacher.clone()).unwrap();
+    let listening = (case.watch != Watch::None)
+        .then(|| listen(WorldSocket::UnixSocket(path.clone()), attacher.clone()).unwrap());
     let stop = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(AtomicBool::new(false));
     let measuring = Arc::new(AtomicBool::new(false));
@@ -1325,6 +1386,9 @@ fn http_run(case: HttpCase) -> HttpRun {
             let page = Page(Bytes::from(vec![b'x'; case.body]));
             let sites =
                 web::Sites::new(move |_| Some(web::Site::new(page.clone()).tls(config.clone())));
+            if case.writer {
+                fcx.events().to_writer(Box::new(std::io::sink()));
+            }
             if case.hooks {
                 fcx.events().subscribe(|_| {});
             }
@@ -1411,6 +1475,7 @@ fn http_run(case: HttpCase) -> HttpRun {
             // Rows still on their way belong to the timed requests.
             fcx.sleep(fictionet::time::ms(150)).await?;
             timing.store(false, Ordering::Release);
+            assert_eq!(fcx.events().lost(), 0, "the writer lost events");
             let mut l = lat.lock().unwrap();
             l.sort_unstable();
             let total = l.len();

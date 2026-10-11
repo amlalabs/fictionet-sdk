@@ -473,6 +473,7 @@ pub(crate) struct Graph {
 
 #[derive(Default)]
 pub(crate) struct GraphState {
+    pub(crate) revision: u64,
     pub(crate) tasks: HashMap<u64, TaskInfo, Ids>,
     pub(crate) links: HashMap<u64, LinkInfo, Ids>,
     /// The link count at which dead links are next swept out.
@@ -548,16 +549,22 @@ impl Graph {
             #[cfg(feature = "observe")]
             started: self.since_start(),
         };
-        self.state().tasks.insert(id, info);
+        let mut s = self.state();
+        s.tasks.insert(id, info);
+        s.revision += 1;
     }
 
     pub(crate) fn task_ended(&self, id: u64) {
-        self.state().tasks.remove(&id);
+        let mut s = self.state();
+        if s.tasks.remove(&id).is_some() {
+            s.revision += 1;
+        }
     }
 
     pub(crate) fn run_ended(&self) {
         let mut s = self.state();
         s.ended = true;
+        s.revision += 1;
         s.tasks.clear();
         drop(s);
         // Nothing more is recorded: let callbacks and file writers go.
@@ -568,6 +575,7 @@ impl Graph {
     }
 
     fn link<'a>(s: &'a mut GraphState, meter: &Arc<Meter>) -> &'a mut LinkInfo {
+        s.revision += 1;
         if s.links.len() >= s.sweep_at {
             // Links are only ever added here, so sweeping when the count
             // doubles keeps the cost per link constant.

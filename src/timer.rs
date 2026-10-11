@@ -86,8 +86,14 @@ impl Timers {
         let earliest = state.heap.peek().map(|Reverse((d, _))| *d);
         let old = match state.entries.get_mut(&id) {
             Some((d, w)) => {
+                let old = (!w.will_wake(waker)).then(|| std::mem::replace(w, waker.clone()));
+                if *d == deadline {
+                    drop(state);
+                    drop(old);
+                    return;
+                }
                 *d = deadline;
-                (!w.will_wake(waker)).then(|| std::mem::replace(w, waker.clone()))
+                old
             }
             None => {
                 state.entries.insert(id, (deadline, waker.clone()));
@@ -232,5 +238,55 @@ mod browser {
         if let Some(next) = super::timers().fire() {
             arm(next);
         }
+    }
+}
+
+#[cfg(all(test, feature = "std", not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::task::Wake;
+
+    #[derive(Default)]
+    struct WakeFlag(std::sync::atomic::AtomicBool);
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn unchanged_deadline_replaces_waker_without_growing_heap() {
+        let timers = Timers {
+            state: Mutex::new(State {
+                heap: BinaryHeap::new(),
+                entries: HashMap::new(),
+                next_id: 0,
+            }),
+            changed: Condvar::new(),
+        };
+        let at = Instant::now() + std::time::Duration::from_secs(60);
+        let id = timers.add(at, Waker::noop().clone());
+        let flag = Arc::new(WakeFlag::default());
+        let waker = Waker::from(flag.clone());
+        timers.reset(id, at, &waker);
+        {
+            let mut state = timers.state.lock();
+            assert_eq!(state.heap.len(), 1);
+            assert!(state.entries[&id].1.will_wake(&waker));
+            state.heap.clear();
+            state.entries.remove(&id);
+        }
+        timers.reset(id, at, &waker);
+        let mut state = timers.state.lock();
+        assert_eq!(state.heap.len(), 1);
+        assert_eq!(state.entries[&id].0, at);
+        assert!(state.entries[&id].1.will_wake(&waker));
+        let mut due = Vec::new();
+        assert!(state.take_due(at, &mut due).is_none());
+        drop(state);
+        assert_eq!(due.len(), 1);
+        due.pop().unwrap().wake();
+        assert!(flag.0.load(std::sync::atomic::Ordering::Relaxed));
     }
 }

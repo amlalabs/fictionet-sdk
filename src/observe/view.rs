@@ -21,12 +21,17 @@ pub(crate) struct View {
     /// The number of the last event sent.
     event_seq: u64,
     ended: bool,
+    revision: u64,
 }
 
 impl View {
     /// Whether the world had ended when this view was taken.
     pub(crate) fn ended(&self) -> bool {
         self.ended
+    }
+
+    pub(crate) fn events_pending(&self, graph: &Graph) -> bool {
+        self.event_seq < graph.events.last()
     }
 }
 
@@ -96,13 +101,22 @@ enum End {
 /// copy: no sorting, no JSON, no counts. Links whose ends are both gone are
 /// dropped.
 struct Copy {
+    revision: u64,
     ended: bool,
     tasks: Vec<(u64, TaskInfo)>,
     links: Vec<LinkRow>,
 }
 
-fn copy(s: &mut GraphState) -> Copy {
+fn prune(s: &mut GraphState) {
+    let before = s.links.len();
     s.links.retain(|_, l| l.meter.strong_count() > 0);
+    if s.links.len() != before {
+        s.revision += 1;
+    }
+}
+
+fn copy(s: &mut GraphState) -> Copy {
+    prune(s);
     let tasks = s.tasks.iter().map(|(&id, t)| (id, t.clone())).collect();
     let live = |task: u64| (task != 0 && s.tasks.contains_key(&task)).then_some(task);
     let mut links = Vec::with_capacity(s.links.len());
@@ -131,6 +145,7 @@ fn copy(s: &mut GraphState) -> Copy {
         });
     }
     Copy {
+        revision: s.revision,
         ended: s.ended,
         tasks,
         links,
@@ -140,6 +155,7 @@ fn copy(s: &mut GraphState) -> Copy {
 /// The graph as it was copied, in the form the browser sees.
 fn build(mut c: Copy) -> View {
     let mut view = View {
+        revision: c.revision,
         ended: c.ended,
         ..View::default()
     };
@@ -293,12 +309,27 @@ pub(crate) fn snapshot(graph: &Graph, after: Option<u64>) -> (View, Message) {
 
 /// What changed since `old`, which becomes the graph as it is now.
 pub(crate) fn changes(graph: &Graph, old: &mut View) -> Vec<Message> {
-    let c = copy(&mut graph.state());
-    let events = graph.events.after(old.event_seq, EVENTS_PER_CHANGE);
+    let mut state = graph.state();
+    prune(&mut state);
+    if state.revision == old.revision {
+        let mut counters = BTreeMap::new();
+        for (id, link) in &state.links {
+            let id = edge_id(*id);
+            if old.edges.contains_key(&id)
+                && let Some(meter) = link.meter.upgrade()
+            {
+                counters.insert(id, meter.totals());
+            }
+        }
+        drop(state);
+        let out = counter_changes(graph, &old.counters, &counters);
+        old.counters = counters;
+        return out;
+    }
+    let c = copy(&mut state);
+    drop(state);
     let mut new = build(c);
-    new.event_seq = events.last().map_or(old.event_seq, |e| e.seq);
-    let events: Vec<String> = events.iter().map(|e| e.to_line()).collect();
-
+    new.event_seq = old.event_seq;
     let mut out = Vec::new();
     // Edges go first, then nodes, so a browser never holds an edge to a
     // node it was told is gone, nor a new edge to a node it has not met.
@@ -328,26 +359,43 @@ pub(crate) fn changes(graph: &Graph, old: &mut View) -> Vec<Message> {
     for id in old.groups.keys().filter(|id| !new.groups.contains_key(*id)) {
         out.push(("group_end", Object::new().str("id", id).done()));
     }
-    let changed = new
-        .counters
-        .iter()
-        .filter(|(id, c)| old.counters.get(*id) != Some(*c));
-    let counters = counters_json(changed);
-    if counters != "{}" {
-        let data = Object::new()
-            .secs("t", graph.since_start())
-            .raw("edges", &counters)
-            .done();
-        out.push(("counters", data));
-    }
-    for event in events {
-        out.push(("event", event));
-    }
+    out.extend(counter_changes(graph, &old.counters, &new.counters));
     if new.ended && !old.ended {
         out.push(("ended", Object::new().secs("t", graph.since_start()).done()));
     }
     *old = new;
     out
+}
+
+fn counter_changes(
+    graph: &Graph,
+    old: &BTreeMap<String, [u64; 4]>,
+    new: &BTreeMap<String, [u64; 4]>,
+) -> Vec<Message> {
+    let changed = new.iter().filter(|(id, c)| old.get(*id) != Some(*c));
+    let counters = counters_json(changed);
+    if counters == "{}" {
+        Vec::new()
+    } else {
+        vec![(
+            "counters",
+            Object::new()
+                .secs("t", graph.since_start())
+                .raw("edges", &counters)
+                .done(),
+        )]
+    }
+}
+
+/// A bounded event batch and whether another batch may be waiting.
+pub(crate) fn event_changes(graph: &Graph, view: &mut View) -> (Vec<Message>, bool) {
+    let events = graph.events.after(view.event_seq, EVENTS_PER_CHANGE);
+    let full = events.len() == EVENTS_PER_CHANGE;
+    view.event_seq = events.last().map_or(view.event_seq, |e| e.seq);
+    (
+        events.iter().map(|e| ("event", e.to_line())).collect(),
+        full,
+    )
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -469,6 +517,44 @@ mod tests {
     }
 
     #[test]
+    fn link_changes_refresh_cached_topology() {
+        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
+        graph.task_started(1, "world".into(), Location::caller(), None);
+        graph.task_started(2, "worker".into(), Location::caller(), None);
+        let meter = Meter::new();
+        graph.owns(&meter, 0, 1);
+        graph.owns(&meter, 1, 2);
+        let (mut view, _) = snapshot(&graph, None);
+        graph.label(&meter, "link label".into());
+        let update = changes(&graph, &mut view);
+        assert_eq!(names(&update), ["edge"]);
+        assert!(update[0].1.contains("link label"));
+        assert!(changes(&graph, &mut view).is_empty());
+        meter.sent(0, &crate::Packet(vec![0; 32]));
+        assert_eq!(names(&changes(&graph, &mut view)), ["counters"]);
+        assert!(changes(&graph, &mut view).is_empty());
+        drop(meter);
+        assert_eq!(names(&changes(&graph, &mut view)), ["edge_end"]);
+        assert_eq!(view.nodes.len(), 2);
+    }
+
+    #[test]
+    fn unchanged_large_graph() {
+        let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
+        for id in 1..=1000 {
+            graph.task_started(id, "worker".into(), Location::caller(), None);
+        }
+        let (mut view, _) = snapshot(&graph, None);
+        let node = view.nodes["t1"].as_ptr();
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            assert!(changes(&graph, &mut view).is_empty());
+            assert_eq!(view.nodes["t1"].as_ptr(), node);
+        }
+        eprintln!("100 unchanged graph ticks: {:?}", started.elapsed());
+    }
+
+    #[test]
     fn changes_follow_the_graph() {
         let graph = Graph::new(crate::Seed::random(), crate::RunMode::Real);
         graph.task_started(1, "world".into(), Location::caller(), None);
@@ -498,7 +584,8 @@ mod tests {
         graph
             .events
             .push(crate::events::Event::new("bottleneck", "drop").summary("queue full"));
-        let m = changes(&graph, &mut view);
+        let (m, full) = event_changes(&graph, &mut view);
+        assert!(!full);
         assert_eq!(names(&m), ["event"]);
         assert!(
             m[0].1.contains(
@@ -507,7 +594,7 @@ mod tests {
             "{}",
             m[0].1
         );
-        assert!(changes(&graph, &mut view).is_empty());
+        assert!(event_changes(&graph, &mut view).0.is_empty());
 
         graph.run_ended();
         assert_eq!(names(&changes(&graph, &mut view)), ["node_end", "ended"]);

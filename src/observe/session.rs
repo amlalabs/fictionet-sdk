@@ -66,6 +66,7 @@ enum Sub {
         after: Option<u64>,
         said_waiting: bool,
         next: Instant,
+        next_graph: Instant,
     },
     /// `packets`: one link's packets as they are copied.
     Packets {
@@ -233,6 +234,7 @@ impl Session {
                     after,
                     said_waiting: false,
                     next: Instant::now(),
+                    next_graph: Instant::now(),
                 });
                 Ok(())
             }
@@ -331,6 +333,7 @@ impl Session {
                     after,
                     said_waiting,
                     next,
+                    next_graph,
                 } => {
                     if *next > now {
                         continue;
@@ -345,11 +348,19 @@ impl Session {
                             }
                         }
                         (Some(graph), Some((g, view, _))) if *g == generation => {
-                            super::reap(&graph);
-                            for (name, data) in view::changes(&graph, view) {
+                            if *next_graph <= now {
+                                super::reap(&graph);
+                                for (name, data) in view::changes(&graph, view) {
+                                    out.push((*id, event(name, &data), false));
+                                }
+                                *next_graph = now + GRAPH_TICK;
+                            }
+                            let (events, full) = view::event_changes(&graph, view);
+                            for (name, data) in events {
                                 out.push((*id, event(name, &data), false));
                             }
-                            if view.ended() {
+                            *next = if full { now } else { *next_graph };
+                            if view.ended() && !view.events_pending(&graph) {
                                 out.push((
                                     *id,
                                     event("end", r#"{"reason":"the world ended"}"#),
@@ -363,7 +374,13 @@ impl Session {
                             // A later run's events start from its first.
                             *after = after.map(|_| 0);
                             out.push((*id, event(name, &data), false));
-                            if view.ended() {
+                            *next_graph = now + GRAPH_TICK;
+                            *next = if view.events_pending(&graph) {
+                                now
+                            } else {
+                                *next_graph
+                            };
+                            if view.ended() && !view.events_pending(&graph) {
                                 out.push((
                                     *id,
                                     event("end", r#"{"reason":"the world ended"}"#),
@@ -452,6 +469,85 @@ fn world(graph: Option<&Graph>) -> String {
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn full_event_batch_schedules_immediate_catch_up() {
+        let mut fds = [0; 2];
+        // SAFETY: socketpair initializes the two owned descriptors.
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let (ours, theirs) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let reader = std::thread::spawn(move || {
+            let mut buf = vec![0; relay::MAX_MESSAGE + 1];
+            let mut count = 0;
+            while let Ok(n) = unix::recv(theirs.as_raw_fd(), &mut buf, false) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(Message::Reply { body, .. }) = relay::decode(&buf[..n])
+                    && std::str::from_utf8(body)
+                        .unwrap()
+                        .contains(r#""event":"event""#)
+                {
+                    count += 1;
+                }
+            }
+            count
+        });
+        let (attacher, mut attachments) = crate::attachments();
+        let mut session = Session {
+            attacher,
+            fd: ours,
+            subs: Vec::new(),
+        };
+        crate::block_on(crate::run(crate::Seed::random(), |fcx| async move {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(std::pin::pin!(attachments.next(&fcx)).as_mut(), &mut cx)
+                    .is_pending()
+            );
+            session
+                .handle(1, json::parse_flat(r#"{"op":"watch","after":0}"#))
+                .unwrap();
+            session.pump().unwrap();
+            let graph_tick = match &session.subs[0] {
+                Sub::Graph { next_graph, .. } => *next_graph,
+                _ => unreachable!(),
+            };
+            for i in 0..2001u32 {
+                fcx.record(crate::events::Event::new("test", "tick").field("i", i));
+            }
+            if let Sub::Graph { next, .. } = &mut session.subs[0] {
+                *next = Instant::now();
+            }
+            let started = Instant::now();
+            session.pump().unwrap();
+            if let Sub::Graph {
+                next, next_graph, ..
+            } = &session.subs[0]
+            {
+                assert!(*next <= Instant::now());
+                assert_eq!(*next_graph, graph_tick);
+            }
+            session.pump().unwrap();
+            session.pump().unwrap();
+            if let Sub::Graph {
+                next, next_graph, ..
+            } = &session.subs[0]
+            {
+                assert!(*next > Instant::now());
+                assert_eq!(*next_graph, graph_tick);
+            }
+            eprintln!("2001 observer events: {:?}", started.elapsed());
+            drop(session);
+            Ok(())
+        }))
+        .unwrap();
+        assert_eq!(reader.join().unwrap(), 2001);
+    }
 
     /// A cancel with an id past `u32` cancels nothing, rather than the
     /// subscription its low 32 bits name.
