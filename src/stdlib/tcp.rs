@@ -65,6 +65,8 @@ const MTU: usize = 1500;
 /// Packets emitted before downstream tasks get a turn. Splits handle
 /// 64 packets per turn across both directions, including returning ACKs.
 const EGRESS_PACKETS: usize = 32;
+/// Copies fed before an ACK that reopens the receive window.
+const REPAIR_ACK_COPIES: usize = 4;
 /// Receive and send buffer per connection, unless [`Options::buffer`] says
 /// otherwise. The receive buffer is the window.
 const BUFFER: usize = 256 * 1024;
@@ -1007,7 +1009,12 @@ impl State {
             if let Some(until) = owed {
                 self.next_tidy = Some(self.next_tidy.map_or(until, |t| t.min(until)));
                 i += 1;
-            } else if matches!(state, TcpState::Closed | TcpState::TimeWait) {
+            } else if (state == TcpState::Closed && self.get(h).remote_endpoint().is_none())
+                || state == TcpState::TimeWait
+            {
+                // An aborted socket is already CLOSED, but keeps its
+                // endpoint until smoltcp sends the RST. The output
+                // allowance may leave that packet for the next turn.
                 self.orphans.swap_remove(i);
                 self.remove_conn(h);
             } else {
@@ -1116,7 +1123,7 @@ fn repair_ack(
         copy[tcp_at + 4..tcp_at + 8].copy_from_slice(&rcv_nxt.to_be_bytes());
         copy[tcp_at + 13] = 0x10;
         fix_lengths(&mut copy, tcp_at, ip.src, ip.dst);
-        return Some((copy, if reopened { 4 } else { 1 }));
+        return Some((copy, if reopened { REPAIR_ACK_COPIES } else { 1 }));
     }
     let pure = off == t.len() && !fin;
     if !ahead
@@ -1232,9 +1239,9 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
             st.iface.poll_maintenance(now);
             received = batch.len();
             let st = &mut *st;
-            // ACK repair can feed four copies before the original packet.
+            // ACK repair can feed copies before the original packet.
             // Keep room for their receive tokens before consuming input.
-            while st.dev.tx.len() + 5 <= EGRESS_PACKETS {
+            while st.dev.tx.len() + REPAIR_ACK_COPIES < EGRESS_PACKETS {
                 let Some(p) = batch.pop_front() else { break };
                 // After a packet with data, egress immediately, so smoltcp can
                 // ACK every second segment as it means to. With one egress
@@ -1817,6 +1824,42 @@ mod tests {
         rx.consume(|p| assert_eq!(p, [1, 2, 3]));
         tx.consume(40, |_| {});
         assert_eq!(dev.tx.len(), 1);
+    }
+
+    #[test]
+    fn orphan_waits_for_reset_when_output_is_full() {
+        block_on(run(Seed::random(), |fcx| async move {
+            let (_raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:80".parse().unwrap();
+            let peer: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+            let ep = endpoint(&fcx, side, local.ip());
+            let _listener = ep.listen(local.port())?;
+            let now = smol_now(&fcx);
+            let mut st = ep.shared.state.lock();
+            st.ingress(local.ip(), now, segment(peer, local, 100, 0, 2).0);
+            let syn_ack = egress(&mut st, now);
+            let t = Header::parse_whole(&syn_ack[0]).unwrap().payload(&syn_ack[0]);
+            let ack = u32::from_be_bytes(t[4..8].try_into().unwrap()).wrapping_add(1);
+            st.ingress(local.ip(), now, segment(peer, local, 101, ack, 16).0);
+            st.housekeeping(now);
+            let h = st.listeners.get_mut(&80).unwrap().ready.pop_front().unwrap();
+            st.orphan(h, true);
+            for _ in 0..EGRESS_PACKETS {
+                st.dev.transmit(now).unwrap().consume(40, |_| {});
+            }
+            let st = &mut *st;
+            st.iface.poll_egress(now, &mut st.dev, &mut st.sockets);
+            st.housekeeping(now);
+            assert!(st.conns.contains_key(&h), "unsent reset must keep its socket");
+            st.dev.tx.clear();
+            let packets = egress(st, now);
+            assert_eq!(packets.len(), 1);
+            let t = Header::parse_whole(&packets[0]).unwrap().payload(&packets[0]);
+            assert_eq!(t[13] & 4, 4);
+            st.housekeeping(now);
+            assert!(!st.conns.contains_key(&h));
+            Ok(())
+        })).unwrap();
     }
 
     struct WakeLog(u16, Arc<Mutex<Vec<u16>>>);

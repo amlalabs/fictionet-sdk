@@ -1095,11 +1095,11 @@ impl EventLog {
     ///
     /// A line is lost, and counted ([`EventLog::lost`]), when it does not
     /// fit in the thread's queue (100,000 events or 16 MiB of retained
-    /// event data), or when `out` fails. After a queue overflow the file gets an `events.lost` line
-    /// with the count so far. After a failed write or flush the thread
-    /// writes nothing more, and counts every line after it, and each line
-    /// written since the last flush that worked, as lost. A grader throws
-    /// away a sample with any line lost.
+    /// event data), or when `out` fails. After a queue overflow the file gets
+    /// an `events.lost` line with the count so far. After a failed write or
+    /// flush the thread writes nothing more, and counts every line after
+    /// it, and each line written since the last flush that worked, as
+    /// lost. A grader throws away a sample with any line lost.
     pub fn to_writer(&self, out: Box<dyn Write + Send>) {
         if !cfg!(feature = "std") || self.store.mode == crate::RunMode::Lab {
             let writer = Mutex::new(Some(out));
