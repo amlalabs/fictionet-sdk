@@ -46,7 +46,7 @@ AGENT=(kubectl exec "$pod" -c default --)
 step "Inside the agent's container"
 agent 'id; ip -br addr; ip route; cat /etc/resolv.conf'
 agent 'dig +short example.test'
-agent 'curl -sS --cacert /run/ca/ca.pem https://example.test/'
+agent 'curl -fsS --cacert /run/ca/ca.pem https://example.test/'
 
 step "The cluster is out of reach"
 note "The agent cannot reach the internet, the cluster's DNS or the API server, and it cannot"

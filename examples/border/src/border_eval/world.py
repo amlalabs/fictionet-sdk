@@ -31,6 +31,7 @@ __all__ = ["COMPOSE", "COMPOSE_HOME", "Assessment", "assess", "log_size", "world
 
 ROOT: Final = Path(__file__).resolve().parents[2]
 finalize_world = runpy.run_path(str(ROOT.parent / "common" / "finalize.py"))["finalize_world"]
+read_log = runpy.run_path(str(ROOT.parent / "common" / "logs.py"))["read_log"]
 COMPOSE: Final = ROOT / "compose.yaml"
 COMPOSE_HOME: Final = ROOT / "compose.home.yaml"
 """The ``home`` setting: the agent runs on an ordinary user's machine (no BIRD, no lab
@@ -49,10 +50,6 @@ async def world_state() -> dict[str, Any]:
         msg = f"cannot read the world's state: {result.stderr}"
         raise RuntimeError(msg)
     return json.loads(result.stdout)
-
-
-EPISODE: Final = "/tmp/border-episode.jsonl"
-"""Where :func:`world_log` copies the episode's part of the log, in the world's container."""
 
 
 async def _size() -> int:
@@ -82,28 +79,16 @@ async def log_size(settle: float = 0.2, tries: int = 50) -> int:
 async def world_log(offset: int = 0) -> list[dict[str, Any]]:
     """The world's log lines, from byte ``offset`` on, after finalization.
 
-    The part is copied to a file in the world's container and read with ``read_file``, never
-    through a command's output, which Inspect cuts to its last 10 MiB without an error. If
-    the bytes read are not all the bytes written, or the last line is not whole, the sample
-    cannot be scored, and this raises.
+    The complete log is read with ``read_file``, never through command output,
+    which Inspect cuts to its last 10 MiB without an error. Missing bytes or an
+    incomplete last line prevent scoring.
     """
     await finalize_world(sandbox(WORLD), sandbox(), LOG)
-    end = await _size()
-    want = end - offset
-    if want < 0:
-        msg = f"the world's log is {end} bytes, shorter than the offset {offset}"
+    data = await read_log(sandbox(WORLD), LOG, raw=True)
+    if offset < 0 or offset > len(data):
+        msg = f"the world's log is {len(data)} bytes, invalid offset {offset}"
         raise RuntimeError(msg)
-    copy = await sandbox(WORLD).exec(
-        ["sh", "-c", 'tail -c +"$1" "$2" | head -c "$3" > "$4"', "copy", str(offset + 1), LOG, str(want), EPISODE]
-    )
-    if not copy.success:
-        msg = f"cannot copy the world's log: {copy.stderr}"
-        raise RuntimeError(msg)
-    data = await sandbox(WORLD).read_file(EPISODE, text=False)
-    if len(data) != want or (data and not data.endswith(b"\n")):
-        msg = f"read {len(data)} of the log's {want} bytes; this sample cannot be scored"
-        raise RuntimeError(msg)
-    return [json.loads(line) for line in data.decode().splitlines() if line.strip()]
+    return [json.loads(line) for line in data[offset:].decode().splitlines() if line.strip()]
 
 
 @dataclass(frozen=True)

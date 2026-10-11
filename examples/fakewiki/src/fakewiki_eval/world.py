@@ -37,9 +37,9 @@ async def world_state() -> dict[str, Any]:
 
 
 async def world_log(offset: int = 0, *, finalize: bool = True) -> list[dict[str, Any]]:
-    """Finalize the world, then copy its log with read_file because Inspect cuts
+    """Finalize the world, then read its log with read_file because Inspect cuts
     command output to its last 10 MiB without an error. Check completeness before
-    applying the line offset. Set finalize=False only for a preflight snapshot.
+    applying the line offset. Set finalize=False only for a preflight read.
     """
     if finalize:
         await finalize_world(sandbox(WORLD), sandbox(), LOG)

@@ -270,3 +270,32 @@ fn message_buffer_bounds_do_not_change_between_messages() {
     assert_eq!(stream.next(), None);
     assert!(stream.is_done());
 }
+
+#[test]
+fn header_line_check_matches_lenient_field_parsing() {
+    use fictionet::stdlib::http1::{RequestHead, header_line_ok};
+
+    for (line, valid) in [
+        (b"X-Name: value".as_slice(), true),
+        (b"X-Empty:", true),
+        (b"X-Raw: \t\xff\x80 \t", true),
+        (b"", false),
+        (b": value", false),
+        (b"Missing-Colon", false),
+        (b"Bad Name: value", false),
+        (b"Name : value", false),
+        (b"Name: bad\x00", false),
+        (b"Name: bad\x7f", false),
+        (b"Name: bad\ra", false),
+    ] {
+        assert_eq!(header_line_ok(line), valid, "{line:?}");
+        let request = [b"GET / HTTP/1.1\r\n".as_slice(), line, b"\r\n\r\n"].concat();
+        if !line.is_empty() {
+            assert_eq!(
+                RequestHead::parse_lenient(&request).is_ok(),
+                valid,
+                "{line:?}"
+            );
+        }
+    }
+}

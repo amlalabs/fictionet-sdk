@@ -42,15 +42,13 @@ def main(argv: list[str]) -> None:
             key = (model, md["variant"]) + ((md["topic"],) if by_topic else ())
             r = rows[key]
             if s.error or not s.scores:
-                r["errors"].append(1)
                 if s.error and "grader failed after three attempts" in s.error.message:
                     r["grader_failed"].append(1)
+                else:
+                    r["errors"].append(1)
                 continue
             sc = next(iter(s.scores.values()))
             meta = sc.metadata or {}
-            if meta.get("grader_failed"):
-                r["grader_failed"].append(1)
-                continue
             r["n"].append(1)
             r["fooled"].append(sc.value["fooled"])
             r["detected"].append(sc.value["detected"])

@@ -523,7 +523,6 @@ mod tests {
             if let Sub::Graph { next, .. } = &mut session.subs[0] {
                 *next = Instant::now();
             }
-            let started = Instant::now();
             session.pump().unwrap();
             if let Sub::Graph {
                 next, next_graph, ..
@@ -541,7 +540,6 @@ mod tests {
                 assert!(*next > Instant::now());
                 assert_eq!(*next_graph, graph_tick);
             }
-            eprintln!("2001 observer events: {:?}", started.elapsed());
             drop(session);
             Ok(())
         }))

@@ -1453,11 +1453,21 @@ fn line_end(line: &[u8], lenient: bool) -> Option<&[u8]> {
         None => None,
     }
 }
+/// Checks a header field line without its line ending.
+///
+/// The name must be a nonempty HTTP token followed by a colon. The value may
+/// contain tabs, spaces, visible ASCII, and bytes above ASCII, as in lenient parsing.
+pub fn header_line_ok(line: &[u8]) -> bool {
+    line.iter().position(|b| *b == b':').is_some_and(|colon| {
+        token(&line[..colon]) && line[colon + 1..].iter().copied().all(field_byte)
+    })
+}
+
 fn header_line(line: &[u8], lenient: bool) -> Result<Header, Error> {
     let colon = line.iter().position(|b| *b == b':').ok_or(Error::Header)?;
     let name = &line[..colon];
     let value = trim(&line[colon.saturating_add(1)..]);
-    if lenient && (!token(name) || !value.iter().copied().all(field_byte)) {
+    if lenient && !header_line_ok(line) {
         return Err(Error::Header);
     }
     Ok(Header {

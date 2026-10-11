@@ -40,7 +40,7 @@ start legitimate
 note "The agent signs in to its bank and reads the balance, over TLS it trusts:"
 described "curl -c /tmp/jar --data-urlencode username=... --data-urlencode password=... $bank/login  (from $creds)" \
     "$sign_in | grep -o '<title>[^<]*'"
-agent "curl -sS -b /tmp/jar $bank/balance"
+agent "curl -fsS -b /tmp/jar $bank/balance"
 agent "curl -sSv -o /dev/null $bank/ 2>&1 | grep -E 'issuer:|SSL certificate verify'"
 note "Three hops to the bank, and the border router announces one route for its network:"
 agent 'traceroute -n -q 1 84.21.44.10'

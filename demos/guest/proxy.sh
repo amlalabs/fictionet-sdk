@@ -67,12 +67,12 @@ agent 'env | grep -E "^(https?_proxy|SOCKS)=" | sed "s/:[^:@]*@/:<token>@/"'
 
 step "Through the HTTP proxy, by the proxy variables"
 note "TLS is end to end: curl checks the site's certificate against the world's CA."
-agent 'curl -sS https://example.test/'
-agent 'curl -sS http://plain.test/'
+agent 'curl -fsS https://example.test/'
+agent 'curl -fsS http://plain.test/'
 agent 'python3 -c "import urllib.request; print(urllib.request.urlopen(\"https://example.test/\").read().decode().strip())"'
 
 step "Through the SOCKS5 proxy"
-agent 'curl -sS -x "$SOCKS" https://example.test/'
+agent 'curl -fsS -x "$SOCKS" https://example.test/'
 
 step "What does not work"
 note "A wrong token is refused:"

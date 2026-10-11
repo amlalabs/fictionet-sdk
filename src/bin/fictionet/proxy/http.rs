@@ -9,7 +9,7 @@ use fictionet::relay::proxy::http::{
     Answer, MAX_HEAD, Reject, Request, Target, error_response, forward_head, parse_request,
     rewrite_response,
 };
-use fictionet::stdlib::codec::ascii::is_tchar;
+use fictionet::stdlib::http1::header_line_ok;
 use fictionet::stdlib::tcp::TcpConnection;
 use fictionet::tokio::{Compat, ConnectionTokioExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -74,14 +74,7 @@ where
             } else if line.is_empty() {
                 return Ok(parse(buf));
             } else {
-                let valid = line.iter().position(|b| *b == b':').is_some_and(|colon| {
-                    colon != 0
-                        && line[..colon].iter().copied().all(is_tchar)
-                        && line[colon + 1..]
-                            .iter()
-                            .all(|&b| b == b'\t' || (b >= b' ' && b != 127))
-                });
-                if !valid {
+                if !header_line_ok(line) {
                     // Keep the parser's error wording for malformed fields.
                     match parse(&buf[..scanned]) {
                         Ok(None) => {}

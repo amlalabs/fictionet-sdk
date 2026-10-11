@@ -10,6 +10,24 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class Launchers(unittest.TestCase):
+    def test_required_fetches_fail_on_http_errors(self):
+        required = {
+            "proxy": ["https://example.test/", "http://plain.test/", '-x "$SOCKS" https://example.test/'],
+            "k8s": ["--cacert /run/ca/ca.pem https://example.test/"],
+            "border": ["-b /tmp/jar $bank/balance"],
+        }
+        for demo, fetches in required.items():
+            lines = (ROOT / f"demos/guest/{demo}.sh").read_text().splitlines()
+            for fetch in fetches:
+                with self.subTest(demo=demo, fetch=fetch):
+                    commands = [shlex.split(shlex.split(line)[1]) for line in lines
+                                if line.startswith("agent ") and fetch in line and "curl " in line]
+                    self.assertTrue(commands)
+                    for command in commands:
+                        self.assertTrue(any(arg == "--fail" or
+                                            (arg.startswith("-") and not arg.startswith("--") and "f" in arg[1:])
+                                            for arg in command[1:]), command)
+
     def test_dashboard_drops_privileges_and_uses_public_ca(self):
         script = (ROOT / "demos/guest/dashboard.sh").read_text()
         prefix = re.search(r"^AGENT=\(.*?\)$", script, re.M | re.S)

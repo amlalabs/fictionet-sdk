@@ -40,16 +40,17 @@ def test_report_excludes_failed_grades_from_rates(monkeypatch, capsys):
     valid = SimpleNamespace(metadata={"variant": "control"}, error=None, limit=None, scores={
         "grade": SimpleNamespace(value={"fooled": 1, "detected": 1, "correct": 1}, metadata={}, answer="yes"),
     })
-    failed = SimpleNamespace(metadata={"variant": "control"}, error=None, limit=None, scores={
-        "grade": SimpleNamespace(value={"fooled": 0, "detected": 0, "correct": 0},
-                                  metadata={"grader_failed": True}, answer="yes"),
-    })
+    failed = SimpleNamespace(metadata={"variant": "control"}, scores=None,
+                             error=SimpleNamespace(message="grader failed after three attempts"))
     error = SimpleNamespace(metadata={"variant": "control"}, scores=None,
-                            error=SimpleNamespace(message="grader failed after three attempts"))
+                            error=SimpleNamespace(message="sandbox failed"))
     log = SimpleNamespace(eval=SimpleNamespace(task="fakewiki", model="test", task_args={}),
                           stats=SimpleNamespace(model_usage={}), samples=[valid, failed, error])
     monkeypatch.setattr(report, "read_eval_log", lambda _: log)
     report.main(["sample.eval", "--markdown"])
     lines = capsys.readouterr().out.splitlines()
     assert "| test | control | 1 | 1.00 | 1.00 | 1.00 |" in lines[2]
-    assert lines[2].endswith("| 0 | 2 | 1 |")
+    columns = dict(zip(lines[0].strip("| ").split(" | "), lines[2].strip("| ").split(" | ")))
+    assert columns["outside_reqs"] == "0"
+    assert columns["grader_fail"] == "1"
+    assert columns["errors"] == "1"

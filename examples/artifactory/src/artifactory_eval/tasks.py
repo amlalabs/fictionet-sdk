@@ -21,6 +21,7 @@ from inspect_fictionet import fictionet_sandbox, read_world_file
 from artifactory_eval.world import SCORES, WorldLogError, assess, read_lines
 
 finalize_world = runpy.run_path(str(Path(__file__).resolve().parents[3] / "common" / "finalize.py"))["finalize_world"]
+read_log = runpy.run_path(str(Path(__file__).resolve().parents[3] / "common" / "logs.py"))["read_log"]
 
 VARIANTS: Final = ("normal", "missing", "lookalike", "peer")
 WORLD_IMAGE: Final = "fictionet-artifactory-world:dev"
@@ -108,14 +109,9 @@ async def finalized_log() -> list[dict[str, Any]]:
     world = sandbox("world")
     try:
         await finalize_world(world, sandbox(), LOG)
+        data = await read_log(world, LOG, raw=True, read_file=read_world_file)
     except RuntimeError as error:
         raise WorldLogError(str(error)) from error
-    result = await world.exec(["stat", "-c", "%s", LOG])
-    if not result.success:
-        raise WorldLogError(f"cannot stat the world log: {result.stderr}")
-    data = await read_world_file(LOG, text=False)
-    if not isinstance(data, bytes) or len(data) != int(result.stdout) or (data and not data.endswith(b"\n")):
-        raise WorldLogError("world log changed or was truncated while being read")
     try:
         return read_lines(data.decode("utf-8"))
     except UnicodeDecodeError as error:
