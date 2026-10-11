@@ -340,6 +340,85 @@ fn replay(seed: u64) -> Trace {
 }
 
 #[test]
+fn https_sites_with_lab_ca_and_axum_repeat() {
+    use fictionet::stdlib::{ca::Ca, codec::Wire, http1, sandbox, web, x509};
+
+    let episode = |seed| {
+        let log = Log::default();
+        let output = log.clone();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let replies = bodies.clone();
+        block_on(lab(Seed::from_u64(seed), move |cx| async move {
+            cx.events().to_writer(Box::new(output));
+            let date = UNIX_EPOCH + Duration::from_secs(DATE);
+            let ca = Ca::new(&cx, "Lab CA")?;
+            let leaf = ca.issue(
+                &cx,
+                &["site.test"],
+                x509::Validity {
+                    not_before: x509::Time::from_unix(DATE as i64 - 86400)?,
+                    not_after: x509::Time::from_unix(DATE as i64 + 86400)?,
+                },
+            )?;
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca.cert_der())?;
+            let roots = Arc::new(roots);
+            let mut config = leaf.server_config(&cx, date)?;
+            Arc::get_mut(&mut config).unwrap().alpn_protocols = vec![b"http/1.1".to_vec()];
+            let handler_cx = cx.clone();
+            let app = axum::Router::new().fallback(move || {
+                let draw = handler_cx.random_u64();
+                async move { format!("hello {draw}") }
+            });
+            let (attacher, attachments) = fictionet::attachments();
+            web::Sites::new(move |name| {
+                (name == "site.test").then(|| web::Site::new(app.clone()).tls(config.clone()))
+            })
+            .date(date)
+            .start(&cx, attachments)?;
+            let machine =
+                sandbox::machine(&cx, attacher.attach("client")?, Ipv4Addr::new(10, 0, 0, 2));
+            let answer = machine
+                .lookup(&cx, "10.0.0.1".parse()?, "site.test", RecordType::A)
+                .await?;
+            let address = answer
+                .answers
+                .iter()
+                .find_map(|r| match r.data {
+                    RData::A(a) => Some(a.0),
+                    _ => None,
+                })
+                .unwrap();
+            let mut conn = machine
+                .tls(&cx, (address, 443).into(), "site.test", Some(&roots), date)
+                .await?;
+            assert_eq!(conn.tls.alpn_protocol(), Some(b"http/1.1".as_slice()));
+            let request = http1::Request::parse(b"GET / HTTP/1.1\r\nHost: site.test\r\n\r\n")?;
+            for _ in 0..2 {
+                let response = sandbox::request(&cx, &mut conn, &request).await?;
+                assert_eq!(response.head.status, 200);
+                assert!(response.body.starts_with(b"hello "));
+                replies.lock().unwrap().push(response.body);
+            }
+            assert_eq!(cx.events().lost(), 0);
+            cx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+        let events = log.0.lock().unwrap().clone();
+        let bodies = bodies.lock().unwrap().clone();
+        (events, bodies)
+    };
+    let first = episode(41);
+    assert!(!first.0.is_empty());
+    assert_eq!(first.1.len(), 2);
+    assert_eq!(first, episode(41));
+    let other = episode(42);
+    assert_ne!(first.0, other.0);
+    assert_ne!(first.1, other.1);
+}
+
+#[test]
 fn sequential_labs_repeat_every_event_and_packet() {
     let first = replay(41);
     assert!(!first.packets.is_empty());

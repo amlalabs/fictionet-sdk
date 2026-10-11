@@ -315,3 +315,90 @@ fn recorded_world() -> Vec<u8> {
 fn lab_event_bytes_repeat() {
     assert_eq!(recorded_world(), recorded_world());
 }
+
+#[test]
+fn seeded_service_faults_repeat_at_the_same_points() {
+    use fictionet::events::{ConnInfo, Event};
+    use fictionet::prelude::*;
+    use fictionet::stdlib::codec::{ByteFault, Ending, LineError, Lines, Rule, Trigger};
+    use fictionet::stdlib::serve::{self, FaultPlan, Flow, Plan, ServeOptions};
+    use fictionet::stdlib::tcp;
+
+    #[macro_use]
+    #[path = "common/service_fixture.rs"]
+    mod service_fixture;
+
+    struct Echo;
+    service_fixture! {
+        Echo => (Lines, (), std::convert::Infallible);
+        decoder(self) { Lines::new(64, Ending::LfOrCrlf) }
+        on_item(self, line: Result<Vec<u8>, LineError>; _, driver) -> Flow {
+            driver.reply().extend_from_slice(&line.unwrap());
+            driver.reply().push(b'\n');
+            Ok(Flow::Continue)
+        }
+    }
+
+    let episode = |seed| {
+        let bytes = Bytes(Arc::default(), std::thread::current().id());
+        let output = bytes.clone();
+        let points = Arc::new(Mutex::new(Vec::new()));
+        let replies = points.clone();
+        block_on(lab(Seed::from_u64(seed), move |cx| async move {
+            cx.events().to_writer(Box::new(output));
+            let (a, b) = fictionet::pair();
+            let client = tcp::endpoint(&cx, a, "10.0.0.2".parse()?);
+            let server = tcp::endpoint(&cx, b, "10.0.0.1".parse()?);
+            let mut listener = server.listen(7)?;
+            cx.spawn(move |cx| async move {
+                let conn = listener.accept(&cx).await?;
+                let info = ConnInfo::new(1, conn.local_addr(), conn.peer_addr());
+                let options = ServeOptions::default().faults(FaultPlan::new(Plan {
+                    outbound: vec![Rule {
+                        when: Trigger::Chance { take: 1, out_of: 2 },
+                        fault: ByteFault::Corrupt {
+                            offset: Some(0),
+                            xor: 1,
+                        },
+                    }],
+                    ..Plan::default()
+                }));
+                serve::connection(&cx, conn, info, &mut Echo, &(), &options).await?;
+                Ok(())
+            });
+            let mut conn = client.connect(&cx, "10.0.0.1:7".parse()?).await?;
+            for i in 0..32 {
+                conn.write_all(&cx, b"a\n").await?;
+                let mut reply = [0; 2];
+                let mut filled = 0;
+                while filled < reply.len() {
+                    let n = conn.read(&cx, &mut reply[filled..]).await?;
+                    assert_ne!(n, 0);
+                    filled += n;
+                }
+                assert!(reply == *b"a\n" || reply == *b"`\n");
+                let fault = reply[0] == b'`';
+                replies.lock().unwrap().push((i, cx.now(), fault));
+                cx.record(
+                    Event::new("client", "reply")
+                        .field("i", i)
+                        .field("fault", fault),
+                );
+            }
+            assert_eq!(cx.events().lost(), 0);
+            cx.cancel();
+            Ok(())
+        }))
+        .unwrap();
+        let events = bytes.0.lock().unwrap().clone();
+        let points = points.lock().unwrap().clone();
+        (events, points)
+    };
+    let first = episode(41);
+    assert!(first.1.iter().any(|(_, _, fault)| *fault));
+    assert!(first.1.iter().any(|(_, _, fault)| !fault));
+    assert_eq!(first, episode(41));
+    let other = episode(42);
+    assert_ne!(first.0, other.0);
+    assert_ne!(first.1, other.1);
+}
