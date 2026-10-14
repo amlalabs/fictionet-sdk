@@ -133,6 +133,89 @@ fn http1_response_policy_preserves_native_framing() {
     }
 }
 
+/// Pending polls and empty frames do not terminate a chunked response.
+/// The next response on the connection starts after the body's EOF.
+/// Before, an HTTP/1.1 body of unknown length began with the zero-size
+/// chunk, so the client saw an empty body and misread what followed.
+#[test]
+fn an_http11_body_of_unknown_length_ends_only_at_eof() {
+    use fictionet::stdlib::httpd::{Body, Exchange, Handler, Reply};
+    use http_body::Frame;
+
+    struct Frames(std::vec::IntoIter<Option<&'static [u8]>>);
+
+    impl http_body::Body for Frames {
+        type Data = Bytes;
+        type Error = fictionet::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, fictionet::Error>>> {
+            match self.get_mut().0.next() {
+                Some(Some(data)) => Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(data))))),
+                Some(None) => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    struct Paced;
+
+    impl Handler for Paced {
+        fn call(&self, request: http::Request<Body>, _: &mut Exchange<'_>) -> Reply {
+            let body = if request.uri().path() == "/next" {
+                Body::from(Bytes::from_static(b"next\n"))
+            } else {
+                Body::new(Frames(
+                    vec![
+                        None,
+                        Some(b"".as_slice()),
+                        Some(b"stream".as_slice()),
+                        None,
+                        Some(b"".as_slice()),
+                        Some(b"ed\n".as_slice()),
+                        Some(b"".as_slice()),
+                        None,
+                    ]
+                    .into_iter(),
+                ))
+            };
+            Reply::Now(http::Response::new(body))
+        }
+    }
+
+    let mut h = Harness::new(fictionet::Seed::from_u64(0), Http1::new(Paced), ());
+    let mut reply = h.push(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").unwrap();
+    let text = std::str::from_utf8(&reply).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    assert!(head.contains("transfer-encoding: chunked"), "{head}");
+    assert_eq!(
+        body, "6\r\nstream\r\n3\r\ned\n\r\n0\r\n\r\n",
+        "wire: {text:?}"
+    );
+    assert_eq!(h.end_reason(), None);
+
+    reply.extend(
+        h.push(b"GET /next HTTP/1.1\r\nHost: a.test\r\n\r\n")
+            .unwrap(),
+    );
+    let mut responses =
+        fictionet::stdlib::codec::Stream::new(fictionet::stdlib::http1::Responses::default());
+    assert_eq!(responses.push(&reply), reply.len());
+    let first = responses.next().unwrap().unwrap();
+    assert_eq!(first.head.status, 200);
+    assert_eq!(first.body, b"streamed\n");
+    let second = responses.next().unwrap().unwrap();
+    assert_eq!(second.head.status, 200);
+    assert_eq!(second.body, b"next\n");
+    assert!(responses.next().is_none());
+    assert_eq!(h.end_reason(), None);
+}
+
 #[test]
 fn an_http11_request_with_no_host_reaches_the_handler_as_one_that_names_no_host() {
     let vhosts = httpd::VirtualHosts::new();

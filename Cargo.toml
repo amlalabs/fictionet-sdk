@@ -167,7 +167,7 @@ required-features = ["tokio"]
 
 [[test]]
 name = "httpd"
-required-features = ["std", "tokio", "observe"]
+required-features = ["std"]
 
 [[test]]
 name = "listen"
