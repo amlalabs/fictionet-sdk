@@ -79,6 +79,35 @@ fn the_genuine_bank_has_a_trusted_certificate_and_redirects_plain_http() {
             .await;
             assert_eq!(got.status, StatusCode::OK);
             assert!(String::from_utf8_lossy(&got.body).contains("\"balance_gbp\": 4120.55"));
+            let balance_len = got.body.len();
+
+            let stream = tls(
+                &fcx,
+                &m,
+                BANK_ADDR,
+                "kestrelmoor.co.uk",
+                fictionet::stdlib::sandbox::client_config(
+                    &fcx,
+                    std::time::SystemTime::now(),
+                    Some(&env.roots),
+                    &[b"http/1.1"],
+                )
+                .unwrap(),
+            )
+            .await?;
+            let got = request(
+                &fcx,
+                stream,
+                "HEAD",
+                "kestrelmoor.co.uk",
+                "/balance",
+                &[],
+                "",
+            )
+            .await;
+            assert_eq!(got.status, StatusCode::OK);
+            assert!(got.body.is_empty());
+            assert_eq!(got.headers["content-length"], balance_len.to_string());
 
             let got = request(
                 &fcx,
@@ -98,13 +127,24 @@ fn the_genuine_bank_has_a_trusted_certificate_and_redirects_plain_http() {
             assert_eq!(tls_lines[0]["outcome"], "accepted");
             assert_eq!(tls_lines[0]["addr"], "84.21.44.10");
             assert_eq!(tls_lines[0]["sandbox"]["name"], "agent");
-            let http = env.log.wait(&fcx, "http", 2, |_| true).await;
-            let balance = http.iter().find(|l| l["scheme"] == "https").unwrap();
+            let http = env.log.wait(&fcx, "http", 3, |_| true).await;
+            let balance = http
+                .iter()
+                .find(|l| l["scheme"] == "https" && l["method"] == "GET")
+                .unwrap();
             assert_eq!(balance["conn"], tls_lines[0]["conn"]);
             assert_eq!(balance["served_by"], "bank");
             assert_eq!(balance["page"], "balance");
             assert_eq!(balance["status"], 200);
             assert_eq!(balance["complete"], true);
+            assert_eq!(balance["sent"], balance_len);
+            assert!(balance_len > 0);
+            let head = http.iter().find(|l| l["method"] == "HEAD").unwrap();
+            assert_eq!(head["served_by"], "bank");
+            assert_eq!(head["page"], "balance");
+            assert_eq!(head["status"], 200);
+            assert_eq!(head["sent"], 0);
+            assert_eq!(head["complete"], true);
             let redirect = http.iter().find(|l| l["scheme"] == "http").unwrap();
             assert_eq!(redirect["answer"], "redirect");
             assert_eq!(redirect["local"], "84.21.44.10:80");
@@ -872,10 +912,28 @@ fn head_over_http2_gets_the_headers_only() {
             assert_eq!(headers["content-length"], home.len().to_string());
             assert_eq!(headers["server"], "nginx");
             let (status, headers, body) =
+                h2_head(&fcx, &m, BANK_ADDR, "kestrelmoor.co.uk", "/balance").await;
+            assert_eq!((status, body), (StatusCode::OK, 0));
+            assert!(
+                headers["content-length"]
+                    .to_str()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+                    > 0
+            );
+            let (status, headers, body) =
                 h2_head(&fcx, &m, STATUS_ADDR, "status.harbourline.net", "/").await;
             assert_eq!((status, body), (StatusCode::OK, 0));
             assert_eq!(headers["content-length"], "28");
-            let lines = env.log.wait(&fcx, "http", 2, |_| true).await;
+            let lines = env.log.wait(&fcx, "http", 3, |_| true).await;
+            let balance = lines.iter().find(|l| l["path"] == "/balance").unwrap();
+            assert_eq!(balance["served_by"], "bank");
+            assert_eq!(balance["page"], "balance");
+            assert_eq!(balance["method"], "HEAD");
+            assert_eq!(balance["status"], 200);
+            assert_eq!(balance["sent"], 0);
+            assert_eq!(balance["complete"], true);
             assert_eq!(
                 (
                     lines[0]["method"].as_str(),
