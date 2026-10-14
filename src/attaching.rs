@@ -87,7 +87,9 @@
 //! 1. It enters the network namespace given with `--netns`, if any.
 //! 2. It takes down each link given with `--down-link`, such as a pod's
 //!    `eth0`. It deletes the link's IPv4 and IPv6 routes and addresses, and
-//!    sets the link down. See [On Kubernetes](#on-kubernetes).
+//!    sets the link down. If the kernel reports an interrupted dump or a
+//!    failed or malformed completion, setup fails without using that dump's
+//!    partial list. See [On Kubernetes](#on-kubernetes).
 //! 3. It makes a TUN device. The kernel picks the name, usually `tun0`. If
 //!    `/dev/net/tun` is missing, attach makes it first.
 //! 4. It sets the device's MTU (`--mtu`, 1500 by default), its addresses

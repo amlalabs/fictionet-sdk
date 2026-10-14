@@ -23,6 +23,7 @@ const RTM_GETROUTE: u16 = 26;
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_MULTI: u16 = 0x2;
 const NLM_F_ACK: u16 = 0x4;
+const NLM_F_DUMP_INTR: u16 = 0x10;
 const NLM_F_DUMP: u16 = 0x300;
 const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
@@ -523,7 +524,8 @@ impl Netlink {
     }
 
     /// Sends a dump request and returns every message of the answer,
-    /// each with its header.
+    /// each with its header. An interrupted dump or a failed or malformed
+    /// completion returns an error and discards the collected messages.
     pub(crate) fn dump(&self, req: Request) -> io::Result<Vec<Vec<u8>>> {
         self.send(req)?;
         let mut buf = vec![0u8; 32768];
@@ -555,7 +557,8 @@ impl Netlink {
 }
 
 /// Splits one datagram of a dump answer into its messages, appending them
-/// to `out`. Returns true once `NLMSG_DONE` is seen.
+/// to `out`. Checks for interruption and the status in `NLMSG_DONE` before
+/// reporting completion. The caller must discard `out` on error.
 pub(crate) fn split_dump(mut reply: &[u8], out: &mut Vec<Vec<u8>>) -> io::Result<bool> {
     while reply.len() >= 16 {
         let len = u32::from_ne_bytes(reply[0..4].try_into().unwrap()) as usize;
@@ -567,8 +570,32 @@ pub(crate) fn split_dump(mut reply: &[u8], out: &mut Vec<Vec<u8>>) -> io::Result
                 "malformed netlink reply",
             ));
         }
+        if flags & NLM_F_DUMP_INTR != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "netlink dump interrupted; inventory is incomplete",
+            ));
+        }
         match kind {
-            NLMSG_DONE => return Ok(true),
+            NLMSG_DONE => {
+                if len < 20 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "short netlink dump status",
+                    ));
+                }
+                let code = i32::from_ne_bytes(reply[16..20].try_into().unwrap());
+                if code > 0 || code == i32::MIN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid netlink dump status",
+                    ));
+                }
+                if code != 0 {
+                    return Err(io::Error::from_raw_os_error(-code));
+                }
+                return Ok(true);
+            }
             NLMSG_ERROR => {
                 let code = if len >= 20 {
                     i32::from_ne_bytes(reply[16..20].try_into().unwrap())
@@ -863,6 +890,82 @@ mod tests {
             Address::parse(&msg).unwrap().addr,
             Some("fe80::1".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn interrupted_dumps_fail_on_data_or_done() {
+        let first = dumped(RTM_NEWROUTE, &[0; 12], &[]);
+        for kind in [RTM_NEWROUTE, NLMSG_DONE] {
+            let mut interrupted = dumped(kind, &[0; 12], &[]);
+            interrupted[6..8].copy_from_slice(&(NLM_F_MULTI | NLM_F_DUMP_INTR).to_ne_bytes());
+            for same_datagram in [false, true] {
+                let mut out = Vec::new();
+                let reply = if same_datagram {
+                    [first.clone(), interrupted.clone()].concat()
+                } else {
+                    assert!(!split_dump(&first, &mut out).unwrap());
+                    interrupted.clone()
+                };
+                let err = split_dump(&reply, &mut out).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+                assert!(err.to_string().contains("netlink dump interrupted"));
+                assert_eq!(out, vec![first.clone()]);
+            }
+        }
+    }
+
+    #[test]
+    fn dump_done_errors_reject_the_collected_prefix() {
+        let first = dumped(RTM_NEWADDR, &[0; 8], &[]);
+        let done = dumped(NLMSG_DONE, &(-libc::EIO).to_ne_bytes(), &[]);
+        for same_datagram in [false, true] {
+            let mut out = Vec::new();
+            let reply = if same_datagram {
+                [first.clone(), done.clone()].concat()
+            } else {
+                assert!(!split_dump(&first, &mut out).unwrap());
+                done.clone()
+            };
+            assert_eq!(
+                split_dump(&reply, &mut out).unwrap_err().raw_os_error(),
+                Some(libc::EIO)
+            );
+        }
+    }
+
+    #[test]
+    fn dump_done_requires_a_valid_status() {
+        let done = dumped(NLMSG_DONE, &0i32.to_ne_bytes(), &[]);
+        for len in 16..20 {
+            let mut short = done[..len].to_vec();
+            short[..4].copy_from_slice(&(len as u32).to_ne_bytes());
+            // Bytes after this message must not supply its missing status.
+            pad(&mut short);
+            short.extend_from_slice(&done);
+            assert_eq!(
+                split_dump(&short, &mut Vec::new()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for status in [1i32, i32::MIN] {
+            let invalid = dumped(NLMSG_DONE, &status.to_ne_bytes(), &[]);
+            assert_eq!(
+                split_dump(&invalid, &mut Vec::new()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    fn dump_done_with_zero_status_completes() {
+        let first = dumped(RTM_NEWADDR, &[0; 8], &[]);
+        // A DONE may also carry extended ACK attributes after its status.
+        for attrs in [vec![], vec![(1, &b"warning\0"[..])]] {
+            let done = dumped(NLMSG_DONE, &0i32.to_ne_bytes(), &attrs);
+            let mut out = Vec::new();
+            assert!(split_dump(&[first.clone(), done].concat(), &mut out).unwrap());
+            assert_eq!(out, vec![first.clone()]);
+        }
     }
 
     #[test]
