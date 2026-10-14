@@ -193,6 +193,11 @@ gets its address by DHCP or by its first packet, and asks the gateway at
 `10.0.0.1` for names. It reaches every host and no other sandbox. An
 address with no host answers "host unreachable", and a closed port a RST.
 
+DHCP checks the UDP length and checksum before reading a request. It drops
+lengths below eight bytes or beyond the IP payload, and incorrect nonzero
+checksums. IPv4 requests may use a zero checksum. Dropped requests do not
+reserve or bind an address and get no reply.
+
 With `fictionet attach --type http_proxy` or `--type socks5`, attach looks
 names up in the world's DNS. It follows at most 16 CNAME aliases from the
 queried name and uses an A record for the final name. It ignores unrelated

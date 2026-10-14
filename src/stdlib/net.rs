@@ -57,6 +57,9 @@
 //!   each family, bound to its attachment, and packets from any other
 //!   source are dropped. Its fragments are put back together in its own
 //!   filter, so a fragment can never complete another sandbox's packet.
+//!   DHCP drops requests with a UDP length below eight bytes or beyond the
+//!   IP payload, or an incorrect nonzero UDP checksum. An IPv4 zero checksum
+//!   is accepted. Dropped requests do not reserve or bind an address.
 //! - **Sandboxes cannot reach each other.** A packet to the sandboxes'
 //!   subnet other than the gateway is dropped. [`Net::route`] attaches a
 //!   trusted sandbox, such as a real container playing a host, at a fixed
@@ -2541,8 +2544,8 @@ fn udp_packet(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8])
 }
 
 /// If `packet` (with header `h`) is for the DHCP server (UDP port 67 at the
-/// broadcast address or the gateway), its message, or `Some(None)` if it
-/// does not parse. `None` for every other packet.
+/// broadcast address or the gateway), its message, or `Some(None)` if
+/// its UDP envelope or message is invalid. `None` for every other packet.
 fn to_dhcp_server(packet: &[u8], h: &Header, gateway: Ipv4Addr) -> Option<Option<dhcp::Message>> {
     if h.protocol != PROTO_UDP || h.fragment.is_some() {
         return None;
@@ -2552,11 +2555,21 @@ fn to_dhcp_server(packet: &[u8], h: &Header, gateway: Ipv4Addr) -> Option<Option
         return None;
     }
     let u = h.payload(packet);
-    if u.len() < 8 || u16::from_be_bytes([u[2], u[3]]) != dhcp::SERVER_PORT {
+    if u.len() < 4 || u16::from_be_bytes([u[2], u[3]]) != dhcp::SERVER_PORT {
         return None;
     }
-    let len = (u16::from_be_bytes([u[4], u[5]]) as usize).clamp(8, u.len());
-    Some(dhcp::Message::parse(&u[8..len]).ok())
+    if u.len() < 8 {
+        return Some(None);
+    }
+    let len = u16::from_be_bytes([u[4], u[5]]) as usize;
+    if len < 8 || len > u.len() {
+        return Some(None);
+    }
+    let u = &u[..len];
+    if !ip::udp_checksum_ok(h.src, h.dst, u) {
+        return Some(None);
+    }
+    Some(dhcp::Message::parse(&u[8..]).ok())
 }
 
 /// One attachment's time on the network, the same for a sandbox behind a

@@ -1197,6 +1197,95 @@ async fn dhcp_ask(
 }
 
 #[test]
+fn dhcp_rejects_bad_udp_checksum() {
+    dhcp_rejects_udp(|u| {
+        let checksum = u16::from_be_bytes([u[6], u[7]]);
+        let bad = if checksum == 1 { 2 } else { checksum ^ 1 };
+        u[6..8].copy_from_slice(&bad.to_be_bytes());
+    });
+}
+
+#[test]
+fn dhcp_rejects_bad_udp_length() {
+    for len in [0u16, 7, u16::MAX] {
+        dhcp_rejects_udp(move |u| {
+            u[4..6].copy_from_slice(&len.to_be_bytes());
+            // Isolate the length check from the checksum check.
+            u[6..8].fill(0);
+        });
+    }
+}
+
+#[test]
+fn dhcp_rejects_short_udp_header() {
+    dhcp_rejects_udp(|u| u.truncate(7));
+}
+
+fn dhcp_rejects_udp(mutate: impl Fn(&mut Vec<u8>) + Copy + Send + 'static) {
+    for dst in [Ipv4Addr::BROADCAST, GATEWAY] {
+        for kind in [dhcp::DISCOVER, dhcp::REQUEST] {
+            world(move |fcx, attacher, _env| async move {
+                let any = Ipv4Addr::UNSPECIFIED;
+                let addr = Ipv4Addr::new(10, 0, 0, 2);
+                let mut a = attacher.attach("a").unwrap();
+                let mut m = dhcp_msg(kind, 1, 1);
+                m.push(dhcp::opt::REQUESTED_IP, addr.octets());
+                let mut u = parse(&udp(any, 68, dst, 67, &m.to_bytes().unwrap())).3;
+                mutate(&mut u);
+                a.send(ipv4(any, dst, 17, &u));
+                assert!(recv_within(&fcx, &mut a, SHORT).await.is_none());
+                // A malformed request with a static source must not fall
+                // through to first-packet address binding either.
+                a.send(ipv4(addr, dst, 17, &u));
+                assert!(recv_within(&fcx, &mut a, SHORT).await.is_none());
+
+                // Keep a attached: rejection must neither hold an offer nor
+                // bind the address. Another sandbox can claim it immediately.
+                let mut b = attacher.attach("b").unwrap();
+                let mut request = dhcp_msg(dhcp::REQUEST, 2, 2);
+                request.push(dhcp::opt::REQUESTED_IP, addr.octets());
+                let (_, ack) = dhcp_ask(&fcx, &mut b, any, dst, &request).await.unwrap();
+                assert_eq!((ack.message_type(), ack.yiaddr), (Some(dhcp::ACK), addr));
+                b.send(ping(addr, GATEWAY, 1));
+                assert!(recv_within(&fcx, &mut b, SHORT).await.is_some());
+                Ok(())
+            });
+        }
+    }
+}
+
+#[test]
+fn dhcp_accepts_zero_udp_checksum() {
+    for dst in [Ipv4Addr::BROADCAST, GATEWAY] {
+        world(move |fcx, attacher, _env| async move {
+            let any = Ipv4Addr::UNSPECIFIED;
+            let addr = Ipv4Addr::new(10, 0, 0, 2);
+            let mut a = attacher.attach("a").unwrap();
+            for (kind, reply_kind) in [(dhcp::DISCOVER, dhcp::OFFER), (dhcp::REQUEST, dhcp::ACK)] {
+                let mut m = dhcp_msg(kind, kind.into(), 1);
+                m.push(dhcp::opt::REQUESTED_IP, addr.octets());
+                let mut u = parse(&udp(any, 68, dst, 67, &m.to_bytes().unwrap())).3;
+                u[6..8].fill(0);
+                a.send(ipv4(any, dst, 17, &u));
+                let p = recv_within(&fcx, &mut a, SHORT).await.expect("a reply");
+                let (from, to, proto, u) = parse(&p);
+                assert_eq!((from, to, proto), (GATEWAY, Ipv4Addr::BROADCAST, 17));
+                assert!(ip::udp_checksum_ok(from.into(), to.into(), &u));
+                let reply = dhcp::Message::parse(&u[8..]).unwrap();
+                assert_eq!(reply.xid, m.xid);
+                assert_eq!(
+                    (reply.message_type(), reply.yiaddr),
+                    (Some(reply_kind), addr)
+                );
+            }
+            a.send(ping(addr, GATEWAY, 1));
+            assert!(recv_within(&fcx, &mut a, SHORT).await.is_some());
+            Ok(())
+        });
+    }
+}
+
+#[test]
 fn dhcp_lease_renewal_and_restart() {
     world(|fcx, attacher, _env| async move {
         let any = Ipv4Addr::UNSPECIFIED;
