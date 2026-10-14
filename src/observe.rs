@@ -61,6 +61,9 @@
 //! summary, as in Wireshark. Select one to see its layers, and its bytes
 //! with the selected field marked. **Capture for Wireshark** downloads the
 //! packets shown as a pcapng file.
+//! Selecting a packet clears the previous layers and bytes while it loads.
+//! Only the current selection can fill them. Closing or reopening the drawer
+//! cancels pending detail requests. Failed requests leave no old bytes visible.
 //! If the packet stream reconnects, the list reloads retained history. It
 //! clears old rows, pending packets, sampling totals and the selected detail.
 //! A paused list stays paused and holds the replay until resumed.

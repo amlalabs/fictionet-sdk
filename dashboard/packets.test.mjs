@@ -1,4 +1,4 @@
-// Tests for packet history reloads with injected streams and detail requests.
+// Tests for packet history and selection with injected streams and detail requests.
 // The Rust test `dashboard_js` runs them when node is installed.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -79,7 +79,7 @@ function setup(t, links = ['a']) {
   const requests = [];
   const transport = createTransport({}, {
     EventSource,
-    fetch: (url) => new Promise((resolve) => requests.push({ url, resolve })),
+    fetch: (url, { signal }) => new Promise((resolve, reject) => requests.push({ url, signal, resolve, reject })),
   });
   const view = createPackets({ $, el, ...transport, fmtCount: String, fit() {} });
   const open = () => view.openLinks('From', 'To', links.map((id) => ({ e: { id }, flip: false })));
@@ -97,7 +97,107 @@ function setup(t, links = ['a']) {
 }
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
-const detail = (seq) => ({ seq, len: 40, t: seq, layers: [], buffers: [] });
+const detail = (seq) => ({ seq, len: 40, t: seq, layers: [], buffers: [{ name: 'packet', hex: '4142' }, { name: 'payload', hex: '43' }] });
+
+async function pending(request, stage) {
+  let resolve, reject;
+  if (stage.startsWith('json')) {
+    request.resolve({ ok: true, json: () => new Promise((done, fail) => { resolve = done; reject = fail; }) });
+    await settle();
+  }
+  return () => {
+    if (stage === 'json') resolve(detail(1));
+    else if (stage === 'json failure') reject(new Error('Invalid JSON'));
+    else if (stage === 'fetch failure') request.reject(new Error('Disconnected'));
+    else request.resolve({ ok: stage !== 'missing', json: async () => detail(1) });
+  };
+}
+
+function assertEmptyHex() {
+  assert.equal($('hex').hidden, true);
+  assert.equal($('hex-tabs').textContent, '');
+  assert.equal($('hex-dump').textContent, '');
+  $('tree').dispatchEvent(new Event('pointerleave'));
+  assert.equal($('hex-dump').textContent, '');
+}
+
+for (const stage of ['fetch', 'json', 'missing', 'fetch failure', 'json failure']) {
+  test(`a newer selection wins over an older ${stage} completion`, async (t) => {
+    const h = setup(t, ['a', 'b']);
+    h.send(1, { link: 'a' });
+    h.send(1, { link: 'b', side: 1 });
+    h.flush();
+    const [first, second] = h.rows();
+    first.click();
+    const old = h.requests[0];
+    const complete = await pending(old, stage);
+    second.click();
+    assert.equal(old.signal.aborted, true);
+    assert.equal(h.requests[1].signal.aborted, false);
+    assert.match(h.requests[1].url, /link=b&seq=1/);
+    h.requests[1].resolve({ ok: true, json: async () => detail(2) });
+    await settle();
+    const tree = $('tree').textContent;
+    const hex = $('hex-dump').textContent;
+    assert.match(tree, /Packet 2.*To → From/);
+    assert.match(hex, /41 42/);
+    complete(); // The mock deliberately completes even after abort.
+    await settle();
+    assert.deepEqual($('prows').querySelectorAll('tr.on'), [second]);
+    assert.equal($('tree').textContent, tree);
+    assert.equal($('hex-dump').textContent, hex);
+  });
+}
+
+for (const action of ['close', 'reopen', 'reconnect']) {
+  for (const stage of ['fetch', 'json']) {
+    test(`${action} invalidates a pending detail ${stage}`, async (t) => {
+      const h = setup(t);
+      h.send(1);
+      h.flush();
+      h.rows()[0].click();
+      const request = h.requests[0];
+      const complete = await pending(request, stage);
+      if (action === 'close') h.view.close();
+      else if (action === 'reopen') h.view.openLinks('Other', 'Link', [{ e: { id: 'b' }, flip: false }]);
+      else h.source.emit('open');
+      assert.equal(request.signal.aborted, true);
+      const tree = $('tree').textContent;
+      complete();
+      await settle();
+      assert.equal($('tree').textContent, tree);
+      assertEmptyHex();
+    });
+  }
+}
+
+for (const stage of ['missing', 'fetch failure', 'json failure']) {
+  test(`${stage} clears the selected tree and bytes and permits retry`, async (t) => {
+    const h = setup(t);
+    h.send(1);
+    h.flush();
+    const row = h.rows()[0];
+    row.click();
+    h.requests[0].resolve({ ok: true, json: async () => detail(1) });
+    await settle();
+    assert.match($('tree').textContent, /Packet 1/);
+    assert.match($('hex-dump').textContent, /41 42/);
+    assert.equal($('hex-tabs').children.length, 2);
+    row.click();
+    assert.match($('tree').textContent, /Loading/);
+    assertEmptyHex();
+    const complete = await pending(h.requests[1], stage);
+    complete();
+    await settle();
+    assert.match($('tree').textContent, stage === 'missing' ? /no longer kept/ : /Could not load/);
+    assertEmptyHex();
+    row.click();
+    h.requests[2].resolve({ ok: true, json: async () => detail(1) });
+    await settle();
+    assert.match($('tree').textContent, /Packet 1/);
+    assert.equal($('hex').hidden, false);
+  });
+}
 
 test('repeated reconnects replace single-link rows and sampling totals before replay', async (t) => {
   const h = setup(t);

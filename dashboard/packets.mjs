@@ -11,6 +11,8 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
   // queue, skipped, rows }. A packet's side is turned to the drawn edge's:
   // 0 from its first end, 1 from its second.
   let packets = null;
+  let selection = 0;
+  let detailRequest = null;
   /// Rows the packet list keeps.
   const MAX_ROWS = 3000;
   /// How long a merged packet view holds packets to put them in order.
@@ -52,11 +54,11 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
     $('pause').textContent = 'Pause';
     $('sampled').hidden = true;
     prows.replaceChildren();
-    $('tree').replaceChildren(el('p', { class: 'placeholder', text: many ? 'Packets from all of these links appear here, merged, as they cross. Select one to see its layers.' : 'Packets appear here as they cross the link. Select one to see its layers.' }));
-    $('hex').hidden = true;
+    clearDetail(many ? 'Packets from all of these links appear here, merged, as they cross. Select one to see its layers.' : 'Packets appear here as they cross the link. Select one to see its layers.');
     const flips = new Map(members.map((m) => [m.e.id, m.flip]));
     const source = packetStream(list, () => {
       if (packets?.source !== source) return;
+      invalidateSelection();
       // A new subscription replays retained history, possibly with restarted
       // sequence numbers. Replace its state before accepting any replay.
       packets = { ...packets, rows: 0, held: [], queue: [], skipped: 0, open: members.length };
@@ -64,11 +66,7 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
       addGap('Packet history reloaded after reconnect.');
       $('sampled').hidden = true;
       $('sampled').textContent = '';
-      $('tree').replaceChildren(el('p', { class: 'placeholder', text: 'Packet history reloaded after reconnect. Select a packet to see its layers.' }));
-      hexState = null;
-      $('hex').hidden = true;
-      $('hex-tabs').replaceChildren();
-      $('hex-dump').replaceChildren();
+      clearDetail('Packet history reloaded after reconnect. Select a packet to see its layers.');
     });
     packets = { flips, many, source, rows: 0, paused: false, held: [], queue: [], skipped: 0, open: members.length };
     source.addEventListener('packet', (ev) => {
@@ -94,6 +92,7 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
   }
 
   function closePackets() {
+    invalidateSelection();
     if (packets) packets.source.close();
     packets = null;
     drawer.hidden = true;
@@ -183,22 +182,48 @@ export function createPackets({ $, el, packetStream, packet, getEdge, ends, node
 
   async function showPacket(p, tr) {
     if (!packets) return;
+    invalidateSelection();
+    const generation = selection;
     const history = packets;
+    const request = new AbortController();
+    detailRequest = request;
+    const current = () => packets === history && selection === generation && !drawer.hidden;
     for (const r of prows.querySelectorAll('tr.on')) r.classList.remove('on');
     tr.classList.add('on');
-    const res = await packet(p);
-    if (packets !== history) return;
-    if (!res.ok) {
-      $('tree').replaceChildren(el('p', { class: 'placeholder', text: 'This packet is no longer kept. The dashboard keeps the last 4,096 packets of a link.' }));
-      return;
+    clearDetail('Loading packet…');
+    try {
+      const res = await packet(p, request.signal);
+      if (!current()) return;
+      if (!res.ok) {
+        clearDetail('This packet is no longer kept. The dashboard keeps the last 4,096 packets of a link.');
+        return;
+      }
+      const d = await res.json();
+      if (!current()) return;
+      d.side = p.side;
+      renderDetail(d);
+    } catch {
+      if (current()) clearDetail('Could not load this packet. Select it again to retry.');
+    } finally {
+      if (detailRequest === request) detailRequest = null;
     }
-    const d = await res.json();
-    if (packets !== history) return;
-    d.side = p.side;
-    renderDetail(d);
+  }
+
+  function invalidateSelection() {
+    selection++;
+    detailRequest?.abort();
+    detailRequest = null;
   }
 
   let hexState = null;
+
+  function clearDetail(text) {
+    $('tree').replaceChildren(el('p', { class: 'placeholder', text }));
+    hexState = null;
+    $('hex').hidden = true;
+    $('hex-tabs').replaceChildren();
+    $('hex-dump').replaceChildren();
+  }
 
   function renderDetail(d) {
     const tree = $('tree');

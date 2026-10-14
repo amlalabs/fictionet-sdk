@@ -516,6 +516,11 @@ Discard a sample if
 
 ## 6. The dashboard
 
+Selecting a packet clears the previous layers and bytes while it loads.
+Only the current selection can fill them. Closing or reopening the drawer,
+or reconnecting its stream, cancels pending detail requests. If a packet is
+unavailable or its request fails, both views clear. Select it again to retry.
+
 When a packet stream reconnects, the dashboard reloads retained history and
 shows a reload notice. It clears old rows, pending and paused packets,
 sampling totals and the selected detail before replay. A paused view stays

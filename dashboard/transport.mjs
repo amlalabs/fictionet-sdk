@@ -44,8 +44,8 @@ export function createTransport({ state, setStatus, tick, snapshot, upsertGroup,
     return source;
   }
 
-  function packet(p) {
-    return fetch(`api/packet?link=${p.link}&seq=${p.seq}`);
+  function packet(p, signal) {
+    return fetch(`api/packet?link=${p.link}&seq=${p.seq}`, { signal });
   }
 
   return { connect, packetStream, packet };
