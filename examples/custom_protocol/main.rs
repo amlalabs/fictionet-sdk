@@ -155,3 +155,13 @@ async fn read_planted_register(fcx: Cx) -> fictionet::Result {
 fn main() -> fictionet::Result {
     block_on(lab(Seed::from_u64(7), read_planted_register))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_protocol_scenario() -> fictionet::Result {
+        block_on(lab(Seed::from_u64(7), read_planted_register))
+    }
+}
