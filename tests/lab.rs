@@ -5,7 +5,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use fictionet::time::{Instant, ms};
-use fictionet::{Cancelled, RaceError, RunMode, Seed, Timer, block_on, lab};
+use fictionet::{Cancelled, JoinError, RaceError, RunMode, Seed, Timer, block_on, lab};
 
 #[test]
 fn a_minute_passes_without_waiting_a_minute() {
@@ -149,6 +149,75 @@ fn spawns_and_self_wakes_drain_before_time_advances() {
     }))
     .unwrap();
     assert_eq!(*log.lock().unwrap(), [Duration::ZERO, ms(5)]);
+}
+
+#[test]
+fn a_retained_context_cannot_reopen_a_completed_region() {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
+        for outcome in ["ok", "failed", "stopped"] {
+            let mut retained = None;
+            let result = fcx
+                .region(|child| {
+                    retained = Some(child.clone());
+                    async move {
+                        match outcome {
+                            "failed" => Err(fictionet::Error::msg("first failure")),
+                            "stopped" => {
+                                child.cancel();
+                                Ok(())
+                            }
+                            _ => Ok(()),
+                        }
+                    }
+                })
+                .await;
+            if outcome == "failed" {
+                assert_eq!(result.unwrap_err().to_string(), "first failure");
+            } else {
+                result?;
+            }
+            let child = retained.unwrap();
+            assert_eq!(child.is_cancelled(), outcome != "ok");
+            let held = Arc::new(());
+            let captured = held.clone();
+            let task = child.spawn(move |_fcx| async move {
+                let _held = captured;
+                Err(fictionet::Error::msg("late failure"))
+            });
+            assert!(matches!(task.join(&fcx).await, Err(JoinError::Cancelled)));
+            assert_eq!(Arc::strong_count(&held), 1);
+            assert_eq!(child.is_cancelled(), outcome != "ok");
+            assert!(!fcx.is_cancelled());
+        }
+        Ok(())
+    }))
+    .unwrap();
+}
+
+#[test]
+fn an_active_cancelled_region_can_spawn_cleanup_work() {
+    let cleaned = Arc::new(Mutex::new(false));
+    let out = cleaned.clone();
+    block_on(lab(Seed::from_u64(1), move |fcx| async move {
+        fcx.region(|child| async move {
+            child.spawn(move |fcx| async move {
+                fcx.cancelled().await;
+                fcx.spawn(move |fcx| async move {
+                    assert!(fcx.is_cancelled());
+                    assert_eq!(fcx.sleep(ms(1)).await, Err(Cancelled));
+                    *out.lock().unwrap() = true;
+                    Ok(())
+                });
+                Ok(())
+            });
+            child.cancel();
+            Ok(())
+        })
+        .await?;
+        assert!(*cleaned.lock().unwrap());
+        Ok(())
+    }))
+    .unwrap();
 }
 
 #[test]

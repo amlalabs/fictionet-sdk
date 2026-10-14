@@ -51,6 +51,11 @@ use crate::watch::Group;
 ///   [`Cx::cancel`] cancels a region without an error, and the region then
 ///   ends with `Ok`, unless a task failed before the cancel.
 ///
+/// Once [`Cx::region`] returns, a retained `Cx` cannot start more tasks in
+/// that region. Spawning returns a task whose join reports
+/// [`JoinError::Cancelled`]. Cancellation alone does not close admission:
+/// tasks in an active region can still spawn work to finish shutting down.
+///
 /// [`running`](crate::running#what-ends-what) has a table of every way a
 /// world and its tasks end.
 ///
@@ -211,6 +216,12 @@ impl Cx {
     /// it with [`Task::join`]. Dropping the `Task` does not stop the work:
     /// the region owns it, not the handle.
     ///
+    /// If the region has completed, the returned task joins with
+    /// [`JoinError::Cancelled`]. `work` is still called to construct the
+    /// future, but that future is dropped without being polled. An active
+    /// region still accepts tasks after cancellation; their waits see the
+    /// cancel as usual.
+    ///
     /// **If `work` returns an error, its region fails.** The region is
     /// cancelled, so its other tasks stop, and the error goes to whoever
     /// owns the region. For the world's region, that means the error comes
@@ -238,8 +249,9 @@ impl Cx {
     /// stdlib names its tasks after the function that starts them, and a
     /// copy of a stdlib file can do the same.
     ///
-    /// `name` is called before taking the scheduler's queue lock. It may
-    /// call methods on this `Cx`, including [`Cx::cancel`].
+    /// `name` is called only if the region admits the task, before taking
+    /// the scheduler's queue lock. It may call methods on this `Cx`,
+    /// including [`Cx::cancel`].
     #[track_caller]
     pub fn spawn_as<F, Fut>(&self, name: impl FnOnce() -> Cow<'static, str>, work: F) -> Task
     where
@@ -254,7 +266,11 @@ impl Cx {
             group: self.group.clone(),
         });
         let join = Arc::new(JoinState::default());
-        region.task_started();
+        if !region.try_start_task() {
+            drop(future);
+            join.finish(Err(JoinError::Cancelled));
+            return Task { join };
+        }
         let group = self.group.as_ref();
         if let Err(future) = self.run.spawn(
             Box::pin(future),
@@ -481,6 +497,10 @@ impl Cx {
     ///   outside, because this region was, and some of its work ended with
     ///   the cancel instead of finishing.
     ///
+    /// Before returning, the new region closes admission. A retained `Cx`
+    /// cannot reopen it with [`Cx::spawn`]. Completion does not itself
+    /// cancel the region.
+    ///
     /// Dropping the returned future before it finishes cancels the new
     /// region. Its work then ends on its own, as after any cancel, but
     /// nothing waits for it and its errors are lost.
@@ -653,7 +673,8 @@ pub enum JoinError {
     Failed(crate::Error),
     /// The task did not finish: it ended with a cancel, or the region of
     /// the `Cx` passed to `join` was cancelled first, or the run was
-    /// dropped.
+    /// dropped, or admission was refused because the task's region had
+    /// completed.
     Cancelled,
 }
 
@@ -699,7 +720,8 @@ impl Task {
     /// says. It is ready before the failure cancels the region, so a joiner
     /// in that same region still gets it. If the task ended with a cancel,
     /// or `fcx`'s region is cancelled before the task ends, or the run is
-    /// dropped, this returns [`JoinError::Cancelled`].
+    /// dropped, this returns [`JoinError::Cancelled`]. It also returns
+    /// `Cancelled` if the task was refused because its region had completed.
     pub async fn join(self, fcx: &Cx) -> Result<(), JoinError> {
         let mut wait = CancelWait::default();
         poll_fn(|cx| {
@@ -793,6 +815,8 @@ struct RegionState {
     cancel_ended: bool,
     /// Spawned work that has not ended yet.
     live: usize,
+    /// The owner observed completion; no more tasks may enter.
+    completed: bool,
     /// Woken when `live` drops to zero.
     done: Option<Waker>,
 }
@@ -896,8 +920,13 @@ impl Region {
             && self.state.lock().cancel_ended
     }
 
-    pub(crate) fn task_started(&self) {
-        self.state.lock().live += 1;
+    fn try_start_task(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.completed {
+            return false;
+        }
+        state.live += 1;
+        true
     }
 
     /// Keeps `error` if it is the region's first and the region was not
@@ -934,6 +963,7 @@ impl Region {
     fn poll_done(&self, cx: &mut Context<'_>) -> Poll<()> {
         let mut state = self.state.lock();
         if state.live == 0 {
+            state.completed = true;
             Poll::Ready(())
         } else {
             state.done = Some(cx.waker().clone());

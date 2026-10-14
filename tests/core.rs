@@ -882,6 +882,58 @@ fn dropping_the_run_ends_waits_outside_it() {
 }
 
 #[test]
+fn region_completion_and_concurrent_admission_have_one_boundary() {
+    for admitted_first in [false, true] {
+        let (child_tx, child_rx) = mpsc::channel::<fictionet::Cx>();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let child = child_rx.recv().unwrap();
+            child.spawn_as(
+                || {
+                    if admitted_first {
+                        // Admission counts the task before naming or enqueueing it.
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    "boundary task".into()
+                },
+                |_fcx| {
+                    if !admitted_first {
+                        // Future construction precedes admission.
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    async { Err(Boom("boundary failure").into()) }
+                },
+            )
+        });
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            let mut region = std::pin::pin!(fcx.region(move |child| {
+                child_tx.send(child).unwrap();
+                entered_rx.recv().unwrap();
+                async { Ok(()) }
+            }));
+            let first =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(region.as_mut().poll(cx))).await;
+            assert_eq!(first.is_pending(), admitted_first);
+            release_tx.send(()).unwrap();
+            let task = worker.join().unwrap();
+            if admitted_first {
+                assert_eq!(region.await.unwrap_err().to_string(), "boundary failure");
+                assert!(matches!(task.join(&fcx).await, Err(JoinError::Failed(_))));
+            } else {
+                assert!(matches!(first, std::task::Poll::Ready(Ok(()))));
+                assert!(matches!(task.join(&fcx).await, Err(JoinError::Cancelled)));
+            }
+            assert!(!fcx.is_cancelled());
+            Ok(())
+        }))
+        .unwrap();
+    }
+}
+
+#[test]
 fn cancel_stops_the_world_cleanly() {
     let (attacher, attachments) = attachments();
     let mut agent = attacher.attach("agent").unwrap();
