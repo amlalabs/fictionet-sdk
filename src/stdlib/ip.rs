@@ -220,9 +220,11 @@ async fn split(
 /// that caused it. An error about a TCP packet goes to the TCP end, and one
 /// about a UDP packet to the UDP end, so code that reads the TCP end sees
 /// the errors about its own connections without reading the ICMP
-/// interface. The stdlib's own [`tcp::endpoint`](fictionet::stdlib::tcp::endpoint)
-/// and [`udp::endpoint`](fictionet::stdlib::udp::endpoint) drop them. Pings and
-/// other ICMP messages go to the ICMP end.
+/// interface. [`tcp::endpoint`](fictionet::stdlib::tcp::endpoint) uses ICMPv4
+/// destination-unreachable errors that quote a pending connect's current SYN,
+/// except code 4 (fragmentation needed). It drops other ICMP errors.
+/// [`udp::endpoint`](fictionet::stdlib::udp::endpoint) drops all of them.
+/// Pings and other ICMP messages go to the ICMP end.
 ///
 /// **Fragments are put back together first.** A fragmented packet only
 /// names its protocol in the first fragment, so fragments are reassembled

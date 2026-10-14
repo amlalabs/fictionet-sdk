@@ -136,6 +136,15 @@ TCP takes the peer's initial sequence number only from an accepted handshake.
 Invalid or unsolicited SYN-ACKs cannot move the connection's receive window
 or keep its buffer pages resident.
 
+A pending TCP connect fails with `ConnError::Unreachable(code)` when an
+ICMPv4 destination-unreachable message quotes its local and remote addresses,
+ports, and current SYN sequence number. The code is the ICMP code, such as
+1 for host unreachable. Code 4 (fragmentation needed) is ignored; TCP does
+no path MTU discovery. A quote needs the IP header and at least eight TCP
+bytes. Malformed, unrelated, and stale quotes are ignored. Other pending
+connects and established connections are unaffected. Attach uses this TCP
+result for its HTTP and SOCKS error replies.
+
 ### One protocol, two framings
 
 Kerberos frames a message with a four-byte length over TCP, and sends one

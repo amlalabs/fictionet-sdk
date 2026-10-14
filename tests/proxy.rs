@@ -149,7 +149,15 @@ impl World {
     /// none. A connection through attach waits for an answer to its SYN
     /// until the world stops.
     fn black_hole() -> World {
-        use fictionet::InterfaceExt;
+        Self::with_packets(|_| Vec::new())
+    }
+
+    /// A raw world whose replies are chosen by the test.
+    fn with_packets(
+        answer: impl Fn(&[u8]) -> Vec<fictionet::Packet> + Send + Sync + 'static,
+    ) -> World {
+        use fictionet::{Interface, InterfaceExt};
+        let answer = Arc::new(answer);
         let dir = temp_dir();
         let sock = dir.join("w.sock").to_str().unwrap().to_owned();
         let stop = Arc::new(AtomicBool::new(false));
@@ -165,15 +173,19 @@ impl World {
             .unwrap();
             ready_tx.send(()).unwrap();
             let _ = fictionet::block_on(fictionet::run(
-                fictionet::Seed::random(),
+                fictionet::Seed::from_u64(1),
                 move |fcx| async move {
                     fcx.spawn(move |fcx| async move {
                         while let Ok(mut sandbox) = attachments.next(&fcx).await {
                             let seen = seen2.clone();
+                            let answer = answer.clone();
                             fcx.spawn(move |fcx| async move {
                                 while let Ok(p) = sandbox.recv(&fcx).await {
                                     if let Some(addrs) = p.0.get(12..20) {
                                         seen.lock().unwrap().insert(addrs.try_into().unwrap());
+                                    }
+                                    for reply in answer(&p.0) {
+                                        sandbox.send(reply);
                                     }
                                 }
                                 Ok(())
@@ -627,6 +639,64 @@ fn tokens_are_checked() {
         a.log()
     );
     assert!(b.logged("socks5: wrong token"), "{}", b.log());
+}
+
+#[test]
+fn an_icmp_error_fails_only_one_proxy_connect_to_the_same_destination() {
+    use fictionet::stdlib::{icmp, ip};
+
+    let pending = Mutex::new(Vec::<Vec<u8>>::new());
+    let world = World::with_packets(move |p| {
+        let Some(header) = ip::Header::parse_whole(p) else {
+            return Vec::new();
+        };
+        let tcp = header.payload(p);
+        if header.protocol != ip::protocol::TCP || tcp.len() < 20 || tcp[13] != 2 {
+            return Vec::new();
+        }
+        let mut pending = pending.lock().unwrap();
+        if !pending.iter().any(|syn| syn[20..22] == tcp[..2]) {
+            pending.push(p.to_vec());
+            if pending.len() == 2 {
+                // Both clients are waiting. Only the first flow is unreachable.
+                return vec![
+                    icmp::host_unreachable(&pending[0], "10.0.0.1".parse().unwrap()).unwrap(),
+                ];
+            }
+        }
+        if pending.len() != 2 || pending[1][20..22] != tcp[..2] {
+            return Vec::new();
+        }
+        // Answer the second flow's retransmission, after the error was handled.
+        // An immediate SYN-ACK could hide the old destination-wide cancellation.
+        let mut reply = tcp[..20].to_vec();
+        reply[..2].copy_from_slice(&tcp[2..4]);
+        reply[2..4].copy_from_slice(&tcp[..2]);
+        let seq = u32::from_be_bytes(tcp[4..8].try_into().unwrap());
+        reply[4..8].copy_from_slice(&1000u32.to_be_bytes());
+        reply[8..12].copy_from_slice(&seq.wrapping_add(1).to_be_bytes());
+        reply[12] = 0x50;
+        reply[13] = 0x12;
+        reply[16..18].fill(0);
+        let sum = ip::transport_checksum(header.dst, header.src, ip::protocol::TCP, &reply);
+        reply[16..18].copy_from_slice(&sum.to_be_bytes());
+        vec![ip::packet(
+            header.dst,
+            header.src,
+            ip::protocol::TCP,
+            &reply,
+        )]
+    });
+    let a = Attach::start(&world, "http_proxy", "icmp", "10.0.0.2");
+    let mut clients = [a.connect(), a.connect()];
+    for client in &mut clients {
+        write!(client, "CONNECT 192.0.2.7:443 HTTP/1.1\r\nHost: 192.0.2.7:443\r\nProxy-Authorization: {BASIC}\r\n\r\n").unwrap();
+    }
+    let mut replies: Vec<_> = clients.iter_mut().map(read_head).collect();
+    replies.sort();
+    assert!(replies[0].starts_with("HTTP/1.1 200 "), "{replies:?}");
+    assert!(replies[1].starts_with("HTTP/1.1 502 "), "{replies:?}");
+    assert!(replies[1].contains("X-Proxy-Error: host unreachable\r\n"));
 }
 
 #[test]

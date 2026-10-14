@@ -57,7 +57,9 @@ use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Packet, TcpPacket, TcpRepr};
 
 use fictionet::CancelWait;
 use fictionet::stdlib::ip::{
-    Header, protocol::TCP, set_header_checksum, strip_extension_headers, transport_checksum,
+    Header, checksum,
+    protocol::{ICMP, TCP},
+    set_header_checksum, strip_extension_headers, transport_checksum,
 };
 use fictionet::stdlib::{ConnError, Connection};
 use fictionet::time::{Duration, Instant};
@@ -129,8 +131,10 @@ const ACK_DELAY: Duration = Duration::from_millis(10);
 /// a SYN, data that is not acknowledged, or a keepalive (sent after 45
 /// seconds of quiet). A connection whose handle was dropped finishes
 /// closing in the background, and is given up when the peer has sent
-/// nothing for one minute, as when it never closes its side. ICMP messages
-/// that reach this layer are dropped, so it does no path MTU discovery.
+/// nothing for one minute, as when it never closes its side. ICMPv4
+/// destination-unreachable messages can fail a pending connect; see
+/// [`Endpoint::connect`]. Other ICMP messages are dropped. Established
+/// connections ignore ICMP, and there is no path MTU discovery.
 #[track_caller]
 pub fn endpoint(fcx: &Cx, inner: impl Interface, addr: IpAddr) -> Endpoint {
     endpoint_with(fcx, inner, addr, Options::default())
@@ -422,6 +426,10 @@ struct Conn {
     side: Side,
     /// The peer's initial sequence number, from its SYN.
     irs: Option<u32>,
+    /// Our initial sequence number, from the SYN sent for this attempt.
+    iss: Option<u32>,
+    /// An ICMPv4 destination-unreachable code for this pending connect.
+    unreachable: Option<u8>,
     /// Bytes the application has read, modulo 2^32.
     read: u32,
     /// The acknowledgment number and window of the last segment from the
@@ -456,6 +464,8 @@ impl Conn {
             shut: false,
             side,
             irs: None,
+            iss: None,
+            unreachable: None,
             read: 0,
             last_fed: None,
             rx_end: None,
@@ -792,11 +802,91 @@ impl State {
         let c = &self.conns[&h];
         if self.stopped {
             ConnError::Closed
+        } else if let Some(code) = c.unreachable {
+            ConnError::Unreachable(code)
         } else if c.rst {
             ConnError::Reset
         } else {
             ConnError::TimedOut
         }
+    }
+
+    /// Records the SYN identity before its packet leaves the endpoint.
+    fn sent(&mut self, packet: &[u8]) {
+        let Some(ip) = Header::parse_whole(packet) else {
+            return;
+        };
+        let t = ip.payload(packet);
+        if ip.protocol != TCP || t.len() < 20 || t[13] & 0x12 != 2 {
+            return;
+        }
+        let local = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
+        let remote = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
+        if let Some(h) = self.by_tuple.get(&(local, remote)) {
+            let c = self.conns.get_mut(h).unwrap();
+            if c.side == Side::Client {
+                c.iss
+                    .get_or_insert(u32::from_be_bytes([t[4], t[5], t[6], t[7]]));
+            }
+        }
+    }
+
+    /// Only the quoted, still-pending attempt can be failed by ICMPv4.
+    fn unreachable(&mut self, message: &[u8]) {
+        if message.len() < 8
+            || message[0] != 3
+            || message[1] == 4
+            || message[1] > 15
+            || checksum(message) != 0
+        {
+            return;
+        }
+        let quoted = &message[8..];
+        let Some(ip) = Header::parse_truncated(quoted) else {
+            return;
+        };
+        if !ip.src.is_ipv4()
+            || ip.protocol != TCP
+            || ip.fragment.is_some()
+            || !Ipv4Packet::new_unchecked(quoted).verify_checksum()
+        {
+            return;
+        }
+        let t = ip.payload(quoted);
+        let total = u16::from_be_bytes([quoted[2], quoted[3]]) as usize;
+        // The minimum ICMP quote has only the ports and sequence number.
+        if t.len() < 8 || total < ip.payload.start + 20 || (t.len() >= 14 && t[13] & 0x17 != 2) {
+            return;
+        }
+        if quoted.len() >= total
+            && TcpRepr::parse(
+                &TcpPacket::new_unchecked(t),
+                &ip.src.into(),
+                &ip.dst.into(),
+                &Default::default(),
+            )
+            .is_err()
+        {
+            return;
+        }
+        let local = SocketAddr::new(ip.src, u16::from_be_bytes([t[0], t[1]]));
+        let remote = SocketAddr::new(ip.dst, u16::from_be_bytes([t[2], t[3]]));
+        let seq = u32::from_be_bytes([t[4], t[5], t[6], t[7]]);
+        let Some(&h) = self.by_tuple.get(&(local, remote)) else {
+            return;
+        };
+        let c = &self.conns[&h];
+        if c.side != Side::Client
+            || c.iss != Some(seq)
+            || !matches!(
+                self.get(h).state(),
+                TcpState::SynSent | TcpState::SynReceived
+            )
+        {
+            return;
+        }
+        self.conns.get_mut(&h).unwrap().unreachable = Some(message[1]);
+        self.abort(h);
     }
 
     /// Feeds one packet from the interface into smoltcp. Returns whether it was
@@ -805,7 +895,16 @@ impl State {
         let Some(mut ip) = Header::parse_whole(&packet) else {
             return false;
         };
-        if ip.protocol != TCP || ip.dst != addr || ip.payload.len() < 20 {
+        if ip.dst != addr {
+            return false;
+        }
+        if ip.protocol == ICMP && addr.is_ipv4() {
+            if Ipv4Packet::new_unchecked(&packet).verify_checksum() {
+                self.unreachable(ip.payload(&packet));
+            }
+            return false;
+        }
+        if ip.protocol != TCP || ip.payload.len() < 20 {
             return false;
         }
         // smoltcp takes TCP only right after the IPv6 header. `parse_whole` has
@@ -1295,6 +1394,9 @@ async fn drive(fcx: &Cx, shared: &Shared, mut inner: impl Interface) {
             st.housekeeping(now);
             exhausted = st.dev.tx.len() >= EGRESS_PACKETS || !batch.is_empty();
             std::mem::swap(&mut out, &mut st.dev.tx);
+            for p in &out {
+                st.sent(p);
+            }
             if st.dirty.is_empty() {
                 st.next_release = None;
             } else {
@@ -1416,6 +1518,14 @@ impl Endpoint {
     /// address, or if every local port from 49152 up is taken. Fails with
     /// [`ConnError::TimedOut`] if nothing answers for two minutes, and with
     /// [`ConnError::Closed`] once the endpoint has stopped.
+    ///
+    /// An ICMPv4 destination-unreachable message (type 3, codes 0 through
+    /// 15, except 4) fails with [`ConnError::Unreachable`] only when it
+    /// quotes this attempt's local and remote addresses, ports, and emitted
+    /// SYN sequence number. A quote may contain just the IP header and eight
+    /// TCP bytes. Code 4 (fragmentation needed) is ignored; there is no path
+    /// MTU discovery. Malformed, unrelated, and stale quotes are ignored.
+    /// ICMP does not affect an established connection.
     pub async fn connect(&self, fcx: &Cx, to: SocketAddr) -> Result<TcpConnection, ConnError> {
         if fcx.is_cancelled() {
             return Err(ConnError::Cancelled);
@@ -2128,7 +2238,122 @@ mod tests {
         while st.iface.poll_egress(now, &mut st.dev, &mut st.sockets)
             != smoltcp::iface::PollResult::None
         {}
-        std::mem::take(&mut st.dev.tx)
+        let packets = std::mem::take(&mut st.dev.tx);
+        for p in &packets {
+            st.sent(p);
+        }
+        packets
+    }
+
+    #[test]
+    fn icmp_requires_the_current_syn_and_a_valid_quote() {
+        use fictionet::stdlib::{icmp, ip};
+
+        block_on(lab(Seed::from_u64(1), |fcx| async move {
+            let (_raw, side) = pair();
+            let local: SocketAddr = "10.0.0.1:49152".parse().unwrap();
+            let peer: SocketAddr = "10.0.0.2:80".parse().unwrap();
+            let ep = endpoint(&fcx, side, local.ip());
+            let now = smol_now(&fcx);
+            let mut st = ep.shared.state.lock();
+            let mut previous = None;
+            for options in [false, true] {
+                let mut socket = new_socket(MIN_BUFFER);
+                socket.0.connect(st.iface.context(), peer, local).unwrap();
+                let h = st.add_socket(socket);
+                st.conns.insert(h, Conn::new(local, peer, Side::Client));
+                st.by_tuple.insert((local, peer), h);
+                st.take_port(local.port());
+                let syn = egress(&mut st, now).remove(0);
+                if let Some(old) = previous.take() {
+                    // The same local port and peer now belong to a new attempt.
+                    st.ingress(local.ip(), now, old);
+                    assert_eq!(st.get(h).state(), TcpState::SynSent);
+                }
+                let fragmentation_needed =
+                    icmp::error(&syn, "10.0.0.254".parse().unwrap(), 3, 4, 1400).unwrap();
+                st.ingress(local.ip(), now, fragmentation_needed.0);
+                assert_eq!(st.get(h).state(), TcpState::SynSent, "fragmentation needed");
+                let error = icmp::host_unreachable(&syn, "10.0.0.254".parse().unwrap()).unwrap().0;
+                for fault in [
+                    "outer_ip", "icmp_checksum", "type", "code", "destination", "version",
+                    "quoted_ip", "protocol", "fragment", "local_ip", "remote_ip",
+                    "local_port", "remote_port", "sequence", "flags", "tcp_checksum", "length",
+                ] {
+                    let mut p = error.clone();
+                    match fault {
+                        "outer_ip" => p[10] ^= 1,
+                        "icmp_checksum" => p[22] ^= 1,
+                        "type" => p[20] = 11,
+                        "code" => p[21] = 16,
+                        "destination" => p[19] ^= 1,
+                        "version" => p[28] = 0x65,
+                        "quoted_ip" => p[38] ^= 1,
+                        "protocol" => p[37] = 17,
+                        "fragment" => p[35] = 1,
+                        "local_ip" => p[43] ^= 1,
+                        "remote_ip" => p[47] ^= 1,
+                        "local_port" => p[49] ^= 1,
+                        "remote_port" => p[51] ^= 1,
+                        "sequence" => p[55] ^= 1,
+                        "flags" => p[61] = 0x10,
+                        "tcp_checksum" => p[64] ^= 1,
+                        "length" => p[31] = 28,
+                        _ => unreachable!(),
+                    }
+                    if matches!(fault, "local_ip" | "remote_ip" | "local_port" | "remote_port" | "sequence") {
+                        // The minimum quote has no TCP checksum to mask a tuple mismatch.
+                        p.truncate(56);
+                        p[2..4].copy_from_slice(&56u16.to_be_bytes());
+                    }
+                    // Keep unrelated checksums valid so each rejection is tested.
+                    if !matches!(fault, "outer_ip" | "icmp_checksum" | "quoted_ip" | "version") {
+                        ip::set_header_checksum(&mut p[28..48]);
+                        ip::set_header_checksum(&mut p[..20]);
+                    }
+                    if fault != "icmp_checksum" {
+                        p[22..24].fill(0);
+                        let sum = checksum(&p[20..]);
+                        p[22..24].copy_from_slice(&sum.to_be_bytes());
+                    }
+                    st.ingress(local.ip(), now, p);
+                    assert_eq!(st.get(h).state(), TcpState::SynSent, "{fault}");
+                }
+                // A truncated quote must contain all eight identity bytes.
+                for len in 0..28 {
+                    let mut message = vec![3, 1, 0, 0, 0, 0, 0, 0];
+                    message.extend_from_slice(&syn[..len]);
+                    let sum = checksum(&message);
+                    message[2..4].copy_from_slice(&sum.to_be_bytes());
+                    let p = ip::packet(peer.ip(), local.ip(), ICMP, &message);
+                    st.ingress(local.ip(), now, p.0);
+                    assert_eq!(st.get(h).state(), TcpState::SynSent, "quote length {len}");
+                }
+                // Also accept the minimum quote with IPv4 options.
+                let mut valid = error.clone();
+                if options {
+                    valid.splice(48..48, [1; 4]);
+                    valid[28] = 0x46;
+                    let total = u16::from_be_bytes([valid[30], valid[31]]) + 4;
+                    valid[30..32].copy_from_slice(&total.to_be_bytes());
+                    ip::set_header_checksum(&mut valid[28..52]);
+                    valid.truncate(60);
+                    valid[2..4].copy_from_slice(&60u16.to_be_bytes());
+                    ip::set_header_checksum(&mut valid[..20]);
+                    valid[22..24].fill(0);
+                    let sum = checksum(&valid[20..]);
+                    valid[22..24].copy_from_slice(&sum.to_be_bytes());
+                }
+                st.ingress(local.ip(), now, valid);
+                assert_eq!(st.get(h).state(), TcpState::Closed);
+                assert_eq!(st.closed_reason(h), ConnError::Unreachable(1));
+                previous = Some(error);
+                st.remove_conn(h);
+            }
+            drop(st);
+            fcx.cancel();
+            Ok(())
+        })).unwrap();
     }
 
     #[test]

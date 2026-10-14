@@ -215,6 +215,11 @@ impl<C: Connection + ?Sized> ConnectionExt for C {}
 pub enum ConnError {
     /// The other side refused the connection. Only from connecting.
     Refused,
+    /// An ICMPv4 destination-unreachable message quoted this connection's
+    /// current SYN. Only from connecting. The value is the ICMP code:
+    /// 0 for network, 1 for host, 3 for port, and so on.
+    /// Code 4 (fragmentation needed) does not fail a TCP connect.
+    Unreachable(u8),
     /// The other side reset the connection.
     Reset,
     /// The other side stopped answering.
@@ -234,6 +239,12 @@ impl std::fmt::Display for ConnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             ConnError::Refused => "connection refused",
+            ConnError::Unreachable(0) => "network unreachable",
+            ConnError::Unreachable(1) => "host unreachable",
+            ConnError::Unreachable(3) => "port unreachable",
+            ConnError::Unreachable(code) => {
+                return write!(f, "destination unreachable (ICMP code {code})");
+            }
             ConnError::Reset => "connection reset",
             ConnError::TimedOut => "connection timed out",
             ConnError::Closed => "the connection's carrier stopped",
@@ -258,6 +269,10 @@ impl std::error::Error for ConnError {
 /// same failure; the `ConnError` is the source, so
 /// `e.get_ref().and_then(|e| e.downcast_ref::<ConnError>())` gets it back.
 ///
+/// An unreachable network (ICMP codes 0, 6, 9, 11) is `NetworkUnreachable`;
+/// an unreachable port (3) is `ConnectionRefused`. Other unreachable codes
+/// are `HostUnreachable`.
+///
 /// A cancel is [`ErrorKind::Other`](std::io::ErrorKind::Other), not
 /// `Interrupted`: std's read loops retry `Interrupted`, and a cancelled
 /// wait must end them.
@@ -266,6 +281,9 @@ impl From<ConnError> for std::io::Error {
         use std::io::ErrorKind;
         let kind = match e {
             ConnError::Refused => ErrorKind::ConnectionRefused,
+            ConnError::Unreachable(0 | 6 | 9 | 11) => ErrorKind::NetworkUnreachable,
+            ConnError::Unreachable(3) => ErrorKind::ConnectionRefused,
+            ConnError::Unreachable(_) => ErrorKind::HostUnreachable,
             ConnError::Reset => ErrorKind::ConnectionReset,
             ConnError::TimedOut => ErrorKind::TimedOut,
             ConnError::Closed => ErrorKind::BrokenPipe,

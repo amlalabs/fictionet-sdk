@@ -301,8 +301,9 @@
 //!    a connection from `--ip-addr` and an ephemeral port to the address
 //!    and port. If no answer comes in 10 seconds, the client is told it
 //!    timed out. An ICMP "destination unreachable" about the connection
-//!    ends the wait immediately: the TCP endpoint ignores ICMP, so a small
-//!    wrapper in front of it, `Watch`, picks those messages out.
+//!    ends the wait immediately. TCP checks the quoted local and remote
+//!    addresses, ports, and current SYN sequence number. An error for
+//!    another attempt cannot end this wait.
 //!
 //! Once the connection is open, the HTTP proxy answers
 //! `200 Connection established` and the SOCKS5 proxy answers reply 0.
@@ -350,7 +351,7 @@
 //! - UDP to `--ip-addr` gets ICMP "port unreachable" from attach's UDP
 //!   endpoint, unless it goes to the port of a DNS query that is waiting.
 //!   There it is read, and ignored unless it is that query's answer;
-//! - a ping to `--ip-addr` gets no answer: the stack drops ICMP.
+//! - a ping to `--ip-addr` gets no answer: the stack does not answer pings.
 //!
 //! # One request, traced through each type
 //!

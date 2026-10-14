@@ -196,6 +196,96 @@ fn a_closed_port_refuses_at_once() {
 }
 
 #[test]
+fn icmp_fails_only_the_quoted_connect() {
+    use fictionet::stdlib::{icmp, ip};
+
+    world(Duration::from_secs(10), |fcx| async move {
+        let (side, mut raw) = pair();
+        let (tcp_side, _udp, _icmp, _other) = ip::split_protocols(&fcx, side);
+        let ep = tcp::endpoint(&fcx, tcp_side, ip(A));
+        let first_ep = ep.clone();
+        let first = fcx.spawn(move |fcx| async move {
+            assert_eq!(
+                first_ep
+                    .connect(&fcx, SocketAddr::new(ip(B), 80))
+                    .await
+                    .err(),
+                Some(ConnError::Unreachable(1)),
+            );
+            Ok(())
+        });
+        let syn1 = raw.recv(&fcx).await?;
+        let second = fcx.spawn(move |fcx| async move {
+            let mut conn = ep.connect(&fcx, SocketAddr::new(ip(B), 80)).await?;
+            // The reply to our ACK below is another quote of this connection's SYN.
+            let mut byte = [0];
+            assert_eq!(conn.read(&fcx, &mut byte).await?, 1);
+            assert_eq!(byte, [b'x']);
+            Ok(())
+        });
+        let syn2 = raw.recv(&fcx).await?;
+        assert_ne!(&syn1.0[20..22], &syn2.0[20..22]);
+        let mut unreachable = icmp::host_unreachable(&syn1.0, B.parse().unwrap()).unwrap();
+        // RFC minimum: the quoted TCP header ends after the sequence number.
+        unreachable.0.truncate(56);
+        unreachable.0[2..4].copy_from_slice(&56u16.to_be_bytes());
+        ip::set_header_checksum(&mut unreachable.0[..20]);
+        unreachable.0[22..24].fill(0);
+        let sum = checksum(&unreachable.0[20..]);
+        unreachable.0[22..24].copy_from_slice(&sum.to_be_bytes());
+        raw.send(unreachable);
+        first.join(&fcx).await?;
+        let mut reply = syn2.0[20..40].to_vec();
+        reply[..2].copy_from_slice(&80u16.to_be_bytes());
+        reply[2..4].copy_from_slice(&syn2.0[20..22]);
+        let seq = u32::from_be_bytes(syn2.0[24..28].try_into().unwrap());
+        reply[4..8].copy_from_slice(&1000u32.to_be_bytes());
+        reply[8..12].copy_from_slice(&seq.wrapping_add(1).to_be_bytes());
+        reply[12] = 0x50;
+        reply[13] = 0x12;
+        reply[16..18].fill(0);
+        raw.send(ip_packet(ip(B), ip(A), 6, reply.clone(), 16));
+        loop {
+            let p = raw.recv(&fcx).await?;
+            if p.0[20..22] == syn2.0[20..22] && p.0[33] == 0x10 {
+                break;
+            }
+        }
+        raw.send(icmp::host_unreachable(&syn2.0, B.parse().unwrap()).unwrap());
+        reply[4..8].copy_from_slice(&1001u32.to_be_bytes());
+        reply[13] = 0x18;
+        reply.push(b'x');
+        raw.send(ip_packet(ip(B), ip(A), 6, reply, 16));
+        second.join(&fcx).await?;
+        Ok(())
+    });
+}
+
+#[test]
+fn unreachable_errors_keep_the_icmp_code_through_io() {
+    use std::io::ErrorKind;
+    for (code, kind, text) in [
+        (0, ErrorKind::NetworkUnreachable, "network unreachable"),
+        (1, ErrorKind::HostUnreachable, "host unreachable"),
+        (3, ErrorKind::ConnectionRefused, "port unreachable"),
+        (
+            13,
+            ErrorKind::HostUnreachable,
+            "destination unreachable (ICMP code 13)",
+        ),
+    ] {
+        let error = ConnError::Unreachable(code);
+        assert_eq!(error.to_string(), text);
+        let io = std::io::Error::from(error);
+        assert_eq!(io.kind(), kind);
+        assert_eq!(
+            io.get_ref().unwrap().downcast_ref::<ConnError>(),
+            Some(&error)
+        );
+    }
+}
+
+#[test]
 fn five_hundred_closed_ports_are_refused() {
     world(Duration::from_secs(20), |fcx| async move {
         let (ea, eb) = two_tcp(&fcx, A, B);

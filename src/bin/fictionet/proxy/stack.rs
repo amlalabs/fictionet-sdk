@@ -12,17 +12,13 @@
 //! names. Every connection is made of packets on the world's interface.
 
 use std::collections::HashMap;
-use std::future::{Future, poll_fn};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::pin::pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use fictionet::stdlib::tcp::TcpConnection;
 use fictionet::stdlib::{ConnError, ip, tcp, udp};
-use fictionet::{Cx, End, Interface, Packet, RecvError};
-use tokio::sync::oneshot;
+use fictionet::{Cx, RecvError};
 
 use super::link::Link;
 use fictionet::relay::proxy::Host;
@@ -92,7 +88,6 @@ pub(crate) struct Stack {
     tcp: tcp::Endpoint,
     udp: udp::Endpoint,
     dns: SocketAddr,
-    unreachable: Arc<Unreachable>,
     /// Each name's answer, and until when it holds: an address, or
     /// [`Fail::NoSuchName`].
     cache: Arc<Mutex<HashMap<String, Cached>>>,
@@ -139,17 +134,11 @@ impl Stack {
     /// Starts the stack at `addr` on `link`, in `fcx`'s region.
     pub(crate) fn new(fcx: &Cx, link: Link, addr: Ipv4Addr, dns: Ipv4Addr) -> Stack {
         let (tcp_end, udp_end, _icmp, _other) = ip::split_protocols(fcx, link);
-        let unreachable = Arc::new(Unreachable::default());
-        let watched = Watch {
-            inner: tcp_end,
-            unreachable: unreachable.clone(),
-        };
         Stack {
             fcx: fcx.clone(),
-            tcp: tcp::endpoint(fcx, watched, IpAddr::V4(addr)),
+            tcp: tcp::endpoint(fcx, tcp_end, IpAddr::V4(addr)),
             udp: udp::endpoint(fcx, udp_end, IpAddr::V4(addr)),
             dns: SocketAddr::new(IpAddr::V4(dns), 53),
-            unreachable,
             cache: Arc::default(),
             pending: Arc::default(),
         }
@@ -276,147 +265,18 @@ impl Stack {
         }
         let addr = self.resolve(host).await?;
         let to = SocketAddr::new(IpAddr::V4(addr), port);
-        let icmp = self.unreachable.watch(to);
-        let opened = race(self.tcp.connect(&self.fcx, to), icmp);
+        let opened = self.tcp.connect(&self.fcx, to);
         match tokio::time::timeout(CONNECT_TIMEOUT, opened).await {
             Err(_) => Err(Fail::TimedOut),
-            Ok(Either::Left(Ok(conn))) => Ok((conn, addr)),
-            Ok(Either::Left(Err(e))) => Err(match e {
+            Ok(Ok(conn)) => Ok((conn, addr)),
+            Ok(Err(e)) => Err(match e {
                 ConnError::Refused | ConnError::Reset => Fail::Refused,
                 ConnError::TimedOut => Fail::TimedOut,
+                ConnError::Unreachable(code) => Fail::Unreachable(code),
                 ConnError::Closed | ConnError::Cancelled | ConnError::Broken => Fail::WorldGone,
             }),
-            Ok(Either::Right(Ok(code))) => Err(Fail::Unreachable(code)),
-            Ok(Either::Right(Err(_))) => Err(Fail::WorldGone),
         }
     }
-}
-
-/// Connections waiting to open, by where they go, so an ICMP
-/// "destination unreachable" about one can end its wait at once. The TCP
-/// endpoint drops ICMP, so without this a connection to an address with
-/// no machine would wait out [`CONNECT_TIMEOUT`].
-#[derive(Default)]
-struct Unreachable {
-    waiting: Mutex<Watchers>,
-}
-
-#[derive(Default)]
-struct Watchers {
-    by_destination: HashMap<SocketAddr, Vec<oneshot::Sender<u8>>>,
-    /// How many senders `by_destination` holds.
-    senders: usize,
-    /// How many it held after the last sweep of every destination.
-    swept: usize,
-}
-
-impl Unreachable {
-    fn watch(&self, to: SocketAddr) -> oneshot::Receiver<u8> {
-        let (tx, rx) = oneshot::channel();
-        let mut guard = self.waiting.lock().unwrap();
-        let w = &mut *guard;
-        // Drop the entries of connections that are no longer waiting, once
-        // the count has doubled since the last sweep. A burst of connects,
-        // to one destination or many, then costs time in proportion to its
-        // size, not its square.
-        w.by_destination.entry(to).or_default().push(tx);
-        w.senders += 1;
-        if w.senders > 2 * w.swept + 64 {
-            w.by_destination.retain(|_, v| {
-                v.retain(|s| !s.is_closed());
-                !v.is_empty()
-            });
-            w.senders = w.by_destination.values().map(Vec::len).sum();
-            w.swept = w.senders;
-        }
-        rx
-    }
-
-    fn report(&self, about: SocketAddr, code: u8) {
-        let senders = {
-            let mut w = self.waiting.lock().unwrap();
-            let senders = w.by_destination.remove(&about);
-            w.senders -= senders.as_ref().map_or(0, Vec::len);
-            senders
-        };
-        for s in senders.into_iter().flatten() {
-            let _ = s.send(code);
-        }
-    }
-}
-
-/// The TCP end of the split, with ICMP errors about TCP packets taken out
-/// and reported to [`Unreachable`].
-struct Watch {
-    inner: End,
-    unreachable: Arc<Unreachable>,
-}
-
-impl Interface for Watch {
-    fn poll_recv(&mut self, fcx: &Cx, cx: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
-        loop {
-            match self.inner.poll_recv(fcx, cx) {
-                Poll::Ready(Ok(p)) => match unreachable_about(&p.0) {
-                    Some((about, code)) => self.unreachable.report(about, code),
-                    None => return Poll::Ready(Ok(p)),
-                },
-                other => return other,
-            }
-        }
-    }
-
-    fn send(&mut self, packet: Packet) {
-        self.inner.send(packet);
-    }
-}
-
-/// If `p` is an ICMPv4 "destination unreachable" about a TCP packet,
-/// where that packet went and the ICMP code.
-pub(crate) fn unreachable_about(p: &[u8]) -> Option<(SocketAddr, u8)> {
-    let ihl = (*p.first()? & 0x0f) as usize * 4;
-    if p[0] >> 4 != 4 || ihl < 20 || *p.get(9)? != 1 {
-        return None;
-    }
-    let icmp = p.get(ihl..)?;
-    if *icmp.first()? != 3 {
-        return None;
-    }
-    let code = *icmp.get(1)?;
-    let inner = icmp.get(8..)?;
-    let inner_ihl = (*inner.first()? & 0x0f) as usize * 4;
-    if inner[0] >> 4 != 4 || inner_ihl < 20 || *inner.get(9)? != 6 {
-        return None;
-    }
-    let dst = Ipv4Addr::new(
-        *inner.get(16)?,
-        *inner.get(17)?,
-        *inner.get(18)?,
-        *inner.get(19)?,
-    );
-    let tcp = inner.get(inner_ihl..inner_ihl + 4)?;
-    let port = u16::from_be_bytes([tcp[2], tcp[3]]);
-    Some((SocketAddr::new(IpAddr::V4(dst), port), code))
-}
-
-pub(crate) enum Either<A, B> {
-    Left(A),
-    Right(B),
-}
-
-/// Waits for the first of two futures, and drops the other.
-pub(crate) async fn race<A: Future, B: Future>(a: A, b: B) -> Either<A::Output, B::Output> {
-    let mut a = pin!(a);
-    let mut b = pin!(b);
-    poll_fn(|cx| {
-        if let Poll::Ready(x) = a.as_mut().poll(cx) {
-            return Poll::Ready(Either::Left(x));
-        }
-        if let Poll::Ready(y) = b.as_mut().poll(cx) {
-            return Poll::Ready(Either::Right(y));
-        }
-        Poll::Pending
-    })
-    .await
 }
 
 #[cfg(test)]
@@ -441,7 +301,6 @@ mod tests {
                     tcp: tcp::endpoint(&fcx, tcp_end, addr.into()),
                     udp: udp::endpoint(&fcx, udp_end, addr.into()),
                     dns,
-                    unreachable: Arc::default(),
                     cache: Arc::default(),
                     pending: Arc::default(),
                 };
@@ -489,92 +348,5 @@ mod tests {
             .await
             .unwrap();
         }
-    }
-
-    /// An ICMP "host unreachable" from 10.0.0.1 about a SYN from
-    /// 10.0.0.2:50000 to 192.0.2.7:443.
-    fn host_unreachable() -> Vec<u8> {
-        let mut syn = vec![
-            0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 10, 0, 0, 2, 192, 0, 2, 7,
-        ];
-        syn.extend_from_slice(&50000u16.to_be_bytes());
-        syn.extend_from_slice(&443u16.to_be_bytes());
-        syn.extend_from_slice(&[0; 16]);
-        let mut p = vec![
-            0x45, 0, 0, 0, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
-        ];
-        p.extend_from_slice(&[3, 1, 0, 0, 0, 0, 0, 0]);
-        p.extend_from_slice(&syn);
-        p
-    }
-
-    #[test]
-    fn icmp_unreachable_names_the_destination() {
-        let p = host_unreachable();
-        assert_eq!(
-            unreachable_about(&p),
-            Some(("192.0.2.7:443".parse().unwrap(), 1))
-        );
-        // Not ICMP, not type 3, not about TCP, cut short.
-        let mut udp = p.clone();
-        udp[9] = 17;
-        assert_eq!(unreachable_about(&udp), None);
-        let mut echo = p.clone();
-        echo[20] = 0;
-        assert_eq!(unreachable_about(&echo), None);
-        let mut about_udp = p.clone();
-        about_udp[28 + 9] = 17;
-        assert_eq!(unreachable_about(&about_udp), None);
-        for n in 0..p.len() - 16 {
-            assert_eq!(unreachable_about(&p[..n]), None, "{n}");
-        }
-        assert_eq!(unreachable_about(&[]), None);
-    }
-
-    #[test]
-    fn watchers_of_finished_connects_do_not_pile_up() {
-        let u = Unreachable::default();
-        let mut live = Vec::new();
-        for i in 0..10_000u32 {
-            let to = SocketAddr::from(([10, 0, (i >> 8) as u8, i as u8], 80));
-            let rx = u.watch(to);
-            // One connect in a hundred still waits; the rest are done.
-            if i % 100 == 0 {
-                live.push(rx);
-            }
-            let w = u.waiting.lock().unwrap();
-            assert!(
-                w.senders <= 2 * (live.len() + 1) + 64 + 1,
-                "{} senders for {} live",
-                w.senders,
-                live.len()
-            );
-            assert_eq!(
-                w.senders,
-                w.by_destination.values().map(Vec::len).sum::<usize>()
-            );
-        }
-    }
-
-    #[test]
-    fn unreachable_reports_reach_only_their_destination() {
-        let u = Unreachable::default();
-        let a: SocketAddr = "192.0.2.7:443".parse().unwrap();
-        let b: SocketAddr = "192.0.2.8:443".parse().unwrap();
-        let mut ra = u.watch(a);
-        let mut rb = u.watch(b);
-        u.report(a, 1);
-        assert_eq!(ra.try_recv(), Ok(1));
-        assert!(rb.try_recv().is_err());
-        drop(rb);
-        // A dropped watcher is cleaned up at the next sweep, once the
-        // count has doubled.
-        let mut keep = Vec::new();
-        for _ in 0..70 {
-            keep.push(u.watch(a));
-        }
-        let w = u.waiting.lock().unwrap();
-        assert!(!w.by_destination.contains_key(&b));
-        assert_eq!(w.senders, 70);
     }
 }
