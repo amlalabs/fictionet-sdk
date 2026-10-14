@@ -338,7 +338,10 @@ late subscribers and dropped-event reporting. Sum `count` when grading
 packet repeats; a port scan of 65,535 ports to one machine costs a couple of
 events a second.
 
-The run waits for file writers at shutdown. Discard a sample if
+Native real runs use writer threads and wait for them at shutdown. In
+browsers, labs and builds without `std`, event sinks write and flush each line
+synchronously. Browser runs can use an in-memory sink with
+`EventLog::to_writer`. Discard a sample if
 [`EventLog::lost`](../src/events.rs) is nonzero.
 
 ## 6. The dashboard

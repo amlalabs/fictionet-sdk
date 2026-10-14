@@ -84,11 +84,12 @@
 //! or a callback set halfway through a run first gets what the log kept,
 //! then the rest as it is recorded.
 //!
-//! Real runs write files on a helper thread with a bounded queue. Lab runs
-//! write and flush sinks synchronously on the run's thread, in event order,
-//! without queue overflow or writer scheduling affecting the log. A lab's
-//! `run.start.wall` is null; real runs record their wall date. Attach a sink
-//! before recording begins to retain events beyond the in-memory log's limits.
+//! Native real runs with `std` write files on a helper thread with a bounded
+//! queue. In browsers, labs and builds without `std`, sinks write and flush
+//! synchronously on the run's thread, in event order, without queue overflow
+//! or writer scheduling affecting the log. A lab's `run.start.wall` is null;
+//! real runs record their wall date. Attach a sink before recording begins to
+//! retain events beyond the in-memory log's limits.
 //!
 //! # What it costs
 //!
@@ -128,10 +129,10 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(feature = "std")]
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 use std::sync::mpsc::{Receiver, sync_channel};
 
 use crate::Cx;
@@ -661,10 +662,10 @@ fn value_size(v: &Value) -> usize {
 type Subscriber = Arc<dyn Fn(&Arc<Event>) + Send + Sync>;
 
 /// How many events may wait for a file's writer thread.
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 const FILE_QUEUE: usize = 100_000;
 /// How many retained event bytes may wait for a file's writer thread.
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 const FILE_QUEUE_BYTES: usize = MAX_EVENT_BYTES;
 
 /// What a run's log holds.
@@ -782,6 +783,7 @@ struct State {
     /// Whether the run is over.
     closed: bool,
     /// The file writers' threads, joined when the run is over.
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     writers: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -836,6 +838,7 @@ impl Store {
                 due: VecDeque::new(),
                 subscribers: Arc::new([]),
                 closed: false,
+                #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
                 writers: Vec::new(),
             }),
             lost: Arc::new(AtomicU64::new(0)),
@@ -921,16 +924,19 @@ impl Store {
     /// write everything.
     pub(crate) fn close(&self) {
         let mut out = Vec::new();
-        let (subscribers, writers) = {
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        let writers;
+        let subscribers = {
             let mut s = self.state.lock();
             while !s.due.is_empty() {
                 s.close_oldest(&mut out);
             }
             s.closed = true;
-            (
-                std::mem::replace(&mut s.subscribers, Arc::new([])),
-                std::mem::take(&mut s.writers),
-            )
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+            {
+                writers = std::mem::take(&mut s.writers);
+            }
+            std::mem::replace(&mut s.subscribers, Arc::new([]))
         };
         for event in &out {
             for f in subscribers.iter() {
@@ -939,6 +945,7 @@ impl Store {
         }
         // The writers end once their senders, in the subscribers, are gone.
         drop(subscribers);
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         for writer in writers {
             let _ = writer.join();
         }
@@ -1087,11 +1094,12 @@ impl EventLog {
         Ok(())
     }
 
-    /// Writes every event to `out` as JSON Lines. A real run uses a thread
-    /// that flushes whenever it has caught up. The run's end waits for the
-    /// thread to write and flush every line. In a lab, each line is written
-    /// and flushed synchronously on the recording task's thread, without a
-    /// queue or writer thread. Successful sinks lose no lines in a lab.
+    /// Writes every event to `out` as JSON Lines. A native real run with
+    /// `std` uses a thread that flushes whenever it has caught up. The run's
+    /// end waits for the thread to write and flush every line. In browsers,
+    /// labs and builds without `std`, each line is written and flushed
+    /// synchronously on the recording task's thread, without a queue or
+    /// writer thread. Successful synchronous sinks lose no lines.
     ///
     /// A line is lost, and counted ([`EventLog::lost`]), when it does not
     /// fit in the thread's queue (100,000 events or 16 MiB of retained
@@ -1101,7 +1109,10 @@ impl EventLog {
     /// it, and each line written since the last flush that worked, as
     /// lost. A grader throws away a sample with any line lost.
     pub fn to_writer(&self, out: Box<dyn Write + Send>) {
-        if !cfg!(feature = "std") || self.store.mode == crate::RunMode::Lab {
+        if cfg!(target_arch = "wasm32")
+            || !cfg!(feature = "std")
+            || self.store.mode == crate::RunMode::Lab
+        {
             let writer = Mutex::new(Some(out));
             let lost = self.store.lost.clone();
             self.subscribe(move |event| {
@@ -1118,11 +1129,11 @@ impl EventLog {
                     lost.fetch_add(1, Ordering::Relaxed);
                 }
             });
-            #[cfg(feature = "std")]
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             return;
         }
 
-        #[cfg(feature = "std")]
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         {
             let (tx, rx) = sync_channel::<Arc<Event>>(FILE_QUEUE);
             let queued = Arc::new(AtomicUsize::new(0));
@@ -1229,7 +1240,7 @@ impl EventLog {
 
 /// Writes the lines from `rx` to `out` until the run is over. After a
 /// failed write or flush, only counts them as lost.
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn write_lines(
     rx: Receiver<Arc<Event>>,
     mut out: Box<dyn Write + Send>,
@@ -1274,7 +1285,7 @@ fn write_lines(
 /// Writes an `events.lost` line if more were lost since the last, then
 /// flushes. Returns whether that failed, counting the unflushed lines as
 /// lost if so.
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn finish_batch(
     out: &mut Box<dyn Write + Send>,
     lost: &AtomicU64,
@@ -1553,6 +1564,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn writer_queue_counts_retained_event_bytes() {
         let sink = Sink::default();

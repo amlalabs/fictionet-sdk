@@ -5,6 +5,8 @@
 //! The README says which requests a world cannot serve in a JavaScript engine.
 
 use http::Version;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 use wasm_world::{Fetched, NAME, SITE, fetch};
 
 fn check(fetched: Fetched, version: Version) {
@@ -34,6 +36,62 @@ fn requests_with_block_on() {
             version,
         );
     }
+}
+
+/// A real run replays retained events and writes new ones to memory.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn real_run_writes_events_to_memory() {
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let sink = Sink::default();
+    let out = sink.clone();
+    let kept = Arc::new(Mutex::new(None));
+    let keep = kept.clone();
+    fictionet::block_on(fictionet::run(
+        fictionet::Seed::from_u64(42),
+        |fcx| async move {
+            assert_eq!(fcx.mode(), fictionet::RunMode::Real);
+            fcx.record(fictionet::events::Event::new("test", "before_writer"));
+            fcx.events().to_writer(Box::new(out.clone()));
+            fcx.record(fictionet::events::Event::new("test", "after_writer"));
+            #[cfg(target_arch = "wasm32")]
+            assert_eq!(
+                out.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|b| **b == b'\n')
+                    .count(),
+                2,
+                "browser writers deliver synchronously"
+            );
+            *keep.lock().unwrap() = Some(fcx.events());
+            Ok(())
+        },
+    ))
+    .unwrap();
+    let log = kept.lock().unwrap().take().unwrap();
+    let events = log.all();
+    assert_eq!(events.len(), 2);
+    let expected: String = events
+        .iter()
+        .map(|event| format!("{}\n", event.to_line()))
+        .collect();
+    assert_eq!(*sink.0.lock().unwrap(), expected.as_bytes());
+    assert_eq!(log.lost(), 0);
 }
 
 /// HTTPS with HTTP/2, with the JavaScript event loop driving the world, as
