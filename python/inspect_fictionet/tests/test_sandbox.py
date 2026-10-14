@@ -459,6 +459,69 @@ def test_edited_source_is_rebuilt(tmp_path):
         subprocess.run(["docker", "rmi", "-f", image], capture_output=True)
 
 
+@pytest.mark.skipif(
+    os.environ.get("INSPECT_FICTIONET_DOCKER") != "1" and "CI" not in os.environ,
+    reason="builds images with Docker; set INSPECT_FICTIONET_DOCKER=1",
+)
+def test_cargo_example_image_is_rebuilt(tmp_path):
+    """Run the generated scratch image before and after a source edit,
+    reusing the same compose file, image tag and Cargo target cache."""
+    crate = tmp_path / "crate"
+    examples = crate / "examples"
+    examples.mkdir(parents=True)
+    (crate / "Cargo.toml").write_text(
+        '[package]\nname = "cargo-image-test"\nversion = "0.1.0"\nedition = "2021"\n'
+    )
+    source = examples / "world.rs"
+
+    def write_source(message, timestamp):
+        source.write_text(f'fn main() {{ println!("{message}"); }}\n')
+        # Restored files can predate the cached binary. Use distinct old
+        # timestamps so BuildKit sees the edit and Cargo must still rebuild.
+        os.utime(source, (timestamp, timestamp))
+
+    write_source("one", 1_000_000_000)
+    world = CargoExample("world", crate=crate)
+    cache = tmp_path / "cache"
+    spec = fictionet_sandbox(world, cache_dir=cache)
+    image = yaml.safe_load(Path(spec.config).read_text())["services"]["world"]["image"]
+    image_ids = []
+
+    def build_and_run():
+        subprocess.run(
+            ["docker", "compose", "-p", "inspect-fictionet-cargo-test", "-f", spec.config, "build", "world"],
+            check=True,
+        )
+        inspected = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}} {{.Config.User}}", image],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        image_id, user = inspected.stdout.strip().split()
+        image_ids.append(image_id)
+        assert user == "65532:65532"
+        result = subprocess.run(
+            ["docker", "run", "--rm", "--network=none", image],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout
+
+    try:
+        assert build_and_run() == "one\n"
+        write_source("two", 1_000_000_001)
+        assert fictionet_sandbox(world, cache_dir=cache) == spec
+        assert build_and_run() == "two\n"
+        assert image_ids[0] != image_ids[1]
+    finally:
+        subprocess.run(["docker", "rmi", "-f", image], capture_output=True)
+        # The first build loses its tag on rebuild but still needs removing.
+        for image_id in dict.fromkeys(image_ids):
+            subprocess.run(["docker", "rmi", "-f", image_id], capture_output=True)
+
+
 def require_k8s():
     if "CI" in os.environ:
         __import__("k8s_sandbox")
