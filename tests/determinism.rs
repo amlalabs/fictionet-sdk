@@ -467,3 +467,111 @@ fn interleaved_labs_repeat_every_event_and_packet() {
     );
     assert_eq!(*a.lock().unwrap(), *b.lock().unwrap());
 }
+
+#[test]
+fn nested_labs_keep_their_own_roots_and_restore_the_outer_task() {
+    let episode = || {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let out = logs.clone();
+        block_on(lab(Seed::from_u64(1), move |fcx| async move {
+            out.lock().unwrap().push(fcx.events());
+            lab(Seed::from_u64(2), move |fcx| async move {
+                out.lock().unwrap().push(fcx.events());
+                fcx.record(Event::new("test", "inner"));
+                fcx.yield_now().await?;
+                fcx.record(Event::new("test", "inner_again"));
+                Ok(())
+            })
+            .await?;
+            fcx.record(Event::new("test", "outer"));
+            fcx.spawn(|fcx| async move {
+                fcx.record(Event::new("test", "child"));
+                Ok(())
+            })
+            .join(&fcx)
+            .await?;
+            Ok(())
+        }))
+        .unwrap();
+        let logs = logs.lock().unwrap();
+        let outer = logs[0].all();
+        let inner = logs[1].all();
+        assert_eq!(outer.len(), 2);
+        assert_eq!(inner.len(), 2);
+        assert_task(&outer[0], "t1", None);
+        assert_task(&outer[1], "t2", Some("t1"));
+        for event in &inner {
+            assert_task(event, "t1", None);
+        }
+        logs.iter()
+            .map(|log| log.all().iter().map(|e| e.to_line()).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(episode(), episode());
+}
+
+#[test]
+fn a_foreign_context_records_without_a_task_and_spawns_without_a_parent() {
+    let kept = Arc::new(Mutex::new(None));
+    let out = kept.clone();
+    block_on(lab(Seed::from_u64(1), move |fcx| async move {
+        *out.lock().unwrap() = Some(fcx.events());
+        let foreign = fcx.clone();
+        lab(Seed::from_u64(2), move |_fcx| async move {
+            foreign.record(Event::new("test", "record"));
+            foreign.record_at(foreign.now(), Event::new("test", "record_at"));
+            foreign.record_repeat(Event::new("test", "repeat"), Fields::new());
+            foreign.spawn(|fcx| async move {
+                fcx.record(Event::new("test", "foreign_spawn"));
+                Ok(())
+            });
+            Ok(())
+        })
+        .await?;
+        let events = fcx.events().all();
+        assert_eq!(events.len(), 3);
+        for event in events {
+            let json = event.to_json();
+            assert!(json.get("node").is_none(), "{}", event.to_line());
+            assert!(json.get("parent").is_none(), "{}", event.to_line());
+        }
+        Ok(())
+    }))
+    .unwrap();
+    let events = kept.lock().unwrap().take().unwrap().all();
+    assert_eq!(events.len(), 4);
+    assert_task(&events[3], "t2", None);
+}
+
+#[test]
+fn a_nested_panic_restores_the_outer_task() {
+    block_on(lab(Seed::from_u64(1), |fcx| async move {
+        let result = std::panic::catch_unwind(|| {
+            block_on(lab(Seed::from_u64(2), |_fcx| async move {
+                panic!("inner world failed");
+            }))
+        });
+        assert!(result.is_err());
+        fcx.record(Event::new("test", "outer"));
+        fcx.spawn(|fcx| async move {
+            fcx.record(Event::new("test", "child"));
+            Ok(())
+        })
+        .join(&fcx)
+        .await?;
+        let events = fcx.events().all();
+        assert_task(&events[0], "t1", None);
+        assert_task(&events[1], "t2", Some("t1"));
+        Ok(())
+    }))
+    .unwrap();
+}
+
+fn assert_task(event: &Event, task: &str, parent: Option<&str>) {
+    let json = event.to_json();
+    assert_eq!(json.get("node").and_then(|v| v.as_str()), Some(task));
+    assert_eq!(
+        json.get("parent"),
+        Some(&parent.map_or(fictionet::stdlib::json::Value::Null, |id| id.into()))
+    );
+}

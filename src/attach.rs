@@ -41,7 +41,7 @@ pub struct Attachment {
     meter: Arc<Meter>,
     /// The last task seen polling this attachment.
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-    seen: u64,
+    seen: Option<crate::run::TaskId>,
     /// The wraps of [`Attachments::map`] still to run, closest to the
     /// sandbox first. They run when the world takes the attachment.
     wraps: Vec<Wrap>,
@@ -112,7 +112,7 @@ impl Attachment {
             link: Link::Socket(link),
             meter,
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-            seen: 0,
+            seen: None,
             wraps: Vec::new(),
         }
     }
@@ -142,10 +142,12 @@ impl Interface for Attachment {
             Link::Cable(end) => end.poll_recv(fcx, cx),
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             Link::Socket(link) => {
-                let current = crate::watch::current_task();
-                if current != self.seen && current != 0 {
+                let current = crate::run::TaskId::current_in(fcx.graph());
+                if current != self.seen
+                    && let Some(task) = current
+                {
                     self.seen = current;
-                    fcx.graph().owns(&self.meter, 0, current);
+                    fcx.graph().owns(&self.meter, 0, task.id);
                 }
                 let polled = link.poll_recv(fcx, cx);
                 if let Poll::Ready(Ok(packet)) = &polled {
@@ -327,7 +329,7 @@ impl Attacher {
             link: Link::Cable(world),
             meter,
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-            seen: 0,
+            seen: None,
             wraps: Vec::new(),
         });
         Ok(sandbox)
@@ -599,7 +601,7 @@ impl Attachments {
                         link,
                         meter: Meter::new(),
                         #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-                        seen: 0,
+                        seen: None,
                         wraps: Vec::new(),
                     }
                 }));

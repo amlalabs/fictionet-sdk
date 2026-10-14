@@ -14,7 +14,6 @@
 use fictionet::sync::{Mutex, MutexGuard};
 
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::collections::HashMap;
 #[cfg(any(feature = "observe", all(test, feature = "std")))]
 use std::collections::VecDeque;
@@ -30,35 +29,6 @@ use crate::Packet;
 use crate::sys::SystemTime;
 #[cfg(any(feature = "observe", all(test, feature = "std")))]
 use crate::time::Instant;
-
-thread_local! {
-    /// The id of the task this thread is polling, or 0 outside any task.
-    static CURRENT: Cell<u64> = const { Cell::new(0) };
-}
-
-/// The task this thread is polling right now, or 0.
-#[inline]
-pub(crate) fn current_task() -> u64 {
-    CURRENT.with(Cell::get)
-}
-
-/// Sets the current task while a task is polled, and puts back the one
-/// before it when dropped.
-pub(crate) struct Polling(u64);
-
-impl Polling {
-    #[inline]
-    pub(crate) fn enter(id: u64) -> Polling {
-        Polling(CURRENT.with(|c| c.replace(id)))
-    }
-}
-
-impl Drop for Polling {
-    #[inline]
-    fn drop(&mut self) {
-        CURRENT.with(|c| c.set(self.0));
-    }
-}
 
 /// Hashes task and link ids, which are small distinct numbers, with one
 /// multiplication instead of SipHash.
@@ -88,6 +58,11 @@ impl std::hash::Hasher for IdHasher {
 /// dashboard's messages.
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
 
+/// Run ids, unique in the process. They are only compared for equality,
+/// never recorded, serialized, ordered or hashed into anything a world
+/// sees, so they do not affect determinism.
+static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
+
 /// The counts and the tap of one link: a pair, or an attachment.
 ///
 /// Side 0 and side 1 are the two ends. For an attachment, side 0 is the
@@ -103,9 +78,9 @@ pub(crate) struct Meter {
     counts: [Count; 2],
     /// What holds the counts of a pair.
     counted: OnceLock<Weak<dyn Counted>>,
-    /// The task that made the link, or 0.
+    /// The task that made the link, if any.
     #[cfg(feature = "observe")]
-    creator: u64,
+    creator: Option<crate::run::TaskId>,
     /// For an attachment: the sandbox's name. Side 1 is the sandbox.
     sandbox: OnceLock<Arc<str>>,
     /// Set while a viewer watches: `send` then copies packets into `tap`.
@@ -130,7 +105,7 @@ impl Meter {
             counts: Default::default(),
             counted: OnceLock::new(),
             #[cfg(feature = "observe")]
-            creator: current_task(),
+            creator: crate::run::TaskId::current(),
             sandbox: OnceLock::new(),
             #[cfg(any(feature = "observe", all(test, feature = "std")))]
             tapped: AtomicBool::new(false),
@@ -454,6 +429,7 @@ pub(crate) const MAX_KEYS: usize = 20_000;
 /// Every run keeps one. Starting a task, and a task taking an end of a
 /// link, each take its lock once. Packets never do.
 pub(crate) struct Graph {
+    pub(crate) run_id: u64,
     pub(crate) environment: Arc<crate::entropy::RunEnvironment>,
     pub(crate) start_wall: SystemTime,
     /// Observer sessions connected to the world. While there are none,
@@ -491,6 +467,7 @@ pub(crate) struct GraphState {
 impl Graph {
     pub(crate) fn new(seed: crate::Seed, mode: crate::RunMode) -> Arc<Graph> {
         Arc::new(Graph {
+            run_id: NEXT_RUN.fetch_add(1, Ordering::Relaxed),
             environment: Arc::new(crate::entropy::RunEnvironment::new(seed, mode)),
             start_wall: if mode == crate::RunMode::Real {
                 SystemTime::now()
@@ -540,7 +517,7 @@ impl Graph {
         #[cfg(not(feature = "observe"))]
         let _ = group;
         let info = TaskInfo {
-            parent: current_task(),
+            parent: crate::run::current_task(self),
             #[cfg(feature = "observe")]
             group,
             name,
@@ -574,7 +551,7 @@ impl Graph {
         self.watches.lock().clear();
     }
 
-    fn link<'a>(s: &'a mut GraphState, meter: &Arc<Meter>) -> &'a mut LinkInfo {
+    fn link<'a>(&self, s: &'a mut GraphState, meter: &Arc<Meter>) -> &'a mut LinkInfo {
         s.revision += 1;
         if s.links.len() >= s.sweep_at {
             // Links are only ever added here, so sweeping when the count
@@ -586,7 +563,7 @@ impl Graph {
             meter: Arc::downgrade(meter),
             owners: [0, 0],
             #[cfg(feature = "observe")]
-            creator: meter.creator,
+            creator: meter.creator.map_or(0, |t| t.in_graph(self)),
             sandbox: meter.sandbox.get().cloned(),
             label: None,
         })
@@ -596,7 +573,7 @@ impl Graph {
     #[cold]
     pub(crate) fn owns(&self, meter: &Arc<Meter>, side: usize, task: u64) {
         let mut s = self.state();
-        let link = Self::link(&mut s, meter);
+        let link = self.link(&mut s, meter);
         link.owners[side] = task;
         if link.sandbox.is_none() {
             link.sandbox = meter.sandbox.get().cloned();
@@ -606,7 +583,7 @@ impl Graph {
     /// Gives a link a label, such as the prefix a router sends to it.
     pub(crate) fn label(&self, meter: &Arc<Meter>, label: String) {
         let mut s = self.state();
-        Self::link(&mut s, meter).label = Some(Arc::from(label));
+        self.link(&mut s, meter).label = Some(Arc::from(label));
     }
 
     /// The task `task` as an event records it, if it is running.
@@ -731,6 +708,45 @@ mod tests {
     }
 
     type Snapshot = (Vec<(u64, TaskInfo)>, Vec<([u64; 2], [u64; 4])>);
+
+    #[test]
+    fn link_owners_and_creators_stay_in_their_run() {
+        use crate::Interface;
+        use crate::prelude::*;
+        crate::block_on(crate::lab(crate::Seed::from_u64(1), |fcx| async move {
+            let (mut a, mut b) = crate::pair();
+            a.send(Packet(vec![1]));
+            b.recv(&fcx).await?;
+            assert_eq!(fcx.graph().state().links[&b.meter().id].owners, [0, 1]);
+            #[cfg(feature = "observe")]
+            assert_eq!(fcx.graph().state().links[&b.meter().id].creator, 1);
+
+            let foreign = fcx;
+            crate::lab(crate::Seed::from_u64(2), move |fcx| async move {
+                a.send(Packet(vec![2]));
+                b.recv(&fcx).await?;
+                // Both roots are task 1, but this end must be seen anew.
+                assert_eq!(fcx.graph().state().links[&b.meter().id].owners, [0, 1]);
+                #[cfg(feature = "observe")]
+                assert_eq!(fcx.graph().state().links[&b.meter().id].creator, 0);
+
+                let (mut c, mut d) = crate::pair();
+                c.send(Packet(vec![3]));
+                d.recv(&foreign).await?;
+                assert!(!foreign.graph().state().links.contains_key(&d.meter().id));
+                // Labeling also creates a graph entry, without ownership.
+                foreign.graph().label(d.meter(), "foreign".into());
+                let graph = foreign.graph().state();
+                let link = &graph.links[&d.meter().id];
+                assert_eq!(link.owners, [0, 0]);
+                #[cfg(feature = "observe")]
+                assert_eq!(link.creator, 0);
+                Ok(())
+            })
+            .await
+        }))
+        .unwrap();
+    }
 
     fn snapshot(g: &Graph) -> Snapshot {
         let s = g.state();

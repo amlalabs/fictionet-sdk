@@ -11,7 +11,7 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use crate::JoinError;
 use crate::cx::{JoinState, Region, is_cancel};
-use crate::watch::{Graph, Polling};
+use crate::watch::Graph;
 use crate::{Cx, Result};
 
 /// Runs a world in real time, as one future that any executor can poll.
@@ -124,6 +124,9 @@ where
 /// seed and the same inputs give the same event log and the same packets.
 /// [Repeatable runs](crate::running#repeatable-runs) says what repeats and
 /// what does not.
+///
+/// Each run has its own task identities. A lab started inside another
+/// run's task has a world root with no parent in the outer run.
 ///
 /// The test plays the sandboxes as tasks of the lab, through
 /// [`attachments`](crate::attachments). A lab whose tasks all wait with no
@@ -302,24 +305,70 @@ struct Slot {
     join: Arc<JoinState>,
 }
 
+/// A task number qualified by its run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TaskId {
+    run: u64,
+    pub(crate) id: u64,
+}
+
+impl TaskId {
+    pub(crate) fn current() -> Option<Self> {
+        CURRENT.with(Cell::get).map(|current| current.task)
+    }
+
+    /// The current task, only if it belongs to `graph`'s run.
+    pub(crate) fn current_in(graph: &Graph) -> Option<Self> {
+        Self::current().filter(|t| t.run == graph.run_id)
+    }
+
+    /// The task number in `graph`, or 0 if it belongs to another run.
+    pub(crate) fn in_graph(&self, graph: &Graph) -> u64 {
+        if self.run == graph.run_id { self.id } else { 0 }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CurrentTask {
+    task: TaskId,
+    waker: *const (),
+}
+
 thread_local! {
-    /// The run and task being polled on this thread, if any: the run's
-    /// address and the data pointer of the task's waker.
-    static CURRENT: Cell<(*const RunShared, *const ())> =
-        const { Cell::new((std::ptr::null(), std::ptr::null())) };
+    /// The run, task and waker being polled on this thread, if any.
+    static CURRENT: Cell<Option<CurrentTask>> = const { Cell::new(None) };
+}
+
+/// The task this thread is polling in `graph`, or 0.
+#[inline]
+pub(crate) fn current_task(graph: &Graph) -> u64 {
+    TaskId::current().map_or(0, |t| t.in_graph(graph))
 }
 
 /// Whether `waker` is the waker of the task of `run` that is being polled
 /// on this thread right now.
 pub(crate) fn is_current_task(run: &Arc<RunShared>, waker: &Waker) -> bool {
     CURRENT.with(|c| {
-        let (r, data) = c.get();
-        r == Arc::as_ptr(run) && data == waker.data()
+        c.get()
+            .is_some_and(|t| t.task.run == run.graph.run_id && t.waker == waker.data())
     })
 }
 
 /// Restores [`CURRENT`] when a poll ends, even by a panic.
-struct CurrentGuard((*const RunShared, *const ()));
+struct CurrentGuard(Option<CurrentTask>);
+
+impl CurrentGuard {
+    fn enter(graph: &Graph, id: u64, waker: &Waker) -> Self {
+        let current = CurrentTask {
+            task: TaskId {
+                run: graph.run_id,
+                id,
+            },
+            waker: waker.data(),
+        };
+        Self(CURRENT.with(|c| c.replace(Some(current))))
+    }
+}
 
 impl Drop for CurrentGuard {
     fn drop(&mut self) {
@@ -387,16 +436,13 @@ impl RunState {
             std::mem::swap(&mut q.ready, &mut turn);
         }
 
-        let run_ptr = Arc::as_ptr(&self.shared);
         while let Some(id) = turn.pop_front() {
             let Some(slot) = self.slots.get_mut(&id) else {
                 continue;
             };
             slot.task_waker.queued.store(false, Ordering::Release);
             let result = {
-                let previous = CURRENT.with(|c| c.replace((run_ptr, slot.waker.data())));
-                let _guard = CurrentGuard(previous);
-                let _polling = Polling::enter(id);
+                let _guard = CurrentGuard::enter(&self.shared.graph, id, &slot.waker);
                 slot.future
                     .as_mut()
                     .poll(&mut Context::from_waker(&slot.waker))

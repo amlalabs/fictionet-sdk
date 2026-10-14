@@ -386,6 +386,12 @@ returns `Cancelled` before inspecting events and before returning matches,
 even when enough events are already held, `n` is zero, or the deadline
 has arrived.
 
+Task identities belong to one run. An event recorded through a `Cx` from
+another run has no task metadata. The same applies outside any world task.
+A nested lab starts its own world root with no parent. Tasks spawned
+through another run's `Cx` also have no parent in their run's graph.
+Link owners and creators name only tasks from the graph's own run.
+
 The file has one JSON object per line: `seq`, `at`, `source`, `kind`,
 `level`, `summary`, `sandbox`, `conn`, `local`, `peer`, `transport`,
 `tls`, `sni`, `alpn`, `fields`, then the task that recorded it (`node`,

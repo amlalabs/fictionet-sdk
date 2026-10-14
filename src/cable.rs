@@ -66,13 +66,13 @@ fn make(guard: Option<Box<dyn Send>>, limit: Option<usize>) -> (End, End) {
             cable: cable.clone(),
             side: 0,
             wait: CancelWait::default(),
-            seen: 0,
+            seen: None,
         },
         End {
             cable,
             side: 1,
             wait: CancelWait::default(),
-            seen: 0,
+            seen: None,
         },
     )
 }
@@ -117,7 +117,7 @@ pub struct End {
     /// Where a receiver outside the run waits for a cancel.
     wait: CancelWait,
     /// The last task seen polling this end, for the dashboard.
-    seen: u64,
+    seen: Option<crate::run::TaskId>,
 }
 
 impl Interface for End {
@@ -125,10 +125,12 @@ impl Interface for End {
         if fcx.is_cancelled() {
             return Poll::Ready(Err(RecvError::Cancelled));
         }
-        let current = crate::watch::current_task();
-        if current != self.seen && current != 0 {
+        let current = crate::run::TaskId::current_in(fcx.graph());
+        if current != self.seen
+            && let Some(task) = current
+        {
             self.seen = current;
-            fcx.graph().owns(&self.cable.meter, self.side, current);
+            fcx.graph().owns(&self.cable.meter, self.side, task.id);
         }
         {
             let mut dir = self.cable.dirs[self.side].lock();

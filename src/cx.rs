@@ -215,6 +215,8 @@ impl Cx {
     /// returns runs as its own task. The returned [`Task`] lets you wait for
     /// it with [`Task::join`]. Dropping the `Task` does not stop the work:
     /// the region owns it, not the handle.
+    /// The task's recorded parent is the current task in this run, if any.
+    /// Spawning from another run or outside a world task leaves no parent.
     ///
     /// If the region has completed, the returned task joins with
     /// [`JoinError::Cancelled`]. `work` is still called to construct the
@@ -346,6 +348,8 @@ impl Cx {
     /// Records `event` in the run's [event log](crate::events), dated now
     /// on the run's clock, with the task that records it. Every run keeps
     /// its events, whether or not anyone reads them.
+    /// The task is included only when it belongs to this `Cx`'s run.
+    /// Recording from outside that run leaves the task metadata absent.
     ///
     /// ```
     /// # fn handled(fcx: &fictionet::Cx) {
@@ -358,11 +362,11 @@ impl Cx {
     }
 
     /// Records `event` as having happened at `at`, which may be earlier
-    /// than now.
+    /// than now. Task attribution follows [`record`](Self::record).
     pub fn record_at(&self, at: Instant, mut event: Event) {
         let graph = &self.run.graph;
         event.at = at;
-        event.origin = graph.origin(crate::watch::current_task());
+        event.origin = graph.origin(crate::run::current_task(graph));
         graph.events.push(event);
     }
 
@@ -372,11 +376,12 @@ impl Cx {
     /// port or a length. The log records the first of a run, then counts
     /// the rest, and keeps repeats within bounds of their own, so they
     /// never push out other events. See
-    /// [Repeats](crate::events#repeats).
+    /// [Repeats](crate::events#repeats). Task attribution follows
+    /// [`record`](Self::record).
     pub fn record_repeat(&self, mut event: Event, detail: crate::events::Fields) {
         let graph = &self.run.graph;
         event.at = self.now();
-        event.origin = graph.origin(crate::watch::current_task());
+        event.origin = graph.origin(crate::run::current_task(graph));
         graph.events.push_repeat(event, detail);
     }
 
