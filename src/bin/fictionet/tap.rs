@@ -234,7 +234,12 @@ impl Link {
                 payload: request,
             } => {
                 return match &self.v6 {
-                    Family::Serve(lease) => match addresses::dhcp6(lease, request) {
+                    Family::Serve(lease) => match addresses::dhcp6(
+                        lease,
+                        // Leave room for the IPv6 and UDP headers.
+                        usize::from(self.mtu).saturating_sub(40 + 8),
+                        request,
+                    ) {
                         Some(answer) => {
                             let packet = addresses::dhcp6_packet(p, &answer);
                             FromVm::Answer(ether::frame(
@@ -1573,6 +1578,85 @@ mod tests {
         assert_eq!(f.dst, VM);
         let (port, payload) = ether::udp_to(f.payload).unwrap();
         assert_eq!((port, payload[0]), (546, 2));
+    }
+
+    fn rebind(stale: usize, client_len: u16) -> Vec<u8> {
+        let mut request = vec![6, 0, 0, 1];
+        request.extend_from_slice(&1u16.to_be_bytes()); // Client ID.
+        request.extend_from_slice(&client_len.to_be_bytes());
+        request.extend_from_slice(&[0, 3, 0, 1]);
+        request.extend_from_slice(&VM);
+        request.resize(8 + usize::from(client_len), 0);
+        request.extend_from_slice(&3u16.to_be_bytes()); // IA_NA.
+        request.extend_from_slice(&u16::try_from(12 + stale * 28).unwrap().to_be_bytes());
+        request.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        for i in 0..stale {
+            request.extend_from_slice(&[0, 5, 0, 24]); // IAADDR.
+            request.extend_from_slice(&Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 1, i as u16).octets());
+            request.extend_from_slice(&[0; 8]);
+        }
+        let p = ether::udp6(
+            ether::link_local(VM),
+            546,
+            "ff02::1:2".parse().unwrap(),
+            547,
+            &request,
+        );
+        eth(VM, [0x33, 0x33, 0, 1, 0, 2], ether::IPV6, &p)
+    }
+
+    #[test]
+    fn dhcp6_replies_fit_the_mtu_exactly() {
+        for (mtu, stale, client_len) in [(1280, 40, 26), (1500, 48, 22), (u16::MAX, 2335, 21)] {
+            let mut link = served();
+            link.mtu = mtu;
+            let Family::Serve(lease) = &mut link.v6 else {
+                unreachable!()
+            };
+            lease.dns = Some("fd00::53".parse().unwrap());
+            let request = rebind(stale, client_len);
+            assert!(request.len() < ether::HEADER + usize::from(mtu));
+            let FromVm::Answer(reply) = link.frame_from_vm(&request) else {
+                panic!("no reply at MTU {mtu}")
+            };
+            assert_eq!(reply.len(), ether::HEADER + usize::from(mtu));
+            let f = Frame::parse(&reply).unwrap();
+            assert_eq!(f.dst, VM);
+            assert_eq!(f.src, ether::GATEWAY_MAC);
+            assert_eq!(f.ethertype, ether::IPV6);
+            assert_eq!(ether::ip_packet(ether::IPV6, f.payload), Some(f.payload));
+            assert!(ether::tests::v6_checksum_ok(f.payload));
+            let (port, payload) = ether::udp_to(f.payload).unwrap();
+            assert_eq!(port, 546);
+            assert_eq!(&payload[..4], &[7, 0, 0, 1]);
+            let udp_len = u16::from_be_bytes([f.payload[44], f.payload[45]]) as usize;
+            assert_eq!(udp_len, 8 + payload.len());
+            assert_eq!(40 + udp_len, usize::from(mtu));
+
+            // One more copied byte still fits on input but exceeds the reply MTU.
+            let too_big = rebind(stale, client_len + 1);
+            assert!(too_big.len() <= ether::HEADER + usize::from(mtu));
+            assert_eq!(link.frame_from_vm(&too_big), FromVm::Drop(Why::Handled));
+            assert!(matches!(link.frame_from_vm(&request), FromVm::Answer(_)));
+        }
+    }
+
+    #[test]
+    fn dhcp6_rebind_cannot_overflow_the_udp_length() {
+        let mut link = served();
+        link.mtu = u16::MAX;
+        let Family::Serve(lease) = &mut link.v6 else {
+            unreachable!()
+        };
+        lease.dns = Some("fd00::53".parse().unwrap());
+        let request = rebind(2337, 10);
+        assert_eq!(request.len(), ether::HEADER + 65_518);
+        assert!(request.len() <= ether::HEADER + usize::from(link.mtu));
+        assert_eq!(link.frame_from_vm(&request), FromVm::Drop(Why::Handled));
+        assert!(matches!(
+            link.frame_from_vm(&rebind(0, 10)),
+            FromVm::Answer(_)
+        ));
     }
 
     #[test]

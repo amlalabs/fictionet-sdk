@@ -1676,8 +1676,10 @@
 //! for the address attach passes packets from.
 //!
 //! **MTU.** Frames carry at most `--mtu` bytes of IP packet. Longer ones
-//! are dropped both ways. To use a larger MTU, give the VM's card the same
-//! one: with QEMU, `-device virtio-net-pci,netdev=n0,host_mtu=9000` and
+//! are dropped both ways. Attach leaves a DHCPv6 request unanswered if its
+//! full reply would exceed the MTU or an option, UDP or IPv6 length limit.
+//! To use a larger MTU, give the VM's card the same one: with QEMU,
+//! `-device virtio-net-pci,netdev=n0,host_mtu=9000` and
 //! `--mtu 9000`. The VM's DHCP client then sets the MTU from the lease. A
 //! test VM showed `mtu 9000` on its card and passed 8,000-byte pings with
 //! fragmentation turned off.

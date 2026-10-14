@@ -217,10 +217,15 @@ fn options6(mut b: &[u8]) -> Option<Vec<(u16, &[u8])>> {
     Some(out)
 }
 
-fn push6(out: &mut Vec<u8>, code: u16, value: &[u8]) {
+fn push6(out: &mut Vec<u8>, code: u16, value: &[u8], budget: usize) -> Option<()> {
+    let len = u16::try_from(value.len()).ok()?;
+    if 4 + value.len() > budget.checked_sub(out.len())? {
+        return None;
+    }
     out.extend_from_slice(&code.to_be_bytes());
-    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(value);
+    Some(())
 }
 
 /// Attach's DHCPv6 server ID: a DUID made from its MAC (DUID-LL).
@@ -232,9 +237,12 @@ fn server_duid() -> [u8; 10] {
 
 /// The answer to one DHCPv6 message from the VM, as the UDP payload.
 /// `None` when no answer is due: a message for another server, one with no
-/// client ID, or a type a server does not answer.
-pub(crate) fn dhcp6(lease: &Lease<Ipv6Addr>, request: &[u8]) -> Option<Vec<u8>> {
-    if request.len() < 4 {
+/// client ID, or a type a server does not answer. Also returns `None` if
+/// the answer exceeds `budget` bytes or an option or UDP length limit.
+pub(crate) fn dhcp6(lease: &Lease<Ipv6Addr>, budget: usize, request: &[u8]) -> Option<Vec<u8>> {
+    // The UDP header and payload must fit both UDP's and IPv6's u16 length.
+    let budget = budget.min(u16::MAX as usize - 8);
+    if request.len() < 4 || budget < 4 {
         return None;
     }
     let kind = request[0];
@@ -257,22 +265,22 @@ pub(crate) fn dhcp6(lease: &Lease<Ipv6Addr>, request: &[u8]) -> Option<Vec<u8>> 
         msg6::SOLICIT if rapid => (msg6::REPLY, true, false),
         msg6::SOLICIT => (msg6::ADVERTISE, true, false),
         msg6::REQUEST | msg6::RENEW | msg6::REBIND => (msg6::REPLY, true, false),
-        msg6::CONFIRM => return confirm(lease, request, client?, &options),
+        msg6::CONFIRM => return confirm(lease, request, client?, &options, budget),
         msg6::RELEASE | msg6::DECLINE => (msg6::REPLY, false, true),
         msg6::INFORMATION_REQUEST => (msg6::REPLY, false, false),
         _ => return None,
     };
     let mut out = vec![reply, request[1], request[2], request[3]];
     if let Some(c) = client {
-        push6(&mut out, opt6::CLIENT_ID, c);
+        push6(&mut out, opt6::CLIENT_ID, c, budget)?;
     }
-    push6(&mut out, opt6::SERVER_ID, &server_duid());
+    push6(&mut out, opt6::SERVER_ID, &server_duid(), budget)?;
     if rapid {
-        push6(&mut out, opt6::RAPID_COMMIT, &[]);
+        push6(&mut out, opt6::RAPID_COMMIT, &[], budget)?;
     }
     if status {
         // Success.
-        push6(&mut out, opt6::STATUS_CODE, &[0, 0]);
+        push6(&mut out, opt6::STATUS_CODE, &[0, 0], budget)?;
     }
     let iaaddr = |addr: Ipv6Addr, secs: u32| {
         let mut a = Vec::with_capacity(24);
@@ -285,8 +293,6 @@ pub(crate) fn dhcp6(lease: &Lease<Ipv6Addr>, request: &[u8]) -> Option<Vec<u8>> 
     // restore or a change of flags, comes back with lifetimes of 0 in a
     // Request, Renew or Rebind, so the VM drops it (RFC 8415, section
     // 18.3.4). Attach passes packets only from the address it hands out.
-    // An answer to the agent's own VM may grow with its request; it harms
-    // no one else.
     let retire = matches!(kind, msg6::REQUEST | msg6::RENEW | msg6::REBIND);
     let ias = options
         .iter()
@@ -309,7 +315,13 @@ pub(crate) fn dhcp6(lease: &Lease<Ipv6Addr>, request: &[u8]) -> Option<Vec<u8>> 
         if !first && stale.is_empty() {
             continue;
         }
-        let mut na = Vec::with_capacity(40);
+        let len = 12 + 28 * (stale.len() + usize::from(first));
+        // Check the nested option and the remaining reply before building it.
+        u16::try_from(len).ok()?;
+        if 4 + len > budget.checked_sub(out.len())? {
+            return None;
+        }
+        let mut na = Vec::with_capacity(len);
         na.extend_from_slice(&ia[0..4]);
         let (t1, t2) = if first {
             (LEASE_SECS / 2, LEASE_SECS / 5 * 4)
@@ -319,15 +331,20 @@ pub(crate) fn dhcp6(lease: &Lease<Ipv6Addr>, request: &[u8]) -> Option<Vec<u8>> 
         na.extend_from_slice(&t1.to_be_bytes());
         na.extend_from_slice(&t2.to_be_bytes());
         if first {
-            push6(&mut na, opt6::IAADDR, &iaaddr(lease.addr.addr, LEASE_SECS));
+            push6(
+                &mut na,
+                opt6::IAADDR,
+                &iaaddr(lease.addr.addr, LEASE_SECS),
+                len,
+            )?;
         }
         for other in stale {
-            push6(&mut na, opt6::IAADDR, &iaaddr(other, 0));
+            push6(&mut na, opt6::IAADDR, &iaaddr(other, 0), len)?;
         }
-        push6(&mut out, opt6::IA_NA, &na);
+        push6(&mut out, opt6::IA_NA, &na, budget)?;
     }
     if let (Some(dns), false) = (lease.dns, matches!(kind, msg6::RELEASE | msg6::DECLINE)) {
-        push6(&mut out, opt6::DNS_SERVERS, &dns.octets());
+        push6(&mut out, opt6::DNS_SERVERS, &dns.octets(), budget)?;
     }
     Some(out)
 }
@@ -359,6 +376,7 @@ fn confirm(
     request: &[u8],
     client: &[u8],
     options: &[(u16, &[u8])],
+    budget: usize,
 ) -> Option<Vec<u8>> {
     let mut addrs = Vec::new();
     for (_, ia) in options
@@ -373,14 +391,15 @@ fn confirm(
     }
     let on_link = addrs.iter().all(|a| *a == lease.addr.addr);
     let mut out = vec![msg6::REPLY, request[1], request[2], request[3]];
-    push6(&mut out, opt6::CLIENT_ID, client);
-    push6(&mut out, opt6::SERVER_ID, &server_duid());
+    push6(&mut out, opt6::CLIENT_ID, client, budget)?;
+    push6(&mut out, opt6::SERVER_ID, &server_duid(), budget)?;
     // Success, or NotOnLink.
     push6(
         &mut out,
         opt6::STATUS_CODE,
         if on_link { &[0, 0] } else { &[0, 4] },
-    );
+        budget,
+    )?;
     Some(out)
 }
 
@@ -602,7 +621,7 @@ mod tests {
     fn msg6(kind: u8, options: &[(u16, &[u8])]) -> Vec<u8> {
         let mut m = vec![kind, 0xab, 0xcd, 0xef];
         for (c, v) in options {
-            push6(&mut m, *c, v);
+            push6(&mut m, *c, v, usize::MAX).unwrap();
         }
         m
     }
@@ -611,9 +630,69 @@ mod tests {
     const IA: &[u8] = &[0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0];
 
     #[test]
+    fn dhcp6_option_lengths_do_not_wrap() {
+        let mut out = Vec::new();
+        let value = vec![0; u16::MAX as usize];
+        push6(&mut out, opt6::IA_NA, &value, usize::MAX).unwrap();
+        assert_eq!(options6(&out).unwrap(), vec![(opt6::IA_NA, &value[..])]);
+        out.clear();
+        assert!(push6(&mut out, opt6::IA_NA, &vec![0; 65_536], usize::MAX).is_none());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn dhcp6_all_reply_types_obey_the_budget() {
+        for kind in [
+            msg6::SOLICIT,
+            msg6::REQUEST,
+            msg6::CONFIRM,
+            msg6::RENEW,
+            msg6::REBIND,
+            msg6::RELEASE,
+            msg6::DECLINE,
+            msg6::INFORMATION_REQUEST,
+        ] {
+            for rapid in [false, true] {
+                let ia = ia_with("fd00::77");
+                let mut options = vec![(opt6::CLIENT_ID, CLIENT), (opt6::IA_NA, &ia[..])];
+                if rapid {
+                    options.push((opt6::RAPID_COMMIT, &[]));
+                }
+                let request = msg6(kind, &options);
+                let reply = dhcp6(&lease6(), 1500 - 48, &request).unwrap();
+                for budget in 0..reply.len() {
+                    assert!(
+                        dhcp6(&lease6(), budget, &request).is_none(),
+                        "{kind}: {budget}"
+                    );
+                }
+                assert_eq!(dhcp6(&lease6(), reply.len(), &request), Some(reply));
+            }
+        }
+    }
+
+    #[test]
+    fn dhcp6_replies_fit_the_udp_length() {
+        let mut ia = IA.to_vec();
+        for _ in 0..2336 {
+            ia.extend_from_slice(&ia_with("fd00::77")[12..]);
+        }
+        let request = |len| {
+            msg6(
+                msg6::REBIND,
+                &[(opt6::CLIENT_ID, &vec![7; len]), (opt6::IA_NA, &ia)],
+            )
+        };
+        let reply = dhcp6(&lease6(), usize::MAX, &request(33)).unwrap();
+        assert_eq!(reply.len() + 8, u16::MAX as usize);
+        assert!(dhcp6(&lease6(), usize::MAX, &request(34)).is_none());
+    }
+
+    #[test]
     fn dhcp6_solicit_advertise_request_reply() {
         let adv = dhcp6(
             &lease6(),
+            1500 - 48,
             &msg6(
                 msg6::SOLICIT,
                 &[(opt6::CLIENT_ID, CLIENT), (opt6::IA_NA, IA)],
@@ -640,6 +719,7 @@ mod tests {
 
         let reply = dhcp6(
             &lease6(),
+            1500 - 48,
             &msg6(
                 msg6::REQUEST,
                 &[
@@ -661,6 +741,7 @@ mod tests {
         // Rapid commit: the solicit gets a reply at once.
         let rapid = dhcp6(
             &lease6(),
+            1500 - 48,
             &msg6(
                 msg6::SOLICIT,
                 &[
@@ -691,25 +772,35 @@ mod tests {
                 (opt6::IA_NA, IA),
             ],
         );
-        assert!(dhcp6(&lease6(), &m).is_none());
+        assert!(dhcp6(&lease6(), 1500 - 48, &m).is_none());
         assert!(
-            dhcp6(&lease6(), &msg6(msg6::SOLICIT, &[(opt6::IA_NA, IA)])).is_none(),
+            dhcp6(
+                &lease6(),
+                1500 - 48,
+                &msg6(msg6::SOLICIT, &[(opt6::IA_NA, IA)])
+            )
+            .is_none(),
             "no client ID"
         );
         assert!(
             dhcp6(
                 &lease6(),
+                1500 - 48,
                 &msg6(msg6::ADVERTISE, &[(opt6::CLIENT_ID, CLIENT)])
             )
             .is_none()
         );
         let mut cut = msg6(msg6::SOLICIT, &[(opt6::CLIENT_ID, CLIENT)]);
         cut.pop();
-        assert!(dhcp6(&lease6(), &cut).is_none(), "an option past the end");
-        assert!(dhcp6(&lease6(), &[1, 2]).is_none());
+        assert!(
+            dhcp6(&lease6(), 1500 - 48, &cut).is_none(),
+            "an option past the end"
+        );
+        assert!(dhcp6(&lease6(), 1500 - 48, &[1, 2]).is_none());
         // A release gets a plain success, and no address or DNS.
         let r = dhcp6(
             &lease6(),
+            1500 - 48,
             &msg6(
                 msg6::RELEASE,
                 &[(opt6::CLIENT_ID, CLIENT), (opt6::IA_NA, IA)],
@@ -727,7 +818,7 @@ mod tests {
                 .any(|(c, _)| *c == opt6::IA_NA || *c == opt6::DNS_SERVERS)
         );
         // Information-request needs no client ID.
-        let r = dhcp6(&lease6(), &msg6(msg6::INFORMATION_REQUEST, &[])).unwrap();
+        let r = dhcp6(&lease6(), 1500 - 48, &msg6(msg6::INFORMATION_REQUEST, &[])).unwrap();
         assert!(
             options6(&r[4..])
                 .unwrap()
@@ -740,7 +831,7 @@ mod tests {
         let mut a: Vec<u8> = addr.parse::<Ipv6Addr>().unwrap().octets().to_vec();
         a.extend_from_slice(&[0; 8]);
         let mut ia = IA.to_vec();
-        push6(&mut ia, opt6::IAADDR, &a);
+        push6(&mut ia, opt6::IAADDR, &a, usize::MAX).unwrap();
         ia
     }
 
@@ -754,6 +845,7 @@ mod tests {
         };
         let ok = dhcp6(
             &lease6(),
+            1500 - 48,
             &msg6(
                 msg6::CONFIRM,
                 &[
@@ -765,6 +857,7 @@ mod tests {
         assert_eq!(status(&ok.unwrap()), Some(vec![0, 0]));
         let off = dhcp6(
             &lease6(),
+            1500 - 48,
             &msg6(
                 msg6::CONFIRM,
                 &[
@@ -777,6 +870,7 @@ mod tests {
         assert!(
             dhcp6(
                 &lease6(),
+                1500 - 48,
                 &msg6(
                     msg6::CONFIRM,
                     &[(opt6::CLIENT_ID, CLIENT), (opt6::IA_NA, IA)]
@@ -788,6 +882,7 @@ mod tests {
         // out and lets through: NotOnLink, so the VM asks again.
         let cached = dhcp6(
             &lease6(),
+            1500 - 48,
             &msg6(
                 msg6::CONFIRM,
                 &[
@@ -805,7 +900,7 @@ mod tests {
             let mut options: Vec<(u16, &[u8])> = vec![(opt6::CLIENT_ID, CLIENT)];
             let ia = ia_with("fd00::77");
             options.push((opt6::IA_NA, &ia));
-            let r = dhcp6(&lease6(), &msg6(kind, &options)).unwrap();
+            let r = dhcp6(&lease6(), 1500 - 48, &msg6(kind, &options)).unwrap();
             let opts = options6(&r[4..]).unwrap();
             let na = opts.iter().find(|(c, _)| *c == opt6::IA_NA).unwrap().1;
             let addrs: Vec<(Ipv6Addr, u32, u32)> = options6(&na[12..])
@@ -841,7 +936,7 @@ mod tests {
         }
         options.push((opt6::IA_NA, &first));
         options.push((opt6::IA_NA, &second));
-        let r = dhcp6(&lease6(), &msg6(msg6::RENEW, &options)).unwrap();
+        let r = dhcp6(&lease6(), 1500 - 48, &msg6(msg6::RENEW, &options)).unwrap();
         let opts = options6(&r[4..]).unwrap();
         let nas: Vec<&[u8]> = opts
             .iter()
@@ -861,6 +956,7 @@ mod tests {
         // A Solicit names no stale address.
         let s = dhcp6(
             &lease6(),
+            1500 - 48,
             &msg6(
                 msg6::SOLICIT,
                 &[(opt6::CLIENT_ID, CLIENT), (opt6::IA_NA, &first)],
@@ -874,6 +970,7 @@ mod tests {
         let ia = ia_with("fd00::2");
         let r = dhcp6(
             &lease6(),
+            1500 - 48,
             &msg6(
                 msg6::RENEW,
                 &[(opt6::CLIENT_ID, CLIENT), (opt6::IA_NA, &ia)],
@@ -891,6 +988,7 @@ mod tests {
         assert!(
             dhcp6(
                 &lease6(),
+                1500 - 48,
                 &msg6(
                     msg6::SOLICIT,
                     &[(opt6::CLIENT_ID, &long), (opt6::IA_NA, IA)]
@@ -901,6 +999,7 @@ mod tests {
         let max = vec![7u8; MAX_DUID];
         let r = dhcp6(
             &lease6(),
+            1500 - 48,
             &msg6(msg6::SOLICIT, &[(opt6::CLIENT_ID, &max), (opt6::IA_NA, IA)]),
         )
         .unwrap();
