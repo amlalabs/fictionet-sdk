@@ -175,8 +175,8 @@ spec:
             seccompProfile:
               type: RuntimeDefault
           {{- else }}
-          # Root in its own container, with two capabilities: NET_ADMIN for
-          # tun0, routes and eth0, and MKNOD to make /dev/net/tun. And
+          # Root in its own container, with three capabilities: NET_ADMIN for
+          # tun0, routes and eth0, MKNOD to make /dev/net/tun, and
           # DAC_OVERRIDE to connect to a socket the world's user owns.
           securityContext:
             runAsUser: 0

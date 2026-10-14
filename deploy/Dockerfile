@@ -37,7 +37,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # `fictionet attach`, and `fictionet ready` for its probe. Attach runs as
 # root in its container, with only the capabilities it is given: in the
-# chart, NET_ADMIN and MKNOD.
+# chart's tun mode, NET_ADMIN, MKNOD and DAC_OVERRIDE.
 FROM scratch AS attach
 COPY --from=build /out/fictionet /fictionet
 ENTRYPOINT ["/fictionet"]

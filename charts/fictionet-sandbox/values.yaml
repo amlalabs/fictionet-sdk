@@ -78,8 +78,8 @@ attach:
   # from deploy/Dockerfile (target attach). Required.
   image: ""
   imagePullPolicy: IfNotPresent
-  # tun, http_proxy or socks5. tun needs NET_ADMIN and MKNOD in attach's
-  # container. The proxy types need no privileges in any container.
+  # tun, http_proxy or socks5. tun uses NET_ADMIN, MKNOD and DAC_OVERRIDE
+  # in attach's container. The proxy types need no privileges in any container.
   type: tun
   # The name attach gives the world. Empty: the service's name.
   name: ""

@@ -418,7 +418,8 @@
 //!   listens on `/run/relay/relay.sock`, in an `emptyDir` that only it
 //!   and attach mount.
 //! - **`attach`** is a native sidecar too, started after the world. It is
-//!   the only container with `NET_ADMIN`.
+//!   the only container with `NET_ADMIN`. It also has `MKNOD` and
+//!   `DAC_OVERRIDE`.
 //!
 //! This section covers `attach.type: tun`, the default. If your cluster
 //! enforces Pod Security "baseline" or "restricted", use `http_proxy` or
@@ -451,6 +452,10 @@
 //!   and logs `made /dev/net/tun (char 10:200)`. The node alone is not
 //!   enough: the runtime's device rules must also allow the device. runc's
 //!   built-in rules do, except in runc 1.2.0 to 1.2.3.
+//! - **The world's socket.** The socket belongs to the world's user.
+//!   Attach runs as root with all capabilities dropped except `NET_ADMIN`,
+//!   `MKNOD` and `DAC_OVERRIDE`. `DAC_OVERRIDE` lets it connect when the
+//!   world's user differs and the socket's permissions would deny access.
 //! - **`--world-wait 60`.** The world may not be listening yet when attach
 //!   starts. Attach tries the socket again every 100 ms, for up to 60
 //!   seconds.
@@ -618,16 +623,15 @@
 //! ```
 //!
 //! Only attach needs `NET_ADMIN`. Attach's other two capabilities, `MKNOD`
-//! and `DAC_OVERRIDE` (to connect to a socket the world's user owns), are
-//! both allowed by "baseline". The agent's container can meet "restricted"
-//! on its own: no capabilities, no privilege escalation, `RuntimeDefault`
-//! seccomp, and a non-root user where its image allows. So the Kubernetes
-//! namespace needs `pod-security.kubernetes.io/enforce: privileged`, or an
-//! exception for the attach container from a policy engine (Kyverno,
-//! Gatekeeper or a ValidatingAdmissionPolicy). The built-in Pod Security
-//! admission can exempt only whole namespaces, users or runtime classes, in
-//! the API server's own config, which managed clusters (GKE, EKS, AKS) do
-//! not let you edit.
+//! and `DAC_OVERRIDE`, are both allowed by "baseline". The agent's container
+//! can meet "restricted" on its own: no capabilities, no privilege
+//! escalation, `RuntimeDefault` seccomp, and a non-root user where its image
+//! allows. So the Kubernetes namespace needs
+//! `pod-security.kubernetes.io/enforce: privileged`, or an exception for the
+//! attach container from a policy engine (Kyverno, Gatekeeper or a
+//! ValidatingAdmissionPolicy). The built-in Pod Security admission can exempt
+//! only whole namespaces, users or runtime classes, in the API server's own
+//! config, which managed clusters (GKE, EKS, AKS) do not let you edit.
 //!
 //! Where none of that is possible, use `attach.type: http_proxy` or
 //! `socks5`. No container then needs a capability, and the pod passes
@@ -644,9 +648,9 @@
 //! - **The world's socket needs pod annotations.** Under gVisor, an
 //!   `emptyDir` is not shared between a pod's containers unless the pod
 //!   says so. The chart adds the pod annotations
-//!   `dev.gvisor.spec.mount.fictionet.share: pod`, `.type: tmpfs` and
-//!   `.options: rw` for the volume that holds the socket. containerd passes
-//!   them to `runsc` only if the runtime's config lists them:
+//!   `dev.gvisor.spec.mount.relay.share: pod`, `.type: tmpfs` and
+//!   `.options: rw` for the `relay` volume that holds the socket. containerd
+//!   passes them to `runsc` only if the runtime's config lists them:
 //!   `pod_annotations = ["dev.gvisor.*"]`. Without that, attach waits for a
 //!   socket it never sees, and gives up after `--world-wait`.
 //! - **`eth0` stays up.** gVisor deletes `eth0`'s addresses and routes but
