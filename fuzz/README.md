@@ -66,16 +66,28 @@ On a system whose default target is not `x86_64-unknown-linux-gnu`, add
 `--target x86_64-unknown-linux-gnu`: the sanitizer does not work with
 musl's static libc.
 
-To run every target in turn for some seconds each, as nightly and manual CI runs do:
+To build and run every target in turn for some seconds each:
 
 ```sh
-cargo +nightly fuzz build -O -a
 fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
+```
+
+`FUZZ_SHARD_INDEX` defaults to 0 and `FUZZ_SHARD_COUNT` defaults to 1:
+one shard runs every target. Targets are sorted in C locale and dealt
+round-robin to zero-based shards, so the shards are disjoint and together
+cover every target. Both values must be decimal integers without leading
+zeros; the count must be positive and the index less than the count.
+Invalid values fail before target discovery. To run one of the four
+shards used by nightly and manual CI:
+
+```sh
+FUZZ_SHARD_INDEX=0 FUZZ_SHARD_COUNT=4 fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
 ```
 
 It goes on past a target that fails and lists the failures at the end.
 It fails without running any targets if `cargo fuzz list` fails or
-lists no targets. `fuzz/tests/run_all.sh` tests the sweep with a stub
+lists no targets. `bash fuzz/tests/run_all.sh` tests discovery failures,
+shard coverage, argument validation and failure reporting with a stub
 cargo, and CI runs it.
 Every target needs a `[[bin]]` in `fuzz/Cargo.toml` and a directory in
 `fuzz/corpus/`, even an empty one. `fuzz/check-targets.sh` checks both,

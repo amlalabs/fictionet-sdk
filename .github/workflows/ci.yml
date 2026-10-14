@@ -211,11 +211,19 @@ jobs:
         run: cargo +1.91 check --locked --workspace --all-targets
 
   fuzz:
-    name: fuzz (build; 60 s per target nightly)
+    name: fuzz (shard ${{ matrix.shard }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
-    # Scheduled and manual runs allow for about 135 targets at 60 s each
-    # and the build. Other runs allow 45 minutes for the build and checks.
-    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 200 || 45 }}
+    # Four scheduled/manual shards each build and run about 34 targets at 60 s
+    # each. Pushes and PRs have one job that builds and checks every target.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 90 || 45 }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '[0,1,2,3]' || '[0]') }}
+    env:
+      FUZZ_SHARD_INDEX: ${{ matrix.shard }}
+      FUZZ_SHARD_COUNT: ${{ strategy.job-total }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -230,16 +238,17 @@ jobs:
         run: cargo install cargo-fuzz --locked
       # +nightly overrides the stable toolchain pinned in rust-toolchain.toml.
       - name: Build the targets
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
         run: cargo +nightly fuzz build -O -a
-      # Runs every target, even after one fails, and fails at the end if any did.
-      - name: Run each target for 60 seconds
+      # Builds and runs only this shard, continuing after individual failures.
+      - name: Run each selected target for 60 seconds
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: fuzz/run-all.sh 60 -timeout=20 -rss_limit_mb=4096
       - name: Keep what a target found
         if: failure() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-artifacts
+          name: fuzz-artifacts-${{ matrix.shard }}
           path: fuzz/artifacts
 
   docker:

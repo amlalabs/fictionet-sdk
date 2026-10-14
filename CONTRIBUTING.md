@@ -48,9 +48,13 @@ $ cargo clippy --locked --lib --no-default-features --target wasm32-unknown-unkn
 ```
 
 CI also checks that the crate builds with Rust 1.91, the minimum version in
-`Cargo.toml`. On pushes and pull requests, CI builds every fuzz target and
-runs `fuzz/check-targets.sh`. Nightly and manual runs also run every target
-for 60 seconds.
+`Cargo.toml`. On pushes and pull requests, CI builds every fuzz target in
+one job and runs `fuzz/check-targets.sh`. Nightly and manual runs use four
+concurrent shard jobs on GitHub's `ubuntu-latest` runners. Each job builds
+and runs its assigned targets for 60 seconds each. A failed target or shard
+does not stop the others. Crash artifacts are named `fuzz-artifacts-0`
+through `fuzz-artifacts-3`. See [fuzz/README.md](fuzz/README.md) for running
+a shard locally.
 
 CI also runs the fuzz helper library's regression tests on the pinned stable
 toolchain. Run this command from the repository root:
