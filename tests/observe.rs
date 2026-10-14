@@ -23,10 +23,11 @@ fn temp_socket() -> String {
     dir.join("world.sock").to_str().unwrap().to_owned()
 }
 
-#[test]
-fn an_observer_times_out_when_an_accepted_connection_never_answers_hello() {
-    let path = temp_socket();
-    let (addr, len) = unix::address(std::path::Path::new(&path)).unwrap();
+fn observer_connection<T: Send + 'static>(
+    path: &str,
+    connect: impl FnOnce() -> T + Send + 'static,
+) -> (std::thread::JoinHandle<T>, OwnedFd) {
+    let (addr, len) = unix::address(std::path::Path::new(path)).unwrap();
     // SAFETY: the socket is owned from here; addr is valid for len bytes.
     let listener = unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
@@ -36,12 +37,7 @@ fn an_observer_times_out_when_an_accepted_connection_never_answers_hello() {
         assert_eq!(libc::listen(fd, 1), 0);
         listener
     };
-    let (tx, rx) = std::sync::mpsc::channel();
-    let client_path = path.clone();
-    let thread = std::thread::spawn(move || {
-        tx.send(Client::connect(&client_path, "silent-peer").err())
-            .unwrap();
-    });
+    let thread = std::thread::spawn(connect);
     // SAFETY: accept needs no address output; the returned fd is owned here.
     let peer = unsafe {
         let fd = libc::accept(
@@ -52,6 +48,107 @@ fn an_observer_times_out_when_an_accepted_connection_never_answers_hello() {
         assert!(fd >= 0);
         OwnedFd::from_raw_fd(fd)
     };
+    (thread, peer)
+}
+
+fn observer_peer(greeting: &[u8]) -> (Result<Client, String>, OwnedFd) {
+    let path = temp_socket();
+    let client_path = path.clone();
+    let (thread, peer) =
+        observer_connection(&path, move || Client::connect(&client_path, "frame-limit"));
+    for option in [libc::SO_SNDTIMEO, libc::SO_RCVTIMEO] {
+        unix::set_timeout(peer.as_raw_fd(), option, Some(Duration::from_secs(5))).unwrap();
+    }
+    let mut buf = vec![0; relay::MAX_MESSAGE + 1];
+    let n = unix::recv(peer.as_raw_fd(), &mut buf, false).unwrap();
+    assert!(matches!(relay::decode(&buf[..n]), Ok(Message::Hello(_))));
+    unix::send(peer.as_raw_fd(), greeting, false).unwrap();
+    let client = thread.join().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(std::path::Path::new(&path).parent().unwrap()).unwrap();
+    (client, peer)
+}
+
+#[test]
+fn observer_accepts_a_reply_at_the_message_limit() {
+    let (client, peer) = observer_peer(&Message::Accept.encode());
+    let mut client = client.unwrap();
+    client.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    let body = vec![42; relay::MAX_REPLY_CHUNK];
+    let frame = Message::Reply {
+        id: 7,
+        flags: relay::BINARY | relay::END,
+        body: &body,
+    }
+    .encode();
+    assert_eq!(frame.len(), relay::MAX_MESSAGE);
+    unix::send(peer.as_raw_fd(), &frame, false).unwrap();
+    let value = client.next_value().unwrap().unwrap();
+    assert_eq!(value.id, 7);
+    assert_eq!(value.bytes, body);
+    assert!(value.binary && value.end);
+}
+
+#[test]
+fn observer_closes_on_oversized_or_truncated_replies() {
+    for extra in [1, 2] {
+        let (client, peer) = observer_peer(&Message::Accept.encode());
+        let mut client = client.unwrap();
+        client.set_timeout(Some(Duration::from_secs(5))).unwrap();
+        let frame = Message::Reply {
+            id: 7,
+            flags: relay::BINARY | relay::END,
+            body: &vec![42; relay::MAX_REPLY_CHUNK + extra],
+        }
+        .encode();
+        unix::send(peer.as_raw_fd(), &frame, false).unwrap();
+        let error = client.next_value().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData,
+            "{extra} bytes over the limit"
+        );
+        assert_eq!(
+            error.to_string(),
+            "the world sent a message longer than 65,536 bytes"
+        );
+        assert_eq!(unix::recv(peer.as_raw_fd(), &mut [0; 1], false).unwrap(), 0);
+    }
+}
+
+#[test]
+fn observer_closes_on_malformed_replies() {
+    let (client, peer) = observer_peer(&Message::Accept.encode());
+    let mut client = client.unwrap();
+    client.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    unix::send(peer.as_raw_fd(), &[relay::REPLY], false).unwrap();
+    assert_eq!(
+        client.next_value().unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(unix::recv(peer.as_raw_fd(), &mut [0; 1], false).unwrap(), 0);
+}
+
+#[test]
+fn observer_rejects_oversized_or_truncated_greetings() {
+    for extra in [1, 2] {
+        let greeting = Message::Refuse("x".repeat(relay::MAX_MESSAGE - 1 + extra)).encode();
+        let (client, peer) = observer_peer(&greeting);
+        let error = client.err().unwrap();
+        assert_eq!(error, "the world sent a message longer than 65,536 bytes");
+        assert_eq!(unix::recv(peer.as_raw_fd(), &mut [0; 1], false).unwrap(), 0);
+    }
+}
+
+#[test]
+fn an_observer_times_out_when_an_accepted_connection_never_answers_hello() {
+    let path = temp_socket();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let client_path = path.clone();
+    let (thread, peer) = observer_connection(&path, move || {
+        tx.send(Client::connect(&client_path, "silent-peer").err())
+            .unwrap();
+    });
     unix::set_timeout(
         peer.as_raw_fd(),
         libc::SO_RCVTIMEO,

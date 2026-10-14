@@ -133,8 +133,11 @@ impl Message<'_> {
     }
 }
 
-/// Reads one message.
+/// Reads one message. Messages longer than [`MAX_MESSAGE`] are malformed.
 pub fn decode(message: &[u8]) -> Result<Message<'_>, DecodeError> {
+    if message.len() > MAX_MESSAGE {
+        return Err(DecodeError::BadBody);
+    }
     let (&kind, body) = message.split_first().ok_or(DecodeError::Empty)?;
     match kind {
         AUTH => Ok(Message::Auth(body)),
@@ -375,8 +378,10 @@ pub mod unix {
     }
 
     /// Receives one datagram into `buf`. `Ok(0)` means the other side
-    /// closed. A datagram longer than `buf` is cut short, so `buf` should
-    /// hold [`MAX_MESSAGE`] bytes.
+    /// closed. A datagram longer than `buf` is cut to `buf.len()` bytes,
+    /// so callers pass [`MAX_MESSAGE`] + 1 bytes. A length above
+    /// [`MAX_MESSAGE`] marks an oversized or truncated message, which
+    /// [`decode`] rejects.
     pub fn recv(fd: RawFd, buf: &mut [u8], nonblocking: bool) -> io::Result<usize> {
         let flags = if nonblocking { libc::MSG_DONTWAIT } else { 0 };
         loop {
@@ -460,6 +465,9 @@ pub mod observer {
             };
             let n = unix::recv(client.fd.as_raw_fd(), &mut client.buf, false)
                 .map_err(handshake_error)?;
+            if n > MAX_MESSAGE {
+                return Err("the world sent a message longer than 65,536 bytes".into());
+            }
             match decode(&client.buf[..n]) {
                 Ok(Message::Accept) => {
                     for option in [libc::SO_SNDTIMEO, libc::SO_RCVTIMEO] {
@@ -492,15 +500,24 @@ pub mod observer {
         }
 
         /// Waits for the next whole value, of any request. `None` once the
-        /// world has closed the session.
+        /// world has closed the session. A malformed, oversized or truncated
+        /// reply shuts down the session and returns `InvalidData`.
         pub fn next_value(&mut self) -> io::Result<Option<Value>> {
             let mut value: Option<Value> = None;
             loop {
                 let n = unix::recv(self.fd.as_raw_fd(), &mut self.buf, false)?;
+                if n > MAX_MESSAGE {
+                    unix::shutdown(self.fd.as_raw_fd());
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the world sent a message longer than 65,536 bytes",
+                    ));
+                }
                 if n == 0 {
                     return Ok(None);
                 }
                 let Ok(Message::Reply { id, flags, body }) = decode(&self.buf[..n]) else {
+                    unix::shutdown(self.fd.as_raw_fd());
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "not a reply"));
                 };
                 let v = value.get_or_insert_with(|| Value {
@@ -602,6 +619,17 @@ pub mod observer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_enforces_the_message_limit() {
+        for kind in [AUTH, REFUSE, PACKET, REQUEST, REPLY] {
+            let mut frame = vec![b'x'; MAX_MESSAGE];
+            frame[0] = kind;
+            assert!(decode(&frame).is_ok());
+            frame.push(b'x');
+            assert_eq!(decode(&frame), Err(DecodeError::BadBody));
+        }
+    }
 
     #[test]
     fn observer_messages_round_trip() {

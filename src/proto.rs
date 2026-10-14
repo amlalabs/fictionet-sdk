@@ -125,6 +125,7 @@
 //! ids, and must not reuse one while it is still being answered. What the
 //! requests ask for, and what the replies say, is the
 //! [observe API](crate::observe#the-api).
+//! The observer closes the session on a malformed or oversized reply.
 //!
 //! ```text
 //!   kind     id        a JSON object
