@@ -22,6 +22,12 @@
 //! and where uploaded files go, is up to world code.
 //! Write raw HTTP bodies with [`Body`] and choose the multipart subtype in
 //! the HTTP header. [`Entity`] writes complete `multipart/mixed` MIME entities.
+//! MIME header accessors, [`boundary`], and [`Entity`] treat comments as
+//! spaces. Nested comments and backslash escapes are allowed. Parentheses
+//! in quoted values stay literal. Raw values are bounded before comments
+//! are removed. Spaces and tabs around the media type's slash are removed.
+//! [`ParamValue`] itself does not interpret MIME comments or normalize
+//! spaces around the slash.
 //!
 //! Every reader checks lengths and counts, because the agent can send any
 //! bytes it likes. The limits are the `MAX_` constants below. A writer
@@ -183,18 +189,13 @@ pub fn valid_boundary(b: &str) -> bool {
 /// boundary split into RFC 2231 continuations (`boundary*0="ab";
 /// boundary*1="cd"`) is joined. The value is `None` if the pieces skip a
 /// number, use the encoded form (`boundary*0*`), or come with a plain
-/// `boundary` as well.
+/// `boundary` as well. CR or LF and unbalanced comments return `None`.
 pub fn boundary(content_type: &str) -> Option<String> {
-    if content_type.len() > MAX_HEADER_BYTES {
-        return None;
-    }
-    let cleaned = strip_comments(content_type)?;
-    let v = ParamValue::parse_text(&cleaned)?;
+    boundary_value(&parse_mime_value(content_type)?)
+}
+
+fn boundary_value(v: &ParamValue) -> Option<String> {
     let (top, sub) = v.value.split_once('/')?;
-    let (top, sub) = (
-        top.trim_end_matches(is_wsp_char),
-        sub.trim_start_matches(is_wsp_char),
-    );
     if !top.eq_ignore_ascii_case("multipart") || sub.is_empty() || !sub.bytes().all(is_token) {
         return None;
     }
@@ -231,9 +232,24 @@ pub fn boundary(content_type: &str) -> Option<String> {
     valid_boundary(&b).then_some(b)
 }
 
+fn parse_mime_value(s: &str) -> Option<ParamValue> {
+    if s.len() > MAX_HEADER_BYTES || s.contains(['\r', '\n']) {
+        return None;
+    }
+    let mut v = ParamValue::parse_text(&strip_comments(s)?)?;
+    if let Some((top, sub)) = v.value.split_once('/') {
+        v.value = format!(
+            "{}/{}",
+            top.trim_end_matches(is_wsp_char),
+            sub.trim_start_matches(is_wsp_char),
+        );
+    }
+    Some(v)
+}
+
 /// `s` with each comment, text in balanced parentheses outside a quoted
 /// string, turned into one space, as RFC 822 reads structured headers.
-/// It returns `None` if a comment is not closed.
+/// It returns `None` if comment parentheses are unbalanced.
 fn strip_comments(s: &str) -> Option<String> {
     let mut out = String::with_capacity(s.len());
     let mut depth = 0usize;
@@ -267,6 +283,7 @@ fn strip_comments(s: &str) -> Option<String> {
         } else {
             match c {
                 '(' => depth = 1,
+                ')' => return None,
                 '"' => {
                     quoted = true;
                     out.push(c);
@@ -298,6 +315,8 @@ pub fn content_type(subtype: &str, boundary: &str) -> Option<ParamValue> {
 
 /// A header value with parameters, as in `Content-Type` and
 /// `Content-Disposition`: `form-data; name="field"; filename="a.txt"`.
+/// Its [`Wire`] parser does not interpret MIME comments. Use the
+/// [`Headers`] accessors when reading MIME fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParamValue {
     /// The text before the first semicolon, without surrounding spaces,
@@ -524,14 +543,19 @@ impl Headers {
     /// The `Content-Type` field, read with its parameters. It is `None` if
     /// the part has no such field or has it twice, since readers that take
     /// the first and readers that take the last would disagree.
+    /// Comments outside quotes are read as spaces. Spaces and tabs around
+    /// the media type's slash are removed. Unbalanced comments,
+    /// malformed parameters, CR or LF, and values longer than
+    /// [`MAX_HEADER_BYTES`] before removing comments return `None`.
     pub fn content_type(&self) -> Option<ParamValue> {
-        ParamValue::parse_text(self.get_one("content-type")?)
+        parse_mime_value(self.get_one("content-type")?)
     }
 
     /// The `Content-Disposition` field, read with its parameters. It is
     /// `None` if the part has no such field or has it twice.
+    /// Comments, slash spacing, and limits are handled as in [`Self::content_type`].
     pub fn content_disposition(&self) -> Option<ParamValue> {
-        ParamValue::parse_text(self.get_one("content-disposition")?)
+        parse_mime_value(self.get_one("content-disposition")?)
     }
 }
 
@@ -1199,20 +1223,16 @@ impl Wire for Entity {
             return Err(Error::Header);
         }
         let value = headers.get("content-type").ok_or(Error::Header)?;
-        let cleaned = strip_comments(value).ok_or(Error::Header)?;
-        let content_type = ParamValue::parse(cleaned.as_bytes())?;
+        let content_type = parse_mime_value(value).ok_or(Error::Header)?;
+        content_type.header_text().map_err(|_| Error::Header)?;
         let (top, sub) = content_type.value.split_once('/').ok_or(Error::Header)?;
-        if !top
-            .trim_end_matches(is_wsp_char)
-            .eq_ignore_ascii_case("multipart")
-            || !sub
-                .trim_start_matches(is_wsp_char)
-                .eq_ignore_ascii_case("mixed")
+        if !top.eq_ignore_ascii_case("multipart")
+            || !sub.eq_ignore_ascii_case("mixed")
             || content_type.params.len() != 1
         {
             return Err(Error::Header);
         }
-        let boundary = boundary(value).ok_or(Error::Boundary)?;
+        let boundary = boundary_value(&content_type).ok_or(Error::Boundary)?;
         let multipart = Multipart::parse(input.get(end..).unwrap_or_default(), &boundary)?;
         let entity = Self {
             boundary,
@@ -2338,7 +2358,114 @@ Content-Type: text/plain
             nested_comments: "(a (nested) \\) one) multipart/mixed (x); boundary=\"(q)\"" => Some("(q)"),
         );
         assert_eq!(boundary("multipart/mixed; boundary=b (open"), None);
+        assert_eq!(
+            boundary("multipart/mixed; boundary=b (hidden\r\nline)"),
+            None
+        );
+        assert_eq!(boundary("multipart/mixed; boundary=b )"), None);
         assert_eq!(boundary("multi(x)part/mixed; boundary=b"), None);
+    }
+
+    #[test]
+    fn header_accessors_comments() {
+        for value in [
+            "text/plain; charset=us-ascii (Plain text)",
+            r"(outer (nested) \) end) text/plain (type); charset (name) = (value) us-ascii",
+        ] {
+            let input = format!("Content-Type: {value}\r\n\r\nhello");
+            let part = Part::parse(input.as_bytes()).unwrap();
+            let parsed = part.headers.content_type().unwrap();
+            assert_eq!(parsed.value, "text/plain");
+            assert_eq!(parsed.get("charset"), Some("us-ascii"));
+            assert_eq!(part.headers.get("content-type"), Some(value));
+            contract::check_wire_value(&part);
+        }
+        let part = Part::parse(
+            b"Content-Disposition: form-data (form); name=field (name); filename=\"a(1).txt\" (file)\r\n\r\nx",
+        )
+        .unwrap();
+        assert_eq!(part.name().as_deref(), Some("field"));
+        assert_eq!(part.filename().as_deref(), Some("a(1).txt"));
+        contract::check_wire_value(&part);
+    }
+
+    #[test]
+    fn header_accessors_media_type_spacing() {
+        for value in [
+            "text (x)/plain; charset=us-ascii",
+            "text / plain; charset=us-ascii",
+            "text\t/\tplain; charset=us-ascii",
+            r"text (outer (nested) \) end) / (subtype) plain; charset=us-ascii",
+        ] {
+            let input = format!("Content-Type: {value}\r\n\r\nhello");
+            let part = Part::parse(input.as_bytes()).unwrap();
+            let parsed = part.headers.content_type().unwrap();
+            assert_eq!(parsed.value, "text/plain");
+            assert_eq!(parsed.get("charset"), Some("us-ascii"));
+            assert_eq!(part.headers.get("content-type"), Some(value));
+            contract::check_wire_value(&part);
+        }
+        let value = ParamValue::parse(b"text / plain (literal); name=\"a / (b)\"").unwrap();
+        assert_eq!(value.value, "text / plain (literal)");
+        assert_eq!(value.get("name"), Some("a / (b)"));
+        contract::check_wire_value(&value);
+    }
+
+    #[test]
+    fn header_comments_limits_and_errors() {
+        for name in ["Content-Type", "Content-Disposition"] {
+            let read = |value: &str| {
+                let headers = Headers {
+                    fields: vec![(name.into(), value.into())],
+                };
+                if name == "Content-Type" {
+                    headers.content_type()
+                } else {
+                    headers.content_disposition()
+                }
+            };
+            for value in [
+                "text/plain (open",
+                "text/plain (escaped end\\)",
+                "text/plain; charset=us-ascii (open",
+                "text/plain (stray) )",
+                "text/plain (hidden\r\nline)",
+                "text/plain; charset=us-ascii (note); CHARSET=utf-8",
+            ] {
+                assert_eq!(read(value), None, "{name}: {value:?}");
+            }
+            let prefix = "multipart/mixed; boundary=b (";
+            let value = format!(
+                "{prefix}{})",
+                "x".repeat(MAX_HEADER_BYTES - prefix.len() - 1)
+            );
+            assert!(read(&value).is_some());
+            assert_eq!(boundary(&value).as_deref(), Some("b"));
+            assert_eq!(read(&format!("{value} ")), None);
+            assert_eq!(boundary(&format!("{value} ")), None);
+            let params = (0..MAX_PARAMETERS)
+                .map(|i| format!("; p{i}=v (note)"))
+                .collect::<String>();
+            assert!(read(&format!("text/plain{params}")).is_some());
+            assert_eq!(read(&format!("text/plain{params}; extra=v")), None);
+            let input = format!("{name}: text/plain (note)\r\n{name}: text/html\r\n\r\n");
+            let part = Part::parse(input.as_bytes()).unwrap();
+            assert_eq!(part.headers.content_type(), None);
+            assert_eq!(part.headers.content_disposition(), None);
+            contract::check_wire_value(&part);
+        }
+    }
+
+    #[test]
+    fn generic_parameters_preserve_parentheses() {
+        let value = ParamValue::parse(b"text/plain (literal); name=\"a(1)\\\".txt\"").unwrap();
+        assert_eq!(value.value, "text/plain (literal)");
+        assert_eq!(value.get("name"), Some("a(1)\".txt"));
+        contract::check_wire_value(&value);
+        assert_eq!(
+            ParamValue::parse(b"text/plain; charset=us-ascii (comment)"),
+            Err(Error::Header)
+        );
     }
 
     #[test]
@@ -2359,6 +2486,7 @@ Content-Type: text/plain
             "multi(x)part/mixed; boundary=b",
             "multipart/form-data; boundary=b (comment)",
             "multipart/mixed; boundary=b; x=y (comment)",
+            "multipart/mixed; boundary=b (note)\r\nContent-Type: multipart/mixed; boundary=b",
         ] {
             let input = format!("Content-Type: {value}\r\n\r\n--b--");
             assert_eq!(Entity::parse(input.as_bytes()), Err(Error::Header));

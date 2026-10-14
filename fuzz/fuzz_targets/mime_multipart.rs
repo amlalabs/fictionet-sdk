@@ -5,8 +5,8 @@ use fictionet::stdlib::codec::{Decode, Fail, Wire};
 use fictionet::stdlib::test_support::contract;
 
 use fictionet::stdlib::mime_multipart::{
-    Body, Entity, Error, Headers, MAX_ENTITY, Multipart, ParamValue, Part, Parts, boundary,
-    valid_boundary,
+    Body, Entity, Error, Headers, MAX_ENTITY, MAX_HEADER_BYTES, Multipart, ParamValue, Part, Parts,
+    boundary, valid_boundary,
 };
 use fictionet::stdlib::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
@@ -82,9 +82,30 @@ fuzz_target!(|input: &[u8]| {
             contract::check_wire_value(&entity);
         }
     }
-    if let Ok(text) = std::str::from_utf8(data)
-        && let Some(bnd) = boundary(text)
-    {
-        assert!(valid_boundary(&bnd));
+    if let Ok(text) = std::str::from_utf8(data) {
+        let headers = Headers {
+            fields: vec![
+                ("Content-Type".into(), text.into()),
+                ("Content-Disposition".into(), text.into()),
+            ],
+        };
+        assert_eq!(headers.content_type(), headers.content_disposition());
+        if let Some(bnd) = boundary(text) {
+            assert!(valid_boundary(&bnd));
+            assert!(headers.content_type().is_some());
+        }
+        if data.len() <= MAX_HEADER_BYTES {
+            let comment = text
+                .replace('\\', "\\\\")
+                .replace('(', "\\(")
+                .replace(')', "\\)");
+            let value = format!("multipart/mixed; boundary=b ({comment})");
+            let headers = Headers {
+                fields: vec![("Content-Type".into(), value.clone())],
+            };
+            assert_eq!(headers.content_type().is_some(), boundary(&value).is_some());
+            let input = format!("Content-Type: {value}\r\n\r\n--b--");
+            contract::check_wire::<Entity>(input.as_bytes());
+        }
     }
 });
