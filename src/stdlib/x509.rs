@@ -30,6 +30,10 @@
 //! bytes it likes. Every list has a named limit, such as
 //! [`MAX_EXTENSIONS`]. Every writer reads its own output back before it
 //! returns it, so it never returns bytes a reader here refuses.
+//! EC public keys require one curve OID as their algorithm parameters.
+//! Ed25519 and ECDSA with SHA256 or SHA384 require absent parameters.
+//! Unknown algorithms keep an optional opaque DER parameter element;
+//! unknown curve OIDs are accepted. These rules apply on read and write.
 //!
 //! Readers relax a few rules that real certificates break. A field
 //! written out at its default value (a critical flag or a cA flag of
@@ -389,6 +393,10 @@ impl Version {
 
 /// An algorithm and its parameters, as a signature or a public key names
 /// them.
+///
+/// EC public keys require a curve OID. Ed25519 and ECDSA with SHA256 or
+/// SHA384 require absent parameters. Other algorithms keep an optional
+/// opaque DER element. Curve OIDs need not be known to this module.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AlgorithmIdentifier {
     /// The algorithm, such as [`oid::ECDSA_WITH_SHA256`].
@@ -412,13 +420,18 @@ fn read_alg(r: &mut Reader<'_>) -> Result<AlgorithmIdentifier, Error> {
     // The parameters the algorithms named in [`oid`] require: none for
     // Ed25519 (RFC 8410 section 3) and ECDSA signatures (RFC 5758 section
     // 3.2), and a curve for an EC public key (RFC 5480 section 2.1.1).
-    let needs = match oid.as_bytes() {
-        oid::ED25519 | oid::ECDSA_WITH_SHA256 => Some(false),
-        oid::EC_PUBLIC_KEY => Some(true),
-        _ => None,
-    };
-    if needs.is_some_and(|n| n != parameters.is_some()) {
-        return Err(Error::Value);
+    match oid.as_bytes() {
+        oid::ED25519 | oid::ECDSA_WITH_SHA256 | oid::ECDSA_WITH_SHA384 => {
+            if parameters.is_some() {
+                return Err(Error::Value);
+            }
+        }
+        oid::EC_PUBLIC_KEY => {
+            let mut p = Reader::new(parameters.as_deref().ok_or(Error::Value)?, Rules::Der);
+            p.read_oid()?;
+            p.finish()?;
+        }
+        _ => {}
     }
     Ok(AlgorithmIdentifier { oid, parameters })
 }
@@ -4919,6 +4932,92 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             .to_bytes(),
             Err(Error::Value)
         );
+    }
+
+    #[test]
+    fn ec_public_key_parameters_must_be_one_curve_oid() {
+        let malformed = [
+            0x30, 0x12, 0x30, 0x0b, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x05,
+            0x00, 0x03, 0x03, 0x00, 0x01, 0x02,
+        ];
+        assert!(PublicKeyInfo::parse(&malformed).is_err());
+        for parameters in [
+            vec![],
+            vec![0x05, 0x00],
+            vec![0x02, 0x01, 0x01],
+            vec![0x06, 0x00],
+            vec![0x06, 0x01, 0x80],
+            vec![0x06, 0x02, 0x80, 0x01],
+            vec![0x06, 0x01, 0x2a, 0x06, 0x01, 0x2b],
+        ] {
+            // Keep the SPKI framing valid even when the parameters are not.
+            let mut der = vec![
+                0x30,
+                16 + parameters.len() as u8,
+                0x30,
+                9 + parameters.len() as u8,
+            ];
+            der.extend_from_slice(&malformed[4..13]);
+            der.extend_from_slice(&parameters);
+            der.extend_from_slice(&malformed[15..]);
+            assert!(PublicKeyInfo::parse(&der).is_err(), "{parameters:?}");
+            let key = PublicKeyInfo {
+                algorithm: AlgorithmIdentifier {
+                    oid: oid(oid::EC_PUBLIC_KEY),
+                    parameters: if parameters.is_empty() {
+                        None
+                    } else {
+                        Some(parameters)
+                    },
+                },
+                key: BitString::new(vec![1, 2], 0).unwrap(),
+            };
+            let mut out = vec![1, 2, 3];
+            assert!(key.write(&mut out).is_err());
+            assert_eq!(out, [1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn ecdsa_sha384_parameters_must_be_absent() {
+        let mut tbs = sample_tbs();
+        tbs.signature = AlgorithmIdentifier {
+            oid: oid(oid::ECDSA_WITH_SHA384),
+            parameters: Some(vec![0x05, 0x00]),
+        };
+        let der = build(|w| tbs.write_fields(w)).unwrap();
+        assert_eq!(TbsCertificate::parse(&der), Err(Error::Value));
+        let mut out = vec![1, 2, 3];
+        assert_eq!(tbs.write(&mut out), Err(Error::Value));
+        assert_eq!(out, [1, 2, 3]);
+        tbs.signature.parameters = None;
+        let der = tbs.to_bytes().unwrap();
+        assert_eq!(TbsCertificate::parse(&der).unwrap(), tbs);
+    }
+
+    #[test]
+    fn unknown_algorithms_and_curve_oids_stay_opaque() {
+        let unknown = oid(&[0x2a, 0x03, 0x04]);
+        for parameters in [None, Some(vec![0x05, 0x00]), Some(vec![0x02, 0x01, 0x01])] {
+            let key = PublicKeyInfo {
+                algorithm: AlgorithmIdentifier {
+                    oid: unknown.clone(),
+                    parameters,
+                },
+                key: BitString::new(vec![1, 2], 0).unwrap(),
+            };
+            assert_eq!(PublicKeyInfo::parse(&key.to_bytes().unwrap()).unwrap(), key);
+        }
+        for curve in [oid(oid::PRIME256V1), unknown] {
+            let key = PublicKeyInfo {
+                algorithm: AlgorithmIdentifier {
+                    oid: oid(oid::EC_PUBLIC_KEY),
+                    parameters: Some(build(|w| w.oid(&curve)).unwrap()),
+                },
+                key: BitString::new(vec![1, 2], 0).unwrap(),
+            };
+            assert_eq!(PublicKeyInfo::parse(&key.to_bytes().unwrap()).unwrap(), key);
+        }
     }
 
     #[test]
