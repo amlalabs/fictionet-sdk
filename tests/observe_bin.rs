@@ -238,8 +238,8 @@ fn the_dashboard_serves_the_app_and_carries_its_api_calls() {
     );
     let (status, body) = get(port, "/");
     assert_eq!(status, "HTTP/1.1 200 OK");
-    assert!(body.contains("app.js"));
-    assert_eq!(get(port, "/app.js").0, "HTTP/1.1 200 OK");
+    assert!(body.contains("app.mjs"));
+    assert_eq!(get(port, "/app.mjs").0, "HTTP/1.1 200 OK");
 
     // An API call becomes an observe request.
     let (status, body) = get(port, "/api/graph");
@@ -373,7 +373,7 @@ fn the_dashboard_merges_the_packets_of_several_links() {
         .parse()
         .unwrap();
     std::fs::remove_file(&token_file).unwrap();
-    assert_eq!(get(port, "/groups.js").0, "HTTP/1.1 200 OK");
+    assert_eq!(get(port, "/groups.mjs").0, "HTTP/1.1 200 OK");
 
     // The two links, and the group their echo tasks are in.
     let mut graph = String::new();

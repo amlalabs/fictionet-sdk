@@ -1,10 +1,10 @@
-// Tests for groups.js: `node --test dashboard/groups.test.js`. The Rust
+// Tests for groups.mjs: `node --test dashboard/groups.test.mjs`. The Rust
 // test `dashboard_js` runs them when node is installed.
 'use strict';
 
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const G = require('./groups.js');
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { FictionetGroups as G } from './groups.mjs';
 
 // A small world: a router, and a group "office" with a nested group
 // "printer". The sandbox is read by a delay in the group "uplink".

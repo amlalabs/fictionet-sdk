@@ -1,4 +1,4 @@
-//! The dashboard's own JavaScript tests (`dashboard/groups.test.js`), run
+//! The dashboard's own JavaScript tests (`dashboard/groups.test.mjs`), run
 //! with node. Skipped, with a note, where node is not installed, except
 //! under CI (`CI` set), where a missing node fails the test.
 
@@ -8,7 +8,7 @@ use std::process::Command;
 fn dashboard_js() {
     let dir = env!("CARGO_MANIFEST_DIR");
     let out = match Command::new("node")
-        .args(["--test", "dashboard/groups.test.js"])
+        .args(["--test", "dashboard/"])
         .current_dir(dir)
         .output()
     {
