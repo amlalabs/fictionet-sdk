@@ -141,6 +141,8 @@ jobs:
       - name: The Inspect package
         working-directory: python/inspect_fictionet
         run: uv run --locked --extra k8s pytest
+      - name: Inspect Kubernetes scorer regressions
+        run: uv run --project python/inspect_fictionet --locked --extra k8s python -m unittest discover -s tests/k8s -p 'test_*.py'
       # From the crate root, so rust-toolchain.toml there, not fuzz/'s
       # nightly, picks the toolchain.
       - name: The fuzz crate on stable
