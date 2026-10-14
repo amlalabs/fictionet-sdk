@@ -42,7 +42,8 @@
 //!
 //! Writers refuse with [`Error::Unwritable`] any value that cannot be
 //! preserved in its version, including excess lengths, invalid tags, and
-//! non-default fields that version lacks.
+//! non-default fields that version lacks. Bounded body appends also return
+//! this error if output storage cannot be reserved.
 //!
 //! ```
 //! use fictionet::stdlib::codec::Frames;
@@ -79,8 +80,8 @@ use fictionet::stdlib::codec::Frames;
 extern crate alloc;
 
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
-use fictionet::stdlib::codec::leb128;
 use fictionet::stdlib::codec::{Reader, Trailing, Truncated, Wire};
+use fictionet::stdlib::codec::{append_bounded, leb128};
 
 /// The TCP port Kafka brokers listen on.
 pub const PORT: u16 = 9092;
@@ -584,10 +585,8 @@ impl Writer {
     }
 
     fn raw(&mut self, bytes: &[u8]) {
-        if self.failed || bytes.len() > self.limit.saturating_sub(self.out.len()) {
+        if self.failed || append_bounded::<()>(bytes, 1, &mut self.out, self.limit).is_err() {
             self.failed = true;
-        } else {
-            self.out.extend_from_slice(bytes);
         }
     }
 
@@ -2259,6 +2258,28 @@ mod tests {
             Reader::new(&[]).i64_be().map_err(Error::from),
             Err(Error::Truncated)
         );
+    }
+
+    #[test]
+    fn bounded_appends_keep_the_first_failure() {
+        let mut writer = Writer {
+            limit: 4,
+            ..Writer::new()
+        };
+        writer.raw(b"ab");
+        writer.raw(b"cd");
+        writer.raw(b"");
+        assert!(!writer.failed);
+        assert_eq!(writer.out, b"abcd");
+        let capacity = writer.out.capacity();
+        writer.raw(b"e");
+        assert!(writer.failed);
+        writer.limit = 8;
+        writer.raw(b"f");
+        writer.raw(b"");
+        assert_eq!(writer.out, b"abcd");
+        assert_eq!(writer.out.capacity(), capacity);
+        assert_eq!(writer.finish(), Err(Error::Unwritable));
     }
 
     #[test]

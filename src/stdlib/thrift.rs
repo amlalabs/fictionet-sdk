@@ -33,7 +33,9 @@
 //!
 //! Every reader checks lengths, counts and nesting against the limits
 //! below, because the agent can send any bytes it likes. Every writer
-//! checks the same limits, so what it writes always reads back.
+//! checks the same limits, so what it writes always reads back. Bounded
+//! value appends return [`Error::Unwritable`] if output storage cannot be
+//! reserved.
 //!
 //! [`Value`] implements `Drop` to release nested trees without recursion,
 //! including hand-built trees beyond [`MAX_DEPTH`]. `Clone`, `Debug`, and
@@ -99,8 +101,8 @@ use fictionet::stdlib::codec::Frames;
 extern crate alloc;
 
 use alloc::{string::String, vec, vec::Vec};
-use fictionet::stdlib::codec::leb128;
 use fictionet::stdlib::codec::{Decode, Reader as ByteReader, Step, Truncated, Wire, Work};
+use fictionet::stdlib::codec::{append_bounded, leb128};
 
 /// The TCP port Thrift servers commonly listen on.
 pub const PORT: u16 = 9090;
@@ -1432,11 +1434,9 @@ impl<'o> Writer<'o> {
     }
 
     fn raw(&mut self, bytes: &[u8]) {
-        if self.failed || bytes.len() > self.limit.saturating_sub(self.out.len()) {
+        if self.failed || append_bounded::<()>(bytes, 1, self.out, self.limit).is_err() {
             self.failed = true;
-            return;
         }
-        self.out.extend_from_slice(bytes);
     }
 
     fn byte(&mut self, byte: u8) {
@@ -2102,6 +2102,27 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn bounded_appends_keep_the_first_failure() {
+        let mut out = Vec::new();
+        let mut writer = Writer::new(&mut out, false);
+        writer.limit = 4;
+        writer.raw(b"ab");
+        writer.raw(b"cd");
+        writer.raw(b"");
+        assert!(!writer.failed);
+        assert_eq!(writer.out, b"abcd");
+        let capacity = writer.out.capacity();
+        writer.raw(b"e");
+        assert!(writer.failed);
+        writer.limit = 8;
+        writer.raw(b"f");
+        writer.raw(b"");
+        assert_eq!(writer.out, b"abcd");
+        assert_eq!(writer.out.capacity(), capacity);
+        assert_eq!(writer.check(), Err(Error::Unwritable));
     }
 
     #[test]

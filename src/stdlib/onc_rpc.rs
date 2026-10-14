@@ -377,6 +377,8 @@ impl<'a> Reader<'a> {
 
 /// Writes XDR values under the [`MAX_RECORD`] byte limit.
 /// Methods can be chained. The first error is returned by [`Writer::finish`].
+/// Bounded appends return [`Error::Allocation`] if output storage cannot be
+/// reserved, leaving the bytes written so far unchanged.
 #[derive(Clone, Debug, Default)]
 pub struct Writer {
     buf: Vec<u8>,
@@ -424,20 +426,26 @@ impl Writer {
     }
 
     /// Appends bytes within the record budget.
-    /// An error carries the total length the append would produce.
+    /// A size error carries the total length the append would produce.
     fn append(&mut self, bytes: &[u8]) {
         if self.error.is_some() {
             return;
         }
-        let total = self.buf.len().checked_add(bytes.len());
-        if total.is_none_or(|n| n > MAX_RECORD) {
-            let length = total
-                .and_then(|n| u32::try_from(n).ok())
-                .unwrap_or(u32::MAX);
-            self.reject(Error::TooLong(length));
-            return;
+        if let Err(error) = codec::append_bounded::<()>(bytes, 1, &mut self.buf, MAX_RECORD) {
+            let error = match error {
+                codec::RewriteError::Allocation => Error::Allocation,
+                _ => {
+                    let length = self
+                        .buf
+                        .len()
+                        .checked_add(bytes.len())
+                        .and_then(|n| u32::try_from(n).ok())
+                        .unwrap_or(u32::MAX);
+                    Error::TooLong(length)
+                }
+            };
+            self.reject(error);
         }
-        self.buf.extend_from_slice(bytes);
     }
 
     /// An unsigned integer: 4 bytes.
@@ -1473,6 +1481,32 @@ mod tests {
 
     fn message(xid: u32, body: Body) -> Message {
         Message { xid, body }
+    }
+
+    #[test]
+    fn bounded_appends_keep_attempted_length_and_first_error() {
+        let mut writer = Writer::new();
+        writer.append(&vec![7; MAX_RECORD - 1]);
+        writer.append(b"x");
+        writer.append(b"");
+        assert!(writer.error.is_none());
+        let capacity = writer.buf.capacity();
+        writer.append(b"y");
+        writer.append(b"ignored");
+        writer.append(b"");
+        assert_eq!(writer.buf.len(), MAX_RECORD);
+        assert_eq!(writer.buf[MAX_RECORD - 1], b'x');
+        assert_eq!(writer.buf.capacity(), capacity);
+        assert_eq!(
+            writer.finish(),
+            Err(Error::TooLong((MAX_RECORD + 1) as u32))
+        );
+
+        let mut writer = Writer::new();
+        writer.reject(Error::Unwritable);
+        writer.append(b"ignored");
+        assert!(writer.as_bytes().is_empty());
+        assert_eq!(writer.finish(), Err(Error::Unwritable));
     }
 
     #[test]

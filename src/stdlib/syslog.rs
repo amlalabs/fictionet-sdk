@@ -36,7 +36,8 @@
 //! the agent can send any bytes it likes, and no message may be longer
 //! than [`MAX_MESSAGE_LEN`]. The stream returns the bounded prefix of an
 //! oversized message and marks it truncated. Writers refuse values they
-//! cannot write unchanged.
+//! cannot write unchanged. Bounded message appends return
+//! [`Error::Unwritable`] if output storage cannot be reserved.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
@@ -82,7 +83,7 @@
 use fictionet::stdlib::codec::civil::days_in_month;
 use std::borrow::Cow;
 
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire, append_bounded};
 
 /// The UDP port syslog collectors listen on (RFC 5426). Plain TCP syslog
 /// has no assigned port and most collectors use 514 for it too.
@@ -1523,15 +1524,7 @@ fn write_sd_element(out: &mut Vec<u8>, id: &str, params: &[SdParam]) -> Result<(
 }
 
 fn append(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Error> {
-    if out
-        .len()
-        .checked_add(bytes.len())
-        .is_none_or(|n| n > MAX_MESSAGE_LEN)
-    {
-        return Err(Error::Unwritable);
-    }
-    out.extend_from_slice(bytes);
-    Ok(())
+    append_bounded::<()>(bytes, 1, out, MAX_MESSAGE_LEN).map_err(|_| Error::Unwritable)
 }
 
 fn valid_field(s: &str, max: usize, forbidden: &[u8]) -> bool {
@@ -2716,6 +2709,19 @@ mod tests {
         assert_eq!(stream.push(b"1x"), 2);
         assert!(stream.next().unwrap().is_err());
         assert_eq!(stream.push(&big), big.len());
+    }
+
+    #[test]
+    fn bounded_appends_leave_refused_output_unchanged() {
+        let mut out = vec![b'a'; MAX_MESSAGE_LEN - 1];
+        append(&mut out, b"b").unwrap();
+        append(&mut out, b"").unwrap();
+        let capacity = out.capacity();
+        assert_eq!(append(&mut out, b"c"), Err(Error::Unwritable));
+        assert_eq!(out.len(), MAX_MESSAGE_LEN);
+        assert!(out[..MAX_MESSAGE_LEN - 1].iter().all(|&byte| byte == b'a'));
+        assert_eq!(out[MAX_MESSAGE_LEN - 1], b'b');
+        assert_eq!(out.capacity(), capacity);
     }
 
     #[test]

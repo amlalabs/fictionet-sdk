@@ -34,7 +34,9 @@
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. Options nest at most [`MAX_DEPTH`] deep; deeper ones are
 //! kept as raw bytes. Writers refuse fields that cannot be written unchanged.
-//! A message that parses writes back to the same bytes.
+//! A message that parses writes back to the same bytes. Bounded option
+//! body appends return [`Error::Unwritable`] if output storage cannot be
+//! reserved.
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
@@ -75,7 +77,7 @@
 //! ```
 
 use core::convert::Infallible;
-use fictionet::stdlib::codec::{Frames, be32};
+use fictionet::stdlib::codec::{Frames, append_bounded, be32};
 use std::net::Ipv6Addr;
 
 use fictionet::stdlib::codec::{Decode, Step, Wire};
@@ -1454,13 +1456,9 @@ fn encode_body(o: &DhcpOption, depth: usize, max: usize) -> Option<Vec<u8>> {
 }
 
 /// Appends `data` if the body stays within `max` bytes, and otherwise
-/// returns `None`.
+/// returns `None`. Allocation refusal also returns `None`.
 fn push_fitting(out: &mut Vec<u8>, data: &[u8], max: usize) -> Option<()> {
-    if out.len().checked_add(data.len())? > max {
-        return None;
-    }
-    out.extend_from_slice(data);
-    Some(())
+    append_bounded::<()>(data, 1, out, max).ok()
 }
 
 /// Appends counted items, refusing invalid lengths or a body over `max`.
@@ -1510,6 +1508,18 @@ mod tests {
 
     fn client_duid() -> Duid {
         Duid::ll(hardware::ETHERNET, &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+    }
+
+    #[test]
+    fn bounded_appends_leave_refused_output_unchanged() {
+        let mut out = b"ab".to_vec();
+        assert_eq!(push_fitting(&mut out, b"cd", 4), Some(()));
+        assert_eq!(push_fitting(&mut out, b"", 4), Some(()));
+        let capacity = out.capacity();
+        assert_eq!(push_fitting(&mut out, b"e", 4), None);
+        assert_eq!(push_fitting(&mut out, b"", 3), None);
+        assert_eq!(out, b"abcd");
+        assert_eq!(out.capacity(), capacity);
     }
 
     #[test]

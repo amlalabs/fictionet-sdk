@@ -209,6 +209,17 @@ writing a frame preserves the original attributes and nonzero padding.
 Use `stun::Message::parse(&frame.0)` to interpret attributes. Writing that
 message uses zero padding and recomputes FINGERPRINT.
 
+### Bounded writer appends
+
+Kafka body writers, Thrift value writers, DHCPv6 option body writers, and
+syslog message writers reserve storage before their bounded byte
+appends. Allocation refusal now returns `Error::Unwritable` instead of using
+infallible vector growth. The ONC RPC XDR `Writer` returns `Error::Allocation`
+for the same refusal. Its size errors still carry the attempted total length.
+Each refused append leaves the existing bytes unchanged. Kafka, Thrift, and
+ONC RPC keep their first failure and ignore later appends. Wire formats and
+protocol limits are unchanged. Other allocations are still infallible.
+
 ### Owning recursive protocol values
 
 AMQP `FieldValue`, Thrift `Value`, and protobuf `Value` release nested
