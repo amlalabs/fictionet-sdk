@@ -94,8 +94,9 @@
 //!
 //! # Errors and names in a codec module
 //!
-//! Every protocol module in [`stdlib`](super) follows these rules, and a
-//! copy reads best if it keeps them. The E rules apply to protocol modules.
+//! Protocol modules in [`stdlib`](super) use these conventions, with the
+//! deliberate exceptions below. A copy reads best if it keeps them.
+//! The E rules apply to protocol modules.
 //!
 //! - **E1.** A module has one `pub enum Error`. It is the `ParseError` and
 //!   `WriteError` of each [`Wire`] type, the [`Decode::Error`] of each
@@ -146,6 +147,74 @@
 //!   `State`.
 //! - **N6.** [`Present`](fictionet::observe::Present) is implemented on the
 //!   decoder it presents.
+//!
+//! ## Framing errors and deliberate exceptions
+//!
+//! The error's position determines whether decoding can continue. An
+//! `Err` from [`Decode::decode`] ends the stream. A `Step::Item(Err(error), n)`
+//! consumes one refused unit and leaves framing able to continue. The caller
+//! still decides whether the protocol permits continuing the conversation.
+//! [`Frames<T>`] preserves the item and terminal error types chosen by
+//! [`Prefixed`]; it does not impose a new error shape.
+//!
+//! Some existing protocols deliberately differ from E1 and E2:
+//!
+//! - [`http2::Error`](super::http2::Error) is a struct carrying an RFC error
+//!   code and a reason, including the code an endpoint needs for GOAWAY.
+//! - `Frames<http3::Frame>`, [`http3::ControlFrames`](super::http3::ControlFrames) and
+//!   [`http3::StreamItems`](super::http3::StreamItems) use `http3::Error`
+//!   for both refused items and terminal failures. Complete invalid units
+//!   can be error items; closing a critical stream is terminal. They do not
+//!   introduce a separate `FrameError` just to give it a different name.
+//! - [`fix::Messages`](super::fix::Messages) yields `fix::FieldFault` items
+//!   and resynchronizes. Its terminal error type is `Infallible`, so it has
+//!   no `FrameError`. By contrast, Diameter uses `diameter::AvpFault` for
+//!   refused messages and `diameter::FrameError` for terminal framing faults.
+//!
+//! Keep these public error shapes when copying or extending the modules.
+//! A naming convention does not change where a protocol can recover.
+//!
+//! ## Serving and capture boundaries
+//!
+//! A [`Wire`] parser validates a complete value. An endpoint also enforces
+//! framing and conversation state. A capture may need to describe traffic
+//! an endpoint would refuse, so its adapter can use an explicit observation
+//! policy while sharing the wire parser's building blocks.
+//!
+//! [`http1`](super::http1) supplies wire values and decoders. With `std`,
+//! `httpd::Http1` supplies the service and `httpd::serve_connection` drives
+//! it. With `tokio`, that driver uses hyper for HTTP/2 and HTTP/1 upgrade
+//! handoffs. The service also supports explicit `httpd::UpgradeHandler`
+//! continuations without `tokio`; see the `httpd` module docs.
+//!
+//! HTTP/1 capture uses [`RequestHead::parse_lenient`](super::http1::RequestHead::parse_lenient)
+//! to check syntax without endpoint framing rules, and frames bodies in
+//! the observe adapter. It consumes trailers through their final empty
+//! line without putting them in the body preview. The endpoint codecs
+//! refuse chunk extensions and non-empty trailers.
+//!
+//! [`http2`](super::http2) supplies frames and directional state. Its
+//! [`http2::Session`](super::http2::Session) and the observe presenter are
+//! independent of hyper's live server. Adding a frame or a capture feature
+//! here does not add it to hyper.
+//!
+//! HTTP/2 capture uses [`Inputs::for_observation`](super::http2::Inputs::for_observation)
+//! and [`HeaderBlocks::for_observation`](super::http2::HeaderBlocks::for_observation).
+//! They report unreadable input for presentation where strict frame and
+//! session decoding would fail. This is a capture policy, not permission
+//! for a live endpoint to accept the same bytes.
+//!
+//! [`http3`](super::http3) supplies frames and caller-driven stream state.
+//! Callers supply ordered QUIC stream bytes and manage QPACK tables,
+//! blocked sections and acknowledgments. There is no HTTP/3 service or
+//! QUIC transport that completes the protected handshake. The
+//! [`quic`](super::quic) wire module alone does not make HTTP/3 reachable
+//! by a real client.
+//!
+//! The [observe extension guide](https://github.com/amlalabs/fictionet-sdk/blob/main/docs/observe-protocols.md)
+//! owns the adapter and registration details; the
+//! [protocol onboarding checklist](super#adding-a-protocol) lists the source,
+//! catalog, copy and fuzz entries a new codec needs.
 
 extern crate alloc;
 

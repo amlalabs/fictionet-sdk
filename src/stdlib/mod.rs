@@ -150,7 +150,59 @@
 //! protocol's items in the dashboard and in captures, implement
 //! [`Present`](fictionet::observe::Present) for its framer and add it to the
 //! observe [`Registry`](fictionet::observe::Registry). The guide
-//! `docs/observe-protocols.md` in the repository walks through it.
+//! [Add an observe protocol](https://github.com/amlalabs/fictionet-sdk/blob/main/docs/observe-protocols.md)
+//! walks through it. Wire parsing, serving and capture presentation are
+//! separate responsibilities. A catalog entry in **Wire** or **Decode**
+//! does not promise a live server or a built-in capture presenter. See the
+//! codec's [serving and capture boundaries](codec#serving-and-capture-boundaries)
+//! for runtime support and observation policies.
+//!
+//! ## Adding a protocol
+//!
+//! Follow [CONTRIBUTING.md](https://github.com/amlalabs/fictionet-sdk/blob/main/CONTRIBUTING.md#adding-a-protocol-module)
+//! and the codec's [errors and names](codec#errors-and-names-in-a-codec-module).
+//! A new protocol needs these entries:
+//!
+//! 1. Add `src/stdlib/<name>.rs`, using public `fictionet::` items, and
+//!    declare it with `pub mod` here. Document the supported wire format,
+//!    limits and caller responsibilities, with runnable doctests. Implement
+//!    [`codec::Wire`] for complete values and [`codec::Prefixed`] or
+//!    [`codec::Decode`] where stream framing is needed. Check decoder
+//!    contracts with [`test_support::contract`].
+//! 2. Add one row to [the catalog](#the-catalog). List only capabilities
+//!    the module implements. Keep protocol-specific descriptions in that
+//!    row and the module docs, without adding a front-page paragraph.
+//! 3. Add a `#[path]` entry to `tests/copy_and_own/modules.rs`. This checks
+//!    that the source compiles in a consumer crate using public APIs.
+//! 4. Add `fuzz/fuzz_targets/<name>.rs`, its `[[bin]]` entry in
+//!    `fuzz/Cargo.toml`, and `fuzz/corpus/<name>/` with seed inputs.
+//!    `fuzz/check-targets.sh` checks the source, bin and corpus inventory.
+//!
+//! A service and a presenter are optional additions. A service owns replies,
+//! connection state and events; install it on a [`net::Host`] port. A capture
+//! adapter belongs in `src/observe/`, implements
+//! [`Present`](fictionet::observe::Present) on its decoder, and keeps observe
+//! dependencies out of the protocol file. For a built-in presenter, declare
+//! the adapter in the observe module and register its matcher and factory
+//! in `src/observe/app.rs`. For a local copy, install a custom
+//! [`Registry`](fictionet::observe::Registry) with
+//! [`Cx::observe_protocols`](fictionet::Cx::observe_protocols) before watches
+//! start, as the observe guide shows.
+//!
+//! `tests/stdlib_catalog.rs` derives inventories from the source files and
+//! declarations, the observe app registrations, the fuzz manifest and the
+//! copy fixture. It checks the catalog against those owners; editing a row
+//! alone does not register a codec, a server or a presenter.
+//!
+//! The [CI workflow](https://github.com/amlalabs/fictionet-sdk/blob/main/.github/workflows/ci.yml)
+//! is the authority for the five feature combinations: default,
+//! `--no-default-features`, `--all-features`,
+//! `--no-default-features --features std,observe`, and
+//! `--no-default-features --features tokio`. It checks the fuzz bins and
+//! helper tests on pinned stable with `RUSTFLAGS="--cfg fuzzing"`. The fuzz
+//! job checks the inventory and sweep script, then builds all targets with
+//! `cargo +nightly fuzz build -O -a`. Scheduled and manual runs also execute
+//! every target for 60 seconds. See that workflow for the exact commands.
 //!
 //! ## Changing a protocol by copying it
 //!
