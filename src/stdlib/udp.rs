@@ -11,6 +11,28 @@
 //! which splits a machine's packets so that only UDP, and ICMP errors
 //! about it, reach this layer.
 //! The [`ip`] page shows a whole machine.
+//!
+//! [`Datagram`] borrows a complete UDP datagram from an IP payload.
+//! [`Datagram::parse`] checks its length; [`Datagram::checksum_ok`] checks
+//! its checksum separately. [`encode`] writes into a caller-owned buffer,
+//! sized with [`encoded_len`]. Neither operation allocates or reassembles
+//! fragments. The caller owns MTU and IP header policy.
+//!
+//! ```
+//! use fictionet::stdlib::udp::{self, Datagram};
+//! let src = "192.0.2.1:1000".parse().unwrap();
+//! let dst = "192.0.2.2:53".parse().unwrap();
+//! let mut bytes = [0; 32];
+//! let len = udp::encode(src, dst, b"query", &mut bytes)?;
+//! let datagram = Datagram::parse(&bytes[..len]).unwrap();
+//! assert_eq!(datagram.payload(), b"query");
+//! assert!(datagram.checksum_ok(src.ip(), dst.ip()));
+//! # Ok::<(), udp::Error>(())
+//! ```
+
+#[path = "udp/wire.rs"]
+mod wire;
+pub use wire::{Datagram, Error, encode, encoded_len};
 
 use fictionet::sync::Mutex;
 use std::collections::{BTreeMap, VecDeque};
@@ -22,7 +44,7 @@ use std::task::{Poll, Waker};
 use fictionet::CancelWait;
 use fictionet::stdlib::icmp;
 use fictionet::stdlib::ip::{self, Fields, Header, protocol};
-use fictionet::{Cx, Error, Interface, Packet, RecvError};
+use fictionet::{Cx, Interface, Packet, RecvError};
 
 /// How many bytes of datagrams a socket holds before it drops new ones,
 /// like a full socket buffer, counting [`DATAGRAM_COST`] more for each.
@@ -48,6 +70,8 @@ const DATAGRAM_COST: usize = 64;
 /// A datagram with a bad checksum is dropped. So is one over IPv6 whose
 /// checksum field is zero: that means "no checksum" only over IPv4, and
 /// RFC 8200 forbids it over IPv6.
+/// A UDP length below eight bytes or beyond the IP payload is dropped.
+/// Bytes after the declared UDP length are ignored, including for checksums.
 ///
 /// A socket holds at most 1 MiB of datagrams it has not received yet,
 /// counting 64 bytes more for each datagram. Further datagrams are dropped,
@@ -158,29 +182,21 @@ fn deliver(shared: &Shared, packet: Packet) {
     if group && !shared.state.lock().groups.contains(&ip.dst) {
         return;
     }
-    let udp = ip.payload(&packet.0);
-    if udp.len() < 8 {
+    let Some(udp) = Datagram::parse(ip.payload(&packet.0)) else {
+        return;
+    };
+    if !udp.checksum_ok(ip.src, ip.dst) {
         return;
     }
-    let len = u16::from_be_bytes([udp[4], udp[5]]) as usize;
-    if len < 8 || len > udp.len() {
-        return;
-    }
-    let udp = &udp[..len];
-    if !ip::udp_checksum_ok(ip.src, ip.dst, udp) {
-        return;
-    }
-    let src_port = u16::from_be_bytes([udp[0], udp[1]]);
-    let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
-    let from = SocketAddr::new(ip.src, src_port);
+    let from = SocketAddr::new(ip.src, udp.source_port());
     let reply = {
         let mut st = shared.state.lock();
-        match st.sockets.get_mut(&dst_port) {
+        match st.sockets.get_mut(&udp.destination_port()) {
             Some(q) => {
-                let cost = udp.len() - 8 + DATAGRAM_COST;
+                let cost = udp.payload().len() + DATAGRAM_COST;
                 if q.bytes + cost <= QUEUE {
                     q.bytes += cost;
-                    q.datagrams.push_back((udp[8..].to_vec(), from));
+                    q.datagrams.push_back((udp.payload().to_vec(), from));
                 }
                 if let Some(w) = q.waker.take() {
                     w.wake();
@@ -214,7 +230,7 @@ impl Endpoint {
     /// member.
     ///
     /// Fails if `group` is not a multicast address of the endpoint's family.
-    pub fn join(&self, group: IpAddr) -> Result<(), Error> {
+    pub fn join(&self, group: IpAddr) -> Result<(), fictionet::Error> {
         if !group.is_multicast() || group.is_ipv4() != self.shared.addr.is_ipv4() {
             return Err(fictionet::Error::msg(format!(
                 "{group} is not a multicast group {} can join",
@@ -238,7 +254,7 @@ impl Endpoint {
     /// Port zero selects a free port from 49152 through 65535. Fails if
     /// that range is full or the requested port is already open. Dropping
     /// the socket frees the port.
-    pub fn bind(&self, port: u16) -> Result<Socket, Error> {
+    pub fn bind(&self, port: u16) -> Result<Socket, fictionet::Error> {
         let mut st = self.shared.state.lock();
         let port = if port == 0 {
             let mut available = None;
@@ -345,27 +361,11 @@ impl Socket {
     /// packet, is lost too. Datagrams are never split into fragments.
     pub fn send_to(&mut self, data: &[u8], to: SocketAddr) {
         let src = self.shared.addr;
-        // IPv4's total length counts its 20-byte header; IPv6's payload
-        // length does not count its 40-byte header.
-        let max = if src.is_ipv4() {
-            65_535 - 20 - 8
-        } else {
-            65_535 - 8
-        };
-        if src.is_ipv4() != to.is_ipv4() || data.len() > max {
+        let Ok(len) = encoded_len(src, to.ip(), data.len()) else {
             return;
-        }
-        let mut udp = Vec::with_capacity(8 + data.len());
-        udp.extend_from_slice(&self.port.to_be_bytes());
-        udp.extend_from_slice(&to.port().to_be_bytes());
-        udp.extend_from_slice(&((8 + data.len()) as u16).to_be_bytes());
-        udp.extend_from_slice(&[0, 0]);
-        udp.extend_from_slice(data);
-        let mut sum = ip::transport_checksum(src, to.ip(), protocol::UDP, &udp);
-        if sum == 0 {
-            sum = 0xffff;
-        }
-        udp[6..8].copy_from_slice(&sum.to_be_bytes());
+        };
+        let mut udp = vec![0; len];
+        encode(self.local_addr(), to, data, &mut udp).expect("a checked UDP length fits");
         let id = {
             let mut st = self.shared.state.lock();
             if st.stopped {

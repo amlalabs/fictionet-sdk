@@ -82,10 +82,12 @@
 //!   address answers DNS, and the packets the LAN drops are recorded
 //!   (as [repeats](fictionet::events#repeats)).
 //! - **Machines** answer pings, reset TCP to closed ports and answer UDP to
-//!   closed ports with "port unreachable". A peer address may have 256
-//!   connections open at once across the network
-//!   ([`Limits::connections_per_peer`]); past that, new ones are reset. Each
-//!   service has its own cap too ([`ServeOptions::max_conns`]).
+//!   closed ports with "port unreachable". UDP delivery and closed-port
+//!   events use the declared UDP length. Invalid lengths are dropped;
+//!   trailing IP payload bytes are ignored when checking the checksum.
+//!   A peer address may have 256 connections open at once across the
+//!   network ([`Limits::connections_per_peer`]); past that, new ones are
+//!   reset. Each service has its own cap too ([`ServeOptions::max_conns`]).
 //! - **Budgets.** Service-layer holdings for one sandbox are charged to
 //!   that sandbox's [`Budget`], 256 MiB unless [`Limits::sandbox_budget`]
 //!   says otherwise. A connection that would pass it is closed. The service
@@ -2529,17 +2531,16 @@ impl Shared {
 
 /// A UDP packet with correct checksums.
 fn udp_packet(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &[u8]) -> Packet {
-    let mut u = Vec::with_capacity(8 + data.len());
-    u.extend_from_slice(&sport.to_be_bytes());
-    u.extend_from_slice(&dport.to_be_bytes());
-    u.extend_from_slice(&((8 + data.len()) as u16).to_be_bytes());
-    u.extend_from_slice(&[0, 0]);
-    u.extend_from_slice(data);
-    let mut sum = ip::transport_checksum(src.into(), dst.into(), PROTO_UDP, &u);
-    if sum == 0 {
-        sum = 0xffff;
-    }
-    u[6..8].copy_from_slice(&sum.to_be_bytes());
+    let len = udp::encoded_len(src.into(), dst.into(), data.len())
+        .expect("a DHCP reply fits one IPv4 packet");
+    let mut u = vec![0; len];
+    udp::encode(
+        SocketAddr::new(src.into(), sport),
+        SocketAddr::new(dst.into(), dport),
+        data,
+        &mut u,
+    )
+    .expect("a checked UDP length fits");
     ip::packet(src.into(), dst.into(), PROTO_UDP, &u)
 }
 
@@ -2558,18 +2559,13 @@ fn to_dhcp_server(packet: &[u8], h: &Header, gateway: Ipv4Addr) -> Option<Option
     if u.len() < 4 || u16::from_be_bytes([u[2], u[3]]) != dhcp::SERVER_PORT {
         return None;
     }
-    if u.len() < 8 {
+    let Some(u) = udp::Datagram::parse(u) else {
+        return Some(None);
+    };
+    if !u.checksum_ok(h.src, h.dst) {
         return Some(None);
     }
-    let len = u16::from_be_bytes([u[4], u[5]]) as usize;
-    if len < 8 || len > u.len() {
-        return Some(None);
-    }
-    let u = &u[..len];
-    if !ip::udp_checksum_ok(h.src, h.dst, u) {
-        return Some(None);
-    }
-    Some(dhcp::Message::parse(&u[8..]).ok())
+    Some(dhcp::Message::parse(u.payload()).ok())
 }
 
 /// One attachment's time on the network, the same for a sandbox behind a
@@ -3058,7 +3054,7 @@ fn answered_closed(p: &[u8], open: impl Fn(u8, u16) -> bool) -> bool {
         return false;
     }
     match h.protocol {
-        PROTO_UDP => ip::udp_checksum_ok(h.src, h.dst, t),
+        PROTO_UDP => udp::Datagram::parse(t).is_some_and(|u| u.checksum_ok(h.src, h.dst)),
         _ => ip::transport_checksum(h.src, h.dst, h.protocol, t) == 0,
     }
 }
@@ -3316,6 +3312,42 @@ mod tests {
         };
         assert!(answered_closed(&tcp(0x02), open(false)));
         assert!(!answered_closed(&tcp(0x04), open(false)));
+    }
+
+    #[test]
+    fn closed_udp_ports_use_the_declared_datagram_boundary() {
+        for (src, dst) in [
+            ("10.0.0.2", "10.40.0.1"),
+            ("2001:db8::2", "2001:2::1"),
+        ] {
+            let src: IpAddr = src.parse().unwrap();
+            let dst: IpAddr = dst.parse().unwrap();
+            let packet = |u: &[u8]| ip::packet(src, dst, PROTO_UDP, u).0;
+            let mut u = [0; 10];
+            udp::encode(SocketAddr::new(src, 5000), SocketAddr::new(dst, 9), b"hi", &mut u)
+                .unwrap();
+            let mut trailing = u.to_vec();
+            trailing.extend_from_slice(b"outside UDP");
+            assert!(answered_closed(&packet(&trailing), |_, _| false));
+            assert!(!answered_closed(&packet(&trailing), |_, _| true));
+            // A checksum over the entire IP payload does not validate the
+            // datagram whose UDP length ends before that payload does.
+            trailing[6..8].fill(0);
+            let sum = ip::transport_checksum(src, dst, PROTO_UDP, &trailing);
+            trailing[6..8].copy_from_slice(&sum.to_be_bytes());
+            assert!(!answered_closed(&packet(&trailing), |_, _| false));
+            for len in [0u16, 7, 11, u16::MAX] {
+                let mut bad = u;
+                bad[4..6].copy_from_slice(&len.to_be_bytes());
+                bad[6..8].fill(0);
+                if src.is_ipv4() {
+                    assert!(!answered_closed(&packet(&bad), |_, _| false));
+                }
+                let sum = ip::transport_checksum(src, dst, PROTO_UDP, &bad);
+                bad[6..8].copy_from_slice(&sum.to_be_bytes());
+                assert!(!answered_closed(&packet(&bad), |_, _| false));
+            }
+        }
     }
 
     #[test]

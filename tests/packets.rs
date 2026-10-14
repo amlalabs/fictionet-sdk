@@ -8,7 +8,7 @@ mod wait;
 
 use common::within;
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -17,7 +17,7 @@ use std::time::Duration;
 use etherparse::PacketBuilder;
 use fictionet::prelude::*;
 use fictionet::stdlib::route::{Prefix, lan, router};
-use fictionet::stdlib::{bottleneck, delay, icmp, ip};
+use fictionet::stdlib::{bottleneck, delay, icmp, ip, udp};
 use fictionet::time::ms;
 use fictionet::{Cx, End, Interface, Packet, RecvError, block_on, pair, run};
 
@@ -273,6 +273,142 @@ const A6: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
 const B6: [u8; 16] = [
     0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11,
 ];
+
+#[test]
+fn udp_wire_matches_independent_packets_at_the_size_limits() {
+    for (src, dst, max) in [
+        (IpAddr::from(A4), IpAddr::from(B4), 65_507),
+        (IpAddr::from(A6), IpAddr::from(B6), 65_527),
+    ] {
+        for size in [0, 1, 2, 3, max - 1, max] {
+            let payload = vec![0xab; size];
+            let packet = if src.is_ipv4() {
+                v4_udp(A4, B4, &payload)
+            } else {
+                v6_udp(A6, B6, &payload)
+            };
+            let h = ip::Header::parse_whole(&packet).unwrap();
+            let len = udp::encoded_len(src, dst, size).unwrap();
+            let mut out = vec![0xaa; len + 3];
+            assert_eq!(
+                udp::encode(
+                    SocketAddr::new(src, 1000),
+                    SocketAddr::new(dst, 53),
+                    &payload,
+                    &mut out,
+                ),
+                Ok(len)
+            );
+            assert_eq!(&out[..len], h.payload(&packet));
+            assert_eq!(&out[len..], &[0xaa; 3]);
+            let datagram = udp::Datagram::parse(&out).unwrap();
+            assert_eq!(datagram.as_bytes(), &out[..len]);
+            assert_eq!(datagram.as_bytes().as_ptr(), out.as_ptr());
+            assert_eq!(datagram.source_port(), 1000);
+            assert_eq!(datagram.destination_port(), 53);
+            assert_eq!(datagram.payload(), payload);
+            assert!(datagram.checksum_ok(src, dst));
+        }
+        for size in [max + 1, usize::MAX] {
+            assert_eq!(udp::encoded_len(src, dst, size), Err(udp::Error::Length));
+        }
+        let mut out = [0xaa; 16];
+        assert_eq!(
+            udp::encode(
+                SocketAddr::new(src, 1),
+                SocketAddr::new(dst, 2),
+                &[0; 9],
+                &mut out,
+            ),
+            Err(udp::Error::BufferTooSmall)
+        );
+        assert_eq!(out, [0xaa; 16]);
+        assert_eq!(
+            udp::encode(
+                SocketAddr::new(src, 1),
+                SocketAddr::new(dst, 2),
+                &vec![0; max + 1],
+                &mut out,
+            ),
+            Err(udp::Error::Length)
+        );
+        assert_eq!(out, [0xaa; 16]);
+    }
+    for (src, dst) in [(IpAddr::from(A4), IpAddr::from(B6)), (A6.into(), B4.into())] {
+        let mut out = [0xaa; 8];
+        assert_eq!(
+            udp::encoded_len(src, dst, 0),
+            Err(udp::Error::AddressFamily)
+        );
+        assert_eq!(
+            udp::encode(
+                SocketAddr::new(src, 1),
+                SocketAddr::new(dst, 2),
+                &[],
+                &mut out
+            ),
+            Err(udp::Error::AddressFamily)
+        );
+        assert_eq!(out, [0xaa; 8]);
+    }
+}
+
+#[test]
+fn udp_wire_checks_declared_lengths_before_checksums() {
+    for packet in [v4_udp(A4, B4, b"odd"), v6_udp(A6, B6, b"odd")] {
+        let h = ip::Header::parse_whole(&packet).unwrap();
+        let bytes = h.payload(&packet);
+        for cut in 0..bytes.len() {
+            assert!(udp::Datagram::parse(&bytes[..cut]).is_none());
+        }
+        for len in [0u16, 1, 7, 12, u16::MAX] {
+            let mut bad = bytes.to_vec();
+            bad[4..6].copy_from_slice(&len.to_be_bytes());
+            assert!(udp::Datagram::parse(&bad).is_none());
+        }
+        let mut trailing = bytes.to_vec();
+        trailing.extend_from_slice(b"outside UDP");
+        let datagram = udp::Datagram::parse(&trailing).unwrap();
+        assert_eq!(datagram.payload(), b"odd");
+        assert!(datagram.checksum_ok(h.src, h.dst));
+        let mut bad = bytes.to_vec();
+        bad[8] ^= 1;
+        assert!(
+            !udp::Datagram::parse(&bad)
+                .unwrap()
+                .checksum_ok(h.src, h.dst)
+        );
+        bad[6..8].fill(0);
+        let datagram = udp::Datagram::parse(&bad).unwrap();
+        assert_eq!(datagram.checksum_ok(h.src, h.dst), h.src.is_ipv4());
+        assert!(!datagram.checksum_ok(A4.into(), B6.into()));
+        assert!(!datagram.checksum_ok(A6.into(), B4.into()));
+    }
+}
+
+#[test]
+fn udp_wire_writes_a_computed_zero_checksum_as_ffff() {
+    for (src, dst, payload) in [
+        ("10.0.0.2:1", "10.0.0.1:2", [0xeb, 0xd4]),
+        ("[2001:db8::2]:1", "[2001:db8::1]:2", [0xa4, 0x62]),
+    ] {
+        let src: SocketAddr = src.parse().unwrap();
+        let dst: SocketAddr = dst.parse().unwrap();
+        let mut out = [0; 10];
+        udp::encode(src, dst, &payload, &mut out).unwrap();
+        assert_eq!(&out[6..8], &[0xff, 0xff]);
+        assert!(
+            udp::Datagram::parse(&out)
+                .unwrap()
+                .checksum_ok(src.ip(), dst.ip())
+        );
+        out[6..8].fill(0);
+        assert_eq!(
+            ip::transport_checksum(src.ip(), dst.ip(), ip::protocol::UDP, &out),
+            0
+        );
+    }
+}
 
 #[test]
 fn split_versions_sorts_by_version_and_merges_back() {

@@ -14,6 +14,20 @@ the one log each run keeps.
 | `httpd` | HTTP as a service: `Router`, the `tower` adapter for axum, `VirtualHosts`, `Http1` |
 | `web` | `Sites`, a preset on `Net` for a world of websites |
 
+UDP sockets and Net's DHCP server read only the declared UDP datagram.
+A length below eight bytes or beyond the IP payload is dropped. Trailing
+IP payload bytes do not enter delivery or checksum validation. Net uses
+the same boundary when recording closed-port replies. A zero checksum is
+accepted only over IPv4.
+
+For raw packets, `udp::Datagram::parse` borrows that boundary without
+checking the checksum; `checksum_ok` checks it separately. TAP uses the
+same parser for complete datagrams and leaves checksums to the recipient.
+It classifies first fragments by port without parsing a complete datagram.
+`udp::encode` writes into a caller-owned buffer, sized with `encoded_len`.
+It checks address families and IP size limits and always writes a checksum.
+Allocation, MTU limits, fragments and IP header fields stay with the caller.
+
 ## 1. A service
 
 A service is the server side of one protocol, for one connection. It

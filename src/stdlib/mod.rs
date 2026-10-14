@@ -319,7 +319,7 @@
 //! | [`thrift`] | Apache Thrift messages and values in the binary and compact protocols, and the framed transport. | yes | yes |  |  |  | yes | yes |
 //! | [`tls`] | The server side of a TLS connection, played by the world with rustls. The world picks the certificate after the client hello. |  |  |  |  | built in | yes | yes |
 //! | [`tpkt`] | TPKT packets, the carrier of ISO transport on TCP. | yes | yes |  |  |  | yes | yes |
-//! | [`udp`] | UDP sockets for a machine on the simulated network. |  |  |  |  |  |  | yes |
+//! | [`udp`] | UDP sockets, borrowed datagram parsing and checked encoding. |  |  |  |  |  |  | yes |
 //! | [`urlencoded_form`] | application/x-www-form-urlencoded form bodies and query strings. | yes | yes |  |  |  | yes | yes |
 //! | [`vrrp`] | VRRP virtual router advertisements, versions 2 and 3. |  |  |  |  |  | yes | yes |
 //! | [`vxlan`] | VXLAN and VXLAN-GPE headers. | yes |  |  |  |  | yes | yes |

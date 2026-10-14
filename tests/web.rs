@@ -3998,6 +3998,46 @@ async fn wait_for_long<T>(fcx: &Cx, log: &Log, mut pick: impl FnMut(&Entry) -> O
 }
 
 #[test]
+fn closed_udp_events_match_delivery_for_declared_lengths() {
+    world_events(|fcx, attacher, _env, log| async move {
+        let me = Ipv4Addr::new(10, 0, 0, 2);
+        let mut raw = attacher.attach("a").unwrap();
+        raw.send(ping(me, GATEWAY, 1));
+        recv_within(&fcx, &mut raw, SHORT).await.unwrap();
+        log.clear();
+        for len in [0u16, 7, 11, u16::MAX] {
+            let mut bad = udp(me, 1000, GATEWAY, 5000, b"hi");
+            bad.0[24..26].copy_from_slice(&len.to_be_bytes());
+            bad.0[26..28].fill(0);
+            raw.send(bad);
+        }
+        assert!(recv_within(&fcx, &mut raw, SHORT).await.is_none());
+        assert!(picked(&log, blocked_seen).is_empty());
+
+        let good = udp(me, 1000, GATEWAY, 5000, b"hi");
+        let mut bytes = good.0[20..].to_vec();
+        bytes.extend_from_slice(b"outside UDP");
+        raw.send(ip::packet(me.into(), GATEWAY.into(), 17, &bytes));
+        let (_, _, proto, icmp) = parse(&recv_within(&fcx, &mut raw, SHORT).await.unwrap());
+        assert_eq!((proto, icmp[0], icmp[1]), (1, 3, 3));
+        let events = wait_for(&fcx, &log, 1, blocked_seen).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            blocked_row(&events[0]),
+            (
+                "ClosedPort",
+                Some(me),
+                Some(17),
+                Some(me.into()),
+                Some(GATEWAY.into()),
+                Some(5000)
+            )
+        );
+        Ok(())
+    });
+}
+
+#[test]
 fn events_for_blocked_packets() {
     world_events(|fcx, attacher, _env, log| async move {
         let me = Ipv4Addr::new(10, 0, 0, 2);

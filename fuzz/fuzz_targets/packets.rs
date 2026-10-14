@@ -3,11 +3,11 @@
 //! messages (`dhcp::Message::parse`).
 #![no_main]
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use fictionet::Packet;
 use fictionet::stdlib::test_support::contract::check_wire;
-use fictionet::stdlib::{dhcp, icmp};
+use fictionet::stdlib::{dhcp, icmp, udp};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -36,4 +36,33 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     check_wire::<dhcp::Message>(data);
+    if let Some(datagram) = udp::Datagram::parse(data) {
+        assert!(datagram.as_bytes().len() <= data.len());
+        for (src, dst) in [
+            (
+                IpAddr::from(Ipv4Addr::UNSPECIFIED),
+                IpAddr::from(Ipv4Addr::BROADCAST),
+            ),
+            (
+                IpAddr::from(Ipv6Addr::LOCALHOST),
+                IpAddr::from(Ipv6Addr::LOCALHOST),
+            ),
+        ] {
+            let _ = datagram.checksum_ok(src, dst);
+            let Ok(len) = udp::encoded_len(src, dst, datagram.payload().len()) else {
+                continue;
+            };
+            let mut out = vec![0; len];
+            udp::encode(
+                SocketAddr::new(src, datagram.source_port()),
+                SocketAddr::new(dst, datagram.destination_port()),
+                datagram.payload(),
+                &mut out,
+            )
+            .unwrap();
+            let encoded = udp::Datagram::parse(&out).unwrap();
+            assert!(encoded.checksum_ok(src, dst));
+            assert_eq!(encoded.payload(), datagram.payload());
+        }
+    }
 });

@@ -6,9 +6,10 @@
 //! run by the agent, so every frame is read as hostile input: no length
 //! is trusted before it is checked.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use fictionet::stdlib::ip::{self, Fields, Header};
+use fictionet::stdlib::udp;
 
 /// A MAC address.
 pub(crate) type Mac = [u8; 6];
@@ -183,17 +184,15 @@ pub(crate) fn udp4(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, data: &
 
 /// A UDP datagram from `src` to `dst`, with a correct checksum.
 fn udp(src: IpAddr, sport: u16, dst: IpAddr, dport: u16, data: &[u8]) -> Vec<u8> {
-    let mut u = Vec::with_capacity(8 + data.len());
-    u.extend_from_slice(&sport.to_be_bytes());
-    u.extend_from_slice(&dport.to_be_bytes());
-    u.extend_from_slice(&((8 + data.len()) as u16).to_be_bytes());
-    u.extend_from_slice(&[0, 0]);
-    u.extend_from_slice(data);
-    let mut c = ip::transport_checksum(src, dst, UDP, &u);
-    if c == 0 {
-        c = 0xffff;
-    }
-    u[6..8].copy_from_slice(&c.to_be_bytes());
+    let len = udp::encoded_len(src, dst, data.len()).expect("a DHCP reply fits one IP packet");
+    let mut u = vec![0; len];
+    udp::encode(
+        SocketAddr::new(src, sport),
+        SocketAddr::new(dst, dport),
+        data,
+        &mut u,
+    )
+    .expect("a checked UDP length fits");
     u
 }
 
@@ -324,6 +323,7 @@ pub(crate) enum Upper<'a> {
 pub(crate) struct Unreadable;
 
 /// Reads the transport of an IP packet, which [`ip_packet`] has checked.
+/// Checks complete UDP lengths, but leaves checksums to the recipient.
 pub(crate) fn upper(packet: &[u8]) -> Result<Upper<'_>, Unreadable> {
     let h = Header::check(packet).map_err(|_| Unreadable)?;
     // An atomic fragment is a whole packet, but neighbor discovery may not
@@ -336,20 +336,17 @@ pub(crate) fn upper(packet: &[u8]) -> Result<Upper<'_>, Unreadable> {
     let (proto, bytes) = (h.protocol, h.payload(packet));
     match proto {
         UDP => {
-            if bytes.len() < 8 {
-                return Err(Unreadable);
-            }
-            let port = u16::from_be_bytes([bytes[2], bytes[3]]);
             if fragment {
+                if bytes.len() < 8 {
+                    return Err(Unreadable);
+                }
+                let port = u16::from_be_bytes([bytes[2], bytes[3]]);
                 return Ok(Upper::UdpFragment { port });
             }
-            let len = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
-            if len < 8 || len > bytes.len() {
-                return Err(Unreadable);
-            }
+            let datagram = udp::Datagram::parse(bytes).ok_or(Unreadable)?;
             Ok(Upper::Udp {
-                port,
-                payload: &bytes[8..len],
+                port: datagram.destination_port(),
+                payload: datagram.payload(),
             })
         }
         ICMPV6 if packet[0] >> 4 == 6 => {
@@ -852,6 +849,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn complete_udp_uses_the_shared_boundary_without_checking_checksums() {
+        for p in [
+            udp4(Ipv4Addr::UNSPECIFIED, 68, Ipv4Addr::BROADCAST, 67, b"odd"),
+            udp6(link_local(VM), 546, link_local(GATEWAY_MAC), 547, b"odd"),
+        ] {
+            let h = Header::parse_whole(&p).unwrap();
+            let mut bytes = h.payload(&p).to_vec();
+            bytes.extend_from_slice(b"outside UDP");
+            // TAP classifies complete datagrams even with a bad checksum.
+            bytes[6..8].copy_from_slice(&[0x12, 0x34]);
+            let datagram = udp::Datagram::parse(&bytes).unwrap();
+            assert!(!datagram.checksum_ok(h.src, h.dst));
+            let expected = Ok(Upper::Udp {
+                port: datagram.destination_port(),
+                payload: datagram.payload(),
+            });
+            let packet = ip::packet(h.src, h.dst, UDP, &bytes);
+            assert_eq!(upper(&packet.0), expected);
+            for len in [0u16, 7, 100] {
+                bytes[4..6].copy_from_slice(&len.to_be_bytes());
+                assert!(udp::Datagram::parse(&bytes).is_none());
+                assert_eq!(
+                    upper(&ip::packet(h.src, h.dst, UDP, &bytes).0),
+                    Err(Unreadable)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn udp_lengths_and_fragments() {
         let p = udp4(
             Ipv4Addr::UNSPECIFIED,
@@ -877,6 +904,7 @@ pub(crate) mod tests {
         // The first fragment gives the port, and only the port.
         let mut first = p.clone();
         first[6] = 0x20;
+        first[24..26].copy_from_slice(&100u16.to_be_bytes());
         assert_eq!(upper(&first), Ok(Upper::UdpFragment { port: 67 }));
         let mut later = p.clone();
         later[7] = 1;
